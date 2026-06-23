@@ -1,0 +1,38 @@
+[package]
+name = "pagh"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+
+[dependencies]
+limine = "0.6"
+spin = "0.9"
+x86_64 = "0.15"
+lazy_static = { version = "1.4", features = ["spin_no_std"] }
+bitflags = "2.6"
+uart_16550 = "0.3"
+volatile = "0.6"
+linked_list_allocator = "0.10"
+virtio-drivers = { version = "0.11", default-features = false, features = ["alloc"] }
+
+[dependencies.acpi]
+version = "5.0"
+default-features = false
+features = ["allocator_api"]
+
+[dependencies.smoltcp]
+version = "0.12"
+default-features = false
+features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4"]
