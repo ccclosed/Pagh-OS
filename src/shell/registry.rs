@@ -180,6 +180,36 @@ pub static COMMANDS: &[CommandSpec] = &[
         usage: "pwd",
         handler: super::commands::cmd_pwd,
     },
+    CommandSpec {
+        name: "cp",
+        description: "Copy a file (cp <src> <dst>)",
+        usage: "cp <src> <dst>",
+        handler: super::commands::cmd_cp,
+    },
+    CommandSpec {
+        name: "mv",
+        description: "Move/rename a file (mv <src> <dst>)",
+        usage: "mv <src> <dst>",
+        handler: super::commands::cmd_mv,
+    },
+    CommandSpec {
+        name: "stat",
+        description: "Show file/directory info",
+        usage: "stat <path>",
+        handler: super::commands::cmd_stat,
+    },
+    CommandSpec {
+        name: "sleep",
+        description: "Sleep for N seconds",
+        usage: "sleep <seconds>",
+        handler: super::commands::cmd_sleep,
+    },
+    CommandSpec {
+        name: "paint",
+        description: "Launch the framebuffer paint app",
+        usage: "paint",
+        handler: super::commands::cmd_paint,
+    },
 ];
 
 /// Look up a command by its exact name via a linear scan of [`COMMANDS`].

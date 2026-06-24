@@ -54,8 +54,6 @@ impl CharacterDevice for Ps2Keyboard {
             None
         }
     }
-
-    fn write_char(&self, _c: u8) {}
 }
 
 static KEYBOARD: Spinlock<Option<Arc<Ps2Keyboard>>> = Spinlock::new(None);

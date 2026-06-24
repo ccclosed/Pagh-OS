@@ -10,8 +10,6 @@
 // scheduler.rs / process.rs / allocator.rs are migrated to use these in task 5.2,
 // so some of these items will report `dead_code` warnings until then.
 
-use core::sync::atomic::Ordering;
-
 /// Architectural page size (4 KiB).
 pub const PAGE_SIZE: u64 = 4096;
 
@@ -71,10 +69,13 @@ pub const USER_STACK_PAGES: u64 = 8;
 
 // ─── Kernel heap ─────────────────────────────────────────────────────────────
 
-/// Initial kernel heap size, in pages (64 × 4 KiB = 256 KiB).
+/// Initial kernel heap size, in pages (4096 × 4 KiB = 16 MiB).
 ///
-/// Source: `memory::allocator::init` (initial 64-page heap).
-pub const HEAP_INITIAL_PAGES: u64 = 64;
+/// Originally 64 pages (256 KiB). Raised to 16 MiB so graphical applications
+/// (e.g. the `paint` tool) can hold full-screen backing buffers in the heap:
+/// a 1024×768 canvas is 3 MiB per `u32` buffer, and `paint` keeps a canvas
+/// plus an undo snapshot. QEMU is launched with 512 MiB, so this is safe.
+pub const HEAP_INITIAL_PAGES: u64 = 4096;
 
 extern "C" {
     /// Start of the kernel image — provided by the linker script
@@ -116,13 +117,8 @@ pub fn heap_base() -> u64 {
 
 // ─── MMIO window ─────────────────────────────────────────────────────────────
 
-/// The MMIO window is, under the current scheme, the HHDM (higher-half direct
-/// map) region: device MMIO (LAPIC/IOAPIC/framebuffer) is reached at
-/// `HHDM_OFFSET + phys`. There is therefore no separate fixed MMIO base; this
-/// helper centralizes the `virt = hhdm + phys` convention.
-///
-/// Task 7 introduces a dedicated `map_mmio` API; for now this just documents and
-/// centralizes the existing convention so call sites stop hardcoding it.
-pub fn mmio_virt_for(phys: u64) -> u64 {
-    crate::HHDM_OFFSET.load(Ordering::Relaxed) + phys
-}
+// The MMIO window is, under the current scheme, the HHDM (higher-half direct
+// map) region: device MMIO (LAPIC/IOAPIC/framebuffer) is reached at
+// `HHDM_OFFSET + phys`. There is therefore no separate fixed MMIO base; the
+// `virt = hhdm + phys` convention is centralized in `memory::vmm`
+// (`phys_to_virt` / `map_mmio`).

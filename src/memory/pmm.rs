@@ -7,6 +7,17 @@ use limine::request::MemmapResponse;
 
 const FRAME_SIZE: u64 = 4096;
 
+/// Everything below 1 MB is permanently reserved (real-mode IVT, BIOS data
+/// area, and assorted legacy/firmware structures). A free call for any address
+/// below this threshold is always a no-op.
+const LOW_RESERVED: u64 = 0x100000;
+
+/// Maximum number of kernel-image physical ranges captured at [`init`] from the
+/// Limine `MEMMAP_EXECUTABLE_AND_MODULES` (kernel-and-modules) memmap entries.
+/// A fixed-size store is used because the PMM is initialized before the heap
+/// allocator exists, so no dynamic allocation is available here.
+const MAX_KERNEL_RANGES: usize = 16;
+
 /// Physical Memory Manager state (bitmap allocator).
 ///
 /// All PMM state lives here, behind the single [`PMM`] spinlock. The bitmap
@@ -23,6 +34,40 @@ struct Pmm {
     base_addr: u64,
     /// Highest address tracked + 1.
     top_addr: u64,
+    /// Physical base address of the bitmap's own storage.
+    bitmap_phys: u64,
+    /// Size in bytes of the bitmap's own storage.
+    bitmap_bytes: u64,
+    /// Kernel-image physical ranges `[start, end)` captured from the Limine
+    /// `MEMMAP_EXECUTABLE_AND_MODULES` entries at init. A free call for any
+    /// address inside one of these ranges is refused.
+    kernel_ranges: [(u64, u64); MAX_KERNEL_RANGES],
+    /// Number of valid entries in [`Pmm::kernel_ranges`].
+    kernel_range_count: usize,
+}
+
+impl Pmm {
+    /// Returns `true` if `addr` falls in a permanently-reserved region that a
+    /// free call must never return to the allocatable pool: below 1 MB, within
+    /// the bitmap's own frames, or within a captured kernel-image range.
+    ///
+    /// These frames were never marked free at init, so flipping their bit on a
+    /// stray free would corrupt the allocatable pool (Property 4).
+    fn is_reserved(&self, addr: u64) -> bool {
+        if addr < LOW_RESERVED {
+            return true;
+        }
+        if addr >= self.bitmap_phys && addr < self.bitmap_phys + self.bitmap_bytes {
+            return true;
+        }
+        for i in 0..self.kernel_range_count {
+            let (start, end) = self.kernel_ranges[i];
+            if addr >= start && addr < end {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Global PMM state, protected by a single spinlock.
@@ -99,6 +144,27 @@ pub fn init(memmap: &MemmapResponse) {
 
     crate::debug!("Bitmap at physical: 0x{:x}", bitmap_phys_addr);
 
+    // Capture the kernel-image physical range(s) from the Limine
+    // kernel-and-modules memmap entries. These frames are reserved (never
+    // freed at init) and must never be returned to the pool by a stray free
+    // (R6.1/R6.2). We page-align each range outward so a partial-frame entry
+    // still fully covers the frames it touches.
+    let mut kernel_ranges = [(0u64, 0u64); MAX_KERNEL_RANGES];
+    let mut kernel_range_count = 0usize;
+    for entry in entries {
+        if entry.type_ == memmap::MEMMAP_EXECUTABLE_AND_MODULES {
+            if kernel_range_count >= MAX_KERNEL_RANGES {
+                crate::warn!("[PMM] more kernel/module ranges than MAX_KERNEL_RANGES; some not tracked");
+                break;
+            }
+            let start = align_down(entry.base, FRAME_SIZE);
+            let end = align_up(entry.base + entry.length, FRAME_SIZE);
+            kernel_ranges[kernel_range_count] = (start, end);
+            kernel_range_count += 1;
+            crate::debug!("[PMM] reserved kernel/module range: 0x{:x}..0x{:x}", start, end);
+        }
+    }
+
     // Map the bitmap into kernel address space via HHDM.
     let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
     let bitmap_virt = (bitmap_phys_addr + hhdm) as *mut u64;
@@ -119,6 +185,10 @@ pub fn init(memmap: &MemmapResponse) {
         free_count: 0,
         base_addr: base,
         top_addr: top,
+        bitmap_phys: bitmap_phys_addr,
+        bitmap_bytes: bitmap_bytes as u64,
+        kernel_ranges,
+        kernel_range_count,
     };
 
     // ─── Reservation logic (frame free/reserve) ──────────────────────────
@@ -343,6 +413,13 @@ pub fn free_frames_contiguous(base: u64, count: usize) {
         if i >= pmm.total_frames {
             break;
         }
+        let addr = pmm.base_addr + (i as u64) * FRAME_SIZE;
+        // Refuse to free reserved frames (below 1 MB, the bitmap's own frames,
+        // or a kernel-image range). Leave free_count and the bitmap unchanged
+        // for those frames (R6.1).
+        if pmm.is_reserved(addr) {
+            continue;
+        }
         let word = i / 64;
         let bit = i % 64;
         if pmm.bitmap[word] & (1u64 << bit) == 0 {
@@ -362,6 +439,12 @@ pub fn free_frame(addr: u64) {
 
     if addr < pmm.base_addr || addr >= pmm.top_addr {
         return; // Not in our range
+    }
+
+    // Refuse to free reserved frames (below 1 MB, the bitmap's own frames, or a
+    // kernel-image range). Leave free_count and the bitmap unchanged (R6.1).
+    if pmm.is_reserved(addr) {
+        return;
     }
 
     let idx = ((addr - pmm.base_addr) / FRAME_SIZE) as usize;

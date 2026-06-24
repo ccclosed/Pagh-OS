@@ -59,7 +59,6 @@ const USER_ADDR_MAX: u64 = 0x0000_8000_0000_0000;
 pub struct ElfProcess {
     pub entry: u64,
     pub pml4_phys: u64,
-    pub brk: u64,
 }
 
 pub struct ElfLoader;
@@ -119,7 +118,7 @@ impl ElfLoader {
 
         crate::debug!("Loaded: entry=0x{:x} brk=0x{:x}", header.e_entry, brk);
 
-        Ok(ElfProcess { entry: header.e_entry, pml4_phys, brk })
+        Ok(ElfProcess { entry: header.e_entry, pml4_phys })
     }
 
     /// Validate the program-header table and all `PT_LOAD` segments using only

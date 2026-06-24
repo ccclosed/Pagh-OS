@@ -16,8 +16,6 @@ pub mod journal;
 /// Mirrors the error model in the design document (`FsError`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsError {
-    /// No virtio-blk device was discovered, so storage is unavailable.
-    NoDevice,
     /// The on-disk ext2 superblock is missing/invalid (`s_magic != 0xEF53`) or
     /// declares a block size that does not match the compiled `BS`.
     BadSuperBlock,

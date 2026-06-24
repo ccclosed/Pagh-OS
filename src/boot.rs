@@ -153,6 +153,14 @@ fn init_apic() {
     arch::x86_64::apic::route_irq(1, 33);
     arch::x86_64::apic::register_irq(33, drivers::ps2_kbd::irq_handler);
 
+    // Route IRQ12 (PS/2 mouse) -> vector 44 and register its handler. The
+    // mouse device itself is enabled later in `init_drivers` (after the
+    // framebuffer is up, so it knows the screen bounds); routing the IOAPIC
+    // redirection entry early is harmless because no packets stream until the
+    // device's data reporting is turned on.
+    arch::x86_64::apic::route_irq(12, 44);
+    arch::x86_64::apic::register_irq(44, drivers::ps2_mouse::irq_handler);
+
     info!("apic");
 }
 

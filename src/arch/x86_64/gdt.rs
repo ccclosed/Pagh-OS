@@ -3,9 +3,9 @@
 
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
-use x86_64::PrivilegeLevel;
 use x86_64::VirtAddr;
-use core::ptr::addr_of;
+use core::cell::SyncUnsafeCell;
+use core::sync::atomic::{AtomicU16, Ordering};
 
 // ─── IST (Interrupt Stack Table) stack allocations ─────────────────────
 
@@ -13,47 +13,54 @@ use core::ptr::addr_of;
 #[repr(C, align(16))]
 struct IstStack([u8; 16384]);
 
-static mut IST1_DOUBLE_FAULT: IstStack = IstStack([0; 16384]);
-static mut IST2_PAGE_FAULT: IstStack = IstStack([0; 16384]);
+// The IST stacks, TSS and GDT live in `SyncUnsafeCell`s rather than `static mut`
+// items so that every access goes through the cell's `.get()` raw pointer and we
+// never create a `&`/`&mut` reference to a mutable static (which the
+// `static_mut_refs` lint forbids). None of these types are `Sync`, but
+// `SyncUnsafeCell` supplies the `Sync` impl a `static` requires; soundness rests
+// on the init-once, single-threaded, pre-interrupt invariant documented at each
+// access site.
+static IST1_DOUBLE_FAULT: SyncUnsafeCell<IstStack> = SyncUnsafeCell::new(IstStack([0; 16384]));
+static IST2_PAGE_FAULT: SyncUnsafeCell<IstStack> = SyncUnsafeCell::new(IstStack([0; 16384]));
 
 // ─── TSS ────────────────────────────────────────────────────────────────
 
-static mut TSS: TaskStateSegment = TaskStateSegment::new();
+static TSS: SyncUnsafeCell<TaskStateSegment> = SyncUnsafeCell::new(TaskStateSegment::new());
 
 // ─── GDT ────────────────────────────────────────────────────────────────
 
-static mut GDT: GlobalDescriptorTable = GlobalDescriptorTable::new();
+static GDT: SyncUnsafeCell<GlobalDescriptorTable> =
+    SyncUnsafeCell::new(GlobalDescriptorTable::new());
 
 /// Public segment selectors, set after `init()`.
 pub struct Selectors;
 
-// These are set by `init()` and immutable thereafter.
-static mut KERNEL_CODE_SEL: SegmentSelector = SegmentSelector::new(0, PrivilegeLevel::Ring0);
-static mut KERNEL_DATA_SEL: SegmentSelector = SegmentSelector::new(0, PrivilegeLevel::Ring0);
-static mut USER_CODE_SEL: SegmentSelector = SegmentSelector::new(0, PrivilegeLevel::Ring0);
-static mut USER_DATA_SEL: SegmentSelector = SegmentSelector::new(0, PrivilegeLevel::Ring0);
-static mut TSS_SEL: SegmentSelector = SegmentSelector::new(0, PrivilegeLevel::Ring0);
+// Selector values are stored as raw `u16`s in `AtomicU16`s: `SegmentSelector` is
+// a `#[repr(transparent)]` wrapper around a `u16`, so storing `.0` in `init` and
+// rebuilding the wrapper on read is an exact, lock-free, reference-free
+// substitute for the previous `static mut SegmentSelector` items.
+static KERNEL_CODE_SEL: AtomicU16 = AtomicU16::new(0);
+static KERNEL_DATA_SEL: AtomicU16 = AtomicU16::new(0);
+static USER_CODE_SEL: AtomicU16 = AtomicU16::new(0);
+static USER_DATA_SEL: AtomicU16 = AtomicU16::new(0);
+static TSS_SEL: AtomicU16 = AtomicU16::new(0);
 
 impl Selectors {
     pub fn kernel_code() -> SegmentSelector {
-        // SAFETY: Set once during init, then read-only.
-        unsafe { KERNEL_CODE_SEL }
+        // Set once during init, then read-only; rebuild the wrapper from the raw value.
+        SegmentSelector(KERNEL_CODE_SEL.load(Ordering::Relaxed))
     }
     pub fn kernel_data() -> SegmentSelector {
-        // SAFETY: Set once during init, then read-only.
-        unsafe { KERNEL_DATA_SEL }
+        // Set once during init, then read-only; rebuild the wrapper from the raw value.
+        SegmentSelector(KERNEL_DATA_SEL.load(Ordering::Relaxed))
     }
     pub fn user_code() -> SegmentSelector {
-        // SAFETY: Set once during init, then read-only.
-        unsafe { USER_CODE_SEL }
+        // Set once during init, then read-only; rebuild the wrapper from the raw value.
+        SegmentSelector(USER_CODE_SEL.load(Ordering::Relaxed))
     }
     pub fn user_data() -> SegmentSelector {
-        // SAFETY: Set once during init, then read-only.
-        unsafe { USER_DATA_SEL }
-    }
-    pub fn tss() -> SegmentSelector {
-        // SAFETY: Set once during init, then read-only.
-        unsafe { TSS_SEL }
+        // Set once during init, then read-only; rebuild the wrapper from the raw value.
+        SegmentSelector(USER_DATA_SEL.load(Ordering::Relaxed))
     }
 }
 
@@ -83,11 +90,14 @@ pub const IST_PAGE_FAULT: u16 = 2;
 /// have to be reprogrammed on every switch into a ring-3 task; that is out of
 /// scope for the current single embedded-test-process bring-up.
 pub fn set_kernel_stack(rsp0: u64) {
-    // SAFETY: `TSS` is a module-private mutable static. RSP0 is written here and
-    // read by the CPU on privilege transitions; the write is a single aligned
-    // 64-bit store and there is no concurrent mutation of this field elsewhere.
+    // SAFETY: init-once, single-threaded, pre-interrupt invariant — the TSS is
+    // owned by this module's `SyncUnsafeCell` and is only mutated here and in
+    // `init`, with no concurrent access. RSP0 is written through the cell's raw
+    // pointer as a single aligned 64-bit store; the CPU re-reads it on the next
+    // privilege transition, so the write through `.get()` (never a `&mut` to a
+    // static) takes effect immediately.
     unsafe {
-        TSS.privilege_stack_table[0] = VirtAddr::new(rsp0);
+        (*TSS.get()).privilege_stack_table[0] = VirtAddr::new(rsp0);
     }
 }
 
@@ -97,32 +107,46 @@ pub fn set_kernel_stack(rsp0: u64) {
 ///
 /// SAFETY: Must be called once during early boot, before interrupts are enabled.
 pub fn init() {
-    // SAFETY: Setting up IST stacks during init — no concurrent access.
-    unsafe {
-        // Set IST entries in TSS
-        let df_stack_top = addr_of!(IST1_DOUBLE_FAULT) as u64 + 16384;
-        let pf_stack_top = addr_of!(IST2_PAGE_FAULT) as u64 + 16384;
+    // IST stack tops. `.get()` yields the `*mut IstStack` backing each cell; the
+    // pointer-to-integer cast gives the stack base, and + 16384 gives its
+    // (exclusive) top. No reference to a static is created.
+    let df_stack_top = IST1_DOUBLE_FAULT.get() as u64 + 16384;
+    let pf_stack_top = IST2_PAGE_FAULT.get() as u64 + 16384;
 
-        TSS.interrupt_stack_table[IST_DOUBLE_FAULT as usize] =
-            VirtAddr::new(df_stack_top);
-        TSS.interrupt_stack_table[IST_PAGE_FAULT as usize] =
-            VirtAddr::new(pf_stack_top);
+    // SAFETY: init-once, single-threaded, pre-interrupt invariant — exclusive
+    // access to the TSS through its cell's raw pointer; no other code observes
+    // or mutates the TSS during early boot.
+    unsafe {
+        let tss = TSS.get();
+        (*tss).interrupt_stack_table[IST_DOUBLE_FAULT as usize] = VirtAddr::new(df_stack_top);
+        (*tss).interrupt_stack_table[IST_PAGE_FAULT as usize] = VirtAddr::new(pf_stack_top);
     }
 
-    // Build GDT descriptors
-    // SAFETY: GDT is a mutable static; init is called once.
+    // Build GDT descriptors.
+    // SAFETY: init-once, single-threaded, pre-interrupt invariant — exclusive
+    // access to the GDT through its cell's raw pointer. The `&'static TSS` fed to
+    // `Descriptor::tss_segment` is taken from the TSS cell, which is fully
+    // initialized above and never mutated concurrently; the reference only needs
+    // to remain valid for the descriptor, and the TSS lives for the whole program.
     unsafe {
-        KERNEL_CODE_SEL = GDT.append(Descriptor::kernel_code_segment());
-        KERNEL_DATA_SEL = GDT.append(Descriptor::kernel_data_segment());
-        USER_CODE_SEL = GDT.append(Descriptor::user_code_segment());
-        USER_DATA_SEL = GDT.append(Descriptor::user_data_segment());
-        TSS_SEL = GDT.append(Descriptor::tss_segment(&TSS));
+        let gdt = &mut *GDT.get();
+        KERNEL_CODE_SEL.store(gdt.append(Descriptor::kernel_code_segment()).0, Ordering::Relaxed);
+        KERNEL_DATA_SEL.store(gdt.append(Descriptor::kernel_data_segment()).0, Ordering::Relaxed);
+        USER_CODE_SEL.store(gdt.append(Descriptor::user_code_segment()).0, Ordering::Relaxed);
+        USER_DATA_SEL.store(gdt.append(Descriptor::user_data_segment()).0, Ordering::Relaxed);
+        let tss_ref: &'static TaskStateSegment = &*TSS.get();
+        TSS_SEL.store(gdt.append(Descriptor::tss_segment(tss_ref)).0, Ordering::Relaxed);
     }
 
-    // Load GDT and TSS
-    // SAFETY: GDT contains valid descriptors; TSS is properly initialized.
+    // Load GDT and TSS.
+    // SAFETY: init-once, single-threaded, pre-interrupt invariant. The GDT holds
+    // valid descriptors built above and the TSS is initialized; access is through
+    // the GDT cell's raw pointer. The `&'static` borrow required by `load()` is
+    // satisfied because the GDT lives for the whole program and is not mutated
+    // after this point. The selector reloads use the just-stored atomic values.
     unsafe {
-        GDT.load();
+        let gdt: &'static GlobalDescriptorTable = &*GDT.get();
+        gdt.load();
         // Reload code segment with a far jump
         core::arch::asm!(
             "push {sel}",
@@ -130,7 +154,7 @@ pub fn init() {
             "push {tmp}",
             "retfq",
             "2:",
-            sel = in(reg) KERNEL_CODE_SEL.0 as u64,
+            sel = in(reg) KERNEL_CODE_SEL.load(Ordering::Relaxed) as u64,
             tmp = lateout(reg) _,
             options(preserves_flags),
         );
@@ -154,18 +178,18 @@ pub fn init() {
             "mov fs, {sel:x}",
             "mov gs, {sel:x}",
             "mov ss, {sel:x}",
-            sel = in(reg) KERNEL_DATA_SEL.0,
+            sel = in(reg) KERNEL_DATA_SEL.load(Ordering::Relaxed),
             options(nomem, nostack),
         );
         // Load TSS
-        x86_64::instructions::tables::load_tss(TSS_SEL);
+        x86_64::instructions::tables::load_tss(SegmentSelector(TSS_SEL.load(Ordering::Relaxed)));
     }
 
     crate::debug!("GDT loaded: kernel CS={:#x}, DS={:#x}, user CS={:#x}, DS={:#x}, TSS={:#x}",
-        unsafe { KERNEL_CODE_SEL.0 },
-        unsafe { KERNEL_DATA_SEL.0 },
-        unsafe { USER_CODE_SEL.0 },
-        unsafe { USER_DATA_SEL.0 },
-        unsafe { TSS_SEL.0 },
+        KERNEL_CODE_SEL.load(Ordering::Relaxed),
+        KERNEL_DATA_SEL.load(Ordering::Relaxed),
+        USER_CODE_SEL.load(Ordering::Relaxed),
+        USER_DATA_SEL.load(Ordering::Relaxed),
+        TSS_SEL.load(Ordering::Relaxed),
     );
 }

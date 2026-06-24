@@ -154,6 +154,11 @@ impl BlockDevice for VirtioBlkDevice {
         dev.write_blocks(block as usize, buf).map_err(|_| ())?;
         Ok(buf.len())
     }
+
+    /// Device capacity in 512-byte sectors, as reported by virtio-blk at attach.
+    fn sector_count(&self) -> u64 {
+        self.capacity_blocks
+    }
 }
 
 /// True if a discovered PCI device is a virtio block device.

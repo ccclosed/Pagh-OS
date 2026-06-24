@@ -13,6 +13,7 @@ pub(crate) mod complete;
 pub(crate) mod editor;
 pub(crate) mod history;
 pub(crate) mod keys;
+pub(crate) mod paint;
 pub(crate) mod path;
 pub(crate) mod registry;
 pub(crate) mod render;
@@ -237,6 +238,13 @@ pub fn shell_main() -> ! {
     let mut decoder = keys::Decoder::new();
     let mut history = history::History::new();
 
+    // Place the mouse cursor at the center of the screen and prime the status
+    // bar. The overlay below redraws it on every wake.
+    let (fw, fh) = crate::drivers::framebuffer::dimensions();
+    if fw != 0 {
+        crate::drivers::cursor::move_to(fw / 2, fh / 2);
+    }
+
     loop {
         // CWD-aware prompt, e.g. `pagh:/> ` (R5.1–R5.3).
         render::prompt(&path::cwd());
@@ -247,81 +255,97 @@ pub fn shell_main() -> ! {
 
         // Read keys until Enter.
         loop {
-            // Idle on halt until an interrupt delivers a scancode (R11.5).
+            // Idle on halt until an interrupt delivers an event (R11.5).
             crate::arch::cpu::halt();
 
-            let scancode = match try_read_scancode() {
-                Some(s) => s,
-                None => continue,
-            };
+            // Live overlay: hide the cursor, repaint the status bar, then drain
+            // and process ALL pending scancodes with the cursor hidden (so
+            // glyph output never clobbers its saved background). The cursor is
+            // redrawn exactly once afterwards.
+            let mouse = crate::drivers::ps2_mouse::poll();
+            crate::drivers::cursor::hide();
+            shell_status_bar(&mouse);
 
-            // Unsupported / mid-prefix / break codes decode to None and are
-            // ignored without panicking (R11.2).
-            let event = match decoder.feed(scancode) {
-                Some(e) => e,
-                None => continue,
-            };
+            let mut entered = false;
+            while let Some(scancode) = try_read_scancode() {
+                // Unsupported / mid-prefix / break codes decode to None and are
+                // ignored without panicking (R11.2).
+                let event = match decoder.feed(scancode) {
+                    Some(e) => e,
+                    None => continue,
+                };
 
-            match event {
-                keys::KeyEvent::Char(c) => {
-                    editor.insert(c);
-                    redraw_line(&editor, &mut shown);
-                }
-                keys::KeyEvent::Backspace => {
-                    editor.delete_back();
-                    redraw_line(&editor, &mut shown);
-                }
-                keys::KeyEvent::Delete => {
-                    editor.delete_fwd();
-                    redraw_line(&editor, &mut shown);
-                }
-                // Cursor moves update the logical cursor only; the visible caret
-                // stays at end-of-line (see redraw_line LIMITATION note).
-                keys::KeyEvent::Left => {
-                    editor.move_left();
-                }
-                keys::KeyEvent::Right => {
-                    editor.move_right();
-                }
-                keys::KeyEvent::Home => {
-                    editor.move_home();
-                }
-                keys::KeyEvent::End => {
-                    editor.move_end();
-                }
-                // Up: recall an older entry, stashing the live line (R2.2).
-                keys::KeyEvent::Up => {
-                    if let Some(line) = history.recall_prev(editor.buffer()) {
-                        editor.set_line(line);
+                match event {
+                    keys::KeyEvent::Char(c) => {
+                        editor.insert(c);
                         redraw_line(&editor, &mut shown);
                     }
-                }
-                // Down: recall a newer entry, or restore the stashed live line
-                // when stepping past the newest (R2.3).
-                keys::KeyEvent::Down => {
-                    match history.recall_next() {
-                        Some(line) => editor.set_line(line),
-                        None => editor.set_line(history.saved_line()),
+                    keys::KeyEvent::Backspace => {
+                        editor.delete_back();
+                        redraw_line(&editor, &mut shown);
                     }
-                    redraw_line(&editor, &mut shown);
-                }
-                keys::KeyEvent::Tab => {
-                    handle_tab(&mut editor, &mut shown);
-                }
-                // Enter: finish the line. Non-empty lines are recorded (with
-                // dedup) and dispatched; navigation is always reset.
-                keys::KeyEvent::Enter => {
-                    crate::kprintln!();
-                    crate::fb_println!();
-                    if editor.is_empty() {
-                        history.reset_nav();
-                    } else {
-                        history.push(editor.buffer());
-                        execute_command(editor.buffer());
+                    keys::KeyEvent::Delete => {
+                        editor.delete_fwd();
+                        redraw_line(&editor, &mut shown);
                     }
-                    break;
+                    // Cursor moves update the logical cursor only; the visible
+                    // caret stays at end-of-line (see redraw_line LIMITATION).
+                    keys::KeyEvent::Left => {
+                        editor.move_left();
+                    }
+                    keys::KeyEvent::Right => {
+                        editor.move_right();
+                    }
+                    keys::KeyEvent::Home => {
+                        editor.move_home();
+                    }
+                    keys::KeyEvent::End => {
+                        editor.move_end();
+                    }
+                    // Up: recall an older entry, stashing the live line (R2.2).
+                    keys::KeyEvent::Up => {
+                        if let Some(line) = history.recall_prev(editor.buffer()) {
+                            editor.set_line(line);
+                            redraw_line(&editor, &mut shown);
+                        }
+                    }
+                    // Down: recall a newer entry, or restore the stashed live
+                    // line when stepping past the newest (R2.3).
+                    keys::KeyEvent::Down => {
+                        match history.recall_next() {
+                            Some(line) => editor.set_line(line),
+                            None => editor.set_line(history.saved_line()),
+                        }
+                        redraw_line(&editor, &mut shown);
+                    }
+                    keys::KeyEvent::Tab => {
+                        handle_tab(&mut editor, &mut shown);
+                    }
+                    // Enter: finish the line. Non-empty lines are recorded
+                    // (with dedup) and dispatched; navigation is always reset.
+                    keys::KeyEvent::Enter => {
+                        crate::kprintln!();
+                        crate::fb_println!();
+                        if editor.is_empty() {
+                            history.reset_nav();
+                        } else {
+                            history.push(editor.buffer());
+                            execute_command(editor.buffer());
+                        }
+                        entered = true;
+                        break;
+                    }
                 }
             }
+
+            if entered {
+                // Re-prompt on the next outer-loop pass; the cursor is redrawn
+                // by the next wake's overlay so the fresh prompt isn't clobbered.
+                break;
+            }
+
+            // Redraw the mouse cursor on top of the final rendered state.
+            crate::drivers::cursor::move_to(mouse.x, mouse.y);
         }
     }
 }
@@ -329,4 +353,16 @@ pub fn shell_main() -> ! {
 /// Try to read a scancode from the keyboard.
 fn try_read_scancode() -> Option<u8> {
     crate::drivers::get_char("keyboard").and_then(|kbd| kbd.read_char())
+}
+
+/// Repaint the bottom status bar with the live shell state: OS name, current
+/// working directory, uptime, and the mouse position. Safe to call every loop
+/// iteration — the status strip sits below the scrolling text region, so it
+/// never conflicts with command output.
+fn shell_status_bar(mouse: &crate::drivers::ps2_mouse::MouseState) {
+    let cwd = path::cwd();
+    let secs = crate::task::scheduler::ticks() / 100;
+    let left = format!("pagh OS   {}", cwd);
+    let right = format!("up {}s   mouse({},{})   type 'paint'", secs, mouse.x, mouse.y);
+    crate::drivers::framebuffer::draw_status_bar(&left, &right);
 }

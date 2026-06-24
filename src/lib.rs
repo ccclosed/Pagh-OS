@@ -6,6 +6,7 @@
 #![feature(abi_x86_interrupt)]
 #![feature(allocator_api)]
 #![feature(custom_test_frameworks)]
+#![feature(sync_unsafe_cell)]
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 

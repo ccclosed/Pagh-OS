@@ -42,12 +42,27 @@ use structs::{
 
 // ─── format layout constants (single block group) ───────────────────────────
 
-/// Total ext2 region blocks (host-visible). 256 * 4 KiB = 1 MiB.
-const FMT_BLOCKS: u32 = 256;
-/// Total inodes.
-const FMT_INODES: u32 = 128;
 /// Circular WAL log blocks (excludes the journal superblock).
 const FMT_LOG_BLOCKS: u64 = 64;
+
+/// FS blocks reserved at the device tail for the WAL journal: the journal
+/// superblock (1 block) plus the circular log.
+const JOURNAL_RESERVE_BLOCKS: u64 = FMT_LOG_BLOCKS + 1;
+
+/// Maximum blocks (and inodes) a single block group can describe with one
+/// 4096-byte bitmap block (`BS * 8 = 32768` bits). Clamping the derived counts
+/// to this bound keeps the single-group layout valid AND keeps every per-group
+/// on-disk `u16` count (`bg_free_blocks_count` / `bg_free_inodes_count`) within
+/// range, since `32768 < u16::MAX`.
+const MAX_GROUP_BLOCKS: u32 = (BS * 8) as u32;
+const MAX_GROUP_INODES: u32 = (BS * 8) as u32;
+
+/// Inode density: provision roughly one inode per this many bytes of capacity.
+const BYTES_PER_INODE: u64 = 16 * 1024;
+
+/// Floor on the inode count so even a tiny freshly-formatted FS keeps a few
+/// usable inodes beyond the reserved set (inodes `1..=EXT2_FIRST_INO-1`).
+const MIN_INODES: u32 = 32;
 
 const SUPERBLOCK_OFFSET: usize = 1024;
 
@@ -363,8 +378,48 @@ impl<'a> Tx<'a> {
 impl Ext2Fs {
     /// Produce a fresh, host-mountable ext2 image plus an empty WAL journal.
     pub fn format(dev: Arc<dyn BlockDevice>) -> Result<(), FsError> {
+        // ── Derive sizing from the real device capacity (R7.1) ──
+        // Device capacity in 4 KiB FS blocks.
+        let device_blocks = dev.sector_count() / SECTORS_PER_BLOCK;
+
+        // ── Minimum-capacity guard (R7.4) ──
+        // Reject a device that cannot hold the smallest valid ext2 layout plus
+        // the WAL journal BEFORE deriving sizing or writing anything, so a
+        // partially-written corrupt image is never produced. The minimum
+        // layout is the fixed metadata blocks (block 0 superblock, block 1
+        // group descriptor, block 2 block bitmap, block 3 inode bitmap), an
+        // inode table sized for MIN_INODES, the root directory block, at least
+        // one allocatable data block, plus the journal reserve at the tail.
+        let min_inode_table_blocks =
+            ((MIN_INODES as usize * INODE_SIZE) + BS - 1) / BS; // ceil
+        let min_ext2_blocks = 4u64                       // superblock + group desc + 2 bitmaps
+            + min_inode_table_blocks as u64              // inode table for MIN_INODES
+            + 1                                          // root directory block
+            + 1; // at least one allocatable data block
+        let min_layout_blocks = min_ext2_blocks + JOURNAL_RESERVE_BLOCKS;
+        if device_blocks < min_layout_blocks {
+            return Err(FsError::OutOfSpace);
+        }
+
+        // Reserve the WAL journal region (journal superblock + circular log) at
+        // the device tail; the ext2 region occupies the blocks before it.
+        let data_blocks = device_blocks.saturating_sub(JOURNAL_RESERVE_BLOCKS);
+
+        // Clamp the ext2 region to one block group (a single bitmap block) so
+        // every per-group on-disk count stays within its field range (R7.2).
+        let total_blocks_u64 = core::cmp::min(data_blocks, MAX_GROUP_BLOCKS as u64);
+        let total_blocks = total_blocks_u64 as u32;
+
+        // Scale the inode count from the data area (one inode per
+        // BYTES_PER_INODE), floored at MIN_INODES and clamped to the
+        // single-group bitmap capacity so `bg_free_inodes_count` (u16) fits.
+        let scaled_inodes = (total_blocks_u64 * BS as u64) / BYTES_PER_INODE;
+        let total_inodes = scaled_inodes
+            .max(MIN_INODES as u64)
+            .min(MAX_GROUP_INODES as u64) as u32;
+
         let inode_table_blocks =
-            ((FMT_INODES as usize * INODE_SIZE) + BS - 1) / BS; // ceil
+            ((total_inodes as usize * INODE_SIZE) + BS - 1) / BS; // ceil
         let block_bitmap_block = 2u32;
         let inode_bitmap_block = 3u32;
         let inode_table_start = 4u32;
@@ -373,20 +428,28 @@ impl Ext2Fs {
         // Blocks used by metadata + root dir: [0 .. root_dir_block].
         let used_blocks = root_dir_block + 1;
 
+        // Underflow safety net for the `total_blocks - used_blocks` free-count
+        // computation below. The up-front minimum-capacity guard (R7.4)
+        // already rejects devices too small to hold the layout; this retains a
+        // defensive check in case clamping leaves no allocatable data block.
+        if total_blocks <= used_blocks {
+            return Err(FsError::OutOfSpace);
+        }
+
         let reserved_inodes = EXT2_FIRST_INO - 1; // inodes 1..=10 marked used
 
         let sb = Ext2SuperBlock {
-            s_inodes_count: FMT_INODES,
-            s_blocks_count: FMT_BLOCKS,
+            s_inodes_count: total_inodes,
+            s_blocks_count: total_blocks,
             s_r_blocks_count: 0,
-            s_free_blocks_count: FMT_BLOCKS - used_blocks,
-            s_free_inodes_count: FMT_INODES - reserved_inodes,
+            s_free_blocks_count: total_blocks - used_blocks,
+            s_free_inodes_count: total_inodes - reserved_inodes,
             s_first_data_block: 0,
             s_log_block_size: 2,
             s_log_frag_size: 2,
-            s_blocks_per_group: FMT_BLOCKS,
-            s_frags_per_group: FMT_BLOCKS,
-            s_inodes_per_group: FMT_INODES,
+            s_blocks_per_group: total_blocks,
+            s_frags_per_group: total_blocks,
+            s_inodes_per_group: total_inodes,
             s_mtime: 0,
             s_wtime: 0,
             s_mnt_count: 0,
@@ -415,8 +478,10 @@ impl Ext2Fs {
             bg_block_bitmap: block_bitmap_block,
             bg_inode_bitmap: inode_bitmap_block,
             bg_inode_table: inode_table_start,
-            bg_free_blocks_count: (FMT_BLOCKS - used_blocks) as u16,
-            bg_free_inodes_count: (FMT_INODES - reserved_inodes) as u16,
+            // Single group: per-group totals equal the superblock totals. The
+            // MAX_GROUP_* clamp guarantees these `u16` casts never truncate.
+            bg_free_blocks_count: (total_blocks - used_blocks) as u16,
+            bg_free_inodes_count: (total_inodes - reserved_inodes) as u16,
             bg_used_dirs_count: 1, // root
             bg_pad: 0,
             bg_reserved: [0; 12],
@@ -424,7 +489,7 @@ impl Ext2Fs {
 
         // Zero the whole ext2 region first (clean bitmaps, inode table, data).
         let zero = vec![0u8; BS];
-        for b in 0..FMT_BLOCKS as u64 {
+        for b in 0..total_blocks as u64 {
             Self::write_fs_block_direct(&*dev, b, &zero)?;
         }
 

@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
+# `host-tests` is an isolated host crate for proptest-based property tests. It must
+# NOT be a member of the kernel workspace: the kernel builds for the bare-metal
+# target `x86_64-unknown-none.json` (see .cargo/config.toml), while host-tests builds
+# and runs on the native host. Excluding it lets host-tests carry its own config and
+# lockfile without affecting the kernel build.
+exclude = ["host-tests"]
 
 [lib]
 crate-type = ["staticlib"]
@@ -36,3 +42,12 @@ features = ["allocator_api"]
 version = "0.12"
 default-features = false
 features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4"]
+
+# Host-only property-testing dependency. Dev-dependencies are NEVER compiled by
+# `cargo build`, so this does not touch the no_std kernel build or the custom target.
+# proptest requires `std`; the kernel cannot be host-compiled, so the actual host
+# property tests live in the excluded `host-tests` crate (which has its own proptest
+# dev-dependency and host target). This entry documents the kernel's intended PBT
+# tool and keeps it pinned in the lockfile.
+[dev-dependencies]
+proptest = "1"

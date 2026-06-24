@@ -781,7 +781,7 @@ mod elf_tests {
     }
     pub fn valid() { assert_kernel!(ElfLoader::load(&make_elf(0x401000)).is_ok(), "valid elf"); }
     pub fn bad_magic() {
-        let mut d = alloc::vec![0u8; 64];
+        let d = alloc::vec![0u8; 64];
         assert_kernel!(ElfLoader::load(&d).is_err(), "no magic");
     }
     pub fn bad_arch() {
@@ -1571,6 +1571,11 @@ pub mod mock_block {
                 inner.data[start..end].copy_from_slice(buf);
             }
             Ok(buf.len())
+        }
+
+        /// Total addressable 512-byte sectors = backing byte length / 512.
+        fn sector_count(&self) -> u64 {
+            (self.inner.lock().data.len() / 512) as u64
         }
     }
 }

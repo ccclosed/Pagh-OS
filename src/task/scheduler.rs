@@ -4,18 +4,14 @@ use crate::memory::{pmm, vmm};
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::structures::paging::PageTableFlags;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskState { Ready, Running, Blocked, Dead }
-
 /// Task control block, reduced to exactly the state the RSP-based context
 /// switch restores from (Requirement 11.3). The vestigial `rip`/`rflags`/
 /// `regs`/signal fields were removed: the entry point and initial register
 /// values are encoded in the kernel stack frame `kernel_thread_spawn` builds,
-/// not stored here. With only `u64`/enum fields the `Tcb` is now `Copy`.
+/// not stored here. With only `u64` fields the `Tcb` is now `Copy`.
 #[derive(Debug, Clone, Copy)]
 pub struct Tcb {
     pub pid: u64,
-    pub state: TaskState,
     /// The only state the switch restores from: the saved kernel stack pointer.
     pub kernel_rsp: u64,
     /// Physical address of this task's PML4 (reloaded into CR3 on switch).
@@ -27,7 +23,7 @@ impl Tcb {
     /// is baked into the constructed kernel stack frame pointed to by
     /// `kernel_rsp` (see `kernel_thread_spawn`).
     pub fn new(pid: u64, kernel_rsp: u64, cr3: u64) -> Self {
-        Tcb { pid, state: TaskState::Ready, kernel_rsp, cr3 }
+        Tcb { pid, kernel_rsp, cr3 }
     }
 }
 
@@ -65,7 +61,6 @@ pub const IDLE_PID: u64 = 0;
 /// "idle task" concept has a single owner.
 static IDLE_TASK: Spinlock<Tcb> = Spinlock::new(Tcb {
     pid: IDLE_PID,
-    state: TaskState::Running,
     kernel_rsp: 0,
     cr3: 0,
 });
@@ -85,6 +80,20 @@ fn idle_rsp() -> u64 { IDLE_TASK.lock().kernel_rsp }
 pub fn init() { crate::debug!("Scheduler initialized (Round Robin)"); }
 pub fn tick() { TICK_COUNT.fetch_add(1, Ordering::Relaxed); }
 pub fn ticks() -> u64 { TICK_COUNT.load(Ordering::Relaxed) }
+
+/// Block the calling thread for approximately `n` timer ticks, halting between
+/// ticks instead of busy-spinning so other tasks (and the CPU) are not starved.
+///
+/// At the 100 Hz LAPIC timer this is ~`n * 10 ms`. Interrupts MUST be enabled
+/// on the caller (they are on the shell thread); otherwise the tick count never
+/// advances and this would block forever. The wait tolerates the (astronomical)
+/// tick-counter wraparound via `wrapping`/elapsed comparison.
+pub fn sleep_ticks(n: u64) {
+    let start = ticks();
+    while ticks().wrapping_sub(start) < n {
+        crate::arch::cpu::halt();
+    }
+}
 pub fn spawn(tcb: Tcb) -> u64 { let pid = tcb.pid; READY_QUEUE.lock().push_back(tcb); pid }
 pub fn schedule() -> Option<Tcb> { READY_QUEUE.lock().pop_front() }
 pub fn requeue(tcb: Tcb) { READY_QUEUE.lock().push_back(tcb); }
@@ -139,7 +148,7 @@ pub fn kernel_thread_spawn(entry: fn()) -> u64 {
         rsp -= 8; (rsp as *mut u64).write(0x202u64);    // [+144] RFLAGS (IF set)
         rsp -= 8; (rsp as *mut u64).write(kernel_cs);   // [+136] CS
 
-        let trampoline = crate::task::switch::kernel_thread_trampoline as u64;
+        let trampoline = crate::task::switch::kernel_thread_trampoline as *const () as u64;
         rsp -= 8; (rsp as *mut u64).write(trampoline);  // [+128] RIP -> trampoline
 
         // ── 15 GPR slots, written high→low to match the pop order ─────────
@@ -166,7 +175,6 @@ pub fn kernel_thread_spawn(entry: fn()) -> u64 {
 
         let tcb = Tcb {
             pid,
-            state: TaskState::Ready,
             kernel_rsp: rsp,
             cr3: vmm::current_pml4_phys(),
         };
@@ -204,7 +212,6 @@ pub extern "C" fn scheduler_tick_irq(current_rsp: u64) -> u64 {
     } else {
         requeue(Tcb {
             pid: cur,
-            state: TaskState::Ready,
             kernel_rsp: current_rsp,
             cr3: vmm::current_pml4_phys(),
         });
@@ -256,7 +263,6 @@ pub fn yield_current() {
 
     requeue(Tcb {
         pid: current_pid,
-        state: TaskState::Ready,
         kernel_rsp: old_rsp,
         cr3: current_cr3,
     });

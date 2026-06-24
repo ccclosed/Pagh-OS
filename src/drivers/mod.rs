@@ -3,6 +3,8 @@
 
 pub mod serial;
 pub mod ps2_kbd;
+pub mod ps2_mouse;
+pub mod cursor;
 pub mod framebuffer;
 pub mod pci;
 pub mod virtio;
@@ -16,14 +18,12 @@ use crate::sync::spinlock::Spinlock;
 /// safe to share across threads/IRQ context (interior-mutability behind a lock).
 pub trait Console: Send + Sync {
     fn write_str(&self, s: &str);
-    fn clear(&self);
 }
 
 /// Trait for character-device drivers (keyboard, serial, etc.).
 pub trait CharacterDevice: Send + Sync {
     fn name(&self) -> &str;
     fn read_char(&self) -> Option<u8>;
-    fn write_char(&self, c: u8);
 }
 
 /// Trait for block-device drivers (disk, etc.).
@@ -31,6 +31,14 @@ pub trait BlockDevice: Send + Sync {
     fn name(&self) -> &str;
     fn read_block(&self, block: u64, buf: &mut [u8]) -> Result<usize, ()>;
     fn write_block(&self, block: u64, buf: &[u8]) -> Result<usize, ()>;
+    /// Total addressable 512-byte sectors reported by the device.
+    ///
+    /// Default `0` means "unknown / not reported"; callers that size a layout
+    /// from capacity (e.g. `ext2::format`) must treat `0` as "no capacity
+    /// information available".
+    fn sector_count(&self) -> u64 {
+        0
+    }
 }
 
 /// Global device registry.
@@ -63,6 +71,12 @@ pub fn init() {
     crate::debug!("Initializing device manager...");
     ps2_kbd::init();
     framebuffer::init();
+    // The mouse needs the framebuffer dimensions for cursor clamping, so it is
+    // brought up after the framebuffer. Failure is non-fatal (no cursor).
+    let (w, h) = framebuffer::dimensions();
+    if w != 0 {
+        ps2_mouse::init(w, h);
+    }
     crate::info!("Device manager ready");
 }
 

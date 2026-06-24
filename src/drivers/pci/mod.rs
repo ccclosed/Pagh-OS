@@ -3,10 +3,14 @@
 //
 // Implements Component 1 of the networking-and-storage design: it walks the PCI
 // configuration space via the legacy I/O ports 0xCF8 (CONFIG_ADDRESS) and 0xCFC
-// (CONFIG_DATA), discovers present devices, decodes their BARs, and exposes
-// helpers used by `virtio-drivers` to attach (config read/write, bus-master
-// enable). Virtio devices are identified by PCI vendor id 0x1AF4; callers filter
-// on `vendor_id`.
+// (CONFIG_DATA), discovers present devices, and exposes helpers used by
+// `virtio-drivers` to attach (config read/write, bus-master enable). Virtio
+// devices are identified by PCI vendor id 0x1AF4; callers filter on `vendor_id`.
+//
+// Enumeration performs only pure configuration-space reads (vendor/device id,
+// class/subclass, header type). BAR size-probing is intentionally NOT performed:
+// `virtio-drivers` discovers and maps device BARs through its own PCI transport,
+// so decoding them here produced unused, side-effecting config-space writes.
 
 use alloc::vec::Vec;
 use x86_64::instructions::port::Port;
@@ -27,18 +31,6 @@ pub struct PciAddress {
     pub function: u8,
 }
 
-/// A discovered PCI base address register.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Bar {
-    /// Unused / unimplemented BAR slot (also used for the high half consumed by
-    /// a preceding 64-bit memory BAR).
-    None,
-    /// Memory-mapped BAR.
-    Memory { base: u64, size: u64, prefetchable: bool },
-    /// Port-I/O BAR.
-    Io { base: u32, size: u32 },
-}
-
 /// A present PCI device (one function).
 #[derive(Debug, Clone)]
 pub struct PciDevice {
@@ -47,8 +39,6 @@ pub struct PciDevice {
     pub device_id: u16,
     pub class: u8,
     pub subclass: u8,
-    pub bars: [Bar; 6],
-    pub interrupt_line: u8,
 }
 
 impl PciDevice {
@@ -111,89 +101,6 @@ pub fn enable_bus_master(addr: PciAddress) {
     config_write_u32(addr, 0x04, new);
 }
 
-/// Probe a single BAR slot. Returns the decoded `Bar` and whether it consumed
-/// the following BAR slot as the high 32 bits of a 64-bit memory BAR.
-fn read_bar(addr: PciAddress, index: u8) -> (Bar, bool) {
-    let offset = 0x10 + index * 4;
-    let original = config_read_u32(addr, offset);
-
-    // Size probe: write all-ones, read back the mask, then restore the original
-    // value. The device clears the bits it does not decode; size is the value of
-    // the lowest set bit of the writable mask.
-    config_write_u32(addr, offset, 0xFFFF_FFFF);
-    let probe = config_read_u32(addr, offset);
-    config_write_u32(addr, offset, original);
-
-    if original & 0x1 != 0 {
-        // I/O space BAR.
-        let base = original & 0xFFFF_FFFC;
-        let mask = probe & 0xFFFF_FFFC;
-        let size = if mask == 0 { 0 } else { (!mask).wrapping_add(1) };
-        if base == 0 && size == 0 {
-            (Bar::None, false)
-        } else {
-            (Bar::Io { base, size }, false)
-        }
-    } else {
-        // Memory space BAR.
-        let prefetchable = original & 0x8 != 0;
-        let bar_type = (original >> 1) & 0x3;
-        let base_low = (original & 0xFFFF_FFF0) as u64;
-        let mask_low = (probe & 0xFFFF_FFF0) as u64;
-
-        if bar_type == 0x2 {
-            // 64-bit memory BAR: the next slot holds the high 32 bits.
-            let high_offset = offset + 4;
-            let high_original = config_read_u32(addr, high_offset);
-            config_write_u32(addr, high_offset, 0xFFFF_FFFF);
-            let high_probe = config_read_u32(addr, high_offset);
-            config_write_u32(addr, high_offset, high_original);
-
-            let base = (high_original as u64) << 32 | base_low;
-            let full_mask = ((high_probe as u64) << 32) | mask_low;
-            let size = if full_mask == 0 { 0 } else { (!full_mask).wrapping_add(1) };
-            if base == 0 && size == 0 {
-                (Bar::None, true)
-            } else {
-                (Bar::Memory { base, size, prefetchable }, true)
-            }
-        } else {
-            // 32-bit (or legacy below-1MiB) memory BAR.
-            let base = base_low;
-            let size = if mask_low == 0 {
-                0
-            } else {
-                (!(mask_low | 0xFFFF_FFFF_0000_0000)).wrapping_add(1)
-            };
-            if base == 0 && size == 0 {
-                (Bar::None, false)
-            } else {
-                (Bar::Memory { base, size, prefetchable }, false)
-            }
-        }
-    }
-}
-
-/// Read and decode all six BARs of a device function.
-fn read_bars(addr: PciAddress) -> [Bar; 6] {
-    let mut bars = [Bar::None; 6];
-    let mut i = 0u8;
-    while i < 6 {
-        let (bar, consumed_next) = read_bar(addr, i);
-        bars[i as usize] = bar;
-        if consumed_next {
-            // The following slot is the high half of this 64-bit BAR.
-            if (i + 1) < 6 {
-                bars[(i + 1) as usize] = Bar::None;
-            }
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    bars
-}
-
 /// Read the full descriptor for a present function at `addr`.
 fn read_device(addr: PciAddress, id0: u32) -> PciDevice {
     let vendor_id = (id0 & 0xFFFF) as u16;
@@ -204,18 +111,12 @@ fn read_device(addr: PciAddress, id0: u32) -> PciDevice {
     let subclass = ((class_reg >> 16) & 0xFF) as u8;
     let class = ((class_reg >> 24) & 0xFF) as u8;
 
-    // Offset 0x3C: interrupt line (7..0), interrupt pin (15..8).
-    let int_reg = config_read_u32(addr, 0x3C);
-    let interrupt_line = (int_reg & 0xFF) as u8;
-
     PciDevice {
         address: addr,
         vendor_id,
         device_id,
         class,
         subclass,
-        bars: read_bars(addr),
-        interrupt_line,
     }
 }
 

@@ -4,51 +4,86 @@
 use core::arch::asm;
 
 /// Cooperative context switch for an *already-running* thread (the
-/// `yield_current` path). Saves the current thread's GPRs + RFLAGS and restores
-/// the next thread's, using the SAME GPR + RFLAGS save/restore order as the
-/// preemptive `irq32_stub` (rax..r15 push / popfq + r15..rax pop). The two paths
-/// therefore share a single register save/restore layout (Requirement 11.2).
+/// `yield_current` path).
 ///
-/// Note on tail handling: this cooperative path ends in `ret` (it returns to the
-/// caller of `switch_context`), whereas the preemptive path ends in `iretq`.
-/// Freshly-spawned kernel threads are entered EXCLUSIVELY via the preemptive
-/// iretq path (`scheduler_tick_irq` -> `irq32_stub`), whose initial frame is
-/// built by `kernel_thread_spawn`; `switch_context` is only ever used to switch
-/// between threads that are already mid-execution (i.e. were previously saved by
-/// one of these two paths), so the differing tail is safe.
+/// # Single saved-frame invariant (Requirement 5.1)
+///
+/// All three context paths — `kernel_thread_spawn` (initial frame),
+/// `switch_context` (this cooperative/yield path), and `irq32_stub` (the
+/// preemptive/tick path) — produce and consume **one** saved-frame layout, so a
+/// task suspended by ANY path can be resumed by ANY path with its exact
+/// instruction pointer and stack pointer intact (Requirements 5.2, 5.3, 5.4).
+///
+/// Saved frame, low → high address (identical to what the timer IRQ leaves):
+/// ```text
+///   [rsp+0]    RFLAGS (for popfq)
+///   [+8..+120] r15,r14,r13,r12,r11,r10,r9,r8,rbp,rdi,rsi,rdx,rcx,rbx,rax
+///   [+128]     RIP        (resume point)
+///   [+136]     CS         (kernel code selector)
+///   [+144]     RFLAGS     (for iretq)
+///   [+152]     RSP        (stack pointer to continue on after resume)
+///   [+160]     SS         (kernel data selector)
+/// ```
+///
+/// To match `irq32_stub` (whose iretq frame is pushed by the CPU on the timer
+/// interrupt), the SAVE side here *synthesizes* the same iretq frame in
+/// software: RIP = a resume label inside this function, CS = kernel CS,
+/// RSP = the stack pointer at function entry (so execution continues exactly as
+/// if `switch_context` had returned normally), SS = kernel SS. The RESTORE side
+/// is then byte-for-byte identical to `irq32_stub`'s tail:
+/// `mov rsp, new_rsp; popfq; pop r15..rax; iretq`.
+///
+/// Unlike the previous implementation, this path does NOT end in `ret`: it ends
+/// in `iretq`, consuming the full 5-word `[RIP,CS,RFLAGS,RSP,SS]` tail, so the
+/// yield and tick paths are interchangeable.
 pub unsafe fn switch_context(old_rsp: &mut u64, new_rsp: u64, new_cr3: Option<u64>) {
     if let Some(cr3) = new_cr3 {
         asm!("mov cr3, {}", in(reg) cr3, options(nostack));
     }
+
+    // Kernel selectors for the synthesized iretq frame. Same values the CPU
+    // pushes on a same-privilege interrupt and the same ones `kernel_thread_spawn`
+    // bakes into a fresh thread's initial frame.
+    let kernel_cs = crate::arch::x86_64::gdt::Selectors::kernel_code().0 as u64;
+    let kernel_ss = crate::arch::x86_64::gdt::Selectors::kernel_data().0 as u64;
+
     asm!(
+        // ── Synthesize the iretq frame (high → low): SS, RSP, RFLAGS, CS, RIP.
+        // `{scratch}` first captures the entry RSP, which becomes the iretq RSP
+        // slot so that after resume RSP == entry RSP and the Rust epilogue/`ret`
+        // returns to `yield_current` normally.
+        "mov {scratch}, rsp",
+        "push {kss}",            // [+160] SS
+        "push {scratch}",        // [+152] RSP  = entry RSP
+        "pushfq",                // [+144] RFLAGS (for iretq)
+        "push {kcs}",            // [+136] CS
+        "lea {scratch}, [rip + 2f]",
+        "push {scratch}",        // [+128] RIP  = resume label below
+        // ── 15 GPRs, rax first … r15 last (mirror of the restore pops) ──────
         "push rax", "push rbx", "push rcx", "push rdx",
         "push rsi", "push rdi", "push rbp",
         "push r8", "push r9", "push r10", "push r11",
         "push r12", "push r13", "push r14", "push r15",
-        "pushfq",
-        "mov [{}], rsp", "mov rsp, {}",
+        "pushfq",                // [+0] RFLAGS (for popfq) = lowest = saved RSP
+        // ── Save this task's RSP, switch to the next task's RSP ─────────────
+        "mov [{old}], rsp",
+        "mov rsp, {new}",
+        // ── Restore: identical to irq32_stub's tail ─────────────────────────
         "popfq",
         "pop r15", "pop r14", "pop r13", "pop r12",
         "pop r11", "pop r10", "pop r9", "pop r8",
         "pop rbp", "pop rdi", "pop rsi", "pop rdx",
         "pop rcx", "pop rbx", "pop rax",
-        in(reg) old_rsp, in(reg) new_rsp,
-        options(nostack, preserves_flags),
-    );
-}
-
-pub unsafe fn jump_to_user(entry: u64, user_stack: u64, code_sel: u16, data_sel: u16) -> ! {
-    asm!(
-        "mov ds, {data_sel:x}", "mov es, {data_sel:x}",
-        "mov fs, {data_sel:x}", "mov gs, {data_sel:x}",
-        "push {data_sel}", "push {user_stack}",
-        "push 0x3202", "push {code_sel}", "push {entry}",
         "iretq",
-        data_sel = in(reg) data_sel as u64,
-        user_stack = in(reg) user_stack,
-        code_sel = in(reg) code_sel as u64,
-        entry = in(reg) entry,
-        options(noreturn, nostack),
+        // Resume point: a task saved by this (or any) path lands here via iretq
+        // with RSP restored to its entry value; control then leaves the asm
+        // block and the function returns to its caller.
+        "2:",
+        old = in(reg) old_rsp,
+        new = in(reg) new_rsp,
+        kcs = in(reg) kernel_cs,
+        kss = in(reg) kernel_ss,
+        scratch = out(reg) _,
     );
 }
 
@@ -56,6 +91,10 @@ pub unsafe fn jump_to_user(entry: u64, user_stack: u64, code_sel: u16, data_sel:
 
 extern "C" {
     pub fn kernel_thread_trampoline() -> !;
+    // retained: not called from Rust — referenced by name from the
+    // `kernel_thread_trampoline` global_asm block (`jmp scheduler_exit_thread`).
+    // The extern decl keeps the symbol in scope for the inline asm linkage.
+    #[allow(dead_code)]
     fn scheduler_exit_thread() -> !;
 }
 
@@ -84,6 +123,10 @@ core::arch::global_asm!(
 
 extern "C" {
     pub fn irq32_stub();
+    // retained: not called from Rust — invoked from the `irq32_stub` global_asm
+    // block (`call scheduler_tick_irq`) which computes the next task's RSP.
+    // The extern decl keeps the symbol in scope for the inline asm linkage.
+    #[allow(dead_code)]
     fn scheduler_tick_irq(current_rsp: u64) -> u64;
 }
 

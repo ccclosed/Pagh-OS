@@ -40,7 +40,7 @@ impl<T> Spinlock<T> {
     ///
     /// Spins until the lock is available. Returns a guard that
     /// automatically releases the lock and restores the interrupt state.
-    pub fn lock(&self) -> SpinlockGuard<T> {
+    pub fn lock(&self) -> SpinlockGuard<'_, T> {
         let were_enabled = crate::arch::cpu::interrupts_enabled();
         // Disabling interrupts prevents deadlocks when an interrupt handler
         // tries to acquire the same lock on this CPU.
@@ -61,7 +61,7 @@ impl<T> Spinlock<T> {
     }
 
     /// Try to acquire the spinlock without blocking.
-    pub fn try_lock(&self) -> Option<SpinlockGuard<T>> {
+    pub fn try_lock(&self) -> Option<SpinlockGuard<'_, T>> {
         let were_enabled = crate::arch::cpu::interrupts_enabled();
         // See lock() rationale.
         crate::arch::cpu::disable_interrupts();

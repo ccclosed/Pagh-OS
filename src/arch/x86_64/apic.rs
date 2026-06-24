@@ -2,15 +2,14 @@
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
 use core::ptr;
+use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::port::Port;
 use crate::sync::spinlock::Spinlock;
 
-const LAPIC_ID: u32        = 0x020;
 const LAPIC_EOI: u32       = 0x0B0;
 const LAPIC_SPURIOUS: u32  = 0x0F0;
 const LAPIC_LVT_TIMER: u32 = 0x320;
 const LAPIC_TIMER_INIT: u32  = 0x380;
-const LAPIC_TIMER_CURRENT: u32 = 0x390;
 const LAPIC_TIMER_DIV: u32    = 0x3E0;
 
 const SPURIOUS_ENABLE: u32 = 0x100;
@@ -20,8 +19,8 @@ const IOAPIC_REG_SEL: u32   = 0x00;
 const IOAPIC_REG_WIN: u32   = 0x10;
 const IOAPIC_REDTBL_BASE: u32 = 0x10;
 
-static mut LAPIC_BASE: u64 = 0;
-static mut IOAPIC_BASE: u64 = 0;
+static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
+static IOAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 
 static IRQ_HANDLERS: Spinlock<[Option<fn()>; 224]> = Spinlock::new([None; 224]);
 
@@ -49,28 +48,42 @@ fn disable_pic() {
 
 unsafe fn lapic_write(reg: u32, value: u32) {
     // LAPIC_BASE is already mapped to HHDM in lib.rs, so we don't add HHDM again
-    let addr = (LAPIC_BASE + reg as u64) as *mut u32;
+    let addr = (LAPIC_BASE.load(Ordering::Relaxed) + reg as u64) as *mut u32;
+    // SAFETY: LAPIC_BASE holds the HHDM-mapped LAPIC MMIO virtual base, set once
+    // in `init` before any register access; `addr` is therefore a valid mapped
+    // device-memory location and the volatile write targets a real LAPIC register.
     ptr::write_volatile(addr, value);
 }
 
 unsafe fn lapic_read(reg: u32) -> u32 {
     // LAPIC_BASE is already mapped to HHDM in lib.rs, so we don't add HHDM again
-    let addr = (LAPIC_BASE + reg as u64) as *const u32;
+    let addr = (LAPIC_BASE.load(Ordering::Relaxed) + reg as u64) as *const u32;
+    // SAFETY: LAPIC_BASE holds the HHDM-mapped LAPIC MMIO virtual base, set once
+    // in `init` before any register access; `addr` is therefore a valid mapped
+    // device-memory location and the volatile read targets a real LAPIC register.
     ptr::read_volatile(addr)
 }
 
 unsafe fn ioapic_write(reg: u32, value: u32) {
     // IOAPIC_BASE should be virtual (HHDM-mapped) if non-zero
-    let sel = (IOAPIC_BASE + IOAPIC_REG_SEL as u64) as *mut u32;
-    let win = (IOAPIC_BASE + IOAPIC_REG_WIN as u64) as *mut u32;
+    let base = IOAPIC_BASE.load(Ordering::Relaxed);
+    let sel = (base + IOAPIC_REG_SEL as u64) as *mut u32;
+    let win = (base + IOAPIC_REG_WIN as u64) as *mut u32;
+    // SAFETY: callers only invoke this once IOAPIC_BASE is set to the non-zero
+    // HHDM-mapped I/O APIC MMIO base; `sel`/`win` therefore point at the valid
+    // mapped index/data register pair and the volatile writes target real registers.
     ptr::write_volatile(sel, reg);
     ptr::write_volatile(win, value);
 }
 
 unsafe fn ioapic_read(reg: u32) -> u32 {
     // IOAPIC_BASE should be virtual (HHDM-mapped) if non-zero
-    let sel = (IOAPIC_BASE + IOAPIC_REG_SEL as u64) as *mut u32;
-    let win = (IOAPIC_BASE + IOAPIC_REG_WIN as u64) as *mut u32;
+    let base = IOAPIC_BASE.load(Ordering::Relaxed);
+    let sel = (base + IOAPIC_REG_SEL as u64) as *mut u32;
+    let win = (base + IOAPIC_REG_WIN as u64) as *mut u32;
+    // SAFETY: callers only invoke this once IOAPIC_BASE is set to the non-zero
+    // HHDM-mapped I/O APIC MMIO base; `sel`/`win` therefore point at the valid
+    // mapped index/data register pair and the volatile accesses target real registers.
     ptr::write_volatile(sel, reg);
     ptr::read_volatile(win)
 }
@@ -123,7 +136,9 @@ fn init_lapic() {
 }
 
 fn init_ioapic() {
-    if unsafe { IOAPIC_BASE } == 0 { return; }
+    if IOAPIC_BASE.load(Ordering::Relaxed) == 0 { return; }
+    // SAFETY: IOAPIC_BASE is non-zero here, so it holds the HHDM-mapped I/O APIC
+    // MMIO base; the ioapic_read/write helpers access only valid mapped registers.
     unsafe {
         let ver = ioapic_read(0x01);
         let max_redir = ((ver >> 16) & 0xFF) + 1;
@@ -154,13 +169,11 @@ pub fn init() {
     } else {
         0
     };
-    unsafe {
-        LAPIC_BASE = lapic_virt;
-        IOAPIC_BASE = ioapic_virt;
-    }
+    LAPIC_BASE.store(lapic_virt, Ordering::Relaxed);
+    IOAPIC_BASE.store(ioapic_virt, Ordering::Relaxed);
 
     crate::debug!("LAPIC virt=0x{:x}, IOAPIC virt=0x{:x}", 
-        unsafe { LAPIC_BASE }, unsafe { IOAPIC_BASE });
+        LAPIC_BASE.load(Ordering::Relaxed), IOAPIC_BASE.load(Ordering::Relaxed));
     
     init_lapic();
     init_ioapic();
@@ -181,21 +194,10 @@ pub fn send_eoi() {
     unsafe { lapic_write(LAPIC_EOI, 0); }
 }
 
-static mut TIMER_HANDLER: Option<fn()> = None;
-
-pub fn set_timer_handler(handler: fn()) {
-    unsafe { TIMER_HANDLER = Some(handler); }
-    crate::debug!("Timer handler registered");
-}
-
-pub fn timer_tick() {
-    unsafe {
-        if let Some(h) = TIMER_HANDLER { h(); }
-    }
-}
-
 pub fn route_irq(isa_irq: u8, vector: u8) {
-    if unsafe { IOAPIC_BASE } == 0 { return; }
+    if IOAPIC_BASE.load(Ordering::Relaxed) == 0 { return; }
+    // SAFETY: IOAPIC_BASE is non-zero here, so it holds the HHDM-mapped I/O APIC
+    // MMIO base; ioapic_write only touches the valid mapped redirection registers.
     unsafe {
         let reg = IOAPIC_REDTBL_BASE + (isa_irq as u32) * 2;
         ioapic_write(reg, vector as u32);

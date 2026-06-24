@@ -18,10 +18,6 @@ pub enum VmError {
     OutOfMemory,
     /// An entry along the page-table walk was not present.
     NotMapped,
-    /// The target virtual page was already mapped.
-    AlreadyMapped,
-    /// The supplied address was malformed (e.g. non-canonical).
-    BadAddress,
 }
 
 impl core::fmt::Display for VmError {
@@ -29,8 +25,6 @@ impl core::fmt::Display for VmError {
         let s = match self {
             VmError::OutOfMemory => "out of memory",
             VmError::NotMapped => "not mapped",
-            VmError::AlreadyMapped => "already mapped",
-            VmError::BadAddress => "bad address",
         };
         f.write_str(s)
     }
@@ -353,30 +347,4 @@ pub fn map_mmio(phys: u64, len: u64) -> Result<u64, VmError> {
     }
 
     Ok(phys_to_virt(phys))
-}
-
-/// Identity-style map every 4 KiB frame in `[phys_start, phys_end)` to its HHDM
-/// virtual address (`virt = phys_to_virt(phys)`) with the supplied `flags`.
-///
-/// `phys_start` is rounded down and `phys_end` rounded up to page boundaries so
-/// the entire requested physical range is covered. This is the general helper
-/// the old inline VGA/BIOS identity-mapping loops would have used; those regions
-/// were removed in task 1, but the helper is retained for reuse.
-pub fn identity_map_range(
-    phys_start: u64,
-    phys_end: u64,
-    flags: PageTableFlags,
-) -> Result<(), VmError> {
-    let page_size = 4096u64;
-
-    let start = phys_start & !(page_size - 1);
-    let end = (phys_end + (page_size - 1)) & !(page_size - 1);
-
-    let mut p = start;
-    while p < end {
-        map(p, phys_to_virt(p), flags)?;
-        p += page_size;
-    }
-
-    Ok(())
 }

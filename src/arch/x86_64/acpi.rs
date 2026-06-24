@@ -33,6 +33,11 @@ use crate::sync::spinlock::Spinlock;
 pub struct ApicAddrs {
     pub lapic_phys: u64,
     pub ioapic_phys: u64,
+    // retained: part of the deliberately-complete ApicAddrs taxonomy mandated by
+    // ACPI Requirement 6.1 (obtain the LAPIC base, I/O APIC base, AND the global
+    // system interrupt base). Parsed from the MADT and kept for future I/O APIC
+    // GSI routing; no consumer reads it yet.
+    #[allow(dead_code)]
     pub gsi_base: u32,
 }
 

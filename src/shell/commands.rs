@@ -583,3 +583,186 @@ fn fscrash_demo() {
         Err(e) => shell_println(&alloc::format!("fscrash: FAIL — read-back error: {:?}", e)),
     }
 }
+
+/// Copy all bytes from `src` to `dst` in chunks, capping total bytes so an
+/// endless device cannot spin forever. Returns the number of bytes copied.
+fn copy_bytes(
+    src: &alloc::sync::Arc<dyn crate::vfs::VfsNode>,
+    dst: &alloc::sync::Arc<dyn crate::vfs::VfsNode>,
+) -> Result<u64, crate::vfs::VfsError> {
+    const MAX_BYTES: u64 = 16 * 1024 * 1024;
+    let mut buf = [0u8; 512];
+    let mut offset: u64 = 0;
+    loop {
+        if offset >= MAX_BYTES {
+            break;
+        }
+        let n = src.read(offset, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        dst.write(offset, &buf[..n])?;
+        offset += n as u64;
+    }
+    dst.sync();
+    Ok(offset)
+}
+
+/// `cp <src> <dst>`: copy a file. If `dst` is an existing directory, the source
+/// file is copied into it under its original name.
+pub(super) fn cmd_cp(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.len() < 2 {
+        shell_println("cp: usage: cp <src> <dst>");
+        return;
+    }
+    let src = resolve_arg(args[0]);
+    let dst = resolve_arg(args[1]);
+
+    let src_node = match crate::vfs::lookup_path(&src) {
+        Ok(n) => n,
+        Err(_) => {
+            shell_println(&alloc::format!("cp: {}: not found", src));
+            return;
+        }
+    };
+    if src_node.is_directory() {
+        shell_println(&alloc::format!("cp: {}: is a directory (not copied)", src));
+        return;
+    }
+
+    // Resolve the destination: into a directory (keep the source leaf name) or
+    // to an explicit file path (create in its parent if needed).
+    let dst_node = match crate::vfs::lookup_path(&dst) {
+        Ok(node) if node.is_directory() => {
+            let leaf = match split_path(&src) {
+                Some((_, l)) => l,
+                None => {
+                    shell_println("cp: invalid source path");
+                    return;
+                }
+            };
+            match node.create_file(leaf) {
+                Ok(n) => n,
+                Err(crate::vfs::VfsError::AlreadyExists) => match node.lookup(leaf) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        shell_println(&alloc::format!("cp: {}: {:?}", dst, e));
+                        return;
+                    }
+                },
+                Err(e) => {
+                    shell_println(&alloc::format!("cp: {}: {:?}", dst, e));
+                    return;
+                }
+            }
+        }
+        Ok(node) => node, // overwrite existing file
+        Err(_) => match split_path(&dst) {
+            Some((parent, leaf)) => match crate::vfs::lookup_path(parent) {
+                Ok(dir) => match dir.create_file(leaf) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        shell_println(&alloc::format!("cp: {}: {:?}", dst, e));
+                        return;
+                    }
+                },
+                Err(_) => {
+                    shell_println(&alloc::format!("cp: {}: parent not found", dst));
+                    return;
+                }
+            },
+            None => {
+                shell_println(&alloc::format!("cp: {}: invalid path", dst));
+                return;
+            }
+        },
+    };
+
+    match copy_bytes(&src_node, &dst_node) {
+        Ok(n) => shell_println(&alloc::format!("cp: copied {} bytes", n)),
+        Err(e) => shell_println(&alloc::format!("cp: copy failed: {:?}", e)),
+    }
+}
+
+/// `mv <src> <dst>`: move/rename a file (copy then remove the source).
+pub(super) fn cmd_mv(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.len() < 2 {
+        shell_println("mv: usage: mv <src> <dst>");
+        return;
+    }
+    let src = resolve_arg(args[0]);
+
+    let src_node = match crate::vfs::lookup_path(&src) {
+        Ok(n) => n,
+        Err(_) => {
+            shell_println(&alloc::format!("mv: {}: not found", src));
+            return;
+        }
+    };
+    if src_node.is_directory() {
+        shell_println(&alloc::format!("mv: {}: is a directory (not moved)", src));
+        return;
+    }
+
+    // Reuse cp for the copy half, then unlink the source.
+    cmd_cp(_ctx, args);
+
+    match split_path(&src) {
+        Some((parent, leaf)) => match crate::vfs::lookup_path(parent) {
+            Ok(dir) => {
+                if let Err(e) = dir.remove(leaf) {
+                    shell_println(&alloc::format!("mv: remove {}: {:?}", src, e));
+                }
+            }
+            Err(_) => shell_println(&alloc::format!("mv: {}: parent not found", src)),
+        },
+        None => shell_println(&alloc::format!("mv: {}: invalid path", src)),
+    }
+}
+
+/// `stat <path>`: print a file/directory's name, type, and size.
+pub(super) fn cmd_stat(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.is_empty() {
+        shell_println("stat: missing operand");
+        return;
+    }
+    let path = resolve_arg(args[0]);
+    match crate::vfs::lookup_path(&path) {
+        Ok(node) => {
+            let kind = if node.is_directory() { "directory" } else { "file" };
+            shell_println(&alloc::format!("  path: {}", path));
+            shell_println(&alloc::format!("  name: {}", node.name()));
+            shell_println(&alloc::format!("  type: {}", kind));
+            shell_println(&alloc::format!("  size: {} bytes", node.size()));
+            if node.is_directory() {
+                if let Ok(children) = node.readdir() {
+                    shell_println(&alloc::format!("  entries: {}", children.len()));
+                }
+            }
+        }
+        Err(_) => shell_println(&alloc::format!("stat: {}: not found", path)),
+    }
+}
+
+/// `sleep <seconds>`: block the shell for the given whole number of seconds,
+/// halting between timer ticks instead of busy-spinning.
+pub(super) fn cmd_sleep(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.is_empty() {
+        shell_println("sleep: usage: sleep <seconds>");
+        return;
+    }
+    match args[0].parse::<u64>() {
+        Ok(secs) => crate::task::scheduler::sleep_ticks(secs * 100),
+        Err(_) => shell_println(&alloc::format!("sleep: invalid number '{}'", args[0])),
+    }
+}
+
+/// `paint`: launch the framebuffer drawing application (mouse + keyboard).
+pub(super) fn cmd_paint(_ctx: &mut ShellCtx, _args: &[&str]) {
+    crate::kprintln!("paint: launching... (Esc or 'q' to quit)");
+    crate::kprintln!(
+        "paint keys: p=pencil e=eraser l=line r=rect f=fillrect c=circle d=disc b=bucket i=picker"
+    );
+    crate::kprintln!("paint keys: 1-0=color [ ]=brush u=undo x=clear s=save g=load q=quit");
+    super::paint::run();
+}

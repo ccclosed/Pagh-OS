@@ -13,7 +13,6 @@ pub type VfsResult<T> = Result<T, VfsError>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsError {
     NotFound,
-    PermissionDenied,
     NotSupported,
     InvalidArgument,
     IoError,
@@ -86,9 +85,12 @@ impl VfsNode for SerialDevice {
     }
 
     fn write(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
-        for &byte in buf {
-            crate::drivers::serial::_kprint(core::format_args!("{}", byte as char));
-        }
+        // Emit each byte verbatim over COM1. The previous implementation routed
+        // bytes through `format_args!("{}", byte as char)`, which UTF-8-encodes
+        // any byte >= 0x80 into two bytes and corrupts binary/non-ASCII data.
+        // The byte-level API transmits every byte unchanged (R8.1, R8.2) and the
+        // write always succeeds, so we return the full input length (R8.3).
+        crate::drivers::serial::write_bytes(buf);
         Ok(buf.len())
     }
 }
@@ -234,13 +236,6 @@ pub fn mount_at(path: &str, node: Arc<dyn VfsNode>) -> VfsResult<()> {
 }
 
 // ─── Path resolution ──────────────────────────────────────────────────────
-
-/// Returns a clone of the VFS root node, or `None` if the VFS is uninitialized.
-///
-/// Useful for the shell to list `/` directly.
-pub fn root() -> Option<Arc<dyn VfsNode>> {
-    VFS_ROOT.lock().clone()
-}
 
 /// Resolves an absolute path from the VFS root to a node.
 ///
