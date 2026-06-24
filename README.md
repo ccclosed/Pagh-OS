@@ -1,4 +1,19 @@
-# pagh
+<h1 align="center">pagh</h1>
+
+<p align="center">
+  A small 64-bit OS kernel in Rust — ext2 + WAL journaling, a TCP/IP stack,
+  a framebuffer GUI, and a mouse-driven paint app, booting on real UEFI via Limine.
+</p>
+
+<p align="center">
+  <img alt="Language: Rust" src="https://img.shields.io/badge/language-Rust-orange.svg">
+  <img alt="Target: x86_64" src="https://img.shields.io/badge/target-x86__64-blue.svg">
+  <img alt="no_std" src="https://img.shields.io/badge/%23!%5Bno__std%5D-yes-informational.svg">
+  <img alt="Bootloader: Limine" src="https://img.shields.io/badge/boot-Limine-purple.svg">
+  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green.svg">
+</p>
+
+---
 
 A small 64-bit operating system kernel written in Rust (`#![no_std]`), booted via the
 [Limine](https://github.com/limine-bootloader/limine) boot protocol on x86_64 and run
@@ -14,6 +29,22 @@ and colored output. It can load and run an embedded test program in ring 3, and 
 full-screen mouse-driven `paint` application.
 
 > Hobby/educational kernel. There is no security model beyond ring 0/3 paging.
+
+---
+
+## Screenshots
+
+<!--
+Add a few images/GIFs here — they do the most to attract interest. Suggestions:
+  - the boot log + shell prompt on serial/framebuffer
+  - the `paint` app in action (a short GIF is ideal)
+  - `ls`/`cat`/`ifconfig` output in the colored shell
+Drop files in a `docs/` or `assets/` folder and reference them:
+  ![pagh shell](docs/shell.png)
+  ![paint app](docs/paint.gif)
+-->
+
+_Coming soon — drop boot/shell/paint screenshots here._
 
 ---
 
@@ -416,3 +447,23 @@ Generated, large, or environment-specific files are git-ignored (see `.gitignore
 
 `OVMF.fd` and `limine-12.3.1/` are kept on disk but ignored — they are downloaded
 locally and required by `run.cmd`. `disk.img` is created automatically on first run.
+
+---
+
+## Contributing
+
+Contributions are welcome. Please read the contributing guide before opening a PR — it
+covers the toolchain setup, the build/run pipeline, the two-tier test story (in-QEMU
+`selftest` + host `proptest`), and the build invariants that must be preserved:
+
+- [`CONTRIBUTING.en.md`](CONTRIBUTING.en.md) (English)
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) (Русский)
+
+Bug reports and feature requests use the issue templates under
+[`.github/ISSUE_TEMPLATE`](.github/ISSUE_TEMPLATE); pull requests get a checklist from
+[`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md).
+
+## License
+
+Licensed under the [MIT License](LICENSE).
+
