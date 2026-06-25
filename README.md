@@ -26,7 +26,10 @@ loader, a preemptive round-robin scheduler, a `SYSCALL`/`int 0x80` interface, PC
 enumeration with virtio drivers, a TCP/IP network stack, a journaled ext2 filesystem on a
 real disk, and a friendly interactive shell with line editing, history, tab completion,
 and colored output. It can load and run an embedded test program in ring 3, and ships a
-full-screen mouse-driven `paint` application.
+full-screen mouse-driven `paint` application. It also runs **statically-linked Linux
+x86_64 ELF binaries** in ring 3 through a Linux syscall-compatibility layer, and includes
+an **`apt`-style package manager** that fetches and installs Debian `.deb` packages by
+name over HTTP/HTTPS.
 
 > Hobby/educational kernel. There is no security model beyond ring 0/3 paging.
 
@@ -66,6 +69,12 @@ _Coming soon — drop boot/shell/paint screenshots here._
 - **Shell:** line editing (arrows/Home/End/Delete/insert), command history, tab
   completion, `cd`/`pwd` with relative paths, file ops (`cp`/`mv`/`stat`), colored
   prompt/errors, typo suggestions, a registry-driven `help`, and a `paint` app.
+- **Linux binaries:** a Linux x86_64 syscall layer (`int 0x80` + `syscall`) and an ELF
+  loader for static `ET_EXEC` / static-PIE images run statically-linked Linux programs in
+  ring 3 (`lxrun`). Dynamic linking, threads/`fork`, and GUI stacks are out of scope.
+- **Packages:** a by-name `apt` (`update`/`install`/`show`/`list`/`setmirror`) that fetches
+  a Debian `Packages` index over HTTP/HTTPS, streams gzip/xz/zstd decompression into a
+  compact in-RAM arena index, resolves dependencies, and installs `.deb`s onto ext2 `/mnt`.
 
 ---
 
@@ -186,6 +195,9 @@ framebuffer (serial stays plain text).
 | `pci`                | List enumerated PCI devices (virtio tagged)                     |
 | `ifconfig`           | Show the network interface (IP, gateway, MAC)                   |
 | `nc <ip> <port> [t]` | Open a TCP connection and echo a line over it                   |
+| `lxrun <path> […]`   | Load and run a static Linux x86_64 ELF from the VFS in ring 3   |
+| `pkg <url> <dst>`    | Download a file / `.deb` over HTTP(S) into the VFS              |
+| `apt <subcmd> …`     | Package manager: `update`/`install`/`show`/`list`/`setmirror`   |
 | `exec`               | Run the embedded ring-3 test process                            |
 | `selftest`           | Run the in-kernel correctness self-test suite (serial)          |
 
@@ -234,6 +246,34 @@ From inside the guest shell you can also drive the TCP client: `nc 10.0.2.2 <por
 
 ---
 
+## Linux binaries & Debian packages
+
+`pagh` can run statically-linked Linux x86_64 programs and install Debian packages by name.
+
+```text
+# run a static Linux ELF already on the filesystem
+lxrun /mnt/bin/busybox
+
+# point apt at a mirror, refresh the index, then install + run a package
+apt setmirror http://deb.debian.org /debian
+apt update
+apt install busybox-static
+lxrun /mnt/bin/busybox
+```
+
+- **Static only.** Only statically-linked binaries run. Dynamic linking (glibc),
+  `fork`/`clone`/threads/futex, and GUI stacks are out of scope and return `-ENOSYS`.
+- **Transport.** Downloads use HTTP or HTTPS. HTTPS is **VARIANT A**: TLS 1.3 encrypted but
+  **unauthenticated** (no certificate chain/hostname/expiry checks, non-cryptographic RNG),
+  and package data is not signature-verified — acceptable only for this hobby/QEMU demo.
+  Treat downloaded data as untrusted.
+- **Scale.** The full Debian `main` index (~60k packages, ~150 MiB decompressed) is streamed
+  and parsed into a compact in-RAM byte-arena index (kept in RAM only, rebuilt per boot).
+  End-to-end install is proven against a local mirror; a live full `apt update` from
+  `deb.debian.org` works but is slow under QEMU user-mode networking (slirp) + TCG emulation.
+
+---
+
 ## Architecture
 
 ```
@@ -260,6 +300,7 @@ src/
 ├── boot.rs             # boot orchestrator: ordered, fallible init steps (incl. storage + net)
 ├── log.rs              # leveled logging facade (error!/warn!/info!/debug!/trace!)
 ├── test.rs             # in-kernel test/self-test harness (Properties P1–P27)
+├── selftest_lx.rs      # boot-time Linux-compat + apt self-tests (cargo feature `lx_selftest`)
 ├── shell/              # interactive shell (thin I/O loop over pure-logic modules)
 │   ├── mod.rs          #   prompt loop: Decoder + LineEditor + History + completion + dispatch
 │   ├── keys.rs         #   KeyEvent + scancode Decoder (0xE0 extended-prefix state machine)
@@ -279,7 +320,8 @@ src/
 │       ├── idt.rs      # IDT, exception handlers, IRQ + int 0x80 dispatch
 │       ├── apic.rs     # LAPIC timer, I/O APIC, IRQ routing
 │       ├── acpi.rs     # MADT parsing via the `acpi` crate (cached)
-│       └── syscall.rs  # SYSCALL/int 0x80 entry + dispatcher (SYS_WRITE/EXIT/YIELD)
+│       ├── syscall.rs  # SYSCALL/int 0x80 entry + dispatcher (native + Linux dispatch)
+│       └── linux/      # Linux x86_64 syscall ABI: errno, io, mem, misc, stat, time, dirent…
 ├── memory/
 │   ├── layout.rs       # single source of truth for fixed virtual regions
 │   ├── pmm.rs          # bitmap physical frame allocator (single Spinlock; contiguous alloc)
@@ -304,17 +346,37 @@ src/
 │   │   └── dir.rs      #   directory entry iteration / insert / remove
 │   └── journal.rs      # write-ahead-log (WAL) journal: begin/log/commit/recover
 ├── net/
-│   ├── mod.rs          # smoltcp interface, DHCP, poll loop, UDP/TCP echo, nc client
+│   ├── mod.rs          # smoltcp interface, DHCP, poll loop, UDP/TCP echo, nc client, resolve
+│   ├── dns.rs          # pure DNS query build + A-record parse (resolver pump in mod.rs)
+│   ├── http.rs         # pure HTTP/1.1 GET builder + response-head parser
+│   ├── http_fetch.rs   # effectful HTTP fetch pump (Package_Fetcher) over a TCP socket
+│   ├── tls.rs          # HTTPS via TLS 1.3 (embedded-tls; VARIANT A — no cert verification)
 │   └── phy.rs          # smoltcp Device adapter over virtio-net (RxToken/TxToken)
+├── pkg/
+│   ├── mod.rs          # package-manager plumbing
+│   ├── apt.rs          # by-name apt front end: update / install / show / list / setmirror
+│   ├── apt_index.rs    # compact byte-arena `Packages` index + streaming builder
+│   ├── apt_resolve.rs  # pure dependency resolver (topological install plan)
+│   ├── deb.rs          # `.deb`/ar parsing + gzip/xz/zstd (streaming) decompression
+│   ├── tar.rs          # pure ustar reader/writer
+│   ├── install.rs      # pure install-path normalization + model
+│   ├── install_fs.rs   # effectful data.tar → ext2 /mnt installer
+│   └── mirror.rs       # `apt setmirror` host/scheme/port argument parser
 ├── sync/
 │   └── spinlock.rs     # IRQ-safe spinlock (built on arch::cpu)
 ├── task/
 │   ├── scheduler.rs    # round-robin scheduler, TCB, idle task
 │   ├── switch.rs       # context-switch asm, kernel-thread trampoline, timer IRQ stub
-│   └── process.rs      # ring-3 user process creation + embedded test ELF
+│   ├── process.rs      # ring-3 user process creation + embedded test ELF
+│   ├── compat.rs       # per-process Linux compat state registry (fds, vm regions)
+│   ├── fd.rs           # per-process file-descriptor table (VFS-backed)
+│   ├── fd_alloc.rs     # pure fd-number bookkeeping (lowest-free ≥ 3, EBADF)
+│   ├── stack.rs        # pure SysV initial-stack / auxv encoder
+│   └── stack_map.rs    # effectful user-stack mapping for the SysV image
 ├── vfs/
 │   ├── mod.rs          # VfsNode trait, root, lookup_path, mount_at, /dev/{null,serial}
-│   └── elf.rs          # ELF64 validation + PT_LOAD loading
+│   ├── elf.rs          # ELF64 validation + PT_LOAD loading (native + Linux static/PIE)
+│   └── elf_classify.rs # pure ELF classifier + static-PIE load-bias selection
 └── debug/
     └── unwind.rs       # heap-free RBP-chain stack trace for panics
 ```
@@ -348,7 +410,10 @@ src/
   `unshare` per the transfer direction; already-contiguous buffers take the direct path.
 - **Networking.** A `smoltcp::phy::Device` adapter wraps virtio-net, delivering each RX
   frame to smoltcp exactly once with single-owner buffer discipline. A dedicated kernel
-  thread runs the poll loop; addressing is DHCPv4 with a static fallback.
+  thread runs the poll loop; addressing is DHCPv4 with a static fallback. Outbound package
+  fetches add a pure DNS resolver, a pure HTTP/1.1 client, and an HTTPS path over TLS 1.3
+  (`embedded-tls`) — the TLS path is **VARIANT A: encrypted but unauthenticated** (no
+  certificate verification, non-cryptographic RNG), acceptable only for this hobby demo.
 - **Shell.** The interactive loop is the only place that touches the keyboard, console,
   and VFS; all the interesting logic (path normalization, the line-editor model, history,
   completion, the scancode decoder, edit distance) is pure and property-tested. A single
@@ -357,10 +422,24 @@ src/
   the cooperative `SYS_YIELD` path, and a freshly spawned kernel thread all use one
   identical saved-frame layout, so a task suspended by any path resumes correctly through
   any other. Kernel threads and ring-3 tasks share this frame; the idle task (pid 0) is
-  explicit.
+  explicit. The cooperative switch saves its frame with interrupts disabled (matching the
+  timer stub's IF=0 restore window), so a context is always restored interrupt-atomically
+  and a timer tick can never corrupt a partially-restored frame.
 - **User mode.** `task::process` loads an ELF into a fresh user PML4, programs `TSS.RSP0`,
   and builds an `iret` frame that drops to ring 3. System calls use `int 0x80`
   (`rax`=number, `rdi/rsi/rdx`=args).
+- **Linux binaries.** A Linux x86_64 syscall layer (`int 0x80` + `syscall` → a single
+  dispatcher) plus an ELF loader for static `ET_EXEC` and static-PIE images, a SysV initial
+  stack/auxv builder, and per-process compat state (fd table, VM regions) let
+  statically-linked Linux programs run in ring 3 (`lxrun`). Dynamic linking (glibc),
+  `fork`/`clone`/threads/futex, and GUI stacks are deliberately out of scope and return
+  `-ENOSYS`.
+- **Packages (apt).** `apt` fetches a Debian `Packages` index and parses it incrementally
+  from a streaming gzip/xz/zstd decompressor into a **compact byte-arena index** — one
+  growable byte arena plus `(offset,len)` references and integer-keyed sorted lookup tables,
+  instead of hundreds of thousands of per-field `String`s — so the full `main` index fits in
+  bounded RAM without an allocator swap. A pure resolver produces a dependency-first plan,
+  then each `.deb` is fetched, its `data.tar` unpacked, and files written onto ext2 `/mnt`.
 - **Input & graphics.** The PS/2 keyboard (IRQ1) and mouse (IRQ12) are routed through the
   I/O APIC. The mouse driver assembles 3-byte packets and maintains an absolute,
   screen-clamped position. The framebuffer driver offers 2D primitives over the
@@ -385,6 +464,13 @@ it from that directory:
 ```sh
 cd host-tests && cargo test
 ```
+
+The host suite now carries **40** property modules (`p01`–`p40`). Beyond the kernel-core
+properties listed below it covers the Linux-compat and package logic added since: the ELF
+classifier and static-PIE bias, the SysV stack/auxv encoder, fd-number bookkeeping, DNS
+query/response and HTTP head parsing, `.deb`/`ar`/`tar` handling, gzip/xz/zstd decode
+round-trips, and the `apt` index/resolver — including the compact arena index checked for
+query-equivalence against a reference `String`-backed model.
 
 | #     | Property                                                            |
 |-------|---------------------------------------------------------------------|
@@ -434,6 +520,8 @@ These are required and preserved across the codebase:
 - [`linked_list_allocator`](https://crates.io/crates/linked_list_allocator) — kernel heap.
 - [`virtio-drivers`](https://crates.io/crates/virtio-drivers) — virtio-blk / virtio-net.
 - [`smoltcp`](https://crates.io/crates/smoltcp) — TCP/IP stack (no_std, alloc).
+- [`embedded-tls`](https://crates.io/crates/embedded-tls) — TLS 1.3 client for HTTPS (VARIANT A).
+- [`miniz_oxide`](https://crates.io/crates/miniz_oxide) / [`xz4rust`](https://crates.io/crates/xz4rust) / [`ruzstd`](https://crates.io/crates/ruzstd) — gzip / xz / zstd decompression for `.deb`s and the package index.
 - [`proptest`](https://crates.io/crates/proptest) — host-side property tests (dev-dependency; `host-tests/`).
 
 ---
