@@ -1,5 +1,24 @@
-// pagh OS kernel — 64-bit hybrid kernel in Rust
-// lib.rs: entry point, panic handler, test infrastructure
+// pagh OS kernel — 64-bit kernel in Rust
+//
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │  ONE CRATE, TWO KERNELS — selected by the build target (cfg(target_arch)) │
+// ├─────────────────────────────────────────────────────────────────────────┤
+// │  • x86_64  — the original pagh kernel (Limine/UEFI). Modules below are    │
+// │    gated `#[cfg(target_arch = "x86_64")]`. Build/run: `run.cmd`.          │
+// │  • riscv64 — the in-progress port (OpenSBI/QEMU virt). Its sources live   │
+// │    in `src/arch/riscv64/` and are declared at the crate root here via     │
+// │    `#[cfg(target_arch = "riscv64")] #[path = "arch/riscv64/X.rs"] mod X;`  │
+// │    so the ported code's `crate::pmm`/`crate::timer`/`kprintln!` paths      │
+// │    resolve unchanged. Build/run: `run_rv.cmd`.                            │
+// │                                                                           │
+// │  The two arches are MUTUALLY EXCLUSIVE: only one set of modules ever      │
+// │  compiles in a given build, so a few module names (e.g. `net`, `shell`)   │
+// │  intentionally appear once per arch. NOTE: today the riscv side keeps its │
+// │  own copies of some upper-half modules (net/shell/ramfs); the planned     │
+// │  end-state shares those and leaves only the true arch layer (cpu/trap/    │
+// │  paging/timer/plic/sbi/uart) under arch/riscv64. See .kiro/specs/         │
+// │  riscv-port/ and CONTRIBUTING.                                            │
+// └─────────────────────────────────────────────────────────────────────────┘
 
 #![no_std]
 #![no_main]
