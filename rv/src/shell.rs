@@ -25,7 +25,7 @@ pub fn run() -> ! {
 
     let mut line = String::new();
     loop {
-        match crate::uart::try_getb() {
+        match crate::uart::getb() {
             Some(b'\r') | Some(b'\n') => {
                 crate::kprintln!();
                 exec(line.trim());

@@ -18,6 +18,7 @@ mod elf;
 mod heap;
 mod net;
 mod paging;
+mod plic;
 mod pmm;
 mod sbi;
 mod sched;
@@ -116,6 +117,14 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     if let Some(ub) = dtb::uart(dtb) {
         uart::init(ub);
         kprintln!("rv: ns16550 UART @ {:#x} online -- console now on MMIO", ub);
+        // Arm interrupt-driven RX: PLIC routes the UART IRQ to S-mode, the UART
+        // raises RDA interrupts, and SEIE lets them be delivered (once SIE is on).
+        plic::init();
+        uart::enable_rx_interrupt();
+        // SAFETY: arming SEIE; the trap vector is installed in Milestone C before
+        // interrupts are globally enabled.
+        unsafe { cpu::sie_set(1 << 9) };
+        kprintln!("rv: PLIC + UART RX interrupt armed (IRQ {})", plic::UART_IRQ);
     } else {
         kprintln!("rv: ns16550 UART not found in DTB; staying on SBI console");
     }

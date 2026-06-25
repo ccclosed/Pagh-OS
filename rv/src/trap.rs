@@ -111,6 +111,8 @@ extern "C" {
 
 /// `scause` code for a supervisor timer interrupt.
 const SCAUSE_S_TIMER: usize = 5;
+/// `scause` code for a supervisor external interrupt (PLIC).
+const SCAUSE_S_EXTERNAL: usize = 9;
 /// `scause` code for an environment call from U-mode.
 const SCAUSE_ECALL_U: usize = 8;
 
@@ -138,6 +140,18 @@ extern "C" fn __trap_handler(frame: *mut usize) {
 
     if is_interrupt && code == SCAUSE_S_TIMER {
         crate::timer::on_tick();
+        return;
+    }
+
+    if is_interrupt && code == SCAUSE_S_EXTERNAL {
+        // PLIC: claim the pending IRQ, service it, complete it.
+        let irq = crate::plic::claim();
+        if irq == crate::plic::UART_IRQ {
+            crate::uart::drain_rx();
+        }
+        if irq != 0 {
+            crate::plic::complete(irq);
+        }
         return;
     }
 
