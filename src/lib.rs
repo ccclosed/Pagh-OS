@@ -1,46 +1,91 @@
-//! pagh OS — RISC-V (riscv64gc) kernel.
-//!
-//! This is the `riscv-port` branch: a standalone RISC-V kernel for the QEMU
-//! `virt` machine, booted by OpenSBI in S-mode. The x86_64 kernel lives
-//! separately on the `main` branch — the two arches are kept on separate
-//! branches by design.
-//!
-//! Boot: OpenSBI jumps to `_start` (in [`boot`]) at 0x8020_0000; `_start` sets up
-//! the stack and calls `kmain`, which brings up the SBI/UART console, DTB-driven
-//! memory discovery, the bitmap PMM, Sv39 paging, the heap, traps + a 100 Hz
-//! timer, a preemptive scheduler, U-mode + `ecall` syscalls, an ELF loader,
-//! virtio-blk and virtio-net (smoltcp + DHCP), a ramfs, and an interactive shell.
+// pagh OS kernel — 64-bit hybrid kernel in Rust
+// lib.rs: entry point, panic handler, test infrastructure
+
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
+#![feature(allocator_api)]
+#![feature(custom_test_frameworks)]
+#![feature(sync_unsafe_cell)]
+#![test_runner(crate::test_runner)]
+#![reexport_test_harness_main = "test_main"]
 
 extern crate alloc;
+use core::panic::PanicInfo;
+use core::sync::atomic::AtomicU64;
 
-// `sbi` defines the `kprint!`/`kprintln!` console macros and must be declared
-// first with `#[macro_use]` so they are in scope for every following module.
-#[macro_use]
-mod sbi;
-
-#[macro_use]
-mod log;
-
-mod blk;
+mod arch;
 mod boot;
-mod cpu;
+mod debug;
 mod drivers;
-mod dtb;
-mod elf;
 mod fs;
-mod heap;
+mod log;
+mod memory;
 mod net;
-mod paging;
-mod plic;
-mod pmm;
-mod ramfs;
-mod sched;
+mod pkg;
+/// Boot-time Linux-compat self-test harness, compiled only under the
+/// `lx_selftest`, `lx_livetest`, or `lx_bigindex` cargo features so the default
+/// build/boot is unchanged.
+#[cfg(any(feature = "lx_selftest", feature = "lx_livetest", feature = "lx_bigindex"))]
+mod selftest_lx;
 mod shell;
 mod sync;
-mod timer;
-mod trap;
-mod uart;
-mod umode;
+mod task;
+mod test;
 mod vfs;
+
+use limine::request::{ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemmapRequest, RsdpRequest};
+use limine::BaseRevision;
+
+#[used]
+#[no_mangle]
+#[link_section = ".requests"]
+pub static BASE_REVISION: BaseRevision = BaseRevision::with_revision(2);
+
+#[used]
+#[no_mangle]
+#[link_section = ".requests"]
+pub static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+#[used]
+#[no_mangle]
+#[link_section = ".requests"]
+pub static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
+
+#[used]
+#[no_mangle]
+#[link_section = ".requests"]
+pub static KERNEL_ADDR_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::new();
+
+#[used]
+#[no_mangle]
+#[link_section = ".requests"]
+pub static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+
+#[used]
+#[no_mangle]
+#[link_section = ".requests"]
+pub static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
+
+pub(crate) static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
+pub(crate) static KERNEL_BASE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static KERNEL_SIZE: AtomicU64 = AtomicU64::new(0);
+
+#[no_mangle]
+pub fn _start() -> ! {
+    crate::boot::start()
+}
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    arch::cpu::disable_interrupts();
+    if let Some(loc) = info.location() {
+        kprint!("[PANIC] {}:{} — ", loc.file(), loc.line());
+    } else { kprint!("[PANIC] "); }
+    kprintln!("{}", info.message());
+    debug::unwind::stack_trace();
+    arch::cpu::halt_loop();
+}
+
+#[cfg(test)]
+fn test_runner(_tests: &[&dyn Fn()]) {}

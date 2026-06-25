@@ -1,0 +1,47 @@
+# Host-side property-test crate for the `pagh` kernel.
+#
+# WHY A SEPARATE CRATE:
+# The kernel (`pagh`) is a `#![no_std]` / `#![no_main]` `staticlib` built for the
+# custom bare-metal target `x86_64-unknown-none.json` via the workspace
+# `.cargo/config.toml` (which also enables `-Zbuild-std`). That crate therefore
+# cannot be compiled or run on the host, so `cargo test` against it is impossible.
+#
+# Property-based tests (proptest) need `std` and must run on the HOST. Per the
+# design's Testing Strategy, the bug-fix logic (Requirements 4-8) is factored into
+# pure, host-testable functions which are exercised here. This crate is deliberately
+# EXCLUDED from the kernel workspace (see the root Cargo.toml `[workspace].exclude`)
+# and carries its own `.cargo/config.toml` that pins the host target and disables
+# `build-std`, so it builds and runs as an ordinary host crate without disturbing
+# the kernel build.
+#
+# HOW TO RUN (from this directory):
+#     cd host-tests
+#     cargo test
+# The trivial smoke property below confirms the proptest harness is wired up.
+# Later tasks (9.2, 10.2, 10.3, 11.2, 13.2, 14.3-14.5) add the real properties by
+# copying the kernel's extracted pure logic into this crate.
+
+[package]
+name = "pagh-host-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+# A library target so `#[cfg(test)]` unit/property tests are discovered by `cargo test`.
+path = "src/lib.rs"
+
+# `deb` (path-included from the kernel) calls `miniz_oxide` for gzip inflate, so the
+# host build of this crate must resolve the same crate. Pinned to match the kernel's
+# `Cargo.toml`. Default features are fine on the host; the kernel disables them.
+[dependencies]
+miniz_oxide = "=0.8.9"
+# `deb` also decodes `.tar.xz` (xz4rust) and `.tar.zst` (ruzstd). Pinned to match
+# the kernel's `Cargo.toml`. Default features are fine on the host; the kernel
+# disables them. These are normal deps (not dev-deps) because `deb.rs` is a
+# non-test library module here, included via `#[path]`.
+ruzstd = "=0.8.3"
+xz4rust = "=0.2.1"
+
+[dev-dependencies]
+proptest = "1"
