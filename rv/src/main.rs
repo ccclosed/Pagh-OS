@@ -20,6 +20,7 @@ mod sbi;
 mod sched;
 mod timer;
 mod trap;
+mod uart;
 mod umode;
 
 use alloc::vec::Vec;
@@ -106,6 +107,14 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // SAFETY: region is owned by the heap and identity-mapped readable/writable.
     unsafe { heap::init(heap_start, HEAP_SIZE) };
     kprintln!("rv: heap up ({} MiB, galloc)", HEAP_SIZE / (1024 * 1024));
+
+    // 4b. Bring up the real ns16550 MMIO UART and move the console onto it.
+    if let Some(ub) = dtb::uart(dtb) {
+        uart::init(ub);
+        kprintln!("rv: ns16550 UART @ {:#x} online -- console now on MMIO", ub);
+    } else {
+        kprintln!("rv: ns16550 UART not found in DTB; staying on SBI console");
+    }
 
     // 5. Smoke-test the allocator: build a Vec on the heap and use it.
     let mut v: Vec<u64> = Vec::new();

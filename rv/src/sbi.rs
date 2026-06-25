@@ -38,7 +38,13 @@ pub struct Console;
 
 impl Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        print(s);
+        // Once the ns16550 MMIO driver is up, write straight to the device;
+        // before that (early boot) use the SBI console.
+        if crate::uart::ready() {
+            crate::uart::print(s);
+        } else {
+            print(s);
+        }
         Ok(())
     }
 }

@@ -25,3 +25,12 @@ pub fn memory(dtb_ptr: usize) -> Option<MemInfo> {
         end: start + size,
     })
 }
+
+/// Find the ns16550 UART's MMIO base address in the DTB.
+pub fn uart(dtb_ptr: usize) -> Option<usize> {
+    // SAFETY: as in `memory`.
+    let fdt = unsafe { fdt::Fdt::from_ptr(dtb_ptr as *const u8) }.ok()?;
+    let node = fdt.find_compatible(&["ns16550a", "ns16550", "snps,dw-apb-uart"])?;
+    let region = node.reg()?.next()?;
+    Some(region.starting_address as usize)
+}
