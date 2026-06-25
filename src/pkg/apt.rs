@@ -311,6 +311,12 @@ pub fn update() -> Result<usize, AptOpError> {
         crate::info!("apt: fetching index {}://{}{}", cfg.scheme(), cfg.host, url);
         match cfg.fetch(url) {
             Ok(bytes) => {
+                // PHASE MARKER (heap-corruption #14 investigation): the body is
+                // fully downloaded at this point. If a crash appears BEFORE this
+                // line (only `net: downloaded ...` lines, no "body fetched"), the
+                // corruption is in the DOWNLOAD/TLS/virtio-DMA path; if it appears
+                // AFTER, it is in the decompress/parse path.
+                crate::info!("apt: index body fetched ({} bytes); decompress+parse...", bytes.len());
                 // A successful download that fails to decompress/parse is a hard
                 // error for this candidate; do not silently fall through.
                 let index = stream_parse_index(&bytes, *comp)?;
