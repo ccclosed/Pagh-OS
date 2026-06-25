@@ -19,7 +19,6 @@
 //! `Package` key is skipped.
 #![allow(dead_code)]
 
-use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::mem::size_of;
@@ -204,22 +203,86 @@ fn parse_provides(value: &str) -> Vec<String> {
     out
 }
 
+/// Which known field the parser's last `Key:` line selected. Continuation lines
+/// are routed back to that field's slot. [`CurField::None`] marks either "no key
+/// seen yet" or "last key was unknown" — in both cases continuation lines are
+/// ignored (an unknown key's continuations were appended to a field nothing ever
+/// reads, so dropping them is observably identical).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CurField {
+    None,
+    Package,
+    Version,
+    Arch,
+    Filename,
+    Depends,
+    PreDepends,
+    Provides,
+    Size,
+}
+
 /// Internal accumulator for a stanza being built line-by-line.
+///
+/// This replaces the old `BTreeMap<String, String>` + per-`Key:` `String`
+/// allocations with one reusable `String` slot per field the parser actually
+/// reads. The slots are *cleared* (not reallocated) between stanzas via
+/// [`clear`](Self::clear), so the per-stanza heap churn that degraded the kernel
+/// allocator (tens of thousands of small alloc/free per index) is eliminated: the
+/// eight slot allocations are reused across every stanza in the file.
+///
+/// Parse semantics are byte-for-byte identical to the old map-backed builder:
+/// only the eight keys below are read by `build_record`/`StanzaView`, a repeated
+/// key overwrites (last-wins, matching `BTreeMap::insert`), an unknown key still
+/// marks the stanza non-empty (matching the old `fields.is_empty()` flipping to
+/// false on the first inserted key, known or not), and continuation lines join
+/// with a single space.
+#[derive(Default)]
 struct StanzaBuilder {
-    current_key: Option<String>,
-    fields: BTreeMap<String, String>,
+    package: String,
+    version: String,
+    arch: String,
+    filename: String,
+    depends: String,
+    pre_depends: String,
+    provides: String,
+    size: String,
+    /// Which known field the last `Key:` line selected (for continuation lines);
+    /// [`CurField::None`] for an unknown key (its continuations are ignored).
+    cur: CurField,
+    /// Whether any key line (known or unknown) set a field this stanza. Drives
+    /// [`is_empty`](Self::is_empty), mirroring the old `fields.is_empty()`.
+    any: bool,
+}
+
+impl Default for CurField {
+    fn default() -> Self {
+        CurField::None
+    }
 }
 
 impl StanzaBuilder {
     fn new() -> Self {
-        StanzaBuilder {
-            current_key: None,
-            fields: BTreeMap::new(),
-        }
+        Self::default()
+    }
+
+    /// Clear every slot for reuse on the next stanza. `String::clear` retains the
+    /// backing capacity — this capacity reuse is the entire point of the rework:
+    /// no per-stanza allocation/free of the field strings.
+    fn clear(&mut self) {
+        self.package.clear();
+        self.version.clear();
+        self.arch.clear();
+        self.filename.clear();
+        self.depends.clear();
+        self.pre_depends.clear();
+        self.provides.clear();
+        self.size.clear();
+        self.cur = CurField::None;
+        self.any = false;
     }
 
     fn is_empty(&self) -> bool {
-        self.fields.is_empty()
+        !self.any
     }
 
     /// True if this stanza carries a non-empty `Package` key. Mirrors the guard
@@ -227,10 +290,37 @@ impl StanzaBuilder {
     /// without a `Package` is skipped, so the streaming view sink uses this to
     /// decide whether to emit a [`StanzaView`] at all.
     fn has_package(&self) -> bool {
-        self.fields
-            .get("Package")
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false)
+        !self.package.trim().is_empty()
+    }
+
+    /// Map a known field selector to its slot, or `None` for an unknown key.
+    fn slot_mut(&mut self, field: CurField) -> Option<&mut String> {
+        match field {
+            CurField::Package => Some(&mut self.package),
+            CurField::Version => Some(&mut self.version),
+            CurField::Arch => Some(&mut self.arch),
+            CurField::Filename => Some(&mut self.filename),
+            CurField::Depends => Some(&mut self.depends),
+            CurField::PreDepends => Some(&mut self.pre_depends),
+            CurField::Provides => Some(&mut self.provides),
+            CurField::Size => Some(&mut self.size),
+            CurField::None => None,
+        }
+    }
+
+    /// Case-sensitive match of a trimmed key against the eight known field names.
+    fn classify(key: &str) -> CurField {
+        match key {
+            "Package" => CurField::Package,
+            "Version" => CurField::Version,
+            "Architecture" => CurField::Arch,
+            "Filename" => CurField::Filename,
+            "Depends" => CurField::Depends,
+            "Pre-Depends" => CurField::PreDepends,
+            "Provides" => CurField::Provides,
+            "Size" => CurField::Size,
+            _ => CurField::None,
+        }
     }
 
     /// Feed one logical line (already stripped of its trailing `\r`/`\n`).
@@ -238,27 +328,36 @@ impl StanzaBuilder {
         // Continuation line: starts with a space or tab. Append to the current
         // field's value (with a single joining space), if any.
         if line.starts_with(' ') || line.starts_with('\t') {
-            if let Some(key) = &self.current_key {
-                let cont = line.trim();
-                if let Some(v) = self.fields.get_mut(key) {
-                    if !cont.is_empty() {
-                        if !v.is_empty() {
-                            v.push(' ');
-                        }
-                        v.push_str(cont);
+            let cont = line.trim();
+            if let Some(v) = self.slot_mut(self.cur) {
+                if !cont.is_empty() {
+                    if !v.is_empty() {
+                        v.push(' ');
                     }
+                    v.push_str(cont);
                 }
             }
+            // `cur == None` (no key yet, or last key unknown): ignore.
             return;
         }
 
         // A normal `Key: value` line.
         if let Some(colon) = line.find(':') {
-            let key = line[..colon].trim().to_string();
-            let value = line[colon + 1..].trim().to_string();
+            let key = line[..colon].trim();
+            let value = line[colon + 1..].trim();
             if !key.is_empty() {
-                self.current_key = Some(key.clone());
-                self.fields.insert(key, value);
+                // Any non-empty key (known or unknown) makes the stanza non-empty,
+                // matching the old `BTreeMap` insert flipping `fields.is_empty()`.
+                self.any = true;
+                let field = Self::classify(key);
+                self.cur = field;
+                if let Some(slot) = self.slot_mut(field) {
+                    // Repeated key overwrites (last-wins, matching map insert).
+                    slot.clear();
+                    slot.push_str(value);
+                }
+                // Unknown key: `cur` is now `None`, so its continuations are
+                // ignored (the old code appended them to an unread field).
             }
         }
         // Lines without a colon and not a continuation are ignored.
@@ -269,47 +368,31 @@ impl StanzaBuilder {
     /// lets the same accumulated stanza back either the owned `PkgRecord`
     /// collector path or a borrowed [`StanzaView`] without being torn down first.
     fn build_record(&self) -> Option<PkgRecord> {
-        let package = self.fields.get("Package")?.trim().to_string();
+        let package = self.package.trim().to_string();
         if package.is_empty() {
             return None;
         }
 
-        let version = self
-            .fields
-            .get("Version")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        let arch = self
-            .fields
-            .get("Architecture")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        let filename = self
-            .fields
-            .get("Filename")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
+        let version = self.version.trim().to_string();
+        let arch = self.arch.trim().to_string();
+        let filename = self.filename.trim().to_string();
 
         // Merge Pre-Depends (first) and Depends.
         let mut depends = Vec::new();
-        if let Some(pre) = self.fields.get("Pre-Depends") {
-            depends.extend(parse_depends(pre));
+        if !self.pre_depends.is_empty() {
+            depends.extend(parse_depends(&self.pre_depends));
         }
-        if let Some(dep) = self.fields.get("Depends") {
-            depends.extend(parse_depends(dep));
+        if !self.depends.is_empty() {
+            depends.extend(parse_depends(&self.depends));
         }
 
-        let provides = self
-            .fields
-            .get("Provides")
-            .map(|s| parse_provides(s))
-            .unwrap_or_default();
+        let provides = if self.provides.is_empty() {
+            Vec::new()
+        } else {
+            parse_provides(&self.provides)
+        };
 
-        let size = self
-            .fields
-            .get("Size")
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(0);
+        let size = self.size.trim().parse::<u64>().unwrap_or(0);
 
         Some(PkgRecord {
             package,
@@ -375,10 +458,19 @@ impl<'a> StanzaView<'a> {
         // `self.builder` is a `&'a StanzaBuilder`, so the borrow handed back lives
         // for `'a` (the stanza's transient lifetime), not merely for `&self`.
         let builder: &'a StanzaBuilder = self.builder;
-        match builder.fields.get(key) {
-            Some(v) => v.trim(),
-            None => "",
-        }
+        let slot = match StanzaBuilder::classify(key) {
+            CurField::Package => &builder.package,
+            CurField::Version => &builder.version,
+            CurField::Arch => &builder.arch,
+            CurField::Filename => &builder.filename,
+            CurField::Depends => &builder.depends,
+            CurField::PreDepends => &builder.pre_depends,
+            CurField::Provides => &builder.provides,
+            CurField::Size => &builder.size,
+            // Unknown key: absent, like the old `fields.get(key) == None`.
+            CurField::None => return "",
+        };
+        slot.trim()
     }
 
     /// `Package:` — the package name (non-empty for any emitted stanza).
@@ -606,7 +698,7 @@ impl StanzaParser {
             // Blank line: stanza separator. Flush the current stanza (if any).
             if !self.builder.is_empty() {
                 consumer.consume(&self.builder);
-                self.builder = StanzaBuilder::new();
+                self.builder.clear();
             }
             return;
         }
