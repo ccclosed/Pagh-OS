@@ -117,6 +117,36 @@ pub fn free_frame(addr: usize) {
     }
 }
 
+/// Allocate `n` physically-contiguous frames, returning the base address, or
+/// `None` if no run of `n` free frames exists. Used for virtio DMA regions.
+pub fn alloc_contig(n: usize) -> Option<usize> {
+    if n == 0 {
+        return None;
+    }
+    let mut guard = PMM.lock();
+    let pmm = guard.as_mut()?;
+    let mut run = 0usize;
+    let mut start = 0usize;
+    for i in 0..pmm.frames {
+        if !pmm.test(i) {
+            if run == 0 {
+                start = i;
+            }
+            run += 1;
+            if run == n {
+                for j in start..start + n {
+                    pmm.set_used(j);
+                    pmm.free -= 1;
+                }
+                return Some(pmm.base + start * FRAME_SIZE);
+            }
+        } else {
+            run = 0;
+        }
+    }
+    None
+}
+
 /// `(free, total)` frame counts.
 pub fn stats() -> (usize, usize) {
     let guard = PMM.lock();

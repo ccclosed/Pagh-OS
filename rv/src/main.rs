@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+mod blk;
 mod cpu;
 mod dtb;
 mod heap;
@@ -162,7 +163,11 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
 
     kprintln!("rv: Milestone C.2 OK -- context switch + cooperative scheduler.");
 
-    // 8. Drop to U-mode and run a tiny program that makes ecall syscalls.
+    // 8. virtio-blk over virtio-mmio: probe + read/write round-trip (Milestone E).
+    blk::test(dtb);
+    kprintln!("rv: Milestone E (blk) OK -- virtio-mmio + virtio-blk.");
+
+    // 9. Drop to U-mode and run a tiny program that makes ecall syscalls.
     let (entry, user_sp) = umode::setup();
     kprintln!("rv: entering U-mode at {:#x} (user sp {:#x})...", entry, user_sp);
     // SAFETY: entry/stack are mapped user-accessible; this does not return

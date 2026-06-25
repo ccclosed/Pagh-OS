@@ -26,6 +26,9 @@ fdt = "0.1"
 good_memory_allocator = "0.1"
 # Tiny no_std spinlock for the PMM state.
 spin = "0.9"
+# virtio-mmio transport + virtio-blk/net drivers (same crate the x86_64 kernel
+# uses over PCI; here over MMIO on the QEMU virt machine).
+virtio-drivers = { version = "0.11", default-features = false, features = ["alloc"] }
 
 [profile.dev]
 panic = "abort"
