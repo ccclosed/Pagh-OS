@@ -47,6 +47,13 @@ unsafe impl Hal for HalImpl {
 /// A discovered virtio-blk device.
 pub type Blk = VirtIOBlk<HalImpl, MmioTransport<'static>>;
 
+/// `Send` wrapper so the device can live in a `static` Mutex (single-hart).
+struct BlkCell(Option<Blk>);
+// SAFETY: all access is serialized through BLK.lock() on the boot hart.
+unsafe impl Send for BlkCell {}
+
+static BLK: spin::Mutex<BlkCell> = spin::Mutex::new(BlkCell(None));
+
 /// Scan the DTB's virtio-mmio nodes and return the first that is a block device.
 pub fn probe(dtb: usize) -> Option<Blk> {
     // SAFETY: valid DTB pointer from OpenSBI.
@@ -87,27 +94,46 @@ pub fn probe(dtb: usize) -> Option<Blk> {
     None
 }
 
-/// Probe for a virtio-blk disk and run a read/write round-trip self-test against
-/// the last sector (a scratch location), printing the result.
-pub fn test(dtb: usize) {
-    let mut blk = match probe(dtb) {
-        Some(b) => b,
+/// Probe for a virtio-blk disk and store it in the global [`BLK`]. Returns the
+/// capacity in 512-byte sectors on success.
+pub fn init(dtb: usize) -> Option<u64> {
+    let blk = probe(dtb)?;
+    let cap = blk.capacity();
+    BLK.lock().0 = Some(blk);
+    Some(cap)
+}
+
+/// Device capacity in 512-byte sectors, if a disk is attached.
+pub fn capacity() -> Option<u64> {
+    BLK.lock().0.as_ref().map(|b| b.capacity())
+}
+
+/// Read one 512-byte sector into `buf` (must be `SECTOR_SIZE`). Returns success.
+pub fn read_sector(sector: usize, buf: &mut [u8]) -> bool {
+    match BLK.lock().0.as_mut() {
+        Some(b) => b.read_blocks(sector, buf).is_ok(),
+        None => false,
+    }
+}
+
+/// Run a read/write round-trip self-test against the last sector (scratch),
+/// printing the result. Uses the attached device in [`BLK`].
+pub fn selftest() {
+    let cap = match capacity() {
+        Some(c) => c,
         None => {
             crate::kprintln!("rv: no virtio-blk device found on virtio-mmio");
             return;
         }
     };
-
-    let cap = blk.capacity(); // in 512-byte sectors
     crate::kprintln!(
         "rv: virtio-blk found -- {} sectors ({} MiB)",
         cap,
         cap * SECTOR_SIZE as u64 / (1024 * 1024)
     );
 
-    // Read sector 0 and show its first bytes.
     let mut buf = [0u8; SECTOR_SIZE];
-    if blk.read_blocks(0, &mut buf).is_err() {
+    if !read_sector(0, &mut buf) {
         crate::kprintln!("rv: virtio-blk read sector 0 FAILED");
         return;
     }
@@ -117,24 +143,20 @@ pub fn test(dtb: usize) {
     }
     crate::kprintln!();
 
-    // Write a pattern to the last sector, read it back, and verify.
     let scratch = (cap - 1) as usize;
     let mut wbuf = [0u8; SECTOR_SIZE];
     for (i, b) in wbuf.iter_mut().enumerate() {
         *b = (i as u8) ^ 0xa5;
     }
-    if blk.write_blocks(scratch, &wbuf).is_err() {
-        crate::kprintln!("rv: virtio-blk write FAILED");
-        return;
-    }
     let mut rbuf = [0u8; SECTOR_SIZE];
-    if blk.read_blocks(scratch, &mut rbuf).is_err() {
-        crate::kprintln!("rv: virtio-blk read-back FAILED");
-        return;
-    }
-    if rbuf == wbuf {
+    let ok = {
+        let mut guard = BLK.lock();
+        let blk = guard.0.as_mut().unwrap();
+        blk.write_blocks(scratch, &wbuf).is_ok() && blk.read_blocks(scratch, &mut rbuf).is_ok()
+    };
+    if ok && rbuf == wbuf {
         crate::kprintln!("rv: virtio-blk write/read round-trip PASS (sector {})", scratch);
     } else {
-        crate::kprintln!("rv: virtio-blk write/read round-trip MISMATCH");
+        crate::kprintln!("rv: virtio-blk write/read round-trip FAILED");
     }
 }

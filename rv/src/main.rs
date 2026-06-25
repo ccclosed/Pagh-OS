@@ -175,8 +175,9 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
 
     kprintln!("rv: Milestone C.2 OK -- context switch + cooperative scheduler.");
 
-    // 8. virtio-blk over virtio-mmio: probe + read/write round-trip (Milestone E).
-    blk::test(dtb);
+    // 8. virtio-blk over virtio-mmio: attach + read/write round-trip (Milestone E).
+    blk::init(dtb);
+    blk::selftest();
     kprintln!("rv: Milestone E (blk) OK -- virtio-mmio + virtio-blk.");
 
     // 8b. virtio-net + smoltcp: acquire a DHCPv4 lease (Milestone E).

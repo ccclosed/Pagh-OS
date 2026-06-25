@@ -63,6 +63,8 @@ fn exec(cmd: &str) {
             crate::kprintln!("  help   - this list");
             crate::kprintln!("  ticks  - timer ticks since boot (~100 Hz)");
             crate::kprintln!("  mem    - physical frame allocator stats");
+            crate::kprintln!("  disk   - virtio-blk capacity + sector 0 preview");
+            crate::kprintln!("  net    - DHCP lease (address + gateway)");
             crate::kprintln!("  info   - system / port info");
             crate::kprintln!("  clear  - clear the screen");
         }
@@ -80,6 +82,30 @@ fn exec(cmd: &str) {
                 total * crate::pmm::FRAME_SIZE / (1024 * 1024)
             );
         }
+        "disk" => match crate::blk::capacity() {
+            Some(cap) => {
+                crate::kprintln!("virtio-blk: {} sectors ({} MiB)", cap, cap * 512 / (1024 * 1024));
+                let mut buf = [0u8; 512];
+                if crate::blk::read_sector(0, &mut buf) {
+                    crate::kprint!("sector 0:");
+                    for b in &buf[..16] {
+                        crate::kprint!(" {:02x}", b);
+                    }
+                    crate::kprintln!();
+                }
+            }
+            None => crate::kprintln!("no virtio-blk device"),
+        },
+        "net" => match crate::net::ip_info() {
+            Some((addr, gw)) => {
+                crate::kprintln!("address: {}", addr);
+                match gw {
+                    Some(g) => crate::kprintln!("gateway: {}", g),
+                    None => crate::kprintln!("gateway: (none)"),
+                }
+            }
+            None => crate::kprintln!("no DHCP lease"),
+        },
         "info" => {
             crate::kprintln!("pagh-rv: riscv64gc, S-mode under OpenSBI, Sv39 paging");
             crate::kprintln!("  ns16550 UART, virtio-mmio (blk + net), smoltcp + DHCP");

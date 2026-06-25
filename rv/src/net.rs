@@ -14,7 +14,7 @@ use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::dhcpv4;
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 
 use virtio_drivers::device::net::{RxBuffer, TxBuffer, VirtIONet};
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
@@ -35,6 +35,14 @@ struct NicCell(Option<Nic>);
 unsafe impl Send for NicCell {}
 
 static NIC: spin::Mutex<NicCell> = spin::Mutex::new(NicCell(None));
+
+/// The acquired DHCPv4 lease `(address, gateway)`, for the shell `net` command.
+static IP_INFO: spin::Mutex<Option<(Ipv4Cidr, Option<Ipv4Address>)>> = spin::Mutex::new(None);
+
+/// The current lease, if any.
+pub fn ip_info() -> Option<(Ipv4Cidr, Option<Ipv4Address>)> {
+    *IP_INFO.lock()
+}
 
 /// Scan the DTB virtio-mmio nodes, attach the first network device, and store it
 /// in [`NIC`]. Returns the MAC address on success.
@@ -202,6 +210,7 @@ pub fn demo(dtb: usize) {
                 if let Some(router) = cfg.router {
                     crate::kprintln!("rv: default gateway: {}", router);
                 }
+                *IP_INFO.lock() = Some((cfg.address, cfg.router));
                 return;
             }
             Some(dhcpv4::Event::Deconfigured) => {}
