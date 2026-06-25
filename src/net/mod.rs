@@ -20,7 +20,11 @@
 //! If no NIC is present, [`init`] returns `Err(NetError::NoDevice)`; the caller
 //! logs a warning and boot continues (R17.3).
 
+pub mod dns;
+pub mod http;
+pub mod http_fetch;
 pub mod phy;
+pub mod tls;
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -29,7 +33,7 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{dhcpv4, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr,
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr,
 };
 
 use crate::sync::spinlock::Spinlock;
@@ -50,6 +54,23 @@ pub enum NetError {
 const FALLBACK_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
 const FALLBACK_PREFIX: u8 = 24;
 const FALLBACK_GW: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
+
+/// QEMU user-mode networking always answers DNS at this address, so it is the
+/// resolver of last resort: used when an address is configured but DHCP supplied
+/// no DNS server, and whenever the static fallback address is in effect (R13.3).
+const QEMU_DNS: Ipv4Address = Ipv4Address::new(10, 0, 2, 3);
+
+/// Per-step `spin_loop` hint count between DNS pump steps; releases the `NET`
+/// lock long enough for the timer tick and QEMU to make progress (mirrors
+/// `nc_echo`/`fetch_deb`).
+const DNS_STEP_SPIN: u32 = 20_000;
+
+/// DNS resolve timeout in 100 Hz scheduler ticks (~700 ms). Bounds the wait for
+/// a response; on expiry [`resolve`] returns `None`.
+const DNS_TIMEOUT_TICKS: u64 = 70;
+
+/// Hard upper bound on DNS pump iterations, independent of the clock.
+const DNS_MAX_STEPS: u32 = 20_000;
 
 /// DHCP timeout in 100 Hz ticks (~5 s). If no lease is acquired within this many
 /// ticks of the first poll, [`poll`] applies the static fallback once.
@@ -86,6 +107,10 @@ struct NetState {
     configured: bool,
     /// Current default gateway, once configured.
     gateway: Option<Ipv4Address>,
+    /// DNS servers supplied by the most recent DHCP lease (empty when none were
+    /// offered or when the static fallback is in effect). [`dns_server`] reads
+    /// the first entry, falling back to [`QEMU_DNS`].
+    dns_servers: Vec<Ipv4Address>,
     /// Tick at which the DHCP timeout expires (set on the first poll).
     deadline_tick: Option<u64>,
 }
@@ -133,6 +158,7 @@ pub fn init() -> Result<(), NetError> {
         mac,
         configured: false,
         gateway: None,
+        dns_servers: Vec::new(),
         deadline_tick: None,
     };
 
@@ -188,7 +214,12 @@ pub fn poll() {
         Some(dhcpv4::Event::Configured(cfg)) => {
             let cidr = cfg.address;
             let router = cfg.router;
+            // Copy the offered DNS servers out before `apply_ipv4` re-borrows
+            // `state` mutably (this is also the last use of `cfg`, ending its
+            // borrow of `state.sockets`).
+            let dns: Vec<Ipv4Address> = cfg.dns_servers.iter().copied().collect();
             apply_ipv4(state, cidr, router);
+            state.dns_servers = dns;
             let gw = router.unwrap_or(Ipv4Address::UNSPECIFIED);
             info!(
                 "net: DHCP lease acquired: {} gw {}",
@@ -205,6 +236,7 @@ pub fn poll() {
             state.iface.routes_mut().remove_default_ipv4_route();
             state.configured = false;
             state.gateway = None;
+            state.dns_servers = Vec::new();
             if was_configured {
                 warn!("net: DHCP lease lost");
             }
@@ -355,6 +387,22 @@ pub fn tcp_echo_listen(port: u16) {
 /// asynchronously across subsequent [`poll`] calls; the caller drives it (and
 /// ultimately removes the socket) via [`nc_echo`] or directly.
 pub fn tcp_connect(remote: IpEndpoint) -> Result<SocketHandle, NetError> {
+    tcp_connect_buffered(remote, 4096, 4096)
+}
+
+/// Open an outbound TCP connection like [`tcp_connect`], but with explicitly
+/// sized rx/tx socket buffers.
+///
+/// TLS 1.3 records can be up to 16 KiB, and a server `Certificate` message is
+/// often several KiB; [`tls::https_get`] requests a larger rx buffer here so the
+/// handshake needs fewer drain/re-window round trips over slow QEMU user-net NAT.
+/// The connection still completes asynchronously across subsequent [`poll`] calls;
+/// the caller drives it (e.g. the locked-step pump in `https_get`).
+pub fn tcp_connect_buffered(
+    remote: IpEndpoint,
+    rx_bytes: usize,
+    tx_bytes: usize,
+) -> Result<SocketHandle, NetError> {
     let mut guard = NET.lock();
     let state = guard.as_mut().ok_or(NetError::NoDevice)?;
 
@@ -366,8 +414,8 @@ pub fn tcp_connect(remote: IpEndpoint) -> Result<SocketHandle, NetError> {
         state.next_eph + 1
     };
 
-    let rx = tcp::SocketBuffer::new(vec![0u8; 4096]);
-    let tx = tcp::SocketBuffer::new(vec![0u8; 4096]);
+    let rx = tcp::SocketBuffer::new(vec![0u8; rx_bytes]);
+    let tx = tcp::SocketBuffer::new(vec![0u8; tx_bytes]);
     let sock = tcp::Socket::new(rx, tx);
     let handle = state.sockets.add(sock);
 
@@ -516,15 +564,136 @@ pub fn ip_config() -> Option<IpConfig> {
     })
 }
 
+/// The first usable DNS server, or `None` when no address is configured yet.
+///
+/// Returns the first DNS server offered by the active DHCP lease. When an
+/// address is configured but DHCP supplied no DNS server — or whenever the
+/// static fallback address is in effect — it falls back to [`QEMU_DNS`]
+/// (`10.0.2.3`), which QEMU's user-mode networking always answers on. Returns
+/// `None` only when the interface has no address at all (so a query could not be
+/// sent anyway).
+pub fn dns_server() -> Option<Ipv4Address> {
+    let guard = NET.lock();
+    let state = guard.as_ref()?;
+    if !state.configured {
+        return None;
+    }
+    Some(state.dns_servers.first().copied().unwrap_or(QEMU_DNS))
+}
+
+/// Resolve `hostname` to an [`Ipv4Address`] via a DNS A-record query.
+///
+/// If `hostname` is already a dotted-quad IPv4 literal it is returned directly
+/// with no query. Otherwise a standard recursive A query is built (pure
+/// [`dns::build_dns_query`]) and sent as a single UDP datagram to
+/// [`dns_server`]`():53` over a temporary `udp::Socket`. The stack is pumped in
+/// short, individually-locked steps (mirroring [`nc_echo`]) with a bounded
+/// tick-based timeout; the first A answer is parsed (pure
+/// [`dns::parse_dns_a_response`]) and returned. Returns `None` on timeout, parse
+/// failure, NXDOMAIN, or when no interface address / DNS server is available.
+pub fn resolve(hostname: &str) -> Option<Ipv4Address> {
+    // Already an IPv4 literal: no query needed.
+    if let Some(o) = dns::parse_ipv4_literal(hostname) {
+        return Some(Ipv4Address::new(o[0], o[1], o[2], o[3]));
+    }
+
+    // Need both an interface address and a resolver to send a query.
+    let server = dns_server()?;
+
+    // Build the query (pure). A transaction id derived from the tick counter is
+    // sufficient here: the socket is bound to a fresh ephemeral port, so only the
+    // matching reply on that port is delivered to us.
+    let id: u16 = (scheduler::ticks() as u16) ^ 0x5353;
+    let mut query: Vec<u8> = Vec::new();
+    if !dns::build_dns_query(id, hostname, &mut query) {
+        return None;
+    }
+
+    // Create + bind a temporary UDP socket on an ephemeral local port.
+    let handle = {
+        let mut guard = NET.lock();
+        let state = guard.as_mut()?;
+        let rx = udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; 4],
+            vec![0u8; 2048],
+        );
+        let tx = udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; 4],
+            vec![0u8; 2048],
+        );
+        let mut sock = udp::Socket::new(rx, tx);
+        let local_port = state.next_eph;
+        state.next_eph = if state.next_eph >= 65535 {
+            49152
+        } else {
+            state.next_eph + 1
+        };
+        if sock.bind(local_port).is_err() {
+            return None;
+        }
+        state.sockets.add(sock)
+    };
+
+    let server_ep = IpEndpoint::new(IpAddress::Ipv4(server), 53);
+    let deadline = scheduler::ticks() + DNS_TIMEOUT_TICKS;
+    let mut sent = false;
+    let mut result: Option<[u8; 4]> = None;
+
+    for _ in 0..DNS_MAX_STEPS {
+        {
+            let mut guard = NET.lock();
+            let state = match guard.as_mut() {
+                Some(s) => s,
+                None => break,
+            };
+
+            let ts = now();
+            let _ = state.iface.poll(ts, &mut state.device, &mut state.sockets);
+
+            let sock = state.sockets.get_mut::<udp::Socket>(handle);
+
+            // Send the query once, as soon as tx has room.
+            if !sent && sock.can_send() {
+                if sock.send_slice(&query, server_ep).is_ok() {
+                    sent = true;
+                }
+            }
+
+            // Parse the first matching A answer from any received datagram.
+            let mut rbuf = [0u8; 1500];
+            if let Ok((n, _meta)) = sock.recv_slice(&mut rbuf) {
+                if let Some(a) = dns::parse_dns_a_response(&rbuf[..n], id) {
+                    result = Some(a);
+                }
+            }
+        }
+
+        if result.is_some() || scheduler::ticks() >= deadline {
+            break;
+        }
+
+        // Release the lock and let time / QEMU advance between steps.
+        for _ in 0..DNS_STEP_SPIN {
+            core::hint::spin_loop();
+        }
+    }
+
+    // Tear down the temporary socket so its buffers are reclaimed.
+    if let Some(state) = NET.lock().as_mut() {
+        state.sockets.remove(handle);
+    }
+
+    result.map(|o| Ipv4Address::new(o[0], o[1], o[2], o[3]))
+}
+
 /// The networking kernel thread entry point (R13.4). Loops forever: advance the
-/// stack, then yield CPU via a short busy delay (the 100 Hz tick both preempts
-/// this thread and advances [`now`], so a coarse cadence is sufficient).
+/// stack, then yield the CPU cooperatively (halt until the next 100 Hz tick)
+/// instead of busy-spinning, so the poller does not burn emulated cycles and
+/// other threads / device IRQs run between polls.
 pub fn net_thread() {
     info!("net: poll thread started");
     loop {
         poll();
-        for _ in 0..50_000 {
-            core::hint::spin_loop();
-        }
+        scheduler::sleep_ticks(1);
     }
 }

@@ -2,6 +2,10 @@
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
 pub mod elf;
+/// Pure, `core`-only ELF classifier + static-PIE bias selection (host-testable,
+/// R11.6). Kept separate from `elf` so it carries no kernel/paging dependencies;
+/// `elf` re-exports its public items.
+pub mod elf_classify;
 
 use alloc::sync::Arc;
 use alloc::string::String;

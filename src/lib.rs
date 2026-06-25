@@ -22,6 +22,12 @@ mod fs;
 mod log;
 mod memory;
 mod net;
+mod pkg;
+/// Boot-time Linux-compat self-test harness, compiled only under the
+/// `lx_selftest` or `lx_livetest` cargo features so the default build/boot is
+/// unchanged.
+#[cfg(any(feature = "lx_selftest", feature = "lx_livetest"))]
+mod selftest_lx;
 mod shell;
 mod sync;
 mod task;

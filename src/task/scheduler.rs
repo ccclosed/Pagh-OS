@@ -1,6 +1,7 @@
 use alloc::collections::VecDeque;
 use crate::sync::spinlock::Spinlock;
 use crate::memory::{pmm, vmm};
+use crate::task::compat::CompatState;
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::structures::paging::PageTableFlags;
 
@@ -8,22 +9,33 @@ use x86_64::structures::paging::PageTableFlags;
 /// switch restores from (Requirement 11.3). The vestigial `rip`/`rflags`/
 /// `regs`/signal fields were removed: the entry point and initial register
 /// values are encoded in the kernel stack frame `kernel_thread_spawn` builds,
-/// not stored here. With only `u64` fields the `Tcb` is now `Copy`.
-#[derive(Debug, Clone, Copy)]
+/// not stored here.
+///
+/// A `Tcb` additionally carries an optional [`CompatState`] (task 11.2). It is
+/// `None` for the existing pagh-native tasks (e.g. `spawn_test_user_process`)
+/// so they are unaffected, and `Some` only once `run_linux_binary` (task 13.3)
+/// populates the Linux-compatibility state for a `Compat_Process`. Because
+/// `CompatState` owns heap-backed tables (`FdTable`/`VmRegionSet`/`BTreeSet`),
+/// the `Tcb` is no longer `Copy`/`Clone`/`Debug`; it is moved through the
+/// scheduler queues by value, which the existing call sites already do.
 pub struct Tcb {
     pub pid: u64,
     /// The only state the switch restores from: the saved kernel stack pointer.
     pub kernel_rsp: u64,
     /// Physical address of this task's PML4 (reloaded into CR3 on switch).
     pub cr3: u64,
+    /// Linux-compatibility state for a `Compat_Process`; `None` for native tasks.
+    /// Read once `run_linux_binary` (task 13.3) populates it.
+    #[allow(dead_code)]
+    pub compat: Option<CompatState>,
 }
 
 impl Tcb {
-    /// Construct a ready task. The entry point is not stored in the `Tcb`; it
-    /// is baked into the constructed kernel stack frame pointed to by
-    /// `kernel_rsp` (see `kernel_thread_spawn`).
+    /// Construct a ready native task with no compat state. The entry point is
+    /// not stored in the `Tcb`; it is baked into the constructed kernel stack
+    /// frame pointed to by `kernel_rsp` (see `kernel_thread_spawn`).
     pub fn new(pid: u64, kernel_rsp: u64, cr3: u64) -> Self {
-        Tcb { pid, kernel_rsp, cr3 }
+        Tcb { pid, kernel_rsp, cr3, compat: None }
     }
 }
 
@@ -63,6 +75,7 @@ static IDLE_TASK: Spinlock<Tcb> = Spinlock::new(Tcb {
     pid: IDLE_PID,
     kernel_rsp: 0,
     cr3: 0,
+    compat: None,
 });
 
 /// Returns true when `pid` is the idle task.
@@ -177,6 +190,7 @@ pub fn kernel_thread_spawn(entry: fn()) -> u64 {
             pid,
             kernel_rsp: rsp,
             cr3: vmm::current_pml4_phys(),
+            compat: None,
         };
         spawn(tcb);
         pid
@@ -214,6 +228,7 @@ pub extern "C" fn scheduler_tick_irq(current_rsp: u64) -> u64 {
             pid: cur,
             kernel_rsp: current_rsp,
             cr3: vmm::current_pml4_phys(),
+            compat: None,
         });
     }
 
@@ -265,6 +280,7 @@ pub fn yield_current() {
         pid: current_pid,
         kernel_rsp: old_rsp,
         cr3: current_cr3,
+        compat: None,
     });
 }
 
@@ -294,6 +310,11 @@ pub fn exit_current() -> ! {
     if is_idle(pid) {
         crate::arch::cpu::halt_loop();
     }
+
+    // Drop any Linux compat state owned by this process. For native tasks (no
+    // registered state) this is a no-op; for a Compat_Process it releases the
+    // FdTable/VmRegionSet/nosys-set so the registry does not leak across exits.
+    crate::task::compat::remove_compat(pid);
 
     EXITING_PID.store(pid, Ordering::Release);
 

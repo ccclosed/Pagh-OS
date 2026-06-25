@@ -368,10 +368,43 @@ fn kernel_main() -> ! {
     // The process performs a `SYS_WRITE` (observable on serial) then `SYS_EXIT`,
     // dropping itself from the scheduler rotation; the shell thread continues to
     // run and the prompt stays interactive.
+    //
+    // Skipped when the `lx_selftest` feature is on: that harness launches its own
+    // ring-3 `Compat_Process`, and the kernel's TSS `RSP0` is single-task (see
+    // `gdt::set_kernel_stack`), so running two ring-3 processes at once would share
+    // one kernel stack. Under the feature the compat process is the sole ring-3
+    // task, so it can run its `write`/`exit_group` cleanly and be observed.
+    #[cfg(not(any(feature = "lx_selftest", feature = "lx_livetest")))]
     match task::process::spawn_test_user_process() {
         Ok(pid) => info!("user test process spawned (pid {})", pid),
         Err(e) => error!("user test process failed: {}", e),
     }
+
+    // Linux-compat boot-time self-test (cargo feature `lx_selftest`). Runs here —
+    // after ext2 mount and networking init, while interrupts are still disabled —
+    // so it can enqueue a Compat_Process like the native test process above and so
+    // the `fetch_no_network` check observes the no-interface-address state before
+    // DHCP runs. Compiled out entirely when the feature is off (default).
+    #[cfg(feature = "lx_selftest")]
+    crate::selftest_lx::run();
+
+    // Post-network checks on a single thread so they run *sequentially* and do
+    // not contend for the network pump. The local-mirror `apt` end-to-end test
+    // runs FIRST (fast, against the QEMU host gateway), then the external HTTPS
+    // smoke test (which may be slow/unreachable depending on the environment and
+    // would otherwise monopolize the pump). Compiled out when the feature is off.
+    #[cfg(feature = "lx_selftest")]
+    task::scheduler::kernel_thread_spawn(crate::selftest_lx::run_post_net_checks);
+
+    // Live full-update integration check (cargo feature `lx_livetest`, spec task
+    // 11.1). Spawned on its own thread so it runs after interrupts/DHCP are up.
+    // Separate from `lx_selftest`: it talks to the live `deb.debian.org` mirror
+    // (default HTTPS config, NOT the local mini-repo). Mutually exclusive in
+    // practice — if both features are set, the local selftest harness wins and
+    // the live check is skipped to avoid two ring-3 processes contending for the
+    // single-task kernel stack. Compiled out when the feature is off (default).
+    #[cfg(all(feature = "lx_livetest", not(feature = "lx_selftest")))]
+    task::scheduler::kernel_thread_spawn(crate::selftest_lx::run_live_update_check);
 
     arch::cpu::enable_interrupts();
     info!("interrupts enabled");
