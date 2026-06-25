@@ -20,11 +20,16 @@ extern crate alloc;
 #[macro_use]
 mod sbi;
 
+#[macro_use]
+mod log;
+
 mod blk;
 mod boot;
 mod cpu;
+mod drivers;
 mod dtb;
 mod elf;
+mod fs;
 mod heap;
 mod net;
 mod paging;
@@ -38,3 +43,4 @@ mod timer;
 mod trap;
 mod uart;
 mod umode;
+mod vfs;

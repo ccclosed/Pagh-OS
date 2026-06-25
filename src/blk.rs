@@ -120,6 +120,48 @@ pub fn capacity() -> Option<u64> {
     BLK.lock().0.as_ref().map(|b| b.capacity())
 }
 
+/// `crate::drivers::BlockDevice` adapter over the global virtio-blk device, so
+/// the ported ext2/journal stack can use it as "virtio-blk0".
+pub struct VirtioBlk;
+
+impl crate::drivers::BlockDevice for VirtioBlk {
+    fn name(&self) -> &str {
+        "virtio-blk0"
+    }
+    fn read_block(&self, block: u64, buf: &mut [u8]) -> Result<usize, ()> {
+        if buf.is_empty() || buf.len() % 512 != 0 {
+            return Err(());
+        }
+        let n = buf.len() / 512;
+        for i in 0..n {
+            if !read_sector(block as usize + i, &mut buf[i * 512..(i + 1) * 512]) {
+                return Err(());
+            }
+        }
+        Ok(buf.len())
+    }
+    fn write_block(&self, block: u64, buf: &[u8]) -> Result<usize, ()> {
+        if buf.is_empty() || buf.len() % 512 != 0 {
+            return Err(());
+        }
+        let n = buf.len() / 512;
+        for i in 0..n {
+            if !write_sector(block as usize + i, &buf[i * 512..(i + 1) * 512]) {
+                return Err(());
+            }
+        }
+        Ok(buf.len())
+    }
+    fn sector_count(&self) -> u64 {
+        capacity().unwrap_or(0)
+    }
+}
+
+/// Register the virtio-blk device in the driver registry as "virtio-blk0".
+pub fn register() {
+    crate::drivers::register_block(alloc::sync::Arc::new(VirtioBlk));
+}
+
 /// Read one 512-byte sector into `buf` (must be `SECTOR_SIZE`). Returns success.
 pub fn read_sector(sector: usize, buf: &mut [u8]) -> bool {
     match BLK.lock().0.as_mut() {

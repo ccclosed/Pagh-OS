@@ -162,6 +162,12 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     crate::blk::selftest();
     kprintln!("rv: Milestone E (blk) OK -- virtio-mmio + virtio-blk.");
 
+    // 8a. Storage: register blk as a BlockDevice, bring up the VFS, and mount a
+    //     journaled ext2 filesystem at /mnt (ported from the x86 kernel).
+    crate::blk::register();
+    crate::vfs::init();
+    mount_ext2();
+
     // 8b. virtio-net + smoltcp: acquire a DHCPv4 lease.
     crate::net::demo(dtb);
     kprintln!("rv: Milestone E (net) OK -- virtio-net + smoltcp + DHCP.");
@@ -208,4 +214,83 @@ fn preempt_worker(name: &str) -> ! {
 fn panic(info: &PanicInfo) -> ! {
     kprintln!("\nrv: PANIC: {}", info);
     crate::cpu::park()
+}
+
+/// Bring up the journaled ext2 filesystem on the virtio-blk disk and mount it at
+/// `/mnt` (ported from the x86 boot path). On first boot (no valid superblock)
+/// the disk is formatted, then mounted; a one-shot journaled write/read demo
+/// proves the real-disk path.
+fn mount_ext2() {
+    use crate::fs::ext2::Ext2Fs;
+
+    let blk = match crate::drivers::get_block("virtio-blk0") {
+        Some(b) => b,
+        None => {
+            crate::warn!("fs: no virtio-blk device; /mnt not mounted");
+            return;
+        }
+    };
+
+    // First boot: if there is no valid ext2 superblock yet, format the disk.
+    if Ext2Fs::mount(blk.clone()).is_err() {
+        kprintln!("rv: fs: no ext2 filesystem found, formatting disk...");
+        if let Err(e) = Ext2Fs::format(blk.clone()) {
+            crate::error!("fs: format failed: {:?}; /mnt not mounted", e);
+            return;
+        }
+    }
+
+    match Ext2Fs::mount(blk) {
+        Ok(root) => {
+            if let Err(e) = crate::vfs::mount_at("/mnt", root) {
+                crate::error!("fs: mount_at(/mnt) failed: {:?}", e);
+                return;
+            }
+            kprintln!("rv: ext2 mounted at /mnt");
+            fs_demo();
+        }
+        Err(e) => crate::warn!("fs: ext2 mount failed: {:?}", e),
+    }
+}
+
+/// One-shot journaled write/read self-demo against the real ext2 disk at /mnt.
+fn fs_demo() {
+    const NAME: &str = "rvfs.txt";
+    const CONTENT: &[u8] = b"pagh-riscv-ext2-journaled-write-OK";
+
+    let mnt = match crate::vfs::lookup_path("/mnt") {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+    let f = match mnt.create_file(NAME) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::warn!("fs demo: create failed: {:?}", e);
+            return;
+        }
+    };
+    if f.write(0, CONTENT).is_err() {
+        crate::warn!("fs demo: write failed");
+        return;
+    }
+    mnt.sync();
+
+    let f2 = match mnt.lookup(NAME) {
+        Ok(f) => f,
+        Err(_) => {
+            crate::warn!("fs demo: lookup-after-write failed");
+            return;
+        }
+    };
+    let mut buf = [0u8; 64];
+    let n = f2.read(0, &mut buf).unwrap_or(0);
+    if &buf[..n] == CONTENT {
+        kprintln!(
+            "rv: fs demo: /mnt/{} journaled write+read round-trip PASS ({} bytes)",
+            NAME,
+            n
+        );
+    } else {
+        kprintln!("rv: fs demo: /mnt/{} MISMATCH (n={})", NAME, n);
+    }
 }
