@@ -64,3 +64,11 @@
 # macOS / Windows directory metadata
 .DS_Store
 Thumbs.db
+
+# --- Stray test / debug / serial dumps ---
+host_tests_ckpt9.txt
+lx_serial.txt
+*_ckpt*.txt
+lx_serial*.txt
+serial_*.txt
+*.serial
