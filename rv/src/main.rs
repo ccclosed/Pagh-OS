@@ -15,6 +15,7 @@ mod blk;
 mod cpu;
 mod dtb;
 mod heap;
+mod net;
 mod paging;
 mod pmm;
 mod sbi;
@@ -166,6 +167,10 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // 8. virtio-blk over virtio-mmio: probe + read/write round-trip (Milestone E).
     blk::test(dtb);
     kprintln!("rv: Milestone E (blk) OK -- virtio-mmio + virtio-blk.");
+
+    // 8b. virtio-net + smoltcp: acquire a DHCPv4 lease (Milestone E).
+    net::demo(dtb);
+    kprintln!("rv: Milestone E (net) OK -- virtio-net + smoltcp + DHCP.");
 
     // 9. Drop to U-mode and run a tiny program that makes ecall syscalls.
     let (entry, user_sp) = umode::setup();

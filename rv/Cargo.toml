@@ -30,6 +30,12 @@ spin = "0.9"
 # uses over PCI; here over MMIO on the QEMU virt machine).
 virtio-drivers = { version = "0.11", default-features = false, features = ["alloc"] }
 
+# TCP/IP stack (same version/features subset as the x86_64 kernel) for DHCP.
+[dependencies.smoltcp]
+version = "0.12"
+default-features = false
+features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-dhcpv4"]
+
 [profile.dev]
 panic = "abort"
 
