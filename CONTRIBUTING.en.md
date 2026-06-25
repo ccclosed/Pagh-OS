@@ -60,17 +60,30 @@ Exit QEMU: `Ctrl-A`, then `X`.
 Any logic change must be covered and/or verified by tests. The project has two testing
 layers:
 
-1. **In-QEMU self-test** (`src/test.rs`) — 27 correctness properties (P1–P27). Run it from
-   the shell with `selftest`; results print over serial as `ok`/`FAIL` lines.
+1. **In-QEMU self-test** (`src/test.rs`) — 27 kernel-core correctness properties (P1–P27).
+   Run it from the shell with `selftest`; results print over serial as `ok`/`FAIL` lines.
 2. **Host property tests** (`host-tests/`) — `proptest` for logic that extracts cleanly to
-   the host. It is a separate, workspace-excluded crate that builds for the host triple:
+   the host (currently **40** modules, `p01`–`p40`, covering the kernel core plus the
+   Linux-compat ABI and the `apt`/`deb`/`tar` pipeline). A separate, workspace-excluded
+   crate that builds for the host triple:
    ```sh
    cd host-tests && cargo test
    ```
+   Note: PowerShell may surface cargo's stderr as a `NativeCommandError` with a nonzero exit
+   code even on success — judge by the `test result: ok` text, not the exit code.
+3. **Boot-time Linux/apt self-tests** (`src/selftest_lx.rs`, cargo feature `lx_selftest`) —
+   build with `--features lx_selftest` to spawn boot-time checks of the Linux syscall layer,
+   the static-ELF loader, and the `apt` pipeline against a local mirror; they print
+   `LXSELFTEST <name> PASS/FAIL` to serial. The repeatable QEMU integration harnesses live
+   under `tools/` (`mini_repo.py` + `e2e_local_mirror.ps1`). **Always rebuild and restore the
+   default (feature-off) kernel into `iso_root/pagh.elf` after a feature build.**
 
 Rules:
 - If you change pure logic (paths, line editor, history, decoder, journal, ext2, etc.),
   add/update the corresponding property.
+- If you change the Linux-compat ABI, the package pipeline (`deb`/`tar`/`apt_index`/
+  `apt_resolve`), or the networking parsers (`dns`/`http`), add/update the matching
+  `host-tests/` property and, where effectful, the `lx_selftest` boot check.
 - If you touch a hardware-dependent path, run `selftest` in QEMU and confirm every line is
   `ok`.
 - A PR must not break the existing P1–P27 properties.
@@ -93,6 +106,9 @@ These constraints are enforced across the codebase and must be preserved:
   trace.
 - `host-tests/` must NOT become a member of the kernel workspace (it builds for the host
   target).
+- Self-test / integration code is **feature-gated** (`lx_selftest`, `lx_livetest`); the
+  default build (no features) must stay behaviorally unchanged, and the default
+  (feature-off) ELF is the one staged into `iso_root/pagh.elf`.
 
 ---
 
@@ -134,6 +150,8 @@ These constraints are enforced across the codebase and must be preserved:
 - [ ] `cargo fmt --all` and `cargo clippy` are clean.
 - [ ] `cd host-tests && cargo test` is green (if portable logic was touched).
 - [ ] `selftest` in QEMU passes with no `FAIL` (if kernel code was touched).
+- [ ] If you built with `lx_selftest`/`lx_livetest`, the default (feature-off) kernel was
+      rebuilt and restored into `iso_root/pagh.elf`.
 - [ ] The build invariants from section 4 are preserved.
 - [ ] New `unsafe` is annotated with `// SAFETY:`.
 - [ ] Docs (`README.md`, comments) updated if behavior changed.
