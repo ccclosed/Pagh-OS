@@ -33,6 +33,7 @@ mod pmm;
 mod ramfs;
 mod sched;
 mod shell;
+mod sync;
 mod timer;
 mod trap;
 mod uart;

@@ -58,6 +58,15 @@ pub unsafe fn disable_interrupts() {
     asm!("csrc sstatus, {}", in(reg) SSTATUS_SIE, options(nomem, nostack));
 }
 
+/// Whether supervisor interrupts are currently enabled (`sstatus.SIE`). Used by
+/// the IRQ-safe `Spinlock` to restore the prior state on unlock.
+pub fn interrupts_enabled() -> bool {
+    let s: usize;
+    // SAFETY: reading sstatus is side-effect-free.
+    unsafe { asm!("csrr {}, sstatus", out(reg) s, options(nomem, nostack)) };
+    s & SSTATUS_SIE != 0
+}
+
 /// Park the current hart low-power until the next interrupt, forever.
 pub fn park() -> ! {
     loop {
