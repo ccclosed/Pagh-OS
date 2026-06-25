@@ -11,11 +11,14 @@
 
 extern crate alloc;
 
+mod cpu;
 mod dtb;
 mod heap;
 mod paging;
 mod pmm;
 mod sbi;
+mod timer;
+mod trap;
 
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
@@ -111,16 +114,37 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     kprintln!("rv: heap test -- sum of squares 0..1000 = {} (len {})", sum, v.len());
 
     kprintln!("rv: Milestone B OK -- DTB + PMM + Sv39 + heap.");
-    kprintln!("rv: next: traps (stvec) + ~100 Hz timer + scheduler.");
-    park();
+
+    // 6. Traps + a periodic ~100 Hz timer interrupt (Milestone C).
+    trap::init();
+    timer::init();
+    // SAFETY: the trap vector and timer are armed before enabling interrupts.
+    unsafe { cpu::enable_interrupts() };
+    kprintln!("rv: traps + 100 Hz timer armed; counting ticks...");
+
+    let mut last_sec = 0u64;
+    loop {
+        // SAFETY: wait for the next interrupt (the timer fires at 100 Hz).
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        let t = timer::ticks();
+        let sec = t / 100;
+        if sec > last_sec {
+            last_sec = sec;
+            kprintln!("rv: ~{}s elapsed, {} timer ticks", sec, t);
+            if sec >= 5 {
+                break;
+            }
+        }
+    }
+
+    kprintln!("rv: Milestone C OK -- trap vector + 100 Hz timer interrupts.");
+    kprintln!("rv: next: context switch + scheduler, then U-mode + ecall syscalls.");
+    cpu::park();
 }
 
 /// Park the current hart until the next interrupt, forever.
 fn park() -> ! {
-    loop {
-        // SAFETY: `wfi` simply waits for an interrupt.
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
-    }
+    cpu::park()
 }
 
 #[panic_handler]
