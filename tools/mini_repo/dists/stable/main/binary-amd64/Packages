@@ -1,0 +1,10 @@
+Package: hello-pagh
+Version: 1.0
+Architecture: amd64
+Maintainer: Pagh-OS <root@pagh>
+Filename: pool/main/h/hello-pagh/hello-pagh_1.0_amd64.deb
+Size: 612
+MD5sum: ffb4605196ad08aabae9366cecc279bc
+SHA256: a0f06e9ac86062fc694a12f32560cbe4dfada59c98334627e157e932767efccb
+Description: tiny hello binary for the apt end-to-end test
+

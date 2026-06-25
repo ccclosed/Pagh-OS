@@ -16,11 +16,11 @@ use core::arch::asm;
 ///
 /// Saved frame, low → high address (identical to what the timer IRQ leaves):
 /// ```text
-///   [rsp+0]    RFLAGS (for popfq)
+///   [rsp+0]    RFLAGS (for popfq, IF=0 — restore tail runs with interrupts off)
 ///   [+8..+120] r15,r14,r13,r12,r11,r10,r9,r8,rbp,rdi,rsi,rdx,rcx,rbx,rax
 ///   [+128]     RIP        (resume point)
 ///   [+136]     CS         (kernel code selector)
-///   [+144]     RFLAGS     (for iretq)
+///   [+144]     RFLAGS     (for iretq, IF=1 — resumed task runs with interrupts on)
 ///   [+152]     RSP        (stack pointer to continue on after resume)
 ///   [+160]     SS         (kernel data selector)
 /// ```
@@ -55,7 +55,21 @@ pub unsafe fn switch_context(old_rsp: &mut u64, new_rsp: u64, new_cr3: Option<u6
         "mov {scratch}, rsp",
         "push {kss}",            // [+160] SS
         "push {scratch}",        // [+152] RSP  = entry RSP
-        "pushfq",                // [+144] RFLAGS (for iretq)
+        // IRET-RFLAGS capture: this runs with IF=1 (the cooperative
+        // `yield_current` caller has interrupts enabled), so the iret-frame
+        // RFLAGS slot keeps IF=1 and the *resumed* task runs with interrupts
+        // enabled after `iretq`. This pushfq MUST stay BEFORE the `cli` below.
+        "pushfq",                // [+144] RFLAGS (for iretq), IF=1
+        // popfq-slot IF=0 invariant (mirrors irq32_stub): clear IF *after* the
+        // iret-RFLAGS capture but *before* the GPR pushes and the final pushfq.
+        // Consequently the [+0] popfq-slot RFLAGS is saved with IF=0, so the
+        // restore tail (`popfq; pop r15..rax; iretq`) of ANY path resuming a
+        // frame we save runs with interrupts OFF until `iretq` — no timer IRQ
+        // can arrive mid-restore and corrupt the frame/stack. It also makes
+        // this switch's own critical region (synthesize-frame → save RSP →
+        // load new RSP → restore) atomic. No `sti` is needed: `iretq` restores
+        // IF from the iret-frame RFLAGS slot captured above.
+        "cli",
         "push {kcs}",            // [+136] CS
         "lea {scratch}, [rip + 2f]",
         "push {scratch}",        // [+128] RIP  = resume label below
@@ -64,7 +78,7 @@ pub unsafe fn switch_context(old_rsp: &mut u64, new_rsp: u64, new_cr3: Option<u6
         "push rsi", "push rdi", "push rbp",
         "push r8", "push r9", "push r10", "push r11",
         "push r12", "push r13", "push r14", "push r15",
-        "pushfq",                // [+0] RFLAGS (for popfq) = lowest = saved RSP
+        "pushfq",                // [+0] RFLAGS (for popfq, IF=0) = lowest = saved RSP
         // ── Save this task's RSP, switch to the next task's RSP ─────────────
         "mov [{old}], rsp",
         "mov rsp, {new}",

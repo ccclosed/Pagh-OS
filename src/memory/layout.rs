@@ -67,15 +67,40 @@ pub const USER_STACK_TOP: u64 = 0x7000_8000_0000;
 /// Source: `task::process` (`USER_STACK_PAGES`).
 pub const USER_STACK_PAGES: u64 = 8;
 
+/// Base virtual address from which anonymous `mmap` regions are bump-allocated
+/// for a `Compat_Process` (the lower-half `mmap` hint base seeded into its
+/// `VmRegionSet`).
+///
+/// Chosen at 32 TiB: comfortably above where any static binary's program break
+/// (`brk`) could plausibly grow (static `ET_EXEC` images load near `0x40_0000`
+/// and static-PIE near `PIE_BASE = 0x1_0000`) and well below both the user stack
+/// (`USER_STACK_TOP = 0x7000_8000_0000`) and the lower-half ceiling
+/// `User_Addr_Max = 0x0000_8000_0000_0000`, so anonymous mappings never collide
+/// with the heap or the stack.
+pub const USER_MMAP_BASE: u64 = 0x2000_0000_0000;
+
 // ─── Kernel heap ─────────────────────────────────────────────────────────────
 
-/// Initial kernel heap size, in pages (4096 × 4 KiB = 16 MiB).
+/// Initial kernel heap size, in pages (65536 × 4 KiB = 256 MiB).
 ///
-/// Originally 64 pages (256 KiB). Raised to 16 MiB so graphical applications
-/// (e.g. the `paint` tool) can hold full-screen backing buffers in the heap:
-/// a 1024×768 canvas is 3 MiB per `u32` buffer, and `paint` keeps a canvas
-/// plus an undo snapshot. QEMU is launched with 512 MiB, so this is safe.
-pub const HEAP_INITIAL_PAGES: u64 = 4096;
+/// History: 64 pages (256 KiB) → 4096 (16 MiB, for the `paint` full-screen
+/// backing buffers) → 65536 (256 MiB). The big jump is for the `apt` package
+/// manager: the in-RAM Debian `Packages` index is large — the compressed
+/// download is ~10 MiB and a moderate decompressed index plus its parsed
+/// records run to tens of MiB, all held on this single fixed heap at once.
+/// With only 16 MiB the download/decompress overran the heap and the
+/// `linked_list_allocator` (which never grows) returned null → the `alloc`
+/// error handler aborted under `panic = "abort"`, which looked like a hang.
+///
+/// The heap does NOT grow on demand (see `memory::heap`), so this is the hard
+/// ceiling. QEMU is launched with 512 MiB, leaving ~256 MiB for the kernel
+/// image, HHDM page tables, framebuffer, and PMM bookkeeping — comfortable.
+/// The full Debian `main` index (~150 MiB decompressed) is intentionally larger
+/// than the index decompression cap (`pkg::deb::MAX_INDEX_DECOMPRESSED`), so
+/// `apt update` against it fails with a clear error rather than exhausting the
+/// heap; use a smaller component / local mirror (or raise both limits + QEMU
+/// `-m`) for a full index.
+pub const HEAP_INITIAL_PAGES: u64 = 65536;
 
 extern "C" {
     /// Start of the kernel image — provided by the linker script

@@ -25,6 +25,11 @@ pub fn init() {
             kernel_cs,
         ).ok();
 
+        // LStar points at the naked `syscall_entry` stub (global_asm below) so the
+        // `syscall` instruction and `int 0x80` both funnel into `linux_dispatch`.
+        // SFMASK clears IF on `syscall`, so the kernel runs the syscall window with
+        // interrupts masked — this is what makes the single-slot user-RSP scratch in
+        // `syscall_entry` non-reentrant-safe under the current single-task model.
         LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
         SFMask::write(RFlags::INTERRUPT_FLAG);
     }
@@ -32,34 +37,65 @@ pub fn init() {
     // concise `info!("syscalls")` line; we deliberately avoid double-logging here.
 }
 
+// ─── `syscall`-instruction kernel-stack mirror ───────────────────────────────
+//
+// Unlike `int 0x80`, the `syscall` instruction performs NO stack switch: on entry
+// the kernel is still running on the user's `rsp`. We must switch to a kernel
+// stack manually before pushing the saved-register frame. The kernel uses the
+// same per-task kernel stack the CPU loads from TSS `RSP0` for the `int 0x80`
+// path; since there is no per-CPU `GS` base set up (no `swapgs`), the `syscall`
+// stub cannot read `RSP0` out of the TSS cheaply, so we mirror the current RSP0
+// into this global whenever it is (re)programmed (`set_syscall_kernel_stack`,
+// called alongside `gdt::set_kernel_stack` in `task::process`).
+//
+// Single-task model: there is exactly one RSP0 slot today (see
+// `gdt::set_kernel_stack`), so a single global mirror is exact. The `syscall`
+// window runs with IF masked (SFMASK), so this slot is not re-entered.
 #[no_mangle]
-extern "sysv64" fn syscall_entry(
-    syscall_number: u64, arg1: u64, arg2: u64, arg3: u64,
-    _arg4: u64, _arg5: u64, _arg6: u64,
-) -> u64 {
-    syscall_dispatch(syscall_number, arg1, arg2, arg3)
+static mut SYSCALL_KERNEL_RSP: u64 = 0;
+
+/// Mirror the current ring-3 → ring-0 kernel stack top (TSS `RSP0`) into the
+/// location the `syscall_entry` stub loads. Call this with the same value passed
+/// to `gdt::set_kernel_stack`.
+///
+/// # Safety / invariants
+/// Single-task, init-time/per-task-spawn use only; written with interrupts
+/// effectively quiescent for the spawning window. The `syscall` stub reads it with
+/// IF masked, so there is no concurrent reader.
+pub fn set_syscall_kernel_stack(rsp0: u64) {
+    // SAFETY: single-writer, single-task bring-up; the only reader is the
+    // `syscall_entry` stub which runs with interrupts masked (SFMASK clears IF).
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(SYSCALL_KERNEL_RSP), rsp0);
+    }
 }
 
 // ─── int 0x80 system-call trampoline ─────────────────────────────────────────
 //
-// The user test program invokes syscalls via `int 0x80` rather than the
-// `syscall` instruction. `int 0x80` is markedly simpler to get right in a small
-// kernel: the CPU already switches to the kernel stack (TSS RSP0) on the ring-3
-// → ring-0 transition and `iretq` cleanly returns to ring 3, so we avoid the
-// `syscall`/`sysretq` subtleties (manual stack switch, rcx/r11 preservation,
-// SS/CS reload ordering). The IDT entry for vector 0x80 is installed with DPL=3
-// so ring-3 code is permitted to raise it (see `idt::init`).
+// The legacy pagh-native test program invokes syscalls via `int 0x80`. `int 0x80`
+// is the simpler of the two entries: the CPU automatically switches to the kernel
+// stack (TSS RSP0) on the ring-3 → ring-0 transition and `iretq` cleanly returns
+// to ring 3, so we avoid the manual stack switch the `syscall` path needs. The IDT
+// entry for vector 0x80 is installed with DPL=3 so ring-3 code may raise it (see
+// `idt::init`); that wiring is unchanged (R11.2).
 //
-// User ABI (matches the existing dispatcher): syscall number in rax, arguments
-// in rdi/rsi/rdx. On `int 0x80` the CPU pushes [SS, RSP, RFLAGS, CS, RIP] onto
-// RSP0 (no error code). We save all GPRs (so the caller sees them preserved
-// except rax, which receives the result), marshal the user registers into the
-// SysV ABI `syscall_dispatch(num, a1, a2, a3)` expects, dispatch, write the
-// result back into the saved rax slot, restore, and `iretq`.
+// Widened entry (task 10.1): the stub now saves ALL 15 general-purpose registers
+// into a `SavedRegs` frame (see `linux::regs::SavedRegs`) and passes a single
+// pointer to that frame to `linux_dispatch`. Funnelling through one
+// `*mut SavedRegs` lets the dispatcher read the full Linux argument set
+// (number=rax, args=rdi,rsi,rdx,r10,r8,r9) and modify saved registers, while
+// sidestepping the SysV six-register argument limit. After the call the result is
+// written into the saved `rax` slot; every other GPR is restored unchanged so the
+// caller observes them preserved (R1.7), then `iretq` returns to ring 3.
 //
-// Stack alignment: RSP0 is 16-byte aligned. The CPU pushes 40 bytes, then we
-// push 15×8 = 120 bytes → 160 bytes total, leaving RSP 16-byte aligned right
-// before `call` (SysV requirement).
+// On `int 0x80` the CPU pushes [SS, RSP, RFLAGS, CS, RIP] (5 qwords = 40 bytes,
+// no error code) onto RSP0. RSP0 is 16-byte aligned, so after those 40 bytes plus
+// our 15×8 = 120 bytes the stack is 160 bytes below RSP0 → 16-byte aligned exactly
+// at the `call` (the SysV requirement; no extra padding needed on this path).
+//
+// SavedRegs layout contract: pushed first = rax = highest address = offset 112;
+// pushed last = r15 = lowest address = offset 0 = where rsp/the pointer points.
+// The `mov [rsp + 112], rax` therefore targets the saved `rax` slot.
 core::arch::global_asm!(
     ".global int80_stub",
     "int80_stub:",
@@ -78,17 +114,11 @@ core::arch::global_asm!(
     "    push r13",
     "    push r14",
     "    push r15",
-    // Marshal user (rax=num, rdi=a1, rsi=a2, rdx=a3) into SysV arg registers
-    // (rdi=num, rsi=a1, rdx=a2, rcx=a3). The original user values are still live
-    // in the registers (push does not modify them); reorder bottom-up so no
-    // source is clobbered before it is read.
-    "    mov rcx, rdx",   // a3  -> 4th arg
-    "    mov rdx, rsi",   // a2  -> 3rd arg
-    "    mov rsi, rdi",   // a1  -> 2nd arg
-    "    mov rdi, rax",   // num -> 1st arg
-    "    call syscall_dispatch",
-    // Store the return value into the saved rax slot (rax was pushed first, so
-    // it sits 14 slots = 112 bytes above the current rsp).
+    // rsp now points at the SavedRegs frame (r15 at offset 0). Pass it as the sole
+    // (rdi) argument to linux_dispatch. rsp is 16-byte aligned here (see header).
+    "    mov rdi, rsp",
+    "    call linux_dispatch",
+    // Write the dispatcher's return value into the saved rax slot (offset 112).
     "    mov [rsp + 112], rax",
     "    pop r15",
     "    pop r14",
@@ -108,17 +138,100 @@ core::arch::global_asm!(
     "    iretq",
 );
 
+// ─── `syscall`-instruction fast-path entry (LStar target) ────────────────────
+//
+// x86_64 static Linux binaries normally use the `syscall` instruction rather than
+// `int 0x80`. This stub is the `LStar` target programmed in `init()`. It funnels
+// into the SAME `linux_dispatch` as `int80_stub`, building an identical
+// `SavedRegs` frame, so the supported-set/validation/errno logic exists once.
+//
+// `syscall` semantics the stub must honor:
+//   * The CPU saves user RIP into rcx and user RFLAGS into r11 (so we must keep
+//     rcx/r11 intact through to `sysretq`, which reloads RIP from rcx and RFLAGS
+//     from r11). They are saved in the frame and restored by the symmetric pops.
+//   * SFMASK clears IF, so the syscall window runs with interrupts masked.
+//   * The CPU performs NO stack switch: on entry rsp is still the USER stack. We
+//     must switch to the kernel stack before touching it. We stash the user rsp in
+//     a global scratch and load the mirrored kernel RSP0 (single-task model;
+//     non-reentrant under the masked-IF window — see `set_syscall_kernel_stack`).
+//   * CS/SS are loaded from STAR on both `syscall` (kernel selectors) and
+//     `sysretq` (user selectors), consistent with the GDT layout in `gdt.rs`.
+//
+// Stack alignment: after switching to the (16-byte aligned) kernel stack top, the
+// 15 pushes leave rsp at kernel_top-120 ≡ 8 (mod 16). We therefore `sub rsp, 8`
+// to reach 16-byte alignment before `call`, and `add rsp, 8` after to recover the
+// SavedRegs pointer for the `mov [rsp + 112], rax` write-back.
+core::arch::global_asm!(
+    ".global syscall_entry",
+    "syscall_entry:",
+    // Switch from the user stack to the kernel stack. rip-relative access to the
+    // module-global scratch/mirror; no GS/swapgs is required.
+    "    mov [rip + SYSCALL_USER_RSP], rsp",
+    "    mov rsp, [rip + SYSCALL_KERNEL_RSP]",
+    // Build the SavedRegs frame in the SAME order as int80_stub (rcx=user RIP and
+    // r11=user RFLAGS are captured here and restored before sysretq).
+    "    push rax",
+    "    push rbx",
+    "    push rcx",
+    "    push rdx",
+    "    push rsi",
+    "    push rdi",
+    "    push rbp",
+    "    push r8",
+    "    push r9",
+    "    push r10",
+    "    push r11",
+    "    push r12",
+    "    push r13",
+    "    push r14",
+    "    push r15",
+    "    mov rdi, rsp",   // &SavedRegs (sole arg)
+    "    sub rsp, 8",     // 16-byte align for the SysV call
+    "    call linux_dispatch",
+    "    add rsp, 8",     // recover the SavedRegs pointer
+    "    mov [rsp + 112], rax",
+    "    pop r15",
+    "    pop r14",
+    "    pop r13",
+    "    pop r12",
+    "    pop r11",        // user RFLAGS -> r11 (consumed by sysretq)
+    "    pop r10",
+    "    pop r9",
+    "    pop r8",
+    "    pop rbp",
+    "    pop rdi",
+    "    pop rsi",
+    "    pop rdx",
+    "    pop rcx",        // user RIP -> rcx (consumed by sysretq)
+    "    pop rbx",
+    "    pop rax",
+    "    mov rsp, [rip + SYSCALL_USER_RSP]",  // restore user stack
+    "    sysretq",
+    // Single-slot scratch for the user rsp across the syscall window. Safe under
+    // the current single-task model with IF masked (SFMASK) — no nesting/reentry.
+    ".section .bss",
+    ".align 8",
+    "SYSCALL_USER_RSP: .skip 8",
+    ".section .text",
+);
+
 extern "C" {
     /// Naked `int 0x80` entry stub (see the `global_asm!` above). Installed as
     /// the IDT vector-0x80 handler with DPL=3 by `idt::init`.
     pub fn int80_stub();
+
+    /// Naked `syscall`-instruction entry stub (see the `global_asm!` above).
+    /// Installed as the `LStar` MSR target by `init`.
+    pub fn syscall_entry();
 }
 
-/// Shared syscall dispatcher used by both the (unused) `syscall` fast-path entry
-/// and the `int 0x80` trampoline. `num` is the syscall number and `a1`..`a3` are
-/// the user arguments (originally in rdi/rsi/rdx).
-#[no_mangle]
-extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+/// Legacy pagh-native syscall dispatcher (`SYS_WRITE`/`SYS_EXIT`/`SYS_YIELD`).
+///
+/// Retained as the boot-path compatibility target: `linux_dispatch` delegates the
+/// three native numbers here so the existing ring-3 test process keeps working
+/// until task 12.7 installs real Linux routing. `num` is the syscall number and
+/// `a1`..`a3` are the user arguments (originally in rdi/rsi/rdx).
+pub(crate) fn legacy_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     match num {
         SYS_WRITE => sys_write(a1, a2, a3),
         SYS_EXIT  => sys_exit(a1),

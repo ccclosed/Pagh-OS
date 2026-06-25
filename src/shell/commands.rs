@@ -766,3 +766,301 @@ pub(super) fn cmd_paint(_ctx: &mut ShellCtx, _args: &[&str]) {
     crate::kprintln!("paint keys: 1-0=color [ ]=brush u=undo x=clear s=save g=load q=quit");
     super::paint::run();
 }
+
+/// `pkg <host> <path> [port]`: download a `.deb` over HTTP and install its files
+/// onto the mounted ext2 filesystem under `/mnt`.
+///
+/// Runs the full Package_Fetcher -> Deb_Parser -> Tar_Reader -> Package_Installer
+/// pipeline: open a TCP connection to `host:port` (port defaults to 80), `GET` the
+/// `.deb`, parse the `ar` container, decompress the `data.tar` (gzip only — `xz`/
+/// `zstd` Debian packages are rejected with a clear message), and write every safe
+/// regular file onto ext2. Networking must be up (see `ifconfig`).
+///
+/// Example:
+///   pkg 10.0.2.2 /pool/main/h/hello/hello-static_2.10.gz.deb
+pub(super) fn cmd_pkg(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.len() < 2 {
+        shell_println("usage: pkg <host> <path> [port]");
+        shell_println("  downloads a .deb over HTTP and installs it under /mnt");
+        shell_println("  note: only gzip-compressed .deb data is supported (not xz/zstd)");
+        shell_println("  tip: for name-based installs with dependency resolution, use `apt`");
+        return;
+    }
+    let host = args[0];
+    let path = args[1];
+    let port: u16 = if args.len() >= 3 {
+        match args[2].parse() {
+            Ok(p) => p,
+            Err(_) => {
+                shell_println(&alloc::format!("pkg: invalid port '{}'", args[2]));
+                return;
+            }
+        }
+    } else {
+        80
+    };
+
+    shell_println(&alloc::format!("pkg: downloading http://{}:{}{} ...", host, port, path));
+    let bytes = match crate::net::http_fetch::fetch_deb(host, port, path) {
+        Ok(b) => b.0,
+        Err(e) => {
+            shell_println(&alloc::format!("pkg: download failed: {:?}", e));
+            return;
+        }
+    };
+    shell_println(&alloc::format!("pkg: downloaded {} bytes", bytes.len()));
+
+    // Parse the .deb ar container and locate its members.
+    let members = match crate::pkg::deb::parse_ar(&bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            shell_println(&alloc::format!("pkg: not a valid .deb: {:?}", e));
+            return;
+        }
+    };
+    let deb = match crate::pkg::deb::locate_members(&members) {
+        Ok(d) => d,
+        Err(e) => {
+            shell_println(&alloc::format!("pkg: malformed .deb: {:?}", e));
+            return;
+        }
+    };
+
+    // Decompress the data.tar member (gzip, xz, or zstd).
+    let comp = match crate::pkg::deb::compression_of(deb.data.name) {
+        Ok(c) => c,
+        Err(e) => {
+            shell_println(&alloc::format!("pkg: {:?}", e));
+            return;
+        }
+    };
+    let tar = match crate::pkg::deb::decompress_data(&deb.data, comp) {
+        Ok(t) => t,
+        Err(e) => {
+            shell_println(&alloc::format!(
+                "pkg: cannot decompress {} ({:?}); supported: gzip/xz/zstd .deb",
+                deb.data.name, e
+            ));
+            return;
+        }
+    };
+
+    // Enumerate and install the regular files onto ext2 under /mnt.
+    let entries = match crate::pkg::tar::read_tar(&tar) {
+        Ok(e) => e,
+        Err(e) => {
+            shell_println(&alloc::format!("pkg: bad data.tar: {:?}", e));
+            return;
+        }
+    };
+    match crate::pkg::install_fs::install_data_tar(&entries, "/mnt") {
+        Ok(n) => {
+            shell_println(&alloc::format!("pkg: installed {} files under /mnt", n));
+            if let Ok(node) = crate::vfs::lookup_path("/mnt") {
+                node.sync();
+            }
+            shell_println("pkg: done. Run an installed binary with: lxrun /mnt/<path>");
+        }
+        Err(e) => shell_println(&alloc::format!("pkg: install failed: {:?}", e)),
+    }
+}
+
+/// `lxrun <path> [args...]`: run an installed statically-linked Linux binary as a
+/// ring-3 `Compat_Process`.
+///
+/// Reads the ELF at `path` from ext2, loads it through the Linux ELF loader, builds
+/// a System V initial stack with the supplied arguments, and enqueues it on the
+/// scheduler. Only static `ET_EXEC` / static-PIE `ET_DYN` binaries are supported
+/// (dynamically-linked binaries are rejected). Like `exec`, this runs with
+/// interrupts disabled across the brief CR3 switch the loader/stack mapper perform.
+pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.is_empty() {
+        shell_println("usage: lxrun <path> [args...]");
+        return;
+    }
+    let path = resolve_arg(args[0]);
+    // argv[0] is the program name as typed; remaining tokens follow.
+    let argv: alloc::vec::Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
+
+    let result = crate::arch::cpu::without_interrupts(|| {
+        crate::task::process::run_linux_binary(&path, &argv, &[])
+    });
+    match result {
+        Ok(pid) => shell_println(&alloc::format!("lxrun: started Compat_Process pid {}", pid)),
+        Err(e) => {
+            let detail = match e {
+                crate::task::process::RunError::ArgsTooLarge => "argument list too large",
+                crate::task::process::RunError::NotFound => "file not found or unreadable",
+                crate::task::process::RunError::LoadFailed(c) => c,
+                crate::task::process::RunError::StackFailed => "initial stack construction failed",
+            };
+            shell_println(&alloc::format!("lxrun: {}: {}", path, detail));
+        }
+    }
+}
+
+/// `apt <subcommand> ...`: the name-driven package manager.
+///
+/// Unlike `pkg` (which takes a raw host/path/port), `apt` works by *package
+/// name* against a downloaded repository index, resolving dependencies
+/// automatically:
+///
+///   * `apt update`                  — download + parse the `Packages` index.
+///   * `apt install <name> [name2…]` — resolve deps and install each package.
+///   * `apt show <name>`             — print a package's index metadata.
+///   * `apt list [substr]`           — list (matching) available package names.
+///   * `apt setmirror <host> [base]` — point apt at a different mirror.
+///
+/// Transport: the default mirror uses HTTPS (TLS 1.3). NOTE: certificate
+/// verification is NOT yet implemented, so HTTPS is encrypted but INSECURE
+/// (unauthenticated / MITM-able). `setmirror` accepts an `http://`/`https://`
+/// scheme prefix to switch transports.
+///
+/// The index lives only in RAM (the 64 MiB disk is too small to cache it), so
+/// `apt update` must be re-run each boot before `install`/`show`/`list`.
+pub(super) fn cmd_apt(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.is_empty() {
+        apt_usage();
+        return;
+    }
+    match args[0] {
+        "update" => cmd_apt_update(),
+        "install" => cmd_apt_install(&args[1..]),
+        "show" => cmd_apt_show(&args[1..]),
+        "list" => cmd_apt_list(&args[1..]),
+        "setmirror" => cmd_apt_setmirror(&args[1..]),
+        other => {
+            shell_println(&alloc::format!("apt: unknown subcommand '{}'", other));
+            apt_usage();
+        }
+    }
+}
+
+/// Print the `apt` usage summary.
+fn apt_usage() {
+    shell_println("usage: apt <command> [args]");
+    shell_println("  update                  download & parse the package index");
+    shell_println("  install <name> [name...]  install package(s) by name + deps");
+    shell_println("  show <name>             show a package's metadata");
+    shell_println("  list [substr]           list available package names");
+    shell_println("  setmirror [scheme://]<host> [base]  set the mirror");
+    shell_println("                          e.g. setmirror https://deb.debian.org /debian");
+    shell_println("  transport: HTTPS (TLS 1.3) by default. NOTE: certificate verification");
+    shell_println("             NOT yet implemented -- HTTPS is encrypted but INSECURE.");
+}
+
+/// `apt update`: refresh the in-RAM package index.
+fn cmd_apt_update() {
+    let cfg = crate::pkg::apt::config();
+    if cfg.tls {
+        shell_println("apt: NOTE HTTPS is INSECURE (TLS 1.3, certificate verification NOT yet implemented)");
+    }
+    shell_println(&alloc::format!(
+        "apt: updating from {}://{}:{}{} ({}/{}/{}) ...",
+        cfg.scheme(), cfg.host, cfg.port, cfg.base, cfg.suite, cfg.component, cfg.arch
+    ));
+    match crate::pkg::apt::update() {
+        Ok(n) => shell_println(&alloc::format!("apt: {} packages available", n)),
+        Err(e) => shell_println(&alloc::format!("apt: update failed: {}", e.message())),
+    }
+}
+
+/// `apt install <name> [name2 …]`: resolve and install each named package.
+fn cmd_apt_install(names: &[&str]) {
+    if names.is_empty() {
+        shell_println("usage: apt install <name> [name2 ...]");
+        return;
+    }
+    for name in names {
+        shell_println(&alloc::format!("apt: installing {} ...", name));
+        match crate::pkg::apt::install(name) {
+            Ok(installed) => {
+                if installed.is_empty() {
+                    shell_println(&alloc::format!(
+                        "apt: {} is already installed (nothing to do)",
+                        name
+                    ));
+                } else {
+                    shell_println(&alloc::format!("Installed: {}", installed.join(" ")));
+                }
+            }
+            Err(e) => shell_println(&alloc::format!("apt: {}: {}", name, e.message())),
+        }
+    }
+    shell_println("apt: run an installed static binary with: lxrun /mnt/<path>");
+}
+
+/// `apt show <name>`: print a package's index metadata.
+fn cmd_apt_show(args: &[&str]) {
+    if args.is_empty() {
+        shell_println("usage: apt show <name>");
+        return;
+    }
+    let name = args[0];
+    match crate::pkg::apt::show(name) {
+        Some(s) => {
+            shell_println(&alloc::format!("Package: {}", s.package));
+            shell_println(&alloc::format!("Version: {}", s.version));
+            shell_println(&alloc::format!("Architecture: {}", s.arch));
+            shell_println(&alloc::format!("Filename: {}", s.filename));
+            let depends = if s.depends.is_empty() {
+                String::from("(none)")
+            } else {
+                s.depends.join(", ")
+            };
+            shell_println(&alloc::format!("Depends: {}", depends));
+            shell_println(&alloc::format!("Size: {} bytes", s.size));
+        }
+        None => {
+            if crate::pkg::apt::has_index() {
+                shell_println(&alloc::format!("apt: no such package '{}'", name));
+            } else {
+                shell_println("apt: no package index - run `apt update` first");
+            }
+        }
+    }
+}
+
+/// `apt list [substr]`: list (matching) available package names, capped.
+fn cmd_apt_list(args: &[&str]) {
+    let filter = args.first().copied();
+    if !crate::pkg::apt::has_index() {
+        shell_println("apt: no package index - run `apt update` first");
+        return;
+    }
+    let names = crate::pkg::apt::list(filter);
+    if names.is_empty() {
+        shell_println("apt: no matching packages");
+        return;
+    }
+    // Cap output so a full index does not flood the console.
+    const MAX_LINES: usize = 100;
+    for name in names.iter().take(MAX_LINES) {
+        shell_println(name);
+    }
+    if names.len() > MAX_LINES {
+        shell_println(&alloc::format!(
+            "... ({} more; narrow with `apt list <substr>`)",
+            names.len() - MAX_LINES
+        ));
+    }
+}
+
+/// `apt setmirror <host> [basepath]`: change the active mirror.
+fn cmd_apt_setmirror(args: &[&str]) {
+    if args.is_empty() {
+        shell_println("usage: apt setmirror <host> [basepath]");
+        return;
+    }
+    let host = args[0];
+    let base = args.get(1).copied();
+    crate::pkg::apt::set_mirror(host, base);
+    let cfg = crate::pkg::apt::config();
+    shell_println(&alloc::format!(
+        "apt: mirror set to {}://{}:{}{}",
+        cfg.scheme(), cfg.host, cfg.port, cfg.base
+    ));
+    if cfg.tls {
+        shell_println("apt: transport is HTTPS (TLS 1.3) -- INSECURE: certificate verification NOT yet implemented");
+    }
+}

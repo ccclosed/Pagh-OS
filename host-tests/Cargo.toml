@@ -31,5 +31,17 @@ publish = false
 # A library target so `#[cfg(test)]` unit/property tests are discovered by `cargo test`.
 path = "src/lib.rs"
 
+# `deb` (path-included from the kernel) calls `miniz_oxide` for gzip inflate, so the
+# host build of this crate must resolve the same crate. Pinned to match the kernel's
+# `Cargo.toml`. Default features are fine on the host; the kernel disables them.
+[dependencies]
+miniz_oxide = "=0.8.9"
+# `deb` also decodes `.tar.xz` (xz4rust) and `.tar.zst` (ruzstd). Pinned to match
+# the kernel's `Cargo.toml`. Default features are fine on the host; the kernel
+# disables them. These are normal deps (not dev-deps) because `deb.rs` is a
+# non-test library module here, included via `#[path]`.
+ruzstd = "=0.8.3"
+xz4rust = "=0.2.1"
+
 [dev-dependencies]
 proptest = "1"

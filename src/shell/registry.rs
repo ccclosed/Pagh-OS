@@ -210,6 +210,24 @@ pub static COMMANDS: &[CommandSpec] = &[
         usage: "paint",
         handler: super::commands::cmd_paint,
     },
+    CommandSpec {
+        name: "pkg",
+        description: "Download & install a .deb by URL (use `apt` for by-name)",
+        usage: "pkg <host> <path> [port]",
+        handler: super::commands::cmd_pkg,
+    },
+    CommandSpec {
+        name: "apt",
+        description: "Name-based package manager (update/install/show/list/setmirror)",
+        usage: "apt <update|install|show|list|setmirror> [args]",
+        handler: super::commands::cmd_apt,
+    },
+    CommandSpec {
+        name: "lxrun",
+        description: "Run an installed static Linux binary",
+        usage: "lxrun <path> [args...]",
+        handler: super::commands::cmd_lxrun,
+    },
 ];
 
 /// Look up a command by its exact name via a linear scan of [`COMMANDS`].

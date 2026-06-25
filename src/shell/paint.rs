@@ -24,11 +24,73 @@ use alloc::string::String;
 use crate::drivers::{cursor, framebuffer, ps2_mouse};
 use super::keys::{Decoder, KeyEvent};
 
-const TOOLBAR_H: usize = 30;
+/// Top row of the toolbar holds the palette + current-color chip + label.
+const PALETTE_ROW_H: usize = 28;
+/// Second row holds the clickable tool buttons.
+const TOOL_ROW_H: usize = 24;
+/// Total toolbar height (both rows stacked).
+const TOOLBAR_H: usize = PALETTE_ROW_H + TOOL_ROW_H;
 const SWATCH: usize = 22; // palette swatch width/height in px
+const CHAR_W: usize = 8; // framebuffer glyph width in px
 
 const WHITE: u32 = 0xFFFFFF;
 const TOOLBAR_BG: u32 = 0x2C2C34;
+
+/// Tools shown as buttons on the second toolbar row, left to right.
+const TOOLS: [Tool; 9] = [
+    Tool::Pencil,
+    Tool::Eraser,
+    Tool::Line,
+    Tool::Rect,
+    Tool::FilledRect,
+    Tool::Circle,
+    Tool::Disc,
+    Tool::Fill,
+    Tool::Picker,
+];
+
+/// Compute the `(tool, x, width)` layout of the tool-button row. Shared by the
+/// renderer and the click hit-test so they can never disagree.
+fn tool_buttons() -> impl Iterator<Item = (Tool, usize, usize)> {
+    let mut x = 4usize;
+    TOOLS.iter().map(move |&t| {
+        let w = t.name().len() * CHAR_W + 8;
+        let bx = x;
+        x += w + 4;
+        (t, bx, w)
+    })
+}
+
+/// Width (px) of the brush `-` / `+` buttons.
+const BRUSH_BTN_W: usize = 22;
+
+/// Pixel layout of the brush-size controls (right of the tool buttons).
+struct BrushUi {
+    minus_x: usize,
+    label_x: usize,
+    plus_x: usize,
+    end_x: usize,
+}
+
+/// X coordinate just past the last tool button.
+fn tools_end_x() -> usize {
+    let mut x = 4usize;
+    for &t in TOOLS.iter() {
+        x += (t.name().len() * CHAR_W + 8) + 4;
+    }
+    x
+}
+
+/// Layout for the brush `-`, size label, and `+` controls. Shared by the
+/// renderer and the click hit-test.
+fn brush_ui() -> BrushUi {
+    let minus_x = tools_end_x() + 16;
+    let label_x = minus_x + BRUSH_BTN_W + 6;
+    let label_w = 6 * CHAR_W; // room for "Sz:NN"
+    let plus_x = label_x + label_w;
+    let end_x = plus_x + BRUSH_BTN_W;
+    BrushUi { minus_x, label_x, plus_x, end_x }
+}
 
 /// 16-color palette (indices 0..15; number keys 1..0 pick the first ten).
 const PALETTE: [u32; 16] = [
@@ -108,6 +170,9 @@ struct PaintApp {
     prev_left: bool,
     prev_right: bool,
     prev_mid: bool,
+
+    /// Last scheduler tick at which the status bar was repainted (throttle).
+    last_info_tick: u64,
 }
 
 /// Entry point invoked by the `paint` shell command.
@@ -150,6 +215,7 @@ pub fn run() {
         prev_left: false,
         prev_right: false,
         prev_mid: false,
+        last_info_tick: 0,
     };
 
     app.run_loop();
@@ -282,14 +348,41 @@ impl PaintApp {
         // Hide the cursor before touching the framebuffer beneath it.
         cursor::hide();
 
-        // Toolbar clicks (top strip): select a palette color.
+        // Toolbar clicks (top strip).
         if (my as usize) < TOOLBAR_H {
             if left_edge {
-                let sw = mx as usize / SWATCH;
-                if sw < PALETTE.len() {
-                    self.pal_index = sw;
-                    self.color = PALETTE[sw];
-                    self.draw_toolbar();
+                if (my as usize) < PALETTE_ROW_H {
+                    // Top row: pick a palette color.
+                    let sw = mx as usize / SWATCH;
+                    if sw < PALETTE.len() {
+                        self.pal_index = sw;
+                        self.color = PALETTE[sw];
+                        self.draw_toolbar();
+                    }
+                } else {
+                    // Second row: select a tool or adjust the brush size.
+                    let px = mx as usize;
+                    let mut hit = false;
+                    for (t, bx, bw) in tool_buttons() {
+                        if px >= bx && px < bx + bw {
+                            self.tool = t;
+                            hit = true;
+                            break;
+                        }
+                    }
+                    if !hit {
+                        let bu = brush_ui();
+                        if px >= bu.minus_x && px < bu.minus_x + BRUSH_BTN_W {
+                            self.brush = (self.brush - 1).max(1);
+                            hit = true;
+                        } else if px >= bu.plus_x && px < bu.plus_x + BRUSH_BTN_W {
+                            self.brush = (self.brush + 1).min(64);
+                            hit = true;
+                        }
+                    }
+                    if hit {
+                        self.draw_toolbar();
+                    }
                 }
             }
         } else {
@@ -302,7 +395,16 @@ impl PaintApp {
         self.prev_right = ms.right;
         self.prev_mid = ms.middle;
 
-        self.draw_info(ms);
+        // Repainting the status bar means a full-width fill + text rendering into
+        // uncached framebuffer memory, which is comparatively slow. Doing it on
+        // every mouse packet is what made the cursor feel like ~5 fps. Throttle
+        // it to a handful of updates per second; the cursor still moves on every
+        // event because cursor::move_to below is cheap.
+        let now = crate::task::scheduler::ticks();
+        if now.wrapping_sub(self.last_info_tick) >= 6 {
+            self.draw_info(ms);
+            self.last_info_tick = now;
+        }
         cursor::move_to(ms.x, ms.y);
     }
 
@@ -696,11 +798,13 @@ impl PaintApp {
     fn draw_toolbar(&self) {
         let color = self.color;
         let pal_index = self.pal_index;
+        let cur_tool = self.tool;
+        let brush = self.brush;
         let label = format!("{}  size:{}", self.tool.name(), self.brush);
         framebuffer::with(|fb| {
             let (w, _) = fb.dimensions();
             fb.fill_rect(0, 0, w, TOOLBAR_H, TOOLBAR_BG);
-            // Palette swatches.
+            // Palette swatches (top row).
             for (i, &col) in PALETTE.iter().enumerate() {
                 let x = i * SWATCH;
                 fb.fill_rect(x + 2, 4, SWATCH - 4, SWATCH - 4, col);
@@ -709,12 +813,42 @@ impl PaintApp {
                     fb.draw_rect(x + 1, 3, SWATCH - 2, SWATCH - 2, 0x000000);
                 }
             }
-            // Current color chip + tool/size label.
+            // Current color chip + tool/size label (top row).
             let tx = PALETTE.len() * SWATCH + 10;
             if tx + 24 < w {
                 fb.fill_rect(tx, 4, 22, 22, color);
                 fb.draw_rect(tx, 4, 22, 22, 0xFFFFFF);
                 fb.draw_text_px(tx + 30, 8, &label, 0xE6E6E6, TOOLBAR_BG);
+            }
+            // Tool buttons (second row).
+            let ty = PALETTE_ROW_H + (TOOL_ROW_H - 16) / 2;
+            for (t, bx, bw) in tool_buttons() {
+                if bx + bw > w {
+                    break;
+                }
+                let selected = t == cur_tool;
+                let bg = if selected { 0x3A6EA5 } else { 0x3A3A44 };
+                fb.fill_rect(bx, PALETTE_ROW_H + 2, bw, TOOL_ROW_H - 4, bg);
+                if selected {
+                    fb.draw_rect(bx, PALETTE_ROW_H + 2, bw, TOOL_ROW_H - 4, 0xFFFF00);
+                }
+                fb.draw_text_px(bx + 4, ty, t.name(), 0xE6E6E6, bg);
+            }
+            // Brush-size controls (second row, right of the tools).
+            let bu = brush_ui();
+            if bu.end_x <= w {
+                let by = PALETTE_ROW_H + 2;
+                let bh = TOOL_ROW_H - 4;
+                let btn_bg = 0x3A3A44;
+                // Minus button.
+                fb.fill_rect(bu.minus_x, by, BRUSH_BTN_W, bh, btn_bg);
+                fb.draw_text_px(bu.minus_x + (BRUSH_BTN_W - CHAR_W) / 2, ty, "-", 0xE6E6E6, btn_bg);
+                // Size label.
+                let s = format!("Sz:{}", brush);
+                fb.draw_text_px(bu.label_x, ty, &s, 0xE6E6E6, TOOLBAR_BG);
+                // Plus button.
+                fb.fill_rect(bu.plus_x, by, BRUSH_BTN_W, bh, btn_bg);
+                fb.draw_text_px(bu.plus_x + (BRUSH_BTN_W - CHAR_W) / 2, ty, "+", 0xE6E6E6, btn_bg);
             }
         });
     }

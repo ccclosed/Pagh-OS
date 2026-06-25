@@ -4,12 +4,98 @@
 use alloc::vec::Vec;
 use crate::arch::x86_64::gdt;
 use crate::memory::{pmm, vmm};
+use crate::task::compat::{self, CompatState};
+use crate::task::fd::FdTable;
 use crate::task::scheduler;
 use crate::task::scheduler::Tcb;
+use crate::task::stack::{arg_gate, AuxInputs};
+use crate::task::stack_map::{map_initial_stack, StackMapError};
+use crate::arch::x86_64::linux::mem::VmRegionSet;
 use crate::vfs::elf::ElfLoader;
 use x86_64::structures::paging::PageTableFlags;
 
-use crate::memory::layout::{PAGE_SIZE, USER_STACK_PAGES, USER_STACK_TOP, KERNEL_STACK_PAGES};
+use crate::memory::layout::{
+    PAGE_SIZE, USER_MMAP_BASE, USER_STACK_PAGES, USER_STACK_TOP, KERNEL_STACK_PAGES,
+};
+
+/// Allocate and map a fresh per-PID kernel stack in the kernel higher-half and
+/// program the TSS `RSP0` (and the `syscall`-instruction kernel stack) to its
+/// top, returning the (exclusive) stack top.
+///
+/// Shared by [`create_user_process`] and [`run_linux_binary`]. The kernel
+/// higher-half PML4 entries are shared by reference into every user PML4 (cloned
+/// in `new_user_pml4`), so a mapping added here under an already-present
+/// top-level entry is visible while a user CR3 is active — exactly what the
+/// ring-3 → ring-0 entry (which lands on RSP0) needs.
+fn setup_task_kernel_stack(pid: u64) -> Result<u64, &'static str> {
+    let (_guard_base, kstack_base, kstack_top) =
+        crate::memory::layout::kernel_stack_for_pid(pid);
+
+    let kflags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    for page in 0..KERNEL_STACK_PAGES {
+        let vaddr = kstack_base + page * PAGE_SIZE;
+        let frame = pmm::alloc_frame().ok_or("process: PMM OOM for kernel stack")?;
+        vmm::map(frame, vaddr, kflags).map_err(|_| "process: VMM map failed (kernel stack)")?;
+    }
+
+    // Program RSP0 so ring-3 → ring-0 transitions land on this kernel stack.
+    // (Single-task limitation documented on `gdt::set_kernel_stack`.)
+    gdt::set_kernel_stack(kstack_top);
+    // Mirror the same stack top for the `syscall`-instruction entry, which (unlike
+    // `int 0x80`) gets no automatic CPU stack switch and reads this value directly.
+    crate::arch::x86_64::syscall::set_syscall_kernel_stack(kstack_top);
+
+    Ok(kstack_top)
+}
+
+/// Build the initial ring-3 kernel-stack frame at `kstack_top` and return the
+/// resulting `kernel_rsp` the scheduler resumes from.
+///
+/// The frame MUST match — byte for byte — the order in which the scheduler
+/// restore path consumes it (see `irq32_stub` / `kernel_thread_spawn`):
+///
+/// ```text
+///     mov rsp, kernel_rsp
+///     popfq                     ; RFLAGS-for-popfq word (lowest address)
+///     pop r15 … pop rax         ; 15 GPR slots
+///     iretq                     ; RIP, CS, RFLAGS, RSP, SS
+/// ```
+///
+/// The `iretq` frame carries a ring-3 CS/SS (RPL 3), so `iretq` performs a
+/// privilege change to ring 3, loading `RSP = user_rsp` and `RIP = entry` with
+/// `RFLAGS.IF` set. All 15 GPR slots are zero: a fresh Linux/native program
+/// starts with no register contract. We OR `3` into the user selectors
+/// defensively so the RPL bits are set regardless of how the GDT crate builds
+/// them.
+///
+/// # Safety
+/// `kstack_top` must be the exclusive top of a freshly mapped, writable kernel
+/// stack with at least `18 * 8` bytes available below it; this function writes
+/// into `[kernel_rsp, kstack_top)`.
+unsafe fn build_ring3_frame(kstack_top: u64, entry: u64, user_rsp: u64) -> u64 {
+    let user_cs = (gdt::Selectors::user_code().0 | 3) as u64;
+    let user_ss = (gdt::Selectors::user_data().0 | 3) as u64;
+
+    let mut rsp = kstack_top;
+
+    // iretq frame (highest addresses), consumed by `iretq`.
+    rsp -= 8; (rsp as *mut u64).write(user_ss);    // SS  (RPL 3)
+    rsp -= 8; (rsp as *mut u64).write(user_rsp);   // RSP (user stack pointer)
+    rsp -= 8; (rsp as *mut u64).write(0x202u64);   // RFLAGS (IF set)
+    rsp -= 8; (rsp as *mut u64).write(user_cs);    // CS  (RPL 3)
+    rsp -= 8; (rsp as *mut u64).write(entry);      // RIP = user entry
+
+    // 15 GPR slots (rax highest .. r15 lowest), all zero.
+    for _ in 0..15 {
+        rsp -= 8;
+        (rsp as *mut u64).write(0);
+    }
+
+    // RFLAGS word consumed by `popfq` (lowest address = final kernel_rsp).
+    rsp -= 8; (rsp as *mut u64).write(0x202u64);
+
+    rsp
+}
 
 /// Create a ring-3 user process from an in-memory ELF image and add it to the
 /// scheduler's ready queue (Requirements 13.1, 13.4, 4.4).
@@ -74,69 +160,12 @@ pub fn create_user_process(elf_data: &[u8]) -> Result<u64, &'static str> {
     }
 
     // ── 3. Allocate the task's kernel stack + program TSS RSP0 ───────────────
-    //
-    // The kernel stack lives in the per-PID kernel-stack region (higher half).
-    // The kernel higher-half PML4 entries are shared by reference into the user
-    // PML4 (cloned in `new_user_pml4`), so a mapping added here under an
-    // already-present top-level entry is visible while the user CR3 is active —
-    // exactly what the ring-3 → ring-0 entry (which lands on RSP0) needs.
     let pid = scheduler::next_pid();
-    let (_guard_base, kstack_base, kstack_top) =
-        crate::memory::layout::kernel_stack_for_pid(pid);
-
-    let kflags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
-    for page in 0..KERNEL_STACK_PAGES {
-        let vaddr = kstack_base + page * PAGE_SIZE;
-        let frame = pmm::alloc_frame().ok_or("process: PMM OOM for kernel stack")?;
-        vmm::map(frame, vaddr, kflags).map_err(|_| "process: VMM map failed (kernel stack)")?;
-    }
-
-    // Program RSP0 so ring-3 → ring-0 transitions land on this kernel stack.
-    // (Single-task limitation documented on `gdt::set_kernel_stack`.)
-    gdt::set_kernel_stack(kstack_top);
+    let kstack_top = setup_task_kernel_stack(pid)?;
 
     // ── 4. Build the initial kernel-stack frame ──────────────────────────────
-    //
-    // This MUST match — byte for byte — the order in which the scheduler restore
-    // path consumes it (see `irq32_stub` / `kernel_thread_spawn`):
-    //     mov rsp, kernel_rsp
-    //     popfq                     ; RFLAGS-for-popfq word (lowest address)
-    //     pop r15 … pop rax         ; 15 GPR slots
-    //     iretq                     ; RIP, CS, RFLAGS, RSP, SS
-    //
-    // The `iretq` frame carries a ring-3 CS/SS (RPL 3), so `iretq` performs a
-    // privilege change to ring 3, loading RSP = user stack top and RIP = entry.
-    // All 15 GPR slots are zero: a fresh user program starts with no register
-    // contract (it does not expect rdi = entry like a kernel thread does).
-    //
-    // `Descriptor::user_code_segment()`/`user_data_segment()` should already
-    // yield DPL-3 selectors with RPL 3; we OR in 3 defensively so the RPL bits
-    // are guaranteed set regardless of how the GDT crate constructs them.
-    let user_cs = (gdt::Selectors::user_code().0 | 3) as u64;
-    let user_ss = (gdt::Selectors::user_data().0 | 3) as u64;
-
     // SAFETY: writing into the freshly mapped kernel stack we just allocated.
-    let kernel_rsp = unsafe {
-        let mut rsp = kstack_top;
-
-        // iretq frame (highest addresses), consumed by `iretq`.
-        rsp -= 8; (rsp as *mut u64).write(user_ss);    // SS  (RPL 3)
-        rsp -= 8; (rsp as *mut u64).write(user_rsp);   // RSP (user stack top)
-        rsp -= 8; (rsp as *mut u64).write(0x202u64);   // RFLAGS (IF set)
-        rsp -= 8; (rsp as *mut u64).write(user_cs);    // CS  (RPL 3)
-        rsp -= 8; (rsp as *mut u64).write(entry);      // RIP = user entry
-
-        // 15 GPR slots (rax highest .. r15 lowest), all zero.
-        for _ in 0..15 {
-            rsp -= 8;
-            (rsp as *mut u64).write(0);
-        }
-
-        // RFLAGS word consumed by `popfq` (lowest address = final kernel_rsp).
-        rsp -= 8; (rsp as *mut u64).write(0x202u64);
-
-        rsp
-    };
+    let kernel_rsp = unsafe { build_ring3_frame(kstack_top, entry, user_rsp) };
 
     let tcb = Tcb::new(pid, kernel_rsp, pml4_phys);
     let pid = scheduler::spawn(tcb);
@@ -238,4 +267,147 @@ fn build_test_elf() -> Vec<u8> {
 pub fn spawn_test_user_process() -> Result<u64, &'static str> {
     let elf = build_test_elf();
     create_user_process(&elf)
+}
+
+/// Failure modes of [`run_linux_binary`] (R7.3, R7.4, R7.5).
+///
+/// In every error case the function returns *before* adding any task to the
+/// scheduler ready queue, so a failed launch never leaves a half-built
+/// `Compat_Process` running (R7.3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RunError {
+    /// The argument list exceeded the run-request gate (>256 args or >4096
+    /// combined bytes); the request is rejected before any work (R7.5).
+    ArgsTooLarge,
+    /// The requested path does not exist or could not be read from ext2 (R7.4).
+    NotFound,
+    /// The ELF loader rejected the binary; carries the loader's descriptive
+    /// cause string (R7.3).
+    LoadFailed(&'static str),
+    /// The initial stack could not be built/mapped (encoder `TooLarge` or a
+    /// mapping failure); the process is not started (R7.3).
+    StackFailed,
+}
+
+/// Read the entire contents of an ext2 file reachable through the VFS at `path`.
+///
+/// Returns [`RunError::NotFound`] when the path does not resolve, names a
+/// directory, or cannot be read (R7.4). Runs with interrupts enabled because the
+/// ext2/VFS read path may block waiting on a device interrupt.
+fn read_file_all(path: &str) -> Result<Vec<u8>, RunError> {
+    let node = crate::vfs::lookup_path(path).map_err(|_| RunError::NotFound)?;
+    if node.is_directory() {
+        return Err(RunError::NotFound);
+    }
+
+    let size = node.size() as usize;
+    let mut data = alloc::vec![0u8; size];
+    let mut off: usize = 0;
+    while off < size {
+        match node.read(off as u64, &mut data[off..]) {
+            Ok(0) => break, // short read / EOF
+            Ok(n) => off += n,
+            Err(_) => return Err(RunError::NotFound),
+        }
+    }
+    data.truncate(off);
+    Ok(data)
+}
+
+/// Read a static Linux binary from ext2, load it, build its System V initial
+/// stack with `argv`/`envp`, register its per-process `Compat_Process` state, and
+/// enqueue it as a ring-3 task (design component 6; R7.1–R7.6).
+///
+/// Pipeline:
+///   1. **Argument gate (R7.5).** [`arg_gate`] enforces ≤256 args and ≤4096
+///      combined bytes; over-limit → [`RunError::ArgsTooLarge`] before any work.
+///   2. **Read the file (R7.4).** Resolve and read the ext2 path; missing or
+///      unreadable → [`RunError::NotFound`].
+///   3. **Load the ELF (R7.3).** [`ElfLoader::load_linux`] maps `PT_LOAD`
+///      segments `USER_ACCESSIBLE` into a fresh user PML4 (R7.6); a rejection →
+///      [`RunError::LoadFailed`] with **no** task enqueued.
+///   4. **Build + map the stack (R7.6, R7.3).** Generate 16 `AT_RANDOM` bytes,
+///      assemble [`AuxInputs`] from the loader outputs, and
+///      [`map_initial_stack`] the SysV image into the user stack (also
+///      `USER_ACCESSIBLE`); any failure → [`RunError::StackFailed`], no enqueue.
+///   5. **Construct the `Compat_Process`.** Allocate a pid, set up its kernel
+///      stack + TSS `RSP0`, seed [`CompatState`] (a [`FdTable`] with the standard
+///      streams + a [`VmRegionSet`] from `initial_brk`/the lower-half mmap hint
+///      base + `tid = pid`), and register it via
+///      [`compat::install_compat`] **before** enqueue so the very first syscall
+///      observes it.
+///   6. **Enqueue.** Build the ring-3 `iretq` frame at `entry`/`initial_rsp` and
+///      `scheduler::spawn` the task. `exit`/`exit_group` later terminate only
+///      this task and drop its registry entry (R7.2).
+///
+/// Steps 3–6 run with interrupts disabled: [`ElfLoader::load_linux`] and
+/// [`map_initial_stack`] each briefly install the user CR3 while executing kernel
+/// code, exactly like [`create_user_process`], so a timer tick must not observe
+/// the foreign address space. The ext2 read in step 2 runs *before* the guard so
+/// it may block on disk I/O.
+pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u64, RunError> {
+    // ── 1. Argument gate (R7.5) ──────────────────────────────────────────────
+    if !arg_gate(argv) {
+        return Err(RunError::ArgsTooLarge);
+    }
+
+    // ── 2. Read the ext2 file (R7.4) — interrupts enabled (may block on I/O) ─
+    let data = read_file_all(path)?;
+
+    // ── 3–6. CR3-sensitive launch, interrupts disabled (like create_user_process) ─
+    crate::arch::cpu::without_interrupts(|| {
+        // 3. Load the ELF into a fresh user PML4 (segments USER_ACCESSIBLE, R7.6).
+        let elf = ElfLoader::load_linux(&data).map_err(RunError::LoadFailed)?;
+
+        // 4. Build the SysV initial stack and map it (USER_ACCESSIBLE, R7.6).
+        let random16 = crate::arch::x86_64::linux::misc::random_bytes_16();
+        let aux = AuxInputs {
+            phdr: elf.phdr_vaddr,
+            phent: elf.phent as u64,
+            phnum: elf.phnum as u64,
+            entry: elf.entry,
+            pagesz: PAGE_SIZE,
+            // The encoder owns the random block placement and ignores this field.
+            random_ptr: 0,
+        };
+        let initial_rsp = map_initial_stack(elf.pml4_phys, argv, envp, &aux, random16)
+            .map_err(|e: StackMapError| {
+                // Any stack failure (encoder TooLarge or a mapping fault) aborts
+                // the launch without enqueuing; the loader's PML4 is simply
+                // abandoned (not handed to the scheduler), satisfying R7.3.
+                crate::error!(
+                    "[linux] run '{}': initial stack construction failed: {:?}",
+                    path, e
+                );
+                RunError::StackFailed
+            })?;
+
+        // 5. Build the Compat_Process: pid, kernel stack + TSS RSP0, compat state.
+        let pid = scheduler::next_pid();
+        let kstack_top = setup_task_kernel_stack(pid).map_err(RunError::LoadFailed)?;
+
+        let state = CompatState::new(
+            FdTable::with_standard_streams(),
+            VmRegionSet::new(elf.initial_brk, USER_MMAP_BASE),
+            pid,
+        );
+        // Register BEFORE enqueue so the first syscall the process makes already
+        // sees its CompatState (and so the dispatcher routes it as a Linux task).
+        compat::install_compat(pid, state);
+
+        // 6. Seed the ring-3 iretq frame at the ELF entry on the SysV stack and
+        //    enqueue the task.
+        // SAFETY: writing into the freshly mapped kernel stack from step 5.
+        let kernel_rsp = unsafe { build_ring3_frame(kstack_top, elf.entry, initial_rsp) };
+
+        let tcb = Tcb::new(pid, kernel_rsp, elf.pml4_phys);
+        let pid = scheduler::spawn(tcb);
+
+        crate::info!(
+            "[linux] Compat_Process pid={} started: entry=0x{:x} rsp=0x{:x} brk=0x{:x} from '{}'",
+            pid, elf.entry, initial_rsp, elf.initial_brk, path
+        );
+
+        Ok(pid)
+    })
 }
