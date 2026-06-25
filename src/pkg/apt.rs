@@ -356,10 +356,32 @@ fn stream_parse_index(bytes: &[u8], comp: Compression) -> Result<PackageIndex, A
     let mut decompressed: usize = 0;
     let mut next_byte_mark = PROGRESS_BYTES;
     let mut next_pkg_mark = PROGRESS_PKGS;
+    // DIAGNOSTIC (Part B, lx_bigindex): a finer ~1 MiB heap-headroom marker so we
+    // can watch allocator used/free as the big index is parsed (rule allocator
+    // exhaustion/corruption in or out). Feature-gated: the default kernel build
+    // does not compile or run this.
+    #[cfg(feature = "lx_bigindex")]
+    let mut next_heap_mark: usize = 1024 * 1024;
 
     let result = deb::decompress_stream(bytes, comp, deb::MAX_INDEX_STREAM_BYTES, |chunk| {
         decompressed += chunk.len();
         parser.push_view(chunk, &mut builder);
+        // DIAGNOSTIC heap-headroom log (~every 1 MiB decompressed).
+        #[cfg(feature = "lx_bigindex")]
+        if decompressed >= next_heap_mark {
+            let (size, used, free) = crate::memory::heap::stats();
+            crate::info!(
+                "BIGINDEX heap: decompressed {} KiB, pkgs {}, heap used {} KiB / free {} KiB / size {} KiB",
+                decompressed / 1024,
+                builder.len(),
+                used / 1024,
+                free / 1024,
+                size / 1024
+            );
+            while decompressed >= next_heap_mark {
+                next_heap_mark += 1024 * 1024;
+            }
+        }
         // Periodic progress (by bytes OR by package count) so a long load does
         // not look hung, while staying modest (not per-line).
         if decompressed >= next_byte_mark || builder.len() >= next_pkg_mark {

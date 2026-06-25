@@ -26,10 +26,15 @@ pub const KERNEL_STACK_REGION_BASE: u64 = 0xFFFF_FE00_0000_0000;
 
 /// Number of mapped stack pages per kernel stack.
 ///
-/// Canonical value is 32 (the larger, safer of the two values that previously
-/// existed: `scheduler.rs` used 32, `process.rs` used 8). `process.rs` adopts
-/// this canonical constant in task 5.2.
-pub const KERNEL_STACK_PAGES: u64 = 32;
+/// Canonical value is 64 (256 KiB). It was originally 32 (the larger, safer of
+/// the two values that previously existed: `scheduler.rs` used 32, `process.rs`
+/// used 8). Bumped 32 → 64 as defense-in-depth for the deep `apt` streaming
+/// decompress → parse → log call chain (`deb::decompress_stream` →
+/// `stream_inflate`/`stream_xz`/`stream_zstd` → `StanzaParser`/builder →
+/// `info!` formatting), which nests many frames in a single activation. The
+/// guard page and `KERNEL_STACK_STRIDE` math derive from this constant, so no
+/// other change is needed. `process.rs` adopts this canonical constant in task 5.2.
+pub const KERNEL_STACK_PAGES: u64 = 64;
 
 /// Number of guard pages preceding each kernel stack (unmapped overflow guard).
 pub const KERNEL_STACK_GUARD_PAGES: u64 = 1;

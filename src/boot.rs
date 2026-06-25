@@ -374,7 +374,7 @@ fn kernel_main() -> ! {
     // `gdt::set_kernel_stack`), so running two ring-3 processes at once would share
     // one kernel stack. Under the feature the compat process is the sole ring-3
     // task, so it can run its `write`/`exit_group` cleanly and be observed.
-    #[cfg(not(any(feature = "lx_selftest", feature = "lx_livetest")))]
+    #[cfg(not(any(feature = "lx_selftest", feature = "lx_livetest", feature = "lx_bigindex")))]
     match task::process::spawn_test_user_process() {
         Ok(pid) => info!("user test process spawned (pid {})", pid),
         Err(e) => error!("user test process failed: {}", e),
@@ -405,6 +405,15 @@ fn kernel_main() -> ! {
     // single-task kernel stack. Compiled out when the feature is off (default).
     #[cfg(all(feature = "lx_livetest", not(feature = "lx_selftest")))]
     task::scheduler::kernel_thread_spawn(crate::selftest_lx::run_live_update_check);
+
+    // DIAGNOSTIC (Part B): apt-update parse-stage crash repro over the LOCAL big
+    // index (cargo feature `lx_bigindex`). Spawned on its own thread so it runs
+    // after interrupts/DHCP are up. Points apt at `http://10.0.2.2:8000` (the
+    // `tools/mini_repo.py bigindex` mirror) and drives `apt::update()` (or, with
+    // `lx_bigindex_inram`, the in-RAM Test-A variant). Compiled out when the
+    // feature is off (default).
+    #[cfg(feature = "lx_bigindex")]
+    task::scheduler::kernel_thread_spawn(crate::selftest_lx::run_bigindex_check);
 
     arch::cpu::enable_interrupts();
     info!("interrupts enabled");

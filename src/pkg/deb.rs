@@ -589,10 +589,14 @@ where
     use miniz_oxide::{DataFormat, MZFlush, MZStatus};
 
     let mut state = InflateState::new_boxed(DataFormat::Raw);
-    let mut out = [0u8; STREAM_CHUNK];
+    // Heap-allocated output scratch (allocated once per call, not per chunk):
+    // keeping this ~8 KiB buffer off the kernel stack avoids stack pressure in
+    // the deep apt streaming-decompress → parse → log call chain (guard-page
+    // overflow). Storage location only — chunk size/semantics are unchanged.
+    let mut out = alloc::vec![0u8; STREAM_CHUNK];
 
     loop {
-        let res = inflate(&mut state, input, &mut out, MZFlush::None);
+        let res = inflate(&mut state, input, &mut out[..], MZFlush::None);
         let consumed = res.bytes_consumed;
         let written = res.bytes_written;
         input = &input[consumed..];
@@ -627,12 +631,14 @@ where
     let dict = core::cmp::min(max, MAX_DECOMPRESSED);
     let mut decoder = XzDecoder::in_heap_with_alloc_dict_size(xz4rust::DICT_SIZE_MIN, dict);
 
-    let mut scratch = [0u8; STREAM_CHUNK];
+    // Heap-allocated scratch (allocated once per call): keeps this ~8 KiB buffer
+    // off the kernel stack to relieve the deep apt streaming-decompress chain.
+    let mut scratch = alloc::vec![0u8; STREAM_CHUNK];
     let mut pos: usize = 0;
 
     loop {
         let result = decoder
-            .decode(&input[pos..], &mut scratch)
+            .decode(&input[pos..], &mut scratch[..])
             .map_err(|_| DebError::DecompressFailed)?;
         match result {
             XzNextBlockResult::NeedMoreData(consumed, produced) => {
@@ -667,11 +673,13 @@ where
     let mut src: &[u8] = input;
     let mut decoder = StreamingDecoder::new(&mut src).map_err(|_| DebError::DecompressFailed)?;
 
-    let mut scratch = [0u8; STREAM_CHUNK];
+    // Heap-allocated scratch (allocated once per call): keeps this ~8 KiB buffer
+    // off the kernel stack to relieve the deep apt streaming-decompress chain.
+    let mut scratch = alloc::vec![0u8; STREAM_CHUNK];
 
     loop {
         let n = decoder
-            .read(&mut scratch)
+            .read(&mut scratch[..])
             .map_err(|_| DebError::DecompressFailed)?;
         if n == 0 {
             return Ok(());

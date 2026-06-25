@@ -72,3 +72,7 @@ lx_serial.txt
 lx_serial*.txt
 serial_*.txt
 *.serial
+
+# --- Python bytecode cache (tools/) ---
+__pycache__/
+*.pyc

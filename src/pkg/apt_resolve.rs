@@ -102,62 +102,146 @@ pub fn resolve_install(
     Ok(order)
 }
 
-/// Post-order DFS that appends each real package to `order` after its
-/// dependencies. `name` may be a real or virtual name; it is resolved to its
-/// providing real record before recursing/emitting.
+/// Post-order traversal that appends each real package to `order` after its
+/// dependencies. `start` may be a real or virtual name; it is resolved to its
+/// providing real record before emitting.
+///
+/// ## Iterative (was recursive)
+///
+/// This is an ITERATIVE post-order traversal using an explicit, heap-allocated
+/// worklist (`Vec<Frame>` on the kernel heap) rather than the program call
+/// stack. The previous implementation was an unbounded post-order DFS recursion:
+/// on a long dependency chain (e.g. the synthetic 60k-package index, where
+/// `pkg-N` depends on `pkg-(N-1)`) it recursed once per chain link and overflowed
+/// the kernel's fixed, small kernel-thread stack (a host needs ~1 GiB; the
+/// kernel's stack faults after a few hundred frames). Moving the frames onto the
+/// heap removes that bound while preserving EXACT semantics.
+///
+/// Each [`Frame`] mirrors one activation of the old recursive `visit`: its
+/// `real_name`, its ordered chosen-dependency names (`deps`, computed ONCE on
+/// entry — never recomputed — so ordering matches the recursive version exactly),
+/// and `idx`, the next dependency to descend into. [`enter`] performs the head of
+/// the old `visit` (resolve provider, skip if missing/installed/visited/on_stack,
+/// else mark on-stack + compute `deps` + push a frame). The main loop descends
+/// into one not-yet-processed dependency at a time (processing a child's whole
+/// subtree before the parent finishes), and on a frame whose deps are exhausted
+/// it pops it, clears on-stack, and appends the real name post-order.
 fn visit(
     index: &PackageIndex,
-    name: &str,
+    start: &str,
     already_installed: &BTreeSet<String>,
     visited: &mut BTreeSet<String>,
     on_stack: &mut BTreeSet<String>,
     order: &mut Vec<String>,
 ) {
-    // Resolve to the concrete providing record. If nothing provides `name`, it is
-    // a missing/essential dependency — silently skip (documented simplification).
-    let record = match index.get_provider(name) {
-        Some(r) => r,
-        None => return,
-    };
-    let real_name = record.package().to_string();
-
-    // Skip anything already installed.
-    if already_installed.contains(&real_name) {
-        return;
-    }
-    // Already scheduled, or currently being expanded (cycle): stop recursing.
-    if visited.contains(&real_name) || on_stack.contains(&real_name) {
-        return;
+    /// One node's traversal state — the heap-allocated equivalent of a single
+    /// recursive `visit` activation record.
+    struct Frame {
+        /// The resolved REAL package name this frame represents.
+        real_name: String,
+        /// The ordered chosen-dependency names to descend into, one per
+        /// satisfiable AND-group (already-installed choices already dropped),
+        /// computed ONCE when the frame was entered.
+        deps: Vec<String>,
+        /// Index of the next entry in `deps` to descend into.
+        idx: usize,
     }
 
-    on_stack.insert(real_name.clone());
+    /// Attempt to "enter" `name`, mirroring the head of the original recursive
+    /// `visit` exactly: resolve `name` to its real providing record (skip if
+    /// none — a missing/essential dependency), then skip if the real package is
+    /// already installed, already scheduled (`visited`), or currently being
+    /// expanded (`on_stack`, cycle-safe). Otherwise mark it on-stack, compute its
+    /// ordered chosen-dependency names ONCE, and push a frame.
+    fn enter(
+        index: &PackageIndex,
+        name: &str,
+        already_installed: &BTreeSet<String>,
+        visited: &BTreeSet<String>,
+        on_stack: &mut BTreeSet<String>,
+        stack: &mut Vec<Frame>,
+    ) {
+        // Resolve to the concrete providing record. If nothing provides `name`,
+        // it is a missing/essential dependency — silently skip (documented
+        // simplification).
+        let record = match index.get_provider(name) {
+            Some(r) => r,
+            None => return,
+        };
+        let real_name = record.package().to_string();
 
-    for group in record.depends() {
-        // Collect the group's OR-alternatives as owned names so the borrow of the
-        // transient `PkgRef` does not outlive the recursive `visit` calls below.
-        let alts: Vec<String> = group.alts().map(|a| a.to_string()).collect();
-        // Pick the alternative to follow for this AND-group.
-        if let Some(chosen) = choose_alternative(index, &alts, already_installed) {
-            // If the chosen alternative is already installed, the group is
-            // satisfied and needs no further work.
-            if !already_installed.contains(&chosen) {
-                visit(
-                    index,
-                    &chosen,
-                    already_installed,
-                    visited,
-                    on_stack,
-                    order,
-                );
+        // Skip anything already installed.
+        if already_installed.contains(&real_name) {
+            return;
+        }
+        // Already scheduled, or currently being expanded (cycle): do not re-expand.
+        if visited.contains(&real_name) || on_stack.contains(&real_name) {
+            return;
+        }
+
+        on_stack.insert(real_name.clone());
+
+        // Compute the chosen dependency for each AND-group ONCE (not on every
+        // visit), so the descent order matches the recursive reference exactly.
+        let mut deps: Vec<String> = Vec::new();
+        for group in record.depends() {
+            // Collect the group's OR-alternatives as owned names so the borrow of
+            // the transient `PkgRef` does not outlive this frame.
+            let alts: Vec<String> = group.alts().map(|a| a.to_string()).collect();
+            // Pick the alternative to follow for this AND-group.
+            if let Some(chosen) = choose_alternative(index, &alts, already_installed) {
+                // If the chosen alternative is already installed, the group is
+                // satisfied and needs no further work — drop it.
+                if !already_installed.contains(&chosen) {
+                    deps.push(chosen);
+                }
+            }
+            // If no alternative is installed or in the index, skip the whole group
+            // (documented simplification: assumed essential/base package).
+        }
+
+        stack.push(Frame {
+            real_name,
+            deps,
+            idx: 0,
+        });
+    }
+
+    // Explicit heap-allocated worklist replacing the program call stack.
+    let mut stack: Vec<Frame> = Vec::new();
+    enter(index, start, already_installed, visited, on_stack, &mut stack);
+
+    loop {
+        // Decide the next action against the top frame, releasing the borrow
+        // before mutating `stack` (push via `enter`, or pop).
+        let next_dep: Option<String> = match stack.last_mut() {
+            None => break,
+            Some(frame) => {
+                if frame.idx < frame.deps.len() {
+                    let dep = frame.deps[frame.idx].clone();
+                    frame.idx += 1;
+                    Some(dep)
+                } else {
+                    None
+                }
+            }
+        };
+
+        match next_dep {
+            // Descend into the next chosen dependency (process the child — and its
+            // whole subtree — before this parent finishes), exactly as the
+            // recursive `visit(chosen)` call did.
+            Some(dep) => enter(index, &dep, already_installed, visited, on_stack, &mut stack),
+            // All dependencies done: finish this node POST-ORDER — remove it from
+            // on-stack and append it to `order` after its subtree.
+            None => {
+                let frame = stack.pop().expect("non-empty: last_mut returned Some");
+                on_stack.remove(&frame.real_name);
+                if visited.insert(frame.real_name.clone()) {
+                    order.push(frame.real_name);
+                }
             }
         }
-        // If no alternative is installed or in the index, skip the whole group
-        // (documented simplification: assumed essential/base package).
-    }
-
-    on_stack.remove(&real_name);
-    if visited.insert(real_name.clone()) {
-        order.push(real_name);
     }
 }
 

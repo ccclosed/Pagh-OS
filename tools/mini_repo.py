@@ -218,6 +218,61 @@ def build_repo() -> None:
     print(f"  ELF         : usr/bin/hello-pagh ({len(elf)} bytes), prints {HELLO_MSG!r}")
 
 
+def build_big_index(n: int) -> None:
+    """DIAGNOSTIC (Pagh-OS apt parse-stage crash repro): generate a LARGE synthetic
+    `Packages` index of `n` stanzas and write both `Packages` and `Packages.gz`
+    under dists/stable/main/binary-amd64, so the kernel `apt update` streaming
+    parse path is exercised at real-`main` scale over local HTTP (no live CDN).
+
+    Mirrors the host-tests `bigindex` generator field-for-field (Package, Version,
+    Architecture, Filename, Depends with version constraints + an OR group,
+    Provides, Maintainer, a continuation-line Description, Size). This produces a
+    multi-MiB decompressed index so the at-scale parse-stage fault reproduces
+    deterministically.
+    """
+    parts = []
+    for i in range(n):
+        pkg = f"pkg-{i:06d}"
+        parts.append(f"Package: {pkg}\n")
+        parts.append(f"Version: {i % 10}.{i % 100}.{i % 7}-{i % 3}\n")
+        parts.append("Architecture: amd64\n")
+        parts.append(f"Filename: pool/main/p/{pkg}/{pkg}_{i % 10}.{i % 100}_amd64.deb\n")
+        if i > 2:
+            parts.append(
+                f"Depends: pkg-{i-1:06d} (>= 1.0), pkg-{i-2:06d} | pkg-{i-3:06d} (>= 2.0)\n"
+            )
+        if i % 5 == 0:
+            parts.append(f"Provides: virtual-{i:06d}, feature-x\n")
+        parts.append("Maintainer: Pagh-OS <root@pagh>\n")
+        parts.append(f"Description: synthetic package {pkg}\n")
+        parts.append(" This is a continuation line describing the package in detail\n")
+        parts.append(" across multiple physical lines for realism.\n")
+        parts.append(f"Size: {1000 + i * 37}\n")
+        parts.append("\n")
+    packages = "".join(parts).encode()
+
+    idx_dir = os.path.join(REPO, "dists", "stable", "main", "binary-amd64")
+    os.makedirs(idx_dir, exist_ok=True)
+    with open(os.path.join(idx_dir, "Packages"), "wb") as f:
+        f.write(packages)
+    out = io.BytesIO()
+    with gzip.GzipFile(fileobj=out, mode="wb", mtime=0) as gz:
+        gz.write(packages)
+    gz_bytes = out.getvalue()
+    with open(os.path.join(idx_dir, "Packages.gz"), "wb") as f:
+        f.write(gz_bytes)
+
+    rel_dir = os.path.join(REPO, "dists", "stable")
+    os.makedirs(rel_dir, exist_ok=True)
+    with open(os.path.join(rel_dir, "Release"), "wb") as f:
+        f.write(b"Suite: stable\nComponent: main\nArchitectures: amd64\n")
+
+    print(f"built BIG index at {idx_dir}")
+    print(f"  stanzas     : {n}")
+    print(f"  Packages    : {len(packages)} bytes ({len(packages)//1024} KiB)")
+    print(f"  Packages.gz : {len(gz_bytes)} bytes ({len(gz_bytes)//1024} KiB)")
+
+
 def serve(port: int) -> None:
     import http.server
     import socketserver
@@ -235,6 +290,17 @@ def serve(port: int) -> None:
 
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "build"
+
+    # DIAGNOSTIC mode: `python mini_repo.py bigindex [N] [port]` builds a LARGE
+    # synthetic Packages.gz (default 60000 stanzas) and serves it over local HTTP
+    # so the kernel apt-update parse-stage crash reproduces without the live CDN.
+    if mode == "bigindex":
+        n = int(sys.argv[2]) if len(sys.argv) > 2 else 60000
+        build_big_index(n)
+        port = int(sys.argv[3]) if len(sys.argv) > 3 else 8000
+        serve(port)
+        return
+
     build_repo()
     if mode == "serve":
         port = int(sys.argv[2]) if len(sys.argv) > 2 else 8000

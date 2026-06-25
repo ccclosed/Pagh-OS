@@ -60,3 +60,15 @@ pub fn init() {
         heap_size / 1024
     );
 }
+
+/// Report the kernel heap accounting as `(size, used, free)` bytes.
+///
+/// DIAGNOSTIC helper (Part B, apt-update parse-stage crash investigation): used
+/// by the `lx_bigindex` self-test and `apt::update`'s feature-gated progress
+/// logging to watch allocator headroom as the big index is parsed, ruling
+/// allocator exhaustion/corruption in or out. `LockedHeap` exposes live
+/// `size`/`used`/`free` counters; this just snapshots them under the lock.
+pub fn stats() -> (usize, usize, usize) {
+    let h = ALLOCATOR.lock();
+    (h.size(), h.used(), h.free())
+}

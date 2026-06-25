@@ -198,7 +198,13 @@ mod properties {
     mod p38;
     mod p39;
     mod p40;
+    mod p41;
 }
+
+// PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the
+// `apt update` parse-stage crash. Left in place (clearly marked) for the fix.
+#[cfg(test)]
+mod bigindex;
 
 #[cfg(test)]
 mod scaffolding {

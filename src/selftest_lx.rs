@@ -406,6 +406,228 @@ pub fn run_apt_e2e() {
     }
 }
 
+// ───────────────────────── Part B: bigindex parse-crash repro ─────────────────────────
+
+/// DIAGNOSTIC (Part B): reproduce the `apt update` parse-stage crash (#14 PF,
+/// RIP=0x1) over a LOCAL big index (cargo feature `lx_bigindex`).
+///
+/// Spawned as a kernel thread from `boot::kernel_main` (after interrupts/DHCP).
+/// It waits for an interface address, points apt at the local mini-repo big
+/// index served by `tools/mini_repo.py bigindex N 8000`, then drives one of two
+/// variants used to DISCRIMINATE the crash cause:
+///
+///   * default (`lx_bigindex`): [`bigindex_streaming`] — the REAL path,
+///     `apt::update()` fetching `Packages.gz` over the socket and stream-parsing
+///     concurrently with NET/scheduler activity (mirrors the live crash).
+///   * with `lx_bigindex_inram` also set: [`bigindex_inram`] ("Test A") — fetch
+///     the gz ONCE into RAM, then decompress+parse in a tight single-threaded
+///     loop with NO concurrent socket/NET work, isolating parse/heap from
+///     net/scheduler.
+///
+/// Both log heap headroom (`BIGINDEX heap: ...`) ~every 1 MiB so allocator
+/// exhaustion/corruption can be ruled in or out. The default kernel build does
+/// not compile or run any of this.
+#[cfg(feature = "lx_bigindex")]
+pub fn run_bigindex_check() {
+    let name = "bigindex";
+
+    // Wait up to ~20 s for an interface address (DHCP, then static fallback).
+    let deadline = scheduler::ticks() + 2000;
+    while crate::net::ip_config().is_none() {
+        if scheduler::ticks() >= deadline {
+            fail(name, "no interface address (DHCP/static fallback did not configure)");
+            return;
+        }
+        scheduler::sleep_ticks(10);
+    }
+
+    let (size, used, free) = crate::memory::heap::stats();
+    crate::info!(
+        "BIGINDEX: interface up; heap used {} KiB / free {} KiB / size {} KiB",
+        used / 1024,
+        free / 1024,
+        size / 1024
+    );
+
+    // MIRROR BASE NOTE: the Part-B brief suggested base "/debian", but the local
+    // `tools/mini_repo.py` serves its tree from the mirror ROOT (the index lives
+    // at "/dists/stable/main/binary-amd64/Packages.gz"), so "/debian/dists/..."
+    // would 404 and never reach the parse stage we are trying to crash. We
+    // therefore point apt at the mirror root "/" — exactly as the working
+    // `run_apt_e2e` does — so the streaming fetch+parse path actually runs.
+    crate::pkg::apt::set_mirror("http://10.0.2.2:8000", Some("/"));
+
+    #[cfg(not(feature = "lx_bigindex_inram"))]
+    bigindex_streaming(name);
+    #[cfg(feature = "lx_bigindex_inram")]
+    bigindex_inram(name);
+}
+
+/// Variant 1 (default `lx_bigindex`): drive the REAL streaming path. `apt::update()`
+/// fetches the big `Packages.gz` over the TCP socket and stream-parses it while
+/// the NET thread/scheduler are live — the exact concurrency the live crash had.
+/// If the #14 PF reproduces, the QEMU exception dump appears before any PASS line.
+#[cfg(all(feature = "lx_bigindex", not(feature = "lx_bigindex_inram")))]
+fn bigindex_streaming(name: &str) {
+    crate::info!("BIGINDEX variant=STREAMING (apt::update over socket; net+parse concurrent)");
+    match crate::pkg::apt::update() {
+        Ok(n) => {
+            let (size, used, free) = crate::memory::heap::stats();
+            crate::info!(
+                "BIGINDEX update OK: {} packages; heap used {} KiB / free {} KiB / size {} KiB",
+                n,
+                used / 1024,
+                free / 1024,
+                size / 1024
+            );
+            crate::info!("LXSELFTEST bigindex PASS (streaming; {} packages)", n);
+        }
+        Err(e) => fail(name, &e.message()),
+    }
+}
+
+/// Variant 2 / "Test A" (`lx_bigindex` + `lx_bigindex_inram`): isolate parse/heap
+/// from net+scheduler ENTIRELY. Build the large `Packages` document IN-KERNEL
+/// from an in-RAM buffer (mirroring the host-tests `bigindex` generator and the
+/// `tools/mini_repo.py bigindex` field layout), then run `StanzaParser::push_view`
+/// into the builder in a tight single-threaded loop in fixed 8 KiB chunks — the
+/// exact kernel parse path `apt::update` uses on decompressed output — with NO
+/// socket/NET work at all.
+///
+/// WHY IN-KERNEL (not "fetch once"): the brief's Test A suggested fetching the gz
+/// once then parsing. In THIS environment the cleartext fetch over QEMU user-net
+/// under TCG does not complete in bounded time (it busy-progresses glacially and
+/// never delivers even ~300 KiB), so a fetch-first Test A never reaches the parse
+/// stage. Generating the buffer in-kernel achieves the SAME — actually stronger —
+/// isolation (zero net, zero scheduler contention from a socket pump) and lets the
+/// parse/heap path run at full crash scale. If this STILL faults at ~the same
+/// package count → the bug is the parse/heap path itself (kernel allocator at
+/// scale or stack), NOT net/scheduler. If it completes → the parse/heap path is
+/// clean in-kernel and the live crash is the net/scheduler interaction during
+/// fetch+parse. Heap headroom is logged ~every 1 MiB pushed.
+#[cfg(all(feature = "lx_bigindex", feature = "lx_bigindex_inram"))]
+fn bigindex_inram(name: &str) {
+    use crate::pkg::apt_index::{PackageIndex, PackageIndexBuilder, StanzaParser};
+
+    /// Stanza count. Past the live-crash point (~5459 pkgs / 4 MiB decompressed):
+    /// 12000 stanzas decompress to ~4.5 MiB and exceed the crash package count,
+    /// while keeping the in-kernel doc build tractable under QEMU/TCG (60k is the
+    /// host-test scale but takes many minutes to *generate* in-kernel under TCG).
+    const N_STANZAS: usize = 12_000;
+    /// Chunk size feeding `push_view`, matching `deb::decompress_stream`'s 8 KiB.
+    const CHUNK: usize = 8 * 1024;
+
+    crate::info!(
+        "BIGINDEX variant=IN-RAM (Test A: build {} stanzas IN-KERNEL, parse with ZERO net)",
+        N_STANZAS
+    );
+
+    // 1. Build the big Packages document in-kernel (in-RAM buffer). Mirrors
+    //    host-tests bigindex::build_big_packages field-for-field.
+    let doc = build_big_packages_kernel(N_STANZAS);
+    let bytes = doc.as_bytes();
+    let (size, used, free) = crate::memory::heap::stats();
+    crate::info!(
+        "BIGINDEX built doc = {} KiB in RAM; heap used {} KiB / free {} KiB / size {} KiB",
+        bytes.len() / 1024,
+        used / 1024,
+        free / 1024,
+        size / 1024
+    );
+
+    // 2. Parse in a tight loop in 8 KiB chunks — the exact kernel push_view path,
+    //    with NO concurrent socket/NET work.
+    let mut parser = StanzaParser::new();
+    let mut builder = PackageIndexBuilder::new();
+    let mut pushed: usize = 0;
+    let mut next_heap_mark: usize = 1024 * 1024;
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let end = (pos + CHUNK).min(bytes.len());
+        parser.push_view(&bytes[pos..end], &mut builder);
+        pushed += end - pos;
+        pos = end;
+        if pushed >= next_heap_mark {
+            let (size, used, free) = crate::memory::heap::stats();
+            crate::info!(
+                "BIGINDEX heap: pushed {} KiB, pkgs {}, heap used {} KiB / free {} KiB / size {} KiB",
+                pushed / 1024,
+                builder.len(),
+                used / 1024,
+                free / 1024,
+                size / 1024
+            );
+            while pushed >= next_heap_mark {
+                next_heap_mark += 1024 * 1024;
+            }
+        }
+    }
+    parser.finish_view(&mut builder);
+    let idx = PackageIndex::from_builder(builder);
+    let _ = name;
+    crate::info!(
+        "LXSELFTEST bigindex PASS (in-ram in-kernel; {} packages parsed)",
+        idx.len()
+    );
+}
+
+/// Build a large, realistic `Packages` document with `n` stanzas, IN-KERNEL.
+/// Field-for-field mirror of host-tests `bigindex::build_big_packages` and
+/// `tools/mini_repo.py build_big_index`, so the in-kernel parse stresses the
+/// same dependency-group / provides side-table arithmetic at scale.
+#[cfg(all(feature = "lx_bigindex", feature = "lx_bigindex_inram"))]
+fn build_big_packages_kernel(n: usize) -> alloc::string::String {
+    use alloc::string::String;
+    let mut s = String::with_capacity(n * 256);
+    for i in 0..n {
+        let pkg = alloc::format!("pkg-{:06}", i);
+        s.push_str("Package: ");
+        s.push_str(&pkg);
+        s.push('\n');
+
+        s.push_str("Version: ");
+        s.push_str(&alloc::format!("{}.{}.{}-{}", i % 10, i % 100, i % 7, i % 3));
+        s.push('\n');
+
+        s.push_str("Architecture: amd64\n");
+
+        s.push_str("Filename: ");
+        s.push_str(&alloc::format!(
+            "pool/main/p/{}/{}_{}.{}_amd64.deb",
+            pkg, pkg, i % 10, i % 100
+        ));
+        s.push('\n');
+
+        if i > 2 {
+            s.push_str(&alloc::format!(
+                "Depends: pkg-{:06} (>= 1.0), pkg-{:06} | pkg-{:06} (>= 2.0)\n",
+                i - 1,
+                i - 2,
+                i - 3
+            ));
+        }
+
+        if i % 5 == 0 {
+            s.push_str(&alloc::format!("Provides: virtual-{:06}, feature-x\n", i));
+        }
+
+        s.push_str("Maintainer: Pagh-OS <root@pagh>\n");
+
+        s.push_str("Description: synthetic package ");
+        s.push_str(&pkg);
+        s.push('\n');
+        s.push_str(" This is a continuation line describing the package in detail\n");
+        s.push_str(" across multiple physical lines for realism.\n");
+
+        s.push_str("Size: ");
+        s.push_str(&alloc::format!("{}", 1000 + (i as u64) * 37));
+        s.push('\n');
+
+        s.push('\n');
+    }
+    s
+}
+
 // ───────────────────────────── reporting helpers ─────────────────────────────
 /// Emit the single `PASS` line for a check.
 fn pass(name: &str) {

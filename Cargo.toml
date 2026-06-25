@@ -29,6 +29,24 @@ lx_selftest = []
 # `cargo build --features lx_livetest`. Network-dependent and slow under QEMU/TCG.
 lx_livetest = []
 
+# DIAGNOSTIC (apt-update parse-stage crash repro, Part B). OFF by default and
+# SEPARATE from the other harnesses: when set, `boot::kernel_main` spawns
+# `selftest_lx::run_bigindex_check`, which after DHCP points apt at the LOCAL
+# mini-repo big index (`tools/mini_repo.py bigindex N 8000`) and drives `apt
+# update()` (the real streaming fetch+parse path) to reproduce the #14 PF /
+# RIP=0x1 parse-stage crash over local HTTP — no live CDN. The default kernel is
+# byte-for-byte unchanged when this is off. Build with `cargo build --release
+# --features lx_bigindex` (see tools/e2e_bigindex.ps1).
+lx_bigindex = []
+
+# DIAGNOSTIC sub-variant of `lx_bigindex` (Part B, "Test A"). When BOTH
+# `lx_bigindex` and this are set, `run_bigindex_check` switches to the IN-KERNEL,
+# IN-RAM variant: it fetches the big `Packages.gz` ONCE into a `Vec`, then runs
+# `deb::decompress_stream` + `StanzaParser::push_view` into the builder in a
+# tight single-threaded loop with NO concurrent socket/NET work — isolating the
+# parse/heap path from the net/scheduler interaction. OFF by default.
+lx_bigindex_inram = []
+
 [profile.dev]
 panic = "abort"
 
