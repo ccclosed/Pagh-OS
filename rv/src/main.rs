@@ -20,6 +20,7 @@ mod sbi;
 mod sched;
 mod timer;
 mod trap;
+mod umode;
 
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
@@ -151,8 +152,13 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     kprintln!("rv: back in main; context switch + scheduler OK.");
 
     kprintln!("rv: Milestone C.2 OK -- context switch + cooperative scheduler.");
-    kprintln!("rv: next: preemptive switch from the timer trap, then U-mode + ecall.");
-    cpu::park();
+
+    // 8. Drop to U-mode and run a tiny program that makes ecall syscalls.
+    let (entry, user_sp) = umode::setup();
+    kprintln!("rv: entering U-mode at {:#x} (user sp {:#x})...", entry, user_sp);
+    // SAFETY: entry/stack are mapped user-accessible; this does not return
+    // (the user program exits via the SYS_EXIT syscall, which parks).
+    unsafe { umode::enter(entry, user_sp) };
 }
 
 /// Demo kernel thread A: print and cooperatively yield.

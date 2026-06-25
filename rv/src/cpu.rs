@@ -34,6 +34,14 @@ pub unsafe fn sie_set(bits: usize) {
     asm!("csrs sie, {}", in(reg) bits, options(nomem, nostack));
 }
 
+/// Set `sscratch` (used by the trap entry to find the kernel trap stack).
+///
+/// # Safety
+/// Must hold the kernel trap-stack top per the trap-entry contract.
+pub unsafe fn write_sscratch(v: usize) {
+    asm!("csrw sscratch, {}", in(reg) v, options(nomem, nostack));
+}
+
 /// Globally enable supervisor interrupts (`sstatus.SIE = 1`).
 ///
 /// # Safety
