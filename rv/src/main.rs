@@ -20,6 +20,7 @@ mod net;
 mod paging;
 mod plic;
 mod pmm;
+mod ramfs;
 mod sbi;
 mod sched;
 mod shell;
@@ -185,6 +186,9 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // 8b. virtio-net + smoltcp: acquire a DHCPv4 lease (Milestone E).
     net::demo(dtb);
     kprintln!("rv: Milestone E (net) OK -- virtio-net + smoltcp + DHCP.");
+
+    // 8c. ramfs self-test (in-RAM filesystem backing the shell file commands).
+    ramfs::selftest();
 
     // 9. Load and run a real static riscv64 ELF in U-mode (Milestone D/E).
     let image = elf::build_test_elf();

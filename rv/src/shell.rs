@@ -56,17 +56,23 @@ pub fn run() -> ! {
 
 /// Execute one entered command line.
 fn exec(cmd: &str) {
-    match cmd {
+    let mut parts = cmd.split_whitespace();
+    let c = parts.next().unwrap_or("");
+    match c {
         "" => {}
         "help" => {
             crate::kprintln!("commands:");
-            crate::kprintln!("  help   - this list");
-            crate::kprintln!("  ticks  - timer ticks since boot (~100 Hz)");
-            crate::kprintln!("  mem    - physical frame allocator stats");
-            crate::kprintln!("  disk   - virtio-blk capacity + sector 0 preview");
-            crate::kprintln!("  net    - DHCP lease (address + gateway)");
-            crate::kprintln!("  info   - system / port info");
-            crate::kprintln!("  clear  - clear the screen");
+            crate::kprintln!("  help                 - this list");
+            crate::kprintln!("  ticks                - timer ticks since boot (~100 Hz)");
+            crate::kprintln!("  mem                  - physical frame allocator stats");
+            crate::kprintln!("  disk                 - virtio-blk capacity + sector 0 preview");
+            crate::kprintln!("  net                  - DHCP lease (address + gateway)");
+            crate::kprintln!("  ls                   - list files (ramfs)");
+            crate::kprintln!("  write <name> <text>  - create/overwrite a file");
+            crate::kprintln!("  cat <name>           - print a file");
+            crate::kprintln!("  rm <name>            - remove a file");
+            crate::kprintln!("  info                 - system / port info");
+            crate::kprintln!("  clear                - clear the screen");
         }
         "ticks" => {
             let t = crate::timer::ticks();
@@ -82,6 +88,41 @@ fn exec(cmd: &str) {
                 total * crate::pmm::FRAME_SIZE / (1024 * 1024)
             );
         }
+        "ls" => {
+            let files = crate::ramfs::list();
+            if files.is_empty() {
+                crate::kprintln!("(no files)");
+            } else {
+                for (name, size) in files {
+                    crate::kprintln!("{:>8}  {}", size, name);
+                }
+            }
+        }
+        "write" => match parts.next() {
+            Some(name) => {
+                let rest = collect_rest(parts);
+                crate::ramfs::write(name, &rest);
+                crate::kprintln!("wrote {} ({} bytes)", name, rest.len());
+            }
+            None => crate::kprintln!("usage: write <name> <text>"),
+        },
+        "cat" => match parts.next() {
+            Some(name) => match crate::ramfs::read(name) {
+                Some(content) => crate::kprintln!("{}", content),
+                None => crate::kprintln!("no such file: {}", name),
+            },
+            None => crate::kprintln!("usage: cat <name>"),
+        },
+        "rm" => match parts.next() {
+            Some(name) => {
+                if crate::ramfs::remove(name) {
+                    crate::kprintln!("removed {}", name);
+                } else {
+                    crate::kprintln!("no such file: {}", name);
+                }
+            }
+            None => crate::kprintln!("usage: rm <name>"),
+        },
         "disk" => match crate::blk::capacity() {
             Some(cap) => {
                 crate::kprintln!("virtio-blk: {} sectors ({} MiB)", cap, cap * 512 / (1024 * 1024));
@@ -108,14 +149,26 @@ fn exec(cmd: &str) {
         },
         "info" => {
             crate::kprintln!("pagh-rv: riscv64gc, S-mode under OpenSBI, Sv39 paging");
-            crate::kprintln!("  ns16550 UART, virtio-mmio (blk + net), smoltcp + DHCP");
+            crate::kprintln!("  ns16550 UART + PLIC, virtio-mmio (blk + net), smoltcp + DHCP");
+            crate::kprintln!("  preemptive scheduler, U-mode + ecall, ramfs");
         }
         "clear" => {
-            // ANSI clear + home (host serial terminal).
             crate::kprint!("\u{1b}[2J\u{1b}[H");
         }
         other => {
             crate::kprintln!("unknown command: '{}' (try 'help')", other);
         }
     }
+}
+
+/// Join the remaining whitespace-split tokens back into a single string.
+fn collect_rest<'a>(parts: impl Iterator<Item = &'a str>) -> String {
+    let mut s = String::new();
+    for (i, p) in parts.enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        s.push_str(p);
+    }
+    s
 }
