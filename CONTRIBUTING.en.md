@@ -177,29 +177,3 @@ When opening an issue, please include where possible:
 
 Thanks for contributing to pagh. Keep changes focused, tests green, and the build
 warning-free, and review will be quick.
-
----
-
-## 8. RISC-V port (branch `riscv-port`)
-
-An experimental `riscv64gc` port lives on the `riscv-port` branch as a standalone
-seed crate under `rv/` (its own workspace, like `host-tests/`, so it does not
-affect the x86_64 kernel build). It targets the QEMU `virt` machine booted by
-OpenSBI in S-mode.
-
-- **Toolchain:** the same nightly + `rust-src`; the seed builds for
-  `riscv64gc-unknown-none-elf` via `build-std` (configured in `rv/.cargo/config.toml`).
-- **Extra tool:** `qemu-system-riscv64` on your `PATH`.
-- **Build & run:**
-  ```bat
-  run_rv.cmd            :: build the seed and boot it under QEMU virt + OpenSBI
-  run_rv.cmd build      :: build only
-  ```
-  A scratch `rv/rvdisk.img` is created on first run (git-ignored). Exit QEMU with
-  `Ctrl-A`, then `X`.
-- **Plan & status:** the architecture mapping (x86_64→riscv64) and milestone list
-  are in `.kiro/specs/riscv-port/`. The README's "RISC-V port" section summarizes
-  what boots today (memory, traps/timer, scheduler, U-mode + ecall, ns16550 UART,
-  virtio-blk, virtio-net + DHCP, a small serial shell).
-- **Scope rule:** keep arch-independent logic shared; only the architecture/platform
-  layer is RISC-V-specific. Do not regress the x86_64 `main` build.
