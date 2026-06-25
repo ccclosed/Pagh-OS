@@ -1,433 +1,211 @@
-// boot.rs — Kernel boot orchestrator
-// 64-bit x86_64 Limine kernel in Rust (#![no_std])
-//
-// This module owns the ordered, fallible kernel initialization sequence that
-// previously lived inline in `lib.rs::_start` (Requirement 1). `_start` now
-// simply delegates to `boot::start()`.
-//
-// Structure (Requirement 1):
-//  * 1.1 — initialization runs as an explicit ordered sequence of init steps,
-//          modeled as one private `fn` per phase invoked in order by `start()`.
-//  * 1.3 — each completed step emits a single concise `info!` line; verbose
-//          detail stays at `debug!`.
-//  * 1.4 — a missing required Limine response or a failed step funnels through
-//          the centralized `fatal()` helper, which logs one `error!` line
-//          naming the failed step and enters `arch::cpu::halt_loop()`.
-//
-// NOTE: behavior is intentionally kept identical to the previous inline
-// `_start` for now. The inline LAPIC/IOAPIC MMIO mapping stays here (it moves
-// to the APIC/memory owners in task 7). `KERNEL_SIZE` is computed precisely
-// from the kernel image extent (linker symbols) in `read_limine_responses`.
+//! pagh OS — RISC-V (riscv64gc) boot/orchestration (folded into the main crate
+//! from the former standalone `rv/` seed; branch `riscv-port`).
+//!
+//! Boot path under QEMU `virt` + OpenSBI: firmware (M-mode) jumps to `_start`
+//! at 0x8020_0000 in S-mode with `a0`=hartid, `a1`=DTB pointer. `_start` sets up
+//! the boot stack and calls [`kmain`], which brings the kernel up step by step.
+//!
+//! The riscv64 modules are declared at the crate root via `#[path]` in `lib.rs`
+//! (gated `#[cfg(target_arch = "riscv64")]`), so this code's `crate::pmm`,
+//! `crate::timer`, `crate::kprintln!`, ... paths resolve unchanged.
 
-use core::sync::atomic::Ordering;
+use alloc::vec::Vec;
+use core::panic::PanicInfo;
 
-use crate::{debug, error, info, warn};
-use crate::{arch, drivers, memory, net, shell, task, vfs};
-use crate::{BASE_REVISION, HHDM_REQUEST, KERNEL_ADDR_REQUEST, MEMMAP_REQUEST};
-use crate::{HHDM_OFFSET, KERNEL_BASE, KERNEL_SIZE};
+// Entry trampoline (first bytes at 0x8020_0000). Set sp to the top of the
+// linker-provided boot stack, then call Rust. `a0`/`a1` (hartid, DTB) are
+// untouched before the call, so they arrive as kmain's C arguments.
+core::arch::global_asm!(
+    r#"
+    .section .text.entry
+    .globl _start
+_start:
+    la      sp, _stack_top
+    call    kmain
+.hang:
+    wfi
+    j       .hang
+"#
+);
 
-/// Centralized fatal-boot handler (Requirement 1.4).
-///
-/// Logs exactly one `error!` line naming the failed step, then parks the CPU
-/// forever via the safe `arch::cpu` halt primitive. Never returns.
-fn fatal(step: &str) -> ! {
-    error!("boot: {} failed", step);
-    arch::cpu::halt_loop();
+extern "C" {
+    static _kernel_end: u8;
 }
 
-/// Run the ordered kernel initialization sequence, then enter the idle loop.
-///
-/// Each call below is one init step (Requirement 1.1). Steps that depend on a
-/// Limine response read it from the request statics in `lib.rs`; missing
-/// responses route through [`fatal`] (Requirement 1.4).
-pub fn start() -> ! {
-    // Step 0: enable SSE before anything else. The kernel and Rust's
-    // `extern "x86-interrupt"` handlers emit SSE (`movaps`) instructions, but
-    // Limine hands off with SSE not OS-enabled, so this must happen before any
-    // FP/SSE use and before interrupts are enabled. See `arch::cpu::enable_sse`.
-    arch::cpu::enable_sse();
-
-    init_serial();
-    check_base_revision();
-    read_limine_responses();
-    init_descriptor_tables();
-    init_syscalls();
-    init_pmm();
-    init_vmm();
-    init_heap();
-    init_apic();
-    init_drivers();
-    init_virtio();
-    init_scheduler();
-    init_vfs();
-    init_fs();
-    init_net();
-
-    // Hand off to the run phase (spawns the shell, enables interrupts, idles).
-    kernel_main();
+/// First free physical address after the loaded kernel image (+ boot stack).
+fn kernel_end() -> usize {
+    core::ptr::addr_of!(_kernel_end) as usize
 }
 
-/// Step 1: bring up the COM1 serial port (the primary log sink).
-fn init_serial() {
-    drivers::serial::init();
-    info!("serial");
-}
+/// Fixed kernel-heap size carved from the front of usable RAM.
+const HEAP_SIZE: usize = 32 * 1024 * 1024;
 
-/// Step 2: verify Limine handed us a base revision we support.
-fn check_base_revision() {
-    if !BASE_REVISION.is_supported() {
-        fatal("base revision");
-    }
-    info!("base revision");
-}
+/// Default RAM assumption if the DTB has no sized memory region.
+const DEFAULT_RAM_END: usize = 0x8000_0000 + 128 * 1024 * 1024;
 
-/// Step 3: read the required Limine responses (HHDM offset + kernel address)
-/// and store them into the global address cells in `lib.rs`.
-fn read_limine_responses() {
-    match HHDM_REQUEST.response() {
-        Some(hhdm) => HHDM_OFFSET.store(hhdm.offset, Ordering::Relaxed),
-        None => fatal("hhdm"),
-    }
+#[no_mangle]
+pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
+    kprintln!();
+    kprintln!("========================================");
+    kprintln!("  pagh OS  --  riscv64 (S-mode, OpenSBI)");
+    kprintln!("========================================");
+    kprintln!("rv: boot hart {}, dtb @ {:#x}", hartid, dtb);
 
-    match KERNEL_ADDR_REQUEST.response() {
-        Some(kaddr) => {
-            KERNEL_BASE.store(kaddr.virtual_base, Ordering::Relaxed);
-            // KERNEL_SIZE is the kernel image extent, computed precisely from
-            // the linker symbols (`__kernel_end - __kernel_start`) rather than
-            // a hardcoded guess. KERNEL_BASE stays the Limine virtual base.
-            KERNEL_SIZE.store(memory::layout::kernel_size(), Ordering::Relaxed);
-        }
-        None => fatal("kernel address"),
-    }
+    // 1. Discover RAM from the device tree (fall back conservatively).
+    let mem = crate::dtb::memory(dtb).unwrap_or(crate::dtb::MemInfo {
+        start: 0x8000_0000,
+        end: DEFAULT_RAM_END,
+    });
+    kprintln!(
+        "rv: RAM {:#x}..{:#x} ({} MiB)",
+        mem.start,
+        mem.end,
+        (mem.end - mem.start) / (1024 * 1024)
+    );
 
-    info!("limine responses");
-}
+    // 2. Carve [kernel_end .. +HEAP_SIZE] for the heap, give the rest to the PMM.
+    let kend = (kernel_end() + 0xfff) & !0xfff;
+    let heap_start = kend;
+    let pmm_start = heap_start + HEAP_SIZE;
+    kprintln!(
+        "rv: kernel_end {:#x}; heap {:#x}..{:#x} ({} MiB)",
+        kend,
+        heap_start,
+        pmm_start,
+        HEAP_SIZE / (1024 * 1024)
+    );
 
-/// Step 4: load the GDT (with TSS/IST) and install the IDT.
-fn init_descriptor_tables() {
-    arch::x86_64::gdt::init();
-    arch::x86_64::idt::init();
-    info!("gdt + idt");
-}
+    crate::pmm::init(pmm_start, mem.end);
+    let (free, total) = crate::pmm::stats();
+    kprintln!(
+        "rv: PMM up -- {} / {} frames free ({} MiB usable)",
+        free,
+        total,
+        (free * crate::pmm::FRAME_SIZE) / (1024 * 1024)
+    );
 
-/// Step 4.5: enable the SYSCALL/SYSRET fast system-call interface.
-///
-/// Must run after `init_descriptor_tables` because `syscall::init` reads the
-/// GDT selectors (`Selectors::user_code()` / `kernel_code()`) to program STAR.
-fn init_syscalls() {
-    arch::x86_64::syscall::init();
-    info!("syscalls");
-}
+    // 3. Enable Sv39 identity paging (root table from the PMM).
+    // SAFETY: boot hart, PMM is up, mapping is identity so execution continues.
+    unsafe { crate::paging::init_identity() };
+    kprintln!("rv: Sv39 identity paging enabled (satp set)");
 
-/// Step 5: initialize the physical frame allocator from the Limine memmap.
-fn init_pmm() {
-    match MEMMAP_REQUEST.response() {
-        Some(memmap) => memory::pmm::init(memmap),
-        None => fatal("memmap"),
-    }
-    info!("pmm");
-}
+    // 4. Bring up the heap over the carved, identity-mapped region.
+    // SAFETY: region is owned by the heap and identity-mapped readable/writable.
+    unsafe { crate::heap::init(heap_start, HEAP_SIZE) };
+    kprintln!("rv: heap up ({} MiB, galloc)", HEAP_SIZE / (1024 * 1024));
 
-/// Step 6: initialize the virtual memory manager over the HHDM.
-fn init_vmm() {
-    let hhdm_offset = HHDM_OFFSET.load(Ordering::Relaxed);
-    memory::vmm::init(hhdm_offset);
-    info!("vmm");
-}
-
-/// Step 7: initialize the kernel heap / global allocator.
-fn init_heap() {
-    memory::heap::init();
-    info!("heap");
-}
-
-/// Step 8: initialize the APIC and route the keyboard IRQ.
-///
-/// The APIC owns its own LAPIC/IOAPIC MMIO mapping (Requirement 7.4):
-/// `apic::init()` establishes those mappings internally via `vmm::map_mmio`
-/// before touching any registers, so no MMIO mapping happens inline here.
-fn init_apic() {
-    arch::x86_64::apic::init();
-
-    // Route IRQ1 (keyboard) -> vector 33 and register its handler.
-    arch::x86_64::apic::route_irq(1, 33);
-    arch::x86_64::apic::register_irq(33, drivers::ps2_kbd::irq_handler);
-
-    // Route IRQ12 (PS/2 mouse) -> vector 44 and register its handler. The
-    // mouse device itself is enabled later in `init_drivers` (after the
-    // framebuffer is up, so it knows the screen bounds); routing the IOAPIC
-    // redirection entry early is harmless because no packets stream until the
-    // device's data reporting is turned on.
-    arch::x86_64::apic::route_irq(12, 44);
-    arch::x86_64::apic::register_irq(44, drivers::ps2_mouse::irq_handler);
-
-    info!("apic");
-}
-
-/// Step 9: initialize the device manager (PS/2 keyboard + framebuffer).
-///
-/// The framebuffer needs no MMIO mapping of its own: Limine maps the
-/// framebuffer into the higher half and hands us the already-mapped virtual
-/// address (`fb.address()`), so the driver uses that mapping directly.
-fn init_drivers() {
-    drivers::init();
-    info!("drivers");
-}
-
-/// Step 9.5: discover and attach virtio devices (PCI enumeration + drivers).
-///
-/// Runs after `init_drivers` so the heap is up (PCI `enumerate()` allocates a
-/// `Vec`). Attaches the virtio-blk disk as a `BlockDevice` ("virtio-blk0"). If
-/// no virtio device of a given kind is present, the corresponding attach logs a
-/// warning and no-ops so boot is always preserved (R17.4).
-///
-/// TODO(task 6): also attach the virtio-net NIC here (smoltcp bring-up).
-fn init_virtio() {
-    let devs = drivers::pci::enumerate();
-    drivers::virtio::blk::init_blk(&devs);
-    info!("virtio");
-}
-
-/// Step 10: initialize the preemptive scheduler.
-fn init_scheduler() {
-    task::scheduler::init();
-    info!("scheduler");
-}
-
-/// Step 11: initialize the virtual filesystem.
-fn init_vfs() {
-    debug!("About to call vfs::init()...");
-    vfs::init();
-    debug!("vfs::init() returned");
-    info!("vfs");
-}
-
-/// Step 11.5: bring the ext2 filesystem up on the real virtio-blk disk and
-/// mount it at `/mnt` (Task 5.1, R5.6/R9.1/R9.2).
-///
-/// Ordering note: this runs *after* `init_vfs` (not inside `init_virtio`)
-/// because `vfs::mount_at` needs the VFS root to already exist. The block
-/// device itself was registered earlier in `init_virtio`; heap/pmm/vmm are all
-/// up, and interrupts are still disabled during boot init, so the format/mount
-/// disk I/O and allocations run on a single, non-preempted path.
-///
-/// If no virtio-blk device is present this logs a warning and continues booting
-/// (R17.4). On first boot (no valid superblock) the disk is formatted then
-/// mounted. After a successful mount a one-shot self-demo writes a file under
-/// `/mnt` and reads it back, proving the real-disk journaled write+read path
-/// end-to-end on a headless boot.
-fn init_fs() {
-    use crate::fs::ext2::Ext2Fs;
-
-    let blk = match drivers::get_block("virtio-blk0") {
-        Some(b) => b,
-        None => {
-            warn!("fs: no virtio-blk device; /mnt not mounted");
-            info!("fs (no disk)");
-            return;
-        }
-    };
-
-    // First boot: if there is no valid ext2 superblock yet, format the disk.
-    if Ext2Fs::mount(blk.clone()).is_err() {
-        info!("fs: no ext2 filesystem found, formatting disk...");
-        if let Err(e) = Ext2Fs::format(blk.clone()) {
-            error!("fs: format failed: {:?}; /mnt not mounted", e);
-            return;
-        }
+    // 4b. Bring up the real ns16550 MMIO UART and move the console onto it.
+    if let Some(ub) = crate::dtb::uart(dtb) {
+        crate::uart::init(ub);
+        kprintln!("rv: ns16550 UART @ {:#x} online -- console now on MMIO", ub);
+        // Arm interrupt-driven RX: PLIC routes the UART IRQ to S-mode, the UART
+        // raises RDA interrupts, and SEIE lets them be delivered (once SIE is on).
+        crate::plic::init();
+        crate::uart::enable_rx_interrupt();
+        // SAFETY: arming SEIE; the trap vector is installed before interrupts are
+        // globally enabled below.
+        unsafe { crate::cpu::sie_set(1 << 9) };
+        kprintln!("rv: PLIC + UART RX interrupt armed (IRQ {})", crate::plic::UART_IRQ);
+    } else {
+        kprintln!("rv: ns16550 UART not found in DTB; staying on SBI console");
     }
 
-    match Ext2Fs::mount(blk) {
-        Ok(root) => {
-            if let Err(e) = vfs::mount_at("/mnt", root) {
-                error!("fs: mount_at(/mnt) failed: {:?}", e);
-                return;
+    // 5. Smoke-test the allocator: build a Vec on the heap and use it.
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..1000u64 {
+        v.push(i * i);
+    }
+    let sum: u64 = v.iter().sum();
+    kprintln!("rv: heap test -- sum of squares 0..1000 = {} (len {})", sum, v.len());
+
+    kprintln!("rv: Milestone B OK -- DTB + PMM + Sv39 + heap.");
+
+    // 6. Traps + a periodic ~100 Hz timer interrupt (Milestone C).
+    crate::trap::init();
+    crate::timer::init();
+    // SAFETY: the trap vector and timer are armed before enabling interrupts.
+    unsafe { crate::cpu::enable_interrupts() };
+    kprintln!("rv: traps + 100 Hz timer armed; counting ticks...");
+
+    let mut last_sec = 0u64;
+    loop {
+        // SAFETY: wait for the next interrupt (the timer fires at 100 Hz).
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        let t = crate::timer::ticks();
+        let sec = t / 100;
+        if sec > last_sec {
+            last_sec = sec;
+            kprintln!("rv: ~{}s elapsed, {} timer ticks", sec, t);
+            if sec >= 2 {
+                break;
             }
-            info!("ext2 mounted at /mnt");
-            fs_boot_demo();
-        }
-        Err(e) => warn!("ext2 mount failed: {:?}", e),
-    }
-    info!("fs");
-}
-
-/// Step 11.6: bring up networking (Task 6). Enumerates PCI, attaches the
-/// virtio-net NIC, builds the smoltcp interface, and enables the UDP echo
-/// service on port 7. Address acquisition (DHCP, static fallback) and packet
-/// servicing run in the net thread spawned from `kernel_main` once interrupts
-/// are enabled and the 100 Hz tick is advancing the network clock.
-///
-/// If no virtio-net device is present this logs a warning and continues booting
-/// (R17.3). Networking is fully optional — boot is always preserved.
-fn init_net() {
-    match net::init() {
-        Ok(()) => {
-            net::udp_echo_enable(7);
-            net::tcp_echo_listen(7);
-            info!("net");
-        }
-        Err(e) => {
-            warn!("net: no interface available ({:?}); networking disabled", e);
-            info!("net (no nic)");
         }
     }
-}
 
-/// One-shot boot self-demo (Task 5.5): exercise the real-disk journaled write
-/// and read-back path so a headless boot proves it works end-to-end. Writes a
-/// known string to `/mnt/bootdemo.txt`, then re-reads it through a fresh VFS
-/// lookup and logs PASS/FAIL. Non-fatal: any error is logged and boot proceeds.
-fn fs_boot_demo() {
-    use crate::vfs::{self, VfsError};
+    kprintln!("rv: Milestone C OK -- trap vector + 100 Hz timer interrupts.");
 
-    const CONTENT: &[u8] = b"pagh-ext2-journaled-write-OK";
-
-    let dir = match vfs::lookup_path("/mnt") {
-        Ok(d) => d,
-        Err(e) => {
-            warn!("fs demo: /mnt lookup failed: {:?}", e);
-            return;
-        }
-    };
-
-    // Create or open the demo file (tolerate it already existing from a prior
-    // boot, since the disk image persists across runs).
-    let file = match dir.create_file("bootdemo.txt") {
-        Ok(f) => f,
-        Err(VfsError::AlreadyExists) => match dir.lookup("bootdemo.txt") {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("fs demo: open existing failed: {:?}", e);
-                return;
-            }
-        },
-        Err(e) => {
-            warn!("fs demo: create_file failed: {:?}", e);
-            return;
-        }
-    };
-
-    match file.write(0, CONTENT) {
-        Ok(n) if n == CONTENT.len() => {}
-        Ok(n) => {
-            warn!("fs demo: short write ({} of {} bytes)", n, CONTENT.len());
-            return;
-        }
-        Err(e) => {
-            warn!("fs demo: write failed: {:?}", e);
-            return;
-        }
-    }
-    dir.sync();
-
-    // Read back through a fresh lookup to avoid any cached node state.
-    let rfile = match vfs::lookup_path("/mnt/bootdemo.txt") {
-        Ok(f) => f,
-        Err(e) => {
-            warn!("fs demo: read-back lookup failed: {:?}", e);
-            return;
-        }
-    };
-    let mut buf = [0u8; 64];
-    match rfile.read(0, &mut buf) {
-        Ok(n) if &buf[..n] == CONTENT => {
-            info!("fs demo: /mnt/bootdemo.txt write+read round-trip PASS ({} bytes)", n);
-        }
-        Ok(n) => {
-            error!("fs demo: read-back MISMATCH ({} bytes): FAIL", n);
-        }
-        Err(e) => warn!("fs demo: read-back failed: {:?}", e),
-    }
-}
-
-/// Run phase: spawn the shell thread, enable interrupts, and become the idle
-/// loop.
-///
-/// The old ~5M-cycle busy-spin debug block (used only to observe timer IRQs
-/// during bringup) is removed per Requirement 1.5.
-fn kernel_main() -> ! {
-    debug!("Spawning shell thread...");
-    task::scheduler::kernel_thread_spawn(shell_thread);
-    debug!("Shell thread spawned (PID should be 1)");
-
-    // Spawn the networking poll thread (Task 6, R13.4). It must start once
-    // scheduling is running and interrupts are enabled (below), because the
-    // smoltcp clock advances off the 100 Hz timer tick and DHCP/echo servicing
-    // relies on the periodic poll. If no NIC was attached, `net::poll` is a
-    // cheap no-op, so spawning unconditionally is harmless.
-    task::scheduler::kernel_thread_spawn(net::net_thread);
-    debug!("Net thread spawned");
-
-    // Spawn the embedded ring-3 test user process (Requirements 13.1 / 13.4).
-    //
-    // This MUST happen while interrupts are still disabled: `create_user_process`
-    // briefly installs the user CR3 to populate the user address space, and a
-    // timer tick in that window would let the scheduler observe the foreign CR3.
-    // It also programs TSS RSP0 for the ring-3 → ring-0 transition.
-    //
-    // The process performs a `SYS_WRITE` (observable on serial) then `SYS_EXIT`,
-    // dropping itself from the scheduler rotation; the shell thread continues to
-    // run and the prompt stays interactive.
-    //
-    // Skipped when the `lx_selftest` feature is on: that harness launches its own
-    // ring-3 `Compat_Process`, and the kernel's TSS `RSP0` is single-task (see
-    // `gdt::set_kernel_stack`), so running two ring-3 processes at once would share
-    // one kernel stack. Under the feature the compat process is the sole ring-3
-    // task, so it can run its `write`/`exit_group` cleanly and be observed.
-    #[cfg(not(any(feature = "lx_selftest", feature = "lx_livetest", feature = "lx_bigindex")))]
-    match task::process::spawn_test_user_process() {
-        Ok(pid) => info!("user test process spawned (pid {})", pid),
-        Err(e) => error!("user test process failed: {}", e),
-    }
-
-    // Linux-compat boot-time self-test (cargo feature `lx_selftest`). Runs here —
-    // after ext2 mount and networking init, while interrupts are still disabled —
-    // so it can enqueue a Compat_Process like the native test process above and so
-    // the `fetch_no_network` check observes the no-interface-address state before
-    // DHCP runs. Compiled out entirely when the feature is off (default).
-    #[cfg(feature = "lx_selftest")]
-    crate::selftest_lx::run();
-
-    // Post-network checks on a single thread so they run *sequentially* and do
-    // not contend for the network pump. The local-mirror `apt` end-to-end test
-    // runs FIRST (fast, against the QEMU host gateway), then the external HTTPS
-    // smoke test (which may be slow/unreachable depending on the environment and
-    // would otherwise monopolize the pump). Compiled out when the feature is off.
-    #[cfg(feature = "lx_selftest")]
-    task::scheduler::kernel_thread_spawn(crate::selftest_lx::run_post_net_checks);
-
-    // Live full-update integration check (cargo feature `lx_livetest`, spec task
-    // 11.1). Spawned on its own thread so it runs after interrupts/DHCP are up.
-    // Separate from `lx_selftest`: it talks to the live `deb.debian.org` mirror
-    // (default HTTPS config, NOT the local mini-repo). Mutually exclusive in
-    // practice — if both features are set, the local selftest harness wins and
-    // the live check is skipped to avoid two ring-3 processes contending for the
-    // single-task kernel stack. Compiled out when the feature is off (default).
-    #[cfg(all(feature = "lx_livetest", not(feature = "lx_selftest")))]
-    task::scheduler::kernel_thread_spawn(crate::selftest_lx::run_live_update_check);
-
-    // DIAGNOSTIC (Part B): apt-update parse-stage crash repro over the LOCAL big
-    // index (cargo feature `lx_bigindex`). Spawned on its own thread so it runs
-    // after interrupts/DHCP are up. Points apt at `http://10.0.2.2:8000` (the
-    // `tools/mini_repo.py bigindex` mirror) and drives `apt::update()` (or, with
-    // `lx_bigindex_inram`, the in-RAM Test-A variant). Compiled out when the
-    // feature is off (default).
-    #[cfg(feature = "lx_bigindex")]
-    task::scheduler::kernel_thread_spawn(crate::selftest_lx::run_bigindex_check);
-
-    arch::cpu::enable_interrupts();
-    info!("interrupts enabled");
-
-    // Main thread becomes the idle loop.
-    arch::cpu::halt_loop()
-}
-
-/// The shell kernel thread: let the scheduler stabilize, then run the shell.
-fn shell_thread() {
-    // Give scheduler time to stabilize.
-    for _ in 0..1_000_000 {
+    // 7. Preemptive scheduler: two CPU-bound threads that NEVER yield; only the
+    //    timer interrupt switches between them. Bounded: each prints a few times
+    //    then exits, after which only `main` remains runnable.
+    crate::sched::init();
+    crate::sched::spawn(worker_a);
+    crate::sched::spawn(worker_b);
+    kprintln!("rv: preemptive scheduler up; 2 non-yielding threads, timer-driven:");
+    while crate::sched::running_count() > 1 {
         core::hint::spin_loop();
     }
+    kprintln!("rv: workers finished; back in main (preemption now a no-op).");
+    kprintln!("rv: Milestone C.2 OK -- preemptive context switch + scheduler.");
 
-    shell::shell_main();
+    // 8. virtio-blk over virtio-mmio: attach + read/write round-trip.
+    crate::blk::init(dtb);
+    crate::blk::selftest();
+    kprintln!("rv: Milestone E (blk) OK -- virtio-mmio + virtio-blk.");
+
+    // 8b. virtio-net + smoltcp: acquire a DHCPv4 lease.
+    crate::net::demo(dtb);
+    kprintln!("rv: Milestone E (net) OK -- virtio-net + smoltcp + DHCP.");
+
+    // 8c. ramfs self-test + persistence to virtio-blk.
+    crate::ramfs::selftest();
+    crate::ramfs::persist_selftest();
+
+    // 9. Load and run a real static riscv64 ELF in U-mode.
+    let image = crate::elf::build_test_elf();
+    crate::elf::load_and_run(&image);
+}
+
+/// Demo worker A: CPU-bound, never yields; prints a few times (timer-paced) then
+/// exits. Interleaving with B proves timer preemption (no cooperative yield).
+extern "C" fn worker_a() -> ! {
+    preempt_worker("A")
+}
+
+/// Demo worker B (see [`worker_a`]).
+extern "C" fn worker_b() -> ! {
+    preempt_worker("B")
+}
+
+/// Shared body: print `name` up to 3 times, ~300 ms apart (by global ticks),
+/// busy-waiting in between (no yield/wfi), then exit.
+fn preempt_worker(name: &str) -> ! {
+    let mut printed = 0u32;
+    let mut next = crate::timer::ticks() + 30;
+    loop {
+        if crate::timer::ticks() >= next {
+            kprintln!("    [preempt {}] print {}", name, printed);
+            printed += 1;
+            next = crate::timer::ticks() + 30;
+            if printed >= 3 {
+                crate::sched::exit();
+            }
+        }
+        core::hint::spin_loop();
+    }
+}
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    kprintln!("\nrv: PANIC: {}", info);
+    crate::cpu::park()
 }

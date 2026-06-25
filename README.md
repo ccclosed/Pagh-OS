@@ -1,6 +1,15 @@
 <h1 align="center">pagh</h1>
 
 <p align="center">
+  <b>⚠️ This is the <code>riscv-port</code> branch — a standalone RISC-V (riscv64gc) kernel
+  for QEMU <code>virt</code> + OpenSBI. The x86_64 kernel lives on the <code>main</code> branch.</b><br>
+  Build &amp; run this kernel with <code>run.cmd</code> (needs <code>qemu-system-riscv64</code>).
+</p>
+
+---
+
+
+<p align="center">
   A small 64-bit OS kernel in Rust — ext2 + WAL journaling, a TCP/IP stack,
   a framebuffer GUI, and a mouse-driven paint app, booting on real UEFI via Limine.
 </p>
