@@ -54,7 +54,7 @@ _Coming soon — drop boot/shell/paint screenshots here._
 ## Features at a glance
 
 - **Core:** safe privileged-instruction layer (incl. SSE enablement), GDT/IDT/TSS/IST,
-  bitmap PMM, 4-level paging VMM with `map_mmio`, `linked_list_allocator` heap, ACPI (MADT),
+  bitmap PMM, 4-level paging VMM with `map_mmio`, a `good_memory_allocator` (galloc) heap, ACPI (MADT),
   LAPIC + I/O APIC.
 - **Tasking:** preemptive ~100 Hz round-robin scheduler, kernel threads, ring-3 user
   processes, `int 0x80` syscalls (`SYS_WRITE`/`EXIT`/`YIELD`).
@@ -263,6 +263,15 @@ lxrun /mnt/bin/busybox
 
 - **Static only.** Only statically-linked binaries run. Dynamic linking (glibc),
   `fork`/`clone`/threads/futex, and GUI stacks are out of scope and return `-ENOSYS`.
+- **Install ≠ run.** `apt install <pkg>` resolves the dependency closure, downloads each
+  `.deb`, and unpacks its files onto `/mnt` — that part works. But because there is no base
+  system, the resolver pulls the *whole* closure (e.g. `htop` drags in `libc6`,
+  `libncursesw6`/`libtinfo6`, `libnl-*`). And the unpacked program still may not **run**:
+  interactive tools like `htop` are shipped dynamically linked (rejected by the loader), and
+  even a static rebuild would have nothing to read — there is no `procfs` (`/proc/stat`,
+  `/proc/meminfo`, per-pid entries) and `ioctl` is a stub (`TIOCGWINSZ`/`TCGETS` return
+  `EINVAL`, so ncurses cannot size or raw-mode the terminal). Treat `apt install` as "fetch
+  and lay down files", not "get a working TUI".
 - **Transport.** Downloads use HTTP or HTTPS. HTTPS is **VARIANT A**: TLS 1.3 encrypted but
   **unauthenticated** (no certificate chain/hostname/expiry checks, non-cryptographic RNG),
   and package data is not signature-verified — acceptable only for this hobby/QEMU demo.
@@ -326,7 +335,7 @@ src/
 │   ├── layout.rs       # single source of truth for fixed virtual regions
 │   ├── pmm.rs          # bitmap physical frame allocator (single Spinlock; contiguous alloc)
 │   ├── vmm.rs          # 4-level paging, PageTableWalker, map_mmio, VmError
-│   └── heap.rs         # global allocator (linked_list_allocator)
+│   └── heap.rs         # global allocator (good_memory_allocator / galloc; O(1)-binned)
 ├── drivers/
 │   ├── mod.rs          # device registry (block/char/console traits, sector_count)
 │   ├── serial.rs       # 16550 UART (byte-accurate writes)
@@ -438,8 +447,13 @@ src/
   from a streaming gzip/xz/zstd decompressor into a **compact byte-arena index** — one
   growable byte arena plus `(offset,len)` references and integer-keyed sorted lookup tables,
   instead of hundreds of thousands of per-field `String`s — so the full `main` index fits in
-  bounded RAM without an allocator swap. A pure resolver produces a dependency-first plan,
-  then each `.deb` is fetched, its `data.tar` unpacked, and files written onto ext2 `/mnt`.
+  bounded RAM. The streaming stanza parser itself reuses one fixed `String` slot per field
+  and `clear()`s them between stanzas, so it does **no** per-stanza heap alloc/free; combined
+  with a size-binned global allocator (`good_memory_allocator`/galloc, replacing
+  `linked_list_allocator`), index parsing stays ~O(n) instead of degrading to O(n²) on the
+  allocator free-list — the earlier symptom that looked like a hang and corrupted the heap.
+  A pure resolver produces a dependency-first plan, then each `.deb` is fetched, its
+  `data.tar` unpacked, and files written onto ext2 `/mnt`.
 - **Input & graphics.** The PS/2 keyboard (IRQ1) and mouse (IRQ12) are routed through the
   I/O APIC. The mouse driver assembles 3-byte packets and maintains an absolute,
   screen-clamped position. The framebuffer driver offers 2D primitives over the
@@ -517,7 +531,7 @@ These are required and preserved across the codebase:
 ### Key dependencies
 
 - [`acpi`](https://crates.io/crates/acpi) — MADT parsing.
-- [`linked_list_allocator`](https://crates.io/crates/linked_list_allocator) — kernel heap.
+- [`good_memory_allocator`](https://crates.io/crates/good_memory_allocator) — kernel heap (galloc; size-binned, ~O(1) alloc/free).
 - [`virtio-drivers`](https://crates.io/crates/virtio-drivers) — virtio-blk / virtio-net.
 - [`smoltcp`](https://crates.io/crates/smoltcp) — TCP/IP stack (no_std, alloc).
 - [`embedded-tls`](https://crates.io/crates/embedded-tls) — TLS 1.3 client for HTTPS (VARIANT A).
