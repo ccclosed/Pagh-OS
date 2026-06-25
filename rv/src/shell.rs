@@ -71,6 +71,7 @@ fn exec(cmd: &str) {
             crate::kprintln!("  write <name> <text>  - create/overwrite a file");
             crate::kprintln!("  cat <name>           - print a file");
             crate::kprintln!("  rm <name>            - remove a file");
+            crate::kprintln!("  save / load          - persist ramfs to/from virtio-blk");
             crate::kprintln!("  info                 - system / port info");
             crate::kprintln!("  clear                - clear the screen");
         }
@@ -122,6 +123,14 @@ fn exec(cmd: &str) {
                 }
             }
             None => crate::kprintln!("usage: rm <name>"),
+        },
+        "save" => match crate::ramfs::save() {
+            Some(n) => crate::kprintln!("saved {} file(s) to virtio-blk", n),
+            None => crate::kprintln!("save failed (no disk?)"),
+        },
+        "load" => match crate::ramfs::load() {
+            Some(n) => crate::kprintln!("loaded {} file(s) from virtio-blk", n),
+            None => crate::kprintln!("load failed (no saved image?)"),
         },
         "disk" => match crate::blk::capacity() {
             Some(cap) => {

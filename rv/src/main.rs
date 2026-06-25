@@ -187,8 +187,10 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     net::demo(dtb);
     kprintln!("rv: Milestone E (net) OK -- virtio-net + smoltcp + DHCP.");
 
-    // 8c. ramfs self-test (in-RAM filesystem backing the shell file commands).
+    // 8c. ramfs self-test + persistence to virtio-blk (after net: verifies the
+    //     virtio-mmio scan no longer resets the blk device).
     ramfs::selftest();
+    ramfs::persist_selftest();
 
     // 9. Load and run a real static riscv64 ELF in U-mode (Milestone D/E).
     let image = elf::build_test_elf();

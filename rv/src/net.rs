@@ -65,11 +65,24 @@ pub fn attach(dtb: usize) -> Option<[u8; 6]> {
             Some(r) => (r.starting_address as usize, r.size.unwrap_or(0x1000)),
             None => continue,
         };
+        // Identify by the MMIO DeviceID (1 = network) without constructing (and
+        // dropping) a transport over non-matching slots — a dropped MmioTransport
+        // resets its device, which would clobber the already-initialized blk.
+        // SAFETY: identity-mapped MMIO reads.
+        let (magic, dev_id) = unsafe {
+            (
+                core::ptr::read_volatile(base as *const u32),
+                core::ptr::read_volatile((base + 8) as *const u32),
+            )
+        };
+        if magic != 0x7472_6976 || dev_id != 1 {
+            continue;
+        }
         let header = match NonNull::new(base as *mut VirtIOHeader) {
             Some(h) => h,
             None => continue,
         };
-        // SAFETY: identity-mapped MMIO window; MmioTransport validates the magic.
+        // SAFETY: confirmed virtio-mmio network device at this identity-mapped window.
         let transport = match unsafe { MmioTransport::new(header, size) } {
             Ok(t) => t,
             Err(_) => continue,

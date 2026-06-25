@@ -55,6 +55,11 @@ unsafe impl Send for BlkCell {}
 static BLK: spin::Mutex<BlkCell> = spin::Mutex::new(BlkCell(None));
 
 /// Scan the DTB's virtio-mmio nodes and return the first that is a block device.
+///
+/// We read the device-type from the MMIO `DeviceID` register directly and only
+/// construct an `MmioTransport` for the matching slot. This matters: dropping an
+/// `MmioTransport` resets its device, so creating+dropping transports over slots
+/// we don't keep would reset other (already-initialized) virtio devices.
 pub fn probe(dtb: usize) -> Option<Blk> {
     // SAFETY: valid DTB pointer from OpenSBI.
     let fdt = unsafe { fdt::Fdt::from_ptr(dtb as *const u8) }.ok()?;
@@ -74,13 +79,20 @@ pub fn probe(dtb: usize) -> Option<Blk> {
             Some(r) => (r.starting_address as usize, r.size.unwrap_or(0x1000)),
             None => continue,
         };
-        let header = match NonNull::new(base as *mut VirtIOHeader) {
-            Some(h) => h,
-            None => continue,
+        // Identify the device without building (and dropping) a transport.
+        // virtio-mmio: 0x00 = MagicValue ("virt"), 0x08 = DeviceID (2 = block).
+        // SAFETY: identity-mapped MMIO reads.
+        let (magic, dev_id) = unsafe {
+            (
+                core::ptr::read_volatile(base as *const u32),
+                core::ptr::read_volatile((base + 8) as *const u32),
+            )
         };
-        // SAFETY: `header` points at an identity-mapped MMIO window of `size`
-        // bytes; MmioTransport validates the virtio magic and bails on empty
-        // or foreign slots.
+        if magic != 0x7472_6976 || dev_id != 2 {
+            continue;
+        }
+        let header = NonNull::new(base as *mut VirtIOHeader)?;
+        // SAFETY: confirmed virtio-mmio block device at this identity-mapped window.
         let transport = match unsafe { MmioTransport::new(header, size) } {
             Ok(t) => t,
             Err(_) => continue,
@@ -112,6 +124,14 @@ pub fn capacity() -> Option<u64> {
 pub fn read_sector(sector: usize, buf: &mut [u8]) -> bool {
     match BLK.lock().0.as_mut() {
         Some(b) => b.read_blocks(sector, buf).is_ok(),
+        None => false,
+    }
+}
+
+/// Write one 512-byte sector from `buf` (must be `SECTOR_SIZE`). Returns success.
+pub fn write_sector(sector: usize, buf: &[u8]) -> bool {
+    match BLK.lock().0.as_mut() {
+        Some(b) => b.write_blocks(sector, buf).is_ok(),
         None => false,
     }
 }
