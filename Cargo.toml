@@ -63,7 +63,15 @@ lazy_static = { version = "1.4", features = ["spin_no_std"] }
 bitflags = "2.6"
 uart_16550 = "0.3"
 volatile = "0.6"
-linked_list_allocator = "0.10"
+# Kernel global allocator. `good_memory_allocator` (galloc) is a drop-in
+# `GlobalAlloc` that replaces `linked_list_allocator`: it keeps a free list but
+# adds size-binned "smallbins" so allocate/free are ~O(1) instead of the pure
+# first-fit O(n) scan. That O(n) scan degraded to ~O(n²) under the `apt` index
+# parser's heavy small-allocation churn (per-stanza BTreeMap/String alloc+free
+# across tens of thousands of stanzas), which manifested as a pathological
+# slowdown ("looks like a hang") and was the leading suspect for heap corruption
+# at scale. `no_std`, fixed region via `init(base, size)`.
+good_memory_allocator = "0.1"
 virtio-drivers = { version = "0.11", default-features = false, features = ["alloc"] }
 # Pure-Rust DEFLATE inflate for `.deb` `data.tar.gz` decompression (R9.3, task 8.3).
 # Pinned exactly; `default-features = false` + `with-alloc` keeps it no_std and routed
