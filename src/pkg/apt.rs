@@ -192,6 +192,21 @@ fn normalize_base(base: &str) -> String {
     }
 }
 
+/// Format a byte count as a short human-readable string (`B`/`KiB`/`MiB`) with
+/// one decimal place, for the apt progress/summary lines. Integer-only (no FP),
+/// so it is cheap and panic-free: `1536 -> "1.5 KiB"`, `13_322_415 -> "12.7 MiB"`.
+pub fn human_bytes(n: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    if n >= MIB {
+        format!("{}.{} MiB", n / MIB, (n % MIB) * 10 / MIB)
+    } else if n >= KIB {
+        format!("{}.{} KiB", n / KIB, (n % KIB) * 10 / KIB)
+    } else {
+        format!("{} B", n)
+    }
+}
+
 /// A read-only summary of one indexed package, returned by [`show`].
 ///
 /// Owns its strings so the caller need not hold the index lock while printing.
@@ -308,21 +323,27 @@ pub fn update() -> Result<usize, AptOpError> {
     let mut saw_no_network = false;
 
     for (url, comp) in candidates.iter() {
-        crate::info!("apt: fetching index {}://{}{}", cfg.scheme(), cfg.host, url);
+        crate::info!(
+            "apt: Get {}://{}{} [{}/{}/{}]",
+            cfg.scheme(), cfg.host, url, cfg.suite, cfg.component, cfg.arch
+        );
         match cfg.fetch(url) {
             Ok(bytes) => {
                 // PHASE MARKER (heap-corruption #14 investigation): the body is
                 // fully downloaded at this point. If a crash appears BEFORE this
-                // line (only `net: downloaded ...` lines, no "body fetched"), the
-                // corruption is in the DOWNLOAD/TLS/virtio-DMA path; if it appears
-                // AFTER, it is in the decompress/parse path.
-                crate::info!("apt: index body fetched ({} bytes); decompress+parse...", bytes.len());
+                // line (only `net: downloaded ...` lines, no "fetched ... body"),
+                // the corruption is in the DOWNLOAD/TLS/virtio-DMA path; if it
+                // appears AFTER, it is in the decompress/parse path.
+                crate::info!(
+                    "apt: fetched {} index body - decompressing...",
+                    human_bytes(bytes.len() as u64)
+                );
                 // A successful download that fails to decompress/parse is a hard
                 // error for this candidate; do not silently fall through.
                 let index = stream_parse_index(&bytes, *comp)?;
                 let count = index.len();
                 *INDEX.lock() = Some(index);
-                crate::info!("apt: index loaded ({} packages)", count);
+                crate::info!("apt: index ready - {} packages", count);
                 return Ok(count);
             }
             Err(crate::net::http_fetch::FetchError::NoNetwork) => {
@@ -392,8 +413,8 @@ fn stream_parse_index(bytes: &[u8], comp: Compression) -> Result<PackageIndex, A
         // not look hung, while staying modest (not per-line).
         if decompressed >= next_byte_mark || builder.len() >= next_pkg_mark {
             crate::info!(
-                "apt: decompressed {} KiB, parsed {} packages...",
-                decompressed / 1024,
+                "apt: reading package lists... {} / {} pkgs",
+                human_bytes(decompressed as u64),
                 builder.len()
             );
             while decompressed >= next_byte_mark {
@@ -411,8 +432,8 @@ fn stream_parse_index(bytes: &[u8], comp: Compression) -> Result<PackageIndex, A
             // Flush the trailing partial line / final stanza.
             parser.finish_view(&mut builder);
             crate::info!(
-                "apt: decompressed {} KiB, parsed {} packages",
-                decompressed / 1024,
+                "apt: read package lists - {} / {} pkgs",
+                human_bytes(decompressed as u64),
                 builder.len()
             );
             Ok(PackageIndex::from_builder(builder))
@@ -454,14 +475,24 @@ pub fn install(name: &str) -> Result<Vec<String>, AptOpError> {
         t
     };
 
+    let total = targets.len();
+    if total > 0 {
+        let plan: Vec<&str> = targets.iter().map(|(p, _)| p.as_str()).collect();
+        crate::info!("apt: {} new package(s) to install: {}", total, plan.join(" "));
+    }
+
     let mut installed: Vec<String> = Vec::new();
 
-    for (pkg, filename) in targets {
+    for (i, (pkg, filename)) in targets.into_iter().enumerate() {
+        let step = i + 1;
         if filename.is_empty() {
             return Err(AptOpError::Download { pkg });
         }
         let url = format!("{}/{}", cfg.base, filename);
-        crate::info!("apt: fetching {} <- {}://{}{}", pkg, cfg.scheme(), cfg.host, url);
+        crate::info!(
+            "apt: [{}/{}] Get {} <- {}://{}{}",
+            step, total, pkg, cfg.scheme(), cfg.host, url
+        );
 
         let bytes = cfg.fetch(&url).map_err(|e| {
             match e {
@@ -469,6 +500,7 @@ pub fn install(name: &str) -> Result<Vec<String>, AptOpError> {
                 _ => AptOpError::Download { pkg: pkg.clone() },
             }
         })?;
+        let dl = bytes.len();
 
         let members =
             deb::parse_ar(&bytes).map_err(|_| AptOpError::Parse { pkg: pkg.clone() })?;
@@ -489,7 +521,10 @@ pub fn install(name: &str) -> Result<Vec<String>, AptOpError> {
         }
 
         INSTALLED.lock().insert(pkg.clone());
-        crate::info!("apt: installed {} ({} files)", pkg, n);
+        crate::info!(
+            "apt: [{}/{}] Unpacked {} ({} files, {})",
+            step, total, pkg, n, human_bytes(dl as u64)
+        );
         installed.push(pkg);
     }
 

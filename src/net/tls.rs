@@ -69,7 +69,7 @@ use super::http_fetch::FetchError;
 use super::{now, NET};
 use crate::arch::x86_64::linux::misc;
 use crate::task::scheduler;
-use crate::{error, info, warn};
+use crate::{error, warn};
 
 /// Default HTTPS port.
 pub const HTTPS_PORT: u16 = 443;
@@ -457,8 +457,10 @@ pub fn https_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchErro
         // a whole ~16 KiB record per `block_on` poll cycle — fewer round-trips
         // through the inter-poll spin → higher throughput, especially on the tail.
         let mut tmp = [0u8; 16 * 1024];
-        // Last whole-MiB mark we logged, so progress is reported ~every 1 MiB.
-        let mut logged_mib: usize = 0;
+        // In-place progress-bar throttle state: last integer percent drawn (once
+        // Content-Length is known) and last 512 KiB step (before it is).
+        let mut last_pct: u64 = u64::MAX;
+        let mut byte_mark: usize = 0;
         loop {
             let n = match tls.read(&mut tmp).await {
                 Ok(0) => break, // clean EOF
@@ -472,14 +474,36 @@ pub fn https_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchErro
                 return Err(FetchError::Incomplete);
             }
 
-            // OBSERVABILITY: emit a progress line roughly every 1 MiB of received
-            // (decrypted) bytes. This makes TLS download throughput measurable
-            // from the serial log and distinguishes a slow-but-progressing
-            // transfer from a genuine hang. Kept coarse (per ~MiB, not per record).
-            let mib = buf.len() / (1024 * 1024);
-            if mib > logged_mib {
-                logged_mib = mib;
-                info!("net: downloaded {} KiB (tls body)", buf.len() / 1024);
+            // OBSERVABILITY: redraw an in-place download progress bar (same line,
+            // leading `\r`, no newline). Before the response head is parsed the
+            // total is unknown, so we show the running byte count and refresh
+            // ~every 512 KiB; once `Content-Length` is known we show a percentage
+            // bar and refresh on each 1% advance. This both makes throughput
+            // visible and distinguishes a slow-but-progressing transfer from a
+            // genuine hang, without scrolling the console.
+            let total = head.map(|(off, cl)| off as u64 + cl);
+            let refresh = match total {
+                Some(t) if t > 0 => {
+                    let pct = 100 * (buf.len() as u64).min(t) / t;
+                    if pct != last_pct {
+                        last_pct = pct;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => {
+                    let step = buf.len() / (512 * 1024);
+                    if step > byte_mark {
+                        byte_mark = step;
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if refresh {
+                super::progress::show(&super::progress::line(buf.len() as u64, total));
             }
 
             if head.is_none() {
@@ -522,7 +546,10 @@ pub fn https_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchErro
     release(handle);
 
     match result {
-        Ok(body) => Ok(body),
+        Ok(body) => {
+            super::progress::finish();
+            Ok(body)
+        }
         Err(e) => {
             emit_tls_failure(&e, host, path);
             Err(e)
@@ -582,6 +609,8 @@ fn release(handle: SocketHandle) {
 
 /// Emit exactly one structured diagnostic for an HTTPS fetch failure.
 fn emit_tls_failure(err: &FetchError, host: &str, path: &str) {
+    // Terminate any in-place progress bar before the diagnostic line.
+    super::progress::finish();
     match err {
         FetchError::NoNetwork => warn!(
             "Package_Fetcher(tls): stage=preflight host={} path={} cause=NoNetwork",

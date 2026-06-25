@@ -24,6 +24,7 @@ pub mod dns;
 pub mod http;
 pub mod http_fetch;
 pub mod phy;
+pub mod progress;
 pub mod tls;
 
 use alloc::vec;

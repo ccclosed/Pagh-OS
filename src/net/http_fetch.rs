@@ -26,7 +26,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint};
 use super::http::{build_get_request, parse_http_head, HeadParse};
 use super::{now, NET};
 use crate::task::scheduler;
-use crate::{error, info, warn};
+use crate::{error, warn};
 
 /// Why a `.deb` fetch failed (design component 7). Each variant carries enough
 /// context for the single structured diagnostic emitted at the failure site.
@@ -154,8 +154,10 @@ pub fn http_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchError
     // High-water mark of received bytes, used to re-arm the idle read timeout
     // whenever the download makes progress.
     let mut last_len: usize = 0;
-    // Last whole-MiB mark we logged, so progress is reported ~every 1 MiB.
-    let mut logged_mib: usize = 0;
+    // In-place progress-bar throttle state: last integer percent drawn (once
+    // Content-Length is known) and last 512 KiB step (before it is).
+    let mut last_pct: u64 = u64::MAX;
+    let mut byte_mark: usize = 0;
 
     for _ in 0..MAX_STEPS {
         // Bytes buffered before this pump step; compared after the drain to tell
@@ -272,6 +274,7 @@ pub fn http_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchError
 
         match outcome {
             Step::Done(body) => {
+                super::progress::finish();
                 release(handle);
                 return Ok(body);
             }
@@ -293,14 +296,35 @@ pub fn http_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchError
                 last_len = buf.len();
                 read_deadline = Some(scheduler::ticks() + READ_TIMEOUT_TICKS);
 
-                // OBSERVABILITY: emit a progress line roughly every 1 MiB of
-                // received bytes so cleartext download throughput is measurable
-                // from the serial log and a slow transfer is distinguishable from
-                // a hang. Kept coarse (per ~MiB, not per packet).
-                let mib = buf.len() / (1024 * 1024);
-                if mib > logged_mib {
-                    logged_mib = mib;
-                    info!("net: downloaded {} KiB (http body)", buf.len() / 1024);
+                // OBSERVABILITY: redraw an in-place download progress bar (same
+                // line, leading `\r`, no newline) so throughput is visible and a
+                // slow transfer is distinguishable from a hang without scrolling.
+                // Before the head is parsed the total is unknown (running byte
+                // count, refreshed ~every 512 KiB); once Content-Length is known a
+                // percentage bar is shown and refreshed on each 1% advance.
+                let total = head.map(|(off, cl)| off as u64 + cl);
+                let refresh = match total {
+                    Some(t) if t > 0 => {
+                        let pct = 100 * (buf.len() as u64).min(t) / t;
+                        if pct != last_pct {
+                            last_pct = pct;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => {
+                        let step = buf.len() / (512 * 1024);
+                        if step > byte_mark {
+                            byte_mark = step;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if refresh {
+                    super::progress::show(&super::progress::line(buf.len() as u64, total));
                 }
             } else if read_deadline.is_none() {
                 read_deadline = Some(scheduler::ticks() + READ_TIMEOUT_TICKS);
@@ -386,6 +410,8 @@ fn release(handle: smoltcp::iface::SocketHandle) {
 /// Emit exactly one structured diagnostic for a fetch failure (R12.4, R12.5):
 /// component name, failed stage, resource (host/path), and cause category.
 fn emit_failure(err: &FetchError, host: &str, path: &str) {
+    // Terminate any in-place progress bar before the diagnostic line.
+    super::progress::finish();
     match err {
         FetchError::NoNetwork => warn!(
             "Package_Fetcher: stage=preflight host={} path={} cause=NoNetwork",

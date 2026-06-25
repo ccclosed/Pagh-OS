@@ -953,15 +953,17 @@ fn apt_usage() {
 fn cmd_apt_update() {
     let cfg = crate::pkg::apt::config();
     if cfg.tls {
-        shell_println("apt: NOTE HTTPS is INSECURE (TLS 1.3, certificate verification NOT yet implemented)");
+        shell_println("apt: HTTPS transport is INSECURE (TLS 1.3, no certificate verification)");
     }
     shell_println(&alloc::format!(
-        "apt: updating from {}://{}:{}{} ({}/{}/{}) ...",
+        "apt: updating from {}://{}:{}{} ({}/{}/{})",
         cfg.scheme(), cfg.host, cfg.port, cfg.base, cfg.suite, cfg.component, cfg.arch
     ));
     match crate::pkg::apt::update() {
-        Ok(n) => shell_println(&alloc::format!("apt: {} packages available", n)),
-        Err(e) => shell_println(&alloc::format!("apt: update failed: {}", e.message())),
+        Ok(n) => super::render::success_line(&alloc::format!(
+            "apt: done - {} packages available", n
+        )),
+        Err(e) => super::render::error_line(&alloc::format!("apt: update failed: {}", e.message())),
     }
 }
 
@@ -971,8 +973,9 @@ fn cmd_apt_install(names: &[&str]) {
         shell_println("usage: apt install <name> [name2 ...]");
         return;
     }
+    let mut any_installed = false;
     for name in names {
-        shell_println(&alloc::format!("apt: installing {} ...", name));
+        shell_println(&alloc::format!("apt: resolving {} ...", name));
         match crate::pkg::apt::install(name) {
             Ok(installed) => {
                 if installed.is_empty() {
@@ -981,13 +984,22 @@ fn cmd_apt_install(names: &[&str]) {
                         name
                     ));
                 } else {
-                    shell_println(&alloc::format!("Installed: {}", installed.join(" ")));
+                    any_installed = true;
+                    super::render::success_line(&alloc::format!(
+                        "apt: installed {} package(s): {}",
+                        installed.len(),
+                        installed.join(" ")
+                    ));
                 }
             }
-            Err(e) => shell_println(&alloc::format!("apt: {}: {}", name, e.message())),
+            Err(e) => {
+                super::render::error_line(&alloc::format!("apt: {}: {}", name, e.message()))
+            }
         }
     }
-    shell_println("apt: run an installed static binary with: lxrun /mnt/<path>");
+    if any_installed {
+        shell_println("apt: run an installed static binary with: lxrun /mnt/<path>");
+    }
 }
 
 /// `apt show <name>`: print a package's index metadata.
