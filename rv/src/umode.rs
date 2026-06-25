@@ -1,59 +1,18 @@
 //! User mode (U-mode) entry and the `ecall` system-call path.
 //!
-//! A tiny hand-assembled user program is mapped into a fresh user page (U-bit
-//! set), the kernel drops to U-mode via `sret`, and the program makes two
-//! `ecall` system calls — `print_u64` then `exit`. This proves the privilege
-//! drop and the `ecall` trap/dispatch round trip before the real Linux ELF
-//! loader + syscall ABI are ported on top (Milestone D follow-on).
+//! [`enter`] drops to U-mode via `sret`; [`syscall`] is the `ecall` dispatcher
+//! (called from the trap handler). The program loaded into U-mode is produced by
+//! the ELF loader ([`crate::elf`]); the demo set of syscalls below is minimal
+//! (the Linux ABI mapping replaces it later).
 
 use core::arch::asm;
 
-/// System-call numbers (carried in `a7`). A minimal demo set; the Linux ABI
-/// mapping replaces this later.
+/// System-call numbers (carried in `a7`).
 pub const SYS_EXIT: usize = 1;
 pub const SYS_PRINT_U64: usize = 2;
 
-/// Hand-assembled RV64 user program (position-independent: only `li`/`ecall`/
-/// `j`, no memory access), mapped at [`USER_CODE_VA`]:
-///   li a0, 42; li a7, 2 (print_u64); ecall;
-///   li a0, 0;  li a7, 1 (exit);      ecall;
-///   j .  (safety loop)
-static USER_PROG: [u32; 7] = [
-    0x02a0_0513, // addi a0, x0, 42
-    0x0020_0893, // addi a7, x0, 2   (SYS_PRINT_U64)
-    0x0000_0073, // ecall
-    0x0000_0513, // addi a0, x0, 0
-    0x0010_0893, // addi a7, x0, 1   (SYS_EXIT)
-    0x0000_0073, // ecall
-    0x0000_006f, // jal x0, 0        (j .)
-];
-
-/// User virtual addresses (above the kernel's identity window at 0..4 GiB).
-const USER_CODE_VA: usize = 0x1_0000_0000;
-const USER_STACK_TOP: usize = 0x1_0001_0000;
-
-/// Map the user code + stack pages and return `(entry_va, user_sp)`.
-pub fn setup() -> (usize, usize) {
-    let code = crate::pmm::alloc_frame().expect("pmm: user code frame");
-    // SAFETY: `code` is an owned frame, identity-mapped, so writable here.
-    unsafe {
-        let dst = code as *mut u32;
-        for (i, w) in USER_PROG.iter().enumerate() {
-            dst.add(i).write_volatile(*w);
-        }
-    }
-
-    let stack = crate::pmm::alloc_frame().expect("pmm: user stack frame");
-
-    // SAFETY: paging is active; these VAs are above the identity window.
-    unsafe {
-        crate::paging::map_user(USER_CODE_VA, code, true, false); // R+X+U
-        crate::paging::map_user(USER_STACK_TOP - 0x1000, stack, false, true); // R+W+U
-    }
-    crate::paging::flush();
-
-    (USER_CODE_VA, USER_STACK_TOP & !0xf)
-}
+/// Top of the user stack VA (above the kernel's identity window at 0..4 GiB).
+pub const USER_STACK_TOP: usize = 0x1_0001_0000;
 
 /// Drop to U-mode: set `sepc` to the user entry, clear `sstatus.SPP` (so `sret`
 /// returns to U-mode) and set `SPIE` (interrupts enabled in U-mode), point `sp`
@@ -78,7 +37,7 @@ pub unsafe fn enter(entry: usize, sp: usize) -> ! {
 
 /// Dispatch a system call from the `ecall` trap. `a0` is the first argument;
 /// the return value goes back in the user's `a0`. `SYS_EXIT` does not return —
-/// it reports completion and parks (the demo's terminal state).
+/// it reports completion and launches the interactive shell.
 pub fn syscall(num: usize, a0: usize) -> usize {
     match num {
         SYS_PRINT_U64 => {
@@ -87,9 +46,9 @@ pub fn syscall(num: usize, a0: usize) -> usize {
         }
         SYS_EXIT => {
             crate::kprintln!("    [user] exit({})", a0);
-            crate::kprintln!("rv: U-mode process made syscalls and exited.");
-            crate::kprintln!("rv: Milestone D OK -- U-mode + ecall syscalls.");
-            crate::kprintln!("rv: all milestones (A-E) up; launching interactive shell.");
+            crate::kprintln!("rv: U-mode ELF made syscalls and exited.");
+            crate::kprintln!("rv: Milestone D OK -- U-mode + ecall syscalls (real ELF).");
+            crate::kprintln!("rv: all milestones up; launching interactive shell.");
             crate::shell::run();
         }
         _ => {

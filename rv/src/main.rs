@@ -14,6 +14,7 @@ extern crate alloc;
 mod blk;
 mod cpu;
 mod dtb;
+mod elf;
 mod heap;
 mod net;
 mod paging;
@@ -173,12 +174,9 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     net::demo(dtb);
     kprintln!("rv: Milestone E (net) OK -- virtio-net + smoltcp + DHCP.");
 
-    // 9. Drop to U-mode and run a tiny program that makes ecall syscalls.
-    let (entry, user_sp) = umode::setup();
-    kprintln!("rv: entering U-mode at {:#x} (user sp {:#x})...", entry, user_sp);
-    // SAFETY: entry/stack are mapped user-accessible; this does not return
-    // (the user program exits via the SYS_EXIT syscall, which parks).
-    unsafe { umode::enter(entry, user_sp) };
+    // 9. Load and run a real static riscv64 ELF in U-mode (Milestone D/E).
+    let image = elf::build_test_elf();
+    elf::load_and_run(&image);
 }
 
 /// Demo kernel thread A: print and cooperatively yield.
