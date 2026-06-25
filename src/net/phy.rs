@@ -1,259 +1,238 @@
-// net/phy.rs — virtio-net attach + smoltcp `phy::Device` adapter
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
-//
-// Component 4 of the networking-and-storage design. This module attaches the
-// QEMU `virtio-net` NIC discovered by `pci::enumerate()` using the
-// `virtio-drivers` 0.11 crate's PCI transport (the exact same transport build
-// pattern used by `drivers/virtio/blk.rs`), wraps the resulting `VirtIONet`
-// behind a global `Spinlock<Option<..>>` owned by the `net` module, and exposes
-// [`SmolDevice`], a thin `smoltcp::phy::Device` adapter over it.
-//
-// ## virtio-drivers 0.11 net API used
-//
-// `virtio_drivers::device::net::VirtIONet<H, T, const QUEUE_SIZE: usize>`:
-//   * `new(transport, buf_len) -> Result<Self>` — pre-allocates `QUEUE_SIZE`
-//     receive buffers of `buf_len` bytes and arms the RX queue.
-//   * `mac_address() -> [u8; 6]`
-//   * `can_recv() -> bool` / `can_send() -> bool`
-//   * `receive() -> Result<RxBuffer>` — pops one completed RX buffer (the frame
-//     is `RxBuffer::packet()`); ownership transfers to the caller.
-//   * `recycle_rx_buffer(RxBuffer) -> Result` — returns a buffer to the RX queue.
-//   * `new_tx_buffer` / `send(TxBuffer) -> Result` — `TxBuffer::from(&[u8])`
-//     builds a TX buffer; `send` blocks until the frame is enqueued+used.
-//
-// ## smoltcp token handling (RX delivered once, TX enqueued once, no aliasing)
-//
-// `SmolDevice` is a zero-sized handle; the NIC lives behind the module-global
-// [`NIC`] lock. `receive()` locks the NIC, pops exactly one `RxBuffer`, and
-// hands ownership to a [`SmolRxToken`]; the lock is released before the token
-// is consumed. `SmolRxToken::consume` runs smoltcp's parser on the frame bytes
-// WITHOUT holding the NIC lock (so a reply built via the paired TX token does
-// not deadlock), then re-locks only to `recycle_rx_buffer`, returning the
-// buffer to the device exactly once. `SmolTxToken::consume` fills a fresh
-// heap buffer and `send`s it exactly once. Because each RX buffer is popped
-// once and recycled once, and each TX frame is built and sent once, no buffer
-// is ever aliased between the device and the driver (Property 17 / R13.6/13.7).
+//! smoltcp `phy::Device` adapter, generic over a [`NetDevice`] HAL trait.
+//!
+//! This is the seam from the design's HAL table: the shared smoltcp glue speaks
+//! only to the arch-neutral [`NetDevice`] trait (send a frame, receive a frame,
+//! MAC, capabilities), while the riscv [`VirtioNet`] wrapper implements that
+//! trait over `virtio-drivers` 0.11's `VirtIONet` on the MMIO transport. Making
+//! the [`SmolDevice`] adapter generic over `NetDevice` is what lets the same net
+//! stack run on either arch's NIC (x86 PCI vs riscv MMIO) — only the `NetDevice`
+//! impl differs.
+//!
+//! The adapter owns its device (no global NIC cell): [`SmolDevice`] holds the
+//! `NetDevice` directly, the RX token owns one popped frame (copied out and the
+//! virtio buffer recycled immediately), and the TX token borrows the device to
+//! send exactly one frame.
 
-use alloc::vec;
+use core::ptr::NonNull;
+
+use alloc::vec::Vec;
 
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 
-use virtio_drivers::device::net::{RxBuffer, TxBuffer, VirtIONet};
-use virtio_drivers::transport::pci::bus::{ConfigurationAccess, DeviceFunction, PciRoot};
-use virtio_drivers::transport::pci::PciTransport;
+use virtio_drivers::device::net::{TxBuffer, VirtIONet};
+use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
+use virtio_drivers::transport::{DeviceType, Transport};
 
-use crate::drivers::pci::{self, PciAddress, PciDevice};
-use crate::drivers::virtio::hal::PaghHal;
-use crate::net::NetError;
-use crate::sync::spinlock::Spinlock;
-use crate::{info, warn};
+use crate::blk::HalImpl;
 
-/// PCI device IDs that identify a virtio network device.
-///
-/// `0x1000` is the transitional (legacy) virtio-net ID; `0x1041` is the modern
-/// virtio-1.0 ID (`0x1040 + DeviceType::Network`). QEMU's `virtio-net-pci`
-/// presents one of these depending on its (non-)transitional configuration.
-const VIRTIO_NET_DEVICE_ID_LEGACY: u16 = 0x1000;
-const VIRTIO_NET_DEVICE_ID_MODERN: u16 = 0x1041;
-
-/// Number of RX/TX descriptors in each virtqueue (const generic of `VirtIONet`).
-pub const QUEUE_SIZE: usize = 16;
-
-/// Per-buffer length handed to `VirtIONet::new`. Must be at least the device's
-/// minimum (1526 bytes: 1514-byte max Ethernet frame + 12-byte virtio-net
-/// header, rounded up); 2048 gives comfortable headroom for a 1500-MTU frame.
+const QUEUE_SIZE: usize = 16;
 const BUF_LEN: usize = 2048;
-
-/// The maximum Ethernet frame MTU advertised to smoltcp (R13 / design: 1500).
 const MTU: usize = 1500;
 
-/// The attached virtio-net device, owned by the `net` module behind a single
-/// lock. `None` until [`attach`] succeeds (and whenever no NIC is present).
-static NIC: Spinlock<Option<VirtIONet<PaghHal, PciTransport, QUEUE_SIZE>>> = Spinlock::new(None);
+type Nic = VirtIONet<HalImpl, MmioTransport<'static>, QUEUE_SIZE>;
 
-/// A `ConfigurationAccess` adapter bridging the `virtio-drivers` PCI transport
-/// to pagh's legacy-port PCI config-space helpers (mirrors the one in
-/// `drivers/virtio/blk.rs`; kept module-local to avoid a cross-module dependency
-/// on a private type).
-struct PaghPciAccess;
-
-impl ConfigurationAccess for PaghPciAccess {
-    fn read_word(&self, device_function: DeviceFunction, register_offset: u8) -> u32 {
-        pci::config_read_u32(df_to_addr(device_function), register_offset)
-    }
-
-    fn write_word(&mut self, device_function: DeviceFunction, register_offset: u8, data: u32) {
-        pci::config_write_u32(df_to_addr(device_function), register_offset, data);
-    }
-
-    unsafe fn unsafe_clone(&self) -> Self {
-        PaghPciAccess
-    }
-}
-
-/// Convert a `virtio-drivers` `DeviceFunction` into a pagh `PciAddress`.
-fn df_to_addr(df: DeviceFunction) -> PciAddress {
-    PciAddress {
-        bus: df.bus,
-        device: df.device,
-        function: df.function,
-    }
-}
-
-/// True if a discovered PCI device is a virtio network device.
-fn is_virtio_net(dev: &PciDevice) -> bool {
-    dev.is_virtio()
-        && (dev.device_id == VIRTIO_NET_DEVICE_ID_LEGACY
-            || dev.device_id == VIRTIO_NET_DEVICE_ID_MODERN)
-}
-
-/// Discover the first virtio-net device among `devices`, attach it, and store
-/// it in the module-global [`NIC`]. Returns the device's MAC address on success.
+/// Hardware-abstraction trait the smoltcp [`SmolDevice`] adapter drives.
 ///
-/// Returns `Err(NetError::NoDevice)` if no virtio-net device is present, and
-/// `Err(NetError::DeviceInit)` if the transport/handshake fails — in both cases
-/// the caller logs and continues booting (R17.3), leaving [`NIC`] as `None`.
-pub fn attach(devices: &[PciDevice]) -> Result<[u8; 6], NetError> {
-    let dev = match devices.iter().find(|d| is_virtio_net(d)) {
-        Some(d) => d,
-        None => return Err(NetError::NoDevice),
-    };
+/// Each arch supplies an implementation over its NIC (riscv virtio-mmio here,
+/// x86 virtio-pci on `main`); the smoltcp glue stays arch-blind.
+pub trait NetDevice {
+    /// The NIC's 6-byte Ethernet MAC address.
+    fn mac_address(&self) -> [u8; 6];
 
-    let addr = dev.address;
-    info!(
-        "virtio-net: found device {:02x}:{:02x}.{} (id {:#06x})",
-        addr.bus, addr.device, addr.function, dev.device_id
-    );
+    /// Link capabilities (medium, MTU, burst) reported to smoltcp.
+    fn capabilities(&self) -> DeviceCapabilities;
 
-    // Enable bus-mastering (and memory-space decoding) so the device can drive
-    // virtqueue DMA and respond to MMIO BAR accesses from the transport.
-    pci::enable_bus_master(addr);
+    /// `true` if at least one received frame is ready to pop.
+    fn can_receive(&self) -> bool;
 
-    let mut root = PciRoot::new(PaghPciAccess);
-    let device_function = DeviceFunction {
-        bus: addr.bus,
-        device: addr.device,
-        function: addr.function,
-    };
+    /// `true` if the TX queue can accept another frame.
+    fn can_transmit(&self) -> bool;
 
-    let transport = match PciTransport::new::<PaghHal, _>(&mut root, device_function) {
-        Ok(t) => t,
-        Err(e) => {
-            warn!("virtio-net: PCI transport init failed: {:?}", e);
-            return Err(NetError::DeviceInit);
-        }
-    };
+    /// Pop one received frame into an owned buffer, recycling the underlying
+    /// driver RX buffer. Returns `None` when no frame is ready.
+    fn receive_frame(&mut self) -> Option<Vec<u8>>;
 
-    let nic = match VirtIONet::<PaghHal, PciTransport, QUEUE_SIZE>::new(transport, BUF_LEN) {
-        Ok(n) => n,
-        Err(e) => {
-            warn!("virtio-net: device init failed: {:?}", e);
-            return Err(NetError::DeviceInit);
-        }
-    };
-
-    let mac = nic.mac_address();
-    info!(
-        "virtio-net: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-    );
-
-    *NIC.lock() = Some(nic);
-    Ok(mac)
+    /// Transmit a single Ethernet frame (best effort; send errors are dropped).
+    fn transmit_frame(&mut self, frame: &[u8]);
 }
 
-/// A smoltcp `phy::Device` over the attached `virtio-net` NIC.
-///
-/// Zero-sized: all state lives in the module-global [`NIC`]. Cheap to construct
-/// and to hand to `Interface::poll`.
-pub struct SmolDevice;
+/// riscv virtio-net `NetDevice`: wraps a `virtio-drivers` `VirtIONet` attached
+/// over the MMIO transport, reusing the identity-map [`crate::blk::HalImpl`].
+pub struct VirtioNet {
+    nic: Nic,
+}
 
-impl Device for SmolDevice {
-    type RxToken<'a> = SmolRxToken;
-    type TxToken<'a> = SmolTxToken;
+impl NetDevice for VirtioNet {
+    fn mac_address(&self) -> [u8; 6] {
+        self.nic.mac_address()
+    }
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
         caps.max_transmission_unit = MTU;
-        // Bound smoltcp's per-poll burst to the queue depth so it never tries to
-        // hold more buffers in flight than the device has descriptors for.
         caps.max_burst_size = Some(QUEUE_SIZE);
         caps
     }
 
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let mut guard = NIC.lock();
-        let nic = guard.as_mut()?;
-        if !nic.can_recv() {
+    fn can_receive(&self) -> bool {
+        self.nic.can_recv()
+    }
+
+    fn can_transmit(&self) -> bool {
+        self.nic.can_send()
+    }
+
+    fn receive_frame(&mut self) -> Option<Vec<u8>> {
+        if !self.nic.can_recv() {
             return None;
         }
-        // Pop exactly one completed RX buffer; ownership moves into the token,
-        // so the frame is delivered to smoltcp exactly once (R13.6).
-        match nic.receive() {
-            Ok(rx_buf) => Some((SmolRxToken { buf: Some(rx_buf) }, SmolTxToken)),
-            // `NotReady` etc.: nothing to deliver this poll.
+        match self.nic.receive() {
+            Ok(buf) => {
+                // Copy the frame out so the (driver-owned) RX buffer can be
+                // recycled immediately; smoltcp parses the owned copy.
+                let frame = buf.packet().to_vec();
+                let _ = self.nic.recycle_rx_buffer(buf);
+                Some(frame)
+            }
             Err(_) => None,
         }
     }
 
-    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        let mut guard = NIC.lock();
-        let nic = guard.as_mut()?;
-        if nic.can_send() {
-            Some(SmolTxToken)
+    fn transmit_frame(&mut self, frame: &[u8]) {
+        let _ = self.nic.send(TxBuffer::from(frame));
+    }
+}
+
+/// Scan the DTB virtio-mmio nodes, attach the first network device, and return
+/// it as a [`VirtioNet`]. Returns `None` if no virtio-net device is present.
+pub fn attach(dtb: usize) -> Option<VirtioNet> {
+    // SAFETY: valid DTB pointer from OpenSBI.
+    let fdt = unsafe { fdt::Fdt::from_ptr(dtb as *const u8) }.ok()?;
+    for node in fdt.all_nodes() {
+        let is_vmmio = node
+            .compatible()
+            .map(|c| c.all().any(|s| s == "virtio,mmio"))
+            .unwrap_or(false);
+        if !is_vmmio {
+            continue;
+        }
+        let mut regs = match node.reg() {
+            Some(r) => r,
+            None => continue,
+        };
+        let (base, size) = match regs.next() {
+            Some(r) => (r.starting_address as usize, r.size.unwrap_or(0x1000)),
+            None => continue,
+        };
+        // Identify by the MMIO DeviceID (1 = network) without constructing (and
+        // dropping) a transport over non-matching slots — a dropped MmioTransport
+        // resets its device, which would clobber the already-initialized blk.
+        // SAFETY: identity-mapped MMIO reads.
+        let (magic, dev_id) = unsafe {
+            (
+                core::ptr::read_volatile(base as *const u32),
+                core::ptr::read_volatile((base + 8) as *const u32),
+            )
+        };
+        if magic != 0x7472_6976 || dev_id != 1 {
+            continue;
+        }
+        let header = match NonNull::new(base as *mut VirtIOHeader) {
+            Some(h) => h,
+            None => continue,
+        };
+        // SAFETY: confirmed virtio-mmio network device at this identity-mapped window.
+        let transport = match unsafe { MmioTransport::new(header, size) } {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if transport.device_type() != DeviceType::Network {
+            continue;
+        }
+        match Nic::new(transport, BUF_LEN) {
+            Ok(nic) => return Some(VirtioNet { nic }),
+            Err(_) => continue,
+        }
+    }
+    None
+}
+
+/// smoltcp `phy::Device` adapter generic over any [`NetDevice`]. Owns the device
+/// directly; tokens borrow it (TX) or own a copied frame (RX).
+pub struct SmolDevice<D: NetDevice> {
+    dev: D,
+}
+
+impl<D: NetDevice> SmolDevice<D> {
+    /// Wrap a `NetDevice` for use as a smoltcp `phy::Device`.
+    pub fn new(dev: D) -> Self {
+        SmolDevice { dev }
+    }
+
+    /// The wrapped device's MAC address.
+    pub fn mac_address(&self) -> [u8; 6] {
+        self.dev.mac_address()
+    }
+}
+
+impl<D: NetDevice> Device for SmolDevice<D> {
+    type RxToken<'a>
+        = SmolRxToken
+    where
+        D: 'a;
+    type TxToken<'a>
+        = SmolTxToken<'a, D>
+    where
+        D: 'a;
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        self.dev.capabilities()
+    }
+
+    fn receive(&mut self, _ts: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // Pop a frame (ending the &mut borrow), then hand out a paired TX token.
+        let frame = self.dev.receive_frame()?;
+        Some((SmolRxToken { frame }, SmolTxToken { dev: &mut self.dev }))
+    }
+
+    fn transmit(&mut self, _ts: Instant) -> Option<Self::TxToken<'_>> {
+        if self.dev.can_transmit() {
+            Some(SmolTxToken { dev: &mut self.dev })
         } else {
             None
         }
     }
 }
 
-/// RX token owning a single popped `RxBuffer`. The buffer is delivered to
-/// smoltcp once (in `consume`) and recycled to the device exactly once.
+/// RX token owning one received frame; delivered to smoltcp exactly once.
 pub struct SmolRxToken {
-    buf: Option<RxBuffer>,
+    frame: Vec<u8>,
 }
 
 impl phy::RxToken for SmolRxToken {
-    fn consume<R, F>(mut self, f: F) -> R
+    fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        // `receive()` always populates `buf`, so this take cannot be `None`.
-        let rx_buf = self.buf.take().expect("SmolRxToken consumed without a buffer");
-
-        // Run smoltcp's parser on the frame bytes WITHOUT holding the NIC lock,
-        // so a reply built through the paired TX token (which re-locks the NIC)
-        // cannot deadlock against us.
-        let result = f(rx_buf.packet());
-
-        // Return the buffer to the RX queue exactly once.
-        if let Some(nic) = NIC.lock().as_mut() {
-            let _ = nic.recycle_rx_buffer(rx_buf);
-        }
-
-        result
+        f(&self.frame)
     }
 }
 
-/// TX token. `consume` builds one frame and sends it exactly once (R13.7).
-pub struct SmolTxToken;
+/// TX token borrowing the device: build one frame and send it once.
+pub struct SmolTxToken<'a, D: NetDevice> {
+    dev: &'a mut D,
+}
 
-impl phy::TxToken for SmolTxToken {
+impl<'a, D: NetDevice> phy::TxToken for SmolTxToken<'a, D> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        // Build the frame in a fresh heap buffer (no aliasing with any device
-        // or other token buffer), let smoltcp fill it, then enqueue it once.
-        let mut frame = vec![0u8; len];
+        let mut frame = alloc::vec![0u8; len];
         let result = f(&mut frame);
-
-        if let Some(nic) = NIC.lock().as_mut() {
-            let _ = nic.send(TxBuffer::from(frame.as_slice()));
-        }
-
+        self.dev.transmit_frame(&frame);
         result
     }
 }
