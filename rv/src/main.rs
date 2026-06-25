@@ -1,19 +1,28 @@
-//! pagh OS — RISC-V (riscv64gc) boot seed (branch `riscv-port`, Milestone A).
+//! pagh OS — RISC-V (riscv64gc) kernel (branch `riscv-port`).
 //!
-//! A minimal, verifiable S-mode kernel: OpenSBI hands control to `_start` at
-//! 0x8020_0000, we set up a stack and call [`kmain`], which prints over the SBI
-//! console and parks the hart. This proves the toolchain (riscv64gc + build-std),
-//! the link layout, and the OpenSBI → S-mode boot path before the real arch layer
-//! (traps, Sv39 paging, PLIC/CLINT, virtio-mmio) is grown on top per the spec.
+//! Boot path under QEMU `virt` + OpenSBI: firmware (M-mode) jumps to `_start`
+//! at 0x8020_0000 in S-mode with `a0`=hartid, `a1`=DTB pointer. `_start` sets up
+//! the boot stack and calls [`kmain`], which brings the kernel up step by step.
+//!
+//! Milestone A: SBI console.
+//! Milestone B: DTB memory discovery, bitmap PMM, Sv39 identity paging, heap.
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+mod dtb;
+mod heap;
+mod paging;
+mod pmm;
+mod sbi;
+
+use alloc::vec::Vec;
 use core::panic::PanicInfo;
 
-// Entry trampoline. This is the first code at 0x8020_0000 (.text.entry). Set the
-// stack pointer to the top of the linker-provided boot stack, then jump to Rust.
-// `a0` (hartid) and `a1` (DTB pointer) are preserved as the SysV C arguments to
-// kmain so later milestones can parse the device tree.
+// Entry trampoline (first bytes at 0x8020_0000). Set sp to the top of the
+// linker-provided boot stack, then call Rust. `a0`/`a1` (hartid, DTB) are
+// untouched before the call, so they arrive as kmain's C arguments.
 core::arch::global_asm!(
     r#"
     .section .text.entry
@@ -27,62 +36,95 @@ _start:
 "#
 );
 
-/// SBI legacy `console_putchar` (Extension ID 0x01): write one byte to the
-/// firmware console. `a7` carries the extension id; `a0` the character.
-fn sbi_putchar(c: u8) {
-    // SAFETY: a plain SBI ecall with the legacy console-putchar calling
-    // convention; clobbers only a0/a1 and does not touch memory or the stack.
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            in("a7") 1usize,
-            in("a0") c as usize,
-            lateout("a0") _,
-            lateout("a1") _,
-            options(nostack),
-        );
-    }
+extern "C" {
+    static _kernel_end: u8;
 }
 
-/// Write a string to the SBI console, translating `\n` to CRLF so host serial
-/// terminals render line breaks correctly.
-fn sbi_print(s: &str) {
-    for b in s.bytes() {
-        if b == b'\n' {
-            sbi_putchar(b'\r');
-        }
-        sbi_putchar(b);
-    }
+/// First free physical address after the loaded kernel image (+ boot stack).
+fn kernel_end() -> usize {
+    core::ptr::addr_of!(_kernel_end) as usize
 }
 
-/// Park the current hart low-power until the next interrupt, forever.
+/// Fixed kernel-heap size carved from the front of usable RAM.
+const HEAP_SIZE: usize = 32 * 1024 * 1024;
+
+/// Default RAM assumption if the DTB has no sized memory region.
+const DEFAULT_RAM_END: usize = 0x8000_0000 + 128 * 1024 * 1024;
+
+#[no_mangle]
+pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
+    kprintln!();
+    kprintln!("========================================");
+    kprintln!("  pagh OS  --  riscv64 (S-mode, OpenSBI)");
+    kprintln!("========================================");
+    kprintln!("rv: boot hart {}, dtb @ {:#x}", hartid, dtb);
+
+    // 1. Discover RAM from the device tree (fall back conservatively).
+    let mem = dtb::memory(dtb).unwrap_or(dtb::MemInfo {
+        start: 0x8000_0000,
+        end: DEFAULT_RAM_END,
+    });
+    kprintln!(
+        "rv: RAM {:#x}..{:#x} ({} MiB)",
+        mem.start,
+        mem.end,
+        (mem.end - mem.start) / (1024 * 1024)
+    );
+
+    // 2. Carve [kernel_end .. +HEAP_SIZE] for the heap, give the rest to the PMM.
+    let kend = (kernel_end() + 0xfff) & !0xfff;
+    let heap_start = kend;
+    let pmm_start = heap_start + HEAP_SIZE;
+    kprintln!(
+        "rv: kernel_end {:#x}; heap {:#x}..{:#x} ({} MiB)",
+        kend,
+        heap_start,
+        pmm_start,
+        HEAP_SIZE / (1024 * 1024)
+    );
+
+    pmm::init(pmm_start, mem.end);
+    let (free, total) = pmm::stats();
+    kprintln!(
+        "rv: PMM up -- {} / {} frames free ({} MiB usable)",
+        free,
+        total,
+        (free * pmm::FRAME_SIZE) / (1024 * 1024)
+    );
+
+    // 3. Enable Sv39 identity paging (root table from the PMM).
+    // SAFETY: boot hart, PMM is up, mapping is identity so execution continues.
+    unsafe { paging::init_identity() };
+    kprintln!("rv: Sv39 identity paging enabled (satp set)");
+
+    // 4. Bring up the heap over the carved, identity-mapped region.
+    // SAFETY: region is owned by the heap and identity-mapped readable/writable.
+    unsafe { heap::init(heap_start, HEAP_SIZE) };
+    kprintln!("rv: heap up ({} MiB, galloc)", HEAP_SIZE / (1024 * 1024));
+
+    // 5. Smoke-test the allocator: build a Vec on the heap and use it.
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..1000u64 {
+        v.push(i * i);
+    }
+    let sum: u64 = v.iter().sum();
+    kprintln!("rv: heap test -- sum of squares 0..1000 = {} (len {})", sum, v.len());
+
+    kprintln!("rv: Milestone B OK -- DTB + PMM + Sv39 + heap.");
+    kprintln!("rv: next: traps (stvec) + ~100 Hz timer + scheduler.");
+    park();
+}
+
+/// Park the current hart until the next interrupt, forever.
 fn park() -> ! {
     loop {
-        // SAFETY: `wfi` is always valid; it simply waits for an interrupt.
+        // SAFETY: `wfi` simply waits for an interrupt.
         unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
     }
 }
 
-/// Rust entry called from `_start` once the stack is set up.
-#[no_mangle]
-pub extern "C" fn kmain() -> ! {
-    sbi_print("\n");
-    sbi_print("========================================\n");
-    sbi_print("  pagh OS  --  riscv64 (S-mode, OpenSBI)\n");
-    sbi_print("========================================\n");
-    sbi_print("rv: Milestone A boot OK -- SBI console up\n");
-    sbi_print("rv: parking hart (wfi). Next: DTB parse + PMM + Sv39.\n");
-    park();
-}
-
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    sbi_print("\nrv: PANIC: ");
-    if let Some(s) = info.message().as_str() {
-        sbi_print(s);
-    } else {
-        sbi_print("(no message)");
-    }
-    sbi_print("\n");
+    kprintln!("\nrv: PANIC: {}", info);
     park();
 }

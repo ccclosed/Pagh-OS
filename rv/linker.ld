@@ -27,5 +27,8 @@ SECTIONS
         _stack_top = .;
     }
 
+    . = ALIGN(4096);
+    _kernel_end = .;           /* first free physical address after the image */
+
     /DISCARD/ : { *(.eh_frame .eh_frame_hdr .comment) }
 }
