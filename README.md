@@ -246,6 +246,45 @@ From inside the guest shell you can also drive the TCP client: `nc 10.0.2.2 <por
 
 ---
 
+## RISC-V port (experimental — branch `riscv-port`)
+
+A 64-bit RISC-V (`riscv64gc`) port is in progress on the [`riscv-port`](https://github.com/ccclosed/Pagh-OS/tree/riscv-port)
+branch, targeting the QEMU `virt` machine booted by OpenSBI (S-mode). It starts
+as a standalone, verifiable boot seed under `rv/` (its own workspace, like
+`host-tests/`); the arch-independent pagh subsystems (shell logic, VFS, ext2,
+the `net`/`pkg`/`apt` stack) fold in over the new architecture layer as the port
+matures. The full plan, the x86_64→riscv64 architecture mapping, and the
+milestone list live in `.kiro/specs/riscv-port/`.
+
+Build and run it (on the branch):
+
+```bat
+run_rv.cmd            :: build the riscv64 seed and boot it under QEMU virt + OpenSBI
+run_rv.cmd build      :: build only
+```
+
+This builds for `riscv64gc-unknown-none-elf` with `build-std` and launches
+`qemu-system-riscv64 -machine virt -bios default` (OpenSBI) with a virtio-blk
+disk and a virtio-net NIC on the virtio-mmio transport; serial is on the console.
+
+What boots and is verified end to end under QEMU today:
+
+- **Boot:** OpenSBI hands off to the kernel in S-mode at `0x8020_0000`; SBI console.
+- **Memory:** device-tree RAM discovery, a bitmap physical frame allocator, Sv39
+  paging (identity map + per-page user mapping), and a `good_memory_allocator` heap.
+- **Traps & time:** an `stvec` trap vector with an `sscratch` kernel-stack swap, and
+  a ~100 Hz timer interrupt via the SBI timer.
+- **Tasking:** RISC-V context switching and a cooperative round-robin scheduler.
+- **User mode:** drop to U-mode via `sret` and an `ecall` system-call path.
+- **Drivers:** a real ns16550 MMIO UART console, virtio-blk (read/write round-trip),
+  and virtio-net driven through `smoltcp` to a DHCPv4 lease.
+- **Shell:** a small interactive serial shell (polled RX; `help`/`ticks`/`mem`/`info`).
+
+Still pending on the branch: PLIC interrupt-driven I/O, a RISC-V Linux ELF loader,
+ext2+WAL over virtio-blk, and the `apt`/`lxrun` stack at parity with x86_64.
+
+---
+
 ## Linux binaries & Debian packages
 
 `pagh` can run statically-linked Linux x86_64 programs and install Debian packages by name.
