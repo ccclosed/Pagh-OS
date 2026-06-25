@@ -1,0 +1,25 @@
+# RISC-V (riscv64gc) boot seed for the pagh OS port (branch `riscv-port`,
+# Milestone A). This is a standalone, verifiable nucleus: it boots under
+# QEMU `virt` + OpenSBI in S-mode and prints over the SBI console. Later
+# milestones grow the arch layer and fold in the arch-independent pagh modules
+# (see .kiro/specs/riscv-port/).
+# Detach from the root crate's tree — this seed is its own workspace (like
+# `host-tests/`), so it builds for riscv64 independently of the x86_64 kernel.
+[workspace]
+
+[package]
+name = "rv"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rv"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

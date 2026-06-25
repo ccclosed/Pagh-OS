@@ -1,0 +1,14 @@
+# Build the seed for bare-metal riscv64gc, compiling core/compiler_builtins from
+# source (build-std) since there is no precompiled std for this target in use.
+# rust-lld (the toolchain default for *-none-elf) links with our linker script.
+[build]
+target = "riscv64gc-unknown-none-elf"
+
+[unstable]
+build-std = ["core", "compiler_builtins"]
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+    "-C", "link-arg=-Tlinker.ld",
+    "-C", "relocation-model=static",
+]
