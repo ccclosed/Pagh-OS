@@ -89,8 +89,8 @@ pub fn syscall(num: usize, a0: usize) -> usize {
             crate::kprintln!("    [user] exit({})", a0);
             crate::kprintln!("rv: U-mode process made syscalls and exited.");
             crate::kprintln!("rv: Milestone D OK -- U-mode + ecall syscalls.");
-            crate::kprintln!("rv: next: PLIC + interactive UART RX, then virtio-net + smoltcp.");
-            crate::cpu::park();
+            crate::kprintln!("rv: all milestones (A-E) up; launching interactive shell.");
+            crate::shell::run();
         }
         _ => {
             crate::kprintln!("    [user] unknown syscall a7={}", num);

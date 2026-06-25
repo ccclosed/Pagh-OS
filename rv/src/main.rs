@@ -20,6 +20,7 @@ mod paging;
 mod pmm;
 mod sbi;
 mod sched;
+mod shell;
 mod timer;
 mod trap;
 mod uart;
