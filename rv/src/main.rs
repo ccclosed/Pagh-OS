@@ -17,6 +17,7 @@ mod heap;
 mod paging;
 mod pmm;
 mod sbi;
+mod sched;
 mod timer;
 mod trap;
 
@@ -131,15 +132,47 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         if sec > last_sec {
             last_sec = sec;
             kprintln!("rv: ~{}s elapsed, {} timer ticks", sec, t);
-            if sec >= 5 {
+            if sec >= 2 {
                 break;
             }
         }
     }
 
     kprintln!("rv: Milestone C OK -- trap vector + 100 Hz timer interrupts.");
-    kprintln!("rv: next: context switch + scheduler, then U-mode + ecall syscalls.");
+
+    // 7. Cooperative scheduler + context switch over kernel threads.
+    sched::init();
+    sched::spawn(thread_a);
+    sched::spawn(thread_b);
+    kprintln!("rv: scheduler up; cooperative round-robin over 2 kernel threads:");
+    for _ in 0..3 {
+        sched::yield_now();
+    }
+    kprintln!("rv: back in main; context switch + scheduler OK.");
+
+    kprintln!("rv: Milestone C.2 OK -- context switch + cooperative scheduler.");
+    kprintln!("rv: next: preemptive switch from the timer trap, then U-mode + ecall.");
     cpu::park();
+}
+
+/// Demo kernel thread A: print and cooperatively yield.
+extern "C" fn thread_a() -> ! {
+    let mut i = 0u64;
+    loop {
+        kprintln!("    [thread A] iteration {}", i);
+        i += 1;
+        sched::yield_now();
+    }
+}
+
+/// Demo kernel thread B: print and cooperatively yield.
+extern "C" fn thread_b() -> ! {
+    let mut i = 0u64;
+    loop {
+        kprintln!("    [thread B] iteration {}", i);
+        i += 1;
+        sched::yield_now();
+    }
 }
 
 /// Park the current hart until the next interrupt, forever.
