@@ -163,17 +163,19 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
 
     kprintln!("rv: Milestone C OK -- trap vector + 100 Hz timer interrupts.");
 
-    // 7. Cooperative scheduler + context switch over kernel threads.
+    // 7. Preemptive scheduler: spawn two CPU-bound threads that NEVER yield;
+    //    only the timer interrupt switches between them. Bounded: each prints a
+    //    few times then exits, after which only `main` remains runnable.
     sched::init();
-    sched::spawn(thread_a);
-    sched::spawn(thread_b);
-    kprintln!("rv: scheduler up; cooperative round-robin over 2 kernel threads:");
-    for _ in 0..3 {
-        sched::yield_now();
+    sched::spawn(worker_a);
+    sched::spawn(worker_b);
+    kprintln!("rv: preemptive scheduler up; 2 non-yielding threads, timer-driven:");
+    while sched::running_count() > 1 {
+        // main is CPU-bound too; the timer preempts among main/A/B.
+        core::hint::spin_loop();
     }
-    kprintln!("rv: back in main; context switch + scheduler OK.");
-
-    kprintln!("rv: Milestone C.2 OK -- context switch + cooperative scheduler.");
+    kprintln!("rv: workers finished; back in main (preemption now a no-op).");
+    kprintln!("rv: Milestone C.2 OK -- preemptive context switch + scheduler.");
 
     // 8. virtio-blk over virtio-mmio: attach + read/write round-trip (Milestone E).
     blk::init(dtb);
@@ -189,23 +191,32 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     elf::load_and_run(&image);
 }
 
-/// Demo kernel thread A: print and cooperatively yield.
-extern "C" fn thread_a() -> ! {
-    let mut i = 0u64;
-    loop {
-        kprintln!("    [thread A] iteration {}", i);
-        i += 1;
-        sched::yield_now();
-    }
+/// Demo worker A: CPU-bound, never yields; prints a few times (timer-paced) then
+/// exits. Interleaving with B proves timer preemption (no cooperative yield).
+extern "C" fn worker_a() -> ! {
+    preempt_worker("A")
 }
 
-/// Demo kernel thread B: print and cooperatively yield.
-extern "C" fn thread_b() -> ! {
-    let mut i = 0u64;
+/// Demo worker B (see [`worker_a`]).
+extern "C" fn worker_b() -> ! {
+    preempt_worker("B")
+}
+
+/// Shared body: print `name` up to 3 times, ~300 ms apart (by global ticks),
+/// busy-waiting in between (no yield/wfi), then exit.
+fn preempt_worker(name: &str) -> ! {
+    let mut printed = 0u32;
+    let mut next = timer::ticks() + 30;
     loop {
-        kprintln!("    [thread B] iteration {}", i);
-        i += 1;
-        sched::yield_now();
+        if timer::ticks() >= next {
+            kprintln!("    [preempt {}] print {}", name, printed);
+            printed += 1;
+            next = timer::ticks() + 30;
+            if printed >= 3 {
+                sched::exit();
+            }
+        }
+        core::hint::spin_loop();
     }
 }
 

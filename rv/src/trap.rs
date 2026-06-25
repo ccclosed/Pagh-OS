@@ -1,31 +1,27 @@
-//! Supervisor trap handling. `stvec` points at `__trap_entry` (direct mode),
-//! which switches to a dedicated kernel trap stack (via `sscratch`), saves the
-//! integer registers, calls the Rust dispatcher, restores them, and returns via
-//! `sret`. Handles the supervisor timer interrupt and `ecall` from U-mode; any
-//! other trap is reported and the hart is parked.
+//! Supervisor trap handling with a full saved frame, enabling **preemptive**
+//! scheduling: the entry saves all GPRs plus `sepc`/`sstatus` into a 34-slot
+//! frame on a per-trap kernel stack (selected via `sscratch`), the Rust
+//! dispatcher may swap that frame between threads (timer preemption), and the
+//! exit restores `sstatus`/`sepc`/GPRs and `sret`s into whatever thread the
+//! frame now describes.
 //!
-//! ## Why the `sscratch` stack swap
-//! On a trap from U-mode the hardware does not change `sp`, so the handler would
-//! otherwise run on the *user* stack (a U-page), which S-mode may not touch
-//! (no `SUM`) — causing a nested-fault storm. We keep `sscratch` = the kernel
-//! trap-stack top at all times; the entry swaps `sp`<->`sscratch`, runs the
-//! handler on the kernel stack, stashes the interrupted `sp` in the frame, and
-//! restores it on exit. This works uniformly for traps from kernel or user mode.
+//! Frame layout (`frame[i]`): 1=ra, 2=interrupted sp, 3..31 = the rest of
+//! x3..x31, 32 = sepc, 33 = sstatus.
 
 use core::arch::asm;
 
-/// Dedicated kernel trap stack (interrupts are masked in-handler, so one is
-/// enough — no nesting).
-const TRAP_STACK_SIZE: usize = 16 * 1024;
+/// Dedicated kernel trap stack (interrupts are masked in-handler, no nesting).
+const TRAP_STACK_SIZE: usize = 32 * 1024;
 
 #[repr(align(16))]
 struct TrapStack([u8; TRAP_STACK_SIZE]);
 
 static mut TRAP_STACK: TrapStack = TrapStack([0; TRAP_STACK_SIZE]);
 
-// Trap entry. Frame layout (offset = i*8 holds x_i): x1=ra, x2=interrupted sp
-// (stashed from sscratch), x3..x31 as usual. `.align 2` keeps it 4-byte aligned
-// for stvec direct mode.
+/// Saved-frame slot count (32 GPRs + sepc + sstatus); the on-stack frame is
+/// padded to 288 bytes (16-aligned).
+pub const FRAME_SLOTS: usize = 34;
+
 core::arch::global_asm!(
     r#"
     .section .text
@@ -33,12 +29,12 @@ core::arch::global_asm!(
     .globl __trap_entry
 __trap_entry:
     csrrw sp, sscratch, sp        # sp = kernel trap stack top; sscratch = interrupted sp
-    addi sp, sp, -256
+    addi sp, sp, -288
     sd ra,   1*8(sp)
     sd t0,   5*8(sp)
     csrr t0, sscratch             # t0 = interrupted sp
-    sd t0,   2*8(sp)              # frame[x2] = interrupted sp
-    addi t0, sp, 256              # restore sscratch to the trap-stack top
+    sd t0,   2*8(sp)
+    addi t0, sp, 288              # restore sscratch to the trap-stack top
     csrw sscratch, t0
     sd gp,   3*8(sp)
     sd tp,   4*8(sp)
@@ -68,8 +64,16 @@ __trap_entry:
     sd t4,  29*8(sp)
     sd t5,  30*8(sp)
     sd t6,  31*8(sp)
+    csrr t0, sepc
+    sd t0,  32*8(sp)
+    csrr t0, sstatus
+    sd t0,  33*8(sp)
     mv a0, sp
     call __trap_handler
+    ld t0,  33*8(sp)
+    csrw sstatus, t0
+    ld t0,  32*8(sp)
+    csrw sepc, t0
     ld ra,   1*8(sp)
     ld gp,   3*8(sp)
     ld tp,   4*8(sp)
@@ -100,7 +104,7 @@ __trap_entry:
     ld t4,  29*8(sp)
     ld t5,  30*8(sp)
     ld t6,  31*8(sp)
-    ld sp,   2*8(sp)              # restore interrupted sp (also leaves the frame)
+    ld sp,   2*8(sp)
     sret
 "#
 );
@@ -109,17 +113,14 @@ extern "C" {
     fn __trap_entry();
 }
 
-/// `scause` code for a supervisor timer interrupt.
 const SCAUSE_S_TIMER: usize = 5;
-/// `scause` code for a supervisor external interrupt (PLIC).
 const SCAUSE_S_EXTERNAL: usize = 9;
-/// `scause` code for an environment call from U-mode.
 const SCAUSE_ECALL_U: usize = 8;
 
 /// Install the trap vector and point `sscratch` at the kernel trap stack.
 pub fn init() {
-    // SAFETY: addr_of! avoids forming a reference to the mutable static; the
-    // top-of-stack value satisfies the trap-entry contract.
+    // SAFETY: addr_of! avoids a reference to the mutable static; the top-of-stack
+    // value satisfies the trap-entry contract.
     unsafe {
         let top = core::ptr::addr_of!(TRAP_STACK) as usize + TRAP_STACK_SIZE;
         crate::cpu::write_sscratch(top);
@@ -127,12 +128,11 @@ pub fn init() {
     }
 }
 
-/// Rust trap dispatcher, called from `__trap_entry` with all GPRs saved on the
-/// kernel trap stack. `frame[i]` is `x_i` (e.g. `frame[10]`=a0, `frame[17]`=a7).
+/// Rust trap dispatcher. `frame` points at the [`FRAME_SLOTS`]-slot saved array.
 #[no_mangle]
 extern "C" fn __trap_handler(frame: *mut usize) {
     let scause: usize;
-    // SAFETY: reading trap CSRs is side-effect-free.
+    // SAFETY: side-effect-free CSR read.
     unsafe { asm!("csrr {}, scause", out(reg) scause, options(nomem, nostack)) };
 
     let is_interrupt = (scause >> (usize::BITS - 1)) & 1 == 1;
@@ -140,11 +140,12 @@ extern "C" fn __trap_handler(frame: *mut usize) {
 
     if is_interrupt && code == SCAUSE_S_TIMER {
         crate::timer::on_tick();
+        // Preempt: may swap `*frame` to another thread's saved frame.
+        crate::sched::preempt(frame);
         return;
     }
 
     if is_interrupt && code == SCAUSE_S_EXTERNAL {
-        // PLIC: claim the pending IRQ, service it, complete it.
         let irq = crate::plic::claim();
         if irq == crate::plic::UART_IRQ {
             crate::uart::drain_rx();
@@ -156,24 +157,17 @@ extern "C" fn __trap_handler(frame: *mut usize) {
     }
 
     if !is_interrupt && code == SCAUSE_ECALL_U {
-        // System call: number in a7, first arg in a0; return value back in a0.
-        // SAFETY: `frame` is the saved register array from __trap_entry.
+        // System call: a7=number, a0=arg; return in a0; resume past the ecall by
+        // advancing the *saved* sepc (it is restored from the frame on exit).
         let (a7, a0) = unsafe { (*frame.add(17), *frame.add(10)) };
         let ret = crate::umode::syscall(a7, a0);
-        unsafe { *frame.add(10) = ret };
-
-        // Advance past the 4-byte `ecall` so `sret` resumes at the next insn.
-        let mut sepc: usize;
-        // SAFETY: side-effect-free CSR read/write of sepc.
         unsafe {
-            asm!("csrr {}, sepc", out(reg) sepc, options(nomem, nostack));
-            sepc += 4;
-            asm!("csrw sepc, {}", in(reg) sepc, options(nomem, nostack));
+            *frame.add(10) = ret;
+            *frame.add(32) += 4;
         }
         return;
     }
 
-    // Anything else is unexpected at this stage: report and park.
     let sepc: usize;
     let stval: usize;
     // SAFETY: side-effect-free CSR reads.
