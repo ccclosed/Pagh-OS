@@ -1,47 +1,48 @@
 @echo off
 REM ============================================================
-REM  pagh OS -- build & boot the riscv64 seed (QEMU virt + OpenSBI)
+REM  pagh OS -- build & boot the riscv64 kernel (QEMU virt + OpenSBI)
 REM ------------------------------------------------------------
-REM  Branch `riscv-port`. Builds the standalone seed crate in rv/
-REM  for riscv64gc (build-std) and boots it in S-mode under QEMU's
-REM  built-in OpenSBI, with a virtio-blk disk on virtio-mmio.
-REM  Serial is on the console.
+REM  Branch `riscv-port`. Builds the MAIN crate for riscv64gc (the riscv code
+REM  lives in src/arch/riscv64/, gated by cfg(target_arch="riscv64")), links the
+REM  staticlib with rust-lld + linker-riscv.ld, and boots it in S-mode under
+REM  QEMU's built-in OpenSBI, with a virtio-blk disk and a virtio-net NIC.
 REM
 REM  Usage:
-REM    run_rv.cmd          build + boot
-REM    run_rv.cmd build    build only
+REM    run_rv.cmd          build + link + boot
+REM    run_rv.cmd build    build + link only
 REM ============================================================
-setlocal
-set ELF=rv\target\riscv64gc-unknown-none-elf\release\rv
-set DISK=rv\rvdisk.img
+setlocal enabledelayedexpansion
+set TARGET=riscv64gc-unknown-none-elf
+set ARCHIVE=target\%TARGET%\debug\libpagh.a
+set ELF=PAGH-rv.elf
+set DISK=rvdisk.img
 set MODE=%1
 if "%MODE%"=="" set MODE=run
 
-echo === Building riscv64 seed (release) ===
-pushd rv
-cargo +nightly build --release
-set ERR=%errorlevel%
-popd
-if not "%ERR%"=="0" (echo BUILD FAILED & exit /b 1)
-echo Build OK: %ELF%
+echo === Building pagh (riscv64) ===
+cargo +nightly build --target %TARGET%
+if errorlevel 1 (echo BUILD FAILED & exit /b 1)
+if not exist "%ARCHIVE%" (echo ERROR: static library not found: %ARCHIVE% & exit /b 1)
+
+REM --- Locate rust-lld in the nightly toolchain ---
+set RUSTLLD=
+for /f "delims=" %%p in ('where /R "%USERPROFILE%\.rustup" rust-lld.exe 2^>nul ^| findstr /i "nightly" ^| findstr /v "lldb"') do set RUSTLLD=%%p
+if "!RUSTLLD!"=="" (echo ERROR: rust-lld.exe not found in the .rustup nightly toolchain & exit /b 1)
+
+echo === Linking %ELF% ===
+"!RUSTLLD!" -flavor gnu -T linker-riscv.ld -nostdlib -static --whole-archive "%ARCHIVE%" --no-whole-archive -o "%ELF%"
+if errorlevel 1 (echo LINK FAILED & exit /b 1)
+echo Link OK: %ELF%
 
 if /i "%MODE%"=="build" goto :done
 
 where qemu-system-riscv64 >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: qemu-system-riscv64 not found in PATH.
-    exit /b 1
-)
+if errorlevel 1 (echo ERROR: qemu-system-riscv64 not found in PATH. & exit /b 1)
 
-REM Create a 16 MiB scratch virtio-blk disk image on first run.
 if not exist %DISK% (
     echo === Creating %DISK% ^(16 MiB raw^) ===
     where qemu-img >nul 2>&1
-    if errorlevel 1 (
-        fsutil file createnew %DISK% 16777216
-    ) else (
-        qemu-img create -f raw %DISK% 16M
-    )
+    if errorlevel 1 (fsutil file createnew %DISK% 16777216) else (qemu-img create -f raw %DISK% 16M)
 )
 
 echo === Booting QEMU (riscv64 virt, OpenSBI, S-mode) ===

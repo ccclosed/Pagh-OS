@@ -1,33 +1,13 @@
-//! pagh OS — RISC-V (riscv64gc) kernel (branch `riscv-port`).
+//! pagh OS — RISC-V (riscv64gc) boot/orchestration (folded into the main crate
+//! from the former standalone `rv/` seed; branch `riscv-port`).
 //!
 //! Boot path under QEMU `virt` + OpenSBI: firmware (M-mode) jumps to `_start`
 //! at 0x8020_0000 in S-mode with `a0`=hartid, `a1`=DTB pointer. `_start` sets up
 //! the boot stack and calls [`kmain`], which brings the kernel up step by step.
 //!
-//! Milestone A: SBI console.
-//! Milestone B: DTB memory discovery, bitmap PMM, Sv39 identity paging, heap.
-#![no_std]
-#![no_main]
-
-extern crate alloc;
-
-mod blk;
-mod cpu;
-mod dtb;
-mod elf;
-mod heap;
-mod net;
-mod paging;
-mod plic;
-mod pmm;
-mod ramfs;
-mod sbi;
-mod sched;
-mod shell;
-mod timer;
-mod trap;
-mod uart;
-mod umode;
+//! The riscv64 modules are declared at the crate root via `#[path]` in `lib.rs`
+//! (gated `#[cfg(target_arch = "riscv64")]`), so this code's `crate::pmm`,
+//! `crate::timer`, `crate::kprintln!`, ... paths resolve unchanged.
 
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
@@ -72,7 +52,7 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     kprintln!("rv: boot hart {}, dtb @ {:#x}", hartid, dtb);
 
     // 1. Discover RAM from the device tree (fall back conservatively).
-    let mem = dtb::memory(dtb).unwrap_or(dtb::MemInfo {
+    let mem = crate::dtb::memory(dtb).unwrap_or(crate::dtb::MemInfo {
         start: 0x8000_0000,
         end: DEFAULT_RAM_END,
     });
@@ -95,37 +75,37 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         HEAP_SIZE / (1024 * 1024)
     );
 
-    pmm::init(pmm_start, mem.end);
-    let (free, total) = pmm::stats();
+    crate::pmm::init(pmm_start, mem.end);
+    let (free, total) = crate::pmm::stats();
     kprintln!(
         "rv: PMM up -- {} / {} frames free ({} MiB usable)",
         free,
         total,
-        (free * pmm::FRAME_SIZE) / (1024 * 1024)
+        (free * crate::pmm::FRAME_SIZE) / (1024 * 1024)
     );
 
     // 3. Enable Sv39 identity paging (root table from the PMM).
     // SAFETY: boot hart, PMM is up, mapping is identity so execution continues.
-    unsafe { paging::init_identity() };
+    unsafe { crate::paging::init_identity() };
     kprintln!("rv: Sv39 identity paging enabled (satp set)");
 
     // 4. Bring up the heap over the carved, identity-mapped region.
     // SAFETY: region is owned by the heap and identity-mapped readable/writable.
-    unsafe { heap::init(heap_start, HEAP_SIZE) };
+    unsafe { crate::heap::init(heap_start, HEAP_SIZE) };
     kprintln!("rv: heap up ({} MiB, galloc)", HEAP_SIZE / (1024 * 1024));
 
     // 4b. Bring up the real ns16550 MMIO UART and move the console onto it.
-    if let Some(ub) = dtb::uart(dtb) {
-        uart::init(ub);
+    if let Some(ub) = crate::dtb::uart(dtb) {
+        crate::uart::init(ub);
         kprintln!("rv: ns16550 UART @ {:#x} online -- console now on MMIO", ub);
         // Arm interrupt-driven RX: PLIC routes the UART IRQ to S-mode, the UART
         // raises RDA interrupts, and SEIE lets them be delivered (once SIE is on).
-        plic::init();
-        uart::enable_rx_interrupt();
-        // SAFETY: arming SEIE; the trap vector is installed in Milestone C before
-        // interrupts are globally enabled.
-        unsafe { cpu::sie_set(1 << 9) };
-        kprintln!("rv: PLIC + UART RX interrupt armed (IRQ {})", plic::UART_IRQ);
+        crate::plic::init();
+        crate::uart::enable_rx_interrupt();
+        // SAFETY: arming SEIE; the trap vector is installed before interrupts are
+        // globally enabled below.
+        unsafe { crate::cpu::sie_set(1 << 9) };
+        kprintln!("rv: PLIC + UART RX interrupt armed (IRQ {})", crate::plic::UART_IRQ);
     } else {
         kprintln!("rv: ns16550 UART not found in DTB; staying on SBI console");
     }
@@ -141,17 +121,17 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     kprintln!("rv: Milestone B OK -- DTB + PMM + Sv39 + heap.");
 
     // 6. Traps + a periodic ~100 Hz timer interrupt (Milestone C).
-    trap::init();
-    timer::init();
+    crate::trap::init();
+    crate::timer::init();
     // SAFETY: the trap vector and timer are armed before enabling interrupts.
-    unsafe { cpu::enable_interrupts() };
+    unsafe { crate::cpu::enable_interrupts() };
     kprintln!("rv: traps + 100 Hz timer armed; counting ticks...");
 
     let mut last_sec = 0u64;
     loop {
         // SAFETY: wait for the next interrupt (the timer fires at 100 Hz).
         unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
-        let t = timer::ticks();
+        let t = crate::timer::ticks();
         let sec = t / 100;
         if sec > last_sec {
             last_sec = sec;
@@ -164,37 +144,35 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
 
     kprintln!("rv: Milestone C OK -- trap vector + 100 Hz timer interrupts.");
 
-    // 7. Preemptive scheduler: spawn two CPU-bound threads that NEVER yield;
-    //    only the timer interrupt switches between them. Bounded: each prints a
-    //    few times then exits, after which only `main` remains runnable.
-    sched::init();
-    sched::spawn(worker_a);
-    sched::spawn(worker_b);
+    // 7. Preemptive scheduler: two CPU-bound threads that NEVER yield; only the
+    //    timer interrupt switches between them. Bounded: each prints a few times
+    //    then exits, after which only `main` remains runnable.
+    crate::sched::init();
+    crate::sched::spawn(worker_a);
+    crate::sched::spawn(worker_b);
     kprintln!("rv: preemptive scheduler up; 2 non-yielding threads, timer-driven:");
-    while sched::running_count() > 1 {
-        // main is CPU-bound too; the timer preempts among main/A/B.
+    while crate::sched::running_count() > 1 {
         core::hint::spin_loop();
     }
     kprintln!("rv: workers finished; back in main (preemption now a no-op).");
     kprintln!("rv: Milestone C.2 OK -- preemptive context switch + scheduler.");
 
-    // 8. virtio-blk over virtio-mmio: attach + read/write round-trip (Milestone E).
-    blk::init(dtb);
-    blk::selftest();
+    // 8. virtio-blk over virtio-mmio: attach + read/write round-trip.
+    crate::blk::init(dtb);
+    crate::blk::selftest();
     kprintln!("rv: Milestone E (blk) OK -- virtio-mmio + virtio-blk.");
 
-    // 8b. virtio-net + smoltcp: acquire a DHCPv4 lease (Milestone E).
-    net::demo(dtb);
+    // 8b. virtio-net + smoltcp: acquire a DHCPv4 lease.
+    crate::net::demo(dtb);
     kprintln!("rv: Milestone E (net) OK -- virtio-net + smoltcp + DHCP.");
 
-    // 8c. ramfs self-test + persistence to virtio-blk (after net: verifies the
-    //     virtio-mmio scan no longer resets the blk device).
-    ramfs::selftest();
-    ramfs::persist_selftest();
+    // 8c. ramfs self-test + persistence to virtio-blk.
+    crate::ramfs::selftest();
+    crate::ramfs::persist_selftest();
 
-    // 9. Load and run a real static riscv64 ELF in U-mode (Milestone D/E).
-    let image = elf::build_test_elf();
-    elf::load_and_run(&image);
+    // 9. Load and run a real static riscv64 ELF in U-mode.
+    let image = crate::elf::build_test_elf();
+    crate::elf::load_and_run(&image);
 }
 
 /// Demo worker A: CPU-bound, never yields; prints a few times (timer-paced) then
@@ -212,27 +190,22 @@ extern "C" fn worker_b() -> ! {
 /// busy-waiting in between (no yield/wfi), then exit.
 fn preempt_worker(name: &str) -> ! {
     let mut printed = 0u32;
-    let mut next = timer::ticks() + 30;
+    let mut next = crate::timer::ticks() + 30;
     loop {
-        if timer::ticks() >= next {
+        if crate::timer::ticks() >= next {
             kprintln!("    [preempt {}] print {}", name, printed);
             printed += 1;
-            next = timer::ticks() + 30;
+            next = crate::timer::ticks() + 30;
             if printed >= 3 {
-                sched::exit();
+                crate::sched::exit();
             }
         }
         core::hint::spin_loop();
     }
 }
 
-/// Park the current hart until the next interrupt, forever.
-fn park() -> ! {
-    cpu::park()
-}
-
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     kprintln!("\nrv: PANIC: {}", info);
-    park();
+    crate::cpu::park()
 }
