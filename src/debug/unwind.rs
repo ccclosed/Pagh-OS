@@ -74,3 +74,69 @@ pub fn stack_trace_from(mut rbp: u64) {
 
     crate::kprintln!("--- End trace ---");
 }
+
+/// Heap-free, best-effort backtrace by SCANNING the kernel stack for return
+/// addresses that lie within the kernel code image.
+///
+/// Used by fatal exception handlers when the normal RBP chain is useless — e.g.
+/// after a control-flow corruption that transferred to a garbage address
+/// (`RIP=0x1`), where neither RIP nor RBP point at real frames. We instead walk
+/// up the faulting stack from `rsp` and print every 8-byte slot whose value
+/// falls in `[kernel_start, kernel_end)`; those are almost all genuine return
+/// addresses, so the list reconstructs the call chain that was live at the fault.
+///
+/// SAFETY/robustness: the scan is capped at the TOP of `rsp`'s per-PID kernel
+/// stack slot (derived from `layout::KERNEL_STACK_REGION_BASE`/`STRIDE`) so it
+/// can never read into the adjacent unmapped guard page and trigger a nested
+/// fault. If `rsp` is not in the per-PID stack region (e.g. the boot/idle
+/// stack), a small fixed window is scanned instead.
+pub fn stack_scan_backtrace(rsp: u64, max_qwords: usize) {
+    use crate::memory::layout;
+
+    crate::kprintln!("--- Stack scan from RSP=0x{:016x} (return addrs in kernel image) ---", rsp);
+
+    // Must be a canonical higher-half, 8-aligned pointer to be usable.
+    if rsp < 0xFFFF_8000_0000_0000 || (rsp & 7) != 0 {
+        crate::kprintln!("  (RSP not a usable kernel stack pointer)");
+        crate::kprintln!("--- End scan ---");
+        return;
+    }
+
+    let kstart = layout::kernel_start();
+    let kend = layout::kernel_end();
+
+    // Upper bound: never read past the top of this stack slot (next slot's
+    // unmapped guard page), so the scan itself cannot fault.
+    let default_limit = rsp.saturating_add((max_qwords as u64) * 8);
+    let limit = if rsp >= layout::KERNEL_STACK_REGION_BASE {
+        let off = rsp - layout::KERNEL_STACK_REGION_BASE;
+        let slot = off / layout::KERNEL_STACK_STRIDE;
+        let slot_top = layout::KERNEL_STACK_REGION_BASE
+            + slot * layout::KERNEL_STACK_STRIDE
+            + layout::KERNEL_STACK_STRIDE; // start of next slot = its guard page
+        core::cmp::min(default_limit, slot_top)
+    } else {
+        default_limit
+    };
+
+    let mut printed = 0usize;
+    let mut addr = rsp;
+    while addr + 8 <= limit {
+        // SAFETY: `addr` is 8-aligned, higher-half, and strictly below the top
+        // of the mapped stack slot, so the read is within mapped memory.
+        let val = unsafe { core::ptr::read_volatile(addr as *const u64) };
+        if val >= kstart && val < kend {
+            crate::kprintln!("  [{:>2}] @0x{:016x} -> 0x{:016x}", printed, addr, val);
+            printed += 1;
+            if printed >= 24 {
+                crate::kprintln!("  ... (truncated at 24 frames)");
+                break;
+            }
+        }
+        addr += 8;
+    }
+    if printed == 0 {
+        crate::kprintln!("  (no in-image return addresses found on the stack)");
+    }
+    crate::kprintln!("--- End scan ---");
+}

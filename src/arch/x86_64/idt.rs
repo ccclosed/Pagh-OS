@@ -148,11 +148,27 @@ extern "x86-interrupt" fn gp_fault_handler(stack: InterruptStackFrame, error_cod
 }
 extern "x86-interrupt" fn page_fault_handler(stack: InterruptStackFrame, error_code: PageFaultErrorCode) {
     let fault_addr = Cr2::read().unwrap_or(VirtAddr::new(0));
-    crate::error!("[EXC #14] PAGE FAULT addr=0x{:016x} RIP=0x{:016x} P={} W={} U={}",
-        fault_addr.as_u64(), stack.instruction_pointer.as_u64(),
+    let rsp = stack.stack_pointer.as_u64();
+    crate::error!(
+        "[EXC #14] PAGE FAULT addr=0x{:016x} RIP=0x{:016x} RSP=0x{:016x} P={} W={} U={} I={} ec=0x{:x}",
+        fault_addr.as_u64(),
+        stack.instruction_pointer.as_u64(),
+        rsp,
         error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION),
         error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE),
-        error_code.contains(PageFaultErrorCode::USER_MODE));
+        error_code.contains(PageFaultErrorCode::USER_MODE),
+        error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH),
+        error_code.bits(),
+    );
+    // For a kernel-mode fault, RIP/RBP may be garbage (control-flow corruption,
+    // e.g. RIP=0x1), so dump a heap-free stack scan of the faulting stack for
+    // return addresses in the kernel image — this reconstructs the call chain
+    // that was live at the fault. Then park (do not return: returning would just
+    // re-execute the faulting instruction and loop).
+    if !error_code.contains(PageFaultErrorCode::USER_MODE) {
+        crate::debug::unwind::stack_scan_backtrace(rsp, 8192);
+        crate::arch::cpu::halt_loop();
+    }
     halt();
 }
 extern "x86-interrupt" fn x87_fpu_handler(stack: InterruptStackFrame) {
