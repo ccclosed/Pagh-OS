@@ -26,12 +26,15 @@ loader, a preemptive round-robin scheduler, a `SYSCALL`/`int 0x80` interface, PC
 enumeration with virtio drivers, a TCP/IP network stack, a journaled ext2 filesystem on a
 real disk, and a friendly interactive shell with line editing, history, tab completion,
 and colored output. It can load and run an embedded test program in ring 3, and ships a
-full-screen mouse-driven `paint` application. It also runs **statically-linked Linux
+windowed, mouse-driven `paint` application (a movable window with minimize/maximize/close
+and a taskbar entry). It also runs **statically-linked Linux
 x86_64 ELF binaries** in ring 3 through a Linux syscall-compatibility layer, and includes
 an **`apt`-style package manager** that fetches and installs Debian `.deb` packages by
 name over HTTP/HTTPS.
 
 > Hobby/educational kernel. There is no security model beyond ring 0/3 paging.
+
+> **Authorship:** this kernel was written by Claude Opus 4.8 under human supervision.
 
 ---
 
@@ -191,7 +194,7 @@ framebuffer (serial stays plain text).
 | `sync`               | Flush the mounted filesystem                                    |
 | `fscrash`            | Demo journal replay + persistence (write → remount → verify)    |
 | `sleep <seconds>`    | Sleep for N seconds                                             |
-| `paint`              | Launch the full-screen mouse-driven framebuffer paint app       |
+| `paint`              | Launch the windowed, mouse-driven framebuffer paint app         |
 | `pci`                | List enumerated PCI devices (virtio tagged)                     |
 | `ifconfig`           | Show the network interface (IP, gateway, MAC)                   |
 | `nc <ip> <port> [t]` | Open a TCP connection and echo a line over it                   |
@@ -220,15 +223,19 @@ bottom status bar. A PS/2 mouse (IRQ12) feeds an absolute, screen-clamped cursor
 and button state, drawn as a trailing-free software arrow cursor (`drivers::cursor`) that
 saves and restores the pixels beneath it.
 
-`paint` ties these together into a full-screen drawing application launched from the shell:
+`paint` ties these together into a windowed drawing application launched from the shell:
 
+- **Window:** draws itself as a desktop window with a title bar (drag to move) and
+  minimize / maximize / close buttons, plus a "Paint" taskbar button that toggles
+  minimize; maximize stretches it to full screen.
 - **Tools:** Pencil, Eraser, Line, Rectangle, Filled Rectangle, Circle, Disc, Bucket fill,
   and color Picker — shape tools show a live rubber-band preview while dragging.
 - **Color:** a 16-entry palette (toolbar swatches, or number keys `1`–`0`); left button
   paints, right button quick-erases to white.
 - **Editing:** keyboard shortcuts for tools, brush size (`[`/`]`), undo/redo (`u`),
-  clear (`x`), and save/load the canvas to `/mnt/paint.img` (`s`/`g`) via the ext2 FS.
-- **Exit:** `Esc` or `q` returns to the shell.
+  clear (`x`), maximize (`m`), and save/load the canvas to `/mnt/paint.img` (`s`/`g`) via
+  the ext2 FS.
+- **Exit:** the close button, `Esc`, or `q` returns to the shell.
 
 ### Trying the network from the host
 
@@ -321,7 +328,7 @@ src/
 │   ├── registry.rs     #   single CommandSpec table driving dispatch and help
 │   ├── render.rs       #   color palette + styled prompt/error/success (serial stays plain)
 │   ├── commands.rs     #   command handlers (ls, cd, cat, cp, mv, stat, write, nc, …)
-│   └── paint.rs        #   full-screen mouse-driven framebuffer paint application
+│   └── paint.rs        #   windowed mouse-driven framebuffer paint application
 ├── arch/
 │   ├── cpu.rs          # safe wrappers for privileged instrs (hlt/cli/sti/rd-/wrmsr, SSE)
 │   └── x86_64/

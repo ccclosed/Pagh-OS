@@ -763,7 +763,8 @@ pub(super) fn cmd_paint(_ctx: &mut ShellCtx, _args: &[&str]) {
     crate::kprintln!(
         "paint keys: p=pencil e=eraser l=line r=rect f=fillrect c=circle d=disc b=bucket i=picker"
     );
-    crate::kprintln!("paint keys: 1-0=color [ ]=brush u=undo x=clear s=save g=load q=quit");
+    crate::kprintln!("paint keys: 1-0=color [ ]=brush u=undo x=clear m=maximize s=save g=load q=quit");
+    crate::kprintln!("paint window: title-bar buttons minimize/maximize/close; taskbar 'Paint' toggles minimize");
     super::paint::run();
 }
 
