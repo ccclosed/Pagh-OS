@@ -40,17 +40,26 @@ name over HTTP/HTTPS.
 
 ## Screenshots
 
-<!--
-Add a few images/GIFs here — they do the most to attract interest. Suggestions:
-  - the boot log + shell prompt on serial/framebuffer
-  - the `paint` app in action (a short GIF is ideal)
-  - `ls`/`cat`/`ifconfig` output in the colored shell
-Drop files in a `docs/` or `assets/` folder and reference them:
-  ![pagh shell](docs/shell.png)
-  ![paint app](docs/paint.gif)
--->
+### The `paint` app (maximized window)
 
-_Coming soon — drop boot/shell/paint screenshots here._
+The windowed, mouse-driven drawing app: title bar with minimize/maximize/close, a
+16-color palette, tool buttons, and a "Paint" entry in the taskbar.
+
+![alt text](docs/image.png)
+
+### Interactive shell
+
+The framebuffer console with the color-coded `pagh:/mnt>` prompt and the bottom status
+bar (OS name, current directory, uptime, live mouse position).
+
+![alt text](docs/image1.png)
+
+### `apt update` over HTTPS
+
+The by-name package manager fetching the Debian `Packages` index over TLS 1.3, with the
+honest INSECURE warnings (VARIANT A: encrypted but unauthenticated).
+
+![alt text](docs/image2.png)
 
 ---
 
