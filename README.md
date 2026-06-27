@@ -45,21 +45,21 @@ name over HTTP/HTTPS.
 The windowed, mouse-driven drawing app: title bar with minimize/maximize/close, a
 16-color palette, tool buttons, and a "Paint" entry in the taskbar.
 
-![alt text](docs/image.png)
+![pagh paint app](docs/paint.png)
 
 ### Interactive shell
 
 The framebuffer console with the color-coded `pagh:/mnt>` prompt and the bottom status
 bar (OS name, current directory, uptime, live mouse position).
 
-![alt text](docs/image1.png)
+![pagh shell](docs/shell.png)
 
 ### `apt update` over HTTPS
 
 The by-name package manager fetching the Debian `Packages` index over TLS 1.3, with the
 honest INSECURE warnings (VARIANT A: encrypted but unauthenticated).
 
-![alt text](docs/image2.png)
+![pagh apt update](docs/apt.png)
 
 ---
 
