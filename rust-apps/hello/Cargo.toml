@@ -1,0 +1,11 @@
+[package]
+name = "pagh-rust-hello"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+strip = true

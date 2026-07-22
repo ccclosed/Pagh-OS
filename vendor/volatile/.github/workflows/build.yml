@@ -1,0 +1,67 @@
+on: [push, pull_request]
+
+name: Build
+
+permissions:
+  contents: read
+
+env:
+  RUSTFLAGS: -Dwarnings
+  RUSTDOCFLAGS: -Dwarnings
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --workspace --features derive
+
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --features derive
+
+  unstable:
+    name: Test Suite (unstable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo test --workspace --features unstable
+
+  very_unstable:
+    name: Test Suite (very_unstable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo test --workspace --features very_unstable
+
+  lints:
+    name: Lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --features derive
+
+  semver-checks:
+    name: Semver Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "semver-checks"
+          cache-targets: false
+      - run: cargo install cargo-semver-checks --locked
+      - name: Check semver
+        run: cargo semver-checks check-release

@@ -1,0 +1,34 @@
+[package]
+name = "good_memory_allocator"
+version = "0.1.7"
+edition = "2021"
+authors = ["Roee Shoshani", "Guy Nir"]
+description = "A blazingly fast and memory efficient memory allocator to be used in `no_std` environments."
+repository = "https://github.com/MaderNoob/galloc"
+keywords = ["allocator", "no_std", "malloc", "heap", "kernel"]
+categories = ["memory-management", "no-std", "algorithms", "data-structures", "embedded"]
+license = "MIT"
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+spin = { version = "0.9.4", optional = true }
+either = { version = "1.8.0", default-features = false }
+
+[dev-dependencies]
+rand =  "0.8.5"
+good_memory_allocator = { path = ".", features = ["spin", "allocator"] }
+linked_list_allocator = { version = "0.10.3", features =  ["use_spin_nightly", "const_mut_refs", "alloc_ref"] }
+simple-chunk-allocator = "0.1.5"
+average = "0.13.1"
+x86 = "0.51.0"
+
+[features]
+default = ["spin"]
+allocator = ["spin"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"

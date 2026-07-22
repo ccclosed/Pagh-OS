@@ -1,0 +1,1066 @@
+//! Effectful Linux file-I/O syscall handlers (task 12.1).
+//!
+//! This is the **kernel-only** half of the `io` component. It wires the pure
+//! planners in [`super::io`] (`plan_read`/`plan_lseek`) and [`super::stat`]
+//! (`encode_stat`) to the running `Compat_Process`'s [`FdTable`], the kernel
+//! console, and the VFS/ext2 file tree.
+//!
+//! It lives in its OWN file (not `io.rs`) on purpose: `io.rs` is `#[path]`-included
+//! verbatim by the `host-tests` crate so its pure planners can be property-tested
+//! on the host (R11.6). These handlers use kernel-only `memory`/`vfs`/`task` APIs
+//! that do not exist on the host, so keeping them here leaves `io.rs` purely
+//! host-testable while this file is compiled only as part of the kernel.
+//!
+//! ## User-pointer safety
+//!
+//! Every handler that takes a user pointer routes it through the single
+//! [`super::check_user_ptr`] choke point (range check + page-presence walk) BEFORE
+//! dereferencing it. During a syscall the active CR3 is the calling process's user
+//! PML4, so a validated lower-half user pointer is directly accessible from ring 0.
+//!
+//! ## Locking discipline
+//!
+//! [`crate::task::compat::with_current_compat`] holds the `COMPAT_STATES` spinlock
+//! (interrupts disabled) for the duration of its closure. Disk-backed VFS reads
+//! can block waiting for a device interrupt, so these handlers never hold that lock
+//! across a VFS call: they resolve the descriptor (cloning the `Arc<dyn VfsNode>`
+//! and snapshotting the offset) under the lock, release it, perform the I/O, then
+//! re-acquire briefly to commit the new offset.
+#![allow(dead_code)]
+
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
+
+use crate::task::compat;
+use crate::task::fd::{OpenObject, PipeEndpoint, PipeReadResult, PipeWriteResult};
+use crate::vfs::{self, VfsNode};
+
+use super::check_user_ptr;
+use super::dirent::{dirent_reclen, encode_dirent64, DT_DIR, DT_REG};
+use super::errno::Errno;
+use super::io::{plan_lseek, plan_read};
+use super::stat::{encode_stat, LinuxStat, S_IFDIR, S_IFREG};
+
+/// `st_mode` type bits for a character device (console/stdin), so `fstat` on a
+/// standard stream reports a plausible (non-regular) type.
+const S_IFCHR: u32 = 0o020000;
+
+/// Largest byte count `read`/`write` accept, matching the Linux `int` cap in
+/// R2.2 (0..=2_147_483_647). Larger requests are rejected with `EINVAL` rather
+/// than attempting a multi-gigabyte kernel allocation.
+const COUNT_MAX: u64 = 0x7FFF_FFFF;
+
+/// `openat` "current working directory" sentinel dir fd.
+const AT_FDCWD: u64 = (-100i64) as u64;
+
+/// Default permission bits reported for an ext2-backed regular file.
+const DEFAULT_FILE_PERMS: u32 = 0o644;
+
+/// A descriptor resolved to an actionable target, decoupled from the
+/// `COMPAT_STATES` lock so subsequent (possibly blocking) VFS I/O runs unlocked.
+enum Resolved {
+    /// fds 1/2 — the kernel console.
+    Console,
+    /// fd 0 — standard input (not writable).
+    Stdin,
+    /// An ext2-backed file: a cloned node handle and the offset at resolve time.
+    File { node: Arc<dyn VfsNode>, offset: u64 },
+    PipeRead(Arc<PipeEndpoint>),
+    PipeWrite(Arc<PipeEndpoint>),
+    /// An open directory (not a byte stream): read/write/pread/pwrite are rejected.
+    Dir,
+}
+
+/// Resolve `fd` for the current process, cloning the backing node so the caller
+/// can drop the `COMPAT_STATES` lock before doing VFS I/O. Returns `None` when the
+/// descriptor is absent/closed or the process has no compat state (→ `EBADF`).
+fn resolve_fd(fd: u32) -> Option<Resolved> {
+    compat::with_current_compat(|cs| {
+        cs.fds.get(fd).map(|obj| match obj {
+            OpenObject::Console => Resolved::Console,
+            OpenObject::Stdin => Resolved::Stdin,
+            OpenObject::PipeRead(e) => Resolved::PipeRead(Arc::clone(e)),
+            OpenObject::PipeWrite(e) => Resolved::PipeWrite(Arc::clone(e)),
+            OpenObject::File { node, offset } => Resolved::File {
+                node: Arc::clone(node),
+                offset: *offset,
+            },
+            OpenObject::Dir { .. } => Resolved::Dir,
+        })
+    })
+    .flatten()
+}
+
+/// Clone the VFS node backing an open regular-file descriptor, for callers
+/// outside this module that need the file bytes without holding the compat
+/// lock (currently `mem_sys::sys_mmap`'s file-backed mappings). Returns `None`
+/// for absent descriptors and anything that is not an ext2-backed `File`.
+pub fn file_node_for_fd(fd: u32) -> Option<Arc<dyn VfsNode>> {
+    match resolve_fd(fd) {
+        Some(Resolved::File { node, .. }) => Some(node),
+        _ => None,
+    }
+}
+
+/// Commit a new offset for an open file descriptor (no-op if it is not currently
+/// an open `File`). Used after a `read`/`write`/`lseek` advances the offset.
+fn set_fd_offset(fd: u32, new_off: u64) {
+    compat::with_current_compat(|cs| {
+        if let Some(OpenObject::File { offset, .. }) = cs.fds.get_mut(fd) {
+            *offset = new_off;
+        }
+    });
+}
+
+/// Write `slice` to the kernel console, reusing the exact serial-console path the
+/// legacy `SYS_WRITE` uses (valid-UTF-8 prefix written as `&str`, trailing
+/// invalid bytes emitted individually so output never panics).
+fn console_write(slice: &[u8]) {
+    use crate::drivers::Console;
+    let console = crate::drivers::serial::console();
+    // STAGE-13.7: mirror every stdout/stderr byte (and the stdin echo) to the
+    // framebuffer console as well. Previously this wrote ONLY to serial, so a
+    // Compat_Process was invisible in the QEMU graphical window: the shell
+    // prints via kprintln!+fb_println!, but python's output bypassed the
+    // framebuffer entirely. The fb writer already handles \n scrolling and
+    // 0x08 backspace, so the line-editor echo renders correctly too.
+    match core::str::from_utf8(slice) {
+        Ok(s) => {
+            console.write_str(s);
+            crate::fb_print!("{}", s);
+        }
+        Err(e) => {
+            let valid_up_to = e.valid_up_to();
+            // SAFETY: `from_utf8` guarantees `slice[..valid_up_to]` is valid UTF-8.
+            let prefix = unsafe { core::str::from_utf8_unchecked(&slice[..valid_up_to]) };
+            console.write_str(prefix);
+            crate::fb_print!("{}", prefix);
+            for &byte in &slice[valid_up_to..] {
+                let mut tmp = [0u8; 4];
+                let s = (byte as char).encode_utf8(&mut tmp);
+                console.write_str(s);
+                crate::fb_print!("{}", s);
+            }
+        }
+    }
+}
+
+/// Copy `len` validated user bytes at `ptr` into an owned buffer.
+///
+/// PRECONDITION: `[ptr, ptr+len)` has already passed [`check_user_ptr`].
+fn copy_in(ptr: u64, len: u64) -> Vec<u8> {
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 {
+        // SAFETY: the range was validated (in-range + every page mapped) and the
+        // active CR3 is the calling process's user PML4, so the source is readable.
+        unsafe {
+            core::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len as usize);
+        }
+    }
+    buf
+}
+
+/// Copy `src` out to the validated user buffer at `ptr`.
+///
+/// PRECONDITION: `[ptr, ptr+src.len())` has already passed [`check_user_ptr`].
+fn copy_out(ptr: u64, src: &[u8]) {
+    if !src.is_empty() {
+        // SAFETY: validated range, active user CR3 — destination is writable.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), ptr as *mut u8, src.len());
+        }
+    }
+}
+
+/// Read a NUL-terminated path string from user memory, validating each byte's
+/// page before dereferencing it. Caps the path at 4096 bytes (`EINVAL` if longer
+/// or not valid UTF-8).
+fn read_user_cstr(ptr: u64) -> Result<String, Errno> {
+    const PATH_MAX: usize = 4096;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut addr = ptr;
+    for _ in 0..PATH_MAX {
+        check_user_ptr(addr, 1)?;
+        // SAFETY: the single byte at `addr` was just validated as mapped/in-range.
+        let b = unsafe { *(addr as *const u8) };
+        if b == 0 {
+            return String::from_utf8(bytes).map_err(|_| Errno::EINVAL);
+        }
+        bytes.push(b);
+        addr += 1;
+    }
+    Err(Errno::EINVAL)
+}
+
+fn read_pipe(e:&PipeEndpoint,dst:&mut[u8])->Result<usize,Errno>{loop{match e.read(dst){PipeReadResult::Data(n)=>return Ok(n),PipeReadResult::Eof=>return Ok(0),PipeReadResult::WouldBlock if e.nonblocking()=>return Err(Errno::EAGAIN),PipeReadResult::WouldBlock=>crate::task::scheduler::yield_current()}}}
+fn write_pipe(e:&PipeEndpoint,src:&[u8])->Result<usize,Errno>{loop{match e.write(src){PipeWriteResult::Data(n)=>return Ok(n),PipeWriteResult::Broken=>return Err(Errno::EPIPE),PipeWriteResult::WouldBlock if e.nonblocking()=>return Err(Errno::EAGAIN),PipeWriteResult::WouldBlock=>crate::task::scheduler::yield_current()}}}
+
+/// `read` (0): copy up to `count` bytes from the file at its current offset into
+/// the user buffer, advance the offset by the bytes copied, and return that count
+/// (R2.3). `EBADF` for an absent fd (R2.14); reads on the console/stdin return 0.
+pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
+    if count > COUNT_MAX {
+        return Err(Errno::EINVAL);
+    }
+    check_user_ptr(buf, count)?;
+
+    match resolve_fd(fd as u32) {
+        None => Err(Errno::EBADF),
+        // STAGE-13.7: stdin is interactive now — a blocking, line-buffered
+        // read from the PS/2 keyboard (echo, backspace, ^D = EOF). Previously
+        // this returned an instant EOF, so CPython silently exited with 0.
+        Some(Resolved::Console) | Some(Resolved::Stdin) => read_stdin_line(buf, count),
+        Some(Resolved::Dir) => Err(Errno::EISDIR),
+        Some(Resolved::PipeWrite(_)) => Err(Errno::EBADF),
+        Some(Resolved::PipeRead(e)) => { let mut data=vec![0u8;count as usize];let n=read_pipe(&e,&mut data)?;copy_out(buf,&data[..n]);Ok(n as u64) }
+        Some(Resolved::File { node, offset }) => {
+            let size = node.size();
+            let (copied, _) = plan_read(size, offset, count);
+            if copied == 0 {
+                return Ok(0);
+            }
+            let mut kbuf = vec![0u8; copied as usize];
+            let n = node.read(offset, &mut kbuf).map_err(|e| {
+                // STAGE-13.7: a real VFS/ext2 read failure is not "invalid
+                // argument" — report EIO and log what actually broke.
+                crate::error!(
+                    "[linux] file read failed: {:?} ino={} off={} len={}",
+                    e, node.fs_ino(), offset, copied
+                );
+                Errno::EIO
+            })?;
+            copy_out(buf, &kbuf[..n]);
+            let new_off = offset + n as u64;
+            set_fd_offset(fd as u32, new_off);
+            Ok(n as u64)
+        }
+    }
+}
+
+/// `write` (1): write `count` user bytes to the descriptor. fds 1/2 (console)
+/// emit to the kernel console and return `count` (R2.2); a file descriptor writes
+/// at its offset and advances it; stdin is not writable (`EBADF`); an absent fd is
+/// `EBADF` (R2.14).
+pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
+    if count > COUNT_MAX {
+        return Err(Errno::EINVAL);
+    }
+    check_user_ptr(buf, count)?;
+
+    match resolve_fd(fd as u32) {
+        None => Err(Errno::EBADF),
+        Some(Resolved::Stdin) => Err(Errno::EBADF),
+        Some(Resolved::Dir) => Err(Errno::EISDIR),
+        Some(Resolved::PipeRead(_)) => Err(Errno::EBADF),
+        Some(Resolved::PipeWrite(e)) => {let data=copy_in(buf,count);Ok(write_pipe(&e,&data)? as u64)}
+        Some(Resolved::Console) => {
+            let data = copy_in(buf, count);
+            console_write(&data);
+            Ok(count)
+        }
+        Some(Resolved::File { node, offset }) => {
+            let data = copy_in(buf, count);
+            let n = node.write(offset, &data).map_err(|_| Errno::EINVAL)?;
+            set_fd_offset(fd as u32, offset + n as u64);
+            Ok(n as u64)
+        }
+    }
+}
+
+/// `writev` (20): gather-write up to `iovcnt` `iovec` entries. fds 1/2 emit each
+/// buffer to the console; a file descriptor writes them in order advancing its
+/// offset; returns the total bytes written (R2.2). Each `iov_base` is validated
+/// through the pointer choke point before being read.
+pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
+    // struct iovec { void *iov_base; size_t iov_len; } — 16 bytes on x86_64.
+    const IOV_SIZE: u64 = 16;
+    const IOV_MAX: u64 = 1024;
+    if iovcnt == 0 {
+        return Ok(0);
+    }
+    if iovcnt > IOV_MAX {
+        return Err(Errno::EINVAL);
+    }
+    // Validate the iovec array itself before reading any entry.
+    check_user_ptr(iov, iovcnt * IOV_SIZE)?;
+
+    let target = resolve_fd(fd as u32).ok_or(Errno::EBADF)?;
+    if matches!(target, Resolved::Stdin) {
+        return Err(Errno::EBADF);
+    }
+    if matches!(target, Resolved::Dir) { return Err(Errno::EISDIR); }
+    if matches!(target, Resolved::PipeRead(_)) { return Err(Errno::EBADF); }
+
+    // Track a running offset for the file case; commit it once at the end.
+    let mut file_off = match &target {
+        Resolved::File { offset, .. } => *offset,
+        _ => 0,
+    };
+    let mut total: u64 = 0;
+
+    for i in 0..iovcnt {
+        let entry = iov + i * IOV_SIZE;
+        // SAFETY: the whole iovec array range was validated above.
+        let base = unsafe { *(entry as *const u64) };
+        let len = unsafe { *((entry + 8) as *const u64) };
+        if len == 0 {
+            continue;
+        }
+        if len > COUNT_MAX {
+            return Err(Errno::EINVAL);
+        }
+        check_user_ptr(base, len)?;
+        let data = copy_in(base, len);
+        match &target {
+            Resolved::Console => {
+                console_write(&data);
+                total += len;
+            }
+            Resolved::PipeWrite(e) => {let n=write_pipe(e,&data)?;total+=n as u64;if n<data.len(){break;}}
+            Resolved::File { node, .. } => {
+                let n = node.write(file_off, &data).map_err(|_| Errno::EINVAL)?;
+                file_off += n as u64;
+                total += n as u64;
+            }
+            Resolved::Stdin | Resolved::PipeRead(_) => unreachable!(),
+            Resolved::Dir => unreachable!(),
+        }
+    }
+
+    if matches!(target, Resolved::File { .. }) {
+        set_fd_offset(fd as u32, file_off);
+    }
+    Ok(total)
+}
+
+/// Read the current process's cwd (absolute), defaulting to `/` when there is no
+/// compat state (a native task driving these handlers in a test harness).
+fn current_cwd() -> String {
+    compat::with_current_compat(|cs| cs.cwd.clone()).unwrap_or_else(|| String::from("/"))
+}
+
+/// Normalize `path`, resolving it against the current working directory when it is
+/// relative, and collapsing `.`/`..`/empty components into a clean absolute path.
+///
+/// `..` at the root stays at the root; the result always begins with `/` and never
+/// has a trailing slash (except the bare root `/`). This is the single place
+/// relative `open`/`openat`/`access`/`chdir`/`statfs`/`readlink` paths become
+/// absolute before hitting [`vfs::lookup_path`] (Feature: linux-binary-compat).
+fn resolve_path(path: &str) -> String {
+    let combined = if path.starts_with('/') {
+        String::from(path)
+    } else {
+        let mut c = current_cwd();
+        if !c.ends_with('/') {
+            c.push('/');
+        }
+        c.push_str(path);
+        c
+    };
+
+    let mut stack: Vec<&str> = Vec::new();
+    for comp in combined.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    if stack.is_empty() {
+        return String::from("/");
+    }
+    let mut out = String::new();
+    for comp in &stack {
+        out.push('/');
+        out.push_str(comp);
+    }
+    out
+}
+
+/// Build the [`OpenObject`] for an already-resolved absolute path, allocating a
+/// fresh descriptor for it. A directory becomes an [`OpenObject::Dir`] carrying a
+/// snapshot of its children (for `getdents64`); a file becomes an
+/// [`OpenObject::File`] at offset 0.
+fn open_resolved(abs: &str) -> Result<u64, Errno> {
+    let node = vfs::lookup_path(abs).map_err(|_| Errno::ENOENT)?;
+    let obj = if node.is_directory() {
+        let children = node.readdir().unwrap_or_default();
+        OpenObject::Dir {
+            path: String::from(abs),
+            children,
+            index: 0,
+        }
+    } else {
+        OpenObject::File {
+            node: Arc::clone(&node),
+            offset: 0,
+        }
+    };
+    let fd = compat::with_current_compat(|cs| cs.fds.alloc(obj));
+    match fd {
+        Some(fd) => Ok(fd as u64),
+        // No compat state (native task) — nowhere to record the descriptor.
+        None => Err(Errno::EBADF),
+    }
+}
+
+/// Resolve a user path (against the cwd if relative) and allocate a fresh
+/// descriptor for it, or `ENOENT` if the path does not exist (R2.4, R2.5). Shared
+/// by `open`/`openat`.
+fn open_path(path: &str) -> Result<u64, Errno> {
+    let abs = resolve_path(path);
+    open_resolved(&abs)
+}
+
+/// `open` (2): open an existing ext2 path (resolved against the cwd if relative),
+/// allocating the lowest fd ≥ 3 (R2.4); `ENOENT` if the path is absent (R2.5).
+/// Directories open as a directory descriptor usable with `getdents64`.
+pub fn sys_open(path: u64, _flags: u64, _mode: u64) -> Result<u64, Errno> {
+    let p = read_user_cstr(path)?;
+    open_path(&p)
+}
+
+/// `openat` (257): like `open`. `AT_FDCWD` (and any dirfd in this minimal layer)
+/// resolves the path against the process cwd; absolute paths ignore the dirfd.
+pub fn sys_openat(dirfd: u64, path: u64, _flags: u64, _mode: u64) -> Result<u64, Errno> {
+    let p = read_user_cstr(path)?;
+    // Absolute paths ignore dirfd; relative paths resolve against the cwd (the
+    // only directory base this minimal layer tracks), which covers AT_FDCWD.
+    let _ = dirfd;
+    open_path(&p)
+}
+
+/// `close` (3): release the descriptor, or `EBADF` if it is not open (R2.6, R2.14).
+pub fn sys_close(fd: u64) -> Result<u64, Errno> {
+    let res = compat::with_current_compat(|cs| cs.fds.close(fd as u32));
+    match res {
+        Some(Ok(())) => Ok(0),
+        Some(Err(e)) => Err(e),
+        None => Err(Errno::EBADF),
+    }
+}
+
+/// `lseek` (8): reposition a file descriptor's offset per `whence`/`offset`,
+/// returning the new absolute offset (R2.7) or `EINVAL` for a bad whence/negative
+/// result (R2.15). Console/stdin are not seekable (`EINVAL`); absent fd is `EBADF`.
+pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> Result<u64, Errno> {
+    match resolve_fd(fd as u32) {
+        None => Err(Errno::EBADF),
+        Some(Resolved::Console) | Some(Resolved::Stdin) => Err(Errno::EINVAL),
+        Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_)) => Err(Errno::ESPIPE),
+        // A directory descriptor supports rewinding/positioning its dents cursor:
+        // SEEK_SET sets the cursor index, returning it. Other whences are EINVAL.
+        Some(Resolved::Dir) => {
+            if whence != super::io::SEEK_SET as u64 {
+                return Err(Errno::EINVAL);
+            }
+            compat::with_current_compat(|cs| {
+                if let Some(OpenObject::Dir { index, .. }) = cs.fds.get_mut(fd as u32) {
+                    *index = offset as usize;
+                }
+            });
+            Ok(offset)
+        }
+        Some(Resolved::File { node, offset: cur }) => {
+            let size = node.size();
+            let new_off = plan_lseek(whence as u32, cur, size, offset as i64)?;
+            set_fd_offset(fd as u32, new_off);
+            Ok(new_off)
+        }
+    }
+}
+
+/// `st_dev` reported for all VFS-backed files (arbitrary but nonzero; 8:0).
+const STAT_DEV_VFS: u64 = 0x0800;
+
+/// Nonzero fallback inode for synthetic nodes without filesystem identity:
+/// FNV-1a of the node name with the top bit set, so it can never collide with
+/// a real ext2 inode number (those fit in 32 bits) and never reads as zero.
+fn synth_ino(name: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.as_bytes() {
+        h = (h ^ *b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h | (1 << 63)
+}
+
+/// Fill a [`LinuxStat`] for a node and copy it to the validated user buffer.
+fn write_stat(node: &Arc<dyn VfsNode>, statbuf: u64) -> Result<u64, Errno> {
+    let mode = if node.is_directory() {
+        S_IFDIR | 0o755
+    } else {
+        S_IFREG | DEFAULT_FILE_PERMS
+    };
+    let mut stat = encode_stat(node.size(), mode);
+    // STAGE-13.7 FIX: file identity matters. glibc's ld.so deduplicates loaded
+    // shared objects by the (st_dev, st_ino) pair from `fstat`, and the main
+    // executable's link_map carries an all-zero file id. With st_dev/st_ino
+    // left zeroed for every file, each freshly opened library "matched" the
+    // main binary, the loader reused its link_map instead of mapping libc, and
+    // startup died with "no version information available" spam followed by
+    // undefined `__libc_start_main, version GLIBC_2.34` (exit 127).
+    stat.st_dev = STAT_DEV_VFS;
+    stat.st_ino = match node.fs_ino() {
+        0 => synth_ino(node.name()),
+        ino => ino,
+    };
+    stat.st_nlink = 1;
+    stat.st_blocks = (stat.st_size + 511) / 512;
+    write_stat_struct(&stat, statbuf);
+    Ok(0)
+}
+
+/// Copy a fully-built [`LinuxStat`] to the validated user buffer.
+fn write_stat_struct(stat: &LinuxStat, statbuf: u64) {
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            stat as *const LinuxStat as *const u8,
+            core::mem::size_of::<LinuxStat>(),
+        )
+    };
+    copy_out(statbuf, bytes);
+}
+
+/// `fstat` (5): populate the user `struct stat` for an open descriptor (R2.8).
+/// `EBADF` for an absent fd (R2.14). Console/stdin report a character device.
+pub fn sys_fstat(fd: u64, statbuf: u64) -> Result<u64, Errno> {
+    check_user_ptr(statbuf, core::mem::size_of::<LinuxStat>() as u64)?;
+    match resolve_fd(fd as u32) {
+        None => Err(Errno::EBADF),
+        Some(Resolved::Console) | Some(Resolved::Stdin)
+        | Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_)) => {
+            let stat = encode_stat(0, S_IFCHR | 0o620);
+            write_stat_struct(&stat, statbuf);
+            Ok(0)
+        }
+        Some(Resolved::Dir) => {
+            let stat = encode_stat(0, S_IFDIR | 0o755);
+            write_stat_struct(&stat, statbuf);
+            Ok(0)
+        }
+        Some(Resolved::File { node, .. }) => write_stat(&node, statbuf),
+    }
+}
+
+/// `newfstatat` (262): stat a path (absolute, or `AT_FDCWD`-relative) into the
+/// user `struct stat` (R2.8); `ENOENT` if absent (R2.5).
+pub fn sys_newfstatat(_dirfd: u64, path: u64, statbuf: u64, _flags: u64) -> Result<u64, Errno> {
+    check_user_ptr(statbuf, core::mem::size_of::<LinuxStat>() as u64)?;
+    let p = read_user_cstr(path)?;
+    let abs = resolve_path(&p);
+    let node = vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
+    write_stat(&node, statbuf)
+}
+
+/// `ioctl` (16): console/stdin answer the core tty queries (`TCGETS`,
+/// `TCSETS*`, `TIOCGWINSZ`) so `isatty()` reports a terminal. STAGE-13.7:
+/// blanket `EINVAL` made CPython treat stdin as a non-tty pipe, read an
+/// instant EOF and exit 0 without ever showing a prompt. Other descriptors
+/// still report `EINVAL`; an absent fd is `EBADF`.
+pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
+    match resolve_fd(fd as u32) {
+        None => Err(Errno::EBADF),
+        Some(Resolved::Console) | Some(Resolved::Stdin) => tty_ioctl(request, arg),
+        Some(_) => Err(Errno::EINVAL),
+    }
+}
+
+// ─── tty surface (stage 13.7) ────────────────────────────────────────────────
+
+/// `TCGETS`: read terminal attributes (`struct termios`).
+const TCGETS: u64 = 0x5401;
+/// `TCSETS` / `TCSETSW` / `TCSETSF`: set terminal attributes (accepted, ignored).
+const TCSETS: u64 = 0x5402;
+const TCSETSW: u64 = 0x5403;
+const TCSETSF: u64 = 0x5404;
+/// `TIOCGWINSZ`: read the window size (`struct winsize`).
+const TIOCGWINSZ: u64 = 0x5413;
+
+/// Byte size of the Linux `struct termios` (4×u32 + c_line + c_cc[19]).
+const TERMIOS_SIZE: usize = 36;
+
+/// Build a plausible cooked-mode `struct termios` byte image: ICRNL|IXON,
+/// OPOST|ONLCR, B38400|CS8|CREAD, ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN plus the
+/// standard control characters (^C, ^\, DEL, ^U, ^D-as-VEOF, ...).
+fn build_termios() -> [u8; TERMIOS_SIZE] {
+    let mut t = [0u8; TERMIOS_SIZE];
+    let c_iflag: u32 = 0x0500; // ICRNL | IXON
+    let c_oflag: u32 = 0x0005; // OPOST | ONLCR
+    let c_cflag: u32 = 0x00BF; // B38400 | CS8 | CREAD
+    let c_lflag: u32 = 0x8A3B; // ISIG|ICANON|ECHO|ECHOE|ECHOK|ECHOCTL|ECHOKE|IEXTEN
+    t[0..4].copy_from_slice(&c_iflag.to_le_bytes());
+    t[4..8].copy_from_slice(&c_oflag.to_le_bytes());
+    t[8..12].copy_from_slice(&c_cflag.to_le_bytes());
+    t[12..16].copy_from_slice(&c_lflag.to_le_bytes());
+    t[16] = 0; // c_line
+    // c_cc: VINTR VQUIT VERASE VKILL VEOF VTIME VMIN VSWTC VSTART VSTOP VSUSP
+    //       VEOL VREPRINT VDISCARD VWERASE VLNEXT VEOL2 (rest zero)
+    let c_cc: [u8; 19] = [3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0];
+    t[17..36].copy_from_slice(&c_cc);
+    t
+}
+
+/// Console/stdin ioctls: just enough tty surface for `isatty()` to say yes
+/// (glibc issues `TCGETS`) and for programs to learn an 80×25 window.
+fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
+    match request {
+        TCGETS => {
+            check_user_ptr(arg, TERMIOS_SIZE as u64)?;
+            copy_out(arg, &build_termios());
+            Ok(0)
+        }
+        // Attribute writes are accepted and ignored (no real line discipline).
+        TCSETS | TCSETSW | TCSETSF => Ok(0),
+        TIOCGWINSZ => {
+            check_user_ptr(arg, 8)?;
+            // struct winsize { ws_row: 25, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 }
+            let ws: [u8; 8] = [25, 0, 80, 0, 0, 0, 0, 0];
+            copy_out(arg, &ws);
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// Blocking, line-buffered stdin read from the PS/2 keyboard (stage 13.7).
+///
+/// Cooked-tty semantics: printable characters echo as they are typed, Backspace
+/// erases, Tab expands to four spaces (one byte per rendered column keeps the
+/// erase bookkeeping trivial), Enter terminates the line (returned including
+/// the trailing `\n`), and Ctrl+D on an empty line reports EOF (`Ok(0)`).
+/// Blocks by yielding to the scheduler between polls, so the shell's
+/// foreground wait and the timer keep running while a binary sits in `read`.
+fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
+    use crate::shell::keys::{Decoder, KeyEvent};
+    if count == 0 {
+        return Ok(0);
+    }
+    let mut decoder = Decoder::new();
+    let mut line: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    loop {
+        let sc = crate::drivers::get_char("keyboard").and_then(|kbd| kbd.read_char());
+        let sc = match sc {
+            Some(b) => b,
+            None => {
+                // No pending scancode: let other tasks (and the IRQ that feeds
+                // the ring buffer) run instead of burning the time slice.
+                crate::task::scheduler::yield_current();
+                continue;
+            }
+        };
+        let ev = match decoder.feed(sc) {
+            Some(ev) => ev,
+            None => continue,
+        };
+        match ev {
+            KeyEvent::Enter | KeyEvent::Char('\n') => {
+                console_write(b"\n");
+                line.push(b'\n');
+                break;
+            }
+            KeyEvent::Tab | KeyEvent::Char('\t') => {
+                for _ in 0..4 {
+                    if (line.len() as u64) < count {
+                        console_write(b" ");
+                        line.push(b' ');
+                    }
+                }
+            }
+            KeyEvent::Char(c) => {
+                let mut utf8 = [0u8; 4];
+                let s = c.encode_utf8(&mut utf8);
+                console_write(s.as_bytes());
+                line.extend_from_slice(s.as_bytes());
+            }
+            KeyEvent::Backspace => {
+                if line.pop().is_some() {
+                    console_write(b"\x08 \x08");
+                }
+            }
+            KeyEvent::Ctrl('d') => {
+                if line.is_empty() {
+                    return Ok(0); // EOF
+                }
+            }
+            _ => {}
+        }
+        if line.len() as u64 >= count {
+            break; // user buffer full: hand back a partial line
+        }
+    }
+    line.truncate(count as usize);
+    copy_out(buf, &line);
+    Ok(line.len() as u64)
+}
+
+/// `access` (21): succeed (return 0) when the path exists on the VFS/ext2 tree,
+/// else `ENOENT` (R2.5). The requested access mode is not enforced in this layer.
+pub fn sys_access(path: u64, _mode: u64) -> Result<u64, Errno> {
+    let p = read_user_cstr(path)?;
+    let abs = resolve_path(&p);
+    vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
+    Ok(0)
+}
+
+// Keep AT_FDCWD referenced so the intent (dir-fd handling) is documented even
+// though absolute paths make it inert in this minimal layer.
+const _: u64 = AT_FDCWD;
+
+// ───────────────────── directory / path / fd (linux-binary-compat) ─────────────────────
+
+/// `getdents64` (217): serialize directory entries from an open directory fd into
+/// the user buffer as packed `struct linux_dirent64`, advancing a per-fd cursor.
+/// Returns the number of bytes written, `0` at end of directory. `EBADF` for an
+/// absent fd, `ENOTDIR` for a non-directory fd, `EINVAL` if the buffer is too small
+/// for even the first remaining entry.
+///
+/// The directory's children were snapshotted at `open` time, so this runs entirely
+/// under the `COMPAT_STATES` lock (no blocking VFS call) using `get_mut` to advance
+/// the cursor. Each record's `d_ino`/`d_off` are synthesized (the VFS exposes no
+/// inode numbers): `d_ino` is the 1-based child position, `d_off` the next cursor.
+pub fn sys_getdents64(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
+    check_user_ptr(buf, count)?;
+
+    let result = compat::with_current_compat(|cs| match cs.fds.get_mut(fd as u32) {
+        None => Err(Errno::EBADF),
+        Some(OpenObject::Dir {
+            children, index, ..
+        }) => {
+            let mut out: Vec<u8> = Vec::new();
+            let mut hit_limit_immediately = false;
+            while *index < children.len() {
+                let child = &children[*index];
+                let name = child.name().as_bytes();
+                let reclen = dirent_reclen(name.len());
+                if out.len() + reclen > count as usize {
+                    if out.is_empty() {
+                        hit_limit_immediately = true;
+                    }
+                    break;
+                }
+                let d_type = if child.is_directory() { DT_DIR } else { DT_REG };
+                let d_ino = (*index as u64) + 1;
+                let d_off = (*index as i64) + 1;
+                let rec = encode_dirent64(d_ino, d_off, d_type, name);
+                out.extend_from_slice(&rec);
+                *index += 1;
+            }
+            if hit_limit_immediately {
+                Err(Errno::EINVAL)
+            } else {
+                Ok(out)
+            }
+        }
+        Some(_) => Err(Errno::ENOTDIR),
+    });
+
+    match result {
+        None => Err(Errno::EBADF),
+        Some(Err(e)) => Err(e),
+        Some(Ok(out)) => {
+            copy_out(buf, &out);
+            Ok(out.len() as u64)
+        }
+    }
+}
+
+/// `getcwd` (79): write the process's current working directory (NUL-terminated)
+/// into the user buffer, returning the number of bytes written including the NUL.
+/// `ERANGE` if the buffer is too small to hold the path plus its terminator.
+pub fn sys_getcwd(buf: u64, size: u64) -> Result<u64, Errno> {
+    let cwd = current_cwd();
+    let bytes = cwd.as_bytes();
+    let need = bytes.len() + 1; // include NUL terminator
+    if size < need as u64 {
+        return Err(Errno::ERANGE);
+    }
+    check_user_ptr(buf, need as u64)?;
+    // Copy the path then the NUL terminator.
+    copy_out(buf, bytes);
+    // SAFETY: byte at buf+bytes.len() is within the validated `need` range.
+    unsafe {
+        *((buf + bytes.len() as u64) as *mut u8) = 0;
+    }
+    Ok(need as u64)
+}
+
+/// `chdir` (80): resolve `path` (against the cwd if relative), verify it is an
+/// existing directory, and set it as the process cwd. `ENOENT` if absent,
+/// `ENOTDIR` if it is not a directory.
+pub fn sys_chdir(path: u64) -> Result<u64, Errno> {
+    let p = read_user_cstr(path)?;
+    let abs = resolve_path(&p);
+    let node = vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
+    if !node.is_directory() {
+        return Err(Errno::ENOTDIR);
+    }
+    compat::with_current_compat(|cs| cs.cwd = abs).ok_or(Errno::EBADF)?;
+    Ok(0)
+}
+
+/// `fchdir` (81): set the process cwd to the path the directory fd was opened
+/// under. `EBADF` for an absent fd, `ENOTDIR` if the fd is not a directory.
+pub fn sys_fchdir(fd: u64) -> Result<u64, Errno> {
+    let resolved = compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
+        None => Err(Errno::EBADF),
+        Some(OpenObject::Dir { path, .. }) => {
+            let p = path.clone();
+            cs.cwd = p;
+            Ok(())
+        }
+        Some(_) => Err(Errno::ENOTDIR),
+    });
+    match resolved {
+        None => Err(Errno::EBADF),
+        Some(Err(e)) => Err(e),
+        Some(Ok(())) => Ok(0),
+    }
+}
+
+/// `dup` (32): duplicate `oldfd` into the lowest free descriptor, returning it.
+/// `EBADF` if `oldfd` is not open.
+pub fn sys_dup(oldfd: u64) -> Result<u64, Errno> {
+    compat::with_current_compat(|cs| cs.fds.dup(oldfd as u32))
+        .unwrap_or(Err(Errno::EBADF))
+        .map(|fd| fd as u64)
+}
+
+/// `dup2` (33): duplicate `oldfd` into the explicit descriptor `newfd`, closing
+/// whatever occupies `newfd` first. If `oldfd == newfd` and `oldfd` is valid, it is
+/// returned unchanged (no close); `EBADF` if `oldfd` is invalid.
+pub fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, Errno> {
+    compat::with_current_compat(|cs| {
+        // `oldfd` must be valid regardless.
+        if cs.fds.get(oldfd as u32).is_none() {
+            return Err(Errno::EBADF);
+        }
+        if oldfd == newfd {
+            return Ok(newfd);
+        }
+        cs.fds.dup_to(oldfd as u32, newfd as u32).map(|fd| fd as u64)
+    })
+    .unwrap_or(Err(Errno::EBADF))
+}
+
+/// `dup3` (292): like `dup2` but `oldfd == newfd` is an error (`EINVAL`) and the
+/// only accepted flag is `O_CLOEXEC` (ignored here). `EBADF` if `oldfd` is invalid.
+pub fn sys_dup3(oldfd: u64, newfd: u64, _flags: u64) -> Result<u64, Errno> {
+    if oldfd == newfd {
+        return Err(Errno::EINVAL);
+    }
+    compat::with_current_compat(|cs| {
+        if cs.fds.get(oldfd as u32).is_none() {
+            return Err(Errno::EBADF);
+        }
+        cs.fds.dup_to(oldfd as u32, newfd as u32).map(|fd| fd as u64)
+    })
+    .unwrap_or(Err(Errno::EBADF))
+}
+
+// fcntl commands.
+const F_DUPFD: u64 = 0;
+const F_GETFD: u64 = 1;
+const F_SETFD: u64 = 2;
+const F_GETFL: u64 = 3;
+const F_SETFL: u64 = 4;
+const F_DUPFD_CLOEXEC: u64 = 1030;
+
+/// `fcntl` (72): the descriptor-management subset.
+///   * `F_DUPFD`/`F_DUPFD_CLOEXEC` → duplicate `fd` into the lowest free
+///     descriptor `>= arg` (close-on-exec is not tracked, so the CLOEXEC form is
+///     equivalent here).
+///   * `F_GETFD`/`F_SETFD` → close-on-exec flag is not tracked; report/accept 0.
+///   * `F_GETFL` → report `O_RDONLY` (0).
+///   * `F_SETFL` → accept and return 0.
+///   * anything else → `EINVAL`.
+pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
+    match cmd {
+        F_DUPFD | F_DUPFD_CLOEXEC => compat::with_current_compat(|cs| {
+            cs.fds.dup_min(fd as u32, arg as u32).map(|f| f as u64)
+        })
+        .unwrap_or(Err(Errno::EBADF)),
+        F_GETFD | F_SETFD => {
+            // Validate the fd exists; flags themselves are not tracked.
+            if resolve_fd(fd as u32).is_none() {
+                return Err(Errno::EBADF);
+            }
+            Ok(0)
+        }
+        F_GETFL | F_SETFL => {
+            if resolve_fd(fd as u32).is_none() {
+                return Err(Errno::EBADF);
+            }
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// `readlink` (89): no symbolic links exist in this filesystem, so a path that
+/// resolves to an existing node is "not a symlink" (`EINVAL`) and an absent path
+/// is `ENOENT`. The output buffer is never written.
+pub fn sys_readlink(path: u64, _buf: u64, _bufsiz: u64) -> Result<u64, Errno> {
+    let p = read_user_cstr(path)?;
+    let abs = resolve_path(&p);
+    match vfs::lookup_path(&abs) {
+        Ok(_) => Err(Errno::EINVAL),
+        Err(_) => Err(Errno::ENOENT),
+    }
+}
+
+/// `readlinkat` (267): like `readlink`; the dirfd is ignored (paths resolve
+/// absolute / against the cwd).
+pub fn sys_readlinkat(_dirfd: u64, path: u64, buf: u64, bufsiz: u64) -> Result<u64, Errno> {
+    sys_readlink(path, buf, bufsiz)
+}
+
+/// `pread64` (17): read up to `count` bytes from `fd` at the absolute `offset`
+/// WITHOUT advancing the descriptor's own offset. `EBADF` for an absent fd;
+/// `ESPIPE` for a non-seekable stream (console/stdin); `EISDIR` for a directory.
+pub fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Errno> {
+    if count > COUNT_MAX {
+        return Err(Errno::EINVAL);
+    }
+    check_user_ptr(buf, count)?;
+    match resolve_fd(fd as u32) {
+        None => Err(Errno::EBADF),
+        Some(Resolved::Console) | Some(Resolved::Stdin)
+        | Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_)) => Err(Errno::ESPIPE),
+        Some(Resolved::Dir) => Err(Errno::EISDIR),
+        Some(Resolved::File { node, .. }) => {
+            let size = node.size();
+            let (copied, _) = plan_read(size, offset, count);
+            if copied == 0 {
+                return Ok(0);
+            }
+            let mut kbuf = vec![0u8; copied as usize];
+            let n = node.read(offset, &mut kbuf).map_err(|e| {
+                // STAGE-13.7: a real VFS/ext2 read failure is not "invalid
+                // argument" — report EIO and log what actually broke.
+                crate::error!(
+                    "[linux] file read failed: {:?} ino={} off={} len={}",
+                    e, node.fs_ino(), offset, copied
+                );
+                Errno::EIO
+            })?;
+            copy_out(buf, &kbuf[..n]);
+            // NOTE: the descriptor offset is intentionally NOT updated.
+            Ok(n as u64)
+        }
+    }
+}
+
+/// `pwrite64` (18): write `count` bytes to `fd` at the absolute `offset` WITHOUT
+/// advancing the descriptor's own offset. Console writes ignore the offset and
+/// emit to the console; `ESPIPE` for stdin; `EISDIR` for a directory; `EBADF` for
+/// an absent fd.
+pub fn sys_pwrite64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Errno> {
+    if count > COUNT_MAX {
+        return Err(Errno::EINVAL);
+    }
+    check_user_ptr(buf, count)?;
+    match resolve_fd(fd as u32) {
+        None => Err(Errno::EBADF),
+        Some(Resolved::Stdin) => Err(Errno::ESPIPE),
+        Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_)) => Err(Errno::ESPIPE),
+        Some(Resolved::Dir) => Err(Errno::EISDIR),
+        Some(Resolved::Console) => {
+            let data = copy_in(buf, count);
+            console_write(&data);
+            Ok(count)
+        }
+        Some(Resolved::File { node, .. }) => {
+            let data = copy_in(buf, count);
+            let n = node.write(offset, &data).map_err(|_| Errno::EINVAL)?;
+            // NOTE: the descriptor offset is intentionally NOT updated.
+            Ok(n as u64)
+        }
+    }
+}
+
+/// The x86_64 Linux `struct statfs` (subset populated with plausible values).
+#[repr(C)]
+struct LinuxStatfs {
+    f_type: i64,
+    f_bsize: i64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [i32; 2],
+    f_namelen: i64,
+    f_frsize: i64,
+    f_flags: i64,
+    f_spare: [i64; 4],
+}
+
+/// ext2 superblock magic, reported in `f_type` so `df`-class probes recognize it.
+const EXT2_SUPER_MAGIC: i64 = 0xEF53;
+
+/// Build a plausible `statfs` snapshot from the PMM frame counts (used as a stand-
+/// in for filesystem capacity, which the VFS does not expose cheaply).
+fn build_statfs() -> LinuxStatfs {
+    let total = crate::memory::pmm::total_frames() as u64;
+    let free = crate::memory::pmm::free_frames() as u64;
+    LinuxStatfs {
+        f_type: EXT2_SUPER_MAGIC,
+        f_bsize: 4096,
+        f_blocks: total,
+        f_bfree: free,
+        f_bavail: free,
+        f_files: total,
+        f_ffree: free,
+        f_fsid: [0, 0],
+        f_namelen: 255,
+        f_frsize: 4096,
+        f_flags: 0,
+        f_spare: [0; 4],
+    }
+}
+
+/// Copy a built `statfs` to the validated user buffer.
+fn write_statfs(buf: u64) {
+    let sf = build_statfs();
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &sf as *const LinuxStatfs as *const u8,
+            core::mem::size_of::<LinuxStatfs>(),
+        )
+    };
+    copy_out(buf, bytes);
+}
+
+/// `statfs` (137): fill the user `struct statfs` with plausible values for the
+/// path (which must exist, else `ENOENT`). Returns 0.
+pub fn sys_statfs(path: u64, buf: u64) -> Result<u64, Errno> {
+    check_user_ptr(buf, core::mem::size_of::<LinuxStatfs>() as u64)?;
+    let p = read_user_cstr(path)?;
+    let abs = resolve_path(&p);
+    vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
+    write_statfs(buf);
+    Ok(0)
+}
+
+/// `fstatfs` (138): fill the user `struct statfs` for an open descriptor (which
+/// must be valid, else `EBADF`). Returns 0.
+pub fn sys_fstatfs(fd: u64, buf: u64) -> Result<u64, Errno> {
+    check_user_ptr(buf, core::mem::size_of::<LinuxStatfs>() as u64)?;
+    if resolve_fd(fd as u32).is_none() {
+        return Err(Errno::EBADF);
+    }
+    write_statfs(buf);
+    Ok(0)
+}
+
+
+const O_NONBLOCK:u64=0x800; const O_CLOEXEC:u64=0x80000;
+const POLLIN:i16=0x001; const POLLOUT:i16=0x004; const POLLERR:i16=0x008; const POLLHUP:i16=0x010; const POLLNVAL:i16=0x020;
+pub fn sys_pipe(pipefd:u64)->Result<u64,Errno>{sys_pipe2(pipefd,0)}
+pub fn sys_pipe2(pipefd:u64,flags:u64)->Result<u64,Errno>{if flags&!(O_NONBLOCK|O_CLOEXEC)!=0{return Err(Errno::EINVAL)}check_user_ptr(pipefd,8)?;let pair=compat::with_current_compat(|cs|cs.fds.pipe(flags&O_NONBLOCK!=0)).ok_or(Errno::EBADF)?;let words=[pair.0,pair.1];let bytes=unsafe{core::slice::from_raw_parts(words.as_ptr()as*const u8,8)};copy_out(pipefd,bytes);Ok(0)}
+fn poll_revents(fd:i32,events:i16)->i16{if fd<0{return 0}match resolve_fd(fd as u32){None=>POLLNVAL,Some(Resolved::PipeRead(e))=>{let mut o=if e.read_ready(){events&POLLIN}else{0};if e.peer_closed(){o|=POLLHUP}o},Some(Resolved::PipeWrite(e))=>{let mut o=if e.write_ready(){events&POLLOUT}else{0};if e.peer_closed(){o|=POLLERR}o},Some(Resolved::Stdin)=>0,Some(Resolved::Console)=>events&POLLOUT,Some(Resolved::File{..})|Some(Resolved::Dir)=>events&(POLLIN|POLLOUT)}}
+pub fn sys_poll(fds:u64,nfds:u64,timeout:u64)->Result<u64,Errno>{const SZ:u64=8;if nfds>1024{return Err(Errno::EINVAL)}check_user_ptr(fds,nfds.checked_mul(SZ).ok_or(Errno::EINVAL)?)?;let ms=timeout as i64;let deadline=if ms<0{None}else{Some(crate::task::scheduler::ticks().saturating_add((ms as u64).saturating_add(9)/10))};loop{let mut ready=0;for i in 0..nfds{let p=fds+i*SZ;let fd=unsafe{*(p as*const i32)};let ev=unsafe{*((p+4)as*const i16)};let rev=poll_revents(fd,ev);unsafe{*((p+6)as*mut i16)=rev}if rev!=0{ready+=1}}if ready!=0||ms==0{return Ok(ready)}if let Some(end)=deadline{if crate::task::scheduler::ticks()>=end{return Ok(0)}}crate::task::scheduler::yield_current()}}

@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-15
+          components: rust-src,rustfmt,clippy,llvm-tools-preview
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Build debug kernel
+        run: python3 tools/build.py build
+      - name: Build release kernel
+        run: python3 tools/build.py build --release
+      - name: Upload kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: pagh-kernel
+          path: target/x86_64-unknown-none/release/pagh.elf
+
+  host-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-15
+          components: rust-src,rustfmt,clippy
+      - name: Test host-safe logic
+        run: python3 tools/host_tests.py
+
+  static-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject unreviewed unsafe blocks
+        run: python3 tools/check_safety.py
