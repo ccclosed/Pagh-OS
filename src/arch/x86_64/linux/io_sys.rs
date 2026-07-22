@@ -562,6 +562,21 @@ pub fn sys_newfstatat(_dirfd: u64, path: u64, statbuf: u64, _flags: u64) -> Resu
 /// instant EOF and exit 0 without ever showing a prompt. Other descriptors
 /// still report `EINVAL`; an absent fd is `EBADF`.
 pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
+    // STAGE-13.8 CLOEXEC FIX: FIOCLEX/FIONCLEX set/clear the close-on-exec
+    // flag on an fd. pagh has no execve yet, so the flag has no observable
+    // effect; report success on any valid fd instead of EINVAL. CPython's
+    // _Py_set_inheritable() issues ioctl(fd, FIOCLEX) for every module file
+    // importlib opens and treats any errno other than ENOTTY/EACCES as a
+    // fatal I/O error — this was the importlib get_data OSError (Errno 22)
+    // that aborted startup with "Failed to import encodings module".
+    const FIONCLEX: u64 = 0x5450;
+    const FIOCLEX: u64 = 0x5451;
+    if request == FIOCLEX || request == FIONCLEX {
+        return match resolve_fd(fd as u32) {
+            None => Err(Errno::EBADF),
+            Some(_) => Ok(0),
+        };
+    }
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
         Some(Resolved::Console) | Some(Resolved::Stdin) => tty_ioctl(request, arg),
