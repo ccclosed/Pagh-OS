@@ -310,6 +310,103 @@ pub fn sys_munmap(addr: u64, len: u64) -> Result<u64, Errno> {
         .unwrap_or(Err(Errno::EINVAL))
 }
 
+/// `mremap` (25): resize an anonymous private mapping (STAGE-13.8). glibc's
+/// realloc() tries mremap first for large blocks and falls back to
+/// malloc+memcpy+free on ENOSYS, which logged an unsupported-syscall warning
+/// on every CPython start. Shrinks drop the tail pages in place; growth
+/// requires `MREMAP_MAYMOVE` (in-place growth is never attempted, matching
+/// Linux when the next pages are taken): a fresh zeroed span is mapped, the
+/// old frames are copied through the HHDM alias (immune to read-only/NX user
+/// PTEs under CR0.WP) and the old range is unmapped.
+pub fn sys_mremap(
+    old_addr: u64,
+    old_size: u64,
+    new_size: u64,
+    flags: u64,
+    _new_addr: u64,
+) -> Result<u64, Errno> {
+    const MREMAP_MAYMOVE: u64 = 1;
+    if old_addr & (PAGE_SIZE - 1) != 0 || old_size == 0 || new_size == 0 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & !MREMAP_MAYMOVE != 0 {
+        // MREMAP_FIXED / MREMAP_DONTUNMAP are unsupported shapes — refuse
+        // loudly rather than mis-map.
+        return Err(Errno::EINVAL);
+    }
+    let old_pages = old_size
+        .checked_add(PAGE_SIZE - 1)
+        .map(|n| n / PAGE_SIZE)
+        .ok_or(Errno::ENOMEM)?;
+    let new_pages = new_size
+        .checked_add(PAGE_SIZE - 1)
+        .map(|n| n / PAGE_SIZE)
+        .ok_or(Errno::ENOMEM)?;
+    compat::with_current_compat(|cs| -> Result<u64, Errno> {
+        let vm = &mut cs.vm;
+        // The whole old range must lie inside one tracked mmap region; its
+        // protections carry over to the new placement.
+        let old_span = old_pages.checked_mul(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
+        let (writable, nx) = match vm.mmaps.iter().find(|r| {
+            r.base <= old_addr && old_addr + old_span <= r.base + r.pages * PAGE_SIZE
+        }) {
+            Some(r) => (r.writable, r.nx),
+            None => return Err(Errno::EFAULT),
+        };
+        if new_pages <= old_pages {
+            if new_pages < old_pages {
+                // Shrink in place: drop the tail pages.
+                let _ = munmap_impl(
+                    vm,
+                    old_addr + new_pages * PAGE_SIZE,
+                    (old_pages - new_pages) * PAGE_SIZE,
+                );
+            }
+            return Ok(old_addr);
+        }
+        if flags & MREMAP_MAYMOVE == 0 {
+            return Err(Errno::ENOMEM);
+        }
+        let span = new_pages.checked_mul(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
+        let base = vm.mmap_next_hint;
+        let end = base.checked_add(span).ok_or(Errno::ENOMEM)?;
+        if end > USER_ADDR_MAX {
+            return Err(Errno::ENOMEM);
+        }
+        if !map_zeroed_range(base, end, leaf_flags(writable, nx)) {
+            // OOM: the old mapping is untouched.
+            return Err(Errno::ENOMEM);
+        }
+        for i in 0..old_pages {
+            let src = vmm::virt_to_phys(old_addr + i * PAGE_SIZE);
+            let dst = vmm::virt_to_phys(base + i * PAGE_SIZE);
+            if let (Some(src), Some(dst)) = (src, dst) {
+                // SAFETY: both frames are 4 KiB, mapped by this process /
+                // this very call; the HHDM aliases are valid and writable.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        vmm::phys_to_virt(src & !(PAGE_SIZE - 1)) as *const u8,
+                        vmm::phys_to_virt(dst & !(PAGE_SIZE - 1)) as *mut u8,
+                        PAGE_SIZE as usize,
+                    );
+                }
+            }
+        }
+        vm.mmaps.push(MmapRegion {
+            base,
+            pages: new_pages,
+            writable,
+            nx,
+        });
+        if end > vm.mmap_next_hint {
+            vm.mmap_next_hint = end;
+        }
+        let _ = munmap_impl(vm, old_addr, old_span);
+        Ok(base)
+    })
+    .unwrap_or(Err(Errno::EINVAL))
+}
+
 fn munmap_impl(vm: &mut VmRegionSet, base: u64, len: u64) -> Result<u64, Errno> {
     match plan_munmap(base, len, &vm.mmaps) {
         MunmapPlan::Reject(e) => Err(e),

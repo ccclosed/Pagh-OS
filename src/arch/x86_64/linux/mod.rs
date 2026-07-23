@@ -126,6 +126,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::BRK => mem_sys::sys_brk(a[0]),
         sysno::MMAP => mem_sys::sys_mmap(a[0], a[1], a[2], a[3], a[4], a[5]),
         sysno::MUNMAP => mem_sys::sys_munmap(a[0], a[1]),
+        sysno::MREMAP => mem_sys::sys_mremap(a[0], a[1], a[2], a[3], a[4]),
         sysno::MPROTECT => mem_sys::sys_mprotect(a[0], a[1], a[2]),
         // `madvise` is purely advisory: accept every hint and do nothing.
         sysno::TGKILL => misc::sys_tgkill(a[0], a[1], a[2]),

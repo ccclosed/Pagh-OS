@@ -23,6 +23,9 @@ including the full CPython 3.13 REPL installed straight from Debian packages.
 - `mkdir` creates real directories on ext2; tty ioctls on non-tty fds return
   `ENOTTY` and `lseek` on the console returns `ESPIPE`, so a normal CPython
   start no longer floods the serial log with EINVAL diagnostics.
+- `mremap` resizes anonymous mappings (shrink in place, grow via move+copy),
+  so glibc `realloc()` uses its fast path instead of logging an
+  unsupported-syscall warning.
 - The `python` shell command finds the installed CPython and runs it with a proper
   `PYTHONHOME`/`PYTHONPATH` environment (`PYTHON_BASIC_REPL=1`).
 

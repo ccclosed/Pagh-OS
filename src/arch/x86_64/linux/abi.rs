@@ -42,6 +42,8 @@ pub mod nr {
     pub const MPROTECT: u64 = 10;
     /// `munmap` — unmap memory.
     pub const MUNMAP: u64 = 11;
+    /// `mremap` — resize a mapping (glibc realloc fast path).
+    pub const MREMAP: u64 = 25;
     /// `brk` — change the program break.
     pub const BRK: u64 = 12;
     /// `rt_sigaction` — examine/change a signal action (stub).
@@ -202,6 +204,7 @@ pub fn is_supported(nr: u64) -> bool {
             | nr::MMAP
             | nr::MPROTECT
             | nr::MUNMAP
+            | nr::MREMAP
             | nr::MADVISE
             | nr::TGKILL
             | nr::BRK
