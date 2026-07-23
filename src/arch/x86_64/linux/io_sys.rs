@@ -594,6 +594,7 @@ const TCSETSW: u64 = 0x5403;
 const TCSETSF: u64 = 0x5404;
 /// `TIOCGWINSZ`: read the window size (`struct winsize`).
 const TIOCGWINSZ: u64 = 0x5413;
+const TIOCSWINSZ: u64 = 0x5414;
 
 /// Byte size of the Linux `struct termios` (4×u32 + c_line + c_cc[19]).
 const TERMIOS_SIZE: usize = 36;
@@ -637,6 +638,9 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
             copy_out(arg, &ws);
             Ok(0)
         }
+        // Window-size writes are accepted and ignored (readline issues
+        // TIOCSWINSZ during startup to propagate its computed size).
+        TIOCSWINSZ => Ok(0),
         _ => Err(Errno::EINVAL),
     }
 }

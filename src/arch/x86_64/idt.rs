@@ -196,6 +196,18 @@ extern "x86-interrupt" fn gp_fault_handler(stack: InterruptStackFrame, error_cod
             i -= 1;
         }
     }
+    // STAGE-13.8 USER-FAULT ISOLATION: a #GP taken while executing ring-3
+    // code is a bug in the user program (or our compat layer), not in the
+    // kernel. Kill only the offending Compat_Process (exit code 139 =
+    // 128+SIGSEGV) and keep the kernel and shell running; previously this
+    // halted the whole machine.
+    if stack.instruction_pointer.as_u64() < 0x8000_0000_0000
+        && crate::task::compat::compat_exists(pid)
+    {
+        crate::task::compat::with_current_compat(|cs| cs.exit_code = Some(139));
+        crate::error!("[EXC #13] killing Compat_Process pid={} (SIGSEGV) - kernel keeps running", pid);
+        crate::task::scheduler::exit_current();
+    }
     halt();
 }
 extern "x86-interrupt" fn page_fault_handler(stack: InterruptStackFrame, error_code: PageFaultErrorCode) {
@@ -220,6 +232,31 @@ extern "x86-interrupt" fn page_fault_handler(stack: InterruptStackFrame, error_c
     if !error_code.contains(PageFaultErrorCode::USER_MODE) {
         crate::debug::unwind::stack_scan_backtrace(rsp, 8192);
         crate::arch::cpu::halt_loop();
+    }
+    // STAGE-13.8 USER-FAULT ISOLATION: a ring-3 page fault must not take the
+    // machine down. Print post-mortem context and the top of the *user*
+    // stack (return-address candidates for symbolizing the crash), then kill
+    // only the faulting Compat_Process and keep the kernel running.
+    let pid = crate::task::scheduler::current_pid();
+    crate::error!("[EXC #14] current pid={} last_dispatch: pid={} nr={}", pid,
+        LAST_SYSCALL_PID.load(core::sync::atomic::Ordering::Relaxed),
+        LAST_SYSCALL_NR.load(core::sync::atomic::Ordering::Relaxed));
+    crate::error!("--- Top 24 words of user stack (rsp=0x{:x}) ---", rsp);
+    let mut i = 0u64;
+    while i < 24 {
+        let addr = rsp.wrapping_add(i * 8);
+        if crate::memory::vmm::virt_to_phys(addr).is_none() {
+            crate::error!("  [rsp+0x{:02x}] <unmapped>", i * 8);
+        } else {
+            let val = unsafe { core::ptr::read_volatile(addr as *const u64) };
+            crate::error!("  [rsp+0x{:02x}] 0x{:016x}", i * 8, val);
+        }
+        i += 1;
+    }
+    if crate::task::compat::compat_exists(pid) {
+        crate::task::compat::with_current_compat(|cs| cs.exit_code = Some(139));
+        crate::error!("[EXC #14] killing Compat_Process pid={} (SIGSEGV) - kernel keeps running", pid);
+        crate::task::scheduler::exit_current();
     }
     halt();
 }
