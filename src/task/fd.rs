@@ -16,6 +16,7 @@ use alloc::vec::Vec;
 use crate::arch::x86_64::linux::errno::Errno;
 use crate::sync::spinlock::Spinlock;
 use crate::vfs::VfsNode;
+use crate::arch::x86_64::linux::epoll_sys::EpollEntry;
 
 use super::fd_alloc::FdSlots;
 
@@ -57,6 +58,10 @@ pub enum OpenObject {
     /// `COMPAT_STATES` lock is held during `getdents64`.
     PipeRead(Arc<PipeEndpoint>),
     PipeWrite(Arc<PipeEndpoint>),
+    /// An eventfd counter (EFD_SEMAPHORE if semaphore=true).
+    Eventfd { val: Arc<Spinlock<u64>>, semaphore: bool },
+    /// An epoll instance with its interest list.
+    Epoll { interests: Arc<Spinlock<Vec<EpollEntry>>> },
     Dir {
         /// Absolute path the directory was opened under (used by `fchdir`).
         path: String,
@@ -96,6 +101,8 @@ impl OpenObject {
                 children: children.clone(),
                 index: *index,
             },
+            OpenObject::Eventfd { val, semaphore } => OpenObject::Eventfd { val: Arc::clone(val), semaphore: *semaphore },
+            OpenObject::Epoll { interests } => OpenObject::Epoll { interests: Arc::clone(interests) },
         }
     }
 }

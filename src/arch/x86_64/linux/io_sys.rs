@@ -69,6 +69,10 @@ enum Resolved {
     File { node: Arc<dyn VfsNode>, offset: u64 },
     PipeRead(Arc<PipeEndpoint>),
     PipeWrite(Arc<PipeEndpoint>),
+    /// An eventfd counter.
+    Eventfd { val: Arc<crate::sync::spinlock::Spinlock<u64>>, semaphore: bool },
+    /// An epoll instance (not directly readable/writable via read/write).
+    Epoll,
     /// An open directory (not a byte stream): read/write/pread/pwrite are rejected.
     Dir,
 }
@@ -88,6 +92,8 @@ fn resolve_fd(fd: u32) -> Option<Resolved> {
                 offset: *offset,
             },
             OpenObject::Dir { .. } => Resolved::Dir,
+            OpenObject::Eventfd { val, semaphore } => Resolved::Eventfd { val: Arc::clone(val), semaphore: *semaphore },
+            OpenObject::Epoll { .. } => Resolved::Epoll,
         })
     })
     .flatten()
@@ -126,22 +132,19 @@ fn console_write(slice: &[u8]) {
     // prints via kprintln!+fb_println!, but python's output bypassed the
     // framebuffer entirely. The fb writer already handles \n scrolling and
     // 0x08 backspace, so the line-editor echo renders correctly too.
+    // STAGE-14 VT: route all compat stdout/stderr through the VT emulator.
+    crate::drivers::vt::write(slice);
     match core::str::from_utf8(slice) {
-        Ok(s) => {
-            console.write_str(s);
-            crate::fb_print!("{}", s);
-        }
+        Ok(s) => { console.write_str(s); }
         Err(e) => {
             let valid_up_to = e.valid_up_to();
             // SAFETY: `from_utf8` guarantees `slice[..valid_up_to]` is valid UTF-8.
             let prefix = unsafe { core::str::from_utf8_unchecked(&slice[..valid_up_to]) };
             console.write_str(prefix);
-            crate::fb_print!("{}", prefix);
             for &byte in &slice[valid_up_to..] {
                 let mut tmp = [0u8; 4];
                 let s = (byte as char).encode_utf8(&mut tmp);
                 console.write_str(s);
-                crate::fb_print!("{}", s);
             }
         }
     }
@@ -211,9 +214,30 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         // STAGE-13.7: stdin is interactive now — a blocking, line-buffered
         // read from the PS/2 keyboard (echo, backspace, ^D = EOF). Previously
         // this returned an instant EOF, so CPython silently exited with 0.
-        Some(Resolved::Console) | Some(Resolved::Stdin) => read_stdin_line(buf, count),
+        Some(Resolved::Console) | Some(Resolved::Stdin) => {
+            let raw = crate::task::compat::with_current_compat(|cs| cs.raw_mode).unwrap_or(false);
+            if raw { read_stdin_raw(buf, count) } else { read_stdin_line(buf, count) }
+        }
         Some(Resolved::Dir) => Err(Errno::EISDIR),
         Some(Resolved::PipeWrite(_)) => Err(Errno::EBADF),
+        Some(Resolved::Eventfd { val, semaphore }) => {
+            // eventfd read: blocks until val > 0, then returns 8-byte u64 and resets.
+            if count < 8 { return Err(Errno::EINVAL); }
+            check_user_ptr(buf, 8)?;
+            loop {
+                let mut v = val.lock();
+                if *v > 0 {
+                    let out = if semaphore { *v -= 1; 1u64 } else { let r=*v; *v=0; r };
+                    drop(v);
+                    // SAFETY: validated above
+                    unsafe { core::ptr::write_unaligned(buf as *mut u64, out); }
+                    return Ok(8);
+                }
+                drop(v);
+                crate::task::scheduler::yield_current();
+            }
+        }
+        Some(Resolved::Epoll) => Err(Errno::EINVAL),
         Some(Resolved::PipeRead(e)) => { let mut data=vec![0u8;count as usize];let n=read_pipe(&e,&mut data)?;copy_out(buf,&data[..n]);Ok(n as u64) }
         Some(Resolved::File { node, offset }) => {
             let size = node.size();
@@ -253,6 +277,15 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         None => Err(Errno::EBADF),
         Some(Resolved::Stdin) => Err(Errno::EBADF),
         Some(Resolved::Dir) => Err(Errno::EISDIR),
+        Some(Resolved::Eventfd { val, .. }) => {
+            if count < 8 { return Err(Errno::EINVAL); }
+            check_user_ptr(buf, 8)?;
+            // SAFETY: validated above
+            let add = unsafe { core::ptr::read_unaligned(buf as *const u64) };
+            *val.lock() = val.lock().saturating_add(add);
+            Ok(8)
+        }
+        Some(Resolved::Epoll) => Err(Errno::EINVAL),
         Some(Resolved::PipeRead(_)) => Err(Errno::EBADF),
         Some(Resolved::PipeWrite(e)) => {let data=copy_in(buf,count);Ok(write_pipe(&e,&data)? as u64)}
         Some(Resolved::Console) => {
@@ -291,6 +324,7 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
         return Err(Errno::EBADF);
     }
     if matches!(target, Resolved::Dir) { return Err(Errno::EISDIR); }
+    if matches!(target, Resolved::Eventfd { .. } | Resolved::Epoll) { return Err(Errno::EINVAL); }
     if matches!(target, Resolved::PipeRead(_)) { return Err(Errno::EBADF); }
 
     // Track a running offset for the file case; commit it once at the end.
@@ -455,6 +489,7 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> Result<u64, Errno> {
         // buffering; EINVAL spammed the diag log three times per start.
         Some(Resolved::Console) | Some(Resolved::Stdin) => Err(Errno::ESPIPE),
         Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_)) => Err(Errno::ESPIPE),
+        Some(Resolved::Eventfd { .. }) | Some(Resolved::Epoll) => Err(Errno::ESPIPE),
         // A directory descriptor supports rewinding/positioning its dents cursor:
         // SEEK_SET sets the cursor index, returning it. Other whences are EINVAL.
         Some(Resolved::Dir) => {
@@ -535,7 +570,8 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> Result<u64, Errno> {
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
         Some(Resolved::Console) | Some(Resolved::Stdin)
-        | Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_)) => {
+        | Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_))
+        | Some(Resolved::Eventfd { .. }) | Some(Resolved::Epoll) => {
             let stat = encode_stat(0, S_IFCHR | 0o620);
             write_stat_struct(&stat, statbuf);
             Ok(0)
@@ -636,12 +672,25 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
             copy_out(arg, &build_termios());
             Ok(0)
         }
-        // Attribute writes are accepted and ignored (no real line discipline).
-        TCSETS | TCSETSW | TCSETSF => Ok(0),
+        // STAGE-14 RAW TTY: if ICANON is cleared, switch to raw mode so reads
+        // return one byte at a time (nvim/less/vim need this).
+        TCSETS | TCSETSW | TCSETSF => {
+            if arg != 0 {
+                let _ = check_user_ptr(arg, TERMIOS_SIZE as u64);
+                // c_lflag is at offset 12; ICANON = 0x02
+                let c_lflag = unsafe { core::ptr::read_unaligned((arg + 12) as *const u32) };
+                let raw = c_lflag & 0x02 == 0; // ICANON cleared => raw mode
+                crate::task::compat::with_current_compat(|cs| { cs.raw_mode = raw; });
+            }
+            Ok(0)
+        }
         TIOCGWINSZ => {
             check_user_ptr(arg, 8)?;
-            // struct winsize { ws_row: 25, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 }
-            let ws: [u8; 8] = [25, 0, 80, 0, 0, 0, 0, 0];
+            let (cols, rows) = crate::drivers::vt::dimensions();
+            // struct winsize { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 }
+            let mut ws = [0u8; 8];
+            ws[0..2].copy_from_slice(&rows.to_le_bytes());
+            ws[2..4].copy_from_slice(&cols.to_le_bytes());
             copy_out(arg, &ws);
             Ok(0)
         }
@@ -667,6 +716,64 @@ const STDIN_LINE_MAX: usize = 4096;
 /// the trailing `\n`), and Ctrl+D on an empty line reports EOF (`Ok(0)`).
 /// Blocks by yielding to the scheduler between polls, so the shell's
 /// foreground wait and the timer keep running while a binary sits in `read`.
+
+// STAGE-14 RAW TTY: in raw mode (ICANON cleared) return one byte immediately;
+// map special keys to ANSI escape sequences so nvim's terminal layer works.
+fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
+    use crate::shell::keys::{Decoder, KeyEvent};
+    if count == 0 { return Ok(0); }
+    // Drain pending bytes first (raw mode can also leave leftovers).
+    {
+        let mut pending = STDIN_PENDING.lock();
+        if !pending.is_empty() {
+            let n = core::cmp::min(count as usize, pending.len());
+            let head: alloc::vec::Vec<u8> = pending.drain(..n).collect();
+            copy_out(buf, &head);
+            return Ok(n as u64);
+        }
+    }
+    let mut decoder = Decoder::new();
+    loop {
+        let sc = crate::drivers::get_char("keyboard").and_then(|kbd| kbd.read_char());
+        let sc = match sc {
+            Some(b) => b,
+            None => { crate::task::scheduler::yield_current(); continue; }
+        };
+        let ev = match decoder.feed(sc) {
+            Some(ev) => ev,
+            None => continue,
+        };
+        // Encode KeyEvent as bytes (ANSI sequences for special keys)
+        let bytes: alloc::vec::Vec<u8> = match ev {
+            KeyEvent::Char(c) => {
+                let mut tmp = [0u8; 4];
+                alloc::vec::Vec::from(c.encode_utf8(&mut tmp).as_bytes())
+            }
+            KeyEvent::Enter => alloc::vec![b'\r'],
+            KeyEvent::Backspace => alloc::vec![0x7F], // DEL
+            KeyEvent::Escape => alloc::vec![0x1B],
+            KeyEvent::Tab => alloc::vec![b'\t'],
+            KeyEvent::Up    => alloc::vec![0x1B, b'[', b'A'],
+            KeyEvent::Down  => alloc::vec![0x1B, b'[', b'B'],
+            KeyEvent::Right => alloc::vec![0x1B, b'[', b'C'],
+            KeyEvent::Left  => alloc::vec![0x1B, b'[', b'D'],
+            KeyEvent::Home  => alloc::vec![0x1B, b'[', b'H'],
+            KeyEvent::End   => alloc::vec![0x1B, b'[', b'F'],
+            KeyEvent::PageUp   => alloc::vec![0x1B, b'[', b'5', b'~'],
+            KeyEvent::PageDown => alloc::vec![0x1B, b'[', b'6', b'~'],
+            KeyEvent::Delete   => alloc::vec![0x1B, b'[', b'3', b'~'],
+            KeyEvent::Ctrl(c)  => alloc::vec![(c as u8) & 0x1F],
+        };
+        if bytes.is_empty() { continue; }
+        let n = core::cmp::min(count as usize, bytes.len());
+        copy_out(buf, &bytes[..n]);
+        if n < bytes.len() {
+            STDIN_PENDING.lock().extend_from_slice(&bytes[n..]);
+        }
+        return Ok(n as u64);
+    }
+}
+
 fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
     use crate::shell::keys::{Decoder, KeyEvent};
     if count == 0 {
@@ -1004,7 +1111,8 @@ pub fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Er
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
         Some(Resolved::Console) | Some(Resolved::Stdin)
-        | Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_)) => Err(Errno::ESPIPE),
+        | Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_))
+        | Some(Resolved::Eventfd { .. }) | Some(Resolved::Epoll) => Err(Errno::ESPIPE),
         Some(Resolved::Dir) => Err(Errno::EISDIR),
         Some(Resolved::File { node, .. }) => {
             let size = node.size();
@@ -1042,6 +1150,7 @@ pub fn sys_pwrite64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, E
         None => Err(Errno::EBADF),
         Some(Resolved::Stdin) => Err(Errno::ESPIPE),
         Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_)) => Err(Errno::ESPIPE),
+        Some(Resolved::Eventfd { .. }) | Some(Resolved::Epoll) => Err(Errno::ESPIPE),
         Some(Resolved::Dir) => Err(Errno::EISDIR),
         Some(Resolved::Console) => {
             let data = copy_in(buf, count);
@@ -1137,7 +1246,7 @@ const O_NONBLOCK:u64=0x800; const O_CLOEXEC:u64=0x80000;
 const POLLIN:i16=0x001; const POLLOUT:i16=0x004; const POLLERR:i16=0x008; const POLLHUP:i16=0x010; const POLLNVAL:i16=0x020;
 pub fn sys_pipe(pipefd:u64)->Result<u64,Errno>{sys_pipe2(pipefd,0)}
 pub fn sys_pipe2(pipefd:u64,flags:u64)->Result<u64,Errno>{if flags&!(O_NONBLOCK|O_CLOEXEC)!=0{return Err(Errno::EINVAL)}check_user_ptr(pipefd,8)?;let pair=compat::with_current_compat(|cs|cs.fds.pipe(flags&O_NONBLOCK!=0)).ok_or(Errno::EBADF)?;let words=[pair.0,pair.1];let bytes=unsafe{core::slice::from_raw_parts(words.as_ptr()as*const u8,8)};copy_out(pipefd,bytes);Ok(0)}
-fn poll_revents(fd:i32,events:i16)->i16{if fd<0{return 0}match resolve_fd(fd as u32){None=>POLLNVAL,Some(Resolved::PipeRead(e))=>{let mut o=if e.read_ready(){events&POLLIN}else{0};if e.peer_closed(){o|=POLLHUP}o},Some(Resolved::PipeWrite(e))=>{let mut o=if e.write_ready(){events&POLLOUT}else{0};if e.peer_closed(){o|=POLLERR}o},Some(Resolved::Stdin)=>0,Some(Resolved::Console)=>events&POLLOUT,Some(Resolved::File{..})|Some(Resolved::Dir)=>events&(POLLIN|POLLOUT)}}
+fn poll_revents(fd:i32,events:i16)->i16{if fd<0{return 0}match resolve_fd(fd as u32){None=>POLLNVAL,Some(Resolved::PipeRead(e))=>{let mut o=if e.read_ready(){events&POLLIN}else{0};if e.peer_closed(){o|=POLLHUP}o},Some(Resolved::PipeWrite(e))=>{let mut o=if e.write_ready(){events&POLLOUT}else{0};if e.peer_closed(){o|=POLLERR}o},Some(Resolved::Stdin)=>0,Some(Resolved::Console)=>events&POLLOUT,Some(Resolved::Eventfd{val,..})=>{let v=val.lock();if*v>0{events&POLLIN}else{0}},Some(Resolved::Epoll)=>0,Some(Resolved::File{..})|Some(Resolved::Dir)=>events&(POLLIN|POLLOUT)}}
 pub fn sys_poll(fds:u64,nfds:u64,timeout:u64)->Result<u64,Errno>{const SZ:u64=8;if nfds>1024{return Err(Errno::EINVAL)}check_user_ptr(fds,nfds.checked_mul(SZ).ok_or(Errno::EINVAL)?)?;let ms=timeout as i64;let deadline=if ms<0{None}else{Some(crate::task::scheduler::ticks().saturating_add((ms as u64).saturating_add(9)/10))};loop{let mut ready=0;for i in 0..nfds{let p=fds+i*SZ;let fd=unsafe{*(p as*const i32)};let ev=unsafe{*((p+4)as*const i16)};let rev=poll_revents(fd,ev);unsafe{*((p+6)as*mut i16)=rev}if rev!=0{ready+=1}}if ready!=0||ms==0{return Ok(ready)}if let Some(end)=deadline{if crate::task::scheduler::ticks()>=end{return Ok(0)}}crate::task::scheduler::yield_current()}}
 
 // ---------------------------------------------------------------------------
@@ -1157,6 +1266,8 @@ fn select_ready(fd: u64, want_write: bool) -> bool {
         Some(Resolved::Console) => true,
         Some(Resolved::PipeRead(e)) => !want_write && (e.read_ready() || e.peer_closed()),
         Some(Resolved::PipeWrite(e)) => want_write && (e.write_ready() || e.peer_closed()),
+        Some(Resolved::Eventfd { val, .. }) => !want_write && { let v=val.lock(); *v>0 },
+        Some(Resolved::Epoll) => false,
         Some(Resolved::File { .. }) | Some(Resolved::Dir) => true,
     }
 }

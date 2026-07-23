@@ -1,0 +1,202 @@
+
+//! STAGE-14: clock_getres(229), eventfd2(290), epoll_create1(291),
+//!           epoll_ctl(233), epoll_wait(232).
+#![allow(dead_code)]
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use crate::arch::x86_64::linux::errno::Errno;
+use crate::arch::x86_64::linux::validate::check_user_ptr;
+use crate::task::fd::OpenObject;
+use crate::task::compat;
+use crate::sync::spinlock::Spinlock;
+
+// ── clock_getres (229) ───────────────────────────────────────────────────────
+
+/// `clock_getres` (229): report the resolution of a clock as a `struct timespec`.
+/// We report 1 ms (= 10 000 000 ns) for all supported clocks, matching the
+/// 100 Hz LAPIC tick granularity. `EINVAL` for unknown ids, consistent with
+/// `clock_gettime`.
+pub fn sys_clock_getres(clock_id: u64, ts_ptr: u64) -> Result<u64, Errno> {
+    // Supported ids: CLOCK_REALTIME(0), CLOCK_MONOTONIC(1),
+    // CLOCK_PROCESS_CPUTIME_ID(2), CLOCK_THREAD_CPUTIME_ID(3),
+    // CLOCK_MONOTONIC_RAW(4), CLOCK_BOOTTIME(7).
+    if !matches!(clock_id, 0|1|2|3|4|7) { return Err(Errno::EINVAL); }
+    if ts_ptr == 0 { return Ok(0); } // null buf is valid: just validate the id
+    check_user_ptr(ts_ptr, 16)?;
+    // struct timespec { tv_sec: i64, tv_nsec: i64 } — 1 ms resolution
+    let sec: i64 = 0;
+    let nsec: i64 = 10_000_000; // 10 ms — one LAPIC tick
+    // SAFETY: validated above
+    unsafe {
+        core::ptr::write_unaligned(ts_ptr as *mut i64, sec);
+        core::ptr::write_unaligned((ts_ptr + 8) as *mut i64, nsec);
+    }
+    Ok(0)
+}
+
+// ── eventfd2 (290) ───────────────────────────────────────────────────────────
+
+/// `eventfd2` (290): create an event file descriptor with initial value `initval`.
+/// Flags: EFD_CLOEXEC(0x80000), EFD_NONBLOCK(0x800), EFD_SEMAPHORE(0x1).
+pub fn sys_eventfd2(initval: u64, flags: u64) -> Result<u64, Errno> {
+    let semaphore = flags & 1 != 0;
+    let state = Arc::new(Spinlock::new(initval));
+    let fd = compat::with_current_compat(|cs| {
+        cs.fds.alloc(OpenObject::Eventfd { val: state, semaphore })
+    }).ok_or(Errno::EBADF)?;
+    Ok(fd as u64)
+}
+
+// ── epoll_create1 (291) ──────────────────────────────────────────────────────
+
+/// `epoll_create1` (291): create an epoll instance. `flags` may be
+/// EPOLL_CLOEXEC (0x80000); others are ignored.
+pub fn sys_epoll_create1(_flags: u64) -> Result<u64, Errno> {
+    let interests: Arc<Spinlock<Vec<EpollEntry>>> = Arc::new(Spinlock::new(Vec::new()));
+    let fd = compat::with_current_compat(|cs| {
+        cs.fds.alloc(OpenObject::Epoll { interests })
+    }).ok_or(Errno::EBADF)?;
+    Ok(fd as u64)
+}
+
+// ── epoll_ctl (233) ──────────────────────────────────────────────────────────
+
+const EPOLL_CTL_ADD: u64 = 1;
+const EPOLL_CTL_DEL: u64 = 2;
+const EPOLL_CTL_MOD: u64 = 3;
+
+/// One registered interest in an epoll instance.
+#[derive(Clone)]
+pub struct EpollEntry {
+    pub fd: i32,
+    pub events: u32,
+    pub data: u64,
+}
+
+/// `epoll_ctl` (233): add / modify / remove an interest in an epoll instance.
+/// `event_ptr` layout: { events: u32, _pad: u32, data: u64 } (epoll_event).
+pub fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> Result<u64, Errno> {
+    // Clone the interest list Arc out of the fd table without holding the
+    // compat lock across the actual mutation.
+    let interests = compat::with_current_compat(|cs| {
+        match cs.fds.get(epfd as u32) {
+            Some(OpenObject::Epoll { interests }) => Some(Arc::clone(interests)),
+            _ => None,
+        }
+    }).flatten().ok_or(Errno::EBADF)?;
+
+    match op {
+        EPOLL_CTL_ADD | EPOLL_CTL_MOD => {
+            check_user_ptr(event_ptr, 12)?;
+            // SAFETY: validated above; epoll_event is { u32 events, u8[8] data }
+            let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
+            let data   = unsafe { core::ptr::read_unaligned((event_ptr + 4) as *const u64) };
+            let mut list = interests.lock();
+            if let Some(e) = list.iter_mut().find(|e| e.fd == fd as i32) {
+                e.events = events; e.data = data;
+            } else {
+                list.push(EpollEntry { fd: fd as i32, events, data });
+            }
+        }
+        EPOLL_CTL_DEL => {
+            let mut list = interests.lock();
+            list.retain(|e| e.fd != fd as i32);
+        }
+        _ => return Err(Errno::EINVAL),
+    }
+    Ok(0)
+}
+
+// ── epoll_wait (232) ─────────────────────────────────────────────────────────
+
+const EPOLLIN:  u32 = 0x0001;
+const EPOLLOUT: u32 = 0x0004;
+const EPOLLERR: u32 = 0x0008;
+const EPOLLHUP: u32 = 0x0010;
+const EPOLLRDHUP: u64 = 0x2000;
+
+/// `epoll_wait` (232): wait for events on an epoll instance.
+/// `events_ptr` must point to `maxevents` * 12 bytes (struct epoll_event[]).
+/// `timeout_ms`: -1 = infinite, 0 = return immediately.
+pub fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout_ms: u64) -> Result<u64, Errno> {
+    if maxevents == 0 || maxevents > 1024 { return Err(Errno::EINVAL); }
+    let event_sz: u64 = 12; // sizeof(struct epoll_event) = 4+8
+    check_user_ptr(events_ptr, maxevents * event_sz)?;
+
+    let interests = compat::with_current_compat(|cs| {
+        match cs.fds.get(epfd as u32) {
+            Some(OpenObject::Epoll { interests }) => Some(Arc::clone(interests)),
+            _ => None,
+        }
+    }).flatten().ok_or(Errno::EBADF)?;
+
+    let timeout_i = timeout_ms as i64;
+    let deadline = if timeout_i < 0 {
+        None
+    } else {
+        let ms = timeout_i as u64;
+        Some(crate::task::scheduler::ticks().saturating_add((ms.saturating_add(9))/10))
+    };
+
+    loop {
+        let snapshot: Vec<EpollEntry> = interests.lock().clone();
+        let mut out = 0usize;
+        for entry in &snapshot {
+            if out >= maxevents as usize { break; }
+            let revents = poll_fd(entry.fd, entry.events);
+            if revents != 0 {
+                let dst = events_ptr + (out as u64) * event_sz;
+                // SAFETY: buffer validated above
+                unsafe {
+                    core::ptr::write_unaligned(dst as *mut u32, revents);
+                    core::ptr::write_unaligned((dst + 4) as *mut u64, entry.data);
+                }
+                out += 1;
+            }
+        }
+        let timed_out = deadline.map(|d| crate::task::scheduler::ticks() >= d).unwrap_or(false);
+        if out > 0 || timed_out || timeout_i == 0 {
+            return Ok(out as u64);
+        }
+        crate::task::scheduler::yield_current();
+    }
+}
+
+/// Compute revents for a single fd given requested events.
+fn poll_fd(fd: i32, events: u32) -> u32 {
+    use crate::task::fd::OpenObject;
+    if fd < 0 { return 0; }
+    let result = crate::task::compat::with_current_compat(|cs| {
+        match cs.fds.get(fd as u32) {
+            None => EPOLLERR,
+            Some(OpenObject::Stdin) => {
+                // In raw mode: ready when there is a scancode available;
+                // in cooked mode: always report readable (read blocks in-kernel).
+                if events & EPOLLIN != 0 { EPOLLIN } else { 0 }
+            }
+            Some(OpenObject::Console) => if events & EPOLLOUT != 0 { EPOLLOUT } else { 0 },
+            Some(OpenObject::PipeRead(e)) => {
+                let mut r = 0u32;
+                if e.read_ready() && events & EPOLLIN != 0 { r |= EPOLLIN; }
+                if e.peer_closed() { r |= EPOLLHUP; }
+                r
+            }
+            Some(OpenObject::PipeWrite(e)) => {
+                let mut r = 0u32;
+                if e.write_ready() && events & EPOLLOUT != 0 { r |= EPOLLOUT; }
+                if e.peer_closed() { r |= EPOLLERR; }
+                r
+            }
+            Some(OpenObject::Eventfd { val, .. }) => {
+                let v = *val.lock();
+                if v > 0 && events & EPOLLIN != 0 { EPOLLIN } else { 0 }
+            }
+            Some(OpenObject::File { .. }) | Some(OpenObject::Dir { .. }) => {
+                events & (EPOLLIN | EPOLLOUT)
+            }
+            Some(OpenObject::Epoll { .. }) => 0,
+        }
+    });
+    let _ = EPOLLRDHUP;
+    result.unwrap_or(0)
+}

@@ -50,6 +50,8 @@ pub struct CompatState {
     /// Distinct unsupported syscall numbers already logged, so the `nosys`
     /// diagnostic is emitted at most once per number per process (R12.2).
     pub nosys_logged: BTreeSet<u64>,
+    /// Whether the controlling tty is in raw mode (ICANON cleared via TCSETS).
+    pub raw_mode: bool,
     /// The normalized exit code (low byte of the requested code), once the
     /// process has exited (R12.3).
     pub exit_code: Option<u8>,
@@ -62,7 +64,7 @@ impl CompatState {
     /// code yet.
     pub fn new(fds: FdTable, vm: VmRegionSet, tid: u64) -> Self { Self::new_with_parent(fds, vm, tid, 1) }
     pub fn new_with_parent(fds: FdTable, vm: VmRegionSet, tid: u64, ppid: u64) -> Self {
-        Self { fds, vm, fs_base: 0, tid, ppid, tgid: tid, clear_child_tid: 0, waitable: true, robust_head: 0, robust_len: 0, cwd: "/".to_string(), nosys_logged: BTreeSet::new(), exit_code: None }
+        Self { fds, vm, fs_base: 0, tid, ppid, tgid: tid, clear_child_tid: 0, waitable: true, robust_head: 0, robust_len: 0, cwd: "/".to_string(), nosys_logged: BTreeSet::new(), raw_mode: false, exit_code: None }
     }
 }
 

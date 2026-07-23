@@ -31,9 +31,14 @@ pub mod nr {
     /// `select` — synchronous fd multiplexing (timeval timeout).
     pub const SELECT: u64 = 23;
     /// `pselect6` — select with timespec + sigmask (readline waits on this).
+    pub const EPOLL_WAIT: u64 = 232;
+    pub const EPOLL_CTL: u64 = 233;
     pub const PSELECT6: u64 = 270;
     /// `ppoll` — poll with timespec + sigmask.
     pub const PPOLL: u64 = 271;
+    pub const EVENTFD2: u64 = 290;
+    pub const EPOLL_CREATE1: u64 = 291;
+    pub const CLOCK_GETRES: u64 = 229;
     /// `lseek` — reposition a descriptor's offset.
     pub const LSEEK: u64 = 8;
     /// `mmap` — map memory.
@@ -248,8 +253,13 @@ pub fn is_supported(nr: u64) -> bool {
             | nr::FUTEX
             | nr::GETDENTS64
             | nr::SET_TID_ADDRESS
+            | nr::CLOCK_GETRES
             | nr::CLOCK_GETTIME
             | nr::CLOCK_NANOSLEEP
+            | nr::EPOLL_WAIT
+            | nr::EPOLL_CTL
+            | nr::EPOLL_CREATE1
+            | nr::EVENTFD2
             | nr::EXIT_GROUP
             | nr::OPENAT
             | nr::NEWFSTATAT

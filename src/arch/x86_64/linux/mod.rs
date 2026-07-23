@@ -29,6 +29,7 @@ pub mod timeconv;
 // handlers here — rather than in the host-included `io.rs`/`mem.rs` — is what lets
 // those pure planners stay host-testable (R11.6).
 pub mod io_sys;
+pub mod epoll_sys;
 pub mod mem_sys;
 pub mod rtc;
 pub mod process_sys;
@@ -107,6 +108,11 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::SELECT => io_sys::sys_select(a[0], a[1], a[2], a[3], a[4]),
         sysno::PSELECT6 => io_sys::sys_pselect6(a[0], a[1], a[2], a[3], a[4], a[5]),
         sysno::PPOLL => io_sys::sys_ppoll(a[0], a[1], a[2], a[3]),
+        sysno::CLOCK_GETRES => epoll_sys::sys_clock_getres(a[0], a[1]),
+        sysno::EVENTFD2 => epoll_sys::sys_eventfd2(a[0], a[1]),
+        sysno::EPOLL_CREATE1 => epoll_sys::sys_epoll_create1(a[0]),
+        sysno::EPOLL_CTL => epoll_sys::sys_epoll_ctl(a[0], a[1], a[2], a[3]),
+        sysno::EPOLL_WAIT => epoll_sys::sys_epoll_wait(a[0], a[1], a[2], a[3]),
         sysno::PIPE => io_sys::sys_pipe(a[0]),
         sysno::PIPE2 => io_sys::sys_pipe2(a[0], a[1]),
         // ── Directory / path / fd (linux-binary-compat) ──

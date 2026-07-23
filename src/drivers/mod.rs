@@ -8,6 +8,7 @@ pub mod cursor;
 pub mod framebuffer;
 pub mod pci;
 pub mod virtio;
+pub mod vt;
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;

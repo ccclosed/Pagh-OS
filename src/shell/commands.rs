@@ -989,8 +989,10 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
     // argv[0] is the program name as typed; remaining tokens follow.
     let argv: alloc::vec::Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
 
+    // STAGE-14: initialise the VT emulator so nvim' ANSI output renders correctly.
+    crate::drivers::vt::init();
     let env: [&[u8]; 8] = [
-        b"TERM=dumb",
+        b"TERM=xterm",
         b"PYTHON_BASIC_REPL=1",
         b"PATH=/mnt/usr/bin",
         b"LD_LIBRARY_PATH=/mnt/usr/lib/x86_64-linux-gnu:/mnt/usr/lib:/mnt/usr/lib64:/mnt/lib64",
