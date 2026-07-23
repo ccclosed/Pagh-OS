@@ -1,6 +1,7 @@
 # Rust applications for pagh
 
-pagh runs statically linked `x86_64-unknown-linux-musl` Rust executables through its ring-3 Linux compatibility layer (dynamically linked glibc binaries also run via `lxrun`). Threads, `fork`, futexes, signals, and GUI libraries are not supported.
+pagh runs statically linked `x86_64-unknown-linux-musl` Rust executables through its ring-3 Linux compatibility layer (dynamically linked glibc binaries also run via `lxrun`). Threads, `fork`, signal delivery, and GUI libraries are not supported (`futex` and
+signal setup are accepted only as far as single-threaded glibc needs).
 
 Build the sample:
 

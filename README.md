@@ -70,7 +70,7 @@ honest INSECURE warnings (VARIANT A: encrypted but unauthenticated).
 
 ## Features at a glance
 
-- **Core:** safe privileged-instruction layer (incl. SSE enablement), GDT/IDT/TSS/IST,
+- **Core:** safe privileged-instruction layer (SSE enabled for ring 3; the kernel itself is compiled soft-float), GDT/IDT/TSS/IST,
   bitmap PMM, 4-level paging VMM with `map_mmio`, a `good_memory_allocator` (galloc) heap, ACPI (MADT),
   LAPIC + I/O APIC.
 - **Tasking:** preemptive ~100 Hz round-robin scheduler, kernel threads, ring-3 user
@@ -89,8 +89,9 @@ honest INSECURE warnings (VARIANT A: encrypted but unauthenticated).
   prompt/errors, typo suggestions, a registry-driven `help`, and a `paint` app.
 - **Linux binaries:** a Linux x86_64 syscall layer (`int 0x80` + `syscall`) and an ELF
   loader for static `ET_EXEC`, static-PIE, and glibc-dynamic (`PT_INTERP`) images run
-  Linux programs in ring 3 (`lxrun`) — including the CPython 3.13 REPL. Threads/`fork`,
-  signals/`epoll`, and GUI stacks are still out of scope.
+  Linux programs in ring 3 (`lxrun`) — including the CPython 3.13 REPL (GNU readline
+  works via `select`/`pselect6`). Threads/`fork`, signal delivery, `epoll`/`eventfd`,
+  and GUI stacks are still out of scope.
 - **Packages:** a by-name `apt` (`update`/`install`/`show`/`list`/`setmirror`) that fetches
   a Debian `Packages` index over HTTP/HTTPS, streams gzip/xz/zstd decompression into a
   compact in-RAM arena index, resolves dependencies, and installs `.deb`s onto ext2 `/mnt`
@@ -212,8 +213,9 @@ pagh:/>
 ```
 
 The default log level is `INFO`; `debug!`/`trace!` output is filtered out. Boot runs as an
-ordered sequence of fallible init steps (`boot::start`); SSE is enabled first, then each
-step logs one concise `info!` line. The `ext2 mounted at /mnt` step also runs a one-shot
+ordered sequence of fallible init steps (`boot::start`); hardware SSE is enabled first
+(ring-3 programs use XMM freely — the kernel itself is compiled soft-float and never
+touches vector registers), then each step logs one concise `info!` line. The `ext2 mounted at /mnt` step also runs a one-shot
 journaled write/read self-demo. The `Hello from ring3 user process!` line is printed by an
 embedded ELF executing in ring 3 via a `SYS_WRITE` system call. The DHCP lease is acquired
 asynchronously by the network poll thread once interrupts are enabled, so it appears after
@@ -391,15 +393,17 @@ python
 - **Static and dynamic.** Statically-linked binaries and glibc-dynamic binaries both run:
   the loader maps the ELF interpreter (`ld-linux-x86-64.so.2`) from `/mnt` (with
   merged-`/usr` fallback paths), and CPython 3.13 works end to end.
-  `fork`/`clone`/threads/futex, signal delivery, `epoll`/`eventfd`, and GUI stacks are
-  still out of scope and return `-ENOSYS` — event-loop TUIs (`nvim`, `htop`) do not run yet.
+  `fork`/`clone`/threads, signal delivery, `epoll`/`eventfd`, and GUI stacks are still
+  out of scope and return `-ENOSYS` — event-loop TUIs (`nvim`, `htop`) do not run yet,
+  though a fatal `tgkill` now ends the process cleanly (glibc `abort()` → exit 134).
 - **Install ≠ run.** `apt install <pkg>` resolves the dependency closure, downloads each
   `.deb`, unpacks its files onto `/mnt`, and materializes tar symlinks/hardlinks as file
   copies (the ext2 writer has no symlink support). Console programs like `python3` then
   genuinely run. Interactive TUIs still may not: there is no `procfs` (`/proc/stat`,
-  `/proc/meminfo`, per-pid entries), no `epoll`/`eventfd`, no signal delivery, and `ioctl`
-  is a stub (`TIOCGWINSZ`/`TCGETS` return `EINVAL`), so ncurses/libuv programs (`htop`,
-  `nvim`) fail at startup. See `LINUX-USERLAND.md` for the exact status.
+  `/proc/meminfo`, per-pid entries), no `epoll`/`eventfd`, and no signal
+  delivery. The console answers `TCGETS`/`TCSETS*`/`TIOCGWINSZ`/`TIOCSWINSZ` (non-tty
+  fds get a proper `ENOTTY`), but stdin stays line-buffered, so ncurses/libuv programs
+  (`htop`, `nvim`) still fail at startup. See `LINUX-USERLAND.md` for the exact status.
 - **Transport.** Downloads use HTTP or HTTPS. HTTPS is **VARIANT A**: TLS 1.3 encrypted but
   **unauthenticated** (no certificate chain/hostname/expiry checks),
   and package data is not signature-verified — acceptable only for this hobby/QEMU demo.
@@ -581,8 +585,9 @@ src/
   dispatcher) plus an ELF loader for static `ET_EXEC`, static-PIE, and `PT_INTERP` dynamic images, a
   SysV initial stack/auxv builder, and per-process compat state (fd table, VM regions) let
   Linux programs — including glibc-dynamic ones such as CPython 3.13 — run in ring 3
-  (`lxrun`). `fork`/`clone`/threads/futex, signals/`epoll`, and GUI stacks are deliberately
-  out of scope and return `-ENOSYS`.
+  (`lxrun`). `fork`/`clone`/threads, signals/`epoll`, and GUI stacks are deliberately
+  out of scope and return `-ENOSYS` (`futex` is handled just far enough for
+  single-threaded glibc locking).
 - **Packages (apt).** `apt` fetches a Debian `Packages` index and parses it incrementally
   from a streaming gzip/xz/zstd decompressor into a **compact byte-arena index** — one
   growable byte arena plus `(offset,len)` references and integer-keyed sorted lookup tables,
@@ -667,6 +672,9 @@ These are required and preserved across the codebase:
 - Limine request statics live in the `.requests` section.
 - Higher-half load address `0xffffffff80000000` (`linker.ld`).
 - Frame pointers forced on (`-Cforce-frame-pointers=yes`) for the panic stack trace.
+- The kernel is compiled **soft-float** (`"rustc-abi": "softfloat"`; SSE/AVX disabled in
+  the target spec): syscalls, interrupts, and context switches never touch user
+  XMM/MXCSR state, which the Linux syscall ABI requires to be preserved.
 
 ### Key dependencies
 

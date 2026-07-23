@@ -53,13 +53,16 @@ The thread is idempotent; delete `disk.img` to re-provision from scratch.
 
 These return `-ENOSYS` (logged once per syscall number per process):
 
-- `fork`/`clone`, threads, futexes — single-process programs only.
+- `fork`/`clone`, threads — single-process programs only (`futex` is implemented
+  just far enough for single-threaded glibc locking).
 - Signal delivery. `sigaltstack` is a stub; `tgkill` with a fatal signal aimed
   at the calling process terminates it with the conventional `128+sig` code
   (this is how glibc `abort()` ends).
 - `epoll`/`eventfd`/`timerfd` — libuv-based programs (`nvim`) abort at startup.
-- Terminal raw mode: `ioctl` `TCGETS`/`TCSETS`/`TIOCGWINSZ` return `EINVAL`, and stdin
-  is line-buffered — ncurses TUIs (`htop`) cannot size or raw-mode the terminal.
+- Terminal raw mode: the console answers `TCGETS`/`TCSETS*`/`TIOCGWINSZ`/`TIOCSWINSZ`
+  (non-tty fds get a proper `ENOTTY`), but the termios settings are not applied —
+  stdin stays line-buffered with echo, so ncurses TUIs (`htop`) cannot actually
+  raw-mode the terminal yet.
 - No `procfs`/`sysfs`.
 
 So: batch/console programs and the CPython REPL run; event-loop TUIs need the next
