@@ -17,6 +17,9 @@ including the full CPython 3.13 REPL installed straight from Debian packages.
 - The kernel itself is built without SSE/AVX (soft-float), so user-space SIMD
   register state (XMM/MXCSR) is never clobbered by syscalls, interrupts, or
   context switches — the Linux syscall ABI preserves vector registers.
+- Minimal `select`/`pselect6`/`ppoll`: the cooked-tty stdin reports readable and
+  the following `read` blocks line-buffered — enough for GNU readline and the
+  interactive CPython prompt.
 - The `python` shell command finds the installed CPython and runs it with a proper
   `PYTHONHOME`/`PYTHONPATH` environment (`PYTHON_BASIC_REPL=1`).
 

@@ -28,6 +28,12 @@ pub mod nr {
     /// `fstat` — file status by descriptor.
     pub const FSTAT: u64 = 5;
     pub const POLL: u64 = 7;
+    /// `select` — synchronous fd multiplexing (timeval timeout).
+    pub const SELECT: u64 = 23;
+    /// `pselect6` — select with timespec + sigmask (readline waits on this).
+    pub const PSELECT6: u64 = 270;
+    /// `ppoll` — poll with timespec + sigmask.
+    pub const PPOLL: u64 = 271;
     /// `lseek` — reposition a descriptor's offset.
     pub const LSEEK: u64 = 8;
     /// `mmap` — map memory.
@@ -187,6 +193,9 @@ pub fn is_supported(nr: u64) -> bool {
             | nr::CLOSE
             | nr::FSTAT
             | nr::POLL
+            | nr::SELECT
+            | nr::PSELECT6
+            | nr::PPOLL
             | nr::LSEEK
             | nr::MMAP
             | nr::MPROTECT

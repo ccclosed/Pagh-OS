@@ -103,6 +103,9 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::IOCTL => io_sys::sys_ioctl(a[0], a[1], a[2]),
         sysno::ACCESS => io_sys::sys_access(a[0], a[1]),
         sysno::POLL => io_sys::sys_poll(a[0], a[1], a[2]),
+        sysno::SELECT => io_sys::sys_select(a[0], a[1], a[2], a[3], a[4]),
+        sysno::PSELECT6 => io_sys::sys_pselect6(a[0], a[1], a[2], a[3], a[4], a[5]),
+        sysno::PPOLL => io_sys::sys_ppoll(a[0], a[1], a[2], a[3]),
         sysno::PIPE => io_sys::sys_pipe(a[0]),
         sysno::PIPE2 => io_sys::sys_pipe2(a[0], a[1]),
         // ── Directory / path / fd (linux-binary-compat) ──

@@ -645,6 +645,13 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
     }
 }
 
+// STAGE-13.8 SELECT: bytes of a cooked line the previous read(2) did not
+// consume — readline drains input one byte per read after select().
+static STDIN_PENDING: crate::sync::spinlock::Spinlock<alloc::vec::Vec<u8>> =
+    crate::sync::spinlock::Spinlock::new(alloc::vec::Vec::new());
+/// Hard cap so a pathological paste cannot grow the cooked line unbounded.
+const STDIN_LINE_MAX: usize = 4096;
+
 /// Blocking, line-buffered stdin read from the PS/2 keyboard (stage 13.7).
 ///
 /// Cooked-tty semantics: printable characters echo as they are typed, Backspace
@@ -657,6 +664,15 @@ fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
     use crate::shell::keys::{Decoder, KeyEvent};
     if count == 0 {
         return Ok(0);
+    }
+    {
+        let mut pending = STDIN_PENDING.lock();
+        if !pending.is_empty() {
+            let n = core::cmp::min(count as usize, pending.len());
+            let head: alloc::vec::Vec<u8> = pending.drain(..n).collect();
+            copy_out(buf, &head);
+            return Ok(n as u64);
+        }
     }
     let mut decoder = Decoder::new();
     let mut line: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
@@ -683,7 +699,7 @@ fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
             }
             KeyEvent::Tab | KeyEvent::Char('\t') => {
                 for _ in 0..4 {
-                    if (line.len() as u64) < count {
+                    if line.len() < STDIN_LINE_MAX {
                         console_write(b" ");
                         line.push(b' ');
                     }
@@ -707,13 +723,17 @@ fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
             }
             _ => {}
         }
-        if line.len() as u64 >= count {
-            break; // user buffer full: hand back a partial line
+        if line.len() >= STDIN_LINE_MAX {
+            break; // pathological line length: hand back what we have
         }
     }
-    line.truncate(count as usize);
-    copy_out(buf, &line);
-    Ok(line.len() as u64)
+    let n = core::cmp::min(count as usize, line.len());
+    copy_out(buf, &line[..n]);
+    if n < line.len() {
+        // Stash the tail: readline asks for one byte per read(2).
+        STDIN_PENDING.lock().extend_from_slice(&line[n..]);
+    }
+    Ok(n as u64)
 }
 
 /// `access` (21): succeed (return 0) when the path exists on the VFS/ext2 tree,
@@ -1083,3 +1103,126 @@ pub fn sys_pipe(pipefd:u64)->Result<u64,Errno>{sys_pipe2(pipefd,0)}
 pub fn sys_pipe2(pipefd:u64,flags:u64)->Result<u64,Errno>{if flags&!(O_NONBLOCK|O_CLOEXEC)!=0{return Err(Errno::EINVAL)}check_user_ptr(pipefd,8)?;let pair=compat::with_current_compat(|cs|cs.fds.pipe(flags&O_NONBLOCK!=0)).ok_or(Errno::EBADF)?;let words=[pair.0,pair.1];let bytes=unsafe{core::slice::from_raw_parts(words.as_ptr()as*const u8,8)};copy_out(pipefd,bytes);Ok(0)}
 fn poll_revents(fd:i32,events:i16)->i16{if fd<0{return 0}match resolve_fd(fd as u32){None=>POLLNVAL,Some(Resolved::PipeRead(e))=>{let mut o=if e.read_ready(){events&POLLIN}else{0};if e.peer_closed(){o|=POLLHUP}o},Some(Resolved::PipeWrite(e))=>{let mut o=if e.write_ready(){events&POLLOUT}else{0};if e.peer_closed(){o|=POLLERR}o},Some(Resolved::Stdin)=>0,Some(Resolved::Console)=>events&POLLOUT,Some(Resolved::File{..})|Some(Resolved::Dir)=>events&(POLLIN|POLLOUT)}}
 pub fn sys_poll(fds:u64,nfds:u64,timeout:u64)->Result<u64,Errno>{const SZ:u64=8;if nfds>1024{return Err(Errno::EINVAL)}check_user_ptr(fds,nfds.checked_mul(SZ).ok_or(Errno::EINVAL)?)?;let ms=timeout as i64;let deadline=if ms<0{None}else{Some(crate::task::scheduler::ticks().saturating_add((ms as u64).saturating_add(9)/10))};loop{let mut ready=0;for i in 0..nfds{let p=fds+i*SZ;let fd=unsafe{*(p as*const i32)};let ev=unsafe{*((p+4)as*const i16)};let rev=poll_revents(fd,ev);unsafe{*((p+6)as*mut i16)=rev}if rev!=0{ready+=1}}if ready!=0||ms==0{return Ok(ready)}if let Some(end)=deadline{if crate::task::scheduler::ticks()>=end{return Ok(0)}}crate::task::scheduler::yield_current()}}
+
+// ---------------------------------------------------------------------------
+// STAGE-13.8 SELECT: minimal select/pselect6/ppoll (nr 23/270/271). GNU
+// readline (loaded by the CPython REPL now that libreadline is installed)
+// waits for stdin with pselect6 before every byte; ENOSYS left it spinning
+// right after the first `>>>` prompt. The cooked-tty stdin always reports
+// readable — the following read(2) blocks line-buffered anyway, and leftover
+// bytes are served from STDIN_PENDING one read at a time.
+// ---------------------------------------------------------------------------
+const FDSET_WORDS: usize = 16; // 1024 fds, matching FD_SETSIZE
+
+fn select_ready(fd: u64, want_write: bool) -> bool {
+    match resolve_fd(fd as u32) {
+        None => true, // report ready; the following operation returns EBADF
+        Some(Resolved::Stdin) => !want_write,
+        Some(Resolved::Console) => true,
+        Some(Resolved::PipeRead(e)) => !want_write && (e.read_ready() || e.peer_closed()),
+        Some(Resolved::PipeWrite(e)) => want_write && (e.write_ready() || e.peer_closed()),
+        Some(Resolved::File { .. }) | Some(Resolved::Dir) => true,
+    }
+}
+
+fn load_fdset(ptr: u64, nfds: u64) -> Result<[u64; FDSET_WORDS], Errno> {
+    let mut set = [0u64; FDSET_WORDS];
+    if ptr == 0 {
+        return Ok(set);
+    }
+    let words = ((nfds + 63) / 64) as usize;
+    check_user_ptr(ptr, (words as u64) * 8)?;
+    for w in 0..words {
+        set[w] = unsafe { *((ptr + (w as u64) * 8) as *const u64) };
+    }
+    Ok(set)
+}
+
+fn store_fdset(ptr: u64, nfds: u64, set: &[u64; FDSET_WORDS]) {
+    if ptr == 0 {
+        return;
+    }
+    let words = ((nfds + 63) / 64) as usize;
+    for w in 0..words {
+        unsafe { *((ptr + (w as u64) * 8) as *mut u64) = set[w] };
+    }
+}
+
+fn do_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout_ms: Option<i64>) -> Result<u64, Errno> {
+    let nfds = nfds.min(1024);
+    let want_r = load_fdset(readfds, nfds)?;
+    let want_w = load_fdset(writefds, nfds)?;
+    let _ = load_fdset(exceptfds, nfds)?; // exceptional conditions never fire here
+    let deadline = match timeout_ms {
+        None => None,
+        Some(ms) if ms <= 0 => Some(0), // scan once, then time out
+        Some(ms) => Some(crate::task::scheduler::ticks().saturating_add(((ms as u64).saturating_add(9)) / 10)),
+    };
+    loop {
+        let mut got_r = [0u64; FDSET_WORDS];
+        let mut got_w = [0u64; FDSET_WORDS];
+        let mut ready = 0u64;
+        for fd in 0..nfds {
+            let (w, b) = ((fd / 64) as usize, 1u64 << (fd % 64));
+            if want_r[w] & b != 0 && select_ready(fd, false) {
+                got_r[w] |= b;
+                ready += 1;
+            }
+            if want_w[w] & b != 0 && select_ready(fd, true) {
+                got_w[w] |= b;
+                ready += 1;
+            }
+        }
+        let timed_out = match deadline {
+            Some(end) => crate::task::scheduler::ticks() >= end,
+            None => false,
+        };
+        if ready != 0 || timed_out {
+            store_fdset(readfds, nfds, &got_r);
+            store_fdset(writefds, nfds, &got_w);
+            store_fdset(exceptfds, nfds, &[0u64; FDSET_WORDS]);
+            return Ok(ready);
+        }
+        crate::task::scheduler::yield_current();
+    }
+}
+
+/// `pselect6` (270): the timeout is a `struct timespec`; the sigmask is
+/// ignored (no signal delivery yet).
+pub fn sys_pselect6(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: u64, _sigmask: u64) -> Result<u64, Errno> {
+    let ms = if timeout == 0 {
+        None
+    } else {
+        check_user_ptr(timeout, 16)?;
+        let sec = unsafe { *(timeout as *const i64) };
+        let nsec = unsafe { *((timeout + 8) as *const i64) };
+        Some(sec.saturating_mul(1000).saturating_add(nsec / 1_000_000))
+    };
+    do_select(nfds, readfds, writefds, exceptfds, ms)
+}
+
+/// `select` (23): the timeout is a `struct timeval`.
+pub fn sys_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: u64) -> Result<u64, Errno> {
+    let ms = if timeout == 0 {
+        None
+    } else {
+        check_user_ptr(timeout, 16)?;
+        let sec = unsafe { *(timeout as *const i64) };
+        let usec = unsafe { *((timeout + 8) as *const i64) };
+        Some(sec.saturating_mul(1000).saturating_add(usec / 1_000))
+    };
+    do_select(nfds, readfds, writefds, exceptfds, ms)
+}
+
+/// `ppoll` (271): `poll` with a `struct timespec` timeout; sigmask ignored.
+pub fn sys_ppoll(fds: u64, nfds: u64, ts: u64, _sigmask: u64) -> Result<u64, Errno> {
+    let ms: i64 = if ts == 0 {
+        -1
+    } else {
+        check_user_ptr(ts, 16)?;
+        let sec = unsafe { *(ts as *const i64) };
+        let nsec = unsafe { *((ts + 8) as *const i64) };
+        sec.saturating_mul(1000).saturating_add(nsec / 1_000_000)
+    };
+    sys_poll(fds, nfds, ms as u64)
+}
