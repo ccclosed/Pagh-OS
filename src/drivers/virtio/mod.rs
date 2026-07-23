@@ -7,5 +7,5 @@
 // (`VirtIOBlk`/`VirtIONet`) are attached in later milestones and parameterize
 // over `PaghHal`.
 
-pub mod hal;
 pub mod blk;
+pub mod hal;

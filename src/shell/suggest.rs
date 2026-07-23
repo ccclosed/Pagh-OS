@@ -59,7 +59,11 @@ pub fn edit_distance(a: &str, b: &str, max: usize) -> usize {
         let mut row_min = i;
 
         for j in 1..=m {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+            let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                0
+            } else {
+                1
+            };
             let deletion = prev[j] + 1;
             let insertion = cur[j - 1] + 1;
             let substitution = prev[j - 1] + cost;

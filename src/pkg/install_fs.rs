@@ -233,9 +233,9 @@ fn install_one(root: &str, rel: &str, content: &[u8]) -> Result<(), InstallError
             Err(VfsError::NotFound) => match dir.create_dir(comp) {
                 Ok(child) => child,
                 // Lost a race (or pre-existing): re-resolve the now-present dir.
-                Err(VfsError::AlreadyExists) => dir
-                    .lookup(comp)
-                    .map_err(|e| vfs_err("mkdir", &abs, e))?,
+                Err(VfsError::AlreadyExists) => {
+                    dir.lookup(comp).map_err(|e| vfs_err("mkdir", &abs, e))?
+                }
                 // ext2 OutOfSpace surfaces as IoError (see module docs) → NoSpace.
                 Err(VfsError::IoError) => return Err(no_space("mkdir", &abs)),
                 Err(e) => return Err(vfs_err("mkdir", &abs, e)),

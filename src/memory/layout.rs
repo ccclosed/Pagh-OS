@@ -40,8 +40,7 @@ pub const KERNEL_STACK_PAGES: u64 = 64;
 pub const KERNEL_STACK_GUARD_PAGES: u64 = 1;
 
 /// Bytes reserved per PID in the kernel-stack region (guard pages + stack pages).
-pub const KERNEL_STACK_STRIDE: u64 =
-    (KERNEL_STACK_PAGES + KERNEL_STACK_GUARD_PAGES) * PAGE_SIZE;
+pub const KERNEL_STACK_STRIDE: u64 = (KERNEL_STACK_PAGES + KERNEL_STACK_GUARD_PAGES) * PAGE_SIZE;
 
 /// Compute the kernel-stack addresses for a given PID.
 ///
@@ -53,7 +52,13 @@ pub const KERNEL_STACK_STRIDE: u64 =
 /// This mirrors the layout `kernel_thread_spawn` builds today:
 /// `guard_base = REGION_BASE + pid * STRIDE`, `stack_base = guard_base + PAGE_SIZE`,
 /// `stack_top = stack_base + KERNEL_STACK_PAGES * PAGE_SIZE`.
-pub fn kernel_stack_for_pid(pid: u64) -> (u64 /*guard_base*/, u64 /*stack_base*/, u64 /*stack_top*/) {
+pub fn kernel_stack_for_pid(
+    pid: u64,
+) -> (
+    u64, /*guard_base*/
+    u64, /*stack_base*/
+    u64, /*stack_top*/
+) {
     let guard_base = KERNEL_STACK_REGION_BASE + pid * KERNEL_STACK_STRIDE;
     let stack_base = guard_base + KERNEL_STACK_GUARD_PAGES * PAGE_SIZE;
     let stack_top = stack_base + KERNEL_STACK_PAGES * PAGE_SIZE;

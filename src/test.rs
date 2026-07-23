@@ -3,18 +3,25 @@
 
 macro_rules! assert_kernel {
     ($cond:expr, $msg:expr) => {
-        if !$cond { crate::kprintln!("FAIL: {}:{}: {}", file!(), line!(), $msg); }
+        if !$cond {
+            crate::kprintln!("FAIL: {}:{}: {}", file!(), line!(), $msg);
+        }
     };
 }
 macro_rules! assert_eq_kernel {
     ($left:expr, $right:expr, $msg:expr) => {
-        if $left != $right { crate::kprintln!("FAIL: {}:{}: {}", file!(), line!(), $msg); }
+        if $left != $right {
+            crate::kprintln!("FAIL: {}:{}: {}", file!(), line!(), $msg);
+        }
     };
 }
 
 mod pmm_tests {
     use crate::memory::pmm;
-    pub fn total_frames() { let n = pmm::total_frames(); assert_kernel!(n > 0, "total_frames > 0"); }
+    pub fn total_frames() {
+        let n = pmm::total_frames();
+        assert_kernel!(n > 0, "total_frames > 0");
+    }
     pub fn alloc_free() {
         let before = pmm::free_frames();
         let f = pmm::alloc_frame().expect("alloc");
@@ -25,9 +32,13 @@ mod pmm_tests {
     pub fn alloc_many() {
         let before = pmm::free_frames();
         let mut frames = [0u64; 8];
-        for i in 0..8 { frames[i] = pmm::alloc_frame().expect("alloc"); }
+        for i in 0..8 {
+            frames[i] = pmm::alloc_frame().expect("alloc");
+        }
         assert_kernel!(pmm::free_frames() == before - 8, "8 allocs");
-        for f in frames { pmm::free_frame(f); }
+        for f in frames {
+            pmm::free_frame(f);
+        }
         assert_kernel!(pmm::free_frames() == before, "free all");
     }
 }
@@ -64,7 +75,9 @@ mod pmm_prop_tests {
     impl XorShift64 {
         fn new(seed: u64) -> Self {
             // Avoid the all-zero state, which would be a fixed point.
-            XorShift64 { state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed } }
+            XorShift64 {
+                state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed },
+            }
         }
         fn next(&mut self) -> u64 {
             let mut x = self.state;
@@ -200,7 +213,9 @@ mod pmm_contig_prop_tests {
     }
     impl XorShift64 {
         fn new(seed: u64) -> Self {
-            XorShift64 { state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed } }
+            XorShift64 {
+                state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed },
+            }
         }
         fn next(&mut self) -> u64 {
             let mut x = self.state;
@@ -384,9 +399,7 @@ mod vmm_prop_tests {
             }
         };
 
-        let flags = PageTableFlags::PRESENT
-            | PageTableFlags::WRITABLE
-            | PageTableFlags::NO_EXECUTE;
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
 
         match vmm::map(frame, test_virt, flags) {
             Ok(()) => {}
@@ -565,7 +578,9 @@ mod heap_prop_tests {
     }
     impl XorShift64 {
         fn new(seed: u64) -> Self {
-            XorShift64 { state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed } }
+            XorShift64 {
+                state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed },
+            }
         }
         fn next(&mut self) -> u64 {
             let mut x = self.state;
@@ -643,14 +658,18 @@ mod heap_prop_tests {
                 // SAFETY: `ptr_addr`/`layout` are exactly the pointer and layout
                 // returned/used by a prior `alloc` that has not yet been freed,
                 // satisfying `dealloc`'s contract (matching layout, freed once).
-                unsafe { dealloc(ptr_addr as *mut u8, layout); }
+                unsafe {
+                    dealloc(ptr_addr as *mut u8, layout);
+                }
             }
         }
 
         // Non-destructive teardown: free everything still live.
         for (ptr_addr, _size, layout) in live.drain(..) {
             // SAFETY: same matching-layout, freed-once contract as above.
-            unsafe { dealloc(ptr_addr as *mut u8, layout); }
+            unsafe {
+                dealloc(ptr_addr as *mut u8, layout);
+            }
         }
     }
 }
@@ -659,7 +678,9 @@ mod spinlock_tests {
     use crate::sync::spinlock::Spinlock;
     pub fn lock_unlock() {
         let l = Spinlock::new(42u64);
-        { assert_eq_kernel!(*l.lock(), 42, "lock read"); }
+        {
+            assert_eq_kernel!(*l.lock(), 42, "lock read");
+        }
         assert_eq_kernel!(*l.lock(), 42, "relock");
     }
     pub fn try_lock() {
@@ -671,7 +692,9 @@ mod spinlock_tests {
     }
     pub fn mutate() {
         let l = Spinlock::new(0u64);
-        { *l.lock() = 99; }
+        {
+            *l.lock() = 99;
+        }
         assert_eq_kernel!(*l.lock(), 99, "mutate");
     }
 }
@@ -706,13 +729,23 @@ mod spinlock_irq_tests {
         {
             let _g = l.lock();
             // The lock disables interrupts while held.
-            assert_kernel!(!interrupts_enabled(), "IF disabled while held (disabled pre-state)");
+            assert_kernel!(
+                !interrupts_enabled(),
+                "IF disabled while held (disabled pre-state)"
+            );
         }
         // Restored to the disabled pre-acquisition state.
-        assert_kernel!(!interrupts_enabled(), "IF restored to disabled after release");
+        assert_kernel!(
+            !interrupts_enabled(),
+            "IF restored to disabled after release"
+        );
 
         // Leave the CPU interrupt state as we found it.
-        if entry { enable_interrupts(); } else { disable_interrupts(); }
+        if entry {
+            enable_interrupts();
+        } else {
+            disable_interrupts();
+        }
     }
 
     /// Pre-state = interrupts enabled. The lock must disable IF while held, and
@@ -728,25 +761,37 @@ mod spinlock_irq_tests {
         {
             let _g = l.lock();
             // The lock disables interrupts while held, regardless of pre-state.
-            assert_kernel!(!interrupts_enabled(), "IF disabled while held (enabled pre-state)");
+            assert_kernel!(
+                !interrupts_enabled(),
+                "IF disabled while held (enabled pre-state)"
+            );
         }
         // Restored to the enabled pre-acquisition state.
         assert_kernel!(interrupts_enabled(), "IF restored to enabled after release");
 
         // Leave the CPU interrupt state as we found it.
-        if entry { enable_interrupts(); } else { disable_interrupts(); }
+        if entry {
+            enable_interrupts();
+        } else {
+            disable_interrupts();
+        }
     }
 }
 
 mod scheduler_tests {
     use crate::task::scheduler::{self, Tcb};
-    pub fn pid_inc() { let a = scheduler::next_pid(); assert_kernel!(scheduler::next_pid() > a, "pid++"); }
+    pub fn pid_inc() {
+        let a = scheduler::next_pid();
+        assert_kernel!(scheduler::next_pid() > a, "pid++");
+    }
     pub fn spawn_sched() {
         let p = scheduler::next_pid();
         scheduler::spawn(Tcb::new(p, 0x8000, 0));
         assert_eq_kernel!(scheduler::schedule().unwrap().pid, p, "spawn+sched");
     }
-    pub fn empty_queue() { assert_kernel!(scheduler::schedule().is_none(), "empty queue"); }
+    pub fn empty_queue() {
+        assert_kernel!(scheduler::schedule().is_none(), "empty queue");
+    }
     pub fn tick_works() {
         let t0 = scheduler::ticks();
         scheduler::tick();
@@ -760,8 +805,15 @@ mod elf_tests {
         let hs = core::mem::size_of::<Elf64Header>();
         let ps = core::mem::size_of::<Elf64ProgramHeader>();
         let mut d = alloc::vec![0u8; hs + ps];
-        d[0]=0x7F; d[1]=b'E'; d[2]=b'L'; d[3]=b'F'; d[4]=2; d[5]=1;
-        d[16]=2; d[18]=0x3E; d[20]=1;
+        d[0] = 0x7F;
+        d[1] = b'E';
+        d[2] = b'L';
+        d[3] = b'F';
+        d[4] = 2;
+        d[5] = 1;
+        d[16] = 2;
+        d[18] = 0x3E;
+        d[20] = 1;
         d[24..32].copy_from_slice(&entry.to_le_bytes());
         let po = hs as u64;
         d[32..40].copy_from_slice(&po.to_le_bytes());
@@ -769,26 +821,31 @@ mod elf_tests {
         d[54..56].copy_from_slice(&pe.to_le_bytes());
         d[56..58].copy_from_slice(&1u16.to_le_bytes());
         let ph = hs;
-        d[ph..ph+4].copy_from_slice(&1u32.to_le_bytes());
-        d[ph+4..ph+8].copy_from_slice(&7u32.to_le_bytes());
-        d[ph+16..ph+24].copy_from_slice(&0x400000u64.to_le_bytes());
-        d[ph+24..ph+32].copy_from_slice(&0x400000u64.to_le_bytes());
+        d[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes());
+        d[ph + 4..ph + 8].copy_from_slice(&7u32.to_le_bytes());
+        d[ph + 16..ph + 24].copy_from_slice(&0x400000u64.to_le_bytes());
+        d[ph + 24..ph + 32].copy_from_slice(&0x400000u64.to_le_bytes());
         let fs = d.len() as u64;
-        d[ph+32..ph+40].copy_from_slice(&fs.to_le_bytes());
-        d[ph+40..ph+48].copy_from_slice(&fs.to_le_bytes());
-        d[ph+48..ph+56].copy_from_slice(&0x1000u64.to_le_bytes());
+        d[ph + 32..ph + 40].copy_from_slice(&fs.to_le_bytes());
+        d[ph + 40..ph + 48].copy_from_slice(&fs.to_le_bytes());
+        d[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes());
         d
     }
-    pub fn valid() { assert_kernel!(ElfLoader::load(&make_elf(0x401000)).is_ok(), "valid elf"); }
+    pub fn valid() {
+        assert_kernel!(ElfLoader::load(&make_elf(0x401000)).is_ok(), "valid elf");
+    }
     pub fn bad_magic() {
         let d = alloc::vec![0u8; 64];
         assert_kernel!(ElfLoader::load(&d).is_err(), "no magic");
     }
     pub fn bad_arch() {
         let mut d = make_elf(0x400000);
-        d[18]=0x28; assert_kernel!(ElfLoader::load(&d).is_err(), "bad arch");
+        d[18] = 0x28;
+        assert_kernel!(ElfLoader::load(&d).is_err(), "bad arch");
     }
-    pub fn short() { assert_kernel!(ElfLoader::load(&[0u8;10]).is_err(), "short data"); }
+    pub fn short() {
+        assert_kernel!(ElfLoader::load(&[0u8; 10]).is_err(), "short data");
+    }
 }
 
 // Property 8: ELF loader rejects malformed binaries.
@@ -814,19 +871,19 @@ mod elf_prop_tests {
 
     // Header field offsets (little-endian on disk), per the ELF64 spec and the
     // exact layout produced by `elf_tests::make_elf`.
-    const EI_CLASS: usize = 4;   // u8  : 2 == ELFCLASS64
-    const EI_DATA: usize = 5;    // u8  : 1 == ELFDATA2LSB
-    const E_TYPE: usize = 16;    // u16 : 2 == ET_EXEC
+    const EI_CLASS: usize = 4; // u8  : 2 == ELFCLASS64
+    const EI_DATA: usize = 5; // u8  : 1 == ELFDATA2LSB
+    const E_TYPE: usize = 16; // u16 : 2 == ET_EXEC
     const E_MACHINE: usize = 18; // u16 : 0x3E == EM_X86_64
     const E_VERSION: usize = 20; // u32 : 1
-    const E_PHOFF: usize = 32;   // u64 : program-header table file offset
+    const E_PHOFF: usize = 32; // u64 : program-header table file offset
 
     // Program-header field offsets *within* the phdr (phdr begins at the end of
     // the ELF header, i.e. at `size_of::<Elf64Header>()`).
-    const P_OFFSET: usize = 8;   // u64 : file offset of segment data
-    const P_VADDR: usize = 16;   // u64 : virtual address of segment
-    const P_FILESZ: usize = 32;  // u64 : bytes of segment in file
-    const P_MEMSZ: usize = 40;   // u64 : bytes of segment in memory
+    const P_OFFSET: usize = 8; // u64 : file offset of segment data
+    const P_VADDR: usize = 16; // u64 : virtual address of segment
+    const P_FILESZ: usize = 32; // u64 : bytes of segment in file
+    const P_MEMSZ: usize = 40; // u64 : bytes of segment in memory
 
     /// Build a valid LE 64-bit ET_EXEC x86_64 ELF with a single PT_LOAD program
     /// header, identical in layout to `elf_tests::make_elf`. Each mutation case
@@ -835,8 +892,15 @@ mod elf_prop_tests {
         let hs = core::mem::size_of::<Elf64Header>();
         let ps = core::mem::size_of::<Elf64ProgramHeader>();
         let mut d = alloc::vec![0u8; hs + ps];
-        d[0] = 0x7F; d[1] = b'E'; d[2] = b'L'; d[3] = b'F'; d[4] = 2; d[5] = 1;
-        d[16] = 2; d[18] = 0x3E; d[20] = 1;
+        d[0] = 0x7F;
+        d[1] = b'E';
+        d[2] = b'L';
+        d[3] = b'F';
+        d[4] = 2;
+        d[5] = 1;
+        d[16] = 2;
+        d[18] = 0x3E;
+        d[20] = 1;
         d[24..32].copy_from_slice(&entry.to_le_bytes());
         let po = hs as u64;
         d[32..40].copy_from_slice(&po.to_le_bytes());
@@ -844,19 +908,21 @@ mod elf_prop_tests {
         d[54..56].copy_from_slice(&pe.to_le_bytes());
         d[56..58].copy_from_slice(&1u16.to_le_bytes());
         let ph = hs;
-        d[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes());       // p_type = PT_LOAD
-        d[ph + 4..ph + 8].copy_from_slice(&7u32.to_le_bytes());   // p_flags = RWX
+        d[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+        d[ph + 4..ph + 8].copy_from_slice(&7u32.to_le_bytes()); // p_flags = RWX
         d[ph + 16..ph + 24].copy_from_slice(&0x400000u64.to_le_bytes()); // p_vaddr
         d[ph + 24..ph + 32].copy_from_slice(&0x400000u64.to_le_bytes()); // p_paddr
         let fs = d.len() as u64;
-        d[ph + 32..ph + 40].copy_from_slice(&fs.to_le_bytes());   // p_filesz
-        d[ph + 40..ph + 48].copy_from_slice(&fs.to_le_bytes());   // p_memsz
+        d[ph + 32..ph + 40].copy_from_slice(&fs.to_le_bytes()); // p_filesz
+        d[ph + 40..ph + 48].copy_from_slice(&fs.to_le_bytes()); // p_memsz
         d[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
         d
     }
 
     /// File offset at which the single program header begins.
-    fn ph_base() -> usize { core::mem::size_of::<Elf64Header>() }
+    fn ph_base() -> usize {
+        core::mem::size_of::<Elf64Header>()
+    }
 
     fn put_u16(d: &mut [u8], off: usize, v: u16) {
         d[off..off + 2].copy_from_slice(&v.to_le_bytes());
@@ -875,7 +941,9 @@ mod elf_prop_tests {
     }
     impl XorShift64 {
         fn new(seed: u64) -> Self {
-            XorShift64 { state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed } }
+            XorShift64 {
+                state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed },
+            }
         }
         fn next(&mut self) -> u64 {
             let mut x = self.state;
@@ -896,7 +964,10 @@ mod elf_prop_tests {
 
         // --- bad magic: zero the whole 4-byte magic --------------------------
         let mut d = make_elf(0x401000);
-        d[0] = 0; d[1] = 0; d[2] = 0; d[3] = 0;
+        d[0] = 0;
+        d[1] = 0;
+        d[2] = 0;
+        d[3] = 0;
         assert_kernel!(ElfLoader::load(&d).is_err(), "rejects zeroed ELF magic");
 
         // --- bad magic: only first byte corrupted ----------------------------
@@ -947,8 +1018,14 @@ mod elf_prop_tests {
         // --- truncated header (buffer shorter than the 64-byte ELF header) ---
         assert_kernel!(ElfLoader::load(&[]).is_err(), "rejects empty buffer");
         assert_kernel!(ElfLoader::load(&[0u8; 1]).is_err(), "rejects 1-byte buffer");
-        assert_kernel!(ElfLoader::load(&[0u8; 16]).is_err(), "rejects 16-byte buffer");
-        assert_kernel!(ElfLoader::load(&[0u8; 63]).is_err(), "rejects 63-byte buffer");
+        assert_kernel!(
+            ElfLoader::load(&[0u8; 16]).is_err(),
+            "rejects 16-byte buffer"
+        );
+        assert_kernel!(
+            ElfLoader::load(&[0u8; 63]).is_err(),
+            "rejects 63-byte buffer"
+        );
         // A truncated copy of an otherwise-valid header is still too short.
         let d = make_elf(0x401000);
         assert_kernel!(
@@ -959,7 +1036,10 @@ mod elf_prop_tests {
         // --- phdr table out of bounds (e_phoff far beyond the buffer) --------
         let mut d = make_elf(0x401000);
         put_u64(&mut d, E_PHOFF, 0xFFFF_FFFF_FFFF_F000);
-        assert_kernel!(ElfLoader::load(&d).is_err(), "rejects phdr table beyond buffer");
+        assert_kernel!(
+            ElfLoader::load(&d).is_err(),
+            "rejects phdr table beyond buffer"
+        );
         // A moderate but still out-of-range offset.
         let mut d = make_elf(0x401000);
         let past = (d.len() as u64) + 4096;
@@ -969,12 +1049,18 @@ mod elf_prop_tests {
         // --- segment file range out of bounds (p_offset + p_filesz > len) ----
         let mut d = make_elf(0x401000);
         put_u64(&mut d, ph + P_FILESZ, 0xFFFF_FFFF); // huge filesz
-        put_u64(&mut d, ph + P_MEMSZ, 0xFFFF_FFFF);  // keep memsz >= filesz
-        assert_kernel!(ElfLoader::load(&d).is_err(), "rejects segment file range past end");
+        put_u64(&mut d, ph + P_MEMSZ, 0xFFFF_FFFF); // keep memsz >= filesz
+        assert_kernel!(
+            ElfLoader::load(&d).is_err(),
+            "rejects segment file range past end"
+        );
         // p_offset itself out of range.
         let mut d = make_elf(0x401000);
         put_u64(&mut d, ph + P_OFFSET, 0xFFFF_FFFF_0000_0000);
-        assert_kernel!(ElfLoader::load(&d).is_err(), "rejects segment file offset overflow");
+        assert_kernel!(
+            ElfLoader::load(&d).is_err(),
+            "rejects segment file offset overflow"
+        );
 
         // --- p_filesz > p_memsz ----------------------------------------------
         let mut d = make_elf(0x401000);
@@ -987,11 +1073,17 @@ mod elf_prop_tests {
         // --- non-canonical / kernel-half vaddr -------------------------------
         let mut d = make_elf(0x401000);
         put_u64(&mut d, ph + P_VADDR, 0xFFFF_8000_0000_0000);
-        assert_kernel!(ElfLoader::load(&d).is_err(), "rejects non-canonical kernel vaddr");
+        assert_kernel!(
+            ElfLoader::load(&d).is_err(),
+            "rejects non-canonical kernel vaddr"
+        );
         // Just at/above the user-address ceiling.
         let mut d = make_elf(0x401000);
         put_u64(&mut d, ph + P_VADDR, 0x0000_8000_0000_0000);
-        assert_kernel!(ElfLoader::load(&d).is_err(), "rejects vaddr at user ceiling");
+        assert_kernel!(
+            ElfLoader::load(&d).is_err(),
+            "rejects vaddr at user ceiling"
+        );
 
         // --- vaddr + memsz overflow (wraps u64) ------------------------------
         let mut d = make_elf(0x401000);
@@ -1030,7 +1122,11 @@ mod elf_prop_tests {
         }
 
         // Reaching here means every fuzz iteration returned without panicking.
-        assert_eq_kernel!(completed, 64, "fuzz: all header mutations ran to completion");
+        assert_eq_kernel!(
+            completed,
+            64,
+            "fuzz: all header mutations ran to completion"
+        );
     }
 }
 
@@ -1051,7 +1147,13 @@ mod log_tests {
 
     pub fn level_filter_monotonicity() {
         let saved = log::level();
-        let levels = [Level::Error, Level::Warn, Level::Info, Level::Debug, Level::Trace];
+        let levels = [
+            Level::Error,
+            Level::Warn,
+            Level::Info,
+            Level::Debug,
+            Level::Trace,
+        ];
 
         for &l in levels.iter() {
             log::set_level(l);
@@ -1073,22 +1175,53 @@ mod log_tests {
 mod vfs_tests {
     use crate::vfs::VfsNode;
     struct Null;
-    impl VfsNode for Null { fn name(&self)->&str{"null"} fn is_directory(&self)->bool{false} fn read(&self,_:u64,_:&mut[u8])->crate::vfs::VfsResult<usize>{Ok(0)} fn write(&self,_:u64,b:&[u8])->crate::vfs::VfsResult<usize>{Ok(b.len())} }
-    pub fn read_zero() { assert_eq_kernel!(Null.read(0,&mut[0u8;16]).unwrap(),0,"null read 0"); }
-    pub fn write_all() { assert_eq_kernel!(Null.write(0,&[1,2,3]).unwrap(),3,"null write"); }
-    pub fn not_dir() { assert_kernel!(!Null.is_directory(),"not dir"); }
-    pub fn readdir_err() { assert_kernel!(Null.readdir().is_err(),"no readdir"); }
+    impl VfsNode for Null {
+        fn name(&self) -> &str {
+            "null"
+        }
+        fn is_directory(&self) -> bool {
+            false
+        }
+        fn read(&self, _: u64, _: &mut [u8]) -> crate::vfs::VfsResult<usize> {
+            Ok(0)
+        }
+        fn write(&self, _: u64, b: &[u8]) -> crate::vfs::VfsResult<usize> {
+            Ok(b.len())
+        }
+    }
+    pub fn read_zero() {
+        assert_eq_kernel!(Null.read(0, &mut [0u8; 16]).unwrap(), 0, "null read 0");
+    }
+    pub fn write_all() {
+        assert_eq_kernel!(Null.write(0, &[1, 2, 3]).unwrap(), 3, "null write");
+    }
+    pub fn not_dir() {
+        assert_kernel!(!Null.is_directory(), "not dir");
+    }
+    pub fn readdir_err() {
+        assert_kernel!(Null.readdir().is_err(), "no readdir");
+    }
 }
 
 mod integration {
-    use crate::task::scheduler::{self,Tcb};
-    pub fn empty_initially() { assert_kernel!(scheduler::schedule().is_none(),"empty init"); }
+    use crate::task::scheduler::{self, Tcb};
+    pub fn empty_initially() {
+        assert_kernel!(scheduler::schedule().is_none(), "empty init");
+    }
     pub fn spawn_sched() {
         let p = scheduler::next_pid();
         scheduler::spawn(Tcb::new(p, 0xDEAD, 0));
-        assert_eq_kernel!(scheduler::schedule().unwrap().kernel_rsp, 0xDEAD, "kernel_rsp match");
+        assert_eq_kernel!(
+            scheduler::schedule().unwrap().kernel_rsp,
+            0xDEAD,
+            "kernel_rsp match"
+        );
     }
-    pub fn tick_inc() { let t0=scheduler::ticks(); scheduler::tick(); assert_kernel!(scheduler::ticks()>t0,"tick++"); }
+    pub fn tick_inc() {
+        let t0 = scheduler::ticks();
+        scheduler::tick();
+        assert_kernel!(scheduler::ticks() > t0, "tick++");
+    }
 }
 
 // Property 7: Scheduler context-switch register layout symmetry.
@@ -1132,9 +1265,9 @@ mod scheduler_layout_tests {
     // ── Word indices, mirroring `kernel_thread_spawn`'s documented layout ───
     //   index = byte_offset / 8 (offsets are from the final kernel_rsp).
     const IDX_POPFQ: usize = 0; // [+0]   RFLAGS consumed by `popfq`
-    // 15 GPR pops, r15 first (lowest addr) … rax last (highest addr):
-    //   r15=1, r14=2, r13=3, r12=4, r11=5, r10=6, r9=7, r8=8, rbp=9,
-    //   rdi=10, rsi=11, rdx=12, rcx=13, rbx=14, rax=15
+                                // 15 GPR pops, r15 first (lowest addr) … rax last (highest addr):
+                                //   r15=1, r14=2, r13=3, r12=4, r11=5, r10=6, r9=7, r8=8, rbp=9,
+                                //   rdi=10, rsi=11, rdx=12, rcx=13, rbx=14, rax=15
     const IDX_RDI: usize = 10; // [+80]  rdi slot — MUST hold `entry`
     const IDX_RIP: usize = 16; // [+128] RIP slot — MUST hold the trampoline
 
@@ -1271,7 +1404,9 @@ mod virtio_blk_tests {
     }
     impl XorShift64 {
         fn new(seed: u64) -> Self {
-            XorShift64 { state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed } }
+            XorShift64 {
+                state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed },
+            }
         }
         fn next(&mut self) -> u64 {
             let mut x = self.state;
@@ -1322,7 +1457,10 @@ mod virtio_blk_tests {
             dev.read_block(SCRATCH_A, &mut readback) == Ok(SECTOR),
             "virtio-blk: read returns byte count"
         );
-        assert_kernel!(readback == pattern, "virtio-blk: read-back equals written pattern");
+        assert_kernel!(
+            readback == pattern,
+            "virtio-blk: read-back equals written pattern"
+        );
 
         // Restore the original contents and confirm the restore.
         assert_kernel!(
@@ -1331,7 +1469,10 @@ mod virtio_blk_tests {
         );
         let mut restored = [0u8; SECTOR];
         let _ = dev.read_block(SCRATCH_A, &mut restored);
-        assert_kernel!(restored == orig, "virtio-blk: original restored (non-destructive)");
+        assert_kernel!(
+            restored == orig,
+            "virtio-blk: original restored (non-destructive)"
+        );
     }
 
     /// Property 14: randomized block read/write round-trip over a scratch
@@ -1349,7 +1490,10 @@ mod virtio_blk_tests {
 
         let mut orig = [0u8; SECTOR];
         if dev.read_block(SCRATCH_A, &mut orig).is_err() {
-            assert_kernel!(true, "virtio-blk: scratch out of range, Property 14 skipped");
+            assert_kernel!(
+                true,
+                "virtio-blk: scratch out of range, Property 14 skipped"
+            );
             return;
         }
 
@@ -1374,7 +1518,10 @@ mod virtio_blk_tests {
                 dev.read_block(SCRATCH_A, &mut readback) == Ok(SECTOR),
                 "Property 14: read returns byte count"
             );
-            assert_kernel!(readback == pattern, "Property 14: round-trip preserves bytes");
+            assert_kernel!(
+                readback == pattern,
+                "Property 14: round-trip preserves bytes"
+            );
         }
 
         // Non-destructive restore.
@@ -1402,7 +1549,10 @@ mod virtio_blk_tests {
         let mut origs = [[0u8; SECTOR]; 3];
         for (k, &s) in sectors.iter().enumerate() {
             if dev.read_block(s, &mut origs[k]).is_err() {
-                assert_kernel!(true, "virtio-blk: scratch out of range, Property 16 skipped");
+                assert_kernel!(
+                    true,
+                    "virtio-blk: scratch out of range, Property 16 skipped"
+                );
                 return;
             }
         }
@@ -1418,7 +1568,9 @@ mod virtio_blk_tests {
             for k in 0..3 {
                 let mut s = rng.next();
                 for b in pats[k].iter_mut() {
-                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     *b = (s >> 33) as u8;
                 }
                 // Guarantee the three patterns are distinct so any aliasing is
@@ -1613,7 +1765,9 @@ mod fs_prop_tests {
     }
     impl XorShift64 {
         fn new(seed: u64) -> Self {
-            XorShift64 { state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed } }
+            XorShift64 {
+                state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed },
+            }
         }
         fn next(&mut self) -> u64 {
             let mut x = self.state;
@@ -1638,7 +1792,11 @@ mod fs_prop_tests {
 
     /// CRC32 known-answer correctness (Task 4.2).
     pub fn crc32_known_answer() {
-        assert_eq_kernel!(structs::crc32(b"123456789"), 0xCBF4_3926, "crc32 KAT 123456789");
+        assert_eq_kernel!(
+            structs::crc32(b"123456789"),
+            0xCBF4_3926,
+            "crc32 KAT 123456789"
+        );
         assert_eq_kernel!(structs::crc32(b""), 0x0000_0000, "crc32 of empty input");
     }
 
@@ -1697,8 +1855,10 @@ mod fs_prop_tests {
             // Random pre/post state for each target block (distinct seeds so the
             // post-state genuinely differs from the pre-state).
             let pre: Vec<Vec<u8>> = targets.iter().map(|_| filled(rng.next() as u32)).collect();
-            let post: Vec<Vec<u8>> =
-                targets.iter().map(|_| filled(rng.next() as u32 ^ 0xA5A5_5A5A)).collect();
+            let post: Vec<Vec<u8>> = targets
+                .iter()
+                .map(|_| filled(rng.next() as u32 ^ 0xA5A5_5A5A))
+                .collect();
             for (i, &t) in targets.iter().enumerate() {
                 dev.poke_block(t, &pre[i]);
             }
@@ -1751,8 +1911,10 @@ mod fs_prop_tests {
             let (dev, area) = make_journal(fs_blocks, log_blocks);
 
             let pre: Vec<Vec<u8>> = targets.iter().map(|_| filled(rng.next() as u32)).collect();
-            let post: Vec<Vec<u8>> =
-                targets.iter().map(|_| filled(rng.next() as u32 ^ 0x5A5A_A5A5)).collect();
+            let post: Vec<Vec<u8>> = targets
+                .iter()
+                .map(|_| filled(rng.next() as u32 ^ 0x5A5A_A5A5))
+                .collect();
             for (i, &t) in targets.iter().enumerate() {
                 dev.poke_block(t, &pre[i]);
             }
@@ -1799,8 +1961,10 @@ mod fs_prop_tests {
 
             let (dev, area) = make_journal(fs_blocks, log_blocks);
             let pre: Vec<Vec<u8>> = targets.iter().map(|_| filled(rng.next() as u32)).collect();
-            let post: Vec<Vec<u8>> =
-                targets.iter().map(|_| filled(rng.next() as u32 ^ 0x33CC_CC33)).collect();
+            let post: Vec<Vec<u8>> = targets
+                .iter()
+                .map(|_| filled(rng.next() as u32 ^ 0x33CC_CC33))
+                .collect();
             for (i, &t) in targets.iter().enumerate() {
                 dev.poke_block(t, &pre[i]);
             }
@@ -1827,7 +1991,10 @@ mod fs_prop_tests {
             let after_twice: Vec<Vec<u8>> = targets.iter().map(|&t| dev.peek_block(t)).collect();
 
             for i in 0..targets.len() {
-                assert_kernel!(after_once[i] == post[i], "P12: first recover reaches post-state");
+                assert_kernel!(
+                    after_once[i] == post[i],
+                    "P12: first recover reaches post-state"
+                );
                 assert_kernel!(
                     after_once[i] == after_twice[i],
                     "P12: recover twice == recover once (idempotent)"
@@ -1858,8 +2025,10 @@ mod fs_prop_tests {
 
             let (dev, area) = make_journal(fs_blocks, log_blocks);
             let pre: Vec<Vec<u8>> = targets.iter().map(|_| filled(rng.next() as u32)).collect();
-            let post: Vec<Vec<u8>> =
-                targets.iter().map(|_| filled(rng.next() as u32 ^ 0x0F0F_F0F0)).collect();
+            let post: Vec<Vec<u8>> = targets
+                .iter()
+                .map(|_| filled(rng.next() as u32 ^ 0x0F0F_F0F0))
+                .collect();
             for (i, &t) in targets.iter().enumerate() {
                 dev.poke_block(t, &pre[i]);
             }
@@ -1921,7 +2090,9 @@ mod fs_prop_tests {
 
         // write -> read back (small, single direct block).
         let content = b"hi there from the pagh ext2 + WAL journal layer";
-        let ino = fs.create(root_ino, "hello.txt", false).expect("create file");
+        let ino = fs
+            .create(root_ino, "hello.txt", false)
+            .expect("create file");
         let n = fs.write_file(ino, 0, content).expect("write");
         assert_eq_kernel!(n, content.len(), "P18: write returns full byte count");
         let mut buf = vec![0u8; content.len()];
@@ -1942,14 +2113,21 @@ mod fs_prop_tests {
         let node = root.lookup("hello.txt").expect("vfs lookup");
         let mut vbuf = vec![0u8; content.len()];
         let vn = node.read(0, &mut vbuf).expect("vfs read");
-        assert_kernel!(vn == content.len() && vbuf == content, "P18: VFS read round-trips");
+        assert_kernel!(
+            vn == content.len() && vbuf == content,
+            "P18: VFS read round-trips"
+        );
 
         // nano save primitive: truncate frees old content, then a shorter rewrite
         // has the exact new size with no stale suffix.
         node.truncate(0).expect("vfs truncate");
         assert_eq_kernel!(node.size(), 0, "P18: truncate resets size");
         let mut empty_probe = [0u8; 8];
-        assert_eq_kernel!(node.read(0, &mut empty_probe).expect("read truncated"), 0, "P18: truncated file reads EOF");
+        assert_eq_kernel!(
+            node.read(0, &mut empty_probe).expect("read truncated"),
+            0,
+            "P18: truncated file reads EOF"
+        );
         node.write(0, b"nano").expect("rewrite after truncate");
         assert_eq_kernel!(node.size(), 4, "P18: shorter rewrite has exact size");
 
@@ -1994,15 +2172,25 @@ mod fs_prop_tests {
             let mut content = vec![0u8; size];
             let mut s = rng.next();
             for b in content.iter_mut() {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 *b = (s >> 33) as u8;
             }
             let rino = fs.create(root_ino, &name, false).expect("create rt");
             let wn = fs.write_file(rino, 0, &content).expect("write rt");
-            assert_eq_kernel!(wn, content.len(), "P18: randomized write returns full byte count");
+            assert_eq_kernel!(
+                wn,
+                content.len(),
+                "P18: randomized write returns full byte count"
+            );
             let mut rbuf = vec![0u8; content.len()];
             let rn = fs.read_file(rino, 0, &mut rbuf).expect("read rt");
-            assert_eq_kernel!(rn, content.len(), "P18: randomized read returns full byte count");
+            assert_eq_kernel!(
+                rn,
+                content.len(),
+                "P18: randomized read returns full byte count"
+            );
             assert_kernel!(rbuf == content, "P18: randomized file round-trips");
             fs.unlink(root_ino, &name).expect("unlink rt");
         }
@@ -2010,9 +2198,15 @@ mod fs_prop_tests {
         // Remount: the journaled state persists across a fresh mount.
         let fs2 = Ext2Fs::mount_fs(dev.clone()).expect("remount");
         let mut rb2 = vec![0u8; big.len()];
-        let bino2 = fs2.lookup_entry(root_ino, "big.bin").expect("lookup big after remount");
-        fs2.read_file(bino2, 0, &mut rb2).expect("read big after remount");
-        assert_kernel!(rb2 == big, "P18: data survives a remount (journal checkpointed)");
+        let bino2 = fs2
+            .lookup_entry(root_ino, "big.bin")
+            .expect("lookup big after remount");
+        fs2.read_file(bino2, 0, &mut rb2)
+            .expect("read big after remount");
+        assert_kernel!(
+            rb2 == big,
+            "P18: data survives a remount (journal checkpointed)"
+        );
     }
 
     /// Property 19: ext2 directory entry rec_len/name_len round-trip and the
@@ -2125,14 +2319,18 @@ mod fs_prop_tests {
             );
 
             // Group-descriptor free counts agree with the bitmaps.
-            let bbm = fs.read_fs_block(gd.bg_block_bitmap as u64).expect("block bitmap");
+            let bbm = fs
+                .read_fs_block(gd.bg_block_bitmap as u64)
+                .expect("block bitmap");
             let used_blocks = ext2alloc::count_set_bits(&bbm, sb.s_blocks_count);
             assert_eq_kernel!(
                 gd.bg_free_blocks_count as u32,
                 sb.s_blocks_count - used_blocks,
                 "P20: bg_free_blocks_count agrees with the block bitmap"
             );
-            let ibm = fs.read_fs_block(gd.bg_inode_bitmap as u64).expect("inode bitmap");
+            let ibm = fs
+                .read_fs_block(gd.bg_inode_bitmap as u64)
+                .expect("inode bitmap");
             let used_inodes = ext2alloc::count_set_bits(&ibm, sb.s_inodes_count);
             assert_eq_kernel!(
                 gd.bg_free_inodes_count as u32,
@@ -2207,12 +2405,18 @@ mod fs_real_device_tests {
         let mut buf = vec![0u8; content.len()];
         let r = file.read(0, &mut buf).unwrap_or(0);
         assert_eq_kernel!(r, content.len(), "P18(real): read returns full byte count");
-        assert_kernel!(buf == content, "P18(real): file read-back equals written content");
+        assert_kernel!(
+            buf == content,
+            "P18(real): file read-back equals written content"
+        );
 
         // Remove to restore the filesystem to its prior state.
         let removed = root.remove(name).is_ok();
         assert_kernel!(removed, "P18(real): temp file removed");
-        assert_kernel!(root.lookup(name).is_err(), "P18(real): removed file is gone");
+        assert_kernel!(
+            root.lookup(name).is_err(),
+            "P18(real): removed file is gone"
+        );
     }
 }
 
@@ -2248,7 +2452,9 @@ mod net_phy_prop_tests {
     }
     impl XorShift64 {
         fn new(seed: u64) -> Self {
-            XorShift64 { state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed } }
+            XorShift64 {
+                state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed },
+            }
         }
         fn next(&mut self) -> u64 {
             let mut x = self.state;
@@ -2277,7 +2483,10 @@ mod net_phy_prop_tests {
         fn new() -> Self {
             // All buffers armed and empty initially (mirrors `VirtIONet::new`
             // pre-arming every RX buffer).
-            ModelNic { slots: [Some(SENTINEL_FREE); QUEUE_SIZE], next_id: 1 }
+            ModelNic {
+                slots: [Some(SENTINEL_FREE); QUEUE_SIZE],
+                next_id: 1,
+            }
         }
 
         /// Simulate one frame arriving: fill the first armed-empty buffer.
@@ -2297,7 +2506,9 @@ mod net_phy_prop_tests {
 
         /// `can_recv`: is any armed buffer holding a real frame?
         fn can_recv(&self) -> bool {
-            self.slots.iter().any(|s| matches!(*s, Some(id) if id != SENTINEL_FREE))
+            self.slots
+                .iter()
+                .any(|s| matches!(*s, Some(id) if id != SENTINEL_FREE))
         }
 
         /// `receive()`: pop the armed buffer holding the smallest frame id
@@ -2386,7 +2597,10 @@ mod net_phy_prop_tests {
                     break;
                 }
             }
-            assert_kernel!(ok_order, "P17: frames delivered exactly once in arrival order");
+            assert_kernel!(
+                ok_order,
+                "P17: frames delivered exactly once in arrival order"
+            );
         }
     }
 }
@@ -2396,29 +2610,65 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         ("pmm::total_frames > 0", pmm_tests::total_frames),
         ("pmm::alloc+free cycle", pmm_tests::alloc_free),
         ("pmm::8x alloc+free", pmm_tests::alloc_many),
-        ("pmm::alloc/free round-trip conserves count", pmm_prop_tests::round_trip_conserves_count),
-        ("pmm::never allocates reserved (<1MB, aligned)", pmm_prop_tests::never_allocates_reserved),
-        ("pmm::contiguous alloc non-overlapping (Property 15)", pmm_contig_prop_tests::contiguous_alloc_non_overlapping),
-        ("vmm::map/translate/unmap consistency", vmm_prop_tests::map_translate_unmap_consistency),
-        ("vmm::USER_ACCESSIBLE propagates to intermediates", vmm_prop_tests::user_accessible_propagates_to_intermediates),
-        ("heap::allocations non-overlapping and aligned", heap_prop_tests::allocations_non_overlapping_and_aligned),
+        (
+            "pmm::alloc/free round-trip conserves count",
+            pmm_prop_tests::round_trip_conserves_count
+        ),
+        (
+            "pmm::never allocates reserved (<1MB, aligned)",
+            pmm_prop_tests::never_allocates_reserved
+        ),
+        (
+            "pmm::contiguous alloc non-overlapping (Property 15)",
+            pmm_contig_prop_tests::contiguous_alloc_non_overlapping
+        ),
+        (
+            "vmm::map/translate/unmap consistency",
+            vmm_prop_tests::map_translate_unmap_consistency
+        ),
+        (
+            "vmm::USER_ACCESSIBLE propagates to intermediates",
+            vmm_prop_tests::user_accessible_propagates_to_intermediates
+        ),
+        (
+            "heap::allocations non-overlapping and aligned",
+            heap_prop_tests::allocations_non_overlapping_and_aligned
+        ),
         ("spinlock::lock+unlock", spinlock_tests::lock_unlock),
         ("spinlock::try_lock", spinlock_tests::try_lock),
         ("spinlock::mutate", spinlock_tests::mutate),
-        ("spinlock::irq restore (disabled)", spinlock_irq_tests::irq_restore_when_disabled),
-        ("spinlock::irq restore (enabled)", spinlock_irq_tests::irq_restore_when_enabled),
+        (
+            "spinlock::irq restore (disabled)",
+            spinlock_irq_tests::irq_restore_when_disabled
+        ),
+        (
+            "spinlock::irq restore (enabled)",
+            spinlock_irq_tests::irq_restore_when_enabled
+        ),
         ("scheduler::pid++", scheduler_tests::pid_inc),
         ("scheduler::spawn+schedule", scheduler_tests::spawn_sched),
         ("scheduler::empty queue", scheduler_tests::empty_queue),
         ("scheduler::tick", scheduler_tests::tick_works),
-        ("scheduler::context-switch layout symmetry (Property 7)", scheduler_layout_tests::context_switch_layout_symmetry),
+        (
+            "scheduler::context-switch layout symmetry (Property 7)",
+            scheduler_layout_tests::context_switch_layout_symmetry
+        ),
         ("elf::valid", elf_tests::valid),
         ("elf::bad magic", elf_tests::bad_magic),
         ("elf::bad arch", elf_tests::bad_arch),
         ("elf::short data", elf_tests::short),
-        ("elf::rejects malformed (Property 8)", elf_prop_tests::rejects_malformed),
-        ("elf::fuzz header no panic (Property 8)", elf_prop_tests::fuzz_header_no_panic),
-        ("log::level filter monotonicity", log_tests::level_filter_monotonicity),
+        (
+            "elf::rejects malformed (Property 8)",
+            elf_prop_tests::rejects_malformed
+        ),
+        (
+            "elf::fuzz header no panic (Property 8)",
+            elf_prop_tests::fuzz_header_no_panic
+        ),
+        (
+            "log::level filter monotonicity",
+            log_tests::level_filter_monotonicity
+        ),
         ("vfs::null read 0", vfs_tests::read_zero),
         ("vfs::null write all", vfs_tests::write_all),
         ("vfs::null not dir", vfs_tests::not_dir),
@@ -2426,30 +2676,96 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         ("integration::empty initially", integration::empty_initially),
         ("integration::spawn+sched", integration::spawn_sched),
         ("integration::tick++", integration::tick_inc),
-        ("virtio-blk::round-trip self-test", virtio_blk_tests::round_trip_self_test),
-        ("virtio-blk::block read/write round-trip (Property 14)", virtio_blk_tests::block_round_trip),
-        ("virtio-blk::virtqueue buffers not aliased (Property 16)", virtio_blk_tests::virtqueue_buffers_not_aliased),
+        (
+            "virtio-blk::round-trip self-test",
+            virtio_blk_tests::round_trip_self_test
+        ),
+        (
+            "virtio-blk::block read/write round-trip (Property 14)",
+            virtio_blk_tests::block_round_trip
+        ),
+        (
+            "virtio-blk::virtqueue buffers not aliased (Property 16)",
+            virtio_blk_tests::virtqueue_buffers_not_aliased
+        ),
         ("fs::crc32 known-answer", fs_prop_tests::crc32_known_answer),
-        ("fs::journal replay reaches committed post-state (Property 10)", fs_prop_tests::p10_replay_committed_post_state),
-        ("fs::journal uncommitted leaves pre-state (Property 11)", fs_prop_tests::p11_uncommitted_leaves_pre_state),
-        ("fs::journal replay idempotence (Property 12)", fs_prop_tests::p12_replay_idempotence),
-        ("fs::journal corruption detected (Property 13)", fs_prop_tests::p13_corruption_detected),
-        ("fs::ext2 operation round-trip (Property 18)", fs_prop_tests::p18_fs_op_round_trip),
-        ("fs::ext2 dir entry rec_len/tiling (Property 19)", fs_prop_tests::p19_dir_entry_roundtrip_and_tiling),
-        ("fs::ext2 formatted superblock valid (Property 20)", fs_prop_tests::p20_formatted_superblock_valid),
-        ("fs::ext2 operation round-trip on real device (Property 18)", fs_real_device_tests::p18_fs_op_round_trip_real_device),
-        ("net::phy poll preserves frames (Property 17)", net_phy_prop_tests::p17_poll_preserves_frames),
+        (
+            "fs::journal replay reaches committed post-state (Property 10)",
+            fs_prop_tests::p10_replay_committed_post_state
+        ),
+        (
+            "fs::journal uncommitted leaves pre-state (Property 11)",
+            fs_prop_tests::p11_uncommitted_leaves_pre_state
+        ),
+        (
+            "fs::journal replay idempotence (Property 12)",
+            fs_prop_tests::p12_replay_idempotence
+        ),
+        (
+            "fs::journal corruption detected (Property 13)",
+            fs_prop_tests::p13_corruption_detected
+        ),
+        (
+            "fs::ext2 operation round-trip (Property 18)",
+            fs_prop_tests::p18_fs_op_round_trip
+        ),
+        (
+            "fs::ext2 dir entry rec_len/tiling (Property 19)",
+            fs_prop_tests::p19_dir_entry_roundtrip_and_tiling
+        ),
+        (
+            "fs::ext2 formatted superblock valid (Property 20)",
+            fs_prop_tests::p20_formatted_superblock_valid
+        ),
+        (
+            "fs::ext2 operation round-trip on real device (Property 18)",
+            fs_real_device_tests::p18_fs_op_round_trip_real_device
+        ),
+        (
+            "net::phy poll preserves frames (Property 17)",
+            net_phy_prop_tests::p17_poll_preserves_frames
+        ),
         // user-friendly-shell: pure-logic properties P21–P27 + unit checks.
-        ("shell::path normalization canonical+idempotent (Property 21)", shell_prop_tests::p21_path_normalization_canonical),
-        ("shell::line-editor buffer/cursor invariants (Property 22)", shell_prop_tests::p22_line_editor_invariants),
-        ("shell::history recall round-trip+bounded+dedup (Property 23)", shell_prop_tests::p23_history_recall_roundtrip),
-        ("shell::completion LCP + matching candidates (Property 24)", shell_prop_tests::p24_completion_lcp),
-        ("shell::decoder extended scancodes -> nav, never Char (Property 25)", shell_prop_tests::p25_decoder_extended_scancodes),
-        ("shell::nearest_command picks true nearest (Property 26)", shell_prop_tests::p26_nearest_command),
-        ("shell::decoder+editor never panic on arbitrary input (Property 27)", shell_prop_tests::p27_decoder_editor_never_panic),
-        ("shell::registry lookup + help enumeration (unit)", shell_prop_tests::unit_registry_lookup_and_help),
-        ("shell::render color palette mapping (unit)", shell_prop_tests::unit_render_color_palette),
-        ("shell::path/listing format behaviors (unit)", shell_prop_tests::unit_path_and_listing_format),
+        (
+            "shell::path normalization canonical+idempotent (Property 21)",
+            shell_prop_tests::p21_path_normalization_canonical
+        ),
+        (
+            "shell::line-editor buffer/cursor invariants (Property 22)",
+            shell_prop_tests::p22_line_editor_invariants
+        ),
+        (
+            "shell::history recall round-trip+bounded+dedup (Property 23)",
+            shell_prop_tests::p23_history_recall_roundtrip
+        ),
+        (
+            "shell::completion LCP + matching candidates (Property 24)",
+            shell_prop_tests::p24_completion_lcp
+        ),
+        (
+            "shell::decoder extended scancodes -> nav, never Char (Property 25)",
+            shell_prop_tests::p25_decoder_extended_scancodes
+        ),
+        (
+            "shell::nearest_command picks true nearest (Property 26)",
+            shell_prop_tests::p26_nearest_command
+        ),
+        (
+            "shell::decoder+editor never panic on arbitrary input (Property 27)",
+            shell_prop_tests::p27_decoder_editor_never_panic
+        ),
+        (
+            "shell::registry lookup + help enumeration (unit)",
+            shell_prop_tests::unit_registry_lookup_and_help
+        ),
+        (
+            "shell::render color palette mapping (unit)",
+            shell_prop_tests::unit_render_color_palette
+        ),
+        (
+            "shell::path/listing format behaviors (unit)",
+            shell_prop_tests::unit_path_and_listing_format
+        ),
     ]
 }
 
@@ -2574,8 +2890,7 @@ mod shell_prop_tests {
 
     /// Character alphabet for the line editor, including multi-byte UTF-8 so the
     /// char/byte-index invariants are exercised (R11.6).
-    const EDIT_CHARS: [char; 12] =
-        ['a', 'b', 'c', '1', ' ', '/', '.', '_', 'é', 'λ', '你', '🦀'];
+    const EDIT_CHARS: [char; 12] = ['a', 'b', 'c', '1', ' ', '/', '.', '_', 'é', 'λ', '你', '🦀'];
 
     fn gen_char(rng: &mut XorShift64) -> char {
         EDIT_CHARS[rng.below(EDIT_CHARS.len())]
@@ -2624,7 +2939,10 @@ mod shell_prop_tests {
         let buf = ed.buffer();
         let char_count = buf.chars().count();
         assert_kernel!(ed.cursor() <= char_count, "editor: cursor <= char count");
-        assert_kernel!(buf.len() <= MAX_CMD_LEN, "editor: byte length <= MAX_CMD_LEN");
+        assert_kernel!(
+            buf.len() <= MAX_CMD_LEN,
+            "editor: byte length <= MAX_CMD_LEN"
+        );
         // The byte length must land on a UTF-8 char boundary (it always does for
         // a String; asserts the buffer was never truncated mid-character).
         assert_kernel!(
@@ -2838,13 +3156,15 @@ mod shell_prop_tests {
             if !cand_refs.is_empty() {
                 let lcp = complete::longest_common_prefix(&cand_refs);
                 for c in &cand_refs {
-                    assert_kernel!(c.starts_with(&lcp), "P24: LCP is a prefix of every candidate");
+                    assert_kernel!(
+                        c.starts_with(&lcp),
+                        "P24: LCP is a prefix of every candidate"
+                    );
                 }
                 // Maximal: not all candidates share the same char just past the
                 // LCP (else it could be extended).
                 let p = lcp.chars().count();
-                let next: Vec<Option<char>> =
-                    cand_refs.iter().map(|c| c.chars().nth(p)).collect();
+                let next: Vec<Option<char>> = cand_refs.iter().map(|c| c.chars().nth(p)).collect();
                 let all_same_next = next.iter().all(|n| n.is_some() && *n == next[0]);
                 assert_kernel!(!all_same_next, "P24: LCP is maximal (cannot be extended)");
             }
@@ -2864,7 +3184,10 @@ mod shell_prop_tests {
                         .filter(|c| c.starts_with(segment.as_str()))
                         .collect();
                     assert_kernel!(matches.len() == 1, "P24: Single implies exactly one match");
-                    assert_kernel!(s == *matches[0], "P24: Single carries the matched candidate");
+                    assert_kernel!(
+                        s == *matches[0],
+                        "P24: Single carries the matched candidate"
+                    );
                     assert_kernel!(
                         s.starts_with(segment.as_str()),
                         "P24: Single candidate starts with the typed segment"
@@ -2881,7 +3204,10 @@ mod shell_prop_tests {
                             c.starts_with(segment.as_str()),
                             "P24: every Multiple candidate starts with the segment"
                         );
-                        assert_kernel!(c.starts_with(&lcp), "P24: lcp is a prefix of each candidate");
+                        assert_kernel!(
+                            c.starts_with(&lcp),
+                            "P24: lcp is a prefix of each candidate"
+                        );
                     }
                 }
             }
@@ -2900,10 +3226,16 @@ mod shell_prop_tests {
             match complete::complete_command(prefix) {
                 complete::Completion::None => {}
                 complete::Completion::Single(s) => {
-                    assert_kernel!(s.starts_with(prefix), "P24: command Single starts with prefix");
+                    assert_kernel!(
+                        s.starts_with(prefix),
+                        "P24: command Single starts with prefix"
+                    );
                 }
                 complete::Completion::Multiple { lcp, candidates } => {
-                    assert_kernel!(lcp.starts_with(prefix), "P24: command lcp starts with prefix");
+                    assert_kernel!(
+                        lcp.starts_with(prefix),
+                        "P24: command lcp starts with prefix"
+                    );
                     for c in &candidates {
                         assert_kernel!(
                             c.starts_with(prefix),
@@ -2943,16 +3275,25 @@ mod shell_prop_tests {
         // Ctrl-modified printable keys become explicit shortcuts.
         let mut ctrl = keys::Decoder::new();
         assert_kernel!(ctrl.feed(0x1D).is_none(), "P25: Ctrl make is state only");
-        assert_kernel!(ctrl.feed(0x1F) == Some(keys::KeyEvent::Ctrl('s')), "P25: Ctrl-S shortcut");
+        assert_kernel!(
+            ctrl.feed(0x1F) == Some(keys::KeyEvent::Ctrl('s')),
+            "P25: Ctrl-S shortcut"
+        );
         assert_kernel!(ctrl.feed(0x9D).is_none(), "P25: Ctrl break is state only");
 
         for _ in 0..150 {
             // 1) Random supported extended make-code decodes to its nav event.
             let (code, expected) = supported[rng.below(supported.len())];
             let mut dec = keys::Decoder::new();
-            assert_kernel!(dec.feed(0xE0).is_none(), "P25: standalone 0xE0 yields no event");
+            assert_kernel!(
+                dec.feed(0xE0).is_none(),
+                "P25: standalone 0xE0 yields no event"
+            );
             let ev = dec.feed(code);
-            assert_kernel!(ev == Some(expected), "P25: extended make-code decodes to nav key");
+            assert_kernel!(
+                ev == Some(expected),
+                "P25: extended make-code decodes to nav key"
+            );
             assert_kernel!(
                 !matches!(ev, Some(keys::KeyEvent::Char(_))),
                 "P25: extended make-code never yields Char"
@@ -2962,7 +3303,10 @@ mod shell_prop_tests {
             let mut dec2 = keys::Decoder::new();
             let _ = dec2.feed(0xE0);
             let brk = 0x80u8 | (rng.next() as u8 & 0x7F);
-            assert_kernel!(dec2.feed(brk).is_none(), "P25: extended break code yields no event");
+            assert_kernel!(
+                dec2.feed(brk).is_none(),
+                "P25: extended break code yields no event"
+            );
 
             // 3) Fuzz: 0xE0 followed by ANY byte never yields a Char.
             let mut dec3 = keys::Decoder::new();
@@ -3086,11 +3430,20 @@ mod shell_prop_tests {
         // Every listed name is looked up to a spec whose name matches (so
         // `help <cmd>` resolves to its usage/description).
         for (i, name) in names.iter().enumerate() {
-            assert_kernel!(*name == registry::COMMANDS[i].name, "registry: names in table order");
+            assert_kernel!(
+                *name == registry::COMMANDS[i].name,
+                "registry: names in table order"
+            );
             match registry::lookup(name) {
                 Some(spec) => {
-                    assert_kernel!(spec.name == *name, "registry: lookup returns the matching spec");
-                    assert_kernel!(!spec.description.is_empty(), "registry: spec has a description");
+                    assert_kernel!(
+                        spec.name == *name,
+                        "registry: lookup returns the matching spec"
+                    );
+                    assert_kernel!(
+                        !spec.description.is_empty(),
+                        "registry: spec has a description"
+                    );
                     assert_kernel!(!spec.usage.is_empty(), "registry: spec has a usage string");
                 }
                 None => assert_kernel!(false, "registry: every listed name is found by lookup"),
@@ -3116,7 +3469,10 @@ mod shell_prop_tests {
     /// the default foreground color stays 0xFFFFFF (R8.6). We assert the pure
     /// color mapping only — never actual framebuffer pixels (no hardware).
     pub fn unit_render_color_palette() {
-        assert_kernel!(render::COLOR_DEFAULT == 0xFFFFFF, "render: default color is 0xFFFFFF");
+        assert_kernel!(
+            render::COLOR_DEFAULT == 0xFFFFFF,
+            "render: default color is 0xFFFFFF"
+        );
         assert_kernel!(
             render::Style::Default.color() == 0xFFFFFF,
             "render: Style::Default maps to 0xFFFFFF"
@@ -3159,18 +3515,42 @@ mod shell_prop_tests {
     pub fn unit_path_and_listing_format() {
         // Absolute folding of '.' and '..'.
         assert_kernel!(path::normalize("/a/./b") == "/a/b", "path: '.' folds away");
-        assert_kernel!(path::normalize("/a/b/..") == "/a", "path: '..' pops a component");
-        assert_kernel!(path::normalize("/a//b") == "/a/b", "path: duplicate '/' collapses");
-        assert_kernel!(path::normalize("/a/b/") == "/a/b", "path: trailing '/' dropped");
+        assert_kernel!(
+            path::normalize("/a/b/..") == "/a",
+            "path: '..' pops a component"
+        );
+        assert_kernel!(
+            path::normalize("/a//b") == "/a/b",
+            "path: duplicate '/' collapses"
+        );
+        assert_kernel!(
+            path::normalize("/a/b/") == "/a/b",
+            "path: trailing '/' dropped"
+        );
         assert_kernel!(path::normalize("") == "/", "path: empty normalizes to root");
         // Excess '..' clamps at root (never escapes).
-        assert_kernel!(path::normalize("/../../x") == "/x", "path: excess '..' clamps at root");
+        assert_kernel!(
+            path::normalize("/../../x") == "/x",
+            "path: excess '..' clamps at root"
+        );
 
         // Relative resolution against an explicit base (no global CWD touched).
-        assert_kernel!(path::resolve("/a/b", "c") == "/a/b/c", "path: relative joins base");
-        assert_kernel!(path::resolve("/a/b", "../c") == "/a/c", "path: '..' against base");
-        assert_kernel!(path::resolve("/a/b", "/x/y") == "/x/y", "path: absolute ignores base");
-        assert_kernel!(path::resolve("/", ".") == "/", "path: '.' against root stays root");
+        assert_kernel!(
+            path::resolve("/a/b", "c") == "/a/b/c",
+            "path: relative joins base"
+        );
+        assert_kernel!(
+            path::resolve("/a/b", "../c") == "/a/c",
+            "path: '..' against base"
+        );
+        assert_kernel!(
+            path::resolve("/a/b", "/x/y") == "/x/y",
+            "path: absolute ignores base"
+        );
+        assert_kernel!(
+            path::resolve("/", ".") == "/",
+            "path: '.' against root stays root"
+        );
 
         // Directory listing format: directory entries render with a trailing
         // '/' (R9.1). The listing is produced inline in `cmd_ls` as

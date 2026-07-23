@@ -14,6 +14,12 @@
 //! the `host-tests` crate `#[path]`-includes the same source and property-tests
 //! it on the host (P23).
 
+/// Effectful `apt` package-manager front end: by-name `update`/`install`/`show`/
+/// `list`/`setmirror` over the pure index ([`apt_index`]), resolver
+/// ([`apt_resolve`]), `.deb` parser ([`deb`]), tar reader ([`tar`]), and ext2
+/// installer ([`install_fs`]). Kernel-only (drives networking + VFS), so it lives
+/// apart from the pure, host-includable modules.
+pub mod apt;
 /// Pure `Packages` index parser + lookup index (the read side of `apt install`).
 /// `core` + `alloc` only — `#[path]`-included by `host-tests` and exercised by P30.
 pub mod apt_index;
@@ -21,19 +27,13 @@ pub mod apt_index;
 /// `apt install`). `core` + `alloc` only; references [`apt_index`] via `super::`
 /// so one source resolves in both the kernel and the host crate. Tested by P30.
 pub mod apt_resolve;
-/// Effectful `apt` package-manager front end: by-name `update`/`install`/`show`/
-/// `list`/`setmirror` over the pure index ([`apt_index`]), resolver
-/// ([`apt_resolve`]), `.deb` parser ([`deb`]), tar reader ([`tar`]), and ext2
-/// installer ([`install_fs`]). Kernel-only (drives networking + VFS), so it lives
-/// apart from the pure, host-includable modules.
-pub mod apt;
 pub mod deb;
 pub mod install;
-/// Pure `apt setmirror` host-argument parsing (URL-scheme prefix handling).
-/// `core`-only and self-contained — `#[path]`-included by `host-tests`.
-pub mod mirror;
 /// Effectful ext2 installer (`Package_Installer`, component 10). Kernel-only: it
 /// drives the `VfsNode` trait, so — like `net::http_fetch` beside the pure
 /// `net::http` — it lives apart from the pure, host-includable `install` module.
 pub mod install_fs;
+/// Pure `apt setmirror` host-argument parsing (URL-scheme prefix handling).
+/// `core`-only and self-contained — `#[path]`-included by `host-tests`.
+pub mod mirror;
 pub mod tar;

@@ -115,8 +115,7 @@ fn unwind(pages: &[u64]) {
 /// `brk` (12): query/move the program break (R3.1–R3.6). On a grow that cannot be
 /// backed by physical memory, the break is left unchanged (R3.4).
 pub fn sys_brk(addr: u64) -> Result<u64, Errno> {
-    compat::with_current_compat(|cs| brk_impl(&mut cs.vm, addr))
-        .ok_or(Errno::EINVAL)
+    compat::with_current_compat(|cs| brk_impl(&mut cs.vm, addr)).ok_or(Errno::EINVAL)
 }
 
 fn brk_impl(vm: &mut VmRegionSet, requested: u64) -> u64 {
@@ -347,9 +346,11 @@ pub fn sys_mremap(
         // The whole old range must lie inside one tracked mmap region; its
         // protections carry over to the new placement.
         let old_span = old_pages.checked_mul(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
-        let (writable, nx) = match vm.mmaps.iter().find(|r| {
-            r.base <= old_addr && old_addr + old_span <= r.base + r.pages * PAGE_SIZE
-        }) {
+        let (writable, nx) = match vm
+            .mmaps
+            .iter()
+            .find(|r| r.base <= old_addr && old_addr + old_span <= r.base + r.pages * PAGE_SIZE)
+        {
             Some(r) => (r.writable, r.nx),
             None => return Err(Errno::EFAULT),
         };

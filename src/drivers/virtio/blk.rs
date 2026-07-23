@@ -38,9 +38,7 @@
 use alloc::sync::Arc;
 
 use virtio_drivers::device::blk::{VirtIOBlk, SECTOR_SIZE};
-use virtio_drivers::transport::pci::bus::{
-    ConfigurationAccess, DeviceFunction, PciRoot,
-};
+use virtio_drivers::transport::pci::bus::{ConfigurationAccess, DeviceFunction, PciRoot};
 use virtio_drivers::transport::pci::PciTransport;
 
 use crate::drivers::pci::{self, PciAddress, PciDevice};
@@ -206,7 +204,10 @@ pub fn init_blk(devices: &[PciDevice]) {
     let transport = match PciTransport::new::<PaghHal, _>(&mut root, device_function) {
         Ok(t) => t,
         Err(e) => {
-            warn!("virtio-blk: PCI transport init failed: {:?}; storage disabled", e);
+            warn!(
+                "virtio-blk: PCI transport init failed: {:?}; storage disabled",
+                e
+            );
             return;
         }
     };

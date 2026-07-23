@@ -154,7 +154,7 @@ core::arch::global_asm!(
     // clean top of this thread's stack — no `pop` is needed (and popping here
     // would read garbage above the frame, the original bring-up bug).
     "    sti",
-    "    call rdi",          // rdi = entry; pushes return addr within the stack
+    "    call rdi", // rdi = entry; pushes return addr within the stack
     "    jmp scheduler_exit_thread",
 );
 
@@ -222,7 +222,7 @@ core::arch::global_asm!(
     // rdi = current RSP (arg1 for scheduler_tick_irq)
     // We must save it BEFORE aligning RSP
     "    mov rdi, rsp",
-    "    sub rsp, 8",        // align to 16 (pushfq made it 8-off)
+    "    sub rsp, 8", // align to 16 (pushfq made it 8-off)
     "    call scheduler_tick_irq",
     // rax = new RSP to restore
     "    mov rsp, rax",

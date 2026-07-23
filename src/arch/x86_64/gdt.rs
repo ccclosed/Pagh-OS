@@ -1,11 +1,11 @@
 // arch/x86_64/gdt.rs — Global Descriptor Table, TSS, IST stacks
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
+use core::cell::SyncUnsafeCell;
+use core::sync::atomic::{AtomicU16, Ordering};
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
-use core::cell::SyncUnsafeCell;
-use core::sync::atomic::{AtomicU16, Ordering};
 
 // ─── IST (Interrupt Stack Table) stack allocations ─────────────────────
 
@@ -130,8 +130,14 @@ pub fn init() {
     // to remain valid for the descriptor, and the TSS lives for the whole program.
     unsafe {
         let gdt = &mut *GDT.get();
-        KERNEL_CODE_SEL.store(gdt.append(Descriptor::kernel_code_segment()).0, Ordering::Relaxed);
-        KERNEL_DATA_SEL.store(gdt.append(Descriptor::kernel_data_segment()).0, Ordering::Relaxed);
+        KERNEL_CODE_SEL.store(
+            gdt.append(Descriptor::kernel_code_segment()).0,
+            Ordering::Relaxed,
+        );
+        KERNEL_DATA_SEL.store(
+            gdt.append(Descriptor::kernel_data_segment()).0,
+            Ordering::Relaxed,
+        );
         // ORDER MATTERS (stage-13.7 fix): `sysretq` loads CS.sel = STAR[63:48]+16
         // and SS.sel = STAR[63:48]+8 without consulting the GDT, so the user DATA
         // descriptor must sit exactly 8 bytes BELOW the user CODE descriptor.
@@ -139,10 +145,19 @@ pub fn init() {
         // exists: sysret would hand ring 3 SS = kernel_data|3, and the first
         // ring-3 interrupt would #GP on the iretq restore of that SS. Nothing
         // depends on the raw selector values: all users go through `Selectors`.
-        USER_DATA_SEL.store(gdt.append(Descriptor::user_data_segment()).0, Ordering::Relaxed);
-        USER_CODE_SEL.store(gdt.append(Descriptor::user_code_segment()).0, Ordering::Relaxed);
+        USER_DATA_SEL.store(
+            gdt.append(Descriptor::user_data_segment()).0,
+            Ordering::Relaxed,
+        );
+        USER_CODE_SEL.store(
+            gdt.append(Descriptor::user_code_segment()).0,
+            Ordering::Relaxed,
+        );
         let tss_ref: &'static TaskStateSegment = &*TSS.get();
-        TSS_SEL.store(gdt.append(Descriptor::tss_segment(tss_ref)).0, Ordering::Relaxed);
+        TSS_SEL.store(
+            gdt.append(Descriptor::tss_segment(tss_ref)).0,
+            Ordering::Relaxed,
+        );
     }
 
     // Load GDT and TSS.
@@ -192,7 +207,8 @@ pub fn init() {
         x86_64::instructions::tables::load_tss(SegmentSelector(TSS_SEL.load(Ordering::Relaxed)));
     }
 
-    crate::debug!("GDT loaded: kernel CS={:#x}, DS={:#x}, user CS={:#x}, DS={:#x}, TSS={:#x}",
+    crate::debug!(
+        "GDT loaded: kernel CS={:#x}, DS={:#x}, user CS={:#x}, DS={:#x}, TSS={:#x}",
         KERNEL_CODE_SEL.load(Ordering::Relaxed),
         KERNEL_DATA_SEL.load(Ordering::Relaxed),
         USER_CODE_SEL.load(Ordering::Relaxed),

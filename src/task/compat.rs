@@ -60,9 +60,25 @@ impl CompatState {
     /// the supplied descriptor table and VM bookkeeping, `FS.base` cleared to 0,
     /// the given thread id, the root cwd `/`, an empty `nosys` log, and no exit
     /// code yet.
-    pub fn new(fds: FdTable, vm: VmRegionSet, tid: u64) -> Self { Self::new_with_parent(fds, vm, tid, 1) }
+    pub fn new(fds: FdTable, vm: VmRegionSet, tid: u64) -> Self {
+        Self::new_with_parent(fds, vm, tid, 1)
+    }
     pub fn new_with_parent(fds: FdTable, vm: VmRegionSet, tid: u64, ppid: u64) -> Self {
-        Self { fds, vm, fs_base: 0, tid, ppid, tgid: tid, clear_child_tid: 0, waitable: true, robust_head: 0, robust_len: 0, cwd: "/".to_string(), nosys_logged: BTreeSet::new(), exit_code: None }
+        Self {
+            fds,
+            vm,
+            fs_base: 0,
+            tid,
+            ppid,
+            tgid: tid,
+            clear_child_tid: 0,
+            waitable: true,
+            robust_head: 0,
+            robust_len: 0,
+            cwd: "/".to_string(),
+            nosys_logged: BTreeSet::new(),
+            exit_code: None,
+        }
     }
 }
 
@@ -112,21 +128,49 @@ pub fn install_compat(pid: u64, state: CompatState) {
 
 /// Remove and return the [`CompatState`] for process `pid`, if any. Called when
 /// a process terminates (`scheduler::exit_current`).
-pub fn remove_compat(pid: u64) -> Option<CompatState> { COMPAT_STATES.lock().remove(&pid) }
+pub fn remove_compat(pid: u64) -> Option<CompatState> {
+    COMPAT_STATES.lock().remove(&pid)
+}
 /// Whether a compat process/thread with this pid still exists (used by the
 /// shell's foreground wait after `lxrun`).
-pub fn compat_exists(pid: u64) -> bool { COMPAT_STATES.lock().contains_key(&pid) }
+pub fn compat_exists(pid: u64) -> bool {
+    COMPAT_STATES.lock().contains_key(&pid)
+}
 pub fn finish_compat_exit(pid: u64) {
-    if let Some(state) = remove_compat(pid) { if state.waitable && state.ppid != 0 { EXITED_CHILDREN.lock().insert((state.ppid, pid), state.exit_code.unwrap_or(0)); } }
+    if let Some(state) = remove_compat(pid) {
+        if state.waitable && state.ppid != 0 {
+            EXITED_CHILDREN
+                .lock()
+                .insert((state.ppid, pid), state.exit_code.unwrap_or(0));
+        }
+    }
 }
-pub fn current_ppid() -> u64 { with_current_compat(|s| s.ppid).unwrap_or(1) }
-fn child_matches(wanted: i64, child: u64) -> bool { wanted == -1 || (wanted > 0 && child == wanted as u64) }
-pub fn reap_child(parent: u64, wanted: i64) -> Option<(u64,u8)> {
-    let mut z=EXITED_CHILDREN.lock(); let k=z.keys().find(|(p,c)| *p==parent && child_matches(wanted,*c)).copied()?; z.remove(&k).map(|v|(k.1,v))
+pub fn current_ppid() -> u64 {
+    with_current_compat(|s| s.ppid).unwrap_or(1)
 }
-pub fn has_child(parent:u64,wanted:i64)->bool {
-    if COMPAT_STATES.lock().iter().any(|(p,s)| s.ppid==parent && child_matches(wanted,*p)){return true}
-    EXITED_CHILDREN.lock().keys().any(|(p,c)|*p==parent&&child_matches(wanted,*c))
+fn child_matches(wanted: i64, child: u64) -> bool {
+    wanted == -1 || (wanted > 0 && child == wanted as u64)
+}
+pub fn reap_child(parent: u64, wanted: i64) -> Option<(u64, u8)> {
+    let mut z = EXITED_CHILDREN.lock();
+    let k = z
+        .keys()
+        .find(|(p, c)| *p == parent && child_matches(wanted, *c))
+        .copied()?;
+    z.remove(&k).map(|v| (k.1, v))
+}
+pub fn has_child(parent: u64, wanted: i64) -> bool {
+    if COMPAT_STATES
+        .lock()
+        .iter()
+        .any(|(p, s)| s.ppid == parent && child_matches(wanted, *p))
+    {
+        return true;
+    }
+    EXITED_CHILDREN
+        .lock()
+        .keys()
+        .any(|(p, c)| *p == parent && child_matches(wanted, *c))
 }
 
 /// Whether the currently-running process (per `scheduler::current_pid`) has a
@@ -137,21 +181,53 @@ pub fn has_child(parent:u64,wanted:i64)->bool {
 pub fn clone_current_compat(child: u64, tls: Option<u64>, clear_child_tid: u64) -> bool {
     let parent = super::scheduler::current_pid();
     let mut states = COMPAT_STATES.lock();
-    let Some(mut child_state) = states.get(&parent).cloned() else { return false; };
-    child_state.tid = child; child_state.ppid = parent; child_state.waitable = false;
-    child_state.clear_child_tid = clear_child_tid; child_state.exit_code = None;
-    if let Some(base) = tls { child_state.fs_base = base; }
-    states.insert(child, child_state); true
+    let Some(mut child_state) = states.get(&parent).cloned() else {
+        return false;
+    };
+    child_state.tid = child;
+    child_state.ppid = parent;
+    child_state.waitable = false;
+    child_state.clear_child_tid = clear_child_tid;
+    child_state.exit_code = None;
+    if let Some(base) = tls {
+        child_state.fs_base = base;
+    }
+    states.insert(child, child_state);
+    true
 }
-pub fn fs_base_for(pid: u64) -> Option<u64> { COMPAT_STATES.lock().get(&pid).map(|s| s.fs_base) }
-pub fn current_tgid() -> u64 { with_current_compat(|s| s.tgid).unwrap_or_else(super::scheduler::current_pid) }
-pub fn current_clear_child_tid() -> u64 { with_current_compat(|s| s.clear_child_tid).unwrap_or(0) }
-pub fn current_robust_list() -> (u64,u64) { with_current_compat(|s| (s.robust_head,s.robust_len)).unwrap_or((0,0)) }
-pub fn group_member_pids(tgid:u64, except:u64) -> alloc::vec::Vec<u64> {
-    COMPAT_STATES.lock().iter().filter_map(|(pid,s)| (s.tgid==tgid && *pid!=except).then_some(*pid)).collect()
+pub fn fs_base_for(pid: u64) -> Option<u64> {
+    COMPAT_STATES.lock().get(&pid).map(|s| s.fs_base)
 }
-pub fn clear_tid_for(pid:u64)->u64 { COMPAT_STATES.lock().get(&pid).map(|s|s.clear_child_tid).unwrap_or(0) }
-pub fn robust_for(pid:u64)->(u64,u64) { COMPAT_STATES.lock().get(&pid).map(|s|(s.robust_head,s.robust_len)).unwrap_or((0,0)) }
+pub fn current_tgid() -> u64 {
+    with_current_compat(|s| s.tgid).unwrap_or_else(super::scheduler::current_pid)
+}
+pub fn current_clear_child_tid() -> u64 {
+    with_current_compat(|s| s.clear_child_tid).unwrap_or(0)
+}
+pub fn current_robust_list() -> (u64, u64) {
+    with_current_compat(|s| (s.robust_head, s.robust_len)).unwrap_or((0, 0))
+}
+pub fn group_member_pids(tgid: u64, except: u64) -> alloc::vec::Vec<u64> {
+    COMPAT_STATES
+        .lock()
+        .iter()
+        .filter_map(|(pid, s)| (s.tgid == tgid && *pid != except).then_some(*pid))
+        .collect()
+}
+pub fn clear_tid_for(pid: u64) -> u64 {
+    COMPAT_STATES
+        .lock()
+        .get(&pid)
+        .map(|s| s.clear_child_tid)
+        .unwrap_or(0)
+}
+pub fn robust_for(pid: u64) -> (u64, u64) {
+    COMPAT_STATES
+        .lock()
+        .get(&pid)
+        .map(|s| (s.robust_head, s.robust_len))
+        .unwrap_or((0, 0))
+}
 
 pub fn current_has_compat() -> bool {
     let pid = super::scheduler::current_pid();

@@ -189,8 +189,8 @@ pub fn read_tar(buf: &[u8]) -> Result<Vec<TarEntry<'_>>, TarError> {
         }
 
         // Validate the checksum before trusting any other field (R9.6).
-        let stored = parse_octal(&block[OFF_CHKSUM..END_CHKSUM])
-            .ok_or(TarError::BadHeaderChecksum)?;
+        let stored =
+            parse_octal(&block[OFF_CHKSUM..END_CHKSUM]).ok_or(TarError::BadHeaderChecksum)?;
         if stored != header_checksum(block) {
             return Err(TarError::BadHeaderChecksum);
         }

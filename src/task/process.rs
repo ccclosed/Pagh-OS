@@ -1,10 +1,8 @@
 // task/process.rs — User process creation
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
-use alloc::vec::Vec;
-use alloc::format;
-use alloc::string::{String, ToString};
 use crate::arch::x86_64::gdt;
+use crate::arch::x86_64::linux::mem::VmRegionSet;
 use crate::memory::{pmm, vmm};
 use crate::task::compat::{self, CompatState};
 use crate::task::fd::FdTable;
@@ -12,12 +10,14 @@ use crate::task::scheduler;
 use crate::task::scheduler::Tcb;
 use crate::task::stack::{arg_gate, AuxInputs};
 use crate::task::stack_map::{map_initial_stack, StackMapError};
-use crate::arch::x86_64::linux::mem::VmRegionSet;
 use crate::vfs::elf::ElfLoader;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use x86_64::structures::paging::PageTableFlags;
 
 use crate::memory::layout::{
-    PAGE_SIZE, USER_MMAP_BASE, USER_STACK_PAGES, USER_STACK_TOP, KERNEL_STACK_PAGES,
+    KERNEL_STACK_PAGES, PAGE_SIZE, USER_MMAP_BASE, USER_STACK_PAGES, USER_STACK_TOP,
 };
 
 /// Allocate and map a fresh per-PID kernel stack in the kernel higher-half and
@@ -30,8 +30,7 @@ use crate::memory::layout::{
 /// top-level entry is visible while a user CR3 is active — exactly what the
 /// ring-3 → ring-0 entry (which lands on RSP0) needs.
 fn setup_task_kernel_stack(pid: u64) -> Result<u64, &'static str> {
-    let (_guard_base, kstack_base, kstack_top) =
-        crate::memory::layout::kernel_stack_for_pid(pid);
+    let (_guard_base, kstack_base, kstack_top) = crate::memory::layout::kernel_stack_for_pid(pid);
 
     let kflags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
     for page in 0..KERNEL_STACK_PAGES {
@@ -81,11 +80,16 @@ unsafe fn build_ring3_frame(kstack_top: u64, entry: u64, user_rsp: u64) -> u64 {
     let mut rsp = kstack_top;
 
     // iretq frame (highest addresses), consumed by `iretq`.
-    rsp -= 8; (rsp as *mut u64).write(user_ss);    // SS  (RPL 3)
-    rsp -= 8; (rsp as *mut u64).write(user_rsp);   // RSP (user stack pointer)
-    rsp -= 8; (rsp as *mut u64).write(0x202u64);   // RFLAGS (IF set)
-    rsp -= 8; (rsp as *mut u64).write(user_cs);    // CS  (RPL 3)
-    rsp -= 8; (rsp as *mut u64).write(entry);      // RIP = user entry
+    rsp -= 8;
+    (rsp as *mut u64).write(user_ss); // SS  (RPL 3)
+    rsp -= 8;
+    (rsp as *mut u64).write(user_rsp); // RSP (user stack pointer)
+    rsp -= 8;
+    (rsp as *mut u64).write(0x202u64); // RFLAGS (IF set)
+    rsp -= 8;
+    (rsp as *mut u64).write(user_cs); // CS  (RPL 3)
+    rsp -= 8;
+    (rsp as *mut u64).write(entry); // RIP = user entry
 
     // 15 GPR slots (rax highest .. r15 lowest), all zero.
     for _ in 0..15 {
@@ -96,7 +100,8 @@ unsafe fn build_ring3_frame(kstack_top: u64, entry: u64, user_rsp: u64) -> u64 {
     // RFLAGS word consumed by `popfq` (lowest address = final kernel_rsp).
     // IF=0 invariant: the restore tail must run with interrupts OFF until
     // `iretq` re-enables them from the iret-frame RFLAGS slot above.
-    rsp -= 8; (rsp as *mut u64).write(0x002u64);
+    rsp -= 8;
+    (rsp as *mut u64).write(0x002u64);
 
     rsp
 }
@@ -140,7 +145,9 @@ pub fn create_user_process(elf_data: &[u8]) -> Result<u64, &'static str> {
     let kernel_cr3 = vmm::current_pml4_phys();
     // SAFETY: `pml4_phys` is a valid PML4 with the kernel higher-half cloned in,
     // so kernel code/stack/heap remain mapped while it is installed.
-    unsafe { vmm::load_cr3(pml4_phys); }
+    unsafe {
+        vmm::load_cr3(pml4_phys);
+    }
     let mut stack_err: Option<&'static str> = None;
     for page in 0..USER_STACK_PAGES {
         let vaddr = user_stack_bottom + page * PAGE_SIZE;
@@ -158,7 +165,9 @@ pub fn create_user_process(elf_data: &[u8]) -> Result<u64, &'static str> {
         }
     }
     // SAFETY: restore the kernel PML4 before doing anything else.
-    unsafe { vmm::load_cr3(kernel_cr3); }
+    unsafe {
+        vmm::load_cr3(kernel_cr3);
+    }
     if let Some(e) = stack_err {
         return Err(e);
     }
@@ -205,15 +214,17 @@ fn build_test_elf() -> Vec<u8> {
     let len = msg.len() as u32;
 
     let mut code: Vec<u8> = Vec::with_capacity(CODE_LEN);
-    code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);          // mov eax, 1  (SYS_WRITE)
-    code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]);          // mov edi, 1  (fd = stdout)
-    code.push(0xBE); code.extend_from_slice(&(msg_addr as u32).to_le_bytes()); // mov esi, msg_addr
-    code.push(0xBA); code.extend_from_slice(&len.to_le_bytes());      // mov edx, len
-    code.extend_from_slice(&[0xCD, 0x80]);                            // int 0x80
-    code.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]);          // mov eax, 2  (SYS_EXIT)
-    code.extend_from_slice(&[0x31, 0xFF]);                            // xor edi, edi (code = 0)
-    code.extend_from_slice(&[0xCD, 0x80]);                            // int 0x80
-    code.extend_from_slice(&[0xEB, 0xFE]);                            // 1: jmp 1b (fallback)
+    code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1  (SYS_WRITE)
+    code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]); // mov edi, 1  (fd = stdout)
+    code.push(0xBE);
+    code.extend_from_slice(&(msg_addr as u32).to_le_bytes()); // mov esi, msg_addr
+    code.push(0xBA);
+    code.extend_from_slice(&len.to_le_bytes()); // mov edx, len
+    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+    code.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]); // mov eax, 2  (SYS_EXIT)
+    code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi (code = 0)
+    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+    code.extend_from_slice(&[0xEB, 0xFE]); // 1: jmp 1b (fallback)
     debug_assert_eq!(code.len(), CODE_LEN);
 
     let entry = VBASE + code_off as u64;
@@ -227,32 +238,32 @@ fn build_test_elf() -> Vec<u8> {
     elf.push(1); // EI_DATA  = ELFDATA2LSB
     elf.push(1); // EI_VERSION
     elf.push(0); // EI_OSABI = System V
-    // EI_ABIVERSION + 7 padding bytes
+                 // EI_ABIVERSION + 7 padding bytes
     elf.extend_from_slice(&[0u8; 8]);
-    elf.extend_from_slice(&2u16.to_le_bytes());        // e_type    = ET_EXEC
-    elf.extend_from_slice(&0x3Eu16.to_le_bytes());     // e_machine = EM_X86_64
-    elf.extend_from_slice(&1u32.to_le_bytes());        // e_version
-    elf.extend_from_slice(&entry.to_le_bytes());       // e_entry
+    elf.extend_from_slice(&2u16.to_le_bytes()); // e_type    = ET_EXEC
+    elf.extend_from_slice(&0x3Eu16.to_le_bytes()); // e_machine = EM_X86_64
+    elf.extend_from_slice(&1u32.to_le_bytes()); // e_version
+    elf.extend_from_slice(&entry.to_le_bytes()); // e_entry
     elf.extend_from_slice(&(EHSIZE as u64).to_le_bytes()); // e_phoff (phdr right after ehdr)
-    elf.extend_from_slice(&0u64.to_le_bytes());        // e_shoff
-    elf.extend_from_slice(&0u32.to_le_bytes());        // e_flags
-    elf.extend_from_slice(&(EHSIZE as u16).to_le_bytes());  // e_ehsize
-    elf.extend_from_slice(&(PHSIZE as u16).to_le_bytes());  // e_phentsize
-    elf.extend_from_slice(&1u16.to_le_bytes());        // e_phnum
-    elf.extend_from_slice(&0u16.to_le_bytes());        // e_shentsize
-    elf.extend_from_slice(&0u16.to_le_bytes());        // e_shnum
-    elf.extend_from_slice(&0u16.to_le_bytes());        // e_shstrndx
+    elf.extend_from_slice(&0u64.to_le_bytes()); // e_shoff
+    elf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    elf.extend_from_slice(&(EHSIZE as u16).to_le_bytes()); // e_ehsize
+    elf.extend_from_slice(&(PHSIZE as u16).to_le_bytes()); // e_phentsize
+    elf.extend_from_slice(&1u16.to_le_bytes()); // e_phnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
     debug_assert_eq!(elf.len(), EHSIZE);
 
     // ── Program header (56 bytes): one PT_LOAD covering the whole image ──────
-    elf.extend_from_slice(&1u32.to_le_bytes());        // p_type  = PT_LOAD
-    elf.extend_from_slice(&7u32.to_le_bytes());        // p_flags = PF_R|PF_W|PF_X
-    elf.extend_from_slice(&0u64.to_le_bytes());        // p_offset (segment starts at file 0)
-    elf.extend_from_slice(&VBASE.to_le_bytes());       // p_vaddr
-    elf.extend_from_slice(&VBASE.to_le_bytes());       // p_paddr
-    elf.extend_from_slice(&total_len.to_le_bytes());   // p_filesz
-    elf.extend_from_slice(&total_len.to_le_bytes());   // p_memsz
-    elf.extend_from_slice(&0x1000u64.to_le_bytes());   // p_align
+    elf.extend_from_slice(&1u32.to_le_bytes()); // p_type  = PT_LOAD
+    elf.extend_from_slice(&7u32.to_le_bytes()); // p_flags = PF_R|PF_W|PF_X
+    elf.extend_from_slice(&0u64.to_le_bytes()); // p_offset (segment starts at file 0)
+    elf.extend_from_slice(&VBASE.to_le_bytes()); // p_vaddr
+    elf.extend_from_slice(&VBASE.to_le_bytes()); // p_paddr
+    elf.extend_from_slice(&total_len.to_le_bytes()); // p_filesz
+    elf.extend_from_slice(&total_len.to_le_bytes()); // p_memsz
+    elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
     debug_assert_eq!(elf.len(), EHSIZE + PHSIZE);
 
     // ── Code + message ───────────────────────────────────────────────────────
@@ -322,22 +333,36 @@ const PT_INTERP: u32 = 3;
 const INTERP_BASE: u64 = 0x0000_7000_0000_0000;
 
 fn elf_interpreter_path(data: &[u8]) -> Result<Option<String>, RunError> {
-    if data.len() < 64 { return Err(RunError::LoadFailed("ELF: short header")); }
+    if data.len() < 64 {
+        return Err(RunError::LoadFailed("ELF: short header"));
+    }
     let phoff = u64::from_le_bytes(data[32..40].try_into().unwrap()) as usize;
     let phentsize = u16::from_le_bytes(data[54..56].try_into().unwrap()) as usize;
     let phnum = u16::from_le_bytes(data[56..58].try_into().unwrap()) as usize;
-    if phentsize < 56 { return Err(RunError::LoadFailed("ELF: invalid phentsize")); }
+    if phentsize < 56 {
+        return Err(RunError::LoadFailed("ELF: invalid phentsize"));
+    }
     for i in 0..phnum {
-        let off = phoff.checked_add(i.checked_mul(phentsize)
-            .ok_or(RunError::LoadFailed("ELF: phdr overflow"))?)
+        let off = phoff
+            .checked_add(
+                i.checked_mul(phentsize)
+                    .ok_or(RunError::LoadFailed("ELF: phdr overflow"))?,
+            )
             .ok_or(RunError::LoadFailed("ELF: phdr overflow"))?;
-        let ph = data.get(off..off + 56)
+        let ph = data
+            .get(off..off + 56)
             .ok_or(RunError::LoadFailed("ELF: phdr outside file"))?;
-        if u32::from_le_bytes(ph[0..4].try_into().unwrap()) != PT_INTERP { continue; }
+        if u32::from_le_bytes(ph[0..4].try_into().unwrap()) != PT_INTERP {
+            continue;
+        }
         let start = u64::from_le_bytes(ph[8..16].try_into().unwrap()) as usize;
         let len = u64::from_le_bytes(ph[32..40].try_into().unwrap()) as usize;
-        let end = start.checked_add(len).ok_or(RunError::LoadFailed("ELF: interp overflow"))?;
-        let raw = data.get(start..end).ok_or(RunError::LoadFailed("ELF: interp outside file"))?;
+        let end = start
+            .checked_add(len)
+            .ok_or(RunError::LoadFailed("ELF: interp overflow"))?;
+        let raw = data
+            .get(start..end)
+            .ok_or(RunError::LoadFailed("ELF: interp outside file"))?;
         let nul = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
         let path = core::str::from_utf8(&raw[..nul])
             .map_err(|_| RunError::LoadFailed("ELF: invalid interp path"))?;
@@ -347,7 +372,9 @@ fn elf_interpreter_path(data: &[u8]) -> Result<Option<String>, RunError> {
 }
 
 fn read_interpreter(data: &[u8]) -> Result<Option<Vec<u8>>, RunError> {
-    let Some(path) = elf_interpreter_path(data)? else { return Ok(None); };
+    let Some(path) = elf_interpreter_path(data)? else {
+        return Ok(None);
+    };
     let disk_path = if path.starts_with('/') {
         format!("/mnt{}", path)
     } else {
@@ -376,7 +403,9 @@ fn read_interpreter(data: &[u8]) -> Result<Option<Vec<u8>>, RunError> {
         if let Ok(data) = read_file_all(cand) {
             crate::warn!(
                 "[linux] interpreter '{}' missing at '{}'; using fallback '{}'",
-                path, disk_path, cand
+                path,
+                disk_path,
+                cand
             );
             return Ok(Some(data));
         }
@@ -396,10 +425,18 @@ fn map_linux_images(data: &[u8], interpreter: Option<&[u8]>) -> Result<LoadedLin
     if let Some(interp) = interpreter {
         let start_entry = ElfLoader::map_interpreter(elf.pml4_phys, interp, INTERP_BASE)
             .map_err(RunError::LoadFailed)?;
-        Ok(LoadedLinux { elf, start_entry, interp_base: INTERP_BASE })
+        Ok(LoadedLinux {
+            elf,
+            start_entry,
+            interp_base: INTERP_BASE,
+        })
     } else {
         let start_entry = elf.entry;
-        Ok(LoadedLinux { elf, start_entry, interp_base: 0 })
+        Ok(LoadedLinux {
+            elf,
+            start_entry,
+            interp_base: 0,
+        })
     }
 }
 
@@ -462,17 +499,19 @@ pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u6
             // The encoder owns the random block placement and ignores this field.
             random_ptr: 0,
         };
-        let initial_rsp = map_initial_stack(elf.pml4_phys, argv, envp, &aux, random16)
-            .map_err(|e: StackMapError| {
+        let initial_rsp = map_initial_stack(elf.pml4_phys, argv, envp, &aux, random16).map_err(
+            |e: StackMapError| {
                 // Any stack failure (encoder TooLarge or a mapping fault) aborts
                 // the launch without enqueuing; the loader's PML4 is simply
                 // abandoned (not handed to the scheduler), satisfying R7.3.
                 crate::error!(
                     "[linux] run '{}': initial stack construction failed: {:?}",
-                    path, e
+                    path,
+                    e
                 );
                 RunError::StackFailed
-            })?;
+            },
+        )?;
 
         // 5. Build the Compat_Process: pid, kernel stack + TSS RSP0, compat state.
         let pid = scheduler::next_pid();
@@ -497,54 +536,114 @@ pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u6
 
         crate::info!(
             "[linux] Compat_Process pid={} started: entry=0x{:x} rsp=0x{:x} brk=0x{:x} from '{}'",
-            pid, elf.entry, initial_rsp, elf.initial_brk, path
+            pid,
+            elf.entry,
+            initial_rsp,
+            elf.initial_brk,
+            path
         );
 
         Ok(pid)
     })
 }
 
-
-pub struct ExecImage { pub entry: u64, pub initial_rsp: u64, pub pml4_phys: u64 }
+pub struct ExecImage {
+    pub entry: u64,
+    pub initial_rsp: u64,
+    pub pml4_phys: u64,
+}
 
 /// Prepare and install a fresh ELF address space for the current pid. Open file
 /// descriptors, cwd, ppid and pid survive; VM/TLS/image state is reset.
 pub fn exec_linux_image(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<ExecImage, RunError> {
-    if !arg_gate(argv) || !arg_gate(envp) { return Err(RunError::ArgsTooLarge); }
+    if !arg_gate(argv) || !arg_gate(envp) {
+        return Err(RunError::ArgsTooLarge);
+    }
     let data = read_file_all(path)?;
     let interpreter = read_interpreter(&data)?;
     crate::arch::cpu::without_interrupts(|| {
         let loaded = map_linux_images(&data, interpreter.as_deref())?;
         let elf = loaded.elf;
-        let aux = AuxInputs { phdr: elf.phdr_vaddr, phent: elf.phent as u64,
-            phnum: elf.phnum as u64, entry: elf.entry, pagesz: PAGE_SIZE,
-            base: loaded.interp_base, random_ptr: 0 };
-        let rsp = map_initial_stack(elf.pml4_phys, argv, envp, &aux,
-            crate::arch::x86_64::linux::misc::random_bytes_16()).map_err(|_| RunError::StackFailed)?;
+        let aux = AuxInputs {
+            phdr: elf.phdr_vaddr,
+            phent: elf.phent as u64,
+            phnum: elf.phnum as u64,
+            entry: elf.entry,
+            pagesz: PAGE_SIZE,
+            base: loaded.interp_base,
+            random_ptr: 0,
+        };
+        let rsp = map_initial_stack(
+            elf.pml4_phys,
+            argv,
+            envp,
+            &aux,
+            crate::arch::x86_64::linux::misc::random_bytes_16(),
+        )
+        .map_err(|_| RunError::StackFailed)?;
         let pid = scheduler::current_pid();
         compat::with_current_compat(|st| {
             st.vm = VmRegionSet::new(elf.initial_brk, USER_MMAP_BASE);
-            st.fs_base = 0; st.tid = pid; st.nosys_logged.clear(); st.exit_code = None;
-        }).ok_or(RunError::LoadFailed("execve without compat state"))?;
+            st.fs_base = 0;
+            st.tid = pid;
+            st.nosys_logged.clear();
+            st.exit_code = None;
+        })
+        .ok_or(RunError::LoadFailed("execve without compat state"))?;
         // SAFETY: loader built a valid PML4 with shared kernel higher-half mappings.
-        unsafe { vmm::load_cr3(elf.pml4_phys); }
-        Ok(ExecImage { entry: loaded.start_entry, initial_rsp: rsp, pml4_phys: elf.pml4_phys })
+        unsafe {
+            vmm::load_cr3(elf.pml4_phys);
+        }
+        Ok(ExecImage {
+            entry: loaded.start_entry,
+            initial_rsp: rsp,
+            pml4_phys: elf.pml4_phys,
+        })
     })
 }
 
-
-unsafe fn build_clone_frame(top:u64, regs:&crate::arch::x86_64::linux::regs::SavedRegs, rip:u64, user_rsp:u64)->u64{
-    let ucs=(gdt::Selectors::user_code().0|3) as u64; let uss=(gdt::Selectors::user_data().0|3) as u64;
-    let mut sp=top; sp-=8;(sp as *mut u64).write(uss); sp-=8;(sp as *mut u64).write(user_rsp);
-    sp-=8;(sp as *mut u64).write(0x202); sp-=8;(sp as *mut u64).write(ucs); sp-=8;(sp as *mut u64).write(rip);
-    let vals=[0,regs.rbx,regs.rcx,regs.rdx,regs.rsi,regs.rdi,regs.rbp,regs.r8,regs.r9,regs.r10,regs.r11,regs.r12,regs.r13,regs.r14,regs.r15];
-    for value in vals { sp-=8;(sp as *mut u64).write(value); } sp-=8;(sp as *mut u64).write(0x002); sp // popfq slot: IF=0 invariant (restore tail runs with IRQs off)
+unsafe fn build_clone_frame(
+    top: u64,
+    regs: &crate::arch::x86_64::linux::regs::SavedRegs,
+    rip: u64,
+    user_rsp: u64,
+) -> u64 {
+    let ucs = (gdt::Selectors::user_code().0 | 3) as u64;
+    let uss = (gdt::Selectors::user_data().0 | 3) as u64;
+    let mut sp = top;
+    sp -= 8;
+    (sp as *mut u64).write(uss);
+    sp -= 8;
+    (sp as *mut u64).write(user_rsp);
+    sp -= 8;
+    (sp as *mut u64).write(0x202);
+    sp -= 8;
+    (sp as *mut u64).write(ucs);
+    sp -= 8;
+    (sp as *mut u64).write(rip);
+    let vals = [
+        0, regs.rbx, regs.rcx, regs.rdx, regs.rsi, regs.rdi, regs.rbp, regs.r8, regs.r9, regs.r10,
+        regs.r11, regs.r12, regs.r13, regs.r14, regs.r15,
+    ];
+    for value in vals {
+        sp -= 8;
+        (sp as *mut u64).write(value);
+    }
+    sp -= 8;
+    (sp as *mut u64).write(0x002);
+    sp // popfq slot: IF=0 invariant (restore tail runs with IRQs off)
 }
-pub fn spawn_linux_thread(regs:&crate::arch::x86_64::linux::regs::SavedRegs,user_rsp:u64)->Result<u64,&'static str>{
-    let parent=scheduler::current_pid(); let child=scheduler::next_pid();
-    let child_top=setup_task_kernel_stack(child)?;
-    let parent_top=crate::memory::layout::kernel_stack_for_pid(parent).2;
-    gdt::set_kernel_stack(parent_top); crate::arch::x86_64::syscall::set_syscall_kernel_stack(parent_top);
-    let krsp=unsafe{build_clone_frame(child_top,regs,regs.rcx,user_rsp)};
-    scheduler::spawn(Tcb::new(child,krsp,vmm::current_pml4_phys())); Ok(child)
+pub fn spawn_linux_thread(
+    regs: &crate::arch::x86_64::linux::regs::SavedRegs,
+    user_rsp: u64,
+) -> Result<u64, &'static str> {
+    let parent = scheduler::current_pid();
+    let child = scheduler::next_pid();
+    let child_top = setup_task_kernel_stack(child)?;
+    let parent_top = crate::memory::layout::kernel_stack_for_pid(parent).2;
+    gdt::set_kernel_stack(parent_top);
+    crate::arch::x86_64::syscall::set_syscall_kernel_stack(parent_top);
+    let krsp = unsafe { build_clone_frame(child_top, regs, regs.rcx, user_rsp) };
+    scheduler::spawn(Tcb::new(child, krsp, vmm::current_pml4_phys()));
+    Ok(child)
 }

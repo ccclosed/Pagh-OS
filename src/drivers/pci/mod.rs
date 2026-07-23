@@ -134,7 +134,11 @@ pub fn enumerate() -> Vec<PciDevice> {
     for bus in 0u16..=255 {
         for device in 0u8..32 {
             for function in 0u8..8 {
-                let addr = PciAddress { bus: bus as u8, device, function };
+                let addr = PciAddress {
+                    bus: bus as u8,
+                    device,
+                    function,
+                };
                 let id0 = config_read_u32(addr, 0x00);
                 let vendor = (id0 & 0xFFFF) as u16;
                 if vendor == 0xFFFF {

@@ -1,7 +1,7 @@
-use alloc::collections::VecDeque;
-use crate::sync::spinlock::Spinlock;
 use crate::memory::{pmm, vmm};
+use crate::sync::spinlock::Spinlock;
 use crate::task::compat::CompatState;
+use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::structures::paging::PageTableFlags;
 
@@ -35,7 +35,12 @@ impl Tcb {
     /// not stored in the `Tcb`; it is baked into the constructed kernel stack
     /// frame pointed to by `kernel_rsp` (see `kernel_thread_spawn`).
     pub fn new(pid: u64, kernel_rsp: u64, cr3: u64) -> Self {
-        Tcb { pid, kernel_rsp, cr3, compat: None }
+        Tcb {
+            pid,
+            kernel_rsp,
+            cr3,
+            compat: None,
+        }
     }
 }
 
@@ -80,19 +85,31 @@ static IDLE_TASK: Spinlock<Tcb> = Spinlock::new(Tcb {
 
 /// Returns true when `pid` is the idle task.
 #[inline]
-pub fn is_idle(pid: u64) -> bool { pid == IDLE_PID }
+pub fn is_idle(pid: u64) -> bool {
+    pid == IDLE_PID
+}
 
 /// Save the idle task's stack pointer (called when the idle task is preempted).
 #[inline]
-fn save_idle_rsp(rsp: u64) { IDLE_TASK.lock().kernel_rsp = rsp; }
+fn save_idle_rsp(rsp: u64) {
+    IDLE_TASK.lock().kernel_rsp = rsp;
+}
 
 /// The idle task's saved stack pointer (scheduled when nothing else is ready).
 #[inline]
-fn idle_rsp() -> u64 { IDLE_TASK.lock().kernel_rsp }
+fn idle_rsp() -> u64 {
+    IDLE_TASK.lock().kernel_rsp
+}
 
-pub fn init() { crate::debug!("Scheduler initialized (Round Robin)"); }
-pub fn tick() { TICK_COUNT.fetch_add(1, Ordering::Relaxed); }
-pub fn ticks() -> u64 { TICK_COUNT.load(Ordering::Relaxed) }
+pub fn init() {
+    crate::debug!("Scheduler initialized (Round Robin)");
+}
+pub fn tick() {
+    TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+pub fn ticks() -> u64 {
+    TICK_COUNT.load(Ordering::Relaxed)
+}
 
 /// Block the calling thread for approximately `n` timer ticks, halting between
 /// ticks instead of busy-spinning so other tasks (and the CPU) are not starved.
@@ -118,7 +135,9 @@ pub fn sleep_ticks(n: u64) {
 /// a frame is enqueued and right before it is restored, so frame corruption
 /// is caught at the moment it happens instead of at the fatal `iretq`.
 pub fn check_frame(who: &str, pid: u64, rsp: u64) {
-    if rsp == 0 { return }
+    if rsp == 0 {
+        return;
+    }
     // Kernel threads (shell, idle, etc.) use a kernel-mode yield frame
     // whose layout differs from the ring-3 interrupt frame: there is no
     // user CS/SS/RSP triple at [+136..+160], so the value at [+136] is
@@ -126,14 +145,26 @@ pub fn check_frame(who: &str, pid: u64, rsp: u64) {
     // ring-3 invariants always fires a false BAD FRAME and then the
     // iretq blows up on that RSP-as-CS (GP#err=rsp&~3). Only run the
     // check for tasks that actually have a Linux compat state.
-    if !crate::task::compat::compat_exists(pid) { return }
+    if !crate::task::compat::compat_exists(pid) {
+        return;
+    }
     let rd = |off: u64| unsafe { core::ptr::read_volatile((rsp + off) as *const u64) };
-    let rip = rd(128); let cs = rd(136); let rf = rd(144);
+    let rip = rd(128);
+    let cs = rd(136);
+    let rf = rd(144);
     let rip_canonical = (((rip as i64) << 16) >> 16) as u64 == rip;
     let cs_ok = cs != 0 && cs < 0x40;
     let rf_ok = rf & 0x2 != 0;
     if !(rip_canonical && cs_ok && rf_ok) {
-        crate::error!("[SCHED] BAD FRAME ({}) pid={} rsp=0x{:x} rip=0x{:x} cs=0x{:x} rflags=0x{:x}", who, pid, rsp, rip, cs, rf);
+        crate::error!(
+            "[SCHED] BAD FRAME ({}) pid={} rsp=0x{:x} rip=0x{:x} cs=0x{:x} rflags=0x{:x}",
+            who,
+            pid,
+            rsp,
+            rip,
+            cs,
+            rf
+        );
         let mut i = 0u64;
         while i < 21 {
             crate::error!("  frame[+0x{:02x}] 0x{:016x}", i * 8, rd(i * 8));
@@ -142,29 +173,54 @@ pub fn check_frame(who: &str, pid: u64, rsp: u64) {
     }
 }
 
-pub fn spawn(tcb: Tcb) -> u64 { let pid = tcb.pid; check_frame("spawn", pid, tcb.kernel_rsp); READY_QUEUE.lock().push_back(tcb); pid }
-pub fn schedule() -> Option<Tcb> { READY_QUEUE.lock().pop_front() }
+pub fn spawn(tcb: Tcb) -> u64 {
+    let pid = tcb.pid;
+    check_frame("spawn", pid, tcb.kernel_rsp);
+    READY_QUEUE.lock().push_back(tcb);
+    pid
+}
+pub fn schedule() -> Option<Tcb> {
+    READY_QUEUE.lock().pop_front()
+}
 pub fn requeue(tcb: Tcb) {
     check_frame("enqueue", tcb.pid, tcb.kernel_rsp);
     let mut q = READY_QUEUE.lock();
     if q.iter().any(|t| t.pid == tcb.pid) {
-        crate::error!("[SCHED] DOUBLE ENQUEUE pid={} rsp=0x{:x}", tcb.pid, tcb.kernel_rsp);
+        crate::error!(
+            "[SCHED] DOUBLE ENQUEUE pid={} rsp=0x{:x}",
+            tcb.pid,
+            tcb.kernel_rsp
+        );
     }
     q.push_back(tcb);
 }
-pub fn remove_ready_pids(pids:&[u64]) { READY_QUEUE.lock().retain(|t| !pids.contains(&t.pid)); }
-pub fn next_pid() -> u64 { NEXT_PID.fetch_add(1, Ordering::Relaxed) }
-pub fn set_current_pid(pid: u64) { *CURRENT_PID.lock() = pid; }
-pub fn current_pid() -> u64 { *CURRENT_PID.lock() }
-fn activate_task(pid:u64){ if is_idle(pid){return} let top=crate::memory::layout::kernel_stack_for_pid(pid).2;
-    crate::arch::x86_64::gdt::set_kernel_stack(top); crate::arch::x86_64::syscall::set_syscall_kernel_stack(top);
-    if let Some(base)=crate::task::compat::fs_base_for(pid){ x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(base)); }
+pub fn remove_ready_pids(pids: &[u64]) {
+    READY_QUEUE.lock().retain(|t| !pids.contains(&t.pid));
+}
+pub fn next_pid() -> u64 {
+    NEXT_PID.fetch_add(1, Ordering::Relaxed)
+}
+pub fn set_current_pid(pid: u64) {
+    *CURRENT_PID.lock() = pid;
+}
+pub fn current_pid() -> u64 {
+    *CURRENT_PID.lock()
+}
+fn activate_task(pid: u64) {
+    if is_idle(pid) {
+        return;
+    }
+    let top = crate::memory::layout::kernel_stack_for_pid(pid).2;
+    crate::arch::x86_64::gdt::set_kernel_stack(top);
+    crate::arch::x86_64::syscall::set_syscall_kernel_stack(top);
+    if let Some(base) = crate::task::compat::fs_base_for(pid) {
+        x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(base));
+    }
 }
 
 pub fn kernel_thread_spawn(entry: fn()) -> u64 {
     let pid = next_pid();
-    let (_guard_base, stack_base, stack_top) =
-        crate::memory::layout::kernel_stack_for_pid(pid);
+    let (_guard_base, stack_base, stack_top) = crate::memory::layout::kernel_stack_for_pid(pid);
 
     for page in 0..crate::memory::layout::KERNEL_STACK_PAGES {
         let vaddr = stack_base + page * crate::memory::layout::PAGE_SIZE;
@@ -206,35 +262,56 @@ pub fn kernel_thread_spawn(entry: fn()) -> u64 {
         // frame must therefore provide the RSP/SS words too; a 3-word frame
         // made iretq read past stack_top into the unmapped guard area and
         // page-fault on the thread's very first restore.
-        rsp -= 8; (rsp as *mut u64).write(kernel_ss);   // [+160] SS
-        rsp -= 8; (rsp as *mut u64).write(stack_top);   // [+152] RSP after iretq
-        rsp -= 8; (rsp as *mut u64).write(0x202u64);    // [+144] RFLAGS (IF set)
-        rsp -= 8; (rsp as *mut u64).write(kernel_cs);   // [+136] CS
+        rsp -= 8;
+        (rsp as *mut u64).write(kernel_ss); // [+160] SS
+        rsp -= 8;
+        (rsp as *mut u64).write(stack_top); // [+152] RSP after iretq
+        rsp -= 8;
+        (rsp as *mut u64).write(0x202u64); // [+144] RFLAGS (IF set)
+        rsp -= 8;
+        (rsp as *mut u64).write(kernel_cs); // [+136] CS
 
         let trampoline = crate::task::switch::kernel_thread_trampoline as *const () as u64;
-        rsp -= 8; (rsp as *mut u64).write(trampoline);  // [+128] RIP -> trampoline
+        rsp -= 8;
+        (rsp as *mut u64).write(trampoline); // [+128] RIP -> trampoline
 
         // ── 15 GPR slots, written high→low to match the pop order ─────────
         // High→low addresses correspond to: rax (highest, popped last) down to
         // r15 (lowest, popped first). `entry` goes in the rdi slot.
-        rsp -= 8; (rsp as *mut u64).write(0);            // [+120] rax
-        rsp -= 8; (rsp as *mut u64).write(0);            // [+112] rbx
-        rsp -= 8; (rsp as *mut u64).write(0);            // [+104] rcx
-        rsp -= 8; (rsp as *mut u64).write(0);            // [+96]  rdx
-        rsp -= 8; (rsp as *mut u64).write(0);            // [+88]  rsi
-        rsp -= 8; (rsp as *mut u64).write(entry as u64); // [+80]  rdi = entry
-        rsp -= 8; (rsp as *mut u64).write(0);            // [+72]  rbp
-        rsp -= 8; (rsp as *mut u64).write(0);            // [+64]  r8
-        rsp -= 8; (rsp as *mut u64).write(0);            // [+56]  r9
-        rsp -= 8; (rsp as *mut u64).write(0);            // [+48]  r10
-        rsp -= 8; (rsp as *mut u64).write(0);            // [+40]  r11
-        rsp -= 8; (rsp as *mut u64).write(0);            // [+32]  r12
-        rsp -= 8; (rsp as *mut u64).write(0);            // [+24]  r13
-        rsp -= 8; (rsp as *mut u64).write(0);            // [+16]  r14
-        rsp -= 8; (rsp as *mut u64).write(0);            // [+8]   r15
+        rsp -= 8;
+        (rsp as *mut u64).write(0); // [+120] rax
+        rsp -= 8;
+        (rsp as *mut u64).write(0); // [+112] rbx
+        rsp -= 8;
+        (rsp as *mut u64).write(0); // [+104] rcx
+        rsp -= 8;
+        (rsp as *mut u64).write(0); // [+96]  rdx
+        rsp -= 8;
+        (rsp as *mut u64).write(0); // [+88]  rsi
+        rsp -= 8;
+        (rsp as *mut u64).write(entry as u64); // [+80]  rdi = entry
+        rsp -= 8;
+        (rsp as *mut u64).write(0); // [+72]  rbp
+        rsp -= 8;
+        (rsp as *mut u64).write(0); // [+64]  r8
+        rsp -= 8;
+        (rsp as *mut u64).write(0); // [+56]  r9
+        rsp -= 8;
+        (rsp as *mut u64).write(0); // [+48]  r10
+        rsp -= 8;
+        (rsp as *mut u64).write(0); // [+40]  r11
+        rsp -= 8;
+        (rsp as *mut u64).write(0); // [+32]  r12
+        rsp -= 8;
+        (rsp as *mut u64).write(0); // [+24]  r13
+        rsp -= 8;
+        (rsp as *mut u64).write(0); // [+16]  r14
+        rsp -= 8;
+        (rsp as *mut u64).write(0); // [+8]   r15
 
         // ── RFLAGS word consumed by `popfq` (lowest address = final rsp) ──
-        rsp -= 8; (rsp as *mut u64).write(0x002u64);     // [+0] RFLAGS-for-popfq (IF=0 invariant)
+        rsp -= 8;
+        (rsp as *mut u64).write(0x002u64); // [+0] RFLAGS-for-popfq (IF=0 invariant)
 
         let tcb = Tcb {
             pid,
@@ -250,7 +327,7 @@ pub fn kernel_thread_spawn(entry: fn()) -> u64 {
 #[no_mangle]
 pub extern "C" fn scheduler_tick_irq(current_rsp: u64) -> u64 {
     let tick = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
-    
+
     if tick % 100 == 0 {
         crate::trace!("Tick {} RSP=0x{:x}", tick, current_rsp);
     }
@@ -295,13 +372,16 @@ pub extern "C" fn scheduler_tick_irq(current_rsp: u64) -> u64 {
         }
     };
 
-    set_current_pid(next.pid); activate_task(next.pid);
+    set_current_pid(next.pid);
+    activate_task(next.pid);
 
     // Single centralized CR3 reload for the preemptive path (Requirement 11.5).
     // Delegates to `vmm::load_cr3`, the ONE place that writes CR3 on a switch.
     // The reload doubles as a TLB flush so the next task's stack pages are
     // reloaded. No other site in this path touches CR3.
-    unsafe { vmm::load_cr3(next.cr3); }
+    unsafe {
+        vmm::load_cr3(next.cr3);
+    }
 
     check_frame("restore-tick", next.pid, next.kernel_rsp);
     next.kernel_rsp
@@ -316,7 +396,9 @@ pub fn yield_current() {
     // SAFETY: yield_switch saves this task's full context in the canonical
     // saved-frame layout, requeues it via `scheduler_yield_switch`, and only
     // then switches stacks; the task is resumed later by any restore path.
-    unsafe { crate::task::switch::yield_switch(); }
+    unsafe {
+        crate::task::switch::yield_switch();
+    }
 }
 
 /// Scheduler half of the cooperative yield. Called from the `yield_switch`
@@ -354,13 +436,16 @@ pub extern "C" fn scheduler_yield_switch(current_rsp: u64) -> u64 {
         });
     }
 
-    set_current_pid(next.pid); activate_task(next.pid);
+    set_current_pid(next.pid);
+    activate_task(next.pid);
 
     // Centralized CR3 reload for the cooperative path (Requirement 11.5): the
     // cooperative yield reloads CR3 through the same `vmm::load_cr3` helper the
     // preemptive tick uses, so CR3 is written in exactly one place. CR3 is not
     // rewritten anywhere else in this path.
-    unsafe { vmm::load_cr3(next.cr3); }
+    unsafe {
+        vmm::load_cr3(next.cr3);
+    }
 
     check_frame("restore-yield", next.pid, next.kernel_rsp);
     next.kernel_rsp

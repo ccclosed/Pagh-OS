@@ -129,11 +129,7 @@ pub fn init_dot_entries(block: &mut [u8], self_ino: u32, parent_ino: u32) {
 /// Attempt to insert `(name, ino)` into the directory block by splitting the
 /// slack of an existing record. Returns `Ok(true)` on success, `Ok(false)` if
 /// the block has no room (caller should grow a new block), or `NameTooLong`.
-pub fn insert_into_block(
-    block: &mut [u8],
-    name: &str,
-    ino: u32,
-) -> Result<bool, FsError> {
+pub fn insert_into_block(block: &mut [u8], name: &str, ino: u32) -> Result<bool, FsError> {
     let name_bytes = name.as_bytes();
     if name_bytes.len() > 255 {
         return Err(FsError::NameTooLong);

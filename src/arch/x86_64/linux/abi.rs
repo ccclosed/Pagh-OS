@@ -286,9 +286,10 @@ mod tests {
     #[test]
     fn supported_set_is_exact() {
         let supported = [
-            0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 20, 21, 22, 24, 28, 32, 33, 35, 39,
-            60, 63, 72, 79, 80, 81, 89, 96, 97, 99, 102, 104, 107, 108, 110, 131, 137, 138,
-            158, 186, 201, 202, 217, 218, 228, 230, 231, 257, 262, 267, 273, 292, 293, 302, 318, 334,
+            0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 20, 21, 22, 24, 28, 32, 33, 35,
+            39, 60, 63, 72, 79, 80, 81, 89, 96, 97, 99, 102, 104, 107, 108, 110, 131, 137, 138,
+            158, 186, 201, 202, 217, 218, 228, 230, 231, 257, 262, 267, 273, 292, 293, 302, 318,
+            334,
         ];
         for nr in supported {
             assert!(is_supported(nr), "expected {nr} to be supported");
@@ -305,7 +306,11 @@ mod tests {
     #[test]
     fn process_model_syscalls_stay_unsupported() {
         // The "later milestone" process-model syscalls must remain ENOSYS.
-        for nr in [56u64 /* clone */, 57 /* fork */, 58 /* vfork */] {
+        for nr in [
+            56u64, /* clone */
+            57,    /* fork */
+            58,    /* vfork */
+        ] {
             assert!(!is_supported(nr), "{nr} must stay unsupported");
         }
     }

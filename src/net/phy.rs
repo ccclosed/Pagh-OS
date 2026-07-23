@@ -221,7 +221,10 @@ impl phy::RxToken for SmolRxToken {
         F: FnOnce(&[u8]) -> R,
     {
         // `receive()` always populates `buf`, so this take cannot be `None`.
-        let rx_buf = self.buf.take().expect("SmolRxToken consumed without a buffer");
+        let rx_buf = self
+            .buf
+            .take()
+            .expect("SmolRxToken consumed without a buffer");
 
         // Run smoltcp's parser on the frame bytes WITHOUT holding the NIC lock,
         // so a reply built through the paired TX token (which re-locks the NIC)

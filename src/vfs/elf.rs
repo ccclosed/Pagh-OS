@@ -1,9 +1,9 @@
 // vfs/elf.rs — ELF64 binary loader
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
+use crate::memory::vmm;
 use core::ptr;
 use x86_64::structures::paging::PageTableFlags;
-use crate::memory::vmm;
 
 // Re-export the pure, host-testable ELF classifier and static-PIE bias selector
 // (task 5.1). These live in the sibling `elf_classify` module so they carry no
@@ -42,18 +42,18 @@ pub struct Elf64ProgramHeader {
     pub p_align: u64,
 }
 
-const PT_LOAD: u32   = 1;
-const ET_EXEC: u16   = 2;
+const PT_LOAD: u32 = 1;
+const ET_EXEC: u16 = 2;
 const EM_X86_64: u16 = 0x3E;
 
 const PF_W: u32 = 2;
 const PF_X: u32 = 1;
 
-const EI_MAG0: usize     = 0;
-const EI_CLASS: usize    = 4;
-const EI_DATA: usize     = 5;
-const ELFCLASS64: u8     = 2;
-const ELFDATA2LSB: u8    = 1;
+const EI_MAG0: usize = 0;
+const EI_CLASS: usize = 4;
+const EI_DATA: usize = 5;
+const ELFCLASS64: u8 = 2;
+const ELFDATA2LSB: u8 = 1;
 
 /// Exclusive upper bound of the lower-half canonical address space on x86_64
 /// (48-bit VA): valid user addresses are `0 .. 0x0000_8000_0000_0000`. Anything
@@ -100,16 +100,24 @@ impl ElfLoader {
         // SAFETY: Slice length validated; pointer is byte-aligned.
         let header: &Elf64Header = unsafe { &*(data.as_ptr() as *const Elf64Header) };
 
-        if header.e_ident[EI_MAG0] != 0x7F
-            || &header.e_ident[1..4] != b"ELF"
-        {
+        if header.e_ident[EI_MAG0] != 0x7F || &header.e_ident[1..4] != b"ELF" {
             return Err("ELF: invalid magic");
         }
-        if header.e_ident[EI_CLASS] != ELFCLASS64 { return Err("ELF: not 64-bit"); }
-        if header.e_ident[EI_DATA] != ELFDATA2LSB { return Err("ELF: not little-endian"); }
-        if header.e_type != ET_EXEC { return Err("ELF: not ET_EXEC"); }
-        if header.e_machine != EM_X86_64 { return Err("ELF: not x86_64"); }
-        if header.e_version != 1 { return Err("ELF: unsupported version"); }
+        if header.e_ident[EI_CLASS] != ELFCLASS64 {
+            return Err("ELF: not 64-bit");
+        }
+        if header.e_ident[EI_DATA] != ELFDATA2LSB {
+            return Err("ELF: not little-endian");
+        }
+        if header.e_type != ET_EXEC {
+            return Err("ELF: not ET_EXEC");
+        }
+        if header.e_machine != EM_X86_64 {
+            return Err("ELF: not x86_64");
+        }
+        if header.e_version != 1 {
+            return Err("ELF: unsupported version");
+        }
 
         // Validate the program-header table and every PT_LOAD segment with
         // overflow-safe arithmetic *before* allocating the user PML4 or mapping
@@ -119,11 +127,13 @@ impl ElfLoader {
         // non-canonical address to `VirtAddr::new` (which would panic).
         Self::validate_program_headers(data, header)?;
 
-        crate::debug!("Valid ELF64, entry=0x{:x}, {} phdrs",
-            header.e_entry, header.e_phnum);
+        crate::debug!(
+            "Valid ELF64, entry=0x{:x}, {} phdrs",
+            header.e_entry,
+            header.e_phnum
+        );
 
-        let pml4_phys = vmm::new_user_pml4()
-            .map_err(|_| "ELF: failed to create PML4")?;
+        let pml4_phys = vmm::new_user_pml4().map_err(|_| "ELF: failed to create PML4")?;
 
         // Map the PT_LOAD segments INTO the freshly created user PML4. Because
         // `vmm::map`/`virt_to_phys` operate on the *active* CR3, we temporarily
@@ -137,11 +147,15 @@ impl ElfLoader {
         // so no timer tick can observe the temporarily-installed user CR3.
         let kernel_cr3 = vmm::current_pml4_phys();
         // SAFETY: `pml4_phys` is a valid PML4 containing the kernel higher-half.
-        unsafe { vmm::load_cr3(pml4_phys); }
+        unsafe {
+            vmm::load_cr3(pml4_phys);
+        }
         let load_result = Self::map_segments(data, header);
         // SAFETY: restore the kernel PML4 regardless of success/failure so we
         // never return to the caller with a foreign address space installed.
-        unsafe { vmm::load_cr3(kernel_cr3); }
+        unsafe {
+            vmm::load_cr3(kernel_cr3);
+        }
         let brk = load_result?;
 
         crate::debug!("Loaded: entry=0x{:x} brk=0x{:x}", header.e_entry, brk);
@@ -211,8 +225,7 @@ impl ElfLoader {
             ElfKind::Exec => 0u64,
             ElfKind::Dyn => {
                 let max_end = Self::max_load_vaddr_end(data, header)?;
-                choose_bias(max_end)
-                    .ok_or("ELF: no load bias fits in user address space")?
+                choose_bias(max_end).ok_or("ELF: no load bias fits in user address space")?
             }
         };
 
@@ -224,7 +237,10 @@ impl ElfLoader {
 
         crate::debug!(
             "Linux ELF: kind={:?} bias=0x{:x} entry=0x{:x} {} phdrs",
-            kind, bias, entry, header.e_phnum
+            kind,
+            bias,
+            entry,
+            header.e_phnum
         );
 
         // 3. Fresh user PML4, then map the biased PT_LOAD segments into it. As in
@@ -235,10 +251,14 @@ impl ElfLoader {
 
         let kernel_cr3 = vmm::current_pml4_phys();
         // SAFETY: `pml4_phys` is a valid PML4 containing the kernel higher-half.
-        unsafe { vmm::load_cr3(pml4_phys); }
+        unsafe {
+            vmm::load_cr3(pml4_phys);
+        }
         let map_result = Self::map_segments_biased(data, header, bias);
         // SAFETY: always restore the kernel PML4 before returning to the caller.
-        unsafe { vmm::load_cr3(kernel_cr3); }
+        unsafe {
+            vmm::load_cr3(kernel_cr3);
+        }
         let initial_brk = map_result?;
 
         // 4. Loader outputs for the auxv.
@@ -246,7 +266,12 @@ impl ElfLoader {
 
         crate::debug!(
             "Linux ELF loaded: entry=0x{:x} bias=0x{:x} phdr=0x{:x} phent={} phnum={} brk=0x{:x}",
-            entry, bias, phdr_vaddr, header.e_phentsize, header.e_phnum, initial_brk
+            entry,
+            bias,
+            phdr_vaddr,
+            header.e_phentsize,
+            header.e_phnum,
+            initial_brk
         );
 
         Ok(ElfProcess {
@@ -261,29 +286,34 @@ impl ElfLoader {
     }
 
     /// Map an ET_DYN PT_INTERP image into an existing user address space.
-    pub fn map_interpreter(
-        pml4_phys: u64,
-        data: &[u8],
-        bias: u64,
-    ) -> Result<u64, &'static str> {
+    pub fn map_interpreter(pml4_phys: u64, data: &[u8], bias: u64) -> Result<u64, &'static str> {
         match classify_elf(data) {
-            ElfVerdict::Load { kind: ElfKind::Dyn, .. } => {}
+            ElfVerdict::Load {
+                kind: ElfKind::Dyn, ..
+            } => {}
             ElfVerdict::Load { .. } => return Err("ELF: interpreter is not ET_DYN"),
             ElfVerdict::Reject(msg) => return Err(msg),
         }
         let header: &Elf64Header = unsafe { &*(data.as_ptr() as *const Elf64Header) };
         let max_end = Self::max_load_vaddr_end(data, header)?;
-        let biased_end = bias.checked_add(max_end)
+        let biased_end = bias
+            .checked_add(max_end)
             .ok_or("ELF: interpreter bias overflow")?;
         if biased_end >= USER_ADDR_MAX {
             return Err("ELF: interpreter does not fit in user address space");
         }
-        let entry = header.e_entry.checked_add(bias)
+        let entry = header
+            .e_entry
+            .checked_add(bias)
             .ok_or("ELF: interpreter entry overflow")?;
         let kernel_cr3 = vmm::current_pml4_phys();
-        unsafe { vmm::load_cr3(pml4_phys); }
+        unsafe {
+            vmm::load_cr3(pml4_phys);
+        }
         let result = Self::map_segments_biased(data, header, bias);
-        unsafe { vmm::load_cr3(kernel_cr3); }
+        unsafe {
+            vmm::load_cr3(kernel_cr3);
+        }
         result?;
         Ok(entry)
     }
@@ -306,15 +336,18 @@ impl ElfLoader {
             // In bounds: classify_elf validated phoff + phnum*phentsize <= len.
             let ph_offset = phoff + i * phentsize;
             // SAFETY: `ph_offset + phentsize <= table_end <= data.len()`.
-            let ph: &Elf64ProgramHeader = unsafe {
-                &*(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader)
-            };
-            if ph.p_type != PT_LOAD { continue; }
+            let ph: &Elf64ProgramHeader =
+                unsafe { &*(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
+            if ph.p_type != PT_LOAD {
+                continue;
+            }
             let end = ph
                 .p_vaddr
                 .checked_add(ph.p_memsz)
                 .ok_or("ELF: vaddr range overflow")?;
-            if end > max_end { max_end = end; }
+            if end > max_end {
+                max_end = end;
+            }
         }
         Ok(max_end)
     }
@@ -342,10 +375,11 @@ impl ElfLoader {
             // In bounds: classify_elf validated the phdr table fits in `data`.
             let ph_offset = table_off + i * phentsize;
             // SAFETY: bounds guaranteed by classify_elf.
-            let ph: &Elf64ProgramHeader = unsafe {
-                &*(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader)
-            };
-            if ph.p_type != PT_LOAD { continue; }
+            let ph: &Elf64ProgramHeader =
+                unsafe { &*(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
+            if ph.p_type != PT_LOAD {
+                continue;
+            }
             if first_load_vaddr.is_none() {
                 first_load_vaddr = Some(ph.p_vaddr);
             }
@@ -406,15 +440,20 @@ impl ElfLoader {
             }
 
             // SAFETY: Bounds checked above.
-            let ph: &Elf64ProgramHeader = unsafe {
-                &*(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader)
-            };
+            let ph: &Elf64ProgramHeader =
+                unsafe { &*(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
 
-            if ph.p_type != PT_LOAD { continue; }
+            if ph.p_type != PT_LOAD {
+                continue;
+            }
 
             let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-            if ph.p_flags & PF_W != 0 { flags |= PageTableFlags::WRITABLE; }
-            if ph.p_flags & PF_X == 0 { flags |= PageTableFlags::NO_EXECUTE; }
+            if ph.p_flags & PF_W != 0 {
+                flags |= PageTableFlags::WRITABLE;
+            }
+            if ph.p_flags & PF_X == 0 {
+                flags |= PageTableFlags::NO_EXECUTE;
+            }
 
             // Apply the load bias to the segment's virtual address (R5.2).
             let vaddr_start = ph
@@ -431,20 +470,27 @@ impl ElfLoader {
             let page_end = vaddr_end
                 .checked_add(4095)
                 .ok_or("ELF: vaddr page-round overflow")?
-                / 4096 * 4096;
+                / 4096
+                * 4096;
 
-            crate::debug!("PT_LOAD@bias: 0x{:x}..0x{:x} fsz={} msz={} fl=0x{:x}",
-                vaddr_start, vaddr_end, ph.p_filesz, ph.p_memsz, ph.p_flags);
+            crate::debug!(
+                "PT_LOAD@bias: 0x{:x}..0x{:x} fsz={} msz={} fl=0x{:x}",
+                vaddr_start,
+                vaddr_end,
+                ph.p_filesz,
+                ph.p_memsz,
+                ph.p_flags
+            );
 
             let mut addr = page_start;
             while addr < page_end {
-                let frame = crate::memory::pmm::alloc_frame()
-                    .ok_or("ELF: PMM OOM for LOAD")?;
+                let frame = crate::memory::pmm::alloc_frame().ok_or("ELF: PMM OOM for LOAD")?;
                 // PT_LOAD pages are independent PMM frames, not a physically
                 // contiguous allocation. Zero each frame through its HHDM alias.
-                unsafe { ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, 4096); }
-                vmm::map(frame, addr, flags)
-                    .map_err(|_| "ELF: VMM map failed")?;
+                unsafe {
+                    ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, 4096);
+                }
+                vmm::map(frame, addr, flags).map_err(|_| "ELF: VMM map failed")?;
                 addr += 4096;
             }
 
@@ -482,14 +528,18 @@ impl ElfLoader {
                 while cursor < bss_end {
                     let page_left = 4096u64 - (cursor & 4095);
                     let chunk = core::cmp::min(page_left, bss_end - cursor);
-                    let phys = vmm::virt_to_phys(cursor)
-                        .ok_or("ELF: failed to translate bss page")?;
-                    unsafe { ptr::write_bytes(vmm::phys_to_virt(phys) as *mut u8, 0, chunk as usize); }
+                    let phys =
+                        vmm::virt_to_phys(cursor).ok_or("ELF: failed to translate bss page")?;
+                    unsafe {
+                        ptr::write_bytes(vmm::phys_to_virt(phys) as *mut u8, 0, chunk as usize);
+                    }
                     cursor += chunk;
                 }
             }
 
-            if vaddr_end > brk { brk = vaddr_end; }
+            if vaddr_end > brk {
+                brk = vaddr_end;
+            }
         }
 
         brk = (brk + 4095) & !4095;
@@ -540,11 +590,12 @@ impl ElfLoader {
             // SAFETY: `ph_offset + phentsize <= table_end <= data.len()` and
             // `phentsize >= size_of::<Elf64ProgramHeader>()`, so the full
             // program-header struct lies within `data`.
-            let ph: &Elf64ProgramHeader = unsafe {
-                &*(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader)
-            };
+            let ph: &Elf64ProgramHeader =
+                unsafe { &*(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
 
-            if ph.p_type != PT_LOAD { continue; }
+            if ph.p_type != PT_LOAD {
+                continue;
+            }
 
             // File data range must lie within the input buffer.
             if ph.p_filesz > 0 {
@@ -564,7 +615,8 @@ impl ElfLoader {
             }
 
             // Virtual range must be canonical lower-half (user) and not overflow.
-            let vaddr_end = ph.p_vaddr
+            let vaddr_end = ph
+                .p_vaddr
                 .checked_add(ph.p_memsz)
                 .ok_or("ELF: vaddr range overflow")?;
             if ph.p_vaddr >= USER_ADDR_MAX || vaddr_end > USER_ADDR_MAX {
@@ -615,15 +667,20 @@ impl ElfLoader {
             }
 
             // SAFETY: Bounds checked above.
-            let ph: &Elf64ProgramHeader = unsafe {
-                &*(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader)
-            };
+            let ph: &Elf64ProgramHeader =
+                unsafe { &*(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
 
-            if ph.p_type != PT_LOAD { continue; }
+            if ph.p_type != PT_LOAD {
+                continue;
+            }
 
             let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-            if ph.p_flags & PF_W != 0 { flags |= PageTableFlags::WRITABLE; }
-            if ph.p_flags & PF_X == 0 { flags |= PageTableFlags::NO_EXECUTE; }
+            if ph.p_flags & PF_W != 0 {
+                flags |= PageTableFlags::WRITABLE;
+            }
+            if ph.p_flags & PF_X == 0 {
+                flags |= PageTableFlags::NO_EXECUTE;
+            }
 
             let vaddr_start = ph.p_vaddr;
             let vaddr_end = vaddr_start
@@ -636,20 +693,27 @@ impl ElfLoader {
             let page_end = vaddr_end
                 .checked_add(4095)
                 .ok_or("ELF: vaddr page-round overflow")?
-                / 4096 * 4096;
+                / 4096
+                * 4096;
 
-            crate::debug!("PT_LOAD: 0x{:x}..0x{:x} fsz={} msz={} fl=0x{:x}",
-                vaddr_start, vaddr_end, ph.p_filesz, ph.p_memsz, ph.p_flags);
+            crate::debug!(
+                "PT_LOAD: 0x{:x}..0x{:x} fsz={} msz={} fl=0x{:x}",
+                vaddr_start,
+                vaddr_end,
+                ph.p_filesz,
+                ph.p_memsz,
+                ph.p_flags
+            );
 
             let mut addr = page_start;
             while addr < page_end {
-                let frame = crate::memory::pmm::alloc_frame()
-                    .ok_or("ELF: PMM OOM for LOAD")?;
+                let frame = crate::memory::pmm::alloc_frame().ok_or("ELF: PMM OOM for LOAD")?;
                 // PT_LOAD pages are independent PMM frames, not a physically
                 // contiguous allocation. Zero each frame through its HHDM alias.
-                unsafe { ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, 4096); }
-                vmm::map(frame, addr, flags)
-                    .map_err(|_| "ELF: VMM map failed")?;
+                unsafe {
+                    ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, 4096);
+                }
+                vmm::map(frame, addr, flags).map_err(|_| "ELF: VMM map failed")?;
                 addr += 4096;
             }
 
@@ -687,14 +751,18 @@ impl ElfLoader {
                 while cursor < bss_end {
                     let page_left = 4096u64 - (cursor & 4095);
                     let chunk = core::cmp::min(page_left, bss_end - cursor);
-                    let phys = vmm::virt_to_phys(cursor)
-                        .ok_or("ELF: failed to translate bss page")?;
-                    unsafe { ptr::write_bytes(vmm::phys_to_virt(phys) as *mut u8, 0, chunk as usize); }
+                    let phys =
+                        vmm::virt_to_phys(cursor).ok_or("ELF: failed to translate bss page")?;
+                    unsafe {
+                        ptr::write_bytes(vmm::phys_to_virt(phys) as *mut u8, 0, chunk as usize);
+                    }
                     cursor += chunk;
                 }
             }
 
-            if vaddr_end > brk { brk = vaddr_end; }
+            if vaddr_end > brk {
+                brk = vaddr_end;
+            }
         }
 
         brk = (brk + 4095) & !4095;

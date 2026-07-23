@@ -1,22 +1,22 @@
 // arch/x86_64/apic.rs — APIC subsystem: LAPIC timer, I/O APIC, IRQ dispatch
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
+use crate::sync::spinlock::Spinlock;
 use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::port::Port;
-use crate::sync::spinlock::Spinlock;
 
-const LAPIC_EOI: u32       = 0x0B0;
-const LAPIC_SPURIOUS: u32  = 0x0F0;
+const LAPIC_EOI: u32 = 0x0B0;
+const LAPIC_SPURIOUS: u32 = 0x0F0;
 const LAPIC_LVT_TIMER: u32 = 0x320;
-const LAPIC_TIMER_INIT: u32  = 0x380;
-const LAPIC_TIMER_DIV: u32    = 0x3E0;
+const LAPIC_TIMER_INIT: u32 = 0x380;
+const LAPIC_TIMER_DIV: u32 = 0x3E0;
 
 const SPURIOUS_ENABLE: u32 = 0x100;
 const SPURIOUS_VECTOR: u32 = 0xFF;
 
-const IOAPIC_REG_SEL: u32   = 0x00;
-const IOAPIC_REG_WIN: u32   = 0x10;
+const IOAPIC_REG_SEL: u32 = 0x00;
+const IOAPIC_REG_WIN: u32 = 0x10;
 const IOAPIC_REDTBL_BASE: u32 = 0x10;
 
 static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
@@ -114,29 +114,35 @@ fn init_lapic() {
         let spurious = SPURIOUS_VECTOR | SPURIOUS_ENABLE;
         lapic_write(LAPIC_SPURIOUS, spurious);
         let spurious_read = lapic_read(LAPIC_SPURIOUS);
-        crate::debug!("Spurious reg: wrote=0x{:x} read=0x{:x}", spurious, spurious_read);
-        
-        lapic_write(LAPIC_TIMER_DIV, 3);  // Divide by 16
-        lapic_write(LAPIC_TIMER_INIT, 625_000);  // Initial count for ~100Hz
-        
-        let timer_cfg = 32 | (1 << 17);  // Vector 32, periodic mode
+        crate::debug!(
+            "Spurious reg: wrote=0x{:x} read=0x{:x}",
+            spurious,
+            spurious_read
+        );
+
+        lapic_write(LAPIC_TIMER_DIV, 3); // Divide by 16
+        lapic_write(LAPIC_TIMER_INIT, 625_000); // Initial count for ~100Hz
+
+        let timer_cfg = 32 | (1 << 17); // Vector 32, periodic mode
         lapic_write(LAPIC_LVT_TIMER, timer_cfg);
         let timer_read = lapic_read(LAPIC_LVT_TIMER);
         crate::debug!("Timer LVT: wrote=0x{:x} read=0x{:x}", timer_cfg, timer_read);
-        
+
         // Check if timer is masked
         if (timer_read & (1 << 16)) != 0 {
             crate::warn!("Timer is MASKED! Unmasking...");
             lapic_write(LAPIC_LVT_TIMER, timer_cfg & !(1 << 16));
         }
-        
+
         lapic_write(LAPIC_EOI, 0);
     }
     crate::debug!("LAPIC fully configured (vector 32, 100 Hz)");
 }
 
 fn init_ioapic() {
-    if IOAPIC_BASE.load(Ordering::Relaxed) == 0 { return; }
+    if IOAPIC_BASE.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     // SAFETY: IOAPIC_BASE is non-zero here, so it holds the HHDM-mapped I/O APIC
     // MMIO base; the ioapic_read/write helpers access only valid mapped registers.
     unsafe {
@@ -155,15 +161,14 @@ pub fn init() {
     let addrs = crate::arch::x86_64::acpi::apic_addresses();
     let lapic_phys = addrs.lapic_phys;
     let ioapic_phys = addrs.ioapic_phys;
-    
+
     // The APIC owns its own MMIO mapping (Requirement 7.4): establish the
     // LAPIC/IOAPIC mappings here via the VMM's `map_mmio` helper before any
     // register access. `map_mmio` maps NO_CACHE|NO_EXECUTE|PRESENT|WRITABLE
     // through the HHDM window and returns the virtual base, which equals
     // `phys + hhdm` — the same value previously computed by hand — so
     // LAPIC_BASE/IOAPIC_BASE are unchanged.
-    let lapic_virt =
-        crate::memory::vmm::map_mmio(lapic_phys, 0x1000).expect("map LAPIC MMIO");
+    let lapic_virt = crate::memory::vmm::map_mmio(lapic_phys, 0x1000).expect("map LAPIC MMIO");
     let ioapic_virt = if ioapic_phys != 0 {
         crate::memory::vmm::map_mmio(ioapic_phys, 0x1000).expect("map IOAPIC MMIO")
     } else {
@@ -172,9 +177,12 @@ pub fn init() {
     LAPIC_BASE.store(lapic_virt, Ordering::Relaxed);
     IOAPIC_BASE.store(ioapic_virt, Ordering::Relaxed);
 
-    crate::debug!("LAPIC virt=0x{:x}, IOAPIC virt=0x{:x}", 
-        LAPIC_BASE.load(Ordering::Relaxed), IOAPIC_BASE.load(Ordering::Relaxed));
-    
+    crate::debug!(
+        "LAPIC virt=0x{:x}, IOAPIC virt=0x{:x}",
+        LAPIC_BASE.load(Ordering::Relaxed),
+        IOAPIC_BASE.load(Ordering::Relaxed)
+    );
+
     init_lapic();
     init_ioapic();
 }
@@ -184,18 +192,24 @@ pub fn register_irq(vector: u8, handler: fn()) {
 }
 
 pub fn irq_dispatch(vector: u8) {
-    if vector < 32 { return; }
+    if vector < 32 {
+        return;
+    }
     if let Some(h) = IRQ_HANDLERS.lock()[(vector - 32) as usize] {
         h();
     }
 }
 
 pub fn send_eoi() {
-    unsafe { lapic_write(LAPIC_EOI, 0); }
+    unsafe {
+        lapic_write(LAPIC_EOI, 0);
+    }
 }
 
 pub fn route_irq(isa_irq: u8, vector: u8) {
-    if IOAPIC_BASE.load(Ordering::Relaxed) == 0 { return; }
+    if IOAPIC_BASE.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     // SAFETY: IOAPIC_BASE is non-zero here, so it holds the HHDM-mapped I/O APIC
     // MMIO base; ioapic_write only touches the valid mapped redirection registers.
     unsafe {

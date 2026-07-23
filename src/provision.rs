@@ -1,10 +1,11 @@
 //! Idempotent first-boot filesystem provisioning for pagh.
 
-use alloc::sync::Arc;
 use crate::vfs::{VfsError, VfsNode};
+use alloc::sync::Arc;
 
 const RELEASE: &[u8] = b"NAME=pagh OS\nID=pagh\nVERSION=0.2-dev\nARCH=x86_64\n";
-const MOTD: &[u8] = b"pagh OS 0.2-dev\nType 'help' to list commands. Network apt and nano+ are available.\n";
+const MOTD: &[u8] =
+    b"pagh OS 0.2-dev\nType 'help' to list commands. Network apt and nano+ are available.\n";
 const README: &[u8] = b"Welcome to pagh!\n\nTry:\n  help\n  nano --settings\n  nano /mnt/home/user/notes.txt\n  cargo run /mnt/examples/hello\n  apt update\n";
 const CARGO: &[u8] = b"[package]\nname = \"pagh-hello\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
 const MAIN_RS: &[u8] = b"fn main() {\n    let values = [8, 16, 32];\n    println!(\"Hello from pagh mini-Rust! sum = {}\", values.iter().sum());\n}\n";
@@ -23,12 +24,16 @@ fn ensure_dir(path: &str) -> Result<Arc<dyn VfsNode>, VfsError> {
 }
 
 fn write_once(path: &str, data: &[u8]) -> Result<(), VfsError> {
-    if crate::vfs::lookup_path(path).is_ok() { return Ok(()); }
+    if crate::vfs::lookup_path(path).is_ok() {
+        return Ok(());
+    }
     let split = path.rfind('/').ok_or(VfsError::InvalidArgument)?;
     let parent = if split == 0 { "/" } else { &path[..split] };
     let dir = ensure_dir(parent)?;
     let file = dir.create_file(&path[split + 1..])?;
-    if file.write(0, data)? != data.len() { return Err(VfsError::IoError); }
+    if file.write(0, data)? != data.len() {
+        return Err(VfsError::IoError);
+    }
     file.sync();
     Ok(())
 }
@@ -36,7 +41,9 @@ fn write_once(path: &str, data: &[u8]) -> Result<(), VfsError> {
 /// Install release metadata, a home skeleton and examples on the first boot.
 /// Existing files are never overwritten.
 pub fn seed() {
-    if crate::vfs::lookup_path("/mnt/etc/pagh-release").is_ok() { return; }
+    if crate::vfs::lookup_path("/mnt/etc/pagh-release").is_ok() {
+        return;
+    }
     let result = (|| {
         ensure_dir("/mnt/etc")?;
         ensure_dir("/mnt/home/user")?;
@@ -45,7 +52,10 @@ pub fn seed() {
         write_once("/mnt/etc/pagh-release", RELEASE)?;
         write_once("/mnt/etc/motd", MOTD)?;
         write_once("/mnt/home/user/README.txt", README)?;
-        write_once("/mnt/usr/share/pagh/LICENSE-NOTICE.txt", b"pagh kernel and bundled development environment: MIT.\n")?;
+        write_once(
+            "/mnt/usr/share/pagh/LICENSE-NOTICE.txt",
+            b"pagh kernel and bundled development environment: MIT.\n",
+        )?;
         write_once("/mnt/examples/hello/Cargo.toml", CARGO)?;
         write_once("/mnt/examples/hello/src/main.rs", MAIN_RS)?;
         Ok::<(), VfsError>(())
@@ -55,7 +65,6 @@ pub fn seed() {
         Err(error) => crate::warn!("pagh first-boot provisioning failed: {:?}", error),
     }
 }
-
 
 // ─── STAGE-13.8: first-boot base userland (glibc + python3) ──────────────────
 
@@ -139,7 +148,10 @@ pub fn ensure_base_packages_thread() {
     // libpython3.x-stdlib, ...) exactly like a shell 'apt install python3'.
     match crate::pkg::apt::install("python3") {
         Ok(pkgs) => {
-            crate::info!("provision: python3 installed ({} package(s) total)", pkgs.len());
+            crate::info!(
+                "provision: python3 installed ({} package(s) total)",
+                pkgs.len()
+            );
         }
         Err(e) => {
             announce("provision: install python3 failed (details on serial); run 'apt install python3' from the shell to retry");

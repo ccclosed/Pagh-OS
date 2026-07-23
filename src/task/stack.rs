@@ -157,9 +157,15 @@ pub fn build_initial_stack(
     // Strings sit flush against stack_top; the 16 random bytes sit just below
     // them; the fixed table sits below that with argc 16-byte aligned. Any slack
     // becomes zero padding between the table and the random bytes.
-    let str_start = stack_top.checked_sub(str_total).ok_or(StackError::TooLarge)?;
-    let rand_start = str_start.checked_sub(RANDOM_LEN).ok_or(StackError::TooLarge)?;
-    let table_floor = rand_start.checked_sub(table_size).ok_or(StackError::TooLarge)?;
+    let str_start = stack_top
+        .checked_sub(str_total)
+        .ok_or(StackError::TooLarge)?;
+    let rand_start = str_start
+        .checked_sub(RANDOM_LEN)
+        .ok_or(StackError::TooLarge)?;
+    let table_floor = rand_start
+        .checked_sub(table_size)
+        .ok_or(StackError::TooLarge)?;
     let argc_addr = align_down_16(table_floor);
 
     // Fit check (R6.8): must stay within the mapped stack region.

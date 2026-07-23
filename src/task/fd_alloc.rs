@@ -96,7 +96,9 @@ impl<T> FdSlots<T> {
     /// Mutably borrow the object at `fd`, or `None` for an out-of-range/empty slot
     /// (caller maps `None` -> EBADF, R2.14).
     pub fn get_mut(&mut self, fd: u32) -> Option<&mut T> {
-        self.slots.get_mut(fd as usize).and_then(|slot| slot.as_mut())
+        self.slots
+            .get_mut(fd as usize)
+            .and_then(|slot| slot.as_mut())
     }
 
     /// Free the slot at `fd`. Returns [`BadFd`] when the slot is out of range or

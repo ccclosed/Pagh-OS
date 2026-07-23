@@ -260,11 +260,7 @@ pub fn http_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchError
 
                 // Peer closed and rx is drained before we completed: incomplete
                 // download (R8.4), discard partial.
-                if matches!(step, Step::Continue)
-                    && sent
-                    && !sock.may_recv()
-                    && !sock.can_recv()
-                {
+                if matches!(step, Step::Continue) && sent && !sock.may_recv() && !sock.can_recv() {
                     step = Step::Fail(FetchError::Incomplete);
                 }
             }

@@ -119,7 +119,9 @@ fn warn_insecure_once() {
 struct KernelRng;
 
 impl KernelRng {
-    fn new() -> Self { KernelRng }
+    fn new() -> Self {
+        KernelRng
+    }
 }
 
 impl rand_core::RngCore for KernelRng {
@@ -213,7 +215,11 @@ impl TlsTransport {
 
     /// One locked pump + send step. `Ready(Ok(n>0))` once tx accepted bytes,
     /// `Ready(Err)` on a dead socket/timeout, `Pending` (re-woken) otherwise.
-    fn poll_write_impl(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, ErrorKind>> {
+    fn poll_write_impl(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, ErrorKind>> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -253,7 +259,11 @@ impl TlsTransport {
     /// One locked pump + recv step. `Ready(Ok(n>=1))` with data, `Ready(Ok(0))` on
     /// a clean peer close (EOF), `Ready(Err)` on a dead socket/timeout, `Pending`
     /// (re-woken) otherwise.
-    fn poll_read_impl(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ErrorKind>> {
+    fn poll_read_impl(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, ErrorKind>> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }

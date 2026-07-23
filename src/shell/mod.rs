@@ -326,7 +326,10 @@ pub fn shell_main() -> ! {
                     }
                     // Enter: finish the line. Non-empty lines are recorded
                     // (with dedup) and dispatched; navigation is always reset.
-                    keys::KeyEvent::Ctrl(_) | keys::KeyEvent::Escape | keys::KeyEvent::PageUp | keys::KeyEvent::PageDown => {}
+                    keys::KeyEvent::Ctrl(_)
+                    | keys::KeyEvent::Escape
+                    | keys::KeyEvent::PageUp
+                    | keys::KeyEvent::PageDown => {}
                     keys::KeyEvent::Enter => {
                         crate::kprintln!();
                         crate::fb_println!();

@@ -333,7 +333,12 @@ pub fn update() -> Result<usize, AptOpError> {
     for (url, comp) in candidates.iter() {
         crate::info!(
             "apt: Get {}://{}{} [{}/{}/{}]",
-            cfg.scheme(), cfg.host, url, cfg.suite, cfg.component, cfg.arch
+            cfg.scheme(),
+            cfg.host,
+            url,
+            cfg.suite,
+            cfg.component,
+            cfg.arch
         );
         match cfg.fetch(url) {
             Ok(bytes) => {
@@ -510,7 +515,11 @@ pub fn install(name: &str) -> Result<Vec<String>, AptOpError> {
     let total = targets.len();
     if total > 0 {
         let plan: Vec<&str> = targets.iter().map(|(p, _)| p.as_str()).collect();
-        crate::info!("apt: {} new package(s) to install: {}", total, plan.join(" "));
+        crate::info!(
+            "apt: {} new package(s) to install: {}",
+            total,
+            plan.join(" ")
+        );
     }
 
     let mut installed: Vec<String> = Vec::new();
@@ -523,19 +532,21 @@ pub fn install(name: &str) -> Result<Vec<String>, AptOpError> {
         let url = format!("{}/{}", cfg.base, filename);
         crate::info!(
             "apt: [{}/{}] Get {} <- {}://{}{}",
-            step, total, pkg, cfg.scheme(), cfg.host, url
+            step,
+            total,
+            pkg,
+            cfg.scheme(),
+            cfg.host,
+            url
         );
 
-        let bytes = cfg.fetch(&url).map_err(|e| {
-            match e {
-                crate::net::http_fetch::FetchError::NoNetwork => AptOpError::NoNetwork,
-                _ => AptOpError::Download { pkg: pkg.clone() },
-            }
+        let bytes = cfg.fetch(&url).map_err(|e| match e {
+            crate::net::http_fetch::FetchError::NoNetwork => AptOpError::NoNetwork,
+            _ => AptOpError::Download { pkg: pkg.clone() },
         })?;
         let dl = bytes.len();
 
-        let members =
-            deb::parse_ar(&bytes).map_err(|_| AptOpError::Parse { pkg: pkg.clone() })?;
+        let members = deb::parse_ar(&bytes).map_err(|_| AptOpError::Parse { pkg: pkg.clone() })?;
         let deb_members =
             deb::locate_members(&members).map_err(|_| AptOpError::Parse { pkg: pkg.clone() })?;
         let comp = deb::compression_of(deb_members.data.name)
@@ -555,7 +566,11 @@ pub fn install(name: &str) -> Result<Vec<String>, AptOpError> {
         INSTALLED.lock().insert(pkg.clone());
         crate::info!(
             "apt: [{}/{}] Unpacked {} ({} files, {})",
-            step, total, pkg, n, human_bytes(dl as u64)
+            step,
+            total,
+            pkg,
+            n,
+            human_bytes(dl as u64)
         );
         installed.push(pkg);
     }

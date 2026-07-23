@@ -72,8 +72,14 @@ impl Decoder {
             return None;
         }
         match scancode {
-            0x1D => { self.ctrl = true; return None; }
-            0x9D => { self.ctrl = false; return None; }
+            0x1D => {
+                self.ctrl = true;
+                return None;
+            }
+            0x9D => {
+                self.ctrl = false;
+                return None;
+            }
             _ => {}
         }
 
@@ -140,7 +146,9 @@ impl Decoder {
                 // Enter ('\n') and Tab ('\t') are handled above as their own
                 // events, so guard against the table also producing them.
                 match scancode_to_ascii(scancode, self.shift) {
-                    Some(ch) if ch != '\n' && ch != '\t' && self.ctrl => Some(KeyEvent::Ctrl(ch.to_ascii_lowercase())),
+                    Some(ch) if ch != '\n' && ch != '\t' && self.ctrl => {
+                        Some(KeyEvent::Ctrl(ch.to_ascii_lowercase()))
+                    }
                     Some(ch) if ch != '\n' && ch != '\t' => Some(KeyEvent::Char(ch)),
                     _ => None,
                 }

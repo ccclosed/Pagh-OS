@@ -1,9 +1,9 @@
 // drivers/ps2_kbd.rs — PS/2 keyboard driver stub
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
-use alloc::sync::Arc;
-use crate::sync::spinlock::Spinlock;
 use crate::drivers::CharacterDevice;
+use crate::sync::spinlock::Spinlock;
+use alloc::sync::Arc;
 
 const BUF_SIZE: usize = 128;
 
@@ -42,7 +42,9 @@ impl Ps2Keyboard {
 }
 
 impl CharacterDevice for Ps2Keyboard {
-    fn name(&self) -> &str { "keyboard" }
+    fn name(&self) -> &str {
+        "keyboard"
+    }
 
     fn read_char(&self) -> Option<u8> {
         let mut inner = self.inner.lock();

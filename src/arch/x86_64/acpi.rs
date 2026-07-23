@@ -124,7 +124,11 @@ fn rsdp_phys_addr() -> Option<usize> {
         return None;
     }
     let hhdm = crate::HHDM_OFFSET.load(Ordering::Relaxed);
-    let phys = if rsdp_virt >= hhdm { rsdp_virt - hhdm } else { rsdp_virt };
+    let phys = if rsdp_virt >= hhdm {
+        rsdp_virt - hhdm
+    } else {
+        rsdp_virt
+    };
     Some(phys as usize)
 }
 
