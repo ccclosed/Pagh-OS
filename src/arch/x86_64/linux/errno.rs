@@ -33,12 +33,16 @@ pub enum Errno {
     ENOMEM = 12,
     /// Bad address.
     EFAULT = 14,
+    /// File exists.
+    EEXIST = 17,
     /// Not a directory.
     ENOTDIR = 20,
     /// Is a directory.
     EISDIR = 21,
     /// Invalid argument.
     EINVAL = 22,
+    /// Inappropriate ioctl for device (not a tty).
+    ENOTTY = 25,
     /// Illegal seek (pipe/non-seekable).
     ESPIPE = 29,
     /// Broken pipe.

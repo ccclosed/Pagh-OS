@@ -450,7 +450,10 @@ pub fn sys_close(fd: u64) -> Result<u64, Errno> {
 pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> Result<u64, Errno> {
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
-        Some(Resolved::Console) | Some(Resolved::Stdin) => Err(Errno::EINVAL),
+        // STAGE-13.8 ERRNO FIX: the console is not seekable — ESPIPE, like a
+        // pipe. CPython probes lseek on fds 0/1/2 at startup to decide
+        // buffering; EINVAL spammed the diag log three times per start.
+        Some(Resolved::Console) | Some(Resolved::Stdin) => Err(Errno::ESPIPE),
         Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_)) => Err(Errno::ESPIPE),
         // A directory descriptor supports rewinding/positioning its dents cursor:
         // SEEK_SET sets the cursor index, returning it. Other whences are EINVAL.
@@ -580,7 +583,11 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
         Some(Resolved::Console) | Some(Resolved::Stdin) => tty_ioctl(request, arg),
-        Some(_) => Err(Errno::EINVAL),
+        // STAGE-13.8 ERRNO FIX: a tty request on a non-tty fd is "inappropriate
+        // ioctl for device", not "invalid argument". glibc isatty() expects
+        // ENOTTY; EINVAL also tripped the EINVAL diag on every isatty probe
+        // CPython makes (TCGETS on fd 3) and flooded the serial log.
+        Some(_) => Err(Errno::ENOTTY),
     }
 }
 
@@ -641,7 +648,7 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
         // Window-size writes are accepted and ignored (readline issues
         // TIOCSWINSZ during startup to propagate its computed size).
         TIOCSWINSZ => Ok(0),
-        _ => Err(Errno::EINVAL),
+        _ => Err(Errno::ENOTTY),
     }
 }
 
@@ -742,6 +749,35 @@ pub fn sys_access(path: u64, _mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
     vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
+    Ok(0)
+}
+
+/// `mkdir` (83): create a directory on the mounted VFS/ext2 tree (STAGE-13.8).
+/// CPython probes it for pyc cache directories; ENOSYS was tolerated but
+/// logged an "unsupported syscall" warning on every interpreter start.
+pub fn sys_mkdir(path: u64, _mode: u64) -> Result<u64, Errno> {
+    let p = read_user_cstr(path)?;
+    let abs = resolve_path(&p);
+    let trimmed = abs.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(Errno::EEXIST); // "/" always exists
+    }
+    if vfs::lookup_path(trimmed).is_ok() {
+        return Err(Errno::EEXIST);
+    }
+    let (parent, name) = match trimmed.rfind('/') {
+        Some(0) => ("/", &trimmed[1..]),
+        Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
+        None => return Err(Errno::ENOENT),
+    };
+    if name.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    let dir = vfs::lookup_path(parent).map_err(|_| Errno::ENOENT)?;
+    dir.create_dir(name).map_err(|e| {
+        crate::error!("[linux] mkdir failed: {:?} parent={} name={}", e, parent, name);
+        Errno::EIO
+    })?;
     Ok(0)
 }
 

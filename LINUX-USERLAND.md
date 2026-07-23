@@ -20,6 +20,9 @@ including the full CPython 3.13 REPL installed straight from Debian packages.
 - Minimal `select`/`pselect6`/`ppoll`: the cooked-tty stdin reports readable and
   the following `read` blocks line-buffered — enough for GNU readline and the
   interactive CPython prompt.
+- `mkdir` creates real directories on ext2; tty ioctls on non-tty fds return
+  `ENOTTY` and `lseek` on the console returns `ESPIPE`, so a normal CPython
+  start no longer floods the serial log with EINVAL diagnostics.
 - The `python` shell command finds the installed CPython and runs it with a proper
   `PYTHONHOME`/`PYTHONPATH` environment (`PYTHON_BASIC_REPL=1`).
 

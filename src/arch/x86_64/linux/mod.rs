@@ -102,6 +102,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::NEWFSTATAT => io_sys::sys_newfstatat(a[0], a[1], a[2], a[3]),
         sysno::IOCTL => io_sys::sys_ioctl(a[0], a[1], a[2]),
         sysno::ACCESS => io_sys::sys_access(a[0], a[1]),
+        sysno::MKDIR => io_sys::sys_mkdir(a[0], a[1]),
         sysno::POLL => io_sys::sys_poll(a[0], a[1], a[2]),
         sysno::SELECT => io_sys::sys_select(a[0], a[1], a[2], a[3], a[4]),
         sysno::PSELECT6 => io_sys::sys_pselect6(a[0], a[1], a[2], a[3], a[4], a[5]),
@@ -261,7 +262,9 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
             // number and raw args. Userspace surfaces a bare OSError(EINVAL)
             // (python importlib get_data) with no way to tell which syscall
             // produced it; this pinpoints the culprit on the next run.
-            if matches!(e, Errno::EINVAL) {
+            // readlink's EINVAL means "not a symlink" — a legitimate answer
+            // for a regular file, not a misbehaving syscall.
+            if matches!(e, Errno::EINVAL) && nr != sysno::READLINK {
                 crate::warn!(
                     "[linux] EINVAL diag: nr={} args=[{:#x}, {:#x}, {:#x}, {:#x}]",
                     nr, args[0], args[1], args[2], args[3]

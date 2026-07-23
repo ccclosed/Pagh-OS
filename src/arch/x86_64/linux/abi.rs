@@ -88,6 +88,8 @@ pub mod nr {
     /// `fchdir` — change the cwd to a directory fd's path.
     pub const FCHDIR: u64 = 81;
     /// `readlink` — read the target of a symbolic link.
+    /// `mkdir` — create a directory.
+    pub const MKDIR: u64 = 83;
     pub const READLINK: u64 = 89;
     /// `gettimeofday` — get wall-clock time as a `timeval`.
     pub const GETTIMEOFDAY: u64 = 96;
@@ -226,6 +228,7 @@ pub fn is_supported(nr: u64) -> bool {
             | nr::CHDIR
             | nr::FCHDIR
             | nr::READLINK
+            | nr::MKDIR
             | nr::GETTIMEOFDAY
             | nr::GETRLIMIT
             | nr::SYSINFO
