@@ -39,7 +39,7 @@ manager** that fetches and installs Debian `.deb` packages by name over HTTP/HTT
 > the development build enables network apt; HTTPS is encrypted but certificate and repository-signature verification are still pending, so downloaded packages remain untrusted
 > for an isolated, developer-controlled QEMU mirror. See `SECURITY.md` and `HARDENING.md`.
 
-> **Authorship:** this kernel was written by Claude Opus 4.8 under human supervision.
+> **Authorship:** this kernel was written by AI under human supervision.
 
 ---
 
