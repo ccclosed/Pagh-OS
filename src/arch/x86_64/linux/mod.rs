@@ -124,6 +124,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::MUNMAP => mem_sys::sys_munmap(a[0], a[1]),
         sysno::MPROTECT => mem_sys::sys_mprotect(a[0], a[1], a[2]),
         // `madvise` is purely advisory: accept every hint and do nothing.
+        sysno::TGKILL => misc::sys_tgkill(a[0], a[1], a[2]),
         sysno::MADVISE => Ok(0),
         // ── Misc + process (task 12.5) ──
         sysno::GETPID => misc::sys_getpid(),

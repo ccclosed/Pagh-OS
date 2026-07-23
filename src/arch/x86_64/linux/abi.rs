@@ -135,6 +135,8 @@ pub mod nr {
     pub const PIPE2: u64 = 293;
     /// `madvise` — advisory memory-usage hints (accepted and ignored).
     pub const MADVISE: u64 = 28;
+    /// `tgkill` — send a signal to a specific thread (single-thread model: self).
+    pub const TGKILL: u64 = 234;
     /// `prlimit64` — get/set a resource limit.
     pub const PRLIMIT64: u64 = 302;
     /// `getrandom` — fill a buffer with random bytes.
@@ -190,6 +192,7 @@ pub fn is_supported(nr: u64) -> bool {
             | nr::MPROTECT
             | nr::MUNMAP
             | nr::MADVISE
+            | nr::TGKILL
             | nr::BRK
             | nr::RT_SIGACTION
             | nr::RT_SIGPROCMASK

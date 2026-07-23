@@ -14,6 +14,9 @@ including the full CPython 3.13 REPL installed straight from Debian packages.
   `/mnt/lib64/`).
 - `LD_LIBRARY_PATH` for `lxrun` children includes `/mnt/usr/lib/x86_64-linux-gnu`,
   where `apt` actually installs libraries.
+- The kernel itself is built without SSE/AVX (soft-float), so user-space SIMD
+  register state (XMM/MXCSR) is never clobbered by syscalls, interrupts, or
+  context switches — the Linux syscall ABI preserves vector registers.
 - The `python` shell command finds the installed CPython and runs it with a proper
   `PYTHONHOME`/`PYTHONPATH` environment (`PYTHON_BASIC_REPL=1`).
 
@@ -42,7 +45,9 @@ The thread is idempotent; delete `disk.img` to re-provision from scratch.
 These return `-ENOSYS` (logged once per syscall number per process):
 
 - `fork`/`clone`, threads, futexes — single-process programs only.
-- Signal delivery (`tgkill`, `sigaltstack` are stubs).
+- Signal delivery. `sigaltstack` is a stub; `tgkill` with a fatal signal aimed
+  at the calling process terminates it with the conventional `128+sig` code
+  (this is how glibc `abort()` ends).
 - `epoll`/`eventfd`/`timerfd` — libuv-based programs (`nvim`) abort at startup.
 - Terminal raw mode: `ioctl` `TCGETS`/`TCSETS`/`TIOCGWINSZ` return `EINVAL`, and stdin
   is line-buffered — ncurses TUIs (`htop`) cannot size or raw-mode the terminal.

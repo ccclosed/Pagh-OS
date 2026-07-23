@@ -191,6 +191,16 @@ pub fn sys_exit_group(code:u64)->!{
     crate::info!("[linux] thread-group {} exited with code {}",tgid,byte); scheduler::exit_current()
 }
 
+/// `tgkill` (234): we model a single-threaded process, so a fatal signal a
+/// process sends to itself (glibc `abort()`/`raise()`) terminates the whole
+/// thread group with the conventional `128 + sig` exit code. Returning
+/// `ENOSYS` here made glibc's `abort()` fall through to a ring-3 `hlt`,
+/// which surfaced as a spurious #GP after every "Fatal Python error".
+pub fn sys_tgkill(_tgid: u64, _tid: u64, sig: u64) -> Result<u64, Errno> {
+    crate::info!("[linux] tgkill: fatal signal {} to self - exiting thread group", sig);
+    sys_exit_group(128 + (sig & 0x3f))
+}
+
 // ─────────────── identity / info / time / sleep / sched / signals ───────────────
 // (Feature: linux-binary-compat) We run as a single root-ish process, so the
 // identity calls return constant ids; signal-related calls accept and return 0
