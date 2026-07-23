@@ -13,7 +13,7 @@
     "disable-redzone": true,
     "frame-pointer": "always",
     "features": "-mmx,-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2,+soft-float",
-    "rustc-abi": "x86-softfloat",
+    "rustc-abi": "softfloat",
     "stack-probes": { "kind": "none" },
     "pre-link-args": {
         "ld.lld": ["-Tlinker.ld", "-nostdlib", "-static"]
