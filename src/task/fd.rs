@@ -231,6 +231,24 @@ impl FdTable {
     /// Whether `fd` carries the FD_CLOEXEC flag.
     pub fn is_cloexec(&self, fd: u32) -> bool { self.cloexec.contains(&fd) }
 
+    /// STAGE-16.8 DIAG: short human name for whatever occupies `fd`.
+    pub fn describe_fd(&self, fd: u32) -> &'static str {
+        match self.slots.get(fd) {
+            None => "closed",
+            Some(OpenObject::Stdin) => "stdin(kbd)",
+            Some(OpenObject::Console) => "console",
+            Some(OpenObject::PipeRead(_)) => "pipe-r",
+            Some(OpenObject::PipeWrite(_)) => "pipe-w",
+            Some(OpenObject::Socket { .. }) => "socket",
+            Some(OpenObject::UnixListener(_)) => "unix-listener",
+            Some(OpenObject::UnixSocketUnbound { .. }) => "unix-unbound",
+            Some(OpenObject::Eventfd { .. }) => "eventfd",
+            Some(OpenObject::File { .. }) => "file",
+            Some(OpenObject::Dir { .. }) => "dir",
+            Some(OpenObject::Epoll { .. }) => "epoll",
+        }
+    }
+
     /// Close every descriptor flagged close-on-exec (the execve sweep).
     pub fn close_cloexec(&mut self) {
         let fds = core::mem::take(&mut self.cloexec);
@@ -252,7 +270,12 @@ impl FdTable {
             rx: Arc::new(PipeEndpoint { state: q_ab, read_end: true, nonblocking }),
             tx: Arc::new(PipeEndpoint { state: q_ba, read_end: false, nonblocking }),
         };
-        (self.alloc(a), self.alloc(b))
+        let fa = self.alloc(a);
+        let fb = self.alloc(b);
+        // STAGE-16.8 DIAG: which descriptor numbers the RPC channel ends get.
+        crate::warn!("[DIAG] socketpair pid={} -> ({},{})",
+            crate::task::scheduler::current_pid(), fa, fb);
+        (fa, fb)
     }
 }
 

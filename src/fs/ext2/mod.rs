@@ -153,6 +153,10 @@ struct Tx<'a> {
     sb: Ext2SuperBlock,
     gds: Vec<Ext2GroupDesc>,
     dirty: BTreeMap<u64, Vec<u8>>,
+    /// STAGE-16.8: blocks in `dirty` that are FILE DATA. Ordered mode: on
+    /// commit they are written straight to their final location and are NOT
+    /// copied through the WAL (metadata-only journaling).
+    data: alloc::collections::BTreeSet<u64>,
 }
 
 impl<'a> Tx<'a> {
@@ -163,6 +167,7 @@ impl<'a> Tx<'a> {
             sb: inner.sb,
             gds: inner.gds.clone(),
             dirty: BTreeMap::new(),
+            data: alloc::collections::BTreeSet::new(),
         }
     }
 
@@ -171,6 +176,22 @@ impl<'a> Tx<'a> {
             let data = self.fs.read_fs_block(blk)?;
             self.dirty.insert(blk, data);
         }
+        Ok(self.dirty.get_mut(&blk).unwrap())
+    }
+
+    /// STAGE-16.8: fetch a FILE DATA block into the dirty set. When the whole
+    /// block is about to be overwritten the disk read is skipped —
+    /// read-modify-write halved sequential write throughput for nothing.
+    fn data_block(&mut self, blk: u64, full_overwrite: bool) -> Result<&mut Vec<u8>, FsError> {
+        if !self.dirty.contains_key(&blk) {
+            let data = if full_overwrite {
+                vec![0u8; BS]
+            } else {
+                self.fs.read_fs_block(blk)?
+            };
+            self.dirty.insert(blk, data);
+        }
+        self.data.insert(blk);
         Ok(self.dirty.get_mut(&blk).unwrap())
     }
 
@@ -419,12 +440,25 @@ impl<'a> Tx<'a> {
             }
         }
 
-        // Hand all dirty blocks to the journal as one transaction.
+        // STAGE-16.8 ORDERED MODE: file data goes straight to its final
+        // location BEFORE the metadata transaction commits (so committed
+        // metadata never points at unwritten data), and only metadata rides
+        // the WAL. This removes the double write of every data block, which
+        // dominated apt/dpkg unpack time.
+        for (blk, data) in self.dirty.iter() {
+            if self.data.contains(blk) {
+                Ext2Fs::write_fs_block_direct(&*self.fs.dev, *blk, data)?;
+            }
+        }
+        // Hand the remaining (metadata) dirty blocks to the journal as one
+        // atomic transaction.
         {
             let mut j = self.fs.journal.lock();
             let mut txn = j.begin();
             for (blk, data) in self.dirty.iter() {
-                j.log_block(&mut txn, *blk, data);
+                if !self.data.contains(blk) {
+                    j.log_block(&mut txn, *blk, data);
+                }
             }
             j.commit(txn)?;
         }
@@ -1099,7 +1133,9 @@ impl Ext2Fs {
         if data.is_empty() {
             return Ok(0);
         }
-        const TX_DATA_BLOCKS: usize = 32;
+        // STAGE-16.8: 64 data blocks per Tx — data is no longer journaled,
+        // so the WAL cap only has to fit the metadata blocks.
+        const TX_DATA_BLOCKS: usize = 64;
 
         let mut written = 0usize;
         let mut pos = offset;
@@ -1117,7 +1153,8 @@ impl Ext2Fs {
                 let blk = tx.map_or_alloc(&mut inode, lbn)?;
                 let chunk = core::cmp::min(BS - within, data.len() - written);
                 {
-                    let b = tx.block(blk as u64)?;
+                    let full = within == 0 && chunk == BS;
+                    let b = tx.data_block(blk as u64, full)?;
                     b[within..within + chunk].copy_from_slice(&data[written..written + chunk]);
                 }
                 written += chunk;

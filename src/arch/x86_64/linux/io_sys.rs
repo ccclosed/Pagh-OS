@@ -1139,9 +1139,18 @@ pub fn sys_fchdir(fd: u64) -> Result<u64, Errno> {
 /// `dup` (32): duplicate `oldfd` into the lowest free descriptor, returning it.
 /// `EBADF` if `oldfd` is not open.
 pub fn sys_dup(oldfd: u64) -> Result<u64, Errno> {
-    compat::with_current_compat(|cs| cs.fds.dup(oldfd as u32))
+    let r = compat::with_current_compat(|cs| cs.fds.dup(oldfd as u32))
         .unwrap_or(Err(Errno::EBADF))
-        .map(|fd| fd as u64)
+        .map(|fd| fd as u64);
+    // STAGE-16.8 DIAG: nvim dup()s its stdio before hiding it behind stderr;
+    // an EBADF here means fd 0/1 were already gone when the server started.
+    match &r {
+        Ok(fd) => crate::warn!("[DIAG] dup pid={} oldfd={} -> {}",
+            crate::task::scheduler::current_pid(), oldfd, fd),
+        Err(_) => crate::warn!("[DIAG] dup pid={} oldfd={} -> EBADF",
+            crate::task::scheduler::current_pid(), oldfd),
+    }
+    r
 }
 
 /// `dup2` (33): duplicate `oldfd` into the explicit descriptor `newfd`, closing
@@ -1204,6 +1213,11 @@ const F_DUPFD_CLOEXEC: u64 = 1030;
 ///     flags are accepted and ignored.
 ///   * anything else → `EINVAL`.
 pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
+    // STAGE-16.8 DIAG: libuv's child-init shuffles stdio fds with F_DUPFD.
+    if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC {
+        crate::warn!("[DIAG] fcntl_dupfd pid={} fd={} min={} cloexec={}",
+            crate::task::scheduler::current_pid(), fd, arg, cmd == F_DUPFD_CLOEXEC);
+    }
     const FD_CLOEXEC: u64 = 1;
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => compat::with_current_compat(|cs| {
