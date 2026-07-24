@@ -44,6 +44,18 @@ pub mod nr {
     pub const SOCKETPAIR: u64 = 53;
     /// `statx` — extended file status (STAGE-15).
     pub const STATX: u64 = 332;
+    /// STAGE-16: AF_UNIX stream sockets (nvim's msgpack-rpc server).
+    pub const SOCKET: u64 = 41;
+    pub const CONNECT: u64 = 42;
+    pub const ACCEPT: u64 = 43;
+    pub const BIND: u64 = 49;
+    pub const LISTEN: u64 = 50;
+    pub const GETSOCKNAME: u64 = 51;
+    pub const ACCEPT4: u64 = 288;
+    /// STAGE-16: session/permission/locking stubs.
+    pub const SETSID: u64 = 112;
+    pub const UMASK: u64 = 95;
+    pub const FLOCK: u64 = 73;
     pub const CLOCK_GETRES: u64 = 229;
     /// `lseek` — reposition a descriptor's offset.
     pub const LSEEK: u64 = 8;
@@ -281,6 +293,16 @@ pub fn is_supported(nr: u64) -> bool {
             | nr::SOCKETPAIR
             | nr::EPOLL_PWAIT
             | nr::STATX
+            | nr::SOCKET
+            | nr::CONNECT
+            | nr::ACCEPT
+            | nr::BIND
+            | nr::LISTEN
+            | nr::GETSOCKNAME
+            | nr::ACCEPT4
+            | nr::SETSID
+            | nr::UMASK
+            | nr::FLOCK
     )
 }
 

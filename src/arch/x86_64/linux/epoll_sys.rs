@@ -208,6 +208,11 @@ fn poll_fd(fd: i32, events: u32) -> u32 {
                 if rx.peer_closed() { r |= EPOLLHUP; }
                 r
             }
+            // STAGE-16: a listener is "readable" when a connection is queued.
+            Some(OpenObject::UnixListener(l)) => {
+                if events & EPOLLIN != 0 && !l.inner.lock().pending.is_empty() { EPOLLIN } else { 0 }
+            }
+            Some(OpenObject::UnixSocketUnbound { .. }) => 0,
             Some(OpenObject::Eventfd { val, .. }) => {
                 let v = *val.lock();
                 if v > 0 && events & EPOLLIN != 0 { EPOLLIN } else { 0 }

@@ -991,7 +991,7 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
 
     // STAGE-14: initialise the VT emulator so nvim' ANSI output renders correctly.
     crate::drivers::vt::init();
-    let env: [&[u8]; 8] = [
+    let env: [&[u8]; 9] = [
         b"TERM=xterm",
         b"PYTHON_BASIC_REPL=1",
         b"PATH=/mnt/usr/bin",
@@ -1000,6 +1000,9 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
         b"PYTHONPATH=/mnt/usr/lib/python3.13:/mnt/usr/lib/python3.16",
         b"RUSTUP_HOME=/mnt/usr/lib/rustlib",
         b"HOME=/mnt/home/user",
+        // STAGE-16: nvim cannot create ~/.local/state/nvim/log; silence the
+        // \"failed to open $NVIM_LOG_FILE\" stderr spam by pointing it at /dev/null.
+        b"NVIM_LOG_FILE=/dev/null",
     ];
     let result = crate::arch::cpu::without_interrupts(|| {
         crate::task::process::run_linux_binary(&path, &argv, &env)

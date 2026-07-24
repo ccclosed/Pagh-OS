@@ -99,6 +99,9 @@ fn resolve_fd(fd: u32) -> Option<Resolved> {
             },
             OpenObject::Dir { .. } => Resolved::Dir,
             OpenObject::Eventfd { val, semaphore } => Resolved::Eventfd { val: Arc::clone(val), semaphore: *semaphore },
+            // STAGE-16: not byte streams — same read/write/seek rejections as epoll fds.
+            OpenObject::UnixListener(_) => Resolved::Epoll,
+            OpenObject::UnixSocketUnbound { .. } => Resolved::Epoll,
             OpenObject::Epoll { .. } => Resolved::Epoll,
         })
     })
@@ -549,7 +552,7 @@ fn synth_ino(name: &str) -> u64 {
 /// Fill a [`LinuxStat`] for a node and copy it to the validated user buffer.
 fn write_stat(node: &Arc<dyn VfsNode>, statbuf: u64) -> Result<u64, Errno> {
     let mode = if node.is_directory() {
-        S_IFDIR | 0o755
+        S_IFDIR | 0o700
     } else {
         S_IFREG | DEFAULT_FILE_PERMS
     };
@@ -604,7 +607,7 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> Result<u64, Errno> {
             Ok(0)
         }
         Some(Resolved::Dir) => {
-            let stat = encode_stat(0, S_IFDIR | 0o755);
+            let stat = encode_stat(0, S_IFDIR | 0o700);
             write_stat_struct(&stat, statbuf);
             Ok(0)
         }
@@ -1086,8 +1089,10 @@ const F_DUPFD_CLOEXEC: u64 = 1030;
 ///   * `F_DUPFD_CLOEXEC` → same, and mark the duplicate close-on-exec.
 ///   * `F_GETFD`/`F_SETFD` → STAGE-15: FD_CLOEXEC is tracked for real now
 ///     (libuv marks its fork error pipe with it and execve must sweep it).
-///   * `F_GETFL` → report `O_RDONLY` (0).
-///   * `F_SETFL` → accept and return 0.
+///   * `F_GETFL` → O_RDWR plus O_NONBLOCK when the descriptor is nonblocking.
+///   * `F_SETFL` → STAGE-16: O_NONBLOCK is applied for real to pipes, sockets
+///     and listeners (libuv reads until EAGAIN, so this must work); other
+///     flags are accepted and ignored.
 ///   * anything else → `EINVAL`.
 pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
     const FD_CLOEXEC: u64 = 1;
@@ -1114,10 +1119,37 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
         })
         .unwrap_or(Err(Errno::EBADF)),
         F_GETFL | F_SETFL => {
-            if resolve_fd(fd as u32).is_none() {
-                return Err(Errno::EBADF);
-            }
-            Ok(0)
+            const O_NONBLOCK_FL: u64 = 0x800;
+            const O_RDWR_FL: u64 = 2;
+            compat::with_current_compat(|cs| {
+                let obj = cs.fds.get_mut(fd as u32).ok_or(Errno::EBADF)?;
+                if cmd == F_GETFL {
+                    let nb = match &*obj {
+                        OpenObject::PipeRead(e) | OpenObject::PipeWrite(e) => e.nonblocking(),
+                        OpenObject::Socket { rx, .. } => rx.nonblocking(),
+                        OpenObject::UnixListener(l) => l.inner.lock().nonblocking,
+                        OpenObject::UnixSocketUnbound { nonblocking } => *nonblocking,
+                        _ => false,
+                    };
+                    Ok(if nb { O_RDWR_FL | O_NONBLOCK_FL } else { O_RDWR_FL })
+                } else {
+                    let on = arg & O_NONBLOCK_FL != 0;
+                    match obj {
+                        OpenObject::PipeRead(e) => *e = e.with_nonblocking(on),
+                        OpenObject::PipeWrite(e) => *e = e.with_nonblocking(on),
+                        OpenObject::Socket { rx, tx } => {
+                            let nrx = rx.with_nonblocking(on);
+                            let ntx = tx.with_nonblocking(on);
+                            *rx = nrx; *tx = ntx;
+                        }
+                        OpenObject::UnixListener(l) => l.inner.lock().nonblocking = on,
+                        OpenObject::UnixSocketUnbound { nonblocking } => *nonblocking = on,
+                        _ => {}
+                    }
+                    Ok(0)
+                }
+            })
+            .unwrap_or(Err(Errno::EBADF))
         }
         _ => Err(Errno::EINVAL),
     }
@@ -1505,14 +1537,14 @@ pub fn sys_statx(dirfd: u64, path: u64, flags: u64, _mask: u64, buf: u64) -> Res
                 write_statx(buf, node.size(), S_IFREG | DEFAULT_FILE_PERMS, ino);
                 Ok(0)
             }
-            Some(Resolved::Dir) => { write_statx(buf, 0, S_IFDIR | 0o755, 1); Ok(0) }
+            Some(Resolved::Dir) => { write_statx(buf, 0, S_IFDIR | 0o700, 1); Ok(0) }
             Some(Resolved::Socket { .. }) => { write_statx(buf, 0, S_IFSOCK | 0o666, 1); Ok(0) }
             Some(_) => { write_statx(buf, 0, S_IFCHR | 0o620, 1); Ok(0) }
         };
     }
     let abs = resolve_path(&p);
     let node = vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
-    let mode = if node.is_directory() { S_IFDIR | 0o755 } else { S_IFREG | DEFAULT_FILE_PERMS };
+    let mode = if node.is_directory() { S_IFDIR | 0o700 } else { S_IFREG | DEFAULT_FILE_PERMS };
     let ino = match node.fs_ino() { 0 => synth_ino(node.name()), ino => ino };
     write_statx(buf, node.size(), mode, ino);
     Ok(0)

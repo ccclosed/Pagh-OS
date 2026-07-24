@@ -32,6 +32,14 @@ impl PipeEndpoint {
     pub fn read_ready(&self)->bool {let s=self.state.lock();!s.bytes.is_empty()||s.writers==0}
     pub fn write_ready(&self)->bool {let s=self.state.lock();s.readers>0&&s.bytes.len()<PIPE_CAPACITY}
     pub fn peer_closed(&self)->bool {let s=self.state.lock();if self.read_end{s.writers==0}else{s.readers==0}}
+    /// STAGE-16: clone this endpoint with a different O_NONBLOCK flag (fcntl
+    /// F_SETFL). The clone registers as an extra reader/writer on the shared
+    /// queue; the original's count drops when its last Arc is released.
+    pub fn with_nonblocking(self: &Arc<Self>, on: bool) -> Arc<PipeEndpoint> {
+        if self.nonblocking == on { return Arc::clone(self); }
+        { let mut s = self.state.lock(); if self.read_end { s.readers += 1 } else { s.writers += 1 } }
+        Arc::new(PipeEndpoint { state: Arc::clone(&self.state), read_end: self.read_end, nonblocking: on })
+    }
 }
 impl Drop for PipeEndpoint {fn drop(&mut self){let mut s=self.state.lock();if self.read_end{s.readers=s.readers.saturating_sub(1)}else{s.writers=s.writers.saturating_sub(1)}}}
 
@@ -63,6 +71,10 @@ pub enum OpenObject {
     /// STAGE-15: one end of an AF_UNIX stream socketpair — a cross-connected
     /// pair of pipe endpoints (rx = this end's incoming bytes, tx = outgoing).
     Socket { rx: Arc<PipeEndpoint>, tx: Arc<PipeEndpoint> },
+    /// STAGE-16: a bound/listening AF_UNIX server socket.
+    UnixListener(Arc<UnixListenerState>),
+    /// STAGE-16: socket(2) created but not yet bound or connected.
+    UnixSocketUnbound { nonblocking: bool },
     /// An epoll instance with its interest list.
     Epoll { interests: Arc<Spinlock<Vec<EpollEntry>>> },
     Dir {
@@ -106,6 +118,8 @@ impl OpenObject {
             },
             OpenObject::Eventfd { val, semaphore } => OpenObject::Eventfd { val: Arc::clone(val), semaphore: *semaphore },
             OpenObject::Socket { rx, tx } => OpenObject::Socket { rx: Arc::clone(rx), tx: Arc::clone(tx) },
+            OpenObject::UnixListener(l) => OpenObject::UnixListener(Arc::clone(l)),
+            OpenObject::UnixSocketUnbound { nonblocking } => OpenObject::UnixSocketUnbound { nonblocking: *nonblocking },
             OpenObject::Epoll { interests } => OpenObject::Epoll { interests: Arc::clone(interests) },
         }
     }
@@ -240,4 +254,50 @@ impl FdTable {
         };
         (self.alloc(a), self.alloc(b))
     }
+}
+
+// --- STAGE-16: AF_UNIX listener plumbing -----------------------------------
+
+/// Mutable half of a listening AF_UNIX socket.
+pub struct UnixListenerInner {
+    /// listen(2) has been called; connect(2) refuses otherwise.
+    pub listening: bool,
+    /// O_NONBLOCK: accept returns EAGAIN instead of blocking.
+    pub nonblocking: bool,
+    /// Fully connected server-side endpoint pairs queued by connect(2),
+    /// waiting for accept(2).
+    pub pending: VecDeque<(Arc<PipeEndpoint>, Arc<PipeEndpoint>)>,
+}
+
+/// STAGE-16: a bound AF_UNIX stream server socket (uv_pipe server in nvim).
+pub struct UnixListenerState {
+    /// The sockaddr_un path this socket was bound to.
+    pub path: String,
+    pub inner: Spinlock<UnixListenerInner>,
+}
+
+impl UnixListenerState {
+    pub fn new(path: String, nonblocking: bool) -> Self {
+        Self { path, inner: Spinlock::new(UnixListenerInner { listening: false, nonblocking, pending: VecDeque::new() }) }
+    }
+}
+
+/// STAGE-16: build the two endpoint pairs of a connected AF_UNIX stream —
+/// (client side, server side) — without allocating fds. connect(2) pushes the
+/// server pair into the listener queue and installs the client pair locally;
+/// accept(2) later turns the server pair into a fresh fd.
+pub fn socket_pair_endpoints(nonblocking_client: bool, nonblocking_server: bool)
+    -> ((Arc<PipeEndpoint>, Arc<PipeEndpoint>), (Arc<PipeEndpoint>, Arc<PipeEndpoint>))
+{
+    let q_cs = Arc::new(Spinlock::new(PipeState { bytes: VecDeque::new(), readers: 1, writers: 1 }));
+    let q_sc = Arc::new(Spinlock::new(PipeState { bytes: VecDeque::new(), readers: 1, writers: 1 }));
+    let client = (
+        Arc::new(PipeEndpoint { state: Arc::clone(&q_sc), read_end: true, nonblocking: nonblocking_client }),
+        Arc::new(PipeEndpoint { state: Arc::clone(&q_cs), read_end: false, nonblocking: nonblocking_client }),
+    );
+    let server = (
+        Arc::new(PipeEndpoint { state: q_cs, read_end: true, nonblocking: nonblocking_server }),
+        Arc::new(PipeEndpoint { state: q_sc, read_end: false, nonblocking: nonblocking_server }),
+    );
+    (client, server)
 }

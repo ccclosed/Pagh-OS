@@ -33,6 +33,7 @@ pub mod epoll_sys;
 pub mod mem_sys;
 pub mod rtc;
 pub mod process_sys;
+pub mod unix_sock;
 
 use abi::nr as sysno;
 use errno::{encode_errno, Errno};
@@ -119,6 +120,16 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::SOCKETPAIR => io_sys::sys_socketpair(a[0], a[1], a[2], a[3]),
         sysno::STATX => io_sys::sys_statx(a[0], a[1], a[2], a[3], a[4]),
         sysno::EPOLL_PWAIT => epoll_sys::sys_epoll_pwait(a[0], a[1], a[2], a[3], a[4]),
+        sysno::SOCKET => unix_sock::sys_socket(a[0], a[1], a[2]),
+        sysno::CONNECT => unix_sock::sys_connect(a[0], a[1], a[2]),
+        sysno::ACCEPT => unix_sock::sys_accept(a[0], a[1], a[2]),
+        sysno::BIND => unix_sock::sys_bind(a[0], a[1], a[2]),
+        sysno::LISTEN => unix_sock::sys_listen(a[0], a[1]),
+        sysno::GETSOCKNAME => unix_sock::sys_getsockname(a[0], a[1], a[2]),
+        sysno::ACCEPT4 => unix_sock::sys_accept4(a[0], a[1], a[2], a[3]),
+        sysno::SETSID => misc::sys_setsid(),
+        sysno::UMASK => misc::sys_umask(a[0]),
+        sysno::FLOCK => misc::sys_flock(a[0], a[1]),
         // ── Directory / path / fd (linux-binary-compat) ──
         sysno::GETDENTS64 => io_sys::sys_getdents64(a[0], a[1], a[2]),
         sysno::GETCWD => io_sys::sys_getcwd(a[0], a[1]),

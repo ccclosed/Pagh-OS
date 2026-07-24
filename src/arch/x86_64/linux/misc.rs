@@ -496,3 +496,16 @@ pub fn sys_getrlimit(resource: u64, rlim: u64) -> Result<u64, Errno> {
     write_rlimit(rlim, resource)?;
     Ok(0)
 }
+
+/// STAGE-16 `setsid` (112): report the caller as its own session leader.
+/// There is no real session/job-control model yet; returning the tgid
+/// satisfies libuv's uv_spawn detach path.
+pub fn sys_setsid() -> Result<u64, Errno> { Ok(compat::current_tgid()) }
+
+/// STAGE-16 `umask` (95): single-user system without a permission model —
+/// accept any mask and report the conventional previous value 022.
+pub fn sys_umask(_mask: u64) -> Result<u64, Errno> { Ok(0o22) }
+
+/// STAGE-16 `flock` (73): advisory locks are meaningless with one user and an
+/// in-process VFS; report success so nvim's swap-file locking proceeds.
+pub fn sys_flock(_fd: u64, _op: u64) -> Result<u64, Errno> { Ok(0) }
