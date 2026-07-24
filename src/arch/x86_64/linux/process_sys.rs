@@ -257,13 +257,14 @@ const FORK_SUPPORTED:u64=0xff|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID|CLONE_CHI
 /// purpose: libuv then falls back to its plain fork+exec spawn path.
 pub fn sys_clone(regs:&SavedRegs,flags:u64,child_stack:u64,parent_tid:u64,child_tid:u64,tls:u64)->Result<u64,Errno>{
     if flags & (CLONE_VM|CLONE_THREAD) == (CLONE_VM|CLONE_THREAD) {
-        if flags & !CLONE_SUPPORTED != 0 {return Err(Errno::ENOSYS)}
+        if flags & !CLONE_SUPPORTED != 0 {crate::warn!("[DIAG] clone(thread): unsupported flags {:#x} -> ENOSYS", flags);return Err(Errno::ENOSYS)}
         // Default stack = the caller's user RSP from the per-task slot at +120
         // above the SavedRegs frame (the global scratch may already belong to a
         // sibling thread by the time we run).
         let stack=if child_stack==0{unsafe{ ((regs as *const SavedRegs as *const u64).add(15)).read() }}else{child_stack}; check_user_ptr(stack.saturating_sub(8),8)?;
         if flags&CLONE_PARENT_SETTID!=0{check_user_ptr(parent_tid,4)?} if flags&CLONE_CHILD_SETTID!=0{check_user_ptr(child_tid,4)?}
         let child=crate::task::process::spawn_linux_thread(regs,stack).map_err(|_|Errno::ENOMEM)?;
+        crate::warn!("[DIAG] clone: thread tid={} in pid={}", child, crate::task::scheduler::current_pid());
         let tls_value=if flags&CLONE_SETTLS!=0{Some(tls)}else{None}; let clear=if flags&CLONE_CHILD_CLEARTID!=0{child_tid}else{0};
         if !crate::task::compat::clone_current_compat(child,tls_value,clear){return Err(Errno::EINVAL)}
         if flags&CLONE_PARENT_SETTID!=0{unsafe{ptr::write_unaligned(parent_tid as *mut u32,child as u32)}}
@@ -271,7 +272,7 @@ pub fn sys_clone(regs:&SavedRegs,flags:u64,child_stack:u64,parent_tid:u64,child_
         return Ok(child)
     }
     // ── fork path (STAGE-15) ──
-    if flags & (CLONE_VM|CLONE_VFORK) != 0 || flags & !FORK_SUPPORTED != 0 {return Err(Errno::ENOSYS)}
+    if flags & (CLONE_VM|CLONE_VFORK) != 0 || flags & !FORK_SUPPORTED != 0 {crate::warn!("[DIAG] clone(fork): unsupported flags {:#x} -> ENOSYS", flags);return Err(Errno::ENOSYS)}
     if child_stack != 0 {return Err(Errno::EINVAL)} // fork(2) never passes a stack
     if flags&CLONE_PARENT_SETTID!=0{check_user_ptr(parent_tid,4)?}
     if flags&CLONE_CHILD_SETTID!=0{check_user_ptr(child_tid,4)?}

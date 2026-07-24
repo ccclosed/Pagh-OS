@@ -142,6 +142,9 @@ fn console_write(slice: &[u8]) {
     // framebuffer entirely. The fb writer already handles \n scrolling and
     // 0x08 backspace, so the line-editor echo renders correctly too.
     // STAGE-14 VT: route all compat stdout/stderr through the VT emulator.
+    // STAGE-16.4 DIAG: if this counter grows but the screen stays black, the
+    // VT renderer is the suspect; if it never grows, the UI client never draws.
+    diag_count(&DIAG_CONSOLE_BYTES, "console bytes", slice.len() as u64, 8192);
     crate::drivers::vt::write(slice);
     match core::str::from_utf8(slice) {
         Ok(s) => { console.write_str(s); }
@@ -248,7 +251,7 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         }
         Some(Resolved::Epoll) => Err(Errno::EINVAL),
         Some(Resolved::PipeRead(e)) => { let mut data=vec![0u8;count as usize];let n=read_pipe(&e,&mut data)?;copy_out(buf,&data[..n]);Ok(n as u64) }
-        Some(Resolved::Socket { rx, .. }) => { let mut data=vec![0u8;count as usize];let n=read_pipe(&rx,&mut data)?;copy_out(buf,&data[..n]);Ok(n as u64) }
+        Some(Resolved::Socket { rx, .. }) => { let mut data=vec![0u8;count as usize];let n=read_pipe(&rx,&mut data)?;if n>0{diag_count(&DIAG_SOCK_R,"sock read",n as u64,16384);}copy_out(buf,&data[..n]);Ok(n as u64) }
         Some(Resolved::File { node, offset }) => {
             let size = node.size();
             let (copied, _) = plan_read(size, offset, count);
@@ -298,7 +301,7 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         Some(Resolved::Epoll) => Err(Errno::EINVAL),
         Some(Resolved::PipeRead(_)) => Err(Errno::EBADF),
         Some(Resolved::PipeWrite(e)) => {let data=copy_in(buf,count);Ok(write_pipe(&e,&data)? as u64)}
-        Some(Resolved::Socket { tx, .. }) => {let data=copy_in(buf,count);Ok(write_pipe(&tx,&data)? as u64)}
+        Some(Resolved::Socket { tx, .. }) => {let data=copy_in(buf,count);let n=write_pipe(&tx,&data)?;if n>0{diag_count(&DIAG_SOCK_W,"sock write",n as u64,16384);}Ok(n as u64)}
         Some(Resolved::Console) => {
             let data = copy_in(buf, count);
             console_write(&data);
@@ -750,7 +753,7 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
                 // c_lflag is at offset 12; ICANON = 0x02
                 let c_lflag = unsafe { core::ptr::read_unaligned((arg + 12) as *const u32) };
                 let raw = c_lflag & 0x02 == 0; // ICANON cleared => raw mode
-                crate::task::compat::with_current_compat(|cs| { cs.raw_mode = raw; });
+                crate::task::compat::with_current_compat(|cs| { if cs.raw_mode != raw { crate::warn!("[DIAG] tty: raw_mode={} pid={}", raw, crate::task::scheduler::current_pid()); } cs.raw_mode = raw; });
             }
             Ok(0)
         }
@@ -788,6 +791,24 @@ pub(crate) fn stdin_input_available() -> bool {
         || crate::drivers::vt::has_input_responses()
         || crate::drivers::ps2_kbd::has_pending()
 }
+
+// STAGE-16.4 DIAG: black-screen telemetry. Counts bytes through the three
+// pipeline segments (client stdout -> VT, RPC socketpair reads/writes) and
+// logs the first byte plus every `step` bytes after, so one glance at the
+// screen shows WHERE the nvim pipeline stalls.
+static DIAG_CONSOLE_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DIAG_SOCK_R: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DIAG_SOCK_W: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DIAG_STDIN_EAGAIN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn diag_count(ctr: &core::sync::atomic::AtomicU64, label: &str, n: u64, step: u64) {
+    let old = ctr.fetch_add(n, core::sync::atomic::Ordering::Relaxed);
+    let new = old + n;
+    if old == 0 || old / step != new / step {
+        crate::warn!("[DIAG] {} pid={} total={}", label,
+            crate::task::scheduler::current_pid(), new);
+    }
+}
 /// Hard cap so a pathological paste cannot grow the cooked line unbounded.
 const STDIN_LINE_MAX: usize = 4096;
 
@@ -810,6 +831,7 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
     {
         let resp = crate::drivers::vt::take_input_responses();
         if !resp.is_empty() {
+            crate::warn!("[DIAG] stdin: injected {} query-reply bytes", resp.len());
             STDIN_PENDING.lock().extend_from_slice(&resp);
         }
     }
@@ -839,6 +861,9 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
                 if STDIN_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed)
                     && (!consumed_any || spins > 200)
                 {
+                    if !DIAG_STDIN_EAGAIN.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                        crate::warn!("[DIAG] stdin: nonblocking read -> first EAGAIN (uv loop is polling)");
+                    }
                     return Err(Errno::EAGAIN);
                 }
                 spins += 1;
@@ -1225,7 +1250,7 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
                         OpenObject::UnixListener(l) => l.inner.lock().nonblocking = on,
                         OpenObject::UnixSocketUnbound { nonblocking } => *nonblocking = on,
                         // STAGE-16.3: libuv flips O_NONBLOCK on the raw tty.
-                        OpenObject::Stdin => { STDIN_NONBLOCK.store(on, core::sync::atomic::Ordering::Relaxed); }
+                        OpenObject::Stdin => { crate::warn!("[DIAG] fcntl: stdin O_NONBLOCK={}", on); STDIN_NONBLOCK.store(on, core::sync::atomic::Ordering::Relaxed); }
                         _ => {}
                     }
                     Ok(0)
