@@ -454,11 +454,51 @@ fn open_resolved(abs: &str) -> Result<u64, Errno> {
     }
 }
 
+// STAGE-16.2: creation flags for open/openat (octal values from fcntl.h).
+const O_CREAT_FL: u64 = 0o100;
+const O_EXCL_FL: u64 = 0o200;
+const O_TRUNC_FL: u64 = 0o1000;
+
 /// Resolve a user path (against the cwd if relative) and allocate a fresh
-/// descriptor for it, or `ENOENT` if the path does not exist (R2.4, R2.5). Shared
-/// by `open`/`openat`.
-fn open_path(path: &str) -> Result<u64, Errno> {
+/// descriptor for it (R2.4). STAGE-16.2: honors O_CREAT/O_EXCL (creates a
+/// regular file via the parent directory's `create_file` - i.e. works on the
+/// /tmp ramfs; read-only trees still refuse) and best-effort O_TRUNC.
+/// `ENOENT` if the path is absent and O_CREAT is unset (R2.5). Shared by
+/// `open`/`openat`.
+fn open_path(path: &str, flags: u64) -> Result<u64, Errno> {
     let abs = resolve_path(path);
+    let trimmed = abs.trim_end_matches('/');
+    let lookup_target = if trimmed.is_empty() { "/" } else { trimmed };
+    match vfs::lookup_path(lookup_target) {
+        Ok(node) => {
+            if flags & O_CREAT_FL != 0 && flags & O_EXCL_FL != 0 {
+                return Err(Errno::EEXIST);
+            }
+            if flags & O_TRUNC_FL != 0 && !node.is_directory() {
+                // Best effort: nodes without truncate support (plain ext2
+                // files in this minimal layer) keep their contents.
+                let _ = node.truncate(0);
+            }
+        }
+        Err(_) => {
+            if flags & O_CREAT_FL == 0 {
+                return Err(Errno::ENOENT);
+            }
+            let (parent, name) = match trimmed.rfind('/') {
+                Some(0) => ("/", &trimmed[1..]),
+                Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
+                None => return Err(Errno::ENOENT),
+            };
+            if name.is_empty() {
+                return Err(Errno::EINVAL);
+            }
+            let dir = vfs::lookup_path(parent).map_err(|_| Errno::ENOENT)?;
+            dir.create_file(name).map_err(|e| {
+                crate::warn!("[linux] open(O_CREAT) failed: {:?} parent={} name={}", e, parent, name);
+                Errno::EIO
+            })?;
+        }
+    }
     open_resolved(&abs)
 }
 
@@ -467,7 +507,7 @@ fn open_path(path: &str) -> Result<u64, Errno> {
 /// Directories open as a directory descriptor usable with `getdents64`.
 pub fn sys_open(path: u64, flags: u64, _mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
-    let fd = open_path(&p)?;
+    let fd = open_path(&p, flags)?;
     // STAGE-15: honor O_CLOEXEC now that execve sweeps flagged descriptors.
     if flags & O_CLOEXEC != 0 {
         compat::with_current_compat(|cs| cs.fds.set_cloexec(fd as u32, true));
@@ -482,7 +522,7 @@ pub fn sys_openat(dirfd: u64, path: u64, flags: u64, _mode: u64) -> Result<u64, 
     // Absolute paths ignore dirfd; relative paths resolve against the cwd (the
     // only directory base this minimal layer tracks), which covers AT_FDCWD.
     let _ = dirfd;
-    let fd = open_path(&p)?;
+    let fd = open_path(&p, flags)?;
     // STAGE-15: honor O_CLOEXEC now that execve sweeps flagged descriptors.
     if flags & O_CLOEXEC != 0 {
         compat::with_current_compat(|cs| cs.fds.set_cloexec(fd as u32, true));

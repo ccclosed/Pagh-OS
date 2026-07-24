@@ -6,6 +6,9 @@ pub mod elf;
 /// R11.6). Kept separate from `elf` so it carries no kernel/paging dependencies;
 /// `elf` re-exports its public items.
 pub mod elf_classify;
+/// STAGE-16.2: in-memory `/tmp` (the only part of the tree with real
+/// `create_dir`/`create_file` support).
+pub mod ramfs;
 
 use alloc::sync::Arc;
 use alloc::string::String;
@@ -204,8 +207,14 @@ pub fn init() {
     let dev = Arc::new(DevDirectory {
         children: vec![Arc::clone(&null), Arc::clone(&serial)],
     }) as Arc<dyn VfsNode>;
+    // STAGE-16.2: writable in-memory /tmp. Linux userspace assumes it exists:
+    // nvim's vim_mktempdir does mkdir("/tmp/nvim.XXXXXX"), which previously
+    // died with NotSupported because no node in the tree implemented
+    // create_dir.
+    let tmp = Arc::new(ramfs::RamDir::new("tmp")) as Arc<dyn VfsNode>;
+    crate::debug!("/tmp (ramfs) - ready");
     let root = Arc::new(RootDirectory {
-        children: Spinlock::new(vec![Arc::clone(&dev)]),
+        children: Spinlock::new(vec![Arc::clone(&dev), tmp]),
     });
     *ROOT_DIR.lock() = Some(Arc::clone(&root));
     *VFS_ROOT.lock() = Some(root as Arc<dyn VfsNode>);

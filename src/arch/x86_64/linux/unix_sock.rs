@@ -25,7 +25,9 @@ const SOCK_NONBLOCK: u64 = 0x800;
 const SOCK_CLOEXEC: u64 = 0x8_0000;
 const SUN_PATH_MAX: usize = 108;
 const SOL_SOCKET: u64 = 1;
+const SO_TYPE: u64 = 3;
 const SO_ERROR: u64 = 4;
+const SO_ACCEPTCONN: u64 = 30;
 
 /// Global listener registry: bound sockaddr_un path -> shared listener state.
 /// The newest bind for a path wins; entries from long-closed listeners are
@@ -211,13 +213,23 @@ pub fn sys_setsockopt(_fd: u64, _level: u64, _optname: u64, _optval: u64, _optle
 /// non-blocking connect. Everything else is EINVAL so callers fall back to
 /// defaults instead of parsing uninitialised memory.
 pub fn sys_getsockopt(_fd: u64, level: u64, optname: u64, optval: u64, optlen: u64) -> Result<u64, Errno> {
-    if level != SOL_SOCKET || optname != SO_ERROR { return Err(Errno::EINVAL); }
+    if level != SOL_SOCKET { return Err(Errno::EINVAL); }
+    // STAGE-16.2: SO_TYPE is what libuv's uv_guess_handle asks right after
+    // fstat reports S_IFSOCK on the stdio fds of the embedded-nvim channel.
+    // Failing it made the whole channel UV_UNKNOWN_HANDLE and hung the
+    // msgpack-RPC handshake (TUI waited forever on a dead pipe).
+    let value: u32 = match optname {
+        SO_ERROR => 0,      // no pending async error
+        SO_TYPE => 1,       // SOCK_STREAM
+        SO_ACCEPTCONN => 0, // "not a listening socket" is fine for probes
+        _ => return Err(Errno::EINVAL),
+    };
     check_user_ptr(optlen, 4)?;
     let want = unsafe { core::ptr::read_unaligned(optlen as *const u32) };
     if want < 4 { return Err(Errno::EINVAL); }
     check_user_ptr(optval, 4)?;
     unsafe {
-        core::ptr::write_unaligned(optval as *mut u32, 0u32);
+        core::ptr::write_unaligned(optval as *mut u32, value);
         core::ptr::write_unaligned(optlen as *mut u32, 4u32);
     }
     Ok(0)
