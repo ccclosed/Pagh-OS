@@ -58,6 +58,13 @@ pub const GETSOCKOPT: u64 = 55;
     pub const SETSID: u64 = 112;
     pub const UMASK: u64 = 95;
     pub const FLOCK: u64 = 73;
+    /// STAGE-16.11: vectored / positional-vectored I/O + file sync. nvim's
+    /// ShaDa reader hit ENOSYS here (E886 "function not implemented").
+    pub const READV: u64 = 19;
+    pub const PREADV: u64 = 295;
+    pub const PWRITEV: u64 = 296;
+    pub const FSYNC: u64 = 74;
+    pub const FDATASYNC: u64 = 75;
     pub const CLOCK_GETRES: u64 = 229;
     /// `lseek` — reposition a descriptor's offset.
     pub const LSEEK: u64 = 8;
@@ -239,6 +246,11 @@ pub fn is_supported(nr: u64) -> bool {
             | nr::PREAD64
             | nr::PWRITE64
             | nr::WRITEV
+            | nr::READV
+            | nr::PREADV
+            | nr::PWRITEV
+            | nr::FSYNC
+            | nr::FDATASYNC
             | nr::ACCESS
             | nr::PIPE
             | nr::SCHED_YIELD

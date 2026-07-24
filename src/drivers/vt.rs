@@ -15,7 +15,7 @@ struct Cell { ch: u8, fg: u32, bg: u32 }
 impl Cell { const BLANK: Self = Self { ch: b' ', fg: DEFAULT_FG, bg: DEFAULT_BG }; }
 
 #[derive(PartialEq, Clone, Copy)]
-enum Es { Normal, Esc, Csi, Osc, OscEsc, Dcs, DcsEsc }
+enum Es { Normal, Esc, Csi, Osc, OscEsc, Dcs, DcsEsc, Chs }
 
 struct Vt {
     cols: usize, rows: usize, cells: Vec<Cell>,
@@ -228,6 +228,11 @@ impl Vt {
                 b'7'=>{self.saved_cx=self.cx;self.saved_cy=self.cy;self.state=Es::Normal;}
                 b'8'=>{self.cx=self.saved_cx;self.cy=self.saved_cy;self.state=Es::Normal;}
                 b'M'=>{if self.cy==self.scroll_top{self.scroll_dn(1);}else if self.cy>0{self.cy-=1;}self.state=Es::Normal;}
+                // STAGE-16.11: ESC ( X / ESC ) X etc. designate the G0/G1
+                // character set. nvim emits ESC(B after every attribute reset;
+                // without this state the designator byte leaked onto the screen
+                // as a literal 'B' after each highlighted span.
+                b'('|b')'|b'*'|b'+'=>{self.state=Es::Chs;}
                 _=>{self.state=Es::Normal;}
             },
             Es::Csi=>match b{
@@ -257,6 +262,7 @@ impl Vt {
                 if b==0x07{self.state=Es::Normal;}
                 else if b==0x1B{self.state=Es::DcsEsc;}
             }
+            Es::Chs=>{self.state=Es::Normal;} // charset designator byte: consume
             Es::DcsEsc=>{
                 self.state=if b==b'\\'{Es::Normal}else{Es::Dcs};
             }

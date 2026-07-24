@@ -384,6 +384,75 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
     Ok(total)
 }
 
+/// STAGE-16.11: `readv` (19) — vectored read. Delegates to `sys_read` on the
+/// first non-empty iovec: a short count is a legal readv result and callers
+/// (glibc stdio, libuv) loop for the rest, so this inherits sys_read's per-fd
+/// blocking semantics without duplicating them.
+pub fn sys_readv(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
+    const IOV_SIZE: u64 = 16;
+    const IOV_MAX: u64 = 1024;
+    if iovcnt == 0 { return Ok(0); }
+    if iovcnt > IOV_MAX { return Err(Errno::EINVAL); }
+    check_user_ptr(iov, iovcnt * IOV_SIZE)?;
+    for i in 0..iovcnt {
+        let entry = iov + i * IOV_SIZE;
+        // SAFETY: the whole iovec array range was validated above.
+        let base = unsafe { *(entry as *const u64) };
+        let len = unsafe { *((entry + 8) as *const u64) };
+        if len == 0 { continue; }
+        return sys_read(fd, base, len);
+    }
+    Ok(0)
+}
+
+/// STAGE-16.11: `preadv` (295) — positional vectored read; first non-empty
+/// iovec via `sys_pread64` (the descriptor offset is not advanced).
+pub fn sys_preadv(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, Errno> {
+    const IOV_SIZE: u64 = 16;
+    const IOV_MAX: u64 = 1024;
+    if iovcnt == 0 { return Ok(0); }
+    if iovcnt > IOV_MAX { return Err(Errno::EINVAL); }
+    check_user_ptr(iov, iovcnt * IOV_SIZE)?;
+    for i in 0..iovcnt {
+        let entry = iov + i * IOV_SIZE;
+        // SAFETY: the whole iovec array range was validated above.
+        let base = unsafe { *(entry as *const u64) };
+        let len = unsafe { *((entry + 8) as *const u64) };
+        if len == 0 { continue; }
+        return sys_pread64(fd, base, len, offset);
+    }
+    Ok(0)
+}
+
+/// STAGE-16.11: `pwritev` (296) — positional vectored write; first non-empty
+/// iovec via `sys_pwrite64`.
+pub fn sys_pwritev(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, Errno> {
+    const IOV_SIZE: u64 = 16;
+    const IOV_MAX: u64 = 1024;
+    if iovcnt == 0 { return Ok(0); }
+    if iovcnt > IOV_MAX { return Err(Errno::EINVAL); }
+    check_user_ptr(iov, iovcnt * IOV_SIZE)?;
+    for i in 0..iovcnt {
+        let entry = iov + i * IOV_SIZE;
+        // SAFETY: the whole iovec array range was validated above.
+        let base = unsafe { *(entry as *const u64) };
+        let len = unsafe { *((entry + 8) as *const u64) };
+        if len == 0 { continue; }
+        return sys_pwrite64(fd, base, len, offset);
+    }
+    Ok(0)
+}
+
+/// STAGE-16.11: `fsync`/`fdatasync` (74/75). nvim fsyncs the ShaDa file on
+/// write; the ext2 WAL already journals every write at syscall time (ordered
+/// mode), so there is no dirty cache to flush — success on any valid fd.
+pub fn sys_fsync(fd: u64) -> Result<u64, Errno> {
+    match resolve_fd(fd as u32) {
+        None => Err(Errno::EBADF),
+        Some(_) => Ok(0),
+    }
+}
+
 /// Read the current process's cwd (absolute), defaulting to `/` when there is no
 /// compat state (a native task driving these handlers in a test harness).
 fn current_cwd() -> String {
