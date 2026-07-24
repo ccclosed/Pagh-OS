@@ -164,8 +164,15 @@ pub fn check_frame(who: &str, pid: u64, rsp: u64) {
     // [+136] and a higher-half RIP; a stack-pointer value in the CS slot is
     // exactly the apt iretq #GP signature (CS=0x...081238 -> #GP err=0x1238).
     let kcs = crate::arch::x86_64::gdt::Selectors::kernel_code().0 as u64;
-    let cs_ok = if is_compat { cs != 0 && cs < 0x40 } else { cs == kcs };
-    let rip_ok = if is_compat { rip_canonical } else { rip_canonical && rip >= 0xffff_8000_0000_0000 };
+    // STAGE-16.8.1: a ring-3 frame (CS with RPL=3, plausible selector) is valid
+    // even for tasks WITHOUT a Linux compat state -- the built-in ring-3 test
+    // process (pid 3) is spawned raw, and 16.5.1 only whitelisted compat tasks,
+    // so its perfectly healthy frame spammed BAD FRAME on every tick. The real
+    // tripwire (a stack-pointer value in the CS slot) still fires: such values
+    // are huge and fail cs < 0x40.
+    let ring3 = cs & 3 == 3 && cs != 0 && cs < 0x40;
+    let cs_ok = if is_compat { cs != 0 && cs < 0x40 } else { cs == kcs || ring3 };
+    let rip_ok = if is_compat || ring3 { rip_canonical } else { rip_canonical && rip >= 0xffff_8000_0000_0000 };
     if !(rip_ok && cs_ok && rf_ok) {
         if !is_compat && KFRAME_ERRS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 8 { return }
         crate::error!("[SCHED] BAD FRAME ({}) pid={} rsp=0x{:x} rip=0x{:x} cs=0x{:x} rflags=0x{:x}", who, pid, rsp, rip, cs, rf);
