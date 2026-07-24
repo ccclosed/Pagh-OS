@@ -40,6 +40,35 @@ impl Tcb {
 }
 
 static READY_QUEUE: Spinlock<VecDeque<Tcb>> = Spinlock::new(VecDeque::new());
+
+// STAGE-16.5 DIAG: frame ledger - catches stale/double restores at the moment
+// they happen instead of at the fatal iretq (the apt #GP: iretq consumed a
+// region of pid 1's stack that no longer held a saved frame). Every save
+// stamps (pid -> rsp, live); every restore must find a matching live stamp
+// and consumes it.
+static FRAME_LEDGER: Spinlock<alloc::collections::BTreeMap<u64, (u64, bool)>> =
+    Spinlock::new(alloc::collections::BTreeMap::new());
+static KFRAME_ERRS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn stamp_save(pid: u64, rsp: u64) {
+    FRAME_LEDGER.lock().insert(pid, (rsp, true));
+}
+
+fn stamp_restore(pid: u64, rsp: u64) {
+    let prev = {
+        let mut led = FRAME_LEDGER.lock();
+        let prev = led.get(&pid).copied();
+        led.insert(pid, (rsp, false));
+        prev
+    };
+    if let Some((saved, live)) = prev {
+        if saved != rsp {
+            crate::error!("[SCHED] STALE RESTORE pid={} rsp=0x{:x} but last saved rsp=0x{:x} (live={})", pid, rsp, saved, live);
+        } else if !live {
+            crate::error!("[SCHED] DOUBLE RESTORE pid={} rsp=0x{:x} (frame already consumed once)", pid, rsp);
+        }
+    }
+}
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 static CURRENT_PID: Spinlock<u64> = Spinlock::new(0);
@@ -84,7 +113,7 @@ pub fn is_idle(pid: u64) -> bool { pid == IDLE_PID }
 
 /// Save the idle task's stack pointer (called when the idle task is preempted).
 #[inline]
-fn save_idle_rsp(rsp: u64) { IDLE_TASK.lock().kernel_rsp = rsp; }
+fn save_idle_rsp(rsp: u64) { stamp_save(IDLE_PID, rsp); IDLE_TASK.lock().kernel_rsp = rsp; }
 
 /// The idle task's saved stack pointer (scheduled when nothing else is ready).
 #[inline]
@@ -126,13 +155,19 @@ pub fn check_frame(who: &str, pid: u64, rsp: u64) {
     // ring-3 invariants always fires a false BAD FRAME and then the
     // iretq blows up on that RSP-as-CS (GP#err=rsp&~3). Only run the
     // check for tasks that actually have a Linux compat state.
-    if !crate::task::compat::compat_exists(pid) { return }
+    let is_compat = crate::task::compat::compat_exists(pid);
     let rd = |off: u64| unsafe { core::ptr::read_volatile((rsp + off) as *const u64) };
     let rip = rd(128); let cs = rd(136); let rf = rd(144);
     let rip_canonical = (((rip as i64) << 16) >> 16) as u64 == rip;
-    let cs_ok = cs != 0 && cs < 0x40;
     let rf_ok = rf & 0x2 != 0;
-    if !(rip_canonical && cs_ok && rf_ok) {
+    // STAGE-16.5: kernel threads must ALWAYS carry the kernel code selector at
+    // [+136] and a higher-half RIP; a stack-pointer value in the CS slot is
+    // exactly the apt iretq #GP signature (CS=0x...081238 -> #GP err=0x1238).
+    let kcs = crate::arch::x86_64::gdt::Selectors::kernel_code().0 as u64;
+    let cs_ok = if is_compat { cs != 0 && cs < 0x40 } else { cs == kcs };
+    let rip_ok = if is_compat { rip_canonical } else { rip_canonical && rip >= 0xffff_8000_0000_0000 };
+    if !(rip_ok && cs_ok && rf_ok) {
+        if !is_compat && KFRAME_ERRS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 8 { return }
         crate::error!("[SCHED] BAD FRAME ({}) pid={} rsp=0x{:x} rip=0x{:x} cs=0x{:x} rflags=0x{:x}", who, pid, rsp, rip, cs, rf);
         let mut i = 0u64;
         while i < 21 {
@@ -142,10 +177,21 @@ pub fn check_frame(who: &str, pid: u64, rsp: u64) {
     }
 }
 
-pub fn spawn(tcb: Tcb) -> u64 { let pid = tcb.pid; check_frame("spawn", pid, tcb.kernel_rsp); READY_QUEUE.lock().push_back(tcb); pid }
+pub fn spawn(tcb: Tcb) -> u64 {
+    let pid = tcb.pid;
+    check_frame("spawn", pid, tcb.kernel_rsp);
+    stamp_save(pid, tcb.kernel_rsp);
+    let mut q = READY_QUEUE.lock();
+    if q.iter().any(|t| t.pid == pid) {
+        crate::error!("[SCHED] DOUBLE ENQUEUE (spawn) pid={} rsp=0x{:x}", pid, tcb.kernel_rsp);
+    }
+    q.push_back(tcb);
+    pid
+}
 pub fn schedule() -> Option<Tcb> { READY_QUEUE.lock().pop_front() }
 pub fn requeue(tcb: Tcb) {
     check_frame("enqueue", tcb.pid, tcb.kernel_rsp);
+    stamp_save(tcb.pid, tcb.kernel_rsp);
     let mut q = READY_QUEUE.lock();
     if q.iter().any(|t| t.pid == tcb.pid) {
         crate::error!("[SCHED] DOUBLE ENQUEUE pid={} rsp=0x{:x}", tcb.pid, tcb.kernel_rsp);
@@ -291,6 +337,7 @@ pub extern "C" fn scheduler_tick_irq(current_rsp: u64) -> u64 {
             set_current_pid(IDLE_PID);
             let rsp = idle_rsp();
             check_frame("restore-idle", IDLE_PID, rsp);
+            stamp_restore(IDLE_PID, rsp);
             return rsp;
         }
     };
@@ -304,6 +351,7 @@ pub extern "C" fn scheduler_tick_irq(current_rsp: u64) -> u64 {
     unsafe { vmm::load_cr3(next.cr3); }
 
     check_frame("restore-tick", next.pid, next.kernel_rsp);
+    stamp_restore(next.pid, next.kernel_rsp);
     next.kernel_rsp
 }
 
@@ -363,6 +411,7 @@ pub extern "C" fn scheduler_yield_switch(current_rsp: u64) -> u64 {
     unsafe { vmm::load_cr3(next.cr3); }
 
     check_frame("restore-yield", next.pid, next.kernel_rsp);
+    stamp_restore(next.pid, next.kernel_rsp);
     next.kernel_rsp
 }
 
