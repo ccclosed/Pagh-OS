@@ -55,6 +55,9 @@ pub struct CompatState {
     /// The normalized exit code (low byte of the requested code), once the
     /// process has exited (R12.3).
     pub exit_code: Option<u8>,
+    /// STAGE-15: absolute VFS path of the exec'd image, reported through
+    /// `readlink("/proc/self/exe")` (libuv's uv_exepath / nvim's progpath).
+    pub exe_path: String,
 }
 
 impl CompatState {
@@ -64,7 +67,7 @@ impl CompatState {
     /// code yet.
     pub fn new(fds: FdTable, vm: VmRegionSet, tid: u64) -> Self { Self::new_with_parent(fds, vm, tid, 1) }
     pub fn new_with_parent(fds: FdTable, vm: VmRegionSet, tid: u64, ppid: u64) -> Self {
-        Self { fds, vm, fs_base: 0, tid, ppid, tgid: tid, clear_child_tid: 0, waitable: true, robust_head: 0, robust_len: 0, cwd: "/".to_string(), nosys_logged: BTreeSet::new(), raw_mode: false, exit_code: None }
+        Self { fds, vm, fs_base: 0, tid, ppid, tgid: tid, clear_child_tid: 0, waitable: true, robust_head: 0, robust_len: 0, cwd: "/".to_string(), nosys_logged: BTreeSet::new(), raw_mode: false, exit_code: None, exe_path: String::new() }
     }
 }
 
@@ -143,6 +146,23 @@ pub fn clone_current_compat(child: u64, tls: Option<u64>, clear_child_tid: u64) 
     child_state.tid = child; child_state.ppid = parent; child_state.waitable = false;
     child_state.clear_child_tid = clear_child_tid; child_state.exit_code = None;
     if let Some(base) = tls { child_state.fs_base = base; }
+    states.insert(child, child_state); true
+}
+
+/// STAGE-15 (fork): clone the parent's full compat state for a forked child.
+/// The child becomes its own thread-group leader (tid = tgid = child pid), is
+/// waitable (a future wait4 zombie for the parent), and inherits the fd table
+/// (Arc-shared pipe/socket endpoints — Linux dup semantics), cwd, fs_base,
+/// raw_mode, robust-list registration, and exe_path.
+pub fn fork_current_compat(child: u64, clear_child_tid: u64) -> bool {
+    let parent = super::scheduler::current_pid();
+    let mut states = COMPAT_STATES.lock();
+    let Some(parent_state) = states.get(&parent) else { return false; };
+    let parent_tgid = parent_state.tgid;
+    let mut child_state = parent_state.clone();
+    child_state.tid = child; child_state.tgid = child; child_state.ppid = parent_tgid;
+    child_state.waitable = true; child_state.clear_child_tid = clear_child_tid;
+    child_state.exit_code = None;
     states.insert(child, child_state); true
 }
 pub fn fs_base_for(pid: u64) -> Option<u64> { COMPAT_STATES.lock().get(&pid).map(|s| s.fs_base) }

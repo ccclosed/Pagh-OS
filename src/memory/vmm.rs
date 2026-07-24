@@ -372,3 +372,85 @@ pub fn map_mmio(phys: u64, len: u64) -> Result<u64, VmError> {
 
     Ok(phys_to_virt(phys))
 }
+
+// ─── STAGE-15: fork support ────────────────────────────────────────────────────
+
+/// STAGE-15 (fork): deep-copy the user lower half (PML4 entries 0..256) of
+/// `src_pml4` into `dst_pml4`, eagerly duplicating every mapped 4 KiB frame
+/// (no copy-on-write). All access goes through the HHDM window, so neither
+/// address space needs to be active in CR3 and no TLB shootdown is needed
+/// (the destination has never been loaded). Leaf flags are preserved;
+/// intermediate tables are rebuilt with the standard user policy. Huge pages
+/// never appear in the user lower half here (the loader and mmap only map
+/// 4 KiB pages), so a huge leaf is reported as `NotMapped` instead of being
+/// silently shared between two address spaces.
+pub fn clone_user_space(src_pml4: u64, dst_pml4: u64) -> Result<(), VmError> {
+    let walker = PageTableWalker::new();
+    let user = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    let src4 = walker.table(src_pml4);
+    for i4 in 0..256usize {
+        let e4 = &src4[i4];
+        if !e4.flags().contains(PageTableFlags::PRESENT) { continue; }
+        let src3 = walker.table(e4.addr().as_u64());
+        for i3 in 0..512usize {
+            let e3 = &src3[i3];
+            if !e3.flags().contains(PageTableFlags::PRESENT) { continue; }
+            if e3.flags().contains(PageTableFlags::HUGE_PAGE) { return Err(VmError::NotMapped); }
+            let src2 = walker.table(e3.addr().as_u64());
+            for i2 in 0..512usize {
+                let e2 = &src2[i2];
+                if !e2.flags().contains(PageTableFlags::PRESENT) { continue; }
+                if e2.flags().contains(PageTableFlags::HUGE_PAGE) { return Err(VmError::NotMapped); }
+                let src1 = walker.table(e2.addr().as_u64());
+                // Build the destination chain lazily — only once this P1 proves
+                // to hold at least one present leaf.
+                let mut dst1: Option<&mut PageTable> = None;
+                for i1 in 0..512usize {
+                    let e1 = &src1[i1];
+                    if !e1.flags().contains(PageTableFlags::PRESENT) { continue; }
+                    if dst1.is_none() {
+                        let p4 = walker.table_mut(dst_pml4);
+                        let p3 = walker.ensure_next(p4, x86_64::structures::paging::PageTableIndex::new(i4 as u16), user)?;
+                        let p2 = walker.ensure_next(p3, x86_64::structures::paging::PageTableIndex::new(i3 as u16), user)?;
+                        let p1 = walker.ensure_next(p2, x86_64::structures::paging::PageTableIndex::new(i2 as u16), user)?;
+                        dst1 = Some(p1);
+                    }
+                    let frame = crate::memory::pmm::alloc_frame().ok_or(VmError::OutOfMemory)?;
+                    // SAFETY: both frames are ordinary RAM reachable through
+                    // the HHDM window; copy one whole page.
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            phys_to_virt(e1.addr().as_u64()) as *const u8,
+                            phys_to_virt(frame) as *mut u8,
+                            4096,
+                        );
+                    }
+                    if let Some(pt) = dst1.as_deref_mut() {
+                        pt[i1].set_addr(x86_64::PhysAddr::new(frame), e1.flags());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// STAGE-15 (fork): translate a user virtual address in the (inactive)
+/// address space rooted at `pml4` — used to write CLONE_CHILD_SETTID into the
+/// child's copied memory. 4 KiB walks only; None on any non-present entry.
+pub fn virt_to_phys_in(pml4: u64, virt: u64) -> Option<u64> {
+    let walker = PageTableWalker::new();
+    let idx4 = ((virt >> 39) & 0x1ff) as usize;
+    let idx3 = ((virt >> 30) & 0x1ff) as usize;
+    let idx2 = ((virt >> 21) & 0x1ff) as usize;
+    let idx1 = ((virt >> 12) & 0x1ff) as usize;
+    let e4 = &walker.table(pml4)[idx4];
+    if !e4.flags().contains(PageTableFlags::PRESENT) { return None; }
+    let e3 = &walker.table(e4.addr().as_u64())[idx3];
+    if !e3.flags().contains(PageTableFlags::PRESENT) || e3.flags().contains(PageTableFlags::HUGE_PAGE) { return None; }
+    let e2 = &walker.table(e3.addr().as_u64())[idx2];
+    if !e2.flags().contains(PageTableFlags::PRESENT) || e2.flags().contains(PageTableFlags::HUGE_PAGE) { return None; }
+    let e1 = &walker.table(e2.addr().as_u64())[idx1];
+    if !e1.flags().contains(PageTableFlags::PRESENT) { return None; }
+    Some(e1.addr().as_u64() + (virt & 0xfff))
+}

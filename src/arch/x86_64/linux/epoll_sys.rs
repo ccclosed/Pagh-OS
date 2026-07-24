@@ -19,8 +19,10 @@ use crate::sync::spinlock::Spinlock;
 pub fn sys_clock_getres(clock_id: u64, ts_ptr: u64) -> Result<u64, Errno> {
     // Supported ids: CLOCK_REALTIME(0), CLOCK_MONOTONIC(1),
     // CLOCK_PROCESS_CPUTIME_ID(2), CLOCK_THREAD_CPUTIME_ID(3),
-    // CLOCK_MONOTONIC_RAW(4), CLOCK_BOOTTIME(7).
-    if !matches!(clock_id, 0|1|2|3|4|7) { return Err(Errno::EINVAL); }
+    // CLOCK_MONOTONIC_RAW(4), CLOCK_REALTIME_COARSE(5), CLOCK_MONOTONIC_COARSE(6),
+    // CLOCK_BOOTTIME(7). STAGE-15: the coarse clocks were missing — libuv probes
+    // CLOCK_MONOTONIC_COARSE(6) at loop init and got the EINVAL diag.
+    if !matches!(clock_id, 0|1|2|3|4|5|6|7) { return Err(Errno::EINVAL); }
     if ts_ptr == 0 { return Ok(0); } // null buf is valid: just validate the id
     check_user_ptr(ts_ptr, 16)?;
     // struct timespec { tv_sec: i64, tv_nsec: i64 } — 1 ms resolution
@@ -42,7 +44,9 @@ pub fn sys_eventfd2(initval: u64, flags: u64) -> Result<u64, Errno> {
     let semaphore = flags & 1 != 0;
     let state = Arc::new(Spinlock::new(initval));
     let fd = compat::with_current_compat(|cs| {
-        cs.fds.alloc(OpenObject::Eventfd { val: state, semaphore })
+        let fd = cs.fds.alloc(OpenObject::Eventfd { val: state, semaphore });
+        if flags & 0x80000 != 0 { cs.fds.set_cloexec(fd, true); } // EFD_CLOEXEC
+        fd
     }).ok_or(Errno::EBADF)?;
     Ok(fd as u64)
 }
@@ -51,10 +55,12 @@ pub fn sys_eventfd2(initval: u64, flags: u64) -> Result<u64, Errno> {
 
 /// `epoll_create1` (291): create an epoll instance. `flags` may be
 /// EPOLL_CLOEXEC (0x80000); others are ignored.
-pub fn sys_epoll_create1(_flags: u64) -> Result<u64, Errno> {
+pub fn sys_epoll_create1(flags: u64) -> Result<u64, Errno> {
     let interests: Arc<Spinlock<Vec<EpollEntry>>> = Arc::new(Spinlock::new(Vec::new()));
     let fd = compat::with_current_compat(|cs| {
-        cs.fds.alloc(OpenObject::Epoll { interests })
+        let fd = cs.fds.alloc(OpenObject::Epoll { interests });
+        if flags & 0x80000 != 0 { cs.fds.set_cloexec(fd, true); } // EPOLL_CLOEXEC
+        fd
     }).ok_or(Errno::EBADF)?;
     Ok(fd as u64)
 }
@@ -162,6 +168,14 @@ pub fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout_ms: u6
     }
 }
 
+/// `epoll_pwait` (281, STAGE-15): `epoll_wait` plus a sigmask. Signals are
+/// never delivered asynchronously in pagh, so the mask is accepted and
+/// ignored; libuv's uv__io_poll calls this unconditionally on newer glibc,
+/// and the ENOSYS fallthrough tripped its `errno == EINTR` assertion.
+pub fn sys_epoll_pwait(epfd: u64, events_ptr: u64, maxevents: u64, timeout_ms: u64, _sigmask: u64) -> Result<u64, Errno> {
+    sys_epoll_wait(epfd, events_ptr, maxevents, timeout_ms)
+}
+
 /// Compute revents for a single fd given requested events.
 fn poll_fd(fd: i32, events: u32) -> u32 {
     use crate::task::fd::OpenObject;
@@ -185,6 +199,13 @@ fn poll_fd(fd: i32, events: u32) -> u32 {
                 let mut r = 0u32;
                 if e.write_ready() && events & EPOLLOUT != 0 { r |= EPOLLOUT; }
                 if e.peer_closed() { r |= EPOLLERR; }
+                r
+            }
+            Some(OpenObject::Socket { rx, tx }) => {
+                let mut r = 0u32;
+                if rx.read_ready() && events & EPOLLIN != 0 { r |= EPOLLIN; }
+                if tx.write_ready() && events & EPOLLOUT != 0 { r |= EPOLLOUT; }
+                if rx.peer_closed() { r |= EPOLLHUP; }
                 r
             }
             Some(OpenObject::Eventfd { val, .. }) => {

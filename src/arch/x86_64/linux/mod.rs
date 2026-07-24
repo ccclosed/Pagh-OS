@@ -115,6 +115,10 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::EPOLL_WAIT => epoll_sys::sys_epoll_wait(a[0], a[1], a[2], a[3]),
         sysno::PIPE => io_sys::sys_pipe(a[0]),
         sysno::PIPE2 => io_sys::sys_pipe2(a[0], a[1]),
+        // ── STAGE-15: nvim uv_spawn support ──
+        sysno::SOCKETPAIR => io_sys::sys_socketpair(a[0], a[1], a[2], a[3]),
+        sysno::STATX => io_sys::sys_statx(a[0], a[1], a[2], a[3], a[4]),
+        sysno::EPOLL_PWAIT => epoll_sys::sys_epoll_pwait(a[0], a[1], a[2], a[3], a[4]),
         // ── Directory / path / fd (linux-binary-compat) ──
         sysno::GETDENTS64 => io_sys::sys_getdents64(a[0], a[1], a[2]),
         sysno::GETCWD => io_sys::sys_getcwd(a[0], a[1]),

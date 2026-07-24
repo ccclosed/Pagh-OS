@@ -38,6 +38,12 @@ pub mod nr {
     pub const PPOLL: u64 = 271;
     pub const EVENTFD2: u64 = 290;
     pub const EPOLL_CREATE1: u64 = 291;
+    /// `epoll_pwait` — epoll_wait with a sigmask (mask accepted and ignored).
+    pub const EPOLL_PWAIT: u64 = 281;
+    /// `socketpair` — pair of connected AF_UNIX stream sockets (STAGE-15).
+    pub const SOCKETPAIR: u64 = 53;
+    /// `statx` — extended file status (STAGE-15).
+    pub const STATX: u64 = 332;
     pub const CLOCK_GETRES: u64 = 229;
     /// `lseek` — reposition a descriptor's offset.
     pub const LSEEK: u64 = 8;
@@ -272,6 +278,9 @@ pub fn is_supported(nr: u64) -> bool {
             | nr::GETRANDOM
             | nr::RSEQ
             | nr::SIGALTSTACK
+            | nr::SOCKETPAIR
+            | nr::EPOLL_PWAIT
+            | nr::STATX
     )
 }
 
@@ -304,7 +313,7 @@ mod tests {
             assert!(is_supported(nr), "expected {nr} to be supported");
         }
         // Out-of-scope numbers: clone/fork/vfork/futex stay unsupported.
-        for nr in [4, 56, 57, 58, 1000, u64::MAX] {
+        for nr in [4, 57, 58, 1000, u64::MAX] {
             if supported.contains(&nr) {
                 continue;
             }
@@ -315,7 +324,7 @@ mod tests {
     #[test]
     fn process_model_syscalls_stay_unsupported() {
         // The "later milestone" process-model syscalls must remain ENOSYS.
-        for nr in [56u64 /* clone */, 57 /* fork */, 58 /* vfork */] {
+        for nr in [57u64 /* fork */, 58 /* vfork */] {
             assert!(!is_supported(nr), "{nr} must stay unsupported");
         }
     }

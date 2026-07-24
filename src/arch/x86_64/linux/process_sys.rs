@@ -247,18 +247,47 @@ const CLONE_SIGHAND:u64=0x800; const CLONE_THREAD:u64=0x10000; const CLONE_SYSVS
 const CLONE_SETTLS:u64=0x80000; const CLONE_PARENT_SETTID:u64=0x100000;
 const CLONE_CHILD_CLEARTID:u64=0x200000; const CLONE_CHILD_SETTID:u64=0x01000000;
 const CLONE_SUPPORTED:u64=0xff|CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID;
+const CLONE_VFORK:u64=0x4000;
+const FORK_SUPPORTED:u64=0xff|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID;
+/// STAGE-15: `clone` now supports BOTH forms nvim's libuv needs.
+///   * thread clone (CLONE_VM|CLONE_THREAD, stage 14) — shared address space;
+///   * fork (no CLONE_VM; glibc fork() = SIGCHLD|CHILD_SETTID|CHILD_CLEARTID)
+///     — deep-copied address space, child gets rax=0, parent gets the pid.
+/// CLONE_VM WITHOUT CLONE_THREAD (vfork / glibc posix_spawn) stays ENOSYS on
+/// purpose: libuv then falls back to its plain fork+exec spawn path.
 pub fn sys_clone(regs:&SavedRegs,flags:u64,child_stack:u64,parent_tid:u64,child_tid:u64,tls:u64)->Result<u64,Errno>{
-    if flags & !CLONE_SUPPORTED != 0 || flags & (CLONE_VM|CLONE_THREAD) != (CLONE_VM|CLONE_THREAD){return Err(Errno::ENOSYS)}
-    // Default stack = the caller's user RSP from the per-task slot at +120
-    // above the SavedRegs frame (the global scratch may already belong to a
-    // sibling thread by the time we run).
-    let stack=if child_stack==0{unsafe{ ((regs as *const SavedRegs as *const u64).add(15)).read() }}else{child_stack}; check_user_ptr(stack.saturating_sub(8),8)?;
-    if flags&CLONE_PARENT_SETTID!=0{check_user_ptr(parent_tid,4)?} if flags&CLONE_CHILD_SETTID!=0{check_user_ptr(child_tid,4)?}
-    let child=crate::task::process::spawn_linux_thread(regs,stack).map_err(|_|Errno::ENOMEM)?;
-    let tls_value=if flags&CLONE_SETTLS!=0{Some(tls)}else{None}; let clear=if flags&CLONE_CHILD_CLEARTID!=0{child_tid}else{0};
-    if !crate::task::compat::clone_current_compat(child,tls_value,clear){return Err(Errno::EINVAL)}
+    if flags & (CLONE_VM|CLONE_THREAD) == (CLONE_VM|CLONE_THREAD) {
+        if flags & !CLONE_SUPPORTED != 0 {return Err(Errno::ENOSYS)}
+        // Default stack = the caller's user RSP from the per-task slot at +120
+        // above the SavedRegs frame (the global scratch may already belong to a
+        // sibling thread by the time we run).
+        let stack=if child_stack==0{unsafe{ ((regs as *const SavedRegs as *const u64).add(15)).read() }}else{child_stack}; check_user_ptr(stack.saturating_sub(8),8)?;
+        if flags&CLONE_PARENT_SETTID!=0{check_user_ptr(parent_tid,4)?} if flags&CLONE_CHILD_SETTID!=0{check_user_ptr(child_tid,4)?}
+        let child=crate::task::process::spawn_linux_thread(regs,stack).map_err(|_|Errno::ENOMEM)?;
+        let tls_value=if flags&CLONE_SETTLS!=0{Some(tls)}else{None}; let clear=if flags&CLONE_CHILD_CLEARTID!=0{child_tid}else{0};
+        if !crate::task::compat::clone_current_compat(child,tls_value,clear){return Err(Errno::EINVAL)}
+        if flags&CLONE_PARENT_SETTID!=0{unsafe{ptr::write_unaligned(parent_tid as *mut u32,child as u32)}}
+        if flags&CLONE_CHILD_SETTID!=0{unsafe{ptr::write_unaligned(child_tid as *mut u32,child as u32)}}
+        return Ok(child)
+    }
+    // ── fork path (STAGE-15) ──
+    if flags & (CLONE_VM|CLONE_VFORK) != 0 || flags & !FORK_SUPPORTED != 0 {return Err(Errno::ENOSYS)}
+    if child_stack != 0 {return Err(Errno::EINVAL)} // fork(2) never passes a stack
+    if flags&CLONE_PARENT_SETTID!=0{check_user_ptr(parent_tid,4)?}
+    if flags&CLONE_CHILD_SETTID!=0{check_user_ptr(child_tid,4)?}
+    let clear=if flags&CLONE_CHILD_CLEARTID!=0{child_tid}else{0};
+    let (child,child_pml4)=crate::task::process::fork_linux_process(regs,clear)
+        .map_err(|e|{crate::error!("[linux] fork failed: {}",e);Errno::ENOMEM})?;
     if flags&CLONE_PARENT_SETTID!=0{unsafe{ptr::write_unaligned(parent_tid as *mut u32,child as u32)}}
-    if flags&CLONE_CHILD_SETTID!=0{unsafe{ptr::write_unaligned(child_tid as *mut u32,child as u32)}} Ok(child)
+    if flags&CLONE_CHILD_SETTID!=0{
+        // Land the tid write in the CHILD's already-copied address space (the
+        // parent's own page must keep its value): translate through the child
+        // PML4 and write via the HHDM window.
+        if let Some(phys)=crate::memory::vmm::virt_to_phys_in(child_pml4,child_tid){
+            unsafe{ptr::write_unaligned(crate::memory::vmm::phys_to_virt(phys) as *mut u32,child as u32)}
+        }
+    }
+    Ok(child)
 }
 const FUTEX_WAITERS:u32=0x8000_0000; const FUTEX_OWNER_DIED:u32=0x4000_0000; const FUTEX_TID_MASK:u32=0x3fff_ffff;
 fn cleanup_robust(head:u64,len:u64,tid:u64){ if head==0||len!=24||check_user_ptr(head,24).is_err(){return}

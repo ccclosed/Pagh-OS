@@ -47,6 +47,9 @@ use super::stat::{encode_stat, LinuxStat, S_IFDIR, S_IFREG};
 /// standard stream reports a plausible (non-regular) type.
 const S_IFCHR: u32 = 0o020000;
 
+/// `st_mode` type bits for a socket (STAGE-15 socketpair ends).
+const S_IFSOCK: u32 = 0o140000;
+
 /// Largest byte count `read`/`write` accept, matching the Linux `int` cap in
 /// R2.2 (0..=2_147_483_647). Larger requests are rejected with `EINVAL` rather
 /// than attempting a multi-gigabyte kernel allocation.
@@ -69,6 +72,8 @@ enum Resolved {
     File { node: Arc<dyn VfsNode>, offset: u64 },
     PipeRead(Arc<PipeEndpoint>),
     PipeWrite(Arc<PipeEndpoint>),
+    /// STAGE-15: one end of an AF_UNIX socketpair (rx = incoming, tx = outgoing).
+    Socket { rx: Arc<PipeEndpoint>, tx: Arc<PipeEndpoint> },
     /// An eventfd counter.
     Eventfd { val: Arc<crate::sync::spinlock::Spinlock<u64>>, semaphore: bool },
     /// An epoll instance (not directly readable/writable via read/write).
@@ -87,6 +92,7 @@ fn resolve_fd(fd: u32) -> Option<Resolved> {
             OpenObject::Stdin => Resolved::Stdin,
             OpenObject::PipeRead(e) => Resolved::PipeRead(Arc::clone(e)),
             OpenObject::PipeWrite(e) => Resolved::PipeWrite(Arc::clone(e)),
+            OpenObject::Socket { rx, tx } => Resolved::Socket { rx: Arc::clone(rx), tx: Arc::clone(tx) },
             OpenObject::File { node, offset } => Resolved::File {
                 node: Arc::clone(node),
                 offset: *offset,
@@ -239,6 +245,7 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         }
         Some(Resolved::Epoll) => Err(Errno::EINVAL),
         Some(Resolved::PipeRead(e)) => { let mut data=vec![0u8;count as usize];let n=read_pipe(&e,&mut data)?;copy_out(buf,&data[..n]);Ok(n as u64) }
+        Some(Resolved::Socket { rx, .. }) => { let mut data=vec![0u8;count as usize];let n=read_pipe(&rx,&mut data)?;copy_out(buf,&data[..n]);Ok(n as u64) }
         Some(Resolved::File { node, offset }) => {
             let size = node.size();
             let (copied, _) = plan_read(size, offset, count);
@@ -288,6 +295,7 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         Some(Resolved::Epoll) => Err(Errno::EINVAL),
         Some(Resolved::PipeRead(_)) => Err(Errno::EBADF),
         Some(Resolved::PipeWrite(e)) => {let data=copy_in(buf,count);Ok(write_pipe(&e,&data)? as u64)}
+        Some(Resolved::Socket { tx, .. }) => {let data=copy_in(buf,count);Ok(write_pipe(&tx,&data)? as u64)}
         Some(Resolved::Console) => {
             let data = copy_in(buf, count);
             console_write(&data);
@@ -358,8 +366,9 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
                 file_off += n as u64;
                 total += n as u64;
             }
-            Resolved::Stdin | Resolved::PipeRead(_) => unreachable!(),
-            Resolved::Dir => unreachable!(),
+            Resolved::Socket { tx, .. } => {let n=write_pipe(tx,&data)?;total+=n as u64;if n<data.len(){break;}}
+            // Stdin/PipeRead/Dir/Eventfd/Epoll are rejected by the guards above.
+            _ => unreachable!(),
         }
     }
 
@@ -453,19 +462,29 @@ fn open_path(path: &str) -> Result<u64, Errno> {
 /// `open` (2): open an existing ext2 path (resolved against the cwd if relative),
 /// allocating the lowest fd ≥ 3 (R2.4); `ENOENT` if the path is absent (R2.5).
 /// Directories open as a directory descriptor usable with `getdents64`.
-pub fn sys_open(path: u64, _flags: u64, _mode: u64) -> Result<u64, Errno> {
+pub fn sys_open(path: u64, flags: u64, _mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
-    open_path(&p)
+    let fd = open_path(&p)?;
+    // STAGE-15: honor O_CLOEXEC now that execve sweeps flagged descriptors.
+    if flags & O_CLOEXEC != 0 {
+        compat::with_current_compat(|cs| cs.fds.set_cloexec(fd as u32, true));
+    }
+    Ok(fd)
 }
 
 /// `openat` (257): like `open`. `AT_FDCWD` (and any dirfd in this minimal layer)
 /// resolves the path against the process cwd; absolute paths ignore the dirfd.
-pub fn sys_openat(dirfd: u64, path: u64, _flags: u64, _mode: u64) -> Result<u64, Errno> {
+pub fn sys_openat(dirfd: u64, path: u64, flags: u64, _mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     // Absolute paths ignore dirfd; relative paths resolve against the cwd (the
     // only directory base this minimal layer tracks), which covers AT_FDCWD.
     let _ = dirfd;
-    open_path(&p)
+    let fd = open_path(&p)?;
+    // STAGE-15: honor O_CLOEXEC now that execve sweeps flagged descriptors.
+    if flags & O_CLOEXEC != 0 {
+        compat::with_current_compat(|cs| cs.fds.set_cloexec(fd as u32, true));
+    }
+    Ok(fd)
 }
 
 /// `close` (3): release the descriptor, or `EBADF` if it is not open (R2.6, R2.14).
@@ -489,6 +508,7 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> Result<u64, Errno> {
         // buffering; EINVAL spammed the diag log three times per start.
         Some(Resolved::Console) | Some(Resolved::Stdin) => Err(Errno::ESPIPE),
         Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_)) => Err(Errno::ESPIPE),
+        Some(Resolved::Socket { .. }) => Err(Errno::ESPIPE),
         Some(Resolved::Eventfd { .. }) | Some(Resolved::Epoll) => Err(Errno::ESPIPE),
         // A directory descriptor supports rewinding/positioning its dents cursor:
         // SEEK_SET sets the cursor index, returning it. Other whences are EINVAL.
@@ -569,6 +589,13 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> Result<u64, Errno> {
     check_user_ptr(statbuf, core::mem::size_of::<LinuxStat>() as u64)?;
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
+        Some(Resolved::Socket { .. }) => {
+            // STAGE-15: socketpair ends report S_IFSOCK — libuv's
+            // uv_guess_handle checks the fd type of stdio descriptors.
+            let stat = encode_stat(0, S_IFSOCK | 0o666);
+            write_stat_struct(&stat, statbuf);
+            Ok(0)
+        }
         Some(Resolved::Console) | Some(Resolved::Stdin)
         | Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_))
         | Some(Resolved::Eventfd { .. }) | Some(Resolved::Epoll) => {
@@ -1030,15 +1057,18 @@ pub fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, Errno> {
 
 /// `dup3` (292): like `dup2` but `oldfd == newfd` is an error (`EINVAL`) and the
 /// only accepted flag is `O_CLOEXEC` (ignored here). `EBADF` if `oldfd` is invalid.
-pub fn sys_dup3(oldfd: u64, newfd: u64, _flags: u64) -> Result<u64, Errno> {
+pub fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> Result<u64, Errno> {
     if oldfd == newfd {
         return Err(Errno::EINVAL);
     }
+    if flags & !O_CLOEXEC != 0 {
+        return Err(Errno::EINVAL);
+    }
     compat::with_current_compat(|cs| {
-        if cs.fds.get(oldfd as u32).is_none() {
-            return Err(Errno::EBADF);
-        }
-        cs.fds.dup_to(oldfd as u32, newfd as u32).map(|fd| fd as u64)
+        let fd = cs.fds.dup_to(oldfd as u32, newfd as u32)?;
+        // STAGE-15: dup3's only flag — mark the new descriptor close-on-exec.
+        if flags & O_CLOEXEC != 0 { cs.fds.set_cloexec(fd, true); }
+        Ok(fd as u64)
     })
     .unwrap_or(Err(Errno::EBADF))
 }
@@ -1052,26 +1082,37 @@ const F_SETFL: u64 = 4;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 
 /// `fcntl` (72): the descriptor-management subset.
-///   * `F_DUPFD`/`F_DUPFD_CLOEXEC` → duplicate `fd` into the lowest free
-///     descriptor `>= arg` (close-on-exec is not tracked, so the CLOEXEC form is
-///     equivalent here).
-///   * `F_GETFD`/`F_SETFD` → close-on-exec flag is not tracked; report/accept 0.
+///   * `F_DUPFD` → duplicate `fd` into the lowest free descriptor `>= arg`.
+///   * `F_DUPFD_CLOEXEC` → same, and mark the duplicate close-on-exec.
+///   * `F_GETFD`/`F_SETFD` → STAGE-15: FD_CLOEXEC is tracked for real now
+///     (libuv marks its fork error pipe with it and execve must sweep it).
 ///   * `F_GETFL` → report `O_RDONLY` (0).
 ///   * `F_SETFL` → accept and return 0.
 ///   * anything else → `EINVAL`.
 pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
+    const FD_CLOEXEC: u64 = 1;
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => compat::with_current_compat(|cs| {
-            cs.fds.dup_min(fd as u32, arg as u32).map(|f| f as u64)
+            let newfd = cs.fds.dup_min(fd as u32, arg as u32)?;
+            cs.fds.set_cloexec(newfd, cmd == F_DUPFD_CLOEXEC);
+            Ok(newfd as u64)
         })
         .unwrap_or(Err(Errno::EBADF)),
-        F_GETFD | F_SETFD => {
-            // Validate the fd exists; flags themselves are not tracked.
-            if resolve_fd(fd as u32).is_none() {
+        F_GETFD => compat::with_current_compat(|cs| {
+            if cs.fds.get(fd as u32).is_none() {
                 return Err(Errno::EBADF);
             }
+            Ok(if cs.fds.is_cloexec(fd as u32) { FD_CLOEXEC } else { 0 })
+        })
+        .unwrap_or(Err(Errno::EBADF)),
+        F_SETFD => compat::with_current_compat(|cs| {
+            if cs.fds.get(fd as u32).is_none() {
+                return Err(Errno::EBADF);
+            }
+            cs.fds.set_cloexec(fd as u32, arg & FD_CLOEXEC != 0);
             Ok(0)
-        }
+        })
+        .unwrap_or(Err(Errno::EBADF)),
         F_GETFL | F_SETFL => {
             if resolve_fd(fd as u32).is_none() {
                 return Err(Errno::EBADF);
@@ -1084,9 +1125,22 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
 
 /// `readlink` (89): no symbolic links exist in this filesystem, so a path that
 /// resolves to an existing node is "not a symlink" (`EINVAL`) and an absent path
-/// is `ENOENT`. The output buffer is never written.
-pub fn sys_readlink(path: u64, _buf: u64, _bufsiz: u64) -> Result<u64, Errno> {
+/// is `ENOENT`. STAGE-15 exception: `/proc/self/exe` resolves to the exec'd
+/// image path (libuv's uv_exepath — nvim's progpath — reads it, and the forked
+/// child re-execs that path to start the embedded server).
+pub fn sys_readlink(path: u64, buf: u64, bufsiz: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
+    if p == "/proc/self/exe" {
+        let exe = compat::with_current_compat(|cs| cs.exe_path.clone()).unwrap_or_default();
+        if exe.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+        let bytes = exe.as_bytes();
+        let n = core::cmp::min(bytes.len() as u64, bufsiz);
+        check_user_ptr(buf, n)?;
+        copy_out(buf, &bytes[..n as usize]);
+        return Ok(n);
+    }
     let abs = resolve_path(&p);
     match vfs::lookup_path(&abs) {
         Ok(_) => Err(Errno::EINVAL),
@@ -1112,6 +1166,7 @@ pub fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Er
         None => Err(Errno::EBADF),
         Some(Resolved::Console) | Some(Resolved::Stdin)
         | Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_))
+        | Some(Resolved::Socket { .. })
         | Some(Resolved::Eventfd { .. }) | Some(Resolved::Epoll) => Err(Errno::ESPIPE),
         Some(Resolved::Dir) => Err(Errno::EISDIR),
         Some(Resolved::File { node, .. }) => {
@@ -1150,6 +1205,7 @@ pub fn sys_pwrite64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, E
         None => Err(Errno::EBADF),
         Some(Resolved::Stdin) => Err(Errno::ESPIPE),
         Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_)) => Err(Errno::ESPIPE),
+        Some(Resolved::Socket { .. }) => Err(Errno::ESPIPE),
         Some(Resolved::Eventfd { .. }) | Some(Resolved::Epoll) => Err(Errno::ESPIPE),
         Some(Resolved::Dir) => Err(Errno::EISDIR),
         Some(Resolved::Console) => {
@@ -1245,8 +1301,8 @@ pub fn sys_fstatfs(fd: u64, buf: u64) -> Result<u64, Errno> {
 const O_NONBLOCK:u64=0x800; const O_CLOEXEC:u64=0x80000;
 const POLLIN:i16=0x001; const POLLOUT:i16=0x004; const POLLERR:i16=0x008; const POLLHUP:i16=0x010; const POLLNVAL:i16=0x020;
 pub fn sys_pipe(pipefd:u64)->Result<u64,Errno>{sys_pipe2(pipefd,0)}
-pub fn sys_pipe2(pipefd:u64,flags:u64)->Result<u64,Errno>{if flags&!(O_NONBLOCK|O_CLOEXEC)!=0{return Err(Errno::EINVAL)}check_user_ptr(pipefd,8)?;let pair=compat::with_current_compat(|cs|cs.fds.pipe(flags&O_NONBLOCK!=0)).ok_or(Errno::EBADF)?;let words=[pair.0,pair.1];let bytes=unsafe{core::slice::from_raw_parts(words.as_ptr()as*const u8,8)};copy_out(pipefd,bytes);Ok(0)}
-fn poll_revents(fd:i32,events:i16)->i16{if fd<0{return 0}match resolve_fd(fd as u32){None=>POLLNVAL,Some(Resolved::PipeRead(e))=>{let mut o=if e.read_ready(){events&POLLIN}else{0};if e.peer_closed(){o|=POLLHUP}o},Some(Resolved::PipeWrite(e))=>{let mut o=if e.write_ready(){events&POLLOUT}else{0};if e.peer_closed(){o|=POLLERR}o},Some(Resolved::Stdin)=>0,Some(Resolved::Console)=>events&POLLOUT,Some(Resolved::Eventfd{val,..})=>{let v=val.lock();if*v>0{events&POLLIN}else{0}},Some(Resolved::Epoll)=>0,Some(Resolved::File{..})|Some(Resolved::Dir)=>events&(POLLIN|POLLOUT)}}
+pub fn sys_pipe2(pipefd:u64,flags:u64)->Result<u64,Errno>{if flags&!(O_NONBLOCK|O_CLOEXEC)!=0{return Err(Errno::EINVAL)}check_user_ptr(pipefd,8)?;let pair=compat::with_current_compat(|cs|{let p=cs.fds.pipe(flags&O_NONBLOCK!=0);if flags&O_CLOEXEC!=0{cs.fds.set_cloexec(p.0,true);cs.fds.set_cloexec(p.1,true);}p}).ok_or(Errno::EBADF)?;let words=[pair.0,pair.1];let bytes=unsafe{core::slice::from_raw_parts(words.as_ptr()as*const u8,8)};copy_out(pipefd,bytes);Ok(0)}
+fn poll_revents(fd:i32,events:i16)->i16{if fd<0{return 0}match resolve_fd(fd as u32){None=>POLLNVAL,Some(Resolved::PipeRead(e))=>{let mut o=if e.read_ready(){events&POLLIN}else{0};if e.peer_closed(){o|=POLLHUP}o},Some(Resolved::PipeWrite(e))=>{let mut o=if e.write_ready(){events&POLLOUT}else{0};if e.peer_closed(){o|=POLLERR}o},Some(Resolved::Socket{rx,tx})=>{let mut o=0i16;if rx.read_ready(){o|=events&POLLIN}if tx.write_ready(){o|=events&POLLOUT}if rx.peer_closed(){o|=POLLHUP}o},Some(Resolved::Stdin)=>0,Some(Resolved::Console)=>events&POLLOUT,Some(Resolved::Eventfd{val,..})=>{let v=val.lock();if*v>0{events&POLLIN}else{0}},Some(Resolved::Epoll)=>0,Some(Resolved::File{..})|Some(Resolved::Dir)=>events&(POLLIN|POLLOUT)}}
 pub fn sys_poll(fds:u64,nfds:u64,timeout:u64)->Result<u64,Errno>{const SZ:u64=8;if nfds>1024{return Err(Errno::EINVAL)}check_user_ptr(fds,nfds.checked_mul(SZ).ok_or(Errno::EINVAL)?)?;let ms=timeout as i64;let deadline=if ms<0{None}else{Some(crate::task::scheduler::ticks().saturating_add((ms as u64).saturating_add(9)/10))};loop{let mut ready=0;for i in 0..nfds{let p=fds+i*SZ;let fd=unsafe{*(p as*const i32)};let ev=unsafe{*((p+4)as*const i16)};let rev=poll_revents(fd,ev);unsafe{*((p+6)as*mut i16)=rev}if rev!=0{ready+=1}}if ready!=0||ms==0{return Ok(ready)}if let Some(end)=deadline{if crate::task::scheduler::ticks()>=end{return Ok(0)}}crate::task::scheduler::yield_current()}}
 
 // ---------------------------------------------------------------------------
@@ -1266,6 +1322,7 @@ fn select_ready(fd: u64, want_write: bool) -> bool {
         Some(Resolved::Console) => true,
         Some(Resolved::PipeRead(e)) => !want_write && (e.read_ready() || e.peer_closed()),
         Some(Resolved::PipeWrite(e)) => want_write && (e.write_ready() || e.peer_closed()),
+        Some(Resolved::Socket { rx, tx }) => if want_write { tx.write_ready() || tx.peer_closed() } else { rx.read_ready() || rx.peer_closed() },
         Some(Resolved::Eventfd { val, .. }) => !want_write && { let v=val.lock(); *v>0 },
         Some(Resolved::Epoll) => false,
         Some(Resolved::File { .. }) | Some(Resolved::Dir) => true,
@@ -1372,4 +1429,91 @@ pub fn sys_ppoll(fds: u64, nfds: u64, ts: u64, _sigmask: u64) -> Result<u64, Err
         sec.saturating_mul(1000).saturating_add(nsec / 1_000_000)
     };
     sys_poll(fds, nfds, ms as u64)
+}
+
+// ─── STAGE-15: socketpair (53) + statx (332) ───────────────────────────────────────────
+
+const AF_UNIX: u64 = 1;
+const SOCK_STREAM: u64 = 1;
+const SOCK_TYPE_MASK: u64 = 0xf;
+const SOCK_NONBLOCK: u64 = 0x800;
+const SOCK_CLOEXEC: u64 = 0x80000;
+
+/// `socketpair` (53): AF_UNIX/SOCK_STREAM only — the channel libuv builds for
+/// the `nvim --embed` msgpack-rpc server, dup2'd onto the child's stdio.
+/// Backed by two cross-connected in-kernel byte queues (FdTable::socketpair),
+/// so both descriptors are readable and writable.
+pub fn sys_socketpair(domain: u64, sock_type: u64, protocol: u64, sv: u64) -> Result<u64, Errno> {
+    if domain != AF_UNIX || protocol != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if sock_type & SOCK_TYPE_MASK != SOCK_STREAM
+        || sock_type & !(SOCK_TYPE_MASK | SOCK_NONBLOCK | SOCK_CLOEXEC) != 0
+    {
+        return Err(Errno::EINVAL);
+    }
+    check_user_ptr(sv, 8)?;
+    let pair = compat::with_current_compat(|cs| {
+        let p = cs.fds.socketpair(sock_type & SOCK_NONBLOCK != 0);
+        if sock_type & SOCK_CLOEXEC != 0 {
+            cs.fds.set_cloexec(p.0, true);
+            cs.fds.set_cloexec(p.1, true);
+        }
+        p
+    })
+    .ok_or(Errno::EBADF)?;
+    let words = [pair.0, pair.1];
+    // SAFETY: two u32 fds → exactly the 8 bytes socketpair writes to sv.
+    let bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, 8) };
+    copy_out(sv, bytes);
+    Ok(0)
+}
+
+const STATX_BASIC_STATS: u32 = 0x7ff;
+const AT_EMPTY_PATH: u64 = 0x1000;
+const STATX_SIZE_BYTES: u64 = 256;
+
+/// Fill a zeroed `struct statx` (256 bytes) with the basic fields pagh tracks.
+/// Timestamps stay zero — the legacy `stat` path reports the same.
+fn write_statx(buf: u64, size: u64, mode: u32, ino: u64) {
+    // SAFETY: the caller validated `buf` for STATX_SIZE_BYTES.
+    unsafe {
+        core::ptr::write_bytes(buf as *mut u8, 0, STATX_SIZE_BYTES as usize);
+        core::ptr::write_unaligned(buf as *mut u32, STATX_BASIC_STATS); // stx_mask
+        core::ptr::write_unaligned((buf + 0x04) as *mut u32, 4096); // stx_blksize
+        core::ptr::write_unaligned((buf + 0x10) as *mut u32, 1); // stx_nlink
+        core::ptr::write_unaligned((buf + 0x1c) as *mut u16, mode as u16); // stx_mode
+        core::ptr::write_unaligned((buf + 0x20) as *mut u64, ino); // stx_ino
+        core::ptr::write_unaligned((buf + 0x28) as *mut u64, size); // stx_size
+        core::ptr::write_unaligned((buf + 0x30) as *mut u64, (size + 511) / 512); // stx_blocks
+    }
+}
+
+/// `statx` (332): translated onto the existing stat plumbing. Supports plain
+/// path lookups (absolute or cwd-relative; any dirfd is treated as AT_FDCWD,
+/// like `openat`) and the `AT_EMPTY_PATH` fd form glibc uses for fstat-style
+/// queries. libuv's uv_fs_fstat probes statx first and only falls back on a
+/// clean ENOSYS from the dispatcher — which it no longer needs to.
+pub fn sys_statx(dirfd: u64, path: u64, flags: u64, _mask: u64, buf: u64) -> Result<u64, Errno> {
+    check_user_ptr(buf, STATX_SIZE_BYTES)?;
+    let p = read_user_cstr(path)?;
+    if p.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        return match resolve_fd(dirfd as u32) {
+            None => Err(Errno::EBADF),
+            Some(Resolved::File { node, .. }) => {
+                let ino = match node.fs_ino() { 0 => synth_ino(node.name()), ino => ino };
+                write_statx(buf, node.size(), S_IFREG | DEFAULT_FILE_PERMS, ino);
+                Ok(0)
+            }
+            Some(Resolved::Dir) => { write_statx(buf, 0, S_IFDIR | 0o755, 1); Ok(0) }
+            Some(Resolved::Socket { .. }) => { write_statx(buf, 0, S_IFSOCK | 0o666, 1); Ok(0) }
+            Some(_) => { write_statx(buf, 0, S_IFCHR | 0o620, 1); Ok(0) }
+        };
+    }
+    let abs = resolve_path(&p);
+    let node = vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
+    let mode = if node.is_directory() { S_IFDIR | 0o755 } else { S_IFREG | DEFAULT_FILE_PERMS };
+    let ino = match node.fs_ino() { 0 => synth_ino(node.name()), ino => ino };
+    write_statx(buf, node.size(), mode, ino);
+    Ok(0)
 }

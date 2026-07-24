@@ -8,7 +8,7 @@
 //! `Arc<dyn VfsNode>`) and the shared [`Errno`] mapping on top of it.
 #![allow(dead_code)]
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -60,6 +60,9 @@ pub enum OpenObject {
     PipeWrite(Arc<PipeEndpoint>),
     /// An eventfd counter (EFD_SEMAPHORE if semaphore=true).
     Eventfd { val: Arc<Spinlock<u64>>, semaphore: bool },
+    /// STAGE-15: one end of an AF_UNIX stream socketpair — a cross-connected
+    /// pair of pipe endpoints (rx = this end's incoming bytes, tx = outgoing).
+    Socket { rx: Arc<PipeEndpoint>, tx: Arc<PipeEndpoint> },
     /// An epoll instance with its interest list.
     Epoll { interests: Arc<Spinlock<Vec<EpollEntry>>> },
     Dir {
@@ -102,6 +105,7 @@ impl OpenObject {
                 index: *index,
             },
             OpenObject::Eventfd { val, semaphore } => OpenObject::Eventfd { val: Arc::clone(val), semaphore: *semaphore },
+            OpenObject::Socket { rx, tx } => OpenObject::Socket { rx: Arc::clone(rx), tx: Arc::clone(tx) },
             OpenObject::Epoll { interests } => OpenObject::Epoll { interests: Arc::clone(interests) },
         }
     }
@@ -115,6 +119,9 @@ impl OpenObject {
 #[derive(Clone)]
 pub struct FdTable {
     slots: FdSlots<OpenObject>,
+    /// STAGE-15: descriptors flagged close-on-exec (O_CLOEXEC / FD_CLOEXEC).
+    /// Swept by execve; libuv's fork+exec error-pipe protocol depends on it.
+    cloexec: BTreeSet<u32>,
 }
 
 impl FdTable {
@@ -131,13 +138,16 @@ impl FdTable {
         initial.push(Some(OpenObject::Console)); // fd 2
         Self {
             slots: FdSlots::from_slots(initial),
+            cloexec: BTreeSet::new(),
         }
     }
 
     /// Allocate the lowest free descriptor `>= 3`, store `obj` there, and return
     /// the descriptor, growing the table as needed (R2.4).
     pub fn alloc(&mut self, obj: OpenObject) -> u32 {
-        self.slots.alloc(Self::FIRST_DYNAMIC_FD, obj)
+        let fd = self.slots.alloc(Self::FIRST_DYNAMIC_FD, obj);
+        self.cloexec.remove(&fd); // a recycled slot must not inherit the flag
+        fd
     }
 
     /// Borrow the object referenced by `fd`, or `None` for an out-of-range/empty
@@ -163,7 +173,9 @@ impl FdTable {
     /// already closed, leaving the table unchanged; otherwise releases it and
     /// returns `Ok` (R2.6, R2.14).
     pub fn close(&mut self, fd: u32) -> Result<(), Errno> {
-        self.slots.close(fd).map_err(|_| Errno::EBADF)
+        let res = self.slots.close(fd).map_err(|_| Errno::EBADF);
+        if res.is_ok() { self.cloexec.remove(&fd); }
+        res
     }
 
     /// `dup` (32): duplicate `oldfd` into the lowest free descriptor `>= 3`,
@@ -176,7 +188,9 @@ impl FdTable {
     /// `>= min`, returning the new descriptor. `EBADF` if `oldfd` is not open.
     pub fn dup_min(&mut self, oldfd: u32, min: u32) -> Result<u32, Errno> {
         let dup = self.slots.get(oldfd).ok_or(Errno::EBADF)?.dup_clone();
-        Ok(self.slots.alloc(min as usize, dup))
+        let fd = self.slots.alloc(min as usize, dup);
+        self.cloexec.remove(&fd); // the duplicate starts without FD_CLOEXEC
+        Ok(fd)
     }
 
     /// `dup2`/`dup3`: duplicate `oldfd` into the explicit descriptor `newfd`,
@@ -189,6 +203,41 @@ impl FdTable {
     pub fn dup_to(&mut self, oldfd: u32, newfd: u32) -> Result<u32, Errno> {
         let dup = self.slots.get(oldfd).ok_or(Errno::EBADF)?.dup_clone();
         self.slots.set(newfd, dup);
+        self.cloexec.remove(&newfd); // dup2/dup3 clear FD_CLOEXEC on the target
         Ok(newfd)
+    }
+
+    // ── STAGE-15: close-on-exec bookkeeping ──
+
+    /// Set or clear the FD_CLOEXEC flag for `fd`.
+    pub fn set_cloexec(&mut self, fd: u32, on: bool) {
+        if on { self.cloexec.insert(fd); } else { self.cloexec.remove(&fd); }
+    }
+
+    /// Whether `fd` carries the FD_CLOEXEC flag.
+    pub fn is_cloexec(&self, fd: u32) -> bool { self.cloexec.contains(&fd) }
+
+    /// Close every descriptor flagged close-on-exec (the execve sweep).
+    pub fn close_cloexec(&mut self) {
+        let fds = core::mem::take(&mut self.cloexec);
+        for fd in fds { let _ = self.slots.close(fd); }
+    }
+
+    /// STAGE-15 `socketpair(AF_UNIX, SOCK_STREAM)`: two cross-connected
+    /// in-kernel byte queues. Each end reads from one queue and writes to the
+    /// other, so BOTH fds are readable and writable (unlike a pipe). Closing
+    /// one end makes the peer observe EOF on read and EPIPE on write.
+    pub fn socketpair(&mut self, nonblocking: bool) -> (u32, u32) {
+        let q_ab = Arc::new(Spinlock::new(PipeState { bytes: VecDeque::new(), readers: 1, writers: 1 }));
+        let q_ba = Arc::new(Spinlock::new(PipeState { bytes: VecDeque::new(), readers: 1, writers: 1 }));
+        let a = OpenObject::Socket {
+            rx: Arc::new(PipeEndpoint { state: Arc::clone(&q_ba), read_end: true, nonblocking }),
+            tx: Arc::new(PipeEndpoint { state: Arc::clone(&q_ab), read_end: false, nonblocking }),
+        };
+        let b = OpenObject::Socket {
+            rx: Arc::new(PipeEndpoint { state: q_ab, read_end: true, nonblocking }),
+            tx: Arc::new(PipeEndpoint { state: q_ba, read_end: false, nonblocking }),
+        };
+        (self.alloc(a), self.alloc(b))
     }
 }
