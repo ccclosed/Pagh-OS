@@ -228,3 +228,59 @@ fn poll_fd(fd: i32, events: u32) -> u32 {
     let _ = EPOLLRDHUP;
     result.unwrap_or(0)
 }
+
+
+/// STAGE-16.7: dump the CURRENT task's epoll interest list together with each
+/// fd's resolved object type and its readiness AS OF RIGHT NOW. Called by the
+/// stuck-syscall watchdog in the context of the stuck task itself. Answers
+/// the nvim question directly: is the RPC socket in the set at all, what does
+/// its fd resolve to, and does the poll see the queued bytes.
+pub(super) fn dump_epoll_self(epfd: u32) {
+    use crate::task::fd::OpenObject;
+    let pid = crate::task::scheduler::current_pid();
+    // Snapshot fds + types under the compat lock; readiness is computed after
+    // it is released (poll_fd takes the same lock internally).
+    let entries: alloc::vec::Vec<(i32, u32, &'static str)> =
+        crate::task::compat::with_current_compat(|cs| {
+            let interests = match cs.fds.get(epfd) {
+                Some(OpenObject::Epoll { interests }) => alloc::sync::Arc::clone(interests),
+                _ => return alloc::vec::Vec::new(),
+            };
+            let snap: alloc::vec::Vec<(i32, u32)> =
+                interests.lock().iter().map(|e| (e.fd, e.events)).collect();
+            snap.into_iter()
+                .map(|(fd, ev)| {
+                    let kind = match cs.fds.get(fd as u32) {
+                        None => "closed",
+                        Some(OpenObject::Stdin) => "stdin(kbd)",
+                        Some(OpenObject::Console) => "console",
+                        Some(OpenObject::PipeRead(_)) => "pipe-r",
+                        Some(OpenObject::PipeWrite(_)) => "pipe-w",
+                        Some(OpenObject::Socket { .. }) => "socket",
+                        Some(OpenObject::UnixListener(_)) => "unix-listener",
+                        Some(OpenObject::UnixSocketUnbound { .. }) => "unix-unbound",
+                        Some(OpenObject::Eventfd { .. }) => "eventfd",
+                        Some(OpenObject::File { .. }) => "file",
+                        Some(OpenObject::Dir { .. }) => "dir",
+                        Some(OpenObject::Epoll { .. }) => "epoll",
+                    };
+                    (fd, ev, kind)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if entries.is_empty() {
+        crate::warn!(
+            "[WATCHDOG]   pid={} epfd={}: interest list is EMPTY (or fd is not an epoll) — this loop can never wake",
+            pid, epfd
+        );
+        return;
+    }
+    for (fd, ev, kind) in entries {
+        let revents = poll_fd(fd, ev);
+        crate::warn!(
+            "[WATCHDOG]   pid={} epoll interest: fd={} type={} events=0x{:x} revents_now=0x{:x}",
+            pid, fd, kind, ev, revents
+        );
+    }
+}

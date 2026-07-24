@@ -70,6 +70,43 @@ fn python_installed() -> bool {
     entries.iter().any(|n| n.name().starts_with("python3"))
 }
 
+/// STAGE-16.7: the first-boot python download is opt-in. Called from the
+/// shell thread right before the shell starts (sole scancode consumer at that
+/// moment, interrupts already on). Enter or Y = install in the background
+/// (the old behavior); N = skip — 'apt update' + 'apt install python3' from
+/// the shell installs it later at any time. No question when python is
+/// already on disk or no disk is mounted.
+pub fn prompt_base_packages() -> bool {
+    if crate::vfs::lookup_path("/mnt").is_err() {
+        return false; // no disk mounted
+    }
+    if python_installed() {
+        return false; // already provisioned: no question, no thread
+    }
+    crate::fb_println!("[provision] no python3 on this disk.");
+    crate::fb_println!("[provision] download & install glibc + python3 in the background? [Y/n]");
+    crate::info!("provision: waiting for the Y/n answer on the console");
+    // Raw PS/2 set-1 make codes: y=0x15, n=0x31, Enter=0x1C. Break codes
+    // (bit 7 set) and 0xE0-extended keys fall through and are ignored.
+    loop {
+        crate::arch::cpu::halt();
+        while let Some(sc) = crate::drivers::get_char("keyboard").and_then(|kbd| kbd.read_char()) {
+            match sc {
+                0x15 | 0x1C => {
+                    crate::fb_println!("[provision] -> yes: installing in the background");
+                    return true;
+                }
+                0x31 => {
+                    crate::fb_println!("[provision] -> no: skipped ('apt update' + 'apt install python3' installs it later)");
+                    crate::info!("provision: python install declined at boot");
+                    return false;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Download and install the base userland (glibc + python3 with its full
 /// stdlib) through the apt subsystem when a freshly formatted disk has none.
 /// Runs on a dedicated kernel thread spawned late in boot; waits for DHCP by

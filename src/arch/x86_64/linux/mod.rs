@@ -313,15 +313,15 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
 // by the very tasks spinning in blocking loops) scans the in-flight table
 // about once a second and reports anyone stuck longer than 5 seconds,
 // re-reporting every 30 seconds. Entries of exited pids are swept lazily.
-// Values: pid -> (nr, arg0, start_tick, last_warn_tick).
+// Values: pid -> (nr, arg0, start_tick, last_warn_tick, last_dump_tick).
 static SYSCALL_INFLIGHT: crate::sync::spinlock::Spinlock<
-    alloc::collections::BTreeMap<u64, (u64, u64, u64, u64)>,
+    alloc::collections::BTreeMap<u64, (u64, u64, u64, u64, u64)>,
 > = crate::sync::spinlock::Spinlock::new(alloc::collections::BTreeMap::new());
 static WD_LAST_SCAN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn inflight_enter(pid: u64, nr: u64, arg0: u64) {
     let now = crate::task::scheduler::ticks();
-    SYSCALL_INFLIGHT.lock().insert(pid, (nr, arg0, now, 0));
+    SYSCALL_INFLIGHT.lock().insert(pid, (nr, arg0, now, 0, 0));
 }
 
 fn inflight_exit(pid: u64) { SYSCALL_INFLIGHT.lock().remove(&pid); }
@@ -340,15 +340,19 @@ fn wd_sys_name(nr: u64) -> &'static str {
 /// COMPAT_STATES is only taken AFTER the in-flight lock is released, so the
 /// two locks never nest and no ordering hazard is introduced.
 pub fn watchdog_tick() {
+    // STAGE-16.7: the stuck task itself spins through yield_current, so this
+    // is the one place where its OWN fd table is the current one — dump its
+    // epoll interest list from here.
+    maybe_dump_self();
     let now = crate::task::scheduler::ticks();
     let last = WD_LAST_SCAN.load(core::sync::atomic::Ordering::Relaxed);
     if now.saturating_sub(last) < 100 { return; } // scan at most once a second
     if WD_LAST_SCAN.compare_exchange(last, now,
         core::sync::atomic::Ordering::Relaxed,
         core::sync::atomic::Ordering::Relaxed).is_err() { return; }
-    let snapshot: alloc::vec::Vec<(u64, (u64, u64, u64, u64))> =
+    let snapshot: alloc::vec::Vec<(u64, (u64, u64, u64, u64, u64))> =
         SYSCALL_INFLIGHT.lock().iter().map(|(&p, &e)| (p, e)).collect();
-    for (pid, (nr, arg0, start, warned)) in snapshot {
+    for (pid, (nr, arg0, start, warned, _dumped)) in snapshot {
         if !crate::task::compat::compat_exists(pid) {
             SYSCALL_INFLIGHT.lock().remove(&pid);
             continue;
@@ -367,5 +371,33 @@ pub fn watchdog_tick() {
                 );
             }
         }
+    }
+}
+
+
+/// STAGE-16.7: when the CURRENT task is the one stuck in epoll_wait (232) or
+/// epoll_pwait (281), dump its interest list with live readiness every ~10 s.
+/// Runs in the stuck task's own context (it spins through yield_current), so
+/// the ordinary current-task fd helpers resolve against the right table.
+fn maybe_dump_self() {
+    let pid = crate::task::scheduler::current_pid();
+    let now = crate::task::scheduler::ticks();
+    let epfd = {
+        let mut map = SYSCALL_INFLIGHT.lock();
+        match map.get_mut(&pid) {
+            Some(e) if e.0 == 232 || e.0 == 281 => {
+                let age = now.saturating_sub(e.2);
+                if age >= 500 && now.saturating_sub(e.4) >= 1000 {
+                    e.4 = now;
+                    Some(e.1 as u32)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    };
+    if let Some(epfd) = epfd {
+        epoll_sys::dump_epoll_self(epfd);
     }
 }

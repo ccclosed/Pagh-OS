@@ -1148,6 +1148,10 @@ pub fn sys_dup(oldfd: u64) -> Result<u64, Errno> {
 /// whatever occupies `newfd` first. If `oldfd == newfd` and `oldfd` is valid, it is
 /// returned unchanged (no close); `EBADF` if `oldfd` is invalid.
 pub fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, Errno> {
+    // STAGE-16.7 DIAG: stdio rewiring during spawn is exactly where a lost
+    // nvim RPC channel would hide; dup2/dup3 are rare enough to log each call.
+    crate::warn!("[DIAG] dup2 pid={} oldfd={} newfd={}",
+        crate::task::scheduler::current_pid(), oldfd, newfd);
     compat::with_current_compat(|cs| {
         // `oldfd` must be valid regardless.
         if cs.fds.get(oldfd as u32).is_none() {
@@ -1164,6 +1168,8 @@ pub fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, Errno> {
 /// `dup3` (292): like `dup2` but `oldfd == newfd` is an error (`EINVAL`) and the
 /// only accepted flag is `O_CLOEXEC` (ignored here). `EBADF` if `oldfd` is invalid.
 pub fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> Result<u64, Errno> {
+    crate::warn!("[DIAG] dup3 pid={} oldfd={} newfd={} flags=0x{:x}",
+        crate::task::scheduler::current_pid(), oldfd, newfd, flags);
     if oldfd == newfd {
         return Err(Errno::EINVAL);
     }
