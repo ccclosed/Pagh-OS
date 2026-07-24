@@ -272,6 +272,10 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
     }
 
     // ── 3. Route to the handler and fold the result into rax (R1.3) ──
+    // STAGE-16.6: bracket the routed handler with the stuck-syscall watchdog
+    // table, so a silent in-kernel block names its pid + syscall in the log.
+    let wd_pid = crate::task::scheduler::current_pid();
+    inflight_enter(wd_pid, nr, args[0]);
     let result = if nr == sysno::EXECVE {
         process_sys::sys_execve(r, args[0], args[1], args[2])
     } else if nr == sysno::CLONE {
@@ -279,6 +283,7 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
     } else {
         dispatch_supported(nr, &args)
     };
+    inflight_exit(wd_pid);
     match result {
         Ok(v) => v,
         Err(e) => {
@@ -295,6 +300,72 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
                 );
             }
             encode_errno(e)
+        }
+    }
+}
+
+
+// ─── STAGE-16.6: stuck-syscall watchdog ────────────────────────────────────────
+// A silent hang (nvim's black screen) means some Compat_Process is parked
+// inside one blocking syscall forever, with nothing in the log to say WHICH
+// pid in WHICH syscall. linux_dispatch brackets every routed syscall with
+// inflight_enter/inflight_exit; watchdog_tick (driven by yield_current, i.e.
+// by the very tasks spinning in blocking loops) scans the in-flight table
+// about once a second and reports anyone stuck longer than 5 seconds,
+// re-reporting every 30 seconds. Entries of exited pids are swept lazily.
+// Values: pid -> (nr, arg0, start_tick, last_warn_tick).
+static SYSCALL_INFLIGHT: crate::sync::spinlock::Spinlock<
+    alloc::collections::BTreeMap<u64, (u64, u64, u64, u64)>,
+> = crate::sync::spinlock::Spinlock::new(alloc::collections::BTreeMap::new());
+static WD_LAST_SCAN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn inflight_enter(pid: u64, nr: u64, arg0: u64) {
+    let now = crate::task::scheduler::ticks();
+    SYSCALL_INFLIGHT.lock().insert(pid, (nr, arg0, now, 0));
+}
+
+fn inflight_exit(pid: u64) { SYSCALL_INFLIGHT.lock().remove(&pid); }
+
+/// Human name for the syscalls a task can realistically block in.
+fn wd_sys_name(nr: u64) -> &'static str {
+    match nr {
+        0 => "read", 1 => "write", 7 => "poll", 20 => "writev", 23 => "select",
+        35 => "nanosleep", 43 => "accept", 61 => "wait4", 202 => "futex",
+        232 => "epoll_wait", 270 => "pselect6", 271 => "ppoll", 281 => "epoll_pwait",
+        _ => "?",
+    }
+}
+
+/// Called from `yield_current` (thread context, no scheduler locks held).
+/// COMPAT_STATES is only taken AFTER the in-flight lock is released, so the
+/// two locks never nest and no ordering hazard is introduced.
+pub fn watchdog_tick() {
+    let now = crate::task::scheduler::ticks();
+    let last = WD_LAST_SCAN.load(core::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) < 100 { return; } // scan at most once a second
+    if WD_LAST_SCAN.compare_exchange(last, now,
+        core::sync::atomic::Ordering::Relaxed,
+        core::sync::atomic::Ordering::Relaxed).is_err() { return; }
+    let snapshot: alloc::vec::Vec<(u64, (u64, u64, u64, u64))> =
+        SYSCALL_INFLIGHT.lock().iter().map(|(&p, &e)| (p, e)).collect();
+    for (pid, (nr, arg0, start, warned)) in snapshot {
+        if !crate::task::compat::compat_exists(pid) {
+            SYSCALL_INFLIGHT.lock().remove(&pid);
+            continue;
+        }
+        let age = now.saturating_sub(start);
+        if age >= 500 && (warned == 0 || now.saturating_sub(warned) >= 3000) {
+            let mut still_stuck = false;
+            if let Some(e) = SYSCALL_INFLIGHT.lock().get_mut(&pid) {
+                // Same syscall instance only: a fresh entry means it moved on.
+                if e.2 == start { e.3 = now; still_stuck = true; }
+            }
+            if still_stuck {
+                crate::warn!(
+                    "[WATCHDOG] pid={} stuck in syscall {} (nr={} arg0=0x{:x}) for {}s",
+                    pid, wd_sys_name(nr), nr, arg0, age / 100
+                );
+            }
         }
     }
 }

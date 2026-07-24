@@ -361,6 +361,9 @@ pub extern "C" fn scheduler_tick_irq(current_rsp: u64) -> u64 {
 /// lives in [`scheduler_yield_switch`]. See both for the critical
 /// requeue-before-restore ordering (the stage-13.6 fix).
 pub fn yield_current() {
+    // STAGE-16.6: every in-kernel blocking loop funnels through here, so the
+    // yielding tasks themselves drive the stuck-syscall watchdog scan.
+    crate::arch::x86_64::linux::watchdog_tick();
     // SAFETY: yield_switch saves this task's full context in the canonical
     // saved-frame layout, requeues it via `scheduler_yield_switch`, and only
     // then switches stacks; the task is resumed later by any restore path.
