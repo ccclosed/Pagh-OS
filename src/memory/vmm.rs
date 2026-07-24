@@ -285,6 +285,22 @@ pub fn map(phys_addr: u64, virt_addr: u64, flags: PageTableFlags) -> Result<(), 
     let pd = walker.ensure_next(pdpt, virt.p3_index(), flags)?;
     let pt = walker.ensure_next(pd, virt.p2_index(), flags)?;
 
+    // STAGE-16.1 DIAG: never silently overwrite a live translation. A present
+    // PTE pointing at a *different* frame means two owners believe they own
+    // this virtual page: the old frame leaks and whoever still uses the old
+    // mapping is one re-allocation away from reading someone else's memory.
+    // Keep the overwrite (previous behaviour, nothing regresses) but log it.
+    {
+        let entry = &pt[virt.p1_index()];
+        if entry.flags().contains(PageTableFlags::PRESENT)
+            && entry.addr().as_u64() != phys.as_u64()
+        {
+            crate::warn!(
+                "[VMM] remap virt=0x{:016x}: old_phys=0x{:x} -> new_phys=0x{:x} (old frame leaked/aliased)",
+                virt_addr, entry.addr().as_u64(), phys.as_u64()
+            );
+        }
+    }
     // Set the PTE (Page Table Entry)
     pt[virt.p1_index()].set_addr(phys, flags | PageTableFlags::PRESENT);
 
@@ -292,6 +308,36 @@ pub fn map(phys_addr: u64, virt_addr: u64, flags: PageTableFlags) -> Result<(), 
     tlb::flush(virt);
 
     Ok(())
+}
+
+/// STAGE-16.1 DIAG: log the raw 4-level page-table walk for `virt_addr` in the
+/// *currently active* address space, one line per level, stopping at the first
+/// non-present entry. Post-mortem this distinguishes "a single PTE vanished"
+/// from "a whole intermediate table vanished" (e.g. its frame was
+/// double-allocated and zero-filled by another owner) - the two failure shapes
+/// point at different culprits.
+pub fn dump_translation(virt_addr: u64) {
+    const NAMES: [&str; 4] = ["PML4E", "PDPTE", "PDE", "PTE"];
+    const SHIFTS: [u64; 4] = [39, 30, 21, 12];
+    let mut table_phys = current_pml4_phys();
+    for level in 0..4 {
+        let idx = ((virt_addr >> SHIFTS[level]) & 0x1ff) as usize;
+        // SAFETY: page-table frames are always readable through the HHDM.
+        let entry = unsafe {
+            core::ptr::read_volatile((phys_to_virt(table_phys) as *const u64).add(idx))
+        };
+        if entry & 1 == 0 {
+            crate::error!("[VMM] walk 0x{:012x}: {}[{}] = 0x{:016x} NOT PRESENT (table@phys=0x{:x})",
+                virt_addr, NAMES[level], idx, entry, table_phys);
+            return;
+        }
+        crate::error!("[VMM] walk 0x{:012x}: {}[{}] = 0x{:016x} (table@phys=0x{:x})",
+            virt_addr, NAMES[level], idx, entry, table_phys);
+        if level > 0 && level < 3 && entry & (1 << 7) != 0 {
+            return; // huge page - the walk legitimately ends here
+        }
+        table_phys = entry & 0x000f_ffff_ffff_f000;
+    }
 }
 
 /// Unmap a virtual page.

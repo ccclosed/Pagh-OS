@@ -451,11 +451,23 @@ pub fn free_frame(addr: u64) {
     let word = idx / 64;
     let bit = idx % 64;
 
+    let mut double_free = false;
     if word < pmm.bitmap.len() {
         if pmm.bitmap[word] & (1u64 << bit) == 0 {
             pmm.bitmap[word] |= 1u64 << bit;
             pmm.free_count += 1;
+        } else {
+            // STAGE-16.1 DIAG: the frame is already marked free -> double free
+            // (or a free of a frame this caller never owned). This is exactly
+            // the accounting bug that later surfaces as "an unrelated process's
+            // page suddenly reads as zeroes" once the frame is re-allocated and
+            // zero-filled by its new owner.
+            double_free = true;
         }
+    }
+    drop(guard);
+    if double_free {
+        crate::error!("[PMM] DOUBLE FREE frame=0x{:016x} - frame ownership bug (see caller)", addr);
     }
 }
 

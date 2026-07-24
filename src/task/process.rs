@@ -559,6 +559,8 @@ pub fn exec_linux_image(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<Ex
         }).ok_or(RunError::LoadFailed("execve without compat state"))?;
         // SAFETY: loader built a valid PML4 with shared kernel higher-half mappings.
         unsafe { vmm::load_cr3(elf.pml4_phys); }
+        crate::info!("[linux] execve pid={} '{}' new_pml4=0x{:x} entry=0x{:x}",
+            pid, path, elf.pml4_phys, loaded.start_entry);
         Ok(ExecImage { entry: loaded.start_entry, initial_rsp: rsp, pml4_phys: elf.pml4_phys })
     })
 }
@@ -611,7 +613,8 @@ pub fn fork_linux_process(regs:&crate::arch::x86_64::linux::regs::SavedRegs, cle
             return Err("fork: parent has no compat state");
         }
         scheduler::spawn(Tcb::new(child,krsp,child_pml4));
-        crate::info!("[linux] fork: parent pid={} -> child pid={}", parent, child);
+        crate::info!("[linux] fork: parent pid={} pml4=0x{:x} -> child pid={} pml4=0x{:x}",
+            parent, parent_pml4, child, child_pml4);
         Ok((child,child_pml4))
     })
 }

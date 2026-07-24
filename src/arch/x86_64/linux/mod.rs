@@ -127,6 +127,8 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::LISTEN => unix_sock::sys_listen(a[0], a[1]),
         sysno::GETSOCKNAME => unix_sock::sys_getsockname(a[0], a[1], a[2]),
         sysno::ACCEPT4 => unix_sock::sys_accept4(a[0], a[1], a[2], a[3]),
+        sysno::SETSOCKOPT => unix_sock::sys_setsockopt(a[0], a[1], a[2], a[3], a[4]),
+        sysno::GETSOCKOPT => unix_sock::sys_getsockopt(a[0], a[1], a[2], a[3], a[4]),
         sysno::SETSID => misc::sys_setsid(),
         sysno::UMASK => misc::sys_umask(a[0]),
         sysno::FLOCK => misc::sys_flock(a[0], a[1]),

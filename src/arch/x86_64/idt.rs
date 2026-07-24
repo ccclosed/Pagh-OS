@@ -241,6 +241,11 @@ extern "x86-interrupt" fn page_fault_handler(stack: InterruptStackFrame, error_c
     crate::error!("[EXC #14] current pid={} last_dispatch: pid={} nr={}", pid,
         LAST_SYSCALL_PID.load(core::sync::atomic::Ordering::Relaxed),
         LAST_SYSCALL_NR.load(core::sync::atomic::Ordering::Relaxed));
+    // STAGE-16.1 DIAG: which address space was live, and at which level does
+    // the translation of the faulting address (and of RIP) break?
+    crate::error!("[EXC #14] CR3=0x{:016x}", crate::memory::vmm::current_pml4_phys());
+    crate::memory::vmm::dump_translation(fault_addr.as_u64());
+    crate::memory::vmm::dump_translation(stack.instruction_pointer.as_u64());
     crate::error!("--- Top 24 words of user stack (rsp=0x{:x}) ---", rsp);
     let mut i = 0u64;
     while i < 24 {
