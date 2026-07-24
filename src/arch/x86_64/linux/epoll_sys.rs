@@ -184,9 +184,11 @@ fn poll_fd(fd: i32, events: u32) -> u32 {
         match cs.fds.get(fd as u32) {
             None => EPOLLERR,
             Some(OpenObject::Stdin) => {
-                // In raw mode: ready when there is a scancode available;
-                // in cooked mode: always report readable (read blocks in-kernel).
-                if events & EPOLLIN != 0 { EPOLLIN } else { 0 }
+                // STAGE-16.3: report readable only when a read can actually
+                // make progress. The old always-ready answer made libuv issue
+                // a read that blocked in-kernel and stalled nvim's TUI loop
+                // before the first frame was drawn.
+                if events & EPOLLIN != 0 && super::io_sys::stdin_input_available() { EPOLLIN } else { 0 }
             }
             Some(OpenObject::Console) => if events & EPOLLOUT != 0 { EPOLLOUT } else { 0 },
             Some(OpenObject::PipeRead(e)) => {

@@ -15,14 +15,14 @@ struct Cell { ch: u8, fg: u32, bg: u32 }
 impl Cell { const BLANK: Self = Self { ch: b' ', fg: DEFAULT_FG, bg: DEFAULT_BG }; }
 
 #[derive(PartialEq, Clone, Copy)]
-enum Es { Normal, Esc, Csi, Osc }
+enum Es { Normal, Esc, Csi, Osc, OscEsc, Dcs, DcsEsc }
 
 struct Vt {
     cols: usize, rows: usize, cells: Vec<Cell>,
     cx: usize, cy: usize, saved_cx: usize, saved_cy: usize,
     fg: u32, bg: u32,
     scroll_top: usize, scroll_bot: usize,
-    state: Es, params: [u32; 16], np: usize, inter: u8,
+    state: Es, params: [u32; 16], np: usize, inter: u8, inter2: u8, osc_buf: Vec<u8>,
 }
 
 fn ansi256(n: u32) -> u32 {
@@ -42,7 +42,7 @@ impl Vt {
         Self { cols, rows, cells: alloc::vec![Cell::BLANK; cols*rows],
                cx:0,cy:0,saved_cx:0,saved_cy:0,fg:DEFAULT_FG,bg:DEFAULT_BG,
                scroll_top:0,scroll_bot:rows.saturating_sub(1),
-               state:Es::Normal,params:[0u32;16],np:0,inter:0 }
+               state:Es::Normal,params:[0u32;16],np:0,inter:0,inter2:0,osc_buf:Vec::new() }
     }
     fn idx(&self,x:usize,y:usize)->usize{y*self.cols+x}
     fn get(&self,x:usize,y:usize)->Cell{self.cells[self.idx(x,y)]}
@@ -169,6 +169,43 @@ impl Vt {
             _=>{}
         }
     }
+    // STAGE-16.3: dispatch a completed CSI, answering interrogation
+    // sequences. Unknown intermediate/private combos are swallowed silently
+    // instead of leaking the final byte as text (the old parser printed
+    // "p3m$qm"-style junk out of nvim's DECRQM/DECSCUSR/XTVERSION probes).
+    fn csi_final(&mut self,f:u8){
+        match(self.inter,self.inter2,f){
+            (b'?',b'$',b'p')=>{ // DECRQM (private): "not recognized"
+                let s=alloc::format!("\x1b[?{};0$y",self.params[0]);
+                respond(s.as_bytes());
+            }
+            (0,b'$',b'p')=>{ // DECRQM (ANSI)
+                let s=alloc::format!("\x1b[{};0$y",self.params[0]);
+                respond(s.as_bytes());
+            }
+            (b'>',0,b'c')=>{respond(b"\x1b[>0;10;1c");} // DA2
+            (0,0,b'c')=>{respond(b"\x1b[?6c");}         // DA1: VT102
+            (0,0,b'n')=>{match self.params[0]{
+                5=>respond(b"\x1b[0n"),                 // DSR: terminal OK
+                6=>{ // CPR: cursor position report
+                    let s=alloc::format!("\x1b[{};{}R",self.cy+1,self.cx+1);
+                    respond(s.as_bytes());
+                }
+                _=>{}
+            }}
+            (b'>',0,b'q')=>{respond(b"\x1bP>|PaghVT 16.3\x1b\\");} // XTVERSION
+            (0,b' ',b'q')=>{} // DECSCUSR (cursor shape) - ignored
+            (b'?',0,b'h')|(b'?',0,b'l')=>{} // DEC private modes - ignored
+            (0,0,_)=>{self.csi(f);}
+            _=>{} // unknown - swallow, never print the final byte
+        }
+    }
+    fn process_osc(&mut self){
+        let buf=core::mem::take(&mut self.osc_buf);
+        // OSC 10/11 color queries: nvim probes fg/bg to pick 'background'.
+        if buf.starts_with(b"10;?"){respond(b"\x1b]10;rgb:aaaa/aaaa/aaaa\x1b\\");}
+        else if buf.starts_with(b"11;?"){respond(b"\x1b]11;rgb:0000/0000/0000\x1b\\");}
+    }
     fn blit(&self,x:usize,y:usize){let c=self.get(x,y);let px=x*GLYPH_W;let py=STATUS_H+y*GLYPH_H;crate::drivers::framebuffer::with(|fb|{fb.draw_glyph_px(c.ch,px,py,c.fg,c.bg);});}
     pub fn feed(&mut self,b:u8){
         match self.state{
@@ -183,8 +220,11 @@ impl Vt {
                 _=>{}
             },
             Es::Esc=>match b{
-                b'['=>{self.state=Es::Csi;self.params=[0u32;16];self.np=0;self.inter=0;}
-                b']'=>{self.state=Es::Osc;}
+                b'['=>{self.state=Es::Csi;self.params=[0u32;16];self.np=0;self.inter=0;self.inter2=0;}
+                b']'=>{self.state=Es::Osc;self.osc_buf.clear();}
+                // STAGE-16.3: DCS/SOS/PM/APC strings (XTGETTCAP etc.) are
+                // consumed up to ST instead of leaking into the grid.
+                b'P'|b'X'|b'^'|b'_'=>{self.state=Es::Dcs;}
                 b'7'=>{self.saved_cx=self.cx;self.saved_cy=self.cy;self.state=Es::Normal;}
                 b'8'=>{self.cx=self.saved_cx;self.cy=self.saved_cy;self.state=Es::Normal;}
                 b'M'=>{if self.cy==self.scroll_top{self.scroll_dn(1);}else if self.cy>0{self.cy-=1;}self.state=Es::Normal;}
@@ -195,28 +235,49 @@ impl Vt {
                     let i=if self.np==0{self.np=1;0}else{self.np-1};
                     self.params[i.min(15)]=self.params[i.min(15)].saturating_mul(10).saturating_add((b-b'0')as u32);
                 }
-                b';'=>{if self.np==0{self.np=1;}if self.np<16{self.np+=1;self.params[self.np-1]=0;}}
-                b'?'|b'>'=>{self.inter=b;}
+                b';'|b':'=>{if self.np==0{self.np=1;}if self.np<16{self.np+=1;self.params[self.np-1]=0;}}
+                0x3C..=0x3F=>{self.inter=b;}   // private markers: ? > = <
+                0x20..=0x2F=>{self.inter2=b;}  // STAGE-16.3: intermediates ($ SP " !)
                 0x40..=0x7E=>{
-                    if self.inter==b'?'{
-                        // handle ?25h/l and ?1049h/l
-                        let n=self.params[0];
-                        if b==b'h'&&n==2004{} // bracketed paste on
-                        if b==b'l'&&n==2004{} // bracketed paste off
-                        // other private modes ignored
-                    }else{
-                        self.csi(b);
-                    }
+                    self.csi_final(b);
                     self.state=Es::Normal;
                 }
                 _=>{self.state=Es::Normal;}
             },
             Es::Osc=>{
-                if b==0x07||b==0x1B{self.state=Es::Normal;}
+                if b==0x07{self.process_osc();self.state=Es::Normal;}
+                else if b==0x1B{self.state=Es::OscEsc;}
+                else if self.osc_buf.len()<64{self.osc_buf.push(b);}
+            }
+            Es::OscEsc=>{
+                if b==b'\\'{self.process_osc();}
+                self.state=Es::Normal;
+            }
+            Es::Dcs=>{
+                if b==0x07{self.state=Es::Normal;}
+                else if b==0x1B{self.state=Es::DcsEsc;}
+            }
+            Es::DcsEsc=>{
+                self.state=if b==b'\\'{Es::Normal}else{Es::Dcs};
             }
         }
     }
 }
+
+// STAGE-16.3: replies to terminal interrogation sequences (DA1, DSR, DECRQM,
+// OSC color queries). nvim sends these at startup and reads the answers from
+// stdin; the raw-tty read path drains this queue into STDIN_PENDING.
+static RESPONSES: Spinlock<Vec<u8>> = Spinlock::new(Vec::new());
+
+fn respond(bytes:&[u8]){
+    RESPONSES.lock().extend_from_slice(bytes);
+}
+
+/// True when query replies are queued (drives poll/epoll stdin readability).
+pub fn has_input_responses()->bool{ !RESPONSES.lock().is_empty() }
+
+/// Drain queued query replies for injection into the stdin stream.
+pub fn take_input_responses()->Vec<u8>{ core::mem::take(&mut *RESPONSES.lock()) }
 
 static VT: Spinlock<Option<Vt>> = Spinlock::new(None);
 

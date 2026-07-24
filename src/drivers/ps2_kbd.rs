@@ -28,6 +28,12 @@ impl Ps2Keyboard {
         }
     }
 
+    /// STAGE-16.3: non-destructive check - is at least one scancode queued?
+    pub fn has_scancode(&self) -> bool {
+        let inner = self.inner.lock();
+        inner.head != inner.tail
+    }
+
     /// Push a scancode byte into the ring buffer (called from IRQ context).
     /// Allocation-free.
     pub fn push_scancode(&self, byte: u8) {
@@ -77,4 +83,10 @@ pub fn irq_handler() {
     if let Some(ref kbd) = *KEYBOARD.lock() {
         kbd.push_scancode(scancode);
     }
+}
+
+/// STAGE-16.3: true when the ring buffer holds an unread scancode. Lets
+/// poll/epoll report stdin readable only when a read can make progress.
+pub fn has_pending() -> bool {
+    KEYBOARD.lock().as_ref().map(|k| k.has_scancode()).unwrap_or(false)
 }

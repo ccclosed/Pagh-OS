@@ -775,6 +775,19 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
 // consume — readline drains input one byte per read after select().
 static STDIN_PENDING: crate::sync::spinlock::Spinlock<alloc::vec::Vec<u8>> =
     crate::sync::spinlock::Spinlock::new(alloc::vec::Vec::new());
+
+// STAGE-16.3: libuv puts the raw tty into O_NONBLOCK and multiplexes it with
+// epoll; a read that blocks in-kernel stalls nvim's whole TUI event loop.
+static STDIN_NONBLOCK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// STAGE-16.3: true when a raw-mode stdin read can make progress right now:
+/// leftover bytes, queued VT query replies, or an unread keyboard scancode.
+pub(crate) fn stdin_input_available() -> bool {
+    !STDIN_PENDING.lock().is_empty()
+        || crate::drivers::vt::has_input_responses()
+        || crate::drivers::ps2_kbd::has_pending()
+}
 /// Hard cap so a pathological paste cannot grow the cooked line unbounded.
 const STDIN_LINE_MAX: usize = 4096;
 
@@ -792,6 +805,14 @@ const STDIN_LINE_MAX: usize = 4096;
 fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
     use crate::shell::keys::{Decoder, KeyEvent};
     if count == 0 { return Ok(0); }
+    // STAGE-16.3: queue any pending VT query replies (DA1/DSR/DECRQM/OSC)
+    // so nvim's terminal interrogation gets its answers on stdin.
+    {
+        let resp = crate::drivers::vt::take_input_responses();
+        if !resp.is_empty() {
+            STDIN_PENDING.lock().extend_from_slice(&resp);
+        }
+    }
     // Drain pending bytes first (raw mode can also leave leftovers).
     {
         let mut pending = STDIN_PENDING.lock();
@@ -803,12 +824,29 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
         }
     }
     let mut decoder = Decoder::new();
+    // STAGE-16.3: once a scancode was consumed, wait a bounded number of
+    // polls so multi-byte sequences (E0-prefixed arrows) complete, but a
+    // lone key-release cannot park a nonblocking reader forever.
+    let mut consumed_any = false;
+    let mut spins = 0u32;
     loop {
         let sc = crate::drivers::get_char("keyboard").and_then(|kbd| kbd.read_char());
         let sc = match sc {
             Some(b) => b,
-            None => { crate::task::scheduler::yield_current(); continue; }
+            None => {
+                // STAGE-16.3: honor O_NONBLOCK - blocking here stalled
+                // nvim's TUI loop before the first frame was drawn.
+                if STDIN_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed)
+                    && (!consumed_any || spins > 200)
+                {
+                    return Err(Errno::EAGAIN);
+                }
+                spins += 1;
+                crate::task::scheduler::yield_current();
+                continue;
+            }
         };
+        consumed_any = true;
         let ev = match decoder.feed(sc) {
             Some(ev) => ev,
             None => continue,
@@ -1169,6 +1207,8 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
                         OpenObject::Socket { rx, .. } => rx.nonblocking(),
                         OpenObject::UnixListener(l) => l.inner.lock().nonblocking,
                         OpenObject::UnixSocketUnbound { nonblocking } => *nonblocking,
+                        // STAGE-16.3: stdin reports its real nonblocking state.
+                        OpenObject::Stdin => STDIN_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed),
                         _ => false,
                     };
                     Ok(if nb { O_RDWR_FL | O_NONBLOCK_FL } else { O_RDWR_FL })
@@ -1184,6 +1224,8 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
                         }
                         OpenObject::UnixListener(l) => l.inner.lock().nonblocking = on,
                         OpenObject::UnixSocketUnbound { nonblocking } => *nonblocking = on,
+                        // STAGE-16.3: libuv flips O_NONBLOCK on the raw tty.
+                        OpenObject::Stdin => { STDIN_NONBLOCK.store(on, core::sync::atomic::Ordering::Relaxed); }
                         _ => {}
                     }
                     Ok(0)
@@ -1374,7 +1416,7 @@ const O_NONBLOCK:u64=0x800; const O_CLOEXEC:u64=0x80000;
 const POLLIN:i16=0x001; const POLLOUT:i16=0x004; const POLLERR:i16=0x008; const POLLHUP:i16=0x010; const POLLNVAL:i16=0x020;
 pub fn sys_pipe(pipefd:u64)->Result<u64,Errno>{sys_pipe2(pipefd,0)}
 pub fn sys_pipe2(pipefd:u64,flags:u64)->Result<u64,Errno>{if flags&!(O_NONBLOCK|O_CLOEXEC)!=0{return Err(Errno::EINVAL)}check_user_ptr(pipefd,8)?;let pair=compat::with_current_compat(|cs|{let p=cs.fds.pipe(flags&O_NONBLOCK!=0);if flags&O_CLOEXEC!=0{cs.fds.set_cloexec(p.0,true);cs.fds.set_cloexec(p.1,true);}p}).ok_or(Errno::EBADF)?;let words=[pair.0,pair.1];let bytes=unsafe{core::slice::from_raw_parts(words.as_ptr()as*const u8,8)};copy_out(pipefd,bytes);Ok(0)}
-fn poll_revents(fd:i32,events:i16)->i16{if fd<0{return 0}match resolve_fd(fd as u32){None=>POLLNVAL,Some(Resolved::PipeRead(e))=>{let mut o=if e.read_ready(){events&POLLIN}else{0};if e.peer_closed(){o|=POLLHUP}o},Some(Resolved::PipeWrite(e))=>{let mut o=if e.write_ready(){events&POLLOUT}else{0};if e.peer_closed(){o|=POLLERR}o},Some(Resolved::Socket{rx,tx})=>{let mut o=0i16;if rx.read_ready(){o|=events&POLLIN}if tx.write_ready(){o|=events&POLLOUT}if rx.peer_closed(){o|=POLLHUP}o},Some(Resolved::Stdin)=>0,Some(Resolved::Console)=>events&POLLOUT,Some(Resolved::Eventfd{val,..})=>{let v=val.lock();if*v>0{events&POLLIN}else{0}},Some(Resolved::Epoll)=>0,Some(Resolved::File{..})|Some(Resolved::Dir)=>events&(POLLIN|POLLOUT)}}
+fn poll_revents(fd:i32,events:i16)->i16{if fd<0{return 0}match resolve_fd(fd as u32){None=>POLLNVAL,Some(Resolved::PipeRead(e))=>{let mut o=if e.read_ready(){events&POLLIN}else{0};if e.peer_closed(){o|=POLLHUP}o},Some(Resolved::PipeWrite(e))=>{let mut o=if e.write_ready(){events&POLLOUT}else{0};if e.peer_closed(){o|=POLLERR}o},Some(Resolved::Socket{rx,tx})=>{let mut o=0i16;if rx.read_ready(){o|=events&POLLIN}if tx.write_ready(){o|=events&POLLOUT}if rx.peer_closed(){o|=POLLHUP}o},Some(Resolved::Stdin)=>{if stdin_input_available(){events&POLLIN}else{0}},Some(Resolved::Console)=>events&POLLOUT,Some(Resolved::Eventfd{val,..})=>{let v=val.lock();if*v>0{events&POLLIN}else{0}},Some(Resolved::Epoll)=>0,Some(Resolved::File{..})|Some(Resolved::Dir)=>events&(POLLIN|POLLOUT)}}
 pub fn sys_poll(fds:u64,nfds:u64,timeout:u64)->Result<u64,Errno>{const SZ:u64=8;if nfds>1024{return Err(Errno::EINVAL)}check_user_ptr(fds,nfds.checked_mul(SZ).ok_or(Errno::EINVAL)?)?;let ms=timeout as i64;let deadline=if ms<0{None}else{Some(crate::task::scheduler::ticks().saturating_add((ms as u64).saturating_add(9)/10))};loop{let mut ready=0;for i in 0..nfds{let p=fds+i*SZ;let fd=unsafe{*(p as*const i32)};let ev=unsafe{*((p+4)as*const i16)};let rev=poll_revents(fd,ev);unsafe{*((p+6)as*mut i16)=rev}if rev!=0{ready+=1}}if ready!=0||ms==0{return Ok(ready)}if let Some(end)=deadline{if crate::task::scheduler::ticks()>=end{return Ok(0)}}crate::task::scheduler::yield_current()}}
 
 // ---------------------------------------------------------------------------
