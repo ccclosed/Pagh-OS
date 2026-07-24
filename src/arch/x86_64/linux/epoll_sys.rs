@@ -5,7 +5,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use crate::arch::x86_64::linux::errno::Errno;
-use crate::arch::x86_64::linux::validate::check_user_ptr;
+use super::check_user_ptr;
 use crate::task::fd::OpenObject;
 use crate::task::compat;
 use crate::sync::spinlock::Spinlock;
