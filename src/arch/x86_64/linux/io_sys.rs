@@ -689,6 +689,36 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
             Some(_) => Ok(0),
         };
     }
+    // STAGE-16.9: FIONBIO. libuv's uv__nonblock on Linux is ioctl(FIONBIO),
+    // NOT fcntl(F_SETFL). uv_pipe_open() calls it on the dup'd socketpair end
+    // of the embedded-nvim RPC channel; answering ENOTTY made pipe_open fail,
+    // so the channel never reached the event loop (the black-screen hang).
+    // Mirrors the F_SETFL O_NONBLOCK arm below.
+    const FIONBIO: u64 = 0x5421;
+    if request == FIONBIO {
+        check_user_ptr(arg, 4)?;
+        let on = unsafe { core::ptr::read_unaligned(arg as *const u32) } != 0;
+        crate::warn!("[DIAG] ioctl FIONBIO pid={} fd={} on={}",
+            crate::task::scheduler::current_pid(), fd, on);
+        return compat::with_current_compat(|cs| {
+            let obj = cs.fds.get_mut(fd as u32).ok_or(Errno::EBADF)?;
+            match obj {
+                OpenObject::PipeRead(e) => *e = e.with_nonblocking(on),
+                OpenObject::PipeWrite(e) => *e = e.with_nonblocking(on),
+                OpenObject::Socket { rx, tx } => {
+                    let nrx = rx.with_nonblocking(on);
+                    let ntx = tx.with_nonblocking(on);
+                    *rx = nrx; *tx = ntx;
+                }
+                OpenObject::UnixListener(l) => l.inner.lock().nonblocking = on,
+                OpenObject::UnixSocketUnbound { nonblocking } => *nonblocking = on,
+                OpenObject::Stdin => { STDIN_NONBLOCK.store(on, core::sync::atomic::Ordering::Relaxed); }
+                _ => {}
+            }
+            Ok(0)
+        })
+        .unwrap_or(Err(Errno::EBADF));
+    }
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
         Some(Resolved::Console) | Some(Resolved::Stdin) => tty_ioctl(request, arg),
@@ -696,7 +726,16 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
         // ioctl for device", not "invalid argument". glibc isatty() expects
         // ENOTTY; EINVAL also tripped the EINVAL diag on every isatty probe
         // CPython makes (TCGETS on fd 3) and flooded the serial log.
-        Some(_) => Err(Errno::ENOTTY),
+        Some(_) => {
+            // STAGE-16.9: tty probes (isatty and friends) on non-tty fds are
+            // routine noise; any OTHER unknown request is a compat-surface gap
+            // worth seeing on screen.
+            if !(0x5401..=0x5420).contains(&request) {
+                crate::warn!("[DIAG] ioctl pid={} fd={} req=0x{:x} -> ENOTTY",
+                    crate::task::scheduler::current_pid(), fd, request);
+            }
+            Err(Errno::ENOTTY)
+        }
     }
 }
 
