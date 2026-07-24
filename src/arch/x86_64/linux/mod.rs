@@ -398,6 +398,15 @@ fn maybe_dump_self() {
         }
     };
     if let Some(epfd) = epfd {
+        // STAGE-16.8.2/3: the spawn-time [DIAG] lines are wiped when the TUI
+        // clears the screen, and the QEMU display cannot scroll back. Re-print
+        // the decisive evidence with every dump: what stdio is NOW and what it
+        // was AT execve time (after the close-on-exec sweep).
+        let _ = crate::task::compat::with_current_compat(|cs| {
+            crate::warn!("[WATCHDOG] pid={} stdio now: fd0={} fd1={} fd2={} | at exec: fd0={} fd1={} fd2={}",
+                pid, cs.fds.describe_fd(0), cs.fds.describe_fd(1), cs.fds.describe_fd(2),
+                cs.exec_stdio[0], cs.exec_stdio[1], cs.exec_stdio[2]);
+        });
         epoll_sys::dump_epoll_self(epfd);
     }
 }
