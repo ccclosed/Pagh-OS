@@ -282,6 +282,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         usage: "lxrun <path> [args...]",
         handler: super::commands::cmd_lxrun,
     },
+    CommandSpec {
+        name: "warn",
+        description: "Show/hide kernel [WARN] lines on screen (serial always logs)",
+        usage: "warn <on|off>",
+        handler: super::commands::cmd_warn,
+    },
 ];
 
 /// Look up a command by its exact name via a linear scan of [`COMMANDS`].

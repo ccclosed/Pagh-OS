@@ -980,6 +980,29 @@ pub(super) fn cmd_pkg(_ctx: &mut ShellCtx, args: &[&str]) {
 /// scheduler. Only static `ET_EXEC` / static-PIE `ET_DYN` binaries are supported
 /// (dynamically-linked binaries are rejected). Like `exec`, this runs with
 /// interrupts disabled across the brief CR3 switch the loader/stack mapper perform.
+/// STAGE-16.10: `warn` toggles mirroring of `[WARN]` kernel log lines onto
+/// the framebuffer console. Serial always receives every line regardless;
+/// this only controls the on-screen spam that wrecked full-screen TUIs.
+pub(super) fn cmd_warn(_ctx: &mut ShellCtx, args: &[&str]) {
+    match args.first().copied() {
+        Some("on") => {
+            crate::log::set_fb_warn_mirror(true);
+            shell_println("warn: [WARN] lines will be shown on screen");
+        }
+        Some("off") => {
+            crate::log::set_fb_warn_mirror(false);
+            shell_println("warn: [WARN] lines hidden from screen (serial still logs them)");
+        }
+        _ => {
+            shell_println(&alloc::format!(
+                "warn: on-screen [WARN] lines are {}",
+                if crate::log::fb_warn_mirror() { "ON" } else { "OFF" }
+            ));
+            shell_println("usage: warn <on|off>");
+        }
+    }
+}
+
 pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
         shell_println("usage: lxrun <path> [args...]");
