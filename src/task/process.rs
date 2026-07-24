@@ -557,8 +557,9 @@ pub fn exec_linux_image(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<Ex
             st.fds.close_cloexec();
             // STAGE-16.8 DIAG: what the fresh image actually sees on stdio —
             // answers whether the spawn wired the RPC socket onto fds 0/1.
+            st.exec_stdio = [st.fds.describe_fd(0), st.fds.describe_fd(1), st.fds.describe_fd(2)];
             crate::warn!("[DIAG] execve pid={} fd0={} fd1={} fd2={}",
-                pid, st.fds.describe_fd(0), st.fds.describe_fd(1), st.fds.describe_fd(2));
+                pid, st.exec_stdio[0], st.exec_stdio[1], st.exec_stdio[2]);
             st.exe_path = resolved.clone();
         }).ok_or(RunError::LoadFailed("execve without compat state"))?;
         // SAFETY: loader built a valid PML4 with shared kernel higher-half mappings.

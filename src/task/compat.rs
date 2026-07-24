@@ -58,6 +58,10 @@ pub struct CompatState {
     /// STAGE-15: absolute VFS path of the exec'd image, reported through
     /// `readlink("/proc/self/exe")` (libuv's uv_exepath / nvim's progpath).
     pub exe_path: String,
+    /// STAGE-16.8.3: what fds 0/1/2 were AT execve time (after the
+    /// close-on-exec sweep). The spawn-time [DIAG] lines are wiped by the
+    /// TUI screen clear, so the watchdog re-prints this snapshot instead.
+    pub exec_stdio: [&'static str; 3],
 }
 
 impl CompatState {
@@ -67,7 +71,7 @@ impl CompatState {
     /// code yet.
     pub fn new(fds: FdTable, vm: VmRegionSet, tid: u64) -> Self { Self::new_with_parent(fds, vm, tid, 1) }
     pub fn new_with_parent(fds: FdTable, vm: VmRegionSet, tid: u64, ppid: u64) -> Self {
-        Self { fds, vm, fs_base: 0, tid, ppid, tgid: tid, clear_child_tid: 0, waitable: true, robust_head: 0, robust_len: 0, cwd: "/".to_string(), nosys_logged: BTreeSet::new(), raw_mode: false, exit_code: None, exe_path: String::new() }
+        Self { fds, vm, fs_base: 0, tid, ppid, tgid: tid, clear_child_tid: 0, waitable: true, robust_head: 0, robust_len: 0, cwd: "/".to_string(), nosys_logged: BTreeSet::new(), raw_mode: false, exit_code: None, exe_path: String::new(), exec_stdio: ["?", "?", "?"] }
     }
 }
 
