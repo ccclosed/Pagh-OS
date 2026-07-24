@@ -12,7 +12,7 @@ const STATUS_H: usize = 18;
 
 #[derive(Clone, Copy)]
 struct Cell { ch: u8, fg: u32, bg: u32 }
-impl Cell { const BLANK: Self = Self { ch: b\' \', fg: DEFAULT_FG, bg: DEFAULT_BG }; }
+impl Cell { const BLANK: Self = Self { ch: b' ', fg: DEFAULT_FG, bg: DEFAULT_BG }; }
 
 #[derive(PartialEq, Clone, Copy)]
 enum Es { Normal, Esc, Csi, Osc }
@@ -130,23 +130,23 @@ impl Vt {
     }
     fn csi(&mut self,f:u8){
         match f{
-            b\'A\'=>{let n=self.p(0,1)as usize;self.cy=self.cy.saturating_sub(n);}
-            b\'B\'=>{let n=self.p(0,1)as usize;self.cy=(self.cy+n).min(self.rows-1);}
-            b\'C\'=>{let n=self.p(0,1)as usize;self.cx=(self.cx+n).min(self.cols-1);}
-            b\'D\'=>{let n=self.p(0,1)as usize;self.cx=self.cx.saturating_sub(n);}
-            b\'E\'=>{let n=self.p(0,1)as usize;self.cy=(self.cy+n).min(self.rows-1);self.cx=0;}
-            b\'F\'=>{let n=self.p(0,1)as usize;self.cy=self.cy.saturating_sub(n);self.cx=0;}
-            b\'G\'=>{self.cx=(self.p(0,1)as usize).saturating_sub(1).min(self.cols-1);}
-            b\'H\'|b\'f\'=>{
+            b'A'=>{let n=self.p(0,1)as usize;self.cy=self.cy.saturating_sub(n);}
+            b'B'=>{let n=self.p(0,1)as usize;self.cy=(self.cy+n).min(self.rows-1);}
+            b'C'=>{let n=self.p(0,1)as usize;self.cx=(self.cx+n).min(self.cols-1);}
+            b'D'=>{let n=self.p(0,1)as usize;self.cx=self.cx.saturating_sub(n);}
+            b'E'=>{let n=self.p(0,1)as usize;self.cy=(self.cy+n).min(self.rows-1);self.cx=0;}
+            b'F'=>{let n=self.p(0,1)as usize;self.cy=self.cy.saturating_sub(n);self.cx=0;}
+            b'G'=>{self.cx=(self.p(0,1)as usize).saturating_sub(1).min(self.cols-1);}
+            b'H'|b'f'=>{
                 let r=(self.p(0,1)as usize).saturating_sub(1).min(self.rows-1);
                 let c=(self.p(1,1)as usize).saturating_sub(1).min(self.cols-1);
                 self.cy=r;self.cx=c;
             }
-            b\'J\'=>{self.erase_disp(self.p(0,0));}
-            b\'K\'=>{self.erase_line(self.p(0,0));}
-            b\'L\'=>{let n=self.p(0,1)as usize;self.scroll_dn(n);}
-            b\'M\'=>{let n=self.p(0,1)as usize;self.scroll_up(n);}
-            b\'P\'=>{
+            b'J'=>{self.erase_disp(self.p(0,0));}
+            b'K'=>{self.erase_line(self.p(0,0));}
+            b'L'=>{let n=self.p(0,1)as usize;self.scroll_dn(n);}
+            b'M'=>{let n=self.p(0,1)as usize;self.scroll_up(n);}
+            b'P'=>{
                 let n=(self.p(0,1)as usize).min(self.cols-self.cx);
                 for col in self.cx..self.cols{
                     let c=if col+n<self.cols{self.get(col+n,self.cy)}else{Cell::BLANK};
@@ -154,18 +154,18 @@ impl Vt {
                 }
                 for col in self.cx..self.cols{self.blit(col,self.cy);}
             }
-            b\'S\'=>{let n=self.p(0,1)as usize;self.scroll_up(n);}
-            b\'T\'=>{let n=self.p(0,1)as usize;self.scroll_dn(n);}
-            b\'X\'=>{let n=(self.p(0,1)as usize).min(self.cols-self.cx);for col in self.cx..self.cx+n{self.put(col,self.cy,Cell::BLANK);}}
-            b\'d\'=>{self.cy=(self.p(0,1)as usize).saturating_sub(1).min(self.rows-1);}
-            b\'m\'=>{self.sgr();}
-            b\'r\'=>{
+            b'S'=>{let n=self.p(0,1)as usize;self.scroll_up(n);}
+            b'T'=>{let n=self.p(0,1)as usize;self.scroll_dn(n);}
+            b'X'=>{let n=(self.p(0,1)as usize).min(self.cols-self.cx);for col in self.cx..self.cx+n{self.put(col,self.cy,Cell::BLANK);}}
+            b'd'=>{self.cy=(self.p(0,1)as usize).saturating_sub(1).min(self.rows-1);}
+            b'm'=>{self.sgr();}
+            b'r'=>{
                 let t=(self.p(0,1)as usize).saturating_sub(1);
                 let b=(self.p(1,self.rows as u32)as usize).saturating_sub(1).min(self.rows-1);
                 if t<b{self.scroll_top=t;self.scroll_bot=b;}
             }
-            b\'s\'=>{self.saved_cx=self.cx;self.saved_cy=self.cy;}
-            b\'u\'=>{self.cx=self.saved_cx;self.cy=self.saved_cy;}
+            b's'=>{self.saved_cx=self.cx;self.saved_cy=self.cy;}
+            b'u'=>{self.cx=self.saved_cx;self.cy=self.saved_cy;}
             _=>{}
         }
     }
@@ -183,26 +183,26 @@ impl Vt {
                 _=>{}
             },
             Es::Esc=>match b{
-                b\'[\'=>{self.state=Es::Csi;self.params=[0u32;16];self.np=0;self.inter=0;}
-                b\']\'=>{self.state=Es::Osc;}
-                b\'7\'=>{self.saved_cx=self.cx;self.saved_cy=self.cy;self.state=Es::Normal;}
-                b\'8\'=>{self.cx=self.saved_cx;self.cy=self.saved_cy;self.state=Es::Normal;}
-                b\'M\'=>{if self.cy==self.scroll_top{self.scroll_dn(1);}else if self.cy>0{self.cy-=1;}self.state=Es::Normal;}
+                b'['=>{self.state=Es::Csi;self.params=[0u32;16];self.np=0;self.inter=0;}
+                b']'=>{self.state=Es::Osc;}
+                b'7'=>{self.saved_cx=self.cx;self.saved_cy=self.cy;self.state=Es::Normal;}
+                b'8'=>{self.cx=self.saved_cx;self.cy=self.saved_cy;self.state=Es::Normal;}
+                b'M'=>{if self.cy==self.scroll_top{self.scroll_dn(1);}else if self.cy>0{self.cy-=1;}self.state=Es::Normal;}
                 _=>{self.state=Es::Normal;}
             },
             Es::Csi=>match b{
-                b\'0\'..=b\'9\'=>{
+                b'0'..=b'9'=>{
                     let i=if self.np==0{self.np=1;0}else{self.np-1};
-                    self.params[i.min(15)]=self.params[i.min(15)].saturating_mul(10).saturating_add((b-b\'0\')as u32);
+                    self.params[i.min(15)]=self.params[i.min(15)].saturating_mul(10).saturating_add((b-b'0')as u32);
                 }
-                b\';\'=>{if self.np==0{self.np=1;}if self.np<16{self.np+=1;self.params[self.np-1]=0;}}
-                b\'?\'|b\'>\'=>{self.inter=b;}
+                b';'=>{if self.np==0{self.np=1;}if self.np<16{self.np+=1;self.params[self.np-1]=0;}}
+                b'?'|b'>'=>{self.inter=b;}
                 0x40..=0x7E=>{
-                    if self.inter==b\'?\'{
+                    if self.inter==b'?'{
                         // handle ?25h/l and ?1049h/l
                         let n=self.params[0];
-                        if b==b\'h\'&&n==2004{} // bracketed paste on
-                        if b==b\'l\'&&n==2004{} // bracketed paste off
+                        if b==b'h'&&n==2004{} // bracketed paste on
+                        if b==b'l'&&n==2004{} // bracketed paste off
                         // other private modes ignored
                     }else{
                         self.csi(b);
