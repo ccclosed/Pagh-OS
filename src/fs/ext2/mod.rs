@@ -156,7 +156,7 @@ struct Tx<'a> {
     /// STAGE-16.8: blocks in `dirty` that are FILE DATA. Ordered mode: on
     /// commit they are written straight to their final location and are NOT
     /// copied through the WAL (metadata-only journaling).
-    data: alloc::collections::BTreeSet<u64>,
+    data: ::alloc::collections::BTreeSet<u64>,
 }
 
 impl<'a> Tx<'a> {
@@ -167,7 +167,7 @@ impl<'a> Tx<'a> {
             sb: inner.sb,
             gds: inner.gds.clone(),
             dirty: BTreeMap::new(),
-            data: alloc::collections::BTreeSet::new(),
+            data: ::alloc::collections::BTreeSet::new(),
         }
     }
 
