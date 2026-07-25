@@ -189,9 +189,11 @@ pub fn sys_futex(
     }
 }
 
-const WNOHANG:u64=1; const RUSAGE_SIZE:u64=18*8;
+// STAGE 16.15: bash with job control calls wait4 with WUNTRACED; we never
+// stop/continue processes, so WUNTRACED/WCONTINUED are accepted as no-ops.
+const WNOHANG:u64=1; const WUNTRACED:u64=2; const WCONTINUED:u64=8; const RUSAGE_SIZE:u64=18*8;
 pub fn sys_wait4(pid:u64,status:u64,options:u64,rusage:u64)->Result<u64,Errno>{
- if options & !WNOHANG !=0{return Err(Errno::EINVAL)} let wanted=pid as i64; if wanted != -1 && wanted<=0{return Err(Errno::ECHILD)}
+ if options & !(WNOHANG|WUNTRACED|WCONTINUED) !=0{return Err(Errno::EINVAL)} let wanted=pid as i64; if wanted != -1 && wanted<=0{return Err(Errno::ECHILD)}
  if status!=0{check_user_ptr(status,4)?} if rusage!=0{check_user_ptr(rusage,RUSAGE_SIZE)?}
  let parent=crate::task::scheduler::current_pid(); loop{
   if let Some((child,code))=crate::task::compat::reap_child(parent,wanted){if status!=0{unsafe{ptr::write_unaligned(status as *mut u32,(code as u32)<<8)}} if rusage!=0{unsafe{ptr::write_bytes(rusage as *mut u8,0,RUSAGE_SIZE as usize)}} return Ok(child)}

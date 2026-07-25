@@ -213,7 +213,7 @@ impl Vt {
                 0x07=>{} // BEL
                 0x08=>{if self.cx>0{self.cx-=1;}}
                 0x09=>{let n=(self.cx+8)&!7;self.cx=n.min(self.cols-1);}
-                0x0A|0x0B|0x0C=>{self.newline();}
+                0x0A|0x0B|0x0C=>{self.cx=0;self.newline();} // STAGE 16.15: LF implies CR (emulated ONLCR)
                 0x0D=>{self.cx=0;}
                 0x1B=>{self.state=Es::Esc;}
                 0x20..=0x7E|0x80..=0xFF=>{self.put_char(b);}
