@@ -125,10 +125,12 @@ pub fn _log(level: Level, args: fmt::Arguments) {
     // serial only and the interactive console is not flooded.
     // STAGE-16.10: [WARN] chatter (watchdog / [DIAG] telemetry) stays off the
     // framebuffer unless explicitly enabled with the `warn on` shell command;
-    // it was wrecking full-screen TUIs (nvim). Serial always logs everything;
-    // [ERROR] and [INFO] mirror to the screen as before.
-    let warn_muted =
-        level == Level::Warn && !FB_WARN_MIRROR.load(core::sync::atomic::Ordering::Relaxed);
+    // it was wrecking full-screen TUIs (nvim). Serial always logs everything.
+    // STAGE-16.14: [INFO] is muted from the framebuffer under the same toggle:
+    // async "Compat_Process pid=N started" lines were interleaving with bash
+    // output and garbling the screen. [ERROR] still always mirrors.
+    let warn_muted = (level == Level::Warn || level == Level::Info)
+        && !FB_WARN_MIRROR.load(core::sync::atomic::Ordering::Relaxed);
     if !FB_MIRROR_PAUSED.load(core::sync::atomic::Ordering::Relaxed) && !warn_muted {
         write_to(crate::drivers::framebuffer::console(), tag, args);
     }

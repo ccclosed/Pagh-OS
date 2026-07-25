@@ -56,6 +56,10 @@ pub const SETSOCKOPT: u64 = 54;
 pub const GETSOCKOPT: u64 = 55;
     /// STAGE-16: session/permission/locking stubs.
     pub const SETSID: u64 = 112;
+    /// STAGE-16.14: job-control family bash probes at startup.
+    pub const SETPGID: u64 = 109;
+    pub const GETPGRP: u64 = 111;
+    pub const GETPGID: u64 = 121;
     pub const UMASK: u64 = 95;
     pub const FLOCK: u64 = 73;
     /// STAGE-16.11: vectored / positional-vectored I/O + file sync. nvim's
@@ -326,6 +330,9 @@ pub fn is_supported(nr: u64) -> bool {
             | nr::SETSOCKOPT
             | nr::GETSOCKOPT
             | nr::SETSID
+            | nr::SETPGID
+            | nr::GETPGRP
+            | nr::GETPGID
             | nr::UMASK
             | nr::FLOCK
     )

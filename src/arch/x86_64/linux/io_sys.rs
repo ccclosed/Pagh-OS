@@ -819,6 +819,9 @@ const TCSETSF: u64 = 0x5404;
 /// `TIOCGWINSZ`: read the window size (`struct winsize`).
 const TIOCGWINSZ: u64 = 0x5413;
 const TIOCSWINSZ: u64 = 0x5414;
+/// STAGE-16.14: terminal foreground process group (bash job control).
+const TIOCGPGRP: u64 = 0x540F;
+const TIOCSPGRP: u64 = 0x5410;
 
 /// Byte size of the Linux `struct termios` (4×u32 + c_line + c_cc[19]).
 const TERMIOS_SIZE: usize = 36;
@@ -878,6 +881,17 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
         // Window-size writes are accepted and ignored (readline issues
         // TIOCSWINSZ during startup to propagate its computed size).
         TIOCSWINSZ => Ok(0),
+        // STAGE-16.14: report the caller as the foreground process group and
+        // accept ownership changes silently. Without these, bash printed
+        // "cannot set terminal process group (-1)" + "no job control in this
+        // shell" on every start.
+        TIOCGPGRP => {
+            check_user_ptr(arg, 4)?;
+            let pg = crate::task::compat::current_tgid() as u32;
+            copy_out(arg, &pg.to_le_bytes());
+            Ok(0)
+        }
+        TIOCSPGRP => Ok(0),
         _ => Err(Errno::ENOTTY),
     }
 }
