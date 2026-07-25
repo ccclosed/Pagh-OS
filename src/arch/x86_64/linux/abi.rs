@@ -65,6 +65,12 @@ pub const GETSOCKOPT: u64 = 55;
     pub const PWRITEV: u64 = 296;
     pub const FSYNC: u64 = 74;
     pub const FDATASYNC: u64 = 75;
+    /// STAGE-16.13: rename family. nvim writes ShaDa to a tmp file and
+    /// renames it into place; missing rename left "E136: Can't rename ShaDa"
+    /// + a Press-ENTER prompt wedged on every exit.
+    pub const RENAME: u64 = 82;
+    pub const RENAMEAT: u64 = 264;
+    pub const RENAMEAT2: u64 = 316;
     pub const CLOCK_GETRES: u64 = 229;
     /// `lseek` — reposition a descriptor's offset.
     pub const LSEEK: u64 = 8;
@@ -251,6 +257,9 @@ pub fn is_supported(nr: u64) -> bool {
             | nr::PWRITEV
             | nr::FSYNC
             | nr::FDATASYNC
+            | nr::RENAME
+            | nr::RENAMEAT
+            | nr::RENAMEAT2
             | nr::ACCESS
             | nr::PIPE
             | nr::SCHED_YIELD

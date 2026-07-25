@@ -1103,6 +1103,107 @@ pub fn sys_access(path: u64, _mode: u64) -> Result<u64, Errno> {
 /// `mkdir` (83): create a directory on the mounted VFS/ext2 tree (STAGE-13.8).
 /// CPython probes it for pyc cache directories; ENOSYS was tolerated but
 /// logged an "unsupported syscall" warning on every interpreter start.
+/// STAGE-16.13 `rename` (82). The VFS trait has no native rename, so this is
+/// an emulation at the syscall layer: copy the file contents to the target
+/// path, then unlink the source. Not atomic (irrelevant for a single-user
+/// kernel) and files only: directory renames report EACCES with a WARN so a
+/// future stage can add real dirent renaming to ext2.
+fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
+    const RENAME_NOREPLACE: u64 = 1;
+    if flags & !RENAME_NOREPLACE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let oldabs_s = resolve_path(old);
+    let newabs_s = resolve_path(new);
+    let oldabs = oldabs_s.trim_end_matches('/');
+    let newabs = newabs_s.trim_end_matches('/');
+    if oldabs.is_empty() || newabs.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    if oldabs == newabs {
+        return Ok(0);
+    }
+    let node = vfs::lookup_path(oldabs).map_err(|_| Errno::ENOENT)?;
+    if node.is_directory() {
+        crate::warn!("[linux] rename: directory rename not supported: {} -> {}", oldabs, newabs);
+        return Err(Errno::EACCES);
+    }
+    if flags & RENAME_NOREPLACE != 0 && vfs::lookup_path(newabs).is_ok() {
+        return Err(Errno::EEXIST);
+    }
+    // Read the whole source file.
+    let size = node.size() as usize;
+    let mut data = ::alloc::vec::Vec::new();
+    data.resize(size, 0u8);
+    let mut off = 0usize;
+    while off < size {
+        let n = node.read(off as u64, &mut data[off..]).map_err(|_| Errno::EIO)?;
+        if n == 0 { break; }
+        off += n;
+    }
+    data.truncate(off);
+    // Create/replace the target and write the contents.
+    let (nparent, nname) = match newabs.rfind('/') {
+        Some(0) => ("/", &newabs[1..]),
+        Some(i) => (&newabs[..i], &newabs[i + 1..]),
+        None => return Err(Errno::ENOENT),
+    };
+    if nname.is_empty() { return Err(Errno::EINVAL); }
+    let ndir = vfs::lookup_path(nparent).map_err(|_| Errno::ENOENT)?;
+    if ndir.lookup(nname).is_ok() {
+        ndir.remove(nname).map_err(|e| {
+            crate::warn!("[linux] rename: replace target failed: {:?} {}", e, newabs);
+            Errno::EIO
+        })?;
+    }
+    let target = ndir.create_file(nname).map_err(|e| {
+        crate::warn!("[linux] rename: create target failed: {:?} {}", e, newabs);
+        Errno::EIO
+    })?;
+    let mut woff = 0usize;
+    while woff < data.len() {
+        let n = target.write(woff as u64, &data[woff..]).map_err(|e| {
+            crate::warn!("[linux] rename: write target failed: {:?} {}", e, newabs);
+            Errno::EIO
+        })?;
+        if n == 0 { return Err(Errno::EIO); }
+        woff += n;
+    }
+    // Unlink the source.
+    let (oparent, oname) = match oldabs.rfind('/') {
+        Some(0) => ("/", &oldabs[1..]),
+        Some(i) => (&oldabs[..i], &oldabs[i + 1..]),
+        None => return Err(Errno::ENOENT),
+    };
+    let odir = vfs::lookup_path(oparent).map_err(|_| Errno::ENOENT)?;
+    odir.remove(oname).map_err(|e| {
+        crate::warn!("[linux] rename: unlink source failed: {:?} {}", e, oldabs);
+        Errno::EIO
+    })?;
+    Ok(0)
+}
+
+pub fn sys_rename(oldpath: u64, newpath: u64) -> Result<u64, Errno> {
+    let o = read_user_cstr(oldpath)?;
+    let n = read_user_cstr(newpath)?;
+    rename_paths(&o, &n, 0)
+}
+
+/// `renameat` (264): dirfds are ignored (paths resolve against the cwd, which
+/// covers AT_FDCWD in this minimal layer, matching openat).
+pub fn sys_renameat(_olddirfd: u64, oldpath: u64, _newdirfd: u64, newpath: u64) -> Result<u64, Errno> {
+    let o = read_user_cstr(oldpath)?;
+    let n = read_user_cstr(newpath)?;
+    rename_paths(&o, &n, 0)
+}
+
+/// `renameat2` (316): like renameat; only RENAME_NOREPLACE is honored.
+pub fn sys_renameat2(_olddirfd: u64, oldpath: u64, _newdirfd: u64, newpath: u64, flags: u64) -> Result<u64, Errno> {
+    let o = read_user_cstr(oldpath)?;
+    let n = read_user_cstr(newpath)?;
+    rename_paths(&o, &n, flags)
+}
+
 pub fn sys_mkdir(path: u64, _mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);

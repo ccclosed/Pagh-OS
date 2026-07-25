@@ -127,6 +127,47 @@ impl VirtioBlkDevice {
     }
 }
 
+// STAGE-16.13: write-through sector cache. ext2 re-reads the same metadata
+// blocks (block/inode bitmaps, inode tables, directory blocks, indirect
+// blocks) thousands of times during apt unpacks and nvim `:help` tag loads;
+// every one of those was a full virtio round-trip. All disk I/O funnels
+// through read_block/write_block below, so a sector-granular map stays
+// coherent by construction: reads populate it, writes update it in place.
+// Capacity is bounded; on overflow the whole cache is dropped (simple and
+// correct, and a full sweep is rare).
+const SECTOR_CACHE_MAX: usize = 4096; // 4096 x 512 B = 2 MiB
+static SECTOR_CACHE: crate::sync::spinlock::Spinlock<
+    ::alloc::collections::BTreeMap<(&'static str, u64), ::alloc::boxed::Box<[u8; SECTOR]>>,
+> = crate::sync::spinlock::Spinlock::new(::alloc::collections::BTreeMap::new());
+
+fn cache_store(name: &'static str, block: u64, buf: &[u8]) {
+    let sectors = buf.len() / SECTOR;
+    let mut cache = SECTOR_CACHE.lock();
+    if cache.len() + sectors > SECTOR_CACHE_MAX {
+        cache.clear();
+    }
+    for i in 0..sectors {
+        let mut a = ::alloc::boxed::Box::new([0u8; SECTOR]);
+        a[..].copy_from_slice(&buf[i * SECTOR..(i + 1) * SECTOR]);
+        cache.insert((name, block + i as u64), a);
+    }
+}
+
+fn cache_fetch(name: &'static str, block: u64, buf: &mut [u8]) -> bool {
+    let sectors = buf.len() / SECTOR;
+    let cache = SECTOR_CACHE.lock();
+    for i in 0..sectors {
+        if !cache.contains_key(&(name, block + i as u64)) {
+            return false;
+        }
+    }
+    for i in 0..sectors {
+        let a = &cache[&(name, block + i as u64)];
+        buf[i * SECTOR..(i + 1) * SECTOR].copy_from_slice(&a[..]);
+    }
+    true
+}
+
 impl BlockDevice for VirtioBlkDevice {
     fn name(&self) -> &str {
         self.name
@@ -139,8 +180,15 @@ impl BlockDevice for VirtioBlkDevice {
     /// kernel-visible state unchanged.
     fn read_block(&self, block: u64, buf: &mut [u8]) -> Result<usize, ()> {
         self.validate(block, buf.len())?;
-        let mut dev = self.inner.lock();
-        dev.read_blocks(block as usize, buf).map_err(|_| ())?;
+        // STAGE-16.13: serve fully-cached requests from RAM.
+        if cache_fetch(self.name, block, buf) {
+            return Ok(buf.len());
+        }
+        {
+            let mut dev = self.inner.lock();
+            dev.read_blocks(block as usize, buf).map_err(|_| ())?;
+        }
+        cache_store(self.name, block, buf);
         Ok(buf.len())
     }
 
@@ -150,8 +198,12 @@ impl BlockDevice for VirtioBlkDevice {
     /// `Err(())` on a bad length / out-of-range request (R3.4/R3.5).
     fn write_block(&self, block: u64, buf: &[u8]) -> Result<usize, ()> {
         self.validate(block, buf.len())?;
-        let mut dev = self.inner.lock();
-        dev.write_blocks(block as usize, buf).map_err(|_| ())?;
+        {
+            let mut dev = self.inner.lock();
+            dev.write_blocks(block as usize, buf).map_err(|_| ())?;
+        }
+        // STAGE-16.13: write-through so subsequent reads hit the cache.
+        cache_store(self.name, block, buf);
         Ok(buf.len())
     }
 
