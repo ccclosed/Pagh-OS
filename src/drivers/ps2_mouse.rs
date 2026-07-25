@@ -8,8 +8,8 @@
 // [`poll`]. It performs no rendering — the software cursor (`drivers::cursor`)
 // and `paint` consume the state.
 
-use x86_64::instructions::port::Port;
 use crate::sync::spinlock::Spinlock;
+use x86_64::instructions::port::Port;
 
 const DATA_PORT: u16 = 0x60;
 const CMD_PORT: u16 = 0x64;
@@ -104,14 +104,18 @@ fn wait_read() {
 fn write_cmd(cmd: u8) {
     wait_write();
     // SAFETY: writing the 8042 command port with a known command byte.
-    unsafe { Port::<u8>::new(CMD_PORT).write(cmd); }
+    unsafe {
+        Port::<u8>::new(CMD_PORT).write(cmd);
+    }
 }
 
 /// Write a data byte to port 0x60 (controller config / mouse stream).
 fn write_data(data: u8) {
     wait_write();
     // SAFETY: writing the 8042 data port.
-    unsafe { Port::<u8>::new(DATA_PORT).write(data); }
+    unsafe {
+        Port::<u8>::new(DATA_PORT).write(data);
+    }
 }
 
 /// Read a data byte from port 0x60.
@@ -164,7 +168,11 @@ pub fn init(screen_w: usize, screen_h: usize) -> bool {
     if ok {
         crate::info!("[PS2MOUSE] mouse enabled ({}x{})", screen_w, screen_h);
     } else {
-        crate::warn!("[PS2MOUSE] mouse not detected (acks {:#x}/{:#x})", ack1, ack2);
+        crate::warn!(
+            "[PS2MOUSE] mouse not detected (acks {:#x}/{:#x})",
+            ack1,
+            ack2
+        );
     }
     ok
 }

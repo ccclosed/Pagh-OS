@@ -35,11 +35,7 @@ fn read_ptr(fs: &Ext2Fs, block: u32, index: u32) -> Result<u32, FsError> {
 /// logical block has not been allocated (a hole or past the last block).
 ///
 /// Returns `Err` only on an underlying device error.
-pub fn block_for_offset(
-    fs: &Ext2Fs,
-    inode: &Ext2Inode,
-    off: u64,
-) -> Result<Option<u32>, FsError> {
+pub fn block_for_offset(fs: &Ext2Fs, inode: &Ext2Inode, off: u64) -> Result<Option<u32>, FsError> {
     let mut idx = off / super::structs::BS as u64;
     let ppb = PTRS_PER_BLOCK as u64;
 

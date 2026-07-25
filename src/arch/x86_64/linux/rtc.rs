@@ -149,8 +149,8 @@ pub fn read_date() -> RtcDate {
     } else {
         // 12-hour: 12AM -> 0, 12PM -> 12, otherwise add 12 for PM.
         match (hour_val % 12, pm) {
-            (h, false) => h,         // 1..=11 AM, and 12AM -> 0
-            (h, true) => h + 12,     // 1..=11 PM -> 13..=23, and 12PM -> 12
+            (h, false) => h,     // 1..=11 AM, and 12AM -> 0
+            (h, true) => h + 12, // 1..=11 PM -> 13..=23, and 12PM -> 12
         }
     };
 

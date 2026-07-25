@@ -50,39 +50,39 @@ pub const JCMT_MAGIC: u32 = 0x4A43_4D54;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Ext2SuperBlock {
-    pub s_inodes_count: u32,        // 0x00
-    pub s_blocks_count: u32,        // 0x04
-    pub s_r_blocks_count: u32,      // 0x08
-    pub s_free_blocks_count: u32,   // 0x0C
-    pub s_free_inodes_count: u32,   // 0x10
-    pub s_first_data_block: u32,    // 0x14
-    pub s_log_block_size: u32,      // 0x18
-    pub s_log_frag_size: u32,       // 0x1C
-    pub s_blocks_per_group: u32,    // 0x20
-    pub s_frags_per_group: u32,     // 0x24
-    pub s_inodes_per_group: u32,    // 0x28
-    pub s_mtime: u32,               // 0x2C
-    pub s_wtime: u32,               // 0x30
-    pub s_mnt_count: u16,           // 0x34
-    pub s_max_mnt_count: u16,       // 0x36
-    pub s_magic: u16,               // 0x38 = 0xEF53
-    pub s_state: u16,               // 0x3A
-    pub s_errors: u16,              // 0x3C
-    pub s_minor_rev_level: u16,     // 0x3E
-    pub s_lastcheck: u32,           // 0x40
-    pub s_checkinterval: u32,       // 0x44
-    pub s_creator_os: u32,          // 0x48
-    pub s_rev_level: u32,           // 0x4C
-    pub s_def_resuid: u16,          // 0x50
-    pub s_def_resgid: u16,          // 0x52
-    pub s_first_ino: u32,           // 0x54
-    pub s_inode_size: u16,          // 0x58
-    pub s_block_group_nr: u16,      // 0x5A
-    pub s_feature_compat: u32,      // 0x5C
-    pub s_feature_incompat: u32,    // 0x60
-    pub s_feature_ro_compat: u32,   // 0x64
-    pub s_uuid: [u8; 16],           // 0x68
-    pub s_volume_name: [u8; 16],    // 0x78
+    pub s_inodes_count: u32,      // 0x00
+    pub s_blocks_count: u32,      // 0x04
+    pub s_r_blocks_count: u32,    // 0x08
+    pub s_free_blocks_count: u32, // 0x0C
+    pub s_free_inodes_count: u32, // 0x10
+    pub s_first_data_block: u32,  // 0x14
+    pub s_log_block_size: u32,    // 0x18
+    pub s_log_frag_size: u32,     // 0x1C
+    pub s_blocks_per_group: u32,  // 0x20
+    pub s_frags_per_group: u32,   // 0x24
+    pub s_inodes_per_group: u32,  // 0x28
+    pub s_mtime: u32,             // 0x2C
+    pub s_wtime: u32,             // 0x30
+    pub s_mnt_count: u16,         // 0x34
+    pub s_max_mnt_count: u16,     // 0x36
+    pub s_magic: u16,             // 0x38 = 0xEF53
+    pub s_state: u16,             // 0x3A
+    pub s_errors: u16,            // 0x3C
+    pub s_minor_rev_level: u16,   // 0x3E
+    pub s_lastcheck: u32,         // 0x40
+    pub s_checkinterval: u32,     // 0x44
+    pub s_creator_os: u32,        // 0x48
+    pub s_rev_level: u32,         // 0x4C
+    pub s_def_resuid: u16,        // 0x50
+    pub s_def_resgid: u16,        // 0x52
+    pub s_first_ino: u32,         // 0x54
+    pub s_inode_size: u16,        // 0x58
+    pub s_block_group_nr: u16,    // 0x5A
+    pub s_feature_compat: u32,    // 0x5C
+    pub s_feature_incompat: u32,  // 0x60
+    pub s_feature_ro_compat: u32, // 0x64
+    pub s_uuid: [u8; 16],         // 0x68
+    pub s_volume_name: [u8; 16],  // 0x78
 }
 
 const _: () = assert!(core::mem::size_of::<Ext2SuperBlock>() == 0x88);
@@ -123,10 +123,10 @@ pub struct Ext2Inode {
     pub i_dtime: u32,
     pub i_gid: u16,
     pub i_links_count: u16,
-    pub i_blocks: u32,          // count of 512-byte sectors
+    pub i_blocks: u32, // count of 512-byte sectors
     pub i_flags: u32,
     pub i_osd1: u32,
-    pub i_block: [u32; 15],     // 0..=11 direct, 12 single, 13 double, 14 triple
+    pub i_block: [u32; 15], // 0..=11 direct, 12 single, 13 double, 14 triple
     pub i_generation: u32,
     pub i_file_acl: u32,
     pub i_dir_acl: u32,
@@ -140,14 +140,32 @@ const _: () = assert!(core::mem::offset_of!(Ext2Inode, i_block) == 40);
 impl Ext2Inode {
     pub const fn zeroed() -> Self {
         Ext2Inode {
-            i_mode: 0, i_uid: 0, i_size: 0, i_atime: 0, i_ctime: 0, i_mtime: 0,
-            i_dtime: 0, i_gid: 0, i_links_count: 0, i_blocks: 0, i_flags: 0,
-            i_osd1: 0, i_block: [0; 15], i_generation: 0, i_file_acl: 0,
-            i_dir_acl: 0, i_faddr: 0, i_osd2: [0; 12],
+            i_mode: 0,
+            i_uid: 0,
+            i_size: 0,
+            i_atime: 0,
+            i_ctime: 0,
+            i_mtime: 0,
+            i_dtime: 0,
+            i_gid: 0,
+            i_links_count: 0,
+            i_blocks: 0,
+            i_flags: 0,
+            i_osd1: 0,
+            i_block: [0; 15],
+            i_generation: 0,
+            i_file_acl: 0,
+            i_dir_acl: 0,
+            i_faddr: 0,
+            i_osd2: [0; 12],
         }
     }
-    pub fn is_dir(&self) -> bool { (self.i_mode & 0xF000) == S_IFDIR }
-    pub fn is_reg(&self) -> bool { (self.i_mode & 0xF000) == S_IFREG }
+    pub fn is_dir(&self) -> bool {
+        (self.i_mode & 0xF000) == S_IFDIR
+    }
+    pub fn is_reg(&self) -> bool {
+        (self.i_mode & 0xF000) == S_IFREG
+    }
 }
 
 // ─── ext2 directory entry header (8 bytes; name follows) ─────────────────────

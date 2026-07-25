@@ -30,8 +30,7 @@ struct WaitQueue {
     woken: BTreeMap<u64, ()>,
 }
 
-static FUTEX_QUEUES: Spinlock<BTreeMap<(u64, u64), WaitQueue>> =
-    Spinlock::new(BTreeMap::new());
+static FUTEX_QUEUES: Spinlock<BTreeMap<(u64, u64), WaitQueue>> = Spinlock::new(BTreeMap::new());
 
 #[inline]
 fn key(uaddr: u64) -> (u64, u64) {
@@ -202,44 +201,67 @@ pub fn sys_wait4(pid:u64,status:u64,options:u64,rusage:u64)->Result<u64,Errno>{
 
 
 fn exec_cstr(ptr: u64, budget: &mut usize) -> Result<Vec<u8>, Errno> {
-    if ptr == 0 { return Err(Errno::EFAULT); }
-    let mut out=Vec::new();
+    if ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut out = Vec::new();
     for i in 0..4096u64 {
-        check_user_ptr(ptr+i,1)?;
-        let b=unsafe{ptr::read((ptr+i) as *const u8)};
-        if b==0 { *budget=budget.checked_add(out.len()+1).ok_or(Errno::E2BIG)?;
-            if *budget>4096{return Err(Errno::E2BIG)} return Ok(out) }
+        check_user_ptr(ptr + i, 1)?;
+        let b = unsafe { ptr::read((ptr + i) as *const u8) };
+        if b == 0 {
+            *budget = budget.checked_add(out.len() + 1).ok_or(Errno::E2BIG)?;
+            if *budget > 4096 {
+                return Err(Errno::E2BIG);
+            }
+            return Ok(out);
+        }
         out.push(b);
     }
     Err(Errno::E2BIG)
 }
-fn exec_vec(base:u64,budget:&mut usize)->Result<Vec<Vec<u8>>,Errno>{
-    if base==0{return Ok(Vec::new())} let mut out=Vec::new();
-    for i in 0..256u64 { let slot=base+i*8; check_user_ptr(slot,8)?;
-        let p=unsafe{ptr::read_unaligned(slot as *const u64)}; if p==0{return Ok(out)};
-        out.push(exec_cstr(p,budget)?); }
+fn exec_vec(base: u64, budget: &mut usize) -> Result<Vec<Vec<u8>>, Errno> {
+    if base == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for i in 0..256u64 {
+        let slot = base + i * 8;
+        check_user_ptr(slot, 8)?;
+        let p = unsafe { ptr::read_unaligned(slot as *const u64) };
+        if p == 0 {
+            return Ok(out);
+        };
+        out.push(exec_cstr(p, budget)?);
+    }
     Err(Errno::E2BIG)
 }
-fn runerr(e:crate::task::process::RunError)->Errno{match e{
-    crate::task::process::RunError::ArgsTooLarge=>Errno::E2BIG,
-    crate::task::process::RunError::NotFound=>Errno::ENOENT,
-    crate::task::process::RunError::LoadFailed(_)=>Errno::ENOEXEC,
-    crate::task::process::RunError::StackFailed=>Errno::ENOMEM,
-}}
+fn runerr(e: crate::task::process::RunError) -> Errno {
+    match e {
+        crate::task::process::RunError::ArgsTooLarge => Errno::E2BIG,
+        crate::task::process::RunError::NotFound => Errno::ENOENT,
+        crate::task::process::RunError::LoadFailed(_) => Errno::ENOEXEC,
+        crate::task::process::RunError::StackFailed => Errno::ENOMEM,
+    }
+}
 /// execve(59), syscall-instruction path: replace CR3/image and return through
 /// sysretq directly to the new ELF entry with a new System-V initial stack.
-pub fn sys_execve(regs:&mut SavedRegs,path:u64,argv:u64,envp:u64)->Result<u64,Errno>{
-    let mut budget=0usize; let pathb=exec_cstr(path,&mut budget)?;
-    let path=String::from_utf8(pathb).map_err(|_|Errno::EINVAL)?;
-    let av=exec_vec(argv,&mut budget)?; let ev=exec_vec(envp,&mut budget)?;
-    let ar:Vec<&[u8]>=av.iter().map(|v|v.as_slice()).collect();
-    let er:Vec<&[u8]>=ev.iter().map(|v|v.as_slice()).collect();
-    let image=crate::task::process::exec_linux_image(&path,&ar,&er).map_err(runerr)?;
-    let flags=regs.r11; *regs=SavedRegs::default(); regs.r11=flags|2; regs.rcx=image.entry;
+pub fn sys_execve(regs: &mut SavedRegs, path: u64, argv: u64, envp: u64) -> Result<u64, Errno> {
+    let mut budget = 0usize;
+    let pathb = exec_cstr(path, &mut budget)?;
+    let path = String::from_utf8(pathb).map_err(|_| Errno::EINVAL)?;
+    let av = exec_vec(argv, &mut budget)?;
+    let ev = exec_vec(envp, &mut budget)?;
+    let ar: Vec<&[u8]> = av.iter().map(|v| v.as_slice()).collect();
+    let er: Vec<&[u8]> = ev.iter().map(|v| v.as_slice()).collect();
+    let image = crate::task::process::exec_linux_image(&path, &ar, &er).map_err(runerr)?;
+    let flags = regs.r11;
+    *regs = SavedRegs::default();
+    regs.r11 = flags | 2;
+    regs.rcx = image.entry;
     // `syscall`-instruction path (musl): the exit stub restores the user RSP
     // from the per-task slot at +120 right above the SavedRegs frame, so
     // execve must rewrite THAT slot; the old global is never read on exit.
-    unsafe{ ((regs as *mut SavedRegs as *mut u64).add(15)).write(image.initial_rsp) };
+    unsafe { ((regs as *mut SavedRegs as *mut u64).add(15)).write(image.initial_rsp) };
     Ok(0)
 }
 
@@ -292,16 +314,57 @@ pub fn sys_clone(regs:&SavedRegs,flags:u64,child_stack:u64,parent_tid:u64,child_
     }
     Ok(child)
 }
-const FUTEX_WAITERS:u32=0x8000_0000; const FUTEX_OWNER_DIED:u32=0x4000_0000; const FUTEX_TID_MASK:u32=0x3fff_ffff;
-fn cleanup_robust(head:u64,len:u64,tid:u64){ if head==0||len!=24||check_user_ptr(head,24).is_err(){return}
-    let next=unsafe{ptr::read_unaligned(head as *const u64)};let offset=unsafe{ptr::read_unaligned((head+8) as *const i64)};
-    let pending=unsafe{ptr::read_unaligned((head+16) as *const u64)};let mut node=next;let mut count=0;
-    while node!=0&&node!=head&&count<2048 { let next_node=if check_user_ptr(node,8).is_ok(){unsafe{ptr::read_unaligned(node as *const u64)}}else{break};
-        mark_owner_died(node,offset,tid);node=next_node;count+=1; }
-    if pending!=0 { mark_owner_died(pending,offset,tid); }
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+fn cleanup_robust(head: u64, len: u64, tid: u64) {
+    if head == 0 || len != 24 || check_user_ptr(head, 24).is_err() {
+        return;
+    }
+    let next = unsafe { ptr::read_unaligned(head as *const u64) };
+    let offset = unsafe { ptr::read_unaligned((head + 8) as *const i64) };
+    let pending = unsafe { ptr::read_unaligned((head + 16) as *const u64) };
+    let mut node = next;
+    let mut count = 0;
+    while node != 0 && node != head && count < 2048 {
+        let next_node = if check_user_ptr(node, 8).is_ok() {
+            unsafe { ptr::read_unaligned(node as *const u64) }
+        } else {
+            break;
+        };
+        mark_owner_died(node, offset, tid);
+        node = next_node;
+        count += 1;
+    }
+    if pending != 0 {
+        mark_owner_died(pending, offset, tid);
+    }
 }
-fn mark_owner_died(node:u64,offset:i64,tid:u64){let Some(addr)=node.checked_add_signed(offset)else{return};if check_user_ptr(addr,4).is_err(){return}
-    unsafe{let p=addr as *mut u32;let old=ptr::read_volatile(p);if old&FUTEX_TID_MASK==tid as u32{ptr::write_volatile(p,(old&FUTEX_WAITERS)|FUTEX_OWNER_DIED);let _=wake_waiters(key(addr),1,FUTEX_BITSET_MATCH_ANY);}}}
-pub fn cleanup_thread_exit(pid:u64){let clear=crate::task::compat::clear_tid_for(pid);let(head,len)=crate::task::compat::robust_for(pid);
-    cleanup_robust(head,len,pid);if clear!=0&&check_user_ptr(clear,4).is_ok(){unsafe{ptr::write_volatile(clear as *mut u32,0)};let _=wake_waiters(key(clear),1,FUTEX_BITSET_MATCH_ANY);}}
-pub fn cleanup_current_thread_exit(){cleanup_thread_exit(crate::task::scheduler::current_pid())}
+fn mark_owner_died(node: u64, offset: i64, tid: u64) {
+    let Some(addr) = node.checked_add_signed(offset) else {
+        return;
+    };
+    if check_user_ptr(addr, 4).is_err() {
+        return;
+    }
+    unsafe {
+        let p = addr as *mut u32;
+        let old = ptr::read_volatile(p);
+        if old & FUTEX_TID_MASK == tid as u32 {
+            ptr::write_volatile(p, (old & FUTEX_WAITERS) | FUTEX_OWNER_DIED);
+            let _ = wake_waiters(key(addr), 1, FUTEX_BITSET_MATCH_ANY);
+        }
+    }
+}
+pub fn cleanup_thread_exit(pid: u64) {
+    let clear = crate::task::compat::clear_tid_for(pid);
+    let (head, len) = crate::task::compat::robust_for(pid);
+    cleanup_robust(head, len, pid);
+    if clear != 0 && check_user_ptr(clear, 4).is_ok() {
+        unsafe { ptr::write_volatile(clear as *mut u32, 0) };
+        let _ = wake_waiters(key(clear), 1, FUTEX_BITSET_MATCH_ANY);
+    }
+}
+pub fn cleanup_current_thread_exit() {
+    cleanup_thread_exit(crate::task::scheduler::current_pid())
+}

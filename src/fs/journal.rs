@@ -24,8 +24,8 @@ use alloc::vec::Vec;
 
 use crate::drivers::BlockDevice;
 use crate::fs::ext2::structs::{
-    self, JournalCommit, JournalDescriptor, JournalSuper, BS, JCMT_MAGIC, JDES_MAGIC,
-    JDESC_MAX_TARGETS, JNL_MAGIC, SECTORS_PER_BLOCK,
+    self, JournalCommit, JournalDescriptor, JournalSuper, BS, JCMT_MAGIC, JDESC_MAX_TARGETS,
+    JDES_MAGIC, JNL_MAGIC, SECTORS_PER_BLOCK,
 };
 use crate::fs::FsError;
 
@@ -61,8 +61,8 @@ pub struct Journal {
     log_start: u64, // first log block (super_block + 1)
     log_blocks: u64,
     fs_blocks: u64,
-    head: u64,     // next free log position (relative to log space)
-    tail: u64,     // oldest live log position
+    head: u64, // next free log position (relative to log space)
+    tail: u64, // oldest live log position
     next_seq: u64,
 }
 
@@ -149,7 +149,9 @@ impl Journal {
 
     /// Begin a new (empty) transaction.
     pub fn begin(&self) -> Txn {
-        Txn { records: Vec::new() }
+        Txn {
+            records: Vec::new(),
+        }
     }
 
     /// Append a block write to a transaction. `contents` is padded/truncated to

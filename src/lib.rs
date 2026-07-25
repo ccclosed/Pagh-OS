@@ -28,7 +28,11 @@ mod security;
 /// Boot-time Linux-compat self-test harness, compiled only under the
 /// `lx_selftest`, `lx_livetest`, or `lx_bigindex` cargo features so the default
 /// build/boot is unchanged.
-#[cfg(any(feature = "lx_selftest", feature = "lx_livetest", feature = "lx_bigindex"))]
+#[cfg(any(
+    feature = "lx_selftest",
+    feature = "lx_livetest",
+    feature = "lx_bigindex"
+))]
 mod selftest_lx;
 mod shell;
 mod sync;
@@ -36,7 +40,9 @@ mod task;
 mod test;
 mod vfs;
 
-use limine::request::{ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemmapRequest, RsdpRequest};
+use limine::request::{
+    ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemmapRequest, RsdpRequest,
+};
 use limine::BaseRevision;
 
 #[used]
@@ -83,7 +89,9 @@ fn panic(info: &PanicInfo) -> ! {
     arch::cpu::disable_interrupts();
     if let Some(loc) = info.location() {
         kprint!("[PANIC] {}:{} — ", loc.file(), loc.line());
-    } else { kprint!("[PANIC] "); }
+    } else {
+        kprint!("[PANIC] ");
+    }
     kprintln!("{}", info.message());
     debug::unwind::stack_trace();
     arch::cpu::halt_loop();

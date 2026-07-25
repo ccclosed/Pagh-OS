@@ -39,7 +39,11 @@ pub fn stack_trace_from(mut rbp: u64) {
         // (higher half: >= 0xFFFF8000_00000000).
         // For kernel stack traces, all frames are in higher half.
         if rbp < 0xFFFF8000_00000000 {
-            crate::kprintln!("  [{}] (invalid RBP 0x{:016x} — not in kernel space)", depth, rbp);
+            crate::kprintln!(
+                "  [{}] (invalid RBP 0x{:016x} — not in kernel space)",
+                depth,
+                rbp
+            );
             break;
         }
 
@@ -93,7 +97,10 @@ pub fn stack_trace_from(mut rbp: u64) {
 pub fn stack_scan_backtrace(rsp: u64, max_qwords: usize) {
     use crate::memory::layout;
 
-    crate::kprintln!("--- Stack scan from RSP=0x{:016x} (return addrs in kernel image) ---", rsp);
+    crate::kprintln!(
+        "--- Stack scan from RSP=0x{:016x} (return addrs in kernel image) ---",
+        rsp
+    );
 
     // Must be a canonical higher-half, 8-aligned pointer to be usable.
     if rsp < 0xFFFF_8000_0000_0000 || (rsp & 7) != 0 {

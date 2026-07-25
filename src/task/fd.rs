@@ -21,10 +21,26 @@ use crate::arch::x86_64::linux::epoll_sys::EpollEntry;
 use super::fd_alloc::FdSlots;
 
 const PIPE_CAPACITY: usize = 64 * 1024;
-struct PipeState { bytes: VecDeque<u8>, readers: usize, writers: usize }
-pub struct PipeEndpoint { state: Arc<Spinlock<PipeState>>, read_end: bool, nonblocking: bool }
-pub enum PipeReadResult { Data(usize), WouldBlock, Eof }
-pub enum PipeWriteResult { Data(usize), WouldBlock, Broken }
+struct PipeState {
+    bytes: VecDeque<u8>,
+    readers: usize,
+    writers: usize,
+}
+pub struct PipeEndpoint {
+    state: Arc<Spinlock<PipeState>>,
+    read_end: bool,
+    nonblocking: bool,
+}
+pub enum PipeReadResult {
+    Data(usize),
+    WouldBlock,
+    Eof,
+}
+pub enum PipeWriteResult {
+    Data(usize),
+    WouldBlock,
+    Broken,
+}
 impl PipeEndpoint {
     pub fn nonblocking(&self)->bool { self.nonblocking }
     pub fn read(&self,dst:&mut[u8])->PipeReadResult { let mut s=self.state.lock(); if !s.bytes.is_empty(){let n=core::cmp::min(dst.len(),s.bytes.len());for b in dst.iter_mut().take(n){*b=s.bytes.pop_front().unwrap();}PipeReadResult::Data(n)}else if s.writers==0{PipeReadResult::Eof}else{PipeReadResult::WouldBlock} }
@@ -41,7 +57,6 @@ impl PipeEndpoint {
         Arc::new(PipeEndpoint { state: Arc::clone(&self.state), read_end: self.read_end, nonblocking: on })
     }
 }
-impl Drop for PipeEndpoint {fn drop(&mut self){let mut s=self.state.lock();if self.read_end{s.readers=s.readers.saturating_sub(1)}else{s.writers=s.writers.saturating_sub(1)}}}
 
 /// An object a file descriptor can refer to.
 ///
@@ -87,7 +102,11 @@ pub enum OpenObject {
     },
 }
 
-impl Clone for OpenObject { fn clone(&self) -> Self { self.dup_clone() } }
+impl Clone for OpenObject {
+    fn clone(&self) -> Self {
+        self.dup_clone()
+    }
+}
 
 impl OpenObject {
     /// Produce an independent duplicate of this descriptor for `dup`/`dup2`/`dup3`.
@@ -176,11 +195,25 @@ impl FdTable {
         self.slots.get_mut(fd)
     }
 
-    pub fn pipe(&mut self, nonblocking: bool) -> (u32,u32) {
-        let state=Arc::new(Spinlock::new(PipeState{bytes:VecDeque::new(),readers:1,writers:1}));
-        let r=Arc::new(PipeEndpoint{state:Arc::clone(&state),read_end:true,nonblocking});
-        let w=Arc::new(PipeEndpoint{state,read_end:false,nonblocking});
-        let rfd=self.alloc(OpenObject::PipeRead(r)); let wfd=self.alloc(OpenObject::PipeWrite(w)); (rfd,wfd)
+    pub fn pipe(&mut self, nonblocking: bool) -> (u32, u32) {
+        let state = Arc::new(Spinlock::new(PipeState {
+            bytes: VecDeque::new(),
+            readers: 1,
+            writers: 1,
+        }));
+        let r = Arc::new(PipeEndpoint {
+            state: Arc::clone(&state),
+            read_end: true,
+            nonblocking,
+        });
+        let w = Arc::new(PipeEndpoint {
+            state,
+            read_end: false,
+            nonblocking,
+        });
+        let rfd = self.alloc(OpenObject::PipeRead(r));
+        let wfd = self.alloc(OpenObject::PipeWrite(w));
+        (rfd, wfd)
     }
 
     /// Close `fd`. Returns `Err(Errno::EBADF)` when the descriptor is absent or

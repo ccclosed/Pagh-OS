@@ -21,8 +21,8 @@
 
 use core::sync::atomic::Ordering;
 
-use crate::{debug, error, info, warn};
 use crate::{arch, drivers, memory, net, shell, task, vfs};
+use crate::{debug, error, info, warn};
 use crate::{BASE_REVISION, HHDM_REQUEST, KERNEL_ADDR_REQUEST, MEMMAP_REQUEST};
 use crate::{HHDM_OFFSET, KERNEL_BASE, KERNEL_SIZE};
 
@@ -241,11 +241,17 @@ fn init_fs() {
             }
             match Ext2Fs::mount(blk.clone()) {
                 Ok(root) => root,
-                Err(e) => { error!("fs: post-format mount failed: {:?}", e); return; }
+                Err(e) => {
+                    error!("fs: post-format mount failed: {:?}", e);
+                    return;
+                }
             }
         }
         Err(e) => {
-            error!("fs: existing ext2 mount failed: {:?}; refusing destructive reformat", e);
+            error!(
+                "fs: existing ext2 mount failed: {:?}; refusing destructive reformat",
+                e
+            );
             return;
         }
     };
@@ -341,7 +347,10 @@ fn fs_boot_demo() {
     let mut buf = [0u8; 64];
     match rfile.read(0, &mut buf) {
         Ok(n) if &buf[..n] == CONTENT => {
-            info!("fs demo: /mnt/bootdemo.txt write+read round-trip PASS ({} bytes)", n);
+            info!(
+                "fs demo: /mnt/bootdemo.txt write+read round-trip PASS ({} bytes)",
+                n
+            );
         }
         Ok(n) => {
             error!("fs demo: read-back MISMATCH ({} bytes): FAIL", n);
@@ -384,7 +393,11 @@ fn kernel_main() -> ! {
     // `gdt::set_kernel_stack`), so running two ring-3 processes at once would share
     // one kernel stack. Under the feature the compat process is the sole ring-3
     // task, so it can run its `write`/`exit_group` cleanly and be observed.
-    #[cfg(not(any(feature = "lx_selftest", feature = "lx_livetest", feature = "lx_bigindex")))]
+    #[cfg(not(any(
+        feature = "lx_selftest",
+        feature = "lx_livetest",
+        feature = "lx_bigindex"
+    )))]
     match task::process::spawn_test_user_process() {
         Ok(pid) => info!("user test process spawned (pid {})", pid),
         Err(e) => error!("user test process failed: {}", e),

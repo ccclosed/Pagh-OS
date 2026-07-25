@@ -364,9 +364,14 @@ pub(super) fn cmd_pci(_ctx: &mut ShellCtx, _args: &[&str]) {
             let tag = if dev.is_virtio() { " [virtio]" } else { "" };
             shell_println(&alloc::format!(
                 "{:02x}:{:02x}.{} {:04x}:{:04x} {:02x}:{:02x}{}",
-                a.bus, a.device, a.function,
-                dev.vendor_id, dev.device_id,
-                dev.class, dev.subclass, tag
+                a.bus,
+                a.device,
+                a.function,
+                dev.vendor_id,
+                dev.device_id,
+                dev.class,
+                dev.subclass,
+                tag
             ));
         }
     }
@@ -377,9 +382,8 @@ pub(super) fn cmd_exec(_ctx: &mut ShellCtx, _args: &[&str]) {
     // create_user_process programs the TSS RSP0 and briefly switches CR3; run
     // it with interrupts disabled so the CR3 window isn't preempted on this
     // interruptible shell thread.
-    let result = crate::arch::cpu::without_interrupts(
-        || crate::task::process::spawn_test_user_process(),
-    );
+    let result =
+        crate::arch::cpu::without_interrupts(|| crate::task::process::spawn_test_user_process());
     match result {
         Ok(pid) => {
             shell_println(&alloc::format!("exec: started user process pid {}", pid));
@@ -399,7 +403,12 @@ pub(super) fn cmd_ifconfig(_ctx: &mut ShellCtx, _args: &[&str]) {
             shell_println(&alloc::format!("      gateway {}", cfg.gateway));
             shell_println(&alloc::format!(
                 "      ether {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                m[0], m[1], m[2], m[3], m[4], m[5]
+                m[0],
+                m[1],
+                m[2],
+                m[3],
+                m[4],
+                m[5]
             ));
         }
         None => shell_println("ifconfig: no interface"),
@@ -442,14 +451,12 @@ pub(super) fn cmd_nc(_ctx: &mut ShellCtx, args: &[&str]) {
         String::from("pagh-nc-test")
     };
 
-    let remote = smoltcp::wire::IpEndpoint::new(
-        smoltcp::wire::IpAddress::Ipv4(ip),
-        port,
-    );
+    let remote = smoltcp::wire::IpEndpoint::new(smoltcp::wire::IpAddress::Ipv4(ip), port);
 
     shell_println(&alloc::format!(
         "nc: connecting to {}:{} ...",
-        args[0], port
+        args[0],
+        port
     ));
 
     match crate::net::nc_echo(remote, payload.as_bytes()) {
@@ -565,7 +572,10 @@ fn fscrash_demo() {
     let node = match root2.lookup("crashtest.txt") {
         Ok(n) => n,
         Err(e) => {
-            shell_println(&alloc::format!("fscrash: FAIL — file missing after remount: {:?}", e));
+            shell_println(&alloc::format!(
+                "fscrash: FAIL — file missing after remount: {:?}",
+                e
+            ));
             return;
         }
     };
@@ -578,7 +588,10 @@ fn fscrash_demo() {
             ));
         }
         Ok(n) => {
-            shell_println(&alloc::format!("fscrash: FAIL — content mismatch after remount ({} bytes)", n));
+            shell_println(&alloc::format!(
+                "fscrash: FAIL — content mismatch after remount ({} bytes)",
+                n
+            ));
         }
         Err(e) => shell_println(&alloc::format!("fscrash: FAIL — read-back error: {:?}", e)),
     }
@@ -729,7 +742,11 @@ pub(super) fn cmd_stat(_ctx: &mut ShellCtx, args: &[&str]) {
     let path = resolve_arg(args[0]);
     match crate::vfs::lookup_path(&path) {
         Ok(node) => {
-            let kind = if node.is_directory() { "directory" } else { "file" };
+            let kind = if node.is_directory() {
+                "directory"
+            } else {
+                "file"
+            };
             shell_println(&alloc::format!("  path: {}", path));
             shell_println(&alloc::format!("  name: {}", node.name()));
             shell_println(&alloc::format!("  type: {}", kind));
@@ -757,11 +774,16 @@ pub(super) fn cmd_sleep(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-
 /// `nano <path>`: launch the full-screen nano+ editor.
 pub(super) fn cmd_nano(_ctx: &mut ShellCtx, args: &[&str]) {
-    if args.first() == Some(&"--settings") { super::nano_config::command(&args[1..]); return; }
-    if args.is_empty() { shell_println("usage: nano <path> | nano --settings [show|reset|set <key> <value>]"); return; }
+    if args.first() == Some(&"--settings") {
+        super::nano_config::command(&args[1..]);
+        return;
+    }
+    if args.is_empty() {
+        shell_println("usage: nano <path> | nano --settings [show|reset|set <key> <value>]");
+        return;
+    }
     super::nano::run(args[0]);
 }
 
@@ -805,7 +827,8 @@ pub(super) fn cmd_rustup(_ctx: &mut ShellCtx, args: &[&str]) {
 }
 
 fn runtime_command(ctx: &mut ShellCtx, path: &'static str, prefix: &[&'static str], args: &[&str]) {
-    let mut argv: alloc::vec::Vec<&str> = alloc::vec::Vec::with_capacity(1 + prefix.len() + args.len());
+    let mut argv: alloc::vec::Vec<&str> =
+        alloc::vec::Vec::with_capacity(1 + prefix.len() + args.len());
     argv.push(path);
     argv.extend_from_slice(prefix);
     argv.extend_from_slice(args);
@@ -869,8 +892,12 @@ pub(super) fn cmd_paint(_ctx: &mut ShellCtx, _args: &[&str]) {
     crate::kprintln!(
         "paint keys: p=pencil e=eraser l=line r=rect f=fillrect c=circle d=disc b=bucket i=picker"
     );
-    crate::kprintln!("paint keys: 1-0=color [ ]=brush u=undo x=clear m=maximize s=save g=load q=quit");
-    crate::kprintln!("paint window: title-bar buttons minimize/maximize/close; taskbar 'Paint' toggles minimize");
+    crate::kprintln!(
+        "paint keys: 1-0=color [ ]=brush u=undo x=clear m=maximize s=save g=load q=quit"
+    );
+    crate::kprintln!(
+        "paint window: title-bar buttons minimize/maximize/close; taskbar 'Paint' toggles minimize"
+    );
     super::paint::run();
 }
 
@@ -907,7 +934,12 @@ pub(super) fn cmd_pkg(_ctx: &mut ShellCtx, args: &[&str]) {
         80
     };
 
-    shell_println(&alloc::format!("pkg: downloading http://{}:{}{} ...", host, port, path));
+    shell_println(&alloc::format!(
+        "pkg: downloading http://{}:{}{} ...",
+        host,
+        port,
+        path
+    ));
     let bytes = match crate::net::http_fetch::fetch_deb(host, port, path) {
         Ok(b) => b.0,
         Err(e) => {
@@ -946,7 +978,8 @@ pub(super) fn cmd_pkg(_ctx: &mut ShellCtx, args: &[&str]) {
         Err(e) => {
             shell_println(&alloc::format!(
                 "pkg: cannot decompress {} ({:?}); supported: gzip/xz/zstd .deb",
-                deb.data.name, e
+                deb.data.name,
+                e
             ));
             return;
         }
@@ -1110,12 +1143,18 @@ fn cmd_apt_update() {
     }
     shell_println(&alloc::format!(
         "apt: updating from {}://{}:{}{} ({}/{}/{})",
-        cfg.scheme(), cfg.host, cfg.port, cfg.base, cfg.suite, cfg.component, cfg.arch
+        cfg.scheme(),
+        cfg.host,
+        cfg.port,
+        cfg.base,
+        cfg.suite,
+        cfg.component,
+        cfg.arch
     ));
     match crate::pkg::apt::update() {
-        Ok(n) => super::render::success_line(&alloc::format!(
-            "apt: done - {} packages available", n
-        )),
+        Ok(n) => {
+            super::render::success_line(&alloc::format!("apt: done - {} packages available", n))
+        }
         Err(e) => super::render::error_line(&alloc::format!("apt: update failed: {}", e.message())),
     }
 }
@@ -1145,9 +1184,7 @@ fn cmd_apt_install(names: &[&str]) {
                     ));
                 }
             }
-            Err(e) => {
-                super::render::error_line(&alloc::format!("apt: {}: {}", name, e.message()))
-            }
+            Err(e) => super::render::error_line(&alloc::format!("apt: {}: {}", name, e.message())),
         }
     }
     if any_installed {
@@ -1223,7 +1260,10 @@ fn cmd_apt_setmirror(args: &[&str]) {
     let cfg = crate::pkg::apt::config();
     shell_println(&alloc::format!(
         "apt: mirror set to {}://{}:{}{}",
-        cfg.scheme(), cfg.host, cfg.port, cfg.base
+        cfg.scheme(),
+        cfg.host,
+        cfg.port,
+        cfg.base
     ));
     if cfg.tls {
         shell_println("apt: transport is HTTPS (TLS 1.3) -- INSECURE: certificate verification NOT yet implemented");

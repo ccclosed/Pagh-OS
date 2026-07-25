@@ -13,15 +13,15 @@ pub mod regs;
 // the module tree exists up front; each starts as a placeholder that compiles
 // cleanly and gains its real content in its own task.
 pub mod abi;
-pub mod validate;
-pub mod io;
-pub mod stat;
-pub mod rand_clock;
-pub mod mem;
-pub mod misc;
 pub mod diag;
 pub mod dirent;
+pub mod io;
+pub mod mem;
+pub mod misc;
+pub mod rand_clock;
+pub mod stat;
 pub mod timeconv;
+pub mod validate;
 
 // Kernel-only effectful handler shells. These are NOT `#[path]`-included by the
 // `host-tests` crate (only the pure modules above are), so they may freely use the
@@ -31,7 +31,6 @@ pub mod timeconv;
 pub mod io_sys;
 pub mod epoll_sys;
 pub mod mem_sys;
-pub mod rtc;
 pub mod process_sys;
 pub mod unix_sock;
 
@@ -186,7 +185,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::RT_SIGPROCMASK => misc::sys_rt_sigprocmask(a[0], a[1], a[2], a[3]),
         sysno::SIGALTSTACK => misc::sys_sigaltstack(a[0], a[1]),
         sysno::SET_ROBUST_LIST => misc::sys_set_robust_list(a[0], a[1]),
-        sysno::GET_ROBUST_LIST => misc::sys_get_robust_list(a[0],a[1],a[2]),
+        sysno::GET_ROBUST_LIST => misc::sys_get_robust_list(a[0], a[1], a[2]),
         sysno::RSEQ => misc::sys_rseq(),
         sysno::PRLIMIT64 => misc::sys_prlimit64(a[0], a[1], a[2], a[3]),
         sysno::GETRLIMIT => misc::sys_getrlimit(a[0], a[1]),
@@ -305,7 +304,11 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
             if matches!(e, Errno::EINVAL) && nr != sysno::READLINK {
                 crate::warn!(
                     "[linux] EINVAL diag: nr={} args=[{:#x}, {:#x}, {:#x}, {:#x}]",
-                    nr, args[0], args[1], args[2], args[3]
+                    nr,
+                    args[0],
+                    args[1],
+                    args[2],
+                    args[3]
                 );
             }
             encode_errno(e)

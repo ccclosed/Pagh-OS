@@ -25,8 +25,9 @@ const GLYPH_BYTES: usize = 16; // rows per glyph
 
 // Fallback glyph (filled rectangle) for codepoints outside the font range,
 // preserving the previous behavior of the hardcoded table's default arm.
-const FALLBACK_GLYPH: [u8; GLYPH_BYTES] =
-    [0x00, 0x7E, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x7E, 0x00, 0x00, 0x00, 0x00];
+const FALLBACK_GLYPH: [u8; GLYPH_BYTES] = [
+    0x00, 0x7E, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x7E, 0x00, 0x00, 0x00, 0x00,
+];
 
 /// Returns the 16-byte (16-row) glyph for `ch`, sourced from the embedded font.
 /// Codepoints outside the font's `0x20..=0x7D` range fall back to a filled box.
@@ -54,35 +55,41 @@ pub struct FramebufferWriter {
 impl FramebufferWriter {
     pub fn new() -> Option<Self> {
         crate::debug!("Attempting to initialize framebuffer...");
-        
+
         let fb_response = crate::FRAMEBUFFER_REQUEST.response();
         if fb_response.is_none() {
             crate::error!("[FB] No framebuffer response from Limine");
             return None;
         }
-        
+
         let fb_response = fb_response.unwrap();
         let fbs = fb_response.framebuffers();
         crate::debug!("Framebuffers available: {}", fbs.len());
-        
+
         let fb = fbs.get(0);
         if fb.is_none() {
             crate::error!("[FB] No framebuffer at index 0");
             return None;
         }
-        
+
         let fb = fb.unwrap();
-        
+
         // Access public fields and address() method
         let address = fb.address() as u64;
         let width = fb.width;
         let height = fb.height;
         let pitch = fb.pitch;
         let bpp = fb.bpp;
-        
-        crate::debug!("addr=0x{:x} w={} h={} pitch={} bpp={}", 
-            address, width, height, pitch, bpp);
-        
+
+        crate::debug!(
+            "addr=0x{:x} w={} h={} pitch={} bpp={}",
+            address,
+            width,
+            height,
+            pitch,
+            bpp
+        );
+
         Some(FramebufferWriter {
             fb_addr: address,
             width: width as usize,
@@ -119,7 +126,8 @@ impl FramebufferWriter {
             b'\r' => {
                 self.col = 0;
             }
-            0x08 => { // Backspace
+            0x08 => {
+                // Backspace
                 if self.col > 0 {
                     self.col -= 1;
                     self.draw_char(b' ', self.col, self.row);
@@ -152,24 +160,24 @@ impl FramebufferWriter {
     fn draw_char(&mut self, ch: u8, col: usize, row: usize) {
         let x = col * CHAR_WIDTH;
         let y = row * CHAR_HEIGHT;
-        
+
         let glyph = get_glyph(ch);
-        
+
         for dy in 0..CHAR_HEIGHT {
             if y + dy >= self.height {
                 break;
             }
-            
+
             let glyph_byte = glyph[dy];
-            
+
             for dx in 0..CHAR_WIDTH {
                 if x + dx >= self.width {
                     break;
                 }
-                
+
                 let pixel_on = (glyph_byte & (1 << (7 - dx))) != 0;
                 let color = if pixel_on { self.fg_color } else { 0x000000 };
-                
+
                 self.put_pixel(x + dx, y + dy, color);
             }
         }
@@ -179,14 +187,16 @@ impl FramebufferWriter {
         if x >= self.width || y >= self.height {
             return;
         }
-        
+
         let offset = y * self.pitch + x * self.bpp;
         unsafe {
             let fb = self.fb_addr as *mut u8;
             if self.bpp >= 3 {
                 fb.add(offset).write_volatile((color & 0xFF) as u8);
-                fb.add(offset + 1).write_volatile(((color >> 8) & 0xFF) as u8);
-                fb.add(offset + 2).write_volatile(((color >> 16) & 0xFF) as u8);
+                fb.add(offset + 1)
+                    .write_volatile(((color >> 8) & 0xFF) as u8);
+                fb.add(offset + 2)
+                    .write_volatile(((color >> 16) & 0xFF) as u8);
             }
         }
     }
@@ -201,11 +211,7 @@ impl FramebufferWriter {
             let text_px = rows * CHAR_HEIGHT;
             let move_bytes = (text_px - CHAR_HEIGHT) * self.pitch;
 
-            core::ptr::copy(
-                fb.add(line_bytes),
-                fb,
-                move_bytes
-            );
+            core::ptr::copy(fb.add(line_bytes), fb, move_bytes);
 
             // Clear the now-vacated last text line.
             let last_line_offset = (text_px - CHAR_HEIGHT) * self.pitch;
@@ -326,7 +332,15 @@ impl FramebufferWriter {
 
     /// A line with adjustable thickness (square brush of `thick` pixels),
     /// used by the `paint` pencil/line tools.
-    pub fn draw_thick_line(&mut self, x0: isize, y0: isize, x1: isize, y1: isize, thick: isize, color: u32) {
+    pub fn draw_thick_line(
+        &mut self,
+        x0: isize,
+        y0: isize,
+        x1: isize,
+        y1: isize,
+        thick: isize,
+        color: u32,
+    ) {
         if thick <= 1 {
             self.draw_line(x0, y0, x1, y1, color);
             return;
@@ -340,7 +354,13 @@ impl FramebufferWriter {
         let mut x = x0;
         let mut y = y0;
         loop {
-            self.fill_rect((x - r).max(0) as usize, (y - r).max(0) as usize, thick as usize, thick as usize, color);
+            self.fill_rect(
+                (x - r).max(0) as usize,
+                (y - r).max(0) as usize,
+                thick as usize,
+                thick as usize,
+                color,
+            );
             if x == x1 && y == y1 {
                 break;
             }
@@ -413,7 +433,15 @@ impl FramebufferWriter {
 
     /// Copy a `w×h` block of pixels from `src` (row stride `src_stride`) to the
     /// framebuffer at `(dx, dy)`. Used by `paint` to restore canvas regions.
-    pub fn blit(&mut self, dx: usize, dy: usize, w: usize, h: usize, src: &[u32], src_stride: usize) {
+    pub fn blit(
+        &mut self,
+        dx: usize,
+        dy: usize,
+        w: usize,
+        h: usize,
+        src: &[u32],
+        src_stride: usize,
+    ) {
         for row in 0..h {
             let py = dy + row;
             if py >= self.height {
@@ -559,7 +587,11 @@ impl FbWriter {
 
     /// Framebuffer dimensions, or `(0, 0)` if uninitialized.
     pub fn dimensions(&self) -> (usize, usize) {
-        self.inner.lock().as_ref().map(|w| w.dimensions()).unwrap_or((0, 0))
+        self.inner
+            .lock()
+            .as_ref()
+            .map(|w| w.dimensions())
+            .unwrap_or((0, 0))
     }
 
     /// Repaint the bottom status bar via the locked writer.

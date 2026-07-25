@@ -10,10 +10,10 @@ pub mod elf_classify;
 /// `create_dir`/`create_file` support).
 pub mod ramfs;
 
-use alloc::sync::Arc;
 use alloc::string::String;
-use alloc::vec::Vec;
+use alloc::sync::Arc;
 use alloc::vec;
+use alloc::vec::Vec;
 
 pub type VfsResult<T> = Result<T, VfsError>;
 
@@ -29,19 +29,33 @@ pub enum VfsError {
 pub trait VfsNode: Send + Sync {
     fn name(&self) -> &str;
     fn is_directory(&self) -> bool;
-    fn read(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> { Err(VfsError::NotSupported) }
-    fn write(&self, _offset: u64, _buf: &[u8]) -> VfsResult<usize> { Err(VfsError::NotSupported) }
+    fn read(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> {
+        Err(VfsError::NotSupported)
+    }
+    fn write(&self, _offset: u64, _buf: &[u8]) -> VfsResult<usize> {
+        Err(VfsError::NotSupported)
+    }
     /// Resize a regular file. Implementations must zero newly exposed bytes.
-    fn truncate(&self, _size: u64) -> VfsResult<()> { Err(VfsError::NotSupported) }
-    fn readdir(&self) -> VfsResult<Vec<Arc<dyn VfsNode>>> { Err(VfsError::NotSupported) }
-    fn lookup(&self, _name: &str) -> VfsResult<Arc<dyn VfsNode>> { Err(VfsError::NotFound) }
-    fn size(&self) -> u64 { 0 }
+    fn truncate(&self, _size: u64) -> VfsResult<()> {
+        Err(VfsError::NotSupported)
+    }
+    fn readdir(&self) -> VfsResult<Vec<Arc<dyn VfsNode>>> {
+        Err(VfsError::NotSupported)
+    }
+    fn lookup(&self, _name: &str) -> VfsResult<Arc<dyn VfsNode>> {
+        Err(VfsError::NotFound)
+    }
+    fn size(&self) -> u64 {
+        0
+    }
     /// Stable, filesystem-unique inode number for `stat`-style identity, or 0
     /// when the node has no real identity (synthetic /dev nodes).
     ///
     /// glibc's ld.so deduplicates loaded shared objects by the (st_dev, st_ino)
     /// pair returned from `fstat`, so distinct files must never share a pair.
-    fn fs_ino(&self) -> u64 { 0 }
+    fn fs_ino(&self) -> u64 {
+        0
+    }
 
     // ── mutating directory operations (Task 5.2) ──
     //
@@ -50,11 +64,17 @@ pub trait VfsNode: Send + Sync {
     // write path.
 
     /// Create a child directory named `name`, returning its node.
-    fn create_dir(&self, _name: &str) -> VfsResult<Arc<dyn VfsNode>> { Err(VfsError::NotSupported) }
+    fn create_dir(&self, _name: &str) -> VfsResult<Arc<dyn VfsNode>> {
+        Err(VfsError::NotSupported)
+    }
     /// Create an empty child file named `name`, returning its node.
-    fn create_file(&self, _name: &str) -> VfsResult<Arc<dyn VfsNode>> { Err(VfsError::NotSupported) }
+    fn create_file(&self, _name: &str) -> VfsResult<Arc<dyn VfsNode>> {
+        Err(VfsError::NotSupported)
+    }
     /// Remove the child entry named `name` (file or empty directory).
-    fn remove(&self, _name: &str) -> VfsResult<()> { Err(VfsError::NotSupported) }
+    fn remove(&self, _name: &str) -> VfsResult<()> {
+        Err(VfsError::NotSupported)
+    }
     /// Flush any buffered state to stable storage. Default no-op.
     fn sync(&self) {}
 }
@@ -64,8 +84,12 @@ pub trait VfsNode: Send + Sync {
 struct NullDevice;
 
 impl VfsNode for NullDevice {
-    fn name(&self) -> &str { "null" }
-    fn is_directory(&self) -> bool { false }
+    fn name(&self) -> &str {
+        "null"
+    }
+    fn is_directory(&self) -> bool {
+        false
+    }
 
     fn read(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> {
         Ok(0)
@@ -81,11 +105,17 @@ impl VfsNode for NullDevice {
 struct SerialDevice;
 
 impl VfsNode for SerialDevice {
-    fn name(&self) -> &str { "serial" }
-    fn is_directory(&self) -> bool { false }
+    fn name(&self) -> &str {
+        "serial"
+    }
+    fn is_directory(&self) -> bool {
+        false
+    }
 
     fn read(&self, _offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
-        if buf.is_empty() { return Ok(0); }
+        if buf.is_empty() {
+            return Ok(0);
+        }
         // SAFETY: Reading from COM1 LSR and DATA ports.
         unsafe {
             let mut lsr = x86_64::instructions::port::Port::<u8>::new(0x3FD);
@@ -117,8 +147,12 @@ struct DevDirectory {
 }
 
 impl VfsNode for DevDirectory {
-    fn name(&self) -> &str { "dev" }
-    fn is_directory(&self) -> bool { true }
+    fn name(&self) -> &str {
+        "dev"
+    }
+    fn is_directory(&self) -> bool {
+        true
+    }
 
     fn readdir(&self) -> VfsResult<Vec<Arc<dyn VfsNode>>> {
         Ok(self.children.clone())
@@ -149,18 +183,42 @@ struct MountNode {
 }
 
 impl VfsNode for MountNode {
-    fn name(&self) -> &str { &self.name }
-    fn is_directory(&self) -> bool { self.inner.is_directory() }
-    fn read(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> { self.inner.read(offset, buf) }
-    fn write(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> { self.inner.write(offset, buf) }
-    fn truncate(&self, size: u64) -> VfsResult<()> { self.inner.truncate(size) }
-    fn readdir(&self) -> VfsResult<Vec<Arc<dyn VfsNode>>> { self.inner.readdir() }
-    fn lookup(&self, name: &str) -> VfsResult<Arc<dyn VfsNode>> { self.inner.lookup(name) }
-    fn size(&self) -> u64 { self.inner.size() }
-    fn create_dir(&self, name: &str) -> VfsResult<Arc<dyn VfsNode>> { self.inner.create_dir(name) }
-    fn create_file(&self, name: &str) -> VfsResult<Arc<dyn VfsNode>> { self.inner.create_file(name) }
-    fn remove(&self, name: &str) -> VfsResult<()> { self.inner.remove(name) }
-    fn sync(&self) { self.inner.sync() }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_directory(&self) -> bool {
+        self.inner.is_directory()
+    }
+    fn read(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        self.inner.read(offset, buf)
+    }
+    fn write(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        self.inner.write(offset, buf)
+    }
+    fn truncate(&self, size: u64) -> VfsResult<()> {
+        self.inner.truncate(size)
+    }
+    fn readdir(&self) -> VfsResult<Vec<Arc<dyn VfsNode>>> {
+        self.inner.readdir()
+    }
+    fn lookup(&self, name: &str) -> VfsResult<Arc<dyn VfsNode>> {
+        self.inner.lookup(name)
+    }
+    fn size(&self) -> u64 {
+        self.inner.size()
+    }
+    fn create_dir(&self, name: &str) -> VfsResult<Arc<dyn VfsNode>> {
+        self.inner.create_dir(name)
+    }
+    fn create_file(&self, name: &str) -> VfsResult<Arc<dyn VfsNode>> {
+        self.inner.create_file(name)
+    }
+    fn remove(&self, name: &str) -> VfsResult<()> {
+        self.inner.remove(name)
+    }
+    fn sync(&self) {
+        self.inner.sync()
+    }
 }
 
 // ─── Root directory ─────────────────────────────────────────────────────────
@@ -172,8 +230,12 @@ struct RootDirectory {
 }
 
 impl VfsNode for RootDirectory {
-    fn name(&self) -> &str { "/" }
-    fn is_directory(&self) -> bool { true }
+    fn name(&self) -> &str {
+        "/"
+    }
+    fn is_directory(&self) -> bool {
+        true
+    }
 
     fn readdir(&self) -> VfsResult<Vec<Arc<dyn VfsNode>>> {
         Ok(self.children.lock().clone())

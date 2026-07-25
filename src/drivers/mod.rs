@@ -1,19 +1,19 @@
 // drivers/mod.rs — Device Manager and driver traits
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
-pub mod serial;
-pub mod ps2_kbd;
-pub mod ps2_mouse;
 pub mod cursor;
 pub mod framebuffer;
 pub mod pci;
+pub mod ps2_kbd;
+pub mod ps2_mouse;
+pub mod serial;
 pub mod virtio;
 pub mod vt;
 
-use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
-use alloc::string::String;
 use crate::sync::spinlock::Spinlock;
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::sync::Arc;
 
 /// A text console sink (serial, framebuffer, ...). Implementations must be
 /// safe to share across threads/IRQ context (interior-mutability behind a lock).

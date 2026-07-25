@@ -209,7 +209,14 @@ fn visit(
 
     // Explicit heap-allocated worklist replacing the program call stack.
     let mut stack: Vec<Frame> = Vec::new();
-    enter(index, start, already_installed, visited, on_stack, &mut stack);
+    enter(
+        index,
+        start,
+        already_installed,
+        visited,
+        on_stack,
+        &mut stack,
+    );
 
     loop {
         // Decide the next action against the top frame, releasing the borrow
@@ -231,7 +238,14 @@ fn visit(
             // Descend into the next chosen dependency (process the child — and its
             // whole subtree — before this parent finishes), exactly as the
             // recursive `visit(chosen)` call did.
-            Some(dep) => enter(index, &dep, already_installed, visited, on_stack, &mut stack),
+            Some(dep) => enter(
+                index,
+                &dep,
+                already_installed,
+                visited,
+                on_stack,
+                &mut stack,
+            ),
             // All dependencies done: finish this node POST-ORDER — remove it from
             // on-stack and append it to `order` after its subtree.
             None => {

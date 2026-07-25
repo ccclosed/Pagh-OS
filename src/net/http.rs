@@ -198,9 +198,8 @@ fn parse_status_code(line: &[u8]) -> Option<u16> {
     if code.len() != 3 || !code.iter().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let value = (code[0] - b'0') as u16 * 100
-        + (code[1] - b'0') as u16 * 10
-        + (code[2] - b'0') as u16;
+    let value =
+        (code[0] - b'0') as u16 * 100 + (code[1] - b'0') as u16 * 10 + (code[2] - b'0') as u16;
     Some(value)
 }
 

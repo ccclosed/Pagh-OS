@@ -1,12 +1,12 @@
 // arch/x86_64/syscall.rs — System call interface (SYSCALL/SYSRET)
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
-use x86_64::VirtAddr;
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
+use x86_64::VirtAddr;
 
 pub const SYS_WRITE: u64 = 1;
-pub const SYS_EXIT: u64  = 2;
+pub const SYS_EXIT: u64 = 2;
 pub const SYS_YIELD: u64 = 3;
 
 pub fn init() {
@@ -38,7 +38,10 @@ pub fn init() {
         let (sysret_base, syscall_base) = Star::read_raw();
         crate::error!(
             "[syscall] STAR readback: sysret_base=0x{:x} syscall_base=0x{:x} (uc=0x{:x} ud=0x{:x})",
-            sysret_base, syscall_base, user_cs.0, user_ds.0,
+            sysret_base,
+            syscall_base,
+            user_cs.0,
+            user_ds.0,
         );
 
         // LStar points at the naked `syscall_entry` stub (global_asm below) so the
@@ -75,9 +78,13 @@ static mut SYSCALL_KERNEL_RSP: u64 = 0;
 static mut SYSCALL_USER_RSP: u64 = 0;
 
 pub fn set_syscall_user_stack(rsp: u64) {
-    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(SYSCALL_USER_RSP), rsp); }
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(SYSCALL_USER_RSP), rsp);
+    }
 }
-pub fn syscall_user_stack() -> u64 { unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RSP)) } }
+pub fn syscall_user_stack() -> u64 {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RSP)) }
+}
 
 /// Mirror the current ring-3 → ring-0 kernel stack top (TSS `RSP0`) into the
 /// location the `syscall_entry` stub loads. Call this with the same value passed
@@ -223,7 +230,7 @@ core::arch::global_asm!(
     "    push r13",
     "    push r14",
     "    push r15",
-    "    mov rdi, rsp",   // &SavedRegs (sole arg; rsp is 16-byte aligned here)
+    "    mov rdi, rsp", // &SavedRegs (sole arg; rsp is 16-byte aligned here)
     "    call linux_dispatch",
     // linux_dispatch re-enables interrupts for blocking handlers; re-mask IF
     // so the frame unwind and the `pop rsp`/`sysretq` tail are atomic — an
@@ -236,7 +243,7 @@ core::arch::global_asm!(
     "    pop r14",
     "    pop r13",
     "    pop r12",
-    "    pop r11",        // user RFLAGS -> r11 (consumed by sysretq)
+    "    pop r11", // user RFLAGS -> r11 (consumed by sysretq)
     "    pop r10",
     "    pop r9",
     "    pop r8",
@@ -244,10 +251,10 @@ core::arch::global_asm!(
     "    pop rdi",
     "    pop rsi",
     "    pop rdx",
-    "    pop rcx",        // user RIP -> rcx (consumed by sysretq)
+    "    pop rcx", // user RIP -> rcx (consumed by sysretq)
     "    pop rbx",
     "    pop rax",
-    "    pop rsp",        // per-task user RSP (slot pushed at entry; execve rewrites it)
+    "    pop rsp", // per-task user RSP (slot pushed at entry; execve rewrites it)
     "    sysretq",
     // SYSCALL_USER_RSP is a Rust-defined no_mangle static used ONLY as entry
     // scratch under masked IF; execve rewrites the per-task +120 slot instead.
@@ -272,9 +279,15 @@ extern "C" {
 pub(crate) fn legacy_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     match num {
         SYS_WRITE => sys_write(a1, a2, a3),
-        SYS_EXIT  => sys_exit(a1),
-        SYS_YIELD => { crate::task::scheduler::yield_current(); 0 }
-        _ => { crate::error!("[SYSCALL] Unknown: {}", num); u64::MAX }
+        SYS_EXIT => sys_exit(a1),
+        SYS_YIELD => {
+            crate::task::scheduler::yield_current();
+            0
+        }
+        _ => {
+            crate::error!("[SYSCALL] Unknown: {}", num);
+            u64::MAX
+        }
     }
 }
 
@@ -291,12 +304,18 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     // / unmapped user pointers WITHOUT ever dereferencing them. ──────────────
     //
     // Only stdout (fd 1) is writable.
-    if fd != 1 { return u64::MAX; }
+    if fd != 1 {
+        return u64::MAX;
+    }
     // Non-null buffer and a bounded, non-zero length. `len <= 4096` bounds the
     // buffer to at most two pages, keeping the page-presence walk below cheap.
-    if buf_ptr == 0 || len == 0 || len > 4096 { return u64::MAX; }
+    if buf_ptr == 0 || len == 0 || len > 4096 {
+        return u64::MAX;
+    }
     // Start must be a lower-half canonical pointer (bits 47..63 zero).
-    if buf_ptr >= USER_CANONICAL_LIMIT { return u64::MAX; }
+    if buf_ptr >= USER_CANONICAL_LIMIT {
+        return u64::MAX;
+    }
     // The END of the buffer must also stay below the canonical boundary: reject
     // on arithmetic overflow (wrap) or if the last byte would land in
     // non-canonical / kernel space. `checked_add` catches the wrap case.
@@ -318,7 +337,9 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
             // Unmapped page in the buffer's span: refuse without dereferencing.
             return u64::MAX;
         }
-        if page == last_page { break; }
+        if page == last_page {
+            break;
+        }
         page += 0x1000;
     }
 

@@ -88,9 +88,13 @@ pub fn init(memmap: &MemmapResponse) {
     // First pass: determine the total range and usable memory size.
     for entry in entries {
         if entry.type_ == memmap::MEMMAP_USABLE {
-            if entry.base < base { base = entry.base; }
+            if entry.base < base {
+                base = entry.base;
+            }
             let entry_top = entry.base + entry.length;
-            if entry_top > top { top = entry_top; }
+            if entry_top > top {
+                top = entry_top;
+            }
             total_usable += entry.length;
         }
     }
@@ -109,8 +113,17 @@ pub fn init(memmap: &MemmapResponse) {
     let bitmap_words = (total_frames + 63) / 64;
     let bitmap_bytes = bitmap_words * 8;
 
-    crate::debug!("Memory range: 0x{:x}..0x{:x} ({} MB)", base, top, (top - base) / (1024 * 1024));
-    crate::debug!("Total frames: {}, bitmap: {} bytes", total_frames, bitmap_bytes);
+    crate::debug!(
+        "Memory range: 0x{:x}..0x{:x} ({} MB)",
+        base,
+        top,
+        (top - base) / (1024 * 1024)
+    );
+    crate::debug!(
+        "Total frames: {}, bitmap: {} bytes",
+        total_frames,
+        bitmap_bytes
+    );
 
     // Find a usable region large enough to hold the bitmap.
     // Place it in the largest usable region to avoid wasting kernel-adjacent memory.
@@ -154,14 +167,20 @@ pub fn init(memmap: &MemmapResponse) {
     for entry in entries {
         if entry.type_ == memmap::MEMMAP_EXECUTABLE_AND_MODULES {
             if kernel_range_count >= MAX_KERNEL_RANGES {
-                crate::warn!("[PMM] more kernel/module ranges than MAX_KERNEL_RANGES; some not tracked");
+                crate::warn!(
+                    "[PMM] more kernel/module ranges than MAX_KERNEL_RANGES; some not tracked"
+                );
                 break;
             }
             let start = align_down(entry.base, FRAME_SIZE);
             let end = align_up(entry.base + entry.length, FRAME_SIZE);
             kernel_ranges[kernel_range_count] = (start, end);
             kernel_range_count += 1;
-            crate::debug!("[PMM] reserved kernel/module range: 0x{:x}..0x{:x}", start, end);
+            crate::debug!(
+                "[PMM] reserved kernel/module range: 0x{:x}..0x{:x}",
+                start,
+                end
+            );
         }
     }
 
@@ -266,8 +285,10 @@ pub fn init(memmap: &MemmapResponse) {
     // Publish the fully-built state. Keep logging outside the locked section.
     *PMM.lock() = Some(pmm);
 
-    crate::debug!("PMM Initialized: {} / {} frames free ({} MB / {} MB)",
-        free_count, total,
+    crate::debug!(
+        "PMM Initialized: {} / {} frames free ({} MB / {} MB)",
+        free_count,
+        total,
         (free_count as u64 * FRAME_SIZE) / (1024 * 1024),
         (total as u64 * FRAME_SIZE) / (1024 * 1024),
     );

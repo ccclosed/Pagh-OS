@@ -570,7 +570,6 @@ impl<S: RecordSink> StanzaConsumer for ViewSink<'_, S> {
     }
 }
 
-
 /// An **incremental**, streaming `Packages` stanza parser.
 ///
 /// This is the bounded-memory core of the apt-index pipeline (the fix for
@@ -1213,7 +1212,11 @@ impl PackageIndexBuilder {
                 });
             }
         }
-        prov_sorted.sort_by(|a, b| resolve(a.name).cmp(resolve(b.name)).then(a.record.cmp(&b.record)));
+        prov_sorted.sort_by(|a, b| {
+            resolve(a.name)
+                .cmp(resolve(b.name))
+                .then(a.record.cmp(&b.record))
+        });
         prov_sorted.dedup_by(|a, b| resolve(a.name) == resolve(b.name));
 
         PackageIndex {

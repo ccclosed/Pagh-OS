@@ -2,8 +2,8 @@
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
 use core::cell::SyncUnsafeCell;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::registers::control::Cr2;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::VirtAddr;
 
 // The IDT lives in a `SyncUnsafeCell` rather than a `static mut` so that all
@@ -30,27 +30,35 @@ pub fn init() {
     idt.overflow.set_handler_fn(overflow_handler);
     idt.bound_range_exceeded.set_handler_fn(bound_range_handler);
     idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
-    idt.device_not_available.set_handler_fn(device_not_available_handler);
+    idt.device_not_available
+        .set_handler_fn(device_not_available_handler);
     idt.double_fault.set_handler_fn(double_fault_handler);
     idt.invalid_tss.set_handler_fn(invalid_tss_handler);
-    idt.segment_not_present.set_handler_fn(segment_not_present_handler);
-    idt.stack_segment_fault.set_handler_fn(stack_segment_handler);
-    idt.general_protection_fault.set_handler_fn(gp_fault_handler);
+    idt.segment_not_present
+        .set_handler_fn(segment_not_present_handler);
+    idt.stack_segment_fault
+        .set_handler_fn(stack_segment_handler);
+    idt.general_protection_fault
+        .set_handler_fn(gp_fault_handler);
     idt.page_fault.set_handler_fn(page_fault_handler);
     idt.x87_floating_point.set_handler_fn(x87_fpu_handler);
     idt.alignment_check.set_handler_fn(alignment_check_handler);
     idt.machine_check.set_handler_fn(machine_check_handler);
     idt.simd_floating_point.set_handler_fn(simd_fpu_handler);
     idt.virtualization.set_handler_fn(virtualization_handler);
-    idt.hv_injection_exception.set_handler_fn(hv_injection_handler);
-    idt.vmm_communication_exception.set_handler_fn(vmm_comm_handler);
+    idt.hv_injection_exception
+        .set_handler_fn(hv_injection_handler);
+    idt.vmm_communication_exception
+        .set_handler_fn(vmm_comm_handler);
     idt.security_exception.set_handler_fn(security_handler);
 
     // Vector 32: custom assembly stub for preemptive context switch.
     // SAFETY: the address is the entry point of the naked `irq32_stub`, which
     // implements the full interrupt prologue/epilogue contract for vector 32.
     unsafe {
-        idt[32].set_handler_addr(VirtAddr::new(crate::task::switch::irq32_stub as *const () as u64));
+        idt[32].set_handler_addr(VirtAddr::new(
+            crate::task::switch::irq32_stub as *const () as u64,
+        ));
     }
     // Vectors 33–47: standard IRQ handlers
     idt[33].set_handler_fn(irq33_handler);
@@ -78,7 +86,9 @@ pub fn init() {
     // honors the interrupt-gate calling contract for vector 0x80.
     unsafe {
         idt[0x80]
-            .set_handler_addr(VirtAddr::new(crate::arch::x86_64::syscall::int80_stub as *const () as u64))
+            .set_handler_addr(VirtAddr::new(
+                crate::arch::x86_64::syscall::int80_stub as *const () as u64,
+            ))
             .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
     }
 
@@ -95,46 +105,77 @@ pub fn init() {
 // ─── Exception handlers ──────────────────────────────────────────────────
 
 extern "x86-interrupt" fn divide_error_handler(stack: InterruptStackFrame) {
-    crate::error!("[EXC #0] Divide Error RIP: 0x{:016x}", stack.instruction_pointer.as_u64());
+    crate::error!(
+        "[EXC #0] Divide Error RIP: 0x{:016x}",
+        stack.instruction_pointer.as_u64()
+    );
     halt();
 }
 extern "x86-interrupt" fn debug_handler(stack: InterruptStackFrame) {
-    crate::error!("[EXC #1] Debug RIP: 0x{:016x}", stack.instruction_pointer.as_u64());
+    crate::error!(
+        "[EXC #1] Debug RIP: 0x{:016x}",
+        stack.instruction_pointer.as_u64()
+    );
     halt();
 }
 extern "x86-interrupt" fn nmi_handler(stack: InterruptStackFrame) {
-    crate::error!("[EXC #2] NMI RIP: 0x{:016x}", stack.instruction_pointer.as_u64());
+    crate::error!(
+        "[EXC #2] NMI RIP: 0x{:016x}",
+        stack.instruction_pointer.as_u64()
+    );
     halt();
 }
 extern "x86-interrupt" fn breakpoint_handler(stack: InterruptStackFrame) {
-    crate::error!("[EXC #3] *** BREAKPOINT HIT *** RIP: 0x{:016x}", stack.instruction_pointer.as_u64());
+    crate::error!(
+        "[EXC #3] *** BREAKPOINT HIT *** RIP: 0x{:016x}",
+        stack.instruction_pointer.as_u64()
+    );
     crate::error!("[EXC #3] IDT is working correctly!");
 }
 extern "x86-interrupt" fn overflow_handler(stack: InterruptStackFrame) {
-    crate::error!("[EXC #4] Overflow RIP: 0x{:016x}", stack.instruction_pointer.as_u64());
+    crate::error!(
+        "[EXC #4] Overflow RIP: 0x{:016x}",
+        stack.instruction_pointer.as_u64()
+    );
     halt();
 }
 extern "x86-interrupt" fn bound_range_handler(stack: InterruptStackFrame) {
-    crate::error!("[EXC #5] Bound Range RIP: 0x{:016x}", stack.instruction_pointer.as_u64());
+    crate::error!(
+        "[EXC #5] Bound Range RIP: 0x{:016x}",
+        stack.instruction_pointer.as_u64()
+    );
     halt();
 }
 extern "x86-interrupt" fn invalid_opcode_handler(stack: InterruptStackFrame) {
-    crate::error!("[EXC #6] Invalid Opcode RIP: 0x{:016x}", stack.instruction_pointer.as_u64());
+    crate::error!(
+        "[EXC #6] Invalid Opcode RIP: 0x{:016x}",
+        stack.instruction_pointer.as_u64()
+    );
     halt();
 }
 extern "x86-interrupt" fn device_not_available_handler(stack: InterruptStackFrame) {
-    crate::error!("[EXC #7] Device NA RIP: 0x{:016x}", stack.instruction_pointer.as_u64());
+    crate::error!(
+        "[EXC #7] Device NA RIP: 0x{:016x}",
+        stack.instruction_pointer.as_u64()
+    );
     halt();
 }
 extern "x86-interrupt" fn double_fault_handler(stack: InterruptStackFrame, error_code: u64) -> ! {
-    crate::error!("[EXC #8] DOUBLE FAULT err=0x{:x} RIP=0x{:016x}", error_code, stack.instruction_pointer.as_u64());
+    crate::error!(
+        "[EXC #8] DOUBLE FAULT err=0x{:x} RIP=0x{:016x}",
+        error_code,
+        stack.instruction_pointer.as_u64()
+    );
     crate::arch::cpu::halt_loop()
 }
 extern "x86-interrupt" fn invalid_tss_handler(_stack: InterruptStackFrame, error_code: u64) {
     crate::error!("[EXC #10] Invalid TSS err=0x{:x}", error_code);
     halt();
 }
-extern "x86-interrupt" fn segment_not_present_handler(_stack: InterruptStackFrame, error_code: u64) {
+extern "x86-interrupt" fn segment_not_present_handler(
+    _stack: InterruptStackFrame,
+    error_code: u64,
+) {
     crate::error!("[EXC #11] Segment NP err=0x{:x}", error_code);
     halt();
 }
@@ -144,8 +185,10 @@ extern "x86-interrupt" fn stack_segment_handler(_stack: InterruptStackFrame, err
 }
 /// Last syscall observed by `linux_dispatch`, for #GP post-mortem context
 /// (pid in the high-level sense, raw syscall nr). Written on every dispatch.
-pub static LAST_SYSCALL_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
-pub static LAST_SYSCALL_NR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+pub static LAST_SYSCALL_PID: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+pub static LAST_SYSCALL_NR: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// Record the syscall a task is about to run (called from `linux_dispatch`).
 pub fn note_syscall(pid: u64, nr: u64) {
@@ -154,11 +197,19 @@ pub fn note_syscall(pid: u64, nr: u64) {
 }
 
 extern "x86-interrupt" fn gp_fault_handler(stack: InterruptStackFrame, error_code: u64) {
-    crate::error!("[EXC #13] GP Fault err=0x{:x} RIP=0x{:016x} RSP=0x{:016x}", error_code, stack.instruction_pointer.as_u64(), stack.stack_pointer.as_u64());
+    crate::error!(
+        "[EXC #13] GP Fault err=0x{:x} RIP=0x{:016x} RSP=0x{:016x}",
+        error_code,
+        stack.instruction_pointer.as_u64(),
+        stack.stack_pointer.as_u64()
+    );
     let pid = crate::task::scheduler::current_pid();
-    crate::error!("[EXC #13] current pid={} last_dispatch: pid={} nr={}", pid,
+    crate::error!(
+        "[EXC #13] current pid={} last_dispatch: pid={} nr={}",
+        pid,
         LAST_SYSCALL_PID.load(core::sync::atomic::Ordering::Relaxed),
-        LAST_SYSCALL_NR.load(core::sync::atomic::Ordering::Relaxed));
+        LAST_SYSCALL_NR.load(core::sync::atomic::Ordering::Relaxed)
+    );
     // For iretq/sysretq exit faults: dump the words the return instruction
     // was consuming (at RSP) plus the GPR area popped just before it.
     let frsp = stack.stack_pointer.as_u64();
@@ -187,7 +238,11 @@ extern "x86-interrupt" fn gp_fault_handler(stack: InterruptStackFrame, error_cod
     //   [top-0x20] rcx (sysretq user RIP!)  [top-0x60] r11 (user RFLAGS) ...
     if !crate::task::scheduler::is_idle(pid) {
         let (_guard, _base, top) = crate::memory::layout::kernel_stack_for_pid(pid);
-        crate::error!("--- Top 24 words of kernel stack for pid {} (top=0x{:x}) ---", pid, top);
+        crate::error!(
+            "--- Top 24 words of kernel stack for pid {} (top=0x{:x}) ---",
+            pid,
+            top
+        );
         let mut i = 24u64;
         while i >= 1 {
             let addr = top - i * 8;
@@ -205,12 +260,18 @@ extern "x86-interrupt" fn gp_fault_handler(stack: InterruptStackFrame, error_cod
         && crate::task::compat::compat_exists(pid)
     {
         crate::task::compat::with_current_compat(|cs| cs.exit_code = Some(139));
-        crate::error!("[EXC #13] killing Compat_Process pid={} (SIGSEGV) - kernel keeps running", pid);
+        crate::error!(
+            "[EXC #13] killing Compat_Process pid={} (SIGSEGV) - kernel keeps running",
+            pid
+        );
         crate::task::scheduler::exit_current();
     }
     halt();
 }
-extern "x86-interrupt" fn page_fault_handler(stack: InterruptStackFrame, error_code: PageFaultErrorCode) {
+extern "x86-interrupt" fn page_fault_handler(
+    stack: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
+) {
     let fault_addr = Cr2::read().unwrap_or(VirtAddr::new(0));
     let rsp = stack.stack_pointer.as_u64();
     crate::error!(
@@ -238,7 +299,9 @@ extern "x86-interrupt" fn page_fault_handler(stack: InterruptStackFrame, error_c
     // stack (return-address candidates for symbolizing the crash), then kill
     // only the faulting Compat_Process and keep the kernel running.
     let pid = crate::task::scheduler::current_pid();
-    crate::error!("[EXC #14] current pid={} last_dispatch: pid={} nr={}", pid,
+    crate::error!(
+        "[EXC #14] current pid={} last_dispatch: pid={} nr={}",
+        pid,
         LAST_SYSCALL_PID.load(core::sync::atomic::Ordering::Relaxed),
         LAST_SYSCALL_NR.load(core::sync::atomic::Ordering::Relaxed));
     // STAGE-16.1 DIAG: which address space was live, and at which level does
@@ -260,13 +323,19 @@ extern "x86-interrupt" fn page_fault_handler(stack: InterruptStackFrame, error_c
     }
     if crate::task::compat::compat_exists(pid) {
         crate::task::compat::with_current_compat(|cs| cs.exit_code = Some(139));
-        crate::error!("[EXC #14] killing Compat_Process pid={} (SIGSEGV) - kernel keeps running", pid);
+        crate::error!(
+            "[EXC #14] killing Compat_Process pid={} (SIGSEGV) - kernel keeps running",
+            pid
+        );
         crate::task::scheduler::exit_current();
     }
     halt();
 }
 extern "x86-interrupt" fn x87_fpu_handler(stack: InterruptStackFrame) {
-    crate::error!("[EXC #16] x87 FPU RIP=0x{:016x}", stack.instruction_pointer.as_u64());
+    crate::error!(
+        "[EXC #16] x87 FPU RIP=0x{:016x}",
+        stack.instruction_pointer.as_u64()
+    );
     halt();
 }
 extern "x86-interrupt" fn alignment_check_handler(_stack: InterruptStackFrame, error_code: u64) {
@@ -278,15 +347,24 @@ extern "x86-interrupt" fn machine_check_handler(_stack: InterruptStackFrame) -> 
     crate::arch::cpu::halt_loop()
 }
 extern "x86-interrupt" fn simd_fpu_handler(stack: InterruptStackFrame) {
-    crate::error!("[EXC #19] SIMD FPU RIP=0x{:016x}", stack.instruction_pointer.as_u64());
+    crate::error!(
+        "[EXC #19] SIMD FPU RIP=0x{:016x}",
+        stack.instruction_pointer.as_u64()
+    );
     halt();
 }
 extern "x86-interrupt" fn virtualization_handler(stack: InterruptStackFrame) {
-    crate::error!("[EXC #20] Virt RIP=0x{:016x}", stack.instruction_pointer.as_u64());
+    crate::error!(
+        "[EXC #20] Virt RIP=0x{:016x}",
+        stack.instruction_pointer.as_u64()
+    );
     halt();
 }
 extern "x86-interrupt" fn hv_injection_handler(stack: InterruptStackFrame) {
-    crate::error!("[EXC #28] HV Injection RIP=0x{:016x}", stack.instruction_pointer.as_u64());
+    crate::error!(
+        "[EXC #28] HV Injection RIP=0x{:016x}",
+        stack.instruction_pointer.as_u64()
+    );
     halt();
 }
 extern "x86-interrupt" fn vmm_comm_handler(_stack: InterruptStackFrame, error_code: u64) {

@@ -107,14 +107,23 @@ mod tests {
 
     #[test]
     fn timespec_rejects_zero_hz() {
-        assert_eq!(ticks_to_timespec(100, CLOCK_MONOTONIC, 0), Err(Errno::EINVAL));
+        assert_eq!(
+            ticks_to_timespec(100, CLOCK_MONOTONIC, 0),
+            Err(Errno::EINVAL)
+        );
     }
 
     #[test]
     fn timespec_normalizes() {
         // 1500 ticks at 1000 Hz = 1.5 s = 1 s + 500_000_000 ns.
         let ts = ticks_to_timespec(1500, CLOCK_REALTIME, 1000).unwrap();
-        assert_eq!(ts, Timespec { tv_sec: 1, tv_nsec: 500_000_000 });
+        assert_eq!(
+            ts,
+            Timespec {
+                tv_sec: 1,
+                tv_nsec: 500_000_000
+            }
+        );
         // tv_nsec is always in range.
         assert!(ts.tv_nsec >= 0 && ts.tv_nsec < NANOS_PER_SEC as i64);
     }

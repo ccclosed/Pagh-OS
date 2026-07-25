@@ -202,7 +202,9 @@ pub fn poll() {
     }
 
     // Advance smoltcp (RX ingress + TX egress, ARP/IP/ICMP/UDP/TCP/DHCP).
-    let _ = state.iface.poll(timestamp, &mut state.device, &mut state.sockets);
+    let _ = state
+        .iface
+        .poll(timestamp, &mut state.device, &mut state.sockets);
 
     // Service the DHCP client: apply a newly-acquired lease to the interface.
     // Copy the (Copy) config fields out first so the socket borrow ends before
@@ -222,10 +224,7 @@ pub fn poll() {
             apply_ipv4(state, cidr, router);
             state.dns_servers = dns;
             let gw = router.unwrap_or(Ipv4Address::UNSPECIFIED);
-            info!(
-                "net: DHCP lease acquired: {} gw {}",
-                cidr, gw
-            );
+            info!("net: DHCP lease acquired: {} gw {}", cidr, gw);
         }
         Some(dhcpv4::Event::Deconfigured) => {
             // Lease lost: clear the address (keep the interface up for a renew).
@@ -331,14 +330,8 @@ pub fn udp_echo_enable(port: u16) {
         }
     };
 
-    let rx = udp::PacketBuffer::new(
-        vec![udp::PacketMetadata::EMPTY; 8],
-        vec![0u8; 8 * 1024],
-    );
-    let tx = udp::PacketBuffer::new(
-        vec![udp::PacketMetadata::EMPTY; 8],
-        vec![0u8; 8 * 1024],
-    );
+    let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 8 * 1024]);
+    let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 8 * 1024]);
     let mut sock = udp::Socket::new(rx, tx);
     if sock.bind(port).is_err() {
         warn!("net: udp_echo_enable: bind {} failed", port);
@@ -614,14 +607,8 @@ pub fn resolve(hostname: &str) -> Option<Ipv4Address> {
     let handle = {
         let mut guard = NET.lock();
         let state = guard.as_mut()?;
-        let rx = udp::PacketBuffer::new(
-            vec![udp::PacketMetadata::EMPTY; 4],
-            vec![0u8; 2048],
-        );
-        let tx = udp::PacketBuffer::new(
-            vec![udp::PacketMetadata::EMPTY; 4],
-            vec![0u8; 2048],
-        );
+        let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 2048]);
+        let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 2048]);
         let mut sock = udp::Socket::new(rx, tx);
         let local_port = state.next_eph;
         state.next_eph = if state.next_eph >= 65535 {

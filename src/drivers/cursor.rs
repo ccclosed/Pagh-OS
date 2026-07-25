@@ -10,8 +10,8 @@
 // redrawing the area beneath the cursor, then `move_to()` afterwards to
 // re-capture the fresh background and redraw the arrow on top.
 
-use crate::sync::spinlock::Spinlock;
 use crate::drivers::framebuffer;
+use crate::sync::spinlock::Spinlock;
 
 const CURSOR_W: usize = 12;
 const CURSOR_H: usize = 19;
@@ -125,7 +125,6 @@ fn draw_arrow(fb: &mut framebuffer::FramebufferWriter, x: usize, y: usize) {
         }
     }
 }
-
 
 // ─── STAGE-13.8: cursor-safe text output ─────────────────────────────────────
 //

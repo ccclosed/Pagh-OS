@@ -50,7 +50,7 @@ use x86_64::registers::model_specific::FsBase;
 use x86_64::structures::paging::PageTableFlags;
 
 use crate::arch::x86_64::linux::errno::Errno;
-use crate::arch::x86_64::linux::mem::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_WRITE, VmRegionSet};
+use crate::arch::x86_64::linux::mem::{VmRegionSet, MAP_ANONYMOUS, MAP_PRIVATE, PROT_WRITE};
 use crate::arch::x86_64::linux::regs::SavedRegs;
 use crate::arch::x86_64::linux::validate::USER_ADDR_MAX;
 use crate::arch::x86_64::linux::{io_sys, linux_dispatch, mem_sys, misc};
@@ -124,7 +124,10 @@ pub fn run_net_smoke() {
     let deadline = scheduler::ticks() + 1500;
     while crate::net::ip_config().is_none() {
         if scheduler::ticks() >= deadline {
-            fail(name, "no interface address (DHCP/static fallback did not configure)");
+            fail(
+                name,
+                "no interface address (DHCP/static fallback did not configure)",
+            );
             return;
         }
         scheduler::sleep_ticks(10);
@@ -202,7 +205,10 @@ pub fn run_live_update_check() {
     let deadline = scheduler::ticks() + 3000;
     while crate::net::ip_config().is_none() {
         if scheduler::ticks() >= deadline {
-            fail(name, "no interface address (DHCP/static fallback did not configure)");
+            fail(
+                name,
+                "no interface address (DHCP/static fallback did not configure)",
+            );
             return;
         }
         scheduler::sleep_ticks(10);
@@ -338,7 +344,10 @@ pub fn run_apt_e2e() {
     let deadline = scheduler::ticks() + 2000;
     while crate::net::ip_config().is_none() {
         if scheduler::ticks() >= deadline {
-            fail(name, "no interface address (DHCP/static fallback did not configure)");
+            fail(
+                name,
+                "no interface address (DHCP/static fallback did not configure)",
+            );
             return;
         }
         scheduler::sleep_ticks(10);
@@ -435,7 +444,10 @@ pub fn run_bigindex_check() {
     let deadline = scheduler::ticks() + 2000;
     while crate::net::ip_config().is_none() {
         if scheduler::ticks() >= deadline {
-            fail(name, "no interface address (DHCP/static fallback did not configure)");
+            fail(
+                name,
+                "no interface address (DHCP/static fallback did not configure)",
+            );
             return;
         }
         scheduler::sleep_ticks(10);
@@ -586,7 +598,13 @@ fn build_big_packages_kernel(n: usize) -> alloc::string::String {
         s.push('\n');
 
         s.push_str("Version: ");
-        s.push_str(&alloc::format!("{}.{}.{}-{}", i % 10, i % 100, i % 7, i % 3));
+        s.push_str(&alloc::format!(
+            "{}.{}.{}-{}",
+            i % 10,
+            i % 100,
+            i % 7,
+            i % 3
+        ));
         s.push('\n');
 
         s.push_str("Architecture: amd64\n");
@@ -594,7 +612,10 @@ fn build_big_packages_kernel(n: usize) -> alloc::string::String {
         s.push_str("Filename: ");
         s.push_str(&alloc::format!(
             "pool/main/p/{}/{}_{}.{}_amd64.deb",
-            pkg, pkg, i % 10, i % 100
+            pkg,
+            pkg,
+            i % 10,
+            i % 100
         ));
         s.push('\n');
 
@@ -867,7 +888,10 @@ fn check_end_to_end_run() {
     // interrupts are enabled).
     match run_linux_binary("/mnt/lxbin", &[b"lxbin"], &[]) {
         Ok(pid) => {
-            crate::info!("LXSELFTEST end_to_end_run spawned Compat_Process pid={}", pid);
+            crate::info!(
+                "LXSELFTEST end_to_end_run spawned Compat_Process pid={}",
+                pid
+            );
             pass(name);
         }
         Err(e) => match e {
@@ -1048,9 +1072,8 @@ fn check_oom_rollback() {
             return Err("impossible mmap did not return ENOMEM");
         }
         // The VM state must be untouched: break still INITIAL_BRK, no regions.
-        let (brk, nmaps) =
-            compat::with_current_compat(|cs| (cs.vm.current_brk, cs.vm.mmaps.len()))
-                .unwrap_or((0, usize::MAX));
+        let (brk, nmaps) = compat::with_current_compat(|cs| (cs.vm.current_brk, cs.vm.mmaps.len()))
+            .unwrap_or((0, usize::MAX));
         if brk != INITIAL_BRK {
             return Err("current_brk changed after rollback");
         }
@@ -1074,7 +1097,10 @@ fn check_fetch_no_network() {
     match fetch_deb("10.0.2.2", 80, "/pool/main/test.deb") {
         Err(FetchError::NoNetwork) => pass(name),
         Err(e) => crate::error!("LXSELFTEST {} FAIL expected NoNetwork got {:?}", name, e),
-        Ok(_) => fail(name, "fetch unexpectedly succeeded with no interface address"),
+        Ok(_) => fail(
+            name,
+            "fetch unexpectedly succeeded with no interface address",
+        ),
     }
 }
 
@@ -1111,7 +1137,11 @@ fn check_ext2_install_roundtrip() {
     };
     // Two safe regular files installed; the `..`-escaping entry is skipped (R10.8).
     if installed != 2 {
-        crate::error!("LXSELFTEST {} FAIL installed={} expected 2", name, installed);
+        crate::error!(
+            "LXSELFTEST {} FAIL installed={} expected 2",
+            name,
+            installed
+        );
         return;
     }
 
@@ -1203,7 +1233,11 @@ fn check_dup() {
     });
     match res {
         Ok(fd) if fd >= 3 => pass(name),
-        Ok(fd) => crate::error!("LXSELFTEST {} FAIL dup returned {} (expected >= 3)", name, fd),
+        Ok(fd) => crate::error!(
+            "LXSELFTEST {} FAIL dup returned {} (expected >= 3)",
+            name,
+            fd
+        ),
         Err(e) => crate::error!("LXSELFTEST {} FAIL {:?}", name, e),
     }
 }

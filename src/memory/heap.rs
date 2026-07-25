@@ -103,8 +103,7 @@ pub fn init() {
         let flags = x86_64::structures::paging::PageTableFlags::PRESENT
             | x86_64::structures::paging::PageTableFlags::WRITABLE
             | x86_64::structures::paging::PageTableFlags::NO_EXECUTE;
-        crate::memory::vmm::map(frame, addr, flags)
-            .expect("VMM: failed to map kernel heap page");
+        crate::memory::vmm::map(frame, addr, flags).expect("VMM: failed to map kernel heap page");
         addr += crate::memory::layout::PAGE_SIZE;
     }
 

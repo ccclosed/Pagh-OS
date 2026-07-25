@@ -36,8 +36,8 @@ use crate::vfs::{VfsError, VfsNode, VfsResult};
 
 use structs::{
     read_struct, read_u32, write_struct, write_u32, Ext2GroupDesc, Ext2Inode, Ext2SuperBlock, BS,
-    EXT2_FIRST_INO, EXT2_MAGIC, EXT2_ROOT_INO, INODE_SIZE, PTRS_PER_BLOCK, S_IFDIR, S_IFREG,
-    SECTORS_PER_BLOCK,
+    EXT2_FIRST_INO, EXT2_MAGIC, EXT2_ROOT_INO, INODE_SIZE, PTRS_PER_BLOCK, SECTORS_PER_BLOCK,
+    S_IFDIR, S_IFREG,
 };
 
 // ─── format layout constants (single block group) ───────────────────────────
@@ -104,7 +104,11 @@ impl Ext2Fs {
         Ok(buf)
     }
 
-    fn write_fs_block_direct(dev: &dyn BlockDevice, block: u64, data: &[u8]) -> Result<(), FsError> {
+    fn write_fs_block_direct(
+        dev: &dyn BlockDevice,
+        block: u64,
+        data: &[u8],
+    ) -> Result<(), FsError> {
         debug_assert!(data.len() == BS);
         dev.write_block(block * SECTORS_PER_BLOCK, data)
             .map(|_| ())
@@ -360,7 +364,11 @@ impl<'a> Tx<'a> {
         Err(FsError::OutOfSpace)
     }
 
-    fn ensure_indirect_root(&mut self, inode: &mut Ext2Inode, which: usize) -> Result<u32, FsError> {
+    fn ensure_indirect_root(
+        &mut self,
+        inode: &mut Ext2Inode,
+        which: usize,
+    ) -> Result<u32, FsError> {
         if inode.i_block[which] == 0 {
             let nb = self.alloc_zeroed_block()?;
             inode.i_block[which] = nb;
@@ -376,7 +384,10 @@ impl<'a> Tx<'a> {
         slot: u32,
     ) -> Result<u32, FsError> {
         self.block(ind_block as u64)?;
-        let cur = read_u32(self.dirty.get(&(ind_block as u64)).unwrap(), slot as usize * 4);
+        let cur = read_u32(
+            self.dirty.get(&(ind_block as u64)).unwrap(),
+            slot as usize * 4,
+        );
         if cur != 0 {
             return Ok(cur);
         }
@@ -471,7 +482,6 @@ impl<'a> Tx<'a> {
     }
 }
 
-
 // ─── format ───────────────────────────────────────────────────────────────
 
 impl Ext2Fs {
@@ -488,12 +498,8 @@ impl Ext2Fs {
         let device_blocks = dev.sector_count() / SECTORS_PER_BLOCK;
 
         // Minimum-capacity guard (R7.4), sized for one small group.
-        let min_inode_table_blocks =
-            ((MIN_INODES as usize * INODE_SIZE) + BS - 1) / BS; // ceil
-        let min_ext2_blocks = 4u64
-            + min_inode_table_blocks as u64
-            + 1
-            + 1;
+        let min_inode_table_blocks = ((MIN_INODES as usize * INODE_SIZE) + BS - 1) / BS; // ceil
+        let min_ext2_blocks = 4u64 + min_inode_table_blocks as u64 + 1 + 1;
         let min_layout_blocks = min_ext2_blocks + JOURNAL_RESERVE_BLOCKS;
         if device_blocks < min_layout_blocks {
             return Err(FsError::OutOfSpace);
@@ -504,13 +510,11 @@ impl Ext2Fs {
 
         let bpg = MAX_GROUP_BLOCKS; // 32768 blocks (128 MiB) per group
         let mut total_blocks = data_blocks.min(u32::MAX as u64) as u32;
-        let mut groups =
-            ((total_blocks as u64 + bpg as u64 - 1) / bpg as u64) as u32;
+        let mut groups = ((total_blocks as u64 + bpg as u64 - 1) / bpg as u64) as u32;
 
         let gd_size = core::mem::size_of::<Ext2GroupDesc>();
-        let gd_blocks = |groups: u32| -> u32 {
-            (((groups as usize * gd_size) + BS - 1) / BS) as u32
-        };
+        let gd_blocks =
+            |groups: u32| -> u32 { (((groups as usize * gd_size) + BS - 1) / BS) as u32 };
 
         // Inode density: one inode per BYTES_PER_INODE across the region,
         // spread uniformly (s_inodes_per_group must be identical in every
@@ -518,10 +522,8 @@ impl Ext2Fs {
         let inodes_per_block = (BS / INODE_SIZE) as u64;
         let scaled = (total_blocks as u64 * BS as u64) / BYTES_PER_INODE;
         let per_group = (scaled.max(MIN_INODES as u64) / groups as u64).max(inodes_per_block);
-        let per_group = per_group
-            .saturating_add(inodes_per_block - 1)
-            / inodes_per_block
-            * inodes_per_block;
+        let per_group =
+            per_group.saturating_add(inodes_per_block - 1) / inodes_per_block * inodes_per_block;
         let ipg = per_group.min(MAX_GROUP_INODES as u64) as u32;
         let itb = ipg / (BS / INODE_SIZE) as u32; // inode-table blocks/group
 
@@ -692,7 +694,6 @@ impl Ext2Fs {
     }
 }
 
-
 // ─── mount ────────────────────────────────────────────────────────────────
 
 impl Ext2Fs {
@@ -766,8 +767,7 @@ impl Ext2Fs {
             let ispan = core::cmp::min(ipg, sb.s_inodes_count.saturating_sub(g as u32 * ipg));
             let free_b = span.saturating_sub(alloc::count_set_bits(&bbm, span));
             let free_i = ispan.saturating_sub(alloc::count_set_bits(&ibm, ispan));
-            if gd.bg_free_blocks_count as u32 != free_b
-                || gd.bg_free_inodes_count as u32 != free_i
+            if gd.bg_free_blocks_count as u32 != free_b || gd.bg_free_inodes_count as u32 != free_i
             {
                 gd.bg_free_blocks_count = free_b.min(u16::MAX as u32) as u16;
                 gd.bg_free_inodes_count = free_i.min(u16::MAX as u32) as u16;
@@ -913,12 +913,7 @@ impl Ext2Fs {
 
     /// Insert `(name -> child_ino)` into directory `dir_ino`, growing a new dir
     /// block if no existing block has room.
-    fn insert_dirent(
-        tx: &mut Tx,
-        dir_ino: u32,
-        name: &str,
-        child_ino: u32,
-    ) -> Result<(), FsError> {
+    fn insert_dirent(tx: &mut Tx, dir_ino: u32, name: &str, child_ino: u32) -> Result<(), FsError> {
         if name.as_bytes().len() > 255 {
             return Err(FsError::NameTooLong);
         }
@@ -1106,7 +1101,9 @@ impl Ext2Fs {
     pub fn truncate_file(&self, ino: u32) -> Result<(), FsError> {
         let mut tx = Tx::new(self);
         let mut inode = tx.read_inode(ino)?;
-        if inode.is_dir() { return Err(FsError::Corrupt); }
+        if inode.is_dir() {
+            return Err(FsError::Corrupt);
+        }
         tx.free_all_blocks(&inode)?;
         inode.i_size = 0;
         inode.i_blocks = 0;
@@ -1230,7 +1227,10 @@ impl VfsNode for Ext2Dir {
         self.fs.sync()
     }
     fn size(&self) -> u64 {
-        self.fs.read_inode(self.ino).map(|i| i.i_size as u64).unwrap_or(0)
+        self.fs
+            .read_inode(self.ino)
+            .map(|i| i.i_size as u64)
+            .unwrap_or(0)
     }
 }
 
@@ -1257,10 +1257,15 @@ impl VfsNode for Ext2File {
         self.fs.write_file(self.ino, offset, buf).map_err(fs_to_vfs)
     }
     fn truncate(&self, size: u64) -> VfsResult<()> {
-        if size != 0 { return Err(VfsError::NotSupported); }
+        if size != 0 {
+            return Err(VfsError::NotSupported);
+        }
         self.fs.truncate_file(self.ino).map_err(fs_to_vfs)
     }
     fn size(&self) -> u64 {
-        self.fs.read_inode(self.ino).map(|i| i.i_size as u64).unwrap_or(0)
+        self.fs
+            .read_inode(self.ino)
+            .map(|i| i.i_size as u64)
+            .unwrap_or(0)
     }
 }

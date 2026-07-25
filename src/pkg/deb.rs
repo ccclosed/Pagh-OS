@@ -96,7 +96,9 @@ pub fn parse_ar(buf: &[u8]) -> Result<Vec<ArMember<'_>>, DebError> {
 
     while pos < buf.len() {
         // A full 60-byte header must fit within the buffer.
-        let header_end = pos.checked_add(AR_HEADER_LEN).ok_or(DebError::BadArHeader)?;
+        let header_end = pos
+            .checked_add(AR_HEADER_LEN)
+            .ok_or(DebError::BadArHeader)?;
         if header_end > buf.len() {
             return Err(DebError::BadArHeader);
         }
@@ -430,7 +432,9 @@ fn decompress_xz(input: &[u8], max: usize) -> Result<Vec<u8>, DebError> {
             .map_err(|_| DebError::DecompressFailed)?;
         match result {
             XzNextBlockResult::NeedMoreData(consumed, produced) => {
-                pos = pos.checked_add(consumed).ok_or(DebError::DecompressFailed)?;
+                pos = pos
+                    .checked_add(consumed)
+                    .ok_or(DebError::DecompressFailed)?;
                 push_capped(&mut out, &scratch[..produced], max)?;
                 // Guard against a non-progressing decoder (e.g. truncated input
                 // that yields neither consumption nor output) to avoid spinning.
@@ -478,7 +482,10 @@ fn decompress_zstd(input: &[u8], max: usize) -> Result<Vec<u8>, DebError> {
 /// Append `chunk` to `out`, returning [`DebError::DecompressFailed`] if the
 /// total would exceed `max` (R9.6).
 fn push_capped(out: &mut Vec<u8>, chunk: &[u8], max: usize) -> Result<(), DebError> {
-    let new_len = out.len().checked_add(chunk.len()).ok_or(DebError::DecompressFailed)?;
+    let new_len = out
+        .len()
+        .checked_add(chunk.len())
+        .ok_or(DebError::DecompressFailed)?;
     if new_len > max {
         return Err(DebError::DecompressFailed);
     }
@@ -538,7 +545,9 @@ where
         if chunk.is_empty() {
             return Ok(());
         }
-        let new_total = total.checked_add(chunk.len()).ok_or(DebError::DecompressFailed)?;
+        let new_total = total
+            .checked_add(chunk.len())
+            .ok_or(DebError::DecompressFailed)?;
         if new_total > max {
             return Err(DebError::DecompressFailed);
         }
@@ -656,7 +665,9 @@ where
             .map_err(|_| DebError::DecompressFailed)?;
         match result {
             XzNextBlockResult::NeedMoreData(consumed, produced) => {
-                pos = pos.checked_add(consumed).ok_or(DebError::DecompressFailed)?;
+                pos = pos
+                    .checked_add(consumed)
+                    .ok_or(DebError::DecompressFailed)?;
                 if produced > 0 {
                     sink(&scratch[..produced])?;
                 }

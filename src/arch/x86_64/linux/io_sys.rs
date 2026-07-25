@@ -69,7 +69,10 @@ enum Resolved {
     /// fd 0 — standard input (not writable).
     Stdin,
     /// An ext2-backed file: a cloned node handle and the offset at resolve time.
-    File { node: Arc<dyn VfsNode>, offset: u64 },
+    File {
+        node: Arc<dyn VfsNode>,
+        offset: u64,
+    },
     PipeRead(Arc<PipeEndpoint>),
     PipeWrite(Arc<PipeEndpoint>),
     /// STAGE-15: one end of an AF_UNIX socketpair (rx = incoming, tx = outgoing).
@@ -209,8 +212,26 @@ fn read_user_cstr(ptr: u64) -> Result<String, Errno> {
     Err(Errno::EINVAL)
 }
 
-fn read_pipe(e:&PipeEndpoint,dst:&mut[u8])->Result<usize,Errno>{loop{match e.read(dst){PipeReadResult::Data(n)=>return Ok(n),PipeReadResult::Eof=>return Ok(0),PipeReadResult::WouldBlock if e.nonblocking()=>return Err(Errno::EAGAIN),PipeReadResult::WouldBlock=>crate::task::scheduler::yield_current()}}}
-fn write_pipe(e:&PipeEndpoint,src:&[u8])->Result<usize,Errno>{loop{match e.write(src){PipeWriteResult::Data(n)=>return Ok(n),PipeWriteResult::Broken=>return Err(Errno::EPIPE),PipeWriteResult::WouldBlock if e.nonblocking()=>return Err(Errno::EAGAIN),PipeWriteResult::WouldBlock=>crate::task::scheduler::yield_current()}}}
+fn read_pipe(e: &PipeEndpoint, dst: &mut [u8]) -> Result<usize, Errno> {
+    loop {
+        match e.read(dst) {
+            PipeReadResult::Data(n) => return Ok(n),
+            PipeReadResult::Eof => return Ok(0),
+            PipeReadResult::WouldBlock if e.nonblocking() => return Err(Errno::EAGAIN),
+            PipeReadResult::WouldBlock => crate::task::scheduler::yield_current(),
+        }
+    }
+}
+fn write_pipe(e: &PipeEndpoint, src: &[u8]) -> Result<usize, Errno> {
+    loop {
+        match e.write(src) {
+            PipeWriteResult::Data(n) => return Ok(n),
+            PipeWriteResult::Broken => return Err(Errno::EPIPE),
+            PipeWriteResult::WouldBlock if e.nonblocking() => return Err(Errno::EAGAIN),
+            PipeWriteResult::WouldBlock => crate::task::scheduler::yield_current(),
+        }
+    }
+}
 
 /// `read` (0): copy up to `count` bytes from the file at its current offset into
 /// the user buffer, advance the offset by the bytes copied, and return that count
@@ -264,7 +285,10 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
                 // argument" — report EIO and log what actually broke.
                 crate::error!(
                     "[linux] file read failed: {:?} ino={} off={} len={}",
-                    e, node.fs_ino(), offset, copied
+                    e,
+                    node.fs_ino(),
+                    offset,
+                    copied
                 );
                 Errno::EIO
             })?;
@@ -366,7 +390,13 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
                 console_write(&data);
                 total += len;
             }
-            Resolved::PipeWrite(e) => {let n=write_pipe(e,&data)?;total+=n as u64;if n<data.len(){break;}}
+            Resolved::PipeWrite(e) => {
+                let n = write_pipe(e, &data)?;
+                total += n as u64;
+                if n < data.len() {
+                    break;
+                }
+            }
             Resolved::File { node, .. } => {
                 let n = node.write(file_off, &data).map_err(|_| Errno::EINVAL)?;
                 file_off += n as u64;
@@ -848,9 +878,11 @@ fn build_termios() -> [u8; TERMIOS_SIZE] {
     t[8..12].copy_from_slice(&c_cflag.to_le_bytes());
     t[12..16].copy_from_slice(&c_lflag.to_le_bytes());
     t[16] = 0; // c_line
-    // c_cc: VINTR VQUIT VERASE VKILL VEOF VTIME VMIN VSWTC VSTART VSTOP VSUSP
-    //       VEOL VREPRINT VDISCARD VWERASE VLNEXT VEOL2 (rest zero)
-    let c_cc: [u8; 19] = [3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0];
+               // c_cc: VINTR VQUIT VERASE VKILL VEOF VTIME VMIN VSWTC VSTART VSTOP VSUSP
+               //       VEOL VREPRINT VDISCARD VWERASE VLNEXT VEOL2 (rest zero)
+    let c_cc: [u8; 19] = [
+        3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0,
+    ];
     t[17..36].copy_from_slice(&c_cc);
     t
 }
@@ -1263,7 +1295,12 @@ pub fn sys_mkdir(path: u64, _mode: u64) -> Result<u64, Errno> {
     }
     let dir = vfs::lookup_path(parent).map_err(|_| Errno::ENOENT)?;
     dir.create_dir(name).map_err(|e| {
-        crate::error!("[linux] mkdir failed: {:?} parent={} name={}", e, parent, name);
+        crate::error!(
+            "[linux] mkdir failed: {:?} parent={} name={}",
+            e,
+            parent,
+            name
+        );
         Errno::EIO
     })?;
     Ok(0)
@@ -1417,7 +1454,9 @@ pub fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, Errno> {
         if oldfd == newfd {
             return Ok(newfd);
         }
-        cs.fds.dup_to(oldfd as u32, newfd as u32).map(|fd| fd as u64)
+        cs.fds
+            .dup_to(oldfd as u32, newfd as u32)
+            .map(|fd| fd as u64)
     })
     .unwrap_or(Err(Errno::EBADF))
 }
@@ -1588,7 +1627,10 @@ pub fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Er
                 // argument" — report EIO and log what actually broke.
                 crate::error!(
                     "[linux] file read failed: {:?} ino={} off={} len={}",
-                    e, node.fs_ino(), offset, copied
+                    e,
+                    node.fs_ino(),
+                    offset,
+                    copied
                 );
                 Errno::EIO
             })?;
@@ -1759,7 +1801,13 @@ fn store_fdset(ptr: u64, nfds: u64, set: &[u64; FDSET_WORDS]) {
     }
 }
 
-fn do_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout_ms: Option<i64>) -> Result<u64, Errno> {
+fn do_select(
+    nfds: u64,
+    readfds: u64,
+    writefds: u64,
+    exceptfds: u64,
+    timeout_ms: Option<i64>,
+) -> Result<u64, Errno> {
     let nfds = nfds.min(1024);
     let want_r = load_fdset(readfds, nfds)?;
     let want_w = load_fdset(writefds, nfds)?;
@@ -1767,7 +1815,9 @@ fn do_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout_ms:
     let deadline = match timeout_ms {
         None => None,
         Some(ms) if ms <= 0 => Some(0), // scan once, then time out
-        Some(ms) => Some(crate::task::scheduler::ticks().saturating_add(((ms as u64).saturating_add(9)) / 10)),
+        Some(ms) => Some(
+            crate::task::scheduler::ticks().saturating_add(((ms as u64).saturating_add(9)) / 10),
+        ),
     };
     loop {
         let mut got_r = [0u64; FDSET_WORDS];
@@ -1800,7 +1850,14 @@ fn do_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout_ms:
 
 /// `pselect6` (270): the timeout is a `struct timespec`; the sigmask is
 /// ignored (no signal delivery yet).
-pub fn sys_pselect6(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: u64, _sigmask: u64) -> Result<u64, Errno> {
+pub fn sys_pselect6(
+    nfds: u64,
+    readfds: u64,
+    writefds: u64,
+    exceptfds: u64,
+    timeout: u64,
+    _sigmask: u64,
+) -> Result<u64, Errno> {
     let ms = if timeout == 0 {
         None
     } else {
@@ -1813,7 +1870,13 @@ pub fn sys_pselect6(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, time
 }
 
 /// `select` (23): the timeout is a `struct timeval`.
-pub fn sys_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: u64) -> Result<u64, Errno> {
+pub fn sys_select(
+    nfds: u64,
+    readfds: u64,
+    writefds: u64,
+    exceptfds: u64,
+    timeout: u64,
+) -> Result<u64, Errno> {
     let ms = if timeout == 0 {
         None
     } else {

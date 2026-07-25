@@ -48,7 +48,9 @@ fn port_write(addr: u16, value: u8) {
     // SAFETY: `addr` is a COM1 UART register (`COM1 + offset`); writing a u8 to
     // a 16550-class UART register has no memory-safety effect and is the
     // intended hardware access.
-    unsafe { port.write(value); }
+    unsafe {
+        port.write(value);
+    }
 }
 
 fn write_byte(b: u8) {

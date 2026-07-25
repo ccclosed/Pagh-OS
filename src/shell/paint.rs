@@ -19,13 +19,13 @@
 //! palette; the left mouse button paints with it and the right button paints
 //! with white (quick erase).
 
-use alloc::vec;
-use alloc::vec::Vec;
 use alloc::format;
 use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 
-use crate::drivers::{cursor, framebuffer, ps2_mouse};
 use super::keys::{Decoder, KeyEvent};
+use crate::drivers::{cursor, framebuffer, ps2_mouse};
 
 /// Top row of the toolbar holds the palette + current-color chip + label.
 const PALETTE_ROW_H: usize = 28;
@@ -122,7 +122,12 @@ fn brush_ui() -> BrushUi {
     let label_w = 6 * CHAR_W; // room for "Sz:NN"
     let plus_x = label_x + label_w;
     let end_x = plus_x + BRUSH_BTN_W;
-    BrushUi { minus_x, label_x, plus_x, end_x }
+    BrushUi {
+        minus_x,
+        label_x,
+        plus_x,
+        end_x,
+    }
 }
 
 /// 16-color palette (indices 0..15; number keys 1..0 pick the first ten).
@@ -175,7 +180,10 @@ impl Tool {
 
     /// True for the click-drag-release shape tools that show a live preview.
     fn is_shape(self) -> bool {
-        matches!(self, Tool::Line | Tool::Rect | Tool::FilledRect | Tool::Circle | Tool::Disc)
+        matches!(
+            self,
+            Tool::Line | Tool::Rect | Tool::FilledRect | Tool::Circle | Tool::Disc
+        )
     }
 }
 
@@ -759,8 +767,14 @@ impl PaintApp {
         let mut err = 1 - r;
         while x >= y {
             for &(px, py) in &[
-                (cx + x, cy + y), (cx + y, cy + x), (cx - y, cy + x), (cx - x, cy + y),
-                (cx - x, cy - y), (cx - y, cy - x), (cx + y, cy - x), (cx + x, cy - y),
+                (cx + x, cy + y),
+                (cx + y, cy + x),
+                (cx - y, cy + x),
+                (cx - x, cy + y),
+                (cx - x, cy - y),
+                (cx - y, cy - x),
+                (cx + y, cy - x),
+                (cx + x, cy - y),
             ] {
                 self.c_square(px, py, b, color);
             }
@@ -804,15 +818,34 @@ impl PaintApp {
         // Draw the new preview directly onto the framebuffer (transient).
         framebuffer::with(|fb| match self.tool {
             Tool::Line => {
-                fb.draw_thick_line(sx as isize + left, sy as isize + top, cx as isize + left, cy as isize + top, b, color);
+                fb.draw_thick_line(
+                    sx as isize + left,
+                    sy as isize + top,
+                    cx as isize + left,
+                    cy as isize + top,
+                    b,
+                    color,
+                );
             }
             Tool::Rect => {
                 let (x0, y0, w, h) = norm_rect(sx, sy, cx, cy);
-                fb.draw_rect((x0 + self.canvas_left as i32) as usize, (y0 + self.canvas_top as i32) as usize, w as usize, h as usize, color);
+                fb.draw_rect(
+                    (x0 + self.canvas_left as i32) as usize,
+                    (y0 + self.canvas_top as i32) as usize,
+                    w as usize,
+                    h as usize,
+                    color,
+                );
             }
             Tool::FilledRect => {
                 let (x0, y0, w, h) = norm_rect(sx, sy, cx, cy);
-                fb.fill_rect((x0 + self.canvas_left as i32) as usize, (y0 + self.canvas_top as i32) as usize, w as usize, h as usize, color);
+                fb.fill_rect(
+                    (x0 + self.canvas_left as i32) as usize,
+                    (y0 + self.canvas_top as i32) as usize,
+                    w as usize,
+                    h as usize,
+                    color,
+                );
             }
             Tool::Circle => {
                 let r = radius(sx, sy, cx, cy);
@@ -999,7 +1032,13 @@ impl PaintApp {
                 let bg = if selected { 0x3A6EA5 } else { 0x3A3A44 };
                 fb.fill_rect(ox + bx, oy + PALETTE_ROW_H + 2, bw, TOOL_ROW_H - 4, bg);
                 if selected {
-                    fb.draw_rect(ox + bx, oy + PALETTE_ROW_H + 2, bw, TOOL_ROW_H - 4, 0xFFFF00);
+                    fb.draw_rect(
+                        ox + bx,
+                        oy + PALETTE_ROW_H + 2,
+                        bw,
+                        TOOL_ROW_H - 4,
+                        0xFFFF00,
+                    );
                 }
                 fb.draw_text_px(ox + bx + 4, ty, t.name(), 0xE6E6E6, bg);
             }
@@ -1011,13 +1050,25 @@ impl PaintApp {
                 let btn_bg = 0x3A3A44;
                 // Minus button.
                 fb.fill_rect(ox + bu.minus_x, by, BRUSH_BTN_W, bh, btn_bg);
-                fb.draw_text_px(ox + bu.minus_x + (BRUSH_BTN_W - CHAR_W) / 2, ty, "-", 0xE6E6E6, btn_bg);
+                fb.draw_text_px(
+                    ox + bu.minus_x + (BRUSH_BTN_W - CHAR_W) / 2,
+                    ty,
+                    "-",
+                    0xE6E6E6,
+                    btn_bg,
+                );
                 // Size label.
                 let s = format!("Sz:{}", brush);
                 fb.draw_text_px(ox + bu.label_x, ty, &s, 0xE6E6E6, TOOLBAR_BG);
                 // Plus button.
                 fb.fill_rect(ox + bu.plus_x, by, BRUSH_BTN_W, bh, btn_bg);
-                fb.draw_text_px(ox + bu.plus_x + (BRUSH_BTN_W - CHAR_W) / 2, ty, "+", 0xE6E6E6, btn_bg);
+                fb.draw_text_px(
+                    ox + bu.plus_x + (BRUSH_BTN_W - CHAR_W) / 2,
+                    ty,
+                    "+",
+                    0xE6E6E6,
+                    btn_bg,
+                );
             }
         });
     }
@@ -1205,7 +1256,13 @@ impl PaintApp {
         framebuffer::with(|fb| {
             // Title bar + caption.
             fb.fill_rect(wx, wy, ww, TITLEBAR_H, TITLE_BG);
-            fb.draw_text_px(wx + 8, wy + (TITLEBAR_H - 16) / 2, title, 0xFFFFFF, TITLE_BG);
+            fb.draw_text_px(
+                wx + 8,
+                wy + (TITLEBAR_H - 16) / 2,
+                title,
+                0xFFFFFF,
+                TITLE_BG,
+            );
             // Window outline (double line for a slight bevel).
             fb.draw_rect(wx, wy, ww, wh, 0x05151F);
             if ww > 2 && wh > 2 {
@@ -1219,7 +1276,13 @@ impl PaintApp {
             fb.draw_rect(mxx + 4, by + 4, bw - 8, bh - 8, 0xFFFFFF);
             // Close button (red, "X" glyph).
             fb.fill_rect(clx, by, bw, bh, 0xC0392B);
-            fb.draw_text_px(clx + (bw - CHAR_W) / 2, by + (bh.saturating_sub(16)) / 2 + 1, "X", 0xFFFFFF, 0xC0392B);
+            fb.draw_text_px(
+                clx + (bw - CHAR_W) / 2,
+                by + (bh.saturating_sub(16)) / 2 + 1,
+                "X",
+                0xFFFFFF,
+                0xC0392B,
+            );
         });
     }
 
@@ -1244,11 +1307,8 @@ impl PaintApp {
     fn draw_bottom_bar(&self, ms: &ps2_mouse::MouseState) {
         let cx = ms.x as i32 - self.canvas_left as i32;
         let cy = ms.y as i32 - self.canvas_top as i32;
-        let in_canvas = !self.minimized
-            && cx >= 0
-            && cx < self.cw as i32
-            && cy >= 0
-            && cy < self.ch as i32;
+        let in_canvas =
+            !self.minimized && cx >= 0 && cx < self.cw as i32 && cy >= 0 && cy < self.ch as i32;
         let info = if self.minimized {
             String::from("minimized - click Paint to restore   q=quit")
         } else if in_canvas {

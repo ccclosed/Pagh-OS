@@ -3,9 +3,9 @@
 
 use core::ptr;
 use core::sync::atomic::Ordering;
+use x86_64::instructions::tlb;
 use x86_64::structures::paging::page_table::{PageTableEntry, PageTableIndex};
 use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
-use x86_64::instructions::tlb;
 use x86_64::{PhysAddr, VirtAddr};
 
 /// Typed errors returned by the virtual memory manager.
@@ -34,7 +34,8 @@ impl core::fmt::Display for VmError {
 pub fn init(hhdm_offset: u64) {
     crate::HHDM_OFFSET.store(hhdm_offset, Ordering::Relaxed);
 
-    crate::debug!("VMM Initialized: HHDM offset=0x{:x}, PML4=0x{:x}",
+    crate::debug!(
+        "VMM Initialized: HHDM offset=0x{:x}, PML4=0x{:x}",
         hhdm_offset,
         current_pml4_phys(),
     );
@@ -169,8 +170,7 @@ impl PageTableWalker {
         // Flags an intermediate entry should carry: present + writable, plus
         // user-accessibility only when the leaf mapping requested it.
         let user = flags & PageTableFlags::USER_ACCESSIBLE;
-        let intermediate_flags =
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | user;
+        let intermediate_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | user;
 
         if !table[idx].flags().contains(PageTableFlags::PRESENT) {
             let frame = crate::memory::pmm::alloc_frame().ok_or(VmError::OutOfMemory)?;
@@ -252,20 +252,32 @@ pub fn page_flags(virt: u64) -> Option<PageTableFlags> {
     let va = VirtAddr::new(virt);
     let walker = PageTableWalker::new();
     let p4e = &walker.root()[va.p4_index()];
-    if !p4e.flags().contains(PageTableFlags::PRESENT) { return None; }
+    if !p4e.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
     let p3 = walker.table(p4e.addr().as_u64());
     let p3e = &p3[va.p3_index()];
-    if !p3e.flags().contains(PageTableFlags::PRESENT) { return None; }
+    if !p3e.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
     let mut effective = p4e.flags() & p3e.flags();
-    if p3e.flags().contains(PageTableFlags::HUGE_PAGE) { return Some(effective); }
+    if p3e.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return Some(effective);
+    }
     let p2 = walker.table(p3e.addr().as_u64());
     let p2e = &p2[va.p2_index()];
-    if !p2e.flags().contains(PageTableFlags::PRESENT) { return None; }
+    if !p2e.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
     effective &= p2e.flags();
-    if p2e.flags().contains(PageTableFlags::HUGE_PAGE) { return Some(effective); }
+    if p2e.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return Some(effective);
+    }
     let p1 = walker.table(p2e.addr().as_u64());
     let p1e = &p1[va.p1_index()];
-    if !p1e.flags().contains(PageTableFlags::PRESENT) { return None; }
+    if !p1e.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
     Some(effective & p1e.flags())
 }
 
