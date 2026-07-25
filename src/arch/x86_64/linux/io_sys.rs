@@ -834,7 +834,15 @@ fn build_termios() -> [u8; TERMIOS_SIZE] {
     let c_iflag: u32 = 0x0500; // ICRNL | IXON
     let c_oflag: u32 = 0x0005; // OPOST | ONLCR
     let c_cflag: u32 = 0x00BF; // B38400 | CS8 | CREAD
-    let c_lflag: u32 = 0x8A3B; // ISIG|ICANON|ECHO|ECHOE|ECHOK|ECHOCTL|ECHOKE|IEXTEN
+    // STAGE 16.16: report the REAL tty state instead of a hardcoded cooked
+    // image. tcgetattr previously always claimed ICANON|ECHO, so a program
+    // that saves attributes, switches to raw and restores them (bash readline
+    // does this around every command) read back a lie.
+    let (raw_now, echo_now) = crate::task::compat::with_current_compat(|cs| (cs.raw_mode, cs.echo))
+        .unwrap_or((false, true));
+    let mut c_lflag: u32 = 0x8A3B; // ISIG|ICANON|ECHO|ECHOE|ECHOK|ECHOCTL|ECHOKE|IEXTEN
+    if raw_now { c_lflag &= !0x0002u32; } // ICANON
+    if !echo_now { c_lflag &= !0x0008u32; } // ECHO
     t[0..4].copy_from_slice(&c_iflag.to_le_bytes());
     t[4..8].copy_from_slice(&c_oflag.to_le_bytes());
     t[8..12].copy_from_slice(&c_cflag.to_le_bytes());
@@ -864,7 +872,10 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
                 // c_lflag is at offset 12; ICANON = 0x02
                 let c_lflag = unsafe { core::ptr::read_unaligned((arg + 12) as *const u32) };
                 let raw = c_lflag & 0x02 == 0; // ICANON cleared => raw mode
-                crate::task::compat::with_current_compat(|cs| { if cs.raw_mode != raw { crate::warn!("[DIAG] tty: raw_mode={} pid={}", raw, crate::task::scheduler::current_pid()); } cs.raw_mode = raw; });
+                // STAGE 16.16: track ECHO (0x08) too, so raw-mode reads know
+                // whether the kernel must echo typed characters itself.
+                let echo = c_lflag & 0x08 != 0;
+                crate::task::compat::with_current_compat(|cs| { if cs.raw_mode != raw || cs.echo != echo { crate::warn!("[DIAG] tty: raw_mode={} echo={} pid={}", raw, echo, crate::task::scheduler::current_pid()); } cs.raw_mode = raw; cs.echo = echo; });
             }
             Ok(0)
         }
@@ -1020,6 +1031,20 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
             KeyEvent::Ctrl(c)  => alloc::vec![(c as u8) & 0x1F],
         };
         if bytes.is_empty() { continue; }
+        // STAGE 16.16: a real tty keeps echoing in raw mode unless ECHO is
+        // cleared. bash's readline runs without a terminfo database here, so
+        // it does NOT redraw the input line itself and relied on that missing
+        // kernel echo - typed characters only showed up when Enter finally
+        // flushed the line. nvim and full readline clear ECHO, so they cannot
+        // double-echo. Escape sequences (0x1B...) are never echoed.
+        if crate::task::compat::with_current_compat(|cs| cs.echo).unwrap_or(false) {
+            match bytes[0] {
+                b'\r' | b'\n' => console_write(b"\r\n"),
+                0x7F | 0x08 => console_write(b"\x08 \x08"),
+                b if b >= 0x20 => console_write(&bytes),
+                _ => {}
+            }
+        }
         let n = core::cmp::min(count as usize, bytes.len());
         copy_out(buf, &bytes[..n]);
         if n < bytes.len() {

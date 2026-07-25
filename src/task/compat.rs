@@ -52,6 +52,10 @@ pub struct CompatState {
     pub nosys_logged: BTreeSet<u64>,
     /// Whether the controlling tty is in raw mode (ICANON cleared via TCSETS).
     pub raw_mode: bool,
+    /// STAGE 16.16: whether the controlling tty still echoes typed characters
+    /// (ECHO in c_lflag). A real tty echoes even in raw mode; only programs
+    /// that draw their own input (nvim, full readline) clear this bit.
+    pub echo: bool,
     /// The normalized exit code (low byte of the requested code), once the
     /// process has exited (R12.3).
     pub exit_code: Option<u8>,
@@ -71,7 +75,7 @@ impl CompatState {
     /// code yet.
     pub fn new(fds: FdTable, vm: VmRegionSet, tid: u64) -> Self { Self::new_with_parent(fds, vm, tid, 1) }
     pub fn new_with_parent(fds: FdTable, vm: VmRegionSet, tid: u64, ppid: u64) -> Self {
-        Self { fds, vm, fs_base: 0, tid, ppid, tgid: tid, clear_child_tid: 0, waitable: true, robust_head: 0, robust_len: 0, cwd: "/".to_string(), nosys_logged: BTreeSet::new(), raw_mode: false, exit_code: None, exe_path: String::new(), exec_stdio: ["?", "?", "?"] }
+        Self { fds, vm, fs_base: 0, tid, ppid, tgid: tid, clear_child_tid: 0, waitable: true, robust_head: 0, robust_len: 0, cwd: "/".to_string(), nosys_logged: BTreeSet::new(), raw_mode: false, echo: true, exit_code: None, exe_path: String::new(), exec_stdio: ["?", "?", "?"] }
     }
 }
 
