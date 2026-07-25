@@ -215,6 +215,10 @@ pub fn fs_base_for(pid: u64) -> Option<u64> { COMPAT_STATES.lock().get(&pid).map
 pub fn current_tgid() -> u64 { with_current_compat(|s| s.tgid).unwrap_or_else(super::scheduler::current_pid) }
 pub fn current_clear_child_tid() -> u64 { with_current_compat(|s| s.clear_child_tid).unwrap_or(0) }
 pub fn current_robust_list() -> (u64,u64) { with_current_compat(|s| (s.robust_head,s.robust_len)).unwrap_or((0,0)) }
+/// Restored during the origin/main merge: futex cleanup on thread exit needs
+/// these by pid (not just for the current task).
+pub fn clear_tid_for(pid: u64) -> u64 { COMPAT_STATES.lock().get(&pid).map(|s| s.clear_child_tid).unwrap_or(0) }
+pub fn robust_for(pid: u64) -> (u64, u64) { COMPAT_STATES.lock().get(&pid).map(|s| (s.robust_head, s.robust_len)).unwrap_or((0, 0)) }
 pub fn group_member_pids(tgid:u64, except:u64) -> alloc::vec::Vec<u64> {
     COMPAT_STATES.lock().iter().filter_map(|(pid,s)| (s.tgid==tgid && *pid!=except).then_some(*pid)).collect()
 }

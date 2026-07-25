@@ -33,6 +33,7 @@ pub mod epoll_sys;
 pub mod mem_sys;
 pub mod process_sys;
 pub mod unix_sock;
+pub mod rtc;
 
 use abi::nr as sysno;
 use errno::{encode_errno, Errno};
