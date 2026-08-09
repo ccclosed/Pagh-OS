@@ -112,6 +112,7 @@ impl<'a> Expr<'a> {
         }
     }
     fn atom(&mut self) -> Result<i64, String> {
+        // Тут какая-то хуйня. Пофиксите пожалуйста
         self.ws();
         if self.eat(b'(') {
             let v = self.add()?;
