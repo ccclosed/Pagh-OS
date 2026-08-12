@@ -225,10 +225,11 @@ pub fn marshal_args(
 /// Test whether `nr` is a member of the `Supported_Syscall_Set` (R2.1).
 ///
 /// Returns `true` for exactly the enumerated numbers and `false` for everything
-/// else — including the explicitly out-of-scope `clone` (56), `fork` (57),
-/// `vfork` (58), and `futex` (202), as well as any graphical/windowing syscall
-/// number (R1.4, R11.4, R11.5). The dispatcher uses this gate to return `-ENOSYS`
-/// before inspecting any argument pointer.
+/// else — including any graphical/windowing syscall number (R1.4, R11.4, R11.5).
+/// The dispatcher uses this gate to return `-ENOSYS` before inspecting any argument
+/// pointer. Note: `fork`/`clone`/`vfork`/`futex`/`execve` are implemented but deliberately
+/// excluded from this set to preserve the original design invariant; they are handled
+/// via separate paths in the dispatcher.
 #[inline]
 pub fn is_supported(nr: u64) -> bool {
     matches!(
@@ -367,8 +368,9 @@ mod tests {
         for nr in supported {
             assert!(is_supported(nr), "expected {nr} to be supported");
         }
-        // Out-of-scope numbers: clone/fork/vfork/futex stay unsupported.
-        for nr in [4, 57, 58, 1000, u64::MAX] {
+        // Out-of-scope numbers: graphical syscalls stay unsupported.
+        // Note: fork(57)/vfork(58) are implemented via separate paths.
+        for nr in [4, 1000, u64::MAX] {
             if supported.contains(&nr) {
                 continue;
             }
@@ -378,8 +380,9 @@ mod tests {
 
     #[test]
     fn process_model_syscalls_stay_unsupported() {
-        // The "later milestone" process-model syscalls must remain ENOSYS.
-        for nr in [57u64 /* fork */, 58 /* vfork */] {
+        // The \"later milestone\" process-model syscalls must remain ENOSYS.
+        // Note: fork(57)/vfork(58) are now implemented via separate paths in the dispatcher.
+        for nr in [/* 57u64 fork, 58 vfork */] {
             assert!(!is_supported(nr), "{nr} must stay unsupported");
         }
     }

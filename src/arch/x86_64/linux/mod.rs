@@ -227,9 +227,9 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
 ///      so the numeric overlap with Linux `open`(2)/`close`(3) is resolved by
 ///      "native ⇒ legacy, Linux ⇒ Linux".
 ///   2. **Supported-set gate (R1.4, R11.4, R11.5).** Unsupported numbers (incl.
-///      `clone`/`fork`/`vfork`/`futex` and graphical syscalls) log one nosys
-///      diagnostic and return `-ENOSYS` **before any argument pointer is
-///      inspected**.
+///      graphical syscalls) log one nosys diagnostic and return `-ENOSYS` **before
+///      any argument pointer is inspected**. Note: `fork`/`clone`/`vfork`/`futex`/`execve` are
+///      implemented via separate dispatcher paths and bypass this gate.
 ///   3. **Routing.** Supported numbers go to the io/mem/misc handlers, each of
 ///      which runs the single [`check_user_ptr`] choke point on its pointer
 ///      arguments. The handler's `Result<u64, Errno>` is folded `Ok(v) -> v` /

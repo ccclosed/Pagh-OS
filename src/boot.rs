@@ -180,8 +180,6 @@ fn init_drivers() {
 /// `Vec`). Attaches the virtio-blk disk as a `BlockDevice` ("virtio-blk0"). If
 /// no virtio device of a given kind is present, the corresponding attach logs a
 /// warning and no-ops so boot is always preserved (R17.4).
-///
-/// TODO(task 6): also attach the virtio-net NIC here (smoltcp bring-up).
 fn init_virtio() {
     let devs = drivers::pci::enumerate();
     drivers::virtio::blk::init_blk(&devs);

@@ -28,7 +28,7 @@ real disk, and a friendly interactive shell with line editing, history, tab comp
 and colored output. It can load and run an embedded test program in ring 3, and ships a
 windowed, mouse-driven `paint` application (a movable window with minimize/maximize/close
 and a taskbar entry). It also runs **Linux x86_64 ELF
-binaries — statically linked or dynamically linked against glibc (up to CPython 3.13) —**
+binaries — statically linked or dynamically linked against glibc (up to CPython 3.16) —**
 in ring 3 through a Linux syscall-compatibility layer, includes an **`apt`-style package
 manager** that fetches and installs Debian `.deb` packages by name over HTTP/HTTPS, and
 **provisions a base glibc + Python userland** onto its ext2 disk on first boot.
@@ -89,15 +89,16 @@ honest INSECURE warnings (VARIANT A: encrypted but unauthenticated).
   prompt/errors, typo suggestions, a registry-driven `help`, and a `paint` app.
 - **Linux binaries:** a Linux x86_64 syscall layer (`int 0x80` + `syscall`) and an ELF
   loader for static `ET_EXEC`, static-PIE, and glibc-dynamic (`PT_INTERP`) images run
-  Linux programs in ring 3 (`lxrun`) — including the CPython 3.13 REPL (GNU readline
-  works via `select`/`pselect6`). Threads/`fork`, signal delivery, `epoll`/`eventfd`,
-  and GUI stacks are still out of scope.
+  Linux programs in ring 3 (`lxrun`) — including the CPython 3.16 REPL (GNU readline
+  works via `select`/`pselect6`). Process syscalls `fork`/`clone`/`execve`, `wait4`,
+  `epoll`/`eventfd`, and `futex` are supported at a basic level; signals are not
+  delivered, but `tgkill` with a fatal signal terminates the process cleanly.
 - **Packages:** a by-name `apt` (`update`/`install`/`show`/`list`/`setmirror`) that fetches
   a Debian `Packages` index over HTTP/HTTPS, streams gzip/xz/zstd decompression into a
   compact in-RAM arena index, resolves dependencies, and installs `.deb`s onto ext2 `/mnt`
   (tar symlinks/hardlinks are materialized as file copies).
 - **Provisioning:** an idempotent first-boot thread seeds `/mnt` and installs the base
-  glibc + CPython 3.13 userland through `apt` (gz→xz index-decode fallback, honest
+  glibc + CPython 3.16 userland through `apt` (gz→xz index-decode fallback, honest
   decode diagnostics, progress on serial).
 
 ---
@@ -256,7 +257,7 @@ framebuffer (serial stays plain text).
 | `ifconfig`           | Show the network interface (IP, gateway, MAC)                   |
 | `nc <ip> <port> [t]` | Open a TCP connection and echo a line over it                   |
 | `lxrun <path> […]`   | Load and run a Linux x86_64 ELF (static or glibc) in ring 3    |
-| `python […]`         | Run the installed CPython 3.13 (glibc) via the Linux layer     |
+| `python […]`         | Run the installed CPython 3.16 (glibc) via the Linux layer     |
 | `pkg <url> <dst>`    | Download a file / `.deb` over HTTP(S) into the VFS              |
 | `apt <subcmd> …`     | Package manager: `update`/`install`/`show`/`list`/`setmirror`   |
 | `exec`               | Run the embedded ring-3 test process                            |
@@ -355,7 +356,8 @@ rust /mnt/pagh-rust-hello one two
 
 For `.rs` and `.pbc`, the `rust` command selects the embedded interpreter. For
 other files it selects the ring-3 Linux ELF loader. Dynamic linking, threads,
-`fork`, futexes and GUI libraries remain unsupported for native binaries.
+`fork`/`clone`/`execve`, `wait4`, futexes and GUI libraries are supported at a basic level;
+signals are not delivered, but `tgkill` with a fatal signal terminates the process cleanly.
 
 ### nano+ editor
 
@@ -386,24 +388,26 @@ apt update
 apt install busybox-static
 lxrun /mnt/bin/busybox
 
-# CPython 3.13 (installed automatically on first boot)
+# CPython 3.16 (installed automatically on first boot)
 python
 ```
 
 - **Static and dynamic.** Statically-linked binaries and glibc-dynamic binaries both run:
   the loader maps the ELF interpreter (`ld-linux-x86-64.so.2`) from `/mnt` (with
-  merged-`/usr` fallback paths), and CPython 3.13 works end to end.
-  `fork`/`clone`/threads, signal delivery, `epoll`/`eventfd`, and GUI stacks are still
-  out of scope and return `-ENOSYS` — event-loop TUIs (`nvim`, `htop`) do not run yet,
-  though a fatal `tgkill` now ends the process cleanly (glibc `abort()` → exit 134).
+  merged-`/usr` fallback paths), and CPython 3.16 works end to end.
+  `fork`/`clone`/`execve`, `wait4`, `epoll`/`eventfd`, futexes and GUI stacks are
+  supported at a basic level — event-loop TUIs (`nvim`, `htop`) may still have limitations;
+  signals are not delivered, but a fatal `tgkill` terminates the process cleanly
+  (glibc `abort()` → exit 134).
 - **Install ≠ run.** `apt install <pkg>` resolves the dependency closure, downloads each
   `.deb`, unpacks its files onto `/mnt`, and materializes tar symlinks/hardlinks as file
   copies (the ext2 writer has no symlink support). Console programs like `python3` then
   genuinely run. Interactive TUIs still may not: there is no `procfs` (`/proc/stat`,
-  `/proc/meminfo`, per-pid entries), no `epoll`/`eventfd`, and no signal
-  delivery. The console answers `TCGETS`/`TCSETS*`/`TIOCGWINSZ`/`TIOCSWINSZ` (non-tty
-  fds get a proper `ENOTTY`), but stdin stays line-buffered, so ncurses/libuv programs
-  (`htop`, `nvim`) still fail at startup. See `LINUX-USERLAND.md` for the exact status.
+  `/proc/meminfo`, per-pid entries); `epoll`/`eventfd` work but TUI frameworks may not
+  use them correctly without full signal delivery. The console answers
+  `TCGETS`/`TCSETS*`/`TIOCGWINSZ`/`TIOCSWINSZ` (non-tty fds get a proper `ENOTTY`),
+  but stdin stays line-buffered, so ncurses/libuv programs (`htop`, `nvim`) still fail
+  at startup. See `LINUX-USERLAND.md` for the exact status.
 - **Transport.** Downloads use HTTP or HTTPS. HTTPS is **VARIANT A**: TLS 1.3 encrypted but
   **unauthenticated** (no certificate chain/hostname/expiry checks),
   and package data is not signature-verified — acceptable only for this hobby/QEMU demo.
@@ -584,10 +588,10 @@ src/
 - **Linux binaries.** A Linux x86_64 syscall layer (`int 0x80` + `syscall` → a single
   dispatcher) plus an ELF loader for static `ET_EXEC`, static-PIE, and `PT_INTERP` dynamic images, a
   SysV initial stack/auxv builder, and per-process compat state (fd table, VM regions) let
-  Linux programs — including glibc-dynamic ones such as CPython 3.13 — run in ring 3
-  (`lxrun`). `fork`/`clone`/threads, signals/`epoll`, and GUI stacks are deliberately
-  out of scope and return `-ENOSYS` (`futex` is handled just far enough for
-  single-threaded glibc locking).
+  Linux programs — including glibc-dynamic ones such as CPython 3.16 — run in ring 3
+  (`lxrun`). Process syscalls `fork`/`clone`/`execve`, `wait4`, `epoll`/`eventfd`, and
+  `futex` are supported at a basic level; signals are not delivered, but `tgkill` with a
+  fatal signal terminates the process cleanly.
 - **Packages (apt).** `apt` fetches a Debian `Packages` index and parses it incrementally
   from a streaming gzip/xz/zstd decompressor into a **compact byte-arena index** — one
   growable byte arena plus `(offset,len)` references and integer-keyed sorted lookup tables,
