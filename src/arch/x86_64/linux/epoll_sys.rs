@@ -183,6 +183,8 @@ fn poll_fd(fd: i32, events: u32) -> u32 {
     let result = crate::task::compat::with_current_compat(|cs| {
         match cs.fds.get(fd as u32) {
             None => EPOLLERR,
+            // AF_INET sockets: report both directions; curl re-checks via send/recv.
+            Some(OpenObject::InetTcp(_)) | Some(OpenObject::InetUdp(_)) => EPOLLIN | EPOLLOUT,
             Some(OpenObject::Stdin) => {
                 // Report readable only when a read can actually
                 // make progress. The old always-ready answer made libuv issue
@@ -257,6 +259,8 @@ pub(super) fn dump_epoll_self(epfd: u32) {
                         Some(OpenObject::PipeRead(_)) => "pipe-r",
                         Some(OpenObject::PipeWrite(_)) => "pipe-w",
                         Some(OpenObject::Socket { .. }) => "socket",
+                        Some(OpenObject::InetTcp(_)) => "inet-tcp",
+                        Some(OpenObject::InetUdp(_)) => "inet-udp",
                         Some(OpenObject::UnixListener(_)) => "unix-listener",
                         Some(OpenObject::UnixSocketUnbound { .. }) => "unix-unbound",
                         Some(OpenObject::Eventfd { .. }) => "eventfd",

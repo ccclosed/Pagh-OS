@@ -136,6 +136,10 @@ pub const GETSOCKOPT: u64 = 55;
     pub const MKDIR: u64 = 83;
     /// `rmdir` (84) — git removes empty temp dirs during cleanup.
     pub const RMDIR: u64 = 84;
+    /// `sendto` (44) — glibc resolver DNS queries over UDP.
+    pub const SENDTO: u64 = 44;
+    /// `recvfrom` (45) — DNS replies.
+    pub const RECVFROM: u64 = 45;
     /// `unlink` (87) — git removes its `*.lock` files.
     pub const UNLINK: u64 = 87;
     /// `chmod` (90) — git chmods `.git/config.lock` during init.
@@ -288,6 +292,8 @@ pub fn is_supported(nr: u64) -> bool {
             | nr::FCHDIR
             | nr::READLINK
             | nr::MKDIR
+            | nr::SENDTO
+            | nr::RECVFROM
             | nr::RMDIR
             | nr::UNLINK
             | nr::CHMOD
@@ -369,7 +375,7 @@ mod tests {
     fn supported_set_is_exact() {
         let supported = [
             0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 20, 21, 22, 24, 28, 32, 33, 35,
-            39, 60, 63, 72, 79, 80, 81, 84, 87, 89, 90, 96, 97, 99, 102, 104, 107, 108, 110, 131,
+            39, 44, 45, 60, 63, 72, 79, 80, 81, 84, 87, 89, 90, 96, 97, 99, 102, 104, 107, 108, 110, 131,
             137, 138,
             158, 186, 201, 202, 217, 218, 228, 230, 231, 257, 262, 267, 273, 292, 293, 302, 318,
             334,

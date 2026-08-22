@@ -27,6 +27,20 @@ pub enum Errno {
     ECHILD = 10,
     /// Resource temporarily unavailable (including unavailable secure entropy).
     EAGAIN = 11,
+    /// Socket operation on non-socket.
+    ENOTSOCK = 88,
+    /// Address family not supported by protocol (AF_INET6 etc.).
+    EAFNOSUPPORT = 97,
+    /// Network is unreachable.
+    ENETUNREACH = 101,
+    /// Connection already in progress (non-blocking connect).
+    EINPROGRESS = 115,
+    /// Transport endpoint is not connected.
+    ENOTCONN = 107,
+    /// Connection refused.
+    ECONNREFUSED = 111,
+    /// Socket is already connected.
+    EISCONN = 106,
     /// Bad file descriptor.
     EBADF = 9,
     /// Cannot allocate memory.

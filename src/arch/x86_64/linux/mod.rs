@@ -28,6 +28,7 @@ pub mod validate;
 // VMM/PMM, VFS, scheduler, and per-process compat state. Keeping the effectful
 // handlers here — rather than in the host-included `io.rs`/`mem.rs` — is what lets
 // those pure planners stay host-testable (R11.6).
+pub mod inet_sock;
 pub mod io_sys;
 pub mod epoll_sys;
 pub mod mem_sys;
@@ -130,15 +131,81 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::SOCKETPAIR => io_sys::sys_socketpair(a[0], a[1], a[2], a[3]),
         sysno::STATX => io_sys::sys_statx(a[0], a[1], a[2], a[3], a[4]),
         sysno::EPOLL_PWAIT => epoll_sys::sys_epoll_pwait(a[0], a[1], a[2], a[3], a[4]),
-        sysno::SOCKET => unix_sock::sys_socket(a[0], a[1], a[2]),
-        sysno::CONNECT => unix_sock::sys_connect(a[0], a[1], a[2]),
+        sysno::SOCKET => {
+            if a[0] == crate::arch::x86_64::linux::inet_sock::AF_INET {
+                crate::arch::x86_64::linux::inet_sock::sys_socket_in(a[0], a[1])
+            } else {
+                unix_sock::sys_socket(a[0], a[1], a[2])
+            }
+        }
+        sysno::CONNECT => {
+            // Peek the sockaddr family to pick the stack (AF_UNIX registry vs AF_INET smoltcp).
+            let fam = if a[1] != 0 && a[2] >= 2 {
+                (unsafe { core::ptr::read_unaligned(a[1] as *const u16) }) as u64
+            } else { 1 };
+            if fam == crate::arch::x86_64::linux::inet_sock::AF_INET {
+                crate::arch::x86_64::linux::inet_sock::sys_connect_tcp(a[0], a[1], a[2])
+            } else {
+                unix_sock::sys_connect(a[0], a[1], a[2])
+            }
+        }
+        sysno::SENDTO => {
+            let fam = if a[4] != 0 && a[5] >= 8 {
+                (unsafe { core::ptr::read_unaligned(a[4] as *const u16) }) as u64
+            } else { 1 };
+            if fam == crate::arch::x86_64::linux::inet_sock::AF_INET {
+                check_user_ptr(a[1], a[2].min(1 << 20))?;
+                let data = crate::arch::x86_64::linux::io_sys::copy_in_pub(a[1], a[2]);
+                let n = crate::arch::x86_64::linux::inet_sock::udp_sendto_fd(a[0], &data, a[4], a[5])?;
+                Ok(n as u64)
+            } else {
+                Err(Errno::EINVAL)
+            }
+        }
+        sysno::RECVFROM => {
+            // Route by fd type: AF_INET UDP sockets come here (glibc resolver).
+            let is_inet_udp = crate::task::compat::with_current_compat(|cs| {
+                matches!(cs.fds.get(a[0] as u32),
+                    Some(crate::task::fd::OpenObject::InetUdp(_)))
+            }).unwrap_or(false);
+            if !is_inet_udp {
+                return Err(Errno::EINVAL);
+            }
+            check_user_ptr(a[1], a[2].min(1 << 20))?;
+            let mut buf = alloc::vec![0u8; a[2] as usize];
+            let (n, port, octets) =
+                crate::arch::x86_64::linux::inet_sock::udp_recvfrom_fd(a[0], &mut buf)?;
+            crate::arch::x86_64::linux::io_sys::copy_out_pub(a[1], &buf[..n]);
+            if a[4] != 0 && a[5] != 0 {
+                // struct sockaddr_in { family=AF_INET(2), port(be16), addr, zero }
+                let mut sa = [0u8; 16];
+                sa[0..2].copy_from_slice(&2u16.to_ne_bytes());
+                sa[2..4].copy_from_slice(&port.to_be_bytes());
+                sa[4..8].copy_from_slice(&octets);
+                unsafe {
+                    core::ptr::write_unaligned(a[4] as *mut [u8; 16], sa);
+                    core::ptr::write_unaligned(a[5] as *mut u32, 16);
+                }
+            }
+            Ok(n as u64)
+        }
         sysno::ACCEPT => unix_sock::sys_accept(a[0], a[1], a[2]),
         sysno::BIND => unix_sock::sys_bind(a[0], a[1], a[2]),
         sysno::LISTEN => unix_sock::sys_listen(a[0], a[1]),
         sysno::GETSOCKNAME => unix_sock::sys_getsockname(a[0], a[1], a[2]),
         sysno::ACCEPT4 => unix_sock::sys_accept4(a[0], a[1], a[2], a[3]),
         sysno::SETSOCKOPT => unix_sock::sys_setsockopt(a[0], a[1], a[2], a[3], a[4]),
-        sysno::GETSOCKOPT => unix_sock::sys_getsockopt(a[0], a[1], a[2], a[3], a[4]),
+        sysno::GETSOCKOPT => {
+            let is_inet = crate::task::compat::with_current_compat(|cs| {
+                matches!(cs.fds.get(a[0] as u32),
+                    Some(crate::task::fd::OpenObject::InetTcp(_)))
+            }).unwrap_or(false);
+            if is_inet {
+                crate::arch::x86_64::linux::inet_sock::getsockopt_in(None, a[1], a[2], a[3], a[4])
+            } else {
+                unix_sock::sys_getsockopt(a[0], a[1], a[2], a[3], a[4])
+            }
+        }
         sysno::SETSID => misc::sys_setsid(),
         sysno::SETPGID => misc::sys_setpgid(a[0], a[1]),
         sysno::GETPGRP | sysno::GETPGID => misc::sys_getpgid(),

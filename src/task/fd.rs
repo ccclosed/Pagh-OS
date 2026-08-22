@@ -82,6 +82,10 @@ impl Drop for PipeEndpoint {
 pub enum OpenObject {
     /// The kernel console (pre-bound to fds 1 and 2 for stdout/stderr).
     Console,
+    /// An AF_INET TCP socket over the smoltcp stack.
+    InetTcp(Arc<crate::arch::x86_64::linux::inet_sock::InetTcp>),
+    /// An AF_INET UDP socket over the smoltcp stack.
+    InetUdp(Arc<crate::arch::x86_64::linux::inet_sock::InetUdp>),
     /// Standard input (pre-bound to fd 0).
     Stdin,
     /// An open ext2-backed file and its current byte offset.
@@ -137,6 +141,8 @@ impl OpenObject {
         match self {
             OpenObject::Console => OpenObject::Console,
             OpenObject::Stdin => OpenObject::Stdin,
+            OpenObject::InetTcp(t) => OpenObject::InetTcp(Arc::clone(t)),
+            OpenObject::InetUdp(u) => OpenObject::InetUdp(Arc::clone(u)),
             OpenObject::PipeRead(e) => OpenObject::PipeRead(Arc::clone(e)),
             OpenObject::PipeWrite(e) => OpenObject::PipeWrite(Arc::clone(e)),
             OpenObject::File { node, offset } => OpenObject::File {
@@ -290,6 +296,8 @@ impl FdTable {
             Some(OpenObject::PipeRead(_)) => "pipe-r",
             Some(OpenObject::PipeWrite(_)) => "pipe-w",
             Some(OpenObject::Socket { .. }) => "socket",
+            Some(OpenObject::InetTcp(_)) => "inet-tcp",
+            Some(OpenObject::InetUdp(_)) => "inet-udp",
             Some(OpenObject::UnixListener(_)) => "unix-listener",
             Some(OpenObject::UnixSocketUnbound { .. }) => "unix-unbound",
             Some(OpenObject::Eventfd { .. }) => "eventfd",

@@ -59,6 +59,12 @@ pub fn seed() {
         ensure_dir("/mnt/usr/share/pagh")?;
         ensure_dir("/mnt/examples/hello/src")?;
         write_once("/mnt/etc/pagh-release", RELEASE)?;
+        // glibc's resolver reads these before any getaddrinfo call works;
+        // 10.0.2.3 is QEMU slirp's built-in DNS forwarder.
+        write_once("/mnt/etc/resolv.conf",
+            b"nameserver 10.0.2.3\noptions timeout:1 attempts:2\n")?;
+        write_once("/mnt/etc/hosts",
+            b"127.0.0.1 localhost\n::1 localhost\n");
         write_once("/mnt/etc/motd", MOTD)?;
         write_once("/mnt/home/user/README.txt", README)?;
         write_once(

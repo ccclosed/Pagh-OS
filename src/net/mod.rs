@@ -34,7 +34,8 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{dhcpv4, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr,
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address,
+    Ipv4Cidr,
 };
 
 use crate::sync::spinlock::Spinlock;
@@ -543,6 +544,124 @@ pub fn nc_echo(remote: IpEndpoint, payload: &[u8]) -> NcResult {
         NcResult::Echoed(reply)
     } else {
         NcResult::Failed
+    }
+}
+
+// ── AF_INET compat-layer primitives (Linux socket syscalls over smoltcp) ─────
+
+/// Is the TCP connection fully established?
+pub fn tcp_established(handle: SocketHandle) -> bool {
+    let mut g = NET.lock();
+    let Some(s) = g.as_mut() else { return false };
+    s.iface.poll(now(), &mut s.device, &mut s.sockets);
+    matches!(
+        s.sockets.get::<tcp::Socket>(handle).state(),
+        tcp::State::Established
+    )
+}
+
+/// Did the connection fail before ever establishing (refused/unreachable)?
+pub fn tcp_dead_before_established(handle: SocketHandle) -> bool {
+    let mut g = NET.lock();
+    let Some(s) = g.as_mut() else { return true };
+    s.sockets.get::<tcp::Socket>(handle).state() == tcp::State::Closed
+}
+
+/// Poll once and enqueue as much of `data` as fits the peer window. Returns
+/// the number of bytes accepted.
+pub fn tcp_send_chunk(handle: SocketHandle, data: &[u8]) -> usize {
+    let mut g = NET.lock();
+    let Some(s) = g.as_mut() else { return 0 };
+    s.iface.poll(now(), &mut s.device, &mut s.sockets);
+    let sock = s.sockets.get_mut::<tcp::Socket>(handle);
+    if !sock.can_send() {
+        return 0;
+    }
+    sock.send_slice(data).unwrap_or(0)
+}
+
+/// Poll once and drain received bytes into `dst`. Returns bytes copied.
+pub fn tcp_recv_chunk(handle: SocketHandle, dst: &mut [u8]) -> usize {
+    let mut g = NET.lock();
+    let Some(s) = g.as_mut() else { return 0 };
+    s.iface.poll(now(), &mut s.device, &mut s.sockets);
+    let sock = s.sockets.get_mut::<tcp::Socket>(handle);
+    if !sock.can_recv() {
+        return 0;
+    }
+    sock.recv_slice(dst).unwrap_or(0)
+}
+
+/// Remote half closed and nothing left to read: read(2) should return 0.
+pub fn tcp_rx_at_eof(handle: SocketHandle) -> bool {
+    let mut g = NET.lock();
+    let Some(s) = g.as_mut() else { return true };
+    let sock = s.sockets.get_mut::<tcp::Socket>(handle);
+    !sock.can_recv() && !sock.may_recv()
+}
+
+/// Half-close our TX then give the close handshake a few polls and reclaim
+/// the socket set entry.
+pub fn tcp_close(handle: SocketHandle) {
+    let mut g = NET.lock();
+    let Some(s) = g.as_mut() else { return };
+    {
+        let sock = s.sockets.get_mut::<tcp::Socket>(handle);
+        sock.close();
+    }
+    for _ in 0..4 {
+        let ts = now();
+        let _ = s.iface.poll(ts, &mut s.device, &mut s.sockets);
+    }
+    s.sockets.remove(handle);
+}
+
+/// Open an UDP socket bound to an ephemeral local port on 0.0.0.0.
+pub fn udp_open() -> Result<SocketHandle, NetError> {
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(NetError::NoDevice)?;
+    let local_port = state.next_eph;
+    state.next_eph = if state.next_eph >= 65535 { 49152 } else { state.next_eph + 1 };
+    let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 4096]);
+    let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 4096]);
+    let sock = udp::Socket::new(rx, tx);
+    let handle = state.sockets.add(sock);
+    let res = state
+        .sockets
+        .get_mut::<udp::Socket>(handle)
+        .bind(IpListenEndpoint { addr: None, port: local_port });
+    if res.is_err() {
+        state.sockets.remove(handle);
+        return Err(NetError::DeviceInit);
+    }
+    Ok(handle)
+}
+
+/// Send one datagram to `remote`.
+pub fn udp_sendto(handle: SocketHandle, data: &[u8], remote: IpEndpoint) -> Result<(), NetError> {
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(NetError::NoDevice)?;
+    let res = state
+        .sockets
+        .get_mut::<udp::Socket>(handle)
+        .send_slice(data, remote);
+    let ts = now();
+    let _ = state.iface.poll(ts, &mut state.device, &mut state.sockets);
+    res.map_err(|_| NetError::DeviceInit)
+}
+
+/// Receive one datagram if available (caller drives polling between calls).
+pub fn udp_recvfrom(handle: SocketHandle, dst: &mut [u8]) -> Option<(usize, IpEndpoint)> {
+    let mut g = NET.lock();
+    let s = g.as_mut()?;
+    s.iface.poll(now(), &mut s.device, &mut s.sockets);
+    let sock = s.sockets.get_mut::<udp::Socket>(handle);
+    if !sock.can_recv() {
+        return None;
+    }
+    match sock.recv_slice(dst) {
+        Ok((c, meta)) => Some((c, meta.endpoint)),
+        Err(_) => None,
     }
 }
 

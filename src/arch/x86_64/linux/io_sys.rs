@@ -85,6 +85,10 @@ enum Resolved {
     Eventfd { val: Arc<crate::sync::spinlock::Spinlock<u64>>, semaphore: bool },
     /// An epoll instance (not directly readable/writable via read/write).
     Epoll,
+    /// AF_INET TCP over smoltcp (data path via net:: primitives).
+    InetTcp(Arc<crate::arch::x86_64::linux::inet_sock::InetTcp>),
+    /// AF_INET UDP over smoltcp.
+    InetUdp(Arc<crate::arch::x86_64::linux::inet_sock::InetUdp>),
     /// An open directory (not a byte stream): read/write/pread/pwrite are rejected.
     Dir,
 }
@@ -92,6 +96,17 @@ enum Resolved {
 /// Resolve `fd` for the current process, cloning the backing node so the caller
 /// can drop the `COMPAT_STATES` lock before doing VFS I/O. Returns `None` when the
 /// descriptor is absent/closed or the process has no compat state (→ `EBADF`).
+/// Public copy helpers for sibling modules (inet_sock dispatch glue).
+/// Populate a statx buffer describing an AF_INET socket.
+fn write_statx_sock(buf: u64) -> Result<u64, Errno> {
+    const S_IFSOCK: u32 = 0o_140000;
+    write_statx(buf, 0, S_IFSOCK | 0o755, 0);
+    Ok(0)
+}
+
+pub(crate) fn copy_in_pub(buf: u64, count: u64) -> alloc::vec::Vec<u8> { copy_in(buf, count) }
+pub(crate) fn copy_out_pub(buf: u64, data: &[u8]) { copy_out(buf, data) }
+
 /// Human-readable descriptor kind for watchdog/telemetry output.
 pub(crate) fn fd_kind(fd: u64) -> &'static str {
     match resolve_fd(fd as u32) {
@@ -99,6 +114,8 @@ pub(crate) fn fd_kind(fd: u64) -> &'static str {
         Some(Resolved::Stdin) => "stdin",
         Some(Resolved::Console) => "console",
         Some(Resolved::Dir) => "dir",
+        Some(Resolved::InetTcp(_)) => "inet-tcp",
+        Some(Resolved::InetUdp(_)) => "inet-udp",
         Some(Resolved::PipeRead(_)) => "pipe-r",
         Some(Resolved::PipeWrite(_)) => "pipe-w",
         Some(Resolved::Socket { .. }) => "sock",
@@ -123,6 +140,8 @@ fn resolve_fd(fd: u32) -> Option<Resolved> {
             OpenObject::Dir { .. } => Resolved::Dir,
             OpenObject::Eventfd { val, semaphore } => Resolved::Eventfd { val: Arc::clone(val), semaphore: *semaphore },
             // Not byte streams — same read/write/seek rejections as epoll fds.
+            OpenObject::InetTcp(t) => Resolved::InetTcp(Arc::clone(&t)),
+            OpenObject::InetUdp(u) => Resolved::InetUdp(Arc::clone(&u)),
             OpenObject::UnixListener(_) => Resolved::Epoll,
             OpenObject::UnixSocketUnbound { .. } => Resolved::Epoll,
             OpenObject::Epoll { .. } => Resolved::Epoll,
@@ -291,6 +310,13 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             }
         }
         Some(Resolved::Epoll) => Err(Errno::EINVAL),
+        Some(Resolved::InetTcp(t)) => {
+            let mut data = vec![0u8; count as usize];
+            let n = crate::arch::x86_64::linux::inet_sock::tcp_read(fd, &mut data)?;
+            copy_out(buf, &data[..n]);
+            return Ok(n as u64);
+        }
+        Some(Resolved::InetUdp(_)) => Err(Errno::ENOTCONN), // recvfrom only
         Some(Resolved::PipeRead(e)) => { let mut data=vec![0u8;count as usize];let n=read_pipe(&e,&mut data)?;
             if n>0{crate::warn!("[DIAG] pipe-read pid={} fd={} n={}", crate::task::scheduler::current_pid(), fd, n);}
             copy_out(buf,&data[..n]);Ok(n as u64) }
@@ -346,6 +372,12 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         }
         Some(Resolved::Epoll) => Err(Errno::EINVAL),
         Some(Resolved::PipeRead(_)) => Err(Errno::EBADF),
+        Some(Resolved::InetTcp(_)) => {
+            let data = copy_in(buf, count);
+            let n = crate::arch::x86_64::linux::inet_sock::tcp_write(fd, &data)?;
+            Ok(n as u64)
+        }
+        Some(Resolved::InetUdp(_)) => Err(Errno::ENOTCONN), // sendto only
         Some(Resolved::PipeWrite(e)) => {let data=copy_in(buf,count);
             crate::warn!("[DIAG] pipe-write pid={} fd={} len={} head={:?}", crate::task::scheduler::current_pid(), fd, count, String::from_utf8_lossy(&data[..data.len().min(32)]));
             Ok(write_pipe(&e,&data)? as u64)}
@@ -384,6 +416,19 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
     let target = resolve_fd(fd as u32).ok_or(Errno::EBADF)?;
     if matches!(target, Resolved::Stdin) {
         return Err(Errno::EBADF);
+    }
+    if matches!(target, Resolved::InetTcp(_)) {
+        // gather-write straight into the TCP socket
+        for i in 0..iovcnt {
+            let entry = iov + i * 16;
+            let base = unsafe { *(entry as *const u64) };
+            let len = unsafe { *((entry + 8) as *const u64) };
+            if len == 0 { continue; }
+            check_user_ptr(base, len)?;
+            let data = copy_in(base, len);
+            crate::arch::x86_64::linux::inet_sock::tcp_write(fd, &data)?;
+        }
+        return Ok(0);
     }
     if matches!(target, Resolved::Dir) { return Err(Errno::EISDIR); }
     if matches!(target, Resolved::Eventfd { .. } | Resolved::Epoll) { return Err(Errno::EINVAL); }
@@ -664,6 +709,9 @@ pub fn sys_openat(dirfd: u64, path: u64, flags: u64, _mode: u64) -> Result<u64, 
 
 /// `close` (3): release the descriptor, or `EBADF` if it is not open (R2.6, R2.14).
 pub fn sys_close(fd: u64) -> Result<u64, Errno> {
+    if fd_kind(fd) == "inet-tcp" {
+        crate::arch::x86_64::linux::inet_sock::tcp_close_fd(fd);
+    }
     let kind = fd_kind(fd);
     if kind.starts_with("pipe") {
         crate::warn!(
@@ -687,6 +735,7 @@ pub fn sys_close(fd: u64) -> Result<u64, Errno> {
 pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> Result<u64, Errno> {
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
+        Some(Resolved::InetTcp(_)) | Some(Resolved::InetUdp(_)) => Err(Errno::ESPIPE),
         // The console is not seekable — ESPIPE, like a
         // pipe. CPython probes lseek on fds 0/1/2 at startup to decide
         // buffering; EINVAL spammed the diag log three times per start.
@@ -773,6 +822,10 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> Result<u64, Errno> {
     check_user_ptr(statbuf, core::mem::size_of::<LinuxStat>() as u64)?;
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
+        Some(Resolved::InetTcp(_)) | Some(Resolved::InetUdp(_)) => {
+            // S_IFSOCK with 0644-ish mode; libuv only asks for the type.
+            write_statx_sock(statbuf)
+        }
         Some(Resolved::Socket { .. }) => {
             // Socketpair ends report S_IFSOCK — libuv's
             // uv_guess_handle checks the fd type of stdio descriptors.
@@ -1717,6 +1770,7 @@ pub fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Er
         Some(Resolved::Console) | Some(Resolved::Stdin)
         | Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_))
         | Some(Resolved::Socket { .. })
+        | Some(Resolved::InetTcp(_)) | Some(Resolved::InetUdp(_))
         | Some(Resolved::Eventfd { .. }) | Some(Resolved::Epoll) => Err(Errno::ESPIPE),
         Some(Resolved::Dir) => Err(Errno::EISDIR),
         Some(Resolved::File { node, .. }) => {
@@ -1759,6 +1813,7 @@ pub fn sys_pwrite64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, E
         Some(Resolved::Stdin) => Err(Errno::ESPIPE),
         Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_)) => Err(Errno::ESPIPE),
         Some(Resolved::Socket { .. }) => Err(Errno::ESPIPE),
+        Some(Resolved::InetTcp(_)) | Some(Resolved::InetUdp(_)) => Err(Errno::ESPIPE),
         Some(Resolved::Eventfd { .. }) | Some(Resolved::Epoll) => Err(Errno::ESPIPE),
         Some(Resolved::Dir) => Err(Errno::EISDIR),
         Some(Resolved::Console) => {
@@ -1855,7 +1910,14 @@ const O_NONBLOCK:u64=0x800; const O_CLOEXEC:u64=0x80000;
 const POLLIN:i16=0x001; const POLLOUT:i16=0x004; const POLLERR:i16=0x008; const POLLHUP:i16=0x010; const POLLNVAL:i16=0x020;
 pub fn sys_pipe(pipefd:u64)->Result<u64,Errno>{sys_pipe2(pipefd,0)}
 pub fn sys_pipe2(pipefd:u64,flags:u64)->Result<u64,Errno>{if flags&!(O_NONBLOCK|O_CLOEXEC)!=0{return Err(Errno::EINVAL)}check_user_ptr(pipefd,8)?;let pair=compat::with_current_compat(|cs|{let p=cs.fds.pipe(flags&O_NONBLOCK!=0);if flags&O_CLOEXEC!=0{cs.fds.set_cloexec(p.0,true);cs.fds.set_cloexec(p.1,true);}p}).ok_or(Errno::EBADF)?;crate::warn!("[DIAG] pipe pid={} -> r={} w={}", crate::task::scheduler::current_pid(), pair.0, pair.1);let words=[pair.0,pair.1];let bytes=unsafe{core::slice::from_raw_parts(words.as_ptr()as*const u8,8)};copy_out(pipefd,bytes);Ok(0)}
-fn poll_revents(fd:i32,events:i16)->i16{if fd<0{return 0}match resolve_fd(fd as u32){None=>POLLNVAL,Some(Resolved::PipeRead(e))=>{let mut o=if e.read_ready(){events&POLLIN}else{0};if e.peer_closed(){o|=POLLHUP}o},Some(Resolved::PipeWrite(e))=>{let mut o=if e.write_ready(){events&POLLOUT}else{0};if e.peer_closed(){o|=POLLERR}o},Some(Resolved::Socket{rx,tx})=>{let mut o=0i16;if rx.read_ready(){o|=events&POLLIN}if tx.write_ready(){o|=events&POLLOUT}if rx.peer_closed(){o|=POLLHUP}o},Some(Resolved::Stdin)=>{if stdin_input_available(){events&POLLIN}else{0}},Some(Resolved::Console)=>events&POLLOUT,Some(Resolved::Eventfd{val,..})=>{let v=val.lock();if*v>0{events&POLLIN}else{0}},Some(Resolved::Epoll)=>0,Some(Resolved::File{..})|Some(Resolved::Dir)=>events&(POLLIN|POLLOUT)}}
+fn poll_revents(fd:i32,events:i16)->i16{if fd<0{return 0}match resolve_fd(fd as u32){
+None=>POLLNVAL,
+Some(Resolved::InetTcp(_))=>{
+    // Conservative: a connected socket is always reported writable and
+    // readable-if-data; curl's event loop re-checks via recv/send anyway.
+    events&(POLLIN|POLLOUT)
+}
+Some(Resolved::InetUdp(_))=>events&(POLLIN|POLLOUT),Some(Resolved::PipeRead(e))=>{let mut o=if e.read_ready(){events&POLLIN}else{0};if e.peer_closed(){o|=POLLHUP}o},Some(Resolved::PipeWrite(e))=>{let mut o=if e.write_ready(){events&POLLOUT}else{0};if e.peer_closed(){o|=POLLERR}o},Some(Resolved::Socket{rx,tx})=>{let mut o=0i16;if rx.read_ready(){o|=events&POLLIN}if tx.write_ready(){o|=events&POLLOUT}if rx.peer_closed(){o|=POLLHUP}o},Some(Resolved::Stdin)=>{if stdin_input_available(){events&POLLIN}else{0}},Some(Resolved::Console)=>events&POLLOUT,Some(Resolved::Eventfd{val,..})=>{let v=val.lock();if*v>0{events&POLLIN}else{0}},Some(Resolved::Epoll)=>0,Some(Resolved::File{..})|Some(Resolved::Dir)=>events&(POLLIN|POLLOUT)}}
 pub fn sys_poll(fds:u64,nfds:u64,timeout:u64)->Result<u64,Errno>{const SZ:u64=8;if nfds>1024{return Err(Errno::EINVAL)}check_user_ptr(fds,nfds.checked_mul(SZ).ok_or(Errno::EINVAL)?)?;let ms=timeout as i64;let deadline=if ms<0{None}else{Some(crate::task::scheduler::ticks().saturating_add((ms as u64).saturating_add(9)/10))};loop{let mut ready=0;for i in 0..nfds{let p=fds+i*SZ;let fd=unsafe{*(p as*const i32)};let ev=unsafe{*((p+4)as*const i16)};let rev=poll_revents(fd,ev);unsafe{*((p+6)as*mut i16)=rev}if rev!=0{ready+=1}}if ready!=0||ms==0{return Ok(ready)}if let Some(end)=deadline{if crate::task::scheduler::ticks()>=end{return Ok(0)}}crate::task::scheduler::yield_current()}}
 
 // ---------------------------------------------------------------------------
@@ -1871,6 +1933,7 @@ const FDSET_WORDS: usize = 16; // 1024 fds, matching FD_SETSIZE
 fn select_ready(fd: u64, want_write: bool) -> bool {
     match resolve_fd(fd as u32) {
         None => true, // report ready; the following operation returns EBADF
+        Some(Resolved::InetTcp(_)) | Some(Resolved::InetUdp(_)) => true,
         Some(Resolved::Stdin) => !want_write,
         Some(Resolved::Console) => true,
         Some(Resolved::PipeRead(e)) => !want_write && (e.read_ready() || e.peer_closed()),
