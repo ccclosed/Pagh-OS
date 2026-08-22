@@ -256,6 +256,10 @@ pub fn udp_connect_fd(fd: u64, addr: u64, len: u64) -> Result<u64, Errno> {
 pub fn udp_write_fd(fd: u64, data: &[u8]) -> Result<usize, Errno> {
     let sock = udp_sock(fd)?;
     let peer = sock.peer.lock().ok_or(Errno::ENOTCONN)?;
+    crate::warn!(
+        "[DIAG] udp write(fd) fd={} -> {:?} len={}",
+        fd, peer, data.len()
+    );
     net::udp_sendto(sock.handle, data, peer).map(|_| data.len()).map_err(|_| Errno::EIO)
 }
 
@@ -275,6 +279,10 @@ fn udp_sock(fd: u64) -> Result<Arc<InetUdp>, Errno> {
 pub fn udp_sendto_fd(fd: u64, data: &[u8], addr: u64, len: u64) -> Result<usize, Errno> {
     let sock = udp_sock(fd)?;
     let (port, octets) = parse_sockaddr_in(addr, len)?;
+    crate::warn!(
+        "[DIAG] udp sendto(fd) fd={} {}.{}.{}.{}:{} len={}",
+        fd, octets[0], octets[1], octets[2], octets[3], port, data.len()
+    );
     crate::warn!("[DIAG] udp sendto fd={} len={} port={}", fd, data.len(), port);
     net::udp_sendto(sock.handle, data, endpoint(port, octets))
         .map(|_| data.len())
@@ -287,7 +295,10 @@ pub fn udp_recvfrom_fd(
     dst: &mut [u8],
 ) -> Result<(usize, u16, [u8; 4]), Errno> {
     let sock = udp_sock(fd)?;
-    crate::warn!("[DIAG] udp recvfrom fd={} ...", fd);
+    static RECV_LOGGED: AtomicU32 = AtomicU32::new(0);
+    if RECV_LOGGED.fetch_or(1 << (fd.min(31)), Ordering::Relaxed) & (1 << (fd.min(31))) == 0 {
+        crate::warn!("[DIAG] udp recvfrom fd={} blocking (first)", fd);
+    }
     let deadline_spins: u32 = 5000;
     let mut spins = 0u32;
     loop {

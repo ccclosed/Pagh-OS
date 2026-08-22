@@ -647,6 +647,10 @@ pub fn udp_sendto(handle: SocketHandle, data: &[u8], remote: IpEndpoint) -> Resu
         .send_slice(data, remote);
     let ts = now();
     let _ = state.iface.poll(ts, &mut state.device, &mut state.sockets);
+    crate::warn!(
+        "[DIAG] net::udp_sendto {}:{} len={} ok={}",
+        remote.addr, remote.port, data.len(), res.is_ok()
+    );
     res.map_err(|_| NetError::DeviceInit)
 }
 
