@@ -634,6 +634,7 @@ pub fn udp_open() -> Result<SocketHandle, NetError> {
         state.sockets.remove(handle);
         return Err(NetError::DeviceInit);
     }
+    crate::warn!("[DIAG] net::udp_open bound :{}", local_port);
     Ok(handle)
 }
 
@@ -661,11 +662,27 @@ pub fn udp_recvfrom(handle: SocketHandle, dst: &mut [u8]) -> Option<(usize, IpEn
     s.iface.poll(now(), &mut s.device, &mut s.sockets);
     let sock = s.sockets.get_mut::<udp::Socket>(handle);
     if !sock.can_recv() {
+        static W: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if W.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 64 == 0 {
+            crate::warn!(
+                "[DIAG] net::udp_recvfrom h={:?}: not yet (rx_queue?={}, last poll saw frames above)",
+                handle, "?"
+            );
+        }
         return None;
     }
     match sock.recv_slice(dst) {
-        Ok((c, meta)) => Some((c, meta.endpoint)),
-        Err(_) => None,
+        Ok((c, meta)) => {
+            crate::warn!(
+                "[DIAG] net::udp_recvfrom h={:?}: GOT {} bytes from {:?}",
+                handle, c, meta.endpoint
+            );
+            Some((c, meta.endpoint))
+        }
+        Err(e) => {
+            crate::warn!("[DIAG] net::udp_recvfrom h={:?}: recv err {:?}", handle, e);
+            None
+        }
     }
 }
 
