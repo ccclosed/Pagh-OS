@@ -77,7 +77,7 @@ serial_*.txt
 # --- Python bytecode cache (tools/) ---
 __pycache__/
 *.pyc
-
+pagh_mcp.py
 # Linux QEMU writable OVMF variables
 /.cache/
 
