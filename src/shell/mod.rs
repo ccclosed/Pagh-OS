@@ -219,6 +219,34 @@ fn apply_completion(
 /// Prints the welcome banner once (R10.1–R10.3), then runs one `LineEditor` per
 /// prompt. A single `Decoder` and `History` persist across the whole session so
 /// Shift/extended-prefix state and recall survive between prompts.
+/// Execute the first line of `/mnt/etc/autorun` (if present) as a shell
+/// command, before the interactive loop starts. Bounded at 512 bytes; a
+/// missing file is silent.
+fn run_autorun() {
+    const MAX: u64 = 512;
+    let node = match crate::vfs::lookup_path("/mnt/etc/autorun") {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+    let mut buf = alloc::vec![0u8; MAX as usize];
+    match node.read(0, &mut buf) {
+        Ok(n) if n > 0 => {
+            let line = core::str::from_utf8(&buf[..n])
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !line.is_empty() {
+                crate::kprintln!("[autorun] {}", line);
+                execute_command(&line);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn shell_main() -> ! {
     // Welcome banner — named OS + `help` hint, on both consoles, before the
     // first prompt with no perceptible delay (R10.1, R10.2, R10.3).
@@ -235,6 +263,12 @@ pub fn shell_main() -> ! {
     crate::fb_println!("========================================");
     crate::fb_println!("Type 'help' for available commands");
     crate::fb_println!();
+
+    // Optional one-shot autorun: if `/mnt/etc/autorun` exists, its first line
+    // is executed exactly like a typed command (a poor man's rc.local — handy
+    // for repro test commands like `lxrun ... git clone ...`). Delete the
+    // file to disable.
+    run_autorun();
 
     // Session-long state: the decoder keeps Shift/0xE0-prefix state across
     // prompts; history accumulates recalled lines.
