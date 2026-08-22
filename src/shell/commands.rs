@@ -1124,19 +1124,27 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
             // (its stdin reads the PS/2 stream directly), so resuming the
             // prompt immediately would make the shell steal every keystroke.
             //
-            // Ctrl+C terminates the child — except when the child runs its
-            // stdin in raw mode (nvim et al. bind ^C as an ordinary key).
+            // Ctrl+C ALWAYS terminates the child now: the latch is set at the
+            // PS/2 driver level, so it reflects real user intent at the
+            // keyboard even when a program never decodes modifiers itself.
+            // (Trade-off: full-screen programs lose ^C as an input key.)
             use core::sync::atomic::Ordering;
             crate::shell::keys::CTRL_C_LATCH.store(false, Ordering::Relaxed);
             crate::drivers::ps2_kbd::CTRL_C.store(false, Ordering::Relaxed);
+            crate::warn!("[DIAG] fg: watching pid={}", pid);
+            let mut heartbeats: u64 = 0;
             while crate::task::compat::compat_exists(pid) {
                 let pressed = crate::shell::keys::CTRL_C_LATCH.swap(false, Ordering::Relaxed)
                     | crate::drivers::ps2_kbd::CTRL_C.swap(false, Ordering::Relaxed);
-                if pressed && !crate::task::compat::compat_is_raw(pid)
-                {
+                if pressed {
+                    crate::warn!("[DIAG] fg: ^C -> exit pid={}", pid);
                     shell_println("^C");
                     crate::task::scheduler::request_exit(pid);
                     break;
+                }
+                heartbeats += 1;
+                if heartbeats % 20000 == 0 {
+                    crate::warn!("[DIAG] fg: still waiting pid={}", pid);
                 }
                 crate::task::scheduler::yield_current();
             }

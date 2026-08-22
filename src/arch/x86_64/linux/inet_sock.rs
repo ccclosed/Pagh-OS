@@ -79,6 +79,12 @@ pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
     if base != SOCK_STREAM && base != SOCK_DGRAM {
         return Err(Errno::EINVAL);
     }
+    crate::warn!(
+        "[DIAG] inet socket domain={} type={} -> {}",
+        domain,
+        ty,
+        if base == SOCK_STREAM { "tcp" } else { "udp" }
+    );
     let nonblocking = ty & SOCK_NONBLOCK != 0;
     let cloexec = ty & SOCK_CLOEXEC != 0;
     compat::with_current_compat(|cs| match base {
@@ -111,6 +117,10 @@ pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
 /// `connect` on an AF_INET TCP fd.
 pub fn sys_connect_tcp(fd: u64, addr: u64, len: u64) -> Result<u64, Errno> {
     let (port, octets) = parse_sockaddr_in(addr, len)?;
+    crate::warn!(
+        "[DIAG] inet connect fd={} -> {}.{}.{}.{}:{}",
+        fd, octets[0], octets[1], octets[2], octets[3], port
+    );
     let remote = endpoint(port, octets);
     let (sock, nonblocking) = compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
         Some(OpenObject::InetTcp(t)) => Some((Arc::clone(&t), t.nonblocking.load(Ordering::Relaxed))),
@@ -245,6 +255,7 @@ fn udp_sock(fd: u64) -> Result<Arc<InetUdp>, Errno> {
 pub fn udp_sendto_fd(fd: u64, data: &[u8], addr: u64, len: u64) -> Result<usize, Errno> {
     let sock = udp_sock(fd)?;
     let (port, octets) = parse_sockaddr_in(addr, len)?;
+    crate::warn!("[DIAG] udp sendto fd={} len={} port={}", fd, data.len(), port);
     net::udp_sendto(sock.handle, data, endpoint(port, octets))
         .map(|_| data.len())
         .map_err(|_| Errno::EIO)
@@ -256,6 +267,7 @@ pub fn udp_recvfrom_fd(
     dst: &mut [u8],
 ) -> Result<(usize, u16, [u8; 4]), Errno> {
     let sock = udp_sock(fd)?;
+    crate::warn!("[DIAG] udp recvfrom fd={} ...", fd);
     let deadline_spins: u32 = 5000;
     let mut spins = 0u32;
     loop {
