@@ -75,7 +75,12 @@ pub const GETSOCKOPT: u64 = 55;
     pub const RENAME: u64 = 82;
     pub const RENAMEAT: u64 = 264;
     pub const RENAMEAT2: u64 = 316;
-    pub const CLOCK_GETRES: u64 = 229;
+    /// NOTE: real x86_64 numbers — clock_settime=228, clock_gettime=229,
+    /// clock_getres=230, clock_nanosleep=231. These were off by one until
+    /// OpenSSL/curl's clock probes flooded EINVAL diagnostics.
+    pub const CLOCK_SETTIME: u64 = 228;
+    pub const CLOCK_GETTIME: u64 = 229;
+    pub const CLOCK_GETRES: u64 = 230;
     /// `lseek` — reposition a descriptor's offset.
     pub const LSEEK: u64 = 8;
     /// `mmap` — map memory.
@@ -178,9 +183,8 @@ pub const GETSOCKOPT: u64 = 55;
     /// `set_tid_address` — set pointer to thread id.
     pub const SET_TID_ADDRESS: u64 = 218;
     /// `clock_gettime` — read a POSIX clock.
-    pub const CLOCK_GETTIME: u64 = 228;
     /// `clock_nanosleep` — high-resolution sleep against a clock.
-    pub const CLOCK_NANOSLEEP: u64 = 230;
+    pub const CLOCK_NANOSLEEP: u64 = 231;
     /// `exit_group` — terminate the calling task (thread-group form).
     pub const EXIT_GROUP: u64 = 231;
     /// `openat` — open relative to a directory fd.
@@ -313,6 +317,7 @@ pub fn is_supported(nr: u64) -> bool {
             | nr::FUTEX
             | nr::GETDENTS64
             | nr::SET_TID_ADDRESS
+            | nr::CLOCK_SETTIME
             | nr::CLOCK_GETRES
             | nr::CLOCK_GETTIME
             | nr::CLOCK_NANOSLEEP
@@ -377,7 +382,7 @@ mod tests {
             0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 20, 21, 22, 24, 28, 32, 33, 35,
             39, 44, 45, 60, 63, 72, 79, 80, 81, 84, 87, 89, 90, 96, 97, 99, 102, 104, 107, 108, 110, 131,
             137, 138,
-            158, 186, 201, 202, 217, 218, 228, 230, 231, 257, 262, 267, 273, 292, 293, 302, 318,
+            158, 186, 201, 202, 217, 218, 228, 229, 230, 231, 257, 262, 267, 273, 292, 293, 302, 318,
             334,
         ];
         for nr in supported {

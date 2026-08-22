@@ -1128,9 +1128,11 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
             // stdin in raw mode (nvim et al. bind ^C as an ordinary key).
             use core::sync::atomic::Ordering;
             crate::shell::keys::CTRL_C_LATCH.store(false, Ordering::Relaxed);
+            crate::drivers::ps2_kbd::CTRL_C.store(false, Ordering::Relaxed);
             while crate::task::compat::compat_exists(pid) {
-                if crate::shell::keys::CTRL_C_LATCH.swap(false, Ordering::Relaxed)
-                    && !crate::task::compat::compat_is_raw(pid)
+                let pressed = crate::shell::keys::CTRL_C_LATCH.swap(false, Ordering::Relaxed)
+                    | crate::drivers::ps2_kbd::CTRL_C.swap(false, Ordering::Relaxed);
+                if pressed && !crate::task::compat::compat_is_raw(pid)
                 {
                     shell_println("^C");
                     crate::task::scheduler::request_exit(pid);

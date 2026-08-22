@@ -75,12 +75,40 @@ pub fn init() {
 }
 
 /// IRQ1 handler — reads scancode from port 0x60.
+/// Set when the driver-level tracker sees Ctrl+C make, regardless of which
+/// consumer later reads the scancode (shell editor OR a compat process's
+/// stdin). The `lxrun` foreground wait polls this to terminate the child.
+pub static CTRL_C: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// Driver-level modifier state (set-1): LCtrl 0x1D/0x9D, RCtrl E0 1D/E0 9D,
+// C = 0x2E. Tracked here so ^C detection cannot be starved by a program
+// that never decodes modifiers itself.
+static DRV_CTRL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static DRV_EXTENDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 pub fn irq_handler() {
     // SAFETY: Reading from port 0x60 is standard PS/2 data port access.
     let scancode: u8 = unsafe {
         let mut port = x86_64::instructions::port::Port::new(0x60);
         port.read()
     };
+
+    // ── ^C tracking (make/break, E0-aware) ──
+    use core::sync::atomic::Ordering;
+    if scancode == 0xE0 {
+        DRV_EXTENDED.store(true, Ordering::Relaxed);
+    } else {
+        let extended = DRV_EXTENDED.swap(false, Ordering::Relaxed);
+        let make = scancode & 0x80 == 0;
+        match (extended, scancode) {
+            (false, 0x1D) => DRV_CTRL.store(make, Ordering::Relaxed),
+            (true, 0x1D) => DRV_CTRL.store(make, Ordering::Relaxed),
+            (false, 0x2E) if make && DRV_CTRL.load(Ordering::Relaxed) => {
+                CTRL_C.store(true, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
 
     if let Some(ref kbd) = *KEYBOARD.lock() {
         kbd.push_scancode(scancode);
