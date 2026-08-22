@@ -123,8 +123,16 @@ pub(super) fn cmd_echo(_ctx: &mut ShellCtx, args: &[&str]) {
 /// `uptime`: print the scheduler tick count and an approximate seconds value.
 pub(super) fn cmd_uptime(_ctx: &mut ShellCtx, _args: &[&str]) {
     let ticks = crate::task::scheduler::ticks();
-    crate::kprintln!("Ticks: {} (~{} sec)", ticks, ticks / 100);
-    crate::fb_println!("Ticks: {} (~{} sec)", ticks, ticks / 100);
+    crate::kprintln!(
+            "Ticks: {} (~{} sec)",
+            ticks,
+            ticks / crate::arch::x86_64::apic::TICK_HZ
+        );
+    crate::fb_println!(
+            "Ticks: {} (~{} sec)",
+            ticks,
+            ticks / crate::arch::x86_64::apic::TICK_HZ
+        );
 }
 
 /// `pwd` (R4.2): print the absolute current working directory.
@@ -769,7 +777,9 @@ pub(super) fn cmd_sleep(_ctx: &mut ShellCtx, args: &[&str]) {
         return;
     }
     match args[0].parse::<u64>() {
-        Ok(secs) => crate::task::scheduler::sleep_ticks(secs * 100),
+        Ok(secs) => crate::task::scheduler::sleep_ticks(
+            secs * crate::arch::x86_64::apic::TICK_HZ,
+        ),
         Err(_) => shell_println(&alloc::format!("sleep: invalid number '{}'", args[0])),
     }
 }

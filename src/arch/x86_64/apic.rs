@@ -121,7 +121,8 @@ fn init_lapic() {
         );
 
         lapic_write(LAPIC_TIMER_DIV, 3); // Divide by 16
-        lapic_write(LAPIC_TIMER_INIT, 625_000); // Initial count for ~100Hz
+        let init_count = APIC_TIMER_BASE_HZ / (APIC_TIMER_DIVIDER * TICK_HZ);
+        lapic_write(LAPIC_TIMER_INIT, init_count as u32);
 
         let timer_cfg = 32 | (1 << 17); // Vector 32, periodic mode
         lapic_write(LAPIC_LVT_TIMER, timer_cfg);
@@ -136,7 +137,24 @@ fn init_lapic() {
 
         lapic_write(LAPIC_EOI, 0);
     }
-    crate::debug!("LAPIC fully configured (vector 32, 100 Hz)");
+    crate::debug!("LAPIC fully configured (vector 32, {} Hz)", TICK_HZ);
+}
+
+/// Scheduler timer tick rate (the LAPIC periodic timer). Every conversion
+/// between ticks and real time in the kernel derives from this constant:
+/// `clock_gettime`/`times` granularity, smoltcp's monotonic clock, and the
+/// tick-denominated network timeouts.
+pub const TICK_HZ: u64 = 350;
+
+/// Platform bus clock driving the LAPIC timer under QEMU (`-cpu max`: 1 GHz).
+const APIC_TIMER_BASE_HZ: u64 = 1_000_000_000;
+
+/// LAPIC timer divider configured in `init_apic` (write value 3 = divide by 16).
+const APIC_TIMER_DIVIDER: u64 = 16;
+
+/// Convert milliseconds to scheduler ticks, rounding up.
+pub const fn ms_to_ticks(ms: u64) -> u64 {
+    (ms * TICK_HZ + 999) / 1000
 }
 
 fn init_ioapic() {

@@ -61,14 +61,14 @@ pub enum FetchError {
 /// A successfully downloaded `.deb` image.
 pub struct DebBytes(pub Vec<u8>);
 
-/// Connect timeout in 100 Hz scheduler ticks (~3 s).
-const CONNECT_TIMEOUT_TICKS: u64 = 300;
-/// Idle read timeout in 100 Hz scheduler ticks (~15 s). This is an *inactivity*
+/// Connect timeout (~3 s).
+const CONNECT_TIMEOUT_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(3_000);
+/// Idle read timeout (~15 s). This is an *inactivity*
 /// timeout: it is re-armed every time new body bytes arrive, so a large but
 /// steadily-progressing download (e.g. a multi-megabyte Debian `Packages` index
 /// over slow QEMU user-net NAT) is not killed by a fixed total-transfer
 /// deadline — only a genuine stall (no bytes for this long) aborts the fetch.
-const READ_TIMEOUT_TICKS: u64 = 1500;
+const READ_TIMEOUT_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(15_000);
 /// Hard upper bound on pump iterations, a safety net independent of the clock.
 const MAX_STEPS: u32 = 2_000_000;
 /// Upper bound on the bytes we will buffer for one response (head + body), to
@@ -352,7 +352,7 @@ pub fn http_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchError
         //     halt; continue immediately (a tiny `spin_loop` only) so we keep
         //     draining the 256 KiB receive window at full speed;
         //   * otherwise rx was empty this step (idle wait) — `sleep_ticks(1)`
-        //     HALTS the CPU until the next 100 Hz tick, letting virtio-net RX
+        //     HALTS the CPU until the next timer tick, letting virtio-net RX
         //     servicing, device IRQs, and the background `net_thread` deliver the
         //     next packets instead of being starved by a busy-spin.
         // With `sleep_ticks` the loop advances ~real time, so the established/

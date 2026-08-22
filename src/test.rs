@@ -783,7 +783,7 @@ mod scheduler_tests {
     use crate::task::scheduler::{self, Tcb};
     use alloc::vec::Vec;
 
-    /// The live ~100 Hz timer tick requeues the preempted current task into
+    /// The live LAPIC timer tick requeues the preempted current task into
     /// READY_QUEUE at arbitrary moments, so pop order is not deterministic
     /// while interrupts are open. Mask ticks and snapshot-drain the queue;
     /// `resume` restores the drained tasks in their original order.

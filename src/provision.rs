@@ -153,7 +153,7 @@ pub fn ensure_base_packages_thread() {
     let mut index_ready = crate::pkg::apt::has_index();
     if !index_ready {
         // Let boot + DHCP settle before touching the network at all.
-        crate::task::scheduler::sleep_ticks(1000); // ~10 s at 100 Hz
+        crate::task::scheduler::sleep_ticks(10 * crate::arch::x86_64::apic::TICK_HZ); // ~10 s
         let mut fatal = false;
         for attempt in 1..=6u32 {
             match crate::pkg::apt::update() {

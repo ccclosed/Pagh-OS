@@ -271,7 +271,7 @@ fn init_fs() {
 /// virtio-net NIC, builds the smoltcp interface, and enables the UDP echo
 /// service on port 7. Address acquisition (DHCP, static fallback) and packet
 /// servicing run in the net thread spawned from `kernel_main` once interrupts
-/// are enabled and the 100 Hz tick is advancing the network clock.
+/// are enabled and the LAPIC tick is advancing the network clock.
 ///
 /// If no virtio-net device is present this logs a warning and continues booting
 /// (R17.3). Networking is fully optional — boot is always preserved.
@@ -371,7 +371,7 @@ fn kernel_main() -> ! {
 
     // Spawn the networking poll thread (Task 6, R13.4). It must start once
     // scheduling is running and interrupts are enabled (below), because the
-    // smoltcp clock advances off the 100 Hz timer tick and DHCP/echo servicing
+    // smoltcp clock advances off the LAPIC timer tick and DHCP/echo servicing
     // relies on the periodic poll. If no NIC was attached, `net::poll` is a
     // cheap no-op, so spawning unconditionally is harmless.
     task::scheduler::kernel_thread_spawn(net::net_thread);

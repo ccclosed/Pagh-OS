@@ -368,7 +368,8 @@ pub(super) fn try_read_scancode() -> Option<u8> {
 /// never conflicts with command output.
 fn shell_status_bar(mouse: &crate::drivers::ps2_mouse::MouseState) {
     let cwd = path::cwd();
-    let secs = crate::task::scheduler::ticks() / 100;
+    let secs =
+        crate::task::scheduler::ticks() / crate::arch::x86_64::apic::TICK_HZ;
     let left = format!("pagh OS   {}", cwd);
     let right = format!("up {}s   mouse({},{})", secs, mouse.x, mouse.y);
     crate::drivers::framebuffer::draw_status_bar(&left, &right);

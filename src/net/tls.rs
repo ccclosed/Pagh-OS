@@ -34,7 +34,7 @@
 //!
 //!   1. [`block_on`] — a minimal executor: it polls a pinned future in a loop with
 //!      a no-op waker until it is `Ready`, spinning briefly between polls so the
-//!      100 Hz timer tick and QEMU can advance.
+//!     timer tick and QEMU can advance.
 //!   2. [`TlsTransport`] — implements [`embedded_io_async::Read`]/[`Write`] over a
 //!      smoltcp TCP [`SocketHandle`]. Each poll takes the `NET` lock, advances
 //!      smoltcp once, then drains/fills the socket. It NEVER holds the `NET` lock
@@ -73,12 +73,12 @@ use crate::{error, warn};
 /// Default HTTPS port.
 pub const HTTPS_PORT: u16 = 443;
 
-/// Connect timeout in 100 Hz scheduler ticks (~3 s), matching `http_get`.
-const CONNECT_TIMEOUT_TICKS: u64 = 300;
-/// Inactivity (idle) timeout for the TLS transport in 100 Hz ticks (~15 s). It is
+/// Connect timeout (~3 s), matching `http_get`.
+const CONNECT_TIMEOUT_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(3_000);
+/// Inactivity (idle) timeout for the TLS transport (~15 s). It is
 /// re-armed on every byte sent or received, so a slow-but-progressing handshake or
 /// download over QEMU NAT is not killed — only a genuine stall aborts.
-const TLS_IDLE_TIMEOUT_TICKS: u64 = 1500;
+const TLS_IDLE_TIMEOUT_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(15_000);
 /// TLS record buffer size. 16 KiB+ is the safe maximum for any TLS 1.3 record.
 const RECORD_BUF: usize = 16 * 1024 + 256;
 /// rx/tx smoltcp socket buffer sizes for the TLS connection.
@@ -159,7 +159,7 @@ fn noop_raw_waker() -> RawWaker {
 }
 
 /// Minimal single-future executor: poll `fut` to completion with a no-op waker,
-/// spinning briefly between `Pending` polls so the 100 Hz timer tick and QEMU can
+/// spinning briefly between `Pending` polls so the timer tick and QEMU can
 /// advance. The transport adapter pumps smoltcp inside each of its own polls, so
 /// re-polling here drives the network forward; the transport's inactivity budget
 /// guarantees this loop terminates (with an error) rather than hanging on a stall.
@@ -173,7 +173,7 @@ fn block_on<F: Future>(fut: F) -> F::Output {
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(v) => return v,
             Poll::Pending => {
-                // Cooperative yield (halt until the next 100 Hz tick) instead of
+                // Cooperative yield (halt until the next timer tick) instead of
                 // a busy-spin: lets the net poll thread and timer service the
                 // device without hot dual-poller contention.
                 scheduler::sleep_ticks(1);

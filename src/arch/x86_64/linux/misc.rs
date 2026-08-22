@@ -25,10 +25,10 @@ use super::rand_clock::{getrandom_plan, ticks_to_timespec, Timespec, CLOCK_REALT
 use super::rtc;
 use super::timeconv::{encode_timeval, Timeval};
 
-/// LAPIC periodic-timer tick rate (see `arch::x86_64::apic`: ~100 Hz). Supplied to
+/// LAPIC periodic-timer tick rate (see `arch::x86_64::apic`). Supplied to
 /// the pure [`ticks_to_timespec`] so `clock_gettime` reports wall-ish time from the
 /// scheduler tick counter.
-const TICK_HZ: u64 = 100;
+use crate::arch::x86_64::apic::TICK_HZ;
 
 /// `arch_prctl` subfunction: set the `FS.base` register.
 const ARCH_SET_FS: u64 = 0x1002;
@@ -229,7 +229,7 @@ pub fn sys_tgkill(_tgid: u64, _tid: u64, sig: u64) -> Result<u64, Errno> {
 
 /// Microseconds per second.
 const USEC_PER_SEC: u64 = 1_000_000;
-/// One scheduler tick is `1/TICK_HZ` seconds = 10 ms at 100 Hz.
+/// One scheduler tick is `1/TICK_HZ` seconds (~2.9 ms at 350 Hz).
 const NS_PER_TICK: u64 = 1_000_000_000 / TICK_HZ;
 
 /// `getuid`/`geteuid`/`getgid`/`getegid` (102/107/104/108): we run root-ish, so

@@ -141,7 +141,8 @@ pub fn ticks() -> u64 {
 /// Block the calling thread for approximately `n` timer ticks, halting between
 /// ticks instead of busy-spinning so other tasks (and the CPU) are not starved.
 ///
-/// At the 100 Hz LAPIC timer this is ~`n * 10 ms`. Interrupts MUST be enabled
+/// At the current LAPIC rate ([`crate::arch::x86_64::apic::TICK_HZ`], 350 Hz)
+/// this is ~`n / TICK_HZ` seconds. Interrupts MUST be enabled
 /// on the caller (they are on the shell thread); otherwise the tick count never
 /// advances and this would block forever. The wait tolerates the (astronomical)
 /// tick-counter wraparound via `wrapping`/elapsed comparison.

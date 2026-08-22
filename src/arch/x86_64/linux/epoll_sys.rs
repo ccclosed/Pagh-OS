@@ -14,7 +14,7 @@ use crate::sync::spinlock::Spinlock;
 
 /// `clock_getres` (229): report the resolution of a clock as a `struct timespec`.
 /// We report 1 ms (= 10 000 000 ns) for all supported clocks, matching the
-/// 100 Hz LAPIC tick granularity. `EINVAL` for unknown ids, consistent with
+/// LAPIC tick granularity. `EINVAL` for unknown ids, consistent with
 /// `clock_gettime`.
 pub fn sys_clock_getres(clock_id: u64, ts_ptr: u64) -> Result<u64, Errno> {
     // Supported ids: CLOCK_REALTIME(0), CLOCK_MONOTONIC(1),
@@ -27,7 +27,7 @@ pub fn sys_clock_getres(clock_id: u64, ts_ptr: u64) -> Result<u64, Errno> {
     check_user_ptr(ts_ptr, 16)?;
     // struct timespec { tv_sec: i64, tv_nsec: i64 } — 1 ms resolution
     let sec: i64 = 0;
-    let nsec: i64 = 10_000_000; // 10 ms — one LAPIC tick
+    let nsec: i64 = (1_000_000_000 / crate::arch::x86_64::apic::TICK_HZ) as i64; // one LAPIC tick
     // SAFETY: validated above
     unsafe {
         core::ptr::write_unaligned(ts_ptr as *mut i64, sec);

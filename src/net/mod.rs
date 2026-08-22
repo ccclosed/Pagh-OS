@@ -4,7 +4,7 @@
 //! loop, and the demo echo services, layered over the `virtio-net` NIC through
 //! the [`phy::SmolDevice`] adapter. The poll loop runs in a dedicated kernel
 //! thread (`net_thread`) so heavy stack work stays out of IRQ context; the
-//! 100 Hz timer tick only advances the monotonic clock ([`now`]) consumed here.
+//! timer tick only advances the monotonic clock ([`now`]) consumed here.
 //!
 //! Bring-up sequence:
 //!   1. [`init`] enumerates PCI, attaches the NIC ([`phy::attach`]), builds the
@@ -66,16 +66,16 @@ const QEMU_DNS: Ipv4Address = Ipv4Address::new(10, 0, 2, 3);
 /// `nc_echo`/`fetch_deb`).
 const DNS_STEP_SPIN: u32 = 20_000;
 
-/// DNS resolve timeout in 100 Hz scheduler ticks (~700 ms). Bounds the wait for
+/// DNS resolve timeout (~700 ms). Bounds the wait for
 /// a response; on expiry [`resolve`] returns `None`.
-const DNS_TIMEOUT_TICKS: u64 = 70;
+const DNS_TIMEOUT_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(700);
 
 /// Hard upper bound on DNS pump iterations, independent of the clock.
 const DNS_MAX_STEPS: u32 = 20_000;
 
-/// DHCP timeout in 100 Hz ticks (~5 s). If no lease is acquired within this many
-/// ticks of the first poll, [`poll`] applies the static fallback once.
-const DHCP_TIMEOUT_TICKS: u64 = 500;
+/// DHCP timeout (~5 s). If no lease is acquired within this much
+/// time of the first poll, [`poll`] applies the static fallback once.
+const DHCP_TIMEOUT_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(5_000);
 
 /// Current IP configuration, reported by `ifconfig` (see [`ip_config`]).
 #[derive(Debug, Clone, Copy)]
@@ -118,10 +118,11 @@ struct NetState {
 
 static NET: Spinlock<Option<NetState>> = Spinlock::new(None);
 
-/// The smoltcp monotonic instant, derived from the 100 Hz tick counter as
-/// `Instant::from_millis(ticks * 10)` (R13.5).
+/// The smoltcp monotonic instant, derived from the tick counter as
+/// `Instant::from_millis(ticks * 1000 / TICK_HZ)` (R13.5).
 pub fn now() -> Instant {
-    Instant::from_millis((scheduler::ticks() * 10) as i64)
+    Instant::from_millis((scheduler::ticks() * 1000
+        / crate::arch::x86_64::apic::TICK_HZ) as i64)
 }
 
 /// Initialize the networking subsystem (R13.1).
@@ -464,7 +465,7 @@ pub fn nc_echo(remote: IpEndpoint, payload: &[u8]) -> NcResult {
     let mut done = false;
 
     // ~ up to a few thousand short steps; each step polls once and spins a
-    // little, which (with the 100 Hz tick) comfortably covers connection setup
+    // little, which (with the ~350 Hz tick) comfortably covers connection setup
     // and a round-trip echo over QEMU user-net.
     for _ in 0..4000 {
         {
@@ -675,7 +676,7 @@ pub fn resolve(hostname: &str) -> Option<Ipv4Address> {
 }
 
 /// The networking kernel thread entry point (R13.4). Loops forever: advance the
-/// stack, then yield the CPU cooperatively (halt until the next 100 Hz tick)
+/// stack, then yield the CPU cooperatively (halt until the next timer tick)
 /// instead of busy-spinning, so the poller does not burn emulated cycles and
 /// other threads / device IRQs run between polls.
 pub fn net_thread() {
