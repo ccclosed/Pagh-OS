@@ -144,7 +144,12 @@ fn init_lapic() {
 /// between ticks and real time in the kernel derives from this constant:
 /// `clock_gettime`/`times` granularity, smoltcp's monotonic clock, and the
 /// tick-denominated network timeouts.
-pub const TICK_HZ: u64 = 350;
+///
+/// Practical ceiling: each tick costs one IRQ delivery (~thousands of cycles),
+/// so rates beyond a few kHz starve everything else; 1000 Hz matches the
+/// classic Linux `CONFIG_HZ=1000` desktop setting. Going higher requires a
+/// one-shot/TSC-deadline (tickless) timer instead of periodic mode.
+pub const TICK_HZ: u64 = 1000;
 
 /// Platform bus clock driving the LAPIC timer under QEMU (`-cpu max`: 1 GHz).
 const APIC_TIMER_BASE_HZ: u64 = 1_000_000_000;

@@ -78,7 +78,7 @@ honest INSECURE warnings (VARIANT A: encrypted but unauthenticated).
 - **Core:** safe privileged-instruction layer (SSE enabled for ring 3; the kernel itself is compiled soft-float), GDT/IDT/TSS/IST,
   bitmap PMM, 4-level paging VMM with `map_mmio`, a `good_memory_allocator` (galloc) heap, ACPI (MADT),
   LAPIC + I/O APIC.
-- **Tasking:** preemptive ~350 Hz round-robin scheduler, kernel threads, ring-3 user
+- **Tasking:** preemptive ~1 kHz round-robin scheduler, kernel threads, ring-3 user
   processes, `int 0x80` syscalls (`SYS_WRITE`/`EXIT`/`YIELD`).
 - **Input & graphics:** PS/2 keyboard (IRQ1) and mouse (IRQ12), a framebuffer console with
   2D primitives (lines, rectangles, circles, fills, blit), a bottom status bar, and a
@@ -241,7 +241,7 @@ framebuffer (serial stays plain text).
 | `help [cmd]`         | List commands, or show usage/description for one command        |
 | `clear`              | Clear the framebuffer screen                                    |
 | `echo …`             | Echo the arguments                                              |
-| `uptime`             | Show scheduler ticks (~100 Hz)                                  |
+| `uptime`             | Show scheduler ticks (~1000 Hz)                                 |
 | `pwd`                | Print the current working directory                             |
 | `cd [path]`          | Change directory (relative or absolute; no arg → `/`)           |
 | `ls [path]`          | List a directory (defaults to the CWD; dirs shown with `/`)     |
@@ -593,7 +593,7 @@ comments.
   and VFS; all the interesting logic (path normalization, the line-editor model, history,
   completion, the scancode decoder, edit distance) is pure and property-tested. A single
   `CommandSpec` registry drives both dispatch and `help`.
-- **Scheduling.** A ~350 Hz LAPIC timer preempts via `irq32_stub`. The preemptive tick,
+- **Scheduling.** A ~1 kHz LAPIC timer preempts via `irq32_stub`. The preemptive tick,
   the cooperative `SYS_YIELD` path, and a freshly spawned kernel thread all use one
   identical saved-frame layout, so a task suspended by any path resumes correctly through
   any other. Kernel threads and ring-3 tasks share this frame; the idle task (pid 0) is

@@ -59,7 +59,11 @@ const COUNT_MAX: u64 = 0x7FFF_FFFF;
 const AT_FDCWD: u64 = (-100i64) as u64;
 
 /// Default permission bits reported for an ext2-backed regular file.
-const DEFAULT_FILE_PERMS: u32 = 0o644;
+/// Reported permission bits for regular files. Everything here runs as root
+/// (single-user system), and apt-installed programs are executable — a plain
+/// 0644 made git refuse its remote helpers (`unable to find remote helper`)
+/// because the helper's statx mode carried no X bits.
+const DEFAULT_FILE_PERMS: u32 = 0o755;
 
 /// A descriptor resolved to an actionable target, decoupled from the
 /// `COMPAT_STATES` lock so subsequent (possibly blocking) VFS I/O runs unlocked.
@@ -1303,6 +1307,71 @@ pub fn sys_mkdir(path: u64, _mode: u64) -> Result<u64, Errno> {
         );
         Errno::EIO
     })?;
+    Ok(0)
+}
+
+/// `unlink` (87): remove a non-directory file (git deletes its `*.lock` files
+/// around every config write). Directories are refused with `EISDIR`, like
+/// unlink(2); empty-dir removal is rmdir's job.
+pub fn sys_unlink(path: u64) -> Result<u64, Errno> {
+    let p = read_user_cstr(path)?;
+    let abs = resolve_path(&p);
+    let trimmed = abs.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(Errno::EISDIR); // cannot unlink "/"
+    }
+    let node = vfs::lookup_path(trimmed).map_err(|_| Errno::ENOENT)?;
+    if node.is_directory() {
+        return Err(Errno::EISDIR);
+    }
+    let (parent, name) = match trimmed.rfind('/') {
+        Some(0) => ("/", &trimmed[1..]),
+        Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
+        None => return Err(Errno::ENOENT),
+    };
+    let dir = vfs::lookup_path(parent).map_err(|_| Errno::ENOENT)?;
+    dir.remove(name).map_err(|e| {
+        crate::warn!("[linux] unlink failed: {:?} path={}", e, trimmed);
+        Errno::EIO
+    })?;
+    Ok(0)
+}
+
+/// `rmdir` (84): remove an empty directory. Non-directories are refused with
+/// `ENOTDIR`; a non-empty directory fails in the ext2 layer (`ENOTEMPTY`),
+/// like rmdir(2).
+pub fn sys_rmdir(path: u64) -> Result<u64, Errno> {
+    let p = read_user_cstr(path)?;
+    let abs = resolve_path(&p);
+    let trimmed = abs.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(Errno::EINVAL); // cannot remove "/"
+    }
+    let node = vfs::lookup_path(trimmed).map_err(|_| Errno::ENOENT)?;
+    if !node.is_directory() {
+        return Err(Errno::ENOTDIR);
+    }
+    let (parent, name) = match trimmed.rfind('/') {
+        Some(0) => ("/", &trimmed[1..]),
+        Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
+        None => return Err(Errno::ENOENT),
+    };
+    let dir = vfs::lookup_path(parent).map_err(|_| Errno::ENOENT)?;
+    dir.remove(name).map_err(|e| {
+        crate::warn!("[linux] rmdir failed: {:?} path={}", e, trimmed);
+        Errno::EIO
+    })?;
+    Ok(0)
+}
+
+/// `chmod` (90): single-user system without a permission model — validate the
+/// path exists and accept-and-ignore the mode change, matching the other
+/// permission stubs (`flock`/`umask`). Programs that chmod their lock/config
+/// files (git) need the success so they can proceed.
+pub fn sys_chmod(path: u64, _mode: u64) -> Result<u64, Errno> {
+    let p = read_user_cstr(path)?;
+    let abs = resolve_path(&p);
+    vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
     Ok(0)
 }
 

@@ -71,13 +71,14 @@ pub struct CompatState {
 impl CompatState {
     /// Build the initial compat state for a freshly launched Linux binary:
     /// the supplied descriptor table and VM bookkeeping, `FS.base` cleared to 0,
-    /// the given thread id, the root cwd `/`, an empty `nosys` log, and no exit
+    /// the given thread id, cwd `/mnt` (the writable ext2 tree; `/` has no
+    /// `create_dir`), an empty `nosys` log, and no exit
     /// code yet.
     pub fn new(fds: FdTable, vm: VmRegionSet, tid: u64) -> Self {
         Self::new_with_parent(fds, vm, tid, 1)
     }
     pub fn new_with_parent(fds: FdTable, vm: VmRegionSet, tid: u64, ppid: u64) -> Self {
-        Self { fds, vm, fs_base: 0, tid, ppid, tgid: tid, clear_child_tid: 0, waitable: true, robust_head: 0, robust_len: 0, cwd: "/".to_string(), nosys_logged: BTreeSet::new(), raw_mode: false, echo: true, exit_code: None, exe_path: String::new(), exec_stdio: ["?", "?", "?"] }
+        Self { fds, vm, fs_base: 0, tid, ppid, tgid: tid, clear_child_tid: 0, waitable: true, robust_head: 0, robust_len: 0, cwd: "/mnt".to_string(), nosys_logged: BTreeSet::new(), raw_mode: false, echo: true, exit_code: None, exe_path: String::new(), exec_stdio: ["?", "?", "?"] }
     }
 }
 

@@ -229,7 +229,7 @@ pub fn sys_tgkill(_tgid: u64, _tid: u64, sig: u64) -> Result<u64, Errno> {
 
 /// Microseconds per second.
 const USEC_PER_SEC: u64 = 1_000_000;
-/// One scheduler tick is `1/TICK_HZ` seconds (~2.9 ms at 350 Hz).
+/// One scheduler tick is `1/TICK_HZ` seconds (1 ms at 1000 Hz).
 const NS_PER_TICK: u64 = 1_000_000_000 / TICK_HZ;
 
 /// `getuid`/`geteuid`/`getgid`/`getegid` (102/107/104/108): we run root-ish, so

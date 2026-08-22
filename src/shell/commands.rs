@@ -1057,7 +1057,7 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
 
     // Initialise the VT emulator so nvim's ANSI output renders correctly.
     crate::drivers::vt::init();
-    let env: [&[u8]; 9] = [
+    let env: [&[u8]; 12] = [
         b"TERM=xterm",
         b"PYTHON_BASIC_REPL=1",
         b"PATH=/mnt/usr/bin",
@@ -1066,6 +1066,13 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
         b"PYTHONPATH=/mnt/usr/lib/python3.13:/mnt/usr/lib/python3.16",
         b"RUSTUP_HOME=/mnt/usr/lib/rustlib",
         b"HOME=/mnt/home/user",
+        // Git discovers remote helpers (git-remote-https) via GIT_EXEC_PATH;
+        // without it the compiled-in /usr/lib/git-core prefix still resolves
+        // through the /mnt mapping, but naming it explicitly keeps the lookup
+        // on the ext2 tree even when cwd differs.
+        b"GIT_EXEC_PATH=/mnt/usr/lib/git-core",
+        b"GIT_TEMPLATE_DIR=/mnt/usr/share/git-core/templates",
+        b"GIT_TRACE=1",
         // Nvim cannot create ~/.local/state/nvim/log; silence the
         // \"failed to open $NVIM_LOG_FILE\" stderr spam by pointing it at /dev/null.
         b"NVIM_LOG_FILE=/dev/null",

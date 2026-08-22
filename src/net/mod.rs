@@ -465,7 +465,7 @@ pub fn nc_echo(remote: IpEndpoint, payload: &[u8]) -> NcResult {
     let mut done = false;
 
     // ~ up to a few thousand short steps; each step polls once and spins a
-    // little, which (with the ~350 Hz tick) comfortably covers connection setup
+    // little, which (with the 1 kHz tick) comfortably covers connection setup
     // and a round-trip echo over QEMU user-net.
     for _ in 0..4000 {
         {
