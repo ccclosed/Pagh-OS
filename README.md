@@ -252,7 +252,7 @@ framebuffer (serial stays plain text).
 | `mkdir path`         | Create a directory                                              |
 | `touch path`         | Create an empty file                                            |
 | `write path text`    | Write text to a file (journaled)                                |
-| `rm path`            | Remove a file or empty directory                                |
+| `rm [-r] path…`      | Remove files; `-r` removes directories recursively              |
 | `sync`               | Flush the mounted filesystem                                    |
 | `fscrash`            | Demo journal replay + persistence (write → remount → verify)    |
 | `sleep <seconds>`    | Sleep for N seconds                                             |

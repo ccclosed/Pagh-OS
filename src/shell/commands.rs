@@ -326,21 +326,58 @@ pub(super) fn cmd_write(_ctx: &mut ShellCtx, args: &[&str]) {
 
 /// `rm <path>`: remove a file or empty directory.
 pub(super) fn cmd_rm(_ctx: &mut ShellCtx, args: &[&str]) {
-    if args.is_empty() {
+    let mut recursive = false;
+    let mut targets: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    for a in args {
+        match *a {
+            "-r" | "-R" | "-rf" | "-fr" | "--recursive" => recursive = true,
+            x if x.starts_with('-') && x.len() > 1 => { /* other flags (-f) are no-ops here */ }
+            _ => targets.push(a),
+        }
+    }
+    if targets.is_empty() {
         shell_println("rm: missing operand");
         return;
     }
-    let path = resolve_arg(args[0]);
-    match split_path(&path) {
-        Some((parent, leaf)) => match crate::vfs::lookup_path(parent) {
-            Ok(dir) => match dir.remove(leaf) {
-                Ok(()) => {}
-                Err(e) => shell_println(&alloc::format!("rm: {}: {:?}", path, e)),
-            },
-            Err(_) => shell_println(&alloc::format!("rm: {}: parent not found", path)),
-        },
-        None => shell_println(&alloc::format!("rm: {}: invalid path", path)),
+    for t in targets {
+        let path = resolve_arg(t);
+        if let Err(msg) = rm_path(&path, recursive, 0) {
+            shell_println(&alloc::format!("rm: {}: {}", path, msg));
+        }
     }
+}
+
+/// Remove one operand. Directories require `-r`; removal is post-order
+/// (children first) with a depth cap so a malformed tree cannot recurse
+/// without bound.
+fn rm_path(path: &str, recursive: bool, depth: u8) -> Result<(), &'static str> {
+    if depth > 24 {
+        return Err("tree too deep");
+    }
+    let node = crate::vfs::lookup_path(path).map_err(|_| "not found")?;
+    if node.is_directory() && !recursive {
+        return Err("is a directory (use -r)");
+    }
+    if node.is_directory() {
+        for child in node.readdir().map_err(|_| "readdir failed")? {
+            let child_path = if path.ends_with('/') {
+                alloc::format!("{}{}", path, child.name())
+            } else {
+                alloc::format!("{}/{}", path, child.name())
+            };
+            rm_path(&child_path, recursive, depth + 1)?;
+        }
+    }
+    let (parent, leaf) = split_path(path).ok_or("invalid path")?;
+    if leaf.is_empty() {
+        return Err("cannot remove that");
+    }
+    let dir = crate::vfs::lookup_path(parent).map_err(|_| "parent not found")?;
+    dir.remove(leaf).map_err(|e| match e {
+        crate::vfs::VfsError::AlreadyExists => "directory not empty",
+        crate::vfs::VfsError::NotSupported => "not supported there",
+        _ => "remove failed",
+    })
 }
 
 /// `sync`: flush the mounted filesystem.

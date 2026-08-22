@@ -275,7 +275,9 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             }
         }
         Some(Resolved::Epoll) => Err(Errno::EINVAL),
-        Some(Resolved::PipeRead(e)) => { let mut data=vec![0u8;count as usize];let n=read_pipe(&e,&mut data)?;copy_out(buf,&data[..n]);Ok(n as u64) }
+        Some(Resolved::PipeRead(e)) => { let mut data=vec![0u8;count as usize];let n=read_pipe(&e,&mut data)?;
+            if n>0{crate::warn!("[DIAG] pipe-read pid={} fd={} n={}", crate::task::scheduler::current_pid(), fd, n);}
+            copy_out(buf,&data[..n]);Ok(n as u64) }
         Some(Resolved::Socket { rx, .. }) => { let mut data=vec![0u8;count as usize];let n=read_pipe(&rx,&mut data)?;if n>0{diag_count(&DIAG_SOCK_R,"sock read",n as u64,16384);}copy_out(buf,&data[..n]);Ok(n as u64) }
         Some(Resolved::File { node, offset }) => {
             let size = node.size();
@@ -328,7 +330,9 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         }
         Some(Resolved::Epoll) => Err(Errno::EINVAL),
         Some(Resolved::PipeRead(_)) => Err(Errno::EBADF),
-        Some(Resolved::PipeWrite(e)) => {let data=copy_in(buf,count);Ok(write_pipe(&e,&data)? as u64)}
+        Some(Resolved::PipeWrite(e)) => {let data=copy_in(buf,count);
+            crate::warn!("[DIAG] pipe-write pid={} fd={} len={} head={:?}", crate::task::scheduler::current_pid(), fd, count, String::from_utf8_lossy(&data[..data.len().min(32)]));
+            Ok(write_pipe(&e,&data)? as u64)}
         Some(Resolved::Socket { tx, .. }) => {let data=copy_in(buf,count);let n=write_pipe(&tx,&data)?;if n>0{diag_count(&DIAG_SOCK_W,"sock write",n as u64,16384);}Ok(n as u64)}
         Some(Resolved::Console) => {
             let data = copy_in(buf, count);

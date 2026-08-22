@@ -122,8 +122,8 @@ pub static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "rm",
-        description: "Remove a file or empty directory",
-        usage: "rm <path>",
+        description: "Remove files/dirs (-r for directories)",
+        usage: "rm [-r] <path>...",
         handler: super::commands::cmd_rm,
     },
     CommandSpec {
