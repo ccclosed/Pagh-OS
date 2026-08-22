@@ -165,6 +165,19 @@ pub fn check_frame(who: &str, pid: u64, rsp: u64) {
     if rsp == 0 {
         return;
     }
+    // The tripwire must never fault on its own input: a corrupted frame can
+    // carry an arbitrary rsp, and selftests enqueue synthetic Tcbs with
+    // sentinel stack pointers (0x8000/0xDEAD). Only probe frames that live in
+    // the canonical higher half; anything else is reported as-is.
+    if (rsp as i64) >= 0 || rsp < 0xffff_8000_0000_0000 {
+        crate::warn!(
+            "[SCHED] BAD FRAME ({}) pid={} rsp=0x{:x}: non-canonical or user-space stack pointer, not probed",
+            who,
+            pid,
+            rsp
+        );
+        return;
+    }
     // Kernel threads (shell, idle, etc.) use a kernel-mode yield frame
     // whose layout differs from the ring-3 interrupt frame: there is no
     // user CS/SS/RSP triple at [+136..+160], so the value at [+136] is
