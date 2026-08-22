@@ -58,6 +58,23 @@ impl PipeEndpoint {
     }
 }
 
+/// Dropping the last endpoint Arc of a side decrements that side's count so
+/// the opposite end observes EOF (`writers == 0`) / EPIPE (`readers == 0`).
+/// Without this, counts only ever grew: a forked child's inherited write ends
+/// (run-command's CLOEXEC notify pipe in particular) never released them and
+/// the parent blocked in `read()` forever — git clone hung right after
+/// spawning its remote helper.
+impl Drop for PipeEndpoint {
+    fn drop(&mut self) {
+        let mut s = self.state.lock();
+        if self.read_end {
+            s.readers = s.readers.saturating_sub(1);
+        } else {
+            s.writers = s.writers.saturating_sub(1);
+        }
+    }
+}
+
 /// An object a file descriptor can refer to.
 ///
 /// Standard streams resolve to the kernel console / stdin; everything else is an
