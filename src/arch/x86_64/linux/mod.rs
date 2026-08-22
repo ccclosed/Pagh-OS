@@ -160,17 +160,23 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             }
         }
         sysno::SENDTO => {
-            let fam = if a[4] != 0 && a[5] >= 8 {
-                (unsafe { core::ptr::read_unaligned(a[4] as *const u16) }) as u64
-            } else { 1 };
-            if fam == crate::arch::x86_64::linux::inet_sock::AF_INET {
-                check_user_ptr(a[1], a[2].min(1 << 20))?;
-                let data = crate::arch::x86_64::linux::io_sys::copy_in_pub(a[1], a[2]);
-                let n = crate::arch::x86_64::linux::inet_sock::udp_sendto_fd(a[0], &data, a[4], a[5])?;
-                Ok(n as u64)
-            } else {
-                Err(Errno::EINVAL)
+            // Route by fd type. For a connected UDP socket glibc passes
+            // dest_addr=NULL (write-style); an explicit address wins.
+            let is_inet_udp = crate::task::compat::with_current_compat(|cs| {
+                matches!(cs.fds.get(a[0] as u32),
+                    Some(crate::task::fd::OpenObject::InetUdp(_)))
+            }).unwrap_or(false);
+            if !is_inet_udp {
+                return Err(Errno::EINVAL);
             }
+            check_user_ptr(a[1], a[2].min(1 << 20))?;
+            let data = crate::arch::x86_64::linux::io_sys::copy_in_pub(a[1], a[2]);
+            let n = if a[4] != 0 && a[5] >= 8 {
+                crate::arch::x86_64::linux::inet_sock::udp_sendto_fd(a[0], &data, a[4], a[5])?
+            } else {
+                crate::arch::x86_64::linux::inet_sock::udp_write_fd(a[0], &data)?
+            };
+            Ok(n as u64)
         }
         sysno::RECVFROM => {
             // Route by fd type: AF_INET UDP sockets come here (glibc resolver).
