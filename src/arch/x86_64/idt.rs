@@ -104,6 +104,10 @@ pub fn init() {
 
 // ─── Exception handlers ──────────────────────────────────────────────────
 
+/// When true, exception handlers dump the raw kernel stack (debugging aid).
+pub static STACK_DUMP: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 extern "x86-interrupt" fn divide_error_handler(stack: InterruptStackFrame) {
     crate::error!(
         "[EXC #0] Divide Error RIP: 0x{:016x}",
@@ -236,7 +240,9 @@ extern "x86-interrupt" fn gp_fault_handler(stack: InterruptStackFrame, error_cod
     // bytes are still intact at the top of the task's kernel stack. Dump them:
     //   [top-0x08] per-task user-RSP slot   [top-0x10] rax  [top-0x18] rbx
     //   [top-0x20] rcx (sysretq user RIP!)  [top-0x60] r11 (user RFLAGS) ...
-    if !crate::task::scheduler::is_idle(pid) {
+    // The full 24-word dump lives behind a flag (it is scary and noisy for a
+    // normal userspace crash); enable with `warn on`-style tooling later.
+    if !crate::task::scheduler::is_idle(pid) && STACK_DUMP.load(Ordering::Relaxed) {
         let (_guard, _base, top) = crate::memory::layout::kernel_stack_for_pid(pid);
         crate::error!(
             "--- Top 24 words of kernel stack for pid {} (top=0x{:x}) ---",
