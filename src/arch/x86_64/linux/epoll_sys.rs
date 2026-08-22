@@ -1,6 +1,6 @@
 
-//! STAGE-14: clock_getres(229), eventfd2(290), epoll_create1(291),
-//!           epoll_ctl(233), epoll_wait(232).
+//! Timer/clock, eventfd and epoll syscalls: clock_getres(229), eventfd2(290),
+//! epoll_create1(291), epoll_ctl(233), epoll_wait(232).
 #![allow(dead_code)]
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -20,8 +20,8 @@ pub fn sys_clock_getres(clock_id: u64, ts_ptr: u64) -> Result<u64, Errno> {
     // Supported ids: CLOCK_REALTIME(0), CLOCK_MONOTONIC(1),
     // CLOCK_PROCESS_CPUTIME_ID(2), CLOCK_THREAD_CPUTIME_ID(3),
     // CLOCK_MONOTONIC_RAW(4), CLOCK_REALTIME_COARSE(5), CLOCK_MONOTONIC_COARSE(6),
-    // CLOCK_BOOTTIME(7). STAGE-15: the coarse clocks were missing — libuv probes
-    // CLOCK_MONOTONIC_COARSE(6) at loop init and got the EINVAL diag.
+    // CLOCK_BOOTTIME(7). libuv probes
+    // CLOCK_MONOTONIC_COARSE(6) at loop init, so both must answer.
     if !matches!(clock_id, 0|1|2|3|4|5|6|7) { return Err(Errno::EINVAL); }
     if ts_ptr == 0 { return Ok(0); } // null buf is valid: just validate the id
     check_user_ptr(ts_ptr, 16)?;
@@ -168,7 +168,7 @@ pub fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout_ms: u6
     }
 }
 
-/// `epoll_pwait` (281, STAGE-15): `epoll_wait` plus a sigmask. Signals are
+/// `epoll_pwait` (281): `epoll_wait` plus a sigmask. Signals are
 /// never delivered asynchronously in pagh, so the mask is accepted and
 /// ignored; libuv's uv__io_poll calls this unconditionally on newer glibc,
 /// and the ENOSYS fallthrough tripped its `errno == EINTR` assertion.
@@ -184,7 +184,7 @@ fn poll_fd(fd: i32, events: u32) -> u32 {
         match cs.fds.get(fd as u32) {
             None => EPOLLERR,
             Some(OpenObject::Stdin) => {
-                // STAGE-16.3: report readable only when a read can actually
+                // Report readable only when a read can actually
                 // make progress. The old always-ready answer made libuv issue
                 // a read that blocked in-kernel and stalled nvim's TUI loop
                 // before the first frame was drawn.
@@ -210,7 +210,7 @@ fn poll_fd(fd: i32, events: u32) -> u32 {
                 if rx.peer_closed() { r |= EPOLLHUP; }
                 r
             }
-            // STAGE-16: a listener is "readable" when a connection is queued.
+            // A listener is "readable" when a connection is queued.
             Some(OpenObject::UnixListener(l)) => {
                 if events & EPOLLIN != 0 && !l.inner.lock().pending.is_empty() { EPOLLIN } else { 0 }
             }
@@ -230,7 +230,7 @@ fn poll_fd(fd: i32, events: u32) -> u32 {
 }
 
 
-/// STAGE-16.7: dump the CURRENT task's epoll interest list together with each
+/// Dump the CURRENT task's epoll interest list together with each
 /// fd's resolved object type and its readiness AS OF RIGHT NOW. Called by the
 /// stuck-syscall watchdog in the context of the stuck task itself. Answers
 /// the nvim question directly: is the RPC socket in the set at all, what does

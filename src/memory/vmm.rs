@@ -297,7 +297,7 @@ pub fn map(phys_addr: u64, virt_addr: u64, flags: PageTableFlags) -> Result<(), 
     let pd = walker.ensure_next(pdpt, virt.p3_index(), flags)?;
     let pt = walker.ensure_next(pd, virt.p2_index(), flags)?;
 
-    // STAGE-16.1 DIAG: never silently overwrite a live translation. A present
+    // Never silently overwrite a live translation. A present
     // PTE pointing at a *different* frame means two owners believe they own
     // this virtual page: the old frame leaks and whoever still uses the old
     // mapping is one re-allocation away from reading someone else's memory.
@@ -322,7 +322,7 @@ pub fn map(phys_addr: u64, virt_addr: u64, flags: PageTableFlags) -> Result<(), 
     Ok(())
 }
 
-/// STAGE-16.1 DIAG: log the raw 4-level page-table walk for `virt_addr` in the
+/// Log the raw 4-level page-table walk for `virt_addr` in the
 /// *currently active* address space, one line per level, stopping at the first
 /// non-present entry. Post-mortem this distinguishes "a single PTE vanished"
 /// from "a whole intermediate table vanished" (e.g. its frame was
@@ -431,9 +431,9 @@ pub fn map_mmio(phys: u64, len: u64) -> Result<u64, VmError> {
     Ok(phys_to_virt(phys))
 }
 
-// ─── STAGE-15: fork support ────────────────────────────────────────────────────
+// ─── fork support ────────────────────────────────────────────────────
 
-/// STAGE-15 (fork): deep-copy the user lower half (PML4 entries 0..256) of
+/// Deep-copy the user lower half (PML4 entries 0..256) of
 /// `src_pml4` into `dst_pml4`, eagerly duplicating every mapped 4 KiB frame
 /// (no copy-on-write). All access goes through the HHDM window, so neither
 /// address space needs to be active in CR3 and no TLB shootdown is needed
@@ -493,7 +493,7 @@ pub fn clone_user_space(src_pml4: u64, dst_pml4: u64) -> Result<(), VmError> {
     Ok(())
 }
 
-/// STAGE-15 (fork): translate a user virtual address in the (inactive)
+/// Translate a user virtual address in the (inactive)
 /// address space rooted at `pml4` — used to write CLONE_CHILD_SETTID into the
 /// child's copied memory. 4 KiB walks only; None on any non-present entry.
 pub fn virt_to_phys_in(pml4: u64, virt: u64) -> Option<u64> {

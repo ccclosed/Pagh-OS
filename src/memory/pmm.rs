@@ -478,7 +478,7 @@ pub fn free_frame(addr: u64) {
             pmm.bitmap[word] |= 1u64 << bit;
             pmm.free_count += 1;
         } else {
-            // STAGE-16.1 DIAG: the frame is already marked free -> double free
+            // The frame is already marked free -> double free
             // (or a free of a frame this caller never owned). This is exactly
             // the accounting bug that later surfaces as "an unrelated process's
             // page suddenly reads as zeroes" once the frame is re-allocated and

@@ -1,5 +1,5 @@
 
-//! STAGE-14 VT: ANSI/VT-100 terminal emulator rendered on the framebuffer.
+//! ANSI/VT-100 terminal emulator rendered on the framebuffer.
 #![allow(dead_code)]
 use alloc::vec::Vec;
 use crate::sync::spinlock::Spinlock;
@@ -169,7 +169,7 @@ impl Vt {
             _=>{}
         }
     }
-    // STAGE-16.3: dispatch a completed CSI, answering interrogation
+    // Dispatch a completed CSI, answering interrogation
     // sequences. Unknown intermediate/private combos are swallowed silently
     // instead of leaking the final byte as text (the old parser printed
     // "p3m$qm"-style junk out of nvim's DECRQM/DECSCUSR/XTVERSION probes).
@@ -222,13 +222,13 @@ impl Vt {
             Es::Esc=>match b{
                 b'['=>{self.state=Es::Csi;self.params=[0u32;16];self.np=0;self.inter=0;self.inter2=0;}
                 b']'=>{self.state=Es::Osc;self.osc_buf.clear();}
-                // STAGE-16.3: DCS/SOS/PM/APC strings (XTGETTCAP etc.) are
+                // DCS/SOS/PM/APC strings (XTGETTCAP etc.) are
                 // consumed up to ST instead of leaking into the grid.
                 b'P'|b'X'|b'^'|b'_'=>{self.state=Es::Dcs;}
                 b'7'=>{self.saved_cx=self.cx;self.saved_cy=self.cy;self.state=Es::Normal;}
                 b'8'=>{self.cx=self.saved_cx;self.cy=self.saved_cy;self.state=Es::Normal;}
                 b'M'=>{if self.cy==self.scroll_top{self.scroll_dn(1);}else if self.cy>0{self.cy-=1;}self.state=Es::Normal;}
-                // STAGE-16.11: ESC ( X / ESC ) X etc. designate the G0/G1
+                // ESC ( X / ESC ) X etc. designate the G0/G1
                 // character set. nvim emits ESC(B after every attribute reset;
                 // without this state the designator byte leaked onto the screen
                 // as a literal 'B' after each highlighted span.
@@ -242,7 +242,7 @@ impl Vt {
                 }
                 b';'|b':'=>{if self.np==0{self.np=1;}if self.np<16{self.np+=1;self.params[self.np-1]=0;}}
                 0x3C..=0x3F=>{self.inter=b;}   // private markers: ? > = <
-                0x20..=0x2F=>{self.inter2=b;}  // STAGE-16.3: intermediates ($ SP " !)
+                0x20..=0x2F=>{self.inter2=b;} // Intermediates ($ SP " !)
                 0x40..=0x7E=>{
                     self.csi_final(b);
                     self.state=Es::Normal;
@@ -270,7 +270,7 @@ impl Vt {
     }
 }
 
-// STAGE-16.3: replies to terminal interrogation sequences (DA1, DSR, DECRQM,
+// Replies to terminal interrogation sequences (DA1, DSR, DECRQM,
 // OSC color queries). nvim sends these at startup and reads the answers from
 // stdin; the raw-tty read path drains this queue into STDIN_PENDING.
 static RESPONSES: Spinlock<Vec<u8>> = Spinlock::new(Vec::new());

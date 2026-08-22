@@ -150,8 +150,7 @@ const MAP_FIXED: u32 = 0x10;
 /// `MAP_DENYWRITE | MAP_EXECUTABLE | MAP_NORESERVE | MAP_POPULATE | MAP_STACK`.
 const MAP_IGNORED: u32 = 0x800 | 0x1000 | 0x4000 | 0x8000 | 0x2_0000;
 
-/// `mmap` (9): map a private region (R4.1, R4.2). Stage 13.7 extends this from
-/// the original anonymous-only shape to the three shapes a dynamic loader
+/// `mmap` (9): map a private region (R4.1, R4.2) in the three shapes a dynamic loader
 /// (`ld.so` mapping shared libraries) actually issues:
 ///
 ///   * anonymous `MAP_PRIVATE|MAP_ANONYMOUS` — zero-filled bump-pointer region
@@ -309,7 +308,7 @@ pub fn sys_munmap(addr: u64, len: u64) -> Result<u64, Errno> {
         .unwrap_or(Err(Errno::EINVAL))
 }
 
-/// `mremap` (25): resize an anonymous private mapping (STAGE-13.8). glibc's
+/// `mremap` (25): resize an anonymous private mapping. glibc's
 /// realloc() tries mremap first for large blocks and falls back to
 /// malloc+memcpy+free on ENOSYS, which logged an unsupported-syscall warning
 /// on every CPython start. Shrinks drop the tail pages in place; growth

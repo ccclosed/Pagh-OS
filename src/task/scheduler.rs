@@ -46,7 +46,7 @@ impl Tcb {
 
 static READY_QUEUE: Spinlock<VecDeque<Tcb>> = Spinlock::new(VecDeque::new());
 
-// STAGE-16.5 DIAG: frame ledger - catches stale/double restores at the moment
+// Frame ledger - catches stale/double restores at the moment
 // they happen instead of at the fatal iretq (the apt #GP: iretq consumed a
 // region of pid 1's stack that no longer held a saved frame). Every save
 // stamps (pid -> rsp, live); every restore must find a matching live stamp
@@ -179,11 +179,11 @@ pub fn check_frame(who: &str, pid: u64, rsp: u64) {
     let rf = rd(144);
     let rip_canonical = (((rip as i64) << 16) >> 16) as u64 == rip;
     let rf_ok = rf & 0x2 != 0;
-    // STAGE-16.5: kernel threads must ALWAYS carry the kernel code selector at
+    // Kernel threads must ALWAYS carry the kernel code selector at
     // [+136] and a higher-half RIP; a stack-pointer value in the CS slot is
     // exactly the apt iretq #GP signature (CS=0x...081238 -> #GP err=0x1238).
     let kcs = crate::arch::x86_64::gdt::Selectors::kernel_code().0 as u64;
-    // STAGE-16.8.1: a ring-3 frame (CS with RPL=3, plausible selector) is valid
+    // A ring-3 frame (CS with RPL=3, plausible selector) is valid
     // even for tasks WITHOUT a Linux compat state -- the built-in ring-3 test
     // process (pid 3) is spawned raw, and 16.5.1 only whitelisted compat tasks,
     // so its perfectly healthy frame spammed BAD FRAME on every tick. The real
@@ -429,7 +429,7 @@ pub extern "C" fn scheduler_tick_irq(current_rsp: u64) -> u64 {
 /// lives in [`scheduler_yield_switch`]. See both for the critical
 /// requeue-before-restore ordering (the stage-13.6 fix).
 pub fn yield_current() {
-    // STAGE-16.6: every in-kernel blocking loop funnels through here, so the
+    // Every in-kernel blocking loop funnels through here, so the
     // yielding tasks themselves drive the stuck-syscall watchdog scan.
     crate::arch::x86_64::linux::watchdog_tick();
     // SAFETY: yield_switch saves this task's full context in the canonical

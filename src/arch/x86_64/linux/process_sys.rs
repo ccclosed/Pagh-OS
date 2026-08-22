@@ -273,8 +273,8 @@ const CLONE_CHILD_CLEARTID:u64=0x200000; const CLONE_CHILD_SETTID:u64=0x01000000
 const CLONE_SUPPORTED:u64=0xff|CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID;
 const CLONE_VFORK:u64=0x4000;
 const FORK_SUPPORTED:u64=0xff|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID;
-/// STAGE-15: `clone` now supports BOTH forms nvim's libuv needs.
-///   * thread clone (CLONE_VM|CLONE_THREAD, stage 14) — shared address space;
+/// `clone` supports both forms nvim's libuv needs.
+///   * thread clone (CLONE_VM|CLONE_THREAD) — shared address space;
 ///   * fork (no CLONE_VM; glibc fork() = SIGCHLD|CHILD_SETTID|CHILD_CLEARTID)
 ///     — deep-copied address space, child gets rax=0, parent gets the pid.
 /// CLONE_VM WITHOUT CLONE_THREAD (vfork / glibc posix_spawn) stays ENOSYS on
@@ -295,7 +295,7 @@ pub fn sys_clone(regs:&SavedRegs,flags:u64,child_stack:u64,parent_tid:u64,child_
         if flags&CLONE_CHILD_SETTID!=0{unsafe{ptr::write_unaligned(child_tid as *mut u32,child as u32)}}
         return Ok(child)
     }
-    // ── fork path (STAGE-15) ──
+    // ── fork path ──
     if flags & (CLONE_VM|CLONE_VFORK) != 0 || flags & !FORK_SUPPORTED != 0 {crate::warn!("[DIAG] clone(fork): unsupported flags {:#x} -> ENOSYS", flags);return Err(Errno::ENOSYS)}
     if child_stack != 0 {return Err(Errno::EINVAL)} // fork(2) never passes a stack
     if flags&CLONE_PARENT_SETTID!=0{check_user_ptr(parent_tid,4)?}

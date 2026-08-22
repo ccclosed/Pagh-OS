@@ -59,10 +59,10 @@ pub struct CompatState {
     /// The normalized exit code (low byte of the requested code), once the
     /// process has exited (R12.3).
     pub exit_code: Option<u8>,
-    /// STAGE-15: absolute VFS path of the exec'd image, reported through
+    /// Absolute VFS path of the exec'd image, reported through
     /// `readlink("/proc/self/exe")` (libuv's uv_exepath / nvim's progpath).
     pub exe_path: String,
-    /// STAGE-16.8.3: what fds 0/1/2 were AT execve time (after the
+    /// What fds 0/1/2 were AT execve time (after the
     /// close-on-exec sweep). The spawn-time [DIAG] lines are wiped by the
     /// TUI screen clear, so the watchdog re-prints this snapshot instead.
     pub exec_stdio: [&'static str; 3],
@@ -195,7 +195,7 @@ pub fn clone_current_compat(child: u64, tls: Option<u64>, clear_child_tid: u64) 
     true
 }
 
-/// STAGE-15 (fork): clone the parent's full compat state for a forked child.
+/// Clone the parent's full compat state for a forked child.
 /// The child becomes its own thread-group leader (tid = tgid = child pid), is
 /// waitable (a future wait4 zombie for the parent), and inherits the fd table
 /// (Arc-shared pipe/socket endpoints — Linux dup semantics), cwd, fs_base,

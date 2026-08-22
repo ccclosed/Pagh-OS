@@ -1,4 +1,4 @@
-//! STAGE-16.2: minimal in-memory filesystem backing `/tmp`.
+//! Minimal in-memory filesystem backing `/tmp`.
 //!
 //! Nothing else in the tree implements `create_dir` (the ext2 root is
 //! read-mostly and directory creation there means real on-disk allocation),

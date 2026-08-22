@@ -23,7 +23,7 @@ pub fn init() {
         // lookup: syscall sets CS.sel = STAR[47:32] and SS.sel = STAR[47:32]+8;
         // sysretq sets CS.sel = STAR[63:48]+16 and SS.sel = STAR[63:48]+8.
         //
-        // STAGE-13.7 ROOT CAUSE: this call used to pass a NULL selector as the
+        // Regression guard: this call used to pass a NULL selector as the
         // syscall CS and swallow the validation error with `.ok()`, so STAR was
         // never written and stayed 0 from reset. Every `syscall` window then ran
         // with CS.sel = 0 / SS.sel = 8, and ring 3 ran after `sysretq` with
@@ -48,7 +48,7 @@ pub fn init() {
         // `syscall` instruction and `int 0x80` both funnel into `linux_dispatch`.
         // SFMASK clears IF on `syscall`, so the entry stub runs with interrupts
         // masked; `linux_dispatch` re-enables them once the user RSP has been
-        // parked in the per-task slot on the kernel stack (stage 13.6), and the
+        // parked in the per-task slot on the kernel stack, and the
         // exit tail runs `cli` before unwinding, so preemption never straddles
         // the frame pops.
         LStar::write(VirtAddr::new(syscall_entry as *const () as u64));

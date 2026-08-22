@@ -116,7 +116,7 @@ pub unsafe fn yield_switch() {
         // iretq with RSP restored to its entry value; control then leaves the
         // asm block and the function returns to its caller.
         "2:",
-        // STAGE-13.7 FIX (the foreground-wait #GP): these MUST be pinned
+        // Foreground-wait #GP fix: these MUST be pinned
         // registers. With a generic `in(reg)` the allocator may pick RAX —
         // clobber_abi("C") does NOT exclude ABI-clobbered registers from
         // operand allocation, it merely skips adding clobbers for registers
@@ -161,7 +161,7 @@ core::arch::global_asm!(
 core::arch::global_asm!(
     ".global scheduler_exit_thread",
     "scheduler_exit_thread:",
-    // STAGE-13.8 TOTAL-FREEZE FIX: park a finished kernel thread WITH
+    // Park a finished kernel thread WITH
     // INTERRUPTS ENABLED. The old `cli` + `hlt` sequence halted the CPU with
     // interrupts masked the moment any kernel thread returned (first hit by
     // the boot provisioner finishing/giving up) -- on a single core that

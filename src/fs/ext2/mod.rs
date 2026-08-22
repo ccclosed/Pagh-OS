@@ -70,7 +70,7 @@ const SUPERBLOCK_OFFSET: usize = 1024;
 
 struct Ext2Inner {
     sb: Ext2SuperBlock,
-    // STAGE-13.8: the full group-descriptor table (one entry per block group).
+    // The full group-descriptor table (one entry per block group).
     gds: Vec<Ext2GroupDesc>,
 }
 
@@ -157,7 +157,7 @@ struct Tx<'a> {
     sb: Ext2SuperBlock,
     gds: Vec<Ext2GroupDesc>,
     dirty: BTreeMap<u64, Vec<u8>>,
-    /// STAGE-16.8: blocks in `dirty` that are FILE DATA. Ordered mode: on
+    /// Blocks in `dirty` that are FILE DATA. Ordered mode: on
     /// commit they are written straight to their final location and are NOT
     /// copied through the WAL (metadata-only journaling).
     data: ::alloc::collections::BTreeSet<u64>,
@@ -183,7 +183,7 @@ impl<'a> Tx<'a> {
         Ok(self.dirty.get_mut(&blk).unwrap())
     }
 
-    /// STAGE-16.8: fetch a FILE DATA block into the dirty set. When the whole
+    /// Fetch a FILE DATA block into the dirty set. When the whole
     /// block is about to be overwritten the disk read is skipped —
     /// read-modify-write halved sequential write throughput for nothing.
     fn data_block(&mut self, blk: u64, full_overwrite: bool) -> Result<&mut Vec<u8>, FsError> {
@@ -199,7 +199,7 @@ impl<'a> Tx<'a> {
         Ok(self.dirty.get_mut(&blk).unwrap())
     }
 
-    /// STAGE-13.8: allocate a zeroed data block from the first group with a
+    /// Allocate a zeroed data block from the first group with a
     /// free block (previously only group 0 was ever consulted, capping every
     /// filesystem at 128 MiB regardless of the device size).
     fn alloc_zeroed_block(&mut self) -> Result<u32, FsError> {
@@ -259,7 +259,7 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
-    /// STAGE-13.8: allocate an inode from the first group with a free slot.
+    /// Allocate an inode from the first group with a free slot.
     fn alloc_new_inode(&mut self) -> Result<u32, FsError> {
         let ipg = self.sb.s_inodes_per_group;
         for g in 0..self.gds.len() {
@@ -451,7 +451,7 @@ impl<'a> Tx<'a> {
             }
         }
 
-        // STAGE-16.8 ORDERED MODE: file data goes straight to its final
+        // File data goes straight to its final
         // location BEFORE the metadata transaction commits (so committed
         // metadata never points at unwritten data), and only metadata rides
         // the WAL. This removes the double write of every data block, which
@@ -487,7 +487,7 @@ impl<'a> Tx<'a> {
 impl Ext2Fs {
     /// Produce a fresh, host-mountable ext2 image plus an empty WAL journal.
     ///
-    /// STAGE-13.8: multi-group layout. The filesystem now spans the whole
+    /// Multi-group layout. The filesystem now spans the whole
     /// device (minus the WAL reserve) with as many 32768-block (128 MiB)
     /// groups as fit, instead of clamping everything to a single group.
     /// Every group starts with a superblock + GD-table backup (no
@@ -697,7 +697,7 @@ impl Ext2Fs {
 // ─── mount ────────────────────────────────────────────────────────────────
 
 impl Ext2Fs {
-    /// Read the superblock and the full group-descriptor table (STAGE-13.8:
+    /// Read the superblock and the full group-descriptor table (one
     /// one descriptor per block group; the table starts at block 1). Old
     /// single-group images load unchanged (they simply yield one descriptor).
     fn read_sb_gds(dev: &dyn BlockDevice) -> Result<(Ext2SuperBlock, Vec<Ext2GroupDesc>), FsError> {
@@ -1115,7 +1115,7 @@ impl Ext2Fs {
     /// Write `data` to file `ino` at `offset`, allocating blocks and growing
     /// `i_size` as needed. Each chunk is atomic via the journal.
     ///
-    /// STAGE-13.8 WAL-CAP FIX: the journal log holds only `FMT_LOG_BLOCKS`
+    /// The journal log holds only `FMT_LOG_BLOCKS`
     /// (64) blocks, and `Journal::commit` rejects any transaction with more
     /// than `log_blocks - 2` dirty blocks (`FsError::OutOfSpace`). The old
     /// single-transaction write therefore made every file larger than
@@ -1130,7 +1130,7 @@ impl Ext2Fs {
         if data.is_empty() {
             return Ok(0);
         }
-        // STAGE-16.8: 64 data blocks per Tx — data is no longer journaled,
+        // 64 data blocks per Tx — data is no longer journaled,
         // so the WAL cap only has to fit the metadata blocks.
         const TX_DATA_BLOCKS: usize = 64;
 

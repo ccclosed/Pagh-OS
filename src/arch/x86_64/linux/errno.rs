@@ -31,7 +31,7 @@ pub enum Errno {
     EBADF = 9,
     /// Cannot allocate memory.
     ENOMEM = 12,
-    /// Permission denied (STAGE-16.13: directory rename refusal).
+    /// Permission denied (directory rename refusal).
     EACCES = 13,
     /// Bad address.
     EFAULT = 14,

@@ -47,7 +47,7 @@ use super::stat::{encode_stat, LinuxStat, S_IFDIR, S_IFREG};
 /// standard stream reports a plausible (non-regular) type.
 const S_IFCHR: u32 = 0o020000;
 
-/// `st_mode` type bits for a socket (STAGE-15 socketpair ends).
+/// `st_mode` type bits for a socket (socketpair ends).
 const S_IFSOCK: u32 = 0o140000;
 
 /// Largest byte count `read`/`write` accept, matching the Linux `int` cap in
@@ -75,7 +75,7 @@ enum Resolved {
     },
     PipeRead(Arc<PipeEndpoint>),
     PipeWrite(Arc<PipeEndpoint>),
-    /// STAGE-15: one end of an AF_UNIX socketpair (rx = incoming, tx = outgoing).
+    /// One end of an AF_UNIX socketpair (rx = incoming, tx = outgoing).
     Socket { rx: Arc<PipeEndpoint>, tx: Arc<PipeEndpoint> },
     /// An eventfd counter.
     Eventfd { val: Arc<crate::sync::spinlock::Spinlock<u64>>, semaphore: bool },
@@ -102,7 +102,7 @@ fn resolve_fd(fd: u32) -> Option<Resolved> {
             },
             OpenObject::Dir { .. } => Resolved::Dir,
             OpenObject::Eventfd { val, semaphore } => Resolved::Eventfd { val: Arc::clone(val), semaphore: *semaphore },
-            // STAGE-16: not byte streams — same read/write/seek rejections as epoll fds.
+            // Not byte streams — same read/write/seek rejections as epoll fds.
             OpenObject::UnixListener(_) => Resolved::Epoll,
             OpenObject::UnixSocketUnbound { .. } => Resolved::Epoll,
             OpenObject::Epoll { .. } => Resolved::Epoll,
@@ -138,14 +138,14 @@ fn set_fd_offset(fd: u32, new_off: u64) {
 fn console_write(slice: &[u8]) {
     use crate::drivers::Console;
     let console = crate::drivers::serial::console();
-    // STAGE-13.7: mirror every stdout/stderr byte (and the stdin echo) to the
+    // Mirror every stdout/stderr byte (and the stdin echo) to the
     // framebuffer console as well. Previously this wrote ONLY to serial, so a
     // Compat_Process was invisible in the QEMU graphical window: the shell
     // prints via kprintln!+fb_println!, but python's output bypassed the
     // framebuffer entirely. The fb writer already handles \n scrolling and
     // 0x08 backspace, so the line-editor echo renders correctly too.
-    // STAGE-14 VT: route all compat stdout/stderr through the VT emulator.
-    // STAGE-16.4 DIAG: if this counter grows but the screen stays black, the
+    // Route all compat stdout/stderr through the VT emulator.
+    // If this counter grows but the screen stays black, the
     // VT renderer is the suspect; if it never grows, the UI client never draws.
     diag_count(&DIAG_CONSOLE_BYTES, "console bytes", slice.len() as u64, 8192);
     crate::drivers::vt::write(slice);
@@ -244,7 +244,7 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
 
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
-        // STAGE-13.7: stdin is interactive now — a blocking, line-buffered
+        // Stdin is interactive now — a blocking, line-buffered
         // read from the PS/2 keyboard (echo, backspace, ^D = EOF). Previously
         // this returned an instant EOF, so CPython silently exited with 0.
         Some(Resolved::Console) | Some(Resolved::Stdin) => {
@@ -281,7 +281,7 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             }
             let mut kbuf = vec![0u8; copied as usize];
             let n = node.read(offset, &mut kbuf).map_err(|e| {
-                // STAGE-13.7: a real VFS/ext2 read failure is not "invalid
+                // A real VFS/ext2 read failure is not "invalid
                 // argument" — report EIO and log what actually broke.
                 crate::error!(
                     "[linux] file read failed: {:?} ino={} off={} len={}",
@@ -414,7 +414,7 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
     Ok(total)
 }
 
-/// STAGE-16.11: `readv` (19) — vectored read. Delegates to `sys_read` on the
+/// `readv` (19) — vectored read. Delegates to `sys_read` on the
 /// first non-empty iovec: a short count is a legal readv result and callers
 /// (glibc stdio, libuv) loop for the rest, so this inherits sys_read's per-fd
 /// blocking semantics without duplicating them.
@@ -435,7 +435,7 @@ pub fn sys_readv(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// STAGE-16.11: `preadv` (295) — positional vectored read; first non-empty
+/// `preadv` (295) — positional vectored read; first non-empty
 /// iovec via `sys_pread64` (the descriptor offset is not advanced).
 pub fn sys_preadv(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, Errno> {
     const IOV_SIZE: u64 = 16;
@@ -454,7 +454,7 @@ pub fn sys_preadv(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, Er
     Ok(0)
 }
 
-/// STAGE-16.11: `pwritev` (296) — positional vectored write; first non-empty
+/// `pwritev` (296) — positional vectored write; first non-empty
 /// iovec via `sys_pwrite64`.
 pub fn sys_pwritev(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, Errno> {
     const IOV_SIZE: u64 = 16;
@@ -473,7 +473,7 @@ pub fn sys_pwritev(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, E
     Ok(0)
 }
 
-/// STAGE-16.11: `fsync`/`fdatasync` (74/75). nvim fsyncs the ShaDa file on
+/// `fsync`/`fdatasync` (74/75). nvim fsyncs the ShaDa file on
 /// write; the ext2 WAL already journals every write at syscall time (ordered
 /// mode), so there is no dirty cache to flush — success on any valid fd.
 pub fn sys_fsync(fd: u64) -> Result<u64, Errno> {
@@ -556,13 +556,13 @@ fn open_resolved(abs: &str) -> Result<u64, Errno> {
     }
 }
 
-// STAGE-16.2: creation flags for open/openat (octal values from fcntl.h).
+// Creation flags for open/openat (octal values from fcntl.h).
 const O_CREAT_FL: u64 = 0o100;
 const O_EXCL_FL: u64 = 0o200;
 const O_TRUNC_FL: u64 = 0o1000;
 
 /// Resolve a user path (against the cwd if relative) and allocate a fresh
-/// descriptor for it (R2.4). STAGE-16.2: honors O_CREAT/O_EXCL (creates a
+/// descriptor for it (R2.4). Honors O_CREAT/O_EXCL (creates a
 /// regular file via the parent directory's `create_file` - i.e. works on the
 /// /tmp ramfs; read-only trees still refuse) and best-effort O_TRUNC.
 /// `ENOENT` if the path is absent and O_CREAT is unset (R2.5). Shared by
@@ -610,7 +610,7 @@ fn open_path(path: &str, flags: u64) -> Result<u64, Errno> {
 pub fn sys_open(path: u64, flags: u64, _mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     let fd = open_path(&p, flags)?;
-    // STAGE-15: honor O_CLOEXEC now that execve sweeps flagged descriptors.
+    // Honor O_CLOEXEC now that execve sweeps flagged descriptors.
     if flags & O_CLOEXEC != 0 {
         compat::with_current_compat(|cs| cs.fds.set_cloexec(fd as u32, true));
     }
@@ -625,7 +625,7 @@ pub fn sys_openat(dirfd: u64, path: u64, flags: u64, _mode: u64) -> Result<u64, 
     // only directory base this minimal layer tracks), which covers AT_FDCWD.
     let _ = dirfd;
     let fd = open_path(&p, flags)?;
-    // STAGE-15: honor O_CLOEXEC now that execve sweeps flagged descriptors.
+    // Honor O_CLOEXEC now that execve sweeps flagged descriptors.
     if flags & O_CLOEXEC != 0 {
         compat::with_current_compat(|cs| cs.fds.set_cloexec(fd as u32, true));
     }
@@ -648,7 +648,7 @@ pub fn sys_close(fd: u64) -> Result<u64, Errno> {
 pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> Result<u64, Errno> {
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
-        // STAGE-13.8 ERRNO FIX: the console is not seekable — ESPIPE, like a
+        // The console is not seekable — ESPIPE, like a
         // pipe. CPython probes lseek on fds 0/1/2 at startup to decide
         // buffering; EINVAL spammed the diag log three times per start.
         Some(Resolved::Console) | Some(Resolved::Stdin) => Err(Errno::ESPIPE),
@@ -699,7 +699,7 @@ fn write_stat(node: &Arc<dyn VfsNode>, statbuf: u64) -> Result<u64, Errno> {
         S_IFREG | DEFAULT_FILE_PERMS
     };
     let mut stat = encode_stat(node.size(), mode);
-    // STAGE-13.7 FIX: file identity matters. glibc's ld.so deduplicates loaded
+    // File identity matters. glibc's ld.so deduplicates loaded
     // shared objects by the (st_dev, st_ino) pair from `fstat`, and the main
     // executable's link_map carries an all-zero file id. With st_dev/st_ino
     // left zeroed for every file, each freshly opened library "matched" the
@@ -735,7 +735,7 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> Result<u64, Errno> {
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
         Some(Resolved::Socket { .. }) => {
-            // STAGE-15: socketpair ends report S_IFSOCK — libuv's
+            // Socketpair ends report S_IFSOCK — libuv's
             // uv_guess_handle checks the fd type of stdio descriptors.
             let stat = encode_stat(0, S_IFSOCK | 0o666);
             write_stat_struct(&stat, statbuf);
@@ -768,12 +768,12 @@ pub fn sys_newfstatat(_dirfd: u64, path: u64, statbuf: u64, _flags: u64) -> Resu
 }
 
 /// `ioctl` (16): console/stdin answer the core tty queries (`TCGETS`,
-/// `TCSETS*`, `TIOCGWINSZ`) so `isatty()` reports a terminal. STAGE-13.7:
+/// `TCSETS*`, `TIOCGWINSZ`) so `isatty()` reports a terminal. A
 /// blanket `EINVAL` made CPython treat stdin as a non-tty pipe, read an
 /// instant EOF and exit 0 without ever showing a prompt. Other descriptors
 /// still report `EINVAL`; an absent fd is `EBADF`.
 pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
-    // STAGE-13.8 CLOEXEC FIX: FIOCLEX/FIONCLEX set/clear the close-on-exec
+    // FIOCLEX/FIONCLEX set/clear the close-on-exec
     // flag on an fd. pagh has no execve yet, so the flag has no observable
     // effect; report success on any valid fd instead of EINVAL. CPython's
     // _Py_set_inheritable() issues ioctl(fd, FIOCLEX) for every module file
@@ -788,7 +788,7 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
             Some(_) => Ok(0),
         };
     }
-    // STAGE-16.9: FIONBIO. libuv's uv__nonblock on Linux is ioctl(FIONBIO),
+    // FIONBIO. libuv's uv__nonblock on Linux is ioctl(FIONBIO),
     // NOT fcntl(F_SETFL). uv_pipe_open() calls it on the dup'd socketpair end
     // of the embedded-nvim RPC channel; answering ENOTTY made pipe_open fail,
     // so the channel never reached the event loop (the black-screen hang).
@@ -821,12 +821,12 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
         Some(Resolved::Console) | Some(Resolved::Stdin) => tty_ioctl(request, arg),
-        // STAGE-13.8 ERRNO FIX: a tty request on a non-tty fd is "inappropriate
+        // A tty request on a non-tty fd is "inappropriate
         // ioctl for device", not "invalid argument". glibc isatty() expects
         // ENOTTY; EINVAL also tripped the EINVAL diag on every isatty probe
         // CPython makes (TCGETS on fd 3) and flooded the serial log.
         Some(_) => {
-            // STAGE-16.9: tty probes (isatty and friends) on non-tty fds are
+            // Tty probes (isatty and friends) on non-tty fds are
             // routine noise; any OTHER unknown request is a compat-surface gap
             // worth seeing on screen.
             if !(0x5401..=0x5420).contains(&request) {
@@ -838,7 +838,7 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
     }
 }
 
-// ─── tty surface (stage 13.7) ────────────────────────────────────────────────
+// ─── tty surface ────────────────────────────────────────────────
 
 /// `TCGETS`: read terminal attributes (`struct termios`).
 const TCGETS: u64 = 0x5401;
@@ -849,7 +849,7 @@ const TCSETSF: u64 = 0x5404;
 /// `TIOCGWINSZ`: read the window size (`struct winsize`).
 const TIOCGWINSZ: u64 = 0x5413;
 const TIOCSWINSZ: u64 = 0x5414;
-/// STAGE-16.14: terminal foreground process group (bash job control).
+/// Terminal foreground process group (bash job control).
 const TIOCGPGRP: u64 = 0x540F;
 const TIOCSPGRP: u64 = 0x5410;
 
@@ -896,7 +896,7 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
             copy_out(arg, &build_termios());
             Ok(0)
         }
-        // STAGE-14 RAW TTY: if ICANON is cleared, switch to raw mode so reads
+        // If ICANON is cleared, switch to raw mode so reads
         // return one byte at a time (nvim/less/vim need this).
         TCSETS | TCSETSW | TCSETSF => {
             if arg != 0 {
@@ -924,7 +924,7 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
         // Window-size writes are accepted and ignored (readline issues
         // TIOCSWINSZ during startup to propagate its computed size).
         TIOCSWINSZ => Ok(0),
-        // STAGE-16.14: report the caller as the foreground process group and
+        // Report the caller as the foreground process group and
         // accept ownership changes silently. Without these, bash printed
         // "cannot set terminal process group (-1)" + "no job control in this
         // shell" on every start.
@@ -939,17 +939,17 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
     }
 }
 
-// STAGE-13.8 SELECT: bytes of a cooked line the previous read(2) did not
+// Bytes of a cooked line the previous read(2) did not
 // consume — readline drains input one byte per read after select().
 static STDIN_PENDING: crate::sync::spinlock::Spinlock<alloc::vec::Vec<u8>> =
     crate::sync::spinlock::Spinlock::new(alloc::vec::Vec::new());
 
-// STAGE-16.3: libuv puts the raw tty into O_NONBLOCK and multiplexes it with
+// Libuv puts the raw tty into O_NONBLOCK and multiplexes it with
 // epoll; a read that blocks in-kernel stalls nvim's whole TUI event loop.
 static STDIN_NONBLOCK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// STAGE-16.3: true when a raw-mode stdin read can make progress right now:
+/// True when a raw-mode stdin read can make progress right now:
 /// leftover bytes, queued VT query replies, or an unread keyboard scancode.
 pub(crate) fn stdin_input_available() -> bool {
     !STDIN_PENDING.lock().is_empty()
@@ -957,7 +957,7 @@ pub(crate) fn stdin_input_available() -> bool {
         || crate::drivers::ps2_kbd::has_pending()
 }
 
-// STAGE-16.4 DIAG: black-screen telemetry. Counts bytes through the three
+// Black-screen telemetry. Counts bytes through the three
 // pipeline segments (client stdout -> VT, RPC socketpair reads/writes) and
 // logs the first byte plus every `step` bytes after, so one glance at the
 // screen shows WHERE the nvim pipeline stalls.
@@ -977,7 +977,7 @@ fn diag_count(ctr: &core::sync::atomic::AtomicU64, label: &str, n: u64, step: u6
 /// Hard cap so a pathological paste cannot grow the cooked line unbounded.
 const STDIN_LINE_MAX: usize = 4096;
 
-/// Blocking, line-buffered stdin read from the PS/2 keyboard (stage 13.7).
+/// Blocking, line-buffered stdin read from the PS/2 keyboard.
 ///
 /// Cooked-tty semantics: printable characters echo as they are typed, Backspace
 /// erases, Tab expands to four spaces (one byte per rendered column keeps the
@@ -986,12 +986,12 @@ const STDIN_LINE_MAX: usize = 4096;
 /// Blocks by yielding to the scheduler between polls, so the shell's
 /// foreground wait and the timer keep running while a binary sits in `read`.
 
-// STAGE-14 RAW TTY: in raw mode (ICANON cleared) return one byte immediately;
+// In raw mode (ICANON cleared) return one byte immediately;
 // map special keys to ANSI escape sequences so nvim's terminal layer works.
 fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
     use crate::shell::keys::{Decoder, KeyEvent};
     if count == 0 { return Ok(0); }
-    // STAGE-16.3: queue any pending VT query replies (DA1/DSR/DECRQM/OSC)
+    // Queue any pending VT query replies (DA1/DSR/DECRQM/OSC)
     // so nvim's terminal interrogation gets its answers on stdin.
     {
         let resp = crate::drivers::vt::take_input_responses();
@@ -1011,7 +1011,7 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
         }
     }
     let mut decoder = Decoder::new();
-    // STAGE-16.3: once a scancode was consumed, wait a bounded number of
+    // Once a scancode was consumed, wait a bounded number of
     // polls so multi-byte sequences (E0-prefixed arrows) complete, but a
     // lone key-release cannot park a nonblocking reader forever.
     let mut consumed_any = false;
@@ -1021,7 +1021,7 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
         let sc = match sc {
             Some(b) => b,
             None => {
-                // STAGE-16.3: honor O_NONBLOCK - blocking here stalled
+                // Honor O_NONBLOCK - blocking here stalled
                 // nvim's TUI loop before the first frame was drawn.
                 if STDIN_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed)
                     && (!consumed_any || spins > 200)
@@ -1171,10 +1171,10 @@ pub fn sys_access(path: u64, _mode: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `mkdir` (83): create a directory on the mounted VFS/ext2 tree (STAGE-13.8).
+/// `mkdir` (83): create a directory on the mounted VFS/ext2 tree.
 /// CPython probes it for pyc cache directories; ENOSYS was tolerated but
 /// logged an "unsupported syscall" warning on every interpreter start.
-/// STAGE-16.13 `rename` (82). The VFS trait has no native rename, so this is
+/// `rename` (82). The VFS trait has no native rename, so this is
 /// an emulation at the syscall layer: copy the file contents to the target
 /// path, then unlink the source. Not atomic (irrelevant for a single-user
 /// kernel) and files only: directory renames report EACCES with a WARN so a
@@ -1427,7 +1427,7 @@ pub fn sys_dup(oldfd: u64) -> Result<u64, Errno> {
     let r = compat::with_current_compat(|cs| cs.fds.dup(oldfd as u32))
         .unwrap_or(Err(Errno::EBADF))
         .map(|fd| fd as u64);
-    // STAGE-16.8 DIAG: nvim dup()s its stdio before hiding it behind stderr;
+    // Nvim dup()s its stdio before hiding it behind stderr;
     // an EBADF here means fd 0/1 were already gone when the server started.
     match &r {
         Ok(fd) => crate::warn!("[DIAG] dup pid={} oldfd={} -> {}",
@@ -1442,7 +1442,7 @@ pub fn sys_dup(oldfd: u64) -> Result<u64, Errno> {
 /// whatever occupies `newfd` first. If `oldfd == newfd` and `oldfd` is valid, it is
 /// returned unchanged (no close); `EBADF` if `oldfd` is invalid.
 pub fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, Errno> {
-    // STAGE-16.7 DIAG: stdio rewiring during spawn is exactly where a lost
+    // Stdio rewiring during spawn is exactly where a lost
     // nvim RPC channel would hide; dup2/dup3 are rare enough to log each call.
     crate::warn!("[DIAG] dup2 pid={} oldfd={} newfd={}",
         crate::task::scheduler::current_pid(), oldfd, newfd);
@@ -1474,7 +1474,7 @@ pub fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> Result<u64, Errno> {
     }
     compat::with_current_compat(|cs| {
         let fd = cs.fds.dup_to(oldfd as u32, newfd as u32)?;
-        // STAGE-15: dup3's only flag — mark the new descriptor close-on-exec.
+        // Dup3's only flag — mark the new descriptor close-on-exec.
         if flags & O_CLOEXEC != 0 { cs.fds.set_cloexec(fd, true); }
         Ok(fd as u64)
     })
@@ -1492,15 +1492,15 @@ const F_DUPFD_CLOEXEC: u64 = 1030;
 /// `fcntl` (72): the descriptor-management subset.
 ///   * `F_DUPFD` → duplicate `fd` into the lowest free descriptor `>= arg`.
 ///   * `F_DUPFD_CLOEXEC` → same, and mark the duplicate close-on-exec.
-///   * `F_GETFD`/`F_SETFD` → STAGE-15: FD_CLOEXEC is tracked for real now
+///   * `F_GETFD`/`F_SETFD` → FD_CLOEXEC is tracked for real now
 ///     (libuv marks its fork error pipe with it and execve must sweep it).
 ///   * `F_GETFL` → O_RDWR plus O_NONBLOCK when the descriptor is nonblocking.
-///   * `F_SETFL` → STAGE-16: O_NONBLOCK is applied for real to pipes, sockets
+///   * `F_SETFL` → O_NONBLOCK is applied for real to pipes, sockets
 ///     and listeners (libuv reads until EAGAIN, so this must work); other
 ///     flags are accepted and ignored.
 ///   * anything else → `EINVAL`.
 pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
-    // STAGE-16.8 DIAG: libuv's child-init shuffles stdio fds with F_DUPFD.
+    // Libuv's child-init shuffles stdio fds with F_DUPFD.
     if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC {
         crate::warn!("[DIAG] fcntl_dupfd pid={} fd={} min={} cloexec={}",
             crate::task::scheduler::current_pid(), fd, arg, cmd == F_DUPFD_CLOEXEC);
@@ -1539,7 +1539,7 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
                         OpenObject::Socket { rx, .. } => rx.nonblocking(),
                         OpenObject::UnixListener(l) => l.inner.lock().nonblocking,
                         OpenObject::UnixSocketUnbound { nonblocking } => *nonblocking,
-                        // STAGE-16.3: stdin reports its real nonblocking state.
+                        // Stdin reports its real nonblocking state.
                         OpenObject::Stdin => STDIN_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed),
                         _ => false,
                     };
@@ -1556,7 +1556,7 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
                         }
                         OpenObject::UnixListener(l) => l.inner.lock().nonblocking = on,
                         OpenObject::UnixSocketUnbound { nonblocking } => *nonblocking = on,
-                        // STAGE-16.3: libuv flips O_NONBLOCK on the raw tty.
+                        // Libuv flips O_NONBLOCK on the raw tty.
                         OpenObject::Stdin => { crate::warn!("[DIAG] fcntl: stdin O_NONBLOCK={}", on); STDIN_NONBLOCK.store(on, core::sync::atomic::Ordering::Relaxed); }
                         _ => {}
                     }
@@ -1571,7 +1571,7 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
 
 /// `readlink` (89): no symbolic links exist in this filesystem, so a path that
 /// resolves to an existing node is "not a symlink" (`EINVAL`) and an absent path
-/// is `ENOENT`. STAGE-15 exception: `/proc/self/exe` resolves to the exec'd
+/// is `ENOENT`. Exception: `/proc/self/exe` resolves to the exec'd
 /// image path (libuv's uv_exepath — nvim's progpath — reads it, and the forked
 /// child re-execs that path to start the embedded server).
 pub fn sys_readlink(path: u64, buf: u64, bufsiz: u64) -> Result<u64, Errno> {
@@ -1623,7 +1623,7 @@ pub fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Er
             }
             let mut kbuf = vec![0u8; copied as usize];
             let n = node.read(offset, &mut kbuf).map_err(|e| {
-                // STAGE-13.7: a real VFS/ext2 read failure is not "invalid
+                // A real VFS/ext2 read failure is not "invalid
                 // argument" — report EIO and log what actually broke.
                 crate::error!(
                     "[linux] file read failed: {:?} ino={} off={} len={}",
@@ -1755,7 +1755,7 @@ fn poll_revents(fd:i32,events:i16)->i16{if fd<0{return 0}match resolve_fd(fd as 
 pub fn sys_poll(fds:u64,nfds:u64,timeout:u64)->Result<u64,Errno>{const SZ:u64=8;if nfds>1024{return Err(Errno::EINVAL)}check_user_ptr(fds,nfds.checked_mul(SZ).ok_or(Errno::EINVAL)?)?;let ms=timeout as i64;let deadline=if ms<0{None}else{Some(crate::task::scheduler::ticks().saturating_add((ms as u64).saturating_add(9)/10))};loop{let mut ready=0;for i in 0..nfds{let p=fds+i*SZ;let fd=unsafe{*(p as*const i32)};let ev=unsafe{*((p+4)as*const i16)};let rev=poll_revents(fd,ev);unsafe{*((p+6)as*mut i16)=rev}if rev!=0{ready+=1}}if ready!=0||ms==0{return Ok(ready)}if let Some(end)=deadline{if crate::task::scheduler::ticks()>=end{return Ok(0)}}crate::task::scheduler::yield_current()}}
 
 // ---------------------------------------------------------------------------
-// STAGE-13.8 SELECT: minimal select/pselect6/ppoll (nr 23/270/271). GNU
+// Minimal select/pselect6/ppoll (nr 23/270/271). GNU
 // readline (loaded by the CPython REPL now that libreadline is installed)
 // waits for stdin with pselect6 before every byte; ENOSYS left it spinning
 // right after the first `>>>` prompt. The cooked-tty stdin always reports
@@ -1901,7 +1901,7 @@ pub fn sys_ppoll(fds: u64, nfds: u64, ts: u64, _sigmask: u64) -> Result<u64, Err
     sys_poll(fds, nfds, ms as u64)
 }
 
-// ─── STAGE-15: socketpair (53) + statx (332) ───────────────────────────────────────────
+// ─── socketpair (53) + statx (332) ───────────────────────────────────────────
 
 const AF_UNIX: u64 = 1;
 const SOCK_STREAM: u64 = 1;

@@ -125,7 +125,7 @@ impl VirtioBlkDevice {
     }
 }
 
-// STAGE-16.13: write-through sector cache. ext2 re-reads the same metadata
+// Write-through sector cache. ext2 re-reads the same metadata
 // blocks (block/inode bitmaps, inode tables, directory blocks, indirect
 // blocks) thousands of times during apt unpacks and nvim `:help` tag loads;
 // every one of those was a full virtio round-trip. All disk I/O funnels
@@ -178,7 +178,7 @@ impl BlockDevice for VirtioBlkDevice {
     /// kernel-visible state unchanged.
     fn read_block(&self, block: u64, buf: &mut [u8]) -> Result<usize, ()> {
         self.validate(block, buf.len())?;
-        // STAGE-16.13: serve fully-cached requests from RAM.
+        // Serve fully-cached requests from RAM.
         if cache_fetch(self.name, block, buf) {
             return Ok(buf.len());
         }
@@ -200,7 +200,7 @@ impl BlockDevice for VirtioBlkDevice {
             let mut dev = self.inner.lock();
             dev.write_blocks(block as usize, buf).map_err(|_| ())?;
         }
-        // STAGE-16.13: write-through so subsequent reads hit the cache.
+        // Write-through so subsequent reads hit the cache.
         cache_store(self.name, block, buf);
         Ok(buf.len())
     }

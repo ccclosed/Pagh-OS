@@ -43,7 +43,7 @@ pub enum TarType {
     /// A directory (`typeflag` `'5'`).
     Directory,
     /// A symbolic link (`typeflag` `'2'`) or hard link (`'1'`).
-    /// STAGE-13.8: previously classified as `Other` and silently skipped by
+    /// Previously classified as `Other` and silently skipped by
     /// the installer, which lost e.g. libc6's `/lib64/ld-linux-x86-64.so.2`.
     Symlink,
     /// Any other entry kind (device, fifo, ...).

@@ -126,7 +126,7 @@ fn draw_arrow(fb: &mut framebuffer::FramebufferWriter, x: usize, y: usize) {
     }
 }
 
-// ─── STAGE-13.8: cursor-safe text output ─────────────────────────────────────
+// ─── cursor-safe text output ─────────────────────────────────────
 //
 // The framebuffer console can be written from arbitrary threads (kernel logs,
 // the first-boot provisioner, the Linux-compat stdout mirror). Only the shell

@@ -79,7 +79,7 @@ pub fn install_data_tar(entries: &[TarEntry<'_>], root: &str) -> Result<usize, I
         installed += 1;
     }
 
-    // STAGE-13.8 SYMLINK FIX: ext2 write support has no symlinks, and skipping
+    // Ext2 write support has no symlinks, and skipping
     // them lost critical files (libc6 ships /lib64/ld-linux-x86-64.so.2 and
     // most lib*.so.N names only as symlinks; python3-minimal ships
     // /usr/bin/python3 as a symlink). Materialize each link as a plain copy of

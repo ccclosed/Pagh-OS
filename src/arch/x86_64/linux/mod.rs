@@ -123,7 +123,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::EPOLL_WAIT => epoll_sys::sys_epoll_wait(a[0], a[1], a[2], a[3]),
         sysno::PIPE => io_sys::sys_pipe(a[0]),
         sysno::PIPE2 => io_sys::sys_pipe2(a[0], a[1]),
-        // ── STAGE-15: nvim uv_spawn support ──
+        // ── nvim uv_spawn support ──
         sysno::SOCKETPAIR => io_sys::sys_socketpair(a[0], a[1], a[2], a[3]),
         sysno::STATX => io_sys::sys_statx(a[0], a[1], a[2], a[3], a[4]),
         sysno::EPOLL_PWAIT => epoll_sys::sys_epoll_pwait(a[0], a[1], a[2], a[3], a[4]),
@@ -281,7 +281,7 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
     }
 
     // ── 3. Route to the handler and fold the result into rax (R1.3) ──
-    // STAGE-16.6: bracket the routed handler with the stuck-syscall watchdog
+    // Bracket the routed handler with the stuck-syscall watchdog
     // table, so a silent in-kernel block names its pid + syscall in the log.
     let wd_pid = crate::task::scheduler::current_pid();
     inflight_enter(wd_pid, nr, args[0]);
@@ -296,7 +296,7 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
     match result {
         Ok(v) => v,
         Err(e) => {
-            // STAGE-13.7 DIAG: EINVAL returns are logged with their syscall
+            // EINVAL returns are logged with their syscall
             // number and raw args. Userspace surfaces a bare OSError(EINVAL)
             // (python importlib get_data) with no way to tell which syscall
             // produced it; this pinpoints the culprit on the next run.
@@ -318,7 +318,7 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
 }
 
 
-// ─── STAGE-16.6: stuck-syscall watchdog ────────────────────────────────────────
+// ─── stuck-syscall watchdog ────────────────────────────────────────
 // A silent hang (nvim's black screen) means some Compat_Process is parked
 // inside one blocking syscall forever, with nothing in the log to say WHICH
 // pid in WHICH syscall. linux_dispatch brackets every routed syscall with
@@ -353,7 +353,7 @@ fn wd_sys_name(nr: u64) -> &'static str {
 /// COMPAT_STATES is only taken AFTER the in-flight lock is released, so the
 /// two locks never nest and no ordering hazard is introduced.
 pub fn watchdog_tick() {
-    // STAGE-16.7: the stuck task itself spins through yield_current, so this
+    // The stuck task itself spins through yield_current, so this
     // is the one place where its OWN fd table is the current one — dump its
     // epoll interest list from here.
     maybe_dump_self();
@@ -388,7 +388,7 @@ pub fn watchdog_tick() {
 }
 
 
-/// STAGE-16.7: when the CURRENT task is the one stuck in epoll_wait (232) or
+/// When the CURRENT task is the one stuck in epoll_wait (232) or
 /// epoll_pwait (281), dump its interest list with live readiness every ~10 s.
 /// Runs in the stuck task's own context (it spins through yield_current), so
 /// the ordinary current-task fd helpers resolve against the right table.
@@ -411,7 +411,7 @@ fn maybe_dump_self() {
         }
     };
     if let Some(epfd) = epfd {
-        // STAGE-16.8.2/3: the spawn-time [DIAG] lines are wiped when the TUI
+        // The spawn-time [DIAG] lines are wiped when the TUI
         // clears the screen, and the QEMU display cannot scroll back. Re-print
         // the decisive evidence with every dump: what stdio is NOW and what it
         // was AT execve time (after the close-on-exec sweep).

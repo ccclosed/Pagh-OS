@@ -1,4 +1,4 @@
-//! STAGE-16: minimal AF_UNIX stream sockets — socket(41)/connect(42)/
+//! Minimal AF_UNIX stream sockets — socket(41)/connect(42)/
 //! accept(43)/bind(49)/listen(50)/getsockname(51)/accept4(288).
 //!
 //! Listeners live in a global path-keyed registry; a connection is a pair of
@@ -214,7 +214,7 @@ pub fn sys_setsockopt(_fd: u64, _level: u64, _optname: u64, _optval: u64, _optle
 /// defaults instead of parsing uninitialised memory.
 pub fn sys_getsockopt(_fd: u64, level: u64, optname: u64, optval: u64, optlen: u64) -> Result<u64, Errno> {
     if level != SOL_SOCKET { return Err(Errno::EINVAL); }
-    // STAGE-16.2: SO_TYPE is what libuv's uv_guess_handle asks right after
+    // SO_TYPE is what libuv's uv_guess_handle asks right after
     // fstat reports S_IFSOCK on the stdio fds of the embedded-nvim channel.
     // Failing it made the whole channel UV_UNKNOWN_HANDLE and hung the
     // msgpack-RPC handshake (TUI waited forever on a dead pipe).

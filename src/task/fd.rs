@@ -48,7 +48,7 @@ impl PipeEndpoint {
     pub fn read_ready(&self)->bool {let s=self.state.lock();!s.bytes.is_empty()||s.writers==0}
     pub fn write_ready(&self)->bool {let s=self.state.lock();s.readers>0&&s.bytes.len()<PIPE_CAPACITY}
     pub fn peer_closed(&self)->bool {let s=self.state.lock();if self.read_end{s.writers==0}else{s.readers==0}}
-    /// STAGE-16: clone this endpoint with a different O_NONBLOCK flag (fcntl
+    /// Clone this endpoint with a different O_NONBLOCK flag (fcntl
     /// F_SETFL). The clone registers as an extra reader/writer on the shared
     /// queue; the original's count drops when its last Arc is released.
     pub fn with_nonblocking(self: &Arc<Self>, on: bool) -> Arc<PipeEndpoint> {
@@ -83,12 +83,12 @@ pub enum OpenObject {
     PipeWrite(Arc<PipeEndpoint>),
     /// An eventfd counter (EFD_SEMAPHORE if semaphore=true).
     Eventfd { val: Arc<Spinlock<u64>>, semaphore: bool },
-    /// STAGE-15: one end of an AF_UNIX stream socketpair — a cross-connected
+    /// One end of an AF_UNIX stream socketpair — a cross-connected
     /// pair of pipe endpoints (rx = this end's incoming bytes, tx = outgoing).
     Socket { rx: Arc<PipeEndpoint>, tx: Arc<PipeEndpoint> },
-    /// STAGE-16: a bound/listening AF_UNIX server socket.
+    /// A bound/listening AF_UNIX server socket.
     UnixListener(Arc<UnixListenerState>),
-    /// STAGE-16: socket(2) created but not yet bound or connected.
+    /// Socket(2) created but not yet bound or connected.
     UnixSocketUnbound { nonblocking: bool },
     /// An epoll instance with its interest list.
     Epoll { interests: Arc<Spinlock<Vec<EpollEntry>>> },
@@ -152,7 +152,7 @@ impl OpenObject {
 #[derive(Clone)]
 pub struct FdTable {
     slots: FdSlots<OpenObject>,
-    /// STAGE-15: descriptors flagged close-on-exec (O_CLOEXEC / FD_CLOEXEC).
+    /// Descriptors flagged close-on-exec (O_CLOEXEC / FD_CLOEXEC).
     /// Swept by execve; libuv's fork+exec error-pipe protocol depends on it.
     cloexec: BTreeSet<u32>,
 }
@@ -254,7 +254,7 @@ impl FdTable {
         Ok(newfd)
     }
 
-    // ── STAGE-15: close-on-exec bookkeeping ──
+    // ── close-on-exec bookkeeping ──
 
     /// Set or clear the FD_CLOEXEC flag for `fd`.
     pub fn set_cloexec(&mut self, fd: u32, on: bool) {
@@ -264,7 +264,7 @@ impl FdTable {
     /// Whether `fd` carries the FD_CLOEXEC flag.
     pub fn is_cloexec(&self, fd: u32) -> bool { self.cloexec.contains(&fd) }
 
-    /// STAGE-16.8 DIAG: short human name for whatever occupies `fd`.
+    /// Short human name for whatever occupies `fd`.
     pub fn describe_fd(&self, fd: u32) -> &'static str {
         match self.slots.get(fd) {
             None => "closed",
@@ -288,7 +288,7 @@ impl FdTable {
         for fd in fds { let _ = self.slots.close(fd); }
     }
 
-    /// STAGE-15 `socketpair(AF_UNIX, SOCK_STREAM)`: two cross-connected
+    /// `socketpair(AF_UNIX, SOCK_STREAM)`: two cross-connected
     /// in-kernel byte queues. Each end reads from one queue and writes to the
     /// other, so BOTH fds are readable and writable (unlike a pipe). Closing
     /// one end makes the peer observe EOF on read and EPIPE on write.
@@ -305,14 +305,14 @@ impl FdTable {
         };
         let fa = self.alloc(a);
         let fb = self.alloc(b);
-        // STAGE-16.8 DIAG: which descriptor numbers the RPC channel ends get.
+        // Which descriptor numbers the RPC channel ends get.
         crate::warn!("[DIAG] socketpair pid={} -> ({},{})",
             crate::task::scheduler::current_pid(), fa, fb);
         (fa, fb)
     }
 }
 
-// --- STAGE-16: AF_UNIX listener plumbing -----------------------------------
+// --- AF_UNIX listener plumbing -----------------------------------
 
 /// Mutable half of a listening AF_UNIX socket.
 pub struct UnixListenerInner {
@@ -325,7 +325,7 @@ pub struct UnixListenerInner {
     pub pending: VecDeque<(Arc<PipeEndpoint>, Arc<PipeEndpoint>)>,
 }
 
-/// STAGE-16: a bound AF_UNIX stream server socket (uv_pipe server in nvim).
+/// A bound AF_UNIX stream server socket (uv_pipe server in nvim).
 pub struct UnixListenerState {
     /// The sockaddr_un path this socket was bound to.
     pub path: String,
@@ -338,7 +338,7 @@ impl UnixListenerState {
     }
 }
 
-/// STAGE-16: build the two endpoint pairs of a connected AF_UNIX stream —
+/// Build the two endpoint pairs of a connected AF_UNIX stream —
 /// (client side, server side) — without allocating fds. connect(2) pushes the
 /// server pair into the listener queue and installs the client pair locally;
 /// accept(2) later turns the server pair into a fresh fd.

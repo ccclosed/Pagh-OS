@@ -66,7 +66,7 @@ pub fn seed() {
     }
 }
 
-// ─── STAGE-13.8: first-boot base userland (glibc + python3) ──────────────────
+// ─── first-boot base userland (glibc + python3) ──────────────────
 
 /// True when any glibc CPython is present under /mnt/usr/bin.
 fn python_installed() -> bool {
@@ -79,7 +79,7 @@ fn python_installed() -> bool {
     entries.iter().any(|n| n.name().starts_with("python3"))
 }
 
-/// STAGE-16.7: the first-boot python download is opt-in. Called from the
+/// The first-boot python download is opt-in. Called from the
 /// shell thread right before the shell starts (sole scancode consumer at that
 /// moment, interrupts already on). Enter or Y = install in the background
 /// (the old behavior); N = skip — 'apt update' + 'apt install python3' from
@@ -135,7 +135,7 @@ pub fn ensure_base_packages_thread() {
     if python_installed() {
         return;
     }
-    // STAGE-13.8: keep the interactive console clean -- all apt chatter
+    // Keep the interactive console clean -- all apt chatter
     // (download progress, index parsing, installer output) goes to serial
     // only; the framebuffer sees just the milestones below. The full Debian
     // index parse alone takes a couple of minutes of quiet CPU time.

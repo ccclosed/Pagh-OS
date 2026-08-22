@@ -604,7 +604,7 @@ impl FbWriter {
 
 impl crate::drivers::Console for FbWriter {
     fn write_str(&self, s: &str) {
-        // STAGE-13.8: keep the software mouse cursor coherent -- hide it
+        // Keep the software mouse cursor coherent -- hide it
         // around the glyph write so scrolling/overdraw never captures or
         // restores a stale background (see drivers::cursor::text_begin).
         crate::drivers::cursor::text_begin();
@@ -630,7 +630,7 @@ pub fn console() -> &'static FbWriter {
 }
 
 pub fn _print(args: fmt::Arguments) {
-    // STAGE-13.8: cursor-safe text output (see drivers::cursor::text_begin).
+    // Cursor-safe text output (see drivers::cursor::text_begin).
     crate::drivers::cursor::text_begin();
     FB_WRITER.write_fmt(args);
     crate::drivers::cursor::text_end();

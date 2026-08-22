@@ -438,7 +438,7 @@ fn kernel_main() -> ! {
     #[cfg(feature = "lx_bigindex")]
     task::scheduler::kernel_thread_spawn(crate::selftest_lx::run_bigindex_check);
 
-    // STAGE-13.8 / STAGE-16.7: the first-boot base userland (glibc + python3)
+    // The first-boot base userland (glibc + python3)
     // download is opt-in now. shell_thread asks Y/n on the console first and
     // spawns crate::provision::ensure_base_packages_thread only on consent.
 
@@ -456,7 +456,7 @@ fn shell_thread() {
         core::hint::spin_loop();
     }
 
-    // STAGE-16.7: ask about the first-boot python download HERE — this thread
+    // Ask about the first-boot python download HERE — this thread
     // is the sole keyboard consumer at this moment (the shell starts right
     // after, nothing can steal the answer) and interrupts are already live.
     if crate::provision::prompt_base_packages() {

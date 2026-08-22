@@ -120,13 +120,13 @@ pub fn _log(level: Level, args: fmt::Arguments) {
     // has been initialized, so fanning out unconditionally is safe and only
     // produces output once the framebuffer console is live.
     //
-    // STAGE-13.8: long-running background work (first-boot provisioning) can
+    // Long-running background work (first-boot provisioning) can
     // pause the framebuffer mirror so its noisy per-chunk progress stays on
     // serial only and the interactive console is not flooded.
-    // STAGE-16.10: [WARN] chatter (watchdog / [DIAG] telemetry) stays off the
+    // [WARN] chatter (watchdog / [DIAG] telemetry) stays off the
     // framebuffer unless explicitly enabled with the `warn on` shell command;
     // it was wrecking full-screen TUIs (nvim). Serial always logs everything.
-    // STAGE-16.14: [INFO] is muted from the framebuffer under the same toggle:
+    // [INFO] is muted from the framebuffer under the same toggle:
     // async "Compat_Process pid=N started" lines were interleaving with bash
     // output and garbling the screen. [ERROR] still always mirrors.
     let warn_muted = (level == Level::Warn || level == Level::Info)
@@ -136,7 +136,7 @@ pub fn _log(level: Level, args: fmt::Arguments) {
     }
 }
 
-/// STAGE-16.10: when `false` (default), `warn!` lines are written to serial
+/// When `false` (default), `warn!` lines are written to serial
 /// only and skip the framebuffer console. Toggled by the `warn` shell command.
 static FB_WARN_MIRROR: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);

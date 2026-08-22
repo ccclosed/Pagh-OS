@@ -75,7 +75,7 @@ pub fn line(received: u64, total: Option<u64>) -> String {
 pub fn show(text: &str) {
     ACTIVE.store(true, Ordering::Relaxed);
     crate::kprint!("\r{}", text);
-    // STAGE-13.8: while the framebuffer log mirror is paused (background
+    // While the framebuffer log mirror is paused (background
     // provisioning), the bar stays on serial only -- the interactive console
     // is not redrawn hundreds of times by a background download.
     if !crate::log::fb_mirror_paused() {

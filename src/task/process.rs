@@ -380,7 +380,7 @@ fn read_interpreter(data: &[u8]) -> Result<Option<Vec<u8>>, RunError> {
     } else {
         format!("/mnt/{}", path)
     };
-    // STAGE-13.8 INTERP FALLBACK: PT_INTERP names /lib64/ld-linux-x86-64.so.2,
+    // PT_INTERP names /lib64/ld-linux-x86-64.so.2,
     // which in Debian debs exists only as a symlink; the real loader lives in
     // /usr/lib/x86_64-linux-gnu. Try the literal path first, then the known
     // merged-usr locations, so a missing symlink cannot break every launch.
@@ -522,7 +522,7 @@ pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u6
             VmRegionSet::new(elf.initial_brk, USER_MMAP_BASE),
             pid,
         );
-        // STAGE-15: remember the image path for readlink("/proc/self/exe").
+        // Remember the image path for readlink("/proc/self/exe").
         state.exe_path = path.to_string();
         // Register BEFORE enqueue so the first syscall the process makes already
         // sees its CompatState (and so the dispatcher routes it as a Linux task).
@@ -555,7 +555,7 @@ pub struct ExecImage {
     pub pml4_phys: u64,
 }
 
-/// STAGE-15: resolve an execve path against the process cwd and the /mnt ext2
+/// Resolve an execve path against the process cwd and the /mnt ext2
 /// root. The forked nvim child execs the /proc/self/exe target or a $PATH hit
 /// like "/mnt/usr/bin/nvim" directly; plain Linux paths ("/usr/bin/x") fall
 /// through to the /mnt-prefixed form.
@@ -581,7 +581,7 @@ fn resolve_exec_path(path: &str) -> String {
 /// descriptors, cwd, ppid and pid survive; VM/TLS/image state is reset.
 pub fn exec_linux_image(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<ExecImage, RunError> {
     if !arg_gate(argv) || !arg_gate(envp) { return Err(RunError::ArgsTooLarge); }
-    // STAGE-15: resolve the path the way Linux userspace sees the tree.
+    // Resolve the path the way Linux userspace sees the tree.
     let resolved = resolve_exec_path(path);
     let path = resolved.as_str();
     let data = read_file_all(path)?;
@@ -610,10 +610,10 @@ pub fn exec_linux_image(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<Ex
         compat::with_current_compat(|st| {
             st.vm = VmRegionSet::new(elf.initial_brk, USER_MMAP_BASE);
             st.fs_base = 0; st.tid = pid; st.nosys_logged.clear(); st.exit_code = None;
-            // STAGE-15: the close-on-exec sweep (libuv's fork error pipe
+            // The close-on-exec sweep (libuv's fork error pipe
             // relies on it) + record the new image for /proc/self/exe.
             st.fds.close_cloexec();
-            // STAGE-16.8 DIAG: what the fresh image actually sees on stdio —
+            // What the fresh image actually sees on stdio —
             // answers whether the spawn wired the RPC socket onto fds 0/1.
             st.exec_stdio = [st.fds.describe_fd(0), st.fds.describe_fd(1), st.fds.describe_fd(2)];
             crate::warn!("[DIAG] execve pid={} fd0={} fd1={} fd2={}",
@@ -674,7 +674,7 @@ pub fn spawn_linux_thread(
     Ok(child)
 }
 
-/// STAGE-15 fork: duplicate the current Compat_Process into a fresh pid with a
+/// Duplicate the current Compat_Process into a fresh pid with a
 /// deep-copied address space (eager page copy — no COW). The child resumes at
 /// the same user RIP (`regs.rcx` on the syscall path) with `rax = 0` (the zero
 /// rax slot in `build_clone_frame`) on its private copy of the parent's user

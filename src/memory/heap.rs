@@ -26,7 +26,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use good_memory_allocator::SpinLockedAllocator;
 
-/// STAGE-13.8 DEADLOCK FIX: interrupt-safe wrapper around galloc.
+/// Interrupt-safe wrapper around galloc.
 ///
 /// `SpinLockedAllocator`'s internal spin lock does NOT disable interrupts, so
 /// the timer could preempt a thread MID-ALLOCATION while it held the heap

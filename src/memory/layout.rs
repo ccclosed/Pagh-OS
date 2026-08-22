@@ -74,7 +74,7 @@ pub const USER_STACK_TOP: u64 = 0x7000_8000_0000;
 
 /// Number of pages mapped for the user-mode stack.
 ///
-/// STAGE-13.7 FIX: 8 pages (32 KiB) starved real Linux binaries — CPython blew
+/// 8 pages (32 KiB) starved real Linux binaries — CPython blew
 /// through it during interpreter startup and page-faulted on a push just below
 /// RSP (`W=true U=true P=false` at `rsp-8`). Linux's default `RLIMIT_STACK` is
 /// 8 MiB, so map 2048 pages eagerly; the region still sits far above the
@@ -117,7 +117,7 @@ pub const USER_MMAP_BASE: u64 = 0x2000_0000_0000;
 /// `apt update` against it fails with a clear error rather than exhausting the
 /// heap; use a smaller component / local mirror (or raise both limits + QEMU
 /// `-m`) for a full index.
-// STAGE-13.8: 512 MiB (was 256 MiB). The fixed galloc arena must hold the
+// 512 MiB (was 256 MiB). The fixed galloc arena must hold the
 // whole parsed apt package index (~60k stanzas) plus normal kernel churn;
 // 256 MiB proved too tight and `apt update` died mid-parse with
 // IndexTooLarge. Requires the VM to run with >= 1 GiB of RAM (run.sh -m).

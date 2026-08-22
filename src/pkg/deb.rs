@@ -620,7 +620,7 @@ where
                 // No progress with input still pending means a truncated/corrupt
                 // stream that can never complete: fail rather than spin.
                 if consumed == 0 && written == 0 {
-                    // STAGE-13.8 DIAGNOSTIC: pinpoint the stall for the serial log.
+                    // Pinpoint the stall for the serial log.
                     crate::warn!(
                         "deb: inflate stalled (no progress), {} input bytes remaining, status {:?}",
                         input.len(),
@@ -630,7 +630,7 @@ where
                 }
             }
             Err(e) => {
-                // STAGE-13.8 DIAGNOSTIC: pinpoint the decode error for the serial log.
+                // Pinpoint the decode error for the serial log.
                 crate::warn!(
                     "deb: inflate error {:?}, {} input bytes remaining",
                     e,

@@ -839,7 +839,7 @@ pub(super) fn cmd_lua(ctx: &mut ShellCtx, args: &[&str]) {
     runtime_command(ctx, "/mnt/usr/bin/lua", &[], args);
 }
 
-/// STAGE-13.8: locate an installed glibc CPython under /mnt/usr/bin (any
+/// Locate an installed glibc CPython under /mnt/usr/bin (any
 /// python3* name), preferring the most specific/versioned entry, so the alias
 /// works with whatever apt/provisioning installed (python3.13, 3.16, ...).
 fn find_python() -> Option<alloc::string::String> {
@@ -1013,7 +1013,7 @@ pub(super) fn cmd_pkg(_ctx: &mut ShellCtx, args: &[&str]) {
 /// scheduler. Only static `ET_EXEC` / static-PIE `ET_DYN` binaries are supported
 /// (dynamically-linked binaries are rejected). Like `exec`, this runs with
 /// interrupts disabled across the brief CR3 switch the loader/stack mapper perform.
-/// STAGE-16.10: `warn` toggles mirroring of `[WARN]` kernel log lines onto
+/// `warn` toggles mirroring of `[WARN]` kernel log lines onto
 /// the framebuffer console. Serial always receives every line regardless;
 /// this only controls the on-screen spam that wrecked full-screen TUIs.
 pub(super) fn cmd_warn(_ctx: &mut ShellCtx, args: &[&str]) {
@@ -1045,7 +1045,7 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
     // argv[0] is the program name as typed; remaining tokens follow.
     let argv: alloc::vec::Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
 
-    // STAGE-14: initialise the VT emulator so nvim' ANSI output renders correctly.
+    // Initialise the VT emulator so nvim's ANSI output renders correctly.
     crate::drivers::vt::init();
     let env: [&[u8]; 9] = [
         b"TERM=xterm",
@@ -1056,7 +1056,7 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
         b"PYTHONPATH=/mnt/usr/lib/python3.13:/mnt/usr/lib/python3.16",
         b"RUSTUP_HOME=/mnt/usr/lib/rustlib",
         b"HOME=/mnt/home/user",
-        // STAGE-16: nvim cannot create ~/.local/state/nvim/log; silence the
+        // Nvim cannot create ~/.local/state/nvim/log; silence the
         // \"failed to open $NVIM_LOG_FILE\" stderr spam by pointing it at /dev/null.
         b"NVIM_LOG_FILE=/dev/null",
     ];
@@ -1066,7 +1066,7 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
     match result {
         Ok(pid) => {
             shell_println(&alloc::format!("lxrun: started Compat_Process pid {}", pid));
-            // Foreground wait (stage 13.7): the process owns the keyboard now
+            // Foreground wait: the process owns the keyboard now
             // (its stdin reads the PS/2 stream directly), so resuming the
             // prompt immediately would make the shell steal every keystroke.
             while crate::task::compat::compat_exists(pid) {

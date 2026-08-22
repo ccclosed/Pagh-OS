@@ -351,7 +351,7 @@ pub fn update() -> Result<usize, AptOpError> {
                     "apt: fetched {} index body - decompressing...",
                     human_bytes(bytes.len() as u64)
                 );
-                // STAGE-13.8: a successful download that fails to decode is no
+                // A successful download that fails to decode is no
                 // longer fatal for the whole update -- fall through and try the
                 // next index variant (different bytes AND a different decoder).
                 let index = match stream_parse_index(&bytes, *comp) {
@@ -401,7 +401,7 @@ const PROGRESS_PKGS: usize = 5000;
 /// index). Logs periodic progress. Maps any decode/parse overrun to
 /// [`AptOpError::IndexTooLarge`] (a clean error, not an abort).
 fn stream_parse_index(bytes: &[u8], comp: Compression) -> Result<PackageIndex, AptOpError> {
-    // STAGE-13.8: explicit start marker -- the full Debian index decompresses
+    // Explicit start marker -- the full Debian index decompresses
     // to ~150 MiB and parses for minutes; without this line the gap after
     // "decompressing..." looks like a hang.
     crate::info!("apt: parsing index (takes a few minutes for the full Debian index; progress every 4 MiB)...");

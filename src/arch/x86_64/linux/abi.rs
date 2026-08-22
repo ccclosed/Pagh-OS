@@ -40,11 +40,11 @@ pub mod nr {
     pub const EPOLL_CREATE1: u64 = 291;
     /// `epoll_pwait` — epoll_wait with a sigmask (mask accepted and ignored).
     pub const EPOLL_PWAIT: u64 = 281;
-    /// `socketpair` — pair of connected AF_UNIX stream sockets (STAGE-15).
+    /// `socketpair` — pair of connected AF_UNIX stream sockets.
     pub const SOCKETPAIR: u64 = 53;
-    /// `statx` — extended file status (STAGE-15).
+    /// `statx` — extended file status.
     pub const STATX: u64 = 332;
-    /// STAGE-16: AF_UNIX stream sockets (nvim's msgpack-rpc server).
+    /// AF_UNIX stream sockets (nvim's msgpack-rpc server).
     pub const SOCKET: u64 = 41;
     pub const CONNECT: u64 = 42;
     pub const ACCEPT: u64 = 43;
@@ -54,22 +54,22 @@ pub mod nr {
     pub const ACCEPT4: u64 = 288;
 pub const SETSOCKOPT: u64 = 54;
 pub const GETSOCKOPT: u64 = 55;
-    /// STAGE-16: session/permission/locking stubs.
+    /// Session/permission/locking stubs.
     pub const SETSID: u64 = 112;
-    /// STAGE-16.14: job-control family bash probes at startup.
+    /// Job-control family bash probes at startup.
     pub const SETPGID: u64 = 109;
     pub const GETPGRP: u64 = 111;
     pub const GETPGID: u64 = 121;
     pub const UMASK: u64 = 95;
     pub const FLOCK: u64 = 73;
-    /// STAGE-16.11: vectored / positional-vectored I/O + file sync. nvim's
+    /// Vectored / positional-vectored I/O + file sync. nvim's
     /// ShaDa reader hit ENOSYS here (E886 "function not implemented").
     pub const READV: u64 = 19;
     pub const PREADV: u64 = 295;
     pub const PWRITEV: u64 = 296;
     pub const FSYNC: u64 = 74;
     pub const FDATASYNC: u64 = 75;
-    /// STAGE-16.13: rename family. nvim writes ShaDa to a tmp file and
+    /// Rename family. nvim writes ShaDa to a tmp file and
     /// renames it into place; missing rename left "E136: Can't rename ShaDa"
     /// + a Press-ENTER prompt wedged on every exit.
     pub const RENAME: u64 = 82;
