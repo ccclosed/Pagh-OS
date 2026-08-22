@@ -3,9 +3,18 @@
 use crate::vfs::{VfsError, VfsNode};
 use alloc::sync::Arc;
 
-const RELEASE: &[u8] = b"NAME=pagh OS\nID=pagh\nVERSION=0.2-dev\nARCH=x86_64\n";
-const MOTD: &[u8] =
-    b"pagh OS 0.2-dev\nType 'help' to list commands. Network apt and nano+ are available.\n";
+// OS version is derived from the crate version (Cargo.toml) so the two
+// cannot drift apart.
+const RELEASE: &[u8] = concat!(
+    "NAME=pagh OS\nID=pagh\nVERSION=",
+    env!("CARGO_PKG_VERSION"),
+    "\nARCH=x86_64\n"
+).as_bytes();
+const MOTD: &[u8] = concat!(
+    "pagh OS ",
+    env!("CARGO_PKG_VERSION"),
+    "\nType 'help' to list commands. Network apt and nano+ are available.\n"
+).as_bytes();
 const README: &[u8] = b"Welcome to pagh!\n\nTry:\n  help\n  nano --settings\n  nano /mnt/home/user/notes.txt\n  cargo run /mnt/examples/hello\n  apt update\n";
 const CARGO: &[u8] = b"[package]\nname = \"pagh-hello\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
 const MAIN_RS: &[u8] = b"fn main() {\n    let values = [8, 16, 32];\n    println!(\"Hello from pagh mini-Rust! sum = {}\", values.iter().sum());\n}\n";
