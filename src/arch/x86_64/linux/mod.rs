@@ -382,11 +382,12 @@ pub fn watchdog_tick() {
             }
             if still_stuck {
                 crate::warn!(
-                    "[WATCHDOG] pid={} stuck in syscall {} (nr={} arg0=0x{:x}) for {}s",
+                    "[WATCHDOG] pid={} stuck in syscall {} (nr={} arg0=0x{:x} {}) for {}s",
                     pid,
                     wd_sys_name(nr),
                     nr,
                     arg0,
+                    crate::arch::x86_64::linux::io_sys::fd_kind(arg0),
                     age / crate::arch::x86_64::apic::TICK_HZ
                 );
             }

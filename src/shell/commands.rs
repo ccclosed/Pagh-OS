@@ -1123,7 +1123,19 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
             // Foreground wait: the process owns the keyboard now
             // (its stdin reads the PS/2 stream directly), so resuming the
             // prompt immediately would make the shell steal every keystroke.
+            //
+            // Ctrl+C terminates the child — except when the child runs its
+            // stdin in raw mode (nvim et al. bind ^C as an ordinary key).
+            use core::sync::atomic::Ordering;
+            crate::shell::keys::CTRL_C_LATCH.store(false, Ordering::Relaxed);
             while crate::task::compat::compat_exists(pid) {
+                if crate::shell::keys::CTRL_C_LATCH.swap(false, Ordering::Relaxed)
+                    && !crate::task::compat::compat_is_raw(pid)
+                {
+                    shell_println("^C");
+                    crate::task::scheduler::request_exit(pid);
+                    break;
+                }
                 crate::task::scheduler::yield_current();
             }
         }

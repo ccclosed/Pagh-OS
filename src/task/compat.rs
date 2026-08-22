@@ -128,6 +128,18 @@ pub fn install_compat(pid: u64, state: CompatState) {
 
 /// Remove and return the [`CompatState`] for process `pid`, if any. Called when
 /// a process terminates (`scheduler::exit_current`).
+/// Is `pid`'s stdin currently in raw mode? The ^C kill path consults this so
+/// full-screen programs that consume ^C as a key (nvim) keep their binding,
+/// while canonical-mode programs (python, bash) get the classic SIGINT-ish
+/// terminate.
+pub fn compat_is_raw(pid: u64) -> bool {
+    COMPAT_STATES
+        .lock()
+        .get(&pid)
+        .map(|cs| cs.raw_mode)
+        .unwrap_or(false)
+}
+
 pub fn remove_compat(pid: u64) -> Option<CompatState> {
     COMPAT_STATES.lock().remove(&pid)
 }

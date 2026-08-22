@@ -40,10 +40,23 @@ pub enum KeyEvent {
 /// `shift` tracks the current Shift modifier across make/break codes. The
 /// decoder never panics on any input byte (Properties 25 & 27).
 #[allow(dead_code)]
+/// Set by any decoder that sees Ctrl+C (the shell line editor AND the
+/// kernel-side raw-mode stdin decoder). The `lxrun` foreground wait polls and
+/// takes this latch to terminate the child — classic ^C semantics for a
+/// kernel that has no signal delivery.
+pub static CTRL_C_LATCH: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Persistent CapsLock state. Decoders are created per read call on the
+/// stdin path, so the toggle must outlive any single instance.
+static CAPS_LOCK_STATE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 pub struct Decoder {
     extended: bool,
     shift: bool,
     ctrl: bool,
+    caps: bool,
 }
 
 #[allow(dead_code)]
@@ -54,6 +67,7 @@ impl Decoder {
             extended: false,
             shift: false,
             ctrl: false,
+            caps: CAPS_LOCK_STATE.load(core::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -81,6 +95,14 @@ impl Decoder {
                 return None;
             }
             _ => {}
+        }
+
+        // CapsLock make: toggle the persistent state, emit no event. Break
+        // (0xBA) is ignored, like a real keyboard's LED-only response.
+        if scancode == 0x3A {
+            self.caps = !self.caps;
+            CAPS_LOCK_STATE.store(self.caps, core::sync::atomic::Ordering::Relaxed);
+            return None;
         }
 
         // Shift make/break: track the modifier, emit no event. Handled before
@@ -147,9 +169,23 @@ impl Decoder {
                 // events, so guard against the table also producing them.
                 match scancode_to_ascii(scancode, self.shift) {
                     Some(ch) if ch != '\n' && ch != '\t' && self.ctrl => {
+                        if ch.to_ascii_lowercase() == 'c' {
+                            CTRL_C_LATCH.store(true, core::sync::atomic::Ordering::Relaxed);
+                        }
                         Some(KeyEvent::Ctrl(ch.to_ascii_lowercase()))
                     }
-                    Some(ch) if ch != '\n' && ch != '\t' => Some(KeyEvent::Char(ch)),
+                    Some(mut ch) if ch != '\n' && ch != '\t' => {
+                        // CapsLock flips the case of letters relative to Shift:
+                        // effective case = shift XOR caps.
+                        if ch.is_ascii_alphabetic() && self.caps != self.shift {
+                            ch = if ch.is_ascii_lowercase() {
+                                ch.to_ascii_uppercase()
+                            } else {
+                                ch.to_ascii_lowercase()
+                            };
+                        }
+                        Some(KeyEvent::Char(ch))
+                    }
                     _ => None,
                 }
             }

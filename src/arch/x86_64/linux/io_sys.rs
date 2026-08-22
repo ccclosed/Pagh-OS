@@ -92,6 +92,22 @@ enum Resolved {
 /// Resolve `fd` for the current process, cloning the backing node so the caller
 /// can drop the `COMPAT_STATES` lock before doing VFS I/O. Returns `None` when the
 /// descriptor is absent/closed or the process has no compat state (→ `EBADF`).
+/// Human-readable descriptor kind for watchdog/telemetry output.
+pub(crate) fn fd_kind(fd: u64) -> &'static str {
+    match resolve_fd(fd as u32) {
+        None => "closed",
+        Some(Resolved::Stdin) => "stdin",
+        Some(Resolved::Console) => "console",
+        Some(Resolved::Dir) => "dir",
+        Some(Resolved::PipeRead(_)) => "pipe-r",
+        Some(Resolved::PipeWrite(_)) => "pipe-w",
+        Some(Resolved::Socket { .. }) => "sock",
+        Some(Resolved::Eventfd { .. }) => "eventfd",
+        Some(Resolved::Epoll) => "epoll",
+        Some(Resolved::File { .. }) => "file",
+    }
+}
+
 fn resolve_fd(fd: u32) -> Option<Resolved> {
     compat::with_current_compat(|cs| {
         cs.fds.get(fd).map(|obj| match obj {
@@ -399,6 +415,12 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
                 total += len;
             }
             Resolved::PipeWrite(e) => {
+                crate::warn!(
+                    "[DIAG] pipe-write pid={} fd={} len={} (writev)",
+                    crate::task::scheduler::current_pid(),
+                    fd,
+                    data.len()
+                );
                 let n = write_pipe(e, &data)?;
                 total += n as u64;
                 if n < data.len() {
@@ -642,6 +664,15 @@ pub fn sys_openat(dirfd: u64, path: u64, flags: u64, _mode: u64) -> Result<u64, 
 
 /// `close` (3): release the descriptor, or `EBADF` if it is not open (R2.6, R2.14).
 pub fn sys_close(fd: u64) -> Result<u64, Errno> {
+    let kind = fd_kind(fd);
+    if kind.starts_with("pipe") {
+        crate::warn!(
+            "[DIAG] close pid={} fd={} ({})",
+            crate::task::scheduler::current_pid(),
+            fd,
+            kind
+        );
+    }
     let res = compat::with_current_compat(|cs| cs.fds.close(fd as u32));
     match res {
         Some(Ok(())) => Ok(0),
@@ -1823,7 +1854,7 @@ pub fn sys_fstatfs(fd: u64, buf: u64) -> Result<u64, Errno> {
 const O_NONBLOCK:u64=0x800; const O_CLOEXEC:u64=0x80000;
 const POLLIN:i16=0x001; const POLLOUT:i16=0x004; const POLLERR:i16=0x008; const POLLHUP:i16=0x010; const POLLNVAL:i16=0x020;
 pub fn sys_pipe(pipefd:u64)->Result<u64,Errno>{sys_pipe2(pipefd,0)}
-pub fn sys_pipe2(pipefd:u64,flags:u64)->Result<u64,Errno>{if flags&!(O_NONBLOCK|O_CLOEXEC)!=0{return Err(Errno::EINVAL)}check_user_ptr(pipefd,8)?;let pair=compat::with_current_compat(|cs|{let p=cs.fds.pipe(flags&O_NONBLOCK!=0);if flags&O_CLOEXEC!=0{cs.fds.set_cloexec(p.0,true);cs.fds.set_cloexec(p.1,true);}p}).ok_or(Errno::EBADF)?;let words=[pair.0,pair.1];let bytes=unsafe{core::slice::from_raw_parts(words.as_ptr()as*const u8,8)};copy_out(pipefd,bytes);Ok(0)}
+pub fn sys_pipe2(pipefd:u64,flags:u64)->Result<u64,Errno>{if flags&!(O_NONBLOCK|O_CLOEXEC)!=0{return Err(Errno::EINVAL)}check_user_ptr(pipefd,8)?;let pair=compat::with_current_compat(|cs|{let p=cs.fds.pipe(flags&O_NONBLOCK!=0);if flags&O_CLOEXEC!=0{cs.fds.set_cloexec(p.0,true);cs.fds.set_cloexec(p.1,true);}p}).ok_or(Errno::EBADF)?;crate::warn!("[DIAG] pipe pid={} -> r={} w={}", crate::task::scheduler::current_pid(), pair.0, pair.1);let words=[pair.0,pair.1];let bytes=unsafe{core::slice::from_raw_parts(words.as_ptr()as*const u8,8)};copy_out(pipefd,bytes);Ok(0)}
 fn poll_revents(fd:i32,events:i16)->i16{if fd<0{return 0}match resolve_fd(fd as u32){None=>POLLNVAL,Some(Resolved::PipeRead(e))=>{let mut o=if e.read_ready(){events&POLLIN}else{0};if e.peer_closed(){o|=POLLHUP}o},Some(Resolved::PipeWrite(e))=>{let mut o=if e.write_ready(){events&POLLOUT}else{0};if e.peer_closed(){o|=POLLERR}o},Some(Resolved::Socket{rx,tx})=>{let mut o=0i16;if rx.read_ready(){o|=events&POLLIN}if tx.write_ready(){o|=events&POLLOUT}if rx.peer_closed(){o|=POLLHUP}o},Some(Resolved::Stdin)=>{if stdin_input_available(){events&POLLIN}else{0}},Some(Resolved::Console)=>events&POLLOUT,Some(Resolved::Eventfd{val,..})=>{let v=val.lock();if*v>0{events&POLLIN}else{0}},Some(Resolved::Epoll)=>0,Some(Resolved::File{..})|Some(Resolved::Dir)=>events&(POLLIN|POLLOUT)}}
 pub fn sys_poll(fds:u64,nfds:u64,timeout:u64)->Result<u64,Errno>{const SZ:u64=8;if nfds>1024{return Err(Errno::EINVAL)}check_user_ptr(fds,nfds.checked_mul(SZ).ok_or(Errno::EINVAL)?)?;let ms=timeout as i64;let deadline=if ms<0{None}else{Some(crate::task::scheduler::ticks().saturating_add((ms as u64).saturating_add(9)/10))};loop{let mut ready=0;for i in 0..nfds{let p=fds+i*SZ;let fd=unsafe{*(p as*const i32)};let ev=unsafe{*((p+4)as*const i16)};let rev=poll_revents(fd,ev);unsafe{*((p+6)as*mut i16)=rev}if rev!=0{ready+=1}}if ready!=0||ms==0{return Ok(ready)}if let Some(end)=deadline{if crate::task::scheduler::ticks()>=end{return Ok(0)}}crate::task::scheduler::yield_current()}}
 

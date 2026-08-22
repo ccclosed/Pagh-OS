@@ -526,6 +526,16 @@ pub extern "C" fn scheduler_yield_switch(current_rsp: u64) -> u64 {
 /// The idle task (`IDLE_PID`) is never a real, exitable task; if `exit_current`
 /// is somehow reached on it we fall back to a full halt loop rather than
 /// removing the always-runnable idle task from rotation.
+/// Kill a task from the outside (^C on the foreground program): mark it as
+/// exiting so the next tick drops it instead of requeueing, and tear down its
+/// Linux-compat state right away so waiters (`lxrun`'s foreground loop) see
+/// it disappear. The task itself notices nothing special — its next blocking
+/// yield never returns.
+pub fn request_exit(pid: u64) {
+    crate::task::compat::remove_compat(pid);
+    EXITING_PID.store(pid, Ordering::Release);
+}
+
 pub fn exit_current() -> ! {
     let pid = current_pid();
     if is_idle(pid) {
