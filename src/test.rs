@@ -779,18 +779,49 @@ mod spinlock_irq_tests {
 }
 
 mod scheduler_tests {
+    use crate::arch::cpu::{disable_interrupts, enable_interrupts, interrupts_enabled};
     use crate::task::scheduler::{self, Tcb};
+    use alloc::vec::Vec;
+
+    /// The live ~100 Hz timer tick requeues the preempted current task into
+    /// READY_QUEUE at arbitrary moments, so pop order is not deterministic
+    /// while interrupts are open. Mask ticks and snapshot-drain the queue;
+    /// `resume` restores the drained tasks in their original order.
+    fn quiesce() -> (bool, Vec<Tcb>) {
+        let entry_if = interrupts_enabled();
+        disable_interrupts();
+        let mut saved: Vec<Tcb> = Vec::new();
+        while let Some(t) = scheduler::schedule() {
+            saved.push(t);
+        }
+        (entry_if, saved)
+    }
+
+    fn resume(entry_if: bool, saved: Vec<Tcb>) {
+        for t in saved {
+            scheduler::requeue(t);
+        }
+        if entry_if {
+            enable_interrupts();
+        }
+    }
+
     pub fn pid_inc() {
         let a = scheduler::next_pid();
         assert_kernel!(scheduler::next_pid() > a, "pid++");
     }
     pub fn spawn_sched() {
+        let (entry_if, saved) = quiesce();
         let p = scheduler::next_pid();
         scheduler::spawn(Tcb::new(p, 0x8000, 0));
         assert_eq_kernel!(scheduler::schedule().unwrap().pid, p, "spawn+sched");
+        assert_kernel!(scheduler::schedule().is_none(), "spawn left no extra tasks");
+        resume(entry_if, saved);
     }
     pub fn empty_queue() {
+        let (entry_if, saved) = quiesce();
         assert_kernel!(scheduler::schedule().is_none(), "empty queue");
+        resume(entry_if, saved);
     }
     pub fn tick_works() {
         let t0 = scheduler::ticks();
@@ -1204,11 +1235,39 @@ mod vfs_tests {
 }
 
 mod integration {
+    use crate::arch::cpu::{disable_interrupts, enable_interrupts, interrupts_enabled};
     use crate::task::scheduler::{self, Tcb};
+    use alloc::vec::Vec;
+
+    /// Same quiesce/resume discipline as `scheduler_tests`: mask ticks and
+    /// snapshot-drain READY_QUEUE so the assertions below are deterministic
+    /// on a live preemptive kernel.
+    fn quiesce() -> (bool, Vec<Tcb>) {
+        let entry_if = interrupts_enabled();
+        disable_interrupts();
+        let mut saved: Vec<Tcb> = Vec::new();
+        while let Some(t) = scheduler::schedule() {
+            saved.push(t);
+        }
+        (entry_if, saved)
+    }
+
+    fn resume(entry_if: bool, saved: Vec<Tcb>) {
+        for t in saved {
+            scheduler::requeue(t);
+        }
+        if entry_if {
+            enable_interrupts();
+        }
+    }
+
     pub fn empty_initially() {
+        let (entry_if, saved) = quiesce();
         assert_kernel!(scheduler::schedule().is_none(), "empty init");
+        resume(entry_if, saved);
     }
     pub fn spawn_sched() {
+        let (entry_if, saved) = quiesce();
         let p = scheduler::next_pid();
         scheduler::spawn(Tcb::new(p, 0xDEAD, 0));
         assert_eq_kernel!(
@@ -1216,6 +1275,8 @@ mod integration {
             0xDEAD,
             "kernel_rsp match"
         );
+        assert_kernel!(scheduler::schedule().is_none(), "spawn left no extra tasks");
+        resume(entry_if, saved);
     }
     pub fn tick_inc() {
         let t0 = scheduler::ticks();
@@ -1652,9 +1713,13 @@ pub mod mock_block {
         }
 
         /// After `n` successful `write_block` calls, drop all later writes.
+        /// The counter restarts from zero here, so a crash window counts only
+        /// writes made while this injection is armed — independent of earlier
+        /// device activity such as the journal-format superblock write.
         pub fn set_crash_after(&self, n: u32) {
             let mut inner = self.inner.lock();
             inner.crash_after = Some(n);
+            inner.write_count = 0;
         }
 
         /// Disable crash injection and reset the write counter.
