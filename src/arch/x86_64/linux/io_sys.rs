@@ -729,7 +729,12 @@ pub fn sys_openat(dirfd: u64, path: u64, flags: u64, _mode: u64) -> Result<u64, 
 
 /// `close` (3): release the descriptor, or `EBADF` if it is not open (R2.6, R2.14).
 pub fn sys_close(fd: u64) -> Result<u64, Errno> {
-    if fd_kind(fd) == "inet-tcp" {
+    let kind = fd_kind(fd);
+    if kind == "inet-udp" {
+        crate::warn!("[DIAG] close inet-udp fd={}", fd);
+    }
+    if kind == "inet-tcp" {
+        crate::warn!("[DIAG] close inet-tcp fd={}", fd);
         crate::arch::x86_64::linux::inet_sock::tcp_close_fd(fd);
     }
     let kind = fd_kind(fd);

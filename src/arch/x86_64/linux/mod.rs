@@ -191,6 +191,10 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             let mut buf = alloc::vec![0u8; a[2] as usize];
             let (n, port, octets) =
                 crate::arch::x86_64::linux::inet_sock::udp_recvfrom_fd(a[0], &mut buf)?;
+            crate::warn!(
+                "[DIAG] recvfrom(fd={}) -> {} bytes (src port {}) to userspace",
+                a[0], n, port
+            );
             crate::arch::x86_64::linux::io_sys::copy_out_pub(a[1], &buf[..n]);
             if a[4] != 0 && a[5] != 0 {
                 // struct sockaddr_in { family=AF_INET(2), port(be16), addr, zero }
