@@ -41,6 +41,10 @@ pub struct InetTcp {
 pub struct InetUdp {
     pub handle: smoltcp::iface::SocketHandle,
     pub nonblocking: AtomicBool,
+    /// Default destination remembered by connect(2): subsequent write(2)/send(2)
+    /// without an address go here (this is exactly how glibc's resolver sends
+    /// its queries over a connected UDP socket).
+    pub peer: crate::sync::spinlock::Spinlock<Option<smoltcp::wire::IpEndpoint>>,
 }
 
 fn parse_sockaddr_in(addr: u64, len: u64) -> Result<(u16, [u8; 4]), Errno> {
@@ -105,6 +109,7 @@ pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
             let sock = Arc::new(InetUdp {
                 handle,
                 nonblocking: AtomicBool::new(nonblocking),
+                peer: crate::sync::spinlock::Spinlock::new(None),
             });
             let fd = cs.fds.alloc(OpenObject::InetUdp(sock));
             if cloexec { cs.fds.set_cloexec(fd, true); }
@@ -237,6 +242,21 @@ fn tcp_sock(fd: u64) -> Result<Arc<InetTcp>, Errno> {
     })
     .unwrap_or(None)
     .ok_or(Errno::ENOTSOCK)
+}
+
+/// `connect` on an AF_INET UDP fd: remember the peer for write()/send().
+pub fn udp_connect_fd(fd: u64, addr: u64, len: u64) -> Result<u64, Errno> {
+    let sock = udp_sock(fd)?;
+    let (port, octets) = parse_sockaddr_in(addr, len)?;
+    *sock.peer.lock() = Some(endpoint(port, octets));
+    Ok(0)
+}
+
+/// write(2)/send(2) on a connected AF_INET UDP fd.
+pub fn udp_write_fd(fd: u64, data: &[u8]) -> Result<usize, Errno> {
+    let sock = udp_sock(fd)?;
+    let peer = sock.peer.lock().ok_or(Errno::ENOTCONN)?;
+    net::udp_sendto(sock.handle, data, peer).map(|_| data.len()).map_err(|_| Errno::EIO)
 }
 
 // ── UDP (glibc resolver path) ────────────────────────────────────────────────

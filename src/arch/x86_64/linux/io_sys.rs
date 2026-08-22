@@ -377,7 +377,11 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             let n = crate::arch::x86_64::linux::inet_sock::tcp_write(fd, &data)?;
             Ok(n as u64)
         }
-        Some(Resolved::InetUdp(_)) => Err(Errno::ENOTCONN), // sendto only
+        Some(Resolved::InetUdp(_)) => {
+            let data = copy_in(buf, count);
+            let n = crate::arch::x86_64::linux::inet_sock::udp_write_fd(fd, &data)?;
+            Ok(n as u64)
+        }
         Some(Resolved::PipeWrite(e)) => {let data=copy_in(buf,count);
             crate::warn!("[DIAG] pipe-write pid={} fd={} len={} head={:?}", crate::task::scheduler::current_pid(), fd, count, String::from_utf8_lossy(&data[..data.len().min(32)]));
             Ok(write_pipe(&e,&data)? as u64)}
@@ -600,6 +604,22 @@ fn resolve_path(path: &str) -> String {
     for comp in &stack {
         out.push('/');
         out.push_str(comp);
+    }
+    // Guest-chroot mapping: Linux programs see the ext2 tree as `/`. Kernel
+    // special trees stay put (/dev nodes, /tmp ramfs, the explicit /mnt view),
+    // everything else resolves under /mnt — this is what makes /etc/resolv.conf
+    // visible to glibc's resolver.
+    if out != "/"
+        && !out.starts_with("/mnt")
+        && !out.starts_with("/dev")
+        && !out.starts_with("/proc")
+        && !out.starts_with("/sys")
+        && !out.starts_with("/tmp")
+    {
+        let mut mapped = String::with_capacity(out.len() + 4);
+        mapped.push_str("/mnt");
+        mapped.push_str(&out);
+        return mapped;
     }
     out
 }

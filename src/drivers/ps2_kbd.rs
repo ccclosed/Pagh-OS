@@ -104,6 +104,7 @@ pub fn irq_handler() {
             (false, 0x1D) => DRV_CTRL.store(make, Ordering::Relaxed),
             (true, 0x1D) => DRV_CTRL.store(make, Ordering::Relaxed),
             (false, 0x2E) if make && DRV_CTRL.load(Ordering::Relaxed) => {
+                crate::warn!("[DIAG] kbd: ctrl+c detected");
                 CTRL_C.store(true, Ordering::Relaxed);
             }
             _ => {}

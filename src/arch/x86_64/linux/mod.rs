@@ -146,7 +146,15 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
                 (unsafe { core::ptr::read_unaligned(a[1] as *const u16) }) as u64
             } else { 1 };
             if fam == crate::arch::x86_64::linux::inet_sock::AF_INET {
-                crate::arch::x86_64::linux::inet_sock::sys_connect_tcp(a[0], a[1], a[2])
+                let is_udp = crate::task::compat::with_current_compat(|cs| {
+                    matches!(cs.fds.get(a[0] as u32),
+                        Some(crate::task::fd::OpenObject::InetUdp(_)))
+                }).unwrap_or(false);
+                if is_udp {
+                    crate::arch::x86_64::linux::inet_sock::udp_connect_fd(a[0], a[1], a[2])
+                } else {
+                    crate::arch::x86_64::linux::inet_sock::sys_connect_tcp(a[0], a[1], a[2])
+                }
             } else {
                 unix_sock::sys_connect(a[0], a[1], a[2])
             }
