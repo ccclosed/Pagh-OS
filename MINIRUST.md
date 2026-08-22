@@ -14,6 +14,11 @@ rust /mnt/demo.pbc
 rustup show
 ```
 
+If a real Rust toolchain was installed onto the disk (e.g. via `apt`), the `cargo`
+and `rustc` shell commands run `/mnt/usr/bin/{cargo,rustc}` through the Linux
+compatibility layer first and fall back to the embedded mini-Rust only when it is
+absent (`rustup` always inspects the built-in offline toolchain).
+
 ## Language subset
 
 ```rust

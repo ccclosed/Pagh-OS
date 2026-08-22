@@ -28,16 +28,21 @@ real disk, and a friendly interactive shell with line editing, history, tab comp
 and colored output. It can load and run an embedded test program in ring 3, and ships a
 windowed, mouse-driven `paint` application (a movable window with minimize/maximize/close
 and a taskbar entry). It also runs **Linux x86_64 ELF
-binaries — statically linked or dynamically linked against glibc (up to CPython 3.13) —**
-in ring 3 through a Linux syscall-compatibility layer, includes an **`apt`-style package
-manager** that fetches and installs Debian `.deb` packages by name over HTTP/HTTPS, and
-**provisions a base glibc + Python userland** onto its ext2 disk on first boot.
+binaries — statically linked or dynamically linked against glibc (up to CPython 3.16) —**
+in ring 3 through a Linux syscall-compatibility layer (`fork`/`clone` + threads,
+`epoll`/`eventfd`, unix sockets, and a VT100-style terminal with raw-mode `termios`
+included), includes an **`apt`-style package manager** that fetches and installs Debian
+`.deb` packages by name over HTTP/HTTPS, and can **provision a base glibc + Python
+userland** onto its ext2 disk after an opt-in confirmation at first boot.
 
 > Hobby/educational kernel. There is no security model beyond ring 0/3 paging.
 
-> **Safe default:** outbound package downloads are disabled in normal builds. The historical
-> the development build enables network apt; HTTPS is encrypted but certificate and repository-signature verification are still pending, so downloaded packages remain untrusted
-> for an isolated, developer-controlled QEMU mirror. See `SECURITY.md` and `HARDENING.md`.
+> **Network default:** outbound package operations are **enabled** in normal builds
+> (`default = ["network_packages"]` in `Cargo.toml`). HTTPS is encrypted but certificate
+> and repository-signature verification are still pending, so downloaded packages remain
+> untrusted — acceptable only for an isolated, developer-controlled QEMU mirror. Use
+> `cargo build --no-default-features` for a fail-closed build. See `SECURITY.md` and
+> `HARDENING.md`.
 
 > **Authorship:** this kernel was written by AI under human supervision.
 
@@ -89,16 +94,18 @@ honest INSECURE warnings (VARIANT A: encrypted but unauthenticated).
   prompt/errors, typo suggestions, a registry-driven `help`, and a `paint` app.
 - **Linux binaries:** a Linux x86_64 syscall layer (`int 0x80` + `syscall`) and an ELF
   loader for static `ET_EXEC`, static-PIE, and glibc-dynamic (`PT_INTERP`) images run
-  Linux programs in ring 3 (`lxrun`) — including the CPython 3.13 REPL (GNU readline
-  works via `select`/`pselect6`). Threads/`fork`, signal delivery, `epoll`/`eventfd`,
-  and GUI stacks are still out of scope.
+  Linux programs in ring 3 (`lxrun`) — including the CPython 3.16 REPL (GNU readline
+  works via `select`/`pselect6`). `fork`/`clone` + threads, `epoll`/`eventfd`, unix
+  sockets, and raw-mode `termios` (with kernel-side echo) are implemented; POSIX signal
+  delivery and `procfs` remain stubs.
 - **Packages:** a by-name `apt` (`update`/`install`/`show`/`list`/`setmirror`) that fetches
   a Debian `Packages` index over HTTP/HTTPS, streams gzip/xz/zstd decompression into a
   compact in-RAM arena index, resolves dependencies, and installs `.deb`s onto ext2 `/mnt`
   (tar symlinks/hardlinks are materialized as file copies).
-- **Provisioning:** an idempotent first-boot thread seeds `/mnt` and installs the base
-  glibc + CPython 3.13 userland through `apt` (gz→xz index-decode fallback, honest
-  decode diagnostics, progress on serial).
+- **Provisioning:** an idempotent first-boot flow seeds `/mnt` and installs the base
+  glibc + CPython userland through `apt` (gz→xz index-decode fallback, honest decode
+  diagnostics, progress on serial) — **opt-in**: the boot asks `Y/n` on the console
+  before downloading anything.
 
 ---
 
@@ -139,9 +146,11 @@ The scripts automatically detect common system OVMF locations. Override with
 are `LIMINE_DIR`, `LIMINE_EFI`, and `PAGH_DISK`. QEMU exits with `Ctrl-A`, then `X`.
 
 `run.sh` creates a 1 GiB raw `disk.img` on first run and boots QEMU with 1 GiB of RAM.
-On the first boot with networking, a background provisioning thread runs `apt update` and
-installs the base `python3` userland onto the disk (≈50 MB of downloads). Delete
-`disk.img` to get a clean re-provisioned system on the next boot.
+On the first boot with networking, the boot asks whether to download & install the base
+`python3` userland (`Y/n` on the console; ≈50 MB of downloads). Answering `Y` runs the
+install in the background; `N` skips it (`apt update` + `apt install python3` from the
+shell installs it later). Delete `disk.img` to get a clean re-provisioned system on the
+next boot.
 
 The cross-platform Python equivalents remain available through `tools/build.py`
 and the `Makefile`.
@@ -219,8 +228,9 @@ touches vector registers), then each step logs one concise `info!` line. The `ex
 journaled write/read self-demo. The `Hello from ring3 user process!` line is printed by an
 embedded ELF executing in ring 3 via a `SYS_WRITE` system call. The DHCP lease is acquired
 asynchronously by the network poll thread once interrupts are enabled, so it appears after
-the prompt. On a fresh disk a background provisioning thread then runs `apt update` and
-installs the base `python3` userland (progress on serial; the framebuffer log mirror is
+the prompt. On a fresh disk the boot asks `download & install glibc + python3 in the
+background? [Y/n]`; after confirmation a background provisioning thread runs `apt update`
+and installs the base `python3` userland (progress on serial; the framebuffer log mirror is
 paused while it runs). The prompt shows the current working directory and is rendered in color on the
 framebuffer (serial stays plain text).
 
@@ -246,19 +256,23 @@ framebuffer (serial stays plain text).
 | `sync`               | Flush the mounted filesystem                                    |
 | `fscrash`            | Demo journal replay + persistence (write → remount → verify)    |
 | `sleep <seconds>`    | Sleep for N seconds                                             |
-| `nano <path>`        | Full-screen editor: undo/redo, search, goto, line numbers       |
-| `rust <path>`       | Run `.rs`/`.pbc` with mini-Rust or a static Rust ELF            |
+| `nano <path>`        | Full-screen editor: undo/redo, search/replace, goto, clipboard  |
+| `rust <path> [...]`  | Run `.rs`/`.pbc` with mini-Rust, or any ELF via the Linux layer |
 | `rustc <file.rs>`    | Compile mini-Rust source into an offline `.pbc` package         |
-| `cargo …`            | Create, check, build and run embedded mini-Rust projects        |
+| `cargo …`            | Real `/mnt/usr/bin/cargo` if installed, else embedded mini-Rust |
 | `rustup …`           | Inspect the built-in offline mini-Rust toolchain                |
+| `lua [file\|-e code]` | Run Lua 5.5 (installed via apt)                                |
+| `python [file\|-c code]` | Run the installed CPython 3.16 (glibc) via the Linux layer  |
+| `python3 [file\|-c code]` | Alias of `python`                                          |
+| `pythonc <file.py>`  | Compile Python source to bytecode                               |
 | `paint`              | Launch the windowed, mouse-driven framebuffer paint app         |
 | `pci`                | List enumerated PCI devices (virtio tagged)                     |
 | `ifconfig`           | Show the network interface (IP, gateway, MAC)                   |
 | `nc <ip> <port> [t]` | Open a TCP connection and echo a line over it                   |
 | `lxrun <path> […]`   | Load and run a Linux x86_64 ELF (static or glibc) in ring 3    |
-| `python […]`         | Run the installed CPython 3.13 (glibc) via the Linux layer     |
-| `pkg <url> <dst>`    | Download a file / `.deb` over HTTP(S) into the VFS              |
+| `pkg <host> <path> [port]` | Download a `.deb` over HTTP(S) and install it under /mnt  |
 | `apt <subcmd> …`     | Package manager: `update`/`install`/`show`/`list`/`setmirror`   |
+| `warn <on\|off>`     | Show/hide kernel `[WARN]` lines on screen (serial always logs)  |
 | `exec`               | Run the embedded ring-3 test process                            |
 | `selftest`           | Run the in-kernel correctness self-test suite (serial)          |
 
@@ -354,8 +368,8 @@ rust /mnt/pagh-rust-hello one two
 ```
 
 For `.rs` and `.pbc`, the `rust` command selects the embedded interpreter. For
-other files it selects the ring-3 Linux ELF loader. Dynamic linking, threads,
-`fork`, futexes and GUI libraries remain unsupported for native binaries.
+other files it selects the ring-3 Linux ELF loader — static or glibc-dynamic,
+single- or multi-threaded. GUI libraries remain unsupported for native binaries.
 
 ### nano+ editor
 
@@ -373,8 +387,8 @@ Open or create a file with `nano /mnt/file.rs`. The editor provides:
 ## Linux binaries & Debian packages
 
 `pagh` can run Linux x86_64 programs — statically linked or glibc-dynamic — and install
-Debian packages by name. On first boot it provisions a base userland automatically, so
-`python` works out of the box.
+Debian packages by name. On the first boot it offers to provision a base userland
+(opt-in `Y/n`), so `python` works out of the box after confirmation.
 
 ```text
 # run a Linux ELF already on the filesystem
@@ -386,24 +400,28 @@ apt update
 apt install busybox-static
 lxrun /mnt/bin/busybox
 
-# CPython 3.13 (installed automatically on first boot)
+# CPython 3.16 (installed after confirming the first-boot prompt)
 python
 ```
 
 - **Static and dynamic.** Statically-linked binaries and glibc-dynamic binaries both run:
   the loader maps the ELF interpreter (`ld-linux-x86-64.so.2`) from `/mnt` (with
-  merged-`/usr` fallback paths), and CPython 3.13 works end to end.
-  `fork`/`clone`/threads, signal delivery, `epoll`/`eventfd`, and GUI stacks are still
-  out of scope and return `-ENOSYS` — event-loop TUIs (`nvim`, `htop`) do not run yet,
-  though a fatal `tgkill` now ends the process cleanly (glibc `abort()` → exit 134).
+  merged-`/usr` fallback paths), and CPython 3.16 works end to end.
+  `fork`/`clone` + threads, `epoll`/`eventfd`, unix sockets, vectored I/O
+  (`readv`/`writev`/…), `rename*`, and job-control probes (`setpgid`/`getpgid`,
+  `TIOCGPGRP`/`TIOCSPGRP`, `wait4` with `WUNTRACED`/`WCONTINUED`) are implemented;
+  POSIX signal delivery is still a stub, though a fatal `tgkill` ends the process
+  cleanly (glibc `abort()` → exit 134).
 - **Install ≠ run.** `apt install <pkg>` resolves the dependency closure, downloads each
   `.deb`, unpacks its files onto `/mnt`, and materializes tar symlinks/hardlinks as file
-  copies (the ext2 writer has no symlink support). Console programs like `python3` then
-  genuinely run. Interactive TUIs still may not: there is no `procfs` (`/proc/stat`,
-  `/proc/meminfo`, per-pid entries), no `epoll`/`eventfd`, and no signal
-  delivery. The console answers `TCGETS`/`TCSETS*`/`TIOCGWINSZ`/`TIOCSWINSZ` (non-tty
-  fds get a proper `ENOTTY`), but stdin stays line-buffered, so ncurses/libuv programs
-  (`htop`, `nvim`) still fail at startup. See `LINUX-USERLAND.md` for the exact status.
+  copies (the ext2 writer has no symlink support). Console programs like `python3`
+  genuinely run, and full-screen TUIs do too: the VT driver emulates CSI/ECMA-48
+  sequences with `ONLCR`, `TCSETS*` applies real raw-mode (`ICANON`/`ECHO`) with
+  kernel-side echo in raw mode, honest `tcgetattr` reports terminal state, and
+  `ioctl(FIONBIO)` covers libuv's non-blocking path — `nvim` runs and saves its ShaDa.
+  There is still no `procfs` beyond an emulated `/proc/self/exe` readlink and no signal
+  delivery, so programs that require `/proc/stat`/`/proc/meminfo` (e.g. `htop`) or POSIX
+  signals remain out of reach. See `LINUX-USERLAND.md` for the exact status.
 - **Transport.** Downloads use HTTP or HTTPS. HTTPS is **VARIANT A**: TLS 1.3 encrypted but
   **unauthenticated** (no certificate chain/hostname/expiry checks),
   and package data is not signature-verified — acceptable only for this hobby/QEMU demo.
@@ -466,7 +484,10 @@ src/
 │       ├── apic.rs     # LAPIC timer, I/O APIC, IRQ routing
 │       ├── acpi.rs     # MADT parsing via the `acpi` crate (cached)
 │       ├── syscall.rs  # SYSCALL/int 0x80 entry + dispatcher (native + Linux dispatch)
-│       └── linux/      # Linux x86_64 syscall ABI: errno, io, mem, misc, stat, time, dirent…
+│       └── linux/      # Linux x86_64 syscall ABI: errno, io/io_sys (termios, ioctl, rename,
+│                        readv/fsync), mem/mem_sys, process/process_sys (clone/fork/wait4),
+│                        epoll_sys (epoll/eventfd/timer), unix_sock, misc (job control),
+│                        stat, dirent, time, rtc, rand_clock, diag, validate…
 ├── memory/
 │   ├── layout.rs       # single source of truth for fixed virtual regions
 │   ├── pmm.rs          # bitmap physical frame allocator (single Spinlock; contiguous alloc)
@@ -479,8 +500,9 @@ src/
 │   ├── ps2_mouse.rs    # PS/2 mouse (IRQ12): packet assembler + absolute cursor state
 │   ├── cursor.rs       # trailing-free software arrow cursor (save/restore under-pixels)
 │   ├── framebuffer.rs  # framebuffer console + 2D primitives (rect/line/circle/blit) + status bar
+│   ├── vt.rs           # ANSI/VT-100 terminal emulator on the framebuffer (CSI, charsets, ONLCR)
 │   ├── pci/            # PCI config-space access + bus enumeration
-│   └── virtio/         # virtio HAL (DMA frames + bounce buffers) + virtio-blk block device
+│   └── virtio/         # virtio HAL (DMA frames + bounce buffers) + virtio-blk (write-through cache)
 ├── fs/
 │   ├── mod.rs          # FsError + filesystem plumbing
 │   ├── ext2/           # ext2 layer: structs, bitmap alloc, inode map, dir entries, mount/format
@@ -521,11 +543,13 @@ src/
 │   └── stack_map.rs    # effectful user-stack mapping for the SysV image
 ├── vfs/
 │   ├── mod.rs          # VfsNode trait, root, lookup_path, mount_at, /dev/{null,serial}
+│   ├── ramfs.rs        # in-memory filesystem backing writable /tmp
 │   ├── elf.rs          # ELF64 validation + PT_LOAD loading (native + Linux static/PIE)
 │   └── elf_classify.rs # pure ELF classifier + static-PIE load-bias selection
 ├── security/
 │   └── entropy.rs      # hardware-backed, fail-closed entropy (RDSEED/RDRAND)
 └── debug/
+    ├── mod.rs          # debug entry points (panic-time helpers)
     └── unwind.rs       # heap-free RBP-chain stack trace for panics
 ```
 
@@ -534,10 +558,10 @@ src/
 - **Safe abstraction layer.** Privileged instructions are funneled through `arch::cpu`;
   no module outside `arch` contains inline `asm!` except the unavoidable `task::switch`
   stubs and the GDT segment reload. Global mutable state (GDT/TSS/IDT, APIC MMIO bases,
-  the serial port) is reached through `SyncUnsafeCell` raw pointers or atomics rather than
-  references to `static mut`, so the tree builds with **zero warnings** and no
-  `static_mut_refs` hazards. The `unsafe` that remains is documented with `// SAFETY:`
-  comments.
+the serial port) is reached through `SyncUnsafeCell` raw pointers or atomics rather than
+references to `static mut`, so the tree avoids `static_mut_refs`
+hazards. The `unsafe` that remains is documented with `// SAFETY:`
+comments.
 - **Memory.** `memory::layout` centralizes fixed virtual regions. The PMM reserves the
   kernel image, the bitmap's own frames, and everything below 1 MB, and offers
   contiguous-frame allocation for DMA. `free_frame`/`free_frames_contiguous` refuse to
@@ -584,10 +608,11 @@ src/
 - **Linux binaries.** A Linux x86_64 syscall layer (`int 0x80` + `syscall` → a single
   dispatcher) plus an ELF loader for static `ET_EXEC`, static-PIE, and `PT_INTERP` dynamic images, a
   SysV initial stack/auxv builder, and per-process compat state (fd table, VM regions) let
-  Linux programs — including glibc-dynamic ones such as CPython 3.13 — run in ring 3
-  (`lxrun`). `fork`/`clone`/threads, signals/`epoll`, and GUI stacks are deliberately
-  out of scope and return `-ENOSYS` (`futex` is handled just far enough for
-  single-threaded glibc locking).
+  Linux programs — including glibc-dynamic ones such as CPython 3.16 — run in ring 3
+  (`lxrun`). `clone` covers both thread and fork paths (real address-space fork via
+  `fork_linux_process`), `epoll`/`eventfd` and unix sockets are backed by real
+  implementations, and the VT driver gives TUIs a terminal. POSIX signal delivery is
+  still stubbed (`futex` supports glibc locking).
 - **Packages (apt).** `apt` fetches a Debian `Packages` index and parses it incrementally
   from a streaming gzip/xz/zstd decompressor into a **compact byte-arena index** — one
   growable byte arena plus `(offset,len)` references and integer-keyed sorted lookup tables,

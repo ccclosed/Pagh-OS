@@ -2,7 +2,8 @@
 
 pagh runs Linux x86_64 ELF binaries in ring 3 through a syscall-compatibility layer
 (`lxrun`). As of the current tree this covers **dynamically linked glibc programs**,
-including the full CPython 3.13 REPL installed straight from Debian packages.
+including the full CPython 3.16 REPL installed straight from Debian packages, and
+full-screen TUIs such as `nvim`.
 
 ## What works
 
@@ -26,18 +27,38 @@ including the full CPython 3.13 REPL installed straight from Debian packages.
 - `mremap` resizes anonymous mappings (shrink in place, grow via move+copy),
   so glibc `realloc()` uses its fast path instead of logging an
   unsupported-syscall warning.
-- The `python` shell command finds the installed CPython and runs it with a proper
+- The `python`/`python3` shell commands find the installed CPython (any `python3*`
+  under `/mnt/usr/bin`, preferring the most specific version) and run it with a proper
   `PYTHONHOME`/`PYTHONPATH` environment (`PYTHON_BASIC_REPL=1`).
+- `fork`/`clone`: `clone` handles both the thread and fork paths; a fork creates a real
+  child with a copied address space (`fork_linux_process`). Threads via
+  `CLONE_VM|CLONE_THREAD` share the address space; glibc `pthread_create` works.
+- `epoll` (create1/ctl/wait/pwait) and `eventfd2` are implemented over the compat fd
+  table, plus unix sockets (`socketpair`/AF_UNIX stream), so libuv event loops run —
+  `nvim` starts, renders through the VT emulator, and saves its ShaDa
+  (`rename`/`renameat`/`renameat2`, `fsync`/`fdatasync`, `readv`/`preadv`/`pwritev`).
+- Terminal: the console is a real tty. Honest `tcgetattr` reports actual
+  `ICANON`/`ECHO` state, `TCSETS*` applies raw mode per termios, and in raw mode the
+  kernel echoes input itself; `ioctl(FIONBIO)` toggles non-blocking fds (libuv
+  `uv__nonblock`); `TIOCGWINSZ`/`TIOCSWINSZ` work. The VT driver emulates CSI/ECMA-48
+  sequences (including cursor interrogation replies, charset designation `ESC ( B`,
+  and `ONLCR`).
+- Job control probes: `setpgid`/`getpgid`/`getpgrp` stubs (single process group),
+  `TIOCGPGRP`/`TIOCSPGRP`, and `wait4` accepting `WUNTRACED`/`WCONTINUED` — enough for
+  bash's job-control hot loop not to spin.
 
 ## First-boot provisioning
 
 A background kernel thread (`src/provision.rs`) makes this work out of the box on a
-fresh `disk.img`:
+fresh `disk.img` — **after an opt-in confirmation**:
 
 1. Seeds `/mnt` with release metadata, a home skeleton, and a mini-Rust example.
-2. Runs `apt update` — streaming the Debian `Packages` index with a gz → xz → plain
-   decode fallback and honest `deb:`/`apt:` serial diagnostics on decode failure.
-3. Installs `python3` and its dependency closure (≈35 packages, ≈50 MB).
+2. Asks on the console: `download & install glibc + python3 in the background? [Y/n]`.
+   `N` skips everything; `apt update` + `apt install python3` from the shell installs
+   the userland later at any time.
+3. On `Y`, runs `apt update` — streaming the Debian `Packages` index with a gz → xz →
+   plain decode fallback and honest `deb:`/`apt:` serial diagnostics on decode failure.
+4. Installs `python3` and its dependency closure (≈35 packages, ≈50 MB).
 
 The thread is idempotent; delete `disk.img` to re-provision from scratch.
 
@@ -51,22 +72,20 @@ The thread is idempotent; delete `disk.img` to re-provision from scratch.
 
 ## What does not work yet
 
-These return `-ENOSYS` (logged once per syscall number per process):
+These return `-ENOSYS` or a stub (logged once per syscall number per process):
 
-- `fork`/`clone`, threads — single-process programs only (`futex` is implemented
-  just far enough for single-threaded glibc locking).
-- Signal delivery. `sigaltstack` is a stub; `tgkill` with a fatal signal aimed
-  at the calling process terminates it with the conventional `128+sig` code
-  (this is how glibc `abort()` ends).
-- `epoll`/`eventfd`/`timerfd` — libuv-based programs (`nvim`) abort at startup.
-- Terminal raw mode: the console answers `TCGETS`/`TCSETS*`/`TIOCGWINSZ`/`TIOCSWINSZ`
-  (non-tty fds get a proper `ENOTTY`), but the termios settings are not applied —
-  stdin stays line-buffered with echo, so ncurses TUIs (`htop`) cannot actually
-  raw-mode the terminal yet.
-- No `procfs`/`sysfs`.
+- POSIX signal delivery: `rt_sigaction`/`rt_sigprocmask`/`sigaltstack` record state but
+  no signals are ever delivered; `tgkill` with a fatal signal aimed at the calling
+  process terminates it with the conventional `128+sig` code (this is how glibc
+  `abort()` ends).
+- `timerfd` — programs needing timerfd descriptors still fail.
+- No real `procfs`/`sysfs`: only an emulated `/proc/self/exe` via `readlink`, so
+  programs that read `/proc/stat`, `/proc/meminfo`, or per-pid entries (e.g. `htop`)
+  do not work.
+- The ext2 writer has no symlink support (installer materializes links as copies).
 
-So: batch/console programs and the CPython REPL run; event-loop TUIs need the next
-stage of the compat layer (signals, epoll, termios, per-keystroke input).
+So: batch/console programs, the CPython REPL, and event-loop TUIs (`nvim`) run; the
+remaining gaps are POSIX signals, timerfd, and procfs.
 
 ## Troubleshooting
 

@@ -112,7 +112,6 @@ impl<'a> Expr<'a> {
         }
     }
     fn atom(&mut self) -> Result<i64, String> {
-        // Тут какая-то хуйня. Пофиксите пожалуйста
         self.ws();
         if self.eat(b'(') {
             let v = self.add()?;
@@ -129,11 +128,12 @@ impl<'a> Expr<'a> {
         }
         if self.p > start {
             let s = core::str::from_utf8(&self.b[start..self.p]).map_err(|_| "bad number")?;
-            let mut v = s.parse::<i64>().map_err(|_| "bad number")?;
-            if neg {
-                v = -v
-            }
-            return Ok(v);
+            let v = s.parse::<i64>().map_err(|_| "bad number")?;
+            return if neg {
+                v.checked_neg().ok_or_else(|| "integer overflow".into())
+            } else {
+                Ok(v)
+            };
         }
         let start = self.p;
         while self.p < self.b.len()
@@ -145,21 +145,27 @@ impl<'a> Expr<'a> {
             return Err("expected value".into());
         }
         let name = core::str::from_utf8(&self.b[start..self.p]).map_err(|_| "bad identifier")?;
-        if self
+        let v = if self
             .b
             .get(self.p..)
             .map_or(false, |r| r.starts_with(b".iter().sum()"))
         {
             self.p += 13;
-            return match self.env.get(name) {
-                Some(Value::List(v)) => Ok(v.iter().copied().sum()),
-                _ => Err(format!("{} is not a list", name)),
-            };
+            match self.env.get(name) {
+                Some(Value::List(v)) => v.iter().copied().sum(),
+                _ => return Err(format!("{} is not a list", name)),
+            }
+        } else {
+            self.env
+                .get(name)
+                .ok_or_else(|| format!("unknown variable '{}'", name))?
+                .int()?
+        };
+        if neg {
+            v.checked_neg().ok_or_else(|| "integer overflow".into())
+        } else {
+            Ok(v)
         }
-        self.env
-            .get(name)
-            .ok_or_else(|| format!("unknown variable '{}'", name))?
-            .int()
     }
 }
 
