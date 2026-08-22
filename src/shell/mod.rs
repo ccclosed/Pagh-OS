@@ -105,6 +105,17 @@ fn list_candidates(editor: &editor::LineEditor, shown: &mut usize, candidates: &
 /// token (R7.1) and, when a near match exists, append a "did you mean" hint
 /// (R7.2).
 fn execute_command(cmd: &str) {
+    // Minimal `&&` chaining: run each part sequentially, stopping at the
+    // first failure signal we can observe (unknown command). Used by the
+    // autorun file (`rm -r X && lxrun ...`).
+    if cmd.contains("&&") {
+        for part in cmd.split("&&") {
+            if !part.trim().is_empty() {
+                execute_command(part);
+            }
+        }
+        return;
+    }
     let parts: Vec<&str> = cmd.trim().split_whitespace().collect();
     if parts.is_empty() {
         return;
@@ -231,14 +242,11 @@ fn run_autorun() {
     let mut buf = alloc::vec![0u8; MAX as usize];
     match node.read(0, &mut buf) {
         Ok(n) if n > 0 => {
-            let line: String = core::str::from_utf8(&buf[..n])
-                .unwrap_or("")
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .into();
-            if !line.is_empty() {
+            for raw in core::str::from_utf8(&buf[..n]).unwrap_or("").lines() {
+                let line: String = raw.trim().into();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
                 crate::kprintln!("[autorun] {}", line);
                 execute_command(&line);
             }
