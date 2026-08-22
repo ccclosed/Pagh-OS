@@ -231,13 +231,13 @@ fn run_autorun() {
     let mut buf = alloc::vec![0u8; MAX as usize];
     match node.read(0, &mut buf) {
         Ok(n) if n > 0 => {
-            let line = core::str::from_utf8(&buf[..n])
+            let line: String = core::str::from_utf8(&buf[..n])
                 .unwrap_or("")
                 .lines()
                 .next()
                 .unwrap_or("")
                 .trim()
-                .to_string();
+                .into();
             if !line.is_empty() {
                 crate::kprintln!("[autorun] {}", line);
                 execute_command(&line);
