@@ -194,14 +194,15 @@ impl Device for SmolDevice {
         match nic.receive() {
             Ok(rx_buf) => {
                 // DNS-reply visibility: UDP frames with either port == 53.
-                if rx_buf.len() >= 42 {
+                let frame = rx_buf.packet();
+                if frame.len() >= 42 {
                     let eth_ip = 14usize;
-                    let proto = rx_buf[eth_ip + 9];
-                    let ihl = (rx_buf[eth_ip] & 0x0f) as usize * 4;
+                    let proto = frame[eth_ip + 9];
+                    let ihl = (frame[eth_ip] & 0x0f) as usize * 4;
                     if proto == 17 {
                         let udp = eth_ip + ihl;
-                        let sp = u16::from_be_bytes([rx_buf[udp], rx_buf[udp + 1]]);
-                        let dp = u16::from_be_bytes([rx_buf[udp + 2], rx_buf[udp + 3]]);
+                        let sp = u16::from_be_bytes([frame[udp], frame[udp + 1]]);
+                        let dp = u16::from_be_bytes([frame[udp + 2], frame[udp + 3]]);
                         if sp == 53 || dp == 53 {
                             static N: core::sync::atomic::AtomicU32 =
                                 core::sync::atomic::AtomicU32::new(0);
@@ -209,7 +210,7 @@ impl Device for SmolDevice {
                                 N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                             crate::warn!(
                                 "[DIAG] net rx: DNS packet #{} {}->{} len={}",
-                                n, sp, dp, rx_buf.len()
+                                n, sp, dp, rx_buf.packet_len()
                             );
                         }
                     }

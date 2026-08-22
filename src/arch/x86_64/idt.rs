@@ -242,7 +242,7 @@ extern "x86-interrupt" fn gp_fault_handler(stack: InterruptStackFrame, error_cod
     //   [top-0x20] rcx (sysretq user RIP!)  [top-0x60] r11 (user RFLAGS) ...
     // The full 24-word dump lives behind a flag (it is scary and noisy for a
     // normal userspace crash); enable with `warn on`-style tooling later.
-    if !crate::task::scheduler::is_idle(pid) && STACK_DUMP.load(Ordering::Relaxed) {
+    if !crate::task::scheduler::is_idle(pid) && STACK_DUMP.load(core::sync::atomic::Ordering::Relaxed) {
         let (_guard, _base, top) = crate::memory::layout::kernel_stack_for_pid(pid);
         crate::error!(
             "--- Top 24 words of kernel stack for pid {} (top=0x{:x}) ---",
