@@ -12,6 +12,7 @@ use crate::task::stack::{arg_gate, AuxInputs};
 use crate::task::stack_map::{map_initial_stack, StackMapError};
 use crate::vfs::elf::ElfLoader;
 use alloc::format;
+use alloc::sync::Arc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use x86_64::structures::paging::PageTableFlags;
@@ -519,7 +520,7 @@ pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u6
 
         let mut state = CompatState::new(
             FdTable::with_standard_streams(),
-            VmRegionSet::new(elf.initial_brk, USER_MMAP_BASE),
+            Arc::new(crate::sync::spinlock::Spinlock::new(VmRegionSet::new(elf.initial_brk, USER_MMAP_BASE))),
             pid,
         );
         // Remember the image path for readlink("/proc/self/exe").
@@ -608,7 +609,7 @@ pub fn exec_linux_image(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<Ex
         .map_err(|_| RunError::StackFailed)?;
         let pid = scheduler::current_pid();
         compat::with_current_compat(|st| {
-            st.vm = VmRegionSet::new(elf.initial_brk, USER_MMAP_BASE);
+            st.vm = Arc::new(crate::sync::spinlock::Spinlock::new(VmRegionSet::new(elf.initial_brk, USER_MMAP_BASE)));
             st.fs_base = 0; st.tid = pid; st.nosys_logged.clear(); st.exit_code = None;
             // The close-on-exec sweep (libuv's fork error pipe
             // relies on it) + record the new image for /proc/self/exe.

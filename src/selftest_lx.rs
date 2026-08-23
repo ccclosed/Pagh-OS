@@ -672,7 +672,7 @@ fn with_synth_compat<R>(initial_brk: u64, tid: u64, f: impl FnOnce() -> R) -> R 
     let pid = scheduler::current_pid();
     let state = CompatState::new(
         FdTable::with_standard_streams(),
-        VmRegionSet::new(initial_brk, USER_MMAP_BASE),
+        Arc::new(crate::sync::spinlock::Spinlock::new(VmRegionSet::new(initial_brk, USER_MMAP_BASE))),
         tid,
     );
     compat::install_compat(pid, state);

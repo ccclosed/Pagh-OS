@@ -325,20 +325,17 @@ extern "x86-interrupt" fn page_fault_handler(
         if let Some(pte) = crate::memory::vmm::walk_pte(fault_addr.as_u64()) {
             let writable = pte.flags().contains(x86_64::structures::paging::PageTableFlags::WRITABLE);
             let present = pte.flags().contains(x86_64::structures::paging::PageTableFlags::PRESENT);
-            // Write to a present-but-RO user page: if our mmap tracking says
-            // the region is writable, the PTE is out of sync — fix it and
-            // return from the interrupt (the instruction retries).
+            // Write to a present-but-RO user page is a genuine fault.
+            // We do NOT fix up the PTE: that would defeat RELRO and make
+            // .text writable. Diagnose and kill instead. The root cause
+            // (VmRegionSet not shared between CLONE_VM threads) is tracked
+            // as a separate work item.
             if present && !writable {
-                // Hobby kernel: user pages have no security model. A write to
-                // a present-but-RO page (ld.so RELRO, COW remnants, mprotect
-                // races between threads sharing CR3) is always resolved by
-                // making the page writable rather than killing the task.
-                crate::memory::vmm::set_pte_writable(fault_addr.as_u64());
-                crate::warn!(
-                    "[DIAG] pf fixup: set W on 0x{:x} (pid={})",
-                    fault_addr.as_u64(), pid
+                crate::error!(
+                    "[EXC #14] write to RO user page — RELRO/ld.so region? \
+                     killing pid {} (fix: share VmRegionSet across CLONE_VM threads)",
+                    pid
                 );
-                return;
             }
             crate::error!(
                 "[EXC #14] COW check: PTE present={}, writable={}",

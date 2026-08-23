@@ -115,7 +115,7 @@ fn unwind(pages: &[u64]) {
 /// `brk` (12): query/move the program break (R3.1–R3.6). On a grow that cannot be
 /// backed by physical memory, the break is left unchanged (R3.4).
 pub fn sys_brk(addr: u64) -> Result<u64, Errno> {
-    compat::with_current_compat(|cs| brk_impl(&mut cs.vm, addr)).ok_or(Errno::EINVAL)
+    compat::with_current_compat(|cs| brk_impl(&mut *cs.vm.lock(), addr)).ok_or(Errno::EINVAL)
 }
 
 fn brk_impl(vm: &mut VmRegionSet, requested: u64) -> u64 {
@@ -215,7 +215,7 @@ pub fn sys_mmap(
     // Phase 1 (under the compat lock): place the region, back it with zeroed
     // frames, record it in the tracked set.
     let base = compat::with_current_compat(|cs| -> Result<u64, Errno> {
-        let vm = &mut cs.vm;
+        let vm = &mut cs.vm.lock();
         let base = if fixed {
             if addr == 0 || addr & (PAGE_SIZE - 1) != 0 {
                 return Err(Errno::EINVAL);
@@ -304,7 +304,7 @@ pub fn sys_mmap(
 /// `munmap` (11): unmap a previously-`mmap`ped range (R4.3) or reject an
 /// unaligned/uncovered request with `-EINVAL` (R4.7).
 pub fn sys_munmap(addr: u64, len: u64) -> Result<u64, Errno> {
-    compat::with_current_compat(|cs| munmap_impl(&mut cs.vm, addr, len))
+    compat::with_current_compat(|cs| munmap_impl(&mut cs.vm.lock(), addr, len))
         .unwrap_or(Err(Errno::EINVAL))
 }
 
@@ -341,7 +341,7 @@ pub fn sys_mremap(
         .map(|n| n / PAGE_SIZE)
         .ok_or(Errno::ENOMEM)?;
     compat::with_current_compat(|cs| -> Result<u64, Errno> {
-        let vm = &mut cs.vm;
+        let vm = &mut cs.vm.lock();
         // The whole old range must lie inside one tracked mmap region; its
         // protections carry over to the new placement.
         let old_span = old_pages.checked_mul(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
@@ -464,7 +464,7 @@ fn cut_regions(regions: &mut Vec<MmapRegion>, base: u64, pages: u64) {
 /// `-ENOMEM` if any page in the range is not currently mapped (R4.8). An unaligned
 /// base is `-EINVAL`.
 pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> Result<u64, Errno> {
-    compat::with_current_compat(|cs| mprotect_impl(&mut cs.vm, addr, len, prot as u32))
+    compat::with_current_compat(|cs| mprotect_impl(&mut cs.vm.lock(), addr, len, prot as u32))
         .unwrap_or(Err(Errno::EINVAL))
 }
 

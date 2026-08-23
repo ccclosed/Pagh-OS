@@ -14,6 +14,8 @@
 #![allow(dead_code)]
 
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::string::{String, ToString};
 
 use crate::arch::x86_64::linux::mem::VmRegionSet;
@@ -27,7 +29,7 @@ pub struct CompatState {
     /// The process's open file descriptors (0/1/2 pre-bound to the std streams).
     pub fds: FdTable,
     /// Program break + anonymous `mmap` region tracking.
-    pub vm: VmRegionSet,
+    pub vm: Arc<Spinlock<VmRegionSet>>,
     /// `FS.base`, settable via `arch_prctl(ARCH_SET_FS)` (R2.9).
     pub fs_base: u64,
     /// The thread id reported by `set_tid_address` (R2.10).
@@ -74,10 +76,10 @@ impl CompatState {
     /// the given thread id, cwd `/mnt` (the writable ext2 tree; `/` has no
     /// `create_dir`), an empty `nosys` log, and no exit
     /// code yet.
-    pub fn new(fds: FdTable, vm: VmRegionSet, tid: u64) -> Self {
+    pub fn new(fds: FdTable, vm: Arc<Spinlock<VmRegionSet>>, tid: u64) -> Self {
         Self::new_with_parent(fds, vm, tid, 1)
     }
-    pub fn new_with_parent(fds: FdTable, vm: VmRegionSet, tid: u64, ppid: u64) -> Self {
+    pub fn new_with_parent(fds: FdTable, vm: Arc<Spinlock<VmRegionSet>>, tid: u64, ppid: u64) -> Self {
         Self { fds, vm, fs_base: 0, tid, ppid, tgid: tid, clear_child_tid: 0, waitable: true, robust_head: 0, robust_len: 0, cwd: "/mnt".to_string(), nosys_logged: BTreeSet::new(), raw_mode: false, echo: true, exit_code: None, exe_path: String::new(), exec_stdio: ["?", "?", "?"] }
     }
 }
@@ -137,7 +139,7 @@ pub fn install_compat(pid: u64, state: CompatState) {
 /// whether a write-to-RO-page fault is a fixable mapping inconsistency.
 pub fn current_addr_in_writable_mmap(addr: u64) -> bool {
     with_current_compat(|cs| {
-        cs.vm.mmaps.iter().any(|m| {
+        cs.vm.lock().mmaps.iter().any(|m| {
             addr >= m.base && addr < m.base + m.pages * 4096 && m.writable
         })
     })
@@ -231,6 +233,13 @@ pub fn fork_current_compat(child: u64, clear_child_tid: u64) -> bool {
     let Some(parent_state) = states.get(&parent) else { return false; };
     let parent_tgid = parent_state.tgid;
     let mut child_state = parent_state.clone();
+    // Fork: the child owns a private address space (deep-copied by
+    // `clone_user_space`), so give it a private copy of the mmap/brk tracking
+    // rather than sharing the parent's VmRegionSet.
+    {
+        let vm_copy = child_state.vm.lock().clone();
+        child_state.vm = Arc::new(Spinlock::new(vm_copy));
+    }
     child_state.tid = child; child_state.tgid = child; child_state.ppid = parent_tgid;
     child_state.waitable = true; child_state.clear_child_tid = clear_child_tid;
     child_state.exit_code = None;
