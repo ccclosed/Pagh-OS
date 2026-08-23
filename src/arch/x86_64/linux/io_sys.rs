@@ -746,7 +746,21 @@ pub fn sys_close(fd: u64) -> Result<u64, Errno> {
             kind
         );
     }
+    // Extract the UDP handle BEFORE the close so we can reclaim the smoltcp
+    // socket AFTER releasing the compat lock (taking NET.lock inside
+    // COMPAT_STATES would deadlock: spinlocks disable interrupts, so the
+    // net thread can never release NET).
+    let udp_handle = compat::with_current_compat(|cs| {
+        match cs.fds.get(fd as u32) {
+            Some(crate::task::fd::OpenObject::InetUdp(u)) => Some(u.handle),
+            _ => None,
+        }
+    }).flatten();
     let res = compat::with_current_compat(|cs| cs.fds.close(fd as u32));
+    // Reclaim the smoltcp socket OUTSIDE the compat lock.
+    if let Some(h) = udp_handle {
+        crate::net::udp_remove(h);
+    }
     match res {
         Some(Ok(())) => Ok(0),
         Some(Err(e)) => Err(e),
