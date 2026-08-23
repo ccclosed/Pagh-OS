@@ -821,8 +821,15 @@ pub fn resolve(hostname: &str) -> Option<Ipv4Address> {
 /// other threads / device IRQs run between polls.
 pub fn net_thread() {
     info!("net: poll thread started");
+    let mut polls: u64 = 0;
     loop {
         poll();
+        polls += 1;
+        // Heartbeat: if this line stops appearing while the system hangs,
+        // the net thread (or the scheduler feeding it ticks) is dead.
+        if polls % (TICK_HZ as u64 * 5) == 0 {
+            crate::warn!("[DIAG] net thread alive, polls={}", polls);
+        }
         scheduler::sleep_ticks(1);
     }
 }
