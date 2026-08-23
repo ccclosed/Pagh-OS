@@ -356,6 +356,36 @@ pub fn walk_pte(virt_addr: u64) -> Option<PageTableEntry> {
     Some(pte)
 }
 
+/// Set the WRITABLE bit on the leaf PTE for `virt_addr` in the CURRENT
+/// address space and invalidate the TLB entry. Returns false if the walk is
+/// not fully present. Used by the page-fault handler to fix up pages whose
+/// VmRegion tracking says "writable" but whose PTE lost the bit.
+pub fn set_pte_writable(virt_addr: u64) -> bool {
+    const SHIFTS: [u64; 3] = [39, 30, 21];
+    let mut table_phys = current_pml4_phys();
+    for shift in SHIFTS {
+        let idx = ((virt_addr >> shift) & 0x1ff) as usize;
+        // SAFETY: page-table frames are always readable through the HHDM.
+        let entry = unsafe {
+            core::ptr::read_volatile((phys_to_virt(table_phys) as *const u64).add(idx))
+        };
+        if entry & 1 == 0 {
+            return false;
+        }
+        table_phys = entry & 0x000f_ffff_ffff_f000;
+    }
+    let idx = (virt_addr >> 12) & 0x1ff;
+    let pte_virt = phys_to_virt(table_phys) + idx * 8;
+    // SAFETY: PTE slot in a mapped page table.
+    let pte = unsafe { core::ptr::read_volatile(pte_virt as *const u64) };
+    if pte & 1 == 0 {
+        return false;
+    }
+    unsafe { core::ptr::write_volatile(pte_virt as *mut u64, pte | PageTableFlags::WRITABLE.bits()) };
+    x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(virt_addr));
+    true
+}
+
 pub fn dump_translation(virt_addr: u64) {
     const NAMES: [&str; 4] = ["PML4E", "PDPTE", "PDE", "PTE"];
     const SHIFTS: [u64; 4] = [39, 30, 21, 12];

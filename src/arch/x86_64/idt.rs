@@ -324,18 +324,24 @@ extern "x86-interrupt" fn page_fault_handler(
     {
         if let Some(pte) = crate::memory::vmm::walk_pte(fault_addr.as_u64()) {
             let writable = pte.flags().contains(x86_64::structures::paging::PageTableFlags::WRITABLE);
+            let present = pte.flags().contains(x86_64::structures::paging::PageTableFlags::PRESENT);
+            // Write to a present-but-RO user page: if our mmap tracking says
+            // the region is writable, the PTE is out of sync — fix it and
+            // return from the interrupt (the instruction retries).
+            if present && !writable
+                && crate::task::compat::current_addr_in_writable_mmap(fault_addr.as_u64())
+            {
+                crate::memory::vmm::set_pte_writable(fault_addr.as_u64());
+                crate::warn!(
+                    "[DIAG] pf fixup: set W on 0x{:x} (pid={})",
+                    fault_addr.as_u64(), pid
+                );
+                return;
+            }
             crate::error!(
                 "[EXC #14] COW check: PTE present={}, writable={}",
-                pte.flags().contains(x86_64::structures::paging::PageTableFlags::PRESENT),
-                writable
+                present, writable
             );
-            if !writable {
-                crate::error!(
-                    "[EXC #14] looks like missing COW: write to RO user page — \
-                     killing pid {} with SIGSEGV",
-                    pid
-                );
-            }
         }
     }
     crate::error!("--- Top 24 words of user stack (rsp=0x{:x}) ---", rsp);

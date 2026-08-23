@@ -132,6 +132,18 @@ pub fn install_compat(pid: u64, state: CompatState) {
 /// full-screen programs that consume ^C as a key (nvim) keep their binding,
 /// while canonical-mode programs (python, bash) get the classic SIGINT-ish
 /// terminate.
+/// Does the CURRENT task's mmap tracking contain `addr` inside a region that
+/// was created with PROT_WRITE? Used by the page-fault handler to decide
+/// whether a write-to-RO-page fault is a fixable mapping inconsistency.
+pub fn current_addr_in_writable_mmap(addr: u64) -> bool {
+    with_current_compat(|cs| {
+        cs.vm.mmaps.iter().any(|m| {
+            addr >= m.base && addr < m.base + m.pages * 4096 && m.writable
+        })
+    })
+    .unwrap_or(false)
+}
+
 pub fn compat_is_raw(pid: u64) -> bool {
     COMPAT_STATES
         .lock()
