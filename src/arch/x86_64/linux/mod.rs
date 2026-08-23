@@ -352,12 +352,9 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
     // #GP post-mortem context + syscall trace for pid >= 4 (compat processes)
     let cur_pid = crate::task::scheduler::current_pid();
     crate::arch::x86_64::idt::note_syscall(cur_pid, nr);
-    if cur_pid >= 4 {
-        static TRACE_SKIP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-        let skip = TRACE_SKIP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if skip % 50 == 0 {
-            crate::warn!("[SYSCALL] pid={} nr={} a0=0x{:x}", cur_pid, nr, args[0]);
-        }
+    if cur_pid >= 4 && nr != 228 {
+        // Log every syscall except clock_gettime (too noisy).
+        crate::warn!("[SYSCALL] pid={} nr={}", cur_pid, nr);
     }
 
     // ── 1. Precedence shim: native tasks keep the legacy pagh-native routing ──
