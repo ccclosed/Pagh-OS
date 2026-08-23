@@ -349,9 +349,16 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
 
     let (nr, args) = abi::marshal_args(r.rax, r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9);
 
-    // #GP post-mortem context: remember which syscall this task is running
-    // (see `gp_fault_handler` in idt.rs).
-    crate::arch::x86_64::idt::note_syscall(crate::task::scheduler::current_pid(), nr);
+    // #GP post-mortem context + syscall trace for pid >= 4 (compat processes)
+    let cur_pid = crate::task::scheduler::current_pid();
+    crate::arch::x86_64::idt::note_syscall(cur_pid, nr);
+    if cur_pid >= 4 {
+        static TRACE_SKIP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let skip = TRACE_SKIP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if skip % 50 == 0 {
+            crate::warn!("[SYSCALL] pid={} nr={} a0=0x{:x}", cur_pid, nr, args[0]);
+        }
+    }
 
     // ── 1. Precedence shim: native tasks keep the legacy pagh-native routing ──
     // A process WITH compat state is a Linux Compat_Process and bypasses this,
