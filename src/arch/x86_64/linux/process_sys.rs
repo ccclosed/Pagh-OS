@@ -147,6 +147,10 @@ pub fn sys_futex(
                 return Err(Errno::EAGAIN);
             }
             let deadline = timeout_deadline(timeout)?;
+            crate::warn!(
+                "[DIAG] futex WAIT addr=0x{:x} expect={} timeout={:?}",
+                uaddr, val, timeout
+            );
             let queue_key = key(uaddr);
             let ticket = register_waiter(queue_key, bitset);
 
@@ -182,7 +186,14 @@ pub fn sys_futex(
                 FUTEX_BITSET_MATCH_ANY
             };
             let _ = load_word(uaddr)?;
-            Ok(wake_waiters(key(uaddr), val, bitset))
+            let n = wake_waiters(key(uaddr), val, bitset);
+            if n > 0 {
+                crate::warn!(
+                    "[DIAG] futex WAKE addr=0x{:x} woke {}",
+                    uaddr, n
+                );
+            }
+            Ok(n)
         }
         _ => Err(Errno::ENOSYS),
     }
@@ -366,5 +377,7 @@ pub fn cleanup_thread_exit(pid: u64) {
     }
 }
 pub fn cleanup_current_thread_exit() {
-    cleanup_thread_exit(crate::task::scheduler::current_pid())
+    let pid = crate::task::scheduler::current_pid();
+    crate::warn!("[DIAG] thread-exit pid={} clearing child_tid + waking joiner", pid);
+    cleanup_thread_exit(pid)
 }
