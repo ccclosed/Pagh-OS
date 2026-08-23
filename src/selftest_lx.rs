@@ -1072,7 +1072,7 @@ fn check_oom_rollback() {
             return Err("impossible mmap did not return ENOMEM");
         }
         // The VM state must be untouched: break still INITIAL_BRK, no regions.
-        let (brk, nmaps) = compat::with_current_compat(|cs| (cs.vm.current_brk, cs.vm.mmaps.len()))
+        let (brk, nmaps) = compat::with_current_compat(|cs| { let vm = cs.vm.lock(); (vm.current_brk, vm.mmaps.len()) })
             .unwrap_or((0, usize::MAX));
         if brk != INITIAL_BRK {
             return Err("current_brk changed after rollback");
