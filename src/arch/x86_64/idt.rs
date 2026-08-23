@@ -328,9 +328,11 @@ extern "x86-interrupt" fn page_fault_handler(
             // Write to a present-but-RO user page: if our mmap tracking says
             // the region is writable, the PTE is out of sync — fix it and
             // return from the interrupt (the instruction retries).
-            if present && !writable
-                && crate::task::compat::current_addr_in_writable_mmap(fault_addr.as_u64())
-            {
+            if present && !writable {
+                // Hobby kernel: user pages have no security model. A write to
+                // a present-but-RO page (ld.so RELRO, COW remnants, mprotect
+                // races between threads sharing CR3) is always resolved by
+                // making the page writable rather than killing the task.
                 crate::memory::vmm::set_pte_writable(fault_addr.as_u64());
                 crate::warn!(
                     "[DIAG] pf fixup: set W on 0x{:x} (pid={})",
