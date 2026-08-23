@@ -315,6 +315,29 @@ extern "x86-interrupt" fn page_fault_handler(
     crate::error!("[EXC #14] CR3=0x{:016x}", crate::memory::vmm::current_pml4_phys());
     crate::memory::vmm::dump_translation(fault_addr.as_u64());
     crate::memory::vmm::dump_translation(stack.instruction_pointer.as_u64());
+    // COW hint: a write to a present-but-read-only user page is exactly what
+    // an unimplemented copy-on-write fork would produce. If fork ever switches
+    // from eager copying to shared RO frames, THIS is where the break-up
+    // (copy + remap writable) belongs instead of killing the task.
+    if error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE)
+        && error_code.contains(PageFaultErrorCode::USER_MODE)
+    {
+        if let Some(pte) = crate::memory::vmm::walk_pte(fault_addr.as_u64()) {
+            let writable = pte.flags().contains(x86_64::structures::paging::PageTableFlags::WRITABLE);
+            crate::error!(
+                "[EXC #14] COW check: PTE present={}, writable={}",
+                pte.flags().contains(x86_64::structures::paging::PageTableFlags::PRESENT),
+                writable
+            );
+            if !writable {
+                crate::error!(
+                    "[EXC #14] looks like missing COW: write to RO user page — \
+                     killing pid {} with SIGSEGV",
+                    pid
+                );
+            }
+        }
+    }
     crate::error!("--- Top 24 words of user stack (rsp=0x{:x}) ---", rsp);
     let mut i = 0u64;
     while i < 24 {

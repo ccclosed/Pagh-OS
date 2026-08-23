@@ -328,6 +328,34 @@ pub fn map(phys_addr: u64, virt_addr: u64, flags: PageTableFlags) -> Result<(), 
 /// from "a whole intermediate table vanished" (e.g. its frame was
 /// double-allocated and zero-filled by another owner) - the two failure shapes
 /// point at different culprits.
+/// Return a copy of the leaf PTE for `virt_addr` in the CURRENT address
+/// space, if the whole walk is present. Used by the page-fault handler for
+/// copy-on-write diagnosis.
+pub fn walk_pte(virt_addr: u64) -> Option<PageTableEntry> {
+    const SHIFTS: [u64; 3] = [39, 30, 21];
+    let mut table_phys = current_pml4_phys();
+    for shift in SHIFTS {
+        let idx = ((virt_addr >> shift) & 0x1ff) as usize;
+        // SAFETY: page-table frames are always readable through the HHDM.
+        let entry = unsafe {
+            core::ptr::read_volatile((phys_to_virt(table_phys) as *const u64).add(idx))
+        };
+        if entry & 1 == 0 {
+            return None;
+        }
+        table_phys = entry & 0x000f_ffff_ffff_f000;
+    }
+    let idx = (virt_addr >> 12) & 0x1ff;
+    // SAFETY: as above.
+    let pte = unsafe {
+        core::ptr::read_volatile((phys_to_virt(table_phys) as *const PageTableEntry).add(idx as usize))
+    };
+    if !pte.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
+    Some(pte)
+}
+
 pub fn dump_translation(virt_addr: u64) {
     const NAMES: [&str; 4] = ["PML4E", "PDPTE", "PDE", "PTE"];
     const SHIFTS: [u64; 4] = [39, 30, 21, 12];
