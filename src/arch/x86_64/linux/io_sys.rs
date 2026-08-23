@@ -746,12 +746,7 @@ pub fn sys_close(fd: u64) -> Result<u64, Errno> {
             kind
         );
     }
-    crate::warn!("[DIAG] close: taking compat lock for fd={}", fd);
-    let res = compat::with_current_compat(|cs| {
-        crate::warn!("[DIAG] close: inside lock, calling fds.close({})", fd);
-        cs.fds.close(fd as u32)
-    });
-    crate::warn!("[DIAG] close: released lock fd={} ok={}", fd, res.is_some());
+    let res = compat::with_current_compat(|cs| cs.fds.close(fd as u32));
     match res {
         Some(Ok(())) => Ok(0),
         Some(Err(e)) => Err(e),
