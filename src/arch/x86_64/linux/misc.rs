@@ -135,7 +135,8 @@ pub fn sys_clock_gettime(clock_id: u64, tsptr: u64) -> Result<u64, Errno> {
     let mut ts = ticks_to_timespec(scheduler::ticks(), clock_id as u32, TICK_HZ)?;
     // CLOCK_REALTIME is wall-clock: take whole seconds from the CMOS RTC and keep
     // the tick-derived sub-second nanoseconds. CLOCK_MONOTONIC stays tick-based.
-    if clock_id as u32 == CLOCK_REALTIME {
+    if clock_id as u32 == CLOCK_REALTIME || clock_id as u32 == 5 {
+        // 5 = CLOCK_REALTIME_COARSE — same wall clock, lower precision.
         ts.tv_sec = rtc::now_unix() as i64;
     }
     check_user_ptr(tsptr, core::mem::size_of::<Timespec>() as u64)?;

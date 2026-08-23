@@ -66,9 +66,12 @@ pub fn getrandom_plan(buflen: u64, n: u64) -> Result<u64, Errno> {
 /// A `tick_hz` of `0` is rejected with `Err(Errno::EINVAL)` rather than dividing by
 /// zero, so the function is total for every input.
 pub fn ticks_to_timespec(ticks: u64, clock_id: u32, tick_hz: u64) -> Result<Timespec, Errno> {
-    match clock_id {
-        CLOCK_REALTIME | CLOCK_MONOTONIC => {}
-        _ => return Err(Errno::EINVAL),
+    // Accept every standard Linux clock id (0..=7). CPUTIME/RAW/COARSE/
+    // BOOTTIME are all served from the same tick-derived monotonic source;
+    // rejecting them made OpenSSL/libcurl flood EINVAL with
+    // clock_gettime(CLOCK_MONOTONIC_RAW).
+    if clock_id > 7 {
+        return Err(Errno::EINVAL);
     }
 
     if tick_hz == 0 {
