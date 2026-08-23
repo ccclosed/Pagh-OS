@@ -47,6 +47,14 @@ pub struct InetUdp {
     pub peer: crate::sync::spinlock::Spinlock<Option<smoltcp::wire::IpEndpoint>>,
 }
 
+impl Drop for InetUdp {
+    fn drop(&mut self) {
+        // Remove the smoltcp socket from the shared set so the net thread
+        // doesn't keep polling a dead endpoint.
+        crate::net::udp_remove(self.handle);
+    }
+}
+
 fn parse_sockaddr_in(addr: u64, len: u64) -> Result<(u16, [u8; 4]), Errno> {
     use super::check_user_ptr;
     if addr == 0 || len < 8 {

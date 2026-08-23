@@ -655,6 +655,14 @@ pub fn udp_sendto(handle: SocketHandle, data: &[u8], remote: IpEndpoint) -> Resu
     res.map_err(|_| NetError::DeviceInit)
 }
 
+/// Remove a UDP socket from the set (reclaim buffers).
+pub fn udp_remove(handle: SocketHandle) {
+    let mut g = NET.lock();
+    if let Some(s) = g.as_mut() {
+        s.sockets.remove(handle);
+    }
+}
+
 /// Receive one datagram if available (caller drives polling between calls).
 pub fn udp_recvfrom(handle: SocketHandle, dst: &mut [u8]) -> Option<(usize, IpEndpoint)> {
     let mut g = NET.lock();
