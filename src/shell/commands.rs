@@ -1131,6 +1131,7 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
             use core::sync::atomic::Ordering;
             crate::shell::keys::CTRL_C_LATCH.store(false, Ordering::Relaxed);
             crate::drivers::ps2_kbd::CTRL_C.store(false, Ordering::Relaxed);
+            crate::drivers::ps2_kbd::FG_PID.store(pid, Ordering::Relaxed);
             crate::warn!("[DIAG] fg: watching pid={}", pid);
             let mut heartbeats: u64 = 0;
             while crate::task::compat::compat_exists(pid) {
@@ -1148,8 +1149,11 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
                 }
                 crate::task::scheduler::yield_current();
             }
+            // Foreground program is gone — clear the ^C kill target.
+            crate::drivers::ps2_kbd::FG_PID.store(0, core::sync::atomic::Ordering::Relaxed);
         }
         Err(e) => {
+            crate::drivers::ps2_kbd::FG_PID.store(0, core::sync::atomic::Ordering::Relaxed);
             let detail = match e {
                 crate::task::process::RunError::ArgsTooLarge => "argument list too large",
                 crate::task::process::RunError::NotFound => "file not found or unreadable",
