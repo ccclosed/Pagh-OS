@@ -751,7 +751,7 @@ pub fn sys_close(fd: u64) -> Result<u64, Errno> {
         crate::warn!("[DIAG] close: inside lock, calling fds.close({})", fd);
         cs.fds.close(fd as u32)
     });
-    crate::warn!("[DIAG] close: released lock fd={} ok={}", fd, res.is_ok());
+    crate::warn!("[DIAG] close: released lock fd={} ok={}", fd, res.is_some());
     match res {
         Some(Ok(())) => Ok(0),
         Some(Err(e)) => Err(e),
