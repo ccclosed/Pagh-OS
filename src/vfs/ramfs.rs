@@ -47,16 +47,26 @@ impl RamDir {
 }
 
 impl VfsNode for RamDir {
-    fn name(&self) -> &str { &self.name }
-    fn is_directory(&self) -> bool { true }
-    fn fs_ino(&self) -> u64 { self.ino }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_directory(&self) -> bool {
+        true
+    }
+    fn fs_ino(&self) -> u64 {
+        self.ino
+    }
 
     fn readdir(&self) -> VfsResult<Vec<Arc<dyn VfsNode>>> {
         Ok(self.children.lock().values().cloned().collect())
     }
 
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn VfsNode>> {
-        self.children.lock().get(name).cloned().ok_or(VfsError::NotFound)
+        self.children
+            .lock()
+            .get(name)
+            .cloned()
+            .ok_or(VfsError::NotFound)
     }
 
     fn create_dir(&self, name: &str) -> VfsResult<Arc<dyn VfsNode>> {
@@ -125,10 +135,18 @@ impl RamFile {
 }
 
 impl VfsNode for RamFile {
-    fn name(&self) -> &str { &self.name }
-    fn is_directory(&self) -> bool { false }
-    fn fs_ino(&self) -> u64 { self.ino }
-    fn size(&self) -> u64 { self.data.lock().len() as u64 }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_directory(&self) -> bool {
+        false
+    }
+    fn fs_ino(&self) -> u64 {
+        self.ino
+    }
+    fn size(&self) -> u64 {
+        self.data.lock().len() as u64
+    }
 
     fn read(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         let data = self.data.lock();
@@ -144,7 +162,9 @@ impl VfsNode for RamFile {
     fn write(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
         let mut data = self.data.lock();
         let off = offset as usize;
-        let end = off.checked_add(buf.len()).ok_or(VfsError::InvalidArgument)?;
+        let end = off
+            .checked_add(buf.len())
+            .ok_or(VfsError::InvalidArgument)?;
         if data.len() < end {
             // Sparse-write gap (off > len) is zero-filled by resize, matching
             // POSIX semantics for writes past EOF.

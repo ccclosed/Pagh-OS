@@ -157,6 +157,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_ifconfig,
     },
     CommandSpec {
+        name: "ping",
+        description: "Send one ICMP echo request and print the RTT",
+        usage: "ping <ip>",
+        handler: super::commands::cmd_ping,
+    },
+    CommandSpec {
         name: "nc",
         description: "TCP connect + echo (nc <ip> <port> [text])",
         usage: "nc <ip> <port> [text]",

@@ -672,7 +672,10 @@ fn with_synth_compat<R>(initial_brk: u64, tid: u64, f: impl FnOnce() -> R) -> R 
     let pid = scheduler::current_pid();
     let state = CompatState::new(
         FdTable::with_standard_streams(),
-        Arc::new(crate::sync::spinlock::Spinlock::new(VmRegionSet::new(initial_brk, USER_MMAP_BASE))),
+        Arc::new(crate::sync::spinlock::Spinlock::new(VmRegionSet::new(
+            initial_brk,
+            USER_MMAP_BASE,
+        ))),
         tid,
     );
     compat::install_compat(pid, state);
@@ -1072,8 +1075,11 @@ fn check_oom_rollback() {
             return Err("impossible mmap did not return ENOMEM");
         }
         // The VM state must be untouched: break still INITIAL_BRK, no regions.
-        let (brk, nmaps) = compat::with_current_compat(|cs| { let vm = cs.vm.lock(); (vm.current_brk, vm.mmaps.len()) })
-            .unwrap_or((0, usize::MAX));
+        let (brk, nmaps) = compat::with_current_compat(|cs| {
+            let vm = cs.vm.lock();
+            (vm.current_brk, vm.mmaps.len())
+        })
+        .unwrap_or((0, usize::MAX));
         if brk != INITIAL_BRK {
             return Err("current_brk changed after rollback");
         }

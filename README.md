@@ -87,8 +87,16 @@ honest INSECURE warnings (VARIANT A: encrypted but unauthenticated).
   read/write filesystem mounted at `/mnt` (GiB-scale disks), protected by a
   write-ahead-log (WAL) journal for crash consistency — large writes are committed in
   bounded per-transaction chunks. The on-disk image is host-mountable (`mount -t ext2 -o loop disk.img`).
-- **Networking:** virtio-net NIC driven through [`smoltcp`](https://github.com/smoltcp-rs/smoltcp)
-  — DHCPv4 addressing, ICMP echo (ping), UDP echo, and a TCP echo server + client.
+- **Networking:** the kernel's OWN dual-stack TCP/IP implementation (no external
+  networking crate) over an own Intel e1000 NIC driver:
+  IPv4 (ARP, fragmentation/reassembly, ICMP echo + `ping`, DHCPv4) and
+  IPv6 (NDP neighbor discovery, Router Solicitation/Advertisement SLAAC,
+  ICMPv6 echo + `ping <ipv6>`, link-local + global addresses); TCP with window
+  scaling (RFC 7323), SACK (RFC 2013/2883 — both sending blocks and a
+  retransmission scoreboard), MSS negotiation, Jacobson/Karels RTO estimation,
+  Reno congestion control; UDP sockets, DNS A+AAAA resolution, and UDP/TCP echo
+  services. AF_INET6 Linux sockets (with v4-mapped addresses) are exposed to
+  Linux binaries.
 - **Shell:** line editing (arrows/Home/End/Delete/insert), command history, tab
   completion, `cd`/`pwd` with relative paths, file ops (`cp`/`mv`/`stat`), colored
   prompt/errors, typo suggestions, a registry-driven `help`, and a `paint` app.
@@ -170,7 +178,7 @@ run.cmd run release     :: release build
 2. links it into `PAGH.elf` with `rust-lld` using `linker.ld`,
 3. stages `iso_root/` (kernel + `BOOTX64.EFI` + a generated `limine.conf`),
 4. creates a 64 MiB raw `disk.img` (via `qemu-img`) if it does not already exist,
-5. launches QEMU with OVMF, a `virtio-blk-pci` drive, a `virtio-net-pci` NIC (user
+5. launches QEMU with OVMF, a `virtio-blk-pci` drive, an `e1000` NIC (user
    networking with host port-forwards), serial on stdio, and interrupt logging to
    `qemu_debug.log`.
 
@@ -442,8 +450,8 @@ Limine ──hands off──▶ _start (lib.rs) ──▶ boot::start()  (ordere
    ▼               ▼               ▼          ▼          ▼           ▼           ▼
 arch::cpu       gdt/idt         memory      apic      drivers      fs / net    vfs /
 (safe priv.   (descriptors,  (pmm/vmm/heap (LAPIC,   (serial,     (ext2+WAL,   scheduler
- instrs, SSE)  TSS, IST)      /layout)      I/O APIC) ps2_kbd/mouse,virtio-net  (lookup_path,
-                                                      cursor,      + smoltcp)   ELF loader,
+ instrs, SSE)  TSS, IST)      /layout)      I/O APIC) ps2_kbd/mouse,e1000  (lookup_path,
+                                                      cursor,      + own stack)  ELF loader,
                                                       framebuf+gfx,             round-robin)
                                                       pci, virtio)
 ```
@@ -513,13 +521,17 @@ src/
 │   │   └── dir.rs      #   directory entry iteration / insert / remove
 │   └── journal.rs      # write-ahead-log (WAL) journal: begin/log/commit/recover
 ├── net/
-│   ├── mod.rs          # smoltcp interface, DHCP, poll loop, UDP/TCP echo, nc client, resolve
+│   ├── mod.rs          # stack state, poll loop, DHCP glue, UDP/TCP echo, nc client, resolve, ping
+│   ├── wire.rs         # own wire types: addresses, internet checksum, Eth/ARP/IP/ICMP/UDP/TCP codecs
+│   ├── arp.rs          # ARP cache + requests + pending-frame queue
+│   ├── ip.rs           # IPv4 routing/fragmentation/reassembly + ICMP echo
+│   ├── udp.rs          # UDP socket table + DHCP client state machine
+│   ├── tcp.rs          # TCP: full state machine, windows(+scaling), timers, Reno
 │   ├── dns.rs          # pure DNS query build + A-record parse (resolver pump in mod.rs)
 │   ├── http.rs         # pure HTTP/1.1 GET builder + response-head parser
 │   ├── http_fetch.rs   # effectful HTTP fetch pump (Package_Fetcher) over a TCP socket
 │   ├── progress.rs     # download/decompress progress reporting (fb-mirror aware)
-│   ├── tls.rs          # HTTPS via TLS 1.3 (embedded-tls; VARIANT A — no cert verification)
-│   └── phy.rs          # smoltcp Device adapter over virtio-net (RxToken/TxToken)
+│   └── tls.rs          # HTTPS via TLS 1.3 (embedded-tls; VARIANT A — no cert verification)
 ├── pkg/
 │   ├── mod.rs          # package-manager plumbing
 │   ├── apt.rs          # by-name apt front end: update / install / show / list / setmirror
@@ -583,9 +595,12 @@ comments.
   `virtio` HAL detects this and, for fragmented buffers, hands the device a
   physically-contiguous bounce buffer, copying bytes in on `share` and back out on
   `unshare` per the transfer direction; already-contiguous buffers take the direct path.
-- **Networking.** A `smoltcp::phy::Device` adapter wraps virtio-net, delivering each RX
-  frame to smoltcp exactly once with single-owner buffer discipline. A dedicated kernel
-  thread runs the poll loop; addressing is DHCPv4 with a static fallback. Outbound package
+- **Networking.** The stack is written from scratch: an e1000 NIC driver (polled, no
+  IRQs) feeds Ethernet/ARP, IPv4 (fragment reassembly on RX, fragmentation on TX),
+  ICMP, UDP+DHCP, and a full TCP implementation (state machine, sliding window with
+  RFC 7323 scaling, MSS negotiation, Jacobson/Karels RTO with Karn retransmission,
+  Reno congestion control with fast retransmit). A dedicated kernel thread runs the
+  poll loop; addressing is DHCPv4 with a static fallback. Outbound package
   fetches add a pure DNS resolver, a pure HTTP/1.1 client, and an HTTPS path over TLS 1.3
   (`embedded-tls`) — the TLS path is **VARIANT A: encrypted but unauthenticated** (no
   certificate verification). The development build enables it through the default `network_packages` feature; use `--no-default-features` for a fail-closed build.
@@ -674,7 +689,7 @@ query-equivalence against a reference `String`-backed model.
 | P14   | Block read/write round-trip                                         |
 | P15   | Contiguous frame allocation is non-overlapping and contiguous       |
 | P16   | Virtqueue buffers are never aliased (no double-use)                 |
-| P17   | smoltcp poll preserves frames (no loss under bounded buffering)     |
+| P17   | NIC poll preserves frames (no loss under bounded buffering)         |
 | P18   | Filesystem operation round-trip through the VFS                     |
 | P19   | ext2 directory entry `rec_len`/`name_len` round-trip + tiling       |
 | P20   | Freshly formatted ext2 superblock is valid and self-consistent      |
@@ -705,8 +720,8 @@ These are required and preserved across the codebase:
 
 - [`acpi`](https://crates.io/crates/acpi) — MADT parsing.
 - [`good_memory_allocator`](https://crates.io/crates/good_memory_allocator) — kernel heap (galloc; size-binned, ~O(1) alloc/free).
-- [`virtio-drivers`](https://crates.io/crates/virtio-drivers) — virtio-blk / virtio-net.
-- [`smoltcp`](https://crates.io/crates/smoltcp) — TCP/IP stack (no_std, alloc).
+- [`virtio-drivers`](https://crates.io/crates/virtio-drivers) — virtio-blk storage.
+- The TCP/IP stack and the e1000 driver are the kernel's own code (`src/net`, `src/drivers/e1000.rs`).
 - [`embedded-tls`](https://crates.io/crates/embedded-tls) — TLS 1.3 client for HTTPS (VARIANT A).
 - [`miniz_oxide`](https://crates.io/crates/miniz_oxide) / [`xz4rust`](https://crates.io/crates/xz4rust) / [`ruzstd`](https://crates.io/crates/ruzstd) — gzip / xz / zstd decompression for `.deb`s and the package index.
 - [`proptest`](https://crates.io/crates/proptest) — host-side property tests (dev-dependency; `host-tests/`).

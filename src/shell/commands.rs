@@ -124,15 +124,15 @@ pub(super) fn cmd_echo(_ctx: &mut ShellCtx, args: &[&str]) {
 pub(super) fn cmd_uptime(_ctx: &mut ShellCtx, _args: &[&str]) {
     let ticks = crate::task::scheduler::ticks();
     crate::kprintln!(
-            "Ticks: {} (~{} sec)",
-            ticks,
-            ticks / crate::arch::x86_64::apic::TICK_HZ
-        );
+        "Ticks: {} (~{} sec)",
+        ticks,
+        ticks / crate::arch::x86_64::apic::TICK_HZ
+    );
     crate::fb_println!(
-            "Ticks: {} (~{} sec)",
-            ticks,
-            ticks / crate::arch::x86_64::apic::TICK_HZ
-        );
+        "Ticks: {} (~{} sec)",
+        ticks,
+        ticks / crate::arch::x86_64::apic::TICK_HZ
+    );
 }
 
 /// `pwd` (R4.2): print the absolute current working directory.
@@ -428,7 +428,7 @@ pub(super) fn cmd_exec(_ctx: &mut ShellCtx, _args: &[&str]) {
     // it with interrupts disabled so the CR3 window isn't preempted on this
     // interruptible shell thread.
     let result =
-        crate::arch::cpu::without_interrupts(|| crate::task::process::spawn_test_user_process());
+        crate::arch::cpu::without_interrupts(crate::task::process::spawn_test_user_process);
     match result {
         Ok(pid) => {
             shell_println(&alloc::format!("exec: started user process pid {}", pid));
@@ -446,6 +446,12 @@ pub(super) fn cmd_ifconfig(_ctx: &mut ShellCtx, _args: &[&str]) {
             let m = cfg.mac.0;
             shell_println(&alloc::format!("eth0  inet {}", cfg.addr));
             shell_println(&alloc::format!("      gateway {}", cfg.gateway));
+            if let Some(v6) = crate::net::ip6_config() {
+                shell_println(&alloc::format!("      inet6 {}", v6.addr));
+            }
+            if let Some(gw6) = crate::net::ip6_gateway() {
+                shell_println(&alloc::format!("      gateway6 {} (link-local)", gw6));
+            }
             shell_println(&alloc::format!(
                 "      ether {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 m[0],
@@ -457,6 +463,29 @@ pub(super) fn cmd_ifconfig(_ctx: &mut ShellCtx, _args: &[&str]) {
             ));
         }
         None => shell_println("ifconfig: no interface"),
+    }
+}
+
+/// `ping <ip>`: send one ICMP echo request (v4 or v6) and print the RTT.
+pub(super) fn cmd_ping(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.is_empty() {
+        shell_println("usage: ping <ip|ipv6>");
+        return;
+    }
+    let ip = match crate::net::wire::parse_ip_literal(args[0]) {
+        Some(ip) => ip,
+        None => {
+            shell_println("ping: invalid IP address");
+            return;
+        }
+    };
+    shell_println(&alloc::format!("ping: sending echo request to {} ...", ip));
+    match crate::net::ping(ip) {
+        Some(rtt_ticks) => {
+            let ms = rtt_ticks * 1000 / crate::arch::x86_64::apic::TICK_HZ as u64;
+            shell_println(&alloc::format!("ping: reply from {} in {} ms", ip, ms));
+        }
+        None => shell_println("ping: no reply (timeout)"),
     }
 }
 
@@ -474,10 +503,10 @@ pub(super) fn cmd_nc(_ctx: &mut ShellCtx, args: &[&str]) {
         return;
     }
 
-    let ip = match parse_ipv4(args[0]) {
+    let ip = match crate::net::wire::parse_ip_literal(args[0]) {
         Some(ip) => ip,
         None => {
-            shell_println("nc: invalid IPv4 address");
+            shell_println("nc: invalid IP address");
             return;
         }
     };
@@ -496,7 +525,7 @@ pub(super) fn cmd_nc(_ctx: &mut ShellCtx, args: &[&str]) {
         String::from("pagh-nc-test")
     };
 
-    let remote = smoltcp::wire::IpEndpoint::new(smoltcp::wire::IpAddress::Ipv4(ip), port);
+    let remote = crate::net::IpEndpoint::new(ip, port);
 
     shell_println(&alloc::format!(
         "nc: connecting to {}:{} ...",
@@ -529,25 +558,6 @@ pub(super) fn cmd_selftest(_ctx: &mut ShellCtx, _args: &[&str]) {
     shell_println("Running kernel self-test (output on serial)...");
     crate::test::run_all();
     shell_println("Self-test complete (see serial log).");
-}
-
-/// Parse a dotted-quad IPv4 address (e.g. `10.0.2.2`) into an `Ipv4Address`.
-fn parse_ipv4(s: &str) -> Option<smoltcp::wire::Ipv4Address> {
-    let mut octets = [0u8; 4];
-    let mut count = 0;
-    for part in s.split('.') {
-        if count >= 4 {
-            return None;
-        }
-        octets[count] = part.parse().ok()?;
-        count += 1;
-    }
-    if count != 4 {
-        return None;
-    }
-    Some(smoltcp::wire::Ipv4Address::new(
-        octets[0], octets[1], octets[2], octets[3],
-    ))
 }
 
 /// `fscrash` demo (Task 5.3): demonstrate journal replay + persistence on the
@@ -814,9 +824,7 @@ pub(super) fn cmd_sleep(_ctx: &mut ShellCtx, args: &[&str]) {
         return;
     }
     match args[0].parse::<u64>() {
-        Ok(secs) => crate::task::scheduler::sleep_ticks(
-            secs * crate::arch::x86_64::apic::TICK_HZ,
-        ),
+        Ok(secs) => crate::task::scheduler::sleep_ticks(secs * crate::arch::x86_64::apic::TICK_HZ),
         Err(_) => shell_println(&alloc::format!("sleep: invalid number '{}'", args[0])),
     }
 }
@@ -1076,7 +1084,11 @@ pub(super) fn cmd_warn(_ctx: &mut ShellCtx, args: &[&str]) {
         _ => {
             shell_println(&alloc::format!(
                 "warn: on-screen [WARN] lines are {}",
-                if crate::log::fb_warn_mirror() { "ON" } else { "OFF" }
+                if crate::log::fb_warn_mirror() {
+                    "ON"
+                } else {
+                    "OFF"
+                }
             ));
             shell_println("usage: warn <on|off>");
         }

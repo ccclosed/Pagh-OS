@@ -2,6 +2,7 @@
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
 pub mod cursor;
+pub mod e1000;
 pub mod framebuffer;
 pub mod pci;
 pub mod ps2_kbd;

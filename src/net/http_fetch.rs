@@ -1,16 +1,17 @@
-//! Effectful `.deb` fetch over a smoltcp TCP socket (Component 7, `Package_Fetcher`).
+//! Effectful `.deb` fetch over the kernel's own TCP stack (Component 7,
+//! `Package_Fetcher`).
 //!
 //! This is the **kernel-only** half of the `Package_Fetcher`. The pure
 //! request-building and response-head parsing live in [`crate::net::http`]
 //! (`parse_http_head` / `build_get_request`, task 7.1) and are shared into the
 //! `host-tests` crate via a `#[path]` include; keeping the socket pump in this
-//! separate file means `net/http.rs` stays purely host-includable (no smoltcp,
-//! no globals) for properties P20/P21 (R11.6).
+//! separate file means `net/http.rs` stays purely host-includable (no network
+//! stack types, no globals) for properties P20/P21 (R11.6).
 //!
 //! [`fetch_deb`] performs one HTTP/1.1 `GET` over a freshly-opened TCP socket and
 //! collects a `Content-Length`-sized body. It reuses the existing networking
 //! primitives owned by the parent [`crate::net`] module — [`super::tcp_connect`]
-//! to open the connection and the module-global `NET` state to pump the socket —
+//! to open the connection and the module-global `NET` stack lock to pump it —
 //! and the pure [`parse_http_head`]/[`build_get_request`] for all wire parsing.
 //!
 //! Failure handling (R8.3–R8.7, R12.4, R12.5): each distinct failure maps to a
@@ -20,11 +21,10 @@
 
 use alloc::vec::Vec;
 
-use smoltcp::socket::tcp;
-use smoltcp::wire::{IpAddress, IpEndpoint};
+use crate::net::IpEndpoint;
 
 use super::http::{build_get_request, parse_http_head, HeadParse};
-use super::{now, NET};
+use super::NET;
 use crate::task::scheduler;
 use crate::{error, warn};
 
@@ -75,11 +75,11 @@ const MAX_STEPS: u32 = 2_000_000;
 /// keep the fetch memory-bounded regardless of the advertised `Content-Length`.
 const MAX_TOTAL: usize = 32 * 1024 * 1024;
 
-/// rx/tx smoltcp socket buffer sizes for the cleartext HTTP fetch.
+/// rx/tx TCP socket buffer sizes for the cleartext HTTP fetch.
 ///
 /// THROUGHPUT: like the TLS path, the cleartext index/`.deb` download is bounded
 /// by the TCP receive window over QEMU user-net NAT (`window / RTT`). A 256 KiB
-/// receive window (smoltcp 0.12 negotiates window scaling for buffers > 64 KiB)
+/// receive window (the stack negotiates window scaling for buffers > 64 KiB)
 /// lets far more data be in flight per round trip, which also benefits the
 /// local-mirror path. tx stays modest (16 KiB): we only send a small GET.
 const HTTP_RX_BYTES: usize = 256 * 1024;
@@ -127,7 +127,7 @@ pub fn http_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchError
             return Err(FetchError::ConnectTimeout);
         }
     };
-    let remote = IpEndpoint::new(IpAddress::Ipv4(addr), port);
+    let remote = IpEndpoint::new(addr, port);
 
     // Open the outbound TCP socket via the existing net primitive, with a large
     // receive window (THROUGHPUT, see HTTP_RX_BYTES). `tcp_connect_buffered`
@@ -175,41 +175,54 @@ pub fn http_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchError
                 None => return fail_after(FetchError::Incomplete, host, path),
             };
 
-            let ts = now();
-            let _ = state.iface.poll(ts, &mut state.device, &mut state.sockets);
+            state.step();
 
-            let sock = state.sockets.get_mut::<tcp::Socket>(handle);
-
-            if sock.is_active() {
+            if state
+                .tcp
+                .get(handle)
+                .map(|k| k.is_active())
+                .unwrap_or(false)
+            {
                 established = true;
             }
 
             let mut step = Step::Continue;
 
             if !established {
-                // Reaching Closed before we ever became active means the
-                // connection was refused / unreachable.
-                if sock.state() == tcp::State::Closed {
+                // The socket vanishing before we ever became active means the
+                // connection was refused / unreachable (the stack reaps Closed
+                // sockets itself).
+                if state.tcp.get(handle).is_none()
+                    || state
+                        .tcp
+                        .get(handle)
+                        .map(|k| k.state() == super::tcp::State::Closed)
+                        .unwrap_or(true)
+                {
                     step = Step::Fail(FetchError::ConnectTimeout);
                 }
             } else {
+                let can_tx = state.tcp.get(handle).map(|k| k.can_send()).unwrap_or(false);
+
                 // Send the request exactly once, as soon as tx is writable. The
                 // `Host:` header carries the original hostname, not the IP.
-                if !sent && sock.can_send() {
+                if !sent && can_tx {
                     let req = build_get_request(host, path);
-                    let _ = sock.send_slice(&req);
+                    let _ = state.tcp.get_mut(handle).map(|k| k.send_slice(&req));
                     sent = true;
                 }
 
                 // Drain whatever is available into the accumulation buffer.
-                if sock.can_recv() {
+                if state.tcp.get(handle).map(|k| k.can_recv()).unwrap_or(false) {
                     loop {
-                        match sock.recv_slice(&mut tmp) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                buf.extend_from_slice(&tmp[..n]);
-                            }
-                            Err(_) => break,
+                        let n = state
+                            .tcp
+                            .get_mut(handle)
+                            .map(|k| k.recv_slice(&mut tmp))
+                            .unwrap_or(0);
+                        match n {
+                            0 => break,
+                            m => buf.extend_from_slice(&tmp[..m]),
                         }
                         if buf.len() > MAX_TOTAL {
                             break;
@@ -260,7 +273,12 @@ pub fn http_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchError
 
                 // Peer closed and rx is drained before we completed: incomplete
                 // download (R8.4), discard partial.
-                if matches!(step, Step::Continue) && sent && !sock.may_recv() && !sock.can_recv() {
+                let peer_done = state
+                    .tcp
+                    .get(handle)
+                    .map(|k| !k.may_recv() && !k.can_recv())
+                    .unwrap_or(true);
+                if matches!(step, Step::Continue) && sent && peer_done {
                     step = Step::Fail(FetchError::Incomplete);
                 }
             }
@@ -395,11 +413,11 @@ fn fail_after(err: FetchError, host: &str, path: &str) -> Result<Vec<u8>, FetchE
     Err(err)
 }
 
-/// Release a still-open socket handle from the shared socket set. Idempotent: a
-/// no-op if the interface or socket is already gone.
-fn release(handle: smoltcp::iface::SocketHandle) {
+/// Release a still-open socket handle from the TCP table. Idempotent: a no-op
+/// if the stack or socket is already gone.
+fn release(handle: crate::net::SocketHandle) {
     if let Some(state) = NET.lock().as_mut() {
-        state.sockets.remove(handle);
+        state.tcp.remove(handle);
     }
 }
 

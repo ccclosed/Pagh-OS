@@ -28,13 +28,13 @@ pub mod validate;
 // VMM/PMM, VFS, scheduler, and per-process compat state. Keeping the effectful
 // handlers here — rather than in the host-included `io.rs`/`mem.rs` — is what lets
 // those pure planners stay host-testable (R11.6).
+pub mod epoll_sys;
 pub mod inet_sock;
 pub mod io_sys;
-pub mod epoll_sys;
 pub mod mem_sys;
 pub mod process_sys;
-pub mod unix_sock;
 pub mod rtc;
+pub mod unix_sock;
 
 use abi::nr as sysno;
 use errno::{encode_errno, Errno};
@@ -141,15 +141,20 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             }
         }
         sysno::CONNECT => {
-            // Peek the sockaddr family to pick the stack (AF_UNIX registry vs AF_INET smoltcp).
+            // Peek the sockaddr family to pick the stack (AF_UNIX registry vs AF_INET own stack).
             let fam = if a[1] != 0 && a[2] >= 2 {
                 (unsafe { core::ptr::read_unaligned(a[1] as *const u16) }) as u64
-            } else { 1 };
+            } else {
+                1
+            };
             if fam == crate::arch::x86_64::linux::inet_sock::AF_INET {
                 let is_udp = crate::task::compat::with_current_compat(|cs| {
-                    matches!(cs.fds.get(a[0] as u32),
-                        Some(crate::task::fd::OpenObject::InetUdp(_)))
-                }).unwrap_or(false);
+                    matches!(
+                        cs.fds.get(a[0] as u32),
+                        Some(crate::task::fd::OpenObject::InetUdp(_))
+                    )
+                })
+                .unwrap_or(false);
                 if is_udp {
                     crate::arch::x86_64::linux::inet_sock::udp_connect_fd(a[0], a[1], a[2])
                 } else {
@@ -163,9 +168,12 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             // Route by fd type. For a connected UDP socket glibc passes
             // dest_addr=NULL (write-style); an explicit address wins.
             let is_inet_udp = crate::task::compat::with_current_compat(|cs| {
-                matches!(cs.fds.get(a[0] as u32),
-                    Some(crate::task::fd::OpenObject::InetUdp(_)))
-            }).unwrap_or(false);
+                matches!(
+                    cs.fds.get(a[0] as u32),
+                    Some(crate::task::fd::OpenObject::InetUdp(_))
+                )
+            })
+            .unwrap_or(false);
             if !is_inet_udp {
                 return Err(Errno::EINVAL);
             }
@@ -181,30 +189,50 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::RECVFROM => {
             // Route by fd type: AF_INET UDP sockets come here (glibc resolver).
             let is_inet_udp = crate::task::compat::with_current_compat(|cs| {
-                matches!(cs.fds.get(a[0] as u32),
-                    Some(crate::task::fd::OpenObject::InetUdp(_)))
-            }).unwrap_or(false);
+                matches!(
+                    cs.fds.get(a[0] as u32),
+                    Some(crate::task::fd::OpenObject::InetUdp(_))
+                )
+            })
+            .unwrap_or(false);
             if !is_inet_udp {
                 return Err(Errno::EINVAL);
             }
             check_user_ptr(a[1], a[2].min(1 << 20))?;
             let mut buf = alloc::vec![0u8; a[2] as usize];
-            let (n, port, octets) =
-                crate::arch::x86_64::linux::inet_sock::udp_recvfrom_fd(a[0], &mut buf)?;
+            let (n, src) = crate::arch::x86_64::linux::inet_sock::udp_recvfrom_fd(a[0], &mut buf)?;
             crate::warn!(
-                "[DIAG] recvfrom(fd={}) -> {} bytes (src port {}) to userspace",
-                a[0], n, port
+                "[DIAG] recvfrom(fd={}) -> {} bytes (src {}) to userspace",
+                a[0],
+                n,
+                src.addr
             );
             crate::arch::x86_64::linux::io_sys::copy_out_pub(a[1], &buf[..n]);
             if a[4] != 0 && a[5] != 0 {
-                // struct sockaddr_in { family=AF_INET(2), port(be16), addr, zero }
-                let mut sa = [0u8; 16];
-                sa[0..2].copy_from_slice(&2u16.to_ne_bytes());
-                sa[2..4].copy_from_slice(&port.to_be_bytes());
-                sa[4..8].copy_from_slice(&octets);
-                unsafe {
-                    core::ptr::write_unaligned(a[4] as *mut [u8; 16], sa);
-                    core::ptr::write_unaligned(a[5] as *mut u32, 16);
+                match src.addr {
+                    crate::net::IpAddr::V4(v4) => {
+                        // struct sockaddr_in { family=2, port(be16), addr, zero }
+                        let mut sa = [0u8; 16];
+                        sa[0..2].copy_from_slice(&2u16.to_ne_bytes());
+                        sa[2..4].copy_from_slice(&src.port.to_be_bytes());
+                        sa[4..8].copy_from_slice(&v4.octets());
+                        unsafe {
+                            core::ptr::write_unaligned(a[4] as *mut [u8; 16], sa);
+                            core::ptr::write_unaligned(a[5] as *mut u32, 16);
+                        }
+                    }
+                    crate::net::IpAddr::V6(v6) => {
+                        // struct sockaddr_in6 { family=10, port(be16), flowinfo,
+                        // addr(16), scope_id }
+                        let mut sa = [0u8; 28];
+                        sa[0..2].copy_from_slice(&10u16.to_ne_bytes());
+                        sa[2..4].copy_from_slice(&src.port.to_be_bytes());
+                        sa[8..24].copy_from_slice(&v6.octets());
+                        unsafe {
+                            core::ptr::write_unaligned(a[4] as *mut [u8; 28], sa);
+                            core::ptr::write_unaligned(a[5] as *mut u32, 28);
+                        }
+                    }
                 }
             }
             Ok(n as u64)
@@ -217,9 +245,12 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::SETSOCKOPT => unix_sock::sys_setsockopt(a[0], a[1], a[2], a[3], a[4]),
         sysno::GETSOCKOPT => {
             let is_inet = crate::task::compat::with_current_compat(|cs| {
-                matches!(cs.fds.get(a[0] as u32),
-                    Some(crate::task::fd::OpenObject::InetTcp(_)))
-            }).unwrap_or(false);
+                matches!(
+                    cs.fds.get(a[0] as u32),
+                    Some(crate::task::fd::OpenObject::InetTcp(_))
+                )
+            })
+            .unwrap_or(false);
             if is_inet {
                 crate::arch::x86_64::linux::inet_sock::getsockopt_in(None, a[1], a[2], a[3], a[4])
             } else {
@@ -411,7 +442,6 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
     }
 }
 
-
 // ─── stuck-syscall watchdog ────────────────────────────────────────
 // A silent hang (nvim's black screen) means some Compat_Process is parked
 // inside one blocking syscall forever, with nothing in the log to say WHICH
@@ -431,14 +461,26 @@ fn inflight_enter(pid: u64, nr: u64, arg0: u64) {
     SYSCALL_INFLIGHT.lock().insert(pid, (nr, arg0, now, 0, 0));
 }
 
-fn inflight_exit(pid: u64) { SYSCALL_INFLIGHT.lock().remove(&pid); }
+fn inflight_exit(pid: u64) {
+    SYSCALL_INFLIGHT.lock().remove(&pid);
+}
 
 /// Human name for the syscalls a task can realistically block in.
 fn wd_sys_name(nr: u64) -> &'static str {
     match nr {
-        0 => "read", 1 => "write", 7 => "poll", 20 => "writev", 23 => "select",
-        35 => "nanosleep", 43 => "accept", 61 => "wait4", 202 => "futex",
-        232 => "epoll_wait", 270 => "pselect6", 271 => "ppoll", 281 => "epoll_pwait",
+        0 => "read",
+        1 => "write",
+        7 => "poll",
+        20 => "writev",
+        23 => "select",
+        35 => "nanosleep",
+        43 => "accept",
+        61 => "wait4",
+        202 => "futex",
+        232 => "epoll_wait",
+        270 => "pselect6",
+        271 => "ppoll",
+        281 => "epoll_pwait",
         _ => "?",
     }
 }
@@ -453,12 +495,25 @@ pub fn watchdog_tick() {
     maybe_dump_self();
     let now = crate::task::scheduler::ticks();
     let last = WD_LAST_SCAN.load(core::sync::atomic::Ordering::Relaxed);
-    if now.saturating_sub(last) < 100 { return; } // scan at most once a second
-    if WD_LAST_SCAN.compare_exchange(last, now,
-        core::sync::atomic::Ordering::Relaxed,
-        core::sync::atomic::Ordering::Relaxed).is_err() { return; }
-    let snapshot: alloc::vec::Vec<(u64, (u64, u64, u64, u64, u64))> =
-        SYSCALL_INFLIGHT.lock().iter().map(|(&p, &e)| (p, e)).collect();
+    if now.saturating_sub(last) < 100 {
+        return;
+    } // scan at most once a second
+    if WD_LAST_SCAN
+        .compare_exchange(
+            last,
+            now,
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
+    let snapshot: alloc::vec::Vec<(u64, (u64, u64, u64, u64, u64))> = SYSCALL_INFLIGHT
+        .lock()
+        .iter()
+        .map(|(&p, &e)| (p, e))
+        .collect();
     for (pid, (nr, arg0, start, warned, _dumped)) in snapshot {
         if !crate::task::compat::compat_exists(pid) {
             SYSCALL_INFLIGHT.lock().remove(&pid);
@@ -469,7 +524,10 @@ pub fn watchdog_tick() {
             let mut still_stuck = false;
             if let Some(e) = SYSCALL_INFLIGHT.lock().get_mut(&pid) {
                 // Same syscall instance only: a fresh entry means it moved on.
-                if e.2 == start { e.3 = now; still_stuck = true; }
+                if e.2 == start {
+                    e.3 = now;
+                    still_stuck = true;
+                }
             }
             if still_stuck {
                 crate::warn!(
@@ -485,7 +543,6 @@ pub fn watchdog_tick() {
         }
     }
 }
-
 
 /// When the CURRENT task is the one stuck in epoll_wait (232) or
 /// epoll_pwait (281), dump its interest list with live readiness every ~10 s.
@@ -515,9 +572,16 @@ fn maybe_dump_self() {
         // the decisive evidence with every dump: what stdio is NOW and what it
         // was AT execve time (after the close-on-exec sweep).
         let _ = crate::task::compat::with_current_compat(|cs| {
-            crate::warn!("[WATCHDOG] pid={} stdio now: fd0={} fd1={} fd2={} | at exec: fd0={} fd1={} fd2={}",
-                pid, cs.fds.describe_fd(0), cs.fds.describe_fd(1), cs.fds.describe_fd(2),
-                cs.exec_stdio[0], cs.exec_stdio[1], cs.exec_stdio[2]);
+            crate::warn!(
+                "[WATCHDOG] pid={} stdio now: fd0={} fd1={} fd2={} | at exec: fd0={} fd1={} fd2={}",
+                pid,
+                cs.fds.describe_fd(0),
+                cs.fds.describe_fd(1),
+                cs.fds.describe_fd(2),
+                cs.exec_stdio[0],
+                cs.exec_stdio[1],
+                cs.exec_stdio[2]
+            );
         });
         epoll_sys::dump_epoll_self(epfd);
     }

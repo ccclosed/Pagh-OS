@@ -30,17 +30,17 @@
 //! ## How it is wired (kernel-only module)
 //!
 //! `embedded-tls` is async (`embedded-io-async`). We do not have an async runtime,
-//! so three small pieces bridge it onto the existing smoltcp socket pump:
+//! so three small pieces bridge it onto the kernel's own TCP stack:
 //!
 //!   1. [`block_on`] — a minimal executor: it polls a pinned future in a loop with
 //!      a no-op waker until it is `Ready`, spinning briefly between polls so the
-//!     timer tick and QEMU can advance.
+//!      timer tick and QEMU can advance.
 //!   2. [`TlsTransport`] — implements [`embedded_io_async::Read`]/[`Write`] over a
-//!      smoltcp TCP [`SocketHandle`]. Each poll takes the `NET` lock, advances
-//!      smoltcp once, then drains/fills the socket. It NEVER holds the `NET` lock
-//!      across an `await`, mirrors the bounded locked-step + `spin_loop` discipline
-//!      of `nc_echo`/`http_get`, and carries an inactivity budget so a stall
-//!      returns an error instead of hanging.
+//!      TCP socket handle from the own stack. Each poll takes the `NET` lock,
+//!      advances the stack once, then drains/fills the socket. It NEVER holds
+//!      the `NET` lock across an `await`, mirrors the bounded locked-step +
+//!      `spin_loop` discipline of `nc_echo`/`http_get`, and carries an
+//!      inactivity budget so a stall returns an error instead of hanging.
 //!   3. [`KernelRng`] — adapts the fail-closed hardware entropy API to the
 //!      `RngCore + CryptoRng` traits required by `embedded-tls`.
 //!
@@ -60,13 +60,12 @@ use embedded_io::ErrorKind;
 use embedded_tls::{
     Aes128GcmSha256, TlsConfig, TlsConnection, TlsContext, TlsError, UnsecureProvider,
 };
-use smoltcp::iface::SocketHandle;
-use smoltcp::socket::tcp;
-use smoltcp::wire::{IpAddress, IpEndpoint};
+
+use crate::net::{IpEndpoint, SocketHandle};
 
 use super::http::{build_get_request, parse_http_head, HeadParse};
 use super::http_fetch::FetchError;
-use super::{now, NET};
+use super::NET;
 use crate::task::scheduler;
 use crate::{error, warn};
 
@@ -81,13 +80,13 @@ const CONNECT_TIMEOUT_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(3_000)
 const TLS_IDLE_TIMEOUT_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(15_000);
 /// TLS record buffer size. 16 KiB+ is the safe maximum for any TLS 1.3 record.
 const RECORD_BUF: usize = 16 * 1024 + 256;
-/// rx/tx smoltcp socket buffer sizes for the TLS connection.
+/// rx/tx TCP socket buffer sizes for the TLS connection.
 ///
 /// THROUGHPUT (#1 lever): over QEMU user-net NAT the achievable bandwidth is
 /// bounded by `window / RTT` (bandwidth-delay product). The old 16 KiB receive
 /// window capped a ~10 MiB `Packages.gz` to roughly one 16 KiB window per RTT.
-/// We raise rx to 256 KiB so smoltcp negotiates TCP window scaling (available in
-/// smoltcp 0.12) and many more bytes are in flight per round trip. The heap is
+/// We raise rx to 256 KiB so the stack negotiates TCP window scaling and many
+/// more bytes are in flight per round trip. The heap is
 /// 256 MiB, so a 256 KiB per-connection buffer is comfortably affordable. tx is
 /// kept modest (16 KiB): we only ever send a small GET request.
 const TLS_RX_BYTES: usize = 256 * 1024;
@@ -160,7 +159,7 @@ fn noop_raw_waker() -> RawWaker {
 
 /// Minimal single-future executor: poll `fut` to completion with a no-op waker,
 /// spinning briefly between `Pending` polls so the timer tick and QEMU can
-/// advance. The transport adapter pumps smoltcp inside each of its own polls, so
+/// advance. The transport adapter pumps the stack inside each of its own polls, so
 /// re-polling here drives the network forward; the transport's inactivity budget
 /// guarantees this loop terminates (with an error) rather than hanging on a stall.
 fn block_on<F: Future>(fut: F) -> F::Output {
@@ -184,11 +183,12 @@ fn block_on<F: Future>(fut: F) -> F::Output {
 
 // ────────────────────────── transport adapter ──────────────────────────
 
-/// An `embedded-io[-async]` byte transport over a smoltcp TCP [`SocketHandle`].
+/// An `embedded-io[-async]` byte transport over a TCP socket handle from the
+/// own stack.
 ///
-/// Each poll takes the `NET` lock, advances smoltcp once (`iface.poll`), then
-/// drains rx / fills tx for the held socket. No `await` happens while the lock is
-/// held. An inactivity deadline (re-armed on every byte moved) bounds stalls.
+/// Each poll takes the `NET` lock, advances the stack once, then drains rx /
+/// fills tx for the held socket. No `await` happens while the lock is held. An
+/// inactivity deadline (re-armed on every byte moved) bounds stalls.
 struct TlsTransport {
     handle: SocketHandle,
     /// Tick at which an idle transport gives up. Re-armed whenever bytes move.
@@ -229,23 +229,32 @@ impl TlsTransport {
                 Some(s) => s,
                 None => return Poll::Ready(Err(ErrorKind::NotConnected)),
             };
-            let ts = now();
-            let _ = state.iface.poll(ts, &mut state.device, &mut state.sockets);
-            let sock = state.sockets.get_mut::<tcp::Socket>(self.handle);
+            state.step();
 
-            // Connection gone for sending (peer reset / fully closed).
-            if !sock.may_send() && !sock.is_active() {
+            let sock_state_ok = state
+                .tcp
+                .get(self.handle)
+                .map(|k| k.may_send() || k.is_active())
+                .unwrap_or(false);
+            if !sock_state_ok {
+                // Connection gone for sending (peer reset / fully closed).
                 return Poll::Ready(Err(ErrorKind::BrokenPipe));
             }
-            if sock.can_send() {
-                match sock.send_slice(buf) {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        drop(guard);
-                        self.touch();
-                        return Poll::Ready(Ok(n));
-                    }
-                    Err(_) => return Poll::Ready(Err(ErrorKind::BrokenPipe)),
+            if state
+                .tcp
+                .get(self.handle)
+                .map(|k| k.can_send())
+                .unwrap_or(false)
+            {
+                let n = state
+                    .tcp
+                    .get_mut(self.handle)
+                    .map(|k| k.send_slice(buf))
+                    .unwrap_or(0);
+                if n > 0 {
+                    drop(guard);
+                    self.touch();
+                    return Poll::Ready(Ok(n));
                 }
             }
         }
@@ -273,9 +282,7 @@ impl TlsTransport {
                 Some(s) => s,
                 None => return Poll::Ready(Err(ErrorKind::NotConnected)),
             };
-            let ts = now();
-            let _ = state.iface.poll(ts, &mut state.device, &mut state.sockets);
-            let sock = state.sockets.get_mut::<tcp::Socket>(self.handle);
+            state.step();
 
             // THROUGHPUT: drain aggressively. Fill as much of `buf` as possible
             // across repeated `recv_slice` calls within this single lock hold
@@ -284,22 +291,16 @@ impl TlsTransport {
             // up to a full `buf` (a TLS record buffer, ~16 KiB) out of the socket
             // per poll, rather than being throttled to one record per re-poll.
             let mut filled = 0usize;
-            if sock.can_recv() {
-                while filled < buf.len() {
-                    match sock.recv_slice(&mut buf[filled..]) {
-                        Ok(0) => break,
-                        Ok(n) => filled += n,
-                        Err(_) => {
-                            // A receive error with nothing collected is a dead
-                            // socket; if we already have bytes, return them and
-                            // surface the error on the next poll.
-                            if filled == 0 {
-                                return Poll::Ready(Err(ErrorKind::BrokenPipe));
-                            }
-                            break;
-                        }
-                    }
+            while filled < buf.len() {
+                let n = state
+                    .tcp
+                    .get_mut(self.handle)
+                    .map(|k| k.recv_slice(&mut buf[filled..]))
+                    .unwrap_or(0);
+                if n == 0 {
+                    break;
                 }
+                filled += n;
             }
             if filled > 0 {
                 drop(guard);
@@ -308,7 +309,12 @@ impl TlsTransport {
             }
 
             // Peer closed its half and rx is drained: clean EOF.
-            if !sock.may_recv() && !sock.can_recv() {
+            let eof = state
+                .tcp
+                .get(self.handle)
+                .map(|k| !k.may_recv() && !k.can_recv())
+                .unwrap_or(true);
+            if eof {
                 return Poll::Ready(Ok(0));
             }
         }
@@ -336,7 +342,7 @@ impl embedded_io_async::Write for TlsTransport {
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
-        // smoltcp egress happens inside each poll; a no-op flush is correct here.
+        // egress happens inside each poll; a no-op flush is correct here.
         Ok(())
     }
 }
@@ -383,7 +389,7 @@ pub fn https_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchErro
             return Err(FetchError::ConnectTimeout);
         }
     };
-    let remote = IpEndpoint::new(IpAddress::Ipv4(addr), port);
+    let remote = IpEndpoint::new(addr, port);
 
     // Open the TCP socket with larger buffers for multi-KiB TLS records.
     let handle = match super::tcp_connect_buffered(remote, TLS_RX_BYTES, TLS_TX_BYTES) {
@@ -527,7 +533,9 @@ pub fn https_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchErro
     });
 
     // Drop the TLS connection (and its borrows) before releasing the socket.
-    drop(tls);
+    // (`tls` does not implement `Drop`; the binding is shadowed/moved into a
+    // type-erased local so the socket is definitely free afterwards.)
+    let _tls_done: TlsConnection<TlsTransport, Aes128GcmSha256> = tls;
     release(handle);
 
     match result {
@@ -560,19 +568,32 @@ fn pump_until_established(handle: SocketHandle) -> Result<(), FetchError> {
                 Some(s) => s,
                 None => return Err(FetchError::ConnectTimeout),
             };
-            let ts = now();
-            let _ = state.iface.poll(ts, &mut state.device, &mut state.sockets);
-            let sock = state.sockets.get_mut::<tcp::Socket>(handle);
+            state.step();
 
-            if sock.is_active() {
+            if state
+                .tcp
+                .get(handle)
+                .map(|k| k.is_active())
+                .unwrap_or(false)
+            {
                 active = true;
             }
-            // Reaching Closed before becoming active = refused / unreachable.
-            if !active && sock.state() == tcp::State::Closed {
+            // Gone before becoming active = refused / unreachable.
+            let dead = state
+                .tcp
+                .get(handle)
+                .map(|k| !k.ever_established() && k.state() == super::tcp::State::Closed)
+                .unwrap_or(true);
+            if !active && dead {
                 return Err(FetchError::ConnectTimeout);
             }
             // Established and writable: ready to start the TLS handshake.
-            if sock.state() == tcp::State::Established && sock.may_send() {
+            let ready = state
+                .tcp
+                .get(handle)
+                .map(|k| k.state() == super::tcp::State::Established && k.may_send())
+                .unwrap_or(false);
+            if ready {
                 return Ok(());
             }
         }
@@ -585,10 +606,10 @@ fn pump_until_established(handle: SocketHandle) -> Result<(), FetchError> {
     }
 }
 
-/// Release a still-open socket handle from the shared socket set (idempotent).
+/// Release a still-open socket handle from the TCP table (idempotent).
 fn release(handle: SocketHandle) {
     if let Some(state) = NET.lock().as_mut() {
-        state.sockets.remove(handle);
+        state.tcp.remove(handle);
     }
 }
 

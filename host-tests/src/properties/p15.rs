@@ -162,10 +162,15 @@ proptest! {
                 prop_assert!(matches!(classify_elf(&bytes), ElfVerdict::Reject(_)));
             }
             Mutation::InterpPresent => {
-                // Mark the first program header as PT_INTERP.
+                // PT_INTERP is now ACCEPTED by the classifier: since dynamic
+                // glibc images landed, the interpreter is validated/resolved by
+                // the effectful process loader, not rejected here.
                 let ph = EHDR_SIZE;
                 put32(&mut bytes, ph, PT_INTERP);
-                prop_assert!(matches!(classify_elf(&bytes), ElfVerdict::Reject(_)));
+                // (bind first: `matches!` with struct-pattern braces cannot be
+                // embedded directly in `prop_assert!`'s format machinery)
+                let accepted = matches!(classify_elf(&bytes), ElfVerdict::Load { .. });
+                prop_assert!(accepted);
             }
             Mutation::FileszGtMemsz => {
                 let ph = EHDR_SIZE;

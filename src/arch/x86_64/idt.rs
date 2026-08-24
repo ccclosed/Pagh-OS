@@ -105,8 +105,7 @@ pub fn init() {
 // ─── Exception handlers ──────────────────────────────────────────────────
 
 /// When true, exception handlers dump the raw kernel stack (debugging aid).
-pub static STACK_DUMP: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+pub static STACK_DUMP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 extern "x86-interrupt" fn divide_error_handler(stack: InterruptStackFrame) {
     crate::error!(
@@ -242,7 +241,9 @@ extern "x86-interrupt" fn gp_fault_handler(stack: InterruptStackFrame, error_cod
     //   [top-0x20] rcx (sysretq user RIP!)  [top-0x60] r11 (user RFLAGS) ...
     // The full 24-word dump lives behind a flag (it is scary and noisy for a
     // normal userspace crash); enable with `warn on`-style tooling later.
-    if !crate::task::scheduler::is_idle(pid) && STACK_DUMP.load(core::sync::atomic::Ordering::Relaxed) {
+    if !crate::task::scheduler::is_idle(pid)
+        && STACK_DUMP.load(core::sync::atomic::Ordering::Relaxed)
+    {
         let (_guard, _base, top) = crate::memory::layout::kernel_stack_for_pid(pid);
         crate::error!(
             "--- Top 24 words of kernel stack for pid {} (top=0x{:x}) ---",
@@ -309,10 +310,14 @@ extern "x86-interrupt" fn page_fault_handler(
         "[EXC #14] current pid={} last_dispatch: pid={} nr={}",
         pid,
         LAST_SYSCALL_PID.load(core::sync::atomic::Ordering::Relaxed),
-        LAST_SYSCALL_NR.load(core::sync::atomic::Ordering::Relaxed));
+        LAST_SYSCALL_NR.load(core::sync::atomic::Ordering::Relaxed)
+    );
     // Which address space was live, and at which level does
     // the translation of the faulting address (and of RIP) break?
-    crate::error!("[EXC #14] CR3=0x{:016x}", crate::memory::vmm::current_pml4_phys());
+    crate::error!(
+        "[EXC #14] CR3=0x{:016x}",
+        crate::memory::vmm::current_pml4_phys()
+    );
     crate::memory::vmm::dump_translation(fault_addr.as_u64());
     crate::memory::vmm::dump_translation(stack.instruction_pointer.as_u64());
     // COW hint: a write to a present-but-read-only user page is exactly what
@@ -323,8 +328,12 @@ extern "x86-interrupt" fn page_fault_handler(
         && error_code.contains(PageFaultErrorCode::USER_MODE)
     {
         if let Some(pte) = crate::memory::vmm::walk_pte(fault_addr.as_u64()) {
-            let writable = pte.flags().contains(x86_64::structures::paging::PageTableFlags::WRITABLE);
-            let present = pte.flags().contains(x86_64::structures::paging::PageTableFlags::PRESENT);
+            let writable = pte
+                .flags()
+                .contains(x86_64::structures::paging::PageTableFlags::WRITABLE);
+            let present = pte
+                .flags()
+                .contains(x86_64::structures::paging::PageTableFlags::PRESENT);
             // Write to a present-but-RO user page is a genuine fault.
             // We do NOT fix up the PTE: that would defeat RELRO and make
             // .text writable. Diagnose and kill instead. The root cause
@@ -339,7 +348,8 @@ extern "x86-interrupt" fn page_fault_handler(
             }
             crate::error!(
                 "[EXC #14] COW check: PTE present={}, writable={}",
-                present, writable
+                present,
+                writable
             );
         }
     }

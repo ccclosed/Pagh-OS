@@ -83,8 +83,7 @@ pub static CTRL_C: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// PID of the current foreground Compat_Process (set by `cmd_lxrun`).
 /// When the driver detects ^C, it directly terminates this pid — the shell
 /// may itself be blocked in read() and unable to poll a latch.
-pub static FG_PID: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static FG_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // Driver-level modifier state (set-1): LCtrl 0x1D/0x9D, RCtrl E0 1D/E0 9D,
 // C = 0x2E. Tracked here so ^C detection cannot be starved by a program
@@ -113,7 +112,8 @@ pub fn irq_handler() {
                 crate::warn!("[DIAG] kbd: ctrl+c detected");
                 CTRL_C.store(true, Ordering::Relaxed);
                 let fg = FG_PID.load(Ordering::Relaxed);
-                if fg != 0 && crate::task::compat::compat_exists(fg)
+                if fg != 0
+                    && crate::task::compat::compat_exists(fg)
                     && !crate::task::compat::compat_is_raw(fg)
                 {
                     crate::warn!("[DIAG] kbd: killing foreground pid={}", fg);
@@ -132,5 +132,9 @@ pub fn irq_handler() {
 /// True when the ring buffer holds an unread scancode. Lets
 /// poll/epoll report stdin readable only when a read can make progress.
 pub fn has_pending() -> bool {
-    KEYBOARD.lock().as_ref().map(|k| k.has_scancode()).unwrap_or(false)
+    KEYBOARD
+        .lock()
+        .as_ref()
+        .map(|k| k.has_scancode())
+        .unwrap_or(false)
 }

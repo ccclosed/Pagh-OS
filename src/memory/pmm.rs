@@ -488,7 +488,10 @@ pub fn free_frame(addr: u64) {
     }
     drop(guard);
     if double_free {
-        crate::error!("[PMM] DOUBLE FREE frame=0x{:016x} - frame ownership bug (see caller)", addr);
+        crate::error!(
+            "[PMM] DOUBLE FREE frame=0x{:016x} - frame ownership bug (see caller)",
+            addr
+        );
     }
 }
 

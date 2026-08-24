@@ -12,8 +12,8 @@ use crate::task::stack::{arg_gate, AuxInputs};
 use crate::task::stack_map::{map_initial_stack, StackMapError};
 use crate::vfs::elf::ElfLoader;
 use alloc::format;
-use alloc::sync::Arc;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use x86_64::structures::paging::PageTableFlags;
 
@@ -520,7 +520,10 @@ pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u6
 
         let mut state = CompatState::new(
             FdTable::with_standard_streams(),
-            Arc::new(crate::sync::spinlock::Spinlock::new(VmRegionSet::new(elf.initial_brk, USER_MMAP_BASE))),
+            Arc::new(crate::sync::spinlock::Spinlock::new(VmRegionSet::new(
+                elf.initial_brk,
+                USER_MMAP_BASE,
+            ))),
             pid,
         );
         // Remember the image path for readlink("/proc/self/exe").
@@ -564,9 +567,13 @@ fn resolve_exec_path(path: &str) -> String {
     let abs = if path.starts_with('/') {
         path.to_string()
     } else {
-        let cwd = compat::with_current_compat(|cs| cs.cwd.clone())
-            .unwrap_or_else(|| String::from("/"));
-        if cwd.ends_with('/') { format!("{}{}", cwd, path) } else { format!("{}/{}", cwd, path) }
+        let cwd =
+            compat::with_current_compat(|cs| cs.cwd.clone()).unwrap_or_else(|| String::from("/"));
+        if cwd.ends_with('/') {
+            format!("{}{}", cwd, path)
+        } else {
+            format!("{}/{}", cwd, path)
+        }
     };
     if crate::vfs::lookup_path(&abs).is_ok() {
         return abs;
@@ -581,7 +588,9 @@ fn resolve_exec_path(path: &str) -> String {
 /// Prepare and install a fresh ELF address space for the current pid. Open file
 /// descriptors, cwd, ppid and pid survive; VM/TLS/image state is reset.
 pub fn exec_linux_image(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<ExecImage, RunError> {
-    if !arg_gate(argv) || !arg_gate(envp) { return Err(RunError::ArgsTooLarge); }
+    if !arg_gate(argv) || !arg_gate(envp) {
+        return Err(RunError::ArgsTooLarge);
+    }
     // Resolve the path the way Linux userspace sees the tree.
     let resolved = resolve_exec_path(path);
     let path = resolved.as_str();
@@ -609,23 +618,50 @@ pub fn exec_linux_image(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<Ex
         .map_err(|_| RunError::StackFailed)?;
         let pid = scheduler::current_pid();
         compat::with_current_compat(|st| {
-            st.vm = Arc::new(crate::sync::spinlock::Spinlock::new(VmRegionSet::new(elf.initial_brk, USER_MMAP_BASE)));
-            st.fs_base = 0; st.tid = pid; st.nosys_logged.clear(); st.exit_code = None;
+            st.vm = Arc::new(crate::sync::spinlock::Spinlock::new(VmRegionSet::new(
+                elf.initial_brk,
+                USER_MMAP_BASE,
+            )));
+            st.fs_base = 0;
+            st.tid = pid;
+            st.nosys_logged.clear();
+            st.exit_code = None;
             // The close-on-exec sweep (libuv's fork error pipe
             // relies on it) + record the new image for /proc/self/exe.
             st.fds.close_cloexec();
             // What the fresh image actually sees on stdio —
             // answers whether the spawn wired the RPC socket onto fds 0/1.
-            st.exec_stdio = [st.fds.describe_fd(0), st.fds.describe_fd(1), st.fds.describe_fd(2)];
-            crate::warn!("[DIAG] execve pid={} fd0={} fd1={} fd2={}",
-                pid, st.exec_stdio[0], st.exec_stdio[1], st.exec_stdio[2]);
+            st.exec_stdio = [
+                st.fds.describe_fd(0),
+                st.fds.describe_fd(1),
+                st.fds.describe_fd(2),
+            ];
+            crate::warn!(
+                "[DIAG] execve pid={} fd0={} fd1={} fd2={}",
+                pid,
+                st.exec_stdio[0],
+                st.exec_stdio[1],
+                st.exec_stdio[2]
+            );
             st.exe_path = resolved.clone();
-        }).ok_or(RunError::LoadFailed("execve without compat state"))?;
+        })
+        .ok_or(RunError::LoadFailed("execve without compat state"))?;
         // SAFETY: loader built a valid PML4 with shared kernel higher-half mappings.
-        unsafe { vmm::load_cr3(elf.pml4_phys); }
-        crate::info!("[linux] execve pid={} '{}' new_pml4=0x{:x} entry=0x{:x}",
-            pid, path, elf.pml4_phys, loaded.start_entry);
-        Ok(ExecImage { entry: loaded.start_entry, initial_rsp: rsp, pml4_phys: elf.pml4_phys })
+        unsafe {
+            vmm::load_cr3(elf.pml4_phys);
+        }
+        crate::info!(
+            "[linux] execve pid={} '{}' new_pml4=0x{:x} entry=0x{:x}",
+            pid,
+            path,
+            elf.pml4_phys,
+            loaded.start_entry
+        );
+        Ok(ExecImage {
+            entry: loaded.start_entry,
+            initial_rsp: rsp,
+            pml4_phys: elf.pml4_phys,
+        })
     })
 }
 
@@ -684,30 +720,44 @@ pub fn spawn_linux_thread(
 /// Runs with interrupts disabled so (a) the page-copy walk sees a stable
 /// parent address space and (b) the child cannot be scheduled before its
 /// CompatState is registered.
-pub fn fork_linux_process(regs:&crate::arch::x86_64::linux::regs::SavedRegs, clear_child_tid:u64)->Result<(u64,u64),&'static str>{
+pub fn fork_linux_process(
+    regs: &crate::arch::x86_64::linux::regs::SavedRegs,
+    clear_child_tid: u64,
+) -> Result<(u64, u64), &'static str> {
     crate::arch::cpu::without_interrupts(|| {
-        let parent=scheduler::current_pid(); let child=scheduler::next_pid();
-        let parent_pml4=vmm::current_pml4_phys();
-        let child_pml4=vmm::new_user_pml4().map_err(|_|"fork: no frame for child PML4")?;
-        vmm::clone_user_space(parent_pml4,child_pml4).map_err(|_|"fork: user-space copy failed")?;
-        let child_top=setup_task_kernel_stack(child)?;
+        let parent = scheduler::current_pid();
+        let child = scheduler::next_pid();
+        let parent_pml4 = vmm::current_pml4_phys();
+        let child_pml4 = vmm::new_user_pml4().map_err(|_| "fork: no frame for child PML4")?;
+        vmm::clone_user_space(parent_pml4, child_pml4)
+            .map_err(|_| "fork: user-space copy failed")?;
+        let child_top = setup_task_kernel_stack(child)?;
         // setup_task_kernel_stack points TSS RSP0 / the syscall stack at the
         // CHILD; the PARENT keeps running after this syscall, so point them back
         // (same pattern as spawn_linux_thread above).
-        let parent_top=crate::memory::layout::kernel_stack_for_pid(parent).2;
-        gdt::set_kernel_stack(parent_top); crate::arch::x86_64::syscall::set_syscall_kernel_stack(parent_top);
+        let parent_top = crate::memory::layout::kernel_stack_for_pid(parent).2;
+        gdt::set_kernel_stack(parent_top);
+        crate::arch::x86_64::syscall::set_syscall_kernel_stack(parent_top);
         // Child resumes at the parent's return RIP with the parent's user RSP
         // from the per-task slot at +120 above the SavedRegs frame.
-        let user_rsp=unsafe{ ((regs as *const crate::arch::x86_64::linux::regs::SavedRegs as *const u64).add(15)).read() };
-        let krsp=unsafe{build_clone_frame(child_top,regs,regs.rcx,user_rsp)};
+        let user_rsp = unsafe {
+            ((regs as *const crate::arch::x86_64::linux::regs::SavedRegs as *const u64).add(15))
+                .read()
+        };
+        let krsp = unsafe { build_clone_frame(child_top, regs, regs.rcx, user_rsp) };
         // Register the child's CompatState BEFORE enqueue so its very first
         // syscall is already routed with full Linux semantics.
         if !compat::fork_current_compat(child, clear_child_tid) {
             return Err("fork: parent has no compat state");
         }
-        scheduler::spawn(Tcb::new(child,krsp,child_pml4));
-        crate::info!("[linux] fork: parent pid={} pml4=0x{:x} -> child pid={} pml4=0x{:x}",
-            parent, parent_pml4, child, child_pml4);
-        Ok((child,child_pml4))
+        scheduler::spawn(Tcb::new(child, krsp, child_pml4));
+        crate::info!(
+            "[linux] fork: parent pid={} pml4=0x{:x} -> child pid={} pml4=0x{:x}",
+            parent,
+            parent_pml4,
+            child,
+            child_pml4
+        );
+        Ok((child, child_pml4))
     })
 }

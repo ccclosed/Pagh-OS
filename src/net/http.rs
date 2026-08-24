@@ -3,7 +3,7 @@
 //! This task (7.1) implements only the **pure** core of the `Package_Fetcher`
 //! (design component 7): allocation-aware but socket-free logic that builds a
 //! `GET` request and parses an HTTP response head. It is `core` + `alloc` only —
-//! no smoltcp sockets, no globals, no hardware — so it compiles into both the
+//! no socket types, no globals, no hardware — so it compiles into both the
 //! kernel (`crate::net::http`) and the `host-tests` crate via `#[path]` include,
 //! letting properties P20/P21 exercise the same source (R11.6).
 //!

@@ -53,7 +53,7 @@ qemu_args=(
   -drive "file=$DISK,format=raw,if=none,id=hd0"
   -device virtio-blk-pci,drive=hd0
   -netdev user,id=net0,hostfwd=tcp::5555-:7,hostfwd=udp::5555-:7
-  -device virtio-net-pci,netdev=net0
+  -device e1000,netdev=net0
   -m 1024M
   -serial stdio
   -no-reboot

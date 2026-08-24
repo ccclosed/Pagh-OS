@@ -181,7 +181,7 @@ fn init_drivers() {
 /// no virtio device of a given kind is present, the corresponding attach logs a
 /// warning and no-ops so boot is always preserved (R17.4).
 ///
-/// TODO(task 6): also attach the virtio-net NIC here (smoltcp bring-up).
+/// Networking bring-up attaches the e1000 NIC here (`net::init`).
 fn init_virtio() {
     let devs = drivers::pci::enumerate();
     drivers::virtio::blk::init_blk(&devs);
@@ -268,7 +268,7 @@ fn init_fs() {
 }
 
 /// Step 11.6: bring up networking (Task 6). Enumerates PCI, attaches the
-/// virtio-net NIC, builds the smoltcp interface, and enables the UDP echo
+/// e1000 NIC, builds the own TCP/IP stack state, and enables the UDP echo
 /// service on port 7. Address acquisition (DHCP, static fallback) and packet
 /// servicing run in the net thread spawned from `kernel_main` once interrupts
 /// are enabled and the LAPIC tick is advancing the network clock.
@@ -371,7 +371,7 @@ fn kernel_main() -> ! {
 
     // Spawn the networking poll thread (Task 6, R13.4). It must start once
     // scheduling is running and interrupts are enabled (below), because the
-    // smoltcp clock advances off the LAPIC timer tick and DHCP/echo servicing
+    // The stack clock advances off the LAPIC timer tick and DHCP/echo servicing
     // relies on the periodic poll. If no NIC was attached, `net::poll` is a
     // cheap no-op, so spawning unconditionally is harmless.
     task::scheduler::kernel_thread_spawn(net::net_thread);

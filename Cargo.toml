@@ -1,6 +1,6 @@
 [package]
 name = "pagh"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 
 [workspace]
@@ -139,11 +139,6 @@ rand_core = { version = "=0.6.4", default-features = false }
 version = "5.0"
 default-features = false
 features = ["allocator_api"]
-
-[dependencies.smoltcp]
-version = "0.12"
-default-features = false
-features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4"]
 
 # Host-only property-testing dependency. Dev-dependencies are NEVER compiled by
 # `cargo build`, so this does not touch the no_std kernel build or the custom target.

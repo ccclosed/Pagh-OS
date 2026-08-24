@@ -13,10 +13,10 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::arch::x86_64::linux::epoll_sys::EpollEntry;
 use crate::arch::x86_64::linux::errno::Errno;
 use crate::sync::spinlock::Spinlock;
 use crate::vfs::VfsNode;
-use crate::arch::x86_64::linux::epoll_sys::EpollEntry;
 
 use super::fd_alloc::FdSlots;
 
@@ -42,19 +42,72 @@ pub enum PipeWriteResult {
     Broken,
 }
 impl PipeEndpoint {
-    pub fn nonblocking(&self)->bool { self.nonblocking }
-    pub fn read(&self,dst:&mut[u8])->PipeReadResult { let mut s=self.state.lock(); if !s.bytes.is_empty(){let n=core::cmp::min(dst.len(),s.bytes.len());for b in dst.iter_mut().take(n){*b=s.bytes.pop_front().unwrap();}PipeReadResult::Data(n)}else if s.writers==0{PipeReadResult::Eof}else{PipeReadResult::WouldBlock} }
-    pub fn write(&self,src:&[u8])->PipeWriteResult { let mut s=self.state.lock();if s.readers==0{return PipeWriteResult::Broken}let room=PIPE_CAPACITY.saturating_sub(s.bytes.len());if room==0{return PipeWriteResult::WouldBlock}let n=core::cmp::min(room,src.len());s.bytes.extend(src[..n].iter().copied());PipeWriteResult::Data(n) }
-    pub fn read_ready(&self)->bool {let s=self.state.lock();!s.bytes.is_empty()||s.writers==0}
-    pub fn write_ready(&self)->bool {let s=self.state.lock();s.readers>0&&s.bytes.len()<PIPE_CAPACITY}
-    pub fn peer_closed(&self)->bool {let s=self.state.lock();if self.read_end{s.writers==0}else{s.readers==0}}
+    pub fn nonblocking(&self) -> bool {
+        self.nonblocking
+    }
+    pub fn read(&self, dst: &mut [u8]) -> PipeReadResult {
+        let mut s = self.state.lock();
+        if !s.bytes.is_empty() {
+            let n = core::cmp::min(dst.len(), s.bytes.len());
+            for b in dst.iter_mut().take(n) {
+                *b = s.bytes.pop_front().unwrap();
+            }
+            PipeReadResult::Data(n)
+        } else if s.writers == 0 {
+            PipeReadResult::Eof
+        } else {
+            PipeReadResult::WouldBlock
+        }
+    }
+    pub fn write(&self, src: &[u8]) -> PipeWriteResult {
+        let mut s = self.state.lock();
+        if s.readers == 0 {
+            return PipeWriteResult::Broken;
+        }
+        let room = PIPE_CAPACITY.saturating_sub(s.bytes.len());
+        if room == 0 {
+            return PipeWriteResult::WouldBlock;
+        }
+        let n = core::cmp::min(room, src.len());
+        s.bytes.extend(src[..n].iter().copied());
+        PipeWriteResult::Data(n)
+    }
+    pub fn read_ready(&self) -> bool {
+        let s = self.state.lock();
+        !s.bytes.is_empty() || s.writers == 0
+    }
+    pub fn write_ready(&self) -> bool {
+        let s = self.state.lock();
+        s.readers > 0 && s.bytes.len() < PIPE_CAPACITY
+    }
+    pub fn peer_closed(&self) -> bool {
+        let s = self.state.lock();
+        if self.read_end {
+            s.writers == 0
+        } else {
+            s.readers == 0
+        }
+    }
     /// Clone this endpoint with a different O_NONBLOCK flag (fcntl
     /// F_SETFL). The clone registers as an extra reader/writer on the shared
     /// queue; the original's count drops when its last Arc is released.
     pub fn with_nonblocking(self: &Arc<Self>, on: bool) -> Arc<PipeEndpoint> {
-        if self.nonblocking == on { return Arc::clone(self); }
-        { let mut s = self.state.lock(); if self.read_end { s.readers += 1 } else { s.writers += 1 } }
-        Arc::new(PipeEndpoint { state: Arc::clone(&self.state), read_end: self.read_end, nonblocking: on })
+        if self.nonblocking == on {
+            return Arc::clone(self);
+        }
+        {
+            let mut s = self.state.lock();
+            if self.read_end {
+                s.readers += 1
+            } else {
+                s.writers += 1
+            }
+        }
+        Arc::new(PipeEndpoint {
+            state: Arc::clone(&self.state),
+            read_end: self.read_end,
+            nonblocking: on,
+        })
     }
 }
 
@@ -82,9 +135,9 @@ impl Drop for PipeEndpoint {
 pub enum OpenObject {
     /// The kernel console (pre-bound to fds 1 and 2 for stdout/stderr).
     Console,
-    /// An AF_INET TCP socket over the smoltcp stack.
+    /// An AF_INET TCP socket over the kernel's own TCP stack.
     InetTcp(Arc<crate::arch::x86_64::linux::inet_sock::InetTcp>),
-    /// An AF_INET UDP socket over the smoltcp stack.
+    /// An AF_INET UDP socket over the kernel's own UDP stack.
     InetUdp(Arc<crate::arch::x86_64::linux::inet_sock::InetUdp>),
     /// Standard input (pre-bound to fd 0).
     Stdin,
@@ -103,16 +156,26 @@ pub enum OpenObject {
     PipeRead(Arc<PipeEndpoint>),
     PipeWrite(Arc<PipeEndpoint>),
     /// An eventfd counter (EFD_SEMAPHORE if semaphore=true).
-    Eventfd { val: Arc<Spinlock<u64>>, semaphore: bool },
+    Eventfd {
+        val: Arc<Spinlock<u64>>,
+        semaphore: bool,
+    },
     /// One end of an AF_UNIX stream socketpair — a cross-connected
     /// pair of pipe endpoints (rx = this end's incoming bytes, tx = outgoing).
-    Socket { rx: Arc<PipeEndpoint>, tx: Arc<PipeEndpoint> },
+    Socket {
+        rx: Arc<PipeEndpoint>,
+        tx: Arc<PipeEndpoint>,
+    },
     /// A bound/listening AF_UNIX server socket.
     UnixListener(Arc<UnixListenerState>),
     /// Socket(2) created but not yet bound or connected.
-    UnixSocketUnbound { nonblocking: bool },
+    UnixSocketUnbound {
+        nonblocking: bool,
+    },
     /// An epoll instance with its interest list.
-    Epoll { interests: Arc<Spinlock<Vec<EpollEntry>>> },
+    Epoll {
+        interests: Arc<Spinlock<Vec<EpollEntry>>>,
+    },
     Dir {
         /// Absolute path the directory was opened under (used by `fchdir`).
         path: String,
@@ -158,11 +221,21 @@ impl OpenObject {
                 children: children.clone(),
                 index: *index,
             },
-            OpenObject::Eventfd { val, semaphore } => OpenObject::Eventfd { val: Arc::clone(val), semaphore: *semaphore },
-            OpenObject::Socket { rx, tx } => OpenObject::Socket { rx: Arc::clone(rx), tx: Arc::clone(tx) },
+            OpenObject::Eventfd { val, semaphore } => OpenObject::Eventfd {
+                val: Arc::clone(val),
+                semaphore: *semaphore,
+            },
+            OpenObject::Socket { rx, tx } => OpenObject::Socket {
+                rx: Arc::clone(rx),
+                tx: Arc::clone(tx),
+            },
             OpenObject::UnixListener(l) => OpenObject::UnixListener(Arc::clone(l)),
-            OpenObject::UnixSocketUnbound { nonblocking } => OpenObject::UnixSocketUnbound { nonblocking: *nonblocking },
-            OpenObject::Epoll { interests } => OpenObject::Epoll { interests: Arc::clone(interests) },
+            OpenObject::UnixSocketUnbound { nonblocking } => OpenObject::UnixSocketUnbound {
+                nonblocking: *nonblocking,
+            },
+            OpenObject::Epoll { interests } => OpenObject::Epoll {
+                interests: Arc::clone(interests),
+            },
         }
     }
 }
@@ -244,7 +317,9 @@ impl FdTable {
     /// returns `Ok` (R2.6, R2.14).
     pub fn close(&mut self, fd: u32) -> Result<(), Errno> {
         let res = self.slots.close(fd).map_err(|_| Errno::EBADF);
-        if res.is_ok() { self.cloexec.remove(&fd); }
+        if res.is_ok() {
+            self.cloexec.remove(&fd);
+        }
         res
     }
 
@@ -281,11 +356,17 @@ impl FdTable {
 
     /// Set or clear the FD_CLOEXEC flag for `fd`.
     pub fn set_cloexec(&mut self, fd: u32, on: bool) {
-        if on { self.cloexec.insert(fd); } else { self.cloexec.remove(&fd); }
+        if on {
+            self.cloexec.insert(fd);
+        } else {
+            self.cloexec.remove(&fd);
+        }
     }
 
     /// Whether `fd` carries the FD_CLOEXEC flag.
-    pub fn is_cloexec(&self, fd: u32) -> bool { self.cloexec.contains(&fd) }
+    pub fn is_cloexec(&self, fd: u32) -> bool {
+        self.cloexec.contains(&fd)
+    }
 
     /// Short human name for whatever occupies `fd`.
     pub fn describe_fd(&self, fd: u32) -> &'static str {
@@ -310,7 +391,9 @@ impl FdTable {
     /// Close every descriptor flagged close-on-exec (the execve sweep).
     pub fn close_cloexec(&mut self) {
         let fds = core::mem::take(&mut self.cloexec);
-        for fd in fds { let _ = self.slots.close(fd); }
+        for fd in fds {
+            let _ = self.slots.close(fd);
+        }
     }
 
     /// `socketpair(AF_UNIX, SOCK_STREAM)`: two cross-connected
@@ -318,21 +401,49 @@ impl FdTable {
     /// other, so BOTH fds are readable and writable (unlike a pipe). Closing
     /// one end makes the peer observe EOF on read and EPIPE on write.
     pub fn socketpair(&mut self, nonblocking: bool) -> (u32, u32) {
-        let q_ab = Arc::new(Spinlock::new(PipeState { bytes: VecDeque::new(), readers: 1, writers: 1 }));
-        let q_ba = Arc::new(Spinlock::new(PipeState { bytes: VecDeque::new(), readers: 1, writers: 1 }));
+        let q_ab = Arc::new(Spinlock::new(PipeState {
+            bytes: VecDeque::new(),
+            readers: 1,
+            writers: 1,
+        }));
+        let q_ba = Arc::new(Spinlock::new(PipeState {
+            bytes: VecDeque::new(),
+            readers: 1,
+            writers: 1,
+        }));
         let a = OpenObject::Socket {
-            rx: Arc::new(PipeEndpoint { state: Arc::clone(&q_ba), read_end: true, nonblocking }),
-            tx: Arc::new(PipeEndpoint { state: Arc::clone(&q_ab), read_end: false, nonblocking }),
+            rx: Arc::new(PipeEndpoint {
+                state: Arc::clone(&q_ba),
+                read_end: true,
+                nonblocking,
+            }),
+            tx: Arc::new(PipeEndpoint {
+                state: Arc::clone(&q_ab),
+                read_end: false,
+                nonblocking,
+            }),
         };
         let b = OpenObject::Socket {
-            rx: Arc::new(PipeEndpoint { state: q_ab, read_end: true, nonblocking }),
-            tx: Arc::new(PipeEndpoint { state: q_ba, read_end: false, nonblocking }),
+            rx: Arc::new(PipeEndpoint {
+                state: q_ab,
+                read_end: true,
+                nonblocking,
+            }),
+            tx: Arc::new(PipeEndpoint {
+                state: q_ba,
+                read_end: false,
+                nonblocking,
+            }),
         };
         let fa = self.alloc(a);
         let fb = self.alloc(b);
         // Which descriptor numbers the RPC channel ends get.
-        crate::warn!("[DIAG] socketpair pid={} -> ({},{})",
-            crate::task::scheduler::current_pid(), fa, fb);
+        crate::warn!(
+            "[DIAG] socketpair pid={} -> ({},{})",
+            crate::task::scheduler::current_pid(),
+            fa,
+            fb
+        );
         (fa, fb)
     }
 }
@@ -359,7 +470,14 @@ pub struct UnixListenerState {
 
 impl UnixListenerState {
     pub fn new(path: String, nonblocking: bool) -> Self {
-        Self { path, inner: Spinlock::new(UnixListenerInner { listening: false, nonblocking, pending: VecDeque::new() }) }
+        Self {
+            path,
+            inner: Spinlock::new(UnixListenerInner {
+                listening: false,
+                nonblocking,
+                pending: VecDeque::new(),
+            }),
+        }
     }
 }
 
@@ -367,18 +485,46 @@ impl UnixListenerState {
 /// (client side, server side) — without allocating fds. connect(2) pushes the
 /// server pair into the listener queue and installs the client pair locally;
 /// accept(2) later turns the server pair into a fresh fd.
-pub fn socket_pair_endpoints(nonblocking_client: bool, nonblocking_server: bool)
-    -> ((Arc<PipeEndpoint>, Arc<PipeEndpoint>), (Arc<PipeEndpoint>, Arc<PipeEndpoint>))
-{
-    let q_cs = Arc::new(Spinlock::new(PipeState { bytes: VecDeque::new(), readers: 1, writers: 1 }));
-    let q_sc = Arc::new(Spinlock::new(PipeState { bytes: VecDeque::new(), readers: 1, writers: 1 }));
+pub fn socket_pair_endpoints(
+    nonblocking_client: bool,
+    nonblocking_server: bool,
+) -> (
+    (Arc<PipeEndpoint>, Arc<PipeEndpoint>),
+    (Arc<PipeEndpoint>, Arc<PipeEndpoint>),
+) {
+    let q_cs = Arc::new(Spinlock::new(PipeState {
+        bytes: VecDeque::new(),
+        readers: 1,
+        writers: 1,
+    }));
+    let q_sc = Arc::new(Spinlock::new(PipeState {
+        bytes: VecDeque::new(),
+        readers: 1,
+        writers: 1,
+    }));
     let client = (
-        Arc::new(PipeEndpoint { state: Arc::clone(&q_sc), read_end: true, nonblocking: nonblocking_client }),
-        Arc::new(PipeEndpoint { state: Arc::clone(&q_cs), read_end: false, nonblocking: nonblocking_client }),
+        Arc::new(PipeEndpoint {
+            state: Arc::clone(&q_sc),
+            read_end: true,
+            nonblocking: nonblocking_client,
+        }),
+        Arc::new(PipeEndpoint {
+            state: Arc::clone(&q_cs),
+            read_end: false,
+            nonblocking: nonblocking_client,
+        }),
     );
     let server = (
-        Arc::new(PipeEndpoint { state: q_cs, read_end: true, nonblocking: nonblocking_server }),
-        Arc::new(PipeEndpoint { state: q_sc, read_end: false, nonblocking: nonblocking_server }),
+        Arc::new(PipeEndpoint {
+            state: q_cs,
+            read_end: true,
+            nonblocking: nonblocking_server,
+        }),
+        Arc::new(PipeEndpoint {
+            state: q_sc,
+            read_end: false,
+            nonblocking: nonblocking_server,
+        }),
     );
     (client, server)
 }

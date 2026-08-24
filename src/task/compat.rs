@@ -14,9 +14,9 @@
 #![allow(dead_code)]
 
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
-use alloc::string::{String, ToString};
 
 use crate::arch::x86_64::linux::mem::VmRegionSet;
 use crate::sync::spinlock::Spinlock;
@@ -79,8 +79,31 @@ impl CompatState {
     pub fn new(fds: FdTable, vm: Arc<Spinlock<VmRegionSet>>, tid: u64) -> Self {
         Self::new_with_parent(fds, vm, tid, 1)
     }
-    pub fn new_with_parent(fds: FdTable, vm: Arc<Spinlock<VmRegionSet>>, tid: u64, ppid: u64) -> Self {
-        Self { fds, vm, fs_base: 0, tid, ppid, tgid: tid, clear_child_tid: 0, waitable: true, robust_head: 0, robust_len: 0, cwd: "/mnt".to_string(), nosys_logged: BTreeSet::new(), raw_mode: false, echo: true, exit_code: None, exe_path: String::new(), exec_stdio: ["?", "?", "?"] }
+    pub fn new_with_parent(
+        fds: FdTable,
+        vm: Arc<Spinlock<VmRegionSet>>,
+        tid: u64,
+        ppid: u64,
+    ) -> Self {
+        Self {
+            fds,
+            vm,
+            fs_base: 0,
+            tid,
+            ppid,
+            tgid: tid,
+            clear_child_tid: 0,
+            waitable: true,
+            robust_head: 0,
+            robust_len: 0,
+            cwd: "/mnt".to_string(),
+            nosys_logged: BTreeSet::new(),
+            raw_mode: false,
+            echo: true,
+            exit_code: None,
+            exe_path: String::new(),
+            exec_stdio: ["?", "?", "?"],
+        }
     }
 }
 
@@ -139,9 +162,11 @@ pub fn install_compat(pid: u64, state: CompatState) {
 /// whether a write-to-RO-page fault is a fixable mapping inconsistency.
 pub fn current_addr_in_writable_mmap(addr: u64) -> bool {
     with_current_compat(|cs| {
-        cs.vm.lock().mmaps.iter().any(|m| {
-            addr >= m.base && addr < m.base + m.pages * 4096 && m.writable
-        })
+        cs.vm
+            .lock()
+            .mmaps
+            .iter()
+            .any(|m| addr >= m.base && addr < m.base + m.pages * 4096 && m.writable)
     })
     .unwrap_or(false)
 }
@@ -230,7 +255,9 @@ pub fn clone_current_compat(child: u64, tls: Option<u64>, clear_child_tid: u64) 
 pub fn fork_current_compat(child: u64, clear_child_tid: u64) -> bool {
     let parent = super::scheduler::current_pid();
     let mut states = COMPAT_STATES.lock();
-    let Some(parent_state) = states.get(&parent) else { return false; };
+    let Some(parent_state) = states.get(&parent) else {
+        return false;
+    };
     let parent_tgid = parent_state.tgid;
     let mut child_state = parent_state.clone();
     // Fork: the child owns a private address space (deep-copied by
@@ -240,21 +267,49 @@ pub fn fork_current_compat(child: u64, clear_child_tid: u64) -> bool {
         let vm_copy = child_state.vm.lock().clone();
         child_state.vm = Arc::new(Spinlock::new(vm_copy));
     }
-    child_state.tid = child; child_state.tgid = child; child_state.ppid = parent_tgid;
-    child_state.waitable = true; child_state.clear_child_tid = clear_child_tid;
+    child_state.tid = child;
+    child_state.tgid = child;
+    child_state.ppid = parent_tgid;
+    child_state.waitable = true;
+    child_state.clear_child_tid = clear_child_tid;
     child_state.exit_code = None;
-    states.insert(child, child_state); true
+    states.insert(child, child_state);
+    true
 }
-pub fn fs_base_for(pid: u64) -> Option<u64> { COMPAT_STATES.lock().get(&pid).map(|s| s.fs_base) }
-pub fn current_tgid() -> u64 { with_current_compat(|s| s.tgid).unwrap_or_else(super::scheduler::current_pid) }
-pub fn current_clear_child_tid() -> u64 { with_current_compat(|s| s.clear_child_tid).unwrap_or(0) }
-pub fn current_robust_list() -> (u64,u64) { with_current_compat(|s| (s.robust_head,s.robust_len)).unwrap_or((0,0)) }
+pub fn fs_base_for(pid: u64) -> Option<u64> {
+    COMPAT_STATES.lock().get(&pid).map(|s| s.fs_base)
+}
+pub fn current_tgid() -> u64 {
+    with_current_compat(|s| s.tgid).unwrap_or_else(super::scheduler::current_pid)
+}
+pub fn current_clear_child_tid() -> u64 {
+    with_current_compat(|s| s.clear_child_tid).unwrap_or(0)
+}
+pub fn current_robust_list() -> (u64, u64) {
+    with_current_compat(|s| (s.robust_head, s.robust_len)).unwrap_or((0, 0))
+}
 /// Restored during the origin/main merge: futex cleanup on thread exit needs
 /// these by pid (not just for the current task).
-pub fn clear_tid_for(pid: u64) -> u64 { COMPAT_STATES.lock().get(&pid).map(|s| s.clear_child_tid).unwrap_or(0) }
-pub fn robust_for(pid: u64) -> (u64, u64) { COMPAT_STATES.lock().get(&pid).map(|s| (s.robust_head, s.robust_len)).unwrap_or((0, 0)) }
-pub fn group_member_pids(tgid:u64, except:u64) -> alloc::vec::Vec<u64> {
-    COMPAT_STATES.lock().iter().filter_map(|(pid,s)| (s.tgid==tgid && *pid!=except).then_some(*pid)).collect()
+pub fn clear_tid_for(pid: u64) -> u64 {
+    COMPAT_STATES
+        .lock()
+        .get(&pid)
+        .map(|s| s.clear_child_tid)
+        .unwrap_or(0)
+}
+pub fn robust_for(pid: u64) -> (u64, u64) {
+    COMPAT_STATES
+        .lock()
+        .get(&pid)
+        .map(|s| (s.robust_head, s.robust_len))
+        .unwrap_or((0, 0))
+}
+pub fn group_member_pids(tgid: u64, except: u64) -> alloc::vec::Vec<u64> {
+    COMPAT_STATES
+        .lock()
+        .iter()
+        .filter_map(|(pid, s)| (s.tgid == tgid && *pid != except).then_some(*pid))
+        .collect()
 }
 
 pub fn current_has_compat() -> bool {

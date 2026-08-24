@@ -43,13 +43,16 @@ proptest! {
 }
 
 /// Explicitly out-of-scope syscalls must never be supported (R11.4, R11.5).
+///
+/// NOTE (updated with the Linux-compat layer): clone(56) and futex(202) ARE
+/// supported these days (fork/clone + threads landed); fork(57)/vfork(58)
+/// remain out of scope.
 #[test]
 fn out_of_scope_syscalls_are_unsupported() {
-    // clone(56), fork(57), vfork(58), futex(202)
-    assert!(!is_supported(56), "clone must be unsupported");
+    assert!(is_supported(56), "clone must be supported");
+    assert!(is_supported(202), "futex must be supported");
     assert!(!is_supported(57), "fork must be unsupported");
     assert!(!is_supported(58), "vfork must be unsupported");
-    assert!(!is_supported(202), "futex must be unsupported");
 
     // A random number not in the set.
     let random_unsupported = 999_999u64;

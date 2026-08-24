@@ -2485,15 +2485,14 @@ mod fs_real_device_tests {
     }
 }
 
-// Property 17: smoltcp poll preserves frames (no loss under bounded buffering).
+// Property 17: NIC polling preserves frames (no loss under bounded buffering).
 //
 // Light/structural routine (Task 6.4*). The real end-to-end proof is host
-// `ping`/UDP echo against the running guest; here we validate the *token
-// recycling discipline* that `net::phy::SmolDevice` implements: when frames
-// arrive (bounded by the RX ring depth `QUEUE_SIZE`), the poll loop pops each
-// completed buffer exactly once (`receive()`), delivers its frame to smoltcp
-// exactly once (`RxToken::consume`), and returns the buffer to the ring exactly
-// once (`recycle_rx_buffer`). The invariants that make this lossless and
+// `ping`/UDP echo against the running guest; here we validate the *buffer
+// recycling discipline* the RX ring model upholds (e1000 driver + stack): when
+// frames arrive (bounded by the RX ring depth), the poll loop pops each
+// completed buffer exactly once, delivers its frame to the stack exactly once,
+// and returns the buffer to the ring exactly once. The invariants that make this lossless and
 // aliasing-free are: (a) every arrived frame is delivered exactly once and in
 // arrival order (R13.6); (b) no buffer is ever "in flight" (taken from the
 // ring) twice simultaneously (no aliasing, R13.7 / Property 17).
@@ -2629,7 +2628,7 @@ mod net_phy_prop_tests {
                     }
                 } else if nic.can_recv() {
                     // Drain one: receive -> consume(deliver) -> recycle, exactly
-                    // as `SmolDevice` + smoltcp poll do.
+                    // as the RX-ring + poll loop do.
                     let (slot, id) = nic.receive().expect("can_recv => receive");
                     assert_kernel!(
                         !in_flight.contains(&slot),

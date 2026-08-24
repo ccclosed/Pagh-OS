@@ -52,8 +52,8 @@ pub mod nr {
     pub const LISTEN: u64 = 50;
     pub const GETSOCKNAME: u64 = 51;
     pub const ACCEPT4: u64 = 288;
-pub const SETSOCKOPT: u64 = 54;
-pub const GETSOCKOPT: u64 = 55;
+    pub const SETSOCKOPT: u64 = 54;
+    pub const GETSOCKOPT: u64 = 55;
     /// Session/permission/locking stubs.
     pub const SETSID: u64 = 112;
     /// Job-control family bash probes at startup.
@@ -381,10 +381,9 @@ mod tests {
     fn supported_set_is_exact() {
         let supported = [
             0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 20, 21, 22, 24, 28, 32, 33, 35,
-            39, 44, 45, 60, 63, 72, 79, 80, 81, 84, 87, 89, 90, 96, 97, 99, 102, 104, 107, 108, 110, 131,
-            137, 138,
-            158, 186, 201, 202, 217, 218, 227, 228, 229, 230, 231, 257, 262, 267, 273, 292, 293, 302, 318,
-            334,
+            39, 44, 45, 60, 63, 72, 79, 80, 81, 84, 87, 89, 90, 96, 97, 99, 102, 104, 107, 108,
+            110, 131, 137, 138, 158, 186, 201, 202, 217, 218, 227, 228, 229, 230, 231, 257, 262,
+            267, 273, 292, 293, 302, 318, 334,
         ];
         for nr in supported {
             assert!(is_supported(nr), "expected {nr} to be supported");

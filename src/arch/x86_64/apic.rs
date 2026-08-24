@@ -142,7 +142,7 @@ fn init_lapic() {
 
 /// Scheduler timer tick rate (the LAPIC periodic timer). Every conversion
 /// between ticks and real time in the kernel derives from this constant:
-/// `clock_gettime`/`times` granularity, smoltcp's monotonic clock, and the
+/// `clock_gettime`/`times` granularity, the network stack's monotonic clock, and the
 /// tick-denominated network timeouts.
 ///
 /// Practical ceiling: each tick costs one IRQ delivery (~thousands of cycles),

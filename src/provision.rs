@@ -9,12 +9,14 @@ const RELEASE: &[u8] = concat!(
     "NAME=pagh OS\nID=pagh\nVERSION=",
     env!("CARGO_PKG_VERSION"),
     "\nARCH=x86_64\n"
-).as_bytes();
+)
+.as_bytes();
 const MOTD: &[u8] = concat!(
     "pagh OS ",
     env!("CARGO_PKG_VERSION"),
     "\nType 'help' to list commands. Network apt and nano+ are available.\n"
-).as_bytes();
+)
+.as_bytes();
 const README: &[u8] = b"Welcome to pagh!\n\nTry:\n  help\n  nano --settings\n  nano /mnt/home/user/notes.txt\n  cargo run /mnt/examples/hello\n  apt update\n";
 const CARGO: &[u8] = b"[package]\nname = \"pagh-hello\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
 const MAIN_RS: &[u8] = b"fn main() {\n    let values = [8, 16, 32];\n    println!(\"Hello from pagh mini-Rust! sum = {}\", values.iter().sum());\n}\n";
@@ -61,10 +63,11 @@ pub fn seed() {
         write_once("/mnt/etc/pagh-release", RELEASE)?;
         // glibc's resolver reads these before any getaddrinfo call works;
         // 10.0.2.3 is QEMU slirp's built-in DNS forwarder.
-        write_once("/mnt/etc/resolv.conf",
-            b"nameserver 10.0.2.3\noptions timeout:1 attempts:2\n")?;
-        write_once("/mnt/etc/hosts",
-            b"127.0.0.1 localhost\n::1 localhost\n");
+        write_once(
+            "/mnt/etc/resolv.conf",
+            b"nameserver 10.0.2.3\noptions timeout:1 attempts:2\n",
+        )?;
+        write_once("/mnt/etc/hosts", b"127.0.0.1 localhost\n::1 localhost\n");
         write_once("/mnt/etc/motd", MOTD)?;
         write_once("/mnt/home/user/README.txt", README)?;
         write_once(

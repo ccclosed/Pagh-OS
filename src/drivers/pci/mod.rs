@@ -23,6 +23,9 @@ const CONFIG_DATA: u16 = 0xCFC;
 /// PCI vendor id used by all QEMU virtio devices.
 pub const VIRTIO_VENDOR_ID: u16 = 0x1AF4;
 
+/// PCI vendor id of Intel (e1000 NICs).
+pub const VENDOR_INTEL: u16 = 0x8086;
+
 /// A bus/device/function coordinate in PCI configuration space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PciAddress {

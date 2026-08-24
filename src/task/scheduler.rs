@@ -68,9 +68,19 @@ fn stamp_restore(pid: u64, rsp: u64) {
     };
     if let Some((saved, live)) = prev {
         if saved != rsp {
-            crate::error!("[SCHED] STALE RESTORE pid={} rsp=0x{:x} but last saved rsp=0x{:x} (live={})", pid, rsp, saved, live);
+            crate::error!(
+                "[SCHED] STALE RESTORE pid={} rsp=0x{:x} but last saved rsp=0x{:x} (live={})",
+                pid,
+                rsp,
+                saved,
+                live
+            );
         } else if !live {
-            crate::error!("[SCHED] DOUBLE RESTORE pid={} rsp=0x{:x} (frame already consumed once)", pid, rsp);
+            crate::error!(
+                "[SCHED] DOUBLE RESTORE pid={} rsp=0x{:x} (frame already consumed once)",
+                pid,
+                rsp
+            );
         }
     }
 }
@@ -120,7 +130,10 @@ pub fn is_idle(pid: u64) -> bool {
 
 /// Save the idle task's stack pointer (called when the idle task is preempted).
 #[inline]
-fn save_idle_rsp(rsp: u64) { stamp_save(IDLE_PID, rsp); IDLE_TASK.lock().kernel_rsp = rsp; }
+fn save_idle_rsp(rsp: u64) {
+    stamp_save(IDLE_PID, rsp);
+    IDLE_TASK.lock().kernel_rsp = rsp;
+}
 
 /// The idle task's saved stack pointer (scheduled when nothing else is ready).
 #[inline]
@@ -204,11 +217,29 @@ pub fn check_frame(who: &str, pid: u64, rsp: u64) {
     // tripwire (a stack-pointer value in the CS slot) still fires: such values
     // are huge and fail cs < 0x40.
     let ring3 = cs & 3 == 3 && cs != 0 && cs < 0x40;
-    let cs_ok = if is_compat { cs != 0 && cs < 0x40 } else { cs == kcs || ring3 };
-    let rip_ok = if is_compat || ring3 { rip_canonical } else { rip_canonical && rip >= 0xffff_8000_0000_0000 };
+    let cs_ok = if is_compat {
+        cs != 0 && cs < 0x40
+    } else {
+        cs == kcs || ring3
+    };
+    let rip_ok = if is_compat || ring3 {
+        rip_canonical
+    } else {
+        rip_canonical && rip >= 0xffff_8000_0000_0000
+    };
     if !(rip_ok && cs_ok && rf_ok) {
-        if !is_compat && KFRAME_ERRS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 8 { return }
-        crate::error!("[SCHED] BAD FRAME ({}) pid={} rsp=0x{:x} rip=0x{:x} cs=0x{:x} rflags=0x{:x}", who, pid, rsp, rip, cs, rf);
+        if !is_compat && KFRAME_ERRS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 8 {
+            return;
+        }
+        crate::error!(
+            "[SCHED] BAD FRAME ({}) pid={} rsp=0x{:x} rip=0x{:x} cs=0x{:x} rflags=0x{:x}",
+            who,
+            pid,
+            rsp,
+            rip,
+            cs,
+            rf
+        );
         let mut i = 0u64;
         while i < 21 {
             crate::error!("  frame[+0x{:02x}] 0x{:016x}", i * 8, rd(i * 8));
@@ -223,12 +254,18 @@ pub fn spawn(tcb: Tcb) -> u64 {
     stamp_save(pid, tcb.kernel_rsp);
     let mut q = READY_QUEUE.lock();
     if q.iter().any(|t| t.pid == pid) {
-        crate::error!("[SCHED] DOUBLE ENQUEUE (spawn) pid={} rsp=0x{:x}", pid, tcb.kernel_rsp);
+        crate::error!(
+            "[SCHED] DOUBLE ENQUEUE (spawn) pid={} rsp=0x{:x}",
+            pid,
+            tcb.kernel_rsp
+        );
     }
     q.push_back(tcb);
     pid
 }
-pub fn schedule() -> Option<Tcb> { READY_QUEUE.lock().pop_front() }
+pub fn schedule() -> Option<Tcb> {
+    READY_QUEUE.lock().pop_front()
+}
 pub fn requeue(tcb: Tcb) {
     check_frame("enqueue", tcb.pid, tcb.kernel_rsp);
     stamp_save(tcb.pid, tcb.kernel_rsp);

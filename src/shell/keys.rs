@@ -49,8 +49,7 @@ pub static CTRL_C_LATCH: core::sync::atomic::AtomicBool =
 
 /// Persistent CapsLock state. Decoders are created per read call on the
 /// stdin path, so the toggle must outlive any single instance.
-static CAPS_LOCK_STATE: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static CAPS_LOCK_STATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub struct Decoder {
     extended: bool,

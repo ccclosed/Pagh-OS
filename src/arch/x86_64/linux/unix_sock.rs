@@ -38,18 +38,26 @@ static LISTENERS: Spinlock<BTreeMap<String, Arc<UnixListenerState>>> =
 /// Parse a `struct sockaddr_un` from user memory into its path.
 /// Abstract-namespace (leading NUL) and autobind (empty) names are rejected.
 fn read_sockaddr_un(addr: u64, addrlen: u64) -> Result<String, Errno> {
-    if addrlen < 2 || addrlen as usize > 2 + SUN_PATH_MAX + 8 { return Err(Errno::EINVAL); }
+    if addrlen < 2 || addrlen as usize > 2 + SUN_PATH_MAX + 8 {
+        return Err(Errno::EINVAL);
+    }
     check_user_ptr(addr, addrlen)?;
     let family = unsafe { core::ptr::read_unaligned(addr as *const u16) };
-    if family as u64 != AF_UNIX { return Err(Errno::EINVAL); }
+    if family as u64 != AF_UNIX {
+        return Err(Errno::EINVAL);
+    }
     let max = core::cmp::min(addrlen.saturating_sub(2) as usize, SUN_PATH_MAX);
     let mut path: Vec<u8> = Vec::new();
     for i in 0..max {
         let b = unsafe { core::ptr::read((addr + 2 + i as u64) as *const u8) };
-        if b == 0 { break; }
+        if b == 0 {
+            break;
+        }
         path.push(b);
     }
-    if path.is_empty() { return Err(Errno::EINVAL); }
+    if path.is_empty() {
+        return Err(Errno::EINVAL);
+    }
     String::from_utf8(path).map_err(|_| Errno::EINVAL)
 }
 
@@ -57,12 +65,22 @@ fn read_sockaddr_un(addr: u64, addrlen: u64) -> Result<String, Errno> {
 /// Linux side). SOCK_NONBLOCK is remembered and applied when the socket turns
 /// into a listener or a connection; SOCK_CLOEXEC marks the fd immediately.
 pub fn sys_socket(domain: u64, ty: u64, _protocol: u64) -> Result<u64, Errno> {
-    if domain != AF_UNIX { return Err(Errno::EINVAL); }
-    if ty & SOCK_TYPE_MASK != SOCK_STREAM { return Err(Errno::EINVAL); }
-    if ty & !(SOCK_TYPE_MASK | SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 { return Err(Errno::EINVAL); }
+    if domain != AF_UNIX {
+        return Err(Errno::EINVAL);
+    }
+    if ty & SOCK_TYPE_MASK != SOCK_STREAM {
+        return Err(Errno::EINVAL);
+    }
+    if ty & !(SOCK_TYPE_MASK | SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+        return Err(Errno::EINVAL);
+    }
     compat::with_current_compat(|cs| {
-        let fd = cs.fds.alloc(OpenObject::UnixSocketUnbound { nonblocking: ty & SOCK_NONBLOCK != 0 });
-        if ty & SOCK_CLOEXEC != 0 { cs.fds.set_cloexec(fd, true); }
+        let fd = cs.fds.alloc(OpenObject::UnixSocketUnbound {
+            nonblocking: ty & SOCK_NONBLOCK != 0,
+        });
+        if ty & SOCK_CLOEXEC != 0 {
+            cs.fds.set_cloexec(fd, true);
+        }
         Ok(fd as u64)
     })
     .unwrap_or(Err(Errno::EBADF))
@@ -91,7 +109,10 @@ pub fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> Result<u64, Errno> {
 /// `listen` (50): open the gate for connect(2). The backlog is unbounded.
 pub fn sys_listen(fd: u64, _backlog: u64) -> Result<u64, Errno> {
     compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
-        Some(OpenObject::UnixListener(l)) => { l.inner.lock().listening = true; Ok(0) }
+        Some(OpenObject::UnixListener(l)) => {
+            l.inner.lock().listening = true;
+            Ok(0)
+        }
         Some(_) => Err(Errno::EINVAL),
         None => Err(Errno::EBADF),
     })
@@ -113,7 +134,9 @@ pub fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> Result<u64, Errno> {
                 _ => return Err(Errno::EINVAL),
             };
             let mut inner = listener.inner.lock();
-            if !inner.listening { return Err(Errno::ENOENT); }
+            if !inner.listening {
+                return Err(Errno::ENOENT);
+            }
             let ((crx, ctx), server) = socket_pair_endpoints(nb, false);
             inner.pending.push_back(server);
             drop(inner);
@@ -128,7 +151,9 @@ pub fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> Result<u64, Errno> {
 /// listener O_NONBLOCK (EAGAIN) and the SOCK_NONBLOCK/SOCK_CLOEXEC flags on
 /// the accepted descriptor; blocks by yielding otherwise.
 pub fn sys_accept4(fd: u64, addr: u64, addrlen_ptr: u64, flags: u64) -> Result<u64, Errno> {
-    if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 { return Err(Errno::EINVAL); }
+    if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+        return Err(Errno::EINVAL);
+    }
     loop {
         let attempt = compat::with_current_compat(|cs| {
             let listener = match cs.fds.get(fd as u32) {
@@ -143,7 +168,9 @@ pub fn sys_accept4(fd: u64, addr: u64, addrlen_ptr: u64, flags: u64) -> Result<u
                 let tx = tx.with_nonblocking(nb);
                 drop(inner);
                 let newfd = cs.fds.alloc(OpenObject::Socket { rx, tx });
-                if flags & SOCK_CLOEXEC != 0 { cs.fds.set_cloexec(newfd, true); }
+                if flags & SOCK_CLOEXEC != 0 {
+                    cs.fds.set_cloexec(newfd, true);
+                }
                 Ok(Some(newfd as u64))
             } else if inner.nonblocking {
                 Err(Errno::EAGAIN)
@@ -188,7 +215,10 @@ pub fn sys_getsockname(fd: u64, addr: u64, addrlen_ptr: u64) -> Result<u64, Errn
     .unwrap_or(Err(Errno::EBADF))?;
     let mut out: Vec<u8> = Vec::with_capacity(2 + SUN_PATH_MAX + 1);
     out.extend_from_slice(&(AF_UNIX as u16).to_le_bytes());
-    if let Some(p) = &path { out.extend_from_slice(p.as_bytes()); out.push(0); }
+    if let Some(p) = &path {
+        out.extend_from_slice(p.as_bytes());
+        out.push(0);
+    }
     let full = out.len() as u32;
     let want = unsafe { core::ptr::read_unaligned(addrlen_ptr as *const u32) } as usize;
     let n = core::cmp::min(want, out.len());
@@ -204,7 +234,13 @@ pub fn sys_getsockname(fd: u64, addr: u64, addrlen_ptr: u64) -> Result<u64, Errn
 /// tunable knobs (no buffer sizes, no credential passing), and libuv only sets
 /// cosmetic options on its pipes; reporting success is the Linux-visible
 /// behaviour callers expect.
-pub fn sys_setsockopt(_fd: u64, _level: u64, _optname: u64, _optval: u64, _optlen: u64) -> Result<u64, Errno> {
+pub fn sys_setsockopt(
+    _fd: u64,
+    _level: u64,
+    _optname: u64,
+    _optval: u64,
+    _optlen: u64,
+) -> Result<u64, Errno> {
     Ok(0)
 }
 
@@ -212,8 +248,16 @@ pub fn sys_setsockopt(_fd: u64, _level: u64, _optname: u64, _optval: u64, _optle
 /// "no pending async error" (0), which is what libuv polls after a
 /// non-blocking connect. Everything else is EINVAL so callers fall back to
 /// defaults instead of parsing uninitialised memory.
-pub fn sys_getsockopt(_fd: u64, level: u64, optname: u64, optval: u64, optlen: u64) -> Result<u64, Errno> {
-    if level != SOL_SOCKET { return Err(Errno::EINVAL); }
+pub fn sys_getsockopt(
+    _fd: u64,
+    level: u64,
+    optname: u64,
+    optval: u64,
+    optlen: u64,
+) -> Result<u64, Errno> {
+    if level != SOL_SOCKET {
+        return Err(Errno::EINVAL);
+    }
     // SO_TYPE is what libuv's uv_guess_handle asks right after
     // fstat reports S_IFSOCK on the stdio fds of the embedded-nvim channel.
     // Failing it made the whole channel UV_UNKNOWN_HANDLE and hung the
@@ -226,7 +270,9 @@ pub fn sys_getsockopt(_fd: u64, level: u64, optname: u64, optval: u64, optlen: u
     };
     check_user_ptr(optlen, 4)?;
     let want = unsafe { core::ptr::read_unaligned(optlen as *const u32) };
-    if want < 4 { return Err(Errno::EINVAL); }
+    if want < 4 {
+        return Err(Errno::EINVAL);
+    }
     check_user_ptr(optval, 4)?;
     unsafe {
         core::ptr::write_unaligned(optval as *mut u32, value);

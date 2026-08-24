@@ -40,7 +40,7 @@ proptest! {
     ) {
         let argv_refs: Vec<&[u8]> = argv.iter().map(|v| v.as_slice()).collect();
         let envp_refs: Vec<&[u8]> = envp.iter().map(|v| v.as_slice()).collect();
-        let aux = AuxInputs { phdr, phent, phnum, entry, pagesz, random_ptr: 0 };
+        let aux = AuxInputs { phdr, phent, phnum, entry, pagesz, base: 0, random_ptr: 0 };
 
         let img = build_initial_stack(STACK_TOP, STACK_LOW, &argv_refs, &envp_refs, &aux, random16)
             .expect("stack must fit in the generous window");
@@ -116,8 +116,17 @@ proptest! {
         }
         prop_assert_eq!(at_null_count, 1);
 
-        // exactly the six required tags, once each
-        let required = [at::PHDR, at::PHENT, at::PHNUM, at::ENTRY, at::PAGESZ, at::RANDOM];
+        // exactly the required tags, once each (AT_BASE joined when the ELF
+        // interpreter load address was added to the auxv)
+        let required = [
+            at::PHDR,
+            at::PHENT,
+            at::PHNUM,
+            at::BASE,
+            at::ENTRY,
+            at::PAGESZ,
+            at::RANDOM,
+        ];
         prop_assert_eq!(seen.len(), required.len());
         for tag in required {
             prop_assert!(seen.contains_key(&tag), "missing auxv tag {}", tag);

@@ -73,6 +73,7 @@ proptest! {
                 mode: 0,
                 size: o.content.len() as u64,
                 content: &o.content,
+                link_target: "",
             })
             .collect();
 

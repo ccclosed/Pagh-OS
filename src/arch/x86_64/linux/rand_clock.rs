@@ -104,7 +104,9 @@ mod tests {
 
     #[test]
     fn timespec_rejects_unsupported_clock() {
-        assert_eq!(ticks_to_timespec(100, 2, 1000), Err(Errno::EINVAL));
+        // Standard ids 0..=7 are all accepted (same monotonic source); only
+        // nonstandard ids are rejected.
+        assert!(ticks_to_timespec(100, 2, 1000).is_ok());
         assert_eq!(ticks_to_timespec(100, 99, 1000), Err(Errno::EINVAL));
     }
 

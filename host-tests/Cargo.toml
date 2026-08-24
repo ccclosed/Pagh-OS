@@ -37,10 +37,13 @@ path = "src/lib.rs"
 [dependencies]
 miniz_oxide = "=0.8.9"
 # `deb` also decodes `.tar.xz` (xz4rust) and `.tar.zst` (ruzstd). Pinned to match
-# the kernel's `Cargo.toml`. Default features are fine on the host; the kernel
-# disables them. These are normal deps (not dev-deps) because `deb.rs` is a
+# the kernel's `Cargo.toml`. Default features are fine on the host; the kernel disables them.
+# These are normal deps (not dev-deps) because `deb.rs` is a
 # non-test library module here, included via `#[path]`.
-ruzstd = "=0.8.3"
+# NOTE: ruzstd's default features pull `twox-hash`, which is NOT vendored in the
+# kernel's vendor/ directory; matching the kernel's feature set keeps the host
+# build resolvable from the same vendor sources.
+ruzstd = { version = "=0.8.3", default-features = false }
 xz4rust = "=0.2.1"
 
 [dev-dependencies]

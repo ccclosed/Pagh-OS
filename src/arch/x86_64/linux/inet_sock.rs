@@ -1,15 +1,15 @@
-//! AF_INET socket syscalls over the smoltcp stack (`net::` primitives).
+//! AF_INET socket syscalls over the kernel's own TCP/IP stack (`net::` primitives).
 //!
 //! TCP covers curl/git-remote-https; UDP covers glibc's resolver, which reads
 //! `/mnt/etc/resolv.conf` and speaks DNS over `sendto`/`recvfrom`. Blocking
 //! calls funnel through the scheduler yield so other tasks keep running while
-//! the network poll thread advances the interface.
+//! the network poll thread advances the stack.
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::errno::Errno;
-use crate::net;
+use crate::net::{self, IpEndpoint};
 use crate::task::compat;
 use crate::task::fd::OpenObject;
 
@@ -30,7 +30,7 @@ const EINPROGRESS_ERR: u32 = 115; // used through Errno mapping below
 
 /// One AF_INET stream socket. `handle` is `None` until connect(2).
 pub struct InetTcp {
-    pub handle: crate::sync::spinlock::Spinlock<Option<smoltcp::iface::SocketHandle>>,
+    pub handle: crate::sync::spinlock::Spinlock<Option<net::SocketHandle>>,
     pub nonblocking: AtomicBool,
     pub so_error: AtomicU32,
     pub connected: AtomicBool,
@@ -39,14 +39,51 @@ pub struct InetTcp {
 
 /// One AF_INET datagram socket bound to an ephemeral local port.
 pub struct InetUdp {
-    pub handle: smoltcp::iface::SocketHandle,
+    pub handle: net::SocketHandle,
     pub nonblocking: AtomicBool,
     /// Default destination remembered by connect(2): subsequent write(2)/send(2)
     /// without an address go here (this is exactly how glibc's resolver sends
     /// its queries over a connected UDP socket).
-    pub peer: crate::sync::spinlock::Spinlock<Option<smoltcp::wire::IpEndpoint>>,
+    pub peer: crate::sync::spinlock::Spinlock<Option<IpEndpoint>>,
 }
 
+/// Parse a `sockaddr_in` OR `sockaddr_in6` into an [`IpEndpoint`].
+/// A v4-mapped IPv6 address (`::ffff:a.b.c.d`) collapses to its IPv4 form,
+/// matching Linux dual-stack socket semantics.
+pub(super) fn parse_sockaddr_ep(addr: u64, len: u64) -> Result<IpEndpoint, Errno> {
+    use super::check_user_ptr;
+    if addr == 0 || len < 8 {
+        return Err(Errno::EINVAL);
+    }
+    check_user_ptr(addr, 8)?;
+    // SAFETY: range validated above
+    let family = unsafe { core::ptr::read_unaligned(addr as *const u16) };
+    match family as u64 {
+        AF_INET => {
+            let (port, o) = parse_sockaddr_in(addr, len)?;
+            Ok(IpEndpoint::new(net::IpAddr::V4(net::Ipv4Addr(o)), port))
+        }
+        AF_INET6 => {
+            // struct sockaddr_in6: family(2) port(2) flowinfo(4) addr(16) scope(4)
+            if len < 28 {
+                return Err(Errno::EINVAL);
+            }
+            check_user_ptr(addr, 28)?;
+            // SAFETY: range validated above
+            let port = u16::from_be(unsafe { core::ptr::read_unaligned((addr + 2) as *const u16) });
+            // SAFETY: as above
+            let octets: [u8; 16] =
+                unsafe { core::ptr::read_unaligned((addr + 8) as *const [u8; 16]) };
+            let v6 = net::Ipv6Addr(octets);
+            let ep_addr = match v6.to_v4_mapped() {
+                Some(v4) => net::IpAddr::V4(net::Ipv4Addr(v4.octets())),
+                None => net::IpAddr::V6(v6),
+            };
+            Ok(IpEndpoint::new(ep_addr, port))
+        }
+        _ => Err(Errno::EAFNOSUPPORT),
+    }
+}
 
 fn parse_sockaddr_in(addr: u64, len: u64) -> Result<(u16, [u8; 4]), Errno> {
     use super::check_user_ptr;
@@ -62,22 +99,13 @@ fn parse_sockaddr_in(addr: u64, len: u64) -> Result<(u16, [u8; 4]), Errno> {
     // SAFETY: as above
     let port = u16::from_be(unsafe { core::ptr::read_unaligned((addr + 2) as *const u16) });
     // SAFETY: as above
-    let octets: [u8; 4] =
-        unsafe { core::ptr::read_unaligned((addr + 4) as *const [u8; 4]) };
+    let octets: [u8; 4] = unsafe { core::ptr::read_unaligned((addr + 4) as *const [u8; 4]) };
     Ok((port, octets))
-}
-
-fn endpoint(port: u16, octets: [u8; 4]) -> smoltcp::wire::IpEndpoint {
-    smoltcp::wire::IpEndpoint {
-        addr: smoltcp::wire::IpAddress::v4(octets[0], octets[1], octets[2], octets[3]),
-        port,
-    }
 }
 
 /// `socket(AF_INET, ...)`: STREAM → lazy TCP slot, DGRAM → bound UDP socket.
 pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
-    if domain != AF_INET {
-        // IPv6 unsupported for now — fail fast with a distinct errno.
+    if domain != AF_INET && domain != AF_INET6 {
         return Err(Errno::EAFNOSUPPORT);
     }
     let base = ty & SOCK_TYPE_MASK;
@@ -102,7 +130,9 @@ pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
                 eof: AtomicBool::new(false),
             });
             let fd = cs.fds.alloc(OpenObject::InetTcp(sock));
-            if cloexec { cs.fds.set_cloexec(fd, true); }
+            if cloexec {
+                cs.fds.set_cloexec(fd, true);
+            }
             Ok(fd as u64)
         }
         _ => {
@@ -113,7 +143,9 @@ pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
                 peer: crate::sync::spinlock::Spinlock::new(None),
             });
             let fd = cs.fds.alloc(OpenObject::InetUdp(sock));
-            if cloexec { cs.fds.set_cloexec(fd, true); }
+            if cloexec {
+                cs.fds.set_cloexec(fd, true);
+            }
             Ok(fd as u64)
         }
     })
@@ -122,14 +154,11 @@ pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
 
 /// `connect` on an AF_INET TCP fd.
 pub fn sys_connect_tcp(fd: u64, addr: u64, len: u64) -> Result<u64, Errno> {
-    let (port, octets) = parse_sockaddr_in(addr, len)?;
-    crate::warn!(
-        "[DIAG] inet connect fd={} -> {}.{}.{}.{}:{}",
-        fd, octets[0], octets[1], octets[2], octets[3], port
-    );
-    let remote = endpoint(port, octets);
+    let remote = parse_sockaddr_ep(addr, len)?;
     let (sock, nonblocking) = compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
-        Some(OpenObject::InetTcp(t)) => Some((Arc::clone(&t), t.nonblocking.load(Ordering::Relaxed))),
+        Some(OpenObject::InetTcp(t)) => {
+            Some((Arc::clone(t), t.nonblocking.load(Ordering::Relaxed)))
+        }
         _ => None,
     })
     .unwrap_or(None)
@@ -153,7 +182,7 @@ pub fn sys_connect_tcp(fd: u64, addr: u64, len: u64) -> Result<u64, Errno> {
     }
 
     // Blocking: bounded wait (~5 s at the current tick rate), yielding to the
-    // scheduler while the net thread drives smoltcp.
+    // scheduler while the net thread drives the stack.
     let mut waited: u32 = 0;
     loop {
         if net::tcp_established(handle) {
@@ -229,7 +258,7 @@ pub fn tcp_read(fd: u64, dst: &mut [u8]) -> Result<usize, Errno> {
 
 /// `close` on an AF_INET TCP fd.
 pub fn tcp_close_fd(fd: u64) {
-    if let Some(sock) = tcp_sock(fd).ok() {
+    if let Ok(sock) = tcp_sock(fd) {
         if let Some(h) = sock.handle.lock().take() {
             net::tcp_close(h);
         }
@@ -238,7 +267,7 @@ pub fn tcp_close_fd(fd: u64) {
 
 fn tcp_sock(fd: u64) -> Result<Arc<InetTcp>, Errno> {
     compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
-        Some(OpenObject::InetTcp(t)) => Some(Arc::clone(&t)),
+        Some(OpenObject::InetTcp(t)) => Some(Arc::clone(t)),
         _ => None,
     })
     .unwrap_or(None)
@@ -248,8 +277,7 @@ fn tcp_sock(fd: u64) -> Result<Arc<InetTcp>, Errno> {
 /// `connect` on an AF_INET UDP fd: remember the peer for write()/send().
 pub fn udp_connect_fd(fd: u64, addr: u64, len: u64) -> Result<u64, Errno> {
     let sock = udp_sock(fd)?;
-    let (port, octets) = parse_sockaddr_in(addr, len)?;
-    *sock.peer.lock() = Some(endpoint(port, octets));
+    *sock.peer.lock() = Some(parse_sockaddr_ep(addr, len)?);
     Ok(0)
 }
 
@@ -259,16 +287,20 @@ pub fn udp_write_fd(fd: u64, data: &[u8]) -> Result<usize, Errno> {
     let peer = sock.peer.lock().ok_or(Errno::ENOTCONN)?;
     crate::warn!(
         "[DIAG] udp write(fd) fd={} -> {:?} len={}",
-        fd, peer, data.len()
+        fd,
+        peer,
+        data.len()
     );
-    net::udp_sendto(sock.handle, data, peer).map(|_| data.len()).map_err(|_| Errno::EIO)
+    net::udp_sendto(sock.handle, data, peer)
+        .map(|_| data.len())
+        .map_err(|_| Errno::EIO)
 }
 
 // ── UDP (glibc resolver path) ────────────────────────────────────────────────
 
 fn udp_sock(fd: u64) -> Result<Arc<InetUdp>, Errno> {
     compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
-        Some(OpenObject::InetUdp(u)) => Some(Arc::clone(&u)),
+        Some(OpenObject::InetUdp(u)) => Some(Arc::clone(u)),
         _ => None,
     })
     .unwrap_or(None)
@@ -279,22 +311,20 @@ fn udp_sock(fd: u64) -> Result<Arc<InetUdp>, Errno> {
 /// which we do not support (glibc's resolver always passes one).
 pub fn udp_sendto_fd(fd: u64, data: &[u8], addr: u64, len: u64) -> Result<usize, Errno> {
     let sock = udp_sock(fd)?;
-    let (port, octets) = parse_sockaddr_in(addr, len)?;
+    let ep = parse_sockaddr_ep(addr, len)?;
     crate::warn!(
-        "[DIAG] udp sendto(fd) fd={} {}.{}.{}.{}:{} len={}",
-        fd, octets[0], octets[1], octets[2], octets[3], port, data.len()
+        "[DIAG] udp sendto(fd) fd={} -> {} len={}",
+        fd,
+        ep,
+        data.len()
     );
-    crate::warn!("[DIAG] udp sendto fd={} len={} port={}", fd, data.len(), port);
-    net::udp_sendto(sock.handle, data, endpoint(port, octets))
+    net::udp_sendto(sock.handle, data, ep)
         .map(|_| data.len())
         .map_err(|_| Errno::EIO)
 }
 
-/// `recvfrom` on an AF_INET UDP fd; returns (bytes, port, ipv4 octets).
-pub fn udp_recvfrom_fd(
-    fd: u64,
-    dst: &mut [u8],
-) -> Result<(usize, u16, [u8; 4]), Errno> {
+/// `recvfrom` on an AF_INET/INET6 UDP fd; returns (bytes, source endpoint).
+pub fn udp_recvfrom_fd(fd: u64, dst: &mut [u8]) -> Result<(usize, IpEndpoint), Errno> {
     let sock = udp_sock(fd)?;
     static RECV_LOGGED: AtomicU32 = AtomicU32::new(0);
     if RECV_LOGGED.fetch_or(1 << (fd.min(31)), Ordering::Relaxed) & (1 << (fd.min(31))) == 0 {
@@ -304,11 +334,7 @@ pub fn udp_recvfrom_fd(
     let mut spins = 0u32;
     loop {
         if let Some((n, ep)) = net::udp_recvfrom(sock.handle, dst) {
-            let o = match ep.addr {
-                smoltcp::wire::IpAddress::Ipv4(v4) => v4.octets(),
-                _ => [0, 0, 0, 0],
-            };
-            return Ok((n, ep.port, o));
+            return Ok((n, ep));
         }
         if sock.nonblocking.load(Ordering::Relaxed) || spins >= deadline_spins {
             return Err(Errno::EAGAIN);

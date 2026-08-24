@@ -138,8 +138,7 @@ pub fn _log(level: Level, args: fmt::Arguments) {
 
 /// When `false` (default), `warn!` lines are written to serial
 /// only and skip the framebuffer console. Toggled by the `warn` shell command.
-static FB_WARN_MIRROR: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static FB_WARN_MIRROR: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Enable/disable mirroring of `[WARN]` log lines onto the framebuffer.
 pub fn set_fb_warn_mirror(on: bool) {

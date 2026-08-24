@@ -149,7 +149,9 @@ pub fn sys_futex(
             let deadline = timeout_deadline(timeout)?;
             crate::warn!(
                 "[DIAG] futex WAIT addr=0x{:x} expect={} timeout={:?}",
-                uaddr, val, timeout
+                uaddr,
+                val,
+                timeout
             );
             let queue_key = key(uaddr);
             let ticket = register_waiter(queue_key, bitset);
@@ -188,10 +190,7 @@ pub fn sys_futex(
             let _ = load_word(uaddr)?;
             let n = wake_waiters(key(uaddr), val, bitset);
             if n > 0 {
-                crate::warn!(
-                    "[DIAG] futex WAKE addr=0x{:x} woke {}",
-                    uaddr, n
-                );
+                crate::warn!("[DIAG] futex WAKE addr=0x{:x} woke {}", uaddr, n);
             }
             Ok(n)
         }
@@ -201,15 +200,44 @@ pub fn sys_futex(
 
 // STAGE 16.15: bash with job control calls wait4 with WUNTRACED; we never
 // stop/continue processes, so WUNTRACED/WCONTINUED are accepted as no-ops.
-const WNOHANG:u64=1; const WUNTRACED:u64=2; const WCONTINUED:u64=8; const RUSAGE_SIZE:u64=18*8;
-pub fn sys_wait4(pid:u64,status:u64,options:u64,rusage:u64)->Result<u64,Errno>{
- if options & !(WNOHANG|WUNTRACED|WCONTINUED) !=0{return Err(Errno::EINVAL)} let wanted=pid as i64; if wanted != -1 && wanted<=0{return Err(Errno::ECHILD)}
- if status!=0{check_user_ptr(status,4)?} if rusage!=0{check_user_ptr(rusage,RUSAGE_SIZE)?}
- let parent=crate::task::scheduler::current_pid(); loop{
-  if let Some((child,code))=crate::task::compat::reap_child(parent,wanted){if status!=0{unsafe{ptr::write_unaligned(status as *mut u32,(code as u32)<<8)}} if rusage!=0{unsafe{ptr::write_bytes(rusage as *mut u8,0,RUSAGE_SIZE as usize)}} return Ok(child)}
-  if !crate::task::compat::has_child(parent,wanted){return Err(Errno::ECHILD)} if options&WNOHANG!=0{return Ok(0)} crate::task::scheduler::yield_current();
- }}
-
+const WNOHANG: u64 = 1;
+const WUNTRACED: u64 = 2;
+const WCONTINUED: u64 = 8;
+const RUSAGE_SIZE: u64 = 18 * 8;
+pub fn sys_wait4(pid: u64, status: u64, options: u64, rusage: u64) -> Result<u64, Errno> {
+    if options & !(WNOHANG | WUNTRACED | WCONTINUED) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let wanted = pid as i64;
+    if wanted != -1 && wanted <= 0 {
+        return Err(Errno::ECHILD);
+    }
+    if status != 0 {
+        check_user_ptr(status, 4)?
+    }
+    if rusage != 0 {
+        check_user_ptr(rusage, RUSAGE_SIZE)?
+    }
+    let parent = crate::task::scheduler::current_pid();
+    loop {
+        if let Some((child, code)) = crate::task::compat::reap_child(parent, wanted) {
+            if status != 0 {
+                unsafe { ptr::write_unaligned(status as *mut u32, (code as u32) << 8) }
+            }
+            if rusage != 0 {
+                unsafe { ptr::write_bytes(rusage as *mut u8, 0, RUSAGE_SIZE as usize) }
+            }
+            return Ok(child);
+        }
+        if !crate::task::compat::has_child(parent, wanted) {
+            return Err(Errno::ECHILD);
+        }
+        if options & WNOHANG != 0 {
+            return Ok(0);
+        }
+        crate::task::scheduler::yield_current();
+    }
+}
 
 fn exec_cstr(ptr: u64, budget: &mut usize) -> Result<Vec<u8>, Errno> {
     if ptr == 0 {
@@ -276,51 +304,135 @@ pub fn sys_execve(regs: &mut SavedRegs, path: u64, argv: u64, envp: u64) -> Resu
     Ok(0)
 }
 
-
-const CLONE_VM:u64=0x100; const CLONE_FS:u64=0x200; const CLONE_FILES:u64=0x400;
-const CLONE_SIGHAND:u64=0x800; const CLONE_THREAD:u64=0x10000; const CLONE_SYSVSEM:u64=0x40000;
-const CLONE_SETTLS:u64=0x80000; const CLONE_PARENT_SETTID:u64=0x100000;
-const CLONE_CHILD_CLEARTID:u64=0x200000; const CLONE_CHILD_SETTID:u64=0x01000000;
-const CLONE_SUPPORTED:u64=0xff|CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID;
-const CLONE_VFORK:u64=0x4000;
-const FORK_SUPPORTED:u64=0xff|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID;
+const CLONE_VM: u64 = 0x100;
+const CLONE_FS: u64 = 0x200;
+const CLONE_FILES: u64 = 0x400;
+const CLONE_SIGHAND: u64 = 0x800;
+const CLONE_THREAD: u64 = 0x10000;
+const CLONE_SYSVSEM: u64 = 0x40000;
+const CLONE_SETTLS: u64 = 0x80000;
+const CLONE_PARENT_SETTID: u64 = 0x100000;
+const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+const CLONE_CHILD_SETTID: u64 = 0x01000000;
+const CLONE_SUPPORTED: u64 = 0xff
+    | CLONE_VM
+    | CLONE_FS
+    | CLONE_FILES
+    | CLONE_SIGHAND
+    | CLONE_THREAD
+    | CLONE_SYSVSEM
+    | CLONE_SETTLS
+    | CLONE_PARENT_SETTID
+    | CLONE_CHILD_CLEARTID
+    | CLONE_CHILD_SETTID;
+const CLONE_VFORK: u64 = 0x4000;
+const FORK_SUPPORTED: u64 = 0xff | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID;
 /// `clone` supports both forms nvim's libuv needs.
 ///   * thread clone (CLONE_VM|CLONE_THREAD) — shared address space;
 ///   * fork (no CLONE_VM; glibc fork() = SIGCHLD|CHILD_SETTID|CHILD_CLEARTID)
 ///     — deep-copied address space, child gets rax=0, parent gets the pid.
 /// CLONE_VM WITHOUT CLONE_THREAD (vfork / glibc posix_spawn) stays ENOSYS on
 /// purpose: libuv then falls back to its plain fork+exec spawn path.
-pub fn sys_clone(regs:&SavedRegs,flags:u64,child_stack:u64,parent_tid:u64,child_tid:u64,tls:u64)->Result<u64,Errno>{
-    if flags & (CLONE_VM|CLONE_THREAD) == (CLONE_VM|CLONE_THREAD) {
-        if flags & !CLONE_SUPPORTED != 0 {crate::warn!("[DIAG] clone(thread): unsupported flags {:#x} -> ENOSYS", flags);return Err(Errno::ENOSYS)}
+pub fn sys_clone(
+    regs: &SavedRegs,
+    flags: u64,
+    child_stack: u64,
+    parent_tid: u64,
+    child_tid: u64,
+    tls: u64,
+) -> Result<u64, Errno> {
+    if flags & (CLONE_VM | CLONE_THREAD) == (CLONE_VM | CLONE_THREAD) {
+        if flags & !CLONE_SUPPORTED != 0 {
+            crate::warn!(
+                "[DIAG] clone(thread): unsupported flags {:#x} -> ENOSYS",
+                flags
+            );
+            return Err(Errno::ENOSYS);
+        }
         // Default stack = the caller's user RSP from the per-task slot at +120
         // above the SavedRegs frame (the global scratch may already belong to a
         // sibling thread by the time we run).
-        let stack=if child_stack==0{unsafe{ ((regs as *const SavedRegs as *const u64).add(15)).read() }}else{child_stack}; check_user_ptr(stack.saturating_sub(8),8)?;
-        if flags&CLONE_PARENT_SETTID!=0{check_user_ptr(parent_tid,4)?} if flags&CLONE_CHILD_SETTID!=0{check_user_ptr(child_tid,4)?}
-        let child=crate::task::process::spawn_linux_thread(regs,stack).map_err(|_|Errno::ENOMEM)?;
-        crate::warn!("[DIAG] clone: thread tid={} in pid={}", child, crate::task::scheduler::current_pid());
-        let tls_value=if flags&CLONE_SETTLS!=0{Some(tls)}else{None}; let clear=if flags&CLONE_CHILD_CLEARTID!=0{child_tid}else{0};
-        if !crate::task::compat::clone_current_compat(child,tls_value,clear){return Err(Errno::EINVAL)}
-        if flags&CLONE_PARENT_SETTID!=0{unsafe{ptr::write_unaligned(parent_tid as *mut u32,child as u32)}}
-        if flags&CLONE_CHILD_SETTID!=0{unsafe{ptr::write_unaligned(child_tid as *mut u32,child as u32)}}
-        return Ok(child)
+        let stack = if child_stack == 0 {
+            unsafe { ((regs as *const SavedRegs as *const u64).add(15)).read() }
+        } else {
+            child_stack
+        };
+        check_user_ptr(stack.saturating_sub(8), 8)?;
+        if flags & CLONE_PARENT_SETTID != 0 {
+            check_user_ptr(parent_tid, 4)?
+        }
+        if flags & CLONE_CHILD_SETTID != 0 {
+            check_user_ptr(child_tid, 4)?
+        }
+        let child =
+            crate::task::process::spawn_linux_thread(regs, stack).map_err(|_| Errno::ENOMEM)?;
+        crate::warn!(
+            "[DIAG] clone: thread tid={} in pid={}",
+            child,
+            crate::task::scheduler::current_pid()
+        );
+        let tls_value = if flags & CLONE_SETTLS != 0 {
+            Some(tls)
+        } else {
+            None
+        };
+        let clear = if flags & CLONE_CHILD_CLEARTID != 0 {
+            child_tid
+        } else {
+            0
+        };
+        if !crate::task::compat::clone_current_compat(child, tls_value, clear) {
+            return Err(Errno::EINVAL);
+        }
+        if flags & CLONE_PARENT_SETTID != 0 {
+            unsafe { ptr::write_unaligned(parent_tid as *mut u32, child as u32) }
+        }
+        if flags & CLONE_CHILD_SETTID != 0 {
+            unsafe { ptr::write_unaligned(child_tid as *mut u32, child as u32) }
+        }
+        return Ok(child);
     }
     // ── fork path ──
-    if flags & (CLONE_VM|CLONE_VFORK) != 0 || flags & !FORK_SUPPORTED != 0 {crate::warn!("[DIAG] clone(fork): unsupported flags {:#x} -> ENOSYS", flags);return Err(Errno::ENOSYS)}
-    if child_stack != 0 {return Err(Errno::EINVAL)} // fork(2) never passes a stack
-    if flags&CLONE_PARENT_SETTID!=0{check_user_ptr(parent_tid,4)?}
-    if flags&CLONE_CHILD_SETTID!=0{check_user_ptr(child_tid,4)?}
-    let clear=if flags&CLONE_CHILD_CLEARTID!=0{child_tid}else{0};
-    let (child,child_pml4)=crate::task::process::fork_linux_process(regs,clear)
-        .map_err(|e|{crate::error!("[linux] fork failed: {}",e);Errno::ENOMEM})?;
-    if flags&CLONE_PARENT_SETTID!=0{unsafe{ptr::write_unaligned(parent_tid as *mut u32,child as u32)}}
-    if flags&CLONE_CHILD_SETTID!=0{
+    if flags & (CLONE_VM | CLONE_VFORK) != 0 || flags & !FORK_SUPPORTED != 0 {
+        crate::warn!(
+            "[DIAG] clone(fork): unsupported flags {:#x} -> ENOSYS",
+            flags
+        );
+        return Err(Errno::ENOSYS);
+    }
+    if child_stack != 0 {
+        return Err(Errno::EINVAL);
+    } // fork(2) never passes a stack
+    if flags & CLONE_PARENT_SETTID != 0 {
+        check_user_ptr(parent_tid, 4)?
+    }
+    if flags & CLONE_CHILD_SETTID != 0 {
+        check_user_ptr(child_tid, 4)?
+    }
+    let clear = if flags & CLONE_CHILD_CLEARTID != 0 {
+        child_tid
+    } else {
+        0
+    };
+    let (child, child_pml4) =
+        crate::task::process::fork_linux_process(regs, clear).map_err(|e| {
+            crate::error!("[linux] fork failed: {}", e);
+            Errno::ENOMEM
+        })?;
+    if flags & CLONE_PARENT_SETTID != 0 {
+        unsafe { ptr::write_unaligned(parent_tid as *mut u32, child as u32) }
+    }
+    if flags & CLONE_CHILD_SETTID != 0 {
         // Land the tid write in the CHILD's already-copied address space (the
         // parent's own page must keep its value): translate through the child
         // PML4 and write via the HHDM window.
-        if let Some(phys)=crate::memory::vmm::virt_to_phys_in(child_pml4,child_tid){
-            unsafe{ptr::write_unaligned(crate::memory::vmm::phys_to_virt(phys) as *mut u32,child as u32)}
+        if let Some(phys) = crate::memory::vmm::virt_to_phys_in(child_pml4, child_tid) {
+            unsafe {
+                ptr::write_unaligned(
+                    crate::memory::vmm::phys_to_virt(phys) as *mut u32,
+                    child as u32,
+                )
+            }
         }
     }
     Ok(child)
@@ -378,6 +490,9 @@ pub fn cleanup_thread_exit(pid: u64) {
 }
 pub fn cleanup_current_thread_exit() {
     let pid = crate::task::scheduler::current_pid();
-    crate::warn!("[DIAG] thread-exit pid={} clearing child_tid + waking joiner", pid);
+    crate::warn!(
+        "[DIAG] thread-exit pid={} clearing child_tid + waking joiner",
+        pid
+    );
     cleanup_thread_exit(pid)
 }

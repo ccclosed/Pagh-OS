@@ -304,8 +304,7 @@ pub fn map(phys_addr: u64, virt_addr: u64, flags: PageTableFlags) -> Result<(), 
     // Keep the overwrite (previous behaviour, nothing regresses) but log it.
     {
         let entry = &pt[virt.p1_index()];
-        if entry.flags().contains(PageTableFlags::PRESENT)
-            && entry.addr().as_u64() != phys.as_u64()
+        if entry.flags().contains(PageTableFlags::PRESENT) && entry.addr().as_u64() != phys.as_u64()
         {
             crate::warn!(
                 "[VMM] remap virt=0x{:016x}: old_phys=0x{:x} -> new_phys=0x{:x} (old frame leaked/aliased)",
@@ -337,9 +336,8 @@ pub fn walk_pte(virt_addr: u64) -> Option<PageTableEntry> {
     for shift in SHIFTS {
         let idx = ((virt_addr >> shift) & 0x1ff) as usize;
         // SAFETY: page-table frames are always readable through the HHDM.
-        let entry = unsafe {
-            core::ptr::read_volatile((phys_to_virt(table_phys) as *const u64).add(idx))
-        };
+        let entry =
+            unsafe { core::ptr::read_volatile((phys_to_virt(table_phys) as *const u64).add(idx)) };
         if entry & 1 == 0 {
             return None;
         }
@@ -348,7 +346,9 @@ pub fn walk_pte(virt_addr: u64) -> Option<PageTableEntry> {
     let idx = (virt_addr >> 12) & 0x1ff;
     // SAFETY: as above.
     let pte = unsafe {
-        core::ptr::read_volatile((phys_to_virt(table_phys) as *const PageTableEntry).add(idx as usize))
+        core::ptr::read_volatile(
+            (phys_to_virt(table_phys) as *const PageTableEntry).add(idx as usize),
+        )
     };
     if !pte.flags().contains(PageTableFlags::PRESENT) {
         return None;
@@ -366,9 +366,8 @@ pub fn set_pte_writable(virt_addr: u64) -> bool {
     for shift in SHIFTS {
         let idx = ((virt_addr >> shift) & 0x1ff) as usize;
         // SAFETY: page-table frames are always readable through the HHDM.
-        let entry = unsafe {
-            core::ptr::read_volatile((phys_to_virt(table_phys) as *const u64).add(idx))
-        };
+        let entry =
+            unsafe { core::ptr::read_volatile((phys_to_virt(table_phys) as *const u64).add(idx)) };
         if entry & 1 == 0 {
             return false;
         }
@@ -381,7 +380,9 @@ pub fn set_pte_writable(virt_addr: u64) -> bool {
     if pte & 1 == 0 {
         return false;
     }
-    unsafe { core::ptr::write_volatile(pte_virt as *mut u64, pte | PageTableFlags::WRITABLE.bits()) };
+    unsafe {
+        core::ptr::write_volatile(pte_virt as *mut u64, pte | PageTableFlags::WRITABLE.bits())
+    };
     x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(virt_addr));
     true
 }
@@ -393,16 +394,27 @@ pub fn dump_translation(virt_addr: u64) {
     for level in 0..4 {
         let idx = ((virt_addr >> SHIFTS[level]) & 0x1ff) as usize;
         // SAFETY: page-table frames are always readable through the HHDM.
-        let entry = unsafe {
-            core::ptr::read_volatile((phys_to_virt(table_phys) as *const u64).add(idx))
-        };
+        let entry =
+            unsafe { core::ptr::read_volatile((phys_to_virt(table_phys) as *const u64).add(idx)) };
         if entry & 1 == 0 {
-            crate::error!("[VMM] walk 0x{:012x}: {}[{}] = 0x{:016x} NOT PRESENT (table@phys=0x{:x})",
-                virt_addr, NAMES[level], idx, entry, table_phys);
+            crate::error!(
+                "[VMM] walk 0x{:012x}: {}[{}] = 0x{:016x} NOT PRESENT (table@phys=0x{:x})",
+                virt_addr,
+                NAMES[level],
+                idx,
+                entry,
+                table_phys
+            );
             return;
         }
-        crate::error!("[VMM] walk 0x{:012x}: {}[{}] = 0x{:016x} (table@phys=0x{:x})",
-            virt_addr, NAMES[level], idx, entry, table_phys);
+        crate::error!(
+            "[VMM] walk 0x{:012x}: {}[{}] = 0x{:016x} (table@phys=0x{:x})",
+            virt_addr,
+            NAMES[level],
+            idx,
+            entry,
+            table_phys
+        );
         if level > 0 && level < 3 && entry & (1 << 7) != 0 {
             return; // huge page - the walk legitimately ends here
         }
@@ -506,29 +518,53 @@ pub fn clone_user_space(src_pml4: u64, dst_pml4: u64) -> Result<(), VmError> {
     let src4 = walker.table(src_pml4);
     for i4 in 0..256usize {
         let e4 = &src4[i4];
-        if !e4.flags().contains(PageTableFlags::PRESENT) { continue; }
+        if !e4.flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
         let src3 = walker.table(e4.addr().as_u64());
         for i3 in 0..512usize {
             let e3 = &src3[i3];
-            if !e3.flags().contains(PageTableFlags::PRESENT) { continue; }
-            if e3.flags().contains(PageTableFlags::HUGE_PAGE) { return Err(VmError::NotMapped); }
+            if !e3.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            if e3.flags().contains(PageTableFlags::HUGE_PAGE) {
+                return Err(VmError::NotMapped);
+            }
             let src2 = walker.table(e3.addr().as_u64());
             for i2 in 0..512usize {
                 let e2 = &src2[i2];
-                if !e2.flags().contains(PageTableFlags::PRESENT) { continue; }
-                if e2.flags().contains(PageTableFlags::HUGE_PAGE) { return Err(VmError::NotMapped); }
+                if !e2.flags().contains(PageTableFlags::PRESENT) {
+                    continue;
+                }
+                if e2.flags().contains(PageTableFlags::HUGE_PAGE) {
+                    return Err(VmError::NotMapped);
+                }
                 let src1 = walker.table(e2.addr().as_u64());
                 // Build the destination chain lazily — only once this P1 proves
                 // to hold at least one present leaf.
                 let mut dst1: Option<&mut PageTable> = None;
                 for i1 in 0..512usize {
                     let e1 = &src1[i1];
-                    if !e1.flags().contains(PageTableFlags::PRESENT) { continue; }
+                    if !e1.flags().contains(PageTableFlags::PRESENT) {
+                        continue;
+                    }
                     if dst1.is_none() {
                         let p4 = walker.table_mut(dst_pml4);
-                        let p3 = walker.ensure_next(p4, x86_64::structures::paging::PageTableIndex::new(i4 as u16), user)?;
-                        let p2 = walker.ensure_next(p3, x86_64::structures::paging::PageTableIndex::new(i3 as u16), user)?;
-                        let p1 = walker.ensure_next(p2, x86_64::structures::paging::PageTableIndex::new(i2 as u16), user)?;
+                        let p3 = walker.ensure_next(
+                            p4,
+                            x86_64::structures::paging::PageTableIndex::new(i4 as u16),
+                            user,
+                        )?;
+                        let p2 = walker.ensure_next(
+                            p3,
+                            x86_64::structures::paging::PageTableIndex::new(i3 as u16),
+                            user,
+                        )?;
+                        let p1 = walker.ensure_next(
+                            p2,
+                            x86_64::structures::paging::PageTableIndex::new(i2 as u16),
+                            user,
+                        )?;
                         dst1 = Some(p1);
                     }
                     let frame = crate::memory::pmm::alloc_frame().ok_or(VmError::OutOfMemory)?;
@@ -561,12 +597,24 @@ pub fn virt_to_phys_in(pml4: u64, virt: u64) -> Option<u64> {
     let idx2 = ((virt >> 21) & 0x1ff) as usize;
     let idx1 = ((virt >> 12) & 0x1ff) as usize;
     let e4 = &walker.table(pml4)[idx4];
-    if !e4.flags().contains(PageTableFlags::PRESENT) { return None; }
+    if !e4.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
     let e3 = &walker.table(e4.addr().as_u64())[idx3];
-    if !e3.flags().contains(PageTableFlags::PRESENT) || e3.flags().contains(PageTableFlags::HUGE_PAGE) { return None; }
+    if !e3.flags().contains(PageTableFlags::PRESENT)
+        || e3.flags().contains(PageTableFlags::HUGE_PAGE)
+    {
+        return None;
+    }
     let e2 = &walker.table(e3.addr().as_u64())[idx2];
-    if !e2.flags().contains(PageTableFlags::PRESENT) || e2.flags().contains(PageTableFlags::HUGE_PAGE) { return None; }
+    if !e2.flags().contains(PageTableFlags::PRESENT)
+        || e2.flags().contains(PageTableFlags::HUGE_PAGE)
+    {
+        return None;
+    }
     let e1 = &walker.table(e2.addr().as_u64())[idx1];
-    if !e1.flags().contains(PageTableFlags::PRESENT) { return None; }
+    if !e1.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
     Some(e1.addr().as_u64() + (virt & 0xfff))
 }

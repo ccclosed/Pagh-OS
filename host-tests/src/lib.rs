@@ -20,6 +20,14 @@
 // resolve `alloc::vec::Vec` identically to the kernel's crate-root `extern crate alloc;`.
 extern crate alloc;
 
+/// Host shim for the kernel's serial-log macro. Some path-included kernel
+/// modules (e.g. `pkg/deb.rs`) call `crate::warn!`; on the host the diagnostic
+/// is discarded (tests assert on return values, not logs).
+#[macro_export]
+macro_rules! warn {
+    ($($t:tt)*) => {{ let _ = format_args!($($t)*); }};
+}
+
 // ---------------------------------------------------------------------------
 // Shared kernel pure logic
 // ---------------------------------------------------------------------------
@@ -64,6 +72,13 @@ pub mod elf_classify;
 // included so P20/P21 exercise the same source the kernel compiles (task 7.1).
 #[path = "../../src/net/http.rs"]
 pub mod http;
+
+// `wire` is the own-stack pure wire-format layer (address types, internet
+// checksum, Ethernet/ARP/IPv4/ICMP/UDP/TCP header build+parse). `core` + `alloc`
+// only and self-contained; its inline `#[cfg(test)]` unit tests run here under
+// `cargo test`, exercising the exact source the kernel compiles.
+#[path = "../../src/net/wire.rs"]
+pub mod wire;
 
 // `dns` is `core` + `alloc` only (pure DNS query building + A-record response
 // parsing, speaking plain byte slices / `[u8; 4]` — no smoltcp types); included

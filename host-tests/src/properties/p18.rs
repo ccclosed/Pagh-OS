@@ -32,7 +32,7 @@ proptest! {
         let stack_low = STACK_TOP - window;
         let argv_refs: Vec<&[u8]> = argv.iter().map(|v| v.as_slice()).collect();
         let envp_refs: Vec<&[u8]> = envp.iter().map(|v| v.as_slice()).collect();
-        let aux = AuxInputs { phdr, phent, phnum, entry, pagesz, random_ptr: 0 };
+        let aux = AuxInputs { phdr, phent, phnum, entry, pagesz, base: 0, random_ptr: 0 };
 
         let result =
             build_initial_stack(STACK_TOP, stack_low, &argv_refs, &envp_refs, &aux, random16);

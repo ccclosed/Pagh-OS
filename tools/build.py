@@ -81,7 +81,7 @@ def main() -> None:
     run([qemu, "-bios", str(ovmf), "-drive", f"file=fat:rw:{esp},format=raw",
          "-drive", f"file={disk},format=raw,if=none,id=hd0", "-device", "virtio-blk-pci,drive=hd0",
          "-netdev", "user,id=net0,hostfwd=tcp::5555-:7,hostfwd=udp::5555-:7",
-         "-device", "virtio-net-pci,netdev=net0", "-m", "512M", "-serial", "stdio",
+         "-device", "e1000,netdev=net0", "-m", "512M", "-serial", "stdio",
          "-no-reboot", "-no-shutdown", "-d", "int,cpu_reset,guest_errors", "-D", "qemu_debug.log"])
 
 if __name__ == "__main__":

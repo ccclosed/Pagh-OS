@@ -80,14 +80,20 @@ enum Resolved {
     PipeRead(Arc<PipeEndpoint>),
     PipeWrite(Arc<PipeEndpoint>),
     /// One end of an AF_UNIX socketpair (rx = incoming, tx = outgoing).
-    Socket { rx: Arc<PipeEndpoint>, tx: Arc<PipeEndpoint> },
+    Socket {
+        rx: Arc<PipeEndpoint>,
+        tx: Arc<PipeEndpoint>,
+    },
     /// An eventfd counter.
-    Eventfd { val: Arc<crate::sync::spinlock::Spinlock<u64>>, semaphore: bool },
+    Eventfd {
+        val: Arc<crate::sync::spinlock::Spinlock<u64>>,
+        semaphore: bool,
+    },
     /// An epoll instance (not directly readable/writable via read/write).
     Epoll,
-    /// AF_INET TCP over smoltcp (data path via net:: primitives).
+    /// AF_INET TCP over the own stack (data path via net:: primitives).
     InetTcp(Arc<crate::arch::x86_64::linux::inet_sock::InetTcp>),
-    /// AF_INET UDP over smoltcp.
+    /// AF_INET UDP over the own stack.
     InetUdp(Arc<crate::arch::x86_64::linux::inet_sock::InetUdp>),
     /// An open directory (not a byte stream): read/write/pread/pwrite are rejected.
     Dir,
@@ -104,8 +110,12 @@ fn write_statx_sock(buf: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-pub(crate) fn copy_in_pub(buf: u64, count: u64) -> alloc::vec::Vec<u8> { copy_in(buf, count) }
-pub(crate) fn copy_out_pub(buf: u64, data: &[u8]) { copy_out(buf, data) }
+pub(crate) fn copy_in_pub(buf: u64, count: u64) -> alloc::vec::Vec<u8> {
+    copy_in(buf, count)
+}
+pub(crate) fn copy_out_pub(buf: u64, data: &[u8]) {
+    copy_out(buf, data)
+}
 
 /// Human-readable descriptor kind for watchdog/telemetry output.
 pub(crate) fn fd_kind(fd: u64) -> &'static str {
@@ -132,13 +142,19 @@ fn resolve_fd(fd: u32) -> Option<Resolved> {
             OpenObject::Stdin => Resolved::Stdin,
             OpenObject::PipeRead(e) => Resolved::PipeRead(Arc::clone(e)),
             OpenObject::PipeWrite(e) => Resolved::PipeWrite(Arc::clone(e)),
-            OpenObject::Socket { rx, tx } => Resolved::Socket { rx: Arc::clone(rx), tx: Arc::clone(tx) },
+            OpenObject::Socket { rx, tx } => Resolved::Socket {
+                rx: Arc::clone(rx),
+                tx: Arc::clone(tx),
+            },
             OpenObject::File { node, offset } => Resolved::File {
                 node: Arc::clone(node),
                 offset: *offset,
             },
             OpenObject::Dir { .. } => Resolved::Dir,
-            OpenObject::Eventfd { val, semaphore } => Resolved::Eventfd { val: Arc::clone(val), semaphore: *semaphore },
+            OpenObject::Eventfd { val, semaphore } => Resolved::Eventfd {
+                val: Arc::clone(val),
+                semaphore: *semaphore,
+            },
             // Not byte streams — same read/write/seek rejections as epoll fds.
             OpenObject::InetTcp(t) => Resolved::InetTcp(Arc::clone(&t)),
             OpenObject::InetUdp(u) => Resolved::InetUdp(Arc::clone(&u)),
@@ -186,10 +202,17 @@ fn console_write(slice: &[u8]) {
     // Route all compat stdout/stderr through the VT emulator.
     // If this counter grows but the screen stays black, the
     // VT renderer is the suspect; if it never grows, the UI client never draws.
-    diag_count(&DIAG_CONSOLE_BYTES, "console bytes", slice.len() as u64, 8192);
+    diag_count(
+        &DIAG_CONSOLE_BYTES,
+        "console bytes",
+        slice.len() as u64,
+        8192,
+    );
     crate::drivers::vt::write(slice);
     match core::str::from_utf8(slice) {
-        Ok(s) => { console.write_str(s); }
+        Ok(s) => {
+            console.write_str(s);
+        }
         Err(e) => {
             let valid_up_to = e.valid_up_to();
             // SAFETY: `from_utf8` guarantees `slice[..valid_up_to]` is valid UTF-8.
@@ -288,21 +311,36 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         // this returned an instant EOF, so CPython silently exited with 0.
         Some(Resolved::Console) | Some(Resolved::Stdin) => {
             let raw = crate::task::compat::with_current_compat(|cs| cs.raw_mode).unwrap_or(false);
-            if raw { read_stdin_raw(buf, count) } else { read_stdin_line(buf, count) }
+            if raw {
+                read_stdin_raw(buf, count)
+            } else {
+                read_stdin_line(buf, count)
+            }
         }
         Some(Resolved::Dir) => Err(Errno::EISDIR),
         Some(Resolved::PipeWrite(_)) => Err(Errno::EBADF),
         Some(Resolved::Eventfd { val, semaphore }) => {
             // eventfd read: blocks until val > 0, then returns 8-byte u64 and resets.
-            if count < 8 { return Err(Errno::EINVAL); }
+            if count < 8 {
+                return Err(Errno::EINVAL);
+            }
             check_user_ptr(buf, 8)?;
             loop {
                 let mut v = val.lock();
                 if *v > 0 {
-                    let out = if semaphore { *v -= 1; 1u64 } else { let r=*v; *v=0; r };
+                    let out = if semaphore {
+                        *v -= 1;
+                        1u64
+                    } else {
+                        let r = *v;
+                        *v = 0;
+                        r
+                    };
                     drop(v);
                     // SAFETY: validated above
-                    unsafe { core::ptr::write_unaligned(buf as *mut u64, out); }
+                    unsafe {
+                        core::ptr::write_unaligned(buf as *mut u64, out);
+                    }
                     return Ok(8);
                 }
                 drop(v);
@@ -317,10 +355,29 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             return Ok(n as u64);
         }
         Some(Resolved::InetUdp(_)) => Err(Errno::ENOTCONN), // recvfrom only
-        Some(Resolved::PipeRead(e)) => { let mut data=vec![0u8;count as usize];let n=read_pipe(&e,&mut data)?;
-            if n>0{crate::warn!("[DIAG] pipe-read pid={} fd={} n={}", crate::task::scheduler::current_pid(), fd, n);}
-            copy_out(buf,&data[..n]);Ok(n as u64) }
-        Some(Resolved::Socket { rx, .. }) => { let mut data=vec![0u8;count as usize];let n=read_pipe(&rx,&mut data)?;if n>0{diag_count(&DIAG_SOCK_R,"sock read",n as u64,16384);}copy_out(buf,&data[..n]);Ok(n as u64) }
+        Some(Resolved::PipeRead(e)) => {
+            let mut data = vec![0u8; count as usize];
+            let n = read_pipe(&e, &mut data)?;
+            if n > 0 {
+                crate::warn!(
+                    "[DIAG] pipe-read pid={} fd={} n={}",
+                    crate::task::scheduler::current_pid(),
+                    fd,
+                    n
+                );
+            }
+            copy_out(buf, &data[..n]);
+            Ok(n as u64)
+        }
+        Some(Resolved::Socket { rx, .. }) => {
+            let mut data = vec![0u8; count as usize];
+            let n = read_pipe(&rx, &mut data)?;
+            if n > 0 {
+                diag_count(&DIAG_SOCK_R, "sock read", n as u64, 16384);
+            }
+            copy_out(buf, &data[..n]);
+            Ok(n as u64)
+        }
         Some(Resolved::File { node, offset }) => {
             let size = node.size();
             let (copied, _) = plan_read(size, offset, count);
@@ -363,7 +420,9 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         Some(Resolved::Stdin) => Err(Errno::EBADF),
         Some(Resolved::Dir) => Err(Errno::EISDIR),
         Some(Resolved::Eventfd { val, .. }) => {
-            if count < 8 { return Err(Errno::EINVAL); }
+            if count < 8 {
+                return Err(Errno::EINVAL);
+            }
             check_user_ptr(buf, 8)?;
             // SAFETY: validated above
             let add = unsafe { core::ptr::read_unaligned(buf as *const u64) };
@@ -382,10 +441,25 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             let n = crate::arch::x86_64::linux::inet_sock::udp_write_fd(fd, &data)?;
             Ok(n as u64)
         }
-        Some(Resolved::PipeWrite(e)) => {let data=copy_in(buf,count);
-            crate::warn!("[DIAG] pipe-write pid={} fd={} len={} head={:?}", crate::task::scheduler::current_pid(), fd, count, String::from_utf8_lossy(&data[..data.len().min(32)]));
-            Ok(write_pipe(&e,&data)? as u64)}
-        Some(Resolved::Socket { tx, .. }) => {let data=copy_in(buf,count);let n=write_pipe(&tx,&data)?;if n>0{diag_count(&DIAG_SOCK_W,"sock write",n as u64,16384);}Ok(n as u64)}
+        Some(Resolved::PipeWrite(e)) => {
+            let data = copy_in(buf, count);
+            crate::warn!(
+                "[DIAG] pipe-write pid={} fd={} len={} head={:?}",
+                crate::task::scheduler::current_pid(),
+                fd,
+                count,
+                String::from_utf8_lossy(&data[..data.len().min(32)])
+            );
+            Ok(write_pipe(&e, &data)? as u64)
+        }
+        Some(Resolved::Socket { tx, .. }) => {
+            let data = copy_in(buf, count);
+            let n = write_pipe(&tx, &data)?;
+            if n > 0 {
+                diag_count(&DIAG_SOCK_W, "sock write", n as u64, 16384);
+            }
+            Ok(n as u64)
+        }
         Some(Resolved::Console) => {
             let data = copy_in(buf, count);
             console_write(&data);
@@ -427,16 +501,24 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
             let entry = iov + i * 16;
             let base = unsafe { *(entry as *const u64) };
             let len = unsafe { *((entry + 8) as *const u64) };
-            if len == 0 { continue; }
+            if len == 0 {
+                continue;
+            }
             check_user_ptr(base, len)?;
             let data = copy_in(base, len);
             crate::arch::x86_64::linux::inet_sock::tcp_write(fd, &data)?;
         }
         return Ok(0);
     }
-    if matches!(target, Resolved::Dir) { return Err(Errno::EISDIR); }
-    if matches!(target, Resolved::Eventfd { .. } | Resolved::Epoll) { return Err(Errno::EINVAL); }
-    if matches!(target, Resolved::PipeRead(_)) { return Err(Errno::EBADF); }
+    if matches!(target, Resolved::Dir) {
+        return Err(Errno::EISDIR);
+    }
+    if matches!(target, Resolved::Eventfd { .. } | Resolved::Epoll) {
+        return Err(Errno::EINVAL);
+    }
+    if matches!(target, Resolved::PipeRead(_)) {
+        return Err(Errno::EBADF);
+    }
 
     // Track a running offset for the file case; commit it once at the end.
     let mut file_off = match &target {
@@ -481,7 +563,13 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
                 file_off += n as u64;
                 total += n as u64;
             }
-            Resolved::Socket { tx, .. } => {let n=write_pipe(tx,&data)?;total+=n as u64;if n<data.len(){break;}}
+            Resolved::Socket { tx, .. } => {
+                let n = write_pipe(tx, &data)?;
+                total += n as u64;
+                if n < data.len() {
+                    break;
+                }
+            }
             // Stdin/PipeRead/Dir/Eventfd/Epoll are rejected by the guards above.
             _ => unreachable!(),
         }
@@ -500,15 +588,21 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
 pub fn sys_readv(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
     const IOV_SIZE: u64 = 16;
     const IOV_MAX: u64 = 1024;
-    if iovcnt == 0 { return Ok(0); }
-    if iovcnt > IOV_MAX { return Err(Errno::EINVAL); }
+    if iovcnt == 0 {
+        return Ok(0);
+    }
+    if iovcnt > IOV_MAX {
+        return Err(Errno::EINVAL);
+    }
     check_user_ptr(iov, iovcnt * IOV_SIZE)?;
     for i in 0..iovcnt {
         let entry = iov + i * IOV_SIZE;
         // SAFETY: the whole iovec array range was validated above.
         let base = unsafe { *(entry as *const u64) };
         let len = unsafe { *((entry + 8) as *const u64) };
-        if len == 0 { continue; }
+        if len == 0 {
+            continue;
+        }
         return sys_read(fd, base, len);
     }
     Ok(0)
@@ -519,15 +613,21 @@ pub fn sys_readv(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
 pub fn sys_preadv(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, Errno> {
     const IOV_SIZE: u64 = 16;
     const IOV_MAX: u64 = 1024;
-    if iovcnt == 0 { return Ok(0); }
-    if iovcnt > IOV_MAX { return Err(Errno::EINVAL); }
+    if iovcnt == 0 {
+        return Ok(0);
+    }
+    if iovcnt > IOV_MAX {
+        return Err(Errno::EINVAL);
+    }
     check_user_ptr(iov, iovcnt * IOV_SIZE)?;
     for i in 0..iovcnt {
         let entry = iov + i * IOV_SIZE;
         // SAFETY: the whole iovec array range was validated above.
         let base = unsafe { *(entry as *const u64) };
         let len = unsafe { *((entry + 8) as *const u64) };
-        if len == 0 { continue; }
+        if len == 0 {
+            continue;
+        }
         return sys_pread64(fd, base, len, offset);
     }
     Ok(0)
@@ -538,15 +638,21 @@ pub fn sys_preadv(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, Er
 pub fn sys_pwritev(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, Errno> {
     const IOV_SIZE: u64 = 16;
     const IOV_MAX: u64 = 1024;
-    if iovcnt == 0 { return Ok(0); }
-    if iovcnt > IOV_MAX { return Err(Errno::EINVAL); }
+    if iovcnt == 0 {
+        return Ok(0);
+    }
+    if iovcnt > IOV_MAX {
+        return Err(Errno::EINVAL);
+    }
     check_user_ptr(iov, iovcnt * IOV_SIZE)?;
     for i in 0..iovcnt {
         let entry = iov + i * IOV_SIZE;
         // SAFETY: the whole iovec array range was validated above.
         let base = unsafe { *(entry as *const u64) };
         let len = unsafe { *((entry + 8) as *const u64) };
-        if len == 0 { continue; }
+        if len == 0 {
+            continue;
+        }
         return sys_pwrite64(fd, base, len, offset);
     }
     Ok(0)
@@ -691,7 +797,12 @@ fn open_path(path: &str, flags: u64) -> Result<u64, Errno> {
             }
             let dir = vfs::lookup_path(parent).map_err(|_| Errno::ENOENT)?;
             dir.create_file(name).map_err(|e| {
-                crate::warn!("[linux] open(O_CREAT) failed: {:?} parent={} name={}", e, parent, name);
+                crate::warn!(
+                    "[linux] open(O_CREAT) failed: {:?} parent={} name={}",
+                    e,
+                    parent,
+                    name
+                );
                 Errno::EIO
             })?;
         }
@@ -746,7 +857,7 @@ pub fn sys_close(fd: u64) -> Result<u64, Errno> {
             kind
         );
     }
-    // NOTE: we deliberately do NOT remove the smoltcp socket here. Any path
+    // NOTE: we deliberately do NOT remove the UDP socket here. Any path
     // that takes NET.lock from a syscall handler risks deadlock (spinlocks
     // disable IF; the net thread can't run to release its side). The leaked
     // SocketSet slot is reclaimed at reboot.
@@ -862,9 +973,12 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> Result<u64, Errno> {
             write_stat_struct(&stat, statbuf);
             Ok(0)
         }
-        Some(Resolved::Console) | Some(Resolved::Stdin)
-        | Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_))
-        | Some(Resolved::Eventfd { .. }) | Some(Resolved::Epoll) => {
+        Some(Resolved::Console)
+        | Some(Resolved::Stdin)
+        | Some(Resolved::PipeRead(_))
+        | Some(Resolved::PipeWrite(_))
+        | Some(Resolved::Eventfd { .. })
+        | Some(Resolved::Epoll) => {
             let stat = encode_stat(0, S_IFCHR | 0o620);
             write_stat_struct(&stat, statbuf);
             Ok(0)
@@ -918,8 +1032,12 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
     if request == FIONBIO {
         check_user_ptr(arg, 4)?;
         let on = unsafe { core::ptr::read_unaligned(arg as *const u32) } != 0;
-        crate::warn!("[DIAG] ioctl FIONBIO pid={} fd={} on={}",
-            crate::task::scheduler::current_pid(), fd, on);
+        crate::warn!(
+            "[DIAG] ioctl FIONBIO pid={} fd={} on={}",
+            crate::task::scheduler::current_pid(),
+            fd,
+            on
+        );
         return compat::with_current_compat(|cs| {
             let obj = cs.fds.get_mut(fd as u32).ok_or(Errno::EBADF)?;
             match obj {
@@ -928,11 +1046,14 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
                 OpenObject::Socket { rx, tx } => {
                     let nrx = rx.with_nonblocking(on);
                     let ntx = tx.with_nonblocking(on);
-                    *rx = nrx; *tx = ntx;
+                    *rx = nrx;
+                    *tx = ntx;
                 }
                 OpenObject::UnixListener(l) => l.inner.lock().nonblocking = on,
                 OpenObject::UnixSocketUnbound { nonblocking } => *nonblocking = on,
-                OpenObject::Stdin => { STDIN_NONBLOCK.store(on, core::sync::atomic::Ordering::Relaxed); }
+                OpenObject::Stdin => {
+                    STDIN_NONBLOCK.store(on, core::sync::atomic::Ordering::Relaxed);
+                }
                 _ => {}
             }
             Ok(0)
@@ -951,8 +1072,12 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
             // routine noise; any OTHER unknown request is a compat-surface gap
             // worth seeing on screen.
             if !(0x5401..=0x5420).contains(&request) {
-                crate::warn!("[DIAG] ioctl pid={} fd={} req=0x{:x} -> ENOTTY",
-                    crate::task::scheduler::current_pid(), fd, request);
+                crate::warn!(
+                    "[DIAG] ioctl pid={} fd={} req=0x{:x} -> ENOTTY",
+                    crate::task::scheduler::current_pid(),
+                    fd,
+                    request
+                );
             }
             Err(Errno::ENOTTY)
         }
@@ -985,15 +1110,19 @@ fn build_termios() -> [u8; TERMIOS_SIZE] {
     let c_iflag: u32 = 0x0500; // ICRNL | IXON
     let c_oflag: u32 = 0x0005; // OPOST | ONLCR
     let c_cflag: u32 = 0x00BF; // B38400 | CS8 | CREAD
-    // STAGE 16.16: report the REAL tty state instead of a hardcoded cooked
-    // image. tcgetattr previously always claimed ICANON|ECHO, so a program
-    // that saves attributes, switches to raw and restores them (bash readline
-    // does this around every command) read back a lie.
+                               // STAGE 16.16: report the REAL tty state instead of a hardcoded cooked
+                               // image. tcgetattr previously always claimed ICANON|ECHO, so a program
+                               // that saves attributes, switches to raw and restores them (bash readline
+                               // does this around every command) read back a lie.
     let (raw_now, echo_now) = crate::task::compat::with_current_compat(|cs| (cs.raw_mode, cs.echo))
         .unwrap_or((false, true));
     let mut c_lflag: u32 = 0x8A3B; // ISIG|ICANON|ECHO|ECHOE|ECHOK|ECHOCTL|ECHOKE|IEXTEN
-    if raw_now { c_lflag &= !0x0002u32; } // ICANON
-    if !echo_now { c_lflag &= !0x0008u32; } // ECHO
+    if raw_now {
+        c_lflag &= !0x0002u32;
+    } // ICANON
+    if !echo_now {
+        c_lflag &= !0x0008u32;
+    } // ECHO
     t[0..4].copy_from_slice(&c_iflag.to_le_bytes());
     t[4..8].copy_from_slice(&c_oflag.to_le_bytes());
     t[8..12].copy_from_slice(&c_cflag.to_le_bytes());
@@ -1025,10 +1154,21 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
                 // c_lflag is at offset 12; ICANON = 0x02
                 let c_lflag = unsafe { core::ptr::read_unaligned((arg + 12) as *const u32) };
                 let raw = c_lflag & 0x02 == 0; // ICANON cleared => raw mode
-                // STAGE 16.16: track ECHO (0x08) too, so raw-mode reads know
-                // whether the kernel must echo typed characters itself.
+                                               // STAGE 16.16: track ECHO (0x08) too, so raw-mode reads know
+                                               // whether the kernel must echo typed characters itself.
                 let echo = c_lflag & 0x08 != 0;
-                crate::task::compat::with_current_compat(|cs| { if cs.raw_mode != raw || cs.echo != echo { crate::warn!("[DIAG] tty: raw_mode={} echo={} pid={}", raw, echo, crate::task::scheduler::current_pid()); } cs.raw_mode = raw; cs.echo = echo; });
+                crate::task::compat::with_current_compat(|cs| {
+                    if cs.raw_mode != raw || cs.echo != echo {
+                        crate::warn!(
+                            "[DIAG] tty: raw_mode={} echo={} pid={}",
+                            raw,
+                            echo,
+                            crate::task::scheduler::current_pid()
+                        );
+                    }
+                    cs.raw_mode = raw;
+                    cs.echo = echo;
+                });
             }
             Ok(0)
         }
@@ -1067,8 +1207,7 @@ static STDIN_PENDING: crate::sync::spinlock::Spinlock<alloc::vec::Vec<u8>> =
 
 // Libuv puts the raw tty into O_NONBLOCK and multiplexes it with
 // epoll; a read that blocks in-kernel stalls nvim's whole TUI event loop.
-static STDIN_NONBLOCK: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static STDIN_NONBLOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// True when a raw-mode stdin read can make progress right now:
 /// leftover bytes, queued VT query replies, or an unread keyboard scancode.
@@ -1085,14 +1224,19 @@ pub(crate) fn stdin_input_available() -> bool {
 static DIAG_CONSOLE_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static DIAG_SOCK_R: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static DIAG_SOCK_W: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static DIAG_STDIN_EAGAIN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static DIAG_STDIN_EAGAIN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 fn diag_count(ctr: &core::sync::atomic::AtomicU64, label: &str, n: u64, step: u64) {
     let old = ctr.fetch_add(n, core::sync::atomic::Ordering::Relaxed);
     let new = old + n;
     if old == 0 || old / step != new / step {
-        crate::warn!("[DIAG] {} pid={} total={}", label,
-            crate::task::scheduler::current_pid(), new);
+        crate::warn!(
+            "[DIAG] {} pid={} total={}",
+            label,
+            crate::task::scheduler::current_pid(),
+            new
+        );
     }
 }
 /// Hard cap so a pathological paste cannot grow the cooked line unbounded.
@@ -1111,7 +1255,9 @@ const STDIN_LINE_MAX: usize = 4096;
 // map special keys to ANSI escape sequences so nvim's terminal layer works.
 fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
     use crate::shell::keys::{Decoder, KeyEvent};
-    if count == 0 { return Ok(0); }
+    if count == 0 {
+        return Ok(0);
+    }
     // Queue any pending VT query replies (DA1/DSR/DECRQM/OSC)
     // so nvim's terminal interrogation gets its answers on stdin.
     {
@@ -1148,7 +1294,9 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
                     && (!consumed_any || spins > 200)
                 {
                     if !DIAG_STDIN_EAGAIN.swap(true, core::sync::atomic::Ordering::Relaxed) {
-                        crate::warn!("[DIAG] stdin: nonblocking read -> first EAGAIN (uv loop is polling)");
+                        crate::warn!(
+                            "[DIAG] stdin: nonblocking read -> first EAGAIN (uv loop is polling)"
+                        );
                     }
                     return Err(Errno::EAGAIN);
                 }
@@ -1172,18 +1320,20 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
             KeyEvent::Backspace => alloc::vec![0x7F], // DEL
             KeyEvent::Escape => alloc::vec![0x1B],
             KeyEvent::Tab => alloc::vec![b'\t'],
-            KeyEvent::Up    => alloc::vec![0x1B, b'[', b'A'],
-            KeyEvent::Down  => alloc::vec![0x1B, b'[', b'B'],
+            KeyEvent::Up => alloc::vec![0x1B, b'[', b'A'],
+            KeyEvent::Down => alloc::vec![0x1B, b'[', b'B'],
             KeyEvent::Right => alloc::vec![0x1B, b'[', b'C'],
-            KeyEvent::Left  => alloc::vec![0x1B, b'[', b'D'],
-            KeyEvent::Home  => alloc::vec![0x1B, b'[', b'H'],
-            KeyEvent::End   => alloc::vec![0x1B, b'[', b'F'],
-            KeyEvent::PageUp   => alloc::vec![0x1B, b'[', b'5', b'~'],
+            KeyEvent::Left => alloc::vec![0x1B, b'[', b'D'],
+            KeyEvent::Home => alloc::vec![0x1B, b'[', b'H'],
+            KeyEvent::End => alloc::vec![0x1B, b'[', b'F'],
+            KeyEvent::PageUp => alloc::vec![0x1B, b'[', b'5', b'~'],
             KeyEvent::PageDown => alloc::vec![0x1B, b'[', b'6', b'~'],
-            KeyEvent::Delete   => alloc::vec![0x1B, b'[', b'3', b'~'],
-            KeyEvent::Ctrl(c)  => alloc::vec![(c as u8) & 0x1F],
+            KeyEvent::Delete => alloc::vec![0x1B, b'[', b'3', b'~'],
+            KeyEvent::Ctrl(c) => alloc::vec![(c as u8) & 0x1F],
         };
-        if bytes.is_empty() { continue; }
+        if bytes.is_empty() {
+            continue;
+        }
         // STAGE 16.16: a real tty keeps echoing in raw mode unless ECHO is
         // cleared. bash's readline runs without a terminfo database here, so
         // it does NOT redraw the input line itself and relied on that missing
@@ -1317,7 +1467,11 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
     }
     let node = vfs::lookup_path(oldabs).map_err(|_| Errno::ENOENT)?;
     if node.is_directory() {
-        crate::warn!("[linux] rename: directory rename not supported: {} -> {}", oldabs, newabs);
+        crate::warn!(
+            "[linux] rename: directory rename not supported: {} -> {}",
+            oldabs,
+            newabs
+        );
         return Err(Errno::EACCES);
     }
     if flags & RENAME_NOREPLACE != 0 && vfs::lookup_path(newabs).is_ok() {
@@ -1329,8 +1483,12 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
     data.resize(size, 0u8);
     let mut off = 0usize;
     while off < size {
-        let n = node.read(off as u64, &mut data[off..]).map_err(|_| Errno::EIO)?;
-        if n == 0 { break; }
+        let n = node
+            .read(off as u64, &mut data[off..])
+            .map_err(|_| Errno::EIO)?;
+        if n == 0 {
+            break;
+        }
         off += n;
     }
     data.truncate(off);
@@ -1340,7 +1498,9 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
         Some(i) => (&newabs[..i], &newabs[i + 1..]),
         None => return Err(Errno::ENOENT),
     };
-    if nname.is_empty() { return Err(Errno::EINVAL); }
+    if nname.is_empty() {
+        return Err(Errno::EINVAL);
+    }
     let ndir = vfs::lookup_path(nparent).map_err(|_| Errno::ENOENT)?;
     if ndir.lookup(nname).is_ok() {
         ndir.remove(nname).map_err(|e| {
@@ -1358,7 +1518,9 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
             crate::warn!("[linux] rename: write target failed: {:?} {}", e, newabs);
             Errno::EIO
         })?;
-        if n == 0 { return Err(Errno::EIO); }
+        if n == 0 {
+            return Err(Errno::EIO);
+        }
         woff += n;
     }
     // Unlink the source.
@@ -1383,14 +1545,25 @@ pub fn sys_rename(oldpath: u64, newpath: u64) -> Result<u64, Errno> {
 
 /// `renameat` (264): dirfds are ignored (paths resolve against the cwd, which
 /// covers AT_FDCWD in this minimal layer, matching openat).
-pub fn sys_renameat(_olddirfd: u64, oldpath: u64, _newdirfd: u64, newpath: u64) -> Result<u64, Errno> {
+pub fn sys_renameat(
+    _olddirfd: u64,
+    oldpath: u64,
+    _newdirfd: u64,
+    newpath: u64,
+) -> Result<u64, Errno> {
     let o = read_user_cstr(oldpath)?;
     let n = read_user_cstr(newpath)?;
     rename_paths(&o, &n, 0)
 }
 
 /// `renameat2` (316): like renameat; only RENAME_NOREPLACE is honored.
-pub fn sys_renameat2(_olddirfd: u64, oldpath: u64, _newdirfd: u64, newpath: u64, flags: u64) -> Result<u64, Errno> {
+pub fn sys_renameat2(
+    _olddirfd: u64,
+    oldpath: u64,
+    _newdirfd: u64,
+    newpath: u64,
+    flags: u64,
+) -> Result<u64, Errno> {
     let o = read_user_cstr(oldpath)?;
     let n = read_user_cstr(newpath)?;
     rename_paths(&o, &n, flags)
@@ -1616,10 +1789,17 @@ pub fn sys_dup(oldfd: u64) -> Result<u64, Errno> {
     // Nvim dup()s its stdio before hiding it behind stderr;
     // an EBADF here means fd 0/1 were already gone when the server started.
     match &r {
-        Ok(fd) => crate::warn!("[DIAG] dup pid={} oldfd={} -> {}",
-            crate::task::scheduler::current_pid(), oldfd, fd),
-        Err(_) => crate::warn!("[DIAG] dup pid={} oldfd={} -> EBADF",
-            crate::task::scheduler::current_pid(), oldfd),
+        Ok(fd) => crate::warn!(
+            "[DIAG] dup pid={} oldfd={} -> {}",
+            crate::task::scheduler::current_pid(),
+            oldfd,
+            fd
+        ),
+        Err(_) => crate::warn!(
+            "[DIAG] dup pid={} oldfd={} -> EBADF",
+            crate::task::scheduler::current_pid(),
+            oldfd
+        ),
     }
     r
 }
@@ -1630,8 +1810,12 @@ pub fn sys_dup(oldfd: u64) -> Result<u64, Errno> {
 pub fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, Errno> {
     // Stdio rewiring during spawn is exactly where a lost
     // nvim RPC channel would hide; dup2/dup3 are rare enough to log each call.
-    crate::warn!("[DIAG] dup2 pid={} oldfd={} newfd={}",
-        crate::task::scheduler::current_pid(), oldfd, newfd);
+    crate::warn!(
+        "[DIAG] dup2 pid={} oldfd={} newfd={}",
+        crate::task::scheduler::current_pid(),
+        oldfd,
+        newfd
+    );
     compat::with_current_compat(|cs| {
         // `oldfd` must be valid regardless.
         if cs.fds.get(oldfd as u32).is_none() {
@@ -1650,8 +1834,13 @@ pub fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, Errno> {
 /// `dup3` (292): like `dup2` but `oldfd == newfd` is an error (`EINVAL`) and the
 /// only accepted flag is `O_CLOEXEC` (ignored here). `EBADF` if `oldfd` is invalid.
 pub fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> Result<u64, Errno> {
-    crate::warn!("[DIAG] dup3 pid={} oldfd={} newfd={} flags=0x{:x}",
-        crate::task::scheduler::current_pid(), oldfd, newfd, flags);
+    crate::warn!(
+        "[DIAG] dup3 pid={} oldfd={} newfd={} flags=0x{:x}",
+        crate::task::scheduler::current_pid(),
+        oldfd,
+        newfd,
+        flags
+    );
     if oldfd == newfd {
         return Err(Errno::EINVAL);
     }
@@ -1661,7 +1850,9 @@ pub fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> Result<u64, Errno> {
     compat::with_current_compat(|cs| {
         let fd = cs.fds.dup_to(oldfd as u32, newfd as u32)?;
         // Dup3's only flag — mark the new descriptor close-on-exec.
-        if flags & O_CLOEXEC != 0 { cs.fds.set_cloexec(fd, true); }
+        if flags & O_CLOEXEC != 0 {
+            cs.fds.set_cloexec(fd, true);
+        }
         Ok(fd as u64)
     })
     .unwrap_or(Err(Errno::EBADF))
@@ -1688,8 +1879,13 @@ const F_DUPFD_CLOEXEC: u64 = 1030;
 pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
     // Libuv's child-init shuffles stdio fds with F_DUPFD.
     if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC {
-        crate::warn!("[DIAG] fcntl_dupfd pid={} fd={} min={} cloexec={}",
-            crate::task::scheduler::current_pid(), fd, arg, cmd == F_DUPFD_CLOEXEC);
+        crate::warn!(
+            "[DIAG] fcntl_dupfd pid={} fd={} min={} cloexec={}",
+            crate::task::scheduler::current_pid(),
+            fd,
+            arg,
+            cmd == F_DUPFD_CLOEXEC
+        );
     }
     const FD_CLOEXEC: u64 = 1;
     match cmd {
@@ -1703,7 +1899,11 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
             if cs.fds.get(fd as u32).is_none() {
                 return Err(Errno::EBADF);
             }
-            Ok(if cs.fds.is_cloexec(fd as u32) { FD_CLOEXEC } else { 0 })
+            Ok(if cs.fds.is_cloexec(fd as u32) {
+                FD_CLOEXEC
+            } else {
+                0
+            })
         })
         .unwrap_or(Err(Errno::EBADF)),
         F_SETFD => compat::with_current_compat(|cs| {
@@ -1726,10 +1926,16 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
                         OpenObject::UnixListener(l) => l.inner.lock().nonblocking,
                         OpenObject::UnixSocketUnbound { nonblocking } => *nonblocking,
                         // Stdin reports its real nonblocking state.
-                        OpenObject::Stdin => STDIN_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed),
+                        OpenObject::Stdin => {
+                            STDIN_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed)
+                        }
                         _ => false,
                     };
-                    Ok(if nb { O_RDWR_FL | O_NONBLOCK_FL } else { O_RDWR_FL })
+                    Ok(if nb {
+                        O_RDWR_FL | O_NONBLOCK_FL
+                    } else {
+                        O_RDWR_FL
+                    })
                 } else {
                     let on = arg & O_NONBLOCK_FL != 0;
                     match obj {
@@ -1738,12 +1944,16 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
                         OpenObject::Socket { rx, tx } => {
                             let nrx = rx.with_nonblocking(on);
                             let ntx = tx.with_nonblocking(on);
-                            *rx = nrx; *tx = ntx;
+                            *rx = nrx;
+                            *tx = ntx;
                         }
                         OpenObject::UnixListener(l) => l.inner.lock().nonblocking = on,
                         OpenObject::UnixSocketUnbound { nonblocking } => *nonblocking = on,
                         // Libuv flips O_NONBLOCK on the raw tty.
-                        OpenObject::Stdin => { crate::warn!("[DIAG] fcntl: stdin O_NONBLOCK={}", on); STDIN_NONBLOCK.store(on, core::sync::atomic::Ordering::Relaxed); }
+                        OpenObject::Stdin => {
+                            crate::warn!("[DIAG] fcntl: stdin O_NONBLOCK={}", on);
+                            STDIN_NONBLOCK.store(on, core::sync::atomic::Ordering::Relaxed);
+                        }
                         _ => {}
                     }
                     Ok(0)
@@ -1796,11 +2006,15 @@ pub fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Er
     check_user_ptr(buf, count)?;
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
-        Some(Resolved::Console) | Some(Resolved::Stdin)
-        | Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_))
+        Some(Resolved::Console)
+        | Some(Resolved::Stdin)
+        | Some(Resolved::PipeRead(_))
+        | Some(Resolved::PipeWrite(_))
         | Some(Resolved::Socket { .. })
-        | Some(Resolved::InetTcp(_)) | Some(Resolved::InetUdp(_))
-        | Some(Resolved::Eventfd { .. }) | Some(Resolved::Epoll) => Err(Errno::ESPIPE),
+        | Some(Resolved::InetTcp(_))
+        | Some(Resolved::InetUdp(_))
+        | Some(Resolved::Eventfd { .. })
+        | Some(Resolved::Epoll) => Err(Errno::ESPIPE),
         Some(Resolved::Dir) => Err(Errno::EISDIR),
         Some(Resolved::File { node, .. }) => {
             let size = node.size();
@@ -1934,20 +2148,135 @@ pub fn sys_fstatfs(fd: u64, buf: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-
-const O_NONBLOCK:u64=0x800; const O_CLOEXEC:u64=0x80000;
-const POLLIN:i16=0x001; const POLLOUT:i16=0x004; const POLLERR:i16=0x008; const POLLHUP:i16=0x010; const POLLNVAL:i16=0x020;
-pub fn sys_pipe(pipefd:u64)->Result<u64,Errno>{sys_pipe2(pipefd,0)}
-pub fn sys_pipe2(pipefd:u64,flags:u64)->Result<u64,Errno>{if flags&!(O_NONBLOCK|O_CLOEXEC)!=0{return Err(Errno::EINVAL)}check_user_ptr(pipefd,8)?;let pair=compat::with_current_compat(|cs|{let p=cs.fds.pipe(flags&O_NONBLOCK!=0);if flags&O_CLOEXEC!=0{cs.fds.set_cloexec(p.0,true);cs.fds.set_cloexec(p.1,true);}p}).ok_or(Errno::EBADF)?;crate::warn!("[DIAG] pipe pid={} -> r={} w={}", crate::task::scheduler::current_pid(), pair.0, pair.1);let words=[pair.0,pair.1];let bytes=unsafe{core::slice::from_raw_parts(words.as_ptr()as*const u8,8)};copy_out(pipefd,bytes);Ok(0)}
-fn poll_revents(fd:i32,events:i16)->i16{if fd<0{return 0}match resolve_fd(fd as u32){
-None=>POLLNVAL,
-Some(Resolved::InetTcp(_))=>{
-    // Conservative: a connected socket is always reported writable and
-    // readable-if-data; curl's event loop re-checks via recv/send anyway.
-    events&(POLLIN|POLLOUT)
+const O_NONBLOCK: u64 = 0x800;
+const O_CLOEXEC: u64 = 0x80000;
+const POLLIN: i16 = 0x001;
+const POLLOUT: i16 = 0x004;
+const POLLERR: i16 = 0x008;
+const POLLHUP: i16 = 0x010;
+const POLLNVAL: i16 = 0x020;
+pub fn sys_pipe(pipefd: u64) -> Result<u64, Errno> {
+    sys_pipe2(pipefd, 0)
 }
-Some(Resolved::InetUdp(_))=>events&(POLLIN|POLLOUT),Some(Resolved::PipeRead(e))=>{let mut o=if e.read_ready(){events&POLLIN}else{0};if e.peer_closed(){o|=POLLHUP}o},Some(Resolved::PipeWrite(e))=>{let mut o=if e.write_ready(){events&POLLOUT}else{0};if e.peer_closed(){o|=POLLERR}o},Some(Resolved::Socket{rx,tx})=>{let mut o=0i16;if rx.read_ready(){o|=events&POLLIN}if tx.write_ready(){o|=events&POLLOUT}if rx.peer_closed(){o|=POLLHUP}o},Some(Resolved::Stdin)=>{if stdin_input_available(){events&POLLIN}else{0}},Some(Resolved::Console)=>events&POLLOUT,Some(Resolved::Eventfd{val,..})=>{let v=val.lock();if*v>0{events&POLLIN}else{0}},Some(Resolved::Epoll)=>0,Some(Resolved::File{..})|Some(Resolved::Dir)=>events&(POLLIN|POLLOUT)}}
-pub fn sys_poll(fds:u64,nfds:u64,timeout:u64)->Result<u64,Errno>{const SZ:u64=8;if nfds>1024{return Err(Errno::EINVAL)}check_user_ptr(fds,nfds.checked_mul(SZ).ok_or(Errno::EINVAL)?)?;let ms=timeout as i64;let deadline=if ms<0{None}else{Some(crate::task::scheduler::ticks().saturating_add((ms as u64).saturating_add(9)/10))};loop{let mut ready=0;for i in 0..nfds{let p=fds+i*SZ;let fd=unsafe{*(p as*const i32)};let ev=unsafe{*((p+4)as*const i16)};let rev=poll_revents(fd,ev);unsafe{*((p+6)as*mut i16)=rev}if rev!=0{ready+=1}}if ready!=0||ms==0{return Ok(ready)}if let Some(end)=deadline{if crate::task::scheduler::ticks()>=end{return Ok(0)}}crate::task::scheduler::yield_current()}}
+pub fn sys_pipe2(pipefd: u64, flags: u64) -> Result<u64, Errno> {
+    if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    check_user_ptr(pipefd, 8)?;
+    let pair = compat::with_current_compat(|cs| {
+        let p = cs.fds.pipe(flags & O_NONBLOCK != 0);
+        if flags & O_CLOEXEC != 0 {
+            cs.fds.set_cloexec(p.0, true);
+            cs.fds.set_cloexec(p.1, true);
+        }
+        p
+    })
+    .ok_or(Errno::EBADF)?;
+    crate::warn!(
+        "[DIAG] pipe pid={} -> r={} w={}",
+        crate::task::scheduler::current_pid(),
+        pair.0,
+        pair.1
+    );
+    let words = [pair.0, pair.1];
+    let bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, 8) };
+    copy_out(pipefd, bytes);
+    Ok(0)
+}
+fn poll_revents(fd: i32, events: i16) -> i16 {
+    if fd < 0 {
+        return 0;
+    }
+    match resolve_fd(fd as u32) {
+        None => POLLNVAL,
+        Some(Resolved::InetTcp(_)) => {
+            // Conservative: a connected socket is always reported writable and
+            // readable-if-data; curl's event loop re-checks via recv/send anyway.
+            events & (POLLIN | POLLOUT)
+        }
+        Some(Resolved::InetUdp(_)) => events & (POLLIN | POLLOUT),
+        Some(Resolved::PipeRead(e)) => {
+            let mut o = if e.read_ready() { events & POLLIN } else { 0 };
+            if e.peer_closed() {
+                o |= POLLHUP
+            }
+            o
+        }
+        Some(Resolved::PipeWrite(e)) => {
+            let mut o = if e.write_ready() { events & POLLOUT } else { 0 };
+            if e.peer_closed() {
+                o |= POLLERR
+            }
+            o
+        }
+        Some(Resolved::Socket { rx, tx }) => {
+            let mut o = 0i16;
+            if rx.read_ready() {
+                o |= events & POLLIN
+            }
+            if tx.write_ready() {
+                o |= events & POLLOUT
+            }
+            if rx.peer_closed() {
+                o |= POLLHUP
+            }
+            o
+        }
+        Some(Resolved::Stdin) => {
+            if stdin_input_available() {
+                events & POLLIN
+            } else {
+                0
+            }
+        }
+        Some(Resolved::Console) => events & POLLOUT,
+        Some(Resolved::Eventfd { val, .. }) => {
+            let v = val.lock();
+            if *v > 0 {
+                events & POLLIN
+            } else {
+                0
+            }
+        }
+        Some(Resolved::Epoll) => 0,
+        Some(Resolved::File { .. }) | Some(Resolved::Dir) => events & (POLLIN | POLLOUT),
+    }
+}
+pub fn sys_poll(fds: u64, nfds: u64, timeout: u64) -> Result<u64, Errno> {
+    const SZ: u64 = 8;
+    if nfds > 1024 {
+        return Err(Errno::EINVAL);
+    }
+    check_user_ptr(fds, nfds.checked_mul(SZ).ok_or(Errno::EINVAL)?)?;
+    let ms = timeout as i64;
+    let deadline = if ms < 0 {
+        None
+    } else {
+        Some(crate::task::scheduler::ticks().saturating_add((ms as u64).saturating_add(9) / 10))
+    };
+    loop {
+        let mut ready = 0;
+        for i in 0..nfds {
+            let p = fds + i * SZ;
+            let fd = unsafe { *(p as *const i32) };
+            let ev = unsafe { *((p + 4) as *const i16) };
+            let rev = poll_revents(fd, ev);
+            unsafe { *((p + 6) as *mut i16) = rev }
+            if rev != 0 {
+                ready += 1
+            }
+        }
+        if ready != 0 || ms == 0 {
+            return Ok(ready);
+        }
+        if let Some(end) = deadline {
+            if crate::task::scheduler::ticks() >= end {
+                return Ok(0);
+            }
+        }
+        crate::task::scheduler::yield_current()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Minimal select/pselect6/ppoll (nr 23/270/271). GNU
@@ -1967,8 +2296,19 @@ fn select_ready(fd: u64, want_write: bool) -> bool {
         Some(Resolved::Console) => true,
         Some(Resolved::PipeRead(e)) => !want_write && (e.read_ready() || e.peer_closed()),
         Some(Resolved::PipeWrite(e)) => want_write && (e.write_ready() || e.peer_closed()),
-        Some(Resolved::Socket { rx, tx }) => if want_write { tx.write_ready() || tx.peer_closed() } else { rx.read_ready() || rx.peer_closed() },
-        Some(Resolved::Eventfd { val, .. }) => !want_write && { let v=val.lock(); *v>0 },
+        Some(Resolved::Socket { rx, tx }) => {
+            if want_write {
+                tx.write_ready() || tx.peer_closed()
+            } else {
+                rx.read_ready() || rx.peer_closed()
+            }
+        }
+        Some(Resolved::Eventfd { val, .. }) => {
+            !want_write && {
+                let v = val.lock();
+                *v > 0
+            }
+        }
         Some(Resolved::Epoll) => false,
         Some(Resolved::File { .. }) | Some(Resolved::Dir) => true,
     }
@@ -2151,7 +2491,8 @@ fn write_statx(buf: u64, size: u64, mode: u32, ino: u64) {
         core::ptr::write_unaligned((buf + 0x1c) as *mut u16, mode as u16); // stx_mode
         core::ptr::write_unaligned((buf + 0x20) as *mut u64, ino); // stx_ino
         core::ptr::write_unaligned((buf + 0x28) as *mut u64, size); // stx_size
-        core::ptr::write_unaligned((buf + 0x30) as *mut u64, (size + 511) / 512); // stx_blocks
+        core::ptr::write_unaligned((buf + 0x30) as *mut u64, (size + 511) / 512);
+        // stx_blocks
     }
 }
 
@@ -2167,19 +2508,38 @@ pub fn sys_statx(dirfd: u64, path: u64, flags: u64, _mask: u64, buf: u64) -> Res
         return match resolve_fd(dirfd as u32) {
             None => Err(Errno::EBADF),
             Some(Resolved::File { node, .. }) => {
-                let ino = match node.fs_ino() { 0 => synth_ino(node.name()), ino => ino };
+                let ino = match node.fs_ino() {
+                    0 => synth_ino(node.name()),
+                    ino => ino,
+                };
                 write_statx(buf, node.size(), S_IFREG | DEFAULT_FILE_PERMS, ino);
                 Ok(0)
             }
-            Some(Resolved::Dir) => { write_statx(buf, 0, S_IFDIR | 0o700, 1); Ok(0) }
-            Some(Resolved::Socket { .. }) => { write_statx(buf, 0, S_IFSOCK | 0o666, 1); Ok(0) }
-            Some(_) => { write_statx(buf, 0, S_IFCHR | 0o620, 1); Ok(0) }
+            Some(Resolved::Dir) => {
+                write_statx(buf, 0, S_IFDIR | 0o700, 1);
+                Ok(0)
+            }
+            Some(Resolved::Socket { .. }) => {
+                write_statx(buf, 0, S_IFSOCK | 0o666, 1);
+                Ok(0)
+            }
+            Some(_) => {
+                write_statx(buf, 0, S_IFCHR | 0o620, 1);
+                Ok(0)
+            }
         };
     }
     let abs = resolve_path(&p);
     let node = vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
-    let mode = if node.is_directory() { S_IFDIR | 0o700 } else { S_IFREG | DEFAULT_FILE_PERMS };
-    let ino = match node.fs_ino() { 0 => synth_ino(node.name()), ino => ino };
+    let mode = if node.is_directory() {
+        S_IFDIR | 0o700
+    } else {
+        S_IFREG | DEFAULT_FILE_PERMS
+    };
+    let ino = match node.fs_ino() {
+        0 => synth_ino(node.name()),
+        ino => ino,
+    };
     write_statx(buf, node.size(), mode, ino);
     Ok(0)
 }

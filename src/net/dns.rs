@@ -2,8 +2,8 @@
 //!
 //! This is the **pure** core of the resolver (the effectful socket pump lives in
 //! [`crate::net::resolve`]). Like [`crate::net::http`] it is `core` + `alloc`
-//! only — no smoltcp sockets, no globals, no hardware — and deliberately speaks
-//! in plain byte slices and `[u8; 4]` octets rather than any `smoltcp` wire type,
+//! only — no sockets, no globals, no hardware — and deliberately speaks
+//! in plain byte slices and `[u8; 4]` octets rather than any stack wire type,
 //! so it compiles unchanged into the `host-tests` crate via a `#[path]` include
 //! and the parser can be property-tested on the host.
 //!
@@ -16,6 +16,8 @@ use alloc::vec::Vec;
 
 /// DNS QTYPE for an IPv4 address (A) record.
 pub const QTYPE_A: u16 = 1;
+/// DNS QTYPE for an IPv6 address (AAAA) record.
+pub const QTYPE_AAAA: u16 = 28;
 /// DNS QCLASS for the Internet (IN).
 pub const QCLASS_IN: u16 = 1;
 
@@ -35,6 +37,12 @@ const MAX_NAME_STEPS: usize = 128;
 /// a label longer than 63 bytes, or a total encoded name longer than 255 bytes.
 /// Pure and panic-free.
 pub fn build_dns_query(id: u16, hostname: &str, out: &mut Vec<u8>) -> bool {
+    build_dns_query_typed(id, hostname, QTYPE_A, out)
+}
+
+/// Same as [`build_dns_query`] but with an explicit question type
+/// ([`QTYPE_A`] or [`QTYPE_AAAA`]).
+pub fn build_dns_query_typed(id: u16, hostname: &str, qtype: u16, out: &mut Vec<u8>) -> bool {
     out.clear();
 
     if hostname.is_empty() {
@@ -70,7 +78,7 @@ pub fn build_dns_query(id: u16, hostname: &str, out: &mut Vec<u8>) -> bool {
     out.push(0);
 
     // QTYPE, QCLASS.
-    out.extend_from_slice(&QTYPE_A.to_be_bytes());
+    out.extend_from_slice(&qtype.to_be_bytes());
     out.extend_from_slice(&QCLASS_IN.to_be_bytes());
     true
 }
@@ -134,6 +142,61 @@ pub fn parse_dns_a_response(buf: &[u8], expected_id: u16) -> Option<[u8; 4]> {
         }
         if rtype == QTYPE_A && rdlength == 4 {
             return Some([buf[rdata], buf[rdata + 1], buf[rdata + 2], buf[rdata + 3]]);
+        }
+        pos = rdata_end;
+    }
+
+    None
+}
+
+/// Parse the first AAAA-record (IPv6) answer out of a DNS response in `buf`.
+///
+/// Same validation rules as [`parse_dns_a_response`]; the answer's RDATA must
+/// be exactly 16 bytes.
+pub fn parse_dns_aaaa_response(buf: &[u8], expected_id: u16) -> Option<[u8; 16]> {
+    if buf.len() < 12 {
+        return None;
+    }
+
+    let id = u16::from_be_bytes([buf[0], buf[1]]);
+    if id != expected_id {
+        return None;
+    }
+
+    let flags = u16::from_be_bytes([buf[2], buf[3]]);
+    if flags & 0x8000 == 0 || flags & 0x000F != 0 {
+        return None;
+    }
+
+    let qdcount = u16::from_be_bytes([buf[4], buf[5]]);
+    let ancount = u16::from_be_bytes([buf[6], buf[7]]);
+
+    let mut pos = 12usize;
+    for _ in 0..qdcount {
+        pos = skip_name(buf, pos)?;
+        pos = pos.checked_add(4)?;
+        if pos > buf.len() {
+            return None;
+        }
+    }
+
+    for _ in 0..ancount {
+        pos = skip_name(buf, pos)?;
+        let fields_end = pos.checked_add(10)?;
+        if fields_end > buf.len() {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+        let rdlength = u16::from_be_bytes([buf[pos + 8], buf[pos + 9]]) as usize;
+        let rdata = fields_end;
+        let rdata_end = rdata.checked_add(rdlength)?;
+        if rdata_end > buf.len() {
+            return None;
+        }
+        if rtype == QTYPE_AAAA && rdlength == 16 {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&buf[rdata..rdata_end]);
+            return Some(octets);
         }
         pos = rdata_end;
     }
