@@ -1144,21 +1144,17 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
             crate::shell::keys::CTRL_C_LATCH.store(false, Ordering::Relaxed);
             crate::drivers::ps2_kbd::CTRL_C.store(false, Ordering::Relaxed);
             crate::drivers::ps2_kbd::FG_PID.store(pid, Ordering::Relaxed);
-            crate::warn!("[DIAG] fg: watching pid={}", pid);
             let mut heartbeats: u64 = 0;
             while crate::task::compat::compat_exists(pid) {
                 let pressed = crate::shell::keys::CTRL_C_LATCH.swap(false, Ordering::Relaxed)
                     | crate::drivers::ps2_kbd::CTRL_C.swap(false, Ordering::Relaxed);
                 if pressed {
-                    crate::warn!("[DIAG] fg: ^C -> exit pid={}", pid);
                     shell_println("^C");
                     crate::task::scheduler::request_exit(pid);
                     break;
                 }
                 heartbeats += 1;
-                if heartbeats % 20000 == 0 {
-                    crate::warn!("[DIAG] fg: still waiting pid={}", pid);
-                }
+                if heartbeats % 20000 == 0 {}
                 crate::task::scheduler::yield_current();
             }
             // Foreground program is gone — clear the ^C kill target.

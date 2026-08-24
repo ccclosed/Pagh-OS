@@ -301,70 +301,15 @@ extern "x86-interrupt" fn page_fault_handler(
         crate::debug::unwind::stack_scan_backtrace(rsp, 8192);
         crate::arch::cpu::halt_loop();
     }
-    // A ring-3 page fault must not take the
-    // machine down. Print post-mortem context and the top of the *user*
-    // stack (return-address candidates for symbolizing the crash), then kill
-    // only the faulting Compat_Process and keep the kernel running.
+    // A ring-3 page fault must not take the machine down: report one concise
+    // SIGSEGV line and kill only the faulting Compat_Process.
     let pid = crate::task::scheduler::current_pid();
     crate::error!(
-        "[EXC #14] current pid={} last_dispatch: pid={} nr={}",
+        "[EXC #14] SIGSEGV pid={} addr=0x{:016x} RIP=0x{:016x}",
         pid,
-        LAST_SYSCALL_PID.load(core::sync::atomic::Ordering::Relaxed),
-        LAST_SYSCALL_NR.load(core::sync::atomic::Ordering::Relaxed)
+        fault_addr.as_u64(),
+        stack.instruction_pointer.as_u64()
     );
-    // Which address space was live, and at which level does
-    // the translation of the faulting address (and of RIP) break?
-    crate::error!(
-        "[EXC #14] CR3=0x{:016x}",
-        crate::memory::vmm::current_pml4_phys()
-    );
-    crate::memory::vmm::dump_translation(fault_addr.as_u64());
-    crate::memory::vmm::dump_translation(stack.instruction_pointer.as_u64());
-    // COW hint: a write to a present-but-read-only user page is exactly what
-    // an unimplemented copy-on-write fork would produce. If fork ever switches
-    // from eager copying to shared RO frames, THIS is where the break-up
-    // (copy + remap writable) belongs instead of killing the task.
-    if error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE)
-        && error_code.contains(PageFaultErrorCode::USER_MODE)
-    {
-        if let Some(pte) = crate::memory::vmm::walk_pte(fault_addr.as_u64()) {
-            let writable = pte
-                .flags()
-                .contains(x86_64::structures::paging::PageTableFlags::WRITABLE);
-            let present = pte
-                .flags()
-                .contains(x86_64::structures::paging::PageTableFlags::PRESENT);
-            // Write to a present-but-RO user page is a genuine fault.
-            // We do NOT fix up the PTE: that would defeat RELRO and make
-            // .text writable. Diagnose and kill instead. The root cause
-            // (VmRegionSet not shared between CLONE_VM threads) is tracked
-            // as a separate work item.
-            if present && !writable {
-                crate::error!(
-                    "[EXC #14] write to RO user page — RELRO/ld.so region? \
-                     killing pid {} (fix: share VmRegionSet across CLONE_VM threads)",
-                    pid
-                );
-            }
-            crate::error!(
-                "[EXC #14] COW check: PTE present={}, writable={}",
-                present,
-                writable
-            );
-        }
-    }
-    crate::error!("--- Top 24 words of user stack (rsp=0x{:x}) ---", rsp);
-    let mut i = 0u64;
-    while i < 24 {
-        let addr = rsp.wrapping_add(i * 8);
-        if crate::memory::vmm::virt_to_phys(addr).is_none() {
-            crate::error!("  [rsp+0x{:02x}] <unmapped>", i * 8);
-        } else {
-            let val = unsafe { core::ptr::read_volatile(addr as *const u64) };
-            crate::error!("  [rsp+0x{:02x}] 0x{:016x}", i * 8, val);
-        }
-        i += 1;
-    }
     if crate::task::compat::compat_exists(pid) {
         crate::task::compat::with_current_compat(|cs| cs.exit_code = Some(139));
         crate::error!(

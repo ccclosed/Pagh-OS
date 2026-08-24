@@ -201,12 +201,6 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             check_user_ptr(a[1], a[2].min(1 << 20))?;
             let mut buf = alloc::vec![0u8; a[2] as usize];
             let (n, src) = crate::arch::x86_64::linux::inet_sock::udp_recvfrom_fd(a[0], &mut buf)?;
-            crate::warn!(
-                "[DIAG] recvfrom(fd={}) -> {} bytes (src {}) to userspace",
-                a[0],
-                n,
-                src.addr
-            );
             crate::arch::x86_64::linux::io_sys::copy_out_pub(a[1], &buf[..n]);
             if a[4] != 0 && a[5] != 0 {
                 match src.addr {
@@ -380,13 +374,9 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
 
     let (nr, args) = abi::marshal_args(r.rax, r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9);
 
-    // #GP post-mortem context + syscall trace for pid >= 4 (compat processes)
+    // #GP post-mortem context (last dispatched syscall) bookkeeping.
     let cur_pid = crate::task::scheduler::current_pid();
     crate::arch::x86_64::idt::note_syscall(cur_pid, nr);
-    if cur_pid >= 4 && nr != 228 {
-        // Log every syscall except clock_gettime (too noisy).
-        crate::warn!("[SYSCALL] pid={} nr={}", cur_pid, nr);
-    }
 
     // ── 1. Precedence shim: native tasks keep the legacy pagh-native routing ──
     // A process WITH compat state is a Linux Compat_Process and bypasses this,

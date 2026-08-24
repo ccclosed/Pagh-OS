@@ -206,7 +206,7 @@ pub fn sys_exit_group(code: u64) -> ! {
     scheduler::remove_ready_pids(&others);
     compat::with_current_compat(|cs| cs.exit_code = Some(byte));
     super::process_sys::cleanup_current_thread_exit();
-    crate::info!("[linux] thread-group {} exited with code {}", tgid, byte);
+    crate::debug!("[linux] thread-group {} exited with code {}", tgid, byte);
     scheduler::exit_current()
 }
 

@@ -147,12 +147,7 @@ pub fn sys_futex(
                 return Err(Errno::EAGAIN);
             }
             let deadline = timeout_deadline(timeout)?;
-            crate::warn!(
-                "[DIAG] futex WAIT addr=0x{:x} expect={} timeout={:?}",
-                uaddr,
-                val,
-                timeout
-            );
+
             let queue_key = key(uaddr);
             let ticket = register_waiter(queue_key, bitset);
 
@@ -189,9 +184,7 @@ pub fn sys_futex(
             };
             let _ = load_word(uaddr)?;
             let n = wake_waiters(key(uaddr), val, bitset);
-            if n > 0 {
-                crate::warn!("[DIAG] futex WAKE addr=0x{:x} woke {}", uaddr, n);
-            }
+            if n > 0 {}
             Ok(n)
         }
         _ => Err(Errno::ENOSYS),
@@ -343,10 +336,7 @@ pub fn sys_clone(
 ) -> Result<u64, Errno> {
     if flags & (CLONE_VM | CLONE_THREAD) == (CLONE_VM | CLONE_THREAD) {
         if flags & !CLONE_SUPPORTED != 0 {
-            crate::warn!(
-                "[DIAG] clone(thread): unsupported flags {:#x} -> ENOSYS",
-                flags
-            );
+            crate::debug!("[clone] unsupported thread flags {:#x} -> ENOSYS", flags);
             return Err(Errno::ENOSYS);
         }
         // Default stack = the caller's user RSP from the per-task slot at +120
@@ -366,11 +356,7 @@ pub fn sys_clone(
         }
         let child =
             crate::task::process::spawn_linux_thread(regs, stack).map_err(|_| Errno::ENOMEM)?;
-        crate::warn!(
-            "[DIAG] clone: thread tid={} in pid={}",
-            child,
-            crate::task::scheduler::current_pid()
-        );
+
         let tls_value = if flags & CLONE_SETTLS != 0 {
             Some(tls)
         } else {
@@ -394,10 +380,7 @@ pub fn sys_clone(
     }
     // ── fork path ──
     if flags & (CLONE_VM | CLONE_VFORK) != 0 || flags & !FORK_SUPPORTED != 0 {
-        crate::warn!(
-            "[DIAG] clone(fork): unsupported flags {:#x} -> ENOSYS",
-            flags
-        );
+        crate::debug!("[clone] unsupported fork flags {:#x} -> ENOSYS", flags);
         return Err(Errno::ENOSYS);
     }
     if child_stack != 0 {
@@ -490,9 +473,6 @@ pub fn cleanup_thread_exit(pid: u64) {
 }
 pub fn cleanup_current_thread_exit() {
     let pid = crate::task::scheduler::current_pid();
-    crate::warn!(
-        "[DIAG] thread-exit pid={} clearing child_tid + waking joiner",
-        pid
-    );
+
     cleanup_thread_exit(pid)
 }

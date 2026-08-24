@@ -358,14 +358,7 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         Some(Resolved::PipeRead(e)) => {
             let mut data = vec![0u8; count as usize];
             let n = read_pipe(&e, &mut data)?;
-            if n > 0 {
-                crate::warn!(
-                    "[DIAG] pipe-read pid={} fd={} n={}",
-                    crate::task::scheduler::current_pid(),
-                    fd,
-                    n
-                );
-            }
+            if n > 0 {}
             copy_out(buf, &data[..n]);
             Ok(n as u64)
         }
@@ -443,13 +436,7 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         }
         Some(Resolved::PipeWrite(e)) => {
             let data = copy_in(buf, count);
-            crate::warn!(
-                "[DIAG] pipe-write pid={} fd={} len={} head={:?}",
-                crate::task::scheduler::current_pid(),
-                fd,
-                count,
-                String::from_utf8_lossy(&data[..data.len().min(32)])
-            );
+
             Ok(write_pipe(&e, &data)? as u64)
         }
         Some(Resolved::Socket { tx, .. }) => {
@@ -546,12 +533,6 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
                 total += len;
             }
             Resolved::PipeWrite(e) => {
-                crate::warn!(
-                    "[DIAG] pipe-write pid={} fd={} len={} (writev)",
-                    crate::task::scheduler::current_pid(),
-                    fd,
-                    data.len()
-                );
                 let n = write_pipe(e, &data)?;
                 total += n as u64;
                 if n < data.len() {
@@ -841,22 +822,12 @@ pub fn sys_openat(dirfd: u64, path: u64, flags: u64, _mode: u64) -> Result<u64, 
 /// `close` (3): release the descriptor, or `EBADF` if it is not open (R2.6, R2.14).
 pub fn sys_close(fd: u64) -> Result<u64, Errno> {
     let kind = fd_kind(fd);
-    if kind == "inet-udp" {
-        crate::warn!("[DIAG] close inet-udp fd={}", fd);
-    }
+    if kind == "inet-udp" {}
     if kind == "inet-tcp" {
-        crate::warn!("[DIAG] close inet-tcp fd={}", fd);
         crate::arch::x86_64::linux::inet_sock::tcp_close_fd(fd);
     }
     let kind = fd_kind(fd);
-    if kind.starts_with("pipe") {
-        crate::warn!(
-            "[DIAG] close pid={} fd={} ({})",
-            crate::task::scheduler::current_pid(),
-            fd,
-            kind
-        );
-    }
+    if kind.starts_with("pipe") {}
     // NOTE: we deliberately do NOT remove the UDP socket here. Any path
     // that takes NET.lock from a syscall handler risks deadlock (spinlocks
     // disable IF; the net thread can't run to release its side). The leaked
@@ -1032,12 +1003,7 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
     if request == FIONBIO {
         check_user_ptr(arg, 4)?;
         let on = unsafe { core::ptr::read_unaligned(arg as *const u32) } != 0;
-        crate::warn!(
-            "[DIAG] ioctl FIONBIO pid={} fd={} on={}",
-            crate::task::scheduler::current_pid(),
-            fd,
-            on
-        );
+
         return compat::with_current_compat(|cs| {
             let obj = cs.fds.get_mut(fd as u32).ok_or(Errno::EBADF)?;
             match obj {
@@ -1071,14 +1037,7 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
             // Tty probes (isatty and friends) on non-tty fds are
             // routine noise; any OTHER unknown request is a compat-surface gap
             // worth seeing on screen.
-            if !(0x5401..=0x5420).contains(&request) {
-                crate::warn!(
-                    "[DIAG] ioctl pid={} fd={} req=0x{:x} -> ENOTTY",
-                    crate::task::scheduler::current_pid(),
-                    fd,
-                    request
-                );
-            }
+            if !(0x5401..=0x5420).contains(&request) {}
             Err(Errno::ENOTTY)
         }
     }
@@ -1158,14 +1117,7 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
                                                // whether the kernel must echo typed characters itself.
                 let echo = c_lflag & 0x08 != 0;
                 crate::task::compat::with_current_compat(|cs| {
-                    if cs.raw_mode != raw || cs.echo != echo {
-                        crate::warn!(
-                            "[DIAG] tty: raw_mode={} echo={} pid={}",
-                            raw,
-                            echo,
-                            crate::task::scheduler::current_pid()
-                        );
-                    }
+                    if cs.raw_mode != raw || cs.echo != echo {}
                     cs.raw_mode = raw;
                     cs.echo = echo;
                 });
@@ -1230,14 +1182,7 @@ static DIAG_STDIN_EAGAIN: core::sync::atomic::AtomicBool =
 fn diag_count(ctr: &core::sync::atomic::AtomicU64, label: &str, n: u64, step: u64) {
     let old = ctr.fetch_add(n, core::sync::atomic::Ordering::Relaxed);
     let new = old + n;
-    if old == 0 || old / step != new / step {
-        crate::warn!(
-            "[DIAG] {} pid={} total={}",
-            label,
-            crate::task::scheduler::current_pid(),
-            new
-        );
-    }
+    if old == 0 || old / step != new / step {}
 }
 /// Hard cap so a pathological paste cannot grow the cooked line unbounded.
 const STDIN_LINE_MAX: usize = 4096;
@@ -1263,7 +1208,6 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
     {
         let resp = crate::drivers::vt::take_input_responses();
         if !resp.is_empty() {
-            crate::warn!("[DIAG] stdin: injected {} query-reply bytes", resp.len());
             STDIN_PENDING.lock().extend_from_slice(&resp);
         }
     }
@@ -1293,11 +1237,7 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
                 if STDIN_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed)
                     && (!consumed_any || spins > 200)
                 {
-                    if !DIAG_STDIN_EAGAIN.swap(true, core::sync::atomic::Ordering::Relaxed) {
-                        crate::warn!(
-                            "[DIAG] stdin: nonblocking read -> first EAGAIN (uv loop is polling)"
-                        );
-                    }
+                    if !DIAG_STDIN_EAGAIN.swap(true, core::sync::atomic::Ordering::Relaxed) {}
                     return Err(Errno::EAGAIN);
                 }
                 spins += 1;
@@ -1788,19 +1728,7 @@ pub fn sys_dup(oldfd: u64) -> Result<u64, Errno> {
         .map(|fd| fd as u64);
     // Nvim dup()s its stdio before hiding it behind stderr;
     // an EBADF here means fd 0/1 were already gone when the server started.
-    match &r {
-        Ok(fd) => crate::warn!(
-            "[DIAG] dup pid={} oldfd={} -> {}",
-            crate::task::scheduler::current_pid(),
-            oldfd,
-            fd
-        ),
-        Err(_) => crate::warn!(
-            "[DIAG] dup pid={} oldfd={} -> EBADF",
-            crate::task::scheduler::current_pid(),
-            oldfd
-        ),
-    }
+    let _ = &r;
     r
 }
 
@@ -1810,12 +1738,7 @@ pub fn sys_dup(oldfd: u64) -> Result<u64, Errno> {
 pub fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, Errno> {
     // Stdio rewiring during spawn is exactly where a lost
     // nvim RPC channel would hide; dup2/dup3 are rare enough to log each call.
-    crate::warn!(
-        "[DIAG] dup2 pid={} oldfd={} newfd={}",
-        crate::task::scheduler::current_pid(),
-        oldfd,
-        newfd
-    );
+
     compat::with_current_compat(|cs| {
         // `oldfd` must be valid regardless.
         if cs.fds.get(oldfd as u32).is_none() {
@@ -1834,13 +1757,6 @@ pub fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, Errno> {
 /// `dup3` (292): like `dup2` but `oldfd == newfd` is an error (`EINVAL`) and the
 /// only accepted flag is `O_CLOEXEC` (ignored here). `EBADF` if `oldfd` is invalid.
 pub fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> Result<u64, Errno> {
-    crate::warn!(
-        "[DIAG] dup3 pid={} oldfd={} newfd={} flags=0x{:x}",
-        crate::task::scheduler::current_pid(),
-        oldfd,
-        newfd,
-        flags
-    );
     if oldfd == newfd {
         return Err(Errno::EINVAL);
     }
@@ -1878,15 +1794,7 @@ const F_DUPFD_CLOEXEC: u64 = 1030;
 ///   * anything else → `EINVAL`.
 pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
     // Libuv's child-init shuffles stdio fds with F_DUPFD.
-    if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC {
-        crate::warn!(
-            "[DIAG] fcntl_dupfd pid={} fd={} min={} cloexec={}",
-            crate::task::scheduler::current_pid(),
-            fd,
-            arg,
-            cmd == F_DUPFD_CLOEXEC
-        );
-    }
+    if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC {}
     const FD_CLOEXEC: u64 = 1;
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => compat::with_current_compat(|cs| {
@@ -1951,7 +1859,6 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
                         OpenObject::UnixSocketUnbound { nonblocking } => *nonblocking = on,
                         // Libuv flips O_NONBLOCK on the raw tty.
                         OpenObject::Stdin => {
-                            crate::warn!("[DIAG] fcntl: stdin O_NONBLOCK={}", on);
                             STDIN_NONBLOCK.store(on, core::sync::atomic::Ordering::Relaxed);
                         }
                         _ => {}
@@ -2172,12 +2079,7 @@ pub fn sys_pipe2(pipefd: u64, flags: u64) -> Result<u64, Errno> {
         p
     })
     .ok_or(Errno::EBADF)?;
-    crate::warn!(
-        "[DIAG] pipe pid={} -> r={} w={}",
-        crate::task::scheduler::current_pid(),
-        pair.0,
-        pair.1
-    );
+
     let words = [pair.0, pair.1];
     let bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, 8) };
     copy_out(pipefd, bytes);

@@ -438,12 +438,7 @@ impl FdTable {
         let fa = self.alloc(a);
         let fb = self.alloc(b);
         // Which descriptor numbers the RPC channel ends get.
-        crate::warn!(
-            "[DIAG] socketpair pid={} -> ({},{})",
-            crate::task::scheduler::current_pid(),
-            fa,
-            fb
-        );
+
         (fa, fb)
     }
 }

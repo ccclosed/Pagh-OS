@@ -400,9 +400,7 @@ pub fn net_thread() {
         polls += 1;
         // Heartbeat: if this line stops appearing while the system hangs,
         // the net thread (or the scheduler feeding it ticks) is dead.
-        if polls.is_multiple_of(crate::arch::x86_64::apic::TICK_HZ * 5) {
-            crate::warn!("[DIAG] net thread alive, polls={}", polls);
-        }
+        if polls.is_multiple_of(crate::arch::x86_64::apic::TICK_HZ * 5) {}
         scheduler::sleep_ticks(1);
     }
 }

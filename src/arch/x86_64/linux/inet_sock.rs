@@ -112,12 +112,7 @@ pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
     if base != SOCK_STREAM && base != SOCK_DGRAM {
         return Err(Errno::EINVAL);
     }
-    crate::warn!(
-        "[DIAG] inet socket domain={} type={} -> {}",
-        domain,
-        ty,
-        if base == SOCK_STREAM { "tcp" } else { "udp" }
-    );
+
     let nonblocking = ty & SOCK_NONBLOCK != 0;
     let cloexec = ty & SOCK_CLOEXEC != 0;
     compat::with_current_compat(|cs| match base {
@@ -285,12 +280,7 @@ pub fn udp_connect_fd(fd: u64, addr: u64, len: u64) -> Result<u64, Errno> {
 pub fn udp_write_fd(fd: u64, data: &[u8]) -> Result<usize, Errno> {
     let sock = udp_sock(fd)?;
     let peer = sock.peer.lock().ok_or(Errno::ENOTCONN)?;
-    crate::warn!(
-        "[DIAG] udp write(fd) fd={} -> {:?} len={}",
-        fd,
-        peer,
-        data.len()
-    );
+
     net::udp_sendto(sock.handle, data, peer)
         .map(|_| data.len())
         .map_err(|_| Errno::EIO)
@@ -312,12 +302,7 @@ fn udp_sock(fd: u64) -> Result<Arc<InetUdp>, Errno> {
 pub fn udp_sendto_fd(fd: u64, data: &[u8], addr: u64, len: u64) -> Result<usize, Errno> {
     let sock = udp_sock(fd)?;
     let ep = parse_sockaddr_ep(addr, len)?;
-    crate::warn!(
-        "[DIAG] udp sendto(fd) fd={} -> {} len={}",
-        fd,
-        ep,
-        data.len()
-    );
+
     net::udp_sendto(sock.handle, data, ep)
         .map(|_| data.len())
         .map_err(|_| Errno::EIO)
@@ -327,9 +312,7 @@ pub fn udp_sendto_fd(fd: u64, data: &[u8], addr: u64, len: u64) -> Result<usize,
 pub fn udp_recvfrom_fd(fd: u64, dst: &mut [u8]) -> Result<(usize, IpEndpoint), Errno> {
     let sock = udp_sock(fd)?;
     static RECV_LOGGED: AtomicU32 = AtomicU32::new(0);
-    if RECV_LOGGED.fetch_or(1 << (fd.min(31)), Ordering::Relaxed) & (1 << (fd.min(31))) == 0 {
-        crate::warn!("[DIAG] udp recvfrom fd={} blocking (first)", fd);
-    }
+    if RECV_LOGGED.fetch_or(1 << (fd.min(31)), Ordering::Relaxed) & (1 << (fd.min(31))) == 0 {}
     let deadline_spins: u32 = 5000;
     let mut spins = 0u32;
     loop {

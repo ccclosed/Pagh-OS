@@ -636,13 +636,7 @@ pub fn exec_linux_image(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<Ex
                 st.fds.describe_fd(1),
                 st.fds.describe_fd(2),
             ];
-            crate::warn!(
-                "[DIAG] execve pid={} fd0={} fd1={} fd2={}",
-                pid,
-                st.exec_stdio[0],
-                st.exec_stdio[1],
-                st.exec_stdio[2]
-            );
+
             st.exe_path = resolved.clone();
         })
         .ok_or(RunError::LoadFailed("execve without compat state"))?;
