@@ -640,17 +640,13 @@ pub fn resolve(hostname: &str) -> Option<IpAddr> {
     }
 
     let server = dns_server()?;
-    let prefer_v6 = NET
-        .lock()
-        .as_ref()
-        .map(|s| s.cidr6.is_some())
-        .unwrap_or(false);
 
-    let order: [(u16, bool); 2] = if prefer_v6 {
-        [(dns::QTYPE_AAAA, true), (dns::QTYPE_A, false)]
-    } else {
-        [(dns::QTYPE_A, false), (dns::QTYPE_AAAA, true)]
-    };
+    // IPv4 FIRST. QEMU user-mode networking (slirp) advertises RAs and answers
+    // AAAA queries but does NOT route outbound IPv6, so AAAA-first resolution
+    // sent apt/TLS into a black hole (regression introduced with dual-stack).
+    // AAAA remains the fallback when a name has no A record, and explicit
+    // IPv6 endpoints connect fine.
+    let order: [(u16, bool); 2] = [(dns::QTYPE_A, false), (dns::QTYPE_AAAA, true)];
 
     for (qtype, _) in order {
         if let Some(found) = dns_query_once(server, hostname, qtype) {
