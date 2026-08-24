@@ -33,6 +33,14 @@ use alloc::vec::Vec;
 use super::wire::{self, tcp_build, tcp_parse, IpAddr, IpEndpoint};
 use super::Stack;
 
+/// Delayed-ACK policy (RFC 1123 §4.2.3.1 permits holding one segment's ACK):
+/// emit an ACK every `N` in-order segments. Each outgoing frame is a VM exit
+/// under QEMU, so halving the ACK rate measurably increases throughput; the
+/// tail guard below bounds any hold-off to [`TAIL_ACK_DELAY_TICKS`].
+const ACK_EVERY_N: u8 = 2;
+/// Max ticks an in-order segment may wait for a coalesced ACK.
+const TAIL_ACK_DELAY_TICKS: u64 = 16;
+
 /// Maximum segment size we announce/use (Ethernet MTU 1500 - IP 20 - TCP 20).
 const MSS: usize = 1460;
 /// Peer MSS default when the option is absent (RFC 1122 minimum).
@@ -127,6 +135,14 @@ pub struct TcpSock {
 
     // Bookkeeping
     ever_established: bool,
+    /// In-order segments received since the last emitted ACK.
+    unacked_segs: u8,
+    /// Tick of the last emitted ACK (tail-guard for the delayed-ACK policy).
+    last_ack_tick: u64,
+    /// Free space at the moment the last segment advertised a window.
+    last_adv_free: usize,
+    /// App drained enough buffer to warrant an immediate window-update ACK.
+    wnd_update_pending: bool,
     refused: bool,
 
     // SACK (RFC 2013/2883)
@@ -183,6 +199,10 @@ impl TcpSock {
             rx_cap,
             ooo: Vec::new(),
             ever_established: false,
+            unacked_segs: 0,
+            last_ack_tick: 0,
+            last_adv_free: 0,
+            wnd_update_pending: false,
             refused: false,
             sack_ok: false,
             offered_sack: true,
@@ -292,11 +312,20 @@ impl TcpSock {
         n
     }
 
-    /// Drain received bytes into `dst`. Returns bytes copied.
+    /// Drain received bytes into `dst`. Returns bytes copied. Flags a
+    /// window-update ACK when the app freed a meaningful chunk of the receive
+    /// buffer — otherwise the peer only learns the window reopened after its
+    /// (multi-second) persist probe.
     pub fn recv_slice(&mut self, dst: &mut [u8]) -> usize {
         let n = core::cmp::min(dst.len(), self.rx.len());
         for slot in dst.iter_mut().take(n) {
             *slot = self.rx.pop_front().unwrap_or(0);
+        }
+        if n > 0 && !self.wnd_update_pending {
+            let free = self.rx_cap - self.rx.len();
+            if free.saturating_sub(self.last_adv_free) >= self.rx_cap / 4 {
+                self.wnd_update_pending = true;
+            }
         }
         n
     }
@@ -631,7 +660,7 @@ impl TcpTable {
 
 /// Emit one segment for socket `h`.
 fn emit(st: &mut Stack, h: usize, seq: u32, ack: u32, flags: u8, opts: &[u8], payload: &[u8]) {
-    let Some(s) = st.tcp.get(h) else { return };
+    let Some(s) = st.tcp.get_mut(h) else { return };
     // Source family follows the remote: a v6 peer answers from our v6 address.
     let src_addr = match s.remote.addr {
         IpAddr::V4(_) => IpAddr::V4(
@@ -657,6 +686,7 @@ fn emit(st: &mut Stack, h: usize, seq: u32, ack: u32, flags: u8, opts: &[u8], pa
     let src = IpEndpoint::new(src_addr, s.local_port);
     let dst = s.remote;
     let wnd = s.rcv_wnd_field();
+    s.last_adv_free = s.rx_cap - s.rx.len();
     let seg = tcp_build(src, dst, seq, ack, flags, wnd, opts, payload);
     let now = crate::task::scheduler::ticks();
     super::ip::output(st, None, dst.addr, wire::PROTO_TCP, &seg, now);
@@ -1037,7 +1067,19 @@ fn accept_stream(st: &mut Stack, h: usize, seq: u32, body: &[u8], fin: bool) -> 
             s.peer_fin_seq = Some(seq.wrapping_add(body.len() as u32));
             s.peer_fin_seen = true;
         }
-        After::SendAck
+        s.unacked_segs = s.unacked_segs.wrapping_add(1);
+        if s.unacked_segs >= ACK_EVERY_N {
+            s.unacked_segs = 0;
+            s.last_ack_tick = crate::task::scheduler::ticks();
+            let ack_no = s.rcv_nxt;
+            let opts = ack_options_with_sack(s);
+            let snd = s.snd_nxt;
+            drop(s);
+            emit(st, h, snd, ack_no, wire::TCP_ACK, &opts, &[]);
+            After::Nothing
+        } else {
+            After::SendAck
+        }
     } else if seq_lt(rcv, seq) {
         // Future segment: store out-of-order if it plausibly fits the flow.
         let off = seq.wrapping_sub(rcv) as usize;
@@ -1123,6 +1165,44 @@ fn consume_fin_and_ooo(st: &mut Stack, h: usize) {
 
 fn step_sock(st: &mut Stack, h: usize, now: u64) {
     timer_step(st, h, now);
+
+    // Tail guard: never hold a lone segment's ACK longer than the delay bound.
+    {
+        let due = st
+            .tcp
+            .get(h)
+            .map(|s| s.unacked_segs > 0 && now >= s.last_ack_tick + TAIL_ACK_DELAY_TICKS)
+            .unwrap_or(false);
+        if due {
+            let ack_no = st.tcp.get(h).unwrap().rcv_nxt;
+            let snd = st.tcp.get(h).unwrap().snd_nxt;
+            emit(st, h, snd, ack_no, wire::TCP_ACK, &no_opts(), &[]);
+            let s = st.tcp.get_mut(h).unwrap();
+            s.unacked_segs = 0;
+            s.last_ack_tick = now;
+        }
+    }
+
+    // Window update after application reads: without this the peer learns the
+    // window reopened only via its own persist timer (seconds of stall).
+    {
+        let fire = st
+            .tcp
+            .get(h)
+            .map(|s| s.wnd_update_pending && s.state.is_data_state())
+            .unwrap_or(false);
+        if fire {
+            let ack_no = st.tcp.get(h).unwrap().rcv_nxt;
+            let snd = st.tcp.get(h).unwrap().snd_nxt;
+            let opts = no_opts();
+            emit(st, h, snd, ack_no, wire::TCP_ACK, &opts, &[]);
+            let s = st.tcp.get_mut(h).unwrap();
+            s.wnd_update_pending = false;
+            s.last_adv_free = s.rx_cap - s.rx.len();
+            s.unacked_segs = 0;
+            s.last_ack_tick = now;
+        }
+    }
 
     let (state, ctrl_needed) = match st.tcp.get(h) {
         Some(s) => (s.state, s.ctrl_needs_send),

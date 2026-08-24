@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "pagh"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "acpi",
  "bitflags 2.13.0",
