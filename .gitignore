@@ -84,3 +84,4 @@ pagh_mcp.py
 # Host-built Rust userspace examples
 /rust-apps/**/target/
 /rust-apps/out/
+pagh-2.0.3.iso
