@@ -219,10 +219,26 @@ fn init_vfs() {
 fn init_fs() {
     use crate::fs::ext2::Ext2Fs;
 
-    let blk = match drivers::get_block("virtio-blk0") {
+    // Storage priority: virtio-blk first (QEMU/dev images), NVMe fallback for
+    // real machines with an NVMe SSD.
+    let mut blk = match drivers::get_block("virtio-blk0") {
+        Some(b) => Some(b),
+        None => {
+            let devices = crate::drivers::pci::enumerate();
+            match crate::drivers::nvme::attach(&devices) {
+                Ok(true) => {
+                    crate::drivers::nvme::register_block_device();
+                    info!("fs: using NVMe block device");
+                }
+                _ => {}
+            }
+            drivers::get_block("nvme0")
+        }
+    };
+    let blk = match blk.take() {
         Some(b) => b,
         None => {
-            warn!("fs: no virtio-blk device; /mnt not mounted");
+            warn!("fs: no virtio-blk or NVMe device; /mnt not mounted");
             info!("fs (no disk)");
             return;
         }

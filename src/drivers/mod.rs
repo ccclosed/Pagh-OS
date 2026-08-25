@@ -4,6 +4,7 @@
 pub mod cursor;
 pub mod e1000;
 pub mod framebuffer;
+pub mod nvme;
 pub mod pci;
 pub mod ps2_kbd;
 pub mod ps2_mouse;
