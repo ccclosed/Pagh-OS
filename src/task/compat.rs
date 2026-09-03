@@ -16,7 +16,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::arch::x86_64::linux::mem::VmRegionSet;
 use crate::sync::spinlock::Spinlock;
@@ -68,6 +68,18 @@ pub struct CompatState {
     /// close-on-exec sweep). The spawn-time [DIAG] lines are wiped by the
     /// TUI screen clear, so the watchdog re-prints this snapshot instead.
     pub exec_stdio: [&'static str; 3],
+    /// Per-process rlimit overrides set via `prlimit64`/`setrlimit` (resource
+    /// id -> (soft, hard)). Resources absent here fall back to the kernel
+    /// defaults (`misc::default_rlimit`); `fork`/`clone` inherit the table.
+    pub rlimits: BTreeMap<u64, (u64, u64)>,
+    /// The process's file-mode creation mask (`umask(2)`); applied to the
+    /// permission bits of freshly created files/directories.
+    pub umask: u32,
+    /// Permission-bit overrides keyed by VFS inode identity (`fs_ino`, or the
+    /// FNV fallback for synthetic nodes). Written by `chmod` and at creation
+    /// time (default mode masked by `umask`); consulted by `stat`-family
+    /// handlers when reporting `st_mode`. Forked/cloned children inherit it.
+    pub mode_overrides: BTreeMap<u64, u32>,
 }
 
 impl CompatState {
@@ -103,6 +115,9 @@ impl CompatState {
             exit_code: None,
             exe_path: String::new(),
             exec_stdio: ["?", "?", "?"],
+            rlimits: BTreeMap::new(),
+            umask: 0o022,
+            mode_overrides: BTreeMap::new(),
         }
     }
 }
@@ -119,12 +134,11 @@ impl CompatState {
 // `nosys_logged` set). A field on the transient `Tcb` therefore cannot be the
 // owner of that state.
 //
-// We resolve this with a global registry keyed by pid. This registry — NOT the
-// `Option<CompatState>` field still present on `Tcb` — is the authoritative home
-// of a Compat_Process's Linux state while it runs. The `Tcb.compat` field is left
-// in place (it is harmless and `None` for every native task) but is not used by
-// the dispatcher/handlers; the registry is consulted instead via
-// [`with_current_compat`].
+// We resolve this with a global registry keyed by pid. This registry — NOT any
+// field on the transient `Tcb` (the field was removed: the `Tcb` is rebuilt
+// from the saved RSP on every tick and can never carry authoritative state) —
+// is the authoritative home of a Compat_Process's Linux state while it runs.
+// It is consulted via [`with_current_compat`].
 //
 // `run_linux_binary` (task 13.3) calls [`install_compat`] to register a freshly
 // launched process's state; [`remove_compat`] tears it down. `exit_current`
@@ -326,6 +340,23 @@ pub fn current_has_compat() -> bool {
 /// into [`with_current_compat`] (which would deadlock on the same lock).
 pub fn with_current_compat<R>(f: impl FnOnce(&mut CompatState) -> R) -> Option<R> {
     let pid = super::scheduler::current_pid();
-    let mut guard = COMPAT_STATES.lock();
-    guard.get_mut(&pid).map(f)
+    COMPAT_DEPTH.fetch_add(1, Ordering::Relaxed);
+    let out = {
+        let mut guard = COMPAT_STATES.lock();
+        guard.get_mut(&pid).map(f)
+    };
+    COMPAT_DEPTH.fetch_sub(1, Ordering::Relaxed);
+    out
+}
+
+/// Reentrance depth of [`with_current_compat`] on this (single) CPU. The
+/// page-fault handler consults it: a fault raised INSIDE a
+/// `with_current_compat` closure (kernel code touching user memory under the
+/// lock) must not re-enter the registry — the spinlock is not reentrant and a
+/// second `lock()` would deadlock the CPU.
+static COMPAT_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether the current context is already inside [`with_current_compat`].
+pub fn compat_lock_held() -> bool {
+    COMPAT_DEPTH.load(Ordering::Relaxed) > 0
 }

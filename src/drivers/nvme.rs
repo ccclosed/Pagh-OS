@@ -240,8 +240,14 @@ impl NvmeCtrl {
             };
             let e = cq_base + head as usize * core::mem::size_of::<CqEntry>();
             let status = unsafe { ptr::read_volatile((e + 14) as *const u16) };
-            let expected_phase = 1u16;
-            if (status & 1) == expected_phase {
+            // The controller inverts the phase tag on every CQ wrap; track it
+            // per queue (starting phase is 1 because the host zeroes the CQ).
+            let expected_phase = if qid == 0 {
+                self.cq_phase_admin
+            } else {
+                self.cq_phase_io
+            };
+            if u32::from(status & 1) == expected_phase {
                 let dw0 = unsafe { ptr::read_volatile(e as *const u32) };
                 // Advance head (wrapping); invert the phase tag on wrap.
                 let new_head = (head + 1) % cq_entries;

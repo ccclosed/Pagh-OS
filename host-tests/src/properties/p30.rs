@@ -53,7 +53,7 @@ fn parser_is_bounds_safe_on_truncation_and_pointers() {
     assert!(build_dns_query(0x1234, "deb.debian.org", &mut q));
     let resp = build_a_response(&q, [151, 101, 0, 1]);
     for len in 0..resp.len() {
-        let _ = parse_dns_a_response(&resp[..len], 0x1234);
+        let _ = parse_dns_a_response(&resp[..len], 0x1234, "deb.debian.org");
     }
 
     // A pointer that loops to itself must terminate (bounded) and return None,
@@ -66,12 +66,31 @@ fn parser_is_bounds_safe_on_truncation_and_pointers() {
     let here = loopy.len();
     loopy.push(0xC0);
     loopy.push((here & 0xFF) as u8); // points at itself
-    assert_eq!(parse_dns_a_response(&loopy, 0x1234), None);
+    assert_eq!(parse_dns_a_response(&loopy, 0x1234, "deb.debian.org"), None);
 
     // NXDOMAIN (RCODE=3) -> None even if an answer is present.
     let mut nx = build_a_response(&q, [1, 2, 3, 4]);
     nx[3] = 0x83; // RA=1, RCODE=3 (NXDOMAIN)
-    assert_eq!(parse_dns_a_response(&nx, 0x1234), None);
+    assert_eq!(parse_dns_a_response(&nx, 0x1234, "deb.debian.org"), None);
+}
+
+/// Flip `query` into a response whose question section was tampered with
+/// (first label replaced): the parser must reject it — an answer to a
+/// different question is not our answer.
+#[test]
+fn parser_rejects_mismatched_question() {
+    let mut q = Vec::new();
+    assert!(build_dns_query(0x1234, "deb.debian.org", &mut q));
+    let mut resp = build_a_response(&q, [151, 101, 0, 1]);
+    // The first QNAME label ("deb") starts at offset 12 (1 length byte + text).
+    resp[13] = b'x';
+    assert_eq!(parse_dns_a_response(&resp, 0x1234, "deb.debian.org"), None);
+
+    // Same bytes parse fine when the expected name matches the tampered label.
+    assert_eq!(
+        parse_dns_a_response(&resp, 0x1234, "xeb.debian.org"),
+        Some([151, 101, 0, 1])
+    );
 }
 
 proptest! {
@@ -99,15 +118,15 @@ proptest! {
 
         // Correct round trip.
         let resp = build_a_response(&q, addr);
-        prop_assert_eq!(parse_dns_a_response(&resp, id), Some(addr));
+        prop_assert_eq!(parse_dns_a_response(&resp, id, &host), Some(addr));
 
         // Wrong expected id -> None.
-        prop_assert_eq!(parse_dns_a_response(&resp, id.wrapping_add(1)), None);
+        prop_assert_eq!(parse_dns_a_response(&resp, id.wrapping_add(1), &host), None);
 
         // The query itself is not a response (QR clear) -> None.
-        prop_assert_eq!(parse_dns_a_response(&q, id), None);
+        prop_assert_eq!(parse_dns_a_response(&q, id, &host), None);
 
         // Arbitrary garbage never panics (result is ignored).
-        let _ = parse_dns_a_response(&garbage, id);
+        let _ = parse_dns_a_response(&garbage, id, &host);
     }
 }

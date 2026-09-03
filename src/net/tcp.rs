@@ -358,10 +358,13 @@ impl TcpSock {
     }
 
     /// Advertised receive-window field for the next outgoing segment.
+    ///
+    /// A fully-full receive buffer advertises 0 honestly (the peer must then
+    /// stop and probe); a window update ACK follows once the app drains `rx`.
     fn rcv_wnd_field(&self) -> u16 {
         let free = self.rx_cap - self.rx.len();
         if self.rcv_scale > 0 {
-            (((free >> self.rcv_scale) as u32).max(1)).min(u16::MAX as u32) as u16
+            ((free >> self.rcv_scale) as u32).min(u16::MAX as u32) as u16
         } else {
             free.min(u16::MAX as usize) as u16
         }
@@ -515,6 +518,16 @@ impl TcpTable {
             .iter()
             .flatten()
             .any(|s| s.local_port == port && s.state != State::Closed)
+    }
+
+    /// Number of half-open (SYN-RCVD) children of the listener on `port`.
+    /// Used as the accept-backlog occupancy for SYN admission control.
+    pub(crate) fn half_open_for(&self, port: u16) -> usize {
+        self.socks
+            .iter()
+            .flatten()
+            .filter(|s| s.state == State::SynRcvd && s.local_port == port)
+            .count()
     }
 
     /// Open an active connection. The SYN goes out on the next poll.
@@ -744,6 +757,11 @@ fn ack_options_with_sack(s: &TcpSock) -> alloc::vec::Vec<u8> {
 
 // ─── Listener path ───────────────────────────────────────────────────────────
 
+/// Maximum simultaneously half-open (SYN-RCVD) children per listener. Excess
+/// SYNs are silently dropped — the peer retransmits, giving the backlog time
+/// to drain — so a SYN flood cannot allocate unbounded sockets.
+const LISTEN_BACKLOG: usize = 16;
+
 /// Answer a bare SYN by creating a child socket in SYN-RCVD + SYN-ACK.
 fn listener_input(
     st: &mut Stack,
@@ -757,6 +775,15 @@ fn listener_input(
         return; // listeners only react to bare SYNs
     }
     let port = st.tcp.get(listener_idx).unwrap().local_port;
+    if st.tcp.half_open_for(port) >= LISTEN_BACKLOG {
+        crate::debug!(
+            "[TCP] listener :{} backlog full ({} half-open) - dropping SYN from {}",
+            port,
+            LISTEN_BACKLOG,
+            src_ep
+        );
+        return;
+    }
     let iss = super::random_u32();
 
     let child_idx = {
@@ -799,10 +826,34 @@ fn connected_input(
     body: &[u8],
     now: u64,
 ) {
-    // RST: tear down unconditionally (seq validity checks are advisory here).
+    // RST: RFC 5961-style validation (simplified) — a blind reset must not
+    // tear down the connection. In SYN-SENT the RST is accepted only when its
+    // ack number acknowledges our SYN (iss+1); otherwise only when its
+    // sequence number falls inside our receive window
+    // [rcv_nxt - rcv_wnd, rcv_nxt + rcv_wnd). Anything else is dropped.
     if hdr.flags & wire::TCP_RST != 0 {
+        let (acceptable, ever_established) = {
+            let s = st.tcp.get(h).unwrap();
+            if s.state == State::SynSent {
+                (hdr.ack == s.iss.wrapping_add(1), s.ever_established)
+            } else {
+                let wnd = (s.rcv_wnd_field() as u32) << s.rcv_scale;
+                let in_window = !seq_lt(hdr.seq, s.rcv_nxt.wrapping_sub(wnd))
+                    && seq_lt(hdr.seq, s.rcv_nxt.wrapping_add(wnd));
+                (in_window, s.ever_established)
+            }
+        };
+        if !acceptable {
+            crate::debug!(
+                "[TCP] dropped invalid RST (seq=0x{:08x} ack=0x{:08x}) from {}",
+                hdr.seq,
+                hdr.ack,
+                _src_ep
+            );
+            return;
+        }
         let s = st.tcp.get_mut(h).unwrap();
-        if !s.ever_established {
+        if !ever_established {
             s.refused = true;
         }
         s.state = State::Closed; // reaped at poll end
@@ -1437,10 +1488,13 @@ fn timer_step(st: &mut Stack, h: usize, now: u64) {
                 );
             }
         } else if s.snd_wnd == 0 && !s.tx.is_empty() {
-            // Persist probe: one byte past the closed window elicits a window
-            // update ACK from the peer.
+            // Persist probe: retransmit the byte AT snd_una (the front of the
+            // send queue) to elicit a window-update ACK from the peer. The
+            // sequence number must match that byte's position — probing with
+            // snd_nxt instead would corrupt the stream if the peer accepted
+            // it.
             let b = s.tx.front().copied().unwrap_or(0);
-            let seq = s.snd_nxt;
+            let seq = s.snd_una;
             let ack_no = s.rcv_nxt;
             emit(st, h, seq, ack_no, wire::TCP_ACK, &[], &[b]);
         }

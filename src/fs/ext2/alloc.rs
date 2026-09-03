@@ -96,7 +96,11 @@ pub fn free_block(
     gd: &mut Ext2GroupDesc,
     block: u32,
 ) {
-    let bit = block - sb.s_first_data_block;
+    // A block below s_first_data_block would wrap around and free a bogus
+    // bit (silent corruption on garbage pointers) — ignore it instead.
+    let Some(bit) = block.checked_sub(sb.s_first_data_block) else {
+        return;
+    };
     if clear_bit(block_bitmap, bit) {
         sb.s_free_blocks_count += 1;
         gd.bg_free_blocks_count += 1;

@@ -143,6 +143,9 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::CONNECT => {
             // Peek the sockaddr family to pick the stack (AF_UNIX registry vs AF_INET own stack).
             let fam = if a[1] != 0 && a[2] >= 2 {
+                // SAFETY: 2-byte user read behind check_user_ptr-style bounds guard
+                // (a[2] >= 2) on a syscall-supplied buffer; unaligned read of the
+                // sa_family field only, never dereferenced past 2 bytes.
                 (unsafe { core::ptr::read_unaligned(a[1] as *const u16) }) as u64
             } else {
                 1
@@ -210,6 +213,9 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
                         sa[0..2].copy_from_slice(&2u16.to_ne_bytes());
                         sa[2..4].copy_from_slice(&src.port.to_be_bytes());
                         sa[4..8].copy_from_slice(&v4.octets());
+                        // SAFETY: addrlen (a[5]) != 0 checked above; fixed 16-byte
+                        // struct write + 4-byte socklen_t write into user memory
+                        // at syscall-supplied pointers, both unaligned-tolerant.
                         unsafe {
                             core::ptr::write_unaligned(a[4] as *mut [u8; 16], sa);
                             core::ptr::write_unaligned(a[5] as *mut u32, 16);
@@ -222,6 +228,9 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
                         sa[0..2].copy_from_slice(&10u16.to_ne_bytes());
                         sa[2..4].copy_from_slice(&src.port.to_be_bytes());
                         sa[8..24].copy_from_slice(&v6.octets());
+                        // SAFETY: addrlen (a[5]) != 0 checked above; fixed 28-byte
+                        // struct write + 4-byte socklen_t write into user memory
+                        // at syscall-supplied pointers, both unaligned-tolerant.
                         unsafe {
                             core::ptr::write_unaligned(a[4] as *mut [u8; 28], sa);
                             core::ptr::write_unaligned(a[5] as *mut u32, 28);

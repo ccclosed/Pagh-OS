@@ -419,7 +419,8 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             check_user_ptr(buf, 8)?;
             // SAFETY: validated above
             let add = unsafe { core::ptr::read_unaligned(buf as *const u64) };
-            *val.lock() = val.lock().saturating_add(add);
+            let mut count = val.lock();
+            *count = count.saturating_add(add);
             Ok(8)
         }
         Some(Resolved::Epoll) => Err(Errno::EINVAL),
@@ -483,7 +484,8 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
         return Err(Errno::EBADF);
     }
     if matches!(target, Resolved::InetTcp(_)) {
-        // gather-write straight into the TCP socket
+        // gather-write straight into the TCP socket; report the total
+        let mut total: u64 = 0;
         for i in 0..iovcnt {
             let entry = iov + i * 16;
             let base = unsafe { *(entry as *const u64) };
@@ -493,9 +495,13 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
             }
             check_user_ptr(base, len)?;
             let data = copy_in(base, len);
-            crate::arch::x86_64::linux::inet_sock::tcp_write(fd, &data)?;
+            let n = crate::arch::x86_64::linux::inet_sock::tcp_write(fd, &data)?;
+            total += n as u64;
+            if (n as u64) < len {
+                break;
+            }
         }
-        return Ok(0);
+        return Ok(total);
     }
     if matches!(target, Resolved::Dir) {
         return Err(Errno::EISDIR);
@@ -562,10 +568,10 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
     Ok(total)
 }
 
-/// `readv` (19) — vectored read. Delegates to `sys_read` on the
-/// first non-empty iovec: a short count is a legal readv result and callers
-/// (glibc stdio, libuv) loop for the rest, so this inherits sys_read's per-fd
-/// blocking semantics without duplicating them.
+/// `readv` (19) — vectored read. Fills iovecs in order, stopping on a short
+/// read or an error (a short count is a legal readv result); callers
+/// (glibc stdio, libuv) loop for the rest. The per-call scalar primitive
+/// inherits sys_read's blocking semantics.
 pub fn sys_readv(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
     const IOV_SIZE: u64 = 16;
     const IOV_MAX: u64 = 1024;
@@ -576,6 +582,7 @@ pub fn sys_readv(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     check_user_ptr(iov, iovcnt * IOV_SIZE)?;
+    let mut total: u64 = 0;
     for i in 0..iovcnt {
         let entry = iov + i * IOV_SIZE;
         // SAFETY: the whole iovec array range was validated above.
@@ -584,9 +591,13 @@ pub fn sys_readv(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
         if len == 0 {
             continue;
         }
-        return sys_read(fd, base, len);
+        let n = sys_read(fd, base, len)?;
+        total += n;
+        if n < len {
+            break;
+        }
     }
-    Ok(0)
+    Ok(total)
 }
 
 /// `preadv` (295) — positional vectored read; first non-empty
@@ -601,6 +612,7 @@ pub fn sys_preadv(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, Er
         return Err(Errno::EINVAL);
     }
     check_user_ptr(iov, iovcnt * IOV_SIZE)?;
+    let mut total: u64 = 0;
     for i in 0..iovcnt {
         let entry = iov + i * IOV_SIZE;
         // SAFETY: the whole iovec array range was validated above.
@@ -609,9 +621,13 @@ pub fn sys_preadv(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, Er
         if len == 0 {
             continue;
         }
-        return sys_pread64(fd, base, len, offset);
+        let n = sys_pread64(fd, base, len, offset + total)?;
+        total += n;
+        if n < len {
+            break;
+        }
     }
-    Ok(0)
+    Ok(total)
 }
 
 /// `pwritev` (296) — positional vectored write; first non-empty
@@ -626,6 +642,7 @@ pub fn sys_pwritev(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, E
         return Err(Errno::EINVAL);
     }
     check_user_ptr(iov, iovcnt * IOV_SIZE)?;
+    let mut total: u64 = 0;
     for i in 0..iovcnt {
         let entry = iov + i * IOV_SIZE;
         // SAFETY: the whole iovec array range was validated above.
@@ -634,9 +651,13 @@ pub fn sys_pwritev(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, E
         if len == 0 {
             continue;
         }
-        return sys_pwrite64(fd, base, len, offset);
+        let n = sys_pwrite64(fd, base, len, offset + total)?;
+        total += n;
+        if n < len {
+            break;
+        }
     }
-    Ok(0)
+    Ok(total)
 }
 
 /// `fsync`/`fdatasync` (74/75). nvim fsyncs the ShaDa file on
@@ -777,7 +798,7 @@ fn open_path(path: &str, flags: u64) -> Result<u64, Errno> {
                 return Err(Errno::EINVAL);
             }
             let dir = vfs::lookup_path(parent).map_err(|_| Errno::ENOENT)?;
-            dir.create_file(name).map_err(|e| {
+            let created = dir.create_file(name).map_err(|e| {
                 crate::warn!(
                     "[linux] open(O_CREAT) failed: {:?} parent={} name={}",
                     e,
@@ -786,6 +807,9 @@ fn open_path(path: &str, flags: u64) -> Result<u64, Errno> {
                 );
                 Errno::EIO
             })?;
+            // Record the creation mode (default perms masked by the process
+            // umask) so stat-family handlers report it.
+            record_mode_override(node_ino(&created), DEFAULT_FILE_PERMS & !current_umask());
         }
     }
     open_resolved(&abs)
@@ -890,13 +914,59 @@ fn synth_ino(name: &str) -> u64 {
     h | (1 << 63)
 }
 
+/// The stat-identity inode of `node`: its filesystem ino when it has one, the
+/// synthetic FNV fallback otherwise. This is the key `mode_overrides` is
+/// indexed by, so it must match what `write_stat`/`write_statx` report.
+fn node_ino(node: &Arc<dyn VfsNode>) -> u64 {
+    match node.fs_ino() {
+        0 => synth_ino(node.name()),
+        ino => ino,
+    }
+}
+
+/// The per-process permission-bit override recorded for `ino` (via `chmod` or
+/// at creation time), if any.
+fn mode_override_perms(ino: u64) -> Option<u32> {
+    compat::with_current_compat(|cs| cs.mode_overrides.get(&ino).copied()).flatten()
+}
+
+/// The current process's umask (022 for native tasks without compat state).
+fn current_umask() -> u32 {
+    compat::with_current_compat(|cs| cs.umask).unwrap_or(0o022)
+}
+
+/// Record `perms` (0o7777 bits) for `ino` in the current process's mode
+/// overrides.
+fn record_mode_override(ino: u64, perms: u32) {
+    compat::with_current_compat(|cs| {
+        cs.mode_overrides.insert(ino, perms);
+    });
+}
+
+/// `st_mode` permission bits for `node`: the per-process override when one was
+/// recorded, else the long-standing defaults (0755 files / 0700 dirs —
+/// everything runs as root, and apt-installed programs need the X bits).
+fn stat_mode_for(node: &Arc<dyn VfsNode>) -> u32 {
+    let perms = match mode_override_perms(node_ino(node)) {
+        Some(p) => p,
+        None => {
+            if node.is_directory() {
+                0o700
+            } else {
+                DEFAULT_FILE_PERMS
+            }
+        }
+    };
+    if node.is_directory() {
+        S_IFDIR | perms
+    } else {
+        S_IFREG | perms
+    }
+}
+
 /// Fill a [`LinuxStat`] for a node and copy it to the validated user buffer.
 fn write_stat(node: &Arc<dyn VfsNode>, statbuf: u64) -> Result<u64, Errno> {
-    let mode = if node.is_directory() {
-        S_IFDIR | 0o700
-    } else {
-        S_IFREG | DEFAULT_FILE_PERMS
-    };
+    let mode = stat_mode_for(node);
     let mut stat = encode_stat(node.size(), mode);
     // File identity matters. glibc's ld.so deduplicates loaded
     // shared objects by the (st_dev, st_ino) pair from `fstat`, and the main
@@ -906,10 +976,7 @@ fn write_stat(node: &Arc<dyn VfsNode>, statbuf: u64) -> Result<u64, Errno> {
     // startup died with "no version information available" spam followed by
     // undefined `__libc_start_main, version GLIBC_2.34` (exit 127).
     stat.st_dev = STAT_DEV_VFS;
-    stat.st_ino = match node.fs_ino() {
-        0 => synth_ino(node.name()),
-        ino => ino,
-    };
+    stat.st_ino = node_ino(node);
     stat.st_nlink = 1;
     stat.st_blocks = (stat.st_size + 511) / 512;
     write_stat_struct(&stat, statbuf);
@@ -1528,7 +1595,7 @@ pub fn sys_mkdir(path: u64, _mode: u64) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     let dir = vfs::lookup_path(parent).map_err(|_| Errno::ENOENT)?;
-    dir.create_dir(name).map_err(|e| {
+    let created = dir.create_dir(name).map_err(|e| {
         crate::error!(
             "[linux] mkdir failed: {:?} parent={} name={}",
             e,
@@ -1537,6 +1604,9 @@ pub fn sys_mkdir(path: u64, _mode: u64) -> Result<u64, Errno> {
         );
         Errno::EIO
     })?;
+    // Record the creation mode (default dir perms masked by the process
+    // umask) so stat-family handlers report it.
+    record_mode_override(node_ino(&created), 0o700 & !current_umask());
     Ok(0)
 }
 
@@ -1594,14 +1664,16 @@ pub fn sys_rmdir(path: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `chmod` (90): single-user system without a permission model — validate the
-/// path exists and accept-and-ignore the mode change, matching the other
-/// permission stubs (`flock`/`umask`). Programs that chmod their lock/config
-/// files (git) need the success so they can proceed.
-pub fn sys_chmod(path: u64, _mode: u64) -> Result<u64, Errno> {
+/// `chmod` (90): record the permission bits against the path's stat-identity
+/// inode so `stat`-family handlers report them. The VFS nodes themselves carry
+/// no persistable mode, so the override lives in the process's compat state
+/// (inherited by fork/clone). Programs that chmod their lock/config files
+/// (git) need the success so they can proceed.
+pub fn sys_chmod(path: u64, mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
-    vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
+    let node = vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
+    record_mode_override(node_ino(&node), (mode & 0o7777) as u32);
     Ok(0)
 }
 
@@ -1732,10 +1804,20 @@ pub fn sys_dup(oldfd: u64) -> Result<u64, Errno> {
     r
 }
 
+/// Upper bound for descriptor numbers (Linux's default RLIMIT_NOFILE soft limit).
+/// `dup2`/`dup3` must reject a `newfd` at or above this instead of growing the
+/// fd table to the (u32) requested index — a hostile or buggy `dup2(fd, 0x7FFFFFFF)`
+/// would otherwise attempt an ~8-billion-slot allocation and abort the kernel.
+pub const NOFILE_MAX: u64 = 1024;
+
 /// `dup2` (33): duplicate `oldfd` into the explicit descriptor `newfd`, closing
 /// whatever occupies `newfd` first. If `oldfd == newfd` and `oldfd` is valid, it is
-/// returned unchanged (no close); `EBADF` if `oldfd` is invalid.
+/// returned unchanged (no close); `EBADF` if `oldfd` is invalid; `EINVAL` when
+/// `newfd` exceeds the descriptor cap (RLIMIT_NOFILE-style bound).
 pub fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, Errno> {
+    if newfd >= NOFILE_MAX {
+        return Err(Errno::EINVAL);
+    }
     // Stdio rewiring during spawn is exactly where a lost
     // nvim RPC channel would hide; dup2/dup3 are rare enough to log each call.
 
@@ -1757,6 +1839,9 @@ pub fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, Errno> {
 /// `dup3` (292): like `dup2` but `oldfd == newfd` is an error (`EINVAL`) and the
 /// only accepted flag is `O_CLOEXEC` (ignored here). `EBADF` if `oldfd` is invalid.
 pub fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> Result<u64, Errno> {
+    if newfd >= NOFILE_MAX {
+        return Err(Errno::EINVAL);
+    }
     if oldfd == newfd {
         return Err(Errno::EINVAL);
     }
@@ -2000,30 +2085,49 @@ struct LinuxStatfs {
 /// ext2 superblock magic, reported in `f_type` so `df`-class probes recognize it.
 const EXT2_SUPER_MAGIC: i64 = 0xEF53;
 
-/// Build a plausible `statfs` snapshot from the PMM frame counts (used as a stand-
-/// in for filesystem capacity, which the VFS does not expose cheaply).
-fn build_statfs() -> LinuxStatfs {
-    let total = crate::memory::pmm::total_frames() as u64;
-    let free = crate::memory::pmm::free_frames() as u64;
-    LinuxStatfs {
-        f_type: EXT2_SUPER_MAGIC,
-        f_bsize: 4096,
-        f_blocks: total,
-        f_bfree: free,
-        f_bavail: free,
-        f_files: total,
-        f_ffree: free,
-        f_fsid: [0, 0],
-        f_namelen: 255,
-        f_frsize: 4096,
-        f_flags: 0,
-        f_spare: [0; 4],
+/// Build a `statfs` snapshot. When the node's filesystem reports capacity
+/// (`vfs::FsStat`, ext2), the real block/inode counts are used; otherwise the
+/// PMM frame counts stand in (ramfs, synthetic /dev nodes).
+fn build_statfs_for(fs: Option<vfs::FsStat>) -> LinuxStatfs {
+    match fs {
+        Some(fs) => LinuxStatfs {
+            f_type: EXT2_SUPER_MAGIC,
+            f_bsize: fs.block_size as i64,
+            f_blocks: fs.blocks_total,
+            f_bfree: fs.blocks_free,
+            f_bavail: fs.blocks_free,
+            f_files: fs.inodes_total,
+            f_ffree: fs.inodes_free,
+            f_fsid: [0, 0],
+            f_namelen: 255,
+            f_frsize: fs.block_size as i64,
+            f_flags: 0,
+            f_spare: [0; 4],
+        },
+        None => {
+            let total = crate::memory::pmm::total_frames() as u64;
+            let free = crate::memory::pmm::free_frames() as u64;
+            LinuxStatfs {
+                f_type: EXT2_SUPER_MAGIC,
+                f_bsize: 4096,
+                f_blocks: total,
+                f_bfree: free,
+                f_bavail: free,
+                f_files: total,
+                f_ffree: free,
+                f_fsid: [0, 0],
+                f_namelen: 255,
+                f_frsize: 4096,
+                f_flags: 0,
+                f_spare: [0; 4],
+            }
+        }
     }
 }
 
 /// Copy a built `statfs` to the validated user buffer.
-fn write_statfs(buf: u64) {
-    let sf = build_statfs();
+fn write_statfs(buf: u64, fs: Option<vfs::FsStat>) {
+    let sf = build_statfs_for(fs);
     let bytes = unsafe {
         core::slice::from_raw_parts(
             &sf as *const LinuxStatfs as *const u8,
@@ -2033,14 +2137,14 @@ fn write_statfs(buf: u64) {
     copy_out(buf, bytes);
 }
 
-/// `statfs` (137): fill the user `struct statfs` with plausible values for the
-/// path (which must exist, else `ENOENT`). Returns 0.
+/// `statfs` (137): fill the user `struct statfs` with the mounted filesystem's
+/// real capacity when available (which must exist, else `ENOENT`). Returns 0.
 pub fn sys_statfs(path: u64, buf: u64) -> Result<u64, Errno> {
     check_user_ptr(buf, core::mem::size_of::<LinuxStatfs>() as u64)?;
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
-    vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
-    write_statfs(buf);
+    let node = vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
+    write_statfs(buf, node.fs_stat());
     Ok(0)
 }
 
@@ -2048,10 +2152,12 @@ pub fn sys_statfs(path: u64, buf: u64) -> Result<u64, Errno> {
 /// must be valid, else `EBADF`). Returns 0.
 pub fn sys_fstatfs(fd: u64, buf: u64) -> Result<u64, Errno> {
     check_user_ptr(buf, core::mem::size_of::<LinuxStatfs>() as u64)?;
-    if resolve_fd(fd as u32).is_none() {
-        return Err(Errno::EBADF);
-    }
-    write_statfs(buf);
+    let fs = match resolve_fd(fd as u32) {
+        None => return Err(Errno::EBADF),
+        Some(Resolved::File { node, .. }) => node.fs_stat(),
+        _ => None,
+    };
+    write_statfs(buf, fs);
     Ok(0)
 }
 
@@ -2410,11 +2516,7 @@ pub fn sys_statx(dirfd: u64, path: u64, flags: u64, _mask: u64, buf: u64) -> Res
         return match resolve_fd(dirfd as u32) {
             None => Err(Errno::EBADF),
             Some(Resolved::File { node, .. }) => {
-                let ino = match node.fs_ino() {
-                    0 => synth_ino(node.name()),
-                    ino => ino,
-                };
-                write_statx(buf, node.size(), S_IFREG | DEFAULT_FILE_PERMS, ino);
+                write_statx(buf, node.size(), stat_mode_for(&node), node_ino(&node));
                 Ok(0)
             }
             Some(Resolved::Dir) => {
@@ -2433,15 +2535,8 @@ pub fn sys_statx(dirfd: u64, path: u64, flags: u64, _mask: u64, buf: u64) -> Res
     }
     let abs = resolve_path(&p);
     let node = vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
-    let mode = if node.is_directory() {
-        S_IFDIR | 0o700
-    } else {
-        S_IFREG | DEFAULT_FILE_PERMS
-    };
-    let ino = match node.fs_ino() {
-        0 => synth_ino(node.name()),
-        ino => ino,
-    };
+    let mode = stat_mode_for(&node);
+    let ino = node_ino(&node);
     write_statx(buf, node.size(), mode, ino);
     Ok(0)
 }

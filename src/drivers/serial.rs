@@ -53,6 +53,14 @@ fn port_write(addr: u16, value: u8) {
     }
 }
 
+/// Loop bound for the transmit-holding-empty wait. A healthy 115200-baud UART
+/// drains a byte in ~87 µs, well under this many status polls; a dead/stuck
+/// UART would otherwise hang the writer forever.
+const TX_RETRY_LIMIT: u32 = 1_000_000;
+/// Set once after a timed-out wait, so the condition is reported a single
+/// time instead of spamming the (possibly dead) console.
+static TX_TIMEOUT_WARNED: AtomicBool = AtomicBool::new(false);
+
 fn write_byte(b: u8) {
     // Mirror the previous `Option`-guarded behavior: do nothing until `init`
     // has brought COM1 up.
@@ -62,12 +70,20 @@ fn write_byte(b: u8) {
     // `Port<u8>` is a zero-cost wrapper over the port number; reconstructing it
     // from the fixed `COM1` base is equivalent to the previously-cached handle.
     let mut data: Port<u8> = Port::new(COM1);
-    // SAFETY: COM1 is a fixed, valid UART base. We spin until the line-status
-    // register reports the transmit-holding register is empty (bit 0x20), then
-    // write one byte to the data register, which is the correct 16550 TX
-    // protocol and carries no memory-safety hazard.
+    // SAFETY: COM1 is a fixed, valid UART base. We poll the line-status
+    // register until the transmit-holding register is empty (bit 0x20), then
+    // write one byte to the data register — the correct 16550 TX protocol,
+    // with a retry bound so a dead UART drops the byte instead of hanging.
     unsafe {
+        let mut tries = 0u32;
         while (port_read(COM1 + 5) & 0x20) == 0 {
+            tries += 1;
+            if tries >= TX_RETRY_LIMIT {
+                if !TX_TIMEOUT_WARNED.swap(true, Ordering::Relaxed) {
+                    crate::warn!("[SERIAL] COM1 TX stuck (LSR never idle); dropping byte");
+                }
+                return;
+            }
             core::hint::spin_loop();
         }
         data.write(b);

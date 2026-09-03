@@ -138,11 +138,6 @@ pub unsafe fn yield_switch() {
 
 extern "C" {
     pub fn kernel_thread_trampoline() -> !;
-    // retained: not called from Rust — referenced by name from the
-    // `kernel_thread_trampoline` global_asm block (`jmp scheduler_exit_thread`).
-    // The extern decl keeps the symbol in scope for the inline asm linkage.
-    #[allow(dead_code)]
-    fn scheduler_exit_thread() -> !;
 }
 
 core::arch::global_asm!(
@@ -158,20 +153,24 @@ core::arch::global_asm!(
     "    jmp scheduler_exit_thread",
 );
 
-core::arch::global_asm!(
-    ".global scheduler_exit_thread",
-    "scheduler_exit_thread:",
-    // Park a finished kernel thread WITH
-    // INTERRUPTS ENABLED. The old `cli` + `hlt` sequence halted the CPU with
-    // interrupts masked the moment any kernel thread returned (first hit by
-    // the boot provisioner finishing/giving up) -- on a single core that
-    // froze the entire machine: no timer, no scheduler, no shell. With
-    // `sti; hlt` the timer keeps firing, the parked thread merely burns one
-    // idle slice per scheduling round, and everything else keeps running.
-    "    sti",
-    "    hlt",
-    "    jmp scheduler_exit_thread",
-);
+/// A finished kernel thread parks here after its entry point returns
+/// (`kernel_thread_trampoline` jumps here by name). Marking the pid exiting
+/// lets the next timer tick drop it from rotation instead of requeueing it —
+/// the old `sti; hlt; jmp` spin requeued the dead frame every round forever.
+#[no_mangle]
+pub extern "C" fn scheduler_exit_thread() -> ! {
+    crate::task::scheduler::kernel_thread_finished();
+    // Park WITH INTERRUPTS ENABLED. The old `cli` + `hlt` sequence halted the
+    // CPU with interrupts masked the moment any kernel thread returned (first
+    // hit by the boot provisioner finishing/giving up) -- on a single core that
+    // froze the entire machine: no timer, no scheduler, no shell. With `sti;
+    // hlt` the timer keeps firing, and once the tick drops this task it is
+    // never restored again.
+    loop {
+        crate::arch::cpu::enable_interrupts();
+        crate::arch::cpu::halt();
+    }
+}
 
 // ─── Timer IRQ stub (preemptive context switch) ──────────────────────────
 

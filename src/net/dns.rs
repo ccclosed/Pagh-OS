@@ -83,15 +83,57 @@ pub fn build_dns_query_typed(id: u16, hostname: &str, qtype: u16, out: &mut Vec<
     true
 }
 
+/// Verify that the Question record starting at `pos` carries exactly the
+/// QNAME labels of `hostname` (byte-for-byte, as the query encoded them) plus
+/// QTYPE `qtype` / QCLASS IN. Returns the position just past the question.
+///
+/// A response whose question does not match the one we sent is not an answer
+/// to our query (off-path spoof or a stale/foreign reply) and must be
+/// rejected. A compression pointer inside the *question* of a response to a
+/// single-question query never occurs legitimately (the question starts at
+/// offset 12, nothing before it to point at) — treat it as a mismatch.
+fn verify_question(buf: &[u8], mut pos: usize, hostname: &str, qtype: u16) -> Option<usize> {
+    for label in hostname.split('.') {
+        let bytes = label.as_bytes();
+        if bytes.is_empty() || bytes.len() > 63 {
+            return None;
+        }
+        let len = *buf.get(pos)?;
+        if len & 0xC0 != 0 || len as usize != bytes.len() {
+            return None;
+        }
+        pos += 1;
+        if buf.get(pos..pos + bytes.len())? != bytes {
+            return None;
+        }
+        pos += bytes.len();
+    }
+    // Terminating root label, then QTYPE + QCLASS.
+    if *buf.get(pos)? != 0 {
+        return None;
+    }
+    pos += 1;
+    if buf.len() < pos + 4 {
+        return None;
+    }
+    let qt = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+    let qc = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]);
+    if qt != qtype || qc != QCLASS_IN {
+        return None;
+    }
+    Some(pos + 4)
+}
+
 /// Parse the first A-record (IPv4) answer out of a DNS response in `buf`.
 ///
 /// Returns `Some([a, b, c, d])` for the first answer RR whose TYPE is A and whose
 /// RDATA is exactly four bytes. Returns `None` on any of: a buffer shorter than
 /// the 12-byte header, a transaction-id mismatch with `expected_id`, a message
-/// that is not a response (QR clear), a non-zero RCODE (e.g. NXDOMAIN), no A
-/// answer present, or any malformed/truncated record. Never indexes past `buf`
-/// and never panics.
-pub fn parse_dns_a_response(buf: &[u8], expected_id: u16) -> Option<[u8; 4]> {
+/// that is not a response (QR clear), a non-zero RCODE (e.g. NXDOMAIN), a
+/// question section that does not exactly echo the `expected_name`/A question
+/// that was sent, no A answer present, or any malformed/truncated record. Never
+/// indexes past `buf` and never panics.
+pub fn parse_dns_a_response(buf: &[u8], expected_id: u16, expected_name: &str) -> Option<[u8; 4]> {
     if buf.len() < 12 {
         return None;
     }
@@ -114,16 +156,11 @@ pub fn parse_dns_a_response(buf: &[u8], expected_id: u16) -> Option<[u8; 4]> {
     let qdcount = u16::from_be_bytes([buf[4], buf[5]]);
     let ancount = u16::from_be_bytes([buf[6], buf[7]]);
 
-    let mut pos = 12usize;
-
-    // Skip the question section: NAME + QTYPE(2) + QCLASS(2).
-    for _ in 0..qdcount {
-        pos = skip_name(buf, pos)?;
-        pos = pos.checked_add(4)?;
-        if pos > buf.len() {
-            return None;
-        }
+    // We only ever send a single question; the response must echo exactly it.
+    if qdcount != 1 {
+        return None;
     }
+    let mut pos = verify_question(buf, 12, expected_name, QTYPE_A)?;
 
     // Walk the answer RRs looking for the first A record.
     for _ in 0..ancount {
@@ -153,7 +190,11 @@ pub fn parse_dns_a_response(buf: &[u8], expected_id: u16) -> Option<[u8; 4]> {
 ///
 /// Same validation rules as [`parse_dns_a_response`]; the answer's RDATA must
 /// be exactly 16 bytes.
-pub fn parse_dns_aaaa_response(buf: &[u8], expected_id: u16) -> Option<[u8; 16]> {
+pub fn parse_dns_aaaa_response(
+    buf: &[u8],
+    expected_id: u16,
+    expected_name: &str,
+) -> Option<[u8; 16]> {
     if buf.len() < 12 {
         return None;
     }
@@ -171,14 +212,10 @@ pub fn parse_dns_aaaa_response(buf: &[u8], expected_id: u16) -> Option<[u8; 16]>
     let qdcount = u16::from_be_bytes([buf[4], buf[5]]);
     let ancount = u16::from_be_bytes([buf[6], buf[7]]);
 
-    let mut pos = 12usize;
-    for _ in 0..qdcount {
-        pos = skip_name(buf, pos)?;
-        pos = pos.checked_add(4)?;
-        if pos > buf.len() {
-            return None;
-        }
+    if qdcount != 1 {
+        return None;
     }
+    let mut pos = verify_question(buf, 12, expected_name, QTYPE_AAAA)?;
 
     for _ in 0..ancount {
         pos = skip_name(buf, pos)?;

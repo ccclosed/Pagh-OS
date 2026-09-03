@@ -201,7 +201,7 @@ impl DhcpClient {
         DhcpClient {
             socket_opened: false,
             phase: Phase::Init,
-            xid: 0x3903_F326, // replaced with a tick-derived id at discovery
+            xid: 0x3903_F326, // placeholder; regenerated (random) at every discovery
             server_id: Ipv4Addr::UNSPECIFIED,
             retry_deadline: 0,
             t1_deadline: None,
@@ -233,6 +233,10 @@ impl DhcpClient {
                     st.udp.open(DHCP_CLIENT_PORT);
                     self.socket_opened = true;
                 }
+                // Fresh random xid for each discovery attempt (the constant
+                // default is predictable and survives across retries, letting
+                // a spoofed OFFER/ACK match a stale exchange).
+                self.xid = super::random_u32();
                 let mac = st.mac;
                 let pkt = dhcp_packet(
                     self.xid,

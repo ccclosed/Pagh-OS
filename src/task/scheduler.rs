@@ -1,7 +1,6 @@
 use crate::memory::{pmm, vmm};
 use crate::sync::spinlock::Spinlock;
-use crate::task::compat::CompatState;
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::structures::paging::PageTableFlags;
 
@@ -11,35 +10,29 @@ use x86_64::structures::paging::PageTableFlags;
 /// values are encoded in the kernel stack frame `kernel_thread_spawn` builds,
 /// not stored here.
 ///
-/// A `Tcb` additionally carries an optional [`CompatState`] (task 11.2). It is
-/// `None` for the existing pagh-native tasks (e.g. `spawn_test_user_process`)
-/// so they are unaffected, and `Some` only once `run_linux_binary` (task 13.3)
-/// populates the Linux-compatibility state for a `Compat_Process`. Because
-/// `CompatState` owns heap-backed tables (`FdTable`/`VmRegionSet`/`BTreeSet`),
-/// the `Tcb` is no longer `Copy`/`Clone`/`Debug`; it is moved through the
-/// scheduler queues by value, which the existing call sites already do.
+/// Linux-compatibility state is NOT carried here: the scheduler rebuilds the
+/// `Tcb` from `current_rsp` on every tick, so a heap-backed `CompatState` on
+/// the `Tcb` could never stay authoritative. The per-pid registry in
+/// `task::compat` (`COMPAT_STATES`) is the single source of truth for a
+/// running Compat_Process. The `Tcb` is moved through the scheduler queues by
+/// value, which the existing call sites already do.
 pub struct Tcb {
     pub pid: u64,
     /// The only state the switch restores from: the saved kernel stack pointer.
     pub kernel_rsp: u64,
     /// Physical address of this task's PML4 (reloaded into CR3 on switch).
     pub cr3: u64,
-    /// Linux-compatibility state for a `Compat_Process`; `None` for native tasks.
-    /// Read once `run_linux_binary` (task 13.3) populates it.
-    #[allow(dead_code)]
-    pub compat: Option<CompatState>,
 }
 
 impl Tcb {
-    /// Construct a ready native task with no compat state. The entry point is
-    /// not stored in the `Tcb`; it is baked into the constructed kernel stack
-    /// frame pointed to by `kernel_rsp` (see `kernel_thread_spawn`).
+    /// Construct a ready task. The entry point is not stored in the `Tcb`; it
+    /// is baked into the constructed kernel stack frame pointed to by
+    /// `kernel_rsp` (see `kernel_thread_spawn`).
     pub fn new(pid: u64, kernel_rsp: u64, cr3: u64) -> Self {
         Tcb {
             pid,
             kernel_rsp,
             cr3,
-            compat: None,
         }
     }
 }
@@ -88,20 +81,109 @@ static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 static CURRENT_PID: Spinlock<u64> = Spinlock::new(0);
 
-/// Sentinel meaning "no task is exiting" for [`EXITING_PID`]. `u64::MAX` is
-/// never a real pid (pids start at 1 and the idle task is `IDLE_PID == 0`).
-const NO_EXITING_PID: u64 = u64::MAX;
-
-/// PID of the task that has requested exit via [`exit_current`], or
-/// [`NO_EXITING_PID`] when none.
+/// Pids that have requested exit but have not yet been dropped by a tick.
 ///
 /// The scheduler stores the running task only as `CURRENT_PID` and rebuilds its
 /// `Tcb` from `current_rsp` on each tick, so "killing" a task is expressed as a
-/// single pid the tick handler must NOT requeue. When the timer tick is about
-/// to requeue the current task, it checks this flag: if it matches, the task is
-/// dropped from rotation (never scheduled again) and the flag is cleared
+/// pid the tick handler must NOT requeue. This is a *set*, not a single slot:
+/// two tasks can request exit between two ticks, and a one-slot sentinel would
+/// let the second store erase the first — leaving that task forever requeued in
+/// its halt loop (an unkillable zombie). When the timer tick is about to
+/// requeue the current task, it removes the pid from this set: removal both
+/// tests and clears the flag, so every pending exit is honoured exactly once
 /// (Requirement 12.4).
-static EXITING_PID: AtomicU64 = AtomicU64::new(NO_EXITING_PID);
+static EXITING_PIDS: Spinlock<BTreeSet<u64>> = Spinlock::new(BTreeSet::new());
+
+/// Mark `pid` as exiting: the next tick that sees it running will drop it from
+/// rotation instead of requeuing it.
+fn mark_exiting(pid: u64) {
+    EXITING_PIDS.lock().insert(pid);
+}
+
+/// Atomically test-and-clear the exiting mark for `pid`. Returns `true` when
+/// the pid was pending exit (and the caller must drop it from rotation).
+fn take_exiting(pid: u64) -> bool {
+    EXITING_PIDS.lock().remove(&pid)
+}
+
+/// Deferred exit-cleanup work for one dropped task (the reap registry).
+struct ExitReap {
+    /// The address space the task ran in (`current_pml4_phys()` captured by
+    /// the tick that dropped it). Freed here when it is a *private* user PML4
+    /// — i.e. neither the kernel PML4 nor shared with any other task.
+    cr3: u64,
+}
+
+/// Pids whose exit has been honoured by a tick but whose memory is not yet
+/// reclaimed. A task is recorded here by the very tick that drops it — which
+/// is still running ON that task's kernel stack, so the stack frames can only
+/// be freed from a later, unrelated context. One entry per tick is processed
+/// by [`reap_exited_tasks`] to bound the interrupt-disabled window.
+static PENDING_REAPS: Spinlock<BTreeMap<u64, ExitReap>> = Spinlock::new(BTreeMap::new());
+
+/// Queue a dropped task's memory for reclamation and release its frame-ledger
+/// stamp (its saved frame will never be restored again). Called from the tick
+/// that drops the task.
+fn pend_reap(pid: u64) {
+    let cr3 = vmm::current_pml4_phys();
+    PENDING_REAPS.lock().insert(pid, ExitReap { cr3 });
+    FRAME_LEDGER.lock().remove(&pid);
+}
+
+/// Reclaim the resources of ONE dropped task (oldest first): unmap and free
+/// its kernel-stack frames, free its private user address space (leaf frames,
+/// intermediate tables, PML4), and drop its frame-ledger entry.
+///
+/// Runs in timer-tick context with interrupts masked, so it processes at most
+/// one pid per call. The stack being freed always belongs to a task that was
+/// dropped on an EARLIER tick — the tick handler itself runs on some live
+/// task's stack — so nothing in use is ever released; the pid whose stack this
+/// handler is currently running on (the just-dropped task, if any) is skipped.
+///
+/// The user address space is freed only when exclusively owned: it is skipped
+/// when the PML4 is the kernel PML4, still installed in CR3 (threads of the
+/// same process), referenced by another queued task, or shared with another
+/// pending reap (the last departing thread frees it).
+fn reap_exited_tasks() {
+    let cur = current_pid();
+    let Some((pid, cr3)) = PENDING_REAPS
+        .lock()
+        .iter()
+        .find(|(p, _)| **p != cur)
+        .map(|(k, v)| (*k, v.cr3))
+    else {
+        return;
+    };
+
+    // Kernel stack: the per-pid slot pages that are actually mapped (the
+    // guard page is not). Kernel threads and processes both get one.
+    let (_guard, stack_base, _top) = crate::memory::layout::kernel_stack_for_pid(pid);
+    for page in 0..crate::memory::layout::KERNEL_STACK_PAGES {
+        let vaddr = stack_base + page * crate::memory::layout::PAGE_SIZE;
+        if let Some(phys) = vmm::virt_to_phys(vaddr) {
+            if vmm::unmap(vaddr).is_ok() {
+                pmm::free_frame(phys);
+            }
+        }
+    }
+
+    // Private user address space.
+    if cr3 != vmm::kernel_pml4_phys()
+        && cr3 != vmm::current_pml4_phys()
+        && !READY_QUEUE.lock().iter().any(|t| t.cr3 == cr3)
+        && !PENDING_REAPS
+            .lock()
+            .iter()
+            .any(|(p, r)| *p != pid && r.cr3 == cr3)
+    {
+        vmm::drop_user_space(cr3);
+    }
+
+    // Release the task's FXSAVE area.
+    crate::task::fpu::free(pid);
+
+    PENDING_REAPS.lock().remove(&pid);
+}
 
 /// PID reserved for the idle task.
 ///
@@ -119,7 +201,6 @@ static IDLE_TASK: Spinlock<Tcb> = Spinlock::new(Tcb {
     pid: IDLE_PID,
     kernel_rsp: 0,
     cr3: 0,
-    compat: None,
 });
 
 /// Returns true when `pid` is the idle task.
@@ -250,16 +331,25 @@ pub fn check_frame(who: &str, pid: u64, rsp: u64) {
 
 pub fn spawn(tcb: Tcb) -> u64 {
     let pid = tcb.pid;
-    check_frame("spawn", pid, tcb.kernel_rsp);
-    stamp_save(pid, tcb.kernel_rsp);
     let mut q = READY_QUEUE.lock();
     if q.iter().any(|t| t.pid == pid) {
+        // A second frame for a pid already in the queue must NOT be pushed:
+        // the duplicate would rotate the task twice per round (each enqueue
+        // running its own stale frame) and grow the queue forever. Report the
+        // pid back to the caller without enqueuing.
         crate::error!(
-            "[SCHED] DOUBLE ENQUEUE (spawn) pid={} rsp=0x{:x}",
+            "[SCHED] DOUBLE ENQUEUE (spawn) pid={} rsp=0x{:x} - duplicate not enqueued",
             pid,
             tcb.kernel_rsp
         );
+        return pid;
     }
+    check_frame("spawn", pid, tcb.kernel_rsp);
+    stamp_save(pid, tcb.kernel_rsp);
+    // Every task gets an FXSAVE area up front: whether it will ever run FP
+    // code is not known at spawn time, and the save/restore paths cannot
+    // allocate (they run in IRQ/tick context).
+    crate::task::fpu::area_for(pid);
     q.push_back(tcb);
     pid
 }
@@ -267,16 +357,20 @@ pub fn schedule() -> Option<Tcb> {
     READY_QUEUE.lock().pop_front()
 }
 pub fn requeue(tcb: Tcb) {
-    check_frame("enqueue", tcb.pid, tcb.kernel_rsp);
-    stamp_save(tcb.pid, tcb.kernel_rsp);
     let mut q = READY_QUEUE.lock();
     if q.iter().any(|t| t.pid == tcb.pid) {
+        // See `spawn`: a queued duplicate is dropped, not pushed. This frame
+        // is abandoned (it was never stamped, so the ledger stays consistent
+        // with the frame already in the queue).
         crate::error!(
-            "[SCHED] DOUBLE ENQUEUE pid={} rsp=0x{:x}",
+            "[SCHED] DOUBLE ENQUEUE pid={} rsp=0x{:x} - duplicate dropped",
             tcb.pid,
             tcb.kernel_rsp
         );
+        return;
     }
+    check_frame("enqueue", tcb.pid, tcb.kernel_rsp);
+    stamp_save(tcb.pid, tcb.kernel_rsp);
     q.push_back(tcb);
 }
 pub fn remove_ready_pids(pids: &[u64]) {
@@ -402,7 +496,6 @@ pub fn kernel_thread_spawn(entry: fn()) -> u64 {
             pid,
             kernel_rsp: rsp,
             cr3: vmm::current_pml4_phys(),
-            compat: None,
         };
         spawn(tcb);
         pid
@@ -428,21 +521,29 @@ pub extern "C" fn scheduler_tick_irq(current_rsp: u64) -> u64 {
         // The idle task was preempted: save its stack pointer in the explicit
         // idle task rather than treating pid 0 as a magic special case.
         save_idle_rsp(current_rsp);
-    } else if EXITING_PID.load(Ordering::Acquire) == cur {
-        // The current task called `exit_current` (Requirement 12.4): do NOT
-        // requeue it, so it is dropped from rotation and never scheduled again.
-        // Clear the flag now that the exit has been honoured; its kernel stack
-        // is simply abandoned (no reaping in this minimal design).
-        EXITING_PID.store(NO_EXITING_PID, Ordering::Release);
+    } else if take_exiting(cur) {
+        // The current task requested exit (Requirement 12.4): do NOT requeue
+        // it, so it is dropped from rotation and never scheduled again. Its
+        // memory cannot be released here — this handler is running on that
+        // task's kernel stack — so it is queued for a later tick's reaper.
         crate::trace!("[SCHED] task {} exited", cur);
+        pend_reap(cur);
     } else {
+        // Preserve the outgoing task's FPU/SSE state before it can be
+        // overwritten by the incoming task's restore below.
+        crate::task::fpu::save_if_user(cur, current_rsp);
         requeue(Tcb {
             pid: cur,
             kernel_rsp: current_rsp,
             cr3: vmm::current_pml4_phys(),
-            compat: None,
         });
     }
+
+    // Release the memory of previously dropped tasks (oldest first, at most
+    // one per tick to bound the interrupt-disabled window). Runs after the
+    // requeue decision above: the pid dropped by THIS tick — if any — is on
+    // the stack we are executing on and is skipped by the reaper.
+    reap_exited_tasks();
 
     crate::arch::x86_64::apic::send_eoi();
 
@@ -468,6 +569,9 @@ pub extern "C" fn scheduler_tick_irq(current_rsp: u64) -> u64 {
     unsafe {
         vmm::load_cr3(next.cr3);
     }
+
+    // Bring the incoming task's FPU/SSE state back before it resumes.
+    crate::task::fpu::restore_if_user(next.pid, next.kernel_rsp);
 
     check_frame("restore-tick", next.pid, next.kernel_rsp);
     stamp_restore(next.pid, next.kernel_rsp);
@@ -512,6 +616,12 @@ pub extern "C" fn scheduler_yield_switch(current_rsp: u64) -> u64 {
         None => return current_rsp,
     };
 
+    // Preserve the yielding task's FPU/SSE state before the incoming task's
+    // restore below overwrites it. A compat task yields from inside a syscall
+    // with its user FP state still live in the CPU — the frame's kernel CS
+    // does not mean the state is kernel-owned.
+    crate::task::fpu::save_if_user(cur, current_rsp);
+
     // Requeue the yielding task BEFORE the stack switch (see doc above). The
     // idle task is never queued; it parks its frame in the dedicated slot,
     // mirroring the preemptive path.
@@ -522,7 +632,6 @@ pub extern "C" fn scheduler_yield_switch(current_rsp: u64) -> u64 {
             pid: cur,
             kernel_rsp: current_rsp,
             cr3: vmm::current_pml4_phys(),
-            compat: None,
         });
     }
 
@@ -537,6 +646,9 @@ pub extern "C" fn scheduler_yield_switch(current_rsp: u64) -> u64 {
         vmm::load_cr3(next.cr3);
     }
 
+    // Bring the incoming task's FPU/SSE state back before it resumes.
+    crate::task::fpu::restore_if_user(next.pid, next.kernel_rsp);
+
     check_frame("restore-yield", next.pid, next.kernel_rsp);
     stamp_restore(next.pid, next.kernel_rsp);
     next.kernel_rsp
@@ -549,13 +661,13 @@ pub extern "C" fn scheduler_yield_switch(current_rsp: u64) -> u64 {
 /// RSP-based scheduler (which keeps no persistent `Tcb` for the running task),
 /// the minimal robust mechanism is:
 ///
-///   1. Record the current pid in [`EXITING_PID`].
+///   1. Record the current pid in [`EXITING_PIDS`].
 ///   2. Spin in a halt loop with interrupts **enabled** so the periodic timer
 ///      tick can preempt us.
-///   3. On the next tick, `scheduler_tick_irq` sees `cur == EXITING_PID`, drops
-///      the task instead of requeuing it, clears the flag, and switches to the
-///      next ready task. Because this task is never requeued, control never
-///      returns here — hence the `-> !` return type.
+///   3. On the next tick, `scheduler_tick_irq` removes `cur` from
+///      [`EXITING_PIDS`], drops the task instead of requeuing it, and switches
+///      to the next ready task. Because this task is never requeued, control
+///      never returns here — hence the `-> !` return type.
 ///
 /// Interrupts MUST stay enabled in the loop, otherwise the timer could never
 /// fire and the task (and CPU) would deadlock.
@@ -570,7 +682,7 @@ pub extern "C" fn scheduler_yield_switch(current_rsp: u64) -> u64 {
 /// yield never returns.
 pub fn request_exit(pid: u64) {
     crate::task::compat::remove_compat(pid);
-    EXITING_PID.store(pid, Ordering::Release);
+    mark_exiting(pid);
 }
 
 pub fn exit_current() -> ! {
@@ -584,7 +696,7 @@ pub fn exit_current() -> ! {
     // FdTable/VmRegionSet/nosys-set so the registry does not leak across exits.
     crate::task::compat::finish_compat_exit(pid);
 
-    EXITING_PID.store(pid, Ordering::Release);
+    mark_exiting(pid);
 
     // Wait to be preempted and dropped. Keep interrupts enabled so the timer
     // tick can fire; once the tick drops us we are never scheduled again.
@@ -592,4 +704,36 @@ pub fn exit_current() -> ! {
         crate::arch::cpu::enable_interrupts();
         crate::arch::cpu::halt();
     }
+}
+
+/// A kernel thread whose entry function returned parked in
+/// `switch::scheduler_exit_thread`. Mark it exiting so the next tick drops it
+/// from rotation instead of requeueing an already-finished frame (the old
+/// parked thread otherwise burned one idle slice per scheduling round forever).
+pub fn kernel_thread_finished() {
+    let pid = current_pid();
+    if !is_idle(pid) {
+        mark_exiting(pid);
+    }
+}
+
+/// Free the frame tree behind `cr3` when THIS task is its exclusive owner:
+/// not the kernel PML4, not shared with any queued task (threads share CR3)
+/// and not referenced by a pending exit reap. COW leaves inside are unref'd
+/// (`drop_user_space`), so an exec'ing fork child releases its parent's
+/// shared frames instead of pinning them forever. Returns `true` when freed.
+///
+/// Used by the execve path right after switching to the freshly loaded image.
+pub fn drop_exclusive_user_space(cr3: u64) -> bool {
+    if cr3 == 0 || cr3 == vmm::kernel_pml4_phys() {
+        return false;
+    }
+    if READY_QUEUE.lock().iter().any(|t| t.cr3 == cr3) {
+        return false;
+    }
+    if PENDING_REAPS.lock().iter().any(|(_, r)| r.cr3 == cr3) {
+        return false;
+    }
+    vmm::drop_user_space(cr3);
+    true
 }

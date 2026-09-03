@@ -165,9 +165,14 @@ impl VfsNode for RamFile {
         let end = off
             .checked_add(buf.len())
             .ok_or(VfsError::InvalidArgument)?;
-        if data.len() < end {
+        let old_len = data.len();
+        if old_len < end {
             // Sparse-write gap (off > len) is zero-filled by resize, matching
-            // POSIX semantics for writes past EOF.
+            // POSIX semantics for writes past EOF. try_reserve first so a huge
+            // user-driven offset cannot exhaust the fixed kernel heap
+            // (allocation failure is a kernel abort, not an error return).
+            data.try_reserve(end - old_len)
+                .map_err(|_| VfsError::IoError)?;
             data.resize(end, 0);
         }
         data[off..end].copy_from_slice(buf);
@@ -175,7 +180,13 @@ impl VfsNode for RamFile {
     }
 
     fn truncate(&self, size: u64) -> VfsResult<()> {
-        self.data.lock().resize(size as usize, 0);
+        let mut data = self.data.lock();
+        let old_len = data.len();
+        if size as usize > old_len {
+            data.try_reserve(size as usize - old_len)
+                .map_err(|_| VfsError::IoError)?;
+        }
+        data.resize(size as usize, 0);
         Ok(())
     }
 }

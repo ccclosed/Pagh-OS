@@ -281,6 +281,22 @@ extern "x86-interrupt" fn page_fault_handler(
 ) {
     let fault_addr = Cr2::read().unwrap_or(VirtAddr::new(0));
     let rsp = stack.stack_pointer.as_u64();
+
+    // Demand paging first: a not-present fault on a lazily-mapped user page
+    // (anonymous mmap region or the brk heap) is serviced by mapping a zero
+    // frame; the faulting instruction then retries on IRET. Covers BOTH
+    // ring-3 faults and kernel-mode faults on user addresses (copy_in/
+    // copy_out over a never-touched buffer). The handler rejects protection
+    // violations, kernel addresses, PROT_NONE regions and eager regions, so
+    // everything below stays a genuine fault.
+    if crate::arch::x86_64::linux::mem_sys::handle_user_page_fault(
+        fault_addr.as_u64(),
+        error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION),
+        error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE),
+    ) {
+        return;
+    }
+
     crate::error!(
         "[EXC #14] PAGE FAULT addr=0x{:016x} RIP=0x{:016x} RSP=0x{:016x} P={} W={} U={} I={} ec=0x{:x}",
         fault_addr.as_u64(),

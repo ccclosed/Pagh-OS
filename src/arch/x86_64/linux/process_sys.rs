@@ -9,6 +9,7 @@ use crate::sync::spinlock::Spinlock;
 
 use super::check_user_ptr;
 use super::errno::Errno;
+use super::misc::duration_to_ticks;
 use super::regs::SavedRegs;
 
 const FUTEX_CMD_MASK: u64 = 0x7f;
@@ -17,7 +18,6 @@ const FUTEX_WAKE: u64 = 1;
 const FUTEX_WAIT_BITSET: u64 = 9;
 const FUTEX_WAKE_BITSET: u64 = 10;
 const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
-const TICK_HZ: u64 = 100;
 
 /// Cooperative waiter registry. Tickets make FUTEX_WAKE return and release an
 /// exact number of waiters even though the current scheduler has no blocked TCB
@@ -58,10 +58,9 @@ fn timeout_deadline(timeout: u64) -> Result<Option<u64>, Errno> {
     if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
         return Err(Errno::EINVAL);
     }
-    let ticks = (sec as u64)
-        .saturating_mul(TICK_HZ)
-        .saturating_add((nsec as u64).saturating_add(9_999_999) / 10_000_000);
-    Ok(Some(crate::task::scheduler::ticks().saturating_add(ticks)))
+    Ok(Some(
+        crate::task::scheduler::ticks().saturating_add(duration_to_ticks(sec, nsec)),
+    ))
 }
 
 fn register_waiter(queue_key: (u64, u64), bitset: u32) -> u64 {
@@ -354,9 +353,11 @@ pub fn sys_clone(
         if flags & CLONE_CHILD_SETTID != 0 {
             check_user_ptr(child_tid, 4)?
         }
-        let child =
-            crate::task::process::spawn_linux_thread(regs, stack).map_err(|_| Errno::ENOMEM)?;
-
+        // Register the child's CompatState BEFORE it can ever run: spawn
+        // enqueues the child, so both the enqueue and the compat registration
+        // happen with interrupts disabled (same pattern as
+        // `fork_linux_process`). Otherwise the tick could schedule the child
+        // between the two steps and route its first syscalls as native.
         let tls_value = if flags & CLONE_SETTLS != 0 {
             Some(tls)
         } else {
@@ -367,9 +368,17 @@ pub fn sys_clone(
         } else {
             0
         };
-        if !crate::task::compat::clone_current_compat(child, tls_value, clear) {
-            return Err(Errno::EINVAL);
-        }
+        let child = crate::arch::cpu::without_interrupts(|| {
+            let child =
+                crate::task::process::spawn_linux_thread(regs, stack).map_err(|_| Errno::ENOMEM)?;
+            if !crate::task::compat::clone_current_compat(child, tls_value, clear) {
+                // Parent has no compat state: never leave the half-spawned
+                // child in rotation.
+                crate::task::scheduler::remove_ready_pids(&[child]);
+                return Err(Errno::EINVAL);
+            }
+            Ok(child)
+        })?;
         if flags & CLONE_PARENT_SETTID != 0 {
             unsafe { ptr::write_unaligned(parent_tid as *mut u32, child as u32) }
         }

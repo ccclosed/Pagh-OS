@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts must stay LF: they run inside WSL/Linux. A CRLF working-tree
+# copy breaks the shebang ("env: 'bash\r': No such file or directory").
+*.sh text eol=lf

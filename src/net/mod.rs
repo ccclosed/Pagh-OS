@@ -77,6 +77,9 @@ const QEMU_DNS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
 const DNS_STEP_SPIN: u32 = 20_000;
 /// DNS resolve timeout (~700 ms).
 const DNS_TIMEOUT_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(700);
+/// DNS query retransmit interval: if no answer has arrived after this many
+/// ticks, the same query (same id) is sent again until the deadline.
+const DNS_RESEND_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(100);
 /// Hard upper bound on DNS pump iterations, independent of the clock.
 const DNS_MAX_STEPS: u32 = 20_000;
 /// DHCP timeout (~5 s) before the static fallback applies (R13.3).
@@ -319,8 +322,9 @@ impl Stack {
                 self.arp
                     .input(self.mac, self.cidr.map(|c| c.addr), payload, now)
             }
-            // ip::input dispatches on the version nibble (v4 and v6).
-            wire::ETHERTYPE_IPV4 | wire::ETHERTYPE_IPV6 => ip::input(self, payload, now),
+            // ip::input dispatches on the version nibble (v4 and v6); NDP needs
+            // the real Ethernet-level sender MAC.
+            wire::ETHERTYPE_IPV4 | wire::ETHERTYPE_IPV6 => ip::input(self, payload, _src, now),
             _ => {}
         }
     }
@@ -657,7 +661,10 @@ pub fn resolve(hostname: &str) -> Option<IpAddr> {
 /// One DNS exchange of `qtype` on a temporary socket; returns the first
 /// matching address.
 fn dns_query_once(server: Ipv4Addr, hostname: &str, qtype: u16) -> Option<IpAddr> {
-    let id: u16 = (scheduler::ticks() as u16) ^ 0x5353;
+    // Random transaction id: a tick-derived id is predictable and collides
+    // between back-to-back lookups, letting an off-path reply be mistaken for
+    // the answer.
+    let id: u16 = random_u32() as u16;
     let mut query: Vec<u8> = Vec::new();
     if !dns::build_dns_query_typed(id, hostname, qtype, &mut query) {
         return None;
@@ -671,8 +678,9 @@ fn dns_query_once(server: Ipv4Addr, hostname: &str, qtype: u16) -> Option<IpAddr
     };
 
     let server_ep = IpEndpoint::new(IpAddr::V4(server), 53);
-    let deadline = scheduler::ticks() + DNS_TIMEOUT_TICKS;
-    let mut sent = false;
+    let now = scheduler::ticks();
+    let deadline = now + DNS_TIMEOUT_TICKS;
+    let mut next_send = now;
     let mut result: Option<IpAddr> = None;
 
     for _ in 0..DNS_MAX_STEPS {
@@ -682,10 +690,13 @@ fn dns_query_once(server: Ipv4Addr, hostname: &str, qtype: u16) -> Option<IpAddr
                 Some(s) => s,
                 None => break,
             };
-            if !sent {
+            // (Re-)send the query every DNS_RESEND_TICKS until an answer
+            // arrives or the deadline passes; a single lost datagram no longer
+            // burns the whole budget spinning.
+            if scheduler::ticks() >= next_send {
                 let port = state.udp.port_of(handle).unwrap_or(0);
                 if udp::send_from(state, port, &query, server_ep).is_ok() {
-                    sent = true;
+                    next_send = scheduler::ticks() + DNS_RESEND_TICKS;
                 }
             }
             state.step();
@@ -693,9 +704,9 @@ fn dns_query_once(server: Ipv4Addr, hostname: &str, qtype: u16) -> Option<IpAddr
             let mut rbuf = [0u8; 1500];
             if let Some((n, _ep)) = state.udp.recv(handle, &mut rbuf) {
                 result = match qtype {
-                    dns::QTYPE_AAAA => dns::parse_dns_aaaa_response(&rbuf[..n], id)
+                    dns::QTYPE_AAAA => dns::parse_dns_aaaa_response(&rbuf[..n], id, hostname)
                         .map(|o| IpAddr::V6(wire::Ipv6Addr(o))),
-                    _ => dns::parse_dns_a_response(&rbuf[..n], id)
+                    _ => dns::parse_dns_a_response(&rbuf[..n], id, hostname)
                         .map(|o| IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], o[3]))),
                 };
                 if result.is_some() {

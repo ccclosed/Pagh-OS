@@ -2,7 +2,7 @@
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
 use core::ptr;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::tlb;
 use x86_64::structures::paging::page_table::{PageTableEntry, PageTableIndex};
 use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
@@ -30,15 +30,27 @@ impl core::fmt::Display for VmError {
     }
 }
 
+/// Physical address of the kernel/boot PML4, captured at `init` (before any
+/// user address space exists, CR3 still holds the boot table). Exit cleanup
+/// uses this to tell the shared kernel PML4 — which must NEVER be torn down —
+/// apart from the per-process user PML4s created by the loader and `fork`.
+static KERNEL_PML4: AtomicU64 = AtomicU64::new(0);
+
 /// Initialize the VMM. Stores the Limine HHDM offset.
 pub fn init(hhdm_offset: u64) {
     crate::HHDM_OFFSET.store(hhdm_offset, Ordering::Relaxed);
+    KERNEL_PML4.store(current_pml4_phys(), Ordering::Relaxed);
 
     crate::debug!(
         "VMM Initialized: HHDM offset=0x{:x}, PML4=0x{:x}",
         hhdm_offset,
         current_pml4_phys(),
     );
+}
+
+/// Physical address of the shared kernel PML4 (captured at boot).
+pub fn kernel_pml4_phys() -> u64 {
+    KERNEL_PML4.load(Ordering::Relaxed)
 }
 
 /// Convert a physical address to a virtual address via HHDM.
@@ -617,4 +629,266 @@ pub fn virt_to_phys_in(pml4: u64, virt: u64) -> Option<u64> {
         return None;
     }
     Some(e1.addr().as_u64() + (virt & 0xfff))
+}
+
+/// Software PTE bit (available bit 9) marking a COW-shared leaf: the frame is
+/// shared with another address space and its ownership is refcounted in the
+/// PMM (`pmm::cow_ref`/`cow_unref`). Set on BOTH sides by
+/// [`fork_user_space_cow`]; cleared when a side copies the page private
+/// ([`cow_copy_page`]) or when it exits (`drop_user_space` unrefs instead of
+/// freeing).
+const COW_BIT: PageTableFlags = PageTableFlags::BIT_9;
+
+/// Release every frame owned by a *private* user address space: all mapped
+/// 4 KiB leaf frames in the lower half (PML4 entries 0..256), the intermediate
+/// page-table frames beneath them, and the PML4 frame itself.
+///
+/// The caller MUST ensure the address space is exclusively owned (no other
+/// task shares this PML4) and that it is not the kernel PML4 — this function
+/// frees unconditionally and would otherwise tear down live mappings. The
+/// address space does not need to be active in CR3: all access goes through
+/// the HHDM window (same convention as `clone_user_space`).
+pub fn drop_user_space(pml4: u64) {
+    let walker = PageTableWalker::new();
+    let p4 = walker.table(pml4);
+    for i4 in 0..256usize {
+        let e4 = &p4[i4];
+        if !e4.flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+        let p3_phys = e4.addr().as_u64();
+        let p3 = walker.table(p3_phys);
+        for i3 in 0..512usize {
+            let e3 = &p3[i3];
+            if !e3.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            if e3.flags().contains(PageTableFlags::HUGE_PAGE) {
+                // 1 GiB leaf: the entry's frame IS the mapped page (there is
+                // no PD table behind it). Nothing else is freed at this level.
+                crate::memory::pmm::free_frame(e3.addr().as_u64());
+                continue;
+            }
+            let p2_phys = e3.addr().as_u64();
+            let p2 = walker.table(p2_phys);
+            for i2 in 0..512usize {
+                let e2 = &p2[i2];
+                if !e2.flags().contains(PageTableFlags::PRESENT) {
+                    continue;
+                }
+                if e2.flags().contains(PageTableFlags::HUGE_PAGE) {
+                    // 2 MiB leaf: the entry's frame IS the mapped page.
+                    crate::memory::pmm::free_frame(e2.addr().as_u64());
+                    continue;
+                }
+                let p1_phys = e2.addr().as_u64();
+                let p1 = walker.table(p1_phys);
+                for i1 in 0..512usize {
+                    let e1 = &p1[i1];
+                    if !e1.flags().contains(PageTableFlags::PRESENT) {
+                        continue;
+                    }
+                    let frame = e1.addr().as_u64();
+                    if e1.flags().contains(COW_BIT) {
+                        // Shared with another address space: only drop this
+                        // side's reference. The last departing side frees —
+                        // `cow_unref` reports that via its return value.
+                        if crate::memory::pmm::cow_unref(frame) {
+                            crate::memory::pmm::free_frame(frame);
+                        }
+                    } else {
+                        crate::memory::pmm::free_frame(frame);
+                    }
+                }
+                // The PT frame itself: free even when every leaf was
+                // unmapped earlier (munmap clears leaf PTEs but leaves the
+                // table) — the table is unreachable once this tree dies.
+                crate::memory::pmm::free_frame(p1_phys);
+            }
+            // ONE PD frame per PDPT entry — freed once, AFTER the PT loop
+            // (freed inside the loop, a populated PD was released once per
+            // present PT entry, tripping the PMM double-free detector).
+            crate::memory::pmm::free_frame(p2_phys);
+        }
+        // ONE PDPT frame per PML4 entry — freed once, after the PD loop.
+        crate::memory::pmm::free_frame(p3_phys);
+    }
+    crate::memory::pmm::free_frame(pml4);
+}
+
+/// Fork the active lower-half address space into `child_pml4` copy-on-write:
+/// every present leaf frame is SHARED (refcounted in the PMM via
+/// `pmm::cow_ref`), both PTEs are marked with the `COW_BIT` software bit, and
+/// formerly-writable entries lose the WRITABLE bit on both sides so the next
+/// write traps into the page-fault handler, which copies the page private
+/// ([`cow_copy_page`]). Read-only leaves (ELF text/rodata) keep their flags —
+/// writes there segfault as before; only their ownership is refcounted.
+///
+/// Intermediate page-table frames are NOT shared: the child gets fresh zeroed
+/// tables, so each side's table mutations stay independent.
+///
+/// Returns `Err` (with the parent untouched) when the parent uses huge pages
+/// in the lower half — the caller falls back to the eager copier. The parent
+/// address space must be ACTIVE (fork runs on the parent's CR3): the RO-flip
+/// needs a TLB invalidate, done here as a full flush on return.
+pub fn fork_user_space_cow(parent_pml4: u64, child_pml4: u64) -> Result<(), VmError> {
+    let walker = PageTableWalker::new();
+    let p4p = walker.table(parent_pml4);
+
+    // Pass 1: reject huge pages before any mutation so the caller's fallback
+    // starts from a clean parent.
+    for i4 in 0..256usize {
+        let e4 = &p4p[i4];
+        if !e4.flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+        if e4.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return Err(VmError::NotMapped);
+        }
+        let p3 = walker.table(e4.addr().as_u64());
+        for i3 in 0..512usize {
+            let e3 = &p3[i3];
+            if !e3.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            if e3.flags().contains(PageTableFlags::HUGE_PAGE) {
+                return Err(VmError::NotMapped);
+            }
+            let p2 = walker.table(e3.addr().as_u64());
+            for i2 in 0..512usize {
+                let e2 = &p2[i2];
+                if e2.flags().contains(PageTableFlags::PRESENT)
+                    && e2.flags().contains(PageTableFlags::HUGE_PAGE)
+                {
+                    return Err(VmError::NotMapped);
+                }
+            }
+        }
+    }
+
+    // Pass 2: mirror the tree into the child, share leaves, flip writables.
+    for i4 in 0..256usize {
+        let e4 = &p4p[i4];
+        if !e4.flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+        let p3p = walker.table(e4.addr().as_u64());
+        let p3c_phys = fork_child_table_phys(child_pml4, PageTableIndex::new(i4 as u16))?;
+        let p3c = walker.table(p3c_phys);
+        for i3 in 0..512usize {
+            let e3 = &p3p[i3];
+            if !e3.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            let p2p = walker.table(e3.addr().as_u64());
+            let p2c_phys = fork_child_table_phys(p3c_phys, PageTableIndex::new(i3 as u16))?;
+            let p2c = walker.table(p2c_phys);
+            for i2 in 0..512usize {
+                let e2 = &p2p[i2];
+                if !e2.flags().contains(PageTableFlags::PRESENT) {
+                    continue;
+                }
+                let p1p = walker.table_mut(e2.addr().as_u64());
+                let p1c_phys = fork_child_table_phys(p2c_phys, PageTableIndex::new(i2 as u16))?;
+                let p1c = walker.table_mut(p1c_phys);
+                for i1 in 0..512usize {
+                    let e1 = &p1p[i1];
+                    if !e1.flags().contains(PageTableFlags::PRESENT) {
+                        continue;
+                    }
+                    let frame = e1.addr();
+                    let flags = e1.flags();
+                    let shared = if flags.contains(PageTableFlags::WRITABLE) {
+                        (flags - PageTableFlags::WRITABLE) | COW_BIT
+                    } else {
+                        flags | COW_BIT
+                    };
+                    p1p[i1].set_addr(frame, shared);
+                    p1c[i1].set_addr(frame, shared);
+                    // Two sharers enter the map when the leaf was privately
+                    // owned (parent + child). When the parent's leaf is
+                    // ALREADY COW (fork of a fork) the parent side is counted
+                    // since its first fork — only the new child registers.
+                    if !flags.contains(COW_BIT) {
+                        crate::memory::pmm::cow_ref(frame.as_u64());
+                    }
+                    crate::memory::pmm::cow_ref(frame.as_u64());
+                }
+            }
+        }
+    }
+    // The parent's flipped PTEs may still sit in the TLB with stale RW
+    // translations; a full reload flushes them.
+    tlb::flush_all();
+    Ok(())
+}
+
+/// Physical address of the intermediate table at `idx` of the table at
+/// physical address `parent`, created (freshly zeroed, USER-accessible
+/// intermediate flags) if absent — a lower-half user tree.
+fn fork_child_table_phys(parent: u64, idx: PageTableIndex) -> Result<u64, VmError> {
+    let walker = PageTableWalker::new();
+    let table = walker.table_mut(parent);
+    if !table[idx].flags().contains(PageTableFlags::PRESENT) {
+        let frame = crate::memory::pmm::alloc_frame().ok_or(VmError::OutOfMemory)?;
+        // SAFETY: `frame` was just allocated and is mapped via the HHDM, so
+        // this zeroes exactly one owned, page-aligned frame.
+        unsafe {
+            ptr::write_bytes(phys_to_virt(frame) as *mut u8, 0, 4096);
+        }
+        table[idx].set_addr(
+            PhysAddr::new(frame),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
+        );
+    }
+    Ok(table[idx].addr().as_u64())
+}
+
+/// Copy-on-write fault service: the page at `virt_addr` (ACTIVE address space)
+/// is a COW-shared leaf (present + `COW_BIT`). Allocate a fresh frame, copy
+/// the shared contents, re-point the PTE at the private copy with WRITABLE
+/// restored, drop this side's share of the old frame (freeing it when this was
+/// the last sharer) and flush the TLB. Returns `false` when the PTE is not a
+/// COW leaf (caller's SIGSEGV path applies) or the PMM is exhausted.
+pub fn cow_copy_page(virt_addr: u64) -> bool {
+    let walker = PageTableWalker::new();
+    let virt = VirtAddr::new(virt_addr);
+
+    let pml4 = walker.root_mut();
+    let Some(pdpt) = walker.next_mut(&pml4[virt.p4_index()]) else {
+        return false;
+    };
+    let Some(pd) = walker.next_mut(&pdpt[virt.p3_index()]) else {
+        return false;
+    };
+    let Some(pt) = walker.next_mut(&pd[virt.p2_index()]) else {
+        return false;
+    };
+    let entry = &mut pt[virt.p1_index()];
+    let flags = entry.flags();
+    if !flags.contains(PageTableFlags::PRESENT) || !flags.contains(COW_BIT) {
+        return false;
+    }
+    let old = entry.addr().as_u64();
+    let Some(new) = crate::memory::pmm::alloc_frame() else {
+        return false;
+    };
+    // SAFETY: both addresses are HHDM aliases of owned 4 KiB frames; the copy
+    // stays inside them.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            phys_to_virt(old) as *const u8,
+            phys_to_virt(new) as *mut u8,
+            4096,
+        );
+    }
+    entry.set_addr(
+        PhysAddr::new(new),
+        (flags - COW_BIT) | PageTableFlags::WRITABLE | PageTableFlags::PRESENT,
+    );
+    tlb::flush(virt);
+    if crate::memory::pmm::cow_unref(old) {
+        crate::memory::pmm::free_frame(old);
+    }
+    true
 }

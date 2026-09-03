@@ -104,25 +104,45 @@ pub fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> Result<u64,
     .ok_or(Errno::EBADF)?;
 
     match op {
-        EPOLL_CTL_ADD | EPOLL_CTL_MOD => {
+        EPOLL_CTL_ADD => {
             check_user_ptr(event_ptr, 12)?;
             // SAFETY: validated above; epoll_event is { u32 events, u8[8] data }
             let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
             let data = unsafe { core::ptr::read_unaligned((event_ptr + 4) as *const u64) };
             let mut list = interests.lock();
-            if let Some(e) = list.iter_mut().find(|e| e.fd == fd as i32) {
-                e.events = events;
-                e.data = data;
-            } else {
-                list.push(EpollEntry {
-                    fd: fd as i32,
-                    events,
-                    data,
-                });
+            if list.iter().any(|e| e.fd == fd as i32) {
+                // Linux semantics: ADD on an already-registered fd is EEXIST.
+                return Err(Errno::EEXIST);
+            }
+            list.push(EpollEntry {
+                fd: fd as i32,
+                events,
+                data,
+            });
+        }
+        EPOLL_CTL_MOD => {
+            check_user_ptr(event_ptr, 12)?;
+            // SAFETY: validated above; epoll_event is { u32 events, u8[8] data }
+            let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
+            let data = unsafe { core::ptr::read_unaligned((event_ptr + 4) as *const u64) };
+            let mut list = interests.lock();
+            match list.iter_mut().find(|e| e.fd == fd as i32) {
+                Some(e) => {
+                    e.events = events;
+                    e.data = data;
+                }
+                // Linux semantics: MOD on an unregistered fd is ENOENT.
+                None => return Err(Errno::ENOENT),
             }
         }
         EPOLL_CTL_DEL => {
             let mut list = interests.lock();
+            let present = list.iter().any(|e| e.fd == fd as i32);
+            if !present {
+                // Linux semantics: DEL of an unregistered fd is ENOENT (and
+                // does not require a valid event_ptr — none is read here).
+                return Err(Errno::ENOENT);
+            }
             list.retain(|e| e.fd != fd as i32);
         }
         _ => return Err(Errno::EINVAL),

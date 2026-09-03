@@ -38,8 +38,8 @@ use crate::task::compat;
 
 use super::errno::Errno;
 use super::mem::{
-    plan_brk, plan_munmap, prot_to_flags, BrkOutcome, MmapRegion, MunmapPlan, VmRegionSet,
-    MAP_ANONYMOUS, MAP_PRIVATE,
+    plan_brk, plan_mmap_base, plan_munmap, prot_to_flags, range_is_free, BrkOutcome, MmapRegion,
+    MunmapPlan, VmRegionSet, MAP_ANONYMOUS, MAP_PRIVATE,
 };
 use super::validate::USER_ADDR_MAX;
 
@@ -119,6 +119,20 @@ pub fn sys_brk(addr: u64) -> Result<u64, Errno> {
 }
 
 fn brk_impl(vm: &mut VmRegionSet, requested: u64) -> u64 {
+    // The brk heap grows upward in the same lower-half range the mmap bump
+    // allocator uses, so a grow must not run into a tracked mmap region: clamp
+    // the ceiling at the lowest region base above the current break (Linux
+    // keeps the two areas apart; failing the grow is the POSIX-visible result).
+    let ceiling = vm
+        .mmaps
+        .iter()
+        .map(|r| r.base)
+        .filter(|b| *b > vm.current_brk)
+        .min()
+        .unwrap_or(USER_ADDR_MAX);
+    if requested > vm.current_brk && requested >= ceiling {
+        return vm.current_brk;
+    }
     match plan_brk(vm.initial_brk, vm.current_brk, requested) {
         BrkOutcome::Unchanged(v) => v,
         BrkOutcome::Shrink(v) => {
@@ -126,18 +140,14 @@ fn brk_impl(vm: &mut VmRegionSet, requested: u64) -> u64 {
             v
         }
         BrkOutcome::Grow {
-            new_brk,
-            map_from,
-            map_to,
+            new_brk, map_from, ..
         } => {
-            let flags = leaf_flags(true, true); // heap: writable, non-executable
-            if map_zeroed_range(map_from, map_to, flags) {
-                vm.current_brk = new_brk;
-                new_brk
-            } else {
-                // OOM: leave the break unchanged (R3.4).
-                vm.current_brk
-            }
+            // Lazy: no eager mapping. Pages in [brk_lazy_from, page_up(new_brk))
+            // are backed by the page-fault handler on first touch; the recorded
+            // floor only ever moves down.
+            vm.brk_lazy_from = vm.brk_lazy_from.min(map_from);
+            vm.current_brk = new_brk;
+            new_brk
         }
     }
 }
@@ -211,9 +221,10 @@ pub fn sys_mmap(
         .ok_or(Errno::ENOMEM)?;
     let span = pages.checked_mul(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
     let (writable, nx) = prot_to_flags(prot as u32);
+    let prot_none = prot == 0;
 
     // Phase 1 (under the compat lock): place the region, back it with zeroed
-    // frames, record it in the tracked set.
+    // frames when eager, record it in the tracked set.
     let base = compat::with_current_compat(|cs| -> Result<u64, Errno> {
         let vm = &mut cs.vm.lock();
         let base = if fixed {
@@ -222,9 +233,11 @@ pub fn sys_mmap(
             }
             addr
         } else {
-            // Non-fixed address hints are only hints; the bump pointer decides
-            // placement (R4.2) and the loader tolerates that.
-            vm.mmap_next_hint
+            // First-fit placement: reuse freed holes before extending past the
+            // high-water mark (Linux reuses VA space; a bump-only allocator
+            // makes long-lived processes walk into USER_ADDR_MAX and die of
+            // ENOMEM with plenty of memory free).
+            plan_mmap_base(&vm.mmaps, vm.mmap_floor, pages, USER_ADDR_MAX).ok_or(Errno::ENOMEM)?
         };
         let end = base.checked_add(span).ok_or(Errno::ENOMEM)?;
         if end > USER_ADDR_MAX {
@@ -243,7 +256,11 @@ pub fn sys_mmap(
             }
             cut_regions(&mut vm.mmaps, base, pages);
         }
-        if !map_zeroed_range(base, end, leaf_flags(writable, nx)) {
+        // Anonymous regions (and PROT_NONE reserves of either kind) are lazy:
+        // only the region is recorded here; the page-fault handler backs pages
+        // on first touch. File-backed regions with access rights keep the
+        // eager copy — there is no page cache to fault them in from.
+        if !anon && !prot_none && !map_zeroed_range(base, end, leaf_flags(writable, nx)) {
             // OOM: existing mappings are untouched (R4.4).
             return Err(Errno::ENOMEM);
         }
@@ -252,6 +269,8 @@ pub fn sys_mmap(
             pages,
             writable,
             nx,
+            prot: prot as u32,
+            anon,
         });
         if !fixed && end > vm.mmap_next_hint {
             vm.mmap_next_hint = end;
@@ -345,14 +364,14 @@ pub fn sys_mremap(
         // The whole old range must lie inside one tracked mmap region; its
         // protections carry over to the new placement.
         let old_span = old_pages.checked_mul(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
-        let (writable, nx) = match vm
+        let idx = vm
             .mmaps
             .iter()
-            .find(|r| r.base <= old_addr && old_addr + old_span <= r.base + r.pages * PAGE_SIZE)
-        {
-            Some(r) => (r.writable, r.nx),
-            None => return Err(Errno::EFAULT),
-        };
+            .position(|r| r.base <= old_addr && old_addr + old_span <= r.base + r.pages * PAGE_SIZE)
+            .ok_or(Errno::EFAULT)?;
+        let old = vm.mmaps[idx];
+        let flags_of = leaf_flags(old.writable, old.nx);
+
         if new_pages <= old_pages {
             if new_pages < old_pages {
                 // Shrink in place: drop the tail pages.
@@ -364,40 +383,90 @@ pub fn sys_mremap(
             }
             return Ok(old_addr);
         }
+        let delta = new_pages - old_pages;
+
+        // In-place growth: when the span right after the region is free, just
+        // widen the tracked region — no copy, no move. Anonymous tails stay
+        // lazy; eager (file-backed) tails are zero-mapped here (mremap never
+        // faults in more file data, matching Linux where the new pages simply
+        // belong to the same VMA).
+        if range_is_free(&vm.mmaps, old_addr + old_span, delta, USER_ADDR_MAX) {
+            let tail = old_addr + old_span;
+            if !old.anon && !map_zeroed_range(tail, tail + delta * PAGE_SIZE, flags_of) {
+                return Err(Errno::ENOMEM);
+            }
+            vm.mmaps[idx].pages = new_pages;
+            let end = old_addr + new_pages * PAGE_SIZE;
+            if end > vm.mmap_next_hint {
+                vm.mmap_next_hint = end;
+            }
+            return Ok(old_addr);
+        }
+
         if flags & MREMAP_MAYMOVE == 0 {
             return Err(Errno::ENOMEM);
         }
         let span = new_pages.checked_mul(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
-        let base = vm.mmap_next_hint;
+        let base = plan_mmap_base(&vm.mmaps, vm.mmap_floor, new_pages, USER_ADDR_MAX)
+            .ok_or(Errno::ENOMEM)?;
         let end = base.checked_add(span).ok_or(Errno::ENOMEM)?;
         if end > USER_ADDR_MAX {
             return Err(Errno::ENOMEM);
         }
-        if !map_zeroed_range(base, end, leaf_flags(writable, nx)) {
+        // Anonymous target: lazy — copy touches only pages that carry data.
+        // Eager (file-backed) target: pre-map the whole span, then copy.
+        if !old.anon && !map_zeroed_range(base, end, flags_of) {
             // OOM: the old mapping is untouched.
             return Err(Errno::ENOMEM);
         }
+        let mut copied: Vec<u64> = Vec::new();
         for i in 0..old_pages {
             let src = vmm::virt_to_phys(old_addr + i * PAGE_SIZE);
-            let dst = vmm::virt_to_phys(base + i * PAGE_SIZE);
-            if let (Some(src), Some(dst)) = (src, dst) {
-                // SAFETY: both frames are 4 KiB, mapped by this process /
-                // this very call; the HHDM aliases are valid and writable.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        vmm::phys_to_virt(src & !(PAGE_SIZE - 1)) as *const u8,
-                        vmm::phys_to_virt(dst & !(PAGE_SIZE - 1)) as *mut u8,
-                        PAGE_SIZE as usize,
-                    );
+            let Some(src) = src else {
+                continue; // never-touched source page: target stays zero/lazy
+            };
+            let dst_page = base + i * PAGE_SIZE;
+            if old.anon {
+                // Ensure the destination page is backed before copying into it
+                // (its frame cannot be written through a missing PTE; the HHDM
+                // alias needs the frame to exist first).
+                match pmm::alloc_frame() {
+                    Some(frame) => {
+                        zero_frame(frame);
+                        if vmm::map(frame, dst_page, flags_of).is_err() {
+                            pmm::free_frame(frame);
+                            unwind(&copied);
+                            return Err(Errno::ENOMEM);
+                        }
+                        copied.push(dst_page);
+                    }
+                    None => {
+                        unwind(&copied);
+                        return Err(Errno::ENOMEM);
+                    }
                 }
             }
+            // SAFETY: both frames are 4 KiB, mapped by this process /
+            // this very call; the HHDM aliases are valid and writable.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    vmm::phys_to_virt(src & !(PAGE_SIZE - 1)) as *const u8,
+                    vmm::phys_to_virt(vmm::virt_to_phys(dst_page).unwrap()) as *mut u8,
+                    PAGE_SIZE as usize,
+                );
+            }
         }
-        vm.mmaps.push(MmapRegion {
-            base,
-            pages: new_pages,
-            writable,
-            nx,
-        });
+        vm.mmaps.insert(
+            idx,
+            MmapRegion {
+                base,
+                pages: new_pages,
+                writable: old.writable,
+                nx: old.nx,
+                prot: old.prot,
+                anon: old.anon,
+            },
+        );
         if end > vm.mmap_next_hint {
             vm.mmap_next_hint = end;
         }
@@ -445,6 +514,8 @@ fn cut_regions(regions: &mut Vec<MmapRegion>, base: u64, pages: u64) {
                 pages: (ustart - rstart) / PAGE_SIZE,
                 writable: r.writable,
                 nx: r.nx,
+                prot: r.prot,
+                anon: r.anon,
             });
         }
         // Surviving right sub-range.
@@ -454,6 +525,8 @@ fn cut_regions(regions: &mut Vec<MmapRegion>, base: u64, pages: u64) {
                 pages: (rend - uend) / PAGE_SIZE,
                 writable: r.writable,
                 nx: r.nx,
+                prot: r.prot,
+                anon: r.anon,
             });
         }
     }
@@ -480,49 +553,179 @@ fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result
         .map(|n| n / PAGE_SIZE)
         .ok_or(Errno::EINVAL)?;
 
-    // First pass: every page in the range must be mapped, else -ENOMEM with no
-    // change applied (R4.8).
-    for i in 0..pages {
-        let page = addr
-            .checked_add(i.checked_mul(PAGE_SIZE).ok_or(Errno::EINVAL)?)
-            .ok_or(Errno::EINVAL)?;
-        if vmm::virt_to_phys(page).is_none() {
+    // Coverage check: every page in the range must belong to a tracked mmap
+    // region or the brk heap. Lazy (never-touched) pages are fine — Linux
+    // mprotect operates on VMAs, not on resident PTEs.
+    {
+        let mut covered = vm.mmaps.clone();
+        if vm.current_brk > vm.brk_lazy_from {
+            covered.push(MmapRegion {
+                base: vm.brk_lazy_from,
+                pages: (vm.current_brk - vm.brk_lazy_from).div_ceil(PAGE_SIZE),
+                writable: true,
+                nx: true,
+                prot: super::mem::PROT_READ | super::mem::PROT_WRITE,
+                anon: true,
+            });
+        }
+        if matches!(plan_munmap(addr, len, &covered), MunmapPlan::Reject(_)) {
             return Err(Errno::ENOMEM);
         }
     }
 
-    // Second pass: re-map each page with the new protection bits.
     let (writable, nx) = prot_to_flags(prot);
-    let flags = leaf_flags(writable, nx);
+    let prot_none = prot == 0;
+    // Second pass: only resident pages change hardware state. PROT_NONE drops
+    // the PTE entirely (a later touch must SIGSEGV, not re-back the page);
+    // everything else is re-mapped in place with the new bits.
     for i in 0..pages {
         let page = addr + i * PAGE_SIZE;
-        let frame = vmm::virt_to_phys(page).unwrap() & !(PAGE_SIZE - 1);
-        let _ = vmm::map(frame, page, flags);
+        if let Some(frame) = vmm::virt_to_phys(page) {
+            let _ = vmm::unmap(page);
+            if prot_none {
+                pmm::free_frame(frame & !(PAGE_SIZE - 1));
+            } else {
+                let _ = vmm::map(frame & !(PAGE_SIZE - 1), page, leaf_flags(writable, nx));
+            }
+        }
     }
 
-    update_region_flags(&mut vm.mmaps, addr, pages, writable, nx);
+    update_region_flags(&mut vm.mmaps, addr, pages, writable, nx, prot);
     Ok(0)
 }
 
-/// Update the tracked `(writable, nx)` of any region whose pages fall entirely
-/// inside the reprotected span. Partial-overlap bookkeeping is intentionally
-/// coarse: only fully-covered regions have their recorded flags refreshed (the
-/// page tables themselves are always updated above).
+/// Update the tracked `(writable, nx)`/`prot` of any region whose pages fall
+/// entirely inside the reprotected span. Partial-overlap bookkeeping is
+/// intentionally coarse: only fully-covered regions have their recorded flags
+/// refreshed (the page tables themselves are always updated above).
 fn update_region_flags(
     regions: &mut [MmapRegion],
     base: u64,
     pages: u64,
     writable: bool,
     nx: bool,
+    prot: u32,
 ) {
     let ustart = base;
-    let uend = base + pages * PAGE_SIZE;
+    let uend = base.saturating_add(pages.saturating_mul(PAGE_SIZE));
     for r in regions.iter_mut() {
         let rstart = r.base;
-        let rend = r.base + r.pages * PAGE_SIZE;
+        let rend = r.base.saturating_add(r.pages.saturating_mul(PAGE_SIZE));
         if rstart >= ustart && rend <= uend {
             r.writable = writable;
             r.nx = nx;
+            r.prot = prot;
         }
     }
+}
+
+/// Write-fault on a present page: copy-on-write service. The page must be a
+/// `COW_BIT` leaf left by [`fork_user_space_cow`] AND live inside a writable
+/// VMA (or the brk heap) — a write into read-only ELF text still SIGSEGVs.
+/// Works for ring-3 faults and kernel-mode faults on user addresses
+/// (`copy_out` over a fork-shared buffer).
+fn handle_cow_fault(addr: u64, caused_by_write: bool) -> bool {
+    if !caused_by_write || compat::compat_lock_held() {
+        return false;
+    }
+    let page = addr & !(PAGE_SIZE - 1);
+    compat::with_current_compat(|cs| {
+        let vm = &mut cs.vm.lock();
+        let brk_end = vm.current_brk.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let in_writable_vma = vm.mmaps.iter().any(|r| {
+            page >= r.base
+                && page < r.base + r.pages * PAGE_SIZE
+                && r.writable
+                && r.prot & super::mem::PROT_WRITE != 0
+        });
+        let in_brk = page >= vm.brk_lazy_from && page < brk_end;
+        if !in_writable_vma && !in_brk {
+            return false;
+        }
+        crate::memory::vmm::cow_copy_page(page)
+    })
+    .unwrap_or(false)
+}
+
+/// Back the page at `addr` on demand (anonymous `mmap` regions and the `brk`
+/// heap). Called from the #PF handler for every page fault, before any
+/// diagnostic/SIGSEGV path.
+///
+/// Returns `true` when the fault was serviced: a zero frame was mapped with
+/// the region's protection bits and the faulting instruction may simply retry.
+/// Returns `false` when the address is not lazily servable — the caller's
+/// existing SIGSEGV/diagnostic path applies:
+///
+///   * a PROTECTION_VIOLATION fault (page present, access type bad — NX/RO
+///     violations must SIGSEGV; COW will hook here later);
+///   * an address at or above `USER_ADDR_MAX` (kernel-side wild pointer);
+///   * a page inside a `PROT_NONE` region (stack guard semantics);
+///   * a page inside an eager (file-backed) region — those are always fully
+///     mapped, so a missing PTE is a kernel bug;
+///   * an address covered by no region and outside the brk heap.
+///
+/// Contract with the syscall layer (see the module docs): kernel code never
+/// touches user memory while holding the compat registry lock, so this handler
+/// can always take that lock. `compat::compat_lock_held()` is the tripwire for
+/// violations of that rule — such a fault is reported as a segfault instead of
+/// deadlocking the CPU on a non-reentrant spinlock.
+pub fn handle_user_page_fault(
+    addr: u64,
+    protection_violation: bool,
+    caused_by_write: bool,
+) -> bool {
+    if addr >= USER_ADDR_MAX {
+        return false;
+    }
+    if protection_violation {
+        return handle_cow_fault(addr, caused_by_write);
+    }
+    if compat::compat_lock_held() {
+        crate::error!(
+            "[PF] fault on user addr 0x{:x} inside with_current_compat - refusing re-entry",
+            addr
+        );
+        return false;
+    }
+    let page = addr & !(PAGE_SIZE - 1);
+    compat::with_current_compat(|cs| {
+        let vm = &mut cs.vm.lock();
+        // brk heap: pages in [brk_lazy_from, page_up(current_brk)) are backed
+        // on first touch, always writable + NX.
+        let brk_end = vm.current_brk.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        if page >= vm.brk_lazy_from && page < brk_end {
+            if vmm::virt_to_phys(page).is_some() {
+                return true; // resident again (shrink/grow race); retry
+            }
+            return map_zeroed_range(page, page + PAGE_SIZE, leaf_flags(true, true));
+        }
+        // Tracked mmap regions.
+        let Some(r) = vm
+            .mmaps
+            .iter()
+            .find(|r| page >= r.base && page < r.base + r.pages * PAGE_SIZE)
+        else {
+            return false;
+        };
+        if r.prot == 0 {
+            // PROT_NONE (e.g. a thread-stack guard page): a touch is a
+            // genuine SIGSEGV, never a mapping opportunity.
+            return false;
+        }
+        if vmm::virt_to_phys(page).is_some() {
+            return true; // already resident; retry
+        }
+        if !r.anon {
+            // File-backed regions are eagerly mapped; a missing PTE here is a
+            // kernel bug, not a lazy-mapping case.
+            crate::error!(
+                "[PF] missing PTE in eager file-backed region base=0x{:x} addr=0x{:x}",
+                r.base,
+                addr
+            );
+            return false;
+        }
+        map_zeroed_range(page, page + PAGE_SIZE, leaf_flags(r.writable, r.nx))
+    })
+    .unwrap_or(false)
 }
