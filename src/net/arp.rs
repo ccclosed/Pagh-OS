@@ -35,6 +35,8 @@ struct Entry {
     ip: Ipv4Addr,
     mac: Mac,
     expires: u64,
+    /// Last time this mapping was (re)learned — LRU victim selection.
+    updated: u64,
 }
 
 struct Pending {
@@ -73,22 +75,35 @@ impl ArpTable {
             if slot.ip == ip {
                 slot.mac = mac;
                 slot.expires = now + ENTRY_TTL_TICKS;
+                slot.updated = now;
                 return;
             }
         }
-        // Otherwise: prefer a free slot, then an expired one, then index 0.
-        let mut victim: Option<usize> = self.entries.iter().position(|s| s.is_none());
-        if victim.is_none() {
-            victim = self
-                .entries
-                .iter()
-                .position(|s| s.map(|e| e.expires <= now).unwrap_or(false));
-        }
-        let v = victim.unwrap_or(0);
-        self.entries[v] = Some(Entry {
+        // Otherwise: prefer a free slot, then an expired one, then evict the
+        // least recently (re)learned entry (LRU). The index-0 fallback is
+        // unreachable while CACHE_SIZE > 0 but keeps the lookup total.
+        let victim = self
+            .entries
+            .iter()
+            .position(|s| s.is_none())
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .position(|s| s.map(|e| e.expires <= now).unwrap_or(false))
+            })
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, s)| s.map(|e| e.updated).unwrap_or(0))
+                    .map(|(i, _)| i)
+            })
+            .unwrap_or(0);
+        self.entries[victim] = Some(Entry {
             ip,
             mac,
             expires: now + ENTRY_TTL_TICKS,
+            updated: now,
         });
     }
 
@@ -135,23 +150,29 @@ impl ArpTable {
         crate::drivers::e1000::send(&frame);
     }
 
-    /// Handle an incoming ARP packet. On REQUEST for our address (or broadcast)
-    /// reply with our MAC; on any valid packet learn sender_ip -> sender_mac.
+    /// Handle an incoming ARP packet. On REQUEST for our address reply with
+    /// our MAC; on a REPLY to one of OUR outstanding resolutions learn
+    /// sender_ip -> sender_mac and flush pending frames.
+    ///
+    /// Learning is deliberately restricted (anti-spoofing): unsolicited
+    /// replies and requests about third parties never touch the cache — an
+    /// attacker cannot remap an arbitrary IP by broadcasting crafted packets.
     pub fn input(&mut self, my_mac: Mac, my_ip: Option<Ipv4Addr>, pkt: &[u8], now: u64) {
         let Some(p) = wire::arp_parse(pkt) else {
             return;
         };
 
-        // Learn from every packet (gratuitous/replies/requests alike).
-        if !p.sender_ip.is_unspecified() {
-            self.insert(p.sender_ip, p.sender_mac, now);
-        }
-
         match p.operation {
             wire::ARP_REQUEST => {
-                // Reply only when someone asks for US.
+                // Reply only when someone asks for US. Such a request is a
+                // legitimate first contact from the requester, so its sender
+                // mapping may be learned (sender/target pair consistent with
+                // a request for our address).
                 let wants_us = my_ip.map(|i| i == p.target_ip).unwrap_or(false);
                 if wants_us {
+                    if !p.sender_ip.is_unspecified() {
+                        self.insert(p.sender_ip, p.sender_mac, now);
+                    }
                     let reply = wire::arp_build(
                         wire::ARP_REPLY,
                         my_mac,
@@ -165,18 +186,28 @@ impl ArpTable {
                 }
             }
             wire::ARP_REPLY => {
-                // Resolution complete: stop requesting, flush pending frames.
-                self.inflight.retain(|(t, _, _)| *t != p.sender_ip);
-                let mut ready: VecDeque<Pending> = VecDeque::new();
-                while let Some(fr) = self.pending.pop_front() {
-                    if fr.dst_ip == p.sender_ip {
-                        let frame = eth_frame(p.sender_mac, my_mac, fr.ethertype, &fr.payload);
-                        crate::drivers::e1000::send(&frame);
-                    } else {
-                        ready.push_back(fr);
+                // Resolution result: accepted only while WE have a request
+                // outstanding for this address. Then stop requesting and
+                // flush the frames parked for it.
+                let expected = self
+                    .inflight
+                    .iter()
+                    .any(|(t, _, _)| *t == p.sender_ip && !p.sender_ip.is_unspecified());
+                if expected {
+                    self.insert(p.sender_ip, p.sender_mac, now);
+                    self.inflight.retain(|(t, _, _)| *t != p.sender_ip);
+                    let mut ready: VecDeque<Pending> = VecDeque::new();
+                    while let Some(fr) = self.pending.pop_front() {
+                        if fr.dst_ip == p.sender_ip {
+                            let frame =
+                                eth_frame(p.sender_mac, my_mac, fr.ethertype, &fr.payload);
+                            crate::drivers::e1000::send(&frame);
+                        } else {
+                            ready.push_back(fr);
+                        }
                     }
+                    self.pending = ready;
                 }
-                self.pending = ready;
             }
             _ => {}
         }

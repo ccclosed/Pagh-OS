@@ -31,13 +31,13 @@ use ::alloc::vec::Vec;
 use crate::drivers::BlockDevice;
 use crate::fs::journal::{Journal, JournalArea};
 use crate::fs::FsError;
-use crate::sync::spinlock::Spinlock;
-use crate::vfs::{VfsError, VfsNode, VfsResult};
+use crate::sync::spinlock::{Spinlock, SpinlockGuard};
+use crate::vfs::{FsStat, VfsError, VfsNode, VfsResult};
 
 use structs::{
-    read_struct, read_u32, write_struct, write_u32, Ext2GroupDesc, Ext2Inode, Ext2SuperBlock, BS,
-    EXT2_FIRST_INO, EXT2_MAGIC, EXT2_ROOT_INO, INODE_SIZE, PTRS_PER_BLOCK, SECTORS_PER_BLOCK,
-    S_IFDIR, S_IFREG,
+    inode_size, read_struct, read_u32, write_struct, write_u32, Ext2GroupDesc, Ext2Inode,
+    Ext2SuperBlock, BS, EXT2_FIRST_INO, EXT2_MAGIC, EXT2_ROOT_INO, INODE_SIZE, PTRS_PER_BLOCK,
+    SECTORS_PER_BLOCK, S_IFDIR, S_IFREG,
 };
 
 // ─── format layout constants (single block group) ───────────────────────────
@@ -79,17 +79,38 @@ pub struct Ext2Fs {
     dev: Arc<dyn BlockDevice>,
     inner: Spinlock<Ext2Inner>,
     journal: Spinlock<Journal>,
+    /// Serializes mutating transactions: a `Tx` snapshots `sb`/`gds` and
+    /// writes them back at `commit`, so two concurrent mutations would race
+    /// their bitmap/free-count updates (lost updates, double allocation).
+    tx_lock: Spinlock<()>,
 }
 
-fn inode_location(sb: &Ext2SuperBlock, gds: &[Ext2GroupDesc], ino: u32) -> (u64, usize) {
+/// Locate inode `ino` in its group's inode table.
+///
+/// Validates the inode number: garbage (0 / past `s_inodes_count` / a group
+/// beyond the descriptor table) is `Corrupt` — silently clamping the group
+/// used to alias another inode's table slot, which later freed arbitrary
+/// blocks out of a corrupted directory entry.
+fn inode_location(
+    sb: &Ext2SuperBlock,
+    gds: &[Ext2GroupDesc],
+    ino: u32,
+) -> Result<(u64, usize), FsError> {
+    if ino == 0 || ino > sb.s_inodes_count {
+        return Err(FsError::Corrupt);
+    }
     let index = (ino - 1) as u64;
     let ipg = sb.s_inodes_per_group.max(1) as u64;
-    let group = core::cmp::min((index / ipg) as usize, gds.len().saturating_sub(1));
+    let group = (index / ipg) as usize;
+    if group >= gds.len() {
+        return Err(FsError::Corrupt);
+    }
     let within = index % ipg;
-    let ipb = (BS / INODE_SIZE) as u64; // inodes per block (32)
+    let isz = inode_size(sb);
+    let ipb = (BS / isz) as u64;
     let block = gds[group].bg_inode_table as u64 + within / ipb;
-    let off = (within % ipb) as usize * INODE_SIZE;
-    (block, off)
+    let off = (within % ipb) as usize * isz;
+    Ok((block, off))
 }
 
 impl Ext2Fs {
@@ -116,15 +137,9 @@ impl Ext2Fs {
     }
 
     pub fn read_inode(&self, ino: u32) -> Result<Ext2Inode, FsError> {
-        if ino == 0 {
-            return Err(FsError::Corrupt);
-        }
         let (block, off) = {
             let inner = self.inner.lock();
-            if ino > inner.sb.s_inodes_count {
-                return Err(FsError::Corrupt);
-            }
-            inode_location(&inner.sb, &inner.gds, ino)
+            inode_location(&inner.sb, &inner.gds, ino)?
         };
         let buf = self.read_fs_block(block)?;
         Ok(unsafe { read_struct::<Ext2Inode>(&buf[off..]) })
@@ -154,6 +169,9 @@ impl Ext2Fs {
 /// handed to the journal as a single atomic transaction.
 struct Tx<'a> {
     fs: &'a Ext2Fs,
+    /// Held for the whole Tx lifetime: mutating transactions are serialized
+    /// per-fs (see `Ext2Fs::tx_lock`).
+    _tx_guard: SpinlockGuard<'a, ()>,
     sb: Ext2SuperBlock,
     gds: Vec<Ext2GroupDesc>,
     dirty: BTreeMap<u64, Vec<u8>>,
@@ -165,9 +183,11 @@ struct Tx<'a> {
 
 impl<'a> Tx<'a> {
     fn new(fs: &'a Ext2Fs) -> Self {
+        let _tx_guard = fs.tx_lock.lock();
         let inner = fs.inner.lock();
         Tx {
             fs,
+            _tx_guard,
             sb: inner.sb,
             gds: inner.gds.clone(),
             dirty: BTreeMap::new(),
@@ -312,17 +332,94 @@ impl<'a> Tx<'a> {
     }
 
     fn read_inode(&mut self, ino: u32) -> Result<Ext2Inode, FsError> {
-        let (block, off) = inode_location(&self.sb, &self.gds, ino);
+        // inode_location rejects 0 / out-of-range inos: a garbage dirent inode
+        // must never resolve to a clamped table slot (arbitrary block frees).
+        let (block, off) = inode_location(&self.sb, &self.gds, ino)?;
         self.block(block)?;
         let buf = self.dirty.get(&block).unwrap();
         Ok(unsafe { read_struct::<Ext2Inode>(&buf[off..]) })
     }
 
     fn write_inode(&mut self, ino: u32, inode: &Ext2Inode) -> Result<(), FsError> {
-        let (block, off) = inode_location(&self.sb, &self.gds, ino);
+        let (block, off) = inode_location(&self.sb, &self.gds, ino)?;
         let b = self.block(block)?;
         unsafe { write_struct(&mut b[off..], inode) };
         Ok(())
+    }
+
+    /// Clear the mapping for logical block `lbn`, freeing the data block and
+    /// any indirect block that becomes empty. Returns the number of freed
+    /// blocks (data + indirect) so the caller can adjust `i_blocks`.
+    fn clear_mapping(&mut self, inode: &mut Ext2Inode, lbn: u64) -> Result<u32, FsError> {
+        if lbn < 12 {
+            let i = lbn as usize;
+            if inode.i_block[i] == 0 {
+                return Ok(0);
+            }
+            self.free_data_block(inode.i_block[i])?;
+            inode.i_block[i] = 0;
+            return Ok(1);
+        }
+        let ppb = PTRS_PER_BLOCK as u64;
+        let l = lbn - 12;
+        let (root_slot, path) = if l < ppb {
+            (12usize, vec![l as u32])
+        } else if l - ppb < ppb * ppb {
+            let l2 = l - ppb;
+            (13, vec![(l2 / ppb) as u32, (l2 % ppb) as u32])
+        } else {
+            let t = l - ppb * ppb;
+            if t >= ppb * ppb * ppb {
+                return Ok(0); // beyond the triple-indirect range
+            }
+            (
+                14,
+                vec![
+                    (t / (ppb * ppb)) as u32,
+                    ((t / ppb) % ppb) as u32,
+                    (t % ppb) as u32,
+                ],
+            )
+        };
+        let root = inode.i_block[root_slot];
+        if root == 0 {
+            return Ok(0);
+        }
+        let (empty, freed) = self.clear_slot(root, &path, path.len() as u32)?;
+        if empty {
+            self.free_data_block(root)?;
+            inode.i_block[root_slot] = 0;
+            return Ok(freed + 1);
+        }
+        Ok(freed)
+    }
+
+    /// Free the leaf (and any emptied child indirect blocks) under `ind`,
+    /// zeroing the traversed pointer slots. Returns `(ind became fully
+    /// empty, blocks freed below ind)`.
+    fn clear_slot(&mut self, ind: u32, path: &[u32], level: u32) -> Result<(bool, u32), FsError> {
+        let slot = path[0] as usize;
+        self.block(ind as u64)?;
+        let child = read_u32(self.dirty.get(&(ind as u64)).unwrap(), slot * 4);
+        let mut freed = 0u32;
+        if child != 0 {
+            let child_empty = if level > 1 {
+                let (e, f) = self.clear_slot(child, &path[1..], level - 1)?;
+                freed += f;
+                e
+            } else {
+                self.free_data_block(child)?;
+                freed += 1;
+                true
+            };
+            if child_empty {
+                let b = self.dirty.get_mut(&(ind as u64)).unwrap();
+                write_u32(b, slot * 4, 0);
+            }
+        }
+        let b = self.dirty.get(&(ind as u64)).unwrap();
+        let empty = b.chunks_exact(4).all(|c| c == [0u8; 4]);
+        Ok((empty, freed))
     }
 
     /// Map (allocating as needed) logical block `lbn` of `inode` to an ext2
@@ -682,7 +779,7 @@ impl Ext2Fs {
         root_inode.i_blocks = (BS / 512) as u32;
         root_inode.i_block[0] = root_dir_block;
 
-        let (rblock, roff) = inode_location(&sb, &gds, EXT2_ROOT_INO);
+        let (rblock, roff) = inode_location(&sb, &gds, EXT2_ROOT_INO)?;
         let mut itbuf = vec![0u8; BS];
         unsafe { write_struct(&mut itbuf[roff..], &root_inode) };
         Self::write_fs_block_direct(&*dev, rblock, &itbuf)?;
@@ -712,6 +809,14 @@ impl Ext2Fs {
         }
         if sb.s_blocks_per_group == 0 || sb.s_inodes_per_group == 0 {
             return Err(FsError::BadSuperBlock);
+        }
+        // Rev >= 1 must declare a sane inode size; address math would land on
+        // arbitrary table bytes otherwise. Rev 0 images always use 128.
+        if sb.s_rev_level >= 1 {
+            let isz = sb.s_inode_size as usize;
+            if isz < INODE_SIZE || isz > BS || !isz.is_power_of_two() {
+                return Err(FsError::BadSuperBlock);
+            }
         }
         let span = sb.s_blocks_count.saturating_sub(sb.s_first_data_block);
         let groups = ((span as u64 + sb.s_blocks_per_group as u64 - 1)
@@ -827,6 +932,7 @@ impl Ext2Fs {
             dev,
             inner: Spinlock::new(Ext2Inner { sb, gds }),
             journal: Spinlock::new(journal),
+            tx_lock: Spinlock::new(()),
         }))
     }
 
@@ -838,27 +944,35 @@ impl Ext2Fs {
 
     /// Build the root directory node (inode 2).
     pub fn root_node(self: &Arc<Self>) -> Arc<dyn VfsNode> {
+        let cached_size = self
+            .read_inode(EXT2_ROOT_INO)
+            .map(|i| i.i_size as u64)
+            .unwrap_or(0);
         Arc::new(Ext2Dir {
             fs: self.clone(),
             ino: EXT2_ROOT_INO,
             name: String::from("/"),
+            cached_size,
         })
     }
 
     /// Build a child node by inode/name, choosing dir vs file from `i_mode`.
     fn node_for(fs: &Arc<Ext2Fs>, ino: u32, name: &str) -> Result<Arc<dyn VfsNode>, FsError> {
         let inode = fs.read_inode(ino)?;
+        let cached_size = inode.i_size as u64;
         if inode.is_dir() {
             Ok(Arc::new(Ext2Dir {
                 fs: fs.clone(),
                 ino,
                 name: String::from(name),
+                cached_size,
             }))
         } else {
             Ok(Arc::new(Ext2File {
                 fs: fs.clone(),
                 ino,
                 name: String::from(name),
+                cached_size,
             }))
         }
     }
@@ -920,9 +1034,14 @@ impl Ext2Fs {
         let mut dinode = tx.read_inode(dir_ino)?;
         let nblocks = (dinode.i_size as usize + BS - 1) / BS;
 
-        // Try existing blocks.
+        // Try existing blocks. Read-only scan: holes must NOT be mapped with
+        // map_or_alloc here — that would allocate a block (and bump
+        // i_blocks/bitmaps) just to look for a name, leaking the allocation
+        // whenever the scan ends in an early error path.
         for lbn in 0..nblocks as u64 {
-            let blk = tx.map_or_alloc(&mut dinode, lbn)?;
+            let Some(blk) = inode::block_for_offset(tx.fs, &dinode, lbn * BS as u64)? else {
+                continue;
+            };
             let inserted = {
                 let buf = tx.block(blk as u64)?;
                 dir::insert_into_block(buf, name, child_ino)?
@@ -1019,7 +1138,10 @@ impl Ext2Fs {
         let nblocks = (pinode.i_size as usize + BS - 1) / BS;
         let mut found: Option<(u64, u32)> = None; // (dir block, child ino)
         for lbn in 0..nblocks as u64 {
-            let blk = tx.map_or_alloc(&mut pinode, lbn)?;
+            // Read-only scan (see insert_dirent): never allocate on a lookup.
+            let Some(blk) = inode::block_for_offset(tx.fs, &pinode, lbn * BS as u64)? else {
+                continue;
+            };
             let hit = {
                 let buf = tx.block(blk as u64)?;
                 dir::find(buf, name)?
@@ -1096,18 +1218,62 @@ impl Ext2Fs {
         Ok(to_read)
     }
 
-    /// Truncate a regular file to zero bytes, freeing all direct and indirect
-    /// blocks in one journal transaction.
-    pub fn truncate_file(&self, ino: u32) -> Result<(), FsError> {
+    /// Truncate a regular file to `new_size` bytes.
+    ///
+    /// Shrinking frees the blocks beyond the new size in one journal
+    /// transaction (clearing their tree pointers and freeing indirect blocks
+    /// that become empty) and zeroes the tail of the boundary block. Growing
+    /// zero-fills the gap through the regular write path. `i_size` is a
+    /// 32-bit field, so larger sizes are `FileTooBig`.
+    pub fn truncate_file(&self, ino: u32, new_size: u64) -> Result<(), FsError> {
+        if new_size > u32::MAX as u64 {
+            return Err(FsError::FileTooBig);
+        }
+        let inode0 = self.read_inode(ino)?;
+        if inode0.is_dir() {
+            return Err(FsError::Corrupt);
+        }
+        let old_size = inode0.i_size as u64;
+        if new_size == old_size {
+            return Ok(());
+        }
+        if new_size > old_size {
+            const ZERO_CHUNK: usize = 64 * 1024;
+            let zeros = [0u8; ZERO_CHUNK];
+            let mut off = old_size;
+            while off < new_size {
+                let n = core::cmp::min(ZERO_CHUNK as u64, new_size - off) as usize;
+                self.write_file(ino, off, &zeros[..n])?;
+                off += n as u64;
+            }
+            return Ok(());
+        }
+
+        // Shrink.
         let mut tx = Tx::new(self);
         let mut inode = tx.read_inode(ino)?;
         if inode.is_dir() {
             return Err(FsError::Corrupt);
         }
-        tx.free_all_blocks(&inode)?;
-        inode.i_size = 0;
-        inode.i_blocks = 0;
-        inode.i_block = [0; 15];
+        let old_nblocks = (old_size as usize + BS - 1) / BS;
+        let new_nblocks = (new_size as usize + BS - 1) / BS;
+        let mut freed: u32 = 0;
+        for lbn in new_nblocks..old_nblocks {
+            freed += tx.clear_mapping(&mut inode, lbn as u64)?;
+        }
+        // Zero the tail of the boundary block when the new size is not
+        // block-aligned and that block is materialized.
+        if new_size % BS as u64 != 0 && new_nblocks > 0 {
+            let lbn = (new_nblocks - 1) as u64;
+            if let Some(blk) = inode::block_for_offset(tx.fs, &inode, lbn * BS as u64)? {
+                let b = tx.data_block(blk as u64, false)?;
+                for x in b[(new_size % BS as u64) as usize..].iter_mut() {
+                    *x = 0;
+                }
+            }
+        }
+        inode.i_size = new_size as u32;
+        inode.i_blocks = inode.i_blocks.saturating_sub(freed * (BS / 512) as u32);
         tx.write_inode(ino, &inode)?;
         tx.commit()
     }
@@ -1129,6 +1295,11 @@ impl Ext2Fs {
     pub fn write_file(&self, ino: u32, offset: u64, data: &[u8]) -> Result<usize, FsError> {
         if data.is_empty() {
             return Ok(0);
+        }
+        // `i_size` is a 32-bit field: a write past 4 GiB would wrap `i_size`
+        // and alias the file to its low 4 GiB.
+        if offset.saturating_add(data.len() as u64) > u32::MAX as u64 {
+            return Err(FsError::FileTooBig);
         }
         // 64 data blocks per Tx — data is no longer journaled,
         // so the WAL cap only has to fit the metadata blocks.
@@ -1175,6 +1346,7 @@ fn fs_to_vfs(e: FsError) -> VfsError {
         FsError::NotFound => VfsError::NotFound,
         FsError::AlreadyExists => VfsError::AlreadyExists,
         FsError::NameTooLong => VfsError::InvalidArgument,
+        FsError::FileTooBig => VfsError::InvalidArgument,
         FsError::OutOfSpace => VfsError::IoError,
         _ => VfsError::IoError,
     }
@@ -1184,6 +1356,10 @@ struct Ext2Dir {
     fs: Arc<Ext2Fs>,
     ino: u32,
     name: String,
+    /// Size observed when the node was created (after a successful inode
+    /// read). Fallback for `size()` when a later `read_inode` hits a device
+    /// error: reporting 0 made installers copy empty files (ld-linux.so).
+    cached_size: u64,
 }
 
 impl VfsNode for Ext2Dir {
@@ -1195,6 +1371,16 @@ impl VfsNode for Ext2Dir {
     }
     fn fs_ino(&self) -> u64 {
         self.ino as u64
+    }
+    fn fs_stat(&self) -> Option<FsStat> {
+        let sb = self.fs.superblock();
+        Some(FsStat {
+            block_size: BS as u64,
+            blocks_total: sb.s_blocks_count as u64,
+            blocks_free: sb.s_free_blocks_count as u64,
+            inodes_total: sb.s_inodes_count as u64,
+            inodes_free: sb.s_free_inodes_count as u64,
+        })
     }
     fn readdir(&self) -> VfsResult<Vec<Arc<dyn VfsNode>>> {
         let entries = self.fs.read_dir_entries(self.ino).map_err(fs_to_vfs)?;
@@ -1227,10 +1413,10 @@ impl VfsNode for Ext2Dir {
         self.fs.sync()
     }
     fn size(&self) -> u64 {
-        self.fs
-            .read_inode(self.ino)
-            .map(|i| i.i_size as u64)
-            .unwrap_or(0)
+        match self.fs.read_inode(self.ino) {
+            Ok(i) => i.i_size as u64,
+            Err(_) => self.cached_size,
+        }
     }
 }
 
@@ -1238,6 +1424,8 @@ struct Ext2File {
     fs: Arc<Ext2Fs>,
     ino: u32,
     name: String,
+    /// See `Ext2Dir::cached_size`.
+    cached_size: u64,
 }
 
 impl VfsNode for Ext2File {
@@ -1250,6 +1438,16 @@ impl VfsNode for Ext2File {
     fn fs_ino(&self) -> u64 {
         self.ino as u64
     }
+    fn fs_stat(&self) -> Option<FsStat> {
+        let sb = self.fs.superblock();
+        Some(FsStat {
+            block_size: BS as u64,
+            blocks_total: sb.s_blocks_count as u64,
+            blocks_free: sb.s_free_blocks_count as u64,
+            inodes_total: sb.s_inodes_count as u64,
+            inodes_free: sb.s_free_inodes_count as u64,
+        })
+    }
     fn read(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         self.fs.read_file(self.ino, offset, buf).map_err(fs_to_vfs)
     }
@@ -1257,15 +1455,12 @@ impl VfsNode for Ext2File {
         self.fs.write_file(self.ino, offset, buf).map_err(fs_to_vfs)
     }
     fn truncate(&self, size: u64) -> VfsResult<()> {
-        if size != 0 {
-            return Err(VfsError::NotSupported);
-        }
-        self.fs.truncate_file(self.ino).map_err(fs_to_vfs)
+        self.fs.truncate_file(self.ino, size).map_err(fs_to_vfs)
     }
     fn size(&self) -> u64 {
-        self.fs
-            .read_inode(self.ino)
-            .map(|i| i.i_size as u64)
-            .unwrap_or(0)
+        match self.fs.read_inode(self.ino) {
+            Ok(i) => i.i_size as u64,
+            Err(_) => self.cached_size,
+        }
     }
 }

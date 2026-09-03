@@ -2,6 +2,7 @@
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
 use crate::sync::spinlock::Spinlock;
+use alloc::collections::BTreeMap;
 use limine::memmap;
 use limine::request::MemmapResponse;
 
@@ -126,23 +127,22 @@ pub fn init(memmap: &MemmapResponse) {
     );
 
     // Find a usable region large enough to hold the bitmap.
-    // Place it in the largest usable region to avoid wasting kernel-adjacent memory.
+    // Every candidate is fully fit-checked: prefer 2 MB into the region (the
+    // bitmap's own frames are reserved explicitly below, so the offset is
+    // just a placement choice), fall back to the region start; a region only
+    // qualifies when the ENTIRE bitmap lands inside it. Scanning all usable
+    // regions (not just the first) means a small low-memory hole cannot win
+    // the placement over a later region that truly fits.
     let mut bitmap_phys_addr: u64 = 0;
     for entry in entries {
         if entry.type_ == memmap::MEMMAP_USABLE {
+            let region_end = entry.base + entry.length;
             if entry.length >= bitmap_bytes as u64 {
-                // Place the bitmap 2 MB into this region. The bitmap's own
-                // frames are reserved explicitly below (the
-                // bitmap-own-frames skip), so this offset is just a placement
-                // choice — it no longer depends on any kernel-location
-                // assumption now that kernel frames are reserved by their
-                // non-usable memmap classification.
                 let candidate = (entry.base + 0x200000) & !(FRAME_SIZE - 1); // 2MB offset
-                if candidate + bitmap_bytes as u64 <= entry.base + entry.length {
+                if candidate + bitmap_bytes as u64 <= region_end {
                     bitmap_phys_addr = candidate;
                     break;
                 }
-                // Fallback: use start of region
                 bitmap_phys_addr = entry.base;
                 break;
             }
@@ -150,9 +150,14 @@ pub fn init(memmap: &MemmapResponse) {
     }
 
     if bitmap_phys_addr == 0 {
-        // Last resort: truncate bitmap and use start of first usable region
-        crate::warn!("[PMM] no region large enough for full bitmap, truncating");
-        bitmap_phys_addr = base;
+        // No usable region can hold the full bitmap. Continuing with a
+        // truncated bitmap (or one spilling past its region) would let the
+        // allocator hand out or corrupt frames outside the covered range, so
+        // refuse to boot instead of failing silently later.
+        panic!(
+            "[PMM] no usable memory region fits the {}-byte frame bitmap ({} frames in 0x{:x}..0x{:x}); cannot initialize the frame allocator",
+            bitmap_bytes, total_frames, base, top
+        );
     }
 
     crate::debug!("Bitmap at physical: 0x{:x}", bitmap_phys_addr);
@@ -495,9 +500,54 @@ pub fn free_frame(addr: u64) {
     }
 }
 
+// ─── COW frame sharing (fork copy-on-write) ──────────────────────────────────
+//
+// `fork_user_space_cow` shares every leaf frame between the parent and the
+// child address space instead of copying it. The frame's physical address is
+// keyed here with the number of address spaces that reference it as COW
+// sharers. Frames enter the map with count 2 at fork time and leave it either
+// via a copy-on-write fault (one side gets a private copy) or via an exit
+// reaper unref. The frame is returned to the free bitmap exactly when the
+// count reaches zero — never before, so a child exiting first cannot pull the
+// parent's data out from under it.
+//
+// The map is deliberately tiny-typed and separate from the bitmap: only COW
+// frames are counted, kernel frames and pre-fork private frames keep the
+// plain alloc/free protocol.
+
+static COW_REFS: Spinlock<BTreeMap<u64, u32>> = Spinlock::new(BTreeMap::new());
+
+/// Register one additional COW sharer of `frame` (fork: called once per
+/// shared leaf, taking the count to 2).
+pub fn cow_ref(frame: u64) {
+    let mut m = COW_REFS.lock();
+    let e = m.entry(frame & !(FRAME_SIZE - 1)).or_insert(0);
+    *e += 1;
+}
+
+/// Drop one COW sharer of `frame`. Returns `true` when the caller must hand
+/// the frame back to the free bitmap (no address space references it
+/// anymore); `false` while at least one sharer remains.
+pub fn cow_unref(frame: u64) -> bool {
+    let mut m = COW_REFS.lock();
+    let key = frame & !(FRAME_SIZE - 1);
+    match m.get_mut(&key) {
+        Some(1) => {
+            m.remove(&key);
+            true
+        }
+        Some(n) => {
+            *n -= 1;
+            false
+        }
+        // Not (or no longer) a tracked COW frame — treat as exclusively
+        // owned: the caller frees it.
+        None => true,
+    }
+}
+
 /// Total number of frames tracked.
-pub fn total_frames() -> usize {
-    match *PMM.lock() {
+pub fn total_frames() -> usize {    match *PMM.lock() {
         Some(ref pmm) => pmm.total_frames,
         None => 0,
     }

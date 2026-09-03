@@ -641,15 +641,22 @@ pub fn exec_linux_image(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<Ex
         })
         .ok_or(RunError::LoadFailed("execve without compat state"))?;
         // SAFETY: loader built a valid PML4 with shared kernel higher-half mappings.
+        let old_cr3 = vmm::current_pml4_phys();
         unsafe {
             vmm::load_cr3(elf.pml4_phys);
         }
+        // The replaced address space is dead: return its frames (COW leaves
+        // are unref'd, so a fork child exec'ing releases the parent's shared
+        // frames). Skipped when another task still shares the CR3.
+        let freed = scheduler::drop_exclusive_user_space(old_cr3);
         crate::info!(
-            "[linux] execve pid={} '{}' new_pml4=0x{:x} entry=0x{:x}",
+            "[linux] execve pid={} '{}' new_pml4=0x{:x} entry=0x{:x} old_cr3=0x{:x} freed={}",
             pid,
             path,
             elf.pml4_phys,
-            loaded.start_entry
+            loaded.start_entry,
+            old_cr3,
+            freed
         );
         Ok(ExecImage {
             entry: loaded.start_entry,
@@ -723,8 +730,14 @@ pub fn fork_linux_process(
         let child = scheduler::next_pid();
         let parent_pml4 = vmm::current_pml4_phys();
         let child_pml4 = vmm::new_user_pml4().map_err(|_| "fork: no frame for child PML4")?;
-        vmm::clone_user_space(parent_pml4, child_pml4)
-            .map_err(|_| "fork: user-space copy failed")?;
+        // Copy-on-write share: the child mirrors the parent's leaf frames
+        // (refcounted), writable entries flip RO on both sides, and the next
+        // write on either side copies the page private. Falls back to the
+        // eager copier if the space uses huge pages (none do today).
+        if vmm::fork_user_space_cow(parent_pml4, child_pml4).is_err() {
+            vmm::clone_user_space(parent_pml4, child_pml4)
+                .map_err(|_| "fork: user-space copy failed")?;
+        }
         let child_top = setup_task_kernel_stack(child)?;
         // setup_task_kernel_stack points TSS RSP0 / the syscall stack at the
         // CHILD; the PARENT keeps running after this syscall, so point them back

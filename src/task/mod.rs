@@ -1,6 +1,7 @@
 pub mod compat;
 pub mod fd;
 pub mod fd_alloc;
+pub mod fpu;
 pub mod process;
 pub mod scheduler;
 pub mod stack;

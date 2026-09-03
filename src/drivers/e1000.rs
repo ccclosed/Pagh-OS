@@ -113,6 +113,10 @@ const RESET_SPINS: u32 = 1_000_000;
 /// How long to wait for the link (STATUS.LU), in poll iterations (~a few s).
 const LINK_SPINS: u32 = 5_000_000;
 
+/// Set after the first oversized-TX-frame warning, so a caller pushing huge
+/// buffers in a loop does not flood the console.
+static OVERSIZED_WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 // ─── Descriptors ─────────────────────────────────────────────────────────────
 
 /// Legacy transmit/receive descriptor (16 bytes). The trailing halfwords mean
@@ -387,13 +391,29 @@ impl E1000 {
     }
 
     /// Send one Ethernet frame. Returns the number of bytes queued to the NIC
-    /// (frame length on success), or 0 when the TX ring is momentarily full.
+    /// (frame length on success), or 0 when the TX ring is momentarily full or
+    /// the frame is too large for a single TX buffer (dropped, not truncated).
     pub fn send_frame(&mut self, data: &[u8]) -> usize {
         self.reclaim_tx();
         if self.tx_free == 0 {
             return 0;
         }
-        let len = core::cmp::min(data.len(), BUF_SIZE - 4);
+        let max = BUF_SIZE - 4;
+        if data.len() > max {
+            // A frame larger than one DMA buffer cannot be split across
+            // descriptors here; silently truncating it sent a corrupt packet
+            // whose length lied to the receiver. Normal Ethernet frames are
+            // at most 1514 bytes, so drop this one and say so (once).
+            if !OVERSIZED_WARNED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+                warn!(
+                    "e1000: dropped {}-byte TX frame (max {}); oversized frames are not splittable",
+                    data.len(),
+                    max
+                );
+            }
+            return 0;
+        }
+        let len = data.len();
 
         // Copy the frame into this slot's pre-allocated DMA buffer.
         let idx = self.tx_tail;

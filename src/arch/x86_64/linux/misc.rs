@@ -29,6 +29,7 @@ use super::timeconv::{encode_timeval, Timeval};
 /// the pure [`ticks_to_timespec`] so `clock_gettime` reports wall-ish time from the
 /// scheduler tick counter.
 use crate::arch::x86_64::apic::TICK_HZ;
+use crate::sync::spinlock::Spinlock;
 
 /// `arch_prctl` subfunction: set the `FS.base` register.
 const ARCH_SET_FS: u64 = 0x1002;
@@ -167,13 +168,32 @@ pub fn sys_getrandom(buf: u64, count: u64, _flags: u64) -> Result<u64, Errno> {
     Ok(n)
 }
 
-/// Produce the ELF `AT_RANDOM` block. Booting a userspace image is aborted by
-/// the caller only when stronger policy is required; for compatibility this API
-/// returns zeroes if the platform exposes no hardware entropy. Zeroes are safer
-/// than misrepresenting a predictable PRNG as cryptographic randomness.
+/// Produce the ELF `AT_RANDOM` block. Hardware entropy (RDSEED/RDRAND) is
+/// preferred. When the platform exposes none, the bytes are mixed from every
+/// cheap entropy source the kernel has — the tick clock, the RTC wall clock,
+/// the current pid, and a free-running process-lifetime counter — through a
+/// xorshift generator, so the block NEVER degrades to all-zero bytes
+/// (glibc consumes AT_RANDOM for stack-canary / pointer-mangling keys; a
+/// constant value defeats both).
 pub fn random_bytes_16() -> [u8; 16] {
     let mut out = [0u8; 16];
-    let _ = crate::security::entropy::fill(&mut out);
+    if crate::security::entropy::fill(&mut out).is_ok() {
+        return out;
+    }
+    static FALLBACK_STATE: Spinlock<u64> = Spinlock::new(0x9E37_79B9_7F4A_7C15);
+    let mut g = FALLBACK_STATE.lock();
+    let mut x = *g
+        ^ scheduler::ticks().wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (rtc::now_unix() as u64).rotate_left(32)
+        ^ scheduler::current_pid() << 48
+        ^ crate::security::entropy::secure_u64().unwrap_or(0);
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    let second = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    *g = x;
+    out[..8].copy_from_slice(&x.to_le_bytes());
+    out[8..].copy_from_slice(&second.to_le_bytes());
     out
 }
 
@@ -210,17 +230,30 @@ pub fn sys_exit_group(code: u64) -> ! {
     scheduler::exit_current()
 }
 
-/// `tgkill` (234): we model a single-threaded process, so a fatal signal a
-/// process sends to itself (glibc `abort()`/`raise()`) terminates the whole
-/// thread group with the conventional `128 + sig` exit code. Returning
-/// `ENOSYS` here made glibc's `abort()` fall through to a ring-3 `hlt`,
-/// which surfaced as a spurious #GP after every "Fatal Python error".
+/// `tgkill` (234): only the truly fatal signals terminate the thread group
+/// (glibc `abort()`/`raise()`). Benign signals (`SIGCHLD`, `SIGCONT`, `SIGSTOP`,
+/// `SIGWINCH`, `SIGURG`, …) are accepted and ignored — a process using tgkill
+/// for ordinary signaling must not self-destruct. Returning `ENOSYS` for the
+/// fatal ones made glibc's `abort()` fall through to a ring-3 `hlt`, which
+/// surfaced as a spurious #GP after every "Fatal Python error".
 pub fn sys_tgkill(_tgid: u64, _tid: u64, sig: u64) -> Result<u64, Errno> {
-    crate::info!(
-        "[linux] tgkill: fatal signal {} to self - exiting thread group",
-        sig
-    );
-    sys_exit_group(128 + (sig & 0x3f))
+    const SIGKILL: u64 = 9;
+    const SIGSEGV: u64 = 11;
+    const SIGABRT: u64 = 6;
+    const SIGFPE: u64 = 8;
+    const SIGILL: u64 = 4;
+    const SIGBUS: u64 = 7;
+    const SIGSYS: u64 = 31;
+    match sig & 0x3f {
+        SIGKILL | SIGSEGV | SIGABRT | SIGFPE | SIGILL | SIGBUS | SIGSYS => {
+            crate::info!(
+                "[linux] tgkill: fatal signal {} to self - exiting thread group",
+                sig
+            );
+            sys_exit_group(128 + (sig & 0x3f))
+        }
+        _ => Ok(0),
+    }
 }
 
 // ─────────────── identity / info / time / sleep / sched / signals ───────────────
@@ -291,7 +324,7 @@ pub fn sys_time(tptr: u64) -> Result<u64, Errno> {
 
 /// Convert a `(sec, nsec)` duration into a tick count at [`TICK_HZ`], rounding up
 /// so any non-zero duration sleeps at least one tick. Saturating throughout.
-fn duration_to_ticks(sec: i64, nsec: i64) -> u64 {
+pub(super) fn duration_to_ticks(sec: i64, nsec: i64) -> u64 {
     if sec <= 0 && nsec <= 0 {
         return 0;
     }
@@ -409,30 +442,59 @@ pub fn sys_sched_yield() -> Result<u64, Errno> {
 }
 
 /// `rt_sigaction` (13): signals are never delivered, so accept and return 0
-/// without installing any handler. The act/oldact pointers are not dereferenced.
+/// without installing any handler. `oldact`, when requested, receives a zeroed
+/// `struct kernel_sigaction` (handler = SIG_DFL) so save-and-restore users read
+/// back defined data instead of uninitialized memory.
 pub fn sys_rt_sigaction(
     _sig: u64,
     _act: u64,
-    _oldact: u64,
-    _sigsetsize: u64,
+    oldact: u64,
+    sigsetsize: u64,
 ) -> Result<u64, Errno> {
+    if oldact != 0 {
+        let size = if sigsetsize != 0 { sigsetsize } else { 8 };
+        // kernel_sigaction = { handler, flags, restorer, mask[sigsetsize] }
+        let total = 24u64.saturating_add(size);
+        check_user_ptr(oldact, total)?;
+        // SAFETY: the oldact range was validated above.
+        unsafe {
+            core::ptr::write_bytes(oldact as *mut u8, 0, total as usize);
+        }
+    }
     Ok(0)
 }
 
-/// `rt_sigprocmask` (14): no signals to mask; accept and return 0. The set/oldset
-/// pointers are not dereferenced.
+/// `rt_sigprocmask` (14): no signals to mask; `oldset`, when requested, receives
+/// an empty sigset (all zeros) instead of leaving user memory untouched.
 pub fn sys_rt_sigprocmask(
     _how: u64,
     _set: u64,
-    _oldset: u64,
-    _sigsetsize: u64,
+    oldset: u64,
+    sigsetsize: u64,
 ) -> Result<u64, Errno> {
+    if oldset != 0 {
+        let size = if sigsetsize != 0 { sigsetsize } else { 8 };
+        check_user_ptr(oldset, size)?;
+        // SAFETY: the oldset range was validated above.
+        unsafe {
+            core::ptr::write_bytes(oldset as *mut u8, 0, size as usize);
+        }
+    }
     Ok(0)
 }
 
 /// `sigaltstack` (131): accept and return 0 (no alternate signal stack is needed
-/// since signals are never delivered).
-pub fn sys_sigaltstack(_ss: u64, _old_ss: u64) -> Result<u64, Errno> {
+/// since signals are never delivered). `old_ss`, when requested, receives a zeroed
+/// stack_t so callers reading it back see "altstack disabled" rather than garbage.
+pub fn sys_sigaltstack(_ss: u64, old_ss: u64) -> Result<u64, Errno> {
+    if old_ss != 0 {
+        // struct stack_t { void *ss_sp; int ss_flags; size_t ss_size; } = 24 bytes
+        check_user_ptr(old_ss, 24)?;
+        // SAFETY: the old_ss range was validated above.
+        unsafe {
+            core::ptr::write_bytes(old_ss as *mut u8, 0, 24);
+        }
+    }
     Ok(0)
 }
 
@@ -485,20 +547,42 @@ const RLIM_INFINITY: u64 = u64::MAX;
 const RLIMIT_STACK: u64 = 3;
 /// `RLIMIT_NOFILE` resource id.
 const RLIMIT_NOFILE: u64 = 7;
+/// Number of rlimit resources Linux defines (`RLIMIT_NLIMITS`); larger
+/// resource ids are rejected with `EINVAL`.
+const RLIMIT_NLIMITS: u64 = 16;
 
-/// Return a sane `(cur, max)` rlimit pair for `resource`.
-fn rlimit_for(resource: u64) -> (u64, u64) {
+/// Kernel-default `(cur, max)` rlimit pair for `resource` when the process has
+/// no `prlimit64`/`setrlimit` override. `RLIMIT_NOFILE`'s hard limit is the
+/// descriptor-table capacity (`io_sys::NOFILE_MAX`).
+fn default_rlimit(resource: u64) -> (u64, u64) {
     match resource {
         RLIMIT_STACK => (8 * 1024 * 1024, RLIM_INFINITY), // 8 MiB soft stack
-        RLIMIT_NOFILE => (1024, 4096),                    // open-file limits
+        RLIMIT_NOFILE => (1024, super::io_sys::NOFILE_MAX), // open-file limits
         _ => (RLIM_INFINITY, RLIM_INFINITY),
     }
 }
 
-/// Write a built `Rlimit` to a validated user pointer.
+/// The current process's effective `(cur, max)` rlimit for `resource`: the
+/// per-process override stored in its [`CompatState`](crate::task::compat::CompatState)
+/// when present, else the kernel default.
+fn current_rlimit(resource: u64) -> (u64, u64) {
+    compat::with_current_compat(|cs| {
+        match cs.rlimits.get(&resource) {
+            Some(lim) => *lim,
+            None => default_rlimit(resource),
+        }
+    })
+    .unwrap_or_else(|| default_rlimit(resource))
+}
+
+/// Write the current process's effective `Rlimit` for `resource` to a validated
+/// user pointer. Unknown resource ids are rejected (`EINVAL`).
 fn write_rlimit(ptr: u64, resource: u64) -> Result<(), Errno> {
+    if resource >= RLIMIT_NLIMITS {
+        return Err(Errno::EINVAL);
+    }
     check_user_ptr(ptr, core::mem::size_of::<Rlimit>() as u64)?;
-    let (cur, max) = rlimit_for(resource);
+    let (cur, max) = current_rlimit(resource);
     let rl = Rlimit {
         rlim_cur: cur,
         rlim_max: max,
@@ -516,14 +600,31 @@ fn write_rlimit(ptr: u64, resource: u64) -> Result<(), Errno> {
     Ok(())
 }
 
-/// `prlimit64` (302): report a sane limit for the resource via the `old_limit`
-/// pointer (if non-null); any `new_limit` is accepted but not enforced. Returns 0.
+/// `prlimit64` (302): report the current process's effective limit for
+/// `resource` via the `old_limit` pointer (if non-null); a non-null `new_limit`
+/// (user pointer to `struct rlimit64`) updates the per-process override for
+/// future queries. Limits are not enforced. Unknown resource ids and
+/// `rlim_cur > rlim_max` yield `EINVAL`.
 pub fn sys_prlimit64(
     _pid: u64,
     resource: u64,
-    _new_limit: u64,
+    new_limit: u64,
     old_limit: u64,
 ) -> Result<u64, Errno> {
+    if resource >= RLIMIT_NLIMITS {
+        return Err(Errno::EINVAL);
+    }
+    if new_limit != 0 {
+        check_user_ptr(new_limit, core::mem::size_of::<Rlimit>() as u64)?;
+        // SAFETY: `new_limit` validated for the rlimit length above.
+        let rl = unsafe { core::ptr::read_unaligned(new_limit as *const Rlimit) };
+        if rl.rlim_cur > rl.rlim_max {
+            return Err(Errno::EINVAL);
+        }
+        compat::with_current_compat(|cs| {
+            cs.rlimits.insert(resource, (rl.rlim_cur, rl.rlim_max));
+        });
+    }
     if old_limit != 0 {
         write_rlimit(old_limit, resource)?;
     }
@@ -556,10 +657,17 @@ pub fn sys_getpgid() -> Result<u64, Errno> {
     Ok(compat::current_tgid())
 }
 
-/// `umask` (95): single-user system without a permission model —
-/// accept any mask and report the conventional previous value 022.
-pub fn sys_umask(_mask: u64) -> Result<u64, Errno> {
-    Ok(0o22)
+/// `umask` (95): set the process's file-mode creation mask to `mask & 0777`
+/// and return the previous mask. The mask is applied to the permission bits of
+/// freshly created files/directories (see the `open`/`mkdir` handlers).
+pub fn sys_umask(mask: u64) -> Result<u64, Errno> {
+    let old = compat::with_current_compat(|cs| {
+        let old = cs.umask;
+        cs.umask = (mask & 0o777) as u32;
+        old
+    })
+    .unwrap_or(0o022);
+    Ok(old as u64)
 }
 
 /// `flock` (73): advisory locks are meaningless with one user and an

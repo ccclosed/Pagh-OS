@@ -42,6 +42,15 @@ pub struct MmapRegion {
     pub writable: bool,
     /// Whether the region's pages carry the no-execute bit (`!PROT_EXEC`).
     pub nx: bool,
+    /// Raw `prot` bitmask the region was created with. `0` (`PROT_NONE`) pages
+    /// must NEVER be backed: the page-fault handler treats a fault inside a
+    /// `PROT_NONE` region as a genuine SIGSEGV (stack-guard semantics), not as
+    /// a lazy-mapping opportunity.
+    pub prot: u32,
+    /// Whether the region is anonymous (zero-filled, lazy — pages are backed
+    /// on first touch by the page-fault handler) as opposed to file-backed
+    /// (eagerly copied at `mmap` time by the kernel handler).
+    pub anon: bool,
 }
 
 /// Outcome of a pure `brk` planning step (R3.1–R3.6).
@@ -159,6 +168,63 @@ pub fn plan_brk(initial: u64, current: u64, requested: u64) -> BrkOutcome {
     }
 }
 
+/// Plan the placement of a non-fixed `mmap` of `pages` pages: the first free
+/// gap at or above `floor` that fits `[base, base + pages*4096)` below
+/// `ceiling`, reusing holes left by `munmap`/`mremap`-moves instead of bumping
+/// the high-water mark forever.
+///
+/// Returns `None` when no gap fits below `ceiling` (caller reports `ENOMEM`).
+/// The scan walks the regions in arbitrary order, restarting after each hit;
+/// each hit strictly advances `candidate`, so the loop terminates.
+pub fn plan_mmap_base(
+    regions: &[MmapRegion],
+    floor: u64,
+    pages: u64,
+    ceiling: u64,
+) -> Option<u64> {
+    let span = pages.checked_mul(PAGE_SIZE)?;
+    let mut candidate = page_up(floor);
+    loop {
+        let end = candidate.checked_add(span)?;
+        if end > ceiling {
+            return None;
+        }
+        match regions.iter().find(|r| {
+            let rend = r.base.saturating_add(r.pages.saturating_mul(PAGE_SIZE));
+            r.base < end && candidate < rend
+        }) {
+            None => return Some(candidate),
+            Some(r) => {
+                let rend = r.base.saturating_add(r.pages.saturating_mul(PAGE_SIZE));
+                candidate = page_up(rend);
+            }
+        }
+    }
+}
+
+/// Whether `[start, start + pages*4096)` is page-aligned, below `ceiling`, and
+/// overlaps no tracked region. Used by `mremap` to decide an in-place growth is
+/// possible (the growing region itself never overlaps: the range starts at its
+/// end).
+pub fn range_is_free(regions: &[MmapRegion], start: u64, pages: u64, ceiling: u64) -> bool {
+    if start & (PAGE_SIZE - 1) != 0 {
+        return false;
+    }
+    let Some(span) = pages.checked_mul(PAGE_SIZE) else {
+        return false;
+    };
+    let Some(end) = start.checked_add(span) else {
+        return false;
+    };
+    if end > ceiling {
+        return false;
+    }
+    regions.iter().all(|r| {
+        let rend = r.base.saturating_add(r.pages.saturating_mul(PAGE_SIZE));
+        !(r.base < end && start < rend)
+    })
+}
+
 /// Plan an anonymous `mmap` of `len` bytes with protection `prot` and `flags` at the
 /// pre-aligned `hint_base`, without mapping anything (R4.1, R4.2, R4.6, Property 12).
 ///
@@ -253,6 +319,16 @@ pub struct VmRegionSet {
     pub mmaps: alloc::vec::Vec<MmapRegion>,
     /// Bump-pointer hint for the next anonymous `mmap` base in the user range.
     pub mmap_next_hint: u64,
+    /// Fixed low-water mark for non-fixed `mmap` placement: `plan_mmap_base`
+    /// scans for free gaps starting here (so holes below the high-water mark
+    /// are reused).
+    pub mmap_floor: u64,
+    /// Lowest page that belongs to the demand-paged `brk` heap: pages in
+    /// `[brk_lazy_from, page_up(current_brk))` are backed on first touch, not
+    /// eagerly. Starts at the (page-rounded-down) initial break and only ever
+    /// moves down — a `brk` grow from `current` records
+    /// `page_down(current)` as a candidate floor.
+    pub brk_lazy_from: u64,
 }
 
 impl VmRegionSet {
@@ -265,6 +341,8 @@ impl VmRegionSet {
             current_brk: initial_brk,
             mmaps: alloc::vec::Vec::new(),
             mmap_next_hint: mmap_hint_base,
+            mmap_floor: mmap_hint_base,
+            brk_lazy_from: initial_brk & !(PAGE_SIZE - 1),
         }
     }
 }

@@ -114,10 +114,17 @@ impl Journal {
     }
 
     /// Open the journal, reading and validating its superblock.
+    ///
+    /// The persisted CRC32 (written by `store_journal_super`) is verified: a
+    /// torn/garbage journal superblock used to pass as `head`/`tail` state and
+    /// made replay start from arbitrary log positions.
     pub fn open(dev: Arc<dyn BlockDevice>, area: JournalArea) -> Result<Self, FsError> {
         let buf = read_block(&*dev, area.super_block)?;
-        let js = load_journal_super(&buf);
+        let js = load_journal_super(&buf)?;
         if js.magic != JNL_MAGIC {
+            return Err(FsError::BadJournal);
+        }
+        if js.log_blocks == 0 {
             return Err(FsError::BadJournal);
         }
         Ok(Journal {
@@ -171,6 +178,11 @@ impl Journal {
     /// Commit a transaction: write the descriptor + data + commit record to the
     /// log, checkpoint the data to its final ext2 locations, then advance the
     /// head and persist the journal superblock.
+    ///
+    /// Checkpointing is synchronous, so everything logged in `[tail, head)` is
+    /// already on its final location when the head advances: when the ring
+    /// wraps into the tail, the live records are dropped (`tail = head`) and
+    /// the free-space check below only guards the current transaction.
     pub fn commit(&mut self, txn: Txn) -> Result<(), FsError> {
         let count = txn.records.len();
         if count == 0 {
@@ -180,9 +192,24 @@ impl Journal {
             // A single descriptor cannot describe more than this many blocks.
             return Err(FsError::OutOfSpace);
         }
-        // Need count + 2 (descriptor + data + commit) free log blocks.
-        if (count as u64) + 2 > self.log_blocks {
+        // Need count + 2 (descriptor + data + commit) log slots, and keep at
+        // least one spare slot so head == tail always means "empty" (recover
+        // relies on that disambiguation).
+        if (count as u64) + 3 > self.log_blocks {
             return Err(FsError::OutOfSpace);
+        }
+        let used = if self.head >= self.tail {
+            self.head - self.tail
+        } else {
+            self.head + self.log_blocks - self.tail
+        };
+        let free = self.log_blocks - used;
+        if (count as u64) + 2 > free {
+            // Everything between tail and head is already checkpointed
+            // (synchronously, before the head advances); reclaim the whole
+            // log for this transaction instead of wrapping straight over
+            // live records.
+            self.tail = self.head;
         }
 
         // Validate every target lies inside the ext2 region.
@@ -250,6 +277,13 @@ impl Journal {
     /// and discards it and everything after. The log is then reset to empty.
     pub fn recover(&mut self) -> Result<u32, FsError> {
         // open() already validated JNL_MAGIC.
+        // head == tail means an empty log (commit keeps one spare slot, so a
+        // non-empty log always has head != tail): without this guard, replay
+        // would wander into stale records of long-checkpointed transactions
+        // and re-apply OLD block images over NEWER committed data.
+        if self.head == self.tail {
+            return Ok(0);
+        }
         let mut pos = self.tail;
         let mut replayed: u32 = 0;
         let mut expected_seq: Option<u64> = None;
@@ -333,8 +367,16 @@ fn store_journal_super(buf: &mut [u8], js: &JournalSuper) {
     structs::write_u32(buf, csum_off, checksum);
 }
 
-fn load_journal_super(buf: &[u8]) -> JournalSuper {
-    unsafe { structs::read_struct(buf) }
+/// Read a journal superblock and verify its CRC32 (the trailing `checksum`
+/// field covers every preceding byte of the struct).
+fn load_journal_super(buf: &[u8]) -> Result<JournalSuper, FsError> {
+    let js: JournalSuper = unsafe { structs::read_struct(buf) };
+    let size = core::mem::size_of::<JournalSuper>();
+    let stored = structs::read_u32(buf, size - 4);
+    if structs::crc32(&buf[..size - 4]) != stored {
+        return Err(FsError::BadJournal);
+    }
+    Ok(js)
 }
 
 fn store_descriptor(buf: &mut [u8], desc: &JournalDescriptor) {

@@ -120,7 +120,12 @@ impl Reassembler {
         {
             Some(b) => b,
             None => {
-                if self.bufs.len() >= REASM_CAP || !more {
+                // CAP exceeded -> drop silently (deliberate). Note the buffer
+                // is created even when THIS fragment is the last one (MF=0):
+                // fragments arrive in any order, and refusing to open the
+                // buffer here would lose the recorded total — the datagram
+                // could then never complete as later fragments arrive.
+                if self.bufs.len() >= REASM_CAP {
                     return None;
                 }
                 self.bufs.push(FragBuf {
@@ -157,10 +162,10 @@ impl Reassembler {
 /// Handle one IP packet received off the wire (`pkt` starts at the IP header).
 /// Dispatches on the version nibble; both families validate, reassemble when
 /// needed, and dispatch by protocol.
-pub(crate) fn input(st: &mut Stack, pkt: &[u8], now: u64) {
+pub(crate) fn input(st: &mut Stack, pkt: &[u8], eth_src: Mac, now: u64) {
     match pkt.first().map(|b| b >> 4) {
         Some(4) => input_v4(st, pkt, now),
-        Some(6) => input_v6(st, pkt, now),
+        Some(6) => input_v6(st, pkt, eth_src, now),
         _ => {}
     }
 }
@@ -168,7 +173,7 @@ pub(crate) fn input(st: &mut Stack, pkt: &[u8], now: u64) {
 /// Handle one IPv6 packet. Also serves NDP (NS/NA) and Router Advertisements
 /// (SLAAC): an RA with an autonomous on-link prefix configures our global
 /// address and default router (RFC 4862).
-fn input_v6(st: &mut Stack, pkt: &[u8], now: u64) {
+fn input_v6(st: &mut Stack, pkt: &[u8], eth_src: Mac, now: u64) {
     let Some((h, payload)) = ipv6_parse(pkt) else {
         return;
     };
@@ -188,21 +193,41 @@ fn input_v6(st: &mut Stack, pkt: &[u8], now: u64) {
 
     if h.proto == wire::PROTO_ICMPV6 {
         // NDP first (its own message space), then RA, then echo.
-        if matches!(
+        let is_ndp = matches!(
             payload.first().copied(),
             Some(wire::ICMPV6_NEIGHBOR_SOLICIT) | Some(wire::ICMPV6_NEIGHBOR_ADVERT)
-        ) {
+        );
+        let is_ra = payload.first() == Some(&wire::ICMPV6_ROUTER_ADVERT);
+        if is_ndp || is_ra {
+            // RFC 4861 anti-off-link-spoof checks: ND/RA messages are valid
+            // only with hop limit 255 (an forwarded packet has been decremented)
+            // and an on-link (link-local, or unspecified for DAD solicitation)
+            // source. An off-link attacker cannot forge either.
+            if h.hop_limit != 255 {
+                return;
+            }
+            if is_ra {
+                // RA sources are always routers' link-local addresses.
+                if !h.src.is_link_local() {
+                    return;
+                }
+            } else if !h.src.is_unspecified() && !h.src.is_link_local() {
+                return;
+            }
+        }
+        if is_ndp {
             if let Some(p) = wire::ndp_parse(h.src, h.dst, payload) {
-                let mut eth_src = [0u8; 6];
-                eth_src.copy_from_slice(&pkt[6..12]);
+                // The link-layer sender is the Ethernet source, not bytes from
+                // inside the IPv6 header (those were next-header/hop-limit/src).
+                let mac = Mac(eth_src.0);
                 // (moved out temporarily so it can use the rest of the stack)
                 let mut nd = core::mem::take(&mut st.nd);
-                nd.input(st, p, h.src, Mac(eth_src), now);
+                nd.input(st, p, h.src, mac, now);
                 st.nd = nd;
             }
             return;
         }
-        if payload.first() == Some(&wire::ICMPV6_ROUTER_ADVERT) {
+        if is_ra {
             if let Some(pi) = wire::ra_parse_prefix(h.src, h.dst, payload) {
                 ra_apply(st, h.src, pi);
             }
@@ -471,14 +496,14 @@ fn output_v4(
     let max_payload = MTU - wire::IPV4_HDR_MIN;
     let fragments = fragment_chunks(payload, max_payload);
     let count = fragments.len();
+    let id = st.next_ip_ident;
+    st.next_ip_ident = st.next_ip_ident.wrapping_add(1);
     for (i, chunk) in fragments.into_iter().enumerate() {
         let more = i + 1 < count;
         let mut flags_frag = ((chunk.offset / FRAG_UNIT) as u16) & 0x1FFF;
         if more {
             flags_frag |= wire::IPV4_FLAG_MF;
         }
-        let id = st.next_ip_ident;
-        st.next_ip_ident = st.next_ip_ident.wrapping_add(1);
 
         let packet = ipv4_build(src, dst_ip, proto, id, flags_frag, 64, chunk.data);
         send_v4(st, next_hop, &packet, now);

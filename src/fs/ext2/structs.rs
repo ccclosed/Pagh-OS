@@ -22,6 +22,20 @@ pub const SECTORS_PER_BLOCK: u64 = (BS / 512) as u64;
 /// Classic ext2 inode size for `s_rev_level == 1` (bytes).
 pub const INODE_SIZE: usize = 128;
 
+/// Effective on-disk inode size for a mounted superblock.
+///
+/// `s_rev_level >= 1` images may declare a larger (power-of-two) inode size in
+/// `s_inode_size` (e.g. 256); address math must honor it or every inode-table
+/// access lands on the wrong slot. Rev-0 images always carry 128-byte inodes,
+/// and a corrupt `s_inode_size` must never be trusted — fall back to 128.
+pub fn inode_size(sb: &Ext2SuperBlock) -> usize {
+    let v = sb.s_inode_size as usize;
+    if sb.s_rev_level == 0 || v < INODE_SIZE || v > BS || !v.is_power_of_two() {
+        return INODE_SIZE;
+    }
+    v
+}
+
 /// ext2 magic, stored at superblock offset 0x38.
 pub const EXT2_MAGIC: u16 = 0xEF53;
 

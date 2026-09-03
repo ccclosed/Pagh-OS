@@ -7,7 +7,7 @@ cfg_if::cfg_if! {
     } else if #[cfg(feature = "force-soft")] {
         mod soft;
         use soft::compress;
-    } else if #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] {
+    } else if #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), not(target_os = "none")))] {
         #[cfg(not(feature = "asm"))]
         mod soft;
         #[cfg(feature = "asm")]

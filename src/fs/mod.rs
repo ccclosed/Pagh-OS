@@ -33,4 +33,6 @@ pub enum FsError {
     NameTooLong,
     /// A structural invariant was violated (corrupt/out-of-range field).
     Corrupt,
+    /// A write would exceed the 32-bit `i_size` limit of the format.
+    FileTooBig,
 }

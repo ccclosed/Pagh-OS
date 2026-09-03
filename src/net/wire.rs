@@ -767,7 +767,10 @@ pub fn ipv6_parse(pkt: &[u8]) -> Option<(Ipv6Header, &[u8])> {
     let mut off = IPV6_HDR_LEN;
     let mut hops = 0;
     while matches!(nh, IPV6_EXT_HOPBYHOP | IPV6_EXT_ROUTING | IPV6_EXT_DESTOPT) {
-        if off >= end {
+        // The 8-byte fixed part of every extension header must be fully in
+        // bounds: the length octet at off+1 is part of it (crafted packets
+        // ending exactly at `end` previously read pkt[off+1] out of bounds).
+        if off + 2 > end || off + 2 > pkt.len() {
             return None;
         }
         let ext_len = ((pkt[off + 1] as usize) + 1) * 8;

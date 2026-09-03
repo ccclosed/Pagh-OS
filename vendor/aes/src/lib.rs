@@ -137,7 +137,8 @@ cfg_if! {
         pub use autodetect::*;
     } else if #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        not(aes_force_soft)
+        not(aes_force_soft),
+        not(target_os = "none")
     ))] {
         mod autodetect;
         mod ni;

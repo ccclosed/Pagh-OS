@@ -13,7 +13,8 @@ cfg_if! {
         pub use crate::backend::autodetect::Polyval;
     } else if #[cfg(all(
         any(target_arch = "x86_64", target_arch = "x86"),
-        not(polyval_force_soft)
+        not(polyval_force_soft),
+        not(target_os = "none")
     ))] {
         mod autodetect;
         mod clmul;

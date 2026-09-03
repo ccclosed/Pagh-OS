@@ -37,7 +37,7 @@ fn expected(base: u64, len: u64, regions: &[MmapRegion]) -> MunmapPlan {
 
 fn region() -> impl Strategy<Value = MmapRegion> {
     ((0u64..256).prop_map(|n| n * PAGE_SIZE), 1u64..8, any::<bool>(), any::<bool>())
-        .prop_map(|(base, pages, writable, nx)| MmapRegion { base, pages, writable, nx })
+        .prop_map(|(base, pages, writable, nx)| MmapRegion { base, pages, writable, nx, prot: 0o6, anon: true })
 }
 
 /// A base that is page-aligned most of the time, occasionally misaligned, kept in

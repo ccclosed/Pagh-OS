@@ -58,20 +58,63 @@ impl IrqSafeAllocator {
     }
 }
 
+/// Live bytes handed out by successful allocations (each request's size is
+/// added on alloc/realloc-grow and subtracted on free/shrink). Diagnostics
+/// only (`stats`); it counts requested bytes, not allocator overhead, so the
+/// real footprint is slightly higher.
+static HEAP_USED: AtomicUsize = AtomicUsize::new(0);
+
+/// Subtract `bytes` from [`HEAP_USED`] without underflowing (a stray/double
+/// free must not wrap the counter into astronomic "used" values).
+fn heap_used_sub(bytes: usize) {
+    let mut cur = HEAP_USED.load(Ordering::Relaxed);
+    loop {
+        if cur == 0 {
+            return;
+        }
+        match HEAP_USED.compare_exchange_weak(
+            cur,
+            cur.saturating_sub(bytes),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(now) => cur = now,
+        }
+    }
+}
+
 // SAFETY: delegates to `SpinLockedAllocator` (a correct `GlobalAlloc`); the
-// wrapper only adds interrupt masking around each operation.
+// wrapper only adds interrupt masking around each operation and live-byte
+// accounting for `stats`.
 unsafe impl GlobalAlloc for IrqSafeAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.guarded(|a| a.alloc(layout))
+        let ptr = self.guarded(|a| a.alloc(layout));
+        if !ptr.is_null() {
+            HEAP_USED.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        ptr
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.guarded(|a| a.dealloc(ptr, layout))
+        self.guarded(|a| a.dealloc(ptr, layout));
+        heap_used_sub(layout.size());
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        self.guarded(|a| a.alloc_zeroed(layout))
+        let ptr = self.guarded(|a| a.alloc_zeroed(layout));
+        if !ptr.is_null() {
+            HEAP_USED.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        ptr
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        self.guarded(|a| a.realloc(ptr, layout, new_size))
+        let new_ptr = self.guarded(|a| a.realloc(ptr, layout, new_size));
+        if !new_ptr.is_null() {
+            // On failure galloc leaves the original allocation live, so only
+            // a successful resize moves the counter (old size out, new in).
+            heap_used_sub(layout.size());
+            HEAP_USED.fetch_add(new_size, Ordering::Relaxed);
+        }
+        new_ptr
     }
 }
 
@@ -131,12 +174,11 @@ pub fn init() {
 ///
 /// DIAGNOSTIC helper (apt-update parse-stage crash investigation): used by the
 /// `lx_bigindex` self-test and `apt::update`'s feature-gated progress logging.
-/// galloc does not expose live used/free counters, so only the total configured
-/// size is reported (`used`/`free` are 0); the heap-exhaustion question this was
-/// added to answer has already been settled (the arena at ~4 MiB decompressed is
-/// far under the 256 MiB heap). Kept with a stable signature so its callers
-/// compile unchanged.
+/// `used` counts the live requested bytes (successful allocations minus
+/// frees), so it excludes per-chunk allocator overhead — the real footprint is
+/// slightly higher. `free` is the configured heap size minus `used`.
 pub fn stats() -> (usize, usize, usize) {
     let size = HEAP_SIZE.load(Ordering::Relaxed);
-    (size, 0, 0)
+    let used = HEAP_USED.load(Ordering::Relaxed).min(size);
+    (size, used, size - used)
 }

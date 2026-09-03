@@ -26,9 +26,26 @@ pub enum VfsError {
     AlreadyExists,
 }
 
+/// Filesystem capacity snapshot for `statfs`/`fstatfs`: block counts are in
+/// units of `block_size`. Reported by filesystems that track their usage
+/// (ext2); `fs_stat()` returning `None` (the trait default) means the node's
+/// filesystem has no capacity to report (ramfs, synthetic /dev nodes).
+#[derive(Debug, Clone, Copy)]
+pub struct FsStat {
+    pub block_size: u64,
+    pub blocks_total: u64,
+    pub blocks_free: u64,
+    pub inodes_total: u64,
+    pub inodes_free: u64,
+}
+
 pub trait VfsNode: Send + Sync {
     fn name(&self) -> &str;
     fn is_directory(&self) -> bool;
+    /// Filesystem capacity behind this node, when the filesystem tracks it.
+    fn fs_stat(&self) -> Option<FsStat> {
+        None
+    }
     fn read(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> {
         Err(VfsError::NotSupported)
     }
@@ -188,6 +205,9 @@ impl VfsNode for MountNode {
     }
     fn is_directory(&self) -> bool {
         self.inner.is_directory()
+    }
+    fn fs_stat(&self) -> Option<FsStat> {
+        self.inner.fs_stat()
     }
     fn read(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         self.inner.read(offset, buf)

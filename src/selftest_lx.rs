@@ -43,6 +43,7 @@
 //! them down afterwards, so the harness leaves no persistent compat state on the idle
 //! task.
 
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
