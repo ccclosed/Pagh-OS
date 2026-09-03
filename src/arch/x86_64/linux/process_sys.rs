@@ -369,8 +369,8 @@ pub fn sys_clone(
             0
         };
         let child = crate::arch::cpu::without_interrupts(|| {
-            let child = crate::task::process::spawn_linux_thread(regs, stack)
-                .map_err(|_| Errno::ENOMEM)?;
+            let child =
+                crate::task::process::spawn_linux_thread(regs, stack).map_err(|_| Errno::ENOMEM)?;
             if !crate::task::compat::clone_current_compat(child, tls_value, clear) {
                 // Parent has no compat state: never leave the half-spawned
                 // child in rotation.

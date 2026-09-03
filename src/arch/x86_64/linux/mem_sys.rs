@@ -140,9 +140,7 @@ fn brk_impl(vm: &mut VmRegionSet, requested: u64) -> u64 {
             v
         }
         BrkOutcome::Grow {
-            new_brk,
-            map_from,
-            ..
+            new_brk, map_from, ..
         } => {
             // Lazy: no eager mapping. Pages in [brk_lazy_from, page_up(new_brk))
             // are backed by the page-fault handler on first touch; the recorded
@@ -239,8 +237,7 @@ pub fn sys_mmap(
             // high-water mark (Linux reuses VA space; a bump-only allocator
             // makes long-lived processes walk into USER_ADDR_MAX and die of
             // ENOMEM with plenty of memory free).
-            plan_mmap_base(&vm.mmaps, vm.mmap_floor, pages, USER_ADDR_MAX)
-                .ok_or(Errno::ENOMEM)?
+            plan_mmap_base(&vm.mmaps, vm.mmap_floor, pages, USER_ADDR_MAX).ok_or(Errno::ENOMEM)?
         };
         let end = base.checked_add(span).ok_or(Errno::ENOMEM)?;
         if end > USER_ADDR_MAX {
@@ -634,10 +631,7 @@ fn handle_cow_fault(addr: u64, caused_by_write: bool) -> bool {
     let page = addr & !(PAGE_SIZE - 1);
     compat::with_current_compat(|cs| {
         let vm = &mut cs.vm.lock();
-        let brk_end = vm
-            .current_brk
-            .saturating_add(PAGE_SIZE - 1)
-            & !(PAGE_SIZE - 1);
+        let brk_end = vm.current_brk.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let in_writable_vma = vm.mmaps.iter().any(|r| {
             page >= r.base
                 && page < r.base + r.pages * PAGE_SIZE
@@ -675,7 +669,11 @@ fn handle_cow_fault(addr: u64, caused_by_write: bool) -> bool {
 /// can always take that lock. `compat::compat_lock_held()` is the tripwire for
 /// violations of that rule — such a fault is reported as a segfault instead of
 /// deadlocking the CPU on a non-reentrant spinlock.
-pub fn handle_user_page_fault(addr: u64, protection_violation: bool, caused_by_write: bool) -> bool {
+pub fn handle_user_page_fault(
+    addr: u64,
+    protection_violation: bool,
+    caused_by_write: bool,
+) -> bool {
     if addr >= USER_ADDR_MAX {
         return false;
     }
@@ -694,10 +692,7 @@ pub fn handle_user_page_fault(addr: u64, protection_violation: bool, caused_by_w
         let vm = &mut cs.vm.lock();
         // brk heap: pages in [brk_lazy_from, page_up(current_brk)) are backed
         // on first touch, always writable + NX.
-        let brk_end = vm
-            .current_brk
-            .saturating_add(PAGE_SIZE - 1)
-            & !(PAGE_SIZE - 1);
+        let brk_end = vm.current_brk.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         if page >= vm.brk_lazy_from && page < brk_end {
             if vmm::virt_to_phys(page).is_some() {
                 return true; // resident again (shrink/grow race); retry

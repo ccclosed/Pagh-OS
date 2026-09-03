@@ -199,8 +199,7 @@ impl ArpTable {
                     let mut ready: VecDeque<Pending> = VecDeque::new();
                     while let Some(fr) = self.pending.pop_front() {
                         if fr.dst_ip == p.sender_ip {
-                            let frame =
-                                eth_frame(p.sender_mac, my_mac, fr.ethertype, &fr.payload);
+                            let frame = eth_frame(p.sender_mac, my_mac, fr.ethertype, &fr.payload);
                             crate::drivers::e1000::send(&frame);
                         } else {
                             ready.push_back(fr);

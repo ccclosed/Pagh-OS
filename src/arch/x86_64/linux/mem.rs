@@ -176,12 +176,7 @@ pub fn plan_brk(initial: u64, current: u64, requested: u64) -> BrkOutcome {
 /// Returns `None` when no gap fits below `ceiling` (caller reports `ENOMEM`).
 /// The scan walks the regions in arbitrary order, restarting after each hit;
 /// each hit strictly advances `candidate`, so the loop terminates.
-pub fn plan_mmap_base(
-    regions: &[MmapRegion],
-    floor: u64,
-    pages: u64,
-    ceiling: u64,
-) -> Option<u64> {
+pub fn plan_mmap_base(regions: &[MmapRegion], floor: u64, pages: u64, ceiling: u64) -> Option<u64> {
     let span = pages.checked_mul(PAGE_SIZE)?;
     let mut candidate = page_up(floor);
     loop {

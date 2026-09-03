@@ -157,7 +157,10 @@ pub fn restore_if_user(pid: u64, rsp: u64) {
         match areas.get(&pid) {
             Some(area) => area.0,
             None => {
-                crate::warn!("[FPU] no FXSAVE area for user pid={} (restore skipped)", pid);
+                crate::warn!(
+                    "[FPU] no FXSAVE area for user pid={} (restore skipped)",
+                    pid
+                );
                 return;
             }
         }

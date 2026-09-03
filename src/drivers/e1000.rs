@@ -115,7 +115,8 @@ const LINK_SPINS: u32 = 5_000_000;
 
 /// Set after the first oversized-TX-frame warning, so a caller pushing huge
 /// buffers in a loop does not flood the console.
-static OVERSIZED_WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static OVERSIZED_WARNED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 // ─── Descriptors ─────────────────────────────────────────────────────────────
 

@@ -809,10 +809,7 @@ fn open_path(path: &str, flags: u64) -> Result<u64, Errno> {
             })?;
             // Record the creation mode (default perms masked by the process
             // umask) so stat-family handlers report it.
-            record_mode_override(
-                node_ino(&created),
-                DEFAULT_FILE_PERMS & !current_umask(),
-            );
+            record_mode_override(node_ino(&created), DEFAULT_FILE_PERMS & !current_umask());
         }
     }
     open_resolved(&abs)

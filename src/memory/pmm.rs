@@ -547,7 +547,8 @@ pub fn cow_unref(frame: u64) -> bool {
 }
 
 /// Total number of frames tracked.
-pub fn total_frames() -> usize {    match *PMM.lock() {
+pub fn total_frames() -> usize {
+    match *PMM.lock() {
         Some(ref pmm) => pmm.total_frames,
         None => 0,
     }

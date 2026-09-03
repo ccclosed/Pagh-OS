@@ -445,12 +445,7 @@ pub fn sys_sched_yield() -> Result<u64, Errno> {
 /// without installing any handler. `oldact`, when requested, receives a zeroed
 /// `struct kernel_sigaction` (handler = SIG_DFL) so save-and-restore users read
 /// back defined data instead of uninitialized memory.
-pub fn sys_rt_sigaction(
-    _sig: u64,
-    _act: u64,
-    oldact: u64,
-    sigsetsize: u64,
-) -> Result<u64, Errno> {
+pub fn sys_rt_sigaction(_sig: u64, _act: u64, oldact: u64, sigsetsize: u64) -> Result<u64, Errno> {
     if oldact != 0 {
         let size = if sigsetsize != 0 { sigsetsize } else { 8 };
         // kernel_sigaction = { handler, flags, restorer, mask[sigsetsize] }
@@ -566,11 +561,9 @@ fn default_rlimit(resource: u64) -> (u64, u64) {
 /// per-process override stored in its [`CompatState`](crate::task::compat::CompatState)
 /// when present, else the kernel default.
 fn current_rlimit(resource: u64) -> (u64, u64) {
-    compat::with_current_compat(|cs| {
-        match cs.rlimits.get(&resource) {
-            Some(lim) => *lim,
-            None => default_rlimit(resource),
-        }
+    compat::with_current_compat(|cs| match cs.rlimits.get(&resource) {
+        Some(lim) => *lim,
+        None => default_rlimit(resource),
     })
     .unwrap_or_else(|| default_rlimit(resource))
 }

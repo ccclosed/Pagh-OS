@@ -828,9 +828,7 @@ fn fork_child_table_phys(parent: u64, idx: PageTableIndex) -> Result<u64, VmErro
         }
         table[idx].set_addr(
             PhysAddr::new(frame),
-            PageTableFlags::PRESENT
-                | PageTableFlags::WRITABLE
-                | PageTableFlags::USER_ACCESSIBLE,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
         );
     }
     Ok(table[idx].addr().as_u64())

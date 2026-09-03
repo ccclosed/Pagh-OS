@@ -324,9 +324,7 @@ impl Stack {
             }
             // ip::input dispatches on the version nibble (v4 and v6); NDP needs
             // the real Ethernet-level sender MAC.
-            wire::ETHERTYPE_IPV4 | wire::ETHERTYPE_IPV6 => {
-                ip::input(self, payload, _src, now)
-            }
+            wire::ETHERTYPE_IPV4 | wire::ETHERTYPE_IPV6 => ip::input(self, payload, _src, now),
             _ => {}
         }
     }
@@ -706,13 +704,10 @@ fn dns_query_once(server: Ipv4Addr, hostname: &str, qtype: u16) -> Option<IpAddr
             let mut rbuf = [0u8; 1500];
             if let Some((n, _ep)) = state.udp.recv(handle, &mut rbuf) {
                 result = match qtype {
-                    dns::QTYPE_AAAA => {
-                        dns::parse_dns_aaaa_response(&rbuf[..n], id, hostname)
-                            .map(|o| IpAddr::V6(wire::Ipv6Addr(o)))
-                    }
-                    _ => dns::parse_dns_a_response(&rbuf[..n], id, hostname).map(|o| {
-                        IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], o[3]))
-                    }),
+                    dns::QTYPE_AAAA => dns::parse_dns_aaaa_response(&rbuf[..n], id, hostname)
+                        .map(|o| IpAddr::V6(wire::Ipv6Addr(o))),
+                    _ => dns::parse_dns_a_response(&rbuf[..n], id, hostname)
+                        .map(|o| IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], o[3]))),
                 };
                 if result.is_some() {
                     break;
