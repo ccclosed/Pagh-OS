@@ -517,8 +517,10 @@ pub fn free_frame(addr: u64) {
 
 static COW_REFS: Spinlock<BTreeMap<u64, u32>> = Spinlock::new(BTreeMap::new());
 
-/// Register one additional COW sharer of `frame` (fork: called once per
-/// shared leaf, taking the count to 2).
+/// Register one additional COW sharer of `frame`. `fork_user_space_cow`
+/// calls this once per side that newly references the leaf as COW: two calls
+/// for a previously-private leaf (parent enters the map along with the
+/// child), one call when forking an already-shared leaf.
 pub fn cow_ref(frame: u64) {
     let mut m = COW_REFS.lock();
     let e = m.entry(frame & !(FRAME_SIZE - 1)).or_insert(0);

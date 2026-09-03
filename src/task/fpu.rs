@@ -89,11 +89,17 @@ static FP_AREAS: Spinlock<BTreeMap<u64, AreaPtr>> = Spinlock::new(BTreeMap::new(
 
 /// Ensure `pid` has an FXSAVE area. Called from `scheduler::spawn` (task
 /// context, possibly with interrupts disabled — never from an IRQ).
+///
+/// Runs with interrupts masked: the save/restore paths take the same lock
+/// from the timer tick (`save_if_user`/`restore_if_user`), so an IRQ landing
+/// here while the lock is held would deadlock the (single) core.
 pub fn area_for(pid: u64) {
-    let mut areas = FP_AREAS.lock();
-    if !areas.contains_key(&pid) {
-        areas.insert(pid, AreaPtr(alloc_area()));
-    }
+    crate::arch::cpu::without_interrupts(|| {
+        let mut areas = FP_AREAS.lock();
+        if !areas.contains_key(&pid) {
+            areas.insert(pid, AreaPtr(alloc_area()));
+        }
+    });
 }
 
 /// Release `pid`'s FXSAVE area. Called by the exit reaper after the task is

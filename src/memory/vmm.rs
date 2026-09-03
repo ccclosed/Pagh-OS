@@ -691,8 +691,11 @@ pub fn drop_user_space(pml4: u64) {
                     let frame = e1.addr().as_u64();
                     if e1.flags().contains(COW_BIT) {
                         // Shared with another address space: only drop this
-                        // side's reference. The last departing side frees.
-                        crate::memory::pmm::cow_unref(frame);
+                        // side's reference. The last departing side frees —
+                        // `cow_unref` reports that via its return value.
+                        if crate::memory::pmm::cow_unref(frame) {
+                            crate::memory::pmm::free_frame(frame);
+                        }
                     } else {
                         crate::memory::pmm::free_frame(frame);
                     }
@@ -802,6 +805,13 @@ pub fn fork_user_space_cow(parent_pml4: u64, child_pml4: u64) -> Result<(), VmEr
                     };
                     p1p[i1].set_addr(frame, shared);
                     p1c[i1].set_addr(frame, shared);
+                    // Two sharers enter the map when the leaf was privately
+                    // owned (parent + child). When the parent's leaf is
+                    // ALREADY COW (fork of a fork) the parent side is counted
+                    // since its first fork — only the new child registers.
+                    if !flags.contains(COW_BIT) {
+                        crate::memory::pmm::cow_ref(frame.as_u64());
+                    }
                     crate::memory::pmm::cow_ref(frame.as_u64());
                 }
             }
