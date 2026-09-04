@@ -41,7 +41,7 @@ qemu-system-x86_64 ^
     -device virtio-blk-pci,drive=hd0 ^
     -netdev user,id=net0,hostfwd=tcp::5555-:7,hostfwd=udp::5555-:7 ^
     -device virtio-net-pci,netdev=net0 ^
-    -m 512M ^
+    -m 1024M ^
     -serial file:serial.log ^
     -no-reboot ^
     -no-shutdown ^

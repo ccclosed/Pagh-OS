@@ -26,7 +26,7 @@ copy /Y iso_root\limine.conf iso_root\EFI\BOOT\limine.conf >nul
 qemu-system-x86_64 ^
     -bios OVMF.fd ^
     -drive file=fat:rw:iso_root,format=raw ^
-    -m 512M ^
+    -m 1024M ^
     -serial file:serial.log ^
     -no-reboot ^
     -no-shutdown ^

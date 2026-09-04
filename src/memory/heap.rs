@@ -20,6 +20,11 @@
 // satisfied it returns a null pointer (Requirement 10.4), which the `alloc`
 // machinery turns into an allocation-error abort. If the kernel ever needs a
 // larger heap, raise `HEAP_INITIAL_PAGES` in `memory::layout`.
+//
+// `HEAP_INITIAL_PAGES` is the desired size for the reference configuration
+// (≥ 1 GiB RAM). On machines with less RAM `init` caps the heap to what the
+// PMM can spare (see `cap_to_available`) instead of exhausting the frame
+// pool and panicking at boot.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -132,9 +137,23 @@ static HEAP_SIZE: AtomicUsize = AtomicUsize::new(0);
 /// Derives the heap base/size from `memory::layout` (Requirement 4.3), maps the
 /// backing physical frames, then initializes the allocator over that region.
 /// The heap is boot-critical, so mapping failures panic.
+///
+/// The heap is FIXED-SIZE, but `HEAP_INITIAL_PAGES` documents the *desired*
+/// size for the reference configuration (≥ 1 GiB RAM — see `layout.rs`), not a
+/// requirement the machine must satisfy. A guest with less RAM would other-
+/// wise have the mapping loop below consume every free PMM frame (including
+/// the ones page tables and later user pages still need) and panic at boot.
+/// So the loop below caps the heap at what the PMM can actually give up
+/// without starving the rest of the kernel: it reserves a quarter of the free
+/// frames (at least 8 MiB) for post-boot PMM users (user pages, COW forks,
+/// kernel stacks, the heap's own intermediate page tables) and caps the heap
+/// at the remainder, warning at `Warn` level when the cap engages. On the
+/// reference configuration the cap never engages and the full 512 MiB heap is
+/// mapped, unchanged.
 pub fn init() {
     let heap_base = crate::memory::layout::heap_base();
     let initial_pages = crate::memory::layout::HEAP_INITIAL_PAGES;
+    let initial_pages = cap_to_available(initial_pages);
     let heap_size = initial_pages * crate::memory::layout::PAGE_SIZE;
 
     // Map the initial heap pages: one physical frame per page, mapped W^X
@@ -169,6 +188,36 @@ pub fn init() {
         heap_size / 1024
     );
 }
+
+/// Cap `requested` heap pages to what the PMM can spare at boot.
+///
+/// See [`init`]: the kernel keeps a quarter of the free frames (at least
+/// `HEAP_MIN_RESERVE_FRAMES`) for everything the PMM must still serve after
+/// boot. Returns `requested` unchanged when the machine has enough RAM, so
+/// behavior on the reference configuration is identical to the fixed-size
+/// heap of previous releases.
+fn cap_to_available(requested: u64) -> u64 {
+    let free = crate::memory::pmm::free_frames() as u64;
+    let reserve = (free / 4).max(HEAP_MIN_RESERVE_FRAMES);
+    let capped = requested.min(free.saturating_sub(reserve));
+    if capped < requested {
+        crate::warn!(
+            "Kernel heap capped: {} pages ({} MiB) requested, RAM allows {} pages ({} MiB); \
+             {} MiB left for PMM",
+            requested,
+            requested * crate::memory::layout::PAGE_SIZE / (1024 * 1024),
+            capped,
+            capped * crate::memory::layout::PAGE_SIZE / (1024 * 1024),
+            free.saturating_sub(capped) * crate::memory::layout::PAGE_SIZE / (1024 * 1024)
+        );
+    }
+    capped
+}
+
+/// Frames kept out of the heap's reach on RAM-starved machines (8 MiB): the
+/// heap's own page tables, user pages and COW forks must not be starved to
+/// zero by the heap mapping loop.
+const HEAP_MIN_RESERVE_FRAMES: u64 = 8 * 1024 * 1024 / crate::memory::layout::PAGE_SIZE;
 
 /// Report the kernel heap accounting as `(size, used, free)` bytes.
 ///

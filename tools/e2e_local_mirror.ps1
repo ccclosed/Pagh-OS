@@ -118,7 +118,7 @@ $qemuArgs = @(
     '-device','virtio-blk-pci,drive=hd0',
     '-netdev','user,id=net0',
     '-device','e1000,netdev=net0',
-    '-m','512M',
+    '-m','1024M',
     '-serial',"file:$serialLog",
     '-display','none',
     '-no-reboot',
