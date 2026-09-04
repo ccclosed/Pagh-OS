@@ -133,6 +133,30 @@ commit them.
   `[WATCHDOG]`, `[DIAG]`, `LXSELFTEST`, `[EXC #N]` markers — E2E asserts
   grep them; don't rename them casually.
 
+## Versioning
+
+Semver `MAJOR.MINOR.PATCH` — in that standard order (major, *then* minor,
+*then* patch). The single source is `Cargo.toml [package].version`; it flows
+into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
+(`provision.rs`), so a stale version is user-visible at boot.
+
+- **MAJOR** — image-level breaks: on-disk/boot format changes, removed
+  syscall families, incompatible userland expectations. Rare; last was
+  2.0.0 (own TCP/IP stack + e1000 replacing smoltcp + virtio-net).
+- **MINOR** — new user-visible features or behavior changes, even
+  fully backward-compatible ones. Precedent: `release 1.1.0: the tick-rate
+  change is a feature (behavior change), so minor bump, not patch`.
+  Land the bump in the same PR (or the final commit of a stacked series)
+  that ships the feature — not some day later. Current 2.1.0 = the COW
+  fork/demand-paging drop (PR #8) + real POSIX signal delivery (PRs #9/#10).
+- **PATCH** — fixes, diagnostics, docs, tooling, vendored-dep refreshes with
+  no behavior change. Docs-only commits (this file, READMEs) do not bump.
+- **Tags**: tag the release commit with the bare version string (`2.1.0`,
+  matching the existing tag style) and push the tag. Tags must never run
+  ahead of `Cargo.toml` — the old `2.0.4` tag sat on a commit whose crate
+  version was still 2.0.3; that drift is exactly what this section prevents.
+- CI does not enforce the bump (yet); reviewers and agents must.
+
 ## Known open gaps (good first issues, all documented in-code)
 
 - procfs does not exist (only emulated `/proc/self/exe` readlink).
