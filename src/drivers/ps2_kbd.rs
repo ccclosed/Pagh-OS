@@ -115,7 +115,20 @@ pub fn irq_handler() {
                     && crate::task::compat::compat_exists(fg)
                     && !crate::task::compat::compat_is_raw(fg)
                 {
-                    crate::task::scheduler::request_exit(fg);
+                    // Phase-2 signals: ^C delivers a real SIGINT. A program
+                    // with a handler gets it (the blocking-wait EINTR checks
+                    // wake it); without one the default-terminate action
+                    // kills it at the next syscall return — the classic
+                    // driver-level bypass remains only as the fallback for a
+                    // process with no compat state.
+                    if crate::arch::x86_64::linux::signal::send_signal(
+                        fg,
+                        crate::arch::x86_64::linux::signal_frame::SIGINT,
+                    )
+                    .is_err()
+                    {
+                        crate::task::scheduler::request_exit(fg);
+                    }
                 }
             }
             _ => {}

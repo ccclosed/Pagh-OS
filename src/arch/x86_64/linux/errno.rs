@@ -17,6 +17,8 @@ pub enum Errno {
     /// No such file or directory.
     ENOENT = 2,
     ESRCH = 3,
+    /// Interrupted system call (a deliverable signal poked a blocking wait).
+    EINTR = 4,
     /// Input/output error (a real VFS/device read or write failure).
     EIO = 5,
     /// Argument list too long.

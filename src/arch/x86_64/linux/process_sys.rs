@@ -168,6 +168,13 @@ pub fn sys_futex(
                     }
                     return Err(Errno::ETIMEDOUT);
                 }
+                // Deliverable signal → -EINTR. Deregister first (same
+                // wake-wins-over-anything race window as the timeout path).
+                if crate::arch::x86_64::linux::signal::has_deliverable_current()
+                    && !finish_wait(queue_key, ticket)
+                {
+                    return Err(Errno::EINTR);
+                }
                 crate::task::scheduler::yield_current();
             }
         }
@@ -226,6 +233,11 @@ pub fn sys_wait4(pid: u64, status: u64, options: u64, rusage: u64) -> Result<u64
         }
         if options & WNOHANG != 0 {
             return Ok(0);
+        }
+        // Deliverable signal → -EINTR (SIGCHLD is not delivered yet — wait4
+        // stays poll-based — but a `^C`-style signal must wake the waiter).
+        if crate::arch::x86_64::linux::signal::has_deliverable_current() {
+            return Err(Errno::EINTR);
         }
         crate::task::scheduler::yield_current();
     }

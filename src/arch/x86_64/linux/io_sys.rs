@@ -1299,6 +1299,12 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
         let sc = match sc {
             Some(b) => b,
             None => {
+                // A deliverable signal (pending ∧ ¬blocked) turns the blocked
+                // read into -EINTR; the dispatch epilogue delivers it right
+                // after this handler returns (handler, or default-terminate).
+                if super::signal::has_deliverable_current() {
+                    return Err(Errno::EINTR);
+                }
                 // Honor O_NONBLOCK - blocking here stalled
                 // nvim's TUI loop before the first frame was drawn.
                 if STDIN_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed)
@@ -1385,6 +1391,10 @@ fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
         let sc = match sc {
             Some(b) => b,
             None => {
+                // Deliverable signal → -EINTR (see read_stdin_raw).
+                if super::signal::has_deliverable_current() {
+                    return Err(Errno::EINTR);
+                }
                 // No pending scancode: let other tasks (and the IRQ that feeds
                 // the ring buffer) run instead of burning the time slice.
                 crate::task::scheduler::yield_current();
@@ -2282,6 +2292,9 @@ pub fn sys_poll(fds: u64, nfds: u64, timeout: u64) -> Result<u64, Errno> {
                 return Ok(0);
             }
         }
+        if super::signal::has_deliverable_current() {
+            return Err(Errno::EINTR);
+        }
         crate::task::scheduler::yield_current()
     }
 }
@@ -2387,6 +2400,9 @@ fn do_select(
             store_fdset(writefds, nfds, &got_w);
             store_fdset(exceptfds, nfds, &[0u64; FDSET_WORDS]);
             return Ok(ready);
+        }
+        if super::signal::has_deliverable_current() {
+            return Err(Errno::EINTR);
         }
         crate::task::scheduler::yield_current();
     }
