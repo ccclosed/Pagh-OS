@@ -34,6 +34,8 @@ pub mod io_sys;
 pub mod mem_sys;
 pub mod process_sys;
 pub mod rtc;
+pub mod signal;
+pub mod signal_frame;
 pub mod unix_sock;
 
 use abi::nr as sysno;
@@ -413,11 +415,14 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
         process_sys::sys_execve(r, args[0], args[1], args[2])
     } else if nr == sysno::CLONE {
         process_sys::sys_clone(r, args[0], args[1], args[2], args[3], args[4])
+    } else if nr == sysno::RT_SIGRETURN {
+        // Needs the saved frame (the user RSP slot +120), not the six args.
+        signal::sys_rt_sigreturn(r)
     } else {
         dispatch_supported(nr, &args)
     };
     inflight_exit(wd_pid);
-    match result {
+    let out = match result {
         Ok(v) => v,
         Err(e) => {
             // EINVAL returns are logged with their syscall
@@ -438,7 +443,18 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
             }
             encode_errno(e)
         }
-    }
+    };
+    // ── 4. Signal delivery at the syscall-return point (Phase 1) ──
+    // After the result was folded but BEFORE the entry stub writes it into
+    // the saved `rax` slot and unwinds: a pending, unblocked signal with a
+    // user handler gets an `rt_sigframe` on the user stack and the saved
+    // registers rewritten so `sysretq` lands in the handler; a
+    // default-terminate signal exits the process right here. The interrupted
+    // syscall's result travels inside the frame's saved `rax`, so a handler
+    // that returns via `rt_sigreturn` resumes with the correct value.
+    // Native tasks (no compat state) pass through with one atomic load.
+    signal::deliver_one_pending(r, out);
+    out
 }
 
 // ─── stuck-syscall watchdog ────────────────────────────────────────
