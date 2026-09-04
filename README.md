@@ -105,7 +105,9 @@ honest INSECURE warnings (VARIANT A: encrypted but unauthenticated).
   Linux programs in ring 3 (`lxrun`) — including the CPython 3.16 REPL (GNU readline
   works via `select`/`pselect6`). `fork`/`clone` + threads, `epoll`/`eventfd`, unix
   sockets, and raw-mode `termios` (with kernel-side echo) are implemented; POSIX signal
-  delivery and `procfs` remain stubs.
+  delivery works at the syscall-return point (real `rt_sigaction`/`rt_sigprocmask`/
+  `sigaltstack`/`rt_sigreturn`, `^C` → SIGINT with `EINTR` wake-ups in the blocking
+  waits); `procfs` remains a stub.
 - **Packages:** a by-name `apt` (`update`/`install`/`show`/`list`/`setmirror`) that fetches
   a Debian `Packages` index over HTTP/HTTPS, streams gzip/xz/zstd decompression into a
   compact in-RAM arena index, resolves dependencies, and installs `.deb`s onto ext2 `/mnt`
@@ -418,8 +420,14 @@ python
   `fork`/`clone` + threads, `epoll`/`eventfd`, unix sockets, vectored I/O
   (`readv`/`writev`/…), `rename*`, and job-control probes (`setpgid`/`getpgid`,
   `TIOCGPGRP`/`TIOCSPGRP`, `wait4` with `WUNTRACED`/`WCONTINUED`) are implemented;
-  POSIX signal delivery is still a stub, though a fatal `tgkill` ends the process
-  cleanly (glibc `abort()` → exit 134).
+  POSIX signal delivery works at the syscall-return point: `rt_sigaction` installs
+  real handlers, delivered signals build an x86_64 `rt_sigframe` on the user stack
+  and `rt_sigreturn` restores the context, `^C` sends a real SIGINT (blocking waits
+  wake with `EINTR`), and a fatal `tgkill` without a handler still ends the process
+  cleanly (glibc `abort()` → exit 134). Not yet: delivery while parked in a wait is
+  limited to the patched wait loops (read/poll/select/epoll/nanosleep/wait4/futex),
+  `kill(2)`/group broadcast, SIGSTOP/SIGCONT scheduling, and signals delivered from
+  the timer-tick return path.
 - **Install ≠ run.** `apt install <pkg>` resolves the dependency closure, downloads each
   `.deb`, unpacks its files onto `/mnt`, and materializes tar symlinks/hardlinks as file
   copies (the ext2 writer has no symlink support). Console programs like `python3`
@@ -427,9 +435,10 @@ python
   sequences with `ONLCR`, `TCSETS*` applies real raw-mode (`ICANON`/`ECHO`) with
   kernel-side echo in raw mode, honest `tcgetattr` reports terminal state, and
   `ioctl(FIONBIO)` covers libuv's non-blocking path — `nvim` runs and saves its ShaDa.
-  There is still no `procfs` beyond an emulated `/proc/self/exe` readlink and no signal
-  delivery, so programs that require `/proc/stat`/`/proc/meminfo` (e.g. `htop`) or POSIX
-  signals remain out of reach. See `LINUX-USERLAND.md` for the exact status.
+  There is still no `procfs` beyond an emulated `/proc/self/exe` readlink, so programs
+  that require `/proc/stat`/`/proc/meminfo` (e.g. `htop`) remain out of reach. Signal
+  delivery is real at the syscall-return point (see above); asynchronous delivery
+  from the timer-tick return path is not yet wired. See `LINUX-USERLAND.md` for the exact status.
 - **Transport.** Downloads use HTTP or HTTPS. HTTPS is **VARIANT A**: TLS 1.3 encrypted but
   **unauthenticated** (no certificate chain/hostname/expiry checks),
   and package data is not signature-verified — acceptable only for this hobby/QEMU demo.

@@ -1136,10 +1136,13 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
             // (its stdin reads the PS/2 stream directly), so resuming the
             // prompt immediately would make the shell steal every keystroke.
             //
-            // Ctrl+C ALWAYS terminates the child now: the latch is set at the
-            // PS/2 driver level, so it reflects real user intent at the
-            // keyboard even when a program never decodes modifiers itself.
-            // (Trade-off: full-screen programs lose ^C as an input key.)
+            // Ctrl+C delivers a real SIGINT to the child (Phase-2 signals):
+            // the latch reflects real user intent at the keyboard even when a
+            // program never decodes modifiers itself, and the EINTR checks in
+            // the blocking waits wake the child so the signal is delivered at
+            // its next syscall return. A handler-installing program can keep
+            // running (each further ^C re-sends); without a handler the
+            // default-terminate action kills it, ending this wait loop.
             use core::sync::atomic::Ordering;
             crate::shell::keys::CTRL_C_LATCH.store(false, Ordering::Relaxed);
             crate::drivers::ps2_kbd::CTRL_C.store(false, Ordering::Relaxed);
@@ -1150,8 +1153,10 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
                     | crate::drivers::ps2_kbd::CTRL_C.swap(false, Ordering::Relaxed);
                 if pressed {
                     shell_println("^C");
-                    crate::task::scheduler::request_exit(pid);
-                    break;
+                    let _ = crate::arch::x86_64::linux::signal::send_signal(
+                        pid,
+                        crate::arch::x86_64::linux::signal_frame::SIGINT,
+                    );
                 }
                 heartbeats += 1;
                 if heartbeats % 20000 == 0 {}

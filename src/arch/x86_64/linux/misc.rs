@@ -374,8 +374,11 @@ fn read_timespec(ptr: u64) -> Result<(i64, i64), Errno> {
 pub fn sys_nanosleep(req: u64, _rem: u64) -> Result<u64, Errno> {
     let (sec, nsec) = read_timespec(req)?;
     let ticks = duration_to_ticks(sec, nsec);
-    if ticks > 0 {
-        scheduler::sleep_ticks(ticks);
+    if ticks > 0 && !sleep_interruptible(ticks) {
+        // A deliverable signal poked the sleep; the dispatch epilogue
+        // delivers it right after this handler returns. (`rem` stays
+        // unwritten — this minimal model never filled it.)
+        return Err(Errno::EINTR);
     }
     Ok(0)
 }
@@ -383,13 +386,29 @@ pub fn sys_nanosleep(req: u64, _rem: u64) -> Result<u64, Errno> {
 /// `clock_nanosleep` (230): relative sleep against the requested clock. Absolute
 /// (`TIMER_ABSTIME`) sleeps and the clock id are ignored in this minimal model; it
 /// sleeps the requested relative duration like `nanosleep` and returns 0.
+/// Interruptible by a deliverable signal (`-EINTR`), like `nanosleep`.
 pub fn sys_clock_nanosleep(_clock_id: u64, _flags: u64, req: u64, _rem: u64) -> Result<u64, Errno> {
     let (sec, nsec) = read_timespec(req)?;
     let ticks = duration_to_ticks(sec, nsec);
-    if ticks > 0 {
-        scheduler::sleep_ticks(ticks);
+    if ticks > 0 && !sleep_interruptible(ticks) {
+        return Err(Errno::EINTR);
     }
     Ok(0)
+}
+
+/// Sleep `total` ticks in one-tick slices, aborting early when the current
+/// process has a deliverable signal (returns false). Checked before each
+/// slice, so worst-case wake-up latency is one tick (~1 ms at 1000 Hz).
+fn sleep_interruptible(total: u64) -> bool {
+    let mut left = total;
+    while left > 0 {
+        if super::signal::has_deliverable_current() {
+            return false;
+        }
+        scheduler::sleep_ticks(1);
+        left -= 1;
+    }
+    true
 }
 
 /// The x86_64 Linux `struct sysinfo` (fields populated with plausible values).

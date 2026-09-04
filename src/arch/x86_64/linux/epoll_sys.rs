@@ -212,14 +212,20 @@ pub fn sys_epoll_wait(
         if out > 0 || timed_out || timeout_i == 0 {
             return Ok(out as u64);
         }
+        // Deliverable signal → -EINTR (libuv's `errno == EINTR` assertion
+        // already expects this shape); the dispatch epilogue delivers.
+        if super::signal::has_deliverable_current() {
+            return Err(Errno::EINTR);
+        }
         crate::task::scheduler::yield_current();
     }
 }
 
-/// `epoll_pwait` (281): `epoll_wait` plus a sigmask. Signals are
-/// never delivered asynchronously in pagh, so the mask is accepted and
-/// ignored; libuv's uv__io_poll calls this unconditionally on newer glibc,
-/// and the ENOSYS fallthrough tripped its `errno == EINTR` assertion.
+/// `epoll_pwait` (281): `epoll_wait` plus a sigmask. The atomic
+/// swap-to-sigmask-then-restore semantics are not implemented (the mask is
+/// accepted and ignored); the wait itself IS signal-interruptible — a
+/// deliverable signal returns `-EINTR`, which libuv's uv__io_poll already
+/// tolerates (its `errno == EINTR` assertion motivated this syscall).
 pub fn sys_epoll_pwait(
     epfd: u64,
     events_ptr: u64,
