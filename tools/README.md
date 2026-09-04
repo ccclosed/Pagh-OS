@@ -27,7 +27,7 @@
   через `limine.py` (любая локальная `limine*/`-дерево, иначе автоскачивание),
   `boot/limine.conf` записывается в двух местах (корень ISO + `EFI/BOOT/`).
 - `run`: stage + QEMU (`-bios OVMF.fd`, `fat:rw:iso_root`, virtio-blk `disk.img`, e1000 NIC
-  с hostfwd `tcp/udp 5555->7`, `-m 512M`, `-serial stdio`, debug-трейс в `qemu_debug.log`).
+  с hostfwd `tcp/udp 5555->7`, `-m 1024M`, `-serial stdio`, debug-трейс в `qemu_debug.log`).
 - Env-оверрайды: `LIMINE_DIR`/`LIMINE_EFI` (иначе автопоиск/автоскачивание), `OVMF` (дефолт `OVMF.fd`),
   `PAGH_DISK` (дефолт `disk.img`).
 
@@ -51,6 +51,7 @@
 
 - E2E-скрипты перезаписывают `iso_root/pagh.elf` и восстанавливают его после — не убить
   дефолтный артефакт посреди прогона.
-- `build.py` даёт диск 64 MiB и `-m 512M`, а `run.sh` — 1 GiB диск и `-m 1024M` (куче нужно
-  ≥1 GiB RAM; см. `src/memory/README.md`).
+- `build.py` даёт диск 64 MiB и `-m 1024M`, а `run.sh` — 1 GiB диск и `-m 1024M` (куче нужно
+  ≥1 GiB RAM; см. `src/memory/README.md`; на машинах с меньшей RAM ядро само капит кучу
+  с `[WARN]` вместо паники).
 - NIC расходится: e1000 (`build.py`, `run.sh`) против virtio-net-pci (`run.cmd`, bg-скрипты).

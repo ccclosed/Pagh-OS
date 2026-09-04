@@ -145,7 +145,8 @@ REM   -bios OVMF.fd ............ UEFI firmware
 REM   -drive fat:rw:iso_root ... expose iso_root as a virtual FAT ESP
 REM   virtio-blk-pci (hd0) ..... the ext2 data disk (disk.img) at /mnt
 REM   -netdev user + virtio-net  user-mode NIC, host:5555 -> guest:7 (TCP/UDP)
-REM   -m 512M .................. guest RAM
+REM   -m 1024M ................. guest RAM (kernel heap wants >= 1 GiB, see
+REM                              HEAP_INITIAL_PAGES in src/memory/layout.rs)
 REM   -serial stdio ............ kernel serial on this console
 REM   -no-reboot/-no-shutdown .. freeze on triple fault instead of looping
 REM   -d ... -D qemu_debug.log . interrupt/reset/guest-error trace to a file
@@ -156,7 +157,7 @@ qemu-system-x86_64 ^
     -device virtio-blk-pci,drive=hd0 ^
     -netdev user,id=net0,hostfwd=tcp::5555-:7,hostfwd=udp::5555-:7 ^
     -device virtio-net-pci,netdev=net0 ^
-    -m 512M ^
+    -m 1024M ^
     -serial stdio ^
     -no-reboot ^
     -no-shutdown ^
