@@ -163,6 +163,13 @@ pub mod timeconv;
 #[path = "../../src/task/fd_alloc.rs"]
 pub mod fd_alloc;
 
+// `signal_frame` is the pure x86_64 Linux signal ABI (signal numbers, sigset
+// algebra, default-action classification, `rt_sigframe` encode/decode) backing
+// the Phase-1 signal delivery. `core`-only and self-contained, so the
+// standalone `#[path]` include resolves with no extra wiring (P42).
+#[path = "../../src/arch/x86_64/linux/signal_frame.rs"]
+pub mod signal_frame;
+
 // ---------------------------------------------------------------------------
 // Property-test modules (P1..P28)
 // ---------------------------------------------------------------------------
@@ -214,6 +221,7 @@ mod properties {
     mod p39;
     mod p40;
     mod p41;
+    mod p42;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the

@@ -94,10 +94,13 @@ pub mod nr {
     pub const MREMAP: u64 = 25;
     /// `brk` — change the program break.
     pub const BRK: u64 = 12;
-    /// `rt_sigaction` — examine/change a signal action (stub).
+    /// `rt_sigaction` — examine/change a signal action.
     pub const RT_SIGACTION: u64 = 13;
-    /// `rt_sigprocmask` — examine/change the blocked-signal mask (stub).
+    /// `rt_sigprocmask` — examine/change the blocked-signal mask.
     pub const RT_SIGPROCMASK: u64 = 14;
+    /// `rt_sigreturn` — return from a signal handler (restores the context
+    /// saved in the `rt_sigframe` the restorer stands on).
+    pub const RT_SIGRETURN: u64 = 15;
     /// `ioctl` — device control.
     pub const IOCTL: u64 = 16;
     /// `pread64` — positional read (offset not advanced).
@@ -267,6 +270,7 @@ pub fn is_supported(nr: u64) -> bool {
             | nr::BRK
             | nr::RT_SIGACTION
             | nr::RT_SIGPROCMASK
+            | nr::RT_SIGRETURN
             | nr::IOCTL
             | nr::PREAD64
             | nr::PWRITE64
@@ -380,8 +384,8 @@ mod tests {
     #[test]
     fn supported_set_is_exact() {
         let supported = [
-            0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 20, 21, 22, 24, 28, 32, 33, 35,
-            39, 44, 45, 60, 63, 72, 79, 80, 81, 84, 87, 89, 90, 96, 97, 99, 102, 104, 107, 108,
+            0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 24, 28, 32, 33,
+            35, 39, 44, 45, 60, 63, 72, 79, 80, 81, 84, 87, 89, 90, 96, 97, 99, 102, 104, 107, 108,
             110, 131, 137, 138, 158, 186, 201, 202, 217, 218, 227, 228, 229, 230, 231, 257, 262,
             267, 273, 292, 293, 302, 318, 334,
         ];

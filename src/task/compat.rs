@@ -19,6 +19,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::arch::x86_64::linux::mem::VmRegionSet;
+use crate::arch::x86_64::linux::signal_frame::{sigbit, SigAltStack, SignalAction, SIGNAL_COUNT};
 use crate::sync::spinlock::Spinlock;
 
 use super::fd::FdTable;
@@ -80,6 +81,26 @@ pub struct CompatState {
     /// time (default mode masked by `umask`); consulted by `stat`-family
     /// handlers when reporting `st_mode`. Forked/cloned children inherit it.
     pub mode_overrides: BTreeMap<u64, u32>,
+    /// Shared signal-disposition table (the `sigaction` state). Wrapped in an
+    /// `Arc` so thread clones (`CLONE_VM|CLONE_THREAD`, like Linux
+    /// `CLONE_SIGHAND`) SHARE one table, while `fork` deep-copies it.
+    pub sig: Arc<Spinlock<SignalTable>>,
+    /// Per-thread pending-signal bitset (Linux pending signals are per-thread
+    /// unless sent via `kill_pgrp`-style group paths, which Phase 1 omits).
+    pub sig_pending: u64,
+    /// Per-thread blocked-signal mask (`rt_sigprocmask`). `SIGKILL`/`SIGSTOP`
+    /// bits are never set (enforced by `signal_frame::apply_mask_op`).
+    pub sig_blocked: u64,
+    /// Alternate signal stack registered via `sigaltstack(2)`.
+    pub sig_altstack: SigAltStack,
+}
+
+/// The disposition table shared by a thread group.
+#[derive(Clone)]
+pub struct SignalTable {
+    /// Disposition for signals 1..=64 (index `sig - 1`); all `SIG_DFL` at
+    /// process creation, matching Linux.
+    pub handlers: [SignalAction; SIGNAL_COUNT],
 }
 
 impl CompatState {
@@ -118,6 +139,12 @@ impl CompatState {
             rlimits: BTreeMap::new(),
             umask: 0o022,
             mode_overrides: BTreeMap::new(),
+            sig: Arc::new(Spinlock::new(SignalTable {
+                handlers: [SignalAction::default(); SIGNAL_COUNT],
+            })),
+            sig_pending: 0,
+            sig_blocked: 0,
+            sig_altstack: SigAltStack::default(),
         }
     }
 }
@@ -281,6 +308,13 @@ pub fn fork_current_compat(child: u64, clear_child_tid: u64) -> bool {
         let vm_copy = child_state.vm.lock().clone();
         child_state.vm = Arc::new(Spinlock::new(vm_copy));
     }
+    // Fork deep-copies the signal-disposition table too (Linux: the child gets
+    // its own `struct sighand_struct`, unlike CLONE_SIGHAND thread clones,
+    // which share the parent's `Arc` via the `CompatState` clone above).
+    {
+        let sig_copy = child_state.sig.lock().clone();
+        child_state.sig = Arc::new(Spinlock::new(sig_copy));
+    }
     child_state.tid = child;
     child_state.tgid = child;
     child_state.ppid = parent_tgid;
@@ -324,6 +358,77 @@ pub fn group_member_pids(tgid: u64, except: u64) -> alloc::vec::Vec<u64> {
         .iter()
         .filter_map(|(pid, s)| (s.tgid == tgid && *pid != except).then_some(*pid))
         .collect()
+}
+
+/// `tgid` of `pid` (falling back to `pid` itself when it has no compat state).
+pub fn tgid_of(pid: u64) -> u64 {
+    COMPAT_STATES
+        .lock()
+        .get(&pid)
+        .map(|s| s.tgid)
+        .unwrap_or(pid)
+}
+
+/// Overwrite the recorded exit code of a still-registered process (used by the
+/// signal force-terminate path so `wait4` reports `128 + sig`).
+pub fn set_exit_code_of(pid: u64, code: u8) -> bool {
+    COMPAT_STATES
+        .lock()
+        .get_mut(&pid)
+        .map(|cs| {
+            cs.exit_code = Some(code);
+        })
+        .is_some()
+}
+
+/// Mark signal `sig` pending for process `pid`. Returns false when the process
+/// is gone (caller maps to `ESRCH`).
+pub fn set_pending(pid: u64, sig: u64) -> bool {
+    COMPAT_STATES
+        .lock()
+        .get_mut(&pid)
+        .map(|cs| {
+            cs.sig_pending |= sigbit(sig);
+        })
+        .is_some()
+}
+
+/// Atomically pick the lowest-numbered deliverable signal for the CURRENT
+/// process (pending AND not blocked), clearing its pending bit.
+///
+/// Returns the signal number, its disposition, the current blocked mask (the
+/// caller ORs the action's `sa_mask` into it for the handler's lifetime), and
+/// the registered alternate stack (for `SA_ONSTACK` placement).
+pub fn pick_pending_signal() -> Option<(u64, SignalAction, u64, SigAltStack)> {
+    let pid = super::scheduler::current_pid();
+    let mut states = COMPAT_STATES.lock();
+    let cs = states.get_mut(&pid)?;
+    let deliverable = cs.sig_pending & !cs.sig_blocked;
+    if deliverable == 0 {
+        return None;
+    }
+    let sig = deliverable.trailing_zeros() as u64;
+    cs.sig_pending &= !(1u64 << (sig - 1));
+    let action = cs.sig.lock().handlers[(sig - 1) as usize];
+    Some((sig, action, cs.sig_blocked, cs.sig_altstack))
+}
+
+/// Block `mask` in the CURRENT process for the handler's lifetime (the
+/// pre-delivery mask is already saved inside the frame; `rt_sigreturn`
+/// reinstates it).
+pub fn block_during_handler(mask: u64) {
+    with_current_compat(|cs| {
+        cs.sig_blocked |= mask & !crate::arch::x86_64::linux::signal_frame::UNBLOCKABLE_MASK
+    });
+}
+
+/// Disposition currently installed for `sig` in the CURRENT process
+/// (`None` when the process has no compat state).
+pub fn current_action(sig: u64) -> Option<SignalAction> {
+    COMPAT_STATES
+        .lock()
+        .get(&super::scheduler::current_pid())
+        .map(|cs| cs.sig.lock().handlers[(sig - 1) as usize])
 }
 
 pub fn current_has_compat() -> bool {

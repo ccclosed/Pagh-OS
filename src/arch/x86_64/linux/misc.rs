@@ -230,29 +230,43 @@ pub fn sys_exit_group(code: u64) -> ! {
     scheduler::exit_current()
 }
 
-/// `tgkill` (234): only the truly fatal signals terminate the thread group
-/// (glibc `abort()`/`raise()`). Benign signals (`SIGCHLD`, `SIGCONT`, `SIGSTOP`,
-/// `SIGWINCH`, `SIGURG`, …) are accepted and ignored — a process using tgkill
-/// for ordinary signaling must not self-destruct. Returning `ENOSYS` for the
-/// fatal ones made glibc's `abort()` fall through to a ring-3 `hlt`, which
-/// surfaced as a spurious #GP after every "Fatal Python error".
+/// `tgkill` (234): send a signal to a thread of the CALLING thread group.
+/// Phase 1 semantics:
+///   * with a user handler installed for `sig` (via `rt_sigaction`): the
+///     signal is queued pending and delivered at this syscall's return point
+///     ([`super::signal::deliver_one_pending`]) — so `raise()`/`abort()`-style
+///     self-signals run the handler before anything else;
+///   * without a handler and a default-fatal `sig`: exit the thread group
+///     with `128 + sig` (Phase-0 behavior kept: an `ENOSYS` here made glibc's
+///     `abort()` fall through to a ring-3 `hlt`, surfacing as a spurious #GP
+///     after every "Fatal Python error");
+///   * without a handler and a non-fatal `sig`: accepted and ignored
+///     (`SIGCHLD`, `SIGCONT`, `SIGWINCH`, ... must not self-destruct).
 pub fn sys_tgkill(_tgid: u64, _tid: u64, sig: u64) -> Result<u64, Errno> {
-    const SIGKILL: u64 = 9;
-    const SIGSEGV: u64 = 11;
-    const SIGABRT: u64 = 6;
-    const SIGFPE: u64 = 8;
-    const SIGILL: u64 = 4;
-    const SIGBUS: u64 = 7;
-    const SIGSYS: u64 = 31;
-    match sig & 0x3f {
-        SIGKILL | SIGSEGV | SIGABRT | SIGFPE | SIGILL | SIGBUS | SIGSYS => {
-            crate::info!(
-                "[linux] tgkill: fatal signal {} to self - exiting thread group",
-                sig
-            );
-            sys_exit_group(128 + (sig & 0x3f))
+    if sig == 0 {
+        return Ok(0);
+    }
+    if sig > super::signal_frame::SIGNAL_COUNT as u64 {
+        return Err(Errno::EINVAL);
+    }
+    match super::signal::current_has_handler(sig) {
+        Some(true) => {
+            super::signal::send_signal(scheduler::current_pid(), sig)?;
+            Ok(0)
         }
-        _ => Ok(0),
+        Some(false) => {
+            if crate::arch::x86_64::linux::signal_frame::default_is_fatal(sig) {
+                crate::info!(
+                    "[linux] tgkill: fatal signal {} to self - exiting thread group",
+                    sig
+                );
+                sys_exit_group(128 + sig)
+            } else {
+                Ok(0)
+            }
+        }
+        // Native task (no compat state): nothing to signal.
+        None => Ok(0),
     }
 }
 
@@ -441,56 +455,163 @@ pub fn sys_sched_yield() -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `rt_sigaction` (13): signals are never delivered, so accept and return 0
-/// without installing any handler. `oldact`, when requested, receives a zeroed
-/// `struct kernel_sigaction` (handler = SIG_DFL) so save-and-restore users read
-/// back defined data instead of uninitialized memory.
-pub fn sys_rt_sigaction(_sig: u64, _act: u64, oldact: u64, sigsetsize: u64) -> Result<u64, Errno> {
+/// `rt_sigaction` (13): install or query the disposition for `sig`.
+///
+/// The user ABI is `struct kernel_sigaction` (32 bytes at `sigsetsize == 8`):
+/// `{ handler, flags, restorer, mask }`. The handler address is stored
+/// verbatim — `SIG_DFL` (0) and `SIG_IGN` (1) are the special values — and
+/// delivery applies `sa_mask` for the handler's lifetime
+/// ([`super::signal::deliver_one_pending`]).
+///
+/// `oldact`, when requested, receives the CURRENT disposition so
+/// save-and-restore users (bash, readline) round-trip exactly. `SIGKILL` and
+/// `SIGSTOP` dispositions cannot be changed (`EINVAL`, matching Linux).
+pub fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> Result<u64, Errno> {
+    if sig == 0 || sig > super::signal_frame::SIGNAL_COUNT as u64 {
+        return Err(Errno::EINVAL);
+    }
+    if (sig == crate::arch::x86_64::linux::signal_frame::SIGKILL
+        || sig == crate::arch::x86_64::linux::signal_frame::SIGSTOP)
+        && act != 0
+    {
+        return Err(Errno::EINVAL);
+    }
+    if act != 0 {
+        check_user_ptr(act, 32)?;
+        let mut b = [0u8; 32];
+        // SAFETY: range validated above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(act as *const u8, b.as_mut_ptr(), 32);
+        }
+        let handler = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let flags = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        let restorer = u64::from_le_bytes(b[16..24].try_into().unwrap());
+        let mask = u64::from_le_bytes(b[24..32].try_into().unwrap());
+        if flags & crate::arch::x86_64::linux::signal_frame::SA_RESTORER == 0 {
+            // glibc always sets SA_RESTORER; a handler returning without it
+            // has no way back into the kernel (Linux would page-fault).
+            crate::warn!(
+                "[linux] rt_sigaction: sig={} without SA_RESTORER (handler return will fault)",
+                sig
+            );
+        }
+        compat::with_current_compat(|cs| {
+            cs.sig.lock().handlers[(sig - 1) as usize] =
+                crate::arch::x86_64::linux::signal_frame::SignalAction {
+                    handler,
+                    flags,
+                    restorer,
+                    mask,
+                };
+        })
+        .ok_or(Errno::EINVAL)?;
+    }
     if oldact != 0 {
-        let size = if sigsetsize != 0 { sigsetsize } else { 8 };
-        // kernel_sigaction = { handler, flags, restorer, mask[sigsetsize] }
-        let total = 24u64.saturating_add(size);
-        check_user_ptr(oldact, total)?;
-        // SAFETY: the oldact range was validated above.
+        let cur = compat::current_action(sig).ok_or(Errno::EINVAL)?;
+        check_user_ptr(oldact, 32)?;
+        let mut b = [0u8; 32];
+        b[0..8].copy_from_slice(&cur.handler.to_le_bytes());
+        b[8..16].copy_from_slice(&cur.flags.to_le_bytes());
+        b[16..24].copy_from_slice(&cur.restorer.to_le_bytes());
+        b[24..32].copy_from_slice(&cur.mask.to_le_bytes());
+        // SAFETY: range validated above.
         unsafe {
-            core::ptr::write_bytes(oldact as *mut u8, 0, total as usize);
+            core::ptr::copy_nonoverlapping(b.as_ptr(), oldact as *mut u8, 32);
         }
     }
     Ok(0)
 }
 
-/// `rt_sigprocmask` (14): no signals to mask; `oldset`, when requested, receives
-/// an empty sigset (all zeros) instead of leaving user memory untouched.
-pub fn sys_rt_sigprocmask(
-    _how: u64,
-    _set: u64,
-    oldset: u64,
-    sigsetsize: u64,
-) -> Result<u64, Errno> {
-    if oldset != 0 {
-        let size = if sigsetsize != 0 { sigsetsize } else { 8 };
-        check_user_ptr(oldset, size)?;
-        // SAFETY: the oldset range was validated above.
-        unsafe {
-            core::ptr::write_bytes(oldset as *mut u8, 0, size as usize);
-        }
+/// `rt_sigprocmask` (14): get/change the calling thread's blocked-signal
+/// mask. `how` is `SIG_BLOCK`/`SIG_UNBLOCK`/`SIG_SETMASK`; the `SIGKILL` and
+/// `SIGSTOP` bits can never end up blocked
+/// ([`apply_mask_op`](super::signal_frame::apply_mask_op) strips them). Only
+/// the low 64 bits of the sigset are implemented (signals 1..=64); a larger
+/// `sigsetsize` is accepted and the remaining bytes ignored.
+pub fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> Result<u64, Errno> {
+    let size = if sigsetsize != 0 { sigsetsize } else { 8 };
+    if size < 8 {
+        return Err(Errno::EINVAL);
     }
-    Ok(0)
+    let outcome: Option<Result<u64, Errno>> = compat::with_current_compat(|cs| {
+        if set != 0 {
+            if let Err(e) = check_user_ptr(set, 8) {
+                return Err(e);
+            }
+            let mut b = [0u8; 8];
+            // SAFETY: range validated above.
+            unsafe {
+                core::ptr::copy_nonoverlapping(set as *const u8, b.as_mut_ptr(), 8);
+            }
+            match crate::arch::x86_64::linux::signal_frame::apply_mask_op(
+                how,
+                cs.sig_blocked,
+                u64::from_le_bytes(b),
+            ) {
+                Some(new) => cs.sig_blocked = new,
+                None => return Err(Errno::EINVAL),
+            }
+        }
+        if oldset != 0 {
+            if let Err(e) = check_user_ptr(oldset, 8) {
+                return Err(e);
+            }
+            let le = cs.sig_blocked.to_le_bytes();
+            // SAFETY: range validated above.
+            unsafe {
+                core::ptr::copy_nonoverlapping(le.as_ptr(), oldset as *mut u8, 8);
+            }
+        }
+        Ok(0)
+    });
+    outcome.ok_or(Errno::EINVAL)?
 }
 
-/// `sigaltstack` (131): accept and return 0 (no alternate signal stack is needed
-/// since signals are never delivered). `old_ss`, when requested, receives a zeroed
-/// stack_t so callers reading it back see "altstack disabled" rather than garbage.
-pub fn sys_sigaltstack(_ss: u64, old_ss: u64) -> Result<u64, Errno> {
-    if old_ss != 0 {
-        // struct stack_t { void *ss_sp; int ss_flags; size_t ss_size; } = 24 bytes
-        check_user_ptr(old_ss, 24)?;
-        // SAFETY: the old_ss range was validated above.
-        unsafe {
-            core::ptr::write_bytes(old_ss as *mut u8, 0, 24);
+/// `sigaltstack` (131): register or query the alternate signal stack
+/// ([`SA_ONSTACK`](super::signal_frame::SA_ONSTACK) handlers run on it).
+/// The 24-byte `stack_t` ABI is `{ ss_sp, ss_flags(+pad), ss_size }`.
+/// Registering a stack while running ON the alternate stack is not detected
+/// in Phase 1 (the check needs the interrupted RSP, which this handler does
+/// not receive); glibc never switches altstacks from inside a handler, so the
+/// omission is benign.
+pub fn sys_sigaltstack(ss: u64, old_ss: u64) -> Result<u64, Errno> {
+    let outcome: Option<Result<u64, Errno>> = compat::with_current_compat(|cs| {
+        if old_ss != 0 {
+            if let Err(e) = check_user_ptr(old_ss, 24) {
+                return Err(e);
+            }
+            let mut b = [0u8; 24];
+            b[0..8].copy_from_slice(&cs.sig_altstack.sp.to_le_bytes());
+            b[8..12].copy_from_slice(&cs.sig_altstack.flags.to_le_bytes());
+            b[16..24].copy_from_slice(&cs.sig_altstack.size.to_le_bytes());
+            // SAFETY: range validated above.
+            unsafe {
+                core::ptr::copy_nonoverlapping(b.as_ptr(), old_ss as *mut u8, 24);
+            }
         }
-    }
-    Ok(0)
+        if ss != 0 {
+            if let Err(e) = check_user_ptr(ss, 24) {
+                return Err(e);
+            }
+            let mut b = [0u8; 24];
+            // SAFETY: range validated above.
+            unsafe {
+                core::ptr::copy_nonoverlapping(ss as *const u8, b.as_mut_ptr(), 24);
+            }
+            let sp = u64::from_le_bytes(b[0..8].try_into().unwrap());
+            let flags = u32::from_le_bytes(b[8..12].try_into().unwrap());
+            let size = u64::from_le_bytes(b[16..24].try_into().unwrap());
+            if flags & crate::arch::x86_64::linux::signal_frame::SS_DISABLE == 0
+                && size < crate::arch::x86_64::linux::signal_frame::MINSIGSTKSZ
+            {
+                return Err(Errno::EINVAL);
+            }
+            cs.sig_altstack =
+                crate::arch::x86_64::linux::signal_frame::SigAltStack { sp, flags, size };
+        }
+        Ok(0)
+    });
+    outcome.ok_or(Errno::EINVAL)?
 }
 
 /// `set_robust_list` (273): accept and return 0 (no futex/robust-list support).
