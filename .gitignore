@@ -22,8 +22,9 @@
 # Firmware (download locally)
 /OVMF.fd
 
-# Limine bootloader source tree (download locally)
-/limine-12.3.1/
+# Limine bootloader trees (any version; auto-downloaded into /limine/ by
+# tools/limine.py when no local loader is present)
+/limine*/
 
 # ─── Build / link / run logs ───────────────────────────────────────────────
 /build_out.txt

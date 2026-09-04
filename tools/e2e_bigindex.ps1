@@ -69,9 +69,10 @@ function Stage-IsoRoot {
     if (Test-Path iso_root) { Remove-Item -Recurse -Force iso_root }
     New-Item -ItemType Directory -Path iso_root\EFI\BOOT | Out-Null
     Copy-Item $relElf iso_root\pagh.elf -Force
-    $loader = 'limine-12.3.1\BOOTX64.EFI'
-    if (Test-Path $loader) { Copy-Item $loader iso_root\EFI\BOOT\ -Force }
-    else { throw "Limine loader missing: $loader" }
+    # Resolve BOOTX64.EFI from any local limine*/ tree (download if missing).
+    $loader = (& python 'tools\limine.py' | Select-Object -Last 1)
+    if (-not $loader -or -not (Test-Path $loader)) { throw 'Limine loader unavailable; run: python tools\limine.py' }
+    Copy-Item $loader iso_root\EFI\BOOT\ -Force
     $conf = "timeout: 5`r`nverbose: yes`r`nserial: yes`r`n`r`n/pagh OS`r`n    protocol: limine`r`n    kernel_path: boot():/pagh.elf`r`n"
     Set-Content -Path iso_root\limine.conf -Value $conf -NoNewline
     Copy-Item iso_root\limine.conf iso_root\EFI\BOOT\limine.conf -Force

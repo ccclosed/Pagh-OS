@@ -34,8 +34,10 @@ necessary, not sufficient.
 The kernel needs the pinned nightly (`rust-toolchain.toml`) with `rust-src`
 (build-std) and `rust-lld`; it links via `linker.ld` into `pagh.elf`. On
 Windows use `run.cmd build|run`; on Linux `./build.sh` / `./run.sh`.
-`OVMF.fd`, `limine-12.3.1/` and `disk.img` are local, git-ignored — never
-commit them.
+`OVMF.fd` and `disk.img` are local, git-ignored — never
+commit them. The Limine loader is version-agnostic: any `limine*/` tree is
+git-ignored; `tools/limine.py` finds it (or auto-downloads the latest binary
+release into `limine/`) — do not hard-code Limine versions in scripts.
 
 ## Repo layout
 

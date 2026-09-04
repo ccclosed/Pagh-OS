@@ -7,6 +7,7 @@
 | Файл | Роль |
 |---|---|
 | `build.py` | Кроссплатформенный build/link/stage/run драйвер (бэкенд Makefile) |
+| `limine.py` | Версионно-независимый локатор/установщик `BOOTX64.EFI`: ищет любой локальный `limine*/` (или `LIMINE_EFI`/`LIMINE_DIR`), иначе качает последний бинарный релиз Limine (`limine-binary.zip`) в `limine/`; путь на stdout, прогресс на stderr |
 | `host_tests.py` | Обёртка: определяет host triple через `rustc -vV`, запускает `cargo test --locked --target <host>` в `host-tests/` |
 | `check_safety.py` | CI-гейт unsafe-политики: сканирует `src/security/`, `src/arch/x86_64/linux/mod.rs`, `src/memory/vmm.rs`, `src/net/tls.rs`, `src/pkg/apt.rs` — каждый `unsafe {` обязан иметь `SAFETY:`-коммент в предыдущих 6 строках, иначе exit 1 |
 | `mini_repo.py` | Мини Debian-зеркало в `tools/mini_repo/` для apt-E2E |
@@ -23,10 +24,11 @@
   (`pagh.lib`) в `pagh.elf` через rust-lld:
   `rust-lld -flavor gnu -T linker.ld -nostdlib -static --whole-archive <archive> --no-whole-archive -o pagh.elf`.
 - `stage`: чистка + пересборка `iso_root/` — `pagh.elf` в корень, `EFI/BOOT/BOOTX64.EFI`
-  из `limine-12.3.1/`, `boot/limine.conf` записывается в двух местах (корень ISO + `EFI/BOOT/`).
+  через `limine.py` (любая локальная `limine*/`-дерево, иначе автоскачивание),
+  `boot/limine.conf` записывается в двух местах (корень ISO + `EFI/BOOT/`).
 - `run`: stage + QEMU (`-bios OVMF.fd`, `fat:rw:iso_root`, virtio-blk `disk.img`, e1000 NIC
   с hostfwd `tcp/udp 5555->7`, `-m 512M`, `-serial stdio`, debug-трейс в `qemu_debug.log`).
-- Env-оверрайды: `LIMINE_DIR` (дефолт `limine-12.3.1`), `OVMF` (дефолт `OVMF.fd`),
+- Env-оверрайды: `LIMINE_DIR`/`LIMINE_EFI` (иначе автопоиск/автоскачивание), `OVMF` (дефолт `OVMF.fd`),
   `PAGH_DISK` (дефолт `disk.img`).
 
 ## mini_repo.py
@@ -43,7 +45,7 @@
 - Параметры: `-Port` (8000), `-TimeoutSec` (120 / 1200 / 240), `-KeepArtifacts`,
   `-InRam` (только bigindex), `-SkipDebugBuild` (smoke).
 - Замечание: `mini_repo.py serve` слушает 0.0.0.0; скрипты ждут раскладки
-  `limine-12.3.1/BOOTX64.EFI` + `OVMF.fd`.
+  `BOOTX64.EFI` (через `limine.py`) + `OVMF.fd`.
 
 ## Грабли
 

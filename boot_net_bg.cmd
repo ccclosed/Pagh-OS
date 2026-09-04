@@ -10,7 +10,11 @@ if exist iso_root rmdir /S /Q iso_root
 mkdir iso_root
 mkdir iso_root\EFI\BOOT
 copy /Y "%KERNEL_BIN%" iso_root\pagh.elf >nul
-copy /Y "limine-12.3.1\BOOTX64.EFI" iso_root\EFI\BOOT\ >nul
+REM Resolve BOOTX64.EFI from any local limine*/ tree (download if missing).
+set LOADER=
+for /f "delims=" %%p in ('python tools\limine.py') do set LOADER=%%p
+if "%LOADER%"=="" (echo ERROR: Limine loader unavailable; run: python tools\limine.py & exit /b 1)
+copy /Y "%LOADER%" iso_root\EFI\BOOT\ >nul
 
 echo timeout: 0> iso_root\limine.conf
 echo verbose: yes>> iso_root\limine.conf

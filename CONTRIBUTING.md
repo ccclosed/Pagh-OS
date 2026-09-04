@@ -26,7 +26,10 @@
 - **QEMU** (`qemu-system-x86_64`) и `qemu-img` в `PATH`.
 - Два локальных блоба в корне проекта (они в `.gitignore`, их НЕ коммитят):
   - `OVMF.fd` — UEFI-прошивка для QEMU.
-  - `limine-12.3.1/` — дерево загрузчика Limine (должно содержать `BOOTX64.EFI`).
+  - Загрузчик Limine (`BOOTX64.EFI`). Версия не зафиксирована: скрипты находят
+    любой локальный каталог `limine*/` (или берут `LIMINE_EFI`/`LIMINE_DIR`),
+    а `tools/limine.py` при отсутствии скачает последний бинарный релиз Limine
+    в `limine/` автоматически.
 
 `disk.img` создаётся автоматически при первом запуске — его тоже не коммитят.
 
@@ -138,7 +141,7 @@ cargo build --release  # release
   («add ext2 dir iteration», а не «fixes»). Желателен формат Conventional Commits
   (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`).
 - Не коммитьте сгенерированные/локальные артефакты: `target/`, `host-tests/target/`,
-  `iso_root/`, `PAGH.elf`, `disk.img`, `OVMF.fd`, `limine-12.3.1/`, логи QEMU, папки
+  `iso_root/`, `PAGH.elf`, `disk.img`, `OVMF.fd`, каталоги `limine*/`, логи QEMU, папки
   IDE. Всё это уже в `.gitignore` — не добавляйте их обходными путями.
 
 ### Чек-лист перед открытием PR

@@ -28,7 +28,10 @@ This document explains what to do and how, so your contribution gets merged smoo
 - **QEMU** (`qemu-system-x86_64`) and `qemu-img` on your `PATH`.
 - Two local blobs in the project root (they are git-ignored — do NOT commit them):
   - `OVMF.fd` — UEFI firmware for QEMU.
-  - `limine-12.3.1/` — the Limine bootloader tree (must contain `BOOTX64.EFI`).
+  - The Limine bootloader loader (`BOOTX64.EFI`). No version is pinned: the scripts
+    find any local `limine*/` tree (or honor `LIMINE_EFI`/`LIMINE_DIR`), and
+    `tools/limine.py` downloads the latest Limine binary release into `limine/`
+    automatically when none is found.
 
 `disk.img` is created automatically on first run — don't commit it either.
 
@@ -141,7 +144,7 @@ These constraints are enforced across the codebase and must be preserved:
   ("add ext2 dir iteration", not "fixes"). Conventional Commits is preferred
   (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`).
 - Don't commit generated/local artifacts: `target/`, `host-tests/target/`, `iso_root/`,
-  `PAGH.elf`, `disk.img`, `OVMF.fd`, `limine-12.3.1/`, QEMU logs, IDE folders. These are
+  `PAGH.elf`, `disk.img`, `OVMF.fd`, any `limine*/` tree, QEMU logs, IDE folders. These are
   already in `.gitignore` — don't add them through workarounds.
 
 ### Pre-PR checklist

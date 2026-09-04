@@ -3,6 +3,9 @@
 from __future__ import annotations
 import argparse, os, pathlib, shutil, subprocess, sys
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import limine  # version-agnostic BOOTX64.EFI locator/installer
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 TARGET = "x86_64-unknown-none"
 
@@ -46,9 +49,8 @@ def build(profile: str, features: str) -> pathlib.Path:
     return elf
 
 
-def stage(elf: pathlib.Path, limine: pathlib.Path) -> pathlib.Path:
-    loader = limine / "BOOTX64.EFI"
-    if not loader.exists(): raise SystemExit(f"error: Limine loader missing: {loader}")
+def stage(elf: pathlib.Path, limine_dir: str | None) -> pathlib.Path:
+    loader = limine.ensure(ROOT, pathlib.Path(limine_dir) if limine_dir else None)
     dest = ROOT / "iso_root"
     shutil.rmtree(dest, ignore_errors=True)
     (dest / "EFI" / "BOOT").mkdir(parents=True)
@@ -65,14 +67,15 @@ def main() -> None:
     p.add_argument("command", choices=["build", "stage", "run"], nargs="?", default="build")
     p.add_argument("--release", action="store_true")
     p.add_argument("--features", default="")
-    p.add_argument("--limine-dir", default=os.environ.get("LIMINE_DIR", "limine-12.3.1"))
+    p.add_argument("--limine-dir", default=os.environ.get("LIMINE_DIR", ""),
+                   help="Limine dir (default: auto-detect any limine*/ tree, download if missing)")
     p.add_argument("--ovmf", default=os.environ.get("OVMF", "OVMF.fd"))
     p.add_argument("--disk", default=os.environ.get("PAGH_DISK", "disk.img"))
     a = p.parse_args()
     elf = build("release" if a.release else "debug", a.features)
     print(f"linked: {elf}")
     if a.command == "build": return
-    esp = stage(elf, ROOT / a.limine_dir)
+    esp = stage(elf, a.limine_dir)
     if a.command == "stage": return
     ovmf, disk = ROOT / a.ovmf, ROOT / a.disk
     if not ovmf.exists(): raise SystemExit(f"error: OVMF missing: {ovmf}")
