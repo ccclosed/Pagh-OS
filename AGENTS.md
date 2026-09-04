@@ -155,6 +155,10 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   matching the existing tag style) and push the tag. Tags must never run
   ahead of `Cargo.toml` — the old `2.0.4` tag sat on a commit whose crate
   version was still 2.0.3; that drift is exactly what this section prevents.
+- **The bump must include the `Cargo.lock` `pagh` entry.** CI builds with
+  `cargo build --locked`, so a version bump without the lockfile update
+  fails the kernel job in ~20 s. A local `cargo build` refreshes the lock —
+  commit it in the SAME commit as `Cargo.toml`.
 - CI does not enforce the bump (yet); reviewers and agents must.
 
 ## Known open gaps (good first issues, all documented in-code)
