@@ -63,6 +63,10 @@
   спинлоке = дедлок. Обёртка маскирует IF на каждую операцию.
 - Куча — фиксированный регион: `init()` маппит `HEAP_INITIAL_PAGES` страниц по `layout::heap_base()`
   (flags `PRESENT|WRITABLE|NO_EXECUTE`) и отдаёт аллокатору. Роста нет → OOM = null → alloc-error abort.
+- Кап по RAM: если свободных кадров меньше, чем запрошено, `init()` капит кучу — четверть
+  свободных кадров (минимум 8 MiB) остаётся PMM под user-страницы/COW/page tables, остальное
+  уходит куче; при срабатывании капа пишется `[WARN] "Kernel heap capped"`. На конфигурации
+  ≥1 GiB кап не срабатывает и куча полные 512 MiB.
 
 ## Важные константы
 
@@ -73,7 +77,7 @@
 | `USER_STACK_TOP` | `0x7000_8000_0000` (8 MiB, как Linux RLIMIT_STACK) |
 | `USER_MMAP_BASE` | `0x2000_0000_0000` |
 | Верхняя граница user VA | `0x0000_8000_0000_0000` (`USER_CANONICAL_LIMIT` в arch) |
-| `HEAP_INITIAL_PAGES` | 512 MiB (нужно ≥1 GiB RAM; `run.sh` даёт `-m 1024M`) |
+| `HEAP_INITIAL_PAGES` | 512 MiB (нужно ≥1 GiB RAM; все раннеры дают `-m 1024M`; на меньшей RAM куча капится с `[WARN]`) |
 
 ## Зависимости
 
