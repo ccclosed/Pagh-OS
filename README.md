@@ -133,14 +133,18 @@ honest INSECURE warnings (VARIANT A: encrypted but unauthenticated).
   image on first run.
 - Two developer-provided blobs in the project root (they are git-ignored — see below):
   - `OVMF.fd` — UEFI firmware for QEMU.
-  - `limine-12.3.1/` — the Limine bootloader tree (must contain `BOOTX64.EFI`).
+  - A Limine bootloader loader (`BOOTX64.EFI`). No version is pinned: the scripts
+    accept any local `limine*/` tree (or `LIMINE_EFI`/`LIMINE_DIR`), and
+    `tools/limine.py` downloads the latest Limine binary release into `limine/`
+    automatically when none is found.
 
 ### Build and run
 
 #### Linux / Bash
 
-Install QEMU/OVMF and the pinned Rust toolchain, then place Limine's
-`BOOTX64.EFI` in `limine-12.3.1/` (or set `LIMINE_EFI`):
+Install QEMU/OVMF and the pinned Rust toolchain. A Limine `BOOTX64.EFI` is
+located automatically (any `limine*/` tree, `LIMINE_EFI`, system paths) or
+downloaded on first build:
 
 ```bash
 chmod +x setup-linux.sh build.sh run.sh
@@ -741,11 +745,13 @@ These are required and preserved across the codebase:
 
 Generated, large, or environment-specific files are git-ignored (see `.gitignore`):
 `target/`, `host-tests/target/`, `iso_root/`, `PAGH.elf`, `disk.img`, `OVMF.fd`,
-`limine-12.3.1/`, QEMU runtime logs, and editor/IDE folders (`.vscode/`, `.kiro/`,
+any `limine*/` loader tree, QEMU runtime logs, and editor/IDE folders (`.vscode/`, `.kiro/`,
 `.idea/`).
 
-`OVMF.fd` and `limine-12.3.1/` are kept on disk but ignored — they are downloaded
-locally and required by `run.cmd`. `disk.img` is created automatically on first run.
+`OVMF.fd` is kept on disk but ignored — it is downloaded locally and required by
+`run.cmd`. The Limine loader is fetched automatically into `limine/` by
+`tools/limine.py` when no local tree is present. `disk.img` is created automatically
+on first run.
 
 ---
 

@@ -15,9 +15,11 @@ setlocal enabledelayedexpansion
 REM --- Tunables -------------------------------------------------
 set KERNEL=PAGH
 set TARGET=x86_64-unknown-none
-set LIMINE_DIR=limine-12.3.1
 set OVMF=OVMF.fd
 set DISK=disk.img
+REM Limine is version-agnostic: set LIMINE_DIR / LIMINE_EFI to override,
+REM otherwise tools\limine.py finds any local limine*/ tree or downloads
+REM the latest binary release into limine\ automatically.
 
 REM --- Argument parsing ----------------------------------------
 REM First arg is the mode (run|build), second is the build type
@@ -93,11 +95,12 @@ REM Copy the freshly linked kernel under the name limine.conf expects.
 copy /Y "!KERNEL_BIN!" iso_root\pagh.elf >nul
 
 REM Copy the Limine UEFI loader; a missing loader is fatal (no boot).
-if exist "%LIMINE_DIR%\BOOTX64.EFI" (
-    copy /Y "%LIMINE_DIR%\BOOTX64.EFI" iso_root\EFI\BOOT\ >nul
-) else (
-    goto :err_no_loader
-)
+REM tools\limine.py resolves any local limine*/BOOTX64.EFI (no version pin)
+REM and downloads the latest Limine binary release into limine\ if none exists.
+set LOADER=
+for /f "delims=" %%p in ('python tools\limine.py') do set LOADER=%%p
+if "%LOADER%"=="" goto :err_no_loader
+copy /Y "%LOADER%" iso_root\EFI\BOOT\ >nul
 
 REM Generate limine.conf on the fly (Limine 12.x format).
 REM '>' creates/overwrites the file; '>>' appends each subsequent line.
@@ -164,8 +167,9 @@ goto :done
 
 REM --- Error exits ---------------------------------------------
 :err_no_loader
-echo ERROR: Limine loader not found: %LIMINE_DIR%\BOOTX64.EFI
-echo Download the Limine %LIMINE_DIR% tree and place BOOTX64.EFI inside it.
+echo ERROR: could not obtain a Limine loader (BOOTX64.EFI).
+echo Ensure network access, or set LIMINE_EFI to an existing BOOTX64.EFI.
+echo To prefetch manually: python tools\limine.py
 exit /b 1
 
 :err_no_bios

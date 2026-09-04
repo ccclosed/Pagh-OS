@@ -23,9 +23,11 @@ rustup toolchain install nightly-2026-06-15 --profile minimal --component rust-s
 cat <<'EOF'
 Host dependencies installed.
 
-Limine is still required. Put its BOOTX64.EFI at:
-  limine-12.3.1/BOOTX64.EFI
-or set LIMINE_EFI=/path/to/BOOTX64.EFI.
+Limine is downloaded automatically on first build/run (tools/limine.py
+fetches the latest binary release into limine/). To prefetch now:
+  python3 tools/limine.py
+
+Or place any Limine BOOTX64.EFI manually and set LIMINE_EFI=/path/to/BOOTX64.EFI.
 
 Then run:
   ./run.sh --release

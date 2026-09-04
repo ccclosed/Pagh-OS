@@ -58,15 +58,22 @@ echo "==> Linking $ELF"
 echo "==> Kernel ready: $ELF"
 
 if ((STAGE)); then
-  LIMINE_DIR="${LIMINE_DIR:-$ROOT/limine-12.3.1}"
-  LOADER="${LIMINE_EFI:-$LIMINE_DIR/BOOTX64.EFI}"
+  # Version-agnostic Limine resolution: LIMINE_EFI / LIMINE_DIR override,
+  # then any local limine*/ tree, then system paths, then auto-download.
+  LOADER="${LIMINE_EFI:-}"
+  if [[ -z "$LOADER" && -n "${LIMINE_DIR:-}" ]]; then
+    LOADER="$LIMINE_DIR/BOOTX64.EFI"
+  fi
+  if [[ -z "$LOADER" ]]; then
+    LOADER="$(find "$ROOT" -maxdepth 2 -path '*/limine*/BOOTX64.EFI' -print -quit 2>/dev/null || true)"
+    [[ -n "$LOADER" ]] || LOADER="$(find /usr/share/limine /usr/local/share/limine -name BOOTX64.EFI -print -quit 2>/dev/null || true)"
+  fi
   if [[ ! -f "$LOADER" ]]; then
-    for candidate in "$ROOT/../limine-12.3.1/BOOTX64.EFI" /usr/share/limine/BOOTX64.EFI; do
-      [[ ! -f "$candidate" ]] || { LOADER="$candidate"; break; }
-    done
+    echo "==> No Limine loader found locally; fetching the latest binary release"
+    LOADER="$(python3 "$ROOT/tools/limine.py")"
   fi
   [[ -f "$LOADER" ]] || {
-    echo "error: BOOTX64.EFI not found" >&2
+    echo "error: BOOTX64.EFI could not be located or downloaded" >&2
     echo "set LIMINE_DIR or LIMINE_EFI to its location" >&2
     exit 1
   }
