@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8694c28de9a9411b066aa78a4337d49d62a9b97ce470507c369ca5aa11eb1923 # shrinks to serial = [1]
+cc bd4d81d36347a0bfde223b37445005b1fc9366cad9847833ed620f9a21f01eb2 # shrinks to serial = [1], (y1, mo1, d1, h1, mi1) = (2020, 1, 1, 0, 0), (y2, mo2, d2, h2, mi2) = (2020, 1, 1, 0, 0), dns = "a.a", ip = [0, 0, 0, 0], n = [1], dummy_sig = []
