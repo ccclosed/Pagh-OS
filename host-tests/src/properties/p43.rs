@@ -193,7 +193,7 @@ proptest! {
         let enc = utc_time_str(y, mo, d, h, mi, s);
         let got = decode_asn1_time(TAG_UTC_TIME, &enc).unwrap();
         let want = civil_to_unix(y as i64, mo, d, h, mi, s);
-        prop_assert_eq!(got as i64, want);
+        prop_assert_eq!(got, want);
     }
 
     /// GeneralizedTime decode likewise agrees, over a four-digit year window
@@ -209,7 +209,7 @@ proptest! {
         let enc = gen_time_str(y, mo, d, h, mi, s);
         let got = decode_asn1_time(TAG_GENERALIZED_TIME, &enc).unwrap();
         let want = civil_to_unix(y as i64, mo, d, h, mi, s);
-        prop_assert_eq!(got as i64, want);
+        prop_assert_eq!(got, want);
     }
 
     /// Malformed/mutated time strings never panic and never invent a date:
@@ -243,7 +243,7 @@ proptest! {
                     two(&enc[8..10]) as u32,
                     two(&enc[10..12]) as u32,
                 );
-                prop_assert_eq!(got as i64, want);
+                prop_assert_eq!(got, want);
             }
             // Rejection is legal exactly when the mutated digits name a date
             // the test-side calendar check also calls impossible (or a time
@@ -287,7 +287,7 @@ fn known_vectors() {
     );
     assert_eq!(
         decode_asn1_time(TAG_UTC_TIME, b"500101000000Z"),
-        Ok((-631_152_000i64) as u64)
+        Ok(-631_152_000)
     );
 }
 

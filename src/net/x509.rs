@@ -253,15 +253,25 @@ fn days_in_month(year: i64, month: u32) -> u32 {
 }
 
 /// Convert a validated civil breakdown to Unix seconds (UTC assumed).
-fn civil_to_unix(year: i64, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> u64 {
-    let days = days_from_civil(year, month, day);
-    (days * 86_400 + (hour as i64) * 3600 + (minute as i64) * 60 + (second as i64)) as u64
+///
+/// Signed: dates before 1970 yield negatives. The certificate verifier MUST
+/// compare against `rtc::now_unix() as i64` — clamping or wrapping this into
+/// an unsigned type would silently flip comparison directions (a pre-epoch
+/// `not_after` wrapped into `u64` would look like "never expires").
+fn civil_to_unix(year: i64, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> i64 {
+    days_from_civil(year, month, day) * 86_400
+        + (hour as i64) * 3600
+        + (minute as i64) * 60
+        + (second as i64)
 }
 
 // ───────────────────────────── X.509 times ─────────────────────────────
 
-/// Decode an X.509 `Validity` time into Unix seconds (UTC assumed, matching
-/// `rtc::now_unix`).
+/// Decode an X.509 `Validity` time into Unix seconds (UTC assumed).
+///
+/// Returns a **signed** count: pre-epoch instants (UTCTime reaches back to
+/// 1950) stay exact negatives, so validity comparisons keep their direction
+/// (`not_before <= now <= not_after` against `rtc::now_unix() as i64`).
 ///
 /// Accepts exactly the RFC 5280 §4.1.2.5 shapes — this is fail-closed on
 /// purpose: fractional seconds and timezone offsets are not produced by
@@ -274,7 +284,7 @@ fn civil_to_unix(year: i64, month: u32, day: u32, hour: u32, minute: u32, second
 ///
 /// The calendar date is fully validated (month, day-of-month, and time-of-day
 /// ranges), so e.g. `"230230120000Z"` (Feb 30) is rejected, not wrapped.
-pub fn decode_asn1_time(tag: u8, s: &[u8]) -> Result<u64, DerError> {
+pub fn decode_asn1_time(tag: u8, s: &[u8]) -> Result<i64, DerError> {
     // ASCII digit helper: '0'..='9' only — DER times carry no sign or space.
     fn digit(b: u8) -> Option<u32> {
         if b.is_ascii_digit() {
@@ -384,7 +394,7 @@ mod tests {
         // days_from_civil) and lands at the known pre-epoch value.
         assert_eq!(
             decode_asn1_time(TAG_UTC_TIME, b"500101000000Z"),
-            Ok((-631_152_000i64) as u64)
+            Ok(-631_152_000)
         );
     }
 
