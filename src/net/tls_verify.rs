@@ -51,6 +51,18 @@ pub const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
 /// Minimum RSA modulus we accept, in bits (NIST SP 800-57 / CA/B Forum).
 const RSA_MIN_MODULUS_BITS: usize = 2048;
 
+/// Actual bit length of a big-endian modulus. The byte length overstates it
+/// by up to 8 bits when the top byte is small — a 256-byte modulus starting
+/// `0x01` is only 2041 bits, below the documented floor. The X.509 parser
+/// sign-strips INTEGERs, so `n` should never START with `0x00`, but this
+/// stays correct even for such caller-supplied input.
+fn modulus_bits(n: &[u8]) -> usize {
+    match n.split_first() {
+        None => 0,
+        Some((&first, rest)) => rest.len() * 8 + (8 - first.leading_zeros() as usize),
+    }
+}
+
 /// Why a certificate signature check refused to pass. Every variant is a
 /// hard reject — the chain is untrusted until a check returns `Ok(())`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,8 +149,10 @@ where
     };
     // Empty/oversized-INTEGER encodings are already rejected by the parser;
     // a leading zero byte (positive-INTEGER padding) is legal and harmless
-    // for from_bytes_be.
-    if n.len() * 8 < RSA_MIN_MODULUS_BITS {
+    // for from_bytes_be. The floor is the ACTUAL bit length, not the byte
+    // length (see `modulus_bits`): a 256-byte modulus with a small top byte
+    // is below 2048 bits and must be rejected.
+    if modulus_bits(n) < RSA_MIN_MODULUS_BITS {
         return Err(SigVerifyError::MalformedKey);
     }
     let modulus = rsa::BigUint::from_bytes_be(n);
@@ -205,11 +219,51 @@ mod tests {
     #[test]
     fn short_rsa_modulus_rejected() {
         let key = SpkiKey::Rsa {
-            n: &[0xc1; 16], // 128 bits — far below the 2048-bit gate
+            n: &[0xc1; 16], // 127 bits — far below the 2048-bit gate
             e: &[0x01, 0x00, 0x01],
         };
         assert_eq!(
             verify_certificate_signature(OID_SHA256_WITH_RSA, &[0u8; 8], &[0u8; 32], &key),
+            Err(SigVerifyError::MalformedKey)
+        );
+    }
+
+    /// The modulus floor is the ACTUAL bit length, not the byte length: a
+    /// 256-byte modulus with a small top byte (2041..2047 bits) is below the
+    /// documented 2048-bit floor and must be rejected, while an exactly
+    /// 2048-bit modulus passes the gate (and only then fails cryptographically).
+    #[test]
+    fn modulus_floor_is_bit_exact() {
+        // 256 bytes, top byte 0x01 → 2041 bits: BELOW the floor.
+        let below = SpkiKey::Rsa {
+            n: &[0x01; 256],
+            e: &[0x01, 0x00, 0x01],
+        };
+        assert_eq!(
+            verify_certificate_signature(OID_SHA256_WITH_RSA, &[0u8; 8], &[0u8; 256], &below),
+            Err(SigVerifyError::MalformedKey)
+        );
+        // 255 bytes, top byte 0xFF → 2040 bits: BELOW the floor (byte-length
+        // alone would have flagged this one correctly; bit-length agrees).
+        let short = SpkiKey::Rsa {
+            n: &[0xff; 255],
+            e: &[0x01, 0x00, 0x01],
+        };
+        assert_eq!(
+            verify_certificate_signature(OID_SHA256_WITH_RSA, &[0u8; 8], &[0u8; 256], &short),
+            Err(SigVerifyError::MalformedKey)
+        );
+        // Exactly 2048 bits, odd (a key rsa would even construct): the gate
+        // passes and the failure moves to the cryptographic step (bogus
+        // signature) — anything but MalformedKey here.
+        let mut n_exact = [0x01u8; 256];
+        n_exact[0] = 0x80; // top bit set → exactly 2048 bits; last byte 0x01 → odd
+        let exact = SpkiKey::Rsa {
+            n: &n_exact,
+            e: &[0x01, 0x00, 0x01],
+        };
+        assert_ne!(
+            verify_certificate_signature(OID_SHA256_WITH_RSA, &[0u8; 8], &[0u8; 256], &exact),
             Err(SigVerifyError::MalformedKey)
         );
     }

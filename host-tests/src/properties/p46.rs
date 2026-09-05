@@ -249,6 +249,13 @@ proptest! {
             n: &[0xc1; 16],
             e: &[0x01, 0x00, 0x01],
         };
+        // Byte-length meets the 2048-bit floor but ACTUAL bit length does
+        // not (top byte 0x01 → 2041 bits): the documented contract is on
+        // bits, so this must be rejected too.
+        let rsa_2041bit = SpkiKey::Rsa {
+            n: &[0x01; 256],
+            e: &[0x01, 0x00, 0x01],
+        };
 
         // RSA-PSS: explicit reject even with a genuine Ed25519 signature
         // present and an RSA-shaped key — scheme, not crypto, decides.
@@ -284,6 +291,11 @@ proptest! {
         // SHA-256-RSA against a below-minimum RSA modulus.
         prop_assert_eq!(
             verify_certificate_signature(OID_SHA256_WITH_RSA, &msg, &sig, &rsa_small),
+            Err(SigVerifyError::MalformedKey)
+        );
+        // And against a 256-byte modulus that is only 2041 BITS.
+        prop_assert_eq!(
+            verify_certificate_signature(OID_SHA256_WITH_RSA, &msg, &sig, &rsa_2041bit),
             Err(SigVerifyError::MalformedKey)
         );
         // Ed25519 with a bogus 65-byte "point" EC key.
