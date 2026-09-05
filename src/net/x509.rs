@@ -92,6 +92,10 @@ pub enum DerError {
     /// The time string is not a Z-suffixed UTCTime/GeneralizedTime of the
     /// exact RFC 5280 shape, or the calendar date it names does not exist.
     BadTime,
+    /// A structural violation of the X.509 shapes themselves (wrong field
+    /// order, impossible version, malformed key material) — the DER is fine
+    /// but it is not a certificate the verifier accepts.
+    BadCert,
 }
 
 impl core::fmt::Display for DerError {
@@ -103,6 +107,7 @@ impl core::fmt::Display for DerError {
                 write!(f, "der: expected tag {expected:#04x}, got {got:#04x}")
             }
             DerError::BadTime => f.write_str("der: malformed ASN.1 time"),
+            DerError::BadCert => f.write_str("der: not a well-formed certificate"),
         }
     }
 }
@@ -180,6 +185,15 @@ pub fn der_expect(buf: &[u8], tag: u8) -> Result<(&[u8], &[u8]), DerError> {
         return Err(DerError::UnexpectedTag { expected: tag, got });
     }
     Ok((content, rest))
+}
+
+/// Like [`der_tlv`] but returns the WHOLE element (tag + header + content)
+/// plus the rest — needed where a slice of the element itself must outlive
+/// the walk (certificate `Name`s, the `TBSCertificate` signature input).
+pub fn der_element(buf: &[u8]) -> Result<(&[u8], &[u8]), DerError> {
+    let (_tag, _content, rest) = der_tlv(buf)?;
+    let whole = &buf[..buf.len() - rest.len()];
+    Ok((whole, rest))
 }
 
 /// Iterator over the sibling elements of a constructed element's content.
@@ -347,6 +361,447 @@ pub fn decode_asn1_time(tag: u8, s: &[u8]) -> Result<i64, DerError> {
     Ok(civil_to_unix(year, month, day, hour, minute, second))
 }
 
+// ─────────────────────── X.509 certificate parsing ───────────────────────
+//
+// Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm,
+//                            signatureValue BIT STRING }
+//
+// Everything below borrows from the input DER — no allocation, so parsed
+// certificates live inside the handshake's existing buffers. The verifier
+// (later PRs) uses: `validity` against the RTC, `spki` for chain signature
+// checks, `issuer`/`subject` raw-DER equality for chain name matching, and
+// `tbs` as the bytes the certificate's own signature is computed over.
+
+/// AlgorithmIdentifier OIDs, as raw DER OID *content* bytes (comparison is a
+/// plain byte slice compare — no OID re-encoding needed).
+/// rsaEncryption (1.2.840.113549.1.1.1).
+pub const OID_RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+/// ecPublicKey (1.2.840.10045.2.1).
+pub const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+/// prime256v1 / secp256r1 (1.2.840.10045.3.1.7).
+pub const OID_PRIME256V1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+/// secp384r1 (1.3.132.0.34).
+pub const OID_SECP384R1: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
+/// Ed25519 (1.3.101.112).
+pub const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
+
+/// Extension OIDs (2.5.29.x arc).
+/// subjectAltName (2.5.29.17).
+pub const OID_EXT_SAN: &[u8] = &[0x55, 0x1d, 0x11];
+/// basicConstraints (2.5.29.19).
+pub const OID_EXT_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+
+/// Bytewise OID comparison helper — reads better at the call sites than `==`.
+#[inline]
+pub fn oid_is(oid: &[u8], known: &[u8]) -> bool {
+    oid == known
+}
+
+/// Strip the leading unused-bits byte of a BIT STRING content.
+///
+/// Key material must occupy whole bytes, so a non-zero unused-bits count is
+/// rejected (fail closed) rather than rounded down.
+pub fn bit_string_bytes(content: &[u8]) -> Result<&[u8], DerError> {
+    let first = *content.first().ok_or(DerError::Truncated)?;
+    if first != 0 {
+        return Err(DerError::BadCert);
+    }
+    Ok(&content[1..])
+}
+
+/// Strip the DER sign-padding byte of a non-negative INTEGER (`0x00` prefix
+/// when the high bit is set). Minimal DER allows at most one, so at most one
+/// is stripped.
+pub fn integer_bytes(content: &[u8]) -> Result<&[u8], DerError> {
+    if content.is_empty() {
+        return Err(DerError::Truncated);
+    }
+    if content.len() > 1 && content[0] == 0 {
+        return Ok(&content[1..]);
+    }
+    Ok(content)
+}
+
+/// `Validity ::= SEQUENCE { notBefore Time, notAfter Time }` — decoded to
+/// Unix seconds (UTC assumed, matching `rtc::now_unix`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Validity {
+    /// Earliest instant the certificate is valid.
+    pub not_before: u64,
+    /// Latest instant the certificate is valid.
+    pub not_after: u64,
+}
+
+/// The public key carried by a `SubjectPublicKeyInfo`, restricted to the
+/// algorithms the verifier can actually check. Anything else — including
+/// well-formed-but-unknown algorithms — lands in [`SpkiKey::Unsupported`]
+/// and fails the handshake later, never silently passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpkiKey<'a> {
+    /// rsaEncryption: modulus (big-endian, sign-stripped) and exponent.
+    Rsa { n: &'a [u8], e: &'a [u8] },
+    /// ecPublicKey on prime256v1: uncompressed point (`0x04 || X || Y`, 65 B).
+    EcP256 { point: &'a [u8] },
+    /// ecPublicKey on secp384r1: uncompressed point (97 B).
+    EcP384 { point: &'a [u8] },
+    /// Ed25519: raw 32-byte public key.
+    Ed25519 { key: &'a [u8] },
+    /// A supported-surface gap: algorithm or curve not in the list above.
+    Unsupported,
+}
+
+/// `SubjectPublicKeyInfo ::= SEQUENCE { algorithm, subjectPublicKey }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpkiRef<'a> {
+    /// The AlgorithmIdentifier OID content (`alg`).
+    pub alg: &'a [u8],
+    /// The parsed key (curve / key type resolved from `alg` + parameters).
+    pub key: SpkiKey<'a>,
+}
+
+/// A parsed X.509 certificate, borrowing from the DER buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CertificateRef<'a> {
+    /// Raw DER of the whole `TBSCertificate` element — the exact bytes the
+    /// certificate's own signature is computed over.
+    pub tbs: &'a [u8],
+    /// Serial number, sign-stripped big-endian (raw bytes; uniqueness is the
+    /// CA's problem, not the verifier's).
+    pub serial: &'a [u8],
+    /// `tbsCertificate.signature` AlgorithmIdentifier OID content.
+    pub sig_alg: &'a [u8],
+    /// Issuer `Name` — raw DER element (byte equality is the chain matcher).
+    pub issuer: &'a [u8],
+    /// Subject `Name` — raw DER element.
+    pub subject: &'a [u8],
+    /// Decoded validity window.
+    pub validity: Validity,
+    /// Subject public key info.
+    pub spki: SpkiRef<'a>,
+    /// RFC 5280 version number: 1 (absent field), 2, or 3.
+    pub version: u8,
+}
+
+/// Parse one `Certificate` at the start of `der`.
+///
+/// Returns the parsed certificate (borrowing from `der`) and the bytes after
+/// the certificate element. `signatureAlgorithm` / `signatureValue` are
+/// required to be present and well-formed but are not decoded here — the
+/// verifier checks the signature over [`CertificateRef::tbs`] in a later PR.
+pub fn parse_certificate(der: &[u8]) -> Result<(CertificateRef<'_>, &[u8]), DerError> {
+    let (cert_content, rest) = der_expect(der, TAG_SEQUENCE)?;
+    let (tbs_el, tail) = der_element(cert_content)?;
+    let cert = parse_tbs(tbs_el)?;
+    // signatureAlgorithm (SEQUENCE) and signatureValue (BIT STRING) must be
+    // present: a certificate that ends after the TBS is not a certificate.
+    let (_alg, tail) = der_expect(tail, TAG_SEQUENCE)?;
+    let (_sig, tail) = der_expect(tail, TAG_BIT_STRING)?;
+    Ok((cert, tail))
+}
+
+/// Parse the `TBSCertificate` element (tag + header included — `tbs` is kept
+/// verbatim as the signature input).
+fn parse_tbs(tbs: &[u8]) -> Result<CertificateRef<'_>, DerError> {
+    let (content, tail) = der_expect(tbs, TAG_SEQUENCE)?;
+    if !tail.is_empty() {
+        return Err(DerError::BadCert);
+    }
+    let mut cur = content;
+
+    // version [0] EXPLICIT INTEGER DEFAULT v1 — absent means v1.
+    let mut version = 1u8;
+    if let Ok((tag, inner, rest)) = der_tlv(cur) {
+        if tag == 0xA0 {
+            let (v, _) = der_expect(inner, TAG_INTEGER)?;
+            version = version_from_der(v)?;
+            cur = rest;
+        }
+    }
+
+    // serialNumber INTEGER.
+    let (serial_el, rest) = der_element(cur)?;
+    let (serial, _) = der_expect(serial_el, TAG_INTEGER)?;
+    let serial = integer_bytes(serial)?;
+    cur = rest;
+
+    // signature AlgorithmIdentifier — keep the OID; parameters ignored.
+    let (sig_el, rest) = der_element(cur)?;
+    let (sig_content, _) = der_expect(sig_el, TAG_SEQUENCE)?;
+    let (sig_alg, _) = der_expect(sig_content, TAG_OID)?;
+    cur = rest;
+
+    // issuer Name — raw DER element for chain name matching.
+    let (issuer, rest) = der_element(cur)?;
+    expect_tag(issuer, TAG_SEQUENCE)?;
+    cur = rest;
+
+    // validity SEQUENCE { notBefore, notAfter }.
+    let (validity_el, rest) = der_element(cur)?;
+    let (v_content, _) = der_expect(validity_el, TAG_SEQUENCE)?;
+    let mut v = der_children(v_content);
+    let (t1, c1) = v.next().ok_or(DerError::BadCert)??;
+    let (t2, c2) = v.next().ok_or(DerError::BadCert)??;
+    let validity = Validity {
+        not_before: decode_asn1_time(t1, c1)?,
+        not_after: decode_asn1_time(t2, c2)?,
+    };
+    cur = rest;
+
+    // subject Name.
+    let (subject, rest) = der_element(cur)?;
+    expect_tag(subject, TAG_SEQUENCE)?;
+    cur = rest;
+
+    // subjectPublicKeyInfo.
+    let (spki_el, _rest) = der_element(cur)?;
+    let spki = parse_spki(spki_el)?;
+
+    Ok(CertificateRef {
+        tbs,
+        serial,
+        sig_alg,
+        issuer,
+        subject,
+        validity,
+        spki,
+        version,
+    })
+    // Optional issuerUniqueID [1] / subjectUniqueID [2] / extensions [3] are
+    // NOT consumed here: `find_extension` re-walks `tbs` on demand, keeping
+    // this parser allocation-free and the hot path short.
+}
+
+/// Require `buf` to start with exactly `tag` (whole-element check).
+fn expect_tag(buf: &[u8], tag: u8) -> Result<(), DerError> {
+    let (got, _, _) = der_tlv(buf)?;
+    if got != tag {
+        return Err(DerError::UnexpectedTag { expected: tag, got });
+    }
+    Ok(())
+}
+
+/// Map the `[0]`-wrapped version INTEGER to the RFC 5280 version number.
+/// Encoded values are 0..=2 for v1..=v3; anything else fails closed.
+fn version_from_der(content: &[u8]) -> Result<u8, DerError> {
+    match integer_bytes(content)? {
+        [0x00] => Ok(1),
+        [0x01] => Ok(2),
+        [0x02] => Ok(3),
+        _ => Err(DerError::BadCert),
+    }
+}
+
+/// Parse a `SubjectPublicKeyInfo` element.
+fn parse_spki(spki_el: &[u8]) -> Result<SpkiRef<'_>, DerError> {
+    let (content, _) = der_expect(spki_el, TAG_SEQUENCE)?;
+    // alg_el must be the WHOLE algorithm element (der_element, not the
+    // content-returning der_expect) — its inner OID is parsed next.
+    let (alg_el, key_el) = der_element(content)?;
+    let (alg_content, _) = der_expect(alg_el, TAG_SEQUENCE)?;
+    let (alg_oid, params) = der_expect(alg_content, TAG_OID)?;
+    let (bits_content, _) = der_expect(key_el, TAG_BIT_STRING)?;
+    let raw = bit_string_bytes(bits_content)?;
+
+    let key = if oid_is(alg_oid, OID_RSA_ENCRYPTION) {
+        // RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+        let (pk_content, _) = der_expect(raw, TAG_SEQUENCE)?;
+        let mut it = der_children(pk_content);
+        let (t, c) = it.next().ok_or(DerError::BadCert)??;
+        if t != TAG_INTEGER {
+            return Err(DerError::UnexpectedTag {
+                expected: TAG_INTEGER,
+                got: t,
+            });
+        }
+        let n = integer_bytes(c)?;
+        let (t, c) = it.next().ok_or(DerError::BadCert)??;
+        if t != TAG_INTEGER {
+            return Err(DerError::UnexpectedTag {
+                expected: TAG_INTEGER,
+                got: t,
+            });
+        }
+        let e = integer_bytes(c)?;
+        if n.is_empty() || e.is_empty() {
+            return Err(DerError::BadCert);
+        }
+        SpkiKey::Rsa { n, e }
+    } else if oid_is(alg_oid, OID_EC_PUBLIC_KEY) {
+        // parameters carry the namedCurve OID.
+        let (curve, _) = der_expect(params, TAG_OID)?;
+        if oid_is(curve, OID_PRIME256V1) {
+            if raw.len() != 65 || raw[0] != 0x04 {
+                return Err(DerError::BadCert);
+            }
+            SpkiKey::EcP256 { point: raw }
+        } else if oid_is(curve, OID_SECP384R1) {
+            if raw.len() != 97 || raw[0] != 0x04 {
+                return Err(DerError::BadCert);
+            }
+            SpkiKey::EcP384 { point: raw }
+        } else {
+            SpkiKey::Unsupported
+        }
+    } else if oid_is(alg_oid, OID_ED25519) {
+        if raw.len() != 32 {
+            return Err(DerError::BadCert);
+        }
+        SpkiKey::Ed25519 { key: raw }
+    } else {
+        SpkiKey::Unsupported
+    };
+
+    Ok(SpkiRef { alg: alg_oid, key })
+}
+
+/// Look up an extension by OID in a parsed certificate.
+///
+/// Returns the *content* of the `extnValue` OCTET STRING (e.g. for SAN the
+/// DER `GeneralNames`, for basicConstraints the DER `SEQUENCE`). Re-walks
+/// [`CertificateRef::tbs`] on demand — the walk is cheap and the borrowed
+/// result needs no storage in the certificate struct.
+pub fn find_extension<'a>(
+    cert: &CertificateRef<'a>,
+    oid: &[u8],
+) -> Result<Option<&'a [u8]>, DerError> {
+    let (tbs_content, _) = der_expect(cert.tbs, TAG_SEQUENCE)?;
+    let mut cur = tbs_content;
+
+    // Skip version if present ([0] EXPLICIT, tag 0xA0).
+    if let Ok((0xA0, _inner, rest)) = der_tlv(cur) {
+        cur = rest;
+    }
+    // Skip the six REQUIRED fields: serial, signature, issuer, validity,
+    // subject, subjectPublicKeyInfo. A missing one is a BadCert — it could
+    // not have parsed in `parse_tbs`.
+    for _ in 0..6 {
+        let (_el, rest) = der_element(cur)?;
+        cur = rest;
+    }
+
+    // Optional uniqueIDs then extensions; an EMPTY tail means the certificate
+    // ends after the SPKI (common for v1) — no extensions, not an error.
+    if cur.is_empty() {
+        return Ok(None);
+    }
+    while !cur.is_empty() {
+        let (tag, _c, rest) = der_tlv(cur)?;
+        if tag == 0x81 || tag == 0x82 {
+            cur = rest;
+        } else {
+            break;
+        }
+    }
+    if cur.is_empty() {
+        return Ok(None);
+    }
+    let (tag, inner, _rest) = der_tlv(cur)?;
+    if tag != 0xA3 {
+        return Ok(None);
+    }
+    let (ext_seq, _) = der_expect(inner, TAG_SEQUENCE)?;
+    for ext in der_children(ext_seq) {
+        let (tag, ext_content) = ext?;
+        if tag != TAG_SEQUENCE {
+            return Err(DerError::UnexpectedTag {
+                expected: TAG_SEQUENCE,
+                got: tag,
+            });
+        }
+        let (ext_oid, rest) = der_expect(ext_content, TAG_OID)?;
+        if oid_is(ext_oid, oid) {
+            // critical BOOLEAN DEFAULT FALSE is optional.
+            let mut r = rest;
+            if let Ok((TAG_BOOLEAN, _c, rest2)) = der_tlv(r) {
+                let _ = _c;
+                r = rest2;
+            }
+            let (octet, _) = der_expect(r, TAG_OCTET_STRING)?;
+            return Ok(Some(octet));
+        }
+    }
+    Ok(None)
+}
+
+/// One `GeneralName` of a `subjectAltName` extension. Everything the verifier
+/// cannot match (rfc822, URI, otherName, ...) collapses to [`San::Other`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum San<'a> {
+    /// dNSName `[2]` IA5String — ASCII hostname content.
+    Dns(&'a [u8]),
+    /// iPAddress `[7]` OCTET STRING — 4 (IPv4) or 16 (IPv6) bytes.
+    Ip(&'a [u8]),
+    /// Any other GeneralName — ignored by hostname verification.
+    Other,
+}
+
+/// Iterator over the `GeneralNames` of a SAN extension value.
+pub struct SanIter<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> Iterator for SanIter<'a> {
+    type Item = Result<San<'a>, DerError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        Some(match der_tlv(self.rest) {
+            Ok((tag, content, rest)) => {
+                self.rest = rest;
+                match tag {
+                    // [2] dNSName (context, primitive) / [7] iPAddress.
+                    0x82 => Ok(San::Dns(content)),
+                    0x87 => Ok(San::Ip(content)),
+                    _ => Ok(San::Other),
+                }
+            }
+            Err(e) => {
+                self.rest = &[];
+                Err(e)
+            }
+        })
+    }
+}
+
+/// Iterate the `GeneralNames` of a SAN `extnValue` OCTET STRING content.
+///
+/// The value is a DER `SEQUENCE OF GeneralName`, so this descends into the
+/// sequence first; a malformed container is an error, not an empty iterator.
+pub fn san_names(san_octets: &[u8]) -> Result<SanIter<'_>, DerError> {
+    let (content, tail) = der_expect(san_octets, TAG_SEQUENCE)?;
+    if !tail.is_empty() {
+        return Err(DerError::BadCert);
+    }
+    Ok(SanIter { rest: content })
+}
+
+/// Parse a `basicConstraints` extnValue OCTET STRING content:
+/// `SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER OPTIONAL }`.
+///
+/// Returns `is_ca`. DER omits a defaulted FALSE, so an empty sequence is
+/// `false`; anything but a leading BOOLEAN (when present) fails closed.
+pub fn parse_basic_constraints(der: &[u8]) -> Result<bool, DerError> {
+    let (content, _) = der_expect(der, TAG_SEQUENCE)?;
+    if content.is_empty() {
+        return Ok(false);
+    }
+    let (tag, c) = der_tlv(content).map(|(t, c, _)| (t, c))?;
+    if tag != TAG_BOOLEAN {
+        return Err(DerError::UnexpectedTag {
+            expected: TAG_BOOLEAN,
+            got: tag,
+        });
+    }
+    // DER: FALSE is 0x00, TRUE is 0xFF; anything else is not DER.
+    match c {
+        [0x00] => Ok(false),
+        [0xff] => Ok(true),
+        _ => Err(DerError::BadCert),
+    }
+}
+
 // ───────────────────────────── self-tests ─────────────────────────────
 
 #[cfg(test)]
@@ -478,5 +933,111 @@ mod tests {
         assert_eq!(children[0].0, TAG_SEQUENCE);
         assert_eq!(children[1].0, TAG_INTEGER);
         assert_eq!(children[1].1, &[0x07]);
+    }
+
+    /// Minimal v1 certificate: empty names, RSA SPKI, no extensions.
+    /// Exercises the whole `parse_certificate` walk (P44 builds on this with
+    /// generated certificates and real-world fixtures).
+    #[test]
+    fn parse_minimal_v1_certificate() {
+        // BIT STRING content = 0x00 unused-bits + DER RSAPublicKey.
+        let rsa_pk = tlv(
+            TAG_SEQUENCE,
+            &[
+                tlv(TAG_INTEGER, &[0x00, 0xc1]).as_slice(), // n (sign-padded 0xc1)
+                tlv(TAG_INTEGER, &[0x01, 0x00, 0x01]).as_slice(), // e = 65537
+            ]
+            .concat(),
+        );
+        let mut bits = alloc::vec::Vec::new();
+        bits.push(0x00);
+        bits.extend_from_slice(&rsa_pk);
+        let spki = tlv(
+            TAG_SEQUENCE,
+            &[
+                tlv(
+                    TAG_SEQUENCE,
+                    &[
+                        tlv(TAG_OID, OID_RSA_ENCRYPTION).as_slice(),
+                        tlv(TAG_NULL, &[]).as_slice(),
+                    ]
+                    .concat(),
+                )
+                .as_slice(),
+                tlv(TAG_BIT_STRING, &bits).as_slice(),
+            ]
+            .concat(),
+        );
+        let name = tlv(TAG_SEQUENCE, &[]);
+        let tbs = tlv(
+            TAG_SEQUENCE,
+            &[
+                tlv(TAG_INTEGER, &[0x2a]).as_slice(), // serial 42
+                tlv(
+                    TAG_SEQUENCE,
+                    &[
+                        tlv(TAG_OID, OID_RSA_ENCRYPTION).as_slice(),
+                        tlv(TAG_NULL, &[]).as_slice(),
+                    ]
+                    .concat(),
+                )
+                .as_slice(),
+                name.as_slice(), // issuer
+                tlv(
+                    TAG_SEQUENCE,
+                    &[
+                        tlv(TAG_UTC_TIME, b"250101000000Z").as_slice(),
+                        tlv(TAG_UTC_TIME, b"260101000000Z").as_slice(),
+                    ]
+                    .concat(),
+                )
+                .as_slice(),
+                name.as_slice(), // subject
+                spki.as_slice(),
+            ]
+            .concat(),
+        );
+        let cert_der = tlv(
+            TAG_SEQUENCE,
+            &[
+                tbs.as_slice(),
+                tlv(
+                    TAG_SEQUENCE,
+                    &[
+                        tlv(TAG_OID, OID_RSA_ENCRYPTION).as_slice(),
+                        tlv(TAG_NULL, &[]).as_slice(),
+                    ]
+                    .concat(),
+                )
+                .as_slice(),
+                tlv(TAG_BIT_STRING, &[0x00, 0xde, 0xad]).as_slice(), // dummy signature
+            ]
+            .concat(),
+        );
+
+        let (cert, rest) = parse_certificate(&cert_der).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(cert.version, 1);
+        assert_eq!(cert.serial, &[0x2a]);
+        assert!(oid_is(cert.sig_alg, OID_RSA_ENCRYPTION));
+        assert_eq!(cert.issuer, name.as_slice());
+        assert_eq!(cert.subject, name.as_slice());
+        assert_eq!(cert.validity.not_before, 1_735_689_600);
+        assert_eq!(cert.validity.not_after, 1_767_225_600);
+        match cert.spki.key {
+            SpkiKey::Rsa { n, e } => {
+                // Sign padding stripped: n = 0xc1, e = 65537 big-endian.
+                assert_eq!(n, &[0xc1]);
+                assert_eq!(e, &[0x01, 0x00, 0x01]);
+            }
+            _ => panic!("expected RSA SPKI"),
+        }
+        // No extensions field at all.
+        assert_eq!(find_extension(&cert, OID_EXT_SAN), Ok(None));
+
+        // Every truncation fails closed.
+        for cut in 0..cert_der.len() {
+            assert!(parse_certificate(&cert_der[..cut]).is_err());
+        }
     }
 }

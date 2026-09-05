@@ -231,6 +231,7 @@ mod properties {
     mod p41;
     mod p42;
     mod p43;
+    mod p44;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the
