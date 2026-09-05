@@ -170,6 +170,14 @@ pub mod fd_alloc;
 #[path = "../../src/arch/x86_64/linux/signal_frame.rs"]
 pub mod signal_frame;
 
+// `x509` is the pure minimal DER (ASN.1) reader + X.509 time decoding that the
+// TLS server-certificate verifier (issue #14) is built on. `core`-only and
+// self-contained — its calendar math deliberately duplicates
+// `timeconv::days_from_civil` to stay subtree-local — so the standalone
+// `#[path]` include resolves with no extra wiring; P43 cross-checks the two.
+#[path = "../../src/net/x509.rs"]
+pub mod x509;
+
 // ---------------------------------------------------------------------------
 // Property-test modules (P1..P28)
 // ---------------------------------------------------------------------------
@@ -222,6 +230,7 @@ mod properties {
     mod p40;
     mod p41;
     mod p42;
+    mod p43;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the

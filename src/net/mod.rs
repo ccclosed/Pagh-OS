@@ -38,6 +38,7 @@ pub mod tcp;
 pub mod tls;
 pub mod udp;
 pub mod wire;
+pub mod x509;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
