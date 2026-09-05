@@ -22,6 +22,9 @@ net-поток или bounded locked-step помпы); из IRQ-контекст
 | `http.rs` | Чистый билдер HTTP/1.1 GET + парсер головы ответа (`HeadParse`) |
 | `http_fetch.rs` | Эффектный HTTP GET поверх стека для пакетного фетчера (`http_get`, `fetch_deb`) |
 | `tls.rs` | HTTPS через `embedded-tls` (TLS 1.3) поверх стека: `TlsTransport`, мини-`block_on`, `KernelRng`. **VARIANT A: без проверки сертификатов** |
+| `x509.rs` | Чистый строгий DER-ридер + минимальный X.509-парсер для верификатора: `parse_certificate` (TBS целиком как вход подписи, SPKI, SAN, basicConstraints, validity в **i64**), байты `signatureValue` + enforce «внешний AlgorithmIdentifier == TBS» (RFC 5280 §4.1.1.2) |
+| `hostname.rs` | RFC 6125 hostname/SAN-матчинг: wildcard только целым левым лейблом SAN (ровно один лейбл хоста), host-side `*` — всегда отказ, IP-литералы — по октетам |
+| `tls_verify.rs` | Диспетчер подписей сертификатов: RSASSA-PKCS1-v1_5 (SHA-256/384/512, мин. модуль 2048 бит), ECDSA P-256/P-384, Ed25519; RSA-PSS явно отклоняется. Крейты `rsa`/`p384`/`ed25519-dalek` (pure-Rust, vendored) |
 | `progress.rs` | Однострочный `\r`-прогресс загрузок |
 
 ## Ключевые символы

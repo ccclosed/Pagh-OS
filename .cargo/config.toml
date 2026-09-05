@@ -4,6 +4,13 @@ target = "x86_64-unknown-none.json"
 [target.x86_64-unknown-none]
 rustflags = [
     "-Cforce-frame-pointers=yes",
+    # curve25519-dalek's build.rs honors this cfg (surfaced to it as
+    # CARGO_CFG_CURVE25519_DALEK_BACKEND) and otherwise defaults to its AVX2
+    # "simd" backend on x86_64 + nightly. LLVM cannot legalize those vector
+    # ops for this bare-metal target ("Do not know how to split the result
+    # of this operator!"), so pin the pure scalar "serial" backend — same
+    # field arithmetic, no SIMD.
+    "--cfg", "curve25519_dalek_backend=\"serial\"",
 ]
 
 [unstable]

@@ -45,6 +45,20 @@ miniz_oxide = "=0.8.9"
 # build resolvable from the same vendor sources.
 ruzstd = { version = "=0.8.3", default-features = false }
 xz4rust = "=0.2.1"
+# `tls_verify` (path-included from the kernel) verifies RSA PKCS1-v1_5 /
+# ECDSA P-256/P-384 / Ed25519 certificate signatures. Pinned to match the
+# kernel's `Cargo.toml`; resolved from the same repo-root vendor/ sources.
+# NOTE: the kernel builds these with `default-features = false`; the host side
+# keeps default features where key GENERATION (P46) needs an RNG — keygen only
+# ever runs in host tests, never in the kernel.
+sha2 = "=0.10.9"
+p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa"] }
+p384 = { version = "=0.13.0", default-features = false, features = ["ecdsa"] }
+rsa = { version = "=0.9.9", features = ["sha2"] }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["fast", "rand_core"] }
+signature = "=2.2.0"
+rand_core = { version = "=0.6.4", default-features = false }
+const-oid = "=0.9.6"
 
 [dev-dependencies]
 proptest = "1"

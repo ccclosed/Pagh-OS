@@ -4,3 +4,9 @@
 # Shell scripts must stay LF: they run inside WSL/Linux. A CRLF working-tree
 # copy breaks the shebang ("env: 'bash\r': No such file or directory").
 *.sh text eol=lf
+
+# Vendored crate sources must stay byte-identical to what
+# vendor/*/.cargo-checksum.json recorded (LF). `* text=auto` + core.autocrlf=true
+# checks them out as CRLF on Windows and cargo then fails with
+# "the listed checksum of vendor/... has changed". Disable all conversion.
+vendor/** -text
