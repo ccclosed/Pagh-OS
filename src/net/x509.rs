@@ -423,13 +423,15 @@ pub fn integer_bytes(content: &[u8]) -> Result<&[u8], DerError> {
 }
 
 /// `Validity ::= SEQUENCE { notBefore Time, notAfter Time }` — decoded to
-/// Unix seconds (UTC assumed, matching `rtc::now_unix`).
+/// Unix seconds (UTC assumed). Signed: pre-epoch instants stay exact
+/// negatives, so the verifier's `not_before <= now <= not_after` comparison
+/// against `rtc::now_unix() as i64` keeps its direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Validity {
     /// Earliest instant the certificate is valid.
-    pub not_before: u64,
+    pub not_before: i64,
     /// Latest instant the certificate is valid.
-    pub not_after: u64,
+    pub not_after: i64,
 }
 
 /// The public key carried by a `SubjectPublicKeyInfo`, restricted to the
