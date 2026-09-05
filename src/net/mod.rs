@@ -30,6 +30,7 @@
 
 pub mod arp;
 pub mod dns;
+pub mod hostname;
 pub mod http;
 pub mod http_fetch;
 pub mod ip;

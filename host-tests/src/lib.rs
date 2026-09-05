@@ -178,6 +178,13 @@ pub mod signal_frame;
 #[path = "../../src/net/x509.rs"]
 pub mod x509;
 
+// `hostname` is the pure RFC 6125 hostname/SAN matcher (dNSName wildcard
+// rules, IP-literal classification) for the TLS verifier (issue #14).
+// `core` + `alloc`, self-contained; P45 exercises it against wildcard
+// equivalence classes and fail-closed inputs.
+#[path = "../../src/net/hostname.rs"]
+pub mod hostname;
+
 // ---------------------------------------------------------------------------
 // Property-test modules (P1..P28)
 // ---------------------------------------------------------------------------
@@ -232,6 +239,7 @@ mod properties {
     mod p42;
     mod p43;
     mod p44;
+    mod p45;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the
