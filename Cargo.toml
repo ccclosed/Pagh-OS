@@ -134,6 +134,34 @@ embedded-io-async = { version = "=0.7.0", default-features = false }
 # of its RNG. `src/net/tls.rs` implements them over the kernel entropy source.
 # WEAK: that source is a non-cryptographic xorshift (see the module docs).
 rand_core = { version = "=0.6.4", default-features = false }
+# ── X.509 certificate signature verification (issue #14 series) ──
+# Pure-Rust verify-only backends for the chain verifier (`src/net/tls_verify.rs`
+# dispatches on the certificate's AlgorithmIdentifier OID). All no_std + alloc,
+# pinned exactly, `default-features = false` (no std, no RNG features — the
+# verifier never generates keys; signature key material comes from the
+# certificate's SPKI).
+# - `rsa` 0.9: RSASSA-PKCS1-v1_5 verify over sha2 (the sha256/384/512WithRSA
+#   OIDs real Debian mirrors sign leaves with). Its transitive num-bigint-dig
+#   stack is pure Rust and bare-metal-safe.
+# - `p384` 0.13: ECDSA P-384 (secp384r1) verify; brings the same ecdsa/
+#   elliptic-curve stack already vendored for embedded-tls's p256.
+# - `ed25519-dalek` 2.2: Ed25519 verify (RFC 8410 certs, e.g. newer Fastly
+#   leaves). `fast` keeps the curve25519 precomputed tables; no rand features.
+rsa = { version = "=0.9.9", default-features = false, features = ["sha2"] }
+p384 = { version = "=0.13.0", default-features = false, features = ["ecdsa", "sha384"] }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["fast"] }
+# `sha2` (already vendored for embedded-tls) and `p256` are used directly by
+# `src/net/tls_verify.rs` (PKCS1-v1_5 digest inputs / P-256 ECDSA verify), and
+# `signature` provides the Verifier trait across all three backends. The `oid`
+# feature gives the sha2 digests their AssociatedOid impls, which rsa's
+# DigestInfo-prefixed PKCS1-v1_5 verifier requires (X.509 signatures use the
+# prefixed form — `new_unprefixed` would verify the wrong encoding).
+sha2 = { version = "=0.10.9", default-features = false, features = ["oid"] }
+p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa"] }
+signature = { version = "=2.2.0", default-features = false }
+# Digest-AlgorithmIdentifier association (`AssociatedOid` bound on rsa's
+# DigestInfo-prefixed PKCS1-v1_5 verifier).
+const-oid = { version = "=0.9.6", default-features = false }
 
 [dependencies.acpi]
 version = "5.0"

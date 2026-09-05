@@ -185,6 +185,14 @@ pub mod x509;
 #[path = "../../src/net/hostname.rs"]
 pub mod hostname;
 
+// `tls_verify` is the certificate-signature scheme dispatcher (issue #14):
+// RSASSA-PKCS1-v1_5 (SHA-256/384/512), ECDSA P-256/P-384 and Ed25519
+// verification against the issuer SPKI key. Pure `core` + `alloc`; P46
+// generates real keypairs on the host (deterministic RNG) and drives
+// sign→verify round-trips plus tamper/mismatch fail-closed cases.
+#[path = "../../src/net/tls_verify.rs"]
+pub mod tls_verify;
+
 // ---------------------------------------------------------------------------
 // Property-test modules (P1..P28)
 // ---------------------------------------------------------------------------
@@ -240,6 +248,7 @@ mod properties {
     mod p43;
     mod p44;
     mod p45;
+    mod p46;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the
