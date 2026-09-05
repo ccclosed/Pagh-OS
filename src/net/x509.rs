@@ -470,7 +470,11 @@ pub struct CertificateRef<'a> {
     /// Serial number, sign-stripped big-endian (raw bytes; uniqueness is the
     /// CA's problem, not the verifier's).
     pub serial: &'a [u8],
-    /// `tbsCertificate.signature` AlgorithmIdentifier OID content.
+    /// `tbsCertificate.signature` — the WHOLE inner AlgorithmIdentifier
+    /// element. RFC 5280 §4.1.1.2 requires it to be identical to the outer
+    /// `signatureAlgorithm`; `parse_certificate` enforces that byte-for-byte.
+    pub sig_alg_der: &'a [u8],
+    /// Algorithm OID content (from the TBS field; equal to the outer one).
     pub sig_alg: &'a [u8],
     /// Issuer `Name` — raw DER element (byte equality is the chain matcher).
     pub issuer: &'a [u8],
@@ -482,28 +486,46 @@ pub struct CertificateRef<'a> {
     pub spki: SpkiRef<'a>,
     /// RFC 5280 version number: 1 (absent field), 2, or 3.
     pub version: u8,
+    /// The certificate's own signature — raw bytes of `signatureValue` (the
+    /// BIT STRING content with the unused-bits byte stripped): the DER
+    /// signature blob the chain verifier checks against the issuer's key.
+    pub signature: &'a [u8],
 }
 
 /// Parse one `Certificate` at the start of `der`.
 ///
 /// Returns the parsed certificate (borrowing from `der`) and the bytes after
-/// the certificate element. `signatureAlgorithm` / `signatureValue` are
-/// required to be present and well-formed but are not decoded here — the
-/// verifier checks the signature over [`CertificateRef::tbs`] in a later PR.
+/// the certificate element. The outer `signatureAlgorithm` is checked to be
+/// byte-identical to the TBS field (RFC 5280 §4.1.1.2) and the raw
+/// `signatureValue` bytes land in [`CertificateRef::signature`] — everything
+/// the chain verifier needs to check a certificate against its issuer's key.
 pub fn parse_certificate(der: &[u8]) -> Result<(CertificateRef<'_>, &[u8]), DerError> {
     let (cert_content, rest) = der_expect(der, TAG_SEQUENCE)?;
     let (tbs_el, tail) = der_element(cert_content)?;
-    let cert = parse_tbs(tbs_el)?;
-    // signatureAlgorithm (SEQUENCE) and signatureValue (BIT STRING) must be
-    // present: a certificate that ends after the TBS is not a certificate.
-    let (_alg, tail) = der_expect(tail, TAG_SEQUENCE)?;
-    let (_sig, tail) = der_expect(tail, TAG_BIT_STRING)?;
+
+    // Outer fields first: signatureAlgorithm (the WHOLE element) and
+    // signatureValue (BIT STRING, unused-bits byte stripped) — the raw
+    // signature blob the chain verifier checks against the issuer's key.
+    let (outer_alg_el, tail) = der_element(tail)?;
+    let (sig_el, tail) = der_element(tail)?;
+    let (sig_bits, _) = der_expect(sig_el, TAG_BIT_STRING)?;
+    let signature = bit_string_bytes(sig_bits)?;
+
+    let cert = parse_tbs(tbs_el, signature)?;
+
+    // RFC 5280 §4.1.1.2: the outer signatureAlgorithm MUST be identical to
+    // the TBS field — compare the raw DER and fail closed on any divergence
+    // (a cert whose two algorithm fields disagree is malformed or hostile).
+    if outer_alg_el != cert.sig_alg_der {
+        return Err(DerError::BadCert);
+    }
     Ok((cert, tail))
 }
 
 /// Parse the `TBSCertificate` element (tag + header included — `tbs` is kept
-/// verbatim as the signature input).
-fn parse_tbs(tbs: &[u8]) -> Result<CertificateRef<'_>, DerError> {
+/// verbatim as the signature input). `signature` is the already-stripped
+/// `signatureValue` byte string parsed by [`parse_certificate`].
+fn parse_tbs<'a>(tbs: &'a [u8], signature: &'a [u8]) -> Result<CertificateRef<'a>, DerError> {
     let (content, tail) = der_expect(tbs, TAG_SEQUENCE)?;
     if !tail.is_empty() {
         return Err(DerError::BadCert);
@@ -526,10 +548,12 @@ fn parse_tbs(tbs: &[u8]) -> Result<CertificateRef<'_>, DerError> {
     let serial = integer_bytes(serial)?;
     cur = rest;
 
-    // signature AlgorithmIdentifier — keep the OID; parameters ignored.
+    // signature AlgorithmIdentifier — keep the whole element (the outer
+    // field is checked byte-identical in `parse_certificate`) and the OID.
     let (sig_el, rest) = der_element(cur)?;
     let (sig_content, _) = der_expect(sig_el, TAG_SEQUENCE)?;
     let (sig_alg, _) = der_expect(sig_content, TAG_OID)?;
+    let sig_alg_der = sig_el;
     cur = rest;
 
     // issuer Name — raw DER element for chain name matching.
@@ -561,12 +585,14 @@ fn parse_tbs(tbs: &[u8]) -> Result<CertificateRef<'_>, DerError> {
     Ok(CertificateRef {
         tbs,
         serial,
+        sig_alg_der,
         sig_alg,
         issuer,
         subject,
         validity,
         spki,
         version,
+        signature,
     })
     // Optional issuerUniqueID [1] / subjectUniqueID [2] / extensions [3] are
     // NOT consumed here: `find_extension` re-walks `tbs` on demand, keeping
@@ -999,19 +1025,19 @@ mod tests {
             ]
             .concat(),
         );
+        let alg_el = tlv(
+            TAG_SEQUENCE,
+            &[
+                tlv(TAG_OID, OID_RSA_ENCRYPTION).as_slice(),
+                tlv(TAG_NULL, &[]).as_slice(),
+            ]
+            .concat(),
+        );
         let cert_der = tlv(
             TAG_SEQUENCE,
             &[
                 tbs.as_slice(),
-                tlv(
-                    TAG_SEQUENCE,
-                    &[
-                        tlv(TAG_OID, OID_RSA_ENCRYPTION).as_slice(),
-                        tlv(TAG_NULL, &[]).as_slice(),
-                    ]
-                    .concat(),
-                )
-                .as_slice(),
+                alg_el.as_slice(),
                 tlv(TAG_BIT_STRING, &[0x00, 0xde, 0xad]).as_slice(), // dummy signature
             ]
             .concat(),
@@ -1022,6 +1048,9 @@ mod tests {
         assert_eq!(cert.version, 1);
         assert_eq!(cert.serial, &[0x2a]);
         assert!(oid_is(cert.sig_alg, OID_RSA_ENCRYPTION));
+        assert_eq!(cert.sig_alg_der, alg_el.as_slice());
+        // Raw signatureValue bytes, unused-bits byte stripped.
+        assert_eq!(cert.signature, &[0xde, 0xad]);
         assert_eq!(cert.issuer, name.as_slice());
         assert_eq!(cert.subject, name.as_slice());
         assert_eq!(cert.validity.not_before, 1_735_689_600);
@@ -1041,5 +1070,26 @@ mod tests {
         for cut in 0..cert_der.len() {
             assert!(parse_certificate(&cert_der[..cut]).is_err());
         }
+
+        // Outer signatureAlgorithm MUST equal the TBS field (RFC 5280
+        // §4.1.1.2): swapping it for a different algorithm is a hard reject.
+        let other_alg = tlv(
+            TAG_SEQUENCE,
+            &[
+                tlv(TAG_OID, OID_EC_PUBLIC_KEY).as_slice(),
+                tlv(TAG_NULL, &[]).as_slice(),
+            ]
+            .concat(),
+        );
+        let mismatched = tlv(
+            TAG_SEQUENCE,
+            &[
+                tbs.as_slice(),
+                other_alg.as_slice(),
+                tlv(TAG_BIT_STRING, &[0x00, 0xde, 0xad]).as_slice(),
+            ]
+            .concat(),
+        );
+        assert_eq!(parse_certificate(&mismatched), Err(DerError::BadCert));
     }
 }

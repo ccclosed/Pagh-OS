@@ -199,6 +199,8 @@ proptest! {
 
         prop_assert_eq!(cert.version, 3);
         prop_assert_eq!(cert.serial, serial.as_slice());
+        // The raw signatureValue bytes come back untouched.
+        prop_assert_eq!(cert.signature, dummy_sig.as_slice());
         let issuer_der = name(b"Issuer");
         let subject_der = name(b"Subject");
         prop_assert_eq!(cert.issuer, issuer_der.as_slice());
@@ -372,6 +374,7 @@ fn generated_v3_cert_matches_all_expected_fields() {
     let (cert, rest) = parse_certificate(&der).unwrap();
     assert!(rest.is_empty());
     assert_eq!(cert.serial, &[0x42]);
+    assert_eq!(cert.signature, &[0x00, 0x01, 0x02]);
     assert_eq!(cert.validity.not_before, 1_735_689_600);
     assert_eq!(cert.validity.not_after, 1_767_225_600);
     let san = find_extension(&cert, OID_EXT_SAN).unwrap().unwrap();
