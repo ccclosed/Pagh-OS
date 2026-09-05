@@ -78,12 +78,20 @@ pub fn hostname_matches(host: &[u8], san: &[u8]) -> bool {
         return false;
     }
 
+    // A `*` on the HOST side is bogus input: the host is the name being
+    // VERIFIED, never a pattern. This must hold before the wildcard branch —
+    // otherwise host `a.*.example.com` would sail through the SAN pattern
+    // `*.example.com` (only hl[1..] is compared there, hl[0] unchecked).
+    if hl.iter().any(|l| l.contains(&b'*')) {
+        return false;
+    }
+
     // Wildcard: ONLY the entire left-most SAN label, matching exactly one
-    // host label. A `*` anywhere else — on either side — never matches.
+    // host label. A `*` anywhere else on the SAN side never matches either.
     if sl[0] == b"*" {
         return hl.len() == sl.len() && labels_eq(&hl[1..], &sl[1..]);
     }
-    if sl.iter().any(|l| l.contains(&b'*')) || hl.iter().any(|l| l.contains(&b'*')) {
+    if sl.iter().any(|l| l.contains(&b'*')) {
         return false;
     }
     labels_eq(&hl, &sl)
@@ -145,7 +153,11 @@ mod tests {
         // Non-left-most wildcard.
         assert!(!m("www.example.com", "www.*.com"));
         assert!(!m("www.example.com", "www.example.*"));
-        // Bogus wildcard on the host side.
+        // Bogus wildcard on the host side — INCLUDING against a wildcard
+        // SAN whose tail lines up: the host is verified, never a pattern.
+        assert!(!m("*.example.com", "*.example.com"));
+        assert!(!m("a.*.example.com", "*.example.com"));
+        assert!(!m("*.example.com", "a.example.com"));
         assert!(!m("a.*.com", "a.*.com"));
     }
 

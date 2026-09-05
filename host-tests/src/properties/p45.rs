@@ -67,8 +67,9 @@ proptest! {
     }
 
     /// Fail-closed on misplaced wildcards: injecting `*` into any label of
-    /// the SAN (so it is never the WHOLE left-most label) always rejects,
-    /// and a wildcarded host never matches a wildcard-free SAN.
+    /// the SAN (so it is never the WHOLE left-most label) always rejects;
+    /// a wildcarded HOST never matches — even against a wildcard SAN whose
+    /// tail lines up (the host is the name being verified, not a pattern).
     #[test]
     fn misplaced_wildcards_fail_closed(
         labels in proptest::collection::vec(label(), 1..=3),
@@ -94,6 +95,14 @@ proptest! {
         let wild_host = hls.join(".");
         let clean_san = labels.join(".");
         prop_assert!(!hostname_matches(wild_host.as_bytes(), clean_san.as_bytes()));
+
+        // And against a WILDCARD SAN with the same tail: the host-side '*'
+        // must not sail through the wildcard branch (hl[0] is unchecked
+        // there, which is exactly why the host check runs first).
+        let wild_san = format!("*.{clean_san}");
+        let deep_wild_host = format!("x.{wild_host}");
+        prop_assert!(!hostname_matches(wild_host.as_bytes(), wild_san.as_bytes()));
+        prop_assert!(!hostname_matches(deep_wild_host.as_bytes(), wild_san.as_bytes()));
     }
 
     /// IP literals: the classifier accepts exactly canonical-ish dotted
@@ -140,6 +149,8 @@ fn equivalence_classes() {
         ("example.com", "*.example.com", false),
         ("www.example.com", "w*.example.com", false),
         ("www.example.com", "www.*.com", false),
+        ("*.example.com", "*.example.com", false),
+        ("a.*.example.com", "*.example.com", false),
         ("www.example.com.", "www.example.com", true),
         ("www..example.com", "www.example.com", false),
         ("пример.рф", "пример.рф", false),
