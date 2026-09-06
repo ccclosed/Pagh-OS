@@ -2,14 +2,17 @@
 //!
 //! GENERATED FILE — do not edit by hand; regenerate with
 //! `tools/gen_ca_bundle.py` (source: the curl/Mozilla CA extract,
-//! `https://curl.se/ca/cacert.pem`), then commit the result. Determinism: no
-//! timestamps, fixed selection order and formatting — identical input
-//! produces a byte-identical file.
+//! `https://curl.se/ca/cacert.pem`; every root is pinned by sha256 inside the
+//! generator and the run fails closed on any mismatch), then commit
+//! the result. The pipeline is `generate` + `rustfmt`, so a plain
+//! regeneration is byte-identical to this file.
 //!
 //! Each entry is one self-signed root CA: raw DER plus a human label
-//! (the subject CN) for diagnostics. `net::tls_chain::TrustAnchor`
-//! pairs the root's subject with its key at verifier start-up.
-//! Pure `core` — also `#[path]`-included by the host tests (P48).
+//! (the subject CN, cross-checked against the DER at generation time
+//! and re-checked by property P48 against the committed bytes).
+//! `net::tls_chain::TrustAnchor` pairs the root's subject with its
+//! key at verifier start-up. Pure `core` — also `#[path]`-included
+//! by the host tests (P48).
 
 #![allow(dead_code)] // consumed by the TlsVerifier in the next PR of the series.
 

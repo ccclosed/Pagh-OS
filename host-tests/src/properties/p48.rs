@@ -11,6 +11,9 @@
 //
 //   * `x509::parse_certificate` accepts the DER and consumes it exactly
 //     (no trailing bytes);
+//   * the LABEL is the subject CN actually inside the DER (independent
+//     re-read with public `x509` primitives — a generator bug or hand edit
+//     pairing a name with foreign bytes fails here);
 //   * the certificate is self-signed (subject == issuer, byte-equal);
 //   * basicConstraints is present with cA=TRUE;
 //   * the SPKI key type is one the verifier actually supports (never
@@ -28,9 +31,41 @@
 use crate::ca_bundle::CA_BUNDLE;
 use crate::tls_verify::verify_certificate_signature;
 use crate::x509::{
-    find_extension, parse_basic_constraints, parse_certificate, SpkiKey, OID_EXT_BASIC_CONSTRAINTS,
+    der_children, der_expect, der_tlv, find_extension, oid_is, parse_basic_constraints,
+    parse_certificate, SpkiKey, OID_EXT_BASIC_CONSTRAINTS, TAG_OID, TAG_SEQUENCE, TAG_SET,
 };
 use proptest::prelude::*;
+
+/// Walk a `Name` DER element (`SEQUENCE { SET { SEQUENCE { OID, value } } }`)
+/// and return the FIRST CN (OID 2.5.4.3) value, using ONLY the public
+/// `x509` primitives — an independent re-read of the committed bytes, not a
+/// call into anything the generator wrote.
+fn name_cn(name_der: &[u8]) -> Option<&[u8]> {
+    let (content, _) = der_expect(name_der, TAG_SEQUENCE).ok()?;
+    for rdn in der_children(content) {
+        let (tag, set) = rdn.ok()?;
+        if tag != TAG_SET {
+            return None;
+        }
+        // Each SET holds one AttributeTypeAndValue SEQUENCE.
+        let (atv_tag, atv, _) = der_tlv(set).ok()?;
+        if atv_tag != TAG_SEQUENCE {
+            return None;
+        }
+        let (oid_tag, oid, rest) = der_tlv(atv).ok()?;
+        if oid_tag != TAG_OID {
+            return None;
+        }
+        if oid_is(oid, &[0x55, 0x04, 0x03]) {
+            let (_val_tag, val, tail) = der_tlv(rest).ok()?;
+            if !tail.is_empty() {
+                return None;
+            }
+            return Some(val);
+        }
+    }
+    None
+}
 
 proptest! {
     /// Each anchor parses as a self-signed, cA=TRUE certificate whose
@@ -53,6 +88,24 @@ proptest! {
         );
         let (cert, tail) = parsed.unwrap();
         prop_assert!(tail.is_empty(), "{}: trailing bytes after certificate", tag);
+
+        // LABEL INTEGRITY: the label must be the subject CN actually inside
+        // the DER. Without this check a generator bug (or a hand edit) could
+        // pair the name "ISRG Root X1" with X2's bytes and every other
+        // property would still pass — the label is the only human-visible
+        // identity of the anchor.
+        let cn = name_cn(cert.subject);
+        prop_assert!(
+            cn.is_some(),
+            "{}: no subject CN found in the DER",
+            tag
+        );
+        prop_assert_eq!(
+            cn.unwrap(),
+            label.as_bytes(),
+            "{}: label does not match the subject CN inside the DER",
+            tag
+        );
 
         // Self-signed root: subject == issuer (byte equality — exactly what
         // the chain builder matches anchors with).

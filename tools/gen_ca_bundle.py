@@ -2,45 +2,53 @@
 """Generate src/net/ca_bundle.rs — the kernel's TLS trust-anchor bundle.
 
 Issue #14 series (PR 6): the TLS verifier must authenticate server chains
-against a fixed set of trusted self-signed roots. This script downloads ONE
-stable source (the curl/Mozilla CA extract), selects a curated list of roots
-by exact subject CN, normalizes each certificate to raw DER, and emits a
-pure-`core` Rust module (static byte arrays + labels). The generated file is
+against a fixed set of trusted self-signed roots. The generated file is
 COMMITTED to the repo; re-run this script only to deliberately refresh it.
 
-Determinism: the output depends only on the selection list and the source
-certificates — no timestamps, no environment data, fixed order, fixed
-formatting. Re-runs against the same source produce byte-identical output.
+TRUST MODEL — the download is NOT trusted on its own:
+  * every root is PINNED by its sha256 in SELECTION below (verified by hand
+    against the operator's own independent copy at pinning time);
+  * the script selects each root BY THE PINNED HASH, then cross-checks the
+    subject CN inside the pinned DER against the expected CN — a substituted
+    or re-issued certificate fails the run instead of silently entering the
+    kernel's trust base;
+  * only SELF-SIGNED certificates (issuer == subject) are eligible; if a CN
+    collision appears in the source (historically: cross-signed variants of
+    GTS roots share a subject CN), the self-signed copy is chosen, and
+    ambiguity that survives the filter is a hard error — never a silent pick.
 
-The selected set covers the real HTTPS surfaces the kernel talks to:
-  * ISRG Root X1 / X2 — Let's Encrypt chains (deb.debian.org and friends);
-  * GlobalSign Root R3 — Fastly/CDN chains (historical deb.debian.org);
-  * GTS Root R1 / R4   — Google Trust Services chains (other CDN edges).
+Determinism: no timestamps, fixed selection order and formatting. The script
+writes the raw module and then runs `rustfmt` over it — the committed
+artifact is the output of THIS pipeline (generate + rustfmt), so a plain
+regeneration must be byte-identical to what is committed.
 
 Usage: python tools/gen_ca_bundle.py
 """
 
 import base64
+import gzip
 import hashlib
-import ssl
+import shutil
+import subprocess
 import sys
 import urllib.request
 
 SOURCE_URL = "https://curl.se/ca/cacert.pem"
 
-# (subject CN) — the exact bundle contents, in output order.
-# Covers the real HTTPS surfaces the kernel talks to:
-#   * ISRG Root X1 / X2 — Let's Encrypt chains: deb.debian.org was probed
-#     serving a leaf issued by a Let's Encrypt intermediate, so ISRG anchors
-#     the Debian mirror surface (X1 = RSA intermediates, X2 = ECC);
-#   * GTS Root R1 / R4  — Google Trust Services chains (other CDN edges).
-# NOTE: GlobalSign Root R3 was considered but is no longer part of the
-# Mozilla store the source bundle mirrors (removed 2025), so it is absent.
+# The exact bundle contents, in output order: (expected subject CN, pinned
+# sha256 of the root's DER). A root is selected BY THE HASH; the CN is a
+# cross-check against substitution (same hash collision aside, a different
+# certificate cannot pass both). Update a pin only as a deliberate,
+# reviewed act: it changes what the kernel's TLS will trust.
 SELECTION = [
-    "ISRG Root X1",
-    "ISRG Root X2",
-    "GTS Root R1",
-    "GTS Root R4",
+    # Let's Encrypt roots: deb.debian.org was probed serving a Let's
+    # Encrypt-issued leaf, so ISRG anchors the apt mirror surface
+    # (X1 = RSA intermediates, X2 = ECC intermediates).
+    ("ISRG Root X1", "96bcec06264976f37460779acf28c5a7cfe8a3c0aae11a8ffcee05c0bddf08c6"),
+    ("ISRG Root X2", "69729b8e15a86efc177a57afb7171dfc64add28c2fca8cf1507e34453ccb1470"),
+    # Google Trust Services roots (CDN edges).
+    ("GTS Root R1", "d947432abde7b7fa90fc2e6b59101b1280e0e1c7e4e40fa3c6887fff57a7f4cf"),
+    ("GTS Root R4", "349dfa4058c5e263123b398ae795573c4e1313c83fe68f93556cd5e8031b3c7d"),
 ]
 
 OUT_PATH = "src/net/ca_bundle.rs"
@@ -62,8 +70,6 @@ def fetch_source(url: str, retries: int = 3) -> bytes:
             # Defensive: if a proxy compressed the body despite `identity`,
             # detect the gzip magic and decompress.
             if data[:2] == b"\x1f\x8b":
-                import gzip
-
                 data = gzip.decompress(data)
             return data
         except Exception as e:  # noqa: BLE001 — report and retry
@@ -130,8 +136,8 @@ def walk_name(name_content: bytes):
     return pairs
 
 
-def subject_cn(der: bytes) -> str:
-    """Extract the subject CN (OID 2.5.4.3 = 55 04 03) of a certificate DER."""
+def cert_names(der: bytes):
+    """Return (issuer pairs, subject pairs) of a certificate DER."""
     tag, cert, _ = read_tlv(der, 0)
     assert tag == 0x30
     tag, tbs, _ = read_tlv(cert, 0)
@@ -150,10 +156,14 @@ def subject_cn(der: bytes) -> str:
     tag, validity_el, i = read_tlv(tbs, i)
     tag, subject_el, i = read_tlv(tbs, i)
     assert tag == 0x30
-    for oid, val in walk_name(subject_el):
+    return walk_name(issuer_el), walk_name(subject_el)
+
+
+def cn_of(pairs) -> str:
+    for oid, val in pairs:
         if oid == b"\x55\x04\x03":
             return val.decode("latin1")
-    raise ValueError("certificate has no subject CN")
+    raise ValueError("name has no CN")
 
 
 def rust_bytes(der: bytes, indent: str) -> str:
@@ -176,44 +186,65 @@ def rust_bytes(der: bytes, indent: str) -> str:
     return body
 
 
+def select_pinned_roots(certs: list[bytes]):
+    """Select every SELECTION root by its pinned hash; fail closed on any
+    deviation. Returns [(cn, der)] in SELECTION order."""
+    by_hash = {hashlib.sha256(der).hexdigest(): der for der in certs}
+    out = []
+    for cn, pin in SELECTION:
+        der = by_hash.get(pin)
+        if der is None:
+            raise SystemExit(
+                f"PINNED ROOT MISSING: {cn} (sha256 {pin}) is not in the source. "
+                "If the source legitimately changed, update the pin as a reviewed act — "
+                "this changes what the kernel's TLS trusts."
+            )
+        issuer, subject = cert_names(der)
+        actual_cn = cn_of(subject)
+        if actual_cn != cn:
+            raise SystemExit(
+                f"PIN MISMATCH: {cn} (sha256 {pin}) has subject CN {actual_cn!r} — "
+                "the pin does not describe the certificate it selects."
+            )
+        if issuer != subject:
+            raise SystemExit(
+                f"NOT SELF-SIGNED: {cn} (sha256 {pin}) has issuer != subject — "
+                "a trust anchor must be a self-signed root."
+            )
+        out.append((cn, der))
+    return out
+
+
 def main() -> None:
     print(f"downloading {SOURCE_URL} ...")
     data = fetch_source(SOURCE_URL)
     certs = list(pem_blocks(data))
     print(f"source contains {len(certs)} certificates")
 
-    by_cn = {}
-    for der in certs:
-        try:
-            cn = subject_cn(der)
-        except Exception as e:  # noqa: BLE001 — skip anything unparsable
-            print(f"  skip unparsable cert: {e}", file=sys.stderr)
-            continue
-        by_cn.setdefault(cn, der)
+    roots = select_pinned_roots(certs)
 
-    missing = [cn for cn in SELECTION if cn not in by_cn]
-    if missing:
-        raise SystemExit(f"selection not found in source: {missing}")
-
-    # Emit the module: fixed order, fixed formatting — deterministic.
+    # Emit the module: fixed order, fixed formatting — deterministic; the
+    # rustfmt pass below makes the committed artifact canonical.
     out = []
     out.append("//! Trust-anchor bundle for the TLS certificate verifier (issue #14).\n")
     out.append("//!\n")
     out.append("//! GENERATED FILE — do not edit by hand; regenerate with\n")
     out.append("//! `tools/gen_ca_bundle.py` (source: the curl/Mozilla CA extract,\n")
-    out.append(f"//! `{SOURCE_URL}`), then commit the result. Determinism: no\n")
-    out.append("//! timestamps, fixed selection order and formatting — identical input\n")
-    out.append("//! produces a byte-identical file.\n")
+    out.append(f"//! `{SOURCE_URL}`; every root is pinned by sha256 inside the\n")
+    out.append("//! generator and the run fails closed on any mismatch), then commit\n")
+    out.append("//! the result. The pipeline is `generate` + `rustfmt`, so a plain\n")
+    out.append("//! regeneration is byte-identical to this file.\n")
     out.append("//!\n")
     out.append("//! Each entry is one self-signed root CA: raw DER plus a human label\n")
-    out.append("//! (the subject CN) for diagnostics. `net::tls_chain::TrustAnchor`\n")
-    out.append("//! pairs the root's subject with its key at verifier start-up.\n")
-    out.append("//! Pure `core` — also `#[path]`-included by the host tests (P48).\n")
+    out.append("//! (the subject CN, cross-checked against the DER at generation time\n")
+    out.append("//! and re-checked by property P48 against the committed bytes).\n")
+    out.append("//! `net::tls_chain::TrustAnchor` pairs the root's subject with its\n")
+    out.append("//! key at verifier start-up. Pure `core` — also `#[path]`-included\n")
+    out.append("//! by the host tests (P48).\n")
     out.append("\n#![allow(dead_code)] // consumed by the TlsVerifier in the next PR of the series.\n\n")
     out.append("/// One trust anchor: label (subject CN) + raw DER of the root certificate.\n")
     out.append("pub static CA_BUNDLE: &[(&str, &[u8])] = &[\n")
-    for cn in SELECTION:
-        der = by_cn[cn]
+    for cn, der in roots:
         fp = hashlib.sha256(der).hexdigest()
         out.append(f"    // sha256 {fp}\n")
         out.append(f"    (\n        \"{cn}\",\n        &[\n{rust_bytes(der, '            ')},\n        ],\n    ),\n")
@@ -221,10 +252,18 @@ def main() -> None:
 
     with open(OUT_PATH, "w", newline="\n", encoding="utf-8") as f:
         f.write("".join(out))
-    print(f"wrote {OUT_PATH} with {len(SELECTION)} anchors:")
-    for cn in SELECTION:
-        der = by_cn[cn]
-        print(f"  {cn}: {len(der)} bytes, sha256 {hashlib.sha256(der).hexdigest()[:16]}...")
+
+    # The committed artifact is the RUSTFMT-CANONICAL form: run the same
+    # formatter `cargo fmt --all` would apply, so a regeneration equals the
+    # committed bytes (no silent formatting drift between script and repo).
+    rustfmt = shutil.which("rustfmt")
+    if rustfmt is None:
+        raise SystemExit("rustfmt not found on PATH; cannot produce the canonical artifact")
+    subprocess.run([rustfmt, "--edition", "2021", OUT_PATH], check=True)
+
+    print(f"wrote {OUT_PATH} with {len(roots)} anchors:")
+    for cn, der in roots:
+        print(f"  {cn}: {len(der)} bytes, sha256 {hashlib.sha256(der).hexdigest()}")
 
 
 if __name__ == "__main__":
