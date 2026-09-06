@@ -278,6 +278,88 @@ const NA: &[u8] = b"350101000000Z";
 proptest! {
     #![proptest_config(proptest::test_runner::Config::with_cases(8))]
 
+    /// A rogue self-signed certificate whose subject DER is byte-identical
+    /// to the anchor's name must NOT shadow the configured anchor: a leaf
+    /// signed by the anchor's real key must still verify (key rotation,
+    /// cross-signing and stale same-name copies must not break the chain).
+    /// The rogue is placed AFTER the leaf, as an intermediate would be.
+    ///
+    /// Regression guard: with NO matching anchor the returned error is
+    /// exactly the FIRST failing name-match in message order (the rogue),
+    /// and a rogue presented FIRST (as the leaf itself) stays a hard reject.
+    #[test]
+    fn same_name_intermediate_does_not_shadow_anchor(
+        seed in any::<u64>(),
+        broken_bc in any::<bool>(),
+    ) {
+        // Leaf signed DIRECTLY by the anchor's key (no real intermediate).
+        let mut rng = rng_from(seed);
+        let sk_root = p256::ecdsa::SigningKey::random(&mut rng);
+        let sk_leaf = p256::ecdsa::SigningKey::random(&mut rng);
+        let root_name = name(b"Test Root CA");
+        let leaf_name = name(b"shadowed.paghsuite");
+        let root_point = sk_root.verifying_key().to_encoded_point(false);
+        let leaf_point = sk_leaf.verifying_key().to_encoded_point(false);
+        let leaf_der = build_cert(
+            0x04, &leaf_name, &root_name, leaf_point.as_bytes(), NB, NA,
+            &[extension(&[0x55, 0x1d, 0x11], false, &san_dns(b"shadowed.paghsuite"))], &sk_root,
+        );
+        let anchor = TrustAnchor {
+            subject: &root_name,
+            key: SpkiKey::EcP256 { point: root_point.as_bytes() },
+        };
+
+        // Rogue self-signed cert: SAME subject DER, DIFFERENT key, valid
+        // dates, cA=TRUE — or broken basicConstraints (a truncated inner
+        // BOOLEAN: lengths stay consistent, the value does not parse).
+        let bc = if broken_bc {
+            tlv(0x30, &[0x01, 0x01])
+        } else {
+            basic_constraints(true)
+        };
+        let sk_rogue = p256::ecdsa::SigningKey::random(&mut rng);
+        let rogue_point = sk_rogue.verifying_key().to_encoded_point(false);
+        let rogue = build_cert(
+            0x7f,
+            &root_name,
+            &root_name,
+            rogue_point.as_bytes(),
+            NB,
+            NA,
+            &[extension(&[0x55, 0x1d, 0x13], true, &bc)],
+            &sk_rogue,
+        );
+
+        // Leaf first, rogue after: the anchor must not be shadowed.
+        let mut der = leaf_der.clone();
+        der.extend_from_slice(&rogue);
+        prop_assert_eq!(verify_chain(&[anchor], &der, NOW), Ok(()));
+
+        // No matching anchor: the exact error is the FIRST failing
+        // name-match in message order (the rogue is the only candidate).
+        let expected = if broken_bc {
+            ChainError::IncompleteChain
+        } else {
+            ChainError::Verify(SigVerifyError::VerifyFailed)
+        };
+        let empty_anchors: [TrustAnchor<'static>; 0] = [];
+        prop_assert_eq!(verify_chain(&empty_anchors, &der, NOW), Err(expected));
+
+        // Rogue FIRST: it IS the presented leaf then, and a leaf that does
+        // not verify against the anchor is a hard reject — the real leaf
+        // sitting behind it must not rescue it.
+        let mut der_first = rogue.clone();
+        der_first.extend_from_slice(&leaf_der);
+        prop_assert_eq!(
+            verify_chain(&[anchor], &der_first, NOW),
+            Err(ChainError::Verify(SigVerifyError::VerifyFailed))
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(8))]
+
     /// A good two-level path (leaf → intermediate → anchor) verifies, with
     /// AND without the extra self-signed root appended (RFC 8446 extra
     /// entries), and a leaf signed directly by the anchor also verifies.

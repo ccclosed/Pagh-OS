@@ -115,6 +115,17 @@ pub struct TrustAnchor<'a> {
 /// (intermediates and the root, when carried as a certificate) is `cA=TRUE`,
 /// every certificate in the path is within its validity window, and `now` is
 /// at or above [`CLOCK_FLOOR`].
+///
+/// Fallback and error-choice semantics: a same-named intermediate that fails
+/// (bad signature, non-CA, unparseable basicConstraints) NEVER shadows the
+/// configured anchors — after the message's candidate list is exhausted the
+/// anchors are always consulted, and the path succeeds if any name-matching
+/// anchor verifies. When nothing verifies, the returned error is the FIRST
+/// failing name-match in message order (message entries rank before the
+/// anchor set; no last-candidate overwrite); an anchor that matched by name
+/// but failed to verify is reported only when no intermediate candidate
+/// failed, and a name with neither a matching certificate nor a matching
+/// anchor is [`ChainError::NoAnchor`].
 pub fn verify_chain(anchors: &[TrustAnchor<'_>], der: &[u8], now: i64) -> Result<(), ChainError> {
     // CLOCK GATE, before anything else: an unset RTC must never look like a
     // valid time for a certificate whose window happens to include it.
@@ -145,17 +156,18 @@ pub fn verify_chain(anchors: &[TrustAnchor<'_>], der: &[u8], now: i64) -> Result
         check_validity(cert, now)?;
     }
 
-    // Walk the path. `path_index` tracks which message entries were consumed
-    // as issuers so a hostile peer cannot reuse the same entry twice (a
+    // Walk the path. `used` tracks which message entries were consumed as
+    // issuers so a hostile peer cannot reuse the same entry twice (a
     // self-issued loop would otherwise let a chain "verify" against itself).
     let mut used = vec![false; certs.len()];
     used[0] = true;
     let mut current = leaf;
     loop {
-        // Does an intermediate certificate in the message name itself as the
-        // issuer of `current`? Try each unused candidate; a name match whose
-        // signature fails is remembered and only surfaces if NO candidate
-        // verifies.
+        // Does an unused intermediate certificate in the message name itself
+        // as the issuer of `current`? Try each candidate; a failed candidate
+        // (bad signature, non-CA, unparseable basicConstraints) never stops
+        // the search: later candidates and — see below — the configured
+        // anchors still get their chance.
         let mut name_match_err: Option<ChainError> = None;
         let mut advanced = false;
         for (i, cand) in certs.iter().enumerate() {
@@ -163,9 +175,24 @@ pub fn verify_chain(anchors: &[TrustAnchor<'_>], der: &[u8], now: i64) -> Result
                 continue;
             }
             // An intermediate MUST be a CA (fail closed on a missing
-            // basicConstraints too — DER omits the defaulted FALSE).
-            if !is_ca(cand)? {
-                name_match_err = Some(ChainError::NotCa);
+            // basicConstraints too — DER omits the defaulted FALSE). A
+            // candidate whose basicConstraints does not even parse is
+            // skipped like a non-CA, with the parse error remembered as a
+            // candidate result (it maps to IncompleteChain if nothing else
+            // verifies).
+            let ca = match is_ca(cand) {
+                Ok(ca) => ca,
+                Err(e) => {
+                    if name_match_err.is_none() {
+                        name_match_err = Some(e);
+                    }
+                    continue;
+                }
+            };
+            if !ca {
+                if name_match_err.is_none() {
+                    name_match_err = Some(ChainError::NotCa);
+                }
                 continue;
             }
             match verify_certificate_signature(
@@ -181,18 +208,22 @@ pub fn verify_chain(anchors: &[TrustAnchor<'_>], der: &[u8], now: i64) -> Result
                     break;
                 }
                 Err(e) => {
-                    name_match_err = Some(ChainError::Verify(e));
+                    if name_match_err.is_none() {
+                        name_match_err = Some(ChainError::Verify(e));
+                    }
                 }
             }
         }
         if advanced {
             continue;
         }
-        if let Some(e) = name_match_err {
-            return Err(e);
-        }
 
-        // No unused intermediate matches: the parent must be a trust anchor.
+        // NO candidate verified — fall through to the configured anchors
+        // UNCONDITIONALLY. A same-named intermediate that fails (rotated
+        // root key, cross-sign, stale copy) must never shadow a trust
+        // anchor: the anchor set is the configured fact, the message is
+        // only a claim. The path succeeds if ANY name-matching anchor
+        // verifies the signature.
         let mut anchor_err: Option<ChainError> = None;
         for anchor in anchors {
             if anchor.subject != current.issuer {
@@ -205,8 +236,22 @@ pub fn verify_chain(anchors: &[TrustAnchor<'_>], der: &[u8], now: i64) -> Result
                 &anchor.key,
             ) {
                 Ok(()) => return Ok(()),
-                Err(e) => anchor_err = Some(ChainError::Verify(e)),
+                Err(e) => {
+                    if anchor_err.is_none() {
+                        anchor_err = Some(ChainError::Verify(e));
+                    }
+                }
             }
+        }
+
+        // Deterministic error choice: the FIRST failing name-match in
+        // message order wins (message entries come before the anchor set,
+        // and no last-candidate overwrite). An anchor that matched by name
+        // but failed to verify is reported only when no intermediate
+        // candidate failed; a name with neither a matching certificate nor
+        // a matching anchor is NoAnchor.
+        if let Some(e) = name_match_err {
+            return Err(e);
         }
         if let Some(e) = anchor_err {
             return Err(e);
