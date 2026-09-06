@@ -25,43 +25,10 @@ use crate::tls_verify::{
 };
 use crate::x509::SpkiKey;
 use proptest::prelude::*;
-use rand_core::{CryptoRng, RngCore};
 
-/// Deterministic XorShift128+ style RNG (seeded from proptest values).
-struct DetRng(u64, u64);
-
-impl RngCore for DetRng {
-    fn next_u32(&mut self) -> u32 {
-        (self.next_u64() >> 32) as u32
-    }
-    fn next_u64(&mut self) -> u64 {
-        // xorshift128+ (linear, deterministic, fine for test key generation).
-        let mut a = self.0;
-        let b = self.1;
-        self.0 = b;
-        a ^= a << 23;
-        a ^= a >> 17;
-        a ^= b ^ (b >> 26);
-        self.1 = a;
-        a.wrapping_add(b)
-    }
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        for chunk in dest.chunks_mut(8) {
-            let v = self.next_u64().to_le_bytes();
-            chunk.copy_from_slice(&v[..chunk.len()]);
-        }
-    }
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-        self.fill_bytes(dest);
-        Ok(())
-    }
-}
-
-impl CryptoRng for DetRng {}
-
-fn rng_from(seed: u64) -> DetRng {
-    DetRng(seed ^ 0x9E3779B97F4A7C15, seed.rotate_left(32) | 1)
-}
+// The deterministic XorShift RNG moved to a shared module so the whole issue
+// #14 property series seeds from ONE implementation (see P47).
+use super::det_rng::rng_from;
 
 /// Random message bytes for signatures.
 fn msg() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
