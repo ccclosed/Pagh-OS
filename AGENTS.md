@@ -131,6 +131,11 @@ release into `limine/`) — do not hard-code Limine versions in scripts.
 - Work on feature branches → PR; merge only with CI green. Stacked PRs are
   fine (branch from the earlier feature branch, then retarget when it
   merges).
+- **Immediately after a PR merges, delete its branch (remote and local) and
+  retarget any stacked PRs to `main`.** A leftover merged branch is a trap:
+  the next stacked PR still defaults to it as base, and the merge then lands
+  on the branch instead of `main` — main silently misses the work while the
+  branch looks done (this is exactly how PR #27 initially bypassed `main`).
 - The shell/regression surface is the serial log: diagnostics use
   `[WATCHDOG]`, `[DIAG]`, `LXSELFTEST`, `[EXC #N]` markers — E2E asserts
   grep them; don't rename them casually.
