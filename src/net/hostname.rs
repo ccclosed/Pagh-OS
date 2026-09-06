@@ -116,6 +116,22 @@ pub fn ip_matches(host: &[u8], san: &[u8]) -> bool {
     (host.len() == 4 || host.len() == 16) && host == san
 }
 
+/// Parse a dotted-quad IPv4 literal into its 4 raw octets — the form
+/// [`ip_matches`] compares `iPAddress` SAN entries with. `None` for anything
+/// that is not exactly four dot-separated decimal octets in range (the same
+/// grammar [`is_ip_literal`] classifies, so the two never disagree).
+pub fn parse_ipv4_literal(host: &[u8]) -> Option<[u8; 4]> {
+    if !is_ip_literal(host) {
+        return None;
+    }
+    let mut out = [0u8; 4];
+    for (slot, part) in out.iter_mut().zip(host.split(|&b| b == b'.')) {
+        // is_ip_literal guaranteed ≤ 3 ASCII digits; the fold cannot overflow.
+        *slot = part.iter().fold(0u8, |v, &d| v * 10 + (d - b'0'));
+    }
+    Some(out)
+}
+
 // ───────────────────────────── self-tests ─────────────────────────────
 
 #[cfg(test)]
@@ -201,5 +217,25 @@ mod tests {
         assert!(!ip_matches(&[10, 0, 2, 15], &[0u8; 16]));
         // Text forms must NOT be compared through ip_matches.
         assert!(!ip_matches(b"10.0.2.15", b"10.0.2.15"));
+    }
+
+    #[test]
+    fn ipv4_parse_agrees_with_classification() {
+        assert_eq!(parse_ipv4_literal(b"10.0.2.15"), Some([10, 0, 2, 15]));
+        assert_eq!(parse_ipv4_literal(b"0.0.0.0"), Some([0, 0, 0, 0]));
+        assert_eq!(parse_ipv4_literal(b"255.255.255.255"), Some([255; 4]));
+        // Every non-literal that is_ip_literal rejects parses to None too —
+        // the classifier and the parser share one grammar.
+        for bad in [
+            &b"999.1.1.1"[..],
+            b"1.2.3.4.5",
+            b"1.2.3",
+            b"example.com",
+            b"",
+            b"1.2.3.256",
+        ] {
+            assert!(!is_ip_literal(bad));
+            assert_eq!(parse_ipv4_literal(bad), None);
+        }
     }
 }

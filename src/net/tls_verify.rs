@@ -25,6 +25,18 @@
 //!     signature validity (NIST SP 800-57 / CA/B minimum).
 //!   * Any key/signature shape mismatch between the algorithm OID and the
 //!     SPKI key type is a hard error (`KeyTypeMismatch`), never a lax try.
+//!
+//! ## TLS 1.3 CertificateVerify backends
+//!
+//! Besides the X.509 chain signatures this module also verifies the TLS 1.3
+//! `CertificateVerify` message (RFC 8446 §4.4.3) for `net::tls_auth`:
+//! [`verify_certificate_verify_signature`] dispatches on the negotiated
+//! [`Tls13Scheme`]. RSA-PSS is REQUIRED there (RFC 8446 §4.2.3) and is
+//! unambiguous: the scheme identifier fixes the hash, the salt length (=
+//! hash length) and the trailer, so there is no parameters surface — this is
+//! a different decision from the PSS OID rejection above, which exists
+//! because inside X.509 the PSS parameters live in the certificate where a
+//! peer controls them.
 
 #![allow(dead_code)] // consumed by the chain verifier in the next PR of the series.
 
@@ -47,6 +59,42 @@ pub const OID_ECDSA_WITH_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0
 pub const OID_ECDSA_WITH_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
 /// `1.3.101.112` Ed25519.
 pub const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
+
+/// TLS 1.3 `CertificateVerify` context string for the SERVER signature
+/// (RFC 8446 §4.4.3): NUL-terminated, prepended by 64 spaces by the caller.
+pub const TLS13_CTX_SERVER_CV: &[u8] = b"TLS 1.3, server CertificateVerify\0";
+
+/// The TLS 1.3 `CertificateVerify` signature schemes the verifier accepts
+/// (RFC 8446 §4.2.3). Own enum — the pure layers never import embedded-tls
+/// types; the kernel call site maps the wire values 1:1.
+///
+/// Deliberately absent: `rsa_pkcs1_*` (banned for TLS 1.3 CertificateVerify
+/// — their presence in a handshake is a downgrade marker), `Ed448`,
+/// `EcdsaSecp521r1Sha512`, and PSS-with-PSS-key (`rsa_pss_pss_*` — the SPKI
+/// is `rsassaPss`, an algorithm family the X.509 layer rejects anyway).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tls13Scheme {
+    EcdsaSecp256r1Sha256,
+    EcdsaSecp384r1Sha384,
+    Ed25519,
+    RsaPssRsaeSha256,
+    RsaPssRsaeSha384,
+    RsaPssRsaeSha512,
+}
+
+impl Tls13Scheme {
+    /// Transcript-hash length this scheme is defined over (RFC 8446 §4.4.3:
+    /// the hash function is the one from the cipher suite / scheme).
+    pub fn hash_len(self) -> usize {
+        match self {
+            Tls13Scheme::EcdsaSecp256r1Sha256
+            | Tls13Scheme::RsaPssRsaeSha256
+            | Tls13Scheme::Ed25519 => 32,
+            Tls13Scheme::EcdsaSecp384r1Sha384 | Tls13Scheme::RsaPssRsaeSha384 => 48,
+            Tls13Scheme::RsaPssRsaeSha512 => 64,
+        }
+    }
+}
 
 /// Minimum RSA modulus we accept, in bits (NIST SP 800-57 / CA/B Forum).
 const RSA_MIN_MODULUS_BITS: usize = 2048;
@@ -129,6 +177,35 @@ pub fn verify_certificate_signature(
     Err(SigVerifyError::UnsupportedAlg)
 }
 
+/// Verify a TLS 1.3 `CertificateVerify` signature: dispatch on the
+/// negotiated [`Tls13Scheme`] and check `signature` over `message` (already
+/// built per RFC 8446 §4.4.3 by `net::tls_auth::certificate_verify_message`)
+/// with the authenticated LEAF key.
+pub fn verify_certificate_verify_signature(
+    scheme: Tls13Scheme,
+    message: &[u8],
+    signature: &[u8],
+    key: &SpkiKey<'_>,
+) -> Result<(), SigVerifyError> {
+    match scheme {
+        Tls13Scheme::EcdsaSecp256r1Sha256 => match key {
+            SpkiKey::EcP256 { point } => verify_ecdsa_p256(point, message, signature),
+            _ => Err(SigVerifyError::KeyTypeMismatch),
+        },
+        Tls13Scheme::EcdsaSecp384r1Sha384 => match key {
+            SpkiKey::EcP384 { point } => verify_ecdsa_p384(point, message, signature),
+            _ => Err(SigVerifyError::KeyTypeMismatch),
+        },
+        Tls13Scheme::Ed25519 => match key {
+            SpkiKey::Ed25519 { key: pk } => verify_ed25519(pk, message, signature),
+            _ => Err(SigVerifyError::KeyTypeMismatch),
+        },
+        Tls13Scheme::RsaPssRsaeSha256 => verify_rsa_pss::<Sha256>(message, signature, key),
+        Tls13Scheme::RsaPssRsaeSha384 => verify_rsa_pss::<Sha384>(message, signature, key),
+        Tls13Scheme::RsaPssRsaeSha512 => verify_rsa_pss::<Sha512>(message, signature, key),
+    }
+}
+
 /// Compare an OID against a known content-byte constant (`x509::oid_is`
 /// semantics: the decoded OID content of the AlgorithmIdentifier).
 fn oid_is(oid: &[u8], known: &[u8]) -> bool {
@@ -205,6 +282,41 @@ fn verify_ed25519(pk: &[u8], tbs: &[u8], signature: &[u8]) -> Result<(), SigVeri
     use signature::Verifier;
     verifying
         .verify(tbs, &sig)
+        .map_err(|_| SigVerifyError::VerifyFailed)
+}
+
+/// RSASSA-PSS verification for one digest width — the TLS 1.3
+/// `CertificateVerify` scheme for RSA keys (RFC 8446 §4.2.3). The scheme
+/// identifier fully determines the parameters (hash = the digest, salt
+/// length = hash length, trailer 0xBC), which is exactly what
+/// `rsa::pss::VerifyingKey::new` constructs — unlike the X.509 PSS OID, there
+/// are no peer-controlled parameters here (see the module docs).
+fn verify_rsa_pss<D>(
+    message: &[u8],
+    signature: &[u8],
+    key: &SpkiKey<'_>,
+) -> Result<(), SigVerifyError>
+where
+    D: Digest + sha2::digest::FixedOutputReset,
+{
+    let SpkiKey::Rsa { n, e } = key else {
+        return Err(SigVerifyError::KeyTypeMismatch);
+    };
+    // Same modulus floor as the PKCS1-v1_5 path: TLS does not make a weak
+    // key acceptable.
+    if modulus_bits(n) < RSA_MIN_MODULUS_BITS {
+        return Err(SigVerifyError::MalformedKey);
+    }
+    let modulus = rsa::BigUint::from_bytes_be(n);
+    let exponent = rsa::BigUint::from_bytes_be(e);
+    let public =
+        rsa::RsaPublicKey::new(modulus, exponent).map_err(|_| SigVerifyError::MalformedKey)?;
+    let verifying = rsa::pss::VerifyingKey::<D>::new(public);
+    let sig =
+        rsa::pss::Signature::try_from(signature).map_err(|_| SigVerifyError::MalformedSignature)?;
+    use rsa::signature::Verifier;
+    verifying
+        .verify(message, &sig)
         .map_err(|_| SigVerifyError::VerifyFailed)
 }
 
