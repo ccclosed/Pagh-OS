@@ -193,6 +193,15 @@ pub mod hostname;
 #[path = "../../src/net/tls_verify.rs"]
 pub mod tls_verify;
 
+// `tls_chain` is the trust-anchor + path-building layer (issue #14): it links
+// a server's certificate chain to a configured anchor by byte-equal
+// issuer/subject names, checks every signature, `cA=TRUE` on issuers and the
+// validity windows against a caller-provided clock, with a hard clock floor
+// (an unset RTC fails closed). Pure `core` + `alloc`; P47 builds synthetic
+// ECDSA chains on the host and drives accept + every fail-closed class.
+#[path = "../../src/net/tls_chain.rs"]
+pub mod tls_chain;
+
 // ---------------------------------------------------------------------------
 // Property-test modules (P1..P28)
 // ---------------------------------------------------------------------------
@@ -201,6 +210,10 @@ pub mod tls_verify;
 // They are `#[cfg(test)]` so they compile only under `cargo test`.
 #[cfg(test)]
 mod properties {
+    // Shared deterministic test RNG (XorShift-based, rand_core-compatible)
+    // extracted from P46; every later TLS property seeds its key generation
+    // from this one implementation.
+    mod det_rng;
     mod p01;
     mod p02;
     mod p03;
@@ -249,6 +262,7 @@ mod properties {
     mod p44;
     mod p45;
     mod p46;
+    mod p47;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the

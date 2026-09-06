@@ -37,6 +37,7 @@ pub mod ip;
 pub mod progress;
 pub mod tcp;
 pub mod tls;
+pub mod tls_chain;
 pub mod tls_verify;
 pub mod udp;
 pub mod wire;

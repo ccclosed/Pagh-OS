@@ -494,11 +494,16 @@ pub struct CertificateRef<'a> {
 
 /// Parse one `Certificate` at the start of `der`.
 ///
-/// Returns the parsed certificate (borrowing from `der`) and the bytes after
-/// the certificate element. The outer `signatureAlgorithm` is checked to be
-/// byte-identical to the TBS field (RFC 5280 §4.1.1.2) and the raw
-/// `signatureValue` bytes land in [`CertificateRef::signature`] — everything
-/// the chain verifier needs to check a certificate against its issuer's key.
+/// Returns the parsed certificate (borrowing from `der`) and the bytes AFTER
+/// the certificate element — so a buffer holding a TLS `Certificate`-message
+/// layout (leaf followed by intermediates) can be walked certificate by
+/// certificate. Any trailing bytes INSIDE the outer `Certificate` SEQUENCE
+/// (between `signatureValue` and the element end) are a hard reject: the
+/// certificate is either whole or it is not accepted. The outer
+/// `signatureAlgorithm` is checked to be byte-identical to the TBS field
+/// (RFC 5280 §4.1.1.2) and the raw `signatureValue` bytes land in
+/// [`CertificateRef::signature`] — everything the chain verifier needs to
+/// check a certificate against its issuer's key.
 pub fn parse_certificate(der: &[u8]) -> Result<(CertificateRef<'_>, &[u8]), DerError> {
     let (cert_content, rest) = der_expect(der, TAG_SEQUENCE)?;
     let (tbs_el, tail) = der_element(cert_content)?;
@@ -513,13 +518,19 @@ pub fn parse_certificate(der: &[u8]) -> Result<(CertificateRef<'_>, &[u8]), DerE
 
     let cert = parse_tbs(tbs_el, signature)?;
 
+    // The outer SEQUENCE must end right after signatureValue — trailing
+    // garbage inside the certificate element is a fail-closed reject.
+    if !tail.is_empty() {
+        return Err(DerError::BadCert);
+    }
+
     // RFC 5280 §4.1.1.2: the outer signatureAlgorithm MUST be identical to
     // the TBS field — compare the raw DER and fail closed on any divergence
     // (a cert whose two algorithm fields disagree is malformed or hostile).
     if outer_alg_el != cert.sig_alg_der {
         return Err(DerError::BadCert);
     }
-    Ok((cert, tail))
+    Ok((cert, rest))
 }
 
 /// Parse the `TBSCertificate` element (tag + header included — `tbs` is kept
