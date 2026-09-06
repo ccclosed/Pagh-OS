@@ -26,6 +26,7 @@ net-поток или bounded locked-step помпы); из IRQ-контекст
 | `hostname.rs` | RFC 6125 hostname/SAN-матчинг: wildcard только целым левым лейблом SAN (ровно один лейбл хоста), host-side `*` — всегда отказ, IP-литералы — по октетам |
 | `tls_verify.rs` | Диспетчер подписей сертификатов: RSASSA-PKCS1-v1_5 (SHA-256/384/512, мин. модуль 2048 бит), ECDSA P-256/P-384, Ed25519; RSA-PSS явно отклоняется. Крейты `rsa`/`p384`/`ed25519-dalek` (pure-Rust, vendored) |
 | `tls_chain.rs` | Trust anchors (raw DER Name + ключ) + построитель цепочки: leaf → intermediates → anchor по **байт-равенству** issuer/subject; подпись каждого звена через `tls_verify`; `cA=TRUE` обязателен у всех эмитентов (отсутствие basicConstraints — отказ); validity всех сертификатов; **clock gate**: `now < 2025-01-01` → `ChainError::Clock` (незаданный RTC = «не знаю который час» = отказ). Неудавшийся одноимённый intermediate не затеняет якоря (откат к anchor set всегда); при полном отказе возвращается **первая** ошибка name-match по порядку сообщения. `ChainError::{NoAnchor, IncompleteChain, Expired, NotYetValid, Clock, NotCa, Verify}` |
+| `ca_bundle.rs` | **Сгенерированный** (tools/gen_ca_bundle.py) trust-anchor бандл: метка + raw DER самоподписанных корней (ISRG Root X1/X2 — цепочки Let's Encrypt, которыми подписан deb.debian.org; GTS R1/R4 — CDN). Обновлять только перегенерацией, файл коммитится; P48 доказывает валидность каждого якоря kernel-парсером и диспетчером подписей |
 | `progress.rs` | Однострочный `\r`-прогресс загрузок |
 
 ## Ключевые символы

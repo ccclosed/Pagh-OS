@@ -29,6 +29,7 @@
 //! logs a warning and boot continues (R17.3).
 
 pub mod arp;
+pub mod ca_bundle;
 pub mod dns;
 pub mod hostname;
 pub mod http;

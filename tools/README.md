@@ -10,6 +10,7 @@
 | `limine.py` | Версионно-независимый локатор/установщик `BOOTX64.EFI`: ищет любой локальный `limine*/` (или `LIMINE_EFI`/`LIMINE_DIR`), иначе качает последний бинарный релиз Limine (`limine-binary.zip`) в `limine/`; путь на stdout, прогресс на stderr |
 | `host_tests.py` | Обёртка: определяет host triple через `rustc -vV`, запускает `cargo test --locked --target <host>` в `host-tests/` |
 | `check_safety.py` | CI-гейт unsafe-политики: сканирует `src/security/`, `src/arch/x86_64/linux/mod.rs`, `src/memory/vmm.rs`, `src/net/tls.rs`, `src/pkg/apt.rs` — каждый `unsafe {` обязан иметь `SAFETY:`-коммент в предыдущих 6 строках, иначе exit 1 |
+| `gen_ca_bundle.py` | Генератор trust-anchor бандла TLS-верификатора: скачивает curl/Mozilla CA extract, выбирает корни по subject CN (ISRG Root X1/X2, GTS R1/R4), пишет детерминированный `src/net/ca_bundle.rs` (DER-массивы + метки); сгенерированный файл коммитится, перегенерация — только осознанно |
 | `mini_repo.py` | Мини Debian-зеркало в `tools/mini_repo/` для apt-E2E |
 | `build-rust-app.sh` | Сборка userland-приложений (`rust-apps/`) под `x86_64-unknown-linux-musl` |
 | `e2e_local_mirror.ps1` | Детерминированный apt E2E: release-сборка c `--features lx_selftest`, stage, serve mini_repo, QEMU, assert serial-маркеров |
