@@ -202,6 +202,14 @@ pub mod tls_verify;
 #[path = "../../src/net/tls_chain.rs"]
 pub mod tls_chain;
 
+// `ca_bundle` is the GENERATED trust-anchor table (tools/gen_ca_bundle.py):
+// label + raw DER per committed root CA. Pure `core`, no deps — the host
+// tests include the exact same source the kernel compiles and (P48) prove
+// every anchor is a well-formed self-signed CA whose self-signature
+// verifies through the kernel's own parser + signature dispatcher.
+#[path = "../../src/net/ca_bundle.rs"]
+pub mod ca_bundle;
+
 // ---------------------------------------------------------------------------
 // Property-test modules (P1..P28)
 // ---------------------------------------------------------------------------
@@ -263,6 +271,7 @@ mod properties {
     mod p45;
     mod p46;
     mod p47;
+    mod p48;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the
