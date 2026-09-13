@@ -210,6 +210,14 @@ pub mod tls_chain;
 #[path = "../../src/net/ca_bundle.rs"]
 pub mod ca_bundle;
 
+// `tls_auth` is the one-shot server-authentication decision layer (issue #14):
+// chain validation + RFC 6125 hostname authorization over SAN entries + leaf
+// key export for the TLS 1.3 `CertificateVerify` step, plus the exact
+// RFC 8446 §4.4.3 message builder. Pure `core` + `alloc`; P49 drives it with
+// synthetic chains and real signatures generated on the host.
+#[path = "../../src/net/tls_auth.rs"]
+pub mod tls_auth;
+
 // ---------------------------------------------------------------------------
 // Property-test modules (P1..P28)
 // ---------------------------------------------------------------------------
@@ -222,6 +230,9 @@ mod properties {
     // extracted from P46; every later TLS property seeds its key generation
     // from this one implementation.
     mod det_rng;
+    // Shared DER chain-building helpers moved out of P47 (same reuse policy):
+    // P47+ build synthetic certificates through this one implementation.
+    mod chain_der;
     mod p01;
     mod p02;
     mod p03;
@@ -272,6 +283,7 @@ mod properties {
     mod p46;
     mod p47;
     mod p48;
+    mod p49;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the
