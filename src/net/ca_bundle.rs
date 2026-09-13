@@ -14,8 +14,6 @@
 //! key at verifier start-up. Pure `core` — also `#[path]`-included
 //! by the host tests (P48).
 
-#![allow(dead_code)] // consumed by the TlsVerifier in the next PR of the series.
-
 /// One trust anchor: label (subject CN) + raw DER of the root certificate.
 pub static CA_BUNDLE: &[(&str, &[u8])] = &[
     // sha256 96bcec06264976f37460779acf28c5a7cfe8a3c0aae11a8ffcee05c0bddf08c6

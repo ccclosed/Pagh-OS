@@ -43,8 +43,19 @@
 //! PKCS1-v1_5 with an RSA leaf therefore verifies its chain in PKCS1-v1_5 and
 //! its `CertificateVerify` in PSS — that combination is what real Debian
 //! mirrors serve.
-
-#![allow(dead_code)] // consumed by net::tls in this very PR; kept explicit.
+//!
+//! ## The two hashes of RFC 8446 §4.4.3
+//!
+//! The transcript hash in that message comes from the negotiated CIPHER SUITE
+//! (`Aes128GcmSha256` ⇒ SHA-256 ⇒ 32 bytes on this path), while the signature
+//! scheme only selects the digest the peer signs with. The two are NOT the same
+//! width in general — and RFC 8446 deliberately allows that:
+//! `ecdsa_secp384r1_sha384` means "a SHA-384 digest *of* the 32-byte transcript
+//! hash". [`verify_certificate_verify`] therefore takes the suite's hash length
+//! as an explicit parameter and gates the transcript hash on it alone; it never
+//! compares that hash against the scheme's digest width. Doing so was the bug:
+//! every P-384 / RSA-PSS-384 / RSA-PSS-512 leaf was refused as if its signature
+//! were bad, and three of the module's backends were unreachable.
 
 use alloc::vec::Vec;
 
@@ -53,21 +64,11 @@ use super::tls_chain::{verify_chain, ChainError, TrustAnchor};
 use super::tls_verify::{verify_certificate_verify_signature, SigVerifyError, TLS13_CTX_SERVER_CV};
 use super::x509::{find_extension, parse_certificate, san_names, SpkiKey, OID_EXT_SAN};
 
-// The scheme enum is defined in `tls_verify` next to the backends it
-// dispatches to; re-exported here so callers see one TLS-auth surface.
+// The scheme enum lives in `tls_verify`, next to the backends it dispatches to,
+// and is re-exported here so callers see one TLS-auth surface. There is
+// deliberately no second declaration (nor a second copy of its docs): the
+// accepted set must not be able to drift between the layers.
 pub use super::tls_verify::Tls13Scheme;
-
-/// The TLS 1.3 `CertificateVerify` signature schemes the verifier accepts
-/// (RFC 8446 §4.2.3). Own enum — the pure layer never imports embedded-tls
-/// types; the kernel call site maps the wire values 1:1.
-///
-/// Deliberately absent: `rsa_pkcs1_*` (banned for TLS 1.3 CertificateVerify —
-/// their presence in a handshake is a downgrade marker), `Ed448`,
-/// `EcdsaSecp521r1Sha512`, PSS-with-PSS-key (`rsa_pss_pss_*` — the SPKI is
-/// `rsassaPss`, an algorithm family the X.509 layer rejects anyway).
-//
-// Tls13Scheme itself is defined in tls_verify next to the backends it
-// dispatches to.
 
 /// The leaf certificate's public key, copied into owned memory.
 ///
@@ -270,16 +271,44 @@ pub fn certificate_verify_message(transcript_hash: &[u8]) -> Vec<u8> {
     msg
 }
 
-/// Verify the handshake's `CertificateVerify` against the authenticated
-/// leaf key: the transcript-hash length must match the negotiated scheme,
-/// and the signature must verify over the exact RFC 8446 §4.4.3 message.
+/// Verify the handshake's `CertificateVerify` against the authenticated leaf
+/// key.
+///
+/// * `scheme` — the scheme the peer announced in its `CertificateVerify`;
+/// * `cipher_suite_hash_len` — the hash width of the NEGOTIATED CIPHER SUITE
+///   (32 for this kernel's only suite, `Aes128GcmSha256`). This is the width
+///   `transcript_hash` must have: the transcript hash comes from the suite,
+///   not from the scheme (RFC 8446 §4.4.3, "the hash function is the one from
+///   the cipher suite"). Callers derive it from the suite they configured —
+///   see `net::tls`;
+/// * `transcript_hash` — the handshake transcript hash at the certificate;
+/// * `signature` — the raw `CertificateVerify` signature bytes;
+/// * `key` — the leaf key exported by [`authenticate_server`].
+///
+/// The scheme is NOT compared against the suite here: RFC 8446 lets a peer
+/// sign the suite's transcript hash with any advertised scheme, so
+/// `EcdsaSecp384r1Sha384` over a 32-byte SHA-256 transcript hash is verified
+/// (with a SHA-384 digest of those bytes), not rejected. Which schemes are
+/// acceptable at all is the kernel's decision (`net::tls::tls13_scheme`), and
+/// the signature backends enforce scheme/key agreement
+/// ([`SigVerifyError::KeyTypeMismatch`]) — one fail-closed path per concern.
+///
+/// Two fail-closed gates, in order, before the signature is checked: the
+/// transcript hash must have the negotiated suite's width (otherwise the
+/// caller handed us bytes the peer never signed — a structural refusal), and
+/// the signature must verify over the exact RFC 8446 §4.4.3 message. No path
+/// returns `Ok(())` without a successful signature check.
 pub fn verify_certificate_verify(
     scheme: Tls13Scheme,
+    cipher_suite_hash_len: usize,
     transcript_hash: &[u8],
     signature: &[u8],
     key: &LeafKey,
 ) -> Result<(), SigVerifyError> {
-    if transcript_hash.len() != scheme.hash_len() {
+    if transcript_hash.len() != cipher_suite_hash_len {
+        // Structural: hash of the wrong width for the suite that was
+        // negotiated. Fail rather than "verifying" over bytes the peer never
+        // signed; nothing is trusted on this path either way.
         return Err(SigVerifyError::MalformedSignature);
     }
     let msg = certificate_verify_message(transcript_hash);
@@ -304,19 +333,45 @@ mod tests {
         assert_eq!(&msg[98..], &hash[..]);
     }
 
-    /// A transcript hash of the wrong length for the scheme is rejected
+    /// The transcript hash is gated on the NEGOTIATED CIPHER SUITE's hash
+    /// width (32 here), never on the scheme's — the two are independent in
+    /// RFC 8446 §4.4.3. A hash of the wrong width for the suite is refused
     /// before any cryptography runs.
     #[test]
-    fn hash_length_gated_by_scheme() {
+    fn hash_length_gated_by_cipher_suite() {
         let key = LeafKey::Ed25519 { key: vec![0u8; 32] };
+        // Suite hash is 32; a 48-byte "transcript hash" cannot be one.
         assert_eq!(
-            verify_certificate_verify(
-                Tls13Scheme::Ed25519,
-                &[0u8; 48], // P-384-width hash for a SHA-256 scheme
-                &[0u8; 64],
-                &key,
-            ),
+            verify_certificate_verify(Tls13Scheme::Ed25519, 32, &[0u8; 48], &[0u8; 64], &key),
             Err(SigVerifyError::MalformedSignature)
+        );
+    }
+
+    /// A SHA-384/512-*scheme* is NOT refused for being wider than the
+    /// negotiated suite's SHA-256 hash: RFC 8446 signs the suite's transcript
+    /// hash with the scheme's digest, so such a leaf must reach the signature
+    /// check. What comes back here is the backend's verdict on the (bogus)
+    /// signature — never a scheme/width rejection, which is what made those
+    /// backends unreachable.
+    #[test]
+    fn wide_scheme_reaches_signature_check() {
+        let key = LeafKey::EcP384 {
+            point: vec![0u8; 97],
+        };
+        let err = verify_certificate_verify(
+            Tls13Scheme::EcdsaSecp384r1Sha384,
+            32, // Aes128GcmSha256 transcript hash
+            &[0u8; 32],
+            &[0u8; 104],
+            &key,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SigVerifyError::MalformedKey | SigVerifyError::MalformedSignature
+            ),
+            "wide scheme must reach the backend, got {err:?}"
         );
     }
 }

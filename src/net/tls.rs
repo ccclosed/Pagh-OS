@@ -14,10 +14,24 @@
 //!     ([`super::tls_chain::CLOCK_FLOOR`]);
 //!   * the handshake's `CertificateVerify` signature is checked against the
 //!     verified leaf key ([`super::tls_auth::verify_certificate_verify`]).
+//!     The transcript hash it signs is the CIPHER SUITE's hash
+//!     ([`CIPHER_SUITE_HASH_LEN`]); the signature scheme only picks the digest
+//!     the peer signed with, so SHA-384/512 schemes over this SHA-256 suite
+//!     stay verifiable instead of becoming dead backends.
 //!
 //! Any failure aborts the handshake — there is no fallback path that keeps
 //! the connection. The session RNG is backed by RDSEED/RDRAND and the
 //! connection likewise fails closed when hardware entropy is unavailable.
+//!
+//! ## Where the diagnostics are
+//!
+//! The verifier reports every rejection through `error!` under the stable
+//! marker `Package_Fetcher(tls): stage=verify cause=…` (`InvalidCertificate`,
+//! `InvalidSignatureScheme`, `InvalidSignature`). `embedded-tls`'s own
+//! handshake messages are `debug!`-level and do NOT reach the log: the facade
+//! defaults to `Info`, which filters `debug!`/`trace!` out. Those `error!`
+//! lines — not any embedded-tls output — are therefore the whole verifier
+//! diagnostic surface, and what the smoke/E2E assertions grep.
 //!
 //! ## How it is wired (kernel-only module)
 //!
@@ -49,6 +63,7 @@
 //! [`parse_http_head`](super::http::parse_http_head) for all wire formatting.
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::future::Future;
@@ -74,6 +89,27 @@ use crate::{error, warn};
 
 /// Default HTTPS port.
 pub const HTTPS_PORT: u16 = 443;
+
+/// Width of the handshake **transcript hash** the verifier consumes: the hash
+/// of the negotiated CIPHER SUITE, [`Aes128GcmSha256`] ⇒ SHA-256 ⇒ 32.
+///
+/// NOT the scheme's hash width (RFC 8446 §4.4.3): `ecdsa_secp384r1_sha384`
+/// signs a SHA-384 digest *of this 32-byte value*, so a SHA-384-scheme leaf is
+/// verifiable on this suite. Comparing the transcript hash against the scheme's
+/// width — the earlier bug — rejected every P-384 / RSA-PSS-384 leaf as
+/// `InvalidSignature` even though the signature was good.
+///
+/// The compile-time assertion below keeps this constant tied to the suite
+/// actually instantiated here, so swapping `Aes128GcmSha256` for a SHA-384
+/// suite cannot silently leave a stale width behind (`KernelVerifier` is
+/// generic over the suite via [`CryptoProvider::CipherSuite`], so such a swap
+/// would otherwise still compile).
+const CIPHER_SUITE_HASH_LEN: usize = 32;
+const _: () = assert!(
+    CIPHER_SUITE_HASH_LEN
+        == <<<Aes128GcmSha256 as embedded_tls::TlsCipherSuite>::Hash as sha2::digest::OutputSizeUser>::OutputSize as sha2::digest::typenum::Unsigned>::USIZE,
+    "CIPHER_SUITE_HASH_LEN must match the negotiated cipher suite's hash width"
+);
 
 /// Connect timeout (~3 s), matching `http_get`.
 const CONNECT_TIMEOUT_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(3_000);
@@ -135,9 +171,12 @@ impl rand_core::CryptoRng for KernelRng {}
 
 // ─────────────────── certificate verification (issue #14) ───────────────────
 
-/// Build the trust-anchor list from the committed CA bundle
+/// Parsed trust anchors, built once per boot (see [`bundle_anchors`]).
+static ANCHORS: spin::Mutex<Option<Arc<Vec<TrustAnchor<'static>>>>> = spin::Mutex::new(None);
+
+/// The configured trust-anchor list from the committed CA bundle
 /// ([`super::ca_bundle::CA_BUNDLE`], generated and pinned by
-/// `tools/gen_ca_bundle.py`).
+/// `tools/gen_ca_bundle.py`), parsed lazily and cached for the whole boot.
 ///
 /// Each root is parsed with the kernel's own X.509 parser (property P48
 /// proves every committed anchor parses and self-verifies). An anchor that
@@ -146,7 +185,19 @@ impl rand_core::CryptoRng for KernelRng {}
 /// would-be accept into a reject — exactly the fail-closed direction. The
 /// alternative (one rotted bundle entry disabling HTTPS entirely) buys no
 /// security.
-fn bundle_anchors() -> Vec<TrustAnchor<'static>> {
+///
+/// WHY CACHED: the bundle is ≈28 KiB of DER across four self-signed roots, and
+/// parsing it re-derives the subject `Name` and SPKI of every root on EVERY
+/// handshake. Parsing once per boot is enough — the bytes are `include!`-ed
+/// constants, and the anchors are immutable after construction. A poisoned or
+/// empty cache is never a bypass: the worst case is the fail-closed
+/// `ChainError::NoAnchor` reject below.
+fn bundle_anchors() -> Arc<Vec<TrustAnchor<'static>>> {
+    let mut cache = ANCHORS.lock();
+    if let Some(anchors) = cache.as_ref() {
+        return anchors.clone();
+    }
+
     let mut out = Vec::with_capacity(super::ca_bundle::CA_BUNDLE.len());
     for (label, der) in super::ca_bundle::CA_BUNDLE.iter() {
         match super::x509::parse_certificate(der) {
@@ -161,7 +212,23 @@ fn bundle_anchors() -> Vec<TrustAnchor<'static>> {
             ),
         }
     }
-    out
+
+    // An empty anchor set makes EVERY handshake fail with `ChainError::NoAnchor`
+    // — correct, but silent. Say why, once, at the moment it is discovered: the
+    // operator otherwise sees only per-handshake "chain: NoAnchor" rejects with
+    // no hint that no trust anchor was ever available (host property P48 catches
+    // this in CI, but only a log line catches it in QEMU).
+    if out.is_empty() {
+        warn!(
+            "net::tls: the committed CA bundle yielded no usable trust anchors — \
+             every HTTPS handshake will be refused (ChainError::NoAnchor); check \
+             net::ca_bundle / tools/gen_ca_bundle.py"
+        );
+    }
+
+    let anchors = Arc::new(out);
+    *cache = Some(anchors.clone());
+    anchors
 }
 
 /// `embedded-tls` verifier driving the pure decision layer
@@ -273,7 +340,14 @@ impl TlsVerifier<Aes128GcmSha256> for KernelVerifier {
             );
             TlsError::InvalidSignatureScheme
         })?;
-        verify_certificate_verify(scheme, hash, verify.signature, leaf_key).map_err(|e| {
+        verify_certificate_verify(
+            scheme,
+            CIPHER_SUITE_HASH_LEN,
+            hash,
+            verify.signature,
+            leaf_key,
+        )
+        .map_err(|e| {
             error!(
                 "Package_Fetcher(tls): stage=verify cause=InvalidSignature (CertificateVerify: {:?})",
                 e
@@ -284,8 +358,15 @@ impl TlsVerifier<Aes128GcmSha256> for KernelVerifier {
 }
 
 /// Map the negotiated TLS `SignatureScheme` onto the verifier's own enum.
-/// `None` for everything the pure layer does not implement — including
-/// `rsa_pkcs1_*` (banned in TLS 1.3) and PSS-with-PSS-key.
+///
+/// `None` for everything the pure layer does not implement — `rsa_pkcs1_*`
+/// (banned in TLS 1.3: their presence is a downgrade marker) and
+/// PSS-with-PSS-key (`rsa_pss_pss_*`, an SPKI family the X.509 layer rejects).
+/// Everything else stays REACHABLE, including the SHA-384/512 schemes: their
+/// signature digest is independent of the SHA-256 transcript hash this suite
+/// negotiates, so a P-384 or RSA-PSS-384/512 leaf verifies here instead of
+/// failing closed on a width check (`CIPHER_SUITE_HASH_LEN` explains that
+/// distinction).
 fn tls13_scheme(scheme: SignatureScheme) -> Option<Tls13Scheme> {
     match scheme {
         SignatureScheme::EcdsaSecp256r1Sha256 => Some(Tls13Scheme::EcdsaSecp256r1Sha256),
@@ -827,8 +908,15 @@ fn emit_tls_failure(err: &FetchError, host: &str, path: &str) {
             host, path
         ),
         FetchError::Tls(stage) => error!(
-            "Package_Fetcher(tls): stage=tls:{} host={} path={} cause=Tls (handshake/record failure; the server was not authenticated)",
+            "Package_Fetcher(tls): stage=tls:{} host={} path={} cause=Tls (handshake/record failure; no application data was exchanged)",
             stage, host, path
         ),
     }
 }
+
+// No `#[cfg(test)]` block here: this module is kernel-only (it needs
+// `embedded-tls` + the kernel's net stack) and is NOT `#[path]`-included by the
+// host test crate, so an in-module test would never be compiled or run. The
+// guard for [`CIPHER_SUITE_HASH_LEN`] is the `const` assertion next to it, which
+// the kernel build evaluates; the pure layers it feeds are property-tested in
+// `host-tests/src/properties/p49.rs`.

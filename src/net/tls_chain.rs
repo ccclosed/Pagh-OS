@@ -34,11 +34,9 @@
 //!     check.
 //!
 //! No kernel services, no RNG, no host calls: `now` is a parameter, so the
-//! kernel call site (later PR of the series) passes `rtc::now_unix() as i64`
-//! and the host property test P47 drives the exact same code with synthetic
-//! values.
-
-#![allow(dead_code)] // consumed by the TlsVerifier in the next PR of the series.
+//! kernel call site (`net::tls`, through `tls_auth::authenticate_server`) passes
+//! `rtc::now_unix() as i64` and the host property test P47 drives the exact same
+//! code with synthetic values.
 
 use alloc::vec;
 use alloc::vec::Vec;

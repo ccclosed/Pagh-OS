@@ -26,8 +26,6 @@
 //! accepted here — no PSL is carried in the kernel. Real CAs cannot issue
 //! such certificates, so this does not weaken the default-mirror trust path.
 
-#![allow(dead_code)] // consumed by the verifier later in the issue #14 series.
-
 use alloc::vec::Vec;
 
 /// Split a dotted name into labels; `None` when it carries an empty label

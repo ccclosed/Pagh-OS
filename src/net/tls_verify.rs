@@ -37,8 +37,24 @@
 //! a different decision from the PSS OID rejection above, which exists
 //! because inside X.509 the PSS parameters live in the certificate where a
 //! peer controls them.
-
-#![allow(dead_code)] // consumed by the chain verifier in the next PR of the series.
+//!
+//! Two DISTINCT hashes appear in that message (RFC 8446 §4.4.3), and
+//! conflating them is a bug this module's API is shaped to prevent:
+//!
+//!   * the **transcript hash** is computed with the hash of the negotiated
+//!     CIPHER SUITE — always 32 bytes (SHA-256) for the only suite this kernel
+//!     negotiates, `Aes128GcmSha256`;
+//!   * the **signature digest** is the one named by the signature SCHEME
+//!     (SHA-384 for `ecdsa_secp384r1_sha384`, …).
+//!
+//! They are independent: a P-384 server signs a SHA-384 digest *of* the
+//! 32-byte transcript hash, and RFC 8446 permits that combination. Gating the
+//! transcript hash on the scheme's own digest width therefore rejected every
+//! SHA-384/SHA-512-scheme leaf although the negotiated suite's hash was 32
+//! bytes. The width gate belongs to the suite alone:
+//! [`crate::net::tls_auth::verify_certificate_verify`] takes the negotiated
+//! suite's hash length as an explicit parameter and does not look at the
+//! scheme's width at all.
 
 use super::x509::SpkiKey;
 use sha2::{Digest, Sha256, Sha384, Sha512};
@@ -65,8 +81,20 @@ pub const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
 pub const TLS13_CTX_SERVER_CV: &[u8] = b"TLS 1.3, server CertificateVerify\0";
 
 /// The TLS 1.3 `CertificateVerify` signature schemes the verifier accepts
-/// (RFC 8446 §4.2.3). Own enum — the pure layers never import embedded-tls
-/// types; the kernel call site maps the wire values 1:1.
+/// (RFC 8446 §4.2.3).
+///
+/// Defined HERE, next to the backends it dispatches to, and re-exported by
+/// `net::tls_auth` (the single TLS-auth surface callers use) — there is no
+/// second declaration, so the accepted set cannot drift between layers. The
+/// pure layers never import embedded-tls types; the kernel call site
+/// (`net::tls::tls13_scheme`) maps the wire values 1:1.
+///
+/// Every variant names BOTH the key type and the digest signed with, and the
+/// digest is independent of the cipher suite's hash: `EcdsaSecp384r1Sha384`
+/// under an `Aes128GcmSha256` suite is a legal handshake, and the backend
+/// verifies exactly that (a SHA-384 ECDSA signature over the 32-byte suite
+/// transcript hash). There is consequently no separate "transcript width"
+/// method here — the only width that gates anything is the suite's.
 ///
 /// Deliberately absent: `rsa_pkcs1_*` (banned for TLS 1.3 CertificateVerify
 /// — their presence in a handshake is a downgrade marker), `Ed448`,
@@ -80,20 +108,6 @@ pub enum Tls13Scheme {
     RsaPssRsaeSha256,
     RsaPssRsaeSha384,
     RsaPssRsaeSha512,
-}
-
-impl Tls13Scheme {
-    /// Transcript-hash length this scheme is defined over (RFC 8446 §4.4.3:
-    /// the hash function is the one from the cipher suite / scheme).
-    pub fn hash_len(self) -> usize {
-        match self {
-            Tls13Scheme::EcdsaSecp256r1Sha256
-            | Tls13Scheme::RsaPssRsaeSha256
-            | Tls13Scheme::Ed25519 => 32,
-            Tls13Scheme::EcdsaSecp384r1Sha384 | Tls13Scheme::RsaPssRsaeSha384 => 48,
-            Tls13Scheme::RsaPssRsaeSha512 => 64,
-        }
-    }
 }
 
 /// Minimum RSA modulus we accept, in bits (NIST SP 800-57 / CA/B Forum).
