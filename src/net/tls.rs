@@ -1,31 +1,23 @@
-//! HTTPS over TLS 1.3 for the package manager — **VARIANT A: INSECURE**.
+//! HTTPS over TLS 1.3 for the package manager — **fail-closed server
+//! authentication** (issue #14).
 //!
-//! ┌─────────────────────────────────────────────────────────────────────────┐
-//! │  ⚠️  SECURITY WARNING — READ THIS BEFORE TRUSTING THIS TRANSPORT  ⚠️       │
-//! │                                                                           │
-//! │  This module establishes an ENCRYPTED but UNAUTHENTICATED TLS 1.3         │
-//! │  session. It performs **NO certificate verification whatsoever**:         │
-//! │    * the server certificate chain is NOT validated against any CA,        │
-//! │    * the hostname is NOT checked against the certificate,                 │
-//! │    * certificate expiry / revocation is NOT checked,                      │
-//! │    * the `CertificateVerify` signature is accepted blindly.               │
-//! │                                                                           │
-//! │  It is driven through `embedded_tls::UnsecureProvider` (the `NoVerify`    │
-//! │  path) ON PURPOSE, to get working encrypted transport now. Because the    │
-//! │  peer is never authenticated, the channel is trivially defeated by an     │
-//! │  active man-in-the-middle: an attacker who can intercept traffic can      │
-//! │  present any certificate and read/modify everything. Treat downloaded     │
-//! │  packages as UNTRUSTED.                                                    │
-//! │                                                                           │
-//! │  The session RNG is backed by RDSEED/RDRAND and the connection fails      │
-//! │  closed when hardware entropy is unavailable. This does not compensate    │
-//! │  for the missing peer authentication above.                               │
-//! │                                                                           │
-//! │  This is acceptable ONLY for this hobby-OS / QEMU demo. The module is     │
-//! │  deliberately structured (a pluggable verifier sits behind                │
-//! │  `UnsecureProvider`) so full chain/hostname/expiry verification can be    │
-//! │  added later without reworking the transport or executor.                 │
-//! └─────────────────────────────────────────────────────────────────────────┘
+//! Every handshake authenticates the peer before a single HTTP byte is sent:
+//!
+//!   * the server certificate chain is validated down to a committed trust
+//!     anchor ([`super::ca_bundle::CA_BUNDLE`]) — signatures, `cA=TRUE` on
+//!     every issuer, validity windows ([`super::tls_chain::verify_chain`]);
+//!   * the connection target is authorized against the leaf's SAN entries
+//!     (RFC 6125, DNS names and IP literals; no CN fallback)
+//!     ([`super::tls_auth::authenticate_server`]);
+//!   * the system clock is gated: an unset RTC (below 2025-01-01) refuses the
+//!     handshake rather than validating against a bogus "now"
+//!     ([`super::tls_chain::CLOCK_FLOOR`]);
+//!   * the handshake's `CertificateVerify` signature is checked against the
+//!     verified leaf key ([`super::tls_auth::verify_certificate_verify`]).
+//!
+//! Any failure aborts the handshake — there is no fallback path that keeps
+//! the connection. The session RNG is backed by RDSEED/RDRAND and the
+//! connection likewise fails closed when hardware entropy is unavailable.
 //!
 //! ## How it is wired (kernel-only module)
 //!
@@ -44,27 +36,38 @@
 //!   3. [`KernelRng`] — adapts the fail-closed hardware entropy API to the
 //!      `RngCore + CryptoRng` traits required by `embedded-tls`.
 //!
+//! [`KernelProvider`] supplies both that RNG and [`KernelVerifier`], the
+//! `embedded-tls` `TlsVerifier` implementation that adapts the handshake's
+//! borrowed certificate entries and negotiated signature scheme onto the pure
+//! decision layer in [`super::tls_auth`]. Because it always returns a
+//! verifier, `embedded-tls`'s "no verifier ⇒ skip verification" path can
+//! never be taken.
+//!
 //! [`https_get`] ties them together: resolve → connect → handshake → HTTP GET →
 //! collect the `Content-Length` body, reusing the pure
 //! [`build_get_request`](super::http::build_get_request) /
 //! [`parse_http_head`](super::http::parse_http_head) for all wire formatting.
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::pin;
-use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use embedded_io::ErrorKind;
 use embedded_tls::{
-    Aes128GcmSha256, TlsConfig, TlsConnection, TlsContext, TlsError, UnsecureProvider,
+    Aes128GcmSha256, CertificateEntryRef, CertificateRef, CertificateVerifyRef, CryptoProvider,
+    SignatureScheme, TlsConfig, TlsConnection, TlsContext, TlsError, TlsVerifier,
 };
 
 use crate::net::{IpEndpoint, SocketHandle};
 
 use super::http::{build_get_request, parse_http_head, HeadParse};
 use super::http_fetch::FetchError;
+use super::tls_auth::{authenticate_server, verify_certificate_verify, AuthError, LeafKey};
+use super::tls_chain::TrustAnchor;
+use super::tls_verify::Tls13Scheme;
 use super::NET;
 use crate::task::scheduler;
 use crate::{error, warn};
@@ -93,20 +96,6 @@ const TLS_RX_BYTES: usize = 256 * 1024;
 const TLS_TX_BYTES: usize = 16 * 1024;
 /// Upper bound on the decrypted HTTP response we will buffer.
 const MAX_TOTAL: usize = 32 * 1024 * 1024;
-
-/// One-time "no certificate verification" warning latch.
-static WARNED_NOVERIFY: AtomicBool = AtomicBool::new(false);
-
-/// Emit the insecure-transport warning exactly once per boot.
-fn warn_insecure_once() {
-    if !WARNED_NOVERIFY.swap(true, Ordering::Relaxed) {
-        warn!(
-            "net::tls: HTTPS is INSECURE — TLS 1.3 certificate verification is NOT implemented \
-             (no chain/hostname/expiry checks). The channel is encrypted but UNAUTHENTICATED and \
-             can be man-in-the-middled. Downloaded data is UNTRUSTED. (VARIANT A)"
-        );
-    }
-}
 
 // ───────────────────── hardware-backed TLS RNG ─────────────────────
 
@@ -143,6 +132,231 @@ impl rand_core::RngCore for KernelRng {
 }
 
 impl rand_core::CryptoRng for KernelRng {}
+
+// ─────────────────── certificate verification (issue #14) ───────────────────
+
+/// Build the trust-anchor list from the committed CA bundle
+/// ([`super::ca_bundle::CA_BUNDLE`], generated and pinned by
+/// `tools/gen_ca_bundle.py`).
+///
+/// Each root is parsed with the kernel's own X.509 parser (property P48
+/// proves every committed anchor parses and self-verifies). An anchor that
+/// fails to parse is SKIPPED with a diagnostic rather than aborting the
+/// whole handshake: skipping narrows the trust set, which can only turn a
+/// would-be accept into a reject — exactly the fail-closed direction. The
+/// alternative (one rotted bundle entry disabling HTTPS entirely) buys no
+/// security.
+fn bundle_anchors() -> Vec<TrustAnchor<'static>> {
+    let mut out = Vec::with_capacity(super::ca_bundle::CA_BUNDLE.len());
+    for (label, der) in super::ca_bundle::CA_BUNDLE.iter() {
+        match super::x509::parse_certificate(der) {
+            Ok((cert, rest)) if rest.is_empty() => out.push(TrustAnchor {
+                subject: cert.subject,
+                key: cert.spki.key,
+            }),
+            _ => error!(
+                "net::tls: trust anchor {:?} in the CA bundle does not parse; skipping it \
+                 (the bundle needs regeneration)",
+                label
+            ),
+        }
+    }
+    out
+}
+
+/// `embedded-tls` verifier driving the pure decision layer
+/// ([`super::tls_auth`]) from the handshake.
+///
+/// State is owned, not borrowed: the certificate entries arrive as borrows of
+/// the handshake's record buffers, so the leaf key and the transcript hash are
+/// copied at `verify_certificate` time and used by `verify_signature` in the
+/// same handshake. A verifier that was never given a certificate cannot
+/// verify a signature ([`TlsError::InvalidCertificate`]), so the ordering
+/// "certificate first, then CertificateVerify" is enforced, not assumed.
+/// Counts completed server authentications, process-wide.
+///
+/// [`KernelVerifier::verify_certificate`] increments it only after the full
+/// decision (chain → committed CA bundle, SAN hostname, validity + clock gate)
+/// succeeded. [`https_get`] snapshots it before the handshake and requires the
+/// value to have advanced before it will send a single application byte.
+///
+/// WHY THIS EXISTS ON TOP OF THE HANDSHAKE STATE MACHINE: a TLS 1.3 client must
+/// reject a server `Finished` that was not preceded by `Certificate` and
+/// `CertificateVerify` (RFC 8446 §4.4.2.4). `vendor/embedded-tls` did not
+/// enforce that, so a peer could omit both messages, still reach
+/// `ApplicationData`, and never invoke this verifier at all — the whole
+/// fail-closed story silently bypassed. The vendored state machine is patched
+/// to enforce it (`connection.rs`, `process_server_verify`, `certificate_received`
+/// / `certificate_verified`), and this counter is the belt to that braces: it
+/// makes "the handshake completed" and "a certificate was actually verified"
+/// two separately checked facts at the kernel call site, so a future vendored
+/// bump or a `vendor/` refresh cannot quietly restore the fail-open path.
+static VERIFIED_HANDSHAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`VERIFIED_HANDSHAKES`], taken before a handshake starts.
+fn verified_handshakes() -> u64 {
+    VERIFIED_HANDSHAKES.load(core::sync::atomic::Ordering::Acquire)
+}
+
+#[derive(Default)]
+struct KernelVerifier {
+    /// Connection target from `TlsConfig::server_name` — always set by
+    /// [`https_get`]; `None` would fail closed inside `tls_auth`.
+    host: Option<String>,
+    /// Verified leaf key, set by `verify_certificate`.
+    leaf_key: Option<LeafKey>,
+    /// Handshake transcript hash at certificate time (the RFC 8446 §4.4.3
+    /// signed message covers the transcript up to the certificate).
+    transcript: Option<Vec<u8>>,
+}
+
+impl KernelVerifier {
+    fn new() -> Self {
+        KernelVerifier::default()
+    }
+}
+
+impl TlsVerifier<Aes128GcmSha256> for KernelVerifier {
+    fn set_hostname_verification(&mut self, hostname: &str) -> Result<(), TlsError> {
+        self.host = Some(String::from(hostname));
+        Ok(())
+    }
+
+    fn verify_certificate(
+        &mut self,
+        transcript: &<Aes128GcmSha256 as embedded_tls::TlsCipherSuite>::Hash,
+        cert: CertificateRef,
+    ) -> Result<(), TlsError> {
+        // Collect the raw DER of every entry. A non-X.509 entry (raw public
+        // key) is outside the authenticated surface — reject rather than
+        // skip it, since the peer would otherwise choose which entries count.
+        let mut entries: Vec<&[u8]> = Vec::with_capacity(cert.entries.len());
+        for entry in cert.entries.iter() {
+            match entry {
+                CertificateEntryRef::X509(der) => entries.push(der),
+                CertificateEntryRef::RawPublicKey(_) => {
+                    error!(
+                        "Package_Fetcher(tls): stage=verify cause=InvalidCertificate \
+                         (raw public key entry is not supported)"
+                    );
+                    return Err(TlsError::InvalidCertificate);
+                }
+            }
+        }
+
+        let anchors = bundle_anchors();
+        let now = crate::arch::x86_64::linux::rtc::now_unix() as i64;
+        match authenticate_server(&entries, self.host.as_deref(), &anchors, now) {
+            Ok(auth) => {
+                self.leaf_key = Some(auth.leaf_key);
+                use sha2::Digest;
+                self.transcript = Some(transcript.clone().finalize().to_vec());
+                // The chain/SAN/clock decision passed for THIS connection's
+                // leaf: record it so `https_get` can tell "handshake completed
+                // with a verified server" from "handshake completed".
+                VERIFIED_HANDSHAKES.fetch_add(1, core::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+            Err(e) => {
+                // One structured diagnostic per failure class: the chain
+                // reason is what an operator needs to tell "mirror is
+                // broken" from "clock is unset" from "wrong hostname".
+                match e {
+                    AuthError::Chain(c) => error!(
+                        "Package_Fetcher(tls): stage=verify cause=InvalidCertificate (chain: {:?})",
+                        c
+                    ),
+                    AuthError::NoHostname => error!(
+                        "Package_Fetcher(tls): stage=verify cause=InvalidCertificate \
+                         (no hostname configured for the connection)"
+                    ),
+                    AuthError::HostnameMismatch => error!(
+                        "Package_Fetcher(tls): stage=verify cause=InvalidCertificate \
+                         (certificate does not authorize the connection host)"
+                    ),
+                    AuthError::UnsupportedLeafKey => error!(
+                        "Package_Fetcher(tls): stage=verify cause=InvalidCertificate \
+                         (leaf public key algorithm is not supported)"
+                    ),
+                }
+                Err(TlsError::InvalidCertificate)
+            }
+        }
+    }
+
+    fn verify_signature(&mut self, verify: CertificateVerifyRef) -> Result<(), TlsError> {
+        // Both facts must come from THIS handshake's verified certificate.
+        let leaf_key = match self.leaf_key.as_ref() {
+            Some(k) => k,
+            None => return Err(TlsError::InvalidCertificate),
+        };
+        let hash = match self.transcript.as_ref() {
+            Some(h) => h,
+            None => return Err(TlsError::InvalidCertificate),
+        };
+        let scheme = tls13_scheme(verify.signature_scheme).ok_or_else(|| {
+            error!(
+                "Package_Fetcher(tls): stage=verify cause=InvalidSignatureScheme \
+                 ({:?} is not accepted for TLS 1.3 CertificateVerify)",
+                verify.signature_scheme
+            );
+            TlsError::InvalidSignatureScheme
+        })?;
+        verify_certificate_verify(scheme, hash, verify.signature, leaf_key).map_err(|e| {
+            error!(
+                "Package_Fetcher(tls): stage=verify cause=InvalidSignature (CertificateVerify: {:?})",
+                e
+            );
+            TlsError::InvalidSignature
+        })
+    }
+}
+
+/// Map the negotiated TLS `SignatureScheme` onto the verifier's own enum.
+/// `None` for everything the pure layer does not implement — including
+/// `rsa_pkcs1_*` (banned in TLS 1.3) and PSS-with-PSS-key.
+fn tls13_scheme(scheme: SignatureScheme) -> Option<Tls13Scheme> {
+    match scheme {
+        SignatureScheme::EcdsaSecp256r1Sha256 => Some(Tls13Scheme::EcdsaSecp256r1Sha256),
+        SignatureScheme::EcdsaSecp384r1Sha384 => Some(Tls13Scheme::EcdsaSecp384r1Sha384),
+        SignatureScheme::Ed25519 => Some(Tls13Scheme::Ed25519),
+        SignatureScheme::RsaPssRsaeSha256 => Some(Tls13Scheme::RsaPssRsaeSha256),
+        SignatureScheme::RsaPssRsaeSha384 => Some(Tls13Scheme::RsaPssRsaeSha384),
+        SignatureScheme::RsaPssRsaeSha512 => Some(Tls13Scheme::RsaPssRsaeSha512),
+        _ => None,
+    }
+}
+
+/// The `embedded-tls` crypto provider: hardware entropy + the fail-closed
+/// verifier. `verifier()` always returns `Ok`, so `embedded-tls`'s
+/// "no verifier ⇒ skip certificate and signature verification" branch cannot
+/// be reached on this path.
+struct KernelProvider {
+    rng: KernelRng,
+    verifier: KernelVerifier,
+}
+
+impl KernelProvider {
+    fn new() -> Self {
+        KernelProvider {
+            rng: KernelRng::new(),
+            verifier: KernelVerifier::new(),
+        }
+    }
+}
+
+impl CryptoProvider for KernelProvider {
+    type CipherSuite = Aes128GcmSha256;
+    type Signature = p256::ecdsa::DerSignature;
+
+    fn rng(&mut self) -> impl rand_core::CryptoRngCore {
+        &mut self.rng
+    }
+
+    fn verifier(&mut self) -> Result<&mut impl TlsVerifier<Self::CipherSuite>, TlsError> {
+        Ok(&mut self.verifier)
+    }
+}
 
 // ─────────────────────────── minimal executor ───────────────────────────
 
@@ -352,10 +566,12 @@ impl embedded_io_async::Write for TlsTransport {
 /// Perform one HTTPS (TLS 1.3) `GET` of `https://host:port/path` and return the
 /// `Content-Length`-sized response body.
 ///
-/// **INSECURE (VARIANT A):** the TLS session is encrypted but the server is NOT
-/// authenticated — no certificate chain, hostname, or expiry verification is
-/// performed (see the module-level warning). A one-time runtime warning is logged
-/// on first use. The default `port` for HTTPS is [`HTTPS_PORT`] (443).
+/// **Authenticated:** the handshake fails unless the server's certificate
+/// chain validates against the committed CA bundle, authorizes `host` through
+/// its SAN entries, and proves possession of the leaf key with a valid TLS 1.3
+/// `CertificateVerify` — with the clock gate applied (an unset RTC refuses the
+/// connection; see the module docs). The default `port` for HTTPS is
+/// [`HTTPS_PORT`] (443).
 ///
 /// Mirrors [`http_get`](super::http_fetch::http_get): `host` may be a dotted-quad
 /// IPv4 literal or a hostname (resolved via [`resolve`](super::resolve)); the
@@ -363,7 +579,6 @@ impl embedded_io_async::Write for TlsTransport {
 /// parsed with the shared pure [`parse_http_head`]. On any failure the socket is
 /// released and exactly one structured diagnostic is emitted.
 pub fn https_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchError> {
-    warn_insecure_once();
     if !crate::security::entropy::is_available() {
         error!("Package_Fetcher(tls): stage=entropy host={} path={} cause=Tls (secure hardware entropy unavailable)", host, path);
         return Err(FetchError::Tls("entropy"));
@@ -418,13 +633,31 @@ pub fn https_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchErro
     let mut tls: TlsConnection<TlsTransport, Aes128GcmSha256> =
         TlsConnection::new(transport, &mut read_buf[..], &mut write_buf[..]);
 
+    // Snapshot the authentication counter BEFORE the handshake: `open()`
+    // returning `Ok` is not by itself proof that a server certificate was
+    // verified, so the counter must advance (see `VERIFIED_HANDSHAKES`).
+    let auth_before = verified_handshakes();
+
     let result = block_on(async {
-        // Handshake (NoVerify path — server NOT authenticated).
-        let context = TlsContext::new(
-            &config,
-            UnsecureProvider::new::<Aes128GcmSha256>(KernelRng::new()),
-        );
+        // Handshake — server authenticated (chain + hostname + clock +
+        // CertificateVerify) through `KernelProvider::verifier`.
+        let context = TlsContext::new(&config, KernelProvider::new());
         tls.open(context).await.map_err(map_tls_err("handshake"))?;
+
+        // The handshake completed. Belt to the state machine's braces: refuse
+        // to move any application byte unless a certificate was actually
+        // verified for THIS handshake. A peer that omits `Certificate` and
+        // `CertificateVerify` (which the TLS 1.3 state machine must reject, and
+        // now does) would land here with the verifier never invoked.
+        if verified_handshakes() == auth_before {
+            error!(
+                "Package_Fetcher(tls): stage=verify host={} path={} cause=InvalidCertificate \
+                 (handshake completed without a verified server certificate — refusing to \
+                 continue)",
+                host, path
+            );
+            return Err(FetchError::Tls("unverified"));
+        }
 
         // Send the HTTP/1.1 GET through the encrypted channel.
         let req = build_get_request(host, path);
@@ -643,7 +876,7 @@ fn emit_tls_failure(err: &FetchError, host: &str, path: &str) {
             host, path
         ),
         FetchError::Tls(stage) => error!(
-            "Package_Fetcher(tls): stage=tls:{} host={} path={} cause=Tls (handshake/record failure; INSECURE: no cert verification)",
+            "Package_Fetcher(tls): stage=tls:{} host={} path={} cause=Tls (handshake/record failure; the server was not authenticated)",
             stage, host, path
         ),
     }

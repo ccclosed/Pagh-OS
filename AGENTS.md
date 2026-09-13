@@ -57,6 +57,16 @@ release into `limine/`) — do not hard-code Limine versions in scripts.
   no_std build breaks. `vendor/**` is `-text` in `.gitattributes` (checksums
   are byte-sensitive); never re-save vendored files with converted line
   endings.
+  - **One deliberate local patch: `vendor/embedded-tls/src/connection.rs`.**
+    Upstream reached `ApplicationData` even when the server never sent
+    `Certificate`/`CertificateVerify`, so a peer (or an active MITM
+    terminating the key exchange itself) could skip the verifier entirely.
+    `Handshake` now carries `certificate_received`/`certificate_verified` and
+    `Finished` is refused unless both are set (PSK handshakes excepted). If you
+    ever refresh that crate, re-apply this and update the entry for
+    `src/connection.rs` in `vendor/embedded-tls/.cargo-checksum.json` — cargo
+    fails the build otherwise. `src/net/tls.rs::VERIFIED_HANDSHAKES` is the
+    kernel-side belt to that braces.
 
 ## Hard invariants (breaking these looks like "hardware" bugs)
 
@@ -81,9 +91,12 @@ release into `limine/`) — do not hard-code Limine versions in scripts.
 4. **Never hold `COMPAT_STATES` (compat registry) across blocking work** —
    extract what you need under the lock, release, do the blocking I/O,
    re-acquire to commit (see the pattern in `io_sys.rs`).
-5. **`ticks()` advances only with interrupts enabled.** Blocking syscall
-   handlers re-enable IF first (`linux_dispatch` does); a `hlt`-based sleep
-   with IF masked sleeps forever.
+5. **`ticks()` advances only with interrupts enabled.** A real syscall enters
+   with IF masked (SFMASK / interrupt gate) and `linux_dispatch` unmasks it for
+   the handler's duration — but only when the caller passes a non-zero
+   `reentry_allowed`, which the two entry stubs do and the boot-time selftest
+   (a direct call on the non-schedulable boot thread) must not. A `hlt`-based
+   sleep with IF masked sleeps forever.
 6. **`create_user_process` / spawn paths run `without_interrupts`** — a
    timer tick observing a half-built CR3 corrupts scheduling.
 7. **Boot order in `boot.rs` is fragile**: `enable_sse()` is first (x86-interrupt
@@ -95,8 +108,11 @@ release into `limine/`) — do not hard-code Limine versions in scripts.
    print `LXSELFTEST <name> PASS/FAIL` and return.
 9. **Feature gates**: `default = ["network_packages"]` enables apt; the
    `lx_selftest` / `lx_livetest` / `lx_bigindex` harnesses must stay
-   compiled-out (and boot-unchanged) when unset. TLS is deliberately
-   NoVerify (VARIANT A) — encrypted, unauthenticated; see `SECURITY.md`.
+   compiled-out (and boot-unchanged) when unset. TLS is fail-closed: the
+   handshake aborts unless the chain validates against the committed CA
+   bundle, the SAN authorizes the host, the clock gate passes, and the
+   `CertificateVerify` signature checks out; repository metadata signatures
+   are still unverified — see `SECURITY.md`.
 10. **Unsafe policy**: every `unsafe {` in `src/security/`,
     `arch/x86_64/linux/mod.rs`, `memory/vmm.rs`, `net/tls.rs`, `pkg/apt.rs`
     needs a `SAFETY:` comment within the previous 6 lines

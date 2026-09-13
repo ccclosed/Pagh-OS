@@ -21,7 +21,7 @@ net-поток или bounded locked-step помпы); из IRQ-контекст
 | `dns.rs` | Чистый билдер DNS-запросов + парсер A/AAAA (hardened, panic-free) |
 | `http.rs` | Чистый билдер HTTP/1.1 GET + парсер головы ответа (`HeadParse`) |
 | `http_fetch.rs` | Эффектный HTTP GET поверх стека для пакетного фетчера (`http_get`, `fetch_deb`) |
-| `tls.rs` | HTTPS через `embedded-tls` (TLS 1.3) поверх стека: `TlsTransport`, мини-`block_on`, `KernelRng`. **VARIANT A: без проверки сертификатов** |
+| `tls.rs` | HTTPS через `embedded-tls` (TLS 1.3) поверх стека: `TlsTransport`, мини-`block_on`, `KernelRng`, `KernelProvider`/`KernelVerifier` — handshake-адаптер к `tls_auth`. **Fail-closed**: без валидной цепочки до CA-бандла, SAN-авторизации хоста, пройденного clock gate и корректного `CertificateVerify` handshake обрывается (у `embedded-tls` ветка «нет верификатора ⇒ пропустить проверку» недостижима — `verifier()` всегда `Ok`) |
 | `x509.rs` | Чистый строгий DER-ридер + минимальный X.509-парсер для верификатора: `parse_certificate` (TBS целиком как вход подписи, SPKI, SAN, basicConstraints, validity в **i64**), байты `signatureValue` + enforce «внешний AlgorithmIdentifier == TBS» (RFC 5280 §4.1.1.2) |
 | `hostname.rs` | RFC 6125 hostname/SAN-матчинг: wildcard только целым левым лейблом SAN (ровно один лейбл хоста), host-side `*` — всегда отказ, IP-литералы — по октетам |
 | `tls_verify.rs` | Диспетчер подписей сертификатов: RSASSA-PKCS1-v1_5 (SHA-256/384/512, мин. модуль 2048 бит), ECDSA P-256/P-384, Ed25519; RSA-PSS явно отклоняется. Крейты `rsa`/`p384`/`ed25519-dalek` (pure-Rust, vendored) |
@@ -99,7 +99,7 @@ ARP/NDP lookup; не резолвится → парковка кадра + rate
 
 ## Грабли и безопасность
 
-- **TLS — VARIANT A**: TLS 1.3 БЕЗ проверки цепочки/hostname/expiry (`UnsecureProvider`).
+- **TLS**: аутентификация сервера включена (цепочка → CA-бандл, SAN-hostname, validity + clock gate, `CertificateVerify`). Не проверяются: подписи метаданных Debian (OpenPGP) и полнота digest-проверки пакетов; HTTP-зеркала (`apt setmirror http://…`) неаутентифицированы по построению.
   Шифровано, но MITM-аемо. Огромный баннер в доке модуля + разовый runtime `warn!`.
   RNG (`KernelRng` над RDSEED/RDRAND) fail-closed.
 - ARP-обучение ограничено: unsolicited-ответы и чужие запросы кэш не наполняют.

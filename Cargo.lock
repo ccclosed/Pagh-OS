@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "pagh"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "acpi",
  "bitflags 2.13.0",

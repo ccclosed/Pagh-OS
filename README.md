@@ -67,7 +67,7 @@ bar (OS name, current directory, uptime, live mouse position).
 ### `apt update` over HTTPS
 
 The by-name package manager fetching the Debian `Packages` index over TLS 1.3, with the
-honest INSECURE warnings (VARIANT A: encrypted but unauthenticated).
+server certificate chain, hostname and validity checked before a byte of the index is read.
 
 ![pagh apt update](docs/apt.png)
 
@@ -443,10 +443,14 @@ python
   that require `/proc/stat`/`/proc/meminfo` (e.g. `htop`) remain out of reach. Signal
   delivery is real at the syscall-return point (see above); asynchronous delivery
   from the timer-tick return path is not yet wired. See `LINUX-USERLAND.md` for the exact status.
-- **Transport.** Downloads use HTTP or HTTPS. HTTPS is **VARIANT A**: TLS 1.3 encrypted but
-  **unauthenticated** (no certificate chain/hostname/expiry checks),
-  and package data is not signature-verified — acceptable only for this hobby/QEMU demo.
-  Treat downloaded data as untrusted.
+- **Transport.** Downloads use HTTP or HTTPS. HTTPS authenticates the peer: the server
+  certificate chain is validated against the committed CA bundle, the hostname against the
+  leaf SAN entries, validity windows are enforced (with a hard clock gate — an unset RTC
+  refuses the handshake), and the `CertificateVerify` signature is checked against the leaf
+  key. What is still missing is repository-side trust: Debian metadata signatures and
+  complete per-package digest verification. Plain-HTTP mirrors (`apt setmirror http://…`)
+  remain unauthenticated by construction, and live `apt update` currently uses HTTP because
+  of the embedded-tls large-stream hang (issue #19).
 - **Scale.** The full Debian `main` index (~60k packages, ~150 MiB decompressed) is streamed
   and parsed into a compact in-RAM byte-arena index (kept in RAM only, rebuilt per boot).
   End-to-end install is proven against a local mirror; a live full `apt update` from
@@ -544,7 +548,7 @@ src/
 │   ├── http.rs         # pure HTTP/1.1 GET builder + response-head parser
 │   ├── http_fetch.rs   # effectful HTTP fetch pump (Package_Fetcher) over a TCP socket
 │   ├── progress.rs     # download/decompress progress reporting (fb-mirror aware)
-│   └── tls.rs          # HTTPS via TLS 1.3 (embedded-tls; VARIANT A — no cert verification)
+│   └── tls.rs          # HTTPS via TLS 1.3 (embedded-tls; fail-closed cert verification)
 ├── pkg/
 │   ├── mod.rs          # package-manager plumbing
 │   ├── apt.rs          # by-name apt front end: update / install / show / list / setmirror
@@ -615,8 +619,10 @@ comments.
   Reno congestion control with fast retransmit). A dedicated kernel thread runs the
   poll loop; addressing is DHCPv4 with a static fallback. Outbound package
   fetches add a pure DNS resolver, a pure HTTP/1.1 client, and an HTTPS path over TLS 1.3
-  (`embedded-tls`) — the TLS path is **VARIANT A: encrypted but unauthenticated** (no
-  certificate verification). The development build enables it through the default `network_packages` feature; use `--no-default-features` for a fail-closed build.
+  (`embedded-tls`) — the TLS path verifies the server certificate chain against the
+  committed CA bundle, matches the hostname against SAN entries, enforces validity with a
+  clock gate, and checks the handshake `CertificateVerify` signature; a failure aborts the
+  handshake. The development build enables the transport through the default `network_packages` feature; use `--no-default-features` for a build with no outbound package transport at all.
 - **Shell.** The interactive loop is the only place that touches the keyboard, console,
   and VFS; all the interesting logic (path normalization, the line-editor model, history,
   completion, the scancode decoder, edit distance) is pure and property-tested. A single
@@ -735,7 +741,7 @@ These are required and preserved across the codebase:
 - [`good_memory_allocator`](https://crates.io/crates/good_memory_allocator) — kernel heap (galloc; size-binned, ~O(1) alloc/free).
 - [`virtio-drivers`](https://crates.io/crates/virtio-drivers) — virtio-blk storage.
 - The TCP/IP stack and the e1000 driver are the kernel's own code (`src/net`, `src/drivers/e1000.rs`).
-- [`embedded-tls`](https://crates.io/crates/embedded-tls) — TLS 1.3 client for HTTPS (VARIANT A).
+- [`embedded-tls`](https://crates.io/crates/embedded-tls) — TLS 1.3 client for HTTPS (driven through the kernel's own fail-closed verifier).
 - [`miniz_oxide`](https://crates.io/crates/miniz_oxide) / [`xz4rust`](https://crates.io/crates/xz4rust) / [`ruzstd`](https://crates.io/crates/ruzstd) — gzip / xz / zstd decompression for `.deb`s and the package index.
 - [`proptest`](https://crates.io/crates/proptest) — host-side property tests (dev-dependency; `host-tests/`).
 
