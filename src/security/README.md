@@ -27,8 +27,8 @@ CPUID-проба возможностей; `rdseed_word`/`rdrand_word` — `#[ta
 ## Зависимости
 
 - **От:** только `core::arch::x86_64`.
-- **На неё:** `net::tls::rs` (`KernelRng` — адаптер к `rand_core::RngCore + CryptoRng`
-  для embedded-tls: ключи TLS-сессий отсюда).
+- **На неё:** `net::tls::KernelRng` — адаптер к `rand_core::RngCore + CryptoRng`
+  для embedded-tls: ключи TLS-сессий отсюда.
 
 ## Замечания
 

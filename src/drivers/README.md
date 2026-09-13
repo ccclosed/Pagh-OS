@@ -9,17 +9,17 @@ framebuffer-консоль, VT-эмулятор, курсор, serial. Коор�
 |---|---|
 | `mod.rs` | Device manager: трейты `Console`/`CharacterDevice`/`BlockDevice`, реестр `DeviceManager` (`register_char/register_block/get_char/get_block`), boot-`init()` (kbd → framebuffer → mouse) |
 | `pci/mod.rs` | Legacy PCI config-space через порты 0xCF8/0xCFC; `enumerate()` по всем 256 шинам; `enable_bus_master`; узнаёт virtio (0x1AF4) и Intel (0x8086) |
-| `e1000.rs` | Intel 8254x NIC — поллинг, без IRQ; MMIO-регистры, EEPROM MAC, легаси 16-слотовые TX/RX-кольца |
+| `e1000.rs` | Intel 8254x NIC — поллинг, без IRQ; MMIO-регистры, EEPROM MAC, легаси 64-слотовые TX/RX-кольца |
 | `virtio/mod.rs` | Корень virtio-обвязки (`blk`, `hal`) |
 | `virtio/hal.rs` | `PaghHal` — реализация `virtio_drivers::Hal`: DMA/MMIO через `pmm`/`vmm`; автоматические bounce-буферы для неконтинуальных heap-буферов |
 | `virtio/blk.rs` | virtio-blk: `PciTransport` + `VirtIOBlk`, обёрнут в `BlockDevice` «virtio-blk0», секторный кэш 2 MiB |
 | `nvme.rs` | NVMe поверх PCIe — поллинг (phase-bit), BAR0 MMIO, PRP scratch-frame; регистрируется как `BlockDevice` |
-| `ps2_kbd.rs` | PS/2 клавиатура (IRQ1): 128-байтное кольцо сканкодов, трекинг Ctrl+C, лATCHи `CTRL_C`/`FG_PID` |
+| `ps2_kbd.rs` | PS/2 клавиатура (IRQ1): 128-байтное кольцо сканкодов, трекинг Ctrl+C, защёлки `CTRL_C`/`FG_PID` |
 | `ps2_mouse.rs` | PS/2 мышь (IRQ12) через 8042 aux: сборка 3-байтовых пакетов, зажатые координаты + кнопки + `seq` |
 | `framebuffer.rs` | Limine framebuffer текстовая консоль + 2D-графика: шрифт 8x16 (`assets/font8x16.bin`), `FbWriter`, скролл, status bar, макросы `fb_print!` |
 | `vt.rs` | ANSI/VT-100 эмулятор поверх framebuffer (`Vt`: CSI/OSC/DCS, 256 цветов, scroll regions, ответы на запросы) — stdout compat-программ |
 | `cursor.rs` | Программный курсор мыши 12×19 (save/restore фона); `text_begin`/`text_end` для курсор-безопасного текста |
-| `serial.rs` | COM1 UART консоль (`init`, `write_bytes`, `console()`, макросы `sprint!`, `kprint!`/`kprintln!`) |
+| `serial.rs` | COM1 UART консоль (`init`, `write_bytes`, `console()`, макросы `kprint!`/`kprintln!`) |
 
 ## Ключевые символы
 
@@ -54,7 +54,8 @@ framebuffer-консоль, VT-эмулятор, курсор, serial. Коор�
 
 ### Клавиатура
 Сканкод с порта 0x60 → трекинг 0xE0-префикса → Ctrl+C-make ставит `CTRL_C` и, если `FG_PID`
-указывает на живой не-raw compat-процесс, зовёт `scheduler::request_exit(pid)` прямо из IRQ
+указывает на живой не-raw compat-процесс, шлёт ему настоящий SIGINT (`signal::send_signal`)
+прямо из IRQ, а `scheduler::request_exit(pid)` зовёт лишь как фолбэк при неудачной доставке
 (^C работает даже когда shell заблокирован в read()) → байт в кольцо (аллокации нет,
 при переполнении дроп).
 

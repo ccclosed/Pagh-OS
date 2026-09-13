@@ -309,7 +309,8 @@ lines on serial for the exact cause; retry 'apt update', or use a smaller compon
 /// The fetched body is **never** decompressed into one giant buffer (the old
 /// "decompress the whole ~150 MiB index to a `Vec`, then parse" path that overran
 /// the heap and looked like a hang). Instead the compressed body is decompressed
-/// in fixed 64 KiB chunks ([`deb::decompress_stream`]) and each chunk is fed into
+/// in fixed chunks ([`deb::decompress_stream`], `STREAM_CHUNK` = 8 KiB) and each
+/// chunk is fed into
 /// an incremental [`StanzaParser`], which emits one [`PkgRecord`] per completed
 /// stanza and drops the chunk. Resident memory is therefore roughly the
 /// compressed body (~10 MiB) + small decode/line buffers + the parsed in-RAM

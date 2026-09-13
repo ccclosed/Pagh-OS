@@ -34,6 +34,12 @@ for tool in cargo rustc; do
   command -v "$tool" >/dev/null || { echo "error: $tool not found" >&2; exit 1; }
 done
 
+# Refuse a cargo that cannot build this crate at all (distro/stable shadowing the
+# rustup shim) before it fails with a misleading json-target-spec error.
+# shellcheck source=tools/toolchain.sh
+source "$ROOT/tools/toolchain.sh"
+pagh_require_pinned_toolchain
+
 cargo_args=(build --locked)
 [[ "$PROFILE" == release ]] && cargo_args+=(--release)
 [[ -n "$FEATURES" ]] && cargo_args+=(--features "$FEATURES")

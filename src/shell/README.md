@@ -8,7 +8,7 @@ Framebuffer-shell с редактированием строки, историе
 
 | Файл | Роль |
 |---|---|
-| `mod.rs` | Единственный I/O-модуль: REPL-цикл (`shell_main`), диспетч через реестр, Tab, autorun, dual serial+framebuffer печать, status bar |
+| `mod.rs` | I/O-слой REPL: REPL-цикл (`shell_main`), диспетч через реестр, Tab, autorun, dual serial+framebuffer печать, status bar |
 | `commands.rs` | Тела всех команд (`cmd_help`, `cmd_ls`, `cmd_apt`, …) + хелперы `shell_println`, `resolve_arg`, `rm_path` и др. |
 | `registry.rs` | Статическая таблица `COMMANDS: &[CommandSpec]`; `lookup()`, `command_names()` |
 | `editor.rs` | `LineEditor` — чистая буфер+курсор модель (курсор в чар-юнитах, cap 256) |
@@ -78,7 +78,7 @@ fixed env `TERM=xterm`, `PATH=/mnt/usr/bin`; foreground-ожидание с poll
 - Canvas: `Vec<u32>` (1 пиксель = u32, белый) + one-level undo (второй undo = redo).
   Windowed-режим = 5/6 экрана по центру; maximize/restore сохраняет перекрывающиеся пиксели.
 - Инструменты (клавиши p/e/l/r/f/c/d/b/i): Pencil, Eraser, Line, Rect, FilledRect, Circle,
-  Disc, Fill (scanline flood fill), Picker. Brush 1..=64. ЛКМ = рисовать, ПКМ = белый.
+  Disc, Fill (scanline flood fill), Picker. Brush 1..=64. ЛКМ = рисовать, ПКМ = белый (только Pencil/Eraser).
 - Shape-preview: rubber-band прямо в framebuffer, откат через `blit_canvas_rect`.
 - Геометрия: Bresenham, brush-thick midpoint circle, локальный `isqrt` (Ньютон).
 - Сохранение: магия `PAGHIMG1` + LE u32 размеры + LE u32/пиксель в `/mnt/paint.img`.
@@ -102,8 +102,9 @@ fixed env `TERM=xterm`, `PATH=/mnt/usr/bin`; foreground-ожидание с poll
 ## Грабли
 
 - Всё в `shell` — `pub(crate)`; наружу крейта ничего не экспортируется.
-- `execute_command` игнорирует коды ошибок отдельных команд `&&`-чейна (стоп только на
-  неизвестной команде).
+- `execute_command` игнорирует коды ошибок отдельных команд `&&`-чейна и выполняет чейн до
+  конца: неизвестная команда тоже его НЕ останавливает — печатает ошибку и продолжает
+  следующий сегмент (для настоящего `&&` это неверно, но так устроен код).
 - `cmd_mv` работает только с файлами (каталоги отклоняются).
 - Дедуп истории — только подряд идущих.
 - Контракт cursor/framebuffer: `hide()` до любого ренда под курсором, потом `move_to`;
