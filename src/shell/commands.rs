@@ -1225,14 +1225,23 @@ fn apt_usage() {
     shell_println("  setmirror [scheme://]<host> [base]  set the mirror");
     shell_println("                          e.g. setmirror https://deb.debian.org /debian");
     shell_println("  transport: network downloads enabled in the development build");
-    shell_println("             WARNING: certificates and repository signatures are not verified");
+    shell_println(
+        "             https: server certificate verified (chain/SAN/expiry/CertificateVerify)",
+    );
+    shell_println(
+        "             WARNING: repository metadata signatures and package digests are not verified",
+    );
 }
 
 /// `apt update`: refresh the in-RAM package index.
 fn cmd_apt_update() {
     let cfg = crate::pkg::apt::config();
     if cfg.tls {
-        shell_println("apt: HTTPS transport is INSECURE (TLS 1.3, no certificate verification)");
+        shell_println(
+            "apt: HTTPS transport: server certificate verified against the committed CA bundle",
+        );
+    } else {
+        shell_println("apt: HTTP transport: the mirror is NOT authenticated (cleartext)");
     }
     shell_println(&alloc::format!(
         "apt: updating from {}://{}:{}{} ({}/{}/{})",
@@ -1359,6 +1368,13 @@ fn cmd_apt_setmirror(args: &[&str]) {
         cfg.base
     ));
     if cfg.tls {
-        shell_println("apt: transport is HTTPS (TLS 1.3) -- INSECURE: certificate verification NOT yet implemented");
+        shell_println(
+            "apt: transport is HTTPS (TLS 1.3) with fail-closed certificate verification",
+        );
+        shell_println("apt: NOTE: only hosts chaining to the committed CA bundle are accepted (ISRG X1/X2, GTS R1/R4)");
+    } else {
+        shell_println(
+            "apt: transport is HTTP (cleartext) -- the mirror and the index are NOT authenticated",
+        );
     }
 }

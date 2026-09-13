@@ -115,9 +115,15 @@ pub fn run() {
 ///     non-200 status still proves the handshake completed; it is reported as
 ///     `Status(code)`).
 ///
-/// SECURITY: the underlying [`crate::net::tls::https_get`] does NOT verify the
-/// server certificate (VARIANT A). This check proves *encrypted transport*, not
-/// authentication.
+/// SECURITY: [`crate::net::tls::https_get`] is **fail-closed server
+/// authentication**, so this check exercises the whole verify path against a live
+/// `deb.debian.org`: the handshake completes only if the server's chain reaches
+/// the committed CA bundle, the SAN authorizes the host, the clock gate passes
+/// and the `CertificateVerify` signature checks out. A `PASS` is therefore
+/// evidence of authenticated transport, and a `FAIL` is accompanied by the
+/// verifier's own `Package_Fetcher(tls): stage=verify cause=…` line naming the
+/// exact refused check (see `SECURITY.md` for what is still unverified:
+/// repository metadata signatures and package digests).
 pub fn run_net_smoke() {
     let name = "https_get";
 
@@ -135,7 +141,8 @@ pub fn run_net_smoke() {
     }
 
     crate::info!(
-        "LXSELFTEST https_get: interface up, attempting TLS 1.3 GET (INSECURE: no cert verification) ..."
+        "LXSELFTEST https_get: interface up, attempting authenticated TLS 1.3 GET \
+         (chain -> committed CA bundle, SAN, clock gate, CertificateVerify) ..."
     );
 
     // A small, stable file on the default Debian mirror (served by Fastly over
@@ -173,10 +180,12 @@ pub fn run_post_net_checks() {
 ///
 /// Spawned as a kernel thread from `boot::kernel_main` under the **dedicated**
 /// `lx_livetest` feature so it never runs in the normal kernel or the regular
-/// `lx_selftest` harness. It deliberately leaves the apt configuration at its
-/// DEFAULT (`deb.debian.org` `/debian stable main amd64`, **HTTPS VARIANT A**) —
-/// it does NOT `set_mirror` to the local mini-repo — and drives the full live
-/// update + install pipeline:
+/// `lx_selftest` harness. It deliberately does NOT `set_mirror` to the local
+/// mini-repo, so the run starts from the DEFAULT apt configuration
+/// (`deb.debian.org` `/debian stable main amd64`) and then switches the transport
+/// to cleartext HTTP (see the `set_mirror` call and its WHY below — the large
+/// index download is what needs HTTP, not the trust story). It drives the full
+/// live update + install pipeline:
 ///
 ///   1. wait for the interface to acquire an address (DHCP, then static fallback),
 ///   2. `apt::update()` against the live mirror; on `Ok(count)` log
@@ -218,13 +227,15 @@ pub fn run_live_update_check() {
     // Point apt at the cleartext HTTP mirror so the large index download uses
     // `http_get` (which does NOT touch embedded-tls) rather than the HTTPS path.
     //
-    // WHY HTTP: the VARIANT-A TLS transport has a determinate embedded-tls hang at
-    // ~12 MiB on large streams (the read() future stops returning to our executor,
-    // so our transport is never re-entered and no timeout can fire). TLS here
-    // provides NO authentication anyway (no cert verification, weak RNG) and the
-    // apt pipeline does no signature verification, so fetching the big index over
-    // plain HTTP is the honest, working way to actually COMPLETE a live full
-    // update from the official Debian mirror. http://deb.debian.org/debian sets
+    // WHY HTTP: embedded-tls deterministically hangs at ~12 MiB on large streams
+    // (the read() future stops returning to our executor, so our transport is
+    // never re-entered and no timeout can fire) — a library limitation, not a trust
+    // decision, and it applies to the authenticated HTTPS path exactly as it did
+    // to the old unverified one. Repository metadata signatures and package
+    // digests are still unverified on EITHER transport, so plain HTTP is the
+    // honest, working way to COMPLETE a live full update from the official Debian
+    // mirror; the authenticated HTTPS path itself is covered end-to-end by
+    // `run_net_smoke` (small file) above. http://deb.debian.org/debian sets
     // tls=false, port=80, base=/debian.
     crate::pkg::apt::set_mirror("http://deb.debian.org", Some("/debian"));
 

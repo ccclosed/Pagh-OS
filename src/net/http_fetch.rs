@@ -52,9 +52,11 @@ pub enum FetchError {
     /// or an encrypted record could not be sent/received. Carries a short static
     /// stage label for the diagnostic (e.g. `"handshake"`, `"write"`, `"read"`).
     ///
-    /// NOTE: with VARIANT A (no certificate verification) this never represents a
-    /// *rejected* certificate — chains are not validated — only transport/crypto
-    /// or protocol failures.
+    /// NOTE: the TLS path (`https_get`) is fail-closed server authentication, so
+    /// this variant DOES cover a rejected certificate: chain, SAN hostname,
+    /// validity/clock and `CertificateVerify` failures all abort the handshake
+    /// before any application byte moves. The label names the transport stage,
+    /// and the verifier's own `stage=verify cause=…` line names the exact check.
     Tls(&'static str),
 }
 
@@ -452,7 +454,7 @@ fn emit_failure(err: &FetchError, host: &str, path: &str) {
             host, path
         ),
         FetchError::Tls(stage) => error!(
-            "Package_Fetcher: stage=tls:{} host={} path={} cause=Tls (INSECURE: no cert verification)",
+            "Package_Fetcher: stage=tls:{} host={} path={} cause=Tls (handshake/record failure; no application data was exchanged)",
             stage, host, path
         ),
     }
