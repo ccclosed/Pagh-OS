@@ -9,6 +9,7 @@
 | `build.py` | Кроссплатформенный build/link/stage/run драйвер (бэкенд Makefile) |
 | `limine.py` | Версионно-независимый локатор/установщик `BOOTX64.EFI`: ищет любой локальный `limine*/` (или `LIMINE_EFI`/`LIMINE_DIR`), иначе качает последний бинарный релиз Limine (`limine-binary.zip`) в `limine/`; путь на stdout, прогресс на stderr |
 | `host_tests.py` | Обёртка: определяет host triple через `rustc -vV`, запускает `cargo test --locked --target <host>` в `host-tests/` |
+| `toolchain.sh` | Guard для `build.sh`/`run.sh`: отказывается собирать ненайтовым (stable/дистрибутивным) `cargo` — тот падает с `-Zjson-target-spec` и не называет настоящую причину. `tools/build.py` его не требует |
 | `check_safety.py` | CI-гейт unsafe-политики: сканирует `src/security/`, `src/arch/x86_64/linux/mod.rs`, `src/memory/vmm.rs`, `src/net/tls.rs`, `src/pkg/apt.rs` — каждый `unsafe {` обязан иметь `SAFETY:`-коммент в предыдущих 6 строках, иначе exit 1 |
 | `gen_ca_bundle.py` | Генератор trust-anchor бандла TLS-верификатора: скачивает curl/Mozilla CA extract, выбирает корни по subject CN (ISRG Root X1/X2, GTS R1/R4), пишет детерминированный `src/net/ca_bundle.rs` (DER-массивы + метки); сгенерированный файл коммитится, перегенерация — только осознанно |
 | `fetch_p44_fixtures.py` | Генератор фикстур host-свойства P44: скачивает реальные ISRG Root X1 и лист `deb.debian.org`, пишет `host-tests/src/properties/p44_fixture_{root,leaf}.rs` (закоммичены; перегенерация — осознанно) |
@@ -64,3 +65,19 @@
   ≥1 GiB RAM; см. `src/memory/README.md`; на машинах с меньшей RAM ядро само капит кучу
   с `[WARN]` вместо паники).
 - NIC расходится: e1000 (`build.py`, `run.sh`) против virtio-net-pci (`run.cmd`, bg-скрипты).
+
+## Грабли: «не тот cargo»
+
+Если `cargo` в `PATH` — не rustup-шим, а дистрибутивный бинарь, сборка падает с
+
+```
+error: `.json` target specs require -Zjson-target-spec to be added to the cargo invocation
+```
+
+Причина не в этой опции: у ядра кастомный target `x86_64-unknown-none.json`, а
+`json-target-spec` — unstable-опция, поэтому stable-cargo до реальной проблемы просто не
+доходит. Нужен toolchain из `rust-toolchain.toml` (nightly + `rust-src` + `rust-lld`).
+
+Лечится добавлением rustup в `PATH` — `. "$HOME/.cargo/env"` (и эту же строку в `~/.bashrc`).
+`build.sh`/`run.sh` теперь проверяют это сами (`tools/toolchain.sh`) и печатают объяснение
+вместо ошибки про `-Zjson-target-spec`.
