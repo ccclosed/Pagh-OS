@@ -111,8 +111,12 @@ Sinks: serial всегда, framebuffer условно. Гейты fb-зерка
 `lazy_static (spin_no_std)`, `bitflags`, `uart_16550`, `volatile`,
 `good_memory_allocator 0.1` (заменил `linked_list_allocator` — тот деградировал до ~O(n²)
 под churn парсера apt-индекса), `virtio-drivers 0.11`, `miniz_oxide =0.8.9`, `ruzstd =0.8.3`,
-`xz4rust =0.2.1`, `embedded-tls =0.19.0` (NoVerify — см. SECURITY), `embedded-io(-async)`,
+`xz4rust =0.2.1`, `embedded-tls =0.19.0` (только транспорт/крипто: сертификаты проверяет
+собственный верификатор `net::tls` → `tls_auth`/`tls_chain`/`ca_bundle`, см. SECURITY),
+`embedded-io(-async)`,
 `rand_core`, `acpi 5.0`. Профили: `panic = "abort"`, release: `lto = true, opt-level = "z"`.
 
 Feature-флаги: `default = ["network_packages"]` (apt включён; fail-closed — `--no-default-features`),
-`lx_selftest`, `lx_livetest`, `lx_bigindex`, `lx_bigindex_inram`, `insecure_network_demo`.
+`lx_selftest`, `lx_livetest`, `lx_bigindex`, `lx_bigindex_inram`, `insecure_network_demo`
+(историческое имя низкоуровневого гейта, который включает `network_packages`; сам HTTPS-транспорт
+аутентифицирует зеркало fail-closed).

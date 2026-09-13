@@ -55,8 +55,29 @@ pub fn ecdsa_sig_alg() -> Vec<u8> {
     )
 }
 
+/// ECDSA-with-SHA384 `AlgorithmIdentifier` element — the signature algorithm a
+/// P-384 issuer/leaf uses (needed by the P-384 `CertificateVerify` regression:
+/// a SHA-384-scheme leaf under a SHA-256 cipher suite).
+pub fn ecdsa_sig_alg_sha384() -> Vec<u8> {
+    tlv(
+        0x30,
+        &tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03]),
+    )
+}
+
 /// P-256 SPKI element from an uncompressed 65-byte point.
 pub fn spki_p256(point: &[u8]) -> Vec<u8> {
+    spki(&[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07], point)
+}
+
+/// P-384 SPKI element from an uncompressed 97-byte point (secp384r1).
+pub fn spki_p384(point: &[u8]) -> Vec<u8> {
+    spki(&[0x2b, 0x81, 0x04, 0x00, 0x22], point)
+}
+
+/// `SubjectPublicKeyInfo` for `id-ecPublicKey` on the curve named by
+/// `curve_oid` (content bytes), with `point` as the uncompressed public point.
+fn spki(curve_oid: &[u8], point: &[u8]) -> Vec<u8> {
     let mut bits = vec![0x00u8];
     bits.extend_from_slice(point);
     tlv(
@@ -66,7 +87,7 @@ pub fn spki_p256(point: &[u8]) -> Vec<u8> {
                 0x30,
                 &[
                     tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]).as_slice(),
-                    tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]).as_slice(),
+                    tlv(0x06, curve_oid).as_slice(),
                 ]
                 .concat(),
             )
@@ -130,7 +151,7 @@ pub const OID_SAN: &[u8] = &[0x55, 0x1d, 0x11];
 /// Build the TBSCertificate for one chain level and return the complete
 /// signed certificate DER. `subject`/`issuer` are pre-encoded `Name` DERs;
 /// `exts` are the raw Extension elements (empty → no extensions field);
-/// `signer` is the ISSUER's key.
+/// `signer` is the ISSUER's key (P-256 here; see [`build_cert_p384`]).
 pub fn build_cert(
     serial: u8,
     subject: &[u8],
@@ -141,35 +162,89 @@ pub fn build_cert(
     exts: &[Vec<u8>],
     signer: &p256::ecdsa::SigningKey,
 ) -> Vec<u8> {
-    let sig_alg = ecdsa_sig_alg();
+    let tbs_sig_alg = ecdsa_sig_alg();
+    // ECDSA-with-SHA256 signature over the EXACT TBS element bytes, DER r,s.
+    let tbs = tbs_cert(
+        serial,
+        subject,
+        issuer,
+        &spki_p256(point),
+        not_before,
+        not_after,
+        exts,
+        &tbs_sig_alg,
+    );
+    let sig: p256::ecdsa::DerSignature = signer.sign(&tbs);
+    assemble_cert(tbs, &tbs_sig_alg, sig.as_ref())
+}
+
+/// As [`build_cert`], but the certificate's SPKI is secp384r1 and the issuer
+/// signs with ECDSA-with-SHA384 — the shape a P-384 leaf really has. Used by
+/// the P-49 regression for the SHA-384 scheme under the SHA-256 cipher suite.
+pub fn build_cert_p384(
+    serial: u8,
+    subject: &[u8],
+    issuer: &[u8],
+    point: &[u8],
+    not_before: &[u8],
+    not_after: &[u8],
+    exts: &[Vec<u8>],
+    signer: &p384::ecdsa::SigningKey,
+) -> Vec<u8> {
+    let tbs_sig_alg = ecdsa_sig_alg_sha384();
+    // ECDSA-with-SHA384 signature over the EXACT TBS element bytes, DER r,s.
+    let tbs = tbs_cert(
+        serial,
+        subject,
+        issuer,
+        &spki_p384(point),
+        not_before,
+        not_after,
+        exts,
+        &tbs_sig_alg,
+    );
+    let sig: p384::ecdsa::DerSignature = signer.sign(&tbs);
+    assemble_cert(tbs, &tbs_sig_alg, sig.as_ref())
+}
+
+/// The TBS element (the exact bytes the issuer signs): identical field order
+/// for every curve — only the SPKI and the signature AlgorithmIdentifier
+/// differ. Shared so the two curve builders cannot drift apart.
+fn tbs_cert(
+    serial: u8,
+    subject: &[u8],
+    issuer: &[u8],
+    spki: &[u8],
+    not_before: &[u8],
+    not_after: &[u8],
+    exts: &[Vec<u8>],
+    sig_alg: &[u8],
+) -> Vec<u8> {
     let mut fields = vec![
         // [0] EXPLICIT version v3.
         tlv(0xa0, &tlv(0x02, &[0x02])),
         tlv(0x02, &[serial]),
-        sig_alg.clone(),
+        sig_alg.to_vec(),
         issuer.to_vec(),
         validity(not_before, not_after),
         subject.to_vec(),
-        spki_p256(point),
+        spki.to_vec(),
     ];
     if !exts.is_empty() {
         let ext_seq: Vec<u8> = exts.concat();
         fields.push(tlv(0xa3, &tlv(0x30, &ext_seq)));
     }
-    let tbs = tlv(0x30, &fields.concat());
-    // ECDSA signature over the EXACT TBS element bytes, DER-encoded r,s.
-    let sig: p256::ecdsa::DerSignature = signer.sign(&tbs);
+    tlv(0x30, &fields.concat())
+}
+
+/// Wrap a signed TBS element into the final `Certificate` SEQUENCE.
+fn assemble_cert(tbs: Vec<u8>, sig_alg: &[u8], sig: &[u8]) -> Vec<u8> {
     // BIT STRING content: 0x00 unused-bits byte || raw DER signature blob.
     let mut sig_bits = vec![0x00u8];
-    sig_bits.extend_from_slice(sig.as_ref());
+    sig_bits.extend_from_slice(sig);
     tlv(
         0x30,
-        &[
-            tbs.as_slice(),
-            sig_alg.as_slice(),
-            tlv(0x03, &sig_bits).as_slice(),
-        ]
-        .concat(),
+        &[tbs.as_slice(), sig_alg, tlv(0x03, &sig_bits).as_slice()].concat(),
     )
 }
 

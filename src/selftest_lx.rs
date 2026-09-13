@@ -102,6 +102,11 @@ pub fn run() {
     crate::info!("LXSELFTEST harness done");
 }
 
+/// How long the post-network checks wait for `net::ip_config()` to become
+/// available (60 s at `TICK_HZ`). One shared constant so the local-mirror and
+/// HTTPS checks cannot drift into different ideas of "the network is up".
+const WAIT_IFACE_TICKS: u64 = crate::arch::x86_64::apic::TICK_HZ * 60;
+
 /// Post-network HTTPS smoke test entry point (cargo feature `lx_selftest`).
 ///
 /// Spawned as a kernel thread from `boot::kernel_main` (NOT called from [`run`],
@@ -115,19 +120,29 @@ pub fn run() {
 ///     non-200 status still proves the handshake completed; it is reported as
 ///     `Status(code)`).
 ///
-/// SECURITY: the underlying [`crate::net::tls::https_get`] does NOT verify the
-/// server certificate (VARIANT A). This check proves *encrypted transport*, not
-/// authentication.
+/// SECURITY: [`crate::net::tls::https_get`] is **fail-closed server
+/// authentication**, so this check exercises the whole verify path against a live
+/// `deb.debian.org`: the handshake completes only if the server's chain reaches
+/// the committed CA bundle, the SAN authorizes the host, the clock gate passes
+/// and the `CertificateVerify` signature checks out. A `PASS` is therefore
+/// evidence of authenticated transport, and a `FAIL` is accompanied by the
+/// verifier's own `Package_Fetcher(tls): stage=verify cause=…` line naming the
+/// exact refused check (see `SECURITY.md` for what is still unverified:
+/// repository metadata signatures and package digests).
 pub fn run_net_smoke() {
     let name = "https_get";
 
-    // Wait up to ~15 s for an interface address (DHCP, then static fallback).
-    let deadline = scheduler::ticks() + 1500;
+    // Wait up to ~60 s for an interface address. The lease/fallback lands
+    // seconds after boot, but under TCG the ring-3 selftest checks that run
+    // before this thread can push that well past the old 15 s window — and a
+    // timeout here is reported as "no interface address", which reads like a
+    // network failure instead of "the harness gave up too early".
+    let deadline = scheduler::ticks() + WAIT_IFACE_TICKS;
     while crate::net::ip_config().is_none() {
         if scheduler::ticks() >= deadline {
             fail(
                 name,
-                "no interface address (DHCP/static fallback did not configure)",
+                "no interface address within 60 s (DHCP/static fallback did not configure)",
             );
             return;
         }
@@ -135,7 +150,8 @@ pub fn run_net_smoke() {
     }
 
     crate::info!(
-        "LXSELFTEST https_get: interface up, attempting TLS 1.3 GET (INSECURE: no cert verification) ..."
+        "LXSELFTEST https_get: interface up, attempting authenticated TLS 1.3 GET \
+         (chain -> committed CA bundle, SAN, clock gate, CertificateVerify) ..."
     );
 
     // A small, stable file on the default Debian mirror (served by Fastly over
@@ -173,10 +189,12 @@ pub fn run_post_net_checks() {
 ///
 /// Spawned as a kernel thread from `boot::kernel_main` under the **dedicated**
 /// `lx_livetest` feature so it never runs in the normal kernel or the regular
-/// `lx_selftest` harness. It deliberately leaves the apt configuration at its
-/// DEFAULT (`deb.debian.org` `/debian stable main amd64`, **HTTPS VARIANT A**) —
-/// it does NOT `set_mirror` to the local mini-repo — and drives the full live
-/// update + install pipeline:
+/// `lx_selftest` harness. It deliberately does NOT `set_mirror` to the local
+/// mini-repo, so the run starts from the DEFAULT apt configuration
+/// (`deb.debian.org` `/debian stable main amd64`) and then switches the transport
+/// to cleartext HTTP (see the `set_mirror` call and its WHY below — the large
+/// index download is what needs HTTP, not the trust story). It drives the full
+/// live update + install pipeline:
 ///
 ///   1. wait for the interface to acquire an address (DHCP, then static fallback),
 ///   2. `apt::update()` against the live mirror; on `Ok(count)` log
@@ -200,15 +218,17 @@ pub fn run_post_net_checks() {
 pub fn run_live_update_check() {
     let name = "live_update";
 
-    // Wait up to ~30 s for an interface address (DHCP, then static fallback). A
-    // live update also needs DNS + TLS, so give it a more generous window than
-    // the local-mirror check.
-    let deadline = scheduler::ticks() + 3000;
+    // Wait up to ~60 s for an interface address (DHCP, then static fallback) —
+    // same shared window as the other post-network checks. A live update also
+    // needs DNS + TLS, so it must not be cut short by a shorter wait than the
+    // local-mirror check uses. (The previous `ticks() + 3000` was 3 s, not the
+    // ~30 s the comment claimed: TICK_HZ is 1000.)
+    let deadline = scheduler::ticks() + WAIT_IFACE_TICKS;
     while crate::net::ip_config().is_none() {
         if scheduler::ticks() >= deadline {
             fail(
                 name,
-                "no interface address (DHCP/static fallback did not configure)",
+                "no interface address within 60 s (DHCP/static fallback did not configure)",
             );
             return;
         }
@@ -218,13 +238,15 @@ pub fn run_live_update_check() {
     // Point apt at the cleartext HTTP mirror so the large index download uses
     // `http_get` (which does NOT touch embedded-tls) rather than the HTTPS path.
     //
-    // WHY HTTP: the VARIANT-A TLS transport has a determinate embedded-tls hang at
-    // ~12 MiB on large streams (the read() future stops returning to our executor,
-    // so our transport is never re-entered and no timeout can fire). TLS here
-    // provides NO authentication anyway (no cert verification, weak RNG) and the
-    // apt pipeline does no signature verification, so fetching the big index over
-    // plain HTTP is the honest, working way to actually COMPLETE a live full
-    // update from the official Debian mirror. http://deb.debian.org/debian sets
+    // WHY HTTP: embedded-tls deterministically hangs at ~12 MiB on large streams
+    // (the read() future stops returning to our executor, so our transport is
+    // never re-entered and no timeout can fire) — a library limitation, not a trust
+    // decision, and it applies to the authenticated HTTPS path exactly as it did
+    // to the old unverified one. Repository metadata signatures and package
+    // digests are still unverified on EITHER transport, so plain HTTP is the
+    // honest, working way to COMPLETE a live full update from the official Debian
+    // mirror; the authenticated HTTPS path itself is covered end-to-end by
+    // `run_net_smoke` (small file) above. http://deb.debian.org/debian sets
     // tls=false, port=80, base=/debian.
     crate::pkg::apt::set_mirror("http://deb.debian.org", Some("/debian"));
 
@@ -341,8 +363,9 @@ pub fn run_live_update_check() {
 pub fn run_apt_e2e() {
     let name = "apt_e2e";
 
-    // Wait up to ~20 s for an interface address (DHCP, then static fallback).
-    let deadline = scheduler::ticks() + 2000;
+    // Wait up to ~60 s for an interface address (DHCP, then static fallback) —
+    // same window as `run_net_smoke`; see the rationale there.
+    let deadline = scheduler::ticks() + WAIT_IFACE_TICKS;
     while crate::net::ip_config().is_none() {
         if scheduler::ticks() >= deadline {
             fail(
@@ -441,13 +464,15 @@ pub fn run_apt_e2e() {
 pub fn run_bigindex_check() {
     let name = "bigindex";
 
-    // Wait up to ~20 s for an interface address (DHCP, then static fallback).
-    let deadline = scheduler::ticks() + 2000;
+    // Wait up to ~60 s for an interface address (DHCP, then static fallback) —
+    // the shared window; see `WAIT_IFACE_TICKS`. (The previous
+    // `ticks() + 2000` was 2 s, not the ~20 s the comment claimed.)
+    let deadline = scheduler::ticks() + WAIT_IFACE_TICKS;
     while crate::net::ip_config().is_none() {
         if scheduler::ticks() >= deadline {
             fail(
                 name,
-                "no interface address (DHCP/static fallback did not configure)",
+                "no interface address within 60 s (DHCP/static fallback did not configure)",
             );
             return;
         }
@@ -1029,7 +1054,11 @@ fn check_register_preservation() {
     };
     let snapshot = regs;
 
-    let ret = linux_dispatch(&mut regs as *mut SavedRegs);
+    // 0 = NOT a real syscall: this direct call runs on the boot thread, which is
+    // not a schedulable task, so the dispatcher must leave IF exactly as it found
+    // it (see `linux_dispatch`). Unmasking here would park the boot thread for
+    // good on the first timer tick.
+    let ret = linux_dispatch(&mut regs as *mut SavedRegs, 0);
     let expected = scheduler::current_pid();
 
     if regs == snapshot && ret == expected {

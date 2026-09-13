@@ -146,9 +146,14 @@ core::arch::global_asm!(
     "    push r13",
     "    push r14",
     "    push r15",
-    // rsp now points at the SavedRegs frame (r15 at offset 0). Pass it as the sole
-    // (rdi) argument to linux_dispatch. rsp is 16-byte aligned here (see header).
+    // rsp now points at the SavedRegs frame (r15 at offset 0). Pass it as the
+    // sole (rdi) argument to linux_dispatch. rsp is 16-byte aligned here (see
+    // header). rsi carries the second argument, REENTRY_ALLOWED: this is a real
+    // syscall on a schedulable task, so the dispatcher may unmask interrupts
+    // (blocking handlers need the timer tick). rsi is free to clobber — the
+    // caller's value was pushed into the frame above.
     "    mov rdi, rsp",
+    "    mov esi, 1",
     "    call linux_dispatch",
     // Write the dispatcher's return value into the saved rax slot (offset 112).
     "    mov [rsp + 112], rax",
@@ -231,6 +236,7 @@ core::arch::global_asm!(
     "    push r14",
     "    push r15",
     "    mov rdi, rsp", // &SavedRegs (sole arg; rsp is 16-byte aligned here)
+    "    mov esi, 1",   // REENTRY_ALLOWED: real syscall on a schedulable task
     "    call linux_dispatch",
     // linux_dispatch re-enables interrupts for blocking handlers; re-mask IF
     // so the frame unwind and the `pop rsp`/`sysretq` tail are atomic — an

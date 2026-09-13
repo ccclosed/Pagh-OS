@@ -362,12 +362,25 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
 ///      `Err(e) -> -errno` (R1.3) into the value written back to `rax`; every other
 ///      GPR is preserved by the entry stub (R1.7).
 ///
+/// Second argument of [`linux_dispatch`] for a REAL syscall: the caller is a
+/// schedulable task whose frame is safely parked, so the dispatcher may unmask
+/// interrupts for the duration of the handler.
+///
+/// The boot-time selftest calls the dispatcher DIRECTLY and passes `0` instead:
+/// it runs on the boot thread, which is not a schedulable task (see
+/// `linux_dispatch`).
+pub const REENTRY_ALLOWED: u64 = 1;
+
 /// # Safety
 ///
 /// `regs` must point at a fully-initialized [`SavedRegs`] frame on the current
 /// kernel stack, exactly as built by the entry stubs. The stubs guarantee this.
+///
+/// `reentry_allowed` must be [`REENTRY_ALLOWED`] only when the caller really is
+/// a syscall on a schedulable task (both entry stubs pass it); the boot-time
+/// selftest passes 0.
 #[no_mangle]
-pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
+pub extern "C" fn linux_dispatch(regs: *mut SavedRegs, reentry_allowed: u64) -> u64 {
     // SAFETY: the entry stubs always pass a pointer to the 15-register frame they
     // just pushed on the current task's own kernel stack; it outlives this call
     // and is uniquely owned for the duration (each task owns a private kernel
@@ -381,7 +394,28 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
     // nanosleep). With IF masked, `ticks()` never advances — timeouts can
     // never fire — and `hlt` inside `sleep_ticks` would sleep forever. The
     // syscall exit stub re-masks IF (`cli`) before unwinding the frame.
-    crate::arch::cpu::enable_interrupts();
+    //
+    // Gated on the CALLER, never on the current IF: every caller arrives with
+    // IF masked (SFMASK on `syscall`, the interrupt gate for `int 0x80`), so a
+    // check of the live flag could never unmask anything. What differs is who
+    // is calling — see REENTRY_ALLOWED.
+    //
+    // The boot-time selftest calls this dispatcher DIRECTLY, from the boot
+    // thread, with interrupts still masked (the whole boot path runs that way
+    // until `boot::kernel_main` enables them just before the idle loop).
+    // Unmasking there is a silent machine hang, not a speedup: the boot thread
+    // has `current_pid() == IDLE_PID`, so the first timer tick files its stack
+    // under the idle task and switches to the always-ready shell/net threads —
+    // and because those two are permanently in the ready queue, the tick never
+    // restores the boot thread, which stays parked mid-`sti` forever (the
+    // harness then dies before its post-network checks are ever spawned, with
+    // no diagnostics). That caller therefore passes a zero `reentry_allowed`
+    // and leaves interrupts exactly as it found them; the boot thread reaches
+    // the idle loop still masked and `boot::kernel_main` enables them there,
+    // as designed.
+    if reentry_allowed == REENTRY_ALLOWED {
+        crate::arch::cpu::enable_interrupts();
+    }
 
     let (nr, args) = abi::marshal_args(r.rax, r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9);
 

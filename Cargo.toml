@@ -16,9 +16,11 @@ crate-type = ["staticlib"]
 
 [features]
 # The pagh development image ships with network package operations enabled.
-# This activates the existing HTTP/HTTPS fetch pipeline; apt still prints an
-# explicit trust warning because CA, InRelease and package-hash verification are
-# not complete. A fail-closed build remains available with
+# This activates the existing HTTP/HTTPS fetch pipeline. The HTTPS transport
+# authenticates the mirror fail-closed (chain -> committed CA bundle, SAN,
+# validity + clock gate, CertificateVerify; see SECURITY.md), but Debian
+# InRelease signatures and package hashes are still unverified, so apt says so
+# rather than implying more. A fail-closed build remains available with
 # `cargo build --no-default-features`.
 default = ["network_packages"]
 network_packages = ["insecure_network_demo"]
@@ -57,8 +59,10 @@ lx_bigindex_inram = []
 
 # Low-level implementation gate retained for compatibility with existing test
 # scripts. `network_packages` enables it in the normal pagh development build.
-# Transport is functional but not trusted until certificate/repository metadata
-# verification lands, so apt emits a prominent warning.
+# The name is historical: the transport it gates (HTTPS via net::tls) now
+# verifies the server certificate fail-closed. What remains unverified is
+# repository metadata (InRelease/OpenPGP) and package digests, so a plain-HTTP
+# mirror selected with `apt setmirror http://...` is still unauthenticated.
 insecure_network_demo = []
 
 [profile.dev]

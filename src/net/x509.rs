@@ -27,7 +27,7 @@
 //!     nothing in an X.509 certificate path uses them; encountering one is a
 //!     hard error rather than a half-supported code path.
 
-#![allow(dead_code)] // grows over the issue #14 series; the verifier consumes it later.
+#![allow(dead_code)] // the DER tag vocabulary is deliberately complete.
 
 // ───────────────────────────── tags ─────────────────────────────
 

@@ -38,11 +38,12 @@ userland** onto its ext2 disk after an opt-in confirmation at first boot.
 > Hobby/educational kernel. There is no security model beyond ring 0/3 paging.
 
 > **Network default:** outbound package operations are **enabled** in normal builds
-> (`default = ["network_packages"]` in `Cargo.toml`). HTTPS is encrypted but certificate
-> and repository-signature verification are still pending, so downloaded packages remain
-> untrusted — acceptable only for an isolated, developer-controlled QEMU mirror. Use
-> `cargo build --no-default-features` for a fail-closed build. See `SECURITY.md` and
-> `HARDENING.md`.
+> (`default = ["network_packages"]` in `Cargo.toml`). HTTPS verifies the server
+> certificate fail-closed against four pinned roots, but repository-signature and
+> per-package digest verification are still pending and plain-HTTP mirrors stay
+> unauthenticated, so downloaded packages remain untrusted — acceptable only for an
+> isolated, developer-controlled QEMU mirror. Use `cargo build --no-default-features`
+> for a fail-closed build. See `SECURITY.md` and `HARDENING.md`.
 
 > **Authorship:** this kernel was written by AI under human supervision.
 
@@ -443,14 +444,16 @@ python
   that require `/proc/stat`/`/proc/meminfo` (e.g. `htop`) remain out of reach. Signal
   delivery is real at the syscall-return point (see above); asynchronous delivery
   from the timer-tick return path is not yet wired. See `LINUX-USERLAND.md` for the exact status.
-- **Transport.** Downloads use HTTP or HTTPS. HTTPS authenticates the peer: the server
-  certificate chain is validated against the committed CA bundle, the hostname against the
-  leaf SAN entries, validity windows are enforced (with a hard clock gate — an unset RTC
+- **Transport.** Downloads use HTTP or HTTPS. HTTPS authenticates the peer fail-closed: the
+  server certificate chain is validated against the committed CA bundle, the hostname against
+  the leaf SAN entries, validity windows are enforced (with a hard clock gate — an unset RTC
   refuses the handshake), and the `CertificateVerify` signature is checked against the leaf
-  key. What is still missing is repository-side trust: Debian metadata signatures and
-  complete per-package digest verification. Plain-HTTP mirrors (`apt setmirror http://…`)
-  remain unauthenticated by construction, and live `apt update` currently uses HTTP because
-  of the embedded-tls large-stream hang (issue #19).
+  key. Trust is limited to the bundle's four pinned roots (ISRG Root X1/X2, GTS R1/R4), and
+  revocation (CRL/OCSP) is not checked, so an HTTPS mirror outside that issuance is refused
+  rather than trusted. What is still missing is repository-side trust: Debian metadata
+  signatures and complete per-package digest verification. Plain-HTTP mirrors
+  (`apt setmirror http://…`) remain unauthenticated by construction, and live `apt update`
+  currently uses HTTP because of the embedded-tls large-stream hang (issue #19).
 - **Scale.** The full Debian `main` index (~60k packages, ~150 MiB decompressed) is streamed
   and parsed into a compact in-RAM byte-arena index (kept in RAM only, rebuilt per boot).
   End-to-end install is proven against a local mirror; a live full `apt update` from

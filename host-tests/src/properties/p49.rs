@@ -16,22 +16,33 @@
 //   * CertificateVerify round-trips: ECDSA P-256, Ed25519 and RSA-PSS-2048
 //     signatures over the exact RFC 8446 §4.4.3 message verify against the
 //     exported leaf key; tampered bytes, wrong keys, scheme/key mismatches
-//     and wrong transcript-hash lengths all reject.
+//     and wrong transcript-hash widths all reject;
+//   * the transcript hash is gated on the negotiated CIPHER SUITE's hash,
+//     NOT on the scheme's: a P-384 leaf (SHA-384 scheme) under the SHA-256
+//     suite verifies — the regression for a gate that compared the incoming
+//     hash against `scheme.hash_len()` and rejected every such leaf as a bad
+//     signature, leaving three backends unreachable.
 
 use crate::tls_auth::{
     authenticate_server, certificate_verify_message, verify_certificate_verify, AuthError,
     LeafKey, Tls13Scheme,
 };
 use crate::tls_chain::{ChainError, CLOCK_FLOOR, TrustAnchor};
+use crate::tls_verify::SigVerifyError;
 use crate::x509::SpkiKey;
 use proptest::prelude::*;
 use signature::{RandomizedSigner, SignatureEncoding, Signer};
 
 use super::chain_der::{
-    basic_constraints, build_cert, extension, name, san_dns, san_ip, san_wildcard, NA, NB,
-    NOW, OID_BASIC_CONSTRAINTS, OID_SAN,
+    basic_constraints, build_cert, build_cert_p384, extension, name, san_dns, san_ip,
+    san_wildcard, NA, NB, NOW, OID_BASIC_CONSTRAINTS, OID_SAN,
 };
 use super::det_rng::rng_from;
+
+/// SHA-256 transcript-hash width: the hash of the only cipher suite this
+/// kernel negotiates (`Aes128GcmSha256`). Every call below passes it
+/// explicitly — `net::tls` derives it from the suite it instantiates.
+const SUITE_HASH: usize = 32;
 
 /// One leaf certificate signed directly by a generated self-signed root
 /// (the minimal chain this layer's hostname/leaf-key logic needs; the full
@@ -99,6 +110,63 @@ fn anchor_of(chain: &AuthChain) -> TrustAnchor<'_> {
         key: SpkiKey::EcP256 {
             point: &chain.anchor_point,
         },
+    }
+}
+
+/// One P-384 leaf signed by a self-signed P-384 root — the shape a mirror
+/// serving `ecdsa_secp384r1_sha384` presents. Kept separate from
+/// [`AuthChain`] because the signer type differs; only what the P-384
+/// regression needs is carried (the root certificate itself never has to be
+/// sent: the anchor is configured out of band, exactly as the CA bundle is).
+struct AuthChainP384 {
+    leaf_der: Vec<u8>,
+    anchor_name: Vec<u8>,
+    anchor_point: Vec<u8>,
+    leaf_point: Vec<u8>,
+    leaf_sk: p384::ecdsa::SigningKey,
+}
+
+/// Root + leaf on secp384r1, leaf carrying a dNSName SAN, signed
+/// ECDSA-with-SHA384 (the algorithm a P-384 issuer uses).
+fn build_auth_chain_p384(seed: u64) -> AuthChainP384 {
+    let mut rng = rng_from(seed);
+    let sk_root = p384::ecdsa::SigningKey::random(&mut rng);
+    let sk_leaf = p384::ecdsa::SigningKey::random(&mut rng);
+
+    let root_name = name(b"Auth P384 Root CA");
+    let leaf_name = name(b"leaf.p384.auth.invalid");
+    let root_point = sk_root.verifying_key().to_encoded_point(false);
+    let leaf_point = sk_leaf.verifying_key().to_encoded_point(false);
+
+    // The root is the configured trust anchor, never sent by the peer, so the
+    // DER is built only to prove the builder/parser agree on a P-384 issuer.
+    let _root_der = build_cert_p384(
+        0x01,
+        &root_name,
+        &root_name,
+        root_point.as_bytes(),
+        NB,
+        NA,
+        &[extension(OID_BASIC_CONSTRAINTS, true, &basic_constraints(true))],
+        &sk_root,
+    );
+    let leaf_der = build_cert_p384(
+        0x02,
+        &leaf_name,
+        &root_name,
+        leaf_point.as_bytes(),
+        NB,
+        NA,
+        &[extension(OID_SAN, false, &san_dns(b"p384.auth"))],
+        &sk_root, // the ISSUER signs the leaf
+    );
+
+    AuthChainP384 {
+        leaf_der,
+        anchor_name: root_name,
+        anchor_point: root_point.as_bytes().to_vec(),
+        leaf_point: leaf_point.as_bytes().to_vec(),
+        leaf_sk: sk_leaf,
     }
 }
 
@@ -217,7 +285,7 @@ proptest! {
 
     /// The exported leaf key verifies the TLS 1.3 `CertificateVerify`
     /// signature for ECDSA P-256 and Ed25519 leaves; any tampering, a wrong
-    /// key, a scheme/key mismatch or a wrong transcript-hash length rejects.
+    /// key, a scheme/key mismatch or a wrong transcript-hash width rejects.
     #[test]
     fn certificate_verify_roundtrip(seed in any::<u64>()) {
         let chain = build_auth_chain(seed, Some(san_dns(b"pagh.auth")));
@@ -230,7 +298,7 @@ proptest! {
         let msg = certificate_verify_message(&hash);
         let good_sig: p256::ecdsa::DerSignature = chain.leaf_sk.sign(&msg);
         prop_assert_eq!(
-            verify_certificate_verify(Tls13Scheme::EcdsaSecp256r1Sha256, &hash, good_sig.as_ref(), &auth.leaf_key),
+            verify_certificate_verify(Tls13Scheme::EcdsaSecp256r1Sha256, SUITE_HASH, &hash, good_sig.as_ref(), &auth.leaf_key),
             Ok(())
         );
 
@@ -239,13 +307,13 @@ proptest! {
         let mut bad_hash = hash;
         bad_hash[0] ^= 0x01;
         prop_assert!(
-            verify_certificate_verify(Tls13Scheme::EcdsaSecp256r1Sha256, &bad_hash, good_sig.as_ref(), &auth.leaf_key).is_err()
+            verify_certificate_verify(Tls13Scheme::EcdsaSecp256r1Sha256, SUITE_HASH, &bad_hash, good_sig.as_ref(), &auth.leaf_key).is_err()
         );
         let mut bad_sig = good_sig.as_ref().to_vec();
         let last = bad_sig.len() - 1;
         bad_sig[last] ^= 0x01;
         prop_assert!(
-            verify_certificate_verify(Tls13Scheme::EcdsaSecp256r1Sha256, &hash, &bad_sig, &auth.leaf_key).is_err()
+            verify_certificate_verify(Tls13Scheme::EcdsaSecp256r1Sha256, SUITE_HASH, &hash, &bad_sig, &auth.leaf_key).is_err()
         );
 
         // A different leaf key does not verify the same signature.
@@ -254,18 +322,21 @@ proptest! {
         let stranger_point = stranger.verifying_key().to_encoded_point(false).as_bytes().to_vec();
         let stranger_key = LeafKey::EcP256 { point: stranger_point };
         prop_assert!(
-            verify_certificate_verify(Tls13Scheme::EcdsaSecp256r1Sha256, &hash, good_sig.as_ref(), &stranger_key).is_err()
+            verify_certificate_verify(Tls13Scheme::EcdsaSecp256r1Sha256, SUITE_HASH, &hash, good_sig.as_ref(), &stranger_key).is_err()
         );
 
-        // Scheme/key mismatch and wrong transcript-hash length reject before
-        // any cryptography.
+        // Scheme/key mismatch is a hard reject before any cryptography.
         prop_assert_eq!(
-            verify_certificate_verify(Tls13Scheme::RsaPssRsaeSha256, &hash, good_sig.as_ref(), &auth.leaf_key),
-            Err(crate::tls_verify::SigVerifyError::KeyTypeMismatch)
+            verify_certificate_verify(Tls13Scheme::RsaPssRsaeSha256, SUITE_HASH, &hash, good_sig.as_ref(), &auth.leaf_key),
+            Err(SigVerifyError::KeyTypeMismatch)
         );
+
+        // A transcript hash of the wrong width for the NEGOTIATED SUITE is
+        // refused. (Full P-384 round trip below: the width gate belongs to the
+        // suite, never to the scheme.)
         prop_assert_eq!(
-            verify_certificate_verify(Tls13Scheme::EcdsaSecp384r1Sha384, &hash, good_sig.as_ref(), &auth.leaf_key),
-            Err(crate::tls_verify::SigVerifyError::MalformedSignature)
+            verify_certificate_verify(Tls13Scheme::EcdsaSecp256r1Sha256, 48, &hash, good_sig.as_ref(), &auth.leaf_key),
+            Err(SigVerifyError::MalformedSignature)
         );
 
         // Ed25519 leaf key round-trips the same message through its scheme.
@@ -273,8 +344,85 @@ proptest! {
         let ed_leaf = LeafKey::Ed25519 { key: ed.verifying_key().as_bytes().to_vec() };
         let ed_sig = ed.sign(&msg);
         prop_assert_eq!(
-            verify_certificate_verify(Tls13Scheme::Ed25519, &hash, &ed_sig.to_vec(), &ed_leaf),
+            verify_certificate_verify(Tls13Scheme::Ed25519, SUITE_HASH, &hash, &ed_sig.to_vec(), &ed_leaf),
             Ok(())
+        );
+    }
+
+    /// Regression for the transcript-hash gate: a VALID server signature made
+    /// with a scheme whose own digest (SHA-384) differs from the negotiated
+    /// cipher suite's hash (SHA-256) must PASS.
+    ///
+    /// RFC 8446 §4.4.3 hashes the transcript with the CIPHER SUITE's hash and
+    /// then signs it with the scheme's digest, so gating the 32-byte transcript
+    /// hash on `scheme.hash_len()` (48 here) rejected every P-384 leaf as
+    /// `MalformedSignature`/`InvalidSignature` although the signature was good —
+    /// and left the P-384 and RSA-PSS-384/512 backends unreachable.
+    #[test]
+    fn p384_leaf_verifies_under_sha256_suite(seed in any::<u64>()) {
+        let chain = build_auth_chain_p384(seed);
+        let anchor = TrustAnchor {
+            subject: &chain.anchor_name,
+            key: SpkiKey::EcP384 { point: &chain.anchor_point },
+        };
+        let entries = [chain.leaf_der.as_slice()];
+
+        // Chain + SAN authorize the host, and the P-384 leaf key is exported.
+        let auth = authenticate_server(
+            &entries,
+            Some("p384.auth"),
+            &[anchor],
+            NOW,
+        )
+        .unwrap();
+        prop_assert_eq!(
+            &auth.leaf_key,
+            &LeafKey::EcP384 { point: chain.leaf_point.clone() }
+        );
+
+        // The suite hash is SHA-256 (32 bytes); the scheme signs it with SHA-384.
+        let hash = [0x5au8; SUITE_HASH];
+        let msg = certificate_verify_message(&hash);
+        let sig: p384::ecdsa::DerSignature = chain.leaf_sk.sign(&msg);
+
+        prop_assert_eq!(
+            verify_certificate_verify(
+                Tls13Scheme::EcdsaSecp384r1Sha384,
+                SUITE_HASH,
+                &hash,
+                sig.as_ref(),
+                &auth.leaf_key,
+            ),
+            Ok(())
+        );
+
+        // ... and the check is real: a tampered signature does not pass.
+        let mut bad = sig.as_ref().to_vec();
+        let last = bad.len() - 1;
+        bad[last] ^= 0x01;
+        prop_assert!(
+            verify_certificate_verify(
+                Tls13Scheme::EcdsaSecp384r1Sha384,
+                SUITE_HASH,
+                &hash,
+                &bad,
+                &auth.leaf_key,
+            )
+            .is_err()
+        );
+
+        // The scheme is NOT gated against the suite hash: a SHA-384 scheme
+        // over this SHA-256 suite is exactly the handshake the fix enables, so
+        // a wrong KEY (not a width) is the class that still refuses it.
+        prop_assert_eq!(
+            verify_certificate_verify(
+                Tls13Scheme::EcdsaSecp384r1Sha384,
+                SUITE_HASH,
+                &hash,
+                sig.as_ref(),
+                &LeafKey::EcP256 { point: vec![0u8; 65] },
+            ),
+            Err(SigVerifyError::KeyTypeMismatch)
         );
     }
 
@@ -297,7 +445,7 @@ proptest! {
         let key = LeafKey::Rsa { n, e };
 
         prop_assert_eq!(
-            verify_certificate_verify(Tls13Scheme::RsaPssRsaeSha256, &[0x42u8; 32], &sig_bytes, &key),
+            verify_certificate_verify(Tls13Scheme::RsaPssRsaeSha256, SUITE_HASH, &[0x42u8; 32], &sig_bytes, &key),
             Ok(())
         );
 
@@ -306,7 +454,7 @@ proptest! {
         let last = bad.len() - 1;
         bad[last] ^= 0x01;
         prop_assert!(
-            verify_certificate_verify(Tls13Scheme::RsaPssRsaeSha256, &[0x42u8; 32], &bad, &key).is_err()
+            verify_certificate_verify(Tls13Scheme::RsaPssRsaeSha256, SUITE_HASH, &[0x42u8; 32], &bad, &key).is_err()
         );
 
         // Below the 2048-bit floor: MalformedKey before any math.
@@ -316,7 +464,7 @@ proptest! {
             (short.n().to_bytes_be(), short.e().to_bytes_be())
         };
         prop_assert_eq!(
-            verify_certificate_verify(Tls13Scheme::RsaPssRsaeSha256, &[0x42u8; 32], &sig_bytes, &LeafKey::Rsa { n: n_short, e: e_short }),
+            verify_certificate_verify(Tls13Scheme::RsaPssRsaeSha256, SUITE_HASH, &[0x42u8; 32], &sig_bytes, &LeafKey::Rsa { n: n_short, e: e_short }),
             Err(crate::tls_verify::SigVerifyError::MalformedKey)
         );
     }

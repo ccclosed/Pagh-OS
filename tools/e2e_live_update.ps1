@@ -6,9 +6,13 @@
 .DESCRIPTION
   Boots a release Pagh-OS kernel built with the dedicated `lx_livetest` cargo
   feature, which (after DHCP comes up) runs the FULL live update pipeline against
-  the DEFAULT mirror -- deb.debian.org /debian stable main amd64 over HTTPS
-  (VARIANT A) -- with NO local mirror and the QEMU default user-net NAT providing
-  outbound connectivity so the guest can reach the internet:
+  deb.debian.org /debian stable main amd64 -- with NO local mirror and the QEMU
+  default user-net NAT providing outbound connectivity so the guest can reach the
+  internet. The harness switches the transport to cleartext HTTP for the large
+  index download (embedded-tls hangs on ~12 MiB streams, issue #19); the
+  authenticated HTTPS path is covered end-to-end by the small-file HTTPS smoke
+  run of the `lx_selftest` harness, and repository metadata signatures are
+  unverified on either transport (see SECURITY.md):
 
       apt::update()                         # stream-fetch + parse the real index
       LIVE_APT_UPDATE: count=N              # assert N >= 50000 (R1.2)
@@ -52,6 +56,15 @@ $relArchive = "target\$TARGET\release\libPAGH.a"
 $relElf     = "target\$TARGET\release\PAGH.elf"
 $serialLog  = Join-Path $root 'serial_live.log'
 $qemuLog    = Join-Path $root 'qemu_live_debug.log'
+
+function Resolve-OvmfPath {
+    if ($env:OVMF -and (Test-Path $env:OVMF)) { return $env:OVMF }
+    if (Test-Path 'OVMF.fd') { return 'OVMF.fd' }
+    foreach ($p in @('/usr/share/edk2/ovmf/OVMF_CODE.fd','/usr/share/ovmf/OVMF_CODE.fd','/usr/share/OVMF/OVMF_CODE.fd','/usr/share/edk2/x64/OVMF_CODE.fd')) {
+        if (Test-Path $p) { return $p }
+    }
+    throw 'OVMF firmware not found: put OVMF.fd in the repo root, set $env:OVMF, or install edk2-ovmf'
+}
 
 function Find-RustLld {
     $hits = Get-ChildItem -Path "$env:USERPROFILE\.rustup" -Recurse -Filter 'rust-lld.exe' -ErrorAction SilentlyContinue |
@@ -104,7 +117,8 @@ Ensure-Disk
 if (Test-Path $serialLog) { Remove-Item $serialLog -Force }
 Write-Host '=== Booting release ELF under QEMU (outbound user-net to deb.debian.org) ===' -ForegroundColor Cyan
 $qemuArgs = @(
-    '-bios','OVMF.fd',
+    '-bios',(Resolve-OvmfPath),
+    '-cpu','max',
     '-drive','file=fat:rw:iso_root,format=raw',
     '-drive','file=disk.img,format=raw,if=none,id=hd0',
     '-device','virtio-blk-pci,drive=hd0',
@@ -135,7 +149,7 @@ while ((Get-Date) -lt $deadline) {
             break
         }
         # Heartbeat: surface the most recent progress line as we wait.
-        $last = ($txt -split "`r?`n" | Select-String -Pattern 'apt: decompressed .* parsed .* packages' | Select-Object -Last 1)
+        $last = ($txt -split "`r?`n" | Select-String -Pattern 'apt: reading package lists' | Select-Object -Last 1)
         if ($last) { Write-Host ("  ... {0}" -f $last.Line.Trim()) -ForegroundColor DarkGray }
     }
 }
@@ -155,37 +169,44 @@ $serial -split "`r?`n" |
     Select-String -Pattern 'apt:|LIVE_APT_UPDATE|LXSELFTEST live_update|Resident_Index_Footprint|net::tls|busybox' |
     ForEach-Object { $_.Line }
 
-# Progress lines: apt: decompressed <K> KiB, parsed <P> packages[...]
-$progress = [regex]::Matches($serial, 'apt: decompressed (\d+) KiB, parsed (\d+) packages')
-$kibSeq  = @(); $pkgSeq = @()
-foreach ($m in $progress) { $kibSeq += [int64]$m.Groups[1].Value; $pkgSeq += [int64]$m.Groups[2].Value }
+# Progress lines. The kernel's periodic marker is
+#   src/pkg/apt.rs:450 -> "apt: reading package lists... <human bytes> / <N> pkgs"
+# (the older "apt: decompressed K KiB, parsed P packages" format was never
+# emitted by this kernel, so this scan used to match nothing and the
+# monotonicity check below passed vacuously on an empty sequence).
+$progress = [regex]::Matches($serial, 'apt: reading package lists\.\.\. \S+ / (\d+) pkgs')
+$pkgSeq = @()
+foreach ($m in $progress) { $pkgSeq += [int64]$m.Groups[1].Value }
 
 function Test-NonDecreasing($seq) {
     for ($i = 1; $i -lt $seq.Count; $i++) { if ($seq[$i] -lt $seq[$i-1]) { return $false } }
     return $true
 }
 
-$kibMono = Test-NonDecreasing $kibSeq
 $pkgMono = Test-NonDecreasing $pkgSeq
 
-$terminal     = [regex]::Match($serial, 'apt: index loaded \((\d+) packages\)')
+# Terminal marker: the kernel logs "apt: index ready - N packages"
+# (src/pkg/apt.rs:374).
+$terminal     = [regex]::Match($serial, 'apt: index ready - (\d+) packages')
 $liveCount    = [regex]::Match($serial, 'LIVE_APT_UPDATE: count=(\d+)')
 $footprint    = [regex]::Match($serial, 'Resident_Index_Footprint = (\d+) bytes')
 $livePass     = $serial -match 'LXSELFTEST live_update PASS'
 $liveFail     = [regex]::Match($serial, 'LXSELFTEST live_update FAIL[^\r\n]*')
-$tlsWarn      = [regex]::Matches($serial, 'net::tls: HTTPS is INSECURE')
+# The apt transport is HTTP here, so the only TLS this run may show is the
+# verifier refusing a handshake (its error! diagnostics) - reported as evidence
+# that the fail-closed path is on, NOT as an expected warning.
+$tlsRefusal   = [regex]::Matches($serial, 'Package_Fetcher\(tls\): stage=verify cause=[^\r\n]*')
 
 Write-Host "`n================ LIVE-UPDATE REPORT ================" -ForegroundColor Yellow
 Write-Host ("Progress lines observed : {0}" -f $progress.Count)
 if ($progress.Count -gt 0) {
-    Write-Host ("Last progress line      : decompressed {0} KiB, parsed {1} packages" -f $kibSeq[-1], $pkgSeq[-1])
-    Write-Host ("Decompressed KiB monotonic non-decreasing : {0}" -f $kibMono)
+    Write-Host ("Last progress line      : {0} packages parsed" -f $pkgSeq[-1])
     Write-Host ("Parsed packages monotonic non-decreasing  : {0}" -f $pkgMono)
 }
 if ($terminal.Success) {
-    Write-Host ("Terminal `apt: index loaded` reached      : YES ({0} packages)" -f $terminal.Groups[1].Value) -ForegroundColor Green
+    Write-Host ("Terminal `apt: index ready` reached       : YES ({0} packages)" -f $terminal.Groups[1].Value) -ForegroundColor Green
 } else {
-    Write-Host  "Terminal `apt: index loaded` reached      : NO (still progressing or blocked)" -ForegroundColor DarkYellow
+    Write-Host  "Terminal `apt: index ready` reached       : NO (still progressing or blocked)" -ForegroundColor DarkYellow
 }
 if ($liveCount.Success) {
     $n = [int64]$liveCount.Groups[1].Value
@@ -195,7 +216,10 @@ if ($liveCount.Success) {
     Write-Host  "LIVE_APT_UPDATE count   : (not reached)" -ForegroundColor DarkYellow
 }
 if ($footprint.Success) { Write-Host ("Resident_Index_Footprint: {0} bytes" -f $footprint.Groups[1].Value) }
-if ($tlsWarn.Count -gt 0) { Write-Host ("Insecure-TLS warning (R7.4): emitted x{0}" -f $tlsWarn.Count) -ForegroundColor Green }
+if ($tlsRefusal.Count -gt 0) {
+    Write-Host ("TLS verifier refusals on serial: x{0} (fail-closed path active)" -f $tlsRefusal.Count) -ForegroundColor DarkYellow
+    Write-Host ("  first: {0}" -f $tlsRefusal[0].Value.Trim())
+}
 
 if ($livePass) {
     Write-Host "`nLIVE RESULT: PASS (count >= 50000, install + run succeeded)" -ForegroundColor Green

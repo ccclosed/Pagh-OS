@@ -27,6 +27,24 @@ pub fn is_available() -> bool {
     rdseed || rdrand
 }
 
+/// Which hardware entropy instructions this CPU exposes, for diagnostics.
+///
+/// The TLS path refuses to run without one of them, and that refusal is easy
+/// to misread as a network failure: under QEMU the default `qemu64` CPU model
+/// exposes NEITHER instruction, so every live HTTPS check reports
+/// `cause=entropy` until the guest is booted with `-cpu max` (or any other
+/// model that carries RDSEED/RDRAND). `tools/build.py run` and the `e2e_*.ps1`
+/// scripts pass `-cpu max` for exactly this reason.
+pub fn capabilities_str() -> &'static str {
+    let (rdseed, rdrand) = capabilities();
+    match (rdseed, rdrand) {
+        (true, true) => "rdseed+rdrand",
+        (true, false) => "rdseed",
+        (false, true) => "rdrand",
+        (false, false) => "none (boot QEMU with -cpu max to expose RDSEED/RDRAND)",
+    }
+}
+
 #[target_feature(enable = "rdseed")]
 unsafe fn rdseed_word() -> Option<u64> {
     let mut value = 0u64;

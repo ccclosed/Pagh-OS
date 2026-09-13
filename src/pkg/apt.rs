@@ -71,11 +71,14 @@ pub struct AptConfig {
     pub port: u16,
     /// Use HTTPS (TLS 1.3) transport instead of cleartext HTTP.
     ///
-    /// **INSECURE (VARIANT A):** when set, downloads go through
-    /// [`net::tls::https_get`](crate::net::tls::https_get), which encrypts but does
-    /// **not** verify the server certificate (no chain/hostname/expiry checks). The
-    /// default mirror ships with this enabled so the out-of-box experience is
-    /// HTTPS; an insecure-transport warning is logged on first use.
+    /// **Authenticated, fail-closed:** downloads go through
+    /// [`net::tls::https_get`](crate::net::tls::https_get), which validates the
+    /// server chain against the committed CA bundle, authorizes the host through
+    /// the leaf SAN, applies the clock gate and checks the TLS 1.3
+    /// `CertificateVerify`; any failure aborts the handshake. Trust is limited to
+    /// the pinned roots in [`net::ca_bundle`](crate::net::ca_bundle) (ISRG Root
+    /// X1/X2, GTS R1/R4), so an HTTPS mirror outside that set is refused — see
+    /// `SECURITY.md`.
     pub tls: bool,
 }
 
@@ -105,8 +108,8 @@ impl AptConfig {
     }
 
     /// Fetch `path` from this mirror over the configured transport, selecting
-    /// HTTPS ([`net::tls::https_get`](crate::net::tls::https_get), INSECURE — no
-    /// cert verification) or cleartext HTTP
+    /// HTTPS ([`net::tls::https_get`](crate::net::tls::https_get) — fail-closed
+    /// server authentication) or cleartext HTTP
     /// ([`http_get`](crate::net::http_fetch::http_get)) based on [`tls`](Self::tls).
     fn fetch(&self, path: &str) -> Result<Vec<u8>, crate::net::http_fetch::FetchError> {
         if self.tls {
@@ -153,8 +156,12 @@ pub fn config() -> AptConfig {
 /// (normalized to a leading-slash, no-trailing-slash form). The suite/component/
 /// arch are left unchanged.
 ///
-/// NOTE: enabling HTTPS selects the **INSECURE** TLS path (no certificate
-/// verification); a warning is logged on first download.
+/// NOTE: HTTPS authenticates the mirror fail-closed (chain → committed CA
+/// bundle, SAN hostname, validity + clock gate, `CertificateVerify`), so a host
+/// whose chain does not reach one of the pinned roots — or whose certificate does
+/// not authorize the host — is REFUSED rather than fetched from. `http://<host>`
+/// selects cleartext HTTP, which is unauthenticated by construction (integrity
+/// then rests on nothing; see `SECURITY.md`).
 pub fn set_mirror(host: &str, base: Option<&str>) {
     let spec = super::mirror::parse_mirror_arg(host);
 
