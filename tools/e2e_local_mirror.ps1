@@ -177,11 +177,22 @@ function Test-Assert($label, $regex) {
 }
 
 Write-Host "`n================ ASSERTIONS ================" -ForegroundColor Yellow
-$a1 = Test-Assert 'index loaded (>0 packages)' 'apt: index loaded \((\d+) packages\)'
-# NOTE: the kernel logs the mirror host without the port (scheme://host + path),
-# so the first index fetch line reads http://10.0.2.2/.../Packages.gz (no :8000).
-$a2 = Test-Assert 'gz-first index fetch (R5.2)' 'apt: fetching index http://10\.0\.2\.2\S*Packages\.gz'
-$a3 = Test-Assert 'install wrote files onto ext2 /mnt' 'apt: installed \S+ \(\d+ files\)'
+# These regexes are pinned to the EXACT strings the kernel emits. They were
+# previously written against formats the kernel has not used since 891e2c9
+# ("apt: index loaded (N packages)", "apt: fetching index ...", "apt: installed
+# X (N files)"), so three of the five assertions could never match and this
+# deterministic e2e always exited 1. The real lines live in:
+#   src/selftest_lx.rs  -> "LXSELFTEST apt_e2e: index loaded (N packages)"
+#   src/pkg/apt.rs:342  -> "apt: Get <scheme>://<host><path> [suite/comp/arch]"
+#   src/pkg/apt.rs:575  -> "apt: [step/total] Unpacked <pkg> (N files, size)"
+# NOTE: the `apt: Get` line interpolates `cfg.host` verbatim, so it carries the
+# mirror's `:port` exactly as configured (verified against a real run:
+# "apt: Get http://10.0.2.2:8000/dists/stable/main/binary-amd64/Packages.gz").
+# The regex accepts the port optionally so it stays valid if the harness ever
+# serves on 80, and matches the UNCOMPRESSED index the local mini-repo serves.
+$a1 = Test-Assert 'index loaded (>0 packages)' 'LXSELFTEST apt_e2e: index loaded \((\d+) packages\)'
+$a2 = Test-Assert 'index fetch from the local mirror (R5.2)' 'apt: Get http://10\.0\.2\.2(?::\d+)?/.*Packages'
+$a3 = Test-Assert 'install wrote files onto ext2 /mnt' 'apt: \[\d+/\d+\] Unpacked \S+ \(\d+ files,'
 $a4 = Test-Assert 'apt_e2e PASS' 'LXSELFTEST apt_e2e PASS[^\r\n]*'
 $a5 = Test-Assert 'installed static binary ran' 'hello from apt'
 

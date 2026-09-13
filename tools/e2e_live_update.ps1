@@ -149,7 +149,7 @@ while ((Get-Date) -lt $deadline) {
             break
         }
         # Heartbeat: surface the most recent progress line as we wait.
-        $last = ($txt -split "`r?`n" | Select-String -Pattern 'apt: decompressed .* parsed .* packages' | Select-Object -Last 1)
+        $last = ($txt -split "`r?`n" | Select-String -Pattern 'apt: reading package lists' | Select-Object -Last 1)
         if ($last) { Write-Host ("  ... {0}" -f $last.Line.Trim()) -ForegroundColor DarkGray }
     }
 }
@@ -169,20 +169,25 @@ $serial -split "`r?`n" |
     Select-String -Pattern 'apt:|LIVE_APT_UPDATE|LXSELFTEST live_update|Resident_Index_Footprint|net::tls|busybox' |
     ForEach-Object { $_.Line }
 
-# Progress lines: apt: decompressed <K> KiB, parsed <P> packages[...]
-$progress = [regex]::Matches($serial, 'apt: decompressed (\d+) KiB, parsed (\d+) packages')
-$kibSeq  = @(); $pkgSeq = @()
-foreach ($m in $progress) { $kibSeq += [int64]$m.Groups[1].Value; $pkgSeq += [int64]$m.Groups[2].Value }
+# Progress lines. The kernel's periodic marker is
+#   src/pkg/apt.rs:450 -> "apt: reading package lists... <human bytes> / <N> pkgs"
+# (the older "apt: decompressed K KiB, parsed P packages" format was never
+# emitted by this kernel, so this scan used to match nothing and the
+# monotonicity check below passed vacuously on an empty sequence).
+$progress = [regex]::Matches($serial, 'apt: reading package lists\.\.\. \S+ / (\d+) pkgs')
+$pkgSeq = @()
+foreach ($m in $progress) { $pkgSeq += [int64]$m.Groups[1].Value }
 
 function Test-NonDecreasing($seq) {
     for ($i = 1; $i -lt $seq.Count; $i++) { if ($seq[$i] -lt $seq[$i-1]) { return $false } }
     return $true
 }
 
-$kibMono = Test-NonDecreasing $kibSeq
 $pkgMono = Test-NonDecreasing $pkgSeq
 
-$terminal     = [regex]::Match($serial, 'apt: index loaded \((\d+) packages\)')
+# Terminal marker: the kernel logs "apt: index ready - N packages"
+# (src/pkg/apt.rs:374).
+$terminal     = [regex]::Match($serial, 'apt: index ready - (\d+) packages')
 $liveCount    = [regex]::Match($serial, 'LIVE_APT_UPDATE: count=(\d+)')
 $footprint    = [regex]::Match($serial, 'Resident_Index_Footprint = (\d+) bytes')
 $livePass     = $serial -match 'LXSELFTEST live_update PASS'
@@ -195,14 +200,13 @@ $tlsRefusal   = [regex]::Matches($serial, 'Package_Fetcher\(tls\): stage=verify 
 Write-Host "`n================ LIVE-UPDATE REPORT ================" -ForegroundColor Yellow
 Write-Host ("Progress lines observed : {0}" -f $progress.Count)
 if ($progress.Count -gt 0) {
-    Write-Host ("Last progress line      : decompressed {0} KiB, parsed {1} packages" -f $kibSeq[-1], $pkgSeq[-1])
-    Write-Host ("Decompressed KiB monotonic non-decreasing : {0}" -f $kibMono)
+    Write-Host ("Last progress line      : {0} packages parsed" -f $pkgSeq[-1])
     Write-Host ("Parsed packages monotonic non-decreasing  : {0}" -f $pkgMono)
 }
 if ($terminal.Success) {
-    Write-Host ("Terminal `apt: index loaded` reached      : YES ({0} packages)" -f $terminal.Groups[1].Value) -ForegroundColor Green
+    Write-Host ("Terminal `apt: index ready` reached       : YES ({0} packages)" -f $terminal.Groups[1].Value) -ForegroundColor Green
 } else {
-    Write-Host  "Terminal `apt: index loaded` reached      : NO (still progressing or blocked)" -ForegroundColor DarkYellow
+    Write-Host  "Terminal `apt: index ready` reached       : NO (still progressing or blocked)" -ForegroundColor DarkYellow
 }
 if ($liveCount.Success) {
     $n = [int64]$liveCount.Groups[1].Value
