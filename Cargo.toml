@@ -124,8 +124,13 @@ xz4rust = { version = "=0.2.1", default-features = false, features = ["alloc", "
 # kernel's verifier — chain validation to `net::ca_bundle`, SAN hostname
 # authorization, validity + clock gate, and the `CertificateVerify` signature are
 # all mandatory, and `embedded-tls`'s "no verifier ⇒ skip verification" branch is
-# unreachable on this path. Repository metadata signatures are still unverified:
-# see `SECURITY.md`.
+# unreachable on this path.
+#
+# This pin carries ONE deliberate local patch (see AGENTS.md, "vendor/"): upstream
+# accepted a server `Finished` that was not preceded by `Certificate` /
+# `CertificateVerify`, so a peer could skip verification altogether. The patched
+# `connection.rs` enforces the RFC 8446 §4.4.2.4 ordering. Repository metadata
+# signatures are still unverified: see `SECURITY.md`.
 embedded-tls = { version = "=0.19.0", default-features = false, features = ["alloc"] }
 # Sync + async byte-IO traits implemented by the smoltcp TCP transport adapter in
 # `src/net/tls.rs`. `embedded-tls` speaks `embedded-io-async`; the adapter bridges

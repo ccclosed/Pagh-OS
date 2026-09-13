@@ -173,6 +173,31 @@ fn bundle_anchors() -> Vec<TrustAnchor<'static>> {
 /// same handshake. A verifier that was never given a certificate cannot
 /// verify a signature ([`TlsError::InvalidCertificate`]), so the ordering
 /// "certificate first, then CertificateVerify" is enforced, not assumed.
+/// Counts completed server authentications, process-wide.
+///
+/// [`KernelVerifier::verify_certificate`] increments it only after the full
+/// decision (chain → committed CA bundle, SAN hostname, validity + clock gate)
+/// succeeded. [`https_get`] snapshots it before the handshake and requires the
+/// value to have advanced before it will send a single application byte.
+///
+/// WHY THIS EXISTS ON TOP OF THE HANDSHAKE STATE MACHINE: a TLS 1.3 client must
+/// reject a server `Finished` that was not preceded by `Certificate` and
+/// `CertificateVerify` (RFC 8446 §4.4.2.4). `vendor/embedded-tls` did not
+/// enforce that, so a peer could omit both messages, still reach
+/// `ApplicationData`, and never invoke this verifier at all — the whole
+/// fail-closed story silently bypassed. The vendored state machine is patched
+/// to enforce it (`connection.rs`, `process_server_verify`, `certificate_received`
+/// / `certificate_verified`), and this counter is the belt to that braces: it
+/// makes "the handshake completed" and "a certificate was actually verified"
+/// two separately checked facts at the kernel call site, so a future vendored
+/// bump or a `vendor/` refresh cannot quietly restore the fail-open path.
+static VERIFIED_HANDSHAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`VERIFIED_HANDSHAKES`], taken before a handshake starts.
+fn verified_handshakes() -> u64 {
+    VERIFIED_HANDSHAKES.load(core::sync::atomic::Ordering::Acquire)
+}
+
 #[derive(Default)]
 struct KernelVerifier {
     /// Connection target from `TlsConfig::server_name` — always set by
@@ -226,6 +251,10 @@ impl TlsVerifier<Aes128GcmSha256> for KernelVerifier {
                 self.leaf_key = Some(auth.leaf_key);
                 use sha2::Digest;
                 self.transcript = Some(transcript.clone().finalize().to_vec());
+                // The chain/SAN/clock decision passed for THIS connection's
+                // leaf: record it so `https_get` can tell "handshake completed
+                // with a verified server" from "handshake completed".
+                VERIFIED_HANDSHAKES.fetch_add(1, core::sync::atomic::Ordering::Release);
                 Ok(())
             }
             Err(e) => {
@@ -604,11 +633,31 @@ pub fn https_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchErro
     let mut tls: TlsConnection<TlsTransport, Aes128GcmSha256> =
         TlsConnection::new(transport, &mut read_buf[..], &mut write_buf[..]);
 
+    // Snapshot the authentication counter BEFORE the handshake: `open()`
+    // returning `Ok` is not by itself proof that a server certificate was
+    // verified, so the counter must advance (see `VERIFIED_HANDSHAKES`).
+    let auth_before = verified_handshakes();
+
     let result = block_on(async {
         // Handshake — server authenticated (chain + hostname + clock +
         // CertificateVerify) through `KernelProvider::verifier`.
         let context = TlsContext::new(&config, KernelProvider::new());
         tls.open(context).await.map_err(map_tls_err("handshake"))?;
+
+        // The handshake completed. Belt to the state machine's braces: refuse
+        // to move any application byte unless a certificate was actually
+        // verified for THIS handshake. A peer that omits `Certificate` and
+        // `CertificateVerify` (which the TLS 1.3 state machine must reject, and
+        // now does) would land here with the verifier never invoked.
+        if verified_handshakes() == auth_before {
+            error!(
+                "Package_Fetcher(tls): stage=verify host={} path={} cause=InvalidCertificate \
+                 (handshake completed without a verified server certificate — refusing to \
+                 continue)",
+                host, path
+            );
+            return Err(FetchError::Tls("unverified"));
+        }
 
         // Send the HTTP/1.1 GET through the encrypted channel.
         let req = build_get_request(host, path);
