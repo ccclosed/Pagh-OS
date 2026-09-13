@@ -381,7 +381,25 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs) -> u64 {
     // nanosleep). With IF masked, `ticks()` never advances — timeouts can
     // never fire — and `hlt` inside `sleep_ticks` would sleep forever. The
     // syscall exit stub re-masks IF (`cli`) before unwinding the frame.
-    crate::arch::cpu::enable_interrupts();
+    //
+    // ONLY when IF was already set on entry, however. The boot-time selftest
+    // (`selftest_lx`) calls into this dispatcher DIRECTLY, from the boot thread,
+    // with interrupts still masked (the whole boot path runs that way until
+    // `boot::kernel_main` enables them just before the idle loop). Unmasking
+    // there is a silent machine hang, not a speedup: the boot thread has
+    // `current_pid() == IDLE_PID`, so the first timer tick files its stack under
+    // the idle task and switches to the always-ready shell/net threads — and
+    // because those two are permanently in the ready queue, the tick never
+    // restores the boot thread, which stays parked mid-`sti` forever (the
+    // harness then dies before its post-network checks are ever spawned, with
+    // no diagnostics). Real syscalls are unaffected: both entry stubs clear IF
+    // before dispatching, so they observe `false` here and unmask exactly as
+    // before — that is what keeps blocking syscalls ticking. The boot thread
+    // reaches the idle loop still masked and enables interrupts there, as
+    // designed.
+    if crate::arch::cpu::interrupts_enabled() {
+        crate::arch::cpu::enable_interrupts();
+    }
 
     let (nr, args) = abi::marshal_args(r.rax, r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9);
 

@@ -632,7 +632,13 @@ impl embedded_io_async::Write for TlsTransport {
 /// released and exactly one structured diagnostic is emitted.
 pub fn https_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchError> {
     if !crate::security::entropy::is_available() {
-        error!("Package_Fetcher(tls): stage=entropy host={} path={} cause=Tls (secure hardware entropy unavailable)", host, path);
+        error!(
+            "Package_Fetcher(tls): stage=entropy host={} path={} cause=Tls \
+             (secure hardware entropy unavailable: CPUID reports {})",
+            host,
+            path,
+            crate::security::entropy::capabilities_str()
+        );
         return Err(FetchError::Tls("entropy"));
     }
 
