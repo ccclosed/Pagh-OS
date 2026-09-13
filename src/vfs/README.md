@@ -9,17 +9,17 @@
 | Файл | Роль |
 |---|---|
 | `mod.rs` | Ядро VFS: трейт `VfsNode`, `VfsError`, `FsStat`, резолв путей (`lookup_path`), монтирование (`mount_at`/`MountNode`), синтетический `/dev` (`NullDevice`, `SerialDevice`, `DevDirectory`), корень (`RootDirectory`), `init()` |
-| `ramfs.rs` | In-memory ФС для `/tmp`; единственное дерево с настоящими `create_dir`/`create_file`/`remove` |
-| `elf.rs` | Эффектный загрузчик ELF64: `ElfLoader::load` (нативный `ET_EXEC`), `ElfLoader::load_linux` (static + static-PIE), `ElfLoader::map_interpreter`; `ElfProcess` |
+| `ramfs.rs` | In-memory ФС для `/tmp`; единственная in-memory-ФС с настоящими `create_dir`/`create_file`/`remove` (на диске то же умеет ext2-каталог под `/mnt`) |
+| `elf.rs` | Эффектный загрузчик ELF64: `ElfLoader::load` (нативный `ET_EXEC`), `ElfLoader::load_linux` (`ET_EXEC`, static-PIE `ET_DYN` и glibc-dynamic образы — `PT_INTERP` подшивается отдельно через `map_interpreter`), `ElfLoader::map_interpreter`; `ElfProcess` |
 | `elf_classify.rs` | Чистый core-only классификатор ELF (`classify_elf`, `ElfKind`, `ElfVerdict`) и выбор bias для static-PIE (`choose_bias`, `PIE_BASE`); включается в host-tests |
 
 ## Ключевые символы
 
 - `VfsResult<T>`, `VfsError::{NotFound, NotSupported, InvalidArgument, IoError, AlreadyExists}`.
 - `FsStat { block_size, blocks_total, blocks_free, inodes_total, inodes_free }` — для `statfs`/`fstatfs`.
-- `trait VfsNode: Send + Sync` — методы с дефолтом `Err(NotSupported)`:
-  `name, is_directory, fs_stat, read, write, truncate, readdir, lookup, size, fs_ino,
-  create_dir, create_file, remove, sync`.
+- `trait VfsNode: Send + Sync` — обязательные только `name`/`is_directory`; дефолты:
+  `read/write/truncate/readdir/create_dir/create_file/remove` → `Err(NotSupported)`,
+  `lookup` → `Err(NotFound)`, `fs_stat` → `None`, `size`/`fs_ino` → `0`, `sync` → no-op.
 - `init()`, `mount_at(path, node)`, `lookup_path(path)`.
 - `elf`: `ElfLoader::{load, load_linux, map_interpreter}`,
   `ElfProcess { entry, pml4_phys, load_bias, phdr_vaddr, phent, phnum, initial_brk }`.
@@ -31,7 +31,9 @@
 - Один плоский трейт нод; каталоги — ноды с `readdir`/`lookup`. Никакого dcache;
   fd-таблица живёт в `task::fd`. `lookup_path` режет по `/`, пустые компоненты пропускает.
 - `mount_at` подсоединяет поддерево под одно-компонентное имя верхнего уровня (`"/mnt"`),
-  оборачивая в `MountNode` (форвард всех методов). Повторный mount того же имени заменяет.
+  оборачивая в `MountNode` (форвард методов; **`fs_ino` не форвардится** — сам корень
+  монтирования отдаёт 0, хотя нижележащий каталог имеет настоящий inode). Повторный mount
+  того же имени заменяет.
   **Ограничение v1: только одноуровневые монтирования** (`"/a/b"` → `InvalidArgument`).
 
 ### Синтетика и ramfs
@@ -39,8 +41,10 @@
   write через `drivers::serial::write_bytes` — побайтово, без UTF-8-энкода).
 - ramfs: `RamDir` = `Spinlock<BTreeMap<String, Arc<dyn VfsNode>>>`, `RamFile` = `Spinlock<Vec<u8>>`;
   запись за EOF заполняет дыры нулями (`try_reserve` заранее — чтобы огромный offset не абортнул
-  кучу). `remove` непустого каталога → `NotSupported`. Счётчик inode стартует с `0x0054_0000`
-  (далеко за диапазоном ext2), чтобы glibc ld.so дедуплицировал корректно.
+  кучу). `remove` непустого каталога → `NotSupported`. Счётчик inode стартует с `0x0054_0000` —
+  выше диапазона, который выдаёт ext2-форматтер на дисках примерно до 84 ГиБ (`st_dev` у всех
+  VFS-файлов один, поэтому пары `(st_dev, st_ino)` не должны пересекаться), чтобы glibc ld.so
+  дедуплицировал корректно.
 - `/tmp` появился из-за nvim: `vim_mktempdir` делает `mkdir("/tmp/nvim.XXXXXX")`.
 
 ### ELF-загрузчик

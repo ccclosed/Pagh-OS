@@ -59,6 +59,10 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
 
 Грабли: `create_user_process` обязан идти с выключенными прерываниями (тик, увидев чужой CR3,
 ломает планирование); отсутствие диска/NIC — warn, не fatal; ext2-маунт до включения прерываний.
+`linux_dispatch(regs, reentry_allowed)` размаскирует IF только при ненулевом втором аргументе:
+оба входных стаба передают 1 (настоящий syscall на планируемой задаче), а boot-selftest —
+0, потому что загрузочный поток ещё не планируемая задача и размаскировка там паркует его
+навсегда на первом же тике.
 
 ### `log.rs` — логгирование
 Leveled-фасад: `error!/warn!/info!/debug!/trace!` + runtime-фильтр (`ACTIVE_LEVEL`, дефолт Info).
@@ -81,7 +85,8 @@ Sinks: serial всегда, framebuffer условно. Гейты fb-зерка
 Компилируется только под `lx_selftest`/`lx_livetest`/`lx_bigindex`.
 - `run()` — 13 проверок до включения прерываний: end-to-end запуск hand-assembled Linux ELF
   (write + exit_group), изоляция exit, ENOENT, arch_prctl/uname/tid, сохранность регистров
-  через `linux_dispatch`, OOM-rollback brk/mmap, fetch без сети, ext2 install roundtrip,
+  через `linux_dispatch` (прямой вызов с `reentry_allowed = 0` — см. «Грабли» ниже),
+  OOM-rollback brk/mmap, fetch без сети, ext2 install roundtrip,
   getcwd/chdir/dup/gettimeofday/getdents.
 - `run_post_net_checks()` — apt E2E через локальное мини-зеркало (`tools/mini_repo.py`) +
   HTTPS smoke (реальный TLS 1.3 GET на deb.debian.org).
@@ -93,7 +98,7 @@ Sinks: serial всегда, framebuffer условно. Гейты fb-зерка
 убила бы харнесс (`panic = "abort"`). Хелпер `with_synth_compat` ставит временный
 `CompatState`; scratch-страница на `0x0000_4000_0000_0000` для user-указателей.
 
-### `test.rs` — in-QEMU kernel self-test suite (~45 рутин)
+### `test.rs` — in-QEMU kernel self-test suite (56 рутин)
 - `assert_kernel!`/`assert_eq_kernel!` печатают `FAIL: file:line: msg` и продолжают (не аборт).
 - `all_tests() -> Vec<(&'static str, fn())>`; `run_all()` — вызывается вручную командой
   `selftest` в shell, не на буте. Все рутины неразрушающие (восстанавливают PMM, кучу, IF, VFS).

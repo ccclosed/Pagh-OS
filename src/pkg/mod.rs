@@ -3,12 +3,13 @@
 //! This subsystem turns a downloaded `.deb` byte buffer into files installed on
 //! the ext2 filesystem. It is split along the R11.6 pure-function boundary:
 //!
-//!   * [`deb`] — pure `ar` container enumeration, `.deb` member location, and
-//!     compression-suffix classification (design component 8, R9). The effectful
-//!     decompression shell is added to the same module by a later task.
+//!   * [`deb`] — pure `ar` container enumeration, `.deb` member location,
+//!     compression-suffix classification (design component 8, R9) and the
+//!     effectful decompression shell (whole-buffer and streaming).
 //!
-//! Later tasks add `tar` (the ustar reader/writer, component 9) and `install`
-//! (the ext2 installer + path normalization, component 10) as sibling modules.
+//! Sibling modules [`tar`] (the ustar reader/writer, component 9), [`install`]
+//! (the pure path-normalization/install model) and [`install_fs`] (the effectful
+//! ext2 installer, component 10) are already in place.
 //!
 //! Everything in [`deb`] is `core` + `alloc` only — no hardware, no globals — so
 //! the `host-tests` crate `#[path]`-includes the same source and property-tests

@@ -11,13 +11,14 @@
 | `host_tests.py` | Обёртка: определяет host triple через `rustc -vV`, запускает `cargo test --locked --target <host>` в `host-tests/` |
 | `check_safety.py` | CI-гейт unsafe-политики: сканирует `src/security/`, `src/arch/x86_64/linux/mod.rs`, `src/memory/vmm.rs`, `src/net/tls.rs`, `src/pkg/apt.rs` — каждый `unsafe {` обязан иметь `SAFETY:`-коммент в предыдущих 6 строках, иначе exit 1 |
 | `gen_ca_bundle.py` | Генератор trust-anchor бандла TLS-верификатора: скачивает curl/Mozilla CA extract, выбирает корни по subject CN (ISRG Root X1/X2, GTS R1/R4), пишет детерминированный `src/net/ca_bundle.rs` (DER-массивы + метки); сгенерированный файл коммитится, перегенерация — только осознанно |
+| `fetch_p44_fixtures.py` | Генератор фикстур host-свойства P44: скачивает реальные ISRG Root X1 и лист `deb.debian.org`, пишет `host-tests/src/properties/p44_fixture_{root,leaf}.rs` (закоммичены; перегенерация — осознанно) |
 | `mini_repo.py` | Мини Debian-зеркало в `tools/mini_repo/` для apt-E2E |
 | `build-rust-app.sh` | Сборка userland-приложений (`rust-apps/`) под `x86_64-unknown-linux-musl` |
 | `e2e_local_mirror.ps1` | Детерминированный apt E2E: release-сборка c `--features lx_selftest`, stage, serve mini_repo, QEMU, assert serial-маркеров |
 | `e2e_live_update.ps1` | Live `apt update` против `deb.debian.org` (`--features lx_livetest`) по HTTP (embedded-tls висит на ~12 MiB, issue #19); assert `LIVE_APT_UPDATE: count=N`, N ≥ 50000; тайминги soft |
 | `e2e_bigindex.ps1` | Репро parse-краша #14 (`--features lx_bigindex`, `-InRam` добавляет `lx_bigindex_inram`); скан serial на `[EXC #14]` |
 | `smoke_assertions.ps1` | Проверка smoke-критериев R4.1/R4.2/R7.4 по захваченным serial-логам (промпт достигнут, debug-link работает, аутентификация HTTPS-сервера подтверждена: `LXSELFTEST https_get PASS` либо отказ верификатора `Package_Fetcher(tls): stage=verify cause=…`) |
-| `mini_repo/` | Сгенерированное дерево зеркала (gitignored) |
+| `mini_repo/` | Сгенерированное дерево зеркала (**закоммичено**, чтобы e2e не требовал сборки) |
 
 ## build.py — как собирается ядро
 
@@ -27,13 +28,16 @@
 - `stage`: чистка + пересборка `iso_root/` — `pagh.elf` в корень, `EFI/BOOT/BOOTX64.EFI`
   через `limine.py` (любая локальная `limine*/`-дерево, иначе автоскачивание),
   `boot/limine.conf` записывается в двух местах (корень ISO + `EFI/BOOT/`).
-- `run`: stage + QEMU (`-bios OVMF.fd`, `fat:rw:iso_root`, virtio-blk `disk.img`, e1000 NIC
+- `run`: stage + QEMU (`-cpu max` по умолчанию, `-bios <OVMF>`, `fat:rw:iso_root`, virtio-blk `disk.img`, e1000 NIC
   с hostfwd `tcp/udp 5555->7`, `-m 1024M`, `-serial stdio`, debug-трейс в `qemu_debug.log`).
   По умолчанию `-cpu max`: TLS-путь требует RDSEED/RDRAND, которых у дефолтного `qemu64`
   нет, поэтому живой HTTPS-чек падает с `stage=entropy` (и ничего не объясняет).
-- Env-оверрайды: `LIMINE_DIR`/`LIMINE_EFI` (иначе автопоиск/автоскачивание), `OVMF` (дефолт
-  `OVMF.fd` из корня репо; если его нет — системный `OVMF_CODE.fd`, напр.
-  `/usr/share/edk2/ovmf/`), `PAGH_DISK` (дефолт `disk.img`), `PAGH_QEMU_CPU` (дефолт `max`).
+- Env-оверрады: `LIMINE_DIR`/`LIMINE_EFI` (иначе автопоиск/автоскачивание), `OVMF`/`--ovmf`
+  (если заданы и файл существует — берутся они; иначе `OVMF.fd` из корня репо; иначе системный
+  `OVMF_CODE.fd`, напр. `/usr/share/edk2/ovmf/`), `PAGH_DISK` (дефолт `disk.img`),
+  `PAGH_QEMU_CPU` (дефолт `max` — **только для `build.py`**: три `e2e_*.ps1` жёстко передают
+  `-cpu max`, `run.sh` читает другое имя `PAGH_CPU`, а `run.cmd` `-cpu` не передаёт вообще,
+  поэтому на Windows-пути живой HTTPS-чек упадёт в `stage=entropy`).
 
 ## mini_repo.py
 
@@ -46,8 +50,9 @@
 
 - Общий паттерн: сборка feature-ELF → перезапись `iso_root/pagh.elf` → serve → QEMU →
   assert по serial → восстановление дефолтного ELF. `-KeepArtifacts` сохраняет артефакты.
-- Параметры: `-Port` (8000), `-TimeoutSec` (120 / 1200 / 240), `-KeepArtifacts`,
-  `-InRam` (только bigindex), `-SkipDebugBuild` (smoke).
+- Параметры: `-Port` (8000; `e2e_local_mirror`/`e2e_bigindex`), `-Stanzas` (60000; только
+  `e2e_bigindex`), `-TimeoutSec` (120 / 1200 / 240), `-KeepArtifacts`, `-InRam` (только
+  bigindex), `-SkipDebugBuild` (smoke). У `e2e_live_update.ps1` параметра `-Port` нет.
 - Замечание: `mini_repo.py serve` слушает 0.0.0.0; скрипты ждут раскладки
   `BOOTX64.EFI` (через `limine.py`) + `OVMF.fd`.
 

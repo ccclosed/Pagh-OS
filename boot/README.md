@@ -11,7 +11,7 @@
 
 ## Как используется
 
-`tools/build.py stage` (и `build.sh --stage`, `run.cmd`) кладёт файл в два места
+`tools/build.py stage` (и `build.sh --stage`) кладёт файл в два места
 собираемого `iso_root/`: корень ISO и `EFI/BOOT/limine.conf`. Ядро обязано называться
 ровно `pagh.elf` в корне ESP.
 
@@ -21,5 +21,7 @@
   без неё Limine не видит валидных kernel-записей; higher-half база `0xffffffff80000000`.
 - `limine.py` (`tools/`) — версионно-независимый локатор/установщик загрузчика
   (`BOOTX64.EFI`): автопоиск или скачивание последнего релиза в `limine/`.
-- Фоновые `.cmd`-скрипты (`boot_qemu_bg.cmd` и др.) генерируют собственный inline-конфиг
-  с `timeout: 0` и этот файл не используют.
+- `run.cmd` и фоновые `.cmd`-скрипты (`boot_qemu_bg.cmd`, `boot_net_bg.cmd`,
+  `boot_virtio_bg.cmd`) генерируют собственный inline-конфиг и канонический файл не читают:
+  `run.cmd` пишет `timeout: 5`/`verbose: yes`/`serial: yes` прямо в `iso_root\limine.conf`,
+  фоновые — `timeout: 0`.

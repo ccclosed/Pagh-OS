@@ -170,8 +170,13 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   fully backward-compatible ones. Precedent: `release 1.1.0: the tick-rate
   change is a feature (behavior change), so minor bump, not patch`.
   Land the bump in the same PR (or the final commit of a stacked series)
-  that ships the feature — not some day later. Current 2.1.0 = the COW
-  fork/demand-paging drop (PR #8) + real POSIX signal delivery (PRs #9/#10).
+  that ships the feature — not some day later. **Current 2.3.0** = fail-closed
+  TLS server authentication (issue #14 series, PRs #22–#30): chain to the
+  committed CA bundle, SAN authorization, the 2025 clock gate and
+  `CertificateVerify`, plus the certificate-omission bypass closed in the
+  vendored `embedded-tls`. Previous minors: 2.2.0 = low-RAM heap cap +
+  version-agnostic Limine loader; 2.1.0 = the COW fork/demand-paging drop
+  (PR #8) + real POSIX signal delivery (PRs #9/#10).
 - **PATCH** — fixes, diagnostics, docs, tooling, vendored-dep refreshes with
   no behavior change. Docs-only commits (this file, READMEs) do not bump.
 - **Tags**: tag the release commit with the bare version string (`2.1.0`,

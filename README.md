@@ -448,12 +448,16 @@ python
   server certificate chain is validated against the committed CA bundle, the hostname against
   the leaf SAN entries, validity windows are enforced (with a hard clock gate — an unset RTC
   refuses the handshake), and the `CertificateVerify` signature is checked against the leaf
-  key. Trust is limited to the bundle's four pinned roots (ISRG Root X1/X2, GTS R1/R4), and
-  revocation (CRL/OCSP) is not checked, so an HTTPS mirror outside that issuance is refused
-  rather than trusted. What is still missing is repository-side trust: Debian metadata
-  signatures and complete per-package digest verification. Plain-HTTP mirrors
+  key. The verifier cannot be skipped by omission either: the vendored `embedded-tls` refuses a
+  server `Finished` that was not preceded by `Certificate`/`CertificateVerify` (RFC 8446
+  §4.4.2.4), and `net::tls` independently requires its authentication counter to advance before
+  any application byte moves. Trust is limited to the bundle's four pinned roots (ISRG Root
+  X1/X2, GTS R1/R4), and revocation (CRL/OCSP) is not checked, so an HTTPS mirror outside that
+  issuance is refused rather than trusted. What is still missing is repository-side trust:
+  Debian metadata signatures and complete per-package digest verification. Plain-HTTP mirrors
   (`apt setmirror http://…`) remain unauthenticated by construction, and live `apt update`
-  currently uses HTTP because of the embedded-tls large-stream hang (issue #19).
+  currently uses HTTP because of the embedded-tls large-stream hang (issue #19). The MITM
+  negative tests for these paths are not written yet — see `SECURITY.md`.
 - **Scale.** The full Debian `main` index (~60k packages, ~150 MiB decompressed) is streamed
   and parsed into a compact in-RAM byte-arena index (kept in RAM only, rebuilt per boot).
   End-to-end install is proven against a local mirror; a live full `apt update` from
@@ -599,8 +603,9 @@ comments.
   contiguous-frame allocation for DMA. `free_frame`/`free_frames_contiguous` refuse to
   return any reserved frame (below 1 MB, kernel image, or the bitmap itself) to the
   allocatable pool, so a stray free cannot corrupt the pool. The VMM propagates
-  `USER_ACCESSIBLE` through intermediate page tables and exposes
-  `map_mmio`/`identity_map_range`. The global heap allocator is an IRQ-safe wrapper over
+  `USER_ACCESSIBLE` through intermediate page tables and exposes `map`/`map_mmio`/
+  `unmap` plus the COW fork helpers (`fork_user_space_cow`/`cow_copy_page`). The global
+  heap allocator is an IRQ-safe wrapper over
   galloc (interrupts are disabled while the allocator lock is held), so allocation from
   interrupt context can never deadlock the kernel.
 - **Storage.** virtio-blk presents a `BlockDevice` that reports its real capacity via

@@ -26,10 +26,10 @@ TLS peer authentication IS implemented (chain, hostname, expiry and `Certificate
 
 Before enabling networking by default, implement and test:
 
-1. ~~CA-chain, hostname, validity-period, and signature verification in TLS.~~ **Done** — `net::tls` / `net::tls_auth` / `net::tls_chain` / `net::ca_bundle`; trust is limited to four pinned roots (ISRG Root X1/X2, GTS R1/R4), and revocation (CRL/OCSP) is still unchecked.
+1. ~~CA-chain, hostname, validity-period, and signature verification in TLS.~~ **Done** — `net::tls` / `net::tls_auth` / `net::tls_chain` / `net::ca_bundle`; trust is limited to four pinned roots (ISRG Root X1/X2, GTS R1/R4), and revocation (CRL/OCSP) is still unchecked. The verifier also cannot be skipped by omitting the certificate: `vendor/embedded-tls` refuses a server `Finished` that was not preceded by `Certificate`/`CertificateVerify` (RFC 8446 §4.4.2.4), with `net::tls::VERIFIED_HANDSHAKES` as an independent kernel-side gate.
 2. Trusted-key verification of Debian `InRelease`/`Release.gpg`.
 3. SHA-256 binding from trusted Release metadata to `Packages`, and from `Packages` to every `.deb`.
 4. Revocation/update policy for trust roots.
-5. MITM and corrupted-artifact integration tests.
+5. MITM and corrupted-artifact integration tests. **Open, and the largest remaining gap.** The certificate-omission MITM is now rejected (item 1) and a wrong-host or untrusted-chain certificate is rejected by `net::tls_auth`, but neither case has an automated test: the first needs a TLS server that deliberately skips `Certificate` (rustls will not), the second a server presenting a foreign chain. Both currently rest on code review, the host property tests (P47–P49) and the kernel-side gate rather than on an integration test.
 
 These items require choosing and reviewing a no-std X.509/OpenPGP trust stack; they must not be approximated with ad-hoc cryptography.

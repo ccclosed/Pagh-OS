@@ -47,7 +47,8 @@ fn disable_pic() {
 }
 
 unsafe fn lapic_write(reg: u32, value: u32) {
-    // LAPIC_BASE is already mapped to HHDM in lib.rs, so we don't add HHDM again
+    // LAPIC_BASE holds an already-HHDM-mapped virtual base: `init_apic` stores
+    // what `vmm::map_mmio` returned, so HHDM must NOT be added again here.
     let addr = (LAPIC_BASE.load(Ordering::Relaxed) + reg as u64) as *mut u32;
     // SAFETY: LAPIC_BASE holds the HHDM-mapped LAPIC MMIO virtual base, set once
     // in `init` before any register access; `addr` is therefore a valid mapped
@@ -56,7 +57,7 @@ unsafe fn lapic_write(reg: u32, value: u32) {
 }
 
 unsafe fn lapic_read(reg: u32) -> u32 {
-    // LAPIC_BASE is already mapped to HHDM in lib.rs, so we don't add HHDM again
+    // LAPIC_BASE holds an already-HHDM-mapped virtual base (see `lapic_write`).
     let addr = (LAPIC_BASE.load(Ordering::Relaxed) + reg as u64) as *const u32;
     // SAFETY: LAPIC_BASE holds the HHDM-mapped LAPIC MMIO virtual base, set once
     // in `init` before any register access; `addr` is therefore a valid mapped

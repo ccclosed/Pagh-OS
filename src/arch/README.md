@@ -23,7 +23,7 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 
 | Файл | Роль |
 |---|---|
-| `mod.rs` | Корень; `linux_dispatch(regs: *mut SavedRegs)` — главный вход; `check_user_ptr` — единая точка валидации user-указателей; гейт поддерживаемого набора; watchdog зависших syscall'ов |
+| `mod.rs` | Корень; `linux_dispatch(regs: *mut SavedRegs, reentry_allowed: u64)` — главный вход (второй аргумент `REENTRY_ALLOWED` разрешает размаскировать IF: его передают оба входных стаба, boot-selftest передаёт 0); `check_user_ptr` — единая точка валидации user-указателей; гейт поддерживаемого набора; watchdog зависших syscall'ов |
 | `regs.rs` | `SavedRegs` — 15-GPR фрейм, общий контракт обоих входных стабов |
 | `abi.rs` | Чистый маршаллинг аргументов (`marshal_args`), membership поддерживаемого набора, константы номеров |
 | `validate.rs` | Чистая валидация user-указателей (`spanned_pages`, границы/переполнение, без разыменований) |
@@ -43,10 +43,12 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 | `timeconv.rs` | Чистый BCD-декод и civil-date → Unix-seconds (хост-тестируемый) |
 | `rand_clock.rs` | Чистое планирование `getrandom`/`ticks_to_timespec` |
 | `diag.rs` | Чистая дедупликация nosys-логов per-process и нормализация exit-кодов (139 = 128+SIGSEGV) |
+| `signal.rs` | Доставка POSIX-сигналов: очередь pending, `deliver_one_pending` в эпилоге `linux_dispatch` (точка возврата из syscall), `rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`, `tgkill`, маски |
+| `signal_frame.rs` | Чистая сборка/разбор `rt_sigframe` на user-стеке (хост-тестируемая) |
 
-Чистые модули (`abi`, `diag`, `dirent`, `errno`, `io`, `mem`, `rand_clock`, `stat`, `timeconv`,
-`validate`) через `#[path]` включаются в хост-крейт `host-tests` — они обязаны быть
-только `core`+`alloc`.
+Чистые модули (`abi`, `diag`, `dirent`, `errno`, `io`, `mem`, `rand_clock`, `signal_frame`,
+`stat`, `timeconv`, `validate`) через `#[path]` включаются в хост-крейт `host-tests` — они
+обязаны быть только `core`+`alloc`.
 
 ## Ключевые символы
 
@@ -93,7 +95,8 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
   - `int 0x80`: CPU сам переключается на TSS RSP0, пушит 5 qword'ов + 15 GPR, фрейм в rdi.
   - `syscall`: переключения стека НЕТ; стаб прячет user RSP в scratch, поднимает kernel-стек
     из глобального зеркала, пушит per-task слот user RSP и 15 GPR.
-- Конвейер `linux_dispatch`: включить IF → `abi::marshal_args` → `note_syscall` →
+- Конвейер `linux_dispatch`: размаскировать IF, если вызывающий передал `REENTRY_ALLOWED`
+  → `abi::marshal_args` → `note_syscall` →
   шим нативных задач (nr 1/2/3 без compat → `legacy_dispatch`) → гейт `is_supported`
   (`-ENOSYS` до любых проверок указателей) → роутинг → фолдинг errno в rax.
 - Legacy `sys_write`: только fd==1, `len <= 4096`, обе границы ниже `USER_CANONICAL_LIMIT`,

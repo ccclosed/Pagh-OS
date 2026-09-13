@@ -89,8 +89,16 @@ gzip — RFC 1952 вручную + `miniz_oxide`; xz — `xz4rust` (словар
 
 ## Безопасность
 
-- HTTPS использует `embedded-tls` c `UnsecureProvider`: **нет проверки цепочки/hostname/expiry**,
-  тривиально MITM-аемо. Нет CA/InRelease/пакетных hash-верификаций. Fail-closed сборка:
-  `cargo build --no-default-features` — тогда `apt update/install` возвращают `NetworkDisabled`.
+- HTTPS аутентифицирует зеркало fail-closed: цепочка до committed CA-бандла (`ca_bundle.rs`),
+  SAN-авторизация хоста, validity + clock gate (незаданный RTC — отказ) и подпись TLS 1.3
+  `CertificateVerify`; любой отказ обрывает handshake, а не деградирует до HTTP. Рукопожатие
+  без `Certificate`/`CertificateVerify` тоже отказ: вендорный патч `embedded-tls` не принимает
+  server `Finished` без них, плюс независимый гейт `net::tls::VERIFIED_HANDSHAKES`. Доверие
+  ограничено четырьмя пиннутыми корнями (ISRG Root X1/X2, GTS R1/R4), поэтому HTTPS-зеркало вне
+  этой выдачи отвергается (`ChainError::NoAnchor`) — лечится только осознанной перегенерацией
+  бандла `tools/gen_ca_bundle.py`. Не проверяются: отзыв (CRL/OCSP), подписи метаданных Debian
+  (OpenPGP) и полнота digest'ов пакетов; HTTP-зеркала (`apt setmirror http://…`)
+  неаутентифицированы по построению. Fail-closed сборка: `cargo build --no-default-features` —
+  тогда `apt update/install` возвращают `NetworkDisabled`.
 - Индекс RAM-only: полный Debian ≈ 150 MiB декомпрессированного — потолок по памяти,
   при превышении чистый отказ.

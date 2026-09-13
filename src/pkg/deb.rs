@@ -319,7 +319,7 @@ const MAX_DECOMPRESSED: usize = 64 * 1024 * 1024;
 /// (bounded by [`MAX_INDEX_STREAM_BYTES`]) so memory stays bounded regardless of
 /// index size. This cap is retained for any caller that still wants a single
 /// whole-buffer decode with a higher-than-`.deb` ceiling; it is sized to stay
-/// within the kernel heap (256 MiB, see `memory::layout::HEAP_INITIAL_PAGES`).
+/// within the kernel heap (96 MiB, matching [`MAX_INDEX_DECOMPRESSED`]).
 /// Callers that decompress a `.deb` member keep the smaller [`MAX_DECOMPRESSED`].
 pub const MAX_INDEX_DECOMPRESSED: usize = 96 * 1024 * 1024;
 
@@ -365,8 +365,10 @@ pub fn decompress_bytes(data: &[u8], c: Compression) -> Result<Vec<u8>, DebError
 
 /// Like [`decompress_bytes`] but with an explicit output cap `max`.
 ///
-/// The apt-index path passes [`MAX_INDEX_DECOMPRESSED`] (256 MiB) so a real
-/// `main` `Packages` decompresses, while `.deb` members keep the tighter default.
+/// The apt-index path does NOT go through here: it streams via
+/// [`decompress_stream`], bounded by [`MAX_INDEX_STREAM_BYTES`] rather than by
+/// [`MAX_INDEX_DECOMPRESSED`] (96 MiB), so a real `main` `Packages` never needs a
+/// whole-buffer decode. `.deb` members keep the tighter [`MAX_DECOMPRESSED`].
 /// Output exceeding `max` (or any decoder error / stall) yields
 /// [`DebError::DecompressFailed`]; no path reads past `data`.
 pub fn decompress_bytes_capped(
