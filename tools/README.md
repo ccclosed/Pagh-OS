@@ -14,9 +14,9 @@
 | `mini_repo.py` | Мини Debian-зеркало в `tools/mini_repo/` для apt-E2E |
 | `build-rust-app.sh` | Сборка userland-приложений (`rust-apps/`) под `x86_64-unknown-linux-musl` |
 | `e2e_local_mirror.ps1` | Детерминированный apt E2E: release-сборка c `--features lx_selftest`, stage, serve mini_repo, QEMU, assert serial-маркеров |
-| `e2e_live_update.ps1` | Live `apt update` против `deb.debian.org` (`--features lx_livetest`); assert `LIVE_APT_UPDATE: count=N`, N ≥ 50000; тайминги soft |
+| `e2e_live_update.ps1` | Live `apt update` против `deb.debian.org` (`--features lx_livetest`) по HTTP (embedded-tls висит на ~12 MiB, issue #19); assert `LIVE_APT_UPDATE: count=N`, N ≥ 50000; тайминги soft |
 | `e2e_bigindex.ps1` | Репро parse-краша #14 (`--features lx_bigindex`, `-InRam` добавляет `lx_bigindex_inram`); скан serial на `[EXC #14]` |
-| `smoke_assertions.ps1` | Проверка smoke-критериев R4.1/R4.2/R7.4 по захваченным serial-логам (промпт достигнут, debug-link работает, HTTPS-INSECURE предупреждение ровно один раз) |
+| `smoke_assertions.ps1` | Проверка smoke-критериев R4.1/R4.2/R7.4 по захваченным serial-логам (промпт достигнут, debug-link работает, аутентификация HTTPS-сервера подтверждена: `LXSELFTEST https_get PASS` либо отказ верификатора `Package_Fetcher(tls): stage=verify cause=…`) |
 | `mini_repo/` | Сгенерированное дерево зеркала (gitignored) |
 
 ## build.py — как собирается ядро

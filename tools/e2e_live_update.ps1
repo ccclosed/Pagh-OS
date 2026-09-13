@@ -6,9 +6,13 @@
 .DESCRIPTION
   Boots a release Pagh-OS kernel built with the dedicated `lx_livetest` cargo
   feature, which (after DHCP comes up) runs the FULL live update pipeline against
-  the DEFAULT mirror -- deb.debian.org /debian stable main amd64 over HTTPS
-  (VARIANT A) -- with NO local mirror and the QEMU default user-net NAT providing
-  outbound connectivity so the guest can reach the internet:
+  deb.debian.org /debian stable main amd64 -- with NO local mirror and the QEMU
+  default user-net NAT providing outbound connectivity so the guest can reach the
+  internet. The harness switches the transport to cleartext HTTP for the large
+  index download (embedded-tls hangs on ~12 MiB streams, issue #19); the
+  authenticated HTTPS path is covered end-to-end by the small-file HTTPS smoke
+  run of the `lx_selftest` harness, and repository metadata signatures are
+  unverified on either transport (see SECURITY.md):
 
       apt::update()                         # stream-fetch + parse the real index
       LIVE_APT_UPDATE: count=N              # assert N >= 50000 (R1.2)
@@ -173,7 +177,10 @@ $liveCount    = [regex]::Match($serial, 'LIVE_APT_UPDATE: count=(\d+)')
 $footprint    = [regex]::Match($serial, 'Resident_Index_Footprint = (\d+) bytes')
 $livePass     = $serial -match 'LXSELFTEST live_update PASS'
 $liveFail     = [regex]::Match($serial, 'LXSELFTEST live_update FAIL[^\r\n]*')
-$tlsWarn      = [regex]::Matches($serial, 'net::tls: HTTPS is INSECURE')
+# The apt transport is HTTP here, so the only TLS this run may show is the
+# verifier refusing a handshake (its error! diagnostics) - reported as evidence
+# that the fail-closed path is on, NOT as an expected warning.
+$tlsRefusal   = [regex]::Matches($serial, 'Package_Fetcher\(tls\): stage=verify cause=[^\r\n]*')
 
 Write-Host "`n================ LIVE-UPDATE REPORT ================" -ForegroundColor Yellow
 Write-Host ("Progress lines observed : {0}" -f $progress.Count)
@@ -195,7 +202,10 @@ if ($liveCount.Success) {
     Write-Host  "LIVE_APT_UPDATE count   : (not reached)" -ForegroundColor DarkYellow
 }
 if ($footprint.Success) { Write-Host ("Resident_Index_Footprint: {0} bytes" -f $footprint.Groups[1].Value) }
-if ($tlsWarn.Count -gt 0) { Write-Host ("Insecure-TLS warning (R7.4): emitted x{0}" -f $tlsWarn.Count) -ForegroundColor Green }
+if ($tlsRefusal.Count -gt 0) {
+    Write-Host ("TLS verifier refusals on serial: x{0} (fail-closed path active)" -f $tlsRefusal.Count) -ForegroundColor DarkYellow
+    Write-Host ("  first: {0}" -f $tlsRefusal[0].Value.Trim())
+}
 
 if ($livePass) {
     Write-Host "`nLIVE RESULT: PASS (count >= 50000, install + run succeeded)" -ForegroundColor Green

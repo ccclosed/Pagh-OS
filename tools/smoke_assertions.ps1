@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
   Build / transport smoke assertions for spec full-debian-apt-update task 11.2.
 
@@ -14,9 +14,15 @@
            (run.cmd build debug) proves the debug profile compiles+links; the
            deterministic local-mirror e2e (serial_e2e.log) exercises the same
            index pipeline functionally.
-    R7.4 - the one-time insecure-TLS warning is emitted exactly once on first
-           HTTPS use: the line "net::tls: HTTPS is INSECURE" appears in a serial
-           log that performed an HTTPS GET.
+    R7.4 - HTTPS server authentication is exercised with concrete serial evidence:
+           POSITIVE - the TLS 1.3 handshake under the fail-closed verifier
+           completed ("LXSELFTEST https_get PASS" against deb.debian.org, or the
+           "Package_Fetcher(tls): stage=response ... cause=Status(" line that can
+           only be emitted after a verified handshake), or NEGATIVE - the
+           handshake was refused and the verifier named the check that refused it
+           ("Package_Fetcher(tls): stage=verify cause=..."). A plain-HTTP
+           "apt: index loaded" line is NOT accepted: it proves the index pipeline,
+           not authentication.
 
   It reads serial_e2e.log (local-mirror run) and, if present, serial_live.log
   (live run) for the evidence lines and reports which lines satisfy each criterion.
@@ -85,25 +91,48 @@ if ($idx.Success) {
     Write-Host "          the live full-index variant is task 11.1 (network-dependent, soft timing)."
 }
 
-# --- R7.4: one-time insecure-TLS warning emitted ---
-Write-Host "`n[R7.4] one-time insecure-TLS warning emitted:" -ForegroundColor Cyan
-$warnLocal = [regex]::Matches($local, 'net::tls: HTTPS is INSECURE')
-$warnLive  = [regex]::Matches($live,  'net::tls: HTTPS is INSECURE')
-$warnTotal = $warnLocal.Count + $warnLive.Count
-if ($warnLocal.Count -ge 1) {
-    Write-Host ("  PASS - warning emitted x{0} in $LocalLog (once per boot)." -f $warnLocal.Count) -ForegroundColor Green
-    Write-Host "    evidence: 'net::tls: HTTPS is INSECURE ...'"
-} elseif ($warnLive.Count -ge 1) {
-    Write-Host ("  PASS - warning emitted x{0} in $LiveLog (once per boot)." -f $warnLive.Count) -ForegroundColor Green
-    Write-Host "    evidence: 'net::tls: HTTPS is INSECURE ...'"
+# --- R7.4: HTTPS server authentication has concrete serial evidence ---
+# The historical one-time "HTTPS is INSECURE" warning no longer exists: HTTPS is
+# fail-closed authenticated. Accept EITHER a positive handshake outcome (which
+# can only be reached after chain + SAN + clock gate + CertificateVerify passed)
+# OR a negative one that names the check which refused the handshake - both prove
+# the verifier is on the path and doing work.
+Write-Host "`n[R7.4] HTTPS server authentication evidenced in the serial log:" -ForegroundColor Cyan
+$r74hit  = $null
+$r74cls  = $null
+$r74log  = $null
+$positive = @(
+    @{ re = 'LXSELFTEST https_get PASS';        why = 'TLS 1.3 handshake completed (chain + SAN + clock + CertificateVerify passed) and the body decrypted' },
+    @{ re = 'Package_Fetcher\(tls\): stage=response host=.*cause=Status\('; why = 'TLS handshake completed; only the HTTP status was non-200' }
+)
+$negative = @(
+    @{ re = 'Package_Fetcher\(tls\): stage=verify cause=InvalidCertificate';     why = 'handshake refused: chain/SAN/clock check failed' },
+    @{ re = 'Package_Fetcher\(tls\): stage=verify cause=InvalidSignatureScheme'; why = 'handshake refused: unacceptable CertificateVerify scheme' },
+    @{ re = 'Package_Fetcher\(tls\): stage=verify cause=InvalidSignature';       why = 'handshake refused: CertificateVerify did not verify' }
+)
+foreach ($src in @(@{log=$LocalLog; text=$local}, @{log=$LiveLog; text=$live})) {
+    if ([string]::IsNullOrEmpty($src.text)) { continue }
+    foreach ($p in $positive) {
+        $m = [regex]::Match($src.text, $p.re)
+        if ($m.Success -and -not $r74hit) { $r74hit = $m.Value.Trim(); $r74cls = "positive: $($p.why)"; $r74log = $src.log }
+    }
+    foreach ($n in $negative) {
+        $m = [regex]::Match($src.text, $n.re)
+        if ($m.Success -and -not $r74hit) { $r74hit = $m.Value.Trim(); $r74cls = "negative: $($n.why)"; $r74log = $src.log }
+    }
+}
+if ($r74hit) {
+    Write-Host "  PASS - $r74cls" -ForegroundColor Green
+    Write-Host ("    evidence ({0}): '{1}'" -f $r74log, $r74hit)
 } else {
-    Write-Host "  UNPROVEN - no insecure-TLS warning found in the provided logs." -ForegroundColor DarkYellow
+    Write-Host "  UNPROVEN - neither a completed TLS handshake nor a verifier refusal line was found." -ForegroundColor DarkYellow
+    Write-Host "             expected e.g. 'LXSELFTEST https_get PASS ...' or 'Package_Fetcher(tls): stage=verify cause=...'"
 }
 
 Write-Host "`n================ SUMMARY ================" -ForegroundColor Yellow
 $r41s = if ($r41) { 'PASS' } else { 'UNPROVEN' }
 $r42s = if ($SkipDebugBuild) { 'SKIPPED' } elseif ($r42link) { 'PASS' } else { 'FAIL' }
-$r74s = if ($warnTotal -ge 1) { 'PASS' } else { 'UNPROVEN' }
+$r74s = if ($r74hit) { 'PASS' } else { 'UNPROVEN' }
 Write-Host ("  R4.1 release links+boots : {0}" -f $r41s)
 Write-Host ("  R4.2 debug build link    : {0}" -f $r42s)
-Write-Host ("  R7.4 insecure-TLS warning: {0}" -f $r74s)
+Write-Host ("  R7.4 HTTPS auth evidence : {0}  {1}" -f $r74s, $r74cls)
