@@ -135,6 +135,18 @@ where
     traffic_hash: Option<CipherSuite::Hash>,
     secret: Option<EphemeralSecret>,
     certificate_request: Option<CertificateRequest>,
+    /// Set when the server sent a `Certificate` message (RFC 8446 §4.4.2).
+    ///
+    /// The server's `Finished` is only accepted once this is set (unless the
+    /// handshake is PSK-based, where no certificate is sent at all). Without
+    /// this latch a server could simply omit `Certificate` and
+    /// `CertificateVerify` and still reach `ApplicationData`, which skipped the
+    /// configured `TlsVerifier` entirely — fail-open for every client that
+    /// installs a verifying provider.
+    certificate_received: bool,
+    /// Set once `CertificateVerify` was validated (RFC 8446 §4.4.3). See
+    /// [`Self::certificate_received`] for why `Finished` requires it.
+    certificate_verified: bool,
 }
 
 impl<CipherSuite> Handshake<CipherSuite>
@@ -146,6 +158,8 @@ where
             traffic_hash: None,
             secret: None,
             certificate_request: None,
+            certificate_received: false,
+            certificate_verified: false,
         }
     }
 }
@@ -201,8 +215,13 @@ impl<'a> State {
                     .read(transport, key_schedule.read_state())
                     .await?;
 
-                let result =
-                    process_server_verify(handshake, key_schedule, crypto_provider, record);
+                let result = process_server_verify(
+                    handshake,
+                    key_schedule,
+                    crypto_provider,
+                    record,
+                    config.psk.is_some(),
+                );
 
                 handle_processing_error(result, transport, key_schedule, tx_buf).await
             }
@@ -265,8 +284,13 @@ impl<'a> State {
             State::ServerVerify => {
                 let record = record_reader.read_blocking(transport, key_schedule.read_state())?;
 
-                let result =
-                    process_server_verify(handshake, key_schedule, crypto_provider, record);
+                let result = process_server_verify(
+                    handshake,
+                    key_schedule,
+                    crypto_provider,
+                    record,
+                    config.psk.is_some(),
+                );
 
                 handle_processing_error_blocking(result, transport, key_schedule, tx_buf)
             }
@@ -440,6 +464,7 @@ fn process_server_verify<Provider>(
     key_schedule: &mut KeySchedule<Provider::CipherSuite>,
     crypto_provider: &mut Provider,
     record: ServerRecord<'_, Provider::CipherSuite>,
+    psk_mode: bool,
 ) -> Result<State, TlsError>
 where
     Provider: CryptoProvider,
@@ -458,19 +483,43 @@ where
                         } else {
                             debug!("Certificate verification skipped due to no verifier!");
                         }
+                        handshake.certificate_received = true;
                     }
                     ServerHandshake::CertificateVerify(verify) => {
+                        // RFC 8446 §4.4.3: CertificateVerify authenticates the
+                        // certificate, so it is only legal right after one.
+                        if !handshake.certificate_received {
+                            error!("CertificateVerify without a preceding Certificate");
+                            return Err(TlsError::InvalidCertificate);
+                        }
                         if let Ok(verifier) = crypto_provider.verifier() {
                             verifier.verify_signature(verify)?;
                             debug!("Signature verified!");
                         } else {
                             debug!("Signature verification skipped due to no verifier!");
                         }
+                        handshake.certificate_verified = true;
                     }
                     ServerHandshake::CertificateRequest(request) => {
                         handshake.certificate_request.replace(request.try_into()?);
                     }
                     ServerHandshake::Finished(finished) => {
+                        // A non-PSK handshake MUST have authenticated the server
+                        // before its Finished is accepted (RFC 8446 §4.4.2.4:
+                        // the client "MUST" abort if Certificate/CertificateVerify
+                        // are missing). Without this check an attacker that
+                        // terminates the key exchange itself could omit both
+                        // messages, compute a valid Finished, and reach
+                        // ApplicationData with the configured verifier never
+                        // having been invoked.
+                        if !psk_mode
+                            && !(handshake.certificate_received && handshake.certificate_verified)
+                        {
+                            error!(
+                                "Server Finished without Certificate/CertificateVerify - aborting"
+                            );
+                            return Err(TlsError::InvalidCertificate);
+                        }
                         if !key_schedule.verify_server_finished(&finished)? {
                             warn!("Server signature verification failed");
                             return Err(TlsError::InvalidSignature);
