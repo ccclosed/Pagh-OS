@@ -49,6 +49,15 @@ $relElf     = "target\$TARGET\release\PAGH.elf"
 $serialLog  = Join-Path $root 'serial_e2e.log'
 $qemuLog    = Join-Path $root 'qemu_e2e_debug.log'
 
+function Resolve-OvmfPath {
+    if ($env:OVMF -and (Test-Path $env:OVMF)) { return $env:OVMF }
+    if (Test-Path 'OVMF.fd') { return 'OVMF.fd' }
+    foreach ($p in @('/usr/share/edk2/ovmf/OVMF_CODE.fd','/usr/share/ovmf/OVMF_CODE.fd','/usr/share/OVMF/OVMF_CODE.fd','/usr/share/edk2/x64/OVMF_CODE.fd')) {
+        if (Test-Path $p) { return $p }
+    }
+    throw 'OVMF firmware not found: put OVMF.fd in the repo root, set $env:OVMF, or install edk2-ovmf'
+}
+
 function Find-RustLld {
     $hits = Get-ChildItem -Path "$env:USERPROFILE\.rustup" -Recurse -Filter 'rust-lld.exe' -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -match 'nightly' -and $_.FullName -notmatch 'lldb' }
@@ -112,7 +121,8 @@ Start-Sleep -Seconds 2
 # ---------------------------------------------------------------------------
 Write-Host '=== Booting release ELF under QEMU ===' -ForegroundColor Cyan
 $qemuArgs = @(
-    '-bios','OVMF.fd',
+    '-bios',(Resolve-OvmfPath),
+    '-cpu','max',
     '-drive','file=fat:rw:iso_root,format=raw',
     '-drive','file=disk.img,format=raw,if=none,id=hd0',
     '-device','virtio-blk-pci,drive=hd0',

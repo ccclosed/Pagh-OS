@@ -29,8 +29,11 @@
   `boot/limine.conf` записывается в двух местах (корень ISO + `EFI/BOOT/`).
 - `run`: stage + QEMU (`-bios OVMF.fd`, `fat:rw:iso_root`, virtio-blk `disk.img`, e1000 NIC
   с hostfwd `tcp/udp 5555->7`, `-m 1024M`, `-serial stdio`, debug-трейс в `qemu_debug.log`).
-- Env-оверрайды: `LIMINE_DIR`/`LIMINE_EFI` (иначе автопоиск/автоскачивание), `OVMF` (дефолт `OVMF.fd`),
-  `PAGH_DISK` (дефолт `disk.img`).
+  По умолчанию `-cpu max`: TLS-путь требует RDSEED/RDRAND, которых у дефолтного `qemu64`
+  нет, поэтому живой HTTPS-чек падает с `stage=entropy` (и ничего не объясняет).
+- Env-оверрайды: `LIMINE_DIR`/`LIMINE_EFI` (иначе автопоиск/автоскачивание), `OVMF` (дефолт
+  `OVMF.fd` из корня репо; если его нет — системный `OVMF_CODE.fd`, напр.
+  `/usr/share/edk2/ovmf/`), `PAGH_DISK` (дефолт `disk.img`), `PAGH_QEMU_CPU` (дефолт `max`).
 
 ## mini_repo.py
 

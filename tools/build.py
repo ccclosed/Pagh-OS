@@ -62,6 +62,33 @@ def stage(elf: pathlib.Path, limine_dir: str | None) -> pathlib.Path:
     return dest
 
 
+def resolve_ovmf(requested: str) -> pathlib.Path:
+    """Resolve the OVMF firmware image.
+
+    `OVMF.fd` (repo root, git-ignored) or `--ovmf`/`$OVMF` win when present.
+    Linux distros ship the same firmware under a system path instead, and the
+    live HTTPS checks cannot run without it — so fall back to the known system
+    locations rather than failing with "OVMF missing".
+    """
+    if requested:
+        cand = pathlib.Path(requested)
+        if not cand.is_absolute():
+            cand = ROOT / cand
+        if cand.exists():
+            return cand
+        if requested != "OVMF.fd":
+            raise SystemExit(f"error: OVMF missing: {cand}")
+    for system in ("/usr/share/edk2/ovmf/OVMF_CODE.fd",
+                   "/usr/share/ovmf/OVMF_CODE.fd",
+                   "/usr/share/OVMF/OVMF_CODE.fd",
+                   "/usr/share/edk2/x64/OVMF_CODE.fd"):
+        if pathlib.Path(system).exists():
+            return pathlib.Path(system)
+    raise SystemExit(
+        "error: OVMF missing: no OVMF.fd in the repo root and no system firmware "
+        "found (install edk2-ovmf / ovmf, or pass --ovmf <path>)")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("command", choices=["build", "stage", "run"], nargs="?", default="build")
@@ -71,17 +98,19 @@ def main() -> None:
                    help="Limine dir (default: auto-detect any limine*/ tree, download if missing)")
     p.add_argument("--ovmf", default=os.environ.get("OVMF", "OVMF.fd"))
     p.add_argument("--disk", default=os.environ.get("PAGH_DISK", "disk.img"))
+    p.add_argument("--cpu", default=os.environ.get("PAGH_QEMU_CPU", "max"),
+                   help="QEMU CPU model (default 'max': the TLS path needs RDSEED/RDRAND, "
+                        "which the default qemu64 model does not expose -> stage=entropy)")
     a = p.parse_args()
     elf = build("release" if a.release else "debug", a.features)
     print(f"linked: {elf}")
     if a.command == "build": return
     esp = stage(elf, a.limine_dir)
     if a.command == "stage": return
-    ovmf, disk = ROOT / a.ovmf, ROOT / a.disk
-    if not ovmf.exists(): raise SystemExit(f"error: OVMF missing: {ovmf}")
+    ovmf, disk = resolve_ovmf(a.ovmf), ROOT / a.disk
     qemu, qimg = require("qemu-system-x86_64"), require("qemu-img")
     if not disk.exists(): run([qimg, "create", "-f", "raw", str(disk), "64M"])
-    run([qemu, "-bios", str(ovmf), "-drive", f"file=fat:rw:{esp},format=raw",
+    run([qemu, "-cpu", a.cpu, "-bios", str(ovmf), "-drive", f"file=fat:rw:{esp},format=raw",
          "-drive", f"file={disk},format=raw,if=none,id=hd0", "-device", "virtio-blk-pci,drive=hd0",
          "-netdev", "user,id=net0,hostfwd=tcp::5555-:7,hostfwd=udp::5555-:7",
          "-device", "e1000,netdev=net0", "-m", "1024M", "-serial", "stdio",

@@ -102,6 +102,11 @@ pub fn run() {
     crate::info!("LXSELFTEST harness done");
 }
 
+/// How long the post-network checks wait for `net::ip_config()` to become
+/// available (60 s at `TICK_HZ`). One shared constant so the local-mirror and
+/// HTTPS checks cannot drift into different ideas of "the network is up".
+const WAIT_IFACE_TICKS: u64 = crate::arch::x86_64::apic::TICK_HZ * 60;
+
 /// Post-network HTTPS smoke test entry point (cargo feature `lx_selftest`).
 ///
 /// Spawned as a kernel thread from `boot::kernel_main` (NOT called from [`run`],
@@ -127,13 +132,17 @@ pub fn run() {
 pub fn run_net_smoke() {
     let name = "https_get";
 
-    // Wait up to ~15 s for an interface address (DHCP, then static fallback).
-    let deadline = scheduler::ticks() + 1500;
+    // Wait up to ~60 s for an interface address. The lease/fallback lands
+    // seconds after boot, but under TCG the ring-3 selftest checks that run
+    // before this thread can push that well past the old 15 s window — and a
+    // timeout here is reported as "no interface address", which reads like a
+    // network failure instead of "the harness gave up too early".
+    let deadline = scheduler::ticks() + WAIT_IFACE_TICKS;
     while crate::net::ip_config().is_none() {
         if scheduler::ticks() >= deadline {
             fail(
                 name,
-                "no interface address (DHCP/static fallback did not configure)",
+                "no interface address within 60 s (DHCP/static fallback did not configure)",
             );
             return;
         }
@@ -352,8 +361,9 @@ pub fn run_live_update_check() {
 pub fn run_apt_e2e() {
     let name = "apt_e2e";
 
-    // Wait up to ~20 s for an interface address (DHCP, then static fallback).
-    let deadline = scheduler::ticks() + 2000;
+    // Wait up to ~60 s for an interface address (DHCP, then static fallback) —
+    // same window as `run_net_smoke`; see the rationale there.
+    let deadline = scheduler::ticks() + WAIT_IFACE_TICKS;
     while crate::net::ip_config().is_none() {
         if scheduler::ticks() >= deadline {
             fail(

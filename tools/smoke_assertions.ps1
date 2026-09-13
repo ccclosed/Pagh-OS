@@ -17,8 +17,8 @@
     R7.4 - HTTPS server authentication is exercised with concrete serial evidence:
            POSITIVE - the TLS 1.3 handshake under the fail-closed verifier
            completed ("LXSELFTEST https_get PASS" against deb.debian.org, or the
-           "Package_Fetcher(tls): stage=response ... cause=Status(" line that can
-           only be emitted after a verified handshake), or NEGATIVE - the
+           "Package_Fetcher(tls): stage=response ... cause=Status(...)" line that
+           can only be emitted after a verified handshake), or NEGATIVE - the
            handshake was refused and the verifier named the check that refused it
            ("Package_Fetcher(tls): stage=verify cause=..."). A plain-HTTP
            "apt: index loaded" line is NOT accepted: it proves the index pipeline,
@@ -93,9 +93,9 @@ if ($idx.Success) {
 
 # --- R7.4: HTTPS server authentication has concrete serial evidence ---
 # The historical one-time "HTTPS is INSECURE" warning no longer exists: HTTPS is
-# fail-closed authenticated. Accept EITHER a positive handshake outcome (which
-# can only be reached after chain + SAN + clock gate + CertificateVerify passed)
-# OR a negative one that names the check which refused the handshake - both prove
+# fail-closed authenticated. Accept EITHER a positive handshake outcome (only
+# reachable after chain + SAN + clock gate + CertificateVerify all passed) OR a
+# negative one that names the check which refused the handshake - both prove
 # the verifier is on the path and doing work.
 Write-Host "`n[R7.4] HTTPS server authentication evidenced in the serial log:" -ForegroundColor Cyan
 $r74hit  = $null
