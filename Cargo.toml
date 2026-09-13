@@ -1,6 +1,6 @@
 [package]
 name = "pagh"
-version = "2.2.0"
+version = "2.3.0"
 edition = "2021"
 
 [workspace]
@@ -110,7 +110,7 @@ ruzstd = { version = "=0.8.3", default-features = false }
 # real distro `data.tar.xz` members decode. `XzDecoder` is driven by
 # `pkg::deb::decompress_data`. Pinned exactly.
 xz4rust = { version = "=0.2.1", default-features = false, features = ["alloc", "bcj", "delta", "crc64"] }
-# ── HTTPS / TLS 1.3 (VARIANT A: encrypted transport, NO certificate verification) ──
+# ── HTTPS / TLS 1.3 (fail-closed certificate verification) ──
 # `embedded-tls` is the maintained no_std Rust TLS 1.3 implementation (formerly
 # drogue-tls). Pinned exactly; `default-features = false` drops its `std`/`log`/
 # `tokio` defaults, and the `alloc` feature routes its heap use through the `alloc`
@@ -119,10 +119,13 @@ xz4rust = { version = "=0.2.1", default-features = false, features = ["alloc", "
 # `alloc` feature also makes `TlsConfig::new()` advertise RSA *and* ECDSA signature
 # schemes, so real Debian mirrors (Fastly, ECDSA or RSA leaf certs) negotiate.
 #
-# SECURITY: we drive it through `UnsecureProvider` (the `NoVerify` path) — the
-# server certificate chain, hostname, and expiry are NOT checked. This gives an
-# encrypted channel only; it is NOT authenticated and is trivially MITM-able. See
-# `src/net/tls.rs` for the full warning. Certificate verification is a follow-up.
+# SECURITY: the crate's own `UnsecureProvider`/`NoVerify` path is NOT used. The
+# handshake runs `net::tls::KernelProvider`, whose `verifier()` always returns the
+# kernel's verifier — chain validation to `net::ca_bundle`, SAN hostname
+# authorization, validity + clock gate, and the `CertificateVerify` signature are
+# all mandatory, and `embedded-tls`'s "no verifier ⇒ skip verification" branch is
+# unreachable on this path. Repository metadata signatures are still unverified:
+# see `SECURITY.md`.
 embedded-tls = { version = "=0.19.0", default-features = false, features = ["alloc"] }
 # Sync + async byte-IO traits implemented by the smoltcp TCP transport adapter in
 # `src/net/tls.rs`. `embedded-tls` speaks `embedded-io-async`; the adapter bridges

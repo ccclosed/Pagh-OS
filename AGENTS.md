@@ -95,8 +95,11 @@ release into `limine/`) — do not hard-code Limine versions in scripts.
    print `LXSELFTEST <name> PASS/FAIL` and return.
 9. **Feature gates**: `default = ["network_packages"]` enables apt; the
    `lx_selftest` / `lx_livetest` / `lx_bigindex` harnesses must stay
-   compiled-out (and boot-unchanged) when unset. TLS is deliberately
-   NoVerify (VARIANT A) — encrypted, unauthenticated; see `SECURITY.md`.
+   compiled-out (and boot-unchanged) when unset. TLS is fail-closed: the
+   handshake aborts unless the chain validates against the committed CA
+   bundle, the SAN authorizes the host, the clock gate passes, and the
+   `CertificateVerify` signature checks out; repository metadata signatures
+   are still unverified — see `SECURITY.md`.
 10. **Unsafe policy**: every `unsafe {` in `src/security/`,
     `arch/x86_64/linux/mod.rs`, `memory/vmm.rs`, `net/tls.rs`, `pkg/apt.rs`
     needs a `SAFETY:` comment within the previous 6 lines

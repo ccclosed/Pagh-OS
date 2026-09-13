@@ -46,7 +46,6 @@
 
 #![allow(dead_code)] // consumed by net::tls in this very PR; kept explicit.
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use super::hostname::{hostname_matches, ip_matches, is_ip_literal, parse_ipv4_literal};
