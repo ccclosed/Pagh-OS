@@ -9,6 +9,7 @@ write-ahead-log журналом для crash-consistency. Чистая логи
 | Файл | Роль |
 |---|---|
 | `mod.rs` | Корень; enum `FsError` |
+| `format_policy.rs` | Политика «можно ли форматировать это устройство»: чистый `core`-модуль **без I/O** — `Probe` (инкрементальный классификатор boot-области: ext2-magic / MBR+GPT / blank / foreign) и `format_allowed(layout, has_valid_superblock, allow_destructive)`; host-тесты гоняют его напрямую (P50, issue #33) |
 | `journal.rs` | WAL-журнал: `Journal`, `Txn`, `JournalArea` — кольцевой лог, атомарные мультиблочные транзакции, CRC-коммиты, crash-consistent `recover()` |
 | `ext2/mod.rs` | Ядро драйвера: `Ext2Fs` (format/mount), `Tx` (dirty-набор, аллокаторы, block-map), файловые операции, VfsNode-адаптеры `Ext2Dir`/`Ext2File`, маппинг ошибок `fs_to_vfs` |
 | `ext2/structs.rs` | On-disk `#[repr(C)]`-структуры с compile-time фиксацией размеров (`Ext2SuperBlock` 0x88 B, `Ext2GroupDesc` 32 B, `Ext2Inode` 128 B, `JournalSuper` 56 B и др.), магии, unaligned read/write, CRC32 |
@@ -86,8 +87,17 @@ write-ahead-log журналом для crash-consistency. Чистая логи
 ### Монтирование (из `boot.rs::init_fs`)
 `has_valid_superblock` → `mount` → валидация (magic, block size, счётчики, `s_inode_size`) →
 `Journal::open` + `recover()` → `reconcile_free_counts` → `Arc<Ext2Fs>`. Boot выбирает
-virtio-blk, фоллбэк NVMe; форматирование — только genuinely blank диска
-(валидный суперблок с убитым WAL = ошибка, а не разрешение стереть данные); маунт в `/mnt`.
+virtio-blk, фоллбэк NVMe; маунт в `/mnt`.
+
+Форматирование разрешено **только для genuinely blank устройства** — либо для устройства с
+явным opt-in маркером (`PAGH-FORMAT` в секторе 0, см. `format_policy::OPT_IN_MARKER`) — и
+решается в `format_policy` (issue #33): провал `mount` больше не означает «диск пустой».
+Порядок правил — валидный (парсящийся) суперблок → отказ (`Refusal::ExistingFilesystem`,
+убитый WAL не даёт права стирать); таблица разделов MBR/GPT → отказ
+`Refusal::PartitionTable`; любые ненулевые данные → `Refusal::ForeignData`; формат — только
+если все спроецированные 1 MiB нулевые либо в секторе 0 стоит маркер. Зонд идёт по 4 KiB с
+ранним выходом и запускается **лишь после неудачного mount**, так что happy path ничего не
+платит.
 
 ## Зависимости
 

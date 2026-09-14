@@ -218,6 +218,14 @@ pub mod ca_bundle;
 #[path = "../../src/net/tls_auth.rs"]
 pub mod tls_auth;
 
+// `format_policy` decides whether boot may format a block device (issue #33).
+// Pure `core`, no I/O by design: `boot::init_fs` probes the device and feeds the
+// bytes in, so P50 asserts the decision itself against real GPT/MBR/ext2 boot
+// areas — the code path that erased a partitioned disk on real hardware, and one
+// that no CI job could reach, because no CI job ever boots the kernel.
+#[path = "../../src/fs/format_policy.rs"]
+pub mod format_policy;
+
 // ---------------------------------------------------------------------------
 // Property-test modules (P1..P28)
 // ---------------------------------------------------------------------------
@@ -284,6 +292,9 @@ mod properties {
     mod p47;
     mod p48;
     mod p49;
+    // Boot-time device safety (issue #33): only a genuinely blank device is
+    // formatted; GPT/MBR/foreign/ext2-like layouts are refused.
+    mod p50;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the
