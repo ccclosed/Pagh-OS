@@ -282,27 +282,39 @@ impl Journal {
 
     /// Replay committed transactions on mount.
     ///
-    /// Scans the log from `tail` in `seq` order: a transaction is replayed iff
-    /// it is committed (valid descriptor + commit, matching seq + CRC32).
-    /// Replay applies each data block to its final location (idempotent block
-    /// overwrites); scanning stops at the first uncommitted/corrupt transaction
-    /// and discards it and everything after. The log is then reset to empty.
+    /// Scans the log from `tail`: a transaction is replayed iff it is committed
+    /// (valid descriptor + commit record, matching seq + CRC32) **and** its
+    /// sequence number is one the persisted journal superblock has not yet
+    /// acknowledged. Replay applies each data block to its final location
+    /// (idempotent block overwrites); scanning stops at the first uncommitted,
+    /// corrupt or out-of-order transaction and leaves the rest alone. The log is
+    /// then reset to empty.
+    ///
+    /// Liveness is decided by `seq` against the persisted `next_seq`, **not** by
+    /// `head == tail` (issue #35). `commit` persists the head advance *after* the
+    /// checkpoint, so a crash between the commit record and that write leaves a
+    /// committed transaction in the log while the on-disk head/tail still
+    /// describe the previous state — `head == tail` there means "the superblock
+    /// has not moved", not "the log is empty", and returning early silently lost
+    /// every block of that transaction that had not been checkpointed yet.
+    ///
+    /// The sequence rule keeps the protection that guard was added for: records
+    /// with `seq < next_seq` were acknowledged by an earlier superblock, so their
+    /// blocks are already checkpointed and they are **skipped**, never replayed
+    /// (in a wrapped ring the stale records after `head` carry older sequence
+    /// numbers, so old images can never be re-applied over newer data). Only
+    /// records with `seq == next_seq` chaining upwards are replayed.
     pub fn recover(&mut self) -> Result<u32, FsError> {
         // open() already validated JNL_MAGIC.
-        // head == tail means an empty log (commit keeps one spare slot, so a
-        // non-empty log always has head != tail): without this guard, replay
-        // would wander into stale records of long-checkpointed transactions
-        // and re-apply OLD block images over NEWER committed data.
-        if self.head == self.tail {
-            return Ok(0);
-        }
         let mut pos = self.tail;
         let mut replayed: u32 = 0;
-        let mut expected_seq: Option<u64> = None;
-        let mut last_seq: u64 = self.next_seq.wrapping_sub(1);
+        let mut expected = self.next_seq;
+        let mut last_seq: Option<u64> = None;
+        // Inspect at most one lap of the ring, so corrupt data cannot make the
+        // scan spin.
+        let mut budget = self.log_blocks;
 
-        // Bound the scan by the log size to avoid spinning on corrupt data.
-        for _ in 0..self.log_blocks {
+        while budget > 0 {
             let desc_buf = self.read_log(pos)?;
             let desc = load_descriptor(&desc_buf);
             if desc.magic != JDES_MAGIC {
@@ -311,6 +323,19 @@ impl Journal {
             let count = desc.count as u64;
             if count == 0 || count as usize > JDESC_MAX_TARGETS || count + 2 > self.log_blocks {
                 break; // structurally impossible descriptor
+            }
+
+            if last_seq.is_none() && desc.seq < expected {
+                // Acknowledged by an earlier superblock: already checkpointed.
+                // Step over it — replaying it is what would re-apply an old
+                // image over newer data.
+                let step = count + 2;
+                pos = (pos + step) % self.log_blocks;
+                budget = budget.saturating_sub(step);
+                continue;
+            }
+            if desc.seq != expected {
+                break; // gap / duplicate / out-of-order: keep the rest untouched
             }
 
             // Read back the data blocks and verify the commit record.
@@ -325,14 +350,8 @@ impl Journal {
             let data_refs: Vec<&[u8]> = data_blocks.iter().map(|b| b.as_slice()).collect();
             let checksum = structs::crc32_slices(&data_refs);
 
-            let seq_ok = match expected_seq {
-                None => true,
-                Some(e) => desc.seq == e,
-            };
-            let committed = cmt.magic == JCMT_MAGIC
-                && cmt.seq == desc.seq
-                && cmt.data_checksum == checksum
-                && seq_ok;
+            let committed =
+                cmt.magic == JCMT_MAGIC && cmt.seq == desc.seq && cmt.data_checksum == checksum;
             if !committed {
                 break; // stop at first incomplete/corrupt txn; discard rest
             }
@@ -347,9 +366,10 @@ impl Journal {
             }
 
             replayed += 1;
-            last_seq = desc.seq;
-            expected_seq = Some(desc.seq + 1);
+            last_seq = Some(desc.seq);
+            expected = desc.seq + 1;
             pos = (commit_pos + 1) % self.log_blocks;
+            budget = budget.saturating_sub(count + 2);
         }
 
         // After replay everything live is checkpointed; empty the log. The
@@ -358,8 +378,8 @@ impl Journal {
         // just declared replayed (issue #15).
         self.tail = pos;
         self.head = pos;
-        if replayed > 0 {
-            self.next_seq = core::cmp::max(self.next_seq, last_seq + 1);
+        if let Some(seq) = last_seq {
+            self.next_seq = core::cmp::max(self.next_seq, seq + 1);
             self.dev.flush().map_err(|_| FsError::IoError)?;
         }
         self.persist_super()?;

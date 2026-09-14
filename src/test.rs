@@ -2574,6 +2574,105 @@ mod fs_prop_tests {
             "P21: the replayed block was rewritten to its final location"
         );
     }
+
+    /// Property 22 (issue #35): recovery decides liveness from the persisted
+    /// sequence number, not from `head == tail`.
+    ///
+    /// The randomized P10–P12 exercise the crash window statistically; this pins
+    /// the two deterministic directions that the removed `head == tail` guard got
+    /// wrong, one per direction:
+    ///
+    /// 1. a transaction committed *after* the last journal-superblock update —
+    ///    exactly the window `commit` leaves between the commit record and the
+    ///    head advance — must be replayed even though the on-disk head/tail still
+    ///    describe the previous (empty-looking) state;
+    /// 2. records the superblock has already acknowledged are **checkpointed**
+    ///    and must never be replayed, or an older image lands on top of newer
+    ///    data — which is the case the old guard existed to prevent.
+    ///
+    /// **Validates: Requirements 10.6, 11.1, 11.3**
+    pub fn p22_recovery_keys_liveness_off_the_persisted_seq() {
+        let fs_blocks = 16u64;
+        // Large enough that the third transaction below cannot wrap onto the
+        // first one's slots.
+        let log_blocks = 16u64;
+
+        // ── direction 1: head advance lost, log holds the committed txn ──────
+        let (dev, area) = make_journal(fs_blocks, log_blocks);
+        let mut j = Journal::open(dev.clone(), area).expect("open");
+        let mut txn = j.begin();
+        j.log_block(&mut txn, 5, &filled(0x11));
+        // Descriptor + data + commit record land; the checkpoint and the head
+        // advance are lost with the power.
+        dev.set_crash_after(3);
+        let _ = j.commit(txn);
+        dev.clear_crash();
+
+        let mut j2 = Journal::open(dev.clone(), area).expect("reopen");
+        let replayed = j2.recover().expect("recover");
+        assert_eq_kernel!(
+            replayed,
+            1,
+            "P22: a committed txn is replayed even though the on-disk head == tail"
+        );
+        assert_kernel!(
+            dev.peek_block(5) == filled(0x11),
+            "P22: the lost transaction's post-state is reached"
+        );
+
+        // ── direction 2: acknowledged records are never replayed ─────────────
+        // A (block 5 <- 0xA1) and B (block 5 <- 0xB2) both commit; the superblock
+        // acknowledges B, so the log still holds A's record while next_seq has
+        // moved past it. A third transaction then crashes before its superblock
+        // update, leaving recovery with two stale records in front of it.
+        let (dev, area) = make_journal(fs_blocks, log_blocks);
+        let mut j = Journal::open(dev.clone(), area).expect("open");
+        let mut txn = j.begin();
+        j.log_block(&mut txn, 5, &filled(0xA1));
+        j.commit(txn).expect("commit A");
+        assert_kernel!(dev.peek_block(5) == filled(0xA1), "P22: A checkpointed");
+
+        let mut txn = j.begin();
+        j.log_block(&mut txn, 5, &filled(0xB2));
+        j.commit(txn).expect("commit B");
+        assert_kernel!(dev.peek_block(5) == filled(0xB2), "P22: B checkpointed");
+
+        let mut txn = j.begin();
+        j.log_block(&mut txn, 6, &filled(0xC3));
+        dev.set_crash_after(3);
+        let _ = j.commit(txn);
+        dev.clear_crash();
+
+        let mut j3 = Journal::open(dev.clone(), area).expect("reopen2");
+        let replayed = j3.recover().expect("recover2");
+        assert_eq_kernel!(
+            replayed,
+            1,
+            "P22: only the un-acknowledged transaction is replayed"
+        );
+        assert_kernel!(
+            dev.peek_block(5) == filled(0xB2),
+            "P22: the stale record for block 5 was skipped, not replayed over B"
+        );
+        assert_kernel!(
+            dev.peek_block(6) == filled(0xC3),
+            "P22: the crashed transaction's block was replayed"
+        );
+
+        // A second recovery has nothing left to do — the stale records are still
+        // in the ring, and must still be ignored.
+        let mut j4 = Journal::open(dev.clone(), area).expect("reopen3");
+        let replay_again = j4.recover().expect("recover3");
+        assert_eq_kernel!(
+            replay_again,
+            0,
+            "P22: a log whose records are all acknowledged replays nothing"
+        );
+        assert_kernel!(
+            dev.peek_block(5) == filled(0xB2),
+            "P22: re-recovery leaves the acknowledged state alone"
+        );
+    }
 }
 
 // Property 18 (real-device variant, Task 5.4*): filesystem operation round-trip
@@ -2937,6 +3036,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "fs::journal flush ordering at transaction boundaries (Property 21)",
             fs_prop_tests::p21_journal_flushes_at_transaction_boundaries
+        ),
+        (
+            "fs::journal recovery keys liveness off the persisted seq (Property 22)",
+            fs_prop_tests::p22_recovery_keys_liveness_off_the_persisted_seq
         ),
         (
             "fs::ext2 operation round-trip on real device (Property 18)",
