@@ -45,6 +45,9 @@ pub fn run() {
             0x00FF_FFFF,
             0,
         );
+
+        // Below the caption: the requisite dick pic, in white.
+        draw_dick(fb, w / 2, band_y + band_h + 46, 0x00FF_FFFF);
     });
 
     // Drain whatever is still queued — the Enter that submitted this command
@@ -63,4 +66,17 @@ pub fn run() {
         }
     }
     framebuffer::clear_screen();
+}
+
+/// A small pixel-art phallus: shaft, glans and two balls, centred on `(cx, cy)`
+/// which is the top of the shaft.
+fn draw_dick(fb: &mut framebuffer::FramebufferWriter, cx: usize, cy: usize, color: u32) {
+    let shaft_w = 26usize;
+    let shaft_h = 74usize;
+    let r = (shaft_w / 2) as isize;
+
+    fb.fill_rect(cx - shaft_w / 2, cy, shaft_w, shaft_h, color);
+    fb.fill_circle(cx as isize, cy as isize, r + 6, color);
+    fb.fill_circle(cx as isize - r - 6, (cy + shaft_h) as isize, r + 1, color);
+    fb.fill_circle(cx as isize + r + 6, (cy + shaft_h) as isize, r + 1, color);
 }
