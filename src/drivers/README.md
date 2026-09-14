@@ -12,8 +12,8 @@ framebuffer-консоль, VT-эмулятор, курсор, serial. Коор�
 | `e1000.rs` | Intel 8254x NIC — поллинг, без IRQ; MMIO-регистры, EEPROM MAC, легаси 64-слотовые TX/RX-кольца |
 | `virtio/mod.rs` | Корень virtio-обвязки (`blk`, `hal`) |
 | `virtio/hal.rs` | `PaghHal` — реализация `virtio_drivers::Hal`: DMA/MMIO через `pmm`/`vmm`; автоматические bounce-буферы для неконтинуальных heap-буферов |
-| `virtio/blk.rs` | virtio-blk: `PciTransport` + `VirtIOBlk`, обёрнут в `BlockDevice` «virtio-blk0», секторный кэш 2 MiB |
-| `nvme.rs` | NVMe поверх PCIe — поллинг (phase-bit), BAR0 MMIO, PRP scratch-frame; регистрируется как `BlockDevice` |
+| `virtio/blk.rs` | virtio-blk: `PciTransport` + `VirtIOBlk`, обёрнут в `BlockDevice` «virtio-blk0», секторный кэш 2 MiB (write-through), `flush` = `VIRTIO_BLK_T_FLUSH` |
+| `nvme.rs` | NVMe поверх PCIe — поллинг (phase-bit), BAR0 MMIO, PRP scratch-frame, FLUSH (opcode 0x08) для дюрабильности WAL (issue #15); регистрируется как `BlockDevice` |
 | `ps2_kbd.rs` | PS/2 клавиатура (IRQ1): 128-байтное кольцо сканкодов, трекинг Ctrl+C, защёлки `CTRL_C`/`FG_PID` |
 | `ps2_mouse.rs` | PS/2 мышь (IRQ12) через 8042 aux: сборка 3-байтовых пакетов, зажатые координаты + кнопки + `seq` |
 | `framebuffer.rs` | Limine framebuffer текстовая консоль + 2D-графика: шрифт 8x16 (`assets/font8x16.bin`), `FbWriter`, скролл, status bar, макросы `fb_print!` |

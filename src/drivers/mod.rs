@@ -42,6 +42,22 @@ pub trait BlockDevice: Send + Sync {
     fn sector_count(&self) -> u64 {
         0
     }
+
+    /// Flush the device's volatile write cache to stable storage (`NVMe FLUSH`,
+    /// `VIRTIO_BLK_T_FLUSH`).
+    ///
+    /// The WAL's crash-consistency argument needs write *ordering* to reach the
+    /// medium, not merely to reach the device: a controller with a volatile cache
+    /// can reorder or lose everything it has acknowledged when power goes away
+    /// (issue #15 — on virtio-blk under QEMU ordering effectively holds because
+    /// the "device" is a host file, on real NVMe it does not).
+    ///
+    /// The default is a no-op, which is correct for devices with no volatile
+    /// cache: the RAM-mock `BlockDevice` used by the in-kernel fs tests, and any
+    /// driver that has not implemented the command yet.
+    fn flush(&self) -> Result<(), ()> {
+        Ok(())
+    }
 }
 
 /// Global device registry.

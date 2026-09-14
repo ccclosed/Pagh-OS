@@ -1689,6 +1689,17 @@ pub mod mock_block {
         data: Vec<u8>,
         crash_after: Option<u32>,
         write_count: u32,
+        flushes: u32,
+        /// Opt-in operation log (see [`MockBlockDevice::record_trace`]).
+        trace: Option<Vec<Op>>,
+    }
+
+    /// One device operation, for the write-ordering assertions of the journal
+    /// durability test (issue #15).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Op {
+        Write(u64),
+        Flush,
     }
 
     pub struct MockBlockDevice {
@@ -1703,6 +1714,8 @@ pub mod mock_block {
                     data: vec![0u8; num_sectors * 512],
                     crash_after: None,
                     write_count: 0,
+                    flushes: 0,
+                    trace: None,
                 }),
             })
         }
@@ -1750,6 +1763,29 @@ pub mod mock_block {
             let idx = (fs_block * BS as u64) as usize + off;
             inner.data[idx] = val;
         }
+
+        /// Start recording the operation log (writes + flushes). Opt-in so the
+        /// bulk round-trip tests do not accumulate a trace they never read.
+        pub fn record_trace(&self) {
+            self.inner.lock().trace = Some(Vec::new());
+        }
+
+        /// The operations recorded since [`Self::record_trace`] / [`Self::reset_trace`].
+        pub fn trace(&self) -> Vec<Op> {
+            self.inner.lock().trace.clone().unwrap_or_default()
+        }
+
+        /// Clear the recorded operations, keeping recording enabled.
+        pub fn reset_trace(&self) {
+            if let Some(t) = self.inner.lock().trace.as_mut() {
+                t.clear();
+            }
+        }
+
+        /// How many times the journal asked the device to drain its cache.
+        pub fn flush_count(&self) -> u32 {
+            self.inner.lock().flushes
+        }
     }
 
     impl BlockDevice for MockBlockDevice {
@@ -1786,6 +1822,9 @@ pub mod mock_block {
                 Some(limit) => inner.write_count > limit,
                 None => false,
             };
+            if let Some(t) = inner.trace.as_mut() {
+                t.push(Op::Write(block));
+            }
             if !drop_write {
                 inner.data[start..end].copy_from_slice(buf);
             }
@@ -1795,6 +1834,18 @@ pub mod mock_block {
         /// Total addressable 512-byte sectors = backing byte length / 512.
         fn sector_count(&self) -> u64 {
             (self.inner.lock().data.len() / 512) as u64
+        }
+
+        /// Record the WAL's durability barrier. The mock has no volatile cache,
+        /// so this only has to be observable — the ordering test asserts where
+        /// the journal places it.
+        fn flush(&self) -> Result<(), ()> {
+            let mut inner = self.inner.lock();
+            inner.flushes += 1;
+            if let Some(t) = inner.trace.as_mut() {
+                t.push(Op::Flush);
+            }
+            Ok(())
         }
     }
 }
@@ -1813,7 +1864,7 @@ pub mod mock_block {
 // Property 19: ext2 dir entry rec_len/name_len round-trip + tiling. R7.2,7.3,7.5
 // Property 20: Freshly formatted ext2 superblock is valid.         R4.1,4.2,4.5,4.6
 mod fs_prop_tests {
-    use super::mock_block::MockBlockDevice;
+    use super::mock_block::{MockBlockDevice, Op};
     use crate::fs::ext2::alloc as ext2alloc;
     use crate::fs::ext2::dir as ext2dir;
     use crate::fs::ext2::structs::{self, BS};
@@ -2421,6 +2472,82 @@ mod fs_prop_tests {
             assert_kernel!(has_dot && has_dotdot, "P20: root contains '.' and '..'");
         }
     }
+
+    /// Property 21 (issue #15): the journal places a durability barrier exactly
+    /// where the crash-consistency argument needs it.
+    ///
+    /// The WAL's ordering claim is: log records become durable before anything is
+    /// checkpointed, and the checkpointed images become durable before the head
+    /// advance declares the log empty. On a device with a volatile write cache
+    /// (real NVMe) that is only true if a flush separates those steps — this test
+    /// pins the exact operation order, because "no ordering bug" is otherwise
+    /// invisible on the RAM mock and on QEMU's file-backed virtio-blk.
+    ///
+    /// **Validates: Requirements 10.1–10.6, 11.1–11.4**
+    pub fn p21_journal_flushes_at_transaction_boundaries() {
+        let fs_blocks = 16u64;
+        let log_blocks = 32u64;
+        let (dev, area) = make_journal(fs_blocks, log_blocks);
+        let super_block = area.super_block;
+        dev.record_trace();
+
+        let mut j = Journal::open(dev.clone(), area).expect("open");
+        let mut txn = j.begin();
+        j.log_block(&mut txn, 5, &filled(0xA1));
+        j.log_block(&mut txn, 7, &filled(0xB2));
+        j.commit(txn).expect("commit");
+
+        // desc + 2 data + commit in the log, then the barrier, then the two
+        // checkpoint images, then the barrier, then the journal superblock.
+        let expected = alloc::vec![
+            Op::Write(super_block + 1), // descriptor
+            Op::Write(super_block + 2), // data 1
+            Op::Write(super_block + 3), // data 2
+            Op::Write(super_block + 4), // commit record
+            Op::Flush,
+            Op::Write(5), // checkpoint images
+            Op::Write(7),
+            Op::Flush,
+            Op::Write(super_block), // head advance
+        ];
+        assert_eq_kernel!(
+            dev.trace(),
+            expected,
+            "P21: flush separates the commit record, the checkpoint and the head advance"
+        );
+
+        // Recovery of a transaction that was committed but never checkpointed
+        // (power loss between the two barriers) must also flush the replayed
+        // images before it persists the emptied log.
+        let mut txn = j.begin();
+        j.log_block(&mut txn, 9, &filled(0xC3));
+        dev.set_crash_after(3); // drop the checkpoint and the head advance
+        let _ = j.commit(txn);
+        dev.clear_crash();
+
+        dev.reset_trace();
+        let mut j2 = Journal::open(dev.clone(), area).expect("reopen");
+        let replayed = j2.recover().expect("recover");
+        // The first transaction is still in the log (its head advance was the
+        // last write that landed), so recovery replays both — idempotently.
+        assert_kernel!(replayed >= 1, "P21: the committed transaction replayed");
+
+        let trace = dev.trace();
+        assert_eq_kernel!(
+            trace.last(),
+            Some(&Op::Write(super_block)),
+            "P21: recovery persists the emptied log last"
+        );
+        assert_eq_kernel!(
+            trace[trace.len() - 2],
+            Op::Flush,
+            "P21: replayed images are flushed before the log is declared empty"
+        );
+        assert_kernel!(
+            trace.contains(&Op::Write(9)),
+            "P21: the replayed block was rewritten to its final location"
+        );
+    }
 }
 
 // Property 18 (real-device variant, Task 5.4*): filesystem operation round-trip
@@ -2780,6 +2907,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "fs::ext2 formatted superblock valid (Property 20)",
             fs_prop_tests::p20_formatted_superblock_valid
+        ),
+        (
+            "fs::journal flush ordering at transaction boundaries (Property 21)",
+            fs_prop_tests::p21_journal_flushes_at_transaction_boundaries
         ),
         (
             "fs::ext2 operation round-trip on real device (Property 18)",
