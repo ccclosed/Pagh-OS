@@ -14,6 +14,7 @@
 | `gen_ca_bundle.py` | Генератор trust-anchor бандла TLS-верификатора: скачивает curl/Mozilla CA extract, выбирает корни по subject CN (ISRG Root X1/X2, GTS R1/R4), пишет детерминированный `src/net/ca_bundle.rs` (DER-массивы + метки); сгенерированный файл коммитится, перегенерация — только осознанно |
 | `fetch_p44_fixtures.py` | Генератор фикстур host-свойства P44: скачивает реальные ISRG Root X1 и лист `deb.debian.org`, пишет `host-tests/src/properties/p44_fixture_{root,leaf}.rs` (закоммичены; перегенерация — осознанно) |
 | `mini_repo.py` | Мини Debian-зеркало в `tools/mini_repo/` для apt-E2E |
+| `qemu_shot.py` | Драйвер живого QEMU через monitor: `screendump` (PNG фреймбуфера — консоль, `paint`, курсор, статус-бар) и `sendkey` (ввод в гостя; shell читает **PS/2**, а не serial). Умеет сам поднять headless-инстанс, ответить `n` на вопрос про python3 и дождаться промпта |
 | `build-rust-app.sh` | Сборка userland-приложений (`rust-apps/`) под `x86_64-unknown-linux-musl` |
 | `e2e_local_mirror.ps1` | Детерминированный apt E2E: release-сборка c `--features lx_selftest`, stage, serve mini_repo, QEMU, assert serial-маркеров |
 | `e2e_live_update.ps1` | Live `apt update` против `deb.debian.org` (`--features lx_livetest`) по HTTP (embedded-tls висит на ~12 MiB, issue #19); assert `LIVE_APT_UPDATE: count=N`, N ≥ 50000; тайминги soft |
@@ -56,6 +57,33 @@
   bigindex), `-SkipDebugBuild` (smoke). У `e2e_live_update.ps1` параметра `-Port` нет.
 - Замечание: `mini_repo.py serve` слушает 0.0.0.0; скрипты ждут раскладки
   `BOOTX64.EFI` (через `limine.py`) + `OVMF.fd`.
+
+## qemu_shot.py — увидеть экран и нажать клавиши
+
+Serial-лог показывает только то, что ядро пишет в COM1. Фреймбуфер (консоль, статус-бар,
+`paint`, курсор) и **ввод** доступны через QEMU monitor, и это единственный способ
+запустить in-QEMU селфтесты без человека за клавиатурой: shell читает PS/2-сканкоды, из
+serial он не читает ничего.
+
+```sh
+# поднять headless-инстанс, ответить n на вопрос про python3 и снять скриншот промпта
+python tools/qemu_shot.py --boot --answer-n --out /tmp/pagh-shell.png
+
+# набрать команду и снять результат (--keep-running = не гасить QEMU после снимка)
+python tools/qemu_shot.py --boot --answer-n --keep-running --out /tmp/pagh.png
+python tools/qemu_shot.py --monitor /tmp/pagh_mon.sock --keys "selftest\n" --settle 100 --out /tmp/pagh-selftest.png
+
+# GUI: paint, затем выйти из него
+python tools/qemu_shot.py --monitor /tmp/pagh_mon.sock --keys "paint\n" --settle 6 --out /tmp/pagh-paint.png
+```
+
+Результат — обычный PNG 1280×800; `screendump` работает и с `-display none` (VGA-устройство
+эмулируется, поверхности достаточно), так что X-сервер не нужен. Вопрос про python3
+печатается **только во фреймбуфер**, поэтому `--answer-n` ждёт в serial строку
+`waiting for the Y/n answer`, а не сам вопрос.
+
+Скриншоты — не замена serial-ассертам (E2E грепают маркеры), а дополнение: то, что видно
+только на экране (отрисовка GUI, курсор, паника во фреймбуфере), иначе не проверить.
 
 ## Грабли
 
