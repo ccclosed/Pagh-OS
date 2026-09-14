@@ -50,7 +50,9 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
 8. `drivers::init` (PS/2 + framebuffer).
 9. virtio: `pci::enumerate()` → `virtio::blk::init_blk` (после кучи — enumerate аллоцирует Vec).
 10. `scheduler::init`, `vfs::init`.
-11. `init_fs`: virtio-blk → NVMe фоллбэк; `Ext2Fs::mount`; формат только genuinely-blank диска;
+11. `init_fs`: virtio-blk → NVMe фоллбэк; `Ext2Fs::mount`; формат — **только если устройство
+    целиком нулевое** (решение принимает `fs::format_policy`, issue #33: валидный суперблок,
+    таблица разделов MBR/GPT или любые другие ненулевые данные = отказ, а не стирание);
     `vfs::mount_at("/mnt", root)`; `fs_boot_demo()`; `provision::seed()`.
 12. `net::init()` + echo-сервисы на порту 7.
 `kernel_main`: спавн `shell_thread` (PID 1) и `net::net_thread`; feature-гейтнутые selftest-хуки;

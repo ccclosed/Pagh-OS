@@ -9,6 +9,7 @@
 //! (that is Task 5).
 
 pub mod ext2;
+pub mod format_policy;
 pub mod journal;
 
 /// Errors produced by the filesystem subsystem.
