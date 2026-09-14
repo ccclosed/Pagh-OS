@@ -1,9 +1,31 @@
 // test.rs — Kernel test suite (runs inside QEMU)
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
+/// Failed checks since the last [`reset_failures`].
+///
+/// `assert_kernel!` cannot unwind, so this counter is the only way `run_all`
+/// learns whether a routine was clean. Printing `ok` unconditionally is how P21
+/// stayed red while looking green.
+static FAILED_CHECKS: AtomicU32 = AtomicU32::new(0);
+
+pub fn reset_failures() {
+    FAILED_CHECKS.store(0, Ordering::Relaxed);
+}
+
+pub fn failed_checks() -> u32 {
+    FAILED_CHECKS.load(Ordering::Relaxed)
+}
+
+fn record_failure() {
+    FAILED_CHECKS.fetch_add(1, Ordering::Relaxed);
+}
+
 macro_rules! assert_kernel {
     ($cond:expr, $msg:expr) => {
         if !$cond {
+            crate::test::record_failure();
             crate::kprintln!("FAIL: {}:{}: {}", file!(), line!(), $msg);
         }
     };
@@ -11,6 +33,7 @@ macro_rules! assert_kernel {
 macro_rules! assert_eq_kernel {
     ($left:expr, $right:expr, $msg:expr) => {
         if $left != $right {
+            crate::test::record_failure();
             crate::kprintln!("FAIL: {}:{}: {}", file!(), line!(), $msg);
         }
     };
@@ -1867,7 +1890,7 @@ mod fs_prop_tests {
     use super::mock_block::{MockBlockDevice, Op};
     use crate::fs::ext2::alloc as ext2alloc;
     use crate::fs::ext2::dir as ext2dir;
-    use crate::fs::ext2::structs::{self, BS};
+    use crate::fs::ext2::structs::{self, BS, SECTORS_PER_BLOCK};
     use crate::fs::ext2::Ext2Fs;
     use crate::fs::journal::{Journal, JournalArea};
     use crate::fs::FsError;
@@ -2488,7 +2511,10 @@ mod fs_prop_tests {
         let fs_blocks = 16u64;
         let log_blocks = 32u64;
         let (dev, area) = make_journal(fs_blocks, log_blocks);
-        let super_block = area.super_block;
+        // The mock records the *sector* index the `BlockDevice` trait uses, so
+        // every expectation below is an FS block times SECTORS_PER_BLOCK.
+        let s = SECTORS_PER_BLOCK as u64;
+        let super_block = area.super_block * s;
         dev.record_trace();
 
         let mut j = Journal::open(dev.clone(), area).expect("open");
@@ -2500,13 +2526,13 @@ mod fs_prop_tests {
         // desc + 2 data + commit in the log, then the barrier, then the two
         // checkpoint images, then the barrier, then the journal superblock.
         let expected = alloc::vec![
-            Op::Write(super_block + 1), // descriptor
-            Op::Write(super_block + 2), // data 1
-            Op::Write(super_block + 3), // data 2
-            Op::Write(super_block + 4), // commit record
+            Op::Write(super_block + s),     // descriptor
+            Op::Write(super_block + 2 * s), // data 1
+            Op::Write(super_block + 3 * s), // data 2
+            Op::Write(super_block + 4 * s), // commit record
             Op::Flush,
-            Op::Write(5), // checkpoint images
-            Op::Write(7),
+            Op::Write(5 * s), // checkpoint images
+            Op::Write(7 * s),
             Op::Flush,
             Op::Write(super_block), // head advance
         ];
@@ -2544,7 +2570,7 @@ mod fs_prop_tests {
             "P21: replayed images are flushed before the log is declared empty"
         );
         assert_kernel!(
-            trace.contains(&Op::Write(9)),
+            trace.contains(&Op::Write(9 * s)),
             "P21: the replayed block was rewritten to its final location"
         );
     }
@@ -2993,14 +3019,29 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
 pub fn run_all() {
     let tests = all_tests();
     crate::kprintln!("=== kernel self-test ({} routines) ===", tests.len());
+    let mut total_failed = 0u32;
     for (name, f) in tests.iter() {
         crate::kprintln!("RUN  {}", name);
         // A failed check inside `f` prints its own `FAIL: file:line: msg` line
         // (the macros do not unwind), then control returns here normally.
+        reset_failures();
         f();
-        crate::kprintln!("ok   {}", name);
+        let failed = failed_checks();
+        total_failed += failed;
+        if failed == 0 {
+            crate::kprintln!("ok   {}", name);
+        } else {
+            crate::kprintln!("FAIL {} ({} failed checks)", name, failed);
+        }
     }
     crate::kprintln!("=== self-test complete ===");
+    // Machine-readable verdict: grepping for `ok` is not one, and grepping for
+    // `FAIL:` misses a routine that failed without printing (or vice versa).
+    crate::kprintln!(
+        "SELFTEST SUMMARY: {} routines, {} failed checks",
+        tests.len(),
+        total_failed
+    );
 }
 
 // ============================================================================
