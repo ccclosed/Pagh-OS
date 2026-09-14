@@ -48,6 +48,13 @@ pub fn run() {
 
         // Below the caption: the requisite dick pic, in white.
         draw_dick(fb, w / 2, band_y + band_h + 46, 0x00FF_FFFF);
+
+        // Bottom-left: the Buddhist 卍 — left-facing (counterclockwise), upright,
+        // gold, and labelled, so it reads as the 2500-year-old temple symbol it
+        // is and not as the other one.
+        let (sx, sy) = (48usize, h.saturating_sub(232));
+        draw_buddhist_swastika(fb, sx, sy, 120, 0x00FF_C90E);
+        fb.draw_text_px(sx, sy + 132, "buddhist", 0x00FF_C90E, 0);
     });
 
     // Drain whatever is still queued — the Enter that submitted this command
@@ -79,4 +86,22 @@ fn draw_dick(fb: &mut framebuffer::FramebufferWriter, cx: usize, cy: usize, colo
     fb.fill_circle(cx as isize, cy as isize, r + 6, color);
     fb.fill_circle(cx as isize - r - 6, (cy + shaft_h) as isize, r + 1, color);
     fb.fill_circle(cx as isize + r + 6, (cy + shaft_h) as isize, r + 1, color);
+}
+
+/// The Buddhist 卍 (U+534D): arms hooking counterclockwise, drawn upright on a
+/// 5×5 grid of `unit`-thick bars. Not the 45°-rotated, clockwise Hakenkreuz.
+fn draw_buddhist_swastika(
+    fb: &mut framebuffer::FramebufferWriter,
+    x: usize,
+    y: usize,
+    size: usize,
+    color: u32,
+) {
+    let u = size / 5;
+    fb.fill_rect(x, y + 2 * u, 5 * u, u, color); // horizontal bar
+    fb.fill_rect(x + 2 * u, y, u, 5 * u, color); // vertical bar
+    fb.fill_rect(x, y, 3 * u, u, color); // top arm hooks left
+    fb.fill_rect(x, y + 2 * u, u, 3 * u, color); // left arm hooks down
+    fb.fill_rect(x + 2 * u, y + 4 * u, 3 * u, u, color); // bottom hooks right
+    fb.fill_rect(x + 4 * u, y, u, 3 * u, color); // right arm hooks up
 }
