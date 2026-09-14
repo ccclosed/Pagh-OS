@@ -13,6 +13,7 @@ pub(crate) mod complete;
 pub(crate) mod editor;
 pub(crate) mod history;
 pub(crate) mod keys;
+pub(crate) mod lgbt;
 pub(crate) mod nano;
 pub(crate) mod nano_config;
 pub(crate) mod paint;

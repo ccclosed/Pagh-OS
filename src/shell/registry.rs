@@ -271,6 +271,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_paint,
     },
     CommandSpec {
+        name: "lgbt",
+        description: "Draw the pride flag over the whole screen",
+        usage: "lgbt",
+        handler: super::commands::cmd_lgbt,
+    },
+    CommandSpec {
         name: "pkg",
         description: "Download & install a .deb by URL (use `apt` for by-name)",
         usage: "pkg <host> <path> [port]",
@@ -301,7 +307,16 @@ pub static COMMANDS: &[CommandSpec] = &[
 /// Returns `None` when no command matches.
 #[allow(dead_code)]
 pub fn lookup(name: &str) -> Option<&'static CommandSpec> {
-    COMMANDS.iter().find(|spec| spec.name == name)
+    COMMANDS
+        .iter()
+        .find(|spec| spec.name == name)
+        // Typing a command in caps should not be "unknown": the flag command is
+        // reachable as `LGBT` as well as `lgbt`.
+        .or_else(|| {
+            COMMANDS
+                .iter()
+                .find(|spec| spec.name.eq_ignore_ascii_case(name))
+        })
 }
 
 /// Iterate the registered command names, in table order.

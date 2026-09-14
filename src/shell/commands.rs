@@ -87,6 +87,10 @@ pub(super) fn cmd_help(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
         shell_println("Available commands:");
         for spec in super::registry::COMMANDS {
+            // `lgbt` is an easter egg: it must stay reachable but unlisted.
+            if spec.name == "lgbt" {
+                continue;
+            }
             shell_println(&alloc::format!("  {:8} - {}", spec.name, spec.description));
         }
     } else {
@@ -939,6 +943,11 @@ pub(super) fn cmd_pythonc(ctx: &mut ShellCtx, args: &[&str]) {
     argv.push("py_compile");
     argv.extend_from_slice(args);
     cmd_lxrun(ctx, &argv);
+}
+
+/// `lgbt`: draw the pride flag over the whole framebuffer.
+pub(super) fn cmd_lgbt(_ctx: &mut ShellCtx, _args: &[&str]) {
+    super::lgbt::run();
 }
 
 /// `paint`: launch the framebuffer drawing application (mouse + keyboard).
