@@ -209,6 +209,18 @@ impl BlockDevice for VirtioBlkDevice {
     fn sector_count(&self) -> u64 {
         self.capacity_blocks
     }
+
+    /// `VIRTIO_BLK_T_FLUSH` (issue #15): drain the device's write cache.
+    ///
+    /// The kernel's own sector cache is write-through, so there is no dirty data
+    /// on our side to push — this reaches the device. Under QEMU the "device" is a
+    /// host file and ordering effectively held anyway, but the same code path runs
+    /// on any virtio-blk backend, and a device that does not advertise
+    /// `VIRTIO_BLK_F_FLUSH` completes the request as a no-op rather than failing.
+    fn flush(&self) -> Result<(), ()> {
+        let mut dev = self.inner.lock();
+        dev.flush().map_err(|_| ())
+    }
 }
 
 /// True if a discovered PCI device is a virtio block device.

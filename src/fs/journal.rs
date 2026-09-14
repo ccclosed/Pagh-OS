@@ -255,11 +255,23 @@ impl Journal {
         self.write_log(desc_pos + 1 + count as u64, &cmt_buf)?;
 
         // === Transaction is now atomic: the commit record makes it replayable.
+        //
+        // ...but only once it is *durable*. On a device with a volatile write
+        // cache the log records above are acknowledged-but-not-stored, so flush
+        // before checkpointing: a crash from here on can still replay the
+        // committed transaction from the log (issue #15).
+        self.dev.flush().map_err(|_| FsError::IoError)?;
 
         // 4. Checkpoint: copy logged blocks to their final ext2 locations.
         for (target, contents) in &txn.records {
             write_block(&*self.dev, *target, contents)?;
         }
+
+        // The checkpointed images must also be durable *before* the head advance
+        // below declares the log empty: otherwise a crash could leave a log that
+        // recovery treats as replayed, and a superblock that says so, with the
+        // data still only in the device's cache — a committed transaction lost.
+        self.dev.flush().map_err(|_| FsError::IoError)?;
 
         // 5. Advance head and persist the journal superblock.
         self.head = (desc_pos + count as u64 + 2) % self.log_blocks;
@@ -340,11 +352,15 @@ impl Journal {
             pos = (commit_pos + 1) % self.log_blocks;
         }
 
-        // After replay everything live is checkpointed; empty the log.
+        // After replay everything live is checkpointed; empty the log. The
+        // replayed block images must reach stable storage before the emptied log
+        // is persisted, or a second crash could lose a transaction this recovery
+        // just declared replayed (issue #15).
         self.tail = pos;
         self.head = pos;
         if replayed > 0 {
             self.next_seq = core::cmp::max(self.next_seq, last_seq + 1);
+            self.dev.flush().map_err(|_| FsError::IoError)?;
         }
         self.persist_super()?;
         Ok(replayed)
