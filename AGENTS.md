@@ -170,7 +170,11 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   fully backward-compatible ones. Precedent: `release 1.1.0: the tick-rate
   change is a feature (behavior change), so minor bump, not patch`.
   Land the bump in the same PR (or the final commit of a stacked series)
-  that ships the feature — not some day later. **Current 2.3.0** = fail-closed
+  that ships the feature — not some day later. **`main` currently reads 2.4.2**
+  (tags 2.3.0 → 2.4.0 → 2.4.1 → 2.4.2); `Cargo.toml` is the source of truth, and
+  a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
+  arrived with the format-guard PR, and a branch that has not merged yet must not
+  be reflected here. **Last documented minor, 2.3.0** = fail-closed
   TLS server authentication (issue #14 series, PRs #22–#30): chain to the
   committed CA bundle, SAN authorization, the 2025 clock gate and
   `CertificateVerify`, plus the certificate-omission bypass closed in the
@@ -191,7 +195,14 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
 
 ## Known open gaps (good first issues, all documented in-code)
 
-- procfs does not exist (only emulated `/proc/self/exe` readlink).
+- procfs covers its first slice only (issue #11, contract `docs/procfs.md`):
+  `/proc/{cpuinfo,meminfo,uptime}` and `/proc/self/{exe,cmdline,status,maps}` are
+  rendered from live kernel state (CPUID, PMM counters, the tick clock, the calling
+  process's `CompatState`), and `/proc/self/exe` is a real symlink for
+  `readlink`/`lstat`/`getdents64`. Deferred, and returning `ENOENT` today:
+  `/proc/<pid>` enumeration, `/proc/stat` (needs real user/sys/idle tick
+  accounting), `/proc/loadavg`, `/proc/mounts`, `/proc/self/{fd,stat,statm}` — so
+  `htop`/`ps` are still out of reach.
 - Signals: delivery happens at the syscall-return point; no timer-tick
   delivery, no `kill(2)`/group broadcast, no SIGSTOP/SIGCONT scheduling.
 - NVMe driver is polled and page-chunked; FLUSH (opcode 0x08) is issued at WAL
