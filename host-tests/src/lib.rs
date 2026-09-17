@@ -227,6 +227,14 @@ pub mod ca_bundle;
 #[path = "../../src/net/tls_auth.rs"]
 pub mod tls_auth;
 
+// `link_walk` is the pure symbolic-link path resolver (issue #18): the component
+// walk, `..` handling, relative/absolute link targets and the `SYMLOOP_MAX`
+// budget the kernel's `vfs::lookup_path_walk` adapter drives. `core`+`alloc` only
+// and self-contained, so the standalone `#[path]` include resolves with no extra
+// wiring (properties in `link_walk_paths`).
+#[path = "../../src/vfs/link_walk.rs"]
+pub mod link_walk;
+
 // `format_policy` decides whether boot may format a block device (issue #33).
 // Pure `core`, no I/O by design: `boot::init_fs` probes the device and feeds the
 // bytes in, so P50 asserts the decision itself against real GPT/MBR/ext2 boot
@@ -234,6 +242,16 @@ pub mod tls_auth;
 // that no CI job could reach, because no CI job ever boots the kernel.
 #[path = "../../src/fs/format_policy.rs"]
 pub mod format_policy;
+
+// `ext2::symlink` is the pure symlink-layout + hard-link accounting core of the
+// ext2 writer (issue #18, contract `EXT2-LINKS.md` §2/§3): which targets stay
+// inline in the inode's `i_block` (≤ 59 bytes) and which need a data block, how
+// an inline image is reshaped into `i_block`'s words and back, and what `unlink`
+// must do with an inode that has N names pointing at it. `core`-only and
+// self-contained, so the standalone `#[path]` include resolves with no extra
+// wiring (properties in `ext2_links`).
+#[path = "../../src/fs/ext2/symlink.rs"]
+pub mod ext2_symlink;
 
 
 // ── OpenPGP repository-metadata verification (issue #32) ─────────────────────
@@ -348,6 +366,15 @@ mod properties {
     // Boot-time device safety (issue #33): only a genuinely blank device is
     // formatted; GPT/MBR/foreign/ext2-like layouts are refused.
     mod p50;
+    // ext2 symbolic links + hard links (issue #18, contract `EXT2-LINKS.md`
+    // §2/§3/§8): the fast/slow layout boundary and inline image round-trip, the
+    // `i_block` word reshape, and the link-count accounting that `unlink` and
+    // `link` must obey (a name is only freed at the last link).
+    mod ext2_links;
+    // Symbolic-link path resolution (issue #18, contract `EXT2-LINKS.md` §4.6,
+    // §7.4): Linux-verified cases plus a randomized comparison against an
+    // independent restart-based oracle.
+    mod link_walk_paths;
     // OpenPGP repository-metadata verification (issue #32), contract
     // OPENPGP-VERIFY-CONTRACT.md §2/§3/§7.
     //   P51 — armor/packet framing: bounded, panic-free parsing of hostile bytes.
