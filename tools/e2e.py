@@ -1094,6 +1094,11 @@ class Harness:
             # QEMU user-net: the guest reaches a host-side mirror on 10.0.2.2:8000
             # and, for the live mode, the outside world.
             argv += ["-netdev", "user,id=net0", "-device", "e1000,netdev=net0"]
+        if a.rtc:
+            # Guest-visible wall clock. Needed for the negative TLS clock-gate case:
+            # `--rtc base=2020-01-01` boots before the committed certificate's
+            # validity window, which must make the fail-closed verifier refuse.
+            argv += ["-rtc", a.rtc]
         argv += ["-serial", f"file:{self.serial_log}",
                  "-monitor", f"unix:{self.monitor},server,nowait",
                  "-display", "none", "-no-reboot",
@@ -1610,6 +1615,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="extra regex that MUST match the serial log (repeatable)")
     r.add_argument("--extra-wait", action="append", default=[],
                    help="extra regex reported best-effort at the end (repeatable)")
+    common.add_argument("--rtc", default=None,
+                        help="QEMU -rtc string, e.g. 'base=2020-01-01' to boot with a clock "
+                             "before 2025-01-01 (exercise the TLS clock gate / #32 ClockUnset "
+                             "case end to end)")
     common.add_argument("--lock-file", default=os.environ.get("PAGH_E2E_LOCK", ""),
                         help="cross-worktree run lock (default /tmp/pagh-e2e.lock; "
                              "$PAGH_E2E_LOCK)")
