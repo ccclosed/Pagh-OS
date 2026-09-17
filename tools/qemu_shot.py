@@ -103,21 +103,43 @@ def key_name(ch: str) -> str:
 
 
 class Monitor:
-    """Minimal QEMU monitor client (unix socket or host:port)."""
+    """Minimal QEMU monitor client (unix socket, or ``tcp:host:port``)."""
 
     def __init__(self, target: str, timeout: float = 15.0):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        deadline = time.time() + timeout
-        while True:
-            try:
-                self.sock.connect(target)
-                break
-            except OSError:
-                if time.time() > deadline:
-                    raise SystemExit(f"error: cannot connect to QEMU monitor {target!r}")
-                time.sleep(0.2)
+        self.sock = self._connect(target, timeout)
         time.sleep(0.3)
         self._drain()
+
+    @staticmethod
+    def _connect(target: str, timeout: float) -> socket.socket:
+        """Open the monitor socket.
+
+        A path (``/tmp/pagh_mon.sock``) is a unix socket, anything that names a
+        host and port — ``host:port`` or ``tcp:host:port`` — is TCP. Both are
+        what QEMU's ``-monitor`` accepts.
+        """
+        spec = target[4:] if target.startswith("tcp:") else target
+        if ":" in spec and not spec.startswith("/"):
+            host, _, port = spec.rpartition(":")
+            if not host or not port.isdigit():
+                raise SystemExit(f"error: --monitor wants a socket path or host:port, got {target!r}")
+            family, address = socket.AF_INET, (host, int(port))
+        else:
+            family, address = socket.AF_UNIX, spec
+        deadline = time.time() + timeout
+        while True:
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            try:
+                sock.connect(address)
+                return sock
+            except OSError:
+                sock.close()
+                if time.time() > deadline:
+                    raise SystemExit(
+                        f"error: cannot connect to QEMU monitor {target!r} "
+                        "(is QEMU running with -monitor unix:…,server,nowait?)"
+                    )
+                time.sleep(0.2)
 
     def _drain(self) -> str:
         self.sock.settimeout(0.4)
@@ -138,20 +160,37 @@ class Monitor:
         time.sleep(0.15)
         return self._drain()
 
+    @staticmethod
+    def _check(reply: str, cmd: str) -> None:
+        """Fail loudly on a monitor error instead of timing out later."""
+        lowered = reply.lower()
+        if "error" in lowered or "unknown command" in lowered or "invalid" in lowered:
+            raise SystemExit(f"error: QEMU rejected {cmd!r}: {reply.strip()}")
+
     def send_keys(self, text: str, delay: float = 0.12) -> None:
         for ch in text:
-            self.command(f"sendkey {key_name(ch)}")
+            cmd = f"sendkey {key_name(ch)}"
+            self._check(self.command(cmd), cmd)
             time.sleep(delay)
 
     def screendump(self, path: pathlib.Path) -> None:
+        """Capture the guest framebuffer to `path` (PNG).
+
+        Writes to a temporary file and renames it into place: an existing
+        `path` is only replaced by a dump that actually succeeded, so a rejected
+        `screendump` can no longer destroy the file it was asked to write.
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            path.unlink()
-        self.sock.sendall(f"screendump {path} -f png\n".encode())
+        tmp = path.with_name(f".{path.name}.qemu_shot.tmp")
+        if tmp.exists():
+            tmp.unlink()
+        reply = self.command(f"screendump {tmp} -f png")
+        self._check(reply, "screendump")
         deadline = time.time() + 20
         while time.time() < deadline:
-            if path.exists() and path.stat().st_size > 0:
+            if tmp.exists() and tmp.stat().st_size > 0:
                 time.sleep(0.2)  # let QEMU finish flushing the file
+                tmp.replace(path)
                 return
             time.sleep(0.2)
         raise SystemExit(f"error: screendump produced no file at {path}")
@@ -164,18 +203,15 @@ class Monitor:
 
 
 def resolve_ovmf(requested: str) -> pathlib.Path:
-    cand = ROOT / requested
-    if cand.exists():
-        return cand
-    for system in (
-        "/usr/share/edk2/ovmf/OVMF_CODE.fd",
-        "/usr/share/ovmf/OVMF_CODE.fd",
-        "/usr/share/OVMF/OVMF_CODE.fd",
-        "/usr/share/edk2/x64/OVMF_CODE.fd",
-    ):
-        if pathlib.Path(system).exists():
-            return pathlib.Path(system)
-    raise SystemExit("error: no OVMF firmware found (pass --ovmf)")
+    """OVMF firmware, resolved by the same rules `tools/build.py` uses.
+
+    `build.py` owns the search order (repo root, then the system copies); this
+    delegates instead of keeping a second, drifting copy of the list.
+    """
+    sys.path.insert(0, str(ROOT / "tools"))
+    import build  # noqa: PLC0415  (tools/build.py; guarded by __main__)
+
+    return build.resolve_ovmf(requested)
 
 
 def decode_keys(text: str) -> str:
@@ -209,13 +245,21 @@ def boot(args: argparse.Namespace) -> tuple[subprocess.Popen, Monitor]:
     if not disk.is_absolute():
         disk = ROOT / disk
     if not disk.exists():
+        # The kernel formats a blank device on boot, which is intended for a
+        # freshly created image — say so, because `--disk` defaults to the repo's
+        # own disk.img and a typo here is a disk image, not a file path.
+        print(f"note: creating a blank 64M disk image at {disk}", file=sys.stderr)
         subprocess.run(["qemu-img", "create", "-f", "raw", str(disk), "64M"], check=True)
 
     monitor_target = args.monitor
-    if not monitor_target.startswith("/"):
-        raise SystemExit("error: --boot needs a unix socket --monitor path (e.g. /tmp/pagh_mon.sock)")
-    if os.path.exists(monitor_target):
-        os.unlink(monitor_target)
+    if not monitor_target.startswith("/") and ":" not in monitor_target:
+        raise SystemExit("error: --boot needs a unix socket path (e.g. /tmp/pagh_mon.sock) or host:port")
+    if monitor_target.startswith("/"):
+        if os.path.exists(monitor_target):
+            os.unlink(monitor_target)
+        monitor_spec = f"unix:{monitor_target},server,nowait"
+    else:
+        monitor_spec = f"tcp:{monitor_target},server,nowait"
     serial = pathlib.Path(args.serial)
     if serial.exists():
         serial.unlink()
@@ -233,26 +277,35 @@ def boot(args: argparse.Namespace) -> tuple[subprocess.Popen, Monitor]:
         "-serial", f"file:{serial}",
         "-display", "none",
         "-no-reboot",
-        "-monitor", f"unix:{monitor_target},server,nowait",
+        "-monitor", monitor_spec,
     ]
     print("+", " ".join(cmd), file=sys.stderr)
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    mon = Monitor(monitor_target)
+    try:
+        mon = Monitor(monitor_target)
+    except BaseException:
+        # Never leave a booted guest behind because the monitor did not come up.
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        raise
     return proc, mon
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Screenshot / type into a pagh QEMU instance")
     p.add_argument("--boot", action="store_true", help="start QEMU headless first (needs a unix --monitor socket)")
-    p.add_argument("--monitor", default=MONITOR_DEFAULT, help=f"monitor unix socket or host:port (default {MONITOR_DEFAULT})")
+    p.add_argument("--monitor", default=MONITOR_DEFAULT, help=f"QEMU monitor: unix socket path or host:port (default {MONITOR_DEFAULT})")
     p.add_argument("--serial", default=SERIAL_DEFAULT, help="serial log path (used with --boot / --wait-prompt)")
-    p.add_argument("--out", default="/tmp/pagh_shot.png", help="screenshot path (PNG)")
+    p.add_argument("--out", default="/tmp/pagh_shot.png", help="screenshot path (PNG; replaced only by a successful dump)")
     p.add_argument("--keys", default="", help="text to type before the screenshot, e.g. 'selftest\\n'")
     p.add_argument("--answer-n", action="store_true", help="answer the first-boot base-package Y/n question with 'n'")
     p.add_argument("--wait-prompt", type=float, default=90.0, help="seconds to wait for the shell prompt (0 = don't)")
     p.add_argument("--settle", type=float, default=2.0, help="seconds to wait after typing, before the screenshot")
     p.add_argument("--keep-running", action="store_true", help="leave a --boot instance running after the screenshot")
-    p.add_argument("--disk", default="disk.img", help="data disk image for --boot (default disk.img)")
+    p.add_argument("--disk", default="disk.img", help="data disk image for --boot; created blank (64M) when absent, and the kernel formats a blank disk on boot")
     p.add_argument("--ovmf", default="OVMF.fd", help="OVMF firmware path (falls back to the system copy)")
     p.add_argument("--cpu", default="max", help="QEMU CPU model ('max' exposes RDSEED/RDRAND for the TLS path)")
     p.add_argument("--memory", default="1024M", help="guest RAM")
