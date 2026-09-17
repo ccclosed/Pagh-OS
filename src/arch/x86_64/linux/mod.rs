@@ -37,6 +37,7 @@ pub mod process_sys;
 pub mod rtc;
 pub mod signal;
 pub mod signal_frame;
+pub mod trap_frame;
 pub mod unix_sock;
 
 use abi::nr as sysno;

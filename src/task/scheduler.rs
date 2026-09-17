@@ -211,6 +211,14 @@ pub fn resume_stopped(pid: u64) -> bool {
     true
 }
 
+/// Forget a stop request that an outside event superseded (the task is being
+/// killed, or a test cancelled the stop before the tick could act on it). The
+/// request set has no other consumer: a request that is never acted on would park
+/// the task at its next tick even though the reason for the stop is gone.
+pub fn cancel_stop_request(pid: u64) {
+    STOP_REQUESTED.lock().remove(&pid);
+}
+
 /// Remove and return a parked task's saved frame. The caller is terminating the
 /// task: the frame will never be restored, so it must be reaped with the cr3
 /// returned here (never the currently loaded one).
@@ -252,6 +260,23 @@ fn pend_reap(pid: u64) {
 fn pend_reap_with(pid: u64, cr3: u64) {
     PENDING_REAPS.lock().insert(pid, ExitReap { cr3 });
     FRAME_LEDGER.lock().remove(&pid);
+}
+
+/// Drop the CURRENTLY-RUNNING task right now (the tick decided it must not run
+/// again: a tick-delivered fatal signal, or an `rt_sigframe` that could not be
+/// placed).
+///
+/// This context is still running ON that task's kernel stack, so the memory can
+/// only be released by a later tick's reaper ([`pend_reap`] captures the address
+/// space that is loaded RIGHT NOW — correct here, because the running task's CR3
+/// is its own). The rotation marks the kill path may have set are cleared: they
+/// are consumed only by a tick that sees the pid as CURRENT, which this task never
+/// will again — a leftover would linger in `EXITING_PIDS` forever.
+pub fn drop_current_now() {
+    let pid = current_pid();
+    let _ = take_exiting(pid);
+    STOP_REQUESTED.lock().remove(&pid);
+    pend_reap(pid);
 }
 
 /// Reclaim the resources of ONE dropped task (oldest first): unmap and free
@@ -657,8 +682,23 @@ pub extern "C" fn scheduler_tick_irq(current_rsp: u64) -> u64 {
         // overwritten by the incoming task's restore below.
         crate::task::fpu::save_if_user(cur, current_rsp);
         let cr3 = vmm::current_pml4_phys();
-        if take_stop_requested(cur) {
-            // A stop signal was delivered to this task: park its frame instead of
+        // Signal delivery from the tick path (issue #12 task t9): the LAST chance
+        // for a task that never enters a syscall (a CPU-bound loop) to see a
+        // signal. The delivery happens HERE — before the requeue decision, on the
+        // CURRENT task's frame, with its own CR3 loaded — so the frame the
+        // scheduler requeues is the one the handler will be entered with. The
+        // frame layout is read through `trap_frame::IrqFrame`, never through the
+        // syscall `SavedRegs` cast (see that module).
+        let tick = crate::arch::x86_64::linux::signal::tick_action(current_rsp);
+        if tick == crate::arch::x86_64::linux::signal::TickAction::Kill {
+            // The tick killed this task (fatal default action, or its rt_sigframe
+            // could not be placed): drop it now, with its own address space, and
+            // never requeue it.
+            crate::trace!("[SCHED] task {} killed by tick-delivered signal", cur);
+            drop_current_now();
+        } else if take_stop_requested(cur) {
+            // A stop signal was delivered to this task (from the tick path above or
+            // from the syscall-return path that yielded): park its frame instead of
             // requeueing it. The frame stays in STOPPED_TASKS until SIGCONT puts it
             // back, so the task resumes at this exact point.
             crate::trace!("[SCHED] task {} parked (stopped)", cur);

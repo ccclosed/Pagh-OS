@@ -73,16 +73,12 @@ use super::regs::SavedRegs;
 use super::signal_frame::{
     decode_rt_sigframe, default_action, encode_rt_sigframe, frame_location, is_user_handler,
     DefaultAction, RestoredFrame, RT_SIGFRAME_SIZE, SIGINFO_OFFSET, SIGKILL, SIG_DFL, SIG_IGN,
-    UC_OFFSET, UNBLOCKABLE_MASK,
+    UC_OFFSET, UNBLOCKABLE_MASK, USER_RFLAGS,
 };
+use super::trap_frame::{plan_irq_delivery, IrqFrame};
 
 use crate::task::compat;
 use crate::task::scheduler;
-
-/// Clean x86_64 user RFLAGS for handler entry: reserved bit 1 set, IF set,
-/// all system flags clear. Linux sanitizes the interrupted flags the same way
-/// when delivering a signal.
-const USER_RFLAGS: u64 = 0x202;
 
 /// Conservative count of enqueued pending signals across all processes. The
 /// delivery check on EVERY syscall return is `load(==0) → skip` — a pure
@@ -207,7 +203,7 @@ fn resume_group(tgid: u64) {
 /// moved out of rotation immediately. `mark_stop_requested` makes the next
 /// requeue decision (this yield, or a tick that fires first) move the frame into
 /// `STOPPED_TASKS`; we never return to ring 3 with a stop pending.
-fn stop_current_group(sig: u64) {
+fn begin_group_stop(sig: u64) {
     let pid = scheduler::current_pid();
     let tgid = compat::tgid_of(pid);
     let siblings: alloc::vec::Vec<u64> = compat::group_pids(tgid)
@@ -224,6 +220,13 @@ fn stop_current_group(sig: u64) {
         parked
     );
     scheduler::mark_stop_requested(pid);
+}
+
+/// Stop-signal delivery at a syscall return: mark the group stopped, then park the
+/// receiver by yielding — the requeue decision inside `yield_switch` sees the stop
+/// request and parks this frame instead of rotating it.
+fn stop_current_group(sig: u64) {
+    begin_group_stop(sig);
     scheduler::yield_current();
 }
 
@@ -531,6 +534,163 @@ pub fn deliver_one_pending_syscall(regs: &mut SavedRegs, result: u64) {
         frame,
         action.restorer
     );
+}
+
+// ─── Timer-tick delivery ─────────────────────────────────────────────────────
+
+/// What the timer-tick return path did with the interrupted task.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TickAction {
+    /// Nothing to do: no deliverable signal, or the interrupted frame is a kernel
+    /// frame whose user context is not here (the syscall return epilogue, or the
+    /// `EINTR` checks of the blocking wait loops, will deliver it).
+    None,
+    /// An `rt_sigframe` was written and the iret frame rewritten in place; the
+    /// caller must requeue the task with this frame.
+    Delivered,
+    /// The signal's default action stopped the task: the caller's requeue decision
+    /// must park it (the stop request is already marked).
+    Park,
+    /// The task was terminated (a fatal default action, or an `rt_sigframe` that
+    /// could not be placed): the caller must drop it — never requeue it — and reap
+    /// it with its own address space.
+    Kill,
+}
+
+/// Handle one pending signal for the CURRENT task at the timer-tick return point,
+/// where `cur_rsp` is the frame `irq32_stub` just saved (see
+/// [`super::trap_frame`]).
+///
+/// ## Why this is a separate path from [`deliver_one_pending_syscall`]
+///
+/// The two frames are different: at `cur_rsp` the word at `+120` is the
+/// interrupted `rax` and the interrupted user context lives in the CPU-pushed
+/// iret words, so the syscall-path code (which rewrites `rcx`/`r11` for `sysretq`
+/// and the per-task user-RSP slot) would corrupt the task. Here the delivery
+/// rewrites the iret frame: `RIP` = handler, `RSP` = frame base, `RFLAGS` =
+/// [`USER_RFLAGS`], `RDI/RSI/RDX` = signo/`&siginfo`/`&ucontext`; `CS`, `SS`,
+/// `rax` and the `popfq` word stay untouched.
+///
+/// ## Order of the checks (all of them load-bearing)
+///
+///   1. **Fatal action first** (any frame): a `SIG_DFL` default-terminate signal
+///      needs no user frame, and the task must die whether it was in ring 3 or
+///      inside a syscall. Terminates WITHOUT diverging — `sys_exit_group` must
+///      never be called from IRQ context.
+///   2. **Stop action next** (any frame): a stop parks the task at this tick's
+///      requeue decision; unlike the syscall path it must NOT yield from IRQ
+///      context.
+///   3. **Ring-3 check BEFORE the pick**: a kernel frame has no user context here,
+///      and consuming the bit would lose the signal forever (nothing re-queues a
+///      signal). This is the one ordering rule the whole path depends on.
+///   4. Then (and only then) consume the bit and build the frame. The picked
+///      signal is checked against the peeked one and the frame is built from the
+///      value that was actually taken, so the delivered signal can never be a
+///      neighbour of the pending bit (the off-by-one class this code was written
+///      next to).
+pub fn tick_action(cur_rsp: u64) -> TickAction {
+    if cur_rsp == 0 || PENDING_APPROX.load(Ordering::Relaxed) == 0 {
+        return TickAction::None;
+    }
+    let pid = scheduler::current_pid();
+    if !compat::compat_exists(pid) {
+        return TickAction::None;
+    }
+    // SAFETY: the only caller is `scheduler_tick_irq`, which passes its own
+    // `current_rsp` — the frame `irq32_stub` pushed on the CURRENT task's kernel
+    // stack. That frame is 168 bytes, mapped and unaliased for the duration of
+    // this call (each task owns a private kernel stack, and the tick runs with
+    // interrupts masked, so nothing can preempt or alias it).
+    let frame = unsafe { &mut *(cur_rsp as *mut IrqFrame) };
+
+    // (1) What would the pending signal do? Peek WITHOUT consuming.
+    let Some((sig, action, _blocked, _alt)) = compat::peek_deliverable_signal() else {
+        return TickAction::None;
+    };
+
+    if action.handler == SIG_DFL && default_action(sig) == DefaultAction::Term {
+        let _ = compat::pick_pending_signal();
+        PENDING_APPROX.fetch_sub(1, Ordering::Relaxed);
+        crate::info!(
+            "[signal] pid={} sig={} tick-delivered default-terminate (no handler)",
+            pid,
+            sig
+        );
+        // Records 128 + sig for wait4 and marks the task exiting; the caller drops
+        // it. Diverging here (exit_group) would be a halt loop inside the IRQ.
+        force_terminate_group(pid, sig);
+        return TickAction::Kill;
+    }
+    if action.handler == SIG_DFL && default_action(sig) == DefaultAction::Stop {
+        let _ = compat::pick_pending_signal();
+        PENDING_APPROX.fetch_sub(1, Ordering::Relaxed);
+        begin_group_stop(sig);
+        return TickAction::Park;
+    }
+    // (3) A kernel frame: no user context here, so consume NOTHING.
+    if !frame.is_user_frame() {
+        return TickAction::None;
+    }
+    if action.handler == SIG_IGN {
+        let _ = compat::pick_pending_signal();
+        PENDING_APPROX.fetch_sub(1, Ordering::Relaxed);
+        return TickAction::None;
+    }
+
+    // (4) Consume the bit and deliver to the user handler.
+    let Some((taken, action, old_blocked, altstack)) = compat::pick_pending_signal() else {
+        return TickAction::None;
+    };
+    PENDING_APPROX.fetch_sub(1, Ordering::Relaxed);
+    if taken != sig {
+        // Impossible while interrupts are masked (nothing else may touch this
+        // process's pending set), but if it ever happens the frame must be built
+        // from the signal that was ACTUALLY taken — never from a neighbour.
+        crate::error!(
+            "[signal] pid={} tick delivery: peeked sig={} but picked sig={} - delivering the picked one",
+            pid,
+            sig,
+            taken
+        );
+    }
+    let user_rsp = frame.rsp;
+    let frame_addr = frame_location(user_rsp, &action, &altstack);
+    if check_user_ptr(frame_addr, RT_SIGFRAME_SIZE).is_err() {
+        crate::warn!(
+            "[signal] pid={} sig={} tick delivery: frame {:#x} unmapped -> SIGSEGV exit",
+            pid,
+            taken,
+            frame_addr
+        );
+        force_terminate_group(pid, super::signal_frame::SIGSEGV);
+        return TickAction::Kill;
+    }
+    let saved = frame.user_context();
+    let newmask = (old_blocked | action.mask) & !UNBLOCKABLE_MASK;
+    let mut buf = [0u8; RT_SIGFRAME_SIZE as usize];
+    encode_rt_sigframe(&mut buf, action.restorer, taken, &saved, newmask, &altstack);
+    // SAFETY: `check_user_ptr` above proved the whole RT_SIGFRAME_SIZE region is
+    // mapped and user-accessible, and this task exclusively owns its user stack
+    // while it is the running task (the tick runs on its kernel stack).
+    unsafe {
+        ptr::copy_nonoverlapping(buf.as_ptr(), frame_addr as *mut u8, buf.len());
+    }
+    frame.enter_handler(&plan_irq_delivery(
+        frame_addr,
+        taken,
+        action.handler,
+        USER_RFLAGS,
+    ));
+    compat::block_during_handler(action.mask);
+    crate::info!(
+        "[signal] pid={} tick-delivered sig={} handler={:#x} frame={:#x} (interrupted rip={:#x})",
+        pid,
+        taken,
+        action.handler,
+        frame_addr,
+        saved.ip
+    );
+    TickAction::Delivered
 }
 
 // ─── rt_sigreturn ────────────────────────────────────────────────────────────

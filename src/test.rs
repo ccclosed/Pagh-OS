@@ -3885,8 +3885,343 @@ mod linux_stop_tests {
         compat::remove_compat(FAKE_CHILD);
     }
 }
+// ─── Timer-tick signal delivery, in-guest (issue #12, task t9) ───────────────
+//
+// The tick path is the LAST chance for a CPU-bound task that never enters a
+// syscall to see a signal, and it is the highest-risk code in the signal work: it
+// runs in IRQ context on the interrupted task's own frame. The host property
+// `irq_frame` proves the byte-level plan; this routine proves the INTEGRATION on
+// the real machine, with a synthetic `IrqFrame` standing in for the one
+// `irq32_stub` pushes (its layout is asserted byte-for-byte by
+// `scheduler_layout_tests`, and `trap_frame`'s const assertions pin the same
+// offsets in type form):
+//
+//   * a KERNEL-mode frame must consume NOTHING (the interrupted task is inside a
+//     syscall; the bit has to survive for its own return path — consuming it here
+//     would lose the signal, because nothing re-queues a signal);
+//   * a RING-3 frame gets a real `rt_sigframe` in user memory plus an entry plan
+//     whose `RDI`/`si_signo` are the signal that was pending — asserted against a
+//     queue that also holds a HIGHER signal, so a neighbouring bit (the
+//     off-by-one class fixed in t8) fails here;
+//   * `CS`, `SS`, the `popfq` word and `rax` survive untouched, and the
+//     interrupted context is recoverable from the frame through
+//     `decode_rt_sigframe` (an `rt_sigreturn` from the handler comes back to the
+//     interrupted instruction).
+//
+// NON-DESTRUCTIVE: the synthetic `CompatState` belongs to the running selftest
+// task and is removed at the end; the fake frames live on this routine's stack;
+// the sigframe goes to a scratch user page that is unmapped and freed before
+// returning. The fatal-action branch of `tick_action` is deliberately NOT
+// exercised here (it would terminate the selftest task itself) — it is covered by
+// the end-to-end CPU-bound-process check in the `lx_selftest` harness.
+mod linux_tick_tests {
+    use crate::arch::x86_64::linux::signal::{self, TickAction};
+    use crate::arch::x86_64::linux::signal_frame::{
+        decode_rt_sigframe, sigbit, SignalAction, SA_RESTORER, SIGINFO_OFFSET, SIGUSR1, SIGUSR2,
+        UC_OFFSET, USER_RFLAGS,
+    };
+    use crate::arch::x86_64::linux::trap_frame::IrqFrame;
+    use crate::memory::{pmm, vmm};
+    use crate::task::compat::{self, CompatState};
+    use crate::task::fd::FdTable;
+    use crate::task::scheduler;
+    use alloc::sync::Arc;
+    use x86_64::structures::paging::PageTableFlags;
+
+    /// Scratch user page holding the fake user stack (and therefore the frame the
+    /// delivery builds on it).
+    const TICK_STACK_VA: u64 = 0x0000_4000_1000_0000;
+    /// The interrupted user RSP: far enough below the top for a 440-byte frame.
+    const USER_RSP: u64 = TICK_STACK_VA + 0x1000 - 0x100;
+    /// Stand-ins for the handler and the sigreturn trampoline: never executed, only
+    /// written into the frame/frame header by the plan under test.
+    const HANDLER: u64 = 0x0040_1000;
+    const RESTORER: u64 = 0x0040_1100;
+    /// A plausible user CS (RPL 3) and the kernel CS the ring-0 case uses.
+    const USER_CS: u64 = 0x2b;
+    const KERNEL_CS: u64 = 0x08;
+
+    fn map_stack_page() -> Option<u64> {
+        if vmm::virt_to_phys(TICK_STACK_VA).is_some() {
+            return None;
+        }
+        let frame = pmm::alloc_frame()?;
+        // SAFETY: the frame was just allocated and is reachable through the HHDM.
+        unsafe {
+            core::ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, 4096);
+        }
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+        vmm::map(frame, TICK_STACK_VA, flags).ok()?;
+        Some(frame)
+    }
+
+    fn unmap_stack_page(frame: Option<u64>) {
+        if let Some(frame) = frame {
+            let _ = vmm::unmap(TICK_STACK_VA);
+            pmm::free_frame(frame);
+        }
+    }
+
+    /// A frame as `irq32_stub` leaves it for a task interrupted in `cs`, with the
+    /// interrupted user context in the iret words.
+    fn fake_frame(cs: u64, rip: u64) -> IrqFrame {
+        let mut f = IrqFrame {
+            popfq_rflags: 0x002, // the IF=0 invariant of the restore tail
+            cs,
+            rflags: 0x246, // an ordinary user RFLAGS (bit 1 set)
+            rsp: USER_RSP,
+            ss: 0x10,
+            rip,
+            ..Default::default()
+        };
+        f.gpr.rax = 0xdead_beef_0000_0001;
+        f.gpr.rbx = 0x1111_2222_3333_4444;
+        f.gpr.rcx = 0x5555_6666_7777_8888;
+        f.gpr.rdx = 0x9999_aaaa_bbbb_cccc;
+        f.gpr.rsi = 0xdddd_eeee_ffff_0000;
+        f.gpr.rdi = 0x0123_4567_89ab_cdef;
+        f.gpr.rbp = 0x7000_0000_0000_1000;
+        f.gpr.r8 = 8;
+        f.gpr.r9 = 9;
+        f.gpr.r10 = 10;
+        f.gpr.r11 = 0x246;
+        f.gpr.r12 = 12;
+        f.gpr.r13 = 13;
+        f.gpr.r14 = 14;
+        f.gpr.r15 = 15;
+        f
+    }
+
+    fn install_self_state() {
+        let me = scheduler::current_pid();
+        let st = CompatState::new(
+            FdTable::with_standard_streams(),
+            Arc::new(crate::sync::spinlock::Spinlock::new(
+                crate::arch::x86_64::linux::mem::VmRegionSet::new(0, 0),
+            )),
+            me,
+        );
+        compat::install_compat(me, st);
+        // User handlers for BOTH queued signals. This is not cosmetic: the tick
+        // path's first branch is the FATAL one (a `SIG_DFL` default-terminate is
+        // executed immediately, any frame), and the delivery always takes the
+        // LOWEST pending bit — a signal left at `SIG_DFL` would therefore terminate
+        // the selftest task itself and hang the suite. The fatal branch is
+        // deliberately not exercised here (see the module docs); it is covered by
+        // the CPU-bound-process check in the `lx_selftest` harness.
+        for signo in [SIGUSR1, SIGUSR2] {
+            compat::with_current_compat(|cs| {
+                cs.sig.lock().handlers[(signo - 1) as usize] = SignalAction {
+                    handler: HANDLER,
+                    flags: SA_RESTORER,
+                    restorer: RESTORER,
+                    mask: 0,
+                };
+            });
+        }
+    }
+
+    pub fn tick_delivery_plan() {
+        let me = scheduler::current_pid();
+        let page = map_stack_page();
+        install_self_state();
+
+        // Guard the whole routine: everything queued below must be non-fatal, or
+        // the tick's fatal branch terminates THIS task.
+        for signo in [SIGUSR1, SIGUSR2] {
+            assert_eq_kernel!(
+                signal::current_has_handler(signo),
+                Some(true),
+                "tick-test: the queued signal has a user handler (never fatal for the selftest task)"
+            );
+        }
+        // Two signals queued, the LOWER one must be the one delivered: a neighbour
+        // bit (the off-by-one class) fails every assertion below.
+        assert_eq_kernel!(
+            signal::send_signal(me, SIGUSR2),
+            Ok(()),
+            "tick-test: SIGUSR2 queued"
+        );
+        assert_eq_kernel!(
+            signal::send_signal(me, SIGUSR1),
+            Ok(()),
+            "tick-test: SIGUSR1 queued"
+        );
+
+        // ── A. A kernel-mode frame consumes NOTHING ──────────────────────────
+        let mut kernel_frame = fake_frame(KERNEL_CS, 0xffff_ffff_8000_1234);
+        let before = kernel_frame;
+        assert_eq_kernel!(
+            signal::tick_action(&mut kernel_frame as *mut IrqFrame as u64),
+            TickAction::None,
+            "tick-test: a kernel-mode frame gets no delivery"
+        );
+        assert_eq_kernel!(
+            kernel_frame,
+            before,
+            "tick-test: a kernel-mode frame is left byte-identical"
+        );
+        assert_kernel!(
+            compat::pending_of(me) & sigbit(SIGUSR1) != 0,
+            "tick-test: the pending bit survived the kernel-frame refusal"
+        );
+
+        // ── B. A ring-3 frame is delivered the LOWEST pending signal ─────────
+        let interrupted_rip = 0x0040_2000 + 7;
+        let mut user_frame = fake_frame(USER_CS, interrupted_rip);
+        let interrupted = user_frame.user_context();
+        assert_eq_kernel!(
+            signal::tick_action(&mut user_frame as *mut IrqFrame as u64),
+            TickAction::Delivered,
+            "tick-test: a ring-3 frame gets the delivery"
+        );
+        // The entry plan, exactly:
+        assert_eq_kernel!(
+            user_frame.rip,
+            HANDLER,
+            "tick-test: iret RIP is the handler"
+        );
+        assert_eq_kernel!(
+            user_frame.rflags,
+            USER_RFLAGS,
+            "tick-test: iret RFLAGS is the clean user value"
+        );
+        assert_eq_kernel!(
+            user_frame.gpr.rdi,
+            SIGUSR1,
+            "tick-test: RDI is the signal that was pending (not a neighbour)"
+        );
+        assert_eq_kernel!(
+            user_frame.gpr.rsi,
+            user_frame.rsp + SIGINFO_OFFSET,
+            "tick-test: RSI points at the siginfo in the delivered frame"
+        );
+        assert_eq_kernel!(
+            user_frame.gpr.rdx,
+            user_frame.rsp + UC_OFFSET,
+            "tick-test: RDX points at the ucontext in the delivered frame"
+        );
+        // …and nothing else moved:
+        assert_eq_kernel!(
+            user_frame.cs,
+            USER_CS,
+            "tick-test: CS survives the delivery"
+        );
+        assert_eq_kernel!(user_frame.ss, 0x10, "tick-test: SS survives the delivery");
+        assert_eq_kernel!(
+            user_frame.popfq_rflags,
+            0x002,
+            "tick-test: the popfq word keeps IF masked"
+        );
+        assert_eq_kernel!(
+            user_frame.gpr.rax,
+            interrupted.ax,
+            "tick-test: the live user rax survives (it is also sigcontext.rax)"
+        );
+
+        // The frame itself is on the (mapped) user stack and round-trips.
+        let frame_addr = user_frame.rsp;
+        assert_eq_kernel!(
+            frame_addr % 16,
+            8,
+            "tick-test: the frame base is 8 mod 16 (SysV alignment for the handler)"
+        );
+        let mut uc = [0u8; 304];
+        // SAFETY: the scratch page is mapped, user-accessible and was written by the
+        // delivery above; reading 304 bytes from it cannot fault.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (frame_addr + UC_OFFSET) as *const u8,
+                uc.as_mut_ptr(),
+                304,
+            );
+        }
+        let Some(restored) = decode_rt_sigframe(&uc) else {
+            assert_kernel!(false, "tick-test: the delivered frame decodes");
+            return;
+        };
+        assert_eq_kernel!(
+            restored.regs,
+            interrupted,
+            "tick-test: the frame carries the interrupted context"
+        );
+        assert_eq_kernel!(
+            restored.regs.ip,
+            interrupted_rip,
+            "tick-test: rt_sigreturn would resume the interrupted instruction"
+        );
+        // siginfo si_signo == the delivered signal.
+        let mut si = [0u8; 4];
+        // SAFETY: as above, inside the same mapped scratch page.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (frame_addr + SIGINFO_OFFSET) as *const u8,
+                si.as_mut_ptr(),
+                4,
+            );
+        }
+        assert_eq_kernel!(
+            u32::from_le_bytes(si),
+            SIGUSR1 as u32,
+            "tick-test: siginfo carries SIGUSR1, the signal that was pending"
+        );
+        // pretcode = the restorer, so the handler returns into rt_sigreturn.
+        let mut pc = [0u8; 8];
+        // SAFETY: as above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(frame_addr as *const u8, pc.as_mut_ptr(), 8);
+        }
+        assert_eq_kernel!(
+            u64::from_le_bytes(pc),
+            RESTORER,
+            "tick-test: pretcode is the sigreturn trampoline"
+        );
+        // Exactly one bit was consumed, and it was SIGUSR1's.
+        assert_eq_kernel!(
+            compat::pending_of(me) & sigbit(SIGUSR1),
+            0,
+            "tick-test: the delivered signal's bit was consumed"
+        );
+        assert_kernel!(
+            compat::pending_of(me) & sigbit(SIGUSR2) != 0,
+            "tick-test: the higher pending signal is still queued"
+        );
+
+        // ── C. A delivered stop parks at the tick's requeue decision ─────────
+        // Drain what case B left (SIGUSR2) so the peek below sees SIGSTOP only:
+        // the pending set is a SET, and the delivery always takes the lowest bit.
+        while crate::task::compat::pick_pending_signal().is_some() {}
+        assert_eq_kernel!(
+            signal::send_signal(me, crate::arch::x86_64::linux::signal_frame::SIGSTOP),
+            Ok(()),
+            "tick-test: SIGSTOP queued"
+        );
+        let mut stop_frame = fake_frame(KERNEL_CS, 0x0040_3000);
+        assert_eq_kernel!(
+            signal::tick_action(&mut stop_frame as *mut IrqFrame as u64),
+            TickAction::Park,
+            "tick-test: a stop action asks the caller to park (no yield from IRQ)"
+        );
+        // The selftest task is NOT parked (this is not a real tick): drop the
+        // request the call marked so no state leaks into the rest of the suite.
+        scheduler::cancel_stop_request(me);
+        assert_kernel!(!scheduler::is_stopped(me), "tick-test: not parked");
+
+        // ── Cleanup ──────────────────────────────────────────────────────────
+        compat::remove_compat(me);
+        unmap_stack_page(page);
+    }
+}
+
 pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
     alloc::vec![
+        (
+            "linux::tick-delivered signal plan (issue #12)",
+            linux_tick_tests::tick_delivery_plan
+        ),
         // Runs FIRST, not last: it spawns two kernel threads (2 x 64 stack frames)
         // via `kernel_thread_spawn`, which panics on PMM exhaustion, and the rest
         // of the suite consumes >100k frames by the time the last routine runs

@@ -614,6 +614,29 @@ pub fn pick_pending_signal() -> Option<(u64, SignalAction, u64, SigAltStack)> {
     Some((sig, action, cs.sig_blocked, cs.sig_altstack))
 }
 
+/// The lowest-numbered deliverable signal for the CURRENT process WITHOUT
+/// consuming it: `(signal, disposition, blocked mask, altstack)`.
+///
+/// The timer-tick delivery needs this to decide what a pending signal WOULD do
+/// (terminate? stop? frame delivery?) before it consumes the bit, because a bit
+/// consumed on a frame it cannot write into (a task interrupted inside a syscall)
+/// would be lost for good — nothing re-queues a signal.
+///
+/// The signal number is the index of the lowest set bit PLUS ONE: `sigbit(N)` is
+/// `1 << (N - 1)`.
+pub fn peek_deliverable_signal() -> Option<(u64, SignalAction, u64, SigAltStack)> {
+    let pid = super::scheduler::current_pid();
+    let states = COMPAT_STATES.lock();
+    let cs = states.get(&pid)?;
+    let deliverable = cs.sig_pending & !cs.sig_blocked;
+    if deliverable == 0 {
+        return None;
+    }
+    let sig = deliverable.trailing_zeros() as u64 + 1;
+    let action = cs.sig.lock().handlers[(sig - 1) as usize];
+    Some((sig, action, cs.sig_blocked, cs.sig_altstack))
+}
+
 /// Block `mask` in the CURRENT process for the handler's lifetime (the
 /// pre-delivery mask is already saved inside the frame; `rt_sigreturn`
 /// reinstates it).

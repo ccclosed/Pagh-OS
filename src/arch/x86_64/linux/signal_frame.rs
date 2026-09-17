@@ -111,6 +111,12 @@ pub const fn sigbit(sig: u64) -> u64 {
 /// Kernel-enforced unblockable signals: `SIGKILL` and `SIGSTOP`.
 pub const UNBLOCKABLE_MASK: u64 = sigbit(SIGKILL) | sigbit(SIGSTOP);
 
+/// Clean x86_64 user RFLAGS for handler entry: reserved bit 1 set, IF set, all
+/// system flags clear. Both delivery paths (syscall return via `sysretq`, timer
+/// tick via `iretq`) enter the handler with exactly these flags; Linux sanitizes
+/// the interrupted flags the same way when delivering a signal.
+pub const USER_RFLAGS: u64 = 0x202;
+
 /// The stop-class signals (`SIG_KERNEL_STOP_MASK` in Linux): their default action
 /// is Stop, and generating `SIGCONT` discards all of them from the pending sets
 /// (POSIX 2.4.1 / Linux `prepare_signal`).
