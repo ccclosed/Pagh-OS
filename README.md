@@ -449,10 +449,12 @@ python
   group, `SIGSTOP`/`SIGCONT` are real scheduler state (a stopped task keeps its saved
   frame, leaves rotation and is resumed by `SIGCONT`; `wait4` reports `WUNTRACED` and
   `WCONTINUED`), and a fatal `tgkill`/`kill` without a handler still ends the process
-  cleanly (glibc `abort()` → exit 134). Not yet: delivery while parked in a wait is
+  cleanly (glibc `abort()` → exit 134); the timer-tick return path delivers to a
+  CPU-bound task that never enters a syscall, and `notify`-style state changes
+  (`stopped`/`continued`) reach `wait4`. Not yet: delivery while parked in a wait is
   limited to the patched wait loops (read/poll/select/epoll/nanosleep/wait4/futex),
-  and a CPU-bound loop with no syscalls does not see a signal until delivery from the
-  timer-tick return path lands.
+  `SIGCHLD` is not generated for stop/continue, and job control is limited to "every
+  process is its own group" (`setpgid` into a foreign group is a no-op).
 - **Install ≠ run.** `apt install <pkg>` resolves the dependency closure, downloads each
   `.deb`, unpacks its files onto `/mnt`, and materializes tar symlinks/hardlinks as file
   copies (the ext2 writer has no symlink support). Console programs like `python3`

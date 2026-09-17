@@ -192,10 +192,11 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
 ## Known open gaps (good first issues, all documented in-code)
 
 - procfs does not exist (only emulated `/proc/self/exe` readlink).
-- Signals: delivery happens only at the syscall-return point. `kill(2)` (nr 62),
-  process-group addressing (`kill(0|-1|-pgid)`) and `SIGSTOP`/`SIGCONT` scheduling
-  are implemented; there is still no timer-tick delivery, so a CPU-bound loop with
-  no syscalls never sees a signal.
+- Signals (issue #12): `kill(2)` (nr 62), process-group addressing
+  (`kill(0|-1|-pgid)`), `SIGSTOP`/`SIGCONT` scheduling, `wait4(WUNTRACED|WCONTINUED)`
+  and timer-tick delivery to a syscall-free task are all implemented. Still missing:
+  a real process-group model (`setpgid` into a foreign group), `SIGCHLD` on
+  stop/continue, and job-control tty stops (`^Z`).
 - NVMe driver is polled and page-chunked; FLUSH (opcode 0x08) is issued at WAL
   transaction boundaries, but there are no PRP lists and no queue depth > 1.
 - embedded-tls deterministically hangs on large streams — live apt update
