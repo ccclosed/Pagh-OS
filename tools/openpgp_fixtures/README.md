@@ -65,6 +65,9 @@ would also pass the negative set. `a08` is an *expected accept* — see below.
 ## The rollback answer (asked for explicitly)
 
 **The replay of an old, valid `stable` triplet is NOT detected: the attack passes.**
+(Independently reproduced by `a08` here from `snapshot.debian.org`, and by the t23 `stale`
+suite inside `selftest_lx`; t23 also landed the caveat in `SECURITY.md`, so the wording
+below is the *rationale* to keep in sync, not an unlanded request.)
 `stable` carries no `Valid-Until` (contract §0, re-verified against the live mirror), and the
 kernel persists no "highest `Release` seen", so `a08` must be *accepted* after a successful
 update from `a01`. The case exists so the residual is visible in an actual run instead of
@@ -98,6 +101,11 @@ that flag and expect `stage=clock cause=ClockUnset`. The manifest records the sa
 * Every case directory is a **complete apt repository root**: `dists/stable/…` + `pool/…`.
   Serve `<case>/` at the mirror root (the layout matches what `apt` fetches) and run
   `apt update` / `apt install` against it.
+* **Serve them all as suite `stable`** (`apt setsuite stable`), not as the case id: since
+  t23 the client cross-checks the signed `Release` against the configured suite
+  (`AptOpError::ReleaseSuiteMismatch`, `src/pkg/apt.rs`), and the `a*` trees carry Debian's
+  own `Suite: stable` inside a signature we cannot re-make. Parameterising the suite
+  directory would therefore break exactly the reference cases.
 * `manifest.json` carries, per case: `id`, `family`, `expect` (`accept`/`reject`), `stage`,
   `cause`, `marker`, `tree`, `attacks`, `notes`; plus `reference_signers` and
   `not_constructible`.
