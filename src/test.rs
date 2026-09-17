@@ -3417,10 +3417,12 @@ mod linux_signal_tests {
     use crate::arch::x86_64::linux::abi::nr;
     use crate::arch::x86_64::linux::errno::{encode_errno, Errno};
     use crate::arch::x86_64::linux::kill::{KillTarget, INT_MIN};
+    use crate::arch::x86_64::linux::misc;
     use crate::arch::x86_64::linux::regs::SavedRegs;
     use crate::arch::x86_64::linux::signal;
     use crate::task::compat::{self, CompatState};
     use crate::task::fd::FdTable;
+    use crate::task::scheduler;
     use alloc::sync::Arc;
 
     /// A pid never produced by `scheduler::next_pid` (which counts up from 1) and
@@ -3459,6 +3461,10 @@ mod linux_signal_tests {
         compat::install_compat(FAKE_PID, synth(FAKE_PID, FAKE_PID));
         compat::install_compat(FAKE_LEADER, synth(FAKE_LEADER, FAKE_GROUP));
         compat::install_compat(FAKE_MEMBER, synth(FAKE_MEMBER, FAKE_GROUP));
+        // The selftest task gets a synthetic state too, so `tgkill`'s self-pair
+        // (`raise()`'s path) can be checked exactly: tgid == tid == this pid.
+        let me = scheduler::current_pid();
+        compat::install_compat(me, synth(me, me));
 
         // ── Handler level: existence probes and the errno matrix ────────────
         assert_eq_kernel!(
@@ -3559,7 +3565,50 @@ mod linux_signal_tests {
             "a number outside SUPPORTED_SYSCALLS still returns -ENOSYS"
         );
 
+        // ── tgkill (234): the (tgid, tid) PAIR is what is addressed ─────────
+        // From the in-guest verification of issue #12 (finding f1): a nonexistent
+        // tid used to be accepted silently, because `sys_tgkill` ignored its two
+        // addressing arguments. All of these are existence probes (`sig == 0`), so
+        // nothing is delivered.
+        let member_tgid = compat::tgid_of(FAKE_MEMBER);
+        assert_eq_kernel!(
+            misc::sys_tgkill(me, me, 0),
+            Ok(0),
+            "tgkill(self tgid, self tid, 0) is the valid self-pair probe"
+        );
+        assert_eq_kernel!(
+            misc::sys_tgkill(member_tgid, FAKE_MEMBER, 0),
+            Ok(0),
+            "tgkill(leader tgid, member tid, 0) is a valid pair"
+        );
+        assert_eq_kernel!(
+            misc::sys_tgkill(me, ABSENT, 0),
+            Err(Errno::ESRCH),
+            "tgkill(<valid tgid>, nonexistent tid, 0) is ESRCH"
+        );
+        assert_eq_kernel!(
+            misc::sys_tgkill(FAKE_PID, me, 0),
+            Err(Errno::ESRCH),
+            "tgkill(<foreign tgid>, existing tid, 0) is ESRCH (tgid mismatch)"
+        );
+        assert_eq_kernel!(
+            misc::sys_tgkill(FAKE_GROUP + 999, FAKE_MEMBER, 0),
+            Err(Errno::ESRCH),
+            "tgkill(nonexistent tgid, existing tid, 0) is ESRCH"
+        );
+        assert_eq_kernel!(
+            misc::sys_tgkill(me, (-1i64) as u64, 0),
+            Err(Errno::ESRCH),
+            "tgkill with a negative tid is ESRCH"
+        );
+        assert_eq_kernel!(
+            misc::sys_tgkill(me, me, 65),
+            Err(Errno::EINVAL),
+            "tgkill with an invalid signal is EINVAL (before the pair check)"
+        );
+
         // ── Cleanup: leave the registry exactly as found ────────────────────
+        compat::remove_compat(me);
         compat::remove_compat(FAKE_PID);
         compat::remove_compat(FAKE_LEADER);
         compat::remove_compat(FAKE_MEMBER);

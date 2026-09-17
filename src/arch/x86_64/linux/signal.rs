@@ -233,6 +233,23 @@ fn stop_current_group(sig: u64) {
 /// Outside-kill of the thread group `pid` belongs to, recording exit status
 /// `128 + sig` for `wait4` (a plain `request_exit` would drop the compat
 /// state without ever inserting the zombie entry).
+///
+/// Public twin of the SIGKILL sender path for `tgkill`-style callers that address
+/// a thread other than themselves.
+pub fn terminate_group(pid: u64, sig: u64) {
+    force_terminate_group(pid, sig);
+}
+
+/// Is a user handler installed for `sig` in the thread group of `pid` (as opposed
+/// to the caller's)? `true`/`false` when `pid` has compat state.
+pub fn has_handler_for(pid: u64, sig: u64) -> bool {
+    compat::with_pid_compat(pid, |cs| is_user_handler(&cs.sig.lock().handlers[(sig - 1) as usize]))
+        .unwrap_or(false)
+}
+
+/// Outside-kill of the thread group `pid` belongs to, recording exit status
+/// `128 + sig` for `wait4` (a plain `request_exit` would drop the compat
+/// state without ever inserting the zombie entry).
 fn force_terminate_group(pid: u64, sig: u64) {
     let tgid = compat::tgid_of(pid);
     for member in compat::group_member_pids(tgid, pid) {

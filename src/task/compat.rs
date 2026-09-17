@@ -614,6 +614,15 @@ pub fn pick_pending_signal() -> Option<(u64, SignalAction, u64, SigAltStack)> {
     Some((sig, action, cs.sig_blocked, cs.sig_altstack))
 }
 
+/// Run `f` against the [`CompatState`] of `pid` (any process, not just the
+/// current one), returning `None` when that pid has no compat state.
+///
+/// The lock is held for the duration of `f` (the same rule as
+/// [`with_current_compat`]: `f` must not block or re-enter the registry).
+pub fn with_pid_compat<R>(pid: u64, f: impl FnOnce(&mut CompatState) -> R) -> Option<R> {
+    COMPAT_STATES.lock().get_mut(&pid).map(f)
+}
+
 /// The lowest-numbered deliverable signal for the CURRENT process WITHOUT
 /// consuming it: `(signal, disposition, blocked mask, altstack)`.
 ///
