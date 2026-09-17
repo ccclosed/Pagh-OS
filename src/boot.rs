@@ -292,8 +292,8 @@ fn init_fs() {
                 }
                 Err(refusal) => {
                     match refusal {
-                        // Historical wording, kept byte-identical: the docs and
-                        // the E2E scripts grep for "refusing destructive reformat".
+                        // Wording kept byte-identical: it is the historical
+                        // refusal line and the docs quote it.
                         Refusal::ExistingFilesystem => error!(
                             "fs: existing ext2 mount failed: {:?}; refusing destructive reformat",
                             first_error
@@ -305,6 +305,15 @@ fn init_fs() {
                             first_error
                         ),
                     }
+                    // No in-guest route forward exists (there is no `mkfs` in the
+                    // shell), so name the operator's options instead of leaving
+                    // the refusal as the last word on the serial line.
+                    error!(
+                        "fs: {} left untouched; to reuse it, zero the start of the device \
+                         (`wipefs -a` / `dd` from another system) or write the {} marker",
+                        blk.name(),
+                        crate::fs::format_policy::OPT_IN_MARKER_NAME
+                    );
                     return;
                 }
             }
@@ -328,6 +337,13 @@ fn init_fs() {
 /// or superblock-at-offset-0 layouts of every filesystem a user is likely to have
 /// (NTFS, XFS, LUKS, ZFS, ext4-in-a-partition). btrfs keeps its superblock at
 /// 64 KiB — inside the window as well.
+///
+/// **The window is a real limitation, not a formality**: a layout that keeps
+/// everything outside the first MiB — a `mkswap` signature at the tail of the
+/// device, mdadm 1.0 superblocks, IMSM/DDF external RAID metadata, or a device
+/// whose start was zeroed by an interrupted `wipefs`/`dd` — probes as `Blank`
+/// and is formatted. Bounding the probe is what keeps boot from reading a whole
+/// SSD; the cost is that "blank" means "blank in the first MiB".
 const PROBE_LIMIT: u64 = 1024 * 1024;
 
 /// Probe granularity, in bytes: one filesystem block (8 device sectors).
@@ -337,8 +353,10 @@ const PROBE_CHUNK: u64 = 4096;
 ///
 /// Reads in [`PROBE_CHUNK`] steps and stops as soon as the layout is decided — a
 /// partitioned or populated device costs a single read; only a device claiming to
-/// be blank is scanned to the end. A read error keeps the `Foreign` (refused)
-/// classification, so an unreadable device is never formatted either.
+/// be blank is scanned to the end of [`PROBE_LIMIT`]. A read error keeps the
+/// `Foreign` (refused) classification, so an unreadable device is never formatted
+/// either — including a device with a single bad sector inside the window, which
+/// therefore cannot be formatted at all until it is zeroed.
 fn probe_boot_area(dev: &dyn drivers::BlockDevice) -> crate::fs::format_policy::Probe {
     use crate::fs::format_policy::Probe;
 

@@ -44,12 +44,26 @@ pub const MIN_PROBE: usize = SUPERBLOCK_OFFSET + 2;
 /// printf 'PAGH-FORMAT' | sudo dd of=/dev/nvme0n1 bs=1 conv=notrunc
 /// ```
 ///
-/// Deliberate and unmistakable: nothing else in the kernel or in any filesystem
-/// writes these bytes, the write itself *is* the operator saying "this device may
-/// be destroyed", and it cannot happen by accident — unlike a bootloader command
-/// line, which is easy to add once and forget. Without the marker, a device is
-/// formatted only when it is entirely zero.
-pub const OPT_IN_MARKER: &[u8] = b"PAGH-FORMAT";
+/// Deliberate and unmistakable: nothing else writes these bytes, and the write
+/// itself *is* the operator saying "this device may be destroyed" — unlike a
+/// bootloader command line, which is easy to add once and forget.
+///
+/// It is the only way to authorise formatting a device that holds data, and it
+/// is **destructive in itself**: the marker lands in the first 11 bytes of
+/// sector 0, which is the bootstrap area of a partitioned disk (and would
+/// overwrite the jump instruction of a partition's boot sector). Recovery from
+/// a disk whose data the operator wants to keep is `dd`/`wipefs`/`sgdisk -Z`
+/// — those zero the start and make the device `Blank`, which is formatted
+/// without any marker. The marker exists for the case where the operator wants
+/// the *data* gone but cannot first make the device look blank (e.g. a
+/// whole-disk foreign filesystem at LBA 0 with metadata beyond the probe
+/// window). Without it, a device is formatted only when the probed region is
+/// entirely zero.
+pub const OPT_IN_MARKER_NAME: &str = "PAGH-FORMAT";
+
+/// The same marker as bytes, for the probe. Derived from the name so the two can
+/// never drift apart.
+pub const OPT_IN_MARKER: &[u8] = OPT_IN_MARKER_NAME.as_bytes();
 
 /// What the probed boot area of a device looks like.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +202,10 @@ impl Probe {
 /// `has_valid_superblock` must be the result of `Ext2Fs::has_valid_superblock`
 /// (a *parsable* superblock, not merely the magic), and `layout` the result of
 /// probing the device's boot area.
+///
+/// Precedence, in order: a parsable ext2 superblock refuses unconditionally; a
+/// blank device is formatted without any opt-in; the [`OPT_IN_MARKER`] lifts
+/// every *layout* refusal; otherwise the layout's own refusal is returned.
 pub fn format_allowed(
     layout: Layout,
     has_valid_superblock: bool,
@@ -195,12 +213,21 @@ pub fn format_allowed(
 ) -> Result<(), Refusal> {
     if has_valid_superblock {
         // A real filesystem that failed to mount is an error, never permission
-        // to erase user data. This is the pre-existing guard, kept first.
+        // to erase user data. This is the pre-existing guard, kept first: it is
+        // the one refusal the opt-in marker cannot lift, because the volume is
+        // intact enough to be recognised. An operator who really wants such a
+        // device back zeroes its superblock first — that makes the probe report
+        // `Blank`, which needs no marker at all.
         return Err(Refusal::ExistingFilesystem);
     }
     if layout == Layout::Blank {
         return Ok(());
     }
+    // The marker is the operator's written consent, so it lifts the layout
+    // refusals — a partition table, an ext2 magic whose superblock does not
+    // validate, any other foreign data. Checked here, before the layout is
+    // turned into a refusal, so the precedence is visible in one place instead
+    // of being implied by the match arms below.
     if allow_destructive {
         return Ok(());
     }
@@ -369,6 +396,38 @@ mod tests {
         assert_eq!(
             format_allowed(p.layout(), true, p.is_marked()),
             Err(Refusal::ExistingFilesystem)
+        );
+    }
+
+    #[test]
+    fn the_marker_lifts_every_layout_refusal() {
+        // The marker is consent for *this device's contents*, whatever the probe
+        // called them: a partition table, an ext2 magic that does not validate,
+        // or unrecognised data. Only a parsable superblock outranks it.
+        for layout in [
+            Layout::PartitionTable,
+            Layout::Ext2,
+            Layout::Foreign,
+            Layout::Blank,
+        ] {
+            assert_eq!(
+                format_allowed(layout, false, true),
+                Ok(()),
+                "the opt-in marker must lift {layout:?}"
+            );
+        }
+        // ...and without it, each layout refuses by name.
+        assert_eq!(
+            format_allowed(Layout::PartitionTable, false, false),
+            Err(Refusal::PartitionTable)
+        );
+        assert_eq!(
+            format_allowed(Layout::Ext2, false, false),
+            Err(Refusal::Ext2Like)
+        );
+        assert_eq!(
+            format_allowed(Layout::Foreign, false, false),
+            Err(Refusal::ForeignData)
         );
     }
 }

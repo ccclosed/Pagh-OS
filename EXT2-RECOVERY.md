@@ -17,12 +17,14 @@ The rules, in order:
 1. a **mountable ext2 superblock** (a parsable `read_sb_gds`, not merely the magic) means
    "this is a filesystem" — never format, and an ext2/ext4 volume with a missing or
    corrupt pagh WAL is rejected instead of erased; ext4 shares the `0xEF53` magic and is
-   covered by this same rule;
+   covered by this same rule. This is the one refusal the opt-in marker cannot lift;
+   an operator who wants such a device back zeroes its start (`wipefs -a`), which makes
+   it blank and therefore formattable without any marker;
 2. an **MBR/GPT partition table** (boot signature at byte 510, or `EFI PART` at LBA 1) is
    refused by name — this is the real-hardware case;
 3. any other **non-zero data** in the probed 1 MiB window is refused by name;
 4. an **all-zero** device is formatted, and so is any device carrying the explicit
-   opt-in marker below.
+   opt-in marker below, whatever layout the probe reported for it.
 
 ### Taking over a disk that already has data
 
@@ -35,8 +37,15 @@ printf 'PAGH-FORMAT' | sudo dd of=/dev/nvme0n1 bs=1 conv=notrunc
 
 Nothing else enables it: there is no bootloader flag, no config file, and the kernel
 never writes those bytes itself. Omit the marker and the device is refused with a line
-naming what was found on it. There is deliberately no "format anyway" prompt, because
-this kernel boots with no console input available at that point.
+naming what was found on it, plus a line naming the two ways forward. There is
+deliberately no "format anyway" prompt, because this kernel boots with no console input
+available at that point.
+
+The marker is destructive in itself: it overwrites the first 11 bytes of sector 0 — on a
+partitioned disk that is the bootstrap area of the protective MBR (and of a partition's
+boot sector, if the disk is used that way). That is the same sector the marker has to
+occupy to be found, so the command above is only for a disk whose contents you have
+already decided to lose.
 
 Boot probes at most 1 MiB, and only after a mount failure, so the happy path pays
 nothing for the check.
