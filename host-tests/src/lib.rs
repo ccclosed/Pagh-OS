@@ -170,6 +170,15 @@ pub mod fd_alloc;
 #[path = "../../src/arch/x86_64/linux/signal_frame.rs"]
 pub mod signal_frame;
 
+// `kill` is the pure `kill(2)` argument/target/errno model (issue #12): 32-bit
+// argument decoding, the `pid > 0 / 0 / -1 / -pgid / INT_MIN` classification,
+// the single-uid permission policy, and the one-thread-per-group pick. It uses
+// only `super::errno` — declared here as a crate-root sibling, exactly like
+// `io` — so the standalone `#[path]` include resolves with no extra wiring
+// (property `kill_target`).
+#[path = "../../src/arch/x86_64/linux/kill.rs"]
+pub mod kill;
+
 // `x509` is the pure minimal DER (ASN.1) reader + X.509 time decoding that the
 // TLS server-certificate verifier (issue #14) is built on. `core`-only and
 // self-contained — its calendar math deliberately duplicates
@@ -351,6 +360,19 @@ mod properties {
     mod p51;
     mod p52;
     mod p53;
+    // `kill(2)` argument decoding + target classification + errno matrix
+    // (issue #12): the decisions `signal::sys_kill` makes before touching the
+    // compat registry. Deliberately NOT numbered p51+: the OpenPGP verification
+    // task owns the p51–p53 range, so this property uses a descriptive module
+    // name instead of racing for a number.
+    mod kill_target;
+    // SIGSTOP/SIGCONT as scheduler state (issue #12, task t8): the pure half of
+    // job control — the `wait(2)` status encodings (`WIFSTOPPED`/`WIFCONTINUED`
+    // can never collide with an exit status), the stop-class set (exactly the
+    // signals whose default action is Stop), and the POSIX flushes (SIGCONT
+    // discards every pending stop-class bit; a stop signal discards a pending
+    // SIGCONT). Descriptive module name, same reason as `kill_target`.
+    mod signal_stop;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the

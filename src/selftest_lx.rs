@@ -809,9 +809,21 @@ fn verify_file(path: &str, expected: &[u8]) -> Result<(), &'static str> {
 /// Build, in memory, a minimal statically-linked `ET_EXEC` x86_64 Linux ELF whose
 /// `_start` issues `write(1, msg, len)` then `exit_group(0)` using the Linux ABI
 /// (`write` = 1, `exit_group` = 231; number in `rax`, args in `rdi/rsi/rdx`) via the
-/// `int 0x80` path. Mirrors `process::build_test_elf` but with Linux syscall numbers
-/// and an `exit_group`, so a `Compat_Process` running it exercises the Linux write
-/// handler (serial output) and the exit diagnostic end-to-end.
+/// `syscall`-instruction entry. Mirrors `process::build_test_elf` but with Linux
+/// syscall numbers and an `exit_group`, so a `Compat_Process` running it exercises
+/// the Linux write handler (serial output) and the exit diagnostic end-to-end.
+///
+/// The entry instruction is `syscall` (`0F 05`), NOT `int 0x80`, and that is
+/// load-bearing: AGENTS.md invariant 2 — a Compat_Process must enter syscalls
+/// through `syscall_entry`, where the CPU saves the user RIP in `rcx`, the user
+/// RFLAGS in `r11` and the per-task user-RSP slot at `SavedRegs + 120` holds the
+/// user RSP. On the `int 0x80` path the CPU-pushed frame makes that `+120` word
+/// the user RIP instead, so signal delivery would build the `rt_sigframe` "below"
+/// a text address and overwrite the user's code. `linux_dispatch` records every
+/// `int 0x80` entry (`linux::INT80_ENTRY`) and the signal path refuses frame
+/// delivery for such a process — but the test binary must not rely on that safety
+/// net: it is a Compat_Process and therefore has to take the compat path. Both
+/// instructions are two bytes, so `CODE_LEN` and the ELF layout are unchanged.
 fn build_linux_test_elf() -> Vec<u8> {
     const VBASE: u64 = 0x40_0000;
     const EHSIZE: usize = 64;
@@ -833,10 +845,10 @@ fn build_linux_test_elf() -> Vec<u8> {
     code.extend_from_slice(&(msg_addr as u32).to_le_bytes()); // mov esi, msg_addr
     code.push(0xBA);
     code.extend_from_slice(&len.to_le_bytes()); // mov edx, len
-    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall (NOT int 0x80: AGENTS invariant 2)
     code.extend_from_slice(&[0xB8, 0xE7, 0x00, 0x00, 0x00]); // mov eax, 231 (exit_group)
     code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi (code = 0)
-    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall (NOT int 0x80: AGENTS invariant 2)
     code.extend_from_slice(&[0xEB, 0xFE]); // 1: jmp 1b (fallback)
     debug_assert_eq!(code.len(), CODE_LEN);
 

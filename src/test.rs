@@ -3392,6 +3392,480 @@ mod net_phy_prop_tests {
     }
 }
 
+// ─── linux::kill(2) in-guest checks (issue #12, task t7) ─────────────────────
+//
+// The pure half of `kill(2)` (argument decoding, target classification, errno
+// matrix) is proven on the host by `host-tests` P51 and `abi::supported_set_is_exact`.
+// These routines cover what a host test cannot: the real dispatcher routing of
+// nr 62 (the gate + the arm + the handler together) and the registry-backed
+// target resolution.
+//
+// NON-DESTRUCTIVE by construction:
+//   * the synthetic `CompatState`s are installed for three pids far above any pid
+//     `scheduler::next_pid` hands out and are removed before returning; nothing
+//     is ever scheduled under them;
+//   * every check uses `sig == 0` (the existence probe, which queues nothing) or
+//     an invalid signal that is rejected before the registry is consulted, so no
+//     pending bit and no `PENDING_APPROX` accounting is touched;
+//   * the dispatcher calls pass `reentry_allowed = 0`, so the interrupt flag of
+//     the calling thread is left exactly as it was.
+//
+// Deliberately NOT here (issue #12 t8/t9): actually delivering a signal (SIGKILL
+// would mark a live pid exiting) and delivery from the timer-tick path — a
+// CPU-bound loop with no syscalls still sees nothing until t9 lands.
+mod linux_signal_tests {
+    use crate::arch::x86_64::linux::abi::nr;
+    use crate::arch::x86_64::linux::errno::{encode_errno, Errno};
+    use crate::arch::x86_64::linux::kill::{KillTarget, INT_MIN};
+    use crate::arch::x86_64::linux::regs::SavedRegs;
+    use crate::arch::x86_64::linux::signal;
+    use crate::task::compat::{self, CompatState};
+    use crate::task::fd::FdTable;
+    use alloc::sync::Arc;
+
+    /// A pid never produced by `scheduler::next_pid` (which counts up from 1) and
+    /// never spawned as a task.
+    ///
+    /// It MUST stay below 2^31: `kill(2)`'s `pid_t` is a 32-bit SIGNED value, so a
+    /// larger raw number sign-extends to a negative `int` and addresses a process
+    /// GROUP instead of a pid — exactly what `kill::decode_pid` implements, and
+    /// what the first version of this routine tripped over.
+    const FAKE_PID: u64 = 0x7F00_0001;
+    /// Leader of the synthetic thread group [`FAKE_GROUP`] (its tgid == its pid).
+    const FAKE_LEADER: u64 = 0x7F00_0002;
+    /// Second member of [`FAKE_GROUP`]: proves the one-copy-per-group pick.
+    const FAKE_MEMBER: u64 = 0x7F00_0003;
+    const FAKE_GROUP: u64 = FAKE_LEADER;
+    /// A pid/group that was never installed.
+    const ABSENT: u64 = 0x7F00_00FF;
+
+    /// A minimal synthetic compat state; the VM bookkeeping is never used by the
+    /// signal paths, so an empty region set is sufficient.
+    fn synth(tid: u64, tgid: u64) -> CompatState {
+        let mut st = CompatState::new(
+            FdTable::with_standard_streams(),
+            Arc::new(crate::sync::spinlock::Spinlock::new(
+                crate::arch::x86_64::linux::mem::VmRegionSet::new(0, 0),
+            )),
+            tid,
+        );
+        st.tgid = tgid;
+        st
+    }
+
+    /// `kill(2)` nr 62 through the REAL dispatcher, plus the registry-backed
+    /// target resolution and the errno matrix.
+    pub fn kill_dispatch_and_errno() {
+        compat::install_compat(FAKE_PID, synth(FAKE_PID, FAKE_PID));
+        compat::install_compat(FAKE_LEADER, synth(FAKE_LEADER, FAKE_GROUP));
+        compat::install_compat(FAKE_MEMBER, synth(FAKE_MEMBER, FAKE_GROUP));
+
+        // ── Handler level: existence probes and the errno matrix ────────────
+        assert_eq_kernel!(
+            signal::sys_kill(FAKE_PID, 0),
+            Ok(0),
+            "kill(live pid, 0) is the Ok existence probe"
+        );
+        assert_eq_kernel!(
+            signal::sys_kill(FAKE_LEADER, 0),
+            Ok(0),
+            "kill(live thread-group leader, 0) succeeds"
+        );
+        assert_eq_kernel!(
+            signal::sys_kill(ABSENT, 0),
+            Err(Errno::ESRCH),
+            "kill(absent pid, 0) is ESRCH"
+        );
+        assert_eq_kernel!(
+            signal::sys_kill((FAKE_GROUP as i64).wrapping_neg() as u64, 0),
+            Ok(0),
+            "kill(-pgid, 0) finds the synthetic group"
+        );
+        assert_eq_kernel!(
+            signal::sys_kill((ABSENT as i64).wrapping_neg() as u64, 0),
+            Err(Errno::ESRCH),
+            "kill(-pgid, 0) with no such group is ESRCH"
+        );
+        assert_eq_kernel!(
+            signal::sys_kill(FAKE_PID, 65),
+            Err(Errno::EINVAL),
+            "kill(pid, 65) is EINVAL"
+        );
+        assert_eq_kernel!(
+            signal::sys_kill(FAKE_PID, u64::from(u32::MAX)),
+            Err(Errno::EINVAL),
+            "kill(pid, -1) decodes as a negative int and is EINVAL"
+        );
+        assert_eq_kernel!(
+            signal::sys_kill(INT_MIN as u64, 0),
+            Err(Errno::ESRCH),
+            "kill(INT_MIN, 0) is the documented ESRCH quirk"
+        );
+
+        // ── Target resolution: exactly ONE thread per addressed group ───────
+        let members = compat::group_pids(FAKE_GROUP);
+        assert_eq_kernel!(
+            members,
+            alloc::vec![FAKE_LEADER, FAKE_MEMBER],
+            "group snapshot lists both members ascending"
+        );
+        assert_eq_kernel!(
+            signal::resolve_kill_targets(KillTarget::Group(FAKE_GROUP)),
+            alloc::vec![FAKE_LEADER],
+            "a group signal is queued once, on the leader"
+        );
+        assert_eq_kernel!(
+            signal::resolve_kill_targets(KillTarget::Pid(FAKE_MEMBER)),
+            alloc::vec![FAKE_MEMBER],
+            "a positive pid is addressed exactly"
+        );
+        assert_kernel!(
+            signal::resolve_kill_targets(KillTarget::Group(ABSENT)).is_empty(),
+            "an absent group resolves to no target"
+        );
+
+        // ── Dispatcher level: nr 62 is gated in AND routed ──────────────────
+        // The gate (`abi::SUPPORTED_SYSCALLS`), the arm
+        // (`dispatch_supported`'s `sysno::KILL`) and the handler are exercised
+        // together here; the only syscall number whose routing this routine
+        // proves is 62, plus ENOSYS for a number outside the set.
+        let call = |nr_raw: u64, a0: u64, a1: u64| -> u64 {
+            let mut regs = SavedRegs::default();
+            regs.rax = nr_raw;
+            regs.rdi = a0;
+            regs.rsi = a1;
+            // The entry stub is what stores the dispatcher's return value into the
+            // saved `rax` slot; a direct Rust call receives it as the return value.
+            crate::arch::x86_64::linux::linux_dispatch(&mut regs, 0)
+        };
+        assert_eq_kernel!(
+            call(nr::KILL, FAKE_PID, 0),
+            0,
+            "dispatcher routes nr 62: kill(live pid, 0) -> 0"
+        );
+        assert_eq_kernel!(
+            call(nr::KILL, ABSENT, 0),
+            encode_errno(Errno::ESRCH),
+            "dispatcher routes nr 62: kill(absent pid, 0) -> -ESRCH"
+        );
+        assert_eq_kernel!(
+            call(nr::KILL, FAKE_PID, 65),
+            encode_errno(Errno::EINVAL),
+            "dispatcher routes nr 62: kill(pid, 65) -> -EINVAL"
+        );
+        assert_eq_kernel!(
+            call(1000, 0, 0),
+            encode_errno(Errno::ENOSYS),
+            "a number outside SUPPORTED_SYSCALLS still returns -ENOSYS"
+        );
+
+        // ── Cleanup: leave the registry exactly as found ────────────────────
+        compat::remove_compat(FAKE_PID);
+        compat::remove_compat(FAKE_LEADER);
+        compat::remove_compat(FAKE_MEMBER);
+        assert_kernel!(
+            !compat::compat_exists(FAKE_PID)
+                && !compat::compat_exists(FAKE_LEADER)
+                && !compat::compat_exists(FAKE_MEMBER),
+            "synthetic compat states were removed"
+        );
+    }
+}
+
+// ─── SIGSTOP/SIGCONT scheduler state, in-guest (issue #12, task t8) ──────────
+//
+// Proves on the real machine what the host properties (`signal_stop`,
+// `signal_frame`) cannot: a parked (stopped) task stops rotating while keeping
+// its frame, SIGCONT puts it back, a stop signal for an already-stopped group is
+// consumed, killing a parked task reaps it with the right exit code, the DELIVERY
+// path itself parks a task that receives SIGSTOP, and `wait4` reports the stop /
+// continue state changes exactly once.
+//
+// NON-DESTRUCTIVE: every task it creates is killed or exits before returning; the
+// synthetic `CompatState`s live on empty VM region sets, are installed for pids
+// whose only user is this routine, and are all removed. The one "dangerous" step —
+// parking the task that is RUNNING this routine — is made safe by a helper kernel
+// thread spawned in advance that resumes the target unconditionally after a few
+// ticks, so a scheduler bug surfaces as a failed assertion instead of a hang.
+mod linux_stop_tests {
+    use crate::arch::x86_64::linux::process_sys::{sys_wait4, WCONTINUED, WNOHANG, WUNTRACED};
+    use crate::arch::x86_64::linux::regs::SavedRegs;
+    use crate::arch::x86_64::linux::signal;
+    use crate::arch::x86_64::linux::signal_frame::{sigbit, SIGCONT, SIGKILL, SIGSTOP, SIGTSTP};
+    use crate::memory::{pmm, vmm};
+    use crate::task::compat::{self, CompatState};
+    use crate::task::fd::FdTable;
+    use crate::task::scheduler;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use x86_64::structures::paging::PageTableFlags;
+
+    /// User-accessible scratch page for the `wait4` status word: the syscall
+    /// validates its pointer with `check_user_ptr`, and a kernel-stack address is
+    /// not `USER_ACCESSIBLE`.
+    const STATUS_VA: u64 = 0x0000_4000_0000_0000;
+
+    /// Incremented by the CPU-bound test task; frozen while it is parked.
+    static SPIN_COUNT: AtomicU64 = AtomicU64::new(0);
+    /// Set by the resumer when it observes the target parked.
+    static RESUMER_SAW_PARKED: AtomicBool = AtomicBool::new(false);
+    /// The pid the resumer must `SIGCONT` (set before it is spawned).
+    static RESUMER_TARGET: AtomicU64 = AtomicU64::new(0);
+
+    /// CPU-bound kernel thread: the "no syscalls at all" case that only a
+    /// scheduler-level park can stop.
+    fn spin_entry() {
+        loop {
+            SPIN_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Bounded helper: wait a few ticks, note whether the target is parked, then
+    /// resume it unconditionally.
+    fn resumer_entry() {
+        scheduler::sleep_ticks(5);
+        let target = RESUMER_TARGET.load(Ordering::Relaxed);
+        if scheduler::is_stopped(target) {
+            RESUMER_SAW_PARKED.store(true, Ordering::Relaxed);
+        }
+        let _ = signal::send_signal(target, SIGCONT);
+    }
+
+    /// A synthetic compat state for `pid` so the REAL signal paths (`send_signal`,
+    /// `wait4`) can address it. Empty VM region set: the signal paths never touch
+    /// it.
+    fn install_fake(pid: u64, ppid: u64, waitable: bool) {
+        let mut st = CompatState::new(
+            FdTable::with_standard_streams(),
+            Arc::new(crate::sync::spinlock::Spinlock::new(
+                crate::arch::x86_64::linux::mem::VmRegionSet::new(0, 0),
+            )),
+            pid,
+        );
+        st.tgid = pid;
+        st.ppid = ppid;
+        st.waitable = waitable;
+        compat::install_compat(pid, st);
+    }
+
+    /// Map (if not already there) the user-accessible status page. Returns the
+    /// frame to free on unmap, or `None` when the page was already mapped.
+    fn map_status_page() -> Option<u64> {
+        if vmm::virt_to_phys(STATUS_VA).is_some() {
+            return None;
+        }
+        let frame = pmm::alloc_frame()?;
+        // SAFETY: the frame was just allocated and is reachable through the HHDM.
+        unsafe {
+            core::ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, 4096);
+        }
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+        vmm::map(frame, STATUS_VA, flags).ok()?;
+        Some(frame)
+    }
+
+    fn unmap_status_page(frame: Option<u64>) {
+        if let Some(frame) = frame {
+            let _ = vmm::unmap(STATUS_VA);
+            pmm::free_frame(frame);
+        }
+    }
+
+    /// Run `wait4(pid, &status, options, 0)` against the scratch page and return
+    /// the reported status (`Some(0)` for a successful WNOHANG with nothing to
+    /// report), or `None` when the call failed.
+    fn wait_status(pid: u64, options: u64) -> Option<u32> {
+        let frame = map_status_page();
+        let r = sys_wait4(pid, STATUS_VA, options, 0);
+        // SAFETY: the page is mapped, writable, user-accessible and zeroed; the
+        // syscall wrote at most 4 bytes into it.
+        let out = unsafe { core::ptr::read_unaligned(STATUS_VA as *const u32) };
+        unmap_status_page(frame);
+        match r {
+            Ok(child) if child == pid => Some(out),
+            Ok(0) => Some(0),
+            _ => None,
+        }
+    }
+
+    /// Park `pid` exactly the way the delivery path does, from an OUTSIDE context:
+    /// the request covers a task that a tick may have made current in the
+    /// meantime, `stop_ready_pids` covers the (usual) case of an already-queued
+    /// frame.
+    fn park(pid: u64) {
+        scheduler::mark_stop_requested(pid);
+        let _ = scheduler::stop_ready_pids(&[pid]);
+        assert_kernel!(scheduler::is_stopped(pid), "stop-test: task is parked");
+    }
+
+    pub fn stop_continue_and_kill() {
+        let me = scheduler::current_pid();
+
+        // ── A. Scheduler-level stop/continue on a CPU-bound task ────────────
+        SPIN_COUNT.store(0, Ordering::Relaxed);
+        let pid = scheduler::kernel_thread_spawn(spin_entry);
+        install_fake(pid, me, true);
+
+        scheduler::sleep_ticks(20);
+        let running = SPIN_COUNT.load(Ordering::Relaxed);
+        assert_kernel!(running > 0, "stop-test: the CPU-bound task rotated");
+        assert_kernel!(
+            !scheduler::is_stopped(pid),
+            "stop-test: it is not stopped yet"
+        );
+
+        park(pid);
+        let frozen = SPIN_COUNT.load(Ordering::Relaxed);
+        scheduler::sleep_ticks(30);
+        assert_kernel!(
+            SPIN_COUNT.load(Ordering::Relaxed) == frozen,
+            "stop-test: a parked task does not rotate"
+        );
+        assert_kernel!(
+            scheduler::current_pid() != pid,
+            "stop-test: a parked task is never made current"
+        );
+
+        // A stop signal generated for an already-stopped group is consumed, not
+        // queued (otherwise the resume would immediately re-stop it).
+        assert_eq_kernel!(
+            signal::send_signal(pid, SIGSTOP),
+            Ok(()),
+            "stop-test: SIGSTOP to a stopped group is accepted"
+        );
+        assert_eq_kernel!(
+            compat::pending_of(pid) & sigbit(SIGSTOP),
+            0,
+            "stop-test: SIGSTOP to a stopped group leaves no pending bit"
+        );
+
+        // SIGCONT resumes at generation time (unconditional).
+        assert_eq_kernel!(
+            signal::send_signal(pid, SIGCONT),
+            Ok(()),
+            "stop-test: SIGCONT is accepted"
+        );
+        assert_kernel!(
+            !scheduler::is_stopped(pid),
+            "stop-test: SIGCONT unparked the task"
+        );
+        scheduler::sleep_ticks(30);
+        assert_kernel!(
+            SPIN_COUNT.load(Ordering::Relaxed) > frozen,
+            "stop-test: the resumed task rotates again"
+        );
+
+        // SIGCONT also discards pending stop-class signals of the group.
+        assert_eq_kernel!(
+            signal::send_signal(pid, SIGTSTP),
+            Ok(()),
+            "stop-test: SIGTSTP is queued for a running task"
+        );
+        assert_kernel!(
+            compat::pending_of(pid) & sigbit(SIGTSTP) != 0,
+            "stop-test: SIGTSTP is pending"
+        );
+        assert_eq_kernel!(
+            signal::send_signal(pid, SIGCONT),
+            Ok(()),
+            "stop-test: SIGCONT is accepted for a running task"
+        );
+        assert_eq_kernel!(
+            compat::pending_of(pid) & sigbit(SIGTSTP),
+            0,
+            "stop-test: SIGCONT discarded the pending stop signal"
+        );
+
+        // Killing a PARKED task: out of STOPPED_TASKS, reaped with its own cr3,
+        // exit status 128 + SIGKILL reaching wait4.
+        park(pid);
+        assert_eq_kernel!(
+            signal::send_signal(pid, SIGKILL),
+            Ok(()),
+            "stop-test: SIGKILL is accepted"
+        );
+        assert_kernel!(
+            !scheduler::is_stopped(pid),
+            "stop-test: the killed parked task left STOPPED_TASKS"
+        );
+        assert_kernel!(
+            !compat::compat_exists(pid),
+            "stop-test: the killed task's compat state was torn down"
+        );
+        assert_eq_kernel!(
+            wait_status(pid, 0),
+            Some(137u32 << 8),
+            "stop-test: wait4 reports 128+SIGKILL for the killed stopped task"
+        );
+
+        // ── B. The DELIVERY path itself: a delivered SIGSTOP parks THIS task ──
+        // The synthetic state must not be waitable, so this stop does not leave a
+        // stop event in the registry behind.
+        install_fake(me, 1, false);
+        RESUMER_TARGET.store(me, Ordering::Relaxed);
+        RESUMER_SAW_PARKED.store(false, Ordering::Relaxed);
+        let _resumer = scheduler::kernel_thread_spawn(resumer_entry);
+        assert_eq_kernel!(
+            signal::send_signal(me, SIGSTOP),
+            Ok(()),
+            "stop-test: SIGSTOP queued for the running selftest task"
+        );
+        let mut regs = SavedRegs::default();
+        regs.r11 = 0x202; // a well-formed syscall-entry frame (RFLAGS bit 1)
+                          // Parks us here (inside `signal::stop_current_group`) until the
+                          // resumer's SIGCONT; returns only after the resume.
+        signal::deliver_one_pending_syscall(&mut regs, 0);
+        assert_kernel!(
+            RESUMER_SAW_PARKED.load(Ordering::Relaxed),
+            "stop-test: the resumer observed this task parked by the delivery path"
+        );
+        assert_kernel!(
+            !scheduler::is_stopped(me),
+            "stop-test: the resumer's SIGCONT brought this task back"
+        );
+        assert_eq_kernel!(
+            compat::pending_of(me) & sigbit(SIGSTOP),
+            0,
+            "stop-test: the delivered SIGSTOP was consumed exactly once"
+        );
+        compat::remove_compat(me);
+
+        // ── C. wait4 stop/continue reports ───────────────────────────────────
+        const FAKE_CHILD: u64 = 0x7F00_0011;
+        install_fake(FAKE_CHILD, me, true);
+        compat::note_child_stopped(FAKE_CHILD, SIGSTOP);
+        assert_eq_kernel!(
+            wait_status(FAKE_CHILD, WUNTRACED),
+            Some((SIGSTOP as u32) << 8 | 0x7f),
+            "stop-test: WUNTRACED reports (stopsig << 8) | 0x7f"
+        );
+        assert_eq_kernel!(
+            wait_status(FAKE_CHILD, WUNTRACED | WNOHANG),
+            Some(0),
+            "stop-test: the stop report is consumed exactly once"
+        );
+        compat::note_child_continued(FAKE_CHILD);
+        assert_eq_kernel!(
+            wait_status(FAKE_CHILD, WCONTINUED),
+            Some(0xffff),
+            "stop-test: WCONTINUED reports 0xffff"
+        );
+        assert_eq_kernel!(
+            wait_status(FAKE_CHILD, WCONTINUED | WNOHANG),
+            Some(0),
+            "stop-test: the continue report is consumed exactly once"
+        );
+        assert_eq_kernel!(
+            wait_status(FAKE_CHILD, WNOHANG),
+            Some(0),
+            "stop-test: without WUNTRACED/WCONTINUED nothing is reported"
+        );
+        compat::remove_compat(FAKE_CHILD);
+    }
+}
 pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
     alloc::vec![
         // procfs (issue #11): the synthetic tree's shape, the rendered texts and
@@ -3574,6 +4048,22 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "shell::path/listing format behaviors (unit)",
             shell_prop_tests::unit_path_and_listing_format
+        ),
+        // Issue #12 (t7): kill(2) nr 62 — dispatcher routing, registry-backed
+        // target resolution and the errno matrix. Non-destructive (see the
+        // module docs); real delivery + tick delivery are t8/t9.
+        (
+            "linux::kill(2) dispatch + errno (issue #12)",
+            linux_signal_tests::kill_dispatch_and_errno
+        ),
+        // Issue #12 (t8): SIGSTOP/SIGCONT as scheduler state — a parked task keeps
+        // its frame and leaves rotation, SIGCONT resumes it at generation time, a stop
+        // signal for a stopped group is consumed, killing a parked task reaps it with
+        // 128+SIGKILL, the delivery path parks the receiver, and wait4 reports
+        // stop/continue exactly once. Non-destructive (see the module docs).
+        (
+            "linux::SIGSTOP/SIGCONT park+resume+kill (issue #12)",
+            linux_stop_tests::stop_continue_and_kill
         ),
     ]
 }
