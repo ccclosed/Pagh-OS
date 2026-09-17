@@ -1373,6 +1373,9 @@ fn check_links() {
     const OUT_OFF: usize = 256; // targets / file payloads
     const STAT_OFF: usize = 512; // struct stat (144 bytes)
     const DIR_OFF: usize = 1024; // getdents64 output
+    /// Bytes of scratch page left for the dirent buffer: the handler validates
+    /// the whole range, so a count reaching past the mapped page fails.
+    const DIR_LEN: u64 = (4096 - DIR_OFF) as u64;
     const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
     const S_IFMT: u32 = 0o170000;
     const S_IFREG: u32 = 0o100000;
@@ -1607,7 +1610,7 @@ fn check_links() {
             scratch_write_at(PATH_OFF, b"/mnt\0");
             let dfd = io_sys::sys_open(SCRATCH_VA + PATH_OFF as u64, 0, 0)
                 .map_err(|_| "open(/mnt) failed")?;
-            let dn = io_sys::sys_getdents64(dfd, SCRATCH_VA + DIR_OFF as u64, 4096)
+            let dn = io_sys::sys_getdents64(dfd, SCRATCH_VA + DIR_OFF as u64, DIR_LEN)
                 .map_err(|_| "getdents64(/mnt) failed")?;
             let _ = io_sys::sys_close(dfd);
             let dir = scratch_read_at(DIR_OFF, dn as usize);
