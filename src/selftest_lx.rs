@@ -1437,6 +1437,10 @@ fn check_links() {
     let result: Result<(), &'static str> =
         with_synth_compat(0x40_0000, scheduler::current_pid(), || {
             // ── readlink: relative target, verbatim ──────────────────────
+            // The expected lengths come from the literals themselves: a magic
+            // number here silently drifts from the string it describes.
+            let rel_target: &[u8] = b"lx_target";
+            let abs_target: &[u8] = b"/mnt/lx_target";
             scratch_write_at(PATH_OFF, b"/mnt/lx_rel\0");
             let n = io_sys::sys_readlink(
                 SCRATCH_VA + PATH_OFF as u64,
@@ -1444,7 +1448,8 @@ fn check_links() {
                 64,
             )
             .map_err(|_| "readlink(rel) failed")?;
-            if n != 10 || scratch_read_at(OUT_OFF, n as usize) != b"lx_target" {
+            if n as usize != rel_target.len() || scratch_read_at(OUT_OFF, n as usize) != rel_target
+            {
                 return Err("readlink(rel) returned the wrong target");
             }
             // ── readlink: absolute target ────────────────────────────────
@@ -1455,7 +1460,8 @@ fn check_links() {
                 64,
             )
             .map_err(|_| "readlink(abs) failed")?;
-            if n != 13 || scratch_read_at(OUT_OFF, n as usize) != b"/mnt/lx_target" {
+            if n as usize != abs_target.len() || scratch_read_at(OUT_OFF, n as usize) != abs_target
+            {
                 return Err("readlink(abs) returned the wrong target");
             }
             // ── readlink: slow layout, then truncation to bufsiz ─────────
@@ -1520,7 +1526,7 @@ fn check_links() {
             let link_ino = u64_at(STAT_OFF + 8);
             // st_size is the *target length*, not the target's size.
             let size = u64_at(STAT_OFF + 48);
-            if size != 13 {
+            if size != abs_target.len() as u64 {
                 return Err("lstat(link).st_size must be the target length");
             }
             io_sys::sys_newfstatat(
