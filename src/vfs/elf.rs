@@ -2,6 +2,7 @@
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
 use crate::memory::vmm;
+use alloc::vec::Vec;
 use core::ptr;
 use x86_64::structures::paging::PageTableFlags;
 
@@ -90,6 +91,65 @@ pub struct ElfProcess {
 }
 
 pub struct ElfLoader;
+
+/// Frames one loader pass has mapped, in mapping order, for rollback on failure.
+///
+/// The loader maps an image page by page with `vmm::map`; until this guard existed
+/// every early return **kept** the frames mapped so far — a forged `p_memsz` that
+/// passed the canonical-address checks drained the entire PMM (443 MiB in one
+/// failed load) and the guest could no longer start a process. The guard makes the
+/// rollback unconditional: it runs on *any* return, including ones added later.
+///
+/// Order matters: unmap the virtual page first, then return the frame to the PMM,
+/// so no live PTE ever points at memory the allocator can hand out again. The user
+/// PML4 and the intermediate page tables `vmm::map` creates are **not** freed —
+/// the VMM exposes no teardown API (the process-exit path has the same property) —
+/// so this guard owns the *data* frames; that limit is deliberate, not forgotten.
+pub(crate) struct MappedFrames {
+    entries: Vec<(u64, u64)>,
+}
+
+impl MappedFrames {
+    pub(crate) fn new() -> Self {
+        MappedFrames {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Map `frame` at `addr`. On failure the frame is returned immediately (it was
+    /// never mapped) and everything mapped before it is released by [`Drop`].
+    ///
+    /// `pub(crate)` together with the type itself: the in-QEMU regression test
+    /// (`elf::failed map rolls back …`) drives the guard with real frames, which
+    /// is the only way to exercise the late-failure path deterministically.
+    pub(crate) fn map(
+        &mut self,
+        frame: u64,
+        addr: u64,
+        flags: PageTableFlags,
+    ) -> Result<(), &'static str> {
+        if vmm::map(frame, addr, flags).is_err() {
+            crate::memory::pmm::free_frame(frame);
+            return Err("ELF: VMM map failed");
+        }
+        self.entries.push((frame, addr));
+        Ok(())
+    }
+
+    /// The mapping succeeded: the frames now belong to the loaded image.
+    fn commit(&mut self) {
+        self.entries.clear();
+    }
+}
+
+impl Drop for MappedFrames {
+    fn drop(&mut self) {
+        while let Some((frame, addr)) = self.entries.pop() {
+            let _ = vmm::unmap(addr);
+            crate::memory::pmm::free_frame(frame);
+        }
+    }
+}
 
 impl ElfLoader {
     pub fn load(data: &[u8]) -> Result<ElfProcess, &'static str> {
@@ -416,7 +476,20 @@ impl ElfLoader {
         header: &Elf64Header,
         bias: u64,
     ) -> Result<u64, &'static str> {
+        // Unlike the legacy path this one does not go through
+        // `validate_program_headers` (a biased vaddr range is only checkable with
+        // the bias in hand), so the eager-mapping bound is applied here — before
+        // the first allocation.
+        if data.len() as u64 > Self::MAX_IMAGE_BYTES {
+            return Err("ELF: image file too large for the loader");
+        }
+        let mut total_memsz: u64 = 0;
+
         let mut brk: u64 = 0;
+        // Frames mapped by this pass; committed only on full success (see
+        // `MappedFrames`). One guard for the whole image: a failure in a later
+        // segment must also release the earlier ones.
+        let mut mapped = MappedFrames::new();
         let phoff = header.e_phoff as usize;
         let phentsize = header.e_phentsize as usize;
         let phnum = header.e_phnum as usize;
@@ -466,6 +539,12 @@ impl ElfLoader {
             if vaddr_start >= USER_ADDR_MAX || vaddr_end > USER_ADDR_MAX {
                 return Err("ELF: segment outside user address space");
             }
+            total_memsz = total_memsz
+                .checked_add(ph.p_memsz)
+                .ok_or("ELF: segment sizes overflow")?;
+            if total_memsz > Self::MAX_IMAGE_BYTES {
+                return Err("ELF: image too large for the loader");
+            }
             let page_start = (vaddr_start / 4096) * 4096;
             let page_end = vaddr_end
                 .checked_add(4095)
@@ -490,7 +569,10 @@ impl ElfLoader {
                 unsafe {
                     ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, 4096);
                 }
-                vmm::map(frame, addr, flags).map_err(|_| "ELF: VMM map failed")?;
+                // Every frame is registered as soon as it is mapped: any later
+                // failure (OOM, a bad translation, a copy error) releases the
+                // whole lot instead of keeping the pages alive.
+                mapped.map(frame, addr, flags)?;
                 addr += 4096;
             }
 
@@ -543,6 +625,7 @@ impl ElfLoader {
         }
 
         brk = (brk + 4095) & !4095;
+        mapped.commit();
         Ok(brk)
     }
 
@@ -557,7 +640,29 @@ impl ElfLoader {
     ///
     /// A zero-`e_phnum` image is accepted (there is simply nothing to map); the
     /// caller still gets a valid entry and handles any run failure itself.
+    /// Largest total `PT_LOAD` `p_memsz` a single image may request (64 MiB).
+    ///
+    /// Every segment page is mapped **eagerly**, so this is a hard bound on how
+    /// much of the PMM one image can consume before anything else rejects it.
+    /// Measured against the userland this kernel runs — a static test ELF,
+    /// `hello-pagh`, glibc's `ld.so`/`libc`, `python3`, `nvim` — the largest
+    /// `PT_LOAD` total is a few MiB, and the largest ELF on the development host
+    /// (`lto-dump`) is 40 MiB. 64 MiB keeps headroom over that while staying 1/16
+    /// of the 1 GiB guest the E2E harness boots: a forged header can no longer
+    /// drain the pool (the previous behaviour: one failed load leaked the whole
+    /// PMM through a bogus `p_memsz`).
+    pub const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+
     fn validate_program_headers(data: &[u8], header: &Elf64Header) -> Result<(), &'static str> {
+        // The file alone cannot be bigger than the image it describes: refuse
+        // before walking anything.
+        if data.len() as u64 > Self::MAX_IMAGE_BYTES {
+            return Err("ELF: image file too large for the loader");
+        }
+        // Sum of the loaded sizes, bounded by `MAX_IMAGE_BYTES` below. This is the
+        // check that keeps a forged `p_memsz` from reaching the mapping loop.
+        let mut total_memsz: u64 = 0;
+
         let phnum = header.e_phnum as usize;
         if phnum == 0 {
             // No program headers: nothing to load. Accept gracefully.
@@ -623,6 +728,15 @@ impl ElfLoader {
                 return Err("ELF: segment outside user address space");
             }
 
+            // Eager mapping: bound the total, so a legal-looking but huge
+            // `p_memsz` is refused here instead of inside the mapping loop.
+            total_memsz = total_memsz
+                .checked_add(ph.p_memsz)
+                .ok_or("ELF: segment sizes overflow")?;
+            if total_memsz > Self::MAX_IMAGE_BYTES {
+                return Err("ELF: image too large for the loader");
+            }
+
             // Page-rounded end must also not overflow (used by the map loop).
             vaddr_end
                 .checked_add(4095)
@@ -643,6 +757,10 @@ impl ElfLoader {
     /// panic or index out of bounds even if called independently.
     fn map_segments(data: &[u8], header: &Elf64Header) -> Result<u64, &'static str> {
         let mut brk: u64 = 0;
+        // Frames mapped by this pass; committed only on full success (see
+        // `MappedFrames`). One guard for the whole image: a failure in a later
+        // segment must also release the earlier ones.
+        let mut mapped = MappedFrames::new();
         let phoff = header.e_phoff as usize;
         let phentsize = header.e_phentsize as usize;
         let phnum = header.e_phnum as usize;
@@ -713,7 +831,10 @@ impl ElfLoader {
                 unsafe {
                     ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, 4096);
                 }
-                vmm::map(frame, addr, flags).map_err(|_| "ELF: VMM map failed")?;
+                // Every frame is registered as soon as it is mapped: any later
+                // failure (OOM, a bad translation, a copy error) releases the
+                // whole lot instead of keeping the pages alive.
+                mapped.map(frame, addr, flags)?;
                 addr += 4096;
             }
 
@@ -766,6 +887,7 @@ impl ElfLoader {
         }
 
         brk = (brk + 4095) & !4095;
+        mapped.commit();
         Ok(brk)
     }
 }
