@@ -2717,6 +2717,196 @@ mod fs_prop_tests {
             );
         }
     }
+
+    /// Property 22 (issue #35): recovery decides liveness from the persisted
+    /// sequence number, not from `head == tail`.
+    ///
+    /// The randomized P10–P12 exercise the crash window statistically; this pins
+    /// the two deterministic directions that the removed `head == tail` guard got
+    /// wrong, one per direction:
+    ///
+    /// 1. a transaction committed *after* the last journal-superblock update —
+    ///    exactly the window `commit` leaves between the commit record and the
+    ///    head advance — must be replayed even though the on-disk head/tail still
+    ///    describe the previous (empty-looking) state;
+    /// 2. records the superblock has already acknowledged are **checkpointed**
+    ///    and must never be replayed, or an older image lands on top of newer
+    ///    data — which is the case the old guard existed to prevent.
+    ///
+    /// **Validates: Requirements 10.6, 11.1, 11.3**
+    pub fn p22_recovery_keys_liveness_off_the_persisted_seq() {
+        let fs_blocks = 16u64;
+        // Large enough that the third transaction below cannot wrap onto the
+        // first one's slots.
+        let log_blocks = 16u64;
+
+        // ── direction 1: head advance lost, log holds the committed txn ──────
+        let (dev, area) = make_journal(fs_blocks, log_blocks);
+        let mut j = Journal::open(dev.clone(), area).expect("open");
+        let mut txn = j.begin();
+        j.log_block(&mut txn, 5, &filled(0x11));
+        // Descriptor + data + commit record land; the checkpoint and the head
+        // advance are lost with the power.
+        dev.set_crash_after(3);
+        let _ = j.commit(txn);
+        dev.clear_crash();
+
+        let mut j2 = Journal::open(dev.clone(), area).expect("reopen");
+        let replayed = j2.recover().expect("recover");
+        assert_eq_kernel!(
+            replayed,
+            1,
+            "P22: a committed txn is replayed even though the on-disk head == tail"
+        );
+        assert_kernel!(
+            dev.peek_block(5) == filled(0x11),
+            "P22: the lost transaction's post-state is reached"
+        );
+
+        // ── direction 2: acknowledged records are never replayed ─────────────
+        // A (block 5 <- 0xA1) and B (block 5 <- 0xB2) both commit; the superblock
+        // acknowledges B, so the log still holds A's record while next_seq has
+        // moved past it. A third transaction then crashes before its superblock
+        // update, leaving recovery with two stale records in front of it.
+        let (dev, area) = make_journal(fs_blocks, log_blocks);
+        let mut j = Journal::open(dev.clone(), area).expect("open");
+        let mut txn = j.begin();
+        j.log_block(&mut txn, 5, &filled(0xA1));
+        j.commit(txn).expect("commit A");
+        assert_kernel!(dev.peek_block(5) == filled(0xA1), "P22: A checkpointed");
+
+        let mut txn = j.begin();
+        j.log_block(&mut txn, 5, &filled(0xB2));
+        j.commit(txn).expect("commit B");
+        assert_kernel!(dev.peek_block(5) == filled(0xB2), "P22: B checkpointed");
+
+        let mut txn = j.begin();
+        j.log_block(&mut txn, 6, &filled(0xC3));
+        dev.set_crash_after(3);
+        let _ = j.commit(txn);
+        dev.clear_crash();
+
+        let mut j3 = Journal::open(dev.clone(), area).expect("reopen2");
+        let replayed = j3.recover().expect("recover2");
+        assert_eq_kernel!(
+            replayed,
+            1,
+            "P22: only the un-acknowledged transaction is replayed"
+        );
+        assert_kernel!(
+            dev.peek_block(5) == filled(0xB2),
+            "P22: the stale record for block 5 was skipped, not replayed over B"
+        );
+        assert_kernel!(
+            dev.peek_block(6) == filled(0xC3),
+            "P22: the crashed transaction's block was replayed"
+        );
+
+        // A second recovery has nothing left to do — the stale records are still
+        // in the ring, and must still be ignored.
+        let mut j4 = Journal::open(dev.clone(), area).expect("reopen3");
+        let replay_again = j4.recover().expect("recover3");
+        assert_eq_kernel!(
+            replay_again,
+            0,
+            "P22: a log whose records are all acknowledged replays nothing"
+        );
+        assert_kernel!(
+            dev.peek_block(5) == filled(0xB2),
+            "P22: re-recovery leaves the acknowledged state alone"
+        );
+    }
+
+    /// Property 23 (review of #35/#38): stale ring content can never be mistaken
+    /// for a live record — not after a reclaimed wrap, not after a reformat.
+    ///
+    /// Two directions, one per hole found while reviewing the seq-based liveness
+    /// rule:
+    ///
+    /// 1. **Reclaim + crash.** When the ring lacks room, `commit` drops the
+    ///    oldest live records (`tail = head` in memory) and then writes a record
+    ///    that wraps onto exactly the slot the old on-disk `tail` named. If that
+    ///    reclaimed tail were only persisted at the end of `commit`, a crash
+    ///    after the commit record would leave an on-disk `tail` pointing at a
+    ///    data block — recovery would stop there and drop the committed
+    ///    transaction. The reclaimed tail is made durable *before* the record is
+    ///    written, so both targets are replayed.
+    /// 2. **Format over a live ring.** `Journal::format` resets `next_seq` to 1
+    ///    and (by itself) leaves the ring intact; the previous incarnation's
+    ///    first record then carries `seq == 1`, satisfies the new chain check,
+    ///    and its stale images would be replayed into the fresh filesystem.
+    ///    `format` invalidates the head of the ring, so recovery replays nothing.
+    ///
+    /// **Validates: Requirements 10.6, 11.1, 11.3**
+    pub fn p23_stale_ring_cannot_resurrect_records() {
+        let fs_blocks = 16u64;
+        let log_blocks = 16u64;
+
+        // ── direction 1: reclaim, then a crash inside the wrapped commit ─────
+        let (dev, area) = make_journal(fs_blocks, log_blocks);
+        let mut j = Journal::open(dev.clone(), area).expect("open");
+        // Five single-target transactions fill the ring to head == 15, tail == 0,
+        // leaving free == 1: the next one has to reclaim.
+        for (i, target) in [2u64, 3, 4, 5, 6].iter().enumerate() {
+            let mut txn = j.begin();
+            j.log_block(&mut txn, *target, &filled(0x100 + i as u32));
+            j.commit(txn).expect("filling commit");
+        }
+        // Two targets: the durable reclaimed tail (1 write), descriptor + 2 data
+        // + commit record (4 more) land; both checkpoints and the final head
+        // advance are lost with the power.
+        let mut txn = j.begin();
+        j.log_block(&mut txn, 7, &filled(0x77));
+        j.log_block(&mut txn, 8, &filled(0x88));
+        dev.set_crash_after(5);
+        let _ = j.commit(txn);
+        dev.clear_crash();
+
+        let mut j2 = Journal::open(dev.clone(), area).expect("reopen after the reclaim crash");
+        let replayed = j2.recover().expect("recover after the reclaim crash");
+        assert_eq_kernel!(
+            replayed,
+            1,
+            "P23: a wrapped, committed transaction is replayed across a reclaim"
+        );
+        assert_kernel!(
+            dev.peek_block(7) == filled(0x77),
+            "P23: the wrapped transaction's first checkpoint is replayed"
+        );
+        assert_kernel!(
+            dev.peek_block(8) == filled(0x88),
+            "P23: the wrapped transaction's second checkpoint is replayed"
+        );
+
+        // ── direction 2: a reformat must not replay the previous ring ────────
+        let (dev, area) = make_journal(fs_blocks, log_blocks);
+        let mut j = Journal::open(dev.clone(), area).expect("open again");
+        let mut txn = j.begin();
+        j.log_block(&mut txn, 5, &filled(0xAA));
+        j.commit(txn).expect("commit before the reformat");
+        assert_kernel!(
+            dev.peek_block(5) == filled(0xAA),
+            "P23: pre-reformat state is checkpointed"
+        );
+
+        // Reformat the device, then let the fresh filesystem put its own content
+        // into the block the old incarnation had written. The old ring is still
+        // physically present beyond the journal superblock.
+        Journal::format(&*dev, area).expect("reformat");
+        dev.poke_block(5, &filled(0x55));
+
+        let mut j3 = Journal::open(dev.clone(), area).expect("reopen after the reformat");
+        let replayed = j3.recover().expect("recover after the reformat");
+        assert_eq_kernel!(
+            replayed,
+            0,
+            "P23: a reformatted journal replays nothing from the previous ring"
+        );
+        assert_kernel!(
+            dev.peek_block(5) == filled(0x55),
+            "P23: no stale image was written over the fresh filesystem"
+        );
+    }
 }
 
 // Property 18 (real-device variant, Task 5.4*): filesystem operation round-trip
@@ -3084,6 +3274,14 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "fs::journal barriers survive a volatile write cache (Property 24)",
             fs_prop_tests::p24_volatile_cache_cannot_tear_or_lose_a_commit
+        ),
+        (
+            "fs::journal recovery keys liveness off the persisted seq (Property 22)",
+            fs_prop_tests::p22_recovery_keys_liveness_off_the_persisted_seq
+        ),
+        (
+            "fs::journal stale ring cannot resurrect records (Property 23)",
+            fs_prop_tests::p23_stale_ring_cannot_resurrect_records
         ),
         (
             "fs::ext2 operation round-trip on real device (Property 18)",
