@@ -1715,6 +1715,12 @@ pub mod mock_block {
         flushes: u32,
         /// Opt-in operation log (see [`MockBlockDevice::record_trace`]).
         trace: Option<Vec<Op>>,
+        /// Volatile write-cache model (see [`MockBlockDevice::enable_volatile_cache`]):
+        /// the last image a `flush` made stable, and the writes sitting in the
+        /// cache since then as `(start, end, bytes)`.
+        volatile: bool,
+        stable: Vec<u8>,
+        cache: Vec<(usize, usize, Vec<u8>)>,
     }
 
     /// One device operation, for the write-ordering assertions of the journal
@@ -1739,6 +1745,9 @@ pub mod mock_block {
                     write_count: 0,
                     flushes: 0,
                     trace: None,
+                    volatile: false,
+                    stable: Vec::new(),
+                    cache: Vec::new(),
                 }),
             })
         }
@@ -1809,6 +1818,46 @@ pub mod mock_block {
         pub fn flush_count(&self) -> u32 {
             self.inner.lock().flushes
         }
+
+        /// Model a device with a **volatile write cache** from here on: writes
+        /// land in the cache, and only [`BlockDevice::flush`] makes them stable.
+        ///
+        /// P21 asserts where the journal *places* its barriers; this is what
+        /// lets a test assert what the barriers are *for*. Enable it after
+        /// installing the pre-state, since everything written before this call
+        /// counts as already stable.
+        pub fn enable_volatile_cache(&self) {
+            let mut inner = self.inner.lock();
+            inner.volatile = true;
+            inner.stable = inner.data.clone();
+            inner.cache.clear();
+        }
+
+        /// How many writes are sitting in the volatile cache right now.
+        pub fn cached_writes(&self) -> usize {
+            self.inner.lock().cache.len()
+        }
+
+        /// Power loss: the device keeps the last image it made stable and, of
+        /// the writes still in its cache, an arbitrary **suffix** of `keep`
+        /// entries (a real cache lands what it happens to land). Everything
+        /// else is lost, the crash injection is cleared and the write counter
+        /// restarts, as after a reboot.
+        pub fn power_loss(&self, keep: usize) {
+            let mut inner = self.inner.lock();
+            if inner.volatile {
+                let stable = inner.stable.clone();
+                inner.data = stable;
+                let cached = inner.cache.clone();
+                let n = core::cmp::min(keep, cached.len());
+                for (start, end, bytes) in cached[cached.len() - n..].iter() {
+                    inner.data[*start..*end].copy_from_slice(bytes);
+                }
+                inner.cache.clear();
+            }
+            inner.crash_after = None;
+            inner.write_count = 0;
+        }
     }
 
     impl BlockDevice for MockBlockDevice {
@@ -1850,6 +1899,9 @@ pub mod mock_block {
             }
             if !drop_write {
                 inner.data[start..end].copy_from_slice(buf);
+                if inner.volatile {
+                    inner.cache.push((start, end, buf.to_vec()));
+                }
             }
             Ok(buf.len())
         }
@@ -1867,6 +1919,11 @@ pub mod mock_block {
             inner.flushes += 1;
             if let Some(t) = inner.trace.as_mut() {
                 t.push(Op::Flush);
+            }
+            // A flush is what makes the cache's contents stable.
+            if inner.volatile {
+                inner.stable = inner.data.clone();
+                inner.cache.clear();
             }
             Ok(())
         }
@@ -2564,15 +2621,101 @@ mod fs_prop_tests {
             Some(&Op::Write(super_block)),
             "P21: recovery persists the emptied log last"
         );
+        // `get(len - 2)`, not `trace[len - 2]`: a short trace (recovery replayed
+        // nothing) would underflow the index and, with `panic = "abort"`, kill
+        // the machine instead of failing this check.
         assert_eq_kernel!(
-            trace[trace.len() - 2],
-            Op::Flush,
+            trace.get(trace.len().wrapping_sub(2)),
+            Some(&Op::Flush),
             "P21: replayed images are flushed before the log is declared empty"
         );
         assert_kernel!(
             trace.contains(&Op::Write(9 * s)),
             "P21: the replayed block was rewritten to its final location"
         );
+    }
+
+    /// Property 24 (issue #15, review of the flush PR): the barriers are what a
+    /// **volatile write cache** makes necessary — and P21's flush counter cannot
+    /// see that, because a counter cannot lose a write.
+    ///
+    /// On power loss a real cache keeps the last image it made stable plus an
+    /// arbitrary *suffix* of the writes still in it. The test sweeps every crash
+    /// point inside `commit` against every surviving suffix (`power_loss(keep)`)
+    /// and asserts two things:
+    ///
+    /// 1. **Never torn.** After a crash anywhere inside `commit`, both targets
+    ///    of a two-block transaction are either both at their pre-state or both
+    ///    at their post-state. Drop the log-before-checkpoint barrier and a
+    ///    cache that lands only the last checkpoint leaves exactly the mix this
+    ///    forbids.
+    /// 2. **Acknowledged is durable.** Once `commit` has returned, any surviving
+    ///    suffix still leaves the transaction applied: the checkpoint reached
+    ///    the medium before the head advance, so recovery either replays it or
+    ///    finds it already checkpointed. Drop the checkpoint-before-head-advance
+    ///    barrier and a cache that lands only the superblock loses a transaction
+    ///    the caller was told was committed.
+    ///
+    /// **Validates: Requirements 10.1–10.6, 11.1–11.4**
+    pub fn p24_volatile_cache_cannot_tear_or_lose_a_commit() {
+        let fs_blocks = 16u64;
+        let log_blocks = 32u64;
+        let t1 = 5u64;
+        let t2 = 7u64;
+        let pre = filled(0x11_0000);
+        let post = filled(0x22_0000);
+
+        // ── 1. crash inside `commit` × surviving suffix ──────────────────────
+        // Eight writes is the whole of a two-target commit; sweeping past the
+        // end simply means "no crash", which must be equally consistent.
+        for crash_at in 1..=8u32 {
+            for keep in 0..=8usize {
+                let (dev, area) = make_journal(fs_blocks, log_blocks);
+                dev.poke_block(t1, &pre);
+                dev.poke_block(t2, &pre);
+                dev.enable_volatile_cache();
+
+                let mut j = Journal::open(dev.clone(), area).expect("open");
+                let mut txn = j.begin();
+                j.log_block(&mut txn, t1, &post);
+                j.log_block(&mut txn, t2, &post);
+                dev.set_crash_after(crash_at);
+                let _ = j.commit(txn);
+                dev.power_loss(keep);
+
+                let mut j2 = Journal::open(dev.clone(), area).expect("reopen");
+                let _ = j2.recover();
+
+                let all_pre = dev.peek_block(t1) == pre && dev.peek_block(t2) == pre;
+                let all_post = dev.peek_block(t1) == post && dev.peek_block(t2) == post;
+                assert_kernel!(
+                    all_pre || all_post,
+                    "P24: a crashed commit never leaves a half-applied transaction"
+                );
+            }
+        }
+
+        // ── 2. `commit` returned, then the power goes ────────────────────────
+        for keep in 0..=4usize {
+            let (dev, area) = make_journal(fs_blocks, log_blocks);
+            dev.poke_block(t1, &pre);
+            dev.poke_block(t2, &pre);
+            dev.enable_volatile_cache();
+
+            let mut j = Journal::open(dev.clone(), area).expect("open");
+            let mut txn = j.begin();
+            j.log_block(&mut txn, t1, &post);
+            j.log_block(&mut txn, t2, &post);
+            j.commit(txn).expect("commit");
+            dev.power_loss(keep);
+
+            let mut j2 = Journal::open(dev.clone(), area).expect("reopen");
+            let _ = j2.recover();
+            assert_kernel!(
+                dev.peek_block(t1) == post && dev.peek_block(t2) == post,
+                "P24: an acknowledged transaction survives any cache loss"
+            );
+        }
     }
 }
 
@@ -2937,6 +3080,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "fs::journal flush ordering at transaction boundaries (Property 21)",
             fs_prop_tests::p21_journal_flushes_at_transaction_boundaries
+        ),
+        (
+            "fs::journal barriers survive a volatile write cache (Property 24)",
+            fs_prop_tests::p24_volatile_cache_cannot_tear_or_lose_a_commit
         ),
         (
             "fs::ext2 operation round-trip on real device (Property 18)",
