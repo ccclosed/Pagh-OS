@@ -57,7 +57,8 @@ Debian keyring. Its output is part of the evidence for t24.
 | `b01-untrusted-signer` | local | well-formed `Release` signed by a key outside the pinned set | reject | `apt: verify FAIL stage=signature cause=NoTrustedSignature` |
 | `b02-no-signature-packets` | local | valid armor carrying a marker packet, no signature packet | reject | `… stage=signature cause=NoSignature` |
 | `b03-armor-crc-mismatch` | local | armor with a corrupted body and stale CRC24 | reject | `… stage=armor cause=CrcMismatch` |
-| `b04-clearsign-malformed` | local | `InRelease` without its `END PGP SIGNATURE` line | reject | `… stage=clearsign cause=Malformed` |
+| `b04-clearsign-malformed` | local | `InRelease` without its `BEGIN PGP SIGNATURE` line | reject | `… stage=clearsign cause=Malformed` |
+| `b04b-armor-malformed-end-missing` | local | `InRelease` without its `END PGP SIGNATURE` line | reject | `… stage=armor cause=MalformedArmor` |
 | `b05-expired-untrusted-signer` | local | signature made by an expired key (valid when signed) | reject | `… stage=signature cause=NoTrustedSignature` |
 
 `a01`/`a02` are mandatory: without a case that must be **accepted**, "refuse everything"
@@ -130,6 +131,25 @@ that flag and expect `stage=clock cause=ClockUnset`. The manifest records the sa
   `hashcat-nvidia` (`pool/contrib/h/hashcat-meta/hashcat-nvidia_20210201_all.deb`).
 * `a01`/`a02`/`a08` need a real `apt update`; `a04`/`a05` additionally need
   `apt install hashcat-nvidia` so the `.deb` is fetched at all.
+
+## Cross-check against the verifier (t23/t24)
+
+kostya-apt replayed every case tree through the kernel's own `pkg::openpgp` policy layer and
+recomputed the digests independently. 13/14 original expectations matched; the three
+divergences were fixed here and belong to the record:
+
+* `b04` removed the `END` line, which fails at the **armor** layer
+  (`stage=armor cause=MalformedArmor`), not at the clearsign layer. The set now carries both
+  layers as separate cases (`b04` removes the `BEGIN` line, `b04b` the `END` line) — they
+  prove two different stages, and the manifest matches what the kernel actually prints.
+* the signer map was hand-written with two entries, so the third signature
+  (`4CB50190…`, subkey of primary `B8B80B5B…`) was reported as "NOT PINNED". It is now
+  derived from the committed Debian keyring (subkey→primary included), and the manifest
+  states "2 of 3 signatures come from a SUBKEY of a pinned primary".
+* the `not_constructible` references used the pre-implementation plan numbers (P57); they
+  now name the implemented properties: P52 (signature policy), P53 (pinned keyring),
+  P54 (`release_file`, including the path-lookup miss behind `index/NoIndexEntry`),
+  P55 (index digests).
 
 ## Reference verification recorded in the manifest
 

@@ -44,9 +44,11 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -395,8 +397,25 @@ def cases() -> list[dict]:
             stage="clearsign",
             cause="Malformed",
             marker="apt: verify FAIL stage=clearsign cause=Malformed",
-            attacks="`InRelease` without its `-----END PGP SIGNATURE-----` line",
-            notes="Clearsign framing is validated before the signature is looked at.",
+            attacks="`InRelease` without its `-----BEGIN PGP SIGNATURE-----` line: the "
+                    "clearsign framing is incomplete while the rest of the document is intact",
+            notes="Two different layers are involved and both are worth a case: this one "
+                  "fails the clearsign framing check, `b04b` fails the armor dearmor "
+                  "(measured against the verifier, contract §16).",
+        ),
+        dict(
+            id="b04b-armor-malformed-end-missing",
+            family="local-keys",
+            expect="reject",
+            stage="armor",
+            cause="MalformedArmor",
+            marker="apt: verify FAIL stage=armor cause=MalformedArmor",
+            attacks="`InRelease` without its `-----END PGP SIGNATURE-----` line: the armor "
+                    "block is dearmored before any signature packet is read",
+            notes="Kept next to `b04` on purpose: the same document with a different line "
+                  "removed fails a different check, which is what makes the two layers "
+                  "visible (the earlier revision of this file expected clearsign/Malformed "
+                  "here — the verifier proved otherwise).",
         ),
         dict(
             id="b05-expired-untrusted-signer",
@@ -490,12 +509,13 @@ def build_case(case: dict, out_root: str, home: str, *, suite_mode: str = "stabl
             if line.startswith("="):  # corrupt the CRC line only
                 lines[i] = "=" + base64.b64encode(b"\x00\x00\x00").decode()
         write(t["release_gpg"], ("\n".join(lines) + "\n").encode())
-    elif cid == "b04-clearsign-malformed":
+    elif cid in ("b04-clearsign-malformed", "b04b-armor-malformed-end-missing"):
         t = real_tree(tree, suite_dir=suite_dir)
         set_suite_field(t["release"], suite_dir)
         sign_clearsign(home, release_fpr, t["release"], t["inrelease"], SIGN_TIME)
-        text = read(t["inrelease"]).decode()
-        kept = [l for l in text.splitlines() if not l.startswith("-----END PGP")]
+        drop = "-----BEGIN PGP SIGNATURE-----" if cid == "b04-clearsign-malformed" \
+            else "-----END PGP SIGNATURE-----"
+        kept = [l for l in read(t["inrelease"]).decode().splitlines() if l != drop]
         write(t["inrelease"], ("\n".join(kept) + "\n").encode())
     else:
         raise SystemExit(f"unknown case {cid}")
@@ -505,27 +525,32 @@ def build_case(case: dict, out_root: str, home: str, *, suite_mode: str = "stabl
 NOT_CONSTRUCTIBLE = [
     dict(cause="key/Expired", why="requires a PINNED key that is expired and a signature "
          "made while it was valid — we hold no Debian private key",
-         covered_by="host property P53 (pinned keyring: validity windows) + code review of "
-                    "`openpgp.rs` expiry handling"),
+         covered_by="P53 (pinned keyring: pins, real-GnuPG interop, expiry) + code review of "
+                    "the expiry branch"),
     dict(cause="key/Revoked", why="no pinned key carries a revocation today (contract §0, "
          "verified), and revocation inside the keyring is a host-side property",
-         covered_by="P53 + the contract's §4.4 pinned-keyring integrity property"),
+         covered_by="P53 (revocation is honoured only inside the committed keyring block)"),
     dict(cause="key/NotYetValid", why="same as Expired: needs a pinned key with a future "
          "creation time",
          covered_by="P53"),
     dict(cause="signature/FutureSignature", why="a signature time > now+86400 by a PINNED "
          "key cannot be produced locally",
-         covered_by="P52 signature policy property"),
+         covered_by="P52 (`signature_time_is_sanity_checked_against_the_clock_and_the_key`, "
+                    "both directions)"),
     dict(cause="release/FutureDate", why="the `Date` field lives inside the signed bytes of "
          "a real Release; we cannot re-sign it as Debian",
-         covered_by="P57 (Release parsing) + code review of the skew gate"),
+         covered_by="P54 (Release parsing) + code review of the skew gate in apt.rs"),
     dict(cause="release/ValidUntilExpired", why="`stable` carries no `Valid-Until` at all "
          "(contract §0, verified); a suite that has one would have to be signed by Debian",
-         covered_by="P57 + code review; the residual (no replay protection) is a08"),
+         covered_by="P54 (Valid-Until parsing) + code review; the residual is a08"),
+    dict(cause="ECDSA coverage by a real archive key", why="no live Debian archive key today is "
+         "ECDSA-signed, so the end-to-end path cannot exercise the curve",
+         covered_by="P52 (`ecdsa_curves_verify_the_digest_through_the_shared_backends`, "
+                    "host-generated P-256/P-384) — added in the OpenPGP branch"),
     dict(cause="index/NoIndexEntry", why="the requested path is derived from the signed "
          "Release's own Components/Architectures fields, so an entry cannot be 'missing' "
          "for a path the client actually asks for",
-         covered_by="host property P57 (release_file lookup miss)"),
+         covered_by="P54 (release_file path lookup miss)"),
     dict(cause="clock/ClockUnset", why="needs the GUEST clock below 2025-01-01, i.e. QEMU "
          "`-rtc base=2020-01-01`; the fixture is the unmodified a01 tree, the harness must "
          "boot with that flag",
@@ -534,13 +559,77 @@ NOT_CONSTRUCTIBLE = [
 ]
 
 
+def keyring_map(kr_path: str) -> dict:
+    """`fpr -> (role, primary_fpr, uid)` for the committed Debian archive keyring.
+
+    Derived from the keyring bytes, not from a hand-written table: the earlier
+    revision of this file listed two signers and called the third one "NOT PINNED",
+    while it was a subkey of the third pinned primary. GnuPG 2.4 ignores `--keyring`
+    when keyboxd is in play, so the keyring is imported into a throwaway home first
+    and read back from there — the same bytes the kernel pins.
+    """
+    if not os.path.exists(kr_path):
+        return {}
+    with tempfile.TemporaryDirectory() as home:
+        os.chmod(home, 0o700)
+        imp = subprocess.run(["gpg", "--homedir", home, "--batch", "--yes", "--import", kr_path],
+                             capture_output=True, text=True)
+        if imp.returncode != 0:
+            return {}
+        col = subprocess.run(["gpg", "--homedir", home, "--batch", "--list-keys", "--with-colons",
+                              "--with-subkey-fingerprint"], capture_output=True, text=True).stdout
+    out: dict = {}
+    kind = None
+    primary = None
+    primary_uid = ""
+    pending = None
+    for line in col.splitlines():
+        parts = line.split(":")
+        tag = parts[0]
+        if tag in ("pub", "sub"):
+            kind = "pub" if tag == "pub" else "sub"
+            pending = None
+        elif tag == "fpr" and kind and pending is None:
+            pending = parts[9]
+            if kind == "pub":
+                primary = pending
+                primary_uid = ""
+            if primary:
+                out[pending] = (kind, primary, primary_uid)
+        elif tag == "uid" and kind == "pub":
+            primary_uid = parts[9]
+            if primary:
+                out[primary] = ("pub", primary, primary_uid)
+    return out
+
+
+def pinned_primaries(root: str) -> dict:
+    """`primary fpr -> label` for the keys the kernel pins, when that file is here.
+
+    The fixture branch is checked out from `main`, where the trust-store module may
+    not exist yet (it arrives with the OpenPGP PR), so its absence is a NOTE, not a
+    failure: the archive keyring above is the self-contained source.
+    """
+    path = os.path.join(root, "src/pkg/openpgp_keys.rs")
+    text = open(path, encoding="utf-8", errors="replace").read() if os.path.exists(path) else ""
+    out = {}
+    for m in re.finditer(r'fingerprint:\s*\[([^\]]+)\]', text):
+        nums = [int(x, 16) if x.strip().startswith("0x") else int(x.strip())
+                for x in m.group(1).split(",") if x.strip()]
+        fpr = "".join(f"{b:02X}" for b in nums)
+        ctx = text[max(0, m.start() - 1500):m.start()]
+        labels = re.findall(r'label:\s*"([^"]+)"', ctx)
+        out[fpr] = labels[-1] if labels else "?"
+    return out
+
+
 def real_signers(out_root: str) -> dict:
     """Who actually signs the pinned inputs, as an independent verifier sees it.
 
-    `VALIDSIG` reports the fingerprint of the *signing* key, which for Debian's
-    archive key is a SUBKEY of the pinned primary — recording both is what makes
-    the reference cases evidence for the subkey-mapping path of the contract §3.5
-    instead of just for the primary-key path.
+    `VALIDSIG` reports the fingerprint of the *signing* key, and Debian signs with
+    subkeys, so the mapping is resolved through the committed keyring: reporting a
+    bare fingerprint list invited exactly the false alarm this function used to
+    contain.
     """
     kr = os.path.join(REAL, "debian-archive-keyring.gpg")
     doc = os.path.join(out_root, "a01-reference-inrelease", "dists", SUITE, "InRelease")
@@ -549,21 +638,39 @@ def real_signers(out_root: str) -> dict:
     res = subprocess.run(["gpgv", "--keyring", kr, "--status-fd", "1", doc],
                          capture_output=True, text=True)
     sigs = [l.split()[2] for l in res.stdout.splitlines() if l.startswith("[GNUPG:] VALIDSIG")]
-    pinned = {
-        "41587F7DB8C774BCCF131416762F67A0B2C39DE4":
-            "Debian Stable Release Key (13/trixie) — pinned PRIMARY",
-        "B8E5F13176D2A7A75220028078DBA3BC47EF2265":
-            "Debian Archive Automatic Signing Key (13/trixie) — pinned SUBKEY of "
-            "primary 04B54C3CDCA79751B16BC6B5225629DF75B188BD",
-    }
+    kmap = keyring_map(kr)
+    pinned = pinned_primaries(ROOT)
+    via_subkey = 0
+    entries = []
+    for fpr in sigs:
+        role, primary, uid = kmap.get(fpr, (None, None, ""))
+        if role == "sub":
+            via_subkey += 1
+            where = f"SUBKEY of primary {primary}"
+        elif role == "pub":
+            where = "PRIMARY"
+            primary = fpr
+        else:
+            where = "NOT in the committed Debian archive keyring"
+        pin = pinned.get(primary or "", None) if primary else None
+        entries.append({
+            "fpr": fpr,
+            "role": where,
+            "primary": primary,
+            "uid": uid,
+            "pinned_as": pin or ("(src/pkg/openpgp_keys.rs absent in this tree — cross-check "
+                                 "against the OpenPGP branch before reading this as unpinned)"
+                                 if not pinned else "NOT PINNED (unexpected!)"),
+        })
     return {
         "verified_by": "gpgv (GnuPG 2.4) with the committed debian-archive-keyring.gpg",
         "valid_signatures": sigs,
-        "fingerprints": [{"fpr": f, "pinned_as": pinned.get(f, "NOT PINNED (unexpected!)")}
-                         for f in sigs],
-        "why_it_matters": "one of the two signatures comes from a SUBKEY; the kernel must "
-                          "map it to its pinned primary (contract §3.5), so these cases "
-                          "exercise that path end-to-end",
+        "fingerprints": entries,
+        "subkey_signatures": f"{via_subkey} of {len(sigs)} signatures come from a SUBKEY of a "
+                             f"pinned primary",
+        "why_it_matters": "the kernel must map a signing subkey to its pinned primary "
+                          "(contract §3.5); reference cases signed through a subkey exercise "
+                          "that path end-to-end",
     }
 
 
