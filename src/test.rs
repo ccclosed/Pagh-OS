@@ -3536,7 +3536,7 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
 /// PMM free counts, heap state, interrupt flags, VFS, etc. before returning),
 /// so `run_all` is safe to invoke on demand from the running shell. It is NOT
 /// run automatically during boot.
-pub fn run_all() -> (usize, u32, u32) {
+pub fn run_all() -> (usize, u32, u32, i64) {
     let tests = all_tests();
     let frames_before = crate::memory::pmm::free_frames();
     reset_skip_totals();
@@ -3597,7 +3597,12 @@ pub fn run_all() -> (usize, u32, u32) {
             total_failed
         );
     }
-    (tests.len(), total_failed, total_skipped)
+    (
+        tests.len(),
+        total_failed,
+        total_skipped,
+        frames_after as i64 - frames_before as i64,
+    )
 }
 
 // ============================================================================

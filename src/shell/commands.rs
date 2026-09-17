@@ -566,7 +566,7 @@ pub(super) fn cmd_selftest(_ctx: &mut ShellCtx, args: &[&str]) {
         .unwrap_or(1)
         .clamp(1, 10);
     shell_println("Running kernel self-test (output on serial)...");
-    let mut results: alloc::vec::Vec<(usize, u32, u32)> = alloc::vec::Vec::new();
+    let mut results: alloc::vec::Vec<(usize, u32, u32, i64)> = alloc::vec::Vec::new();
     for pass in 1..=passes {
         if passes > 1 {
             shell_println(&alloc::format!(
@@ -583,22 +583,26 @@ pub(super) fn cmd_selftest(_ctx: &mut ShellCtx, args: &[&str]) {
         // retains state — frames above all — makes the passes diverge here, while
         // the `[selftest] PMM hygiene` lines above show which direction the pool
         // moved. E2E greps this marker.
-        let (n0, f0, s0) = results[0];
-        let (nl, fl, sl) = *results.last().expect("at least one pass");
-        // ANY divergence counts, skips included: a routine that silently stops
-        // running on the second pass is exactly the failure mode this checks for.
+        let (n0, f0, s0, d0) = results[0];
+        let (nl, fl, sl, dl) = *results.last().expect("at least one pass");
+        // Divergence = any pass reports more failures or more skips than the first,
+        // a different routine count, or a LARGER frame delta than the first. A
+        // constant per-pass residual (a fixed warm-up allocation that stabilizes) is
+        // not divergence; a growing one is exactly the retention this checks for.
         let diverged = results
             .iter()
-            .any(|(n, f, sk)| *n != n0 || *f > f0 || *sk > s0);
+            .any(|(n, f, sk, d)| *n != n0 || *f > f0 || *sk > s0 || *d > d0);
         crate::kprintln!(
-            "SELFTEST IDEMPOTENCY: passes={} first={} routines/{} failed/{} skipped last={} routines/{} failed/{} skipped diverged={}",
+            "SELFTEST IDEMPOTENCY: passes={} first={} routines/{} failed/{} skipped/{} frames last={} routines/{} failed/{} skipped/{} frames diverged={}",
             passes,
             n0,
             f0,
             s0,
+            d0,
             nl,
             fl,
             sl,
+            dl,
             diverged
         );
     }
