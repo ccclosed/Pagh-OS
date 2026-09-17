@@ -1154,27 +1154,98 @@ mod elf_prop_tests {
     /// panic inside `load` would abort the kernel and the harness would never
     /// reach the trailing assertion. Iterations are kept modest.
     ///
-    /// NOTE: an `Ok` result here would map and leak a user PML4 + frames, but a
-    /// single-byte flip in the header region essentially always invalidates the
-    /// image (magic / class / type / machine / version / offsets), so in
-    /// practice every iteration takes the `Err` path and maps nothing.
+    /// ## PMM hygiene (why this routine has a frame budget)
+    ///
+    /// The flips hit `p_filesz`/`p_memsz`, so an iteration can ask the loader for
+    /// a segment of essentially any size — and the loader maps it EAGERLY. Two
+    /// things therefore have to be true, and both are checked here:
+    ///
+    ///   * an `Ok` load hands back a fully mapped user address space; this routine
+    ///     must release it ([`crate::task::scheduler::drop_exclusive_user_space`]),
+    ///     or it retains ~1.8k frames per iteration and starves the PMM for every
+    ///     routine that runs after it (measured: the pool went from 113 360 free
+    ///     frames to 0 inside this single routine, after which anything spawning a
+    ///     kernel thread panicked with `SCHED: PMM OOM` and took the whole suite's
+    ///     verdict with it);
+    ///   * an `Err` load must roll back its own allocations — that part is the
+    ///     LOADER's contract (the frame ledger below reports it as a leak with the
+    ///     iteration number instead of hiding it), not this test's.
+    ///
+    /// The loop therefore stops early when an iteration drops the free-frame count
+    /// below the budget, so one runaway iteration cannot eat the whole pool, and it
+    /// FAILs with the numbers. With a roll-back-correct loader the routine is green
+    /// and the pool is unchanged.
     pub fn fuzz_header_no_panic() {
         let hs = core::mem::size_of::<Elf64Header>();
         let ps = core::mem::size_of::<Elf64ProgramHeader>();
         let region = hs + ps; // full header + single phdr
         let mut rng = XorShift64::new(0xD1B54A32D192ED03);
 
+        // Budget: no single iteration may take more than a quarter of the pool, so
+        // the suite keeps running even when the loader leaks (or eagerly maps) a
+        // giant segment. 64 iterations x 1 page + tables fits in far less.
+        let start_free = crate::memory::pmm::free_frames();
+        let floor = start_free / 4;
+
         let mut completed = 0u32;
-        for _ in 0..64 {
+        let mut ok_loads = 0u32;
+        let mut released = 0u32;
+        let mut leaked: usize = 0;
+        for i in 0..64 {
             let mut d = make_elf(0x401000);
             let idx = (rng.next() as usize) % region;
             let bit = (rng.next() as u8) | 1; // non-zero so the flip changes a bit
             d[idx] ^= bit;
             // The point is that this returns (no panic / no kernel abort).
-            let _ = ElfLoader::load(&d);
+            match ElfLoader::load(&d) {
+                Ok(proc) => {
+                    ok_loads += 1;
+                    // Give the address space back: `Ok` means the loader mapped it.
+                    if crate::task::scheduler::drop_exclusive_user_space(proc.pml4_phys) {
+                        released += 1;
+                    } else {
+                        // Not exclusively ours to free - keep the pml4 alive rather
+                        // than tearing down something the scheduler still needs.
+                        crate::warn!(
+                            "[selftest] elf fuzz iteration {}: user space {:#x} not exclusively owned",
+                            i,
+                            proc.pml4_phys
+                        );
+                    }
+                }
+                Err(_) => {}
+            }
             completed += 1;
+            // Per-iteration frame ledger: the pool must not collapse.
+            let free_now = crate::memory::pmm::free_frames();
+            if free_now < floor {
+                leaked = start_free.saturating_sub(free_now);
+                assert_kernel!(
+                    false,
+                    "elf fuzz: the PMM collapsed mid-routine - an iteration retained frames (Err path = the loader must roll back; see the frames line below)"
+                );
+                break;
+            }
         }
 
+        let end_free = crate::memory::pmm::free_frames();
+        crate::kprintln!(
+            "[selftest] elf fuzz: {} iterations, {} Ok ({} address spaces released), {} Err; frames {} -> {} (delta {})",
+            completed,
+            ok_loads,
+            released,
+            completed - ok_loads,
+            start_free,
+            end_free,
+            end_free as i64 - start_free as i64
+        );
+        // A leak that did not collapse the pool still has to be visible: with the
+        // budget above, `floor` can only be crossed by a genuine retention.
+        assert_eq_kernel!(
+            leaked,
+            0,
+            "elf fuzz: no iteration may retain PMM frames (see the frames line)"
+        );
         // Reaching here means every fuzz iteration returned without panicking.
         assert_eq_kernel!(
             completed,
@@ -3361,8 +3432,9 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
 /// PMM free counts, heap state, interrupt flags, VFS, etc. before returning),
 /// so `run_all` is safe to invoke on demand from the running shell. It is NOT
 /// run automatically during boot.
-pub fn run_all() {
+pub fn run_all() -> (usize, u32) {
     let tests = all_tests();
+    let frames_before = crate::memory::pmm::free_frames();
     crate::kprintln!("=== kernel self-test ({} routines) ===", tests.len());
     let mut total_failed = 0u32;
     for (name, f) in tests.iter() {
@@ -3380,6 +3452,17 @@ pub fn run_all() {
         }
     }
     crate::kprintln!("=== self-test complete ===");
+    // The suite's frame ledger: every routine is supposed to leave the PMM as it
+    // found it (a routine that retains frames starves everything that runs later
+    // and makes the suite non-idempotent). Printed BEFORE the summary so a harness
+    // can compare two passes of `selftest 2` in one boot.
+    let frames_after = crate::memory::pmm::free_frames();
+    crate::kprintln!(
+        "[selftest] PMM hygiene: free frames {} -> {} (delta {})",
+        frames_before,
+        frames_after,
+        frames_after as i64 - frames_before as i64
+    );
     // Machine-readable verdict: grepping for `ok` is not one, and grepping for
     // `FAIL:` misses a routine that failed without printing (or vice versa).
     crate::kprintln!(
@@ -3387,6 +3470,7 @@ pub fn run_all() {
         tests.len(),
         total_failed
     );
+    (tests.len(), total_failed)
 }
 
 // ============================================================================
