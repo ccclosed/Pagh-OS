@@ -194,7 +194,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
 - procfs does not exist (only emulated `/proc/self/exe` readlink).
 - Signals: delivery happens at the syscall-return point; no timer-tick
   delivery, no `kill(2)`/group broadcast, no SIGSTOP/SIGCONT scheduling.
-- NVMe driver is polled, page-chunked, has no FLUSH (weakens WAL ordering
-  guarantees on real hardware).
+- NVMe driver is polled and page-chunked; FLUSH (opcode 0x08) is issued at WAL
+  transaction boundaries, but there are no PRP lists and no queue depth > 1.
 - embedded-tls deterministically hangs on large streams — live apt update
   runs over plain HTTP because of it.

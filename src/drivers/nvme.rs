@@ -51,6 +51,8 @@ const OPC_IDENTIFY: u8 = 0x06;
 // NVM opcodes.
 const OPC_NVM_READ: u8 = 0x02;
 const OPC_NVM_WRITE: u8 = 0x03;
+/// NVM Flush: write the controller's volatile cache to stable storage.
+const OPC_NVM_FLUSH: u8 = 0x08;
 
 const IDENTIFY_NS: u32 = 0;
 const IDENTIFY_CTRL: u32 = 1;
@@ -400,6 +402,33 @@ impl NvmeCtrl {
         self.io_sq_tail = (tail + 1) % IO_SQ_ENTRIES;
         Ok(())
     }
+
+    /// NVM Flush (opcode 0x08): make every write this namespace has acknowledged
+    /// durable in non-volatile storage.
+    ///
+    /// No data transfer and no LBA range — CDW10..CDW12 stay zero, which the spec
+    /// defines as "flush everything". Issued unconditionally rather than gated on
+    /// the Identify-Controller VWC bit: for a controller with no volatile write
+    /// cache the command is a defined no-op, so the gate would only add a way to
+    /// silently lose the flush.
+    fn io_flush(&mut self) -> Result<(), ()> {
+        let tail = self.io_sq_tail;
+        let cid = self.submit(
+            self.io_sq.virt,
+            1,
+            tail,
+            OPC_NVM_FLUSH,
+            self.nsid,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        self.complete(self.io_cq.virt, 1, IO_CQ_ENTRIES, cid)?;
+        self.io_sq_tail = (tail + 1) % IO_SQ_ENTRIES;
+        Ok(())
+    }
 }
 
 // ─── Attach ──────────────────────────────────────────────────────────────────
@@ -668,6 +697,17 @@ impl BlockDevice for NvmeBlock {
 
     fn sector_count(&self) -> u64 {
         NS_SIZE_SECTORS.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// NVMe FLUSH on the attached namespace (issue #15): the journal's ordering
+    /// guarantee is only real if the controller's volatile cache is drained at
+    /// transaction boundaries.
+    fn flush(&self) -> Result<(), ()> {
+        let mut guard = NVME_DEV.lock();
+        match guard.as_mut() {
+            Some(c) => c.io_flush(),
+            None => Err(()),
+        }
     }
 }
 
