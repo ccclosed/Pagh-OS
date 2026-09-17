@@ -550,13 +550,62 @@ pub(super) fn cmd_nc(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `selftest`: run the kernel self-test suite (output on serial).
-pub(super) fn cmd_selftest(_ctx: &mut ShellCtx, _args: &[&str]) {
-    // All registered routines are non-destructive (they restore PMM free
-    // counts, heap, interrupt state, VFS, etc.), so it is safe to run them
-    // interactively. Output goes over serial via kprintln!.
+/// `selftest [passes]`: run the kernel self-test suite (output on serial).
+///
+/// Every registered routine is supposed to be non-destructive (it restores PMM
+/// free counts, heap, interrupt state, VFS, …). `passes >= 2` turns that claim
+/// into a measurable one: the SECOND pass of the same boot must report the same
+/// routine count, zero failed checks, and the same `[selftest] PMM hygiene`
+/// delta as the first — a routine that retains frames, VFS nodes or heap makes
+/// the passes diverge, which is exactly how the harness was found to be
+/// non-idempotent (one ELF fuzz routine used to eat the whole PMM pool).
+pub(super) fn cmd_selftest(_ctx: &mut ShellCtx, args: &[&str]) {
+    let passes = args
+        .first()
+        .and_then(|a| a.parse::<u32>().ok())
+        .unwrap_or(1)
+        .clamp(1, 10);
     shell_println("Running kernel self-test (output on serial)...");
-    crate::test::run_all();
+    let mut results: alloc::vec::Vec<(usize, u32, u32, i64)> = alloc::vec::Vec::new();
+    for pass in 1..=passes {
+        if passes > 1 {
+            shell_println(&alloc::format!(
+                "--- self-test pass {}/{} ---",
+                pass,
+                passes
+            ));
+        }
+        results.push(crate::test::run_all());
+    }
+    if passes > 1 {
+        // The idempotency verdict in ONE line: a later pass must not report more
+        // failures than the first (nor a different routine count). A routine that
+        // retains state — frames above all — makes the passes diverge here, while
+        // the `[selftest] PMM hygiene` lines above show which direction the pool
+        // moved. E2E greps this marker.
+        let (n0, f0, s0, d0) = results[0];
+        let (nl, fl, sl, dl) = *results.last().expect("at least one pass");
+        // Divergence = any pass reports more failures or more skips than the first,
+        // a different routine count, or a LARGER frame delta than the first. A
+        // constant per-pass residual (a fixed warm-up allocation that stabilizes) is
+        // not divergence; a growing one is exactly the retention this checks for.
+        let diverged = results
+            .iter()
+            .any(|(n, f, sk, d)| *n != n0 || *f > f0 || *sk > s0 || *d > d0);
+        crate::kprintln!(
+            "SELFTEST IDEMPOTENCY: passes={} first={} routines/{} failed/{} skipped/{} frames last={} routines/{} failed/{} skipped/{} frames diverged={}",
+            passes,
+            n0,
+            f0,
+            s0,
+            d0,
+            nl,
+            fl,
+            sl,
+            dl,
+            diverged
+        );
+    }
     shell_println("Self-test complete (see serial log).");
 }
 

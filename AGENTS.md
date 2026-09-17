@@ -129,6 +129,11 @@ release into `limine/`) — do not hard-code Limine versions in scripts.
   `supported_set_is_exact` list in `abi.rs` must match `is_supported`.
 - **Kernel-internal state → in-QEMU selftests** (`src/test.rs`, run via the
   `selftest` shell command; non-destructive, deterministic XorShift seeds).
+  `selftest 2` runs the suite twice in one boot and prints a
+  `SELFTEST IDEMPOTENCY: …` verdict plus each pass's
+  `[selftest] PMM hygiene: free frames … -> …` ledger: a routine that retains
+  PMM frames (or any other kernel state) makes the passes diverge, which is how
+  an ELF fuzz routine was found to drain the whole pool.
 - **Linux-compat end-to-end → `selftest_lx`** (feature-gated harnesses) and
   the `tools/e2e_*.ps1` scripts (local mini-repo, live apt update, bigindex
   repro, multi-MB TLS stream via `lx_tlsbig`).
