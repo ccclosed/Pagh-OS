@@ -1,0 +1,26 @@
+{
+  "note": "Test keys for the adversarial fixtures. Not secrets of any real archive: they exist so a valid GnuPG signature by an UNPINNED key can be produced. Generated with gpg 2.4.9 under `--faked-system-time`, so creation/expiry dates are fixtures too.",
+  "keys": [
+    {
+      "purpose": "release",
+      "fingerprint": "8937E8198954E5EEAD62A80475643A52A662CE31",
+      "uid": "Pagh Fixture Release (untrusted test key) <release@fixture.invalid>",
+      "public": "key_release.asc",
+      "secret": "key_release.sec.asc"
+    },
+    {
+      "purpose": "expired",
+      "fingerprint": "1A096C6FBFE8AC6AF4BF43D3E693241D1285F5A9",
+      "uid": "Pagh Fixture Expired (untrusted) <expired@fixture.invalid>",
+      "public": "key_expired.asc",
+      "secret": "key_expired.sec.asc"
+    },
+    {
+      "purpose": "future",
+      "fingerprint": "0050588B2B86C2266518CB3EFCE9F78E1A21B92A",
+      "uid": "Pagh Fixture Future (untrusted) <future@fixture.invalid>",
+      "public": "key_future.asc",
+      "secret": "key_future.sec.asc"
+    }
+  ]
+}

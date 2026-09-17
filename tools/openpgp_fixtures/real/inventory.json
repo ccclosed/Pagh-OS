@@ -1,0 +1,27 @@
+{
+  "release": {
+    "sha256": "ed56aac47e7911e65ee63aae8d67e29f20e023f840e49f8ed037043a33de138a",
+    "size": 138612
+  },
+  "inrelease": {
+    "sha256": "0584fba32e13e0ab8285fb16c27adea1ec03a73669c18702821094fd6ca86675",
+    "size": 140421
+  },
+  "release_gpg": {
+    "sha256": "9f80d5c8e4f9fd918a8b4fedd35c00ecc6c1a3ca9eddbc981c83823d4a4b8dc4",
+    "size": 1760
+  },
+  "contrib_index": {
+    "sha256": "926e365110c83a7bc974c2700a82cbd833a4ce1ea6b4134c97b6aba85e5ecb84",
+    "size": 53856,
+    "path": "contrib/binary-amd64/Packages.xz"
+  },
+  "deb": {
+    "package": "hashcat-nvidia",
+    "filename": "pool/contrib/h/hashcat-meta/hashcat-nvidia_20210201_all.deb",
+    "sha256": "78c952014dc273cc1079e65265ebe7d4cc330042ca4d97f618808693d484f32b",
+    "size": 2680,
+    "local": "hashcat-nvidia_20210201_all.deb"
+  },
+  "fetched_from": "https://deb.debian.org/debian/dists/stable/"
+}
