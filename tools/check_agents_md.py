@@ -49,15 +49,29 @@ WHAT IT CHECKS (an explicit list — see `CHECKS` — not a heuristic):
                     *trackedness*, not on a file merely lying around in the working
                     tree, because that is what a reader of a fresh clone gets
   9. absence        absence claims (`does not exist`, `still unverified`, `hangs`) are
-                    matched against the evidence that would contradict them, wherever they
-                    live — `Known open gaps` *and* `Hard invariants`
+                    matched — on the WHITESPACE-FLATTENED document, because these sentences
+                    wrap across lines — against the evidence that would contradict them,
+                    wherever they live: `Known open gaps` *and* `Hard invariants`. Every
+                    entry uses the same polarity (`contradicted_by(root) -> (bool, found)`),
+                    and `--probe` exercises each entry in BOTH directions: an earlier version
+                    mixed the polarity, which made the class inert — the invariant-9 claim
+                    would have survived the merge that falsified it, with a green gate
  10. safety-list    the invariant-10 path list == `tools/check_safety.py::critical`
                     (both directions: a doc describing something else than the gate
-                    enforces is a false claim with consequences)
+                    enforces is a false claim with consequences). Findings carry the line of
+                    the path INSIDE invariant 10 — and of the entry inside `check_safety.py`
+                    in the reverse direction; when the line cannot be located the gate says
+                    "line unknown" rather than pointing at line 1
  11. tracked        a referenced path that is present but NOT tracked by git is a finding:
                     CI and every reader clone the repository, not this working tree. A
                     `tools/e2e.py` that only ever existed here is how a documented entry
                     point became unreachable
+ 12. folder-docs    every `src/<subsystem>/` that holds `.rs` files has a `README.md`
+                    ("each folder documents itself"); nested folders documented by their
+                    subsystem README are reported as NOTE
+ 13. pattern-claims "this file contains this": the vendored embedded-tls patch symbols,
+                    `vendor/** -text`, `[workspace] exclude = ["host-tests"]`,
+                    `crate-type = ["staticlib"]` — each with its own probe
 
 WHAT IT DELIBERATELY DOES NOT CHECK (judgment, not facts): wording quality, whether a
 limitation list is complete, whether an explanation convinces, whether a path is used
@@ -81,6 +95,7 @@ import subprocess
 import sys
 import tempfile
 
+GIT = shutil.which("git") or ""  # empty: every git-backed check degrades to NOTE
 DOCS = ["AGENTS.md"]
 CI_PATH = ".github/workflows/ci.yml"
 SAFETY_PATH = "tools/check_safety.py"
@@ -88,7 +103,7 @@ SAFETY_PATH = "tools/check_safety.py"
 CHECKS = [
     "version-claim", "lockfile", "tag-list", "command-set", "command-count",
     "canon-python", "entry-points", "paths", "absence-claims", "safety-list",
-    "tracked-paths",
+    "tracked-paths", "folder-docs", "pattern-claims",
 ]
 
 #: The gate reads "which tool is current" from the declaration: see the docstring above
@@ -138,35 +153,86 @@ PATH_TOKEN = re.compile(
 )
 FENCE_BLOCK = re.compile(r"```[a-z]*\n(.*?)```", re.S)
 
+#: Absence claims, each with the evidence that CONTRADICTS it. The contract is one-way on
+#: purpose — `contradicted_by(root)` returns `(True, "what was found")` when the claim has
+#: become false, and `check_absence` fails exactly then. An earlier version mixed the
+#: polarity between entries (two of them returned "the evidence is here", which read as
+#: "the claim is fine") and the whole class was inert: `repository metadata signatures are
+#: still unverified` would have survived the merge that falsified it, with a green gate.
+#:
+#: The `claim` patterns are matched against the WHITESPACE-FLATTENED document (see
+#: `flatten_with_lines`): these sentences wrap across lines, so a pattern written with
+#: literal spaces misses the real text and a pattern written to tolerate any spacing misses
+#: the edit that matters. Each pattern must also quote the sentence as it is written TODAY —
+#: `embedded-tls deterministically hangs on large streams` — not a convenient paraphrase.
 ABSENCE_CLAIMS: list[dict] = [
     {
         "claim": re.compile(r"procfs does not exist", re.I),
-        "evidence": lambda root: (not os.path.exists(os.path.join(root, "src/vfs/procfs.rs")),
-                                  "src/vfs/procfs.rs exists"),
+        "contradicted_by": lambda root: (
+            os.path.exists(os.path.join(root, "src/vfs/procfs.rs")),
+            "src/vfs/procfs.rs exists"),
         "fix": "rewrite the bullet: name what the first /proc slice serves and what still "
                "returns ENOENT",
         "where": "Known open gaps",
     },
     {
         "claim": re.compile(r"repository metadata signatures are still unverified", re.I),
-        "evidence": lambda root: (
+        "contradicted_by": lambda root: (
             os.path.exists(os.path.join(root, "src/pkg/openpgp.rs"))
             and "openpgp::verify" in _read(os.path.join(root, "src/pkg/apt.rs")),
-            "src/pkg/openpgp.rs + apt.rs wire the trust chain",
-        ),
+            "src/pkg/openpgp.rs + apt.rs wire the trust chain"),
         "fix": "rewrite invariant 9: metadata signatures and package digests ARE verified; "
                "name what is still unverified (e.g. rollback, upstream revocation)",
         "where": "Hard invariants (this section is easy to forget — that is why it is checked)",
     },
     {
-        "claim": re.compile(r"embedded-tls[`\s]*hangs on large streams", re.I),
-        "evidence": lambda root: (
+        "claim": re.compile(r"embedded-tls deterministically hangs on large streams", re.I),
+        "contradicted_by": lambda root: (
             "lx_tlsbig" in _read(os.path.join(root, "Cargo.toml"))
             and "run_tls_big_check" in _read(os.path.join(root, "src/selftest_lx.rs")),
-            "the lx_tlsbig feature + src/selftest_lx.rs::run_tls_big_check exist",
-        ),
+            "the lx_tlsbig feature + src/selftest_lx.rs::run_tls_big_check exist"),
         "fix": "drop or reword the gap: the harness that closes it exists",
         "where": "Known open gaps / docs",
+    },
+]
+
+#: The documentation table promises `src/<subsystem>/README.md`, "each folder documents
+#: itself". Its own scope is the subsystem folder; nested folders are documented by their
+#: subsystem README, and that wider reading is reported as NOTE so the convention stays
+#: visible without turning it into a claim the tree does not meet.
+FOLDER_DOC_CLAIM = re.compile(r"each folder documents itself", re.I)
+
+#: Declarative claims of the form "this file contains this". `quote` is the sentence in the
+#: guide that makes the claim; `probe` is the (old, new) pair that breaks it for `--probe`.
+PATTERN_CLAIMS: list[dict] = [
+    {
+        "what": "the vendored embedded-tls patch carries `certificate_received` and "
+                "`certificate_verified`",
+        "quote": "One deliberate local patch",
+        "path": "vendor/embedded-tls/src/connection.rs",
+        "patterns": (r"certificate_received", r"certificate_verified"),
+        "probe": ("certificate_received", "certificate_was_received"),
+    },
+    {
+        "what": "`vendor/**` is `-text` in `.gitattributes` (checksums are byte-sensitive)",
+        "quote": "never re-save vendored files",
+        "path": ".gitattributes",
+        "patterns": (r"^vendor/\*\*\s+-text\s*$",),
+        "probe": ("-text", "text"),
+    },
+    {
+        "what": "`[workspace] exclude` keeps `host-tests` out of the kernel workspace",
+        "quote": "excluded from the kernel workspace",
+        "path": "Cargo.toml",
+        "patterns": (r'^exclude\s*=\s*\[\s*"host-tests"\s*\]',),
+        "probe": ('exclude = ["host-tests"]', "exclude = []"),
+    },
+    {
+        "what": "the kernel crate is `staticlib`",
+        "quote": "`staticlib`",
+        "path": "Cargo.toml",
+        "patterns": (r'^crate-type\s*=\s*\[\s*"staticlib"\s*\]',),
+        "probe": ('crate-type = ["staticlib"]', 'crate-type = ["lib"]'),
     },
 ]
 
@@ -201,8 +267,10 @@ def _git_index(root: str) -> set[str] | None:
     `None` is the probe's scratch copy and means 'trackedness is not observable here':
     the check then falls back to existence instead of inventing a finding.
     """
+    if not GIT:
+        return None
     try:
-        out = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True,
+        out = subprocess.run([GIT, "ls-files", "-z"], cwd=root, capture_output=True,
                              text=True)
     except OSError:
         return None
@@ -260,6 +328,32 @@ class Report:
 
 def line_of(text: str, match: re.Match) -> int:
     return text[: match.start()].count("\n") + 1
+
+
+def flatten_with_lines(text: str) -> tuple[str, list[int]]:
+    """`(flat, line_of_char)`: whitespace collapsed to single spaces.
+
+    Prose in AGENTS.md wraps: the sentence about unverified metadata signatures ends a line
+    with `signatures` and starts the next with `are still unverified`. A regex with literal
+    spaces cannot see it, and `line_of` computed on the flat text would report a line that
+    does not exist in the file — so every flat character carries the line it came from.
+    """
+    out: list[str] = []
+    lines: list[int] = []
+    line, pending_space = 1, False
+    for ch in text:
+        if ch == "\n":
+            line += 1
+        if ch.isspace():
+            pending_space = bool(out)
+            continue
+        if pending_space:
+            out.append(" ")
+            lines.append(line)
+            pending_space = False
+        out.append(ch)
+        lines.append(line)
+    return "".join(out), lines
 
 
 # ─── sources of truth ───────────────────────────────────────────────────────
@@ -320,8 +414,13 @@ def commands_block(text: str) -> tuple[list[tuple[str, int]], int] | None:
     return cmds, fence + 1
 
 
-def safety_list(root: str) -> list[str]:
-    """The `critical` array of `tools/check_safety.py`, as root-relative paths."""
+def safety_list(root: str) -> list[tuple[str, int]]:
+    """`[(path, line)]` from the `critical` array of `tools/check_safety.py`.
+
+    The line matters in the reverse direction of the comparison: when the script enforces
+    something the guide does not list, the finding has to point at the entry, not at the
+    script as a whole.
+    """
     text = _read(os.path.join(root, SAFETY_PATH))
     m = re.search(r"critical\s*=\s*\[(.*?)\]", text, re.S)
     if not m:
@@ -333,13 +432,29 @@ def safety_list(root: str) -> list[str]:
             continue
         lit = re.search(r"['\"]([^'\"]+)['\"]", item)
         if lit:
-            out.append(lit.group(1).strip("/"))
-            continue
-        seg = re.findall(r"['\"]([^'\"]+)['\"]|(\w+)", item)
-        parts = [a or b for a, b in seg]
-        if parts:
-            out.append("/".join(parts))
+            path, needle = lit.group(1).strip("/"), lit.group(1)
+        else:
+            seg = re.findall(r"['\"]([^'\"]+)['\"]|(\w+)", item)
+            parts = [a or b for a, b in seg]
+            if not parts:
+                continue
+            path, needle = "/".join(parts), parts[-1]
+        off = text.find(needle, m.start())
+        out.append((path, text[:off].count("\n") + 1 if off >= 0 else 0))
     return out
+
+
+def invariant10(text: str) -> tuple[str, int]:
+    """`(body, first_line)` of invariant 10, or `("", 0)` when it is not there.
+
+    The span is what makes a finding point INSIDE the invariant: a path named in the text
+    (`src/security/`) also appears elsewhere in the file, and searching the whole document
+    reported the first hit — an unrelated line about the Limine loader.
+    """
+    m = re.search(r"^10\.\s\*\*Unsafe policy\*\*(.*?)(?=^## |\Z)", text, re.M | re.S)
+    if not m:
+        return "", 0
+    return m.group(1), line_of(text, m)
 
 
 def invariant10_list(text: str) -> list[str]:
@@ -350,10 +465,9 @@ def invariant10_list(text: str) -> list[str]:
     also names the *gate* (`tools/check_safety.py`), which is not one of the files the
     gate covers.
     """
-    m = re.search(r"^10\.\s\*\*Unsafe policy\*\*(.*?)(?=^## |\Z)", text, re.M | re.S)
-    if not m:
+    body, _first = invariant10(text)
+    if not body:
         return []
-    body = m.group(1)
     listing = re.split(r"needs a", body, maxsplit=1)[0]
     out = []
     for tok in re.findall(r"`([^`]+)`", listing):
@@ -422,13 +536,17 @@ def check_tags(rep: Report, doc: str, text: str) -> None:
         rep.note(f"{os.path.relpath(doc, rep.root)}: no 'tags A → B → …' claim to check")
         return
     listed = re.findall(r"\d+\.\d+\.\d+", m.group(1))
-    shallow = subprocess.run(["git", "rev-parse", "--is-shallow-repository"], cwd=rep.root,
+    if not GIT:
+        rep.note(f"{os.path.relpath(doc, rep.root)}: git is not on PATH — the tag claim was "
+                 f"not checked (and cannot be: tags live in the repository)")
+        return
+    shallow = subprocess.run([GIT, "rev-parse", "--is-shallow-repository"], cwd=rep.root,
                              capture_output=True, text=True)
     if shallow.stdout.strip() == "true":
         rep.note(f"{os.path.relpath(doc, rep.root)}: shallow clone (fetch-depth 1) — the tag "
                  f"claim was not checked; the CI job fetches full history with tags")
         return
-    tags = subprocess.run(["git", "tag", "--list"], cwd=rep.root,
+    tags = subprocess.run([GIT, "tag", "--list"], cwd=rep.root,
                           capture_output=True, text=True).stdout.split()
     if not tags:
         rep.note("git tags unavailable (not a checkout?) — the tag claim was not checked")
@@ -502,11 +620,16 @@ CANON_SKIP_SUFFIX = (".cmd", ".ps1")
 #: Files whose examples are stale while the branch that rewrites them is still in flight.
 #: Reported as NOTE (never a silent pass), and the entry becomes a FINDING once the file is
 #: clean — so it cannot outlive the branch it describes (`ALLOWED_MISSING` discipline).
-#: Empty today: `tools/e2e.py` carried one stale hint (`run: python tools/limine.py`) until
-#: tools/e2e-verify-integrity f2bda5d spelled it `python3`, and the entry was removed with
-#: that commit rather than left to rot. The mechanism stays for the next branch in flight —
-#: `--probe src-canon-pending-stale` exercises the expiry path, which an empty dict would
-#: otherwise leave untested.
+#: `tools/e2e.py` was the first entry: it carried a stale hint (`run: python tools/limine.py`)
+#: until tools/e2e-verify-integrity f2bda5d spelled it `python3`, and the entry was removed
+#: with that commit rather than left to rot. `--probe src-canon-pending-stale` exercises the
+#: expiry path either way, so the mechanism is never untested dead code. The two entries
+#: The entry is deliberately NOT used for the files that are already on main
+#: (`tools/qemu_shot.py`, `tools/README.md`, four stale examples each, from 7784d83): a
+#: tolerance declared in advance for a defect that is already merged would be an excuse, not
+#: a schedule. Those are findings until the follow-up commit fixes the lines — the same
+#: commit that drops the ALLOWED_MISSING entries — and until then the gate is right to be
+#: red on a tree that ships copy-paste failures.
 CANON_PENDING: dict[str, str] = {}
 
 
@@ -656,14 +779,20 @@ def check_paths(rep: Report, doc: str, text: str) -> None:
 
 def check_absence(rep: Report, doc: str, text: str) -> None:
     """Absence claims are searched in the WHOLE document, so a claim moved from 'Known
-    open gaps' into 'Hard invariants' (where it is easier to forget) is still caught."""
+    open gaps' into 'Hard invariants' (where it is easier to forget) is still caught.
+
+    Matching happens on the flattened text and every hit is reported at the line it really
+    came from; the finding appears when the contradiction is present, never the other way
+    round (see `ABSENCE_CLAIMS`).
+    """
+    flat, line_at = flatten_with_lines(text)
     for entry in ABSENCE_CLAIMS:
-        m = entry["claim"].search(text)
+        m = entry["claim"].search(flat)
         if not m:
             continue
-        ok, found = entry["evidence"](rep.root)
-        if not ok:
-            rep.fail(doc, line_of(text, m),
+        contradicted, found = entry["contradicted_by"](rep.root)
+        if contradicted:
+            rep.fail(doc, line_at[m.start()],
                      f"absence claim '{m.group(0).strip()}' (in {entry['where']}) is "
                      f"contradicted: {found}; {entry['fix']}", found)
     for item in NOT_CHECKED:
@@ -690,16 +819,83 @@ def check_safety_list(rep: Report, doc: str, text: str) -> None:
     if not doc_paths:
         rep.fail_plain(f"{os.path.relpath(doc, rep.root)}: invariant 10 lists no paths")
         return
+    body, first = invariant10(text)
     for p in doc_paths:
-        if not any(_same_path(p, q) for q in src_paths):
-            line = next((i for i, l in enumerate(text.splitlines(), 1) if f"`{p}`" in l), 1)
-            rep.fail(doc, line, f"invariant 10 names '{p}', which {SAFETY_PATH} does not enforce",
-                     f"{SAFETY_PATH}::critical ({len(src_paths)} entries)")
-    for q in src_paths:
+        if not any(_same_path(p, q) for q, _line in src_paths):
+            offset = next((off for off, l in enumerate(body.splitlines()) if f"`{p}`" in l),
+                          None)
+            message = (f"invariant 10 names '{p}', which {SAFETY_PATH} does not enforce")
+            if offset is None:
+                # No silent `, 1)`: a wrong line sends the reader to the wrong place.
+                rep.fail_plain(f"{os.path.relpath(doc, rep.root)}: invariant 10 (line unknown): "
+                               f"{message} (checked against {SAFETY_PATH}::critical "
+                               f"({len(src_paths)} entries))")
+            else:
+                rep.fail(doc, first + offset, message,
+                         f"{SAFETY_PATH}::critical ({len(src_paths)} entries)")
+    for q, line in src_paths:
         if not any(_same_path(p, q) for p in doc_paths):
-            rep.fail_plain(f"{SAFETY_PATH}: enforces '{q}' but AGENTS.md invariant 10 does not "
+            where = f"{SAFETY_PATH}:{line}" if line else f"{SAFETY_PATH} (line unknown)"
+            rep.fail_plain(f"{where}: enforces '{q}' but AGENTS.md invariant 10 does not "
                            f"list it (both directions matter: a doc describing a different "
                            f"gate is a false claim)")
+
+
+def check_folder_docs(rep: Report, doc: str, text: str) -> None:
+    """Every `src/<subsystem>/` that holds `.rs` files has a `README.md`."""
+    m = FOLDER_DOC_CLAIM.search(text)
+    if not m:
+        rep.note(f"{os.path.relpath(doc, rep.root)}: no 'each folder documents itself' claim")
+        return
+    index = _git_index(rep.root)
+    if index is not None:
+        files = sorted(index)
+    else:  # probe scratch copy: no checkout, so walk
+        files = []
+        for dirpath, _dirs, names in os.walk(os.path.join(rep.root, "src")):
+            files += [os.path.relpath(os.path.join(dirpath, n), rep.root) for n in names]
+    dirs: set[str] = set()
+    for rel in files:
+        if not rel.startswith("src/") or not rel.endswith(".rs"):
+            continue
+        parts = rel.split("/")[:-1]
+        for i in range(2, len(parts) + 1):
+            dirs.add("/".join(parts[:i]))
+    for d in sorted(dirs):
+        if f"{d}/README.md" in files:
+            continue
+        if len(d.split("/")) == 2:
+            rep.fail(doc, line_of(text, m),
+                     f"'{d}' holds code but has no README.md — the table promises every "
+                     f"folder documents itself", "the tracked tree (src/<subsystem>/README.md)")
+        else:
+            rep.note(f"{d}: no README of its own — documented by its subsystem README; the "
+                     f"claim's own scope is src/<subsystem>/")
+
+
+def check_patterns(rep: Report, doc: str, text: str) -> None:
+    """The "this file contains this" claims, one regex each.
+
+    A claim whose sentence is no longer in the guide is reported as NOTE: the check
+    verifies what the guide states, it does not invent requirements of its own.
+    """
+    for claim in PATTERN_CLAIMS:
+        m = re.search(re.escape(claim["quote"]), text)
+        if not m:
+            rep.note(f"{os.path.relpath(doc, rep.root)}: no claim '{claim['quote']}' — "
+                     f"'{claim['what']}' is not checked")
+            continue
+        body = _read(os.path.join(rep.root, claim["path"]))
+        if not body:
+            rep.fail(doc, line_of(text, m),
+                     f"'{claim['path']}' is missing or empty, so '{claim['what']}' cannot "
+                     f"hold", "the tracked tree")
+            continue
+        for pattern in claim["patterns"]:
+            if not re.search(pattern, body, re.M):
+                rep.fail(doc, line_of(text, m),
+                         f"'{claim['path']}' does not match /{pattern}/ — {claim['what']}",
+                         f"the text of {claim['path']}")
 
 
 def check_honesty(rep: Report, _doc: str, _text: str) -> None:
@@ -728,6 +924,8 @@ def run_checks(root: str, quiet: bool = False) -> Report:
         check_paths(rep, doc, text)
         check_absence(rep, doc, text)
         check_safety_list(rep, doc, text)
+        check_folder_docs(rep, doc, text)
+        check_patterns(rep, doc, text)
     return rep
 
 
@@ -754,8 +952,15 @@ PROBES: list[tuple[str, str, str]] = [
     ("doc-count", "command-count: the heading count stops matching the block",
      "the heading says"),
     ("doc-glob", "paths: point a referenced glob at nothing", "matches no file"),
-    ("doc-absence", "absence: land src/vfs/procfs.rs while the gap claim stays",
+    ("absence-1-fire", "absence #1: procfs.rs lands and the gap claim stays",
      "procfs does not exist"),
+    ("absence-1-clean", "absence #1 control: the claim is back, the evidence is NOT", ""),
+    ("absence-2-fire", "absence #2: the trust chain lands on a claim wrapped across lines",
+     "repository metadata signatures are still unverified"),
+    ("absence-2-clean", "absence #2 control: claim back, no trust chain", ""),
+    ("absence-3-fire", "absence #3: lx_tlsbig lands and the 'deterministically hangs' bullet stays",
+     "embedded-tls deterministically hangs on large streams"),
+    ("absence-3-clean", "absence #3 control: claim back, no harness", ""),
     ("doc-safety", "safety-list: a path in invariant 10 that check_safety.py does not enforce",
      "which tools/check_safety.py does not enforce"),
     ("doc-entry-point", "entry-points: canonical path that does not exist",
@@ -776,9 +981,17 @@ PROBES: list[tuple[str, str, str]] = [
      "shebang '#!/usr/bin/env python'"),
     ("doc-exception-stale", "ALLOWED_MISSING: the in-flight path appears, the excuse must go",
      "remove the stale exception"),
+    ("folder-doc-removed", "folder-docs: a subsystem README disappears",
+     "has no README.md"),
+    ("folder-doc-new", "folder-docs: a new subsystem folder arrives without one",
+     "has no README.md"),
+    ("no-git", "the gate's own knob: git is not on PATH (must degrade, not crash)", ""),
     ("src-untracked", "SOURCE: a checkout where the documented path is present but uncommitted",
      "not tracked by git"),
 ]
+#: One probe per declarative claim: break exactly the pattern it looks for.
+PROBES += [(f"src-pattern-{i}", f"SOURCE: break '{c['what']}'", "does not match /")
+           for i, c in enumerate(PATTERN_CLAIMS)]
 
 
 #: Probes that patch one of the gate's own knobs instead of a file. The knobs are read from
@@ -788,6 +1001,7 @@ PROBES: list[tuple[str, str, str]] = [
 MEMORY_PROBES: dict[str, dict[str, object]] = {
     "src-canon-pending-stale": {"CANON_PENDING": {"tools/limine.py": "probe: pretend it is "
                                                                      "in flight and stale"}},
+    "no-git": {"GIT": ""},
 }
 
 
@@ -807,6 +1021,10 @@ def probe(root: str) -> int:
             globals().update(patched)
             try:
                 rep = run_checks(tmp, quiet=True)
+            except Exception as exc:  # a gate that dies on an odd tree is not a gate
+                print(f"PROBE {name:20} ERROR   run_checks raised {exc!r}")
+                ok = False
+                continue
             finally:
                 globals().update(saved)
             if not marker:  # self-asserting probe: it raised on any unexpected finding
@@ -845,13 +1063,31 @@ def apply_probe(root: str, name: str) -> None:
         _sub(doc, re.compile(r"\(all [a-z0-9]+ must be green"), lambda m: "(all nine must be green")
     elif name == "doc-glob":
         _sub(doc, re.compile(r"tools/e2e_\*\.ps1"), lambda m: "tools/e2e_*_gone.ps1")
-    elif name == "doc-absence":
-        # The claim has to be reintroduced: the branch that lands the feature is supposed to
-        # delete it, and the probe tests exactly that edit being forgotten.
-        _sub(doc, re.compile(r"^## Known open gaps.*$", re.M | re.S),
-             lambda m: m.group(0) + "\n- procfs does not exist (only emulated `/proc/self/exe` "
-                                   "readlink).\n")
-        _touch(root, "src/vfs/procfs.rs")
+    elif name.startswith("absence-"):
+        # Every absence entry is probed in BOTH directions, because one direction is what
+        # makes the class trustworthy: with the contradiction landed the gate must fire, and
+        # with the claim back but the evidence absent it must stay silent. (A single probe on
+        # entry #1 is how a mixed-up polarity went unnoticed.)
+        _kind, idx_s, direction = name.split("-")
+        idx = int(idx_s)
+        _append(root, "AGENTS.md", "\n" + ABSENCE_PROBE_TEXT[idx - 1] + "\n")
+        if direction == "fire":
+            _land_contradiction(root, idx)
+        else:
+            rep = run_checks(root, quiet=True)
+            fired = [f for f in rep.failures if "absence claim" in f]
+            if fired:
+                raise AssertionError(f"the claim fired with no contradiction present: "
+                                     f"{fired[0]}")
+            return
+    elif name == "folder-doc-removed":
+        os.remove(os.path.join(root, "src/net/README.md"))
+    elif name == "folder-doc-new":
+        _touch(root, "src/newsub/mod.rs")
+    elif name.startswith("src-pattern-"):
+        claim = PATTERN_CLAIMS[int(name.rsplit("-", 1)[1])]
+        _sub(os.path.join(root, claim["path"]), re.compile(re.escape(claim["probe"][0])),
+             lambda m: claim["probe"][1], count=0)
     elif name == "doc-safety":
         # A real path that check_safety.py::critical does not contain, so the only finding
         # is the safety-list one (an invented path would be caught by the paths check).
@@ -906,13 +1142,49 @@ def apply_probe(root: str, name: str) -> None:
         raise AssertionError(f"unknown probe {name}")
 
 
-def _sub(path: str, pattern: re.Pattern, repl) -> None:
+def _sub(path: str, pattern: re.Pattern, repl, count: int = 1) -> None:
+    """Apply a probe edit; `count=0` replaces every match.
+
+    A pattern probe must remove ALL occurrences of what it breaks: the vendored patch uses
+    `certificate_received` in several places, and replacing one left the claim true — a
+    probe that cannot fail (`src-pattern-0` was caught doing exactly that).
+    """
     text = _read(path)
-    new, n = pattern.subn(repl, text, count=1)
+    new, n = pattern.subn(repl, text, count=count)
     if n == 0:
         raise AssertionError(f"probe pattern {pattern.pattern!r} not found in {path}")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(new)
+
+
+#: The claim text each probe puts back, `ABSENCE_CLAIMS` order. Entry #2 is written across
+#: a line break on purpose — that wrapping is what a regex with literal spaces cannot see.
+ABSENCE_PROBE_TEXT = (
+    "- procfs does not exist (only emulated `/proc/self/exe` readlink).",
+    "- repository metadata signatures\n  are still unverified.",
+    "- embedded-tls deterministically hangs on large streams.",
+)
+
+
+def _land_contradiction(root: str, idx: int) -> None:
+    """The evidence that makes absence claim `idx` (1-based) false."""
+    if idx == 1:
+        _touch(root, "src/vfs/procfs.rs")
+    elif idx == 2:
+        _touch(root, "src/pkg/openpgp.rs")
+        _append(root, "src/pkg/apt.rs", "\n// openpgp::verify wires the trust chain\n")
+    elif idx == 3:
+        _append(root, "Cargo.toml", "\nlx_tlsbig = []\n")
+        _append(root, "src/selftest_lx.rs", "// run_tls_big_check lives here\n")
+    else:
+        raise AssertionError(f"no contradiction defined for absence #{idx}")
+
+
+def _append(root: str, rel: str, text: str) -> None:
+    path = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(text)
 
 
 def _git_init(root: str) -> None:
@@ -945,6 +1217,11 @@ def copy_tree(root: str, dest: str) -> None:
     wrong reason, and the probe would 'prove' what it never tested. (The first version of
     this function copied a handful of top-level names and did exactly that.)
     """
+    # Files a check READS (not merely asks about) are copied in full even under
+    # PLACEHOLDER_DIRS: a 0-byte `connection.rs` would make the pattern claim fail in the
+    # scratch copy for a reason that has nothing to do with the probe (`src-cargo-trap`
+    # caught exactly that). Derived from the table, so it cannot drift from it.
+    read_full = {claim["path"] for claim in PATTERN_CLAIMS}
     index = _git_index(root)
     if index is None:  # not a checkout: at least bring the names the checks read
         index = {"AGENTS.md", "Cargo.toml", "Cargo.lock", ".github/workflows/ci.yml",
@@ -957,7 +1234,7 @@ def copy_tree(root: str, dest: str) -> None:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if not os.path.exists(src):
             continue
-        if rel.startswith(PLACEHOLDER_DIRS) or os.path.islink(src):
+        if (rel.startswith(PLACEHOLDER_DIRS) and rel not in read_full) or os.path.islink(src):
             if os.path.isdir(src) and not os.path.islink(src):
                 continue
             try:
