@@ -67,14 +67,14 @@ serial он не читает ничего.
 
 ```sh
 # поднять headless-инстанс, ответить n на вопрос про python3 и снять скриншот промпта
-python tools/qemu_shot.py --boot --answer-n --out /tmp/pagh-shell.png
+python3 tools/qemu_shot.py --boot --answer-n --out /tmp/pagh-shell.png
 
 # набрать команду и снять результат (--keep-running = не гасить QEMU после снимка)
-python tools/qemu_shot.py --boot --answer-n --keep-running --out /tmp/pagh.png
-python tools/qemu_shot.py --monitor /tmp/pagh_mon.sock --keys "selftest\n" --settle 100 --out /tmp/pagh-selftest.png
+python3 tools/qemu_shot.py --boot --answer-n --keep-running --out /tmp/pagh.png
+python3 tools/qemu_shot.py --monitor /tmp/pagh_mon.sock --keys "selftest\n" --settle 100 --out /tmp/pagh-selftest.png
 
 # GUI: paint, затем выйти из него
-python tools/qemu_shot.py --monitor /tmp/pagh_mon.sock --keys "paint\n" --settle 6 --out /tmp/pagh-paint.png
+python3 tools/qemu_shot.py --monitor /tmp/pagh_mon.sock --keys "paint\n" --settle 6 --out /tmp/pagh-paint.png
 ```
 
 Результат — обычный PNG 1280×800; `screendump` работает и с `-display none` (VGA-устройство
