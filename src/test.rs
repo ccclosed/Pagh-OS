@@ -4154,7 +4154,7 @@ mod shell_prop_tests {
 //
 // The *statistical* proof that the fallback block is not a function of the
 // observable inputs (tick clock, pid, RTC) lives in the host property tests
-// (`host-tests/src/properties/p51.rs`), which drive `security::seed` directly.
+// (`host-tests/src/properties/at_random.rs`), which drive `security::seed` directly.
 // This routine is the in-QEMU counterpart: it exercises the REAL effectful path
 // (`misc::random_bytes_16` → RDSEED/RDRAND or `entropy::mixed_fill`) on whatever
 // CPU the run happens to have, and fails if that path ever hands out a constant,
@@ -4209,6 +4209,16 @@ mod at_random_tests {
         // observables): two degraded boots with different fingerprints provably
         // collected different seeds, which is what the per-run `digest` above
         // cannot show on its own (it also mixes in the tick clock).
+        //
+        // TRADEOFF (verifier finding, low, selftest-only): printing it makes the
+        // log an ORACLE for testing hypotheses about the secret seed — the seed
+        // is not recoverable from 8 bytes of a hash, but a guess like "it was
+        // collected at these timings" can be checked by recomputing it. That is
+        // acceptable because the timings are not reproducible after the fact and
+        // this line only exists while an operator runs `selftest`; it is
+        // diagnostics, not part of the security model (`SECURITY.md` does not
+        // rely on it). With hardware entropy the fingerprint is not computed at
+        // all (`seed_fp=n/a`).
         let seed_fp = if crate::security::entropy::is_available() {
             alloc::string::String::from("n/a (hardware entropy in use)")
         } else {

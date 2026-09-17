@@ -28,7 +28,7 @@
 //!   * it is not a substitute for hardware entropy, and `SECURITY.md` says so.
 //!
 //! The module is `core`-only plus `sha2` and deliberately effect-free, so the host
-//! property tests (`host-tests/src/properties/p51.rs`) exercise the exact source
+//! property tests (`host-tests/src/properties/at_random.rs`) exercise the exact source
 //! the kernel compiles: avalanche, no output dependence on observables alone, and
 //! no repeats under a fixed observable tuple.
 

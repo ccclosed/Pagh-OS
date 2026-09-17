@@ -305,8 +305,11 @@ mod properties {
     mod p50;
     // AT_RANDOM fallback mixer (issue #16): avalanche/secret-separation/attack
     // properties, with the removed xorshift and degenerate mixers as negative
-    // controls.
-    mod p51;
+    // controls. DESCRIPTIVE file name on purpose: a numeric `p51.rs` collided
+    // with an unrelated property file added in another branch (OpenPGP), and a
+    // merge that resolves it the wrong way drops properties silently. The test
+    // FUNCTIONS keep their `p51_*` names — numbers inside a file are harmless.
+    mod at_random;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the

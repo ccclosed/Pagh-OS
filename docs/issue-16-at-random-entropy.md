@@ -69,7 +69,7 @@ RDRAND/RDSEED (в частности QEMU `-cpu qemu64`).
 | `src/arch/x86_64/linux/misc.rs` | `random_bytes_16()`: HW-путь без изменений; фоллбэк — `mixed_fill`; доккомментарий переписан по факту (см. выше) |
 | `src/boot.rs` | boot-probe `report_capabilities()` в начале `kernel_main` — деградация видна ДО старта первого процесса; при наличии HW-энтропии — no-op |
 | `src/test.rs` | новая in-QEMU проверка `at_random`: 64 блока, не повторы/не вырожденные, печатает `digest` и `seed_fp` |
-| `host-tests/src/lib.rs`, `properties/p51.rs` (новый) | 10 host-свойств: 6 на поставляемый микшер + 3 отрицательных контроля + контракт транскрипта |
+| `host-tests/src/lib.rs`, `properties/at_random.rs` (новый; описательное имя — номерной `p51.rs` коллизировал с файлом OpenPGP из другой ветки) | 10 host-свойств (имена тестов `p51_*`): 6 на поставляемый микшер + 3 отрицательных контроля + контракт транскрипта |
 | `src/security/README.md`, `SECURITY.md`, `HARDENING.md`, `README.md`, `tools/README.md` | документация: механизм, честная граница (best-effort, НЕ CSPRNG), маркеры, как гонять `-cpu qemu64` |
 
 ## Ответы на критерии верификатора (по каждому свойству: a/b/c/d/e)
@@ -176,6 +176,15 @@ none of which is derivable from the observable inputs» была неверно�
 ≈2000–2300 подряд идущих `RDTSC`-дельт. Это и есть названный механизм
 непредсказуемости вместо «общего вида» хеша.
 
+**Оговорка про `seed_fp` (находка верификатора, low, только `selftest`):** печатать
+отпечаток seed в serial — значит дать читателю лога **оракул для проверки гипотез о
+секретном seed**: сам seed из 8 байт хеша не восстанавливается, но гипотезу вида
+«seed собран на таких-то таймингах» можно проверить, посчитав отпечаток самому.
+Практическая ценность этого низкая (тайминги невоспроизводимы постфактум, а строка
+появляется только когда оператор сам запускает `selftest`), но оговорка остаётся:
+это диагностический инструмент, а не часть модели безопасности, и `SECURITY.md` на
+него не опирается. На `-cpu max` отпечаток вообще не считается (`seed_fp=n/a`).
+
 **Ограничение сверки ELF:** ядро не бит-репродуцируемо между каталогами сборки
 (debug-info пути входят в образ), поэтому совпадение `elf_sha256` доказывает
 идентичность только внутри одного дерева/каталога; мои три прогона сделаны одним
@@ -195,7 +204,8 @@ fail-closed (`EAGAIN`) и никогда не отдаёт эти байты, а
 
 ```sh
 # host-свойства микшера (+ отрицательные контроли)
-python3 tools/host_tests.py                       # или: cd host-tests && cargo test p51
+python3 tools/host_tests.py                       # или: cd host-tests && cargo test at_random
+#   (модуль называется at_random; имена тестов по-прежнему p51_*, поэтому cargo test p51 тоже работает)
 
 # путь БЕЗ аппаратной энтропии (там жил дефект)
 python3 tools/e2e.py selftest --cpu qemu64 --timeout 600 --serial-log serial_t11_qemu64_run1.log
@@ -212,5 +222,5 @@ python3 tools/e2e.py selftest --cpu max --timeout 600 --serial-log serial_t11_qe
 
 `src/security/seed.rs` (новый), `src/security/entropy.rs`, `src/security/mod.rs`,
 `src/security/README.md`, `src/arch/x86_64/linux/misc.rs`, `src/boot.rs`,
-`src/test.rs`, `host-tests/src/lib.rs`, `host-tests/src/properties/p51.rs` (новый),
+`src/test.rs`, `host-tests/src/lib.rs`, `host-tests/src/properties/at_random.rs` (новый),
 `SECURITY.md`, `HARDENING.md`, `README.md`, `tools/README.md`.
