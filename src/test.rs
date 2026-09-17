@@ -3887,6 +3887,21 @@ mod linux_stop_tests {
 }
 pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
     alloc::vec![
+        // Runs FIRST, not last: it spawns two kernel threads (2 x 64 stack frames)
+        // via `kernel_thread_spawn`, which panics on PMM exhaustion, and the rest
+        // of the suite consumes >100k frames by the time the last routine runs
+        // (measured: 113 381 free at the start, 0 at the end). Running it here
+        // exercises the feature on every run; the starvation guard inside still
+        // reports a starved PMM as a diagnostic instead of dying.
+        // Issue #12 (t8): SIGSTOP/SIGCONT as scheduler state — a parked task keeps
+        // its frame and leaves rotation, SIGCONT resumes it at generation time, a stop
+        // signal for a stopped group is consumed, killing a parked task reaps it with
+        // 128+SIGKILL, the delivery path parks the receiver, and wait4 reports
+        // stop/continue exactly once. Non-destructive (see the module docs).
+        (
+            "linux::SIGSTOP/SIGCONT park+resume+kill (issue #12)",
+            linux_stop_tests::stop_continue_and_kill
+        ),
         // procfs (issue #11): the synthetic tree's shape, the rendered texts and
         // the ENOENT matrix. Read-only; see the module docs.
         (
@@ -4074,15 +4089,6 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "linux::kill(2) dispatch + errno (issue #12)",
             linux_signal_tests::kill_dispatch_and_errno
-        ),
-        // Issue #12 (t8): SIGSTOP/SIGCONT as scheduler state — a parked task keeps
-        // its frame and leaves rotation, SIGCONT resumes it at generation time, a stop
-        // signal for a stopped group is consumed, killing a parked task reaps it with
-        // 128+SIGKILL, the delivery path parks the receiver, and wait4 reports
-        // stop/continue exactly once. Non-destructive (see the module docs).
-        (
-            "linux::SIGSTOP/SIGCONT park+resume+kill (issue #12)",
-            linux_stop_tests::stop_continue_and_kill
         ),
     ]
 }
