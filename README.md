@@ -108,7 +108,9 @@ server certificate chain, hostname and validity checked before a byte of the ind
   sockets, and raw-mode `termios` (with kernel-side echo) are implemented; POSIX signal
   delivery works at the syscall-return point (real `rt_sigaction`/`rt_sigprocmask`/
   `sigaltstack`/`rt_sigreturn`, `^C` → SIGINT with `EINTR` wake-ups in the blocking
-  waits); `procfs` remains a stub.
+  waits); a synthetic `procfs` serves `/proc/{cpuinfo,meminfo,uptime}` and
+  `/proc/self/{exe,cmdline,status,maps}` — per-pid entries, `/proc/stat` and
+  `/proc/loadavg` are still missing, so `htop`/`ps` remain out of reach.
 - **Packages:** a by-name `apt` (`update`/`install`/`show`/`list`/`setmirror`) that fetches
   a Debian `Packages` index over HTTP/HTTPS, streams gzip/xz/zstd decompression into a
   compact in-RAM arena index, resolves dependencies, and installs `.deb`s onto ext2 `/mnt`
