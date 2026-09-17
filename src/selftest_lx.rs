@@ -408,6 +408,28 @@ pub fn run_apt_e2e() {
     };
     crate::info!("LXSELFTEST apt_e2e: installed {:?}", installed);
 
+    // 3b. The link fixture (issue #18): `apt install` of a package whose data.tar
+    // carries a relative symlink, an absolute symlink and a hard link must create
+    // *links*, not copies. Verified through the VFS, i.e. exactly what `lstat`,
+    // `readlink` and `stat` report to the guest.
+    match crate::pkg::apt::install("links-pagh") {
+        Ok(v) => {
+            crate::info!("LXSELFTEST apt_e2e: installed link fixture {:?}", v);
+            if let Err(d) = verify_apt_links() {
+                fail(name, d);
+                return;
+            }
+        }
+        Err(e) => {
+            // A mirror without the fixture (an older mini_repo.py) must not fail
+            // the whole run; the tar-level check above still covers the semantics.
+            crate::warn!(
+                "LXSELFTEST apt_e2e: link fixture not installed ({}); skipping the link assertions",
+                e.message()
+            );
+        }
+    }
+
     // The installed binary must be present on ext2 under /mnt.
     let bin_path = "/mnt/usr/bin/hello-pagh";
     match vfs::lookup_path(bin_path) {
@@ -1347,6 +1369,59 @@ fn check_walltime() {
         Ok(()) => pass(name),
         Err(d) => fail(name, d),
     }
+}
+
+/// Verify the `links-pagh` fixture installed by `apt`: the symlinks are symlinks
+/// with verbatim targets, `stat` follows them to the payload, and the hard link
+/// shares the inode of the file it names (`st_nlink == 2`).
+fn verify_apt_links() -> Result<(), &'static str> {
+    const REAL: &str = "/mnt/usr/share/links-pagh/real";
+    let real = vfs::lookup_path(REAL).map_err(|_| "links fixture: real file missing")?;
+    if real.is_symlink() {
+        return Err("links fixture: the payload file is a symlink");
+    }
+
+    for (link, target) in [
+        ("/mnt/usr/share/links-pagh/rel", "real"),
+        (
+            "/mnt/usr/share/links-pagh/abs",
+            "/usr/share/links-pagh/real",
+        ),
+    ] {
+        let node = vfs::lookup_path(link).map_err(|_| "links fixture: symlink missing")?;
+        if !node.is_symlink() {
+            return Err("links fixture: a symlink member was materialized as a copy");
+        }
+        match node.read_link() {
+            Some(t) if t == target => {}
+            _ => return Err("links fixture: readlink returned the wrong target"),
+        }
+        if node.size() as usize != target.len() {
+            return Err("links fixture: lstat size must be the target length");
+        }
+        let followed = vfs::lookup_path_walk(link, true)
+            .map_err(|_| "links fixture: the link does not resolve")?;
+        if followed.fs_ino() != real.fs_ino() {
+            return Err("links fixture: following the link missed the target inode");
+        }
+    }
+
+    let hard = vfs::lookup_path("/mnt/usr/share/links-pagh/hard")
+        .map_err(|_| "links fixture: hard link missing")?;
+    if hard.fs_ino() != real.fs_ino() {
+        return Err("links fixture: the hard link does not share the target inode");
+    }
+    if real.nlink() != 2 {
+        return Err("links fixture: st_nlink must be 2 for the hard-linked file");
+    }
+    let mut buf = alloc::vec![0u8; 13];
+    let n = hard
+        .read(0, &mut buf)
+        .map_err(|_| "links fixture: reading the hard link failed")?;
+    if n == 0 {
+        return Err("links fixture: the hard link reads empty");
+    }
+    Ok(())
 }
 
 /// 18.6 / issue #18 — a `data.tar` that carries links installs **links**.

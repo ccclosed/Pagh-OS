@@ -122,6 +122,39 @@ def make_tar_gz(members: list) -> bytes:
     return out.getvalue()
 
 
+def make_tar_gz_members(members: list) -> bytes:
+    """Build a GNU-format tar from explicit members, gzip it, return bytes.
+
+    `members` are dicts: `name`, `mode`, and either `data` (a regular file) or
+    `linkname` plus `type` (`tarfile.SYMTYPE`/`tarfile.LNKTYPE`). GNU format is
+    deliberate: it is what dpkg's `tar` writes, so a member path longer than the
+    100-byte `name` field comes out as a `'L'` header — exactly the encoding the
+    kernel parser has to understand (issue #18).
+    """
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.GNU_FORMAT) as tf:
+        for m in members:
+            ti = tarfile.TarInfo(name=m["name"])
+            ti.mode = m.get("mode", 0o644)
+            ti.mtime = 0
+            ti.uid = 0
+            ti.gid = 0
+            if "linkname" in m:
+                ti.type = m.get("type", tarfile.SYMTYPE)
+                ti.linkname = m["linkname"]
+                ti.size = 0
+                tf.addfile(ti)
+            else:
+                data = m.get("data", b"")
+                ti.type = tarfile.REGTYPE
+                ti.size = len(data)
+                tf.addfile(ti, io.BytesIO(data))
+    out = io.BytesIO()
+    with gzip.GzipFile(fileobj=out, mode="wb", mtime=0) as gz:
+        gz.write(raw.getvalue())
+    return out.getvalue()
+
+
 def ar_member(name: str, data: bytes) -> bytes:
     """Encode one `ar` archive member (60-byte header + content + even pad)."""
     header = b""
@@ -167,6 +200,48 @@ def build_repo() -> None:
 
     deb = build_deb(control_tar_gz, data_tar_gz)
 
+    # --- second package: links (issue #18) -------------------------------------
+    # A file, a relative symlink, an absolute symlink, a hard link sharing the
+    # file's inode, and a member path longer than the 100-byte `name` field (GNU
+    # `'L'`). `real` must come first: the hard link names it as its target.
+    links_payload = b"links payload\n"
+    long_leaf = "usr/share/links-pagh/" + ("l" * 110) + "/leaf.txt"
+    links_data_tar_gz = make_tar_gz_members(
+        [
+            {"name": "usr/share/links-pagh/real", "mode": 0o644, "data": links_payload},
+            {
+                "name": "usr/share/links-pagh/rel",
+                "type": tarfile.SYMTYPE,
+                "linkname": "real",
+            },
+            {
+                "name": "usr/share/links-pagh/abs",
+                "type": tarfile.SYMTYPE,
+                "linkname": "/usr/share/links-pagh/real",
+            },
+            {
+                "name": "usr/share/links-pagh/hard",
+                "type": tarfile.LNKTYPE,
+                "linkname": "usr/share/links-pagh/real",
+            },
+            {"name": long_leaf, "mode": 0o644, "data": b"long\n"},
+        ]
+    )
+    links_control = (
+        "Package: links-pagh\n"
+        "Version: 1.0\n"
+        "Architecture: amd64\n"
+        "Maintainer: Pagh-OS <root@pagh>\n"
+        "Description: symlink and hardlink fixture for issue #18\n"
+    ).encode()
+    links_deb = build_deb(make_tar_gz([("control", 0o644, links_control)]), links_data_tar_gz)
+    links_pool_dir = os.path.join(REPO, "pool", "main", "l", "links-pagh")
+    os.makedirs(links_pool_dir, exist_ok=True)
+    links_deb_name = "links-pagh_1.0_amd64.deb"
+    with open(os.path.join(links_pool_dir, links_deb_name), "wb") as f:
+        f.write(links_deb)
+    links_pool_rel = "pool/main/l/links-pagh/" + links_deb_name
+
     # Write the pool .deb.
     pool_dir = os.path.join(REPO, "pool", "main", "h", "hello-pagh")
     os.makedirs(pool_dir, exist_ok=True)
@@ -193,6 +268,16 @@ def build_repo() -> None:
         f"SHA256: {sha256}\n"
         f"Description: tiny hello binary for the apt end-to-end test\n"
         f"\n"
+        f"Package: links-pagh\n"
+        f"Version: 1.0\n"
+        f"Architecture: amd64\n"
+        f"Maintainer: Pagh-OS <root@pagh>\n"
+        f"Filename: {links_pool_rel}\n"
+        f"Size: {len(links_deb)}\n"
+        f"MD5sum: {hashlib.md5(links_deb).hexdigest()}\n"
+        f"SHA256: {hashlib.sha256(links_deb).hexdigest()}\n"
+        f"Description: symlink and hardlink fixture for issue #18\n"
+        f"\n"
     ).encode()
 
     idx_dir = os.path.join(REPO, "dists", "stable", "main", "binary-amd64")
@@ -216,6 +301,10 @@ def build_repo() -> None:
     print(f"  .deb        : {pool_rel} ({size} bytes, md5 {md5[:12]}...)")
     print(f"  Packages.gz : dists/stable/main/binary-amd64/Packages.gz")
     print(f"  ELF         : usr/bin/hello-pagh ({len(elf)} bytes), prints {HELLO_MSG!r}")
+    print(
+        f"  links .deb  : {links_pool_rel} ({len(links_deb)} bytes) — symlink rel/abs, "
+        f"hard link, and a {len(long_leaf)}-byte member path"
+    )
 
 
 def build_big_index(n: int) -> None:

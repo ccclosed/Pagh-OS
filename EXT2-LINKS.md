@@ -691,8 +691,11 @@ t15 не завёл дублирующий механизм:
 
 ### 9.2 `tools/mini_repo.py` + `tools/e2e.py`
 
-- Фикстуры: пакет с symlink, hardlink, длинным путём; два варианта кодирования длинного
-  имени — GNU (`tarfile.GNU_FORMAT` → `'L'`/`'K'`) и ustar (`USTAR_FORMAT` → `prefix`).
+- Фикстуры: `tools/mini_repo.py` собирает второй пакет **`links-pagh`** — regular-файл,
+  относительный и абсолютный симлинки, хардлинк на этот же файл и путь длиной 140 байт
+  (GNU `'L'`, формат `GNU_FORMAT`, как у dpkg). `run_apt_e2e` ставит его и проверяет через VFS:
+  `is_symlink`/`read_link` (цель дословно), `size` = длина цели, следование до inode цели,
+  общий `st_ino` у хардлинка и `st_nlink == 2`.
 - `python3 tools/e2e.py local-mirror` — сценарий apt (проверяет `LXSELFTEST apt_e2e PASS`);
   при расширении сценария добавить проверки ссылок в `run_apt_e2e` (`selftest_lx.rs:363-440`).
 - `python3 tools/e2e.py shell --cmd '<команда>' --expect '<маркер>'` — точечные проверки
