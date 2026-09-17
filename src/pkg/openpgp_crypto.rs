@@ -124,6 +124,21 @@ impl HashAlgo {
     }
 }
 
+/// SHA-256 of `data`.
+///
+/// The apt trust chain uses this for the digests the signed `Release` declares:
+/// the `Packages` body (`verify_index_body`) and every downloaded `.deb`
+/// (`verify_package_body`). It lives here so the kernel's repository-metadata
+/// path has exactly one SHA-256 implementation, the same one the signature
+/// digests use.
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
 /// Compute the v4 signature digest `H` over `parts || hashed_portion || trailer`.
 ///
 /// `parts` is the signed data split into the pieces the caller already owns (a

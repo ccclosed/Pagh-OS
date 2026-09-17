@@ -38,12 +38,16 @@ userland** onto its ext2 disk after an opt-in confirmation at first boot.
 > Hobby/educational kernel. There is no security model beyond ring 0/3 paging.
 
 > **Network default:** outbound package operations are **enabled** in normal builds
-> (`default = ["network_packages"]` in `Cargo.toml`). HTTPS verifies the server
-> certificate fail-closed against four pinned roots, but repository-signature and
-> per-package digest verification are still pending and plain-HTTP mirrors stay
-> unauthenticated, so downloaded packages remain untrusted — acceptable only for an
-> isolated, developer-controlled QEMU mirror. Use `cargo build --no-default-features`
-> for a fail-closed build. See `SECURITY.md` and `HARDENING.md`.
+> (`default = ["network_packages"]` in `Cargo.toml`). Two independent halves now
+> authenticate a repository: HTTPS verifies the server certificate fail-closed against
+> four pinned roots, and the package pipeline verifies the signed metadata end to end —
+> `InRelease`/`Release.gpg` against a fingerprint-pinned Debian keyring, then the
+> SHA-256 **and** size of `Packages` and of every `.deb` (issue #32). A mirror that
+> serves no signature is refused; there is no override flag. Plain-HTTP mirrors are
+> integrity-checked by that chain even though their transport is unauthenticated.
+> Remaining gaps (revocation distribution, replay of a whole old triplet on suites
+> without `Valid-Until`, the index-free `pkg` command) are listed in `SECURITY.md`.
+> Use `cargo build --no-default-features` for a fail-closed build. See `HARDENING.md`.
 
 > **Authorship:** this kernel was written by AI under human supervision.
 
@@ -475,11 +479,15 @@ python
   §4.4.2.4), and `net::tls` independently requires its authentication counter to advance before
   any application byte moves. Trust is limited to the bundle's four pinned roots (ISRG Root
   X1/X2, GTS R1/R4), and revocation (CRL/OCSP) is not checked, so an HTTPS mirror outside that
-  issuance is refused rather than trusted. What is still missing is repository-side trust:
-  Debian metadata signatures and complete per-package digest verification. Plain-HTTP mirrors
-  (`apt setmirror http://…`) remain unauthenticated by construction, and live `apt update`
-  currently uses HTTP because of the embedded-tls large-stream hang (issue #19). The MITM
-  negative tests for these paths are not written yet — see `SECURITY.md`.
+  issuance is refused rather than trusted. Repository-side trust is implemented on top of
+  that: `apt update` verifies `InRelease`/`Release.gpg` against the committed, fingerprint-pinned
+  Debian keyring (subkey bindings, expiry, revocation, 2025 clock gate) and refuses an unsigned
+  mirror outright, the `Packages` body must match the signed `SHA-256` **and** size before it is
+  decoded, and every `.deb` must match the digest from the signed index before it is unpacked.
+  Plain-HTTP mirrors (`apt setmirror http://…`) are integrity-checked by that chain although
+  their transport is unauthenticated, and live `apt update` runs over HTTPS (issue #19 closed).
+  What remains open: revocation distribution, replay of a whole old triplet on suites without
+  `Valid-Until`, and the negative MITM/digest E2E harnesses — see `SECURITY.md`.
 - **Scale.** The full Debian `main` index (~60k packages, ~150 MiB decompressed) is streamed
   and parsed into a compact in-RAM byte-arena index (kept in RAM only, rebuilt per boot).
   End-to-end install is proven against a local mirror; a live full `apt update` from

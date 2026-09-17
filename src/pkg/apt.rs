@@ -31,6 +31,26 @@
 //! Network I/O is performed with **no apt lock held**: each global is locked only
 //! long enough to read/clone what is needed (the index lock is never held across
 //! an `http_get`, which itself disables interrupts while pumping the socket).
+//!
+//! ## Trust chain
+//!
+//! Nothing from the mirror is used before the signature chain checks out
+//! (issue #32, `OPENPGP-VERIFY-CONTRACT.md`):
+//!
+//! ```text
+//! InRelease | Release.gpg+Release   (OpenPGP, pinned Debian keyring)
+//!        |
+//!        +-- SHA-256 + size of the Packages variant actually fetched
+//!                 |
+//!                 +-- per-.deb SHA-256 + size from the signed index,
+//!                     checked after the download and BEFORE deb::parse_ar
+//! ```
+//!
+//! A mirror that serves no signatures is refused loudly
+//! ([`AptOpError::Unsigned`]); a mismatch anywhere is fatal and there is no flag,
+//! feature or environment variable that turns verification off. The only
+//! unverified build is `--no-default-features`, where `update`/`install` return
+//! [`AptOpError::NetworkDisabled`].
 
 #![allow(dead_code)]
 
@@ -45,6 +65,10 @@ use super::apt_index::{PackageIndex, PackageIndexBuilder, PkgRef, StanzaParser};
 use super::apt_resolve::{resolve_install, AptError};
 use super::deb::{self, Compression};
 use super::install_fs;
+use super::openpgp::{self, OpenPgpError};
+use super::openpgp_crypto;
+use super::openpgp_keys::DEBIAN_KEYRING;
+use super::release_file::{self, DateField, Release};
 use super::tar;
 
 /// The active repository configuration for `apt`.
@@ -274,6 +298,43 @@ pub enum AptOpError {
     IndexTooLarge,
     /// Writing a package's files onto ext2 failed.
     Install { pkg: String },
+    /// The mirror serves no signed metadata at all: neither `InRelease` nor
+    /// `Release.gpg`+`Release`. pagh refuses to trust unauthenticated package
+    /// metadata — there is no override flag, by design.
+    Unsigned { url: String },
+    /// Signature verification of the signed metadata failed (bad armor, no
+    /// trusted signature, expired/revoked key, unset clock, …). `stage` and
+    /// `cause` are the same strings the serial diagnostic carries.
+    BadSignature {
+        stage: &'static str,
+        cause: &'static str,
+    },
+    /// The RTC is below the verifier's clock floor (2025-01-01), so no date in
+    /// the metadata can be checked.
+    ClockUnset,
+    /// The signed `Release` is past its `Valid-Until`, or that field is present
+    /// but unreadable.
+    ReleaseExpired { detail: &'static str },
+    /// The signed `Release` is dated implausibly far in the future.
+    ReleaseFuture { detail: &'static str },
+    /// A date field of the signed `Release` is present but not readable.
+    ReleaseDateUnreadable { field: &'static str },
+    /// The signed `Release` cannot be used as served (truncated, or it does not
+    /// describe this component/architecture).
+    ReleaseMalformed { detail: &'static str },
+    /// The signed `Release` does not describe the configured suite.
+    ReleaseSuiteMismatch,
+    /// The signed `Release` lists no `Packages` variant this build can use.
+    NoIndexEntry { path: String },
+    /// The downloaded `Packages` body does not match the SHA-256/size the signed
+    /// `Release` declares. Fatal for the whole update: no other variant is tried.
+    IndexMismatch { path: String, cause: &'static str },
+    /// A `.deb` stanza carries no usable `SHA256:`, so the payload cannot be
+    /// bound to the signed index.
+    DigestUnavailable { pkg: String },
+    /// The downloaded `.deb` does not match the SHA-256/size from the signed
+    /// index. Refused BEFORE any parsing or unpacking.
+    DigestMismatch { pkg: String, cause: &'static str },
 }
 
 impl AptOpError {
@@ -293,52 +354,442 @@ lines on serial for the exact cause; retry 'apt update', or use a smaller compon
                     .to_string()
             }
             AptOpError::Install { pkg } => format!("install failed for '{}'", pkg),
+            AptOpError::Unsigned { url } => format!(
+                "the mirror serves no signed metadata (no InRelease, no Release.gpg; refused {}) \
+                 — refusing unauthenticated package metadata; see SECURITY.md",
+                url
+            ),
+            AptOpError::BadSignature { stage, cause } => format!(
+                "metadata signature verification failed (stage={} cause={}) - the mirror is \
+                 not trusted; refusing to continue",
+                stage, cause
+            ),
+            AptOpError::ClockUnset => "the system clock is unset (before 2025-01-01), so the \
+                 signed metadata's validity cannot be checked - refusing (set the RTC)"
+                .to_string(),
+            AptOpError::ReleaseExpired { detail } => format!(
+                "the signed Release is not valid any more ({}) - refusing stale metadata",
+                detail
+            ),
+            AptOpError::ReleaseFuture { detail } => {
+                format!("the signed Release is dated in the future ({})", detail)
+            }
+            AptOpError::ReleaseDateUnreadable { field } => format!(
+                "the signed Release carries an unreadable '{}' field - refusing (a date that \
+                 cannot be checked is not the same as no date)",
+                field
+            ),
+            AptOpError::ReleaseMalformed { detail } => {
+                format!("the signed Release cannot be used as served: {}", detail)
+            }
+            AptOpError::ReleaseSuiteMismatch => "the signed Release does not describe the \
+                 configured suite - refusing metadata for a different suite"
+                .to_string(),
+            AptOpError::NoIndexEntry { path } => format!(
+                "the signed Release lists no '{}' - the mirror cannot be trusted to serve \
+                 this component/architecture",
+                path
+            ),
+            AptOpError::IndexMismatch { path, cause } => format!(
+                "the downloaded index '{}' does not match the signed Release ({}) - refusing \
+                 (no fallback to another variant)",
+                path, cause
+            ),
+            AptOpError::DigestUnavailable { pkg } => format!(
+                "package '{}' has no SHA256 in the signed index - cannot bind it to the \
+                 signed metadata; refusing to install it",
+                pkg
+            ),
+            AptOpError::DigestMismatch { pkg, cause } => format!(
+                "package '{}' does not match the signed index digest ({}) - refusing to \
+                 unpack it",
+                pkg, cause
+            ),
         }
     }
+}
+
+/// The keys a repository signature is accepted from.
+///
+/// The trust store is a compile-time constant: the kernel never fetches, adds or
+/// updates a key at runtime. A mirror signed by any other key is refused with
+/// `cause=NoTrustedSignature`.
+fn trusted_keyring() -> &'static [openpgp::PinnedKey] {
+    &DEBIAN_KEYRING
+}
+
+/// Signed metadata that verified, with the signer recorded for diagnostics.
+struct SignedRelease {
+    /// The `Release` body (clear text of `InRelease`, or the `Release` file).
+    text: Vec<u8>,
+    /// Which document was verified (`InRelease` or `Release.gpg`).
+    source: &'static str,
+    /// Primary fingerprint of the pinned key that vouched for it.
+    signer: [u8; 20],
+}
+
+/// Fetch `dists/<suite>/InRelease`, or fall back to `Release.gpg`+`Release`, and
+/// verify the signature against the pinned keyring.
+///
+/// The fallback happens **only** when `InRelease` is absent (HTTP 404). A
+/// present-but-invalid `InRelease` is fatal: falling back there would let a
+/// man-in-the-middle force the weaker path.
+fn fetch_signed_release(cfg: &AptConfig, now: i64) -> Result<SignedRelease, AptOpError> {
+    let inrelease = format!("{}/dists/{}/InRelease", cfg.base, cfg.suite);
+    match cfg.fetch(&inrelease) {
+        Ok(bytes) => match openpgp::verify_clearsigned(trusted_keyring(), &bytes, now) {
+            Ok((cs, verified)) => {
+                crate::info!(
+                    "apt: verify OK release=InRelease signer={} key={}",
+                    hex20(&verified.signer),
+                    hex20(&verified.key)
+                );
+                return Ok(SignedRelease {
+                    text: cs.text.to_vec(),
+                    source: "InRelease",
+                    signer: verified.signer,
+                });
+            }
+            Err(e) => return Err(signature_error(e, "InRelease")),
+        },
+        Err(crate::net::http_fetch::FetchError::Status(404)) => {
+            // No InRelease: the detached pair must be present instead.
+        }
+        Err(crate::net::http_fetch::FetchError::NoNetwork) => return Err(AptOpError::NoNetwork),
+        Err(e) => {
+            crate::warn!("apt: InRelease fetch failed ({:?}) - trying Release.gpg", e);
+        }
+    }
+
+    let release_url = format!("{}/dists/{}/Release", cfg.base, cfg.suite);
+    let sig_url = format!("{}/dists/{}/Release.gpg", cfg.base, cfg.suite);
+    let signature = match cfg.fetch(&sig_url) {
+        Ok(b) => b,
+        Err(crate::net::http_fetch::FetchError::Status(404)) => {
+            verify_fail("metadata", "Unsigned", &format!(" url={}", sig_url));
+            return Err(AptOpError::Unsigned { url: sig_url });
+        }
+        Err(crate::net::http_fetch::FetchError::NoNetwork) => return Err(AptOpError::NoNetwork),
+        Err(_) => {
+            return Err(AptOpError::Download {
+                pkg: "Release.gpg".to_string(),
+            })
+        }
+    };
+    let text = match cfg.fetch(&release_url) {
+        Ok(b) => b,
+        Err(crate::net::http_fetch::FetchError::Status(404)) => {
+            verify_fail("metadata", "Unsigned", &format!(" url={}", release_url));
+            return Err(AptOpError::Unsigned { url: release_url });
+        }
+        Err(crate::net::http_fetch::FetchError::NoNetwork) => return Err(AptOpError::NoNetwork),
+        Err(_) => {
+            return Err(AptOpError::Download {
+                pkg: "Release".to_string(),
+            })
+        }
+    };
+
+    match openpgp::verify_detached(trusted_keyring(), &signature, &text, now) {
+        Ok(verified) => {
+            crate::info!(
+                "apt: verify OK release=Release.gpg signer={} key={}",
+                hex20(&verified.signer),
+                hex20(&verified.key)
+            );
+            Ok(SignedRelease {
+                text,
+                source: "Release.gpg",
+                signer: verified.signer,
+            })
+        }
+        Err(e) => Err(signature_error(e, "Release.gpg")),
+    }
+}
+
+/// Apply the `Release` policy checks that are not part of the signature.
+fn check_release_policy(cfg: &AptConfig, release: &Release, now: i64) -> Result<(), AptOpError> {
+    if release.truncated {
+        verify_fail("release", "Truncated", "");
+        return Err(AptOpError::ReleaseMalformed {
+            detail: "the body is larger than the accepted parse limit",
+        });
+    }
+    if !release.matches_suite(&cfg.suite) {
+        verify_fail(
+            "release",
+            "SuiteMismatch",
+            &format!(" suite={} codename={}", release.suite, release.codename),
+        );
+        return Err(AptOpError::ReleaseSuiteMismatch);
+    }
+    if !release.architectures.is_empty()
+        && !release
+            .architectures
+            .iter()
+            .any(|a| a == &cfg.arch || a == "all")
+    {
+        verify_fail("release", "ArchitectureNotListed", "");
+        return Err(AptOpError::ReleaseMalformed {
+            detail: "the configured architecture is not listed in Architectures",
+        });
+    }
+
+    match release.date {
+        DateField::Parsed(date) => {
+            if date > now + openpgp::MAX_SKEW {
+                verify_fail("release", "FutureDate", "");
+                return Err(AptOpError::ReleaseFuture {
+                    detail: "Date is after the current time",
+                });
+            }
+        }
+        DateField::Malformed => {
+            verify_fail("release", "DateUnreadable", "");
+            return Err(AptOpError::ReleaseDateUnreadable { field: "Date" });
+        }
+        DateField::Absent => {}
+    }
+
+    match release.valid_until {
+        DateField::Parsed(until) => {
+            if now > until {
+                verify_fail("release", "ValidUntilExpired", "");
+                return Err(AptOpError::ReleaseExpired {
+                    detail: "Valid-Until has passed",
+                });
+            }
+        }
+        DateField::Malformed => {
+            verify_fail("release", "ValidUntilUnreadable", "");
+            return Err(AptOpError::ReleaseDateUnreadable {
+                field: "Valid-Until",
+            });
+        }
+        DateField::Absent => {}
+    }
+    Ok(())
+}
+
+/// Verify a downloaded `Packages` body against the signed `Release` entry
+/// **before** it is decompressed or parsed.
+fn verify_index_body(
+    path: &str,
+    bytes: &[u8],
+    entry: &release_file::ReleaseEntry,
+) -> Result<(), AptOpError> {
+    if bytes.len() as u64 != entry.size {
+        verify_fail(
+            "index",
+            "SizeMismatch",
+            &format!(" path={} expected={} got={}", path, entry.size, bytes.len()),
+        );
+        return Err(AptOpError::IndexMismatch {
+            path: path.to_string(),
+            cause: "SizeMismatch",
+        });
+    }
+    let digest = openpgp_crypto::sha256(bytes);
+    if digest != entry.sha256 {
+        verify_fail(
+            "index",
+            "HashMismatch",
+            &format!(
+                " path={} expected={} got={}",
+                path,
+                hex32(&entry.sha256),
+                hex32(&digest)
+            ),
+        );
+        return Err(AptOpError::IndexMismatch {
+            path: path.to_string(),
+            cause: "HashMismatch",
+        });
+    }
+    crate::info!(
+        "apt: verify index path={} sha256={} size={} ok",
+        path,
+        hex32(&digest),
+        entry.size
+    );
+    Ok(())
+}
+
+/// Verify a downloaded `.deb` against the digest the signed index declares.
+///
+/// Runs immediately after the download and before `deb::parse_ar`, so a payload
+/// that does not match the signed metadata is never parsed, never decompressed
+/// and never written to disk.
+fn verify_package_body(
+    pkg: &str,
+    bytes: &[u8],
+    expected: &[u8; 32],
+    expected_size: u64,
+) -> Result<(), AptOpError> {
+    if bytes.len() as u64 != expected_size {
+        verify_fail(
+            "deb",
+            "SizeMismatch",
+            &format!(
+                " pkg={} expected={} got={}",
+                pkg,
+                expected_size,
+                bytes.len()
+            ),
+        );
+        return Err(AptOpError::DigestMismatch {
+            pkg: pkg.to_string(),
+            cause: "SizeMismatch",
+        });
+    }
+    let digest = openpgp_crypto::sha256(bytes);
+    if &digest != expected {
+        verify_fail(
+            "deb",
+            "HashMismatch",
+            &format!(
+                " pkg={} expected={} got={}",
+                pkg,
+                hex32(expected),
+                hex32(&digest)
+            ),
+        );
+        return Err(AptOpError::DigestMismatch {
+            pkg: pkg.to_string(),
+            cause: "HashMismatch",
+        });
+    }
+    crate::info!(
+        "apt: verify deb pkg={} sha256={} size={} ok",
+        pkg,
+        hex32(&digest),
+        expected_size
+    );
+    Ok(())
+}
+
+/// One `apt: verify FAIL stage=… cause=…` line — the grep surface the e2e
+/// harnesses assert on. Exactly one line per refusal.
+fn verify_fail(stage: &str, cause: &str, extra: &str) {
+    crate::error!("apt: verify FAIL stage={} cause={}{}", stage, cause, extra);
+}
+
+/// Map a signature failure onto the apt error, keeping the (stage, cause) pair.
+fn signature_error(e: OpenPgpError, source: &str) -> AptOpError {
+    let (stage, cause) = e.diagnostic();
+    verify_fail(stage, cause, &format!(" release={}", source));
+    AptOpError::BadSignature { stage, cause }
+}
+
+fn hex_nibble_out(out: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(HEX[(byte >> 4) as usize] as char);
+    out.push(HEX[(byte & 0x0f) as usize] as char);
+}
+
+/// Lower-case hex of a 32-octet digest (diagnostics only).
+fn hex32(digest: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        hex_nibble_out(&mut out, *byte);
+    }
+    out
+}
+
+/// Lower-case hex of a 20-octet fingerprint (diagnostics only).
+fn hex20(fpr: &[u8; 20]) -> String {
+    let mut out = String::with_capacity(40);
+    for byte in fpr {
+        hex_nibble_out(&mut out, *byte);
+    }
+    out
 }
 
 /// Download and parse the repository `Packages` index into RAM, returning the
 /// number of package records loaded.
 ///
-/// Builds the index URL `{base}/dists/{suite}/{component}/binary-{arch}/Packages.gz`
-/// and `GET`s it; if that download fails (e.g. the mirror 404s that compression),
-/// it falls back to `.xz`, then to the uncompressed `Packages`.
+/// ## Trust chain (issue #32)
 ///
-/// ## Streaming, bounded-memory pipeline
+/// The index is only parsed after the metadata that describes it verified:
 ///
-/// The fetched body is **never** decompressed into one giant buffer (the old
-/// "decompress the whole ~150 MiB index to a `Vec`, then parse" path that overran
-/// the heap and looked like a hang). Instead the compressed body is decompressed
-/// in fixed chunks ([`deb::decompress_stream`], `STREAM_CHUNK` = 8 KiB) and each
-/// chunk is fed into
-/// an incremental [`StanzaParser`], which emits one [`PkgRecord`] per completed
-/// stanza and drops the chunk. Resident memory is therefore roughly the
-/// compressed body (~10 MiB) + small decode/line buffers + the parsed in-RAM
-/// index — there is no large intermediate. Progress is logged periodically so a
-/// long index visibly advances instead of appearing hung. A runaway stream is
-/// bounded by [`deb::MAX_INDEX_STREAM_BYTES`] and fails cleanly (no OOM abort).
+///   1. `dists/<suite>/InRelease` (clear-signed) is fetched and verified against
+///      the pinned keyring — or, only when it is absent (404), the detached
+///      `Release.gpg` over the `Release` file. A mirror that serves neither is
+///      refused outright ([`AptOpError::Unsigned`]); there is no override flag.
+///   2. The verified `Release` is parsed ([`release_file`]) and its policy
+///      fields are checked: suite/codename, architecture list, `Date` and
+///      `Valid-Until`.
+///   3. Only `Packages` variants that the signed `Release` actually lists are
+///      fetched — an unlisted variant cannot be verified, so it is never used.
+///   4. The downloaded body is checked against the declared **SHA-256 and size
+///      before** it is decompressed or parsed. A mismatch is fatal: the update
+///      does not fall back to another variant (a decode failure still does,
+///      since that is a corrupt stream rather than a mismatch).
+///
+/// The digest is computed over the body the fetch layer already holds (one pass,
+/// no copy); the decompressed index is still produced incrementally by
+/// [`stream_parse_index`], so resident memory does not grow with index size.
+///
+/// ## Failure is fail-closed
+///
+/// Any refusal clears [`struct@INDEX`]: a failed update never leaves the previous
+/// index in place as if the mirror had answered, so `apt install` cannot proceed
+/// on metadata that no longer verifies.
 pub fn update() -> Result<usize, AptOpError> {
+    let result = update_verified();
+    if result.is_err() {
+        *INDEX.lock() = None;
+    }
+    result
+}
+
+fn update_verified() -> Result<usize, AptOpError> {
     #[cfg(not(feature = "insecure_network_demo"))]
     return Err(AptOpError::NetworkDisabled);
 
     let cfg = config();
+    let now = crate::arch::x86_64::linux::rtc::now_unix() as i64;
+
+    // 1+2. Signed metadata, verified, parsed and policy-checked.
+    let signed = fetch_signed_release(&cfg, now)?;
+    let release = release_file::parse_release(&signed.text);
+    check_release_policy(&cfg, &release, now)?;
+
+    // 3. Candidate index variants, in preference order: gzip first (faster to
+    // decode at full-index scale), then xz, then uncompressed — but only those
+    // the signed Release lists, with their declared digest and size.
     let dir = format!(
         "{}/dists/{}/{}/binary-{}",
         cfg.base, cfg.suite, cfg.component, cfg.arch
     );
-
-    // Preference order: gzip first (faster to decode at full-index scale), then
-    // xz, then uncompressed.
-    let candidates: [(String, Compression); 3] = [
-        (format!("{}/Packages.gz", dir), Compression::Gzip),
-        (format!("{}/Packages.xz", dir), Compression::Xz),
-        (format!("{}/Packages", dir), Compression::None),
+    let rel_dir = format!("{}/binary-{}", cfg.component, cfg.arch);
+    let candidates: [(String, String, Compression); 3] = [
+        (
+            format!("{}/Packages.gz", dir),
+            format!("{}/Packages.gz", rel_dir),
+            Compression::Gzip,
+        ),
+        (
+            format!("{}/Packages.xz", dir),
+            format!("{}/Packages.xz", rel_dir),
+            Compression::Xz,
+        ),
+        (
+            format!("{}/Packages", dir),
+            format!("{}/Packages", rel_dir),
+            Compression::None,
+        ),
     ];
 
     let mut saw_no_network = false;
     let mut last_decode_err: Option<AptOpError> = None;
+    let mut listed = 0usize;
 
-    for (url, comp) in candidates.iter() {
+    for (url, path, comp) in candidates.iter() {
+        let Some(entry) = release.sha256_for(path) else {
+            continue;
+        };
+        listed += 1;
         crate::info!(
             "apt: Get {}://{}{} [{}/{}/{}]",
             cfg.scheme(),
@@ -350,18 +801,17 @@ pub fn update() -> Result<usize, AptOpError> {
         );
         match cfg.fetch(url) {
             Ok(bytes) => {
-                // PHASE MARKER (heap-corruption #14 investigation): the body is
-                // fully downloaded at this point. If a crash appears BEFORE this
-                // line (only `net: downloaded ...` lines, no "fetched ... body"),
-                // the corruption is in the DOWNLOAD/TLS/virtio-DMA path; if it
-                // appears AFTER, it is in the decompress/parse path.
+                // 4. The signed Release is the authority for these bytes: check
+                // them BEFORE any decoding. A mismatch is fatal for the whole
+                // update (see the doc comment).
+                verify_index_body(path, &bytes, entry)?;
                 crate::info!(
                     "apt: fetched {} index body - decompressing...",
                     human_bytes(bytes.len() as u64)
                 );
-                // A successful download that fails to decode is no
-                // longer fatal for the whole update -- fall through and try the
-                // next index variant (different bytes AND a different decoder).
+                // A successful download that fails to *decode* is no longer fatal
+                // for the whole update: fall through and try the next index
+                // variant (different bytes AND a different decoder).
                 let index = match stream_parse_index(&bytes, *comp) {
                     Ok(index) => index,
                     Err(e) => {
@@ -383,6 +833,13 @@ pub fn update() -> Result<usize, AptOpError> {
                 // Try the next compression variant.
             }
         }
+    }
+
+    if listed == 0 {
+        verify_fail("index", "NoIndexEntry", &format!(" path={}", rel_dir));
+        return Err(AptOpError::NoIndexEntry {
+            path: format!("{}/Packages.gz", rel_dir),
+        });
     }
 
     if let Some(e) = last_decode_err {
@@ -487,6 +944,12 @@ fn stream_parse_index(bytes: &[u8], comp: Compression) -> Result<PackageIndex, A
 /// Resolve and install `name` (and its not-yet-installed dependencies) from the
 /// loaded index, returning the package names installed in dependency-first order.
 ///
+/// Every `.deb` is bound to the *signed* index before it is unpacked: the
+/// `SHA256:` and `Size:` of the stanza that supplied the `Filename:` are checked
+/// against the downloaded bytes (see [`verify_package_body`]). A stanza without a
+/// usable digest is refused, and so is any mismatch — the package is not parsed,
+/// not decompressed and not written to disk.
+///
 /// Requires [`update`] to have been run (else [`AptOpError::NoIndex`]). The plan
 /// is computed by [`resolve_install`] against a snapshot of the session
 /// installed-set; each planned package's `.deb` is then fetched from
@@ -501,9 +964,17 @@ pub fn install(name: &str) -> Result<Vec<String>, AptOpError> {
     // Snapshot the session installed-set for the resolver.
     let already = INSTALLED.lock().clone();
 
-    // Plan the transaction and capture (name, pool filename) for each package,
-    // holding the index lock only for this short, network-free span.
-    let targets: Vec<(String, String)> = {
+    // Plan the transaction and capture, for each package, the pool filename AND
+    // the digest the signed index declares for it — from the SAME record, so the
+    // URL and the digest can never come from different stanzas. The index lock is
+    // held only for this short, network-free span.
+    struct Target {
+        pkg: String,
+        filename: String,
+        sha256: Option<[u8; 32]>,
+        size: u64,
+    }
+    let targets: Vec<Target> = {
         let guard = INDEX.lock();
         let index = guard.as_ref().ok_or(AptOpError::NoIndex)?;
         let plan = resolve_install(index, name, &already).map_err(|e| match e {
@@ -514,7 +985,12 @@ pub fn install(name: &str) -> Result<Vec<String>, AptOpError> {
             // resolve_install yields real package names; get() should hit, but
             // fall back to provider resolution defensively.
             if let Some(rec) = index.get(pkg).or_else(|| index.get_provider(pkg)) {
-                t.push((rec.package().to_string(), rec.filename().to_string()));
+                t.push(Target {
+                    pkg: rec.package().to_string(),
+                    filename: rec.filename().to_string(),
+                    sha256: rec.sha256(),
+                    size: rec.size(),
+                });
             }
         }
         t
@@ -522,7 +998,7 @@ pub fn install(name: &str) -> Result<Vec<String>, AptOpError> {
 
     let total = targets.len();
     if total > 0 {
-        let plan: Vec<&str> = targets.iter().map(|(p, _)| p.as_str()).collect();
+        let plan: Vec<&str> = targets.iter().map(|t| t.pkg.as_str()).collect();
         crate::info!(
             "apt: {} new package(s) to install: {}",
             total,
@@ -532,11 +1008,20 @@ pub fn install(name: &str) -> Result<Vec<String>, AptOpError> {
 
     let mut installed: Vec<String> = Vec::new();
 
-    for (i, (pkg, filename)) in targets.into_iter().enumerate() {
+    for (i, target) in targets.into_iter().enumerate() {
         let step = i + 1;
+        let pkg = target.pkg;
+        let filename = target.filename;
         if filename.is_empty() {
-            return Err(AptOpError::Download { pkg });
+            return Err(AptOpError::Download { pkg: pkg.clone() });
         }
+        // The payload is bound to the signed metadata through this digest. A
+        // stanza without one cannot be verified, so it is refused instead of
+        // installed on faith.
+        let Some(expected_digest) = target.sha256 else {
+            verify_fail("deb", "DigestUnavailable", &format!(" pkg={}", pkg));
+            return Err(AptOpError::DigestUnavailable { pkg });
+        };
         let url = format!("{}/{}", cfg.base, filename);
         crate::info!(
             "apt: [{}/{}] Get {} <- {}://{}{}",
@@ -553,6 +1038,11 @@ pub fn install(name: &str) -> Result<Vec<String>, AptOpError> {
             _ => AptOpError::Download { pkg: pkg.clone() },
         })?;
         let dl = bytes.len();
+
+        // Signature -> Release -> Packages -> .deb: the digest from the signed
+        // index is checked BEFORE the payload is parsed, decompressed or written
+        // to ext2. Nothing below this line sees unverified bytes.
+        verify_package_body(&pkg, &bytes, &expected_digest, target.size)?;
 
         let members = deb::parse_ar(&bytes).map_err(|_| AptOpError::Parse { pkg: pkg.clone() })?;
         let deb_members =

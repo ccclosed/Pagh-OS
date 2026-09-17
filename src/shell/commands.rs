@@ -1229,8 +1229,15 @@ fn apt_usage() {
         "             https: server certificate verified (chain/SAN/expiry/CertificateVerify)",
     );
     shell_println(
-        "             WARNING: repository metadata signatures and package digests are not verified",
+        "             metadata: InRelease/Release.gpg verified against the pinned Debian keys",
     );
+    shell_println(
+        "                       (subkey binding, expiry/revocation, 2025 clock gate); Packages and",
+    );
+    shell_println(
+        "                       each .deb are checked against the signed SHA-256 before use",
+    );
+    shell_println("             an unsigned mirror is REFUSED; there is no 'continue anyway' flag");
 }
 
 /// `apt update`: refresh the in-RAM package index.
@@ -1243,6 +1250,9 @@ fn cmd_apt_update() {
     } else {
         shell_println("apt: HTTP transport: the mirror is NOT authenticated (cleartext)");
     }
+    shell_println(
+        "apt: metadata will be verified against the pinned Debian archive keys (InRelease/Release.gpg)",
+    );
     shell_println(&alloc::format!(
         "apt: updating from {}://{}:{}{} ({}/{}/{})",
         cfg.scheme(),

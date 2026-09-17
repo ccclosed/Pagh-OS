@@ -30,14 +30,16 @@ Delete `disk.img` to re-provision from scratch.
 ## Index decode robustness
 
 `apt update` tries the `Packages.gz`, `Packages.xz`, and plain `Packages` variants in
-order. A decode failure in one variant (e.g. a corrupt gzip stream) logs an honest
+order — but only those the signed `Release` lists, with the digest and size it declares.
+A decode failure in one variant (e.g. a corrupt gzip stream) logs an honest
 `deb:`/`apt:` diagnostic on serial and falls through to the next variant instead of
-aborting. Package payloads unpack with tar symlinks/hardlinks materialized as file
+aborting; a **digest or size mismatch** does not fall through — it aborts the update,
+because a mismatch means the mirror served bytes that differ from the signed metadata. Package payloads unpack with tar symlinks/hardlinks materialized as file
 copies, since the ext2 writer has no symlink support.
 
 ## Trust status
 
-DNS, HTTP/HTTPS, package-index parsing, dependency resolution, `.deb` decompression and ext2 installation are implemented. HTTPS authenticates the mirror fail-closed: the server chain must reach the committed CA bundle (four pinned roots — ISRG Root X1/X2, GTS Root R1/R4), the leaf SAN must authorize the host, the 2025 clock gate must pass, and the TLS 1.3 `CertificateVerify` signature must check out; a handshake that omits the certificate is refused outright. Plain HTTP is unauthenticated by construction. Debian `InRelease` signature validation and package SHA-256 verification are still not implemented, and no warning is printed before network use any more — what remains unverified is stated in `SECURITY.md`.
+DNS, HTTP/HTTPS, package-index parsing, dependency resolution, `.deb` decompression and ext2 installation are implemented. HTTPS authenticates the mirror fail-closed: the server chain must reach the committed CA bundle (four pinned roots — ISRG Root X1/X2, GTS Root R1/R4), the leaf SAN must authorize the host, the 2025 clock gate must pass, and the TLS 1.3 `CertificateVerify` signature must check out; a handshake that omits the certificate is refused outright. Plain HTTP is unauthenticated as a transport, but it no longer decides what pagh trusts: `apt update` verifies `InRelease`/`Release.gpg` against the pinned Debian keys, checks the `Packages` digest **and** size from the signed `Release` before parsing it, and `apt install` checks each `.deb` digest **and** size from the signed index before unpacking it. A mirror that serves no signatures is refused outright (no override flag exists). Deployment consequences: the local mini-repo used by the E2E harnesses must be signed with the test anchor, and a mirror that is not signed by one of the pinned Debian keys is unusable by design; what remains unverified (revocation distribution, replay of a whole old triplet on suites without `Valid-Until`, the index-free `pkg` command) is stated in `SECURITY.md`.
 
 For a fail-closed build:
 

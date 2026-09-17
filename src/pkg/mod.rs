@@ -61,3 +61,10 @@ pub mod openpgp_packet;
 /// reviewed deliberately; the kernel never fetches or updates keys at runtime.
 /// The apt trust chain consumes this table in the next PR of the series.
 pub mod openpgp_keys;
+
+/// Pure parser for a Debian `Release`/`InRelease` body (issue #32): the fields
+/// the apt trust chain policy-checks (`Suite`/`Codename`/`Date`/`Valid-Until`)
+/// and — the part that matters — the `SHA256:` section, so the `Packages` body
+/// can be bound to the signed metadata before it is parsed. `core` + `alloc`
+/// only — `#[path]`-included by `host-tests` (P54).
+pub mod release_file;
