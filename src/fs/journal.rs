@@ -12,9 +12,11 @@
 //! CRC32 over the logged data) immediately follows its data blocks. `commit`
 //! writes the log records and the commit record, **then** checkpoints the data
 //! to its final ext2 locations; the commit point is the durability of the
-//! commit record. `recover` scans the log from `tail` in `seq` order, replays
-//! committed transactions idempotently, and stops (discarding the rest) at the
-//! first uncommitted/corrupt transaction.
+//! commit record. `recover` scans the log from `tail` and replays only the
+//! records whose `seq` chains upward from the persisted `next_seq`
+//! ([`Journal::recover`] has the rule and why `head == tail` cannot decide it),
+//! idempotently, stopping at the first uncommitted, corrupt or out-of-order
+//! transaction.
 
 #![allow(dead_code)]
 
@@ -98,6 +100,17 @@ impl Journal {
     }
 
     /// Write an empty journal superblock into the reserved region (format).
+    ///
+    /// The **head of the ring is invalidated too**. The log outlives the
+    /// filesystem that owned it — nothing else ever clears it — and `recover`
+    /// starts every scan at `tail == 0`, which this format writes. Without the
+    /// zeroed slot a reformatted device still holds the previous
+    /// incarnation's first transaction: a descriptor whose `seq` is exactly the
+    /// `next_seq = 1` written here, so the chain check accepts it, its CRC
+    /// still matches, and its stale block images are replayed into the fresh
+    /// filesystem. `recover` stops at the first slot whose descriptor magic is
+    /// wrong, so clearing position 0 is enough; the rest of the ring stays
+    /// untouched because no scan can reach it from `tail`.
     pub fn format(dev: &dyn BlockDevice, area: JournalArea) -> Result<(), FsError> {
         let js = JournalSuper {
             magic: JNL_MAGIC,
@@ -110,7 +123,8 @@ impl Journal {
         };
         let mut buf = vec![0u8; BS];
         store_journal_super(&mut buf, &js);
-        write_block(dev, area.super_block, &buf)
+        write_block(dev, area.super_block, &buf)?;
+        write_block(dev, area.super_block + 1, &vec![0u8; BS])
     }
 
     /// Open the journal, reading and validating its superblock.
@@ -192,9 +206,10 @@ impl Journal {
             // A single descriptor cannot describe more than this many blocks.
             return Err(FsError::OutOfSpace);
         }
-        // Need count + 2 (descriptor + data + commit) log slots, and keep at
-        // least one spare slot so head == tail always means "empty" (recover
-        // relies on that disambiguation).
+        // Need count + 2 (descriptor + data + commit) log slots, and at least
+        // one spare on top of that: the free-space arithmetic below reads
+        // `head == tail` as "empty", so a record must never be able to fill the
+        // ring exactly.
         if (count as u64) + 3 > self.log_blocks {
             return Err(FsError::OutOfSpace);
         }
@@ -209,7 +224,19 @@ impl Journal {
             // (synchronously, before the head advances); reclaim the whole
             // log for this transaction instead of wrapping straight over
             // live records.
+            //
+            // The reclaimed `tail` has to be durable *before* the record below
+            // is written: a wrapped record starts at `head` and its blocks land
+            // on the oldest live record — precisely the slot the old on-disk
+            // `tail` named. A crash after the commit record but before the
+            // final `persist_super` would then leave an on-disk `tail` that no
+            // longer names a descriptor, `recover` would stop at it, and the
+            // committed transaction would be dropped: issue #35's window,
+            // reached through the ring instead of through the first commit
+            // after `format`.
             self.tail = self.head;
+            self.persist_super()?;
+            self.dev.flush().map_err(|_| FsError::IoError)?;
         }
 
         // Validate every target lies inside the ext2 region.

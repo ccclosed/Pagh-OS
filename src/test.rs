@@ -2816,6 +2816,97 @@ mod fs_prop_tests {
             "P22: re-recovery leaves the acknowledged state alone"
         );
     }
+
+    /// Property 23 (review of #35/#38): stale ring content can never be mistaken
+    /// for a live record — not after a reclaimed wrap, not after a reformat.
+    ///
+    /// Two directions, one per hole found while reviewing the seq-based liveness
+    /// rule:
+    ///
+    /// 1. **Reclaim + crash.** When the ring lacks room, `commit` drops the
+    ///    oldest live records (`tail = head` in memory) and then writes a record
+    ///    that wraps onto exactly the slot the old on-disk `tail` named. If that
+    ///    reclaimed tail were only persisted at the end of `commit`, a crash
+    ///    after the commit record would leave an on-disk `tail` pointing at a
+    ///    data block — recovery would stop there and drop the committed
+    ///    transaction. The reclaimed tail is made durable *before* the record is
+    ///    written, so both targets are replayed.
+    /// 2. **Format over a live ring.** `Journal::format` resets `next_seq` to 1
+    ///    and (by itself) leaves the ring intact; the previous incarnation's
+    ///    first record then carries `seq == 1`, satisfies the new chain check,
+    ///    and its stale images would be replayed into the fresh filesystem.
+    ///    `format` invalidates the head of the ring, so recovery replays nothing.
+    ///
+    /// **Validates: Requirements 10.6, 11.1, 11.3**
+    pub fn p23_stale_ring_cannot_resurrect_records() {
+        let fs_blocks = 16u64;
+        let log_blocks = 16u64;
+
+        // ── direction 1: reclaim, then a crash inside the wrapped commit ─────
+        let (dev, area) = make_journal(fs_blocks, log_blocks);
+        let mut j = Journal::open(dev.clone(), area).expect("open");
+        // Five single-target transactions fill the ring to head == 15, tail == 0,
+        // leaving free == 1: the next one has to reclaim.
+        for (i, target) in [2u64, 3, 4, 5, 6].iter().enumerate() {
+            let mut txn = j.begin();
+            j.log_block(&mut txn, *target, &filled(0x100 + i as u32));
+            j.commit(txn).expect("filling commit");
+        }
+        // Two targets: the durable reclaimed tail (1 write), descriptor + 2 data
+        // + commit record (4 more) land; both checkpoints and the final head
+        // advance are lost with the power.
+        let mut txn = j.begin();
+        j.log_block(&mut txn, 7, &filled(0x77));
+        j.log_block(&mut txn, 8, &filled(0x88));
+        dev.set_crash_after(5);
+        let _ = j.commit(txn);
+        dev.clear_crash();
+
+        let mut j2 = Journal::open(dev.clone(), area).expect("reopen after the reclaim crash");
+        let replayed = j2.recover().expect("recover after the reclaim crash");
+        assert_eq_kernel!(
+            replayed,
+            1,
+            "P23: a wrapped, committed transaction is replayed across a reclaim"
+        );
+        assert_kernel!(
+            dev.peek_block(7) == filled(0x77),
+            "P23: the wrapped transaction's first checkpoint is replayed"
+        );
+        assert_kernel!(
+            dev.peek_block(8) == filled(0x88),
+            "P23: the wrapped transaction's second checkpoint is replayed"
+        );
+
+        // ── direction 2: a reformat must not replay the previous ring ────────
+        let (dev, area) = make_journal(fs_blocks, log_blocks);
+        let mut j = Journal::open(dev.clone(), area).expect("open again");
+        let mut txn = j.begin();
+        j.log_block(&mut txn, 5, &filled(0xAA));
+        j.commit(txn).expect("commit before the reformat");
+        assert_kernel!(
+            dev.peek_block(5) == filled(0xAA),
+            "P23: pre-reformat state is checkpointed"
+        );
+
+        // Reformat the device, then let the fresh filesystem put its own content
+        // into the block the old incarnation had written. The old ring is still
+        // physically present beyond the journal superblock.
+        Journal::format(&*dev, area).expect("reformat");
+        dev.poke_block(5, &filled(0x55));
+
+        let mut j3 = Journal::open(dev.clone(), area).expect("reopen after the reformat");
+        let replayed = j3.recover().expect("recover after the reformat");
+        assert_eq_kernel!(
+            replayed,
+            0,
+            "P23: a reformatted journal replays nothing from the previous ring"
+        );
+        assert_kernel!(
+            dev.peek_block(5) == filled(0x55),
+            "P23: no stale image was written over the fresh filesystem"
+        );
+    }
 }
 
 // Property 18 (real-device variant, Task 5.4*): filesystem operation round-trip
@@ -3187,6 +3278,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "fs::journal recovery keys liveness off the persisted seq (Property 22)",
             fs_prop_tests::p22_recovery_keys_liveness_off_the_persisted_seq
+        ),
+        (
+            "fs::journal stale ring cannot resurrect records (Property 23)",
+            fs_prop_tests::p23_stale_ring_cannot_resurrect_records
         ),
         (
             "fs::ext2 operation round-trip on real device (Property 18)",
