@@ -21,15 +21,31 @@ static FAILED_CHECKS: AtomicU32 = AtomicU32::new(0);
 /// PMM was starved used to print `ok`).
 static SKIPPED_CHECKS: AtomicU32 = AtomicU32::new(0);
 
-/// Per-reason skip counts for the summary breakdown: `reason -> count`.
+/// Per-reason skip counts of the routine currently running: `reason -> count`.
+/// Cleared by [`reset_failures`] before each routine, so the `skip <routine>` line
+/// names that routine's own reasons.
 static SKIP_REASONS: crate::sync::spinlock::Spinlock<
+    alloc::collections::BTreeMap<&'static str, u32>,
+> = crate::sync::spinlock::Spinlock::new(alloc::collections::BTreeMap::new());
+
+/// Per-reason skip counts of the WHOLE run. Updated by every [`record_skip`] and
+/// deliberately NOT cleared by [`reset_failures`]: the summary is printed after the
+/// last routine's reset has already wiped the per-routine map, and without this
+/// accumulator the breakdown printed as an empty `()`.
+static SKIP_REASONS_TOTAL: crate::sync::spinlock::Spinlock<
     alloc::collections::BTreeMap<&'static str, u32>,
 > = crate::sync::spinlock::Spinlock::new(alloc::collections::BTreeMap::new());
 
 pub fn reset_failures() {
     FAILED_CHECKS.store(0, Ordering::Relaxed);
     SKIPPED_CHECKS.store(0, Ordering::Relaxed);
+    // Per-routine view only: the run-wide accumulator survives.
     SKIP_REASONS.lock().clear();
+}
+
+/// Clear the run-wide skip accumulator (once, at the start of `run_all`).
+pub fn reset_skip_totals() {
+    SKIP_REASONS_TOTAL.lock().clear();
 }
 
 pub fn failed_checks() -> u32 {
@@ -45,6 +61,7 @@ pub fn skipped_checks() -> u32 {
 pub fn record_skip(reason: &'static str) {
     SKIPPED_CHECKS.fetch_add(1, Ordering::Relaxed);
     *SKIP_REASONS.lock().entry(reason).or_insert(0) += 1;
+    *SKIP_REASONS_TOTAL.lock().entry(reason).or_insert(0) += 1;
 }
 
 /// `reason xN, reason2 xM` for the summary line (empty string when nothing was
@@ -53,6 +70,21 @@ pub fn skip_breakdown() -> alloc::string::String {
     use alloc::string::ToString;
     let mut out = alloc::string::String::new();
     for (reason, n) in SKIP_REASONS.lock().iter() {
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        out.push_str(reason);
+        out.push_str(" x");
+        out.push_str(&n.to_string());
+    }
+    out
+}
+
+/// `reason xN, reason2 xM` aggregated over the whole run (the summary line).
+pub fn skip_breakdown_total() -> alloc::string::String {
+    use alloc::string::ToString;
+    let mut out = alloc::string::String::new();
+    for (reason, n) in SKIP_REASONS_TOTAL.lock().iter() {
         if !out.is_empty() {
             out.push_str(", ");
         }
@@ -3507,6 +3539,7 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
 pub fn run_all() -> (usize, u32, u32) {
     let tests = all_tests();
     let frames_before = crate::memory::pmm::free_frames();
+    reset_skip_totals();
     crate::kprintln!("=== kernel self-test ({} routines) ===", tests.len());
     let mut total_failed = 0u32;
     let mut total_skipped = 0u32;
@@ -3555,7 +3588,7 @@ pub fn run_all() -> (usize, u32, u32) {
             tests.len(),
             total_failed,
             total_skipped,
-            skip_breakdown()
+            skip_breakdown_total()
         );
     } else {
         crate::kprintln!(
