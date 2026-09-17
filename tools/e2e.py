@@ -622,7 +622,7 @@ def stage_iso_root(elf: pathlib.Path, stage_dir: pathlib.Path, limine_dir: str) 
     places Limine looks)."""
     loader = limine.ensure(ROOT, pathlib.Path(limine_dir) if limine_dir else None)
     if not loader.is_file():
-        raise HarnessError("Limine loader unavailable (run: python tools/limine.py)")
+        raise HarnessError("Limine loader unavailable (run: python3 tools/limine.py)")
     shutil.rmtree(stage_dir, ignore_errors=True)
     (stage_dir / "EFI" / "BOOT").mkdir(parents=True)
     shutil.copy2(elf, stage_dir / "pagh.elf")
