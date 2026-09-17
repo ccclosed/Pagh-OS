@@ -54,7 +54,7 @@ pagh_require_pinned_toolchain() {
       echo "            add that line to ~/.bashrc to make it permanent."
       echo "         2. or build through the cross-platform driver, which"
       echo "            resolves the pinned toolchain itself:"
-      echo "              python tools/build.py run --release"
+      echo "              python3 tools/build.py run --release"
     } >&2
     exit 1
   fi

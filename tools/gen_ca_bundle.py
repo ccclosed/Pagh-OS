@@ -22,7 +22,7 @@ writes the raw module and then runs `rustfmt` over it — the committed
 artifact is the output of THIS pipeline (generate + rustfmt), so a plain
 regeneration must be byte-identical to what is committed.
 
-Usage: python tools/gen_ca_bundle.py
+Usage: python3 tools/gen_ca_bundle.py
 """
 
 import base64

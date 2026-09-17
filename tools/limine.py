@@ -16,9 +16,9 @@ An explicit version can still be requested with ``--version`` (or the
 hard-pinned.
 
 Usage:
-    python tools/limine.py                # ensure + print the loader path
-    python tools/limine.py --dir limine/  # install destination override
-    python tools/limine.py --version 12.7.0
+    python3 tools/limine.py                # ensure + print the loader path
+    python3 tools/limine.py --dir limine/  # install destination override
+    python3 tools/limine.py --version 12.7.0
 
 The resolved BOOTX64.EFI path goes to stdout (so batch/PowerShell callers
 can capture it); all progress chatter goes to stderr.
