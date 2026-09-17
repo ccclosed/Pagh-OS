@@ -29,7 +29,7 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
   реальный харнесс — `test::run_all()` из shell.
 - Дерево модулей: `arch, boot, debug, drivers, fs, log, memory, net, pkg, provision,
   security, shell, sync, task, test, vfs`; `selftest_lx` — под feature-гейтами
-  (`lx_selftest`/`lx_livetest`/`lx_bigindex`).
+  (`lx_selftest`/`lx_livetest`/`lx_bigindex`/`lx_tlsbig`).
 - Limine-запросы в секции `.requests`: `BASE_REVISION` (rev 2), `HHDM_REQUEST`,
   `MEMMAP_REQUEST`, `KERNEL_ADDR_REQUEST`, `FRAMEBUFFER_REQUEST`, `RSDP_REQUEST`.
 - Глобалы: `HHDM_OFFSET`, `KERNEL_BASE`, `KERNEL_SIZE` (заполняет `boot::start`).
@@ -84,7 +84,7 @@ Sinks: serial всегда, framebuffer условно. Гейты fb-зерка
   Зависит от `pkg::apt`, `vfs`, `scheduler::sleep_ticks`, `drivers` (клавиатура).
 
 ### `selftest_lx.rs` — Linux-совместимость selftests (feature-gated)
-Компилируется только под `lx_selftest`/`lx_livetest`/`lx_bigindex`.
+Компилируется только под `lx_selftest`/`lx_livetest`/`lx_bigindex`/`lx_tlsbig`.
 - `run()` — 13 проверок до включения прерываний: end-to-end запуск hand-assembled Linux ELF
   (write + exit_group), изоляция exit, ENOENT, arch_prctl/uname/tid, сохранность регистров
   через `linux_dispatch` (прямой вызов с `reentry_allowed = 0` — см. «Грабли» ниже),
@@ -92,8 +92,14 @@ Sinks: serial всегда, framebuffer условно. Гейты fb-зерка
   getcwd/chdir/dup/gettimeofday/getdents.
 - `run_post_net_checks()` — apt E2E через локальное мини-зеркало (`tools/mini_repo.py`) +
   HTTPS smoke (реальный TLS 1.3 GET на deb.debian.org).
-- `run_live_update_check()` (`lx_livetest`) — полный live `apt update` (HTTP, не HTTPS —
-  у embedded-tls детерминированный хэнг на больших стримах), assert count ≥ 50 000.
+- `run_live_update_check()` (`lx_livetest`) — полный live `apt update` **по HTTPS** (TLS 1.3;
+  зеркало из `apt::DEFAULT_MIRROR_HOST/BASE`; на cleartext-конфиге харнесс не стартует и
+  печатает FAIL, так что «случайный PASS по HTTP» невозможен), assert count ≥ 50 000.
+  Стойки на больших стримах нет — issue #19 опровергнут байт-трейсом (13 332 733 B одним
+  fetch'ем), см. `docs/issue-19-tls-large-stream.md`.
+- `run_tls_big_check()` (`lx_tlsbig`) — регресс-пин #19: один много-МБ HTTPS GET того же
+  `Packages.gz` ДО фаз decompress/parse (порог 4 MiB), печатает
+  `LXSELFTEST tls_big PASS (TLS 1.3; N bytes decrypted end to end)`.
 - `run_bigindex_check()` (`lx_bigindex`) — репро parse-краша #14; вариант in-RAM
   (`lx_bigindex_inram`) отделяет parse/heap от net/scheduler.
 Все проверки печатают `LXSELFTEST <name> PASS/FAIL` и возвращаются — паника в проверке

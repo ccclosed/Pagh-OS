@@ -86,4 +86,61 @@ record-слой) — этого диагностического канала у
 `src/net/tls.rs`, `src/net/tcp.rs`, `src/net/README.md`, `src/selftest_lx.rs`,
 `src/pkg/apt.rs`, `src/pkg/README.md`, `src/lib.rs`, `src/boot.rs`, `Cargo.toml`,
 `README.md`, `AGENTS.md`, `SECURITY.md`, `tools/README.md`,
-`tools/e2e_live_update.ps1`, `tools/e2e_tlsbig.script` (новый).
+`tools/e2e_live_update.ps1`, `tools/e2e_tlsbig.script` (новый),
+`src/README.md` (repair по finding t19-doc-1).
+
+## Независимая верификация (t19, 2026-09-17)
+
+Проверено заново своими прогонами и своими сверками тел (свежие ELF, свои
+serial-логи; сырые артефакты — `.cache/t19_evidence/`). Дерево в момент прогонов
+параллельно правили другие задачи, поэтому у каждого прогона свой sha256 ELF.
+
+| Прогон | Команда | ELF (нач.) | Ключевые строки | Время |
+|---|---|---|---|---|
+| `tls_big` #1 | `python3 tools/e2e.py shell --features lx_tlsbig --script tools/e2e_tlsbig.script --timeout 1000 --settle 30 --serial-log serial_t19_tlsbig_1.log` | `4611b4dec47010f5` | `stage=done … body=13332733 raw_in=13357100 read_polls=2215 pending_polls=471 bytes_per_s=1577091` → `LXSELFTEST tls_big PASS (TLS 1.3; 13332733 bytes decrypted end to end)`, **exit 0** | 69.7 s |
+| `tls_big` #2 (детерминизм) | то же, `--serial-log serial_t19_tlsbig_2.log` | тот же билд | `body=13332733 raw_in=13356809 read_polls=2464 pending_polls=757 bytes_per_s=1277816` → **PASS**, **exit 0** | ~65 s |
+| живой `apt update` по HTTPS | `python3 tools/e2e.py live-update --timeout 1800 --serial-log serial_t19_live.log` | `bf73be0951415513` | `apt: Get https://deb.debian.org/…/Packages.gz` → `stage=done … body=13332733` → `LIVE_APT_UPDATE: count=68825` → `.deb` по HTTPS `body=955316` → `compat pid=4 started … from '/mnt/usr/bin/busybox'` → `LXSELFTEST live_update PASS (index 68825 pkgs; installed 1; spawned busybox pid=4)`, **exit 0** | 74.2 s |
+| регресс `https_get` | `python3 tools/e2e.py local-mirror --serial-log serial_t19_httpsget.log` | — | `stage=done host=deb.debian.org path=/debian/dists/stable/Release body=138612` → `LXSELFTEST https_get PASS`, `apt_e2e PASS`, **exit 0** | ~40 s |
+| НЕГАТИВ (недоверенная цепочка) | локальный self-signed HTTPS-сервер на 10.0.2.2:8443 (SAN `deb.debian.org`, `10.0.2.2`), в госте `apt setmirror https://10.0.2.2:8443 /` + `apt update` | default-билд | `Package_Fetcher(tls): stage=verify cause=InvalidCertificate (chain: NoAnchor)` → `stage=tls:handshake … cause=Tls (handshake/record failure; no application data was exchanged)`; `stage=done host=10.0.2.2` — **0 вхождений** | ~50 s |
+
+Сверка тел (хост-сторона, независимо от гостя):
+`https://deb.debian.org/debian/dists/stable/main/binary-amd64/Packages.gz` →
+`Content-Length` = **13 332 733** = размер в `stage=done` у обоих прогонов `tls_big`
+и у живого прогона; sha256 тела
+`42c23aaca08e8225ed0449360724b92531952cbe4ce3bbf189298a7108f40a85`, 57 МБ после
+распаковки, **68 825** станзов → ровно столько же распарсил живой прогон
+(`count=68825`). `…/dists/stable/Release` → `Content-Length` = **138 612** = размер
+в `stage=done` у `https_get`. `.deb` busybox: 955 316 B по HTTPS.
+
+Итог: `LXSELFTEST tls_big PASS` дважды с N = 13 332 733 ≥ `TLS_BIG_MIN_BYTES`
+(4 194 304) — точка «~12 MiB» пройдена с запасом; живой путь идёт по HTTPS
+(1 × `apt: Get https://…Packages.gz`, 0 × `apt: Get http://…`), `TLS verifier
+refusals` = 0, строки `FAIL installed busybox binary not found` нет (ассерт на
+`/mnt/usr/bin/busybox`, бинарь реально запущен); негативный кейс с недоверенной
+цепочкой отклонён на `stage=verify` без обмена прикладными данными; `https_get`
+не деградировал. **Верификация: подтверждаю.**
+
+Замечания верификатора (не блокируют подтверждение, требуют правки до закрытия #19):
+
+1. **finding (doc):** `src/README.md:98` всё ещё утверждает «`run_live_update_check()`
+   (`lx_livetest`) — полный live `apt update` (**HTTP, не HTTPS — у embedded-tls
+   детерминированный хэнг на больших стримах**)» — ровно тот устаревший тезис,
+   который #19 опровергает; там же (строка 91) список feature-гейтов не упоминает
+   `lx_tlsbig`. Три файла из задания (root `README.md`, `SECURITY.md`,
+   `src/net/README.md`) чисты. Замена: «полный live `apt update` по HTTPS (TLS 1.3;
+   cleartext-конфиг — FAIL), assert count ≥ 50 000» + `lx_tlsbig` в списке гейтов.
+   **Исправлено** этим (repair) коммитом ветки `net/tls-large-stream`: `src/README.md`
+   теперь говорит «полный live `apt update` по HTTPS (TLS 1.3; cleartext-конфиг — FAIL)»,
+   `lx_tlsbig` добавлен в ОБА списка feature-гейтов (`lib.rs`-карта, строка 32, и раздел
+   `selftest_lx.rs`), а `run_tls_big_check()` описан как регресс-пин #19.
+2. **ограничение:** `tls_big` логирует только длину тела — ни хеша, ни явной
+   сверки с `Content-Length`. Сейчас целостность подтверждается косвенно: длина ==
+   независимо снятому `Content-Length`, а в живом прогоне ещё и распаковкой +
+   парсингом (68 825 станзов). Полезно добавить в `stage=done` хеш тела (или явную
+   сверку с `Content-Length`), чтобы «докатилось» и «целостно» различались внутри гостя.
+3. **ограничение:** `tools/mini_repo.py` не умеет TLS (ни `ssl`, ни сертификата), а
+   якоря доверия ядра запинованы на 4 реальных корня — поэтому «локальный
+   позитивный multi-MB HTTPS GET» на этом дереве неконструируем; локальный
+   HTTPS-сервер может служить только негативным кейсом (что и сделано). Позитивный
+   multi-MB кейс идёт против реального зеркала — для #19 это строже тестового CA,
+   но требует сети.
