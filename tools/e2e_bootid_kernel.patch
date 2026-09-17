@@ -1,0 +1,30 @@
+diff --git a/src/boot.rs b/src/boot.rs
+index 9ca70c9..cde9e7d 100644
+--- a/src/boot.rs
++++ b/src/boot.rs
+@@ -67,10 +67,25 @@ pub fn start() -> ! {
+     kernel_main();
+ }
+ 
++/// Boot-identity marker for the E2E driver (`tools/e2e.py`).
++///
++/// The driver overwrites this exact fixed-length (28-byte) placeholder inside its
++/// STAGED ELF copy with a per-run tag and requires the tag back on serial, which
++/// proves the guest executed the staged image and not a stale kernel booted from
++/// another device. Behaviour is otherwise identical to any other startup log line.
++///
++/// INVARIANT: `[BOOTID]` is part of the serial regression surface (see
++/// `AGENTS.md` → Conventions) — never rename or reflow the marker, and keep the
++/// placeholder length unchanged (the driver patches it in place).
++pub const BOOT_ID: &str = "PAGH-BOOTID-0000000000000000";
++
+ /// Step 1: bring up the COM1 serial port (the primary log sink).
+ fn init_serial() {
+     drivers::serial::init();
+     info!("serial");
++    // Printed first, right after the UART is up, so the tag survives even if a
++    // later boot phase fails.
++    info!("[BOOTID] {}", BOOT_ID);
+ }
+ 
+ /// Step 2: verify Limine handed us a base revision we support.
