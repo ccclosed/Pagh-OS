@@ -32,8 +32,10 @@ Delete `disk.img` to re-provision from scratch.
 `apt update` tries the `Packages.gz`, `Packages.xz`, and plain `Packages` variants in
 order. A decode failure in one variant (e.g. a corrupt gzip stream) logs an honest
 `deb:`/`apt:` diagnostic on serial and falls through to the next variant instead of
-aborting. Package payloads unpack with tar symlinks/hardlinks materialized as file
-copies, since the ext2 writer has no symlink support.
+aborting. Package payloads unpack with tar symlinks and hardlinks **created as real
+links**: symlink inodes and shared inodes through the ext2 writer (issue #18), with
+the `tar` `'1'`/`'2'`/GNU-long-name/pax-prefix forms parsed and no silent
+truncation of paths over 100 bytes.
 
 ## Trust status
 

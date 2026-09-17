@@ -134,8 +134,12 @@ kernel-e2e-legacy -> tools/e2e_*.ps1         # Windows-only legacy harnesses (ne
    compiled-out (and boot-unchanged) when unset. TLS is fail-closed: the
    handshake aborts unless the chain validates against the committed CA
    bundle, the SAN authorizes the host, the clock gate passes, and the
-   `CertificateVerify` signature checks out; repository metadata signatures
-   are still unverified — see `SECURITY.md`.
+   `CertificateVerify` signature checks out. `apt` also verifies what it installs:
+   `InRelease`/`Release.gpg` against the pinned Debian keyring, then the `Packages`
+   digest **and** size from the signed `Release`, then each `.deb` digest **and**
+   size from the signed index; what remains unverified (revocation distribution,
+   replay of a whole old triplet on suites without `Valid-Until`, the index-free
+   `pkg` command) is named in `SECURITY.md`.
 10. **Unsafe policy**: every `unsafe {` in `src/security/`,
     `arch/x86_64/linux/mod.rs`, `memory/vmm.rs`, `net/tls.rs`, `pkg/apt.rs`
     needs a `SAFETY:` comment within the previous 6 lines
