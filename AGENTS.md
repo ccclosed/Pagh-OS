@@ -17,19 +17,25 @@ Read in this order; do not rely on memory over these files:
 | `CONTRIBUTING.md` | Human-facing contributor guide (RU) |
 | `tools/README.md` | Build/test/E2E tooling reference |
 
-## Commands (all four must be green before you push)
+## Commands (all six must be green before you push)
 
 ```sh
-cargo build                              # debug kernel (libpagh.a)
-python tools/build.py build --release    # release kernel + link (CI parity)
-cargo fmt --all -- --check               # formatting gate
-python tools/check_safety.py             # unsafe-policy gate
-python tools/host_tests.py               # host property tests (or: cd host-tests && cargo test)
+cargo fmt --all -- --check                  # formatting gate
+python3 tools/build.py build                # debug kernel + link (CI parity)
+python3 tools/build.py build --release      # release kernel + link
+python3 tools/host_tests.py                 # host property tests (or: cd host-tests && cargo test)
+python3 tools/check_safety.py               # unsafe-policy gate
+python3 tools/check_agents_md.py            # the claims in this file vs the tree
 ```
 
-CI (`.github/workflows/ci.yml`) runs exactly: fmt check, debug build, release
-build, host-tests, static-policy. CI is the arbiter — local green is
-necessary, not sufficient.
+CI (`.github/workflows/ci.yml`) runs exactly these six, one job each. CI is the
+arbiter — local green is necessary, not sufficient. The block is a *set*, not a
+suggestion: `tools/check_agents_md.py` compares it with the `run:` steps of the
+workflow in both directions, so a gate that CI runs and this block omits (or the
+other way round) fails. For a faster inner loop, `cargo build` alone builds the
+debug library; `tools/build.py build` additionally links and stages. To see the
+claim gate prove itself, run it with `--probe`: it breaks each class of claim in
+a scratch copy and requires a finding for every break.
 
 The kernel needs the pinned nightly (`rust-toolchain.toml`) with `rust-src`
 (build-std) and `rust-lld`; it links via `linker.ld` into `pagh.elf`. On
@@ -38,6 +44,23 @@ Windows use `run.cmd build|run`; on Linux `./build.sh` / `./run.sh`.
 commit them. The Limine loader is version-agnostic: any `limine*/` tree is
 git-ignored; `tools/limine.py` finds it (or auto-downloads the latest binary
 release into `limine/`) — do not hard-code Limine versions in scripts.
+
+## Canonical entry points
+
+One role, one current path — the one CI, the docs and a fresh checkout should
+use. A `-legacy` companion is kept for parity on another OS and is **not** run
+here. Which row is current is a statement about the repository, not something a
+gate can infer from the filesystem — so it is written down, and
+`tools/check_agents_md.py` checks the table: every path exists, a `-legacy` row
+has its canonical counterpart, names a different file and says why it is legacy.
+
+```text
+kernel-build      -> tools/build.py          # builder: cargo + linker + stage (debug/release)
+kernel-run        -> run.sh                  # Linux/QEMU launcher (build.sh = toolchain guard)
+kernel-run-legacy -> run.cmd                 # Windows-only legacy launcher (run.cmd build|run)
+kernel-e2e        -> tools/e2e.py            # in-guest E2E driver (Linux/CI, no pwsh)
+kernel-e2e-legacy -> tools/e2e_*.ps1         # Windows-only legacy harnesses (need pwsh), same scenarios
+```
 
 ## Repo layout
 
@@ -129,9 +152,12 @@ release into `limine/`) — do not hard-code Limine versions in scripts.
   `supported_set_is_exact` list in `abi.rs` must match `is_supported`.
 - **Kernel-internal state → in-QEMU selftests** (`src/test.rs`, run via the
   `selftest` shell command; non-destructive, deterministic XorShift seeds).
-- **Linux-compat end-to-end → `selftest_lx`** (feature-gated harnesses) and
-  the `tools/e2e_*.ps1` scripts (local mini-repo, live apt update, bigindex
-  repro).
+- **Linux-compat end-to-end → `selftest_lx`** (feature-gated harnesses) plus the
+  in-guest driver `tools/e2e.py` (modes `selftest`, `local-mirror`, `live-update`,
+  `bigindex`, `shell`): local mini-repo, live apt update, bigindex repro,
+  multi-MB TLS stream via `lx_tlsbig`. The `tools/e2e_*.ps1` harnesses are the
+  Windows-only legacy equivalents of the same scenarios — see *Canonical entry
+  points*; new work goes into `tools/e2e.py` (Linux and CI can run it).
 - A regression fix without a test is not done. New pure module without a
   property is suspicious.
 
