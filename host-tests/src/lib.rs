@@ -218,6 +218,14 @@ pub mod ca_bundle;
 #[path = "../../src/net/tls_auth.rs"]
 pub mod tls_auth;
 
+// `seed` is the pure `AT_RANDOM` fallback mixer (issue #16): a SHA-256
+// transcript over independent boot-time sources plus a counter-based derivation.
+// `core` + `sha2` only (no I/O, no globals), so P51 exercises the exact source
+// the kernel compiles — and can prove that the properties bite by running the
+// same checks against the REMOVED xorshift and against degenerate mixers.
+#[path = "../../src/security/seed.rs"]
+pub mod seed;
+
 // `format_policy` decides whether boot may format a block device (issue #33).
 // Pure `core`, no I/O by design: `boot::init_fs` probes the device and feeds the
 // bytes in, so P50 asserts the decision itself against real GPT/MBR/ext2 boot
@@ -295,6 +303,10 @@ mod properties {
     // Boot-time device safety (issue #33): only a genuinely blank device is
     // formatted; GPT/MBR/foreign/ext2-like layouts are refused.
     mod p50;
+    // AT_RANDOM fallback mixer (issue #16): avalanche/secret-separation/attack
+    // properties, with the removed xorshift and degenerate mixers as negative
+    // controls.
+    mod p51;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the

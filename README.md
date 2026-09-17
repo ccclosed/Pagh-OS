@@ -599,7 +599,8 @@ src/
 │   ├── elf.rs          # ELF64 validation + PT_LOAD loading (native + Linux static/PIE)
 │   └── elf_classify.rs # pure ELF classifier + static-PIE load-bias selection
 ├── security/
-│   └── entropy.rs      # hardware-backed, fail-closed entropy (RDSEED/RDRAND)
+│   ├── entropy.rs      # hardware-backed, fail-closed entropy (RDSEED/RDRAND)
+│   └── seed.rs         # pure SHA-256 mixer for the AT_RANDOM fallback (issue #16)
 └── debug/
     ├── mod.rs          # debug entry points (panic-time helpers)
     └── unwind.rs       # heap-free RBP-chain stack trace for panics

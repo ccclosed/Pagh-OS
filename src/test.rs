@@ -3332,6 +3332,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             "shell::path/listing format behaviors (unit)",
             shell_prop_tests::unit_path_and_listing_format
         ),
+        (
+            "entropy::AT_RANDOM blocks distinct and non-degenerate (issue #16)",
+            at_random_tests::blocks_are_distinct_and_mixed
+        ),
     ]
 }
 
@@ -4140,6 +4144,87 @@ mod shell_prop_tests {
         assert_kernel!(
             alloc::format!("{}/", dir_name) == "subdir/",
             "listing: directory entry formats with a trailing '/'"
+        );
+    }
+}
+
+// ============================================================================
+// entropy::AT_RANDOM (issue #16) — in-kernel liveness/regression check
+// ============================================================================
+//
+// The *statistical* proof that the fallback block is not a function of the
+// observable inputs (tick clock, pid, RTC) lives in the host property tests
+// (`host-tests/src/properties/p51.rs`), which drive `security::seed` directly.
+// This routine is the in-QEMU counterpart: it exercises the REAL effectful path
+// (`misc::random_bytes_16` → RDSEED/RDRAND or `entropy::mixed_fill`) on whatever
+// CPU the run happens to have, and fails if that path ever hands out a constant,
+// a repeat, or an all-zero block.
+//
+// It is the reason a `-cpu qemu64` run (no RDSEED/RDRAND — exactly where the old
+// xorshift fallback lived) is meaningful evidence: the digest printed here is
+// taken over 64 consecutive blocks, so two such boots can be compared from the
+// host. A degraded boot also prints the `stage=degraded` entropy warning.
+//
+// NON-DESTRUCTIVE: the only state touched is the entropy sequence counter, which
+// is monotonic by design (consuming samples cannot break anything).
+mod at_random_tests {
+    use crate::security::seed::SeedPool;
+
+    /// Blocks sampled per run. 64 keeps the check cheap while collisions of a
+    /// 128-bit block would still be ~1e-34.
+    const BLOCKS: usize = 64;
+
+    /// `random_bytes_16` must never hand out a constant, a repeat, or an all-zero
+    /// / all-ones block — on a CPU with RDSEED/RDRAND *and* on one without.
+    pub fn blocks_are_distinct_and_mixed() {
+        let mut seen: alloc::vec::Vec<[u8; 16]> = alloc::vec::Vec::with_capacity(BLOCKS);
+        let mut pool = SeedPool::new();
+        for _ in 0..BLOCKS {
+            let block = crate::arch::x86_64::linux::misc::random_bytes_16();
+            assert_kernel!(
+                block != [0u8; 16],
+                "at_random: all-zero AT_RANDOM block (constant canary)"
+            );
+            assert_kernel!(block != [0xFFu8; 16], "at_random: all-ones AT_RANDOM block");
+            assert_kernel!(
+                !seen.contains(&block),
+                "at_random: repeated AT_RANDOM block within one boot"
+            );
+            pool.absorb_bytes(b"block", &block);
+            seen.push(block);
+        }
+        assert_kernel!(
+            seen.len() == BLOCKS,
+            "at_random: sampled the expected number of blocks"
+        );
+
+        // One digest line per run: comparable across boots from the host side
+        // (and safe to print — it is one-way over 64 blocks).
+        let digest = pool.finish();
+        let mut hex = alloc::string::String::with_capacity(16);
+        for byte in digest.iter().take(8) {
+            hex.push_str(&alloc::format!("{:02x}", byte));
+        }
+        // The fingerprint depends ONLY on the boot seed (no counter, no
+        // observables): two degraded boots with different fingerprints provably
+        // collected different seeds, which is what the per-run `digest` above
+        // cannot show on its own (it also mixes in the tick clock).
+        let seed_fp = if crate::security::entropy::is_available() {
+            alloc::string::String::from("n/a (hardware entropy in use)")
+        } else {
+            let mut fp = alloc::string::String::with_capacity(16);
+            for byte in crate::security::entropy::boot_seed_fingerprint() {
+                fp.push_str(&alloc::format!("{:02x}", byte));
+            }
+            fp
+        };
+        crate::kprintln!(
+            "SELFTEST at_random: blocks={} distinct={} digest={} seed_fp={} entropy={}",
+            BLOCKS,
+            seen.len(),
+            hex,
+            seed_fp,
+            crate::security::entropy::capabilities_str()
         );
     }
 }
