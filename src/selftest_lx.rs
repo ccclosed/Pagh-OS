@@ -155,8 +155,18 @@ pub fn run_net_smoke() {
     );
 
     // A small, stable file on the default Debian mirror (served by Fastly over
-    // HTTPS). The Release index is a few KiB of text — quick to download over NAT.
-    match crate::net::tls::https_get("deb.debian.org", 443, "/debian/dists/stable/Release") {
+    // HTTPS). The Release index is a few hundred KiB of text — quick to download
+    // over NAT. Host/base come from the apt mirror constants (single source of
+    // truth for which mirror "the live one" is).
+    let release_path = alloc::format!(
+        "{}/dists/stable/Release",
+        crate::pkg::apt::DEFAULT_MIRROR_BASE
+    );
+    match crate::net::tls::https_get(
+        crate::pkg::apt::DEFAULT_MIRROR_HOST,
+        crate::net::tls::HTTPS_PORT,
+        &release_path,
+    ) {
         Ok(body) if !body.is_empty() => {
             crate::info!(
                 "LXSELFTEST https_get PASS (TLS 1.3 handshake OK; HTTP 200; {} body bytes decrypted)",
@@ -165,6 +175,94 @@ pub fn run_net_smoke() {
         }
         Ok(_) => fail(name, "HTTP 200 but empty body"),
         Err(e) => crate::error!("LXSELFTEST https_get FAIL {:?}", e),
+    }
+}
+
+/// Path of the large-stream regression object: the compressed `main` index that
+/// the live update fetches first (~13 MB — exactly the size class where issue #19
+/// reported a deterministic stall, so this check fails if a stall ever comes
+/// back). Built from the shared apt mirror constants.
+/// The cfg mirrors the spawn site in `boot.rs` exactly: with a broader live
+/// harness also enabled this check is never spawned, and compiling it in anyway
+/// would only add dead code.
+#[cfg(all(
+    feature = "lx_tlsbig",
+    not(any(feature = "lx_selftest", feature = "lx_livetest"))
+))]
+fn tls_big_path() -> alloc::string::String {
+    alloc::format!(
+        "{}/dists/stable/main/binary-amd64/Packages.gz",
+        crate::pkg::apt::DEFAULT_MIRROR_BASE
+    )
+}
+
+/// Smallest body that makes the check meaningful. Anything below this does not
+/// exercise a multi-MB stream (the #19 stall point was ~12 MiB), so a mirror that
+/// shrinks the file would fail the check rather than silently weaken it. See
+/// [`tls_big_path`] for why the cfg mirrors the `boot.rs` spawn site.
+#[cfg(all(
+    feature = "lx_tlsbig",
+    not(any(feature = "lx_selftest", feature = "lx_livetest"))
+))]
+const TLS_BIG_MIN_BYTES: usize = 4 * 1024 * 1024;
+
+/// Large-stream HTTPS regression check (cargo feature `lx_tlsbig`, issue #19).
+///
+/// One **multi-MB authenticated** `https_get` against the live mirror's full
+/// `Packages.gz`. It is deliberately the same object `apt update` fetches first
+/// and deliberately stops before the decompress/parse phases: it isolates the
+/// TLS transport (record reader + stepped pump + TCP receive window) from the
+/// index pipeline, so a failure here names the transport and nothing else.
+///
+/// Prints exactly one line: `LXSELFTEST tls_big PASS (bytes=N)` or
+/// `LXSELFTEST tls_big FAIL <detail>`. `https_get` returns only once the whole
+/// `Content-Length` body has been decrypted, so a PASS on a body of ≥
+/// [`TLS_BIG_MIN_BYTES`] is proof that a multi-MB stream completed end to end.
+/// See [`tls_big_path`] for why the cfg mirrors the `boot.rs` spawn site.
+#[cfg(all(
+    feature = "lx_tlsbig",
+    not(any(feature = "lx_selftest", feature = "lx_livetest"))
+))]
+pub fn run_tls_big_check() {
+    let name = "tls_big";
+
+    let deadline = scheduler::ticks() + WAIT_IFACE_TICKS;
+    while crate::net::ip_config().is_none() {
+        if scheduler::ticks() >= deadline {
+            fail(
+                name,
+                "no interface address within 60 s (DHCP/static fallback did not configure)",
+            );
+            return;
+        }
+        scheduler::sleep_ticks(10);
+    }
+
+    let path = tls_big_path();
+    crate::info!(
+        "LXSELFTEST tls_big: interface up, fetching {} over authenticated TLS 1.3 \
+         (multi-MB stream regression for issue #19) ...",
+        path
+    );
+
+    match crate::net::tls::https_get(
+        crate::pkg::apt::DEFAULT_MIRROR_HOST,
+        crate::net::tls::HTTPS_PORT,
+        &path,
+    ) {
+        Ok(body) if body.len() >= TLS_BIG_MIN_BYTES => {
+            crate::info!(
+                "LXSELFTEST tls_big PASS (TLS 1.3; {} bytes decrypted end to end)",
+                body.len()
+            );
+        }
+        Ok(body) => crate::error!(
+            "LXSELFTEST tls_big FAIL body {} bytes < {} - the mirror no longer serves a \
+             large index, or the transfer was truncated",
+            body.len(),
+            TLS_BIG_MIN_BYTES
+        ),
+        Err(e) => crate::error!("LXSELFTEST tls_big FAIL {:?}", e),
     }
 }
 
@@ -184,28 +282,34 @@ pub fn run_post_net_checks() {
     run_net_smoke();
 }
 
-/// Live full-update integration check against the real `deb.debian.org` mirror
+/// Live full-update integration check against the real official mirror
 /// (cargo feature `lx_livetest`; spec task 11.1).
 ///
 /// Spawned as a kernel thread from `boot::kernel_main` under the **dedicated**
 /// `lx_livetest` feature so it never runs in the normal kernel or the regular
-/// `lx_selftest` harness. It deliberately does NOT `set_mirror` to the local
-/// mini-repo, so the run starts from the DEFAULT apt configuration
-/// (`deb.debian.org` `/debian stable main amd64`) and then switches the transport
-/// to cleartext HTTP (see the `set_mirror` call and its WHY below — the large
-/// index download is what needs HTTP, not the trust story). It drives the full
-/// live update + install pipeline:
+/// `lx_selftest` harness. It points apt at the live mirror through the shared
+/// [`apt::DEFAULT_MIRROR_HOST`]/[`apt::DEFAULT_MIRROR_BASE`] constants — the
+/// same ones the default config uses — and **refuses to run over anything but
+/// the authenticated HTTPS transport**: the whole point of the harness is to
+/// prove the real `apt update` end to end over TLS (issue #19), so a downgraded
+/// transport is a FAIL, not a footnote. It drives the full live update + install
+/// pipeline:
 ///
 ///   1. wait for the interface to acquire an address (DHCP, then static fallback),
 ///   2. `apt::update()` against the live mirror; on `Ok(count)` log
 ///      `LIVE_APT_UPDATE: count=N` and assert `N >= 50_000` (R1.2). The
 ///      `apt: decompressed K KiB, parsed P packages...` lines emitted underneath
 ///      are the monotonic-progress evidence (R1.4/R3.2) and `apt: index loaded
-///      (N packages)` is the terminal no-hang outcome (R3.1),
+///      (N packages)` is the terminal no-hang outcome (R3.1). The index is
+///      ~13 MB of TLS record stream — the size class issue #19 reported as a
+///      deterministic stall,
 ///   3. report the Resident_Index_Footprint via [`apt::index_footprint`]
 ///      (R2.4/R6.2),
 ///   4. `apt::install("busybox-static")` then run it through the loader
-///      (R8.1–R8.3).
+///      (R8.1–R8.3). The assertion is on `/mnt/usr/bin/busybox` — the only
+///      binary member the .deb actually ships (`./usr/bin/busybox`, 2 MB) —
+///      not on a `/mnt/bin` symlink, which the installer cannot materialize
+///      (symlink members are a separate gap; see `pkg/README.md`).
 ///
 /// Prints `LXSELFTEST live_update PASS ...` on full success, or a single `FAIL`
 /// line naming the failing step (never hangs, never panics).
@@ -235,26 +339,32 @@ pub fn run_live_update_check() {
         scheduler::sleep_ticks(10);
     }
 
-    // Point apt at the cleartext HTTP mirror so the large index download uses
-    // `http_get` (which does NOT touch embedded-tls) rather than the HTTPS path.
-    //
-    // WHY HTTP: embedded-tls deterministically hangs at ~12 MiB on large streams
-    // (the read() future stops returning to our executor, so our transport is
-    // never re-entered and no timeout can fire) — a library limitation, not a trust
-    // decision, and it applies to the authenticated HTTPS path exactly as it did
-    // to the old unverified one. Repository metadata signatures and package
-    // digests are still unverified on EITHER transport, so plain HTTP is the
-    // honest, working way to COMPLETE a live full update from the official Debian
-    // mirror; the authenticated HTTPS path itself is covered end-to-end by
-    // `run_net_smoke` (small file) above. http://deb.debian.org/debian sets
-    // tls=false, port=80, base=/debian.
-    crate::pkg::apt::set_mirror("http://deb.debian.org", Some("/debian"));
+    // Pin the live mirror explicitly, in the ONE place that names it
+    // ([`apt::DEFAULT_MIRROR_HOST`]/[`apt::DEFAULT_MIRROR_BASE`]) and WITHOUT a
+    // scheme prefix, so the transport stays whatever the default config says.
+    // The assertion right below turns "the live path silently ran cleartext"
+    // from a footnote into a FAIL: this harness exists to prove the
+    // AUTHENTICATED path end to end (issue #19), so a downgraded transport must
+    // never report PASS.
+    crate::pkg::apt::set_mirror(
+        crate::pkg::apt::DEFAULT_MIRROR_HOST,
+        Some(crate::pkg::apt::DEFAULT_MIRROR_BASE),
+    );
+    let cfg = crate::pkg::apt::config();
+    if !cfg.tls || cfg.port != crate::net::tls::HTTPS_PORT {
+        fail(
+            name,
+            "live harness must run over HTTPS (the authenticated transport); \
+             the active apt config is cleartext",
+        );
+        return;
+    }
 
     // Confirm the active mirror config and log it so the serial record is
-    // unambiguous (now updating over HTTP, not HTTPS).
-    let cfg = crate::pkg::apt::config();
+    // unambiguous (this run is a live HTTPS update).
     crate::info!(
-        "LXSELFTEST live_update: interface up, updating over http against {}://{}{} ({} {} {})",
+        "LXSELFTEST live_update: interface up, updating over {} against {}://{}{} ({} {} {})",
+        cfg.scheme(),
         cfg.scheme(),
         cfg.host,
         cfg.base,
@@ -304,9 +414,15 @@ pub fn run_live_update_check() {
     };
     crate::info!("LXSELFTEST live_update: installed {:?}", installed);
 
-    // busybox-static ships its binary at /bin/busybox; it was written onto ext2
-    // under /mnt by the installer.
-    let bin_path = "/mnt/bin/busybox";
+    // The .deb's ONLY binary member is `./usr/bin/busybox` (2 024 544 bytes; the
+    // package ships no `/bin/busybox` and no symlink member), so that is the path
+    // the installer writes under `/mnt`. Checking a `/mnt/bin` symlink instead —
+    // what this harness used to do — can never succeed: symlink members are not
+    // materialized (a separate, documented installer gap), and the check would
+    // stay red for a reason that has nothing to do with the transport. A missing
+    // or empty binary is still a FAIL; the assertion is on the real member, not
+    // weakened to "maybe somewhere".
+    let bin_path = "/mnt/usr/bin/busybox";
     match vfs::lookup_path(bin_path) {
         Ok(node) if !node.is_directory() && node.size() > 0 => {}
         Ok(_) => {
@@ -314,7 +430,10 @@ pub fn run_live_update_check() {
             return;
         }
         Err(_) => {
-            fail(name, "installed busybox binary not found under /mnt/bin");
+            fail(
+                name,
+                "installed busybox binary not found at /mnt/usr/bin/busybox",
+            );
             return;
         }
     }
