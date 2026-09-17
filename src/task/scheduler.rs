@@ -153,6 +153,11 @@ pub fn is_stopped(pid: u64) -> bool {
 /// Park a task's just-saved frame: validate + stamp it, then move it out of
 /// rotation into [`STOPPED_TASKS`].
 fn park_stopped(pid: u64, rsp: u64, cr3: u64) {
+    // The request that led here — and any request still queued for a task whose
+    // frame another caller parked first (`stop_ready_pids`) — is satisfied by this
+    // park: drop it, or the leftover would re-park the task at its next tick AFTER
+    // a SIGCONT resumed it (the task then looks stopped while it is running).
+    STOP_REQUESTED.lock().remove(&pid);
     check_frame("park-stopped", pid, rsp);
     stamp_save(pid, rsp);
     STOPPED_TASKS.lock().insert(pid, (rsp, cr3));
@@ -191,6 +196,10 @@ pub fn stop_ready_pids(pids: &[u64]) -> usize {
 /// validated by the ordinary `requeue`. Returns `false` when `pid` was not parked
 /// (nothing to resume), so a `SIGCONT` to a running process is a no-op.
 pub fn resume_stopped(pid: u64) -> bool {
+    // A resumed task is not stopped: a stop request that has not been honoured yet
+    // must not park it at the next tick (POSIX: SIGCONT discards pending stop
+    // signals).
+    STOP_REQUESTED.lock().remove(&pid);
     let Some((rsp, cr3)) = STOPPED_TASKS.lock().remove(&pid) else {
         return false;
     };

@@ -604,7 +604,13 @@ pub fn pick_pending_signal() -> Option<(u64, SignalAction, u64, SigAltStack)> {
     if deliverable == 0 {
         return None;
     }
-    let sig = deliverable.trailing_zeros() as u64;
+    // `sigbit(N)` is `1 << (N - 1)`, so the signal number is the index of the
+    // lowest set bit PLUS ONE. Without the +1 this delivered signal N-1 with
+    // N-1's disposition (the real bit stayed pending and was re-picked on every
+    // syscall return), and a pending SIGHUP underflowed `sig - 1` into an
+    // out-of-bounds disposition-table index — a kernel panic (`panic = "abort"`)
+    // on an ordinary self-signal.
+    let sig = deliverable.trailing_zeros() as u64 + 1;
     cs.sig_pending &= !(1u64 << (sig - 1));
     let action = cs.sig.lock().handlers[(sig - 1) as usize];
     Some((sig, action, cs.sig_blocked, cs.sig_altstack))
