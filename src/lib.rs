@@ -26,12 +26,13 @@ mod pkg;
 mod provision;
 mod security;
 /// Boot-time Linux-compat self-test harness, compiled only under the
-/// `lx_selftest`, `lx_livetest`, or `lx_bigindex` cargo features so the default
-/// build/boot is unchanged.
+/// `lx_selftest`, `lx_livetest`, `lx_bigindex`, or `lx_tlsbig` cargo features so
+/// the default build/boot is unchanged.
 #[cfg(any(
     feature = "lx_selftest",
     feature = "lx_livetest",
-    feature = "lx_bigindex"
+    feature = "lx_bigindex",
+    feature = "lx_tlsbig"
 ))]
 mod selftest_lx;
 mod shell;

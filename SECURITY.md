@@ -15,7 +15,7 @@ The development build enables outbound package downloads through the default `ne
 The bundle trusts exactly four self-signed roots: **ISRG Root X1**, **ISRG Root X2**, **GTS Root R1**, and **GTS Root R4** (each selected by a sha256 pin in `tools/gen_ca_bundle.py`). Consequences:
 
 * An HTTPS mirror whose chain does not reach one of those four roots is **refused** (`ChainError::NoAnchor`), even if the certificate is otherwise perfectly valid and issued by a widely trusted CA. Adding a root means deliberately re-running the generator with a reviewed pin and committing the regenerated `src/net/ca_bundle.rs`.
-* Plain-HTTP mirrors (`apt setmirror http://…`, and the live-update harness) are **unauthenticated by construction**: cleartext, no certificate to check. Metadata/digest verification below is what would have to carry that path, and it is not implemented.
+* Plain-HTTP mirrors (`apt setmirror http://…`) are **unauthenticated by construction**: cleartext, no certificate to check. Metadata/digest verification below is what would have to carry such a path, and it is not implemented. It is no longer the live default: `deb.debian.org` is reached over HTTPS, large indexes included, and the `lx_livetest` harness refuses to run on a cleartext config (issue #19).
 * Certificate **revocation is not checked** (no CRL, no OCSP, no stapling): a certificate that its issuer has revoked but that is still inside its validity window is accepted.
 
 ### What is still not verified
