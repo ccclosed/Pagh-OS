@@ -360,6 +360,248 @@ pub fn run_live_update_check() {
 /// file was written, and the binary was enqueued; otherwise a single `FAIL` line
 /// naming the failing step (never hangs, never panics). The installed binary's
 /// `hello from apt` line appears separately on serial once the scheduler runs it.
+/// Trust-chain checks for the apt end-to-end harness (issue #32).
+///
+/// The local mirror (`tools/mini_repo.py`) serves five suites from one root, and
+/// this function walks them to prove the *positive* and the negative halves of
+/// the chain in one boot:
+///
+/// | suite            | served                                   | expected                |
+/// |------------------|------------------------------------------|-------------------------|
+/// | `stable`         | correct, signed by the anchored test key  | index loads             |
+/// | `tampered-index` | **valid signature**, tampered `Packages`  | `IndexMismatch`/Hash    |
+/// | `tampered-deb`   | correct metadata, tampered `.deb`         | install refused, nothing written |
+/// | `unsigned`       | no `InRelease`, no `Release.gpg`          | `Unsigned`              |
+/// | `untrusted`      | signed by a key that is not anchored      | `NoTrustedSignature`    |
+///
+/// The `tampered-index` case is the important one: the signature verifies, so
+/// only the SHA-256 binding from the signed `Release` to the `Packages` body can
+/// catch it. Every refusal must be an error — never a warning that still loads
+/// the index — and the tampered `.deb` must leave `/mnt` untouched.
+#[cfg(feature = "lx_selftest")]
+fn run_apt_verify_checks() -> bool {
+    use crate::pkg::apt::AptOpError;
+
+    let mut ok = true;
+
+    // (0) Positive control: a correctly signed suite must load. Without this the
+    // refusals below could all pass on a mirror that nothing can verify.
+    crate::pkg::apt::set_mirror("http://10.0.2.2:8000", Some("/"));
+    crate::pkg::apt::set_suite("stable");
+    match crate::pkg::apt::update() {
+        Ok(n) if n > 0 => {
+            crate::info!("LXSELFTEST apt_verify signed-suite PASS ({} packages)", n)
+        }
+        Ok(n) => {
+            ok = false;
+            crate::error!(
+                "LXSELFTEST apt_verify signed-suite FAIL: index held {} packages",
+                n
+            );
+        }
+        Err(e) => {
+            ok = false;
+            crate::error!("LXSELFTEST apt_verify signed-suite FAIL: {}", e.message());
+        }
+    }
+
+    // (1) A valid signature over a `Packages` file that was replaced afterwards.
+    crate::pkg::apt::set_suite("tampered-index");
+    match crate::pkg::apt::update() {
+        Err(AptOpError::IndexMismatch { .. }) => {
+            // A refusal must not leave the previous index behind: `apt install`
+            // would otherwise keep working on metadata that no longer verifies.
+            if crate::pkg::apt::has_index() {
+                ok = false;
+                crate::error!(
+                    "LXSELFTEST apt_verify tampered-index FAIL: the index was left published \
+                     after a refused update"
+                );
+            } else {
+                crate::info!(
+                    "LXSELFTEST apt_verify tampered-index PASS (signed Release vs served \
+                     Packages; index cleared)"
+                )
+            }
+        }
+        Err(e) => {
+            ok = false;
+            crate::error!(
+                "LXSELFTEST apt_verify tampered-index FAIL: wrong refusal: {}",
+                e.message()
+            );
+        }
+        Ok(n) => {
+            ok = false;
+            crate::error!(
+                "LXSELFTEST apt_verify tampered-index FAIL: update ACCEPTED {} packages from a \
+                 Packages file that does not match the signed Release",
+                n
+            );
+        }
+    }
+
+    // (2) A signature by a key that is not in the trust anchor.
+    crate::pkg::apt::set_suite("untrusted");
+    match crate::pkg::apt::update() {
+        Err(AptOpError::BadSignature { stage, cause }) => {
+            if stage == "signature"
+                && cause == "NoTrustedSignature"
+                && !crate::pkg::apt::has_index()
+            {
+                crate::info!(
+                    "LXSELFTEST apt_verify untrusted-key PASS (no trusted signature; index cleared)"
+                )
+            } else {
+                ok = false;
+                crate::error!(
+                    "LXSELFTEST apt_verify untrusted-key FAIL: refused for the wrong reason \
+                     (stage={} cause={})",
+                    stage,
+                    cause
+                );
+            }
+        }
+        Err(e) => {
+            ok = false;
+            crate::error!(
+                "LXSELFTEST apt_verify untrusted-key FAIL: wrong refusal: {}",
+                e.message()
+            );
+        }
+        Ok(n) => {
+            ok = false;
+            crate::error!(
+                "LXSELFTEST apt_verify untrusted-key FAIL: update ACCEPTED {} packages signed by \
+                 an unpinned key",
+                n
+            );
+        }
+    }
+
+    // (3) No signatures at all: a visible refusal, not silent trust.
+    crate::pkg::apt::set_suite("unsigned");
+    match crate::pkg::apt::update() {
+        Err(AptOpError::Unsigned { .. }) if !crate::pkg::apt::has_index() => {
+            crate::info!("LXSELFTEST apt_verify unsigned-mirror PASS (refused; index cleared)")
+        }
+        Err(AptOpError::Unsigned { .. }) => {
+            ok = false;
+            crate::error!(
+                "LXSELFTEST apt_verify unsigned-mirror FAIL: the index was left published"
+            );
+        }
+        Err(e) => {
+            ok = false;
+            crate::error!(
+                "LXSELFTEST apt_verify unsigned-mirror FAIL: wrong refusal: {}",
+                e.message()
+            );
+        }
+        Ok(n) => {
+            ok = false;
+            crate::error!(
+                "LXSELFTEST apt_verify unsigned-mirror FAIL: update ACCEPTED {} packages from an \
+                 unsigned mirror",
+                n
+            );
+        }
+    }
+
+    // (4) Correct, signed metadata, but the `.deb` served is not the one the
+    // signed index describes: the install must refuse it BEFORE writing anything.
+    crate::pkg::apt::set_suite("tampered-deb");
+    match crate::pkg::apt::update() {
+        Ok(n) if n > 0 => match crate::pkg::apt::install("hello-pagh") {
+            Err(AptOpError::DigestMismatch { .. }) => {
+                match vfs::lookup_path("/mnt/usr/bin/hello-pagh") {
+                    Err(_) => crate::info!(
+                    "LXSELFTEST apt_verify tampered-deb PASS (install refused before unpacking; \
+                     nothing written to /mnt; index kept, the metadata itself is valid)"
+                ),
+                    Ok(_) => {
+                        ok = false;
+                        crate::error!(
+                        "LXSELFTEST apt_verify tampered-deb FAIL: the tampered payload was written \
+                         to /mnt/usr/bin/hello-pagh"
+                    );
+                    }
+                }
+            }
+            Err(e) => {
+                ok = false;
+                crate::error!(
+                    "LXSELFTEST apt_verify tampered-deb FAIL: wrong refusal: {}",
+                    e.message()
+                );
+            }
+            Ok(v) => {
+                ok = false;
+                crate::error!(
+                    "LXSELFTEST apt_verify tampered-deb FAIL: installed {:?} from a payload that \
+                     does not match the signed index",
+                    v
+                );
+            }
+        },
+        Err(e) => {
+            ok = false;
+            crate::error!(
+                "LXSELFTEST apt_verify tampered-deb FAIL: the signed metadata should load, got: {}",
+                e.message()
+            );
+        }
+        Ok(_) => {
+            ok = false;
+            crate::error!("LXSELFTEST apt_verify tampered-deb FAIL: empty index");
+        }
+    }
+
+    // (5) Rollback to a complete, correctly signed OLDER triplet. Nothing in the
+    // chain can detect it: this suite carries no `Valid-Until`, and the `Date`
+    // check only rejects the future. It is a KNOWN GAP recorded in SECURITY.md,
+    // exercised here so the gap is demonstrated rather than assumed — hence a
+    // NOTE marker, not a PASS of a security property.
+    let version_before = crate::pkg::apt::show("hello-pagh").map(|p| p.version);
+    crate::pkg::apt::set_suite("stale");
+    match crate::pkg::apt::update() {
+        Ok(n) if n > 0 => {
+            let after = crate::pkg::apt::show("hello-pagh").map(|p| p.version);
+            crate::info!(
+                "LXSELFTEST apt_verify stale-rollback NOTE (accepted: {} -> {}; rollback is NOT \
+                 detected on a suite without Valid-Until - see SECURITY.md)",
+                version_before.unwrap_or_default(),
+                after.unwrap_or_default()
+            );
+        }
+        Err(e) => {
+            ok = false;
+            crate::error!(
+                "LXSELFTEST apt_verify stale-rollback FAIL: an older signed triplet should load \
+                 (nothing claims to reject it), got: {}",
+                e.message()
+            );
+        }
+        Ok(_) => {
+            ok = false;
+            crate::error!("LXSELFTEST apt_verify stale-rollback FAIL: empty index");
+        }
+    }
+
+    // Leave the session pointing at the good suite for the positive half.
+    crate::pkg::apt::set_mirror("http://10.0.2.2:8000", Some("/"));
+    crate::pkg::apt::set_suite("stable");
+    if ok {
+        crate::info!(
+            "LXSELFTEST apt_verify PASS (signed suite loads; tampered Packages, tampered .deb, \
+             unsigned mirror and unpinned signer all refused)"
+        );
+    } else {
+        crate::error!("LXSELFTEST apt_verify FAIL (see the per-case lines above)");
+    }
+    ok
+}
+
 pub fn run_apt_e2e() {
     let name = "apt_e2e";
 
@@ -379,10 +621,17 @@ pub fn run_apt_e2e() {
 
     crate::info!("LXSELFTEST apt_e2e: interface up, pointing apt at http://10.0.2.2:8000 ...");
 
-    // 1. Point apt at the local mirror (cleartext HTTP, port 8000, mirror root).
-    crate::pkg::apt::set_mirror("http://10.0.2.2:8000", Some("/"));
+    // 1. Trust-chain checks first (issue #32): the negative cases run before the
+    // positive install so "nothing was written" is unambiguous, and the whole
+    // harness passes only if they all pass.
+    let verify_ok = run_apt_verify_checks();
 
-    // 2. Download + stream-parse the index.
+    // 2. Point apt at the local mirror (cleartext HTTP, port 8000, mirror root),
+    // signed suite (the checks above leave the session there).
+    crate::pkg::apt::set_mirror("http://10.0.2.2:8000", Some("/"));
+    crate::pkg::apt::set_suite("stable");
+
+    // 3. Download + stream-parse the index (verified against the signed Release).
     let count = match crate::pkg::apt::update() {
         Ok(n) => n,
         Err(e) => {
@@ -423,8 +672,13 @@ pub fn run_apt_e2e() {
     // 4. Load + enqueue the installed Linux binary; it prints "hello from apt".
     match run_linux_binary(bin_path, &[b"hello-pagh"], &[]) {
         Ok(pid) => {
+            if !verify_ok {
+                fail(name, "apt_verify trust-chain checks failed");
+                return;
+            }
             crate::info!(
-                "LXSELFTEST apt_e2e PASS (index {} pkgs; installed {}; spawned hello-pagh pid={})",
+                "LXSELFTEST apt_e2e PASS (index {} pkgs; installed {}; spawned hello-pagh pid={}; \
+                 trust-chain checks passed)",
                 count,
                 installed.len(),
                 pid

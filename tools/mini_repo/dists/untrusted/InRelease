@@ -1,0 +1,20 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+Suite: untrusted
+Codename: pagh-test-untrusted
+Date: Thu, 01 Jan 2026 00:00:00 UTC
+Architectures: all amd64
+Components: main
+Acquire-By-Hash: no
+
+SHA256:
+ 5ca4f3496133e9c7db6894aaadbb1e9983c6bd5d6c81f13ef6d8ad2d3e308840 291 main/binary-amd64/Packages
+ 7252f12eee1c37dbeccf32aabc999a3e45e4a150cc712782f785d8a2216e9e44 242 main/binary-amd64/Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+wngEARYIACAWIQSk8nWxrG5S+sL7kPop18xgFOa1awUCaVW5AAIbAwAKCRAp18xg
+FOa1a0+eAP0aUEGyN3lL5lGUR9wyIX/RIwr2OW2DLaK6tlfg8NIwPgEAwr5q2g3T
+hFkTyV1T+lgLbOex2xXMJf0IZYkKaU9pcAI=
+=UsbP
+-----END PGP SIGNATURE-----

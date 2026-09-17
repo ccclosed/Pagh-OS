@@ -1014,3 +1014,61 @@ Also confirmed while implementing: `Clearsigned::text` (the armor's clear text, 
 to the standalone `Release`) keeps its final line ending; only `canonical_text()` drops it for
 the signature computation. The apt step that parses the `SHA256:` section therefore gets the
 same bytes as a detached-style fetch.
+
+---
+
+## 15. Amendment after t23 (negative integration test)
+
+The E2E half of §8.3 is implemented and passing in QEMU; two fixture-construction
+facts are worth recording because they are easy to get wrong on the *producing*
+side (they cost a debugging cycle here, and both are now checked by the tools
+themselves).
+
+1. **A clear-signed fixture must be signed over the canonical text, not the raw
+   document.** `tools/openpgp_sign.py::canonicalize()` mirrors the verifier's rule
+   (dash-unescape, strip trailing whitespace per line, CRLF joins, no final line
+   ending). The first attempt signed the raw `Release` bytes for `InRelease`,
+   which the kernel and `gpgv` both refuse; the detached `Release.gpg` path is the
+   raw-bytes one, so the two differ on purpose.
+
+2. **The tamper cases are length-preserving.** `tampered-index` serves a
+   `Packages` body of exactly the signed size with a different SHA-256 (and the
+   signed `InRelease` verifies), and `tampered-deb` serves a `.deb` of exactly the
+   indexed size with a different digest. That makes the *hash* the only check that
+   can catch them — a size check would not — which is precisely what issue #32
+   asks to be proven. (Both suites' signatures are confirmed valid by `gpgv`
+   before the kernel ever sees them.)
+
+Also implemented, as §4.6 described: the deterministic test anchor
+(`tools/gen_openpgp_testkey.py` → `src/pkg/openpgp_test_keys.rs`) is compiled only
+under `lx_selftest` / `lx_bigindex`, and `pkg::apt::trusted_keyring()` selects it
+only there, so no other build can trust the test key. `DEBIAN_KEYRING` gained
+per-key `const`s (`DEBIAN_KEY_0`…) purely so the selftest anchor table can list the
+Debian keys and the test key in one static slice; the production table is
+unchanged in content.
+
+In-guest markers (asserted by `python3 tools/e2e.py local-mirror`, whose
+`LXSELFTEST apt_e2e PASS` is gated on all of them):
+
+```
+LXSELFTEST apt_verify signed-suite PASS (1 packages)
+LXSELFTEST apt_verify tampered-index PASS   # verify OK, then stage=index cause=HashMismatch
+LXSELFTEST apt_verify tampered-deb   PASS   # stage=deb cause=HashMismatch, nothing written
+LXSELFTEST apt_verify unsigned-mirror PASS  # stage=metadata cause=Unsigned
+LXSELFTEST apt_verify untrusted-key  PASS   # stage=signature cause=NoTrustedSignature
+LXSELFTEST apt_e2e PASS (… trust-chain checks passed)
+```
+
+### Coverage map after t23 (what is proven where)
+
+| Refusal / property | Where it is proven |
+|---|---|
+| correctly signed mirror loads and installs | QEMU E2E (`stable` suite; also the live Debian mirror in the t22 run) |
+| `Packages` ≠ signed `Release`, **signature valid**, same size | QEMU E2E (`tampered-index`) |
+| `.deb` ≠ signed index, same size, nothing written to `/mnt` | QEMU E2E (`tampered-deb`) |
+| mirror with no signatures | QEMU E2E (`unsigned`) |
+| signature by an unpinned key | QEMU E2E (`untrusted`) |
+| refused update leaves no index published | QEMU E2E (asserted per refusal) |
+| subkey issuer → pinned primary mapping | QEMU E2E (the test key signs with its primary; the *live* t22 run exercised a Debian subkey) |
+| rollback to a complete older signed triplet | QEMU E2E `stale` — **accepted**, printed as a NOTE; the gap is documented in `SECURITY.md` |
+| `ClockUnset`, key expiry/revocation/not-yet-valid, future-dated signature, `Date`/`Valid-Until` parsing, `NoIndexEntry`, ECDSA | host properties P52–P54 only — end-to-end they would need a guest clock override (`-rtc base=2020-01-01`, which the E2E driver does not expose) or a Debian private key |

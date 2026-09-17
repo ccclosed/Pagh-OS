@@ -67,7 +67,6 @@ use super::deb::{self, Compression};
 use super::install_fs;
 use super::openpgp::{self, OpenPgpError};
 use super::openpgp_crypto;
-use super::openpgp_keys::DEBIAN_KEYRING;
 use super::release_file::{self, DateField, Release};
 use super::tar;
 
@@ -204,6 +203,24 @@ pub fn set_mirror(host: &str, base: Option<&str>) {
     if let Some(b) = base {
         cfg.base = normalize_base(b);
     }
+    *guard = Some(cfg);
+}
+
+/// Select the release/suite `apt` fetches from the mirror (e.g. `stable`,
+/// `bookworm`, `trixie-security`).
+///
+/// The built-in default is Debian `stable`; `apt setmirror` changes the host and
+/// base path but deliberately not the suite, so switching suites is its own
+/// operation. Like [`set_mirror`], this only updates the session configuration —
+/// the next `apt update` verifies the metadata of whichever suite is selected.
+pub fn set_suite(suite: &str) {
+    let trimmed = suite.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let mut guard = CONFIG.lock();
+    let mut cfg = guard.take().unwrap_or_else(AptConfig::defaults);
+    cfg.suite = trimmed.to_string();
     *guard = Some(cfg);
 }
 
@@ -414,8 +431,20 @@ lines on serial for the exact cause; retry 'apt update', or use a smaller compon
 /// The trust store is a compile-time constant: the kernel never fetches, adds or
 /// updates a key at runtime. A mirror signed by any other key is refused with
 /// `cause=NoTrustedSignature`.
+///
+/// The `lx_selftest` build adds the deterministic E2E test key (compiled out
+/// everywhere else, see [`crate::pkg::openpgp_test_keys`]), because the local
+/// mirror used by the in-QEMU harness is signed by it — that key exists so the
+/// harness can prove the *positive* path as well as the refusals.
 fn trusted_keyring() -> &'static [openpgp::PinnedKey] {
-    &DEBIAN_KEYRING
+    #[cfg(not(feature = "lx_selftest"))]
+    {
+        &super::openpgp_keys::DEBIAN_KEYRING
+    }
+    #[cfg(feature = "lx_selftest")]
+    {
+        &super::openpgp_test_keys::TEST_TRUST_ANCHORS
+    }
 }
 
 /// Signed metadata that verified, with the signer recorded for diagnostics.

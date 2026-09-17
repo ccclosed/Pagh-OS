@@ -1,0 +1,19 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+Suite: tampered-index
+Codename: pagh-test-tampered-index
+Date: Thu, 01 Jan 2026 00:00:00 UTC
+Architectures: all amd64
+Components: main
+Acquire-By-Hash: no
+
+SHA256:
+ 5ae1ae0af145d88f7f6a07bcee7d80aa3f41b0654069f2b6489539379b1bb769 296 main/binary-amd64/Packages
+-----BEGIN PGP SIGNATURE-----
+
+wngEARYIACAWIQSzW/4QKvENIN6+vEUR/o11ndlAVgUCaVW5AAIbAwAKCRAR/o11
+ndlAVkXvAP0d9rk+HgfII47Cy89R5UjypXAko8FJTc/Hu2chhH48cQD+L5qKGYNd
+n4n8E5NaNZDYWF1tYkkgLEz7GqhY2/9VhgU=
+=LF93
+-----END PGP SIGNATURE-----
