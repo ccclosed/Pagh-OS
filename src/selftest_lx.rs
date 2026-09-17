@@ -378,7 +378,10 @@ pub fn run_live_update_check() {
 /// only the SHA-256 binding from the signed `Release` to the `Packages` body can
 /// catch it. Every refusal must be an error — never a warning that still loads
 /// the index — and the tampered `.deb` must leave `/mnt` untouched.
-#[cfg(feature = "lx_selftest")]
+///
+/// Compiled unconditionally (like [`run_apt_e2e`], which is only *called* under
+/// the harness features), so no feature combination can end up calling a
+/// function that does not exist.
 fn run_apt_verify_checks() -> bool {
     use crate::pkg::apt::AptOpError;
 

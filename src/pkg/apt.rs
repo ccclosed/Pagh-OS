@@ -432,16 +432,26 @@ lines on serial for the exact cause; retry 'apt update', or use a smaller compon
 /// updates a key at runtime. A mirror signed by any other key is refused with
 /// `cause=NoTrustedSignature`.
 ///
-/// The `lx_selftest` build adds the deterministic E2E test key (compiled out
-/// everywhere else, see [`crate::pkg::openpgp_test_keys`]), because the local
-/// mirror used by the in-QEMU harness is signed by it — that key exists so the
-/// harness can prove the *positive* path as well as the refusals.
+/// The harness builds that run `apt update` against the LOCAL test mirror
+/// (`lx_selftest`, and `lx_bigindex`, whose synthetic index is signed too) add the
+/// deterministic E2E test key — compiled out everywhere else, see
+/// [`crate::pkg::openpgp_test_keys`]. Those builds still contain every pinned
+/// Debian key; the test key only *adds* an anchor, and no configuration can
+/// remove one.
 fn trusted_keyring() -> &'static [openpgp::PinnedKey] {
-    #[cfg(not(feature = "lx_selftest"))]
+    #[cfg(not(any(
+        feature = "lx_selftest",
+        feature = "lx_bigindex",
+        feature = "lx_bigindex_inram"
+    )))]
     {
         &super::openpgp_keys::DEBIAN_KEYRING
     }
-    #[cfg(feature = "lx_selftest")]
+    #[cfg(any(
+        feature = "lx_selftest",
+        feature = "lx_bigindex",
+        feature = "lx_bigindex_inram"
+    ))]
     {
         &super::openpgp_test_keys::TEST_TRUST_ANCHORS
     }
