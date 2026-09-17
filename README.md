@@ -456,8 +456,14 @@ python
   sequences with `ONLCR`, `TCSETS*` applies real raw-mode (`ICANON`/`ECHO`) with
   kernel-side echo in raw mode, honest `tcgetattr` reports terminal state, and
   `ioctl(FIONBIO)` covers libuv's non-blocking path — `nvim` runs and saves its ShaDa.
-  There is still no `procfs` beyond an emulated `/proc/self/exe` readlink, so programs
-  that require `/proc/stat`/`/proc/meminfo` (e.g. `htop`) remain out of reach. Signal
+  A synthetic `/proc` (issue #11) now serves `/proc/cpuinfo`, `/proc/meminfo`,
+  `/proc/uptime` and `/proc/self/{exe,cmdline,status,maps}` from live kernel state
+  (CPUID, PMM counters, the tick clock, the calling process's `CompatState`), with
+  `readlink`/`lstat`/`getdents64` handling `/proc/self/exe` as a real symlink. What is
+  still missing is the per-pid tree (`/proc/<pid>`) and `/proc/stat`, so `htop` and
+  `ps` remain out of reach; `/proc/meminfo`-only consumers (busybox `free`, libuv's
+  `uv_get_total_memory`) and `/proc/uptime` consumers now work. See
+  `docs/procfs.md` for the exact contract and the deliberately deferred paths. Signal
   delivery is real at the syscall-return point (see above); asynchronous delivery
   from the timer-tick return path is not yet wired. See `LINUX-USERLAND.md` for the exact status.
 - **Transport.** Downloads use HTTP or HTTPS. HTTPS authenticates the peer fail-closed: the

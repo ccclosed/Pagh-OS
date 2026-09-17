@@ -79,9 +79,11 @@ These return `-ENOSYS` or a stub (logged once per syscall number per process):
   process terminates it with the conventional `128+sig` code (this is how glibc
   `abort()` ends).
 - `timerfd` — programs needing timerfd descriptors still fail.
-- No real `procfs`/`sysfs`: only an emulated `/proc/self/exe` via `readlink`, so
-  programs that read `/proc/stat`, `/proc/meminfo`, or per-pid entries (e.g. `htop`)
-  do not work.
+- `procfs` covers the first slice only (issue #11): `/proc/cpuinfo`, `/proc/meminfo`,
+  `/proc/uptime` and `/proc/self/{exe,cmdline,status,maps}`, rendered from live kernel
+  state (contract: `docs/procfs.md`). `/proc/<pid>`, `/proc/stat`, `/proc/loadavg` and
+  `/proc/self/fd` return `ENOENT`, so `htop`/`ps` still do not work; `sysfs` does not
+  exist at all.
 - The ext2 writer has no symlink support (installer materializes links as copies).
 
 So: batch/console programs, the CPython REPL, and event-loop TUIs (`nvim`) run; the

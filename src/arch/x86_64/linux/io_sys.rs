@@ -38,10 +38,10 @@ use crate::task::fd::{OpenObject, PipeEndpoint, PipeReadResult, PipeWriteResult}
 use crate::vfs::{self, VfsNode};
 
 use super::check_user_ptr;
-use super::dirent::{dirent_reclen, encode_dirent64, DT_DIR, DT_REG};
+use super::dirent::{d_type_for, dirent_reclen, encode_dirent64};
 use super::errno::Errno;
 use super::io::{plan_lseek, plan_read};
-use super::stat::{encode_stat, LinuxStat, S_IFDIR, S_IFREG};
+use super::stat::{encode_stat, LinuxStat, S_IFDIR, S_IFLNK, S_IFREG};
 
 /// `st_mode` type bits for a character device (console/stdin), so `fstat` on a
 /// standard stream reports a plausible (non-regular) type.
@@ -57,6 +57,9 @@ const COUNT_MAX: u64 = 0x7FFF_FFFF;
 
 /// `openat` "current working directory" sentinel dir fd.
 const AT_FDCWD: u64 = (-100i64) as u64;
+
+/// `newfstatat` flag: do not follow a final symbolic link (`lstat`).
+const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 
 /// Default permission bits reported for an ext2-backed regular file.
 /// Reported permission bits for regular files. Everything here runs as root
@@ -115,6 +118,18 @@ pub(crate) fn copy_in_pub(buf: u64, count: u64) -> alloc::vec::Vec<u8> {
 }
 pub(crate) fn copy_out_pub(buf: u64, data: &[u8]) {
     copy_out(buf, data)
+}
+
+/// Map a VFS write failure to errno.
+///
+/// A node that does not implement `write` is a read-only file — `/proc` files
+/// (issue #11) are exactly that, and Linux answers `EACCES` for them. Any other
+/// failure keeps the historical `EINVAL`.
+fn write_errno(e: crate::vfs::VfsError) -> Errno {
+    match e {
+        crate::vfs::VfsError::NotSupported => Errno::EACCES,
+        _ => Errno::EINVAL,
+    }
 }
 
 /// Human-readable descriptor kind for watchdog/telemetry output.
@@ -455,7 +470,7 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         }
         Some(Resolved::File { node, offset }) => {
             let data = copy_in(buf, count);
-            let n = node.write(offset, &data).map_err(|_| Errno::EINVAL)?;
+            let n = node.write(offset, &data).map_err(write_errno)?;
             set_fd_offset(fd as u32, offset + n as u64);
             Ok(n as u64)
         }
@@ -546,7 +561,7 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
                 }
             }
             Resolved::File { node, .. } => {
-                let n = node.write(file_off, &data).map_err(|_| Errno::EINVAL)?;
+                let n = node.write(file_off, &data).map_err(write_errno)?;
                 file_off += n as u64;
                 total += n as u64;
             }
@@ -714,16 +729,11 @@ fn resolve_path(path: &str) -> String {
         out.push_str(comp);
     }
     // Guest-chroot mapping: Linux programs see the ext2 tree as `/`. Kernel
-    // special trees stay put (/dev nodes, /tmp ramfs, the explicit /mnt view),
-    // everything else resolves under /mnt — this is what makes /etc/resolv.conf
-    // visible to glibc's resolver.
-    if out != "/"
-        && !out.starts_with("/mnt")
-        && !out.starts_with("/dev")
-        && !out.starts_with("/proc")
-        && !out.starts_with("/sys")
-        && !out.starts_with("/tmp")
-    {
+    // special trees stay put (/dev nodes, /tmp ramfs, /proc — issue #11 —, the
+    // explicit /mnt view), everything else resolves under /mnt — this is what
+    // makes /etc/resolv.conf visible to glibc's resolver. The predicate compares
+    // whole path components (`/process` is a guest path, not a `/proc` path).
+    if out != "/" && !super::io::guest_path_keeps_root(&out) {
         let mut mapped = String::with_capacity(out.len() + 4);
         mapped.push_str("/mnt");
         mapped.push_str(&out);
@@ -732,12 +742,49 @@ fn resolve_path(path: &str) -> String {
     out
 }
 
+/// Maximum number of symbolic links crossed while resolving one path.
+///
+/// Issue #18 (`EXT2-LINKS.md` §4.6) owns the general `SYMLOOP_MAX = 40` +
+/// `Errno::ELOOP` resolver; until that lands, procfs needs just enough follow
+/// semantics for `/proc/self/exe` to behave (open follows the link, `stat`
+/// follows it, `lstat` does not). Exhausting the budget is reported as `ENOENT`
+/// with one diagnostic, never as a bogus success (`docs/procfs.md` §5.4).
+const SYMLINK_BUDGET: usize = 8;
+
+/// Resolve an already guest-mapped absolute path, following symbolic links in
+/// the final component (and in intermediates, should any appear).
+///
+/// `readlink(2)` deliberately does **not** use this: it must see the link itself.
+fn lookup_follow(abs: &str) -> Result<Arc<dyn VfsNode>, Errno> {
+    let mut path = String::from(abs);
+    for _ in 0..SYMLINK_BUDGET {
+        let node = vfs::lookup_path(&path).map_err(|_| Errno::ENOENT)?;
+        if !node.is_symlink() {
+            return Ok(node);
+        }
+        let target = match node.read_link() {
+            Some(t) => t,
+            None => return Err(Errno::ENOENT),
+        };
+        // The target is a guest path too (`/lib64/ld-linux…` → `/mnt/lib64/…`).
+        path = resolve_path(&target);
+    }
+    crate::warn!(
+        "[linux] symlink budget {} exhausted at '{}': reporting ENOENT (ELOOP arrives with issue #18)",
+        SYMLINK_BUDGET,
+        abs
+    );
+    Err(Errno::ENOENT)
+}
+
 /// Build the [`OpenObject`] for an already-resolved absolute path, allocating a
 /// fresh descriptor for it. A directory becomes an [`OpenObject::Dir`] carrying a
 /// snapshot of its children (for `getdents64`); a file becomes an
 /// [`OpenObject::File`] at offset 0.
 fn open_resolved(abs: &str) -> Result<u64, Errno> {
-    let node = vfs::lookup_path(abs).map_err(|_| Errno::ENOENT)?;
+    // `open(2)` follows a final symlink; `/proc/self/exe` is such a link, and
+    // opening it must hand back the real image, not the link node.
+    let node = lookup_follow(abs)?;
     let obj = if node.is_directory() {
         let children = node.readdir().unwrap_or_default();
         OpenObject::Dir {
@@ -774,7 +821,7 @@ fn open_path(path: &str, flags: u64) -> Result<u64, Errno> {
     let abs = resolve_path(path);
     let trimmed = abs.trim_end_matches('/');
     let lookup_target = if trimmed.is_empty() { "/" } else { trimmed };
-    match vfs::lookup_path(lookup_target) {
+    match lookup_follow(lookup_target) {
         Ok(node) => {
             if flags & O_CREAT_FL != 0 && flags & O_EXCL_FL != 0 {
                 return Err(Errno::EEXIST);
@@ -983,6 +1030,21 @@ fn write_stat(node: &Arc<dyn VfsNode>, statbuf: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
+/// Fill a [`LinuxStat`] describing a symbolic link itself (`lstat`).
+///
+/// `st_size` is the target length and `st_nlink` is 1, matching Linux for
+/// `/proc/self/exe`; `st_blocks` is 0 because a synthetic link occupies no
+/// blocks.
+fn write_link_stat(node: &Arc<dyn VfsNode>, statbuf: u64) {
+    let len = node.read_link().map(|t| t.len() as u64).unwrap_or(0);
+    let mut stat = encode_stat(len, S_IFLNK | 0o777);
+    stat.st_dev = STAT_DEV_VFS;
+    stat.st_ino = node_ino(node);
+    stat.st_nlink = 1;
+    stat.st_blocks = 0;
+    write_stat_struct(&stat, statbuf);
+}
+
 /// Copy a fully-built [`LinuxStat`] to the validated user buffer.
 fn write_stat_struct(stat: &LinuxStat, statbuf: u64) {
     let bytes = unsafe {
@@ -1032,11 +1094,21 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> Result<u64, Errno> {
 
 /// `newfstatat` (262): stat a path (absolute, or `AT_FDCWD`-relative) into the
 /// user `struct stat` (R2.8); `ENOENT` if absent (R2.5).
-pub fn sys_newfstatat(_dirfd: u64, path: u64, statbuf: u64, _flags: u64) -> Result<u64, Errno> {
+pub fn sys_newfstatat(_dirfd: u64, path: u64, statbuf: u64, flags: u64) -> Result<u64, Errno> {
     check_user_ptr(statbuf, core::mem::size_of::<LinuxStat>() as u64)?;
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
-    let node = vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
+    if flags & AT_SYMLINK_NOFOLLOW != 0 {
+        // `lstat`: describe the link itself, never what it points at.
+        let node = vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
+        if node.is_symlink() {
+            write_link_stat(&node, statbuf);
+            return Ok(0);
+        }
+        return write_stat(&node, statbuf);
+    }
+    // `stat`: follow the final link (a dangling one is ENOENT).
+    let node = lookup_follow(&abs)?;
     write_stat(&node, statbuf)
 }
 
@@ -1455,7 +1527,8 @@ fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
 pub fn sys_access(path: u64, _mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
-    vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
+    // `access(2)` follows symlinks (a dangling link is ENOENT).
+    lookup_follow(&abs)?;
     Ok(0)
 }
 
@@ -1723,8 +1796,10 @@ pub fn sys_getdents64(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
                     }
                     break;
                 }
-                let d_type = if child.is_directory() { DT_DIR } else { DT_REG };
-                let d_ino = (*index as u64) + 1;
+                let d_type = d_type_for(child.is_directory(), child.is_symlink());
+                // The real identity, so `readdir` and `stat` agree (`ls -i`,
+                // `find`); the old `index + 1` was a cursor position, not an inode.
+                let d_ino = node_ino(child);
                 let d_off = (*index as i64) + 1;
                 let rec = encode_dirent64(d_ino, d_off, d_type, name);
                 out.extend_from_slice(&rec);
@@ -1775,7 +1850,8 @@ pub fn sys_getcwd(buf: u64, size: u64) -> Result<u64, Errno> {
 pub fn sys_chdir(path: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
-    let node = vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
+    // `chdir(2)` follows symlinks (`cd` into a link-to-directory works).
+    let node = lookup_follow(&abs)?;
     if !node.is_directory() {
         return Err(Errno::ENOTDIR);
     }
@@ -1974,22 +2050,22 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
 /// child re-execs that path to start the embedded server).
 pub fn sys_readlink(path: u64, buf: u64, bufsiz: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
-    if p == "/proc/self/exe" {
-        let exe = compat::with_current_compat(|cs| cs.exe_path.clone()).unwrap_or_default();
-        if exe.is_empty() {
-            return Err(Errno::ENOENT);
-        }
-        let bytes = exe.as_bytes();
-        let n = core::cmp::min(bytes.len() as u64, bufsiz);
-        check_user_ptr(buf, n)?;
-        copy_out(buf, &bytes[..n as usize]);
-        return Ok(n);
-    }
     let abs = resolve_path(&p);
-    match vfs::lookup_path(&abs) {
-        Ok(_) => Err(Errno::EINVAL),
-        Err(_) => Err(Errno::ENOENT),
+    // Deliberately the *unfollowed* resolver: `readlink` must report the link
+    // itself. `/proc/self/exe` is now an ordinary node with `is_symlink()`
+    // (contract `docs/procfs.md` §5.4); the old hardcoded path check is gone, so
+    // relative/cwd-relative references to it work too.
+    let node = vfs::lookup_path(&abs).map_err(|_| Errno::ENOENT)?;
+    if !node.is_symlink() {
+        // No symbolic links anywhere else in this filesystem yet.
+        return Err(Errno::EINVAL);
     }
+    let target = node.read_link().ok_or(Errno::ENOENT)?;
+    let bytes = target.as_bytes();
+    let n = core::cmp::min(bytes.len() as u64, bufsiz);
+    check_user_ptr(buf, n)?;
+    copy_out(buf, &bytes[..n as usize]);
+    Ok(n)
 }
 
 /// `readlinkat` (267): like `readlink`; the dirfd is ignored (paths resolve
@@ -2068,7 +2144,7 @@ pub fn sys_pwrite64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, E
         }
         Some(Resolved::File { node, .. }) => {
             let data = copy_in(buf, count);
-            let n = node.write(offset, &data).map_err(|_| Errno::EINVAL)?;
+            let n = node.write(offset, &data).map_err(write_errno)?;
             // NOTE: the descriptor offset is intentionally NOT updated.
             Ok(n as u64)
         }
