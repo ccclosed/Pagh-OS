@@ -1,6 +1,55 @@
 # ext2 recovery and host import
 
-This pagh-only patch makes boot formatting non-destructive, reserves bitmap padding correctly, rounds inode geometry for host compatibility and reconciles free-space counters from bitmaps on mount. An existing ext2 with a missing/corrupt pagh WAL is now rejected instead of erased.
+This pagh-only patch reserves bitmap padding correctly, rounds inode geometry for host
+compatibility and reconciles free-space counters from bitmaps on mount.
+
+## Boot formatting is allowed only on a genuinely blank device
+
+`boot.rs::init_fs` formats a device **only when it is blank**, and the decision is
+`fs::format_policy` (issue #33). It used to format whenever `Ext2Fs::mount` failed and the
+ext2 magic was absent at byte 1024 — which on a real machine is the machine's *own*
+disk: the NVMe path takes the first active namespace (the whole disk, not a partition),
+and byte 1024 of a GPT disk holds the partition-entry array, so a partitioned disk was
+classified "blank" and erased.
+
+The rules, in order:
+
+1. a **mountable ext2 superblock** (a parsable `read_sb_gds`, not merely the magic) means
+   "this is a filesystem" — never format, and an ext2/ext4 volume with a missing or
+   corrupt pagh WAL is rejected instead of erased; ext4 shares the `0xEF53` magic and is
+   covered by this same rule. This is the one refusal the opt-in marker cannot lift;
+   an operator who wants such a device back zeroes its start (`wipefs -a`), which makes
+   it blank and therefore formattable without any marker;
+2. an **MBR/GPT partition table** (boot signature at byte 510, or `EFI PART` at LBA 1) is
+   refused by name — this is the real-hardware case;
+3. any other **non-zero data** in the probed 1 MiB window is refused by name;
+4. an **all-zero** device is formatted, and so is any device carrying the explicit
+   opt-in marker below, whatever layout the probe reported for it.
+
+### Taking over a disk that already has data
+
+Formatting a device that is not blank requires a deliberate, unmistakable act by the
+operator — writing the marker into sector 0 of that device:
+
+```sh
+printf 'PAGH-FORMAT' | sudo dd of=/dev/nvme0n1 bs=1 conv=notrunc
+```
+
+Nothing else enables it: there is no bootloader flag, no config file, and the kernel
+never writes those bytes itself. Omit the marker and the device is refused with a line
+naming what was found on it, plus a line naming the two ways forward. There is
+deliberately no "format anyway" prompt, because this kernel boots with no console input
+available at that point.
+
+The marker is destructive in itself: it overwrites the first 11 bytes of sector 0 — on a
+partitioned disk that is the bootstrap area of the protective MBR (and of a partition's
+boot sector, if the disk is used that way). That is the same sector the marker has to
+occupy to be found, so the command above is only for a disk whose contents you have
+already decided to lose.
+
+Boot probes at most 1 MiB, and only after a mount failure, so the happy path pays
+nothing for the check.
+
 
 ## Multi-group layout
 

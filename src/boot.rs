@@ -202,7 +202,7 @@ fn init_vfs() {
     info!("vfs");
 }
 
-/// Step 11.5: bring the ext2 filesystem up on the real virtio-blk disk and
+/// Step 11.5: bring the ext2 filesystem up on the real virtio-blk/NVMe disk and
 /// mount it at `/mnt` (Task 5.1, R5.6/R9.1/R9.2).
 ///
 /// Ordering note: this runs *after* `init_vfs` (not inside `init_virtio`)
@@ -211,13 +211,18 @@ fn init_vfs() {
 /// up, and interrupts are still disabled during boot init, so the format/mount
 /// disk I/O and allocations run on a single, non-preempted path.
 ///
-/// If no virtio-blk device is present this logs a warning and continues booting
-/// (R17.4). On first boot (no valid superblock) the disk is formatted then
-/// mounted. After a successful mount a one-shot self-demo writes a file under
-/// `/mnt` and reads it back, proving the real-disk journaled write+read path
-/// end-to-end on a headless boot.
+/// If no virtio-blk or NVMe device is present this logs a warning and continues
+/// booting (R17.4). On first boot the device is formatted, but **only when it is
+/// genuinely blank or carries the explicit opt-in marker**: the decision lives in
+/// [`crate::fs::format_policy`] and every other layout — a valid ext2 superblock,
+/// a partition table, or any other non-zero data — is refused by name (issue #33;
+/// on real hardware the machine's own SSD is exactly such a device, and the NVMe
+/// path takes the whole namespace, not a partition). After a successful mount a
+/// one-shot self-demo writes a file under `/mnt` and reads it back, proving the
+/// real-disk journaled write+read path end-to-end on a headless boot.
 fn init_fs() {
     use crate::fs::ext2::Ext2Fs;
+    use crate::fs::format_policy::{format_allowed, Refusal};
 
     // Storage priority: virtio-blk first (QEMU/dev images), NVMe fallback for
     // real machines with an NVMe SSD.
@@ -244,31 +249,74 @@ fn init_fs() {
         }
     };
 
-    // Format only a genuinely blank/non-ext2 device. A valid ext2 superblock
-    // with a damaged/missing private WAL is an error, never permission to erase
-    // user data.
+    // Format only a genuinely blank device. A valid ext2 superblock with a
+    // damaged/missing private WAL is an error, never permission to erase user
+    // data — and neither is a partition table or any other on-disk data.
     let root = match Ext2Fs::mount(blk.clone()) {
         Ok(root) => root,
-        Err(first_error) if !Ext2Fs::has_valid_superblock(&*blk) => {
-            info!("fs: blank disk, formatting ext2 + WAL...");
-            if let Err(e) = Ext2Fs::format(blk.clone()) {
-                error!("fs: format failed: {:?}; /mnt not mounted", e);
-                return;
+        Err(first_error) => {
+            let has_superblock = Ext2Fs::has_valid_superblock(&*blk);
+            // The probe runs only here: a failed mount is the sole situation in
+            // which erasing the device is even on the table, so the happy path
+            // pays nothing for it.
+            let probe = probe_boot_area(&*blk);
+            // The one way to authorise formatting a device that is not blank: an
+            // operator deliberately wrote `format_policy::OPT_IN_MARKER` into
+            // sector 0. Nothing else — no bootloader flag, no config file — can
+            // turn this on, and the marker cannot appear by accident.
+            let allow_destructive = probe.is_marked();
+            if allow_destructive {
+                warn!(
+                    "fs: {} carries the PAGH-FORMAT opt-in marker; formatting over existing data",
+                    blk.name()
+                );
             }
-            match Ext2Fs::mount(blk.clone()) {
-                Ok(root) => root,
-                Err(e) => {
-                    error!("fs: post-format mount failed: {:?}", e);
+            match format_allowed(probe.layout(), has_superblock, allow_destructive) {
+                Ok(()) => {
+                    info!(
+                        "fs: formatting {} ({}), ext2 + WAL...",
+                        blk.name(),
+                        probe.layout().name()
+                    );
+                    if let Err(e) = Ext2Fs::format(blk.clone()) {
+                        error!("fs: format failed: {:?}; /mnt not mounted", e);
+                        return;
+                    }
+                    match Ext2Fs::mount(blk.clone()) {
+                        Ok(root) => root,
+                        Err(e) => {
+                            error!("fs: post-format mount failed: {:?}", e);
+                            return;
+                        }
+                    }
+                }
+                Err(refusal) => {
+                    match refusal {
+                        // Wording kept byte-identical: it is the historical
+                        // refusal line and the docs quote it.
+                        Refusal::ExistingFilesystem => error!(
+                            "fs: existing ext2 mount failed: {:?}; refusing destructive reformat",
+                            first_error
+                        ),
+                        other => error!(
+                            "fs: refusing to format {} ({}): {:?}",
+                            blk.name(),
+                            other.reason(),
+                            first_error
+                        ),
+                    }
+                    // No in-guest route forward exists (there is no `mkfs` in the
+                    // shell), so name the operator's options instead of leaving
+                    // the refusal as the last word on the serial line.
+                    error!(
+                        "fs: {} left untouched; to reuse it, zero the start of the device \
+                         (`wipefs -a` / `dd` from another system) or write the {} marker",
+                        blk.name(),
+                        crate::fs::format_policy::OPT_IN_MARKER_NAME
+                    );
                     return;
                 }
             }
-        }
-        Err(e) => {
-            error!(
-                "fs: existing ext2 mount failed: {:?}; refusing destructive reformat",
-                e
-            );
-            return;
         }
     };
 
@@ -281,6 +329,52 @@ fn init_fs() {
         Err(e) => error!("fs: mount_at(/mnt) failed: {:?}", e),
     }
     info!("fs");
+}
+
+/// How far into a device [`probe_boot_area`] looks: 1 MiB.
+///
+/// Enough for a GPT/MBR partition table, an ext2 superblock, and the boot-sector
+/// or superblock-at-offset-0 layouts of every filesystem a user is likely to have
+/// (NTFS, XFS, LUKS, ZFS, ext4-in-a-partition). btrfs keeps its superblock at
+/// 64 KiB — inside the window as well.
+///
+/// **The window is a real limitation, not a formality**: a layout that keeps
+/// everything outside the first MiB — a `mkswap` signature at the tail of the
+/// device, mdadm 1.0 superblocks, IMSM/DDF external RAID metadata, or a device
+/// whose start was zeroed by an interrupted `wipefs`/`dd` — probes as `Blank`
+/// and is formatted. Bounding the probe is what keeps boot from reading a whole
+/// SSD; the cost is that "blank" means "blank in the first MiB".
+const PROBE_LIMIT: u64 = 1024 * 1024;
+
+/// Probe granularity, in bytes: one filesystem block (8 device sectors).
+const PROBE_CHUNK: u64 = 4096;
+
+/// Classify the first MiB of `dev` for [`crate::fs::format_policy`].
+///
+/// Reads in [`PROBE_CHUNK`] steps and stops as soon as the layout is decided — a
+/// partitioned or populated device costs a single read; only a device claiming to
+/// be blank is scanned to the end of [`PROBE_LIMIT`]. A read error keeps the
+/// `Foreign` (refused) classification, so an unreadable device is never formatted
+/// either — including a device with a single bad sector inside the window, which
+/// therefore cannot be formatted at all until it is zeroed.
+fn probe_boot_area(dev: &dyn drivers::BlockDevice) -> crate::fs::format_policy::Probe {
+    use crate::fs::format_policy::Probe;
+
+    const SECTORS_PER_CHUNK: u64 = PROBE_CHUNK / 512;
+    let mut buf = alloc::vec![0u8; PROBE_CHUNK as usize];
+    let mut probe = match dev.read_block(0, &mut buf) {
+        Ok(_) => Probe::new(&buf),
+        Err(()) => return Probe::unreadable(),
+    };
+    let mut sector = SECTORS_PER_CHUNK;
+    while !probe.is_decided() && sector * 512 < PROBE_LIMIT {
+        match dev.read_block(sector, &mut buf) {
+            Ok(_) => probe.feed(&buf),
+            Err(()) => return Probe::unreadable(),
+        }
+        sector += SECTORS_PER_CHUNK;
+    }
+    probe
 }
 
 /// Step 11.6: bring up networking (Task 6). Enumerates PCI, attaches the

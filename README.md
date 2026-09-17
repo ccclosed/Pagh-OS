@@ -167,6 +167,22 @@ install in the background; `N` skips it (`apt update` + `apt install python3` fr
 shell installs it later). Delete `disk.img` to get a clean re-provisioned system on the
 next boot.
 
+> **Data safety when booting real hardware.** pagh formats a block device **only when the
+> probed first MiB is entirely zero**, or when it carries the explicit opt-in marker (write
+> `PAGH-FORMAT` into sector 0 of that disk: `printf 'PAGH-FORMAT' | sudo dd of=/dev/nvme0n1
+> bs=1 conv=notrunc`); the decision is `fs::format_policy` (issue #33). A valid ext2
+> superblock, an MBR/GPT partition table, or any other non-zero data in that window makes the
+> kernel refuse to format and log why. Two caveats matter: the probe **stops at 1 MiB**, so a
+> layout that keeps all of its metadata past that point (a `mkswap` signature at the end of
+> the device, an mdadm 1.0 superblock, external RAID metadata) looks blank and *is* formatted;
+> and the marker is itself destructive — it overwrites the first 11 bytes of sector 0, which
+> on a partitioned disk is the bootstrap area. A device refused because its ext2 superblock
+> parses but its mount fails cannot be rescued by the marker; zero its start (`wipefs -a`)
+> and it becomes blank, which is formatted without any marker. Attach pagh to a dedicated
+> blank disk — never to a disk that holds data you care about. Note that the NVMe fallback
+> takes the first active namespace, i.e. the **whole SSD**, not a partition; there is no
+> bootloader flag or config file that can turn formatting of a populated disk on by accident.
+
 The cross-platform Python equivalents remain available through `tools/build.py`
 and the `Makefile`.
 
