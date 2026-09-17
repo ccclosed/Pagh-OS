@@ -16,11 +16,14 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use alloc::vec::Vec;
+
 use crate::arch::x86_64::linux::mem::VmRegionSet;
-use crate::arch::x86_64::linux::signal_frame::{sigbit, SigAltStack, SignalAction, SIGNAL_COUNT};
+use crate::arch::x86_64::linux::signal_frame::{
+    flush_cont_bits, flush_stop_bits, sigbit, SigAltStack, SignalAction, SIGNAL_COUNT,
+};
 use crate::sync::spinlock::Spinlock;
 use crate::vfs::elf::LoadSegment;
 
@@ -107,6 +110,19 @@ pub struct CompatState {
     pub sig_blocked: u64,
     /// Alternate signal stack registered via `sigaltstack(2)`.
     pub sig_altstack: SigAltStack,
+    /// Set once the process has been observed entering a syscall through the
+    /// `int 0x80` gate (`linux::INT80_ENTRY`). AGENTS.md invariant 2 forbids that
+    /// entry for a Compat_Process: on it the saved `rcx`/`r11` are ordinary GPRs
+    /// and the `+120` slot is the CPU-pushed user RIP, so the register meaning
+    /// that `execve`/`clone`/signal delivery rely on does not hold. The signal
+    /// path refuses frame delivery for such a process instead of writing the
+    /// `rt_sigframe` over the user's code (see `signal::deliver_one_pending_syscall`).
+    /// Reset to `false` for forked/cloned children (their own first syscall sets
+    /// it again if they take that path).
+    pub int80_entry: bool,
+    /// Whether the int80-entry delivery refusal has already been reported for
+    /// this process (keeps the diagnostic at one line per process).
+    pub int80_refused_logged: bool,
 }
 
 /// The disposition table shared by a thread group.
@@ -163,6 +179,8 @@ impl CompatState {
             sig_pending: 0,
             sig_blocked: 0,
             sig_altstack: SigAltStack::default(),
+            int80_entry: false,
+            int80_refused_logged: false,
         }
     }
 }
@@ -253,6 +271,9 @@ pub fn finish_compat_exit(pid: u64) {
                 .lock()
                 .insert((state.ppid, pid), state.exit_code.unwrap_or(0));
         }
+        // An exit SUPERSEDES any pending stop/continue report for this child: the
+        // parent's next `wait4` must see the exit, not a stale "stopped" event.
+        clear_child_state_events(state.ppid, pid);
     }
 }
 pub fn current_ppid() -> u64 {
@@ -283,6 +304,122 @@ pub fn has_child(parent: u64, wanted: i64) -> bool {
         .any(|(p, c)| *p == parent && child_matches(wanted, *c))
 }
 
+// ─── Child stop/continue events (`wait4` WUNTRACED / WCONTINUED) ─────────────
+//
+// `EXITED_CHILDREN` above carries exit codes only; the two registries here carry
+// the other two state changes `wait(2)` reports. Each event is reported AT MOST
+// ONCE and the report consumes it, which is what makes a `wait4(WUNTRACED)` loop
+// terminate instead of reporting the same stop forever. Lock order for all four
+// helpers below: STOPPED_CHILDREN, then CONTINUED_CHILDREN (never the reverse),
+// and never nested inside a `COMPAT_STATES` guard.
+
+/// Children parked in the stopped state: `(parent, child) -> stop signal`.
+static STOPPED_CHILDREN: Spinlock<BTreeMap<(u64, u64), u8>> = Spinlock::new(BTreeMap::new());
+/// Children resumed by `SIGCONT` since their parent last asked: `(parent, child)`.
+static CONTINUED_CHILDREN: Spinlock<BTreeSet<(u64, u64)>> = Spinlock::new(BTreeSet::new());
+
+/// The parent a stop/continue report belongs to (`None` when the child has no
+/// compat state, or is not a waitable child).
+fn reporting_parent(child: u64) -> Option<u64> {
+    COMPAT_STATES
+        .lock()
+        .get(&child)
+        .filter(|cs| cs.waitable && cs.ppid != 0)
+        .map(|cs| cs.ppid)
+}
+
+/// Record that `child` stopped on `sig`: its parent's next `wait4(WUNTRACED)`
+/// reports `wait_status_stopped(sig)`.
+pub fn note_child_stopped(child: u64, sig: u64) {
+    let Some(parent) = reporting_parent(child) else {
+        return;
+    };
+    STOPPED_CHILDREN.lock().insert((parent, child), sig as u8);
+    CONTINUED_CHILDREN.lock().remove(&(parent, child));
+}
+
+/// Record that `child` was resumed: its parent's next `wait4(WCONTINUED)`
+/// reports `0xffff`.
+///
+/// The caller only calls this for a child it has just taken out of the parked
+/// state (see `signal::resume_group`), so there is no "was it stopped?" check
+/// here — the child's stopped STATE lives in the scheduler (`STOPPED_TASKS`),
+/// while this registry carries only the *unreported event*.
+pub fn note_child_continued(child: u64) {
+    let Some(parent) = reporting_parent(child) else {
+        return;
+    };
+    STOPPED_CHILDREN.lock().remove(&(parent, child));
+    CONTINUED_CHILDREN.lock().insert((parent, child));
+}
+
+/// Drop every pending stop/continue report for `(parent, child)`: the child
+/// exited, so its exit status supersedes any state change it reported before.
+fn clear_child_state_events(parent: u64, child: u64) {
+    STOPPED_CHILDREN.lock().remove(&(parent, child));
+    CONTINUED_CHILDREN.lock().remove(&(parent, child));
+}
+
+/// Pop one pending stop report for `parent` matching `wanted`, consuming it.
+pub fn reap_child_stop(parent: u64, wanted: i64) -> Option<(u64, u8)> {
+    let mut m = STOPPED_CHILDREN.lock();
+    let k = m
+        .keys()
+        .find(|(p, c)| *p == parent && child_matches(wanted, *c))
+        .copied()?;
+    m.remove(&k).map(|sig| (k.1, sig))
+}
+
+/// Pop one pending continue report for `parent` matching `wanted`, consuming it.
+pub fn reap_child_continued(parent: u64, wanted: i64) -> Option<u64> {
+    let mut s = CONTINUED_CHILDREN.lock();
+    let k = s
+        .iter()
+        .find(|(p, c)| *p == parent && child_matches(wanted, *c))
+        .copied()?;
+    s.remove(&k);
+    Some(k.1)
+}
+
+/// Is `child` currently reported as stopped (per the event registry)?
+pub fn child_is_stopped(child: u64) -> bool {
+    STOPPED_CHILDREN.lock().keys().any(|(_, c)| *c == child)
+}
+
+// ─── Pending-bit surgery for the stop/continue magic ─────────────────────────
+
+/// Clear every pending stop-class bit of `pid` (a `SIGCONT` generation does
+/// this). Returns `false` when the process is gone.
+///
+/// `PENDING_APPROX` is deliberately NOT decremented: the counter is documented to
+/// overcount (it is an optimistic "is anything deliverable" guard), and
+/// overcounting only costs the real check on the next syscall return.
+pub fn clear_stop_pending(pid: u64) -> bool {
+    COMPAT_STATES
+        .lock()
+        .get_mut(&pid)
+        .map(|cs| cs.sig_pending = flush_stop_bits(cs.sig_pending))
+        .is_some()
+}
+
+/// Clear a pending `SIGCONT` bit of `pid` (generating a stop signal does this).
+pub fn clear_cont_pending(pid: u64) -> bool {
+    COMPAT_STATES
+        .lock()
+        .get_mut(&pid)
+        .map(|cs| cs.sig_pending = flush_cont_bits(cs.sig_pending))
+        .is_some()
+}
+
+/// The pending bit set of `pid` (diagnostics + in-QEMU tests).
+pub fn pending_of(pid: u64) -> u64 {
+    COMPAT_STATES
+        .lock()
+        .get(&pid)
+        .map(|cs| cs.sig_pending)
+        .unwrap_or(0)
+}
+
 /// Whether the currently-running process (per `scheduler::current_pid`) has a
 /// registered [`CompatState`] — i.e. is a Linux `Compat_Process` rather than a
 /// pagh-native task. The dispatcher uses this to decide precedence: a process
@@ -299,6 +436,12 @@ pub fn clone_current_compat(child: u64, tls: Option<u64>, clear_child_tid: u64) 
     child_state.waitable = false;
     child_state.clear_child_tid = clear_child_tid;
     child_state.exit_code = None;
+    // A new thread has no signals queued (Linux: the child's pending set starts
+    // empty; only the disposition table is shared with the group).
+    child_state.sig_pending = 0;
+    // The entry path is per-thread: the new thread's first syscall decides.
+    child_state.int80_entry = false;
+    child_state.int80_refused_logged = false;
     if let Some(base) = tls {
         child_state.fs_base = base;
     }
@@ -339,6 +482,12 @@ pub fn fork_current_compat(child: u64, clear_child_tid: u64) -> bool {
     child_state.waitable = true;
     child_state.clear_child_tid = clear_child_tid;
     child_state.exit_code = None;
+    // Fork does not inherit queued signals (Linux: the child's pending set is
+    // empty even though it inherits the dispositions and the blocked mask), and
+    // its own first syscall decides the entry path observation.
+    child_state.sig_pending = 0;
+    child_state.int80_entry = false;
+    child_state.int80_refused_logged = false;
     states.insert(child, child_state);
     true
 }
@@ -375,6 +524,34 @@ pub fn group_member_pids(tgid: u64, except: u64) -> alloc::vec::Vec<u64> {
         .lock()
         .iter()
         .filter_map(|(pid, s)| (s.tgid == tgid && *pid != except).then_some(*pid))
+        .collect()
+}
+
+/// Every registered pid in thread group `tgid`, the given pid included,
+/// ascending (the registry is a `BTreeMap`, so iteration order is pid order).
+///
+/// The `kill(-pgid)`/`kill(0)` path resolves its targets through this — in
+/// pagh's model the process-group id of a process IS its thread-group id
+/// (`sys_getpgid` reports `current_tgid`, `sys_setpgid` is a no-op). The result
+/// is a SNAPSHOT: callers release the registry lock, then deliver (invariant 4:
+/// never hold `COMPAT_STATES` across the send).
+pub fn group_pids(tgid: u64) -> alloc::vec::Vec<u64> {
+    COMPAT_STATES
+        .lock()
+        .iter()
+        .filter_map(|(pid, s)| (s.tgid == tgid).then_some(*pid))
+        .collect()
+}
+
+/// Snapshot of `(pid, tgid)` for every registered compat process/thread, pid
+/// ascending. One lock acquisition for the whole target resolution of a
+/// `kill(-1)` broadcast, which must not iterate the registry while signals are
+/// being delivered into it.
+pub fn compat_pid_tgid_snapshot() -> alloc::vec::Vec<(u64, u64)> {
+    COMPAT_STATES
+        .lock()
+        .iter()
+        .map(|(pid, s)| (*pid, s.tgid))
         .collect()
 }
 
@@ -425,8 +602,46 @@ pub fn pick_pending_signal() -> Option<(u64, SignalAction, u64, SigAltStack)> {
     if deliverable == 0 {
         return None;
     }
-    let sig = deliverable.trailing_zeros() as u64;
+    // `sigbit(N)` is `1 << (N - 1)`, so the signal number is the index of the
+    // lowest set bit PLUS ONE. Without the +1 this delivered signal N-1 with
+    // N-1's disposition (the real bit stayed pending and was re-picked on every
+    // syscall return), and a pending SIGHUP underflowed `sig - 1` into an
+    // out-of-bounds disposition-table index — a kernel panic (`panic = "abort"`)
+    // on an ordinary self-signal.
+    let sig = deliverable.trailing_zeros() as u64 + 1;
     cs.sig_pending &= !(1u64 << (sig - 1));
+    let action = cs.sig.lock().handlers[(sig - 1) as usize];
+    Some((sig, action, cs.sig_blocked, cs.sig_altstack))
+}
+
+/// Run `f` against the [`CompatState`] of `pid` (any process, not just the
+/// current one), returning `None` when that pid has no compat state.
+///
+/// The lock is held for the duration of `f` (the same rule as
+/// [`with_current_compat`]: `f` must not block or re-enter the registry).
+pub fn with_pid_compat<R>(pid: u64, f: impl FnOnce(&mut CompatState) -> R) -> Option<R> {
+    COMPAT_STATES.lock().get_mut(&pid).map(f)
+}
+
+/// The lowest-numbered deliverable signal for the CURRENT process WITHOUT
+/// consuming it: `(signal, disposition, blocked mask, altstack)`.
+///
+/// The timer-tick delivery needs this to decide what a pending signal WOULD do
+/// (terminate? stop? frame delivery?) before it consumes the bit, because a bit
+/// consumed on a frame it cannot write into (a task interrupted inside a syscall)
+/// would be lost for good — nothing re-queues a signal.
+///
+/// The signal number is the index of the lowest set bit PLUS ONE: `sigbit(N)` is
+/// `1 << (N - 1)`.
+pub fn peek_deliverable_signal() -> Option<(u64, SignalAction, u64, SigAltStack)> {
+    let pid = super::scheduler::current_pid();
+    let states = COMPAT_STATES.lock();
+    let cs = states.get(&pid)?;
+    let deliverable = cs.sig_pending & !cs.sig_blocked;
+    if deliverable == 0 {
+        return None;
+    }
+    let sig = deliverable.trailing_zeros() as u64 + 1;
     let action = cs.sig.lock().handlers[(sig - 1) as usize];
     Some((sig, action, cs.sig_blocked, cs.sig_altstack))
 }
@@ -452,6 +667,30 @@ pub fn current_action(sig: u64) -> Option<SignalAction> {
 pub fn current_has_compat() -> bool {
     let pid = super::scheduler::current_pid();
     COMPAT_STATES.lock().contains_key(&pid)
+}
+
+/// Record that the CURRENT process entered a syscall through `int 0x80`
+/// (AGENTS.md invariant 2 violation for a Compat_Process). No-op for a native
+/// task — it has no compat state to mark.
+pub fn note_int80_entry() {
+    with_current_compat(|cs| cs.int80_entry = true);
+}
+
+/// Has the CURRENT process been observed on the `int 0x80` entry path?
+pub fn current_int80_entry() -> bool {
+    with_current_compat(|cs| cs.int80_entry).unwrap_or(false)
+}
+
+/// Mark the int80-entry delivery refusal as reported for the CURRENT process.
+/// Returns `true` on the first call, so the diagnostic is logged once per
+/// process instead of on every syscall return.
+pub fn note_int80_refused() -> bool {
+    with_current_compat(|cs| {
+        let first = !cs.int80_refused_logged;
+        cs.int80_refused_logged = true;
+        first
+    })
+    .unwrap_or(false)
 }
 
 /// Run `f` against the currently-running process's [`CompatState`], returning

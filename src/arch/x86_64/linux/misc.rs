@@ -234,7 +234,7 @@ pub fn sys_exit_group(code: u64) -> ! {
 /// Phase 1 semantics:
 ///   * with a user handler installed for `sig` (via `rt_sigaction`): the
 ///     signal is queued pending and delivered at this syscall's return point
-///     ([`super::signal::deliver_one_pending`]) — so `raise()`/`abort()`-style
+///     ([`super::signal::deliver_one_pending_syscall`]) — so `raise()`/`abort()`-style
 ///     self-signals run the handler before anything else;
 ///   * without a handler and a default-fatal `sig`: exit the thread group
 ///     with `128 + sig` (Phase-0 behavior kept: an `ENOSYS` here made glibc's
@@ -242,25 +242,75 @@ pub fn sys_exit_group(code: u64) -> ! {
 ///     after every "Fatal Python error");
 ///   * without a handler and a non-fatal `sig`: accepted and ignored
 ///     (`SIGCHLD`, `SIGCONT`, `SIGWINCH`, ... must not self-destruct).
-pub fn sys_tgkill(_tgid: u64, _tid: u64, sig: u64) -> Result<u64, Errno> {
-    if sig == 0 {
-        return Ok(0);
-    }
-    if sig > super::signal_frame::SIGNAL_COUNT as u64 {
+pub fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> Result<u64, Errno> {
+    // ALL THREE arguments are C `int`s: truncate each to 32 bits and sign-extend
+    // before anything else. `sig` additionally indexes the disposition table by
+    // `sig - 1`, so a "negative" signal (0xFFFF_FFFF as `int`) would underflow that
+    // index and panic the kernel (`panic = "abort"` → the machine dies on an
+    // untrusted syscall argument) — the validation is the shared
+    // `kill::kill_sig_valid`, one implementation for the whole family.
+    let sig = super::kill::decode_sig(sig);
+    let tgid = super::kill::decode_pid(tgid);
+    let tid = super::kill::decode_pid(tid);
+    if !super::kill::kill_sig_valid(sig) {
         return Err(Errno::EINVAL);
     }
-    match super::signal::current_has_handler(sig) {
+    // ESRCH — the (tgid, tid) PAIR is what `tgkill` addresses, and Linux's
+    // `do_tkill` rejects it unless the thread exists AND belongs to that thread
+    // group (`task_tgid_vnr(p) != tgid` → ESRCH). Without this, `tgkill(self,
+    // 999999, 0)` "succeeded" against a thread id that does not exist. A
+    // nonexistent `tgid` cannot match either, so it lands here too; note that the
+    // group's id stays valid while ANY of its threads is alive, even after the
+    // leader has exited (the registry keeps `tgid` per thread).
+    if tid <= 0 {
+        return Err(Errno::ESRCH);
+    }
+    let tid = tid as u64;
+    if !compat::compat_exists(tid) {
+        return Err(Errno::ESRCH);
+    }
+    if tgid <= 0 || tgid as u64 != compat::tgid_of(tid) {
+        return Err(Errno::ESRCH);
+    }
+    if sig == 0 {
+        // Existence probe: the pair is valid, nothing is sent.
+        return Ok(0);
+    }
+    let sig = sig as u64;
+    // The disposition table is shared by the whole thread group (CLONE_THREAD
+    // shares it), so asking for the CALLER's action is the same as asking for the
+    // addressed thread's when they are in one group; for a foreign thread the
+    // lookup below simply finds no handler and the default action applies.
+    let has_handler = if tid == scheduler::current_pid() {
+        super::signal::current_has_handler(sig)
+    } else {
+        // A foreign target: its own table decides. `None` (no compat state) cannot
+        // happen here — the pair check above proved it exists.
+        Some(super::signal::has_handler_for(tid, sig))
+    };
+    match has_handler {
         Some(true) => {
-            super::signal::send_signal(scheduler::current_pid(), sig)?;
+            super::signal::send_signal(tid, sig)?;
             Ok(0)
         }
         Some(false) => {
             if crate::arch::x86_64::linux::signal_frame::default_is_fatal(sig) {
-                crate::info!(
-                    "[linux] tgkill: fatal signal {} to self - exiting thread group",
-                    sig
-                );
-                sys_exit_group(128 + sig)
+                if tid == scheduler::current_pid() {
+                    // Phase-0 behavior kept: a fatal self-signal (glibc `abort()`)
+                    // exits the caller's thread group from here.
+                    crate::info!("[linux] tgkill: fatal signal {} to self - exiting", sig);
+                    sys_exit_group(128 + sig)
+                } else {
+                    // A fatal signal aimed at another thread must kill THAT group,
+                    // not the caller's.
+                    crate::info!(
+                        "[linux] tgkill: fatal signal {} to tid={} - terminating its group",
+                        sig,
+                        tid
+                    );
+                    super::signal::terminate_group(tid, sig);
+                    Ok(0)
+                }
             } else {
                 Ok(0)
             }
@@ -480,7 +530,7 @@ pub fn sys_sched_yield() -> Result<u64, Errno> {
 /// `{ handler, flags, restorer, mask }`. The handler address is stored
 /// verbatim — `SIG_DFL` (0) and `SIG_IGN` (1) are the special values — and
 /// delivery applies `sa_mask` for the handler's lifetime
-/// ([`super::signal::deliver_one_pending`]).
+/// ([`super::signal::deliver_one_pending_syscall`]).
 ///
 /// `oldact`, when requested, receives the CURRENT disposition so
 /// save-and-restore users (bash, readline) round-trip exactly. `SIGKILL` and

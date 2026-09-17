@@ -106,6 +106,126 @@ fn take_exiting(pid: u64) -> bool {
     EXITING_PIDS.lock().remove(&pid)
 }
 
+/// Pids with a pending STOP request: the next time this task's frame is saved
+/// for a requeue decision — the timer tick, or the cooperative `yield_switch` —
+/// the frame is parked instead of put back into rotation.
+///
+/// Stop is a *delivery-time* action (Linux: "the actual stopping ... is done as a
+/// signal action for `SIG_DFL`"), while `SIGCONT`'s resume is done at
+/// *generation* time by the sender. A stopped task can therefore only ever be
+/// parked by one of the two paths that save a frame; the signal code cannot do it
+/// itself, because a task's saved RSP exists only in the ready queue and dropping
+/// it would lose the task.
+static STOP_REQUESTED: Spinlock<BTreeSet<u64>> = Spinlock::new(BTreeSet::new());
+
+/// Frames of the tasks parked in the stopped state: `pid -> (saved kernel RSP,
+/// cr3)`.
+///
+/// A stopped task is NOT dropped — that is what [`EXITING_PIDS`] is for. Its saved
+/// frame moves out of the ready queue into this map, so `SIGCONT` can put it back
+/// with its exact instruction pointer, stack pointer and address space.
+///
+/// Invariants:
+///   * a pid is in at most ONE of {ready queue, `STOPPED_TASKS`,
+///     `EXITING_PIDS`} — the three are the mutually exclusive rotation states;
+///   * parking validates the frame (`check_frame`) and stamps the ledger
+///     (`stamp_save`), exactly like `requeue`, so a resumed frame is checked
+///     again by the normal restore path;
+///   * the address space is remembered per parked task, because the exit reaper
+///     must use THAT cr3 (see [`pend_reap_with`]).
+static STOPPED_TASKS: Spinlock<BTreeMap<u64, (u64, u64)>> = Spinlock::new(BTreeMap::new());
+
+/// Ask for `pid` to be parked the next time its frame is saved. Idempotent.
+pub fn mark_stop_requested(pid: u64) {
+    STOP_REQUESTED.lock().insert(pid);
+}
+
+/// Atomically test-and-clear the stop request for `pid`.
+fn take_stop_requested(pid: u64) -> bool {
+    STOP_REQUESTED.lock().remove(&pid)
+}
+
+/// Is `pid` currently parked in the stopped state?
+pub fn is_stopped(pid: u64) -> bool {
+    STOPPED_TASKS.lock().contains_key(&pid)
+}
+
+/// Park a task's just-saved frame: validate + stamp it, then move it out of
+/// rotation into [`STOPPED_TASKS`].
+fn park_stopped(pid: u64, rsp: u64, cr3: u64) {
+    // The request that led here — and any request still queued for a task whose
+    // frame another caller parked first (`stop_ready_pids`) — is satisfied by this
+    // park: drop it, or the leftover would re-park the task at its next tick AFTER
+    // a SIGCONT resumed it (the task then looks stopped while it is running).
+    STOP_REQUESTED.lock().remove(&pid);
+    check_frame("park-stopped", pid, rsp);
+    stamp_save(pid, rsp);
+    STOPPED_TASKS.lock().insert(pid, (rsp, cr3));
+}
+
+/// Park tasks whose frames are ALREADY saved: drain them out of the ready queue
+/// into [`STOPPED_TASKS`]. Used to stop every thread of a group except the one
+/// that is currently running (the receiver parks itself at its delivery point).
+///
+/// One lock order only (READY_QUEUE → STOPPED_TASKS) and the first lock masks
+/// interrupts, so a tick cannot observe a frame in neither place. Returns how
+/// many tasks were parked.
+pub fn stop_ready_pids(pids: &[u64]) -> usize {
+    let mut frames: alloc::vec::Vec<(u64, u64, u64)> = alloc::vec::Vec::new();
+    {
+        let mut q = READY_QUEUE.lock();
+        let mut i = 0;
+        while i < q.len() {
+            if pids.contains(&q[i].pid) {
+                if let Some(t) = q.remove(i) {
+                    frames.push((t.pid, t.kernel_rsp, t.cr3));
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    let n = frames.len();
+    for (pid, rsp, cr3) in frames {
+        park_stopped(pid, rsp, cr3);
+    }
+    n
+}
+
+/// Put a parked task back into rotation with its exact saved frame, stamped and
+/// validated by the ordinary `requeue`. Returns `false` when `pid` was not parked
+/// (nothing to resume), so a `SIGCONT` to a running process is a no-op.
+pub fn resume_stopped(pid: u64) -> bool {
+    // A resumed task is not stopped: a stop request that has not been honoured yet
+    // must not park it at the next tick (POSIX: SIGCONT discards pending stop
+    // signals).
+    STOP_REQUESTED.lock().remove(&pid);
+    let Some((rsp, cr3)) = STOPPED_TASKS.lock().remove(&pid) else {
+        return false;
+    };
+    requeue(Tcb {
+        pid,
+        kernel_rsp: rsp,
+        cr3,
+    });
+    true
+}
+
+/// Forget a stop request that an outside event superseded (the task is being
+/// killed, or a test cancelled the stop before the tick could act on it). The
+/// request set has no other consumer: a request that is never acted on would park
+/// the task at its next tick even though the reason for the stop is gone.
+pub fn cancel_stop_request(pid: u64) {
+    STOP_REQUESTED.lock().remove(&pid);
+}
+
+/// Remove and return a parked task's saved frame. The caller is terminating the
+/// task: the frame will never be restored, so it must be reaped with the cr3
+/// returned here (never the currently loaded one).
+fn take_stopped_frame(pid: u64) -> Option<(u64, u64)> {
+    STOPPED_TASKS.lock().remove(&pid)
+}
+
 /// Deferred exit-cleanup work for one dropped task (the reap registry).
 struct ExitReap {
     /// The address space the task ran in (`current_pml4_phys()` captured by
@@ -125,9 +245,38 @@ static PENDING_REAPS: Spinlock<BTreeMap<u64, ExitReap>> = Spinlock::new(BTreeMap
 /// stamp (its saved frame will never be restored again). Called from the tick
 /// that drops the task.
 fn pend_reap(pid: u64) {
-    let cr3 = vmm::current_pml4_phys();
+    pend_reap_with(pid, vmm::current_pml4_phys());
+}
+
+/// Queue a NON-current task's memory for reclamation together with the address
+/// space it actually ran in.
+///
+/// [`pend_reap`]'s `current_pml4_phys()` is only correct for the task the tick is
+/// dropping, because that call runs on the dropped task's own stack. A parked
+/// (stopped) task that is force-killed from outside is NOT current, so reusing
+/// the current CR3 would make the reaper test — and possibly free — a foreign
+/// address space, while the parked task's own user PML4 leaks. The frame is
+/// stamped out of the ledger here for the same reason as in [`pend_reap`].
+fn pend_reap_with(pid: u64, cr3: u64) {
     PENDING_REAPS.lock().insert(pid, ExitReap { cr3 });
     FRAME_LEDGER.lock().remove(&pid);
+}
+
+/// Drop the CURRENTLY-RUNNING task right now (the tick decided it must not run
+/// again: a tick-delivered fatal signal, or an `rt_sigframe` that could not be
+/// placed).
+///
+/// This context is still running ON that task's kernel stack, so the memory can
+/// only be released by a later tick's reaper ([`pend_reap`] captures the address
+/// space that is loaded RIGHT NOW — correct here, because the running task's CR3
+/// is its own). The rotation marks the kill path may have set are cleared: they
+/// are consumed only by a tick that sees the pid as CURRENT, which this task never
+/// will again — a leftover would linger in `EXITING_PIDS` forever.
+pub fn drop_current_now() {
+    let pid = current_pid();
+    let _ = take_exiting(pid);
+    STOP_REQUESTED.lock().remove(&pid);
+    pend_reap(pid);
 }
 
 /// Reclaim the resources of ONE dropped task (oldest first): unmap and free
@@ -532,11 +681,35 @@ pub extern "C" fn scheduler_tick_irq(current_rsp: u64) -> u64 {
         // Preserve the outgoing task's FPU/SSE state before it can be
         // overwritten by the incoming task's restore below.
         crate::task::fpu::save_if_user(cur, current_rsp);
-        requeue(Tcb {
-            pid: cur,
-            kernel_rsp: current_rsp,
-            cr3: vmm::current_pml4_phys(),
-        });
+        let cr3 = vmm::current_pml4_phys();
+        // Signal delivery from the tick path (issue #12 task t9): the LAST chance
+        // for a task that never enters a syscall (a CPU-bound loop) to see a
+        // signal. The delivery happens HERE — before the requeue decision, on the
+        // CURRENT task's frame, with its own CR3 loaded — so the frame the
+        // scheduler requeues is the one the handler will be entered with. The
+        // frame layout is read through `trap_frame::IrqFrame`, never through the
+        // syscall `SavedRegs` cast (see that module).
+        let tick = crate::arch::x86_64::linux::signal::tick_action(current_rsp);
+        if tick == crate::arch::x86_64::linux::signal::TickAction::Kill {
+            // The tick killed this task (fatal default action, or its rt_sigframe
+            // could not be placed): drop it now, with its own address space, and
+            // never requeue it.
+            crate::trace!("[SCHED] task {} killed by tick-delivered signal", cur);
+            drop_current_now();
+        } else if take_stop_requested(cur) {
+            // A stop signal was delivered to this task (from the tick path above or
+            // from the syscall-return path that yielded): park its frame instead of
+            // requeueing it. The frame stays in STOPPED_TASKS until SIGCONT puts it
+            // back, so the task resumes at this exact point.
+            crate::trace!("[SCHED] task {} parked (stopped)", cur);
+            park_stopped(cur, current_rsp, cr3);
+        } else {
+            requeue(Tcb {
+                pid: cur,
+                kernel_rsp: current_rsp,
+                cr3,
+            });
+        }
     }
 
     // Release the memory of previously dropped tasks (oldest first, at most
@@ -612,8 +785,24 @@ pub extern "C" fn scheduler_yield_switch(current_rsp: u64) -> u64 {
 
     let next = match schedule() {
         Some(tcb) => tcb,
-        // Nothing else ready: resume the caller's own frame.
-        None => return current_rsp,
+        // Nothing else ready: resume the caller's own frame — UNLESS this yield is
+        // how a stop signal takes effect. A stopped task must not be restored by
+        // its own yield (its frame is now in STOPPED_TASKS and restoring it here
+        // would run the task and leave a duplicate frame behind), so hand the CPU
+        // to the idle task exactly like the tick's empty-queue path does.
+        None => {
+            if !is_idle(cur) && take_stop_requested(cur) {
+                crate::task::fpu::save_if_user(cur, current_rsp);
+                crate::trace!("[SCHED] task {} parked (stopped, empty queue)", cur);
+                park_stopped(cur, current_rsp, vmm::current_pml4_phys());
+                set_current_pid(IDLE_PID);
+                let rsp = idle_rsp();
+                check_frame("restore-yield-idle", IDLE_PID, rsp);
+                stamp_restore(IDLE_PID, rsp);
+                return rsp;
+            }
+            return current_rsp;
+        }
     };
 
     // Preserve the yielding task's FPU/SSE state before the incoming task's
@@ -624,9 +813,13 @@ pub extern "C" fn scheduler_yield_switch(current_rsp: u64) -> u64 {
 
     // Requeue the yielding task BEFORE the stack switch (see doc above). The
     // idle task is never queued; it parks its frame in the dedicated slot,
-    // mirroring the preemptive path.
+    // mirroring the preemptive path. A stop request parks the frame instead of
+    // requeueing it (see `STOPPED_TASKS`).
     if is_idle(cur) {
         save_idle_rsp(current_rsp);
+    } else if take_stop_requested(cur) {
+        crate::trace!("[SCHED] task {} parked (stopped)", cur);
+        park_stopped(cur, current_rsp, vmm::current_pml4_phys());
     } else {
         requeue(Tcb {
             pid: cur,
@@ -680,8 +873,21 @@ pub extern "C" fn scheduler_yield_switch(current_rsp: u64) -> u64 {
 /// Linux-compat state right away so waiters (`lxrun`'s foreground loop) see
 /// it disappear. The task itself notices nothing special — its next blocking
 /// yield never returns.
+///
+/// A PARKED (stopped) task is the exception, and the two defects this closes:
+/// `EXITING_PIDS` is consumed by the tick only for the task that is CURRENT, and
+/// a parked task can never become current again — a mark would linger there
+/// forever while the frame stayed parked. Its saved frame is therefore taken out
+/// of `STOPPED_TASKS` here and queued for the reaper directly, with the cr3 it
+/// was parked with (`pend_reap_with`), never with the currently loaded one.
 pub fn request_exit(pid: u64) {
     crate::task::compat::remove_compat(pid);
+    if let Some((_rsp, cr3)) = take_stopped_frame(pid) {
+        STOP_REQUESTED.lock().remove(&pid);
+        crate::trace!("[SCHED] parked task {} killed", pid);
+        pend_reap_with(pid, cr3);
+        return;
+    }
     mark_exiting(pid);
 }
 

@@ -170,6 +170,29 @@ pub mod fd_alloc;
 #[path = "../../src/arch/x86_64/linux/signal_frame.rs"]
 pub mod signal_frame;
 
+// `kill` is the pure `kill(2)` argument/target/errno model (issue #12): 32-bit
+// argument decoding, the `pid > 0 / 0 / -1 / -pgid / INT_MIN` classification,
+// the single-uid permission policy, and the one-thread-per-group pick. It uses
+// only `super::errno` — declared here as a crate-root sibling, exactly like
+// `io` — so the standalone `#[path]` include resolves with no extra wiring
+// (property `kill_target`).
+#[path = "../../src/arch/x86_64/linux/kill.rs"]
+pub mod kill;
+
+// `regs` is the pure 15-GPR syscall frame contract (`repr(C)`, `rax` at offset
+// 112) — `core`-only and self-contained, included here so the tick-path frame
+// mirror below can be asserted against the REAL struct rather than a copy.
+#[path = "../../src/arch/x86_64/linux/regs.rs"]
+pub mod regs;
+
+// `trap_frame` is the pure mirror of the frame `irq32_stub` leaves on the kernel
+// stack plus the timer-tick delivery plan (issue #12, task t9): the adapter that
+// makes it impossible to confuse the IRQ frame's `rax` (+120) with the syscall
+// frame's user-RSP slot. Its `const` assertions pin the offsets `src/test.rs`
+// asserts byte-for-byte in-QEMU (property `irq_frame`).
+#[path = "../../src/arch/x86_64/linux/trap_frame.rs"]
+pub mod trap_frame;
+
 // `x509` is the pure minimal DER (ASN.1) reader + X.509 time decoding that the
 // TLS server-certificate verifier (issue #14) is built on. `core`-only and
 // self-contained — its calendar math deliberately duplicates
@@ -225,6 +248,30 @@ pub mod tls_auth;
 // that no CI job could reach, because no CI job ever boots the kernel.
 #[path = "../../src/fs/format_policy.rs"]
 pub mod format_policy;
+
+
+// ── OpenPGP repository-metadata verification (issue #32) ─────────────────────
+// The pure verifier the `apt` trust chain will use: packet/armor parsing,
+// signature verification (RSA PKCS#1 v1.5, EdDSA, ECDSA), subkey binding,
+// expiry/revocation/key-flag policy and the `Release.gpg` / `InRelease` entry
+// points. `core` + `alloc` only, so the host tests exercise the same source the
+// kernel compiles; P51–P53 drive it with GnuPG-produced fixtures and with the
+// committed Debian archive keyring.
+#[path = "../../src/pkg/openpgp_crypto.rs"]
+pub mod openpgp_crypto;
+
+#[path = "../../src/pkg/openpgp_packet.rs"]
+pub mod openpgp_packet;
+
+#[path = "../../src/pkg/openpgp.rs"]
+pub mod openpgp;
+
+// The GENERATED trust store (tools/gen_debian_keyring.py): the pinned Debian
+// archive keys as exact keyring byte ranges plus their fingerprints, algorithm,
+// size and validity window. P53 re-derives every pinned value from those bytes
+// and verifies the keys' real GnuPG self-signatures and subkey bindings.
+#[path = "../../src/pkg/openpgp_keys.rs"]
+pub mod openpgp_keys;
 
 // `procfs_format` is the pure text rendering + path/inode table behind the
 // synthetic `/proc` (issue #11, contract `docs/procfs.md`). `core` + `alloc` only
@@ -315,6 +362,37 @@ mod properties {
     // Boot-time device safety (issue #33): only a genuinely blank device is
     // formatted; GPT/MBR/foreign/ext2-like layouts are refused.
     mod p50;
+    // OpenPGP repository-metadata verification (issue #32), contract
+    // OPENPGP-VERIFY-CONTRACT.md §2/§3/§7.
+    //   P51 — armor/packet framing: bounded, panic-free parsing of hostile bytes.
+    //   P52 — signature policy: real GnuPG signatures accept, every tamper class
+    //         (data, signature, foreign signer, expired key, clock) refuses.
+    //   P53 — the committed Debian keyring: pinned fingerprints/metadata agree
+    //         with the bytes, and the keys' real self-signatures and subkey
+    //         bindings verify through this implementation.
+    mod openpgp_fixtures;
+    mod p51;
+    mod p52;
+    mod p53;
+    // `kill(2)` argument decoding + target classification + errno matrix
+    // (issue #12): the decisions `signal::sys_kill` makes before touching the
+    // compat registry. Deliberately NOT numbered p51+: the OpenPGP verification
+    // task owns the p51–p53 range, so this property uses a descriptive module
+    // name instead of racing for a number.
+    mod kill_target;
+    // SIGSTOP/SIGCONT as scheduler state (issue #12, task t8): the pure half of
+    // job control — the `wait(2)` status encodings (`WIFSTOPPED`/`WIFCONTINUED`
+    // can never collide with an exit status), the stop-class set (exactly the
+    // signals whose default action is Stop), and the POSIX flushes (SIGCONT
+    // discards every pending stop-class bit; a stop signal discards a pending
+    // SIGCONT). Descriptive module name, same reason as `kill_target`.
+    mod signal_stop;
+    // The timer-tick frame adapter (issue #12, task t9): iret-frame mirror, the
+    // ring-3 classification, the exact handler-entry mutation set, the
+    // "delivered signal == consumed signal" guard and the rt_sigframe round trip
+    // for a tick-delivered signal. Descriptive module name, same reason as
+    // `kill_target`.
+    mod irq_frame;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the

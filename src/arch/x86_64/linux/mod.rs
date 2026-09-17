@@ -16,6 +16,7 @@ pub mod abi;
 pub mod diag;
 pub mod dirent;
 pub mod io;
+pub mod kill;
 pub mod mem;
 pub mod misc;
 pub mod rand_clock;
@@ -36,6 +37,7 @@ pub mod process_sys;
 pub mod rtc;
 pub mod signal;
 pub mod signal_frame;
+pub mod trap_frame;
 pub mod unix_sock;
 
 use abi::nr as sysno;
@@ -288,6 +290,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::MPROTECT => mem_sys::sys_mprotect(a[0], a[1], a[2]),
         // `madvise` is purely advisory: accept every hint and do nothing.
         sysno::TGKILL => misc::sys_tgkill(a[0], a[1], a[2]),
+        sysno::KILL => signal::sys_kill(a[0], a[1]),
         sysno::MADVISE => Ok(0),
         // ── Misc + process (task 12.5) ──
         sysno::GETPID => misc::sys_getpid(),
@@ -320,8 +323,18 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         // `Result` arm type.
         sysno::EXIT => misc::sys_exit(a[0]),
         sysno::EXIT_GROUP => misc::sys_exit_group(a[0]),
-        // Unreachable: `is_supported` gated everything else to ENOSYS already.
-        _ => Err(Errno::ENOSYS),
+        // Tripwire for `abi::SUPPORTED_SYSCALLS` drift: a number the gate
+        // accepted must have a real arm above. Reaching this line means the
+        // enumerated coverage list and this match disagree, so say which number
+        // it is instead of returning a silent, permanent ENOSYS (the test in
+        // `abi.rs` locks the numbers; this locks the arms).
+        _ => {
+            crate::error!(
+                "[linux] nr={} is gated as supported but has NO dispatch arm (SUPPORTED_SYSCALLS drift)",
+                nr
+            );
+            Err(Errno::ENOSYS)
+        }
     }
 }
 
@@ -369,7 +382,23 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
 /// The boot-time selftest calls the dispatcher DIRECTLY and passes `0` instead:
 /// it runs on the boot thread, which is not a schedulable task (see
 /// `linux_dispatch`).
+/// Bit 0 of [`linux_dispatch`]'s `reentry_allowed` argument: the caller is a real
+/// syscall on a schedulable task (both entry stubs pass it), so the dispatcher
+/// may unmask interrupts for the handler's duration.
 pub const REENTRY_ALLOWED: u64 = 1;
+
+/// Bit 1 of `reentry_allowed`: the syscall arrived through `int 0x80` (only
+/// `syscall::int80_stub` sets it, i.e. the legacy pagh-native entry).
+///
+/// AGENTS.md invariant 2 forbids that path for a Compat_Process: on it the saved
+/// `rcx`/`r11` are ordinary user GPRs and the word at `SavedRegs + 120` is the
+/// CPU-pushed user RIP — not the per-task user-RSP slot `execve`, `clone` and
+/// signal delivery depend on. `linux_dispatch` records the observation on the
+/// process so the signal path can refuse frame delivery
+/// (`signal::deliver_one_pending_syscall`) instead of writing an `rt_sigframe`
+/// over the user's code. Native tasks have no compat state (the flag is then
+/// recorded nowhere) and keep working unchanged.
+pub const INT80_ENTRY: u64 = 2;
 
 /// # Safety
 ///
@@ -413,8 +442,16 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs, reentry_allowed: u64) -> 
     // and leaves interrupts exactly as it found them; the boot thread reaches
     // the idle loop still masked and `boot::kernel_main` enables them there,
     // as designed.
-    if reentry_allowed == REENTRY_ALLOWED {
+    if reentry_allowed & REENTRY_ALLOWED != 0 {
         crate::arch::cpu::enable_interrupts();
+    }
+
+    // The `int 0x80` observation (bit 1) is recorded per process, never acted on
+    // here: the dispatcher itself can serve such a caller (the legacy native
+    // process and the pre-migration compat test binary both did), but the
+    // signal-frame path cannot trust its saved-register meaning (see INT80_ENTRY).
+    if reentry_allowed & INT80_ENTRY != 0 {
+        crate::task::compat::note_int80_entry();
     }
 
     let (nr, args) = abi::marshal_args(r.rax, r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9);
@@ -487,7 +524,7 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs, reentry_allowed: u64) -> 
     // syscall's result travels inside the frame's saved `rax`, so a handler
     // that returns via `rt_sigreturn` resumes with the correct value.
     // Native tasks (no compat state) pass through with one atomic load.
-    signal::deliver_one_pending(r, out);
+    signal::deliver_one_pending_syscall(r, out);
     out
 }
 
@@ -512,6 +549,18 @@ fn inflight_enter(pid: u64, nr: u64, arg0: u64) {
 
 fn inflight_exit(pid: u64) {
     SYSCALL_INFLIGHT.lock().remove(&pid);
+}
+
+/// Restart the stuck-syscall clock of `pid`'s in-flight entry (called when a task
+/// that was parked by SIGSTOP is resumed). Without it the paused interval would
+/// count towards the watchdog age and a resumed task could be reported as "stuck"
+/// the moment it continues.
+pub fn inflight_refresh(pid: u64) {
+    let now = crate::task::scheduler::ticks();
+    if let Some(e) = SYSCALL_INFLIGHT.lock().get_mut(&pid) {
+        e.2 = now;
+        e.3 = 0;
+    }
 }
 
 /// Human name for the syscalls a task can realistically block in.
@@ -566,6 +615,15 @@ pub fn watchdog_tick() {
     for (pid, (nr, arg0, start, warned, _dumped)) in snapshot {
         if !crate::task::compat::compat_exists(pid) {
             SYSCALL_INFLIGHT.lock().remove(&pid);
+            continue;
+        }
+        // A task parked by SIGSTOP is not stuck: it is STOPPED, and its in-flight
+        // entry simply freezes with it (a task blocked in a wait loop can be parked
+        // from another context by a group stop). Reporting it would make
+        // `[WATCHDOG]` — an E2E problem marker — fire for a process that is doing
+        // exactly what it was told to do. The entry's clock is restarted on resume
+        // (`inflight_refresh`), so the paused time never counts as "stuck".
+        if crate::task::scheduler::is_stopped(pid) {
             continue;
         }
         let age = now.saturating_sub(start);
