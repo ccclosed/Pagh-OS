@@ -502,12 +502,12 @@ CANON_SKIP_SUFFIX = (".cmd", ".ps1")
 #: Files whose examples are stale while the branch that rewrites them is still in flight.
 #: Reported as NOTE (never a silent pass), and the entry becomes a FINDING once the file is
 #: clean — so it cannot outlive the branch it describes (`ALLOWED_MISSING` discipline).
-CANON_PENDING: dict[str, str] = {
-    "tools/e2e.py": "the Linux E2E driver lives on tools/e2e-verify-integrity, which merges "
-                    "before this branch; its hint 'run: python tools/limine.py' (:625) must "
-                    "be spelled `python3` in the commit that drops the ALLOWED_MISSING "
-                    "entries",
-}
+#: Empty today: `tools/e2e.py` carried one stale hint (`run: python tools/limine.py`) until
+#: tools/e2e-verify-integrity f2bda5d spelled it `python3`, and the entry was removed with
+#: that commit rather than left to rot. The mechanism stays for the next branch in flight —
+#: `--probe src-canon-pending-stale` exercises the expiry path, which an empty dict would
+#: otherwise leave untested.
+CANON_PENDING: dict[str, str] = {}
 
 
 def canon_scan_files(root: str) -> list[str]:
@@ -770,6 +770,8 @@ PROBES: list[tuple[str, str, str]] = [
     ("src-cargo-trap", "SOURCE: dependency version bumped, [package] untouched", ""),
     ("src-canon-example", "SOURCE: a stale `python tool.py` example in a Linux-facing file",
      "bare 'python' in a usage example"),
+    ("src-canon-pending-stale", "the gate's own knob: a clean file declared as in flight",
+     "CANON_PENDING says the file still has a stale"),
     ("src-shebang", "SOURCE: a tool shebang that spells the interpreter bare",
      "shebang '#!/usr/bin/env python'"),
     ("doc-exception-stale", "ALLOWED_MISSING: the in-flight path appears, the excuse must go",
@@ -777,6 +779,16 @@ PROBES: list[tuple[str, str, str]] = [
     ("src-untracked", "SOURCE: a checkout where the documented path is present but uncommitted",
      "not tracked by git"),
 ]
+
+
+#: Probes that patch one of the gate's own knobs instead of a file. The knobs are read from
+#: THIS module, not from the scratch tree, so a file edit in the copy could not change them;
+#: the patch lives only for the duration of that run, and the scratch tree stays a faithful
+#: copy of the repository.
+MEMORY_PROBES: dict[str, dict[str, object]] = {
+    "src-canon-pending-stale": {"CANON_PENDING": {"tools/limine.py": "probe: pretend it is "
+                                                                     "in flight and stale"}},
+}
 
 
 def probe(root: str) -> int:
@@ -790,7 +802,13 @@ def probe(root: str) -> int:
                 print(f"PROBE {name:20} ERROR   {exc}")
                 ok = False
                 continue
-            rep = run_checks(tmp, quiet=True)
+            patched = MEMORY_PROBES.get(name, {})
+            saved = {k: globals()[k] for k in patched}
+            globals().update(patched)
+            try:
+                rep = run_checks(tmp, quiet=True)
+            finally:
+                globals().update(saved)
             if not marker:  # self-asserting probe: it raised on any unexpected finding
                 caught, detail = True, "-> self-asserting: no spurious finding appeared"
             else:
@@ -808,6 +826,8 @@ def probe(root: str) -> int:
 
 def apply_probe(root: str, name: str) -> None:
     doc = os.path.join(root, "AGENTS.md")
+    if name in MEMORY_PROBES:
+        return  # nothing on disk: the probe patches the gate's own knob, see MEMORY_PROBES
     if name == "doc-version":
         _sub(doc, VERSION_CLAIM, lambda m: m.group(0).replace(m.group(1), "9.9.9"))
     elif name == "doc-lockfile":
