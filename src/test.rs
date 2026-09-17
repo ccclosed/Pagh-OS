@@ -3705,6 +3705,25 @@ mod linux_stop_tests {
         let me = scheduler::current_pid();
 
         // ── A. Scheduler-level stop/continue on a CPU-bound task ────────────
+        // A kernel thread needs `KERNEL_STACK_PAGES` (64) frames for its stack, and
+        // this routine runs LAST in the suite — after dozens of routines that
+        // allocate PMM frames. `kernel_thread_spawn` panics (SCHED: PMM OOM) when the
+        // pool is empty, and a panic takes the whole machine with it (and with it the
+        // verdict of every routine that has not run yet). Detect the starved state and
+        // report it as a FAIL with the number instead of dying.
+        let free_before = crate::memory::pmm::free_frames();
+        crate::kprintln!(
+            "[stop-test] free PMM frames before spawning (need {}): {}",
+            2 * crate::memory::layout::KERNEL_STACK_PAGES,
+            free_before
+        );
+        if free_before < (2 * crate::memory::layout::KERNEL_STACK_PAGES + 8) as usize {
+            assert_kernel!(
+                false,
+                "stop-test: PMM starved - the two kernel threads this routine needs cannot be spawned; the suite leaks frames, the SIGSTOP/SIGCONT feature itself is not implicated (see the free-frames line above)"
+            );
+            return;
+        }
         SPIN_COUNT.store(0, Ordering::Relaxed);
         let pid = scheduler::kernel_thread_spawn(spin_entry);
         install_fake(pid, me, true);
