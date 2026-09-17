@@ -2748,12 +2748,22 @@ mod fs_prop_tests {
                 return;
             }
         };
-        let inner = mkfile("lxwalk_dir/inner", b"inner");
-        let _ = inner;
+        // A file *inside* the scratch directory (a name containing '/' is
+        // rejected by the writer — see the guard check below).
+        let inner_ok = match dir.create_file("inner") {
+            Ok(f) => f.write(0, b"inner").is_ok(),
+            Err(_) => false,
+        };
+        assert_kernel!(inner_ok, "links: the scratch directory holds a file");
+        assert_kernel!(
+            dir.create_file("bad/name").is_err(),
+            "links: a name containing '/' is refused (unreachable entry)"
+        );
 
         let ok = mk("lxwalk_rel", b"lxwalk_target")
             && mk("lxwalk_abs", b"/mnt/lxwalk_target")
             && mk("lxwalk_mid", b"lxwalk_dir")
+            && mk("lxwalk_dirlink", b"/mnt/lxwalk_dir")
             && mk("lxwalk_dang", b"/mnt/lxwalk_absent")
             && mk("lxwalk_loop_a", b"/mnt/lxwalk_loop_b")
             && mk("lxwalk_loop_b", b"/mnt/lxwalk_loop_a");
@@ -2804,12 +2814,19 @@ mod fs_prop_tests {
         }
 
         // ── `..` after a jump belongs to the target ──────────────────────
-        if let Some(node) = walk_ok("/mnt/lxwalk_abs/../lxwalk_rel", true) {
+        if let Some(node) = walk_ok("/mnt/lxwalk_dirlink/../lxwalk_rel", true) {
             assert_kernel!(
                 node.fs_ino() == target.fs_ino(),
                 "links: '..' after a link jump is applied to the target's directory"
             );
         }
+        // A link to a *file* with components after it is ENOTDIR (not a silent
+        // walk into the file's block map).
+        assert_eq_kernel!(
+            walk_err("/mnt/lxwalk_abs/..", true),
+            Some(crate::vfs::link_walk::WalkError::NotDir),
+            "links: a component below a file link is NotDir (ENOTDIR)"
+        );
 
         // ── dangling link ────────────────────────────────────────────────
         if let Some(link) = walk_ok("/mnt/lxwalk_dang", false) {
@@ -2839,6 +2856,7 @@ mod fs_prop_tests {
             "lxwalk_rel",
             "lxwalk_abs",
             "lxwalk_mid",
+            "lxwalk_dirlink",
             "lxwalk_dang",
             "lxwalk_loop_a",
             "lxwalk_loop_b",

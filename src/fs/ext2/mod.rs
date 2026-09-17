@@ -1170,6 +1170,13 @@ impl Ext2Fs {
         if name.is_empty() || name == "." || name == ".." {
             return Err(FsError::Corrupt);
         }
+        // A directory entry name never contains a separator: every caller splits
+        // the path first, and an entry created with a '/' in its name could never
+        // be looked up again (`lookup_entry` splits on '/') — an unreachable,
+        // unremovable file. Refuse it at the writer.
+        if name.contains('/') {
+            return Err(FsError::Corrupt);
+        }
         if name.as_bytes().len() > 255 {
             return Err(FsError::NameTooLong);
         }
