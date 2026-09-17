@@ -72,7 +72,6 @@ TARGET = "x86_64-unknown-none"
 CACHE = ROOT / ".cache"
 BACKUP_DIR = CACHE / "e2e_backup"
 BACKUP_MANIFEST = BACKUP_DIR / "manifest.json"
-LOCK_PATH = CACHE / "e2e.lock"
 MINI_REPO = TOOLS / "mini_repo"
 MINI_REPO_BACKUP = CACHE / "e2e_mini_repo_backup"
 
@@ -372,7 +371,7 @@ class RunLock:
             import fcntl
         except ImportError:  # non-POSIX host: no locking available
             return self
-        self.fh = open(LOCK_PATH, "w")
+        self.fh = open(self.path, "w")
         deadline = time.time() + self.timeout
         warned = False
         while True:
