@@ -10,12 +10,89 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// stayed red while looking green.
 static FAILED_CHECKS: AtomicU32 = AtomicU32::new(0);
 
+/// Checks that were NOT executed because the environment could not support them
+/// (no block device, an exhausted frame pool, …).
+///
+/// A skip is NEVER a success: it is counted here, printed as its own `SKIP:` line
+/// and named in the summary together with the number of routines it affected. A
+/// suite that reports `0 failed checks` while a routine silently returned early is
+/// a verdict that means nothing — this counter is what makes the difference
+/// visible (a signal routine that could not spawn its kernel threads because the
+/// PMM was starved used to print `ok`).
+static SKIPPED_CHECKS: AtomicU32 = AtomicU32::new(0);
+
+/// Per-reason skip counts of the routine currently running: `reason -> count`.
+/// Cleared by [`reset_failures`] before each routine, so the `skip <routine>` line
+/// names that routine's own reasons.
+static SKIP_REASONS: crate::sync::spinlock::Spinlock<
+    alloc::collections::BTreeMap<&'static str, u32>,
+> = crate::sync::spinlock::Spinlock::new(alloc::collections::BTreeMap::new());
+
+/// Per-reason skip counts of the WHOLE run. Updated by every [`record_skip`] and
+/// deliberately NOT cleared by [`reset_failures`]: the summary is printed after the
+/// last routine's reset has already wiped the per-routine map, and without this
+/// accumulator the breakdown printed as an empty `()`.
+static SKIP_REASONS_TOTAL: crate::sync::spinlock::Spinlock<
+    alloc::collections::BTreeMap<&'static str, u32>,
+> = crate::sync::spinlock::Spinlock::new(alloc::collections::BTreeMap::new());
+
 pub fn reset_failures() {
     FAILED_CHECKS.store(0, Ordering::Relaxed);
+    SKIPPED_CHECKS.store(0, Ordering::Relaxed);
+    // Per-routine view only: the run-wide accumulator survives.
+    SKIP_REASONS.lock().clear();
+}
+
+/// Clear the run-wide skip accumulator (once, at the start of `run_all`).
+pub fn reset_skip_totals() {
+    SKIP_REASONS_TOTAL.lock().clear();
 }
 
 pub fn failed_checks() -> u32 {
     FAILED_CHECKS.load(Ordering::Relaxed)
+}
+
+/// Number of checks this routine reported as skipped.
+pub fn skipped_checks() -> u32 {
+    SKIPPED_CHECKS.load(Ordering::Relaxed)
+}
+
+/// Record one skipped check with its reason (never increments the success count).
+pub fn record_skip(reason: &'static str) {
+    SKIPPED_CHECKS.fetch_add(1, Ordering::Relaxed);
+    *SKIP_REASONS.lock().entry(reason).or_insert(0) += 1;
+    *SKIP_REASONS_TOTAL.lock().entry(reason).or_insert(0) += 1;
+}
+
+/// `reason xN, reason2 xM` for the summary line (empty string when nothing was
+/// skipped).
+pub fn skip_breakdown() -> alloc::string::String {
+    use alloc::string::ToString;
+    let mut out = alloc::string::String::new();
+    for (reason, n) in SKIP_REASONS.lock().iter() {
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        out.push_str(reason);
+        out.push_str(" x");
+        out.push_str(&n.to_string());
+    }
+    out
+}
+
+/// `reason xN, reason2 xM` aggregated over the whole run (the summary line).
+pub fn skip_breakdown_total() -> alloc::string::String {
+    use alloc::string::ToString;
+    let mut out = alloc::string::String::new();
+    for (reason, n) in SKIP_REASONS_TOTAL.lock().iter() {
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        out.push_str(reason);
+        out.push_str(" x");
+        out.push_str(&n.to_string());
+    }
+    out
 }
 
 fn record_failure() {
@@ -30,6 +107,18 @@ macro_rules! assert_kernel {
         }
     };
 }
+/// Report a check that could NOT run (`no device`, `PMM starved`, …) — visibly.
+///
+/// Use this INSTEAD of `assert_kernel!(true, "... skipped")`, which printed an
+/// indistinguishable `ok` line and incremented nothing: a caller that wants to
+/// return early must call `skip_kernel!` and then `return`.
+macro_rules! skip_kernel {
+    ($reason:expr, $msg:expr) => {{
+        crate::test::record_skip($reason);
+        crate::kprintln!("SKIP: {}:{}: {} [{}]", file!(), line!(), $msg, $reason);
+    }};
+}
+
 macro_rules! assert_eq_kernel {
     ($left:expr, $right:expr, $msg:expr) => {
         if $left != $right {
@@ -408,7 +497,7 @@ mod vmm_prop_tests {
             Some(v) => v,
             None => {
                 // Every candidate is already mapped; skip without clobbering.
-                assert_kernel!(true, "vmm map/translate: all candidates mapped, skipped");
+                skip_kernel!("all candidates mapped", "vmm map/translate");
                 return;
             }
         };
@@ -417,7 +506,7 @@ mod vmm_prop_tests {
         let frame = match pmm::alloc_frame() {
             Some(f) => f,
             None => {
-                assert_kernel!(true, "vmm map/translate: no free frame, skipped");
+                skip_kernel!("no free frame", "vmm map/translate");
                 return;
             }
         };
@@ -430,7 +519,7 @@ mod vmm_prop_tests {
                 // Mapping failed (e.g. OOM building intermediates); clean up the
                 // leaf frame and skip.
                 pmm::free_frame(frame);
-                assert_kernel!(true, "vmm map/translate: map failed, skipped");
+                skip_kernel!("map failed", "vmm map/translate");
                 return;
             }
         }
@@ -471,7 +560,7 @@ mod vmm_prop_tests {
         let test_virt = match first_unmapped(&USER_TEST_VIRTS) {
             Some(v) => v,
             None => {
-                assert_kernel!(true, "vmm user-flag: all candidates mapped, skipped");
+                skip_kernel!("all candidates mapped", "vmm user-flag propagation");
                 return;
             }
         };
@@ -479,7 +568,7 @@ mod vmm_prop_tests {
         let frame = match pmm::alloc_frame() {
             Some(f) => f,
             None => {
-                assert_kernel!(true, "vmm user-flag: no free frame, skipped");
+                skip_kernel!("no free frame", "vmm user-flag propagation");
                 return;
             }
         };
@@ -493,7 +582,7 @@ mod vmm_prop_tests {
             Ok(()) => {}
             Err(_) => {
                 pmm::free_frame(frame);
-                assert_kernel!(true, "vmm user-flag: map failed, skipped");
+                skip_kernel!("map failed", "vmm user-flag propagation");
                 return;
             }
         }
@@ -1154,27 +1243,98 @@ mod elf_prop_tests {
     /// panic inside `load` would abort the kernel and the harness would never
     /// reach the trailing assertion. Iterations are kept modest.
     ///
-    /// NOTE: an `Ok` result here would map and leak a user PML4 + frames, but a
-    /// single-byte flip in the header region essentially always invalidates the
-    /// image (magic / class / type / machine / version / offsets), so in
-    /// practice every iteration takes the `Err` path and maps nothing.
+    /// ## PMM hygiene (why this routine has a frame budget)
+    ///
+    /// The flips hit `p_filesz`/`p_memsz`, so an iteration can ask the loader for
+    /// a segment of essentially any size — and the loader maps it EAGERLY. Two
+    /// things therefore have to be true, and both are checked here:
+    ///
+    ///   * an `Ok` load hands back a fully mapped user address space; this routine
+    ///     must release it ([`crate::task::scheduler::drop_exclusive_user_space`]),
+    ///     or it retains ~1.8k frames per iteration and starves the PMM for every
+    ///     routine that runs after it (measured: the pool went from 113 360 free
+    ///     frames to 0 inside this single routine, after which anything spawning a
+    ///     kernel thread panicked with `SCHED: PMM OOM` and took the whole suite's
+    ///     verdict with it);
+    ///   * an `Err` load must roll back its own allocations — that part is the
+    ///     LOADER's contract (the frame ledger below reports it as a leak with the
+    ///     iteration number instead of hiding it), not this test's.
+    ///
+    /// The loop therefore stops early when an iteration drops the free-frame count
+    /// below the budget, so one runaway iteration cannot eat the whole pool, and it
+    /// FAILs with the numbers. With a roll-back-correct loader the routine is green
+    /// and the pool is unchanged.
     pub fn fuzz_header_no_panic() {
         let hs = core::mem::size_of::<Elf64Header>();
         let ps = core::mem::size_of::<Elf64ProgramHeader>();
         let region = hs + ps; // full header + single phdr
         let mut rng = XorShift64::new(0xD1B54A32D192ED03);
 
+        // Budget: no single iteration may take more than a quarter of the pool, so
+        // the suite keeps running even when the loader leaks (or eagerly maps) a
+        // giant segment. 64 iterations x 1 page + tables fits in far less.
+        let start_free = crate::memory::pmm::free_frames();
+        let floor = start_free / 4;
+
         let mut completed = 0u32;
-        for _ in 0..64 {
+        let mut ok_loads = 0u32;
+        let mut released = 0u32;
+        let mut leaked: usize = 0;
+        for i in 0..64 {
             let mut d = make_elf(0x401000);
             let idx = (rng.next() as usize) % region;
             let bit = (rng.next() as u8) | 1; // non-zero so the flip changes a bit
             d[idx] ^= bit;
             // The point is that this returns (no panic / no kernel abort).
-            let _ = ElfLoader::load(&d);
+            match ElfLoader::load(&d) {
+                Ok(proc) => {
+                    ok_loads += 1;
+                    // Give the address space back: `Ok` means the loader mapped it.
+                    if crate::task::scheduler::drop_exclusive_user_space(proc.pml4_phys) {
+                        released += 1;
+                    } else {
+                        // Not exclusively ours to free - keep the pml4 alive rather
+                        // than tearing down something the scheduler still needs.
+                        crate::warn!(
+                            "[selftest] elf fuzz iteration {}: user space {:#x} not exclusively owned",
+                            i,
+                            proc.pml4_phys
+                        );
+                    }
+                }
+                Err(_) => {}
+            }
             completed += 1;
+            // Per-iteration frame ledger: the pool must not collapse.
+            let free_now = crate::memory::pmm::free_frames();
+            if free_now < floor {
+                leaked = start_free.saturating_sub(free_now);
+                assert_kernel!(
+                    false,
+                    "elf fuzz: the PMM collapsed mid-routine - an iteration retained frames (Err path = the loader must roll back; see the frames line below)"
+                );
+                break;
+            }
         }
 
+        let end_free = crate::memory::pmm::free_frames();
+        crate::kprintln!(
+            "[selftest] elf fuzz: {} iterations, {} Ok ({} address spaces released), {} Err; frames {} -> {} (delta {})",
+            completed,
+            ok_loads,
+            released,
+            completed - ok_loads,
+            start_free,
+            end_free,
+            end_free as i64 - start_free as i64
+        );
+        // A leak that did not collapse the pool still has to be visible: with the
+        // budget above, `floor` can only be crossed by a genuine retention.
+        assert_eq_kernel!(
+            leaked,
+            0,
+            "elf fuzz: no iteration may retain PMM frames (see the frames line)"
+        );
         // Reaching here means every fuzz iteration returned without panicking.
         assert_eq_kernel!(
             completed,
@@ -1513,7 +1673,7 @@ mod virtio_blk_tests {
         let dev = match device() {
             Some(d) => d,
             None => {
-                assert_kernel!(true, "virtio-blk: no device, self-test skipped");
+                skip_kernel!("no block device", "virtio-blk round-trip");
                 return;
             }
         };
@@ -1521,7 +1681,7 @@ mod virtio_blk_tests {
         // Save the original sector so we can restore it (non-destructive).
         let mut orig = [0u8; SECTOR];
         if dev.read_block(SCRATCH_A, &mut orig).is_err() {
-            assert_kernel!(true, "virtio-blk: scratch sector out of range, skipped");
+            skip_kernel!("scratch sector out of range", "virtio-blk round-trip");
             return;
         }
 
@@ -1567,7 +1727,10 @@ mod virtio_blk_tests {
         let dev = match device() {
             Some(d) => d,
             None => {
-                assert_kernel!(true, "virtio-blk: no device, Property 14 skipped");
+                skip_kernel!(
+                    "no block device",
+                    "virtio-blk block round-trip (Property 14)"
+                );
                 return;
             }
         };
@@ -1622,7 +1785,10 @@ mod virtio_blk_tests {
         let dev = match device() {
             Some(d) => d,
             None => {
-                assert_kernel!(true, "virtio-blk: no device, Property 16 skipped");
+                skip_kernel!(
+                    "no block device",
+                    "virtio-blk virtqueue aliasing (Property 16)"
+                );
                 return;
             }
         };
@@ -2925,14 +3091,20 @@ mod fs_real_device_tests {
         let blk = match drivers::get_block("virtio-blk0") {
             Some(b) => b,
             None => {
-                assert_kernel!(true, "P18(real): no disk attached, skipped");
+                skip_kernel!(
+                    "no disk attached",
+                    "ext2 round-trip on the real device (Property 18)"
+                );
                 return;
             }
         };
         let root = match Ext2Fs::mount(blk) {
             Ok(r) => r,
             Err(_) => {
-                assert_kernel!(true, "P18(real): no ext2 filesystem, skipped");
+                skip_kernel!(
+                    "no ext2 filesystem",
+                    "ext2 round-trip on the real device (Property 18)"
+                );
                 return;
             }
         };
@@ -3212,10 +3384,6 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             elf_prop_tests::rejects_malformed
         ),
         (
-            "elf::fuzz header no panic (Property 8)",
-            elf_prop_tests::fuzz_header_no_panic
-        ),
-        (
             "log::level filter monotonicity",
             log_tests::level_filter_monotonicity
         ),
@@ -3331,6 +3499,13 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "shell::path/listing format behaviors (unit)",
             shell_prop_tests::unit_path_and_listing_format
+        ), // LAST on purpose: this routine feeds hostile sizes to the ELF loader
+        // and can consume (or leak) almost the whole PMM pool. Anything registered
+        // after it would silently run starved - and a starved routine reports a
+        // skip, not a pass, but the order must not be a trap in the first place.
+        (
+            "elf::fuzz header no panic (Property 8)",
+            elf_prop_tests::fuzz_header_no_panic
         ),
     ]
 }
@@ -3361,10 +3536,13 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
 /// PMM free counts, heap state, interrupt flags, VFS, etc. before returning),
 /// so `run_all` is safe to invoke on demand from the running shell. It is NOT
 /// run automatically during boot.
-pub fn run_all() {
+pub fn run_all() -> (usize, u32, u32, i64) {
     let tests = all_tests();
+    let frames_before = crate::memory::pmm::free_frames();
+    reset_skip_totals();
     crate::kprintln!("=== kernel self-test ({} routines) ===", tests.len());
     let mut total_failed = 0u32;
+    let mut total_skipped = 0u32;
     for (name, f) in tests.iter() {
         crate::kprintln!("RUN  {}", name);
         // A failed check inside `f` prints its own `FAIL: file:line: msg` line
@@ -3372,21 +3550,59 @@ pub fn run_all() {
         reset_failures();
         f();
         let failed = failed_checks();
+        let skipped = skipped_checks();
         total_failed += failed;
-        if failed == 0 {
-            crate::kprintln!("ok   {}", name);
-        } else {
+        total_skipped += skipped;
+        if failed > 0 {
             crate::kprintln!("FAIL {} ({} failed checks)", name, failed);
+        } else if skipped > 0 {
+            // A routine that could not run its checks is NOT `ok`: say so here and
+            // in the summary, with the reason.
+            crate::kprintln!(
+                "skip {} ({} check(s) skipped: {})",
+                name,
+                skipped,
+                skip_breakdown()
+            );
+        } else {
+            crate::kprintln!("ok   {}", name);
         }
     }
     crate::kprintln!("=== self-test complete ===");
+    // The suite's frame ledger: every routine is supposed to leave the PMM as it
+    // found it (a routine that retains frames starves everything that runs later
+    // and makes the suite non-idempotent). Printed BEFORE the summary so a harness
+    // can compare two passes of `selftest 2` in one boot.
+    let frames_after = crate::memory::pmm::free_frames();
+    crate::kprintln!(
+        "[selftest] PMM hygiene: free frames {} -> {} (delta {})",
+        frames_before,
+        frames_after,
+        frames_after as i64 - frames_before as i64
+    );
     // Machine-readable verdict: grepping for `ok` is not one, and grepping for
     // `FAIL:` misses a routine that failed without printing (or vice versa).
-    crate::kprintln!(
-        "SELFTEST SUMMARY: {} routines, {} failed checks",
+    if total_skipped > 0 {
+        crate::kprintln!(
+            "SELFTEST SUMMARY: {} routines, {} failed checks, {} skipped ({})",
+            tests.len(),
+            total_failed,
+            total_skipped,
+            skip_breakdown_total()
+        );
+    } else {
+        crate::kprintln!(
+            "SELFTEST SUMMARY: {} routines, {} failed checks, 0 skipped",
+            tests.len(),
+            total_failed
+        );
+    }
+    (
         tests.len(),
-        total_failed
-    );
+        total_failed,
+        total_skipped,
+        frames_after as i64 - frames_before as i64,
+    )
 }
 
 // ============================================================================
