@@ -266,7 +266,8 @@ mod pmm_contig_prop_tests {
     /// performs several random-sized contiguous allocations (verifying
     /// alignment, the exact free-count delta, exclusion of the held frame, and
     /// mutual non-overlap), then frees every run and the held frame so the trial
-    /// is non-destructive. The whole routine restores the PMM free count.
+    /// frees every data frame it maps; the page tables `vmm::map` allocates for
+    /// fresh addresses stay charged (documented, no teardown API).
     pub fn contiguous_alloc_non_overlapping() {
         let before = pmm::free_frames();
         let mut rng = XorShift64::new(0x15C0_FFEE_15A1_1000);
@@ -449,8 +450,10 @@ mod vmm_prop_tests {
             "after unmap virt_to_phys returns no translation"
         );
 
-        // Free the leaf data frame to stay non-destructive. The intermediate
-        // page tables map() allocated are intentionally not reclaimed.
+        // Return the leaf data frame. The PMM free count is *not* restored
+        // exactly: the intermediate page tables `vmm::map` created for these
+        // never-before-used addresses stay charged (the VMM has no teardown API).
+        // That overhead is documented rather than reclaimed.
         pmm::free_frame(frame);
 
         // The single leaf frame round-trips; intermediate tables (if any were
@@ -1148,16 +1151,22 @@ mod elf_prop_tests {
     }
 
     /// Bounded fuzz loop: take a valid ELF, flip a random byte somewhere in the
-    /// header / program-header region, and assert `load()` runs to completion
-    /// returning `Err` OR `Ok` without panicking. Because `no_std` cannot catch
-    /// a panic, the value of this routine is simply that it returns at all — a
-    /// panic inside `load` would abort the kernel and the harness would never
-    /// reach the trailing assertion. Iterations are kept modest.
+    /// header / program-header region, and assert `load()` runs to completion.
+    /// Because `no_std` cannot catch a panic, part of the value of this routine is
+    /// simply that it returns at all — a panic inside `load` aborts the kernel.
     ///
-    /// NOTE: an `Ok` result here would map and leak a user PML4 + frames, but a
-    /// single-byte flip in the header region essentially always invalidates the
-    /// image (magic / class / type / machine / version / offsets), so in
-    /// practice every iteration takes the `Err` path and maps nothing.
+    /// Every iteration also checks the PMM: a **rejected** load must leave
+    /// `pmm::free_frames()` exactly as it found it. That is the regression this
+    /// routine exists for — a single mutation of `p_memsz` used to allocate and
+    /// map segment pages, fail, and keep all of them (443 MiB of the pool in one
+    /// call, after which the guest could not spawn a process at all).
+    ///
+    /// An `Ok` iteration maps a live user address space that the returned
+    /// `ElfProcess` owns; the test drops it, so such iterations (rare: only flips
+    /// in fields that stay loadable, e.g. `p_align`) legitimately consume frames.
+    /// They are counted and reported rather than treated as a leak; the routine
+    /// below fuzzes only fields that must be rejected, which pins the invariant
+    /// with no exemptions.
     pub fn fuzz_header_no_panic() {
         let hs = core::mem::size_of::<Elf64Header>();
         let ps = core::mem::size_of::<Elf64ProgramHeader>();
@@ -1165,13 +1174,24 @@ mod elf_prop_tests {
         let mut rng = XorShift64::new(0xD1B54A32D192ED03);
 
         let mut completed = 0u32;
+        let mut accepted = 0u32;
         for _ in 0..64 {
             let mut d = make_elf(0x401000);
             let idx = (rng.next() as usize) % region;
             let bit = (rng.next() as u8) | 1; // non-zero so the flip changes a bit
             d[idx] ^= bit;
-            // The point is that this returns (no panic / no kernel abort).
-            let _ = ElfLoader::load(&d);
+
+            let before = crate::memory::pmm::free_frames();
+            let result = ElfLoader::load(&d);
+            let after = crate::memory::pmm::free_frames();
+            match result {
+                Err(_) => assert_eq_kernel!(
+                    after,
+                    before,
+                    "fuzz: a rejected load must not consume a single PMM frame"
+                ),
+                Ok(_) => accepted += 1,
+            }
             completed += 1;
         }
 
@@ -1180,6 +1200,182 @@ mod elf_prop_tests {
             completed,
             64,
             "fuzz: all header mutations ran to completion"
+        );
+        if accepted > 0 {
+            crate::kprintln!(
+                "[fuzz] {} of {} mutations stayed loadable (test-owned address spaces, not leaks)",
+                accepted,
+                completed
+            );
+        }
+    }
+
+    /// Every mutation of a field that **must** invalidate an image is rejected
+    /// before the loader allocates anything: `free_frames()` is untouched.
+    ///
+    /// This is the strict half of the fuzz property — no `Ok` exemption here.
+    pub fn rejected_images_never_touch_the_pmm() {
+        const MAX: u64 = ElfLoader::MAX_IMAGE_BYTES;
+        let p = ph_base();
+        let len = make_elf(0x401000).len() as u64;
+
+        // Each case mutates a field that cannot stay valid, either in the header
+        // or in the single program header. `load` must refuse all of them in its
+        // validation pass, i.e. before the first `alloc_frame`.
+        let cases: &[(&str, usize, u64)] = &[
+            ("magic", 0, 0),
+            ("class", EI_CLASS, 1),
+            ("data", EI_DATA, 2),
+            ("type", E_TYPE, 3),
+            ("machine", E_MACHINE, 0x28),
+            ("version", E_VERSION, 2),
+            ("phoff beyond data", E_PHOFF, len + 8),
+            ("phnum beyond data", 56, 0xFFFF),
+            ("segment file range beyond data", p + P_OFFSET, 0xFFFF_FFFF),
+            (
+                "segment above the user ceiling",
+                p + P_VADDR,
+                0x0000_8000_0000_0000,
+            ),
+            ("filesz beyond data", p + P_FILESZ, 0x10_0000),
+            ("memsz over the image cap", p + P_MEMSZ, MAX + 0x1000),
+        ];
+
+        for (label, off, value) in cases {
+            let mut d = make_elf(0x401000);
+            put_u64(&mut d, *off, *value);
+            let before = crate::memory::pmm::free_frames();
+            let result = ElfLoader::load(&d);
+            let after = crate::memory::pmm::free_frames();
+            assert_kernel!(
+                result.is_err(),
+                "a field that must invalidate the image is refused"
+            );
+            assert_eq_kernel!(
+                after,
+                before,
+                "rejected image consumes no PMM frame (nothing is allocated)"
+            );
+            // Report the refusal reason (the `Err` string), not the result
+            // struct: `ElfProcess` has no `Debug`.
+            let reason = match result {
+                Err(e) => e,
+                Ok(_) => "accepted",
+            };
+            crate::kprintln!(
+                "[elf-cap] case '{}' refused: {}, PMM untouched",
+                label,
+                reason
+            );
+        }
+
+        // `e_phentsize` below the ELF64 program-header size: a `u16` write, so the
+        // neighbouring `e_phnum` stays 1 — a `u64` write would zero it and an image
+        // with no program headers legitimately loads "nothing" (Ok).
+        let mut d = make_elf(0x401000);
+        put_u16(&mut d, 54, 8);
+        let before = crate::memory::pmm::free_frames();
+        assert_kernel!(
+            ElfLoader::load(&d).is_err(),
+            "a program-header entry smaller than ELF64's is refused"
+        );
+        assert_eq_kernel!(
+            crate::memory::pmm::free_frames(),
+            before,
+            "a bad e_phentsize consumes no PMM frame"
+        );
+
+        // `p_filesz > p_memsz` (the bss tail would be negative) is its own case:
+        // it needs two fields set together.
+        let mut d = make_elf(0x401000);
+        put_u64(&mut d, p + P_FILESZ, 0x2000);
+        put_u64(&mut d, p + P_MEMSZ, 0x1000);
+        let before = crate::memory::pmm::free_frames();
+        assert_kernel!(
+            ElfLoader::load(&d).is_err(),
+            "p_filesz above p_memsz is refused"
+        );
+        assert_eq_kernel!(
+            crate::memory::pmm::free_frames(),
+            before,
+            "p_filesz above p_memsz consumes no PMM frame"
+        );
+    }
+
+    /// The exact leak this fix closes: a legal-looking but huge `p_memsz` used to
+    /// be mapped eagerly, fail on PMM exhaustion, and keep every frame. It must
+    /// now be refused *before* the first allocation, and the documented mutation
+    /// value (443 MiB) must leave the pool untouched.
+    pub fn oversized_segment_is_refused_before_allocating() {
+        let p = ph_base();
+        for memsz in [ElfLoader::MAX_IMAGE_BYTES + 1, 443 * 1024 * 1024] {
+            let mut d = make_elf(0x401000);
+            put_u64(&mut d, p + P_MEMSZ, memsz);
+            let before = crate::memory::pmm::free_frames();
+            let result = ElfLoader::load(&d);
+            let after = crate::memory::pmm::free_frames();
+            assert_kernel!(result.is_err(), "oversized p_memsz must be refused");
+            assert_eq_kernel!(
+                after,
+                before,
+                "oversized image is refused before any frame is taken"
+            );
+        }
+    }
+
+    /// The rollback guard itself, with real frames: mapping three pages and then
+    /// dropping the guard must return every frame to the PMM **and** leave no live
+    /// translation behind (unmap before free).
+    ///
+    /// The loader's own late-failure paths (allocator exhaustion, a failing
+    /// `vmm::map`, a translation that vanished under it) cannot be triggered
+    /// deterministically from a test fixture, so the guard they rely on is
+    /// exercised directly.
+    pub fn mapped_frames_guard_rolls_back() {
+        use crate::vfs::elf::MappedFrames;
+        use x86_64::structures::paging::PageTableFlags;
+        // A user address well away from the loader's own fixtures.
+        const BASE: u64 = 0x0000_6000_0000_0000;
+
+        let before = crate::memory::pmm::free_frames();
+        let mut guard = MappedFrames::new();
+        for i in 0..3u64 {
+            let frame = match crate::memory::pmm::alloc_frame() {
+                Some(f) => f,
+                None => {
+                    assert_kernel!(false, "guard test: out of PMM frames");
+                    return;
+                }
+            };
+            // SAFETY: freshly allocated frame, reachable through the HHDM alias.
+            unsafe {
+                core::ptr::write_bytes(crate::memory::vmm::phys_to_virt(frame) as *mut u8, 0, 4096);
+            }
+            let flags = PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::USER_ACCESSIBLE;
+            if guard.map(frame, BASE + i * 4096, flags).is_err() {
+                assert_kernel!(false, "guard test: vmm::map failed");
+                return;
+            }
+        }
+        assert_kernel!(
+            crate::memory::vmm::virt_to_phys(BASE).is_some(),
+            "guard test: the page is mapped before the rollback"
+        );
+        drop(guard);
+        assert_kernel!(
+            crate::memory::vmm::virt_to_phys(BASE).is_none(),
+            "guard test: rollback unmaps the page"
+        );
+        // `vmm::map` also allocated the PDPT/PD/PT chain for this fresh range (3
+        // frames) and the guard deliberately does not free page tables — it owns
+        // data frames only. So the bound is exactly those 3: any further loss
+        // means a data frame was not returned.
+        let consumed = before.saturating_sub(crate::memory::pmm::free_frames());
+        assert_kernel!(
+            consumed <= 3,
+            "guard test: rollback returns every data frame it mapped (only page tables remain)"
         );
     }
 }
@@ -3210,6 +3406,18 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "elf::rejects malformed (Property 8)",
             elf_prop_tests::rejects_malformed
+        ),
+        (
+            "elf::oversized image refused before allocating (issue: PMM leak)",
+            elf_prop_tests::oversized_segment_is_refused_before_allocating
+        ),
+        (
+            "elf::mapped-frames guard rolls back (issue: PMM leak)",
+            elf_prop_tests::mapped_frames_guard_rolls_back
+        ),
+        (
+            "elf::every rejected image leaves the PMM untouched",
+            elf_prop_tests::rejected_images_never_touch_the_pmm
         ),
         (
             "elf::fuzz header no panic (Property 8)",
