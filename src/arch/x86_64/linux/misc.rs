@@ -234,7 +234,7 @@ pub fn sys_exit_group(code: u64) -> ! {
 /// Phase 1 semantics:
 ///   * with a user handler installed for `sig` (via `rt_sigaction`): the
 ///     signal is queued pending and delivered at this syscall's return point
-///     ([`super::signal::deliver_one_pending`]) — so `raise()`/`abort()`-style
+///     ([`super::signal::deliver_one_pending_syscall`]) — so `raise()`/`abort()`-style
 ///     self-signals run the handler before anything else;
 ///   * without a handler and a default-fatal `sig`: exit the thread group
 ///     with `128 + sig` (Phase-0 behavior kept: an `ENOSYS` here made glibc's
@@ -243,12 +243,20 @@ pub fn sys_exit_group(code: u64) -> ! {
 ///   * without a handler and a non-fatal `sig`: accepted and ignored
 ///     (`SIGCHLD`, `SIGCONT`, `SIGWINCH`, ... must not self-destruct).
 pub fn sys_tgkill(_tgid: u64, _tid: u64, sig: u64) -> Result<u64, Errno> {
+    // `int sig` arrives in a 64-bit register: truncate to 32 bits and
+    // sign-extend FIRST. The disposition table is indexed by `sig - 1`, so a
+    // "negative" signal (0xFFFF_FFFF as `int`) would underflow that index and
+    // panic the kernel (`panic = "abort"` → the machine dies on an untrusted
+    // syscall argument). Exactly the validation `kill(2)` uses — one
+    // implementation, in `kill::kill_sig_valid`.
+    let sig = super::kill::decode_sig(sig);
+    if !super::kill::kill_sig_valid(sig) {
+        return Err(Errno::EINVAL);
+    }
     if sig == 0 {
         return Ok(0);
     }
-    if sig > super::signal_frame::SIGNAL_COUNT as u64 {
-        return Err(Errno::EINVAL);
-    }
+    let sig = sig as u64;
     match super::signal::current_has_handler(sig) {
         Some(true) => {
             super::signal::send_signal(scheduler::current_pid(), sig)?;
@@ -480,7 +488,7 @@ pub fn sys_sched_yield() -> Result<u64, Errno> {
 /// `{ handler, flags, restorer, mask }`. The handler address is stored
 /// verbatim — `SIG_DFL` (0) and `SIG_IGN` (1) are the special values — and
 /// delivery applies `sa_mask` for the handler's lifetime
-/// ([`super::signal::deliver_one_pending`]).
+/// ([`super::signal::deliver_one_pending_syscall`]).
 ///
 /// `oldact`, when requested, receives the CURRENT disposition so
 /// save-and-restore users (bash, readline) round-trip exactly. `SIGKILL` and

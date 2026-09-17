@@ -49,9 +49,17 @@ pub const SIGABRT: u64 = 6;
 pub const SIGBUS: u64 = 7;
 pub const SIGFPE: u64 = 8;
 pub const SIGKILL: u64 = 9;
+/// `SIGUSR1` — the first user-defined signal, the natural choice for
+/// tests and for programs that want a purely application-level notification.
+pub const SIGUSR1: u64 = 10;
 pub const SIGSEGV: u64 = 11;
+/// `SIGUSR2` — the second user-defined signal.
+pub const SIGUSR2: u64 = 12;
 pub const SIGPIPE: u64 = 13;
 pub const SIGALRM: u64 = 14;
+/// `SIGTERM` — the standard polite termination request (`kill -TERM`); its
+/// default action is `Term`.
+pub const SIGTERM: u64 = 15;
 pub const SIGCHLD: u64 = 17;
 pub const SIGCONT: u64 = 18;
 pub const SIGSTOP: u64 = 19;
@@ -103,6 +111,61 @@ pub const fn sigbit(sig: u64) -> u64 {
 /// Kernel-enforced unblockable signals: `SIGKILL` and `SIGSTOP`.
 pub const UNBLOCKABLE_MASK: u64 = sigbit(SIGKILL) | sigbit(SIGSTOP);
 
+/// The stop-class signals (`SIG_KERNEL_STOP_MASK` in Linux): their default action
+/// is Stop, and generating `SIGCONT` discards all of them from the pending sets
+/// (POSIX 2.4.1 / Linux `prepare_signal`).
+pub const SIG_KERNEL_STOP_MASK: u64 =
+    sigbit(SIGSTOP) | sigbit(SIGTSTP) | sigbit(SIGTTIN) | sigbit(SIGTTOU);
+
+/// Is `sig` a stop-class signal (default action Stop)?
+pub fn is_stop_signal(sig: u64) -> bool {
+    sig != 0 && sigbit(sig) & SIG_KERNEL_STOP_MASK != 0
+}
+
+/// Drop every pending stop-class bit (a `SIGCONT` generation does this).
+pub fn flush_stop_bits(pending: u64) -> u64 {
+    pending & !SIG_KERNEL_STOP_MASK
+}
+
+/// Drop a pending `SIGCONT` (generating a stop signal does this — POSIX: "when
+/// any stop signal is generated ... any pending SIGCONT shall be discarded").
+pub fn flush_cont_bits(pending: u64) -> u64 {
+    pending & !sigbit(SIGCONT)
+}
+
+// ─── `wait(2)` status words ──────────────────────────────────────────────────
+
+/// `wait(2)` status of a child STOPPED by signal `sig`: `(sig << 8) | 0x7f`, the
+/// Linux encoding in which `WIFSTOPPED(status)` is exactly `status & 0xff == 0x7f`.
+/// `WSTOPSIG(status)` is `status >> 8`.
+#[inline]
+pub const fn wait_status_stopped(sig: u64) -> u32 {
+    (((sig as u32) & 0xff) << 8) | 0x7f
+}
+
+/// `wait(2)` status of a child RESUMED by `SIGCONT`: `0xffff`
+/// (`WIFCONTINUED(status)` is exactly `status == 0xffff`).
+pub const WAIT_STATUS_CONTINUED: u32 = 0xffff;
+
+/// `wait(2)` status of a normally exiting child: the exit code in the high byte
+/// (pagh's convention: `128 + sig` for a signal-terminated child).
+#[inline]
+pub const fn wait_status_exited(code: u8) -> u32 {
+    (code as u32) << 8
+}
+
+/// `WIFSTOPPED(status)`.
+#[inline]
+pub const fn wait_status_is_stopped(status: u32) -> bool {
+    status & 0xff == 0x7f
+}
+
+/// `WIFCONTINUED(status)`.
+#[inline]
+pub const fn wait_status_is_continued(status: u32) -> bool {
+    status == WAIT_STATUS_CONTINUED
+}
+
 /// Apply a `sigprocmask` operation. `SIGKILL`/`SIGSTOP` bits can never end up
 /// blocked; an unknown `how` is `None` (caller maps to `EINVAL`).
 pub fn apply_mask_op(how: u64, old: u64, set: u64) -> Option<u64> {
@@ -125,7 +188,8 @@ pub enum DefaultAction {
     Term,
     /// Ignore the signal.
     Ignore,
-    /// Stop the process (Phase 1 logs and drops — the scheduler has no stop).
+    /// Stop the process (delivered as a scheduler park: the task's saved frame
+    /// moves to `STOPPED_TASKS` and stays there until `SIGCONT`).
     Stop,
     /// Continue the process if stopped, else ignore.
     Cont,
