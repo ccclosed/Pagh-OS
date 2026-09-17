@@ -121,6 +121,40 @@ pub(super) fn cmd_echo(_ctx: &mut ShellCtx, args: &[&str]) {
 }
 
 /// `uptime`: print the scheduler tick count and an approximate seconds value.
+/// `atrand [n]` — VERIFICATION PROBE (branch `verify/atrandom-baseline`, never
+/// for merge). Prints `n` (default 8) consecutive `AT_RANDOM` blocks with the
+/// clock/pid context, so the host-side model can prove the fallback is a
+/// deterministic function of publicly observable inputs. It only *calls* the
+/// existing function; no entropy path is changed.
+pub(super) fn cmd_atrand(_ctx: &mut ShellCtx, args: &[&str]) {
+    let count: usize = args.first().and_then(|a| a.parse().ok()).unwrap_or(8);
+    let hw = crate::security::entropy::capabilities_str();
+    let pid = crate::task::scheduler::current_pid();
+    shell_println(&alloc::format!(
+        "ATRAND start count={} pid={} hw_avail={} hw={}",
+        count,
+        pid,
+        crate::security::entropy::is_available(),
+        hw
+    ));
+    for i in 0..count {
+        let ticks = crate::task::scheduler::ticks();
+        let rtc = crate::arch::x86_64::linux::rtc::now_unix();
+        let bytes = crate::arch::x86_64::linux::misc::random_bytes_16();
+        let _ = (ticks, rtc);
+        shell_println(&alloc::format!(
+            "ATRAND i={} ticks_before={} rtc_before={} pid={} hw_avail={} bytes={}",
+            i,
+            ticks,
+            rtc,
+            pid,
+            crate::security::entropy::is_available(),
+            crate::arch::x86_64::linux::misc::hex16(&bytes)
+        ));
+    }
+    shell_println("ATRAND end");
+}
+
 pub(super) fn cmd_uptime(_ctx: &mut ShellCtx, _args: &[&str]) {
     let ticks = crate::task::scheduler::ticks();
     crate::kprintln!(

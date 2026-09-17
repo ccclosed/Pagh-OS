@@ -84,6 +84,14 @@ pub static COMMANDS: &[CommandSpec] = &[
         usage: "echo <text>",
         handler: super::commands::cmd_echo,
     },
+    // VERIFICATION PROBE (branch `verify/atrandom-baseline`): AT_RANDOM stream
+    // sampling for the issue-#16 baseline. Not for merge.
+    CommandSpec {
+        name: "atrand",
+        description: "Probe: print AT_RANDOM blocks (issue #16 verification)",
+        usage: "atrand [count]",
+        handler: super::commands::cmd_atrand,
+    },
     CommandSpec {
         name: "uptime",
         description: "Show ticks",

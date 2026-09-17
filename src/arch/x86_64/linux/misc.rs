@@ -182,11 +182,20 @@ pub fn random_bytes_16() -> [u8; 16] {
     }
     static FALLBACK_STATE: Spinlock<u64> = Spinlock::new(0x9E37_79B9_7F4A_7C15);
     let mut g = FALLBACK_STATE.lock();
-    let mut x = *g
-        ^ scheduler::ticks().wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ (rtc::now_unix() as u64).rotate_left(32)
-        ^ scheduler::current_pid() << 48
-        ^ crate::security::entropy::secure_u64().unwrap_or(0);
+    // VERIFICATION PROBE (branch `verify/atrandom-baseline`, never for merge):
+    // the inputs are hoisted into locals — same reads in the same order, same
+    // arithmetic — so they can be logged next to the bytes they produced. The
+    // host-side model checks `bytes` against exactly these values.
+    let probe_state = *g;
+    let probe_ticks = scheduler::ticks();
+    let probe_rtc = rtc::now_unix();
+    let probe_pid = scheduler::current_pid();
+    let probe_hw = crate::security::entropy::secure_u64().unwrap_or(0);
+    let mut x = probe_state
+        ^ probe_ticks.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (probe_rtc as u64).rotate_left(32)
+        ^ probe_pid << 48
+        ^ probe_hw;
     x ^= x << 13;
     x ^= x >> 7;
     x ^= x << 17;
@@ -194,7 +203,26 @@ pub fn random_bytes_16() -> [u8; 16] {
     *g = x;
     out[..8].copy_from_slice(&x.to_le_bytes());
     out[8..].copy_from_slice(&second.to_le_bytes());
+    crate::info!(
+        "[atrand] hw=none state_in={:016x} ticks={} rtc={} pid={} hw_term={:016x} bytes={}",
+        probe_state,
+        probe_ticks,
+        probe_rtc,
+        probe_pid,
+        probe_hw,
+        hex16(&out)
+    );
     out
+}
+
+/// Lowercase hex of a 16-byte probe block (verification probe only).
+pub fn hex16(bytes: &[u8; 16]) -> alloc::string::String {
+    use core::fmt::Write as _;
+    let mut s = alloc::string::String::with_capacity(32);
+    for b in bytes {
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
 }
 
 /// `exit` (60) / `exit_group` (231): record the normalized exit code (low byte,
