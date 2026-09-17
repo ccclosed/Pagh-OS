@@ -24,14 +24,19 @@ WHAT IT CHECKS (an explicit list — see `CHECKS` — not a heuristic):
                     in CI. The evidence for the canon is itself checked: every shebang in
                     `tools/*.py` is `#!/usr/bin/env python3` (a bare one would make the
                     tool unrunnable in CI), and ci.yml's `python3` steps spell it that way
-                    (its remaining `run:` step is `cargo fmt`). Stale `python` usage
-                    examples that
-                    live inside other tools are printed as NOTE with file:line (see
-                    `check_canon_python`) instead of failing this gate, because they are
-                    files other streams own — but they are not hidden.
+                    (its remaining `run:` step is `cargo fmt`). A file that is
+                    still in flight is listed in `CANON_PENDING`: reported as NOTE, never a
+                    silent pass, and the entry itself fails once the file is clean, so it
+                    cannot outlive the branch it describes.
   5. command-count  "Commands (all <word> must be green)" == the number of commands in
                     the block below it
-  6. canon-python   no bare `python` inside an AGENTS.md command block (canon, as above)
+  6. canon-python   no bare `python` inside an AGENTS.md command block, and no stale
+                    `python <tool>.py` example anywhere a Linux/CI reader copies commands
+                    from (the tools' own docstrings included); every `tools/*.py` shebang
+                    is `python3`. Windows-only launchers (`.cmd`, `.ps1`) are exempt by RULE,
+                    not by exception: on Windows the interpreter is `python`/`py` (python.org
+                    installs no `python3.exe`) and those files call it that way in their
+                    runtime lines — the `-legacy` rows of the entry-points table mark them
   7. entry-points   the declared `canonical entry points` registry: every canonical path
                     exists (or is an `ALLOWED_MISSING` in-flight path, see 8), a `-legacy`
                     companion exists, is marked as legacy, and is not the canonical path. **Which tool is current comes from that
@@ -166,8 +171,8 @@ ABSENCE_CLAIMS: list[dict] = [
 ]
 
 NOT_CHECKED = [
-    "bare `python` outside AGENTS.md command blocks and ci.yml (printed as NOTE per "
-    "file:line — the usable examples inside tools are somebody else's file to fix)",
+    "the interpreter spelling inside Windows-only `.cmd`/`.ps1` runtime lines "
+    "(CANON_SKIP_SUFFIX: a platform rule, not a defect — Windows has `python`, not `python3`)",
     "NVMe 'no PRP lists and no queue depth > 1' (driver-level knowledge)",
     "signals 'no timer-tick delivery' (judgement about scheduling semantics)",
     "whether a limitation list is complete, or an explanation convincing",
@@ -489,6 +494,21 @@ BARE_PYTHON_CMD = re.compile(r"(?<![-\w./])python\s+[\w./-]*\.py")
 #: out of. `python FILE.py` needs an unversioned interpreter that ubuntu-latest lacks.
 CANON_SCAN = (".github/workflows/ci.yml", "build.sh", "run.sh", "Makefile", "tools")
 
+#: Windows-only launchers, exempt from the canon BY RULE: on Windows the interpreter is
+#: `python` (or `py`) — python.org installs no `python3.exe` — and these files call it that
+#: way in their runtime lines. A statement about the platform, so it needs no exceptions.
+CANON_SKIP_SUFFIX = (".cmd", ".ps1")
+
+#: Files whose examples are stale while the branch that rewrites them is still in flight.
+#: Reported as NOTE (never a silent pass), and the entry becomes a FINDING once the file is
+#: clean — so it cannot outlive the branch it describes (`ALLOWED_MISSING` discipline).
+CANON_PENDING: dict[str, str] = {
+    "tools/e2e.py": "the Linux E2E driver lives on tools/e2e-verify-integrity, which merges "
+                    "before this branch; its hint 'run: python tools/limine.py' (:625) must "
+                    "be spelled `python3` in the commit that drops the ALLOWED_MISSING "
+                    "entries",
+}
+
 
 def canon_scan_files(root: str) -> list[str]:
     index = _git_index(root)
@@ -522,28 +542,43 @@ def check_canon_python(rep: Report, doc: str, text: str) -> None:
         rep.fail(doc, line, f"bare 'python' in a command block ('{raw}') — the repository "
                             f"canon is '{canon}'", "the `#!/usr/bin/env python3` shebangs "
                             "of tools/*.py and the run: steps of ci.yml")
-    skip = {os.path.relpath(doc, rep.root), os.path.relpath(os.path.abspath(__file__),
-                                                           rep.root)}
+    # `self_name` falls back to the repo-relative name, which matters in the probe's
+    # scratch copy: there `__file__` still points at this checkout, and without the
+    # fallback the copy of THIS file would be scanned and its own strings reported.
+    skip = {os.path.relpath(doc, rep.root), self_name(rep.root)}
+    for rel, why in CANON_PENDING.items():
+        if not os.path.exists(os.path.join(rep.root, rel)):
+            rep.note(f"{rel}: CANON_PENDING not verifiable in this tree (in flight?): {why}")
     for rel in canon_scan_files(rep.root):
-        if rel in skip:
-            continue
-        head = (_read(os.path.join(rep.root, rel)).splitlines() or [""])[0]
+        if rel in skip or rel.endswith(CANON_SKIP_SUFFIX):
+            continue  # the guide's own blocks were checked above; this file's strings
+                      # describe the check; Windows-only launchers are exempt by rule
+        body = _read(os.path.join(rep.root, rel))
+        head = (body.splitlines() or [""])[0]
         if rel.endswith(".py") and head.startswith("#!") and "python" in head \
                 and "python3" not in head:
             rep.fail_plain(f"{rel}:1: shebang '{head}' — the repository canon is "
                            f"'#!/usr/bin/env python3' (a bare `python` may not exist on "
                            f"ubuntu-latest, where the tool is expected to run)"
                            f" (checked against the shebangs of tools/*.py)")
-    for rel in canon_scan_files(rep.root):
-        if rel in skip:
-            continue  # the guide's own blocks are checked above; this file's strings
-                      # describe the check, they are not examples of how to run a tool
-        for i, line in enumerate(_read(os.path.join(rep.root, rel)).splitlines(), 1):
-            m = BARE_PYTHON_CMD.search(line)
-            if m:
-                rep.note(f"{rel}:{i}: bare 'python' in a usage example "
-                         f"('{line.strip()}') — the canon is '{canon}'; this line is a "
-                         f"copy-paste failure on ubuntu-latest")
+        hits = [(i, line) for i, line in enumerate(body.splitlines(), 1)
+                if BARE_PYTHON_CMD.search(line)]
+        if not hits:
+            if rel in CANON_PENDING:
+                rep.fail_plain(f"{rel}: CANON_PENDING says the file still has a stale "
+                               f"`python` example, but it is clean now — remove the entry "
+                               f"({CANON_PENDING[rel]})")
+            continue
+        for i, line in hits:
+            detail = (f"{rel}:{i}: bare 'python' in a usage example ('{line.strip()}') — the "
+                      f"repository canon is '{canon}'; this is a copy-paste failure on "
+                      f"ubuntu-latest, where the unversioned interpreter may not exist "
+                      f"(checked against the shebangs of tools/*.py and the run: steps of "
+                      f"ci.yml)")
+            if rel in CANON_PENDING:
+                rep.note(f"{detail} [tolerated while in flight: {CANON_PENDING[rel]}]")
+            else:
+                rep.fail_plain(detail)
 
 
 def check_entry_points(rep: Report, doc: str, text: str) -> None:
@@ -733,6 +768,8 @@ PROBES: list[tuple[str, str, str]] = [
     ("src-safety", "SOURCE: add a path to check_safety.py::critical, leave the doc",
      "invariant 10 does not list it"),
     ("src-cargo-trap", "SOURCE: dependency version bumped, [package] untouched", ""),
+    ("src-canon-example", "SOURCE: a stale `python tool.py` example in a Linux-facing file",
+     "bare 'python' in a usage example"),
     ("src-shebang", "SOURCE: a tool shebang that spells the interpreter bare",
      "shebang '#!/usr/bin/env python'"),
     ("doc-exception-stale", "ALLOWED_MISSING: the in-flight path appears, the excuse must go",
@@ -825,6 +862,9 @@ def apply_probe(root: str, name: str) -> None:
             raise AssertionError("a dependency version bump was misread as a doc version drift: "
                                  f"{rep.failures[0]}")
         return
+    elif name == "src-canon-example":
+        with open(os.path.join(root, "tools/mini_repo.py"), "a", encoding="utf-8") as fh:
+            fh.write("\n# Example: python tools/mini_repo.py serve 8000\n")
     elif name == "src-shebang":
         _sub(os.path.join(root, "tools/host_tests.py"), re.compile(r"^#!.*python3.*$", re.M),
              lambda m: "#!/usr/bin/env python")
