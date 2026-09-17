@@ -12,6 +12,29 @@
 //! batched into a single journal transaction so the host-visible ext2 state
 //! only ever advances atomically.
 //!
+//! # Links (issue #18)
+//!
+//! The writer creates all three on-disk inode kinds a Debian `data.tar`
+//! carries: regular files, directories and **symbolic links** (`S_IFLNK`), and
+//! it supports **hard links** as ext2 does natively — several directory
+//! entries sharing one inode, kept honest by `i_links_count`:
+//!
+//!   * [`Ext2Fs::create_symlink`] picks the fast/slow layout via
+//!     [`symlink::plan`] (target ≤ 59 bytes inline in `i_block`, longer ones in
+//!     one data block written through `Tx::data_block`, i.e. ordered-mode);
+//!   * [`Ext2Fs::link`] bumps `i_links_count` and adds a directory entry, never
+//!     a block;
+//!   * [`Ext2Fs::unlink`] reads the link count: it frees blocks + inode only for
+//!     the **last** name, otherwise it just decrements — so deleting one name of
+//!     a hard-linked file cannot free data another name still uses.
+//!
+//! `i_links_count` is never repaired by `recover()` or `reconcile_free_counts`,
+//! and this filesystem has no fsck, so the accounting is authoritative: the
+//! rules are pinned in the pure `symlink` module and property-tested on the
+//! host. A symlink inode must never be handed out as an [`Ext2File`] — `read`
+//! on a fast link would interpret the target text as block pointers; see
+//! [`Ext2Fs::node_for`].
+//!
 //! This module is pure logic exercised over a RAM-mock `BlockDevice`
 //! (`crate::test`); it is not wired into boot or the VFS mount table here.
 
@@ -21,6 +44,8 @@ pub mod alloc;
 pub mod dir;
 pub mod inode;
 pub mod structs;
+/// Pure symlink-layout / hard-link accounting rules (host-testable, R11.6).
+pub mod symlink;
 
 use ::alloc::collections::BTreeMap;
 use ::alloc::string::String;
@@ -37,8 +62,10 @@ use crate::vfs::{FsStat, VfsError, VfsNode, VfsResult};
 use structs::{
     inode_size, read_struct, read_u32, write_struct, write_u32, Ext2GroupDesc, Ext2Inode,
     Ext2SuperBlock, BS, EXT2_FIRST_INO, EXT2_MAGIC, EXT2_ROOT_INO, INODE_SIZE, PTRS_PER_BLOCK,
-    SECTORS_PER_BLOCK, S_IFDIR, S_IFREG,
+    SECTORS_PER_BLOCK, S_IFDIR, S_IFLNK, S_IFREG,
 };
+
+use symlink::{SymlinkLayout, UnlinkAction};
 
 // ─── format layout constants (single block group) ───────────────────────────
 
@@ -496,6 +523,10 @@ impl<'a> Tx<'a> {
     }
 
     /// Free every data + indirect block referenced by `inode`.
+    ///
+    /// Only valid for inodes whose `i_block` really is a block map — regular
+    /// files and directories. Symlinks must go through
+    /// [`Self::free_inode_blocks`].
     fn free_all_blocks(&mut self, inode: &Ext2Inode) -> Result<(), FsError> {
         for i in 0..12 {
             if inode.i_block[i] != 0 {
@@ -506,6 +537,28 @@ impl<'a> Tx<'a> {
         self.free_indirect(inode.i_block[13], 2)?;
         self.free_indirect(inode.i_block[14], 3)?;
         Ok(())
+    }
+
+    /// Delete-path counterpart of `free_all_blocks` that honors the inode kind
+    /// (issue #18).
+    ///
+    /// A **fast** symlink keeps its target *text* in `i_block`, so walking it as
+    /// a block map would free the blocks whose numbers happen to spell the
+    /// target — arbitrary block frees out of a corrupt-but-plausible inode. A
+    /// **slow** symlink owns exactly the single block in `i_block[0]` and has no
+    /// indirect tree at all. Everything else is a regular file or a directory and
+    /// uses the normal map.
+    fn free_inode_blocks(&mut self, inode: &Ext2Inode) -> Result<(), FsError> {
+        if inode.is_symlink() {
+            if symlink::is_fast(inode.i_blocks, inode.i_size) {
+                return Ok(()); // inline target: no data block exists
+            }
+            if inode.i_block[0] != 0 {
+                self.free_data_block(inode.i_block[0])?;
+            }
+            return Ok(());
+        }
+        self.free_all_blocks(inode)
     }
 
     fn free_indirect(&mut self, blk: u32, level: u32) -> Result<(), FsError> {
@@ -956,7 +1009,15 @@ impl Ext2Fs {
         })
     }
 
-    /// Build a child node by inode/name, choosing dir vs file from `i_mode`.
+    /// Build a child node by inode/name, dispatching on the inode's `i_mode`.
+    ///
+    /// The dispatch is explicit and must stay that way: handing a symlink inode
+    /// to [`Ext2File`] would let `read` run the block map over `i_block`, where a
+    /// *fast* symlink stores its target text — i.e. the target bytes would be
+    /// interpreted as block numbers and an arbitrary disk block returned
+    /// (issue #18). Anything that is neither a directory, a regular file nor a
+    /// symlink (a foreign image's device node, fifo, ...) becomes an
+    /// [`Ext2Opaque`] node with no readable content at all.
     fn node_for(fs: &Arc<Ext2Fs>, ino: u32, name: &str) -> Result<Arc<dyn VfsNode>, FsError> {
         let inode = fs.read_inode(ino)?;
         let cached_size = inode.i_size as u64;
@@ -967,9 +1028,22 @@ impl Ext2Fs {
                 name: String::from(name),
                 cached_size,
             }))
-        } else {
+        } else if inode.is_symlink() {
+            Ok(Arc::new(Ext2Symlink {
+                fs: fs.clone(),
+                ino,
+                name: String::from(name),
+                cached_size,
+            }))
+        } else if inode.is_reg() {
             Ok(Arc::new(Ext2File {
                 fs: fs.clone(),
+                ino,
+                name: String::from(name),
+                cached_size,
+            }))
+        } else {
+            Ok(Arc::new(Ext2Opaque {
                 ino,
                 name: String::from(name),
                 cached_size,
@@ -1034,6 +1108,24 @@ impl Ext2Fs {
         let mut dinode = tx.read_inode(dir_ino)?;
         let nblocks = (dinode.i_size as usize + BS - 1) / BS;
 
+        // Full in-transaction duplicate scan. Callers probe with `lookup_entry`
+        // first, but that probe runs outside the tx lock; inserting a second
+        // entry with the same name would leave two directory entries for one
+        // inode and silently break the link count. The blocks read here are
+        // cached in the transaction, so the insertion loop below re-reads none.
+        for lbn in 0..nblocks as u64 {
+            let Some(blk) = inode::block_for_offset(tx.fs, &dinode, lbn * BS as u64)? else {
+                continue;
+            };
+            let exists = {
+                let buf = tx.block(blk as u64)?;
+                dir::find(buf, name)?.is_some()
+            };
+            if exists {
+                return Err(FsError::AlreadyExists);
+            }
+        }
+
         // Try existing blocks. Read-only scan: holes must NOT be mapped with
         // map_or_alloc here — that would allocate a block (and bump
         // i_blocks/bitmaps) just to look for a name, leaking the allocation
@@ -1068,19 +1160,36 @@ impl Ext2Fs {
         Ok(())
     }
 
-    /// Create a regular file or directory named `name` under `parent_ino`.
-    /// Returns the new inode number.
-    pub fn create(&self, parent_ino: u32, name: &str, is_dir: bool) -> Result<u32, FsError> {
+    /// Shared pre-flight for a new directory entry: reject unusable names and a
+    /// name that already exists in `parent_ino`. Used by `create`,
+    /// `create_symlink` and `link` so all three report identical errors.
+    ///
+    /// The duplicate probe is an optimization only — `insert_dirent` re-checks
+    /// it inside the transaction.
+    fn check_new_entry(&self, parent_ino: u32, name: &str) -> Result<(), FsError> {
         if name.is_empty() || name == "." || name == ".." {
+            return Err(FsError::Corrupt);
+        }
+        // A directory entry name never contains a separator: every caller splits
+        // the path first, and an entry created with a '/' in its name could never
+        // be looked up again (`lookup_entry` splits on '/') — an unreachable,
+        // unremovable file. Refuse it at the writer.
+        if name.contains('/') {
             return Err(FsError::Corrupt);
         }
         if name.as_bytes().len() > 255 {
             return Err(FsError::NameTooLong);
         }
-        // Reject duplicates.
         if self.lookup_entry(parent_ino, name).is_ok() {
             return Err(FsError::AlreadyExists);
         }
+        Ok(())
+    }
+
+    /// Create a regular file or directory named `name` under `parent_ino`.
+    /// Returns the new inode number.
+    pub fn create(&self, parent_ino: u32, name: &str, is_dir: bool) -> Result<u32, FsError> {
+        self.check_new_entry(parent_ino, name)?;
 
         let mut tx = Tx::new(self);
         let new_ino = tx.alloc_new_inode()?;
@@ -1122,8 +1231,140 @@ impl Ext2Fs {
         Ok(new_ino)
     }
 
-    /// Remove `name` from `parent_ino`, freeing the child inode and its blocks.
-    /// Directories must be empty.
+    /// Create a symbolic link named `name` under `parent_ino` whose target is
+    /// the raw bytes `target` (a link target is stored verbatim — it is never
+    /// resolved or normalized against anything). Returns the new inode number.
+    ///
+    /// The on-disk shape comes from [`symlink::plan`] (issue #18):
+    ///
+    ///   * **fast** — `target.len() <= 59`: the target plus its terminating NUL
+    ///     fit in `i_block`, `i_blocks == 0`, and no data block is allocated;
+    ///   * **slow** — longer targets: one zeroed data block carries the target
+    ///     (its tail is a NUL by construction) and `i_blocks == BS/512`.
+    ///
+    /// The slow block is fetched through `Tx::data_block`, so it is written to
+    /// its final location *before* the metadata transaction commits (ordered
+    /// mode): a committed symlink inode can never point at an unwritten block.
+    /// One transaction covers the inode, its bitmap bit, the parent directory
+    /// entry and the superblock/group counters — no state is written outside the
+    /// usual transactional boundaries.
+    ///
+    /// An empty target is refused ([`FsError::Corrupt`]): silently creating a
+    /// link with no target is exactly the kind of corruption `tar` extraction
+    /// must not introduce.
+    pub fn create_symlink(
+        &self,
+        parent_ino: u32,
+        name: &str,
+        target: &[u8],
+    ) -> Result<u32, FsError> {
+        self.check_new_entry(parent_ino, name)?;
+        let plan = match symlink::plan(target) {
+            Ok(p) => p,
+            Err(symlink::SymlinkError::Empty) => return Err(FsError::Corrupt),
+            Err(symlink::SymlinkError::TooBig) => return Err(FsError::FileTooBig),
+        };
+
+        let mut tx = Tx::new(self);
+        let new_ino = tx.alloc_new_inode()?;
+
+        let mut inode = Ext2Inode::zeroed();
+        inode.i_mode = S_IFLNK | 0o777; // ext2 symlinks are always rwxrwxrwx
+        inode.i_size = plan.size as u32;
+        inode.i_links_count = 1;
+        match plan.layout {
+            SymlinkLayout::Fast => {
+                let inline = plan.inline.unwrap_or([0u8; symlink::INLINE_CAPACITY]);
+                inode.i_block = symlink::inline_words(&inline);
+                inode.i_blocks = 0;
+            }
+            SymlinkLayout::Slow => {
+                let blk = tx.alloc_zeroed_block()?;
+                {
+                    let b = tx.data_block(blk as u64, true)?;
+                    b[..target.len()].copy_from_slice(target);
+                }
+                inode.i_block[0] = blk;
+                inode.i_blocks = (BS / 512) as u32;
+            }
+        }
+        tx.write_inode(new_ino, &inode)?;
+
+        // Link into the parent directory.
+        Self::insert_dirent(&mut tx, parent_ino, name, new_ino)?;
+
+        tx.commit()?;
+        Ok(new_ino)
+    }
+
+    /// Read the target of symlink `ino`: exactly `i_size` bytes, no trailing
+    /// NUL, in the frozen image of the inode.
+    ///
+    /// Fast links are decoded from `i_block` (`read` must never touch them:
+    /// the inline bytes are not block pointers); slow links are read from their
+    /// single data block. A non-symlink inode — and a slow link whose first
+    /// block is missing — is [`FsError::Corrupt`]: returning a truncated target
+    /// would silently send the caller to a different path.
+    pub fn read_symlink(&self, ino: u32) -> Result<Vec<u8>, FsError> {
+        let inode = self.read_inode(ino)?;
+        if !inode.is_symlink() {
+            return Err(FsError::Corrupt);
+        }
+        if symlink::is_fast(inode.i_blocks, inode.i_size) {
+            let inline = symlink::inline_bytes(&inode.i_block);
+            let target = symlink::fast_target(&inline, inode.i_size).ok_or(FsError::Corrupt)?;
+            return Ok(target.to_vec());
+        }
+        let size = inode.i_size as usize;
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        if inode::block_for_offset(self, &inode, 0)?.is_none() {
+            return Err(FsError::Corrupt);
+        }
+        let mut out = vec![0u8; size];
+        let n = self.read_file(ino, 0, &mut out)?;
+        out.truncate(n);
+        Ok(out)
+    }
+
+    /// Add the hard link `name` under `parent_ino`, pointing at the existing
+    /// inode `target_ino`: the same inode, one more `i_links_count`, no new
+    /// blocks and no content copy.
+    ///
+    /// Refused for a directory target — ext2 has no directory hard links, and
+    /// `i_links_count` on a directory counts `.`/`..` rather than names — and
+    /// for an inode that is already free. Both a duplicate name and a
+    /// non-linkable target report [`FsError::AlreadyExists`], matching how
+    /// `unlink` reports a non-empty directory.
+    ///
+    /// The count bump and the directory entry are committed in **one**
+    /// transaction, so the on-disk state never shows a link count that does not
+    /// match the number of names pointing at the inode.
+    pub fn link(&self, parent_ino: u32, name: &str, target_ino: u32) -> Result<(), FsError> {
+        self.check_new_entry(parent_ino, name)?;
+
+        let mut tx = Tx::new(self);
+        let mut target = tx.read_inode(target_ino)?;
+        if target.is_dir() {
+            return Err(FsError::AlreadyExists);
+        }
+        target.i_links_count = symlink::link_bump(target.i_links_count).ok_or(FsError::Corrupt)?;
+        tx.write_inode(target_ino, &target)?;
+
+        Self::insert_dirent(&mut tx, parent_ino, name, target_ino)?;
+
+        tx.commit()
+    }
+
+    /// Remove `name` from `parent_ino`.
+    ///
+    /// Directories must be empty and are always released completely. For every
+    /// other inode the link count decides (issue #18): with more than one name
+    /// pointing at it only `i_links_count` is decremented, and the data/indirect
+    /// blocks plus the inode are freed only for the **last** name. Both branches
+    /// commit inside the same transaction as the directory-entry removal, so a
+    /// crash can never leave an entry pointing at a free inode.
     pub fn unlink(&self, parent_ino: u32, name: &str) -> Result<(), FsError> {
         if name == "." || name == ".." {
             return Err(FsError::Corrupt);
@@ -1152,7 +1393,7 @@ impl Ext2Fs {
             }
         }
         let (dir_block, child_ino) = found.ok_or(FsError::NotFound)?;
-        let child = tx.read_inode(child_ino)?;
+        let mut child = tx.read_inode(child_ino)?;
 
         // Empty-directory check (read committed state; child is unmodified here).
         if child.is_dir() {
@@ -1173,9 +1414,35 @@ impl Ext2Fs {
             dir::remove_from_block(buf, name)?;
         }
 
-        // Free the child's blocks and inode.
-        tx.free_all_blocks(&child)?;
-        tx.free_inode_bit(child_ino)?;
+        // Release the child according to its link count (issue #18).
+        //
+        // A directory is always released whole: its `i_links_count` counts
+        // `.`/`..` links rather than names, and a hard link to a directory
+        // cannot exist, so the "another name still points here" case is
+        // impossible (empty-directory `rmdir` arrives through `remove`).
+        // Everything else uses the pure `symlink::unlink_action` rule: several
+        // names share the inode, so only the last one frees its blocks — freeing
+        // them early would destroy data the surviving names still read.
+        let released = if child.is_dir() {
+            true
+        } else {
+            match symlink::unlink_action(child.i_links_count) {
+                Some(UnlinkAction::DropLink) => {
+                    child.i_links_count -= 1;
+                    false
+                }
+                Some(UnlinkAction::FreeInode) => true,
+                // A live directory entry pointing at a free inode is already
+                // corrupt; freeing "again" could release a reallocated inode.
+                None => return Err(FsError::Corrupt),
+            }
+        };
+        if released {
+            tx.free_inode_blocks(&child)?;
+            tx.free_inode_bit(child_ino)?;
+            child.i_links_count = 0;
+        }
+        tx.write_inode(child_ino, &child)?;
 
         if child.is_dir() {
             pinode.i_links_count = pinode.i_links_count.saturating_sub(1);
@@ -1230,7 +1497,10 @@ impl Ext2Fs {
             return Err(FsError::FileTooBig);
         }
         let inode0 = self.read_inode(ino)?;
-        if inode0.is_dir() {
+        // Only regular files have data blocks. A symlink inode keeps its target
+        // in `i_block` (fast) or in its single block (slow) — truncating it
+        // would rewrite the link target as block pointers (issue #18).
+        if !inode0.is_reg() {
             return Err(FsError::Corrupt);
         }
         let old_size = inode0.i_size as u64;
@@ -1252,7 +1522,7 @@ impl Ext2Fs {
         // Shrink.
         let mut tx = Tx::new(self);
         let mut inode = tx.read_inode(ino)?;
-        if inode.is_dir() {
+        if !inode.is_reg() {
             return Err(FsError::Corrupt);
         }
         let old_nblocks = (old_size as usize + BS - 1) / BS;
@@ -1310,7 +1580,9 @@ impl Ext2Fs {
         while written < data.len() {
             let mut tx = Tx::new(self);
             let mut inode = tx.read_inode(ino)?;
-            if inode.is_dir() {
+            // Only regular files have data blocks (see `truncate_file`): for a
+            // symlink inode `map_or_alloc` would overwrite the inline target.
+            if !inode.is_reg() {
                 return Err(FsError::Corrupt);
             }
 
@@ -1406,6 +1678,31 @@ impl VfsNode for Ext2Dir {
         let ino = self.fs.create(self.ino, name, false).map_err(fs_to_vfs)?;
         Ext2Fs::node_for(&self.fs, ino, name).map_err(fs_to_vfs)
     }
+    /// `ln -s`: the target bytes are stored verbatim (issue #18).
+    fn create_symlink(&self, name: &str, target: &[u8]) -> VfsResult<Arc<dyn VfsNode>> {
+        let ino = self
+            .fs
+            .create_symlink(self.ino, name, target)
+            .map_err(fs_to_vfs)?;
+        Ext2Fs::node_for(&self.fs, ino, name).map_err(fs_to_vfs)
+    }
+    /// `ln` (hard link): a second name for the target's inode, never a copy.
+    fn link(&self, name: &str, target: &Arc<dyn VfsNode>) -> VfsResult<Arc<dyn VfsNode>> {
+        let ino = target.fs_ino();
+        if ino == 0 || ino > u32::MAX as u64 {
+            return Err(VfsError::InvalidArgument);
+        }
+        self.fs
+            .link(self.ino, name, ino as u32)
+            .map_err(fs_to_vfs)?;
+        Ext2Fs::node_for(&self.fs, ino as u32, name).map_err(fs_to_vfs)
+    }
+    fn nlink(&self) -> u64 {
+        self.fs
+            .read_inode(self.ino)
+            .map(|i| i.i_links_count as u64)
+            .unwrap_or(1)
+    }
     fn remove(&self, name: &str) -> VfsResult<()> {
         self.fs.unlink(self.ino, name).map_err(fs_to_vfs)
     }
@@ -1457,10 +1754,117 @@ impl VfsNode for Ext2File {
     fn truncate(&self, size: u64) -> VfsResult<()> {
         self.fs.truncate_file(self.ino, size).map_err(fs_to_vfs)
     }
+    /// `i_links_count` in both directions: a hard-linked file reports the number
+    /// of names pointing at it (issue #18).
+    fn nlink(&self) -> u64 {
+        self.fs
+            .read_inode(self.ino)
+            .map(|i| i.i_links_count as u64)
+            .unwrap_or(1)
+    }
     fn size(&self) -> u64 {
         match self.fs.read_inode(self.ino) {
             Ok(i) => i.i_size as u64,
             Err(_) => self.cached_size,
         }
+    }
+}
+
+/// A symbolic link (ext2 `S_IFLNK`, issue #18).
+///
+/// The node carries no readable content: `read`/`write`/`truncate` stay
+/// `NotSupported` because for a *fast* link those bytes are the target text
+/// living in `i_block`, not data blocks. `size()` is `i_size`, i.e. the target
+/// length — what `lstat` reports and the upper bound `readlink` may return.
+///
+/// The guest-visible side is task t15's: it adds the additive
+/// `VfsNode::readlink() -> Option<String>` (introduced by the procfs slice,
+/// `docs/procfs.md` §6.1) and overrides it here with [`Self::target_bytes`].
+struct Ext2Symlink {
+    fs: Arc<Ext2Fs>,
+    ino: u32,
+    name: String,
+    /// See `Ext2Dir::cached_size`.
+    cached_size: u64,
+}
+
+impl Ext2Symlink {
+    /// The link target exactly as stored (no trailing NUL), or `None` when the
+    /// inode is not a well-formed symlink or the device read fails.
+    fn target_bytes(&self) -> Option<Vec<u8>> {
+        self.fs.read_symlink(self.ino).ok()
+    }
+}
+
+impl VfsNode for Ext2Symlink {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_directory(&self) -> bool {
+        false
+    }
+    /// Wired into the VFS link machinery (issue #18, t15): `readlink(2)`,
+    /// `lstat` and `d_type` all branch on this, and `vfs::lookup_path_walk`
+    /// follows the link only when it is true.
+    fn is_symlink(&self) -> bool {
+        true
+    }
+    /// The stored target. The VFS models targets as `String` (kernel paths are
+    /// UTF-8 throughout), so a target that is not valid UTF-8 — possible only in
+    /// a foreign image, this writer stores what `tar` gave it — is reported
+    /// lossily; the walker then simply fails to resolve it (`ENOENT`).
+    fn read_link(&self) -> Option<String> {
+        self.target_bytes()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+    fn fs_ino(&self) -> u64 {
+        self.ino as u64
+    }
+    fn fs_stat(&self) -> Option<FsStat> {
+        let sb = self.fs.superblock();
+        Some(FsStat {
+            block_size: BS as u64,
+            blocks_total: sb.s_blocks_count as u64,
+            blocks_free: sb.s_free_blocks_count as u64,
+            inodes_total: sb.s_inodes_count as u64,
+            inodes_free: sb.s_free_inodes_count as u64,
+        })
+    }
+    fn nlink(&self) -> u64 {
+        self.fs
+            .read_inode(self.ino)
+            .map(|i| i.i_links_count as u64)
+            .unwrap_or(1)
+    }
+    fn size(&self) -> u64 {
+        match self.fs.read_inode(self.ino) {
+            Ok(i) => i.i_size as u64,
+            Err(_) => self.cached_size,
+        }
+    }
+}
+
+/// An inode of a kind this writer never creates (a foreign image's device node,
+/// fifo, socket, ...): visible and stat-able, but never readable as a file, so
+/// no unknown `i_mode` can reach the regular-file block map.
+struct Ext2Opaque {
+    ino: u32,
+    name: String,
+    /// See `Ext2Dir::cached_size`.
+    cached_size: u64,
+}
+
+impl VfsNode for Ext2Opaque {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_directory(&self) -> bool {
+        false
+    }
+    fn fs_ino(&self) -> u64 {
+        self.ino as u64
+    }
+    fn size(&self) -> u64 {
+        self.cached_size
     }
 }

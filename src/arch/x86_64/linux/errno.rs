@@ -67,8 +67,12 @@ pub enum Errno {
     EPIPE = 32,
     /// Result too large / buffer too small.
     ERANGE = 34,
+    /// File name too long (a resolution expanded past `link_walk::MAX_EXPANDED_BYTES`).
+    ENAMETOOLONG = 36,
     /// Function not implemented.
     ENOSYS = 38,
+    /// Too many levels of symbolic links (`link_walk::SYMLOOP_MAX` crossed).
+    ELOOP = 40,
     /// Operation timed out.
     ETIMEDOUT = 110,
 }

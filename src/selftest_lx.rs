@@ -98,6 +98,7 @@ pub fn run() {
     check_dup();
     check_walltime();
     check_getdents();
+    check_links();
 
     crate::info!("LXSELFTEST harness done");
 }
@@ -758,6 +759,31 @@ fn scratch_write(bytes: &[u8]) {
     unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), SCRATCH_VA as *mut u8, bytes.len());
     }
+}
+
+/// Copy `bytes` into the scratch page at `off`. PRECONDITION: scratch mapped and
+/// `off + bytes.len() <= 4096`.
+fn scratch_write_at(off: usize, bytes: &[u8]) {
+    // SAFETY: the scratch page is mapped writable; the caller keeps the write
+    // inside the 4 KiB page.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            (SCRATCH_VA as *mut u8).add(off),
+            bytes.len(),
+        );
+    }
+}
+
+/// Read `len` bytes from the scratch page at `off` into an owned buffer.
+fn scratch_read_at(off: usize, len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    // SAFETY: the scratch page is mapped readable; the caller keeps the read
+    // inside the 4 KiB page.
+    unsafe {
+        core::ptr::copy_nonoverlapping((SCRATCH_VA as *const u8).add(off), buf.as_mut_ptr(), len);
+    }
+    buf
 }
 
 /// Read `len` bytes back from the scratch page into an owned buffer.
@@ -1516,6 +1542,401 @@ fn check_walltime() {
     match result {
         Ok(()) => pass(name),
         Err(d) => fail(name, d),
+    }
+}
+
+/// 18.5 / issue #18 — symbolic links end to end through the real syscall layer.
+///
+/// Builds links on the mounted ext2 under `/mnt` and then drives `readlink(2)`,
+/// `newfstatat` (`stat` vs `lstat`), `open`, `getdents64` and the `/proc/self/exe`
+/// path. Pins the contract (`EXT2-LINKS.md` §4):
+///
+///   * `readlink` returns the stored target verbatim (fast *and* slow layout),
+///     truncates to `bufsiz` without a NUL, and answers `EINVAL` for a
+///     non-link or a zero `bufsiz`, `ENOENT` for an absent path;
+///   * `lstat` describes the link itself (`S_IFLNK`, `st_size` = target length,
+///     the link's own inode) while `stat` follows it (`S_IFREG`, target size,
+///     target inode) — and two hard links report the same `st_ino` with
+///     `st_nlink == 2`;
+///   * `open` follows a link and reads the target's bytes;
+///   * `getdents64` reports `DT_LNK` for the link and the real inode numbers;
+///   * a dangling link is `ENOENT` for `stat`/`open` but fine for `lstat`, and a
+///     **cycle** is `ELOOP` (never a hang, never a wrong file).
+///
+/// Everything it creates is removed again, so the mounted tree is left as found.
+fn check_links() {
+    let name = "ext2_links";
+    const PATH_OFF: usize = 0; // C-string path for the handlers
+    const OUT_OFF: usize = 256; // targets / file payloads
+    const STAT_OFF: usize = 512; // struct stat (144 bytes)
+    const DIR_OFF: usize = 1024; // getdents64 output
+    /// Bytes of scratch page left for the dirent buffer: the handler validates
+    /// the whole range, so a count reaching past the mapped page fails.
+    const DIR_LEN: u64 = (4096 - DIR_OFF) as u64;
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const S_IFMT: u32 = 0o170000;
+    const S_IFREG: u32 = 0o100000;
+    const S_IFLNK: u32 = 0o120000;
+
+    let mnt = match vfs::lookup_path("/mnt") {
+        Ok(n) => n,
+        Err(_) => {
+            fail(name, "/mnt is not mounted");
+            return;
+        }
+    };
+    let target_payload: &[u8] = b"link-payload";
+    if let Err(d) = write_mnt_file("lx_target", target_payload) {
+        fail(name, d);
+        return;
+    }
+    // 70-byte target: long enough for the *slow* (data-block) inode layout.
+    let mut slow_target: alloc::vec::Vec<u8> = b"/mnt/".to_vec();
+    for _ in 0..70 {
+        slow_target.push(b'z');
+    }
+    let make = |n: &str, t: &[u8]| -> bool {
+        let _ = mnt.remove(n);
+        mnt.create_symlink(n, t).is_ok()
+    };
+    let created = make("lx_rel", b"lx_target")
+        && make("lx_abs", b"/mnt/lx_target")
+        && make("lx_slow", &slow_target)
+        && make("lx_dang", b"/mnt/lx_absent")
+        && make("lx_loop_a", b"/mnt/lx_loop_b")
+        && make("lx_loop_b", b"/mnt/lx_loop_a");
+    if !created {
+        fail(name, "create_symlink failed on /mnt");
+        cleanup_links(&mnt);
+        return;
+    }
+    // A second name for the target inode (hard link, issue #18).
+    let hard_ok = {
+        let _ = mnt.remove("lx_hard");
+        match vfs::lookup_path("/mnt/lx_target") {
+            Ok(t) => mnt.link("lx_hard", &t).is_ok(),
+            Err(_) => false,
+        }
+    };
+
+    if !map_scratch() {
+        cleanup_links(&mnt);
+        fail(name, "scratch map failed");
+        return;
+    }
+
+    let u32_at = |off: usize| -> u32 {
+        let b = scratch_read_at(off, 4);
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    };
+    let u64_at = |off: usize| -> u64 {
+        let b = scratch_read_at(off, 8);
+        u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+    };
+
+    let result: Result<(), &'static str> =
+        with_synth_compat(0x40_0000, scheduler::current_pid(), || {
+            // ── readlink: relative target, verbatim ──────────────────────
+            // The expected lengths come from the literals themselves: a magic
+            // number here silently drifts from the string it describes.
+            let rel_target: &[u8] = b"lx_target";
+            let abs_target: &[u8] = b"/mnt/lx_target";
+            scratch_write_at(PATH_OFF, b"/mnt/lx_rel\0");
+            let n = io_sys::sys_readlink(
+                SCRATCH_VA + PATH_OFF as u64,
+                SCRATCH_VA + OUT_OFF as u64,
+                64,
+            )
+            .map_err(|_| "readlink(rel) failed")?;
+            if n as usize != rel_target.len() || scratch_read_at(OUT_OFF, n as usize) != rel_target
+            {
+                return Err("readlink(rel) returned the wrong target");
+            }
+            // ── readlink: absolute target ────────────────────────────────
+            scratch_write_at(PATH_OFF, b"/mnt/lx_abs\0");
+            let n = io_sys::sys_readlink(
+                SCRATCH_VA + PATH_OFF as u64,
+                SCRATCH_VA + OUT_OFF as u64,
+                64,
+            )
+            .map_err(|_| "readlink(abs) failed")?;
+            if n as usize != abs_target.len() || scratch_read_at(OUT_OFF, n as usize) != abs_target
+            {
+                return Err("readlink(abs) returned the wrong target");
+            }
+            // ── readlink: slow layout, then truncation to bufsiz ─────────
+            scratch_write_at(PATH_OFF, b"/mnt/lx_slow\0");
+            let n = io_sys::sys_readlink(
+                SCRATCH_VA + PATH_OFF as u64,
+                SCRATCH_VA + OUT_OFF as u64,
+                128,
+            )
+            .map_err(|_| "readlink(slow) failed")?;
+            if n as usize != slow_target.len()
+                || scratch_read_at(OUT_OFF, n as usize) != slow_target.as_slice()
+            {
+                return Err("readlink(slow) did not round-trip the 70-byte target");
+            }
+            let n =
+                io_sys::sys_readlink(SCRATCH_VA + PATH_OFF as u64, SCRATCH_VA + OUT_OFF as u64, 4)
+                    .map_err(|_| "readlink(truncating) failed")?;
+            // Truncation returns the *prefix* of the stored target (which starts
+            // with `/mnt/`), not a NUL-terminated or re-encoded string.
+            if n != 4 || scratch_read_at(OUT_OFF, 4) != b"/mnt" {
+                return Err("readlink must truncate to bufsiz without a NUL");
+            }
+            // ── readlink error cases ─────────────────────────────────────
+            if io_sys::sys_readlink(SCRATCH_VA + PATH_OFF as u64, SCRATCH_VA + OUT_OFF as u64, 0)
+                != Err(Errno::EINVAL)
+            {
+                return Err("readlink with bufsiz 0 must be EINVAL");
+            }
+            scratch_write_at(PATH_OFF, b"/mnt/lx_target\0");
+            if io_sys::sys_readlink(
+                SCRATCH_VA + PATH_OFF as u64,
+                SCRATCH_VA + OUT_OFF as u64,
+                64,
+            ) != Err(Errno::EINVAL)
+            {
+                return Err("readlink of a regular file must be EINVAL");
+            }
+            scratch_write_at(PATH_OFF, b"/mnt/lx_absent\0");
+            if io_sys::sys_readlink(
+                SCRATCH_VA + PATH_OFF as u64,
+                SCRATCH_VA + OUT_OFF as u64,
+                64,
+            ) != Err(Errno::ENOENT)
+            {
+                return Err("readlink of an absent path must be ENOENT");
+            }
+
+            // ── lstat vs stat ────────────────────────────────────────────
+            scratch_write_at(PATH_OFF, b"/mnt/lx_abs\0");
+            io_sys::sys_newfstatat(
+                0,
+                SCRATCH_VA + PATH_OFF as u64,
+                SCRATCH_VA + STAT_OFF as u64,
+                AT_SYMLINK_NOFOLLOW,
+            )
+            .map_err(|_| "lstat(link) failed")?;
+            if u32_at(STAT_OFF + 24) & S_IFMT != S_IFLNK {
+                return Err("lstat(link) must report S_IFLNK");
+            }
+            if u32_at(STAT_OFF + 24) & 0o777 != 0o777 {
+                return Err("ext2 symlinks are 0777");
+            }
+            let link_ino = u64_at(STAT_OFF + 8);
+            // st_size is the *target length*, not the target's size.
+            let size = u64_at(STAT_OFF + 48);
+            if size != abs_target.len() as u64 {
+                return Err("lstat(link).st_size must be the target length");
+            }
+            io_sys::sys_newfstatat(
+                0,
+                SCRATCH_VA + PATH_OFF as u64,
+                SCRATCH_VA + STAT_OFF as u64,
+                0,
+            )
+            .map_err(|_| "stat(link) failed")?;
+            if u32_at(STAT_OFF + 24) & S_IFMT != S_IFREG {
+                return Err("stat(link) must follow to the regular file");
+            }
+            if u64_at(STAT_OFF + 8) == link_ino {
+                return Err("stat(link) must report the target's inode");
+            }
+            if u64_at(STAT_OFF + 48) as usize != target_payload.len() {
+                return Err("stat(link).st_size must be the target's size");
+            }
+            let target_ino = u64_at(STAT_OFF + 8);
+            // Hard links: same inode, nlink == 2 (skip when the link failed).
+            if hard_ok {
+                scratch_write_at(PATH_OFF, b"/mnt/lx_hard\0");
+                io_sys::sys_newfstatat(
+                    0,
+                    SCRATCH_VA + PATH_OFF as u64,
+                    SCRATCH_VA + STAT_OFF as u64,
+                    0,
+                )
+                .map_err(|_| "stat(hardlink) failed")?;
+                if u64_at(STAT_OFF + 8) != target_ino {
+                    return Err("a hard link must report the same st_ino");
+                }
+                if u64_at(STAT_OFF + 16) != 2 {
+                    return Err("a hard-linked file must report st_nlink 2");
+                }
+            }
+
+            // ── dangling link ────────────────────────────────────────────
+            scratch_write_at(PATH_OFF, b"/mnt/lx_dang\0");
+            io_sys::sys_newfstatat(
+                0,
+                SCRATCH_VA + PATH_OFF as u64,
+                SCRATCH_VA + STAT_OFF as u64,
+                AT_SYMLINK_NOFOLLOW,
+            )
+            .map_err(|_| "lstat(dangling) failed")?;
+            if u32_at(STAT_OFF + 24) & S_IFMT != S_IFLNK {
+                return Err("lstat(dangling) must still report S_IFLNK");
+            }
+            if io_sys::sys_newfstatat(
+                0,
+                SCRATCH_VA + PATH_OFF as u64,
+                SCRATCH_VA + STAT_OFF as u64,
+                0,
+            ) != Err(Errno::ENOENT)
+            {
+                return Err("stat(dangling) must be ENOENT");
+            }
+
+            // ── open follows, and reads the target ───────────────────────
+            scratch_write_at(PATH_OFF, b"/mnt/lx_rel\0");
+            let fd = io_sys::sys_open(SCRATCH_VA + PATH_OFF as u64, 0, 0)
+                .map_err(|_| "open(link) failed")?;
+            let rn = io_sys::sys_read(fd, SCRATCH_VA + OUT_OFF as u64, 32)
+                .map_err(|_| "read through the link failed")?;
+            if scratch_read_at(OUT_OFF, rn as usize) != target_payload {
+                return Err("reading through a link must return the target's bytes");
+            }
+            let _ = io_sys::sys_close(fd);
+            scratch_write_at(PATH_OFF, b"/mnt/lx_dang\0");
+            if io_sys::sys_open(SCRATCH_VA + PATH_OFF as u64, 0, 0) != Err(Errno::ENOENT) {
+                return Err("open(dangling) must be ENOENT");
+            }
+
+            // ── getdents64: d_type and the real inode ────────────────────
+            scratch_write_at(PATH_OFF, b"/mnt\0");
+            let dfd = io_sys::sys_open(SCRATCH_VA + PATH_OFF as u64, 0, 0)
+                .map_err(|_| "open(/mnt) failed")?;
+            let dn = io_sys::sys_getdents64(dfd, SCRATCH_VA + DIR_OFF as u64, DIR_LEN)
+                .map_err(|_| "getdents64(/mnt) failed")?;
+            let _ = io_sys::sys_close(dfd);
+            let dir = scratch_read_at(DIR_OFF, dn as usize);
+            let mut at = 0usize;
+            let mut saw_link = false;
+            let mut saw_target = false;
+            while at + 19 <= dir.len() {
+                let rec_len = u16::from_le_bytes([dir[at + 16], dir[at + 17]]) as usize;
+                if rec_len < 19 || at + rec_len > dir.len() {
+                    break;
+                }
+                let d_type = dir[at + 18];
+                let d_ino = u64::from_le_bytes([
+                    dir[at],
+                    dir[at + 1],
+                    dir[at + 2],
+                    dir[at + 3],
+                    dir[at + 4],
+                    dir[at + 5],
+                    dir[at + 6],
+                    dir[at + 7],
+                ]);
+                let name_bytes = &dir[at + 19..at + rec_len];
+                let end = name_bytes
+                    .iter()
+                    .position(|b| *b == 0)
+                    .unwrap_or(name_bytes.len());
+                let nm = &name_bytes[..end];
+                if nm == b"lx_rel" {
+                    saw_link = d_type == 10; // DT_LNK
+                }
+                if nm == b"lx_target" {
+                    saw_target = d_type == 8 && d_ino == target_ino; // DT_REG
+                }
+                at += rec_len;
+            }
+            if !saw_link {
+                return Err("getdents64 must report DT_LNK for a symlink");
+            }
+            if !saw_target {
+                return Err("getdents64 must report the real inode for a regular file");
+            }
+
+            // ── cycles are ELOOP, and lstat still sees the link ──────────
+            scratch_write_at(PATH_OFF, b"/mnt/lx_loop_a\0");
+            io_sys::sys_newfstatat(
+                0,
+                SCRATCH_VA + PATH_OFF as u64,
+                SCRATCH_VA + STAT_OFF as u64,
+                AT_SYMLINK_NOFOLLOW,
+            )
+            .map_err(|_| "lstat(cyclic link) failed")?;
+            if u32_at(STAT_OFF + 24) & S_IFMT != S_IFLNK {
+                return Err("lstat of a cyclic link must still describe the link");
+            }
+            if io_sys::sys_newfstatat(
+                0,
+                SCRATCH_VA + PATH_OFF as u64,
+                SCRATCH_VA + STAT_OFF as u64,
+                0,
+            ) != Err(Errno::ELOOP)
+            {
+                return Err("stat through a link cycle must be ELOOP");
+            }
+            if io_sys::sys_open(SCRATCH_VA + PATH_OFF as u64, 0, 0) != Err(Errno::ELOOP) {
+                return Err("open through a link cycle must be ELOOP");
+            }
+
+            // ── /proc/self/exe still works through the same mechanism ────
+            compat::with_current_compat(|cs| {
+                cs.exe_path = alloc::string::String::from("/mnt/lx_target")
+            });
+            scratch_write_at(PATH_OFF, b"/proc/self/exe\0");
+            let n = io_sys::sys_readlink(
+                SCRATCH_VA + PATH_OFF as u64,
+                SCRATCH_VA + OUT_OFF as u64,
+                64,
+            )
+            .map_err(|_| "readlink(/proc/self/exe) failed")?;
+            if scratch_read_at(OUT_OFF, n as usize) != b"/mnt/lx_target" {
+                return Err("readlink(/proc/self/exe) must report the image path");
+            }
+            io_sys::sys_newfstatat(
+                0,
+                SCRATCH_VA + PATH_OFF as u64,
+                SCRATCH_VA + STAT_OFF as u64,
+                AT_SYMLINK_NOFOLLOW,
+            )
+            .map_err(|_| "lstat(/proc/self/exe) failed")?;
+            if u32_at(STAT_OFF + 24) & S_IFMT != S_IFLNK {
+                return Err("lstat(/proc/self/exe) must report S_IFLNK");
+            }
+            io_sys::sys_newfstatat(
+                0,
+                SCRATCH_VA + PATH_OFF as u64,
+                SCRATCH_VA + STAT_OFF as u64,
+                0,
+            )
+            .map_err(|_| "stat(/proc/self/exe) failed")?;
+            if u32_at(STAT_OFF + 24) & S_IFMT != S_IFREG {
+                return Err("stat(/proc/self/exe) must follow to the image");
+            }
+
+            Ok(())
+        });
+
+    unmap_scratch();
+    cleanup_links(&mnt);
+    mnt.sync();
+
+    match result {
+        Ok(()) => pass(name),
+        Err(d) => fail(name, d),
+    }
+}
+
+/// Remove every scratch entry [`check_links`] creates.
+fn cleanup_links(mnt: &Arc<dyn crate::vfs::VfsNode>) {
+    for n in [
+        "lx_rel",
+        "lx_abs",
+        "lx_slow",
+        "lx_dang",
+        "lx_loop_a",
+        "lx_loop_b",
+        "lx_hard",
+        "lx_target",
+    ] {
+        let _ = mnt.remove(n);
     }
 }
 

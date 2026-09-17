@@ -19,15 +19,19 @@
 | `procfs_format.rs` | Чистое (`core`+`alloc`) форматирование текстов procfs, таблица путей и inode'ов — включается в host-tests (свойства `procfs_*`) |
 | `elf.rs` | Эффектный загрузчик ELF64: `ElfLoader::load` (нативный `ET_EXEC`), `ElfLoader::load_linux` (`ET_EXEC`, static-PIE `ET_DYN` и glibc-dynamic образы — `PT_INTERP` подшивается отдельно через `map_interpreter`), `ElfLoader::map_interpreter`; `ElfProcess` |
 | `elf_classify.rs` | Чистый core-only классификатор ELF (`classify_elf`, `ElfKind`, `ElfVerdict`) и выбор bias для static-PIE (`choose_bias`, `PIE_BASE`); включается в host-tests |
+| `link_walk.rs` | Чистый (`core`+`alloc`, self-contained) резолвер симлинков (issue #18): компонентный обход, стек `..`, относительные/абсолютные цели, бюджет `SYMLOOP_MAX=40`, `MAX_EXPANDED_BYTES`; host-свойства `link_walk_paths` (включая сравнение с независимым оракулом) |
 
 ## Ключевые символы
 
 - `VfsResult<T>`, `VfsError::{NotFound, NotSupported, InvalidArgument, IoError, AlreadyExists}`.
 - `FsStat { block_size, blocks_total, blocks_free, inodes_total, inodes_free }` — для `statfs`/`fstatfs`.
 - `trait VfsNode: Send + Sync` — обязательные только `name`/`is_directory`; дефолты:
-  `read/write/truncate/readdir/create_dir/create_file/remove` → `Err(NotSupported)`,
-  `lookup` → `Err(NotFound)`, `fs_stat` → `None`, `size`/`fs_ino` → `0`, `sync` → no-op.
-- `init()`, `mount_at(path, node)`, `lookup_path(path)`.
+  `read/write/truncate/readdir/create_dir/create_file/remove/create_symlink/link` →
+  `Err(NotSupported)`, `lookup` → `Err(NotFound)`, `fs_stat` → `None`, `size`/`fs_ino` → `0`,
+  `is_symlink` → `false`, `read_link` → `None`, `nlink` → `1`, `sync` → no-op.
+- `init()`, `mount_at(path, node)`, `lookup_path(path)` (одношаговый, **не** следует за ссылкой),
+  `lookup_path_walk(path, follow_final)` (обход с переходом по ссылкам → `link_walk::WalkError`).
+- `link_walk::{resolve, LinkTree, WalkError, SYMLOOP_MAX, map_guest_target, guest_path_keeps_root}`.
 - `VfsNode::is_symlink()` / `read_link() -> Option<String>` — понятие ссылки в трейте
   (дефолты `false`/`None`; переопределён у `/proc/self/exe`, будет переиспользован
   ext2-симлинками из issue #18). `MountNode` форвардит оба метода.
@@ -77,14 +81,43 @@
   получает ENOENT, а не выдуманное содержимое.
 - Неизвестный `/proc`-путь — всегда `NotFound` → `ENOENT`; никакого catch-all.
 - `/proc/self/exe` — первый узел с `is_symlink() == true`: `readlink` отдаёт путь образа,
-  `lstat` — `S_IFLNK|0777` с длиной цели, `open`/`stat` следуют по ссылке (бюджет 8 переходов
-  до общего резолвера issue #18), а `getdents64` помечает запись `DT_LNK`.
+  `lstat` — `S_IFLNK|0777` с длиной цели, `open`/`stat` следуют по ссылке (общий резолвер
+  `lookup_path_walk`, `SYMLOOP_MAX = 40` → `ELOOP`), а `getdents64` помечает запись `DT_LNK`.
 - `MountNode.fs_ino` не форвардится, поэтому `stat("/proc")` отдаёт синтетический
   FNV-inode имени `proc`; inode'ы детей — из фиксированной таблицы (`PROC_INO_BASE`),
   выше ramfs-диапазона и с нулевым старшим битом (он занят `synth_ino`).
 - Тесты: `procfs_format.rs` покрыт host-свойствами (`procfs_meminfo`/`procfs_cpuinfo`/
   `procfs_status`/`procfs_cmdline`/`procfs_maps`), дерево и тексты — in-QEMU рутином
   `procfs::tree, rendered files and ENOENT matrix` в `src/test.rs`.
+
+### Симлинки и обход путей (issue #18, контракт `EXT2-LINKS.md` §4/§7)
+- Трейт расширен аддитивно: `is_symlink()`, `read_link() -> Option<String>`, `nlink()`,
+  `create_symlink(name, target)`, `link(name, target_node)`; `MountNode` форвардит их
+  (`nlink` — чтобы `stat("/mnt")` показывал `i_links_count` корня ext2).
+  **`lookup_path` семантику не меняет** (одношаговый, без перехода): на нём остаются
+  `readlink`, `lstat`, `unlink`, `rmdir`, `rename`, `chmod`-исключения. Всё, что говорит
+  «файл, на который указывает путь» (`stat`, `open`, `access`, `chdir`, `statfs`, `execve`),
+  идёт через `lookup_path_walk(p, true)`; родительские каталоги в `mkdir`/`unlink`/`rmdir`/
+  `rename`/`O_CREAT` — тоже follow.
+- **Алгоритм живёт в чистом `link_walk.rs`**, ядро подставляет адаптер над `dyn VfsNode`
+  (интернирование узлов в `usize`-хендлы). Один обход: стек каталогов для `..`; промежуточные
+  ссылки следуются всегда, конечная — по `follow_final`; переход по ссылке **вставляет
+  компоненты цели перед оставшимися** (абсолютная цель сбрасывает стек к корню, относительная
+  продолжает от каталога ссылки — не от cwd!); 41-й переход → `ELOOP`, разросшийся путь →
+  `ENAMETOOLONG`.
+- Отображение цели: абсолютная цель — гостевая (`/x` → `/mnt/x`, кроме `dev/tmp/proc/sys/mnt`),
+  поэтому `lib64 → /usr/lib64` и `python3 → /mnt/usr/bin/python3.11` работают; относительная —
+  дословно от каталога ссылки. `map_guest_target` **не** схлопывает `..` лексически: стек
+  должен его увидеть (`/a/link/..` — это каталог цели, а не каталога ссылки).
+- `lstat` (`AT_SYMLINK_NOFOLLOW`): `S_IFLNK|0777`, `st_size` = длина цели, `st_nlink` =
+  `i_links_count`, `st_ino` — сам inode ссылки. `stat` следует (висячая цель → `ENOENT`,
+  цикл → `ELOOP`); `open` следует, `O_NOFOLLOW` на ссылке → `ELOOP`, `O_CREAT|O_EXCL` при
+  существующем имени (даже висячей ссылке) → `EEXIST`; `readlink` отдаёт `min(bufsiz, len)`
+  байт без NUL, `bufsiz == 0` → `EINVAL`, не-ссылка → `EINVAL`.
+- `getdents64`: `d_type = DT_LNK` для ссылок, `d_ino` — реальный номер inode.
+- Известные отклонения: цель хранится как `String`, поэтому не-UTF-8 цель чужого образа
+  отдаётся lossy; `st_blocks` ссылки — 0 (у slow-ссылки реально 1 блок); `rename`
+  по-прежнему копирует файлы и на ссылке-источнике отказывает (`EIO`), а не переносит dirent.
 
 ### ELF-загрузчик
 - `load` (legacy): валидация хедера и program headers с overflow-safe арифметикой **до**
@@ -114,3 +147,12 @@
 - `elf_classify.rs` сознательно дублирует `USER_ADDR_MAX` вместо импорта (иначе в host-tests
   протекают kernel-зависимости).
 - Нулевой `e_phnum` допустим; валидация phdr идёт до аллокаций — битые бинари не трогают память.
+- Абсолютная цель ссылки **не** очищает оставшиеся компоненты пути: `/a/link/..` обязан
+  применить `..` к каталогу цели (`/b/c/..` = `/b`). Ранний вариант резолвера чистил список
+  компонентов при абсолютной цели и возвращал `/b/c` — поймано host-свойством против
+  независимого оракула (`link_walk_paths`).
+- Адаптер `WalkNodes` интернирует узлы по `Arc::ptr_eq`: узел, возвращённый `lookup`,
+  должен быть тем же `Arc`, иначе один и тот же inode получит разные id и решение
+  «туда ли мы пришли» разъедется.
+- `readlink`, `lstat`, `unlink`, `rmdir` **нельзя** переводить на `lookup_path_walk(_, true)`:
+  они должны видеть саму ссылку (иначе удаление ссылки в каталог вернёт `EISDIR`).
