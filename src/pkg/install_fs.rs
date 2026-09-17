@@ -36,8 +36,8 @@ use alloc::vec::Vec;
 
 use crate::vfs::{self, VfsError, VfsNode};
 
-use super::install::{normalize_entry_path, NormPath};
-use super::tar::{TarEntry, TarType};
+use super::install::{plan_install, InstallOp};
+use super::tar::TarEntry;
 
 /// Failure modes of the effectful ext2 install (design component 10).
 #[derive(Debug)]
@@ -50,206 +50,272 @@ pub enum InstallError {
     Vfs(VfsError),
 }
 
-/// Install every regular-file entry of a decompressed `data.tar` onto ext2 under
-/// `root`, returning the number of files written (R10.1–R10.4, R10.6–R10.8).
+/// Install every member of a decompressed `data.tar` onto ext2 under `root`,
+/// returning the number of entries created (R10.1–R10.4, R10.6–R10.8, issue #18).
 ///
-/// For each entry: non-regular entries are skipped (R10.6); the archived path is
-/// normalized and `..`-escaping/empty paths are skipped (R10.8); missing parent
-/// directories are created (R10.2); the file is created (replacing any existing
-/// regular file so the stored size equals the content length — R10.3, R10.7) and the
-/// entry content is written verbatim. On a no-space failure the partial file is
-/// removed and [`InstallError::NoSpace`] is returned (R10.4); every failure emits one
-/// structured diagnostic (R12.4, R12.5).
+/// The selection and ordering rules live in the pure [`plan_install`]; this is the
+/// effectful shell that executes the plan:
+///
+///   * regular files are written verbatim (replacing an existing entry so the
+///     stored size matches the content length — R10.3, R10.7);
+///   * **symlinks are created as symlinks**, with the archive's target stored
+///     verbatim (`VfsNode::create_symlink`); a dangling target is normal;
+///   * **hard links are created as hard links** (`VfsNode::link`), i.e. a second
+///     name for the target inode — never a copy. The target may come from this
+///     archive or from an earlier package, so the hard-link operations are retried
+///     until no further progress, and whatever remains is reported and skipped;
+///   * missing parent directories are created (R10.2) and resolved **through
+///     symbolic links**, so a member under an existing `/lib64 -> usr/lib64`
+///     lands inside the target instead of creating a parallel tree;
+///   * an existing entry at a member's path is removed first — through the
+///     link-aware `unlink`, so removing one name of a hard-linked file cannot take
+///     the data another name still uses. A directory in the way is skipped with one
+///     diagnostic (never recursively deleted).
+///
+/// On a no-space failure the partial file is removed and [`InstallError::NoSpace`]
+/// is returned (R10.4); every failure emits one structured diagnostic (R12.4,
+/// R12.5). Nothing is ever materialized as a copy.
 pub fn install_data_tar(entries: &[TarEntry<'_>], root: &str) -> Result<usize, InstallError> {
+    let plan = plan_install(entries);
+
+    if plan.skipped_unsafe > 0 || plan.skipped_empty_target > 0 {
+        crate::warn!(
+            "Package_Installer: skipped {} path-unsafe and {} empty-target members",
+            plan.skipped_unsafe,
+            plan.skipped_empty_target
+        );
+    }
+
     let mut installed = 0usize;
 
-    for entry in entries {
-        // R10.6: only regular files are installed; skip directories and others.
-        if entry.kind != TarType::Regular {
-            continue;
-        }
+    // Hard links needing a target that this archive does not create (or that was
+    // created later in the plan): retried after the first pass.
+    let mut deferred: Vec<&InstallOp<'_>> = Vec::new();
 
-        // R10.1/R10.8: normalize against the root; skip unsafe/empty paths.
-        let rel = match normalize_entry_path(entry.path) {
-            NormPath::Keep(p) => p,
-            NormPath::SkipUnsafe => continue,
-        };
-
-        install_one(root, &rel, entry.content)?;
-        installed += 1;
-    }
-
-    // Ext2 write support has no symlinks, and skipping
-    // them lost critical files (libc6 ships /lib64/ld-linux-x86-64.so.2 and
-    // most lib*.so.N names only as symlinks; python3-minimal ships
-    // /usr/bin/python3 as a symlink). Materialize each link as a plain copy of
-    // its target file, after all regular files of the package are on disk.
-    installed += materialize_symlinks(entries, root)?;
-
-    Ok(installed)
-}
-
-/// Materialize symlink/hardlink entries as regular-file copies of their
-/// targets. Targets may live in this package (just installed) or in an earlier
-/// one (already on disk). Multi-level link chains are handled by re-trying
-/// unresolved links after each pass; links whose target never appears (or is a
-/// directory) are skipped with one warning each.
-fn materialize_symlinks(entries: &[TarEntry<'_>], root: &str) -> Result<usize, InstallError> {
-    // (link rel path, candidate target rel paths)
-    let mut pending: Vec<(String, Vec<String>)> = Vec::new();
-
-    for entry in entries {
-        if entry.kind != TarType::Symlink || entry.link_target.is_empty() {
-            continue;
-        }
-        let rel = match normalize_entry_path(entry.path) {
-            NormPath::Keep(p) => p,
-            NormPath::SkipUnsafe => continue,
-        };
-        let mut candidates: Vec<String> = Vec::new();
-        if let Some(stripped) = entry.link_target.strip_prefix('/') {
-            // Absolute symlink target: interpret relative to the install root.
-            if let NormPath::Keep(t) = normalize_entry_path(stripped) {
-                candidates.push(t);
+    for op in plan.ops.iter() {
+        match op {
+            InstallOp::File { path, content, .. } => {
+                install_one(root, path, content)?;
+                installed += 1;
             }
-        } else {
-            // Relative symlink target: resolve against the link's parent dir.
-            let mut comps: Vec<&str> = rel.split('/').collect();
-            comps.pop();
-            let mut ok = true;
-            for c in entry.link_target.split('/') {
-                match c {
-                    "" | "." => {}
-                    ".." => {
-                        if comps.pop().is_none() {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    c => comps.push(c),
-                }
+            InstallOp::Symlink { path, target } => {
+                install_symlink(root, path, target)?;
+                installed += 1;
             }
-            if ok && !comps.is_empty() {
-                candidates.push(comps.join("/"));
-            }
-            // Hardlink targets are archive paths (root-relative, no leading
-            // slash): also try the raw target against the root.
-            if let NormPath::Keep(t) = normalize_entry_path(entry.link_target) {
-                if !candidates.contains(&t) {
-                    candidates.push(t);
+            InstallOp::Hardlink { path, target } => {
+                match install_hardlink(root, path, target) {
+                    Ok(()) => installed += 1,
+                    // The target is not on the tree yet: a later member (or an
+                    // earlier package) may still provide it.
+                    Err(HardlinkOutcome::Missing) => deferred.push(op),
+                    Err(HardlinkOutcome::Failed(e)) => return Err(e),
                 }
             }
         }
-        if candidates.is_empty() {
-            crate::warn!(
-                "Package_Installer: link '{}' -> '{}' skipped (unresolvable target)",
-                entry.path,
-                entry.link_target
-            );
-            continue;
-        }
-        pending.push((rel, candidates));
     }
 
-    let mut count = 0usize;
-    for _pass in 0..4 {
-        if pending.is_empty() {
+    // Bounded fixpoint over the deferred hard links: each pass must create at
+    // least one, otherwise the rest can never resolve.
+    loop {
+        if deferred.is_empty() {
             break;
         }
         let mut progressed = false;
-        let mut remaining: Vec<(String, Vec<String>)> = Vec::new();
-        for (rel, candidates) in pending {
-            let mut content: Option<Vec<u8>> = None;
-            for cand in &candidates {
-                if let Some(data) = read_regular_file(root, cand) {
-                    content = Some(data);
-                    break;
-                }
-            }
-            match content {
-                Some(data) => {
-                    install_one(root, &rel, &data)?;
-                    count += 1;
+        let mut remaining: Vec<&InstallOp<'_>> = Vec::new();
+        for op in deferred {
+            let InstallOp::Hardlink { path, target } = op else {
+                continue;
+            };
+            match install_hardlink(root, path, target) {
+                Ok(()) => {
+                    installed += 1;
                     progressed = true;
                 }
-                None => remaining.push((rel, candidates)),
+                Err(HardlinkOutcome::Missing) => remaining.push(op),
+                Err(HardlinkOutcome::Failed(e)) => return Err(e),
             }
         }
-        pending = remaining;
+        deferred = remaining;
         if !progressed {
             break;
         }
     }
-    for (rel, candidates) in &pending {
-        crate::warn!(
-            "Package_Installer: link '{}' -> '{}' skipped (target missing or not a regular file)",
-            rel,
-            candidates[0]
-        );
-    }
-    Ok(count)
-}
 
-/// Read a regular file below `root` fully into memory; `None` when the path
-/// does not resolve, is a directory, or any read fails.
-fn read_regular_file(root: &str, rel: &str) -> Option<Vec<u8>> {
-    let abs = join_abs(root, rel);
-    let node = vfs::lookup_path(&abs).ok()?;
-    if node.is_directory() {
-        return None;
-    }
-    let size = node.size() as usize;
-    let mut data = alloc::vec![0u8; size];
-    let mut off = 0usize;
-    while off < size {
-        match node.read(off as u64, &mut data[off..]) {
-            Ok(0) => break,
-            Ok(n) => off += n,
-            Err(_) => return None,
+    // One diagnostic per hard link that never found its target. It is skipped —
+    // turning it into a copy is exactly what issue #18 removed.
+    for op in deferred {
+        if let InstallOp::Hardlink { path, target } = op {
+            crate::warn!(
+                "Package_Installer: hard link '{}' -> '{}' skipped (target missing after all passes)",
+                path,
+                target
+            );
         }
     }
-    data.truncate(off);
-    Some(data)
+
+    Ok(installed)
+}
+
+/// Outcome of one hard-link attempt.
+enum HardlinkOutcome {
+    /// The target does not exist (yet) — the caller may retry.
+    Missing,
+    /// A real failure (no space, I/O, a directory in the way, ...).
+    Failed(InstallError),
+}
+
+/// Create `rel` as a symbolic link to `target` (stored verbatim).
+fn install_symlink(root: &str, rel: &str, target: &str) -> Result<(), InstallError> {
+    let abs = join_abs(root, rel);
+    let (dir, filename) = resolve_parent(root, rel, &abs)?;
+
+    // Replace any existing entry (link-aware removal), but never a directory.
+    match dir.lookup(filename) {
+        Ok(existing) => {
+            if existing.is_directory() {
+                crate::warn!(
+                    "Package_Installer: link '{}' skipped (a directory is in the way)",
+                    abs
+                );
+                return Ok(());
+            }
+            dir.remove(filename)
+                .map_err(|e| vfs_err("replace", &abs, e))?;
+        }
+        Err(VfsError::NotFound) => {}
+        Err(e) => return Err(vfs_err("stat", &abs, e)),
+    }
+
+    match dir.create_symlink(filename, target.as_bytes()) {
+        Ok(_) => {
+            crate::debug!("Package_Installer: link {} -> {}", abs, target);
+            Ok(())
+        }
+        Err(VfsError::IoError) => Err(no_space("symlink", &abs)),
+        Err(e) => Err(vfs_err("symlink", &abs, e)),
+    }
+}
+
+/// Create `rel` as a hard link to the existing entry at `target` (a
+/// root-relative path from the archive).
+fn install_hardlink(root: &str, rel: &str, target: &str) -> Result<(), HardlinkOutcome> {
+    let abs = join_abs(root, rel);
+    let target_abs = join_abs(root, target);
+
+    // The target is resolved **without** following a final symlink: `link(2)`
+    // hard-links the entry itself, and a hard link to a symlink is legal.
+    let target_node = match vfs::lookup_path_walk(&target_abs, false) {
+        Ok(n) => n,
+        Err(_) => return Err(HardlinkOutcome::Missing),
+    };
+    if target_node.is_directory() {
+        crate::warn!(
+            "Package_Installer: hard link '{}' skipped (target '{}' is a directory)",
+            abs,
+            target_abs
+        );
+        return Ok(());
+    }
+
+    let (dir, filename) = match resolve_parent(root, rel, &abs) {
+        Ok(v) => v,
+        Err(e) => return Err(HardlinkOutcome::Failed(e)),
+    };
+    match dir.lookup(filename) {
+        Ok(existing) => {
+            if existing.is_directory() {
+                crate::warn!(
+                    "Package_Installer: hard link '{}' skipped (a directory is in the way)",
+                    abs
+                );
+                return Ok(());
+            }
+            if let Err(e) = dir.remove(filename) {
+                return Err(HardlinkOutcome::Failed(vfs_err("replace", &abs, e)));
+            }
+        }
+        Err(VfsError::NotFound) => {}
+        Err(e) => return Err(HardlinkOutcome::Failed(vfs_err("stat", &abs, e))),
+    }
+
+    match dir.link(filename, &target_node) {
+        Ok(_) => Ok(()),
+        Err(VfsError::IoError) => Err(HardlinkOutcome::Failed(no_space("link", &abs))),
+        Err(e) => Err(HardlinkOutcome::Failed(vfs_err("link", &abs, e))),
+    }
+}
+
+/// Resolve the parent directory of a normalized root-relative path, creating any
+/// missing component.
+///
+/// Parents are resolved **through symlinks** (`lookup_path_walk(_, true)`): when a
+/// package ships a file under a path that is already a link to a directory
+/// (`/lib64 -> usr/lib64`), the file must land in the target, not in a fresh
+/// parallel directory.
+fn resolve_parent<'a>(
+    root: &str,
+    rel: &'a str,
+    abs: &str,
+) -> Result<(Arc<dyn VfsNode>, &'a str), InstallError> {
+    let comps: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+    if comps.is_empty() {
+        return Err(vfs_err("resolve", abs, VfsError::InvalidArgument));
+    }
+    let (dirs, last) = comps.split_at(comps.len() - 1);
+    let filename = last[0];
+
+    let mut dir =
+        vfs::lookup_path_walk(root, true).map_err(|e| vfs_err("resolve_root", abs, walk_err(e)))?;
+    let mut walked = String::from(root.trim_end_matches('/'));
+    for comp in dirs {
+        walked.push('/');
+        walked.push_str(comp);
+        dir = match vfs::lookup_path_walk(&walked, true) {
+            Ok(child) => child,
+            Err(_) => match dir.create_dir(comp) {
+                Ok(child) => child,
+                Err(VfsError::AlreadyExists) => vfs::lookup_path_walk(&walked, true)
+                    .map_err(|e| vfs_err("mkdir", abs, walk_err(e)))?,
+                Err(VfsError::IoError) => return Err(no_space("mkdir", abs)),
+                Err(e) => return Err(vfs_err("mkdir", abs, e)),
+            },
+        };
+    }
+    Ok((dir, filename))
+}
+
+/// Map a walk failure onto a VFS error for diagnostics.
+fn walk_err(e: crate::vfs::link_walk::WalkError) -> VfsError {
+    use crate::vfs::link_walk::WalkError;
+    match e {
+        WalkError::NotFound => VfsError::NotFound,
+        WalkError::NotDir | WalkError::TooManyLinks | WalkError::TooLong => {
+            VfsError::InvalidArgument
+        }
+    }
 }
 
 /// Install a single normalized, root-relative regular file.
 fn install_one(root: &str, rel: &str, content: &[u8]) -> Result<(), InstallError> {
     let abs = join_abs(root, rel);
 
-    // Resolve the installation root node.
-    let root_node = vfs::lookup_path(root).map_err(|e| vfs_err("resolve_root", &abs, e))?;
-
-    // Split the (non-empty, slash-joined) relative path into parent dirs + filename.
-    let comps: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
-    // `normalize_entry_path` never yields an empty Keep, so `comps` is non-empty.
-    let (dirs, last) = comps.split_at(comps.len() - 1);
-    let filename = last[0];
-
-    // R10.2: walk the parent chain, creating any missing directory.
-    let mut dir = root_node;
-    for comp in dirs {
-        dir = match dir.lookup(comp) {
-            Ok(child) => child,
-            Err(VfsError::NotFound) => match dir.create_dir(comp) {
-                Ok(child) => child,
-                // Lost a race (or pre-existing): re-resolve the now-present dir.
-                Err(VfsError::AlreadyExists) => {
-                    dir.lookup(comp).map_err(|e| vfs_err("mkdir", &abs, e))?
-                }
-                // ext2 OutOfSpace surfaces as IoError (see module docs) → NoSpace.
-                Err(VfsError::IoError) => return Err(no_space("mkdir", &abs)),
-                Err(e) => return Err(vfs_err("mkdir", &abs, e)),
-            },
-            Err(e) => return Err(vfs_err("mkdir", &abs, e)),
-        };
-    }
+    // R10.2: walk (and create) the parent chain, following symbolic links — a
+    // member under `/lib64 -> usr/lib64` belongs inside the target.
+    let (dir, filename) = resolve_parent(root, rel, &abs)?;
 
     // R10.7: replace an existing regular file so the stored size matches the new
     // content length. ext2 `write_file` only ever GROWS `i_size`, so overwriting in
     // place would leave a stale tail when the new content is shorter; removing and
     // recreating guarantees `size == content.len()` (R10.3).
     match dir.lookup(filename) {
-        Ok(_existing) => {
+        Ok(existing) => {
+            if existing.is_directory() {
+                crate::warn!(
+                    "Package_Installer: file '{}' skipped (a directory is in the way)",
+                    abs
+                );
+                return Ok(());
+            }
             if let Err(e) = dir.remove(filename) {
                 return Err(vfs_err("replace", &abs, e));
             }

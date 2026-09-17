@@ -112,7 +112,7 @@ server certificate chain, hostname and validity checked before a byte of the ind
 - **Packages:** a by-name `apt` (`update`/`install`/`show`/`list`/`setmirror`) that fetches
   a Debian `Packages` index over HTTP/HTTPS, streams gzip/xz/zstd decompression into a
   compact in-RAM arena index, resolves dependencies, and installs `.deb`s onto ext2 `/mnt`
-  (tar symlinks/hardlinks are materialized as file copies).
+  (tar symlinks/hardlinks are created as real links on ext2).
 - **Provisioning:** an idempotent first-boot flow seeds `/mnt` and installs the base
   glibc + CPython userland through `apt` (gz→xz index-decode fallback, honest decode
   diagnostics, progress on serial) — **opt-in**: the boot asks `Y/n` on the console
@@ -454,8 +454,8 @@ python
   and a CPU-bound loop with no syscalls does not see a signal until delivery from the
   timer-tick return path lands.
 - **Install ≠ run.** `apt install <pkg>` resolves the dependency closure, downloads each
-  `.deb`, unpacks its files onto `/mnt`, and materializes tar symlinks/hardlinks as file
-  copies (the ext2 writer has no symlink support). Console programs like `python3`
+  `.deb`, unpacks its files onto `/mnt`, and creates tar symlinks/hardlinks as real links
+  (symlink inodes, shared inodes for hard links — issue #18). Console programs like `python3`
   genuinely run, and full-screen TUIs do too: the VT driver emulates CSI/ECMA-48
   sequences with `ONLCR`, `TCSETS*` applies real raw-mode (`ICANON`/`ECHO`) with
   kernel-side echo in raw mode, honest `tcgetattr` reports terminal state, and

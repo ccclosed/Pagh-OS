@@ -8,3 +8,13 @@ MD5sum: ffb4605196ad08aabae9366cecc279bc
 SHA256: a0f06e9ac86062fc694a12f32560cbe4dfada59c98334627e157e932767efccb
 Description: tiny hello binary for the apt end-to-end test
 
+Package: links-pagh
+Version: 1.0
+Architecture: amd64
+Maintainer: Pagh-OS <root@pagh>
+Filename: pool/main/l/links-pagh/links-pagh_1.0_amd64.deb
+Size: 664
+MD5sum: 54cd80c2a333f5b85296432c7121e893
+SHA256: ac942cfee6ed1f51f010e140cc2327f3f6394634c5b9962378c129840991e8f6
+Description: symlink and hardlink fixture for issue #18
+
