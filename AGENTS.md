@@ -153,8 +153,11 @@ release into `limine/`) — do not hard-code Limine versions in scripts.
   on the branch instead of `main` — main silently misses the work while the
   branch looks done (this is exactly how PR #27 initially bypassed `main`).
 - The shell/regression surface is the serial log: diagnostics use
-  `[WATCHDOG]`, `[DIAG]`, `LXSELFTEST`, `[EXC #N]` markers — E2E asserts
-  grep them; don't rename them casually.
+  `[WATCHDOG]`, `[DIAG]`, `LXSELFTEST`, `[EXC #N]`, `[BOOTID]` markers — E2E
+  asserts grep them; don't rename them casually. `[BOOTID]` is the boot-identity
+  proof (`tools/e2e.py` patches its placeholder inside the staged ELF and
+  requires the per-run tag back on serial — see `tools/e2e_boot_integrity.md`);
+  removing or reflowing it silently turns every E2E verdict unfalsifiable.
 
 ## Versioning
 
