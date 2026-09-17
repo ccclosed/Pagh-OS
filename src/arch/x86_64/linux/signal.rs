@@ -191,6 +191,9 @@ fn resume_group(tgid: u64) {
         let was_parked = scheduler::is_stopped(member);
         if scheduler::resume_stopped(member) && was_parked {
             compat::note_child_continued(member);
+            // The stuck-syscall clock restarts: the paused interval must not count
+            // as "stuck in syscall" for the watchdog (see `watchdog_tick`).
+            super::inflight_refresh(member);
             crate::info!("[signal] pid={} resumed by SIGCONT", member);
         }
     }
