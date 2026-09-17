@@ -475,6 +475,13 @@ fn fs_boot_demo() {
 /// The old ~5M-cycle busy-spin debug block (used only to observe timer IRQs
 /// during bringup) is removed per Requirement 1.5.
 fn kernel_main() -> ! {
+    // Entropy capability probe (issue #16). `AT_RANDOM` cannot fail closed —
+    // glibc reads it unconditionally at process start — so without RDSEED/RDRAND
+    // it derives from the mixed boot seed instead of the old predictable
+    // xorshift; this line is what tells the operator the fallback is in use
+    // BEFORE the first process starts. No-op (no log line) with hardware entropy.
+    crate::security::entropy::report_capabilities();
+
     debug!("Spawning shell thread...");
     task::scheduler::kernel_thread_spawn(shell_thread);
     debug!("Shell thread spawned (PID should be 1)");

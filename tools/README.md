@@ -34,6 +34,10 @@
   с hostfwd `tcp/udp 5555->7`, `-m 1024M`, `-serial stdio`, debug-трейс в `qemu_debug.log`).
   По умолчанию `-cpu max`: TLS-путь требует RDSEED/RDRAND, которых у дефолтного `qemu64`
   нет, поэтому живой HTTPS-чек падает с `stage=entropy` (и ничего не объясняет).
+  Без RDSEED/RDRAND деградирует и ELF `AT_RANDOM` (issue #16): он идёт через смешанный
+  boot-seed, печатает `entropy: stage=degraded cause=NoHardwareEntropy` при загрузке и
+  `SELFTEST at_random: blocks=64 distinct=64 digest=… entropy=none …` в `selftest` —
+  `python3 tools/e2e.py selftest --cpu qemu64` и есть прогон этого пути.
 - Env-оверрады: `LIMINE_DIR`/`LIMINE_EFI` (иначе автопоиск/автоскачивание), `OVMF`/`--ovmf`
   (если заданы и файл существует — берутся они; иначе `OVMF.fd` из корня репо; иначе системный
   `OVMF_CODE.fd`, напр. `/usr/share/edk2/ovmf/`), `PAGH_DISK` (дефолт `disk.img`),
