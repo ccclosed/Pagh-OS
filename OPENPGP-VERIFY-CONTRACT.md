@@ -1080,3 +1080,53 @@ not-yet-valid deterministic test key, P53 proves the verifier refuses each as
 appears in the harness anchor table. Connecting them to the E2E run is a small,
 deliberate follow-up, kept out of the series so the verification surface stays
 bounded.
+
+---
+
+## 16. Amendment after the external fixture cross-check
+
+1. **Final property map.** §8.1 planned P50–P58 and §14 fixed P51–P53 for the
+   verifier/keyring series; the trust-chain and `Release` work then took the next
+   numbers. The implemented set is:
+
+   | Property | File | Covers |
+   |---|---|---|
+   | P51 | `host-tests/src/properties/p51.rs` | armor/dearmor, CRC24, packet framing |
+   | P52 | `p52.rs` | verification policy: accept, tamper, canonicalization, key validity, clock gate, signature times, ECDSA |
+   | P53 | `p53.rs` | pinned Debian keyring: pins vs committed bytes, real-GnuPG interop, expiry/revocation, anchor separation |
+   | P54 | `p54.rs` | `Release` parsing: `SHA256:` section only, path lookup (including a miss), `Date` / `Valid-Until` |
+   | P55 | `p55.rs` | index records carry the stanza's SHA-256 |
+
+   Forward references inside §4 and §8.1 that still say "P55"/"P56" describe the
+   pre-t21 plan; the table above is what the tests actually carry.
+
+2. **Two branches that the coverage map claimed but no test reached are now
+   tested**, both noticed while replaying an *independent* fixture manifest that
+   attributed them to P52:
+   * `signature/FutureSignature` — both directions (a signature dated after the
+     clock, and a signature predating the key that made it).
+     `P52::signature_time_is_sanity_checked_against_the_clock_and_the_key`
+     rewrites the creation-time subpacket of the committed fixture signature and
+     asserts the pair `("signature", "FutureSignature")`. The time gates run
+     *before* the digest check, so a `BadSignature` result would mean the check
+     moved to the wrong layer — that is what the assertion pins.
+   * OpenPGP ECDSA — the positive path had no fixture at all (no Debian key uses
+     ECDSA and `tools/openpgp_sign.py` signs Ed25519/RSA only).
+     `P52::ecdsa_curves_verify_the_digest_through_the_shared_backends` drives
+     `verify_ecdsa_p256` / `verify_ecdsa_p384` from host-generated keys and checks
+     that the digest is bound.
+
+3. **Malformed metadata is diagnosed by the layer that detects it.** Harness
+   markers must use these pairs:
+
+   | Input | Diagnostic |
+   |---|---|
+   | `InRelease` without its `-----BEGIN PGP SIGNATURE-----` line, or with a header line lacking `:` | `stage=clearsign cause=Malformed` |
+   | `InRelease` without its `Hash:` header | `stage=clearsign cause=HashHeaderMismatch` |
+   | armor block with a missing `-----END PGP SIGNATURE-----`, a bad CRC24 or non-base64 body | `stage=armor cause=MalformedArmor` / `CrcMismatch` / `BadBase64` |
+
+   The armor layer is parsed before the packets inside it, so a *truncated*
+   signature block is an armor fault, not a clearsign-framing fault; the
+   clear-signed framing check owns the message header, the armor headers and the
+   presence of the signature header at a line boundary.
+

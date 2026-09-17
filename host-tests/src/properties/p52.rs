@@ -22,11 +22,11 @@
 
 use proptest::prelude::*;
 
+use super::openpgp_fixtures::*;
 use crate::openpgp::{
     check_pinned_key, verify_clearsigned, verify_detached, OpenPgpError, PinnedKey, CLOCK_FLOOR,
 };
-use crate::openpgp_crypto::CryptoError;
-use super::openpgp_fixtures::*;
+use crate::openpgp_crypto::{verify_ecdsa_p256, verify_ecdsa_p384, CryptoError};
 use crate::openpgp_packet::{self as packet, PacketError};
 
 const ED_LABEL: &str = "pagh test release key (ed25519) <pagh-test@example.invalid>";
@@ -131,7 +131,8 @@ fn packet_offsets(buf: &[u8]) -> Vec<(usize, usize, usize, u8)> {
                     (tag, len)
                 }
                 _ => {
-                    let len = u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as usize;
+                    let len =
+                        u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as usize;
                     i += 4;
                     (tag, len)
                 }
@@ -192,7 +193,10 @@ fn detached_multi_signer_accepts() {
         verified.signer == FPR_ED || verified.signer == FPR_RSA,
         "signer is one of the pinned keys"
     );
-    assert!(verified.created.is_some(), "signature creation time recorded");
+    assert!(
+        verified.created.is_some(),
+        "signature creation time recorded"
+    );
 }
 
 #[test]
@@ -203,7 +207,10 @@ fn detached_accepts_through_the_rsa_signing_subkey() {
     let verified = verify_detached(&ring, RELEASE_GPG, RELEASE, FIXTURE_NOW)
         .expect("subkey signature verifies");
     assert_eq!(verified.signer, FPR_RSA);
-    assert_eq!(verified.key, FPR_RSA_SUB, "the subkey, not the primary, signed");
+    assert_eq!(
+        verified.key, FPR_RSA_SUB,
+        "the subkey, not the primary, signed"
+    );
 }
 
 #[test]
@@ -216,7 +223,10 @@ fn clearsigned_accepts_and_yields_the_signed_text() {
     // apt gets the `Release` body out of `InRelease`.
     assert_eq!(cs.text, RELEASE);
     assert_eq!(cs.canonical_text(), INRELEASE_CANONICAL);
-    assert_eq!(cs.declared_hashes(), vec![crate::openpgp_crypto::HashAlgo::Sha256]);
+    assert_eq!(
+        cs.declared_hashes(),
+        vec![crate::openpgp_crypto::HashAlgo::Sha256]
+    );
 }
 
 #[test]
@@ -231,7 +241,11 @@ fn clearsign_canonicalization_matches_gnupg() {
     assert_eq!(cs.canonical_text(), expected, "canonical form of WS_DOC");
     // The generator computed the same bytes independently (in Python).
     assert_eq!(cs.canonical_text(), WS_CANONICAL);
-    assert_ne!(cs.canonical_text(), WS_DOC, "the rules must actually change the bytes");
+    assert_ne!(
+        cs.canonical_text(),
+        WS_DOC,
+        "the rules must actually change the bytes"
+    );
 }
 
 #[test]
@@ -245,7 +259,10 @@ fn tampered_signature_byte_is_refused() {
     // packet body are the signature value).
     let mut tampered = RELEASE_GPG_BIN.to_vec();
     let (value_start, value_end) = signature_value_ranges(&tampered)[0];
-    assert!(value_end > value_start, "signature value range is non-empty");
+    assert!(
+        value_end > value_start,
+        "signature value range is non-empty"
+    );
     tampered[value_end - 1] ^= 0x01;
     let ring = [ed_key(), rsa_key()];
     let err = verify_detached(&ring, &tampered, RELEASE, FIXTURE_NOW)
@@ -316,6 +333,50 @@ fn expired_key_is_valid_inside_its_window_and_refused_after_it() {
         check_pinned_key(&ring[0], EXPIRED_NOW).expect_err("expired key block"),
         OpenPgpError::Expired
     );
+}
+
+/// Every signature packet of `RELEASE_GPG_BIN` (the Ed25519 primary and the RSA
+/// subkey) carries the creation-time subpacket `05 02 <be32>` in its hashed
+/// area. Rewriting just the value keeps the packets structurally valid, so the
+/// policy gates still see well-formed signatures and the digest mismatch is
+/// irrelevant — the time gate runs before the signature is verified.
+fn with_signature_time(sig: &[u8], created: u32) -> Vec<u8> {
+    let t = (FIXTURE_NOW as u32).to_be_bytes();
+    let needle = [0x05u8, 0x02, t[0], t[1], t[2], t[3]];
+    let mut out = sig.to_vec();
+    let (mut patched, mut i) = (0usize, 0usize);
+    while i + needle.len() <= out.len() {
+        if out[i..i + needle.len()] == needle {
+            out[i + 2..i + 6].copy_from_slice(&created.to_be_bytes());
+            patched += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    assert!(patched > 0, "the fixture signatures carry a creation time");
+    out
+}
+
+#[test]
+fn signature_time_is_sanity_checked_against_the_clock_and_the_key() {
+    // Both directions of `OpenPgpError::FutureSignature` (contract §3.4, step 3
+    // of the policy): a signature dated after the clock, and a signature dated
+    // before the key that made it. They are refused as a time inconsistency, not
+    // as a bad digest, because the gates run before the signature is verified —
+    // the patched signature cannot verify, so a `BadSignature` result here would
+    // mean the check moved to the wrong layer.
+    let ring = [ed_key()];
+    let future = with_signature_time(RELEASE_GPG_BIN, (FIXTURE_NOW + 10 * 86_400) as u32);
+    let err = verify_detached(&ring, &future, RELEASE, FIXTURE_NOW)
+        .expect_err("a future-dated signature must be refused");
+    assert_eq!(err, OpenPgpError::FutureSignature);
+    assert_eq!(err.diagnostic(), ("signature", "FutureSignature"));
+
+    let predates_key = with_signature_time(RELEASE_GPG_BIN, (FIXTURE_NOW - 10 * 86_400) as u32);
+    let err = verify_detached(&ring, &predates_key, RELEASE, FIXTURE_NOW)
+        .expect_err("a signature older than its key must be refused");
+    assert_eq!(err, OpenPgpError::FutureSignature);
 }
 
 #[test]
@@ -426,7 +487,8 @@ fn unpinned_issuer_fingerprint_falls_back_to_the_remaining_signer() {
     let mut tampered = RELEASE_GPG_BIN.to_vec();
     let body = signature_body_offsets(&tampered);
     let hashed_len_at = body[0] + 4;
-    let hashed_len = u16::from_be_bytes([tampered[hashed_len_at], tampered[hashed_len_at + 1]]) as usize;
+    let hashed_len =
+        u16::from_be_bytes([tampered[hashed_len_at], tampered[hashed_len_at + 1]]) as usize;
     let area_start = hashed_len_at + 2;
     // Walk the subpacket area: [length (1 or 5 octets)][type][data]; the length
     // counts the type octet but not the length octets themselves.
@@ -438,7 +500,10 @@ fn unpinned_issuer_fingerprint_falls_back_to_the_remaining_signer() {
         let (len, len_bytes) = if first < 192 {
             (first, 1usize)
         } else if first < 255 {
-            (((first - 192) << 8) + tampered[at + 1] as usize + 192, 2usize)
+            (
+                ((first - 192) << 8) + tampered[at + 1] as usize + 192,
+                2usize,
+            )
         } else {
             (
                 u32::from_be_bytes([
@@ -466,7 +531,10 @@ fn unpinned_issuer_fingerprint_falls_back_to_the_remaining_signer() {
     let ring = [ed_key(), rsa_key()];
     let verified = verify_detached(&ring, &tampered, RELEASE, FIXTURE_NOW)
         .expect("the remaining pinned signature verifies");
-    assert_eq!(verified.signer, FPR_RSA, "the RSA subkey signer carried the file");
+    assert_eq!(
+        verified.signer, FPR_RSA,
+        "the RSA subkey signer carried the file"
+    );
 
     // With only the Ed25519 key pinned, no signature is left to trust.
     let ring = [ed_key()];
@@ -482,7 +550,10 @@ fn keyring_block_must_match_its_pin() {
     let leaked: &'static [u8] = Box::leak(KEY_ED.to_vec().into_boxed_slice());
     let mut wrong = ed_key();
     wrong.block = leaked;
-    assert!(check_pinned_key(&wrong, FIXTURE_NOW).is_ok(), "control: unaltered copy");
+    assert!(
+        check_pinned_key(&wrong, FIXTURE_NOW).is_ok(),
+        "control: unaltered copy"
+    );
 
     let mut flipped: Vec<u8> = KEY_ED.to_vec();
     let last = flipped.len() - 1;
@@ -535,6 +606,44 @@ fn unsupported_curve_is_refused_by_name() {
     );
 }
 
+#[test]
+fn ecdsa_curves_verify_the_digest_through_the_shared_backends() {
+    // No Debian archive key uses ECDSA and `tools/openpgp_sign.py` has no ECDSA
+    // signer, so these two branches have no GnuPG fixture. Drive them from
+    // host-generated keys (the same `p256`/`p384` backends the TLS property
+    // suite uses) so the positive path is not code-review-only: OpenPGP signs
+    // and verifies the DIGEST (contract §3.3), which is exactly what
+    // `verify_prehash` under these entry points has to reproduce.
+    use signature::hazmat::PrehashSigner;
+
+    let sk = p256::ecdsa::SigningKey::from_bytes(&[7u8; 32].into()).expect("p256 scalar");
+    let digest = [0x42u8; 32];
+    let sig: p256::ecdsa::Signature = sk.sign_prehash(&digest).expect("sign");
+    let point = sk.verifying_key().to_encoded_point(false);
+    let (r, s) = (sig.r().to_bytes(), sig.s().to_bytes());
+    verify_ecdsa_p256(point.as_bytes(), &digest, &r, &s)
+        .expect("a host-generated P-256 signature must verify");
+    let mut other = digest;
+    other[0] ^= 1;
+    assert_eq!(
+        verify_ecdsa_p256(point.as_bytes(), &other, &r, &s).unwrap_err(),
+        CryptoError::VerifyFailed,
+        "the digest must be bound"
+    );
+
+    let sk = p384::ecdsa::SigningKey::from_bytes(&[9u8; 48].into()).expect("p384 scalar");
+    let digest = [0x24u8; 48];
+    let sig: p384::ecdsa::Signature = sk.sign_prehash(&digest).expect("sign");
+    let point = sk.verifying_key().to_encoded_point(false);
+    verify_ecdsa_p384(
+        point.as_bytes(),
+        &digest,
+        &sig.r().to_bytes(),
+        &sig.s().to_bytes(),
+    )
+    .expect("a host-generated P-384 signature must verify");
+}
+
 proptest! {
     /// Any single-bit change to the signed document must be refused — for every
     /// position, not just the two the unit tests pick.
@@ -582,6 +691,3 @@ proptest! {
         let _ = verify_clearsigned(&ring, &data, FIXTURE_NOW);
     }
 }
-
-
-
