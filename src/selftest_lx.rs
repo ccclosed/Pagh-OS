@@ -1480,7 +1480,9 @@ fn check_links() {
             let n =
                 io_sys::sys_readlink(SCRATCH_VA + PATH_OFF as u64, SCRATCH_VA + OUT_OFF as u64, 4)
                     .map_err(|_| "readlink(truncating) failed")?;
-            if n != 4 || scratch_read_at(OUT_OFF, 4) != b"zzzz" {
+            // Truncation returns the *prefix* of the stored target (which starts
+            // with `/mnt/`), not a NUL-terminated or re-encoded string.
+            if n != 4 || scratch_read_at(OUT_OFF, 4) != b"/mnt" {
                 return Err("readlink must truncate to bufsiz without a NUL");
             }
             // ── readlink error cases ─────────────────────────────────────
