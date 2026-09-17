@@ -27,7 +27,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::tar::{TarEntry, TarType};
+use super::tar::{effective_path, TarEntry, TarType};
 
 /// The outcome of normalizing an archived tar path against the installation root.
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -90,6 +90,173 @@ pub fn normalize_entry_path(archived: &str) -> NormPath {
         out.push_str(comp);
     }
     NormPath::Keep(out)
+}
+
+/// One planned install operation, in execution order (issue #18).
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum InstallOp<'a> {
+    /// Create (or replace) a regular file with this content and mode.
+    File {
+        path: String,
+        content: &'a [u8],
+        mode: u32,
+    },
+    /// Create a symbolic link. `target` is the archive string **verbatim** — the
+    /// extractor never normalizes or resolves it, so a link keeps working the way
+    /// its author wrote it.
+    Symlink { path: String, target: String },
+    /// Create a hard link. `target` is a root-relative path that must exist when
+    /// the operation runs (it may come from this archive or from an earlier
+    /// package).
+    Hardlink { path: String, target: String },
+}
+
+/// What an archive's members mean for the installer, computed purely so the
+/// ordering rules can be property-tested on the host (issue #18, `EXT2-LINKS.md`
+/// §5).
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+pub struct InstallPlan<'a> {
+    /// Operations in execution order: regular files and symlinks in archive
+    /// order, then hard links in dependency order.
+    pub ops: Vec<InstallOp<'a>>,
+    /// Hard links whose target is **not** provided by this archive: the target has
+    /// to exist in the filesystem already (an earlier package, or a member the
+    /// parser skipped). They are still emitted (last) for the effectful installer
+    /// to try; anything left is reported and skipped, never copied.
+    pub deferred: Vec<String>,
+    /// Hard links that reference each other in a cycle inside this archive and so
+    /// can never be created; skipped with one diagnostic each.
+    pub unresolved: Vec<String>,
+    /// Members dropped because their path escapes the install root (R10.8).
+    pub skipped_unsafe: usize,
+    /// Link members with an empty target: creating them would be meaningless.
+    pub skipped_empty_target: usize,
+    /// Members of a kind this installer does not create (device, fifo, ...).
+    pub skipped_other: usize,
+}
+
+/// Turn tar members into the ordered operations a faithful install performs.
+///
+/// The rules (`EXT2-LINKS.md` §5.6):
+///
+///   * only `Regular`, `Symlink` and `Hardlink` members produce operations;
+///     directories are created implicitly as parents and other kinds are skipped;
+///   * a **symlink** is planned where it appears — a dangling target is legal and
+///     common (`alternatives`-style aliases), so nothing is deferred for it;
+///   * a **hard link** needs its target to exist first, so hard links are planned
+///     *after* every file and symlink and ordered among themselves by a fixpoint
+///     over the paths this archive creates (chains `a -> b -> c` work);
+///   * hard links that reference each other in a cycle, or that no member
+///     provides, are collected in [`InstallPlan::unresolved`] /
+///     [`InstallPlan::deferred`] instead of being silently turned into copies;
+///   * paths escaping the root (`..`), and link members with an empty target, are
+///     counted and dropped.
+///
+/// Pure and allocation-bounded.
+pub fn plan_install<'a>(entries: &[TarEntry<'a>]) -> InstallPlan<'a> {
+    let mut plan = InstallPlan::default();
+    // Paths this archive creates, used to order hard links.
+    let mut created: Vec<String> = Vec::new();
+    // Hard links still to be ordered: (member path, normalized target).
+    let mut pending: Vec<(String, String)> = Vec::new();
+
+    for entry in entries {
+        // Long paths arrive through the GNU `'L'` header or the ustar `prefix`
+        // field; `effective_path` joins the latter.
+        let raw = effective_path(entry);
+        let path = match normalize_entry_path(&raw) {
+            NormPath::Keep(p) => p,
+            NormPath::SkipUnsafe => {
+                plan.skipped_unsafe += 1;
+                continue;
+            }
+        };
+        match entry.kind {
+            TarType::Regular => {
+                plan.ops.push(InstallOp::File {
+                    path: path.clone(),
+                    content: entry.content,
+                    mode: entry.mode,
+                });
+                created.push(path);
+            }
+            TarType::Symlink => {
+                if entry.link_target.is_empty() {
+                    plan.skipped_empty_target += 1;
+                    continue;
+                }
+                // Verbatim: no normalization, no existence check, no deferral.
+                plan.ops.push(InstallOp::Symlink {
+                    path: path.clone(),
+                    target: String::from(entry.link_target),
+                });
+                // A symlink is a directory entry too, so a hard link may reference
+                // it (Linux `link(2)` does not follow the final component).
+                created.push(path);
+            }
+            TarType::Hardlink => {
+                if entry.link_target.is_empty() {
+                    plan.skipped_empty_target += 1;
+                    continue;
+                }
+                // Tar stores the target as the *archive* path of the first
+                // occurrence, so it is normalized like any other member path.
+                match normalize_entry_path(entry.link_target) {
+                    NormPath::Keep(t) => pending.push((path, t)),
+                    NormPath::SkipUnsafe => {
+                        plan.skipped_unsafe += 1;
+                        continue;
+                    }
+                }
+            }
+            TarType::Directory | TarType::Other => {
+                plan.skipped_other += 1;
+            }
+        }
+    }
+
+    // Fixpoint over the pending hard links: emit one whose target already exists,
+    // then treat its own path as created (so chains resolve). No progress in a
+    // round means the rest form cycles.
+    loop {
+        let mut progressed = false;
+        let mut remaining: Vec<(String, String)> = Vec::new();
+        for (path, target) in pending {
+            if created.iter().any(|c| *c == target) {
+                created.push(path.clone());
+                plan.ops.push(InstallOp::Hardlink { path, target });
+                progressed = true;
+            } else {
+                remaining.push((path, target));
+            }
+        }
+        pending = remaining;
+        if !progressed {
+            break;
+        }
+    }
+
+    // Everything left references a path this archive does not create. Two cases:
+    //
+    //   * the target is another *pending hard link's* path — a cycle inside the
+    //     archive (a -> b -> a): it can never be satisfied and is reported;
+    //   * otherwise the target must already exist in the filesystem (a member of
+    //     an earlier package), which only the effectful installer can decide, so
+    //     the operation is emitted last and recorded as deferred.
+    for (path, target) in pending.iter() {
+        let in_cycle = pending
+            .iter()
+            .any(|(other, _)| other != path && *other == *target);
+        if in_cycle {
+            plan.unresolved.push(path.clone());
+        } else {
+            plan.deferred.push(path.clone());
+        }
+    }
+    for (path, target) in pending {
+        plan.ops.push(InstallOp::Hardlink { path, target });
+    }
+    plan
 }
 
 /// Pure model of the effectful package install (R10.5/R10.6/R10.7/R10.8).

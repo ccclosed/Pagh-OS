@@ -59,7 +59,7 @@ use crate::memory::layout::USER_MMAP_BASE;
 use crate::memory::{pmm, vmm};
 use crate::net::http_fetch::{fetch_deb, FetchError};
 use crate::pkg::install_fs::install_data_tar;
-use crate::pkg::tar::{read_tar, write_tar};
+use crate::pkg::tar::{read_tar, write_tar, write_tar_members, TarFormat, TarMember};
 use crate::task::compat::{self, CompatState};
 use crate::task::fd::FdTable;
 use crate::task::process::{run_linux_binary, RunError};
@@ -99,6 +99,7 @@ pub fn run() {
     check_walltime();
     check_getdents();
     check_links();
+    check_tar_links();
 
     crate::info!("LXSELFTEST harness done");
 }
@@ -1348,6 +1349,192 @@ fn check_walltime() {
     }
 }
 
+/// 18.6 / issue #18 — a `data.tar` that carries links installs **links**.
+///
+/// Builds an archive in memory (both the GNU long-name and the ustar `prefix`
+/// encodings), installs it with the real [`install_data_tar`] onto the mounted
+/// ext2 and checks the result through the VFS: a symlink is a link whose target is
+/// stored verbatim (absolute *and* relative), a hard link shares the inode of its
+/// target with `st_nlink == 2`, the content is reachable through the link, and a
+/// path longer than the 100-byte `name` field is installed under its full name —
+/// the silent truncation that used to rename such members.
+///
+/// Everything it creates lives under `/mnt/lxtar` and is removed again.
+fn check_tar_links() {
+    let name = "tar_links";
+    // These checks run at boot, before the kernel self-test suite: leaking a
+    // single frame here would starve the routines that come later, so the PMM
+    // free count must come back exactly (the installer allocates inodes/blocks
+    // and removes them again).
+    let frames_before = crate::memory::pmm::free_frames();
+    // Longer than the 100-byte `name` field, so it needs an extension header.
+    let mut long_rel = alloc::string::String::from("lxtar/");
+    while long_rel.len() < 130 {
+        long_rel.push('x');
+    }
+    long_rel.push_str("/leaf");
+    let long_abs = alloc::format!("/mnt/{}", long_rel);
+
+    let payload: &[u8] = b"link payload";
+
+    let build = |format: TarFormat| -> alloc::vec::Vec<u8> {
+        let members = [
+            TarMember::File {
+                path: "lxtar/real",
+                content: payload,
+            },
+            TarMember::Symlink {
+                path: "lxtar/abs",
+                target: "/lxtar/real",
+            },
+            TarMember::Symlink {
+                path: "lxtar/rel",
+                target: "real",
+            },
+            TarMember::Hardlink {
+                path: "lxtar/hard",
+                target: "lxtar/real",
+            },
+            TarMember::File {
+                path: long_rel.as_str(),
+                content: b"long",
+            },
+        ];
+        write_tar_members(&members, format)
+    };
+
+    let verify = || -> Result<(), &'static str> {
+        // The regular file and the long-named sibling are real files.
+        let real = vfs::lookup_path("/mnt/lxtar/real").map_err(|_| "lxtar/real missing")?;
+        if real.size() as usize != payload.len() {
+            return Err("lxtar/real has the wrong size");
+        }
+        vfs::lookup_path(&long_abs)
+            .map_err(|_| "the long-named member was not installed under its full name")?;
+
+        // Symlinks: the link itself, with the archive's target verbatim.
+        for (link, expected) in [
+            ("/mnt/lxtar/abs", "/lxtar/real"),
+            ("/mnt/lxtar/rel", "real"),
+        ] {
+            let node = vfs::lookup_path(link).map_err(|_| "link is missing")?;
+            if !node.is_symlink() {
+                return Err("a tar symlink was not installed as a symlink");
+            }
+            match node.read_link() {
+                Some(t) if t == expected => {}
+                _ => return Err("readlink through the VFS returned the wrong target"),
+            }
+            if node.size() as usize != expected.len() {
+                return Err("lstat size of a symlink must be the target length");
+            }
+            // `stat`/`open` follow: the content must be reachable through it.
+            let followed = vfs::lookup_path_walk(link, true)
+                .map_err(|_| "following the installed link failed")?;
+            if followed.fs_ino() != real.fs_ino() {
+                return Err("following a link did not reach its target inode");
+            }
+        }
+
+        // Hard link: the same inode under a second name, no copy.
+        let hard = vfs::lookup_path("/mnt/lxtar/hard").map_err(|_| "lxtar/hard missing")?;
+        if hard.is_symlink() {
+            return Err("a tar hard link was installed as a symlink");
+        }
+        if hard.fs_ino() != real.fs_ino() {
+            return Err("a tar hard link does not share its target's inode");
+        }
+        if real.nlink() != 2 {
+            return Err("the hard-linked inode must report st_nlink 2");
+        }
+        let mut buf = alloc::vec![0u8; payload.len()];
+        let n = hard
+            .read(0, &mut buf)
+            .map_err(|_| "reading the hard link failed")?;
+        if n != payload.len() || buf != payload {
+            return Err("reading the hard link did not return the target's bytes");
+        }
+
+        // The truncated variant of the long path must NOT exist.
+        let truncated = &long_abs[..core::cmp::min(long_abs.len(), 100)];
+        if vfs::lookup_path(truncated).is_ok() {
+            return Err("a long member was also installed under a truncated name");
+        }
+        Ok(())
+    };
+
+    let cleanup = || {
+        for p in [
+            "/mnt/lxtar/hard",
+            "/mnt/lxtar/abs",
+            "/mnt/lxtar/rel",
+            long_abs.as_str(),
+            "/mnt/lxtar/real",
+        ] {
+            if let Ok((parent, leaf)) = split_parent(p) {
+                if let Ok(dir) = vfs::lookup_path(parent) {
+                    let _ = dir.remove(leaf);
+                }
+            }
+        }
+        // Remove the now-empty scratch directory itself (`ROOT` is a leaf under
+        // `/mnt`, so its parent is `/mnt`).
+        if let Ok(mnt) = vfs::lookup_path("/mnt") {
+            let _ = mnt.remove("lxtar");
+        }
+    };
+
+    cleanup();
+    for format in [TarFormat::GnuLongName, TarFormat::UstarPrefix] {
+        let tar = build(format);
+        let entries = match read_tar(&tar) {
+            Ok(e) => e,
+            Err(_) => {
+                fail(name, "read_tar rejected an archive the writer produced");
+                cleanup();
+                return;
+            }
+        };
+        let installed = match install_data_tar(&entries, "/mnt") {
+            Ok(n) => n,
+            Err(_) => {
+                fail(name, "install_data_tar failed on a link archive");
+                cleanup();
+                return;
+            }
+        };
+        if installed != 5 {
+            fail(name, "install_data_tar must count every member it creates");
+            cleanup();
+            return;
+        }
+        if let Err(d) = verify() {
+            fail(name, d);
+            cleanup();
+            return;
+        }
+        cleanup();
+    }
+
+    if crate::memory::pmm::free_frames() != frames_before {
+        fail(
+            name,
+            "the tar-link install did not return every frame it used",
+        );
+        return;
+    }
+    pass(name);
+}
+
+/// Split an absolute path into its parent and last component.
+fn split_parent(path: &str) -> Result<(&str, &str), &'static str> {
+    match path.rfind('/') {
+        Some(0) => Ok(("/", &path[1..])),
+        Some(i) => Ok((&path[..i], &path[i + 1..])),
+        None => Err("not an absolute path"),
+    }
+}
+
 /// 18.5 / issue #18 — symbolic links end to end through the real syscall layer.
 ///
 /// Builds links on the mounted ext2 under `/mnt` and then drives `readlink(2)`,
@@ -1369,6 +1556,10 @@ fn check_walltime() {
 /// Everything it creates is removed again, so the mounted tree is left as found.
 fn check_links() {
     let name = "ext2_links";
+    // Same boot-time invariant as `check_tar_links`: the scratch page is unmapped
+    // again and every scratch entry removed, so the PMM must be back where it
+    // started (a leak here would starve the kernel self-test suite).
+    let frames_before = crate::memory::pmm::free_frames();
     const PATH_OFF: usize = 0; // C-string path for the handlers
     const OUT_OFF: usize = 256; // targets / file payloads
     const STAT_OFF: usize = 512; // struct stat (144 bytes)
@@ -1722,7 +1913,13 @@ fn check_links() {
     mnt.sync();
 
     match result {
-        Ok(()) => pass(name),
+        Ok(()) => {
+            if crate::memory::pmm::free_frames() != frames_before {
+                fail(name, "the link checks did not return every frame they used");
+                return;
+            }
+            pass(name)
+        }
         Err(d) => fail(name, d),
     }
 }

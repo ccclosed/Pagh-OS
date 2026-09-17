@@ -16,7 +16,7 @@ symlink-inode + hardlink), **t15** (`readlink`/`lstat`/`stat`/`open`), **t16** (
 |---|---|---|
 | t14 | §2, §3, §6 (сторона ext2) | **сделано**: `Ext2Fs::{create_symlink, read_symlink, link}`, link-aware `unlink`, `S_IFLNK`, узлы `Ext2Symlink`/`Ext2Opaque` в `node_for`, чистый `ext2/symlink.rs` + host-свойства `ext2_links.rs` + in-QEMU тест `ext2 symlink + hardlink round-trip` |
 | t15 | §4, §7 (VFS + syscalls) | **сделано**: `VfsNode::{is_symlink, read_link, nlink, create_symlink, link}` (+форвард в `MountNode`), `vfs::lookup_path_walk` на базе чистого `src/vfs/link_walk.rs` (бюджет 40 → `ELOOP`, относительные цели от каталога ссылки, `..` от цели), `Errno::{ELOOP=40, ENAMETOOLONG=36}`, `readlink` по правилам §4.2, `lstat`/`stat`/`open`(+`O_NOFOLLOW`→`ELOOP`)/`access`/`chdir`/`statfs`/`execve` следуют, `unlink`/`rmdir`/`rename` — нет, `st_nlink = i_links_count`, `DT_LNK`; host-свойства `link_walk_paths` (в т.ч. против независимого оракула), in-QEMU рутины `ext2 link resolution through the VFS walker` и `LXSELFTEST ext2_links` |
-| t16 | §5 (tar/pkg) | ожидается: split `TarType`, `'L'`/`'K'`/`prefix`, реальные ссылки вместо `materialize_symlinks` |
+| t16 | §5 (tar/pkg) | **сделано**: `TarType::{Symlink,Hardlink}`, GNU `'L'`/`'K'`, ustar `prefix`, pax `path=`/`linkpath=`, `effective_path`; чистый `install::plan_install` (порядок хардлинков, `deferred`/`unresolved`); `install_data_tar` создаёт реальные ссылки через `VfsNode::{create_symlink,link}`, `materialize_symlinks` удалён; host-свойства `tar_links` (9) + in-QEMU `LXSELFTEST tar_links` |
 | t17 | §11 | ожидается (см. §11.10 — добавлен пункт про удаление fast-ссылки) |
 
 ---

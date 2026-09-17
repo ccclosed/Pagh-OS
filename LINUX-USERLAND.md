@@ -67,8 +67,8 @@ The thread is idempotent; delete `disk.img` to re-provision from scratch.
 
 - The ext2 writer and the VFS resolve real symlinks and hard links: `readlink`, `lstat`
   (S_IFLNK), `stat`/`open` following, `ELOOP` on cycles, `st_nlink` from `i_links_count`
-  (issue #18). The tar side (t16) still materializes symlink/hardlink members as file
-  copies until it is switched over; see `EXT2-LINKS.md`.
+  (issue #18), and the installer creates tar symlink/hardlink members as real links rather
+  than copies; see `EXT2-LINKS.md`.
 - Large files are written in bounded WAL transactions (see `EXT2-RECOVERY.md`), so
   multi-hundred-KiB payloads install reliably.
 
@@ -89,8 +89,9 @@ These return `-ENOSYS` or a stub (logged once per syscall number per process):
   state (contract: `docs/procfs.md`). `/proc/<pid>`, `/proc/stat`, `/proc/loadavg` and
   `/proc/self/fd` return `ENOENT`, so `htop`/`ps` still do not work; `sysfs` does not
   exist at all.
-- Symbolic/hard links exist on ext2 and resolve through the VFS (issue #18); the *installer*
-  still materializes tar links as copies until t16 switches it over (`EXT2-LINKS.md`).
+- Symbolic/hard links exist on ext2, resolve through the VFS and are what a `.deb` unpacks to
+  (issue #18): `lstat` differs from `stat`, `readlink` reports the stored target, two hard links
+  share `st_ino` with `st_nlink == 2`.
 
 So: batch/console programs, the CPython REPL, and event-loop TUIs (`nvim`) run; the
 remaining gaps are timer-tick signal delivery/SIGSTOP-SIGCONT, timerfd, and procfs.

@@ -375,6 +375,10 @@ mod properties {
     // §7.4): Linux-verified cases plus a randomized comparison against an
     // independent restart-based oracle.
     mod link_walk_paths;
+    // Tar members that carry links and the pure install plan built from them
+    // (issue #18, contract `EXT2-LINKS.md` §5): `'1'` vs `'2'`, GNU `'L'`/`'K'`,
+    // ustar `prefix`, pax records, and the hard-link ordering rules.
+    mod tar_links;
     // OpenPGP repository-metadata verification (issue #32), contract
     // OPENPGP-VERIFY-CONTRACT.md §2/§3/§7.
     //   P51 — armor/packet framing: bounded, panic-free parsing of hostile bytes.
