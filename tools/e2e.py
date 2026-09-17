@@ -1174,6 +1174,14 @@ def mode_selftest(h: Harness) -> tuple[str, int]:
         found = re.search(pattern_extra, text)
         ok &= h.check(f"expected /{pattern_extra}/", bool(found),
                       found.group(0).strip() if found else "not found")
+    # The in-kernel suite has its own summary, but an `lx_selftest` build runs a
+    # SEPARATE LXSELFTEST harness whose failures only appear as
+    # `[ERROR] LXSELFTEST <case> FAIL ...` lines. Without this check a run with a
+    # failing LXSELFTEST case still reported PASS (observed in t10: `getcwd FAIL`
+    # slipped through) — exactly the false-green class this harness must not emit.
+    lx_fails = re.findall(r"LXSELFTEST \S+ FAIL[^\r\n]*", text)
+    ok &= h.check("no LXSELFTEST case failures", not lx_fails,
+                  lx_fails[0] if lx_fails else "none")
     for extra in h.extra_evidence:
         found = re.search(extra, text)
         h.check(f"extra marker /{extra}/ (best effort)", bool(found),
