@@ -27,6 +27,7 @@ green test that proves nothing.
 
 ```sh
 python3 tools/openpgp_attack_fixtures.py build      # -> .cache/openpgp_cases/ + manifest.json
+python3 tools/openpgp_attack_fixtures.py build --suite case   # b* under dists/<case_id>/
 python3 tools/openpgp_attack_fixtures.py check      # gpgv cross-check of the fixtures
 python3 tools/openpgp_attack_fixtures.py list       # the case table
 ```
@@ -101,11 +102,16 @@ that flag and expect `stage=clock cause=ClockUnset`. The manifest records the sa
 * Every case directory is a **complete apt repository root**: `dists/stable/…` + `pool/…`.
   Serve `<case>/` at the mirror root (the layout matches what `apt` fetches) and run
   `apt update` / `apt install` against it.
-* **Serve them all as suite `stable`** (`apt setsuite stable`), not as the case id: since
-  t23 the client cross-checks the signed `Release` against the configured suite
-  (`AptOpError::ReleaseSuiteMismatch`, `src/pkg/apt.rs`), and the `a*` trees carry Debian's
-  own `Suite: stable` inside a signature we cannot re-make. Parameterising the suite
-  directory would therefore break exactly the reference cases.
+* **Suite, exactly.** `release.matches_suite()` is true when `Suite:` **or** `Codename:`
+  equals the configured suite (both empty also passes), and the fetch path is
+  `{base}/dists/{suite}/…`. Consequences:
+  * the `a*` trees carry Debian's own `Suite: stable` inside a signature we cannot re-make,
+    so they are **always served as `stable`** (`apt setsuite stable`);
+  * the `b*` trees are documents *we* sign, so `--suite case` lays them out under
+    `dists/<case_id>/` and rewrites `Suite:` to the case id, letting a harness use
+    `apt setsuite <case_id>`. `manifest.json` records the suite per case
+    (`serving_suite`, `configured_suite`), so the adapter does not have to guess; the
+    default (`--suite stable`) keeps every tree under `dists/stable/`.
 * `manifest.json` carries, per case: `id`, `family`, `expect` (`accept`/`reject`), `stage`,
   `cause`, `marker`, `tree`, `attacks`, `notes`; plus `reference_signers` and
   `not_constructible`.

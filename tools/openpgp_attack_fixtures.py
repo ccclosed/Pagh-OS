@@ -191,10 +191,10 @@ def read(path: str) -> bytes:
 
 
 def real_tree(dest: str, *, source: str = REAL, inrelease: bool = True,
-              release_gpg: bool = True) -> dict:
+              release_gpg: bool = True, suite_dir: str = SUITE) -> dict:
     """Lay out a complete repository tree from a pinned Debian inventory."""
     inv = json.load(open(os.path.join(source, "inventory.json"), encoding="utf-8"))
-    d = os.path.join(dest, "dists", SUITE)
+    d = os.path.join(dest, "dists", suite_dir)
     idx = os.path.join(d, COMPONENT, ARCH, INDEX_NAME)
     write(idx, read(os.path.join(source, "contrib_binary-amd64_Packages.xz")))
     write(os.path.join(d, "Release"), read(os.path.join(source, "Release")))
@@ -208,6 +208,29 @@ def real_tree(dest: str, *, source: str = REAL, inrelease: bool = True,
             "release": os.path.join(d, "Release"),
             "inrelease": os.path.join(d, "InRelease"),
             "release_gpg": os.path.join(d, "Release.gpg")}
+
+
+def set_suite_field(path: str, suite: str) -> None:
+    """Point the `Suite:` field of a Release we sign ourselves at `suite`.
+
+    `release.matches_suite()` is true only when `Suite:` or `Codename:` equals the
+    configured suite (or both are empty), so a tree served under
+    `dists/<case_id>/` MUST carry that name in the signed bytes. Only ever called
+    for trees whose Release we sign; a Debian-signed Release keeps `Suite: stable`
+    forever.
+    """
+    text = read(path).decode()
+    out = []
+    seen = False
+    for line in text.splitlines():
+        if line.startswith("Suite:"):
+            out.append(f"Suite: {suite}")
+            seen = True
+        else:
+            out.append(line)
+    if not seen:
+        raise SystemExit(f"no Suite: field in {path}")
+    write(path, ("\n".join(out) + "\n").encode())
 
 
 def flip_byte(path: str, *, at: str = "middle") -> None:
@@ -395,8 +418,14 @@ def cases() -> list[dict]:
 # ─── per-case builders ──────────────────────────────────────────────────────
 
 
-def build_case(case: dict, out_root: str, home: str) -> dict:
+def build_case(case: dict, out_root: str, home: str, *, suite_mode: str = "stable") -> dict:
     cid = case["id"]
+    # `a*` trees carry Debian's own signature, whose `Suite: stable` we cannot
+    # recreate: they are served as `stable` whatever the caller asked for.
+    per_case = suite_mode == "case" and case["family"] == "local-keys"
+    suite_dir = cid if per_case else SUITE
+    if suite_mode == "case" and case["family"] != "local-keys":
+        pass  # documented in the manifest; not an error, `stable` is the only option
     tree = os.path.join(out_root, cid)
     if os.path.exists(tree):
         shutil.rmtree(tree)
@@ -438,19 +467,22 @@ def build_case(case: dict, out_root: str, home: str) -> dict:
     elif cid == "a08-rollback-old-stable":
         real_tree(tree, source=REAL_OLD)
     elif cid in ("b01-untrusted-signer", "b05-expired-untrusted-signer"):
-        t = real_tree(tree)
+        t = real_tree(tree, suite_dir=suite_dir)
+        set_suite_field(t["release"], suite_dir)
         # keep the real Release TEXT (a realistic document), replace both signatures
         fpr, when = (release_fpr, SIGN_TIME) if cid == "b01-untrusted-signer" else (
             expired_fpr, EXPIRED_SIGN_TIME)
         sign_clearsign(home, fpr, t["release"], t["inrelease"], when)
         sign_detached(home, fpr, t["release"], t["release_gpg"], when)
     elif cid == "b02-no-signature-packets":
-        t = real_tree(tree, inrelease=False)
+        t = real_tree(tree, inrelease=False, suite_dir=suite_dir)
+        set_suite_field(t["release"], suite_dir)
         # A marker packet (tag 10, body "PGP") and nothing else: well-formed armor,
         # no signature packet.
         write(t["release_gpg"], armor("SIGNATURE", bytes([0xCA, 0x03]) + b"PGP"))
     elif cid == "b03-armor-crc-mismatch":
-        t = real_tree(tree, inrelease=False)
+        t = real_tree(tree, inrelease=False, suite_dir=suite_dir)
+        set_suite_field(t["release"], suite_dir)
         sign_detached(home, release_fpr, t["release"], t["release_gpg"], SIGN_TIME)
         text = read(t["release_gpg"]).decode()
         lines = text.splitlines()
@@ -459,14 +491,15 @@ def build_case(case: dict, out_root: str, home: str) -> dict:
                 lines[i] = "=" + base64.b64encode(b"\x00\x00\x00").decode()
         write(t["release_gpg"], ("\n".join(lines) + "\n").encode())
     elif cid == "b04-clearsign-malformed":
-        t = real_tree(tree)
+        t = real_tree(tree, suite_dir=suite_dir)
+        set_suite_field(t["release"], suite_dir)
         sign_clearsign(home, release_fpr, t["release"], t["inrelease"], SIGN_TIME)
         text = read(t["inrelease"]).decode()
         kept = [l for l in text.splitlines() if not l.startswith("-----END PGP")]
         write(t["inrelease"], ("\n".join(kept) + "\n").encode())
     else:
         raise SystemExit(f"unknown case {cid}")
-    return {"tree": os.path.relpath(tree, ROOT)}
+    return {"tree": os.path.relpath(tree, ROOT), "configured_suite": suite_dir}
 
 
 NOT_CONSTRUCTIBLE = [
@@ -546,7 +579,7 @@ def build(args) -> None:
     for case in table:
         if args.only and case["id"] not in args.only:
             continue
-        built = build_case(case, out_root, home)
+        built = build_case(case, out_root, home, suite_mode=args.suite)
         entry = dict(case)
         entry.update(built)
         entry["tree"] = built["tree"]
@@ -561,7 +594,9 @@ def build(args) -> None:
         "serving": "each case directory is a complete apt repository root: serve "
                    "`<case>/` at the mirror root (the pool/ and dists/ layout matches what "
                    "apt fetches), then run `apt update` / `apt install`",
-        "index_path": f"dists/{SUITE}/{COMPONENT}/{ARCH}/{INDEX_NAME}",
+        "suite_mode": args.suite,
+        "serving_suite": {c["id"]: c.get("configured_suite", SUITE) for c in manifest_cases},
+        "index_path": f"dists/*/{COMPONENT}/{ARCH}/{INDEX_NAME}",
         "package": json.load(open(os.path.join(REAL, "inventory.json")))["deb"]["package"],
         "signing_keys": [
             {"purpose": k["purpose"], "fingerprint": k["fingerprint"], "public": k["public"]}
@@ -583,8 +618,16 @@ def check(args) -> None:
     out_root = os.path.abspath(args.out)
     home = os.path.join(out_root, "_gnupg")
     ok = True
+    # The served suite directory is per case: `stable` for the Debian-signed trees,
+    # the case id for the ones we sign ourselves (`--suite case`).
+    manifest_path = os.path.join(out_root, "manifest.json")
+    suites = {}
+    if os.path.exists(manifest_path):
+        with open(manifest_path, encoding="utf-8") as fh:
+            for c in json.load(fh)["cases"]:
+                suites[c["id"]] = c.get("configured_suite", SUITE)
     for cid in ["b01-untrusted-signer", "b05-expired-untrusted-signer", "b03-armor-crc-mismatch"]:
-        tree = os.path.join(out_root, cid, "dists", SUITE)
+        tree = os.path.join(out_root, cid, "dists", suites.get(cid, SUITE))
         if not os.path.isdir(tree):
             # A missing tree must fail the check: "nothing to verify" is not "verified".
             print(f"FAIL {cid}: not built (run `build` first)")
@@ -614,6 +657,12 @@ def main() -> None:
     b = sub.add_parser("build", help="build the case trees + manifest")
     b.add_argument("--out", default=DEFAULT_OUT)
     b.add_argument("--only", nargs="*", default=None)
+    b.add_argument("--suite", choices=["stable", "case"], default="stable",
+                   help="suite directory the trees are laid out under, and the field the "
+                        "Release carries: `stable` for everything (required for the `a*` "
+                        "trees, whose signature is Debian's), `case` puts the locally signed "
+                        "`b*` trees under dists/<case_id>/ with `Suite: <case_id>` so a "
+                        "harness can use `apt setsuite <case_id>`")
     b.set_defaults(func=build)
     c = sub.add_parser("check", help="reference-verify the built fixtures with gpgv")
     c.add_argument("--out", default=DEFAULT_OUT)
