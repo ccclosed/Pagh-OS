@@ -8,7 +8,7 @@ Output (committed, regenerated only when the fixtures must be refreshed):
   host-tests/src/properties/p44_fixture_root.rs
   host-tests/src/properties/p44_fixture_leaf.rs
 
-Run from the repo root: python tools/fetch_p44_fixtures.py
+Run from the repo root: python3 tools/fetch_p44_fixtures.py
 """
 import binascii
 import socket
