@@ -444,11 +444,15 @@ python
   POSIX signal delivery works at the syscall-return point: `rt_sigaction` installs
   real handlers, delivered signals build an x86_64 `rt_sigframe` on the user stack
   and `rt_sigreturn` restores the context, `^C` sends a real SIGINT (blocking waits
-  wake with `EINTR`), and a fatal `tgkill` without a handler still ends the process
+  wake with `EINTR`), `kill(2)` (nr 62) addresses a process, the caller's process
+  group, a `-pgid` group or every process (`kill(-1)`), queuing one copy per thread
+  group, `SIGSTOP`/`SIGCONT` are real scheduler state (a stopped task keeps its saved
+  frame, leaves rotation and is resumed by `SIGCONT`; `wait4` reports `WUNTRACED` and
+  `WCONTINUED`), and a fatal `tgkill`/`kill` without a handler still ends the process
   cleanly (glibc `abort()` → exit 134). Not yet: delivery while parked in a wait is
   limited to the patched wait loops (read/poll/select/epoll/nanosleep/wait4/futex),
-  `kill(2)`/group broadcast, SIGSTOP/SIGCONT scheduling, and signals delivered from
-  the timer-tick return path.
+  and a CPU-bound loop with no syscalls does not see a signal until delivery from the
+  timer-tick return path lands.
 - **Install ≠ run.** `apt install <pkg>` resolves the dependency closure, downloads each
   `.deb`, unpacks its files onto `/mnt`, and materializes tar symlinks/hardlinks as file
   copies (the ext2 writer has no symlink support). Console programs like `python3`

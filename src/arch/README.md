@@ -23,10 +23,11 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 
 | Файл | Роль |
 |---|---|
-| `mod.rs` | Корень; `linux_dispatch(regs: *mut SavedRegs, reentry_allowed: u64)` — главный вход (второй аргумент `REENTRY_ALLOWED` разрешает размаскировать IF: его передают оба входных стаба, boot-selftest передаёт 0); `check_user_ptr` — единая точка валидации user-указателей; гейт поддерживаемого набора; watchdog зависших syscall'ов |
+| `mod.rs` | Корень; `linux_dispatch(regs: *mut SavedRegs, reentry_allowed: u64)` — главный вход (бит 0 `REENTRY_ALLOWED` разрешает размаскировать IF: его передают оба входных стаба, boot-selftest передаёт 0; бит 1 `INT80_ENTRY` помечает вход через `int 0x80`, см. инвариант 2); `check_user_ptr` — единая точка валидации user-указателей; гейт набора `abi::SUPPORTED_SYSCALLS`; watchdog зависших syscall'ов |
 | `regs.rs` | `SavedRegs` — 15-GPR фрейм, общий контракт обоих входных стабов |
-| `abi.rs` | Чистый маршаллинг аргументов (`marshal_args`), membership поддерживаемого набора, константы номеров |
+| `abi.rs` | Чистый маршаллинг аргументов (`marshal_args`), полный перечень поддерживаемого набора `SUPPORTED_SYSCALLS` (единственный источник истины, `is_supported` — бинарный поиск по нему), константы номеров |
 | `validate.rs` | Чистая валидация user-указателей (`spanned_pages`, границы/переполнение, без разыменований) |
+| `kill.rs` | Чистая модель `kill(2)` (issue #12): 32-битное декодирование `pid_t`/`int`, классификация цели (`pid>0`, `0`, `-1`, `-pgid`, `INT_MIN → ESRCH`), политика прав (single-uid), выбор одного потока на группу (хост-тестируемая, свойство `kill_target`) |
 | `errno.rs` | Модель errno; ядро складывает `Err(e)` в rax как `-errno` (`-4095..=-1`) |
 | `io.rs` | Чистое планирование `read`/`lseek` |
 | `io_sys.rs` | Эффектные обработчики файлового I/O (FdTable, консоль, VFS/ext2) |
@@ -43,10 +44,10 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 | `timeconv.rs` | Чистый BCD-декод и civil-date → Unix-seconds (хост-тестируемый) |
 | `rand_clock.rs` | Чистое планирование `getrandom`/`ticks_to_timespec` |
 | `diag.rs` | Чистая дедупликация nosys-логов per-process и нормализация exit-кодов (139 = 128+SIGSEGV) |
-| `signal.rs` | Доставка POSIX-сигналов: очередь pending, `deliver_one_pending` в эпилоге `linux_dispatch` (точка возврата из syscall), `rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`, `tgkill`, маски |
+| `signal.rs` | Доставка POSIX-сигналов: очередь pending, `deliver_one_pending_syscall` в эпилоге `linux_dispatch` (точка возврата из syscall), `sys_kill` (nr 62: pid / своя группа / `-pgid` / `-1`, по одной копии на группу), `SIGSTOP`/`SIGCONT` (стоп — действие доставки, остановка группы паркует фреймы; продолжение — генерация `SIGCONT` отправителем + сброс pending stop-битов), `rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`, `tgkill`, маски, guard'ы инварианта 2 (флаг int80-входа + проверка кадра) |
 | `signal_frame.rs` | Чистая сборка/разбор `rt_sigframe` на user-стеке (хост-тестируемая) |
 
-Чистые модули (`abi`, `diag`, `dirent`, `errno`, `io`, `mem`, `rand_clock`, `signal_frame`,
+Чистые модули (`abi`, `diag`, `dirent`, `errno`, `io`, `kill`, `mem`, `rand_clock`, `signal_frame`,
 `stat`, `timeconv`, `validate`) через `#[path]` включаются в хост-крейт `host-tests` — они
 обязаны быть только `core`+`alloc`.
 
