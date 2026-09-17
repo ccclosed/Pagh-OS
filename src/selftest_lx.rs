@@ -94,6 +94,8 @@ pub fn run() {
 
     // ── New "no new process model" syscalls (Feature: linux-binary-compat) ──
     check_getcwd();
+    check_getcwd_erange();
+    check_cwd_relative_create();
     check_chdir();
     check_dup();
     check_walltime();
@@ -1210,25 +1212,171 @@ fn check_ext2_install_roundtrip() {
 
 // ───────── new directory / fd / time syscall checks (linux-binary-compat) ─────────
 
-/// `getcwd` returns the default cwd `/` (two bytes: `'/'` + NUL) for a fresh
-/// Compat_Process. Driven through the real handler with the result written to the
-/// scratch user page.
+/// `getcwd` names the guest root for a fresh `Compat_Process`, NUL-terminates the
+/// result, reports the length *including* the NUL byte, and its output is usable
+/// as-is (`chdir(getcwd())` succeeds). Driven through the real handler with the
+/// buffer on the scratch user page.
+///
+/// Deliberately not an assertion on one exact spelling (git history, all three
+/// steps verified against the source and a live guest):
+///   * 891e2c9 added this check together with `cwd: "/"` — the two agreed;
+///   * acbd956 moved the default to `/mnt` ("'/' has no create_dir, git clone died
+///     with EIO creating the work tree at VFS root") and left this check behind, so
+///     it asserted an unreachable value for the whole 2.x series;
+///   * 6399523 made `resolve_path` remap guest paths under `/mnt`, which is why the
+///     two spellings now name the *same* directory — a live probe of a fresh
+///     process shows `access("/<n>") == access("/mnt/<n>") == 0`.
+/// The portable contract is therefore "the fresh cwd is the guest root and its
+/// spelling round-trips": `/mnt` is today's stored value (`docs/procfs.md` §1.2,
+/// DEVIATION-8) and `/` is what a program sees after `chdir("/")`.
+/// [`check_cwd_relative_create`] pins what actually depends on the default.
 fn check_getcwd() {
     let name = "getcwd";
     if !map_scratch() {
         fail(name, "scratch map failed");
         return;
     }
+    let result: Result<(), &'static str> =
+        with_synth_compat(0x40_0000, scheduler::current_pid(), || {
+            let n = io_sys::sys_getcwd(SCRATCH_VA, 256).map_err(|_| "getcwd failed")?;
+            if !(2..=256).contains(&n) {
+                return Err("getcwd length out of range");
+            }
+            let len = n as usize;
+            let raw = scratch_read(len);
+            if raw[len - 1] != 0 {
+                return Err("getcwd result is not NUL-terminated");
+            }
+            let path =
+                core::str::from_utf8(&raw[..len - 1]).map_err(|_| "getcwd result is not UTF-8")?;
+            if !path.starts_with('/') {
+                return Err("getcwd result is not absolute");
+            }
+            if path != "/" && path != "/mnt" {
+                return Err("fresh cwd is not the guest root");
+            }
+            // What the handler left in the buffer must be accepted back unchanged.
+            if io_sys::sys_chdir(SCRATCH_VA) != Ok(0) {
+                return Err("chdir(getcwd()) failed");
+            }
+            Ok(())
+        });
+    unmap_scratch();
+
+    match result {
+        Ok(()) => pass(name),
+        Err(d) => fail(name, d),
+    }
+}
+
+/// `getcwd` with a buffer too small for the path plus its NUL must fail with
+/// `ERANGE` — never a truncated or unterminated path. One byte is too small for
+/// either candidate spelling (`/mnt` and `/`), so this holds if the guest root
+/// spelling is ever normalised.
+fn check_getcwd_erange() {
+    let name = "getcwd_erange";
+    if !map_scratch() {
+        fail(name, "scratch map failed");
+        return;
+    }
     let res = with_synth_compat(0x40_0000, scheduler::current_pid(), || {
-        io_sys::sys_getcwd(SCRATCH_VA, 256)
+        io_sys::sys_getcwd(SCRATCH_VA, 1)
     });
-    let buf = scratch_read(2);
     unmap_scratch();
 
     match res {
-        Ok(2) if buf[0] == b'/' && buf[1] == 0 => pass(name),
-        Ok(n) => crate::error!("LXSELFTEST {} FAIL got len {} bytes {:?}", name, n, buf),
-        Err(e) => crate::error!("LXSELFTEST {} FAIL {:?}", name, e),
+        Err(Errno::ERANGE) => pass(name),
+        Err(e) => crate::error!("LXSELFTEST {} FAIL {:?} (expected ERANGE)", name, e),
+        Ok(n) => crate::error!(
+            "LXSELFTEST {} FAIL returned {} for a 1-byte buffer (expected ERANGE)",
+            name,
+            n
+        ),
+    }
+}
+
+/// A relative create from *both* candidate cwds lands at the guest root, and the
+/// guest→kernel mapping a `chdir` target goes through is pinned.
+///
+/// This is the regression test the `/mnt` default never got: acbd956 fixed a real
+/// field failure ("git clone died with EIO creating the work tree at VFS root") and
+/// left no test behind, so nothing recorded that 6399523's guest mapping had made
+/// the workaround unnecessary. Coverage, in order:
+///   (a) fresh process (`CompatState::new` cwd `/mnt`): `mkdir("lx_cwd_rel_a")`
+///       must create `/mnt/lx_cwd_rel_a`;
+///   (b) after `chdir("/")`: `mkdir("lx_cwd_rel_b")` must create `/mnt/lx_cwd_rel_b`
+///       — the case that used to fail with EIO; it works only because `resolve_path`
+///       remaps the relative path through the guest mapping;
+///   (c) `chdir("/lx_cwd_rel_b")` must store the *kernel* path `/mnt/lx_cwd_rel_b`,
+///       which is where the `/mnt` prefix `getcwd` reports comes from.
+/// Every directory created here is removed again, pass or fail (AGENTS.md
+/// invariant 8).
+fn check_cwd_relative_create() {
+    let name = "cwd_relative_create";
+    let dir = match vfs::lookup_path("/mnt") {
+        Ok(d) => d,
+        Err(_) => {
+            fail(name, "/mnt is not mounted");
+            return;
+        }
+    };
+    if !map_scratch() {
+        fail(name, "scratch map failed");
+        return;
+    }
+
+    // (a) fresh cwd (`/mnt`): the relative name must resolve there.
+    let _ = dir.remove("lx_cwd_rel_a");
+    scratch_write(b"lx_cwd_rel_a\0");
+    let from_default = with_synth_compat(0x40_0000, scheduler::current_pid(), || {
+        io_sys::sys_mkdir(SCRATCH_VA, 0o755)
+    });
+
+    // (b) guest-visible root, then the same relative create.
+    let _ = dir.remove("lx_cwd_rel_b");
+    let from_root = with_synth_compat(0x40_0000, scheduler::current_pid(), || {
+        scratch_write(b"/\0");
+        if io_sys::sys_chdir(SCRATCH_VA) != Ok(0) {
+            return Err(Errno::ENOENT);
+        }
+        scratch_write(b"lx_cwd_rel_b\0");
+        io_sys::sys_mkdir(SCRATCH_VA, 0o755)
+    });
+
+    // (c) the guest → kernel mapping carried by the cwd string.
+    let mapped = with_synth_compat(0x40_0000, scheduler::current_pid(), || {
+        scratch_write(b"/lx_cwd_rel_b\0");
+        if io_sys::sys_chdir(SCRATCH_VA) != Ok(0) {
+            return None;
+        }
+        Some(compat::with_current_compat(|cs| cs.cwd.clone()).unwrap_or_default())
+    });
+
+    let landed = |n: &str| matches!(vfs::lookup_path(&alloc::format!("/mnt/{}", n)), Ok(node) if node.is_directory());
+    let a_ok = landed("lx_cwd_rel_a");
+    let b_ok = landed("lx_cwd_rel_b");
+    let ok = matches!(from_default, Ok(0))
+        && matches!(from_root, Ok(0))
+        && a_ok
+        && b_ok
+        && mapped.as_deref() == Some("/mnt/lx_cwd_rel_b");
+
+    let _ = dir.remove("lx_cwd_rel_a");
+    let _ = dir.remove("lx_cwd_rel_b");
+    unmap_scratch();
+
+    if ok {
+        pass(name);
+    } else {
+        let detail = alloc::format!(
+            "default={:?} root={:?} a={} b={} mapped={:?}",
+            from_default,
+            from_root,
+            a_ok,
+            b_ok,
+            mapped
+        );
+        fail(name, &detail);
     }
 }
 

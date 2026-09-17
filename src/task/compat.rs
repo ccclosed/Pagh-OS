@@ -46,9 +46,12 @@ pub struct CompatState {
     /// Linux robust-futex list head and ABI structure size.
     pub robust_head: u64,
     pub robust_len: u64,
-    /// The process's current working directory (absolute, default `/`). Relative
-    /// `open`/`openat`/`access`/`chdir` paths resolve against this; `getcwd`
-    /// reports it (Feature: linux-binary-compat).
+    /// The process's current working directory, in *kernel* path form (a fresh
+    /// process starts at `/mnt`, the writable ext2 tree — see [`CompatState::new`]).
+    /// Relative `open`/`openat`/`access`/`chdir` paths resolve against this, so the
+    /// stored value must be the kernel path `resolve_path` returns; `getcwd` reports
+    /// it verbatim, which is why a guest-visible `/usr` comes back as `/mnt/usr`
+    /// (`selftest_lx::check_cwd_relative_create`, `docs/procfs.md` §1.2).
     pub cwd: String,
     /// Distinct unsupported syscall numbers already logged, so the `nosys`
     /// diagnostic is emitted at most once per number per process (R12.2).
