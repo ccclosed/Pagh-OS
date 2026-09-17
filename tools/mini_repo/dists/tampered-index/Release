@@ -1,0 +1,9 @@
+Suite: tampered-index
+Codename: pagh-test-tampered-index
+Date: Thu, 01 Jan 2026 00:00:00 UTC
+Architectures: all amd64
+Components: main
+Acquire-By-Hash: no
+
+SHA256:
+ 5ae1ae0af145d88f7f6a07bcee7d80aa3f41b0654069f2b6489539379b1bb769 296 main/binary-amd64/Packages

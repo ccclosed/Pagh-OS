@@ -1,0 +1,10 @@
+Suite: stale
+Codename: pagh-test-stale
+Date: Sun, 01 Jun 2025 00:00:00 UTC
+Architectures: all amd64
+Components: main
+Acquire-By-Hash: no
+
+SHA256:
+ fbfa4fc3383597cd944b27bcaa2f2a71c0c5c137b440ce4a92142b8cc1fbcfbb 287 main/binary-amd64/Packages
+ 68f10846da9e9ffd60c779fb740c4b1e9c0b7cc2141f7dda9b3f282054c07867 240 main/binary-amd64/Packages.gz

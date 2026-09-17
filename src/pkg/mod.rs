@@ -68,3 +68,18 @@ pub mod openpgp_keys;
 /// can be bound to the signed metadata before it is parsed. `core` + `alloc`
 /// only — `#[path]`-included by `host-tests` (P54).
 pub mod release_file;
+
+/// The GENERATED E2E *test* trust anchor (`tools/gen_openpgp_testkey.py`): a
+/// deterministic Ed25519 test key plus the three pinned Debian keys, used ONLY by
+/// the harness builds that drive `apt update` against the local test mirror —
+/// `lx_selftest` (the apt E2E checks) and `lx_bigindex` (whose synthetic index is
+/// signed with the same test key, so a real `apt update` can reach the parse
+/// stage). Compiled out of every other build, so a normal kernel — and the
+/// `lx_livetest` live-mirror harness, which must keep trusting only Debian — has
+/// no test key in its trust store at all.
+#[cfg(any(
+    feature = "lx_selftest",
+    feature = "lx_bigindex",
+    feature = "lx_bigindex_inram"
+))]
+pub mod openpgp_test_keys;

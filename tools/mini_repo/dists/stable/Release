@@ -1,3 +1,10 @@
 Suite: stable
-Component: main
-Architectures: amd64
+Codename: pagh-test-stable
+Date: Thu, 01 Jan 2026 00:00:00 UTC
+Architectures: all amd64
+Components: main
+Acquire-By-Hash: no
+
+SHA256:
+ 455bbe631759175c8edff1f3daacbf087bbb673598efd5fee34c9c2c08fef21b 288 main/binary-amd64/Packages
+ d684484f328ab9c6fb758b5e5957535c690343dbc5bae83155ea63927e6d87d6 240 main/binary-amd64/Packages.gz

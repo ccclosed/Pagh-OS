@@ -1,0 +1,10 @@
+Suite: tampered-deb
+Codename: pagh-test-tampered-deb
+Date: Thu, 01 Jan 2026 00:00:00 UTC
+Architectures: all amd64
+Components: main
+Acquire-By-Hash: no
+
+SHA256:
+ e48e956bf24d6bf6b4a37ca1d2ac2a55c27b914cc7af764896c2cdc134eb9cde 294 main/binary-amd64/Packages
+ 630d1e28ebada81cde5041139fc2e7c5fa66028862daf7f47b331c036c518d4d 243 main/binary-amd64/Packages.gz

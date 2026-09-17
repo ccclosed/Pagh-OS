@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
-"""Build (and optionally serve) a tiny Debian-style binary repository for the
-Pagh-OS `apt` end-to-end test.
+"""Build (and optionally serve) the tiny Debian-style repository used by the apt
+end-to-end tests, including the SIGNED and deliberately-broken suites that prove
+issue #32's trust chain.
 
-Layout produced under `tools/mini_repo/`:
+Suites under `tools/mini_repo/dists/` (one served root, switched with `apt setsuite`):
 
-    dists/stable/main/binary-amd64/Packages        (uncompressed index)
-    dists/stable/main/binary-amd64/Packages.gz     (gzip index, what apt uses)
-    pool/main/h/hello-pagh/hello-pagh_1.0_amd64.deb (a real .deb)
+    stable/          correct AND signed          -> `apt update` + `install` succeed
+    tampered-index/  signature VALID, but the served `Packages.gz` is not the one
+                     the signed `Release` describes (it adds an attacker stanza)
+                                                  -> update refused, no index published
+    tampered-deb/    metadata correct and signed, but the served `.deb` is not the
+                     one the signed `Packages` describes
+                                                  -> install refused BEFORE unpacking
+    unsigned/        no `InRelease`, no `Release.gpg`
+                                                  -> update refused (visible)
+    untrusted/       signed by a key that is NOT in the trust anchor
+                                                  -> update refused (no trusted signature)
 
-The .deb is a real `ar` archive (debian-binary + control.tar.gz + data.tar.gz)
-whose `data.tar.gz` installs a single tiny, statically-linked x86_64 Linux ELF at
-`usr/bin/hello-pagh`. That ELF does `write(1, "hello from apt\n", 15)` then
-`exit_group(0)` via the Linux `int 0x80` ABI — byte-for-byte mirroring the layout
-of `src/selftest_lx.rs::build_linux_test_elf`, so the kernel's `run_linux_binary`
-loads and runs it.
+Every suite serves its own `pool/<suite>/...` `.deb`, so the cases cannot
+interfere. The signatures come from `tools/openpgp_sign.py` using the
+deterministic TEST-ONLY seeds in `tools/gen_openpgp_testkey.py`: no committed
+secret, no `gpg` on the host, byte-identical output on every run. The kernel
+verifies them against `src/pkg/openpgp_test_keys.rs`, compiled ONLY into the
+`lx_selftest` / `lx_bigindex` harness builds.
+
+The `.deb` payload is a real `ar` archive (debian-binary + control.tar.gz +
+data.tar.gz) whose `data.tar.gz` installs a tiny statically-linked x86_64 Linux
+ELF at `usr/bin/hello-pagh` (it writes `hello from apt` and exits) — the same
+layout as `src/selftest_lx.rs::build_linux_test_elf`.
 
 Usage:
     python tools/mini_repo.py build              # just (re)build the tree
@@ -28,6 +42,10 @@ import io
 import os
 import struct
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import openpgp_sign as pgp  # noqa: E402  (deterministic test signing)
+import gen_openpgp_testkey as testkey  # noqa: E402  (the TEST-ONLY seeds/UIDs)
 import tarfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -148,14 +166,171 @@ def build_deb(control_tar_gz: bytes, data_tar_gz: bytes) -> bytes:
     return out
 
 
-def build_repo() -> None:
-    elf = build_linux_elf(HELLO_MSG)
+# The suites served from one mirror root. `signer` is None for the deliberately
+# unsigned suite, "untrusted" for the second (never-anchored) key, "test" for the
+# key the `lx_selftest` build anchors.
+SUITES = [
+    ("stable", "test"),
+    ("tampered-index", "test"),
+    ("tampered-deb", "test"),
+    ("unsigned", None),
+    ("untrusted", "untrusted"),
+    # A complete, correctly signed OLDER triplet. Nothing in the chain can tell it
+    # from the current one (the `stable` suite has no `Valid-Until`), so `apt`
+    # ACCEPTS it — the harness prints a NOTE for it instead of pretending the
+    # rollback is caught. See SECURITY.md, "What is still not verified".
+    ("stale", "test"),
+]
 
-    # data.tar.gz: the installed file tree.
+RELEASE_DATE = "Thu, 01 Jan 2026 00:00:00 UTC"
+
+
+def gzip_bytes(data: bytes) -> bytes:
+    """Deterministic gzip (mtime=0): the committed tree must be reproducible."""
+    out = io.BytesIO()
+    with gzip.GzipFile(fileobj=out, mode="wb", mtime=0) as gz:
+        gz.write(data)
+    return out.getvalue()
+
+
+def packages_stanza(suite: str, size: int, sha256: str, version: str = "1.0") -> bytes:
+    pool_rel = f"pool/{suite}/h/hello-pagh/hello-pagh_{version}_amd64.deb"
+    return (
+        f"Package: hello-pagh\n"
+        f"Version: {version}\n"
+        f"Architecture: amd64\n"
+        f"Maintainer: Pagh-OS <root@pagh>\n"
+        f"Filename: {pool_rel}\n"
+        f"Size: {size}\n"
+        f"SHA256: {sha256}\n"
+        f"Description: tiny hello binary for the apt end-to-end test\n"
+        f"\n"
+    ).encode()
+
+
+def attacker_index(honest: bytes) -> bytes:
+    """A length-preserving tamper of an index: the attacker swaps the version and
+    redirects `Filename:` to a payload the mirror controls, without changing the
+    file's size (so the signed `Size:` still matches and the *hash* is the only
+    thing that can catch it)."""
+    out = honest.replace(b"Version: 1.0\n", b"Version: 6.6\n")
+    out = out.replace(b"Version: 9.9\n", b"Version: 6.6\n")
+    assert len(out) == len(honest), "version swap must be length-preserving"
+    return out
+
+
+def suite_release(
+    suite: str, packages: bytes, packages_gz: bytes | None, date: str = RELEASE_DATE
+) -> bytes:
+    entries = [f" {hashlib.sha256(packages).hexdigest()} {len(packages)} main/binary-amd64/Packages\n"]
+    if packages_gz is not None:
+        entries.append(
+            f" {hashlib.sha256(packages_gz).hexdigest()} {len(packages_gz)} main/binary-amd64/Packages.gz\n"
+        )
+    return (
+        f"Suite: {suite}\n"
+        f"Codename: pagh-test-{suite}\n"
+        f"Date: {date}\n"
+        f"Architectures: all amd64\n"
+        f"Components: main\n"
+        f"Acquire-By-Hash: no\n"
+        f"\n"
+        f"SHA256:\n" + "".join(entries)
+    ).encode()
+
+
+def sign_release(rel_dir: str, release: bytes, signer) -> None:
+    """Write `Release.gpg` + `InRelease` for a suite, or nothing if unsigned."""
+    if signer is None:
+        return
+    seed = testkey.SEED_SIGNING if signer == "test" else testkey.SEED_UNTRUSTED
+    key_body = pgp.public_key_packet(seed, testkey.CREATED)
+    detached = pgp.signature_packet(seed, key_body, release, 0x00, testkey.CREATED)
+    with open(os.path.join(rel_dir, "Release.gpg"), "wb") as f:
+        f.write(pgp.armor(detached))
+    # The clear-signed signature covers the CANONICAL text (CRLF joins, no final
+    # line ending), never the raw document — see `openpgp_sign.canonicalize`.
+    cleartext = pgp.signature_packet(
+        seed, key_body, pgp.canonicalize(release), 0x01, testkey.CREATED
+    )
+    with open(os.path.join(rel_dir, "InRelease"), "wb") as f:
+        f.write(pgp.cleartext_signed(release, cleartext))
+
+
+def stale_deb() -> bytes:
+    """An older, differently-versioned payload for the rollback demonstration."""
+    elf = build_linux_elf(b"hello from apt\n")
     data_tar_gz = make_tar_gz([("usr/bin/hello-pagh", 0o755, elf)])
+    control_text = (
+        "Package: hello-pagh\n"
+        "Version: 0.9\n"
+        "Architecture: amd64\n"
+        "Maintainer: Pagh-OS <root@pagh>\n"
+        "Description: older hello binary (rollback demonstration)\n"
+    ).encode()
+    control_tar_gz = make_tar_gz([("control", 0o644, control_text)])
+    return build_deb(control_tar_gz, data_tar_gz)
 
-    # control.tar.gz: a minimal control file (not parsed on install, included for
-    # a well-formed .deb so locate_members finds all three members).
+
+# 2025-06-01: an older (and still correct) repository revision.
+STALE_DATE = "Sun, 01 Jun 2025 00:00:00 UTC"
+
+
+def write_suite(suite: str, signer, deb: bytes, tamper_deb: bool) -> None:
+    version = "0.9" if suite == "stale" else "1.0"
+    date = STALE_DATE if suite == "stale" else RELEASE_DATE
+    pool_dir = os.path.join(REPO, "pool", suite, "h", "hello-pagh")
+    os.makedirs(pool_dir, exist_ok=True)
+    served_deb = bytearray(deb)
+    if tamper_deb:
+        # Flip one bit inside the (compressed) data member: the file keeps its
+        # exact length, so the signed `Size:` matches and the SHA-256 is the only
+        # check that can refuse it. `apt install` verifies the digest BEFORE it
+        # parses the archive, which is the behaviour under test.
+        served_deb[-1] ^= 0x01
+    served_deb = bytes(served_deb)
+    with open(os.path.join(pool_dir, f"hello-pagh_{version}_amd64.deb"), "wb") as f:
+        f.write(served_deb)
+
+    # The index always describes the HONEST payload; only the tampered-deb suite
+    # then serves a different file, which is exactly the case the digest check
+    # must catch. (For every other suite the served file is the honest one.)
+    honest = packages_stanza(suite, len(deb), hashlib.sha256(deb).hexdigest(), version)
+    honest_gz = gzip_bytes(honest)
+
+    idx_dir = os.path.join(REPO, "dists", suite, "main", "binary-amd64")
+    os.makedirs(idx_dir, exist_ok=True)
+    with open(os.path.join(idx_dir, "Packages"), "wb") as f:
+        f.write(honest)
+    served_gz = honest_gz
+    if suite == "tampered-index":
+        # The signature below covers `honest`; the mirror serves `tampered`, which
+        # has the SAME length and a different digest — so only the SHA-256 binding
+        # can catch it (a length check would not, and the signature is valid).
+        tampered = attacker_index(honest)
+        assert len(tampered) == len(honest), "tamper must be length-preserving"
+        with open(os.path.join(idx_dir, "Packages"), "wb") as f:
+            f.write(tampered)
+        # No `Packages.gz` for this suite: the release for it is not written
+        # either, so the plain variant is the only candidate apt may use.
+    else:
+        with open(os.path.join(idx_dir, "Packages.gz"), "wb") as f:
+            f.write(served_gz)
+
+    rel_dir = os.path.join(REPO, "dists", suite)
+    os.makedirs(rel_dir, exist_ok=True)
+    release = suite_release(
+        suite, honest, None if suite == "tampered-index" else honest_gz, date
+    )
+    with open(os.path.join(rel_dir, "Release"), "wb") as f:
+        f.write(release)
+    sign_release(rel_dir, release, signer)
+
+
+def build_repo() -> None:
+    pgp.self_test()  # never sign with a signer that fails the RFC 8032 vectors
+    elf = build_linux_elf(HELLO_MSG)
+    data_tar_gz = make_tar_gz([("usr/bin/hello-pagh", 0o755, elf)])
     control_text = (
         "Package: hello-pagh\n"
         "Version: 1.0\n"
@@ -164,58 +339,18 @@ def build_repo() -> None:
         "Description: tiny hello binary for the apt end-to-end test\n"
     ).encode()
     control_tar_gz = make_tar_gz([("control", 0o644, control_text)])
-
     deb = build_deb(control_tar_gz, data_tar_gz)
 
-    # Write the pool .deb.
-    pool_dir = os.path.join(REPO, "pool", "main", "h", "hello-pagh")
-    os.makedirs(pool_dir, exist_ok=True)
-    deb_name = "hello-pagh_1.0_amd64.deb"
-    deb_path = os.path.join(pool_dir, deb_name)
-    with open(deb_path, "wb") as f:
-        f.write(deb)
-
-    pool_rel = "pool/main/h/hello-pagh/" + deb_name
-    size = len(deb)
-    md5 = hashlib.md5(deb).hexdigest()
-    sha256 = hashlib.sha256(deb).hexdigest()
-
-    # The Packages index. Fields the kernel parser keeps: Package, Version,
-    # Architecture, Filename, Depends (none -> trivial install), Size.
-    packages = (
-        f"Package: hello-pagh\n"
-        f"Version: 1.0\n"
-        f"Architecture: amd64\n"
-        f"Maintainer: Pagh-OS <root@pagh>\n"
-        f"Filename: {pool_rel}\n"
-        f"Size: {size}\n"
-        f"MD5sum: {md5}\n"
-        f"SHA256: {sha256}\n"
-        f"Description: tiny hello binary for the apt end-to-end test\n"
-        f"\n"
-    ).encode()
-
-    idx_dir = os.path.join(REPO, "dists", "stable", "main", "binary-amd64")
-    os.makedirs(idx_dir, exist_ok=True)
-    with open(os.path.join(idx_dir, "Packages"), "wb") as f:
-        f.write(packages)
-    out = io.BytesIO()
-    with gzip.GzipFile(fileobj=out, mode="wb", mtime=0) as gz:
-        gz.write(packages)
-    with open(os.path.join(idx_dir, "Packages.gz"), "wb") as f:
-        f.write(out.getvalue())
-
-    # A minimal Release file (not required by the kernel, included for realism).
-    rel_dir = os.path.join(REPO, "dists", "stable")
-    with open(os.path.join(rel_dir, "Release"), "wb") as f:
-        f.write(
-            b"Suite: stable\nComponent: main\nArchitectures: amd64\n"
-        )
+    stale = stale_deb()
+    for suite, signer in SUITES:
+        payload = stale if suite == "stale" else deb
+        write_suite(suite, signer, payload, tamper_deb=(suite == "tampered-deb"))
 
     print(f"built repo at {REPO}")
-    print(f"  .deb        : {pool_rel} ({size} bytes, md5 {md5[:12]}...)")
-    print(f"  Packages.gz : dists/stable/main/binary-amd64/Packages.gz")
     print(f"  ELF         : usr/bin/hello-pagh ({len(elf)} bytes), prints {HELLO_MSG!r}")
+    print(f"  .deb        : {len(deb)} bytes, sha256 {hashlib.sha256(deb).hexdigest()[:12]}…")
+    for suite, signer in SUITES:
+        print(f"  dists/{suite:15s} signed-by={signer or 'NONE (deliberately unsigned)'}")
 
 
 def build_big_index(n: int) -> None:
@@ -264,8 +399,10 @@ def build_big_index(n: int) -> None:
 
     rel_dir = os.path.join(REPO, "dists", "stable")
     os.makedirs(rel_dir, exist_ok=True)
+    release = suite_release("stable", packages, gz_bytes)
     with open(os.path.join(rel_dir, "Release"), "wb") as f:
-        f.write(b"Suite: stable\nComponent: main\nArchitectures: amd64\n")
+        f.write(release)
+    sign_release(rel_dir, release, "test")
 
     print(f"built BIG index at {idx_dir}")
     print(f"  stanzas     : {n}")
