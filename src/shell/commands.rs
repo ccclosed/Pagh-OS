@@ -121,6 +121,35 @@ pub(super) fn cmd_echo(_ctx: &mut ShellCtx, args: &[&str]) {
 }
 
 /// `uptime`: print the scheduler tick count and an approximate seconds value.
+/// `atrand [n]` — VERIFICATION PROBE (branch `verify/atrandom-probe`, never for
+/// merge): prints `n` consecutive `AT_RANDOM` blocks so the host can sample the
+/// derivation stream on demand. Calls the shipped path; changes nothing.
+pub(super) fn cmd_atrand(_ctx: &mut ShellCtx, args: &[&str]) {
+    let count: usize = args.first().and_then(|a| a.parse().ok()).unwrap_or(8);
+    shell_println(&alloc::format!(
+        "ATRAND start count={} hw_avail={} hw={} seed_fp={}",
+        count,
+        crate::security::entropy::is_available(),
+        crate::security::entropy::capabilities_str(),
+        crate::security::entropy::boot_seed_fingerprint()
+            .iter()
+            .map(|b| alloc::format!("{:02x}", b))
+            .collect::<alloc::string::String>()
+    ));
+    for i in 0..count {
+        let block = crate::arch::x86_64::linux::misc::random_bytes_16();
+        shell_println(&alloc::format!(
+            "ATRAND i={} bytes={}",
+            i,
+            block
+                .iter()
+                .map(|b| alloc::format!("{:02x}", b))
+                .collect::<alloc::string::String>()
+        ));
+    }
+    shell_println("ATRAND end");
+}
+
 pub(super) fn cmd_uptime(_ctx: &mut ShellCtx, _args: &[&str]) {
     let ticks = crate::task::scheduler::ticks();
     crate::kprintln!(

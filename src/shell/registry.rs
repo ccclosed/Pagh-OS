@@ -85,6 +85,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_echo,
     },
     CommandSpec {
+        name: "atrand",
+        description: "Probe: print AT_RANDOM blocks (issue #16 verification)",
+        usage: "atrand [count]",
+        handler: super::commands::cmd_atrand,
+    },
+    CommandSpec {
         name: "uptime",
         description: "Show ticks",
         usage: "uptime",

@@ -218,8 +218,15 @@ fn collect_boot_seed() -> [u8; 32] {
     pool.absorb(b"tsc.start", start);
     pool.absorb(b"tsc.jitter", jitter);
     pool.absorb(b"tsc.iters", iterations as u64);
+    crate::info!(
+        "[atseed] tsc start={} jitter={} iters={}",
+        start,
+        jitter,
+        iterations
+    );
 
     // 2. RTC wall-clock reads + the cycle cost of each (port I/O latency).
+    let mut rtc_line = alloc::string::String::new();
     for i in 0..RTC_SAMPLES {
         let before = rdtsc();
         let secs = crate::arch::x86_64::linux::rtc::now_unix();
@@ -227,25 +234,62 @@ fn collect_boot_seed() -> [u8; 32] {
         pool.absorb(b"rtc.secs", secs);
         pool.absorb(b"rtc.latency", after.wrapping_sub(before));
         pool.absorb(b"rtc.index", i as u64);
+        let _ = core::fmt::Write::write_fmt(
+            &mut rtc_line,
+            format_args!("{}:{} ", secs, after.wrapping_sub(before)),
+        );
     }
+    crate::info!("[atseed] rtc {}", rtc_line);
 
     // 3. Kernel counters and state.
-    pool.absorb(b"tick", crate::task::scheduler::ticks());
-    pool.absorb(b"pid.cur", crate::task::scheduler::current_pid());
-    pool.absorb(b"pid.next", crate::task::scheduler::next_pid());
-    pool.absorb(b"pmm.free", crate::memory::pmm::free_frames() as u64);
-    pool.absorb(b"pmm.total", crate::memory::pmm::total_frames() as u64);
+    let tick = crate::task::scheduler::ticks();
+    let pid_cur = crate::task::scheduler::current_pid();
+    let pid_next = crate::task::scheduler::next_pid();
+    let pmm_free = crate::memory::pmm::free_frames() as u64;
+    let pmm_total = crate::memory::pmm::total_frames() as u64;
     let (heap_size, heap_used, heap_free) = crate::memory::heap::stats();
+    pool.absorb(b"tick", tick);
+    pool.absorb(b"pid.cur", pid_cur);
+    pool.absorb(b"pid.next", pid_next);
+    pool.absorb(b"pmm.free", pmm_free);
+    pool.absorb(b"pmm.total", pmm_total);
     pool.absorb(b"heap.size", heap_size as u64);
     pool.absorb(b"heap.used", heap_used as u64);
     pool.absorb(b"heap.free", heap_free as u64);
 
     // 4. Address-space layout: the page table in use and where these objects live.
-    pool.absorb(b"cr3", crate::memory::vmm::current_pml4_phys());
-    pool.absorb(b"addr.pool", core::ptr::addr_of!(pool) as u64);
+    let cr3 = crate::memory::vmm::current_pml4_phys();
+    let addr_pool = core::ptr::addr_of!(pool) as u64;
+    pool.absorb(b"cr3", cr3);
+    pool.absorb(b"addr.pool", addr_pool);
     pool.absorb(b"addr.absorbed", pool.sources() as u64);
+    crate::info!(
+        "[atseed] misc tick={} pid_cur={} pid_next={} pmm_free={} pmm_total={} heap={},{},{} cr3={:#x} addr_pool={:#x} sources={}",
+        tick,
+        pid_cur,
+        pid_next,
+        pmm_free,
+        pmm_total,
+        heap_size,
+        heap_used,
+        heap_free,
+        cr3,
+        addr_pool,
+        pool.sources()
+    );
 
-    pool.finish()
+    let seed = pool.finish();
+    crate::info!("[atseed] seed={}", hex_bytes(&seed));
+    seed
+}
+
+/// Probe-only hex helper (verification branch, never merged).
+fn hex_bytes(bytes: &[u8]) -> alloc::string::String {
+    let mut s = alloc::string::String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{:02x}", b));
+    }
+    s
 }
 
 /// One-way fingerprint of the boot seed, for diagnostics and in-QEMU evidence.
@@ -296,4 +340,12 @@ pub fn mixed_fill(dest: &mut [u8]) {
     };
 
     seed::derive_bytes(&boot_seed, seq, observables, dest);
+    crate::info!(
+        "[atblk] seq={} ticks={} rtc={} pid={} bytes={}",
+        seq,
+        observables.ticks,
+        observables.rtc_unix,
+        observables.pid,
+        hex_bytes(dest)
+    );
 }
