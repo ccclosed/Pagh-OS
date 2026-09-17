@@ -214,6 +214,50 @@ fn e2e_test_anchor_is_well_formed_and_not_in_the_production_store() {
     check_pinned_key(&TEST_KEY_PRIMARY, NOW).expect("test anchor validates");
 }
 
+#[test]
+fn lifecycle_test_keys_are_validated_but_not_anchored() {
+    // `tools/gen_openpgp_testkey.py` also emits two TEST-ONLY lifecycle keys — one
+    // whose window closed an hour after creation, one created ten years in the
+    // future. They are deliberately NOT in `TEST_TRUST_ANCHORS` (wiring them into
+    // the E2E run would widen the surface the E2E verifier must cover), and this
+    // test is what makes them more than dead bytes: the SAME verifier that runs in
+    // the kernel must refuse each of them for exactly the right reason, using the
+    // expiry/creation data the generator wrote into the self-signature.
+    use crate::openpgp_test_keys::{
+        TEST_KEY_EXPIRED, TEST_KEY_NOT_YET_VALID, TEST_TRUST_ANCHORS,
+    };
+
+    for key in [TEST_KEY_EXPIRED, TEST_KEY_NOT_YET_VALID] {
+        assert!(
+            !TEST_TRUST_ANCHORS
+                .iter()
+                .any(|k| k.fingerprint == key.fingerprint),
+            "lifecycle keys must not be anchored: {}",
+            key.label
+        );
+    }
+    // The key is created at NOW and expires an hour later, so it is a *valid*
+    // window that we can step outside of — exactly the shape the kernel meets:
+    check_pinned_key(&TEST_KEY_EXPIRED, NOW).expect("valid inside its one-hour window");
+    assert_eq!(
+        check_pinned_key(&TEST_KEY_EXPIRED, NOW + 7_200).unwrap_err(),
+        OpenPgpError::Expired,
+        "the expired fixture key must be refused once its window closed"
+    );
+    assert_eq!(
+        check_pinned_key(&TEST_KEY_NOT_YET_VALID, NOW).unwrap_err(),
+        OpenPgpError::NotYetValid,
+        "the future fixture key must be refused as not yet valid"
+    );
+    // Sanity: their metadata really says so (a generator drift would otherwise
+    // turn the two assertions above into "refused for some other reason").
+    assert_eq!(
+        TEST_KEY_EXPIRED.expires,
+        Some(TEST_KEY_EXPIRED.created + 3_600)
+    );
+    assert!(TEST_KEY_NOT_YET_VALID.created as i64 > NOW);
+}
+
 fn hex(fpr: &[u8; 20]) -> String {
     fpr.iter().map(|b| format!("{b:02X}")).collect()
 }

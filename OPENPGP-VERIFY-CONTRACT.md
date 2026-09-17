@@ -1072,3 +1072,11 @@ LXSELFTEST apt_e2e PASS (… trust-chain checks passed)
 | subkey issuer → pinned primary mapping | QEMU E2E (the test key signs with its primary; the *live* t22 run exercised a Debian subkey) |
 | rollback to a complete older signed triplet | QEMU E2E `stale` — **accepted**, printed as a NOTE; the gap is documented in `SECURITY.md` |
 | `ClockUnset`, key expiry/revocation/not-yet-valid, future-dated signature, `Date`/`Valid-Until` parsing, `NoIndexEntry`, ECDSA | host properties P52–P54 only — end-to-end they would need a guest clock override (`-rtc base=2020-01-01`, which the E2E driver does not expose) or a Debian private key |
+
+For the two key-lifecycle branches the E2E *tool* is ready and validated without
+being wired in: `tools/gen_openpgp_testkey.py` emits an expired and a
+not-yet-valid deterministic test key, P53 proves the verifier refuses each as
+`Expired` / `NotYetValid` from the generator's own metadata, and neither key
+appears in the harness anchor table. Connecting them to the E2E run is a small,
+deliberate follow-up, kept out of the series so the verification surface stays
+bounded.

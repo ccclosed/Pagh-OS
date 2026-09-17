@@ -201,6 +201,7 @@ def signature_packet(
     sig_type: int,
     created: int,
     hash_algo: int = 8,
+    key_expiry: int | None = None,
 ) -> bytes:
     """A v4 signature packet over `signed_data` (already key/uid/body parts).
 
@@ -213,6 +214,10 @@ def signature_packet(
         + subpacket(2, struct.pack(">I", created))
         + subpacket(27, bytes([0x03]))  # key flags: certify + sign
     )
+    if key_expiry is not None:
+        # Subpacket 9: seconds after the key's creation time. Only fixture keys
+        # meant to exercise the expiry policy carry it.
+        hashed += subpacket(9, struct.pack(">I", key_expiry))
     hashed_portion = (
         bytes([4, sig_type, 22, hash_algo]) + struct.pack(">H", len(hashed)) + hashed
     )
@@ -236,11 +241,22 @@ def signature_packet(
     return packet(2, body)
 
 
-def keyring_block(seed: bytes, uid: bytes, created: int) -> bytes:
-    """A complete one-key keyring: primary key, user ID, self-certification."""
+def keyring_block(
+    seed: bytes, uid: bytes, created: int, key_expiry: int | None = None
+) -> bytes:
+    """A complete one-key keyring: primary key, user ID, self-certification.
+
+    `key_expiry` (seconds after `created`) is written into the self-signature's
+    subpacket 9, which is where the verifier reads a primary key's expiry from.
+    """
     primary = public_key_packet(seed, created)
     cert = signature_packet(
-        seed, primary, key_hashed(primary) + uid_hashed(uid), 0x13, created
+        seed,
+        primary,
+        key_hashed(primary) + uid_hashed(uid),
+        0x13,
+        created,
+        key_expiry=key_expiry,
     )
     return packet(6, primary) + packet(13, uid) + cert
 
