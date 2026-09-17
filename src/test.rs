@@ -1257,6 +1257,243 @@ mod vfs_tests {
     }
 }
 
+// ============================================================================
+// procfs: the synthetic /proc (issue #11, contract docs/procfs.md)
+// ============================================================================
+//
+// Read-only by construction: `lookup_path` / `readdir` / `read` / `size` only.
+// Nothing here opens a descriptor, installs `CompatState`, touches the PMM or IF,
+// or mutates the VFS, so the routine is non-destructive (AGENTS.md invariant 8)
+// and safe to run from the shell thread — which has no `CompatState`, which is
+// exactly why the `/proc/self` half of the contract is asserted to be *invisible*
+// here (the Linux-process half is verified end to end from a guest binary).
+mod procfs_tests {
+    use crate::vfs::{self, VfsError, VfsNode};
+    use alloc::string::String;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+
+    /// Read a whole node through the VFS API (the same shape `sys_read` uses).
+    fn read_all(node: &Arc<dyn VfsNode>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 512];
+        let mut off = 0u64;
+        loop {
+            match node.read(off, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    out.extend_from_slice(&buf[..n]);
+                    off += n as u64;
+                    if out.len() > 64 * 1024 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    fn read_path(path: &str) -> Vec<u8> {
+        match vfs::lookup_path(path) {
+            Ok(node) => read_all(&node),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn names(node: &Arc<dyn VfsNode>) -> Vec<String> {
+        node.readdir()
+            .map(|children| {
+                children
+                    .iter()
+                    .map(|c| String::from(c.name()))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The `MemTotal:`-style value of a meminfo line, in kB.
+    fn meminfo_value(text: &str, key: &str) -> Option<u64> {
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix(key) {
+                let rest = rest.trim_start_matches(' ');
+                return rest.strip_suffix(" kB").and_then(|n| n.parse().ok());
+            }
+        }
+        None
+    }
+
+    pub fn tree_and_contents() {
+        // ── /proc: a directory with exactly the first-slice children ─────────
+        let proc_dir = match vfs::lookup_path("/proc") {
+            Ok(n) => n,
+            Err(e) => {
+                assert_kernel!(false, "procfs: lookup_path(/proc) failed");
+                let _ = e;
+                return;
+            }
+        };
+        assert_kernel!(proc_dir.is_directory(), "procfs: /proc is a directory");
+        assert_eq_kernel!(
+            names(&proc_dir),
+            alloc::vec![
+                String::from("self"),
+                String::from("cpuinfo"),
+                String::from("meminfo"),
+                String::from("uptime"),
+            ],
+            "procfs: /proc readdir order"
+        );
+        // The `MountNode` wrapper does not forward `fs_ino`, so `/proc` itself
+        // reports the synthetic (FNV) identity of the mount name — the documented
+        // status quo (docs/procfs.md §2.3). What must hold is that the files below
+        // it carry real, distinct, path-stable inodes, so `getdents64` and `stat`
+        // cannot disagree about a file's identity.
+        let mut seen_inos: Vec<u64> = Vec::new();
+        for name in ["cpuinfo", "meminfo", "uptime"] {
+            let node = match proc_dir.lookup(name) {
+                Ok(n) => n,
+                Err(_) => {
+                    assert_kernel!(false, "procfs: child lookup failed");
+                    return;
+                }
+            };
+            assert_kernel!(node.fs_ino() != 0, "procfs: child has a real inode");
+            assert_kernel!(
+                !seen_inos.contains(&node.fs_ino()),
+                "procfs: child inodes are distinct"
+            );
+            seen_inos.push(node.fs_ino());
+        }
+        assert_eq_kernel!(
+            seen_inos[1],
+            crate::vfs::procfs_format::proc_file("meminfo")
+                .map(|e| e.ino)
+                .unwrap_or(0),
+            "procfs: /proc/meminfo reports its table inode"
+        );
+
+        // ── /proc/cpuinfo ────────────────────────────────────────────────────
+        let cpuinfo = read_path("/proc/cpuinfo");
+        assert_kernel!(!cpuinfo.is_empty(), "procfs: /proc/cpuinfo is not empty");
+        let cpuinfo_text = core::str::from_utf8(&cpuinfo).unwrap_or("");
+        assert_kernel!(
+            cpuinfo_text.starts_with("processor\t: 0\n"),
+            "procfs: cpuinfo starts with the processor line libuv parses"
+        );
+        assert_kernel!(
+            cpuinfo_text.contains("vendor_id\t: ") && cpuinfo_text.contains("model name\t: "),
+            "procfs: cpuinfo carries vendor_id and model name"
+        );
+        assert_kernel!(
+            cpuinfo_text.ends_with("\n\n"),
+            "procfs: cpuinfo ends with a blank line"
+        );
+
+        // ── /proc/meminfo ────────────────────────────────────────────────────
+        let meminfo = read_path("/proc/meminfo");
+        let meminfo_text = core::str::from_utf8(&meminfo).unwrap_or("");
+        let total_kb = meminfo_value(meminfo_text, "MemTotal:").unwrap_or(0);
+        let free_kb = meminfo_value(meminfo_text, "MemFree:").unwrap_or(0);
+        assert_kernel!(total_kb > 0, "procfs: MemTotal is non-zero");
+        assert_kernel!(free_kb <= total_kb, "procfs: MemFree <= MemTotal");
+        let pmm_total_kb = crate::memory::pmm::total_frames() as u64 * 4096 / 1024;
+        let pmm_free_kb = crate::memory::pmm::free_frames() as u64 * 4096 / 1024;
+        assert_eq_kernel!(
+            total_kb,
+            pmm_total_kb,
+            "procfs: MemTotal agrees with the PMM frame count"
+        );
+        assert_eq_kernel!(
+            free_kb,
+            pmm_free_kb,
+            "procfs: MemFree agrees with the PMM free count"
+        );
+        assert_eq_kernel!(
+            meminfo_value(meminfo_text, "MemAvailable:"),
+            Some(free_kb),
+            "procfs: MemAvailable mirrors MemFree"
+        );
+        assert_kernel!(
+            meminfo.len() <= 4096,
+            "procfs: meminfo fits libuv's 4096-byte read buffer"
+        );
+        assert_kernel!(
+            meminfo_value(meminfo_text, "MemTotal:").is_some() && meminfo_text.contains(" kB\n"),
+            "procfs: meminfo uses the ' kB' unit"
+        );
+
+        // ── /proc/uptime ─────────────────────────────────────────────────────
+        let uptime = read_path("/proc/uptime");
+        let uptime_text = core::str::from_utf8(&uptime).unwrap_or("");
+        let mut fields = uptime_text.trim_end_matches('\n').split(' ');
+        let secs_field = fields.next().unwrap_or("");
+        let idle_field = fields.next().unwrap_or("");
+        let secs = secs_field
+            .split_once('.')
+            .and_then(|(s, c)| (c.len() == 2).then(|| s.parse::<u64>().ok()).flatten())
+            .unwrap_or(u64::MAX);
+        let now_secs = crate::task::scheduler::ticks() / crate::arch::x86_64::apic::TICK_HZ;
+        assert_kernel!(
+            secs != u64::MAX && secs + 1 >= now_secs && secs <= now_secs + 1,
+            "procfs: /proc/uptime seconds track the tick clock"
+        );
+        assert_eq_kernel!(idle_field, "0.00", "procfs: idle field is 0.00");
+
+        // ── snapshot/size consistency and EOF behaviour ──────────────────────
+        let meminfo_node = match vfs::lookup_path("/proc/meminfo") {
+            Ok(n) => n,
+            Err(_) => {
+                assert_kernel!(false, "procfs: /proc/meminfo lookup failed");
+                return;
+            }
+        };
+        let size = meminfo_node.size();
+        assert_kernel!(size > 0, "procfs: size() is the rendered length, not 0");
+        let mut big = alloc::vec![0u8; 8192];
+        let n = meminfo_node.read(0, &mut big).unwrap_or(0) as u64;
+        assert_kernel!(
+            n == size,
+            "procfs: one large read returns the whole file (size-driven EOF)"
+        );
+        assert_eq_kernel!(
+            meminfo_node.read(size, &mut big).unwrap_or(999),
+            0,
+            "procfs: read at EOF returns 0"
+        );
+        assert_eq_kernel!(
+            meminfo_node.read(size + 1, &mut big).unwrap_or(999),
+            0,
+            "procfs: read past EOF returns 0"
+        );
+
+        // ── the ENOENT matrix: no wildcard, no invented files ────────────────
+        for path in [
+            "/proc/1",
+            "/proc/1234",
+            "/proc/self/fd",
+            "/proc/version",
+            "/proc/stat",
+            "/proc/cpuinfo/child",
+            "/proc/nonexistent",
+        ] {
+            assert_kernel!(
+                matches!(vfs::lookup_path(path), Err(VfsError::NotFound)),
+                "procfs: an unknown /proc path is ENOENT, never a catch-all"
+            );
+        }
+
+        // ── /proc/self is invisible to a task without CompatState ────────────
+        // The shell thread that runs these tests is not a Linux process; the
+        // contract (docs/procfs.md §5.5) says such a caller gets ENOENT instead
+        // of a fabricated process.
+        assert_kernel!(
+            matches!(vfs::lookup_path("/proc/self"), Err(VfsError::NotFound)),
+            "procfs: /proc/self is ENOENT without CompatState"
+        );
+    }
+}
+
 mod integration {
     use crate::arch::cpu::{disable_interrupts, enable_interrupts, interrupts_enabled};
     use crate::task::scheduler::{self, Tcb};
@@ -3157,6 +3394,12 @@ mod net_phy_prop_tests {
 
 pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
     alloc::vec![
+        // procfs (issue #11): the synthetic tree's shape, the rendered texts and
+        // the ENOENT matrix. Read-only; see the module docs.
+        (
+            "procfs::tree, rendered files and ENOENT matrix",
+            procfs_tests::tree_and_contents
+        ),
         ("pmm::total_frames > 0", pmm_tests::total_frames),
         ("pmm::alloc+free cycle", pmm_tests::alloc_free),
         ("pmm::8x alloc+free", pmm_tests::alloc_many),

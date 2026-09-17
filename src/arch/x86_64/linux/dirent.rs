@@ -35,9 +35,27 @@ pub const DT_DIR: u8 = 4;
 /// `d_type` value: regular file.
 pub const DT_REG: u8 = 8;
 
+/// `d_type` value: symbolic link.
+pub const DT_LNK: u8 = 10;
+
 /// Fixed-size header of a `linux_dirent64` preceding the variable-length name:
 /// `d_ino` (8) + `d_off` (8) + `d_reclen` (2) + `d_type` (1) = 19 bytes.
 pub const DIRENT_HEADER: usize = 19;
+
+/// `d_type` for a directory entry, from the node's VFS kind.
+///
+/// The symlink check comes first: `/proc/self/exe` is a link, never a directory,
+/// and `ls -l` renders `l` only when `d_type` says so (`docs/procfs.md` §5.3).
+#[inline]
+pub fn d_type_for(is_directory: bool, is_symlink: bool) -> u8 {
+    if is_symlink {
+        DT_LNK
+    } else if is_directory {
+        DT_DIR
+    } else {
+        DT_REG
+    }
+}
 
 /// Compute the 8-byte-aligned `d_reclen` for an entry whose name is `name_len`
 /// bytes long (the stored name is always NUL-terminated, hence the `+ 1`).

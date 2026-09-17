@@ -1,6 +1,8 @@
 // vfs/elf.rs — ELF64 binary loader
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
+use alloc::vec::Vec;
+
 use crate::memory::vmm;
 use core::ptr;
 use x86_64::structures::paging::PageTableFlags;
@@ -46,6 +48,7 @@ const PT_LOAD: u32 = 1;
 const ET_EXEC: u16 = 2;
 const EM_X86_64: u16 = 0x3E;
 
+const PF_R: u32 = 4;
 const PF_W: u32 = 2;
 const PF_X: u32 = 1;
 
@@ -62,6 +65,20 @@ const ELFDATA2LSB: u8 = 1;
 /// `VirtAddr::new` (which rejects non-canonical addresses). We reject these in
 /// validation so a malformed program header can never reach the mapping loop.
 const USER_ADDR_MAX: u64 = 0x0000_8000_0000_0000;
+
+/// One mapped `PT_LOAD` segment, page-rounded, as `/proc/self/maps` needs it.
+///
+/// `prot` holds the raw ELF `p_flags` (`PF_R`/`PF_W`/`PF_X`); the procfs layer
+/// converts them to Linux `PROT_*` bits when it renders the line. `file_offset`
+/// is the segment's `p_offset` rounded down to the page boundary (Linux reports
+/// the page-aligned file offset of a mapping).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoadSegment {
+    pub start: u64,
+    pub end: u64,
+    pub prot: u32,
+    pub file_offset: u64,
+}
 
 /// Loader outputs for a successfully mapped Linux ELF image.
 ///
@@ -87,6 +104,9 @@ pub struct ElfProcess {
     pub phnum: u16,
     /// Page-aligned top of the highest `PT_LOAD` (+bias); seeds the heap break.
     pub initial_brk: u64,
+    /// The mapped `PT_LOAD` segments, in program-header order. Consumed by
+    /// `/proc/self/maps`; empty for images with no `PT_LOAD`.
+    pub segments: Vec<LoadSegment>,
 }
 
 pub struct ElfLoader;
@@ -170,6 +190,9 @@ impl ElfLoader {
             phent: header.e_phentsize,
             phnum: header.e_phnum,
             initial_brk: brk,
+            // The legacy native path has no maps consumer; the segments are only
+            // collected for Linux images (`load_linux`).
+            segments: Vec::new(),
         })
     }
 
@@ -254,7 +277,8 @@ impl ElfLoader {
         unsafe {
             vmm::load_cr3(pml4_phys);
         }
-        let map_result = Self::map_segments_biased(data, header, bias);
+        let mut segments: Vec<LoadSegment> = Vec::new();
+        let map_result = Self::map_segments_biased(data, header, bias, &mut segments);
         // SAFETY: always restore the kernel PML4 before returning to the caller.
         unsafe {
             vmm::load_cr3(kernel_cr3);
@@ -282,11 +306,17 @@ impl ElfLoader {
             phent: header.e_phentsize,
             phnum: header.e_phnum,
             initial_brk,
+            segments,
         })
     }
 
     /// Map an ET_DYN PT_INTERP image into an existing user address space.
-    pub fn map_interpreter(pml4_phys: u64, data: &[u8], bias: u64) -> Result<u64, &'static str> {
+    pub fn map_interpreter(
+        pml4_phys: u64,
+        data: &[u8],
+        bias: u64,
+        segments: &mut Vec<LoadSegment>,
+    ) -> Result<u64, &'static str> {
         match classify_elf(data) {
             ElfVerdict::Load {
                 kind: ElfKind::Dyn, ..
@@ -310,7 +340,7 @@ impl ElfLoader {
         unsafe {
             vmm::load_cr3(pml4_phys);
         }
-        let result = Self::map_segments_biased(data, header, bias);
+        let result = Self::map_segments_biased(data, header, bias, segments);
         unsafe {
             vmm::load_cr3(kernel_cr3);
         }
@@ -415,6 +445,7 @@ impl ElfLoader {
         data: &[u8],
         header: &Elf64Header,
         bias: u64,
+        segments: &mut Vec<LoadSegment>,
     ) -> Result<u64, &'static str> {
         let mut brk: u64 = 0;
         let phoff = header.e_phoff as usize;
@@ -481,6 +512,13 @@ impl ElfLoader {
                 ph.p_memsz,
                 ph.p_flags
             );
+
+            segments.push(LoadSegment {
+                start: page_start,
+                end: page_end,
+                prot: ph.p_flags & (PF_R | PF_W | PF_X),
+                file_offset: ph.p_offset & !4095,
+            });
 
             let mut addr = page_start;
             while addr < page_end {

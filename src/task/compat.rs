@@ -16,11 +16,13 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::arch::x86_64::linux::mem::VmRegionSet;
 use crate::arch::x86_64::linux::signal_frame::{sigbit, SigAltStack, SignalAction, SIGNAL_COUNT};
 use crate::sync::spinlock::Spinlock;
+use crate::vfs::elf::LoadSegment;
 
 use super::fd::FdTable;
 
@@ -65,6 +67,18 @@ pub struct CompatState {
     /// Absolute VFS path of the exec'd image, reported through
     /// `readlink("/proc/self/exe")` (libuv's uv_exepath / nvim's progpath).
     pub exe_path: String,
+    /// `/proc/self/cmdline`: the process's argv, each argument followed by a NUL
+    /// (Linux format). Captured at launch/exec from the same `argv` slice that
+    /// builds the initial stack — the initial stack itself is user memory and
+    /// cannot be read back from a VFS node (`docs/procfs.md` §4.4). `fork`/`clone`
+    /// inherit it, `execve` replaces it.
+    pub cmdline: Vec<u8>,
+    /// Mapped `PT_LOAD` segments of the executable, for `/proc/self/maps`.
+    pub image_segments: Vec<LoadSegment>,
+    /// Mapped `PT_LOAD` segments of the ELF interpreter (empty for static images).
+    pub interp_segments: Vec<LoadSegment>,
+    /// Path of the ELF interpreter, when one was loaded (for `/proc/self/maps`).
+    pub interp_path: String,
     /// What fds 0/1/2 were AT execve time (after the
     /// close-on-exec sweep). The spawn-time [DIAG] lines are wiped by the
     /// TUI screen clear, so the watchdog re-prints this snapshot instead.
@@ -135,6 +149,10 @@ impl CompatState {
             echo: true,
             exit_code: None,
             exe_path: String::new(),
+            cmdline: Vec::new(),
+            image_segments: Vec::new(),
+            interp_segments: Vec::new(),
+            interp_path: String::new(),
             exec_stdio: ["?", "?", "?"],
             rlimits: BTreeMap::new(),
             umask: 0o022,

@@ -19,7 +19,7 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
 | `shell/` | Интерактивный shell, paint, nano, мини-Rust toolchain | [shell/README.md](shell/README.md) |
 | `sync/` | Спинлок с маскированием IF | [sync/README.md](sync/README.md) |
 | `task/` | Планировщик RR, процессы, fd-таблица, Linux compat-состояние | [task/README.md](task/README.md) |
-| `vfs/` | VFS-трейт, ramfs, ELF-загрузчик | [vfs/README.md](vfs/README.md) |
+| `vfs/` | VFS-трейт, ramfs, синтетический `/proc`, ELF-загрузчик | [vfs/README.md](vfs/README.md) |
 
 ## Верхнеуровневые файлы
 
@@ -49,7 +49,9 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
 7. `apic::init` + роутинг IRQ1/IRQ12 (клавиатура/мышь).
 8. `drivers::init` (PS/2 + framebuffer).
 9. virtio: `pci::enumerate()` → `virtio::blk::init_blk` (после кучи — enumerate аллоцирует Vec).
-10. `scheduler::init`, `vfs::init`.
+10. `scheduler::init`, `vfs::init` (монтирует `/dev`, ramfs `/tmp` и синтетический
+    `/proc` — issue #11; содержимое `/proc` рендерится лениво, поэтому порядок
+    boot-фаз не меняется, но к этому моменту уже готовы PMM, heap и тик-клок).
 11. `init_fs`: virtio-blk → NVMe фоллбэк; `Ext2Fs::mount`; формат — **только если устройство
     целиком нулевое** (решение принимает `fs::format_policy`, issue #33: валидный суперблок,
     таблица разделов MBR/GPT или любые другие ненулевые данные = отказ, а не стирание);

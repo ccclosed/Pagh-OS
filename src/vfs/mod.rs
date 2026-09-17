@@ -8,6 +8,12 @@ pub mod elf;
 pub mod elf_classify;
 /// In-memory `/tmp` (the only part of the tree with real
 /// `create_dir`/`create_file` support).
+pub mod procfs;
+/// Pure, `core`+`alloc`-only text rendering + path/inode table for the
+/// synthetic `/proc` (issue #11). Split out so `host-tests` can
+/// `#[path]`-include it and property-test the exact formats the kernel emits
+/// (contract `docs/procfs.md` §7).
+pub mod procfs_format;
 pub mod ramfs;
 
 use alloc::string::String;
@@ -72,6 +78,24 @@ pub trait VfsNode: Send + Sync {
     /// pair returned from `fstat`, so distinct files must never share a pair.
     fn fs_ino(&self) -> u64 {
         0
+    }
+
+    /// Is this node a symbolic link?
+    ///
+    /// Default `false`: the VFS had no notion of links before `/proc/self/exe`
+    /// (issue #11) and ext2 links (issue #18) — those are the two overriders.
+    /// `readlink(2)`, `lstat` and `d_type` all branch on this.
+    fn is_symlink(&self) -> bool {
+        false
+    }
+
+    /// The link target when [`is_symlink`](VfsNode::is_symlink) is true.
+    ///
+    /// Paths are UTF-8 `String`s in this kernel (`read_user_cstr`, `resolve_path`),
+    /// so a target is a `String` too. `None` means "not a link, or a link with no
+    /// target".
+    fn read_link(&self) -> Option<String> {
+        None
     }
 
     // ── mutating directory operations (Task 5.2) ──
@@ -227,6 +251,12 @@ impl VfsNode for MountNode {
     fn size(&self) -> u64 {
         self.inner.size()
     }
+    fn is_symlink(&self) -> bool {
+        self.inner.is_symlink()
+    }
+    fn read_link(&self) -> Option<String> {
+        self.inner.read_link()
+    }
     fn create_dir(&self, name: &str) -> VfsResult<Arc<dyn VfsNode>> {
         self.inner.create_dir(name)
     }
@@ -300,6 +330,17 @@ pub fn init() {
     });
     *ROOT_DIR.lock() = Some(Arc::clone(&root));
     *VFS_ROOT.lock() = Some(root as Arc<dyn VfsNode>);
+    // Synthetic /proc (issue #11). Mounted here, not in `boot::init_fs`, so it
+    // exists even when the ext2 tree is absent or refused by `format_policy` —
+    // /proc/meminfo and /proc/cpuinfo are exactly the diagnostics wanted in that
+    // situation. Everything procfs reads (PMM, heap, tick clock, scheduler) is
+    // already up: `pmm::init`/`vmm::init`/`heap::init`/`scheduler::init` all run
+    // earlier in `boot.rs`, and nothing is rendered at mount time.
+    if let Err(e) = mount_at("/proc", procfs::root()) {
+        crate::warn!("vfs: mounting /proc failed: {:?}", e);
+    } else {
+        crate::debug!("/proc (procfs) - ready");
+    }
     crate::debug!("VFS Initialized");
 }
 

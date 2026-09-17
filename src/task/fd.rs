@@ -315,6 +315,13 @@ impl FdTable {
     /// Close `fd`. Returns `Err(Errno::EBADF)` when the descriptor is absent or
     /// already closed, leaving the table unchanged; otherwise releases it and
     /// returns `Ok` (R2.6, R2.14).
+    /// The descriptor table's current slot capacity, reported as `FDSize:` in
+    /// `/proc/self/status` (Linux reports the allocated table size, not the
+    /// number of open descriptors).
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
     pub fn close(&mut self, fd: u32) -> Result<(), Errno> {
         let res = self.slots.close(fd).map_err(|_| Errno::EBADF);
         if res.is_ok() {
