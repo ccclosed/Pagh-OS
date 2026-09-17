@@ -226,6 +226,30 @@ pub mod tls_auth;
 #[path = "../../src/fs/format_policy.rs"]
 pub mod format_policy;
 
+
+// ── OpenPGP repository-metadata verification (issue #32) ─────────────────────
+// The pure verifier the `apt` trust chain will use: packet/armor parsing,
+// signature verification (RSA PKCS#1 v1.5, EdDSA, ECDSA), subkey binding,
+// expiry/revocation/key-flag policy and the `Release.gpg` / `InRelease` entry
+// points. `core` + `alloc` only, so the host tests exercise the same source the
+// kernel compiles; P51–P53 drive it with GnuPG-produced fixtures and with the
+// committed Debian archive keyring.
+#[path = "../../src/pkg/openpgp_crypto.rs"]
+pub mod openpgp_crypto;
+
+#[path = "../../src/pkg/openpgp_packet.rs"]
+pub mod openpgp_packet;
+
+#[path = "../../src/pkg/openpgp.rs"]
+pub mod openpgp;
+
+// The GENERATED trust store (tools/gen_debian_keyring.py): the pinned Debian
+// archive keys as exact keyring byte ranges plus their fingerprints, algorithm,
+// size and validity window. P53 re-derives every pinned value from those bytes
+// and verifies the keys' real GnuPG self-signatures and subkey bindings.
+#[path = "../../src/pkg/openpgp_keys.rs"]
+pub mod openpgp_keys;
+
 // `procfs_format` is the pure text rendering + path/inode table behind the
 // synthetic `/proc` (issue #11, contract `docs/procfs.md`). `core` + `alloc` only
 // and self-contained, so the standalone `#[path]` include resolves with no extra
@@ -315,6 +339,18 @@ mod properties {
     // Boot-time device safety (issue #33): only a genuinely blank device is
     // formatted; GPT/MBR/foreign/ext2-like layouts are refused.
     mod p50;
+    // OpenPGP repository-metadata verification (issue #32), contract
+    // OPENPGP-VERIFY-CONTRACT.md §2/§3/§7.
+    //   P51 — armor/packet framing: bounded, panic-free parsing of hostile bytes.
+    //   P52 — signature policy: real GnuPG signatures accept, every tamper class
+    //         (data, signature, foreign signer, expired key, clock) refuses.
+    //   P53 — the committed Debian keyring: pinned fingerprints/metadata agree
+    //         with the bytes, and the keys' real self-signatures and subkey
+    //         bindings verify through this implementation.
+    mod openpgp_fixtures;
+    mod p51;
+    mod p52;
+    mod p53;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the
