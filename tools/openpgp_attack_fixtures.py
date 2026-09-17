@@ -399,6 +399,33 @@ def cases() -> list[dict]:
             notes="Clearsign framing is validated before the signature is looked at.",
         ),
         dict(
+            id="c01-pinned-expired-signer",
+            family="pinned-test-anchor",
+            expect="reject",
+            stage="key",
+            cause="Expired",
+            marker="apt: verify FAIL stage=key cause=Expired",
+            attacks="signature by a PINNED key that has expired (signed while it was valid): "
+                    "the trust check passes, the validity window refuses",
+            notes="BUILT BUT NOT WIRED: reachable only after the victim build pins this key "
+                  "(see `pending_anchor`); the captain's decision is that extending the test "
+                  "anchor is a separate implementation task, not part of t24. Until then the "
+                  "same logic is covered by host property P52/P53.",
+            wired=False,
+        ),
+        dict(
+            id="c02-pinned-not-yet-valid-signer",
+            family="pinned-test-anchor",
+            expect="reject",
+            stage="key",
+            cause="NotYetValid",
+            marker="apt: verify FAIL stage=key cause=NotYetValid",
+            attacks="signature by a PINNED key whose creation time is in the future relative "
+                    "to the verifying clock",
+            notes="BUILT BUT NOT WIRED, same `pending_anchor` requirement as c01.",
+            wired=False,
+        ),
+        dict(
             id="b05-expired-untrusted-signer",
             family="local-keys",
             expect="reject",
@@ -422,9 +449,9 @@ def build_case(case: dict, out_root: str, home: str, *, suite_mode: str = "stabl
     cid = case["id"]
     # `a*` trees carry Debian's own signature, whose `Suite: stable` we cannot
     # recreate: they are served as `stable` whatever the caller asked for.
-    per_case = suite_mode == "case" and case["family"] == "local-keys"
+    per_case = suite_mode == "case" and case["family"] in ("local-keys", "pinned-test-anchor")
     suite_dir = cid if per_case else SUITE
-    if suite_mode == "case" and case["family"] != "local-keys":
+    if suite_mode == "case" and case["family"] not in ("local-keys", "pinned-test-anchor"):
         pass  # documented in the manifest; not an error, `stable` is the only option
     tree = os.path.join(out_root, cid)
     if os.path.exists(tree):
@@ -433,6 +460,7 @@ def build_case(case: dict, out_root: str, home: str, *, suite_mode: str = "stabl
     meta = keys_meta()
     release_fpr = meta["keys"][0]["fingerprint"]
     expired_fpr = meta["keys"][1]["fingerprint"]
+    future_fpr = meta["keys"][2]["fingerprint"]
     # 2025-01-02T01:00:00Z: inside the release key's validity; a fixed instant, so
     # every generated signature is reproducible.
     SIGN_TIME = "20250102T010000!"
@@ -474,6 +502,17 @@ def build_case(case: dict, out_root: str, home: str, *, suite_mode: str = "stabl
             expired_fpr, EXPIRED_SIGN_TIME)
         sign_clearsign(home, fpr, t["release"], t["inrelease"], when)
         sign_detached(home, fpr, t["release"], t["release_gpg"], when)
+    elif cid in ("c01-pinned-expired-signer", "c02-pinned-not-yet-valid-signer"):
+        t = real_tree(tree, suite_dir=suite_dir)
+        set_suite_field(t["release"], suite_dir)
+        # Signed inside each key's own validity: `key/Expired` is about *now*, and a
+        # not-yet-valid key can only be used at its creation instant.
+        if cid == "c01-pinned-expired-signer":
+            fpr, when = expired_fpr, EXPIRED_SIGN_TIME
+        else:
+            fpr, when = future_fpr, "20300101T010000!"
+        sign_clearsign(home, fpr, t["release"], t["inrelease"], when)
+        sign_detach = sign_detached(home, fpr, t["release"], t["release_gpg"], when)
     elif cid == "b02-no-signature-packets":
         t = real_tree(tree, inrelease=False, suite_dir=suite_dir)
         set_suite_field(t["release"], suite_dir)
@@ -567,6 +606,59 @@ def real_signers(out_root: str) -> dict:
     }
 
 
+def pending_anchor() -> dict:
+    """The two fixture keys the `c*` cases need pinned, as ready-to-paste Rust.
+
+    `PinnedKey` literals for `src/pkg/openpgp_test_keys.rs` (the `lx_selftest`-gated
+    anchor file): the cases are built and their signatures are valid GnuPG
+    signatures, but a pinned key is required for the validity check to be reached
+    at all. The captain's decision is that extending the anchor is a separate
+    implementation task, so these stay unwired; this section is what makes that
+    task mechanical when it is wanted.
+    """
+    entries = []
+    for purpose, why in (("expired", "expired at verification time"),
+                         ("future", "created in the future relative to the clock")):
+        m = next(k for k in keys_meta()["keys"] if k["purpose"] == purpose)
+        res = subprocess.run(["gpg", "--homedir", os.path.join(DEFAULT_OUT, "_gnupg"),
+                              "--batch", "--yes", "--armor", "--export", m["fingerprint"]],
+                             capture_output=True, text=True)
+        col = subprocess.run(["gpg", "--homedir", os.path.join(DEFAULT_OUT, "_gnupg"),
+                              "--batch", "--yes", "--with-colons", "--list-keys",
+                              m["fingerprint"]], capture_output=True, text=True).stdout
+        pub = next((l.split(":") for l in col.splitlines() if l.startswith("pub:")), None)
+        algo = int(pub[3]) if pub and pub[3] else 0
+        bits = int(pub[2]) if pub and pub[2] else 0
+        created = int(pub[5]) if pub and pub[5] else 0
+        expires = int(pub[6]) if pub and len(pub) > 6 and pub[6] else None
+        raw = subprocess.run(["gpg", "--homedir", os.path.join(DEFAULT_OUT, "_gnupg"),
+                              "--batch", "--yes", "--export", m["fingerprint"]],
+                             capture_output=True).stdout
+        block = ", ".join(f"0x{b:02x}" for b in raw)
+        entries.append({
+            "purpose": purpose,
+            "why_needed": why,
+            "fingerprint": m["fingerprint"],
+            "rust_literal": (
+                "    PinnedKey {\n"
+                f"        label: \"pagh fixture key ({purpose}) <fixture@example.invalid>\",\n"
+                f"        fingerprint: [{m['fingerprint'].lower()}],\n"
+                f"        algo: {algo},\n        bits: {bits},\n        created: {created},\n"
+                f"        expires: {'Some(' + str(expires) + ')' if expires else 'None'},\n"
+                f"        block: &[{block}],\n"
+                "    },\n"
+            ),
+            "armored_public": res.stdout,
+        })
+    return {
+        "where": "src/pkg/openpgp_test_keys.rs - the #[cfg(feature = \"lx_selftest\")] "
+                 "anchor file; add the literals to TEST_TRUST_ANCHORS",
+        "status": "not applied: extending the test anchor is a separate implementation task "
+                  "(captain's decision), so c01/c02 are built but not wired into any run",
+        "keys": entries,
+    }
+
+
 def build(args) -> None:
     out_root = os.path.abspath(args.out)
     os.makedirs(out_root, exist_ok=True)
@@ -602,6 +694,7 @@ def build(args) -> None:
             {"purpose": k["purpose"], "fingerprint": k["fingerprint"], "public": k["public"]}
             for k in keys_meta()["keys"]
         ],
+        "pending_anchor": pending_anchor(),
         "cases": manifest_cases,
         "not_constructible": NOT_CONSTRUCTIBLE,
     }
@@ -626,7 +719,9 @@ def check(args) -> None:
         with open(manifest_path, encoding="utf-8") as fh:
             for c in json.load(fh)["cases"]:
                 suites[c["id"]] = c.get("configured_suite", SUITE)
-    for cid in ["b01-untrusted-signer", "b05-expired-untrusted-signer", "b03-armor-crc-mismatch"]:
+    for cid in ["b01-untrusted-signer", "b05-expired-untrusted-signer",
+                "c01-pinned-expired-signer", "b03-armor-crc-mismatch",
+                "c02-pinned-not-yet-valid-signer"]:
         tree = os.path.join(out_root, cid, "dists", suites.get(cid, SUITE))
         if not os.path.isdir(tree):
             # A missing tree must fail the check: "nothing to verify" is not "verified".
@@ -642,6 +737,15 @@ def check(args) -> None:
                              env=dict(os.environ, GNUPGHOME=home))
         valid = "Good signature" in res.stderr or "Действительная подпись" in res.stderr \
             or res.returncode == 0
+        if cid == "c02-pinned-not-yet-valid-signer":
+            # By construction GnuPG cannot confirm this one at the current clock: the
+            # key is not yet valid, and gpgv has no way to fake its clock. The fixture
+            # is checked instead by asserting that gpgv *reports that exact reason*.
+            not_yet = "будущем" in (res.stderr + res.stdout) or "future" in (res.stderr + res.stdout)
+            print(f"{'ok ' if not_yet else 'FAIL'} {cid}: gpgv reports the key is not yet valid "
+                  f"(the fixture's whole point)")
+            ok &= not_yet
+            continue
         want = cid != "b03-armor-crc-mismatch"
         ok &= valid == want
         print(f"{'ok ' if valid == want else 'FAIL'} {cid}: gpgv says "

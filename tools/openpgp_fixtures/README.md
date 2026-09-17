@@ -83,6 +83,21 @@ the implementation — but it must be written down where users read it. Proposed
 > triplet (`Release` + `Packages` + `.deb`) is accepted. `Valid-Until` **is** enforced
 > whenever a suite carries it, and a signature or `Date` far in the future is refused.
 
+## Ready but intentionally unwired: the two `c*` cases
+
+`c01-pinned-expired-signer` and `c02-pinned-not-yet-valid-signer` live at the validity
+check, so they need the *test* key to be **pinned** — otherwise the refusal happens earlier
+(`NoTrustedSignature`) and the case proves nothing. They are built, their signatures are
+valid GnuPG signatures (gpgv confirms `c01`; for `c02` gpgv reports exactly "key created in
+the future", which *is* the condition under test), and `manifest.json::pending_anchor`
+carries ready-to-paste `PinnedKey` literals for `src/pkg/openpgp_test_keys.rs` plus the
+`TEST_TRUST_ANCHORS` row to add.
+
+They are **not wired into any run** on purpose: extending the trust anchor is a separate
+implementation task, not part of verification (t24 must check, not extend, what it checks).
+Until the anchor carries these keys, the same two conditions are covered by host properties
+P52/P53. `manifest.cases[].wired` distinguishes the 14 runnable cases from these two.
+
 ## What cannot be tested end-to-end, and why
 
 These failures need a **pinned** key to be expired/revoked/future-dated, or a signature by a
@@ -90,8 +105,10 @@ pinned key whose signed bytes we cannot produce — none of which we can create 
 Debian's private keys. They stay with the host properties; the manifest lists them under
 `not_constructible` with the property that covers each:
 
-`key/Expired`, `key/Revoked`, `key/NotYetValid`, `signature/FutureSignature`,
-`release/FutureDate`, `release/ValidUntilExpired`, `index/NoIndexEntry`.
+`key/Revoked`, `signature/FutureSignature`, `release/FutureDate`,
+`release/ValidUntilExpired`, `index/NoIndexEntry` — plus `key/Expired` and `key/NotYetValid`
+*until* the test anchor carries the two fixture keys (see `pending_anchor`; the `c*` cases
+are already built for that moment).
 
 One more is reachable but needs a harness flag: **`clock/ClockUnset`** requires the *guest*
 clock below 2025-01-01, i.e. QEMU `-rtc base=2020-01-01T00:00:00`; serve the `a01` tree with
