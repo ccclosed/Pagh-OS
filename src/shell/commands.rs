@@ -566,7 +566,7 @@ pub(super) fn cmd_selftest(_ctx: &mut ShellCtx, args: &[&str]) {
         .unwrap_or(1)
         .clamp(1, 10);
     shell_println("Running kernel self-test (output on serial)...");
-    let mut results: alloc::vec::Vec<(usize, u32)> = alloc::vec::Vec::new();
+    let mut results: alloc::vec::Vec<(usize, u32, u32)> = alloc::vec::Vec::new();
     for pass in 1..=passes {
         if passes > 1 {
             shell_println(&alloc::format!(
@@ -583,16 +583,22 @@ pub(super) fn cmd_selftest(_ctx: &mut ShellCtx, args: &[&str]) {
         // retains state — frames above all — makes the passes diverge here, while
         // the `[selftest] PMM hygiene` lines above show which direction the pool
         // moved. E2E greps this marker.
-        let (n0, f0) = results[0];
-        let (nl, fl) = *results.last().expect("at least one pass");
-        let diverged = results.iter().any(|(n, f)| *n != n0 || *f > f0);
+        let (n0, f0, s0) = results[0];
+        let (nl, fl, sl) = *results.last().expect("at least one pass");
+        // ANY divergence counts, skips included: a routine that silently stops
+        // running on the second pass is exactly the failure mode this checks for.
+        let diverged = results
+            .iter()
+            .any(|(n, f, sk)| *n != n0 || *f > f0 || *sk > s0);
         crate::kprintln!(
-            "SELFTEST IDEMPOTENCY: passes={} first={} routines/{} failed last={} routines/{} failed diverged={}",
+            "SELFTEST IDEMPOTENCY: passes={} first={} routines/{} failed/{} skipped last={} routines/{} failed/{} skipped diverged={}",
             passes,
             n0,
             f0,
+            s0,
             nl,
             fl,
+            sl,
             diverged
         );
     }

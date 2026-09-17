@@ -10,12 +10,57 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// stayed red while looking green.
 static FAILED_CHECKS: AtomicU32 = AtomicU32::new(0);
 
+/// Checks that were NOT executed because the environment could not support them
+/// (no block device, an exhausted frame pool, …).
+///
+/// A skip is NEVER a success: it is counted here, printed as its own `SKIP:` line
+/// and named in the summary together with the number of routines it affected. A
+/// suite that reports `0 failed checks` while a routine silently returned early is
+/// a verdict that means nothing — this counter is what makes the difference
+/// visible (a signal routine that could not spawn its kernel threads because the
+/// PMM was starved used to print `ok`).
+static SKIPPED_CHECKS: AtomicU32 = AtomicU32::new(0);
+
+/// Per-reason skip counts for the summary breakdown: `reason -> count`.
+static SKIP_REASONS: crate::sync::spinlock::Spinlock<
+    alloc::collections::BTreeMap<&'static str, u32>,
+> = crate::sync::spinlock::Spinlock::new(alloc::collections::BTreeMap::new());
+
 pub fn reset_failures() {
     FAILED_CHECKS.store(0, Ordering::Relaxed);
+    SKIPPED_CHECKS.store(0, Ordering::Relaxed);
+    SKIP_REASONS.lock().clear();
 }
 
 pub fn failed_checks() -> u32 {
     FAILED_CHECKS.load(Ordering::Relaxed)
+}
+
+/// Number of checks this routine reported as skipped.
+pub fn skipped_checks() -> u32 {
+    SKIPPED_CHECKS.load(Ordering::Relaxed)
+}
+
+/// Record one skipped check with its reason (never increments the success count).
+pub fn record_skip(reason: &'static str) {
+    SKIPPED_CHECKS.fetch_add(1, Ordering::Relaxed);
+    *SKIP_REASONS.lock().entry(reason).or_insert(0) += 1;
+}
+
+/// `reason xN, reason2 xM` for the summary line (empty string when nothing was
+/// skipped).
+pub fn skip_breakdown() -> alloc::string::String {
+    use alloc::string::ToString;
+    let mut out = alloc::string::String::new();
+    for (reason, n) in SKIP_REASONS.lock().iter() {
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        out.push_str(reason);
+        out.push_str(" x");
+        out.push_str(&n.to_string());
+    }
+    out
 }
 
 fn record_failure() {
@@ -30,6 +75,18 @@ macro_rules! assert_kernel {
         }
     };
 }
+/// Report a check that could NOT run (`no device`, `PMM starved`, …) — visibly.
+///
+/// Use this INSTEAD of `assert_kernel!(true, "... skipped")`, which printed an
+/// indistinguishable `ok` line and incremented nothing: a caller that wants to
+/// return early must call `skip_kernel!` and then `return`.
+macro_rules! skip_kernel {
+    ($reason:expr, $msg:expr) => {{
+        crate::test::record_skip($reason);
+        crate::kprintln!("SKIP: {}:{}: {} [{}]", file!(), line!(), $msg, $reason);
+    }};
+}
+
 macro_rules! assert_eq_kernel {
     ($left:expr, $right:expr, $msg:expr) => {
         if $left != $right {
@@ -408,7 +465,7 @@ mod vmm_prop_tests {
             Some(v) => v,
             None => {
                 // Every candidate is already mapped; skip without clobbering.
-                assert_kernel!(true, "vmm map/translate: all candidates mapped, skipped");
+                skip_kernel!("all candidates mapped", "vmm map/translate");
                 return;
             }
         };
@@ -417,7 +474,7 @@ mod vmm_prop_tests {
         let frame = match pmm::alloc_frame() {
             Some(f) => f,
             None => {
-                assert_kernel!(true, "vmm map/translate: no free frame, skipped");
+                skip_kernel!("no free frame", "vmm map/translate");
                 return;
             }
         };
@@ -430,7 +487,7 @@ mod vmm_prop_tests {
                 // Mapping failed (e.g. OOM building intermediates); clean up the
                 // leaf frame and skip.
                 pmm::free_frame(frame);
-                assert_kernel!(true, "vmm map/translate: map failed, skipped");
+                skip_kernel!("map failed", "vmm map/translate");
                 return;
             }
         }
@@ -471,7 +528,7 @@ mod vmm_prop_tests {
         let test_virt = match first_unmapped(&USER_TEST_VIRTS) {
             Some(v) => v,
             None => {
-                assert_kernel!(true, "vmm user-flag: all candidates mapped, skipped");
+                skip_kernel!("all candidates mapped", "vmm user-flag propagation");
                 return;
             }
         };
@@ -479,7 +536,7 @@ mod vmm_prop_tests {
         let frame = match pmm::alloc_frame() {
             Some(f) => f,
             None => {
-                assert_kernel!(true, "vmm user-flag: no free frame, skipped");
+                skip_kernel!("no free frame", "vmm user-flag propagation");
                 return;
             }
         };
@@ -493,7 +550,7 @@ mod vmm_prop_tests {
             Ok(()) => {}
             Err(_) => {
                 pmm::free_frame(frame);
-                assert_kernel!(true, "vmm user-flag: map failed, skipped");
+                skip_kernel!("map failed", "vmm user-flag propagation");
                 return;
             }
         }
@@ -1584,7 +1641,7 @@ mod virtio_blk_tests {
         let dev = match device() {
             Some(d) => d,
             None => {
-                assert_kernel!(true, "virtio-blk: no device, self-test skipped");
+                skip_kernel!("no block device", "virtio-blk round-trip");
                 return;
             }
         };
@@ -1592,7 +1649,7 @@ mod virtio_blk_tests {
         // Save the original sector so we can restore it (non-destructive).
         let mut orig = [0u8; SECTOR];
         if dev.read_block(SCRATCH_A, &mut orig).is_err() {
-            assert_kernel!(true, "virtio-blk: scratch sector out of range, skipped");
+            skip_kernel!("scratch sector out of range", "virtio-blk round-trip");
             return;
         }
 
@@ -1638,7 +1695,10 @@ mod virtio_blk_tests {
         let dev = match device() {
             Some(d) => d,
             None => {
-                assert_kernel!(true, "virtio-blk: no device, Property 14 skipped");
+                skip_kernel!(
+                    "no block device",
+                    "virtio-blk block round-trip (Property 14)"
+                );
                 return;
             }
         };
@@ -1693,7 +1753,10 @@ mod virtio_blk_tests {
         let dev = match device() {
             Some(d) => d,
             None => {
-                assert_kernel!(true, "virtio-blk: no device, Property 16 skipped");
+                skip_kernel!(
+                    "no block device",
+                    "virtio-blk virtqueue aliasing (Property 16)"
+                );
                 return;
             }
         };
@@ -2996,14 +3059,20 @@ mod fs_real_device_tests {
         let blk = match drivers::get_block("virtio-blk0") {
             Some(b) => b,
             None => {
-                assert_kernel!(true, "P18(real): no disk attached, skipped");
+                skip_kernel!(
+                    "no disk attached",
+                    "ext2 round-trip on the real device (Property 18)"
+                );
                 return;
             }
         };
         let root = match Ext2Fs::mount(blk) {
             Ok(r) => r,
             Err(_) => {
-                assert_kernel!(true, "P18(real): no ext2 filesystem, skipped");
+                skip_kernel!(
+                    "no ext2 filesystem",
+                    "ext2 round-trip on the real device (Property 18)"
+                );
                 return;
             }
         };
@@ -3283,10 +3352,6 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             elf_prop_tests::rejects_malformed
         ),
         (
-            "elf::fuzz header no panic (Property 8)",
-            elf_prop_tests::fuzz_header_no_panic
-        ),
-        (
             "log::level filter monotonicity",
             log_tests::level_filter_monotonicity
         ),
@@ -3402,6 +3467,13 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "shell::path/listing format behaviors (unit)",
             shell_prop_tests::unit_path_and_listing_format
+        ), // LAST on purpose: this routine feeds hostile sizes to the ELF loader
+        // and can consume (or leak) almost the whole PMM pool. Anything registered
+        // after it would silently run starved - and a starved routine reports a
+        // skip, not a pass, but the order must not be a trap in the first place.
+        (
+            "elf::fuzz header no panic (Property 8)",
+            elf_prop_tests::fuzz_header_no_panic
         ),
     ]
 }
@@ -3432,11 +3504,12 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
 /// PMM free counts, heap state, interrupt flags, VFS, etc. before returning),
 /// so `run_all` is safe to invoke on demand from the running shell. It is NOT
 /// run automatically during boot.
-pub fn run_all() -> (usize, u32) {
+pub fn run_all() -> (usize, u32, u32) {
     let tests = all_tests();
     let frames_before = crate::memory::pmm::free_frames();
     crate::kprintln!("=== kernel self-test ({} routines) ===", tests.len());
     let mut total_failed = 0u32;
+    let mut total_skipped = 0u32;
     for (name, f) in tests.iter() {
         crate::kprintln!("RUN  {}", name);
         // A failed check inside `f` prints its own `FAIL: file:line: msg` line
@@ -3444,11 +3517,22 @@ pub fn run_all() -> (usize, u32) {
         reset_failures();
         f();
         let failed = failed_checks();
+        let skipped = skipped_checks();
         total_failed += failed;
-        if failed == 0 {
-            crate::kprintln!("ok   {}", name);
-        } else {
+        total_skipped += skipped;
+        if failed > 0 {
             crate::kprintln!("FAIL {} ({} failed checks)", name, failed);
+        } else if skipped > 0 {
+            // A routine that could not run its checks is NOT `ok`: say so here and
+            // in the summary, with the reason.
+            crate::kprintln!(
+                "skip {} ({} check(s) skipped: {})",
+                name,
+                skipped,
+                skip_breakdown()
+            );
+        } else {
+            crate::kprintln!("ok   {}", name);
         }
     }
     crate::kprintln!("=== self-test complete ===");
@@ -3465,12 +3549,22 @@ pub fn run_all() -> (usize, u32) {
     );
     // Machine-readable verdict: grepping for `ok` is not one, and grepping for
     // `FAIL:` misses a routine that failed without printing (or vice versa).
-    crate::kprintln!(
-        "SELFTEST SUMMARY: {} routines, {} failed checks",
-        tests.len(),
-        total_failed
-    );
-    (tests.len(), total_failed)
+    if total_skipped > 0 {
+        crate::kprintln!(
+            "SELFTEST SUMMARY: {} routines, {} failed checks, {} skipped ({})",
+            tests.len(),
+            total_failed,
+            total_skipped,
+            skip_breakdown()
+        );
+    } else {
+        crate::kprintln!(
+            "SELFTEST SUMMARY: {} routines, {} failed checks, 0 skipped",
+            tests.len(),
+            total_failed
+        );
+    }
+    (tests.len(), total_failed, total_skipped)
 }
 
 // ============================================================================
