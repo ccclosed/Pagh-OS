@@ -226,6 +226,13 @@ pub mod tls_auth;
 #[path = "../../src/fs/format_policy.rs"]
 pub mod format_policy;
 
+// `procfs_format` is the pure text rendering + path/inode table behind the
+// synthetic `/proc` (issue #11, contract `docs/procfs.md`). `core` + `alloc` only
+// and self-contained, so the standalone `#[path]` include resolves with no extra
+// wiring; its properties live in the `procfs_*` files under `properties/`.
+#[path = "../../src/vfs/procfs_format.rs"]
+pub mod procfs_format;
+
 // ---------------------------------------------------------------------------
 // Property-test modules (P1..P28)
 // ---------------------------------------------------------------------------
@@ -292,6 +299,19 @@ mod properties {
     mod p47;
     mod p48;
     mod p49;
+    // procfs (issue #11, contract `docs/procfs.md` §7): meminfo columns + the
+    // libuv `strstr`/`sscanf` substrings; cpuinfo block/`\t: ` separators and the
+    // truthfulness of the `flags` line against the CPUID bits; uptime arithmetic
+    // and the `status` key set/formats; the NUL-joined `cmdline` byte fidelity;
+    // and the `maps` line/ordering plus the path-inode table and chroot
+    // predicate. Named rather than numbered because the numeric namespace is
+    // shared with the other issue streams.
+    mod procfs_cmdline;
+    mod procfs_cpuinfo;
+    mod procfs_maps;
+    mod procfs_meminfo;
+    mod procfs_status;
+
     // Boot-time device safety (issue #33): only a genuinely blank device is
     // formatted; GPT/MBR/foreign/ext2-like layouts are refused.
     mod p50;

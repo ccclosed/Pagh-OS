@@ -21,6 +21,22 @@ pub const SEEK_CUR: u32 = 1;
 /// `lseek` whence: set the offset to `delta` relative to the end of the file.
 pub const SEEK_END: u32 = 2;
 
+/// First path components that keep the VFS root as their base.
+///
+/// `/proc` (issue #11) is the reason this predicate exists as a named, testable
+/// unit: `resolve_path` must NOT rewrite `/proc/...` into `/mnt/proc/...`, or the
+/// synthetic tree would be unreachable for Linux programs. The comparison is by
+/// **whole component** — a path like `/process` is a guest path under `/mnt`, not
+/// a `/proc` path (`docs/procfs.md` §1.3).
+pub const ROOT_KEEPING_COMPONENTS: [&str; 5] = ["mnt", "dev", "proc", "sys", "tmp"];
+
+/// Does `abs` (an absolute, normalized guest path) resolve against the VFS root
+/// instead of being remapped under `/mnt`?
+pub fn guest_path_keeps_root(abs: &str) -> bool {
+    let first = abs.trim_start_matches('/').split('/').next().unwrap_or("");
+    ROOT_KEEPING_COMPONENTS.contains(&first)
+}
+
 /// Plan a `read` of `count` bytes from offset `off` of a file of length `size`.
 ///
 /// Returns `(copied, new_off)` where the byte count is clamped to what remains

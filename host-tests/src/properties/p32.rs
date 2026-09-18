@@ -9,7 +9,8 @@
 // on the host against the SAME source the kernel compiles (R11.6).
 
 use crate::dirent::{
-    dirent_reclen, encode_dirent64, record_reclen, DIRENT_HEADER, DT_DIR, DT_REG,
+    d_type_for, dirent_reclen, encode_dirent64, record_reclen, DIRENT_HEADER, DT_DIR, DT_LNK,
+    DT_REG,
 };
 use crate::timeconv::{bcd_to_bin, civil_to_unix, days_from_civil, encode_timeval};
 use proptest::prelude::*;
@@ -162,4 +163,44 @@ proptest! {
             1
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// d_type mapping (procfs, issue #11): a directory entry's type must come from the
+// node's VFS kind, and `/proc/self/exe` is the first `DT_LNK` this kernel emits.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn d_type_values_match_linux() {
+    assert_eq!(DT_UNKNOWN_VALUE, 0);
+    assert_eq!(DT_DIR, 4);
+    assert_eq!(DT_REG, 8);
+    assert_eq!(DT_LNK, 10, "linux_dirent64 d_type for a symlink");
+}
+
+/// Reference copy of the constant so the assertion above does not depend on the
+/// same name it is checking.
+const DT_UNKNOWN_VALUE: u8 = 0;
+
+#[test]
+fn d_type_for_is_kind_ordered() {
+    assert_eq!(d_type_for(true, false), DT_DIR);
+    assert_eq!(d_type_for(false, false), DT_REG);
+    assert_eq!(d_type_for(false, true), DT_LNK);
+    // A link is never reported as a directory, whatever the node says.
+    assert_eq!(d_type_for(true, true), DT_LNK);
+}
+
+#[test]
+fn encode_dirent64_round_trips_a_symlink_record() {
+    let rec = encode_dirent64(0x00F0_0000_0002, 3, DT_LNK, b"exe");
+    assert_eq!(record_reclen(&rec) as usize, rec.len());
+    assert_eq!(u16::from_le_bytes([rec[16], rec[17]]) as usize, rec.len());
+    assert_eq!(rec[18], DT_LNK);
+    assert_eq!(&rec[DIRENT_HEADER..DIRENT_HEADER + 3], b"exe");
+    assert_eq!(rec[DIRENT_HEADER + 3], 0, "name is NUL-terminated");
+    assert_eq!(
+        u64::from_le_bytes(rec[0..8].try_into().unwrap()),
+        0x00F0_0000_0002
+    );
 }

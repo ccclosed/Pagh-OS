@@ -15,6 +15,13 @@ pub const S_IFREG: u32 = 0o100000;
 /// File-type bits for a directory (`S_IFDIR`).
 pub const S_IFDIR: u32 = 0o040000;
 
+/// File-type bits for a symbolic link (`S_IFLNK`).
+///
+/// `/proc/self/exe` is the first node in this VFS that reports it: `lstat`
+/// (`newfstatat` with `AT_SYMLINK_NOFOLLOW`) uses `S_IFLNK | 0o777` and the
+/// link's target length as `st_size`, exactly like Linux.
+pub const S_IFLNK: u32 = 0o120000;
+
 /// A sane default block size reported in `st_blksize`.
 pub const DEFAULT_BLKSIZE: i64 = 4096;
 
