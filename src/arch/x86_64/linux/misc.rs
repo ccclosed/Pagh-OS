@@ -29,7 +29,6 @@ use super::timeconv::{encode_timeval, Timeval};
 /// the pure [`ticks_to_timespec`] so `clock_gettime` reports wall-ish time from the
 /// scheduler tick counter.
 use crate::arch::x86_64::apic::TICK_HZ;
-use crate::sync::spinlock::Spinlock;
 
 /// `arch_prctl` subfunction: set the `FS.base` register.
 const ARCH_SET_FS: u64 = 0x1002;
@@ -169,31 +168,33 @@ pub fn sys_getrandom(buf: u64, count: u64, _flags: u64) -> Result<u64, Errno> {
 }
 
 /// Produce the ELF `AT_RANDOM` block. Hardware entropy (RDSEED/RDRAND) is
-/// preferred. When the platform exposes none, the bytes are mixed from every
-/// cheap entropy source the kernel has — the tick clock, the RTC wall clock,
-/// the current pid, and a free-running process-lifetime counter — through a
-/// xorshift generator, so the block NEVER degrades to all-zero bytes
-/// (glibc consumes AT_RANDOM for stack-canary / pointer-mangling keys; a
-/// constant value defeats both).
+/// preferred. When the platform exposes none, the block is derived from the
+/// **mixed boot seed** ([`crate::security::entropy::mixed_fill`]): several
+/// independent boot-time sources folded through SHA-256, plus a per-call counter
+/// and the observable inputs (issue #16).
+///
+/// WHY NOT A FALLBACK PRNG: the previous implementation mixed the tick clock, the
+/// RTC, the pid and a fixed constant (the hardware-entropy term —
+/// `secure_u64().unwrap_or(0)` — is necessarily zero on this path, and there was
+/// no free-running counter, whatever the old comment claimed) through a 64-bit
+/// xorshift. That is a *linear* stream over values an attacker observes or
+/// guesses, so every process's glibc stack-canary/pointer-mangling key was
+/// predictable whenever RDSEED/RDRAND was absent, and it did not even guarantee a
+/// non-zero block (zero is reachable for particular tick values; issue #16). The
+/// boot seed is not derivable from those observables, and the degradation is
+/// announced once at boot (`stage=degraded` in the entropy warning) instead of
+/// being silent. `sys_getrandom` keeps failing closed with `EAGAIN`; it never
+/// serves these bytes.
+///
+/// Never panics and never fails: glibc reads `AT_RANDOM` unconditionally at
+/// process start, so refusing to produce it would mean refusing to start the
+/// process.
 pub fn random_bytes_16() -> [u8; 16] {
     let mut out = [0u8; 16];
     if crate::security::entropy::fill(&mut out).is_ok() {
         return out;
     }
-    static FALLBACK_STATE: Spinlock<u64> = Spinlock::new(0x9E37_79B9_7F4A_7C15);
-    let mut g = FALLBACK_STATE.lock();
-    let mut x = *g
-        ^ scheduler::ticks().wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ (rtc::now_unix() as u64).rotate_left(32)
-        ^ scheduler::current_pid() << 48
-        ^ crate::security::entropy::secure_u64().unwrap_or(0);
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    let second = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    *g = x;
-    out[..8].copy_from_slice(&x.to_le_bytes());
-    out[8..].copy_from_slice(&second.to_le_bytes());
+    crate::security::entropy::mixed_fill(&mut out);
     out
 }
 

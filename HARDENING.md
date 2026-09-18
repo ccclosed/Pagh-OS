@@ -11,6 +11,9 @@ This branch implements the safe foundation of the four-stage review plan.
 - Network package installation is feature-gated: the development build enables it through the default `network_packages` feature (the low-level `insecure_network_demo` gate that feature turns on keeps its historical name, but the HTTPS transport it enables now authenticates the mirror fail-closed); `cargo build --no-default-features` remains fail-closed.
 - Hardware-backed, fail-closed entropy API using RDSEED/RDRAND.
 - Linux `getrandom` returns `EAGAIN` when secure entropy is unavailable.
+- ELF `AT_RANDOM` is the one caller that cannot fail closed (glibc reads it unconditionally): without
+  RDSEED/RDRAND it derives from a mixed boot seed (issue #16), announces the degradation once at boot
+  (`entropy: stage=degraded …`) and is documented as best-effort in `SECURITY.md`.
 - TLS demo refuses to start without hardware entropy.
 - User-pointer validation now requires `USER_ACCESSIBLE` at every page-table level, not merely a present mapping.
 - A narrow page-flag inspection API and a CI check for undocumented unsafe in trust-boundary modules.
