@@ -2,6 +2,12 @@
 name = "pagh"
 version = "2.5.0"
 edition = "2021"
+# SPDX identifier for the MIT license in `LICENSE` (Copyright (c) 2026 ccclosed).
+# Declared here as well as in the file: packaging tools, grant paperwork and
+# dependency scanners read `Cargo.toml`, not the license text.
+license = "MIT"
+description = "A small 64-bit OS kernel in Rust: ext2 + WAL, own TCP/IP stack, Linux ABI compat layer, UEFI boot via Limine"
+repository = "https://github.com/ccclosed/Pagh-OS"
 
 [workspace]
 # `host-tests` is an isolated host crate for proptest-based property tests. It must
