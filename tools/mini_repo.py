@@ -16,8 +16,8 @@ of `src/selftest_lx.rs::build_linux_test_elf`, so the kernel's `run_linux_binary
 loads and runs it.
 
 Usage:
-    python tools/mini_repo.py build              # just (re)build the tree
-    python tools/mini_repo.py serve [port]       # build, then serve (default 8000)
+    python3 tools/mini_repo.py build              # just (re)build the tree
+    python3 tools/mini_repo.py serve [port]       # build, then serve (default 8000)
 
 When serving, the server binds 0.0.0.0 so the QEMU user-net host gateway
 (10.0.2.2) reaches it from inside the guest.
@@ -380,7 +380,7 @@ def serve(port: int) -> None:
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "build"
 
-    # DIAGNOSTIC mode: `python mini_repo.py bigindex [N] [port]` builds a LARGE
+    # DIAGNOSTIC mode: `python3 mini_repo.py bigindex [N] [port]` builds a LARGE
     # synthetic Packages.gz (default 60000 stanzas) and serves it over local HTTP
     # so the kernel apt-update parse-stage crash reproduces without the live CDN.
     if mode == "bigindex":

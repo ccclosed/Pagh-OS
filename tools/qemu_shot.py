@@ -17,17 +17,17 @@ Examples
 Boot a fresh instance, answer the base-package question with ``n``, wait for the
 shell prompt and screenshot it::
 
-    python tools/qemu_shot.py --boot --answer-n --out /tmp/pagh-shell.png
+    python3 tools/qemu_shot.py --boot --answer-n --out /tmp/pagh-shell.png
 
 Type a command and capture the result::
 
-    python tools/qemu_shot.py --boot --answer-n --keys "selftest\\n" \\
+    python3 tools/qemu_shot.py --boot --answer-n --keys "selftest\\n" \\
         --settle 60 --out /tmp/pagh-selftest.png
 
 Reuse an instance that is already running (any QEMU started with a monitor
 socket, e.g. ``-monitor unix:/tmp/pagh_mon.sock,server,nowait``)::
 
-    python tools/qemu_shot.py --monitor /tmp/pagh_mon.sock --keys "help\\n" --out /tmp/pagh-help.png
+    python3 tools/qemu_shot.py --monitor /tmp/pagh_mon.sock --keys "help\\n" --out /tmp/pagh-help.png
 
 The screenshot is a normal PNG; open it, or read it with an image-capable tool.
 """
@@ -240,7 +240,7 @@ def boot(args: argparse.Namespace) -> tuple[subprocess.Popen, Monitor]:
     """Start QEMU headless with a monitor socket and a serial log."""
     iso_root = ROOT / "iso_root"
     if not (iso_root / "pagh.elf").exists():
-        raise SystemExit("error: iso_root/pagh.elf missing — run `python tools/build.py stage --release` first")
+        raise SystemExit("error: iso_root/pagh.elf missing — run `python3 tools/build.py stage --release` first")
     disk = pathlib.Path(args.disk)
     if not disk.is_absolute():
         disk = ROOT / disk
