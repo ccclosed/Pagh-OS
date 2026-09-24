@@ -194,6 +194,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
 
 ## Known open gaps (good first issues, all documented in-code)
 
+
 - procfs covers its first slice only (issue #11, contract `docs/procfs.md`):
   `/proc/{cpuinfo,meminfo,uptime}` and `/proc/self/{exe,cmdline,status,maps}` are
   rendered from live kernel state (CPUID, PMM counters, the tick clock, the calling
@@ -202,8 +203,11 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `/proc/<pid>` enumeration, `/proc/stat` (needs real user/sys/idle tick
   accounting), `/proc/loadavg`, `/proc/mounts`, `/proc/self/{fd,stat,statm}` — so
   `htop`/`ps` are still out of reach.
-- Signals: delivery happens at the syscall-return point; no timer-tick
-  delivery, no `kill(2)`/group broadcast, no SIGSTOP/SIGCONT scheduling.
+- Signals: delivery happens only at the syscall-return point. `kill(2)` (nr 62),
+  process-group addressing (`kill(0|-1|-pgid)`) and `SIGSTOP`/`SIGCONT` scheduling
+  are implemented; there is still no timer-tick delivery, so a CPU-bound loop with
+  no syscalls never sees a signal.
+
 - NVMe driver is polled and page-chunked; FLUSH (opcode 0x08) is issued at WAL
   transaction boundaries, but there are no PRP lists and no queue depth > 1.
   (The former "embedded-tls hangs on large streams" gap is closed: a multi-MB

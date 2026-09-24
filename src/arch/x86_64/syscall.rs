@@ -148,12 +148,19 @@ core::arch::global_asm!(
     "    push r15",
     // rsp now points at the SavedRegs frame (r15 at offset 0). Pass it as the
     // sole (rdi) argument to linux_dispatch. rsp is 16-byte aligned here (see
-    // header). rsi carries the second argument, REENTRY_ALLOWED: this is a real
-    // syscall on a schedulable task, so the dispatcher may unmask interrupts
-    // (blocking handlers need the timer tick). rsi is free to clobber — the
-    // caller's value was pushed into the frame above.
+    // header). rsi carries the second argument: REENTRY_ALLOWED | INT80_ENTRY
+    // (1 | 2). Bit 0 says this is a real syscall on a schedulable task, so the
+    // dispatcher may unmask interrupts (blocking handlers need the timer tick).
+    // Bit 1 records the entry path as `int 0x80`: AGENTS.md invariant 2 forbids
+    // that for a Compat_Process, because the CPU-pushed frame makes the word at
+    // SavedRegs+120 the user RIP, not the per-task user-RSP slot signal delivery
+    // reads. `linux_dispatch` marks the process so the signal path refuses frame
+    // delivery instead of corrupting the user's code. The legacy native ring-3
+    // test process is unaffected (no compat state; its 1/2/3 numbers keep the
+    // legacy routing). rsi is free to clobber — the caller's value was pushed
+    // into the frame above.
     "    mov rdi, rsp",
-    "    mov esi, 1",
+    "    mov esi, 3",
     "    call linux_dispatch",
     // Write the dispatcher's return value into the saved rax slot (offset 112).
     "    mov [rsp + 112], rax",

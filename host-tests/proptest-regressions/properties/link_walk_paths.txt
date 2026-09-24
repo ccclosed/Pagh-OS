@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc abc3c818e2243c7cf1abf8ec01e767750e584c2be1952eaec2b4770856d23d6c # shrinks to spec = [("c", 2, "/x")], path = "/mnt/c/x", follow = false

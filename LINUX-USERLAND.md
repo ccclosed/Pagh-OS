@@ -9,10 +9,11 @@ full-screen TUIs such as `nvim`.
 
 - Static `ET_EXEC` and static-PIE binaries (musl/busybox-style).
 - Dynamic binaries: the loader reads `PT_INTERP`, maps glibc’s `ld-linux-x86-64.so.2`
-  from the ext2 disk, and lets it resolve shared libraries. If the literal interpreter
-  path is missing (Debian ships it as a symlink), the loader falls back to the
-  merged-`/usr` locations (`/mnt/usr/lib/x86_64-linux-gnu/`, `/mnt/usr/lib64/`,
-  `/mnt/lib64/`).
+  from the ext2 disk, and lets it resolve shared libraries. The literal interpreter
+  path is resolved **through symbolic links** (`/lib64/ld-linux-x86-64.so.2` is a real
+  link now, issue #18), and the merged-`/usr` locations
+  (`/mnt/usr/lib/x86_64-linux-gnu/`, `/mnt/usr/lib64/`, `/mnt/lib64/`) remain as a
+  fallback for images that ship no link at all.
 - `LD_LIBRARY_PATH` for `lxrun` children includes `/mnt/usr/lib/x86_64-linux-gnu`,
   where `apt` actually installs libraries.
 - The kernel itself is built without SSE/AVX (soft-float), so user-space SIMD
@@ -64,9 +65,10 @@ The thread is idempotent; delete `disk.img` to re-provision from scratch.
 
 ## Installer details
 
-- tar entries of type symlink/hardlink are **materialized as file copies** (the ext2
-  writer has no symlink support). Chains and relative targets are resolved; unresolvable
-  links produce one serial warning each.
+- The ext2 writer and the VFS resolve real symlinks and hard links: `readlink`, `lstat`
+  (S_IFLNK), `stat`/`open` following, `ELOOP` on cycles, `st_nlink` from `i_links_count`
+  (issue #18). The tar side (t16) still materializes symlink/hardlink members as file
+  copies until it is switched over; see `EXT2-LINKS.md`.
 - Large files are written in bounded WAL transactions (see `EXT2-RECOVERY.md`), so
   multi-hundred-KiB payloads install reliably.
 
@@ -74,20 +76,24 @@ The thread is idempotent; delete `disk.img` to re-provision from scratch.
 
 These return `-ENOSYS` or a stub (logged once per syscall number per process):
 
-- POSIX signal delivery: `rt_sigaction`/`rt_sigprocmask`/`sigaltstack` record state but
-  no signals are ever delivered; `tgkill` with a fatal signal aimed at the calling
-  process terminates it with the conventional `128+sig` code (this is how glibc
-  `abort()` ends).
+- Signals: delivery is real but happens **only at the syscall-return point**
+  (`rt_sigaction` handlers get a real `rt_sigframe`, `rt_sigreturn` restores the
+  context, `EINTR` wakes the patched blocking waits, `kill(2)`/`tgkill` send
+  signals including process-group broadcasts, and `SIGSTOP`/`SIGCONT` park/resume
+  the task with `wait4(WUNTRACED)`/`WCONTINUED` reporting both state changes).
+  Delivery from the timer-tick return path is still missing, so a CPU-bound loop
+  that never enters a syscall does not see a signal.
 - `timerfd` — programs needing timerfd descriptors still fail.
 - `procfs` covers the first slice only (issue #11): `/proc/cpuinfo`, `/proc/meminfo`,
   `/proc/uptime` and `/proc/self/{exe,cmdline,status,maps}`, rendered from live kernel
   state (contract: `docs/procfs.md`). `/proc/<pid>`, `/proc/stat`, `/proc/loadavg` and
   `/proc/self/fd` return `ENOENT`, so `htop`/`ps` still do not work; `sysfs` does not
   exist at all.
-- The ext2 writer has no symlink support (installer materializes links as copies).
+- Symbolic/hard links exist on ext2 and resolve through the VFS (issue #18); the *installer*
+  still materializes tar links as copies until t16 switches it over (`EXT2-LINKS.md`).
 
 So: batch/console programs, the CPython REPL, and event-loop TUIs (`nvim`) run; the
-remaining gaps are POSIX signals, timerfd, and procfs.
+remaining gaps are timer-tick signal delivery/SIGSTOP-SIGCONT, timerfd, and procfs.
 
 ## Troubleshooting
 

@@ -197,13 +197,20 @@ pub fn sys_futex(
     }
 }
 
-// STAGE 16.15: bash with job control calls wait4 with WUNTRACED; we never
-// stop/continue processes, so WUNTRACED/WCONTINUED are accepted as no-ops.
-const WNOHANG: u64 = 1;
-const WUNTRACED: u64 = 2;
-const WCONTINUED: u64 = 8;
+// bash with job control calls wait4 with WUNTRACED (and WCONTINUED since Linux
+// 2.6.10). Both are real now: a stopped child is parked by the signal path
+// (`signal::stop_current_group`) and reports `(stopsig << 8) | 0x7f`, a child
+// resumed by SIGCONT reports `0xffff`. Each event is reported ONCE — the report
+// consumes the registry entry (`compat::reap_child_stop` /
+// `reap_child_continued`), so a wait loop advances instead of re-reporting.
+pub const WNOHANG: u64 = 1;
+pub const WUNTRACED: u64 = 2;
+pub const WCONTINUED: u64 = 8;
 const RUSAGE_SIZE: u64 = 18 * 8;
 pub fn sys_wait4(pid: u64, status: u64, options: u64, rusage: u64) -> Result<u64, Errno> {
+    use crate::arch::x86_64::linux::signal_frame::{
+        wait_status_exited, wait_status_stopped, WAIT_STATUS_CONTINUED,
+    };
     if options & !(WNOHANG | WUNTRACED | WCONTINUED) != 0 {
         return Err(Errno::EINVAL);
     }
@@ -219,14 +226,44 @@ pub fn sys_wait4(pid: u64, status: u64, options: u64, rusage: u64) -> Result<u64
     }
     let parent = crate::task::scheduler::current_pid();
     loop {
+        // Report order: a real exit wins over a state change (the exit path drops
+        // the child's pending stop/continue reports), then the stop (WUNTRACED),
+        // then the continue (WCONTINUED). Each arm consumes its event.
         if let Some((child, code)) = crate::task::compat::reap_child(parent, wanted) {
             if status != 0 {
-                unsafe { ptr::write_unaligned(status as *mut u32, (code as u32) << 8) }
+                unsafe { ptr::write_unaligned(status as *mut u32, wait_status_exited(code)) }
             }
             if rusage != 0 {
                 unsafe { ptr::write_bytes(rusage as *mut u8, 0, RUSAGE_SIZE as usize) }
             }
             return Ok(child);
+        }
+        if options & WUNTRACED != 0 {
+            if let Some((child, stopsig)) = crate::task::compat::reap_child_stop(parent, wanted) {
+                if status != 0 {
+                    unsafe {
+                        ptr::write_unaligned(
+                            status as *mut u32,
+                            wait_status_stopped(stopsig as u64),
+                        )
+                    }
+                }
+                if rusage != 0 {
+                    unsafe { ptr::write_bytes(rusage as *mut u8, 0, RUSAGE_SIZE as usize) }
+                }
+                return Ok(child);
+            }
+        }
+        if options & WCONTINUED != 0 {
+            if let Some(child) = crate::task::compat::reap_child_continued(parent, wanted) {
+                if status != 0 {
+                    unsafe { ptr::write_unaligned(status as *mut u32, WAIT_STATUS_CONTINUED) }
+                }
+                if rusage != 0 {
+                    unsafe { ptr::write_bytes(rusage as *mut u8, 0, RUSAGE_SIZE as usize) }
+                }
+                return Ok(child);
+            }
         }
         if !crate::task::compat::has_child(parent, wanted) {
             return Err(Errno::ECHILD);

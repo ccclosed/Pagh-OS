@@ -6,6 +6,10 @@ pub mod elf;
 /// R11.6). Kept separate from `elf` so it carries no kernel/paging dependencies;
 /// `elf` re-exports its public items.
 pub mod elf_classify;
+/// Pure, host-testable symbolic-link path resolution (issue #18): component
+/// walk, `..` stack, relative/absolute link targets, `SYMLOOP_MAX` budget. The
+/// adapter below feeds it `Arc<dyn VfsNode>` handles.
+pub mod link_walk;
 /// In-memory `/tmp` (the only part of the tree with real
 /// `create_dir`/`create_file` support).
 pub mod procfs;
@@ -96,6 +100,28 @@ pub trait VfsNode: Send + Sync {
     /// target".
     fn read_link(&self) -> Option<String> {
         None
+    }
+
+    /// Number of hard links to this node — Linux's `st_nlink`.
+    ///
+    /// ext2 overrides this with `i_links_count` (a hard-linked file reports how
+    /// many names point at it, a directory `2 + subdirs`); synthetic nodes
+    /// (`/dev`, `/proc`) keep the default of one.
+    fn nlink(&self) -> u64 {
+        1
+    }
+
+    /// Create a symbolic link `name` pointing at the raw bytes `target`
+    /// (issue #18). Default `NotSupported`: only writable directories (ext2)
+    /// can hold one.
+    fn create_symlink(&self, _name: &str, _target: &[u8]) -> VfsResult<Arc<dyn VfsNode>> {
+        Err(VfsError::NotSupported)
+    }
+
+    /// Create the hard link `name` pointing at the existing node `target` — the
+    /// same inode under a second name (issue #18). Default `NotSupported`.
+    fn link(&self, _name: &str, _target: &Arc<dyn VfsNode>) -> VfsResult<Arc<dyn VfsNode>> {
+        Err(VfsError::NotSupported)
     }
 
     // ── mutating directory operations (Task 5.2) ──
@@ -257,6 +283,15 @@ impl VfsNode for MountNode {
     fn read_link(&self) -> Option<String> {
         self.inner.read_link()
     }
+    fn nlink(&self) -> u64 {
+        self.inner.nlink()
+    }
+    fn create_symlink(&self, name: &str, target: &[u8]) -> VfsResult<Arc<dyn VfsNode>> {
+        self.inner.create_symlink(name, target)
+    }
+    fn link(&self, name: &str, target: &Arc<dyn VfsNode>) -> VfsResult<Arc<dyn VfsNode>> {
+        self.inner.link(name, target)
+    }
     fn create_dir(&self, name: &str) -> VfsResult<Arc<dyn VfsNode>> {
         self.inner.create_dir(name)
     }
@@ -411,4 +446,100 @@ pub fn lookup_path(path: &str) -> VfsResult<Arc<dyn VfsNode>> {
     }
 
     Ok(node)
+}
+
+/// Resolve an absolute path, following symbolic links (issue #18).
+///
+/// `lookup_path` above stays the single-step, no-follow primitive (it returns the
+/// link node itself), which is what `readlink`, `lstat`, `unlink` and `rmdir`
+/// need. Everything that talks about "the file the path names" —
+/// `stat`/`open`/`access`/`chdir`/`execve` — goes through this walker instead:
+///
+///   * intermediate links are always followed, the last one only when
+///     `follow_final` is set;
+///   * a crossed link splices its target ahead of the remaining components
+///     (relative targets against the link's directory, absolute ones from the
+///     root), with Linux's `SYMLOOP_MAX` budget → [`link_walk::WalkError::TooManyLinks`];
+///   * an intermediate non-directory is [`link_walk::WalkError::NotDir`], and the
+///     expanded path is capped ([`link_walk::WalkError::TooLong`]).
+///
+/// The algorithm itself lives in the pure [`link_walk`] module; this function is
+/// only the `Arc<dyn VfsNode>` adapter, so the walk is property-tested on the
+/// host (R11.6).
+pub fn lookup_path_walk(
+    path: &str,
+    follow_final: bool,
+) -> Result<Arc<dyn VfsNode>, link_walk::WalkError> {
+    if !path.starts_with('/') {
+        return Err(link_walk::WalkError::NotFound);
+    }
+    let root = VFS_ROOT
+        .lock()
+        .clone()
+        .ok_or(link_walk::WalkError::NotFound)?;
+    // Node handles for this resolution: the pure walker works on `usize` ids and
+    // never sees an `Arc`, so the adapter interns every node it hands out.
+    let mut nodes = WalkNodes {
+        nodes: alloc::vec![Arc::clone(&root)],
+        root: 0,
+    };
+    let id = link_walk::resolve(&mut nodes, path, follow_final)?;
+    nodes
+        .nodes
+        .get(id)
+        .cloned()
+        .ok_or(link_walk::WalkError::NotFound)
+}
+
+/// `Arc<dyn VfsNode>` interner behind [`lookup_path_walk`].
+struct WalkNodes {
+    nodes: alloc::vec::Vec<Arc<dyn VfsNode>>,
+    root: usize,
+}
+
+impl WalkNodes {
+    fn intern(&mut self, node: Arc<dyn VfsNode>) -> usize {
+        for (i, existing) in self.nodes.iter().enumerate() {
+            if Arc::ptr_eq(existing, &node) {
+                return i;
+            }
+        }
+        self.nodes.push(node);
+        self.nodes.len() - 1
+    }
+}
+
+impl link_walk::LinkTree for WalkNodes {
+    fn root(&self) -> usize {
+        self.root
+    }
+
+    fn lookup(&mut self, id: usize, name: &str) -> Option<usize> {
+        let child = self.nodes.get(id)?.lookup(name).ok()?;
+        Some(self.intern(child))
+    }
+
+    fn is_dir(&self, id: usize) -> bool {
+        self.nodes
+            .get(id)
+            .map(|n| n.is_directory())
+            .unwrap_or(false)
+    }
+
+    fn link_target(&self, id: usize) -> Option<link_walk::LinkTarget> {
+        let node = self.nodes.get(id)?;
+        if !node.is_symlink() {
+            return None;
+        }
+        match node.read_link() {
+            // Target read: interpret it in the guest namespace (`/x` → `/mnt/x`).
+            Some(target) if !target.is_empty() => Some(link_walk::map_guest_target(&target)),
+            // A link whose target is empty or unreadable must fail the walk
+            // (`ENOENT`), never silently resolve to the link node itself.
+            _ => Some(link_walk::LinkTarget {
+                path: String::new(),
+                absolute: false,
+            }),
+        }
+    }
 }

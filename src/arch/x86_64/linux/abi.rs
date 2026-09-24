@@ -130,6 +130,11 @@ pub mod nr {
     pub const EXIT: u64 = 60;
     /// wait4 — wait for a child process.
     pub const WAIT4: u64 = 61;
+    /// `kill` — send a signal to a process, process group, or every process.
+    /// Argument decoding + target classification live in [`super::kill`]
+    /// (host-tested by `p51`); the effectful handler is
+    /// [`super::signal::sys_kill`].
+    pub const KILL: u64 = 62;
     /// `uname` — get system identification.
     pub const UNAME: u64 = 63;
     /// `fcntl` — file descriptor control.
@@ -240,127 +245,162 @@ pub fn marshal_args(
     (rax, [rdi, rsi, rdx, r10, r8, r9])
 }
 
+/// The complete `Supported_Syscall_Set` (R2.1) — the single source of truth for
+/// both the dispatch gate and the exactness test.
+///
+/// Written as `nr::` NAMES, not bare numbers, so the list is self-documenting and
+/// cannot drift from the constants the dispatcher matches on. Every entry has a
+/// real arm in `linux::dispatch_supported` (the two entries routed specially by
+/// `linux_dispatch` itself — `execve`, `clone`, `rt_sigreturn` — are members
+/// too, since they pass the gate on the way there); a number NOT here returns
+/// `-ENOSYS` before any argument pointer is inspected (R1.4, R11.4, R11.5).
+/// The list is strictly ascending, so [`is_supported`] can binary-search it.
+///
+/// ## Maintenance contract (three edits, same commit)
+///
+/// Adding a syscall means: an `nr::` constant, a `dispatch_supported` arm, and
+/// this list. The two runtime-visible halves are then checked from both ends:
+///
+///   * the `supported_set_is_exact` test compares this list against an
+///     INDEPENDENT literal enumeration of the numbers (so a typo in a constant
+///     or a missing/extra entry fails on the host), asserts strict ascending
+///     order (so a duplicated or misplaced entry fails), and walks `0..=600`
+///     in BOTH directions (accepted here ⇒ gated in; not here ⇒ `-ENOSYS`);
+///   * the `dispatch_supported` fallback arm logs
+///     `nr has NO dispatch arm` and returns `ENOSYS` — the reverse drift
+///     (gated in, no arm) therefore announces itself instead of silently
+///     turning a syscall into a permanent `ENOSYS`.
+///
+/// Match arms cannot be introspected from a test, so this list is the manual
+/// enumeration of the dispatcher's coverage; the test locks the numbers and the
+/// fallback tripwire locks the arms.
+///
+/// History note: the previous test asserted membership for only 69 of the 109
+/// numbers the gate accepted and never asserted that anything was *unsupported*,
+/// so it could not catch either class of drift.
+pub const SUPPORTED_SYSCALLS: [u64; 110] = [
+    nr::READ,
+    nr::WRITE,
+    nr::OPEN,
+    nr::CLOSE,
+    nr::FSTAT,
+    nr::POLL,
+    nr::LSEEK,
+    nr::MMAP,
+    nr::MPROTECT,
+    nr::MUNMAP,
+    nr::BRK,
+    nr::RT_SIGACTION,
+    nr::RT_SIGPROCMASK,
+    nr::RT_SIGRETURN,
+    nr::IOCTL,
+    nr::PREAD64,
+    nr::PWRITE64,
+    nr::READV,
+    nr::WRITEV,
+    nr::ACCESS,
+    nr::PIPE,
+    nr::SELECT,
+    nr::SCHED_YIELD,
+    nr::MREMAP,
+    nr::MADVISE,
+    nr::DUP,
+    nr::DUP2,
+    nr::NANOSLEEP,
+    nr::GETPID,
+    nr::SOCKET,
+    nr::CONNECT,
+    nr::ACCEPT,
+    nr::SENDTO,
+    nr::RECVFROM,
+    nr::BIND,
+    nr::LISTEN,
+    nr::GETSOCKNAME,
+    nr::SOCKETPAIR,
+    nr::SETSOCKOPT,
+    nr::GETSOCKOPT,
+    nr::CLONE,
+    nr::EXECVE,
+    nr::EXIT,
+    nr::WAIT4,
+    nr::KILL,
+    nr::UNAME,
+    nr::FCNTL,
+    nr::FLOCK,
+    nr::FSYNC,
+    nr::FDATASYNC,
+    nr::GETCWD,
+    nr::CHDIR,
+    nr::FCHDIR,
+    nr::RENAME,
+    nr::MKDIR,
+    nr::RMDIR,
+    nr::UNLINK,
+    nr::READLINK,
+    nr::CHMOD,
+    nr::UMASK,
+    nr::GETTIMEOFDAY,
+    nr::GETRLIMIT,
+    nr::SYSINFO,
+    nr::GETUID,
+    nr::GETGID,
+    nr::GETEUID,
+    nr::GETEGID,
+    nr::SETPGID,
+    nr::GETPPID,
+    nr::GETPGRP,
+    nr::SETSID,
+    nr::GETPGID,
+    nr::SIGALTSTACK,
+    nr::STATFS,
+    nr::FSTATFS,
+    nr::ARCH_PRCTL,
+    nr::GETTID,
+    nr::TIME,
+    nr::FUTEX,
+    nr::GETDENTS64,
+    nr::SET_TID_ADDRESS,
+    nr::CLOCK_SETTIME,
+    nr::CLOCK_GETTIME,
+    nr::CLOCK_GETRES,
+    nr::CLOCK_NANOSLEEP,
+    nr::EXIT_GROUP,
+    nr::EPOLL_WAIT,
+    nr::EPOLL_CTL,
+    nr::TGKILL,
+    nr::OPENAT,
+    nr::NEWFSTATAT,
+    nr::RENAMEAT,
+    nr::READLINKAT,
+    nr::PSELECT6,
+    nr::PPOLL,
+    nr::SET_ROBUST_LIST,
+    nr::GET_ROBUST_LIST,
+    nr::EPOLL_PWAIT,
+    nr::ACCEPT4,
+    nr::EVENTFD2,
+    nr::EPOLL_CREATE1,
+    nr::DUP3,
+    nr::PIPE2,
+    nr::PREADV,
+    nr::PWRITEV,
+    nr::PRLIMIT64,
+    nr::RENAMEAT2,
+    nr::GETRANDOM,
+    nr::STATX,
+    nr::RSEQ,
+];
+
 /// Test whether `nr` is a member of the `Supported_Syscall_Set` (R2.1).
 ///
-/// Returns `true` for exactly the enumerated numbers and `false` for everything
-/// else — including the explicitly out-of-scope `clone` (56), `fork` (57),
-/// `vfork` (58), and `futex` (202), as well as any graphical/windowing syscall
-/// number (R1.4, R11.4, R11.5). The dispatcher uses this gate to return `-ENOSYS`
-/// before inspecting any argument pointer.
+/// A binary search of [`SUPPORTED_SYSCALLS`], so the gate and the enumerated
+/// table can never disagree. Returns `false` for every number not in the table,
+/// including the still-out-of-scope `fork` (57) and `vfork` (58) and any
+/// graphical/windowing syscall number (R1.4, R11.4, R11.5). The dispatcher uses
+/// this gate to return `-ENOSYS` before inspecting any argument pointer.
 #[inline]
 pub fn is_supported(nr: u64) -> bool {
-    matches!(
-        nr,
-        nr::READ
-            | nr::WRITE
-            | nr::OPEN
-            | nr::CLOSE
-            | nr::FSTAT
-            | nr::POLL
-            | nr::SELECT
-            | nr::PSELECT6
-            | nr::PPOLL
-            | nr::LSEEK
-            | nr::MMAP
-            | nr::MPROTECT
-            | nr::MUNMAP
-            | nr::MREMAP
-            | nr::MADVISE
-            | nr::TGKILL
-            | nr::BRK
-            | nr::RT_SIGACTION
-            | nr::RT_SIGPROCMASK
-            | nr::RT_SIGRETURN
-            | nr::IOCTL
-            | nr::PREAD64
-            | nr::PWRITE64
-            | nr::WRITEV
-            | nr::READV
-            | nr::PREADV
-            | nr::PWRITEV
-            | nr::FSYNC
-            | nr::FDATASYNC
-            | nr::RENAME
-            | nr::RENAMEAT
-            | nr::RENAMEAT2
-            | nr::ACCESS
-            | nr::PIPE
-            | nr::SCHED_YIELD
-            | nr::DUP
-            | nr::DUP2
-            | nr::NANOSLEEP
-            | nr::GETPID
-            | nr::CLONE
-            | nr::EXECVE
-            | nr::EXIT
-            | nr::WAIT4
-            | nr::UNAME
-            | nr::FCNTL
-            | nr::GETCWD
-            | nr::CHDIR
-            | nr::FCHDIR
-            | nr::READLINK
-            | nr::MKDIR
-            | nr::SENDTO
-            | nr::RECVFROM
-            | nr::RMDIR
-            | nr::UNLINK
-            | nr::CHMOD
-            | nr::GETTIMEOFDAY
-            | nr::GETRLIMIT
-            | nr::SYSINFO
-            | nr::GETUID
-            | nr::GETGID
-            | nr::GETEUID
-            | nr::GETEGID
-            | nr::GETPPID
-            | nr::STATFS
-            | nr::FSTATFS
-            | nr::ARCH_PRCTL
-            | nr::GETTID
-            | nr::TIME
-            | nr::FUTEX
-            | nr::GETDENTS64
-            | nr::SET_TID_ADDRESS
-            | nr::CLOCK_SETTIME
-            | nr::CLOCK_GETRES
-            | nr::CLOCK_GETTIME
-            | nr::CLOCK_NANOSLEEP
-            | nr::EPOLL_WAIT
-            | nr::EPOLL_CTL
-            | nr::EPOLL_CREATE1
-            | nr::EVENTFD2
-            | nr::EXIT_GROUP
-            | nr::OPENAT
-            | nr::NEWFSTATAT
-            | nr::READLINKAT
-            | nr::SET_ROBUST_LIST
-            | nr::GET_ROBUST_LIST
-            | nr::DUP3
-            | nr::PIPE2
-            | nr::PRLIMIT64
-            | nr::GETRANDOM
-            | nr::RSEQ
-            | nr::SIGALTSTACK
-            | nr::SOCKETPAIR
-            | nr::EPOLL_PWAIT
-            | nr::STATX
-            | nr::SOCKET
-            | nr::CONNECT
-            | nr::ACCEPT
-            | nr::BIND
-            | nr::LISTEN
-            | nr::GETSOCKNAME
-            | nr::ACCEPT4
-            | nr::SETSOCKOPT
-            | nr::GETSOCKOPT
-            | nr::SETSID
-            | nr::SETPGID
-            | nr::GETPGRP
-            | nr::GETPGID
-            | nr::UMASK
-            | nr::FLOCK
-    )
+    SUPPORTED_SYSCALLS.binary_search(&nr).is_ok()
 }
 
 #[cfg(test)]
@@ -381,23 +421,75 @@ mod tests {
         assert_eq!(args, [0x10, 0x20, 0x30, 0x40, 0x50, 0x60]);
     }
 
+    /// The gate and the enumerated `Supported_Syscall_Set` are the same set —
+    /// checked in BOTH directions against an independent literal enumeration of
+    /// the Linux x86_64 numbers the dispatcher implements.
+    ///
+    /// `EXPECTED` is deliberately NOT derived from [`SUPPORTED_SYSCALLS`] or from
+    /// [`is_supported`]: it is the independent half of a double-entry check
+    /// (`nr::` names vs bare numbers), so a wrong constant value, a missing
+    /// entry, or a duplicated one fails here instead of shipping. The reverse
+    /// drift (a number gated in with no `dispatch_supported` arm) is caught by
+    /// that function's fallback tripwire at runtime.
+    ///
+    /// The old version of this test asserted membership for only 69 of the 109
+    /// numbers the gate accepted, never asserted that anything was unsupported,
+    /// and compared against a subset instead of the whole `0..=600` domain.
     #[test]
     fn supported_set_is_exact() {
-        let supported = [
-            0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 24, 28, 32, 33,
-            35, 39, 44, 45, 60, 63, 72, 79, 80, 81, 84, 87, 89, 90, 96, 97, 99, 102, 104, 107, 108,
-            110, 131, 137, 138, 158, 186, 201, 202, 217, 218, 227, 228, 229, 230, 231, 257, 262,
-            267, 273, 292, 293, 302, 318, 334,
+        // Independent enumeration: the Linux x86_64 syscall numbers with a real
+        // dispatcher arm, in ascending order (keep it sorted!).
+        const EXPECTED: [u64; 110] = [
+            0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+            28, 32, 33, 35, 39, 41, 42, 43, 44, 45, 49, 50, 51, 53, 54, 55, 56, 59, 60, 61, 62, 63,
+            72, 73, 74, 75, 79, 80, 81, 82, 83, 84, 87, 89, 90, 95, 96, 97, 99, 102, 104, 107, 108,
+            109, 110, 111, 112, 121, 131, 137, 138, 158, 186, 201, 202, 217, 218, 227, 228, 229,
+            230, 231, 232, 233, 234, 257, 262, 264, 267, 270, 271, 273, 274, 281, 288, 290, 291,
+            292, 293, 295, 296, 302, 316, 318, 332, 334,
         ];
-        for nr in supported {
-            assert!(is_supported(nr), "expected {nr} to be supported");
+
+        // 1. The two independent enumerations agree element-wise, and both are
+        //    strictly ascending (the gate's binary search depends on it; a
+        //    duplicated or misplaced entry cannot hide behind a passing check).
+        assert_eq!(
+            SUPPORTED_SYSCALLS, EXPECTED,
+            "nr:: names and the literal number list disagree"
+        );
+        for w in EXPECTED.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "enumeration is not strictly ascending: {} then {}",
+                w[0],
+                w[1]
+            );
         }
-        // Out-of-scope numbers: clone/fork/vfork/futex stay unsupported.
-        for nr in [4, 57, 58, 1000, u64::MAX] {
-            if supported.contains(&nr) {
-                continue;
-            }
-            assert!(!is_supported(nr), "expected {nr} to be unsupported");
+
+        // 2. Two-way exactness over a superset of every defined number: the gate
+        //    accepts `n` iff the independent enumeration contains `n`.
+        for n in 0..=600u64 {
+            assert_eq!(
+                is_supported(n),
+                EXPECTED.binary_search(&n).is_ok(),
+                "gate and enumeration disagree on nr={n}"
+            );
+        }
+        for n in [1000u64, 1 << 20, u64::MAX] {
+            assert!(!is_supported(n), "nr={n} must stay unsupported");
+        }
+
+        // 3. Spot checks for the numbers whose treatment the docs got wrong:
+        //    clone(56) and futex(202) ARE supported (the previous doc comment
+        //    claimed they were out of scope), kill(62) is the newest member,
+        //    and fork/vfork/stat never are.
+        for n in [nr::CLONE, nr::FUTEX, nr::KILL] {
+            assert!(is_supported(n), "nr={n} must be supported");
+        }
+        for n in [
+            4u64, /* stat */
+            57,   /* fork */
+            58,   /* vfork */
+        ] {
+            assert!(!is_supported(n), "nr={n} must stay unsupported");
         }
     }
 

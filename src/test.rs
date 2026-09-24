@@ -2838,6 +2838,628 @@ mod fs_prop_tests {
         );
     }
 
+    /// `lookup_entry` that records a failed check instead of panicking.
+    ///
+    /// The kernel is built with `panic = "abort"`: an `.expect()` on a lookup a
+    /// regression made `NotFound` would abort the machine and take the entire
+    /// self-test suite (and the serial evidence for every other routine) down
+    /// with it.
+    fn lookup_checked(fs: &Ext2Fs, dir: u32, name: &str) -> Option<u32> {
+        match fs.lookup_entry(dir, name) {
+            Ok(ino) => Some(ino),
+            Err(_) => {
+                crate::test::record_failure();
+                crate::kprintln!("FAIL: {}:{}: lookup '{}' not found", file!(), line!(), name);
+                None
+            }
+        }
+    }
+
+    /// Run an operation the test expects to succeed, recording a failed check
+    /// instead of panicking. The kernel uses `panic = "abort"`, so a regression
+    /// must show up as `FAIL: ...` plus a non-zero summary, never as a machine
+    /// abort that would also hide every other routine's verdict.
+    fn check_ok<T>(r: Result<T, FsError>, what: &str) -> Option<T> {
+        match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                crate::test::record_failure();
+                crate::kprintln!("FAIL: {}: {} → {:?}", file!(), what, e);
+                None
+            }
+        }
+    }
+
+    /// `vfs::lookup_path_walk` without panicking (see `check_ok`): a walk error is
+    /// recorded as a failed check instead of aborting the machine.
+    fn walk_ok(path: &str, follow: bool) -> Option<Arc<dyn crate::vfs::VfsNode>> {
+        match crate::vfs::lookup_path_walk(path, follow) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                crate::test::record_failure();
+                crate::kprintln!("FAIL: {}: walk {} → {:?}", file!(), path, e);
+                None
+            }
+        }
+    }
+
+    /// Inverse of [`walk_ok`]: expects the walk to fail and returns why.
+    fn walk_err(path: &str, follow: bool) -> Option<crate::vfs::link_walk::WalkError> {
+        match crate::vfs::lookup_path_walk(path, follow) {
+            Ok(_) => {
+                crate::test::record_failure();
+                crate::kprintln!("FAIL: {}: walk {} unexpectedly resolved", file!(), path);
+                None
+            }
+            Err(e) => Some(e),
+        }
+    }
+
+    /// Link resolution over the **mounted** ext2 tree (issue #18, contract
+    /// `EXT2-LINKS.md` §4.6/§7.4): `stat`/`open` follow the final link while
+    /// `lstat`/`readlink` do not, relative targets resolve against the link's own
+    /// directory, an intermediate link is followed, `..` after a jump belongs to
+    /// the target, and a link cycle ends in `TooManyLinks` instead of a hang.
+    ///
+    /// Creates its scratch entries under `/mnt` and removes every one of them.
+    pub fn ext2_link_walk_resolution() {
+        let mnt = match crate::vfs::lookup_path("/mnt") {
+            Ok(n) => n,
+            Err(_) => {
+                crate::test::record_failure();
+                crate::kprintln!("FAIL: {}: /mnt is not mounted", file!());
+                return;
+            }
+        };
+        // Scratch names must survive a *persistent* disk: `tools/e2e.py` copies
+        // the repo's `disk.img`, so leftovers from an earlier boot are still
+        // here. `mnt.remove()` on a non-empty directory fails (`AlreadyExists`),
+        // and the following `create_dir` then fails too — the routine used to
+        // pass only on a pristine disk. Empty the leftovers first.
+        let purge = |name: &str| {
+            if let Ok(node) = mnt.lookup(name) {
+                if node.is_directory() {
+                    if let Ok(children) = node.readdir() {
+                        for child in children {
+                            let cname = alloc::string::String::from(child.name());
+                            if cname == "." || cname == ".." {
+                                continue;
+                            }
+                            let _ = node.remove(&cname);
+                        }
+                    }
+                }
+            }
+            let _ = mnt.remove(name);
+        };
+        for name in [
+            "lxwalk_rel",
+            "lxwalk_abs",
+            "lxwalk_mid",
+            "lxwalk_dirlink",
+            "lxwalk_dang",
+            "lxwalk_loop_a",
+            "lxwalk_loop_b",
+            "lxwalk_dir",
+            "lxwalk_target",
+        ] {
+            purge(name);
+        }
+
+        let mk = |name: &str, target: &[u8]| -> bool {
+            let _ = mnt.remove(name);
+            mnt.create_symlink(name, target).is_ok()
+        };
+        let mkdir = |name: &str| -> Option<Arc<dyn crate::vfs::VfsNode>> {
+            let _ = mnt.remove(name);
+            mnt.create_dir(name).ok()
+        };
+        let mkfile = |name: &str, data: &[u8]| -> Option<Arc<dyn crate::vfs::VfsNode>> {
+            let _ = mnt.remove(name);
+            let n = mnt.create_file(name).ok()?;
+            let _ = n.write(0, data);
+            Some(n)
+        };
+
+        // Filesystem under test on the real mount.
+        let payload = b"walk-payload";
+        let target = match mkfile("lxwalk_target", payload) {
+            Some(n) => n,
+            None => {
+                crate::test::record_failure();
+                crate::kprintln!("FAIL: {}: cannot create the target file", file!());
+                return;
+            }
+        };
+        let dir = match mkdir("lxwalk_dir") {
+            Some(d) => d,
+            None => {
+                crate::test::record_failure();
+                crate::kprintln!("FAIL: {}: cannot create the scratch directory", file!());
+                return;
+            }
+        };
+        // A file *inside* the scratch directory (a name containing '/' is
+        // rejected by the writer — see the guard check below).
+        let inner_ok = match dir.create_file("inner") {
+            Ok(f) => f.write(0, b"inner").is_ok(),
+            Err(_) => false,
+        };
+        assert_kernel!(inner_ok, "links: the scratch directory holds a file");
+        assert_kernel!(
+            dir.create_file("bad/name").is_err(),
+            "links: a name containing '/' is refused (unreachable entry)"
+        );
+
+        let ok = mk("lxwalk_rel", b"lxwalk_target")
+            && mk("lxwalk_abs", b"/mnt/lxwalk_target")
+            && mk("lxwalk_mid", b"lxwalk_dir")
+            && mk("lxwalk_dirlink", b"/mnt/lxwalk_dir")
+            && mk("lxwalk_dang", b"/mnt/lxwalk_absent")
+            && mk("lxwalk_loop_a", b"/mnt/lxwalk_loop_b")
+            && mk("lxwalk_loop_b", b"/mnt/lxwalk_loop_a");
+        assert_kernel!(ok, "links: all scratch links were created");
+        let _ = dir;
+
+        // ── stat/open follow, lstat/readlink do not ───────────────────────
+        if let Some(node) = walk_ok("/mnt/lxwalk_rel", true) {
+            assert_kernel!(
+                node.fs_ino() == target.fs_ino(),
+                "links: a relative link resolves to its target's inode"
+            );
+            assert_eq_kernel!(
+                node.size() as usize,
+                payload.len(),
+                "links: the followed node reports the target's size"
+            );
+        }
+        if let Some(node) = walk_ok("/mnt/lxwalk_rel", false) {
+            assert_kernel!(
+                node.is_symlink(),
+                "links: the unfollowed walk stops at the link itself"
+            );
+            assert_eq_kernel!(
+                node.size() as usize,
+                "lxwalk_target".len(),
+                "links: lstat reports the target *length* as the size"
+            );
+            assert_eq_kernel!(
+                node.read_link().as_deref(),
+                Some("lxwalk_target"),
+                "links: readlink returns the stored target verbatim"
+            );
+        }
+        if let Some(node) = walk_ok("/mnt/lxwalk_abs", true) {
+            assert_kernel!(
+                node.fs_ino() == target.fs_ino(),
+                "links: an absolute target resolves to its target's inode"
+            );
+        }
+
+        // ── intermediate link (the `lib64 -> usr/lib64` case) ────────────
+        if let Some(node) = walk_ok("/mnt/lxwalk_mid/inner", true) {
+            assert_kernel!(
+                node.size() == 5 && node.read_link().is_none(),
+                "links: a path through a linked directory reaches the file"
+            );
+        }
+
+        // ── `..` after a jump belongs to the target ──────────────────────
+        if let Some(node) = walk_ok("/mnt/lxwalk_dirlink/../lxwalk_rel", true) {
+            assert_kernel!(
+                node.fs_ino() == target.fs_ino(),
+                "links: '..' after a link jump is applied to the target's directory"
+            );
+        }
+        // A link to a *file* with components after it is ENOTDIR (not a silent
+        // walk into the file's block map).
+        assert_eq_kernel!(
+            walk_err("/mnt/lxwalk_abs/..", true),
+            Some(crate::vfs::link_walk::WalkError::NotDir),
+            "links: a component below a file link is NotDir (ENOTDIR)"
+        );
+
+        // ── dangling link ────────────────────────────────────────────────
+        if let Some(link) = walk_ok("/mnt/lxwalk_dang", false) {
+            assert_kernel!(link.is_symlink(), "links: lstat sees a dangling link");
+        }
+        assert_eq_kernel!(
+            walk_err("/mnt/lxwalk_dang", true),
+            Some(crate::vfs::link_walk::WalkError::NotFound),
+            "links: following a dangling link is NotFound (ENOENT)"
+        );
+
+        // ── cycle: budget, not a hang ────────────────────────────────────
+        assert_eq_kernel!(
+            walk_err("/mnt/lxwalk_loop_a", true),
+            Some(crate::vfs::link_walk::WalkError::TooManyLinks),
+            "links: a link cycle spends the SYMLOOP_MAX budget (ELOOP)"
+        );
+        if let Some(link) = walk_ok("/mnt/lxwalk_loop_a", false) {
+            assert_kernel!(
+                link.is_symlink(),
+                "links: lstat of a cyclic link still describes the link"
+            );
+        }
+
+        // ── cleanup: leave the mounted tree as it was ────────────────────
+        for name in [
+            "lxwalk_rel",
+            "lxwalk_abs",
+            "lxwalk_mid",
+            "lxwalk_dirlink",
+            "lxwalk_dang",
+            "lxwalk_loop_a",
+            "lxwalk_loop_b",
+            "lxwalk_dir",
+            "lxwalk_target",
+        ] {
+            let _ = mnt.remove(name);
+        }
+        assert_kernel!(
+            crate::vfs::lookup_path("/mnt/lxwalk_target").is_err(),
+            "links: the scratch tree was removed"
+        );
+        mnt.sync();
+    }
+
+    /// ext2 symbolic links and hard links (issue #18; contract `EXT2-LINKS.md`
+    /// §2, §3, §6).
+    ///
+    /// Covers the fast/slow layout boundary (59 inline, 60 via a data block),
+    /// verbatim targets, hard-link identity through one shared inode,
+    /// link-count-aware `unlink` (a surviving name keeps its data), release of
+    /// the last name, the `rmdir` path still freeing a directory, the safety
+    /// rules that keep a symlink inode out of the regular-file write/read paths,
+    /// and persistence across a remount.
+    pub fn ext2_symlink_hardlink_round_trip() {
+        use crate::fs::ext2::symlink as symlink_pure;
+        let dev = fresh_formatted();
+        let fs = Ext2Fs::mount_fs(dev.clone()).expect("mount");
+        let root = 2u32;
+        let free_blocks0 = fs.superblock().s_free_blocks_count;
+        let free_inodes0 = fs.superblock().s_free_inodes_count;
+
+        // ── fast symlink: target ≤ 59 bytes lives in i_block ──────────────
+        let fast_target: &[u8] = b"/usr/bin/real";
+        let fast_ino = check_ok(
+            fs.create_symlink(root, "fast.link", fast_target),
+            "create fast symlink",
+        )
+        .unwrap_or(0);
+        let fi = check_ok(fs.read_inode(fast_ino), "read fast inode")
+            .unwrap_or_else(structs::Ext2Inode::zeroed);
+        assert_kernel!(fi.is_symlink(), "symlink: fast inode carries S_IFLNK");
+        assert_eq_kernel!(
+            fi.i_mode & 0xF000,
+            structs::S_IFLNK,
+            "symlink: fast i_mode type bits are S_IFLNK"
+        );
+        assert_eq_kernel!(
+            fi.i_mode & 0o777,
+            0o777,
+            "symlink: ext2 symlinks are created 0777"
+        );
+        assert_eq_kernel!(fi.i_blocks, 0, "symlink: fast link has i_blocks == 0");
+        assert_eq_kernel!(
+            fi.i_size as usize,
+            fast_target.len(),
+            "symlink: fast i_size is the target length"
+        );
+        assert_eq_kernel!(
+            fi.i_links_count,
+            1,
+            "symlink: fresh symlink has exactly one link"
+        );
+        assert_eq_kernel!(
+            check_ok(fs.read_symlink(fast_ino), "read fast target").unwrap_or_default(),
+            fast_target.to_vec(),
+            "symlink: fast target round-trips byte-for-byte"
+        );
+        assert_kernel!(
+            fs.read_symlink(1).is_err(),
+            "symlink: read_symlink refuses a non-symlink inode"
+        );
+
+        // Boundaries: 59 bytes still fast, 60 bytes already slow (the NUL has to
+        // fit inside the 60-byte i_block, so the last fast target is 59 bytes).
+        let t59: Vec<u8> = core::iter::repeat(b'a').take(59).collect();
+        let t60: Vec<u8> = core::iter::repeat(b'b').take(60).collect();
+        let ino59 = check_ok(
+            fs.create_symlink(root, "edge59.link", &t59),
+            "create 59-byte symlink",
+        )
+        .unwrap_or(0);
+        let ino60 = check_ok(
+            fs.create_symlink(root, "edge60.link", &t60),
+            "create 60-byte symlink",
+        )
+        .unwrap_or(0);
+        assert_eq_kernel!(
+            check_ok(fs.read_inode(ino59), "inode59")
+                .unwrap_or_else(structs::Ext2Inode::zeroed)
+                .i_blocks,
+            0,
+            "symlink: a 59-byte target stays inline (fast)"
+        );
+        assert_eq_kernel!(
+            check_ok(fs.read_inode(ino60), "inode60")
+                .unwrap_or_else(structs::Ext2Inode::zeroed)
+                .i_blocks,
+            (BS / 512) as u32,
+            "symlink: a 60-byte target needs a data block (slow)"
+        );
+        assert_kernel!(
+            check_ok(fs.read_symlink(ino59), "read59").as_deref() == Some(&t59[..])
+                && check_ok(fs.read_symlink(ino60), "read60").as_deref() == Some(&t60[..]),
+            "symlink: both layouts round-trip"
+        );
+
+        // ── slow symlink: raw bytes, including non-UTF-8 ones ─────────────
+        let slow_target: Vec<u8> = b"/opt/very/long/target/"
+            .iter()
+            .copied()
+            .chain(core::iter::repeat(0xFE).take(symlink_pure::FAST_MAX_TARGET + 20))
+            .collect();
+        let slow_ino = check_ok(
+            fs.create_symlink(root, "slow.link", &slow_target),
+            "create slow symlink",
+        )
+        .unwrap_or(0);
+        let si = check_ok(fs.read_inode(slow_ino), "read slow inode")
+            .unwrap_or_else(structs::Ext2Inode::zeroed);
+        assert_eq_kernel!(
+            si.i_blocks,
+            (BS / 512) as u32,
+            "symlink: slow link owns exactly one data block"
+        );
+        assert_kernel!(si.i_block[0] != 0, "symlink: slow link has a data block");
+        assert_eq_kernel!(
+            check_ok(fs.read_symlink(slow_ino), "read slow target").unwrap_or_default(),
+            slow_target,
+            "symlink: slow target round-trips byte-for-byte (verbatim, non-UTF-8 ok)"
+        );
+
+        // ── a symlink inode is never a regular file ───────────────────────
+        assert_kernel!(
+            fs.create_symlink(root, "empty.link", b"").is_err(),
+            "symlink: an empty target is refused"
+        );
+        assert_kernel!(
+            fs.write_file(fast_ino, 0, b"x").is_err(),
+            "symlink: write_file refuses a fast symlink inode"
+        );
+        assert_kernel!(
+            fs.truncate_file(fast_ino, 0).is_err(),
+            "symlink: truncate_file refuses a fast symlink inode"
+        );
+        assert_kernel!(
+            fs.write_file(slow_ino, 0, b"x").is_err(),
+            "symlink: write_file refuses a slow symlink inode"
+        );
+        assert_eq_kernel!(
+            check_ok(fs.read_symlink(fast_ino), "re-read fast").unwrap_or_default(),
+            fast_target.to_vec(),
+            "symlink: refused writes leave the target intact"
+        );
+        // The VFS node for a symlink must not expose readable content either:
+        // a fast link's inline bytes are target text, not block pointers.
+        let root_node = fs.root_node();
+        match root_node.lookup("fast.link") {
+            Ok(link_node) => {
+                assert_kernel!(!link_node.is_directory(), "symlink: node is not a dir");
+                assert_eq_kernel!(
+                    link_node.size() as usize,
+                    fast_target.len(),
+                    "symlink: node size is the target length"
+                );
+                assert_kernel!(
+                    link_node.read(0, &mut [0u8; 8]).is_err(),
+                    "symlink: reading the node itself is refused (no block-map walk)"
+                );
+            }
+            Err(_) => {
+                crate::test::record_failure();
+                crate::kprintln!("FAIL: {}: vfs lookup of fast.link", file!());
+            }
+        }
+
+        // ── hard links: two names, one inode, no copy ─────────────────────
+        let content = b"shared hard-link payload";
+        let a_ino = check_ok(fs.create(root, "a.txt", false), "create a.txt").unwrap_or(0);
+        let _ = check_ok(fs.write_file(a_ino, 0, content), "write a.txt");
+        // Measured immediately before the link: `link` must not allocate a block
+        // (a directory-growth allocation would show up here too, and that is
+        // exactly what "no new block for the link itself" must not hide).
+        let free_before_link = fs.superblock().s_free_blocks_count;
+        let _ = check_ok(fs.link(root, "b.txt", a_ino), "link b.txt");
+        assert_eq_kernel!(
+            lookup_checked(&fs, root, "b.txt"),
+            Some(a_ino),
+            "hardlink: both names resolve to the same inode"
+        );
+        assert_eq_kernel!(
+            check_ok(fs.read_inode(a_ino), "inode a")
+                .unwrap_or_else(structs::Ext2Inode::zeroed)
+                .i_links_count,
+            2,
+            "hardlink: i_links_count reaches 2"
+        );
+        assert_eq_kernel!(
+            fs.superblock().s_free_blocks_count,
+            free_before_link,
+            "hardlink: linking allocates no data block"
+        );
+        let mut hbuf = vec![0u8; content.len()];
+        if let Some(b_ino) = lookup_checked(&fs, root, "b.txt") {
+            let _ = check_ok(fs.read_file(b_ino, 0, &mut hbuf), "read via b.txt");
+        }
+        assert_kernel!(
+            hbuf == content,
+            "hardlink: the second name reads the same content"
+        );
+        let ino_a = root_node.lookup("a.txt").ok().map(|n| n.fs_ino());
+        let ino_b = root_node.lookup("b.txt").ok().map(|n| n.fs_ino());
+        assert_kernel!(
+            ino_a.is_some() && ino_a == ino_b,
+            "hardlink: both VFS nodes report the same st_ino"
+        );
+        // A directory is not linkable, and a duplicate name is refused.
+        let _ = check_ok(fs.create(root, "adir", true), "mkdir adir");
+        if let Some(adir_ino) = lookup_checked(&fs, root, "adir") {
+            assert_kernel!(
+                fs.link(root, "adir2", adir_ino).is_err(),
+                "hardlink: a directory target is refused"
+            );
+        }
+        assert_kernel!(
+            fs.link(root, "b.txt", a_ino).is_err(),
+            "hardlink: a duplicate name is refused"
+        );
+
+        // ── unlink one of two names: the survivor keeps its data ──────────
+        let free_blocks_before_drop = fs.superblock().s_free_blocks_count;
+        let _ = check_ok(fs.unlink(root, "a.txt"), "unlink a.txt");
+        assert_eq_kernel!(
+            check_ok(fs.read_inode(a_ino), "inode a after drop")
+                .unwrap_or_else(structs::Ext2Inode::zeroed)
+                .i_links_count,
+            1,
+            "hardlink: unlinking one name only decrements the count"
+        );
+        assert_eq_kernel!(
+            fs.superblock().s_free_blocks_count,
+            free_blocks_before_drop,
+            "hardlink: unlinking one name frees nothing"
+        );
+        let mut sbinv = vec![0u8; content.len()];
+        match lookup_checked(&fs, root, "b.txt") {
+            Some(live) => {
+                assert_eq_kernel!(live, a_ino, "hardlink: survivor points at the inode");
+                let _ = check_ok(fs.read_file(live, 0, &mut sbinv), "read survivor");
+            }
+            None => {}
+        }
+        assert_kernel!(sbinv == content, "hardlink: survivor still reads its data");
+
+        // ── unlink the last name: inode + blocks are released ─────────────
+        let free_before_last = fs.superblock().s_free_blocks_count;
+        if check_ok(fs.unlink(root, "b.txt"), "unlink b.txt").is_some() {
+            assert_kernel!(
+                fs.lookup_entry(root, "b.txt").is_err(),
+                "hardlink: the last name is gone"
+            );
+            assert_eq_kernel!(
+                check_ok(fs.read_inode(a_ino), "inode a freed")
+                    .unwrap_or_else(structs::Ext2Inode::zeroed)
+                    .i_links_count,
+                0,
+                "hardlink: the released inode has i_links_count == 0"
+            );
+            assert_eq_kernel!(
+                fs.superblock().s_free_blocks_count,
+                free_before_last + 1,
+                "hardlink: the last unlink returns the file's data block"
+            );
+        }
+
+        // ── slow symlink unlink frees its data block ─────────────────────
+        let free_before = fs.superblock().s_free_blocks_count;
+        let inodes_before = fs.superblock().s_free_inodes_count;
+        if check_ok(fs.unlink(root, "slow.link"), "unlink slow.link").is_some() {
+            assert_eq_kernel!(
+                fs.superblock().s_free_blocks_count,
+                free_before + 1,
+                "symlink: unlinking a slow link frees its data block"
+            );
+            assert_eq_kernel!(
+                fs.superblock().s_free_inodes_count,
+                inodes_before + 1,
+                "symlink: unlinking frees the inode"
+            );
+        }
+
+        // ── fast symlink unlink must free NOTHING ────────────────────────
+        // A fast link keeps its target text in `i_block`: freeing it through the
+        // regular block map would free the blocks whose numbers spell the target.
+        let free_before_fast = fs.superblock().s_free_blocks_count;
+        let inodes_before_fast = fs.superblock().s_free_inodes_count;
+        if check_ok(fs.unlink(root, "fast.link"), "unlink fast.link").is_some() {
+            assert_eq_kernel!(
+                fs.superblock().s_free_blocks_count,
+                free_before_fast,
+                "symlink: unlinking a fast link frees no block (i_block holds target text)"
+            );
+            assert_eq_kernel!(
+                fs.superblock().s_free_inodes_count,
+                inodes_before_fast + 1,
+                "symlink: unlinking a fast link frees only its inode"
+            );
+        }
+        // The freed inode slot is reusable and the filesystem still allocates.
+        let reuse = check_ok(
+            fs.create(root, "reuse.bin", false),
+            "allocate after unlinks",
+        )
+        .unwrap_or(0);
+        let _ = check_ok(
+            fs.write_file(reuse, 0, b"still working"),
+            "write after unlinking links",
+        );
+
+        // ── rmdir still releases a directory whole ────────────────────────
+        // (a directory's i_links_count counts `.`/`..`, so the link-count rule
+        // must not be applied to it: that would leak the inode and its block).
+        let free_before_dir = fs.superblock().s_free_blocks_count;
+        let inodes_before_dir = fs.superblock().s_free_inodes_count;
+        if check_ok(fs.unlink(root, "adir"), "rmdir adir").is_some() {
+            assert_kernel!(
+                fs.lookup_entry(root, "adir").is_err(),
+                "rmdir: the directory entry is gone"
+            );
+            assert_eq_kernel!(
+                fs.superblock().s_free_blocks_count,
+                free_before_dir + 1,
+                "rmdir: the directory's data block is freed"
+            );
+            assert_eq_kernel!(
+                fs.superblock().s_free_inodes_count,
+                inodes_before_dir + 1,
+                "rmdir: the directory inode is freed"
+            );
+        }
+
+        // ── remount: the journaled state persists ────────────────────────
+        // `fast.link` was unlinked above; the surviving links are edge59 (fast)
+        // and edge60 (slow) — one of each layout must survive the remount.
+        match Ext2Fs::mount_fs(dev.clone()) {
+            Ok(fs2) => {
+                if let Some(fast2) = lookup_checked(&fs2, root, "edge59.link") {
+                    assert_eq_kernel!(
+                        check_ok(fs2.read_symlink(fast2), "re-read fast").unwrap_or_default(),
+                        t59,
+                        "symlink: fast target survives a remount"
+                    );
+                }
+                if let Some(edge2) = lookup_checked(&fs2, root, "edge60.link") {
+                    assert_kernel!(
+                        check_ok(fs2.read_symlink(edge2), "re-read edge60").as_deref()
+                            == Some(&t60[..]),
+                        "symlink: slow target survives a remount"
+                    );
+                }
+                assert_kernel!(
+                    fs2.superblock().s_free_inodes_count <= free_inodes0,
+                    "links: the test never leaks inodes (accounting stays consistent)"
+                );
+            }
+            Err(e) => {
+                crate::test::record_failure();
+                crate::kprintln!("FAIL: {}: remount after links → {:?}", file!(), e);
+            }
+        }
+    }
+
     /// Property 19: ext2 directory entry rec_len/name_len round-trip and the
     /// rec_len tiling invariant over insert/remove sequences.
     /// **Validates: Requirements 7.2, 7.3, 7.5**
@@ -3588,6 +4210,480 @@ mod net_phy_prop_tests {
     }
 }
 
+// ─── linux::kill(2) in-guest checks (issue #12, task t7) ─────────────────────
+//
+// The pure half of `kill(2)` (argument decoding, target classification, errno
+// matrix) is proven on the host by `host-tests` P51 and `abi::supported_set_is_exact`.
+// These routines cover what a host test cannot: the real dispatcher routing of
+// nr 62 (the gate + the arm + the handler together) and the registry-backed
+// target resolution.
+//
+// NON-DESTRUCTIVE by construction:
+//   * the synthetic `CompatState`s are installed for three pids far above any pid
+//     `scheduler::next_pid` hands out and are removed before returning; nothing
+//     is ever scheduled under them;
+//   * every check uses `sig == 0` (the existence probe, which queues nothing) or
+//     an invalid signal that is rejected before the registry is consulted, so no
+//     pending bit and no `PENDING_APPROX` accounting is touched;
+//   * the dispatcher calls pass `reentry_allowed = 0`, so the interrupt flag of
+//     the calling thread is left exactly as it was.
+//
+// Deliberately NOT here (issue #12 t8/t9): actually delivering a signal (SIGKILL
+// would mark a live pid exiting) and delivery from the timer-tick path — a
+// CPU-bound loop with no syscalls still sees nothing until t9 lands.
+mod linux_signal_tests {
+    use crate::arch::x86_64::linux::abi::nr;
+    use crate::arch::x86_64::linux::errno::{encode_errno, Errno};
+    use crate::arch::x86_64::linux::kill::{KillTarget, INT_MIN};
+    use crate::arch::x86_64::linux::regs::SavedRegs;
+    use crate::arch::x86_64::linux::signal;
+    use crate::task::compat::{self, CompatState};
+    use crate::task::fd::FdTable;
+    use alloc::sync::Arc;
+
+    /// A pid never produced by `scheduler::next_pid` (which counts up from 1) and
+    /// never spawned as a task.
+    ///
+    /// It MUST stay below 2^31: `kill(2)`'s `pid_t` is a 32-bit SIGNED value, so a
+    /// larger raw number sign-extends to a negative `int` and addresses a process
+    /// GROUP instead of a pid — exactly what `kill::decode_pid` implements, and
+    /// what the first version of this routine tripped over.
+    const FAKE_PID: u64 = 0x7F00_0001;
+    /// Leader of the synthetic thread group [`FAKE_GROUP`] (its tgid == its pid).
+    const FAKE_LEADER: u64 = 0x7F00_0002;
+    /// Second member of [`FAKE_GROUP`]: proves the one-copy-per-group pick.
+    const FAKE_MEMBER: u64 = 0x7F00_0003;
+    const FAKE_GROUP: u64 = FAKE_LEADER;
+    /// A pid/group that was never installed.
+    const ABSENT: u64 = 0x7F00_00FF;
+
+    /// A minimal synthetic compat state; the VM bookkeeping is never used by the
+    /// signal paths, so an empty region set is sufficient.
+    fn synth(tid: u64, tgid: u64) -> CompatState {
+        let mut st = CompatState::new(
+            FdTable::with_standard_streams(),
+            Arc::new(crate::sync::spinlock::Spinlock::new(
+                crate::arch::x86_64::linux::mem::VmRegionSet::new(0, 0),
+            )),
+            tid,
+        );
+        st.tgid = tgid;
+        st
+    }
+
+    /// `kill(2)` nr 62 through the REAL dispatcher, plus the registry-backed
+    /// target resolution and the errno matrix.
+    pub fn kill_dispatch_and_errno() {
+        compat::install_compat(FAKE_PID, synth(FAKE_PID, FAKE_PID));
+        compat::install_compat(FAKE_LEADER, synth(FAKE_LEADER, FAKE_GROUP));
+        compat::install_compat(FAKE_MEMBER, synth(FAKE_MEMBER, FAKE_GROUP));
+
+        // ── Handler level: existence probes and the errno matrix ────────────
+        assert_eq_kernel!(
+            signal::sys_kill(FAKE_PID, 0),
+            Ok(0),
+            "kill(live pid, 0) is the Ok existence probe"
+        );
+        assert_eq_kernel!(
+            signal::sys_kill(FAKE_LEADER, 0),
+            Ok(0),
+            "kill(live thread-group leader, 0) succeeds"
+        );
+        assert_eq_kernel!(
+            signal::sys_kill(ABSENT, 0),
+            Err(Errno::ESRCH),
+            "kill(absent pid, 0) is ESRCH"
+        );
+        assert_eq_kernel!(
+            signal::sys_kill((FAKE_GROUP as i64).wrapping_neg() as u64, 0),
+            Ok(0),
+            "kill(-pgid, 0) finds the synthetic group"
+        );
+        assert_eq_kernel!(
+            signal::sys_kill((ABSENT as i64).wrapping_neg() as u64, 0),
+            Err(Errno::ESRCH),
+            "kill(-pgid, 0) with no such group is ESRCH"
+        );
+        assert_eq_kernel!(
+            signal::sys_kill(FAKE_PID, 65),
+            Err(Errno::EINVAL),
+            "kill(pid, 65) is EINVAL"
+        );
+        assert_eq_kernel!(
+            signal::sys_kill(FAKE_PID, u64::from(u32::MAX)),
+            Err(Errno::EINVAL),
+            "kill(pid, -1) decodes as a negative int and is EINVAL"
+        );
+        assert_eq_kernel!(
+            signal::sys_kill(INT_MIN as u64, 0),
+            Err(Errno::ESRCH),
+            "kill(INT_MIN, 0) is the documented ESRCH quirk"
+        );
+
+        // ── Target resolution: exactly ONE thread per addressed group ───────
+        let members = compat::group_pids(FAKE_GROUP);
+        assert_eq_kernel!(
+            members,
+            alloc::vec![FAKE_LEADER, FAKE_MEMBER],
+            "group snapshot lists both members ascending"
+        );
+        assert_eq_kernel!(
+            signal::resolve_kill_targets(KillTarget::Group(FAKE_GROUP)),
+            alloc::vec![FAKE_LEADER],
+            "a group signal is queued once, on the leader"
+        );
+        assert_eq_kernel!(
+            signal::resolve_kill_targets(KillTarget::Pid(FAKE_MEMBER)),
+            alloc::vec![FAKE_MEMBER],
+            "a positive pid is addressed exactly"
+        );
+        assert_kernel!(
+            signal::resolve_kill_targets(KillTarget::Group(ABSENT)).is_empty(),
+            "an absent group resolves to no target"
+        );
+
+        // ── Dispatcher level: nr 62 is gated in AND routed ──────────────────
+        // The gate (`abi::SUPPORTED_SYSCALLS`), the arm
+        // (`dispatch_supported`'s `sysno::KILL`) and the handler are exercised
+        // together here; the only syscall number whose routing this routine
+        // proves is 62, plus ENOSYS for a number outside the set.
+        let call = |nr_raw: u64, a0: u64, a1: u64| -> u64 {
+            let mut regs = SavedRegs::default();
+            regs.rax = nr_raw;
+            regs.rdi = a0;
+            regs.rsi = a1;
+            // The entry stub is what stores the dispatcher's return value into the
+            // saved `rax` slot; a direct Rust call receives it as the return value.
+            crate::arch::x86_64::linux::linux_dispatch(&mut regs, 0)
+        };
+        assert_eq_kernel!(
+            call(nr::KILL, FAKE_PID, 0),
+            0,
+            "dispatcher routes nr 62: kill(live pid, 0) -> 0"
+        );
+        assert_eq_kernel!(
+            call(nr::KILL, ABSENT, 0),
+            encode_errno(Errno::ESRCH),
+            "dispatcher routes nr 62: kill(absent pid, 0) -> -ESRCH"
+        );
+        assert_eq_kernel!(
+            call(nr::KILL, FAKE_PID, 65),
+            encode_errno(Errno::EINVAL),
+            "dispatcher routes nr 62: kill(pid, 65) -> -EINVAL"
+        );
+        assert_eq_kernel!(
+            call(1000, 0, 0),
+            encode_errno(Errno::ENOSYS),
+            "a number outside SUPPORTED_SYSCALLS still returns -ENOSYS"
+        );
+
+        // ── Cleanup: leave the registry exactly as found ────────────────────
+        compat::remove_compat(FAKE_PID);
+        compat::remove_compat(FAKE_LEADER);
+        compat::remove_compat(FAKE_MEMBER);
+        assert_kernel!(
+            !compat::compat_exists(FAKE_PID)
+                && !compat::compat_exists(FAKE_LEADER)
+                && !compat::compat_exists(FAKE_MEMBER),
+            "synthetic compat states were removed"
+        );
+    }
+}
+
+// ─── SIGSTOP/SIGCONT scheduler state, in-guest (issue #12, task t8) ──────────
+//
+// Proves on the real machine what the host properties (`signal_stop`,
+// `signal_frame`) cannot: a parked (stopped) task stops rotating while keeping
+// its frame, SIGCONT puts it back, a stop signal for an already-stopped group is
+// consumed, killing a parked task reaps it with the right exit code, the DELIVERY
+// path itself parks a task that receives SIGSTOP, and `wait4` reports the stop /
+// continue state changes exactly once.
+//
+// NON-DESTRUCTIVE: every task it creates is killed or exits before returning; the
+// synthetic `CompatState`s live on empty VM region sets, are installed for pids
+// whose only user is this routine, and are all removed. The one "dangerous" step —
+// parking the task that is RUNNING this routine — is made safe by a helper kernel
+// thread spawned in advance that resumes the target unconditionally after a few
+// ticks, so a scheduler bug surfaces as a failed assertion instead of a hang.
+mod linux_stop_tests {
+    use crate::arch::x86_64::linux::process_sys::{sys_wait4, WCONTINUED, WNOHANG, WUNTRACED};
+    use crate::arch::x86_64::linux::regs::SavedRegs;
+    use crate::arch::x86_64::linux::signal;
+    use crate::arch::x86_64::linux::signal_frame::{sigbit, SIGCONT, SIGKILL, SIGSTOP, SIGTSTP};
+    use crate::memory::{pmm, vmm};
+    use crate::task::compat::{self, CompatState};
+    use crate::task::fd::FdTable;
+    use crate::task::scheduler;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use x86_64::structures::paging::PageTableFlags;
+
+    /// User-accessible scratch page for the `wait4` status word: the syscall
+    /// validates its pointer with `check_user_ptr`, and a kernel-stack address is
+    /// not `USER_ACCESSIBLE`.
+    const STATUS_VA: u64 = 0x0000_4000_0000_0000;
+
+    /// Incremented by the CPU-bound test task; frozen while it is parked.
+    static SPIN_COUNT: AtomicU64 = AtomicU64::new(0);
+    /// Set by the resumer when it observes the target parked.
+    static RESUMER_SAW_PARKED: AtomicBool = AtomicBool::new(false);
+    /// The pid the resumer must `SIGCONT` (set before it is spawned).
+    static RESUMER_TARGET: AtomicU64 = AtomicU64::new(0);
+
+    /// CPU-bound kernel thread: the "no syscalls at all" case that only a
+    /// scheduler-level park can stop.
+    fn spin_entry() {
+        loop {
+            SPIN_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Bounded helper: wait a few ticks, note whether the target is parked, then
+    /// resume it unconditionally.
+    fn resumer_entry() {
+        scheduler::sleep_ticks(5);
+        let target = RESUMER_TARGET.load(Ordering::Relaxed);
+        if scheduler::is_stopped(target) {
+            RESUMER_SAW_PARKED.store(true, Ordering::Relaxed);
+        }
+        let _ = signal::send_signal(target, SIGCONT);
+    }
+
+    /// A synthetic compat state for `pid` so the REAL signal paths (`send_signal`,
+    /// `wait4`) can address it. Empty VM region set: the signal paths never touch
+    /// it.
+    fn install_fake(pid: u64, ppid: u64, waitable: bool) {
+        let mut st = CompatState::new(
+            FdTable::with_standard_streams(),
+            Arc::new(crate::sync::spinlock::Spinlock::new(
+                crate::arch::x86_64::linux::mem::VmRegionSet::new(0, 0),
+            )),
+            pid,
+        );
+        st.tgid = pid;
+        st.ppid = ppid;
+        st.waitable = waitable;
+        compat::install_compat(pid, st);
+    }
+
+    /// Map (if not already there) the user-accessible status page. Returns the
+    /// frame to free on unmap, or `None` when the page was already mapped.
+    fn map_status_page() -> Option<u64> {
+        if vmm::virt_to_phys(STATUS_VA).is_some() {
+            return None;
+        }
+        let frame = pmm::alloc_frame()?;
+        // SAFETY: the frame was just allocated and is reachable through the HHDM.
+        unsafe {
+            core::ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, 4096);
+        }
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+        vmm::map(frame, STATUS_VA, flags).ok()?;
+        Some(frame)
+    }
+
+    fn unmap_status_page(frame: Option<u64>) {
+        if let Some(frame) = frame {
+            let _ = vmm::unmap(STATUS_VA);
+            pmm::free_frame(frame);
+        }
+    }
+
+    /// Run `wait4(pid, &status, options, 0)` against the scratch page and return
+    /// the reported status (`Some(0)` for a successful WNOHANG with nothing to
+    /// report), or `None` when the call failed.
+    fn wait_status(pid: u64, options: u64) -> Option<u32> {
+        let frame = map_status_page();
+        let r = sys_wait4(pid, STATUS_VA, options, 0);
+        // SAFETY: the page is mapped, writable, user-accessible and zeroed; the
+        // syscall wrote at most 4 bytes into it.
+        let out = unsafe { core::ptr::read_unaligned(STATUS_VA as *const u32) };
+        unmap_status_page(frame);
+        match r {
+            Ok(child) if child == pid => Some(out),
+            Ok(0) => Some(0),
+            _ => None,
+        }
+    }
+
+    /// Park `pid` exactly the way the delivery path does, from an OUTSIDE context:
+    /// the request covers a task that a tick may have made current in the
+    /// meantime, `stop_ready_pids` covers the (usual) case of an already-queued
+    /// frame.
+    fn park(pid: u64) {
+        scheduler::mark_stop_requested(pid);
+        let _ = scheduler::stop_ready_pids(&[pid]);
+        assert_kernel!(scheduler::is_stopped(pid), "stop-test: task is parked");
+    }
+
+    pub fn stop_continue_and_kill() {
+        let me = scheduler::current_pid();
+
+        // ── A. Scheduler-level stop/continue on a CPU-bound task ────────────
+        SPIN_COUNT.store(0, Ordering::Relaxed);
+        let pid = scheduler::kernel_thread_spawn(spin_entry);
+        install_fake(pid, me, true);
+
+        scheduler::sleep_ticks(20);
+        let running = SPIN_COUNT.load(Ordering::Relaxed);
+        assert_kernel!(running > 0, "stop-test: the CPU-bound task rotated");
+        assert_kernel!(
+            !scheduler::is_stopped(pid),
+            "stop-test: it is not stopped yet"
+        );
+
+        park(pid);
+        let frozen = SPIN_COUNT.load(Ordering::Relaxed);
+        scheduler::sleep_ticks(30);
+        assert_kernel!(
+            SPIN_COUNT.load(Ordering::Relaxed) == frozen,
+            "stop-test: a parked task does not rotate"
+        );
+        assert_kernel!(
+            scheduler::current_pid() != pid,
+            "stop-test: a parked task is never made current"
+        );
+
+        // A stop signal generated for an already-stopped group is consumed, not
+        // queued (otherwise the resume would immediately re-stop it).
+        assert_eq_kernel!(
+            signal::send_signal(pid, SIGSTOP),
+            Ok(()),
+            "stop-test: SIGSTOP to a stopped group is accepted"
+        );
+        assert_eq_kernel!(
+            compat::pending_of(pid) & sigbit(SIGSTOP),
+            0,
+            "stop-test: SIGSTOP to a stopped group leaves no pending bit"
+        );
+
+        // SIGCONT resumes at generation time (unconditional).
+        assert_eq_kernel!(
+            signal::send_signal(pid, SIGCONT),
+            Ok(()),
+            "stop-test: SIGCONT is accepted"
+        );
+        assert_kernel!(
+            !scheduler::is_stopped(pid),
+            "stop-test: SIGCONT unparked the task"
+        );
+        scheduler::sleep_ticks(30);
+        assert_kernel!(
+            SPIN_COUNT.load(Ordering::Relaxed) > frozen,
+            "stop-test: the resumed task rotates again"
+        );
+
+        // SIGCONT also discards pending stop-class signals of the group.
+        assert_eq_kernel!(
+            signal::send_signal(pid, SIGTSTP),
+            Ok(()),
+            "stop-test: SIGTSTP is queued for a running task"
+        );
+        assert_kernel!(
+            compat::pending_of(pid) & sigbit(SIGTSTP) != 0,
+            "stop-test: SIGTSTP is pending"
+        );
+        assert_eq_kernel!(
+            signal::send_signal(pid, SIGCONT),
+            Ok(()),
+            "stop-test: SIGCONT is accepted for a running task"
+        );
+        assert_eq_kernel!(
+            compat::pending_of(pid) & sigbit(SIGTSTP),
+            0,
+            "stop-test: SIGCONT discarded the pending stop signal"
+        );
+
+        // Killing a PARKED task: out of STOPPED_TASKS, reaped with its own cr3,
+        // exit status 128 + SIGKILL reaching wait4.
+        park(pid);
+        assert_eq_kernel!(
+            signal::send_signal(pid, SIGKILL),
+            Ok(()),
+            "stop-test: SIGKILL is accepted"
+        );
+        assert_kernel!(
+            !scheduler::is_stopped(pid),
+            "stop-test: the killed parked task left STOPPED_TASKS"
+        );
+        assert_kernel!(
+            !compat::compat_exists(pid),
+            "stop-test: the killed task's compat state was torn down"
+        );
+        assert_eq_kernel!(
+            wait_status(pid, 0),
+            Some(137u32 << 8),
+            "stop-test: wait4 reports 128+SIGKILL for the killed stopped task"
+        );
+
+        // ── B. The DELIVERY path itself: a delivered SIGSTOP parks THIS task ──
+        // The synthetic state must not be waitable, so this stop does not leave a
+        // stop event in the registry behind.
+        install_fake(me, 1, false);
+        RESUMER_TARGET.store(me, Ordering::Relaxed);
+        RESUMER_SAW_PARKED.store(false, Ordering::Relaxed);
+        let _resumer = scheduler::kernel_thread_spawn(resumer_entry);
+        assert_eq_kernel!(
+            signal::send_signal(me, SIGSTOP),
+            Ok(()),
+            "stop-test: SIGSTOP queued for the running selftest task"
+        );
+        let mut regs = SavedRegs::default();
+        regs.r11 = 0x202; // a well-formed syscall-entry frame (RFLAGS bit 1)
+                          // Parks us here (inside `signal::stop_current_group`) until the
+                          // resumer's SIGCONT; returns only after the resume.
+        signal::deliver_one_pending_syscall(&mut regs, 0);
+        assert_kernel!(
+            RESUMER_SAW_PARKED.load(Ordering::Relaxed),
+            "stop-test: the resumer observed this task parked by the delivery path"
+        );
+        assert_kernel!(
+            !scheduler::is_stopped(me),
+            "stop-test: the resumer's SIGCONT brought this task back"
+        );
+        assert_eq_kernel!(
+            compat::pending_of(me) & sigbit(SIGSTOP),
+            0,
+            "stop-test: the delivered SIGSTOP was consumed exactly once"
+        );
+        compat::remove_compat(me);
+
+        // ── C. wait4 stop/continue reports ───────────────────────────────────
+        const FAKE_CHILD: u64 = 0x7F00_0011;
+        install_fake(FAKE_CHILD, me, true);
+        compat::note_child_stopped(FAKE_CHILD, SIGSTOP);
+        assert_eq_kernel!(
+            wait_status(FAKE_CHILD, WUNTRACED),
+            Some((SIGSTOP as u32) << 8 | 0x7f),
+            "stop-test: WUNTRACED reports (stopsig << 8) | 0x7f"
+        );
+        assert_eq_kernel!(
+            wait_status(FAKE_CHILD, WUNTRACED | WNOHANG),
+            Some(0),
+            "stop-test: the stop report is consumed exactly once"
+        );
+        compat::note_child_continued(FAKE_CHILD);
+        assert_eq_kernel!(
+            wait_status(FAKE_CHILD, WCONTINUED),
+            Some(0xffff),
+            "stop-test: WCONTINUED reports 0xffff"
+        );
+        assert_eq_kernel!(
+            wait_status(FAKE_CHILD, WCONTINUED | WNOHANG),
+            Some(0),
+            "stop-test: the continue report is consumed exactly once"
+        );
+        assert_eq_kernel!(
+            wait_status(FAKE_CHILD, WNOHANG),
+            Some(0),
+            "stop-test: without WUNTRACED/WCONTINUED nothing is reported"
+        );
+        compat::remove_compat(FAKE_CHILD);
+    }
+}
 pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
     alloc::vec![
         // procfs (issue #11): the synthetic tree's shape, the rendered texts and
@@ -3711,6 +4807,14 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             fs_prop_tests::p18_fs_op_round_trip
         ),
         (
+            "fs::ext2 symlink + hardlink round-trip (issue #18)",
+            fs_prop_tests::ext2_symlink_hardlink_round_trip
+        ),
+        (
+            "fs::ext2 link resolution through the VFS walker (issue #18)",
+            fs_prop_tests::ext2_link_walk_resolution
+        ),
+        (
             "fs::ext2 dir entry rec_len/tiling (Property 19)",
             fs_prop_tests::p19_dir_entry_roundtrip_and_tiling
         ),
@@ -3783,9 +4887,11 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             "shell::path/listing format behaviors (unit)",
             shell_prop_tests::unit_path_and_listing_format
         ),
+
         (
             "entropy::AT_RANDOM blocks distinct and non-degenerate (issue #16)",
             at_random_tests::blocks_are_distinct_and_mixed
+
         ),
     ]
 }

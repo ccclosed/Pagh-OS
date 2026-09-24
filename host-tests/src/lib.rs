@@ -170,6 +170,15 @@ pub mod fd_alloc;
 #[path = "../../src/arch/x86_64/linux/signal_frame.rs"]
 pub mod signal_frame;
 
+// `kill` is the pure `kill(2)` argument/target/errno model (issue #12): 32-bit
+// argument decoding, the `pid > 0 / 0 / -1 / -pgid / INT_MIN` classification,
+// the single-uid permission policy, and the one-thread-per-group pick. It uses
+// only `super::errno` — declared here as a crate-root sibling, exactly like
+// `io` — so the standalone `#[path]` include resolves with no extra wiring
+// (property `kill_target`).
+#[path = "../../src/arch/x86_64/linux/kill.rs"]
+pub mod kill;
+
 // `x509` is the pure minimal DER (ASN.1) reader + X.509 time decoding that the
 // TLS server-certificate verifier (issue #14) is built on. `core`-only and
 // self-contained — its calendar math deliberately duplicates
@@ -218,6 +227,7 @@ pub mod ca_bundle;
 #[path = "../../src/net/tls_auth.rs"]
 pub mod tls_auth;
 
+
 // `seed` is the pure `AT_RANDOM` fallback mixer (issue #16): a SHA-256
 // transcript over independent boot-time sources plus a counter-based derivation.
 // `core` + `sha2` only (no I/O, no globals), so P51 exercises the exact source
@@ -225,6 +235,14 @@ pub mod tls_auth;
 // same checks against the REMOVED xorshift and against degenerate mixers.
 #[path = "../../src/security/seed.rs"]
 pub mod seed;
+// `link_walk` is the pure symbolic-link path resolver (issue #18): the component
+// walk, `..` handling, relative/absolute link targets and the `SYMLOOP_MAX`
+// budget the kernel's `vfs::lookup_path_walk` adapter drives. `core`+`alloc` only
+// and self-contained, so the standalone `#[path]` include resolves with no extra
+// wiring (properties in `link_walk_paths`).
+#[path = "../../src/vfs/link_walk.rs"]
+pub mod link_walk;
+
 
 // `format_policy` decides whether boot may format a block device (issue #33).
 // Pure `core`, no I/O by design: `boot::init_fs` probes the device and feeds the
@@ -233,6 +251,40 @@ pub mod seed;
 // that no CI job could reach, because no CI job ever boots the kernel.
 #[path = "../../src/fs/format_policy.rs"]
 pub mod format_policy;
+
+// `ext2::symlink` is the pure symlink-layout + hard-link accounting core of the
+// ext2 writer (issue #18, contract `EXT2-LINKS.md` §2/§3): which targets stay
+// inline in the inode's `i_block` (≤ 59 bytes) and which need a data block, how
+// an inline image is reshaped into `i_block`'s words and back, and what `unlink`
+// must do with an inode that has N names pointing at it. `core`-only and
+// self-contained, so the standalone `#[path]` include resolves with no extra
+// wiring (properties in `ext2_links`).
+#[path = "../../src/fs/ext2/symlink.rs"]
+pub mod ext2_symlink;
+
+
+// ── OpenPGP repository-metadata verification (issue #32) ─────────────────────
+// The pure verifier the `apt` trust chain will use: packet/armor parsing,
+// signature verification (RSA PKCS#1 v1.5, EdDSA, ECDSA), subkey binding,
+// expiry/revocation/key-flag policy and the `Release.gpg` / `InRelease` entry
+// points. `core` + `alloc` only, so the host tests exercise the same source the
+// kernel compiles; P51–P53 drive it with GnuPG-produced fixtures and with the
+// committed Debian archive keyring.
+#[path = "../../src/pkg/openpgp_crypto.rs"]
+pub mod openpgp_crypto;
+
+#[path = "../../src/pkg/openpgp_packet.rs"]
+pub mod openpgp_packet;
+
+#[path = "../../src/pkg/openpgp.rs"]
+pub mod openpgp;
+
+// The GENERATED trust store (tools/gen_debian_keyring.py): the pinned Debian
+// archive keys as exact keyring byte ranges plus their fingerprints, algorithm,
+// size and validity window. P53 re-derives every pinned value from those bytes
+// and verifies the keys' real GnuPG self-signatures and subkey bindings.
+#[path = "../../src/pkg/openpgp_keys.rs"]
+pub mod openpgp_keys;
 
 // `procfs_format` is the pure text rendering + path/inode table behind the
 // synthetic `/proc` (issue #11, contract `docs/procfs.md`). `core` + `alloc` only
@@ -323,6 +375,7 @@ mod properties {
     // Boot-time device safety (issue #33): only a genuinely blank device is
     // formatted; GPT/MBR/foreign/ext2-like layouts are refused.
     mod p50;
+
     // AT_RANDOM fallback mixer (issue #16): avalanche/secret-separation/attack
     // properties, with the removed xorshift and degenerate mixers as negative
     // controls. DESCRIPTIVE file name on purpose: a numeric `p51.rs` collided
@@ -330,6 +383,41 @@ mod properties {
     // merge that resolves it the wrong way drops properties silently. The test
     // FUNCTIONS keep their `p51_*` names — numbers inside a file are harmless.
     mod at_random;
+// ext2 symbolic links + hard links (issue #18, contract `EXT2-LINKS.md`
+    // §2/§3/§8): the fast/slow layout boundary and inline image round-trip, the
+    // `i_block` word reshape, and the link-count accounting that `unlink` and
+    // `link` must obey (a name is only freed at the last link).
+    mod ext2_links;
+    // Symbolic-link path resolution (issue #18, contract `EXT2-LINKS.md` §4.6,
+    // §7.4): Linux-verified cases plus a randomized comparison against an
+    // independent restart-based oracle.
+    mod link_walk_paths;
+    // OpenPGP repository-metadata verification (issue #32), contract
+    // OPENPGP-VERIFY-CONTRACT.md §2/§3/§7.
+    //   P51 — armor/packet framing: bounded, panic-free parsing of hostile bytes.
+    //   P52 — signature policy: real GnuPG signatures accept, every tamper class
+    //         (data, signature, foreign signer, expired key, clock) refuses.
+    //   P53 — the committed Debian keyring: pinned fingerprints/metadata agree
+    //         with the bytes, and the keys' real self-signatures and subkey
+    //         bindings verify through this implementation.
+    mod openpgp_fixtures;
+    mod p51;
+    mod p52;
+    mod p53;
+    // `kill(2)` argument decoding + target classification + errno matrix
+    // (issue #12): the decisions `signal::sys_kill` makes before touching the
+    // compat registry. Deliberately NOT numbered p51+: the OpenPGP verification
+    // task owns the p51–p53 range, so this property uses a descriptive module
+    // name instead of racing for a number.
+    mod kill_target;
+    // SIGSTOP/SIGCONT as scheduler state (issue #12, task t8): the pure half of
+    // job control — the `wait(2)` status encodings (`WIFSTOPPED`/`WIFCONTINUED`
+    // can never collide with an exit status), the stop-class set (exactly the
+    // signals whose default action is Stop), and the POSIX flushes (SIGCONT
+    // discards every pending stop-class bit; a stop signal discards a pending
+    // SIGCONT). Descriptive module name, same reason as `kill_target`.
+    mod signal_stop;
+
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the

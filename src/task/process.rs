@@ -311,7 +311,9 @@ pub enum RunError {
 /// directory, or cannot be read (R7.4). Runs with interrupts enabled because the
 /// ext2/VFS read path may block waiting on a device interrupt.
 fn read_file_all(path: &str) -> Result<Vec<u8>, RunError> {
-    let node = crate::vfs::lookup_path(path).map_err(|_| RunError::NotFound)?;
+    // Follow symbolic links (issue #18): a Debian image is usually reached
+    // through one (`/usr/bin/python3` → `python3.11`, `/lib64/ld-linux…`).
+    let node = crate::vfs::lookup_path_walk(path, true).map_err(|_| RunError::NotFound)?;
     if node.is_directory() {
         return Err(RunError::NotFound);
     }
@@ -596,11 +598,11 @@ fn resolve_exec_path(path: &str) -> String {
             format!("{}/{}", cwd, path)
         }
     };
-    if crate::vfs::lookup_path(&abs).is_ok() {
+    if crate::vfs::lookup_path_walk(&abs, true).is_ok() {
         return abs;
     }
     let mnt = format!("/mnt{}", abs);
-    if crate::vfs::lookup_path(&mnt).is_ok() {
+    if crate::vfs::lookup_path_walk(&mnt, true).is_ok() {
         return mnt;
     }
     abs

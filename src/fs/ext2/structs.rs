@@ -51,6 +51,7 @@ pub const PTRS_PER_BLOCK: u32 = (BS / 4) as u32;
 /// Inode mode bits.
 pub const S_IFREG: u16 = 0x8000;
 pub const S_IFDIR: u16 = 0x4000;
+pub const S_IFLNK: u16 = 0xA000;
 
 /// Journal superblock magic ("PAGHJNL\1") — OUR format, not jbd2.
 pub const JNL_MAGIC: u64 = 0x5041_4748_4A4E_4C01;
@@ -179,6 +180,12 @@ impl Ext2Inode {
     }
     pub fn is_reg(&self) -> bool {
         (self.i_mode & 0xF000) == S_IFREG
+    }
+    /// A symbolic link: the target lives inline in `i_block` (fast,
+    /// `i_blocks == 0`) or in one data block (slow). Layout math lives in
+    /// `super::symlink`.
+    pub fn is_symlink(&self) -> bool {
+        (self.i_mode & 0xF000) == S_IFLNK
     }
 }
 

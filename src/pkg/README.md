@@ -20,6 +20,10 @@ list/setmirror), парсер индекса `Packages`, резолвер зав
 | `install.rs` | Чистая нормализация путей и модель инсталлятора |
 | `install_fs.rs` | Kernel-only ext2-инсталлятор (`install_data_tar`) через `VfsNode`, включая материализацию симлинков |
 | `mirror.rs` | Чистый парсер аргумента `apt setmirror` |
+| `openpgp.rs` | Чистая политика OpenPGP-верификации (issue #32): выбор доверенного ключа, subkey binding, expiry/revocation/key-flags, точки входа `verify_detached` (`Release.gpg`) и `verify_clearsigned` (`InRelease`), `check_pinned_key` |
+| `openpgp_packet.rs` | Чистый слой пакетов: armor (CRC24), framing (old/new, definite lengths), public key/subkey, signature packet, keyring-блок, clearsign-разбор и канонизация |
+| `openpgp_crypto.rs` | Чистая криптография верификатора: правило v4-хеша, RSA PKCS#1 v1.5 / EdDSA / ECDSA по дайджесту, локальная SHA-1 (только для v4-фингерпринтов) |
+| `openpgp_keys.rs` | **Сгенерированный** (`tools/gen_debian_keyring.py`) пиннутый Debian-keyring: байтовые блоки ключей + фингерпринты, алгоритм, размер, окно валидности, подключи |
 
 ## Ключевые символы
 
@@ -106,3 +110,15 @@ gzip — RFC 1952 вручную + `miniz_oxide`; xz — `xz4rust` (словар
   отказывается стартовать на cleartext-конфиге, поэтому PASS не может быть «случайно по HTTP».
 - Индекс RAM-only: полный Debian ≈ 150 MiB декомпрессированного — потолок по памяти,
   при превышении чистый отказ.
+- **OpenPGP-верификатор (issue #32, первый шаг серии).** Реализованы и покрыты host-свойствами
+  P51–P53 (`host-tests/src/properties/p5{1,2,3}.rs`) чистые модули `openpgp{,_packet,_crypto}.rs`:
+  разбор armor/пакетов, проверка `Release.gpg` (detached) и `InRelease` (clearsigned) по
+  пиннутому keyring'у, обработка subkey/expiry/revocation/key-flags. Доверие — только к трём
+  ключам, закреплённым по v4-фингерпринту в `src/pkg/openpgp_keys.rs` (генерируется
+  `tools/gen_debian_keyring.py` из зафиксированного по sha256 `debian-archive-keyring`; рантайм
+  ключи не качает). P53 проверяет РЕАЛЬНЫЕ подписи GnuPG внутри закоммиченных блоков (RSA-4096
+  SHA-512 self-sig + subkey binding, Ed25519 SHA-256 с легаси OID 1.3.6.1.4.1.11591.15.1).
+  Два осознанных отличия от `gpgv`: подпись просроченного ключа отвергается (gpgv её принимает),
+  и частичные длины пакетов не собираются, а отвергаются. Пока НЕ подключено к `apt.rs`:
+  привязка `InRelease` → SHA-256 `Packages` → SHA-256 `.deb` и негативный e2e — следующая задача
+  серии, поэтому строка «подписи метаданных не проверяются» выше остаётся верной до неё.
