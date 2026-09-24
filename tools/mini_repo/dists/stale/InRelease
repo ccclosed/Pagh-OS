@@ -1,0 +1,20 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+Suite: stale
+Codename: pagh-test-stale
+Date: Sun, 01 Jun 2025 00:00:00 UTC
+Architectures: all amd64
+Components: main
+Acquire-By-Hash: no
+
+SHA256:
+ af02e1174392ebf12062b5ad9eb8ca5d5b36364e3ee58c23294e215330a058ef 328 main/binary-amd64/Packages
+ 37efbc8addfb104df5d9cd5c343650b77cceed4b2d5aa5b2e3123a1ef49896ea 268 main/binary-amd64/Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+wngEARYIACAWIQSzW/4QKvENIN6+vEUR/o11ndlAVgUCaVW5AAIbAwAKCRAR/o11
+ndlAVnr3AP9gDYtlwqGio2NeXz8dteEeq6ZS0wzRz4NTsEp/EY8tbwEAwJoD4gzC
+yTP3jBIbk+YdTz+/0fBZQmdsHbLxm6Bi8gg=
+=VerP
+-----END PGP SIGNATURE-----

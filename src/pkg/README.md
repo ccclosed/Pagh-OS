@@ -24,6 +24,7 @@ list/setmirror), парсер индекса `Packages`, резолвер зав
 | `openpgp_packet.rs` | Чистый слой пакетов: armor (CRC24), framing (old/new, definite lengths), public key/subkey, signature packet, keyring-блок, clearsign-разбор и канонизация |
 | `openpgp_crypto.rs` | Чистая криптография верификатора: правило v4-хеша, RSA PKCS#1 v1.5 / EdDSA / ECDSA по дайджесту, локальная SHA-1 (только для v4-фингерпринтов) |
 | `openpgp_keys.rs` | **Сгенерированный** (`tools/gen_debian_keyring.py`) пиннутый Debian-keyring: байтовые блоки ключей + фингерпринты, алгоритм, размер, окно валидности, подключи |
+| `openpgp_test_keys.rs` | **Сгенерированный** (`tools/gen_openpgp_testkey.py`) E2E-якорь: детерминированный тестовый Ed25519-ключ + три ключа Debian; компилируется только под `lx_selftest`/`lx_bigindex` |
 | `release_file.rs` | Чистый парсер тела `Release`/`InRelease`: поля `Suite`/`Codename`/`Date`/`Valid-Until`/`Acquire-By-Hash` и секция `SHA256:` (только она — `MD5Sum:`/`SHA1:` не должны выглядеть как SHA-256) |
 
 ## Ключевые символы
@@ -68,6 +69,8 @@ OOM-аборта. Публикация индекса — только посл�
 `INDEX` (никакого «оставить прошлый индекс»).
 
 ### apt install
+`apt setsuite <suite>` переключает release/suite (по умолчанию `stable`); `apt setmirror`
+по-прежнему меняет только хост и базовый путь.
 `resolve_install` → на каждый пакет: из **той же** записи индекса берутся `Filename`,
 `SHA256` и `Size`; запись без пригодного `SHA256` отвергается (`DigestUnavailable`), затем
 fetch `{base}/{filename}` → сверка SHA-256 **и размера ДО** `parse_ar`/распаковки
@@ -131,6 +134,16 @@ gzip — RFC 1952 вручную + `miniz_oxide`; xz — `xz4rust` (словар
   отказывается стартовать на cleartext-конфиге, поэтому PASS не может быть «случайно по HTTP».
 - Индекс RAM-only: полный Debian ≈ 150 MiB декомпрессированного — потолок по памяти,
   при превышении чистый отказ.
+- **Негативные E2E-кейсы (issue #32, t23).** Локальное зеркало `tools/mini_repo.py` содержит пять
+  suite'ов: `stable` (корректный и подписанный тестовым якорем), `tampered-index` (подпись валидна,
+  но отдаваемый `Packages` заменён на файл **той же длины** с другим SHA-256), `tampered-deb`
+  (метаданные корректны, `.deb` тоже равной длины, но не тот), `unsigned` (подписей нет) и
+  `untrusted` (подписан непроверенным ключом). Ин-гостевые проверки живут в `selftest_lx.rs`
+  (`run_apt_verify_checks`, feature `lx_selftest`) и печатают `LXSELFTEST apt_verify <case> PASS/FAIL`;
+  общий `LXSELFTEST apt_e2e PASS` выдаётся ТОЛЬКО если все они прошли, поэтому один прогон
+  `python3 tools/e2e.py local-mirror` доказывает и позитив, и все четыре отказа. Тестовый якорь
+  (`src/pkg/openpgp_test_keys.rs`, генерируется `tools/gen_openpgp_testkey.py`) компилируется только
+  под `lx_selftest`/`lx_bigindex` — в обычной сборке тестовый ключ недоверенный по построению.
 - **Цепочка доверия apt (issue #32, реализовано).** Подпись `InRelease`/`Release.gpg` по
   пиннутому keyring'у → SHA-256 **и** размер `Packages` из подписанного Release (до
   декомпрессии) → SHA-256 **и** размер каждого `.deb` из подписанного индекса (до

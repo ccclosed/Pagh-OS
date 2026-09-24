@@ -1,3 +1,6 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
 Suite: stable
 Codename: pagh-test-stable
 Date: Thu, 01 Jan 2026 00:00:00 UTC
@@ -8,3 +11,10 @@ Acquire-By-Hash: no
 SHA256:
  11181678e5f8c0d764fbb6704daa1bf2fbeb83fd7587f2a8c5044acba600d161 651 main/binary-amd64/Packages
  55f8f915210d437216d4806e15470d6a737a0679ea0df5ffab6aebdd295c1f67 384 main/binary-amd64/Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+wngEARYIACAWIQSzW/4QKvENIN6+vEUR/o11ndlAVgUCaVW5AAIbAwAKCRAR/o11
+ndlAVnkDAP9RainSHxzohGpalJoYnGnph4OQGmi8tAqCEkAAKYbm7QD/UcMty5/o
+vur4UsrOI0AwJD5dyJA8I5zD5zoFBxsH7wk=
+=5fn3
+-----END PGP SIGNATURE-----

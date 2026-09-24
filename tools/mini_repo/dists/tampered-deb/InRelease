@@ -1,0 +1,20 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+Suite: tampered-deb
+Codename: pagh-test-tampered-deb
+Date: Thu, 01 Jan 2026 00:00:00 UTC
+Architectures: all amd64
+Components: main
+Acquire-By-Hash: no
+
+SHA256:
+ fa1059c20441d35e63de784bf09935600c03cc71127579d5178e1eb85bbd5b41 335 main/binary-amd64/Packages
+ f6e84e1b5d4d764b8e4795b7a0833398240ae5cf0a36f9383e6149a3502d0f08 269 main/binary-amd64/Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+wngEARYIACAWIQSzW/4QKvENIN6+vEUR/o11ndlAVgUCaVW5AAIbAwAKCRAR/o11
+ndlAVmFKAP4kf1vJTPPB0/5dxwYjR6h35U2kvqmRFZNblFCkBeYfqgEAyYE5kcO4
+5HDEqk4M/38NbUlkU1UL/J/TyLyMlcwHLw4=
+=KfI7
+-----END PGP SIGNATURE-----

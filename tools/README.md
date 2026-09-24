@@ -16,7 +16,9 @@
 | `gen_debian_keyring.py` | Генератор пиннутого Debian-keyring'а OpenPGP-верификатора (issue #32): качает зафиксированный по sha256 `debian-archive-keyring_*.deb` (или берёт `--deb FILE`), выбирает ключи **по v4-фингерпринту**, сверяет UID/алгоритм/размер/создание/истечение/подключи, пишет детерминированный `src/pkg/openpgp_keys.rs` (блоки байт + таблица пинов); `--check` — diff без записи, `--print-keyring` — тот же набор как бинарный keyring для `gpg --list-packets`. Перегенерация — только осознанно |
 | `gen_openpgp_fixtures.py` | Генератор OpenPGP-фикстур для host-свойств P51–P53: настоящие подписи GnuPG 2.4 (`--faked-system-time`, Ed25519 + RSA-2048 c signing-подключом, просроченный и непроверенный ключи), пишет `host-tests/src/properties/openpgp_fixtures.rs` (закоммичены; генерация ключей случайна, поэтому перегенерация — осознанный акт) |
 | `pgp_packets.py` | Мини-читалка OpenPGP-пакетов (реестр блоков, MPI, subpacket'ы, v4-фингерпринты) для обоих генераторов выше; только стандартная библиотека |
-| `mini_repo.py` | Мини Debian-зеркало в `tools/mini_repo/` для apt-E2E |
+| `mini_repo.py` | Мини Debian-зеркало в `tools/mini_repo/` для apt-E2E: **шесть suite'ов** — `stable` (корректный и **подписанный**), `tampered-index` (подпись валидна, но отдаваемый `Packages` не тот, что описан в подписанном `Release`; длина совпадает — ловится только SHA-256), `tampered-deb` (метаданные корректны, а `.deb` не тот; тоже равной длины), `unsigned` (подписей нет), `untrusted` (подписан непроверенным ключом) и `stale` (корректный, но более старый triplet — `apt` его принимает, харнесс печатает NOTE). `stable` дополнительно несёт фикстуру `links-pagh` (symlink/hardlink/длинное имя, issue #18). Подпись — `tools/openpgp_sign.py` по детерминированному тестовому seed'у, без секретов в репозитории |
+| `openpgp_sign.py` | Детерминированная OpenPGP-подпись для фикстур (issue #32): RFC 8032 Ed25519 от фиксированного seed + v4-пакеты (public key с легаси-OID, UID, сертификация 0x13, detached/clearsign) + armor с CRC24. Только stdlib, векторы RFC 8032 проверяются перед каждой генерацией; применим только для тестовых фикстур |
+| `gen_openpgp_testkey.py` | Генератор E2E-**тестового** trust-anchor'а `src/pkg/openpgp_test_keys.rs` (компилируется только под `lx_selftest`/`lx_bigindex`): детерминированный Ed25519-ключ + три пиннутых ключа Debian в одной таблице. `--print-keyring DIR` выкладывает бинарные блоки для `gpg --list-packets` |
 | `qemu_shot.py` | Драйвер живого QEMU через monitor: `screendump` (PNG фреймбуфера — консоль, `paint`, курсор, статус-бар) и `sendkey` (ввод в гостя; shell читает **PS/2**, а не serial). Умеет сам поднять headless-инстанс, ответить `n` на вопрос про python3 и дождаться промпта |
 | `build-rust-app.sh` | Сборка userland-приложений (`rust-apps/`) под `x86_64-unknown-linux-musl` |
 | `e2e_local_mirror.ps1` | Детерминированный apt E2E: release-сборка c `--features lx_selftest`, stage, serve mini_repo, QEMU, assert serial-маркеров |
@@ -50,10 +52,19 @@
 
 ## mini_repo.py
 
-Моды: `build` (собирает `dists/stable/main/binary-amd64/Packages[.gz]` + pool с
-`hello-pagh_1.0_amd64.deb` — hand-assembled static ELF, печатающий `hello from apt`),
+Моды: `build` (собирает `dists/<suite>/…` + pool для **шести** suite'ов: `stable` —
+`hello-pagh_1.0_amd64.deb` (hand-assembled static ELF, печатающий `hello from apt`) и
+`links-pagh_1.0_amd64.deb` (symlink/hardlink/длинное имя, issue #18) — плюс
+`tampered-index`, `tampered-deb`, `unsigned`, `untrusted` и `stale`; каждый, кроме
+`unsigned`, подписан детерминированным тестовым ключом, `stable` — эталонный),
 `serve [port]` (bind 0.0.0.0; из гостя виден как `10.0.2.2:8000`),
 `bigindex [N] [port]` — синтетический 60000-станзовый `Packages.gz` для репро-харнесса.
+
+`stable` держит Debian-раскладку пула (`pool/main/…`), поэтому её артефакты совпадают с
+закоммиченными байт-в-байт; остальные suite'ы пишут в `pool/<suite>/…`, чтобы один прогон
+мог отдавать несколько противоречащих release-triplet'ов сразу. Подписанный
+release-триплет — то, что делает возможным `python3 tools/e2e.py local-mirror`;
+отрицательные suite'ы разбирает `run_apt_verify_checks()` в `src/selftest_lx.rs`.
 
 ## E2E-скрипты (PowerShell)
 
