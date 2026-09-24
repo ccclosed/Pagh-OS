@@ -47,13 +47,26 @@ use super::deb::{self, Compression};
 use super::install_fs;
 use super::tar;
 
+/// Host of the built-in live mirror (the official Debian archive), over HTTPS.
+///
+/// SINGLE SOURCE OF TRUTH: the default [`AptConfig`], the shell's mirror
+/// examples and the live E2E harnesses all name the mirror through this
+/// constant and [`DEFAULT_MIRROR_BASE`] instead of re-spelling host and base
+/// (issue #19 cleanup: the live harness used to point at a *second*,
+/// cleartext-HTTP mirror of the same host, so "which mirror does the guest
+/// actually use" had two answers).
+pub const DEFAULT_MIRROR_HOST: &str = "deb.debian.org";
+/// Base path of the built-in live mirror (`https://<host>/debian`). See
+/// [`DEFAULT_MIRROR_HOST`].
+pub const DEFAULT_MIRROR_BASE: &str = "/debian";
+
 /// The active repository configuration for `apt`.
 ///
 /// The index URL is derived from these as
 /// `{base}/dists/{suite}/{component}/binary-{arch}/Packages.{xz,gz,}` and each
 /// `.deb` URL as `{base}/{filename}` (the pool-relative `Filename:` from the
-/// index). Defaults target Debian `stable`/`main`/`amd64` on `deb.debian.org`
-/// over **HTTPS** (TLS 1.3).
+/// index). Defaults target Debian `stable`/`main`/`amd64` on
+/// [`DEFAULT_MIRROR_HOST`] over **HTTPS** (TLS 1.3).
 #[derive(Clone, Debug)]
 pub struct AptConfig {
     /// Mirror host (DNS name or IPv4 literal), e.g. `deb.debian.org`.
@@ -84,11 +97,11 @@ pub struct AptConfig {
 
 impl AptConfig {
     /// The built-in default configuration (Debian `stable`/`main`/`amd64` over
-    /// HTTPS on `deb.debian.org`).
+    /// HTTPS on [`DEFAULT_MIRROR_HOST`]).
     fn defaults() -> AptConfig {
         AptConfig {
-            host: "deb.debian.org".to_string(),
-            base: "/debian".to_string(),
+            host: DEFAULT_MIRROR_HOST.to_string(),
+            base: DEFAULT_MIRROR_BASE.to_string(),
             suite: "stable".to_string(),
             component: "main".to_string(),
             arch: "amd64".to_string(),

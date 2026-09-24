@@ -63,6 +63,17 @@ lx_bigindex = []
 # parse/heap path from the net/scheduler interaction. OFF by default.
 lx_bigindex_inram = []
 
+# Large-stream HTTPS regression (issue #19). OFF by default and SEPARATE from the
+# other harnesses: when set, `boot::kernel_main` spawns
+# `selftest_lx::run_tls_big_check`, which performs ONE multi-MB authenticated
+# `https_get` against the live `deb.debian.org` mirror (the full ~13 MB
+# `Packages.gz` — the size class where the stepped TLS pump used to stall
+# deterministically) and prints `LXSELFTEST tls_big PASS/FAIL`. It isolates the
+# TLS transport from the decompress/parse pipeline, so it is the fast regression
+# pin for #19. Network-dependent. Build with
+# `cargo build --release --features lx_tlsbig`.
+lx_tlsbig = []
+
 # Low-level implementation gate retained for compatibility with existing test
 # scripts. `network_packages` enables it in the normal pagh development build.
 # The name is historical: the transport it gates (HTTPS via net::tls) now

@@ -8,17 +8,18 @@
   feature, which (after DHCP comes up) runs the FULL live update pipeline against
   deb.debian.org /debian stable main amd64 -- with NO local mirror and the QEMU
   default user-net NAT providing outbound connectivity so the guest can reach the
-  internet. The harness switches the transport to cleartext HTTP for the large
-  index download (embedded-tls hangs on ~12 MiB streams, issue #19); the
-  authenticated HTTPS path is covered end-to-end by the small-file HTTPS smoke
-  run of the `lx_selftest` harness, and repository metadata signatures are
-  unverified on either transport (see SECURITY.md):
+  internet. The harness runs over the AUTHENTICATED HTTPS transport end to end
+  (the ~13 MB index included) and refuses to start if the active apt config is
+  cleartext (issue #19: the old "embedded-tls hangs on streams past ~12 MiB"
+  downgrade is gone; a multi-MB TLS fetch completes -- see the `lx_tlsbig`
+  harness). Repository metadata signatures are still unverified (see
+  SECURITY.md):
 
       apt::update()                         # stream-fetch + parse the real index
       LIVE_APT_UPDATE: count=N              # assert N >= 50000 (R1.2)
       Resident_Index_Footprint = ...        # R2.4/R6.2
       apt::install("busybox-static")        # R8.1-8.2
-      run /mnt/bin/busybox via the loader   # R8.3
+      run /mnt/usr/bin/busybox via the loader  # R8.3
 
   This run is NETWORK-DEPENDENT and SLOW under QEMU/TCG. Per resolved open
   question Q-A the timing is SOFT and NON-BINDING: this harness does NOT gate on

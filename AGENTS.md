@@ -107,7 +107,7 @@ release into `limine/`) — do not hard-code Limine versions in scripts.
    restore all state they touch (PMM, heap, IF, VFS). `selftest_lx` checks
    print `LXSELFTEST <name> PASS/FAIL` and return.
 9. **Feature gates**: `default = ["network_packages"]` enables apt; the
-   `lx_selftest` / `lx_livetest` / `lx_bigindex` harnesses must stay
+   `lx_selftest` / `lx_livetest` / `lx_bigindex` / `lx_tlsbig` harnesses must stay
    compiled-out (and boot-unchanged) when unset. TLS is fail-closed: the
    handshake aborts unless the chain validates against the committed CA
    bundle, the SAN authorizes the host, the clock gate passes, and the
@@ -131,7 +131,7 @@ release into `limine/`) — do not hard-code Limine versions in scripts.
   `selftest` shell command; non-destructive, deterministic XorShift seeds).
 - **Linux-compat end-to-end → `selftest_lx`** (feature-gated harnesses) and
   the `tools/e2e_*.ps1` scripts (local mini-repo, live apt update, bigindex
-  repro).
+  repro, multi-MB TLS stream via `lx_tlsbig`).
 - A regression fix without a test is not done. New pure module without a
   property is suspicious.
 
@@ -194,10 +194,18 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
 
 ## Known open gaps (good first issues, all documented in-code)
 
-- procfs does not exist (only emulated `/proc/self/exe` readlink).
+- procfs covers its first slice only (issue #11, contract `docs/procfs.md`):
+  `/proc/{cpuinfo,meminfo,uptime}` and `/proc/self/{exe,cmdline,status,maps}` are
+  rendered from live kernel state (CPUID, PMM counters, the tick clock, the calling
+  process's `CompatState`), and `/proc/self/exe` is a real symlink for
+  `readlink`/`lstat`/`getdents64`. Deferred, and returning `ENOENT` today:
+  `/proc/<pid>` enumeration, `/proc/stat` (needs real user/sys/idle tick
+  accounting), `/proc/loadavg`, `/proc/mounts`, `/proc/self/{fd,stat,statm}` — so
+  `htop`/`ps` are still out of reach.
 - Signals: delivery happens at the syscall-return point; no timer-tick
   delivery, no `kill(2)`/group broadcast, no SIGSTOP/SIGCONT scheduling.
 - NVMe driver is polled and page-chunked; FLUSH (opcode 0x08) is issued at WAL
   transaction boundaries, but there are no PRP lists and no queue depth > 1.
-- embedded-tls deterministically hangs on large streams — live apt update
-  runs over plain HTTP because of it.
+  (The former "embedded-tls hangs on large streams" gap is closed: a multi-MB
+  TLS fetch completes end to end — `lx_tlsbig`, issue #19 — and the live
+  `apt update` runs over HTTPS.)

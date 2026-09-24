@@ -1,0 +1,12 @@
+# Interaction script for `tools/e2e.py shell` — the `lx_tlsbig` regression
+# (issue #19: multi-MB HTTPS stream).
+#
+#   python3 tools/e2e.py shell --features lx_tlsbig --script tools/e2e_tlsbig.script \
+#       --timeout 1000 --settle 30
+#
+# The kernel spawns `selftest_lx::run_tls_big_check` at boot (after DHCP), so the
+# only thing the driver has to do is wait for the verdict line and assert PASS.
+# The wait timeout (900 s) is deliberately generous: the fetch is ~13 MB over
+# QEMU user-net NAT under TCG.
+wait LXSELFTEST tls_big 900
+expect LXSELFTEST tls_big PASS

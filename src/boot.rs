@@ -513,7 +513,8 @@ fn kernel_main() -> ! {
     #[cfg(not(any(
         feature = "lx_selftest",
         feature = "lx_livetest",
-        feature = "lx_bigindex"
+        feature = "lx_bigindex",
+        feature = "lx_tlsbig"
     )))]
     match task::process::spawn_test_user_process() {
         Ok(pid) => info!("user test process spawned (pid {})", pid),
@@ -554,6 +555,18 @@ fn kernel_main() -> ! {
     // feature is off (default).
     #[cfg(feature = "lx_bigindex")]
     task::scheduler::kernel_thread_spawn(crate::selftest_lx::run_bigindex_check);
+
+    // Large-stream HTTPS regression (cargo feature `lx_tlsbig`, issue #19).
+    // One multi-MB authenticated `https_get` against the live mirror's full
+    // `Packages.gz`, isolating the TLS transport from the index pipeline.
+    // Skipped when a broader harness is also enabled, so exactly one live
+    // external download runs per boot (and no two ring-3 processes share the
+    // single-task kernel stack).
+    #[cfg(all(
+        feature = "lx_tlsbig",
+        not(any(feature = "lx_selftest", feature = "lx_livetest"))
+    ))]
+    task::scheduler::kernel_thread_spawn(crate::selftest_lx::run_tls_big_check);
 
     // The first-boot base userland (glibc + python3)
     // download is opt-in now. shell_thread asks Y/n on the console first and

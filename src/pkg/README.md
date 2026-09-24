@@ -100,5 +100,9 @@ gzip — RFC 1952 вручную + `miniz_oxide`; xz — `xz4rust` (словар
   (OpenPGP) и полнота digest'ов пакетов; HTTP-зеркала (`apt setmirror http://…`)
   неаутентифицированы по построению. Fail-closed сборка: `cargo build --no-default-features` —
   тогда `apt update/install` возвращают `NetworkDisabled`.
+- Живой `apt update` идёт по HTTPS ЦЕЛИКОМ, включая ~13 МБ `Packages.gz` (issue #19: сообщённой
+  стойки TLS-транспорта на много-МБ потоках на текущем TCP-стеке нет; пин — харнесс `lx_tlsbig`,
+  диагностика — строки `Package_Fetcher(tls): stage=done|stall …`). Живой харнесс `lx_livetest`
+  отказывается стартовать на cleartext-конфиге, поэтому PASS не может быть «случайно по HTTP».
 - Индекс RAM-only: полный Debian ≈ 150 MiB декомпрессированного — потолок по памяти,
   при превышении чистый отказ.

@@ -21,7 +21,7 @@ net-поток или bounded locked-step помпы); из IRQ-контекст
 | `dns.rs` | Чистый билдер DNS-запросов + парсер A/AAAA (hardened, panic-free) |
 | `http.rs` | Чистый билдер HTTP/1.1 GET + парсер головы ответа (`HeadParse`) |
 | `http_fetch.rs` | Эффектный HTTP GET поверх стека для пакетного фетчера (`http_get`, `fetch_deb`) |
-| `tls.rs` | HTTPS через `embedded-tls` (TLS 1.3) поверх стека: `TlsTransport`, мини-`block_on`, `KernelRng`, `KernelProvider`/`KernelVerifier` — handshake-адаптер к `tls_auth`. **Fail-closed**: без валидной цепочки до CA-бандла, SAN-авторизации хоста, пройденного clock gate и корректного `CertificateVerify` handshake обрывается (у `embedded-tls` ветка «нет верификатора ⇒ пропустить проверку» недостижима — `verifier()` всегда `Ok`) |
+| `tls.rs` | HTTPS через `embedded-tls` (TLS 1.3) поверх стека: `TlsTransport`, мини-`block_on`, `KernelRng`, `KernelProvider`/`KernelVerifier` — handshake-адаптер к `tls_auth`. **Fail-closed**: без валидной цепочки до CA-бандла, SAN-авторизации хоста, пройденного clock gate и корректного `CertificateVerify` handshake обрывается (у `embedded-tls` ветка «нет верификатора ⇒ пропустить проверку» недостижима — `verifier()` всегда `Ok`). Диагностика больших потоков (#19): байт-трейс `TLS_RAW_IN`/`TLS_READ_POLLS`/`TLS_READ_PENDING`, watchdog `stage=stall` со снапшотом flow-control сокета (`tcp::TcpSock::diag`) и строка `stage=done ... bytes_per_s=` на каждый завершённый fetch |
 | `x509.rs` | Чистый строгий DER-ридер + минимальный X.509-парсер для верификатора: `parse_certificate` (TBS целиком как вход подписи, SPKI, SAN, basicConstraints, validity в **i64**), байты `signatureValue` + enforce «внешний AlgorithmIdentifier == TBS» (RFC 5280 §4.1.1.2) |
 | `hostname.rs` | RFC 6125 hostname/SAN-матчинг: wildcard только целым левым лейблом SAN (ровно один лейбл хоста), host-side `*` — всегда отказ, IP-литералы — по октетам |
 | `tls_verify.rs` | Диспетчер подписей сертификатов: RSASSA-PKCS1-v1_5 (SHA-256/384/512, мин. модуль 2048 бит), ECDSA P-256/P-384, Ed25519; RSA-PSS явно отклоняется. Крейты `rsa`/`p384`/`ed25519-dalek` (pure-Rust, vendored) |
@@ -82,6 +82,40 @@ ARP/NDP lookup; не резолвится → парковка кадра + rate
 - Zero-window: persist-зонд **байта на snd_una** (зонд snd_nxt бы корраптил поток).
 - RST-валидация (RFC 5961 упрощённо): слепые RST дропаются; out-of-order очередь `OOO_CAP=16`
   с генерацией dup-ACK+SACK; TIME-WAIT укорочен до 2 c.
+
+### TLS-поток и большие потоки (issue #19)
+
+`https_get` = `resolve → connect → TLS 1.3 handshake (fail-closed verify) → HTTP GET →
+чтение тела по `Content-Length`. Между стеком и `embedded-tls` стоит `TlsTransport`:
+каждый poll берёт `NET`, делает ровно один `Stack::step()`, дренирует rx / заливает tx и
+возвращает `Pending`, НЕ удерживая лок; `block_on` переполливает один pinned future с
+`sleep_ticks(1)` между poll'ами. Бюджет неактивности — 15 c, пере-взводится на каждом
+перемещённом байте, поэтому медленный, но прогрессирующий трансфер не убивается, а
+настоящая стойка превращается в `TimedOut`, а не в вечное молчание.
+
+**Проверено: заявленная в #19 «детерминированная стойка embedded-tls на ~12 MiB» на
+текущем стеке не воспроизводится.** Полный `Packages.gz` (`stable/main/amd64`) —
+13 332 733 B — скачивается одним fetch'ем целиком; доказательство из serial-лога:
+
+    Package_Fetcher(tls): stage=done host=deb.debian.org path=/debian/dists/stable/main/binary-amd64/Packages.gz
+      body=13332733 raw_in=13357139 read_polls=1967 pending_polls=215 bytes_per_s=2134603
+
+(`raw_in` > `body` — это TLS-записи/теги поверх тела плюс рукопожатие; ≈2.1 MB/s под
+QEMU/TCG). Исторически стойка наблюдалась ещё на smoltcp-стеке; собственный TCP-стек
+(`369c408`, 2026-08-24) и фикс «window-update ACK после чтения приложением» (x40,
+`0fb66e5`) закрыли именно тот класс (окно/ack-фидбек), но живой харнесс с тех пор всё
+равно ходил plain HTTP — поэтому старое утверждение перепечатывалось в доках, а не
+перепроверялось.
+
+**Регрессионный пин:** feature `lx_tlsbig` (`selftest_lx::run_tls_big_check`) — один
+много-МБ HTTPS GET того же объекта, ДО фаз decompress/parse, печатает
+`LXSELFTEST tls_big PASS (TLS 1.3; N bytes decrypted end to end)`. Живой `apt update`
+(`lx_livetest`) идёт по HTTPS и сам отказывается стартовать при cleartext-конфиге
+(`set_mirror` без схемы из общих констант `apt::DEFAULT_MIRROR_HOST/BASE` + проверка
+`tls`/порт 443). Если стойка вернётся, watchdog печатает `stage=stall` со счётчиками и
+снапшотом сокета (`state=… rx=…/… free=… adv_wnd=… wnd_update=… rcv_nxt=…`), т.е. сразу
+называет слой: сокет (не растёт `raw_in`), транспорт (растут poll'ы, не растёт `raw_in`)
+или record-слой (растут оба, не растёт тело).
 
 ### Сокеты для Linux-compat
 `src/arch/x86_64/linux/inet_sock.rs`: `InetTcp` (ленивый слот до connect) и `InetUdp`

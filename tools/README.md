@@ -17,7 +17,7 @@
 | `qemu_shot.py` | Драйвер живого QEMU через monitor: `screendump` (PNG фреймбуфера — консоль, `paint`, курсор, статус-бар) и `sendkey` (ввод в гостя; shell читает **PS/2**, а не serial). Умеет сам поднять headless-инстанс, ответить `n` на вопрос про python3 и дождаться промпта |
 | `build-rust-app.sh` | Сборка userland-приложений (`rust-apps/`) под `x86_64-unknown-linux-musl` |
 | `e2e_local_mirror.ps1` | Детерминированный apt E2E: release-сборка c `--features lx_selftest`, stage, serve mini_repo, QEMU, assert serial-маркеров |
-| `e2e_live_update.ps1` | Live `apt update` против `deb.debian.org` (`--features lx_livetest`) по HTTP (embedded-tls висит на ~12 MiB, issue #19); assert `LIVE_APT_UPDATE: count=N`, N ≥ 50000; тайминги soft |
+| `e2e_live_update.ps1` | Live `apt update` против `deb.debian.org` (`--features lx_livetest`) **по HTTPS** (issue #19 закрыт: живой путь идёт аутентифицированным транспортом, харнесс отказывается стартовать на cleartext-конфиге); assert `LIVE_APT_UPDATE: count=N`, N ≥ 50000; тайминги soft |
 | `e2e_bigindex.ps1` | Репро parse-краша #14 (`--features lx_bigindex`, `-InRam` добавляет `lx_bigindex_inram`); скан serial на `[EXC #14]` |
 | `smoke_assertions.ps1` | Проверка smoke-критериев R4.1/R4.2/R7.4 по захваченным serial-логам (промпт достигнут, debug-link работает, аутентификация HTTPS-сервера подтверждена: `LXSELFTEST https_get PASS` либо отказ верификатора `Package_Fetcher(tls): stage=verify cause=…`) |
 | `mini_repo/` | Сгенерированное дерево зеркала (**закоммичено**, чтобы e2e не требовал сборки) |
@@ -62,6 +62,7 @@
 - Замечание: `mini_repo.py serve` слушает 0.0.0.0; скрипты ждут раскладки
   `BOOTX64.EFI` (через `limine.py`) + `OVMF.fd`.
 
+
 ## qemu_shot.py — увидеть экран и нажать клавиши
 
 Serial-лог показывает только то, что ядро пишет в COM1. Фреймбуфер (консоль, статус-бар,
@@ -99,6 +100,27 @@ OVMF ищется тем же кодом, что и в `build.py` (репози�
 частности, надпись `Self-test complete (see serial log)` печатается безусловно — PNG
 доказывает, что набор **запустился**, а не что он прошёл; вердикт берётся из serial
 (`SELFTEST SUMMARY: N routines, M failed checks`).
+### Регрессия много-МБ TLS-потока (issue #19)
+
+Отдельный харнесс `lx_tlsbig` (`selftest_lx::run_tls_big_check`) качает ОДИН
+много-МБ объект — полный `Packages.gz` живой зеркала (`stable/main/amd64`,
+≈13 МБ, ровно тот класс размера, где #19 сообщал детерминированную стойку) — и
+печатает `LXSELFTEST tls_big PASS (TLS 1.3; N bytes decrypted end to end)`.
+Он останавливается ДО фаз decompress/parse, поэтому падение здесь указывает на
+транспорт, а не на парсер индекса. Гоняется через `e2e.py shell` со скриптом
+ожидания:
+
+```sh
+python3 tools/e2e.py shell --features lx_tlsbig --script tools/e2e_tlsbig.script \
+    --timeout 1000 --settle 30
+```
+
+Строка-доказательство в serial-логе: `Package_Fetcher(tls): stage=done …
+body=13332733 raw_in=… read_polls=… pending_polls=… bytes_per_s=…`
+(≈2 MB/s под QEMU/TCG). Если трансфер встанет, watchdog печатает
+`stage=stall … sock=state=… rx=…/… free=… adv_wnd=… wnd_update=…` — по этой
+строке видно, кто встал: сокет, транспорт или record-слой.
+
 
 ## Грабли
 

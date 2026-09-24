@@ -450,6 +450,41 @@ impl TcpSock {
 
     // Read-only accessors for diagnostics / connection-state checks.
 
+    /// One-line flow-control snapshot of this socket, for the TLS large-stream
+    /// stall watchdog (`net::tls`, issue #19).
+    ///
+    /// When a download stalls, the first question is WHO stopped: the peer
+    /// (it stopped sending because the window we advertised closed), our own
+    /// reader (bytes are buffered in `rx` and nothing drains them), or the
+    /// connection itself (state/timers). The fields below answer exactly that:
+    /// `rx`/`free` show the receive backlog and the space left, `adv_wnd` is
+    /// the window field the next segment will advertise, `wnd_update` says
+    /// whether a window-update ACK is queued, and `rcv_nxt`/`peer_fin_seen`
+    /// show how far the stream got.
+    pub(crate) fn diag(&self) -> alloc::string::String {
+        alloc::format!(
+            "state={:?} rx={}/{} free={} adv_wnd={} rcv_nxt={} rcv_scale={} \
+             unacked_segs={} wnd_update={} ooo={} snd_una={} snd_nxt={} snd_wnd={} \
+             snd_scale={} fin_seen={} retries={}",
+            self.state,
+            self.rx.len(),
+            self.rx_cap,
+            self.rx_cap - self.rx.len(),
+            self.rcv_wnd_field(),
+            self.rcv_nxt,
+            self.rcv_scale,
+            self.unacked_segs,
+            self.wnd_update_pending,
+            self.ooo.len(),
+            self.snd_una,
+            self.snd_nxt,
+            self.snd_wnd,
+            self.snd_scale,
+            self.peer_fin_seen,
+            self.retries,
+        )
+    }
+
     pub(crate) fn refused_flag(&self) -> bool {
         self.refused
     }
