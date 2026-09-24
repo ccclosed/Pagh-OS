@@ -244,16 +244,15 @@ def render_module(selected):
         "\n"
         "use super::openpgp::PinnedKey;\n"
     )
-    out.append(
-        "\n/// The Debian archive keys pagh trusts for repository metadata.\n"
-        "///\n"
-        "/// Adding or refreshing a key is a deliberate act: run\n"
-        "/// `tools/gen_debian_keyring.py`, review the diff and commit it. The kernel\n"
-        "/// never fetches or updates keys at runtime.\n"
-        "pub static DEBIAN_KEYRING: &[PinnedKey] = &[\n"
-    )
-    for entry, block, subkeys in selected:
-        out.append("    PinnedKey {\n")
+    for index, (entry, block, subkeys) in enumerate(selected):
+        out.append(
+            f"\n/// Pinned Debian key #{index}: {entry['label']}\n"
+            f"///\n"
+            f"/// One entry of [`DEBIAN_KEYRING`], exported separately so that a build which\n"
+            f"/// adds its own anchors (the `lx_selftest` E2E build) can list the Debian keys\n"
+            f"/// and the extra anchor in ONE table without duplicating the key bytes.\n"
+            f"pub const DEBIAN_KEY_{index}: PinnedKey = PinnedKey {{\n"
+        )
         out.append(f"        label: {rust_string(entry['label'])},\n")
         out.append(f"        fingerprint: {rust_fpr(entry['fpr'])},\n")
         out.append(f"        algo: {entry['algo']},\n")
@@ -273,8 +272,17 @@ def render_module(selected):
             out.append("        ],\n")
         else:
             out.append("        subkeys: &[],\n")
-        out.append("    },\n")
-    out.append("];\n")
+        out.append("};\n")
+    out.append(
+        "\n/// The Debian archive keys pagh trusts for repository metadata.\n"
+        "///\n"
+        "/// Adding or refreshing a key is a deliberate act: run\n"
+        "/// `tools/gen_debian_keyring.py`, review the diff and commit it. The kernel\n"
+        "/// never fetches or updates keys at runtime.\n"
+        "pub static DEBIAN_KEYRING: &[PinnedKey] = &["
+        + ", ".join(f"DEBIAN_KEY_{i}" for i in range(len(selected)))
+        + "];\n"
+    )
     return "".join(out)
 
 

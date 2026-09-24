@@ -1,0 +1,10 @@
+Suite: unsigned
+Codename: pagh-test-unsigned
+Date: Thu, 01 Jan 2026 00:00:00 UTC
+Architectures: all amd64
+Components: main
+Acquire-By-Hash: no
+
+SHA256:
+ ec9ca7a8d30b206862ba53c094455c0350aa21cd136a668ab0c49529e4f3afe7 331 main/binary-amd64/Packages
+ 48e26d7655b9f75ccc59a8f1d5c70c54a7feea05688e8c19ecc9a5bd4976d8a7 267 main/binary-amd64/Packages.gz

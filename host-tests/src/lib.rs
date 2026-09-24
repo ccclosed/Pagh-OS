@@ -300,6 +300,14 @@ pub mod openpgp;
 #[path = "../../src/pkg/openpgp_keys.rs"]
 pub mod openpgp_keys;
 
+// The GENERATED E2E test anchor (tools/gen_openpgp_testkey.py): the deterministic
+// test signing key plus the three pinned Debian keys. Compiled into the kernel only
+// under `lx_selftest`/`lx_bigindex`; included here so P53 can prove the anchor is a
+// well-formed, self-certified key that the verifier accepts — i.e. that the fixture
+// signer and the kernel verifier agree before any QEMU run.
+#[path = "../../src/pkg/openpgp_test_keys.rs"]
+pub mod openpgp_test_keys;
+
 // The pure `Release`/`InRelease` body parser (issue #32): the `SHA256:` section
 // that binds the `Packages` body to the signed metadata, plus the fields the apt
 // trust-chain policy checks (`Suite`/`Codename`/`Date`/`Valid-Until`). P54 pins
