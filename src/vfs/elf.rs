@@ -4,7 +4,6 @@
 use alloc::vec::Vec;
 
 use crate::memory::vmm;
-use alloc::vec::Vec;
 use core::ptr;
 use x86_64::structures::paging::PageTableFlags;
 
