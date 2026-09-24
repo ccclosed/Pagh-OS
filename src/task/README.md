@@ -12,7 +12,7 @@
 | Файл | Роль |
 |---|---|
 | `mod.rs` | Корень: реэкспорт 8 субмодулей |
-| `scheduler.rs` | Round-Robin: `Tcb`, ready-queue, вытеснение по тику (`scheduler_tick_irq`), кооперативный yield, exit/reap, idle-задача, tripwire'ы повреждения фрейма; остановленное состояние — `STOPPED_TASKS` (pid → сохранённые rsp+cr3) и `STOP_REQUESTED`: обе точки requeue паркуют фрейм вместо ротации, `request_exit` запаркованного pid снимает фрейм и ставит его в reap со своим cr3 |
+| `scheduler.rs` | Round-Robin: `Tcb`, ready-queue, вытеснение по тику (`scheduler_tick_irq`), кооперативный yield, exit/reap, idle-задача, tripwire'ы повреждения фрейма; остановленное состояние — `STOPPED_TASKS` (pid → сохранённые rsp+cr3) и `STOP_REQUESTED` (обе точки requeue паркуют фрейм вместо ротации); на тике перед решением о requeue вызывается `signal::tick_action(current_rsp)` — доставка сигнала задаче, которая не заходит в syscall (`Kill` → drop + reap со своим cr3, `Park` → парковка, `Delivered` → фрейм перезаписан на месте) |
 | `switch.rs` | Контекст-свитч на asm: раскладка сохранённого фрейма, `yield_switch()`, `irq32_stub`, `kernel_thread_trampoline`, `scheduler_exit_thread` |
 | `process.rs` | Создание user-процессов: ring-3 стартовые фреймы, `create_user_process`, `run_linux_binary`, `exec_linux_image`, `fork_linux_process`, `spawn_linux_thread` |
 | `compat.rs` | Per-pid реестр `CompatState` (`COMPAT_STATES`): fd-таблица, VM-состояние, TLS, tid/tgid/ppid, cwd, umask, rlimits, exit-коды, зомби (`EXITED_CHILDREN`) |

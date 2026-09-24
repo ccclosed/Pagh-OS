@@ -37,6 +37,7 @@ pub mod process_sys;
 pub mod rtc;
 pub mod signal;
 pub mod signal_frame;
+pub mod trap_frame;
 pub mod unix_sock;
 
 use abi::nr as sysno;
@@ -550,6 +551,18 @@ fn inflight_exit(pid: u64) {
     SYSCALL_INFLIGHT.lock().remove(&pid);
 }
 
+/// Restart the stuck-syscall clock of `pid`'s in-flight entry (called when a task
+/// that was parked by SIGSTOP is resumed). Without it the paused interval would
+/// count towards the watchdog age and a resumed task could be reported as "stuck"
+/// the moment it continues.
+pub fn inflight_refresh(pid: u64) {
+    let now = crate::task::scheduler::ticks();
+    if let Some(e) = SYSCALL_INFLIGHT.lock().get_mut(&pid) {
+        e.2 = now;
+        e.3 = 0;
+    }
+}
+
 /// Human name for the syscalls a task can realistically block in.
 fn wd_sys_name(nr: u64) -> &'static str {
     match nr {
@@ -602,6 +615,15 @@ pub fn watchdog_tick() {
     for (pid, (nr, arg0, start, warned, _dumped)) in snapshot {
         if !crate::task::compat::compat_exists(pid) {
             SYSCALL_INFLIGHT.lock().remove(&pid);
+            continue;
+        }
+        // A task parked by SIGSTOP is not stuck: it is STOPPED, and its in-flight
+        // entry simply freezes with it (a task blocked in a wait loop can be parked
+        // from another context by a group stop). Reporting it would make
+        // `[WATCHDOG]` — an E2E problem marker — fire for a process that is doing
+        // exactly what it was told to do. The entry's clock is restarted on resume
+        // (`inflight_refresh`), so the paused time never counts as "stuck".
+        if crate::task::scheduler::is_stopped(pid) {
             continue;
         }
         let age = now.saturating_sub(start);

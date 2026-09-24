@@ -76,13 +76,13 @@ The thread is idempotent; delete `disk.img` to re-provision from scratch.
 
 These return `-ENOSYS` or a stub (logged once per syscall number per process):
 
-- Signals: delivery is real but happens **only at the syscall-return point**
-  (`rt_sigaction` handlers get a real `rt_sigframe`, `rt_sigreturn` restores the
-  context, `EINTR` wakes the patched blocking waits, `kill(2)`/`tgkill` send
-  signals including process-group broadcasts, and `SIGSTOP`/`SIGCONT` park/resume
-  the task with `wait4(WUNTRACED)`/`WCONTINUED` reporting both state changes).
-  Delivery from the timer-tick return path is still missing, so a CPU-bound loop
-  that never enters a syscall does not see a signal.
+- Signals: delivery is real at the syscall-return point AND from the timer-tick
+  return path (`rt_sigaction` handlers get a real `rt_sigframe`, `rt_sigreturn`
+  restores the context, `EINTR` wakes the patched blocking waits, `kill(2)`/`tgkill`
+  send signals including process-group broadcasts, `SIGSTOP`/`SIGCONT` park/resume
+  with `wait4(WUNTRACED)`/`WCONTINUED`, and a CPU-bound loop with no syscalls is
+  interrupted by the tick). Still missing: `SIGCHLD` on stop/continue, job-control
+  `^Z`, and a real process-group model.
 - `timerfd` — programs needing timerfd descriptors still fail.
 - `procfs` covers the first slice only (issue #11): `/proc/cpuinfo`, `/proc/meminfo`,
   `/proc/uptime` and `/proc/self/{exe,cmdline,status,maps}`, rendered from live kernel

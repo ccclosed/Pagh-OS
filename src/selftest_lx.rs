@@ -278,6 +278,14 @@ pub fn run_tls_big_check() {
 /// for the single network pump (a slow/unreachable external HTTPS handshake would
 /// otherwise starve the local apt fetch).
 pub fn run_post_net_checks() {
+    // Issue #12 / t9 FIRST, and here rather than in `run()`: this check waits on
+    // ticks (`sleep_ticks`), which means unmasking interrupts, and `run()` executes
+    // on the BOOT thread while the ready queue is non-empty — the first tick would
+    // file the boot thread's stack under the idle task and it would never be
+    // scheduled again (see the `REENTRY_ALLOWED` note in `linux::mod`). A spawned
+    // kernel thread is schedulable, so waiting here is safe (and the same reason
+    // every other waiting check in this file lives in a spawned harness).
+    check_tick_delivery();
     run_apt_e2e();
     // Give the scheduler a window to run the just-enqueued hello-pagh process so
     // its "hello from apt" output lands on serial before the external HTTPS test
@@ -994,6 +1002,195 @@ fn verify_file(path: &str, expected: &[u8]) -> Result<(), &'static str> {
 /// delivery for such a process — but the test binary must not rely on that safety
 /// net: it is a Compat_Process and therefore has to take the compat path. Both
 /// instructions are two bytes, so `CODE_LEN` and the ELF layout are unchanged.
+/// Issue #12 (t9): a compat process that installs a `SIGUSR1` handler and then
+/// parks itself in a CPU-bound loop with NO syscalls must still be interrupted —
+/// the timer tick is the only return path such a process ever takes.
+///
+/// POSITIVE proof, not "the process vanished": the handler writes `/mnt/tick.done`
+/// (4 bytes) and then exits. A default-action kill (the process never got the
+/// signal, or the handler was not installed) leaves no file, and a signal that is
+/// never delivered leaves the process spinning forever — both fail this check.
+fn check_tick_delivery() {
+    let name = "tick_signal_cpu_bound";
+    // Clear a previous run's marker through the VFS (the handler writes it with
+    // plain Linux syscalls).
+    if let Ok(dir) = vfs::lookup_path("/mnt") {
+        let _ = dir.remove("tick.done");
+    }
+    let elf = build_tick_test_elf();
+    if let Err(d) = write_mnt_file("tickbin", &elf) {
+        fail(name, d);
+        return;
+    }
+    let pid = match run_linux_binary("/mnt/tickbin", &[b"tickbin"], &[]) {
+        Ok(pid) => pid,
+        Err(_) => {
+            fail(name, "run_linux_binary failed");
+            return;
+        }
+    };
+    // Give it time to install the handler and reach the no-syscall loop.
+    scheduler::sleep_ticks(50);
+    if !compat::compat_exists(pid) {
+        fail(
+            name,
+            "process exited before the signal (handler install failed?)",
+        );
+        return;
+    }
+    if crate::arch::x86_64::linux::signal::send_signal(
+        pid,
+        crate::arch::x86_64::linux::signal_frame::SIGUSR1,
+    )
+    .is_err()
+    {
+        fail(name, "send_signal(SIGUSR1) failed");
+        return;
+    }
+    // The tick path must deliver it to the CPU-bound loop; the handler then writes
+    // the marker. 200 ticks is a very generous bound (the tick rate is 1 kHz).
+    for _ in 0..200 {
+        if verify_file("/mnt/tick.done", b"TICK").is_ok() {
+            pass(name);
+            return;
+        }
+        scheduler::sleep_ticks(1);
+    }
+    fail(
+        name,
+        "no /mnt/tick.done marker within 200 ticks: the CPU-bound process did not run its SIGUSR1 handler (tick delivery?)",
+    );
+}
+
+/// Hand-assembled `ET_EXEC` x86_64 ELF for [`check_tick_delivery`]:
+///
+/// ```text
+///   _start:   rt_sigaction(SIGUSR1, &act, NULL, 8)
+///   1:        jmp 1b          ; CPU-bound: no syscall, so only a tick can
+///                             ; interrupt this process
+///   handler:  open("/mnt/tick.done", O_WRONLY|O_CREAT|O_TRUNC, 0644)
+///             write(fd, "TICK", 4)
+///             exit_group(0)
+///   restorer: rt_sigreturn    ; the delivered frame's pretcode
+///   act:      { handler, SA_RESTORER, restorer, 0 }
+///   path:     "/mnt/tick.done\0"
+///   msg:      "TICK"
+/// ```
+///
+/// The builder is TWO-PASS on purpose: the instructions are emitted with zero
+/// placeholders for the data addresses, the real addresses are derived from the
+/// FINAL code length, and the placeholders are patched afterwards. A
+/// hand-maintained length constant is a silent way to point the handler at the
+/// middle of an instruction (the first version of this file did exactly that, and
+/// release builds do not run `debug_assert!`) — deriving the addresses from the
+/// emitted bytes cannot drift.
+fn build_tick_test_elf() -> Vec<u8> {
+    const VBASE: u64 = 0x40_0000;
+    const EHSIZE: usize = 64;
+    const PHSIZE: usize = 56;
+    const O_WRONLY_CREAT_TRUNC: u32 = 0o1 | 0o100 | 0o1000;
+    const MODE_0644: u32 = 0o644;
+    const PATH: &[u8] = b"/mnt/tick.done\0";
+    const MSG: &[u8] = b"TICK";
+
+    let code_off = EHSIZE + PHSIZE;
+    let mut code: Vec<u8> = Vec::new();
+    // rt_sigaction(10, &act, 0, 8) — act address patched below.
+    code.extend_from_slice(&[0xB8, 0x0D, 0x00, 0x00, 0x00]); // mov eax, 13
+    code.extend_from_slice(&[0xBF, 0x0A, 0x00, 0x00, 0x00]); // mov edi, SIGUSR1
+    code.push(0xBE); // mov esi, imm32
+    let patch_act = code.len();
+    code.extend_from_slice(&0u32.to_le_bytes());
+    code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+    code.extend_from_slice(&[0x41, 0xBA, 0x08, 0x00, 0x00, 0x00]); // mov r10d, 8
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+                                           // The CPU-bound loop: no syscalls at all.
+    let loop_off = code.len();
+    code.extend_from_slice(&[0xEB, 0xFE]); // 1: jmp 1b
+                                           // handler(): open the marker file, write it, exit 0. Addresses patched below.
+    let handler_off = code.len();
+    code.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]); // mov eax, 2 (open)
+    code.push(0xBF); // mov edi, imm32 (path)
+    let patch_path = code.len();
+    code.extend_from_slice(&0u32.to_le_bytes());
+    code.extend_from_slice(&[0xBE]);
+    code.extend_from_slice(&O_WRONLY_CREAT_TRUNC.to_le_bytes()); // mov esi, flags
+    code.extend_from_slice(&[0xBA]);
+    code.extend_from_slice(&MODE_0644.to_le_bytes()); // mov edx, mode
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall -> fd in eax
+    code.extend_from_slice(&[0x89, 0xC7]); // mov edi, eax
+    code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1 (write)
+    code.push(0xBE);
+    let patch_msg = code.len();
+    code.extend_from_slice(&0u32.to_le_bytes());
+    code.extend_from_slice(&[0xBA]);
+    code.extend_from_slice(&(MSG.len() as u32).to_le_bytes()); // mov edx, 4
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    code.extend_from_slice(&[0xB8, 0xE7, 0x00, 0x00, 0x00]); // mov eax, 231
+    code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall (exit_group)
+                                           // restorer: rt_sigreturn — the frame's pretcode.
+    let restorer_off = code.len();
+    code.extend_from_slice(&[0xB8, 0x0F, 0x00, 0x00, 0x00]); // mov eax, 15
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    // Second pass: derive the data addresses from the FINAL code length and patch.
+    let act_off = (code_off + code.len() + 7) & !7;
+    let act_addr = VBASE + act_off as u64;
+    let path_off = act_off + 32;
+    let path_addr = VBASE + path_off as u64;
+    let msg_off = path_off + PATH.len();
+    let msg_addr = VBASE + msg_off as u64;
+    code[patch_act..patch_act + 4].copy_from_slice(&(act_addr as u32).to_le_bytes());
+    code[patch_path..patch_path + 4].copy_from_slice(&(path_addr as u32).to_le_bytes());
+    code[patch_msg..patch_msg + 4].copy_from_slice(&(msg_addr as u32).to_le_bytes());
+    let handler_addr = VBASE + (code_off + handler_off) as u64;
+    let restorer_addr = VBASE + (code_off + restorer_off) as u64;
+    let _ = loop_off; // documented above; the loop is not addressed
+
+    let entry = VBASE + code_off as u64;
+    let total_len = (msg_off + MSG.len()) as u64;
+
+    let mut elf: Vec<u8> = Vec::new();
+    // ELF64 header.
+    elf.extend_from_slice(&[0x7F, b'E', b'L', b'F']);
+    elf.push(2); // ELFCLASS64
+    elf.push(1); // ELFDATA2LSB
+    elf.push(1); // EI_VERSION
+    elf.push(0); // System V
+    elf.extend_from_slice(&[0u8; 8]);
+    elf.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+    elf.extend_from_slice(&0x3Eu16.to_le_bytes()); // e_machine = EM_X86_64
+    elf.extend_from_slice(&1u32.to_le_bytes()); // e_version
+    elf.extend_from_slice(&entry.to_le_bytes());
+    elf.extend_from_slice(&(EHSIZE as u64).to_le_bytes()); // e_phoff
+    elf.extend_from_slice(&0u64.to_le_bytes()); // e_shoff
+    elf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    elf.extend_from_slice(&(EHSIZE as u16).to_le_bytes());
+    elf.extend_from_slice(&(PHSIZE as u16).to_le_bytes());
+    elf.extend_from_slice(&1u16.to_le_bytes()); // e_phnum
+    elf.extend_from_slice(&[0u8; 6]); // shentsize/shnum/shstrndx
+                                      // Program header: one RWX PT_LOAD covering everything.
+    elf.extend_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    elf.extend_from_slice(&7u32.to_le_bytes()); // PF_R|PF_W|PF_X
+    elf.extend_from_slice(&0u64.to_le_bytes()); // p_offset
+    elf.extend_from_slice(&VBASE.to_le_bytes()); // p_vaddr
+    elf.extend_from_slice(&VBASE.to_le_bytes()); // p_paddr
+    elf.extend_from_slice(&total_len.to_le_bytes()); // p_filesz
+    elf.extend_from_slice(&total_len.to_le_bytes()); // p_memsz
+    elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
+    elf.extend_from_slice(&code);
+    elf.resize(act_off, 0);
+    // struct sigaction: { handler, flags, restorer, mask } (32 bytes, sigsetsize 8).
+    elf.extend_from_slice(&handler_addr.to_le_bytes());
+    elf.extend_from_slice(&crate::arch::x86_64::linux::signal_frame::SA_RESTORER.to_le_bytes());
+    elf.extend_from_slice(&restorer_addr.to_le_bytes());
+    elf.extend_from_slice(&0u64.to_le_bytes()); // sa_mask
+    elf.extend_from_slice(PATH);
+    elf.extend_from_slice(MSG);
+    elf
+}
+
 fn build_linux_test_elf() -> Vec<u8> {
     const VBASE: u64 = 0x40_0000;
     const EHSIZE: usize = 64;

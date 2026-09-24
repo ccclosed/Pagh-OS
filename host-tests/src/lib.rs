@@ -179,6 +179,20 @@ pub mod signal_frame;
 #[path = "../../src/arch/x86_64/linux/kill.rs"]
 pub mod kill;
 
+// `regs` is the pure 15-GPR syscall frame contract (`repr(C)`, `rax` at offset
+// 112) — `core`-only and self-contained, included here so the tick-path frame
+// mirror below can be asserted against the REAL struct rather than a copy.
+#[path = "../../src/arch/x86_64/linux/regs.rs"]
+pub mod regs;
+
+// `trap_frame` is the pure mirror of the frame `irq32_stub` leaves on the kernel
+// stack plus the timer-tick delivery plan (issue #12, task t9): the adapter that
+// makes it impossible to confuse the IRQ frame's `rax` (+120) with the syscall
+// frame's user-RSP slot. Its `const` assertions pin the offsets `src/test.rs`
+// asserts byte-for-byte in-QEMU (property `irq_frame`).
+#[path = "../../src/arch/x86_64/linux/trap_frame.rs"]
+pub mod trap_frame;
+
 // `x509` is the pure minimal DER (ASN.1) reader + X.509 time decoding that the
 // TLS server-certificate verifier (issue #14) is built on. `core`-only and
 // self-contained — its calendar math deliberately duplicates
@@ -430,6 +444,7 @@ mod properties {
     // discards every pending stop-class bit; a stop signal discards a pending
     // SIGCONT). Descriptive module name, same reason as `kill_target`.
     mod signal_stop;
+
 // The apt trust chain (issue #32, contract OPENPGP-VERIFY-CONTRACT.md
     // §5/§6): P54 covers the `Release` parser that binds `Packages` to the
     // signed metadata, P55 covers the per-record `.deb` digest on BOTH parser
@@ -437,6 +452,12 @@ mod properties {
     // that would "verify" any payload).
     mod p54;
     mod p55;
+// The timer-tick frame adapter (issue #12, task t9): iret-frame mirror, the
+    // ring-3 classification, the exact handler-entry mutation set, the
+    // "delivered signal == consumed signal" guard and the rt_sigframe round trip
+    // for a tick-delivered signal. Descriptive module name, same reason as
+    // `kill_target`.
+    mod irq_frame;
 
 }
 
