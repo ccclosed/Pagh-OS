@@ -134,11 +134,12 @@ PATH_ALIASES: dict[str, str] = {
 #: AND the condition that removes it: the entry itself becomes a finding the moment the
 #: path is tracked by git (see `_in_repo`), so this list cannot rot the way the prose did.
 ALLOWED_MISSING: dict[str, str] = {
-    "docs/procfs.md": "written on vfs/procfs (ac339c8) and in flight for issue #11; "
-                      "delete this entry when that PR merges",
-    "tools/e2e.py": "committed on tools/e2e-verify-integrity (cd66944) and in flight; the "
-                    "Linux/CI replacement for the e2e_*.ps1 harnesses, delete this entry "
-                    "when that PR merges",
+    # Empty on purpose: both in-flight paths (`docs/procfs.md` from vfs/procfs and
+    # `tools/e2e.py` from tools/e2e-verify-integrity) landed in main, and the gate
+    # demanded their removal the moment they became tracked — which is exactly the
+    # self-extinguishing behaviour these exceptions are for. Add an entry only for a
+    # path a branch has not merged yet; it expires on trackedness, not on a file
+    # merely lying around in the working tree.
 }
 
 PATH_PREFIXES = ("src/", "tools/", "docs/", "host-tests/", "vendor/", "third_party/",

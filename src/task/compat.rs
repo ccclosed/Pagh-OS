@@ -337,9 +337,7 @@ pub fn note_child_stopped(child: u64, sig: u64) {
     let Some(parent) = reporting_parent(child) else {
         return;
     };
-    STOPPED_CHILDREN
-        .lock()
-        .insert((parent, child), sig as u8);
+    STOPPED_CHILDREN.lock().insert((parent, child), sig as u8);
     CONTINUED_CHILDREN.lock().remove(&(parent, child));
 }
 

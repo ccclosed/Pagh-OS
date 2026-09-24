@@ -203,7 +203,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   fully backward-compatible ones. Precedent: `release 1.1.0: the tick-rate
   change is a feature (behavior change), so minor bump, not patch`.
   Land the bump in the same PR (or the final commit of a stacked series)
-  that ships the feature — not some day later. **`main` currently reads 2.4.2**
+  that ships the feature — not some day later. **`main` currently reads 2.5.0**
   (tags 2.3.0 → 2.4.0 → 2.4.1 → 2.4.2); `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not

@@ -4887,11 +4887,9 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             "shell::path/listing format behaviors (unit)",
             shell_prop_tests::unit_path_and_listing_format
         ),
-
         (
             "entropy::AT_RANDOM blocks distinct and non-degenerate (issue #16)",
             at_random_tests::blocks_are_distinct_and_mixed
-
         ),
     ]
 }
