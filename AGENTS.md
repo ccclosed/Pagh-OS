@@ -156,6 +156,11 @@ kernel-e2e-legacy -> tools/e2e_*.ps1         # Windows-only legacy harnesses (ne
   `supported_set_is_exact` list in `abi.rs` must match `is_supported`.
 - **Kernel-internal state → in-QEMU selftests** (`src/test.rs`, run via the
   `selftest` shell command; non-destructive, deterministic XorShift seeds).
+  `selftest 2` runs the suite twice in one boot and prints a
+  `SELFTEST IDEMPOTENCY: …` verdict plus each pass's
+  `[selftest] PMM hygiene: free frames … -> …` ledger: a routine that retains
+  PMM frames (or any other kernel state) makes the passes diverge, which is how
+  an ELF fuzz routine was found to drain the whole pool.
 - **Linux-compat end-to-end → `selftest_lx`** (feature-gated harnesses) plus the
   in-guest driver `tools/e2e.py` (modes `selftest`, `local-mirror`, `live-update`,
   `bigindex`, `shell`): local mini-repo, live apt update, bigindex repro,

@@ -12,10 +12,79 @@ static FAILED_CHECKS: AtomicU32 = AtomicU32::new(0);
 
 pub fn reset_failures() {
     FAILED_CHECKS.store(0, Ordering::Relaxed);
+    SKIPPED_CHECKS.store(0, Ordering::Relaxed);
+    SKIP_REASONS.lock().clear();
 }
 
 pub fn failed_checks() -> u32 {
     FAILED_CHECKS.load(Ordering::Relaxed)
+}
+
+/// Checks the current routine did NOT execute because the environment could not
+/// support them (no block device, a starved frame pool, …).
+///
+/// A skip is **never** a success: before this counter existed a routine that
+/// could not run printed `ok`, so `SELFTEST SUMMARY: … 0 failed checks` looked
+/// green while part of the suite had not happened at all.
+static SKIPPED_CHECKS: AtomicU32 = AtomicU32::new(0);
+
+/// Per-reason skip counts of the routine currently running (`reason -> count`).
+static SKIP_REASONS: crate::sync::spinlock::Spinlock<
+    alloc::collections::BTreeMap<&'static str, u32>,
+> = crate::sync::spinlock::Spinlock::new(alloc::collections::BTreeMap::new());
+
+/// Per-reason skip counts of the whole run. Not cleared by [`reset_failures`]:
+/// the summary is printed after the last routine's reset has wiped the
+/// per-routine map, so without this accumulator the breakdown would print empty.
+static SKIP_REASONS_TOTAL: crate::sync::spinlock::Spinlock<
+    alloc::collections::BTreeMap<&'static str, u32>,
+> = crate::sync::spinlock::Spinlock::new(alloc::collections::BTreeMap::new());
+
+/// Clear the run-wide skip accumulator (once, at the start of `run_all`).
+pub fn reset_skip_totals() {
+    SKIP_REASONS_TOTAL.lock().clear();
+}
+
+/// Skips recorded by the routine that is running right now.
+pub fn skipped_checks() -> u32 {
+    SKIPPED_CHECKS.load(Ordering::Relaxed)
+}
+
+/// Skips recorded by the whole run, across every routine.
+pub fn skipped_total() -> u32 {
+    SKIP_REASONS_TOTAL.lock().values().copied().sum()
+}
+
+/// Record one skipped check with its reason. Never touches the success path.
+pub fn record_skip(reason: &'static str) {
+    SKIPPED_CHECKS.fetch_add(1, Ordering::Relaxed);
+    *SKIP_REASONS.lock().entry(reason).or_insert(0) += 1;
+    *SKIP_REASONS_TOTAL.lock().entry(reason).or_insert(0) += 1;
+}
+
+/// `reason xN, reason2 xM` for the summary line (empty when nothing was skipped).
+pub fn skip_breakdown() -> alloc::string::String {
+    use alloc::string::ToString;
+    let mut out = alloc::string::String::new();
+    for (reason, n) in SKIP_REASONS.lock().iter() {
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        out.push_str(reason);
+        out.push_str(" x");
+        out.push_str(&n.to_string());
+    }
+    out
+}
+
+/// Declare a check that could not run. Prints its own line and counts as a skip,
+/// never as an `ok` — grepping the summary for failures must not hide it.
+#[macro_export]
+macro_rules! skip_kernel {
+    ($reason:expr, $msg:expr) => {{
+        $crate::test::record_skip($reason);
+        $crate::kprintln!("SKIP: {}: {} [{}]", file!(), $msg, $reason);
+    }};
 }
 
 fn record_failure() {
@@ -1175,6 +1244,8 @@ mod elf_prop_tests {
 
         let mut completed = 0u32;
         let mut accepted = 0u32;
+        let mut released = 0u32;
+        let start_frames = crate::memory::pmm::free_frames();
         for _ in 0..64 {
             let mut d = make_elf(0x401000);
             let idx = (rng.next() as usize) % region;
@@ -1190,10 +1261,38 @@ mod elf_prop_tests {
                     before,
                     "fuzz: a rejected load must not consume a single PMM frame"
                 ),
-                Ok(_) => accepted += 1,
+                Ok(proc) => {
+                    accepted += 1;
+                    // An `Ok` load hands back a live address space that this test
+                    // now owns: release it, or the loop retains ~1.8k frames per
+                    // iteration and starves every routine that runs after it (the
+                    // pool was measured going from 113 620 free frames to 0 inside
+                    // this one routine, after which anything spawning a kernel
+                    // thread panicked and took the suite's verdict with it).
+                    if crate::task::scheduler::drop_exclusive_user_space(proc.pml4_phys) {
+                        released += 1;
+                    } else {
+                        crate::warn!(
+                            "[selftest] elf fuzz: user space {:#x} not exclusively owned",
+                            proc.pml4_phys
+                        );
+                    }
+                }
             }
             completed += 1;
         }
+        let net = start_frames as i64 - crate::memory::pmm::free_frames() as i64;
+        crate::kprintln!(
+            "[selftest] elf fuzz: {} iterations, {} Ok ({} address spaces released), net frames {}",
+            completed,
+            accepted,
+            released,
+            net
+        );
+        assert_kernel!(
+            accepted == released || net <= 64,
+            "fuzz: the routine must not retain PMM frames for the rest of the suite"
+        );
 
         // Reaching here means every fuzz iteration returned without panicking.
         assert_eq_kernel!(
@@ -5342,10 +5441,17 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
 /// PMM free counts, heap state, interrupt flags, VFS, etc. before returning),
 /// so `run_all` is safe to invoke on demand from the running shell. It is NOT
 /// run automatically during boot.
-pub fn run_all() {
+/// Run every in-kernel routine once.
+///
+/// Returns `(routines, failed checks, skipped checks, net PMM frames consumed)`.
+/// The last two exist so `selftest 2` can compare two passes in one boot: a
+/// routine that retains PMM frames (or any other kernel state) makes the passes
+/// diverge, which is how the ELF fuzz routine was caught draining the whole pool.
+pub fn run_all() -> (usize, u32, u32, i64) {
     let tests = all_tests();
     crate::kprintln!("=== kernel self-test ({} routines) ===", tests.len());
     let mut total_failed = 0u32;
+    let frames_before = crate::memory::pmm::free_frames();
     for (name, f) in tests.iter() {
         crate::kprintln!("RUN  {}", name);
         // A failed check inside `f` prints its own `FAIL: file:line: msg` line
@@ -5353,21 +5459,39 @@ pub fn run_all() {
         reset_failures();
         f();
         let failed = failed_checks();
+        let skipped = skipped_checks();
         total_failed += failed;
-        if failed == 0 {
+        if failed == 0 && skipped == 0 {
             crate::kprintln!("ok   {}", name);
+        } else if failed == 0 {
+            crate::kprintln!(
+                "skip {} ({} check(s) skipped: {})",
+                name,
+                skipped,
+                skip_breakdown()
+            );
         } else {
             crate::kprintln!("FAIL {} ({} failed checks)", name, failed);
         }
+        crate::kprintln!(
+            "[selftest] PMM hygiene: free frames {} -> {}",
+            frames_before,
+            crate::memory::pmm::free_frames()
+        );
     }
+    let frames_after = crate::memory::pmm::free_frames();
+    let delta = frames_before as i64 - frames_after as i64;
     crate::kprintln!("=== self-test complete ===");
     // Machine-readable verdict: grepping for `ok` is not one, and grepping for
-    // `FAIL:` misses a routine that failed without printing (or vice versa).
+    // `FAIL:` misses a routine that failed without printing (or vice versa). The
+    // skip count is part of the verdict because a skipped check is NOT a pass.
     crate::kprintln!(
-        "SELFTEST SUMMARY: {} routines, {} failed checks",
+        "SELFTEST SUMMARY: {} routines, {} failed checks, {} skipped",
         tests.len(),
-        total_failed
+        total_failed,
+        skipped_total()
     );
+    (tests.len(), total_failed, skipped_total(), delta)
 }
 
 // ============================================================================

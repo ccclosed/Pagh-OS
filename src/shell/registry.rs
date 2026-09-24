@@ -170,8 +170,8 @@ pub static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "selftest",
-        description: "Run kernel self-test suite (serial)",
-        usage: "selftest",
+        description: "Run kernel self-test suite (serial; N passes = idempotency check)",
+        usage: "selftest [passes]",
         handler: super::commands::cmd_selftest,
     },
     CommandSpec {
