@@ -16,9 +16,9 @@ list/setmirror), парсер индекса `Packages`, резолвер зав
 | `apt_index.rs` | Чистый парсер Debian-индекса (RFC822-станзы) + компактный arena-backed `PackageIndex` |
 | `apt_resolve.rs` | Чистый резолвер зависимостей → план установки dependency-first |
 | `deb.rs` | Чистый парсер `ar`/`.deb`, классификация сжатия, gzip/xz/zstd декомпрессоры (буферные и streaming) |
-| `tar.rs` | Чистый POSIX/ustar tar reader/writer, zero-copy, валидация checksum |
+| `tar.rs` | Чистый POSIX/ustar/GNU/pax tar reader/writer, zero-copy, валидация checksum: `TarType::{Regular,Directory,Symlink,Hardlink,Other}`, GNU `'L'`/`'K'`, ustar `prefix`, pax `path=`/`linkpath=` |
 | `install.rs` | Чистая нормализация путей и модель инсталлятора |
-| `install_fs.rs` | Kernel-only ext2-инсталлятор (`install_data_tar`) через `VfsNode`, включая материализацию симлинков |
+| `install_fs.rs` | Kernel-only ext2-инсталлятор (`install_data_tar`) через `VfsNode`: реальные симлинки и хардлинки (issue #18), создание недостающих родителей |
 | `mirror.rs` | Чистый парсер аргумента `apt setmirror` |
 | `openpgp.rs` | Чистая политика OpenPGP-верификации (issue #32): выбор доверенного ключа, subkey binding, expiry/revocation/key-flags, точки входа `verify_detached` (`Release.gpg`) и `verify_clearsigned` (`InRelease`), `check_pinned_key` |
 | `openpgp_packet.rs` | Чистый слой пакетов: armor (CRC24), framing (old/new, definite lengths), public key/subkey, signature packet, keyring-блок, clearsign-разбор и канонизация |
@@ -41,6 +41,8 @@ list/setmirror), парсер индекса `Packages`, резолвер зав
   `decompress_bytes_capped`, `decompress_stream(data, c, max, sink)`.
 - `tar`: `read_tar(buf) -> Vec<TarEntry>`, `write_tar(entries)`; `TarType::{Regular, Directory, Symlink, Other}`.
 - `install_fs`: `install_data_tar(entries, root) -> usize`; `InstallError::{NoSpace, Vfs}`.
+- `install`: `plan_install(entries) -> InstallPlan` — чистый планировщик (файлы, симлинки, порядок хардлинков, `deferred`/`unresolved`, счётчики пропусков).
+- `tar`: ещё `write_tar_members(members, TarFormat)` + `TarMember` (фикстуры со ссылками и длинными именами), `effective_path(entry)` (склейка ustar `prefix`).
 
 ## Как работает
 
@@ -65,12 +67,20 @@ owned `PkgRecord`). Поток ограничен `MAX_INDEX_STREAM_BYTES` (512 
 отсутствующие транзитивные депы молча пропускаются, первый годный альтернативный вариант,
 виртуалы через Provides.
 
-### Инсталляция в ext2
-Пропуск non-regular записей; нормализация пути (`..`-выход за корень → `SkipUnsafe`);
-создание недостающих родителей; удаление+пересоздание существующего файла (ext2 `write_file`
-только растит `i_size`); `VfsError::IoError` от ext2 = out-of-space → частичный файл удаляется,
-`InstallError::NoSpace`. Симлинки материализуются копиями (до 4 проходов по цепочкам) —
-в ext2-драйвере симлинков нет.
+### Инсталляция в ext2 (issue #18)
+Порядок и выбор членов архива решает **чистый** `install::plan_install` (host-свойства
+`tar_links`), а `install_data_tar` его исполняет:
+- регулярные файлы — как раньше: нормализация пути (`..`-выход за корень → `SkipUnsafe`),
+  создание недостающих родителей (резолв **со следованием по ссылкам**, поэтому `lib64 → usr/lib64`
+  кладёт файл внутрь цели), удаление+пересоздание существующей записи (ext2 `write_file` только
+  растит `i_size`);
+- **симлинки создаются как симлинки** (`VfsNode::create_symlink`), цель хранится дословно;
+  висячая цель — норма (альтернативы/`ld-linux`);
+- **хардлинки — как хардлинки** (`VfsNode::link`, общий inode, `st_nlink == 2`), цель берётся из
+  ФС без следования по конечной ссылке; цели, которых ещё нет, повторяются фикспойнтом, а
+  неразрешимые пропускаются с одним warn — **копией не становится ничто**;
+- существующий каталог на пути члена — пропуск с warn (рекурсивного удаления нет);
+- `VfsError::IoError` от ext2 = out-of-space → частичный файл удаляется, `InstallError::NoSpace`.
 
 ### Декомпрессия
 gzip — RFC 1952 вручную + `miniz_oxide`; xz — `xz4rust` (словарь cap 64 MiB); zstd —

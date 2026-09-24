@@ -52,7 +52,11 @@ fn entry_strategy() -> impl Strategy<Value = OwnedEntry> {
         kind_strategy(),
         prop::collection::vec(any::<u8>(), 0..32),
     )
-        .prop_map(|(path, kind, content)| OwnedEntry { path, kind, content })
+        .prop_map(|(path, kind, content)| OwnedEntry {
+            path,
+            kind,
+            content,
+        })
 }
 
 proptest! {
@@ -69,6 +73,7 @@ proptest! {
             .iter()
             .map(|o| TarEntry {
                 path: &o.path,
+                prefix: "",
                 kind: o.kind,
                 mode: 0,
                 size: o.content.len() as u64,
