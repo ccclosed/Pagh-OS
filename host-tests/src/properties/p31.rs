@@ -38,6 +38,7 @@ fn rec(name: &str, deps: &[&[&str]], provides: &[&str]) -> PkgRecord {
             .collect(),
         provides: provides.iter().map(|s| s.to_string()).collect(),
         size: 0,
+        sha256: None,
     }
 }
 
@@ -302,6 +303,7 @@ proptest! {
                 depends: groups,
                 provides: Vec::new(),
                 size: 0,
+                sha256: None,
             });
         }
 

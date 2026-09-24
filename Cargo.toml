@@ -24,10 +24,11 @@ crate-type = ["staticlib"]
 # The pagh development image ships with network package operations enabled.
 # This activates the existing HTTP/HTTPS fetch pipeline. The HTTPS transport
 # authenticates the mirror fail-closed (chain -> committed CA bundle, SAN,
-# validity + clock gate, CertificateVerify; see SECURITY.md), but Debian
-# InRelease signatures and package hashes are still unverified, so apt says so
-# rather than implying more. A fail-closed build remains available with
-# `cargo build --no-default-features`.
+# validity + clock gate, CertificateVerify) AND verifies the repository metadata
+# end to end: InRelease/Release.gpg against the fingerprint-pinned Debian keyring,
+# then the SHA-256+size of Packages and of every .deb from the signed index
+# (issue #32; see SECURITY.md for the remaining gaps). A fail-closed build remains
+# available with `cargo build --no-default-features`.
 default = ["network_packages"]
 network_packages = ["insecure_network_demo"]
 
@@ -76,10 +77,11 @@ lx_tlsbig = []
 
 # Low-level implementation gate retained for compatibility with existing test
 # scripts. `network_packages` enables it in the normal pagh development build.
-# The name is historical: the transport it gates (HTTPS via net::tls) now
-# verifies the server certificate fail-closed. What remains unverified is
-# repository metadata (InRelease/OpenPGP) and package digests, so a plain-HTTP
-# mirror selected with `apt setmirror http://...` is still unauthenticated.
+# The name is historical: the transport it gates (HTTPS via net::tls) verifies the
+# server certificate fail-closed, and the package pipeline verifies the signed
+# repository metadata (InRelease/Release.gpg -> Packages -> .deb digests). A
+# plain-HTTP mirror is therefore integrity-checked by the metadata chain even
+# though its transport is not authenticated.
 insecure_network_demo = []
 
 [profile.dev]
@@ -151,7 +153,8 @@ xz4rust = { version = "=0.2.1", default-features = false, features = ["alloc", "
 # accepted a server `Finished` that was not preceded by `Certificate` /
 # `CertificateVerify`, so a peer could skip verification altogether. The patched
 # `connection.rs` enforces the RFC 8446 §4.4.2.4 ordering. Repository metadata
-# signatures are still unverified: see `SECURITY.md`.
+# signatures are verified by `pkg::openpgp` (issue #32); see `SECURITY.md` for
+# what remains unchecked (revocation, replay without Valid-Until).
 embedded-tls = { version = "=0.19.0", default-features = false, features = ["alloc"] }
 # Sync + async byte-IO traits implemented by the smoltcp TCP transport adapter in
 # `src/net/tls.rs`. `embedded-tls` speaks `embedded-io-async`; the adapter bridges

@@ -135,6 +135,96 @@ pub enum OpenPgpError {
     FutureSignature,
 }
 
+impl OpenPgpError {
+    /// The `(stage, cause)` pair for the `apt: verify FAIL stage=… cause=…`
+    /// diagnostic and for `AptOpError::BadSignature`.
+    ///
+    /// Stages name the layer that refused (`armor`, `clearsign`, `packet`,
+    /// `signature`, `key`, `clock`); the cause is the specific check, so a
+    /// serial log says exactly what failed without dumping bytes. The e2e
+    /// harnesses grep these strings, so they are stable API.
+    pub fn diagnostic(self) -> (&'static str, &'static str) {
+        match self {
+            OpenPgpError::Packet(e) => (packet_stage(e), packet_cause(e)),
+            OpenPgpError::Crypto(e) => ("signature", crypto_cause(e)),
+            OpenPgpError::ClockUnset => ("clock", "ClockUnset"),
+            OpenPgpError::NoSignature => ("signature", "NoSignature"),
+            OpenPgpError::TooManySignatures => ("signature", "TooManySignatures"),
+            OpenPgpError::SigTypeMismatch => ("signature", "SigTypeMismatch"),
+            OpenPgpError::HashHeaderMismatch => ("clearsign", "HashHeaderMismatch"),
+            OpenPgpError::UnsupportedHashAlgo(_) => ("signature", "UnsupportedHashAlgo"),
+            OpenPgpError::UnsupportedPubAlgo(_) => ("key", "UnsupportedPubAlgo"),
+            OpenPgpError::AlgoMismatch => ("signature", "AlgoMismatch"),
+            OpenPgpError::NoIssuer => ("signature", "NoIssuer"),
+            OpenPgpError::NoTrustedSignature => ("signature", "NoTrustedSignature"),
+            OpenPgpError::BadSignature => ("signature", "BadSignature"),
+            OpenPgpError::FingerprintMismatch => ("key", "FingerprintMismatch"),
+            OpenPgpError::KeyMetadataMismatch => ("key", "KeyMetadataMismatch"),
+            OpenPgpError::UncertifiedKey => ("key", "UncertifiedKey"),
+            OpenPgpError::NoSubkeyBinding => ("key", "NoSubkeyBinding"),
+            OpenPgpError::BadSubkeyBinding => ("key", "BadSubkeyBinding"),
+            OpenPgpError::NotASigningKey => ("key", "NotASigningKey"),
+            OpenPgpError::Expired => ("key", "Expired"),
+            OpenPgpError::NotYetValid => ("key", "NotYetValid"),
+            OpenPgpError::Revoked => ("key", "Revoked"),
+            OpenPgpError::FutureSignature => ("signature", "FutureSignature"),
+        }
+    }
+}
+
+fn packet_stage(e: PacketError) -> &'static str {
+    match e {
+        PacketError::TooLarge
+        | PacketError::ArmorMissing
+        | PacketError::ArmorLineTooLong
+        | PacketError::ArmorMalformed
+        | PacketError::ArmorBase64
+        | PacketError::ArmorCrc
+        | PacketError::ArmorTrailingData => "armor",
+        PacketError::ClearsignMalformed => "clearsign",
+        _ => "packet",
+    }
+}
+
+fn packet_cause(e: PacketError) -> &'static str {
+    match e {
+        PacketError::TooLarge => "TooLarge",
+        PacketError::ArmorMissing => "ArmorMissing",
+        PacketError::ArmorLineTooLong => "ArmorLineTooLong",
+        PacketError::ArmorMalformed => "MalformedArmor",
+        PacketError::ArmorBase64 => "BadBase64",
+        PacketError::ArmorCrc => "CrcMismatch",
+        PacketError::ArmorTrailingData => "TrailingData",
+        PacketError::NotAPacket | PacketError::Truncated => "MalformedPacket",
+        PacketError::PartialLength => "PartialLengthUnsupported",
+        PacketError::IndeterminateLength => "IndeterminateLengthUnsupported",
+        PacketError::TooManyPackets => "TooManyPackets",
+        PacketError::PacketTooLarge => "PacketTooLarge",
+        PacketError::UnsupportedVersion(_) => "UnsupportedVersion",
+        PacketError::UnsupportedAlgo(_) => "UnsupportedAlgo",
+        PacketError::MalformedKey => "MalformedKey",
+        PacketError::MalformedSignature => "MalformedSignature",
+        PacketError::TooManySignatures => "TooManySignatures",
+        PacketError::NoSignaturePacket => "NoSignature",
+        PacketError::MalformedSubpackets => "MalformedSubpackets",
+        PacketError::ClearsignMalformed => "Malformed",
+        PacketError::KeyBlockMalformed
+        | PacketError::KeyBlockTooLarge
+        | PacketError::MissingPrimaryKey => "MalformedKeyBlock",
+    }
+}
+
+fn crypto_cause(e: CryptoError) -> &'static str {
+    match e {
+        CryptoError::KeyTooSmall => "KeyTooSmall",
+        CryptoError::KeyTooLarge => "KeyTooLarge",
+        CryptoError::MalformedKey => "MalformedKey",
+        CryptoError::MalformedSignature => "MalformedSignature",
+        CryptoError::VerifyFailed => "BadSignature",
+        CryptoError::UnsupportedCurve => "UnsupportedCurve",
+    }
+}
+
 impl From<PacketError> for OpenPgpError {
     fn from(e: PacketError) -> Self {
         OpenPgpError::Packet(e)

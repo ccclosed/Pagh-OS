@@ -24,6 +24,7 @@ list/setmirror), парсер индекса `Packages`, резолвер зав
 | `openpgp_packet.rs` | Чистый слой пакетов: armor (CRC24), framing (old/new, definite lengths), public key/subkey, signature packet, keyring-блок, clearsign-разбор и канонизация |
 | `openpgp_crypto.rs` | Чистая криптография верификатора: правило v4-хеша, RSA PKCS#1 v1.5 / EdDSA / ECDSA по дайджесту, локальная SHA-1 (только для v4-фингерпринтов) |
 | `openpgp_keys.rs` | **Сгенерированный** (`tools/gen_debian_keyring.py`) пиннутый Debian-keyring: байтовые блоки ключей + фингерпринты, алгоритм, размер, окно валидности, подключи |
+| `release_file.rs` | Чистый парсер тела `Release`/`InRelease`: поля `Suite`/`Codename`/`Date`/`Valid-Until`/`Acquire-By-Hash` и секция `SHA256:` (только она — `MD5Sum:`/`SHA1:` не должны выглядеть как SHA-256) |
 
 ## Ключевые символы
 
@@ -52,15 +53,25 @@ list/setmirror), парсер индекса `Packages`, резолвер зав
 `INSTALLED` (`BTreeSet<String>` — сессионный список, не настоящий dpkg db).
 Сетевой I/O никогда не держит лок индекса.
 
-### apt update
-`{base}/dists/{suite}/{component}/binary-{arch}/Packages.gz` → фоллбэк `.xz` → несжатый
-`Packages`. Тело декомпрессится **инкрементально** (`decompress_stream`, чанки 8 KiB),
-каждый чанк — в `StanzaParser::push_view` → `PackageIndexBuilder` (arena-интернинг, без
-owned `PkgRecord`). Поток ограничен `MAX_INDEX_STREAM_BYTES` (512 MiB) → чистый
-`IndexTooLarge` вместо OOM-аборта.
+### apt update (цепочка доверия, issue #32)
+Сначала подписанные метаданные: `dists/{suite}/InRelease` (clearsigned) проверяется по
+пиннутому keyring'у; фоллбэк на `Release.gpg`+`Release` — **только** при 404 на `InRelease`
+(битая подпись фатальна, фоллбэка нет). Затем поля Release (suite/codename, architectures,
+`Date`, `Valid-Until`) и **только те варианты `Packages`, которые перечислены в подписанной
+секции `SHA256:`**, с объявленными digest'ом и размером: `{base}/dists/{suite}/{component}/binary-{arch}/Packages.gz`
+→ `.xz` → несжатый. Тело сверяется с подписанным SHA-256 **и размером ДО** декомпрессии;
+несовпадение фатально (без перебора вариантов), ошибка декодирования — по-прежнему
+фоллбэк. Декомпрессия инкрементальная (`decompress_stream`, чанки 8 KiB), каждый чанк — в
+`StanzaParser::push_view` → `PackageIndexBuilder` (arena-интернинг, без owned `PkgRecord`).
+Поток ограничен `MAX_INDEX_STREAM_BYTES` (512 MiB) → чистый `IndexTooLarge` вместо
+OOM-аборта. Публикация индекса — только после полной проверки; любой отказ **очищает**
+`INDEX` (никакого «оставить прошлый индекс»).
 
 ### apt install
-`resolve_install` → на каждый пакет: fetch `{base}/{filename}` → `parse_ar` →
+`resolve_install` → на каждый пакет: из **той же** записи индекса берутся `Filename`,
+`SHA256` и `Size`; запись без пригодного `SHA256` отвергается (`DigestUnavailable`), затем
+fetch `{base}/{filename}` → сверка SHA-256 **и размера ДО** `parse_ar`/распаковки
+(несовпадение → `DigestMismatch`, пакет не парсится и не пишется) → `parse_ar` →
 `locate_members` → `decompress_data` (data.tar целиком, cap 64 MiB) → `read_tar` →
 `install_data_tar(entries, "/mnt")` → `sync()` vfs-ноды → запись в `INSTALLED`.
 Упрощения резолвера (задокументированы): версии игнорируются, Pre-Depends слиты с Depends,
@@ -120,6 +131,14 @@ gzip — RFC 1952 вручную + `miniz_oxide`; xz — `xz4rust` (словар
   отказывается стартовать на cleartext-конфиге, поэтому PASS не может быть «случайно по HTTP».
 - Индекс RAM-only: полный Debian ≈ 150 MiB декомпрессированного — потолок по памяти,
   при превышении чистый отказ.
+- **Цепочка доверия apt (issue #32, реализовано).** Подпись `InRelease`/`Release.gpg` по
+  пиннутому keyring'у → SHA-256 **и** размер `Packages` из подписанного Release (до
+  декомпрессии) → SHA-256 **и** размер каждого `.deb` из подписанного индекса (до
+  распаковки). Любое несовпадение — жёсткий отказ с одной строкой
+  `apt: verify FAIL stage=… cause=…` и без обходных путей; зеркало без подписей отвергается
+  явно (`AptOpError::Unsigned`). Отличия от `gpgv`: подпись просроченного ключа отвергается,
+  частичные длины пакетов не собираются. Остаточные пробелы (нет распространения отзывов,
+  replay старого триплета на suite без `Valid-Until`, ручной `pkg`-путь) — в `SECURITY.md`.
 - **OpenPGP-верификатор (issue #32, первый шаг серии).** Реализованы и покрыты host-свойствами
   P51–P53 (`host-tests/src/properties/p5{1,2,3}.rs`) чистые модули `openpgp{,_packet,_crypto}.rs`:
   разбор armor/пакетов, проверка `Release.gpg` (detached) и `InRelease` (clearsigned) по

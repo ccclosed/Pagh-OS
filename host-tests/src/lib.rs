@@ -286,6 +286,14 @@ pub mod openpgp;
 #[path = "../../src/pkg/openpgp_keys.rs"]
 pub mod openpgp_keys;
 
+// The pure `Release`/`InRelease` body parser (issue #32): the `SHA256:` section
+// that binds the `Packages` body to the signed metadata, plus the fields the apt
+// trust-chain policy checks (`Suite`/`Codename`/`Date`/`Valid-Until`). P54 pins
+// that only the `SHA256:` section yields an entry and that an unreadable date is
+// reported as malformed (the caller refuses) rather than as absent.
+#[path = "../../src/pkg/release_file.rs"]
+pub mod release_file;
+
 // `procfs_format` is the pure text rendering + path/inode table behind the
 // synthetic `/proc` (issue #11, contract `docs/procfs.md`). `core` + `alloc` only
 // and self-contained, so the standalone `#[path]` include resolves with no extra
@@ -408,6 +416,7 @@ mod properties {
     mod p51;
     mod p52;
     mod p53;
+
     // `kill(2)` argument decoding + target classification + errno matrix
     // (issue #12): the decisions `signal::sys_kill` makes before touching the
     // compat registry. Deliberately NOT numbered p51+: the OpenPGP verification
@@ -421,6 +430,13 @@ mod properties {
     // discards every pending stop-class bit; a stop signal discards a pending
     // SIGCONT). Descriptive module name, same reason as `kill_target`.
     mod signal_stop;
+// The apt trust chain (issue #32, contract OPENPGP-VERIFY-CONTRACT.md
+    // §5/§6): P54 covers the `Release` parser that binds `Packages` to the
+    // signed metadata, P55 covers the per-record `.deb` digest on BOTH parser
+    // paths (a missing or malformed digest must be `None`, never a zero digest
+    // that would "verify" any payload).
+    mod p54;
+    mod p55;
 
 }
 

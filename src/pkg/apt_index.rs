@@ -146,6 +146,30 @@ pub struct PkgRecord {
     pub provides: Vec<String>,
     /// `Size:` — download size in bytes (0 if absent or unparseable).
     pub size: u64,
+    /// `SHA256:` — the `.deb` digest the *signed* index declares, or `None` if
+    /// the field is absent or not 64 hex characters. `apt install` refuses a
+    /// package without one: the digest is the only link from the signed
+    /// `Packages` metadata to the payload it is about to unpack.
+    pub sha256: Option<[u8; 32]>,
+}
+
+/// Parse a 64-hex-character `SHA256:` field value into its 32 octets.
+///
+/// `None` for anything else (absent, wrong length, non-hex): the caller then has
+/// no digest to verify against and must refuse the package rather than treat an
+/// absent digest as "nothing to check".
+fn parse_sha256_hex(value: &str) -> Option<[u8; 32]> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = (bytes[2 * i] as char).to_digit(16)?;
+        let lo = (bytes[2 * i + 1] as char).to_digit(16)?;
+        *byte = ((hi << 4) | lo) as u8;
+    }
+    Some(out)
 }
 
 /// Strip a single dependency atom down to its bare package name by removing any
@@ -219,6 +243,7 @@ enum CurField {
     PreDepends,
     Provides,
     Size,
+    Sha256,
 }
 
 /// Internal accumulator for a stanza being built line-by-line.
@@ -228,10 +253,10 @@ enum CurField {
 /// reads. The slots are *cleared* (not reallocated) between stanzas via
 /// [`clear`](Self::clear), so the per-stanza heap churn that degraded the kernel
 /// allocator (tens of thousands of small alloc/free per index) is eliminated: the
-/// eight slot allocations are reused across every stanza in the file.
+/// nine slot allocations are reused across every stanza in the file.
 ///
 /// Parse semantics are byte-for-byte identical to the old map-backed builder:
-/// only the eight keys below are read by `build_record`/`StanzaView`, a repeated
+/// only the nine keys below are read by `build_record`/`StanzaView`, a repeated
 /// key overwrites (last-wins, matching `BTreeMap::insert`), an unknown key still
 /// marks the stanza non-empty (matching the old `fields.is_empty()` flipping to
 /// false on the first inserted key, known or not), and continuation lines join
@@ -246,6 +271,7 @@ struct StanzaBuilder {
     pre_depends: String,
     provides: String,
     size: String,
+    sha256: String,
     /// Which known field the last `Key:` line selected (for continuation lines);
     /// [`CurField::None`] for an unknown key (its continuations are ignored).
     cur: CurField,
@@ -277,6 +303,7 @@ impl StanzaBuilder {
         self.pre_depends.clear();
         self.provides.clear();
         self.size.clear();
+        self.sha256.clear();
         self.cur = CurField::None;
         self.any = false;
     }
@@ -304,11 +331,12 @@ impl StanzaBuilder {
             CurField::PreDepends => Some(&mut self.pre_depends),
             CurField::Provides => Some(&mut self.provides),
             CurField::Size => Some(&mut self.size),
+            CurField::Sha256 => Some(&mut self.sha256),
             CurField::None => None,
         }
     }
 
-    /// Case-sensitive match of a trimmed key against the eight known field names.
+    /// Case-sensitive match of a trimmed key against the nine known field names.
     fn classify(key: &str) -> CurField {
         match key {
             "Package" => CurField::Package,
@@ -319,6 +347,7 @@ impl StanzaBuilder {
             "Pre-Depends" => CurField::PreDepends,
             "Provides" => CurField::Provides,
             "Size" => CurField::Size,
+            "SHA256" => CurField::Sha256,
             _ => CurField::None,
         }
     }
@@ -393,6 +422,7 @@ impl StanzaBuilder {
         };
 
         let size = self.size.trim().parse::<u64>().unwrap_or(0);
+        let sha256 = parse_sha256_hex(self.sha256.trim());
 
         Some(PkgRecord {
             package,
@@ -402,6 +432,7 @@ impl StanzaBuilder {
             depends,
             provides,
             size,
+            sha256,
         })
     }
 }
@@ -467,6 +498,7 @@ impl<'a> StanzaView<'a> {
             CurField::PreDepends => &builder.pre_depends,
             CurField::Provides => &builder.provides,
             CurField::Size => &builder.size,
+            CurField::Sha256 => &builder.sha256,
             // Unknown key: absent, like the old `fields.get(key) == None`.
             CurField::None => return "",
         };
@@ -496,6 +528,13 @@ impl<'a> StanzaView<'a> {
     /// `Size:` in bytes (0 if absent or unparseable), matching [`build_record`].
     pub fn size(&self) -> u64 {
         self.field("Size").parse::<u64>().unwrap_or(0)
+    }
+
+    /// `SHA256:` — the declared `.deb` digest, or `None` if absent/malformed.
+    /// Matching [`build_record`], a repeated key is last-wins (the parser's slot
+    /// was overwritten).
+    pub fn sha256(&self) -> Option<[u8; 32]> {
+        parse_sha256_hex(self.field("SHA256"))
     }
 
     /// Yield the merged `Pre-Depends:` then `Depends:` AND-groups (in that order,
@@ -744,6 +783,8 @@ pub struct PkgRecordC {
     pub filename: StrRef,
     /// `Size:` — download size in bytes (0 if absent or unparseable).
     pub size: u64,
+    /// `SHA256:` — declared `.deb` digest (`None` if absent or malformed).
+    pub sha256: Option<[u8; 32]>,
     /// Start index of this record's dependency groups within `dep_groups`.
     pub dep_group_start: u32,
     /// Number of dependency groups belonging to this record.
@@ -855,6 +896,7 @@ impl PackageIndex {
             }
 
             builder.records.push(PkgRecordC {
+                sha256: None,
                 package,
                 version,
                 arch,
@@ -1029,6 +1071,12 @@ impl<'a> PkgRef<'a> {
         self.rec.size
     }
 
+    /// `SHA256:` — the declared `.deb` digest, or `None` when the stanza carried
+    /// no usable digest (in which case `apt install` refuses the package).
+    pub fn sha256(&self) -> Option<[u8; 32]> {
+        self.rec.sha256
+    }
+
     /// Iterate the record's merged `Pre-Depends:`-then-`Depends:` AND-groups,
     /// each as a borrowed [`DepGroupRef`].
     pub fn depends(&self) -> impl Iterator<Item = DepGroupRef<'a>> {
@@ -1115,6 +1163,7 @@ impl PackageIndexBuilder {
         let arch = self.intern(view.arch());
         let filename = self.intern(view.filename());
         let size = view.size();
+        let sha256 = view.sha256();
 
         let dep_group_start = self.dep_groups.len() as u32;
         let mut dep_group_len: u32 = 0;
@@ -1144,6 +1193,7 @@ impl PackageIndexBuilder {
             arch,
             filename,
             size,
+            sha256,
             dep_group_start,
             dep_group_len,
             prov_start,
