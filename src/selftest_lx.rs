@@ -644,40 +644,64 @@ fn run_apt_verify_checks() -> bool {
 
     // (4) Correct, signed metadata, but the `.deb` served is not the one the
     // signed index describes: the install must refuse it BEFORE writing anything.
+    //
+    // "Nothing was written" must NOT be asserted as "the destination file is
+    // absent". `disk.img` is persistent and a previous run can legitimately have
+    // installed `hello-pagh` there, so an absence check passes only on a freshly
+    // formatted disk and reports a failure on the machine an E2E run actually
+    // uses. Whether the payload was written is not a question about the
+    // filesystem's history: it is a question about whether THESE bytes reached it.
+    // So the check compares the destination against itself — bit-for-bit before
+    // and after the refused install. A payload unpacked on top of it changes the
+    // body or the length; a refusal leaves both exactly as they were.
     crate::pkg::apt::set_suite("tampered-deb");
     match crate::pkg::apt::update() {
-        Ok(n) if n > 0 => match crate::pkg::apt::install("hello-pagh") {
-            Err(AptOpError::DigestMismatch { .. }) => {
-                match vfs::lookup_path("/mnt/usr/bin/hello-pagh") {
-                    Err(_) => crate::info!(
-                    "LXSELFTEST apt_verify tampered-deb PASS (install refused before unpacking; \
-                     nothing written to /mnt; index kept, the metadata itself is valid)"
-                ),
-                    Ok(_) => {
+        Ok(n) if n > 0 => {
+            let dest = "/mnt/usr/bin/hello-pagh";
+            let before = read_file_bytes(dest);
+            match crate::pkg::apt::install("hello-pagh") {
+                Err(AptOpError::DigestMismatch { .. }) => {
+                    let after = read_file_bytes(dest);
+                    if after == before {
+                        let state = match before {
+                            Some(ref b) => alloc::format!("{} B present before", b.len()),
+                            None => alloc::string::String::from("absent before and after"),
+                        };
+                        crate::info!(
+                            "LXSELFTEST apt_verify tampered-deb PASS (install refused before \
+                             unpacking; index kept, the metadata itself is valid; {} left \
+                             byte-identical: {})",
+                            dest,
+                            state.as_str()
+                        )
+                    } else {
                         ok = false;
                         crate::error!(
-                        "LXSELFTEST apt_verify tampered-deb FAIL: the tampered payload was written \
-                         to /mnt/usr/bin/hello-pagh"
-                    );
+                            "LXSELFTEST apt_verify tampered-deb FAIL: the refused install changed \
+                             {}: before={:?} after={:?}",
+                            dest,
+                            before.as_ref().map(|b| b.len()),
+                            after.as_ref().map(|b| b.len())
+                        );
                     }
                 }
-            }
-            Err(e) => {
-                ok = false;
-                crate::error!(
-                    "LXSELFTEST apt_verify tampered-deb FAIL: wrong refusal: {}",
-                    e.message()
-                );
-            }
-            Ok(v) => {
-                ok = false;
-                crate::error!(
+                Err(e) => {
+                    ok = false;
+                    crate::error!(
+                        "LXSELFTEST apt_verify tampered-deb FAIL: wrong refusal: {}",
+                        e.message()
+                    );
+                }
+                Ok(v) => {
+                    ok = false;
+                    crate::error!(
                     "LXSELFTEST apt_verify tampered-deb FAIL: installed {:?} from a payload that \
                      does not match the signed index",
                     v
                 );
+                }
             }
-        },
+        }
         Err(e) => {
             ok = false;
             crate::error!(
@@ -1152,6 +1176,25 @@ fn unmap_scratch() {
         let _ = vmm::unmap(SCRATCH_VA);
         pmm::free_frame(phys & !0xFFF);
     }
+}
+
+/// Read a file in full through the VFS, or `None` if it does not exist / cannot
+/// be read. Used to compare a destination file's bytes before and after an
+/// operation that must not touch it (see the `tampered-deb` check).
+fn read_file_bytes(path: &str) -> Option<Vec<u8>> {
+    let node = vfs::lookup_path(path).ok()?;
+    let size = usize::try_from(node.size()).ok()?;
+    let mut buf = alloc::vec![0u8; size];
+    let mut done = 0usize;
+    while done < size {
+        let n = node.read(done as u64, &mut buf[done..]).ok()?;
+        if n == 0 {
+            break;
+        }
+        done += n;
+    }
+    buf.truncate(done);
+    Some(buf)
 }
 
 /// Copy `bytes` into the scratch page at offset 0. PRECONDITION: scratch mapped.
