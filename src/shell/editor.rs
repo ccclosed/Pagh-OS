@@ -99,6 +99,28 @@ impl LineEditor {
         true
     }
 
+    /// Replace the character range `[from, to)` with nothing, placing the cursor
+    /// at `from`.
+    ///
+    /// Indices are character units, matching the rest of this type. An out-of-range
+    /// or inverted range is clamped rather than refused, so a selection that runs
+    /// past either end of the line still deletes the part that exists. Returns
+    /// whether anything was removed.
+    pub fn replace_range(&mut self, from: usize, to: usize) -> bool {
+        let count = self.char_count();
+        let from = from.min(count);
+        let to = to.min(count);
+        if from >= to {
+            self.cursor = from;
+            return false;
+        }
+        let start_byte = self.byte_index(from);
+        let end_byte = self.byte_index(to);
+        self.buf.replace_range(start_byte..end_byte, "");
+        self.cursor = from;
+        true
+    }
+
     /// Move the cursor one character left, clamping at the start (R1.1).
     /// Returns `true` if the cursor moved.
     pub fn move_left(&mut self) -> bool {

@@ -56,6 +56,11 @@ pub struct FramebufferWriter {
     /// answer "what character is here" (a selection copied out of the screen).
     /// Kept in sync by `write_char`, `scroll` and `clear`.
     grid: alloc::vec::Vec<u8>,
+    /// The foreground color each grid cell was last drawn in, so a cell repainted
+    /// for a selection can be restored *to its own color* rather than to the
+    /// console default. Without this, selecting the green prompt and releasing
+    /// would leave it white: the pixels carry no record of how they were drawn.
+    grid_fg: alloc::vec::Vec<u32>,
 }
 
 impl FramebufferWriter {
@@ -109,6 +114,7 @@ impl FramebufferWriter {
             // `MAX_LINES` text rows, and `text_rows()` is clamped to it, so the
             // model cannot grow with output volume.
             grid: alloc::vec![b' '; MAX_LINES * CHARS_PER_LINE],
+            grid_fg: alloc::vec![0xFFFFFF; MAX_LINES * CHARS_PER_LINE],
         })
     }
 
@@ -117,6 +123,9 @@ impl FramebufferWriter {
         self.row = 0;
         for cell in self.grid.iter_mut() {
             *cell = b' ';
+        }
+        for fg in self.grid_fg.iter_mut() {
+            *fg = self.fg_color;
         }
         unsafe {
             let fb = self.fb_addr as *mut u8;
@@ -129,7 +138,9 @@ impl FramebufferWriter {
     /// Record `ch` at grid cell `(col, row)`; out-of-range writes are dropped.
     fn set_cell(&mut self, col: usize, row: usize, ch: u8) {
         if col < CHARS_PER_LINE && row < MAX_LINES {
-            self.grid[row * CHARS_PER_LINE + col] = ch;
+            let idx = row * CHARS_PER_LINE + col;
+            self.grid[idx] = ch;
+            self.grid_fg[idx] = self.fg_color;
         }
     }
 
@@ -140,6 +151,37 @@ impl FramebufferWriter {
             self.grid[row * CHARS_PER_LINE + col]
         } else {
             b' '
+        }
+    }
+
+    /// The foreground color cell `(col, row)` was drawn in.
+    fn cell_fg(&self, col: usize, row: usize) -> u32 {
+        if col < CHARS_PER_LINE && row < MAX_LINES {
+            self.grid_fg[row * CHARS_PER_LINE + col]
+        } else {
+            0xFFFFFF
+        }
+    }
+
+    /// Copy `[from_col, to_col)` of `row` into `out` as a `String`.
+    ///
+    /// This is how text is copied off the screen: the model is the only record of
+    /// what is displayed, and reading it back avoids re-deriving text from glyphs.
+    /// Out-of-range coordinates are clipped rather than refused, so a caller
+    /// copying a selection that runs off the end simply gets the part that exists.
+    fn row_text(
+        &self,
+        row: usize,
+        from_col: usize,
+        to_col: usize,
+        out: &mut alloc::string::String,
+    ) {
+        let from = from_col.min(CHARS_PER_LINE);
+        let to = to_col.min(CHARS_PER_LINE);
+        for col in from..to {
+            let ch = self.grid[row.min(MAX_LINES - 1) * CHARS_PER_LINE + col];
+            // The grid holds console bytes (printable ASCII, see `write_char`).
+            out.push(ch as char);
         }
     }
 
@@ -259,11 +301,13 @@ impl FramebufferWriter {
             let dst = row * CHARS_PER_LINE;
             for col in 0..CHARS_PER_LINE {
                 self.grid[dst + col] = self.grid[src + col];
+                self.grid_fg[dst + col] = self.grid_fg[src + col];
             }
         }
         let last = (rows - 1) * CHARS_PER_LINE;
         for col in 0..CHARS_PER_LINE {
             self.grid[last + col] = b' ';
+            self.grid_fg[last + col] = self.fg_color;
         }
         self.row = rows - 1;
     }
@@ -308,12 +352,21 @@ impl FramebufferWriter {
     /// `color` is the glyph color for this cell only; the writer's `fg_color` is
     /// left alone, so a caret's color cannot leak into subsequent output.
     pub fn paint_cell(&mut self, col: usize, row: usize, ch: u8, color: u32) {
+        self.paint_cell_with_bg(col, row, ch, color, 0x000000);
+    }
+
+    /// As [`paint_cell`](Self::paint_cell), with an explicit cell background.
+    ///
+    /// The background is what makes a text selection readable: inverting the cell
+    /// is visible where a foreground change would be lost against text of the same
+    /// color.
+    pub fn paint_cell_with_bg(&mut self, col: usize, row: usize, ch: u8, color: u32, bg: u32) {
         let (max_cols, max_rows) = self.text_grid();
         if col >= max_cols || row >= max_rows {
             return;
         }
-        // Draw the glyph's own pixels in `color`, everything else in the
-        // background color, so repainting a cell fully replaces what was there.
+        // Draw the glyph's own pixels in `color`, everything else in `bg`, so
+        // repainting a cell fully replaces what was there.
         let x = col * CHAR_WIDTH;
         let y = row * CHAR_HEIGHT;
         let glyph = get_glyph(ch);
@@ -327,7 +380,7 @@ impl FramebufferWriter {
                     break;
                 }
                 let pixel_on = (glyph_byte & (1 << (7 - dx))) != 0;
-                self.put_pixel(x + dx, y + dy, if pixel_on { color } else { 0x000000 });
+                self.put_pixel(x + dx, y + dy, if pixel_on { color } else { bg });
             }
         }
     }
@@ -719,6 +772,43 @@ impl FbWriter {
     pub fn draw_status_bar(&self, left: &str, right: &str) {
         if let Some(ref mut writer) = *self.inner.lock() {
             writer.draw_status_bar(left, right);
+        }
+    }
+
+    /// Copy one row of the text grid into `out`, as `[from_col, to_col)`.
+    ///
+    /// The console is the only record of what is on screen, so copying text off it
+    /// goes through here rather than re-deriving characters from pixels.
+    pub fn read_row(&self, row: usize, from_col: usize, to_col: usize) -> alloc::string::String {
+        let mut out = alloc::string::String::new();
+        if let Some(writer) = self.inner.lock().as_ref() {
+            writer.row_text(row, from_col, to_col, &mut out);
+        }
+        out
+    }
+
+    /// Paint cell `(col, row)` as selected: `bg` fills the cell, the glyph is
+    /// drawn in `fg` on top.
+    ///
+    /// A selection has to be visible *over* ordinary text, which a foreground-only
+    /// change cannot do — so this is the one place that paints a cell background.
+    /// It restores the glyph from the model, so clearing a selection is the same
+    /// call with the console's own colors.
+    pub fn paint_cell_selected(&self, col: usize, row: usize, fg: u32, bg: u32, restore: bool) {
+        if let Some(ref mut writer) = *self.inner.lock() {
+            let (max_cols, max_rows) = writer.text_grid();
+            if col >= max_cols || row >= max_rows {
+                return;
+            }
+            let ch = writer.cell_char(col, row);
+            // Restoring uses the color the cell was drawn in, not a default: the
+            // pixels do not remember, but the model does.
+            let color = if restore {
+                writer.cell_fg(col, row)
+            } else {
+                fg
+            };
+            writer.paint_cell_with_bg(col, row, ch, color, bg);
         }
     }
 

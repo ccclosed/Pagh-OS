@@ -20,6 +20,7 @@ pub(crate) mod paint;
 pub(crate) mod path;
 pub(crate) mod registry;
 pub(crate) mod render;
+pub(crate) mod selection;
 pub(crate) mod suggest;
 pub(crate) mod toolchain;
 
@@ -309,6 +310,12 @@ pub fn shell_main() -> ! {
     // One caret for the whole session: it must erase itself at the cell it was
     // drawn at, and that cell is not recoverable from the buffer alone.
     let mut caret = caret::Caret::new();
+    // One selection for the whole session (a drag outlives a single loop pass), and
+    // the clipboard it feeds. The clipboard is session-scoped on purpose: it is
+    // filled by copying text off the screen and consumed by Ctrl+Y / Ctrl+X.
+    let mut selection = selection::Selection::new();
+    let mut clipboard = String::new();
+    let mut prev_left = false;
 
     loop {
         // CWD-aware prompt, e.g. `pagh:/> ` (R5.1–R5.3).
@@ -330,6 +337,39 @@ pub fn shell_main() -> ! {
             // redrawn exactly once afterwards.
             let mouse = crate::drivers::ps2_mouse::poll();
             crate::drivers::cursor::hide();
+
+            // Mouse selection: a press anchors, a drag extends, a release copies the
+            // text to the clipboard. Cell coordinates come from the glyph size, and
+            // `Selection` clips anything left of the prompt away, so a drag that
+            // starts on the prompt still selects usable line text.
+            let pressed = mouse.left && !prev_left;
+            let released = !mouse.left && prev_left;
+            prev_left = mouse.left;
+            if pressed || (mouse.left && selection.is_active()) {
+                let cell = caret::Cell {
+                    col: mouse.x / CARET_GLYPH_W,
+                    row: mouse.y / CARET_GLYPH_H,
+                };
+                if pressed {
+                    selection.clear();
+                    selection.begin(cell);
+                } else if selection.extend(cell) {
+                    selection.paint(console_cols());
+                }
+            } else if released {
+                if let Some(range) = selection.finish() {
+                    // Copy is silent on purpose: it is a mouse gesture, and printing
+                    // into the console for it would push the very text the user just
+                    // selected off the screen.
+                    let text = range.text(console_cols());
+                    if !text.is_empty() {
+                        clipboard = text;
+                    }
+                    // The highlight stays after the release: it shows what was taken,
+                    // and it is what Ctrl+X / Ctrl+Y then act on.
+                    selection.paint(console_cols());
+                }
+            }
             // NOTE: the caret is NOT erased here. It is erased by the functions
             // that repaint the line (`redraw_line`/`list_candidates`), which is
             // where it actually matters. Erasing it on every loop pass would make
@@ -349,10 +389,12 @@ pub fn shell_main() -> ! {
 
                 match event {
                     keys::KeyEvent::Char(c) => {
+                        selection.clear();
                         editor.insert(c);
                         redraw_line(&editor, &mut shown, &mut caret);
                     }
                     keys::KeyEvent::Backspace => {
+                        selection.clear();
                         editor.delete_back();
                         redraw_line(&editor, &mut shown, &mut caret);
                     }
@@ -396,6 +438,40 @@ pub fn shell_main() -> ! {
                     }
                     // Enter: finish the line. Non-empty lines are recorded
                     // (with dedup) and dispatched; navigation is always reset.
+                    // Ctrl+X cuts the selected text out of the line, Ctrl+Y pastes
+                    // the clipboard back. Between them they are what makes a copy
+                    // observable: the text that was copied is the text that comes
+                    // back, and nothing else.
+                    keys::KeyEvent::Ctrl('x') => {
+                        if let Some(range) = selection.range() {
+                            let cols = console_cols();
+                            if let Some((from, to)) = range.line_indices(
+                                prompt_cols(),
+                                cols,
+                                editor.buffer().chars().count(),
+                            ) {
+                                let text = range.text(cols);
+                                if !text.is_empty() {
+                                    clipboard = text;
+                                }
+                                editor.replace_range(from, to);
+                                selection.clear();
+                                redraw_line(&editor, &mut shown, &mut caret);
+                            }
+                        }
+                    }
+                    keys::KeyEvent::Ctrl('y') => {
+                        if !clipboard.is_empty() {
+                            // A multi-line clipboard is pasted with newlines folded to
+                            // spaces: the line editor holds one line, and dropping the
+                            // rest silently would lose text.
+                            let text = clipboard.replace('\n', " ");
+                            for ch in text.chars() {
+                                editor.insert(ch);
+                            }
+                            redraw_line(&editor, &mut shown, &mut caret);
+                        }
+                    }
                     keys::KeyEvent::Ctrl(_)
                     | keys::KeyEvent::Escape
                     | keys::KeyEvent::PageUp
@@ -437,6 +513,24 @@ pub fn shell_main() -> ! {
             crate::drivers::cursor::move_to(mouse.x, mouse.y);
         }
     }
+}
+
+/// Console glyph size in pixels (the framebuffer's 8x16 font). The mouse reports
+/// pixels and selection works in cells, so this is the conversion between them.
+const CARET_GLYPH_W: usize = 8;
+const CARET_GLYPH_H: usize = 16;
+
+/// Visible width of the prompt (`pagh:{cwd}> `) in cells. The prompt is what
+/// separates console cells from line indices, so selection needs it to know where
+/// the editable text starts.
+fn prompt_cols() -> usize {
+    let cwd = path::cwd();
+    "pagh:".chars().count() + cwd.chars().count() + "> ".chars().count()
+}
+
+/// Console width in cells, or 0 when the framebuffer never initialized.
+fn console_cols() -> usize {
+    crate::drivers::framebuffer::console().text_grid().0
 }
 
 /// The cell the caret belongs in for the current line.
