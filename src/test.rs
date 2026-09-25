@@ -5393,6 +5393,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             shell_prop_tests::p27_decoder_editor_never_panic
         ),
         (
+            "shell::caret cell tracks the logical cursor (Property 28)",
+            shell_prop_tests::p28_caret_cell_tracks_the_logical_cursor
+        ),
+        (
             "shell::registry lookup + help enumeration (unit)",
             shell_prop_tests::unit_registry_lookup_and_help
         ),
@@ -6099,6 +6103,116 @@ mod shell_prop_tests {
     }
 
     // --- Unit / example tests (non-property) --------------------------------
+
+    /// Property 28: the caret's cell is derived from the console's cursor cell and
+    /// the characters that follow the logical cursor.
+    ///
+    /// The caret is an overlay drawn at a cell, so an off-by-one or an
+    /// out-of-grid cell is not a cosmetic bug: it either draws a bar over the
+    /// wrong character or leaves a stray bar that nothing will ever erase (the
+    /// erase uses the cell the draw used). Three things are checked, and the
+    /// third is the one that would have been wrong under the old end-of-line
+    /// behaviour:
+    ///
+    ///   * the cell stays inside the grid for arbitrary buffer/cursor/column
+    ///     combinations, including a line that wraps;
+    ///   * it moves left and right with the cursor (it is not pinned to the end);
+    ///   * it equals the exact arithmetic `end - trailing`, and cursor 0 lands on
+    ///     the first buffer cell while cursor == len lands one past the last.
+    pub fn p28_caret_cell_tracks_the_logical_cursor() {
+        use crate::shell::caret::{Caret, Cell};
+
+        let mut rng = XorShift64::new(0x28CA_2E70);
+        for _ in 0..400 {
+            let cols = 20 + (rng.next() % 81) as usize; // 20..=100 columns
+            let rows = 1 + (rng.next() % 37) as usize;
+            let len = (rng.next() % 200) as usize;
+            let line: String = (0..len)
+                .map(|i| char::from(b'a' + ((i as u8) % 26)))
+                .collect();
+            let mut ed = editor::LineEditor::from_line(&line);
+            for _ in 0..(rng.next() % 12) {
+                ed.move_left();
+            }
+            let cursor = ed.cursor();
+
+            // The console sits just past the last printed character. A random
+            // absolute cell also models a console that has scrolled.
+            let end = (rng.next() % (rows as u64 * cols as u64)) as usize;
+            let console_cell = (end % cols, end / cols);
+            let cell = match Caret::cell_for(console_cell, &ed, cols) {
+                Some(c) => c,
+                None => {
+                    // Refusing is only legitimate when the back-walk leaves the grid.
+                    assert_kernel!(
+                        end < len.saturating_sub(cursor),
+                        "caret: cell_for refused a position that is inside the grid"
+                    );
+                    continue;
+                }
+            };
+            assert_kernel!(
+                cell.col < cols,
+                "caret: column outside the console's columns"
+            );
+            assert_kernel!(cell.row < rows, "caret: row outside the console's rows");
+
+            let trailing = len - cursor;
+            let start = end - trailing;
+            assert_kernel!(
+                cell.col == start % cols && cell.row == start / cols,
+                "caret: cell is not the exact back-walk from the console cursor"
+            );
+
+            // Moving the cursor right must move the caret, never leave it behind.
+            if cursor < len {
+                let mut right = editor::LineEditor::from_line(&line);
+                for _ in 0..cursor {
+                    right.move_right();
+                }
+                right.move_right();
+                assert_kernel!(
+                    Caret::cell_for(console_cell, &right, cols) != Some(cell),
+                    "caret: moving the cursor right did not move the caret"
+                );
+            }
+        }
+
+        // Hand-computed edge cases against the model the code implements: the
+        // console's cell is the position of the NEXT character, so 11 characters
+        // have been printed after a 3-character buffer. `from_line` puts the
+        // cursor at the END (see its doc), so `move_home` is what makes the
+        // start-of-buffer case an actual start-of-buffer case.
+        let mut ed = editor::LineEditor::from_line("abc");
+        ed.move_home();
+        assert_kernel!(
+            Caret::cell_for((11, 0), &ed, 100) == Some(Cell { col: 8, row: 0 }),
+            "caret: cursor 0 must sit at the start of the buffer"
+        );
+        let mut end_ed = editor::LineEditor::from_line("abc");
+        end_ed.move_end();
+        assert_kernel!(
+            Caret::cell_for((11, 0), &end_ed, 100) == Some(Cell { col: 11, row: 0 }),
+            "caret: cursor at the end must sit one past the last character"
+        );
+        // A line that wrapped: 98 columns, console cursor at (10, 1) is cell 108,
+        // so cursor 0 of the 3-character buffer is 3 cells back — cell 105, which
+        // is row 1, column 7. This is the case the old end-of-line caret got wrong.
+        assert_kernel!(
+            Caret::cell_for((10, 1), &ed, 98) == Some(Cell { col: 7, row: 1 }),
+            "caret: a wrapped line must place the caret on the correct row"
+        );
+        // An uninitialized framebuffer (zero columns) must refuse, not panic.
+        assert_kernel!(
+            Caret::cell_for((0, 0), &ed, 0).is_none(),
+            "caret: a zero-column grid must yield no cell"
+        );
+        // The blink is a square wave, and it must actually change state.
+        assert_kernel!(
+            Caret::blink_on(0) && !Caret::blink_on(400),
+            "caret: blink phase is not a square wave"
+        );
+    }
 
     /// Unit (task 8.3): the registry is the single source of truth — every
     /// `COMMANDS` row is enumerated by `command_names` (so `help` lists all of

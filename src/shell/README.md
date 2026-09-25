@@ -16,6 +16,7 @@ Framebuffer-shell с редактированием строки, историе
 | `complete.rs` | Чистое таб-дополнение: `longest_common_prefix`, `Completion::{None, Single, Multiple}`, `complete_command`, `complete_path` |
 | `keys.rs` | Декодер PS/2 Set 1: `KeyEvent`, `Decoder` (0xE0-префикс, Shift/Ctrl/CapsLock), таблица ASCII, `CTRL_C_LATCH` |
 | `render.rs` | `Style`, цветовые константы, `with_style`, `prompt`, `error_line`, `success_line` (framebuffer — цвет, serial — plain) |
+| `caret.rs` | Мигающая каретка: клетка из позиции консоли и логического курсора (`Caret::cell_for`), отрисовка/стирание вертикальной черты (`paint_caret`), фаза мигания по тикам |
 | `path.rs` | Глобальный CWD под `Spinlock<String>`; чистые `normalize` (фолдинг `.`/`..`, кламп в корень), `resolve`, `cwd`, `set_cwd` |
 | `suggest.rs` | Bounded Levenshtein `edit_distance`, `nearest_command` для «did you mean» |
 | `paint.rs` | Оконная рисовалка (~1470 строк): title bar, toolbar, taskbar, canvas `Vec<u32>` |
@@ -48,9 +49,14 @@ Framebuffer-shell с редактированием строки, историе
 6. `execute_command`: split по `&&`, токенизация, `registry::lookup` → вызов хендлера;
    неизвестное → `error_line` + `nearest_command` «did you mean».
 
-**Модель рендера (v1, задокументирована)**: консоль деструктивная; `erase_visible(n)` =
-`"\x08 \x08"` на обеих консолях; `redraw_line` стирает `shown` символов и перепечатывает буфер.
-Видимая каретка всегда в конце строки; логический курсор может быть в середине.
+**Модель рендера**: редактируемая строка по-прежнему перерисовывается деструктивно —
+`erase_visible(n)` даёт `"\x08 \x08"` на обеих консолях, `redraw_line` стирает `shown`
+символов и перепечатывает буфер. Но **каретка от этого больше не зависит**: консоль ведёт
+модель экранных клеток (`FramebufferWriter::grid`), умеет перерисовывать одну клетку, не
+двигая собственный курсор (`paint_cell`), и сообщает, где стоит (`cursor_cell`). Поэтому
+`caret.rs` ставит мигающую голубую черту (`0x00FFFF`) ровно в клетку логического курсора —
+включая середину строки, перенос и скролл; раньше она всегда стояла в конце строки.
+Каретка — наложение: её стирают перед любой перепечаткой текста и переставляют после.
 
 ### Tab-комплишн
 Без whitespace → `complete_command`; иначе `readdir()` родителя токена через VFS →

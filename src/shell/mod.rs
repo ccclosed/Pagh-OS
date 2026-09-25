@@ -9,6 +9,7 @@ mod commands;
 // suite in `src/test.rs` can exercise them directly (design properties P21–P27
 // and the registry/render/path unit tests). They remain crate-private — nothing
 // leaves the crate. `commands` stays private (it is thin VFS/console I/O).
+pub(crate) mod caret;
 pub(crate) mod complete;
 pub(crate) mod editor;
 pub(crate) mod history;
@@ -61,14 +62,14 @@ fn visible_len(s: &str) -> usize {
 /// after the prompt. We destructively erase that whole region, then reprint the
 /// full current buffer and update `shown`.
 ///
-/// LIMITATION (v1): the framebuffer is destructive-only — there is no
-/// non-destructive glyph-level cursor positioning and `\r` would jump back over
-/// the prompt. So the *visible* caret always rests at end-of-line, while the
-/// editor's *logical* cursor (used for insert/delete) may sit mid-line. The
-/// reprinted buffer always shows the correct content; only the blinking-caret
-/// position is approximate. Mid-line edits therefore appear to apply "at the
-/// end" visually but are placed correctly in the buffer.
-fn redraw_line(editor: &editor::LineEditor, shown: &mut usize) {
+/// The framebuffer console stays destructive here — the line is erased and
+/// reprinted — but the caret is no longer tied to that: `caret.rs` draws it at
+/// the cell the logical cursor occupies, so a mid-line edit shows the caret
+/// exactly where the next character will land (see `caret_cell`).
+fn redraw_line(editor: &editor::LineEditor, shown: &mut usize, caret: &mut caret::Caret) {
+    // The caret is an overlay on the text being replaced: erase it first, or the
+    // glyphs printed over it bake its bar into their cells.
+    caret.erase();
     erase_visible(*shown);
     let buf = editor.buffer();
     print_both(buf);
@@ -78,7 +79,8 @@ fn redraw_line(editor: &editor::LineEditor, shown: &mut usize) {
 /// Drop to a fresh line, re-render the prompt, and reprint the current buffer.
 /// Used after listing Tab-completion candidates (R3.4). Resets `shown` to the
 /// reprinted buffer width.
-fn reprompt_with_buffer(editor: &editor::LineEditor, shown: &mut usize) {
+fn reprompt_with_buffer(editor: &editor::LineEditor, shown: &mut usize, caret: &mut caret::Caret) {
+    caret.erase();
     crate::kprintln!();
     crate::fb_println!();
     render::prompt(&path::cwd());
@@ -88,13 +90,19 @@ fn reprompt_with_buffer(editor: &editor::LineEditor, shown: &mut usize) {
 }
 
 /// List completion candidates on a new line, then re-render the prompt+buffer.
-fn list_candidates(editor: &editor::LineEditor, shown: &mut usize, candidates: &[String]) {
+fn list_candidates(
+    editor: &editor::LineEditor,
+    shown: &mut usize,
+    candidates: &[String],
+    caret: &mut caret::Caret,
+) {
+    caret.erase();
     crate::kprintln!();
     crate::fb_println!();
     let joined = candidates.join("  ");
     crate::kprintln!("{}", joined);
     crate::fb_println!("{}", joined);
-    reprompt_with_buffer(editor, shown);
+    reprompt_with_buffer(editor, shown, caret);
 }
 
 /// Execute a command line by dispatching through the command registry.
@@ -149,13 +157,20 @@ fn execute_command(cmd: &str) {
 /// against the VFS entries of its parent directory. VFS reads happen here and
 /// are passed to the pure `complete` functions as data — the completion logic
 /// itself performs no I/O.
-fn handle_tab(editor: &mut editor::LineEditor, shown: &mut usize) {
+fn handle_tab(editor: &mut editor::LineEditor, shown: &mut usize, caret: &mut caret::Caret) {
     let line = String::from(editor.buffer());
 
     match line.rfind(|c: char| c == ' ' || c == '\t') {
         // No whitespace -> first/only token: complete a command name.
         None => {
-            apply_completion(editor, shown, "", "", complete::complete_command(&line));
+            apply_completion(
+                editor,
+                shown,
+                caret,
+                "",
+                "",
+                complete::complete_command(&line),
+            );
         }
         // Whitespace present -> complete the trailing token as a path.
         Some(idx) => {
@@ -188,7 +203,7 @@ fn handle_tab(editor: &mut editor::LineEditor, shown: &mut usize) {
             let entry_refs: Vec<&str> = entries_owned.iter().map(|s| s.as_str()).collect();
 
             let comp = complete::complete_path(&cwd, token, &entry_refs);
-            apply_completion(editor, shown, before, dir_part, comp);
+            apply_completion(editor, shown, caret, before, dir_part, comp);
         }
     }
 }
@@ -202,6 +217,7 @@ fn handle_tab(editor: &mut editor::LineEditor, shown: &mut usize) {
 fn apply_completion(
     editor: &mut editor::LineEditor,
     shown: &mut usize,
+    caret: &mut caret::Caret,
     prefix: &str,
     dir_part: &str,
     comp: complete::Completion,
@@ -213,14 +229,14 @@ fn apply_completion(
         complete::Completion::Single(s) => {
             let new_line = format!("{}{}{}", prefix, dir_part, s);
             editor.set_line(&new_line);
-            redraw_line(editor, shown);
+            redraw_line(editor, shown, caret);
         }
         // Several matches: extend to the longest common prefix, then list the
         // candidates and redraw the prompt + buffer (R3.4).
         complete::Completion::Multiple { lcp, candidates } => {
             let new_line = format!("{}{}{}", prefix, dir_part, lcp);
             editor.set_line(&new_line);
-            list_candidates(editor, shown, &candidates);
+            list_candidates(editor, shown, &candidates, caret);
         }
     }
 }
@@ -290,6 +306,10 @@ pub fn shell_main() -> ! {
         crate::drivers::cursor::move_to(fw / 2, fh / 2);
     }
 
+    // One caret for the whole session: it must erase itself at the cell it was
+    // drawn at, and that cell is not recoverable from the buffer alone.
+    let mut caret = caret::Caret::new();
+
     loop {
         // CWD-aware prompt, e.g. `pagh:/> ` (R5.1–R5.3).
         render::prompt(&path::cwd());
@@ -297,6 +317,7 @@ pub fn shell_main() -> ! {
         // Fresh editor per prompt; `shown` tracks rendered input width.
         let mut editor = editor::LineEditor::new();
         let mut shown: usize = 0;
+        caret.reset();
 
         // Read keys until Enter.
         loop {
@@ -309,6 +330,12 @@ pub fn shell_main() -> ! {
             // redrawn exactly once afterwards.
             let mouse = crate::drivers::ps2_mouse::poll();
             crate::drivers::cursor::hide();
+            // NOTE: the caret is NOT erased here. It is erased by the functions
+            // that repaint the line (`redraw_line`/`list_candidates`), which is
+            // where it actually matters. Erasing it on every loop pass would make
+            // it nearly invisible: `halt()` returns on every timer tick, so the
+            // erase would follow the draw within microseconds and the caret would
+            // be absent for almost the whole blink period.
             shell_status_bar(&mouse);
 
             let mut entered = false;
@@ -323,18 +350,19 @@ pub fn shell_main() -> ! {
                 match event {
                     keys::KeyEvent::Char(c) => {
                         editor.insert(c);
-                        redraw_line(&editor, &mut shown);
+                        redraw_line(&editor, &mut shown, &mut caret);
                     }
                     keys::KeyEvent::Backspace => {
                         editor.delete_back();
-                        redraw_line(&editor, &mut shown);
+                        redraw_line(&editor, &mut shown, &mut caret);
                     }
                     keys::KeyEvent::Delete => {
                         editor.delete_fwd();
-                        redraw_line(&editor, &mut shown);
+                        redraw_line(&editor, &mut shown, &mut caret);
                     }
-                    // Cursor moves update the logical cursor only; the visible
-                    // caret stays at end-of-line (see redraw_line LIMITATION).
+                    // Cursor moves change only the logical cursor; the caret is
+                    // placed at that cursor's cell by the overlay below, so a
+                    // mid-line position is now what the user actually sees.
                     keys::KeyEvent::Left => {
                         editor.move_left();
                     }
@@ -351,7 +379,7 @@ pub fn shell_main() -> ! {
                     keys::KeyEvent::Up => {
                         if let Some(line) = history.recall_prev(editor.buffer()) {
                             editor.set_line(line);
-                            redraw_line(&editor, &mut shown);
+                            redraw_line(&editor, &mut shown, &mut caret);
                         }
                     }
                     // Down: recall a newer entry, or restore the stashed live
@@ -361,10 +389,10 @@ pub fn shell_main() -> ! {
                             Some(line) => editor.set_line(line),
                             None => editor.set_line(history.saved_line()),
                         }
-                        redraw_line(&editor, &mut shown);
+                        redraw_line(&editor, &mut shown, &mut caret);
                     }
                     keys::KeyEvent::Tab => {
-                        handle_tab(&mut editor, &mut shown);
+                        handle_tab(&mut editor, &mut shown, &mut caret);
                     }
                     // Enter: finish the line. Non-empty lines are recorded
                     // (with dedup) and dispatched; navigation is always reset.
@@ -390,13 +418,38 @@ pub fn shell_main() -> ! {
             if entered {
                 // Re-prompt on the next outer-loop pass; the cursor is redrawn
                 // by the next wake's overlay so the fresh prompt isn't clobbered.
+                caret.erase();
                 break;
+            }
+
+            // Place the caret at the logical cursor's cell, blinking on the
+            // scheduler's millisecond tick. The console is exactly at the end of
+            // the buffer here (`redraw_line` leaves it there), so the cell is
+            // found by walking back over the characters that follow the cursor.
+            if let Some(cell) = caret_cell(&editor) {
+                caret.place(
+                    cell,
+                    caret::Caret::blink_on(crate::task::scheduler::ticks()),
+                );
             }
 
             // Redraw the mouse cursor on top of the final rendered state.
             crate::drivers::cursor::move_to(mouse.x, mouse.y);
         }
     }
+}
+
+/// The cell the caret belongs in for the current line.
+///
+/// The console is exactly at the end of the printed buffer when this runs
+/// (`redraw_line` leaves it there), so its cursor cell plus the number of
+/// characters after the logical cursor pins the caret. Returns `None` when the
+/// framebuffer never initialized (serial-only boot), in which case no caret is
+/// drawn and the console behaves exactly as it did before.
+fn caret_cell(editor: &editor::LineEditor) -> Option<caret::Cell> {
+    let (cols, _rows) = crate::drivers::framebuffer::console().text_grid();
+    let console_cell = crate::drivers::framebuffer::console().cursor_cell()?;
+    caret::Caret::cell_for(console_cell, editor, cols)
 }
 
 /// Try to read a scancode from the keyboard.

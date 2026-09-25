@@ -50,6 +50,12 @@ pub struct FramebufferWriter {
     col: usize,
     row: usize,
     fg_color: u32,
+    /// A retained copy of what is currently on the text grid, `MAX_LINES` rows of
+    /// `CHARS_PER_LINE` cells. The pixels are still the display; this is the model
+    /// the shell needs to place things *at* a cell (the blinking caret) and to
+    /// answer "what character is here" (a selection copied out of the screen).
+    /// Kept in sync by `write_char`, `scroll` and `clear`.
+    grid: alloc::vec::Vec<u8>,
 }
 
 impl FramebufferWriter {
@@ -99,17 +105,41 @@ impl FramebufferWriter {
             col: 0,
             row: 0,
             fg_color: 0xFFFFFF,
+            // Bounded by construction: the console never holds more than
+            // `MAX_LINES` text rows, and `text_rows()` is clamped to it, so the
+            // model cannot grow with output volume.
+            grid: alloc::vec![b' '; MAX_LINES * CHARS_PER_LINE],
         })
     }
 
     pub fn clear(&mut self) {
         self.col = 0;
         self.row = 0;
+        for cell in self.grid.iter_mut() {
+            *cell = b' ';
+        }
         unsafe {
             let fb = self.fb_addr as *mut u8;
             for i in 0..(self.height * self.pitch) {
                 fb.add(i).write_volatile(0);
             }
+        }
+    }
+
+    /// Record `ch` at grid cell `(col, row)`; out-of-range writes are dropped.
+    fn set_cell(&mut self, col: usize, row: usize, ch: u8) {
+        if col < CHARS_PER_LINE && row < MAX_LINES {
+            self.grid[row * CHARS_PER_LINE + col] = ch;
+        }
+    }
+
+    /// The character recorded at grid cell `(col, row)`, or a space outside the
+    /// grid. Used to restore the glyph a caret was drawn over.
+    fn cell_char(&self, col: usize, row: usize) -> u8 {
+        if col < CHARS_PER_LINE && row < MAX_LINES {
+            self.grid[row * CHARS_PER_LINE + col]
+        } else {
+            b' '
         }
     }
 
@@ -131,6 +161,7 @@ impl FramebufferWriter {
                 if self.col > 0 {
                     self.col -= 1;
                     self.draw_char(b' ', self.col, self.row);
+                    self.set_cell(self.col, self.row, b' ');
                 }
             }
             32..=126 => {
@@ -142,6 +173,7 @@ impl FramebufferWriter {
                     }
                 }
                 self.draw_char(ch, self.col, self.row);
+                self.set_cell(self.col, self.row, ch);
                 self.col += 1;
             }
             _ => {}
@@ -219,6 +251,20 @@ impl FramebufferWriter {
                 fb.add(last_line_offset + i).write_volatile(0);
             }
         }
+        // The model must move with the pixels: a caret or a selection computed
+        // from a stale grid would point at the wrong row for the rest of the
+        // session. Shift up by one row over the same `rows` the pixels moved.
+        for row in 0..rows.saturating_sub(1) {
+            let src = (row + 1) * CHARS_PER_LINE;
+            let dst = row * CHARS_PER_LINE;
+            for col in 0..CHARS_PER_LINE {
+                self.grid[dst + col] = self.grid[src + col];
+            }
+        }
+        let last = (rows - 1) * CHARS_PER_LINE;
+        for col in 0..CHARS_PER_LINE {
+            self.grid[last + col] = b' ';
+        }
         self.row = rows - 1;
     }
 
@@ -232,6 +278,81 @@ impl FramebufferWriter {
     /// The background/clear color is unaffected. Defaults to `0xFFFFFF`.
     pub fn set_fg_color(&mut self, color: u32) {
         self.fg_color = color;
+    }
+
+    // ─── Text-cursor support (the blinking caret) ───
+
+    /// Current text cursor as `(col, row)`, in character cells.
+    ///
+    /// This is where the *next* character would land, which is what makes a
+    /// mid-line caret computable at all: the shell knows how many characters it
+    /// has printed after the caret, so it can walk back from here.
+    pub fn cursor_cell(&self) -> (usize, usize) {
+        (self.col, self.row)
+    }
+
+    /// Number of character columns on one text row, and the number of text rows
+    /// the console may use (the status bar is excluded).
+    pub fn text_grid(&self) -> (usize, usize) {
+        (CHARS_PER_LINE, self.text_rows())
+    }
+
+    /// Repaint cell `(col, row)` with `ch`, **without moving the text cursor**.
+    ///
+    /// `write_char` cannot be used to touch a cell that is not the current one:
+    /// it advances `col`/`row`, so using it to erase a caret would walk the
+    /// console forward and eventually scroll. This paints in place, so a caller
+    /// can erase a caret and draw a new one anywhere on the grid while the
+    /// console's own position stays exactly where it was.
+    ///
+    /// `color` is the glyph color for this cell only; the writer's `fg_color` is
+    /// left alone, so a caret's color cannot leak into subsequent output.
+    pub fn paint_cell(&mut self, col: usize, row: usize, ch: u8, color: u32) {
+        let (max_cols, max_rows) = self.text_grid();
+        if col >= max_cols || row >= max_rows {
+            return;
+        }
+        // Draw the glyph's own pixels in `color`, everything else in the
+        // background color, so repainting a cell fully replaces what was there.
+        let x = col * CHAR_WIDTH;
+        let y = row * CHAR_HEIGHT;
+        let glyph = get_glyph(ch);
+        for dy in 0..CHAR_HEIGHT {
+            if y + dy >= self.height {
+                break;
+            }
+            let glyph_byte = glyph[dy];
+            for dx in 0..CHAR_WIDTH {
+                if x + dx >= self.width {
+                    break;
+                }
+                let pixel_on = (glyph_byte & (1 << (7 - dx))) != 0;
+                self.put_pixel(x + dx, y + dy, if pixel_on { color } else { 0x000000 });
+            }
+        }
+    }
+
+    /// Paint a vertical bar in the **left** pixel column of cell `(col, row)`,
+    /// leaving the cell's own glyph pixels in their columns alone.
+    ///
+    /// A bar rather than a block on purpose: a block would hide the character it
+    /// sits on, and the caret's job here is to show where text will go, not to
+    /// replace it. `top_skip`/`height` bound the bar inside the 16-pixel cell so
+    /// the caller can make it shorter than the letters.
+    pub fn paint_cell_bar(&mut self, col: usize, row: usize, color: u32, height: usize) {
+        let (max_cols, max_rows) = self.text_grid();
+        if col >= max_cols || row >= max_rows {
+            return;
+        }
+        let x = col * CHAR_WIDTH;
+        let y = row * CHAR_HEIGHT;
+        let h = height.min(CHAR_HEIGHT);
+        for dy in 0..h {
+            if y + dy >= self.height {
+                break;
+            }
+            self.put_pixel(x, y + dy, color);
+        }
     }
 
     // ─── Graphics primitives (used by `paint`, the cursor, the status bar) ───
@@ -598,6 +719,42 @@ impl FbWriter {
     pub fn draw_status_bar(&self, left: &str, right: &str) {
         if let Some(ref mut writer) = *self.inner.lock() {
             writer.draw_status_bar(left, right);
+        }
+    }
+
+    /// The console's current text cursor cell as `(col, row)`, or `None` when the
+    /// framebuffer is uninitialized (serial-only boot).
+    pub fn cursor_cell(&self) -> Option<(usize, usize)> {
+        self.inner.lock().as_ref().map(|w| w.cursor_cell())
+    }
+
+    /// The text grid as `(cols, rows)`, or `(0, 0)` when uninitialized.
+    pub fn text_grid(&self) -> (usize, usize) {
+        self.inner
+            .lock()
+            .as_ref()
+            .map(|w| w.text_grid())
+            .unwrap_or((0, 0))
+    }
+
+    /// Draw a blinking caret as a vertical bar in cell `(col, row)`.
+    ///
+    /// `visible = false` erases a caret previously drawn at that cell by
+    /// repainting the glyph underneath it, so the caller keeps the character it
+    /// is sitting on. Both directions go through one method because they must be
+    /// exact inverses: a caret erased at a different cell than it was drawn at
+    /// leaves a stray bar on the screen.
+    pub fn paint_caret(&self, col: usize, row: usize, visible: bool, color: u32, height: usize) {
+        if let Some(ref mut writer) = *self.inner.lock() {
+            if visible {
+                writer.paint_cell_bar(col, row, color, height);
+            } else {
+                // Repaint the cell's glyph in the console's own foreground color
+                // so the letter the caret was covering comes back.
+                let fg = writer.fg_color;
+                let ch = writer.cell_char(col, row);
+                writer.paint_cell(col, row, ch, fg);
+            }
         }
     }
 }
