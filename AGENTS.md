@@ -209,10 +209,16 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   change is a feature (behavior change), so minor bump, not patch`.
   Land the bump in the same PR (or the final commit of a stacked series)
   that ships the feature — not some day later. **`main` currently reads 2.5.0**
-  (tags 2.3.0 → 2.4.0 → 2.4.1 → 2.4.2); `Cargo.toml` is the source of truth, and
+  (tags 2.3.0 → 2.4.0 → 2.4.1 → 2.4.2 → 2.5.0, each with a GitHub release);
+  `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **Last documented minor, 2.3.0** = fail-closed
+  be reflected here. **2.5.0** = procfs, signals, the verified apt trust chain
+  and the durability fixes (issues #11–#19, #32–#35). Every release owes both a
+  tag and a GitHub release: `main` reached 2.4.0 without either, so the tag list
+  and the release list drifted three minors apart before anyone noticed — an
+  unreleased version is invisible to anyone reading the repository from GitHub.
+  **Previous documented minor, 2.3.0** = fail-closed
   TLS server authentication (issue #14 series, PRs #22–#30): chain to the
   committed CA bundle, SAN authorization, the 2025 clock gate and
   `CertificateVerify`, plus the certificate-omission bypass closed in the
