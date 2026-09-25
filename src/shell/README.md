@@ -16,6 +16,7 @@ Framebuffer-shell с редактированием строки, историе
 | `complete.rs` | Чистое таб-дополнение: `longest_common_prefix`, `Completion::{None, Single, Multiple}`, `complete_command`, `complete_path` |
 | `keys.rs` | Декодер PS/2 Set 1: `KeyEvent`, `Decoder` (0xE0-префикс, Shift/Ctrl/CapsLock), таблица ASCII, `CTRL_C_LATCH` |
 | `render.rs` | `Style`, цветовые константы, `with_style`, `prompt`, `error_line`, `success_line` (framebuffer — цвет, serial — plain) |
+| `selection.rs` | Выделение мышью: диапазон клеток, подсветка инверсией, копирование текста из модели экрана; `Ctrl+A` — выделить строку, `Ctrl+X` — вырезать, `Ctrl+Y`/`Ctrl+V` — вставить |
 | `caret.rs` | Мигающая каретка: клетка из позиции консоли и логического курсора (`Caret::cell_for`), отрисовка/стирание вертикальной черты (`paint_caret`), фаза мигания по тикам |
 | `path.rs` | Глобальный CWD под `Spinlock<String>`; чистые `normalize` (фолдинг `.`/`..`, кламп в корень), `resolve`, `cwd`, `set_cwd` |
 | `suggest.rs` | Bounded Levenshtein `edit_distance`, `nearest_command` для «did you mean» |
@@ -48,6 +49,16 @@ Framebuffer-shell с редактированием строки, историе
    `execute_command`.
 6. `execute_command`: split по `&&`, токенизация, `registry::lookup` → вызов хендлера;
    неизвестное → `error_line` + `nearest_command` «did you mean».
+
+**Выделение и буфер обмена**: левая кнопка мыши с протяжкой выделяет текст консоли
+(подсветка — инверсия клеток), при отпускании текст уходит в буфер обмена сессии;
+`Ctrl+A` выделяет всю строку ввода, `Ctrl+X` вырезает выделенное (сначала скопировав),
+`Ctrl+Y` и `Ctrl+V` вставляют. Копирование ничего не печатает в консоль: это жест
+мышью, и вывод сдвинул бы с экрана тот самый текст, который выделили. Диапазон
+строится от **фактической строки консоли** (`line_cells`), а не от нулевой строки
+сетки: до промпта уже есть вывод и скролл, и координаты «от нуля» копировали чужой
+текст — это был реальный баг (см. коммит `fix: selection built its range from grid
+row 0`).
 
 **Модель рендера**: редактируемая строка по-прежнему перерисовывается деструктивно —
 `erase_visible(n)` даёт `"\x08 \x08"` на обеих консолях, `redraw_line` стирает `shown`
