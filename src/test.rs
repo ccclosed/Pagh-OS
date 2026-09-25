@@ -5397,6 +5397,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             shell_prop_tests::p28_caret_cell_tracks_the_logical_cursor
         ),
         (
+            "shell::selection range maps to line indices (Property 29)",
+            shell_prop_tests::p29_selection_range_maps_to_line_indices
+        ),
+        (
             "shell::registry lookup + help enumeration (unit)",
             shell_prop_tests::unit_registry_lookup_and_help
         ),
@@ -6214,8 +6218,6 @@ mod shell_prop_tests {
         );
     }
 
-    /// NOT REGISTERED — see the note at the end of this routine.
-    ///
     /// Property 29: a selection's cell range maps onto the line's indices the way
     /// the shell assumes.
     ///
@@ -6265,58 +6267,62 @@ mod shell_prop_tests {
                     "selection: empty index range returned as a range"
                 );
                 assert_kernel!(to <= line_len, "selection: index range runs past the line");
-                // The mapped span must start at or after the prompt, i.e. the
-                // selection's first cell cannot be inside the prompt.
+                // The line's own first character must map to index 0, and a range
+                // that starts there must not be reported as starting later. (An
+                // earlier version of this property also asserted that the mapped
+                // span starts at or after the prompt; that is wrong when the prompt
+                // is not on the grid's first row, which happens as soon as the
+                // console scrolls — the assumption, not the mapping, was the bug.)
                 let first_cell = range.a.row * cols + range.a.col;
                 assert_kernel!(
-                    first_cell < prompt || from == 0,
-                    "selection: mapped range starts before the prompt's end"
+                    first_cell != prompt || from == 0,
+                    "selection: a range starting at the line's first character must map to 0"
                 );
             }
         }
 
         // A selection entirely inside the prompt has no line text to act on.
-        // These use `cols = 100`, the console width, so a cell's absolute index is
-        // `row * 100 + col` — the same arithmetic the random loop above uses.
+        //
+        // These use absolute grid coordinates, and that is the whole point: the
+        // console holds boot output above the prompt, so the input line lives on a
+        // row like 11, not row 0. A selection built on row 0 copies whatever boot
+        // text is there — which is exactly the bug this property now pins. In these
+        // cases row 11 holds `pagh:/> abcdefgh`, so the console cursor is at cell
+        // (16, 11) and the 8-character buffer starts at cell (8, 11).
         let cols = 100usize;
-        let inside = CellRange::new(Cell { col: 0, row: 3 }, Cell { col: 5, row: 3 });
+        let row = 11usize;
+        let start_of_line = row * cols + 8; // first character after the prompt
+        let inside = CellRange::new(Cell { col: 0, row }, Cell { col: 5, row });
         assert_kernel!(
-            inside.line_indices(8, cols, 10).is_none(),
+            inside.line_indices(8, cols, 8).is_none(),
             "selection: a range inside the prompt must map to nothing"
         );
-        // Cells 8..=17 of row 3 are exactly the 10 characters after an 8-cell
-        // prompt, so the whole line maps to [0, 10).
-        let whole = CellRange::new(Cell { col: 8, row: 3 }, Cell { col: 17, row: 3 });
+        // Cells 8..=15 are exactly the 8 characters after the prompt.
+        let whole = CellRange::new(Cell { col: 8, row }, Cell { col: 15, row });
         assert_kernel!(
-            whole.line_indices(8, cols, 10) == Some((0, 10)),
+            whole.line_indices(start_of_line, cols, 8) == Some((0, 8)),
             "selection: the whole line did not map to [0, len)"
         );
-        // Mid-line: cells 10..=12 are line indices 2..=4, so the range is [2, 5).
-        let mid = CellRange::new(Cell { col: 10, row: 3 }, Cell { col: 12, row: 3 });
+        // Cells 10..=12 are line indices 2..=4, so the range is [2, 5).
+        let mid = CellRange::new(Cell { col: 10, row }, Cell { col: 12, row });
         assert_kernel!(
-            mid.line_indices(8, cols, 10) == Some((2, 5)),
+            mid.line_indices(start_of_line, cols, 8) == Some((2, 5)),
             "selection: a mid-line range did not map to its indices"
         );
         // A selection that runs past the end of the line is clipped to it, which is
         // what Ctrl+X needs: deleting must not reach past the buffer.
-        let over = CellRange::new(Cell { col: 12, row: 3 }, Cell { col: 40, row: 3 });
+        let over = CellRange::new(Cell { col: 12, row }, Cell { col: 40, row });
         assert_kernel!(
-            over.line_indices(8, cols, 10) == Some((4, 10)),
+            over.line_indices(start_of_line, cols, 8) == Some((4, 8)),
             "selection: a range past the line's end was not clipped to it"
         );
-
-        // NOT REGISTERED in `all_tests`, deliberately. In the guest these four
-        // explicit cases fail with `line_indices` returning `None` for inputs whose
-        // arithmetic (checked on the host) yields `Some` — e.g. `a=(8,3) b=(17,3)
-        // cols=100 prompt=8 len=10` should be `(0, 10)` and comes back `None`. That
-        // is a real discrepancy and it is unresolved: either the test's coordinate
-        // assumption is wrong in a way the host check does not reproduce, or the
-        // mapping is wrong for every selection. Registering a property that fails
-        // would block the suite on an open question, and weakening it to pass would
-        // hide one — so it stays out of the suite until the discrepancy is
-        // explained. The mouse path itself is verified in QEMU by the drag test
-        // (1920 highlighted pixels, range extending cell by cell); copy/cut/paste
-        // are therefore implemented but NOT independently verified end to end.
+        // And the bug itself: the same cells interpreted as if the line started on
+        // row 0 must NOT map to the buffer, because row 0 is boot output.
+        let wrong_row = CellRange::new(Cell { col: 8, row: 0 }, Cell { col: 15, row: 0 });
+        assert_kernel!(
+            wrong_row.line_indices(start_of_line, cols, 8) != Some((0, 8)),
+            "selection: a range on the wrong row must not map to the line"
+        );
     }
 
     /// Unit (task 8.3): the registry is the single source of truth — every

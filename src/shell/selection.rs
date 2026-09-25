@@ -135,6 +135,11 @@ impl CellRange {
 pub struct Selection {
     anchor: Option<Cell>,
     range: Option<CellRange>,
+    /// Exact line indices this selection corresponds to, when they are known
+    /// without inference. Keyboard selection knows them by construction (`Ctrl+A`
+    /// selects the buffer), so it does not have to re-derive them from cells —
+    /// which is the arithmetic that turned out to be unreliable.
+    line_range: Option<(usize, usize)>,
     painted: bool,
 }
 
@@ -143,8 +148,22 @@ impl Selection {
         Selection {
             anchor: None,
             range: None,
+            line_range: None,
             painted: false,
         }
+    }
+
+    /// Set the range directly (no drag), for keyboard-driven selection, together
+    /// with the line indices it covers.
+    pub fn set_range(&mut self, range: CellRange, line_range: Option<(usize, usize)>) {
+        self.anchor = None;
+        self.range = Some(range);
+        self.line_range = line_range;
+    }
+
+    /// The line indices this selection covers, when they are known exactly.
+    pub fn known_line_range(&self) -> Option<(usize, usize)> {
+        self.line_range
     }
 
     /// Begin a drag at `cell`.
@@ -152,6 +171,7 @@ impl Selection {
         self.clear();
         self.anchor = Some(cell);
         self.range = None;
+        self.line_range = None;
     }
 
     /// Extend the drag to `cell` and report whether anything is selected.
@@ -219,6 +239,7 @@ impl Selection {
         }
         self.anchor = None;
         self.range = None;
+        self.line_range = None;
         self.painted = false;
     }
 }

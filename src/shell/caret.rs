@@ -37,6 +37,15 @@ const BLINK_PERIOD_MS: u64 = 600;
 /// so the bar reads as an insertion point rather than as a drawn border.
 const CARET_BAR_H: usize = 12;
 
+/// The first and last cells of one console line, both in absolute grid
+/// coordinates. Produced by the shell (which alone knows where the input line was
+/// printed) and consumed by select-all, so every user of these rows agrees.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CellRangeCells {
+    pub first: Cell,
+    pub last: Cell,
+}
+
 /// A grid cell `(col, row)` on the text console.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Cell {

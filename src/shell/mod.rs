@@ -442,14 +442,38 @@ pub fn shell_main() -> ! {
                     // the clipboard back. Between them they are what makes a copy
                     // observable: the text that was copied is the text that comes
                     // back, and nothing else.
+                    keys::KeyEvent::Ctrl('a') => {
+                        // Select the whole input line. The range is built from the
+                        // prompt's width, so this doubles as the mouse-free path to a
+                        // selection: typing, Ctrl+A, Ctrl+X, Ctrl+V exercises the
+                        // clipboard without needing a mouse in the test rig.
+                        let line_len = editor.buffer().chars().count();
+                        if line_len > 0 {
+                            if let Some(cells) = line_cells(&editor) {
+                                let cols = console_cols();
+                                selection.clear();
+                                selection.set_range(
+                                    selection::CellRange::new(cells.first, cells.last),
+                                    Some((0, line_len)),
+                                );
+                                selection.paint(cols);
+                            }
+                        }
+                    }
                     keys::KeyEvent::Ctrl('x') => {
                         if let Some(range) = selection.range() {
                             let cols = console_cols();
-                            if let Some((from, to)) = range.line_indices(
-                                prompt_cols(),
-                                cols,
-                                editor.buffer().chars().count(),
-                            ) {
+                            // Prefer the exact indices a keyboard selection already
+                            // knows; fall back to deriving them from cells for a
+                            // mouse drag.
+                            let idx = selection.known_line_range().or_else(|| {
+                                range.line_indices(
+                                    prompt_cols(),
+                                    cols,
+                                    editor.buffer().chars().count(),
+                                )
+                            });
+                            if let Some((from, to)) = idx {
                                 let text = range.text(cols);
                                 if !text.is_empty() {
                                     clipboard = text;
@@ -460,7 +484,7 @@ pub fn shell_main() -> ! {
                             }
                         }
                     }
-                    keys::KeyEvent::Ctrl('y') => {
+                    keys::KeyEvent::Ctrl('y') | keys::KeyEvent::Ctrl('v') => {
                         if !clipboard.is_empty() {
                             // A multi-line clipboard is pasted with newlines folded to
                             // spaces: the line editor holds one line, and dropping the
@@ -531,6 +555,40 @@ fn prompt_cols() -> usize {
 /// Console width in cells, or 0 when the framebuffer never initialized.
 fn console_cols() -> usize {
     crate::drivers::framebuffer::console().text_grid().0
+}
+
+/// The console rows the current input line occupies, `(first_row, last_row)`, with
+/// the columns of its first and last character.
+///
+/// The line is printed after the prompt, so it does not start at grid row 0: boot
+/// output and earlier commands have scrolled the console, and the prompt can itself
+/// wrap. Everything that has to touch the line's cells — the caret, `Ctrl+A`'s
+/// selection, and the mapping back to line indices — must agree on these rows, so
+/// they are computed in one place. Deriving them from "the line starts at row 0"
+/// is the bug this exists to prevent: a selection built on row 0 copies whatever
+/// boot text happens to be there.
+fn line_cells(editor: &editor::LineEditor) -> Option<caret::CellRangeCells> {
+    let (cols, _rows) = crate::drivers::framebuffer::console().text_grid();
+    let (ccol, crow) = crate::drivers::framebuffer::console().cursor_cell()?;
+    if cols == 0 {
+        return None;
+    }
+    // The console is exactly past the last printed character of the line.
+    let end = crow * cols + ccol;
+    let start = end.checked_sub(editor.buffer().chars().count())?;
+    let first_row = start / cols;
+    // `Ctrl+A` selects the whole buffer, so the range spans whole rows: from the
+    // line's first character to the console's last printed cell.
+    Some(caret::CellRangeCells {
+        first: caret::Cell {
+            col: start % cols,
+            row: first_row,
+        },
+        last: caret::Cell {
+            col: ccol.saturating_sub(1).max(start % cols),
+            row: crow,
+        },
+    })
 }
 
 /// The cell the caret belongs in for the current line.
