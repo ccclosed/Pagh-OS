@@ -530,6 +530,25 @@ fn clipped_ascii(s: &str, start: usize, width: usize, spaces: bool) -> String {
 }
 
 fn render(editor: &Editor, caret_on: bool, tree: Option<&super::tree::FileTree>) {
+    render_impl(editor, caret_on, tree, false)
+}
+
+/// Repaint **only** the caret cell.
+///
+/// The caret has to change twice per blink period while the rest of the screen
+/// stays put. Redrawing everything for that produced frames caught mid-draw — the
+/// screen looked like it was tearing — so the blink path touches two cells instead:
+/// the old caret (restored by repainting its character) and the new one.
+fn render_caret(editor: &Editor, caret_on: bool, tree: Option<&super::tree::FileTree>) {
+    render_impl(editor, caret_on, tree, true)
+}
+
+fn render_impl(
+    editor: &Editor,
+    caret_on: bool,
+    tree: Option<&super::tree::FileTree>,
+    caret_only: bool,
+) {
     let (w, h) = framebuffer::dimensions();
     if w == 0 || h == 0 {
         return;
@@ -547,6 +566,11 @@ fn render(editor: &Editor, caret_on: bool, tree: Option<&super::tree::FileTree>)
     let [bg, surface, text, muted, blue, green, red, select] = editor.config.palette();
     cursor::hide();
     let _ = framebuffer::with(|fb| {
+        if caret_only {
+            // Only the two cells the caret occupies can have changed.
+            paint_caret_bar(fb, editor, caret_on, tree, w);
+            return;
+        }
         fb.fill_rect(0, 0, w, h, bg);
         fb.fill_rect(0, 0, w, HEADER_H, blue);
         let mark = if editor.dirty { " *" } else { "" };
@@ -694,9 +718,7 @@ fn render(editor: &Editor, caret_on: bool, tree: Option<&super::tree::FileTree>)
         );
         // The caret: a blinking vertical bar in the left pixel column of the cell
         // the next character will occupy — the same shape and color as the shell's
-        // caret, so the two read as one thing. It used to be a static two-pixel
-        // underline, which is why it did not look like a cursor at all, and it
-        // vanished the moment the cursor scrolled out of view without saying so.
+        // caret, so the two read as one thing.
         if editor.prompt.is_none() && editor.row >= editor.top && editor.col >= editor.left {
             let cx = (tree_cols + gutter + editor.col - editor.left) * CHAR_W;
             let cy = HEADER_H + (editor.row - editor.top) * CHAR_H;
@@ -705,6 +727,7 @@ fn render(editor: &Editor, caret_on: bool, tree: Option<&super::tree::FileTree>)
             }
         }
     });
+    let _ = caret_only;
 }
 
 pub fn run(path_arg: &str) {
@@ -749,11 +772,12 @@ fn event_loop(
     tree_focus: &mut bool,
 ) {
     let mut decoder = Decoder::new();
-    let mut pane = if editor.tree_root.is_some() {
-        Pane::Tree
-    } else {
-        Pane::Text
-    };
+    // The keyboard starts in the TEXT, always — including when the sidebar is open.
+    // Opening a file is an intent to edit it; routing the first keystroke into a
+    // file browser instead made the editor look broken (you could not type, and
+    // `^Q` did nothing because the sidebar owned the keys). `Tab` moves into the
+    // tree when it is wanted.
+    let mut pane = Pane::Text;
     // Open the sidebar at the edited file's directory.
     if let Some(root) = editor.tree_root.clone() {
         *tree = Some(super::tree::FileTree::new(&root));
@@ -768,7 +792,9 @@ fn event_loop(
             t.ensure_visible();
         }
     }
-    render(&editor, blink(), tree.as_ref());
+    let mut last_phase = blink();
+    let mut caret_cell = caret_cell_of(&editor, tree.as_ref());
+    render(&editor, last_phase, tree.as_ref());
     'app: loop {
         crate::arch::cpu::halt();
         while let Some(sc) = super::try_read_scancode() {
@@ -779,6 +805,43 @@ fn event_loop(
                 editor.handle_prompt(event);
                 render(&editor, blink(), tree.as_ref());
                 continue;
+            }
+
+            // ── Keys that belong to the editor no matter where the focus is ──
+            // `^Q`, `^S` and `^B` are how you leave, save and get back; a focus
+            // state that swallows them is a trap, which is exactly what happened
+            // when the sidebar opened focused.
+            match event {
+                KeyEvent::Ctrl('q') => {
+                    if editor.dirty && !editor.quit_armed {
+                        editor.quit_armed = true;
+                        editor.status = "Unsaved changes — press ^Q again to quit".into();
+                    } else {
+                        break 'app;
+                    }
+                    render(&editor, blink(), tree.as_ref());
+                    continue;
+                }
+                KeyEvent::Ctrl('s') => {
+                    if let Err(e) = save(&mut editor, &node) {
+                        editor.status = format!("Error saving: {:?}", e)
+                    }
+                    render(&editor, blink(), tree.as_ref());
+                    continue;
+                }
+                KeyEvent::Ctrl('b') => {
+                    if tree.is_some() {
+                        *tree = None;
+                        pane = Pane::Text;
+                    } else {
+                        *tree = Some(super::tree::FileTree::new(&parent_dir(&editor.path)));
+                        pane = Pane::Tree;
+                    }
+                    *tree_focus = pane == Pane::Tree;
+                    render(&editor, blink(), tree.as_ref());
+                    continue;
+                }
+                _ => {}
             }
 
             // ── Sidebar focus: the tree owns the arrow keys and Enter ──
@@ -814,7 +877,9 @@ fn event_loop(
                             }
                         }
                     }
-                    KeyEvent::Ctrl('b') | KeyEvent::Escape | KeyEvent::Tab => {
+                    // `Tab` returns to the text; `Esc` too. The editor-level
+                    // `^Q`/`^S`/`^B` above are already handled.
+                    KeyEvent::Tab | KeyEvent::Escape => {
                         pane = Pane::Text;
                         *tree_focus = false;
                     }
@@ -859,30 +924,19 @@ fn event_loop(
                         editor.insert(' ')
                     }
                 }
-                // Toggle the project tree, rooted at the edited file's directory.
-                KeyEvent::Ctrl('b') => {
-                    if tree.is_some() {
-                        *tree = None;
-                        pane = Pane::Text;
-                        *tree_focus = false;
-                    } else {
-                        let dir = parent_dir(&editor.path);
-                        *tree = Some(super::tree::FileTree::new(&dir));
-                        pane = Pane::Tree;
-                        *tree_focus = true;
-                    }
-                }
-                KeyEvent::Ctrl('s') => {
-                    if let Err(e) = save(&mut editor, &node) {
-                        editor.status = format!("Error saving: {:?}", e)
-                    }
-                }
-                KeyEvent::Ctrl('q') | KeyEvent::Escape => {
+                KeyEvent::Escape => {
                     if editor.dirty && !editor.quit_armed {
                         editor.quit_armed = true;
                         editor.status = "Unsaved changes — press ^Q again to quit".into()
                     } else {
                         break 'app;
+                    }
+                }
+                // Enter the sidebar without the mouse.
+                KeyEvent::Ctrl('t') => {
+                    if tree.is_some() {
+                        pane = Pane::Tree;
+                        *tree_focus = true;
                     }
                 }
                 KeyEvent::Ctrl('f') => editor.begin_prompt(PromptMode::Search),
@@ -896,14 +950,89 @@ fn event_loop(
                 _ => {}
             }
         }
-        // Repaint on every wake, not only on a keystroke: `halt()` returns on each
-        // timer tick, and the caret's blink phase is a function of the tick counter,
-        // so rendering only after input would freeze the caret in whichever phase it
-        // happened to be in when the last key arrived. The shell's loop repaints the
-        // same way; this is that behaviour, not an extra refresh loop.
-        render(&editor, blink(), tree.as_ref());
+        // Repaint **only when the blink phase changes**, not on every wake.
+        //
+        // `halt()` returns on every timer tick (1 kHz), so repainting on each wake
+        // meant rebuilding the whole screen a thousand times a second: the frame was
+        // almost always caught half-drawn, which reads as violent flicker rather
+        // than a blinking caret. The phase changes twice per period, so a full
+        // repaint twice per 600 ms is both enough to animate the caret and quiet
+        // enough to draw a complete frame between changes. Any keystroke already
+        // repainted above.
+        let phase = blink();
+        if phase != last_phase {
+            last_phase = phase;
+            // Erase the bar where it was, then paint the new phase where it is:
+            // the two can differ because the cursor moved between blinks.
+            let prev = caret_cell;
+            let now = caret_cell_of(&editor, tree.as_ref());
+            caret_cell = now;
+            let _ = framebuffer::with(|fb| {
+                let bg = editor.config.palette()[0];
+                if let Some((px, py)) = prev {
+                    fb.fill_rect(px, py, 2, CHAR_H, bg);
+                }
+                if let Some((cx, cy)) = now {
+                    if phase {
+                        fb.fill_rect(cx, cy, 2, CHAR_H, super::caret::CARET_COLOR);
+                    }
+                }
+            });
+        }
     }
     let _ = tree_focus;
+}
+
+/// Where the caret cell is, in pixels, or `None` when it is off-screen or a
+/// prompt is showing. Used by the blink path so it can erase the previous bar.
+fn caret_cell_of(editor: &Editor, tree: Option<&super::tree::FileTree>) -> Option<(usize, usize)> {
+    if editor.prompt.is_some() || editor.row < editor.top || editor.col < editor.left {
+        return None;
+    }
+    let tree_cols = if tree.is_some() { TREE_COLS } else { 0 };
+    let gutter = if editor.config.line_numbers {
+        7usize
+    } else {
+        0
+    };
+    Some((
+        (tree_cols + gutter + editor.col - editor.left) * CHAR_W,
+        HEADER_H + (editor.row - editor.top) * CHAR_H,
+    ))
+}
+
+/// Repaint just the caret bar for the current cursor position.
+///
+/// Erasing costs nothing extra: the cell is painted with the caret's own cell
+/// background first, which is what the full render would have drawn there anyway.
+fn paint_caret_bar(
+    fb: &mut crate::drivers::framebuffer::FramebufferWriter,
+    editor: &Editor,
+    caret_on: bool,
+    tree: Option<&super::tree::FileTree>,
+    w: usize,
+) {
+    let tree_cols = if tree.is_some() { TREE_COLS } else { 0 };
+    let gutter = if editor.config.line_numbers {
+        7usize
+    } else {
+        0
+    };
+    if editor.prompt.is_some() || editor.row < editor.top || editor.col < editor.left {
+        return;
+    }
+    let bg = editor.config.palette()[0];
+    let cx = (tree_cols + gutter + editor.col - editor.left) * CHAR_W;
+    let cy = HEADER_H + (editor.row - editor.top) * CHAR_H;
+    if cx >= w {
+        return;
+    }
+    // Clear the two pixels the bar occupies, then draw it when lit. Clearing is
+    // what erases a caret from the previous phase without repainting the screen.
+    fb.fill_rect(cx, cy, 2, CHAR_H, bg);
+    if caret_on {
+        fb.fill_rect(cx, cy, 2, CHAR_H, super::caret::CARET_COLOR);
+    }
 }
 
 /// The caret's blink phase, shared with the shell so both carets blink together.
