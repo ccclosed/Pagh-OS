@@ -22,6 +22,8 @@ const CHAR_W: usize = 8;
 const CHAR_H: usize = 16;
 const HEADER_H: usize = 22;
 const FOOTER_H: usize = 38;
+/// Sidebar width in character cells.
+const TREE_COLS: usize = 24;
 const BG: u32 = 0x191919;
 const SURFACE: u32 = 0x252525;
 const TEXT: u32 = 0xF2F2F2;
@@ -63,6 +65,8 @@ pub struct Editor {
     config: NanoConfig,
     clipboard: Vec<String>,
     replace_needle: Option<String>,
+    /// Directory the sidebar should open at, when the editor starts with one.
+    tree_root: Option<String>,
 }
 
 impl Editor {
@@ -87,8 +91,34 @@ impl Editor {
             quit_armed: false,
             config,
             clipboard: Vec::new(),
+            tree_root: None,
             replace_needle: None,
         }
+    }
+
+    /// Point this editor at a different file, keeping the configuration.
+    ///
+    /// Undo history is dropped deliberately: it belongs to the previous file, and
+    /// keeping it would let an undo in one file rewrite another.
+    fn reload(&mut self, path: &str, text: &str) {
+        self.path = path.to_string();
+        self.lines = {
+            let mut l: Vec<String> = text.split('\n').map(sanitize_line).collect();
+            if l.is_empty() {
+                l.push(String::new());
+            }
+            l
+        };
+        self.row = 0;
+        self.col = 0;
+        self.top = 0;
+        self.left = 0;
+        self.dirty = false;
+        self.undo.clear();
+        self.redo.clear();
+        self.search_hit = None;
+        self.quit_armed = false;
+        self.status = alloc::format!("opened {}", path);
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -499,12 +529,15 @@ fn clipped_ascii(s: &str, start: usize, width: usize, spaces: bool) -> String {
         .collect()
 }
 
-fn render(editor: &Editor) {
+fn render(editor: &Editor, caret_on: bool, tree: Option<&super::tree::FileTree>) {
     let (w, h) = framebuffer::dimensions();
     if w == 0 || h == 0 {
         return;
     }
-    let cols = w / CHAR_W;
+    // The sidebar takes a fixed share of the width, and the text area gets the
+    // rest: the tree is context, the text is the work.
+    let tree_cols = if tree.is_some() { TREE_COLS } else { 0 };
+    let cols = (w / CHAR_W).saturating_sub(tree_cols);
     let rows = h.saturating_sub(HEADER_H + FOOTER_H) / CHAR_H;
     let gutter = if editor.config.line_numbers {
         7usize
@@ -525,16 +558,70 @@ fn render(editor: &Editor) {
             0xFFFFFF,
             blue,
         );
+        // ── Sidebar: the project tree ──
+        if let Some(tree) = tree {
+            let tw = tree_cols * CHAR_W;
+            fb.fill_rect(
+                0,
+                HEADER_H,
+                tw,
+                h.saturating_sub(HEADER_H + FOOTER_H),
+                surface,
+            );
+            let header = alloc::format!(" {} ", tree.root());
+            fb.draw_text_px(
+                2,
+                HEADER_H + 2,
+                &clipped_ascii(&header, 0, tree_cols.saturating_sub(1), false),
+                muted,
+                surface,
+            );
+            let list_y = HEADER_H + CHAR_H + 4;
+            let list_rows = rows.saturating_sub(1);
+            for vr in 0..list_rows {
+                let i = tree.top + vr;
+                let Some(row) = tree.rows().get(i) else {
+                    break;
+                };
+                let y = list_y + vr * CHAR_H;
+                // Indent per depth, and a marker that says open/closed at a glance.
+                let indent = row.depth * 2;
+                let mark = if row.is_dir {
+                    if row.expanded {
+                        "v "
+                    } else {
+                        "> "
+                    }
+                } else {
+                    "  "
+                };
+                let text_line = alloc::format!("{}{}{}", " ".repeat(indent), mark, row.name);
+                let (fg, bg) = if i == tree.cursor {
+                    (0x000000, 0xCCCCCC)
+                } else if row.is_dir {
+                    (text, surface)
+                } else {
+                    (muted, surface)
+                };
+                fb.draw_text_px(
+                    2,
+                    y,
+                    &clipped_ascii(&text_line, 0, tree_cols.saturating_sub(1), false),
+                    fg,
+                    bg,
+                );
+            }
+        }
         for vr in 0..rows {
             let r = editor.top + vr;
             let y = HEADER_H + vr * CHAR_H;
             if r >= editor.lines.len() {
-                fb.draw_text_px(8, y, "~", blue, bg);
+                fb.draw_text_px(tree_cols * CHAR_W + 8, y, "~", blue, bg);
                 continue;
             }
             if editor.config.line_numbers {
                 let num = format!("{:>5} ", r + 1);
-                fb.draw_text_px(0, y, &num, muted, surface);
+                fb.draw_text_px(tree_cols * CHAR_W, y, &num, muted, surface);
             }
             let visible = clipped_ascii(
                 &editor.lines[r],
@@ -552,13 +639,19 @@ fn render(editor: &Editor) {
                     );
                     let hit =
                         clipped_ascii(&editor.lines[r], hc, hlen, editor.config.show_whitespace);
-                    fb.draw_text_px(gutter * CHAR_W, y, &visible, text, bg);
-                    fb.draw_text_px((gutter + before.len()) * CHAR_W, y, &hit, 0xFFFFFF, select);
+                    fb.draw_text_px(tree_cols * CHAR_W + gutter * CHAR_W, y, &visible, text, bg);
+                    fb.draw_text_px(
+                        tree_cols * CHAR_W + (gutter + before.len()) * CHAR_W,
+                        y,
+                        &hit,
+                        0xFFFFFF,
+                        select,
+                    );
                 } else {
-                    fb.draw_text_px(gutter * CHAR_W, y, &visible, text, bg);
+                    fb.draw_text_px(tree_cols * CHAR_W + gutter * CHAR_W, y, &visible, text, bg);
                 }
             } else {
-                fb.draw_text_px(gutter * CHAR_W, y, &visible, text, bg);
+                fb.draw_text_px(tree_cols * CHAR_W + gutter * CHAR_W, y, &visible, text, bg);
             }
         }
         let foot = h - FOOTER_H;
@@ -595,15 +688,20 @@ fn render(editor: &Editor) {
         fb.draw_text_px(
             6,
             foot + 20,
-            "^S Save ^Q Quit ^F Find ^R Replace ^K Cut ^U Paste ^Z Undo",
+            "^S Save ^Q Quit ^B Files ^F Find ^R Replace ^K Cut ^U Paste ^Z Undo",
             text,
             surface,
         );
+        // The caret: a blinking vertical bar in the left pixel column of the cell
+        // the next character will occupy — the same shape and color as the shell's
+        // caret, so the two read as one thing. It used to be a static two-pixel
+        // underline, which is why it did not look like a cursor at all, and it
+        // vanished the moment the cursor scrolled out of view without saying so.
         if editor.prompt.is_none() && editor.row >= editor.top && editor.col >= editor.left {
-            let cx = (gutter + editor.col - editor.left) * CHAR_W;
+            let cx = (tree_cols + gutter + editor.col - editor.left) * CHAR_W;
             let cy = HEADER_H + (editor.row - editor.top) * CHAR_H;
-            if cx < w {
-                fb.fill_rect(cx, cy + CHAR_H - 2, CHAR_W, 2, blue);
+            if cx < w && caret_on {
+                fb.fill_rect(cx, cy, 2, CHAR_H, super::caret::CARET_COLOR);
             }
         }
     });
@@ -618,10 +716,59 @@ pub fn run(path_arg: &str) {
             return;
         }
     };
+    let mut node = node;
     let mut editor = Editor::new(&path, &text, NanoConfig::load());
-    let mut decoder = Decoder::new();
+    editor.tree_root = Some(parent_dir(&path));
+    // The sidebar is visible from the start: seeing the project is the point of an
+    // IDE-like editor, and `^B` hides it for a full-width view of the text.
+    let mut tree: Option<super::tree::FileTree> = None;
+    let mut tree_focus = false;
     crate::kprintln!("nano+: editing {}", path);
-    render(&editor);
+    event_loop(editor, node, &mut tree, &mut tree_focus);
+    framebuffer::clear_screen();
+    cursor::hide();
+    crate::kprintln!("nano+: closed {}", path);
+}
+
+/// Which pane the keyboard drives. The sidebar is only reachable while it is open.
+#[derive(PartialEq, Clone, Copy)]
+enum Pane {
+    Text,
+    Tree,
+}
+
+/// The editor's event loop, with the sidebar threaded through it.
+///
+/// Split out of [`run`] so the tree and the editor are separate borrows: the loop
+/// needs `&mut` on both, and holding them as two locals of one frame is what keeps
+/// that legal without interior mutability.
+fn event_loop(
+    mut editor: Editor,
+    mut node: alloc::sync::Arc<dyn crate::vfs::VfsNode>,
+    tree: &mut Option<super::tree::FileTree>,
+    tree_focus: &mut bool,
+) {
+    let mut decoder = Decoder::new();
+    let mut pane = if editor.tree_root.is_some() {
+        Pane::Tree
+    } else {
+        Pane::Text
+    };
+    // Open the sidebar at the edited file's directory.
+    if let Some(root) = editor.tree_root.clone() {
+        *tree = Some(super::tree::FileTree::new(&root));
+        if let Some(t) = tree.as_mut() {
+            t.view_rows = 20;
+            // Put the highlight on the file being edited, not on the first entry:
+            // the tree should show where you are.
+            let current = editor.path.clone();
+            if let Some(i) = t.rows().iter().position(|r| r.path == current) {
+                t.cursor = i;
+            }
+            t.ensure_visible();
+        }
+    }
+    render(&editor, blink(), tree.as_ref());
     'app: loop {
         crate::arch::cpu::halt();
         while let Some(sc) = super::try_read_scancode() {
@@ -630,9 +777,56 @@ pub fn run(path_arg: &str) {
             };
             if editor.prompt.is_some() {
                 editor.handle_prompt(event);
-                render(&editor);
+                render(&editor, blink(), tree.as_ref());
                 continue;
             }
+
+            // ── Sidebar focus: the tree owns the arrow keys and Enter ──
+            if pane == Pane::Tree {
+                match event {
+                    KeyEvent::Up => {
+                        if let Some(t) = tree.as_mut() {
+                            t.move_up()
+                        }
+                    }
+                    KeyEvent::Down => {
+                        if let Some(t) = tree.as_mut() {
+                            t.move_down()
+                        }
+                    }
+                    KeyEvent::Left => {
+                        if let Some(t) = tree.as_mut() {
+                            t.collapse_or_parent();
+                        }
+                    }
+                    KeyEvent::Right | KeyEvent::Enter => {
+                        if let Some(t) = tree.as_mut() {
+                            if let Some(path) = t.activate() {
+                                // Switching files with unsaved changes would silently
+                                // drop them, so it is refused instead.
+                                if editor.dirty {
+                                    editor.status =
+                                        "Unsaved changes — ^S to save, or ^B to go back".into();
+                                } else if let Ok((n, text)) = open_or_create(&path) {
+                                    editor.reload(&path, &text);
+                                    node = n;
+                                }
+                            }
+                        }
+                    }
+                    KeyEvent::Ctrl('b') | KeyEvent::Escape | KeyEvent::Tab => {
+                        pane = Pane::Text;
+                        *tree_focus = false;
+                    }
+                    _ => {}
+                }
+                if let Some(t) = tree.as_mut() {
+                    t.ensure_visible();
+                }
+                render(&editor, blink(), tree.as_ref());
+                continue;
+            }
+
             match event {
                 KeyEvent::Char(c) => editor.insert(c),
                 KeyEvent::Enter => editor.newline(),
@@ -665,6 +859,19 @@ pub fn run(path_arg: &str) {
                         editor.insert(' ')
                     }
                 }
+                // Toggle the project tree, rooted at the edited file's directory.
+                KeyEvent::Ctrl('b') => {
+                    if tree.is_some() {
+                        *tree = None;
+                        pane = Pane::Text;
+                        *tree_focus = false;
+                    } else {
+                        let dir = parent_dir(&editor.path);
+                        *tree = Some(super::tree::FileTree::new(&dir));
+                        pane = Pane::Tree;
+                        *tree_focus = true;
+                    }
+                }
                 KeyEvent::Ctrl('s') => {
                     if let Err(e) = save(&mut editor, &node) {
                         editor.status = format!("Error saving: {:?}", e)
@@ -688,10 +895,27 @@ pub fn run(path_arg: &str) {
                 KeyEvent::Ctrl('u') | KeyEvent::Ctrl('v') => editor.paste_line(),
                 _ => {}
             }
-            render(&editor);
         }
+        // Repaint on every wake, not only on a keystroke: `halt()` returns on each
+        // timer tick, and the caret's blink phase is a function of the tick counter,
+        // so rendering only after input would freeze the caret in whichever phase it
+        // happened to be in when the last key arrived. The shell's loop repaints the
+        // same way; this is that behaviour, not an extra refresh loop.
+        render(&editor, blink(), tree.as_ref());
     }
-    framebuffer::clear_screen();
-    cursor::hide();
-    crate::kprintln!("nano+: closed {}", path);
+    let _ = tree_focus;
+}
+
+/// The caret's blink phase, shared with the shell so both carets blink together.
+fn blink() -> bool {
+    super::caret::Caret::blink_on(crate::task::scheduler::ticks())
+}
+
+/// The directory containing `path`, used to root the tree beside the edited file.
+fn parent_dir(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) | None => String::from("/"),
+        Some(i) => String::from(&trimmed[..i]),
+    }
 }

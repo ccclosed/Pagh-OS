@@ -23,6 +23,7 @@ pub(crate) mod render;
 pub(crate) mod selection;
 pub(crate) mod suggest;
 pub(crate) mod toolchain;
+pub(crate) mod tree;
 
 use alloc::format;
 use alloc::string::String;

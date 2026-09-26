@@ -21,7 +21,8 @@ Framebuffer-shell с редактированием строки, историе
 | `path.rs` | Глобальный CWD под `Spinlock<String>`; чистые `normalize` (фолдинг `.`/`..`, кламп в корень), `resolve`, `cwd`, `set_cwd` |
 | `suggest.rs` | Bounded Levenshtein `edit_distance`, `nearest_command` для «did you mean» |
 | `paint.rs` | Оконная рисовалка (~1470 строк): title bar, toolbar, taskbar, canvas `Vec<u32>` |
-| `nano.rs` | `nano+` полноэкранный редактор: `Editor`, undo/redo, поиск/замена/goto, clipboard |
+| `nano.rs` | `nano+` полноэкранный редактор: `Editor`, undo/redo, поиск/замена/goto, clipboard, мигающая каретка, сайдбар с деревом файлов (`^B`) |
+| `tree.rs` | Дерево файлов для сайдбара редактора: плоский список видимых строк с отступами, раскрытие/сворачивание каталогов, навигация с клавиатуры; обход VFS с ограничением глубины и числа записей |
 | `nano_config.rs` | Персист `NanoConfig` в `/mnt/.nanorc`; темы Dark/Light/Blue; CLI `nano --settings` |
 | `toolchain.rs` | «pagh-mini» мини-Rust: интерпретатор (`execute`), `rustc` (компиляция в `.pbc` = магия `PAGH-MINI-RUST:1\n` + исходник), `cargo new/check/build/run`, `rustup` |
 
@@ -103,6 +104,14 @@ fixed env `TERM=xterm`, `PATH=/mnt/usr/bin`; foreground-ожидание с poll
   taskbar репейнтится не чаще раза в 6 тиков.
 
 ## nano
+
+Сайдбар с деревом файлов — `^B`. Дерево строится от каталога редактируемого файла,
+каталоги раскрываются `→`/Enter, сворачиваются `←`, `Esc`/`Tab` возвращают фокус в
+текст. Открытие файла из дерева запрещено при несохранённых правках (`^S`), чтобы
+они не потерялись молча. Каретка — такая же мигающая вертикальная черта, как в
+shell; раньше это было статичное подчёркивание, из-за чего её было не видно.
+
+## nano (детали)
 
 `MAX_FILE=64KiB`, `MAX_LINE=4096`, `UNDO_LIMIT=32`; 3 темы через `NanoConfig::palette()`.
 Клавиши: `^S` save (опц. `.bak`), `^Q`/Esc — двухнажатный quit guard, `^F` find, `^R` replace,
