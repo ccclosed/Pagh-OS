@@ -573,13 +573,19 @@ fn render_impl(
         }
         fb.fill_rect(0, 0, w, h, bg);
         fb.fill_rect(0, 0, w, HEADER_H, blue);
-        let mark = if editor.dirty { " *" } else { "" };
-        let title = format!(" nano+  {}{}", editor.path, mark);
+        // Unsaved work is stated in the title, in words rather than a lone
+        // asterisk: "did my edit do anything" should be answerable at a glance,
+        // and an `*` next to a long path is not.
+        let title = if editor.dirty {
+            format!(" nano+  {}   [modified - ^S saves]", editor.path)
+        } else {
+            format!(" nano+  {}", editor.path)
+        };
         fb.draw_text_px(
             6,
             3,
             &clipped_ascii(&title, 0, cols.saturating_sub(1), false),
-            0xFFFFFF,
+            if editor.dirty { 0xFFE066 } else { 0xFFFFFF },
             blue,
         );
         // ── Sidebar: the project tree ──
@@ -679,43 +685,7 @@ fn render_impl(
             }
         }
         let foot = h - FOOTER_H;
-        fb.fill_rect(0, foot, w, FOOTER_H, surface);
-        let status = if let Some((mode, value)) = &editor.prompt {
-            format!(
-                "{}: {}_",
-                if *mode == PromptMode::Search {
-                    "Search"
-                } else {
-                    "Line"
-                },
-                value
-            )
-        } else {
-            format!(
-                "{}   Ln {}, Col {}",
-                editor.status,
-                editor.row + 1,
-                editor.col + 1
-            )
-        };
-        fb.draw_text_px(
-            6,
-            foot + 2,
-            &clipped_ascii(&status, 0, cols.saturating_sub(1), false),
-            if editor.status.starts_with("Error") {
-                red
-            } else {
-                green
-            },
-            surface,
-        );
-        fb.draw_text_px(
-            6,
-            foot + 20,
-            "^S Save ^Q Quit ^B Files ^F Find ^R Replace ^K Cut ^U Paste ^Z Undo",
-            text,
-            surface,
-        );
+        paint_footer(fb, editor, foot, w, cols);
         // The caret: a blinking vertical bar in the left pixel column of the cell
         // the next character will occupy — the same shape and color as the shell's
         // caret, so the two read as one thing.
@@ -727,6 +697,8 @@ fn render_impl(
             }
         }
     });
+    // The console is RAM-backed; nothing is visible until the frame is flushed.
+    framebuffer::flush();
     let _ = caret_only;
 }
 
@@ -794,6 +766,9 @@ fn event_loop(
     }
     let mut last_phase = blink();
     let mut caret_cell = caret_cell_of(&editor, tree.as_ref());
+    // Cursor position before the current key, so the repaint after it can touch only
+    // the rows that key actually changed (usually one).
+    let mut before = (editor.row, editor.col);
     render(&editor, last_phase, tree.as_ref());
     'app: loop {
         crate::arch::cpu::halt();
@@ -949,16 +924,28 @@ fn event_loop(
                 KeyEvent::Ctrl('u') | KeyEvent::Ctrl('v') => editor.paste_line(),
                 _ => {}
             }
+            // A keystroke changed one line and the cursor column, so repaint that
+            // line and the caret — not the whole frame. Refreshing everything here
+            // is what made typing feel slow, and (because a frame takes longer than
+            // the gap between keystrokes) left the screen showing half-drawn
+            // frames, which is why an edit looked like it had not landed until
+            // something else forced a redraw.
+            // Repaint the frame on every keystroke. The console is RAM-backed now, so
+            // this costs a `memcpy` of the changed rectangle rather than tens of
+            // thousands of uncached pixel writes — cheap enough that the per-row
+            // special case this replaced is not worth its failure modes (it missed
+            // updates whenever the cursor moved without the row changing).
+            render(&editor, blink(), tree.as_ref());
+            before = (editor.row, editor.col);
         }
-        // Repaint **only when the blink phase changes**, not on every wake.
+        // Blink: repaint **only the caret cell**, and only when the phase changes.
         //
-        // `halt()` returns on every timer tick (1 kHz), so repainting on each wake
-        // meant rebuilding the whole screen a thousand times a second: the frame was
-        // almost always caught half-drawn, which reads as violent flicker rather
-        // than a blinking caret. The phase changes twice per period, so a full
-        // repaint twice per 600 ms is both enough to animate the caret and quiet
-        // enough to draw a complete frame between changes. Any keystroke already
-        // repainted above.
+        // `halt()` returns on every timer tick (1 kHz), so a full repaint per wake
+        // rebuilt the whole screen a thousand times a second: frames were caught
+        // half-drawn (which reads as tearing) and the cost landed between
+        // keystrokes, which is what made the editor feel slow. A full frame is drawn
+        // when something actually changes — a keystroke, a navigation — and the
+        // blink touches two cells, twice per period.
         let phase = blink();
         if phase != last_phase {
             last_phase = phase;
@@ -981,6 +968,141 @@ fn event_loop(
         }
     }
     let _ = tree_focus;
+}
+
+/// Draw the footer strip: the status line (or the active prompt) and the key hints.
+///
+/// Split out so a keystroke can refresh it without repainting the text body: the
+/// `Ln, Col` readout and the modified flag live here, and they change on almost
+/// every key.
+fn paint_footer(
+    fb: &mut crate::drivers::framebuffer::FramebufferWriter,
+    editor: &Editor,
+    foot: usize,
+    w: usize,
+    cols: usize,
+) {
+    let [_, _, _, _, _, green, red, _] = editor.config.palette();
+    let surface = editor.config.palette()[1];
+    let text = editor.config.palette()[2];
+    fb.fill_rect(0, foot, w, FOOTER_H, surface);
+    let status = if let Some((mode, value)) = &editor.prompt {
+        format!(
+            "{}: {}_",
+            if *mode == PromptMode::Search {
+                "Search"
+            } else {
+                "Line"
+            },
+            value
+        )
+    } else {
+        format!(
+            "{}   Ln {}, Col {}",
+            editor.status,
+            editor.row + 1,
+            editor.col + 1
+        )
+    };
+    fb.draw_text_px(
+        6,
+        foot + 2,
+        &clipped_ascii(&status, 0, cols.saturating_sub(1), false),
+        if editor.status.starts_with("Error") {
+            red
+        } else {
+            green
+        },
+        surface,
+    );
+    let dirty_hint = if editor.dirty {
+        "^S Save (modified)  ^Q Quit"
+    } else {
+        "^S Save  ^Q Quit"
+    };
+    fb.draw_text_px(
+        6,
+        foot + 20,
+        &alloc::format!(
+            "{}  ^B Files  ^F Find  ^R Replace  ^K Cut  ^U Paste  ^Z Undo",
+            dirty_hint
+        ),
+        if editor.dirty { 0xFFE066 } else { text },
+        surface,
+    );
+}
+
+/// Repaint just the footer strip.
+fn render_footer(editor: &Editor) {
+    let (w, h) = framebuffer::dimensions();
+    if w == 0 || h == 0 {
+        return;
+    }
+    let tree_cols = 0usize;
+    let cols = (w / CHAR_W).saturating_sub(tree_cols);
+    let foot = h - FOOTER_H;
+    let _ = framebuffer::with(|fb| {
+        fb.fill_rect(0, foot, w, FOOTER_H, editor.config.palette()[1]);
+        paint_footer(fb, editor, foot, w, cols);
+    });
+    framebuffer::flush();
+}
+
+/// Repaint one editor row (and the gutter beside it).
+///
+/// One keystroke changes one line — the row the cursor is on — and the cursor's
+/// own column. Repainting the whole frame for that is what made editing feel slow:
+/// a full frame is ~18 000 pixel writes, and `put_pixel` writes the framebuffer
+/// through three separate volatile stores per pixel, so on this machine a frame is
+/// tens of milliseconds. One row is ~130 writes.
+fn paint_editor_row(
+    fb: &mut crate::drivers::framebuffer::FramebufferWriter,
+    editor: &Editor,
+    r: usize,
+    vr: usize,
+    tree_cols: usize,
+    gutter: usize,
+    cols: usize,
+) {
+    let y = HEADER_H + vr * CHAR_H;
+    let bg = editor.config.palette()[0];
+    let surface = editor.config.palette()[1];
+    let text = editor.config.palette()[2];
+    let muted = editor.config.palette()[3];
+    let blue = editor.config.palette()[4];
+    let select = editor.config.palette()[7];
+    let x0 = tree_cols * CHAR_W;
+    if r >= editor.lines.len() {
+        fb.draw_text_px(x0 + 8, y, "~", blue, bg);
+        return;
+    }
+    if editor.config.line_numbers {
+        let num = format!("{:>5} ", r + 1);
+        fb.draw_text_px(x0, y, &num, muted, surface);
+    }
+    let visible = clipped_ascii(
+        &editor.lines[r],
+        editor.left,
+        cols.saturating_sub(gutter),
+        editor.config.show_whitespace,
+    );
+    let tx = x0 + gutter * CHAR_W;
+    match editor.search_hit {
+        Some((hr, hc, hlen))
+            if hr == r && hc >= editor.left && hc < editor.left + visible.len() =>
+        {
+            let before = clipped_ascii(
+                &editor.lines[r],
+                editor.left,
+                hc - editor.left,
+                editor.config.show_whitespace,
+            );
+            let hit = clipped_ascii(&editor.lines[r], hc, hlen, editor.config.show_whitespace);
+            fb.draw_text_px(tx, y, &visible, text, bg);
+            fb.draw_text_px(tx + before.len() * CHAR_W, y, &hit, 0xFFFFFF, select);
+        }
+        _ => fb.draw_text_px(tx, y, &visible, text, bg),
+    }
 }
 
 /// Where the caret cell is, in pixels, or `None` when it is off-screen or a

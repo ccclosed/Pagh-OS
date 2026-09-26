@@ -317,6 +317,7 @@ pub fn shell_main() -> ! {
     let mut selection = selection::Selection::new();
     let mut clipboard = String::new();
     let mut prev_left = false;
+    let mut status_cache: Option<(alloc::string::String, alloc::string::String)> = None;
 
     loop {
         // CWD-aware prompt, e.g. `pagh:/> ` (R5.1–R5.3).
@@ -377,7 +378,17 @@ pub fn shell_main() -> ! {
             // it nearly invisible: `halt()` returns on every timer tick, so the
             // erase would follow the draw within microseconds and the caret would
             // be absent for almost the whole blink period.
-            shell_status_bar(&mouse);
+            //
+            // The status strip is redrawn only when its text actually changes: it
+            // is the one thing on screen that changes on its own (the clock, the
+            // pointer), and rebuilding it per tick was the shell's main cost.
+            let mut status_dirty = false;
+            if shell_status_text(&mouse, &mut status_cache) {
+                if let Some((left, right)) = status_cache.as_ref() {
+                    crate::drivers::framebuffer::draw_status_bar(left, right);
+                    status_dirty = true;
+                }
+            }
 
             let mut entered = false;
             while let Some(scancode) = try_read_scancode() {
@@ -533,6 +544,10 @@ pub fn shell_main() -> ! {
                     caret::Caret::blink_on(crate::task::scheduler::ticks()),
                 );
             }
+            // Push whatever this pass drew. The console is RAM-backed now, so
+            // without this the screen would never change at all.
+            let _ = status_dirty;
+            crate::drivers::framebuffer::flush();
 
             // Redraw the mouse cursor on top of the final rendered state.
             crate::drivers::cursor::move_to(mouse.x, mouse.y);
@@ -610,14 +625,33 @@ pub(super) fn try_read_scancode() -> Option<u8> {
     crate::drivers::get_char("keyboard").and_then(|kbd| kbd.read_char())
 }
 
-/// Repaint the bottom status bar with the live shell state: OS name, current
-/// working directory, uptime, and the mouse position. Safe to call every loop
-/// iteration — the status strip sits below the scrolling text region, so it
-/// never conflicts with command output.
-fn shell_status_bar(mouse: &crate::drivers::ps2_mouse::MouseState) {
+/// The status bar's text for the current state, or `None` when it would repeat the
+/// string already on screen.
+///
+/// The strip mentions the mouse position, so redrawing it on every loop pass meant
+/// rebuilding its glyphs ~1000 times a second (once per timer tick) for a line that
+/// changes only when the pointer moves a cell or a second passes. That repaint is
+/// what made the shell feel sluggish: it is on the shell's own thread, between
+/// keystrokes. Caching the text turns it into a comparison per pass.
+fn shell_status_text(
+    mouse: &crate::drivers::ps2_mouse::MouseState,
+    cached: &mut Option<(alloc::string::String, alloc::string::String)>,
+) -> bool {
     let cwd = path::cwd();
     let secs = crate::task::scheduler::ticks() / crate::arch::x86_64::apic::TICK_HZ;
+    // The pointer is quantized to its cell: a one-pixel jitter is not worth a
+    // repaint, and the strip's own resolution is a character cell anyway.
     let left = format!("pagh OS   {}", cwd);
-    let right = format!("up {}s   mouse({},{})", secs, mouse.x, mouse.y);
-    crate::drivers::framebuffer::draw_status_bar(&left, &right);
+    let right = format!(
+        "up {}s   mouse({},{})",
+        secs,
+        mouse.x / CARET_GLYPH_W,
+        mouse.y / CARET_GLYPH_H
+    );
+    let next = (left, right);
+    if cached.as_ref() == Some(&next) {
+        return false;
+    }
+    *cached = Some(next);
+    true
 }

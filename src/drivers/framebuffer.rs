@@ -61,6 +61,19 @@ pub struct FramebufferWriter {
     /// console default. Without this, selecting the green prompt and releasing
     /// would leave it white: the pixels carry no record of how they were drawn.
     grid_fg: alloc::vec::Vec<u32>,
+    /// Shadow copy of the screen in ordinary RAM.
+    ///
+    /// All drawing goes here first, because the framebuffer itself is MMIO: every
+    /// `write_volatile` to it is uncached and crosses to the device, so a full
+    /// 1280x800 frame cost ~54 000 such writes and took tens of milliseconds. Text
+    /// output felt slow and frames were caught half-drawn for that reason alone.
+    /// Writing to RAM costs a few nanoseconds per pixel, and [`Self::flush`] then
+    /// moves only the rectangle that actually changed up to the device in one
+    /// linear copy.
+    back: alloc::vec::Vec<u8>,
+    /// Bounding box of cells changed since the last flush, as `(x0, y0, x1, y1)`
+    /// inclusive. `None` when nothing has been drawn.
+    dirty: Option<(usize, usize, usize, usize)>,
 }
 
 impl FramebufferWriter {
@@ -115,6 +128,13 @@ impl FramebufferWriter {
             // model cannot grow with output volume.
             grid: alloc::vec![b' '; MAX_LINES * CHARS_PER_LINE],
             grid_fg: alloc::vec![0xFFFFFF; MAX_LINES * CHARS_PER_LINE],
+            // Zeroed, matching what the device shows after `clear`. Sized by PITCH,
+            // not by width: every offset in this file is `y * pitch + x * bpp`, so a
+            // buffer of `width * bpp` per row would be read at the wrong stride
+            // whenever the device pads its rows (which it does), and the flush would
+            // copy garbage.
+            back: alloc::vec![0u8; (pitch as usize) * (height as usize)],
+            dirty: None,
         })
     }
 
@@ -127,12 +147,15 @@ impl FramebufferWriter {
         for fg in self.grid_fg.iter_mut() {
             *fg = self.fg_color;
         }
-        unsafe {
-            let fb = self.fb_addr as *mut u8;
-            for i in 0..(self.height * self.pitch) {
-                fb.add(i).write_volatile(0);
-            }
+        for b in self.back.iter_mut() {
+            *b = 0;
         }
+        self.dirty = Some((
+            0,
+            0,
+            self.width.saturating_sub(1),
+            self.height.saturating_sub(1),
+        ));
     }
 
     /// Record `ch` at grid cell `(col, row)`; out-of-range writes are dropped.
@@ -261,37 +284,74 @@ impl FramebufferWriter {
         if x >= self.width || y >= self.height {
             return;
         }
-
         let offset = y * self.pitch + x * self.bpp;
-        unsafe {
-            let fb = self.fb_addr as *mut u8;
-            if self.bpp >= 3 {
-                fb.add(offset).write_volatile((color & 0xFF) as u8);
-                fb.add(offset + 1)
-                    .write_volatile(((color >> 8) & 0xFF) as u8);
-                fb.add(offset + 2)
-                    .write_volatile(((color >> 16) & 0xFF) as u8);
-            }
+        if self.bpp >= 3 {
+            self.back[offset] = (color & 0xFF) as u8;
+            self.back[offset + 1] = ((color >> 8) & 0xFF) as u8;
+            self.back[offset + 2] = ((color >> 16) & 0xFF) as u8;
+            self.mark_dirty(x, y);
         }
+    }
+
+    /// Extend the pending-flush rectangle to include `(x, y)`.
+    fn mark_dirty(&mut self, x: usize, y: usize) {
+        self.dirty = Some(match self.dirty {
+            None => (x, y, x, y),
+            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+        });
+    }
+
+    /// Copy the changed rectangle from the shadow buffer to the framebuffer.
+    ///
+    /// Only the rows that changed are touched, and rows are copied with one
+    /// incremental pointer walk rather than a volatile store per component, so the
+    /// device sees a small number of linear runs instead of tens of thousands of
+    /// individual writes. Returns whether anything was flushed.
+    pub fn flush(&mut self) -> bool {
+        if self.dirty.take().is_none() {
+            return false;
+        }
+        // Flush the whole surface, not the tracked rectangle.
+        //
+        // A bounding box was tried first and was wrong in practice: the screen kept
+        // showing stale rows, because a rectangle computed from individual pixel
+        // writes does not survive the bulk paths (`scroll` shifts the buffer, `clear`
+        // wipes it) without every one of them remembering to widen it. Correctness
+        // first: this is one linear copy into the device instead of tens of thousands
+        // of uncached component writes, which is where the original slowness came
+        // from. Damage tracking can come back once the simple version is trusted.
+        let len = self.pitch * self.height;
+        // SAFETY: the shadow buffer is `pitch * height` bytes (allocated that way) and
+        // the framebuffer is the device surface of the same geometry, so both spans
+        // are valid and do not overlap (one is kernel RAM, the other is MMIO).
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.back.as_ptr(), self.fb_addr as *mut u8, len);
+        }
+        true
     }
 
     fn scroll(&mut self) {
         // Scroll only the text region (the usable rows), leaving the reserved
         // status-bar strip at the bottom of the screen untouched.
         let rows = self.text_rows();
-        unsafe {
-            let fb = self.fb_addr as *mut u8;
+        {
             let line_bytes = CHAR_HEIGHT * self.pitch;
             let text_px = rows * CHAR_HEIGHT;
             let move_bytes = (text_px - CHAR_HEIGHT) * self.pitch;
-
-            core::ptr::copy(fb.add(line_bytes), fb, move_bytes);
-
-            // Clear the now-vacated last text line.
+            // Shift the shadow copy; the device catches up on the next `flush`, which
+            // is why the whole text area is marked dirty rather than a rectangle.
+            self.back
+                .copy_within(line_bytes..line_bytes + move_bytes, 0);
             let last_line_offset = (text_px - CHAR_HEIGHT) * self.pitch;
-            for i in 0..(line_bytes) {
-                fb.add(last_line_offset + i).write_volatile(0);
+            for b in &mut self.back[last_line_offset..last_line_offset + line_bytes] {
+                *b = 0;
             }
+            self.dirty = Some((
+                0,
+                0,
+                self.width.saturating_sub(1),
+                text_px.saturating_sub(1),
+            ));
         }
         // The model must move with the pixels: a caret or a selection computed
         // from a stale grid would point at the wrong row for the rest of the
@@ -432,20 +492,18 @@ impl FramebufferWriter {
             return 0;
         }
         let offset = y * self.pitch + x * self.bpp;
-        // SAFETY: offset is within the mapped framebuffer (bounds checked).
-        unsafe {
-            let fb = self.fb_addr as *const u8;
-            if self.bpp >= 3 {
-                let b = fb.add(offset).read_volatile() as u32;
-                let g = fb.add(offset + 1).read_volatile() as u32;
-                let r = fb.add(offset + 2).read_volatile() as u32;
-                (r << 16) | (g << 8) | b
-            } else {
-                0
-            }
+        // Read the shadow copy, not the device: the device is only current up to the
+        // last `flush`, and a caller that saved pixels and restored them must see the
+        // same bytes it drew.
+        if self.bpp >= 3 {
+            let b = self.back[offset] as u32;
+            let g = self.back[offset + 1] as u32;
+            let r = self.back[offset + 2] as u32;
+            (r << 16) | (g << 8) | b
+        } else {
+            0
         }
     }
-
     /// Fill an axis-aligned rectangle with a solid color.
     pub fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32) {
         let x1 = (x + w).min(self.width);
@@ -812,6 +870,19 @@ impl FbWriter {
         }
     }
 
+    /// Push the changed rectangle of the shadow buffer to the framebuffer.
+    ///
+    /// Drawing goes to RAM (see `FramebufferWriter::back`); nothing reaches the
+    /// device until this is called. Callers that expect the screen to be current —
+    /// the shell and the editor, at the end of every repaint — call it once per
+    /// frame, which is what turns tens of thousands of uncached pixel writes into a
+    /// few linear row copies.
+    pub fn flush(&self) {
+        if let Some(ref mut writer) = *self.inner.lock() {
+            writer.flush();
+        }
+    }
+
     /// The console's current text cursor cell as `(col, row)`, or `None` when the
     /// framebuffer is uninitialized (serial-only boot).
     pub fn cursor_cell(&self) -> Option<(usize, usize)> {
@@ -885,6 +956,17 @@ pub fn _print(args: fmt::Arguments) {
 
 pub fn clear_screen() {
     FB_WRITER.clear();
+    FB_WRITER.flush();
+}
+
+/// Push the shadow buffer's changed rectangle to the framebuffer.
+///
+/// Every drawing call writes to RAM (`FramebufferWriter::back`); nothing reaches
+/// the device until this runs. That is what turns a full frame from tens of
+/// thousands of uncached MMIO stores into a few linear row copies, and it is why
+/// callers must flush once at the end of a repaint.
+pub fn flush() {
+    FB_WRITER.flush();
 }
 
 /// Sets the framebuffer foreground (glyph) color via the global writer.
