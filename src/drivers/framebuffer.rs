@@ -4,33 +4,77 @@
 use crate::sync::spinlock::Spinlock;
 use core::fmt;
 
-const CHAR_WIDTH: usize = 8;
-const CHAR_HEIGHT: usize = 16;
+/// Glyph cell width in pixels. **Public on purpose**: the VT emulator, the shell's
+/// mouse-to-cell mapping and the `paint` toolbar all lay out in cells, so they must
+/// take the cell from here instead of re-declaring it. A second copy of these two
+/// numbers is a silent layout bug the moment the font changes (`tools/gen_font.py`
+/// decides the cell; the asset and these constants move together).
+pub const CHAR_WIDTH: usize = 8;
+/// Glyph cell height in pixels (see [`CHAR_WIDTH`]).
+pub const CHAR_HEIGHT: usize = 18;
 const CHARS_PER_LINE: usize = 100;
 const MAX_LINES: usize = 37;
 
 /// Height in pixels of the reserved status-bar strip at the bottom of the
 /// screen. The text console never scrolls into this region (see `scroll`).
-pub const STATUS_BAR_HEIGHT: usize = 18;
+///
+/// Sized to hold one glyph row with a little padding: the strip's own labels go
+/// through `draw_text_px`, so a bar shorter than a glyph would clip them in half.
+/// `paint`'s taskbar uses this same constant, so the two bars stay aligned.
+pub const STATUS_BAR_HEIGHT: usize = CHAR_HEIGHT;
 
-// 8x16 glyph data loaded from the font asset instead of a hardcoded table.
-// The file packs 95 glyphs of 16 bytes each (one byte per row, bit 7 = leftmost
-// pixel), covering printable ASCII from 0x20 (space) through 0x7E ('~'),
-// so the glyph for codepoint `ch` lives at index `ch - 0x20`.
-static FONT: &[u8] = include_bytes!("../../assets/font8x16.bin");
+/// The console typeface: Fira Code (the host's terminal font), rasterised offline
+/// by `tools/gen_font.py` into one **8-bit coverage** glyph per printable ASCII
+/// codepoint.
+///
+/// The kernel deliberately does not parse TrueType: the asset holds 95 glyphs, each
+/// `CHAR_HEIGHT` rows of `CHAR_WIDTH` coverage bytes (0 = background, 255 = full
+/// ink), covering 0x20 (space) through 0x7E ('~'), so the glyph for codepoint `ch`
+/// lives at index `ch - 0x20`. Coverage — not a bitmap — is what lets the console
+/// antialias its glyphs ([`blend_px`]); a 1-bit asset at an 8 px advance is the
+/// "rough" text this replaced. Regenerate (never hand-edit) with::
+///
+///     python3 tools/gen_font.py \
+///         --font /usr/share/fonts/fira-code/FiraCode-Regular.ttf \
+///         --cell 8 --cell-h 18 --out assets/font8x18.bin
+///
+/// Fira Code 6.002 (`sha256 5992ab96…f6117`) was chosen because its advance is
+/// 0.6154 em: at em 13 the advance is exactly 8.00 px, so the 8 px cell fits the
+/// face with zero slack and no glyph is squeezed. The generator derives the pixel
+/// size from the cell width rather than trusting a number here, and `--check`
+/// re-rasterises the asset and fails unless the bytes match. A wider cell renders
+/// the face at the size it was drawn for, but reduces the column count and the
+/// text grid (`CHARS_PER_LINE`); that trade was tried and rejected. Regenerating
+/// with another size or cell is supported, but these constants, the asset and the
+/// grid must change in the same commit.
+static FONT: &[u8] = include_bytes!("../../assets/font8x18.bin");
+
+/// Console colours before any theme is applied. `settings` overrides both.
+pub const DEFAULT_FG: u32 = 0xFF_FFFF;
+pub const DEFAULT_BG: u32 = 0x00_0000;
 
 const FONT_FIRST_CP: u8 = 0x20; // first codepoint present in the font
 const FONT_LAST_CP: u8 = 0x7E; // last codepoint present in the font
-const GLYPH_BYTES: usize = 16; // rows per glyph
+const GLYPH_BYTES: usize = CHAR_HEIGHT * CHAR_WIDTH; // coverage bytes per glyph
 
-// Fallback glyph (filled rectangle) for codepoints outside the font range,
-// preserving the previous behavior of the hardcoded table's default arm.
-const FALLBACK_GLYPH: [u8; GLYPH_BYTES] = [
-    0x00, 0x7E, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x7E, 0x00, 0x00, 0x00, 0x00,
-];
+// Fallback glyph (hollow rectangle) for codepoints outside the font range. Built
+// from the cell rather than written out, so it keeps filling exactly one cell when
+// the cell changes. The first and last rows carry the top and bottom edges, the
+// rows between them the sides; every border pixel is full ink.
+const FALLBACK_GLYPH: [u8; GLYPH_BYTES] = {
+    let mut g = [0u8; GLYPH_BYTES];
+    let mut i = 0;
+    while i < GLYPH_BYTES {
+        let (row, col) = (i / CHAR_WIDTH, i % CHAR_WIDTH); // pixel this byte holds
+        let border = row == 0 || row == CHAR_HEIGHT - 1 || col == 0 || col == CHAR_WIDTH - 1;
+        g[i] = if border { 0xFF } else { 0x00 };
+        i += 1;
+    }
+    g
+};
 
-/// Returns the 16-byte (16-row) glyph for `ch`, sourced from the embedded font.
-/// Codepoints outside the font's `0x20..=0x7D` range fall back to a filled box.
+/// Returns the coverage bitmap for `ch`, sourced from the embedded font.
+/// Codepoints outside the font's `0x20..=0x7E` range fall back to a plain box.
 fn get_glyph(ch: u8) -> &'static [u8] {
     if ch >= FONT_FIRST_CP && ch <= FONT_LAST_CP {
         let idx = (ch - FONT_FIRST_CP) as usize;
@@ -38,6 +82,51 @@ fn get_glyph(ch: u8) -> &'static [u8] {
         &FONT[start..start + GLYPH_BYTES]
     } else {
         &FALLBACK_GLYPH
+    }
+}
+
+/// Blend `b` into `a` by `t/256`, channel-wise. Used for derived shades (the
+/// status-bar edge, the wallpaper ramp) so a theme swap needs no extra constants.
+fn mix_rgb(a: u32, b: u32, t: u32) -> u32 {
+    let ch = |shift: u32| {
+        let (x, y) = ((a >> shift) & 0xFF, (b >> shift) & 0xFF);
+        (x * (256 - t) + y * t) >> 8
+    };
+    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+/// Coverage (0 = background, 255 = full ink) of pixel `(dx, dy)` of `glyph`.
+///
+/// The glyph is `CHAR_HEIGHT` rows of `CHAR_WIDTH` bytes, row-major: one byte per
+/// pixel, in reading order. Treating a row as any other length is the mistake that
+/// stays silent — it shifts every row of every glyph after the first.
+fn glyph_coverage(glyph: &[u8], dx: usize, dy: usize) -> u8 {
+    glyph[dy * CHAR_WIDTH + dx]
+}
+
+/// Blend `fg` over `base` with 8-bit coverage: 0 leaves `base`, 255 is exactly
+/// `fg`, and everything between walks the ramp with rounding.
+///
+/// This is the whole reason the asset stores coverage instead of bits: the console
+/// gets the antialiased edges the same face has in a terminal on the host. The
+/// rounding matters beyond cosmetics — `tools/font_check.py` rebuilds the expected
+/// screen from the asset with the same formula and fails on a single differing
+/// pixel, so an off-by-one ramp means the console is not provably showing the font
+/// that is committed.
+fn blend_px(base: u32, fg: u32, cov: u8) -> u32 {
+    match cov {
+        0 => base,
+        255 => fg,
+        _ => {
+            let c = cov as u32;
+            let ch = |shift: u32| {
+                let (a, b) = ((base >> shift) & 0xFF, (fg >> shift) & 0xFF);
+                // Coverage is 0..=255, i.e. the blend weight is cov/255 (not /256):
+                // the `+127` rounds, so coverage 128 lands halfway.
+                (a * (255 - c) + b * c + 127) / 255
+            };
+            (ch(16) << 16) | (ch(8) << 8) | ch(0)
+        }
     }
 }
 
@@ -50,6 +139,21 @@ pub struct FramebufferWriter {
     col: usize,
     row: usize,
     fg_color: u32,
+    /// Background colour: the unlit pixels of every cell, the `clear` fill, and the
+    /// fallback for a cell painted without an explicit background. The `settings`
+    /// panel changes it for the theme; the text blitter only ever reads it.
+    bg_color: u32,
+    /// Status-bar strip colours, themed by `settings` (see `shell::theme`).
+    status_bg: u32,
+    status_fg: u32,
+    /// Whether a printed character also paints its cell background.
+    ///
+    /// `true` (the default, and the only behaviour there was before wallpapers)
+    /// keeps the classic destructive console. `false` leaves the pixels behind a
+    /// glyph alone, which is what lets a wallpaper show *through* the text: with it
+    /// on, every printed cell stamps `bg_color` over the gradient underneath and the
+    /// wallpaper survives only outside the 100x37 text grid.
+    opaque_bg: bool,
     /// A retained copy of what is currently on the text grid, `MAX_LINES` rows of
     /// `CHARS_PER_LINE` cells. The pixels are still the display; this is the model
     /// the shell needs to place things *at* a cell (the blinking caret) and to
@@ -74,6 +178,14 @@ pub struct FramebufferWriter {
     /// Bounding box of cells changed since the last flush, as `(x0, y0, x1, y1)`
     /// inclusive. `None` when nothing has been drawn.
     dirty: Option<(usize, usize, usize, usize)>,
+    /// When set, `put_pixel` does not mark the frame dirty.
+    ///
+    /// The software cursor is an overlay: it moves on its own and is pushed to
+    /// the device with [`Self::flush_rect`], so drawing it must not make the whole
+    /// 1280x800 surface "changed". Without this flag every mouse move would force
+    /// a full-surface copy on the next frame flush — an idle shell would spend the
+    /// CPU of a busy one just to redraw a 12x19 arrow nobody asked to move.
+    quiet: bool,
 }
 
 impl FramebufferWriter {
@@ -122,7 +234,11 @@ impl FramebufferWriter {
             bpp: (bpp / 8) as usize,
             col: 0,
             row: 0,
-            fg_color: 0xFFFFFF,
+            fg_color: DEFAULT_FG,
+            bg_color: DEFAULT_BG,
+            status_bg: 0x1B_3A5B, // slate blue
+            status_fg: 0xE6_F0FF,
+            opaque_bg: true,
             // Bounded by construction: the console never holds more than
             // `MAX_LINES` text rows, and `text_rows()` is clamped to it, so the
             // model cannot grow with output volume.
@@ -135,6 +251,7 @@ impl FramebufferWriter {
             // copy garbage.
             back: alloc::vec![0u8; (pitch as usize) * (height as usize)],
             dirty: None,
+            quiet: false,
         })
     }
 
@@ -147,8 +264,19 @@ impl FramebufferWriter {
         for fg in self.grid_fg.iter_mut() {
             *fg = self.fg_color;
         }
-        for b in self.back.iter_mut() {
-            *b = 0;
+        let (b, g, r) = (
+            (self.bg_color & 0xFF) as u8,
+            ((self.bg_color >> 8) & 0xFF) as u8,
+            ((self.bg_color >> 16) & 0xFF) as u8,
+        );
+        for row in 0..self.height {
+            let base = row * self.pitch;
+            for px in 0..self.width {
+                let off = base + px * self.bpp;
+                self.back[off] = b;
+                self.back[off + 1] = g;
+                self.back[off + 2] = r;
+            }
         }
         self.dirty = Some((
             0,
@@ -264,18 +392,25 @@ impl FramebufferWriter {
             if y + dy >= self.height {
                 break;
             }
-
-            let glyph_byte = glyph[dy];
-
             for dx in 0..CHAR_WIDTH {
                 if x + dx >= self.width {
                     break;
                 }
-
-                let pixel_on = (glyph_byte & (1 << (7 - dx))) != 0;
-                let color = if pixel_on { self.fg_color } else { 0x000000 };
-
-                self.put_pixel(x + dx, y + dy, color);
+                let cov = glyph_coverage(glyph, dx, dy);
+                if cov == 0 && !self.opaque_bg {
+                    // Transparent console (wallpaper active): an empty pixel must
+                    // leave the picture behind the glyph alone.
+                    continue;
+                }
+                // Opaque console: blend against the cell background. Transparent:
+                // blend against whatever is already in the frame, so a glyph sits on
+                // the wallpaper instead of stamping a rectangle over it.
+                let base = if self.opaque_bg {
+                    self.bg_color
+                } else {
+                    self.get_pixel(x + dx, y + dy)
+                };
+                self.put_pixel(x + dx, y + dy, blend_px(base, self.fg_color, cov));
             }
         }
     }
@@ -289,7 +424,9 @@ impl FramebufferWriter {
             self.back[offset] = (color & 0xFF) as u8;
             self.back[offset + 1] = ((color >> 8) & 0xFF) as u8;
             self.back[offset + 2] = ((color >> 16) & 0xFF) as u8;
-            self.mark_dirty(x, y);
+            if !self.quiet {
+                self.mark_dirty(x, y);
+            }
         }
     }
 
@@ -301,33 +438,76 @@ impl FramebufferWriter {
         });
     }
 
-    /// Copy the changed rectangle from the shadow buffer to the framebuffer.
+    /// Push everything drawn since the last flush to the framebuffer.
     ///
-    /// Only the rows that changed are touched, and rows are copied with one
-    /// incremental pointer walk rather than a volatile store per component, so the
-    /// device sees a small number of linear runs instead of tens of thousands of
-    /// individual writes. Returns whether anything was flushed.
+    /// Copies only the tracked bounding box rather than the whole surface: a cursor
+    /// blink touches 2x18 pixels and a typed character one text row, and copying
+    /// 1280x800 pixels for those is what made the editor feel slow under TCG.
+    /// Returns whether anything was flushed.
+    ///
+    /// The box is trustworthy because **every** write to `back` goes through
+    /// [`Self::put_pixel`] (which widens it) and the two bulk moves widen it
+    /// explicitly: [`Self::scroll`] marks the whole text area, [`Self::clear`] the
+    /// whole surface. Overlays that must *not* count as frame damage (the software
+    /// cursor) draw with [`Self::quiet`] set and push themselves via
+    /// [`Self::flush_rect`]. A bug that bypasses `put_pixel` would show as a stale
+    /// rectangle, so keep new drawing primitives going through it.
     pub fn flush(&mut self) -> bool {
-        if self.dirty.take().is_none() {
+        let Some((x0, y0, x1, y1)) = self.dirty.take() else {
+            return false;
+        };
+        if self.bpp < 3 || self.width == 0 || self.height == 0 {
             return false;
         }
-        // Flush the whole surface, not the tracked rectangle.
-        //
-        // A bounding box was tried first and was wrong in practice: the screen kept
-        // showing stale rows, because a rectangle computed from individual pixel
-        // writes does not survive the bulk paths (`scroll` shifts the buffer, `clear`
-        // wipes it) without every one of them remembering to widen it. Correctness
-        // first: this is one linear copy into the device instead of tens of thousands
-        // of uncached component writes, which is where the original slowness came
-        // from. Damage tracking can come back once the simple version is trusted.
-        let len = self.pitch * self.height;
-        // SAFETY: the shadow buffer is `pitch * height` bytes (allocated that way) and
-        // the framebuffer is the device surface of the same geometry, so both spans
-        // are valid and do not overlap (one is kernel RAM, the other is MMIO).
-        unsafe {
-            core::ptr::copy_nonoverlapping(self.back.as_ptr(), self.fb_addr as *mut u8, len);
+        // `mark_dirty` only ever records in-bounds pixels, but the box is clipped
+        // here anyway: a future caller that sets `dirty` by hand must not be able to
+        // index outside the buffer.
+        let x1 = x1.min(self.width - 1);
+        let y1 = y1.min(self.height - 1);
+        if x0 >= self.width || y0 >= self.height || x0 > x1 || y0 > y1 {
+            return false;
         }
+        self.flush_rect(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
         true
+    }
+
+    /// Set whether pixel writes are "quiet" (see [`Self::quiet`]).
+    ///
+    /// Used by the software cursor around its save/restore/draw sequence: those
+    /// pixels are pushed by [`Self::flush_rect`] and must not schedule a
+    /// full-surface flush.
+    pub fn set_quiet(&mut self, quiet: bool) {
+        self.quiet = quiet;
+    }
+
+    /// Push just one rectangle of the shadow buffer to the device.
+    ///
+    /// A side channel for overlays that have their own flush: unlike [`Self::flush`]
+    /// it does not consume the dirty box, so a caller that just wants these pixels
+    /// on the device (the software cursor) does not force a frame flush later.
+    /// Rectangles are clipped to the surface; an empty intersection is a no-op.
+    pub fn flush_rect(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        if self.bpp < 3 || w == 0 || h == 0 || x >= self.width || y >= self.height {
+            return;
+        }
+        let x1 = (x + w).min(self.width);
+        let y1 = (y + h).min(self.height);
+        let row_bytes = (x1 - x) * self.bpp;
+        let src_base = y * self.pitch + x * self.bpp;
+        // SAFETY: `x1 <= width` and `y1 <= height`, so every offset stays inside
+        // the `pitch * height` shadow buffer and inside the device surface of the
+        // same geometry; the spans do not overlap (kernel RAM vs MMIO).
+        unsafe {
+            let fb = self.fb_addr as *mut u8;
+            for row in 0..(y1 - y) {
+                let offset = src_base + row * self.pitch;
+                core::ptr::copy_nonoverlapping(
+                    self.back.as_ptr().add(offset),
+                    fb.add(offset),
+                    row_bytes,
+                );
+            }
+        }
     }
 
     fn scroll(&mut self) {
@@ -379,9 +559,46 @@ impl FramebufferWriter {
     }
 
     /// Sets the foreground color used for lit glyph pixels in `write_char`.
-    /// The background/clear color is unaffected. Defaults to `0xFFFFFF`.
+    /// The background/clear color is unaffected. Defaults to `DEFAULT_FG`.
     pub fn set_fg_color(&mut self, color: u32) {
         self.fg_color = color;
+    }
+
+    /// Sets the background colour: unlit glyph pixels, the `clear` fill, and the
+    /// background of a cell painted without one. Defaults to `DEFAULT_BG`.
+    pub fn set_bg_color(&mut self, color: u32) {
+        self.bg_color = color;
+    }
+
+    /// See [`FramebufferWriter::opaque_bg`]. `false` makes the console paint glyphs
+    /// only, so whatever is behind them — a wallpaper — stays visible.
+    pub fn set_opaque_bg(&mut self, opaque: bool) {
+        self.opaque_bg = opaque;
+    }
+
+    /// Sets the status-bar strip colours.
+    pub fn set_status_colors(&mut self, bg: u32, fg: u32) {
+        self.status_bg = bg;
+        self.status_fg = fg;
+    }
+
+    /// Redraw every cell of the model into the shadow buffer.
+    ///
+    /// `clear` wipes the pixels, so anything that repaints the background (a
+    /// wallpaper, a theme switch) has to put the text back. This walks the model
+    /// rather than a screen scrape, so what reappears is exactly what was there.
+    pub fn repaint_grid(&mut self) {
+        let (cols, rows) = self.text_grid();
+        for row in 0..rows {
+            for col in 0..cols {
+                let ch = self.cell_char(col, row);
+                let fg = self.cell_fg(col, row);
+                // Not `explicit_bg`: a transparent console must leave the wallpaper
+                // behind an empty cell alone, otherwise every repaint stamps the
+                // console background back over the picture.
+                self.paint_cell_with_bg(col, row, ch, fg, self.bg_color, false);
+            }
+        }
     }
 
     // ─── Text-cursor support (the blinking caret) ───
@@ -412,7 +629,8 @@ impl FramebufferWriter {
     /// `color` is the glyph color for this cell only; the writer's `fg_color` is
     /// left alone, so a caret's color cannot leak into subsequent output.
     pub fn paint_cell(&mut self, col: usize, row: usize, ch: u8, color: u32) {
-        self.paint_cell_with_bg(col, row, ch, color, 0x000000);
+        let bg = self.bg_color;
+        self.paint_cell_with_bg(col, row, ch, color, bg, true);
     }
 
     /// As [`paint_cell`](Self::paint_cell), with an explicit cell background.
@@ -420,7 +638,15 @@ impl FramebufferWriter {
     /// The background is what makes a text selection readable: inverting the cell
     /// is visible where a foreground change would be lost against text of the same
     /// color.
-    pub fn paint_cell_with_bg(&mut self, col: usize, row: usize, ch: u8, color: u32, bg: u32) {
+    pub fn paint_cell_with_bg(
+        &mut self,
+        col: usize,
+        row: usize,
+        ch: u8,
+        color: u32,
+        bg: u32,
+        explicit_bg: bool,
+    ) {
         let (max_cols, max_rows) = self.text_grid();
         if col >= max_cols || row >= max_rows {
             return;
@@ -430,17 +656,25 @@ impl FramebufferWriter {
         let x = col * CHAR_WIDTH;
         let y = row * CHAR_HEIGHT;
         let glyph = get_glyph(ch);
+        let paint_bg = self.opaque_bg || explicit_bg;
         for dy in 0..CHAR_HEIGHT {
             if y + dy >= self.height {
                 break;
             }
-            let glyph_byte = glyph[dy];
             for dx in 0..CHAR_WIDTH {
                 if x + dx >= self.width {
                     break;
                 }
-                let pixel_on = (glyph_byte & (1 << (7 - dx))) != 0;
-                self.put_pixel(x + dx, y + dy, if pixel_on { color } else { bg });
+                let cov = glyph_coverage(glyph, dx, dy);
+                if cov == 0 && !paint_bg {
+                    continue;
+                }
+                let base = if paint_bg {
+                    bg
+                } else {
+                    self.get_pixel(x + dx, y + dy)
+                };
+                self.put_pixel(x + dx, y + dy, blend_px(base, color, cov));
             }
         }
     }
@@ -695,10 +929,9 @@ impl FramebufferWriter {
     pub fn draw_glyph_px(&mut self, ch: u8, px: usize, py: usize, fg: u32, bg: u32) {
         let glyph = get_glyph(ch);
         for dy in 0..CHAR_HEIGHT {
-            let row = glyph[dy];
             for dx in 0..CHAR_WIDTH {
-                let on = (row & (1 << (7 - dx))) != 0;
-                self.put_pixel(px + dx, py + dy, if on { fg } else { bg });
+                let cov = glyph_coverage(glyph, dx, dy);
+                self.put_pixel(px + dx, py + dy, blend_px(bg, fg, cov));
             }
         }
     }
@@ -727,18 +960,18 @@ impl FramebufferWriter {
         if top + STATUS_BAR_HEIGHT > self.height {
             return;
         }
-        const BG: u32 = 0x1B3A5B; // slate blue
-        const FG: u32 = 0xE6F0FF;
-        self.fill_rect(0, top, self.width, STATUS_BAR_HEIGHT, BG);
-        // separator highlight line on top of the bar
+        let (bg, fg) = (self.status_bg, self.status_fg);
+        self.fill_rect(0, top, self.width, STATUS_BAR_HEIGHT, bg);
+        // separator highlight line on top of the bar, one shade lighter
+        let edge = mix_rgb(bg, fg, 60);
         for px in 0..self.width {
-            self.put_pixel(px, top, 0x3C6FA0);
+            self.put_pixel(px, top, edge);
         }
         let ty = top + (STATUS_BAR_HEIGHT - CHAR_HEIGHT) / 2;
-        self.draw_text_px(6, ty, left, FG, BG);
+        self.draw_text_px(6, ty, left, fg, bg);
         let rw = right.len() * CHAR_WIDTH;
         if rw + 6 < self.width {
-            self.draw_text_px(self.width - rw - 6, ty, right, FG, BG);
+            self.draw_text_px(self.width - rw - 6, ty, right, fg, bg);
         }
     }
 }
@@ -792,6 +1025,17 @@ impl FbWriter {
         }
     }
 
+    /// Write formatted arguments and push the result to the device.
+    ///
+    /// This is the `fb_print!` path. Without the flush the text only lands in the
+    /// shadow buffer and the screen stays black until something else happens to
+    /// flush: that is exactly how the first-boot `[provision] ... [Y/n]` prompt
+    /// came up on an empty screen and only appeared once the answer was typed.
+    pub fn write_fmt_now(&self, args: fmt::Arguments) {
+        self.write_fmt(args);
+        self.flush();
+    }
+
     pub fn clear(&self) {
         if let Some(ref mut writer) = *self.inner.lock() {
             writer.clear();
@@ -803,6 +1047,35 @@ impl FbWriter {
     pub fn set_fg_color(&self, color: u32) {
         if let Some(ref mut writer) = *self.inner.lock() {
             writer.set_fg_color(color);
+        }
+    }
+
+    /// Sets the background colour (see [`FramebufferWriter::set_bg_color`]).
+    pub fn set_bg_color(&self, color: u32) {
+        if let Some(ref mut writer) = *self.inner.lock() {
+            writer.set_bg_color(color);
+        }
+    }
+
+    /// Makes the console paint glyphs only (see [`FramebufferWriter::opaque_bg`]).
+    pub fn set_opaque_bg(&self, opaque: bool) {
+        if let Some(ref mut writer) = *self.inner.lock() {
+            writer.set_opaque_bg(opaque);
+        }
+    }
+
+    /// Sets the status-bar strip colours.
+    pub fn set_status_colors(&self, bg: u32, fg: u32) {
+        if let Some(ref mut writer) = *self.inner.lock() {
+            writer.set_status_colors(bg, fg);
+        }
+    }
+
+    /// Redraw the retained grid into the shadow buffer (see
+    /// [`FramebufferWriter::repaint_grid`]). The device catches up on `flush`.
+    pub fn repaint_grid(&self) {
+        if let Some(ref mut writer) = *self.inner.lock() {
+            writer.repaint_grid();
         }
     }
 
@@ -866,7 +1139,8 @@ impl FbWriter {
             } else {
                 fg
             };
-            writer.paint_cell_with_bg(col, row, ch, color, bg);
+            // A selection overlay really does want the cell filled.
+            writer.paint_cell_with_bg(col, row, ch, color, bg, true);
         }
     }
 
@@ -930,6 +1204,13 @@ impl crate::drivers::Console for FbWriter {
         // glyph-rendering path. No-op if the framebuffer never initialized.
         if let Some(ref mut writer) = *self.inner.lock() {
             writer.write_string(s);
+            // A line end is the natural frame boundary of a scrolling console
+            // (the logging facade writes tag + message + "\n" as separate
+            // chunks). Without this push the boot log lives only in RAM and the
+            // device stays black until some other component flushes.
+            if s.contains('\n') {
+                writer.flush();
+            }
         }
         crate::drivers::cursor::text_end();
     }
@@ -950,13 +1231,21 @@ pub fn console() -> &'static FbWriter {
 pub fn _print(args: fmt::Arguments) {
     // Cursor-safe text output (see drivers::cursor::text_begin).
     crate::drivers::cursor::text_begin();
-    FB_WRITER.write_fmt(args);
+    // Push on every explicit print: callers of `fb_print!` are reacting to
+    // something (boot progress, a command's output, a prompt) and expect it on
+    // screen when the call returns, not whenever the next frame flush happens.
+    FB_WRITER.write_fmt_now(args);
     crate::drivers::cursor::text_end();
 }
 
 pub fn clear_screen() {
+    // Hide the arrow first and capture its background *after* the wipe: clearing
+    // the screen while the cursor is drawn leaves its saved pixels describing the
+    // old frame, and the next `hide()` would blit that stale square back.
+    crate::drivers::cursor::text_begin();
     FB_WRITER.clear();
     FB_WRITER.flush();
+    crate::drivers::cursor::text_end();
 }
 
 /// Push the shadow buffer's changed rectangle to the framebuffer.
@@ -974,6 +1263,33 @@ pub fn flush() {
 /// framebuffer-only).
 pub fn set_fg_color(color: u32) {
     FB_WRITER.set_fg_color(color);
+}
+
+/// Sets the console background colour (unlit glyph pixels and the `clear` fill).
+pub fn set_bg_color(color: u32) {
+    FB_WRITER.set_bg_color(color);
+}
+
+/// Makes the console paint glyphs only, leaving the pixels behind them alone.
+///
+/// Used by `shell::theme` when a wallpaper is active; the shell reinstates opaque
+/// painting when the wallpaper is switched back off.
+pub fn set_opaque_bg(opaque: bool) {
+    FB_WRITER.set_opaque_bg(opaque);
+}
+
+/// Sets the status-bar strip colours via the global writer.
+pub fn set_status_colors(bg: u32, fg: u32) {
+    FB_WRITER.set_status_colors(bg, fg);
+}
+
+/// Redraw the retained text grid into the shadow buffer and push it out.
+///
+/// Call after anything that wipes the pixels behind the text (wallpaper, theme
+/// switch, `clear`): the model is the only record of what was on screen.
+pub fn repaint_grid() {
+    FB_WRITER.repaint_grid();
+    FB_WRITER.flush();
 }
 
 /// Framebuffer dimensions in pixels via the global writer, `(0, 0)` if the

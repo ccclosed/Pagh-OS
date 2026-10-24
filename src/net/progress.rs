@@ -12,7 +12,8 @@
 //!
 //! Output goes to both serial and the framebuffer (mirroring the rest of the
 //! kernel's console I/O); no ANSI/escape bytes are emitted, only printable ASCII
-//! plus `\r`/`\n`, so the 8x16 bitmap font renders it verbatim.
+//! plus `\r`/`\n`, so the console's bitmap font (Fira Code 8×18, see
+//! [`crate::drivers::framebuffer`]) renders it verbatim.
 
 #![allow(dead_code)]
 

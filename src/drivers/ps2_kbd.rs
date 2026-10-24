@@ -74,6 +74,19 @@ pub fn init() {
     crate::debug!("[PS2KBD] Keyboard driver initialized (IRQ1 not wired)");
 }
 
+/// Whether at least one scancode is currently queued (non-destructive).
+///
+/// The shell's REPL wakes on every timer tick; this is how it tells a real
+/// keypress from an idle wake-up, so it can skip the overlay/repaint cycle (and
+/// the frame flush it ends with) when there is nothing to do.
+pub fn has_scancode() -> bool {
+    KEYBOARD
+        .lock()
+        .as_ref()
+        .map(|kbd| kbd.has_scancode())
+        .unwrap_or(false)
+}
+
 /// IRQ1 handler — reads scancode from port 0x60.
 /// Set when the driver-level tracker sees Ctrl+C make, regardless of which
 /// consumer later reads the scancode (shell editor OR a compat process's

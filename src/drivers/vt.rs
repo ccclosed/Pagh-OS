@@ -1,13 +1,13 @@
 //! ANSI/VT-100 terminal emulator rendered on the framebuffer.
 #![allow(dead_code)]
+// Glyph cell geometry and the status-bar strip belong to the framebuffer/font:
+// the VT lays out in cells, so it must not re-declare the size it is drawn at.
+use crate::drivers::framebuffer::{CHAR_HEIGHT, CHAR_WIDTH, STATUS_BAR_HEIGHT};
 use crate::sync::spinlock::Spinlock;
 use alloc::vec::Vec;
 
 const DEFAULT_FG: u32 = 0xAAAAAA;
 const DEFAULT_BG: u32 = 0x000000;
-const GLYPH_W: usize = 8;
-const GLYPH_H: usize = 16;
-const STATUS_H: usize = 18;
 
 #[derive(Clone, Copy)]
 struct Cell {
@@ -119,8 +119,8 @@ impl Vt {
     fn put(&mut self, x: usize, y: usize, c: Cell) {
         let i = self.idx(x, y);
         self.cells[i] = c;
-        let px = x * GLYPH_W;
-        let py = STATUS_H + y * GLYPH_H;
+        let px = x * CHAR_WIDTH;
+        let py = STATUS_BAR_HEIGHT + y * CHAR_HEIGHT;
         crate::drivers::framebuffer::with(|fb| {
             fb.draw_glyph_px(c.ch, px, py, c.fg, c.bg);
         });
@@ -129,8 +129,8 @@ impl Vt {
         for row in 0..self.rows {
             for col in 0..self.cols {
                 let c = self.get(col, row);
-                let px = col * GLYPH_W;
-                let py = STATUS_H + row * GLYPH_H;
+                let px = col * CHAR_WIDTH;
+                let py = STATUS_BAR_HEIGHT + row * CHAR_HEIGHT;
                 crate::drivers::framebuffer::with(|fb| {
                     fb.draw_glyph_px(c.ch, px, py, c.fg, c.bg);
                 });
@@ -447,8 +447,8 @@ impl Vt {
     }
     fn blit(&self, x: usize, y: usize) {
         let c = self.get(x, y);
-        let px = x * GLYPH_W;
-        let py = STATUS_H + y * GLYPH_H;
+        let px = x * CHAR_WIDTH;
+        let py = STATUS_BAR_HEIGHT + y * CHAR_HEIGHT;
         crate::drivers::framebuffer::with(|fb| {
             fb.draw_glyph_px(c.ch, px, py, c.fg, c.bg);
         });
@@ -622,13 +622,19 @@ pub fn init() {
     if fbw == 0 || fbh == 0 {
         return;
     }
-    let cols = fbw / GLYPH_W;
-    let rows = (fbh.saturating_sub(STATUS_H)) / GLYPH_H;
+    let cols = fbw / CHAR_WIDTH;
+    let rows = (fbh.saturating_sub(STATUS_BAR_HEIGHT)) / CHAR_HEIGHT;
     if cols == 0 || rows == 0 {
         return;
     }
     crate::drivers::framebuffer::with(|fb| {
-        fb.fill_rect(0, STATUS_H, fbw, fbh - STATUS_H, DEFAULT_BG);
+        fb.fill_rect(
+            0,
+            STATUS_BAR_HEIGHT,
+            fbw,
+            fbh - STATUS_BAR_HEIGHT,
+            DEFAULT_BG,
+        );
     });
     let mut vt = Vt::new(cols, rows);
     vt.paint_all();
