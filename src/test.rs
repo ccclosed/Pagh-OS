@@ -2475,6 +2475,8 @@ pub mod mock_block {
 // Property 18: Filesystem operation round-trip.                    R6.3, R9.3-5
 // Property 19: ext2 dir entry rec_len/name_len round-trip + tiling. R7.2,7.3,7.5
 // Property 20: Freshly formatted ext2 superblock is valid.         R4.1,4.2,4.5,4.6
+// Regression: `replace_contents` truncates, so a shorter rewrite leaves no tail
+// (the `write`/`cp`/`nano`-save bug), and the keyboard's caps-XOR-shift rule.
 mod fs_prop_tests {
     use super::mock_block::{MockBlockDevice, Op};
     use crate::fs::ext2::alloc as ext2alloc;
@@ -3199,6 +3201,60 @@ mod fs_prop_tests {
             crate::vfs::lookup_path("/mnt/lxwalk_target").is_err(),
             "links: the scratch tree was removed"
         );
+        mnt.sync();
+    }
+
+    /// Regression: replacing a file with a shorter payload must not leave the
+    /// old tail behind.
+    ///
+    /// This is the VFS half of the `write`/`cp` commands and of `nano`'s save:
+    /// `write f BBB` after `write f AAAAAAAAAAAAAAAAAAAA` used to leave a
+    /// 20-byte file whose bytes were `BBBAAAAAAAAAAAAAAAAA`, because the command
+    /// wrote at offset 0 and never truncated. A later `nano f` then displayed
+    /// that stale tail. The routine exercises `vfs::replace_contents` (the fixed
+    /// command path) on the mounted ext2 and removes its scratch entry.
+    pub fn ext2_replace_contents_truncates() {
+        let mnt = match crate::vfs::lookup_path("/mnt") {
+            Ok(n) => n,
+            Err(_) => {
+                crate::test::record_failure();
+                crate::kprintln!("FAIL: {}: /mnt is not mounted", file!());
+                return;
+            }
+        };
+        let name = "selftest_replace";
+        let _ = mnt.remove(name);
+        let node = match mnt.create_file(name) {
+            Ok(n) => n,
+            Err(e) => {
+                crate::test::record_failure();
+                crate::kprintln!("FAIL: {}: create_file: {:?}", file!(), e);
+                return;
+            }
+        };
+
+        let long = b"AAAAAAAAAAAAAAAAAAAA";
+        assert_kernel!(
+            crate::vfs::replace_contents(&node, long).is_ok(),
+            "replace: the first (long) write failed"
+        );
+        assert_eq_kernel!(node.size(), 20, "replace: the long write has the full size");
+
+        assert_kernel!(
+            crate::vfs::replace_contents(&node, b"BBB").is_ok(),
+            "replace: the shorter write failed"
+        );
+        assert_eq_kernel!(
+            node.size(),
+            3,
+            "replace: a shorter write must truncate the old tail"
+        );
+        let mut buf = [0u8; 8];
+        let n = node.read(0, &mut buf).unwrap_or(0);
+        assert_eq_kernel!(&buf[..n], &b"BBB"[..], "replace: read-back is the new text");
+
+        node.sync();
+        let _ = mnt.remove(name);
         mnt.sync();
     }
 
@@ -5160,6 +5216,16 @@ mod linux_tick_tests {
         // Drain what case B left (SIGUSR2) so the peek below sees SIGSTOP only:
         // the pending set is a SET, and the delivery always takes the lowest bit.
         while crate::task::compat::pick_pending_signal().is_some() {}
+        // Run the simulated delivery with interrupts masked. A REAL timer tick
+        // between queueing SIGSTOP and the fake `tick_action` below would deliver
+        // the stop for real (the SIG_DFL stop branch is checked before the
+        // user-frame check), park this task at the tick's requeue decision, and
+        // the routine would never return — the test used to depend on not being
+        // preempted in that window. `tick_action` is an IRQ-context function
+        // whose only real caller runs with IF masked, so masking is also the
+        // faithful environment for the plan it is supposed to exercise.
+        let irq_was_on = crate::arch::cpu::interrupts_enabled();
+        crate::arch::cpu::disable_interrupts();
         assert_eq_kernel!(
             signal::send_signal(me, crate::arch::x86_64::linux::signal_frame::SIGSTOP),
             Ok(()),
@@ -5174,6 +5240,9 @@ mod linux_tick_tests {
         // The selftest task is NOT parked (this is not a real tick): drop the
         // request the call marked so no state leaks into the rest of the suite.
         scheduler::cancel_stop_request(me);
+        if irq_was_on {
+            crate::arch::cpu::enable_interrupts();
+        }
         assert_kernel!(!scheduler::is_stopped(me), "tick-test: not parked");
 
         // ── Cleanup ──────────────────────────────────────────────────────────
@@ -5332,6 +5401,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             fs_prop_tests::ext2_link_walk_resolution
         ),
         (
+            "fs::ext2 replace truncates the old tail (write/cp regression)",
+            fs_prop_tests::ext2_replace_contents_truncates
+        ),
+        (
             "fs::ext2 dir entry rec_len/tiling (Property 19)",
             fs_prop_tests::p19_dir_entry_roundtrip_and_tiling
         ),
@@ -5407,6 +5480,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "shell::render color palette mapping (unit)",
             shell_prop_tests::unit_render_color_palette
+        ),
+        (
+            "shell::keyboard Shift+CapsLock rule (regression)",
+            shell_prop_tests::unit_keyboard_shift_and_caps
         ),
         (
             "shell::path/listing format behaviors (unit)",
@@ -6376,40 +6453,102 @@ mod shell_prop_tests {
         }
     }
 
-    /// Unit (task 9.3): color helpers map each style to its palette constant and
-    /// the default foreground color stays 0xFFFFFF (R8.6). We assert the pure
-    /// color mapping only — never actual framebuffer pixels (no hardware).
+    /// Regression: Shift+letter must uppercase while CapsLock is off, and
+    /// CapsLock must invert that (caps+shift -> lowercase).
+    ///
+    /// The decoder used to flip the case when `caps != shift`, double-counting
+    /// the Shift that `scancode_to_ascii` had already applied — so Shift+letter
+    /// typed *lowercase* whenever CapsLock was off, the inverse of a keyboard.
+    /// CapsLock is a process-wide latch, so the routine toggles it into a known
+    /// state and toggles it back on the way out.
+    pub fn unit_keyboard_shift_and_caps() {
+        const LETTER: u8 = 0x1E; // 'a' make code
+        const SHIFT_MAKE: u8 = 0x2A;
+        const SHIFT_BREAK: u8 = 0xAA;
+        const CAPS_TOGGLE: u8 = 0x3A;
+
+        let mut dec = keys::Decoder::new();
+        let caps_was_on = dec.feed(LETTER) == Some(keys::KeyEvent::Char('A'));
+        dec.feed(CAPS_TOGGLE); // now definitely off
+
+        assert_eq_kernel!(
+            dec.feed(LETTER),
+            Some(keys::KeyEvent::Char('a')),
+            "keyboard: CapsLock off, a plain letter is lowercase"
+        );
+        dec.feed(SHIFT_MAKE);
+        assert_eq_kernel!(
+            dec.feed(LETTER),
+            Some(keys::KeyEvent::Char('A')),
+            "keyboard: CapsLock off, Shift+letter is uppercase"
+        );
+        dec.feed(SHIFT_BREAK);
+        dec.feed(CAPS_TOGGLE); // now on
+        assert_eq_kernel!(
+            dec.feed(LETTER),
+            Some(keys::KeyEvent::Char('A')),
+            "keyboard: CapsLock on, a plain letter is uppercase"
+        );
+        dec.feed(SHIFT_MAKE);
+        assert_eq_kernel!(
+            dec.feed(LETTER),
+            Some(keys::KeyEvent::Char('a')),
+            "keyboard: CapsLock on, Shift+letter is lowercase"
+        );
+        dec.feed(SHIFT_BREAK);
+
+        dec.feed(CAPS_TOGGLE); // restore the latch the rest of the boot had
+        assert_eq_kernel!(
+            dec.feed(LETTER),
+            Some(keys::KeyEvent::Char(if caps_was_on { 'A' } else { 'a' })),
+            "keyboard: CapsLock state restored after the routine"
+        );
+    }
+
+    /// Unit (task 9.3): color helpers map each style to its palette entry and the
+    /// default foreground color starts at 0xFFFFFF (R8.6). The palette is runtime
+    /// state since themes exist, so this checks the *seeded* values and that a
+    /// `set_colors` swap is visible through every accessor — the property a theme
+    /// switch depends on. Framebuffer pixels are never asserted (no hardware).
     pub fn unit_render_color_palette() {
+        let (def, prompt, err, ok) = (
+            render::color_default(),
+            render::color_prompt(),
+            render::color_error(),
+            render::color_success(),
+        );
+        assert_kernel!(def == 0xFFFFFF, "render: default color is 0xFFFFFF");
         assert_kernel!(
-            render::COLOR_DEFAULT == 0xFFFFFF,
-            "render: default color is 0xFFFFFF"
+            render::Style::Default.color() == def,
+            "render: Style::Default maps to the default color"
         );
         assert_kernel!(
-            render::Style::Default.color() == 0xFFFFFF,
-            "render: Style::Default maps to 0xFFFFFF"
+            render::Style::Prompt.color() == prompt,
+            "render: Prompt style matches the prompt color"
         );
         assert_kernel!(
-            render::Style::Default.color() == render::COLOR_DEFAULT,
-            "render: Default style matches default constant"
+            render::Style::Error.color() == err,
+            "render: Error style matches the error color"
         );
         assert_kernel!(
-            render::Style::Prompt.color() == render::COLOR_PROMPT,
-            "render: Prompt style matches prompt constant"
+            render::Style::Success.color() == ok,
+            "render: Success style matches the success color"
         );
         assert_kernel!(
-            render::Style::Error.color() == render::COLOR_ERROR,
-            "render: Error style matches error constant"
-        );
-        assert_kernel!(
-            render::Style::Success.color() == render::COLOR_SUCCESS,
-            "render: Success style matches success constant"
-        );
-        // Styles are distinct so the four states are visually distinguishable.
-        assert_kernel!(
-            render::COLOR_PROMPT != render::COLOR_DEFAULT
-                && render::COLOR_ERROR != render::COLOR_DEFAULT
-                && render::COLOR_SUCCESS != render::COLOR_DEFAULT,
+            prompt != def && err != def && ok != def,
             "render: styled colors differ from default"
+        );
+        // A theme swap must be observable through the accessors, and must be
+        // restored: this runs in-QEMU, where later checks read the same palette.
+        render::set_colors(0x010203, 0x040506, 0x070809, 0x0A0B0C);
+        assert_kernel!(
+            render::Style::Prompt.color() == 0x040506 && render::color_default() == 0x010203,
+            "render: set_colors replaces the palette for every style"
+        );
+        render::set_colors(def, prompt, err, ok);
+        assert_kernel!(
+            render::color_default() == 0xFFFFFF && render::color_prompt() == prompt,
+            "render: palette restored after the theme check"
         );
     }
 

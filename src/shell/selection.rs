@@ -141,6 +141,14 @@ pub struct Selection {
     /// which is the arithmetic that turned out to be unreliable.
     line_range: Option<(usize, usize)>,
     painted: bool,
+    /// The range that is currently highlighted on screen.
+    ///
+    /// Repainting is incremental: a drag extends the range cell by cell, so a
+    /// repaint must first restore the cells the *previous* range covered. Without
+    /// this record a shrinking drag (or a click after a drag) left the cells that
+    /// fell out of the range still highlighted — the "holes" and stuck bright
+    /// patches after releasing the mouse.
+    painted_range: Option<CellRange>,
 }
 
 impl Selection {
@@ -150,6 +158,7 @@ impl Selection {
             range: None,
             line_range: None,
             painted: false,
+            painted_range: None,
         }
     }
 
@@ -205,25 +214,35 @@ impl Selection {
         self.anchor.is_some()
     }
 
-    /// Repaint the range as selected. Repeated calls are cheap: the range is
-    /// remembered, and only a changed range is repainted.
+    /// Repaint the range as selected, restoring whatever the previous range
+    /// covered first. Repeated calls are cheap: a drag moves the highlight by a
+    /// cell or two, and only the cells that left the range are repainted back.
     pub fn paint(&mut self, cols: usize) {
+        self.unpaint_painted(cols);
         let Some(range) = self.range else {
+            self.painted = false;
             return;
         };
         for cell in range.cells(cols) {
             framebuffer::console()
                 .paint_cell_selected(cell.col, cell.row, SELECT_FG, SELECT_BG, false);
         }
+        self.painted_range = Some(range);
         self.painted = true;
     }
 
-    /// Repaint the range back to ordinary console colors.
+    /// Repaint the highlighted range back to ordinary console colors.
     pub fn unpaint(&mut self) {
-        let Some(range) = self.range else {
+        let cols = framebuffer::console().text_grid().0;
+        self.unpaint_painted(cols);
+        self.painted = false;
+    }
+
+    /// Restore exactly the cells that are highlighted right now.
+    fn unpaint_painted(&mut self, cols: usize) {
+        let Some(range) = self.painted_range.take() else {
             return;
         };
-        let cols = framebuffer::console().text_grid().0;
         for cell in range.cells(cols) {
             // `restore = true`: each cell goes back to the color it was drawn in,
             // so releasing a selection over the green prompt leaves it green.
@@ -234,9 +253,7 @@ impl Selection {
 
     /// Drop the selection, restoring the cells it covered.
     pub fn clear(&mut self) {
-        if self.painted {
-            self.unpaint();
-        }
+        self.unpaint();
         self.anchor = None;
         self.range = None;
         self.line_range = None;

@@ -34,7 +34,6 @@ const TOOL_ROW_H: usize = 24;
 /// Total toolbar height (both rows stacked).
 const TOOLBAR_H: usize = PALETTE_ROW_H + TOOL_ROW_H;
 const SWATCH: usize = 22; // palette swatch width/height in px
-const CHAR_W: usize = 8; // framebuffer glyph width in px
 
 const WHITE: u32 = 0xFFFFFF;
 const TOOLBAR_BG: u32 = 0x2C2C34;
@@ -87,7 +86,7 @@ const TOOLS: [Tool; 9] = [
 fn tool_buttons() -> impl Iterator<Item = (Tool, usize, usize)> {
     let mut x = 4usize;
     TOOLS.iter().map(move |&t| {
-        let w = t.name().len() * CHAR_W + 8;
+        let w = t.name().len() * framebuffer::CHAR_WIDTH + 8;
         let bx = x;
         x += w + 4;
         (t, bx, w)
@@ -109,7 +108,7 @@ struct BrushUi {
 fn tools_end_x() -> usize {
     let mut x = 4usize;
     for &t in TOOLS.iter() {
-        x += (t.name().len() * CHAR_W + 8) + 4;
+        x += (t.name().len() * framebuffer::CHAR_WIDTH + 8) + 4;
     }
     x
 }
@@ -119,7 +118,7 @@ fn tools_end_x() -> usize {
 fn brush_ui() -> BrushUi {
     let minus_x = tools_end_x() + 16;
     let label_x = minus_x + BRUSH_BTN_W + 6;
-    let label_w = 6 * CHAR_W; // room for "Sz:NN"
+    let label_w = 6 * framebuffer::CHAR_WIDTH; // room for "Sz:NN"
     let plus_x = label_x + label_w;
     let end_x = plus_x + BRUSH_BTN_W;
     BrushUi {
@@ -323,7 +322,12 @@ impl PaintApp {
         // Paint the initial desktop + window UI.
         let init = ps2_mouse::poll();
         self.redraw_all(&init);
+        // The console draws into a RAM shadow buffer; the cursor is part of the
+        // frame and is drawn before the flush, so one push shows both. Without
+        // the flush the window would be correct in RAM while the device still
+        // shows the shell screen underneath.
         cursor::move_to(init.x, init.y);
+        framebuffer::flush();
 
         let mut dec = Decoder::new();
         let mut last_seq = u64::MAX;
@@ -356,6 +360,13 @@ impl PaintApp {
                 last_seq = ms.seq;
                 self.handle_mouse(&ms);
             }
+
+            // Push the frame once per pass. `flush` is a no-op when nothing was
+            // drawn (`dirty` is empty), so idling on `halt` stays free; every
+            // canvas edit, toolbar repaint and taskbar update lands on the device
+            // here. This is the paint-side equivalent of the shell's once-per-pass
+            // flush — without it the app drew entirely into RAM.
+            framebuffer::flush();
 
             // The title-bar close button requests quit asynchronously.
             if self.quit_requested {
@@ -1023,7 +1034,7 @@ impl PaintApp {
                 fb.draw_text_px(ox + tx + 30, oy + 8, &label, 0xE6E6E6, TOOLBAR_BG);
             }
             // Tool buttons (second row).
-            let ty = oy + PALETTE_ROW_H + (TOOL_ROW_H - 16) / 2;
+            let ty = oy + PALETTE_ROW_H + TOOL_ROW_H.saturating_sub(framebuffer::CHAR_HEIGHT) / 2;
             for (t, bx, bw) in tool_buttons() {
                 if bx + bw > aw {
                     break;
@@ -1051,7 +1062,7 @@ impl PaintApp {
                 // Minus button.
                 fb.fill_rect(ox + bu.minus_x, by, BRUSH_BTN_W, bh, btn_bg);
                 fb.draw_text_px(
-                    ox + bu.minus_x + (BRUSH_BTN_W - CHAR_W) / 2,
+                    ox + bu.minus_x + (BRUSH_BTN_W - framebuffer::CHAR_WIDTH) / 2,
                     ty,
                     "-",
                     0xE6E6E6,
@@ -1063,7 +1074,7 @@ impl PaintApp {
                 // Plus button.
                 fb.fill_rect(ox + bu.plus_x, by, BRUSH_BTN_W, bh, btn_bg);
                 fb.draw_text_px(
-                    ox + bu.plus_x + (BRUSH_BTN_W - CHAR_W) / 2,
+                    ox + bu.plus_x + (BRUSH_BTN_W - framebuffer::CHAR_WIDTH) / 2,
                     ty,
                     "+",
                     0xE6E6E6,
@@ -1258,7 +1269,7 @@ impl PaintApp {
             fb.fill_rect(wx, wy, ww, TITLEBAR_H, TITLE_BG);
             fb.draw_text_px(
                 wx + 8,
-                wy + (TITLEBAR_H - 16) / 2,
+                wy + TITLEBAR_H.saturating_sub(framebuffer::CHAR_HEIGHT) / 2,
                 title,
                 0xFFFFFF,
                 TITLE_BG,
@@ -1277,8 +1288,8 @@ impl PaintApp {
             // Close button (red, "X" glyph).
             fb.fill_rect(clx, by, bw, bh, 0xC0392B);
             fb.draw_text_px(
-                clx + (bw - CHAR_W) / 2,
-                by + (bh.saturating_sub(16)) / 2 + 1,
+                clx + (bw - framebuffer::CHAR_WIDTH) / 2,
+                by + (bh.saturating_sub(framebuffer::CHAR_HEIGHT)) / 2 + 1,
                 "X",
                 0xFFFFFF,
                 0xC0392B,
@@ -1291,7 +1302,7 @@ impl PaintApp {
     /// Rectangle of the "Paint" taskbar button `(x, y, w, h)`.
     fn taskbar_button_rect(&self) -> (usize, usize, usize, usize) {
         let bar_top = self.screen_h.saturating_sub(framebuffer::STATUS_BAR_HEIGHT);
-        let bw = 7 * CHAR_W; // " Paint "
+        let bw = 7 * framebuffer::CHAR_WIDTH; // " Paint "
         let bx = 200usize.min(self.screen_w.saturating_sub(bw + 6));
         let by = bar_top + 2;
         let bh = framebuffer::STATUS_BAR_HEIGHT.saturating_sub(4);
@@ -1336,15 +1347,15 @@ impl PaintApp {
             let (w, _) = fb.dimensions();
             fb.fill_rect(0, bar_top, w, bar_h, BG);
             fb.fill_rect(0, bar_top, w, 1, 0x3C6FA0); // separator highlight
-            let ty = bar_top + (bar_h.saturating_sub(16)) / 2;
+            let ty = bar_top + (bar_h.saturating_sub(framebuffer::CHAR_HEIGHT)) / 2;
             fb.draw_text_px(6, ty, "pagh OS", FG, BG);
             // Taskbar button for the paint window (dim when minimized).
             let btn_bg = if minimized { 0x10324F } else { 0x2E5C86 };
             fb.fill_rect(bx, by, bw, bh, btn_bg);
             fb.draw_rect(bx, by, bw, bh, 0x6FA8C8);
-            fb.draw_text_px(bx + CHAR_W, ty, "Paint", FG, btn_bg);
+            fb.draw_text_px(bx + framebuffer::CHAR_WIDTH, ty, "Paint", FG, btn_bg);
             // Right-aligned status message.
-            let rw = msg.len() * CHAR_W;
+            let rw = msg.len() * framebuffer::CHAR_WIDTH;
             if rw + 8 < w {
                 fb.draw_text_px(w - rw - 6, ty, msg, FG, BG);
             }

@@ -18,20 +18,18 @@ use crate::vfs::{VfsError, VfsNode};
 const MAX_FILE: usize = 64 * 1024;
 const MAX_LINE: usize = 4096;
 const UNDO_LIMIT: usize = 32;
-const CHAR_W: usize = 8;
-const CHAR_H: usize = 16;
-const HEADER_H: usize = 22;
-const FOOTER_H: usize = 38;
+// Cell geometry comes from the console and nowhere else. These were `8`/`16`
+// while the console rendered 8x16 glyphs; after the switch to the Fira Code
+// 8x18 cell the editor kept laying every row out at 16 pixels and drew each row
+// two pixels into the next one (and its caret was two pixels short).
+const CHAR_W: usize = framebuffer::CHAR_WIDTH;
+const CHAR_H: usize = framebuffer::CHAR_HEIGHT;
+/// Title strip: one glyph row plus a small margin.
+const HEADER_H: usize = CHAR_H + 4;
+/// Footer: two text lines (status, key hints) plus a small margin.
+const FOOTER_H: usize = 2 * CHAR_H + 2;
 /// Sidebar width in character cells.
 const TREE_COLS: usize = 24;
-const BG: u32 = 0x191919;
-const SURFACE: u32 = 0x252525;
-const TEXT: u32 = 0xF2F2F2;
-const MUTED: u32 = 0x9B9B9B;
-const BLUE: u32 = 0x2783DE;
-const GREEN: u32 = 0x46A171;
-const RED: u32 = 0xE56458;
-const SELECT: u32 = 0x24496D;
 
 #[derive(Clone)]
 struct Snapshot {
@@ -46,6 +44,67 @@ enum PromptMode {
     Goto,
     ReplaceFind,
     ReplaceWith,
+}
+
+/// A position in the document: a line and a byte column in it.
+///
+/// Columns are "just past the last character" at `line.len()`, so a selection can
+/// end at the end of a line without pointing at a character.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SelPoint {
+    row: usize,
+    col: usize,
+}
+
+/// A text selection in document coordinates.
+///
+/// `anchor` is where a drag started (or one end of a keyboard selection) and stays
+/// put; `head` is the moving end. Both are kept in the order the user created them
+/// and normalised by [`Self::ordered`] wherever reading order matters, so a drag in
+/// any direction selects the same text.
+#[derive(Clone, Copy)]
+struct Selection {
+    anchor: Option<SelPoint>,
+    head: Option<SelPoint>,
+}
+
+impl Selection {
+    const fn new() -> Self {
+        Selection {
+            anchor: None,
+            head: None,
+        }
+    }
+
+    /// The two ends in reading order, or `None` when no selection exists.
+    fn ordered(&self) -> Option<(SelPoint, SelPoint)> {
+        let (a, h) = (self.anchor?, self.head?);
+        if (a.row, a.col) <= (h.row, h.col) {
+            Some((a, h))
+        } else {
+            Some((h, a))
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self.ordered() {
+            Some((a, b)) => a == b,
+            None => true,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.anchor = None;
+        self.head = None;
+    }
+}
+
+/// Where a mouse click landed.
+enum Hit {
+    /// A document position in the text pane.
+    Text(SelPoint),
+    /// A row index into the sidebar's visible list.
+    Tree(usize),
 }
 
 pub struct Editor {
@@ -67,6 +126,18 @@ pub struct Editor {
     replace_needle: Option<String>,
     /// Directory the sidebar should open at, when the editor starts with one.
     tree_root: Option<String>,
+    /// The buffer as of the last save/open, so "is this modified?" is answered by the
+    /// text itself instead of by "did a keystroke happen".
+    ///
+    /// A counter of edits is what marked the file dirty after typing a character and
+    /// deleting it again: the buffer was identical, the flag was not. Comparing the
+    /// lines is the only answer that cannot lie about it.
+    clean: Vec<String>,
+    /// Active text selection (mouse drag or `^A`).
+    sel: Selection,
+    /// Clipboard for a copied/cut *selection*, as opposed to the line-oriented
+    /// clipboard `^C`/`^K` use when nothing is selected.
+    sel_clip: String,
 }
 
 impl Editor {
@@ -75,9 +146,11 @@ impl Editor {
         if lines.is_empty() {
             lines.push(String::new());
         }
+        let clean = lines.clone();
         Self {
             path: path.to_string(),
             lines,
+            clean,
             row: 0,
             col: 0,
             top: 0,
@@ -93,6 +166,8 @@ impl Editor {
             clipboard: Vec::new(),
             tree_root: None,
             replace_needle: None,
+            sel: Selection::new(),
+            sel_clip: String::new(),
         }
     }
 
@@ -113,12 +188,31 @@ impl Editor {
         self.col = 0;
         self.top = 0;
         self.left = 0;
-        self.dirty = false;
+        self.mark_clean();
         self.undo.clear();
         self.redo.clear();
         self.search_hit = None;
         self.quit_armed = false;
+        self.sel.clear();
+        self.sel_clip.clear();
         self.status = alloc::format!("opened {}", path);
+    }
+
+    /// Recompute `dirty` from the buffer — the only honest definition of "modified".
+    fn refresh_dirty(&mut self) {
+        self.dirty = self.lines != self.clean;
+        if !self.dirty {
+            // Back to the saved text: there is nothing to lose, so the two-step quit
+            // guard has nothing to guard either.
+            self.quit_armed = false;
+        }
+    }
+
+    /// Remember the current buffer as the saved state (open, reload, save).
+    fn mark_clean(&mut self) {
+        self.clean = self.lines.clone();
+        self.dirty = false;
+        self.quit_armed = false;
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -134,7 +228,8 @@ impl Editor {
         }
         self.undo.push(self.snapshot());
         self.redo.clear();
-        self.dirty = true;
+        // `dirty` is decided by the text, not by the keystroke: the caller mutates and
+        // then calls `refresh_dirty`.
         self.quit_armed = false;
     }
     fn restore(&mut self, s: Snapshot) {
@@ -148,7 +243,7 @@ impl Editor {
             let cur = self.snapshot();
             self.redo.push(cur);
             self.restore(s);
-            self.dirty = true;
+            self.refresh_dirty();
             self.status = "Undo".into();
         } else {
             self.status = "Nothing to undo".into();
@@ -159,7 +254,7 @@ impl Editor {
             let cur = self.snapshot();
             self.undo.push(cur);
             self.restore(s);
-            self.dirty = true;
+            self.refresh_dirty();
             self.status = "Redo".into();
         } else {
             self.status = "Nothing to redo".into();
@@ -177,6 +272,7 @@ impl Editor {
             self.newline_without_checkpoint();
         }
         self.ensure_visible();
+        self.refresh_dirty();
     }
     fn newline_without_checkpoint(&mut self) {
         let indent = if self.config.auto_indent {
@@ -201,6 +297,7 @@ impl Editor {
     fn newline(&mut self) {
         self.checkpoint();
         self.newline_without_checkpoint();
+        self.refresh_dirty();
     }
     fn backspace(&mut self) {
         if self.col > 0 {
@@ -221,6 +318,7 @@ impl Editor {
             }
         }
         self.ensure_visible();
+        self.refresh_dirty();
     }
     fn delete(&mut self) {
         if self.col < self.lines[self.row].len() {
@@ -233,6 +331,7 @@ impl Editor {
             let next = self.lines.remove(self.row + 1);
             self.lines[self.row].push_str(&next);
         }
+        self.refresh_dirty();
     }
     fn left(&mut self) {
         if self.col > 0 {
@@ -280,6 +379,7 @@ impl Editor {
         self.col = self.col.min(self.lines[self.row].len());
         self.status = "Line cut".into();
         self.ensure_visible();
+        self.refresh_dirty();
     }
     fn paste_line(&mut self) {
         if self.clipboard.is_empty() {
@@ -295,6 +395,7 @@ impl Editor {
         self.col = 0;
         self.status = "Pasted".into();
         self.ensure_visible();
+        self.refresh_dirty();
     }
     fn ensure_visible(&mut self) {
         let (w, h) = framebuffer::dimensions();
@@ -355,6 +456,7 @@ impl Editor {
                     for line in &mut self.lines {
                         *line = line.replace(&needle, &value)
                     }
+                    self.refresh_dirty();
                 }
                 self.status = format!("Replaced {} occurrence(s)", count);
             }
@@ -417,6 +519,134 @@ impl Editor {
     }
     fn text(&self) -> String {
         self.lines.join("\n")
+    }
+
+    // ── selection ────────────────────────────────────────────────────────
+
+    /// The selected range as `(start, end)` in reading order, or `None` for an
+    /// empty/absent selection. `start` is included, `end` is the position just
+    /// past the last selected character in the same row, or a character position
+    /// on the last row for a multi-row selection.
+    fn sel_bounds(&self) -> Option<(SelPoint, SelPoint)> {
+        match self.sel.ordered() {
+            Some((a, b)) if a != b => Some((a, b)),
+            _ => None,
+        }
+    }
+
+    fn has_selection(&self) -> bool {
+        self.sel_bounds().is_some()
+    }
+
+    fn clear_selection(&mut self) {
+        self.sel.clear();
+    }
+
+    fn begin_select(&mut self, p: SelPoint) {
+        self.sel.anchor = Some(p);
+        self.sel.head = Some(p);
+    }
+
+    fn extend_select(&mut self, p: SelPoint) {
+        self.sel.head = Some(p);
+    }
+
+    /// Move the caret to `p`, clamped into the document and scrolled into view.
+    /// Returns whether the viewport scrolled (the caller then repaints the frame).
+    fn set_cursor(&mut self, p: SelPoint) -> bool {
+        let (top, left) = (self.top, self.left);
+        self.row = p.row.min(self.lines.len().saturating_sub(1));
+        self.col = p.col.min(self.lines[self.row].len());
+        self.ensure_visible();
+        self.top != top || self.left != left
+    }
+
+    /// Select the whole buffer and put the caret at its end.
+    fn select_all(&mut self) {
+        let last = self.lines.len() - 1;
+        let end = self.lines[last].len();
+        let col = end.saturating_sub(1);
+        self.sel.anchor = Some(SelPoint { row: 0, col: 0 });
+        self.sel.head = Some(SelPoint { row: last, col });
+        self.row = last;
+        self.col = col;
+        self.ensure_visible();
+        self.status = alloc::format!("Selected {} line(s)", self.lines.len());
+    }
+
+    /// The selected text, or `None` when nothing is selected.
+    ///
+    /// Both ends are *character* positions (see [`Selection`]): a row-to-row drag
+    /// includes the character under the pointer, which is what the highlight shows.
+    fn sel_text(&self) -> Option<String> {
+        let (a, b) = self.sel_bounds()?;
+        let mut out = String::new();
+        if a.row == b.row {
+            let line = &self.lines[a.row];
+            let ac = a.col.min(line.len());
+            let bc = (b.col + 1).min(line.len());
+            out.push_str(&line[ac..bc]);
+        } else {
+            let first = &self.lines[a.row];
+            out.push_str(&first[a.col.min(first.len())..]);
+            for r in (a.row + 1)..b.row {
+                out.push('\n');
+                out.push_str(&self.lines[r]);
+            }
+            out.push('\n');
+            let last = &self.lines[b.row];
+            let bc = (b.col + 1).min(last.len());
+            out.push_str(&last[..bc]);
+        }
+        Some(out)
+    }
+
+    /// Delete the selected text, dropping the selection and leaving the caret at
+    /// its start. Returns whether there was a selection to delete.
+    fn delete_selection(&mut self) -> bool {
+        let Some((a, b)) = self.sel_bounds() else {
+            self.sel.clear();
+            return false;
+        };
+        self.checkpoint();
+        // Both ends are inclusive character positions: same row deletes
+        // `[a.col, b.col]`, a multi-row range deletes the tail of the first row,
+        // the whole middle rows and the head of the last row, joining the two
+        // remains into one line.
+        if a.row == b.row {
+            let line = &mut self.lines[a.row];
+            let ac = a.col.min(line.len());
+            let bc = (b.col + 1).min(line.len());
+            line.replace_range(ac..bc, "");
+            self.row = a.row;
+            self.col = ac;
+        } else {
+            let ac = a.col.min(self.lines[a.row].len());
+            let bc = (b.col + 1).min(self.lines[b.row].len());
+            let tail: String = self.lines[b.row][bc..].into();
+            self.lines[a.row].truncate(ac);
+            self.lines[a.row].push_str(&tail);
+            self.lines.drain(a.row + 1..=b.row);
+            self.row = a.row;
+            self.col = ac;
+        }
+        self.sel.clear();
+        self.ensure_visible();
+        self.refresh_dirty();
+        true
+    }
+
+    /// Insert `text` at the caret (newlines split lines). Used by the pastes;
+    /// a selection is deleted first by the caller.
+    fn insert_text(&mut self, text: &str) {
+        for (i, part) in text.split('\n').enumerate() {
+            if i > 0 {
+                self.newline();
+            }
+            for ch in part.chars() {
+                self.insert(ch);
+            }
+        }
     }
 }
 
@@ -507,8 +737,7 @@ fn save(editor: &mut Editor, node: &Arc<dyn VfsNode>) -> Result<(), VfsError> {
         }
     }
     node.sync();
-    editor.dirty = false;
-    editor.quit_armed = false;
+    editor.mark_clean();
     editor.status = format!("Saved {} bytes", text.len());
     Ok(())
 }
@@ -529,177 +758,505 @@ fn clipped_ascii(s: &str, start: usize, width: usize, spaces: bool) -> String {
         .collect()
 }
 
-fn render(editor: &Editor, caret_on: bool, tree: Option<&super::tree::FileTree>) {
-    render_impl(editor, caret_on, tree, false)
+// ─── rendering ────────────────────────────────────────────────────────────
+//
+// Three rules keep the drawing paths honest:
+//
+// * **Damage, not frames.** A keystroke changes one line and the caret.
+//   Repainting the whole surface for it was measured at tens of milliseconds
+//   under TCG (a full frame is ~10 000 glyphs = ~1.4 M pixel writes) and is what
+//   made typing feel laggy. Each entry point below repaints the smallest region
+//   that can have changed; the console's dirty-rect flush then copies only that
+//   region to the device.
+// * **The arrow is re-shown after every frame.** Full-screen drawers hide the
+//   software mouse cursor before painting and must put it back on top of the
+//   finished frame — a path that hides it and never shows it leaves the pointer
+//   invisible for as long as the editor is open.
+// * **RAM, then exactly one flush.** Pixels only reach the screen through
+//   `framebuffer::flush`; a path that returns without it leaves its work in the
+//   shadow buffer (that is how the caret vanished: the blink wrote the bar but
+//   never pushed it).
+
+/// Pixel geometry of the editor frame, derived once per draw.
+struct Layout {
+    w: usize,
+    h: usize,
+    /// Sidebar width in cells (0 when the sidebar is hidden).
+    tree_cols: usize,
+    /// Text columns beside the sidebar.
+    cols: usize,
+    /// Visible editor rows.
+    rows: usize,
+    /// Line-number gutter width in cells (0 when line numbers are off).
+    gutter: usize,
+    /// Top pixel of the footer strip.
+    foot: usize,
 }
 
-/// Repaint **only** the caret cell.
-///
-/// The caret has to change twice per blink period while the rest of the screen
-/// stays put. Redrawing everything for that produced frames caught mid-draw — the
-/// screen looked like it was tearing — so the blink path touches two cells instead:
-/// the old caret (restored by repainting its character) and the new one.
-fn render_caret(editor: &Editor, caret_on: bool, tree: Option<&super::tree::FileTree>) {
-    render_impl(editor, caret_on, tree, true)
+/// Visible editor rows for a screen `h` pixels tall.
+fn body_rows(h: usize) -> usize {
+    h.saturating_sub(HEADER_H + FOOTER_H) / CHAR_H
 }
 
-fn render_impl(
-    editor: &Editor,
-    caret_on: bool,
-    tree: Option<&super::tree::FileTree>,
-    caret_only: bool,
-) {
+fn layout(editor: &Editor, tree: Option<&super::tree::FileTree>) -> Option<Layout> {
     let (w, h) = framebuffer::dimensions();
     if w == 0 || h == 0 {
-        return;
+        return None;
     }
-    // The sidebar takes a fixed share of the width, and the text area gets the
-    // rest: the tree is context, the text is the work.
     let tree_cols = if tree.is_some() { TREE_COLS } else { 0 };
-    let cols = (w / CHAR_W).saturating_sub(tree_cols);
-    let rows = h.saturating_sub(HEADER_H + FOOTER_H) / CHAR_H;
-    let gutter = if editor.config.line_numbers {
-        7usize
+    Some(Layout {
+        w,
+        h,
+        tree_cols,
+        cols: (w / CHAR_W).saturating_sub(tree_cols),
+        rows: body_rows(h),
+        gutter: if editor.config.line_numbers { 7 } else { 0 },
+        foot: h.saturating_sub(FOOTER_H),
+    })
+}
+
+/// Title strip at the top: path and modified marker.
+fn paint_header(fb: &mut framebuffer::FramebufferWriter, editor: &Editor, l: &Layout) {
+    let blue = editor.config.palette()[4];
+    fb.fill_rect(0, 0, l.w, HEADER_H, blue);
+    // Unsaved work is stated in the title, in words rather than a lone asterisk:
+    // "did my edit do anything" should be answerable at a glance, and an `*` next
+    // to a long path is not.
+    let title = if editor.dirty {
+        format!(" nano+  {}   [modified - ^S saves]", editor.path)
     } else {
-        0
+        format!(" nano+  {}", editor.path)
     };
-    let [bg, surface, text, muted, blue, green, red, select] = editor.config.palette();
-    cursor::hide();
-    let _ = framebuffer::with(|fb| {
-        if caret_only {
-            // Only the two cells the caret occupies can have changed.
-            paint_caret_bar(fb, editor, caret_on, tree, w);
-            return;
-        }
-        fb.fill_rect(0, 0, w, h, bg);
-        fb.fill_rect(0, 0, w, HEADER_H, blue);
-        // Unsaved work is stated in the title, in words rather than a lone
-        // asterisk: "did my edit do anything" should be answerable at a glance,
-        // and an `*` next to a long path is not.
-        let title = if editor.dirty {
-            format!(" nano+  {}   [modified - ^S saves]", editor.path)
+    fb.draw_text_px(
+        6,
+        3,
+        &clipped_ascii(&title, 0, l.cols.saturating_sub(1), false),
+        if editor.dirty { 0xFFE066 } else { 0xFFFFFF },
+        blue,
+    );
+}
+
+/// The sidebar: the project tree rooted at the edited file's directory.
+fn paint_tree(
+    fb: &mut framebuffer::FramebufferWriter,
+    editor: &Editor,
+    tree: &super::tree::FileTree,
+    l: &Layout,
+) {
+    let [_, surface, text, muted, _, _, _, _] = editor.config.palette();
+    let tw = l.tree_cols * CHAR_W;
+    fb.fill_rect(
+        0,
+        HEADER_H,
+        tw,
+        l.h.saturating_sub(HEADER_H + FOOTER_H),
+        surface,
+    );
+    let header = alloc::format!(" {} ", tree.root());
+    fb.draw_text_px(
+        2,
+        HEADER_H + 2,
+        &clipped_ascii(&header, 0, l.tree_cols.saturating_sub(1), false),
+        muted,
+        surface,
+    );
+    let list_y = HEADER_H + CHAR_H + 4;
+    let list_rows = l.rows.saturating_sub(1);
+    for vr in 0..list_rows {
+        let i = tree.top + vr;
+        let Some(row) = tree.rows().get(i) else {
+            break;
+        };
+        let y = list_y + vr * CHAR_H;
+        // Indent per depth, and a marker that says open/closed at a glance.
+        let indent = row.depth * 2;
+        let mark = if row.is_dir {
+            if row.expanded {
+                "v "
+            } else {
+                "> "
+            }
         } else {
-            format!(" nano+  {}", editor.path)
+            "  "
+        };
+        let text_line = alloc::format!("{}{}{}", " ".repeat(indent), mark, row.name);
+        let (fg, bg) = if i == tree.cursor {
+            (0x000000, 0xCCCCCC)
+        } else if row.is_dir {
+            (text, surface)
+        } else {
+            (muted, surface)
         };
         fb.draw_text_px(
-            6,
-            3,
-            &clipped_ascii(&title, 0, cols.saturating_sub(1), false),
-            if editor.dirty { 0xFFE066 } else { 0xFFFFFF },
-            blue,
+            2,
+            y,
+            &clipped_ascii(&text_line, 0, l.tree_cols.saturating_sub(1), false),
+            fg,
+            bg,
         );
-        // ── Sidebar: the project tree ──
-        if let Some(tree) = tree {
-            let tw = tree_cols * CHAR_W;
-            fb.fill_rect(
-                0,
-                HEADER_H,
-                tw,
-                h.saturating_sub(HEADER_H + FOOTER_H),
-                surface,
+    }
+}
+
+/// Repaint one editor row (background, gutter, text, search hit).
+///
+/// Fills its own background: incremental callers have no full-frame fill behind
+/// them, so the tail of a line that just got shorter must be wiped here.
+fn paint_editor_row(
+    fb: &mut framebuffer::FramebufferWriter,
+    editor: &Editor,
+    l: &Layout,
+    r: usize,
+    vr: usize,
+) {
+    let [bg, surface, text, muted, blue, _, _, select] = editor.config.palette();
+    let y = HEADER_H + vr * CHAR_H;
+    let x0 = l.tree_cols * CHAR_W;
+    fb.fill_rect(x0, y, l.w.saturating_sub(x0), CHAR_H, bg);
+    if r >= editor.lines.len() {
+        fb.draw_text_px(x0 + 8, y, "~", blue, bg);
+        return;
+    }
+    if editor.config.line_numbers {
+        fb.fill_rect(x0, y, l.gutter * CHAR_W, CHAR_H, surface);
+        let num = format!("{:>5} ", r + 1);
+        fb.draw_text_px(x0, y, &num, muted, surface);
+    }
+    let visible = clipped_ascii(
+        &editor.lines[r],
+        editor.left,
+        l.cols.saturating_sub(l.gutter),
+        editor.config.show_whitespace,
+    );
+    let tx = x0 + l.gutter * CHAR_W;
+    match editor.search_hit {
+        Some((hr, hc, hlen))
+            if hr == r && hc >= editor.left && hc < editor.left + visible.len() =>
+        {
+            let before = clipped_ascii(
+                &editor.lines[r],
+                editor.left,
+                hc - editor.left,
+                editor.config.show_whitespace,
             );
-            let header = alloc::format!(" {} ", tree.root());
-            fb.draw_text_px(
-                2,
-                HEADER_H + 2,
-                &clipped_ascii(&header, 0, tree_cols.saturating_sub(1), false),
-                muted,
-                surface,
-            );
-            let list_y = HEADER_H + CHAR_H + 4;
-            let list_rows = rows.saturating_sub(1);
-            for vr in 0..list_rows {
-                let i = tree.top + vr;
-                let Some(row) = tree.rows().get(i) else {
-                    break;
-                };
-                let y = list_y + vr * CHAR_H;
-                // Indent per depth, and a marker that says open/closed at a glance.
-                let indent = row.depth * 2;
-                let mark = if row.is_dir {
-                    if row.expanded {
-                        "v "
-                    } else {
-                        "> "
-                    }
-                } else {
-                    "  "
-                };
-                let text_line = alloc::format!("{}{}{}", " ".repeat(indent), mark, row.name);
-                let (fg, bg) = if i == tree.cursor {
-                    (0x000000, 0xCCCCCC)
-                } else if row.is_dir {
-                    (text, surface)
-                } else {
-                    (muted, surface)
-                };
+            let hit = clipped_ascii(&editor.lines[r], hc, hlen, editor.config.show_whitespace);
+            fb.draw_text_px(tx, y, &visible, text, bg);
+            fb.draw_text_px(tx + before.len() * CHAR_W, y, &hit, 0xFFFFFF, select);
+        }
+        _ => fb.draw_text_px(tx, y, &visible, text, bg),
+    }
+    // Selection highlight goes on last, over the text and over a search hit: what
+    // the user selected is what they will act on. The console has no blending, so
+    // this repaints the covered cells inverted (black on light) instead of tinting.
+    if let Some((c0, c1)) = selected_cols(editor, r) {
+        let vis_last = editor.left + visible.len().saturating_sub(1);
+        if !visible.is_empty() && c0 <= vis_last && c1 >= editor.left {
+            let from = c0.max(editor.left);
+            let to = c1.min(vis_last);
+            if from <= to {
+                let seg = clipped_ascii(
+                    &editor.lines[r],
+                    from,
+                    to - from + 1,
+                    editor.config.show_whitespace,
+                );
                 fb.draw_text_px(
-                    2,
+                    tx + (from - editor.left) * CHAR_W,
                     y,
-                    &clipped_ascii(&text_line, 0, tree_cols.saturating_sub(1), false),
-                    fg,
-                    bg,
+                    &seg,
+                    0x000000,
+                    select,
                 );
             }
         }
-        for vr in 0..rows {
-            let r = editor.top + vr;
-            let y = HEADER_H + vr * CHAR_H;
-            if r >= editor.lines.len() {
-                fb.draw_text_px(tree_cols * CHAR_W + 8, y, "~", blue, bg);
-                continue;
+    }
+}
+
+/// The document columns of line `r` covered by the selection, inclusive, or `None`
+/// when this row has no selected characters.
+///
+/// Selection ends are character positions (a drag includes the character under the
+/// pointer); the last character of a multi-row selection's last row is `b.col`, and
+/// rows in between are fully selected. An empty line has nothing to highlight.
+fn selected_cols(editor: &Editor, r: usize) -> Option<(usize, usize)> {
+    let (a, b) = editor.sel_bounds()?;
+    if r < a.row || r > b.row {
+        return None;
+    }
+    let line_len = editor.lines.get(r).map(|l| l.len()).unwrap_or(0);
+    if line_len == 0 {
+        return None;
+    }
+    let from = if r == a.row { a.col } else { 0 };
+    let to = if r == b.row { b.col } else { line_len - 1 };
+    let to = to.min(line_len - 1);
+    if from > to {
+        return None;
+    }
+    Some((from, to))
+}
+
+/// Map a pixel position to a document position when it is over the text pane.
+///
+/// The screen is cells of [`CHAR_W`]×[`CHAR_H`] pixels starting below the header;
+/// the sidebar and the line-number gutter are subtracted before the column is
+/// translated by the horizontal scroll offset. A click past the end of a line puts
+/// the caret at its end, never on a non-existent character.
+fn mouse_text_point(
+    editor: &Editor,
+    tree: Option<&super::tree::FileTree>,
+    mx: usize,
+    my: usize,
+) -> Option<SelPoint> {
+    let l = layout(editor, tree)?;
+    if my < HEADER_H || my >= l.foot {
+        return None;
+    }
+    let vr = (my - HEADER_H) / CHAR_H;
+    if vr >= l.rows {
+        return None;
+    }
+    let x0 = l.tree_cols * CHAR_W;
+    if mx < x0 {
+        return None;
+    }
+    let cell = (mx - x0) / CHAR_W;
+    let col_in_text = cell.saturating_sub(l.gutter);
+    let row = (editor.top + vr).min(editor.lines.len().saturating_sub(1));
+    let col = (editor.left + col_in_text).min(editor.lines[row].len());
+    Some(SelPoint { row, col })
+}
+
+/// What a click at `(mx, my)` hits: a document position, a sidebar row, or nothing.
+fn mouse_target(
+    editor: &Editor,
+    tree: Option<&super::tree::FileTree>,
+    mx: usize,
+    my: usize,
+) -> Option<Hit> {
+    let l = layout(editor, tree)?;
+    if my < HEADER_H || my >= l.foot {
+        return None;
+    }
+    if let Some(t) = tree {
+        if mx < l.tree_cols * CHAR_W {
+            // Same rows `paint_tree` lists: the root line, then one row per entry.
+            let list_y = HEADER_H + CHAR_H + 4;
+            if my < list_y {
+                return None;
             }
-            if editor.config.line_numbers {
-                let num = format!("{:>5} ", r + 1);
-                fb.draw_text_px(tree_cols * CHAR_W, y, &num, muted, surface);
+            let vr = (my - list_y) / CHAR_H;
+            let i = t.top + vr;
+            if i < t.rows().len() {
+                return Some(Hit::Tree(i));
             }
-            let visible = clipped_ascii(
-                &editor.lines[r],
-                editor.left,
-                cols.saturating_sub(gutter),
-                editor.config.show_whitespace,
-            );
-            if let Some((hr, hc, hlen)) = editor.search_hit {
-                if hr == r && hc >= editor.left && hc < editor.left + visible.len() {
-                    let before = clipped_ascii(
-                        &editor.lines[r],
-                        editor.left,
-                        hc - editor.left,
-                        editor.config.show_whitespace,
-                    );
-                    let hit =
-                        clipped_ascii(&editor.lines[r], hc, hlen, editor.config.show_whitespace);
-                    fb.draw_text_px(tree_cols * CHAR_W + gutter * CHAR_W, y, &visible, text, bg);
-                    fb.draw_text_px(
-                        tree_cols * CHAR_W + (gutter + before.len()) * CHAR_W,
-                        y,
-                        &hit,
-                        0xFFFFFF,
-                        select,
-                    );
-                } else {
-                    fb.draw_text_px(tree_cols * CHAR_W + gutter * CHAR_W, y, &visible, text, bg);
-                }
+            return None;
+        }
+    }
+    mouse_text_point(editor, tree, mx, my).map(Hit::Text)
+}
+
+/// Draw the footer strip: the status line (or the active prompt) and key hints.
+fn paint_footer(fb: &mut framebuffer::FramebufferWriter, editor: &Editor, l: &Layout) {
+    let [_, surface, text, _, _, green, red, _] = editor.config.palette();
+    let foot = l.foot;
+    fb.fill_rect(0, foot, l.w, FOOTER_H, surface);
+    let status = if let Some((mode, value)) = &editor.prompt {
+        format!(
+            "{}: {}_",
+            if *mode == PromptMode::Search {
+                "Search"
             } else {
-                fb.draw_text_px(tree_cols * CHAR_W + gutter * CHAR_W, y, &visible, text, bg);
-            }
+                "Line"
+            },
+            value
+        )
+    } else {
+        format!(
+            "{}   Ln {}, Col {}",
+            editor.status,
+            editor.row + 1,
+            editor.col + 1
+        )
+    };
+    fb.draw_text_px(
+        6,
+        foot + 2,
+        &clipped_ascii(&status, 0, l.cols.saturating_sub(1), false),
+        if editor.status.starts_with("Error") {
+            red
+        } else {
+            green
+        },
+        surface,
+    );
+    let dirty_hint = if editor.dirty {
+        "^S Save (modified)  ^Q Quit"
+    } else {
+        "^S Save  ^Q Quit"
+    };
+    fb.draw_text_px(
+        6,
+        foot + CHAR_H + 2,
+        &alloc::format!(
+            "{}  ^A Sel  ^C Copy  ^X Cut  ^B Files  ^F Find  ^K Line  ^U Paste",
+            dirty_hint
+        ),
+        if editor.dirty { 0xFFE066 } else { text },
+        surface,
+    );
+}
+
+/// The caret's pixel position, or `None` when it is off-screen or a prompt owns
+/// the footer.
+fn caret_position(editor: &Editor, l: &Layout) -> Option<(usize, usize)> {
+    if editor.prompt.is_some() || editor.row < editor.top || editor.col < editor.left {
+        return None;
+    }
+    let vr = editor.row - editor.top;
+    if vr >= l.rows {
+        return None;
+    }
+    let cx = (l.tree_cols + l.gutter + editor.col - editor.left) * CHAR_W;
+    if cx + 1 >= l.w {
+        return None;
+    }
+    Some((cx, HEADER_H + vr * CHAR_H))
+}
+
+/// Draw the caret bar on top of a row that has just been repainted.
+///
+/// Only the "on" phase needs drawing: the row under it was repainted immediately
+/// before, which is what restores the character the bar covers.
+fn paint_caret_bar(
+    fb: &mut framebuffer::FramebufferWriter,
+    editor: &Editor,
+    caret_on: bool,
+    l: &Layout,
+) {
+    let Some((cx, cy)) = caret_position(editor, l) else {
+        return;
+    };
+    if caret_on {
+        fb.fill_rect(cx, cy, 2, CHAR_H, super::caret::CARET_COLOR);
+    }
+}
+
+/// Repaint the whole frame: header, sidebar, every editor row, footer, caret.
+fn render_full(editor: &Editor, caret_on: bool, tree: Option<&super::tree::FileTree>) {
+    let Some(l) = layout(editor, tree) else {
+        return;
+    };
+    // Deferred: the restored background rides along with the frame flush below, so
+    // the arrow stays on the device while the frame is being painted.
+    cursor::hide_deferred();
+    let _ = framebuffer::with(|fb| {
+        let bg = editor.config.palette()[0];
+        fb.fill_rect(0, 0, l.w, l.h, bg);
+        paint_header(fb, editor, &l);
+        if let Some(t) = tree {
+            paint_tree(fb, editor, t, &l);
         }
-        let foot = h - FOOTER_H;
-        paint_footer(fb, editor, foot, w, cols);
-        // The caret: a blinking vertical bar in the left pixel column of the cell
-        // the next character will occupy — the same shape and color as the shell's
-        // caret, so the two read as one thing.
-        if editor.prompt.is_none() && editor.row >= editor.top && editor.col >= editor.left {
-            let cx = (tree_cols + gutter + editor.col - editor.left) * CHAR_W;
-            let cy = HEADER_H + (editor.row - editor.top) * CHAR_H;
-            if cx < w && caret_on {
-                fb.fill_rect(cx, cy, 2, CHAR_H, super::caret::CARET_COLOR);
-            }
+        for vr in 0..l.rows {
+            paint_editor_row(fb, editor, &l, editor.top + vr, vr);
         }
+        paint_footer(fb, editor, &l);
+        paint_caret_bar(fb, editor, caret_on, &l);
     });
-    // The console is RAM-backed; nothing is visible until the frame is flushed.
+    cursor::place_here_deferred();
     framebuffer::flush();
-    let _ = caret_only;
+}
+
+/// Repaint body rows `first..=last` (visible row indices), the footer and the
+/// caret. The header and sidebar are left alone.
+fn render_body(
+    editor: &Editor,
+    caret_on: bool,
+    tree: Option<&super::tree::FileTree>,
+    first: usize,
+    last: usize,
+) {
+    let Some(l) = layout(editor, tree) else {
+        return;
+    };
+    if l.rows == 0 {
+        return;
+    }
+    let last = last.min(l.rows - 1);
+    let first = first.min(last);
+    // Deferred: the restored background rides along with the frame flush below, so
+    // the arrow stays on the device while the frame is being painted.
+    cursor::hide_deferred();
+    let _ = framebuffer::with(|fb| {
+        for vr in first..=last {
+            paint_editor_row(fb, editor, &l, editor.top + vr, vr);
+        }
+        paint_footer(fb, editor, &l);
+        paint_caret_bar(fb, editor, caret_on, &l);
+    });
+    cursor::place_here_deferred();
+    framebuffer::flush();
+}
+
+/// Repaint the sidebar and footer (tree focus), plus the caret row so a blinking
+/// bar cannot be left stranded while the text pane is not being edited.
+fn render_tree(editor: &Editor, caret_on: bool, tree: Option<&super::tree::FileTree>) {
+    let Some(l) = layout(editor, tree) else {
+        return;
+    };
+    // Deferred: the restored background rides along with the frame flush below, so
+    // the arrow stays on the device while the frame is being painted.
+    cursor::hide_deferred();
+    let _ = framebuffer::with(|fb| {
+        if let Some(t) = tree {
+            paint_tree(fb, editor, t, &l);
+        }
+        if editor.prompt.is_none() {
+            if let Some(vr) = caret_position(editor, &l).map(|(_, y)| (y - HEADER_H) / CHAR_H) {
+                if vr < l.rows {
+                    paint_editor_row(fb, editor, &l, editor.top + vr, vr);
+                }
+            }
+        }
+        paint_footer(fb, editor, &l);
+        paint_caret_bar(fb, editor, caret_on, &l);
+    });
+    cursor::place_here_deferred();
+    framebuffer::flush();
+}
+
+/// Repaint only the footer (a live prompt is being typed into). No caret is drawn
+/// while a prompt owns the footer, so nothing else can have changed.
+fn render_footer_only(editor: &Editor, tree: Option<&super::tree::FileTree>) {
+    let Some(l) = layout(editor, tree) else {
+        return;
+    };
+    cursor::hide_deferred();
+    let _ = framebuffer::with(|fb| paint_footer(fb, editor, &l));
+    cursor::place_here_deferred();
+    framebuffer::flush();
+}
+
+/// Repaint the caret's row and the caret itself — the blink path.
+///
+/// Erasing the bar means putting the character underneath back, so the row is
+/// repainted rather than blanked with the background colour: a 2-pixel background
+/// strip would erase the left column of a mid-line glyph on every blink.
+fn render_blink(editor: &Editor, caret_on: bool, tree: Option<&super::tree::FileTree>) {
+    let Some(l) = layout(editor, tree) else {
+        return;
+    };
+    let Some(vr) = caret_position(editor, &l).map(|(_, y)| (y - HEADER_H) / CHAR_H) else {
+        return;
+    };
+    // Deferred: the restored background rides along with the frame flush below, so
+    // the arrow stays on the device while the frame is being painted.
+    cursor::hide_deferred();
+    let _ = framebuffer::with(|fb| {
+        paint_editor_row(fb, editor, &l, editor.top + vr, vr);
+        paint_caret_bar(fb, editor, caret_on, &l);
+    });
+    cursor::place_here_deferred();
+    framebuffer::flush();
 }
 
 pub fn run(path_arg: &str) {
@@ -711,7 +1268,7 @@ pub fn run(path_arg: &str) {
             return;
         }
     };
-    let mut node = node;
+    let node = node;
     let mut editor = Editor::new(&path, &text, NanoConfig::load());
     editor.tree_root = Some(parent_dir(&path));
     // The sidebar is visible from the start: seeing the project is the point of an
@@ -754,7 +1311,8 @@ fn event_loop(
     if let Some(root) = editor.tree_root.clone() {
         *tree = Some(super::tree::FileTree::new(&root));
         if let Some(t) = tree.as_mut() {
-            t.view_rows = 20;
+            let (_, h) = framebuffer::dimensions();
+            t.view_rows = body_rows(h).saturating_sub(1);
             // Put the highlight on the file being edited, not on the first entry:
             // the tree should show where you are.
             let current = editor.path.clone();
@@ -765,11 +1323,10 @@ fn event_loop(
         }
     }
     let mut last_phase = blink();
-    let mut caret_cell = caret_cell_of(&editor, tree.as_ref());
-    // Cursor position before the current key, so the repaint after it can touch only
-    // the rows that key actually changed (usually one).
-    let mut before = (editor.row, editor.col);
-    render(&editor, last_phase, tree.as_ref());
+    // Previous left-button state, for edge detection. The PS/2 driver reports the
+    // button as a level, so "pressed" is a rising edge, not `left == true`.
+    let mut prev_left = false;
+    render_full(&editor, last_phase, tree.as_ref());
     'app: loop {
         crate::arch::cpu::halt();
         while let Some(sc) = super::try_read_scancode() {
@@ -778,7 +1335,19 @@ fn event_loop(
             };
             if editor.prompt.is_some() {
                 editor.handle_prompt(event);
-                render(&editor, blink(), tree.as_ref());
+                // A committed/cancelled prompt moves the cursor and may highlight a
+                // search hit elsewhere on screen; typing into it only changes the
+                // footer line.
+                if matches!(
+                    event,
+                    KeyEvent::Enter | KeyEvent::Escape | KeyEvent::Ctrl('q')
+                ) {
+                    last_phase = blink();
+                    render_full(&editor, last_phase, tree.as_ref());
+                } else {
+                    last_phase = blink();
+                    render_footer_only(&editor, tree.as_ref());
+                }
                 continue;
             }
 
@@ -794,14 +1363,16 @@ fn event_loop(
                     } else {
                         break 'app;
                     }
-                    render(&editor, blink(), tree.as_ref());
+                    last_phase = blink();
+                    render_full(&editor, last_phase, tree.as_ref());
                     continue;
                 }
                 KeyEvent::Ctrl('s') => {
                     if let Err(e) = save(&mut editor, &node) {
                         editor.status = format!("Error saving: {:?}", e)
                     }
-                    render(&editor, blink(), tree.as_ref());
+                    last_phase = blink();
+                    render_full(&editor, last_phase, tree.as_ref());
                     continue;
                 }
                 KeyEvent::Ctrl('b') => {
@@ -811,9 +1382,14 @@ fn event_loop(
                     } else {
                         *tree = Some(super::tree::FileTree::new(&parent_dir(&editor.path)));
                         pane = Pane::Tree;
+                        if let Some(t) = tree.as_mut() {
+                            let (_, h) = framebuffer::dimensions();
+                            t.view_rows = body_rows(h).saturating_sub(1);
+                        }
                     }
                     *tree_focus = pane == Pane::Tree;
-                    render(&editor, blink(), tree.as_ref());
+                    last_phase = blink();
+                    render_full(&editor, last_phase, tree.as_ref());
                     continue;
                 }
                 _ => {}
@@ -821,6 +1397,11 @@ fn event_loop(
 
             // ── Sidebar focus: the tree owns the arrow keys and Enter ──
             if pane == Pane::Tree {
+                let mut switched = false;
+                // Set when a file switch was refused because the buffer is dirty: the
+                // sidebar must then snap its highlight back to the file that is
+                // actually open, or it claims you are editing a file you are not.
+                let mut refused = false;
                 match event {
                     KeyEvent::Up => {
                         if let Some(t) = tree.as_mut() {
@@ -838,17 +1419,23 @@ fn event_loop(
                         }
                     }
                     KeyEvent::Right | KeyEvent::Enter => {
-                        if let Some(t) = tree.as_mut() {
-                            if let Some(path) = t.activate() {
-                                // Switching files with unsaved changes would silently
-                                // drop them, so it is refused instead.
-                                if editor.dirty {
-                                    editor.status =
-                                        "Unsaved changes — ^S to save, or ^B to go back".into();
-                                } else if let Ok((n, text)) = open_or_create(&path) {
-                                    editor.reload(&path, &text);
-                                    node = n;
-                                }
+                        if let Some(path) = tree.as_mut().and_then(|t| t.activate()) {
+                            // Switching files with unsaved changes would silently
+                            // drop them, so it is refused instead.
+                            if editor.dirty {
+                                editor.status =
+                                    "Unsaved changes — ^S to save, ^Q to discard".into();
+                                refused = true;
+                            } else if let Ok((n, text)) = open_or_create(&path) {
+                                editor.reload(&path, &text);
+                                node = n;
+                                switched = true;
+                                // Opening a file is an intent to edit it: the keyboard
+                                // goes back to the text, so the very next keystroke is
+                                // typing instead of tree navigation. (Opening a
+                                // directory keeps the focus here for arrow-key walking.)
+                                pane = Pane::Text;
+                                *tree_focus = false;
                             }
                         }
                     }
@@ -861,46 +1448,106 @@ fn event_loop(
                     _ => {}
                 }
                 if let Some(t) = tree.as_mut() {
+                    let (_, h) = framebuffer::dimensions();
+                    t.view_rows = body_rows(h).saturating_sub(1);
+                    if refused {
+                        // The switch was refused: the highlight had already moved to
+                        // the clicked row, so put it back on the open file.
+                        focus_tree_on(&editor, t);
+                    }
                     t.ensure_visible();
                 }
-                render(&editor, blink(), tree.as_ref());
+                last_phase = blink();
+                if switched {
+                    render_full(&editor, last_phase, tree.as_ref());
+                } else {
+                    render_tree(&editor, last_phase, tree.as_ref());
+                }
                 continue;
             }
 
+            // ── Text focus ──
+            let before = (
+                editor.row,
+                editor.col,
+                editor.top,
+                editor.left,
+                editor.lines.len(),
+            );
             match event {
-                KeyEvent::Char(c) => editor.insert(c),
-                KeyEvent::Enter => editor.newline(),
-                KeyEvent::Backspace => editor.backspace(),
-                KeyEvent::Delete => editor.delete(),
-                KeyEvent::Left => editor.left(),
-                KeyEvent::Right => editor.right(),
-                KeyEvent::Up => editor.up(),
-                KeyEvent::Down => editor.down(),
+                // Editing keys act on the selection when there is one: typing
+                // replaces it, Backspace/Delete remove it, and `^A` + Delete clears
+                // the whole line (or the whole file) instead of deleting one
+                // character. Ignoring the visible selection here was the bug the
+                // first user hit within a minute of opening the editor.
+                KeyEvent::Char(c) => {
+                    editor.delete_selection();
+                    editor.insert(c)
+                }
+                KeyEvent::Enter => {
+                    editor.delete_selection();
+                    editor.newline()
+                }
+                KeyEvent::Backspace => {
+                    if !editor.delete_selection() {
+                        editor.backspace()
+                    }
+                }
+                KeyEvent::Delete => {
+                    if !editor.delete_selection() {
+                        editor.delete()
+                    }
+                }
+                // Plain caret movement cancels the selection, like every editor.
+                KeyEvent::Left => {
+                    editor.clear_selection();
+                    editor.left()
+                }
+                KeyEvent::Right => {
+                    editor.clear_selection();
+                    editor.right()
+                }
+                KeyEvent::Up => {
+                    editor.clear_selection();
+                    editor.up()
+                }
+                KeyEvent::Down => {
+                    editor.clear_selection();
+                    editor.down()
+                }
                 KeyEvent::Home => {
+                    editor.clear_selection();
                     editor.col = 0;
                     editor.ensure_visible()
                 }
                 KeyEvent::End => {
+                    editor.clear_selection();
                     editor.col = editor.lines[editor.row].len();
                     editor.ensure_visible()
                 }
                 KeyEvent::PageUp => {
+                    editor.clear_selection();
                     for _ in 0..12 {
                         editor.up()
                     }
                 }
                 KeyEvent::PageDown => {
+                    editor.clear_selection();
                     for _ in 0..12 {
                         editor.down()
                     }
                 }
                 KeyEvent::Tab => {
+                    editor.delete_selection();
                     for _ in 0..editor.config.tab_size {
                         editor.insert(' ')
                     }
                 }
                 KeyEvent::Escape => {
-                    if editor.dirty && !editor.quit_armed {
+                    if editor.has_selection() {
+                        // Esc first drops a selection; quitting is the next key.
+                        editor.clear_selection();
+                    } else if editor.dirty && !editor.quit_armed {
                         editor.quit_armed = true;
                         editor.status = "Unsaved changes — press ^Q again to quit".into()
                     } else {
@@ -919,247 +1566,196 @@ fn event_loop(
                 KeyEvent::Ctrl('g') => editor.begin_prompt(PromptMode::Goto),
                 KeyEvent::Ctrl('z') => editor.undo(),
                 KeyEvent::Ctrl('y') => editor.redo(),
-                KeyEvent::Ctrl('c') => editor.copy_line(),
-                KeyEvent::Ctrl('k') => editor.cut_line(),
-                KeyEvent::Ctrl('u') | KeyEvent::Ctrl('v') => editor.paste_line(),
+                // `^A` selects everything; `^C`/`^K`/`^X` copy and cut the
+                // selection when one exists and fall back to their line behaviour
+                // when none does. That keeps the classic bindings and gives the
+                // mouse selection somewhere to go.
+                KeyEvent::Ctrl('a') => editor.select_all(),
+                KeyEvent::Ctrl('c') => {
+                    if let Some(text) = editor.sel_text() {
+                        let n = text.chars().count();
+                        editor.sel_clip = text;
+                        editor.status = format!("Copied {} char(s)", n);
+                    } else {
+                        editor.copy_line();
+                    }
+                }
+                KeyEvent::Ctrl('x') | KeyEvent::Ctrl('k') => {
+                    if let Some(text) = editor.sel_text() {
+                        let n = text.chars().count();
+                        editor.sel_clip = text;
+                        editor.delete_selection();
+                        editor.status = format!("Cut {} char(s)", n);
+                    } else {
+                        editor.cut_line();
+                    }
+                }
+                KeyEvent::Ctrl('u') | KeyEvent::Ctrl('v') => {
+                    if editor.sel_clip.is_empty() {
+                        editor.paste_line();
+                    } else {
+                        let text = editor.sel_clip.clone();
+                        editor.delete_selection();
+                        editor.insert_text(&text);
+                        editor.status = "Pasted".into();
+                    }
+                }
                 _ => {}
             }
-            // A keystroke changed one line and the cursor column, so repaint that
-            // line and the caret — not the whole frame. Refreshing everything here
-            // is what made typing feel slow, and (because a frame takes longer than
-            // the gap between keystrokes) left the screen showing half-drawn
-            // frames, which is why an edit looked like it had not landed until
-            // something else forced a redraw.
-            // Repaint the frame on every keystroke. The console is RAM-backed now, so
-            // this costs a `memcpy` of the changed rectangle rather than tens of
-            // thousands of uncached pixel writes — cheap enough that the per-row
-            // special case this replaced is not worth its failure modes (it missed
-            // updates whenever the cursor moved without the row changing).
-            render(&editor, blink(), tree.as_ref());
-            before = (editor.row, editor.col);
+            last_phase = blink();
+            if editor.prompt.is_some() {
+                // ^F/^R/^G opened a prompt: repaint the frame so the caret bar on
+                // its old row is erased and the footer shows the prompt.
+                render_full(&editor, last_phase, tree.as_ref());
+            } else if editor.top != before.2 || editor.left != before.3 {
+                // Scrolling (or a very long line) moved the whole viewport.
+                render_full(&editor, last_phase, tree.as_ref());
+            } else if editor.lines.len() != before.4 {
+                // Rows below the edit shifted: repaint from the changed row down.
+                let first = before.0.min(editor.row).saturating_sub(editor.top);
+                render_body(
+                    &editor,
+                    last_phase,
+                    tree.as_ref(),
+                    first,
+                    body_rows(framebuffer::dimensions().1).saturating_sub(1),
+                );
+            } else {
+                // Only the rows the caret moved between (usually one) changed.
+                let a = before.0.saturating_sub(editor.top);
+                let b = editor.row.saturating_sub(editor.top);
+                render_body(&editor, last_phase, tree.as_ref(), a.min(b), a.max(b));
+            }
         }
-        // Blink: repaint **only the caret cell**, and only when the phase changes.
-        //
-        // `halt()` returns on every timer tick (1 kHz), so a full repaint per wake
-        // rebuilt the whole screen a thousand times a second: frames were caught
-        // half-drawn (which reads as tearing) and the cost landed between
-        // keystrokes, which is what made the editor feel slow. A full frame is drawn
-        // when something actually changes — a keystroke, a navigation — and the
-        // blink touches two cells, twice per period.
+        // ── Mouse ────────────────────────────────────────────────────────
+        // Clicking used to do nothing at all in the editor: the arrow was drawn,
+        // the buttons were never read. A click places the caret, a drag selects
+        // text (and the caret follows the drag), and a click on a sidebar row
+        // focuses/activates it.
+        let mouse = crate::drivers::ps2_mouse::poll();
+        let pressed = mouse.left && !prev_left;
+        let released = !mouse.left && prev_left;
+        prev_left = mouse.left;
+        let mut mouse_changed = false;
+        let mut mouse_full = false;
+        if pressed {
+            match mouse_target(&editor, tree.as_ref(), mouse.x, mouse.y) {
+                Some(Hit::Text(p)) => {
+                    let old_row = editor.row;
+                    editor.clear_selection();
+                    mouse_full = editor.set_cursor(p);
+                    editor.begin_select(p);
+                    if !mouse_full {
+                        let a = old_row.saturating_sub(editor.top);
+                        let b = editor.row.saturating_sub(editor.top);
+                        last_phase = blink();
+                        render_body(&editor, last_phase, tree.as_ref(), a.min(b), a.max(b));
+                    }
+                    mouse_changed = true;
+                }
+                Some(Hit::Tree(i)) => {
+                    pane = Pane::Tree;
+                    *tree_focus = true;
+                    if let Some(t) = tree.as_mut() {
+                        t.cursor = i;
+                    }
+                    // A click on a file row opens it; on a directory it just
+                    // focuses the row (Enter/Right still expands).
+                    let target = tree.as_mut().and_then(|t| t.activate());
+                    if let Some(path) = target {
+                        if editor.dirty {
+                            editor.status = "Unsaved changes — ^S to save, ^Q to discard".into();
+                            if let Some(t) = tree.as_mut() {
+                                focus_tree_on(&editor, t);
+                            }
+                        } else if let Ok((n, text)) = open_or_create(&path) {
+                            editor.reload(&path, &text);
+                            node = n;
+                            // Clicking a file row opens it *and* hands the keyboard
+                            // back to the text: leaving the sidebar focused is what made
+                            // the editor look dead after a few file switches — every
+                            // key was going to the tree.
+                            pane = Pane::Text;
+                            *tree_focus = false;
+                        }
+                    }
+                    mouse_full = true;
+                    mouse_changed = true;
+                }
+                None => {}
+            }
+        } else if mouse.left && editor.sel.anchor.is_some() {
+            // Drag: extend the selection to the cell under the pointer and move the
+            // caret with it, so typing after a drag lands at the pointer.
+            if let Some(p) = mouse_text_point(&editor, tree.as_ref(), mouse.x, mouse.y) {
+                let prev_head = editor.sel.head.map(|q| q.row);
+                let old_row = editor.row;
+                editor.extend_select(p);
+                mouse_full = editor.set_cursor(p);
+                if !mouse_full {
+                    let mut lo = p.row;
+                    let mut hi = p.row;
+                    for r in [old_row, p.row]
+                        .into_iter()
+                        .chain(prev_head)
+                        .chain(editor.sel.anchor.map(|q| q.row))
+                    {
+                        lo = lo.min(r);
+                        hi = hi.max(r);
+                    }
+                    let lo_vr = lo.saturating_sub(editor.top);
+                    let hi_vr = hi
+                        .saturating_sub(editor.top)
+                        .min(body_rows(framebuffer::dimensions().1).saturating_sub(1));
+                    if lo_vr <= hi_vr {
+                        last_phase = blink();
+                        render_body(&editor, last_phase, tree.as_ref(), lo_vr, hi_vr);
+                    }
+                }
+                mouse_changed = true;
+            }
+        } else if released && editor.sel.is_empty() {
+            editor.clear_selection();
+        }
+        if mouse_changed && mouse_full {
+            last_phase = blink();
+            render_full(&editor, last_phase, tree.as_ref());
+        }
+        // The arrow: `move_to` is idempotent (it returns early when the pointer
+        // has not moved), so this is a comparison per timer tick, not a redraw.
+        cursor::move_to(mouse.x, mouse.y);
+        // Blink: repaint the caret's row and the bar, only when the phase changed.
+        // 1 kHz wakes are too fast for that to be anything but two screen changes
+        // per second.
         let phase = blink();
         if phase != last_phase {
             last_phase = phase;
-            // Erase the bar where it was, then paint the new phase where it is:
-            // the two can differ because the cursor moved between blinks.
-            let prev = caret_cell;
-            let now = caret_cell_of(&editor, tree.as_ref());
-            caret_cell = now;
-            let _ = framebuffer::with(|fb| {
-                let bg = editor.config.palette()[0];
-                if let Some((px, py)) = prev {
-                    fb.fill_rect(px, py, 2, CHAR_H, bg);
-                }
-                if let Some((cx, cy)) = now {
-                    if phase {
-                        fb.fill_rect(cx, cy, 2, CHAR_H, super::caret::CARET_COLOR);
-                    }
-                }
-            });
+            render_blink(&editor, phase, tree.as_ref());
         }
     }
     let _ = tree_focus;
 }
 
-/// Draw the footer strip: the status line (or the active prompt) and the key hints.
-///
-/// Split out so a keystroke can refresh it without repainting the text body: the
-/// `Ln, Col` readout and the modified flag live here, and they change on almost
-/// every key.
-fn paint_footer(
-    fb: &mut crate::drivers::framebuffer::FramebufferWriter,
-    editor: &Editor,
-    foot: usize,
-    w: usize,
-    cols: usize,
-) {
-    let [_, _, _, _, _, green, red, _] = editor.config.palette();
-    let surface = editor.config.palette()[1];
-    let text = editor.config.palette()[2];
-    fb.fill_rect(0, foot, w, FOOTER_H, surface);
-    let status = if let Some((mode, value)) = &editor.prompt {
-        format!(
-            "{}: {}_",
-            if *mode == PromptMode::Search {
-                "Search"
-            } else {
-                "Line"
-            },
-            value
-        )
-    } else {
-        format!(
-            "{}   Ln {}, Col {}",
-            editor.status,
-            editor.row + 1,
-            editor.col + 1
-        )
-    };
-    fb.draw_text_px(
-        6,
-        foot + 2,
-        &clipped_ascii(&status, 0, cols.saturating_sub(1), false),
-        if editor.status.starts_with("Error") {
-            red
-        } else {
-            green
-        },
-        surface,
-    );
-    let dirty_hint = if editor.dirty {
-        "^S Save (modified)  ^Q Quit"
-    } else {
-        "^S Save  ^Q Quit"
-    };
-    fb.draw_text_px(
-        6,
-        foot + 20,
-        &alloc::format!(
-            "{}  ^B Files  ^F Find  ^R Replace  ^K Cut  ^U Paste  ^Z Undo",
-            dirty_hint
-        ),
-        if editor.dirty { 0xFFE066 } else { text },
-        surface,
-    );
-}
-
-/// Repaint just the footer strip.
-fn render_footer(editor: &Editor) {
-    let (w, h) = framebuffer::dimensions();
-    if w == 0 || h == 0 {
-        return;
-    }
-    let tree_cols = 0usize;
-    let cols = (w / CHAR_W).saturating_sub(tree_cols);
-    let foot = h - FOOTER_H;
-    let _ = framebuffer::with(|fb| {
-        fb.fill_rect(0, foot, w, FOOTER_H, editor.config.palette()[1]);
-        paint_footer(fb, editor, foot, w, cols);
-    });
-    framebuffer::flush();
-}
-
-/// Repaint one editor row (and the gutter beside it).
-///
-/// One keystroke changes one line — the row the cursor is on — and the cursor's
-/// own column. Repainting the whole frame for that is what made editing feel slow:
-/// a full frame is ~18 000 pixel writes, and `put_pixel` writes the framebuffer
-/// through three separate volatile stores per pixel, so on this machine a frame is
-/// tens of milliseconds. One row is ~130 writes.
-fn paint_editor_row(
-    fb: &mut crate::drivers::framebuffer::FramebufferWriter,
-    editor: &Editor,
-    r: usize,
-    vr: usize,
-    tree_cols: usize,
-    gutter: usize,
-    cols: usize,
-) {
-    let y = HEADER_H + vr * CHAR_H;
-    let bg = editor.config.palette()[0];
-    let surface = editor.config.palette()[1];
-    let text = editor.config.palette()[2];
-    let muted = editor.config.palette()[3];
-    let blue = editor.config.palette()[4];
-    let select = editor.config.palette()[7];
-    let x0 = tree_cols * CHAR_W;
-    if r >= editor.lines.len() {
-        fb.draw_text_px(x0 + 8, y, "~", blue, bg);
-        return;
-    }
-    if editor.config.line_numbers {
-        let num = format!("{:>5} ", r + 1);
-        fb.draw_text_px(x0, y, &num, muted, surface);
-    }
-    let visible = clipped_ascii(
-        &editor.lines[r],
-        editor.left,
-        cols.saturating_sub(gutter),
-        editor.config.show_whitespace,
-    );
-    let tx = x0 + gutter * CHAR_W;
-    match editor.search_hit {
-        Some((hr, hc, hlen))
-            if hr == r && hc >= editor.left && hc < editor.left + visible.len() =>
-        {
-            let before = clipped_ascii(
-                &editor.lines[r],
-                editor.left,
-                hc - editor.left,
-                editor.config.show_whitespace,
-            );
-            let hit = clipped_ascii(&editor.lines[r], hc, hlen, editor.config.show_whitespace);
-            fb.draw_text_px(tx, y, &visible, text, bg);
-            fb.draw_text_px(tx + before.len() * CHAR_W, y, &hit, 0xFFFFFF, select);
-        }
-        _ => fb.draw_text_px(tx, y, &visible, text, bg),
-    }
-}
-
-/// Where the caret cell is, in pixels, or `None` when it is off-screen or a
-/// prompt is showing. Used by the blink path so it can erase the previous bar.
-fn caret_cell_of(editor: &Editor, tree: Option<&super::tree::FileTree>) -> Option<(usize, usize)> {
-    if editor.prompt.is_some() || editor.row < editor.top || editor.col < editor.left {
-        return None;
-    }
-    let tree_cols = if tree.is_some() { TREE_COLS } else { 0 };
-    let gutter = if editor.config.line_numbers {
-        7usize
-    } else {
-        0
-    };
-    Some((
-        (tree_cols + gutter + editor.col - editor.left) * CHAR_W,
-        HEADER_H + (editor.row - editor.top) * CHAR_H,
-    ))
-}
-
-/// Repaint just the caret bar for the current cursor position.
-///
-/// Erasing costs nothing extra: the cell is painted with the caret's own cell
-/// background first, which is what the full render would have drawn there anyway.
-fn paint_caret_bar(
-    fb: &mut crate::drivers::framebuffer::FramebufferWriter,
-    editor: &Editor,
-    caret_on: bool,
-    tree: Option<&super::tree::FileTree>,
-    w: usize,
-) {
-    let tree_cols = if tree.is_some() { TREE_COLS } else { 0 };
-    let gutter = if editor.config.line_numbers {
-        7usize
-    } else {
-        0
-    };
-    if editor.prompt.is_some() || editor.row < editor.top || editor.col < editor.left {
-        return;
-    }
-    let bg = editor.config.palette()[0];
-    let cx = (tree_cols + gutter + editor.col - editor.left) * CHAR_W;
-    let cy = HEADER_H + (editor.row - editor.top) * CHAR_H;
-    if cx >= w {
-        return;
-    }
-    // Clear the two pixels the bar occupies, then draw it when lit. Clearing is
-    // what erases a caret from the previous phase without repainting the screen.
-    fb.fill_rect(cx, cy, 2, CHAR_H, bg);
-    if caret_on {
-        fb.fill_rect(cx, cy, 2, CHAR_H, super::caret::CARET_COLOR);
-    }
-}
-
 /// The caret's blink phase, shared with the shell so both carets blink together.
 fn blink() -> bool {
     super::caret::Caret::blink_on(crate::task::scheduler::ticks())
+}
+
+/// Put the sidebar highlight back on the file that is actually open.
+///
+/// Used when a switch is refused (unsaved changes): the tree had already moved its
+/// highlight to the clicked row, and leaving it there claims the editor is showing a
+/// file it is not. Returns whether the highlight moved.
+fn focus_tree_on(editor: &Editor, tree: &mut super::tree::FileTree) -> bool {
+    let current = editor.path.clone();
+    match tree.rows().iter().position(|r| r.path == current) {
+        Some(i) if i != tree.cursor => {
+            tree.cursor = i;
+            tree.ensure_visible();
+            true
+        }
+        _ => false,
+    }
 }
 
 /// The directory containing `path`, used to root the tree beside the edited file.

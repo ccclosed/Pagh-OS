@@ -174,9 +174,14 @@ impl Decoder {
                         Some(KeyEvent::Ctrl(ch.to_ascii_lowercase()))
                     }
                     Some(mut ch) if ch != '\n' && ch != '\t' => {
-                        // CapsLock flips the case of letters relative to Shift:
-                        // effective case = shift XOR caps.
-                        if ch.is_ascii_alphabetic() && self.caps != self.shift {
+                        // `scancode_to_ascii` has already applied Shift, so the
+                        // only case flip left is CapsLock: it turns the letter
+                        // around *relative to whatever Shift produced*, which is
+                        // the standard caps-XOR-shift rule. Comparing the two
+                        // modifiers here (`caps != shift`) double-counted Shift
+                        // and made Shift+letter type lowercase whenever CapsLock
+                        // was off — the inverse of what a keyboard does.
+                        if ch.is_ascii_alphabetic() && self.caps {
                             ch = if ch.is_ascii_lowercase() {
                                 ch.to_ascii_uppercase()
                             } else {

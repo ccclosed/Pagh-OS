@@ -29,24 +29,42 @@ pub enum Style {
     Success,
 }
 
-/// Foreground color (0xRRGGBB) for normal text and user input. Legible on the
-/// existing background (R8.6); also the framebuffer driver's own default.
-pub const COLOR_DEFAULT: u32 = 0xFFFFFF;
+/// Active colors, one per [`Style`]. Seeded with the historical values so an
+/// untouched boot looks exactly as it did before themes existed.
+static PALETTE: crate::sync::spinlock::Spinlock<[u32; 4]> =
+    crate::sync::spinlock::Spinlock::new([0xFFFFFF, 0x55FF55, 0xFF5555, 0x55FFFF]);
+
+/// Foreground color (0xRRGGBB) for normal text and user input (R8.6).
+pub fn color_default() -> u32 {
+    PALETTE.lock()[0]
+}
 /// Foreground color for the prompt (R8.3).
-pub const COLOR_PROMPT: u32 = 0x55FF55;
+pub fn color_prompt() -> u32 {
+    PALETTE.lock()[1]
+}
 /// Foreground color for error lines (R8.2).
-pub const COLOR_ERROR: u32 = 0xFF5555;
+pub fn color_error() -> u32 {
+    PALETTE.lock()[2]
+}
 /// Foreground color for success / confirmation lines (R8.4).
-pub const COLOR_SUCCESS: u32 = 0x55FFFF;
+pub fn color_success() -> u32 {
+    PALETTE.lock()[3]
+}
+
+/// Replace the whole palette — what `shell::theme::apply` calls. One lock, so a
+/// reader can never observe half of a new theme.
+pub fn set_colors(text: u32, prompt: u32, error: u32, success: u32) {
+    *PALETTE.lock() = [text, prompt, error, success];
+}
 
 impl Style {
     /// The framebuffer foreground color (0xRRGGBB) for this style.
     pub fn color(self) -> u32 {
         match self {
-            Style::Default => COLOR_DEFAULT,
-            Style::Prompt => COLOR_PROMPT,
-            Style::Error => COLOR_ERROR,
-            Style::Success => COLOR_SUCCESS,
+            Style::Default => color_default(),
+            Style::Prompt => color_prompt(),
+            Style::Error => color_error(),
+            Style::Success => color_success(),
         }
     }
 }
@@ -62,7 +80,7 @@ impl Style {
 pub fn with_style(style: Style, f: impl FnOnce()) {
     framebuffer::set_fg_color(style.color());
     f();
-    framebuffer::set_fg_color(COLOR_DEFAULT);
+    framebuffer::set_fg_color(color_default());
 }
 
 /// Print `text` as a full line in `style`'s color on the framebuffer (reset to

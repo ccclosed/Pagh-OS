@@ -22,6 +22,7 @@ pub(crate) mod registry;
 pub(crate) mod render;
 pub(crate) mod selection;
 pub(crate) mod suggest;
+pub(crate) mod theme;
 pub(crate) mod toolchain;
 pub(crate) mod tree;
 
@@ -55,6 +56,32 @@ fn erase_visible(n: usize) {
 /// drives the erase count in [`redraw_line`].
 fn visible_len(s: &str) -> usize {
     s.chars().count()
+}
+
+/// Delete the active selection from the line, telling the caller whether there
+/// was one to delete.
+///
+/// The line indices come from the keyboard selection's own record when it has one
+/// (`Ctrl+A` builds the selection from the buffer, so its indices are exact);
+/// a mouse drag is mapped back from cells. When neither yields a range the
+/// selection is dropped — a highlight that cannot be edited is a lie.
+fn delete_selection(editor: &mut editor::LineEditor, selection: &mut selection::Selection) -> bool {
+    let Some(range) = selection.range() else {
+        return false;
+    };
+    let cols = console_cols();
+    let indices = selection
+        .known_line_range()
+        .or_else(|| range.line_indices(prompt_cols(), cols, editor.buffer().chars().count()));
+    let Some((from, to)) = indices else {
+        selection.clear();
+        return false;
+    };
+    // Clear first: `unpaint` restores the cells the highlight covered, and the
+    // caller's `redraw_line` then reprints the shortened buffer over them.
+    selection.clear();
+    editor.replace_range(from, to);
+    true
 }
 
 /// Redraw the current input region so the console reflects the editor buffer
@@ -308,8 +335,18 @@ pub fn shell_main() -> ! {
         crate::drivers::cursor::move_to(fw / 2, fh / 2);
     }
 
+    // Push the saved theme into the drivers before the first prompt. Without this
+    // the palette reaches the screen only when a command changes it, and the console
+    // keeps the driver defaults (black background, white text) until then — the
+    // wallpaper then paints the area *outside* the text grid, because every grid
+    // cell repaints its own background in the old colour.
+    theme::apply();
+
     // One caret for the whole session: it must erase itself at the cell it was
     // drawn at, and that cell is not recoverable from the buffer alone.
+    // The caret is tracked even when hidden: `Caret` remembers the cell it erased,
+    // so turning it back on draws it where the cursor actually is instead of at a
+    // stale position.
     let mut caret = caret::Caret::new();
     // One selection for the whole session (a drag outlives a single loop pass), and
     // the clipboard it feeds. The clipboard is session-scoped on purpose: it is
@@ -320,6 +357,16 @@ pub fn shell_main() -> ! {
     let mut status_cache: Option<(alloc::string::String, alloc::string::String)> = None;
 
     loop {
+        // A theme switch invalidates everything drawn so far: the *model* stores a
+        // colour per cell (`grid_fg`), and that colour is whatever was current when
+        // the cell was written. Repainting pixels is not enough — the cells have to
+        // be reprinted through the new palette, so the prompt is redrawn on a fresh
+        // line and the status text is forgotten so the strip repaints too.
+        if theme::take_force_redraw() {
+            crate::fb_println!();
+            status_cache = None;
+        }
+
         // CWD-aware prompt, e.g. `pagh:/> ` (R5.1–R5.3).
         render::prompt(&path::cwd());
 
@@ -329,28 +376,59 @@ pub fn shell_main() -> ! {
         caret.reset();
 
         // Read keys until Enter.
+        // Wake-up bookkeeping for the idle skip below: sentinels force the first
+        // pass to run (`mouse.seq` is never `u64::MAX`).
+        let mut last_mouse_seq = u64::MAX;
+        let mut last_secs = u64::MAX;
+        let mut last_blink = caret::Caret::blink_on(crate::task::scheduler::ticks());
         loop {
             // Idle on halt until an interrupt delivers an event (R11.5).
             crate::arch::cpu::halt();
 
-            // Live overlay: hide the cursor, repaint the status bar, then drain
-            // and process ALL pending scancodes with the cursor hidden (so
-            // glyph output never clobbers its saved background). The cursor is
-            // redrawn exactly once afterwards.
+            // A timer tick wakes the shell every millisecond, but there is only
+            // work when something that can change the screen changed: a scancode
+            // arrived, the pointer moved (a button packet bumps the same `seq`),
+            // the status strip's clock ticked over, or the caret's blink phase
+            // flipped. Skipping the overlay cycle otherwise keeps an idle shell
+            // idle: every pass ends in a frame flush, and a frame flush copies the
+            // whole shadow surface to the device.
             let mouse = crate::drivers::ps2_mouse::poll();
-            crate::drivers::cursor::hide();
+            let ticks = crate::task::scheduler::ticks();
+            let secs = ticks / crate::arch::x86_64::apic::TICK_HZ;
+            let blink = caret::Caret::blink_on(ticks);
+            let key_pending = crate::drivers::ps2_kbd::has_scancode();
+            if !key_pending
+                && mouse.seq == last_mouse_seq
+                && secs == last_secs
+                && blink == last_blink
+            {
+                continue;
+            }
+            last_mouse_seq = mouse.seq;
+            last_secs = secs;
+            last_blink = blink;
+
+            // Live overlay: take the arrow down for this pass, repaint the status
+            // bar, then drain and process ALL pending scancodes with it hidden (so
+            // glyph output never clobbers its saved background). The restored
+            // background is *deferred* into this frame's damage rather than pushed
+            // immediately: pushing it here would take the arrow off the device for
+            // the whole pass, which is exactly the flicker you see when moving the
+            // mouse over an otherwise idle shell.
+            crate::drivers::cursor::hide_deferred();
 
             // Mouse selection: a press anchors, a drag extends, a release copies the
-            // text to the clipboard. Cell coordinates come from the glyph size, and
-            // `Selection` clips anything left of the prompt away, so a drag that
-            // starts on the prompt still selects usable line text.
+            // text to the clipboard. Cell coordinates divide the pointer's pixels by
+            // the framebuffer's real cell size, and `Selection` clips anything left
+            // of the prompt away, so a drag that starts on the prompt still selects
+            // usable line text.
             let pressed = mouse.left && !prev_left;
             let released = !mouse.left && prev_left;
             prev_left = mouse.left;
             if pressed || (mouse.left && selection.is_active()) {
                 let cell = caret::Cell {
-                    col: mouse.x / CARET_GLYPH_W,
-                    row: mouse.y / CARET_GLYPH_H,
+                    col: mouse.x / crate::drivers::framebuffer::CHAR_WIDTH,
+                    row: mouse.y / crate::drivers::framebuffer::CHAR_HEIGHT,
                 };
                 if pressed {
                     selection.clear();
@@ -383,11 +461,29 @@ pub fn shell_main() -> ! {
             // is the one thing on screen that changes on its own (the clock, the
             // pointer), and rebuilding it per tick was the shell's main cost.
             let mut status_dirty = false;
-            if shell_status_text(&mouse, &mut status_cache) {
-                if let Some((left, right)) = status_cache.as_ref() {
-                    crate::drivers::framebuffer::draw_status_bar(left, right);
-                    status_dirty = true;
+            if theme::snapshot().status_bar {
+                if shell_status_text(&mouse, &mut status_cache) {
+                    if let Some((left, right)) = status_cache.as_ref() {
+                        crate::drivers::framebuffer::draw_status_bar(left, right);
+                        status_dirty = true;
+                    }
                 }
+            } else if status_cache.is_some() {
+                // Just switched off: wipe the strip once and remember that the
+                // cache no longer describes the screen, so switching it back on
+                // repaints instead of believing the stale text is still there.
+                crate::drivers::framebuffer::with(|fb| {
+                    let (w, h) = fb.dimensions();
+                    fb.fill_rect(
+                        0,
+                        h - crate::drivers::framebuffer::STATUS_BAR_HEIGHT,
+                        w,
+                        crate::drivers::framebuffer::STATUS_BAR_HEIGHT,
+                        0,
+                    );
+                });
+                crate::drivers::framebuffer::flush();
+                status_cache = None;
             }
 
             let mut entered = false;
@@ -400,33 +496,51 @@ pub fn shell_main() -> ! {
                 };
 
                 match event {
+                    // A visible selection is real input state, not decoration: typing
+                    // or deleting replaces it, the way every text field behaves. The
+                    // `Ctrl+A` + Delete combination is the one users reach for to
+                    // clear the line, and it did nothing before because these arms
+                    // ignored the selection and acted on the bare cursor.
                     keys::KeyEvent::Char(c) => {
-                        selection.clear();
+                        delete_selection(&mut editor, &mut selection);
                         editor.insert(c);
                         redraw_line(&editor, &mut shown, &mut caret);
                     }
                     keys::KeyEvent::Backspace => {
-                        selection.clear();
-                        editor.delete_back();
+                        if !delete_selection(&mut editor, &mut selection) {
+                            editor.delete_back();
+                        }
                         redraw_line(&editor, &mut shown, &mut caret);
                     }
                     keys::KeyEvent::Delete => {
-                        editor.delete_fwd();
+                        if !delete_selection(&mut editor, &mut selection) {
+                            editor.delete_fwd();
+                        }
                         redraw_line(&editor, &mut shown, &mut caret);
                     }
                     // Cursor moves change only the logical cursor; the caret is
                     // placed at that cursor's cell by the overlay below, so a
                     // mid-line position is now what the user actually sees.
+                    //
+                    // Moving also drops the selection, like every text field: a
+                    // highlight that survives a caret move is still "edited" by the
+                    // next Delete/Backspace, so `Ctrl+A`, Left, Delete used to wipe
+                    // the whole line — the selection was invisible state the arrows
+                    // did not touch.
                     keys::KeyEvent::Left => {
+                        selection.clear();
                         editor.move_left();
                     }
                     keys::KeyEvent::Right => {
+                        selection.clear();
                         editor.move_right();
                     }
                     keys::KeyEvent::Home => {
+                        selection.clear();
                         editor.move_home();
                     }
                     keys::KeyEvent::End => {
+                        selection.clear();
                         editor.move_end();
                     }
                     // Up: recall an older entry, stashing the live line (R2.2).
@@ -490,8 +604,8 @@ pub fn shell_main() -> ! {
                                 if !text.is_empty() {
                                     clipboard = text;
                                 }
-                                editor.replace_range(from, to);
                                 selection.clear();
+                                editor.replace_range(from, to);
                                 redraw_line(&editor, &mut shown, &mut caret);
                             }
                         }
@@ -539,26 +653,30 @@ pub fn shell_main() -> ! {
             // the buffer here (`redraw_line` leaves it there), so the cell is
             // found by walking back over the characters that follow the cursor.
             if let Some(cell) = caret_cell(&editor) {
-                caret.place(
-                    cell,
-                    caret::Caret::blink_on(crate::task::scheduler::ticks()),
-                );
+                // `Caret::place` is still called when the caret is switched off —
+                // with `on = false` — so it erases wherever it currently is instead
+                // of leaving a bar stranded on screen after the toggle.
+                let blink = theme::snapshot().caret
+                    && caret::Caret::blink_on(crate::task::scheduler::ticks());
+                caret.place(cell, blink);
             }
-            // Push whatever this pass drew. The console is RAM-backed now, so
-            // without this the screen would never change at all.
+            // Push whatever this pass drew first, then draw the arrow on top of the
+            // finished frame. The console is RAM-backed, so both flushes are small:
+            // the frame one carries only the dirty rectangle, and `move_to` pushes
+            // just the 12x19 arrow. Doing it in this order means the device shows
+            // the old frame with the arrow until the new frame replaces it, and the
+            // arrow comes back immediately afterwards — no gap, and never two
+            // arrows on screen at once.
             let _ = status_dirty;
+            // Draw the arrow into the same shadow frame and push both at once:
+            // the old arrow's restored background, this pass's changes and the new
+            // arrow reach the device in one flush, so there is never a frame with
+            // no pointer.
+            crate::drivers::cursor::place_deferred(mouse.x, mouse.y);
             crate::drivers::framebuffer::flush();
-
-            // Redraw the mouse cursor on top of the final rendered state.
-            crate::drivers::cursor::move_to(mouse.x, mouse.y);
         }
     }
 }
-
-/// Console glyph size in pixels (the framebuffer's 8x16 font). The mouse reports
-/// pixels and selection works in cells, so this is the conversion between them.
-const CARET_GLYPH_W: usize = 8;
-const CARET_GLYPH_H: usize = 16;
 
 /// Visible width of the prompt (`pagh:{cwd}> `) in cells. The prompt is what
 /// separates console cells from line indices, so selection needs it to know where
@@ -637,18 +755,10 @@ fn shell_status_text(
     mouse: &crate::drivers::ps2_mouse::MouseState,
     cached: &mut Option<(alloc::string::String, alloc::string::String)>,
 ) -> bool {
-    let cwd = path::cwd();
-    let secs = crate::task::scheduler::ticks() / crate::arch::x86_64::apic::TICK_HZ;
-    // The pointer is quantized to its cell: a one-pixel jitter is not worth a
-    // repaint, and the strip's own resolution is a character cell anyway.
-    let left = format!("pagh OS   {}", cwd);
-    let right = format!(
-        "up {}s   mouse({},{})",
-        secs,
-        mouse.x / CARET_GLYPH_W,
-        mouse.y / CARET_GLYPH_H
-    );
-    let next = (left, right);
+    // The two halves live in `theme` because the theme switch has to repaint the
+    // strip itself (its colours change without its text changing) and a second
+    // copy of this format string would drift from the one the switch draws.
+    let next = (theme::status_left(), theme::status_right(mouse));
     if cached.as_ref() == Some(&next) {
         return false;
     }

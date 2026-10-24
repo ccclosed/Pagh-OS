@@ -13,6 +13,7 @@
 //! ([`shell_println`] / [`shell_print_bytes`]) and the path/networking helpers
 //! live here so handlers can share them.
 
+use alloc::format;
 use alloc::string::String;
 
 use super::registry::ShellCtx;
@@ -311,7 +312,9 @@ pub(super) fn cmd_write(_ctx: &mut ShellCtx, args: &[&str]) {
             if node.is_directory() {
                 shell_println(&alloc::format!("write: {}: is a directory", path));
             } else {
-                match node.write(0, text.as_bytes()) {
+                // Replace, not overwrite-in-place: a shorter text must not leave
+                // the previous file's tail behind (see `vfs::replace_contents`).
+                match crate::vfs::replace_contents(&node, text.as_bytes()) {
                     Ok(n) => {
                         node.sync();
                         shell_println(&alloc::format!("write: wrote {} bytes to {}", n, path));
@@ -708,6 +711,9 @@ fn copy_bytes(
     dst: &alloc::sync::Arc<dyn crate::vfs::VfsNode>,
 ) -> Result<u64, crate::vfs::VfsError> {
     const MAX_BYTES: u64 = 16 * 1024 * 1024;
+    // `cp` replaces the destination: copying a shorter file over a longer one
+    // used to leave the old tail in place. Truncate first, like `O_TRUNC`.
+    dst.truncate(0)?;
     let mut buf = [0u8; 512];
     let mut offset: u64 = 0;
     loop {
@@ -971,6 +977,77 @@ pub(super) fn cmd_python(ctx: &mut ShellCtx, args: &[&str]) {
     argv.push(py.as_str());
     argv.extend_from_slice(args);
     cmd_lxrun(ctx, &argv);
+}
+
+/// `settings`: the interactive terminal-customization panel.
+///
+/// Modal on purpose — it owns the keyboard until the user leaves, because each
+/// keystroke there means "change it and show me", which the shell's line editor
+/// would otherwise swallow. `paint` takes the same approach.
+pub(super) fn cmd_settings(_ctx: &mut ShellCtx, _args: &[&str]) {
+    crate::kprintln!("settings: theme/wallpaper/status/caret");
+    crate::kprintln!("settings keys: arrows or hjkl, t=theme w=wallpaper r=reset q=quit");
+    super::theme::run_panel();
+}
+
+/// `theme`: show the schemes, or switch to one by name / by cycling with no argument.
+pub(super) fn cmd_theme(_ctx: &mut ShellCtx, args: &[&str]) {
+    use super::theme::{self, THEMES};
+    match args.first().copied() {
+        None | Some("list") => {
+            let current = theme::snapshot().theme().name;
+            for t in THEMES {
+                let mark = if t.name == current { "*" } else { " " };
+                shell_println(&format!("{} {}", mark, t.name));
+            }
+            shell_println("theme <name> | theme next | settings");
+        }
+        Some("next") => {
+            let name = theme::with(|s| s.next_theme());
+            theme::apply();
+            theme::repaint();
+            shell_println(&format!("theme: {}", name));
+        }
+        Some(name) => match THEMES.iter().position(|t| t.name == name) {
+            Some(i) => {
+                theme::with(|s| s.theme = i);
+                theme::apply();
+                theme::repaint();
+                shell_println(&format!("theme: {}", name));
+            }
+            None => {
+                let names: alloc::vec::Vec<&str> = THEMES.iter().map(|t| t.name).collect();
+                super::render::error_line(&format!(
+                    "theme: unknown '{}' (have: {})",
+                    name,
+                    names.join(", ")
+                ));
+            }
+        },
+    }
+}
+
+/// `wallpaper`: set (or list) the background layer behind the text.
+pub(super) fn cmd_wallpaper(_ctx: &mut ShellCtx, args: &[&str]) {
+    use super::theme::{self, Wallpaper};
+    match args.first().copied() {
+        None | Some("list") => {
+            let current = theme::snapshot().wallpaper;
+            for w in Wallpaper::ALL {
+                let mark = if w == current { "*" } else { " " };
+                shell_println(&format!("{} {}", mark, w.name()));
+            }
+            shell_println("wallpaper <name> | settings");
+        }
+        Some(name) => match Wallpaper::from_name(name) {
+            Some(w) => {
+                theme::with(|s| s.wallpaper = w);
+                theme::repaint();
+                shell_println(&format!("wallpaper: {}", w.name()));
+            }
+            None => super::render::error_line(&format!("wallpaper: unknown '{}'", name)),
+        },
+    }
 }
 
 pub(super) fn cmd_pythonc(ctx: &mut ShellCtx, args: &[&str]) {

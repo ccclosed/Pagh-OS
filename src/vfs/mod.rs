@@ -36,6 +36,21 @@ pub enum VfsError {
     AlreadyExists,
 }
 
+/// Replace a regular file's contents with `bytes`.
+///
+/// POSIX `open(..., O_TRUNC)` semantics: nothing of the old contents beyond
+/// `bytes.len()` may survive. Writing at offset 0 is *not* replacement — `write
+/// f BBB` over a 20-byte file used to leave `BBBAAAAAAAAAAAAAAAAA` behind (and
+/// `nano f` then displayed that stale tail). Truncation lives here rather than at
+/// each call site because the next caller forgets it.
+pub fn replace_contents(node: &Arc<dyn VfsNode>, bytes: &[u8]) -> VfsResult<usize> {
+    node.truncate(0)?;
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    node.write(0, bytes)
+}
+
 /// Filesystem capacity snapshot for `statfs`/`fstatfs`: block counts are in
 /// units of `block_size`. Reported by filesystems that track their usage
 /// (ext2); `fs_stat()` returning `None` (the trait default) means the node's

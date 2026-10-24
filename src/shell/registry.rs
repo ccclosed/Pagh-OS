@@ -294,6 +294,24 @@ pub static COMMANDS: &[CommandSpec] = &[
         usage: "warn <on|off>",
         handler: super::commands::cmd_warn,
     },
+    CommandSpec {
+        name: "settings",
+        description: "Customize the terminal (themes, wallpaper, status bar, caret)",
+        usage: "settings",
+        handler: super::commands::cmd_settings,
+    },
+    CommandSpec {
+        name: "theme",
+        description: "List or switch console colour schemes",
+        usage: "theme [name|next|list]",
+        handler: super::commands::cmd_theme,
+    },
+    CommandSpec {
+        name: "wallpaper",
+        description: "Set the background layer behind the text",
+        usage: "wallpaper <name|list>",
+        handler: super::commands::cmd_wallpaper,
+    },
 ];
 
 /// Look up a command by its exact name via a linear scan of [`COMMANDS`].
