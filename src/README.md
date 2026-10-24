@@ -59,7 +59,7 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
 12. `net::init()` + echo-сервисы на порту 7.
 `kernel_main`: спавн `shell_thread` (PID 1) и `net::net_thread`; feature-гейтнутые selftest-хуки;
 `enable_interrupts()`; main-поток — `halt_loop()`. `shell_thread` после стабилизации
-спрашивает `provision::prompt_base_packages()` (Y/n) и запускает shell.
+запускает shell (никаких вопросов на консоли: юзерленд ставится из shell через `apt`).
 
 Грабли: `create_user_process` обязан идти с выключенными прерываниями (тик, увидев чужой CR3,
 ломает планирование); отсутствие диска/NIC — warn, не fatal; ext2-маунт до включения прерываний.
@@ -79,9 +79,7 @@ Sinks: serial всегда, framebuffer условно. Гейты fb-зерка
 - `seed()` — идемпотентный посев ФС первого бута (guard `/mnt/etc/pagh-release`):
   `etc/`, `home/user/`, `usr/share/pagh/`, `examples/hello/`; `resolv.conf` (10.0.2.3),
   `hosts`, `motd`, README, LICENSE-NOTICE, hello-пример. `write_once` — не перезаписывает.
-- `prompt_base_packages() -> bool` — Y/n на консоли (raw PS/2 set-1: y=0x15, Enter=0x1C,
   n=0x31); false, если python уже стоит.
-- `ensure_base_packages_thread()` — фон-поток: пауза fb-зеркала, sleep ~10 c (DHCP),
   до 6 ретраев `apt::update()`, затем `apt::install("python3")` (тянет libc6, libpython).
   Зависит от `pkg::apt`, `vfs`, `scheduler::sleep_ticks`, `drivers` (клавиатура).
 

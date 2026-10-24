@@ -55,19 +55,67 @@ userland** onto its ext2 disk after an opt-in confirmation at first boot.
 
 ## Screenshots
 
-### The `paint` app (maximized window)
-
-The windowed, mouse-driven drawing app: title bar with minimize/maximize/close, a
-16-color palette, tool buttons, and a "Paint" entry in the taskbar.
-
-![pagh paint app](docs/paint.png)
+Every image below is a raw QEMU capture of the 1280×800 framebuffer — the kernel draws
+these pixels itself (the console blits the Fira Code bitmap asset, the cursor is a
+software overlay, `paint` is a canvas in a window), so there is no host-side font
+rendering or screenshot compositing in play.
 
 ### Interactive shell
 
-The framebuffer console with the color-coded `pagh:/mnt>` prompt and the bottom status
-bar (OS name, current directory, uptime, live mouse position).
+The framebuffer console with the colour-coded `pagh:/>` prompt, the blinking caret at
+the logical cursor, the live status bar (OS name, current directory, uptime, mouse
+position) and the software mouse cursor. Line editing, history, tab completion,
+`Shift`/`CapsLock`, mouse selection and `Ctrl+A`/`Ctrl+X`/`Ctrl+Y` all work on this
+screen; an idle shell sleeps instead of redrawing the surface on every timer tick.
 
 ![pagh shell](docs/shell.png)
+
+### Selecting console text with the mouse
+
+Dragging the left button selects console cells (the highlight is the console *model*
+inverted, not a bitmap copy); releasing copies the text into the session clipboard,
+and `Ctrl+X`, `Ctrl+Y`/`Ctrl+V` cut and paste it into the editable line.
+
+![pagh mouse selection](docs/selection.png)
+
+### `nano+` editor
+
+Full-screen editor with a file-tree sidebar (`^B`), undo/redo, search/replace, a line
+clipboard, per-file backups and a two-press quit guard. Saving truncates the file, so a
+shorter document really replaces the old one instead of leaving its tail behind.
+
+![pagh nano editor](docs/nano.png)
+
+### The `paint` app
+
+Windowed, mouse-driven drawing app: title bar with minimize/maximize/close, a 16-colour
+palette, pencil/eraser/line/rect/filled-rect/circle/disc/bucket/picker tools, brush
+sizes 1–64, undo, and a "Paint" entry in the taskbar. The canvas is a `Vec<u32>` that
+is blitted through the same shadow buffer as the console.
+
+![pagh paint app](docs/paint.png)
+
+### `settings`: themes, wallpapers, status bar, caret
+
+`settings` opens a modal panel that switches colour schemes (classic, amber, green,
+paper, synth) and wallpapers (plain, gradient, scanlines, stars, grid) live — every
+change repaints the real framebuffer, so the panel is the preview.
+
+![pagh settings panel](docs/settings.png)
+
+A theme + wallpaper applied to the running console; the palette also recolours the
+status strip and the prompt.
+
+![pagh theme and wallpaper](docs/themes.png)
+
+### In-QEMU self-test
+
+`selftest` runs the kernel's own property/regression suite against live kernel state
+(PMM, VMM, ext2, the VFS, the scheduler, signals, TLS/apt parsers, the shell's pure
+logic …) and prints a machine-checkable verdict on serial; the screen gets the
+one-line result.
+
+![pagh self-test](docs/selftest.png)
 
 ### `apt update` over HTTPS
 
@@ -85,9 +133,16 @@ server certificate chain, hostname and validity checked before a byte of the ind
   LAPIC + I/O APIC.
 - **Tasking:** preemptive ~1 kHz round-robin scheduler, kernel threads, ring-3 user
   processes, `int 0x80` syscalls (`SYS_WRITE`/`EXIT`/`YIELD`).
-- **Input & graphics:** PS/2 keyboard (IRQ1) and mouse (IRQ12), a framebuffer console with
-  2D primitives (lines, rectangles, circles, fills, blit), a bottom status bar, and a
-  trailing-free software mouse cursor.
+- **Input & graphics:** PS/2 keyboard (IRQ1) and mouse (IRQ12), a framebuffer console
+  that draws through a RAM shadow buffer and pushes it to the device once per changed
+  frame (so an idle shell is actually idle), 2D primitives (lines, rectangles, circles,
+  fills, blit), a bottom status bar, and a trail-free software mouse cursor drawn as
+  part of that frame. The `nano+` editor takes the mouse too (click to place the
+  caret, drag to select, click a sidebar row to switch files) and marks a file
+  modified only while its text actually differs from what was saved. The console typeface is Fira Code in an 8×18 cell, rasterised
+  offline into `assets/font8x18.bin` by `tools/gen_font.py` — the kernel blends
+  8-bit coverage per pixel, so glyph edges are antialiased, and it ships no TrueType
+  parser.
 - **Storage:** PCI enumeration, virtio-blk block device, a multi-block-group ext2-compatible
   read/write filesystem mounted at `/mnt` (GiB-scale disks), protected by a
   write-ahead-log (WAL) journal for crash consistency — large writes are committed in
@@ -103,8 +158,10 @@ server certificate chain, hostname and validity checked before a byte of the ind
   services. AF_INET6 Linux sockets (with v4-mapped addresses) are exposed to
   Linux binaries.
 - **Shell:** line editing (arrows/Home/End/Delete/insert), command history, tab
-  completion, `cd`/`pwd` with relative paths, file ops (`cp`/`mv`/`stat`), colored
-  prompt/errors, typo suggestions, a registry-driven `help`, and a `paint` app.
+  completion, `cd`/`pwd` with relative paths, file ops (`cp`/`mv`/`stat`), coloured
+  prompt/errors, typo suggestions, a registry-driven `help`, mouse text selection with
+  a session clipboard, a full-screen `nano+` editor, the `paint` app, and a `settings`
+  panel with live colour themes and wallpapers.
 - **Linux binaries:** a Linux x86_64 syscall layer (`int 0x80` + `syscall`) and an ELF
   loader for static `ET_EXEC`, static-PIE, and glibc-dynamic (`PT_INTERP`) images run
   Linux programs in ring 3 (`lxrun`) — including the CPython 3.16 REPL (GNU readline
@@ -119,10 +176,11 @@ server certificate chain, hostname and validity checked before a byte of the ind
   a Debian `Packages` index over HTTP/HTTPS, streams gzip/xz/zstd decompression into a
   compact in-RAM arena index, resolves dependencies, and installs `.deb`s onto ext2 `/mnt`
   (tar symlinks/hardlinks are created as real links on ext2).
-- **Provisioning:** an idempotent first-boot flow seeds `/mnt` and installs the base
-  glibc + CPython userland through `apt` (gz→xz index-decode fallback, honest decode
-  diagnostics, progress on serial) — **opt-in**: the boot asks `Y/n` on the console
-  before downloading anything.
+- **Provisioning:** an idempotent first-boot flow seeds `/mnt`; the glibc + CPython
+  userland is installed through `apt` (gz→xz index-decode fallback, honest decode
+  diagnostics, progress on serial) on demand from the shell (`apt update` +
+  `apt install python3`). Boot no longer stops to ask: a console prompt without a
+  timeout is not something boot may do.
 
 ---
 
@@ -168,7 +226,7 @@ are `LIMINE_DIR`, `LIMINE_EFI`, and `PAGH_DISK`. QEMU exits with `Ctrl-A`, then 
 
 `run.sh` creates a 1 GiB raw `disk.img` on first run and boots QEMU with 1 GiB of RAM.
 On the first boot with networking, the boot asks whether to download & install the base
-`python3` userland (`Y/n` on the console; ≈50 MB of downloads). Answering `Y` runs the
+`python3` userland from the shell (`apt install python3`; ≈50 MB of downloads). It runs the
 install in the background; `N` skips it (`apt update` + `apt install python3` from the
 shell installs it later). Delete `disk.img` to get a clean re-provisioned system on the
 next boot.
@@ -266,7 +324,7 @@ journaled write/read self-demo. The `Hello from ring3 user process!` line is pri
 embedded ELF executing in ring 3 via a `SYS_WRITE` system call. The DHCP lease is acquired
 asynchronously by the network poll thread once interrupts are enabled, so it appears after
 the prompt. On a fresh disk the boot asks `download & install glibc + python3 in the
-background? [Y/n]`; after confirmation a background provisioning thread runs `apt update`
+background` — the install path runs `apt update`
 and installs the base `python3` userland (progress on serial; the framebuffer log mirror is
 paused while it runs). The prompt shows the current working directory and is rendered in color on the
 framebuffer (serial stays plain text).
@@ -425,7 +483,7 @@ Open or create a file with `nano /mnt/file.rs`. The editor provides:
 
 `pagh` can run Linux x86_64 programs — statically linked or glibc-dynamic — and install
 Debian packages by name. On the first boot it offers to provision a base userland
-(opt-in `Y/n`), so `python` works out of the box after confirmation.
+(installed on demand from the shell), so `python` works once you ask for it.
 
 ```text
 # run a Linux ELF already on the filesystem

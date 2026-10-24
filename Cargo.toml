@@ -1,6 +1,6 @@
 [package]
 name = "pagh"
-version = "2.5.0"
+version = "2.7.0"
 edition = "2021"
 # SPDX identifier for the MIT license in `LICENSE` (Copyright (c) 2026 ccclosed).
 # Declared here as well as in the file: packaging tools, grant paperwork and

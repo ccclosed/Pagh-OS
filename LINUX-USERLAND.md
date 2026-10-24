@@ -54,7 +54,7 @@ A background kernel thread (`src/provision.rs`) makes this work out of the box o
 fresh `disk.img` — **after an opt-in confirmation**:
 
 1. Seeds `/mnt` with release metadata, a home skeleton, and a mini-Rust example.
-2. Asks on the console: `download & install glibc + python3 in the background? [Y/n]`.
+2. Does not ask: the base userland is installed from the shell (`apt update` + `apt install python3`), so boot never waits on a keystroke.
    `N` skips everything; `apt update` + `apt install python3` from the shell installs
    the userland later at any time.
 3. On `Y`, runs `apt update` — streaming the Debian `Packages` index with a gz → xz →

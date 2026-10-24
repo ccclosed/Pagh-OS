@@ -22,7 +22,7 @@ python            # CPython 3.13, installed by first-boot provisioning
 On the first boot with a fresh `disk.img`, the kernel seeds `/mnt` (release metadata, home
 skeleton, mini-Rust example). Installing the base glibc + CPython 3.13 userland (≈35 packages,
 ≈50 MB of downloads — the equivalent of `apt update && apt install python3`) is **opt-in**: the
-boot asks `[Y/n]` on the console and only a `Y`/Enter starts the background provisioning thread.
+the shell runs `apt update` + `apt install python3` on demand; boot itself never blocks on a console question.
 It is idempotent — on later boots it detects the installed userland and exits. Progress is
 reported on serial; the framebuffer log mirror is paused while it runs so the shell stays usable.
 Delete `disk.img` to re-provision from scratch.

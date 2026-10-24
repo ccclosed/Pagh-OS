@@ -16,7 +16,7 @@ framebuffer-консоль, VT-эмулятор, курсор, serial. Коор�
 | `nvme.rs` | NVMe поверх PCIe — поллинг (phase-bit), BAR0 MMIO, PRP scratch-frame, FLUSH (opcode 0x08) для дюрабильности WAL (issue #15); регистрируется как `BlockDevice` |
 | `ps2_kbd.rs` | PS/2 клавиатура (IRQ1): 128-байтное кольцо сканкодов, трекинг Ctrl+C, защёлки `CTRL_C`/`FG_PID` |
 | `ps2_mouse.rs` | PS/2 мышь (IRQ12) через 8042 aux: сборка 3-байтовых пакетов, зажатые координаты + кнопки + `seq` |
-| `framebuffer.rs` | Limine framebuffer текстовая консоль + 2D-графика: шрифт 8x16 (`assets/font8x16.bin`), `FbWriter`, скролл, status bar, макросы `fb_print!` |
+| `framebuffer.rs` | Limine framebuffer текстовая консоль + 2D-графика: шрифт Fira Code 8×18 (`assets/font8x18.bin` — 8-битное **покрытие** на пиксель, генерируется `tools/gen_font.py`), `FbWriter`, скролл, status bar, макросы `fb_print!` |
 | `vt.rs` | ANSI/VT-100 эмулятор поверх framebuffer (`Vt`: CSI/OSC/DCS, 256 цветов, scroll regions, ответы на запросы) — stdout compat-программ |
 | `cursor.rs` | Программный курсор мыши 12×19 (save/restore фона); `text_begin`/`text_end` для курсор-безопасного текста |
 | `serial.rs` | COM1 UART консоль (`init`, `write_bytes`, `console()`, макросы `kprint!`/`kprintln!`) |
@@ -38,8 +38,10 @@ framebuffer-консоль, VT-эмулятор, курсор, serial. Коор�
   `MouseState { x, y, left, right, middle, seq }`.
 - `framebuffer`: `init()`, `console()`, `clear_screen()`, `set_fg_color()`, `dimensions()`,
   `with(f)`, `draw_status_bar(left, right)`, `fb_print!/fb_println!`;
-  константы `CHAR_WIDTH=8`, `CHAR_HEIGHT=16`, `CHARS_PER_LINE=100`, `MAX_LINES=37`,
-  `STATUS_BAR_HEIGHT=18`.
+  константы `CHAR_WIDTH=8`, `CHAR_HEIGHT=18`, `CHARS_PER_LINE=100`, `MAX_LINES=37`,
+  `STATUS_BAR_HEIGHT=18`. Размер глифа экспортируется **намеренно**: VT, маппинг мыши в
+  клетку и тулбар `paint` берут его отсюда, а не заводят свою копию (вторая копия —
+  молчаливый баг раскладки при смене шрифта).
 - `vt`: `init()`, `write(bytes)`, `dimensions()`, `take_input_responses()`.
 - `cursor`: `hide()`, `move_to()`, `text_begin()`, `text_end()`.
 - `serial`: `init()`, `write_bytes()`, `console()`.
@@ -79,10 +81,40 @@ RX-поллинг по биту `STATUS.DD`; TX: копия в слот-буфе
 + reconcile на `unshare`. Весь доступ — под одним `Spinlock` на время обмена.
 
 ### Консоль / VT / курсор
-- Текстовая сетка 8×16, скролл — `copy` текстовой области на строку вверх (status bar не трогается);
+
+![Консоль pagh: шрифт Fira Code, каретка, статус-бар и программный курсор](../../docs/shell.png)
+
+- Текстовая сетка 8×18 (Fira Code; ширина и высота клетки — `CHAR_WIDTH`/`CHAR_HEIGHT`,
+  их же используют VT, маппинг мыши в клетку и тулбар `paint`), скролл — `copy` текстовой
+  области на строку вверх (status bar не трогается);
   контрольные символы: `\n`, `\r`, `0x08`, печатные 32..=126.
+- Шрифт — **данные, а не код**: `tools/gen_font.py` растеризует TTF в
+  `assets/font8x18.bin` (95 глифов ASCII 0x20..0x7E, **8 бит покрытия** на пиксель:
+  0 — фон, 255 — полная заливка),
+  ядро его только блитит (`include_bytes!`) и смешивает (`blend_px`) с фоном и цветом
+  текста — отсюда сглаженные края букв; никакого TrueType-парсера в ядре нет. Размер
+  em выводится из ширины клетки (у Fira Code advance 0.6154 em → ровно 8.00 px при em 13,
+  то есть клетка 8 px подходит без сжатия букв), базовая линия подбирается по реальным
+  чернилам, так что descender'ы не липнут к низу клетки. Перегенерация —
+  `python3 tools/gen_font.py --font /usr/share/fonts/fira-code/FiraCode-Regular.ttf
+  --cell 8 --cell-h 18 --out assets/font8x18.bin` (ассет и константы меняются одним
+  коммитом). Прежний `assets/font8x16.bin` (VGA-подобный 8×16) остаётся в дереве только
+  как контроль для `tools/font_check.py` и предпросмотра `gen_font.py --png` — ядро на
+  него больше не ссылается.
+- **Тень экрана, а не MMIO на каждый пиксель.** `FramebufferWriter::back` — копия кадра в
+  обычной RAM; рисование идёт туда, а `flush()` копирует всю поверхность на устройство.
+  `put_pixel` отмечает прямоугольник `dirty`, и `flush()` без изменений — no-op, поэтому
+  простаивающий шелл не копирует 4 МБ каждый тик. Это контракт: **нарисовал в тень —
+  вызови `flush()` один раз в конце кадра**; иначе экран останется старым (именно так
+  «пропал» курсор: стрелку рисовали после `flush`, а следующий `hide` восстанавливал фон
+  раньше следующего flush).
 - `FbWriter` = `Spinlock<Option<FramebufferWriter>>`; `init()` строит writer **вне** локa
   (лог внутри `new()` ре-лочит нереентерабельный спинлок — дедлок).
+- **Курсор — часть кадра.** `cursor::move_to(x, y)` пишет стрелку в тень (в «тихом»
+  режиме `set_quiet(true)`, чтобы 12×19 пикселей не помечали весь кадр грязным) и сразу
+  выталкивает свой прямоугольник `flush_rect`; `hide()` так же возвращает фон. Поэтому
+  `move_to` вызывается **до** кадрового `flush`, а не после. `move_to` идемпотентен: шелл
+  зовёт его на каждом пробуждении, и неподвижная стрелка не должна ничего копировать.
 - Каждый текстовый вывод идёт `cursor::text_begin()` → write → `text_end()` — стрелка мыши
   прячется/восстанавливается из любого потока.
 - VT-эмулятор: сетка ячеек с fg/bg, scroll regions, 16 ANSI + 256 цветов; отвечает на

@@ -169,6 +169,9 @@ BOOT_TAG_PREFIX = b"PAGH-BOOTID-"
 BOOT_TAG_PLACEHOLDER = BOOT_TAG_PREFIX + b"0" * 16  # fixed length, patched in place
 BOOT_TAG_LEN = len(BOOT_TAG_PLACEHOLDER)
 
+# Legacy marker: older images asked a first-boot Y/n question about the python
+# download. Current kernels never print it (the shell installs the userland on
+# demand), so the answer path below is a compatibility branch, not a step.
 PROVISION_MARK = "provision: waiting for the Y/n answer"
 SHELL_MARK = "Type 'help' for available commands"
 SHELL_PROMPT = "pagh:/>"
@@ -1601,8 +1604,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="reuse .cache/e2e_disk.img instead of re-copying disk.img")
     q.add_argument("--ovmf", default=os.environ.get("OVMF", "OVMF.fd"))
     q.add_argument("--provision", choices=["skip", "yes", "ask"], default="skip",
-                   help="answer to the first-boot [Y/n] python3 question "
-                        "(default skip = 'n'; the shell stays usable)")
+                   help="answer to the legacy first-boot [Y/n] python3 question "
+                        "(default skip = 'n'; kernels that never ask it ignore this)")
     q.add_argument("--key-delay", type=float, default=0.15,
                    help="delay between injected keystrokes, seconds")
     q.add_argument("--poll", type=float, default=1.5, help="serial poll interval, seconds")

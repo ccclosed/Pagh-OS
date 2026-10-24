@@ -10,7 +10,8 @@ and to run the in-QEMU selftests without a human at the keyboard:
     surface.
   * ``sendkey`` — type into the guest.  The pagh shell reads the **PS/2
     keyboard**, not the serial port, so this is the only way to answer the
-    first-boot ``Y/n`` question or to run ``selftest`` from a script.
+    in-guest ``selftest`` from a script (older images also asked a first-boot ``Y/n``
+    question; current ones do not, so ``--answer-n`` simply does nothing there).
 
 Examples
 --------
@@ -49,6 +50,9 @@ PROMPT_MARKER = "pagh:"  # shell prompt: `pagh:<cwd>> ` (serial + framebuffer)
 # The provisioning question itself is printed to the framebuffer only
 # (`fb_println!`), so the serial log carries the *waiting* line instead — that is
 # the marker a headless driver has to key off.
+# Older images asked whether to install python3 at first boot; the kernel no longer
+# does (the shell installs it on demand), so this marker is only a compatibility
+# probe for such images — its absence is normal and not a warning.
 YN_WAIT_MARKER = "waiting for the Y/n answer"
 
 # Characters the pagh shell accepts that are not spelled like their QEMU key
@@ -301,7 +305,12 @@ def main() -> int:
     p.add_argument("--serial", default=SERIAL_DEFAULT, help="serial log path (used with --boot / --wait-prompt)")
     p.add_argument("--out", default="/tmp/pagh_shot.png", help="screenshot path (PNG; replaced only by a successful dump)")
     p.add_argument("--keys", default="", help="text to type before the screenshot, e.g. 'selftest\\n'")
-    p.add_argument("--answer-n", action="store_true", help="answer the first-boot base-package Y/n question with 'n'")
+    p.add_argument(
+        "--answer-n",
+        action="store_true",
+        help="answer the legacy first-boot base-package Y/n question with 'n' (no-op on "
+        "kernels that no longer ask it)",
+    )
     p.add_argument("--wait-prompt", type=float, default=90.0, help="seconds to wait for the shell prompt (0 = don't)")
     p.add_argument("--settle", type=float, default=2.0, help="seconds to wait after typing, before the screenshot")
     p.add_argument("--keep-running", action="store_true", help="leave a --boot instance running after the screenshot")
@@ -320,14 +329,13 @@ def main() -> int:
 
         serial = pathlib.Path(args.serial)
         if args.answer_n:
-            # The first boot on a disk without python3 asks Y/n on the console and
-            # waits for a keystroke before the shell starts.
-            if wait_for(serial, YN_WAIT_MARKER, args.wait_prompt):
-                print("answering the base-package question with 'n'", file=sys.stderr)
+            # Compatibility with images that still ask the first-boot Y/n question:
+            # answer it if it shows up. Current kernels never print it, and waiting
+            # the whole --wait-prompt for a marker that will not come would just add
+            # a minute to every scripted boot, so the wait is short.
+            if wait_for(serial, YN_WAIT_MARKER, min(args.wait_prompt, 5.0)):
+                print("answering the legacy base-package question with 'n'", file=sys.stderr)
                 mon.send_keys("n\n")
-            else:
-                print("warning: the Y/n question was not seen; continuing without an answer",
-                      file=sys.stderr)
 
         if args.wait_prompt and not wait_for(serial, PROMPT_MARKER, args.wait_prompt):
             print(f"warning: shell prompt not seen in {args.serial} within {args.wait_prompt:.0f}s",

@@ -208,12 +208,33 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   fully backward-compatible ones. Precedent: `release 1.1.0: the tick-rate
   change is a feature (behavior change), so minor bump, not patch`.
   Land the bump in the same PR (or the final commit of a stacked series)
-  that ships the feature — not some day later. **`main` currently reads 2.5.0**
-  (tags 2.3.0 → 2.4.0 → 2.4.1 → 2.4.2 → 2.5.0, each with a GitHub release);
+  that ships the feature — not some day later. (tags
+  2.3.0 → 2.4.0 → 2.4.1 → 2.4.2 → 2.5.0, each with a GitHub release);
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **2.5.0** = procfs, signals, the verified apt trust chain
+  be reflected here. **`main` currently reads 2.7.0**
+  (this branch's bump; it lands on `main` with the merge). **2.7.0** = the console renders
+  **antialiased** text: the
+  embedded font asset holds 8-bit *coverage* per pixel (not a 1-bit bitmap) and
+  the blitter blends it between the console's background and foreground colour,
+  which is what makes the 8×18 Fira Code cell read like the same face in a
+  terminal on the host; the first boot no longer stops at a `Y/n` prompt about the
+  python download (install it from the shell with `apt install python3`), `nano+`
+  takes the mouse (click to place the caret, drag to select, click a sidebar row
+  to switch files) with `^A`/`^C`/`^X` acting on the selection, an arrow key now
+  drops a selection, and the software cursor is drawn into the same frame it is
+  flushed with, so it no longer flickers while it moves. **2.6.0** = the console
+  typeface is Fira Code
+  (8×18 cell, rasterised offline by `tools/gen_font.py` into
+  `assets/font8x18.bin`; the kernel still ships no TrueType parser), the glyph
+  geometry has exactly one source (`framebuffer::CHAR_WIDTH`/`CHAR_HEIGHT`,
+  used by the VT emulator, the shell's mouse-to-cell mapping and `paint`), and
+  the software mouse cursor is back: it is drawn as part of the frame's shadow
+  buffer and flushed with it (the shadow-buffer commit had left it drawn *after*
+  the flush, so it never reached the device), while an idle shell skips the
+  overlay/repaint cycle instead of copying the surface once per timer tick.
+  **2.5.0** = procfs, signals, the verified apt trust chain
   and the durability fixes (issues #11–#19, #32–#35). Every release owes both a
   tag and a GitHub release: `main` reached 2.4.0 without either, so the tag list
   and the release list drifted three minors apart before anyone noticed — an

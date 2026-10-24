@@ -586,12 +586,10 @@ fn shell_thread() {
         core::hint::spin_loop();
     }
 
-    // Ask about the first-boot python download HERE — this thread
-    // is the sole keyboard consumer at this moment (the shell starts right
-    // after, nothing can steal the answer) and interrupts are already live.
-    if crate::provision::prompt_base_packages() {
-        task::scheduler::kernel_thread_spawn(crate::provision::ensure_base_packages_thread);
-    }
-
+    // The first boot no longer stops to ask about downloading python3: a fresh
+    // disk gets the file skeleton from `provision::seed()`, and the glibc/python
+    // userland is installed on demand from the shell (`apt update` +
+    // `apt install python3`). A boot-time question blocked the shell on a console
+    // prompt with no default timeout, which is not something boot may do.
     shell::shell_main();
 }
