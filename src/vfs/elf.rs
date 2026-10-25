@@ -44,6 +44,37 @@ pub struct Elf64ProgramHeader {
     pub p_align: u64,
 }
 
+/// Read the ELF file header out of the first bytes of `data`.
+///
+/// A `&[u8]` starts at an arbitrary byte alignment, so forming a `&Elf64Header`
+/// over it is undefined behaviour even when the length is in bounds — and the
+/// debug build's alignment check turns that UB into a kernel panic. Copying the
+/// struct out by value (`ptr::read_unaligned`) has no alignment requirement.
+///
+/// # Safety
+/// The caller must have checked `data.len() >= size_of::<Elf64Header>()`.
+unsafe fn read_elf_header(data: &[u8]) -> Elf64Header {
+    // SAFETY: the caller guarantees the header is in bounds; `read_unaligned`
+    // accepts any alignment.
+    unsafe { core::ptr::read_unaligned(data.as_ptr() as *const Elf64Header) }
+}
+
+/// Read one program header out of the file bytes.
+///
+/// `ph_offset` is attacker-controlled (`e_phoff` came from the file), so it is
+/// not necessarily aligned for `Elf64ProgramHeader`. The ELF fuzz routine found
+/// exactly that: a single flipped bit in `e_phoff` made the old reference cast
+/// panic the kernel with "misaligned pointer dereference", which is the debug
+/// build's version of UB. The copy below needs no alignment.
+///
+/// # Safety
+/// The caller must have checked `ph_offset + size_of::<Elf64ProgramHeader>() <= data.len()`.
+unsafe fn read_program_header(data: &[u8], ph_offset: usize) -> Elf64ProgramHeader {
+    // SAFETY: in bounds per the caller's contract; `read_unaligned` accepts any
+    // alignment.
+    unsafe { core::ptr::read_unaligned(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) }
+}
+
 const PT_LOAD: u32 = 1;
 const ET_EXEC: u16 = 2;
 const EM_X86_64: u16 = 0x3E;
@@ -176,8 +207,10 @@ impl ElfLoader {
             return Err("ELF: data too small for header");
         }
 
-        // SAFETY: Slice length validated; pointer is byte-aligned.
-        let header: &Elf64Header = unsafe { &*(data.as_ptr() as *const Elf64Header) };
+        // SAFETY: the slice is longer than a header (checked above); the bytes
+        // are only byte-aligned, so the header is copied, not referenced.
+        let header_owned = unsafe { read_elf_header(data) };
+        let header: &Elf64Header = &header_owned;
 
         if header.e_ident[EI_MAG0] != 0x7F || &header.e_ident[1..4] != b"ELF" {
             return Err("ELF: invalid magic");
@@ -299,8 +332,10 @@ impl ElfLoader {
         // valid magic / ELFCLASS64 / ELFDATA2LSB / EM_X86_64, and that every
         // PT_LOAD is in bounds with a (zero-bias) page-rounded range below
         // USER_ADDR_MAX. Reading the header struct is therefore in-bounds.
-        // SAFETY: length validated by `classify_elf`; byte pointer.
-        let header: &Elf64Header = unsafe { &*(data.as_ptr() as *const Elf64Header) };
+        // SAFETY: length validated by `classify_elf`; byte alignment means the
+        // header must be copied rather than referenced.
+        let header_owned = unsafe { read_elf_header(data) };
+        let header: &Elf64Header = &header_owned;
 
         // 2. Choose the load bias.
         let bias = match kind {
@@ -383,7 +418,10 @@ impl ElfLoader {
             ElfVerdict::Load { .. } => return Err("ELF: interpreter is not ET_DYN"),
             ElfVerdict::Reject(msg) => return Err(msg),
         }
-        let header: &Elf64Header = unsafe { &*(data.as_ptr() as *const Elf64Header) };
+        // SAFETY: `classify_elf` validated the length; the buffer is only
+        // byte-aligned, so the header is copied out of it.
+        let header_owned = unsafe { read_elf_header(data) };
+        let header: &Elf64Header = &header_owned;
         let max_end = Self::max_load_vaddr_end(data, header)?;
         let biased_end = bias
             .checked_add(max_end)
@@ -425,8 +463,9 @@ impl ElfLoader {
             // In bounds: classify_elf validated phoff + phnum*phentsize <= len.
             let ph_offset = phoff + i * phentsize;
             // SAFETY: `ph_offset + phentsize <= table_end <= data.len()`.
-            let ph: &Elf64ProgramHeader =
-                unsafe { &*(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
+            // `ph_offset` is attacker-controlled, so it need not be aligned for
+            // `Elf64ProgramHeader`: copy the header instead of referencing it.
+            let ph = unsafe { read_program_header(data, ph_offset) };
             if ph.p_type != PT_LOAD {
                 continue;
             }
@@ -464,8 +503,9 @@ impl ElfLoader {
             // In bounds: classify_elf validated the phdr table fits in `data`.
             let ph_offset = table_off + i * phentsize;
             // SAFETY: bounds guaranteed by classify_elf.
-            let ph: &Elf64ProgramHeader =
-                unsafe { &*(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
+            // `ph_offset` is attacker-controlled, so it need not be aligned for
+            // `Elf64ProgramHeader`: copy the header instead of referencing it.
+            let ph = unsafe { read_program_header(data, ph_offset) };
             if ph.p_type != PT_LOAD {
                 continue;
             }
@@ -543,8 +583,9 @@ impl ElfLoader {
             }
 
             // SAFETY: Bounds checked above.
-            let ph: &Elf64ProgramHeader =
-                unsafe { &*(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
+            // `ph_offset` is attacker-controlled, so it need not be aligned for
+            // `Elf64ProgramHeader`: copy the header instead of referencing it.
+            let ph = unsafe { read_program_header(data, ph_offset) };
 
             if ph.p_type != PT_LOAD {
                 continue;
@@ -732,8 +773,9 @@ impl ElfLoader {
             // SAFETY: `ph_offset + phentsize <= table_end <= data.len()` and
             // `phentsize >= size_of::<Elf64ProgramHeader>()`, so the full
             // program-header struct lies within `data`.
-            let ph: &Elf64ProgramHeader =
-                unsafe { &*(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
+            // `ph_offset` is attacker-controlled, so it need not be aligned for
+            // `Elf64ProgramHeader`: copy the header instead of referencing it.
+            let ph = unsafe { read_program_header(data, ph_offset) };
 
             if ph.p_type != PT_LOAD {
                 continue;
@@ -822,8 +864,9 @@ impl ElfLoader {
             }
 
             // SAFETY: Bounds checked above.
-            let ph: &Elf64ProgramHeader =
-                unsafe { &*(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
+            // `ph_offset` is attacker-controlled, so it need not be aligned for
+            // `Elf64ProgramHeader`: copy the header instead of referencing it.
+            let ph = unsafe { read_program_header(data, ph_offset) };
 
             if ph.p_type != PT_LOAD {
                 continue;
