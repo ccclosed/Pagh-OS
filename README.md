@@ -112,8 +112,9 @@ status strip and the prompt.
 
 `selftest` runs the kernel's own property/regression suite against live kernel state
 (PMM, VMM, ext2, the VFS, the scheduler, signals, TLS/apt parsers, the shell's pure
-logic …) and prints a machine-checkable verdict on serial; the screen gets the
-one-line result.
+logic …) and prints a machine-checkable verdict on serial (`SELFTEST SUMMARY`, plus the
+`SELFTEST IDEMPOTENCY` line when it runs more than one pass); the screen reports that
+the run started and finished.
 
 ![pagh self-test](docs/selftest.png)
 
