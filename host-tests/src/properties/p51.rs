@@ -271,6 +271,13 @@ proptest! {
         pos in 0usize..RELEASE_GPG.len(),
         bit in 0u8..8,
     ) {
+        // Bit 7 of the blob's *first* byte is not an armor byte at all: it flips
+        // `dearmor_or_binary`'s format decision, because a high bit means "this is
+        // already a binary packet stream". The ASCII blob then comes back verbatim
+        // as "payload" — deliberately fail-closed (the packet layer rejects it, so
+        // no signature verifies), but it is not the armor path or the payload this
+        // property is about. Every other flip stays inside the armored text.
+        prop_assume!(!(pos == 0 && bit == 7));
         let mut tampered = RELEASE_GPG.to_vec();
         tampered[pos] ^= 1 << bit;
         let result = packet::dearmor_or_binary(&tampered);
