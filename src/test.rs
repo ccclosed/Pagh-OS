@@ -6468,8 +6468,13 @@ mod shell_prop_tests {
         const CAPS_TOGGLE: u8 = 0x3A;
 
         let mut dec = keys::Decoder::new();
+        // The latch is process-wide and earlier routines (the scancode fuzz,
+        // notably) may have toggled it any number of times. Read it, and only
+        // toggle when it is on, so "off" below is a fact and not an assumption.
         let caps_was_on = dec.feed(LETTER) == Some(keys::KeyEvent::Char('A'));
-        dec.feed(CAPS_TOGGLE); // now definitely off
+        if caps_was_on {
+            dec.feed(CAPS_TOGGLE); // now definitely off
+        }
 
         assert_eq_kernel!(
             dec.feed(LETTER),
@@ -6497,7 +6502,11 @@ mod shell_prop_tests {
         );
         dec.feed(SHIFT_BREAK);
 
-        dec.feed(CAPS_TOGGLE); // restore the latch the rest of the boot had
+        dec.feed(CAPS_TOGGLE); // the "on" checks above left it on; now off again
+        if caps_was_on {
+            // ...and one more toggle restores the latch the rest of the boot had.
+            dec.feed(CAPS_TOGGLE);
+        }
         assert_eq_kernel!(
             dec.feed(LETTER),
             Some(keys::KeyEvent::Char(if caps_was_on { 'A' } else { 'a' })),
