@@ -213,8 +213,10 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.7.0**
-  (this branch's bump; it lands on `main` with the merge). **2.7.0** = the console renders
+  be reflected here. **`main` currently reads 2.7.1**
+  (the QA-fix patch bump; it lands on `main` with the merge). **2.7.1** = the
+  F-01/F-03/F-04 QA fixes (STAR readback at info, `cat` transcript terminator,
+  a claim gate whose `--probe` really tests it). **2.7.0** = the console renders
   **antialiased** text: the
   embedded font asset holds 8-bit *coverage* per pixel (not a 1-bit bitmap) and
   the blitter blends it between the console's background and foreground colour,
