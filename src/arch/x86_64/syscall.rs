@@ -34,9 +34,13 @@ pub fn init() {
         // Fail loudly: a kernel with a broken STAR must not boot.
         Star::write(user_cs, user_ds, kernel_cs, kernel_ds)
             .expect("STAR: GDT selector layout incompatible with syscall/sysret");
-        // Boot-time proof in the log that STAR really holds what we wrote.
+        // Boot-time proof in the log that STAR really holds what we wrote. The
+        // proof is informational: the loud failure is the `.expect()` above, so
+        // the good-path readback must not use `error!` — a healthy boot that
+        // prints `[ERROR]` makes every log filter treating that tag as "this
+        // boot failed" raise a false alarm.
         let (sysret_base, syscall_base) = Star::read_raw();
-        crate::error!(
+        crate::info!(
             "[syscall] STAR readback: sysret_base=0x{:x} syscall_base=0x{:x} (uc=0x{:x} ud=0x{:x})",
             sysret_base,
             syscall_base,
