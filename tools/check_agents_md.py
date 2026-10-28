@@ -140,6 +140,13 @@ ALLOWED_MISSING: dict[str, str] = {
     # self-extinguishing behaviour these exceptions are for. Add an entry only for a
     # path a branch has not merged yet; it expires on trackedness, not on a file
     # merely lying around in the working tree.
+    #
+    # While the list is empty, the stale-exception branches in `check_paths` and
+    # `check_entry_points` are not untested dead code: the `doc-exception-stale` probe
+    # patches this very dict in memory (see `MEMORY_PROBES`) and requires the finding.
+    # It has to work that way — an exception is the gate's own knob, so no edit to a
+    # file in the scratch copy could create one (the old file-based probe touched
+    # `docs/procfs.md` and could never fire once the list was empty).
 }
 
 PATH_PREFIXES = ("src/", "tools/", "docs/", "host-tests/", "vendor/", "third_party/",
@@ -980,7 +987,7 @@ PROBES: list[tuple[str, str, str]] = [
      "CANON_PENDING says the file still has a stale"),
     ("src-shebang", "SOURCE: a tool shebang that spells the interpreter bare",
      "shebang '#!/usr/bin/env python'"),
-    ("doc-exception-stale", "ALLOWED_MISSING: the in-flight path appears, the excuse must go",
+    ("doc-exception-stale", "the gate's own knob: a tracked path declared as in flight",
      "remove the stale exception"),
     ("folder-doc-removed", "folder-docs: a subsystem README disappears",
      "has no README.md"),
@@ -1002,6 +1009,13 @@ PROBES += [(f"src-pattern-{i}", f"SOURCE: break '{c['what']}'", "does not match 
 MEMORY_PROBES: dict[str, dict[str, object]] = {
     "src-canon-pending-stale": {"CANON_PENDING": {"tools/limine.py": "probe: pretend it is "
                                                                      "in flight and stale"}},
+    # `ALLOWED_MISSING` is empty on main, so no scratch-tree edit can make the
+    # stale-exception branch fire: the exception list IS the gate's knob. Declare a
+    # path that the repository already has (and AGENTS.md names) as "in flight" — the
+    # gate must then demand the exception be removed. (QA finding F-03: this probe used
+    # to only `_touch` the file, which proved nothing while the list was empty.)
+    "doc-exception-stale": {"ALLOWED_MISSING": {"docs/procfs.md": "probe: pretend the path "
+                                                                    "has not merged yet"}},
     "no-git": {"GIT": ""},
 }
 
@@ -1069,12 +1083,19 @@ def apply_probe(root: str, name: str) -> None:
         # makes the class trustworthy: with the contradiction landed the gate must fire, and
         # with the claim back but the evidence absent it must stay silent. (A single probe on
         # entry #1 is how a mixed-up polarity went unnoticed.)
+        #
+        # All three gaps have since CLOSED, so their evidence is now part of the tracked tree
+        # and "the evidence is absent" no longer describes the copy: the clean direction has
+        # to remove the evidence explicitly. Without that it stopped controlling polarity and
+        # just asserted that the real contradiction is invisible — which is false, and is how
+        # all three clean probes were failing on main 2.7.0 (see QA finding F-03).
         _kind, idx_s, direction = name.split("-")
         idx = int(idx_s)
         _append(root, "AGENTS.md", "\n" + ABSENCE_PROBE_TEXT[idx - 1] + "\n")
         if direction == "fire":
             _land_contradiction(root, idx)
         else:
+            _clear_contradiction(root, idx)
             rep = run_checks(root, quiet=True)
             fired = [f for f in rep.failures if "absence claim" in f]
             if fired:
@@ -1125,8 +1146,6 @@ def apply_probe(root: str, name: str) -> None:
     elif name == "src-shebang":
         _sub(os.path.join(root, "tools/host_tests.py"), re.compile(r"^#!.*python3.*$", re.M),
              lambda m: "#!/usr/bin/env python")
-    elif name == "doc-exception-stale":
-        _touch(root, "docs/procfs.md")
     elif name == "src-untracked":
         # The scratch copy becomes a checkout with everything committed, then a documented
         # path appears WITHOUT being committed: exactly the tools/e2e.py situation.
@@ -1179,6 +1198,40 @@ def _land_contradiction(root: str, idx: int) -> None:
         _append(root, "src/selftest_lx.rs", "// run_tls_big_check lives here\n")
     else:
         raise AssertionError(f"no contradiction defined for absence #{idx}")
+
+
+def _clear_contradiction(root: str, idx: int) -> None:
+    """Remove the evidence that makes absence claim `idx` (1-based) false.
+
+    The "clean" direction of an absence probe must prove the finding stays silent when the
+    gap is real. On a tree where the gap has since closed the evidence is present, so the
+    scratch copy has to lose it explicitly; merely re-asserting the claim would be a probe
+    that cannot fail (QA finding F-03; all three gaps had closed by 2.7.0, which is why the
+    old clean probes were red on `main`).
+    """
+    if idx == 1:
+        _remove(root, "src/vfs/procfs.rs")
+    elif idx == 2:
+        _remove(root, "src/pkg/openpgp.rs")
+        _sub(os.path.join(root, "src/pkg/apt.rs"),
+             re.compile(re.escape("openpgp::verify")),
+             lambda m: "probe_removed_verify", count=0)
+    elif idx == 3:
+        _sub(os.path.join(root, "Cargo.toml"),
+             re.compile(r"^\s*lx_tlsbig\s*=\s*\[\]\s*$", re.M),
+             lambda m: "# probe: feature removed", count=0)
+        _sub(os.path.join(root, "src/selftest_lx.rs"),
+             re.compile(re.escape("run_tls_big_check")),
+             lambda m: "probe_removed_big_check", count=0)
+    else:
+        raise AssertionError(f"no clean direction defined for absence #{idx}")
+
+
+def _remove(root: str, rel: str) -> None:
+    """Delete a scratch-copy file if it exists (probe support)."""
+    path = os.path.join(root, rel)
+    if os.path.exists(path):
+        os.remove(path)
 
 
 def _append(root: str, rel: str, text: str) -> None:
