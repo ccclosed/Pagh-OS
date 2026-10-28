@@ -5490,6 +5490,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             shell_prop_tests::unit_path_and_listing_format
         ),
         (
+            "shell::cat streaming ends the transcript on a fresh line (F-04)",
+            shell_prop_tests::unit_cat_stream_ends_transcript_on_fresh_line
+        ),
+        (
             "entropy::AT_RANDOM blocks distinct and non-degenerate (issue #16)",
             at_random_tests::blocks_are_distinct_and_mixed
         ),
@@ -5595,7 +5599,7 @@ pub fn run_all() -> (usize, u32, u32, i64) {
 // data structures and drops them, so running them via `selftest` leaves the
 // running kernel undisturbed.
 mod shell_prop_tests {
-    use crate::shell::{complete, editor, history, keys, path, registry, render, suggest};
+    use crate::shell::{cat, complete, editor, history, keys, path, registry, render, suggest};
     use alloc::string::{String, ToString};
     use alloc::vec::Vec;
 
@@ -6618,6 +6622,164 @@ mod shell_prop_tests {
         assert_kernel!(
             alloc::format!("{}/", dir_name) == "subdir/",
             "listing: directory entry formats with a trailing '/'"
+        );
+    }
+
+    /// Regression (QA finding F-04): `cat` of a file without a trailing newline
+    /// left the console on the file's last line, so the NEXT prompt was glued
+    /// onto it (`hello-pagh:/>`) — one corrupted line in every transcript a
+    /// human or an E2E grep reads. The rule lives in [`cat::stream`]; this
+    /// drives that same function with an in-memory file (deterministic, no VFS,
+    /// no console) and asserts the exact byte sequence the console receives.
+    pub fn unit_cat_stream_ends_transcript_on_fresh_line() {
+        /// Run the streaming core over `content`; `fail_at` makes the read
+        /// return an error once that many bytes have been echoed.
+        fn run(content: &[u8], fail_at: Option<u64>) -> (Vec<u8>, cat::Streamed) {
+            let mut out = Vec::with_capacity(content.len() + 1);
+            let res = cat::stream(
+                |offset, buf| {
+                    if let Some(limit) = fail_at {
+                        if offset >= limit {
+                            return Err(());
+                        }
+                    }
+                    let start = offset as usize;
+                    if start >= content.len() {
+                        return Ok(0);
+                    }
+                    let mut n = (content.len() - start).min(buf.len());
+                    if let Some(limit) = fail_at {
+                        n = n.min((limit - offset) as usize);
+                    }
+                    buf[..n].copy_from_slice(&content[start..start + n]);
+                    Ok(n)
+                },
+                |bytes| out.extend_from_slice(bytes),
+            );
+            (out, res)
+        }
+
+        // Empty file: nothing echoed, nothing appended.
+        let (out, res) = run(b"", None);
+        assert_kernel!(out.is_empty(), "cat: empty file prints nothing");
+        assert_eq_kernel!(
+            res,
+            cat::Streamed {
+                bytes: 0,
+                newline_added: false,
+                read_failed: false,
+            },
+            "cat: empty file result"
+        );
+
+        // The F-04 case: unterminated content gets exactly one newline.
+        let (out, res) = run(b"hello-pagh", None);
+        assert_eq_kernel!(
+            out.as_slice(),
+            b"hello-pagh\n" as &[u8],
+            "cat: unterminated file gets a terminating newline"
+        );
+        assert_eq_kernel!(res.bytes, 10, "cat: echoed every byte");
+        assert_kernel!(res.newline_added, "cat: reports the added newline");
+        assert_kernel!(!res.read_failed, "cat: clean read is not an error");
+
+        // Already terminated: printed verbatim, the newline is not doubled.
+        let (out, res) = run(b"hello\n", None);
+        assert_eq_kernel!(
+            out.as_slice(),
+            b"hello\n" as &[u8],
+            "cat: terminated file is printed verbatim"
+        );
+        assert_kernel!(
+            !res.newline_added,
+            "cat: no newline added to a terminated file"
+        );
+
+        // CRLF is already a line end; a lone CR is not one for the shell.
+        let (out, _) = run(b"line\r\n", None);
+        assert_eq_kernel!(
+            out.as_slice(),
+            b"line\r\n" as &[u8],
+            "cat: CRLF text is printed verbatim"
+        );
+        let (out, _) = run(b"line\r", None);
+        assert_eq_kernel!(
+            out.as_slice(),
+            b"line\r\n" as &[u8],
+            "cat: a lone CR is not a line end"
+        );
+
+        // A read error after some bytes: the caller's error message must start
+        // on its own line, so the terminator precedes the failure report.
+        let (out, res) = run(b"abcdef", Some(3));
+        assert_eq_kernel!(
+            out.as_slice(),
+            b"abc\n" as &[u8],
+            "cat: partial output is terminated on a read error"
+        );
+        assert_eq_kernel!(res.bytes, 3, "cat: bytes counts what was echoed");
+        assert_kernel!(res.read_failed, "cat: a read error is reported");
+
+        // Property over arbitrary content, including embedded/terminal newlines:
+        // the transcript is exactly the file plus at most one newline, and it
+        // never ends mid-line when it is non-empty.
+        let mut rng = XorShift64::new(0x0F04_0001);
+        for _ in 0..200 {
+            let len = rng.below(601);
+            let mut content = Vec::with_capacity(len + 1);
+            for _ in 0..len {
+                content.push((rng.next() & 0x7F) as u8);
+            }
+            let (out, res) = run(&content, None);
+            let mut want = content.clone();
+            if !content.is_empty() && content[content.len() - 1] != b'\n' {
+                want.push(b'\n');
+            }
+            assert_eq_kernel!(out, want, "cat: transcript = file + optional terminator");
+            assert_eq_kernel!(
+                res.bytes,
+                len as u64,
+                "cat: bytes equals the file length under the cap"
+            );
+            assert_kernel!(!res.read_failed, "cat: a byte slice cannot fail");
+            if let Some(last) = out.last() {
+                assert_eq_kernel!(*last, b'\n', "cat: transcript ends on a fresh line");
+            }
+        }
+
+        // The 64 KiB cap is exact and still terminates the transcript.
+        let max = cat::MAX_BYTES as usize;
+        let endless: Vec<u8> = core::iter::repeat(b'x').take(max + 10_000).collect();
+        let (out, res) = run(&endless, None);
+        assert_eq_kernel!(res.bytes, cat::MAX_BYTES, "cat: cap stops at MAX_BYTES");
+        assert_eq_kernel!(
+            out.len(),
+            max + 1,
+            "cat: caught content is capped and newline-terminated"
+        );
+        assert_eq_kernel!(
+            *out.last().unwrap(),
+            b'\n',
+            "cat: capped transcript ends on a fresh line"
+        );
+        // A file that ends with '\n' exactly at the cap is not padded.
+        let mut exact = Vec::with_capacity(max);
+        exact.resize(max - 1, b'a');
+        exact.push(b'\n');
+        let (out, res) = run(&exact, None);
+        assert_eq_kernel!(
+            res.bytes,
+            cat::MAX_BYTES,
+            "cat: exact-cap file is fully read"
+        );
+        assert_eq_kernel!(
+            out.len(),
+            max,
+            "cat: terminated file at the cap is not padded"
+        );
+        assert_kernel!(
+            !res.newline_added,
+            "cat: no newline when the cap lands on one"
         );
     }
 }

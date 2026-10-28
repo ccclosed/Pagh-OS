@@ -6,10 +6,11 @@
 // framebuffer, serial, and VFS.
 mod commands;
 // The pure-logic submodules are exposed `pub(crate)` so the in-kernel property
-// suite in `src/test.rs` can exercise them directly (design properties P21–P27
-// and the registry/render/path unit tests). They remain crate-private — nothing
-// leaves the crate. `commands` stays private (it is thin VFS/console I/O).
+// suite in `src/test.rs` can exercise them directly (design properties P21–P29
+// and the registry/render/path/cat unit tests). They remain crate-private —
+// nothing leaves the crate. `commands` stays private (it is thin VFS/console I/O).
 pub(crate) mod caret;
+pub(crate) mod cat;
 pub(crate) mod complete;
 pub(crate) mod editor;
 pub(crate) mod history;

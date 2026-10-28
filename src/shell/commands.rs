@@ -208,7 +208,8 @@ pub(super) fn cmd_ls(_ctx: &mut ShellCtx, args: &[&str]) {
 }
 
 /// `cat <path>`: print a file's contents, capping the total bytes read so an
-/// endless device cannot spin forever.
+/// endless device cannot spin forever, and end the transcript on a fresh line
+/// so the next prompt cannot be glued onto the file's last line.
 pub(super) fn cmd_cat(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
         shell_println("cat: missing operand");
@@ -220,26 +221,15 @@ pub(super) fn cmd_cat(_ctx: &mut ShellCtx, args: &[&str]) {
             if node.is_directory() {
                 shell_println(&alloc::format!("cat: {}: is a directory", path));
             } else {
-                // Read in chunks, capping total bytes to avoid spinning forever
-                // on endless devices.
-                const MAX_BYTES: u64 = 64 * 1024;
-                let mut offset: u64 = 0;
-                let mut buf = [0u8; 256];
-                loop {
-                    if offset >= MAX_BYTES {
-                        break;
-                    }
-                    match node.read(offset, &mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            shell_print_bytes(&buf[..n]);
-                            offset += n as u64;
-                        }
-                        Err(_) => {
-                            shell_println(&alloc::format!("cat: {}: read error", path));
-                            break;
-                        }
-                    }
+                // The streaming/newline rules live in `shell::cat` so the
+                // in-kernel property suite exercises the same bytes a user
+                // gets; this handler is only the VFS read + console sink.
+                let out = super::cat::stream(
+                    |offset, buf| node.read(offset, buf).map_err(|_| ()),
+                    shell_print_bytes,
+                );
+                if out.read_failed {
+                    shell_println(&alloc::format!("cat: {}: read error", path));
                 }
             }
         }

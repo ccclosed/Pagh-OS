@@ -10,6 +10,7 @@ Framebuffer-shell с редактированием строки, историе
 |---|---|
 | `mod.rs` | I/O-слой REPL: REPL-цикл (`shell_main`), диспетч через реестр, Tab, autorun, dual serial+framebuffer печать, status bar |
 | `commands.rs` | Тела всех команд (`cmd_help`, `cmd_ls`, `cmd_apt`, …) + хелперы `shell_println`, `resolve_arg`, `rm_path` и др. |
+| `cat.rs` | Чистое ядро `cat`: потоковое чтение чанками 256 Б с капом 64 KiB, дословный вывод и завершающий `\n`, если файл не заканчивается переводом строки (иначе следующий промпт приклеивался к последней строке файла — QA F-04) |
 | `registry.rs` | Статическая таблица `COMMANDS: &[CommandSpec]`; `lookup()`, `command_names()` |
 | `editor.rs` | `LineEditor` — чистая буфер+курсор модель (курсор в чар-юнитах, cap 256) |
 | `history.rs` | `History` — bounded ring (CAP=64), recall вверх/вниз, stash текущей строки, дедуп подряд идущих |
@@ -90,7 +91,9 @@ Shift+букву строчной при выключенном CapsLock.
 
 ## Команды (полный список)
 
-`help`, `clear`, `echo`, `uptime`, `ls`, `cat` (cap 64 KiB), `mkdir`, `touch`, `write`
+`help`, `clear`, `echo`, `uptime`, `ls`, `cat` (cap 64 KiB; если файл не заканчивается
+`\n`, вывод завершается переводом строки, чтобы промпт не приклеился к последней строке),
+`mkdir`, `touch`, `write`
 (заменяет содержимое: `truncate(0)` + запись, поэтому короткий текст не оставляет хвоста),
 `rm` (`-r`/`-rf`, post-order, depth cap 24), `sync`, `fscrash` (демо journal replay:
 запись, ремоунт ext2, `journal.recover()`, верификация), `pci`, `exec` (встроенный
@@ -162,8 +165,9 @@ fixed env `TERM=xterm`, `PATH=/mnt/usr/bin`; foreground-ожидание с poll
 
 - **От:** `drivers` (framebuffer, cursor, ps2_mouse, ps2_kbd), `vfs`, `net`, `pkg`,
   `task::{process, compat, scheduler}`, `arch::cpu`, `apic::TICK_HZ`, `log`, `sync::spinlock`.
-- **На неё:** `boot.rs` (вызов `shell_main`), `test.rs` (свойства P21–P27 гоняют чистые
-  модули `complete/editor/history/keys/path/render/suggest/registry` напрямую).
+- **На неё:** `boot.rs` (вызов `shell_main`), `test.rs` (свойства P21–P29 + unit-проверки
+  гоняют чистые модули `complete/editor/history/keys/path/render/suggest/registry/cat`
+  напрямую).
 
 ## Грабли
 
