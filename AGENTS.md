@@ -33,7 +33,8 @@ arbiter — local green is necessary, not sufficient. The block is a *set*, not 
 suggestion: `tools/check_agents_md.py` compares it with the `run:` steps of the
 workflow in both directions, so a gate that CI runs and this block omits (or the
 other way round) fails. For a faster inner loop, `cargo build` alone builds the
-debug library; `tools/build.py build` additionally links and stages. To see the
+debug library; `tools/build.py build` additionally links, and `tools/build.py stage`
+writes the bootable ESP used by QEMU. To see the
 claim gate prove itself, run it with `--probe`: it breaks each class of claim in
 a scratch copy and requires a finding for every break.
 
@@ -55,7 +56,7 @@ gate can infer from the filesystem — so it is written down, and
 has its canonical counterpart, names a different file and says why it is legacy.
 
 ```text
-kernel-build      -> tools/build.py          # builder: cargo + linker + stage (debug/release)
+kernel-build      -> tools/build.py          # builder: cargo + linker; `stage` writes the ESP
 kernel-run        -> run.sh                  # Linux/QEMU launcher (build.sh = toolchain guard)
 kernel-run-legacy -> run.cmd                 # Windows-only legacy launcher (run.cmd build|run)
 kernel-e2e        -> tools/e2e.py            # in-guest E2E driver (Linux/CI, no pwsh)
