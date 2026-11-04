@@ -117,10 +117,12 @@ impl LinuxStat {
 /// `size` is placed in `st_size` and `mode` (which already carries the file-type
 /// bits such as [`S_IFREG`]) in `st_mode`. `st_blksize` is set to a sane value and
 /// every other field is zeroed (R2.8).
-pub fn encode_stat(size: u64, mode: u32) -> LinuxStat {
+pub fn encode_stat(size: u64, mode: u32, uid: u32, gid: u32) -> LinuxStat {
     let mut stat = LinuxStat::zeroed();
     stat.st_size = size as i64;
     stat.st_mode = mode;
+    stat.st_uid = uid;
+    stat.st_gid = gid;
     stat.st_blksize = DEFAULT_BLKSIZE;
     stat
 }

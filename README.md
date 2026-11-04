@@ -42,7 +42,8 @@ userland** onto its ext2 disk after an opt-in confirmation at first boot.
 > values, the `set*id` family changes them under the Linux rules, and the syscall layer
 > enforces POSIX owner/group/other bits (with the standard root read/write bypass and
 > the "execute still needs an x bit" rule) on `open`, `execve`, directory mutation,
-> `chmod`/`chown` and `kill`, backed by ext2 `i_mode`/`i_uid`/`i_gid`. SMEP is enabled
+> `chmod`/`chown`, `kill` and `access`, backed by ext2 `i_mode`/`i_uid`/`i_gid`
+> (creation stamps the caller's ids and mode; `stat` reports them). SMEP is enabled
 > when CPUID reports it. What is **still missing**: there are no user accounts or login
 > (the shell and every kernel-spawned process default to root, so the model only
 > constrains processes that deliberately drop privileges), no setuid-binary elevation on

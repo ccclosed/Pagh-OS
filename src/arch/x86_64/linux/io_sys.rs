@@ -812,7 +812,7 @@ const O_NOFOLLOW_FL: u64 = 0o400000;
 /// /tmp ramfs; read-only trees still refuse) and best-effort O_TRUNC.
 /// `ENOENT` if the path is absent and O_CREAT is unset (R2.5). Shared by
 /// `open`/`openat`.
-fn open_path(path: &str, flags: u64) -> Result<u64, Errno> {
+fn open_path(path: &str, flags: u64, mode: u32) -> Result<u64, Errno> {
     let abs = resolve_path(path);
     let trimmed = abs.trim_end_matches('/');
     let lookup_target = if trimmed.is_empty() { "/" } else { trimmed };
@@ -878,10 +878,13 @@ fn open_path(path: &str, flags: u64) -> Result<u64, Errno> {
                 );
                 Errno::EIO
             })?;
-            // Record the creation mode (default perms masked by the process
-            // umask) so stat-family handlers report it.
+            // `open(2)`'s mode argument, masked by the process umask, is the
+            // file's real permission set; `0` means the caller passed no mode
+            // (some libc paths do), which Linux treats as `0666 & ~umask` for
+            // the read/write-without-exec case.
             stamp_creation_owner(&created);
-            record_mode_override(node_ino(&created), DEFAULT_FILE_PERMS & !current_umask());
+            let requested = if mode == 0 { 0o666 } else { mode & 0o7777 };
+            let _ = apply_node_mode(&created, requested & !current_umask());
         }
     }
     open_resolved(&abs)
@@ -890,9 +893,9 @@ fn open_path(path: &str, flags: u64) -> Result<u64, Errno> {
 /// `open` (2): open an existing ext2 path (resolved against the cwd if relative),
 /// allocating the lowest fd ≥ 3 (R2.4); `ENOENT` if the path is absent (R2.5).
 /// Directories open as a directory descriptor usable with `getdents64`.
-pub fn sys_open(path: u64, flags: u64, _mode: u64) -> Result<u64, Errno> {
+pub fn sys_open(path: u64, flags: u64, mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
-    let fd = open_path(&p, flags)?;
+    let fd = open_path(&p, flags, mode as u32)?;
     // Honor O_CLOEXEC now that execve sweeps flagged descriptors.
     if flags & O_CLOEXEC != 0 {
         compat::with_current_compat(|cs| cs.fds.set_cloexec(fd as u32, true));
@@ -902,12 +905,12 @@ pub fn sys_open(path: u64, flags: u64, _mode: u64) -> Result<u64, Errno> {
 
 /// `openat` (257): like `open`. `AT_FDCWD` (and any dirfd in this minimal layer)
 /// resolves the path against the process cwd; absolute paths ignore the dirfd.
-pub fn sys_openat(dirfd: u64, path: u64, flags: u64, _mode: u64) -> Result<u64, Errno> {
+pub fn sys_openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     // Absolute paths ignore dirfd; relative paths resolve against the cwd (the
     // only directory base this minimal layer tracks), which covers AT_FDCWD.
     let _ = dirfd;
-    let fd = open_path(&p, flags)?;
+    let fd = open_path(&p, flags, mode as u32)?;
     // Honor O_CLOEXEC now that execve sweeps flagged descriptors.
     if flags & O_CLOEXEC != 0 {
         compat::with_current_compat(|cs| cs.fds.set_cloexec(fd as u32, true));
@@ -1186,18 +1189,17 @@ fn record_mode_override(ino: u64, perms: u32) {
 /// recorded, else the long-standing defaults (0755 files / 0700 dirs —
 /// everything runs as root, and apt-installed programs need the X bits).
 fn stat_mode_for(node: &Arc<dyn VfsNode>) -> u32 {
+    // The override is kept for synthetic nodes (`/proc`, `/dev`, ramfs) that
+    // cannot persist a mode; real files answer from their inode, which is what
+    // the permission checks use, so stat can no longer disagree with access.
     let perms = match mode_override_perms(node_ino(node)) {
         Some(p) => p,
-        None => {
-            if node.is_directory() {
-                0o700
-            } else {
-                DEFAULT_FILE_PERMS
-            }
-        }
+        None => node.mode() & 0o7777,
     };
     if node.is_directory() {
         S_IFDIR | perms
+    } else if node.is_symlink() {
+        S_IFLNK | perms
     } else {
         S_IFREG | perms
     }
@@ -1206,7 +1208,8 @@ fn stat_mode_for(node: &Arc<dyn VfsNode>) -> u32 {
 /// Fill a [`LinuxStat`] for a node and copy it to the validated user buffer.
 fn write_stat(node: &Arc<dyn VfsNode>, statbuf: u64) -> Result<u64, Errno> {
     let mode = stat_mode_for(node);
-    let mut stat = encode_stat(node.size(), mode);
+    let (uid, gid) = node.owner();
+    let mut stat = encode_stat(node.size(), mode, uid, gid);
     // File identity matters. glibc's ld.so deduplicates loaded
     // shared objects by the (st_dev, st_ino) pair from `fstat`, and the main
     // executable's link_map carries an all-zero file id. With st_dev/st_ino
@@ -1232,7 +1235,8 @@ fn write_stat(node: &Arc<dyn VfsNode>, statbuf: u64) -> Result<u64, Errno> {
 /// needed here (documented in `src/vfs/README.md`).
 fn write_link_stat(node: &Arc<dyn VfsNode>, statbuf: u64) {
     let len = node.read_link().map(|t| t.len() as u64).unwrap_or(0);
-    let mut stat = encode_stat(len, S_IFLNK | 0o777);
+    let (uid, gid) = node.owner();
+    let mut stat = encode_stat(len, S_IFLNK | 0o777, uid, gid);
     stat.st_dev = STAT_DEV_VFS;
     stat.st_ino = node_ino(node);
     stat.st_nlink = node.nlink();
@@ -1264,7 +1268,7 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> Result<u64, Errno> {
         Some(Resolved::Socket { .. }) => {
             // Socketpair ends report S_IFSOCK — libuv's
             // uv_guess_handle checks the fd type of stdio descriptors.
-            let stat = encode_stat(0, S_IFSOCK | 0o666);
+            let stat = encode_stat(0, S_IFSOCK | 0o666, 0, 0);
             write_stat_struct(&stat, statbuf);
             Ok(0)
         }
@@ -1274,12 +1278,12 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> Result<u64, Errno> {
         | Some(Resolved::PipeWrite(_))
         | Some(Resolved::Eventfd { .. })
         | Some(Resolved::Epoll) => {
-            let stat = encode_stat(0, S_IFCHR | 0o620);
+            let stat = encode_stat(0, S_IFCHR | 0o620, 0, 0);
             write_stat_struct(&stat, statbuf);
             Ok(0)
         }
         Some(Resolved::Dir) => {
-            let stat = encode_stat(0, S_IFDIR | 0o700);
+            let stat = encode_stat(0, S_IFDIR | 0o700, 0, 0);
             write_stat_struct(&stat, statbuf);
             Ok(0)
         }
@@ -1720,11 +1724,33 @@ fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
 
 /// `access` (21): succeed (return 0) when the path exists on the VFS/ext2 tree,
 /// else `ENOENT` (R2.5). The requested access mode is not enforced in this layer.
-pub fn sys_access(path: u64, _mode: u64) -> Result<u64, Errno> {
+pub fn sys_access(path: u64, mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
     // `access(2)` follows symlinks (a dangling link is ENOENT).
-    walk(&abs, true)?;
+    let node = walk(&abs, true)?;
+    if mode & !0o7 != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // POSIX: access(2) checks the REAL ids (not the effective ones); the
+    // root bypass still applies, but a setuid-style elevation cannot be used
+    // to probe rights the process would not have after dropping back.
+    let creds = current_creds();
+    let real = Creds::new(
+        creds.uid, creds.gid, creds.uid, creds.gid, creds.uid, creds.gid,
+    );
+    let owner = node.owner();
+    let file_mode = node.mode();
+    let wanted = [
+        (0o4, Access::Read),
+        (0o2, Access::Write),
+        (0o1, Access::Execute),
+    ];
+    for (bit, access) in wanted {
+        if mode & bit != 0 && !real.may(file_mode, owner, access) {
+            return Err(Errno::EACCES);
+        }
+    }
     Ok(0)
 }
 
@@ -1865,7 +1891,7 @@ pub fn sys_renameat2(
     rename_paths(&o, &n, flags)
 }
 
-pub fn sys_mkdir(path: u64, _mode: u64) -> Result<u64, Errno> {
+pub fn sys_mkdir(path: u64, mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
     let trimmed = abs.trim_end_matches('/');
@@ -1894,10 +1920,15 @@ pub fn sys_mkdir(path: u64, _mode: u64) -> Result<u64, Errno> {
         );
         Errno::EIO
     })?;
-    // Record the creation mode (default dir perms masked by the process
-    // umask) so stat-family handlers report it.
+    // Apply `mkdir(2)`'s mode argument (masked by the umask) to the inode, so
+    // stat and permission checks agree from the first lookup.
     stamp_creation_owner(&created);
-    record_mode_override(node_ino(&created), 0o700 & !current_umask());
+    let requested = if mode == 0 {
+        0o777
+    } else {
+        mode as u32 & 0o7777
+    };
+    let _ = apply_node_mode(&created, requested & !current_umask());
     Ok(0)
 }
 

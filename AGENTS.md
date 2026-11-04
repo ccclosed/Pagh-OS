@@ -231,8 +231,14 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.7.1**
-  (the QA-fix patch bump; it lands on `main` with the merge). **2.7.1** = the
+  be reflected here. **`main` currently reads 2.8.0**
+  (the credentials/permissions minor bump; it lands on `main` with the merge).
+  **2.8.0** = the security model: per-process real/effective/saved uid+gid in
+  `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
+  `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real
+  ext2 `i_mode`/`i_uid`/`i_gid`, creation stamps the caller's ids and mode,
+  `stat` reports real metadata, and SMEP is enabled when CPUID reports it.
+  Contract: `docs/security-model.md`. **2.7.1** = the
   F-01/F-03/F-04 QA fixes (STAR readback at info, `cat` transcript terminator,
   a claim gate whose `--probe` really tests it). **2.7.0** = the console renders
   **antialiased** text: the
@@ -309,6 +315,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `SECURITY.md`: no login/accounts (the shell and all kernel-spawned processes
   start as root), no setuid-binary elevation on `execve`, no supplementary
   groups/ACLs/`fsuid`, no capability sets/seccomp/LSM/audit, no sticky-bit or
-  directory-owner checks, `access(2)` is still an existence probe, `stat` still
-  uses the historical 0755/0700 defaults unless the process recorded an
-  override, and SMEP is the only hardware mitigation (SMAP/KPTI are absent).
+  directory-owner checks, synthetic nodes (`/dev`, `/proc`, ramfs) cannot
+  persist an owner and keep the historical per-process `stat` override, and
+  SMEP is the only hardware mitigation (SMAP/KPTI are absent). `access(2)`
+  checks real ids; `stat` reports real inode metadata.

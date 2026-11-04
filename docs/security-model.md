@@ -94,12 +94,17 @@ All checks live in `src/arch/x86_64/linux/`; the VFS remains credential-free.
 | `chown`/`fchown` | root only; `(uid_t)-1` keeps the current id | `EPERM` |
 | `kill` | sender euid is root, or equals the target's real or effective uid; a group/broadcast send delivers to the permitted subset | `EPERM` if none permitted |
 | `tgkill` | same rule for the addressed thread | `EPERM` |
+| `access` | the real-id variant of the `may` matrix (`R_OK`/`W_OK`/`X_OK`; `F_OK` is existence); follows symlinks | `EACCES` |
+| `stat`/`lstat`/`fstat` | reports the inode's real permission bits, type and `st_uid`/`st_gid` (the per-process override is only for nodes that cannot store metadata) | — |
 
-`chmod` writes the ext2 inode and also records the historical per-process stat override,
-because `stat_mode_for` still prefers that override and the existing userland expects it
-for untouched files. Synthetic nodes cannot persist metadata: their `set_mode` returns
-`NotSupported` (the override still makes `stat` report the mode), and `chown` returns
-`EPERM` instead of pretending to have stored an owner.
+`chmod` writes the ext2 inode and also records the historical per-process stat override;
+`stat` prefers that override (it is what keeps synthetic nodes coherent) and otherwise
+reports the real `VfsNode::mode`/`owner`. Creation through `open(O_CREAT)` and `mkdir`
+applies the caller's mode argument masked by the umask to the inode and stamps the
+creator's effective ids, so a non-root process owns what it creates and can `chmod` it.
+Synthetic nodes cannot persist metadata: their `set_mode` returns `NotSupported` (the
+override still makes `stat` report the mode), and `chown` returns `EPERM` instead of
+pretending to have stored an owner.
 
 The package installer now applies each tar member's `mode` to the created ext2 inode.
 Without that, every apt-installed program would be `0644`, and the execute check would
@@ -116,10 +121,9 @@ reject it even for root.
   namespaces.** Owner/group/other + root bypass is the whole model.
 * **No sticky-bit or directory-owner checks** on unlink/rename beyond the parent
   write+execute rule.
-* **No `access(2)` enforcement** — it remains an existence probe that reports success.
-* **`stat` reports the historical defaults** (`0755` files / `0700` dirs) unless the
-  process recorded an override; `st_uid`/`st_gid` are not yet rendered. Permission
-  decisions always use the real `VfsNode::mode`/`owner`.
+* **Synthetic nodes have no persistable owner/mode.** `/dev`, `/proc` and the RAM-backed
+  tree keep the historical per-process override for `stat`; a non-root file created there
+  remains root-owned for `chmod`/`chown` purposes.
 * **SMEP only.** `CR4.SMEP` is set when CPUID leaf 7 EBX bit 7 reports support. SMAP
   (would require `stac`/`clac` around every user-memory access) and KPTI (would require a
   separate kernel page-table hierarchy) are not implemented.
