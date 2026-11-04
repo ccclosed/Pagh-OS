@@ -2,6 +2,19 @@
 
 pagh is an educational kernel, not a production operating system.
 
+## Threat model in one paragraph
+
+pagh gives you two things: **kernel integrity** (ring 3 cannot read or write kernel
+memory, execute writable memory, or touch device MMIO — paging enforces it) and
+**package authenticity** (the TLS/OpenPGP/digest chain above refuses a mirror that
+cannot prove what it served). It gives you **no containment of a hostile local
+process**: every process runs with the same identity (`getuid()` is 0 everywhere, a
+single-uid model), has the whole syscall surface, and there is no ASLR/KASLR, no
+KPTI, no SMEP/SMAP, no seccomp/capabilities, no LSM, no audit and no authenticated
+filesystem permissions. Side channels, network availability and firmware are out of
+scope. Treat it as a teaching kernel that a careful operator runs only with code they
+trust.
+
 ## Safe defaults
 
 The development build enables outbound package downloads through the default `network_packages` Cargo feature, which activates the network transport; `cargo build --no-default-features` produces a fail-closed build with no outbound package transport.

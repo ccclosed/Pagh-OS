@@ -35,7 +35,14 @@ included), includes an **`apt`-style package manager** that fetches and installs
 `.deb` packages by name over HTTP/HTTPS, and can **provision a base glibc + Python
 userland** onto its ext2 disk after an opt-in confirmation at first boot.
 
-> Hobby/educational kernel. There is no security model beyond ring 0/3 paging.
+> Hobby/educational kernel — **not a security boundary.** Ring 3 is isolated from the
+> kernel by paging (the U/S bit, W^X/NX leaves, and device MMIO never user-accessible)
+> and syscall buffers are range-checked against user mappings, but there is no privilege
+> separation *between* processes (a single-uid model: every process sees `getuid() == 0`),
+> no ASLR/KASLR, no seccomp or capability model, no KPTI and no SMEP/SMAP, and no LSM or
+> audit trail. The TLS + OpenPGP + digest chain below authenticates **packages** against a
+> hostile mirror; it does not contain hostile local code. Do not run untrusted binaries or
+> expose this kernel to a network you do not control. Details in `SECURITY.md`.
 
 > **Network default:** outbound package operations are **enabled** in normal builds
 > (`default = ["network_packages"]` in `Cargo.toml`). Two independent halves now
