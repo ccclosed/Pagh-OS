@@ -54,6 +54,12 @@ same pure module and follow the Linux ownership rules:
 never change the real id on the unprivileged path. A refused transition returns `EPERM`.
 `getresuid`/`getresgid` validate all three user pointers before writing any of them.
 
+One deliberate deviation from Linux: on the unprivileged `setuid`/`setgid` path pagh
+also sets the saved id to the new effective id, so a process that drops root cannot
+re-acquire it through the saved id. That is stricter than Linux (which leaves the saved
+id alone) and is the rule this milestone asked for; it is not a compatibility promise
+for setuid-root programs, which pagh does not support anyway.
+
 ## 2. Filesystem metadata
 
 `VfsNode` (`src/vfs/mod.rs`) gained four **metadata-only** methods:
@@ -115,6 +121,13 @@ reject it even for root.
 * **`link(2)`/`symlink(2)` do not exist** in this syscall set, so the parent-directory
   rule is documented for the VFS operations the installer uses, not enforced through a
   missing syscall.
+* **Images populated before this change** (including a local `disk.img`) store
+  apt-installed programs as `0644`, because the old installer ignored the tar mode.
+  `execve` of such a file now returns `EACCES` until the package is reinstalled (the
+  installer now applies the archive mode) or the file is `chmod +x`. Kernel-internal
+  launchers (`run_linux_binary`, the shell's `lxrun`, the `lx_selftest` harnesses) are
+  not affected: they bypass the syscall check, exactly like the package installer
+  bypasses the VFS checks.
 
 ## 5. Tests
 
@@ -122,11 +135,13 @@ reject it even for root.
   independent oracle over arbitrary ids/modes, the exact root execute law, exhaustive
   class selection on a small id universe, and every `set*id` transition's ownership
   invariant. Runs via `python3 tools/host_tests.py`.
-* **In-QEMU `src/test.rs`** (`security_tests`, four routines): the permission matrix,
-  setuid transitions, chmod/chown rules plus ext2 mode/owner write-back, and the kill
-  permission rule. They allocate no PMM frames net of the suite and the ext2 test uses
-  the heap-backed mock and removes its file.
-* `python3 tools/e2e.py selftest` prints `SELFTEST SUMMARY: 79 routines, 0 failed
+* **In-QEMU `src/test.rs`** (`security_tests`, five routines): the permission matrix,
+  setuid transitions, chmod/chown rules plus ext2 mode/owner write-back, the kill
+  permission rule, and a get/set*id syscall round-trip against a synthetic
+  `CompatState` (root drops to 1000/100, then `setuid(0)`/`setgid(0)` are `EPERM`).
+  They allocate no PMM frames net of the suite and the ext2 test uses the
+  heap-backed mock and removes its file.
+* `python3 tools/e2e.py selftest` prints `SELFTEST SUMMARY: 80 routines, 0 failed
   checks, 0 skipped` on this branch.
 
 ## 6. Review checklist for new syscalls

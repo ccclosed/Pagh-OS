@@ -5261,8 +5261,13 @@ mod linux_tick_tests {
 mod security_tests {
     use super::mock_block::MockBlockDevice;
     use crate::arch::x86_64::linux::cred::{Access, Creds};
+    use crate::arch::x86_64::linux::errno::Errno;
     use crate::arch::x86_64::linux::kill::kill_permits;
+    use crate::arch::x86_64::linux::misc;
     use crate::fs::ext2::Ext2Fs;
+    use crate::task::compat::{self, CompatState};
+    use crate::task::fd::FdTable;
+    use crate::task::scheduler;
     use crate::vfs::VfsError;
     use alloc::sync::Arc;
 
@@ -5438,6 +5443,62 @@ mod security_tests {
         assert_kernel!(kill_permits(1000, 1001, 1000), "effective-id match");
         assert_kernel!(!kill_permits(1000, 1001, 1002), "foreign uid -> EPERM");
         assert_kernel!(!kill_permits(0xFFFF_FFFF, 0, 0), "non-root not owner");
+    }
+
+    /// The real syscall handlers: get/set id round-trips against a synthetic
+    /// `CompatState`, including the EPERM a non-root process gets when it tries
+    /// to become root. The state is installed for this routine only and removed
+    /// afterwards, so the suite leaves the registry as it found it.
+    pub fn syscall_cred_roundtrip() {
+        let me = scheduler::current_pid();
+        let st = CompatState::new(
+            FdTable::with_standard_streams(),
+            Arc::new(crate::sync::spinlock::Spinlock::new(
+                crate::arch::x86_64::linux::mem::VmRegionSet::new(0, 0),
+            )),
+            me,
+        );
+        compat::install_compat(me, st);
+
+        assert_eq_kernel!(misc::sys_getuid(), Ok(0), "getuid starts at 0");
+        assert_eq_kernel!(misc::sys_getgid(), Ok(0), "getgid starts at 0");
+        assert_eq_kernel!(misc::sys_geteuid(), Ok(0), "geteuid starts at 0");
+        assert_eq_kernel!(misc::sys_getegid(), Ok(0), "getegid starts at 0");
+
+        // Root may drop to an arbitrary user/group; all three ids follow. Do the
+        // GROUP change first: after `setuid(1000)` the process is no longer
+        // privileged, and `setgid(100)` would (correctly) be EPERM.
+        assert_eq_kernel!(misc::sys_setgid(100), Ok(0), "root setgid(100)");
+        assert_eq_kernel!(misc::sys_getgid(), Ok(100), "getgid after setgid");
+        assert_eq_kernel!(misc::sys_getegid(), Ok(100), "getegid after setgid");
+        assert_eq_kernel!(misc::sys_setuid(1000), Ok(0), "root setuid(1000)");
+        assert_eq_kernel!(misc::sys_getuid(), Ok(1000), "getuid after setuid");
+        assert_eq_kernel!(misc::sys_geteuid(), Ok(1000), "geteuid after setuid");
+
+        // Now unprivileged: becoming root is EPERM, setresuid to owned ids works.
+        assert_eq_kernel!(misc::sys_setuid(0), Err(Errno::EPERM), "setuid(0) EPERM");
+        assert_eq_kernel!(misc::sys_setgid(0), Err(Errno::EPERM), "setgid(0) EPERM");
+        assert_eq_kernel!(
+            misc::sys_setresuid(1000, 1000, 1000),
+            Ok(0),
+            "setresuid to owned ids"
+        );
+        assert_eq_kernel!(
+            misc::sys_setresgid(100, 100, 100),
+            Ok(0),
+            "setresgid to owned ids"
+        );
+        assert_eq_kernel!(
+            misc::sys_setresuid(0, u32::MAX as u64, u32::MAX as u64),
+            Err(Errno::EPERM),
+            "setresuid(0) EPERM"
+        );
+
+        compat::remove_compat(me);
+        assert_kernel!(
+            !compat::current_has_compat(),
+            "synthetic credential state removed"
+        );
     }
 }
 
@@ -5707,6 +5768,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "security::kill permission rules",
             security_tests::kill_permission_rules
+        ),
+        (
+            "security::get/set*id syscall round-trip",
+            security_tests::syscall_cred_roundtrip
         ),
     ]
 }
