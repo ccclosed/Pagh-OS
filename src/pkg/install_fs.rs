@@ -94,7 +94,11 @@ pub fn install_data_tar(entries: &[TarEntry<'_>], root: &str) -> Result<usize, I
 
     for op in plan.ops.iter() {
         match op {
-            InstallOp::File { path, content, mode } => {
+            InstallOp::File {
+                path,
+                content,
+                mode,
+            } => {
                 install_one(root, path, content, *mode)?;
                 installed += 1;
             }

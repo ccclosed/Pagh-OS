@@ -5251,6 +5251,196 @@ mod linux_tick_tests {
     }
 }
 
+// ============================================================================
+// Security model: credentials, permission matrix, set*id transitions, chmod /
+// chown rules and kill permission. The pure half is host property P56; these
+// routines are the in-QEMU counterpart and also prove the ext2 metadata
+// write-back (mode/owner) end to end. Non-destructive: the mock filesystem is
+// heap-backed and its single test file is removed again.
+// ============================================================================
+mod security_tests {
+    use super::mock_block::MockBlockDevice;
+    use crate::arch::x86_64::linux::cred::{Access, Creds};
+    use crate::arch::x86_64::linux::kill::kill_permits;
+    use crate::fs::ext2::Ext2Fs;
+    use crate::vfs::VfsError;
+    use alloc::sync::Arc;
+
+    const FMT_TOTAL_BLOCKS: usize = 256 + 1 + 64;
+
+    fn fresh_ext2() -> Arc<MockBlockDevice> {
+        let dev = MockBlockDevice::with_fs_blocks(FMT_TOTAL_BLOCKS + 8);
+        Ext2Fs::format(dev.clone()).expect("format");
+        dev
+    }
+
+    /// Owner/group/other selection, root bypass and the execute rule.
+    pub fn permission_matrix() {
+        let owner = Creds::new(1000, 100, 1000, 100, 1000, 100);
+        let group = Creds::new(2000, 100, 2000, 100, 2000, 100);
+        let other = Creds::new(3000, 300, 3000, 300, 3000, 300);
+        let file = (1000u32, 100u32);
+
+        // 0640: owner rw, group r, other none.
+        let mode = 0o640;
+        assert_kernel!(owner.may(mode, file, Access::Read), "owner reads 0640");
+        assert_kernel!(owner.may(mode, file, Access::Write), "owner writes 0640");
+        assert_kernel!(
+            !owner.may(mode, file, Access::Execute),
+            "owner cannot exec 0640"
+        );
+        assert_kernel!(group.may(mode, file, Access::Read), "group reads 0640");
+        assert_kernel!(
+            !group.may(mode, file, Access::Write),
+            "group cannot write 0640"
+        );
+        assert_kernel!(!other.may(mode, file, Access::Read), "other denied 0640");
+
+        // 0755: group/other execute without read.
+        assert_kernel!(group.may(0o755, file, Access::Execute), "group execs 0755");
+        assert_kernel!(other.may(0o755, file, Access::Execute), "other execs 0755");
+        assert_kernel!(
+            !other.may(0o755, file, Access::Write),
+            "other cannot write 0755"
+        );
+
+        // Root bypasses r/w on a mode-0000 file, but execute still needs an x
+        // bit — the standard Linux rule, and the reason a 0644 file cannot be
+        // execed even by root.
+        let root = Creds::ROOT;
+        assert_kernel!(root.may(0o000, file, Access::Read), "root reads mode 0000");
+        assert_kernel!(
+            root.may(0o000, file, Access::Write),
+            "root writes mode 0000"
+        );
+        assert_kernel!(
+            !root.may(0o000, file, Access::Execute),
+            "root cannot exec 0000"
+        );
+        assert_kernel!(
+            !root.may(0o644, file, Access::Execute),
+            "root cannot exec 0644"
+        );
+        assert_kernel!(root.may(0o001, file, Access::Execute), "root execs 0001");
+        assert_kernel!(root.may(0o100, file, Access::Execute), "root execs 0100");
+        assert_kernel!(root.may(0o010, file, Access::Execute), "root execs 0010");
+
+        // Type/special bits must not leak into the permission decision.
+        assert_kernel!(
+            owner.may(0o104640, file, Access::Read),
+            "type bits ignored by may()"
+        );
+        assert_kernel!(
+            !owner.may(0o104640, file, Access::Execute),
+            "type bits do not grant execute"
+        );
+    }
+
+    /// setuid/setgid/setreuid/setresuid transitions (Linux ownership rules).
+    pub fn setid_transitions() {
+        // Root may set any id; all three identities move together.
+        let c = Creds::ROOT.setuid(1000).expect("root setuid");
+        assert_eq_kernel!(
+            (c.uid, c.euid, c.suid),
+            (1000, 1000, 1000),
+            "root setuid all"
+        );
+        let c = Creds::ROOT.setgid(100).expect("root setgid");
+        assert_eq_kernel!((c.gid, c.egid, c.sgid), (100, 100, 100), "root setgid all");
+
+        // Non-root may only choose the real or saved id.
+        let plain = Creds::new(1000, 100, 1000, 100, 1000, 100);
+        assert_kernel!(plain.setuid(0).is_none(), "plain setuid(0) -> EPERM");
+        assert_kernel!(plain.setgid(0).is_none(), "plain setgid(0) -> EPERM");
+        let saved = Creds::new(1000, 100, 1000, 100, 0, 0);
+        assert_kernel!(saved.setuid(0).is_some(), "saved uid 0 is reachable");
+        assert_kernel!(saved.setgid(0).is_some(), "saved gid 0 is reachable");
+        let next = saved.setuid(0).expect("saved uid");
+        assert_eq_kernel!(
+            (next.uid, next.euid, next.suid),
+            (1000, 0, 0),
+            "non-root setuid keeps the real id"
+        );
+
+        // setresuid: an unprivileged caller can only name ids it owns.
+        let owned = Creds::new(1000, 100, 1001, 100, 1002, 100);
+        assert_kernel!(owned.setresuid(Some(1002), None, None).is_some(), "owned r");
+        assert_kernel!(owned.setresuid(None, None, Some(1000)).is_some(), "owned s");
+        assert_kernel!(owned.setresuid(Some(0), None, None).is_none(), "not owned");
+        assert_kernel!(
+            owned.setresgid(Some(0), None, None).is_none(),
+            "gid not owned"
+        );
+        let res = Creds::ROOT
+            .setresuid(Some(1), Some(2), Some(3))
+            .expect("root resuid");
+        assert_eq_kernel!((res.uid, res.euid, res.suid), (1, 2, 3), "root resuid");
+
+        // setreuid(-1,-1) is a no-op; a real change resets the saved id.
+        assert_eq_kernel!(saved.setreuid(None, None), Some(saved), "setreuid no-op");
+        let changed = saved.setreuid(Some(0), Some(0)).expect("owned real id");
+        assert_eq_kernel!(changed.suid, 0, "saved follows the new effective id");
+    }
+
+    /// chmod is owner-or-root, chown is root-only; ext2 stores both.
+    pub fn chmod_chown_rules() {
+        let root = Creds::ROOT;
+        let owner = Creds::new(1000, 100, 1000, 100, 1000, 100);
+        let stranger = Creds::new(2000, 200, 2000, 200, 2000, 200);
+        assert_kernel!(root.may_chmod((1000, 100)), "root may chmod");
+        assert_kernel!(root.may_chown(), "root may chown");
+        assert_kernel!(owner.may_chmod((1000, 100)), "owner may chmod");
+        assert_kernel!(!stranger.may_chmod((1000, 100)), "stranger may not chmod");
+        assert_kernel!(!owner.may_chown(), "owner may not chown");
+
+        // ext2 metadata write-back, through the same VFS calls the syscalls use.
+        let dev = fresh_ext2();
+        let fs = Ext2Fs::mount_fs(dev).expect("mount ext2");
+        let rootdir = fs.root_node();
+        let _ = rootdir.remove("sec-model.tmp");
+        let node = rootdir.create_file("sec-model.tmp").expect("create");
+        assert_eq_kernel!(node.mode() & 0o777, 0o644, "new file defaults to 0644");
+        assert_eq_kernel!(node.owner(), (0, 0), "new file is root-owned");
+        node.set_mode(0o640).expect("set_mode");
+        assert_eq_kernel!(node.mode() & 0o777, 0o640, "ext2 mode round-trips");
+        node.set_owner(1000, 100).expect("set_owner");
+        assert_eq_kernel!(node.owner(), (1000, 100), "ext2 owner round-trips");
+
+        // The metadata is what the permission decision reads.
+        assert_kernel!(
+            !stranger.may(node.mode(), node.owner(), Access::Read),
+            "a foreign uid cannot read 0640"
+        );
+        assert_kernel!(
+            owner.may(node.mode(), node.owner(), Access::Write),
+            "owner writes 0640"
+        );
+        assert_kernel!(
+            !owner.may(node.mode(), node.owner(), Access::Execute),
+            "0640 is not executable"
+        );
+        // Reject an owner that ext2's u16 fields cannot represent rather than
+        // truncating it.
+        assert_eq_kernel!(
+            node.set_owner(70000, 0).err(),
+            Some(VfsError::InvalidArgument),
+            "out-of-range uid is EINVAL"
+        );
+
+        assert_kernel!(rootdir.remove("sec-model.tmp").is_ok(), "cleanup remove");
+    }
+
+    /// kill: root or same real/effective uid, nothing else.
+    pub fn kill_permission_rules() {
+        assert_kernel!(kill_permits(0, 0, 0), "root -> root");
+        assert_kernel!(kill_permits(0, 1000, 1001), "root -> anyone");
+        assert_kernel!(kill_permits(1000, 1000, 1001), "real-id match");
+        assert_kernel!(kill_permits(1000, 1001, 1000), "effective-id match");
+        assert_kernel!(!kill_permits(1000, 1001, 1002), "foreign uid -> EPERM");
+        assert_kernel!(!kill_permits(0xFFFF_FFFF, 0, 0), "non-root not owner");
+    }
+}
+
 pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
     alloc::vec![
         (
@@ -5500,6 +5690,23 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "linux::kill(2) dispatch + errno (issue #12)",
             linux_signal_tests::kill_dispatch_and_errno
+        ),
+        // Security model: credentials + filesystem permissions.
+        (
+            "security::permission matrix (owner/group/other + root execute)",
+            security_tests::permission_matrix
+        ),
+        (
+            "security::setuid/setgid/setresuid transitions",
+            security_tests::setid_transitions
+        ),
+        (
+            "security::chmod/chown rules + ext2 metadata write-back",
+            security_tests::chmod_chown_rules
+        ),
+        (
+            "security::kill permission rules",
+            security_tests::kill_permission_rules
         ),
     ]
 }

@@ -21,6 +21,7 @@ const CR0_MP: u64 = 1 << 1; // Monitor coprocessor: set alongside clearing EM.
 // CR4 bits relevant to SSE.
 const CR4_OSFXSR: u64 = 1 << 9; // OS supports FXSAVE/FXRSTOR and SSE.
 const CR4_OSXMMEXCPT: u64 = 1 << 10; // OS supports unmasked SSE exceptions (#XM).
+
 // Supervisor-mode execution prevention: ring 0 may not execute user pages.
 // Enabled only when CPUID leaf 7 EBX bit 7 reports support. SMAP (bit 21) and
 // KPTI are NOT implemented — see `SECURITY.md`.
