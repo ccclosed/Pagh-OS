@@ -608,6 +608,19 @@ fn resolve_exec_path(path: &str) -> String {
     abs
 }
 
+/// Resolve `path` exactly as [`exec_linux_image`] would and return the VFS node
+/// that would be execed (`None` when the path does not resolve, in which case
+/// the exec itself reports the error).
+///
+/// The syscall layer (`process_sys::sys_execve`) uses this to enforce the
+/// execute permission; the kernel-internal launcher (`run_linux_binary`, used by
+/// the boot selftests and the shell's `lxrun`) deliberately does not go through
+/// this check — it is a privileged kernel caller, like the package installer.
+pub fn exec_target_node(path: &str) -> Option<Arc<dyn crate::vfs::VfsNode>> {
+    let resolved = resolve_exec_path(path);
+    crate::vfs::lookup_path_walk(&resolved, true).ok()
+}
+
 /// Prepare and install a fresh ELF address space for the current pid. Open file
 /// descriptors, cwd, ppid and pid survive; VM/TLS/image state is reset.
 pub fn exec_linux_image(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<ExecImage, RunError> {

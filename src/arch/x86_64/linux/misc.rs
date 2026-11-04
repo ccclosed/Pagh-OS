@@ -19,6 +19,7 @@ use crate::task::compat;
 use crate::task::scheduler;
 
 use super::check_user_ptr;
+use super::cred::Creds;
 use super::diag::exit_code_byte;
 use super::errno::Errno;
 use super::rand_clock::{getrandom_plan, ticks_to_timespec, Timespec, CLOCK_REALTIME};
@@ -273,6 +274,14 @@ pub fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> Result<u64, Errno> {
     if tgid <= 0 || tgid as u64 != compat::tgid_of(tid) {
         return Err(Errno::ESRCH);
     }
+    // Same permission rule as kill(2), applied to the addressed thread (Linux's
+    // `do_tkill` runs `check_kill_permission` before delivering, including for
+    // the `sig == 0` existence probe).
+    if let Some(target) = compat::creds_of(tid) {
+        if !super::kill::kill_permits(compat::current_creds().euid, target.uid, target.euid) {
+            return Err(Errno::EPERM);
+        }
+    }
     if sig == 0 {
         // Existence probe: the pair is valid, nothing is sent.
         return Ok(0);
@@ -322,19 +331,165 @@ pub fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> Result<u64, Errno> {
 }
 
 // ─────────────── identity / info / time / sleep / sched / signals ───────────────
-// (Feature: linux-binary-compat) We run as a single root-ish process, so the
-// identity calls return constant ids; signal-related calls accept and return 0
-// because signals are never delivered.
+// (Feature: linux-binary-compat) Credentials live in `CompatState` and default
+// to root for every kernel-spawned process, so the shell and the existing
+// userland keep their old behaviour while the `setuid` family can produce a real
+// non-root process for the tests.
 
 /// Microseconds per second.
 const USEC_PER_SEC: u64 = 1_000_000;
 /// One scheduler tick is `1/TICK_HZ` seconds (1 ms at 1000 Hz).
 const NS_PER_TICK: u64 = 1_000_000_000 / TICK_HZ;
 
-/// `getuid`/`geteuid`/`getgid`/`getegid` (102/107/104/108): we run root-ish, so
-/// every id is 0.
-pub fn sys_getid() -> Result<u64, Errno> {
+/// Truncate a syscall register to a `uid_t`/`gid_t` (`u32`). The upper half of a
+/// 64-bit register carries whatever the caller's codegen left there; Linux
+/// truncates the C argument, and so must we.
+#[inline]
+fn id_arg(raw: u64) -> u32 {
+    raw as u32
+}
+
+/// Decode a `uid_t`/`gid_t` argument where `(u32)-1` means "leave unchanged"
+/// (the `setreuid`/`setresuid` convention).
+#[inline]
+fn optional_id_arg(raw: u64) -> Option<u32> {
+    let v = raw as u32;
+    if v == u32::MAX {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// Write one `u32` to a validated user pointer.
+fn put_u32(ptr: u64, value: u32) -> Result<(), Errno> {
+    check_user_ptr(ptr, 4)?;
+    // SAFETY: `ptr` was validated for four bytes above; `write_unaligned` has no
+    // alignment requirement and the page-presence walk already ran.
+    unsafe {
+        core::ptr::write_unaligned(ptr as *mut u32, value);
+    }
+    Ok(())
+}
+
+/// Replace the current process's credentials, mapping "no compat state" to
+/// `EPERM` — a native task has no user-visible identity to change.
+fn commit_creds(next: Creds) -> Result<u64, Errno> {
+    if compat::set_current_creds(next) {
+        Ok(0)
+    } else {
+        Err(Errno::EPERM)
+    }
+}
+
+/// `getuid` (102): the real user id.
+pub fn sys_getuid() -> Result<u64, Errno> {
+    Ok(compat::current_creds().uid as u64)
+}
+
+/// `getgid` (104): the real group id.
+pub fn sys_getgid() -> Result<u64, Errno> {
+    Ok(compat::current_creds().gid as u64)
+}
+
+/// `geteuid` (107): the effective user id (what permission checks use).
+pub fn sys_geteuid() -> Result<u64, Errno> {
+    Ok(compat::current_creds().euid as u64)
+}
+
+/// `getegid` (108): the effective group id.
+pub fn sys_getegid() -> Result<u64, Errno> {
+    Ok(compat::current_creds().egid as u64)
+}
+
+/// `getresuid` (118): write `(ruid, euid, suid)` to the three user pointers.
+///
+/// All three pointers are required (Linux returns `EFAULT` for a bad one), and
+/// they are all validated before the first write, so a partial result is not
+/// observable.
+pub fn sys_getresuid(ruid: u64, euid: u64, suid: u64) -> Result<u64, Errno> {
+    let c = compat::current_creds();
+    check_user_ptr(ruid, 4)?;
+    check_user_ptr(euid, 4)?;
+    check_user_ptr(suid, 4)?;
+    put_u32(ruid, c.uid)?;
+    put_u32(euid, c.euid)?;
+    put_u32(suid, c.suid)?;
     Ok(0)
+}
+
+/// `getresgid` (120): write `(rgid, egid, sgid)` to the three user pointers.
+pub fn sys_getresgid(rgid: u64, egid: u64, sgid: u64) -> Result<u64, Errno> {
+    let c = compat::current_creds();
+    check_user_ptr(rgid, 4)?;
+    check_user_ptr(egid, 4)?;
+    check_user_ptr(sgid, 4)?;
+    put_u32(rgid, c.gid)?;
+    put_u32(egid, c.egid)?;
+    put_u32(sgid, c.sgid)?;
+    Ok(0)
+}
+
+/// `setuid` (105): [`Creds::setuid`], `EPERM` when the transition is refused.
+pub fn sys_setuid(uid: u64) -> Result<u64, Errno> {
+    let c = compat::current_creds();
+    match c.setuid(id_arg(uid)) {
+        Some(next) => commit_creds(next),
+        None => Err(Errno::EPERM),
+    }
+}
+
+/// `setgid` (106): the group analogue of [`sys_setuid`].
+pub fn sys_setgid(gid: u64) -> Result<u64, Errno> {
+    let c = compat::current_creds();
+    match c.setgid(id_arg(gid)) {
+        Some(next) => commit_creds(next),
+        None => Err(Errno::EPERM),
+    }
+}
+
+/// `setreuid` (113): `(u32)-1` leaves an id unchanged.
+pub fn sys_setreuid(uid: u64, euid: u64) -> Result<u64, Errno> {
+    let c = compat::current_creds();
+    match c.setreuid(optional_id_arg(uid), optional_id_arg(euid)) {
+        Some(next) => commit_creds(next),
+        None => Err(Errno::EPERM),
+    }
+}
+
+/// `setregid` (114): the group analogue of [`sys_setreuid`].
+pub fn sys_setregid(gid: u64, egid: u64) -> Result<u64, Errno> {
+    let c = compat::current_creds();
+    match c.setregid(optional_id_arg(gid), optional_id_arg(egid)) {
+        Some(next) => commit_creds(next),
+        None => Err(Errno::EPERM),
+    }
+}
+
+/// `setresuid` (117): set any subset of the three user ids.
+pub fn sys_setresuid(uid: u64, euid: u64, suid: u64) -> Result<u64, Errno> {
+    let c = compat::current_creds();
+    match c.setresuid(
+        optional_id_arg(uid),
+        optional_id_arg(euid),
+        optional_id_arg(suid),
+    ) {
+        Some(next) => commit_creds(next),
+        None => Err(Errno::EPERM),
+    }
+}
+
+/// `setresgid` (119): set any subset of the three group ids.
+pub fn sys_setresgid(gid: u64, egid: u64, sgid: u64) -> Result<u64, Errno> {
+    let c = compat::current_creds();
+    match c.setresgid(
+        optional_id_arg(gid),
+        optional_id_arg(egid),
+        optional_id_arg(sgid),
+    ) {
+        Some(next) => commit_creds(next),
+        None => Err(Errno::EPERM),
+    }
 }
 
 /// `getppid` (110): return the tracked parent pid.

@@ -53,6 +53,12 @@ pub mod io;
 #[path = "../../src/arch/x86_64/linux/abi.rs"]
 pub mod abi;
 
+// Process credentials + POSIX permission/setuid decisions (security model).
+// `core`-only and self-contained, so the same source the kernel compiles is
+// exercised by property P56 and its inline unit tests.
+#[path = "../../src/arch/x86_64/linux/cred.rs"]
+pub mod cred;
+
 #[path = "../../src/arch/x86_64/linux/rand_clock.rs"]
 pub mod rand_clock;
 
@@ -466,6 +472,13 @@ mod properties {
     // for a tick-delivered signal. Descriptive module name, same reason as
     // `kill_target`.
     mod irq_frame;
+
+    // Process credentials + filesystem permission enforcement (security model):
+    // the POSIX owner/group/other matrix with the root execute rule, and every
+    // set*id transition's ownership invariant, over arbitrary ids. `p55` is
+    // taken by the OpenPGP `.deb`-digest property, so this is the next free
+    // number.
+    mod p56;
 
 }
 

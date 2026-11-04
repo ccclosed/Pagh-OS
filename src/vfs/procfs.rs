@@ -199,6 +199,8 @@ impl ProcFile {
             sig_blocked: u64,
             sig_ign: u64,
             sig_cgt: u64,
+            uids: [u32; 4],
+            gids: [u32; 4],
             vm: fmt::VmKb,
         }
 
@@ -253,6 +255,11 @@ impl ProcFile {
                 sig_blocked: cs.sig_blocked,
                 sig_ign,
                 sig_cgt,
+                // Linux's four Uid/Gid columns are real, effective, saved and
+                // filesystem. pagh has no separate fsuid/fsgid, so the last
+                // column repeats the effective id.
+                uids: [cs.creds.uid, cs.creds.euid, cs.creds.suid, cs.creds.euid],
+                gids: [cs.creds.gid, cs.creds.egid, cs.creds.sgid, cs.creds.egid],
                 vm,
             }
         });
@@ -280,6 +287,8 @@ impl ProcFile {
             sig_blocked: s.sig_blocked,
             sig_ign: s.sig_ign,
             sig_cgt: s.sig_cgt,
+            uids: s.uids,
+            gids: s.gids,
             vm: s.vm,
         })
     }

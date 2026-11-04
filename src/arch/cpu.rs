@@ -21,6 +21,10 @@ const CR0_MP: u64 = 1 << 1; // Monitor coprocessor: set alongside clearing EM.
 // CR4 bits relevant to SSE.
 const CR4_OSFXSR: u64 = 1 << 9; // OS supports FXSAVE/FXRSTOR and SSE.
 const CR4_OSXMMEXCPT: u64 = 1 << 10; // OS supports unmasked SSE exceptions (#XM).
+// Supervisor-mode execution prevention: ring 0 may not execute user pages.
+// Enabled only when CPUID leaf 7 EBX bit 7 reports support. SMAP (bit 21) and
+// KPTI are NOT implemented — see `SECURITY.md`.
+const CR4_SMEP: u64 = 1 << 20;
 
 /// Enable SSE so XMM/`movaps`-style instructions execute instead of faulting
 /// with #UD.
@@ -39,12 +43,22 @@ const CR4_OSXMMEXCPT: u64 = 1 << 10; // OS supports unmasked SSE exceptions (#XM
 ///
 /// Sequence (Intel SDM Vol. 3A, §13.1.4 "Initialization of SSE Extensions"):
 ///   CR0.EM = 0, CR0.MP = 1, CR4.OSFXSR = 1, CR4.OSXMMEXCPT = 1.
+///
+/// Additionally enables **SMEP** (`CR4.SMEP`, bit 20) when CPUID leaf 7 EBX
+/// bit 7 reports support, so the kernel cannot fetch instructions from a user
+/// page. This is cheap (one control-register bit) and does not need paging
+/// changes because the kernel never executes user mappings by design. SMAP
+/// (`CR4.SMAP`) and KPTI are deliberately not enabled: SMAP would require every
+/// kernel access to user memory to be wrapped in `stac`/`clac`, and KPTI would
+/// need a full separate page-table hierarchy — neither exists in this tree, and
+/// claiming them would be false.
 pub fn enable_sse() {
     // SAFETY: Reading and writing CR0/CR4 with the standard SSE-enable bit
     // pattern is the architecturally defined way to turn on SSE. We only clear
-    // EM and set MP/OSFXSR/OSXMMEXCPT, leaving all other control bits (paging,
-    // PAE, etc. established by Limine) untouched. This touches no Rust-visible
-    // memory and is performed once during early boot before interrupts.
+    // EM and set MP/OSFXSR/OSXMMEXCPT (plus SMEP when CPUID reports it), leaving
+    // all other control bits (paging, PAE, etc. established by Limine)
+    // untouched. This touches no Rust-visible memory and is performed once
+    // during early boot before interrupts.
     unsafe {
         let mut cr0: u64;
         core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
@@ -55,8 +69,24 @@ pub fn enable_sse() {
         let mut cr4: u64;
         core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
         cr4 |= CR4_OSFXSR | CR4_OSXMMEXCPT;
+        if cpu_has_smep() {
+            cr4 |= CR4_SMEP;
+        }
         core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack));
     }
+}
+
+/// Does the CPU support SMEP? Guarded by CPUID leaf 0's maximum basic leaf: a
+/// leaf-7 read on a CPU that does not define it returns unspecified data, so the
+/// feature bit must never be trusted unguarded.
+fn cpu_has_smep() -> bool {
+    // CPUID is an unprivileged architectural query; leaf 0 is defined on every
+    // x86_64 CPU. The same guard pattern is used by `arch/x86_64/cpuid.rs`.
+    let max_basic = core::arch::x86_64::__cpuid(0).eax;
+    if max_basic < 7 {
+        return false;
+    }
+    core::arch::x86_64::__cpuid_count(7, 0).ebx & (1 << 7) != 0
 }
 
 /// Halt the CPU forever in a low-power wait loop.

@@ -20,6 +20,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
 
+use crate::arch::x86_64::linux::cred::Creds;
 use crate::arch::x86_64::linux::mem::VmRegionSet;
 use crate::arch::x86_64::linux::signal_frame::{
     flush_cont_bits, flush_stop_bits, sigbit, SigAltStack, SignalAction, SIGNAL_COUNT,
@@ -96,6 +97,12 @@ pub struct CompatState {
     /// The process's file-mode creation mask (`umask(2)`); applied to the
     /// permission bits of freshly created files/directories.
     pub umask: u32,
+    /// Process credentials (real/effective/saved user and group ids). Starts as
+    /// [`Creds::ROOT`] for every kernel-spawned process, is inherited unchanged
+    /// by `fork`/`clone`, and survives `execve` (pagh does not model setuid
+    /// binaries, so exec never changes the ids). All permission checks at the
+    /// syscall boundary read this; the VFS itself never sees a credential.
+    pub creds: Creds,
     /// Permission-bit overrides keyed by VFS inode identity (`fs_ino`, or the
     /// FNV fallback for synthetic nodes). Written by `chmod` and at creation
     /// time (default mode masked by `umask`); consulted by `stat`-family
@@ -175,6 +182,7 @@ impl CompatState {
             exec_stdio: ["?", "?", "?"],
             rlimits: BTreeMap::new(),
             umask: 0o022,
+            creds: Creds::ROOT,
             mode_overrides: BTreeMap::new(),
             sig: Arc::new(Spinlock::new(SignalTable {
                 handlers: [SignalAction::default(); SIGNAL_COUNT],
@@ -496,6 +504,32 @@ pub fn fork_current_compat(child: u64, clear_child_tid: u64) -> bool {
 }
 pub fn fs_base_for(pid: u64) -> Option<u64> {
     COMPAT_STATES.lock().get(&pid).map(|s| s.fs_base)
+}
+
+/// Snapshot of the CURRENT process's credentials, or [`Creds::ROOT`] for a
+/// native task (which has no compat state and no user-visible identity).
+///
+/// This is what the syscall-layer permission checks call: credentials are a
+/// property of the `Compat_Process`, never of the VFS node.
+pub fn current_creds() -> Creds {
+    with_current_compat(|cs| cs.creds).unwrap_or(Creds::ROOT)
+}
+
+/// Replace the CURRENT process's credentials. Returns `false` when the caller
+/// has no compat state (a native task cannot change an identity it does not
+/// have).
+pub fn set_current_creds(creds: Creds) -> bool {
+    with_current_compat(|cs| {
+        cs.creds = creds;
+    })
+    .is_some()
+}
+
+/// Credentials of an arbitrary registered process (used by `kill` to decide
+/// whether the caller may signal each target). `None` when `pid` is not a
+/// registered compat process/thread.
+pub fn creds_of(pid: u64) -> Option<Creds> {
+    COMPAT_STATES.lock().get(&pid).map(|s| s.creds)
 }
 pub fn current_tgid() -> u64 {
     with_current_compat(|s| s.tgid).unwrap_or_else(super::scheduler::current_pid)

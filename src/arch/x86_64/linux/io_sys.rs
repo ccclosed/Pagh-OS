@@ -38,6 +38,7 @@ use crate::task::fd::{OpenObject, PipeEndpoint, PipeReadResult, PipeWriteResult}
 use crate::vfs::{self, VfsNode};
 
 use super::check_user_ptr;
+use super::cred::{Access, Creds};
 use super::dirent::{d_type_for, dirent_reclen, encode_dirent64};
 use super::errno::Errno;
 use super::io::{plan_lseek, plan_read};
@@ -837,6 +838,11 @@ fn open_path(path: &str, flags: u64) -> Result<u64, Errno> {
             if flags & O_CREAT_FL != 0 && flags & O_EXCL_FL != 0 {
                 return Err(Errno::EEXIST);
             }
+            // Permission check BEFORE the O_TRUNC side effect: a caller that may
+            // not write the file must not be able to empty it. Root bypasses
+            // read/write but still needs an execute bit for a directory walk
+            // through the VFS, which happened above.
+            check_open_mode(&node, flags)?;
             if flags & O_TRUNC_FL != 0 && !node.is_directory() {
                 // Best effort: nodes without truncate support (plain ext2
                 // files in this minimal layer) keep their contents.
@@ -861,6 +867,8 @@ fn open_path(path: &str, flags: u64) -> Result<u64, Errno> {
             // The parent is resolved through the link walker: `O_CREAT` under a
             // symlinked directory (`/lib64/...`) must land in its target.
             let dir = walk(parent, true)?;
+            // Creating a directory entry needs write + execute on the parent.
+            check_dir_mutation(&dir)?;
             let created = dir.create_file(name).map_err(|e| {
                 crate::warn!(
                     "[linux] open(O_CREAT) failed: {:?} parent={} name={}",
@@ -991,6 +999,158 @@ fn node_ino(node: &Arc<dyn VfsNode>) -> u64 {
 /// at creation time), if any.
 fn mode_override_perms(ino: u64) -> Option<u32> {
     compat::with_current_compat(|cs| cs.mode_overrides.get(&ino).copied()).flatten()
+}
+
+// ─── syscall-boundary permission checks ─────────────────────────────────────
+//
+// Credentials and permission checks live HERE, in the syscall layer. The VFS
+// only carries metadata (`VfsNode::mode`/`owner`); boot provisioning, the shell
+// and the package installer keep calling VFS methods directly with no credential
+// and are therefore unaffected — the same shape Linux has (the VFS does not know
+// the caller; `inode_permission()` runs in the syscall path).
+//
+// Everything below uses the process's EFFECTIVE ids (see `cred::Creds::may`).
+
+/// Snapshot of the calling process's credentials (`ROOT` for a native task).
+fn current_creds() -> Creds {
+    compat::current_creds()
+}
+
+/// May the caller access `node` for `access`? `EACCES` otherwise.
+fn check_node_access(node: &Arc<dyn VfsNode>, access: Access) -> Result<(), Errno> {
+    if current_creds().may(node.mode(), node.owner(), access) {
+        Ok(())
+    } else {
+        Err(Errno::EACCES)
+    }
+}
+
+/// Creating, removing or renaming an entry needs write AND execute on the
+/// parent directory (POSIX). Root bypasses write but, like every `may` call,
+/// still needs an execute bit — a mode-`0644` directory is not searchable even
+/// for root.
+fn check_dir_mutation(dir: &Arc<dyn VfsNode>) -> Result<(), Errno> {
+    let creds = current_creds();
+    let mode = dir.mode();
+    let owner = dir.owner();
+    if creds.may(mode, owner, Access::Write) && creds.may(mode, owner, Access::Execute) {
+        Ok(())
+    } else {
+        Err(Errno::EACCES)
+    }
+}
+
+/// Access an already-open `open(2)` call needs on an existing node.
+///
+/// `O_RDONLY` needs read; `O_WRONLY` write; `O_RDWR` both; `O_TRUNC` additionally
+/// needs write (Linux checks the truncation right separately, and a read-only
+/// descriptor that truncates is still a write).
+fn check_open_mode(node: &Arc<dyn VfsNode>, flags: u64) -> Result<(), Errno> {
+    let acc = flags & 0o3;
+    let creds = current_creds();
+    let mode = node.mode();
+    let owner = node.owner();
+    let read_ok = || creds.may(mode, owner, Access::Read);
+    let write_ok = || creds.may(mode, owner, Access::Write);
+    match acc {
+        0 => {
+            if read_ok() {
+                Ok(())
+            } else {
+                Err(Errno::EACCES)
+            }
+        }
+        1 => {
+            if write_ok() {
+                Ok(())
+            } else {
+                Err(Errno::EACCES)
+            }
+        }
+        2 => {
+            if read_ok() && write_ok() {
+                Ok(())
+            } else {
+                Err(Errno::EACCES)
+            }
+        }
+        _ => Err(Errno::EINVAL),
+    }
+    .and_then(|()| {
+        if flags & O_TRUNC_FL != 0 && !write_ok() {
+            Err(Errno::EACCES)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+/// Persist `perms` on `node` and mirror it in the per-process stat override.
+///
+/// ext2 writes the inode. Synthetic nodes (`/proc`, `/dev`, ramfs) have no
+/// metadata store and return `NotSupported`; for those the historical override
+/// remains the only record, which is why the caller keeps calling
+/// [`record_mode_override`] either way.
+fn apply_node_mode(node: &Arc<dyn VfsNode>, perms: u32) -> Result<(), Errno> {
+    match node.set_mode(perms) {
+        Ok(()) | Err(crate::vfs::VfsError::NotSupported) => {
+            record_mode_override(node_ino(node), perms);
+            Ok(())
+        }
+        Err(_) => Err(Errno::EIO),
+    }
+}
+
+/// Root-or-owner check shared by `chmod`/`fchmod`.
+fn check_chmod_allowed(node: &Arc<dyn VfsNode>) -> Result<(), Errno> {
+    if current_creds().may_chmod(node.owner()) {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
+}
+
+/// Root-only check shared by `chown`/`fchown`.
+fn check_chown_allowed() -> Result<(), Errno> {
+    if current_creds().may_chown() {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
+}
+
+/// Resolve a `(uid, gid)` pair for `chown(2)`: `(u32)-1` means "keep the current
+/// one". ext2 stores both as `u16`, so an out-of-range id is `EINVAL` rather than
+/// a silent truncation.
+fn resolve_chown_ids(node: &Arc<dyn VfsNode>, uid: u64, gid: u64) -> Result<(u32, u32), Errno> {
+    let (cur_uid, cur_gid) = node.owner();
+    let new_uid = optional_owner_id(uid, cur_uid);
+    let new_gid = optional_owner_id(gid, cur_gid);
+    if new_uid > u16::MAX as u32 || new_gid > u16::MAX as u32 {
+        return Err(Errno::EINVAL);
+    }
+    Ok((new_uid, new_gid))
+}
+
+#[inline]
+fn optional_owner_id(raw: u64, current: u32) -> u32 {
+    match raw as u32 {
+        u32::MAX => current,
+        v => v,
+    }
+}
+
+/// Apply a `chown` to `node`, or `EPERM` when the node has no persistent owner.
+fn apply_node_owner(node: &Arc<dyn VfsNode>, uid: u64, gid: u64) -> Result<(), Errno> {
+    let (new_uid, new_gid) = resolve_chown_ids(node, uid, gid)?;
+    match node.set_owner(new_uid, new_gid) {
+        Ok(()) => Ok(()),
+        // Synthetic nodes cannot store an owner; reporting success would be a
+        // lie (a later `stat`/permission check would still see `(0, 0)`).
+        Err(crate::vfs::VfsError::NotSupported) => Err(Errno::EPERM),
+        Err(crate::vfs::VfsError::InvalidArgument) => Err(Errno::EINVAL),
+        Err(_) => Err(Errno::EIO),
+    }
 }
 
 /// The current process's umask (022 for native tasks without compat state).
@@ -1614,6 +1774,7 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
     // Parents follow links (a rename into a symlinked directory must land in its
     // target); the *source* stays unresolved on purpose — see the note above.
     let ndir = walk(nparent, true)?;
+    check_dir_mutation(&ndir)?;
     if ndir.lookup(nname).is_ok() {
         ndir.remove(nname).map_err(|e| {
             crate::warn!("[linux] rename: replace target failed: {:?} {}", e, newabs);
@@ -1642,6 +1803,7 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
         None => return Err(Errno::ENOENT),
     };
     let odir = walk(oparent, true)?;
+    check_dir_mutation(&odir)?;
     odir.remove(oname).map_err(|e| {
         crate::warn!("[linux] rename: unlink source failed: {:?} {}", e, oldabs);
         Errno::EIO
@@ -1700,6 +1862,7 @@ pub fn sys_mkdir(path: u64, _mode: u64) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     let dir = walk(parent, true)?;
+    check_dir_mutation(&dir)?;
     let created = dir.create_dir(name).map_err(|e| {
         crate::error!(
             "[linux] mkdir failed: {:?} parent={} name={}",
@@ -1735,6 +1898,7 @@ pub fn sys_unlink(path: u64) -> Result<u64, Errno> {
         None => return Err(Errno::ENOENT),
     };
     let dir = walk(parent, true)?;
+    check_dir_mutation(&dir)?;
     dir.remove(name).map_err(|e| {
         crate::warn!("[linux] unlink failed: {:?} path={}", e, trimmed);
         Errno::EIO
@@ -1762,6 +1926,7 @@ pub fn sys_rmdir(path: u64) -> Result<u64, Errno> {
         None => return Err(Errno::ENOENT),
     };
     let dir = walk(parent, true)?;
+    check_dir_mutation(&dir)?;
     dir.remove(name).map_err(|e| {
         crate::warn!("[linux] rmdir failed: {:?} path={}", e, trimmed);
         Errno::EIO
@@ -1769,18 +1934,84 @@ pub fn sys_rmdir(path: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `chmod` (90): record the permission bits against the path's stat-identity
-/// inode so `stat`-family handlers report them. The VFS nodes themselves carry
-/// no persistable mode, so the override lives in the process's compat state
-/// (inherited by fork/clone). Programs that chmod their lock/config files
-/// (git) need the success so they can proceed.
+/// `chmod` (90): change a file's permission bits.
+///
+/// Enforcement: root or the file's owner only (`EPERM`). The bits are written to
+/// the ext2 inode through [`VfsNode::set_mode`]; nodes with no metadata store
+/// (`/dev`, `/proc`, ramfs) keep the historical per-process override so
+/// `stat`-family handlers still report the requested mode. The override is also
+/// recorded for ext2 because `stat_mode_for` consults it first (existing
+/// userland expects the old 0755 default for untouched files).
 pub fn sys_chmod(path: u64, mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
     // `chmod(2)` follows symlinks: the bits belong to the target's inode.
     let node = walk(&abs, true)?;
-    record_mode_override(node_ino(&node), (mode & 0o7777) as u32);
+    check_chmod_allowed(&node)?;
+    apply_node_mode(&node, (mode & 0o7777) as u32)?;
     Ok(0)
+}
+
+/// `fchmod` (91): `chmod` on an open descriptor.
+///
+/// The descriptor is resolved under the registry lock (cloning the node or the
+/// directory path), then the check/write runs outside it — the VFS write can
+/// block on the device.
+pub fn sys_fchmod(fd: u64, mode: u64) -> Result<u64, Errno> {
+    let node = fd_node(fd)?;
+    check_chmod_allowed(&node)?;
+    apply_node_mode(&node, (mode & 0o7777) as u32)?;
+    Ok(0)
+}
+
+/// `chown` (92): change a file's owner. Root only (`EPERM`); a `(uid_t)-1`
+/// argument keeps the current id. Only ext2 inodes can store an owner, so a
+/// synthetic node reports `EPERM` instead of pretending the write happened.
+pub fn sys_chown(path: u64, uid: u64, gid: u64) -> Result<u64, Errno> {
+    let p = read_user_cstr(path)?;
+    let abs = resolve_path(&p);
+    // `chown(2)` follows symlinks: the owner belongs to the target's inode.
+    let node = walk(&abs, true)?;
+    check_chown_allowed()?;
+    apply_node_owner(&node, uid, gid)?;
+    Ok(0)
+}
+
+/// `fchown` (93): `chown` on an open descriptor (root only).
+pub fn sys_fchown(fd: u64, uid: u64, gid: u64) -> Result<u64, Errno> {
+    let node = fd_node(fd)?;
+    check_chown_allowed()?;
+    apply_node_owner(&node, uid, gid)?;
+    Ok(0)
+}
+
+/// Resolve an open descriptor to a VFS node for `fchmod`/`fchown`/`fstat`-style
+/// metadata operations.
+///
+/// A regular file descriptor carries its node directly. A directory descriptor
+/// carries only the path it was opened under (the children snapshot is for
+/// `getdents64`), so it is re-resolved through the link walker after the
+/// registry lock is released. Any other descriptor kind is `EINVAL`; an absent
+/// one is `EBADF`.
+fn fd_node(fd: u64) -> Result<Arc<dyn VfsNode>, Errno> {
+    enum Found {
+        File(Arc<dyn VfsNode>),
+        Dir(String),
+        Other,
+        Absent,
+    }
+    let found = compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
+        None => Found::Absent,
+        Some(OpenObject::File { node, .. }) => Found::File(Arc::clone(node)),
+        Some(OpenObject::Dir { path, .. }) => Found::Dir(path.clone()),
+        Some(_) => Found::Other,
+    });
+    match found {
+        Some(Found::File(node)) => Ok(node),
+        Some(Found::Dir(path)) => walk(&path, true),
+        Some(Found::Other) => Err(Errno::EINVAL),
+        Some(Found::Absent) | None => Err(Errno::EBADF),
+    }
 }
 
 // Keep AT_FDCWD referenced so the intent (dir-fd handling) is documented even

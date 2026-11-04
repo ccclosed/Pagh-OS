@@ -24,8 +24,8 @@
 //! `-pgid`) via [`super::kill`], resolves it to a SNAPSHOT of pids and queues the
 //! signal once per addressed thread group (`kill::pick_group_target`), which is
 //! what Linux's shared group-pending list achieves. Errno decisions (EINVAL
-//! before any lookup, `ESRCH` for `INT_MIN` and empty groups, `EPERM`
-//! structurally unreachable under the single-uid model) are documented on
+//! before any lookup, `ESRCH` for `INT_MIN` and empty groups, `EPERM` when no
+//! target is signalable by the caller's effective uid) are documented on
 //! `kill::kill_args`.
 //!
 //! ## Path assumption: compat ⇒ `syscall_entry`
@@ -268,11 +268,6 @@ fn force_terminate_group(pid: u64, sig: u64) {
 
 // ─── kill(2) ─────────────────────────────────────────────────────────────────
 
-/// The uid of every process in pagh's single-user model (`misc::sys_getid`
-/// returns 0 for every caller) — the CAP_KILL-equivalent that makes `EPERM`
-/// structurally unreachable in [`deliver_to_targets`].
-const SINGLE_UID: u32 = 0;
-
 /// `kill(2)` (62): send `sig` to a process, a process group, or every process
 /// the caller may signal.
 ///
@@ -281,8 +276,8 @@ const SINGLE_UID: u32 = 0;
 /// depends on it), target classification, and the errno matrix. See
 /// `kill::kill_args` for why each error is returned where it is: `EINVAL` for an
 /// invalid signal BEFORE any target lookup, `ESRCH` for `INT_MIN` and for a
-/// group with no live member, `EPERM` structurally unreachable under the
-/// single-uid model.
+/// group with no live member, `EPERM` when the caller's effective uid may signal
+/// none of the resolved targets.
 ///
 /// Locking (AGENTS.md invariant 4): [`resolve_kill_targets`] takes one short
 /// registry snapshot and releases it; the sends happen afterwards, never while
@@ -345,14 +340,13 @@ pub fn resolve_kill_targets(target: super::kill::KillTarget) -> alloc::vec::Vec<
     }
 }
 
-/// Send `sig` to every resolved target and fold the per-target results into the
-/// single `kill(2)` return value.
-///
-/// Permission policy: pagh runs a single uid ([`SINGLE_UID`]) for both sender and
-/// target, which is the CAP_KILL-equivalent, so every target is permitted and
-/// `EPERM` cannot be returned today. It is still a real call to
-/// `kill::kill_permits` rather than a comment, so a future credential model has
-/// exactly one place to change.
+/// Permission policy: the sender is the CURRENT process's effective uid and each
+/// target's credentials are looked up in the compat registry. A target that is
+/// no longer registered (it exited between the snapshot and this call) is not
+/// filtered here — `send_signal` reports `ESRCH` for it, which is what Linux
+/// does. If every resolved target is un-signalable the result is `EPERM`;
+/// otherwise the permitted subset is delivered to and the usual errno folding
+/// applies.
 ///
 /// Errno folding (Linux: a group send succeeds when at least one target was
 /// reached — `__kill_pgrp_info`): `Ok(0)` as soon as one delivery succeeded,
@@ -363,10 +357,17 @@ fn deliver_to_targets(targets: &[u64], sig: u64) -> Result<u64, Errno> {
     if targets.is_empty() {
         return Err(Errno::ESRCH);
     }
+    let sender_euid = compat::current_creds().euid;
     let permitted: alloc::vec::Vec<u64> = targets
         .iter()
         .copied()
-        .filter(|_| super::kill::kill_permits(SINGLE_UID, SINGLE_UID))
+        .filter(|pid| match compat::creds_of(*pid) {
+            Some(target) => super::kill::kill_permits(sender_euid, target.uid, target.euid),
+            // Gone already: let `send_signal` answer ESRCH rather than
+            // misreporting a permission failure for a process that no longer
+            // exists.
+            None => true,
+        })
         .collect();
     if permitted.is_empty() {
         return Err(Errno::EPERM);

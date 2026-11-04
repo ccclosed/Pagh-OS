@@ -94,8 +94,8 @@ pub fn install_data_tar(entries: &[TarEntry<'_>], root: &str) -> Result<usize, I
 
     for op in plan.ops.iter() {
         match op {
-            InstallOp::File { path, content, .. } => {
-                install_one(root, path, content)?;
+            InstallOp::File { path, content, mode } => {
+                install_one(root, path, content, *mode)?;
                 installed += 1;
             }
             InstallOp::Symlink { path, target } => {
@@ -296,7 +296,7 @@ fn walk_err(e: crate::vfs::link_walk::WalkError) -> VfsError {
 }
 
 /// Install a single normalized, root-relative regular file.
-fn install_one(root: &str, rel: &str, content: &[u8]) -> Result<(), InstallError> {
+fn install_one(root: &str, rel: &str, content: &[u8], mode: u32) -> Result<(), InstallError> {
     let abs = join_abs(root, rel);
 
     // R10.2: walk (and create) the parent chain, following symbolic links — a
@@ -352,6 +352,22 @@ fn install_one(root: &str, rel: &str, content: &[u8]) -> Result<(), InstallError
                 let _ = dir.remove(filename);
                 return Err(vfs_err("write", &abs, e));
             }
+        }
+    }
+
+    // Preserve the archive's permission bits on the ext2 inode. `create_file`
+    // creates 0644, which would make every installed program non-executable —
+    // the security model's execute check requires at least one x bit, even for
+    // root. A filesystem without mode support (not ext2) keeps the default.
+    let perms = mode & 0o7777;
+    if perms != 0 {
+        if let Err(e) = file_node.set_mode(perms) {
+            crate::warn!(
+                "Package_Installer: could not apply mode {:04o} to '{}': {:?}",
+                perms,
+                abs,
+                e
+            );
         }
     }
 

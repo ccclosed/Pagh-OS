@@ -541,6 +541,11 @@ pub struct StatusInputs<'a> {
     pub sig_ign: u64,
     /// Signals with a user handler installed.
     pub sig_cgt: u64,
+    /// `[real, effective, saved, filesystem]` user ids. pagh has no separate
+    /// fsuid, so the fourth entry is the effective id.
+    pub uids: [u32; 4],
+    /// `[real, effective, saved, filesystem]` group ids.
+    pub gids: [u32; 4],
     pub vm: VmKb,
 }
 
@@ -561,8 +566,20 @@ pub fn format_status(s: &StatusInputs<'_>) -> Vec<u8> {
     push(&mut out, format_args!("Pid:\t{}\n", s.pid));
     push(&mut out, format_args!("PPid:\t{}\n", s.ppid));
     out.extend_from_slice(b"TracerPid:\t0\n");
-    out.extend_from_slice(b"Uid:\t0\t0\t0\t0\n");
-    out.extend_from_slice(b"Gid:\t0\t0\t0\t0\n");
+    push(
+        &mut out,
+        format_args!(
+            "Uid:\t{}\t{}\t{}\t{}\n",
+            s.uids[0], s.uids[1], s.uids[2], s.uids[3]
+        ),
+    );
+    push(
+        &mut out,
+        format_args!(
+            "Gid:\t{}\t{}\t{}\t{}\n",
+            s.gids[0], s.gids[1], s.gids[2], s.gids[3]
+        ),
+    );
     push(&mut out, format_args!("FDSize:\t{}\n", s.fd_size));
     push(&mut out, format_args!("Threads:\t{}\n", s.threads));
     push(&mut out, format_args!("SigPnd:\t{:016x}\n", s.sig_pending));

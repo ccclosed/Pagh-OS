@@ -68,6 +68,8 @@ fn render(name: &[u8], pid: u64, tgid: u64, ppid: u64, threads: u64, vm: VmKb) -
         sig_blocked: 0,
         sig_ign: 0,
         sig_cgt: 0,
+        uids: [0, 0, 0, 0],
+        gids: [0, 0, 0, 0],
         vm,
     });
     String::from_utf8(out).expect("ASCII name in this property")
@@ -161,6 +163,8 @@ proptest! {
             sig_blocked: 0,
             sig_ign: 0,
             sig_cgt: 0,
+            uids: [0, 0, 0, 0],
+            gids: [0, 0, 0, 0],
             vm,
         });
         prop_assert!(out.starts_with(b"Name:\t"));

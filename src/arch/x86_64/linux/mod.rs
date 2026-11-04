@@ -13,6 +13,7 @@ pub mod regs;
 // the module tree exists up front; each starts as a placeholder that compiles
 // cleanly and gains its real content in its own task.
 pub mod abi;
+pub mod cred;
 pub mod diag;
 pub mod dirent;
 pub mod io;
@@ -120,6 +121,9 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::RMDIR => io_sys::sys_rmdir(a[0]),
         sysno::UNLINK => io_sys::sys_unlink(a[0]),
         sysno::CHMOD => io_sys::sys_chmod(a[0], a[1]),
+        sysno::FCHMOD => io_sys::sys_fchmod(a[0], a[1]),
+        sysno::CHOWN => io_sys::sys_chown(a[0], a[1], a[2]),
+        sysno::FCHOWN => io_sys::sys_fchown(a[0], a[1], a[2]),
         sysno::POLL => io_sys::sys_poll(a[0], a[1], a[2]),
         sysno::SELECT => io_sys::sys_select(a[0], a[1], a[2], a[3], a[4]),
         sysno::PSELECT6 => io_sys::sys_pselect6(a[0], a[1], a[2], a[3], a[4], a[5]),
@@ -302,7 +306,18 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::GETRANDOM => misc::sys_getrandom(a[0], a[1], a[2]),
         sysno::FUTEX => process_sys::sys_futex(a[0], a[1], a[2], a[3], a[4], a[5]),
         // ── Identity / info / time / sleep / sched / signals (linux-binary-compat) ──
-        sysno::GETUID | sysno::GETEUID | sysno::GETGID | sysno::GETEGID => misc::sys_getid(),
+        sysno::GETUID => misc::sys_getuid(),
+        sysno::GETGID => misc::sys_getgid(),
+        sysno::GETEUID => misc::sys_geteuid(),
+        sysno::GETEGID => misc::sys_getegid(),
+        sysno::SETUID => misc::sys_setuid(a[0]),
+        sysno::SETGID => misc::sys_setgid(a[0]),
+        sysno::SETREUID => misc::sys_setreuid(a[0], a[1]),
+        sysno::SETREGID => misc::sys_setregid(a[0], a[1]),
+        sysno::SETRESUID => misc::sys_setresuid(a[0], a[1], a[2]),
+        sysno::SETRESGID => misc::sys_setresgid(a[0], a[1], a[2]),
+        sysno::GETRESUID => misc::sys_getresuid(a[0], a[1], a[2]),
+        sysno::GETRESGID => misc::sys_getresgid(a[0], a[1], a[2]),
         sysno::GETPPID => misc::sys_getppid(),
         sysno::GETTID => misc::sys_gettid(),
         sysno::GETTIMEOFDAY => misc::sys_gettimeofday(a[0], a[1]),

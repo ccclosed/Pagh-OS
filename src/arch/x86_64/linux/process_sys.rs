@@ -329,6 +329,19 @@ pub fn sys_execve(regs: &mut SavedRegs, path: u64, argv: u64, envp: u64) -> Resu
     let mut budget = 0usize;
     let pathb = exec_cstr(path, &mut budget)?;
     let path = String::from_utf8(pathb).map_err(|_| Errno::EINVAL)?;
+    // Execute permission is checked HERE, at the syscall boundary, before any
+    // image/memory work. Root still needs at least one x bit (`Creds::may`);
+    // a missing path is left to `exec_linux_image`, which reports ENOENT.
+    if let Some(node) = crate::task::process::exec_target_node(&path) {
+        let creds = crate::task::compat::current_creds();
+        if !creds.may(
+            node.mode(),
+            node.owner(),
+            crate::arch::x86_64::linux::cred::Access::Execute,
+        ) {
+            return Err(Errno::EACCES);
+        }
+    }
     let av = exec_vec(argv, &mut budget)?;
     let ev = exec_vec(envp, &mut budget)?;
     let ar: Vec<&[u8]> = av.iter().map(|v| v.as_slice()).collect();

@@ -1044,6 +1044,7 @@ impl Ext2Fs {
             }))
         } else {
             Ok(Arc::new(Ext2Opaque {
+                fs: fs.clone(),
                 ino,
                 name: String::from(name),
                 cached_size,
@@ -1054,6 +1055,45 @@ impl Ext2Fs {
     /// Flush is a no-op: every mutation is already durably journaled+checkpointed
     /// at `commit` time. Provided for API completeness.
     pub fn sync(&self) {}
+
+    /// Permission bits of `ino` (`i_mode & 0o7777`), or `fallback` when the
+    /// inode cannot be read (a device error must not turn a file executable).
+    pub fn node_mode(&self, ino: u32, fallback: u32) -> u32 {
+        match self.read_inode(ino) {
+            Ok(inode) => (inode.i_mode as u32) & 0o7777,
+            Err(_) => fallback,
+        }
+    }
+
+    /// `(i_uid, i_gid)` of `ino`, `(0, 0)` when the inode cannot be read (the
+    /// writer stamps root on every inode it creates).
+    pub fn node_owner(&self, ino: u32) -> (u32, u32) {
+        match self.read_inode(ino) {
+            Ok(inode) => (inode.i_uid as u32, inode.i_gid as u32),
+            Err(_) => (0, 0),
+        }
+    }
+
+    /// Write the permission bits of `ino` through the journal, preserving the
+    /// inode's type bits. One committed transaction, like every other mutation.
+    pub fn set_inode_mode(&self, ino: u32, mode: u32) -> Result<(), FsError> {
+        let mut tx = Tx::new(self);
+        let mut inode = tx.read_inode(ino)?;
+        inode.i_mode = (inode.i_mode & 0xF000) | ((mode as u16) & 0o7777);
+        tx.write_inode(ino, &inode)?;
+        tx.commit()
+    }
+
+    /// Write `i_uid`/`i_gid` of `ino` through the journal. ext2 stores both as
+    /// `u16`; the syscall layer has already rejected values that do not fit.
+    pub fn set_inode_owner(&self, ino: u32, uid: u16, gid: u16) -> Result<(), FsError> {
+        let mut tx = Tx::new(self);
+        let mut inode = tx.read_inode(ino)?;
+        inode.i_uid = uid;
+        inode.i_gid = gid;
+        tx.write_inode(ino, &inode)?;
+        tx.commit()
+    }
 }
 
 // ─── directory + file operations ──────────────────────────────────────────────
@@ -1624,6 +1664,17 @@ fn fs_to_vfs(e: FsError) -> VfsError {
     }
 }
 
+/// Write `(uid, gid)` to an inode. ext2 stores both as `u16`, so a value that
+/// does not fit is refused instead of silently truncated — a `chown(70000)`
+/// must not become owner 4464.
+fn ext2_set_owner(fs: &Arc<Ext2Fs>, ino: u32, uid: u32, gid: u32) -> VfsResult<()> {
+    if uid > u16::MAX as u32 || gid > u16::MAX as u32 {
+        return Err(VfsError::InvalidArgument);
+    }
+    fs.set_inode_owner(ino, uid as u16, gid as u16)
+        .map_err(fs_to_vfs)
+}
+
 struct Ext2Dir {
     fs: Arc<Ext2Fs>,
     ino: u32,
@@ -1643,6 +1694,18 @@ impl VfsNode for Ext2Dir {
     }
     fn fs_ino(&self) -> u64 {
         self.ino as u64
+    }
+    fn mode(&self) -> u32 {
+        self.fs.node_mode(self.ino, 0o755)
+    }
+    fn owner(&self) -> (u32, u32) {
+        self.fs.node_owner(self.ino)
+    }
+    fn set_mode(&self, mode: u32) -> VfsResult<()> {
+        self.fs.set_inode_mode(self.ino, mode).map_err(fs_to_vfs)
+    }
+    fn set_owner(&self, uid: u32, gid: u32) -> VfsResult<()> {
+        ext2_set_owner(&self.fs, self.ino, uid, gid)
     }
     fn fs_stat(&self) -> Option<FsStat> {
         let sb = self.fs.superblock();
@@ -1735,6 +1798,18 @@ impl VfsNode for Ext2File {
     fn fs_ino(&self) -> u64 {
         self.ino as u64
     }
+    fn mode(&self) -> u32 {
+        self.fs.node_mode(self.ino, 0o644)
+    }
+    fn owner(&self) -> (u32, u32) {
+        self.fs.node_owner(self.ino)
+    }
+    fn set_mode(&self, mode: u32) -> VfsResult<()> {
+        self.fs.set_inode_mode(self.ino, mode).map_err(fs_to_vfs)
+    }
+    fn set_owner(&self, uid: u32, gid: u32) -> VfsResult<()> {
+        ext2_set_owner(&self.fs, self.ino, uid, gid)
+    }
     fn fs_stat(&self) -> Option<FsStat> {
         let sb = self.fs.superblock();
         Some(FsStat {
@@ -1820,6 +1895,18 @@ impl VfsNode for Ext2Symlink {
     fn fs_ino(&self) -> u64 {
         self.ino as u64
     }
+    fn mode(&self) -> u32 {
+        self.fs.node_mode(self.ino, 0o777)
+    }
+    fn owner(&self) -> (u32, u32) {
+        self.fs.node_owner(self.ino)
+    }
+    fn set_mode(&self, mode: u32) -> VfsResult<()> {
+        self.fs.set_inode_mode(self.ino, mode).map_err(fs_to_vfs)
+    }
+    fn set_owner(&self, uid: u32, gid: u32) -> VfsResult<()> {
+        ext2_set_owner(&self.fs, self.ino, uid, gid)
+    }
     fn fs_stat(&self) -> Option<FsStat> {
         let sb = self.fs.superblock();
         Some(FsStat {
@@ -1848,6 +1935,7 @@ impl VfsNode for Ext2Symlink {
 /// fifo, socket, ...): visible and stat-able, but never readable as a file, so
 /// no unknown `i_mode` can reach the regular-file block map.
 struct Ext2Opaque {
+    fs: Arc<Ext2Fs>,
     ino: u32,
     name: String,
     /// See `Ext2Dir::cached_size`.
@@ -1863,6 +1951,18 @@ impl VfsNode for Ext2Opaque {
     }
     fn fs_ino(&self) -> u64 {
         self.ino as u64
+    }
+    fn mode(&self) -> u32 {
+        self.fs.node_mode(self.ino, 0o644)
+    }
+    fn owner(&self) -> (u32, u32) {
+        self.fs.node_owner(self.ino)
+    }
+    fn set_mode(&self, mode: u32) -> VfsResult<()> {
+        self.fs.set_inode_mode(self.ino, mode).map_err(fs_to_vfs)
+    }
+    fn set_owner(&self, uid: u32, gid: u32) -> VfsResult<()> {
+        ext2_set_owner(&self.fs, self.ino, uid, gid)
     }
     fn size(&self) -> u64 {
         self.cached_size

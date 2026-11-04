@@ -34,11 +34,13 @@
 //! | `pid == INT_MIN` | `-INT_MIN` overflows, so Linux returns | `ESRCH` (NOT `EINVAL`) |
 //! | any | no permission to signal ANY target | `EPERM` |
 //!
-//! `EPERM` is structurally unreachable in pagh: there is a single uid model
-//! (`misc::sys_getid` returns 0 for every process, i.e. the CAP_KILL-equivalent),
-//! so every target is permitted. The decision is nevertheless a real function
-//! ([`kill_permits`]) that the handler calls, so a future uid/credential model
-//! has exactly one place to change instead of a silently missing check.
+//! `EPERM` is real: a caller may signal a target only when its **effective**
+//! user id equals the target's real or effective user id, or when the caller is
+//! root (`kill_permits`). The `kill(-1)` broadcast applies the same rule per
+//! target and delivers to the permitted subset (Linux's `kill_something_info`),
+//! so one un-signalable process does not turn the whole broadcast into `EPERM`.
+//! The handler snapshots credentials from the compat registry; the decision
+//! itself is the pure [`kill_permits`] exercised by the `kill_target` property.
 //!
 //! ## Process groups in pagh
 //!
@@ -127,15 +129,15 @@ pub fn kill_target(pid: i64) -> Result<KillTarget, Errno> {
     }
 }
 
-/// May a process with `sender_uid` signal a target with `target_uid`?
+/// May a process with effective uid `sender_euid` signal a target whose real
+/// uid is `target_uid` and effective uid is `target_euid`?
 ///
-/// pagh runs a single root-ish uid (`sys_getid()` returns 0 for every process),
-/// which is the kernel's CAP_KILL-equivalent, so every target is permitted and
-/// `EPERM` is unreachable. Kept as a function (rather than a comment) so a real
-/// credential model lands here.
+/// Linux (`check_kill_permission`): permitted when the sender's effective uid is
+/// root, or equals the target's real **or** effective uid. Supplementary groups
+/// and capabilities are not modelled, and there is no `uids` namespace.
 #[inline]
-pub fn kill_permits(sender_uid: u32, target_uid: u32) -> bool {
-    sender_uid == 0 || sender_uid == target_uid
+pub fn kill_permits(sender_euid: u32, target_uid: u32, target_euid: u32) -> bool {
+    sender_euid == 0 || sender_euid == target_uid || sender_euid == target_euid
 }
 
 /// Pick the ONE thread a group-wide signal is queued on.
@@ -202,10 +204,11 @@ mod tests {
     }
 
     #[test]
-    fn single_uid_permits_everything() {
-        assert!(kill_permits(0, 0));
-        assert!(kill_permits(0, 1000));
-        assert!(!kill_permits(1000, 1001));
-        assert!(kill_permits(1000, 1000));
+    fn permission_policy_uses_real_and_effective_target_ids() {
+        assert!(kill_permits(0, 0, 0));
+        assert!(kill_permits(0, 1000, 1001));
+        assert!(kill_permits(1000, 1000, 1001));
+        assert!(kill_permits(1000, 1001, 1000));
+        assert!(!kill_permits(1000, 1001, 1002));
     }
 }

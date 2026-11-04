@@ -90,12 +90,19 @@ proptest! {
         }
     }
 
-    /// The permission policy is reflexive and single-uid-permissive: uid 0 (every
-    /// process in pagh) may signal anyone, and a nonzero uid may always signal
-    /// itself.
+    /// The permission policy is root-or-same-identity: root may signal anyone, a
+/// nonzero effective uid may signal a target whose real OR effective uid it
+/// matches, and nothing else.
     #[test]
-    fn permission_policy_is_reflexive(sender in any::<u32>(), target in any::<u32>()) {
-        prop_assert!(kill_permits(sender, sender));
-        prop_assert_eq!(kill_permits(0, target), true);
+    fn permission_policy_is_root_or_same_identity(
+        sender in any::<u32>(),
+        target_uid in any::<u32>(),
+        target_euid in any::<u32>(),
+    ) {
+        let expected = sender == 0 || sender == target_uid || sender == target_euid;
+        prop_assert_eq!(kill_permits(sender, target_uid, target_euid), expected);
+        prop_assert!(kill_permits(sender, sender, target_euid));
+        prop_assert!(kill_permits(sender, target_uid, sender));
+        prop_assert!(kill_permits(0, target_uid, target_euid));
     }
 }

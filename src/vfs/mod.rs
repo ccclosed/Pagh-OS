@@ -99,6 +99,43 @@ pub trait VfsNode: Send + Sync {
         0
     }
 
+    /// Permission bits (`0o7777`) and type information are not returned here —
+    /// only the nine permission bits plus setuid/setgid/sticky, exactly what
+    /// `chmod(2)` accepts.
+    ///
+    /// Defaults to `0o755` for directories and `0o644` for files. Metadata is
+    /// **data**, not policy: the VFS never checks a caller's credentials. The
+    /// syscall layer reads these values and enforces access; kernel-internal
+    /// callers (boot provisioning, the package installer, the shell) continue to
+    /// use the VFS without a credential.
+    fn mode(&self) -> u32 {
+        if self.is_directory() {
+            0o755
+        } else {
+            0o644
+        }
+    }
+
+    /// `(uid, gid)` of the node's owner. Synthetic nodes default to `(0, 0)`
+    /// (root), which is also what the ext2 writer stamps on new inodes.
+    fn owner(&self) -> (u32, u32) {
+        (0, 0)
+    }
+
+    /// Persist new permission bits. Default `NotSupported`: nodes without
+    /// on-disk metadata (`/dev`, `/proc`, ramfs) cannot store a mode, and the
+    /// syscall layer keeps its historical per-process override for exactly that
+    /// case.
+    fn set_mode(&self, _mode: u32) -> VfsResult<()> {
+        Err(VfsError::NotSupported)
+    }
+
+    /// Persist a new owner. Default `NotSupported` (see [`VfsNode::set_mode`]);
+    /// only ext2-backed inodes have an `i_uid`/`i_gid` to write.
+    fn set_owner(&self, _uid: u32, _gid: u32) -> VfsResult<()> {
+        Err(VfsError::NotSupported)
+    }
+
     /// Is this node a symbolic link?
     ///
     /// Default `false`: the VFS had no notion of links before `/proc/self/exe`
@@ -291,6 +328,18 @@ impl VfsNode for MountNode {
     }
     fn size(&self) -> u64 {
         self.inner.size()
+    }
+    fn mode(&self) -> u32 {
+        self.inner.mode()
+    }
+    fn owner(&self) -> (u32, u32) {
+        self.inner.owner()
+    }
+    fn set_mode(&self, mode: u32) -> VfsResult<()> {
+        self.inner.set_mode(mode)
+    }
+    fn set_owner(&self, uid: u32, gid: u32) -> VfsResult<()> {
+        self.inner.set_owner(uid, gid)
     }
     fn is_symlink(&self) -> bool {
         self.inner.is_symlink()

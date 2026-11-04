@@ -158,6 +158,12 @@ pub mod nr {
     pub const UNLINK: u64 = 87;
     /// `chmod` (90) — git chmods `.git/config.lock` during init.
     pub const CHMOD: u64 = 90;
+    /// `fchmod` (91) — change the mode of an open file descriptor.
+    pub const FCHMOD: u64 = 91;
+    /// `chown` (92) — change a path's owner (root only).
+    pub const CHOWN: u64 = 92;
+    /// `fchown` (93) — change an open descriptor's owner (root only).
+    pub const FCHOWN: u64 = 93;
     pub const READLINK: u64 = 89;
     /// `gettimeofday` — get wall-clock time as a `timeval`.
     pub const GETTIMEOFDAY: u64 = 96;
@@ -169,10 +175,26 @@ pub mod nr {
     pub const GETUID: u64 = 102;
     /// `getgid` — get real group id.
     pub const GETGID: u64 = 104;
+    /// `setuid` — set the real/effective/saved user id.
+    pub const SETUID: u64 = 105;
+    /// `setgid` — set the real/effective/saved group id.
+    pub const SETGID: u64 = 106;
     /// `geteuid` — get effective user id.
     pub const GETEUID: u64 = 107;
     /// `getegid` — get effective group id.
     pub const GETEGID: u64 = 108;
+    /// `setreuid` — set the real/effective user id.
+    pub const SETREUID: u64 = 113;
+    /// `setregid` — set the real/effective group id.
+    pub const SETREGID: u64 = 114;
+    /// `setresuid` — set any subset of the real/effective/saved user ids.
+    pub const SETRESUID: u64 = 117;
+    /// `getresuid` — read the real/effective/saved user ids.
+    pub const GETRESUID: u64 = 118;
+    /// `setresgid` — set any subset of the real/effective/saved group ids.
+    pub const SETRESGID: u64 = 119;
+    /// `getresgid` — read the real/effective/saved group ids.
+    pub const GETRESGID: u64 = 120;
     /// `getppid` — get parent process id.
     pub const GETPPID: u64 = 110;
     /// `statfs` — filesystem statistics by path.
@@ -278,7 +300,7 @@ pub fn marshal_args(
 /// History note: the previous test asserted membership for only 69 of the 109
 /// numbers the gate accepted and never asserted that anything was *unsupported*,
 /// so it could not catch either class of drift.
-pub const SUPPORTED_SYSCALLS: [u64; 110] = [
+pub const SUPPORTED_SYSCALLS: [u64; 121] = [
     nr::READ,
     nr::WRITE,
     nr::OPEN,
@@ -338,18 +360,29 @@ pub const SUPPORTED_SYSCALLS: [u64; 110] = [
     nr::UNLINK,
     nr::READLINK,
     nr::CHMOD,
+    nr::FCHMOD,
+    nr::CHOWN,
+    nr::FCHOWN,
     nr::UMASK,
     nr::GETTIMEOFDAY,
     nr::GETRLIMIT,
     nr::SYSINFO,
     nr::GETUID,
     nr::GETGID,
+    nr::SETUID,
+    nr::SETGID,
     nr::GETEUID,
     nr::GETEGID,
     nr::SETPGID,
     nr::GETPPID,
     nr::GETPGRP,
     nr::SETSID,
+    nr::SETREUID,
+    nr::SETREGID,
+    nr::SETRESUID,
+    nr::GETRESUID,
+    nr::SETRESGID,
+    nr::GETRESGID,
     nr::GETPGID,
     nr::SIGALTSTACK,
     nr::STATFS,
@@ -439,13 +472,14 @@ mod tests {
     fn supported_set_is_exact() {
         // Independent enumeration: the Linux x86_64 syscall numbers with a real
         // dispatcher arm, in ascending order (keep it sorted!).
-        const EXPECTED: [u64; 110] = [
+        const EXPECTED: [u64; 121] = [
             0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
             28, 32, 33, 35, 39, 41, 42, 43, 44, 45, 49, 50, 51, 53, 54, 55, 56, 59, 60, 61, 62, 63,
-            72, 73, 74, 75, 79, 80, 81, 82, 83, 84, 87, 89, 90, 95, 96, 97, 99, 102, 104, 107, 108,
-            109, 110, 111, 112, 121, 131, 137, 138, 158, 186, 201, 202, 217, 218, 227, 228, 229,
-            230, 231, 232, 233, 234, 257, 262, 264, 267, 270, 271, 273, 274, 281, 288, 290, 291,
-            292, 293, 295, 296, 302, 316, 318, 332, 334,
+            72, 73, 74, 75, 79, 80, 81, 82, 83, 84, 87, 89, 90, 91, 92, 93, 95, 96, 97, 99, 102,
+            104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 117, 118, 119, 120, 121, 131,
+            137, 138, 158, 186, 201, 202, 217, 218, 227, 228, 229, 230, 231, 232, 233, 234, 257,
+            262, 264, 267, 270, 271, 273, 274, 281, 288, 290, 291, 292, 293, 295, 296, 302, 316,
+            318, 332, 334,
         ];
 
         // 1. The two independent enumerations agree element-wise, and both are
