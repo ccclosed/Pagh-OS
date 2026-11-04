@@ -1747,6 +1747,31 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
     if flags & RENAME_NOREPLACE != 0 && walk(newabs, false).is_ok() {
         return Err(Errno::EEXIST);
     }
+    // Resolve and authorise BOTH parent directories before any side effect: a
+    // rename that is denied on the source side must not have already created or
+    // overwritten the target.
+    let (nparent, nname) = match newabs.rfind('/') {
+        Some(0) => ("/", &newabs[1..]),
+        Some(i) => (&newabs[..i], &newabs[i + 1..]),
+        None => return Err(Errno::ENOENT),
+    };
+    if nname.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    let (oparent, oname) = match oldabs.rfind('/') {
+        Some(0) => ("/", &oldabs[1..]),
+        Some(i) => (&oldabs[..i], &oldabs[i + 1..]),
+        None => return Err(Errno::ENOENT),
+    };
+    if oname.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    // Parents follow links (a rename into a symlinked directory must land in its
+    // target); the *source* stays unresolved on purpose — see the note above.
+    let ndir = walk(nparent, true)?;
+    check_dir_mutation(&ndir)?;
+    let odir = walk(oparent, true)?;
+    check_dir_mutation(&odir)?;
     // Read the whole source file.
     let size = node.size() as usize;
     let mut data = ::alloc::vec::Vec::new();
@@ -1763,18 +1788,6 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
     }
     data.truncate(off);
     // Create/replace the target and write the contents.
-    let (nparent, nname) = match newabs.rfind('/') {
-        Some(0) => ("/", &newabs[1..]),
-        Some(i) => (&newabs[..i], &newabs[i + 1..]),
-        None => return Err(Errno::ENOENT),
-    };
-    if nname.is_empty() {
-        return Err(Errno::EINVAL);
-    }
-    // Parents follow links (a rename into a symlinked directory must land in its
-    // target); the *source* stays unresolved on purpose — see the note above.
-    let ndir = walk(nparent, true)?;
-    check_dir_mutation(&ndir)?;
     if ndir.lookup(nname).is_ok() {
         ndir.remove(nname).map_err(|e| {
             crate::warn!("[linux] rename: replace target failed: {:?} {}", e, newabs);
@@ -1796,14 +1809,7 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
         }
         woff += n;
     }
-    // Unlink the source.
-    let (oparent, oname) = match oldabs.rfind('/') {
-        Some(0) => ("/", &oldabs[1..]),
-        Some(i) => (&oldabs[..i], &oldabs[i + 1..]),
-        None => return Err(Errno::ENOENT),
-    };
-    let odir = walk(oparent, true)?;
-    check_dir_mutation(&odir)?;
+    // Unlink the source (both parents were authorised before any mutation).
     odir.remove(oname).map_err(|e| {
         crate::warn!("[linux] rename: unlink source failed: {:?} {}", e, oldabs);
         Errno::EIO

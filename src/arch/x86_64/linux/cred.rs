@@ -253,7 +253,12 @@ impl Creds {
     /// An unprivileged caller may only move each specified id within the set
     /// `{uid, euid, suid}` (the values it already owns); a privileged caller may
     /// set any value. `None` in an argument means "unchanged" (`(uid_t)-1`).
-    pub fn setresuid(&self, uid: Option<u32>, euid: Option<u32>, suid: Option<u32>) -> Option<Creds> {
+    pub fn setresuid(
+        &self,
+        uid: Option<u32>,
+        euid: Option<u32>,
+        suid: Option<u32>,
+    ) -> Option<Creds> {
         if self.euid != 0 {
             for requested in [uid, euid, suid].into_iter().flatten() {
                 if requested != self.uid && requested != self.euid && requested != self.suid {
@@ -275,7 +280,12 @@ impl Creds {
     }
 
     /// `setresgid(2)`: the group analogue of [`Creds::setresuid`].
-    pub fn setresgid(&self, gid: Option<u32>, egid: Option<u32>, sgid: Option<u32>) -> Option<Creds> {
+    pub fn setresgid(
+        &self,
+        gid: Option<u32>,
+        egid: Option<u32>,
+        sgid: Option<u32>,
+    ) -> Option<Creds> {
         if self.euid != 0 {
             for requested in [gid, egid, sgid].into_iter().flatten() {
                 if requested != self.gid && requested != self.egid && requested != self.sgid {
@@ -373,7 +383,10 @@ mod tests {
         // A setuid-root child: ruid 1000, euid/suid 0.
         let setuid_root = Creds::new(1000, 1000, 0, 1000, 0, 1000);
         let released = setuid_root.setuid(1000).expect("back to real uid");
-        assert_eq!((released.uid, released.euid, released.suid), (1000, 1000, 1000));
+        assert_eq!(
+            (released.uid, released.euid, released.suid),
+            (1000, 1000, 1000)
+        );
         let back = setuid_root.setuid(0).expect("saved id is permitted");
         assert_eq!(back.euid, 0);
 
