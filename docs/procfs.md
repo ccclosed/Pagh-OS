@@ -435,7 +435,7 @@ pub cmdline: Vec<u8>,
 | `Pid` | `Pid:\t{pid}\n` | `scheduler::current_pid()` |
 | `PPid` | `PPid:\t{ppid}\n` | `cs.ppid` |
 | `TracerPid` | `TracerPid:\t0\n` | трассировки нет |
-| `Uid`,`Gid` | `Uid:\t0\t0\t0\t0\n` (и `Gid` так же) | всё выполняется как root (модель ядра) |
+| `Uid`,`Gid` | `Uid:\t{uid}\t{euid}\t{suid}\t{euid}\n` (и `Gid` с gid/egid/sgid/egid) | `cs.creds` (security model). Колонки Linux: real, effective, saved, filesystem; отдельного fsuid/fsgid нет, поэтому четвёртая колонка повторяет effective |
 | `FDSize` | `FDSize:\t{slots}\n` | `FdTable` → `FdSlots::len()` (`src/task/fd_alloc.rs:118`); нужен однострочный аксессор `FdTable::capacity()` |
 | `Threads` | `Threads:\t{n}\n` | число pid в `COMPAT_STATES` с `tgid == cs.tgid` (через существующий `group_member_pids`, `compat.rs:355`) |
 | `SigPnd` | `SigPnd:\t{:016x}\n` | `cs.sig_pending` |
@@ -765,7 +765,8 @@ pub fn format_uptime(ticks: u64, tick_hz: u64) -> Vec<u8>;
 
 pub struct StatusInputs<'a> { pub name: &'a [u8], pub umask: u32, pub pid: u64, pub tgid: u64,
     pub ppid: u64, pub threads: u64, pub fd_size: u64, pub sig_pending: u64,
-    pub sig_blocked: u64, pub sig_ign: u64, pub sig_cgt: u64, pub vm: VmKb }
+    pub sig_blocked: u64, pub sig_ign: u64, pub sig_cgt: u64,
+    pub uids: [u32; 4], pub gids: [u32; 4], pub vm: VmKb }
 pub struct VmKb { pub size: u64, pub rss: u64, pub data: u64, pub stk: u64, pub exe: u64, pub lib: u64 }
 pub fn format_status(s: &StatusInputs) -> Vec<u8>;
 pub fn task_name(exe_path: &str, argv0: &[u8]) -> Vec<u8>;   // ≤15 байт

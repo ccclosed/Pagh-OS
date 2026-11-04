@@ -86,9 +86,28 @@ replay seed воспроизводим — поэтому деградация �
 - RDSEED/RDRAND-бэкенд не компенсирует отсутствия аутентификации пира в TLS: ключи
   сессии случайны и fail-closed, но доверие к серверу даёт только верификатор
   (`net::tls` → `tls_auth`/`tls_chain`/`ca_bundle`), и он ограничен пиннутыми корнями.
-  Подписи метаданных Debian и digest'ы пакетов не проверяются (`SECURITY.md`).
+  Остающиеся непроверяемыми места цепочки apt (отзыв сертификатов, replay старой
+  тройки на suite без `Valid-Until`) перечислены в `SECURITY.md`.
 - Транзиентный сбой инструкции после успешной проверки доступности трактуется как
   нарушение инварианта, а не повод подставить предсказуемые байты.
 - `mixed_fill` — единственное место, где байты boot-seed покидают модуль; всё, что
   запрашивает криптографическую случайность (`fill`, TLS-ключи, `getrandom`), этих
   байтов не получает.
+
+## Модель прав процесса (security model)
+
+Этот каталог по-прежнему отвечает только за энтропию; модель креденшелов и прав ФС
+живёт рядом с syscall-слоем, а не здесь:
+
+| Компонент | Где | Роль |
+|---|---|---|
+| `Creds`, `Access`, `may`, set*id-переходы | `arch/x86_64/linux/cred.rs` | **чистая** POSIX-матрица (owner/group/other, root bypass r/w, execute требует x) и правила Linux для setuid/setgid/setreuid/setresuid; host-свойство P56 |
+| `CompatState::creds` | `task/compat.rs` | единственный владелец шести id процесса; ROOT по умолчанию, наследуется fork/clone |
+| `check_node_access`, `check_dir_mutation` | `arch/x86_64/linux/io_sys.rs` | проверки на границе syscall для open/exec/unlink/rename/mkdir/chmod/chown |
+| `kill_permits` | `arch/x86_64/linux/kill.rs` | euid отправителя = root / real uid / effective uid цели |
+| `VfsNode::{mode, owner}` | `vfs/mod.rs`, `fs/ext2/mod.rs` | **только метаданные** (`i_mode`/`i_uid`/`i_gid`), без проверки прав |
+
+Что это **не** даёт: логина/аккаунтов (shell и все kernel-spawned процессы — root),
+setuid-бинарей, supplementary groups/ACL/fsuid/capabilities/seccomp/LSM/audit,
+SMAP/KPTI (SMEP включается по CPUID). Полный контракт и список пробелов —
+`docs/security-model.md`.

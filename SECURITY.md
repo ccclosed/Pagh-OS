@@ -4,16 +4,47 @@ pagh is an educational kernel, not a production operating system.
 
 ## Threat model in one paragraph
 
-pagh gives you two things: **kernel integrity** (ring 3 cannot read or write kernel
-memory, execute writable memory, or touch device MMIO — paging enforces it) and
-**package authenticity** (the TLS/OpenPGP/digest chain above refuses a mirror that
-cannot prove what it served). It gives you **no containment of a hostile local
-process**: every process runs with the same identity (`getuid()` is 0 everywhere, a
-single-uid model), has the whole syscall surface, and there is no ASLR/KASLR, no
-KPTI, no SMEP/SMAP, no seccomp/capabilities, no LSM, no audit and no authenticated
-filesystem permissions. Side channels, network availability and firmware are out of
-scope. Treat it as a teaching kernel that a careful operator runs only with code they
-trust.
+pagh gives you **kernel integrity** (ring 3 cannot read or write kernel memory,
+execute writable memory, or touch device MMIO — paging enforces it), **package
+authenticity** (the TLS/OpenPGP/digest chain above refuses a mirror that cannot prove
+what it served), and a **filesystem permission model between processes** (per-process
+`uid`/`gid`/`euid`/`egid`/`suid`/`sgid`, POSIX owner/group/other checks on `open`,
+`execve`, directory mutation and `kill`, and owner/root-only `chmod`, root-only
+`chown`, all against real ext2 inode metadata). It does **not** give you a secure
+multi-user system: there is no login or account database, so the boot shell and every
+kernel-spawned process run as root and the model constrains only a process that
+deliberately drops privileges (`setuid` family). There are no supplementary groups,
+ACLs, `fsuid`, capabilities, seccomp, LSM or audit trail, no setuid-binary elevation on
+`execve`, no ASLR/KASLR, no KPTI, no SMAP (SMEP is enabled only when CPUID reports it)
+and no address-space or mount namespaces. A hostile process that starts as root stays
+root; a process that has dropped privileges can still exhaust memory/CPU and has the
+whole remaining syscall surface. Side channels, network availability and firmware are
+out of scope. Treat it as a teaching kernel that a careful operator runs only with code
+they trust. The enforcement points and the exact gaps are listed in
+`docs/security-model.md`.
+
+### Credentials and filesystem permissions
+
+Credentials live in `CompatState` (`src/task/compat.rs`) and start as `Creds::ROOT` for
+every process the kernel spawns; `fork`/`clone` inherit them unchanged and `execve`
+preserves them (setuid *binaries* are not modelled). The pure decisions live in
+`src/arch/x86_64/linux/cred.rs` (host property P56), and the syscall layer — not the
+VFS — consults them:
+
+* `open`/`openat`: read for `O_RDONLY`, write for `O_WRONLY`/`O_RDWR`, plus write for
+  `O_TRUNC`; `O_CREAT` additionally needs write+execute on the parent directory.
+* `execve`: at least one execute bit, even for root (Linux's rule).
+* `unlink`/`rmdir`/`mkdir`/`rename`: write+execute on every parent directory involved;
+  `rename` authorises both parents before it mutates either.
+* `chmod`/`fchmod`: root or the inode owner; `chown`/`fchown`: root only. ext2 writes
+  `i_mode`/`i_uid`/`i_gid` back through the journal; synthetic nodes (`/dev`, `/proc`,
+  ramfs) keep the historical per-process stat override and cannot persist an owner.
+* `kill`/`tgkill`: caller's effective uid must be root or equal the target's real or
+  effective uid.
+
+Root bypasses read and write, but **not** execute: a `0644` file cannot be execed by
+anyone. That rule is what makes the model meaningful even though the default identity
+is root.
 
 ## Safe defaults
 

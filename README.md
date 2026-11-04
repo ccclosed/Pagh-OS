@@ -37,12 +37,21 @@ userland** onto its ext2 disk after an opt-in confirmation at first boot.
 
 > Hobby/educational kernel — **not a security boundary.** Ring 3 is isolated from the
 > kernel by paging (the U/S bit, W^X/NX leaves, and device MMIO never user-accessible)
-> and syscall buffers are range-checked against user mappings, but there is no privilege
-> separation *between* processes (a single-uid model: every process sees `getuid() == 0`),
-> no ASLR/KASLR, no seccomp or capability model, no KPTI and no SMEP/SMAP, and no LSM or
-> audit trail. The TLS + OpenPGP + digest chain below authenticates **packages** against a
+> and syscall buffers are range-checked against user mappings. A **process credential
+> model** now exists: `CompatState` carries real `uid`/`gid`/`euid`/`egid`/`suid`/`sgid`
+> values, the `set*id` family changes them under the Linux rules, and the syscall layer
+> enforces POSIX owner/group/other bits (with the standard root read/write bypass and
+> the "execute still needs an x bit" rule) on `open`, `execve`, directory mutation,
+> `chmod`/`chown` and `kill`, backed by ext2 `i_mode`/`i_uid`/`i_gid`. SMEP is enabled
+> when CPUID reports it. What is **still missing**: there are no user accounts or login
+> (the shell and every kernel-spawned process default to root, so the model only
+> constrains processes that deliberately drop privileges), no setuid-binary elevation on
+> `execve`, no supplementary groups, ACLs or `fsuid`, no capability sets, seccomp or LSM,
+> no audit trail, no ASLR/KASLR, no KPTI, no SMAP and no address-space or mount
+> namespaces. The TLS + OpenPGP + digest chain below authenticates **packages** against a
 > hostile mirror; it does not contain hostile local code. Do not run untrusted binaries or
-> expose this kernel to a network you do not control. Details in `SECURITY.md`.
+> expose this kernel to a network you do not control. Details in `SECURITY.md` and
+> `docs/security-model.md`.
 
 > **Network default:** outbound package operations are **enabled** in normal builds
 > (`default = ["network_packages"]` in `Cargo.toml`). Two independent halves now

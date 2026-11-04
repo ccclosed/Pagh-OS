@@ -28,13 +28,14 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 | `abi.rs` | Чистый маршаллинг аргументов (`marshal_args`), полный перечень поддерживаемого набора `SUPPORTED_SYSCALLS` (единственный источник истины, `is_supported` — бинарный поиск по нему), константы номеров |
 | `validate.rs` | Чистая валидация user-указателей (`spanned_pages`, границы/переполнение, без разыменований) |
 | `trap_frame.rs` | Чистое зеркало фрейма `irq32_stub` (21 слово: popfq, 15 GPR в порядке `SavedRegs`, iret-слова) и план доставки сигнала с тика: ring-3 классификация, точный набор мутаций входа в обработчик, проверка «доставлен тот же сигнал» (хост-тестируемый, свойство `irq_frame`; const-asserts против индексов из `src/test.rs`) |
-| `kill.rs` | Чистая модель `kill(2)` (issue #12): 32-битное декодирование `pid_t`/`int`, классификация цели (`pid>0`, `0`, `-1`, `-pgid`, `INT_MIN → ESRCH`), политика прав (single-uid), выбор одного потока на группу (хост-тестируемая, свойство `kill_target`) |
+| `kill.rs` | Чистая модель `kill(2)` (issue #12): 32-битное декодирование `pid_t`/`int`, классификация цели (`pid>0`, `0`, `-1`, `-pgid`, `INT_MIN → ESRCH`), политика прав `kill_permits` (root / real uid / effective uid цели; EPERM реально достижим), выбор одного потока на группу (хост-тестируемая, свойство `kill_target`) |
+| `cred.rs` | Чистая модель креденшелов: `Creds` (6 id), `Access`, POSIX `may` (owner/group/other по effective id, root bypass r/w, execute требует x), переходы setuid/setgid/setreuid/setregid/setresuid/setresgid, `may_chmod`/`may_chown` (хост-тестируемая, свойство P56) |
 | `errno.rs` | Модель errno; ядро складывает `Err(e)` в rax как `-errno` (`-4095..=-1`) |
 | `io.rs` | Чистое планирование `read`/`lseek` |
 | `io_sys.rs` | Эффектные обработчики файлового I/O (FdTable, консоль, VFS/ext2) |
 | `mem.rs` | Чистое планирование `brk`/`mmap`/`munmap`, `prot_to_flags` |
 | `mem_sys.rs` | Эффектные memory-syscall'ы: `handle_user_page_fault` (demand paging для anon mmap/brk), VmRegionSet + VMM/PMM |
-| `misc.rs` | `getpid`/`uname`/`arch_prctl`/`set_tid_address`/`clock_gettime`/`getrandom`/`exit`/`exit_group` |
+| `misc.rs` | `getpid`/`uname`/`arch_prctl`/`set_tid_address`/`clock_gettime`/`getrandom`/`exit`/`exit_group`, а также `get[res]{u,g}id`/`set[res]{u,g}id` (читают и меняют `CompatState::creds`) |
 | `stat.rs` | Кодирование `struct stat` (`LinuxStat`) для `fstat`/`newfstatat` |
 | `dirent.rs` | Чистая упаковка `linux_dirent64` для `getdents64` |
 | `epoll_sys.rs` | `clock_getres`, `eventfd2`, `epoll_create1/ctl/wait` |
@@ -48,7 +49,7 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 | `signal.rs` | Доставка POSIX-сигналов: очередь pending, `deliver_one_pending_syscall` в эпилоге `linux_dispatch` (возврат из syscall) и `tick_action` на возврате тика (только текущей задаче, ring-3 проверка ДО выбора сигнала, `sys_exit_group` из IRQ не вызывается), `sys_kill` (nr 62: pid / своя группа / `-pgid` / `-1`, по одной копии на группу), `SIGSTOP`/`SIGCONT` (стоп — действие доставки, парковка фреймов; продолжение — генерация `SIGCONT` отправителем + сброс pending stop-битов), `rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`, `tgkill`, маски, guard'ы инварианта 2 (флаг int80-входа + проверка кадра) |
 | `signal_frame.rs` | Чистая сборка/разбор `rt_sigframe` на user-стеке (хост-тестируемая) |
 
-Чистые модули (`abi`, `diag`, `dirent`, `errno`, `io`, `kill`, `mem`, `rand_clock`, `regs`,
+Чистые модули (`abi`, `cred`, `diag`, `dirent`, `errno`, `io`, `kill`, `mem`, `rand_clock`, `regs`,
 `signal_frame`, `stat`, `timeconv`, `trap_frame`, `validate`) через `#[path]` включаются в
 хост-крейт `host-tests` — они обязаны быть только `core`+`alloc`.
 

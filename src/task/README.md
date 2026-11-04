@@ -99,6 +99,10 @@
   `CLONE_THREAD` (vfork/posix_spawn) — сознательно ENOSYS, чтобы libuv шла через fork+exec.
 - Зомби: `finish_compat_exit` кладёт детей в `EXITED_CHILDREN`; `sys_wait4` опрашивает
   `reap_child`, уступая между проверками.
+- Креденшелы: `CompatState.creds` (шесть id, `Creds::ROOT` по умолчанию) — единственный
+  владелец личности процесса; fork/clone наследуют, execve сохраняет (setuid-бинарей
+  нет). Проверки прав — в syscall-слое (`arch/.../linux/cred.rs` +
+  `io_sys`/`process_sys`/`signal`), не в VFS; контракт `docs/security-model.md`.
 
 ## Реализованные Linux syscall'ы (кратко)
 

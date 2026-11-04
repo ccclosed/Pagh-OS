@@ -146,6 +146,23 @@ kernel-e2e-legacy -> tools/e2e_*.ps1         # Windows-only legacy harnesses (ne
     needs a `SAFETY:` comment within the previous 6 lines
     (`tools/check_safety.py` enforces; the rest of the kernel follows the
     same style voluntarily — keep it).
+11. **Credentials are syscall-layer state, never VFS policy.**
+    `CompatState::creds` (`src/task/compat.rs`) is the only owner of a process's
+    six ids; it starts as `Creds::ROOT`, is inherited by `fork`/`clone`, and is
+    preserved by `execve` (setuid binaries are not modelled). The pure decisions
+    live in `src/arch/x86_64/linux/cred.rs` (host property P56). Invariants:
+    * `VfsNode` carries metadata only (`mode`/`owner`/`set_mode`/`set_owner`).
+      Never add a credential check inside a `VfsNode` implementation — boot
+      provisioning, the package installer and the shell call the VFS directly and
+      must keep working without an identity.
+    * root bypasses **read and write** but never **execute**: a mode with no
+      `0o111` bit is not executable even for root. Do not "fix" a `0644`
+      executable by special-casing root.
+    * a new syscall follows the three-edit `abi.rs` contract (nr constant, dispatch
+      arm, `SUPPORTED_SYSCALLS` + the independent `EXPECTED` literal). Path
+      syscalls use `check_node_access`/`check_dir_mutation`; id changes go through
+      a `Creds` transition method, never field-by-field in a handler.
+    Contract and exact gap list: `docs/security-model.md`.
 
 ## Testing philosophy
 
@@ -153,7 +170,7 @@ kernel-e2e-legacy -> tools/e2e_*.ps1         # Windows-only legacy harnesses (ne
 -only to be `#[path]`-included in `host-tests/src/lib.rs` and covered by a
   `properties/pNN.rs` property file. If your change touches such a module
   (`abi`, `errno`, `validate`, `io`, `wire`, `deb`, `tar`, `apt_index`,
-  `signal_frame`, …), extend/adjust the property; the `#[cfg(test)]`
+  `signal_frame`, `cred`, …), extend/adjust the property; the `#[cfg(test)]`
   `supported_set_is_exact` list in `abi.rs` must match `is_supported`.
 - **Kernel-internal state → in-QEMU selftests** (`src/test.rs`, run via the
   `selftest` shell command; non-destructive, deterministic XorShift seeds).
@@ -283,3 +300,15 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   (The former "embedded-tls hangs on large streams" gap is closed: a multi-MB
   TLS fetch completes end to end — `lx_tlsbig`, issue #19 — and the live
   `apt update` runs over HTTPS.)
+
+- Process credentials + filesystem permissions are implemented (contract
+  `docs/security-model.md`): per-process real/effective/saved uid+gid in
+  `CompatState`, the `set*id` family, owner/group/other checks on `open`,
+  `execve`, directory mutation, `chmod`/`chown` and `kill`, and ext2
+  `i_mode`/`i_uid`/`i_gid` write-back. What is still missing and named in
+  `SECURITY.md`: no login/accounts (the shell and all kernel-spawned processes
+  start as root), no setuid-binary elevation on `execve`, no supplementary
+  groups/ACLs/`fsuid`, no capability sets/seccomp/LSM/audit, no sticky-bit or
+  directory-owner checks, `access(2)` is still an existence probe, `stat` still
+  uses the historical 0755/0700 defaults unless the process recorded an
+  override, and SMEP is the only hardware mitigation (SMAP/KPTI are absent).

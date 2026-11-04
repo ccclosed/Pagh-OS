@@ -35,6 +35,11 @@
 - `VfsNode::is_symlink()` / `read_link() -> Option<String>` — понятие ссылки в трейте
   (дефолты `false`/`None`; переопределён у `/proc/self/exe`, будет переиспользован
   ext2-симлинками из issue #18). `MountNode` форвардит оба метода.
+- `VfsNode::{mode, owner, set_mode, set_owner}` — **метаданные**, не политика:
+  дефолты `0o755`/`0o644` по `is_directory`, владелец `(0, 0)`, set*-методы →
+  `NotSupported`. ext2 читает/пишет `i_mode`, `i_uid`, `i_gid` через журнал;
+  `MountNode` форвардит все четыре. Права проверяет ТОЛЬКО syscall-слой
+  (`docs/security-model.md`), не VFS — boot/installer/shell ходят мимо него.
 - `elf`: `ElfLoader::{load, load_linux, map_interpreter}`,
   `ElfProcess { entry, pml4_phys, load_bias, phdr_vaddr, phent, phnum, initial_brk }`.
 - `elf_classify`: `USER_ADDR_MAX = 0x0000_8000_0000_0000`, `PIE_BASE = 0x1_0000`.
