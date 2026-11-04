@@ -73,6 +73,11 @@ for setuid-root programs, which pagh does not support anyway.
 
 The VFS never checks a credential. Boot provisioning, the package installer and the
 shell call these methods directly, exactly as before. A `MountNode` forwards all four.
+Creation through a syscall stamps the creator's `euid`/`egid` on the new node
+(`stamp_creation_owner`), because ext2's writer has no credential and always stores
+`(0, 0)`; root's own `(0, 0)` needs no extra transaction. Synthetic nodes cannot store
+an owner, so a non-root file created on ramfs remains root-owned for `chmod` purposes
+(documented gap).
 
 ## 3. Enforcement points (syscall layer only)
 

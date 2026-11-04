@@ -880,6 +880,7 @@ fn open_path(path: &str, flags: u64) -> Result<u64, Errno> {
             })?;
             // Record the creation mode (default perms masked by the process
             // umask) so stat-family handlers report it.
+            stamp_creation_owner(&created);
             record_mode_override(node_ino(&created), DEFAULT_FILE_PERMS & !current_umask());
         }
     }
@@ -1098,6 +1099,21 @@ fn apply_node_mode(node: &Arc<dyn VfsNode>, perms: u32) -> Result<(), Errno> {
             Ok(())
         }
         Err(_) => Err(Errno::EIO),
+    }
+}
+
+/// Stamp a newly created node with the creator's effective uid/egid.
+///
+/// ext2's writer has no credential and stamps `(0, 0)`; the syscall boundary is
+/// where the caller's identity is known, so a non-root creator must become the
+/// owner here or it could never `chmod` the file it just made. Root's `(0, 0)`
+/// is already what the writer stores, so the extra journaled transaction is
+/// skipped for the default identity. Synthetic nodes cannot store an owner
+/// (`NotSupported`); that is the documented ramfs/procfs limitation.
+fn stamp_creation_owner(node: &Arc<dyn VfsNode>) {
+    let creds = current_creds();
+    if creds.euid != 0 || creds.egid != 0 {
+        let _ = node.set_owner(creds.euid, creds.egid);
     }
 }
 
@@ -1880,6 +1896,7 @@ pub fn sys_mkdir(path: u64, _mode: u64) -> Result<u64, Errno> {
     })?;
     // Record the creation mode (default dir perms masked by the process
     // umask) so stat-family handlers report it.
+    stamp_creation_owner(&created);
     record_mode_override(node_ino(&created), 0o700 & !current_umask());
     Ok(0)
 }
