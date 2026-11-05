@@ -89,8 +89,18 @@
 
 ## Грабли
 
-- Куча не растёт: полный Debian-индекс (`apt update`) специально упирается в лимит
-  `pkg::deb::MAX_INDEX_*`, чтобы падать чисто, а не OOM-абортом.
-- `fork_user_space_cow` требует, чтобы родительское адресное пространство было АКТИВНО в CR3
-  (нужен TLB-invalidate).
-- Некоторые элементы `layout.rs` помечены `dead_code` до миграции вызовов планировщика.
+- Куча не растёт: `HEAP_INITIAL_PAGES = 131072` (512 MiB) — жёсткий потолок
+  `linked_list_allocator`; `init()` капит его по фактической RAM и логирует `[WARN]`.
+  Полный Debian-индекс (`apt update`) специально упирается в
+  `pkg::deb::MAX_INDEX_DECOMPRESSED = 96 MiB` / `MAX_INDEX_STREAM_BYTES =
+  512 MiB`, чтобы падать чистым `IndexTooLarge`, а не OOM-абортом; для полного
+  индекса нужны меньший компонент/локальное зеркало или поднятые лимиты и `-m`.
+- `fork_user_space_cow` требует, чтобы родительское адресное пространство было
+  АКТИВНО в CR3: функция снимает WRITABLE с родительских PTE и делает полный
+  `tlb::flush_all()`. Вызов из `fork_linux_process` идёт из syscall-контекста
+  родителя, поэтому контракт выполняется; в debug-сборке это проверяется
+  утверждением (`parent_pml4 == current_pml4_phys()`), а не только комментарием.
+- `layout.rs` — единственный источник истины: `task::scheduler` и
+  `task::process` уже вызывают `kernel_stack_for_pid`/`KERNEL_STACK_PAGES`/
+  `USER_STACK_TOP`/`USER_STACK_PAGES`/`USER_MMAP_BASE`/`heap_base`; пункт про
+  `dead_code` до миграции (task 5.1) устарел и удалён.

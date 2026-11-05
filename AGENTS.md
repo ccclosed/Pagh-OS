@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.9.0**
+  be reflected here. **`main` currently reads 2.9.1**
   (the credentials/permissions minor bump; it lands on `main` with the merge).
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
@@ -260,7 +260,11 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   buffer and flushed with it (the shadow-buffer commit had left it drawn *after*
   the flush, so it never reached the device), while an idle shell skips the
   overlay/repaint cycle instead of copying the surface once per timer tick.
-  **2.9.0** = the procfs slice 2: `/proc/stat` with real user/system/idle tick
+  **2.9.1** = the memory-docs truth pass: the fixed 512 MiB heap and the
+  `MAX_INDEX_*` clean-failure policy are recorded with the exact constants,
+  `fork_user_space_cow`'s active-CR3/TLB contract is a debug assertion rather
+  than a comment, and the stale layout.rs `dead_code` note is gone (migration
+  complete); **2.9.0** = the procfs slice 2: `/proc/stat` with real user/system/idle tick
   accounting in the timer path, host properties and an in-QEMU two-read
   monotonicity check; **2.5.0** = procfs, signals, the verified apt trust chain
   and the durability fixes (issues #11–#19, #32–#35). Every release owes both a

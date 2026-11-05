@@ -732,6 +732,16 @@ pub fn drop_user_space(pml4: u64) {
 /// address space must be ACTIVE (fork runs on the parent's CR3): the RO-flip
 /// needs a TLB invalidate, done here as a full flush on return.
 pub fn fork_user_space_cow(parent_pml4: u64, child_pml4: u64) -> Result<(), VmError> {
+    // Caller contract: the parent's address space is the active CR3, because
+    // the RO-flip below must invalidate the parent's TLB entries; the full
+    // flush at the end is only correct for the active space. `fork_linux_process`
+    // calls this from the parent's syscall context. Debug builds enforce the
+    // contract here instead of letting a future caller silently skip the flush.
+    debug_assert_eq!(
+        parent_pml4,
+        crate::memory::vmm::current_pml4_phys(),
+        "fork_user_space_cow requires the parent PML4 to be active"
+    );
     let walker = PageTableWalker::new();
     let p4p = walker.table(parent_pml4);
 

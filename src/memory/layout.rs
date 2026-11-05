@@ -6,9 +6,9 @@
 // across `task::scheduler`, `task::process`, and `memory::allocator`. They are
 // collected here so the rest of the kernel can derive addresses from one place.
 //
-// NOTE: This task (5.1) ONLY defines the constants/helpers. The call sites in
-// scheduler.rs / process.rs / allocator.rs are migrated to use these in task 5.2,
-// so some of these items will report `dead_code` warnings until then.
+// The call sites in scheduler.rs / process.rs / allocator.rs / heap.rs use these
+// constants (migration from task 5.1 is complete), so this module is the single
+// source of truth and none of the items below are dead code.
 
 /// Architectural page size (4 KiB).
 pub const PAGE_SIZE: u64 = 4096;
