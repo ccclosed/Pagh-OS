@@ -20,7 +20,12 @@
 //!     thread, the boot selftest): `lookup` returns `NotFound` → `ENOENT` rather
 //!     than inventing a process (`docs/procfs.md` §5.5).
 //!   * **Unknown paths are `NotFound`** — there is no wildcard, so `/proc/1`,
-//!     `/proc/stat` (deferred), `/proc/self/fd` etc. all return `ENOENT`.
+//!     `/proc/self/stat` and `/proc/self/fd` all return `ENOENT`.
+//!
+//! `/proc/stat` (slice 2) is a real node: its numbers come from
+//! `crate::task::stat`, where the timer tick charges every interrupt to exactly
+//! one of user/system/idle before the scheduler decision. The renderer only
+//! formats those counters — it never derives time from wall-clock sources.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -32,11 +37,15 @@ use crate::arch::x86_64::linux::signal_frame::{SIG_DFL, SIG_IGN};
 use crate::memory::layout::{PAGE_SIZE, USER_STACK_PAGES, USER_STACK_TOP};
 use crate::memory::pmm;
 use crate::sync::spinlock::Spinlock;
-use crate::task::{compat, scheduler};
+use crate::task::{compat, scheduler, stat};
 
 use super::elf::LoadSegment;
 use super::procfs_format::{self as fmt, ProcKind};
 use super::{VfsError, VfsNode, VfsResult};
+
+// `/proc/stat` reports USER_HZ units; the counters are raw ticks, so the two
+// rates must be the same constant or every number would silently be wrong.
+const _: () = assert!(TICK_HZ == stat::USER_HZ);
 
 /// The `/proc` subtree root, ready for `vfs::mount_at("/proc", …)`.
 pub fn root() -> Arc<dyn VfsNode> {
@@ -168,6 +177,23 @@ impl ProcFile {
                 free_kb: pmm::free_frames() as u64 * PAGE_SIZE / 1024,
             }),
             ProcKind::Uptime => fmt::format_uptime(scheduler::ticks(), TICK_HZ),
+            // Counters only: no wall-clock read and no arithmetic in the
+            // renderer (`docs/procfs.md` §4.8). `procs_blocked` is a real zero:
+            // this scheduler has no blocked state (blocking waits yield and stay
+            // runnable), so there is nothing to count.
+            ProcKind::Stat => {
+                let cpu = stat::cpu_ticks();
+                fmt::format_stat(&fmt::StatInputs {
+                    user: cpu.user,
+                    system: cpu.system,
+                    idle: cpu.idle,
+                    ctxt: stat::context_switches(),
+                    btime: stat::boot_unix(),
+                    processes: stat::processes(),
+                    procs_running: scheduler::ready_count(),
+                    procs_blocked: 0,
+                })
+            }
             ProcKind::SelfCmdline => {
                 compat::with_current_compat(|cs| cs.cmdline.clone()).unwrap_or_default()
             }

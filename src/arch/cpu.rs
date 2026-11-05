@@ -14,6 +14,23 @@
 /// RFLAGS interrupt-enable flag (IF) bit position.
 const RFLAGS_IF: u64 = 1 << 9;
 
+/// Set while a task is parked in [`halt`] waiting for an interrupt.
+///
+/// The timer-tick accounting (`crate::task::stat`) samples this to charge the
+/// interrupted tick to `idle` instead of `system`: with the CPU actually halted
+/// there is no runnable work even when the parked task is not the idle task
+/// (e.g. the shell's read loop or a `sleep_ticks` wait). This is a sampling
+/// hint, not a state machine: an interrupt delivered in the few instructions
+/// between `hlt` returning and the flag being cleared can still be charged to
+/// idle, which is no less truthful than the wake-up boundary itself.
+static IN_HALT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Was the CPU parked in [`halt`] when the timer tick interrupted it?
+#[inline]
+pub fn in_halt() -> bool {
+    IN_HALT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 // CR0 bits relevant to FPU/SSE.
 const CR0_EM: u64 = 1 << 2; // Emulation: must be CLEAR to use SSE.
 const CR0_MP: u64 = 1 << 1; // Monitor coprocessor: set alongside clearing EM.
@@ -111,12 +128,18 @@ pub fn halt_loop() -> ! {
 /// CPU wakes (e.g. from a timer or device IRQ). It is the one-shot primitive
 /// for IRQ-wait spin loops (the shell read loop, keyboard wait paths) that need
 /// to sleep until an interrupt then continue, rather than halt forever.
+///
+/// The [`IN_HALT`] flag is published for the timer-tick accounting; it is
+/// cleared as soon as the CPU wakes. Interrupts must be enabled by the caller
+/// (otherwise the `hlt` never wakes), exactly as before.
 pub fn halt() {
+    IN_HALT.store(true, core::sync::atomic::Ordering::SeqCst);
     // SAFETY: `hlt` only places the CPU in a halt state until the next
     // interrupt. It accesses no memory and cannot violate Rust's memory model.
     unsafe {
         core::arch::asm!("hlt", options(nomem, nostack));
     }
+    IN_HALT.store(false, core::sync::atomic::Ordering::SeqCst);
 }
 
 /// Enable maskable interrupts on the current CPU (`sti`).

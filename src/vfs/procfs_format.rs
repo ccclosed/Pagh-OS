@@ -66,6 +66,8 @@ pub enum ProcKind {
     MemInfo,
     /// `/proc/uptime`.
     Uptime,
+    /// `/proc/stat` — the kernel tick/event counters.
+    Stat,
 }
 
 /// One named entry: its `readdir` name, stable inode, and content kind.
@@ -77,7 +79,7 @@ pub struct ProcEntry {
 }
 
 /// The regular files directly under `/proc` (in `readdir` order).
-pub const PROC_FILES: [ProcEntry; 3] = [
+pub const PROC_FILES: [ProcEntry; 4] = [
     ProcEntry {
         name: "cpuinfo",
         ino: PROC_INO_BASE + 6,
@@ -92,6 +94,11 @@ pub const PROC_FILES: [ProcEntry; 3] = [
         name: "uptime",
         ino: PROC_INO_BASE + 8,
         kind: ProcKind::Uptime,
+    },
+    ProcEntry {
+        name: "stat",
+        ino: PROC_INO_BASE + 9,
+        kind: ProcKind::Stat,
     },
 ];
 
@@ -120,7 +127,7 @@ pub const PROC_SELF_FILES: [ProcEntry; 4] = [
 ];
 
 /// `readdir` order of `/proc`: the `self` directory first, then the files.
-pub const PROC_ROOT_ORDER: [&str; 4] = ["self", "cpuinfo", "meminfo", "uptime"];
+pub const PROC_ROOT_ORDER: [&str; 5] = ["self", "cpuinfo", "meminfo", "uptime", "stat"];
 
 /// Look up a regular `/proc` file by name (`self` is a directory, not here).
 pub fn proc_file(name: &str) -> Option<ProcEntry> {
@@ -193,6 +200,79 @@ pub fn format_uptime(ticks: u64, tick_hz: u64) -> Vec<u8> {
     let centis = (ticks % hz) * 100 / hz;
     let mut out = Vec::with_capacity(32);
     push(&mut out, format_args!("{}.{:02} 0.00\n", secs, centis));
+    out
+}
+
+// ─── /proc/stat ─────────────────────────────────────────────────────────────
+
+/// Kernel tick and event counters behind `/proc/stat`, already in `USER_HZ`
+/// units (one tick = one unit; `USER_HZ == TICK_HZ == 1000`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatInputs {
+    /// Ring-3 ticks.
+    pub user: u64,
+    /// Ring-0 non-idle ticks.
+    pub system: u64,
+    /// Idle-task / `hlt` ticks.
+    pub idle: u64,
+    /// Context switches since boot.
+    pub ctxt: u64,
+    /// Boot wall-clock time in Unix seconds, `0` when the RTC had no valid time.
+    pub btime: u64,
+    /// Tasks created since boot (Linux `total_forks` analogue).
+    pub processes: u64,
+    /// Ready + running tasks (idle excluded).
+    pub procs_running: u64,
+    /// Blocked tasks (this kernel has no blocked state: always `0`).
+    pub procs_blocked: u64,
+}
+
+/// Render `/proc/stat` for the single-CPU machine.
+///
+/// Linux field order, exactly 10 numeric columns per CPU line:
+///
+/// ```text
+/// cpu  user nice system idle iowait irq softirq steal guest guest_nice
+/// cpu0 …
+/// ctxt …
+/// btime …
+/// processes …
+/// procs_running …
+/// procs_blocked …
+/// ```
+///
+/// `nice`, `iowait`, `irq`, `softirq`, `steal`, `guest` and `guest_nice` are
+/// real zeros: this kernel does not account for them, and inventing values
+/// would be worse than saying nothing. For the same reason the `intr` and
+/// `softirq` lines are omitted — there is no per-IRQ counter to fill them
+/// truthfully (`docs/procfs.md` §4.8, DEVIATION-15).
+///
+/// The aggregate `cpu` line has **two** spaces after the label: Linux writes
+/// `"cpu "` and then each value prefixed by one space (`show_val`), while the
+/// per-CPU `cpu0` line writes the label without a trailing space. libuv's
+/// `uv_cpu_info` discards the first line, then parses `cpu%u` + six numbers,
+/// so the `cpu0` line is what makes Node's `os.cpus()` work on a one-CPU box.
+pub fn format_stat(s: &StatInputs) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256);
+    push(
+        &mut out,
+        format_args!("cpu  {} 0 {} {} 0 0 0 0 0 0\n", s.user, s.system, s.idle),
+    );
+    push(
+        &mut out,
+        format_args!("cpu0 {} 0 {} {} 0 0 0 0 0 0\n", s.user, s.system, s.idle),
+    );
+    push(&mut out, format_args!("ctxt {}\n", s.ctxt));
+    push(&mut out, format_args!("btime {}\n", s.btime));
+    push(&mut out, format_args!("processes {}\n", s.processes));
+    push(
+        &mut out,
+        format_args!("procs_running {}\n", s.procs_running),
+    );
+    push(
+        &mut out,
+        format_args!("procs_blocked {}\n", s.procs_blocked),
+    );
     out
 }
 

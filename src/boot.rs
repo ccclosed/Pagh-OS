@@ -189,8 +189,15 @@ fn init_virtio() {
 }
 
 /// Step 10: initialize the preemptive scheduler.
+///
+/// Also captures the wall-clock boot time for `/proc/stat`'s `btime` line: the
+/// CMOS RTC is readable before interrupts are enabled, and reading it here
+/// (rather than lazily in the renderer) makes `btime` the boot instant, as in
+/// Linux. A dead/pre-epoch RTC yields `0`, which the file prints verbatim and
+/// the contract documents as the honest gap (`docs/procfs.md` §4.8).
 fn init_scheduler() {
     task::scheduler::init();
+    task::stat::set_boot_unix(arch::x86_64::linux::rtc::now_unix());
     info!("scheduler");
 }
 

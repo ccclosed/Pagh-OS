@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.8.0**
+  be reflected here. **`main` currently reads 2.9.0**
   (the credentials/permissions minor bump; it lands on `main` with the merge).
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
@@ -260,7 +260,9 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   buffer and flushed with it (the shadow-buffer commit had left it drawn *after*
   the flush, so it never reached the device), while an idle shell skips the
   overlay/repaint cycle instead of copying the surface once per timer tick.
-  **2.5.0** = procfs, signals, the verified apt trust chain
+  **2.9.0** = the procfs slice 2: `/proc/stat` with real user/system/idle tick
+  accounting in the timer path, host properties and an in-QEMU two-read
+  monotonicity check; **2.5.0** = procfs, signals, the verified apt trust chain
   and the durability fixes (issues #11–#19, #32–#35). Every release owes both a
   tag and a GitHub release: `main` reached 2.4.0 without either, so the tag list
   and the release list drifted three minors apart before anyone noticed — an
@@ -287,13 +289,13 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
 ## Known open gaps (good first issues, all documented in-code)
 
 
-- procfs covers its first slice only (issue #11, contract `docs/procfs.md`):
-  `/proc/{cpuinfo,meminfo,uptime}` and `/proc/self/{exe,cmdline,status,maps}` are
-  rendered from live kernel state (CPUID, PMM counters, the tick clock, the calling
-  process's `CompatState`), and `/proc/self/exe` is a real symlink for
+- procfs covers slices 1 and 2 (issue #11, contract `docs/procfs.md`):
+  `/proc/{cpuinfo,meminfo,uptime,stat}` and `/proc/self/{exe,cmdline,status,maps}`
+  are rendered from live kernel state (CPUID, PMM counters, the tick clock, the
+  scheduler's user/system/idle tick accounting, the calling process's
+  `CompatState`), and `/proc/self/exe` is a real symlink for
   `readlink`/`lstat`/`getdents64`. Deferred, and returning `ENOENT` today:
-  `/proc/<pid>` enumeration, `/proc/stat` (needs real user/sys/idle tick
-  accounting), `/proc/loadavg`, `/proc/mounts`, `/proc/self/{fd,stat,statm}` — so
+  `/proc/<pid>` enumeration, `/proc/loadavg`, `/proc/mounts`, `/proc/self/{fd,stat,statm}` — so
   `htop`/`ps` are still out of reach.
 - Signals (issue #12): `kill(2)` (nr 62), process-group addressing
   (`kill(0|-1|-pgid)`), `SIGSTOP`/`SIGCONT` scheduling, `wait4(WUNTRACED|WCONTINUED)`

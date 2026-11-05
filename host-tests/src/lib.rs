@@ -329,6 +329,14 @@ pub mod release_file;
 #[path = "../../src/vfs/procfs_format.rs"]
 pub mod procfs_format;
 
+// `task_stat` is the tick/event accounting behind `/proc/stat` (issue #11,
+// slice 2): the pure user/system/idle classification plus the monotonic
+// `AtomicU64` counters and the seqlock snapshot. `core`-only and self-contained,
+// so the host includes the exact source the kernel compiles and property-tests
+// `classify_tick` (the counters themselves are only meaningful in-QEMU).
+#[path = "../../src/task/stat.rs"]
+pub mod task_stat;
+
 // ---------------------------------------------------------------------------
 // Property-test modules (P1..P28)
 // ---------------------------------------------------------------------------
@@ -406,6 +414,7 @@ mod properties {
     mod procfs_cpuinfo;
     mod procfs_maps;
     mod procfs_meminfo;
+    mod procfs_stat;
     mod procfs_status;
 
     // Boot-time device safety (issue #33): only a genuinely blank device is

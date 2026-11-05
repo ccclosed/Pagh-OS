@@ -187,8 +187,8 @@ server certificate chain, hostname and validity checked before a byte of the ind
   sockets, and raw-mode `termios` (with kernel-side echo) are implemented; POSIX signal
   delivery works at the syscall-return point (real `rt_sigaction`/`rt_sigprocmask`/
   `sigaltstack`/`rt_sigreturn`, `^C` → SIGINT with `EINTR` wake-ups in the blocking
-  waits); a synthetic `procfs` serves `/proc/{cpuinfo,meminfo,uptime}` and
-  `/proc/self/{exe,cmdline,status,maps}` — per-pid entries, `/proc/stat` and
+  waits); a synthetic `procfs` serves `/proc/{cpuinfo,meminfo,uptime,stat}` and
+  `/proc/self/{exe,cmdline,status,maps}` — per-pid entries and
   `/proc/loadavg` are still missing, so `htop`/`ps` remain out of reach.
 - **Packages:** a by-name `apt` (`update`/`install`/`show`/`list`/`setmirror`) that fetches
   a Debian `Packages` index over HTTP/HTTPS, streams gzip/xz/zstd decompression into a
@@ -557,7 +557,7 @@ group, `SIGSTOP`/`SIGCONT` are real scheduler state (a stopped task keeps its sa
   `/proc/uptime` and `/proc/self/{exe,cmdline,status,maps}` from live kernel state
   (CPUID, PMM counters, the tick clock, the calling process's `CompatState`), with
   `readlink`/`lstat`/`getdents64` handling `/proc/self/exe` as a real symlink. What is
-  still missing is the per-pid tree (`/proc/<pid>`) and `/proc/stat`, so `htop` and
+  still missing is the per-pid tree (`/proc/<pid>`), so `htop` and
   `ps` remain out of reach; `/proc/meminfo`-only consumers (busybox `free`, libuv's
   `uv_get_total_memory`) and `/proc/uptime` consumers now work. See
   `docs/procfs.md` for the exact contract and the deliberately deferred paths. Signal

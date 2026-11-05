@@ -6,4 +6,5 @@ pub mod process;
 pub mod scheduler;
 pub mod stack;
 pub mod stack_map;
+pub mod stat;
 pub mod switch;

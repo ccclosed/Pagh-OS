@@ -1618,8 +1618,16 @@ mod procfs_tests {
         None
     }
 
+    /// The 10 numeric columns of a `/proc/stat` `cpu`/`cpu0` line.
+    fn stat_columns(line: &str) -> Vec<u64> {
+        line.split_whitespace()
+            .skip(1)
+            .map(|f| f.parse::<u64>().unwrap_or(u64::MAX))
+            .collect()
+    }
+
     pub fn tree_and_contents() {
-        // ── /proc: a directory with exactly the first-slice children ─────────
+        // ── /proc: a directory with exactly the implemented children ─────────
         let proc_dir = match vfs::lookup_path("/proc") {
             Ok(n) => n,
             Err(e) => {
@@ -1636,6 +1644,7 @@ mod procfs_tests {
                 String::from("cpuinfo"),
                 String::from("meminfo"),
                 String::from("uptime"),
+                String::from("stat"),
             ],
             "procfs: /proc readdir order"
         );
@@ -1645,7 +1654,7 @@ mod procfs_tests {
         // it carry real, distinct, path-stable inodes, so `getdents64` and `stat`
         // cannot disagree about a file's identity.
         let mut seen_inos: Vec<u64> = Vec::new();
-        for name in ["cpuinfo", "meminfo", "uptime"] {
+        for name in ["cpuinfo", "meminfo", "uptime", "stat"] {
             let node = match proc_dir.lookup(name) {
                 Ok(n) => n,
                 Err(_) => {
@@ -1735,6 +1744,107 @@ mod procfs_tests {
         );
         assert_eq_kernel!(idle_field, "0.00", "procfs: idle field is 0.00");
 
+        // ── /proc/stat: real tick accounting, Linux shape, no catch-all ──────
+        // Two reads separated by one second of ticks: every bucket is monotonic
+        // and the user+system+idle total advances by roughly TICK_HZ. The
+        // renderer must format counters, never derive time from the wall clock.
+        let stat_node = match vfs::lookup_path("/proc/stat") {
+            Ok(n) => n,
+            Err(_) => {
+                assert_kernel!(false, "procfs: /proc/stat must exist (not ENOENT)");
+                return;
+            }
+        };
+        assert_kernel!(
+            !stat_node.is_directory(),
+            "procfs: /proc/stat is a regular file"
+        );
+
+        let stat1 = read_path("/proc/stat");
+        let stat1_text = core::str::from_utf8(&stat1).unwrap_or("");
+        let mut stat1_lines = stat1_text.lines();
+        let cpu1_line = stat1_lines.next().unwrap_or("");
+        assert_kernel!(
+            cpu1_line.starts_with("cpu  "),
+            "procfs: /proc/stat first line starts 'cpu  ' (Linux aggregate gap)"
+        );
+        let cpu1 = stat_columns(cpu1_line);
+        assert_eq_kernel!(cpu1.len(), 10, "procfs: /proc/stat has 10 cpu columns");
+        let cpu0_line = stat1_lines.next().unwrap_or("");
+        assert_kernel!(
+            cpu0_line.starts_with("cpu0 "),
+            "procfs: /proc/stat carries the single-CPU cpu0 line"
+        );
+        assert_eq_kernel!(
+            stat_columns(cpu0_line),
+            cpu1,
+            "procfs: the one CPU's line equals the aggregate"
+        );
+        for (field, name) in [
+            (1, "nice"),
+            (4, "iowait"),
+            (5, "irq"),
+            (6, "softirq"),
+            (7, "steal"),
+            (8, "guest"),
+            (9, "guest_nice"),
+        ] {
+            assert_eq_kernel!(
+                cpu1[field],
+                0,
+                "procfs: /proc/stat has no fabricated accounting: a zero field must stay 0"
+            );
+            let _ = name;
+        }
+        let tail: Vec<&str> = stat1_lines.collect();
+        assert_eq_kernel!(tail.len(), 5, "procfs: /proc/stat tail line count");
+        for (line, key) in tail.iter().zip([
+            "ctxt",
+            "btime",
+            "processes",
+            "procs_running",
+            "procs_blocked",
+        ]) {
+            let mut it = line.split_whitespace();
+            assert_eq_kernel!(
+                it.next(),
+                Some(key),
+                "procfs: /proc/stat line order is Linux's"
+            );
+            assert_kernel!(
+                it.next().and_then(|v| v.parse::<u64>().ok()).is_some(),
+                "procfs: /proc/stat numeric value parses"
+            );
+            assert_kernel!(it.next().is_none(), "procfs: one value per /proc/stat line");
+        }
+        let sum1 = cpu1[0] + cpu1[2] + cpu1[3];
+
+        crate::task::scheduler::sleep_ticks(crate::arch::x86_64::apic::TICK_HZ);
+
+        let stat2 = read_path("/proc/stat");
+        let stat2_text = core::str::from_utf8(&stat2).unwrap_or("");
+        let cpu2_line = stat2_text.lines().next().unwrap_or("");
+        let cpu2 = stat_columns(cpu2_line);
+        assert_eq_kernel!(cpu2.len(), 10, "procfs: second read keeps 10 columns");
+        let sum2 = cpu2[0] + cpu2[2] + cpu2[3];
+        assert_kernel!(
+            cpu2[0] >= cpu1[0] && cpu2[2] >= cpu1[2] && cpu2[3] >= cpu1[3],
+            "procfs: /proc/stat buckets never decrease"
+        );
+        assert_kernel!(
+            sum2 > sum1,
+            "procfs: user+system+idle strictly advances with ticks"
+        );
+        let delta = sum2 - sum1;
+        assert_kernel!(
+            delta >= crate::arch::x86_64::apic::TICK_HZ / 2,
+            "procfs: one second of sleep charges roughly TICK_HZ ticks"
+        );
+        assert_kernel!(
+            delta <= 2 * crate::arch::x86_64::apic::TICK_HZ,
+            "procfs: tick accounting does not run ahead of the clock"
+        );
+
         // ── snapshot/size consistency and EOF behaviour ──────────────────────
         let meminfo_node = match vfs::lookup_path("/proc/meminfo") {
             Ok(n) => n,
@@ -1763,12 +1873,15 @@ mod procfs_tests {
         );
 
         // ── the ENOENT matrix: no wildcard, no invented files ────────────────
+        // `/proc/stat` is now a real node; `/proc/self/stat` belongs to the
+        // deferred per-pid family and must stay ENOENT (as must `/proc/1`).
         for path in [
             "/proc/1",
             "/proc/1234",
             "/proc/self/fd",
+            "/proc/self/stat",
             "/proc/version",
-            "/proc/stat",
+            "/proc/stat/child",
             "/proc/cpuinfo/child",
             "/proc/nonexistent",
         ] {

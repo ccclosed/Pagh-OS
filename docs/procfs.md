@@ -1,4 +1,4 @@
-# Контракт procfs для issue #11 — первый срез
+# Контракт procfs для issue #11 — срезы 1 и 2
 
 **Статус:** требования (задача `t3`, kind=work). Документ — приёмка: реализация issue #11
 обязана соответствовать ему по путям, содержимому и поведению syscall-поверхности.
@@ -20,9 +20,11 @@
 1. Добавляется **`/proc`**, смонтированный из `vfs::init()` рядом с `/dev` и `/tmp`, — без
    изменений в `boot.rs` и без единого изменения в `resolve_path`: `/proc` уже исключён из
    chroot-маппинга `/mnt` (см. §1).
-2. Первый срез — ровно **7 файлов** + 2 каталога:
+2. Срез 1 — ровно **7 файлов** + 2 каталога:
    `/proc`, `/proc/self`, `/proc/self/{exe,cmdline,status,maps}`, `/proc/{cpuinfo,meminfo,uptime}`.
-   Всё остальное (`/proc/<pid>`, `/proc/stat`, `/proc/loadavg`, `/proc/mounts`,
+   Срез 2 (2.9.0) добавил `/proc/stat` с реальным учётом user/system/idle в
+   тике; всё
+   остальное (`/proc/<pid>`, `/proc/loadavg`, `/proc/mounts`,
    `/proc/self/fd`, `/proc/self/stat`, `/proc/sys`, `/proc/version`) — **ENOENT** в этом срезе,
    обоснование отложенности в §2.2.
 3. Содержимое генерируется **снимком на `lookup()`/`open()`** в форме Linux-текста; `size()`
@@ -147,14 +149,12 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 | `/proc/cpuinfo` | libuv `uv_cpu_info` (Node `os.cpus()`), Python `platform.processor()`, busybox | Единственный источник «какой это CPU» для userland |
 | `/proc/meminfo` | libuv `uv_get_total_memory`/`uv_get_free_memory` (`MemTotal:`, `MemAvailable:`), busybox `free`, htop, psutil | glibc с 2.23 берёт физические страницы из `sysinfo(2)` (см. §4.2), поэтому meminfo нужен именно этим потребителям |
 | `/proc/uptime` | libuv `uv_uptime` (`sscanf("%lf")`), busybox `uptime` | Тривиально и переиспользует уже существующий тик-клок |
-| `/proc/stat` | libuv `uv_cpu_info` — **открывает первым, без него `os.cpus()` вообще падает** | **Сознательно отложен**: требует реального учёта user/sys/idle (см. §2.2) |
 
 ### 2.2 Что осознанно отложено и почему
 
 | Путь | Причина отложенности |
 |---|---|
 | `/proc/<pid>` (перечисление), `/proc/<pid>/{status,stat,cmdline,maps}` | Нужен pid-keyed каталог, snapshot `COMPAT_STATES` и **чтение чужого процесса** (его `CompatState` + `VmRegionSet`) без удержания реестрового спинлока во время генерации содержимого. Плюс потребители (ps/htop) одновременно требуют `/proc/stat` и `/proc/<pid>/stat` — половина набора бесполезна. Отдельный срез. |
-| `/proc/stat` | Нельзя отдавать выдуманное разбиение user/sys/idle. В ядре есть только глобальный `scheduler::ticks()` (`src/task/scheduler.rs:231`, `TICK_HZ = 1000`, `src/arch/x86_64/apic.rs:153`); для честного `/proc/stat` нужен учёт в `scheduler_tick_irq` (ring 3 → user, ring 0 → system, idle-pid → idle). Это самостоятельная правка с собственными тестами. **Первый кандидат в срез 2** — без него Node `os.cpus()` не заработает вовсе (libuv открывает `/proc/stat` первым и возвращает ошибку). |
 | `/proc/loadavg` | Нет учёта загрузки (libuv падает обратно на `sysinfo(2)`, который уже реализован и возвращает `loads = [0;3]`). |
 | `/proc/mounts`, `/proc/self/mountinfo` | В VFS нет таблицы монтирований (есть только `RootDirectory.children`); сначала нужен реестр монтирований. |
 | `/proc/self/fd/*`, `/proc/self/task/*` | Требуют симлинков на произвольный fd/pid и полноценного следования по ссылкам (общая задача с #18), а не одного уровня (§5.4). |

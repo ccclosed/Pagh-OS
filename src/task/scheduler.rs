@@ -500,6 +500,10 @@ pub fn spawn(tcb: Tcb) -> u64 {
     // allocate (they run in IRQ/tick context).
     crate::task::fpu::area_for(pid);
     q.push_back(tcb);
+    // `/proc/stat` `processes`: every successfully enqueued new task, i.e. the
+    // analogue of Linux's `total_forks` (which also counts threads and kernel
+    // threads, because they all go through `copy_process`).
+    crate::task::stat::count_process();
     pid
 }
 pub fn schedule() -> Option<Tcb> {
@@ -533,6 +537,19 @@ pub fn set_current_pid(pid: u64) {
 }
 pub fn current_pid() -> u64 {
     *CURRENT_PID.lock()
+}
+
+/// Number of tasks that can run right now: the ready queue plus the running
+/// task, unless it is the idle task (Linux's `procs_running` does not count
+/// idle). Stopped tasks are parked outside the queue and excluded, like Linux's
+/// stopped state. `/proc/stat` renders this as `procs_running`.
+///
+/// Takes the ready-queue lock briefly; callers are ordinary kernel/syscall
+/// context, never the tick handler (which must stay lock-free apart from the
+/// scheduler's own queue operations).
+pub fn ready_count() -> u64 {
+    let queued = READY_QUEUE.lock().len() as u64;
+    queued + if is_idle(current_pid()) { 0 } else { 1 }
 }
 fn activate_task(pid: u64) {
     if is_idle(pid) {
@@ -666,6 +683,25 @@ pub extern "C" fn scheduler_tick_irq(current_rsp: u64) -> u64 {
         crate::arch::cpu::halt_loop();
     }
 
+    // `/proc/stat` tick accounting: charge THIS tick to exactly one bucket
+    // before any signal/requeue work can rewrite the frame. The ring comes from
+    // the interrupted CS the CPU pushed (offset +136, `trap_frame::IrqFrame`),
+    // not from the scheduler's next-task choice; `idle_task`/`in_halt` are the
+    // two ways this kernel says "nothing was running". Nothing below charges
+    // again — one `charge` call per timer interrupt.
+    //
+    // SAFETY: `current_rsp` is the frame `irq32_stub` just pushed for the
+    // current task (168 bytes on that task's private kernel stack); the sanity
+    // check above proved it is a higher-half pointer, and interrupts are masked
+    // for the whole handler, so the frame cannot be replaced under us.
+    let interrupted_cs =
+        unsafe { (*(current_rsp as *const crate::arch::x86_64::linux::trap_frame::IrqFrame)).cs };
+    crate::task::stat::charge(crate::task::stat::classify_tick(
+        interrupted_cs,
+        is_idle(cur),
+        crate::arch::cpu::in_halt(),
+    ));
+
     if is_idle(cur) {
         // The idle task was preempted: save its stack pointer in the explicit
         // idle task rather than treating pid 0 as a magic special case.
@@ -725,12 +761,23 @@ pub extern "C" fn scheduler_tick_irq(current_rsp: u64) -> u64 {
         None => {
             // Nothing ready: run the idle task.
             set_current_pid(IDLE_PID);
+            if !is_idle(cur) {
+                crate::task::stat::count_context_switch();
+            }
             let rsp = idle_rsp();
             check_frame("restore-idle", IDLE_PID, rsp);
             stamp_restore(IDLE_PID, rsp);
             return rsp;
         }
     };
+
+    // A switch is counted only when a DIFFERENT task resumes: with one ready
+    // task the round-robin pops the interrupted task itself, which saves and
+    // restores a frame but is not a context switch (Linux's `ctxt` likewise
+    // counts `nr_switches`, not ticks). `/proc/stat` renders the counter.
+    if next.pid != cur {
+        crate::task::stat::count_context_switch();
+    }
 
     set_current_pid(next.pid);
     activate_task(next.pid);
@@ -796,6 +843,9 @@ pub extern "C" fn scheduler_yield_switch(current_rsp: u64) -> u64 {
                 crate::trace!("[SCHED] task {} parked (stopped, empty queue)", cur);
                 park_stopped(cur, current_rsp, vmm::current_pml4_phys());
                 set_current_pid(IDLE_PID);
+                // The stopped task handed the CPU to the idle task: a real
+                // switch, counted exactly like the tick path's idle fallback.
+                crate::task::stat::count_context_switch();
                 let rsp = idle_rsp();
                 check_frame("restore-yield-idle", IDLE_PID, rsp);
                 stamp_restore(IDLE_PID, rsp);
@@ -826,6 +876,12 @@ pub extern "C" fn scheduler_yield_switch(current_rsp: u64) -> u64 {
             kernel_rsp: current_rsp,
             cr3: vmm::current_pml4_phys(),
         });
+    }
+
+    // Count a real task-to-task switch (the counter `/proc/stat` reports); a
+    // yield that resumes the caller's own frame is not one.
+    if next.pid != cur {
+        crate::task::stat::count_context_switch();
     }
 
     set_current_pid(next.pid);

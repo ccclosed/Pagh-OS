@@ -215,10 +215,13 @@ fn overlapping_regions_are_merged() {
 /// distinct, none inside the synthetic FNV range.
 #[test]
 fn procfs_table_is_stable_and_unique() {
-    assert_eq!(PROC_ROOT_ORDER, ["self", "cpuinfo", "meminfo", "uptime"]);
+    assert_eq!(
+        PROC_ROOT_ORDER,
+        ["self", "cpuinfo", "meminfo", "uptime", "stat"]
+    );
     assert_eq!(
         PROC_FILES.iter().map(|e| e.name).collect::<Vec<_>>(),
-        ["cpuinfo", "meminfo", "uptime"]
+        ["cpuinfo", "meminfo", "uptime", "stat"]
     );
     assert_eq!(
         PROC_SELF_FILES.iter().map(|e| e.name).collect::<Vec<_>>(),
@@ -228,9 +231,17 @@ fn procfs_table_is_stable_and_unique() {
         crate::procfs_format::proc_file("cpuinfo").unwrap().ino,
         PROC_INO_BASE + 6
     );
+    assert_eq!(
+        crate::procfs_format::proc_file("stat").unwrap().ino,
+        PROC_INO_BASE + 9,
+        "/proc/stat is a real node with its own stable inode (slice 2)"
+    );
+    // The per-pid family and other deferred paths stay absent from the table:
+    // `ProcDir::lookup` then returns NotFound, never a wildcard.
     assert!(crate::procfs_format::proc_file("1").is_none());
-    assert!(crate::procfs_format::proc_file("stat").is_none());
+    assert!(crate::procfs_format::proc_file("statm").is_none());
     assert!(crate::procfs_format::proc_self_file("fd").is_none());
+    assert!(crate::procfs_format::proc_self_file("stat").is_none());
     assert!(crate::procfs_format::proc_self_file("status/x").is_none());
     assert!(crate::procfs_format::proc_self_file("").is_none());
 
