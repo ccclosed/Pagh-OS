@@ -26,6 +26,14 @@
 //! `crate::task::stat`, where the timer tick charges every interrupt to exactly
 //! one of user/system/idle before the scheduler decision. The renderer only
 //! formats those counters — it never derives time from wall-clock sources.
+//!
+//! Slice 3 adds `/proc/version`, `/proc/filesystems`, `/proc/loadavg` and the
+//! read-only `/proc/sys/kernel/{ostype,osrelease,hostname}` files. `/proc/version`
+//! and `osrelease` embed the real crate version; `/proc/filesystems` names only
+//! the drivers this build implements; `/proc/loadavg` reports honest `0.00` load
+//! averages (there is no load accounting) plus live scheduler counts. All three
+//! sys files are constants — pagh has no hostname/sysctl machinery, so there is
+//! deliberately no writable `/proc/sys` path.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -47,6 +55,10 @@ use super::{VfsError, VfsNode, VfsResult};
 // rates must be the same constant or every number would silently be wrong.
 const _: () = assert!(TICK_HZ == stat::USER_HZ);
 
+/// The real crate version (`Cargo.toml` is the single source), the same value
+/// `provision.rs` writes to `/mnt/etc/pagh-release`.
+const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// The `/proc` subtree root, ready for `vfs::mount_at("/proc", …)`.
 pub fn root() -> Arc<dyn VfsNode> {
     Arc::new(ProcDir {
@@ -64,6 +76,10 @@ enum DirKind {
     Root,
     /// `/proc/self`.
     SelfDir,
+    /// `/proc/sys`.
+    SysDir,
+    /// `/proc/sys/kernel`.
+    SysKernelDir,
 }
 
 struct ProcDir {
@@ -79,6 +95,24 @@ fn self_dir() -> Arc<dyn VfsNode> {
         name: "self",
         ino: fmt::PROC_SELF_DIR_INO,
         kind: DirKind::SelfDir,
+    })
+}
+
+/// `/proc/sys` — the read-only sysctl namespace (slice 3).
+fn sys_dir() -> Arc<dyn VfsNode> {
+    Arc::new(ProcDir {
+        name: "sys",
+        ino: fmt::PROC_SYS_DIR_INO,
+        kind: DirKind::SysDir,
+    })
+}
+
+/// `/proc/sys/kernel`.
+fn sys_kernel_dir() -> Arc<dyn VfsNode> {
+    Arc::new(ProcDir {
+        name: "kernel",
+        ino: fmt::PROC_SYS_KERNEL_DIR_INO,
+        kind: DirKind::SysKernelDir,
     })
 }
 
@@ -103,12 +137,21 @@ impl VfsNode for ProcDir {
             // (Linux behaves the same way for a pid directory that disappeared).
             DirKind::Root => {
                 out.push(self_dir());
+                out.push(sys_dir());
                 for e in fmt::PROC_FILES.iter().copied() {
                     out.push(file_for(e));
                 }
             }
             DirKind::SelfDir => {
                 for e in fmt::PROC_SELF_FILES.iter().copied() {
+                    out.push(file_for(e));
+                }
+            }
+            DirKind::SysDir => {
+                out.push(sys_kernel_dir());
+            }
+            DirKind::SysKernelDir => {
+                for e in fmt::PROC_SYS_FILES.iter().copied() {
                     out.push(file_for(e));
                 }
             }
@@ -126,6 +169,9 @@ impl VfsNode for ProcDir {
                     // No process of our own: nothing to describe.
                     return Err(VfsError::NotFound);
                 }
+                if name == "sys" {
+                    return Ok(sys_dir());
+                }
                 fmt::proc_file(name).map(file_for).ok_or(VfsError::NotFound)
             }
             DirKind::SelfDir => {
@@ -137,6 +183,16 @@ impl VfsNode for ProcDir {
                 }
                 Ok(file_for(e))
             }
+            DirKind::SysDir => {
+                if name == "kernel" {
+                    Ok(sys_kernel_dir())
+                } else {
+                    Err(VfsError::NotFound)
+                }
+            }
+            DirKind::SysKernelDir => fmt::proc_sys_file(name)
+                .map(file_for)
+                .ok_or(VfsError::NotFound),
         }
     }
 }
@@ -199,6 +255,23 @@ impl ProcFile {
             }
             ProcKind::SelfStatus => self.render_status(),
             ProcKind::SelfMaps => self.render_maps(),
+            // The real crate version, never a fabricated Linux release string.
+            ProcKind::Version => fmt::format_version(KERNEL_VERSION),
+            // The static list of implemented drivers; see `FILESYSTEMS`.
+            ProcKind::FileSystems => fmt::format_filesystems(&fmt::FILESYSTEMS),
+            // Load averages are honestly zero (no accounting); the counts are
+            // live scheduler state, fetched through one small accessor.
+            ProcKind::LoadAvg => {
+                let (runnable, total, last_pid) = scheduler::loadavg_counts();
+                fmt::format_loadavg(&fmt::LoadAvg {
+                    runnable,
+                    total,
+                    last_pid,
+                })
+            }
+            ProcKind::SysOstype => fmt::format_sys_ostype(),
+            ProcKind::SysOsrelease => fmt::format_sys_osrelease(KERNEL_VERSION),
+            ProcKind::SysHostname => fmt::format_sys_hostname(),
             // The `exe` node is a symlink, not a readable file.
             ProcKind::SelfExe => Vec::new(),
         }

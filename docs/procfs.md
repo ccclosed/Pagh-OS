@@ -1,11 +1,14 @@
-# Контракт procfs для issue #11 — срезы 1 и 2
+# Контракт procfs для issue #11 — срезы 1–3
 
 **Статус:** требования (задача `t3`, kind=work). Документ — приёмка: реализация issue #11
 обязана соответствовать ему по путям, содержимому и поведению syscall-поверхности.
-**Реализовано** в задаче `t4` (ветка `vfs/procfs`); отступления от текста ниже, если они
-есть, перечислены в коде и в `src/vfs/README.md`; DEVIATION-2 уточнён: рендер ленивый и
-живёт один проход чтения (`read(offset == 0)` перерисовывает), а не снимок на `open()`.
-Ссылки на код даны на `HEAD cd542bb` («Merge pull request #38 … fs/journal-live-seq-recovery»).
+**Реализовано** в задаче `t4` (ветка `vfs/procfs`), срез 2 — в 2.9.0 (`/proc/stat`),
+срез 3 — в 2.10.0 (`/proc/version`, `/proc/filesystems`, `/proc/loadavg`,
+read-only `/proc/sys/kernel/*`); отступления от текста ниже, если они есть, перечислены в
+коде и в `src/vfs/README.md`; DEVIATION-2 уточнён: рендер ленивый и живёт один проход
+чтения (`read(offset == 0)` перерисовывает), а не снимок на `open()`.
+Ссылки на код и номера строк — исторические (контракт писался на `cd542bb`), сверяйтесь
+с текущим деревом: имена файлов и функций стабильнее номеров строк.
 
 Источники решения: issue #11; `src/vfs/mod.rs` (трейт `VfsNode`); `src/vfs/ramfs.rs`;
 `src/arch/x86_64/linux/io_sys.rs` (резолв путей, `open`/`stat`/`readlink`/`getdents64`);
@@ -22,11 +25,12 @@
    chroot-маппинга `/mnt` (см. §1).
 2. Срез 1 — ровно **7 файлов** + 2 каталога:
    `/proc`, `/proc/self`, `/proc/self/{exe,cmdline,status,maps}`, `/proc/{cpuinfo,meminfo,uptime}`.
-   Срез 2 (2.9.0) добавил `/proc/stat` с реальным учётом user/system/idle в
-   тике; всё
-   остальное (`/proc/<pid>`, `/proc/loadavg`, `/proc/mounts`,
-   `/proc/self/fd`, `/proc/self/stat`, `/proc/sys`, `/proc/version`) — **ENOENT** в этом срезе,
-   обоснование отложенности в §2.2.
+   Срез 2 (2.9.0) добавил `/proc/stat` с реальным учётом user/system/idle в тике.
+   Срез 3 (2.10.0) добавил `/proc/version`, `/proc/filesystems`, `/proc/loadavg` и
+   read-only `/proc/sys` + `/proc/sys/kernel/{ostype,osrelease,hostname}`.
+   Всё остальное (`/proc/<pid>`, `/proc/mounts`, `/proc/self/fd`, `/proc/self/stat`,
+   `/proc/devices`, прочие имена в `/proc/sys`) — **ENOENT**, обоснование отложенности
+   в §2.2.
 3. Содержимое генерируется **снимком на `lookup()`/`open()`** в форме Linux-текста; `size()`
    файла возвращает длину снимка (это необходимо из-за `plan_read`-модели EOF — §3.2,
    DEVIATION-1).
@@ -121,13 +125,14 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 
 ---
 
-## 2. Дерево первого среза
+## 2. Дерево (срезы 1–3)
 
 ### 2.1 Что входит
 
 ```
 /                     (VFS root; children: dev, tmp, proc, [mnt])
-/proc                 каталог, readdir → ["self","cpuinfo","meminfo","uptime"]
+/proc                 каталог, readdir → ["self","sys","cpuinfo","meminfo","uptime",
+                              "stat","version","filesystems","loadavg"]
 /proc/self            каталог, readdir → ["exe","cmdline","status","maps"]
 /proc/self/exe        симлинк (readlink → exe_path текущего процесса)
 /proc/self/cmdline    обычный файл, снимок argv
@@ -136,6 +141,15 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 /proc/cpuinfo         обычный файл, CPUID
 /proc/meminfo         обычный файл, счётчики PMM/heap
 /proc/uptime          обычный файл, тики планировщика
+/proc/stat            обычный файл, тики user/system/idle + счётчики событий
+/proc/version         обычный файл, `pagh <version> (x86_64) #1 SMP`
+/proc/filesystems     обычный файл, только реализованные драйверы
+/proc/loadavg         обычный файл, 0.00-средние + live-счётчики
+/proc/sys             каталог (read-only), readdir → ["kernel"]
+/proc/sys/kernel      каталог (read-only), readdir → ["ostype","osrelease","hostname"]
+/proc/sys/kernel/ostype     обычный файл, "Pagh\n"
+/proc/sys/kernel/osrelease  обычный файл, "<version>\n"
+/proc/sys/kernel/hostname   обычный файл, "pagh\n"
 ```
 
 Обоснование вхождения каждого пути:
@@ -149,17 +163,20 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 | `/proc/cpuinfo` | libuv `uv_cpu_info` (Node `os.cpus()`), Python `platform.processor()`, busybox | Единственный источник «какой это CPU» для userland |
 | `/proc/meminfo` | libuv `uv_get_total_memory`/`uv_get_free_memory` (`MemTotal:`, `MemAvailable:`), busybox `free`, htop, psutil | glibc с 2.23 берёт физические страницы из `sysinfo(2)` (см. §4.2), поэтому meminfo нужен именно этим потребителям |
 | `/proc/uptime` | libuv `uv_uptime` (`sscanf("%lf")`), busybox `uptime` | Тривиально и переиспользует уже существующий тик-клок |
+| `/proc/version` | скрипты/диагностика, `uname -v`-подобные проверки; ни один E2E-сценарий на нём не стоит | Дёшев (константа + `CARGO_PKG_VERSION`) и закрывает давно отложенный путь |
+| `/proc/filesystems` | busybox/mount-подобные читатели, диагностика | Статическая таблица реально реализованных драйверов; врёт только при добавлении драйвера без строки в таблице, поэтому таблица — часть контракта |
+| `/proc/loadavg` | libuv `uv_loadavg` (при отсутствии/нуле падает обратно на `sysinfo(2)`), `uptime`/`w` | Средние честно `0.00`; live-счётчики задач и `last_pid` уже есть в планировщике |
+| `/proc/sys/kernel/{ostype,osrelease,hostname}` | скрипты, читающие версию/имя хоста; `osrelease` совпадает с `/mnt/etc/pagh-release` | Три константы и два каталога; записываемого sysctl нет, поэтому поверхность read-only |
 
 ### 2.2 Что осознанно отложено и почему
 
 | Путь | Причина отложенности |
 |---|---|
 | `/proc/<pid>` (перечисление), `/proc/<pid>/{status,stat,cmdline,maps}` | Нужен pid-keyed каталог, snapshot `COMPAT_STATES` и **чтение чужого процесса** (его `CompatState` + `VmRegionSet`) без удержания реестрового спинлока во время генерации содержимого. Плюс потребители (ps/htop) одновременно требуют `/proc/stat` и `/proc/<pid>/stat` — половина набора бесполезна. Отдельный срез. |
-| `/proc/loadavg` | Нет учёта загрузки (libuv падает обратно на `sysinfo(2)`, который уже реализован и возвращает `loads = [0;3]`). |
 | `/proc/mounts`, `/proc/self/mountinfo` | В VFS нет таблицы монтирований (есть только `RootDirectory.children`); сначала нужен реестр монтирований. |
 | `/proc/self/fd/*`, `/proc/self/task/*` | Требуют симлинков на произвольный fd/pid и полноценного следования по ссылкам (общая задача с #18), а не одного уровня (§5.4). |
 | `/proc/self/stat`, `/proc/self/statm`, `/proc/self/cgroup` | Принадлежат семейству `/proc/<pid>/stat`; `statm` дёшев, но требует residency-учёта, которого нет (§4.5.1). |
-| `/proc/sys/*`, `/proc/version`, `/proc/filesystems`, `/proc/devices` | Не нужны заявленным потребителям; `/proc/version` тривиален, но не проверяется ни одним E2E-сценарием — держим срез минимальным. |
+| `/proc/devices`, прочие имена в `/proc/sys/*` | Сверх трёх read-only файлов `/proc/sys/kernel` нет ни sysctl-реестра, ни списка устройств; неизвестное имя обязано оставаться `ENOENT` (§5.6), а не «пустым успехом». |
 | `[vdso]`, `[vvar]`, `[vsyscall]` в maps | В ядре их физически нет — строки не должны появляться (это не «не реализовано», а «отсутствует»). |
 
 ### 2.3 Идентичность узлов и inode-номера
@@ -175,7 +192,10 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 pub const PROC_INO_BASE: u64 = 0x00F0_0000_0000; // 1.03e12, < 2^63
 // /proc = base+0, /proc/self = base+1,
 // /proc/self/{exe,cmdline,status,maps} = base+2..5,
-// /proc/{cpuinfo,meminfo,uptime} = base+6..8
+// /proc/{cpuinfo,meminfo,uptime,stat} = base+6..9,
+// /proc/sys = base+10, /proc/sys/kernel = base+11,
+// /proc/sys/kernel/{ostype,osrelease,hostname} = base+12..14,
+// /proc/{version,filesystems,loadavg} = base+15..17
 ```
 
 - Обёртка `MountNode` `fs_ino` не форвардит (`src/vfs/README.md`, «Грабли»), поэтому
@@ -536,6 +556,116 @@ pub struct LoadSegment { pub start: u64, pub end: u64, pub prot: u32, pub file_o
   косметика для `ps`-подобных инструментов).
 - Если `cs.exe_path` пуст — узел не существует для вызывающего (§5.5).
 
+### 4.8 `/proc/stat`
+
+Реализован в 2.9.0. Первые две строки — агрегат и единственный CPU, по 10
+числовых колонок Linux (`user nice system idle iowait irq softirq steal guest
+guest_nice`):
+
+```
+cpu  {user} 0 {system} {idle} 0 0 0 0 0 0\n
+cpu0 {user} 0 {system} {idle} 0 0 0 0 0 0\n
+ctxt {n}\n
+btime {unix}\n
+processes {n}\n
+procs_running {n}\n
+procs_blocked 0\n
+```
+
+`nice/iowait/irq/softirq/steal/guest/guest_nice` — честные нули: учёта для них
+нет; строки `intr`/`softirq` не печатаются вовсе, чтобы не выдумывать счётчики.
+Тик планировщика заряжает ровно один из user/system/idle **до** решения о
+переключении; `procs_running` — `scheduler::ready_count()`, `procs_blocked`
+всегда `0` (блокирующих состояний нет).
+
+### 4.9 `/proc/version`
+
+Одна строка, ровно:
+
+```
+pagh <CARGO_PKG_VERSION> (x86_64) #1 SMP\n
+```
+
+- `<CARGO_PKG_VERSION>` — **реальная** версия крейта (`Cargo.toml`, тот же
+  `env!`, что у `/mnt/etc/pagh-release` и motd), например `2.10.0`.
+- Это **не** поддельная Linux-строка: нет ни `Linux version`, ни даты сборки, ни
+  компилятора. `#1 SMP` — фиксированный build-тег запрошенной формы; ядро
+  однопроцессорное, и строка не является заявлением о поддержке SMP.
+- Форматтер `format_version(version)` чистый (версия передаётся снаружи) и
+  покрыт host-свойством; in-QEMU рутина проверяет наличие
+  `env!("CARGO_PKG_VERSION")`.
+
+### 4.10 `/proc/filesystems`
+
+Строки Linux-формы, по одной на **реализованный в этой сборке** драйвер ФС:
+
+```
+nodev\tproc\n
+nodev\tramfs\n
+\text2\n
+```
+
+- «Присутствует» означает «драйвер реализован в этой сборке», а не
+  «смонтирован»: Linux тоже перечисляет драйверы независимо от монтирований.
+  Поэтому `ext2` печатается и при неудавшемся монтировании `/mnt` — драйвер
+  (`src/fs/ext2/`) в сборке есть; отсутствие mount-таблицы отмечено в §2.2.
+- Имена — реальные Linux-имена (`proc`, `ramfs`, `ext2`), не имена Rust-модулей
+  (`vfs::procfs`, `vfs::ramfs`, `fs::ext2`).
+- В ядре нет runtime-реестра ФС, поэтому `procfs_format::FILESYSTEMS` и есть
+  реестр: добавление/удаление драйвера обязано менять эту таблицу в том же
+  коммите. Wildcard нет: всё, чего нет в таблице, не печатается.
+- `nodev` — ФС не требует блочного устройства; у `ext2` префикса нет, строка
+  начинается с таба (как в Linux).
+
+### 4.11 `/proc/loadavg`
+
+Одна строка:
+
+```
+0.00 0.00 0.00 <runnable>/<total> <last_pid>\n
+```
+
+- Первые три поля — **честные** `0.00`: учёта загрузки (экспоненциальных средних)
+  в ядре нет. libuv `uv_loadavg` в этом случае падает обратно на `sysinfo(2)`,
+  который реализован и возвращает `loads = [0;3]` (см. `misc.rs`); выдумывать
+  ненулевые средние запрещено.
+- `<runnable>` — `scheduler::ready_count()`: ready-очередь + текущая задача,
+  idle не считается. `<total>` — живые задачи: `runnable` + припаркованные
+  (`STOPPED_TASKS`). Блокирующего/непрерываемого состояния в этом планировщике
+  нет (блокирующее ожидание yield'ит и остаётся runnable), `EXITING_PIDS` —
+  уже мёртвые и не считаются; поэтому это настоящий live-счётчик, а не
+  накопленный `processes`.
+- `<last_pid>` — последний выданный планировщиком pid; `next_pid()` возвращает
+  старое значение и инкрементирует счётчик, поэтому аксессор отдаёт
+  `NEXT_PID - 1`, а `0` означает «pid ещё не выдавался».
+- Все три значения приходят через один аксессор
+  `scheduler::loadavg_counts() -> (runnable, total, last_pid)`; формат —
+  `procfs_format::format_loadavg`. `runnable <= total` — инвариант входа.
+
+### 4.12 `/proc/sys` и `/proc/sys/kernel/*`
+
+Два read-only каталога и три read-only файла:
+
+```
+/proc/sys                    readdir → ["kernel"]
+/proc/sys/kernel             readdir → ["ostype","osrelease","hostname"]
+/proc/sys/kernel/ostype      "Pagh\n"
+/proc/sys/kernel/osrelease   "<CARGO_PKG_VERSION>\n"
+/proc/sys/kernel/hostname    "pagh\n"
+```
+
+- `ostype` — собственное имя ядра `Pagh`, а не Linux-овское `Linux`: `uname(2)`
+  отвечает `Linux` ради совместимости, но этот файл по контракту называет
+  систему.
+- `osrelease` — реальная версия крейта, та же, что в `/proc/version` и
+  `/mnt/etc/pagh-release`; никакой отдельной «release-строки» нет.
+- `hostname` — `uname(2).nodename`, который в этом ядре жёстко равен `pagh`;
+  переменной hostname и `sethostname(2)` нет. Оба места обязаны меняться вместе,
+  если hostname когда-нибудь появится.
+- Записываемого sysctl нет: `write(2)` идёт по общему procfs-пути
+  (`NotSupported` → `EACCES`). Любое имя вне таблицы — `ENOENT` (§5.6), включая
+  `/proc/sys/kernel/random` и `/proc/sys/net`.
+
 ---
 
 ## 5. Поведение syscall-поверхности
@@ -579,11 +709,11 @@ pub struct LoadSegment { pub start: u64, pub end: u64, pub prot: u32, pub file_o
 
 | Путь | `st_mode` | `st_size` | `st_nlink` |
 |---|---|---|---|
-| `/proc` | `S_IFDIR \| 0700` | 0 | 1 |
+| `/proc`, `/proc/sys`, `/proc/sys/kernel` | `S_IFDIR \| 0700` | 0 | 1 |
 | `/proc/self` | `S_IFDIR \| 0700` | 0 | 1 |
 | `/proc/self/exe` (`lstat`) | `S_IFLNK \| 0777` | длина `exe_path` | 1 |
 | `/proc/self/exe` (`stat`) | по цели | по цели | по цели |
-| `/proc/{cpuinfo,meminfo,uptime}`, `/proc/self/{cmdline,status,maps}` | `S_IFREG \| 0755` | длина снимка | 1 |
+| `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg}`, `/proc/sys/kernel/{ostype,osrelease,hostname}`, `/proc/self/{cmdline,status,maps}` | `S_IFREG \| 0755` | длина снимка | 1 |
 
 DEVIATION-1 (size ≠ 0), DEVIATION-11 (права: `stat_mode_for` даёт дефолты 0700/0755,
 тогда как Linux для procfs — 0555/0444; режим в этом ядре не влияет на `access`,
@@ -592,8 +722,10 @@ DEVIATION-1 (size ≠ 0), DEVIATION-11 (права: `stat_mode_for` даёт д�
 ### 5.3 `readdir` / `getdents64`
 
 - `readdir()` каталогов procfs возвращает ровно детей из §2.1 в фиксированном порядке:
-  `/proc` → `["self","cpuinfo","meminfo","uptime"]`,
-  `/proc/self` → `["exe","cmdline","status","maps"]`.
+  `/proc` → `["self","sys","cpuinfo","meminfo","uptime","stat","version","filesystems","loadavg"]`,
+  `/proc/self` → `["exe","cmdline","status","maps"]`,
+  `/proc/sys` → `["kernel"]`,
+  `/proc/sys/kernel` → `["ostype","osrelease","hostname"]`.
   Порядок стабилен между вызовами при неизменном дереве (Linux порядок не гарантирует;
   нашим потребителям он безразличен, а тесты на нём стоят).
 - `getdents64` (`io_sys.rs:1706-1750`) отдаёт записи `linux_dirent64`
@@ -656,8 +788,15 @@ DEVIATION-1 (size ≠ 0), DEVIATION-11 (права: `stat_mode_for` даёт д�
 §2.1, даёт `VfsError::NotFound` → `ENOENT` — и никогда `EISDIR`, `EIO` или «успех с пустым
 файлом». Отдельный нюанс: `open("/proc/cpuinfo/child")` — тоже `ENOENT` (DEVIATION-10),
 а не Linux-овский `ENOTDIR` (дефолтный `lookup` трейта возвращает `NotFound`).
-Обязательно покрыть тестами: `/proc/1`, `/proc/1234`, `/proc/self/fd`, `/proc/self/status/x`,
-`/proc/sys/kernel/ostype`, `/proc/version`, `/proc/nonexistent`.
+Обязательно покрыть тестами (ENOENT-матрица; реальные узлы перечислены отдельно):
+
+- **ENOENT**: `/proc/1`, `/proc/1234`, `/proc/self/fd`, `/proc/self/status/x`,
+  `/proc/mounts`, `/proc/devices`, `/proc/sys/kernel/nonexistent`,
+  `/proc/version/child`, `/proc/nonexistent`.
+- **Существуют** (после срезов 2–3): `/proc/version`, `/proc/filesystems`,
+  `/proc/loadavg`, `/proc/sys`, `/proc/sys/kernel`,
+  `/proc/sys/kernel/{ostype,osrelease,hostname}` — для них проверяется содержимое,
+  а не ENOENT. `/proc/sys/kernel/ostype` из старой матрицы исключён именно поэтому.
 
 ---
 
@@ -685,10 +824,12 @@ fn read_link(&self) -> Option<String> { None }
   follow-резолвер из t15 (§5.4).
 
 ### 6.2 `src/vfs/procfs.rs` (новый)
-- Узлы `ProcDir`/`ProcFile`/`ProcSymlink`, `root()`; источники: `pmm`, `heap`,
-  `scheduler::ticks`, `apic::TICK_HZ`, `compat::with_current_compat`,
-  `arch::x86_64::cpuid`, `memory::layout` (стек), `task::process` (образ).
-- Никакого блокирующего I/O; снимок — §3.2.
+- Узлы `ProcDir`/`ProcFile`, `root()`; `DirKind::{Root,SelfDir,SysDir,SysKernelDir}`;
+  источники: `pmm`, `heap`, `scheduler::{ticks,ready_count,loadavg_counts}`,
+  `apic::TICK_HZ`, `compat::with_current_compat`, `arch::x86_64::cpuid`,
+  `memory::layout` (стек), `task::process` (образ), `env!("CARGO_PKG_VERSION")`.
+- Никакого блокирующего I/O; снимок — §3.2. `/proc/version` и `/proc/sys/kernel/*`
+  константны, `/proc/loadavg` читает живой планировщик.
 
 ### 6.3 `src/arch/x86_64/linux/io_sys.rs`
 - `sys_readlink` (`:1975-1993`): удалить хардкод `/proc/self/exe`, резолвить путь через
@@ -750,11 +891,16 @@ fn read_link(&self) -> Option<String> { None }
 
 ```rust
 pub const PROC_INO_BASE: u64;
-pub enum ProcKind { SelfExe, SelfCmdline, SelfStatus, SelfMaps, CpuInfo, MemInfo, Uptime }
+pub enum ProcKind { SelfExe, SelfCmdline, SelfStatus, SelfMaps, CpuInfo, MemInfo,
+                    Uptime, Stat, Version, FileSystems, LoadAvg,
+                    SysOstype, SysOsrelease, SysHostname }
 pub struct ProcEntry { pub name: &'static str, pub ino: u64, pub kind: ProcKind }
-pub const PROC_ENTRIES: [ProcEntry; 4];        // self, cpuinfo, meminfo, uptime
-pub const PROC_SELF_ENTRIES: [ProcEntry; 4];   // exe, cmdline, status, maps
-pub fn proc_entry(name: &str) -> Option<ProcEntry>;
+pub const PROC_FILES: [ProcEntry; 7];          // cpuinfo..loadavg (срез 3)
+pub const PROC_SELF_FILES: [ProcEntry; 4];     // exe, cmdline, status, maps
+pub const PROC_SYS_FILES: [ProcEntry; 3];      // ostype, osrelease, hostname
+pub fn proc_file(name: &str) -> Option<ProcEntry>;
+pub fn proc_self_file(name: &str) -> Option<ProcEntry>;
+pub fn proc_sys_file(name: &str) -> Option<ProcEntry>;
 
 pub struct CpuIdReport { /* слово-в-слово как в 6.6, но без Option-API ядра */ }
 pub fn format_cpuinfo(cpus: &[CpuIdReport]) -> Vec<u8>;
@@ -762,6 +908,18 @@ pub fn format_cpuinfo(cpus: &[CpuIdReport]) -> Vec<u8>;
 pub struct MemInfoKb { pub total_kb: u64, pub free_kb: u64 }
 pub fn format_meminfo(m: &MemInfoKb) -> Vec<u8>;
 pub fn format_uptime(ticks: u64, tick_hz: u64) -> Vec<u8>;
+
+pub fn format_version(version: &str) -> Vec<u8>;
+pub struct FileSystemEntry { pub nodev: bool, pub name: &'static str }
+pub const FILESYSTEMS: [FileSystemEntry; 3];
+pub fn format_filesystems(entries: &[FileSystemEntry]) -> Vec<u8>;
+pub struct LoadAvg { pub runnable: u64, pub total: u64, pub last_pid: u64 }
+pub fn format_loadavg(l: &LoadAvg) -> Vec<u8>;
+pub const KERNEL_OSTYPE: &str;
+pub const KERNEL_HOSTNAME: &str;
+pub fn format_sys_ostype() -> Vec<u8>;
+pub fn format_sys_osrelease(version: &str) -> Vec<u8>;
+pub fn format_sys_hostname() -> Vec<u8>;
 
 pub struct StatusInputs<'a> { pub name: &'a [u8], pub umask: u32, pub pid: u64, pub tgid: u64,
     pub ppid: u64, pub threads: u64, pub fd_size: u64, pub sig_pending: u64,
@@ -786,11 +944,12 @@ pub fn format_maps(regions: &[MapsRegion]) -> Vec<u8>;       // сортируе
 | `properties/p52.rs` | cpuinfo | для случайного набора CPUID-слов: ровно один блок на CPU, блок кончается `\n\n`; первая строка каждого блока ровно `processor\t: {i}\n`; есть литерал `model name\t: `; `flags` — **точное равенство** «таблица ∩ биты» (для всех нулевых слов список имён пуст — `flags\t\t: \n`, ни одного выдуманного имени); `model name` не пуст; `cpu MHz`/`cache size`/`bogomips` присутствуют ⇔ соответствуют `Some`; `bugs\t\t:` присутствует; ключи не дублируются |
 | `properties/p53.rs` | uptime + status | `uptime`: regex `^\d+\.\d{2} \d+\.\d{2}\n$`, `secs*100+centis == ticks*100/hz`, монотонность по `ticks`, `idle == 0`; `status`: каждая обязательная строка ровно один раз, `Pid`/`Tgid`/`PPid` равны входу, `SigPnd`/`SigBlk`/`SigIgn`/`SigCgt` — ровно 16 строчных hex, `Name` = `task_name` и ≤ 15 байт, `VmSize ≥ VmRSS`, нет NUL, каждая строка кончается `\n` |
 | `properties/p54.rs` | cmdline | `format_cmdline(a)` == конкатенация `a[i] + \0`; расщепление по NUL (без последнего пустого) байт-в-байт возвращает `a`; пустой argv → пустой вывод; при лимите отбрасываются только целые аргументы, вывод кончается NUL, `len ≤ cap`; аргументы с невалидным UTF-8 и с внутренними `\n` проходят без изменений |
-| `properties/p55.rs` | maps + таблица + путём | maps: результат парсится regex'ом `^[0-9a-f]{8,16}-[0-9a-f]{8,16} [r-][w-][x-]p [0-9a-f]{8} [0-9a-f]{2}:[0-9a-f]{2} [0-9]+( \S.*)?$`, отсортирован, `start<end`, не пересекается, ни одного `0x`, пустой путь ⇒ нет хвостового пробела; таблица: `proc_entry` для всех имён из контракта → `Some`, для `"1"`, `"self/fd"`, `"cpuinfo/x"`, `""`, `"version"` → `None`; все inode'ы из таблицы различны, bit 63 = 0, `> 0x540000`; `guest_path_keeps_root`: `true` ⇔ первый компонент ∈ {mnt,dev,proc,sys,tmp}, и `/proc/...` **всегда** true |
+| `properties/p55.rs` | maps + таблица + путём | maps: результат парсится regex'ом `^[0-9a-f]{8,16}-[0-9a-f]{8,16} [r-][w-][x-]p [0-9a-f]{8} [0-9a-f]{2}:[0-9a-f]{2} [0-9]+( \S.*)?$`, отсортирован, `start<end`, не пересекается, ни одного `0x`, пустой путь ⇒ нет хвостового пробела; таблица: `proc_entry` для всех имён из контракта → `Some`, для `"1"`, `"self/fd"`, `"cpuinfo/x"`, `""`, `"mounts"`, `"devices"` → `None`; `"version"`/`"filesystems"`/`"loadavg"` → `Some`; все inode'ы из таблицы различны, bit 63 = 0, `> 0x540000`; `guest_path_keeps_root`: `true` ⇔ первый компонент ∈ {mnt,dev,proc,sys,tmp}, и `/proc/...` **всегда** true |
+| `properties/procfs_misc.rs` (срез 3) | version + filesystems + loadavg + sys | `format_version` — ровно одна строка `pagh {version} (x86_64) #1 SMP\n` с переданной версией и без `Linux version`; `format_filesystems` — `nodev\t<name>`/`\t<name>` построчно, пустой вход → пустой выход, `FILESYSTEMS` == ровно `proc/ramfs/ext2`; `format_loadavg` — ровно три `0.00`, `runnable/total` парсится в вход, `runnable <= total`, `last_pid` парсится, нулевой случай `0.00 0.00 0.00 0/0 0`; sys-файлы — ровно `Pagh\n`, `<version>\n`, `pagh\n`, имена/порядок `PROC_SYS_FILES` |
 | `properties/p32.rs` (расширить) | dirent | `DT_LNK == 10`, `d_type_for(dir=true)=DT_DIR`, `d_type_for(link=true)=DT_LNK`, иначе `DT_REG`; `encode_dirent64` сохраняет `d_ino`/`d_type`/имя (уже есть — дополнить новыми кейсами) |
 
-Итого 5 новых property-файлов + правка одного; регистрация в `host-tests/src/lib.rs`
-(`#[path]`-include `procfs_format` + `mod p51..p55` в `properties`). `procfs_format`
+Итого 6 новых property-файлов (`p51..p55` + `procfs_misc`) + правка одного; регистрация в
+`host-tests/src/lib.rs` (`#[path]`-include `procfs_format` + модули в `properties`). `procfs_format`
 ссылается на `super::signal_frame` (для `sig_masks`) — ровно как `io.rs` на
 `super::errno`; в host-tests `signal_frame` уже объявлен на crate root (`P42`), так что
 дополнительной обвязки не нужно, но `#[path]`-include должен стоять как crate-root
@@ -813,15 +972,15 @@ cargo build
 python3 tools/build.py build --release
 cargo fmt --all -- --check
 python3 tools/check_safety.py
-python3 tools/host_tests.py          # + 5 новых property-наборов
+python3 tools/host_tests.py          # + 6 новых property-наборов
 ```
 
 ### 8.2 In-QEMU selftest (`src/test.rs`)
 Новый недеструктивный рутин (`all_tests()` в `src/test.rs:3158`, никаких мутаций
 `COMPAT_STATES`/PMM/IF/VFS и никаких spawn'ов):
 
-- `lookup_path("/proc")` → каталог; имена `readdir()` == множество
-  `{self, cpuinfo, meminfo, uptime}`;
+- `lookup_path("/proc")` → каталог; имена `readdir()` (фиксированный порядок) ==
+  `{self, sys, cpuinfo, meminfo, uptime, stat, version, filesystems, loadavg}`;
 - `/proc/cpuinfo`: непусто, первая строка `processor\t: 0`, есть `vendor_id\t: ` и
   `model name\t: `, файл кончается `\n\n`;
 - `/proc/meminfo`: каждая строка парсится, `MemTotal ≥ MemFree > 0`,
@@ -831,7 +990,15 @@ python3 tools/host_tests.py          # + 5 новых property-наборов
   `[ticks/TICK_HZ - 1, ticks/TICK_HZ + 1]`;
 - `read(offset=0, 8 KiB)` на `/proc/meminfo` возвращает полный снимок, повторный `read`
   с `offset == size` → `Ok(0)`, `read` с `offset > size` → `Ok(0)`;
-- `lookup_path("/proc/1")`, `"/proc/self/fd"`, `"/proc/version"`,
+- `/proc/version`: одна строка, начинается `pagh `, содержит
+  `env!("CARGO_PKG_VERSION")`, кончается ` (x86_64) #1 SMP\n`;
+- `/proc/filesystems`: ровно три строки `nodev\tproc`, `nodev\tramfs`, `\text2`;
+- `/proc/loadavg`: пять полей, первые три `0.00`, `runnable/total` с `runnable ≥ 1` и
+  `total ≥ runnable`, `last_pid > 0` и `≥ current_pid()`;
+- `/proc/sys` и `/proc/sys/kernel` — каталоги с ожидаемым `readdir`;
+  `ostype`/`osrelease`/`hostname` равны `Pagh\n` / `<version>\n` / `pagh\n`;
+- `lookup_path("/proc/1")`, `"/proc/self/fd"`, `"/proc/mounts"`, `"/proc/devices"`,
+  `"/proc/version/child"`, `"/proc/sys/kernel/nonexistent"`,
   `"/proc/cpuinfo/child"` → `Err(VfsError::NotFound)`;
 - `lookup_path("/proc/self")` → `Err(NotFound)` **в контексте boot-thread** (нет compat
   состояния — §5.5), и это утверждение фиксирует контракт.
@@ -878,7 +1045,10 @@ python3 tools/host_tests.py          # + 5 новых property-наборов
 | 11 | Права procfs = дефолты слоя (0700/0755), а не 0555/0444 | `stat_mode_for` не имеет per-node режима; `access(2)` режим не проверяет |
 | 12 | Нет записей `.`/`..` в `getdents64` | Общее свойство VFS этого ядра, не специфика procfs |
 | 13 | До мержа t15: цикл/лишние ссылки → `ENOENT` (нет `ELOOP` в `errno.rs`), вместо Linux-овского `ELOOP` | Бюджет 8 + `warn!` как временный шов; t15 (`EXT2-LINKS.md` §4.6) добавляет `Errno::ELOOP = 40` и `SYMLOOP_MAX = 40`, после чего procfs переиспользует общий резолвер |
-| 14 | `/proc/<pid>` (в т.ч. `/proc/1`) → `ENOENT` | Перечисление отложено (§2.2); `ps`/`htop` в этом срезе по-прежнему не работают |
+| 14 | `/proc/<pid>` (в т.ч. `/proc/1`) → `ENOENT` | Перечисление отложено (§2.2); `ps`/`htop` и после среза 3 не работают |
+| 15 | `/proc/loadavg` первые три поля всегда `0.00` | Учёта загрузки нет; libuv `uv_loadavg` падает обратно на `sysinfo(2)` (`loads = [0;3]`), выдумывать средние запрещено. `runnable/total` и `last_pid` — реальные (§4.11) |
+| 16 | `/proc/version` — `pagh <version> (x86_64) #1 SMP`, а не Linux-строка | Ядро не Linux: реальная версия крейта вместо поддельного релиза. `#1 SMP` — фиксированный build-тег формы, не заявление о SMP (машина однопроцессорная) |
+| 17 | `/proc/sys/kernel/*` — read-only константы, `hostname` не настраивается | Нет sysctl-реестра, `sethostname(2)` и hostname-переменной; `hostname` повторяет `uname(2).nodename`, `ostype` — собственное имя `Pagh`. Любое другое имя — `ENOENT` (§5.6) |
 
 ---
 
@@ -905,15 +1075,15 @@ python3 tools/host_tests.py          # + 5 новых property-наборов
 
 ## 11. Definition of Done для реализации
 
-1. Все 9 узлов §2.1 существуют и ведут себя по §3–§5; неизвестные пути → `ENOENT` (§5.6).
+1. Все узлы §2.1 (срезы 1–3) существуют и ведут себя по §3–§5; неизвестные пути → `ENOENT` (§5.6).
 2. `VfsNode::{is_symlink, read_link}` (+ форвард в `MountNode`), follow-резолвер (t15 или
    минимальный §5.4(2)), `FdTable::capacity`, `LoadSegment`,
    `CompatState::{cmdline,image_segments,interp_path}`, `cpuid::read`,
    `procfs_format::*` — на месте.
-3. 5 новых property-наборов (p51–p55) + расширение p32 зелёные в
-   `python3 tools/host_tests.py`; все 4 гейта `AGENTS.md` зелёные.
+3. 6 новых property-наборов (p51–p55 + `procfs_misc`) + расширение p32 зелёные в
+   `python3 tools/host_tests.py`; все шесть гейтов `AGENTS.md` зелёные.
 4. Новый selftest-рутин (§8.2) даёт 0 failed checks в `python3 tools/e2e.py selftest`;
    E2E-команды §8.3 проходят (включая `/proc/self/*` через busybox).
-5. Обновлены `src/vfs/README.md`, `README.md`, `LINUX-USERLAND.md`; MINOR-бамп версии
-   вместе с `Cargo.lock`.
+5. Обновлены `src/vfs/README.md`, `README.md`, `AGENTS.md` (текущая версия и история),
+   `docs/procfs.md`; MINOR-бамп версии вместе с `Cargo.lock`.
 6. Каждое отклонение §9 имеет комментарий в коде рядом с местом отклонения.

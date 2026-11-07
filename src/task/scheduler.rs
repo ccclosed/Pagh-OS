@@ -551,6 +551,30 @@ pub fn ready_count() -> u64 {
     let queued = READY_QUEUE.lock().len() as u64;
     queued + if is_idle(current_pid()) { 0 } else { 1 }
 }
+
+/// Live task counts plus the last allocated pid, for `/proc/loadavg`.
+///
+/// `runnable` is [`ready_count`] (ready queue + running task, idle excluded).
+/// `total` adds the parked/stopped tasks: this scheduler has no sleeping or
+/// uninterruptible state — a blocking wait yields and stays runnable, and a
+/// stopped task is parked in [`STOPPED_TASKS`] rather than dropped — so among
+/// live tasks those are the only ones not in the ready set. Pids in
+/// [`EXITING_PIDS`] are already dead (awaiting reaping) and are not counted.
+///
+/// `last_pid` is derived from the pid counter: [`next_pid`] returns the old value
+/// and increments, so the highest pid handed out is `NEXT_PID - 1`, and `0`
+/// means no pid has been allocated yet.
+///
+/// Lock order matches the rest of the scheduler: `READY_QUEUE` (inside
+/// [`ready_count`]) is released before `STOPPED_TASKS` is taken, so the one
+/// documented order (`READY_QUEUE → STOPPED_TASKS`) is preserved. Called from
+/// ordinary syscall/kernel context (the procfs renderer), never from the tick.
+pub fn loadavg_counts() -> (u64, u64, u64) {
+    let runnable = ready_count();
+    let stopped = STOPPED_TASKS.lock().len() as u64;
+    let last_pid = NEXT_PID.load(Ordering::Relaxed).saturating_sub(1);
+    (runnable, runnable + stopped, last_pid)
+}
 fn activate_task(pid: u64) {
     if is_idle(pid) {
         return;

@@ -48,6 +48,10 @@ pub const PROC_INO_BASE: u64 = 0x00F0_0000_0000;
 pub const PROC_ROOT_DIR_INO: u64 = PROC_INO_BASE;
 /// `/proc/self`.
 pub const PROC_SELF_DIR_INO: u64 = PROC_INO_BASE + 1;
+/// `/proc/sys` (`docs/procfs.md` §2.3).
+pub const PROC_SYS_DIR_INO: u64 = PROC_INO_BASE + 10;
+/// `/proc/sys/kernel`.
+pub const PROC_SYS_KERNEL_DIR_INO: u64 = PROC_INO_BASE + 11;
 
 /// Which `/proc` file a node presents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +72,18 @@ pub enum ProcKind {
     Uptime,
     /// `/proc/stat` — the kernel tick/event counters.
     Stat,
+    /// `/proc/version` — this kernel's identity string.
+    Version,
+    /// `/proc/filesystems` — the filesystem drivers this build implements.
+    FileSystems,
+    /// `/proc/loadavg` — load averages plus live task counts.
+    LoadAvg,
+    /// `/proc/sys/kernel/ostype`.
+    SysOstype,
+    /// `/proc/sys/kernel/osrelease`.
+    SysOsrelease,
+    /// `/proc/sys/kernel/hostname`.
+    SysHostname,
 }
 
 /// One named entry: its `readdir` name, stable inode, and content kind.
@@ -79,7 +95,7 @@ pub struct ProcEntry {
 }
 
 /// The regular files directly under `/proc` (in `readdir` order).
-pub const PROC_FILES: [ProcEntry; 4] = [
+pub const PROC_FILES: [ProcEntry; 7] = [
     ProcEntry {
         name: "cpuinfo",
         ino: PROC_INO_BASE + 6,
@@ -99,6 +115,40 @@ pub const PROC_FILES: [ProcEntry; 4] = [
         name: "stat",
         ino: PROC_INO_BASE + 9,
         kind: ProcKind::Stat,
+    },
+    ProcEntry {
+        name: "version",
+        ino: PROC_INO_BASE + 15,
+        kind: ProcKind::Version,
+    },
+    ProcEntry {
+        name: "filesystems",
+        ino: PROC_INO_BASE + 16,
+        kind: ProcKind::FileSystems,
+    },
+    ProcEntry {
+        name: "loadavg",
+        ino: PROC_INO_BASE + 17,
+        kind: ProcKind::LoadAvg,
+    },
+];
+
+/// The regular files under `/proc/sys/kernel` (in `readdir` order).
+pub const PROC_SYS_FILES: [ProcEntry; 3] = [
+    ProcEntry {
+        name: "ostype",
+        ino: PROC_INO_BASE + 12,
+        kind: ProcKind::SysOstype,
+    },
+    ProcEntry {
+        name: "osrelease",
+        ino: PROC_INO_BASE + 13,
+        kind: ProcKind::SysOsrelease,
+    },
+    ProcEntry {
+        name: "hostname",
+        ino: PROC_INO_BASE + 14,
+        kind: ProcKind::SysHostname,
     },
 ];
 
@@ -126,10 +176,20 @@ pub const PROC_SELF_FILES: [ProcEntry; 4] = [
     },
 ];
 
-/// `readdir` order of `/proc`: the `self` directory first, then the files.
-pub const PROC_ROOT_ORDER: [&str; 5] = ["self", "cpuinfo", "meminfo", "uptime", "stat"];
+/// `readdir` order of `/proc`: the two directories first, then the files.
+pub const PROC_ROOT_ORDER: [&str; 9] = [
+    "self",
+    "sys",
+    "cpuinfo",
+    "meminfo",
+    "uptime",
+    "stat",
+    "version",
+    "filesystems",
+    "loadavg",
+];
 
-/// Look up a regular `/proc` file by name (`self` is a directory, not here).
+/// Look up a regular `/proc` file by name (`self`/`sys` are directories, not here).
 pub fn proc_file(name: &str) -> Option<ProcEntry> {
     PROC_FILES.iter().copied().find(|e| e.name == name)
 }
@@ -137,6 +197,11 @@ pub fn proc_file(name: &str) -> Option<ProcEntry> {
 /// Look up a `/proc/self` file by name.
 pub fn proc_self_file(name: &str) -> Option<ProcEntry> {
     PROC_SELF_FILES.iter().copied().find(|e| e.name == name)
+}
+
+/// Look up a `/proc/sys/kernel` file by name.
+pub fn proc_sys_file(name: &str) -> Option<ProcEntry> {
+    PROC_SYS_FILES.iter().copied().find(|e| e.name == name)
 }
 
 // ─── /proc/meminfo ──────────────────────────────────────────────────────────
@@ -200,6 +265,121 @@ pub fn format_uptime(ticks: u64, tick_hz: u64) -> Vec<u8> {
     let centis = (ticks % hz) * 100 / hz;
     let mut out = Vec::with_capacity(32);
     push(&mut out, format_args!("{}.{:02} 0.00\n", secs, centis));
+    out
+}
+
+// ─── /proc/version ──────────────────────────────────────────────────────────
+
+/// Render `/proc/version`.
+///
+/// pagh is not Linux, so this is **not** a fake Linux release string: the first
+/// word is the kernel name, the second is the real crate version
+/// (`env!("CARGO_PKG_VERSION")`, the same source as `/mnt/etc/pagh-release`),
+/// then the machine and the fixed build tag.
+///
+/// The trailing `#1 SMP` is the shape consumer scripts grep for; `#1` is this
+/// kernel's constant build number and `SMP` is part of the requested fixed tag —
+/// pagh is a **single-CPU** kernel and this line is not a claim of SMP support.
+/// The version is passed in rather than read here so the formatter stays pure and
+/// host-testable; the kernel-side node supplies the crate version.
+pub fn format_version(version: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32 + version.len());
+    push(&mut out, format_args!("pagh {} (x86_64) #1 SMP\n", version));
+    out
+}
+
+// ─── /proc/filesystems ──────────────────────────────────────────────────────
+
+/// One `/proc/filesystems` row: a filesystem this build actually implements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileSystemEntry {
+    /// Linux's `nodev` marker: the filesystem needs no block device.
+    pub nodev: bool,
+    /// The name Linux uses for the filesystem (not the Rust module name).
+    pub name: &'static str,
+}
+
+/// The filesystem drivers present in this build, in the documented order.
+///
+/// "Present" means **implemented and registered in the VFS**, not "mounted": Linux
+/// lists drivers here regardless of whether an instance is mounted. There is no
+/// runtime filesystem registry in pagh, so this table *is* the registry — adding or
+/// removing a driver must update it in the same commit (`docs/procfs.md` §4.10).
+///
+/// * `proc` — `src/vfs/procfs.rs`, synthetic, no block device;
+/// * `ramfs` — `src/vfs/ramfs.rs`, in-memory `/tmp`, no block device;
+/// * `ext2` — `src/fs/ext2/`, the on-disk root mounted at `/mnt` when present.
+pub const FILESYSTEMS: [FileSystemEntry; 3] = [
+    FileSystemEntry {
+        nodev: true,
+        name: "proc",
+    },
+    FileSystemEntry {
+        nodev: true,
+        name: "ramfs",
+    },
+    FileSystemEntry {
+        nodev: false,
+        name: "ext2",
+    },
+];
+
+/// Render `/proc/filesystems`: `nodev\t<name>\n` for a device-less filesystem,
+/// `\t<name>\n` for one backed by a block device.
+///
+/// The leading tab on a block-device row is Linux's exact layout (`seq_puts(m,
+/// "\text4\n")` without a `nodev` word); the parser everyone uses splits on
+/// whitespace, but the byte shape is fixed here so a future `mount -t` reader can
+/// rely on it.
+pub fn format_filesystems(entries: &[FileSystemEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 * entries.len());
+    for e in entries {
+        if e.nodev {
+            out.extend_from_slice(b"nodev\t");
+        } else {
+            out.push(b'\t');
+        }
+        out.extend_from_slice(e.name.as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+// ─── /proc/loadavg ──────────────────────────────────────────────────────────
+
+/// `/proc/loadavg` inputs.
+///
+/// The three load averages are not inputs because pagh has no load accounting:
+/// the formatter always emits `0.00 0.00 0.00`, the honest value. libuv's
+/// `uv_loadavg` falls back to `sysinfo(2)`, which is already implemented with
+/// `loads = [0; 3]` (`docs/procfs.md` §4.11), so nothing downstream is misled.
+/// The remaining fields are real: runnable and total are live scheduler counts,
+/// `last_pid` is the most recently allocated pid (`0` before the first
+/// allocation).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadAvg {
+    /// Ready queue + the running task (idle excluded).
+    pub runnable: u64,
+    /// Live tasks: runnable + parked/stopped (blocking waits stay runnable).
+    pub total: u64,
+    /// Last pid handed out by the scheduler, or `0` if none was ever allocated.
+    pub last_pid: u64,
+}
+
+/// Render `/proc/loadavg`:
+/// `"0.00 0.00 0.00 <runnable>/<total> <last_pid>\n"`.
+///
+/// Linux's fourth field is `runnable/total` where `total` is the number of
+/// threads. pagh has no blocked (uninterruptible) state and no sleeping-task
+/// list, so `total` is every live task in the scheduler's rotation states —
+/// runnable plus stopped. Task creation counters are deliberately not used: that
+/// would grow forever and is not a live count.
+pub fn format_loadavg(l: &LoadAvg) -> Vec<u8> {
+    let mut out = Vec::with_capacity(48);
+    push(
+        &mut out,
+        format_args!("0.00 0.00 0.00 {}/{} {}\n", l.runnable, l.total, l.last_pid),
+    );
     out
 }
 
@@ -273,6 +453,52 @@ pub fn format_stat(s: &StatInputs) -> Vec<u8> {
         &mut out,
         format_args!("procs_blocked {}\n", s.procs_blocked),
     );
+    out
+}
+
+// ─── /proc/sys/kernel ───────────────────────────────────────────────────────
+
+/// `/proc/sys/kernel/ostype`: the kernel's own name, not Linux's.
+///
+/// Linux answers `Linux\n` here because it reads `init_uts_ns.name.sysname`.
+/// pagh's `uname(2)` reports `Linux` for compatibility, but the procfs contract
+/// asks for this kernel's identity, so the value is `Pagh` — the same name the
+/// project uses (`docs/procfs.md` §4.12).
+pub const KERNEL_OSTYPE: &str = "Pagh";
+
+/// `/proc/sys/kernel/hostname`: the nodename `uname(2)` reports.
+///
+/// There is no hostname variable and no `sethostname(2)` in pagh;
+/// `sys_uname` hard-codes `pagh`, so this file mirrors that constant and is
+/// therefore always writable-looking but static. A future hostname facility must
+/// update both call sites (`src/arch/x86_64/linux/misc.rs` and here).
+pub const KERNEL_HOSTNAME: &str = "pagh";
+
+/// Render `/proc/sys/kernel/ostype`: `"Pagh\n"`.
+pub fn format_sys_ostype() -> Vec<u8> {
+    let mut out = Vec::with_capacity(KERNEL_OSTYPE.len() + 1);
+    out.extend_from_slice(KERNEL_OSTYPE.as_bytes());
+    out.push(b'\n');
+    out
+}
+
+/// Render `/proc/sys/kernel/osrelease`: the real crate version plus a newline.
+///
+/// This is the same `env!("CARGO_PKG_VERSION")` that `/proc/version` embeds and
+/// that `provision.rs` writes to `/mnt/etc/pagh-release`; it is passed in so the
+/// formatter stays host-testable.
+pub fn format_sys_osrelease(version: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(version.len() + 1);
+    out.extend_from_slice(version.as_bytes());
+    out.push(b'\n');
+    out
+}
+
+/// Render `/proc/sys/kernel/hostname`: `KERNEL_HOSTNAME` plus a newline.
+pub fn format_sys_hostname() -> Vec<u8> {
+    let mut out = Vec::with_capacity(KERNEL_HOSTNAME.len() + 1);
+    out.extend_from_slice(KERNEL_HOSTNAME.as_bytes());
+    out.push(b'\n');
     out
 }
 

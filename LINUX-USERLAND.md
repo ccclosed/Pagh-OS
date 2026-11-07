@@ -84,17 +84,19 @@ These return `-ENOSYS` or a stub (logged once per syscall number per process):
   interrupted by the tick). Still missing: `SIGCHLD` on stop/continue, job-control
   `^Z`, and a real process-group model.
 - `timerfd` — programs needing timerfd descriptors still fail.
-- `procfs` covers the first slice only (issue #11): `/proc/cpuinfo`, `/proc/meminfo`,
-  `/proc/uptime` and `/proc/self/{exe,cmdline,status,maps}`, rendered from live kernel
-  state (contract: `docs/procfs.md`). `/proc/<pid>`, `/proc/stat`, `/proc/loadavg` and
-  `/proc/self/fd` return `ENOENT`, so `htop`/`ps` still do not work; `sysfs` does not
-  exist at all.
+- `procfs` covers slices 1–3 (issue #11): `/proc/{cpuinfo,meminfo,uptime,stat,version,
+  filesystems,loadavg}`, the read-only `/proc/sys/kernel/{ostype,osrelease,hostname}`
+  stubs and `/proc/self/{exe,cmdline,status,maps}`, rendered from live kernel state
+  (contract: `docs/procfs.md`). `/proc/loadavg` reports honest `0.00` load averages
+  (no load accounting) plus live task counts. `/proc/<pid>`, `/proc/mounts` and
+  `/proc/self/{fd,stat,statm}` return `ENOENT`, so `htop`/`ps` still do not work;
+  `sysfs` does not exist at all.
 - Symbolic/hard links exist on ext2, resolve through the VFS and are what a `.deb` unpacks to
   (issue #18): `lstat` differs from `stat`, `readlink` reports the stored target, two hard links
   share `st_ino` with `st_nlink == 2`.
 
 So: batch/console programs, the CPython REPL, and event-loop TUIs (`nvim`) run; the
-remaining gaps are timer-tick signal delivery/SIGSTOP-SIGCONT, timerfd, and procfs.
+remaining gaps are timer-tick signal delivery/SIGSTOP-SIGCONT, timerfd, and the per-pid procfs tree.
 
 ## Troubleshooting
 

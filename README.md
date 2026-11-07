@@ -187,9 +187,11 @@ server certificate chain, hostname and validity checked before a byte of the ind
   sockets, and raw-mode `termios` (with kernel-side echo) are implemented; POSIX signal
   delivery works at the syscall-return point (real `rt_sigaction`/`rt_sigprocmask`/
   `sigaltstack`/`rt_sigreturn`, `^C` → SIGINT with `EINTR` wake-ups in the blocking
-  waits); a synthetic `procfs` serves `/proc/{cpuinfo,meminfo,uptime,stat}` and
-  `/proc/self/{exe,cmdline,status,maps}` — per-pid entries and
-  `/proc/loadavg` are still missing, so `htop`/`ps` remain out of reach.
+  waits); a synthetic `procfs` serves
+  `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg}`, the read-only
+  `/proc/sys/kernel/{ostype,osrelease,hostname}` stubs and
+  `/proc/self/{exe,cmdline,status,maps}` — per-pid entries and `/proc/mounts` are
+  still missing, so `htop`/`ps` remain out of reach.
 - **Packages:** a by-name `apt` (`update`/`install`/`show`/`list`/`setmirror`) that fetches
   a Debian `Packages` index over HTTP/HTTPS, streams gzip/xz/zstd decompression into a
   compact in-RAM arena index, resolves dependencies, and installs `.deb`s onto ext2 `/mnt`
@@ -554,10 +556,15 @@ group, `SIGSTOP`/`SIGCONT` are real scheduler state (a stopped task keeps its sa
   kernel-side echo in raw mode, honest `tcgetattr` reports terminal state, and
   `ioctl(FIONBIO)` covers libuv's non-blocking path — `nvim` runs and saves its ShaDa.
   A synthetic `/proc` (issue #11) now serves `/proc/cpuinfo`, `/proc/meminfo`,
-  `/proc/uptime` and `/proc/self/{exe,cmdline,status,maps}` from live kernel state
-  (CPUID, PMM counters, the tick clock, the calling process's `CompatState`), with
-  `readlink`/`lstat`/`getdents64` handling `/proc/self/exe` as a real symlink. What is
-  still missing is the per-pid tree (`/proc/<pid>`), so `htop` and
+  `/proc/uptime`, `/proc/stat`, `/proc/version`, `/proc/filesystems`,
+  `/proc/loadavg`, the read-only `/proc/sys/kernel/{ostype,osrelease,hostname}`
+  stubs and `/proc/self/{exe,cmdline,status,maps}` from live kernel state
+  (CPUID, PMM counters, the tick clock, the scheduler's task counts, the calling
+  process's `CompatState`), with `readlink`/`lstat`/`getdents64` handling
+  `/proc/self/exe` as a real symlink. `/proc/loadavg` reports honest `0.00` load
+  averages (there is no load accounting) plus live runnable/total counts and the
+  last allocated pid. What is still missing is the per-pid tree
+  (`/proc/<pid>`) and the mount table, so `htop` and
   `ps` remain out of reach; `/proc/meminfo`-only consumers (busybox `free`, libuv's
   `uv_get_total_memory`) and `/proc/uptime` consumers now work. See
   `docs/procfs.md` for the exact contract and the deliberately deferred paths. Signal

@@ -1641,10 +1641,14 @@ mod procfs_tests {
             names(&proc_dir),
             alloc::vec![
                 String::from("self"),
+                String::from("sys"),
                 String::from("cpuinfo"),
                 String::from("meminfo"),
                 String::from("uptime"),
                 String::from("stat"),
+                String::from("version"),
+                String::from("filesystems"),
+                String::from("loadavg"),
             ],
             "procfs: /proc readdir order"
         );
@@ -1654,7 +1658,15 @@ mod procfs_tests {
         // it carry real, distinct, path-stable inodes, so `getdents64` and `stat`
         // cannot disagree about a file's identity.
         let mut seen_inos: Vec<u64> = Vec::new();
-        for name in ["cpuinfo", "meminfo", "uptime", "stat"] {
+        for name in [
+            "cpuinfo",
+            "meminfo",
+            "uptime",
+            "stat",
+            "version",
+            "filesystems",
+            "loadavg",
+        ] {
             let node = match proc_dir.lookup(name) {
                 Ok(n) => n,
                 Err(_) => {
@@ -1743,6 +1755,123 @@ mod procfs_tests {
             "procfs: /proc/uptime seconds track the tick clock"
         );
         assert_eq_kernel!(idle_field, "0.00", "procfs: idle field is 0.00");
+
+        // ── /proc/version, /proc/filesystems, /proc/loadavg (slice 3) ────────
+        // The version is this crate's real version, not a Linux release string.
+        let version = read_path("/proc/version");
+        let version_text = core::str::from_utf8(&version).unwrap_or("");
+        assert_kernel!(
+            version_text.starts_with("pagh "),
+            "procfs: /proc/version starts with the kernel name"
+        );
+        assert_kernel!(
+            version_text.contains(env!("CARGO_PKG_VERSION")),
+            "procfs: /proc/version carries the real crate version"
+        );
+        assert_kernel!(
+            version_text.ends_with(" (x86_64) #1 SMP\n"),
+            "procfs: /proc/version has the documented machine/build tail"
+        );
+        assert_eq_kernel!(
+            version_text.lines().count(),
+            1,
+            "procfs: /proc/version is one line"
+        );
+
+        // Only implemented drivers: proc, ramfs, ext2 — the VFS modules.
+        let filesystems = read_path("/proc/filesystems");
+        let filesystems_text = core::str::from_utf8(&filesystems).unwrap_or("");
+        assert_eq_kernel!(
+            filesystems_text.lines().count(),
+            3,
+            "procfs: /proc/filesystems lists the three implemented drivers"
+        );
+        for row in ["nodev\tproc\n", "nodev\tramfs\n", "\text2\n"] {
+            assert_kernel!(
+                filesystems_text.contains(row),
+                "procfs: /proc/filesystems has the documented row"
+            );
+        }
+
+        // Three honest zero averages, then live scheduler counts and the last
+        // allocated pid.
+        let loadavg = read_path("/proc/loadavg");
+        let loadavg_text = core::str::from_utf8(&loadavg).unwrap_or("");
+        let fields: Vec<&str> = loadavg_text.trim_end_matches('\n').split(' ').collect();
+        assert_eq_kernel!(fields.len(), 5, "procfs: /proc/loadavg has five fields");
+        for field in &fields[..3] {
+            assert_eq_kernel!(*field, "0.00", "procfs: load average is honestly 0.00");
+        }
+        let pair: Vec<&str> = fields[3].split('/').collect();
+        assert_eq_kernel!(pair.len(), 2, "procfs: loadavg runnable/total shape");
+        let runnable = pair[0].parse::<u64>().unwrap_or(0);
+        let total = pair[1].parse::<u64>().unwrap_or(0);
+        assert_kernel!(
+            runnable >= 1,
+            "procfs: the running task is counted as runnable"
+        );
+        assert_kernel!(
+            total >= runnable,
+            "procfs: runnable/total is a live scheduler count"
+        );
+        let last_pid = fields[4].parse::<u64>().unwrap_or(0);
+        assert_kernel!(last_pid > 0, "procfs: last_pid is a real allocated pid");
+        assert_kernel!(
+            last_pid >= crate::task::scheduler::current_pid(),
+            "procfs: last_pid is at least the running pid"
+        );
+
+        // ── /proc/sys: the read-only sysctl stubs ────────────────────────────
+        let sys_dir = match vfs::lookup_path("/proc/sys") {
+            Ok(n) => n,
+            Err(_) => {
+                assert_kernel!(false, "procfs: /proc/sys must exist");
+                return;
+            }
+        };
+        assert_kernel!(sys_dir.is_directory(), "procfs: /proc/sys is a directory");
+        assert_eq_kernel!(
+            names(&sys_dir),
+            alloc::vec![String::from("kernel")],
+            "procfs: /proc/sys readdir"
+        );
+        let kernel_dir = match sys_dir.lookup("kernel") {
+            Ok(n) => n,
+            Err(_) => {
+                assert_kernel!(false, "procfs: /proc/sys/kernel must exist");
+                return;
+            }
+        };
+        assert_kernel!(
+            kernel_dir.is_directory(),
+            "procfs: /proc/sys/kernel is a directory"
+        );
+        assert_eq_kernel!(
+            names(&kernel_dir),
+            alloc::vec![
+                String::from("ostype"),
+                String::from("osrelease"),
+                String::from("hostname"),
+            ],
+            "procfs: /proc/sys/kernel readdir"
+        );
+        assert_eq_kernel!(
+            read_path("/proc/sys/kernel/ostype"),
+            b"Pagh\n".to_vec(),
+            "procfs: /proc/sys/kernel/ostype is the kernel name"
+        );
+        let mut want_release = Vec::from(env!("CARGO_PKG_VERSION").as_bytes());
+        want_release.push(b'\n');
+        assert_eq_kernel!(
+            read_path("/proc/sys/kernel/osrelease"),
+            want_release,
+            "procfs: /proc/sys/kernel/osrelease is the real version"
+        );
+        assert_eq_kernel!(
+            read_path("/proc/sys/kernel/hostname"),
+            b"pagh\n".to_vec(),
+            "procfs: /proc/sys/kernel/hostname mirrors uname's nodename"
+        );
 
         // ── /proc/stat: real tick accounting, Linux shape, no catch-all ──────
         // Two reads separated by one second of ticks: every bucket is monotonic
@@ -1873,16 +2002,22 @@ mod procfs_tests {
         );
 
         // ── the ENOENT matrix: no wildcard, no invented files ────────────────
-        // `/proc/stat` is now a real node; `/proc/self/stat` belongs to the
-        // deferred per-pid family and must stay ENOENT (as must `/proc/1`).
+        // `/proc/version`, `/proc/filesystems`, `/proc/loadavg` and
+        // `/proc/sys/kernel/*` are real nodes now; the per-pid family, the mount
+        // table and unknown sysctl names must still be ENOENT (no catch-all).
         for path in [
             "/proc/1",
             "/proc/1234",
             "/proc/self/fd",
             "/proc/self/stat",
-            "/proc/version",
+            "/proc/mounts",
+            "/proc/devices",
+            "/proc/version/child",
             "/proc/stat/child",
             "/proc/cpuinfo/child",
+            "/proc/sys/kernel/nonexistent",
+            "/proc/sys/kernel/ostype/child",
+            "/proc/sys/nonexistent",
             "/proc/nonexistent",
         ] {
             assert_kernel!(

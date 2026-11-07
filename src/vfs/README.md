@@ -4,10 +4,10 @@
 `/tmp` и загрузчик ELF64 (нативные и Linux-бинари). Инициализация — `vfs::init()` из `boot.rs`,
 затем `boot.rs` подключает ext2-корень: `vfs::mount_at("/mnt", root)`.
 
-Синтетический `/proc` (issue #11) реализован: контракт — пути, байтовые форматы файлов,
-семантика `lstat`/`readdir`/`getdents64`/`readlink`, список отложенного — зафиксирован в
-**`docs/procfs.md`**, он же приёмка. Отложены `/proc/<pid>`, `/proc/loadavg`,
-`/proc/mounts`, `/proc/self/fd` (все дают `ENOENT`).
+Синтетический `/proc` (issue #11) реализован в трёх срезах: контракт — пути, байтовые
+форматы файлов, семантика `lstat`/`readdir`/`getdents64`/`readlink`, список отложенного —
+зафиксирован в **`docs/procfs.md`**, он же приёмка. Отложены `/proc/<pid>`,
+`/proc/mounts`, `/proc/self/{fd,stat,statm}` (все дают `ENOENT`).
 
 ## Файлы
 
@@ -15,8 +15,8 @@
 |---|---|
 | `mod.rs` | Ядро VFS: трейт `VfsNode`, `VfsError`, `FsStat`, резолв путей (`lookup_path`), монтирование (`mount_at`/`MountNode`), синтетический `/dev` (`NullDevice`, `SerialDevice`, `DevDirectory`), корень (`RootDirectory`), `init()` |
 | `ramfs.rs` | In-memory ФС для `/tmp`; единственная in-memory-ФС с настоящими `create_dir`/`create_file`/`remove` (на диске то же умеет ext2-каталог под `/mnt`) |
-| `procfs.rs` | Синтетический `/proc`: узлы `ProcDir`/`ProcFile`, ленивый рендер текста на `size()`/`read()`, источники — PMM/heap/тики/`CompatState`/CPUID. Kernel-only |
-| `procfs_format.rs` | Чистое (`core`+`alloc`) форматирование текстов procfs, таблица путей и inode'ов — включается в host-tests (свойства `procfs_*`) |
+| `procfs.rs` | Синтетический `/proc`: узлы `ProcDir`/`ProcFile`, ленивый рендер текста на `size()`/`read()`, источники — PMM/heap/тики/счётчики планировщика/`CompatState`/CPUID. Kernel-only |
+| `procfs_format.rs` | Чистое (`core`+`alloc`) форматирование текстов procfs (включая `/proc/version`, `/proc/filesystems`, `/proc/loadavg`, `/proc/sys/kernel/*`), таблица путей и inode'ов — включается в host-tests (свойства `procfs_*`) |
 | `elf.rs` | Эффектный загрузчик ELF64: `ElfLoader::load` (нативный `ET_EXEC`), `ElfLoader::load_linux` (`ET_EXEC`, static-PIE `ET_DYN` и glibc-dynamic образы — `PT_INTERP` подшивается отдельно через `map_interpreter`), `ElfLoader::map_interpreter`; `ElfProcess` |
 | `elf_classify.rs` | Чистый core-only классификатор ELF (`classify_elf`, `ElfKind`, `ElfVerdict`) и выбор bias для static-PIE (`choose_bias`, `PIE_BASE`); включается в host-tests |
 | `link_walk.rs` | Чистый (`core`+`alloc`, self-contained) резолвер симлинков (issue #18): компонентный обход, стек `..`, относительные/абсолютные цели, бюджет `SYMLOOP_MAX=40`, `MAX_EXPANDED_BYTES`; host-свойства `link_walk_paths` (включая сравнение с независимым оракулом) |
@@ -67,9 +67,10 @@
 - `/tmp` появился из-за nvim: `vim_mktempdir` делает `mkdir("/tmp/nvim.XXXXXX")`.
 
 ### procfs (issue #11 — контракт `docs/procfs.md`)
-- Первый срез: `/proc` + `/proc/self` + `self/{exe,cmdline,status,maps}` +
-  `{cpuinfo,meminfo,uptime,stat}`. `/proc/<pid>` отложен (
-  честного учёта user/sys/idle в тике планировщика).
+- Срезы 1–3: `/proc` + `/proc/self` + `self/{exe,cmdline,status,maps}` +
+  `{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg}` + read-only
+  `/proc/sys/kernel/{ostype,osrelease,hostname}`. `/proc/<pid>` и `/proc/mounts` отложены:
+  для них нужны pid-keyed snapshot чужого `CompatState` и реестр монтирований.
 - Монтируется из `vfs::init()` (не из `boot::init_fs`): `/proc` обязан работать даже когда
   ext2 отказан `format_policy`. Готовые источники к этому моменту — PMM, heap, тик-клок;
   при монтировании не рендерится ничего.
@@ -85,6 +86,20 @@
 - `/proc/self` невидим (ENOENT) для задачи без `CompatState` — kernel-side `cat` поэтому
   получает ENOENT, а не выдуманное содержимое.
 - Неизвестный `/proc`-путь — всегда `NotFound` → `ENOENT`; никакого catch-all.
+- `/proc/version` — `pagh <CARGO_PKG_VERSION> (x86_64) #1 SMP\n`: реальная версия
+  крейта (`env!("CARGO_PKG_VERSION")`), а не поддельная Linux-строка. `#1 SMP` —
+  фиксированный build-тег формы; ядро однопроцессорное и SMP не заявляет.
+- `/proc/filesystems` — только реально реализованные драйверы: `nodev\tproc`,
+  `nodev\tramfs`, `\text2`. Это статическая таблица (`procfs_format::FILESYSTEMS`),
+  а не wildcard; новый драйвер обязан добавить строку в тот же коммит.
+- `/proc/loadavg` — `0.00 0.00 0.00 <runnable>/<total> <last_pid>\n`. Средние
+  честно нулевые (учёта загрузки нет; libuv падает обратно на `sysinfo(2)`, где
+  `loads = [0;3]`), `runnable/total` — живые счётчики планировщика (ready+running
+  против ready+running+parked), `last_pid` — последний выданный pid (`0` до
+  первого). Доступ — `scheduler::loadavg_counts()`.
+- `/proc/sys/kernel/{ostype,osrelease,hostname}` (+ каталоги `/proc/sys`,
+  `/proc/sys/kernel`) — read-only константы: `Pagh`, реальная версия, `pagh`
+  (совпадает с `uname(2).nodename`). Записываемого sysctl нет, wildcard нет.
 - `/proc/self/exe` — первый узел с `is_symlink() == true`: `readlink` отдаёт путь образа,
   `lstat` — `S_IFLNK|0777` с длиной цели, `open`/`stat` следуют по ссылке (общий резолвер
   `lookup_path_walk`, `SYMLOOP_MAX = 40` → `ELOOP`), а `getdents64` помечает запись `DT_LNK`.
@@ -92,8 +107,8 @@
   FNV-inode имени `proc`; inode'ы детей — из фиксированной таблицы (`PROC_INO_BASE`),
   выше ramfs-диапазона и с нулевым старшим битом (он занят `synth_ino`).
 - Тесты: `procfs_format.rs` покрыт host-свойствами (`procfs_meminfo`/`procfs_cpuinfo`/
-  `procfs_status`/`procfs_cmdline`/`procfs_maps`), дерево и тексты — in-QEMU рутином
-  `procfs::tree, rendered files and ENOENT matrix` в `src/test.rs`.
+  `procfs_status`/`procfs_cmdline`/`procfs_maps`/`procfs_misc`), дерево и тексты — in-QEMU
+  рутином `procfs::tree, rendered files and ENOENT matrix` в `src/test.rs`.
 
 ### Симлинки и обход путей (issue #18, контракт `EXT2-LINKS.md` §4/§7)
 - Трейт расширен аддитивно: `is_symlink()`, `read_link() -> Option<String>`, `nlink()`,

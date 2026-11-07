@@ -231,8 +231,8 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.9.1**
-  (the credentials/permissions minor bump; it lands on `main` with the merge).
+  be reflected here. **`main` currently reads 2.10.0**
+  (the procfs slice 3 minor bump; it lands on `main` with the merge).
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
   `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real
@@ -260,7 +260,12 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   buffer and flushed with it (the shadow-buffer commit had left it drawn *after*
   the flush, so it never reached the device), while an idle shell skips the
   overlay/repaint cycle instead of copying the surface once per timer tick.
-  **2.9.1** = the memory-docs truth pass: the fixed 512 MiB heap and the
+  **2.10.0** = the procfs slice 3: `/proc/version` (`pagh <version> (x86_64) #1 SMP`,
+  the real crate version, not a fake Linux release), `/proc/filesystems` (only the
+  implemented `proc`/`ramfs`/`ext2` drivers), `/proc/loadavg` (honest `0.00` load
+  averages plus live runnable/total scheduler counts and the last allocated pid) and
+  read-only `/proc/sys/kernel/{ostype,osrelease,hostname}`; host properties and
+  in-QEMU checks. **2.9.1** = the memory-docs truth pass: the fixed 512 MiB heap and the
   `MAX_INDEX_*` clean-failure policy are recorded with the exact constants,
   `fork_user_space_cow`'s active-CR3/TLB contract is a debug assertion rather
   than a comment, and the stale layout.rs `dead_code` note is gone (migration
@@ -293,14 +298,16 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
 ## Known open gaps (good first issues, all documented in-code)
 
 
-- procfs covers slices 1 and 2 (issue #11, contract `docs/procfs.md`):
-  `/proc/{cpuinfo,meminfo,uptime,stat}` and `/proc/self/{exe,cmdline,status,maps}`
-  are rendered from live kernel state (CPUID, PMM counters, the tick clock, the
-  scheduler's user/system/idle tick accounting, the calling process's
-  `CompatState`), and `/proc/self/exe` is a real symlink for
-  `readlink`/`lstat`/`getdents64`. Deferred, and returning `ENOENT` today:
-  `/proc/<pid>` enumeration, `/proc/loadavg`, `/proc/mounts`, `/proc/self/{fd,stat,statm}` — so
-  `htop`/`ps` are still out of reach.
+- procfs covers slices 1–3 (issue #11, contract `docs/procfs.md`):
+  `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg}` and
+  `/proc/self/{exe,cmdline,status,maps}` are rendered from live kernel state
+  (CPUID, PMM counters, the tick clock, the scheduler's user/system/idle tick
+  accounting and live task counts, the calling process's `CompatState`);
+  `/proc/self/exe` is a real symlink for `readlink`/`lstat`/`getdents64`, and
+  the read-only `/proc/sys/kernel/{ostype,osrelease,hostname}` stubs exist.
+  Deferred, and returning `ENOENT` today: `/proc/<pid>` enumeration,
+  `/proc/mounts`, `/proc/self/{fd,stat,statm}` — so `htop`/`ps` are still out
+  of reach.
 - Signals (issue #12): `kill(2)` (nr 62), process-group addressing
   (`kill(0|-1|-pgid)`), `SIGSTOP`/`SIGCONT` scheduling, `wait4(WUNTRACED|WCONTINUED)`
   and timer-tick delivery to a syscall-free task are all implemented. Still missing:

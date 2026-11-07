@@ -11,7 +11,7 @@
 use crate::io::guest_path_keeps_root;
 use crate::procfs_format::{
     format_maps, MapsRegion, PROC_FILES, PROC_INO_BASE, PROC_ROOT_ORDER, PROC_SELF_FILES,
-    PROT_EXEC, PROT_READ, PROT_WRITE,
+    PROC_SYS_FILES, PROT_EXEC, PROT_READ, PROT_WRITE,
 };
 use proptest::prelude::*;
 
@@ -217,15 +217,37 @@ fn overlapping_regions_are_merged() {
 fn procfs_table_is_stable_and_unique() {
     assert_eq!(
         PROC_ROOT_ORDER,
-        ["self", "cpuinfo", "meminfo", "uptime", "stat"]
+        [
+            "self",
+            "sys",
+            "cpuinfo",
+            "meminfo",
+            "uptime",
+            "stat",
+            "version",
+            "filesystems",
+            "loadavg",
+        ]
     );
     assert_eq!(
         PROC_FILES.iter().map(|e| e.name).collect::<Vec<_>>(),
-        ["cpuinfo", "meminfo", "uptime", "stat"]
+        [
+            "cpuinfo",
+            "meminfo",
+            "uptime",
+            "stat",
+            "version",
+            "filesystems",
+            "loadavg",
+        ]
     );
     assert_eq!(
         PROC_SELF_FILES.iter().map(|e| e.name).collect::<Vec<_>>(),
         ["exe", "cmdline", "status", "maps"]
+    );
+    assert_eq!(
+        PROC_SYS_FILES.iter().map(|e| e.name).collect::<Vec<_>>(),
+        ["ostype", "osrelease", "hostname"]
     );
     assert_eq!(
         crate::procfs_format::proc_file("cpuinfo").unwrap().ino,
@@ -236,17 +258,44 @@ fn procfs_table_is_stable_and_unique() {
         PROC_INO_BASE + 9,
         "/proc/stat is a real node with its own stable inode (slice 2)"
     );
+    assert_eq!(
+        crate::procfs_format::proc_file("version").unwrap().ino,
+        PROC_INO_BASE + 15,
+        "/proc/version is a real node with its own stable inode (slice 3)"
+    );
+    assert_eq!(
+        crate::procfs_format::proc_file("filesystems").unwrap().ino,
+        PROC_INO_BASE + 16
+    );
+    assert_eq!(
+        crate::procfs_format::proc_file("loadavg").unwrap().ino,
+        PROC_INO_BASE + 17
+    );
+    assert_eq!(
+        crate::procfs_format::proc_sys_file("hostname").unwrap().ino,
+        PROC_INO_BASE + 14
+    );
     // The per-pid family and other deferred paths stay absent from the table:
     // `ProcDir::lookup` then returns NotFound, never a wildcard.
     assert!(crate::procfs_format::proc_file("1").is_none());
     assert!(crate::procfs_format::proc_file("statm").is_none());
+    assert!(crate::procfs_format::proc_file("mounts").is_none());
+    assert!(crate::procfs_format::proc_file("devices").is_none());
     assert!(crate::procfs_format::proc_self_file("fd").is_none());
     assert!(crate::procfs_format::proc_self_file("stat").is_none());
     assert!(crate::procfs_format::proc_self_file("status/x").is_none());
     assert!(crate::procfs_format::proc_self_file("").is_none());
+    assert!(crate::procfs_format::proc_sys_file("kernel").is_none());
+    assert!(crate::procfs_format::proc_sys_file("random").is_none());
+    assert!(crate::procfs_format::proc_sys_file("").is_none());
 
     let mut inos: Vec<u64> = Vec::new();
-    for e in PROC_FILES.iter().chain(PROC_SELF_FILES.iter()).copied() {
+    for e in PROC_FILES
+        .iter()
+        .chain(PROC_SELF_FILES.iter())
+        .chain(PROC_SYS_FILES.iter())
+        .copied()
+    {
         assert!(
             e.ino & (1 << 63) == 0,
             "{} must stay below the FNV range",

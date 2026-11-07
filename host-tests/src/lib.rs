@@ -408,12 +408,15 @@ mod properties {
     // truthfulness of the `flags` line against the CPUID bits; uptime arithmetic
     // and the `status` key set/formats; the NUL-joined `cmdline` byte fidelity;
     // and the `maps` line/ordering plus the path-inode table and chroot
-    // predicate. Named rather than numbered because the numeric namespace is
-    // shared with the other issue streams.
+    // predicate; slice 3 (`procfs_misc`) pins `/proc/version`, `/proc/filesystems`,
+    // `/proc/loadavg` and the `/proc/sys/kernel/*` constants. Named rather than
+    // numbered because the numeric namespace is shared with the other issue
+    // streams.
     mod procfs_cmdline;
     mod procfs_cpuinfo;
     mod procfs_maps;
     mod procfs_meminfo;
+    mod procfs_misc;
     mod procfs_stat;
     mod procfs_status;
 
