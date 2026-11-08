@@ -184,3 +184,14 @@ proptest! {
 fn cgroup_is_root_v2_line() {
     assert_eq!(crate::procfs_format::format_cgroup(), b"0::/\n".to_vec());
 }
+
+
+#[test]
+fn mountinfo_is_linux_shaped() {
+    let out = crate::procfs_format::format_mountinfo(&[("/", "rootfs"), ("/mnt", "ext2")]);
+    let text = core::str::from_utf8(&out).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], "1 1 0:0 / / rw - rootfs rootfs rw");
+    assert_eq!(lines[1], "2 1 0:0 / /mnt rw - ext2 ext2 rw");
+}

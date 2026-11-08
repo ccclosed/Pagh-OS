@@ -447,6 +447,18 @@ impl ProcFile {
             ProcKind::SysOsrelease => fmt::format_sys_osrelease(KERNEL_VERSION),
             ProcKind::SysHostname => fmt::format_sys_hostname(),
             ProcKind::SelfCgroup | ProcKind::PidCgroup => fmt::format_cgroup(),
+            ProcKind::SelfMountInfo | ProcKind::PidMountInfo => {
+                let snapshot = crate::vfs::mount_snapshot();
+                let owned: Vec<(String, &'static str)> = snapshot
+                    .into_iter()
+                    .map(|entry| (entry.point, entry.fs))
+                    .collect();
+                let refs: Vec<(&str, &str)> = owned
+                    .iter()
+                    .map(|(point, fs)| (point.as_str(), *fs))
+                    .collect();
+                fmt::format_mountinfo(&refs)
+            }
             ProcKind::Mounts | ProcKind::SelfMounts => {
                 let snapshot = crate::vfs::mount_snapshot();
                 let owned: Vec<(String, &'static str)> = snapshot

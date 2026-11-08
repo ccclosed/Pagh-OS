@@ -90,6 +90,10 @@ pub enum ProcKind {
     SelfCgroup,
     /// `/proc/<pid>/cgroup`.
     PidCgroup,
+    /// `/proc/self/mountinfo`.
+    SelfMountInfo,
+    /// `/proc/<pid>/mountinfo`.
+    PidMountInfo,
     /// `/proc/sys/kernel/ostype`.
     SysOstype,
     /// `/proc/sys/kernel/osrelease`.
@@ -184,7 +188,7 @@ pub const PROC_SYS_FILES: [ProcEntry; 3] = [
 /// pid-derived identity below instead; the two paths describe the same state but
 /// are distinct VFS nodes (this `self` is a directory, not a symlink to the pid
 /// directory).
-pub const PROC_SELF_FILES: [ProcEntry; 8] = [
+pub const PROC_SELF_FILES: [ProcEntry; 9] = [
     ProcEntry {
         name: "exe",
         ino: PROC_INO_BASE + 2,
@@ -224,6 +228,11 @@ pub const PROC_SELF_FILES: [ProcEntry; 8] = [
         name: "cgroup",
         ino: PROC_INO_BASE + 20,
         kind: ProcKind::SelfCgroup,
+    },
+    ProcEntry {
+        name: "mountinfo",
+        ino: PROC_INO_BASE + 21,
+        kind: ProcKind::SelfMountInfo,
     },
 ];
 
@@ -279,7 +288,7 @@ pub struct ProcPidEntry {
 }
 
 /// The files under every `/proc/<pid>` directory, in `readdir` order.
-pub const PROC_PID_FILES: [ProcPidEntry; 5] = [
+pub const PROC_PID_FILES: [ProcPidEntry; 6] = [
     ProcPidEntry {
         name: "cmdline",
         slot: 1,
@@ -305,10 +314,15 @@ pub const PROC_PID_FILES: [ProcPidEntry; 5] = [
         slot: 5,
         kind: ProcKind::PidCgroup,
     },
+    ProcPidEntry {
+        name: "mountinfo",
+        slot: 6,
+        kind: ProcKind::PidMountInfo,
+    },
 ];
 
 /// `readdir` order of `/proc/<pid>`.
-pub const PROC_PID_ORDER: [&str; 5] = ["cmdline", "stat", "status", "maps", "cgroup"];
+pub const PROC_PID_ORDER: [&str; 6] = ["cmdline", "stat", "status", "maps", "cgroup", "mountinfo"];
 
 /// Look up a `/proc/<pid>` file by name.
 pub fn proc_pid_file(name: &str) -> Option<ProcPidEntry> {
@@ -426,6 +440,25 @@ pub fn format_uptime(ticks: u64, tick_hz: u64) -> Vec<u8> {
 /// Linux field order: `device mount_point fstype options dump pass`. pagh has no
 /// per-mount options and no separate block devices, so the device field is the
 /// mount point itself, options are `rw`, and dump/pass are `0 0`.
+/// Format `/proc/*/mountinfo` (Linux's 36-field mountinfo subset).
+///
+/// pagh has no separate block devices and no per-mount option strings, so the
+/// optional-fields section is empty (`-`), major:minor is `0:0`, root is `/`,
+/// and both options and super-options are `rw`. IDs are assigned in sorted
+/// mount-point order; the root is its own parent, everything else has parent 1.
+pub fn format_mountinfo(mounts: &[(&str, &str)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (index, (point, fs)) in mounts.iter().enumerate() {
+        let id = index + 1;
+        let parent = if index == 0 { id } else { 1 };
+        push(
+            &mut out,
+            format_args!("{id} {parent} 0:0 / {} rw - {} {} rw\n", point, fs, fs),
+        );
+    }
+    out
+}
+
 pub fn format_mounts(mounts: &[(&str, &str)]) -> Vec<u8> {
     let mut out = Vec::new();
     for (point, fs) in mounts {
