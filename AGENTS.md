@@ -300,16 +300,15 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
 ## Known open gaps (good first issues, all documented in-code)
 
 
-- procfs covers slices 1–3 (issue #11, contract `docs/procfs.md`):
-  `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg}` and
-  `/proc/self/{exe,cmdline,status,maps}` are rendered from live kernel state
-  (CPUID, PMM counters, the tick clock, the scheduler's user/system/idle tick
-  accounting and live task counts, the calling process's `CompatState`);
-  `/proc/self/exe` is a real symlink for `readlink`/`lstat`/`getdents64`, and
-  the read-only `/proc/sys/kernel/{ostype,osrelease,hostname}` stubs exist.
-  Deferred, and returning `ENOENT` today: `/proc/<pid>` enumeration,
-  `/proc/mounts`, `/proc/self/{fd,stat,statm}` — so `htop`/`ps` are still out
-  of reach.
+- procfs covers slices 1–4 (issue #11, contract `docs/procfs.md`):
+  `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg}`,
+  `/proc/<pid>/{cmdline,stat,status,maps}`, `/proc/self/{exe,cmdline,status,maps,stat,statm}`
+  and read-only `/proc/sys/kernel/{ostype,osrelease,hostname}` are rendered from
+  live kernel state (CPUID, PMM counters, the tick clock, the scheduler's
+  user/system/idle tick accounting and live task counts, and the target
+  process's `CompatState` snapshot). Deferred, returning `ENOENT` today:
+  `/proc/mounts`, `/proc/self/{fd,cgroup}` — `ps` works from `/proc/<pid>`, but
+  `htop` still wants the mount table.
 - Signals (issue #12): `kill(2)` (nr 62), process-group addressing
   (`kill(0|-1|-pgid)`), `SIGSTOP`/`SIGCONT` scheduling, `wait4(WUNTRACED|WCONTINUED)`
   and timer-tick delivery to a syscall-free task are all implemented. Still missing:
