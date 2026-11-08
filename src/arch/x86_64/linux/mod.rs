@@ -139,7 +139,13 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         // The wall clock is read-only here (ticks-derived); setting it is EPERM.
         sysno::CLOCK_SETTIME => Err(crate::arch::x86_64::linux::errno::Errno::EPERM),
         sysno::EVENTFD2 => epoll_sys::sys_eventfd2(a[0], a[1]),
+        sysno::EVENTFD => epoll_sys::sys_eventfd2(a[0], 0),
         sysno::EPOLL_CREATE1 => epoll_sys::sys_epoll_create1(a[0]),
+        sysno::EPOLL_CREATE => epoll_sys::sys_epoll_create1(0),
+        sysno::SCHED_SETAFFINITY => misc::sys_sched_setaffinity(a[0], a[1], a[2]),
+        sysno::SCHED_GETAFFINITY => misc::sys_sched_getaffinity(a[0], a[1], a[2]),
+        sysno::GETCPU => misc::sys_getcpu(a[0], a[1], a[2]),
+        sysno::FADVISE64 => misc::sys_fadvise64(a[0], a[1], a[2], a[3]),
         sysno::EPOLL_CTL => epoll_sys::sys_epoll_ctl(a[0], a[1], a[2], a[3]),
         sysno::EPOLL_WAIT => epoll_sys::sys_epoll_wait(a[0], a[1], a[2], a[3]),
         sysno::PIPE => io_sys::sys_pipe(a[0]),

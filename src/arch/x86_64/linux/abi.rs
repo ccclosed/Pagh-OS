@@ -115,6 +115,18 @@ pub mod nr {
     pub const SENDFILE: u64 = 40;
     /// `copy_file_range` (326) — copy a byte range between two regular files.
     pub const COPY_FILE_RANGE: u64 = 326;
+    /// `sched_setaffinity` (203) — single-CPU mask.
+    pub const SCHED_SETAFFINITY: u64 = 203;
+    /// `sched_getaffinity` (204) — single-CPU mask.
+    pub const SCHED_GETAFFINITY: u64 = 204;
+    /// `epoll_create` (213) — legacy size argument, same object as create1.
+    pub const EPOLL_CREATE: u64 = 213;
+    /// `fadvise64` (221) — advisory only.
+    pub const FADVISE64: u64 = 221;
+    /// `eventfd` (284) — legacy flags-less eventfd.
+    pub const EVENTFD: u64 = 284;
+    /// `getcpu` (309) — the single CPU and NUMA node.
+    pub const GETCPU: u64 = 309;
     pub const PIPE: u64 = 22;
     /// `sched_yield` — yield the CPU.
     pub const SCHED_YIELD: u64 = 24;
@@ -314,7 +326,7 @@ pub fn marshal_args(
 /// History note: the previous test asserted membership for only 69 of the 109
 /// numbers the gate accepted and never asserted that anything was *unsupported*,
 /// so it could not catch either class of drift.
-pub const SUPPORTED_SYSCALLS: [u64; 128] = [
+pub const SUPPORTED_SYSCALLS: [u64; 134] = [
     nr::READ,
     nr::WRITE,
     nr::OPEN,
@@ -406,8 +418,12 @@ pub const SUPPORTED_SYSCALLS: [u64; 128] = [
     nr::GETTID,
     nr::TIME,
     nr::FUTEX,
+    nr::SCHED_SETAFFINITY,
+    nr::SCHED_GETAFFINITY,
+    nr::EPOLL_CREATE,
     nr::GETDENTS64,
     nr::SET_TID_ADDRESS,
+    nr::FADVISE64,
     nr::CLOCK_SETTIME,
     nr::CLOCK_GETTIME,
     nr::CLOCK_GETRES,
@@ -430,6 +446,7 @@ pub const SUPPORTED_SYSCALLS: [u64; 128] = [
     nr::SET_ROBUST_LIST,
     nr::GET_ROBUST_LIST,
     nr::EPOLL_PWAIT,
+    nr::EVENTFD,
     nr::ACCEPT4,
     nr::EVENTFD2,
     nr::EPOLL_CREATE1,
@@ -438,6 +455,7 @@ pub const SUPPORTED_SYSCALLS: [u64; 128] = [
     nr::PREADV,
     nr::PWRITEV,
     nr::PRLIMIT64,
+    nr::GETCPU,
     nr::RENAMEAT2,
     nr::GETRANDOM,
     nr::COPY_FILE_RANGE,
@@ -493,14 +511,14 @@ mod tests {
     fn supported_set_is_exact() {
         // Independent enumeration: the Linux x86_64 syscall numbers with a real
         // dispatcher arm, in ascending order (keep it sorted!).
-        const EXPECTED: [u64; 128] = [
+        const EXPECTED: [u64; 134] = [
             0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
             28, 32, 33, 35, 39, 40, 41, 42, 43, 44, 45, 49, 50, 51, 53, 54, 55, 56, 59, 60, 61, 62,
             63, 72, 73, 74, 75, 79, 80, 81, 82, 83, 84, 87, 89, 90, 91, 92, 93, 95, 96, 97, 99,
             102, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 117, 118, 119, 120, 121,
-            131, 137, 138, 158, 186, 201, 202, 217, 218, 227, 228, 229, 230, 231, 232, 233, 234,
-            257, 258, 260, 262, 263, 264, 267, 268, 269, 270, 271, 273, 274, 281, 288, 290, 291,
-            292, 293, 295, 296, 302, 316, 318, 326, 332, 334,
+            131, 137, 138, 158, 186, 201, 202, 203, 204, 213, 217, 218, 221, 227, 228, 229, 230,
+            231, 232, 233, 234, 257, 258, 260, 262, 263, 264, 267, 268, 269, 270, 271, 273, 274,
+            281, 284, 288, 290, 291, 292, 293, 295, 296, 302, 309, 316, 318, 326, 332, 334,
         ];
 
         // 1. The two independent enumerations agree element-wise, and both are

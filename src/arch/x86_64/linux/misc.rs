@@ -1014,3 +1014,69 @@ pub fn sys_umask(mask: u64) -> Result<u64, Errno> {
 pub fn sys_flock(_fd: u64, _op: u64) -> Result<u64, Errno> {
     Ok(0)
 }
+
+/// Write one `u32` to a validated user pointer.
+fn write_user_u32(ptr: u64, value: u32) -> Result<(), Errno> {
+    check_user_ptr(ptr, 4)?;
+    super::io_sys::copy_out_pub(ptr, &value.to_le_bytes());
+    Ok(())
+}
+
+/// `getcpu` (309): pagh is single-CPU, single-NUMA-node.
+pub fn sys_getcpu(cpu: u64, node: u64, _tcache: u64) -> Result<u64, Errno> {
+    if cpu != 0 {
+        write_user_u32(cpu, 0)?;
+    }
+    if node != 0 {
+        write_user_u32(node, 0)?;
+    }
+    Ok(0)
+}
+
+/// `sched_getaffinity` (204): the affinity mask is always exactly CPU 0.
+///
+/// `pid` must name the caller (`0` or `getpid`); the mask is one 64-bit word, so
+/// `cpusetsize < 8` is `EINVAL`. Returns the bytes written (8), matching Linux's
+/// "bytes copied" convention.
+pub fn sys_sched_getaffinity(pid: u64, cpusetsize: u64, mask: u64) -> Result<u64, Errno> {
+    let me = compat::with_current_compat(|cs| cs.tgid).unwrap_or(0);
+    if pid != 0 && pid != me {
+        return Err(Errno::EINVAL);
+    }
+    if cpusetsize < 8 || mask == 0 {
+        return Err(Errno::EINVAL);
+    }
+    check_user_ptr(mask, 8)?;
+    super::io_sys::copy_out_pub(mask, &1u64.to_le_bytes());
+    Ok(8)
+}
+
+/// `sched_setaffinity` (203): accept only masks that include CPU 0.
+pub fn sys_sched_setaffinity(pid: u64, cpusetsize: u64, mask: u64) -> Result<u64, Errno> {
+    let me = compat::with_current_compat(|cs| cs.tgid).unwrap_or(0);
+    if pid != 0 && pid != me {
+        return Err(Errno::EINVAL);
+    }
+    if cpusetsize < 8 || mask == 0 {
+        return Err(Errno::EINVAL);
+    }
+    check_user_ptr(mask, 8)?;
+    let raw = super::io_sys::copy_in_pub(mask, 8);
+    let bits = u64::from_le_bytes(raw[..8].try_into().unwrap_or([0; 8]));
+    if bits & 1 == 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(0)
+}
+
+/// `fadvise64` (221): advice is advisory; validate the descriptor and accept.
+pub fn sys_fadvise64(fd: u64, _offset: u64, _len: u64, advice: u64) -> Result<u64, Errno> {
+    if advice > 5 {
+        return Err(Errno::EINVAL);
+    }
+    let open = compat::with_current_compat(|cs| cs.fds.get(fd as u32).is_some()).unwrap_or(false);
+    if !open {
+        return Err(Errno::EBADF);
+    }
+    Ok(0)
+}
