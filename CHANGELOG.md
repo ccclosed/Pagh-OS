@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.16.0 — unreleased
+
+- `signalfd` (282) / `signalfd4` (289): a readable fd over the caller's pending
+  signals; `read` consumes one matching pending signal and returns a 128-byte
+  `signalfd_siginfo` with `ssi_signo` (only the signal number is stored, other
+  fields are zero). Poll/select/epoll report `POLLIN` when readable. Updating an
+  existing signalfd replaces its mask; `SFD_NONBLOCK`/`SFD_CLOEXEC` accepted.
+
 ## 2.15.0 — 2026-11-08
 
 Batch release: 15 commits, focused on the Linux compatibility layer and two GUI

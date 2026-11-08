@@ -95,6 +95,8 @@ enum Resolved {
     },
     /// A timerfd instance.
     Timerfd(Arc<crate::sync::spinlock::Spinlock<crate::task::fd::TimerfdState>>),
+    /// A signalfd instance and its mask snapshot.
+    Signalfd(u64),
     /// An eventfd counter.
     Eventfd {
         val: Arc<crate::sync::spinlock::Spinlock<u64>>,
@@ -154,6 +156,7 @@ pub(crate) fn fd_kind(fd: u64) -> &'static str {
         Some(Resolved::Socket { .. }) => "sock",
         Some(Resolved::Eventfd { .. }) => "eventfd",
         Some(Resolved::Timerfd(_)) => "timerfd",
+        Some(Resolved::Signalfd(_)) => "signalfd",
         Some(Resolved::Epoll) => "epoll",
         Some(Resolved::File { .. }) => "file",
     }
@@ -176,6 +179,7 @@ fn resolve_fd(fd: u32) -> Option<Resolved> {
             },
             OpenObject::Dir { .. } => Resolved::Dir,
             OpenObject::Timerfd(state) => Resolved::Timerfd(Arc::clone(state)),
+            OpenObject::Signalfd { mask } => Resolved::Signalfd(*mask.lock()),
             OpenObject::Eventfd { val, semaphore } => Resolved::Eventfd {
                 val: Arc::clone(val),
                 semaphore: *semaphore,
@@ -344,6 +348,9 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         }
         Some(Resolved::Dir) => Err(Errno::EISDIR),
         Some(Resolved::PipeWrite(_)) => Err(Errno::EBADF),
+        Some(Resolved::Signalfd(mask)) => {
+            return super::signalfd::read_signalfd(mask, buf, count);
+        }
         Some(Resolved::Timerfd(state)) => {
             if count < 8 {
                 return Err(Errno::EINVAL);
@@ -601,7 +608,7 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         None => Err(Errno::EBADF),
         Some(Resolved::Stdin) => Err(Errno::EBADF),
         Some(Resolved::Dir) => Err(Errno::EISDIR),
-        Some(Resolved::Timerfd(_)) => Err(Errno::EINVAL),
+        Some(Resolved::Timerfd(_)) | Some(Resolved::Signalfd(_)) => Err(Errno::EINVAL),
         Some(Resolved::Eventfd { val, .. }) => {
             if count < 8 {
                 return Err(Errno::EINVAL);
@@ -1127,9 +1134,10 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> Result<u64, Errno> {
         Some(Resolved::Console) | Some(Resolved::Stdin) => Err(Errno::ESPIPE),
         Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_)) => Err(Errno::ESPIPE),
         Some(Resolved::Socket { .. }) => Err(Errno::ESPIPE),
-        Some(Resolved::Eventfd { .. }) | Some(Resolved::Epoll) | Some(Resolved::Timerfd(_)) => {
-            Err(Errno::ESPIPE)
-        }
+        Some(Resolved::Eventfd { .. })
+        | Some(Resolved::Epoll)
+        | Some(Resolved::Timerfd(_))
+        | Some(Resolved::Signalfd(_)) => Err(Errno::ESPIPE),
         // A directory descriptor supports rewinding/positioning its dents cursor:
         // SEEK_SET sets the cursor index, returning it. Other whences are EINVAL.
         Some(Resolved::Dir) => {
@@ -1455,6 +1463,7 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> Result<u64, Errno> {
         | Some(Resolved::PipeWrite(_))
         | Some(Resolved::Eventfd { .. })
         | Some(Resolved::Timerfd(_))
+        | Some(Resolved::Signalfd(_))
         | Some(Resolved::Epoll) => {
             let stat = encode_stat(0, S_IFCHR | 0o620, 0, 0);
             write_stat_struct(&stat, statbuf);
@@ -2707,6 +2716,7 @@ pub fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Er
         | Some(Resolved::InetUdp(_))
         | Some(Resolved::Eventfd { .. })
         | Some(Resolved::Timerfd(_))
+        | Some(Resolved::Signalfd(_))
         | Some(Resolved::Epoll) => Err(Errno::ESPIPE),
         Some(Resolved::Dir) => Err(Errno::EISDIR),
         Some(Resolved::File { node, .. }) => {
@@ -2750,9 +2760,10 @@ pub fn sys_pwrite64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, E
         Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_)) => Err(Errno::ESPIPE),
         Some(Resolved::Socket { .. }) => Err(Errno::ESPIPE),
         Some(Resolved::InetTcp(_)) | Some(Resolved::InetUdp(_)) => Err(Errno::ESPIPE),
-        Some(Resolved::Eventfd { .. }) | Some(Resolved::Epoll) | Some(Resolved::Timerfd(_)) => {
-            Err(Errno::ESPIPE)
-        }
+        Some(Resolved::Eventfd { .. })
+        | Some(Resolved::Epoll)
+        | Some(Resolved::Timerfd(_))
+        | Some(Resolved::Signalfd(_)) => Err(Errno::ESPIPE),
         Some(Resolved::Dir) => Err(Errno::EISDIR),
         Some(Resolved::Console) => {
             let data = copy_in(buf, count);
@@ -2942,6 +2953,13 @@ fn poll_revents(fd: i32, events: i16) -> i16 {
             }
         }
         Some(Resolved::Console) => events & POLLOUT,
+        Some(Resolved::Signalfd(mask)) => {
+            if crate::task::compat::signalfd_readable(mask) {
+                events & POLLIN
+            } else {
+                0
+            }
+        }
         Some(Resolved::Timerfd(state)) => {
             if state.lock().pending(crate::task::scheduler::ticks()) > 0 {
                 events & POLLIN
@@ -3024,6 +3042,9 @@ fn select_ready(fd: u64, want_write: bool) -> bool {
             } else {
                 rx.read_ready() || rx.peer_closed()
             }
+        }
+        Some(Resolved::Signalfd(mask)) => {
+            !want_write && crate::task::compat::signalfd_readable(mask)
         }
         Some(Resolved::Timerfd(state)) => {
             !want_write && state.lock().pending(crate::task::scheduler::ticks()) > 0

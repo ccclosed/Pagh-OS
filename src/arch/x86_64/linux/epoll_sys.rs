@@ -307,6 +307,13 @@ fn poll_fd(fd: i32, events: u32) -> u32 {
                 }
             }
             Some(OpenObject::UnixSocketUnbound { .. }) => 0,
+            Some(OpenObject::Signalfd { mask }) => {
+                if crate::task::compat::signalfd_readable(*mask.lock()) {
+                    EPOLLIN
+                } else {
+                    0
+                }
+            }
             Some(OpenObject::Timerfd(state)) => {
                 if state.lock().pending(crate::task::scheduler::ticks()) > 0 {
                     EPOLLIN
@@ -364,6 +371,7 @@ pub(super) fn dump_epoll_self(epfd: u32) {
                         Some(OpenObject::UnixListener(_)) => "unix-listener",
                         Some(OpenObject::UnixSocketUnbound { .. }) => "unix-unbound",
                         Some(OpenObject::Timerfd(_)) => "timerfd",
+                        Some(OpenObject::Signalfd { .. }) => "signalfd",
                         Some(OpenObject::Eventfd { .. }) => "eventfd",
                         Some(OpenObject::File { .. }) => "file",
                         Some(OpenObject::Dir { .. }) => "dir",

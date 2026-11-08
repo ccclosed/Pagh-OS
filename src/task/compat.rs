@@ -304,6 +304,28 @@ pub fn finish_compat_exit(pid: u64) {
         notify_parent_sigchld(state.ppid);
     }
 }
+/// Consume one pending signal matching `mask` for signalfd.
+///
+/// Signalfd reads the process's pending set in mask order and clears the bit it
+/// returns, exactly like `read(2)` on a signalfd: the signal is not delivered
+/// through the normal handler path. `None` means nothing matching is pending.
+pub fn take_signalfd_signal(mask: u64) -> Option<u64> {
+    let mut states = COMPAT_STATES.lock();
+    let state = states.get_mut(&crate::task::scheduler::current_pid())?;
+    let matching = state.sig_pending & mask & !state.sig_blocked;
+    if matching == 0 {
+        return None;
+    }
+    let signal = matching.trailing_zeros() as u64 + 1;
+    state.sig_pending &= !(1u64 << (signal - 1));
+    Some(signal)
+}
+
+/// Whether a signalfd with `mask` is readable right now.
+pub fn signalfd_readable(mask: u64) -> bool {
+    with_current_compat(|cs| cs.sig_pending & mask & !cs.sig_blocked != 0).unwrap_or(false)
+}
+
 pub fn current_ppid() -> u64 {
     with_current_compat(|s| s.ppid).unwrap_or(1)
 }

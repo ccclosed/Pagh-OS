@@ -208,6 +208,10 @@ pub enum OpenObject {
     PipeWrite(Arc<PipeEndpoint>),
     /// A `timerfd` instance; state is shared with poll/epoll readers.
     Timerfd(Arc<Spinlock<TimerfdState>>),
+    /// A `signalfd` instance: the mask of signals it consumes.
+    Signalfd {
+        mask: Arc<Spinlock<u64>>,
+    },
     /// An eventfd counter (EFD_SEMAPHORE if semaphore=true).
     Eventfd {
         val: Arc<Spinlock<u64>>,
@@ -276,6 +280,9 @@ impl OpenObject {
                 index: *index,
             },
             OpenObject::Timerfd(state) => OpenObject::Timerfd(Arc::clone(state)),
+            OpenObject::Signalfd { mask } => OpenObject::Signalfd {
+                mask: Arc::clone(mask),
+            },
             OpenObject::Eventfd { val, semaphore } => OpenObject::Eventfd {
                 val: Arc::clone(val),
                 semaphore: *semaphore,
@@ -444,6 +451,7 @@ impl FdTable {
             Some(OpenObject::UnixListener(_)) => "unix-listener",
             Some(OpenObject::UnixSocketUnbound { .. }) => "unix-unbound",
             Some(OpenObject::Timerfd(_)) => "timerfd",
+            Some(OpenObject::Signalfd { .. }) => "signalfd",
             Some(OpenObject::Eventfd { .. }) => "eventfd",
             Some(OpenObject::File { .. }) => "file",
             Some(OpenObject::Dir { .. }) => "dir",

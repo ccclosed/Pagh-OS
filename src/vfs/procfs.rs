@@ -186,6 +186,7 @@ fn fd_target(fd: u32, object: &OpenObject) -> String {
             alloc::format!("socket:[{fd}]")
         }
         OpenObject::Timerfd(_) => String::from("anon_inode:[timerfd]"),
+        OpenObject::Signalfd { .. } => String::from("anon_inode:[signalfd]"),
         OpenObject::Eventfd { .. } => String::from("anon_inode:[eventfd]"),
         OpenObject::Epoll { .. } => String::from("anon_inode:[eventpoll]"),
     }

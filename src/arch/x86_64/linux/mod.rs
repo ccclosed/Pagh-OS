@@ -38,6 +38,7 @@ pub mod process_sys;
 pub mod rtc;
 pub mod signal;
 pub mod signal_frame;
+pub mod signalfd;
 pub mod timerfd;
 pub mod trap_frame;
 pub mod unix_sock;
@@ -144,6 +145,8 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::TIMERFD_CREATE => timerfd::sys_timerfd_create(a[0], a[1]),
         sysno::TIMERFD_SETTIME => timerfd::sys_timerfd_settime(a[0], a[1], a[2], a[3]),
         sysno::TIMERFD_GETTIME => timerfd::sys_timerfd_gettime(a[0], a[1]),
+        sysno::SIGNALFD => signalfd::sys_signalfd(a[0], a[1], a[2]),
+        sysno::SIGNALFD4 => signalfd::sys_signalfd4(a[0], a[1], a[2], a[3]),
         sysno::EPOLL_CREATE1 => epoll_sys::sys_epoll_create1(a[0]),
         sysno::EPOLL_CREATE => epoll_sys::sys_epoll_create1(0),
         sysno::SCHED_SETAFFINITY => misc::sys_sched_setaffinity(a[0], a[1], a[2]),
