@@ -145,6 +145,18 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_pci,
     },
     CommandSpec {
+        name: "df",
+        description: "Show mounted filesystems and capacity",
+        usage: "df",
+        handler: super::commands::cmd_df,
+    },
+    CommandSpec {
+        name: "ps",
+        description: "List compat processes (PID/PPID/STAT/COMMAND)",
+        usage: "ps",
+        handler: super::commands::cmd_ps,
+    },
+    CommandSpec {
         name: "exec",
         description: "Run the embedded user process",
         usage: "exec",

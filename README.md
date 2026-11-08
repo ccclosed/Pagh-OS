@@ -383,6 +383,8 @@ framebuffer (serial stays plain text).
 | `paint`              | Launch the windowed, mouse-driven framebuffer paint app         |
 | `pci`                | List enumerated PCI devices (virtio tagged)                     |
 | `ifconfig`           | Show the network interface (IP, gateway, MAC)                   |
+| `df`                 | Mounted filesystems: 1K blocks, used, available, use%, mount point |
+| `ps`                 | Live compat processes: PID, PPID, STAT, COMMAND (from `/proc/<pid>/*`) |
 | `nc <ip> <port> [t]` | Open a TCP connection and echo a line over it                   |
 | `lxrun <path> […]`   | Load and run a Linux x86_64 ELF (static or glibc) in ring 3    |
 | `pkg <host> <path> [port]` | Download a `.deb` over HTTP(S) and install it under /mnt  |

@@ -1504,3 +1504,88 @@ fn cmd_apt_setmirror(args: &[&str]) {
         );
     }
 }
+
+/// `df`: filesystem capacity from the VFS mount registry.
+///
+/// The header and column layout follow `df -k`; `1K-blocks` is
+/// `blocks_total * block_size / 1024`. Synthetic filesystems (`rootfs`,
+/// `devtmpfs`, `proc`) have no capacity accounting, so their numeric columns
+/// are `-` rather than a made-up zero. `ext2` reports real counts through
+/// `VfsNode::fs_stat`.
+pub(super) fn cmd_df(_ctx: &mut ShellCtx, _args: &[&str]) {
+    shell_println("Filesystem     1K-blocks  Used Available Use% Mounted on");
+    for mount in crate::vfs::mount_snapshot() {
+        let fs = mount.fs;
+        let point = &mount.point;
+        let stats = crate::vfs::lookup_path(point)
+            .ok()
+            .and_then(|node| node.fs_stat());
+        match stats {
+            Some(s) if s.block_size > 0 => {
+                let block_kb = (s.block_size / 1024).max(1);
+                let total = s.blocks_total.saturating_mul(block_kb);
+                let free = s.blocks_free.saturating_mul(block_kb);
+                let used = total.saturating_sub(free);
+                let pct = if total == 0 {
+                    0
+                } else {
+                    used.saturating_mul(100) / total
+                };
+                shell_println(&format!(
+                    "{:<12} {:>9} {:>5} {:>9} {:>3}% {}",
+                    fs, total, used, free, pct, point
+                ));
+            }
+            _ => shell_println(&format!(
+                "{:<12} {:>9} {:>5} {:>9} {:>3}% {}",
+                fs, "-", "-", "-", "-", point
+            )),
+        }
+    }
+}
+
+/// `ps`: the live compat-process table, rendered from `/proc/<pid>/*`.
+///
+/// Header and columns mimic `ps` (`PID PPID STAT COMMAND`), but the state
+/// letter and command name come from the same per-pid procfs nodes a Linux
+/// program would read, so this is also a smoke test of that tree. Threads are
+/// listed individually; `COMMAND` is the basename of argv[0], or `[comm]` when
+/// cmdline is empty.
+pub(super) fn cmd_ps(_ctx: &mut ShellCtx, _args: &[&str]) {
+    shell_println("  PID  PPID STAT COMMAND");
+    let mut pids = crate::task::compat::compat_pid_tgid_snapshot();
+    pids.sort_by_key(|(pid, _tgid)| *pid);
+    for (pid, _tgid) in pids {
+        let mut stat_buf = [0u8; 512];
+        let stat_len = crate::vfs::lookup_path(&format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|node| node.read(0, &mut stat_buf).ok())
+            .unwrap_or(0);
+        let stat = core::str::from_utf8(&stat_buf[..stat_len]).unwrap_or("");
+        let (comm, state, ppid) =
+            if let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) {
+                let comm = &stat[open + 1..close];
+                let mut fields = stat[close + 1..].trim_start().split(' ');
+                (
+                    comm,
+                    fields.next().unwrap_or("?"),
+                    fields.next().unwrap_or("0"),
+                )
+            } else {
+                ("?", "?", "0")
+            };
+        let mut cmdline = [0u8; 256];
+        let cmd_len = crate::vfs::lookup_path(&format!("/proc/{pid}/cmdline"))
+            .ok()
+            .and_then(|node| node.read(0, &mut cmdline).ok())
+            .unwrap_or(0);
+        let argv0 = cmdline[..cmd_len].split(|b| *b == 0).next().unwrap_or(&[]);
+        let command = if argv0.is_empty() {
+            format!("[{comm}]")
+        } else {
+            let text = core::str::from_utf8(argv0).unwrap_or(comm);
+            String::from(text.rsplit('/').next().unwrap_or(text))
+        };
+        shell_println(&format!("{:>5} {:>5} {:>4} {}", pid, ppid, state, command));
+    }
+}
