@@ -363,6 +363,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::RT_SIGPENDING => misc::sys_rt_sigpending(a[0], a[1]),
         sysno::SYNC_FILE_RANGE => misc::sys_sync_file_range(a[0], a[1], a[2], a[3]),
         sysno::FALLOCATE => misc::sys_fallocate(a[0], a[1], a[2], a[3]),
+        sysno::MEMFD_CREATE => io_sys::sys_memfd_create(a[0], a[1]),
         sysno::GETRUSAGE => misc::sys_getrusage(a[0], a[1]),
         sysno::TIMES => misc::sys_times(a[0]),
         // `exit`/`exit_group` diverge (never return); the `!` coerces to the

@@ -35,6 +35,7 @@ use alloc::vec::Vec;
 
 use crate::task::compat;
 use crate::task::fd::{OpenObject, PipeEndpoint, PipeReadResult, PipeWriteResult};
+use crate::vfs::ramfs::RamFile;
 use crate::vfs::{self, VfsNode};
 
 use super::check_user_ptr;
@@ -1901,6 +1902,37 @@ pub fn sys_access(path: u64, mode: u64) -> Result<u64, Errno> {
         }
     }
     Ok(0)
+}
+
+/// `memfd_create` (319): an anonymous RAM-backed file descriptor.
+///
+/// The name is only a label (`/memfd:<name>` for `/proc/.../fd` and debugging);
+/// it creates no VFS name, exactly like Linux. `MFD_CLOEXEC` sets FD_CLOEXEC;
+/// `MFD_ALLOW_SEALING` is accepted (no seals are implemented, so sealing calls
+/// are not exposed); other flags are `EINVAL`. Executing a memfd is not
+/// supported, because `execve` resolves a VFS path.
+pub fn sys_memfd_create(name: u64, flags: u64) -> Result<u64, Errno> {
+    const MFD_CLOEXEC: u64 = 0x0001;
+    const MFD_ALLOW_SEALING: u64 = 0x0002;
+    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let requested = read_user_cstr(name)?;
+    let node = Arc::new(RamFile::new(&alloc::format!("memfd:{requested}"))) as Arc<dyn VfsNode>;
+    let obj = OpenObject::File {
+        node,
+        path: alloc::format!("/memfd:{requested}"),
+        offset: 0,
+    };
+    let fd = compat::with_current_compat(|cs| {
+        let fd = cs.fds.alloc(obj);
+        if flags & MFD_CLOEXEC != 0 {
+            cs.fds.set_cloexec(fd, true);
+        }
+        fd
+    })
+    .ok_or(Errno::EBADF)?;
+    Ok(fd as u64)
 }
 
 /// `mkdir` (83): create a directory on the mounted VFS/ext2 tree.
