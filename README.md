@@ -190,7 +190,7 @@ server certificate chain, hostname and validity checked before a byte of the ind
   waits); a synthetic `procfs` serves
   `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg}`, the read-only
   `/proc/sys/kernel/{ostype,osrelease,hostname}` stubs and
-  `/proc/self/{exe,cmdline,status,maps}` — per-pid entries and `/proc/mounts` are
+  `/proc/self/{exe,cmdline,status,maps}` — per-pid entries are
   still missing, so `htop`/`ps` remain out of reach.
 - **Packages:** a by-name `apt` (`update`/`install`/`show`/`list`/`setmirror`) that fetches
   a Debian `Packages` index over HTTP/HTTPS, streams gzip/xz/zstd decompression into a

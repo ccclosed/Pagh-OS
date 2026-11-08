@@ -409,6 +409,34 @@ static VFS_ROOT: Spinlock<Option<Arc<dyn VfsNode>>> = Spinlock::new(None);
 /// splice into its mutable children without downcasting a `dyn VfsNode`.
 static ROOT_DIR: Spinlock<Option<Arc<RootDirectory>>> = Spinlock::new(None);
 
+/// One entry of the VFS mount table, as `/proc/mounts` reports it.
+#[derive(Clone, Debug)]
+pub struct MountInfo {
+    /// Absolute mount point (`"/"`, `"/mnt"`, `"/proc"`, ...).
+    pub point: alloc::string::String,
+    /// Filesystem driver name shown in field 3 (`rootfs`, `ext2`, `proc`, ...).
+    pub fs: &'static str,
+}
+
+static MOUNTS: Spinlock<Option<Vec<MountInfo>>> = Spinlock::new(None);
+
+fn record_mount(point: &str, fs: &'static str) {
+    let mut mounts = MOUNTS.lock();
+    let table = mounts.get_or_insert_with(Vec::new);
+    table.retain(|entry| entry.point != point);
+    table.push(MountInfo {
+        point: alloc::string::String::from(point),
+        fs,
+    });
+}
+
+/// Snapshot of the mount table, sorted by mount point, for `/proc/mounts`.
+pub fn mount_snapshot() -> Vec<MountInfo> {
+    let mut out = MOUNTS.lock().clone().unwrap_or_default();
+    out.sort_by(|a, b| a.point.cmp(&b.point));
+    out
+}
+
 pub fn init() {
     crate::debug!("Mounting /dev...");
     let null = Arc::new(NullDevice) as Arc<dyn VfsNode>;
@@ -429,13 +457,16 @@ pub fn init() {
     });
     *ROOT_DIR.lock() = Some(Arc::clone(&root));
     *VFS_ROOT.lock() = Some(root as Arc<dyn VfsNode>);
+    record_mount("/", "rootfs");
+    record_mount("/dev", "devtmpfs");
+    record_mount("/tmp", "ramfs");
     // Synthetic /proc (issue #11). Mounted here, not in `boot::init_fs`, so it
     // exists even when the ext2 tree is absent or refused by `format_policy` —
     // /proc/meminfo and /proc/cpuinfo are exactly the diagnostics wanted in that
     // situation. Everything procfs reads (PMM, heap, tick clock, scheduler) is
     // already up: `pmm::init`/`vmm::init`/`heap::init`/`scheduler::init` all run
     // earlier in `boot.rs`, and nothing is rendered at mount time.
-    if let Err(e) = mount_at("/proc", procfs::root()) {
+    if let Err(e) = mount_at_named("/proc", procfs::root(), "proc") {
         crate::warn!("vfs: mounting /proc failed: {:?}", e);
     } else {
         crate::debug!("/proc (procfs) - ready");
@@ -454,6 +485,12 @@ pub fn init() {
 /// handle deeper path components). Existing top-level entries such as `/dev`
 /// are untouched. Re-mounting the same name replaces the previous entry.
 pub fn mount_at(path: &str, node: Arc<dyn VfsNode>) -> VfsResult<()> {
+    mount_at_named(path, node, "unknown")
+}
+
+/// Like [`mount_at`], but also records the filesystem driver name for
+/// `/proc/mounts` (`"ext2"`, `"proc"`, ...).
+pub fn mount_at_named(path: &str, node: Arc<dyn VfsNode>, fs: &'static str) -> VfsResult<()> {
     let name = match path.strip_prefix('/') {
         Some(rest) => rest.trim_end_matches('/'),
         None => return Err(VfsError::InvalidArgument),
@@ -476,6 +513,8 @@ pub fn mount_at(path: &str, node: Arc<dyn VfsNode>) -> VfsResult<()> {
     let mut children = root.children.lock();
     children.retain(|c| c.name() != name);
     children.push(mount);
+    drop(children);
+    record_mount(path.trim_end_matches('/'), fs);
     Ok(())
 }
 

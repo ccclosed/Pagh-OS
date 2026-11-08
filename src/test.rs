@@ -1649,6 +1649,7 @@ mod procfs_tests {
                 String::from("version"),
                 String::from("filesystems"),
                 String::from("loadavg"),
+                String::from("mounts"),
             ],
             "procfs: /proc readdir order"
         );
@@ -1666,6 +1667,7 @@ mod procfs_tests {
             "version",
             "filesystems",
             "loadavg",
+            "mounts",
         ] {
             let node = match proc_dir.lookup(name) {
                 Ok(n) => n,
@@ -2010,7 +2012,6 @@ mod procfs_tests {
             "/proc/1234",
             "/proc/self/fd",
             "/proc/self/stat",
-            "/proc/mounts",
             "/proc/devices",
             "/proc/version/child",
             "/proc/stat/child",
@@ -2024,6 +2025,28 @@ mod procfs_tests {
                 matches!(vfs::lookup_path(path), Err(VfsError::NotFound)),
                 "procfs: an unknown /proc path is ENOENT, never a catch-all"
             );
+        }
+
+        // ── /proc/mounts exposes the real VFS table ──────────────────────────
+        match vfs::lookup_path("/proc/mounts") {
+            Ok(node) => {
+                let mut buf = alloc::vec![0u8; 512];
+                let n = node.read(0, &mut buf).unwrap_or(0) as u64;
+                let text = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
+                assert_kernel!(
+                    text.contains("/mnt /mnt ext2 rw 0 0"),
+                    "procfs: /proc/mounts lists the ext2 mount"
+                );
+                assert_kernel!(
+                    text.contains("/proc /proc proc rw 0 0"),
+                    "procfs: /proc/mounts lists procfs"
+                );
+                assert_kernel!(
+                    text.contains("/ / rootfs rw 0 0"),
+                    "procfs: /proc/mounts lists rootfs"
+                );
+            }
+            Err(_) => assert_kernel!(false, "procfs: /proc/mounts lookup failed"),
         }
 
         // ── /proc/self is invisible to a task without CompatState ────────────

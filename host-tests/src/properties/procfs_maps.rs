@@ -229,6 +229,7 @@ fn procfs_table_is_stable_and_unique() {
             "version",
             "filesystems",
             "loadavg",
+            "mounts",
         ]
     );
     assert_eq!(
@@ -241,11 +242,12 @@ fn procfs_table_is_stable_and_unique() {
             "version",
             "filesystems",
             "loadavg",
+            "mounts",
         ]
     );
     assert_eq!(
         PROC_SELF_FILES.iter().map(|e| e.name).collect::<Vec<_>>(),
-        ["exe", "cmdline", "status", "maps", "stat", "statm"]
+        ["exe", "cmdline", "status", "maps", "stat", "statm", "mounts"]
     );
     assert_eq!(
         PROC_PID_FILES.iter().map(|e| e.name).collect::<Vec<_>>(),
@@ -288,7 +290,8 @@ fn procfs_table_is_stable_and_unique() {
     // knows the names of the files inside a pid directory.
     assert!(crate::procfs_format::proc_file("1").is_none());
     assert!(crate::procfs_format::proc_file("statm").is_none());
-    assert!(crate::procfs_format::proc_file("mounts").is_none());
+    assert!(crate::procfs_format::proc_file("mounts").is_some());
+    assert!(crate::procfs_format::proc_self_file("mounts").is_some());
     assert!(crate::procfs_format::proc_file("devices").is_none());
     assert!(crate::procfs_format::proc_self_file("fd").is_none());
     assert!(crate::procfs_format::proc_self_file("status/x").is_none());
@@ -381,4 +384,28 @@ fn pid_components_and_inodes_are_well_formed() {
     assert_ne!(pid_dir_ino(7), pid_dir_ino(8));
     // The mask is what keeps an arbitrary u64 below bit 63.
     assert_eq!(pid_dir_ino(u64::MAX), pid_dir_ino(PROC_PID_INO_MASK));
+}
+
+
+#[test]
+fn mounts_format_is_linux_shaped() {
+    let lines = crate::procfs_format::format_mounts(&[
+        ("/", "rootfs"),
+        ("/dev", "devtmpfs"),
+        ("/mnt", "ext2"),
+        ("/proc", "proc"),
+    ]);
+    let text = core::str::from_utf8(&lines).unwrap();
+    assert_eq!(text.lines().count(), 4);
+    let expected = [("/", "rootfs"), ("/dev", "devtmpfs"), ("/mnt", "ext2"), ("/proc", "proc")];
+    for (line, (point, fs)) in text.lines().zip(expected) {
+        let fields: Vec<&str> = line.split(' ').collect();
+        assert_eq!(fields.len(), 6, "field count: {line}");
+        assert_eq!(fields[0], point);
+        assert_eq!(fields[1], point);
+        assert_eq!(fields[2], fs);
+        assert_eq!(fields[3], "rw");
+        assert_eq!(fields[4], "0");
+        assert_eq!(fields[5], "0");
+    }
 }

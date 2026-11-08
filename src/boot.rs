@@ -327,7 +327,7 @@ fn init_fs() {
         }
     };
 
-    match vfs::mount_at("/mnt", root) {
+    match vfs::mount_at_named("/mnt", root, "ext2") {
         Ok(()) => {
             info!("ext2 mounted at /mnt");
             fs_boot_demo();

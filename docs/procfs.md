@@ -28,7 +28,7 @@ read-only `/proc/sys/kernel/*`); отступления от текста ниж
    Срез 2 (2.9.0) добавил `/proc/stat` с реальным учётом user/system/idle в тике.
    Срез 3 (2.10.0) добавил `/proc/version`, `/proc/filesystems`, `/proc/loadavg` и
    read-only `/proc/sys` + `/proc/sys/kernel/{ostype,osrelease,hostname}`.
-   Всё остальное (`/proc/mounts`, `/proc/self/fd`, `/proc/self/cgroup`,
+   Всё остальное (`/proc/self/fd`, `/proc/self/cgroup`,
    `/proc/devices`, прочие имена в `/proc/sys`) — **ENOENT**, обоснование отложенности
    в §2.2.
 3. Содержимое генерируется **снимком на `lookup()`/`open()`** в форме Linux-текста; `size()`
@@ -172,7 +172,6 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 
 | Путь | Причина отложенности |
 |---|---|
-| `/proc/mounts`, `/proc/self/mountinfo` | В VFS нет таблицы монтирований (есть только `RootDirectory.children`); сначала нужен реестр монтирований. |
 | `/proc/self/fd/*`, `/proc/self/task/*` | Требуют симлинков на произвольный fd/pid и полноценного следования по ссылкам (общая задача с #18), а не одного уровня (§5.4). |
 | `/proc/devices`, прочие имена в `/proc/sys/*` | Сверх трёх read-only файлов `/proc/sys/kernel` нет ни sysctl-реестра, ни списка устройств; неизвестное имя обязано оставаться `ENOENT` (§5.6), а не «пустым успехом». |
 | `[vdso]`, `[vvar]`, `[vsyscall]` в maps | В ядре их физически нет — строки не должны появляться (это не «не реализовано», а «отсутствует»). |
@@ -788,8 +787,8 @@ DEVIATION-1 (size ≠ 0), DEVIATION-11 (права: `stat_mode_for` даёт д�
 а не Linux-овский `ENOTDIR` (дефолтный `lookup` трейта возвращает `NotFound`).
 Обязательно покрыть тестами (ENOENT-матрица; реальные узлы перечислены отдельно):
 
-- **ENOENT**: `/proc/mounts`, `/proc/self/fd`, `/proc/self/status/x`,
-  `/proc/mounts`, `/proc/devices`, `/proc/sys/kernel/nonexistent`,
+- **ENOENT**: `/proc/self/fd`, `/proc/self/status/x`,
+  `/proc/devices`, `/proc/sys/kernel/nonexistent`,
   `/proc/version/child`, `/proc/nonexistent`.
 - **Существуют** (после срезов 2–3): `/proc/version`, `/proc/filesystems`,
   `/proc/loadavg`, `/proc/sys`, `/proc/sys/kernel`,
@@ -995,7 +994,7 @@ python3 tools/host_tests.py          # + 6 новых property-наборов
   `total ≥ runnable`, `last_pid > 0` и `≥ current_pid()`;
 - `/proc/sys` и `/proc/sys/kernel` — каталоги с ожидаемым `readdir`;
   `ostype`/`osrelease`/`hostname` равны `Pagh\n` / `<version>\n` / `pagh\n`;
-- `lookup_path("/proc/1")`, `"/proc/self/fd"`, `"/proc/mounts"`, `"/proc/devices"`,
+- `lookup_path("/proc/1")`, `"/proc/self/fd"`, `"/proc/devices"`,
   `"/proc/version/child"`, `"/proc/sys/kernel/nonexistent"`,
   `"/proc/cpuinfo/child"` → `Err(VfsError::NotFound)`;
 - `lookup_path("/proc/self")` → `Err(NotFound)` **в контексте boot-thread** (нет compat

@@ -82,6 +82,10 @@ pub enum ProcKind {
     FileSystems,
     /// `/proc/loadavg` — load averages plus live task counts.
     LoadAvg,
+    /// `/proc/mounts` — the VFS mount table (Linux field order).
+    Mounts,
+    /// `/proc/self/mounts` — same table, per-process path.
+    SelfMounts,
     /// `/proc/sys/kernel/ostype`.
     SysOstype,
     /// `/proc/sys/kernel/osrelease`.
@@ -107,7 +111,7 @@ pub struct ProcEntry {
 }
 
 /// The regular files directly under `/proc` (in `readdir` order).
-pub const PROC_FILES: [ProcEntry; 7] = [
+pub const PROC_FILES: [ProcEntry; 8] = [
     ProcEntry {
         name: "cpuinfo",
         ino: PROC_INO_BASE + 6,
@@ -143,6 +147,11 @@ pub const PROC_FILES: [ProcEntry; 7] = [
         ino: PROC_INO_BASE + 17,
         kind: ProcKind::LoadAvg,
     },
+    ProcEntry {
+        name: "mounts",
+        ino: PROC_INO_BASE + 18,
+        kind: ProcKind::Mounts,
+    },
 ];
 
 /// The regular files under `/proc/sys/kernel` (in `readdir` order).
@@ -171,7 +180,7 @@ pub const PROC_SYS_FILES: [ProcEntry; 3] = [
 /// pid-derived identity below instead; the two paths describe the same state but
 /// are distinct VFS nodes (this `self` is a directory, not a symlink to the pid
 /// directory).
-pub const PROC_SELF_FILES: [ProcEntry; 6] = [
+pub const PROC_SELF_FILES: [ProcEntry; 7] = [
     ProcEntry {
         name: "exe",
         ino: PROC_INO_BASE + 2,
@@ -202,13 +211,18 @@ pub const PROC_SELF_FILES: [ProcEntry; 6] = [
         ino: PROC_INO_BASE + 11,
         kind: ProcKind::SelfStatm,
     },
+    ProcEntry {
+        name: "mounts",
+        ino: PROC_INO_BASE + 19,
+        kind: ProcKind::SelfMounts,
+    },
 ];
 
 /// `readdir` order of `/proc`'s **static** entries: `self`/`sys` first, then the
 /// regular files. Live numeric pid directories are inserted between `self` and
 /// `cpuinfo` by the kernel-facing `ProcDir::readdir` (ascending pid, snapshot of
 /// the compat registry); they are dynamic and therefore not listed here.
-pub const PROC_ROOT_ORDER: [&str; 9] = [
+pub const PROC_ROOT_ORDER: [&str; 10] = [
     "self",
     "sys",
     "cpuinfo",
@@ -218,6 +232,7 @@ pub const PROC_ROOT_ORDER: [&str; 9] = [
     "version",
     "filesystems",
     "loadavg",
+    "mounts",
 ];
 
 // ─── /proc/<pid> path / inode identity ──────────────────────────────────────
@@ -392,6 +407,22 @@ pub fn format_uptime(ticks: u64, tick_hz: u64) -> Vec<u8> {
 /// pagh is a **single-CPU** kernel and this line is not a claim of SMP support.
 /// The version is passed in rather than read here so the formatter stays pure and
 /// host-testable; the kernel-side node supplies the crate version.
+/// Format `/proc/mounts` / `/proc/self/mounts`.
+///
+/// Linux field order: `device mount_point fstype options dump pass`. pagh has no
+/// per-mount options and no separate block devices, so the device field is the
+/// mount point itself, options are `rw`, and dump/pass are `0 0`.
+pub fn format_mounts(mounts: &[(&str, &str)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (point, fs) in mounts {
+        push(
+            &mut out,
+            format_args!("{} {} {} rw 0 0\n", point, point, fs),
+        );
+    }
+    out
+}
+
 pub fn format_version(version: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 + version.len());
     push(&mut out, format_args!("pagh {} (x86_64) #1 SMP\n", version));
