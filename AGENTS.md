@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.14.0**
+  be reflected here. **`main` currently reads 2.15.0**
   (the procfs slice 3 minor bump; it lands on `main` with the merge).
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
@@ -260,6 +260,8 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   buffer and flushed with it (the shadow-buffer commit had left it drawn *after*
   the flush, so it never reached the device), while an idle shell skips the
   overlay/repaint cycle instead of copying the surface once per timer tick.
+  **2.15.0** = the current unreleased batch (starts with the 15-commits-per-release
+  policy; features land here until the batch closes);
   **2.14.0** = shell `df` (real ext2 capacity from `fs_stat`, `-` for synthetic
   filesystems) and `ps` (PID/PPID/STAT/COMMAND rendered from `/proc/<pid>`),
   plus `/proc/self/cgroup` + `/proc/<pid>/cgroup` (`0::/`, no controllers);
@@ -295,8 +297,8 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   vendored `embedded-tls`. Previous minors: 2.2.0 = low-RAM heap cap +
   version-agnostic Limine loader; 2.1.0 = the COW fork/demand-paging drop
   (PR #8) + real POSIX signal delivery (PRs #9/#10).
-- **Release cadence (human request, 2.13.0)**: do not tag every commit. Accumulate
-  **4–5 commits per release**; the first commit of the batch carries the version
+- **Release cadence (human request, 2.15.0)**: do not tag every commit. Accumulate
+  **15 commits per release**; the first commit of the batch carries the version
   bump, the last one carries the tag and GitHub release. Choose the batch version
   by its highest-impact change: any image/ABI break -> MAJOR, any user-visible
   feature -> MINOR, otherwise PATCH. Low-impact documentation and test commits ride in the next
