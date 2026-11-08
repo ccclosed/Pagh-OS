@@ -128,6 +128,55 @@ impl Drop for PipeEndpoint {
     }
 }
 
+/// State of one `timerfd` instance.
+///
+/// Times are in scheduler ticks (the only clock available to the kernel), and
+/// expiration is computed lazily on read/poll: no timer IRQ walks the fd table.
+pub struct TimerfdState {
+    /// Absolute tick at which the next expiration is due; `None` = disarmed.
+    pub deadline: Option<u64>,
+    /// Repetition interval in ticks; `0` = one-shot.
+    pub interval: u64,
+    /// Expirations already accumulated (returned by the next read).
+    pub expirations: u64,
+    /// Whether the descriptor was created with TFD_NONBLOCK.
+    pub nonblocking: bool,
+}
+
+impl TimerfdState {
+    /// Expirations due at `now`, without mutating (used by poll/epoll).
+    pub fn pending(&self, now: u64) -> u64 {
+        if self.expirations > 0 {
+            return self.expirations;
+        }
+        match self.deadline {
+            Some(deadline) if now >= deadline => {
+                if self.interval == 0 {
+                    1
+                } else {
+                    (now - deadline) / self.interval + 1
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    /// Consume all due expirations, advancing the deadline.
+    pub fn take(&mut self, now: u64) -> u64 {
+        let due = self.pending(now);
+        if due > 0 {
+            self.expirations = 0;
+            if self.interval == 0 {
+                self.deadline = None;
+            } else if let Some(deadline) = self.deadline {
+                let elapsed_periods = (now.saturating_sub(deadline)) / self.interval + 1;
+                self.deadline = Some(deadline + elapsed_periods * self.interval);
+            }
+        }
+        due
+    }
+}
+
 /// An object a file descriptor can refer to.
 ///
 /// Standard streams resolve to the kernel console / stdin; everything else is an
@@ -157,6 +206,8 @@ pub enum OpenObject {
     /// `COMPAT_STATES` lock is held during `getdents64`.
     PipeRead(Arc<PipeEndpoint>),
     PipeWrite(Arc<PipeEndpoint>),
+    /// A `timerfd` instance; state is shared with poll/epoll readers.
+    Timerfd(Arc<Spinlock<TimerfdState>>),
     /// An eventfd counter (EFD_SEMAPHORE if semaphore=true).
     Eventfd {
         val: Arc<Spinlock<u64>>,
@@ -224,6 +275,7 @@ impl OpenObject {
                 children: children.clone(),
                 index: *index,
             },
+            OpenObject::Timerfd(state) => OpenObject::Timerfd(Arc::clone(state)),
             OpenObject::Eventfd { val, semaphore } => OpenObject::Eventfd {
                 val: Arc::clone(val),
                 semaphore: *semaphore,
@@ -391,6 +443,7 @@ impl FdTable {
             Some(OpenObject::InetUdp(_)) => "inet-udp",
             Some(OpenObject::UnixListener(_)) => "unix-listener",
             Some(OpenObject::UnixSocketUnbound { .. }) => "unix-unbound",
+            Some(OpenObject::Timerfd(_)) => "timerfd",
             Some(OpenObject::Eventfd { .. }) => "eventfd",
             Some(OpenObject::File { .. }) => "file",
             Some(OpenObject::Dir { .. }) => "dir",

@@ -149,6 +149,12 @@ pub mod nr {
     pub const FALLOCATE: u64 = 285;
     /// `memfd_create` (319) — an anonymous in-memory file.
     pub const MEMFD_CREATE: u64 = 319;
+    /// `timerfd_create` (283).
+    pub const TIMERFD_CREATE: u64 = 283;
+    /// `timerfd_settime` (286).
+    pub const TIMERFD_SETTIME: u64 = 286;
+    /// `timerfd_gettime` (287).
+    pub const TIMERFD_GETTIME: u64 = 287;
     /// `sched_setaffinity` (203) — single-CPU mask.
     pub const SCHED_SETAFFINITY: u64 = 203;
     /// `sched_getaffinity` (204) — single-CPU mask.
@@ -366,7 +372,7 @@ pub fn marshal_args(
 /// History note: the previous test asserted membership for only 69 of the 109
 /// numbers the gate accepted and never asserted that anything was *unsupported*,
 /// so it could not catch either class of drift.
-pub const SUPPORTED_SYSCALLS: [u64; 154] = [
+pub const SUPPORTED_SYSCALLS: [u64; 157] = [
     nr::READ,
     nr::WRITE,
     nr::OPEN,
@@ -502,8 +508,11 @@ pub const SUPPORTED_SYSCALLS: [u64; 154] = [
     nr::GET_ROBUST_LIST,
     nr::SYNC_FILE_RANGE,
     nr::EPOLL_PWAIT,
+    nr::TIMERFD_CREATE,
     nr::EVENTFD,
     nr::FALLOCATE,
+    nr::TIMERFD_SETTIME,
+    nr::TIMERFD_GETTIME,
     nr::ACCEPT4,
     nr::EVENTFD2,
     nr::EPOLL_CREATE1,
@@ -571,16 +580,16 @@ mod tests {
     fn supported_set_is_exact() {
         // Independent enumeration: the Linux x86_64 syscall numbers with a real
         // dispatcher arm, in ascending order (keep it sorted!).
-        const EXPECTED: [u64; 154] = [
+        const EXPECTED: [u64; 157] = [
             0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
             28, 32, 33, 35, 39, 40, 41, 42, 43, 44, 45, 49, 50, 51, 53, 54, 55, 56, 59, 60, 61, 62,
             63, 72, 73, 74, 75, 79, 80, 81, 82, 83, 84, 87, 89, 90, 91, 92, 93, 95, 96, 97, 98, 99,
             100, 102, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 117, 118, 119, 120,
             121, 127, 131, 135, 137, 138, 140, 141, 143, 144, 145, 146, 147, 148, 158, 160, 162,
             186, 187, 201, 202, 203, 204, 213, 217, 218, 221, 227, 228, 229, 230, 231, 232, 233,
-            234, 257, 258, 260, 262, 263, 264, 267, 268, 269, 270, 271, 273, 274, 277, 281, 284,
-            285, 288, 290, 291, 292, 293, 295, 296, 302, 306, 309, 316, 318, 319, 326, 332, 334,
-            439,
+            234, 257, 258, 260, 262, 263, 264, 267, 268, 269, 270, 271, 273, 274, 277, 281, 283,
+            284, 285, 286, 287, 288, 290, 291, 292, 293, 295, 296, 302, 306, 309, 316, 318, 319,
+            326, 332, 334, 439,
         ];
 
         // 1. The two independent enumerations agree element-wise, and both are

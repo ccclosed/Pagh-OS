@@ -307,6 +307,13 @@ fn poll_fd(fd: i32, events: u32) -> u32 {
                 }
             }
             Some(OpenObject::UnixSocketUnbound { .. }) => 0,
+            Some(OpenObject::Timerfd(state)) => {
+                if state.lock().pending(crate::task::scheduler::ticks()) > 0 {
+                    EPOLLIN
+                } else {
+                    0
+                }
+            }
             Some(OpenObject::Eventfd { val, .. }) => {
                 let v = *val.lock();
                 if v > 0 && events & EPOLLIN != 0 {
@@ -356,6 +363,7 @@ pub(super) fn dump_epoll_self(epfd: u32) {
                         Some(OpenObject::InetUdp(_)) => "inet-udp",
                         Some(OpenObject::UnixListener(_)) => "unix-listener",
                         Some(OpenObject::UnixSocketUnbound { .. }) => "unix-unbound",
+                        Some(OpenObject::Timerfd(_)) => "timerfd",
                         Some(OpenObject::Eventfd { .. }) => "eventfd",
                         Some(OpenObject::File { .. }) => "file",
                         Some(OpenObject::Dir { .. }) => "dir",
