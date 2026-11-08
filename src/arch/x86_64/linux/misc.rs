@@ -1110,3 +1110,89 @@ pub fn sys_times(tms: u64) -> Result<u64, Errno> {
     }
     Ok(scheduler::ticks())
 }
+
+/// `readahead` (187): advisory prefetch; validate the fd and accept.
+pub fn sys_readahead(fd: u64, _offset: u64, _count: u64) -> Result<u64, Errno> {
+    let open = compat::with_current_compat(|cs| cs.fds.get(fd as u32).is_some()).unwrap_or(false);
+    if !open {
+        return Err(Errno::EBADF);
+    }
+    Ok(0)
+}
+
+/// `syncfs` (306): the VFS/ext2 write path is synchronous, so there is nothing
+/// to flush; validate the fd as Linux does.
+pub fn sys_syncfs(fd: u64) -> Result<u64, Errno> {
+    let open = compat::with_current_compat(|cs| cs.fds.get(fd as u32).is_some()).unwrap_or(false);
+    if !open {
+        return Err(Errno::EBADF);
+    }
+    Ok(0)
+}
+
+/// `getpriority` (140): nice value 0 maps to the canonical 20.
+pub fn sys_getpriority(_which: u64, _who: u64) -> Result<u64, Errno> {
+    Ok(20)
+}
+
+/// `setpriority` (141): one CPU, no scheduler priority classes; accepted.
+pub fn sys_setpriority(_which: u64, _who: u64, priority: u64) -> Result<u64, Errno> {
+    if priority < 40 {
+        Ok(0)
+    } else {
+        Err(Errno::EINVAL)
+    }
+}
+
+/// `sched_getparam` (143): `struct sched_param { int sched_priority; }`.
+pub fn sys_sched_getparam(_pid: u64, param: u64) -> Result<u64, Errno> {
+    write_user_u32(param, 0)?;
+    Ok(0)
+}
+
+/// `sched_setscheduler` (144): only SCHED_OTHER (0) exists.
+pub fn sys_sched_setscheduler(_pid: u64, policy: u64, _param: u64) -> Result<u64, Errno> {
+    if policy == 0 {
+        Ok(0)
+    } else {
+        Err(Errno::EINVAL)
+    }
+}
+
+/// `sched_rr_get_interval` (148): zero timespec; SCHED_RR is not implemented.
+pub fn sys_sched_rr_get_interval(_pid: u64, interval: u64) -> Result<u64, Errno> {
+    check_user_ptr(interval, 16)?;
+    super::io_sys::copy_out_pub(interval, &[0u8; 16]);
+    Ok(0)
+}
+
+/// `rt_sigpending` (127): no pending signals are ever reported.
+pub fn sys_rt_sigpending(set: u64, sigsetsize: u64) -> Result<u64, Errno> {
+    if sigsetsize != 8 {
+        return Err(Errno::EINVAL);
+    }
+    check_user_ptr(set, 8)?;
+    super::io_sys::copy_out_pub(set, &0u64.to_le_bytes());
+    Ok(0)
+}
+
+/// `sync_file_range` (277): no dirty-page writeback exists; validate fd.
+pub fn sys_sync_file_range(fd: u64, _offset: u64, _nbytes: u64, _flags: u64) -> Result<u64, Errno> {
+    let open = compat::with_current_compat(|cs| cs.fds.get(fd as u32).is_some()).unwrap_or(false);
+    if !open {
+        return Err(Errno::EBADF);
+    }
+    Ok(0)
+}
+
+/// `fallocate` (285): mode 0 extends the file to `offset + len`; other modes
+/// (punch-hole, collapse, zero-range) are not implemented.
+pub fn sys_fallocate(fd: u64, mode: u64, offset: u64, len: u64) -> Result<u64, Errno> {
+    if mode != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let node = super::io_sys::file_node_for_fd(fd as u32).ok_or(Errno::EBADF)?;
+    let end = offset.checked_add(len).ok_or(Errno::EINVAL)?;
+    node.truncate(end).map_err(|_| Errno::EIO)?;
+    Ok(0)
+}
