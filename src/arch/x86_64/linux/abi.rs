@@ -156,6 +156,12 @@ pub mod nr {
     pub const RECVFROM: u64 = 45;
     /// `unlink` (87) — git removes its `*.lock` files.
     pub const UNLINK: u64 = 87;
+    /// `mkdirat` (258) — mkdir relative to AT_FDCWD/dirfd.
+    pub const MKDIRAT: u64 = 258;
+    /// `fchownat` (260) — chown relative to AT_FDCWD/dirfd.
+    pub const FCHOWNAT: u64 = 260;
+    /// `unlinkat` (263) — unlink/rmdir relative to AT_FDCWD/dirfd.
+    pub const UNLINKAT: u64 = 263;
     /// `chmod` (90) — git chmods `.git/config.lock` during init.
     pub const CHMOD: u64 = 90;
     /// `fchmod` (91) — change the mode of an open file descriptor.
@@ -304,7 +310,7 @@ pub fn marshal_args(
 /// History note: the previous test asserted membership for only 69 of the 109
 /// numbers the gate accepted and never asserted that anything was *unsupported*,
 /// so it could not catch either class of drift.
-pub const SUPPORTED_SYSCALLS: [u64; 123] = [
+pub const SUPPORTED_SYSCALLS: [u64; 126] = [
     nr::READ,
     nr::WRITE,
     nr::OPEN,
@@ -406,7 +412,10 @@ pub const SUPPORTED_SYSCALLS: [u64; 123] = [
     nr::EPOLL_CTL,
     nr::TGKILL,
     nr::OPENAT,
+    nr::MKDIRAT,
+    nr::FCHOWNAT,
     nr::NEWFSTATAT,
+    nr::UNLINKAT,
     nr::RENAMEAT,
     nr::READLINKAT,
     nr::FCHMODAT,
@@ -478,14 +487,14 @@ mod tests {
     fn supported_set_is_exact() {
         // Independent enumeration: the Linux x86_64 syscall numbers with a real
         // dispatcher arm, in ascending order (keep it sorted!).
-        const EXPECTED: [u64; 123] = [
+        const EXPECTED: [u64; 126] = [
             0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
             28, 32, 33, 35, 39, 41, 42, 43, 44, 45, 49, 50, 51, 53, 54, 55, 56, 59, 60, 61, 62, 63,
             72, 73, 74, 75, 79, 80, 81, 82, 83, 84, 87, 89, 90, 91, 92, 93, 95, 96, 97, 99, 102,
             104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 117, 118, 119, 120, 121, 131,
             137, 138, 158, 186, 201, 202, 217, 218, 227, 228, 229, 230, 231, 232, 233, 234, 257,
-            262, 264, 267, 268, 269, 270, 271, 273, 274, 281, 288, 290, 291, 292, 293, 295, 296,
-            302, 316, 318, 332, 334,
+            258, 260, 262, 263, 264, 267, 268, 269, 270, 271, 273, 274, 281, 288, 290, 291, 292,
+            293, 295, 296, 302, 316, 318, 332, 334,
         ];
 
         // 1. The two independent enumerations agree element-wise, and both are

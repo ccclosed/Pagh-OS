@@ -63,6 +63,8 @@ const AT_EACCESS: u64 = 0x200;
 
 /// `newfstatat` flag: do not follow a final symbolic link (`lstat`).
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+/// `unlinkat` flag: remove a directory instead of a file.
+const AT_REMOVEDIR: u64 = 0x200;
 
 /// Default permission bits reported for an ext2-backed regular file.
 /// Reported permission bits for regular files. Everything here runs as root
@@ -2074,6 +2076,44 @@ pub fn sys_faccessat(dirfd: u64, path: u64, mode: u64, flags: u64) -> Result<u64
             return Err(Errno::EACCES);
         }
     }
+    Ok(0)
+}
+
+/// `mkdirat` (258): `mkdir` with an AT_FDCWD/dirfd base.
+///
+/// `dirfd` is AT_FDCWD-equivalent in this minimal layer, matching
+/// `openat`/`newfstatat`; creation permissions come from `mode` & umask in the
+/// existing `sys_mkdir` path.
+pub fn sys_mkdirat(dirfd: u64, path: u64, mode: u64) -> Result<u64, Errno> {
+    let _ = dirfd;
+    sys_mkdir(path, mode)
+}
+
+/// `unlinkat` (263): unlink a file, or rmdir with `AT_REMOVEDIR`.
+pub fn sys_unlinkat(dirfd: u64, path: u64, flags: u64) -> Result<u64, Errno> {
+    let _ = dirfd;
+    if flags & !AT_REMOVEDIR != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & AT_REMOVEDIR != 0 {
+        sys_rmdir(path)
+    } else {
+        sys_unlink(path)
+    }
+}
+
+/// `fchownat` (260): `chown` relative to AT_FDCWD/dirfd, honouring
+/// `AT_SYMLINK_NOFOLLOW` for the final component.
+pub fn sys_fchownat(dirfd: u64, path: u64, uid: u64, gid: u64, flags: u64) -> Result<u64, Errno> {
+    let _ = dirfd;
+    if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let p = read_user_cstr(path)?;
+    let abs = resolve_path(&p);
+    let node = walk(&abs, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+    check_chown_allowed()?;
+    apply_node_owner(&node, uid, gid)?;
     Ok(0)
 }
 
