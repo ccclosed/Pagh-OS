@@ -423,6 +423,71 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
 /// at its offset and advances it; stdin is not writable (`EBADF`); an absent fd is
 /// `EBADF` (R2.14).
 
+/// `copy_file_range` (326): copy a byte range between two regular files.
+///
+/// Both descriptors must be regular files; `flags` must be 0. Each optional
+/// offset pointer, when non-NULL, is read before and written after the copy
+/// (the fd's own offset stays put); a NULL pointer uses and advances the fd's
+/// offset. A short write ends the loop and returns the bytes copied.
+pub fn sys_copy_file_range(
+    fd_in: u64,
+    off_in: u64,
+    fd_out: u64,
+    off_out: u64,
+    len: u64,
+    flags: u64,
+) -> Result<u64, Errno> {
+    if flags != 0 || len > COUNT_MAX {
+        return Err(Errno::EINVAL);
+    }
+    let (input_node, input_current) = match resolve_fd(fd_in as u32) {
+        Some(Resolved::File { node, offset }) => (node, offset),
+        _ => return Err(Errno::EINVAL),
+    };
+    let (output_node, output_current) = match resolve_fd(fd_out as u32) {
+        Some(Resolved::File { node, offset }) => (node, offset),
+        _ => return Err(Errno::EINVAL),
+    };
+    let mut read_and_advance = |ptr: u64, current: u64| -> Result<u64, Errno> {
+        if ptr == 0 {
+            return Ok(current);
+        }
+        check_user_ptr(ptr, 8)?;
+        let raw = copy_in_pub(ptr, 8);
+        Ok(u64::from_le_bytes(raw[..8].try_into().unwrap_or([0; 8])))
+    };
+    let mut in_off = read_and_advance(off_in, input_current)?;
+    let mut out_off = read_and_advance(off_out, output_current)?;
+    let mut total = 0u64;
+    let mut buf = [0u8; 8192];
+    while total < len {
+        let want = (len - total).min(buf.len() as u64) as usize;
+        let n = match input_node.read(in_off, &mut buf[..want]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return Err(Errno::EINVAL),
+        };
+        let written = output_node.write(out_off, &buf[..n]).map_err(write_errno)?;
+        in_off += n as u64;
+        out_off += written as u64;
+        total += written as u64;
+        if written < n {
+            break;
+        }
+    }
+    if off_in != 0 {
+        copy_out_pub(off_in, &in_off.to_le_bytes());
+    } else {
+        set_fd_offset(fd_in as u32, in_off);
+    }
+    if off_out != 0 {
+        copy_out_pub(off_out, &out_off.to_le_bytes());
+    } else {
+        set_fd_offset(fd_out as u32, out_off);
+    }
+    Ok(total)
+}
+
 /// `sendfile` (40): copy bytes from a regular file to a file/socket/console.
 ///
 /// Only a regular-file input is supported; the output may be a regular file,

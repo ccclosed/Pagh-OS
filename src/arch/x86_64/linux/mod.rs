@@ -118,6 +118,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::IOCTL => io_sys::sys_ioctl(a[0], a[1], a[2]),
         sysno::ACCESS => io_sys::sys_access(a[0], a[1]),
         sysno::SENDFILE => io_sys::sys_sendfile(a[0], a[1], a[2], a[3]),
+        sysno::COPY_FILE_RANGE => io_sys::sys_copy_file_range(a[0], a[1], a[2], a[3], a[4], a[5]),
         sysno::MKDIR => io_sys::sys_mkdir(a[0], a[1]),
         sysno::RMDIR => io_sys::sys_rmdir(a[0]),
         sysno::UNLINK => io_sys::sys_unlink(a[0]),
