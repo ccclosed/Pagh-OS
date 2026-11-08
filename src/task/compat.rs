@@ -45,6 +45,9 @@ pub struct CompatState {
     pub ppid: u64,
     /// Process id shared by all threads in the group.
     pub tgid: u64,
+    /// Process group id (Linux `pgid`), independent of the thread group.
+    /// `setpgid` changes it; `kill(-pgid)` and `kill(0)` address this group.
+    pub pgid: u64,
     /// Address cleared and futex-woken at thread exit.
     pub clear_child_tid: u64,
     /// Whether exit creates a wait4-visible zombie.
@@ -165,6 +168,7 @@ impl CompatState {
             tid,
             ppid,
             tgid: tid,
+            pgid: tid,
             clear_child_tid: 0,
             waitable: true,
             robust_head: 0,
@@ -608,17 +612,33 @@ pub fn group_member_pids(tgid: u64, except: u64) -> alloc::vec::Vec<u64> {
 /// Every registered pid in thread group `tgid`, the given pid included,
 /// ascending (the registry is a `BTreeMap`, so iteration order is pid order).
 ///
-/// The `kill(-pgid)`/`kill(0)` path resolves its targets through this — in
-/// pagh's model the process-group id of a process IS its thread-group id
-/// (`sys_getpgid` reports `current_tgid`, `sys_setpgid` is a no-op). The result
-/// is a SNAPSHOT: callers release the registry lock, then deliver (invariant 4:
-/// never hold `COMPAT_STATES` across the send).
-pub fn group_pids(tgid: u64) -> alloc::vec::Vec<u64> {
+/// Every registered pid in process group `pgid`, ascending.
+///
+/// `kill(-pgid)`/`kill(0)` resolve their targets through this. The result is a
+/// SNAPSHOT: callers release the registry lock, then deliver (invariant 4).
+pub fn group_pids(pgid: u64) -> alloc::vec::Vec<u64> {
     COMPAT_STATES
         .lock()
         .iter()
-        .filter_map(|(pid, s)| (s.tgid == tgid).then_some(*pid))
+        .filter_map(|(pid, s)| (s.pgid == pgid).then_some(*pid))
         .collect()
+}
+
+/// The caller's process group (falls back to its tgid).
+pub fn current_pgid() -> u64 {
+    with_current_compat(|cs| cs.pgid).unwrap_or_else(current_tgid)
+}
+
+/// Set the process group of `pid`.
+pub fn set_pgid(pid: u64, pgid: u64) {
+    if let Some(state) = COMPAT_STATES.lock().get_mut(&pid) {
+        state.pgid = pgid;
+    }
+}
+
+/// The process group of `pid`, or `None` when it has no compat state.
+pub fn pgid_of(pid: u64) -> Option<u64> {
+    COMPAT_STATES.lock().get(&pid).map(|s| s.pgid)
 }
 
 /// Snapshot of `(pid, tgid)` for every registered compat process/thread, pid

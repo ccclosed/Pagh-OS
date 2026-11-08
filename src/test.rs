@@ -4704,6 +4704,7 @@ mod linux_signal_tests {
             tid,
         );
         st.tgid = tgid;
+        st.pgid = tgid;
         st
     }
 

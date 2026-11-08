@@ -976,24 +976,47 @@ pub fn sys_getrlimit(resource: u64, rlim: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `setsid` (112): report the caller as its own session leader.
-/// There is no real session/job-control model yet; returning the tgid
-/// satisfies libuv's uv_spawn detach path.
+/// `setsid` (112): start a new session; the caller becomes session leader and
+/// the leader of a new process group (sessions themselves are not modelled).
 pub fn sys_setsid() -> Result<u64, Errno> {
-    Ok(compat::current_tgid())
+    let pid = scheduler::current_pid();
+    compat::with_current_compat(|cs| {
+        cs.pgid = cs.tgid;
+    });
+    Ok(pid)
 }
 
-/// `setpgid` (109): accepted as a no-op. There is still no real
-/// process-group model; bash only needs the call to not fail so it stops
-/// printing "initialize_job_control: setpgid: Function not implemented".
-pub fn sys_setpgid(_pid: u64, _pgid: u64) -> Result<u64, Errno> {
+/// `setpgid` (109): move the caller or one of its children into `pgid`.
+///
+/// `pid == 0` means the caller, `pgid == 0` means the target's own pid. The
+/// target must be the caller or a direct child.
+pub fn sys_setpgid(pid: u64, pgid: u64) -> Result<u64, Errno> {
+    let me = scheduler::current_pid();
+    let target = if pid == 0 { me } else { pid };
+    let new_pgid = if pgid == 0 { target } else { pgid };
+    let Some((ppid, _current)) = compat::with_pid_compat(target, |cs| (cs.ppid, cs.pgid)) else {
+        return Err(Errno::ESRCH);
+    };
+    if target != me && ppid != me {
+        return Err(Errno::ESRCH);
+    }
+    compat::set_pgid(target, new_pgid);
     Ok(0)
 }
 
-/// `getpgrp` (111) / `getpgid` (121): every process is modeled as
-/// the leader of its own group, mirroring sys_setsid above.
-pub fn sys_getpgid() -> Result<u64, Errno> {
-    Ok(compat::current_tgid())
+/// `getpgid` (132): the process group of `pid`, or the caller for `pid == 0`.
+pub fn sys_getpgid(pid: u64) -> Result<u64, Errno> {
+    let target = if pid == 0 {
+        scheduler::current_pid()
+    } else {
+        pid
+    };
+    compat::pgid_of(target).ok_or(Errno::ESRCH)
+}
+
+/// `getpgrp` (111): the caller's process group.
+pub fn sys_getpgrp() -> Result<u64, Errno> {
+    sys_getpgid(0)
 }
 
 /// `umask` (95): set the process's file-mode creation mask to `mask & 0777`

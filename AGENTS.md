@@ -260,7 +260,8 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   buffer and flushed with it (the shadow-buffer commit had left it drawn *after*
   the flush, so it never reached the device), while an idle shell skips the
   overlay/repaint cycle instead of copying the surface once per timer tick.
-  **2.16.0** = the current unreleased batch, starting with signalfd/signalfd4;
+  **2.16.0** = the current unreleased batch: signalfd/signalfd4 and real process
+  groups (`pgid` in `CompatState`, setpgid/getpgid/getpgrp/setsid, group kill);
   **2.15.0** = the 15-commit Linux-compat batch: `*at` family, sendfile/
   copy_file_range, legacy/advisory syscalls, memfd_create, timerfd (poll/epoll
   integrated), SIGCHLD delivery, `/proc/*/mountinfo` and shell df/ps, plus the
@@ -335,9 +336,10 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
 - Signals (issue #12): `kill(2)` (nr 62), process-group addressing
   (`kill(0|-1|-pgid)`), `SIGSTOP`/`SIGCONT` scheduling, `wait4(WUNTRACED|WCONTINUED)`
   and timer-tick delivery to a syscall-free task are all implemented. SIGCHLD is
-  queued to the parent on child exit/stop/continue (2.15.0). Still missing: a real
-  process-group model (`setpgid` into a foreign group) and job-control tty stops
-  (`^Z`).
+  queued to the parent on child exit/stop/continue (2.15.0). Real process groups
+  now exist in `CompatState` (`pgid`, `setpgid`/`getpgid`/`getpgrp`/`setsid`,
+  `kill(0)`/`kill(-pgid)` address the group) as of 2.16.0. Still missing: terminal
+  foreground-group tracking and the `^Z` tty stop path.
 
 - NVMe driver is polled and page-chunked; FLUSH (opcode 0x08) is issued at WAL
   transaction boundaries, but there are no PRP lists and no queue depth > 1.

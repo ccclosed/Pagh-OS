@@ -310,8 +310,8 @@ pub fn resolve_kill_targets(target: super::kill::KillTarget) -> alloc::vec::Vec<
         // thread group (`sys_getpgid` reports the tgid, `sys_setpgid` is a
         // documented no-op), so its members are the pids with that tgid.
         KillTarget::OwnGroup => {
-            let tgid = compat::current_tgid();
-            super::kill::pick_group_target(&compat::group_pids(tgid), tgid)
+            let pgid = compat::current_pgid();
+            super::kill::pick_group_target(&compat::group_pids(pgid), pgid)
                 .into_iter()
                 .collect()
         }

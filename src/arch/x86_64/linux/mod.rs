@@ -290,7 +290,8 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         }
         sysno::SETSID => misc::sys_setsid(),
         sysno::SETPGID => misc::sys_setpgid(a[0], a[1]),
-        sysno::GETPGRP | sysno::GETPGID => misc::sys_getpgid(),
+        sysno::GETPGRP => misc::sys_getpgrp(),
+        sysno::GETPGID => misc::sys_getpgid(a[0]),
         sysno::UMASK => misc::sys_umask(a[0]),
         sysno::FLOCK => misc::sys_flock(a[0], a[1]),
         // ── Directory / path / fd (linux-binary-compat) ──
