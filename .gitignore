@@ -86,3 +86,6 @@ pagh_mcp.py
 /rust-apps/**/target/
 /rust-apps/out/
 pagh-2.0.3.iso
+
+# local boot loader tree/symlink (git-ignored, CI downloads it)
+/limine
