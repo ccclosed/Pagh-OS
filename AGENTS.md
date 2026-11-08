@@ -260,8 +260,10 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   buffer and flushed with it (the shadow-buffer commit had left it drawn *after*
   the flush, so it never reached the device), while an idle shell skips the
   overlay/repaint cycle instead of copying the surface once per timer tick.
-  **2.15.0** = the current unreleased batch (starts with the 15-commits-per-release
-  policy; features land here until the batch closes);
+  **2.15.0** = the 15-commit Linux-compat batch: `*at` family, sendfile/
+  copy_file_range, legacy/advisory syscalls, memfd_create, timerfd (poll/epoll
+  integrated), SIGCHLD delivery, `/proc/*/mountinfo` and shell df/ps, plus the
+  incremental selection repaint that fixes the large-drag FPS drop;
   **2.14.0** = shell `df` (real ext2 capacity from `fs_stat`, `-` for synthetic
   filesystems) and `ps` (PID/PPID/STAT/COMMAND rendered from `/proc/<pid>`),
   plus `/proc/self/cgroup` + `/proc/<pid>/cgroup` (`0::/`, no controllers), the
