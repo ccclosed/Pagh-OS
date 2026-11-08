@@ -261,7 +261,8 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   the flush, so it never reached the device), while an idle shell skips the
   overlay/repaint cycle instead of copying the surface once per timer tick.
   **2.14.0** = shell `df` (real ext2 capacity from `fs_stat`, `-` for synthetic
-  filesystems) and `ps` (PID/PPID/STAT/COMMAND rendered from `/proc/<pid>`);
+  filesystems) and `ps` (PID/PPID/STAT/COMMAND rendered from `/proc/<pid>`),
+  plus `/proc/self/cgroup` + `/proc/<pid>/cgroup` (`0::/`, no controllers);
   **2.13.0** = `/proc/self/fd` and `/proc/<pid>/fd`: numeric symlinks over the
   live FdTable, with `/dev/serial`, real file/directory paths, `pipe:[...]`,
   `socket:[...]` and `anon_inode:[...]` targets; plus real 1/5/15-minute
@@ -322,8 +323,9 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   live kernel state (CPUID, PMM counters, the tick clock, the scheduler's
   user/system/idle tick accounting and live task counts, and the target
   process's `CompatState` snapshot). `/proc/self/fd` and `/proc/<pid>/fd` expose
-  the fd table as numeric symlinks. Deferred, returning `ENOENT` today:
-  `/proc/self/cgroup` (and mountinfo/statfs metadata).
+  the fd table as numeric symlinks. `/proc/self/cgroup` and `/proc/<pid>/cgroup`
+  report the single root cgroup (`0::/`, no controllers). Deferred, returning
+  `ENOENT` today: mountinfo/statfs metadata.
 - Signals (issue #12): `kill(2)` (nr 62), process-group addressing
   (`kill(0|-1|-pgid)`), `SIGSTOP`/`SIGCONT` scheduling, `wait4(WUNTRACED|WCONTINUED)`
   and timer-tick delivery to a syscall-free task are all implemented. Still missing:

@@ -179,3 +179,8 @@ proptest! {
         prop_assert_eq!(names, ["ostype", "osrelease", "hostname"]);
     }
 }
+
+#[test]
+fn cgroup_is_root_v2_line() {
+    assert_eq!(crate::procfs_format::format_cgroup(), b"0::/\n".to_vec());
+}

@@ -247,7 +247,7 @@ fn procfs_table_is_stable_and_unique() {
     );
     assert_eq!(
         PROC_SELF_FILES.iter().map(|e| e.name).collect::<Vec<_>>(),
-        ["exe", "cmdline", "status", "maps", "stat", "statm", "mounts"]
+        ["exe", "cmdline", "status", "maps", "stat", "statm", "mounts", "cgroup"]
     );
     assert_eq!(
         PROC_PID_FILES.iter().map(|e| e.name).collect::<Vec<_>>(),

@@ -445,6 +445,7 @@ impl ProcFile {
             ProcKind::SysOstype => fmt::format_sys_ostype(),
             ProcKind::SysOsrelease => fmt::format_sys_osrelease(KERNEL_VERSION),
             ProcKind::SysHostname => fmt::format_sys_hostname(),
+            ProcKind::SelfCgroup | ProcKind::PidCgroup => fmt::format_cgroup(),
             ProcKind::Mounts | ProcKind::SelfMounts => {
                 let snapshot = crate::vfs::mount_snapshot();
                 let owned: Vec<(String, &'static str)> = snapshot

@@ -86,6 +86,10 @@ pub enum ProcKind {
     Mounts,
     /// `/proc/self/mounts` — same table, per-process path.
     SelfMounts,
+    /// `/proc/self/cgroup` — root cgroup (no controllers).
+    SelfCgroup,
+    /// `/proc/<pid>/cgroup`.
+    PidCgroup,
     /// `/proc/sys/kernel/ostype`.
     SysOstype,
     /// `/proc/sys/kernel/osrelease`.
@@ -180,7 +184,7 @@ pub const PROC_SYS_FILES: [ProcEntry; 3] = [
 /// pid-derived identity below instead; the two paths describe the same state but
 /// are distinct VFS nodes (this `self` is a directory, not a symlink to the pid
 /// directory).
-pub const PROC_SELF_FILES: [ProcEntry; 7] = [
+pub const PROC_SELF_FILES: [ProcEntry; 8] = [
     ProcEntry {
         name: "exe",
         ino: PROC_INO_BASE + 2,
@@ -215,6 +219,11 @@ pub const PROC_SELF_FILES: [ProcEntry; 7] = [
         name: "mounts",
         ino: PROC_INO_BASE + 19,
         kind: ProcKind::SelfMounts,
+    },
+    ProcEntry {
+        name: "cgroup",
+        ino: PROC_INO_BASE + 20,
+        kind: ProcKind::SelfCgroup,
     },
 ];
 
@@ -270,7 +279,7 @@ pub struct ProcPidEntry {
 }
 
 /// The files under every `/proc/<pid>` directory, in `readdir` order.
-pub const PROC_PID_FILES: [ProcPidEntry; 4] = [
+pub const PROC_PID_FILES: [ProcPidEntry; 5] = [
     ProcPidEntry {
         name: "cmdline",
         slot: 1,
@@ -291,10 +300,15 @@ pub const PROC_PID_FILES: [ProcPidEntry; 4] = [
         slot: 4,
         kind: ProcKind::PidMaps,
     },
+    ProcPidEntry {
+        name: "cgroup",
+        slot: 5,
+        kind: ProcKind::PidCgroup,
+    },
 ];
 
 /// `readdir` order of `/proc/<pid>`.
-pub const PROC_PID_ORDER: [&str; 4] = ["cmdline", "stat", "status", "maps"];
+pub const PROC_PID_ORDER: [&str; 5] = ["cmdline", "stat", "status", "maps", "cgroup"];
 
 /// Look up a `/proc/<pid>` file by name.
 pub fn proc_pid_file(name: &str) -> Option<ProcPidEntry> {
@@ -421,6 +435,12 @@ pub fn format_mounts(mounts: &[(&str, &str)]) -> Vec<u8> {
         );
     }
     out
+}
+
+/// `/proc/*/cgroup` — pagh runs every process in one root cgroup and implements
+/// no controllers. Linux's v2 format has one line per hierarchy: `0::/`.
+pub fn format_cgroup() -> Vec<u8> {
+    Vec::from(&b"0::/\n"[..])
 }
 
 pub fn format_version(version: &str) -> Vec<u8> {
