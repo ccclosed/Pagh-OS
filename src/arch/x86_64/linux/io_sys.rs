@@ -422,6 +422,85 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
 /// emit to the kernel console and return `count` (R2.2); a file descriptor writes
 /// at its offset and advances it; stdin is not writable (`EBADF`); an absent fd is
 /// `EBADF` (R2.14).
+
+/// `sendfile` (40): copy bytes from a regular file to a file/socket/console.
+///
+/// Only a regular-file input is supported; the output may be a regular file,
+/// the console, a pipe, an AF_UNIX socketpair end or an AF_INET stream. The
+/// input offset comes from `*offset` when non-NULL (and is written back),
+/// otherwise from the fd's current offset, which advances. A short output write
+/// ends the copy and returns the bytes transferred, like Linux.
+pub fn sys_sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<u64, Errno> {
+    if count > COUNT_MAX {
+        return Err(Errno::EINVAL);
+    }
+    let (input_node, input_offset) = match resolve_fd(in_fd as u32) {
+        Some(Resolved::File { node, offset }) => (node, offset),
+        Some(_) | None => return Err(Errno::EINVAL),
+    };
+    let output = match resolve_fd(out_fd as u32) {
+        Some(value) => value,
+        None => return Err(Errno::EBADF),
+    };
+    let mut in_offset = if offset != 0 {
+        check_user_ptr(offset, 8)?;
+        let raw = copy_in_pub(offset, 8);
+        u64::from_le_bytes(raw[..8].try_into().unwrap_or([0; 8]))
+    } else {
+        input_offset
+    };
+    let mut out_offset = match &output {
+        Resolved::File { offset, .. } => *offset,
+        _ => 0,
+    };
+    let mut total = 0u64;
+    let mut buf = [0u8; 8192];
+    while total < count {
+        let want = (count - total).min(buf.len() as u64) as usize;
+        let n = match input_node.read(in_offset, &mut buf[..want]) {
+            Ok(n) => n,
+            Err(_) => return Err(Errno::EINVAL),
+        };
+        if n == 0 {
+            break;
+        }
+        let written = match &output {
+            Resolved::Console => {
+                console_write(&buf[..n]);
+                n
+            }
+            Resolved::File { node, .. } => {
+                let written = node.write(out_offset, &buf[..n]).map_err(write_errno)?;
+                out_offset += written as u64;
+                written
+            }
+            Resolved::PipeWrite(end) => write_pipe(end, &buf[..n])?,
+            Resolved::Socket { tx, .. } => write_pipe(tx, &buf[..n])?,
+            Resolved::InetTcp(_) => {
+                crate::arch::x86_64::linux::inet_sock::tcp_write(out_fd, &buf[..n])?
+            }
+            Resolved::InetUdp(_) => {
+                crate::arch::x86_64::linux::inet_sock::udp_write_fd(out_fd, &buf[..n])?
+            }
+            _ => return Err(Errno::EINVAL),
+        };
+        in_offset += n as u64;
+        total += written as u64;
+        if written < n {
+            break;
+        }
+    }
+    if offset != 0 {
+        copy_out_pub(offset, &in_offset.to_le_bytes());
+    } else {
+        set_fd_offset(in_fd as u32, in_offset);
+    }
+    if let Resolved::File { .. } = output {
+        set_fd_offset(out_fd as u32, out_offset);
+    }
+    Ok(total)
+}
+
 pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
     if count > COUNT_MAX {
         return Err(Errno::EINVAL);

@@ -111,6 +111,8 @@ pub mod nr {
     pub const WRITEV: u64 = 20;
     /// `access` — check file accessibility.
     pub const ACCESS: u64 = 21;
+    /// `sendfile` (40) — copy a regular file to a stream/file descriptor.
+    pub const SENDFILE: u64 = 40;
     pub const PIPE: u64 = 22;
     /// `sched_yield` — yield the CPU.
     pub const SCHED_YIELD: u64 = 24;
@@ -310,7 +312,7 @@ pub fn marshal_args(
 /// History note: the previous test asserted membership for only 69 of the 109
 /// numbers the gate accepted and never asserted that anything was *unsupported*,
 /// so it could not catch either class of drift.
-pub const SUPPORTED_SYSCALLS: [u64; 126] = [
+pub const SUPPORTED_SYSCALLS: [u64; 127] = [
     nr::READ,
     nr::WRITE,
     nr::OPEN,
@@ -340,6 +342,7 @@ pub const SUPPORTED_SYSCALLS: [u64; 126] = [
     nr::DUP2,
     nr::NANOSLEEP,
     nr::GETPID,
+    nr::SENDFILE,
     nr::SOCKET,
     nr::CONNECT,
     nr::ACCEPT,
@@ -487,14 +490,14 @@ mod tests {
     fn supported_set_is_exact() {
         // Independent enumeration: the Linux x86_64 syscall numbers with a real
         // dispatcher arm, in ascending order (keep it sorted!).
-        const EXPECTED: [u64; 126] = [
+        const EXPECTED: [u64; 127] = [
             0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-            28, 32, 33, 35, 39, 41, 42, 43, 44, 45, 49, 50, 51, 53, 54, 55, 56, 59, 60, 61, 62, 63,
-            72, 73, 74, 75, 79, 80, 81, 82, 83, 84, 87, 89, 90, 91, 92, 93, 95, 96, 97, 99, 102,
-            104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 117, 118, 119, 120, 121, 131,
-            137, 138, 158, 186, 201, 202, 217, 218, 227, 228, 229, 230, 231, 232, 233, 234, 257,
-            258, 260, 262, 263, 264, 267, 268, 269, 270, 271, 273, 274, 281, 288, 290, 291, 292,
-            293, 295, 296, 302, 316, 318, 332, 334,
+            28, 32, 33, 35, 39, 40, 41, 42, 43, 44, 45, 49, 50, 51, 53, 54, 55, 56, 59, 60, 61, 62,
+            63, 72, 73, 74, 75, 79, 80, 81, 82, 83, 84, 87, 89, 90, 91, 92, 93, 95, 96, 97, 99,
+            102, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 117, 118, 119, 120, 121,
+            131, 137, 138, 158, 186, 201, 202, 217, 218, 227, 228, 229, 230, 231, 232, 233, 234,
+            257, 258, 260, 262, 263, 264, 267, 268, 269, 270, 271, 273, 274, 281, 288, 290, 291,
+            292, 293, 295, 296, 302, 316, 318, 332, 334,
         ];
 
         // 1. The two independent enumerations agree element-wise, and both are
