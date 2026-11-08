@@ -131,6 +131,90 @@ impl CellRange {
     }
 }
 
+/// The `[from, to]` columns a range covers on `row`, clipped to the grid.
+fn row_interval(range: CellRange, row: usize, cols: usize) -> Option<(usize, usize)> {
+    if cols == 0 || row < range.a.row || row > range.b.row {
+        return None;
+    }
+    let from = if row == range.a.row { range.a.col } else { 0 };
+    let to = if row == range.b.row {
+        range.b.col
+    } else {
+        cols - 1
+    };
+    if from > to || from >= cols {
+        return None;
+    }
+    Some((from, to.min(cols - 1)))
+}
+
+/// `a \ b` for two inclusive column intervals, as up to two segments.
+fn subtract(a: (usize, usize), b: (usize, usize)) -> [Option<(usize, usize)>; 2] {
+    let (af, at) = a;
+    let (bf, bt) = b;
+    if bf > at || bt < af {
+        return [Some(a), None];
+    }
+    let left = if af < bf { Some((af, bf - 1)) } else { None };
+    let right = if bt < at { Some((bt + 1, at)) } else { None };
+    [left, right]
+}
+
+/// Cells to restore and cells to highlight when moving from `old` to `new`.
+///
+/// A drag extends by one cell at a time; the old implementation repainted the
+/// whole range (restore all, then paint all) on every mouse event, which made a
+/// large selection O(cells) per pixel of mouse movement and dropped the frame
+/// rate. Computing the row-interval difference keeps each move proportional to
+/// the changed cells — usually one cell, and at most two short row segments.
+fn paint_diff(
+    old: Option<CellRange>,
+    new: Option<CellRange>,
+    cols: usize,
+) -> (alloc::vec::Vec<Cell>, alloc::vec::Vec<Cell>) {
+    let mut restore = alloc::vec::Vec::new();
+    let mut paint = alloc::vec::Vec::new();
+    if cols == 0 {
+        return (restore, paint);
+    }
+    let mut first_row = usize::MAX;
+    let mut last_row = 0usize;
+    let mut any = false;
+    for range in [old, new].into_iter().flatten() {
+        first_row = first_row.min(range.a.row);
+        last_row = last_row.max(range.b.row);
+        any = true;
+    }
+    if !any {
+        return (restore, paint);
+    }
+    for row in first_row..=last_row {
+        let before = old.and_then(|r| row_interval(r, row, cols));
+        let after = new.and_then(|r| row_interval(r, row, cols));
+        if let (Some(before), Some(after)) = (before, after) {
+            for (from, to) in subtract(before, after).into_iter().flatten() {
+                for col in from..=to {
+                    restore.push(Cell { col, row });
+                }
+            }
+            for (from, to) in subtract(after, before).into_iter().flatten() {
+                for col in from..=to {
+                    paint.push(Cell { col, row });
+                }
+            }
+        } else if let Some(before) = before {
+            for col in before.0..=before.1 {
+                restore.push(Cell { col, row });
+            }
+        } else if let Some(after) = after {
+            for col in after.0..=after.1 {
+                paint.push(Cell { col, row });
+            }
+        }
+    }
+    (restore, paint)
+}
+
 /// An in-progress or finished mouse selection.
 pub struct Selection {
     anchor: Option<Cell>,
@@ -218,17 +302,19 @@ impl Selection {
     /// covered first. Repeated calls are cheap: a drag moves the highlight by a
     /// cell or two, and only the cells that left the range are repainted back.
     pub fn paint(&mut self, cols: usize) {
-        self.unpaint_painted(cols);
-        let Some(range) = self.range else {
-            self.painted = false;
+        if self.painted_range == self.range {
             return;
-        };
-        for cell in range.cells(cols) {
+        }
+        let (restore, paint) = paint_diff(self.painted_range, self.range, cols);
+        for cell in restore {
+            framebuffer::console().paint_cell_selected(cell.col, cell.row, 0, 0x000000, true);
+        }
+        for cell in paint {
             framebuffer::console()
                 .paint_cell_selected(cell.col, cell.row, SELECT_FG, SELECT_BG, false);
         }
-        self.painted_range = Some(range);
-        self.painted = true;
+        self.painted_range = self.range;
+        self.painted = self.painted_range.is_some();
     }
 
     /// Repaint the highlighted range back to ordinary console colors.
