@@ -52,6 +52,7 @@ use crate::memory::layout::{PAGE_SIZE, USER_STACK_PAGES, USER_STACK_TOP};
 use crate::memory::pmm;
 use crate::sync::spinlock::Spinlock;
 use crate::task::compat::{self, CompatState};
+use crate::task::fd::OpenObject;
 use crate::task::{scheduler, stat};
 
 use super::elf::LoadSegment;
@@ -89,6 +90,8 @@ enum DirKind {
     SysKernelDir,
     /// `/proc/<pid>`, carrying the target pid.
     Pid(u64),
+    /// `/proc/self/fd` or `/proc/<pid>/fd`, carrying the target pid.
+    FdDir(u64),
 }
 
 struct ProcDir {
@@ -138,6 +141,73 @@ fn pid_dir(pid: u64) -> Arc<dyn VfsNode> {
     })
 }
 
+/// A `/proc/<pid>/fd/<n>` symlink.
+struct ProcFdLink {
+    name: String,
+    target: String,
+    ino: u64,
+}
+
+impl VfsNode for ProcFdLink {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_directory(&self) -> bool {
+        false
+    }
+    fn is_symlink(&self) -> bool {
+        true
+    }
+    fn read_link(&self) -> Option<String> {
+        Some(self.target.clone())
+    }
+    fn fs_ino(&self) -> u64 {
+        self.ino
+    }
+    fn size(&self) -> u64 {
+        self.target.len() as u64
+    }
+    fn mode(&self) -> u32 {
+        0o777
+    }
+}
+
+/// Human/Linux-shaped target for one open descriptor.
+fn fd_target(fd: u32, object: &OpenObject) -> String {
+    match object {
+        OpenObject::Stdin | OpenObject::Console => String::from("/dev/serial"),
+        OpenObject::File { path, .. } | OpenObject::Dir { path, .. } => path.clone(),
+        OpenObject::PipeRead(end) | OpenObject::PipeWrite(end) => {
+            alloc::format!("pipe:[{}]", Arc::as_ptr(end) as usize)
+        }
+        OpenObject::Socket { rx, .. } => alloc::format!("socket:[{}]", Arc::as_ptr(rx) as usize),
+        OpenObject::InetTcp(_) | OpenObject::InetUdp(_) => alloc::format!("socket:[{fd}]"),
+        OpenObject::UnixListener(_) | OpenObject::UnixSocketUnbound { .. } => {
+            alloc::format!("socket:[{fd}]")
+        }
+        OpenObject::Eventfd { .. } => String::from("anon_inode:[eventfd]"),
+        OpenObject::Epoll { .. } => String::from("anon_inode:[eventpoll]"),
+    }
+}
+
+fn fd_snapshot(pid: u64) -> Vec<(u32, String)> {
+    compat::with_pid_compat(pid, |cs| {
+        let capacity = cs.fds.capacity() as u32;
+        (0..capacity)
+            .filter_map(|fd| cs.fds.get(fd).map(|obj| (fd, fd_target(fd, obj))))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn fd_dir(pid: u64) -> Arc<dyn VfsNode> {
+    Arc::new(ProcDir {
+        name: String::from("fd"),
+        ino: fmt::pid_dir_ino(pid) + 5,
+        kind: DirKind::FdDir(pid),
+    })
+}
+
 impl VfsNode for ProcDir {
     fn name(&self) -> &str {
         &self.name
@@ -172,6 +242,9 @@ impl VfsNode for ProcDir {
                 for e in fmt::PROC_SELF_FILES.iter().copied() {
                     out.push(file_for(e));
                 }
+                if compat::current_has_compat() {
+                    out.push(fd_dir(scheduler::current_pid()));
+                }
             }
             DirKind::SysDir => {
                 out.push(sys_kernel_dir());
@@ -184,6 +257,16 @@ impl VfsNode for ProcDir {
             DirKind::Pid(pid) => {
                 for e in fmt::PROC_PID_FILES.iter().copied() {
                     out.push(pid_file(pid, e));
+                }
+                out.push(fd_dir(pid));
+            }
+            DirKind::FdDir(pid) => {
+                for (fd, target) in fd_snapshot(pid) {
+                    out.push(Arc::new(ProcFdLink {
+                        name: alloc::format!("{fd}"),
+                        target,
+                        ino: fmt::pid_dir_ino(pid) + 0x100 + fd as u64,
+                    }));
                 }
             }
         }
@@ -216,6 +299,13 @@ impl VfsNode for ProcDir {
                 fmt::proc_file(name).map(file_for).ok_or(VfsError::NotFound)
             }
             DirKind::SelfDir => {
+                if name == "fd" {
+                    return if compat::current_has_compat() {
+                        Ok(fd_dir(scheduler::current_pid()))
+                    } else {
+                        Err(VfsError::NotFound)
+                    };
+                }
                 let e = fmt::proc_self_file(name).ok_or(VfsError::NotFound)?;
                 if e.kind == ProcKind::SelfExe && current_exe().is_none() {
                     // No image to point at (`readlink` used to answer ENOENT in
@@ -238,9 +328,25 @@ impl VfsNode for ProcDir {
                 if !compat::compat_exists(pid) {
                     return Err(VfsError::NotFound);
                 }
+                if name == "fd" {
+                    return Ok(fd_dir(pid));
+                }
                 fmt::proc_pid_file(name)
                     .map(|e| pid_file(pid, e))
                     .ok_or(VfsError::NotFound)
+            }
+            DirKind::FdDir(pid) => {
+                let fd: u32 = name.parse().map_err(|_| VfsError::NotFound)?;
+                let target = fd_snapshot(pid)
+                    .into_iter()
+                    .find(|(open_fd, _)| *open_fd == fd)
+                    .map(|(_, target)| target)
+                    .ok_or(VfsError::NotFound)?;
+                Ok(Arc::new(ProcFdLink {
+                    name: String::from(name),
+                    target,
+                    ino: fmt::pid_dir_ino(pid) + 0x100 + fd as u64,
+                }))
             }
         }
     }

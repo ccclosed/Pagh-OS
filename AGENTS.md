@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.12.0**
+  be reflected here. **`main` currently reads 2.13.0**
   (the procfs slice 3 minor bump; it lands on `main` with the merge).
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
@@ -260,8 +260,11 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   buffer and flushed with it (the shadow-buffer commit had left it drawn *after*
   the flush, so it never reached the device), while an idle shell skips the
   overlay/repaint cycle instead of copying the surface once per timer tick.
-  **2.12.0** = `/proc/mounts` + `/proc/self/mounts` backed by a real VFS mount
-  registry (`mount_at_named` records rootfs/devtmpfs/ramfs/ext2/proc);
+  **2.13.0** = `/proc/self/fd` and `/proc/<pid>/fd`: numeric symlinks over the
+  live FdTable, with `/dev/serial`, real file/directory paths, `pipe:[...]`,
+  `socket:[...]` and `anon_inode:[...]` targets; **2.12.0** = `/proc/mounts` +
+  `/proc/self/mounts` backed by a real VFS mount registry (`mount_at_named`
+  records rootfs/devtmpfs/ramfs/ext2/proc);
   **2.11.0** = procfs slice 4: `/proc/<pid>/{cmdline,stat,status,maps}` for every live
   pid plus `/proc/self/{stat,statm}`, with target-state snapshots taken under
   `COMPAT_STATES` and formatted after the lock is released; **2.10.0** = the procfs slice 3: `/proc/version` (`pagh <version> (x86_64) #1 SMP`,
@@ -287,6 +290,12 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   vendored `embedded-tls`. Previous minors: 2.2.0 = low-RAM heap cap +
   version-agnostic Limine loader; 2.1.0 = the COW fork/demand-paging drop
   (PR #8) + real POSIX signal delivery (PRs #9/#10).
+- **Release cadence (human request, 2.13.0)**: do not tag every commit. Accumulate
+  **4–5 commits per release**; the first commit of the batch carries the version
+  bump, the last one carries the tag and GitHub release. Choose the batch version
+  by its highest-impact change: any image/ABI break -> MAJOR, any user-visible
+  feature -> MINOR, otherwise PATCH. Low-impact documentation and test commits ride in the next
+  MINOR/PATCH instead of getting their own release. CI still runs on every commit.
 - **PATCH** — fixes, diagnostics, docs, tooling, vendored-dep refreshes with
   no behavior change. Docs-only commits (this file, READMEs) do not bump.
 - **Tags**: tag the release commit with the bare version string (`2.1.0`,
@@ -308,9 +317,9 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   and read-only `/proc/sys/kernel/{ostype,osrelease,hostname}` are rendered from
   live kernel state (CPUID, PMM counters, the tick clock, the scheduler's
   user/system/idle tick accounting and live task counts, and the target
-  process's `CompatState` snapshot). Deferred, returning `ENOENT` today:
-  `/proc/self/{fd,cgroup}` — `ps` and `df` now have `/proc/<pid>` and
-  `/proc/mounts`, but `htop` still wants per-fd links.
+  process's `CompatState` snapshot). `/proc/self/fd` and `/proc/<pid>/fd` expose
+  the fd table as numeric symlinks. Deferred, returning `ENOENT` today:
+  `/proc/self/cgroup` (and mountinfo/statfs metadata).
 - Signals (issue #12): `kill(2)` (nr 62), process-group addressing
   (`kill(0|-1|-pgid)`), `SIGSTOP`/`SIGCONT` scheduling, `wait4(WUNTRACED|WCONTINUED)`
   and timer-tick delivery to a syscall-free task are all implemented. Still missing:

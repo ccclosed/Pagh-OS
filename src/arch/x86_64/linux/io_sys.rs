@@ -162,7 +162,7 @@ fn resolve_fd(fd: u32) -> Option<Resolved> {
                 rx: Arc::clone(rx),
                 tx: Arc::clone(tx),
             },
-            OpenObject::File { node, offset } => Resolved::File {
+            OpenObject::File { node, offset, .. } => Resolved::File {
                 node: Arc::clone(node),
                 offset: *offset,
             },
@@ -788,6 +788,7 @@ fn open_resolved(abs: &str) -> Result<u64, Errno> {
     } else {
         OpenObject::File {
             node: Arc::clone(&node),
+            path: String::from(abs),
             offset: 0,
         }
     };

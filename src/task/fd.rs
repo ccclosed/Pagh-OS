@@ -145,6 +145,8 @@ pub enum OpenObject {
     File {
         /// The VFS node backing this descriptor.
         node: Arc<dyn VfsNode>,
+        /// Absolute path the descriptor was opened under (for `/proc/.../fd`).
+        path: String,
         /// Current read/write offset within the file.
         offset: u64,
     },
@@ -208,8 +210,9 @@ impl OpenObject {
             OpenObject::InetUdp(u) => OpenObject::InetUdp(Arc::clone(u)),
             OpenObject::PipeRead(e) => OpenObject::PipeRead(Arc::clone(e)),
             OpenObject::PipeWrite(e) => OpenObject::PipeWrite(Arc::clone(e)),
-            OpenObject::File { node, offset } => OpenObject::File {
+            OpenObject::File { node, path, offset } => OpenObject::File {
                 node: Arc::clone(node),
+                path: path.clone(),
                 offset: *offset,
             },
             OpenObject::Dir {
