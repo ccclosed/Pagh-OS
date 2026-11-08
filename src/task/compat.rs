@@ -275,6 +275,22 @@ pub fn remove_compat(pid: u64) -> Option<CompatState> {
 pub fn compat_exists(pid: u64) -> bool {
     COMPAT_STATES.lock().contains_key(&pid)
 }
+/// Notify `parent` that `child` changed state, matching Linux's SIGCHLD.
+///
+/// This is a best-effort queue: a parent that is gone (or is not a compat
+/// process) simply does not receive the signal. The call happens after the
+/// registry locks are released, so `send_signal` may re-enter `COMPAT_STATES`
+/// safely.
+fn notify_parent_sigchld(parent: u64) {
+    if parent == 0 {
+        return;
+    }
+    let _ = crate::arch::x86_64::linux::signal::send_signal(
+        parent,
+        crate::arch::x86_64::linux::signal_frame::SIGCHLD,
+    );
+}
+
 pub fn finish_compat_exit(pid: u64) {
     if let Some(state) = remove_compat(pid) {
         if state.waitable && state.ppid != 0 {
@@ -285,6 +301,7 @@ pub fn finish_compat_exit(pid: u64) {
         // An exit SUPERSEDES any pending stop/continue report for this child: the
         // parent's next `wait4` must see the exit, not a stale "stopped" event.
         clear_child_state_events(state.ppid, pid);
+        notify_parent_sigchld(state.ppid);
     }
 }
 pub fn current_ppid() -> u64 {
@@ -347,6 +364,7 @@ pub fn note_child_stopped(child: u64, sig: u64) {
     };
     STOPPED_CHILDREN.lock().insert((parent, child), sig as u8);
     CONTINUED_CHILDREN.lock().remove(&(parent, child));
+    notify_parent_sigchld(parent);
 }
 
 /// Record that `child` was resumed: its parent's next `wait4(WCONTINUED)`
@@ -362,6 +380,7 @@ pub fn note_child_continued(child: u64) {
     };
     STOPPED_CHILDREN.lock().remove(&(parent, child));
     CONTINUED_CHILDREN.lock().insert((parent, child));
+    notify_parent_sigchld(parent);
 }
 
 /// Drop every pending stop/continue report for `(parent, child)`: the child
