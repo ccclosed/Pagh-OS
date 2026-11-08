@@ -45,6 +45,11 @@
   boot-seed, печатает `entropy: stage=degraded cause=NoHardwareEntropy` при загрузке и
   `SELFTEST at_random: blocks=64 distinct=64 digest=… entropy=none …` в `selftest` —
   `python3 tools/e2e.py selftest --cpu qemu64` и есть прогон этого пути.
+- `python3 tools/e2e.py selftest --nvme [--disk PATH]` — тот же in-guest selftest, но
+  data-disk подключён как NVMe (`-device nvme,...`) вместо virtio-blk: на свежем
+  образе проверяются формат/монтирование ext2 на NVMe, а routine
+  `nvme::PRP-list multi-page read + batch depth` реально исполняется (без `--nvme`
+  она печатает `skip`, потому что `nvme0` не зарегистрирован).
 - Env-оверрады: `LIMINE_DIR`/`LIMINE_EFI` (иначе автопоиск/автоскачивание), `OVMF`/`--ovmf`
   (если заданы и файл существует — берутся они; иначе `OVMF.fd` из корня репо; иначе системный
   `OVMF_CODE.fd`, напр. `/usr/share/edk2/ovmf/`), `PAGH_DISK` (дефолт `disk.img`),

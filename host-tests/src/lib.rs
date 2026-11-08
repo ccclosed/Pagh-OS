@@ -272,6 +272,14 @@ pub mod link_walk;
 #[path = "../../src/fs/format_policy.rs"]
 pub mod format_policy;
 
+// `nvme_prp` is the NVMe driver's pure transfer arithmetic: PRP1/PRP2 and the
+// PRP-list page contents (NVMe Base Spec §3.3.3), LBA-aligned command chunking,
+// and the polled SQ/CQ ring state. `core`-only and self-contained, so the host
+// property tests exercise the exact source the kernel compiles (property
+// `nvme_io`, no numeric `pNN` name to avoid racing the other issue streams).
+#[path = "../../src/drivers/nvme_prp.rs"]
+pub mod nvme_prp;
+
 // `ext2::symlink` is the pure symlink-layout + hard-link accounting core of the
 // ext2 writer (issue #18, contract `EXT2-LINKS.md` §2/§3): which targets stay
 // inline in the inode's `i_block` (≤ 59 bytes) and which need a data block, how
@@ -492,6 +500,12 @@ mod properties {
     // taken by the OpenPGP `.deb`-digest property, so this is the next free
     // number.
     mod p56;
+
+    // NVMe PRP lists + queue-depth arithmetic (PRP1/PRP2/list page, LBA chunk
+    // planning, polled CQ phase tags, CAP.MQES clamping). The driver itself is
+    // MMIO/PMM code and cannot run on the host; this is the half that decides
+    // which physical pages a command names.
+    mod nvme_io;
 
 }
 

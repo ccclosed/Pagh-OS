@@ -261,7 +261,9 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   the flush, so it never reached the device), while an idle shell skips the
   overlay/repaint cycle instead of copying the surface once per timer tick.
   **2.16.0** = the current unreleased batch: signalfd/signalfd4 and real process
-  groups (`pgid` in `CompatState`, setpgid/getpgid/getpgrp/setsid, group kill);
+  groups (`pgid` in `CompatState`, setpgid/getpgid/getpgrp/setsid, group kill),
+  plus the NVMe rewrite (multi-page PRP lists, a four-command polled queue and
+  the bring-up/protocol fixes that made NVMe actually usable under QEMU);
   **2.15.0** = the 15-commit Linux-compat batch: `*at` family, sendfile/
   copy_file_range, legacy/advisory syscalls, memfd_create, timerfd (poll/epoll
   integrated), SIGCHLD delivery, `/proc/*/mountinfo` and shell df/ps, plus the
@@ -341,8 +343,13 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `kill(0)`/`kill(-pgid)` address the group) as of 2.16.0. Still missing: terminal
   foreground-group tracking and the `^Z` tty stop path.
 
-- NVMe driver is polled and page-chunked; FLUSH (opcode 0x08) is issued at WAL
-  transaction boundaries, but there are no PRP lists and no queue depth > 1.
+- NVMe driver is polled (no IRQs) with multi-page PRP lists and four commands in
+  flight; FLUSH (opcode 0x00) is issued at WAL transaction boundaries. Still
+  missing: the driver takes the whole namespace (no partition parsing, one
+  namespace), one I/O queue pair (admin commands are serialized), no timeout
+  recovery (a completion timeout marks the device failed until reboot), no
+  SMART/self-test or shutdown notification, and unaligned writes are
+  read-modify-write per LBA rather than batched.
   (The former "embedded-tls hangs on large streams" gap is closed: a multi-MB
   TLS fetch completes end to end — `lx_tlsbig`, issue #19 — and the live
   `apt update` runs over HTTPS.)

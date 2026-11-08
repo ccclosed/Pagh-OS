@@ -1090,9 +1090,14 @@ class Harness:
         _, ovmf_args = resolve_ovmf(a.ovmf, self.vars_path)
         argv = ["qemu-system-x86_64", "-cpu", a.cpu, "-m", a.memory]
         argv += ovmf_args
+        # NVMe is opt-in: the normal path stays virtio-blk (fast under TCG and
+        # what the image layout is sized for), while `--nvme` exercises the
+        # driver's PRP-list/queue-depth data path in the same harness.
+        data_device = ("nvme,drive=hd0,serial=pagh0001" if getattr(a, "nvme", False)
+                       else "virtio-blk-pci,drive=hd0")
         argv += ["-drive", f"file=fat:rw:{self.stage_dir},format=raw",
                  "-drive", f"file={disk},format=raw,if=none,id=hd0",
-                 "-device", "virtio-blk-pci,drive=hd0"]
+                 "-device", data_device]
         if net:
             # QEMU user-net: the guest reaches a host-side mirror on 10.0.2.2:8000
             # and, for the live mode, the outside world.
@@ -1600,6 +1605,10 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--memory", default="1024M")
     q.add_argument("--disk", default=None,
                    help="data disk image (default: per-run scratch copy of disk.img)")
+    q.add_argument("--nvme", action="store_true",
+                   help="attach the data disk as an NVMe controller instead of "
+                        "virtio-blk (exercises the NVMe PRP-list/queue-depth path; "
+                        "boot falls back to NVMe when virtio-blk is absent)")
     q.add_argument("--reuse-scratch-disk", action="store_true",
                    help="reuse .cache/e2e_disk.img instead of re-copying disk.img")
     q.add_argument("--ovmf", default=os.environ.get("OVMF", "OVMF.fd"))

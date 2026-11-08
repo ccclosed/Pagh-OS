@@ -2503,6 +2503,102 @@ mod virtio_blk_tests {
     }
 }
 
+// ─── NVMe PRP-list / queue-depth data path ───────────────────────────────────
+//
+// These routines run only when an NVMe namespace was registered at boot (the
+// normal QEMU/e2e path uses virtio-blk and skips them). They are deliberately
+// READ-ONLY: on real hardware `nvme0` is the machine's whole namespace, not a
+// scratch partition, so a write/restore test would risk user data if the kernel
+// died between the two operations. The reads still exercise both new paths:
+// a 640 KiB request is split into multi-page commands (PRP>2 → PRP list) and
+// batched four commands deep, then every 4 KiB page is compared against an
+// independent one-page read (PRP2=0).
+mod nvme_tests {
+    use crate::drivers::{self, BlockDevice};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    const PAGE: usize = 4096;
+    const CHUNK: usize = 64 * 1024;
+    const CHUNKS: usize = 10;
+
+    fn device() -> Option<Arc<dyn BlockDevice>> {
+        drivers::get_block("nvme0")
+    }
+
+    /// **Validates: NVMe PRP list + polled queue depth**
+    pub fn multi_page_read_and_batch_depth() {
+        let dev = match device() {
+            Some(d) => d,
+            None => {
+                crate::skip_kernel!("nvme", "no NVMe namespace, PRP-list test skipped");
+                return;
+            }
+        };
+
+        let sectors = dev.sector_count();
+        assert_kernel!(
+            sectors != 0,
+            "nvme: sector_count reports a non-zero namespace"
+        );
+        let needed_sectors = (CHUNK * CHUNKS / 512) as u64;
+        if sectors != 0 && sectors < needed_sectors {
+            crate::skip_kernel!(
+                "nvme-small",
+                "namespace too small for the 640 KiB multi-page read"
+            );
+            return;
+        }
+
+        let total = CHUNK * CHUNKS;
+        let mut batched = vec![0u8; total];
+        assert_kernel!(
+            dev.read_block(0, &mut batched).is_ok(),
+            "nvme: 640 KiB multi-page read succeeds"
+        );
+
+        // Exactly two pages: PRP2 must be the second page address, not a list.
+        let mut pair = vec![0u8; 2 * PAGE];
+        assert_kernel!(
+            dev.read_block(0, &mut pair).is_ok(),
+            "nvme: two-page read succeeds"
+        );
+        assert_kernel!(
+            pair[..] == batched[..2 * PAGE],
+            "nvme: two-page read matches the batched multi-page read"
+        );
+
+        // Each 4 KiB page is read through the single-page (PRP1-only) path and
+        // compared with the corresponding page of the PRP-list transfer.
+        let mut one = vec![0u8; PAGE];
+        let mut mismatch: Option<usize> = None;
+        for page in 0..(total / PAGE) {
+            let sector = (page * (PAGE / 512)) as u64;
+            if dev.read_block(sector, &mut one).is_err() {
+                mismatch = Some(page);
+                break;
+            }
+            if one[..] != batched[page * PAGE..(page + 1) * PAGE] {
+                mismatch = Some(page);
+                break;
+            }
+        }
+        assert_eq_kernel!(
+            mismatch,
+            None,
+            "nvme: every 4 KiB page matches its one-page read (PRP-list addresses)"
+        );
+
+        // The 640 KiB request needs 10 commands; the driver must have had more
+        // than one in flight for at least one of the batches.
+        let depth = crate::drivers::nvme::max_io_batch_depth();
+        assert_kernel!(
+            depth >= 2,
+            "nvme: block path submitted more than one command per batch"
+        );
+    }
+}
+
 // ─── RAM-mock BlockDevice for ext2 + journal property tests (Task 4.1) ───────
 //
 // A `Spinlock`-guarded byte buffer addressed at the 512-byte sector granularity
@@ -5901,6 +5997,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "virtio-blk::virtqueue buffers not aliased (Property 16)",
             virtio_blk_tests::virtqueue_buffers_not_aliased
+        ),
+        (
+            "nvme::PRP-list multi-page read + batch depth",
+            nvme_tests::multi_page_read_and_batch_depth
         ),
         ("fs::crc32 known-answer", fs_prop_tests::crc32_known_answer),
         (

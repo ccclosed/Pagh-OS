@@ -13,7 +13,8 @@ framebuffer-консоль, VT-эмулятор, курсор, serial. Коор�
 | `virtio/mod.rs` | Корень virtio-обвязки (`blk`, `hal`) |
 | `virtio/hal.rs` | `PaghHal` — реализация `virtio_drivers::Hal`: DMA/MMIO через `pmm`/`vmm`; автоматические bounce-буферы для неконтинуальных heap-буферов |
 | `virtio/blk.rs` | virtio-blk: `PciTransport` + `VirtIOBlk`, обёрнут в `BlockDevice` «virtio-blk0», секторный кэш 2 MiB (write-through), `flush` = `VIRTIO_BLK_T_FLUSH` |
-| `nvme.rs` | NVMe поверх PCIe — поллинг (phase-bit), BAR0 MMIO, PRP scratch-frame, FLUSH (opcode 0x08) для дюрабильности WAL (issue #15); регистрируется как `BlockDevice` |
+| `nvme.rs` | NVMe поверх PCIe — поллинг (phase-bit, поиск по CID), BAR0 MMIO, многостраничные PRP (PRP1 + PRP-list), до 4 команд в полёте, FLUSH (opcode 0x00) для дюрабильности WAL (issue #15), RMW для невыровненных записей; регистрируется как `BlockDevice` |
+| `nvme_prp.rs` | Чистая (`core` только) арифметика NVMe: PRP1/PRP2/PRP-list, LBA-чанки команд, SQ/CQ phase-tag и зажим CAP.MQES — включается в host-tests как есть |
 | `ps2_kbd.rs` | PS/2 клавиатура (IRQ1): 128-байтное кольцо сканкодов, трекинг Ctrl+C, защёлки `CTRL_C`/`FG_PID` |
 | `ps2_mouse.rs` | PS/2 мышь (IRQ12) через 8042 aux: сборка 3-байтовых пакетов, зажатые координаты + кнопки + `seq` |
 | `framebuffer.rs` | Limine framebuffer текстовая консоль + 2D-графика: шрифт Fira Code 8×18 (`assets/font8x18.bin` — 8-битное **покрытие** на пиксель, генерируется `tools/gen_font.py`), `FbWriter`, скролл, status bar, макросы `fb_print!` |
@@ -80,6 +81,29 @@ RX-поллинг по биту `STATUS.DD`; TX: копия в слот-буфе
 проходят `PaghHal::share`: прямой DMA при физической континуальности, иначе bounce-буфер
 + reconcile на `unshare`. Весь доступ — под одним `Spinlock` на время обмена.
 
+### NVMe
+PCI-класс 01h/08h → `enable_bus_master` → BAR0 (`map_mmio(..., 0x4000)`) → disable →
+AQA/ASQ/ACQ → enable → Identify Controller → namespace list → Identify Namespace →
+Create IOCQ/IOSQ (qid 1) → готово. `CAP.MQES` зажимает размеры очередей, `CAP.DSTRD`
+берётся из битов 35:32 (младший ниббл старшего dword), `CAP.MPSMIN` обязан быть 0
+(драйвер программирует CC.MPS = 4 KiB). `QSIZE` в Create-командах **zero-based**:
+64-энтрийная очередь создаётся значением 63, иначе контроллер заворачивается на запись
+позже хоста и читает за пределами кольца.
+
+I/O-путь: до `IO_QUEUE_DEPTH = 4` команд в полёте, у каждой свой физически
+континуальный data-slot (≤ 16 страниц / 64 KiB, дополнительно зажатый MDTS) и своя
+PRP-list страница. `rw_common` режет запрос на LBA-выровненные чанки и отправляет
+батч: все PRP валидируются до записи первого SQ-слота, дверной звонок SQ — один на
+батч. PRP1 = первая страница (offset 0), PRP2 = вторая страница для ровно двух
+страниц либо адрес PRP-list для трёх и более; entry 0 списка — **вторая** страница.
+Завершения поллятся по phase-bit и сопоставляются с командами **по CID** (не по
+порядку прихода); при таймауте/неизвестном CID драйвер помечает устройство
+отказавшим (`io_failed`) вместо рискованного сопоставления. Невыровненные записи
+идут read-modify-write по LBA, чтобы не затирать соседние сектора. `sector_count()`
+отдаёт весь namespace в 512-байтных секторах (нужно `ext2::format`).
+Не реализовано: IRQ, несколько namespace, разбор партиций (берётся весь namespace),
+несколько I/O-очередей, SMART/self-test и shutdown-notification.
+
 ### Консоль / VT / курсор
 
 ![Консоль pagh: шрифт Fira Code, каретка, статус-бар и программный курсор](../../docs/shell.png)
@@ -142,3 +166,9 @@ RX-поллинг по биту `STATUS.DD`; TX: копия в слот-буфе
 - Шрифт покрывает только ASCII 0x20–0x7E; остальное — fallback-бокс.
 - `CHARS_PER_LINE=100` — фиксированная ширина переноса независимо от разрешения.
 - DMA-буферы e1000/NVMe — PMM-кадры через HHDM; heap-аллокаций на I/O-пути нет.
+  NVMe выделяет data-slot'ы и PRP-list страницы на `attach`, не на каждый запрос.
+- PRP-list entry 0 — вторая страница, не первая (PRP1 уже назвал первую); `QSIZE`
+  zero-based; `CAP.DSTRD` — младший ниббл `cap_hi`, а не `(cap_hi >> 12)`.
+- Команда покрывает целые LBA: `plan_chunk` держит `within + data_len` и весь
+  LBA-command внутри slot; выровненные записи не содержат padding. Невыровненные
+  записи — RMW, иначе байты соседних секторов были бы обнулены.

@@ -247,7 +247,7 @@ PATTERN_CLAIMS: list[dict] = [
 NOT_CHECKED = [
     "the interpreter spelling inside Windows-only `.cmd`/`.ps1` runtime lines "
     "(CANON_SKIP_SUFFIX: a platform rule, not a defect — Windows has `python`, not `python3`)",
-    "NVMe 'no PRP lists and no queue depth > 1' (driver-level knowledge)",
+    "whether the NVMe limitation list is complete (driver-level knowledge)",
     "signals 'no timer-tick delivery' (judgement about scheduling semantics)",
     "whether a limitation list is complete, or an explanation convincing",
     "a version stated in prose without the word 'current'",
