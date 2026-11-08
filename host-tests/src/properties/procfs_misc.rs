@@ -104,28 +104,34 @@ proptest! {
         prop_assert!(!FILESYSTEMS[2].nodev);
     }
 
-    /// `/proc/loadavg`: three honest `0.00` averages, then `runnable/total` and
+    /// `/proc/loadavg`: the three computed averages, then `runnable/total` and
     /// the last allocated pid. The counts parse back to the inputs and
     /// `runnable <= total` is upstream state, not something the renderer clamps.
     #[test]
     fn loadavg_is_exact_and_parseable(
+        one in any::<u32>(),
+        five in any::<u32>(),
+        fifteen in any::<u32>(),
         runnable in any::<u64>(),
         stopped in any::<u64>(),
         last_pid in any::<u64>(),
     ) {
         let total = runnable.saturating_add(stopped);
-        let input = LoadAvg { runnable, total, last_pid };
+        let input = LoadAvg { one, five, fifteen, runnable, total, last_pid };
         let out = format_loadavg(&input);
         let text = core::str::from_utf8(&out).unwrap();
         prop_assert_eq!(
             text,
-            format!("0.00 0.00 0.00 {runnable}/{total} {last_pid}\n")
+            format!(
+                "{}.{:02} {}.{:02} {}.{:02} {runnable}/{total} {last_pid}\n",
+                one / 100, one % 100, five / 100, five % 100,
+                fifteen / 100, fifteen % 100
+            )
         );
         prop_assert_eq!(text.lines().count(), 1);
 
         let fields: Vec<&str> = text.trim_end_matches('\n').split(' ').collect();
         prop_assert_eq!(fields.len(), 5);
-        prop_assert_eq!(&fields[..3], &["0.00", "0.00", "0.00"]);
 
         let (run, tot) = fields[3].split_once('/').expect("runnable/total field");
         prop_assert_eq!(run.parse::<u64>().unwrap(), runnable);

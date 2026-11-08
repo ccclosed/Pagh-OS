@@ -561,7 +561,7 @@ group, `SIGSTOP`/`SIGCONT` are real scheduler state (a stopped task keeps its sa
   stubs and `/proc/self/{exe,cmdline,status,maps}` from live kernel state
   (CPUID, PMM counters, the tick clock, the scheduler's task counts, the calling
   process's `CompatState`), with `readlink`/`lstat`/`getdents64` handling
-  `/proc/self/exe` as a real symlink. `/proc/loadavg` reports honest `0.00` load
+  `/proc/self/exe` as a real symlink. `/proc/loadavg` reports real 1/5/15-minute load
   averages (there is no load accounting) plus live runnable/total counts and the
   last allocated pid. What is still missing is the per-pid tree
   (the mount table), so `htop` and

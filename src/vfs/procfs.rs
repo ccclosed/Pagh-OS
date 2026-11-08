@@ -431,8 +431,12 @@ impl ProcFile {
             ProcKind::Version => fmt::format_version(KERNEL_VERSION),
             ProcKind::FileSystems => fmt::format_filesystems(&fmt::FILESYSTEMS),
             ProcKind::LoadAvg => {
+                let (one, five, fifteen) = scheduler::load_averages();
                 let (runnable, total, last_pid) = scheduler::loadavg_counts();
                 fmt::format_loadavg(&fmt::LoadAvg {
+                    one,
+                    five,
+                    fifteen,
                     runnable,
                     total,
                     last_pid,

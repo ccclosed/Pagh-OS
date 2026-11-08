@@ -499,6 +499,12 @@ pub fn format_filesystems(entries: &[FileSystemEntry]) -> Vec<u8> {
 /// allocation).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoadAvg {
+    /// 1-minute average in hundredths (`123` = `1.23`).
+    pub one: u32,
+    /// 5-minute average in hundredths.
+    pub five: u32,
+    /// 15-minute average in hundredths.
+    pub fifteen: u32,
     /// Ready queue + the running task (idle excluded).
     pub runnable: u64,
     /// Live tasks: runnable + parked/stopped (blocking waits stay runnable).
@@ -508,7 +514,7 @@ pub struct LoadAvg {
 }
 
 /// Render `/proc/loadavg`:
-/// `"0.00 0.00 0.00 <runnable>/<total> <last_pid>\n"`.
+/// `"<1m> <5m> <15m> <runnable>/<total> <last_pid>\n"`, averages in hundredths.
 ///
 /// Linux's fourth field is `runnable/total` where `total` is the number of
 /// threads. pagh has no blocked (uninterruptible) state and no sleeping-task
@@ -519,7 +525,18 @@ pub fn format_loadavg(l: &LoadAvg) -> Vec<u8> {
     let mut out = Vec::with_capacity(48);
     push(
         &mut out,
-        format_args!("0.00 0.00 0.00 {}/{} {}\n", l.runnable, l.total, l.last_pid),
+        format_args!(
+            "{}.{:02} {}.{:02} {}.{:02} {}/{} {}\n",
+            l.one / 100,
+            l.one % 100,
+            l.five / 100,
+            l.five % 100,
+            l.fifteen / 100,
+            l.fifteen % 100,
+            l.runnable,
+            l.total,
+            l.last_pid
+        ),
     );
     out
 }

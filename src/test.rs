@@ -1795,14 +1795,22 @@ mod procfs_tests {
             );
         }
 
-        // Three honest zero averages, then live scheduler counts and the last
-        // allocated pid.
+        // Three numerically valid averages, then live scheduler counts and the
+        // last allocated pid.
         let loadavg = read_path("/proc/loadavg");
         let loadavg_text = core::str::from_utf8(&loadavg).unwrap_or("");
         let fields: Vec<&str> = loadavg_text.trim_end_matches('\n').split(' ').collect();
         assert_eq_kernel!(fields.len(), 5, "procfs: /proc/loadavg has five fields");
         for field in &fields[..3] {
-            assert_eq_kernel!(*field, "0.00", "procfs: load average is honestly 0.00");
+            let (whole, frac) = field.split_once('.').unwrap_or(("", ""));
+            assert_kernel!(
+                !whole.is_empty() && whole.bytes().all(|b| b.is_ascii_digit()),
+                "procfs: loadavg integer part"
+            );
+            assert_kernel!(
+                frac.len() == 2 && frac.bytes().all(|b| b.is_ascii_digit()),
+                "procfs: loadavg two decimals"
+            );
         }
         let pair: Vec<&str> = fields[3].split('/').collect();
         assert_eq_kernel!(pair.len(), 2, "procfs: loadavg runnable/total shape");

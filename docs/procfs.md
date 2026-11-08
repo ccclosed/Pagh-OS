@@ -144,7 +144,7 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 /proc/stat            обычный файл, тики user/system/idle + счётчики событий
 /proc/version         обычный файл, `pagh <version> (x86_64) #1 SMP`
 /proc/filesystems     обычный файл, только реализованные драйверы
-/proc/loadavg         обычный файл, 0.00-средние + live-счётчики
+/proc/loadavg         обычный файл, 1/5/15-мин средние + live-счётчики
 /proc/sys             каталог (read-only), readdir → ["kernel"]
 /proc/sys/kernel      каталог (read-only), readdir → ["ostype","osrelease","hostname"]
 /proc/sys/kernel/ostype     обычный файл, "Pagh\n"
@@ -165,7 +165,7 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 | `/proc/uptime` | libuv `uv_uptime` (`sscanf("%lf")`), busybox `uptime` | Тривиально и переиспользует уже существующий тик-клок |
 | `/proc/version` | скрипты/диагностика, `uname -v`-подобные проверки; ни один E2E-сценарий на нём не стоит | Дёшев (константа + `CARGO_PKG_VERSION`) и закрывает давно отложенный путь |
 | `/proc/filesystems` | busybox/mount-подобные читатели, диагностика | Статическая таблица реально реализованных драйверов; врёт только при добавлении драйвера без строки в таблице, поэтому таблица — часть контракта |
-| `/proc/loadavg` | libuv `uv_loadavg` (при отсутствии/нуле падает обратно на `sysinfo(2)`), `uptime`/`w` | Средние честно `0.00`; live-счётчики задач и `last_pid` уже есть в планировщике |
+| `/proc/loadavg` | libuv `uv_loadavg`, `uptime`/`w` | Средние считаются экспоненциально (fixed point 16.16, окна 60/300/900 с) из live `runnable`; счётчики задач и `last_pid` — из планировщика. Обновление ленивое, при чтении, без FPU |
 | `/proc/sys/kernel/{ostype,osrelease,hostname}` | скрипты, читающие версию/имя хоста; `osrelease` совпадает с `/mnt/etc/pagh-release` | Три константы и два каталога; записываемого sysctl нет, поэтому поверхность read-only |
 
 ### 2.2 Что осознанно отложено и почему

@@ -262,15 +262,17 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   overlay/repaint cycle instead of copying the surface once per timer tick.
   **2.13.0** = `/proc/self/fd` and `/proc/<pid>/fd`: numeric symlinks over the
   live FdTable, with `/dev/serial`, real file/directory paths, `pipe:[...]`,
-  `socket:[...]` and `anon_inode:[...]` targets; **2.12.0** = `/proc/mounts` +
+  `socket:[...]` and `anon_inode:[...]` targets; plus real 1/5/15-minute
+  exponentially decayed `/proc/loadavg` (fixed point 16.16, lazy update, no
+  FPU), replacing the honest `0.00` placeholder; **2.12.0** = `/proc/mounts` +
   `/proc/self/mounts` backed by a real VFS mount registry (`mount_at_named`
   records rootfs/devtmpfs/ramfs/ext2/proc);
   **2.11.0** = procfs slice 4: `/proc/<pid>/{cmdline,stat,status,maps}` for every live
   pid plus `/proc/self/{stat,statm}`, with target-state snapshots taken under
   `COMPAT_STATES` and formatted after the lock is released; **2.10.0** = the procfs slice 3: `/proc/version` (`pagh <version> (x86_64) #1 SMP`,
   the real crate version, not a fake Linux release), `/proc/filesystems` (only the
-  implemented `proc`/`ramfs`/`ext2` drivers), `/proc/loadavg` (honest `0.00` load
-  averages plus live runnable/total scheduler counts and the last allocated pid) and
+  implemented `proc`/`ramfs`/`ext2` drivers), `/proc/loadavg` (currently real 1/5/15-minute
+  averages from 2.13.0, plus live runnable/total scheduler counts and the last allocated pid) and
   read-only `/proc/sys/kernel/{ostype,osrelease,hostname}`; host properties and
   in-QEMU checks. **2.9.1** = the memory-docs truth pass: the fixed 512 MiB heap and the
   `MAX_INDEX_*` clean-failure policy are recorded with the exact constants,

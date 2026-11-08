@@ -575,6 +575,56 @@ pub fn loadavg_counts() -> (u64, u64, u64) {
     let last_pid = NEXT_PID.load(Ordering::Relaxed).saturating_sub(1);
     (runnable, runnable + stopped, last_pid)
 }
+/// Exponentially decayed 1/5/15-minute load averages, fixed point 16.16.
+///
+/// Linux's load average is `load = load * exp(-dt/window) + runnable *
+/// (1 - exp(-dt/window))`. This kernel has no FPU context in the scheduler, so
+/// the same recurrence is applied in integer fixed point on every read of
+/// `/proc/loadavg` (Linux also updates lazily, from timer context). The
+/// sampling interval is the wall-clock tick delta between reads; a long gap
+/// simply decays towards the current runnable count, which is the correct
+/// limit. `loadavg_counts` takes the ready/stopped locks, so this must run in
+/// ordinary kernel/syscall context — never the tick handler.
+static LOADAVG: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static LOADAVG_LAST_TICK: AtomicU64 = AtomicU64::new(0);
+/// Windows in seconds: 1, 5 and 15 minutes.
+const LOADAVG_WINDOWS: [u64; 3] = [60, 300, 900];
+const LOADAVG_ONE: u64 = 1 << 16;
+
+/// The current 1/5/15-minute load averages, in hundredths (`123` = `1.23`).
+pub fn load_averages() -> (u32, u32, u32) {
+    let now = ticks();
+    let last = LOADAVG_LAST_TICK.swap(now, Ordering::Relaxed);
+    let (runnable, _total, _last_pid) = loadavg_counts();
+    let dt = now.saturating_sub(last);
+    let tick_hz = crate::arch::x86_64::apic::TICK_HZ;
+    if dt > 0 && tick_hz > 0 {
+        for (index, seconds) in LOADAVG_WINDOWS.iter().enumerate() {
+            let window = tick_hz.saturating_mul(*seconds);
+            if window == 0 {
+                continue;
+            }
+            let old = LOADAVG[index].load(Ordering::Relaxed);
+            let (decay, add) = if dt >= window {
+                // More than one full window elapsed: the old value has decayed
+                // away, so start from the current runnable count.
+                (0, LOADAVG_ONE)
+            } else {
+                let decay = LOADAVG_ONE.saturating_sub(dt.saturating_mul(LOADAVG_ONE) / window);
+                let add = runnable.saturating_mul(LOADAVG_ONE).saturating_mul(dt) / window;
+                (decay, add)
+            };
+            let new = old.saturating_mul(decay) / LOADAVG_ONE + add;
+            LOADAVG[index].store(new, Ordering::Relaxed);
+        }
+    }
+    let hundredths = |index: usize| {
+        let value = LOADAVG[index].load(Ordering::Relaxed);
+        ((value.saturating_mul(100)) / LOADAVG_ONE).min(u32::MAX as u64) as u32
+    };
+    (hundredths(0), hundredths(1), hundredths(2))
+}
+
 fn activate_task(pid: u64) {
     if is_idle(pid) {
         return;
