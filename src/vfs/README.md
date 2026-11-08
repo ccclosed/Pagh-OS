@@ -6,7 +6,7 @@
 
 Синтетический `/proc` (issue #11) реализован в трёх срезах: контракт — пути, байтовые
 форматы файлов, семантика `lstat`/`readdir`/`getdents64`/`readlink`, список отложенного —
-зафиксирован в **`docs/procfs.md`**, он же приёмка. Отложены `/proc/<pid>`,
+зафиксирован в **`docs/procfs.md`**, он же приёмка. Отложены `/proc/mounts`,
 `/proc/mounts`, `/proc/self/{fd,stat,statm}` (все дают `ENOENT`).
 
 ## Файлы
@@ -69,7 +69,7 @@
 ### procfs (issue #11 — контракт `docs/procfs.md`)
 - Срезы 1–3: `/proc` + `/proc/self` + `self/{exe,cmdline,status,maps}` +
   `{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg}` + read-only
-  `/proc/sys/kernel/{ostype,osrelease,hostname}`. `/proc/<pid>` и `/proc/mounts` отложены:
+  `/proc/sys/kernel/{ostype,osrelease,hostname}`. `/proc/mounts` отложен:
   для них нужны pid-keyed snapshot чужого `CompatState` и реестр монтирований.
 - Монтируется из `vfs::init()` (не из `boot::init_fs`): `/proc` обязан работать даже когда
   ext2 отказан `format_policy`. Готовые источники к этому моменту — PMM, heap, тик-клок;

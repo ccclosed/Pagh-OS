@@ -417,6 +417,7 @@ mod properties {
     mod procfs_maps;
     mod procfs_meminfo;
     mod procfs_misc;
+    mod procfs_pid;
     mod procfs_stat;
     mod procfs_status;
 

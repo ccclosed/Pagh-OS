@@ -10,8 +10,10 @@
 
 use crate::io::guest_path_keeps_root;
 use crate::procfs_format::{
-    format_maps, MapsRegion, PROC_FILES, PROC_INO_BASE, PROC_ROOT_ORDER, PROC_SELF_FILES,
-    PROC_SYS_FILES, PROT_EXEC, PROT_READ, PROT_WRITE,
+    format_maps, parse_pid_component, pid_dir_ino, pid_file_ino, proc_pid_file, MapsRegion,
+    PROC_FILES, PROC_INO_BASE, PROC_PID_FILES, PROC_PID_INO_MASK, PROC_PID_INO_STRIDE,
+    PROC_PID_ORDER, PROC_ROOT_ORDER, PROC_SELF_FILES, PROC_SYS_FILES, PROT_EXEC, PROT_READ,
+    PROT_WRITE,
 };
 use proptest::prelude::*;
 
@@ -243,7 +245,11 @@ fn procfs_table_is_stable_and_unique() {
     );
     assert_eq!(
         PROC_SELF_FILES.iter().map(|e| e.name).collect::<Vec<_>>(),
-        ["exe", "cmdline", "status", "maps"]
+        ["exe", "cmdline", "status", "maps", "stat", "statm"]
+    );
+    assert_eq!(
+        PROC_PID_FILES.iter().map(|e| e.name).collect::<Vec<_>>(),
+        PROC_PID_ORDER
     );
     assert_eq!(
         PROC_SYS_FILES.iter().map(|e| e.name).collect::<Vec<_>>(),
@@ -277,17 +283,22 @@ fn procfs_table_is_stable_and_unique() {
     );
     // The per-pid family and other deferred paths stay absent from the table:
     // `ProcDir::lookup` then returns NotFound, never a wildcard.
+    // Numeric pids are NOT static table rows: the kernel-facing lookup parses
+    // the component and then requires the pid to be LIVE. The pure table only
+    // knows the names of the files inside a pid directory.
     assert!(crate::procfs_format::proc_file("1").is_none());
     assert!(crate::procfs_format::proc_file("statm").is_none());
     assert!(crate::procfs_format::proc_file("mounts").is_none());
     assert!(crate::procfs_format::proc_file("devices").is_none());
     assert!(crate::procfs_format::proc_self_file("fd").is_none());
-    assert!(crate::procfs_format::proc_self_file("stat").is_none());
     assert!(crate::procfs_format::proc_self_file("status/x").is_none());
     assert!(crate::procfs_format::proc_self_file("").is_none());
     assert!(crate::procfs_format::proc_sys_file("kernel").is_none());
     assert!(crate::procfs_format::proc_sys_file("random").is_none());
     assert!(crate::procfs_format::proc_sys_file("").is_none());
+    assert!(proc_pid_file("exe").is_none());
+    assert!(proc_pid_file("statm").is_none());
+    assert!(proc_pid_file("stat/child").is_none());
 
     let mut inos: Vec<u64> = Vec::new();
     for e in PROC_FILES
@@ -338,4 +349,36 @@ fn chroot_predicate_is_component_exact() {
     // The procfs entry point specifically: never remapped.
     assert!(guest_path_keeps_root("/proc"));
     assert!(guest_path_keeps_root("/proc/meminfo"));
+}
+
+/// The pid path/inode rules: a component is a pid only when it is decimal,
+/// non-zero and fits a signed 32-bit `pid_t`; every pid directory's identity is
+/// stable, distinct, and stays below the FNV bit.
+#[test]
+fn pid_components_and_inodes_are_well_formed() {
+    assert_eq!(parse_pid_component("1"), Some(1));
+    assert_eq!(parse_pid_component("42"), Some(42));
+    assert_eq!(parse_pid_component("01"), Some(1));
+    assert_eq!(parse_pid_component(&i32::MAX.to_string()), Some(i32::MAX as u64));
+    for bad in ["", "0", "00", "-1", "+1", "1a", "a1", " 1", "1 ", "2147483648", "18446744073709551616"] {
+        assert_eq!(parse_pid_component(bad), None, "{bad:?} is not a pid");
+    }
+
+    let mut seen: Vec<u64> = Vec::new();
+    for pid in [1u64, 2, 3, 42, 999_999, i32::MAX as u64] {
+        let dir = pid_dir_ino(pid);
+        assert_eq!(dir & (1 << 63), 0, "pid {pid} inode must stay below the FNV bit");
+        assert!(dir > PROC_INO_BASE + 11, "pid inode must be above the static range");
+        for slot in 1..=4 {
+            let ino = pid_file_ino(pid, slot);
+            assert_eq!(ino, dir + slot);
+            assert!(!seen.contains(&ino), "duplicate pid-file inode {ino}");
+            seen.push(ino);
+        }
+        assert!(PROC_PID_INO_STRIDE > 4);
+    }
+    // Distinct pids never share a directory inode.
+    assert_ne!(pid_dir_ino(7), pid_dir_ino(8));
+    // The mask is what keeps an arbitrary u64 below bit 63.
+    assert_eq!(pid_dir_ino(u64::MAX), pid_dir_ino(PROC_PID_INO_MASK));
 }

@@ -28,7 +28,7 @@ read-only `/proc/sys/kernel/*`); отступления от текста ниж
    Срез 2 (2.9.0) добавил `/proc/stat` с реальным учётом user/system/idle в тике.
    Срез 3 (2.10.0) добавил `/proc/version`, `/proc/filesystems`, `/proc/loadavg` и
    read-only `/proc/sys` + `/proc/sys/kernel/{ostype,osrelease,hostname}`.
-   Всё остальное (`/proc/<pid>`, `/proc/mounts`, `/proc/self/fd`, `/proc/self/stat`,
+   Всё остальное (`/proc/mounts`, `/proc/self/fd`, `/proc/self/cgroup`,
    `/proc/devices`, прочие имена в `/proc/sys`) — **ENOENT**, обоснование отложенности
    в §2.2.
 3. Содержимое генерируется **снимком на `lookup()`/`open()`** в форме Linux-текста; `size()`
@@ -172,10 +172,8 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 
 | Путь | Причина отложенности |
 |---|---|
-| `/proc/<pid>` (перечисление), `/proc/<pid>/{status,stat,cmdline,maps}` | Нужен pid-keyed каталог, snapshot `COMPAT_STATES` и **чтение чужого процесса** (его `CompatState` + `VmRegionSet`) без удержания реестрового спинлока во время генерации содержимого. Плюс потребители (ps/htop) одновременно требуют `/proc/stat` и `/proc/<pid>/stat` — половина набора бесполезна. Отдельный срез. |
 | `/proc/mounts`, `/proc/self/mountinfo` | В VFS нет таблицы монтирований (есть только `RootDirectory.children`); сначала нужен реестр монтирований. |
 | `/proc/self/fd/*`, `/proc/self/task/*` | Требуют симлинков на произвольный fd/pid и полноценного следования по ссылкам (общая задача с #18), а не одного уровня (§5.4). |
-| `/proc/self/stat`, `/proc/self/statm`, `/proc/self/cgroup` | Принадлежат семейству `/proc/<pid>/stat`; `statm` дёшев, но требует residency-учёта, которого нет (§4.5.1). |
 | `/proc/devices`, прочие имена в `/proc/sys/*` | Сверх трёх read-only файлов `/proc/sys/kernel` нет ни sysctl-реестра, ни списка устройств; неизвестное имя обязано оставаться `ENOENT` (§5.6), а не «пустым успехом». |
 | `[vdso]`, `[vvar]`, `[vsyscall]` в maps | В ядре их физически нет — строки не должны появляться (это не «не реализовано», а «отсутствует»). |
 
@@ -790,7 +788,7 @@ DEVIATION-1 (size ≠ 0), DEVIATION-11 (права: `stat_mode_for` даёт д�
 а не Linux-овский `ENOTDIR` (дефолтный `lookup` трейта возвращает `NotFound`).
 Обязательно покрыть тестами (ENOENT-матрица; реальные узлы перечислены отдельно):
 
-- **ENOENT**: `/proc/1`, `/proc/1234`, `/proc/self/fd`, `/proc/self/status/x`,
+- **ENOENT**: `/proc/mounts`, `/proc/self/fd`, `/proc/self/status/x`,
   `/proc/mounts`, `/proc/devices`, `/proc/sys/kernel/nonexistent`,
   `/proc/version/child`, `/proc/nonexistent`.
 - **Существуют** (после срезов 2–3): `/proc/version`, `/proc/filesystems`,
@@ -1045,7 +1043,7 @@ python3 tools/host_tests.py          # + 6 новых property-наборов
 | 11 | Права procfs = дефолты слоя (0700/0755), а не 0555/0444 | `stat_mode_for` не имеет per-node режима; `access(2)` режим не проверяет |
 | 12 | Нет записей `.`/`..` в `getdents64` | Общее свойство VFS этого ядра, не специфика procfs |
 | 13 | До мержа t15: цикл/лишние ссылки → `ENOENT` (нет `ELOOP` в `errno.rs`), вместо Linux-овского `ELOOP` | Бюджет 8 + `warn!` как временный шов; t15 (`EXT2-LINKS.md` §4.6) добавляет `Errno::ELOOP = 40` и `SYMLOOP_MAX = 40`, после чего procfs переиспользует общий резолвер |
-| 14 | `/proc/<pid>` (в т.ч. `/proc/1`) → `ENOENT` | Перечисление отложено (§2.2); `ps`/`htop` и после среза 3 не работают |
+| 14 | `/proc/1` для живого pid → файл; `/proc/999999` → `ENOENT` | Срез 4: pid-keyed дерево есть |
 | 15 | `/proc/loadavg` первые три поля всегда `0.00` | Учёта загрузки нет; libuv `uv_loadavg` падает обратно на `sysinfo(2)` (`loads = [0;3]`), выдумывать средние запрещено. `runnable/total` и `last_pid` — реальные (§4.11) |
 | 16 | `/proc/version` — `pagh <version> (x86_64) #1 SMP`, а не Linux-строка | Ядро не Linux: реальная версия крейта вместо поддельного релиза. `#1 SMP` — фиксированный build-тег формы, не заявление о SMP (машина однопроцессорная) |
 | 17 | `/proc/sys/kernel/*` — read-only константы, `hostname` не настраивается | Нет sysctl-реестра, `sethostname(2)` и hostname-переменной; `hostname` повторяет `uname(2).nodename`, `ostype` — собственное имя `Pagh`. Любое другое имя — `ENOENT` (§5.6) |

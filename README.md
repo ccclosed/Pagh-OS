@@ -564,7 +564,7 @@ group, `SIGSTOP`/`SIGCONT` are real scheduler state (a stopped task keeps its sa
   `/proc/self/exe` as a real symlink. `/proc/loadavg` reports honest `0.00` load
   averages (there is no load accounting) plus live runnable/total counts and the
   last allocated pid. What is still missing is the per-pid tree
-  (`/proc/<pid>`) and the mount table, so `htop` and
+  (the mount table), so `htop` and
   `ps` remain out of reach; `/proc/meminfo`-only consumers (busybox `free`, libuv's
   `uv_get_total_memory`) and `/proc/uptime` consumers now work. See
   `docs/procfs.md` for the exact contract and the deliberately deferred paths. Signal

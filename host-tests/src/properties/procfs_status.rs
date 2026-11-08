@@ -58,6 +58,7 @@ const REQUIRED_STATUS_KEYS: [&str; 41] = [
 fn render(name: &[u8], pid: u64, tgid: u64, ppid: u64, threads: u64, vm: VmKb) -> String {
     let out = format_status(&StatusInputs {
         name,
+        state: b'R',
         umask: 0o022,
         pid,
         tgid,
@@ -134,6 +135,7 @@ proptest! {
         prop_assert!(t.contains(&want_ppid));
         prop_assert!(t.contains(&want_threads));
         prop_assert!(t.contains("Umask:\t0022\n"));
+        prop_assert!(t.contains("State:\tR (running)\n"));
         prop_assert!(t.contains(&want_vm_size));
         prop_assert!(t.contains(&want_vm_rss));
         prop_assert_eq!(t.matches('\n').count(), t.lines().count());
@@ -153,6 +155,7 @@ proptest! {
         let vm = VmKb { size: 0, rss: 0, data: 0, stk: 0, exe: 0, lib: 0 };
         let out = format_status(&StatusInputs {
             name: &name,
+            state: b'R',
             umask: 0o022,
             pid: 7,
             tgid: 7,

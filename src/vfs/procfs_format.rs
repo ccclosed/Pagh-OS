@@ -64,6 +64,10 @@ pub enum ProcKind {
     SelfStatus,
     /// `/proc/self/maps`.
     SelfMaps,
+    /// `/proc/self/stat` — the Linux per-task `stat` line of the reader.
+    SelfStat,
+    /// `/proc/self/statm` — the reader's memory summary in pages.
+    SelfStatm,
     /// `/proc/cpuinfo`.
     CpuInfo,
     /// `/proc/meminfo`.
@@ -84,6 +88,14 @@ pub enum ProcKind {
     SysOsrelease,
     /// `/proc/sys/kernel/hostname`.
     SysHostname,
+    /// `/proc/<pid>/cmdline`.
+    PidCmdline,
+    /// `/proc/<pid>/stat`.
+    PidStat,
+    /// `/proc/<pid>/status`.
+    PidStatus,
+    /// `/proc/<pid>/maps`.
+    PidMaps,
 }
 
 /// One named entry: its `readdir` name, stable inode, and content kind.
@@ -153,7 +165,13 @@ pub const PROC_SYS_FILES: [ProcEntry; 3] = [
 ];
 
 /// The regular files under `/proc/self` (in `readdir` order).
-pub const PROC_SELF_FILES: [ProcEntry; 4] = [
+///
+/// `stat` and `statm` (slice 3) describe the *calling* process, so their inodes
+/// are fixed here like the older `self` entries. `/proc/<pid>/stat` uses the
+/// pid-derived identity below instead; the two paths describe the same state but
+/// are distinct VFS nodes (this `self` is a directory, not a symlink to the pid
+/// directory).
+pub const PROC_SELF_FILES: [ProcEntry; 6] = [
     ProcEntry {
         name: "exe",
         ino: PROC_INO_BASE + 2,
@@ -174,9 +192,22 @@ pub const PROC_SELF_FILES: [ProcEntry; 4] = [
         ino: PROC_INO_BASE + 5,
         kind: ProcKind::SelfMaps,
     },
+    ProcEntry {
+        name: "stat",
+        ino: PROC_INO_BASE + 10,
+        kind: ProcKind::SelfStat,
+    },
+    ProcEntry {
+        name: "statm",
+        ino: PROC_INO_BASE + 11,
+        kind: ProcKind::SelfStatm,
+    },
 ];
 
-/// `readdir` order of `/proc`: the two directories first, then the files.
+/// `readdir` order of `/proc`'s **static** entries: `self`/`sys` first, then the
+/// regular files. Live numeric pid directories are inserted between `self` and
+/// `cpuinfo` by the kernel-facing `ProcDir::readdir` (ascending pid, snapshot of
+/// the compat registry); they are dynamic and therefore not listed here.
 pub const PROC_ROOT_ORDER: [&str; 9] = [
     "self",
     "sys",
@@ -189,7 +220,86 @@ pub const PROC_ROOT_ORDER: [&str; 9] = [
     "loadavg",
 ];
 
-/// Look up a regular `/proc` file by name (`self`/`sys` are directories, not here).
+// ─── /proc/<pid> path / inode identity ──────────────────────────────────────
+//
+// A pid directory has no fixed table row: its identity is derived from the pid,
+// so `getdents64` (`d_ino`), `stat` and repeated `lookup`s agree for the whole
+// life of the directory. The base sits above the static range (`PROC_INO_BASE +
+// 11`) and the stride leaves room for the four files. The pid is masked to its
+// low 32 bits: pagh's scheduler hands out small sequential pids, and a 32-bit
+// mask keeps the result below bit 63 for any input.
+
+/// First inode of the `/proc/<pid>` directory range.
+pub const PROC_PID_DIR_INO_BASE: u64 = PROC_INO_BASE + 0x0000_0000_0010_0000;
+/// Inodes reserved per pid directory (`+0` dir, `+1..=4` files).
+pub const PROC_PID_INO_STRIDE: u64 = 8;
+/// Pids are masked to this many bits before deriving an inode.
+pub const PROC_PID_INO_MASK: u64 = 0xFFFF_FFFF;
+
+/// Stable inode of the `/proc/<pid>` directory.
+pub fn pid_dir_ino(pid: u64) -> u64 {
+    PROC_PID_DIR_INO_BASE + (pid & PROC_PID_INO_MASK) * PROC_PID_INO_STRIDE
+}
+
+/// Stable inode of one file under `/proc/<pid>` (`slot` is its table entry).
+pub fn pid_file_ino(pid: u64, slot: u64) -> u64 {
+    pid_dir_ino(pid) + slot
+}
+
+/// One file under `/proc/<pid>`: a static name, its inode slot, and its kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcPidEntry {
+    pub name: &'static str,
+    pub slot: u64,
+    pub kind: ProcKind,
+}
+
+/// The files under every `/proc/<pid>` directory, in `readdir` order.
+pub const PROC_PID_FILES: [ProcPidEntry; 4] = [
+    ProcPidEntry {
+        name: "cmdline",
+        slot: 1,
+        kind: ProcKind::PidCmdline,
+    },
+    ProcPidEntry {
+        name: "stat",
+        slot: 2,
+        kind: ProcKind::PidStat,
+    },
+    ProcPidEntry {
+        name: "status",
+        slot: 3,
+        kind: ProcKind::PidStatus,
+    },
+    ProcPidEntry {
+        name: "maps",
+        slot: 4,
+        kind: ProcKind::PidMaps,
+    },
+];
+
+/// `readdir` order of `/proc/<pid>`.
+pub const PROC_PID_ORDER: [&str; 4] = ["cmdline", "stat", "status", "maps"];
+
+/// Look up a `/proc/<pid>` file by name.
+pub fn proc_pid_file(name: &str) -> Option<ProcPidEntry> {
+    PROC_PID_FILES.iter().copied().find(|e| e.name == name)
+}
+
+/// Parse a `/proc` path component as a Linux pid.
+pub fn parse_pid_component(name: &str) -> Option<u64> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || !bytes.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let pid: u64 = name.parse().ok()?;
+    if pid == 0 || pid > i32::MAX as u64 {
+        return None;
+    }
+    Some(pid)
+}
+
+/// Look up a regular `/proc` file by name (`self`/`sys` are directories).
 pub fn proc_file(name: &str) -> Option<ProcEntry> {
     PROC_FILES.iter().copied().find(|e| e.name == name)
 }
@@ -835,6 +945,9 @@ pub struct VmKb {
 pub struct StatusInputs<'a> {
     /// Task name (≤ 15 bytes, raw bytes on purpose).
     pub name: &'a [u8],
+    /// Linux state letter: `R` running, `T` stopped (the two this kernel can
+    /// truthfully distinguish).
+    pub state: u8,
     pub umask: u32,
     pub pid: u64,
     pub tgid: u64,
@@ -855,6 +968,26 @@ pub struct StatusInputs<'a> {
     pub vm: VmKb,
 }
 
+/// Long-form description of a Linux task-state letter for the `State:` line.
+///
+/// Only `R` and `T` are ever produced by this kernel (task 4 of the procfs
+/// slice: there is no sleeping/blocked task bookkeeping and zombies are removed
+/// from the compat registry at exit). The remaining Linux letters are mapped
+/// too so a future producer cannot silently emit "unknown".
+pub fn state_word(state: u8) -> &'static str {
+    match state {
+        b'R' => "running",
+        b'S' => "sleeping",
+        b'D' => "disk sleep",
+        b'T' => "stopped",
+        b't' => "tracing stop",
+        b'Z' => "zombie",
+        b'X' | b'x' => "dead",
+        b'I' => "idle",
+        _ => "unknown",
+    }
+}
+
 /// Render `/proc/self/status`.
 ///
 /// Field order and separators follow Linux `fs/proc/array.c`. Capabilities are
@@ -867,7 +1000,10 @@ pub fn format_status(s: &StatusInputs<'_>) -> Vec<u8> {
     out.extend_from_slice(s.name);
     out.push(b'\n');
     push(&mut out, format_args!("Umask:\t{:04o}\n", s.umask));
-    out.extend_from_slice(b"State:\tR (running)\n");
+    push(
+        &mut out,
+        format_args!("State:\t{} ({})\n", s.state as char, state_word(s.state)),
+    );
     push(&mut out, format_args!("Tgid:\t{}\n", s.tgid));
     push(&mut out, format_args!("Pid:\t{}\n", s.pid));
     push(&mut out, format_args!("PPid:\t{}\n", s.ppid));
@@ -916,6 +1052,138 @@ pub fn format_status(s: &StatusInputs<'_>) -> Vec<u8> {
     out.extend_from_slice(b"VmSwap:\t       0 kB\n");
     out.extend_from_slice(b"voluntary_ctxt_switches:\t0\n");
     out.extend_from_slice(b"nonvoluntary_ctxt_switches:\t0\n");
+    out
+}
+
+// ─── /proc/<pid>/stat and /proc/self/statm ──────────────────────────────────
+
+/// `/proc/<pid>/stat` inputs.
+///
+/// The line has 52 Linux fields; the ones this kernel can answer truthfully come
+/// from the target's `CompatState` snapshot, and the rest are the documented
+/// "not tracked" zeros (see the renderer). Keeping the full Linux width means
+/// `ps`/`procps` can index the fields it cares about (18 priority, 20 threads,
+/// 22 starttime, 23 vsize, 24 rss, 39 processor, …) without falling off the end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PidStatInputs<'a> {
+    /// Task name (raw bytes; capped and sanitized by [`stat_comm`]).
+    pub name: &'a [u8],
+    pub pid: u64,
+    /// Linux state letter (`R` or `T` here).
+    pub state: u8,
+    pub ppid: u64,
+    /// Process group id. pagh has one group per thread group, so this is `tgid`.
+    pub pgrp: u64,
+    /// Session id; pagh has no sessions, so this is `tgid` too.
+    pub session: u64,
+    pub threads: u64,
+    pub sig_blocked: u64,
+    pub sig_ign: u64,
+    pub sig_cgt: u64,
+    pub vm: VmKb,
+    /// Current program break (field 47, `start_brk`).
+    pub start_brk: u64,
+    /// Lowest address of the mapped user stack (field 28, `startstack`).
+    pub startstack: u64,
+    /// Field 52, `exit_code`: 0 until the process exits (a zombie is already gone
+    /// from the compat registry in this kernel, so it is always 0 in practice).
+    pub exit_code: i64,
+}
+
+/// Sanitize a task name for the parenthesised `comm` field of `/proc/<pid>/stat`.
+///
+/// Linux emits the raw 15-byte `comm`; this renderer additionally folds NUL,
+/// CR/LF and `)` to visible ASCII (`)` becomes `]`) so a filename that a user
+/// happened to create can neither split the line nor confuse the conventional
+/// "find the LAST `)`" parse used by `ps`/`procps`. Truncation is by bytes at
+/// Linux's `TASK_COMM_LEN - 1`.
+pub fn stat_comm(name: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = name
+        .iter()
+        .take(TASK_NAME_MAX)
+        .map(|b| match *b {
+            0 | b'\n' | b'\r' => b' ',
+            b')' => b']',
+            other => other,
+        })
+        .collect();
+    if out.is_empty() {
+        out.extend_from_slice(b"pagh");
+    }
+    out
+}
+
+/// Render `/proc/<pid>/stat` (and `/proc/self/stat`): Linux's 52-field line.
+///
+/// Fields the kernel does not account for are emitted as 0 rather than invented
+/// (`utime`/`stime`/`cutime`/`cstime`, page-fault counters, `starttime`, the
+/// signal bitmap, code/data segment addresses and `arg/env` bounds). `vsize` is
+/// KiB → bytes and `rss` is KiB → 4 KiB pages, both derived from the same
+/// [`VmKb`] snapshot as `/proc/<pid>/status`, so the two files agree.
+/// `rsslim` is Linux's `RLIM_INFINITY` (all ones), `exit_signal` is `SIGCHLD`.
+pub fn format_pid_stat(s: &PidStatInputs<'_>) -> Vec<u8> {
+    let comm = stat_comm(s.name);
+    let mut out = Vec::with_capacity(384);
+
+    // Fields 1–9: pid, comm, state, ppid, pgrp, session, tty_nr, tpgid, flags.
+    push(&mut out, format_args!("{} (", s.pid));
+    out.extend_from_slice(&comm);
+    push(
+        &mut out,
+        format_args!(
+            ") {} {} {} {} 0 -1 0",
+            s.state as char, s.ppid, s.pgrp, s.session
+        ),
+    );
+
+    // Fields 10–17: minflt, cminflt, majflt, cmajflt, utime, stime, cutime,
+    // cstime — no per-process CPU/fault accounting exists.
+    out.extend_from_slice(b" 0 0 0 0 0 0 0 0");
+
+    // Fields 18–52: priority, nice, threads, itrealvalue, starttime, vsize,
+    // rss, rsslim, startcode, endcode, startstack, kstkesp, kstkeip, signal,
+    // blocked, sigignore, sigcatch, wchan, nswap, cnswap, exit_signal,
+    // processor, rt_priority, policy, delayacct_blkio_ticks, guest_time,
+    // cguest_time, start_data, end_data, start_brk, arg_start, arg_end,
+    // env_start, env_end, exit_code.
+    push(
+        &mut out,
+        format_args!(
+            " 20 0 {} 0 0 {} {} {} 0 0 {} 0 0 0 {} {} {} 0 0 0 17 0 0 0 0 0 0 0 0 {} 0 0 0 0 {}\n",
+            s.threads,
+            s.vm.size.saturating_mul(1024),
+            s.vm.rss / 4,
+            u64::MAX,
+            s.startstack,
+            s.sig_blocked,
+            s.sig_ign,
+            s.sig_cgt,
+            s.start_brk,
+            s.exit_code,
+        ),
+    );
+    out
+}
+
+/// Render `/proc/self/statm`: `size resident shared text lib data dt` in pages.
+///
+/// `shared` and `dt` are real zeros (no shared-memory accounting). `lib` is 0 in
+/// practice because `VmKb::lib` is 0 (interpreter segments are folded into
+/// `exe`). `size`/`resident`/`text`/`data` are the same KiB values as
+/// `/proc/<pid>/status`, divided by the 4 KiB page size.
+pub fn format_statm(vm: &VmKb) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    push(
+        &mut out,
+        format_args!(
+            "{} {} 0 {} {} {} 0\n",
+            vm.size / 4,
+            vm.rss / 4,
+            vm.exe / 4,
+            vm.lib / 4,
+            vm.data / 4
+        ),
+    );
     out
 }
 

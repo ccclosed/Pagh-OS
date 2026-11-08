@@ -15,26 +15,32 @@
 //!     would read as instantly empty (DEVIATION-1).
 //!   * **Lock order is state-then-node.** Rendering (`COMPAT_STATES`, PMM,
 //!     scheduler) happens before the node's own spinlock is taken; the node lock
-//!     is never held across a `with_current_compat` call.
+//!     is never held across a `with_pid_compat` call.
 //!   * **`/proc/self` is invisible to a task without `CompatState`** (a kernel
 //!     thread, the boot selftest): `lookup` returns `NotFound` → `ENOENT` rather
 //!     than inventing a process (`docs/procfs.md` §5.5).
-//!   * **Unknown paths are `NotFound`** — there is no wildcard, so `/proc/1`,
-//!     `/proc/self/stat` and `/proc/self/fd` all return `ENOENT`.
+//!   * **Unknown paths are `NotFound`** — there is no wildcard. A numeric
+//!     component is resolved *only* when that pid is currently registered in
+//!     `COMPAT_STATES`, so `/proc/<dead-pid>` is `ENOENT`; `/proc/self/fd`,
+//!     `/proc/loadavg`, `/proc/version` and friends stay `ENOENT` too.
 //!
-//! `/proc/stat` (slice 2) is a real node: its numbers come from
-//! `crate::task::stat`, where the timer tick charges every interrupt to exactly
-//! one of user/system/idle before the scheduler decision. The renderer only
-//! formats those counters — it never derives time from wall-clock sources.
+//! Slices:
+//!   * 1 (2.5.0): `/proc/{cpuinfo,meminfo,uptime}` and
+//!     `/proc/self/{exe,cmdline,status,maps}`;
+//!   * 2 (2.9.0): `/proc/stat` from real tick accounting;
+//!   * 3 (2.10.0): `/proc/version`, `/proc/filesystems`, `/proc/loadavg`,
+//!     `/proc/sys/kernel/{ostype,osrelease,hostname}` and the per-pid tree
+//!     `/proc/<pid>/{status,stat,cmdline,maps}`, plus
+//!     `/proc/self/{stat,statm}`.
 //!
-//! Slice 3 adds `/proc/version`, `/proc/filesystems`, `/proc/loadavg` and the
-//! read-only `/proc/sys/kernel/{ostype,osrelease,hostname}` files. `/proc/version`
-//! and `osrelease` embed the real crate version; `/proc/filesystems` names only
-//! the drivers this build implements; `/proc/loadavg` reports honest `0.00` load
-//! averages (there is no load accounting) plus live scheduler counts. All three
-//! sys files are constants — pagh has no hostname/sysctl machinery, so there is
-//! deliberately no writable `/proc/sys` path.
+//! The per-pid files snapshot the TARGET's state (not the reader's) under
+//! `COMPAT_STATES`, release the registry lock, and only then format the text.
+//! That is the whole point of the `*Snap` structs below: `COMPAT_STATES` is a
+//! non-reentrant spinlock and must never be held across a render (AGENTS.md
+//! invariant 4), while a cpu-bound target may be concurrently changing its
+//! `VmRegionSet`.
 
+use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -45,7 +51,8 @@ use crate::arch::x86_64::linux::signal_frame::{SIG_DFL, SIG_IGN};
 use crate::memory::layout::{PAGE_SIZE, USER_STACK_PAGES, USER_STACK_TOP};
 use crate::memory::pmm;
 use crate::sync::spinlock::Spinlock;
-use crate::task::{compat, scheduler, stat};
+use crate::task::compat::{self, CompatState};
+use crate::task::{scheduler, stat};
 
 use super::elf::LoadSegment;
 use super::procfs_format::{self as fmt, ProcKind};
@@ -62,7 +69,7 @@ const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The `/proc` subtree root, ready for `vfs::mount_at("/proc", …)`.
 pub fn root() -> Arc<dyn VfsNode> {
     Arc::new(ProcDir {
-        name: "proc",
+        name: String::from("proc"),
         ino: fmt::PROC_ROOT_DIR_INO,
         kind: DirKind::Root,
     })
@@ -80,10 +87,14 @@ enum DirKind {
     SysDir,
     /// `/proc/sys/kernel`.
     SysKernelDir,
+    /// `/proc/<pid>`, carrying the target pid.
+    Pid(u64),
 }
 
 struct ProcDir {
-    name: &'static str,
+    /// `"proc"`, `"self"`, or the decimal pid. Owned because a pid directory's
+    /// name is dynamic (`VfsNode::name` returns `&str`).
+    name: String,
     ino: u64,
     kind: DirKind,
 }
@@ -92,7 +103,7 @@ struct ProcDir {
 /// renders for the process that is asking).
 fn self_dir() -> Arc<dyn VfsNode> {
     Arc::new(ProcDir {
-        name: "self",
+        name: String::from("self"),
         ino: fmt::PROC_SELF_DIR_INO,
         kind: DirKind::SelfDir,
     })
@@ -101,7 +112,7 @@ fn self_dir() -> Arc<dyn VfsNode> {
 /// `/proc/sys` — the read-only sysctl namespace (slice 3).
 fn sys_dir() -> Arc<dyn VfsNode> {
     Arc::new(ProcDir {
-        name: "sys",
+        name: String::from("sys"),
         ino: fmt::PROC_SYS_DIR_INO,
         kind: DirKind::SysDir,
     })
@@ -110,15 +121,26 @@ fn sys_dir() -> Arc<dyn VfsNode> {
 /// `/proc/sys/kernel`.
 fn sys_kernel_dir() -> Arc<dyn VfsNode> {
     Arc::new(ProcDir {
-        name: "kernel",
+        name: String::from("kernel"),
         ino: fmt::PROC_SYS_KERNEL_DIR_INO,
         kind: DirKind::SysKernelDir,
     })
 }
 
+/// A fresh `/proc/<pid>` node. Only created after the pid was observed live;
+/// `lookup` re-checks that on every child access, so a cached directory cannot
+/// outlive its process.
+fn pid_dir(pid: u64) -> Arc<dyn VfsNode> {
+    Arc::new(ProcDir {
+        name: format!("{}", pid),
+        ino: fmt::pid_dir_ino(pid),
+        kind: DirKind::Pid(pid),
+    })
+}
+
 impl VfsNode for ProcDir {
     fn name(&self) -> &str {
-        self.name
+        &self.name
     }
 
     fn is_directory(&self) -> bool {
@@ -135,9 +157,13 @@ impl VfsNode for ProcDir {
             // `readdir` lists the namespace, not the visible-at-this-instant
             // subset: `self` is listed even for a caller that cannot resolve it
             // (Linux behaves the same way for a pid directory that disappeared).
+            // The numeric pids ARE a live snapshot: one short registry lock.
             DirKind::Root => {
                 out.push(self_dir());
                 out.push(sys_dir());
+                for (pid, _tgid) in compat::compat_pid_tgid_snapshot() {
+                    out.push(pid_dir(pid));
+                }
                 for e in fmt::PROC_FILES.iter().copied() {
                     out.push(file_for(e));
                 }
@@ -153,6 +179,11 @@ impl VfsNode for ProcDir {
             DirKind::SysKernelDir => {
                 for e in fmt::PROC_SYS_FILES.iter().copied() {
                     out.push(file_for(e));
+                }
+            }
+            DirKind::Pid(pid) => {
+                for e in fmt::PROC_PID_FILES.iter().copied() {
+                    out.push(pid_file(pid, e));
                 }
             }
         }
@@ -171,6 +202,16 @@ impl VfsNode for ProcDir {
                 }
                 if name == "sys" {
                     return Ok(sys_dir());
+                }
+                // Numeric components are the per-pid tree. The liveness check is
+                // what makes this a namespace rather than a wildcard: a dead (or
+                // never-used) pid is ENOENT, never an empty file.
+                if let Some(pid) = fmt::parse_pid_component(name) {
+                    return if compat::compat_exists(pid) {
+                        Ok(pid_dir(pid))
+                    } else {
+                        Err(VfsError::NotFound)
+                    };
                 }
                 fmt::proc_file(name).map(file_for).ok_or(VfsError::NotFound)
             }
@@ -193,6 +234,14 @@ impl VfsNode for ProcDir {
             DirKind::SysKernelDir => fmt::proc_sys_file(name)
                 .map(file_for)
                 .ok_or(VfsError::NotFound),
+            DirKind::Pid(pid) => {
+                if !compat::compat_exists(pid) {
+                    return Err(VfsError::NotFound);
+                }
+                fmt::proc_pid_file(name)
+                    .map(|e| pid_file(pid, e))
+                    .ok_or(VfsError::NotFound)
+            }
         }
     }
 }
@@ -204,6 +253,17 @@ fn file_for(e: fmt::ProcEntry) -> Arc<dyn VfsNode> {
         name: e.name,
         ino: e.ino,
         kind: e.kind,
+        pid: 0,
+        buf: Spinlock::new(None),
+    })
+}
+
+fn pid_file(pid: u64, e: fmt::ProcPidEntry) -> Arc<dyn VfsNode> {
+    Arc::new(ProcFile {
+        name: e.name,
+        ino: fmt::pid_file_ino(pid, e.slot),
+        kind: e.kind,
+        pid,
         buf: Spinlock::new(None),
     })
 }
@@ -217,6 +277,8 @@ struct ProcFile {
     name: &'static str,
     ino: u64,
     kind: ProcKind,
+    /// Target of a `ProcKind::Pid*` node; ignored by the `Self*`/static kinds.
+    pid: u64,
     /// The render in use for the current reading pass. Filled on demand; a
     /// zero-offset read refreshes it (see the module docs).
     buf: Spinlock<Option<Vec<u8>>>,
@@ -250,17 +312,18 @@ impl ProcFile {
                     procs_blocked: 0,
                 })
             }
-            ProcKind::SelfCmdline => {
-                compat::with_current_compat(|cs| cs.cmdline.clone()).unwrap_or_default()
-            }
-            ProcKind::SelfStatus => self.render_status(),
-            ProcKind::SelfMaps => self.render_maps(),
+            ProcKind::SelfCmdline => self.render_cmdline(scheduler::current_pid()),
+            ProcKind::SelfStatus => self.render_status(scheduler::current_pid()),
+            ProcKind::SelfMaps => self.render_maps(scheduler::current_pid()),
+            ProcKind::SelfStat => self.render_stat(scheduler::current_pid()),
+            ProcKind::SelfStatm => self.render_statm(scheduler::current_pid()),
+            ProcKind::PidCmdline => self.render_cmdline(self.pid),
+            ProcKind::PidStatus => self.render_status(self.pid),
+            ProcKind::PidMaps => self.render_maps(self.pid),
+            ProcKind::PidStat => self.render_stat(self.pid),
             // The real crate version, never a fabricated Linux release string.
             ProcKind::Version => fmt::format_version(KERNEL_VERSION),
-            // The static list of implemented drivers; see `FILESYSTEMS`.
             ProcKind::FileSystems => fmt::format_filesystems(&fmt::FILESYSTEMS),
-            // Load averages are honestly zero (no accounting); the counts are
-            // live scheduler state, fetched through one small accessor.
             ProcKind::LoadAvg => {
                 let (runnable, total, last_pid) = scheduler::loadavg_counts();
                 fmt::format_loadavg(&fmt::LoadAvg {
@@ -283,99 +346,26 @@ impl ProcFile {
         *self.buf.lock() = Some(fresh);
     }
 
-    fn render_status(&self) -> Vec<u8> {
-        let pid = scheduler::current_pid();
+    /// `/proc/<pid>/cmdline` is the argv snapshot `CompatState` already holds in
+    /// Linux's NUL-separated form (`format_cmdline`). Copy it out under the
+    /// registry lock, format nothing.
+    fn render_cmdline(&self, pid: u64) -> Vec<u8> {
+        compat::with_pid_compat(pid, |cs| cs.cmdline.clone()).unwrap_or_default()
+    }
 
-        /// Everything `/proc/self/status` needs, copied out from under the
-        /// registry lock so rendering and the thread-count query happen outside.
-        struct Snap {
-            name: Vec<u8>,
-            umask: u32,
-            tgid: u64,
-            ppid: u64,
-            fd_size: u64,
-            sig_pending: u64,
-            sig_blocked: u64,
-            sig_ign: u64,
-            sig_cgt: u64,
-            uids: [u32; 4],
-            gids: [u32; 4],
-            vm: fmt::VmKb,
-        }
-
-        let snap = compat::with_current_compat(|cs| {
-            let argv0: &[u8] = match cs.cmdline.iter().position(|b| *b == 0) {
-                Some(end) => &cs.cmdline[..end],
-                None => &cs.cmdline[..],
-            };
-            let name = fmt::task_name(&cs.exe_path, argv0);
-
-            // Disposition masks: `SIG_IGN` for ignored signals, "handler
-            // installed" for everything that is neither default nor ignore.
-            let mut sig_ign = 0u64;
-            let mut sig_cgt = 0u64;
-            for (i, action) in cs.sig.lock().handlers.iter().enumerate() {
-                if action.handler == SIG_IGN {
-                    sig_ign |= 1u64 << i;
-                } else if action.handler != SIG_DFL {
-                    sig_cgt |= 1u64 << i;
-                }
-            }
-
-            let vm = {
-                let guard = cs.vm.lock();
-                let heap_lo = page_down(guard.initial_brk);
-                let heap_hi = page_up(guard.current_brk);
-                let heap_kb = if heap_hi > heap_lo {
-                    (heap_hi - heap_lo) / 1024
-                } else {
-                    0
-                };
-                let stack_kb = USER_STACK_PAGES * PAGE_SIZE / 1024;
-                let mmap_kb: u64 = guard.mmaps.iter().map(|m| m.pages * PAGE_SIZE / 1024).sum();
-                let (image_kb, rss_kb) = image_kb(&cs.image_segments, &cs.interp_segments);
-                fmt::VmKb {
-                    size: image_kb + heap_kb + stack_kb + mmap_kb,
-                    rss: rss_kb + stack_kb,
-                    data: heap_kb,
-                    stk: stack_kb,
-                    exe: image_kb,
-                    lib: 0,
-                }
-            };
-
-            Snap {
-                name,
-                umask: cs.umask,
-                tgid: cs.tgid,
-                ppid: cs.ppid,
-                fd_size: cs.fds.capacity() as u64,
-                sig_pending: cs.sig_pending,
-                sig_blocked: cs.sig_blocked,
-                sig_ign,
-                sig_cgt,
-                // Linux's four Uid/Gid columns are real, effective, saved and
-                // filesystem. pagh has no separate fsuid/fsgid, so the last
-                // column repeats the effective id.
-                uids: [cs.creds.uid, cs.creds.euid, cs.creds.suid, cs.creds.euid],
-                gids: [cs.creds.gid, cs.creds.egid, cs.creds.sgid, cs.creds.egid],
-                vm,
-            }
-        });
-
-        // A kernel thread has no compat state: the caller cannot reach this node
-        // (see `lookup`), but stay defensive and render nothing rather than a
-        // half-invented process.
-        let Some(s) = snap else {
+    fn render_status(&self, pid: u64) -> Vec<u8> {
+        let Some(s) = compat::with_pid_compat(pid, |cs| StatusSnap::from(cs)) else {
+            // The target exited between lookup and render: an empty file is the
+            // only truthful answer a VFS node can give (the path itself is gone).
             return Vec::new();
         };
-
-        // Threads = the calling thread plus every other thread of the group.
+        // Threads = the target thread plus every other thread of its group.
         // Queried outside the registry lock (`group_member_pids` takes it).
         let threads = compat::group_member_pids(s.tgid, pid).len() as u64 + 1;
 
         fmt::format_status(&fmt::StatusInputs {
             name: &s.name,
+            state: pid_state(pid),
             umask: s.umask,
             pid,
             tgid: s.tgid,
@@ -392,88 +382,205 @@ impl ProcFile {
         })
     }
 
-    fn render_maps(&self) -> Vec<u8> {
-        struct Snap {
-            exe_path: String,
-            interp_path: String,
-            image_segments: Vec<LoadSegment>,
-            interp_segments: Vec<LoadSegment>,
-            initial_brk: u64,
-            current_brk: u64,
-            mmaps: Vec<crate::arch::x86_64::linux::mem::MmapRegion>,
-        }
-
-        let snap = compat::with_current_compat(|cs| {
-            let guard = cs.vm.lock();
-            Snap {
-                exe_path: cs.exe_path.clone(),
-                interp_path: cs.interp_path.clone(),
-                image_segments: cs.image_segments.clone(),
-                interp_segments: cs.interp_segments.clone(),
-                initial_brk: guard.initial_brk,
-                current_brk: guard.current_brk,
-                mmaps: guard.mmaps.clone(),
-            }
-        });
-        let Some(s) = snap else {
+    fn render_stat(&self, pid: u64) -> Vec<u8> {
+        let Some(s) = compat::with_pid_compat(pid, |cs| StatusSnap::from(cs)) else {
             return Vec::new();
         };
-
-        let mut regions: Vec<fmt::MapsRegion> = Vec::new();
-        for seg in &s.image_segments {
-            regions.push(seg_region(seg, Some(s.exe_path.as_str())));
-        }
-        for seg in &s.interp_segments {
-            regions.push(seg_region(seg, Some(s.interp_path.as_str())));
-        }
-
-        let heap_lo = page_down(s.initial_brk);
-        let heap_hi = page_up(s.current_brk);
-        if heap_hi > heap_lo {
-            regions.push(fmt::MapsRegion {
-                start: heap_lo,
-                end: heap_hi,
-                prot: fmt::PROT_READ | fmt::PROT_WRITE,
-                file_offset: 0,
-                dev_major: 0,
-                dev_minor: 0,
-                ino: 0,
-                path: Some("[heap]"),
-            });
-        }
-
-        for m in &s.mmaps {
-            regions.push(fmt::MapsRegion {
-                start: m.base,
-                end: m.base.saturating_add(m.pages * PAGE_SIZE),
-                prot: m.prot,
-                file_offset: 0,
-                dev_major: 0,
-                dev_minor: 0,
-                ino: 0,
-                // A file-backed `mmap` has no recorded pathname in
-                // `VmRegionSet` (docs/procfs.md DEVIATION-7).
-                path: None,
-            });
-        }
-
+        let threads = compat::group_member_pids(s.tgid, pid).len() as u64 + 1;
         let stack_lo = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
+
+        fmt::format_pid_stat(&fmt::PidStatInputs {
+            name: &s.name,
+            pid,
+            state: pid_state(pid),
+            ppid: s.ppid,
+            // One process group per thread group (pagh does not model sessions).
+            pgrp: s.tgid,
+            session: s.tgid,
+            threads,
+            sig_blocked: s.sig_blocked,
+            sig_ign: s.sig_ign,
+            sig_cgt: s.sig_cgt,
+            vm: s.vm,
+            start_brk: s.current_brk,
+            startstack: stack_lo,
+            exit_code: s.exit_code,
+        })
+    }
+
+    fn render_statm(&self, pid: u64) -> Vec<u8> {
+        match compat::with_pid_compat(pid, |cs| StatusSnap::from(cs)) {
+            Some(s) => fmt::format_statm(&s.vm),
+            None => Vec::new(),
+        }
+    }
+
+    fn render_maps(&self, pid: u64) -> Vec<u8> {
+        let Some(s) = compat::with_pid_compat(pid, |cs| MapsSnap::from(cs)) else {
+            return Vec::new();
+        };
+        maps_text(&s)
+    }
+}
+
+/// Is the target task currently parked by a stop signal? This kernel tracks
+/// exactly two observable states for `/proc` purposes: `R` (running/ready) and
+/// `T` (stopped; `scheduler::STOPPED_TASKS`). Sleeping tasks are not modelled.
+fn pid_state(pid: u64) -> u8 {
+    if scheduler::is_stopped(pid) {
+        b'T'
+    } else {
+        b'R'
+    }
+}
+
+/// Everything `/proc/<pid>/{status,stat,statm}` needs, copied out from under the
+/// registry lock so formatting never holds it (AGENTS.md invariant 4).
+struct StatusSnap {
+    name: Vec<u8>,
+    umask: u32,
+    tgid: u64,
+    ppid: u64,
+    fd_size: u64,
+    sig_pending: u64,
+    sig_blocked: u64,
+    sig_ign: u64,
+    sig_cgt: u64,
+    uids: [u32; 4],
+    gids: [u32; 4],
+    vm: fmt::VmKb,
+    /// Current program break (`/proc/<pid>/stat` field 47).
+    current_brk: u64,
+    /// Recorded exit code (`/proc/<pid>/stat` field 52), 0 while alive.
+    exit_code: i64,
+}
+
+impl StatusSnap {
+    fn from(cs: &CompatState) -> Self {
+        let argv0: &[u8] = match cs.cmdline.iter().position(|b| *b == 0) {
+            Some(end) => &cs.cmdline[..end],
+            None => &cs.cmdline[..],
+        };
+        let name = fmt::task_name(&cs.exe_path, argv0);
+
+        // Disposition masks: `SIG_IGN` for ignored signals, "handler installed"
+        // for everything that is neither default nor ignore.
+        let mut sig_ign = 0u64;
+        let mut sig_cgt = 0u64;
+        for (i, action) in cs.sig.lock().handlers.iter().enumerate() {
+            if action.handler == SIG_IGN {
+                sig_ign |= 1u64 << i;
+            } else if action.handler != SIG_DFL {
+                sig_cgt |= 1u64 << i;
+            }
+        }
+
+        let (vm, current_brk) = vm_kb(cs);
+
+        StatusSnap {
+            name,
+            umask: cs.umask,
+            tgid: cs.tgid,
+            ppid: cs.ppid,
+            fd_size: cs.fds.capacity() as u64,
+            sig_pending: cs.sig_pending,
+            sig_blocked: cs.sig_blocked,
+            sig_ign,
+            sig_cgt,
+            // Linux's four Uid/Gid columns are real, effective, saved and
+            // filesystem. pagh has no separate fsuid/fsgid, so the last column
+            // repeats the effective id.
+            uids: [cs.creds.uid, cs.creds.euid, cs.creds.suid, cs.creds.euid],
+            gids: [cs.creds.gid, cs.creds.egid, cs.creds.sgid, cs.creds.egid],
+            vm,
+            current_brk,
+            exit_code: cs.exit_code.map(|c| c as i64).unwrap_or(0),
+        }
+    }
+}
+
+/// `/proc/<pid>/maps` inputs, snapshotted under the registry lock.
+struct MapsSnap {
+    exe_path: String,
+    interp_path: String,
+    image_segments: Vec<LoadSegment>,
+    interp_segments: Vec<LoadSegment>,
+    initial_brk: u64,
+    current_brk: u64,
+    mmaps: Vec<crate::arch::x86_64::linux::mem::MmapRegion>,
+}
+
+impl MapsSnap {
+    fn from(cs: &CompatState) -> Self {
+        let guard = cs.vm.lock();
+        MapsSnap {
+            exe_path: cs.exe_path.clone(),
+            interp_path: cs.interp_path.clone(),
+            image_segments: cs.image_segments.clone(),
+            interp_segments: cs.interp_segments.clone(),
+            initial_brk: guard.initial_brk,
+            current_brk: guard.current_brk,
+            mmaps: guard.mmaps.clone(),
+        }
+    }
+}
+
+/// Render a `/proc/<pid>/maps` snapshot (shared by `self` and pid nodes).
+fn maps_text(s: &MapsSnap) -> Vec<u8> {
+    let mut regions: Vec<fmt::MapsRegion> = Vec::new();
+    for seg in &s.image_segments {
+        regions.push(seg_region(seg, Some(s.exe_path.as_str())));
+    }
+    for seg in &s.interp_segments {
+        regions.push(seg_region(seg, Some(s.interp_path.as_str())));
+    }
+
+    let heap_lo = page_down(s.initial_brk);
+    let heap_hi = page_up(s.current_brk);
+    if heap_hi > heap_lo {
         regions.push(fmt::MapsRegion {
-            start: stack_lo,
-            end: USER_STACK_TOP,
+            start: heap_lo,
+            end: heap_hi,
             prot: fmt::PROT_READ | fmt::PROT_WRITE,
             file_offset: 0,
             dev_major: 0,
             dev_minor: 0,
             ino: 0,
-            path: Some("[stack]"),
+            path: Some("[heap]"),
         });
-
-        fmt::format_maps(&regions)
     }
+
+    for m in &s.mmaps {
+        regions.push(fmt::MapsRegion {
+            start: m.base,
+            end: m.base.saturating_add(m.pages * PAGE_SIZE),
+            prot: m.prot,
+            file_offset: 0,
+            dev_major: 0,
+            dev_minor: 0,
+            ino: 0,
+            // A file-backed `mmap` has no recorded pathname in
+            // `VmRegionSet` (docs/procfs.md DEVIATION-7).
+            path: None,
+        });
+    }
+
+    let stack_lo = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
+    regions.push(fmt::MapsRegion {
+        start: stack_lo,
+        end: USER_STACK_TOP,
+        prot: fmt::PROT_READ | fmt::PROT_WRITE,
+        file_offset: 0,
+        dev_major: 0,
+        dev_minor: 0,
+        ino: 0,
+        path: Some("[stack]"),
+    });
+
+    fmt::format_maps(&regions)
 }
 
-/// One `/proc/self/maps` line for a loaded `PT_LOAD` segment.
+/// One `/proc/<pid>/maps` line for a loaded `PT_LOAD` segment.
 fn seg_region<'a>(seg: &LoadSegment, path: Option<&'a str>) -> fmt::MapsRegion<'a> {
     fmt::MapsRegion {
         start: seg.start,
@@ -509,6 +616,36 @@ fn image_kb(image: &[LoadSegment], interp: &[LoadSegment]) -> (u64, u64) {
         total += seg.end.saturating_sub(seg.start);
     }
     (total / 1024, total / 1024)
+}
+
+/// Snapshot the target's Vm* accounting and current break under one `vm` lock.
+///
+/// `size` is image + heap + stack + anonymous mappings; `rss` counts only the
+/// eagerly backed parts (image + stack), exactly as `/proc/self/status` has
+/// reported since slice 1 (`docs/procfs.md` §4.5.1, DEVIATION-5).
+fn vm_kb(cs: &CompatState) -> (fmt::VmKb, u64) {
+    let guard = cs.vm.lock();
+    let heap_lo = page_down(guard.initial_brk);
+    let heap_hi = page_up(guard.current_brk);
+    let heap_kb = if heap_hi > heap_lo {
+        (heap_hi - heap_lo) / 1024
+    } else {
+        0
+    };
+    let stack_kb = USER_STACK_PAGES * PAGE_SIZE / 1024;
+    let mmap_kb: u64 = guard.mmaps.iter().map(|m| m.pages * PAGE_SIZE / 1024).sum();
+    let (image_kb, rss_kb) = image_kb(&cs.image_segments, &cs.interp_segments);
+    (
+        fmt::VmKb {
+            size: image_kb + heap_kb + stack_kb + mmap_kb,
+            rss: rss_kb + stack_kb,
+            data: heap_kb,
+            stk: stack_kb,
+            exe: image_kb,
+            lib: 0,
+        },
+        guard.current_brk,
+    )
 }
 
 fn page_down(addr: u64) -> u64 {
