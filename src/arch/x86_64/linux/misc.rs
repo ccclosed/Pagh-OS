@@ -1080,3 +1080,33 @@ pub fn sys_fadvise64(fd: u64, _offset: u64, _len: u64, advice: u64) -> Result<u6
     }
     Ok(0)
 }
+
+/// `setrlimit` (160): `prlimit64` for the calling process, old limit unused.
+pub fn sys_setrlimit(resource: u64, new_limit: u64) -> Result<u64, Errno> {
+    sys_prlimit64(0, resource, new_limit, 0)
+}
+
+/// `getrusage` (98): Linux's `struct rusage` is 144 bytes. pagh does not
+/// account per-process CPU time or faults yet, so the whole structure is
+/// zeroed — the same honest substitution as the zeroed fields in
+/// `/proc/<pid>/stat`, not invented numbers.
+pub fn sys_getrusage(who: u64, usage: u64) -> Result<u64, Errno> {
+    if who > 2 && who != u64::MAX {
+        return Err(Errno::EINVAL);
+    }
+    if usage == 0 {
+        return Err(Errno::EFAULT);
+    }
+    check_user_ptr(usage, 144)?;
+    super::io_sys::copy_out_pub(usage, &[0u8; 144]);
+    Ok(0)
+}
+
+/// `times` (100): return the scheduler tick counter and zero `struct tms`.
+pub fn sys_times(tms: u64) -> Result<u64, Errno> {
+    if tms != 0 {
+        check_user_ptr(tms, 32)?;
+        super::io_sys::copy_out_pub(tms, &[0u8; 32]);
+    }
+    Ok(scheduler::ticks())
+}

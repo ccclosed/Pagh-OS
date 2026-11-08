@@ -262,6 +262,12 @@ pub mod nr {
     pub const TGKILL: u64 = 234;
     /// `prlimit64` — get/set a resource limit.
     pub const PRLIMIT64: u64 = 302;
+    /// `setrlimit` (160) — prlimit64 with the caller as the target.
+    pub const SETRLIMIT: u64 = 160;
+    /// `getrusage` (98) — zeroed CPU/fault accounting.
+    pub const GETRUSAGE: u64 = 98;
+    /// `times` (100) — tick counter plus zeroed tms.
+    pub const TIMES: u64 = 100;
     /// `getrandom` — fill a buffer with random bytes.
     pub const GETRANDOM: u64 = 318;
     /// `rseq` — restartable sequences registration (stub).
@@ -326,7 +332,7 @@ pub fn marshal_args(
 /// History note: the previous test asserted membership for only 69 of the 109
 /// numbers the gate accepted and never asserted that anything was *unsupported*,
 /// so it could not catch either class of drift.
-pub const SUPPORTED_SYSCALLS: [u64; 134] = [
+pub const SUPPORTED_SYSCALLS: [u64; 137] = [
     nr::READ,
     nr::WRITE,
     nr::OPEN,
@@ -393,7 +399,9 @@ pub const SUPPORTED_SYSCALLS: [u64; 134] = [
     nr::UMASK,
     nr::GETTIMEOFDAY,
     nr::GETRLIMIT,
+    nr::GETRUSAGE,
     nr::SYSINFO,
+    nr::TIMES,
     nr::GETUID,
     nr::GETGID,
     nr::SETUID,
@@ -415,6 +423,7 @@ pub const SUPPORTED_SYSCALLS: [u64; 134] = [
     nr::STATFS,
     nr::FSTATFS,
     nr::ARCH_PRCTL,
+    nr::SETRLIMIT,
     nr::GETTID,
     nr::TIME,
     nr::FUTEX,
@@ -511,14 +520,15 @@ mod tests {
     fn supported_set_is_exact() {
         // Independent enumeration: the Linux x86_64 syscall numbers with a real
         // dispatcher arm, in ascending order (keep it sorted!).
-        const EXPECTED: [u64; 134] = [
+        const EXPECTED: [u64; 137] = [
             0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
             28, 32, 33, 35, 39, 40, 41, 42, 43, 44, 45, 49, 50, 51, 53, 54, 55, 56, 59, 60, 61, 62,
-            63, 72, 73, 74, 75, 79, 80, 81, 82, 83, 84, 87, 89, 90, 91, 92, 93, 95, 96, 97, 99,
-            102, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 117, 118, 119, 120, 121,
-            131, 137, 138, 158, 186, 201, 202, 203, 204, 213, 217, 218, 221, 227, 228, 229, 230,
-            231, 232, 233, 234, 257, 258, 260, 262, 263, 264, 267, 268, 269, 270, 271, 273, 274,
-            281, 284, 288, 290, 291, 292, 293, 295, 296, 302, 309, 316, 318, 326, 332, 334,
+            63, 72, 73, 74, 75, 79, 80, 81, 82, 83, 84, 87, 89, 90, 91, 92, 93, 95, 96, 97, 98, 99,
+            100, 102, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 117, 118, 119, 120,
+            121, 131, 137, 138, 158, 160, 186, 201, 202, 203, 204, 213, 217, 218, 221, 227, 228,
+            229, 230, 231, 232, 233, 234, 257, 258, 260, 262, 263, 264, 267, 268, 269, 270, 271,
+            273, 274, 281, 284, 288, 290, 291, 292, 293, 295, 296, 302, 309, 316, 318, 326, 332,
+            334,
         ];
 
         // 1. The two independent enumerations agree element-wise, and both are

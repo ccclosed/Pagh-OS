@@ -347,6 +347,9 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::RSEQ => misc::sys_rseq(),
         sysno::PRLIMIT64 => misc::sys_prlimit64(a[0], a[1], a[2], a[3]),
         sysno::GETRLIMIT => misc::sys_getrlimit(a[0], a[1]),
+        sysno::SETRLIMIT => misc::sys_setrlimit(a[0], a[1]),
+        sysno::GETRUSAGE => misc::sys_getrusage(a[0], a[1]),
+        sysno::TIMES => misc::sys_times(a[0]),
         // `exit`/`exit_group` diverge (never return); the `!` coerces to the
         // `Result` arm type.
         sysno::EXIT => misc::sys_exit(a[0]),
