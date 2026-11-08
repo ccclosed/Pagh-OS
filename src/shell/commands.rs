@@ -1211,6 +1211,94 @@ pub(super) fn cmd_warn(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
+/// Wait for a foreground job, translating ^C/^Z into SIGINT/SIGTSTP.
+///
+/// Returns when the program exits or stops. A stopped program is recorded in
+/// the shell job table; `fg`/`bg` resume it later.
+fn foreground_wait(pid: u64, command: &str) {
+    use core::sync::atomic::Ordering;
+    crate::shell::keys::CTRL_C_LATCH.store(false, Ordering::Relaxed);
+    crate::shell::keys::CTRL_Z_LATCH.store(false, Ordering::Relaxed);
+    crate::drivers::ps2_kbd::CTRL_C.store(false, Ordering::Relaxed);
+    crate::drivers::ps2_kbd::CTRL_Z.store(false, Ordering::Relaxed);
+    crate::drivers::ps2_kbd::FG_PID.store(pid, Ordering::Relaxed);
+    while crate::task::compat::compat_exists(pid) {
+        let stopped = crate::shell::keys::CTRL_Z_LATCH.swap(false, Ordering::Relaxed)
+            | crate::drivers::ps2_kbd::CTRL_Z.swap(false, Ordering::Relaxed);
+        if stopped {
+            shell_println("^Z");
+            let pgid = crate::task::compat::pgid_of(pid).unwrap_or(pid);
+            let _ = crate::arch::x86_64::linux::signal::send_signal_to_pgid(
+                pgid,
+                crate::arch::x86_64::linux::signal_frame::SIGTSTP,
+            );
+            crate::shell::jobs::record(pid, pgid, String::from(command), true);
+            crate::drivers::ps2_kbd::FG_PID.store(0, Ordering::Relaxed);
+            return;
+        }
+        let pressed = crate::shell::keys::CTRL_C_LATCH.swap(false, Ordering::Relaxed)
+            | crate::drivers::ps2_kbd::CTRL_C.swap(false, Ordering::Relaxed);
+        if pressed {
+            shell_println("^C");
+            let _ = crate::arch::x86_64::linux::signal::send_signal(
+                pid,
+                crate::arch::x86_64::linux::signal_frame::SIGINT,
+            );
+        }
+        crate::task::scheduler::yield_current();
+    }
+    crate::drivers::ps2_kbd::FG_PID.store(0, Ordering::Relaxed);
+    crate::shell::jobs::remove(pid);
+}
+
+/// `jobs`: list remembered jobs.
+pub(super) fn cmd_jobs(_ctx: &mut ShellCtx, _args: &[&str]) {
+    let jobs = crate::shell::jobs::snapshot();
+    if jobs.is_empty() {
+        shell_println("jobs: none");
+        return;
+    }
+    for (index, (pid, pgid, command, stopped)) in jobs.iter().enumerate() {
+        shell_println(&format!(
+            "[{}] {} pid={} pgid={} {}",
+            index + 1,
+            if *stopped { "Stopped" } else { "Running" },
+            pid,
+            pgid,
+            command
+        ));
+    }
+}
+
+/// `bg`: resume the most recent stopped job in the background.
+pub(super) fn cmd_bg(_ctx: &mut ShellCtx, _args: &[&str]) {
+    let Some((pid, pgid, command)) = crate::shell::jobs::last() else {
+        shell_println("bg: no jobs");
+        return;
+    };
+    let _ = crate::arch::x86_64::linux::signal::send_signal_to_pgid(
+        pgid,
+        crate::arch::x86_64::linux::signal_frame::SIGCONT,
+    );
+    crate::shell::jobs::set_stopped(pid, false);
+    shell_println(&format!("bg: [{}] {}", pid, command));
+}
+
+/// `fg`: resume the most recent stopped job and wait for it.
+pub(super) fn cmd_fg(_ctx: &mut ShellCtx, _args: &[&str]) {
+    let Some((pid, pgid, command)) = crate::shell::jobs::last() else {
+        shell_println("fg: no jobs");
+        return;
+    };
+    let _ = crate::arch::x86_64::linux::signal::send_signal_to_pgid(
+        pgid,
+        crate::arch::x86_64::linux::signal_frame::SIGCONT,
+    );
+    crate::shell::jobs::set_stopped(pid, false);
+    shell_println(&format!("fg: [{}] {}", pid, command));
+    foreground_wait(pid, &command);
+}
+
 pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
         shell_println("usage: lxrun <path> [args...]");
@@ -1260,42 +1348,14 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
             // running (each further ^C re-sends); without a handler the
             // default-terminate action kills it, ending this wait loop.
             use core::sync::atomic::Ordering;
-            crate::shell::keys::CTRL_C_LATCH.store(false, Ordering::Relaxed);
-            crate::shell::keys::CTRL_Z_LATCH.store(false, Ordering::Relaxed);
-            crate::drivers::ps2_kbd::CTRL_C.store(false, Ordering::Relaxed);
-            crate::drivers::ps2_kbd::CTRL_Z.store(false, Ordering::Relaxed);
-            crate::drivers::ps2_kbd::FG_PID.store(pid, Ordering::Relaxed);
-            let mut heartbeats: u64 = 0;
-            while crate::task::compat::compat_exists(pid) {
-                let stopped = crate::shell::keys::CTRL_Z_LATCH.swap(false, Ordering::Relaxed)
-                    | crate::drivers::ps2_kbd::CTRL_Z.swap(false, Ordering::Relaxed);
-                if stopped {
-                    shell_println("^Z");
-                    let pgid = crate::task::compat::pgid_of(pid).unwrap_or(pid);
-                    let _ = crate::arch::x86_64::linux::signal::send_signal_to_pgid(
-                        pgid,
-                        crate::arch::x86_64::linux::signal_frame::SIGTSTP,
-                    );
-                    // The group is parked by the signal path; return to the
-                    // prompt instead of blocking the shell on a stopped child.
-                    crate::drivers::ps2_kbd::FG_PID.store(0, Ordering::Relaxed);
-                    break;
-                }
-                let pressed = crate::shell::keys::CTRL_C_LATCH.swap(false, Ordering::Relaxed)
-                    | crate::drivers::ps2_kbd::CTRL_C.swap(false, Ordering::Relaxed);
-                if pressed {
-                    shell_println("^C");
-                    let _ = crate::arch::x86_64::linux::signal::send_signal(
-                        pid,
-                        crate::arch::x86_64::linux::signal_frame::SIGINT,
-                    );
-                }
-                heartbeats += 1;
-                if heartbeats % 20000 == 0 {}
-                crate::task::scheduler::yield_current();
-            }
-            // Foreground program is gone — clear the ^C kill target.
-            crate::drivers::ps2_kbd::FG_PID.store(0, core::sync::atomic::Ordering::Relaxed);
+            let command = args.first().copied().unwrap_or("?").into();
+            crate::shell::jobs::record(
+                pid,
+                crate::task::compat::pgid_of(pid).unwrap_or(pid),
+                command,
+                false,
+            );
+            foreground_wait(pid, args.first().copied().unwrap_or("?"));
         }
         Err(e) => {
             crate::drivers::ps2_kbd::FG_PID.store(0, core::sync::atomic::Ordering::Relaxed);

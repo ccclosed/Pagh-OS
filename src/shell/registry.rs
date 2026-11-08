@@ -181,6 +181,24 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_nc,
     },
     CommandSpec {
+        name: "jobs",
+        description: "List stopped/running jobs",
+        usage: "jobs",
+        handler: super::commands::cmd_jobs,
+    },
+    CommandSpec {
+        name: "fg",
+        description: "Resume the most recent stopped job in the foreground",
+        usage: "fg",
+        handler: super::commands::cmd_fg,
+    },
+    CommandSpec {
+        name: "bg",
+        description: "Resume the most recent stopped job in the background",
+        usage: "bg",
+        handler: super::commands::cmd_bg,
+    },
+    CommandSpec {
         name: "selftest",
         description: "Run kernel self-test suite (serial; N passes = idempotency check)",
         usage: "selftest [passes]",

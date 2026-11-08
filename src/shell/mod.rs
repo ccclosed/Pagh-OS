@@ -14,6 +14,7 @@ pub(crate) mod cat;
 pub(crate) mod complete;
 pub(crate) mod editor;
 pub(crate) mod history;
+pub(crate) mod jobs;
 pub(crate) mod keys;
 pub(crate) mod nano;
 pub(crate) mod nano_config;
