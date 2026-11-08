@@ -1261,10 +1261,26 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
             // default-terminate action kills it, ending this wait loop.
             use core::sync::atomic::Ordering;
             crate::shell::keys::CTRL_C_LATCH.store(false, Ordering::Relaxed);
+            crate::shell::keys::CTRL_Z_LATCH.store(false, Ordering::Relaxed);
             crate::drivers::ps2_kbd::CTRL_C.store(false, Ordering::Relaxed);
+            crate::drivers::ps2_kbd::CTRL_Z.store(false, Ordering::Relaxed);
             crate::drivers::ps2_kbd::FG_PID.store(pid, Ordering::Relaxed);
             let mut heartbeats: u64 = 0;
             while crate::task::compat::compat_exists(pid) {
+                let stopped = crate::shell::keys::CTRL_Z_LATCH.swap(false, Ordering::Relaxed)
+                    | crate::drivers::ps2_kbd::CTRL_Z.swap(false, Ordering::Relaxed);
+                if stopped {
+                    shell_println("^Z");
+                    let pgid = crate::task::compat::pgid_of(pid).unwrap_or(pid);
+                    let _ = crate::arch::x86_64::linux::signal::send_signal_to_pgid(
+                        pgid,
+                        crate::arch::x86_64::linux::signal_frame::SIGTSTP,
+                    );
+                    // The group is parked by the signal path; return to the
+                    // prompt instead of blocking the shell on a stopped child.
+                    crate::drivers::ps2_kbd::FG_PID.store(0, Ordering::Relaxed);
+                    break;
+                }
                 let pressed = crate::shell::keys::CTRL_C_LATCH.swap(false, Ordering::Relaxed)
                     | crate::drivers::ps2_kbd::CTRL_C.swap(false, Ordering::Relaxed);
                 if pressed {

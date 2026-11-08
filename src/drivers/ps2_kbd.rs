@@ -92,6 +92,9 @@ pub fn has_scancode() -> bool {
 /// consumer later reads the scancode (shell editor OR a compat process's
 /// stdin). The `lxrun` foreground wait polls this to terminate the child.
 pub static CTRL_C: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Set when the driver sees Ctrl+Z make; the `lxrun` foreground wait turns it
+/// into SIGTSTP for the foreground process group.
+pub static CTRL_Z: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// PID of the current foreground Compat_Process (set by `cmd_lxrun`).
 /// When the driver detects ^C, it directly terminates this pid — the shell
@@ -121,6 +124,9 @@ pub fn irq_handler() {
         match (extended, scancode) {
             (false, 0x1D) => DRV_CTRL.store(make, Ordering::Relaxed),
             (true, 0x1D) => DRV_CTRL.store(make, Ordering::Relaxed),
+            (false, 0x2C) if make && DRV_CTRL.load(Ordering::Relaxed) => {
+                CTRL_Z.store(true, Ordering::Relaxed);
+            }
             (false, 0x2E) if make && DRV_CTRL.load(Ordering::Relaxed) => {
                 CTRL_C.store(true, Ordering::Relaxed);
                 let fg = FG_PID.load(Ordering::Relaxed);

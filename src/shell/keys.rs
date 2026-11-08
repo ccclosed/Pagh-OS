@@ -47,6 +47,10 @@ pub enum KeyEvent {
 pub static CTRL_C_LATCH: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Ctrl+Z latch for the `lxrun` foreground wait (same path as Ctrl+C).
+pub static CTRL_Z_LATCH: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Persistent CapsLock state. Decoders are created per read call on the
 /// stdin path, so the toggle must outlive any single instance.
 static CAPS_LOCK_STATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -170,6 +174,9 @@ impl Decoder {
                     Some(ch) if ch != '\n' && ch != '\t' && self.ctrl => {
                         if ch.to_ascii_lowercase() == 'c' {
                             CTRL_C_LATCH.store(true, core::sync::atomic::Ordering::Relaxed);
+                        }
+                        if ch.to_ascii_lowercase() == 'z' {
+                            CTRL_Z_LATCH.store(true, core::sync::atomic::Ordering::Relaxed);
                         }
                         Some(KeyEvent::Ctrl(ch.to_ascii_lowercase()))
                     }

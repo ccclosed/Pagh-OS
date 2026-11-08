@@ -282,6 +282,15 @@ fn force_terminate_group(pid: u64, sig: u64) {
 /// Locking (AGENTS.md invariant 4): [`resolve_kill_targets`] takes one short
 /// registry snapshot and releases it; the sends happen afterwards, never while
 /// `COMPAT_STATES` is held (each `send_signal` re-enters the registry itself).
+/// Send `sig` to the process group `pgid`, queued once on its leader.
+pub fn send_signal_to_pgid(pgid: u64, sig: u64) -> Result<(), Errno> {
+    let targets = super::kill::pick_group_target(&compat::group_pids(pgid), pgid);
+    match targets {
+        Some(leader) => send_signal(leader, sig),
+        None => Err(Errno::ESRCH),
+    }
+}
+
 pub fn sys_kill(pid_raw: u64, sig_raw: u64) -> Result<u64, Errno> {
     let (target, sig) = super::kill::kill_args(
         super::kill::decode_pid(pid_raw),
