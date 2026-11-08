@@ -122,6 +122,8 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::UNLINK => io_sys::sys_unlink(a[0]),
         sysno::CHMOD => io_sys::sys_chmod(a[0], a[1]),
         sysno::FCHMOD => io_sys::sys_fchmod(a[0], a[1]),
+        sysno::FCHMODAT => io_sys::sys_fchmodat(a[0], a[1], a[2], a[3]),
+        sysno::FACCESSAT => io_sys::sys_faccessat(a[0], a[1], a[2], a[3]),
         sysno::CHOWN => io_sys::sys_chown(a[0], a[1], a[2]),
         sysno::FCHOWN => io_sys::sys_fchown(a[0], a[1], a[2]),
         sysno::POLL => io_sys::sys_poll(a[0], a[1], a[2]),

@@ -58,6 +58,8 @@ const COUNT_MAX: u64 = 0x7FFF_FFFF;
 
 /// `openat` "current working directory" sentinel dir fd.
 const AT_FDCWD: u64 = (-100i64) as u64;
+/// `faccessat` flag: check against the effective ids instead of the real ids.
+const AT_EACCESS: u64 = 0x200;
 
 /// `newfstatat` flag: do not follow a final symbolic link (`lstat`).
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
@@ -2016,6 +2018,62 @@ pub fn sys_fchmod(fd: u64, mode: u64) -> Result<u64, Errno> {
     let node = fd_node(fd)?;
     check_chmod_allowed(&node)?;
     apply_node_mode(&node, (mode & 0o7777) as u32)?;
+    Ok(0)
+}
+
+/// `fchmodat` (268): `chmod` relative to an fd base, with flags.
+///
+/// This minimal layer treats every `dirfd` as `AT_FDCWD` (absolute or
+/// cwd-relative), matching `openat`/`newfstatat`; `AT_SYMLINK_NOFOLLOW` keeps
+/// the link node itself instead of following it. Other flags are `EINVAL`.
+pub fn sys_fchmodat(dirfd: u64, path: u64, mode: u64, flags: u64) -> Result<u64, Errno> {
+    let _ = dirfd; // AT_FDCWD-equivalent in this minimal compat layer.
+    if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let p = read_user_cstr(path)?;
+    let abs = resolve_path(&p);
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let node = walk(&abs, follow)?;
+    check_chmod_allowed(&node)?;
+    apply_node_mode(&node, (mode & 0o7777) as u32)?;
+    Ok(0)
+}
+
+/// `faccessat` (269): `access` relative to an fd base, with `AT_EACCESS`.
+///
+/// `dirfd` is treated as `AT_FDCWD` (see `sys_fchmodat`). Without `AT_EACCESS`
+/// the check uses the REAL ids, exactly like `access(2)`; with it, the
+/// effective ids. `AT_SYMLINK_NOFOLLOW` makes a final symlink the target of the
+/// check; other flags are `EINVAL`.
+pub fn sys_faccessat(dirfd: u64, path: u64, mode: u64, flags: u64) -> Result<u64, Errno> {
+    let _ = dirfd; // AT_FDCWD-equivalent in this minimal compat layer.
+    if flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW) != 0 || mode & !0o7 != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let p = read_user_cstr(path)?;
+    let abs = resolve_path(&p);
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let node = walk(&abs, follow)?;
+    let creds = current_creds();
+    let check = if flags & AT_EACCESS != 0 {
+        creds
+    } else {
+        Creds::new(
+            creds.uid, creds.gid, creds.uid, creds.gid, creds.uid, creds.gid,
+        )
+    };
+    let owner = node.owner();
+    let file_mode = node.mode();
+    for (bit, access) in [
+        (0o4, Access::Read),
+        (0o2, Access::Write),
+        (0o1, Access::Execute),
+    ] {
+        if mode & bit != 0 && !check.may(file_mode, owner, access) {
+            return Err(Errno::EACCES);
+        }
+    }
     Ok(0)
 }
 
