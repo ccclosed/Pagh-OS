@@ -64,6 +64,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 TOOLS = pathlib.Path(__file__).resolve().parent
@@ -912,6 +913,81 @@ class Mirror:
             self._fh = None
 
 
+class OneShotServer:
+    """A TCP server that answers once and closes **in the same burst**.
+
+    WHY THIS EXISTS. slirp hands the guest the reply and the FIN together, so the
+    kernel-side socket goes SYN-SENT → ESTABLISHED → CLOSE-WAIT inside a single
+    poll pass. Any code that waits for `state == Established` (rather than "the
+    handshake happened") never observes the window and fails the connect with a
+    timeout, throwing away a peer that had already answered. That was a real bug
+    in `sys_connect_tcp` and in the shell's `nc`; this server is the smallest
+    deterministic reproduction of the shape, and it is not synthetic — an
+    HTTP/1.0 `Connection: close` peer behaves exactly like this.
+    """
+
+    def __init__(self, port: int, payload: bytes, out_log: pathlib.Path) -> None:
+        self.port = port
+        self.payload = payload
+        self.out_log = out_log
+        self.srv: socket.socket | None = None
+        self.thread: threading.Thread | None = None
+        self.accepted = 0
+        self.error: str | None = None
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        if not port_free(self.port):
+            raise SetupError(
+                f"TCP port {self.port} is already in use; the guest reaches the host "
+                f"as 10.0.2.2:{self.port}, so a stale listener would silently "
+                f"answer this test. Stop it and retry.")
+        self.srv = socket.socket()
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(("0.0.0.0", self.port))
+        self.srv.listen(4)
+        self.srv.settimeout(0.5)
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+        log(f"one-shot TCP server listening on 0.0.0.0:{self.port}")
+
+    def _serve(self) -> None:
+        assert self.srv is not None
+        while not self._stop.is_set():
+            try:
+                conn, _peer = self.srv.accept()
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                self.error = str(exc)
+                return
+            self.accepted += 1
+            try:
+                # Reply and close immediately: the payload and the FIN leave in
+                # one write+close, which is what puts the peer into CLOSE-WAIT.
+                conn.sendall(self.payload)
+                conn.close()
+                self._log(f"accept #{self.accepted}: sent {len(self.payload)}B and closed")
+            except OSError as exc:
+                self._log(f"accept #{self.accepted}: send failed: {exc}")
+
+    def _log(self, line: str) -> None:
+        self.out_log.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.out_log, "a") as fh:
+            fh.write(line + "\n")
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=5)
+        if self.srv is not None:
+            try:
+                self.srv.close()
+            except OSError:
+                pass
+            self.srv = None
+
+
 # ───────────────────────── the harness ─────────────────────────
 
 
@@ -1470,6 +1546,56 @@ def resolve_log(path: str, default: str) -> pathlib.Path:
     return p if p.is_absolute() else ROOT / p
 
 
+def mode_tcp_shot(h: Harness) -> tuple[str, int]:
+    """Regression: a peer that answers and closes in ONE burst.
+
+    The guest's `nc` connects, sends, and reads the reply; the host answers and
+    closes immediately (see [`OneShotServer`]). Before the fix this failed —
+    `sys_connect_tcp` waited for `state == Established`, missed the window the
+    reply+FIN skipped through, timed out after 5 s and reported ETIMEDOUT for a
+    server that had already delivered its bytes. The test asserts the echoed
+    payload reaches the guest AND that no "connection failed" line is printed,
+    so it fails on the old behaviour and passes on the new one.
+    """
+    a = h.a
+    port = a.port
+    payload = b"PAGH-TCP-SHOT-OK\n"
+    out_log = h.run_dir / "tcp_shot_server.log"
+    server = OneShotServer(port, payload, out_log)
+    server.start()
+    try:
+        h.boot(need_keyboard=True)
+        assert h.kb is not None and h.guest is not None
+        if not wait_for_shell(h.guest, h.kb, a, a.boot_timeout):
+            raise HarnessError(f"the shell prompt never appeared within {a.boot_timeout:.0f}s; "
+                               f"serial tail:\n{tail(h.guest.serial())}")
+        cmd = f"nc 10.0.2.2 {port} pagh-shot"
+        log(f"type: {cmd}")
+        h.kb.text(cmd)
+        h.kb.key("ret")
+        found = wait_for(h.guest, [r"nc: echoed \d+ bytes:", r"nc: connection failed"],
+                         h.timeout, label="nc verdict")
+        text = h.guest.serial()
+        echoed = re.search(r"nc: echoed (\d+) bytes:", text)
+        failed = "nc: connection failed" in text
+        ok = h.check("nc reached the one-shot peer", bool(found), found or "no verdict line")
+        ok &= h.check("the reply arrived", bool(echoed) and not failed,
+                      f"echoed {echoed.group(1)} bytes" if echoed else "no echo")
+        ok &= h.check("payload text present", payload.strip().decode() in text,
+                      payload.strip().decode())
+        ok &= h.check("no connect failure", not failed, "nc: connection failed" if failed else "none")
+        ok &= h.check("server accepted exactly one connection", server.accepted == 1,
+                      f"{server.accepted} accept(s)")
+        ok &= h.check("server error-free", server.error is None, server.error or "none")
+        for extra in h.extra_evidence:
+            m = re.search(extra, text)
+            h.check(f"extra marker /{extra}/ (best effort)", bool(m),
+                    m.group(0).strip() if m else "not observed")
+        return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
+    finally:
+        server.stop()
+
+
 def mode_smoke(h: Harness) -> tuple[str, int]:
     """Log-based smoke criteria R4.1/R4.2/R7.4 (port of smoke_assertions.ps1).
 
@@ -1569,6 +1695,7 @@ MODES = {
     "live-update": mode_live_update,
     "bigindex": mode_bigindex,
     "shell": mode_shell,
+    "tcp-shot": mode_tcp_shot,
     "smoke": mode_smoke,
     "boot-check": mode_boot_check,
     "restore": mode_restore,
@@ -1689,6 +1816,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="shell command to type + Enter (repeatable)")
     sh.add_argument("--script", default=None,
                     help="interaction script (see the module docstring for the DSL)")
+
+    ts = sub.add_parser("tcp-shot", parents=[common],
+                        help="regression: a peer that replies and closes in one burst "
+                             "(exercises connect(2) completion and the shell's `nc`)")
+    ts.add_argument("--port", type=int, default=8099,
+                    help="host TCP port the guest reaches as 10.0.2.2:<port> (default 8099)")
 
     sm = sub.add_parser("smoke", parents=[common],
                         help="log-based smoke criteria R4.1/R4.2/R7.4 (replaces "
