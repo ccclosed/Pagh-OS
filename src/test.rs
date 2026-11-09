@@ -2179,6 +2179,27 @@ mod procfs_tests {
             "procfs fdinfo: ino is the backing VFS inode"
         );
 
+        // Creation-only flags (`O_CREAT`, `O_TRUNC`) are not part of Linux's
+        // `f_flags`; fdinfo must show only the flags the descriptor keeps.
+        let created_fd = compat::with_pid_compat(FAKE, |cs| {
+            cs.fds.alloc_with_flags(
+                OpenObject::File {
+                    node: Arc::clone(&meminfo),
+                    path: String::from("/proc/meminfo"),
+                    offset: 0,
+                },
+                O_RDONLY | 0o100 | 0o1000, // O_CREAT | O_TRUNC
+            )
+        })
+        .unwrap_or(0);
+        let created = text_of(&alloc::format!("/proc/{FAKE}/fdinfo/{created_fd}"));
+        assert_eq_kernel!(
+            line(&created, "flags:"),
+            "flags:\t00",
+            "procfs fdinfo: O_CREAT/O_TRUNC are cleared from f_flags"
+        );
+        compat::with_pid_compat(FAKE, |cs| cs.fds.close(created_fd));
+
         // Stdio has no VFS mount/inode; 0 is the documented sentinel, never a
         // fabricated id.
         let stdio = text_of(&alloc::format!("/proc/{FAKE}/fdinfo/0"));

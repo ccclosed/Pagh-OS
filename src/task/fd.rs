@@ -255,6 +255,16 @@ pub const O_NONBLOCK: u64 = 0o4000;
 /// `FD_CLOEXEC` can be toggled without rewriting the open flags.
 pub const O_CLOEXEC: u64 = 0o2000000;
 
+/// Open-time flags Linux strips from `file->f_flags` after `open(2)` returns
+/// (`fs/open.c::do_dentry_open`: `f->f_flags &= ~(O_CREAT | O_EXCL | O_NOCTTY |
+/// O_TRUNC | …)`). `/proc/<pid>/fdinfo/<n>` reports `f_flags`, so these must not
+/// leak into `flags:` even though the caller passed them to `open`.
+const O_CREAT_FLAG: u64 = 0o100;
+const O_EXCL_FLAG: u64 = 0o200;
+const O_NOCTTY_FLAG: u64 = 0o400;
+const O_TRUNC_FLAG: u64 = 0o1000;
+const FDINFO_OPEN_TIME_FLAGS: u64 = O_CREAT_FLAG | O_EXCL_FLAG | O_NOCTTY_FLAG | O_TRUNC_FLAG;
+
 /// Default open/status flags for an object created without an explicit open
 /// flag set. These are the access modes the object actually has: stdio is
 /// one-directional, pipes are one-directional, every socket/event object is
@@ -386,13 +396,16 @@ impl FdTable {
         self.alloc_with_flags(obj, flags)
     }
 
-    /// Allocate a descriptor and record the exact open/status flags it was
-    /// created with. `O_CLOEXEC` is stripped here because it is tracked in
-    /// `cloexec`; [`Self::fdinfo_flags`] recombines the two.
+    /// Allocate a descriptor and record the exact open/status flags the
+    /// descriptor carries. `O_CLOEXEC` is stripped here because it is tracked
+    /// in `cloexec` ([`Self::fdinfo_flags`] recombines the two), and the
+    /// creation-only flags Linux clears from `f_flags` are removed for the
+    /// same reason.
     pub fn alloc_with_flags(&mut self, obj: OpenObject, flags: u64) -> u32 {
         let fd = self.slots.alloc(Self::FIRST_DYNAMIC_FD, obj);
         self.cloexec.remove(&fd); // a recycled slot must not inherit the flag
-        self.flags.insert(fd, flags & !O_CLOEXEC);
+        self.flags
+            .insert(fd, flags & !(O_CLOEXEC | FDINFO_OPEN_TIME_FLAGS));
         fd
     }
 
