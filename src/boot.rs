@@ -428,7 +428,13 @@ fn fs_boot_demo() {
     let file = match dir.create_file("bootdemo.txt") {
         Ok(f) => f,
         Err(VfsError::AlreadyExists) => match dir.lookup("bootdemo.txt") {
-            Ok(f) => f,
+            Ok(f) => {
+                // The disk persists across boots; a shorter demo string must not
+                // leave the previous run's tail in place (write(2) does not
+                // truncate, exactly like POSIX).
+                let _ = f.truncate(0);
+                f
+            }
             Err(e) => {
                 warn!("fs demo: open existing failed: {:?}", e);
                 return;
@@ -463,7 +469,7 @@ fn fs_boot_demo() {
     };
     let mut buf = [0u8; 64];
     match rfile.read(0, &mut buf) {
-        Ok(n) if &buf[..n] == CONTENT => {
+        Ok(n) if n == CONTENT.len() && &buf[..n] == CONTENT => {
             info!(
                 "fs demo: /mnt/bootdemo.txt write+read round-trip PASS ({} bytes)",
                 n

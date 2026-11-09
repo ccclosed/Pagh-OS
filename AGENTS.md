@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.16.0**
+  be reflected here. **`main` currently reads 2.16.1**
   (the procfs slice 3 minor bump; it lands on `main` with the merge).
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
@@ -260,7 +260,9 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   buffer and flushed with it (the shadow-buffer commit had left it drawn *after*
   the flush, so it never reached the device), while an idle shell skips the
   overlay/repaint cycle instead of copying the surface once per timer tick.
-  **2.16.0** = the current unreleased batch: signalfd/signalfd4 and real process
+  **2.16.1** = the fastfetch/persistent-disk fixes (mprotect on untracked
+  resident pages, COW faults on stack/thread/heap pages, boot-demo truncate);
+  **2.16.0** = the 2.16 batch: signalfd/signalfd4 and real process
   groups (`pgid` in `CompatState`, setpgid/getpgid/getpgrp/setsid, group kill),
   tty foreground job control (`TIOCGPGRP`/`TIOCSPGRP`, SIGTTIN/TTOU, Ctrl+Z),
   `/proc/<pid>/fdinfo` + `/proc/<pid>/limits`, and the NVMe rewrite (multi-page

@@ -33,6 +33,7 @@ use alloc::vec::Vec;
 
 use x86_64::structures::paging::PageTableFlags;
 
+use crate::memory::layout::{USER_STACK_PAGES, USER_STACK_TOP};
 use crate::memory::{pmm, vmm};
 use crate::task::compat;
 
@@ -553,9 +554,13 @@ fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result
         .map(|n| n / PAGE_SIZE)
         .ok_or(Errno::EINVAL)?;
 
-    // Coverage check: every page in the range must belong to a tracked mmap
-    // region or the brk heap. Lazy (never-touched) pages are fine — Linux
-    // mprotect operates on VMAs, not on resident PTEs.
+    // Coverage check: every page in the range must be mapped in the caller's
+    // address space. Most pages are tracked as mmap regions or the brk heap,
+    // but the ELF loader maps PT_LOAD segments (and glibc's ld.so reprotects
+    // its RELRO segment) without a VmRegionSet entry; a resident PTE is just as
+    // real a mapping, so fall back to the page tables instead of answering
+    // ENOMEM. glibc reports that failure as "cannot apply additional memory
+    // protection after relocation", which is how fastfetch failed to start.
     {
         let mut covered = vm.mmaps.clone();
         if vm.current_brk > vm.brk_lazy_from {
@@ -568,7 +573,14 @@ fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result
                 anon: true,
             });
         }
-        if matches!(plan_munmap(addr, len, &covered), MunmapPlan::Reject(_)) {
+        let region_rejected = matches!(plan_munmap(addr, len, &covered), MunmapPlan::Reject(_));
+        // A page is acceptable when the region planner covers it OR when it is
+        // actually mapped (loader/stack/other PTEs). ENOMEM means at least one
+        // page is genuinely absent.
+        let unmapped = (0..pages)
+            .filter(|i| vmm::virt_to_phys(addr + i * PAGE_SIZE).is_none())
+            .count();
+        if region_rejected && unmapped > 0 {
             return Err(Errno::ENOMEM);
         }
     }
@@ -628,23 +640,15 @@ fn handle_cow_fault(addr: u64, caused_by_write: bool) -> bool {
     if !caused_by_write || compat::compat_lock_held() {
         return false;
     }
+    // `cow_copy_page` itself verifies the `COW_BIT`: a present read-only page
+    // WITHOUT that bit (ELF text/rodata, PROT_READ mmap) still returns false
+    // and keeps the SIGSEGV path. Gating on VMA bookkeeping here was wrong:
+    // the user stack, thread stacks and fork-shared heap pages are real
+    // writable mappings that `fork_user_space_cow` turns read-only, and a
+    // bookkeeping miss killed fastfetch in both the child and the parent
+    // immediately after fork.
     let page = addr & !(PAGE_SIZE - 1);
-    compat::with_current_compat(|cs| {
-        let vm = &mut cs.vm.lock();
-        let brk_end = vm.current_brk.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let in_writable_vma = vm.mmaps.iter().any(|r| {
-            page >= r.base
-                && page < r.base + r.pages * PAGE_SIZE
-                && r.writable
-                && r.prot & super::mem::PROT_WRITE != 0
-        });
-        let in_brk = page >= vm.brk_lazy_from && page < brk_end;
-        if !in_writable_vma && !in_brk {
-            return false;
-        }
-        crate::memory::vmm::cow_copy_page(page)
-    })
-    .unwrap_or(false)
+    crate::memory::vmm::cow_copy_page(page)
 }
 
 /// Back the page at `addr` on demand (anonymous `mmap` regions and the `brk`

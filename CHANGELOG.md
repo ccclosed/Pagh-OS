@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.16.1 — 2026-11-09
+
+Fixes found by running real apt-installed binaries (fastfetch) and a persistent
+disk:
+
+- `mprotect` no longer returns ENOMEM for a range whose pages are resident but
+  not tracked as mmap/brk regions (the ELF loader maps PT_LOAD segments without
+  a VmRegionSet entry). glibc's ld.so reported this as "cannot apply additional
+  memory protection after relocation"; fastfetch now starts.
+- COW write faults are serviced for every `COW_BIT` page, not only pages inside
+  a tracked writable VMA or the brk heap: the user stack, thread stacks and
+  fork-shared heap pages are real writable mappings, and a bookkeeping miss
+  killed both parent and child immediately after `fork` in fastfetch.
+- The boot fs demo truncates `bootdemo.txt` before rewriting it, so a shorter
+  demo string on a persistent disk no longer leaves the previous run's tail and
+  reports a false read-back MISMATCH.
+
+Verified live: `lxrun /mnt/usr/bin/fastfetch` prints Kernel/Uptime/Terminal/
+CPU/Memory/Disk and exits cleanly; the fs demo is PASS again; 414 host tests and
+the 82/83-routine e2e selftest remain green.
+
 ## 2.16.0 — 2026-11-09
 
 Batch release: Linux compat, procfs slice 5, job control and the NVMe rewrite.
