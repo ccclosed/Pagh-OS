@@ -64,6 +64,44 @@
   `-cpu max`, `run.sh` читает другое имя `PAGH_CPU`, а `run.cmd` `-cpu` не передаёт вообще,
   поэтому на Windows-пути живой HTTPS-чек упадёт в `stage=entropy`).
 
+## mkimage.py — загрузочный носитель для реального ПК
+
+```sh
+python3 tools/build.py stage --release          # iso_root/pagh.elf
+python3 tools/mkimage.py --usb dist/pagh-usb.img [--disk disk.img]
+sudo dd if=dist/pagh-usb.img of=/dev/sdX bs=4M status=progress conv=fsync
+```
+
+Образ UEFI-only: GPT + один FAT32 ESP (`EFI/BOOT/BOOTX64.EFI` от Limine,
+`limine.conf`, `pagh.elf`) и **сам `disk.img` рядом с ядром**. Диск-образ едет на
+носителе не для красоты: ядро монтирует только virtio-blk и NVMe, поэтому ПК без
+NVMe (например, только SATA) поднимался вообще без `/mnt` — шелл и ни одной
+программы. Limine отдаёт `disk.img` ядру как модуль, `drivers::memdisk` показывает
+его блочным устройством `ram0`, и `/mnt` монтируется из памяти.
+
+Честно про ограничения RAM-варианта: **запись идёт в ОЗУ и не переживает
+перезагрузку**, а образ на флешке при этом не меняется. Журнал на таком томе даёт
+только атомарность внутри сессии (см. `src/fs/README.md`, раздел «Журнал на
+RAM-диске»). Хочешь сохранение — нужен настоящий носитель: NVMe с разделом
+ext2+WAL (тогда `disk setup` в шелле отформатирует и смонтирует его).
+
+ISO-сборщика здесь нет намеренно. Для UEFI-загрузочного ISO нужен El Torito, а
+инструмент для него — `xorriso`, которого в базовой системе нет; самодельный
+ISO9660+El Torito каталог OVMF отвергает («Default entry is not valid, booting to
+menu»), и складывать в репозиторий сборщик, выдающий негрузящийся диск, хуже, чем
+его не иметь. Если xorriso есть:
+
+```sh
+xorriso -as mkisofs -o dist/pagh.iso \
+  -b limine-bios-cd.bin -no-emul-boot -boot-load-size 4 -boot-info-table \
+  --efi-boot limine-uefi-cd.bin -efi-boot-part --efi-boot-image \
+  -hfs-bless dist -R -J iso_root
+```
+
+(`limine-bios-cd.bin` / `limine-uefi-cd.bin` лежат в дереве Limine; при UEFI-only
+загрузке достаточно `--efi-boot`-части — содержимое `iso_root/` то же самое, что
+едет на флешку.)
+
 ## mini_repo.py
 
 Моды: `build` (собирает `dists/<suite>/…` + pool для **шести** suite'ов: `stable` —

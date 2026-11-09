@@ -20,6 +20,13 @@
 //! changes are discarded, like a live CD. Persisting them needs a writable
 //! medium, which means a real storage driver (NVMe today, USB mass storage
 //! later).
+//!
+//! The WAL on such a volume is therefore NOT a durability mechanism — the
+//! medium dies with the boot and the image on the boot medium is never
+//! modified, so there is nothing to replay on the next start. It still earns its
+//! keep as intra-session atomicity (a mutation interrupted halfway leaves the
+//! live tree consistent), and `fs/README.md` states the distinction rather than
+//! letting "WAL" imply "safe across power loss" where it cannot be.
 
 use alloc::sync::Arc;
 
