@@ -14,16 +14,21 @@
 //! process right there. Blocking kernel waits are interrupted through the
 //! `EINTR` checks the wait loops perform with [`has_deliverable_current`].
 //!
-//! Not yet wired (tracked by issue #12): timer-tick delivery (a CPU-bound loop
-//! with no syscalls still never sees a signal) and SIGSTOP/SIGCONT scheduling.
+//! Delivery also happens at the timer-tick return path (`tick_action`, for a
+//! CPU-bound task that never enters a syscall) and stop/continue are real
+//! scheduler state (a stopped task keeps its frame and leaves rotation), so the
+//! only remaining delivery limit is that a signal is observed at a syscall or
+//! tick boundary — never in the middle of a kernel computation.
 //!
 //! ## Sending: `kill(2)`, `tgkill` and the group broadcast
 //!
 //! [`send_signal`] queues onto ONE thread. [`sys_kill`] (`kill`, nr 62) decodes
 //! the `pid_t`/`int` arguments, classifies the target (`pid > 0`, `0`, `-1`,
 //! `-pgid`) via [`super::kill`], resolves it to a SNAPSHOT of pids and queues the
-//! signal once per addressed thread group (`kill::pick_group_target`), which is
-//! what Linux's shared group-pending list achieves. Errno decisions (EINVAL
+//! signal once per addressed process group (`kill::pick_group_target`), which is
+//! what Linux's shared group-pending list achieves. [`send_signal_to_pgid_all`]
+//! is the per-THREAD-GROUP variant the terminal and shell stop/continue paths
+//! need (a group stop parks one thread group at a time). Errno decisions (EINVAL
 //! before any lookup, `ESRCH` for `INT_MIN` and empty groups, `EPERM` when no
 //! target is signalable by the caller's effective uid) are documented on
 //! `kill::kill_args`.
@@ -291,6 +296,45 @@ pub fn send_signal_to_pgid(pgid: u64, sig: u64) -> Result<(), Errno> {
     }
 }
 
+/// Send `sig` to EVERY thread group in process group `pgid`.
+///
+/// [`send_signal_to_pgid`] queues one copy on the group's leader, which is what
+/// `kill(-pgid)`/`kill(0)` want (Linux's shared group-pending list runs a handler
+/// once per process). Terminal access control is different: `SIGTTIN`,
+/// `SIGTTOU` and `SIGTSTP` stop the whole foreground group, and a pagh process
+/// group can hold SEVERAL thread groups (a job whose process forked), so each
+/// of them must receive its own copy — a group stop is per thread group in the
+/// scheduler ([`begin_group_stop`]), and signalling only the leader would leave
+/// its siblings running (the exact "stops only the last pid" failure this
+/// replaces). One representative per thread group preserves the "one handler
+/// run per process" property.
+pub fn send_signal_to_pgid_all(pgid: u64, sig: u64) -> Result<(), Errno> {
+    let members = compat::group_pids(pgid);
+    if members.is_empty() {
+        return Err(Errno::ESRCH);
+    }
+    // One registry snapshot, then group it in memory: `tgid_of` would re-lock
+    // per member, and AGENTS.md invariant 4 keeps delivery out of the lock.
+    let mut groups: alloc::collections::BTreeMap<u64, alloc::vec::Vec<u64>> =
+        alloc::collections::BTreeMap::new();
+    for pid in members {
+        groups.entry(compat::tgid_of(pid)).or_default().push(pid);
+    }
+    let mut sent = 0usize;
+    for (tgid, pids) in groups {
+        if let Some(target) = super::kill::pick_group_target(&pids, tgid) {
+            if send_signal(target, sig).is_ok() {
+                sent += 1;
+            }
+        }
+    }
+    if sent == 0 {
+        Err(Errno::ESRCH)
+    } else {
+        Ok(())
+    }
+}
+
 pub fn sys_kill(pid_raw: u64, sig_raw: u64) -> Result<u64, Errno> {
     let (target, sig) = super::kill::kill_args(
         super::kill::decode_pid(pid_raw),
@@ -301,9 +345,16 @@ pub fn sys_kill(pid_raw: u64, sig_raw: u64) -> Result<u64, Errno> {
 }
 
 /// Resolve a classified `kill(2)` target into the exact pids a signal is queued
-/// on: ONE thread per addressed thread group (`kill::pick_group_target`), not
+/// on: ONE thread per addressed process group (`kill::pick_group_target`), not
 /// every member — the equivalent of Linux queueing on the group's shared pending
 /// list, so a handler installed by a multi-threaded process runs once.
+///
+/// KNOWN GAP (named in `AGENTS.md` → Known open gaps): since `pgid` became
+/// independent of the thread group (2.16.0), a signal sent to a process group
+/// that holds SEVERAL thread groups reaches only the one this picks, so
+/// `kill(-pgid, SIGCONT)` resumes just that thread group. The terminal and shell
+/// stop/continue paths do not use this function — they use
+/// [`send_signal_to_pgid_all`], which queues one copy per thread group.
 ///
 /// An empty result means "no such process/group" and becomes `ESRCH` in
 /// [`deliver_to_targets`]. All registry iteration happens inside the snapshot
@@ -315,9 +366,7 @@ pub fn resolve_kill_targets(target: super::kill::KillTarget) -> alloc::vec::Vec<
         // module doc records this deviation from Linux's group delivery). No
         // registry walk: existence is checked by `send_signal` itself.
         KillTarget::Pid(pid) => alloc::vec![pid],
-        // pid == 0: the caller's own process group. In pagh a process group IS a
-        // thread group (`sys_getpgid` reports the tgid, `sys_setpgid` is a
-        // documented no-op), so its members are the pids with that tgid.
+        // pid == 0: the caller's own process group.
         KillTarget::OwnGroup => {
             let pgid = compat::current_pgid();
             super::kill::pick_group_target(&compat::group_pids(pgid), pgid)

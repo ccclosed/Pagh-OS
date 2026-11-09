@@ -29,6 +29,7 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 | `validate.rs` | Чистая валидация user-указателей (`spanned_pages`, границы/переполнение, без разыменований) |
 | `trap_frame.rs` | Чистое зеркало фрейма `irq32_stub` (21 слово: popfq, 15 GPR в порядке `SavedRegs`, iret-слова) и план доставки сигнала с тика: ring-3 классификация, точный набор мутаций входа в обработчик, проверка «доставлен тот же сигнал» (хост-тестируемый, свойство `irq_frame`; const-asserts против индексов из `src/test.rs`) |
 | `kill.rs` | Чистая модель `kill(2)` (issue #12): 32-битное декодирование `pid_t`/`int`, классификация цели (`pid>0`, `0`, `-1`, `-pgid`, `INT_MIN → ESRCH`), политика прав `kill_permits` (root / real uid / effective uid цели; EPERM реально достижим), выбор одного потока на группу (хост-тестируемая, свойство `kill_target`) |
+| `tty.rs` | Чистая модель управления терминалом (job control): foreground-pgid + `TOSTOP`, вердикт доступа (`SIGTTIN` на фоновое чтение, `SIGTTOU` на фоновую запись при `TOSTOP`), декодирование `int`-аргумента `TIOCSPGRP` (отрицательный → `EINVAL`) и `may_set_foreground` (живая группа / текущая / группа shell; иначе `EPERM`), константы `TIOCGPGRP` 0x540F / `TIOCSPGRP` 0x5410 и `TOSTOP` (хост-тестируемая, свойство `tty_job`; состояние — в `drivers/tty.rs`) |
 | `cred.rs` | Чистая модель креденшелов: `Creds` (6 id), `Access`, POSIX `may` (owner/group/other по effective id, root bypass r/w, execute требует x), переходы setuid/setgid/setreuid/setregid/setresuid/setresgid, `may_chmod`/`may_chown` (хост-тестируемая, свойство P56) |
 | `errno.rs` | Модель errno; ядро складывает `Err(e)` в rax как `-errno` (`-4095..=-1`) |
 | `io.rs` | Чистое планирование `read`/`lseek` |
@@ -46,11 +47,11 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 | `timeconv.rs` | Чистый BCD-декод и civil-date → Unix-seconds (хост-тестируемый) |
 | `rand_clock.rs` | Чистое планирование `getrandom`/`ticks_to_timespec` |
 | `diag.rs` | Чистая дедупликация nosys-логов per-process и нормализация exit-кодов (139 = 128+SIGSEGV) |
-| `signal.rs` | Доставка POSIX-сигналов: очередь pending, `deliver_one_pending_syscall` в эпилоге `linux_dispatch` (возврат из syscall) и `tick_action` на возврате тика (только текущей задаче, ring-3 проверка ДО выбора сигнала, `sys_exit_group` из IRQ не вызывается), `sys_kill` (nr 62: pid / своя группа / `-pgid` / `-1`, по одной копии на группу), `SIGSTOP`/`SIGCONT` (стоп — действие доставки, парковка фреймов; продолжение — генерация `SIGCONT` отправителем + сброс pending stop-битов), `rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`, `tgkill`, маски, guard'ы инварианта 2 (флаг int80-входа + проверка кадра) |
+| `signal.rs` | Доставка POSIX-сигналов: очередь pending, `deliver_one_pending_syscall` в эпилоге `linux_dispatch` (возврат из syscall) и `tick_action` на возврате тика (только текущей задаче, ring-3 проверка ДО выбора сигнала, `sys_exit_group` из IRQ не вызывается), `sys_kill` (nr 62: pid / своя группа / `-pgid` / `-1`, по одной копии на группу), `send_signal_to_pgid` (одна копия на группу — для `kill`) и `send_signal_to_pgid_all` (по одной копии на КАЖДУЮ thread-группу внутри pgid — для терминальных `SIGTTIN`/`SIGTTOU`/`SIGTSTP`/`SIGCONT` и `^C`/`^Z`: групповая остановка в планировщике per-thread-group, лидеру её недостаточно), `SIGSTOP`/`SIGCONT` (стоп — действие доставки, парковка фреймов; продолжение — генерация `SIGCONT` отправителем + сброс pending stop-битов), `rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`, `tgkill`, маски, guard'ы инварианта 2 (флаг int80-входа + проверка кадра) |
 | `signal_frame.rs` | Чистая сборка/разбор `rt_sigframe` на user-стеке (хост-тестируемая) |
 
 Чистые модули (`abi`, `cred`, `diag`, `dirent`, `errno`, `io`, `kill`, `mem`, `rand_clock`, `regs`,
-`signal_frame`, `stat`, `timeconv`, `trap_frame`, `validate`) через `#[path]` включаются в
+`signal_frame`, `stat`, `timeconv`, `trap_frame`, `tty`, `validate`) через `#[path]` включаются в
 хост-крейт `host-tests` — они обязаны быть только `core`+`alloc`.
 
 ## Ключевые символы
