@@ -526,30 +526,28 @@ python
   the loader maps the ELF interpreter (`ld-linux-x86-64.so.2`) from `/mnt` (with
   merged-`/usr` fallback paths), and CPython 3.16 works end to end.
   `fork`/`clone` + threads, `epoll`/`eventfd`, unix sockets, vectored I/O
-  (`readv`/`writev`/…), `rename*`, and job-control probes (`setpgid`/`getpgid`,
-  `TIOCGPGRP`/`TIOCSPGRP`, `wait4` with `WUNTRACED`/`WCONTINUED`) are implemented;
-  POSIX signal delivery works at the syscall-return point: `rt_sigaction` installs
-  real handlers, delivered signals build an x86_64 `rt_sigframe` on the user stack
-  and `rt_sigreturn` restores the context, `^C` sends a real SIGINT (blocking waits
-  wake with `EINTR`), `kill(2)` (nr 62) addresses a process, the caller's process
-  group, a `-pgid` group or every process (`kill(-1)`), queuing one copy per thread
-
-  group, and a fatal `tgkill`/`kill` without a handler still ends the process
-  cleanly (glibc `abort()` → exit 134). Not yet: delivery while parked in a wait is
-  limited to the patched wait loops (read/poll/select/epoll/nanosleep/wait4/futex),
-  SIGSTOP/SIGCONT scheduling, and signals delivered from the timer-tick return path.
-group, `SIGSTOP`/`SIGCONT` are real scheduler state (a stopped task keeps its saved
-  frame, leaves rotation and is resumed by `SIGCONT`; `wait4` reports `WUNTRACED` and
-  `WCONTINUED`), and a fatal `tgkill`/`kill` without a handler still ends the process
-  cleanly (glibc `abort()` → exit 134); the timer-tick return path delivers to a
-  CPU-bound task that never enters a syscall, and `notify`-style state changes
-  (`stopped`/`continued`) reach `wait4`. Not yet: delivery while parked in a wait is
-  limited to the patched wait loops (read/poll/select/epoll/nanosleep/wait4/futex),
-
-  and a CPU-bound loop with no syscalls does not see a signal until delivery from the
-  timer-tick return path lands.
-`SIGCHLD` is not generated for stop/continue, and job control is limited to "every
-  process is its own group" (`setpgid` into a foreign group is a no-op).
+  (`readv`/`writev`/…), `rename*`, and real process groups (`pgid` in `CompatState`,
+  `setpgid`/`getpgid`/`getpgrp`/`setsid`; `kill(0)`/`kill(-pgid)` address the group)
+  are implemented.
+  POSIX signal delivery works at the syscall-return point and at the timer-tick return:
+  `rt_sigaction` installs real handlers, delivered signals build an x86_64 `rt_sigframe`
+  on the user stack and `rt_sigreturn` restores the context, `kill(2)` (nr 62) addresses
+  a process, the caller's process group, a `-pgid` group or every process (`kill(-1)`),
+  `SIGSTOP`/`SIGCONT` are real scheduler state (a stopped task keeps its saved frame,
+  leaves rotation and is resumed by `SIGCONT`; `wait4` reports `WUNTRACED` and
+  `WCONTINUED`, and `SIGCHLD` is queued on child exit/stop/continue), and a fatal
+  `tgkill`/`kill` without a handler still ends the process cleanly (glibc `abort()` →
+  exit 134).
+  The console is a real controlling terminal: a kernel-side foreground process group
+  (`tcgetpgrp`/`tcsetpgrp` through `TIOCGPGRP`/`TIOCSPGRP`) that `lxrun` hands to its
+  child and restores to the shell on exit, `SIGTTIN` when a background job reads the
+  terminal and `SIGTTOU` when it writes with `TOSTOP` set (pagh defaults `TOSTOP` on;
+  `tcsetattr` clears it), and `^Z` stopping the terminal's whole foreground group
+  instead of only the last pid. The shell keeps a job table (`jobs`/`fg`/`bg`).
+  Not yet: no sessions/`getsid`, `tcsetattr` from a background group does not generate
+  `SIGTTOU`, and `kill(-pgid)` queues one copy on the group leader rather than one per
+  thread group (the terminal and shell stop/continue paths use a per-thread-group
+  broadcast).
 
 - **Install ≠ run.** `apt install <pkg>` resolves the dependency closure, downloads each
   `.deb`, unpacks its files onto `/mnt`, and creates tar symlinks/hardlinks as real links

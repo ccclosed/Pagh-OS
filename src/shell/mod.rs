@@ -303,6 +303,12 @@ fn run_autorun() {
 }
 
 pub fn shell_main() -> ! {
+    // The console is the controlling terminal, and the shell is its default
+    // owner: record the shell's own process group now so `lxrun` can hand the
+    // terminal to a child and give it back afterwards (terminal access control
+    // compares a process's pgid against this).
+    crate::drivers::tty::init_shell(crate::task::scheduler::current_pid());
+
     // Welcome banner — named OS + `help` hint, on both consoles, before the
     // first prompt with no perceptible delay (R10.1, R10.2, R10.3).
     crate::kprintln!();

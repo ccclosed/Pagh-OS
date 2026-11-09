@@ -1215,40 +1215,63 @@ pub(super) fn cmd_warn(_ctx: &mut ShellCtx, args: &[&str]) {
 ///
 /// Returns when the program exits or stops. A stopped program is recorded in
 /// the shell job table; `fg`/`bg` resume it later.
-fn foreground_wait(pid: u64, command: &str) {
+///
+/// The terminal belongs to the job for the duration: `pgid` is a terminal
+/// foreground process group (`drivers::tty`), so ^C/^Z are delivered to THAT
+/// group — not merely to the pid the shell happens to be waiting for — and the
+/// shell takes the terminal back on every exit path (exit, stop). This is what
+/// makes a multi-process foreground job (a process that forked) stop as a unit.
+fn foreground_wait(pid: u64, pgid: u64, command: &str) {
+    use crate::arch::x86_64::linux::signal::send_signal_to_pgid_all;
+    use crate::arch::x86_64::linux::signal_frame::{SIGINT, SIGTSTP};
     use core::sync::atomic::Ordering;
+
     crate::shell::keys::CTRL_C_LATCH.store(false, Ordering::Relaxed);
     crate::shell::keys::CTRL_Z_LATCH.store(false, Ordering::Relaxed);
     crate::drivers::ps2_kbd::CTRL_C.store(false, Ordering::Relaxed);
     crate::drivers::ps2_kbd::CTRL_Z.store(false, Ordering::Relaxed);
     crate::drivers::ps2_kbd::FG_PID.store(pid, Ordering::Relaxed);
-    while crate::task::compat::compat_exists(pid) {
+    // The job owns the terminal while it runs (also set by `lxrun` inside the
+    // spawn's critical section; `fg` sets it here before resuming).
+    crate::drivers::tty::set_foreground_pgid(pgid);
+    let mut parked = false;
+    while crate::task::compat::compat_exists(pid) && !parked {
         let stopped = crate::shell::keys::CTRL_Z_LATCH.swap(false, Ordering::Relaxed)
             | crate::drivers::ps2_kbd::CTRL_Z.swap(false, Ordering::Relaxed);
         if stopped {
-            shell_println("^Z");
-            let pgid = crate::task::compat::pgid_of(pid).unwrap_or(pid);
-            let _ = crate::arch::x86_64::linux::signal::send_signal_to_pgid(
-                pgid,
-                crate::arch::x86_64::linux::signal_frame::SIGTSTP,
-            );
-            crate::shell::jobs::record(pid, pgid, String::from(command), true);
-            crate::drivers::ps2_kbd::FG_PID.store(0, Ordering::Relaxed);
-            return;
+            // Stop the TERMINAL's foreground group. The recorded pid is only
+            // the shell's own waiter: a job that forked has several thread
+            // groups, and all of them must park, not just the leader.
+            let target = crate::drivers::tty::foreground_pgid();
+            match send_signal_to_pgid_all(target, SIGTSTP) {
+                Ok(()) => {
+                    shell_println("^Z");
+                    crate::shell::jobs::record(pid, pgid, String::from(command), true);
+                    parked = true;
+                }
+                Err(_) => shell_println("^Z: no live foreground job"),
+            }
         }
         let pressed = crate::shell::keys::CTRL_C_LATCH.swap(false, Ordering::Relaxed)
             | crate::drivers::ps2_kbd::CTRL_C.swap(false, Ordering::Relaxed);
         if pressed {
+            // ^C is a terminal signal too: SIGINT goes to the foreground group.
             shell_println("^C");
-            let _ = crate::arch::x86_64::linux::signal::send_signal(
-                pid,
-                crate::arch::x86_64::linux::signal_frame::SIGINT,
-            );
+            if send_signal_to_pgid_all(crate::drivers::tty::foreground_pgid(), SIGINT).is_err() {
+                let _ = crate::arch::x86_64::linux::signal::send_signal(pid, SIGINT);
+            }
         }
         crate::task::scheduler::yield_current();
     }
     crate::drivers::ps2_kbd::FG_PID.store(0, Ordering::Relaxed);
-    crate::shell::jobs::remove(pid);
+    if !parked {
+        // The job exited: forget it. A parked job stays in the table for
+        // `jobs`/`fg`/`bg`.
+        crate::shell::jobs::remove(pid);
+    }
+    // Give the terminal back to the shell. A stopped job is resumed by `fg`,
+    // which re-arms its group before the SIGCONT.
+    crate::drivers::tty::restore_shell_foreground();
 }
 
 /// `jobs`: list remembered jobs.
@@ -1276,7 +1299,10 @@ pub(super) fn cmd_bg(_ctx: &mut ShellCtx, _args: &[&str]) {
         shell_println("bg: no jobs");
         return;
     };
-    let _ = crate::arch::x86_64::linux::signal::send_signal_to_pgid(
+    // Every thread group in the job resumes (a group stop is per thread group),
+    // and the terminal stays with the shell — that is what "background" means:
+    // the job's next terminal read stops it again with SIGTTIN.
+    let _ = crate::arch::x86_64::linux::signal::send_signal_to_pgid_all(
         pgid,
         crate::arch::x86_64::linux::signal_frame::SIGCONT,
     );
@@ -1290,13 +1316,17 @@ pub(super) fn cmd_fg(_ctx: &mut ShellCtx, _args: &[&str]) {
         shell_println("fg: no jobs");
         return;
     };
-    let _ = crate::arch::x86_64::linux::signal::send_signal_to_pgid(
+    // Hand the terminal to the job BEFORE resuming it: a job that writes
+    // immediately after SIGCONT must not be stopped as "background" (it is the
+    // foreground job again) — the ordering is what makes `fg` reliable.
+    crate::drivers::tty::set_foreground_pgid(pgid);
+    let _ = crate::arch::x86_64::linux::signal::send_signal_to_pgid_all(
         pgid,
         crate::arch::x86_64::linux::signal_frame::SIGCONT,
     );
     crate::shell::jobs::set_stopped(pid, false);
     shell_println(&format!("fg: [{}] {}", pid, command));
-    foreground_wait(pid, &command);
+    foreground_wait(pid, pgid, &command);
 }
 
 pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
@@ -1330,8 +1360,19 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
         // \"failed to open $NVIM_LOG_FILE\" stderr spam by pointing it at /dev/null.
         b"NVIM_LOG_FILE=/dev/null",
     ];
+    // Spawn AND hand the terminal to the child inside ONE `without_interrupts`
+    // section. The child becomes runnable the instant interrupts come back, so
+    // marking it as a job / setting the foreground pgid afterwards would leave a
+    // window in which the new process is "background" relative to the shell: a
+    // read it issues in that window would be refused, and a write stopped.
     let result = crate::arch::cpu::without_interrupts(|| {
-        crate::task::process::run_linux_binary(&path, &argv, &env)
+        let r = crate::task::process::run_linux_binary(&path, &argv, &env);
+        if let Ok(pid) = r {
+            let child_pgid = crate::task::compat::pgid_of(pid).unwrap_or(pid);
+            crate::task::compat::mark_tty_job(pid);
+            crate::drivers::tty::set_foreground_pgid(child_pgid);
+        }
+        r
     });
     match result {
         Ok(pid) => {
@@ -1347,15 +1388,12 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
             // its next syscall return. A handler-installing program can keep
             // running (each further ^C re-sends); without a handler the
             // default-terminate action kills it, ending this wait loop.
-            use core::sync::atomic::Ordering;
+            // Ctrl+Z stops the terminal's foreground group (see
+            // `foreground_wait`); the shell takes the terminal back on exit.
             let command = args.first().copied().unwrap_or("?").into();
-            crate::shell::jobs::record(
-                pid,
-                crate::task::compat::pgid_of(pid).unwrap_or(pid),
-                command,
-                false,
-            );
-            foreground_wait(pid, args.first().copied().unwrap_or("?"));
+            let child_pgid = crate::task::compat::pgid_of(pid).unwrap_or(pid);
+            crate::shell::jobs::record(pid, child_pgid, command, false);
+            foreground_wait(pid, child_pgid, args.first().copied().unwrap_or("?"));
         }
         Err(e) => {
             crate::drivers::ps2_kbd::FG_PID.store(0, core::sync::atomic::Ordering::Relaxed);

@@ -15,7 +15,8 @@ Framebuffer-shell с редактированием строки, историе
 | `editor.rs` | `LineEditor` — чистая буфер+курсор модель (курсор в чар-юнитах, cap 256) |
 | `history.rs` | `History` — bounded ring (CAP=64), recall вверх/вниз, stash текущей строки, дедуп подряд идущих |
 | `complete.rs` | Чистое таб-дополнение: `longest_common_prefix`, `Completion::{None, Single, Multiple}`, `complete_command`, `complete_path` |
-| `keys.rs` | Декодер PS/2 Set 1: `KeyEvent`, `Decoder` (0xE0-префикс, Shift/Ctrl/CapsLock), таблица ASCII, `CTRL_C_LATCH` |
+| `keys.rs` | Декодер PS/2 Set 1: `KeyEvent`, `Decoder` (0xE0-префикс, Shift/Ctrl/CapsLock), таблица ASCII, `CTRL_C_LATCH`, `CTRL_Z_LATCH` |
+| `jobs.rs` | Таблица заданий shell'а: `Job { pid, pgid, command, stopped }` под `Spinlock`, `record`/`remove`/`snapshot`/`last`/`set_stopped`; наполняется `lxrun`/`fg`/`bg` |
 | `render.rs` | `Style`, цветовые константы, `with_style`, `prompt`, `error_line`, `success_line` (framebuffer — цвет, serial — plain) |
 | `selection.rs` | Выделение мышью: диапазон клеток, подсветка инверсией, копирование текста из модели экрана; `Ctrl+A` — выделить строку, `Ctrl+X` — вырезать, `Ctrl+Y`/`Ctrl+V` — вставить |
 | `caret.rs` | Мигающая каретка: клетка из позиции консоли и логического курсора (`Caret::cell_for`), отрисовка/стирание вертикальной черты (`paint_caret`), фаза мигания по тикам |
@@ -34,7 +35,8 @@ Framebuffer-shell с редактированием строки, историе
 - `editor::LineEditor::{insert, delete_back, delete_fwd, move_left/right/home/end, buffer, cursor}`
 - `history::History::{push, recall_prev, recall_next, reset_nav, saved_line}`
 - `complete::{longest_common_prefix, complete_command, complete_path}`
-- `keys::{KeyEvent, Decoder::{new, feed}, CTRL_C_LATCH}`
+- `keys::{KeyEvent, Decoder::{new, feed}, CTRL_C_LATCH, CTRL_Z_LATCH}`
+- `jobs::{Job, record, remove, snapshot, last, set_stopped}`
 - `path::{normalize, resolve, cwd, set_cwd}`
 - `suggest::{edit_distance, nearest_command}`
 - `paint::run()`, `nano::run(path)`, `toolchain::{execute, run_path, rustc, cargo, rustup}`
@@ -102,8 +104,39 @@ Shift+букву строчной при выключенном CapsLock.
 `python`/`python3`, `pythonc`, `cargo`, `rustc`, `rustup`, `rust`, `paint`,
 `pkg <host> <path> [port]` (HTTP GET .deb → ar → decompress → tar → install в /mnt),
 `apt <update|install|show|list|setmirror>`, `lxrun <path> [args]` (Linux ELF в ring 3,
-fixed env `TERM=xterm`, `PATH=/mnt/usr/bin`; foreground-ожидание с polling ^C),
-`warn <on|off>` (тумблер fb-зеркала warn-логов).
+fixed env `TERM=xterm`, `PATH=/mnt/usr/bin`; забирает терминал у shell'а на время
+работы — см. «Job control»), `jobs`, `fg`, `bg`, `warn <on|off>` (тумблер fb-зеркала
+warn-логов).
+
+## Job control
+
+Терминал консоли — управляющий, и у него ровно одна foreground-группа
+(`drivers::tty`, чистые правила — `linux::tty`, хост-свойство `tty_job`).
+
+1. `lxrun` (и команды, которые его переиспользуют) спавнит процесс и **в той же
+   `without_interrupts`-секции** помечает его JOB'ом (`compat::mark_tty_job`) и
+   отдаёт ему терминал (`tty::set_foreground_pgid(child_pgid)`). Один критический
+   участок — чтобы у только что созданного процесса не было окна, в котором он
+   «фоновый» и получает `SIGTTIN` на первом же чтении.
+2. `foreground_wait(pid, pgid, command)` ждёт, опрашивая защёлки ^C/^Z:
+   - ^C → `SIGINT` **foreground-группе** (`signal::send_signal_to_pgid_all`), а не
+     записанному pid; для не-raw процесса fallback — `scheduler::request_exit`;
+   - ^Z → `SIGTSTP` той же группе: останавливаются ВСЕ thread-группы задания
+     (групповая остановка в планировщике per-thread-group, лидеру её мало), запись
+     попадает в `jobs` как `Stopped`;
+   - на любом выходе (exit или stop) shell возвращает себе терминал
+     (`tty::restore_shell_foreground()`).
+3. `jobs` печатает таблицу, `bg` шлёт `SIGCONT` всей группе и оставляет её в фоне
+   (следующее чтение терминала снова её остановит — `SIGTTIN`), `fg` **сначала**
+   отдаёт терминал заданию, потом шлёт `SIGCONT`, и ждёт его тем же
+   `foreground_wait` (иначе задание, пишущее сразу после `SIGCONT`, было бы
+   остановлено как фоновое).
+
+JOB-статус (`CompatState::tty_job`) наследуется `fork`/`clone`, поэтому подпроцессы
+задания остаются под управлением терминала. Процессы, которых shell терминалу не
+передавал (проверочные бинарники apt, harness `selftest_lx`), — не JOB'ы и
+терминалом не останавливаются: иначе фоновый запуск при живом shell'е подвесил бы
+boot/E2E, который их ждёт.
 
 ## paint — архитектура
 
