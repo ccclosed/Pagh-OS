@@ -16,6 +16,38 @@ use x86_64::structures::paging::PageTableFlags;
 /// `task::compat` (`COMPAT_STATES`) is the single source of truth for a
 /// running Compat_Process. The `Tcb` is moved through the scheduler queues by
 /// value, which the existing call sites already do.
+/// Human-readable names of the kernel threads (pid -> name), for `ps`.
+///
+/// The scheduler's `Tcb` deliberately carries no name: it is the byte-exact
+/// state the context switch restores, and adding fields there is a change to a
+/// load-bearing structure. `ps` still has to be able to show that the machine is
+/// running something — a shell session with no Linux process in it used to print
+/// a bare header, which reads as "the kernel sees no processes at all". A side
+/// table fed by [`kernel_thread_spawn_named`] keeps the two concerns apart:
+/// nothing here is ever read by the switch path.
+static TASK_NAMES: Spinlock<alloc::collections::BTreeMap<u64, &'static str>> =
+    Spinlock::new(alloc::collections::BTreeMap::new());
+
+/// Record/refresh a task's display name.
+pub fn set_task_name(pid: u64, name: &'static str) {
+    TASK_NAMES.lock().insert(pid, name);
+}
+
+/// Forget a task's display name (called when its frame is dropped).
+pub fn forget_task_name(pid: u64) {
+    TASK_NAMES.lock().remove(&pid);
+}
+
+/// Every named kernel task as `(pid, name)`, ascending by pid.
+pub fn task_names_snapshot() -> alloc::vec::Vec<(u64, &'static str)> {
+    TASK_NAMES.lock().iter().map(|(p, n)| (*p, *n)).collect()
+}
+
+/// The display name of `pid`, if it has one.
+pub fn task_name(pid: u64) -> Option<&'static str> {
+    TASK_NAMES.lock().get(&pid).copied()
+}
+
 pub struct Tcb {
     pub pid: u64,
     /// The only state the switch restores from: the saved kernel stack pointer.
@@ -260,6 +292,9 @@ fn pend_reap(pid: u64) {
 fn pend_reap_with(pid: u64, cr3: u64) {
     PENDING_REAPS.lock().insert(pid, ExitReap { cr3 });
     FRAME_LEDGER.lock().remove(&pid);
+    // The task is out of rotation: drop its display name too, or `ps` would keep
+    // listing a pid that no longer exists.
+    forget_task_name(pid);
 }
 
 /// Drop the CURRENTLY-RUNNING task right now (the tick decided it must not run
@@ -638,7 +673,13 @@ fn activate_task(pid: u64) {
 }
 
 pub fn kernel_thread_spawn(entry: fn()) -> u64 {
+    kernel_thread_spawn_named(entry, "kernel")
+}
+
+/// Spawn a kernel thread and remember a display name for it (see [`TASK_NAMES`]).
+pub fn kernel_thread_spawn_named(entry: fn(), name: &'static str) -> u64 {
     let pid = next_pid();
+    set_task_name(pid, name);
     let (_guard_base, stack_base, stack_top) = crate::memory::layout::kernel_stack_for_pid(pid);
 
     for page in 0..crate::memory::layout::KERNEL_STACK_PAGES {

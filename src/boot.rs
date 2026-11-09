@@ -496,7 +496,7 @@ fn kernel_main() -> ! {
     crate::security::entropy::report_capabilities();
 
     debug!("Spawning shell thread...");
-    task::scheduler::kernel_thread_spawn(shell_thread);
+    task::scheduler::kernel_thread_spawn_named(shell_thread, "shell");
     debug!("Shell thread spawned (PID should be 1)");
 
     // Spawn the networking poll thread (Task 6, R13.4). It must start once
@@ -504,7 +504,7 @@ fn kernel_main() -> ! {
     // The stack clock advances off the LAPIC timer tick and DHCP/echo servicing
     // relies on the periodic poll. If no NIC was attached, `net::poll` is a
     // cheap no-op, so spawning unconditionally is harmless.
-    task::scheduler::kernel_thread_spawn(net::net_thread);
+    task::scheduler::kernel_thread_spawn_named(net::net_thread, "net");
     debug!("Net thread spawned");
 
     // Spawn the embedded ring-3 test user process (Requirements 13.1 / 13.4).
@@ -548,7 +548,10 @@ fn kernel_main() -> ! {
     // smoke test (which may be slow/unreachable depending on the environment and
     // would otherwise monopolize the pump). Compiled out when the feature is off.
     #[cfg(feature = "lx_selftest")]
-    task::scheduler::kernel_thread_spawn(crate::selftest_lx::run_post_net_checks);
+    task::scheduler::kernel_thread_spawn_named(
+        crate::selftest_lx::run_post_net_checks,
+        "lx-selftest",
+    );
 
     // Live full-update integration check (cargo feature `lx_livetest`, spec task
     // 11.1). Spawned on its own thread so it runs after interrupts/DHCP are up.
@@ -558,7 +561,10 @@ fn kernel_main() -> ! {
     // the live check is skipped to avoid two ring-3 processes contending for the
     // single-task kernel stack. Compiled out when the feature is off (default).
     #[cfg(all(feature = "lx_livetest", not(feature = "lx_selftest")))]
-    task::scheduler::kernel_thread_spawn(crate::selftest_lx::run_live_update_check);
+    task::scheduler::kernel_thread_spawn_named(
+        crate::selftest_lx::run_live_update_check,
+        "lx-live",
+    );
 
     // DIAGNOSTIC (Part B): apt-update parse-stage crash repro over the LOCAL big
     // index (cargo feature `lx_bigindex`). Spawned on its own thread so it runs
@@ -567,7 +573,10 @@ fn kernel_main() -> ! {
     // `lx_bigindex_inram`, the in-RAM Test-A variant). Compiled out when the
     // feature is off (default).
     #[cfg(feature = "lx_bigindex")]
-    task::scheduler::kernel_thread_spawn(crate::selftest_lx::run_bigindex_check);
+    task::scheduler::kernel_thread_spawn_named(
+        crate::selftest_lx::run_bigindex_check,
+        "lx-bigindex",
+    );
 
     // Large-stream HTTPS regression (cargo feature `lx_tlsbig`, issue #19).
     // One multi-MB authenticated `https_get` against the live mirror's full
@@ -579,7 +588,7 @@ fn kernel_main() -> ! {
         feature = "lx_tlsbig",
         not(any(feature = "lx_selftest", feature = "lx_livetest"))
     ))]
-    task::scheduler::kernel_thread_spawn(crate::selftest_lx::run_tls_big_check);
+    task::scheduler::kernel_thread_spawn_named(crate::selftest_lx::run_tls_big_check, "lx-tlsbig");
 
     // The first-boot base userland (glibc + python3)
     // download is opt-in now. shell_thread asks Y/n on the console first and

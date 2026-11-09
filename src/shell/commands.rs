@@ -1264,6 +1264,10 @@ fn foreground_wait(pid: u64, pgid: u64, command: &str) {
         crate::task::scheduler::yield_current();
     }
     crate::drivers::ps2_kbd::FG_PID.store(0, Ordering::Relaxed);
+    // The job is done with the screen: continue the shell below its last line
+    // instead of overwriting it (the VT knows where its cursor ended up, the
+    // console does not).
+    crate::drivers::vt::cursor_to_console();
     if !parked {
         // The job exited: forget it. A parked job stays in the table for
         // `jobs`/`fg`/`bg`.
@@ -1338,8 +1342,11 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
     // argv[0] is the program name as typed; remaining tokens follow.
     let argv: alloc::vec::Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
 
-    // Initialise the VT emulator so nvim's ANSI output renders correctly.
-    crate::drivers::vt::init();
+    // Make sure the VT emulator exists so nvim's ANSI output renders correctly.
+    // It is created once and then kept: the console and the VT share the same
+    // framebuffer, and re-initialising per run wiped the screen and left the
+    // shell's cursor behind (the prompt marched down the display on every run).
+    crate::drivers::vt::ensure();
     let env: [&[u8]; 12] = [
         b"TERM=xterm",
         b"PYTHON_BASIC_REPL=1",
@@ -1663,12 +1670,60 @@ pub(super) fn cmd_df(_ctx: &mut ShellCtx, _args: &[&str]) {
                     fs, total, used, free, pct, point
                 ));
             }
-            _ => shell_println(&format!(
-                "{:<12} {:>9} {:>5} {:>9} {:>3}% {}",
-                fs, "-", "-", "-", "-", point
-            )),
+            // No capacity to report (VFS contract: `fs_stat() == None`). A
+            // ramfs still knows how many bytes it is HOLDING, and that is worth
+            // showing: the total/available columns stay `-` (it is bounded only
+            // by physical memory), but `Used` stops being a shrug. Pure
+            // synthetic trees (/dev, /proc) have no bytes of their own and stay
+            // all-dashes, which is what Linux prints for the same reason.
+            _ => {
+                let used = crate::vfs::lookup_path(point)
+                    .ok()
+                    .map(|node| tree_bytes(&node, 0))
+                    .unwrap_or(0);
+                if matches!(fs, "ramfs" | "rootfs") && used > 0 {
+                    shell_println(&format!(
+                        "{:<12} {:>9} {:>5} {:>9} {:>3}% {}",
+                        fs,
+                        "-",
+                        used.div_ceil(1024),
+                        "-",
+                        "-",
+                        point
+                    ));
+                } else {
+                    shell_println(&format!(
+                        "{:<12} {:>9} {:>5} {:>9} {:>3}% {}",
+                        fs, "-", "-", "-", "-", point
+                    ));
+                }
+            }
         }
     }
+}
+
+/// Bytes held by `node` and everything under it, in a ramfs tree.
+///
+/// Used by `df` for filesystems without capacity accounting (see the VFS
+/// `fs_stat` contract): they cannot say how much room is left, but they can say
+/// how much they are holding. Depth-capped and cycle-free by construction —
+/// mounts are looked up by path, and a directory's children are walked only
+/// through `readdir`, which cannot loop back to an ancestor in these trees.
+fn tree_bytes(node: &alloc::sync::Arc<dyn crate::vfs::VfsNode>, depth: usize) -> u64 {
+    const MAX_DEPTH: usize = 8;
+    if depth > MAX_DEPTH {
+        return 0;
+    }
+    if !node.is_directory() {
+        return node.size();
+    }
+    let Ok(children) = node.readdir() else {
+        return 0;
+    };
+    children
+        .iter()
+        .map(|child| tree_bytes(child, depth + 1))
+        .fold(0u64, |acc, n| acc.saturating_add(n))
 }
 
 /// `ps`: the live compat-process table, rendered from `/proc/<pid>/*`.
@@ -1680,9 +1735,17 @@ pub(super) fn cmd_df(_ctx: &mut ShellCtx, _args: &[&str]) {
 /// cmdline is empty.
 pub(super) fn cmd_ps(_ctx: &mut ShellCtx, _args: &[&str]) {
     shell_println("  PID  PPID STAT COMMAND");
+    // Kernel threads (the shell itself, the network pump, a gated selftest
+    // harness) are NOT Linux compat processes and have no /proc entry, so the
+    // table used to consist of a bare header whenever no `lxrun`ed program was
+    // alive — which reads as "this machine has no processes at all", the exact
+    // opposite of what `ps` is for. They are listed from the scheduler's name
+    // table, in brackets like a Linux kernel thread.
+    let kernel_tasks = crate::task::scheduler::task_names_snapshot();
     let mut pids = crate::task::compat::compat_pid_tgid_snapshot();
     pids.sort_by_key(|(pid, _tgid)| *pid);
-    for (pid, _tgid) in pids {
+    let compat_pids: alloc::collections::BTreeSet<u64> = pids.iter().map(|(p, _)| *p).collect();
+    for (pid, _tgid) in pids.iter().copied() {
         let mut stat_buf = [0u8; 512];
         let stat_len = crate::vfs::lookup_path(&format!("/proc/{pid}/stat"))
             .ok()
@@ -1714,5 +1777,18 @@ pub(super) fn cmd_ps(_ctx: &mut ShellCtx, _args: &[&str]) {
             String::from(text.rsplit('/').next().unwrap_or(text))
         };
         shell_println(&format!("{:>5} {:>5} {:>4} {}", pid, ppid, state, command));
+    }
+    for (pid, name) in kernel_tasks {
+        if compat_pids.contains(&pid) {
+            continue; // a thread with compat state was already rendered from /proc
+        }
+        // `T` is the stopped state, exactly as in /proc/<pid>/stat; everything
+        // else the scheduler can run is `R` (running or runnable).
+        let state = if crate::task::scheduler::is_stopped(pid) {
+            "T"
+        } else {
+            "R"
+        };
+        shell_println(&format!("{:>5} {:>5} {:>4} [{}]", pid, 0, state, name));
     }
 }
