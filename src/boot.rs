@@ -23,7 +23,7 @@ use core::sync::atomic::Ordering;
 
 use crate::{arch, drivers, memory, net, shell, task, vfs};
 use crate::{debug, error, info, warn};
-use crate::{BASE_REVISION, HHDM_REQUEST, KERNEL_ADDR_REQUEST, MEMMAP_REQUEST};
+use crate::{BASE_REVISION, HHDM_REQUEST, KERNEL_ADDR_REQUEST, MEMMAP_REQUEST, MODULES_REQUEST};
 use crate::{HHDM_OFFSET, KERNEL_BASE, KERNEL_SIZE};
 
 /// Centralized fatal-boot handler (Requirement 1.4).
@@ -60,6 +60,7 @@ pub fn start() -> ! {
     init_virtio();
     init_scheduler();
     init_vfs();
+    init_ramdisk();
     init_fs();
     init_net();
 
@@ -209,6 +210,56 @@ fn init_vfs() {
     info!("vfs");
 }
 
+/// Step 11.4: register a boot-loaded disk image as a RAM disk.
+///
+/// WHY: on real hardware the kernel can only mount a device it has a driver for
+/// (virtio-blk, NVMe), so a machine with only SATA — or one whose disk the
+/// operator does not want to hand over — came up with no `/mnt` at all. Limine
+/// can load files next to the kernel, so the system's disk image travels on the
+/// boot medium and is mounted from memory. The device is registered under the
+/// module's own file name (`disk.img` -> `ram0`), so `disk list` shows where the
+/// filesystem came from.
+///
+/// Selection rule: the FIRST module whose name ends in `.img`. Deliberate and
+/// narrow — a module named `pagh.elf` or `notes.txt` is not a disk, and the boot
+/// configuration is the only writer of this list.
+fn init_ramdisk() {
+    let Some(response) = MODULES_REQUEST.response() else {
+        return;
+    };
+    for module in response.modules() {
+        let path = module.path();
+        if !path.ends_with(".img") {
+            continue;
+        }
+        let data = module.data();
+        if data.is_empty() {
+            warn!("ramdisk: module {} is empty; skipped", path);
+            continue;
+        }
+        // SAFETY: a Limine module is a kernel-owned buffer in the HHDM that the
+        // PMM keeps reserved for the kernel's lifetime, and no other block device
+        // aliases it. `drivers::memdisk` only does bounds-checked byte copies.
+        let sectors = unsafe {
+            crate::drivers::memdisk::register("ram0", data.as_ptr() as usize, data.len())
+        };
+        if sectors == 0 {
+            warn!(
+                "ramdisk: module {} is smaller than one sector; skipped",
+                path
+            );
+            continue;
+        }
+        info!(
+            "ramdisk: {} ({} KiB, {} sectors) registered as ram0",
+            path,
+            data.len() / 1024,
+            sectors
+        );
+        return;
+    }
+}
+
 /// Step 11.5: bring the ext2 filesystem up on the real virtio-blk/NVMe disk and
 /// mount it at `/mnt` (Task 5.1, R5.6/R9.1/R9.2).
 ///
@@ -231,26 +282,34 @@ fn init_fs() {
     use crate::fs::ext2::Ext2Fs;
     use crate::fs::format_policy::{format_allowed, Refusal};
 
-    // Storage priority: virtio-blk first (QEMU/dev images), NVMe fallback for
-    // real machines with an NVMe SSD.
-    let mut blk = match drivers::get_block("virtio-blk0") {
-        Some(b) => Some(b),
-        None => {
-            let devices = crate::drivers::pci::enumerate();
-            match crate::drivers::nvme::attach(&devices) {
-                Ok(true) => {
-                    crate::drivers::nvme::register_block_device();
-                    info!("fs: using NVMe block device");
-                }
-                _ => {}
-            }
-            drivers::get_block("nvme0")
+    // Storage priority: a disk image loaded from the boot medium wins (it is
+    // the system the operator deliberately carried with them), then virtio-blk
+    // (QEMU/dev images), then NVMe for real machines with an NVMe SSD.
+    let mut blk = match drivers::get_block("ram0") {
+        Some(b) => {
+            info!("fs: using the RAM disk from the boot medium");
+            Some(b)
         }
+        None => match drivers::get_block("virtio-blk0") {
+            Some(b) => Some(b),
+            None => {
+                let devices = crate::drivers::pci::enumerate();
+                match crate::drivers::nvme::attach(&devices) {
+                    Ok(true) => {
+                        crate::drivers::nvme::register_block_device();
+                        info!("fs: using NVMe block device");
+                    }
+                    _ => {}
+                }
+                drivers::get_block("nvme0")
+            }
+        },
     };
     let blk = match blk.take() {
         Some(b) => b,
         None => {
-            warn!("fs: no virtio-blk or NVMe device; /mnt not mounted");
+            warn!("fs: no block device at all; /mnt not mounted");
+            warn!("fs: attach a disk, or boot an image that carries one (`module_path: boot():/disk.img`)");
             info!("fs (no disk)");
             return;
         }
@@ -266,7 +325,7 @@ fn init_fs() {
             // The probe runs only here: a failed mount is the sole situation in
             // which erasing the device is even on the table, so the happy path
             // pays nothing for it.
-            let probe = probe_boot_area(&*blk);
+            let probe = crate::fs::device::probe_boot_area(&*blk);
             // The one way to authorise formatting a device that is not blank: an
             // operator deliberately wrote `format_policy::OPT_IN_MARKER` into
             // sector 0. Nothing else — no bootloader flag, no config file — can
@@ -316,8 +375,9 @@ fn init_fs() {
                     // shell), so name the operator's options instead of leaving
                     // the refusal as the last word on the serial line.
                     error!(
-                        "fs: {} left untouched; to reuse it, zero the start of the device \
-                         (`wipefs -a` / `dd` from another system) or write the {} marker",
+                        "fs: {} left untouched; run `disk setup` at the shell to format it \
+                         deliberately, or zero the start of the device (`wipefs -a` / `dd` \
+                         from another system) / write the {} marker",
                         blk.name(),
                         crate::fs::format_policy::OPT_IN_MARKER_NAME
                     );
@@ -352,37 +412,6 @@ fn init_fs() {
 /// and is formatted. Bounding the probe is what keeps boot from reading a whole
 /// SSD; the cost is that "blank" means "blank in the first MiB".
 const PROBE_LIMIT: u64 = 1024 * 1024;
-
-/// Probe granularity, in bytes: one filesystem block (8 device sectors).
-const PROBE_CHUNK: u64 = 4096;
-
-/// Classify the first MiB of `dev` for [`crate::fs::format_policy`].
-///
-/// Reads in [`PROBE_CHUNK`] steps and stops as soon as the layout is decided — a
-/// partitioned or populated device costs a single read; only a device claiming to
-/// be blank is scanned to the end of [`PROBE_LIMIT`]. A read error keeps the
-/// `Foreign` (refused) classification, so an unreadable device is never formatted
-/// either — including a device with a single bad sector inside the window, which
-/// therefore cannot be formatted at all until it is zeroed.
-fn probe_boot_area(dev: &dyn drivers::BlockDevice) -> crate::fs::format_policy::Probe {
-    use crate::fs::format_policy::Probe;
-
-    const SECTORS_PER_CHUNK: u64 = PROBE_CHUNK / 512;
-    let mut buf = alloc::vec![0u8; PROBE_CHUNK as usize];
-    let mut probe = match dev.read_block(0, &mut buf) {
-        Ok(_) => Probe::new(&buf),
-        Err(()) => return Probe::unreadable(),
-    };
-    let mut sector = SECTORS_PER_CHUNK;
-    while !probe.is_decided() && sector * 512 < PROBE_LIMIT {
-        match dev.read_block(sector, &mut buf) {
-            Ok(_) => probe.feed(&buf),
-            Err(()) => return Probe::unreadable(),
-        }
-        sector += SECTORS_PER_CHUNK;
-    }
-    probe
-}
 
 /// Step 11.6: bring up networking (Task 6). Enumerates PCI, attaches the
 /// e1000 NIC, builds the own TCP/IP stack state, and enables the UDP echo

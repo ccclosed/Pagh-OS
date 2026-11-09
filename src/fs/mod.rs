@@ -8,6 +8,7 @@
 //! real-disk dependency and is not wired into boot or the VFS mount table here
 //! (that is Task 5).
 
+pub mod device;
 pub mod ext2;
 pub mod format_policy;
 pub mod journal;

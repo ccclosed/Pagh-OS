@@ -1646,6 +1646,14 @@ fn cmd_apt_setmirror(args: &[&str]) {
 /// `devtmpfs`, `proc`) have no capacity accounting, so their numeric columns
 /// are `-` rather than a made-up zero. `ext2` reports real counts through
 /// `VfsNode::fs_stat`.
+/// `disk`: block devices, and the deliberate path to a formatted `/mnt`.
+///
+/// The interactive wizard lives in [`crate::shell::disk`]; this is the thin
+/// command shim, so the REPL and the wizard stay independent.
+pub(super) fn cmd_disk(_ctx: &mut ShellCtx, args: &[&str]) {
+    crate::shell::disk::cmd(args);
+}
+
 pub(super) fn cmd_df(_ctx: &mut ShellCtx, _args: &[&str]) {
     shell_println("Filesystem     1K-blocks  Used Available Use% Mounted on");
     for mount in crate::vfs::mount_snapshot() {

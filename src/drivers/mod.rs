@@ -4,6 +4,7 @@
 pub mod cursor;
 pub mod e1000;
 pub mod framebuffer;
+pub mod memdisk;
 pub mod nvme;
 pub mod nvme_prp;
 pub mod pci;
@@ -109,6 +110,20 @@ pub fn register_char(dev: Arc<dyn CharacterDevice>) {
 /// Register a block device in the global manager.
 pub fn register_block(dev: Arc<dyn BlockDevice>) {
     DEVICE_MANAGER.lock().register_block(dev);
+}
+
+/// Every registered block device as `(name, sector_count)`, name-sorted.
+///
+/// The registry is a `BTreeMap`, so the order is stable across boots — which is
+/// what lets the shell's `disk` menu number devices and a script refer to the
+/// same number in the same run.
+pub fn list_blocks() -> alloc::vec::Vec<(alloc::string::String, u64)> {
+    DEVICE_MANAGER
+        .lock()
+        .blocks
+        .iter()
+        .map(|(name, dev)| (name.clone(), dev.sector_count()))
+        .collect()
 }
 
 /// Get a character device by name

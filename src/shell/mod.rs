@@ -12,6 +12,7 @@ mod commands;
 pub(crate) mod caret;
 pub(crate) mod cat;
 pub(crate) mod complete;
+pub(crate) mod disk;
 pub(crate) mod editor;
 pub(crate) mod history;
 pub(crate) mod jobs;
@@ -641,7 +642,15 @@ pub fn shell_main() -> ! {
                             history.reset_nav();
                         } else {
                             history.push(editor.buffer());
-                            execute_command(editor.buffer());
+                            // A pending `disk` question owns this line: its answer
+                            // ("2", or the device name) is not a command, and
+                            // running it through the dispatcher would print
+                            // "Unknown command: 2" and leave the wizard waiting.
+                            if disk::pending() {
+                                disk::feed_line(editor.buffer());
+                            } else {
+                                execute_command(editor.buffer());
+                            }
                         }
                         entered = true;
                         break;

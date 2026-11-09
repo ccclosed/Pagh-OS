@@ -42,7 +42,8 @@ mod test;
 mod vfs;
 
 use limine::request::{
-    ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemmapRequest, RsdpRequest,
+    ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemmapRequest, ModulesRequest,
+    RsdpRequest,
 };
 use limine::BaseRevision;
 
@@ -75,6 +76,18 @@ pub static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 #[no_mangle]
 #[link_section = ".requests"]
 pub static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
+
+/// Boot-loaded files (`module_path:` entries in `limine.conf`).
+///
+/// The storage path uses this to find a disk image travelling next to the
+/// kernel — the boot medium itself becomes the system's disk, which is what
+/// makes a machine with no supported drive usable at all (see
+/// `drivers::memdisk`). The request is unconditional and costs one response
+/// lookup; with no modules configured the response is simply empty.
+#[used]
+#[no_mangle]
+#[link_section = ".requests"]
+pub static MODULES_REQUEST: ModulesRequest = ModulesRequest::new();
 
 pub(crate) static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KERNEL_BASE: AtomicU64 = AtomicU64::new(0);

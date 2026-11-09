@@ -145,6 +145,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_pci,
     },
     CommandSpec {
+        name: "disk",
+        description: "List block devices; format one as ext2 and mount it at /mnt",
+        usage: "disk [list|setup|mount <n>|format <n> [--force]|cancel]",
+        handler: super::commands::cmd_disk,
+    },
+    CommandSpec {
         name: "df",
         description: "Show mounted filesystems and capacity",
         usage: "df",
