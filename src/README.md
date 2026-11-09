@@ -10,7 +10,7 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
 |---|---|---|
 | `arch/` | CPU-слой: GDT/IDT/TSS/IST, APIC/ACPI, syscall-вход, Linux compat layer | [arch/README.md](arch/README.md) |
 | `debug/` | Stack trace без heap (panic/фолт-контексты) | [debug/README.md](debug/README.md) |
-| `drivers/` | Все устройства: PCI, e1000, virtio-blk, NVMe, PS/2, framebuffer, VT, курсор, serial | [drivers/README.md](drivers/README.md) |
+| `drivers/` | Все устройства: PCI, e1000, virtio-blk, NVMe, PS/2, framebuffer, VT, курсор, serial, управляющий терминал (foreground process group) | [drivers/README.md](drivers/README.md) |
 | `fs/` | ext2 + WAL-журнал | [fs/README.md](fs/README.md) |
 | `memory/` | PMM (битмап + COW), VMM (4-уровневый paging), куча, layout | [memory/README.md](memory/README.md) |
 | `net/` | Собственный TCP/IP-стек, DNS, HTTP/HTTPS(TLS) | [net/README.md](net/README.md) |

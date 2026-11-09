@@ -43,7 +43,11 @@ use super::cred::{Access, Creds};
 use super::dirent::{d_type_for, dirent_reclen, encode_dirent64};
 use super::errno::Errno;
 use super::io::{plan_lseek, plan_read};
+// The two foreground-group ioctls (`tcgetpgrp`/`tcsetpgrp`) and the `TOSTOP`
+// bit come from the pure model (`super::tty`) so the kernel and the host
+// properties cannot drift apart on the ABI numbers.
 use super::stat::{encode_stat, LinuxStat, S_IFDIR, S_IFLNK, S_IFREG};
+use super::tty::{TIOCGPGRP, TIOCSPGRP, TOSTOP};
 
 /// `st_mode` type bits for a character device (console/stdin), so `fstat` on a
 /// standard stream reports a plausible (non-regular) type.
@@ -339,6 +343,11 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         // read from the PS/2 keyboard (echo, backspace, ^D = EOF). Previously
         // this returned an instant EOF, so CPython silently exited with 0.
         Some(Resolved::Console) | Some(Resolved::Stdin) => {
+            // Terminal access control: a background JOB reading the terminal is
+            // stopped (SIGTTIN queued on its group, -EINTR here — the group
+            // parks at this syscall's return). Checked BEFORE the read so the
+            // process cannot consume a keystroke it does not own.
+            crate::drivers::tty::check_access(super::tty::TtyAccess::Read)?;
             let raw = crate::task::compat::with_current_compat(|cs| cs.raw_mode).unwrap_or(false);
             if raw {
                 read_stdin_raw(buf, count)
@@ -539,6 +548,11 @@ pub fn sys_sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<
         Some(value) => value,
         None => return Err(Errno::EBADF),
     };
+    // A sendfile into the terminal is a write to it: same access control as
+    // `write(2)`, checked once before any byte reaches the console.
+    if matches!(output, Resolved::Console) {
+        crate::drivers::tty::check_access(super::tty::TtyAccess::Write)?;
+    }
     let mut in_offset = if offset != 0 {
         check_user_ptr(offset, 8)?;
         let raw = copy_in_pub(offset, 8);
@@ -646,6 +660,10 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             Ok(n as u64)
         }
         Some(Resolved::Console) => {
+            // Terminal access control: a background JOB writing the terminal is
+            // stopped when TOSTOP is set (SIGTTOU + -EINTR), exactly like
+            // Linux; with TOSTOP clear the write goes through.
+            crate::drivers::tty::check_access(super::tty::TtyAccess::Write)?;
             let data = copy_in(buf, count);
             console_write(&data);
             Ok(count)
@@ -732,6 +750,9 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
         let data = copy_in(base, len);
         match &target {
             Resolved::Console => {
+                // Same terminal access control as `write(2)`: a background job
+                // under TOSTOP is stopped before its first gathered write.
+                crate::drivers::tty::check_access(super::tty::TtyAccess::Write)?;
                 console_write(&data);
                 total += len;
             }
@@ -1583,9 +1604,6 @@ const TCSETSF: u64 = 0x5404;
 /// `TIOCGWINSZ`: read the window size (`struct winsize`).
 const TIOCGWINSZ: u64 = 0x5413;
 const TIOCSWINSZ: u64 = 0x5414;
-/// Terminal foreground process group (bash job control).
-const TIOCGPGRP: u64 = 0x540F;
-const TIOCSPGRP: u64 = 0x5410;
 
 /// Byte size of the Linux `struct termios` (4×u32 + c_line + c_cc[19]).
 const TERMIOS_SIZE: usize = 36;
@@ -1593,15 +1611,17 @@ const TERMIOS_SIZE: usize = 36;
 /// Build a plausible cooked-mode `struct termios` byte image: ICRNL|IXON,
 /// OPOST|ONLCR, B38400|CS8|CREAD, ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN plus the
 /// standard control characters (^C, ^\, DEL, ^U, ^D-as-VEOF, ...).
+///
+/// STAGE 16.16: the three bits the kernel actually implements — `ICANON` and
+/// `ECHO` (per-process, set by `TCSETS`) and `TOSTOP` (the terminal-wide
+/// background-write policy, see `drivers::tty`) — are reported from live state.
+/// A program that saves the attributes, changes them and restores them must get
+/// back what it set, not a hardcoded image.
 fn build_termios() -> [u8; TERMIOS_SIZE] {
     let mut t = [0u8; TERMIOS_SIZE];
     let c_iflag: u32 = 0x0500; // ICRNL | IXON
     let c_oflag: u32 = 0x0005; // OPOST | ONLCR
     let c_cflag: u32 = 0x00BF; // B38400 | CS8 | CREAD
-                               // STAGE 16.16: report the REAL tty state instead of a hardcoded cooked
-                               // image. tcgetattr previously always claimed ICANON|ECHO, so a program
-                               // that saves attributes, switches to raw and restores them (bash readline
-                               // does this around every command) read back a lie.
     let (raw_now, echo_now) = crate::task::compat::with_current_compat(|cs| (cs.raw_mode, cs.echo))
         .unwrap_or((false, true));
     let mut c_lflag: u32 = 0x8A3B; // ISIG|ICANON|ECHO|ECHOE|ECHOK|ECHOCTL|ECHOKE|IEXTEN
@@ -1611,6 +1631,9 @@ fn build_termios() -> [u8; TERMIOS_SIZE] {
     if !echo_now {
         c_lflag &= !0x0008u32;
     } // ECHO
+    if crate::drivers::tty::tostop() {
+        c_lflag |= TOSTOP;
+    }
     t[0..4].copy_from_slice(&c_iflag.to_le_bytes());
     t[4..8].copy_from_slice(&c_oflag.to_le_bytes());
     t[8..12].copy_from_slice(&c_cflag.to_le_bytes());
@@ -1650,6 +1673,9 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
                     cs.raw_mode = raw;
                     cs.echo = echo;
                 });
+                // TOSTOP (0x100) is TERMINAL state, not per-process: it decides
+                // whether a background job's write stops it (drivers::tty).
+                crate::drivers::tty::set_tostop(c_lflag & TOSTOP != 0);
             }
             Ok(0)
         }
@@ -1666,17 +1692,39 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
         // Window-size writes are accepted and ignored (readline issues
         // TIOCSWINSZ during startup to propagate its computed size).
         TIOCSWINSZ => Ok(0),
-        // Report the caller as the foreground process group and
-        // accept ownership changes silently. Without these, bash printed
-        // "cannot set terminal process group (-1)" + "no job control in this
-        // shell" on every start.
+        // Terminal job control: report / change the terminal's foreground
+        // process group. Previously both answered in terms of the CALLER
+        // (report the caller, accept any change silently), so `tcgetpgrp` lied
+        // to every background job and bash printed "cannot set terminal process
+        // group (-1)" + "no job control in this shell" on every start.
         TIOCGPGRP => {
             check_user_ptr(arg, 4)?;
-            let pg = crate::task::compat::current_tgid() as u32;
+            let pg = crate::drivers::tty::foreground_pgid() as u32;
             copy_out(arg, &pg.to_le_bytes());
             Ok(0)
         }
-        TIOCSPGRP => Ok(0),
+        TIOCSPGRP => {
+            // The argument is an `int *` (glibc's tcsetpgrp passes &pgrp): the
+            // 32-bit word is signed, so a negative pgid is EINVAL (Linux's
+            // tiocspgrp rejects `pgrp < 0` before any lookup). pagh has no
+            // sessions, so `tty::may_set_foreground` approximates Linux's
+            // session check with "the group must be live, or the terminal's
+            // current/shell group" and returns EPERM otherwise.
+            check_user_ptr(arg, 4)?;
+            // SAFETY: validated above; the read is unaligned because the user
+            // pointer carries no alignment guarantee.
+            let raw = unsafe { core::ptr::read_unaligned(arg as *const u32) };
+            let target = super::tty::decode_pgrp_arg(raw)?;
+            let live = !compat::group_pids(target).is_empty();
+            super::tty::may_set_foreground(
+                target,
+                live,
+                crate::drivers::tty::shell_pgid(),
+                crate::drivers::tty::foreground_pgid(),
+            )?;
+            crate::drivers::tty::set_foreground_pgid(target);
+            Ok(0)
+        }
         _ => Err(Errno::ENOTTY),
     }
 }
@@ -2770,6 +2818,8 @@ pub fn sys_pwrite64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, E
         | Some(Resolved::Signalfd(_)) => Err(Errno::ESPIPE),
         Some(Resolved::Dir) => Err(Errno::EISDIR),
         Some(Resolved::Console) => {
+            // Terminal access control, like `write(2)`/`writev(2)`.
+            crate::drivers::tty::check_access(super::tty::TtyAccess::Write)?;
             let data = copy_in(buf, count);
             console_write(&data);
             Ok(count)

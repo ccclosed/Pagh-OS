@@ -40,7 +40,8 @@ static SKIP_REASONS_TOTAL: crate::sync::spinlock::Spinlock<
     alloc::collections::BTreeMap<&'static str, u32>,
 > = crate::sync::spinlock::Spinlock::new(alloc::collections::BTreeMap::new());
 
-/// Clear the run-wide skip accumulator (once, at the start of `run_all`).
+/// Clear the run-wide skip accumulator (at the start of every `run_all` pass,
+/// so the count `run_all` returns — and prints — describes ONE pass).
 pub fn reset_skip_totals() {
     SKIP_REASONS_TOTAL.lock().clear();
 }
@@ -5206,6 +5207,336 @@ mod linux_signal_tests {
     }
 }
 
+// ─── Controlling-terminal job control, in-guest (2.16.0) ─────────────────────
+//
+// Proves on the real machine what the host property `tty_job` cannot: the
+// KERNEL-side terminal state and its two ioctls actually move the foreground
+// process group, the stdin/console read+write paths really queue SIGTTIN /
+// SIGTTOU and return EINTR for a background JOB, a kernel-spawned non-job is
+// exempt, and a group signal reaches EVERY thread group in the process group
+// (the "stops only the last pid" failure this feature replaces).
+//
+// NON-DESTRUCTIVE: the terminal state (foreground pgid + TOSTOP) is saved and
+// restored, the synthetic `CompatState`s use empty VM region sets and pids whose
+// only user is this routine, and every one of them — including the one installed
+// for the CALLING task — is removed before returning. The one user page is
+// allocated from the PMM and freed again, so the PMM-hygiene ledger of `selftest
+// 2` stays balanced.
+mod linux_tty_tests {
+    use crate::arch::x86_64::linux::errno::Errno;
+    use crate::arch::x86_64::linux::io_sys::{sys_ioctl, sys_read, sys_write};
+    use crate::arch::x86_64::linux::signal;
+    use crate::arch::x86_64::linux::signal_frame::{sigbit, SIGTSTP, SIGTTIN, SIGTTOU};
+    use crate::arch::x86_64::linux::tty::{TIOCGPGRP, TIOCSPGRP};
+    use crate::drivers::tty as ktty;
+    use crate::memory::{pmm, vmm};
+    use crate::task::compat::{self, CompatState};
+    use crate::task::fd::FdTable;
+    use crate::task::scheduler;
+    use alloc::sync::Arc;
+    use x86_64::structures::paging::PageTableFlags;
+
+    /// User-accessible scratch page for the ioctl `int` argument and the zero
+    /// length read/write buffers (a kernel-stack address is not USER_ACCESSIBLE).
+    const SCRATCH_VA: u64 = 0x0000_4001_0000_0000;
+
+    /// Pids that `scheduler::next_pid` never produces (it counts up from 1) and
+    /// that no task is spawned with. Kept below 2^31: the ioctl argument is a C
+    /// `int`, and a larger raw value would decode as negative.
+    const JOB_A: u64 = 0x7E00_0001;
+    const JOB_B: u64 = 0x7E00_0002;
+    const JOB_C: u64 = 0x7E00_0003;
+    /// The process group JOB_A/JOB_B share (JOB_A is its leader).
+    const GROUP: u64 = JOB_A;
+    /// A second, unrelated process group (JOB_C is its leader).
+    const OTHER_GROUP: u64 = JOB_C;
+    /// A group that was never installed.
+    const ABSENT: u64 = 0x7E00_00FF;
+
+    /// A minimal synthetic compat state (no VM bookkeeping; the signal and fd
+    /// paths never touch it).
+    fn synth(tid: u64, tgid: u64, pgid: u64) -> CompatState {
+        let mut st = CompatState::new(
+            FdTable::with_standard_streams(),
+            Arc::new(crate::sync::spinlock::Spinlock::new(
+                crate::arch::x86_64::linux::mem::VmRegionSet::new(0, 0),
+            )),
+            tid,
+        );
+        st.tgid = tgid;
+        st.pgid = pgid;
+        st
+    }
+
+    /// Map the scratch page if it is not mapped yet; returns the frame to free.
+    fn map_scratch() -> Option<u64> {
+        if vmm::virt_to_phys(SCRATCH_VA).is_some() {
+            return None;
+        }
+        let frame = pmm::alloc_frame()?;
+        // SAFETY: the frame was just allocated and is reachable through the HHDM.
+        unsafe {
+            core::ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, 4096);
+        }
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+        vmm::map(frame, SCRATCH_VA, flags).ok()?;
+        Some(frame)
+    }
+
+    fn unmap_scratch(frame: Option<u64>) {
+        if let Some(frame) = frame {
+            let _ = vmm::unmap(SCRATCH_VA);
+            pmm::free_frame(frame);
+        }
+    }
+
+    /// Write a 32-bit pgid into the scratch page.
+    fn put_pgid(pgid: u32) {
+        // SAFETY: SCRATCH_VA is mapped writable by `map_scratch`.
+        unsafe {
+            core::ptr::write_unaligned(SCRATCH_VA as *mut u32, pgid);
+        }
+    }
+
+    /// Read the 32-bit pgid back out of the scratch page.
+    fn get_pgid() -> u32 {
+        // SAFETY: SCRATCH_VA is mapped readable by `map_scratch`.
+        unsafe { core::ptr::read_unaligned(SCRATCH_VA as *const u32) }
+    }
+
+    /// Stop-class signals that the background terminal checks queue on the
+    /// CALLING task. They are BLOCKED for the duration of this routine: a stop
+    /// signal parks its receiver at the next tick even in ring 0, and this
+    /// routine runs on the shell thread — parking it would hang the suite. A
+    /// blocked bit is invisible to `tick_action`/`pick_pending_signal` (both
+    /// require pending ∧ ¬blocked), which is exactly what lets the assertions
+    /// below observe the bit without being stopped by it.
+    const TEST_STOP_BLOCK: u64 = sigbit(SIGTTIN) | sigbit(SIGTTOU) | sigbit(SIGTSTP);
+
+    /// Clear the calling task's pending bits through the registry (blocked bits
+    /// cannot be consumed by `pick_pending_signal`).
+    fn clear_own_pending(me: u64) {
+        if let Some(mut st) = compat::remove_compat(me) {
+            st.sig_pending = 0;
+            compat::install_compat(me, st);
+        }
+    }
+
+    pub fn foreground_group_and_access_control() {
+        // ── Save the live terminal state ────────────────────────────────────
+        let saved_fg = ktty::foreground_pgid();
+        let saved_tostop = ktty::tostop();
+        let me = scheduler::current_pid();
+        let shell = ktty::shell_pgid();
+
+        // The terminal starts owned by the shell, and the shell's own group is
+        // accepted as a target even though no compat process is in it.
+        assert_eq_kernel!(
+            ktty::foreground_pgid(),
+            shell,
+            "the terminal starts owned by the shell's own process group"
+        );
+
+        // ── Synthetic registry: the caller + two process groups ─────────────
+        // The caller gets a compat state so `resolve_fd`/`with_current_compat`
+        // see a Linux process; its pgid is GROUP (it is a job of that group).
+        let mut mine = synth(me, me, GROUP);
+        mine.tty_job = true;
+        mine.sig_blocked |= TEST_STOP_BLOCK;
+        compat::install_compat(me, mine);
+        compat::install_compat(JOB_A, synth(JOB_A, JOB_A, GROUP));
+        // A SECOND thread group inside the same process group: this is the case
+        // "stop only the last pid" missed.
+        compat::install_compat(JOB_B, synth(JOB_B, JOB_B, GROUP));
+        compat::install_compat(JOB_C, synth(JOB_C, JOB_C, OTHER_GROUP));
+
+        let frame = map_scratch();
+        assert_kernel!(frame.is_some(), "scratch user page mapped");
+
+        // ── A. The two ioctls through the real syscall surface ──────────────
+        ktty::set_foreground_pgid(OTHER_GROUP);
+        put_pgid(0);
+        assert_eq_kernel!(
+            sys_ioctl(0, TIOCGPGRP, SCRATCH_VA),
+            Ok(0),
+            "TIOCGPGRP answers on the terminal"
+        );
+        assert_eq_kernel!(
+            get_pgid() as u64,
+            OTHER_GROUP,
+            "TIOCGPGRP reports the terminal's foreground group, not the caller"
+        );
+
+        // A live group in another thread group is accepted.
+        put_pgid(GROUP as u32);
+        assert_eq_kernel!(
+            sys_ioctl(0, TIOCSPGRP, SCRATCH_VA),
+            Ok(0),
+            "TIOCSPGRP accepts a live target group"
+        );
+        assert_eq_kernel!(
+            ktty::foreground_pgid(),
+            GROUP,
+            "TIOCSPGRP moved the foreground group"
+        );
+
+        // The shell's own group is accepted even though it has no compat member.
+        put_pgid(shell as u32);
+        assert_eq_kernel!(
+            sys_ioctl(0, TIOCSPGRP, SCRATCH_VA),
+            Ok(0),
+            "TIOCSPGRP accepts the shell's own group"
+        );
+        assert_eq_kernel!(ktty::foreground_pgid(), shell, "fg == shell group");
+
+        // A negative C `int` is EINVAL; group 0 and a dead group are EPERM; the
+        // foreground group never moves on a refused call.
+        put_pgid(0xFFFF_FFFF);
+        assert_eq_kernel!(
+            sys_ioctl(0, TIOCSPGRP, SCRATCH_VA),
+            Err(Errno::EINVAL),
+            "TIOCSPGRP with a negative pgid is EINVAL"
+        );
+        put_pgid(0);
+        assert_eq_kernel!(
+            sys_ioctl(0, TIOCSPGRP, SCRATCH_VA),
+            Err(Errno::EPERM),
+            "TIOCSPGRP to group 0 is EPERM"
+        );
+        put_pgid(ABSENT as u32);
+        assert_eq_kernel!(
+            sys_ioctl(0, TIOCSPGRP, SCRATCH_VA),
+            Err(Errno::EPERM),
+            "TIOCSPGRP to a group with no live member is EPERM (the session check pagh cannot make)"
+        );
+        assert_eq_kernel!(
+            ktty::foreground_pgid(),
+            shell,
+            "a refused TIOCSPGRP left the foreground group alone"
+        );
+
+        // ── B. Background read: SIGTTIN + EINTR ─────────────────────────────
+        // The caller is a JOB in GROUP; the terminal is owned by OTHER_GROUP.
+        ktty::set_foreground_pgid(OTHER_GROUP);
+        ktty::set_tostop(true);
+        clear_own_pending(me);
+        assert_eq_kernel!(
+            sys_read(0, SCRATCH_VA, 0),
+            Err(Errno::EINTR),
+            "a background job's terminal read fails with EINTR"
+        );
+        assert_kernel!(
+            compat::pending_of(me) & sigbit(SIGTTIN) != 0,
+            "the background read queued SIGTTIN on the caller's process group"
+        );
+        clear_own_pending(me);
+
+        // ── C. Background write: SIGTTOU + EINTR iff TOSTOP ─────────────────
+        assert_eq_kernel!(
+            sys_write(1, SCRATCH_VA, 0),
+            Err(Errno::EINTR),
+            "a background job's terminal write fails with EINTR under TOSTOP"
+        );
+        assert_kernel!(
+            compat::pending_of(me) & sigbit(SIGTTOU) != 0,
+            "the background write queued SIGTTOU"
+        );
+        clear_own_pending(me);
+        ktty::set_tostop(false);
+        assert_eq_kernel!(
+            sys_write(1, SCRATCH_VA, 0),
+            Ok(0),
+            "with TOSTOP clear a background write goes through (Linux semantics)"
+        );
+        assert_kernel!(
+            compat::pending_of(me) & sigbit(SIGTTOU) == 0,
+            "no SIGTTOU was queued with TOSTOP clear"
+        );
+
+        // ── D. The foreground group is never stopped ────────────────────────
+        ktty::set_tostop(true);
+        ktty::set_foreground_pgid(GROUP);
+        clear_own_pending(me);
+        assert_eq_kernel!(
+            sys_read(0, SCRATCH_VA, 0),
+            Ok(0),
+            "the foreground job's read is allowed (count 0 = no keystroke consumed)"
+        );
+        assert_eq_kernel!(
+            sys_write(1, SCRATCH_VA, 0),
+            Ok(0),
+            "the foreground job's write is allowed"
+        );
+        assert_eq_kernel!(
+            compat::pending_of(me),
+            0,
+            "the foreground job accumulated no terminal signal"
+        );
+
+        // ── E. A kernel-spawned non-job is exempt ───────────────────────────
+        // Re-install the caller WITHOUT the job flag: this is what apt's
+        // verification binary or the selftest harness looks like. It must keep
+        // working while the shell owns the terminal (its pgid is background).
+        let mut plain = synth(me, me, GROUP);
+        plain.sig_blocked |= TEST_STOP_BLOCK;
+        compat::install_compat(me, plain);
+        ktty::set_foreground_pgid(OTHER_GROUP);
+        clear_own_pending(me);
+        assert_eq_kernel!(
+            sys_read(0, SCRATCH_VA, 0),
+            Ok(0),
+            "a non-job (kernel-spawned) process is not stopped by the terminal"
+        );
+        assert_eq_kernel!(
+            sys_write(1, SCRATCH_VA, 0),
+            Ok(0),
+            "a non-job's terminal write is not stopped either"
+        );
+
+        // ── F. A group signal reaches EVERY thread group of the pgid ────────
+        assert_kernel!(
+            signal::send_signal_to_pgid_all(GROUP, SIGTSTP).is_ok(),
+            "SIGTSTP to the group is delivered"
+        );
+        assert_kernel!(
+            compat::pending_of(JOB_A) & sigbit(SIGTSTP) != 0,
+            "the group leader received SIGTSTP"
+        );
+        assert_kernel!(
+            compat::pending_of(JOB_B) & sigbit(SIGTSTP) != 0,
+            "the SECOND thread group in the same process group received SIGTSTP (the old path stopped only one pid)"
+        );
+        assert_kernel!(
+            compat::pending_of(JOB_C) & sigbit(SIGTSTP) == 0,
+            "a process in another group was not signalled"
+        );
+        assert_eq_kernel!(
+            signal::send_signal_to_pgid_all(ABSENT, SIGTSTP),
+            Err(Errno::ESRCH),
+            "a group with no live member is ESRCH"
+        );
+
+        // ── Cleanup: the registry sees exactly what it saw before ───────────
+        unmap_scratch(frame);
+        compat::remove_compat(me);
+        compat::remove_compat(JOB_A);
+        compat::remove_compat(JOB_B);
+        compat::remove_compat(JOB_C);
+        ktty::set_tostop(saved_tostop);
+        ktty::set_foreground_pgid(saved_fg);
+        assert_kernel!(
+            !compat::compat_exists(JOB_A)
+                && !compat::compat_exists(JOB_B)
+                && !compat::compat_exists(JOB_C)
+                && !compat::compat_exists(me),
+            "synthetic compat states were removed"
+        );
+    }
+}
+
 // ─── SIGSTOP/SIGCONT scheduler state, in-guest (issue #12, task t8) ──────────
 //
 // Proves on the real machine what the host properties (`signal_stop`,
@@ -6135,6 +6466,14 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             "linux::SIGSTOP/SIGCONT park+resume+kill (issue #12)",
             linux_stop_tests::stop_continue_and_kill
         ),
+        // Terminal job control (2.16.0): the foreground pgid, TIOCGPGRP/
+        // TIOCSPGRP, SIGTTIN/SIGTTOU on background tty I/O, the non-job
+        // exemption and the all-thread-groups group signal. Restores the
+        // terminal state and the registry; see the module docs.
+        (
+            "linux::tty foreground group + SIGTTIN/SIGTTOU",
+            linux_tty_tests::foreground_group_and_access_control
+        ),
         // procfs (issue #11): the synthetic tree's shape, the rendered texts and
         // the ENOENT matrix. Read-only; see the module docs.
         (
@@ -6428,7 +6767,11 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
 /// The last two exist so `selftest 2` can compare two passes in one boot: a
 /// routine that retains PMM frames (or any other kernel state) makes the passes
 /// diverge, which is how the ELF fuzz routine was caught draining the whole pool.
+/// The skip count is PER PASS (the accumulator is cleared here): a run-wide one
+/// would make the second pass report more skips than the first and turn every
+/// `selftest 2` verdict into a false `diverged=true`.
 pub fn run_all() -> (usize, u32, u32, i64) {
+    reset_skip_totals();
     let tests = all_tests();
     crate::kprintln!("=== kernel self-test ({} routines) ===", tests.len());
     let mut total_failed = 0u32;

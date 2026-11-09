@@ -15,7 +15,8 @@ framebuffer-консоль, VT-эмулятор, курсор, serial. Коор�
 | `virtio/blk.rs` | virtio-blk: `PciTransport` + `VirtIOBlk`, обёрнут в `BlockDevice` «virtio-blk0», секторный кэш 2 MiB (write-through), `flush` = `VIRTIO_BLK_T_FLUSH` |
 | `nvme.rs` | NVMe поверх PCIe — поллинг (phase-bit, поиск по CID), BAR0 MMIO, многостраничные PRP (PRP1 + PRP-list), до 4 команд в полёте, FLUSH (opcode 0x00) для дюрабильности WAL (issue #15), RMW для невыровненных записей; регистрируется как `BlockDevice` |
 | `nvme_prp.rs` | Чистая (`core` только) арифметика NVMe: PRP1/PRP2/PRP-list, LBA-чанки команд, SQ/CQ phase-tag и зажим CAP.MQES — включается в host-tests как есть |
-| `ps2_kbd.rs` | PS/2 клавиатура (IRQ1): 128-байтное кольцо сканкодов, трекинг Ctrl+C, защёлки `CTRL_C`/`FG_PID` |
+| `ps2_kbd.rs` | PS/2 клавиатура (IRQ1): 128-байтное кольцо сканкодов, трекинг Ctrl+C/Ctrl+Z, защёлки `CTRL_C`/`CTRL_Z`/`FG_PID`; ^C шлёт `SIGINT` foreground-группе терминала (`drivers::tty`), а не только записанному pid |
+| `tty.rs` | Управляющий терминал консоли: foreground process group (kernel-side, по умолчанию — группа shell) + `TOSTOP`, `TIOCGPGRP`/`TIOCSPGRP` через чистую модель `linux::tty`, `check_access(kind)` — фоновое чтение/запись JOB-процесса получает `SIGTTIN`/`SIGTTOU` на всю группу и `EINTR` (не-JOB'ы, т.е. служебные spawn'ы ядра, не останавливаются) |
 | `ps2_mouse.rs` | PS/2 мышь (IRQ12) через 8042 aux: сборка 3-байтовых пакетов, зажатые координаты + кнопки + `seq` |
 | `framebuffer.rs` | Limine framebuffer текстовая консоль + 2D-графика: шрифт Fira Code 8×18 (`assets/font8x18.bin` — 8-битное **покрытие** на пиксель, генерируется `tools/gen_font.py`), `FbWriter`, скролл, status bar, макросы `fb_print!` |
 | `vt.rs` | ANSI/VT-100 эмулятор поверх framebuffer (`Vt`: CSI/OSC/DCS, 256 цветов, scroll regions, ответы на запросы) — stdout compat-программ |
@@ -34,7 +35,9 @@ framebuffer-консоль, VT-эмулятор, курсор, serial. Коор�
   RX-кольцо 0x2800.., TX-кольцо 0x3800..; `DESC_COUNT=64`, `BUF_SIZE=2048`.
 - `virtio::blk`: `init_blk(&[PciDevice])`, `VirtioBlkDevice` (реализует `BlockDevice`);
   `SECTOR_CACHE_MAX=4096` секторов, write-through.
-- `ps2_kbd`: `init()`, `irq_handler()`, `has_pending()`, атомики `CTRL_C`, `FG_PID`.
+- `ps2_kbd`: `init()`, `irq_handler()`, `has_pending()`, атомики `CTRL_C`, `CTRL_Z`, `FG_PID`.
+- `tty`: `init_shell(pgid)`, `shell_pgid()`, `foreground_pgid()`, `set_foreground_pgid()`,
+  `restore_shell_foreground()`, `tostop()`/`set_tostop()`, `check_access(TtyAccess) -> Result<(), Errno>`.
 - `ps2_mouse`: `init(screen_w, screen_h) -> bool`, `irq_handler()`, `poll()`,
   `MouseState { x, y, left, right, middle, seq }`.
 - `framebuffer`: `init()`, `console()`, `clear_screen()`, `set_fg_color()`, `dimensions()`,
@@ -57,10 +60,12 @@ framebuffer-консоль, VT-эмулятор, курсор, serial. Коор�
 
 ### Клавиатура
 Сканкод с порта 0x60 → трекинг 0xE0-префикса → Ctrl+C-make ставит `CTRL_C` и, если `FG_PID`
-указывает на живой не-raw compat-процесс, шлёт ему настоящий SIGINT (`signal::send_signal`)
-прямо из IRQ, а `scheduler::request_exit(pid)` зовёт лишь как фолбэк при неудачной доставке
-(^C работает даже когда shell заблокирован в read()) → байт в кольцо (аллокации нет,
-при переполнении дроп).
+указывает на живой не-raw compat-процесс, шлёт настоящий `SIGINT` **foreground-группе
+терминала** (`drivers::tty::foreground_pgid()` + `signal::send_signal_to_pgid_all`, по копии
+на каждую thread-группу внутри pgid) прямо из IRQ, а `scheduler::request_exit(fg)` зовёт лишь
+как фолбэк, когда у foreground-группы нет живого члена (например, ^C гонится с передачей
+терминала в `cmd_lxrun`) → байт в кольцо (аллокации нет, при переполнении дроп). Ctrl+Z
+(`CTRL_Z`) обрабатывает foreground-wait shell'а: останавливает ту же группу `SIGTSTP`.
 
 ### Мышь
 Байт с 0x60 → ресинк по биту 3 нулевого байта → сборка 3 байтов → 9-битные знаковые дельты,

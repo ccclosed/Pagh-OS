@@ -48,6 +48,14 @@ pub struct CompatState {
     /// Process group id (Linux `pgid`), independent of the thread group.
     /// `setpgid` changes it; `kill(-pgid)` and `kill(0)` address this group.
     pub pgid: u64,
+    /// Whether the shell has handed this process the controlling terminal as a
+    /// JOB (`lxrun` / `fg` → `drivers::tty`). Only a job is subject to terminal
+    /// access control (`SIGTTIN` on background reads, `SIGTTOU` on background
+    /// writes under `TOSTOP`); the kernel's own non-interactive spawns (apt
+    /// verification binaries, the selftest harness) were never given the
+    /// terminal and must not be stopped by it. Inherited by `fork`/`clone`, so
+    /// a job's subprocesses stay governed by the terminal it owns.
+    pub tty_job: bool,
     /// Address cleared and futex-woken at thread exit.
     pub clear_child_tid: u64,
     /// Whether exit creates a wait4-visible zombie.
@@ -169,6 +177,7 @@ impl CompatState {
             ppid,
             tgid: tid,
             pgid: tid,
+            tty_job: false,
             clear_child_tid: 0,
             waitable: true,
             robust_head: 0,
@@ -639,6 +648,24 @@ pub fn set_pgid(pid: u64, pgid: u64) {
 /// The process group of `pid`, or `None` when it has no compat state.
 pub fn pgid_of(pid: u64) -> Option<u64> {
     COMPAT_STATES.lock().get(&pid).map(|s| s.pgid)
+}
+
+/// Mark `pid` as a terminal JOB: the shell handed it the controlling terminal
+/// (`lxrun`, `fg`). Only jobs are subject to terminal access control
+/// ([`crate::drivers::tty::check_access`]).
+pub fn mark_tty_job(pid: u64) {
+    if let Some(state) = COMPAT_STATES.lock().get_mut(&pid) {
+        state.tty_job = true;
+    }
+}
+
+/// Is `pid` a terminal job? `false` for an unknown pid.
+pub fn is_tty_job(pid: u64) -> bool {
+    COMPAT_STATES
+        .lock()
+        .get(&pid)
+        .map(|s| s.tty_job)
+        .unwrap_or(false)
 }
 
 /// Snapshot of `(pid, tgid)` for every registered compat process/thread, pid

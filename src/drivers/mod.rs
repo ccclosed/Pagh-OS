@@ -10,6 +10,7 @@ pub mod pci;
 pub mod ps2_kbd;
 pub mod ps2_mouse;
 pub mod serial;
+pub mod tty;
 pub mod virtio;
 pub mod vt;
 
