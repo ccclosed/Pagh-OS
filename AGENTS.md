@@ -231,8 +231,19 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.16.1**
-  (the procfs slice 3 minor bump; it lands on `main` with the merge).
+  be reflected here. **`main` currently reads 2.17.0** (the batch open with the
+  `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
+  kernel-thread rows in `ps`; the tag lands at the end of the batch).
+  **2.17.0** = a peer that answers and closes in one burst now completes
+  `connect(2)`: the completion test is `ever_established` (the handshake
+  happened), not `state == Established` (a window a reply+FIN skips straight
+  through), and `tools/e2e.py tcp-shot` pins that down; the VT emulator and the
+  text console share one coordinate system (cell `(col,row)` is
+  `row*CHAR_HEIGHT`, no status-bar offset) and hand the cursor over in both
+  directions inside the spawn's `without_interrupts` window, so `lxrun` no
+  longer clears the screen black and no longer marches the prompt downwards;
+  `ps` lists kernel threads (`[shell]`, `[net]`, …) and `df` reports the bytes a
+  ramfs is holding.
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
   `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real
@@ -347,8 +358,16 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   and timer-tick delivery to a syscall-free task are all implemented. SIGCHLD is
   queued to the parent on child exit/stop/continue (2.15.0). Real process groups
   now exist in `CompatState` (`pgid`, `setpgid`/`getpgid`/`getpgrp`/`setsid`,
-  `kill(0)`/`kill(-pgid)` address the group) as of 2.16.0. Still missing: terminal
-  foreground-group tracking and the `^Z` tty stop path.
+  `kill(0)`/`kill(-pgid)` address the group) as of 2.16.0. Terminal job control
+  landed with them: the console is a controlling terminal with one foreground
+  process group (`drivers::tty`, pure rules in `arch/x86_64/linux/tty.rs`,
+  host property `tty_job`), `TIOCGPGRP`/`TIOCSPGRP` answer as
+  `tcgetpgrp`/`tcsetpgrp`, a background read gets `SIGTTIN` and (under `TOSTOP`)
+  a background write gets `SIGTTOU`, and `^Z` stops the foreground GROUP.
+  Deviations that remain, stated in that module rather than implied: no
+  sessions (the `tcsetpgrp` session rule is approximated), a background access
+  returns `EINTR` instead of being restarted after `SIGCONT`, and `TOSTOP`
+  defaults ON where Linux defaults it off.
 
 - NVMe driver is polled (no IRQs) with multi-page PRP lists and four commands in
   flight; FLUSH (opcode 0x00) is issued at WAL transaction boundaries. Still
