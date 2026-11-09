@@ -185,6 +185,15 @@ pub mod signal_frame;
 #[path = "../../src/arch/x86_64/linux/kill.rs"]
 pub mod kill;
 
+// `tty` is the pure controlling-terminal job-control model (foreground process
+// group, `TOSTOP`, `tcgetpgrp`/`tcsetpgrp` argument rules). It uses
+// `super::errno` and `super::signal_frame` only — both declared here as
+// crate-root siblings, exactly like the kernel's `crate::arch::x86_64::linux::*`
+// siblings — so the standalone `#[path]` include resolves with no extra wiring
+// (property file `tty_job`).
+#[path = "../../src/arch/x86_64/linux/tty.rs"]
+pub mod tty;
+
 // `regs` is the pure 15-GPR syscall frame contract (`repr(C)`, `rax` at offset
 // 112) — `core`-only and self-contained, included here so the tick-path frame
 // mirror below can be asserted against the REAL struct rather than a copy.
@@ -466,6 +475,10 @@ mod properties {
     mod p51;
     mod p52;
     mod p53;
+
+    // Controlling-terminal job control: the pure foreground-group/TOSTOP model
+    // behind TIOCGPGRP/TIOCSPGRP and the SIGTTIN/SIGTTOU signal choice.
+    mod tty_job;
 
     // `kill(2)` argument decoding + target classification + errno matrix
     // (issue #12): the decisions `signal::sys_kill` makes before touching the

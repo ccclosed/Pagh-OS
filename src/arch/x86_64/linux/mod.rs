@@ -23,6 +23,7 @@ pub mod misc;
 pub mod rand_clock;
 pub mod stat;
 pub mod timeconv;
+pub mod tty;
 pub mod validate;
 
 // Kernel-only effectful handler shells. These are NOT `#[path]`-included by the
