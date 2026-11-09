@@ -369,6 +369,17 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   returns `EINTR` instead of being restarted after `SIGCONT`, and `TOSTOP`
   defaults ON where Linux defaults it off.
 
+- Input devices: PS/2 keyboard/mouse (IRQ1/IRQ12) and, as of this batch, USB HID
+  through an xHCI controller the kernel drives itself (`drivers::xhci`,
+  `drivers::usb_hid`, polled from the `usb` thread). The HID translation is
+  covered by six in-QEMU routines. **Not verified: device enumeration** — QEMU's
+  emulated controller never reports a connected device, so the port→slot→address
+  →descriptor→endpoint path has never actually run; the shell's `usb` command
+  exists to diagnose that on real hardware. Not implemented anywhere: hubs
+  (root ports only), isochronous transfers, hot-unplug teardown, and USB mass
+  storage — which is why the boot medium's disk image is mounted as a RAM disk
+  rather than read from the stick.
+
 - NVMe driver is polled (no IRQs) with multi-page PRP lists and four commands in
   flight; FLUSH (opcode 0x00) is issued at WAL transaction boundaries. Still
   missing: the driver takes the whole namespace (no partition parsing, one
