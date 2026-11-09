@@ -7,13 +7,11 @@ The kernel is a Limine UEFI payload, so the image is UEFI-only:
   holding the loader, the kernel and the disk image. ``dd`` it onto a USB stick
   and any UEFI machine boots it. This is the artifact for a real PC: an optical
   drive is the exception now, a USB port is not.
-There is deliberately NO ISO builder here. A UEFI-bootable ISO needs El Torito,
-and the authoring tool for that is xorriso, which is not part of a base system
-(and not present on the machine this was written on). A hand-built ISO9660 +
-El Torito catalog was tried and OVMF rejects it ("Default entry is not valid,
-booting to menu"), so instead of shipping a builder that emits a disc nothing
-boots, the recipe with the real tool is documented in ``tools/README.md``. The
-USB image below is the artifact that actually works on hardware.
+* ``--iso dist/pagh.iso`` — an ISO9660 disc with an El Torito EFI entry, which
+  is what a Ventoy stick (or a virtual machine, or an optical drive) wants. The
+  writer is `tools/iso9660.py`; its docstring records the exact conditions
+  firmware checks, taken from EDK2's El Torito source, because guessing them cost
+  several non-booting images.
 
 WHY THE DISK IMAGE IS ON THE MEDIA. The kernel mounts virtio-blk or NVMe and
 nothing else, so a PC with only SATA comes up with no ``/mnt`` — a shell and no
@@ -55,6 +53,22 @@ SECTOR = 512
 ISO_SECTOR = 2048
 # The partition starts at 1 MiB: the conventional, firmware-friendly alignment.
 ESP_OFFSET = 1024 * 1024
+
+# ISO menu. The paths use `fslabel` DELIBERATELY: on an El Torito disc `boot()`
+# is "the partition holding this config file", which is the small FAT boot image,
+# not the ISO9660 volume where the kernel actually lives. Limine documents
+# `fslabel` as matching FAT volume labels *and ISO 9660 volume identifiers*, so
+# the disc is addressed by the volume id the writer put in the PVD. The second
+# entry is the USB-image layout (`boot():`), kept as a fallback.
+ISO_MENU = """timeout: 10
+verbose: yes
+serial: yes
+
+/pagh OS (ISO)
+    protocol: limine
+    kernel_path: boot():/pagh.elf
+    module_path: boot():/disk.img
+"""
 
 BOOT_MENU = """timeout: 5
 verbose: yes
@@ -122,6 +136,71 @@ def fat_partition(dest: pathlib.Path, payload: list[tuple[pathlib.Path, str]],
         run([mcopy, "-i", spec, "-o", str(src), f"::{guest}"], f"mcopy {guest}")
 
 
+def build_iso_from(dest: str, loader: pathlib.Path, kernel: pathlib.Path,
+                   diskimg: pathlib.Path) -> None:
+    """Assemble the EFI boot image and hand it to the ISO9660 writer.
+
+    The split matters: the boot image is what firmware mounts and runs
+    `EFI/BOOT/BOOTX64.EFI` from, and it must stay under 32 MiB because the El
+    Torito sector count is 16 bits. The kernel (21 MiB) and the disk image
+    (64 MiB) therefore live on the ISO9660 volume, where Limine reads them.
+    """
+    import tempfile
+
+    import iso9660
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = pathlib.Path(tmp)
+        conf = tmpdir / "limine.conf"
+        conf.write_text(ISO_MENU, encoding="utf-8")
+        boot_img = tmpdir / "efiboot.img"
+        # THE KERNEL MUST BE IN HERE. Firmware hands the bootloader only the El
+        # Torito *boot image* as a partition (an "HD(1,...)" child of the CD
+        # device); the ISO9660 volume is a separate device Limine does not
+        # necessarily see, so `boot():/pagh.elf` resolves on the FAT image and
+        # nowhere else. A 1.44 MB floppy could not hold a 21 MiB kernel, hence
+        # FAT16 in a 30 MiB image: still inside the 0xFFFF-sector (32 MiB) limit
+        # the El Torito entry can describe, and big enough for loader + kernel.
+        payload = kernel.stat().st_size + diskimg.stat().st_size
+        boot_mb = max(2, (payload + (1 << 20) - 1) >> 20)
+        if boot_mb * 1024 * 1024 // 512 > 0xFFFF:
+            fail(f"the ISO boot image would be {boot_mb} MiB, but an El Torito "
+                 f"entry can describe at most 32 MiB: pass a smaller --disk image "
+                 f"(the kernel alone is {kernel.stat().st_size >> 20} MiB)")
+        with open(boot_img, "wb") as fh:
+            fh.truncate(boot_mb * 1024 * 1024)
+        run([shutil.which("mformat") or "mformat", "-i", str(boot_img), "-v",
+             "EFIBOOT", "::"], "mformat efiboot")
+        mmd_bin = shutil.which("mmd") or "mmd"
+        mcopy_bin = shutil.which("mcopy") or "mcopy"
+        run([mmd_bin, "-i", str(boot_img), "::/EFI"], "mmd ::/EFI")
+        run([mmd_bin, "-i", str(boot_img), "::/EFI/BOOT"], "mmd ::/EFI/BOOT")
+        run([mcopy_bin, "-i", str(boot_img), "-o", str(loader), "::/EFI/BOOT/BOOTX64.EFI"],
+            "mcopy BOOTX64.EFI")
+        # The config goes next to the EFI binary as well as at the volume root:
+        # a UEFI Limine looks for `limine.conf` beside BOOTX64.EFI first, and a
+        # disc whose only config is at /limine.conf boots into an empty menu.
+        run([mcopy_bin, "-i", str(boot_img), "-o", str(conf), "::/limine.conf"],
+            "mcopy limine.conf")
+        run([mcopy_bin, "-i", str(boot_img), "-o", str(conf), "::/EFI/BOOT/limine.conf"],
+            "mcopy EFI/BOOT/limine.conf")
+        run([mcopy_bin, "-i", str(boot_img), "-o", str(kernel), "::/pagh.elf"],
+            "mcopy pagh.elf")
+        run([mcopy_bin, "-i", str(boot_img), "-o", str(diskimg), "::/disk.img"],
+            "mcopy disk.img")
+        iso9660.build_iso(
+            pathlib.Path(dest),
+            boot_img,
+            [
+                (loader, "EFI/BOOT/BOOTX64.EFI"),
+                (conf, "limine.conf"),
+                (kernel, "pagh.elf"),
+                (diskimg, "disk.img"),
+            ],
+            volume_id="PAGH_OS",
+        )
+
+
 def run(argv: list[str], what: str) -> None:
     proc = subprocess.run(argv, capture_output=True, text=True)
     if proc.returncode != 0:
@@ -161,13 +240,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--usb", metavar="PATH", help="write a GPT+ESP USB image here")
+    ap.add_argument("--iso", metavar="PATH", help="write an El Torito UEFI ISO here")
     ap.add_argument("--disk", metavar="PATH", help="disk image to embed (default disk.img)")
     ap.add_argument("--elf", metavar="PATH", help="kernel ELF (default iso_root/pagh.elf)")
     ap.add_argument("--size-mb", type=int, default=0,
                     help="minimum USB image size (default: sized to the payload)")
     args = ap.parse_args()
-    if not args.usb:
-        ap.error("nothing to do: pass --usb PATH")
+    if not args.usb and not args.iso:
+        ap.error("nothing to do: pass --usb PATH and/or --iso PATH")
 
     kernel, diskimg, loader = resolve_inputs(args.elf, args.disk)
     log(f"kernel {kernel} ({kernel.stat().st_size // 1024} KiB)")
@@ -175,6 +255,8 @@ def main() -> int:
     log(f"loader {loader}")
     if args.usb:
         build_usb(pathlib.Path(args.usb), kernel, diskimg, loader, args.size_mb or 0)
+    if args.iso:
+        build_iso_from(args.iso, loader, kernel, diskimg)
     return 0
 
 
