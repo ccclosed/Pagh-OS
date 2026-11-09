@@ -612,6 +612,15 @@ impl FramebufferWriter {
         (self.col, self.row)
     }
 
+    /// Place the text cursor at cell `(col, row)`. Out-of-range values are
+    /// clamped to the usable text grid, so a caller handing the screen back
+    /// from the VT emulator can never park the console inside the status bar.
+    pub fn set_cursor(&mut self, col: usize, row: usize) {
+        let (cols, rows) = self.text_grid();
+        self.col = col.min(cols.saturating_sub(1));
+        self.row = row.min(rows.saturating_sub(1));
+    }
+
     /// Number of character columns on one text row, and the number of text rows
     /// the console may use (the status bar is excluded).
     pub fn text_grid(&self) -> (usize, usize) {
@@ -1057,6 +1066,32 @@ impl FbWriter {
         }
     }
 
+    /// The console's current foreground and background colours.
+    ///
+    /// The VT emulator draws its own cells, so it must start from the *current*
+    /// palette rather than its own idea of black-on-white: without this, the
+    /// first byte a compat process writes repaints the themed console in the
+    /// driver defaults (and a cleared VT area came out pure black over a themed
+    /// background). `(DEFAULT_FG, DEFAULT_BG)` before initialization.
+    pub fn colors(&self) -> (u32, u32) {
+        self.inner
+            .lock()
+            .as_ref()
+            .map(|w| (w.fg_color, w.bg_color))
+            .unwrap_or((DEFAULT_FG, DEFAULT_BG))
+    }
+
+    /// Move the text cursor to cell `(col, row)`, as if the console had printed
+    /// its way there. Used to hand the screen between the shell's console writer
+    /// and the VT emulator: both render into the same framebuffer, so their
+    /// cursors have to be kept in step or the next writer overwrites the other's
+    /// output (and every `lxrun` pushed the prompt one line further down).
+    pub fn set_cursor_cell(&self, col: usize, row: usize) {
+        if let Some(ref mut writer) = *self.inner.lock() {
+            writer.set_cursor(col, row);
+        }
+    }
+
     /// Makes the console paint glyphs only (see [`FramebufferWriter::opaque_bg`]).
     pub fn set_opaque_bg(&self, opaque: bool) {
         if let Some(ref mut writer) = *self.inner.lock() {
@@ -1296,6 +1331,22 @@ pub fn repaint_grid() {
 /// framebuffer never initialized.
 pub fn dimensions() -> (usize, usize) {
     FB_WRITER.dimensions()
+}
+
+/// The console's current foreground and background colours (see
+/// [`FbWriter::colors`]).
+pub fn colors() -> (u32, u32) {
+    FB_WRITER.colors()
+}
+
+/// The console's current text cursor cell, or `None` when serial-only.
+pub fn cursor_cell() -> Option<(usize, usize)> {
+    FB_WRITER.cursor_cell()
+}
+
+/// Place the console's text cursor at a cell (see [`FbWriter::set_cursor_cell`]).
+pub fn set_cursor_cell(col: usize, row: usize) {
+    FB_WRITER.set_cursor_cell(col, row);
 }
 
 /// Run `f` with exclusive raw access to the framebuffer. See

@@ -16,11 +16,12 @@ struct Cell {
     bg: u32,
 }
 impl Cell {
-    const BLANK: Self = Self {
-        ch: b' ',
-        fg: DEFAULT_FG,
-        bg: DEFAULT_BG,
-    };
+    /// A blank cell in the given palette. The VT draws its own cells, so
+    /// "blank" has to mean the *console's* current colours: a hard-coded black
+    /// blank repainted the themed screen black the moment the VT took over.
+    const fn blank(fg: u32, bg: u32) -> Self {
+        Self { ch: b' ', fg, bg }
+    }
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -38,6 +39,10 @@ enum Es {
 struct Vt {
     cols: usize,
     rows: usize,
+    /// Palette of a blank/erased cell (the console's colours when the VT was
+    /// created). Every `Cell::BLANK` use goes through [`Vt::blank`].
+    default_fg: u32,
+    default_bg: u32,
     cells: Vec<Cell>,
     cx: usize,
     cy: usize,
@@ -89,11 +94,13 @@ fn ansi256(n: u32) -> u32 {
 }
 
 impl Vt {
-    fn new(cols: usize, rows: usize) -> Self {
+    fn new(cols: usize, rows: usize, default_fg: u32, default_bg: u32) -> Self {
         Self {
             cols,
             rows,
-            cells: alloc::vec![Cell::BLANK; cols*rows],
+            default_fg,
+            default_bg,
+            cells: alloc::vec![Cell::blank(default_fg, default_bg); cols*rows],
             cx: 0,
             cy: 0,
             saved_cx: 0,
@@ -113,6 +120,10 @@ impl Vt {
     fn idx(&self, x: usize, y: usize) -> usize {
         y * self.cols + x
     }
+    /// A blank cell in this VT's palette (see [`Vt::default_fg`]).
+    const fn blank(&self) -> Cell {
+        Cell::blank(self.default_fg, self.default_bg)
+    }
     fn get(&self, x: usize, y: usize) -> Cell {
         self.cells[self.idx(x, y)]
     }
@@ -120,7 +131,7 @@ impl Vt {
         let i = self.idx(x, y);
         self.cells[i] = c;
         let px = x * CHAR_WIDTH;
-        let py = STATUS_BAR_HEIGHT + y * CHAR_HEIGHT;
+        let py = y * CHAR_HEIGHT;
         crate::drivers::framebuffer::with(|fb| {
             fb.draw_glyph_px(c.ch, px, py, c.fg, c.bg);
         });
@@ -130,7 +141,7 @@ impl Vt {
             for col in 0..self.cols {
                 let c = self.get(col, row);
                 let px = col * CHAR_WIDTH;
-                let py = STATUS_BAR_HEIGHT + row * CHAR_HEIGHT;
+                let py = row * CHAR_HEIGHT;
                 crate::drivers::framebuffer::with(|fb| {
                     fb.draw_glyph_px(c.ch, px, py, c.fg, c.bg);
                 });
@@ -160,7 +171,7 @@ impl Vt {
         for row in (bot + 1).saturating_sub(n)..=bot {
             for col in 0..self.cols {
                 let i = self.idx(col, row);
-                self.cells[i] = Cell::BLANK;
+                self.cells[i] = self.blank();
             }
         }
         self.paint_all();
@@ -181,7 +192,7 @@ impl Vt {
         for row in top..top + n {
             for col in 0..self.cols {
                 let i = self.idx(col, row);
-                self.cells[i] = Cell::BLANK;
+                self.cells[i] = self.blank();
             }
         }
         self.paint_all();
@@ -193,7 +204,7 @@ impl Vt {
             _ => (0, self.rows * self.cols),
         };
         for i in s..e.min(self.cells.len()) {
-            self.cells[i] = Cell::BLANK;
+            self.cells[i] = self.blank();
         }
         self.paint_all();
     }
@@ -204,7 +215,7 @@ impl Vt {
             _ => (0, self.cols),
         };
         for col in s..e {
-            self.put(col, self.cy, Cell::BLANK);
+            self.put(col, self.cy, self.blank());
         }
     }
     fn newline(&mut self) {
@@ -338,11 +349,12 @@ impl Vt {
             }
             b'P' => {
                 let n = (self.p(0, 1) as usize).min(self.cols - self.cx);
+                let blank = self.blank();
                 for col in self.cx..self.cols {
                     let c = if col + n < self.cols {
                         self.get(col + n, self.cy)
                     } else {
-                        Cell::BLANK
+                        blank
                     };
                     let i = self.idx(col, self.cy);
                     self.cells[i] = c;
@@ -362,7 +374,7 @@ impl Vt {
             b'X' => {
                 let n = (self.p(0, 1) as usize).min(self.cols - self.cx);
                 for col in self.cx..self.cx + n {
-                    self.put(col, self.cy, Cell::BLANK);
+                    self.put(col, self.cy, self.blank());
                 }
             }
             b'd' => {
@@ -448,7 +460,7 @@ impl Vt {
     fn blit(&self, x: usize, y: usize) {
         let c = self.get(x, y);
         let px = x * CHAR_WIDTH;
-        let py = STATUS_BAR_HEIGHT + y * CHAR_HEIGHT;
+        let py = y * CHAR_HEIGHT;
         crate::drivers::framebuffer::with(|fb| {
             fb.draw_glyph_px(c.ch, px, py, c.fg, c.bg);
         });
@@ -616,8 +628,29 @@ pub fn take_input_responses() -> Vec<u8> {
 
 static VT: Spinlock<Option<Vt>> = Spinlock::new(None);
 
-/// Initialise (or reinitialise) the VT emulator, clearing the screen area.
-pub fn init() {
+/// Make sure the VT emulator exists, without disturbing what is on screen.
+///
+/// COORDINATES. The VT and the console writer draw into the same framebuffer and
+/// MUST agree on the origin: text cell `(col, row)` is pixel (`col*CHAR_WIDTH`,
+/// `row*CHAR_HEIGHT`), and the reserved status-bar strip lives *below* the text
+/// rows — `FramebufferWriter::draw_char` starts at y=0 and `text_rows()` already
+/// excludes the strip. The VT used to add `STATUS_BAR_HEIGHT` to every row, so
+/// each line a compat process wrote landed one row below the cell the console
+/// considered current: the program's output overwrote the line after it, and
+/// the shell prompt that followed overwrote the program's output. That is what
+/// made the desktop look like it was drifting downwards.
+///
+/// WHY IDEMPOTENT AND NON-DESTRUCTIVE. This used to run on *every* `lxrun`,
+/// wipe the text area to pure black and repaint a fresh grid. That is not what
+/// a terminal does: on Linux, running a program neither clears the screen nor
+/// forgets the scrollback, and the visible effect here was a full black screen
+/// on start-up followed by the shell prompt drifting further down the display
+/// with each run (the console's own cursor was never told the screen had been
+/// reset). The VT grid starts blank in the console's *current* colours and is
+/// written where the console cursor already is, so a command's output continues
+/// the session exactly like a real terminal. A program that wants a clean
+/// screen still gets one: it emits `ESC[2J`, which [`Vt::erase_disp`] honours.
+pub fn ensure() {
     let (fbw, fbh) = crate::drivers::framebuffer::dimensions();
     if fbw == 0 || fbh == 0 {
         return;
@@ -627,18 +660,49 @@ pub fn init() {
     if cols == 0 || rows == 0 {
         return;
     }
-    crate::drivers::framebuffer::with(|fb| {
-        fb.fill_rect(
-            0,
-            STATUS_BAR_HEIGHT,
-            fbw,
-            fbh - STATUS_BAR_HEIGHT,
-            DEFAULT_BG,
-        );
-    });
-    let mut vt = Vt::new(cols, rows);
-    vt.paint_all();
-    *VT.lock() = Some(vt);
+    let (fg, bg) = crate::drivers::framebuffer::colors();
+    let mut g = VT.lock();
+    if g.is_none() {
+        *g = Some(Vt::new(cols, rows, fg, bg));
+        return;
+    }
+    // Already live: follow a theme change (the old grid keeps the colours it
+    // was created with, which would make erased cells look like a foreign
+    // palette on a themed console).
+    if let Some(vt) = g.as_mut() {
+        vt.default_fg = fg;
+        vt.default_bg = bg;
+    }
+}
+
+/// Align the VT's cursor with the console's, so the next byte a compat process
+/// writes lands where the shell's prompt left off instead of on top of it.
+///
+/// Called after the shell has finished printing a job's start-up line and before
+/// the job runs.
+pub fn cursor_from_console() {
+    let Some((col, row)) = crate::drivers::framebuffer::cursor_cell() else {
+        return;
+    };
+    let mut g = VT.lock();
+    if let Some(vt) = g.as_mut() {
+        // The console's row counts from the top of the text area, like the VT's.
+        vt.cx = col.min(vt.cols.saturating_sub(1));
+        vt.cy = row.min(vt.rows.saturating_sub(1));
+    }
+}
+
+/// Hand the console cursor back at the VT's current cell, so the shell's next
+/// line starts *below* whatever the job printed rather than over it.
+pub fn cursor_to_console() {
+    let (col, row) = {
+        let g = VT.lock();
+        match g.as_ref() {
+            Some(vt) => (vt.cx, vt.cy),
+            None => return,
+        }
+    };
+    crate::drivers::framebuffer::set_cursor_cell(col, row);
 }
 
 /// Returns (cols, rows) of the active VT, or fallback (80,25).

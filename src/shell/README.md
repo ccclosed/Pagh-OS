@@ -114,10 +114,13 @@ warn-логов).
 (`drivers::tty`, чистые правила — `linux::tty`, хост-свойство `tty_job`).
 
 1. `lxrun` (и команды, которые его переиспользуют) спавнит процесс и **в той же
-   `without_interrupts`-секции** помечает его JOB'ом (`compat::mark_tty_job`) и
-   отдаёт ему терминал (`tty::set_foreground_pgid(child_pgid)`). Один критический
-   участок — чтобы у только что созданного процесса не было окна, в котором он
-   «фоновый» и получает `SIGTTIN` на первом же чтении.
+   `without_interrupts`-секции** помечает его JOB'ом (`compat::mark_tty_job`),
+   отдаёт ему терминал (`tty::set_foreground_pgid(child_pgid)`), печатает строку
+   `lxrun: started …` и выравнивает курсор VT по курсору консоли
+   (`vt::cursor_from_console`). Один критический участок на всё: дочерний процесс
+   становится runnable сразу по возврате interrupts, поэтому и «фоновое окно»
+   (`SIGTTIN` на первом чтении), и гонка «первый вывод программы против строки
+   шелла» закрываются только так.
 2. `foreground_wait(pid, pgid, command)` ждёт, опрашивая защёлки ^C/^Z:
    - ^C → `SIGINT` **foreground-группе** (`signal::send_signal_to_pgid_all`), а не
      записанному pid; для не-raw процесса fallback — `scheduler::request_exit`;

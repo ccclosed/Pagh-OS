@@ -1360,23 +1360,36 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
         // \"failed to open $NVIM_LOG_FILE\" stderr spam by pointing it at /dev/null.
         b"NVIM_LOG_FILE=/dev/null",
     ];
-    // Spawn AND hand the terminal to the child inside ONE `without_interrupts`
-    // section. The child becomes runnable the instant interrupts come back, so
-    // marking it as a job / setting the foreground pgid afterwards would leave a
-    // window in which the new process is "background" relative to the shell: a
-    // read it issues in that window would be refused, and a write stopped.
+    // Spawn AND publish the child's terminal state inside ONE
+    // `without_interrupts` section. The child becomes runnable the instant
+    // interrupts come back, so anything the shell does afterwards races it:
+    //   * marking it as a job / setting the foreground pgid late would leave a
+    //     window in which the new process is "background" relative to the shell
+    //     — a read it issues there would be refused and a write stopped;
+    //   * printing the banner and aligning the VT cursor late let a quick
+    //     program write its first line at the PREVIOUS job's cursor position,
+    //     so its output landed on the shell's own prompt line.
+    // Both are fixed by doing the whole hand-over before the child can execute.
+    // Console output here is safe with interrupts masked: it takes the
+    // framebuffer/serial locks, neither of which is taken twice, and neither
+    // blocks.
     let result = crate::arch::cpu::without_interrupts(|| {
         let r = crate::task::process::run_linux_binary(&path, &argv, &env);
         if let Ok(pid) = r {
             let child_pgid = crate::task::compat::pgid_of(pid).unwrap_or(pid);
             crate::task::compat::mark_tty_job(pid);
             crate::drivers::tty::set_foreground_pgid(child_pgid);
+            // The job's output goes through the VT, the shell's through the text
+            // console: both draw into the same framebuffer, so hand the VT the
+            // cell the console has reached. Without this the program's first
+            // line lands on top of the "lxrun: started" line above it.
+            shell_println(&alloc::format!("lxrun: started Compat_Process pid {}", pid));
+            crate::drivers::vt::cursor_from_console();
         }
         r
     });
     match result {
         Ok(pid) => {
-            shell_println(&alloc::format!("lxrun: started Compat_Process pid {}", pid));
             // Foreground wait: the process owns the keyboard now
             // (its stdin reads the PS/2 stream directly), so resuming the
             // prompt immediately would make the shell steal every keystroke.
