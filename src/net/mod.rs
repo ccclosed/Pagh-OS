@@ -432,20 +432,38 @@ pub fn tcp_connect_buffered(
     let mut guard = NET.lock();
     let state = guard.as_mut().ok_or(NetError::NoDevice)?;
     let port = ephemeral_port_locked(state);
-    state
+    let r = state
         .tcp
         .connect(remote, port, rx_bytes, tx_bytes)
-        .map_err(|_| NetError::DeviceInit)
+        .map_err(|_| NetError::DeviceInit);
+    crate::debug!(
+        "[TCP] connect remote={}:{} local_port={} -> {:?}",
+        remote.addr,
+        remote.port,
+        port,
+        r
+    );
+    r
 }
 
-/// Is the TCP connection fully established?
+/// Has the TCP handshake completed?
+///
+/// This deliberately asks "did the connection ever reach ESTABLISHED", not "is
+/// it in ESTABLISHED right now". A peer that sends its data and its FIN in the
+/// same burst (a one-shot server replying and closing — exactly what the
+/// clipboard bridge and any `curl`-style request/response peer does) drives the
+/// socket from SYN-SENT straight through ESTABLISHED into CLOSE-WAIT inside a
+/// single poll pass. Comparing `state == Established` missed that window
+/// entirely: `connect(2)` then spun out its whole timeout and failed with
+/// ETIMEDOUT even though the peer had already answered — the data sitting in
+/// the receive buffer was thrown away with the socket.
 pub fn tcp_established(handle: SocketHandle) -> bool {
     let mut g = NET.lock();
     let Some(s) = g.as_mut() else { return false };
     s.step();
     s.tcp
         .get(handle)
-        .map(|k| k.state() == tcp::State::Established)
+        .map(|k| k.ever_established())
         .unwrap_or(false)
 }
 
@@ -766,7 +784,13 @@ pub fn nc_echo(remote: IpEndpoint, payload: &[u8]) -> NcResult {
                     }
                 }
                 Some(sock) => {
-                    if sock.state() == tcp::State::Established {
+                    // `ever_established`, not `state == Established`: a peer that
+                    // answers and closes in one burst moves the socket through
+                    // ESTABLISHED into CLOSE-WAIT inside a single poll pass, and
+                    // the equality test then never fires — the payload was never
+                    // sent and `nc` reported a failure against a server that had
+                    // already replied. Same trap as `tcp_established`.
+                    if sock.ever_established() {
                         established = true;
                     }
                 }

@@ -182,25 +182,34 @@ pub fn sys_connect_tcp(fd: u64, addr: u64, len: u64) -> Result<u64, Errno> {
         return Err(Errno::EINPROGRESS);
     }
 
-    // Blocking: bounded wait (~5 s at the current tick rate), yielding to the
-    // scheduler while the net thread drives the stack.
-    let mut waited: u32 = 0;
+    // Blocking: bounded wait, driven by the wall clock rather than a yield
+    // count. `ticks()` is LAPIC ticks at TICK_HZ (1000), so the deadline is
+    // real elapsed time: counting loop iterations measured scheduling pressure,
+    // not seconds, and a busy machine could fail a connect that was still
+    // progressing.
+    const CONNECT_TIMEOUT_MS: u64 = 5_000;
+    // How long a refused/unreachable peer may keep the caller waiting before
+    // the connect reports ECONNREFUSED (Linux reports it immediately, but the
+    // RST can arrive after several lost SYNs).
+    const CONNECT_REFUSED_MS: u64 = 200;
+    let deadline = crate::task::scheduler::ticks() + CONNECT_TIMEOUT_MS;
+    let refused_at = crate::task::scheduler::ticks() + CONNECT_REFUSED_MS;
     loop {
         if net::tcp_established(handle) {
             sock.connected.store(true, Ordering::Relaxed);
             sock.so_error.store(0, Ordering::Relaxed);
             return Ok(0);
         }
-        if net::tcp_dead_before_established(handle) && waited > 50 {
+        let now = crate::task::scheduler::ticks();
+        if now >= refused_at && net::tcp_dead_before_established(handle) {
             sock.so_error.store(111, Ordering::Relaxed); // ECONNREFUSED
             return Err(Errno::ECONNREFUSED);
         }
-        if waited >= 5000 {
+        if now >= deadline {
             sock.so_error.store(110, Ordering::Relaxed); // ETIMEDOUT
             return Err(Errno::ETIMEDOUT);
         }
         crate::task::scheduler::yield_current();
-        waited += 1;
     }
 }
 

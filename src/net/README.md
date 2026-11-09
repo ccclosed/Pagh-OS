@@ -35,6 +35,14 @@ net-поток или bounded locked-step помпы); из IRQ-контекст
 - `init() -> Result<(), NetError>` — PCI enumerate + attach e1000 + неконфигурированный `Stack`;
   без NIC — `Err(NoDevice)`, boot продолжается.
 - `poll()`, `net_thread()` (спавнится из `boot.rs`), `Stack::step()`, `Stack::input_frame()`.
+- **«Установилось» = рукопожатие состоялось, а не `state == Established`.** Пир,
+  который отвечает и закрывается одним залпом (HTTP/1.0 `Connection: close`,
+  одноразовый сервер), прогоняет сокет `SYN-SENT → ESTABLISHED → CLOSE-WAIT`
+  внутри ОДНОГО прохода poll: равенство `state == Established` этот момент не
+  ловит никогда, и `connect(2)` уходил в таймаут, выбрасывая уже пришедший ответ.
+  Спрашивайте `TcpSock::ever_established()` — так делают `tcp_established`,
+  `nc_echo` и определение «мертв до установления»; `state == Established` остался
+  только в TLS, где полузакрытый сокет действительно не годится для ClientHello.
 - TCP: `tcp_connect / tcp_connect_buffered / tcp_established / tcp_send_chunk / tcp_recv_chunk /
   tcp_rx_at_eof / tcp_close`.
 - UDP: `udp_open / udp_sendto / udp_recvfrom / udp_remove`; эфемерные порты 49152..=65535.

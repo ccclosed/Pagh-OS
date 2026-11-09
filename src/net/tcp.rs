@@ -650,6 +650,15 @@ impl TcpTable {
                 })
                 .map(|i| (i, true)),
         };
+        crate::debug!(
+            "[TCP] rx {}:{} -> :{} flags=0x{:x} exact={:?} match={:?}",
+            src_ip,
+            hdr.src_port,
+            dst_port,
+            hdr.flags,
+            exact,
+            target.map(|(i, l)| (i, l))
+        );
 
         match target {
             None => {
@@ -903,6 +912,14 @@ fn connected_input(
 }
 
 fn synsent_input(st: &mut Stack, h: usize, hdr: &wire::TcpHeader, body: &[u8], now: u64) {
+    crate::debug!(
+        "[TCP] synsent h={} flags=0x{:x} seq=0x{:08x} ack=0x{:08x} iss+1=0x{:08x}",
+        h,
+        hdr.flags,
+        hdr.seq,
+        hdr.ack,
+        st.tcp.get(h).map(|s| s.iss.wrapping_add(1)).unwrap_or(0)
+    );
     if hdr.flags & wire::TCP_SYN != 0 && hdr.flags & wire::TCP_ACK != 0 {
         let s = st.tcp.get_mut(h).unwrap();
         if hdr.ack != s.iss.wrapping_add(1) {
@@ -1313,6 +1330,14 @@ fn step_sock(st: &mut Stack, h: usize, now: u64) {
                     (s.iss, ack_no, flags, s.rcv_scale)
                 };
                 let opts = ctrl_options(scale);
+                crate::debug!(
+                    "[TCP] emit SYN h={} seq=0x{:08x} flags=0x{:x} local_port={} remote={}",
+                    h,
+                    seq,
+                    flags,
+                    st.tcp.get(h).map(|s| s.local_port).unwrap_or(0),
+                    st.tcp.get(h).map(|s| s.remote).map(|r| r.port).unwrap_or(0)
+                );
                 emit(st, h, seq, ack_no, flags, &opts, &[]);
                 let s = st.tcp.get_mut(h).unwrap();
                 s.ctrl_needs_send = false;
