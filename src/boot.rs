@@ -59,6 +59,7 @@ pub fn start() -> ! {
     init_drivers();
     init_virtio();
     init_scheduler();
+    init_usb();
     init_vfs();
     init_ramdisk();
     init_fs();
@@ -208,6 +209,22 @@ fn init_vfs() {
     vfs::init();
     debug!("vfs::init() returned");
     info!("vfs");
+}
+
+/// Step 11.35: bring up a USB host controller, if the machine has one.
+///
+/// Runs after the PCI walk (which the virtio step already did) and before the
+/// filesystem, because a USB keyboard is an INPUT device: the sooner it is
+/// alive, the sooner a machine without PS/2 can be typed into. Failure is not
+/// fatal — no controller, or one that will not start, leaves the PS/2 path (and
+/// whatever the firmware translates into it) as the only input.
+fn init_usb() {
+    let devices = crate::drivers::pci::enumerate();
+    if crate::drivers::xhci::init(&devices) {
+        info!("xhci");
+    } else {
+        debug!("usb: no xHCI controller");
+    }
 }
 
 /// Step 11.4: register a boot-loaded disk image as a RAM disk.
@@ -534,6 +551,12 @@ fn kernel_main() -> ! {
     // relies on the periodic poll. If no NIC was attached, `net::poll` is a
     // cheap no-op, so spawning unconditionally is harmless.
     task::scheduler::kernel_thread_spawn_named(net::net_thread, "net");
+
+    // USB poll thread: enumerates newly attached devices and collects HID
+    // reports. Spawned unconditionally — with no controller `xhci::poll` is a
+    // no-op, and gating it would need a second source of truth about the
+    // hardware that the controller itself already provides.
+    task::scheduler::kernel_thread_spawn_named(crate::drivers::xhci::usb_thread, "usb");
     debug!("Net thread spawned");
 
     // Spawn the embedded ring-3 test user process (Requirements 13.1 / 13.4).

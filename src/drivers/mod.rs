@@ -12,8 +12,10 @@ pub mod ps2_kbd;
 pub mod ps2_mouse;
 pub mod serial;
 pub mod tty;
+pub mod usb_hid;
 pub mod virtio;
 pub mod vt;
+pub mod xhci;
 
 use crate::sync::spinlock::Spinlock;
 use alloc::collections::BTreeMap;

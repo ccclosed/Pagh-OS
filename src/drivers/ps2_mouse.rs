@@ -181,7 +181,48 @@ pub fn init(screen_w: usize, screen_h: usize) -> bool {
 pub fn irq_handler() {
     // SAFETY: standard PS/2 data-port read in IRQ context.
     let byte: u8 = unsafe { Port::<u8>::new(DATA_PORT).read() };
+    decode_byte(byte);
+}
 
+/// Inject a complete PS/2-format packet from another pointing device (USB HID).
+///
+/// The USB boot mouse report is `[buttons, dx, dy]` — the same information the
+/// 8042 aux stream carries — so it is converted by the caller into this packet
+/// shape and fed through the same decoder, which keeps cursor clamping, button
+/// state and `seq` semantics identical for both sources.
+pub fn inject_packet(packet: [u8; 3]) {
+    let mut m = MOUSE.lock();
+    m.packet = packet;
+    m.index = 3;
+    decode_packet(&mut m);
+}
+
+fn decode_packet(m: &mut MouseInner) {
+    // Unchanged from the PS/2 path: this is the body of the old IRQ handler.
+    let flags = m.packet[0];
+    if flags & 0xC0 != 0 {
+        return;
+    }
+    let mut dx = m.packet[1] as i32;
+    let mut dy = m.packet[2] as i32;
+    if flags & 0x10 != 0 {
+        dx -= 256;
+    }
+    if flags & 0x20 != 0 {
+        dy -= 256;
+    }
+    let max_x = m.max_x;
+    let max_y = m.max_y;
+    m.x = (m.x + dx).clamp(0, max_x);
+    m.y = (m.y - dy).clamp(0, max_y);
+    m.left = flags & 0x01 != 0;
+    m.right = flags & 0x02 != 0;
+    m.middle = flags & 0x04 != 0;
+    m.seq = m.seq.wrapping_add(1);
+}
+
+/// Feed one byte of the PS/2 aux stream through the assembler.
+fn decode_byte(byte: u8) {
     let mut m = MOUSE.lock();
 
     // Resync: the first byte of a packet always has bit 3 set. If we are at
@@ -198,31 +239,5 @@ pub fn irq_handler() {
         return;
     }
     m.index = 0;
-
-    let flags = m.packet[0];
-    // Discard packets reporting overflow — their deltas are meaningless.
-    if flags & 0xC0 != 0 {
-        return;
-    }
-
-    // Sign-extend the 9-bit relative movement deltas.
-    let mut dx = m.packet[1] as i32;
-    let mut dy = m.packet[2] as i32;
-    if flags & 0x10 != 0 {
-        dx -= 256;
-    }
-    if flags & 0x20 != 0 {
-        dy -= 256;
-    }
-
-    // Screen Y grows downward; mouse Y grows upward, so subtract dy.
-    let max_x = m.max_x;
-    let max_y = m.max_y;
-    m.x = (m.x + dx).clamp(0, max_x);
-    m.y = (m.y - dy).clamp(0, max_y);
-
-    m.left = flags & 0x01 != 0;
-    m.right = flags & 0x02 != 0;
-    m.middle = flags & 0x04 != 0;
-    m.seq = m.seq.wrapping_add(1);
+    decode_packet(&mut m);
 }

@@ -1646,6 +1646,57 @@ fn cmd_apt_setmirror(args: &[&str]) {
 /// `devtmpfs`, `proc`) have no capacity accounting, so their numeric columns
 /// are `-` rather than a made-up zero. `ext2` reports real counts through
 /// `VfsNode::fs_stat`.
+/// `usb`: the xHCI controller's live state, and what is on each port.
+///
+/// On a real machine this is the first thing to look at when a USB keyboard does
+/// nothing: a port reading `ccs=false` with a device plugged in means the
+/// controller never saw it (cable, port, or the device), while `ccs=true` with no
+/// `HID device on port N` line in the log means enumeration (the steps in
+/// `drivers::xhci`) did not get through.
+pub(super) fn cmd_usb(_ctx: &mut ShellCtx, _args: &[&str]) {
+    let (present, ports, reports) = crate::drivers::xhci::status();
+    let (kb_reports, _, unmapped) = crate::drivers::usb_hid::stats();
+    if !present {
+        shell_println("usb: no xHCI controller");
+        shell_println("usb: the kernel drives xHCI only; a PS/2 keyboard needs no driver");
+        return;
+    }
+    shell_println(&alloc::format!(
+        "usb: xHCI up, {} ports, {} report(s), {} key report(s), {} unmapped usage(s)",
+        ports,
+        reports,
+        kb_reports,
+        unmapped
+    ));
+    shell_println("  PORT  PORTSC      CONNECT  ENABLED  POWER  SPEED  LINK");
+    for (port, sc) in crate::drivers::xhci::port_status() {
+        let (ccs, ped, pp, speed, pls) = crate::drivers::xhci::decode_portsc(sc);
+        let speed_text = match speed {
+            1 => "full",
+            2 => "low",
+            3 => "high",
+            4 => "super",
+            _ => "-",
+        };
+        shell_println(&alloc::format!(
+            "  {:>4}  {:#010x}  {:>7}  {:>7}  {:>5}  {:>5}  {}",
+            port,
+            sc,
+            ccs,
+            ped,
+            pp,
+            speed_text,
+            match pls {
+                0 => "U0",
+                3 => "U3",
+                5 => "RxDetect",
+                _ => "poll",
+            }
+        ));
+    }
+    shell_println("usb: a keyboard shows as `ccs=true` on its port, then `HID device on port N`");
+}
+
 /// `disk`: block devices, and the deliberate path to a formatted `/mnt`.
 ///
 /// The interactive wizard lives in [`crate::shell::disk`]; this is the thin

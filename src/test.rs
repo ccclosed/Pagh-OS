@@ -6445,6 +6445,150 @@ mod security_tests {
     }
 }
 
+/// USB HID boot-protocol translation (see `drivers::usb_hid`).
+///
+/// WHY A KERNEL TEST AND NOT A HOST PROPERTY: the translation's whole job is to
+/// push scancodes into the PS/2 ring, and that ring is behind a hardware driver
+/// (`drivers::ps2_kbd`) that cannot be `#[path]`-included on the host. Feeding a
+/// report and reading the ring back is therefore only possible in-QEMU — and it
+/// is the one part of the USB path that CAN be tested without a USB device, since
+/// the translation itself is pure apart from the ring it writes to.
+///
+/// The routine drains the ring before and after itself, so a key pressed by
+/// whoever is at the keyboard during a `selftest` run cannot make it flaky.
+mod usb_hid_tests {
+    use crate::drivers::{ps2_kbd, usb_hid};
+
+    /// Drain whatever is queued, so the routine starts from a known state.
+    fn drain() {
+        let mut guard = 0;
+        while ps2_kbd::take_scancode().is_some() && guard < 1024 {
+            guard += 1;
+        }
+    }
+
+    /// Release every key and drain the result.
+    ///
+    /// MANDATORY at the start and end of each routine: the translator's state is
+    /// "which keys are held", so a routine that leaves a key down makes the NEXT
+    /// one see a break code it did not expect. (That is exactly how the rollover
+    /// routine first failed — a real bug report against the wrong module.)
+    fn release_all() {
+        usb_hid::feed(&[0, 0, 0, 0, 0, 0, 0, 0], 1);
+        drain();
+    }
+
+    fn collect() -> alloc::vec::Vec<u8> {
+        let mut out = alloc::vec::Vec::new();
+        while let Some(b) = ps2_kbd::take_scancode() {
+            out.push(b);
+            if out.len() > 64 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// `a` down, `a` up: one make and one break code, in that order.
+    pub fn key_make_break() {
+        release_all();
+        // Boot keyboard report: modifiers, reserved, then up to six usages.
+        usb_hid::feed(&[0, 0, 0x04, 0, 0, 0, 0, 0], 1);
+        let down = collect();
+        assert_kernel!(
+            down == alloc::vec![0x1E],
+            "HID 'a' down must translate to PS/2 0x1E"
+        );
+        usb_hid::feed(&[0, 0, 0, 0, 0, 0, 0, 0], 1);
+        let up = collect();
+        assert_kernel!(
+            up == alloc::vec![0x9E],
+            "HID 'a' release must translate to the break code 0x9E"
+        );
+        drain();
+    }
+
+    /// Ctrl+C: the modifier goes down first, so `^C` still reaches a program.
+    pub fn ctrl_c_order() {
+        release_all();
+        // Left Ctrl (bit 0) held with 'c' (usage 0x06) pressed in the same report.
+        usb_hid::feed(&[0x01, 0, 0x06, 0, 0, 0, 0, 0], 1);
+        let seq = collect();
+        assert_kernel!(
+            seq == alloc::vec![0x1D, 0x2E],
+            "Ctrl+C must emit the modifier make before the key make"
+        );
+        usb_hid::feed(&[0, 0, 0, 0, 0, 0, 0, 0], 1);
+        let released = collect();
+        assert_kernel!(
+            released == alloc::vec![0x1D | 0x80, 0x2E | 0x80],
+            "releasing Ctrl+C must emit both break codes"
+        );
+        release_all();
+    }
+
+    /// An arrow key is an extended key: it must carry the 0xE0 prefix, or the
+    /// shell's decoder reads it as an unrelated character.
+    pub fn extended_keys_carry_e0() {
+        release_all();
+        usb_hid::feed(&[0, 0, 0x52, 0, 0, 0, 0, 0], 1); // Up arrow
+        let seq = collect();
+        assert_kernel!(
+            seq == alloc::vec![0xE0, 0x48],
+            "the Up arrow must arrive as E0 48"
+        );
+        release_all();
+    }
+
+    /// A held key is not re-sent: the report is a snapshot, and repeating the
+    /// make code would make the shell see auto-repeat as separate keypresses.
+    pub fn held_key_is_not_repeated() {
+        release_all();
+        usb_hid::feed(&[0, 0, 0x04, 0, 0, 0, 0, 0], 1);
+        let _ = collect();
+        usb_hid::feed(&[0, 0, 0x04, 0, 0, 0, 0, 0], 1);
+        let again = collect();
+        assert_kernel!(
+            again.is_empty(),
+            "the same held key must not produce a second make code"
+        );
+        release_all();
+    }
+
+    /// ErrorRollOver (usage 1) is not a key, and an unmapped usage must be
+    /// dropped without emitting a wrong character.
+    pub fn rollover_and_unknown_usage() {
+        release_all();
+        usb_hid::feed(&[0, 0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01], 1);
+        let rollover = collect();
+        assert_kernel!(
+            rollover.is_empty(),
+            "ErrorRollOver must not produce scancodes"
+        );
+        usb_hid::feed(&[0, 0, 0xF0, 0, 0, 0, 0, 0], 1); // vendor-defined usage
+        let unknown = collect();
+        assert_kernel!(
+            unknown.is_empty(),
+            "an unmapped HID usage must not emit a scancode"
+        );
+        release_all();
+    }
+
+    /// A mouse report moves the cursor through the PS/2 path: buttons and
+    /// deltas reach the same state `poll()` exposes.
+    pub fn mouse_report_moves_cursor() {
+        let before = crate::drivers::ps2_mouse::poll();
+        // Buttons bit 0 (left), dx = +4, dy = +2 (screen Y grows downward).
+        usb_hid::feed(&[0x01, 0x04, 0x02], 2);
+        let after = crate::drivers::ps2_mouse::poll();
+        assert_kernel!(
+            after.seq == before.seq + 1,
+            "a HID mouse report must go through the PS/2 packet assembler"
+        );
+        assert_kernel!(after.left, "the left button must be reported as held");
+    }
+}
+
 pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
     alloc::vec![
         (
@@ -6731,6 +6875,24 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "security::get/set*id syscall round-trip",
             security_tests::syscall_cred_roundtrip
+        ),
+        ("usb: HID key make/break", usb_hid_tests::key_make_break),
+        ("usb: HID Ctrl+C ordering", usb_hid_tests::ctrl_c_order),
+        (
+            "usb: HID extended keys (E0 prefix)",
+            usb_hid_tests::extended_keys_carry_e0
+        ),
+        (
+            "usb: HID held key is not repeated",
+            usb_hid_tests::held_key_is_not_repeated
+        ),
+        (
+            "usb: HID rollover and unknown usages",
+            usb_hid_tests::rollover_and_unknown_usage
+        ),
+        (
+            "usb: HID mouse report reaches the cursor",
+            usb_hid_tests::mouse_report_moves_cursor
         ),
     ]
 }

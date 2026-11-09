@@ -74,6 +74,32 @@ pub fn init() {
     crate::debug!("[PS2KBD] Keyboard driver initialized (IRQ1 not wired)");
 }
 
+/// Take one scancode out of the ring, if any is queued.
+///
+/// The shell reads the ring through its own decoder; this is the same operation
+/// for any other kernel consumer (the in-QEMU selftest drives the HID translator
+/// and reads back what it produced, which is the only way to test that path
+/// without a human at the keyboard).
+pub fn take_scancode() -> Option<u8> {
+    KEYBOARD.lock().as_ref().and_then(|kbd| kbd.read_char())
+}
+
+/// Inject a scancode from another keyboard source (USB HID), exactly as if the
+/// 8042 had delivered it.
+///
+/// The whole point of feeding THIS ring rather than a second queue: every
+/// consumer — the shell's decoder, the `^C`/`^Z` latches, a compat process's
+/// stdin — already reads here, so a USB keyboard needs no changes downstream.
+/// The modifier tracking the driver does for `^C` is deliberately NOT duplicated
+/// here: it runs in `irq_handler`, and duplicating it would double-count a
+/// Ctrl press that arrived on both paths (firmware PS/2 translation plus a real
+/// USB device) and latch `^C` without a keypress.
+pub fn inject_scancode(byte: u8) {
+    if let Some(kbd) = KEYBOARD.lock().as_ref() {
+        kbd.push_scancode(byte);
+    }
+}
+
 /// Whether at least one scancode is currently queued (non-destructive).
 ///
 /// The shell's REPL wakes on every timer tick; this is how it tells a real

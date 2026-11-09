@@ -145,6 +145,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_pci,
     },
     CommandSpec {
+        name: "usb",
+        description: "xHCI controller state and per-port status",
+        usage: "usb",
+        handler: super::commands::cmd_usb,
+    },
+    CommandSpec {
         name: "disk",
         description: "List block devices; format one as ext2 and mount it at /mnt",
         usage: "disk [list|setup|mount <n>|format <n> [--force]|cancel]",
