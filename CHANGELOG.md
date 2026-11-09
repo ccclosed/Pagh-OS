@@ -1,12 +1,33 @@
 # Changelog
 
-## 2.16.0 — unreleased
+## 2.16.0 — 2026-11-09
 
-- `signalfd` (282) / `signalfd4` (289): a readable fd over the caller's pending
-  signals; `read` consumes one matching pending signal and returns a 128-byte
-  `signalfd_siginfo` with `ssi_signo` (only the signal number is stored, other
-  fields are zero). Poll/select/epoll report `POLLIN` when readable. Updating an
-  existing signalfd replaces its mask; `SFD_NONBLOCK`/`SFD_CLOEXEC` accepted.
+Batch release: Linux compat, procfs slice 5, job control and the NVMe rewrite.
+
+### Linux compat
+- `signalfd`/`signalfd4`: readable fd over pending signals, `POLLIN` in poll/select/epoll.
+- Real process groups: `pgid` in `CompatState`, `setpgid`/`getpgid`/`getpgrp`/`setsid`, group `kill`.
+- `memfd_create`, `timerfd_create/settime/gettime` (read/poll/epoll integrated).
+- Broad syscall batches: `*at` family, `sendfile`, `copy_file_range`, legacy/advisory
+  calls, `setrlimit`/`getrusage`/`times`.
+
+### Job control
+- Ctrl+Z stops the foreground process group (SIGTSTP); shell job table with
+  `jobs`/`fg`/`bg` and SIGCONT resume.
+- Kernel controlling-terminal foreground pgid, `TIOCGPGRP`/`TIOCSPGRP`,
+  SIGTTIN/SIGTTOU on background tty I/O; `lxrun` hands the terminal to the job
+  and restores it.
+
+### procfs slice 5
+- `/proc/<pid>/fdinfo/<n>` (real `pos`/`flags`/`mnt_id`/`ino`) and
+  `/proc/<pid>/limits` (16 Linux rlimit rows), plus `self` variants.
+
+### NVMe
+- Multi-page PRP lists, up to 64 KiB per command, four commands in flight,
+  completion reaping by CID, and the bring-up/protocol fixes that made QEMU NVMe
+  usable (Identify NN offset, Create-IOCQ/IOSQ fields, Write/Flush opcodes).
+
+Gates: 414 host tests, e2e selftest 83 routines / 0 failed, all AGENTS gates green.
 
 ## 2.15.0 — 2026-11-08
 

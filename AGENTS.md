@@ -262,8 +262,10 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   overlay/repaint cycle instead of copying the surface once per timer tick.
   **2.16.0** = the current unreleased batch: signalfd/signalfd4 and real process
   groups (`pgid` in `CompatState`, setpgid/getpgid/getpgrp/setsid, group kill),
-  plus the NVMe rewrite (multi-page PRP lists, a four-command polled queue and
-  the bring-up/protocol fixes that made NVMe actually usable under QEMU);
+  tty foreground job control (`TIOCGPGRP`/`TIOCSPGRP`, SIGTTIN/TTOU, Ctrl+Z),
+  `/proc/<pid>/fdinfo` + `/proc/<pid>/limits`, and the NVMe rewrite (multi-page
+  PRP lists, a four-command polled queue and the bring-up/protocol fixes that
+  made NVMe usable under QEMU);
   **2.15.0** = the 15-commit Linux-compat batch: `*at` family, sendfile/
   copy_file_range, legacy/advisory syscalls, memfd_create, timerfd (poll/epoll
   integrated), SIGCHLD delivery, `/proc/*/mountinfo` and shell df/ps, plus the
