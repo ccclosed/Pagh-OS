@@ -1,10 +1,13 @@
-# Контракт procfs для issue #11 — срезы 1–3
+# Контракт procfs для issue #11 — срезы 1–5
 
 **Статус:** требования (задача `t3`, kind=work). Документ — приёмка: реализация issue #11
 обязана соответствовать ему по путям, содержимому и поведению syscall-поверхности.
 **Реализовано** в задаче `t4` (ветка `vfs/procfs`), срез 2 — в 2.9.0 (`/proc/stat`),
 срез 3 — в 2.10.0 (`/proc/version`, `/proc/filesystems`, `/proc/loadavg`,
-read-only `/proc/sys/kernel/*`); отступления от текста ниже, если они есть, перечислены в
+read-only `/proc/sys/kernel/*`), срез 4 — в 2.11.0 (per-pid `cmdline/stat/status/maps`,
+`/proc/self/{stat,statm}`, mountinfo/mounts/cgroup — в 2.12–2.15), срез 5 — в unreleased
+2.16.0 batch (`/proc/<pid>/fdinfo/<n>`, `/proc/self/fdinfo/<n>`, `/proc/<pid>/limits`,
+`/proc/self/limits`; §12). Отступления от текста ниже, если они есть, перечислены в
 коде и в `src/vfs/README.md`; DEVIATION-2 уточнён: рендер ленивый и живёт один проход
 чтения (`read(offset == 0)` перерисовывает), а не снимок на `open()`.
 Ссылки на код и номера строк — исторические (контракт писался на `cd542bb`), сверяйтесь
@@ -125,7 +128,7 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 
 ---
 
-## 2. Дерево (срезы 1–3)
+## 2. Дерево (срезы 1–5)
 
 ### 2.1 Что входит
 
@@ -133,11 +136,17 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 /                     (VFS root; children: dev, tmp, proc, [mnt])
 /proc                 каталог, readdir → ["self","sys","cpuinfo","meminfo","uptime",
                               "stat","version","filesystems","loadavg"]
-/proc/self            каталог, readdir → ["exe","cmdline","status","maps"]
+/proc/self            каталог, readdir → ["exe","cmdline","status","maps","stat","statm",
+                              "mounts","cgroup","mountinfo","limits","fd","fdinfo"]
 /proc/self/exe        симлинк (readlink → exe_path текущего процесса)
 /proc/self/cmdline    обычный файл, снимок argv
 /proc/self/status     обычный файл, Linux-поля процесса
 /proc/self/maps       обычный файл, карта адресного пространства
+/proc/self/fd/<n>     симлинк на объект открытого fd
+/proc/self/fdinfo/<n> обычный файл: pos/flags/mnt_id/ino (срез 5)
+/proc/self/limits     обычный файл: 16 строк rlimit (срез 5)
+/proc/<pid>/          каталог на каждый живой pid; {cmdline,stat,status,maps,
+                              cgroup,mountinfo,limits,fd,fdinfo} (срезы 4–5)
 /proc/cpuinfo         обычный файл, CPUID
 /proc/meminfo         обычный файл, счётчики PMM/heap
 /proc/uptime          обычный файл, тики планировщика
@@ -172,7 +181,7 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 
 | Путь | Причина отложенности |
 |---|---|
-| `/proc/self/fd/*`, `/proc/self/task/*` | Требуют симлинков на произвольный fd/pid и полноценного следования по ссылкам (общая задача с #18), а не одного уровня (§5.4). |
+| `/proc/self/task/*` | Требует per-thread состояния, которого планировщик не хранит (треды видны только как pid в `COMPAT_STATES`); `/proc/self/fd/*` и `fdinfo/*` реализованы в 2.13.0/срезе 5. |
 | `/proc/devices`, прочие имена в `/proc/sys/*` | Сверх трёх read-only файлов `/proc/sys/kernel` нет ни sysctl-реестра, ни списка устройств; неизвестное имя обязано оставаться `ENOENT` (§5.6), а не «пустым успехом». |
 | `[vdso]`, `[vvar]`, `[vsyscall]` в maps | В ядре их физически нет — строки не должны появляться (это не «не реализовано», а «отсутствует»). |
 
@@ -1072,7 +1081,7 @@ python3 tools/host_tests.py          # + 6 новых property-наборов
 
 ## 11. Definition of Done для реализации
 
-1. Все узлы §2.1 (срезы 1–3) существуют и ведут себя по §3–§5; неизвестные пути → `ENOENT` (§5.6).
+1. Все узлы §2.1 (срезы 1–5) существуют и ведут себя по §3–§5/§12; неизвестные пути → `ENOENT` (§5.6).
 2. `VfsNode::{is_symlink, read_link}` (+ форвард в `MountNode`), follow-резолвер (t15 или
    минимальный §5.4(2)), `FdTable::capacity`, `LoadSegment`,
    `CompatState::{cmdline,image_segments,interp_path}`, `cpuid::read`,
@@ -1084,3 +1093,116 @@ python3 tools/host_tests.py          # + 6 новых property-наборов
 5. Обновлены `src/vfs/README.md`, `README.md`, `AGENTS.md` (текущая версия и история),
    `docs/procfs.md`; MINOR-бамп версии вместе с `Cargo.lock`.
 6. Каждое отклонение §9 имеет комментарий в коде рядом с местом отклонения.
+---
+
+## 12. Срез 5 (2.16.0 batch): fdinfo и limits
+
+Реализовано в unreleased-пакете 2.16.0 (версия в `Cargo.toml` уже поднята; отдельного
+MINOR-бампа срез не несёт). Контракт путей:
+
+```
+/proc/<pid>/fdinfo/<n>      обычный файл, n — открытый fd целевого процесса
+/proc/self/fdinfo/<n>       то же для вызывающего процесса
+/proc/<pid>/limits          обычный файл, 16 строк rlimit
+/proc/self/limits           то же для вызывающего процесса
+```
+
+### 12.1 `/proc/<pid>/fdinfo`
+
+- `fdinfo` — **каталог** (`ProcDir`, `DirKind::FdInfoDir(pid)`) под `fd` в
+  `/proc/<pid>` и `/proc/self`; `readdir` отдаёт по одной записи на каждый реально
+  открытый fd (числовое имя, порядок возрастания fd), `lookup` разбирает десятичный
+  `u32`, затем проверяет, что pid жив (`compat_exists`) **и** fd открыт
+  (`FdTable::get`). Поэтому закрытый fd и мёртвый pid — `ENOENT`, без wildcard.
+- Файл — `ProcFile` с `ProcKind::FdInfo`, `pid` цели и `fd`; имя — decimal `fd`,
+  inode — `pid_fdinfo_ino(pid, fd)` (отдельный диапазон от symlink'ов `fd/<n>`).
+- Поля рендерит `procfs_format::format_fdinfo` (чистый, host-тестируемый), строго в
+  порядке Linux `fs/proc/fd.c`:
+
+```
+pos:	<f_pos>
+flags:	0<octal f_flags>
+mnt_id:	<mnt_id>
+ino:	<inode>
+```
+
+  * `pos` — реальный offset: `OpenObject::File.offset`; для `Dir` — курсор
+    `getdents64` (`OpenObject::Dir.index`, который `lseek(SEEK_SET)` и меняет);
+    у stdio/pipe/socket/event/timer/signalfd/epoll позиции нет — `0`.
+  * `flags` — реальные `f_flags` дескриптора, записанные в `FdTable` при создании
+    (`alloc_with_flags`) и обновляемые `F_SETFL`/`FIONBIO`; `O_CLOEXEC` добавляется
+    из отдельного `FD_CLOEXEC`-множества. Формат Linux — `0%o` (ведущий ноль;
+    `O_RDONLY` → `00`, `O_RDWR` → `02`).
+  * `mnt_id` — 1-based индекс точки монтирования в отсортированном
+    `vfs::mount_snapshot()` — той же таблице и в том же порядке, что у
+    `/proc/*/mountinfo`; для файла под `/proc` это id строки `/proc`. Объекты без
+    VFS-монтирования (stdio, pipe, socket, eventfd/timerfd/signalfd/epoll, memfd)
+    дают `0` — документированный sentinel «нет mount», а не выдуманный id.
+  * `ino` — `io_sys::node_ino`: реальный `fs_ino()` VFS-узла, а для синтетических
+    узлов — тот же FNV-fallback, что у `stat`/`getdents64` (то есть `fdinfo.ino`
+    совпадает с `stat`-идентичностью). У объектов без VFS-узла — `0`.
+- Снимок делается **под** `COMPAT_STATES` (клонируются offset/flags/path/`Arc` узла),
+  форматирование — после снятия реестрового спинлока; `mount_snapshot()` берётся вне
+  него (AGENTS.md invariant 4).
+- `pos/flags` читаются с живого дескриптора; `mnt_id/ino` — с его VFS-узла. Никаких
+  констант «на все fd»: один и тот же рендерер для `self` и `<pid>` получает только
+  цель.
+
+### 12.2 `/proc/<pid>/limits`
+
+- `limits` — обычный файл в `PROC_PID_FILES` (slot 7) и `PROC_SELF_FILES` (inode
+  `PROC_INO_BASE+22`); `/proc/self/limits` и `/proc/<pid>/limits` различаются только
+  pid-ом цели.
+- `procfs_format::format_limits` печатает Linux-заголовок **байт-в-байт**, включая
+  пять пробелов после `Units`:
+
+```
+Limit                     Soft Limit           Hard Limit           Units
+```
+
+  Строки — `%-25s %-20s %-20s %-10s\n`; у `Max nice priority`/`Max realtime priority`
+  единицы отсутствуют, и строка кончается одним разделительным пробелом (как в
+  `fs/proc/base.c::proc_pid_limits`).
+- Ровно 16 строк в порядке Linux `RLIMIT_*` (0..15): cpu, fsize, data, stack, core,
+  rss, nproc, nofile, memlock, as, locks, sigpending, msgqueue, nice, rtprio, rttime.
+- Значения — **реальные** `(soft, hard)` цели: override из `CompatState.rlimits`
+  (`prlimit64`/`setrlimit`), иначе `misc::default_rlimit(resource)` — то же, что
+  вернёт `getrlimit(2)` этой цели. `RLIM_INFINITY` печатается как `unlimited`;
+  не смоделированные ресурсы наследуют `(∞, ∞)` и потому честно `unlimited`.
+  Моделируемые значения: `RLIMIT_STACK` soft = 8 MiB, hard = unlimited;
+  `RLIMIT_NOFILE` = 1024/1024 (`io_sys::NOFILE_MAX`).
+
+### 12.3 Inode-идентичность среза 5
+
+`PROC_PID_INO_STRIDE` поднят до `0x1_0000`, чтобы динамические fd-диапазоны не
+пересекались с inode'ами соседних pid:
+
+- `pid_dir_ino(pid) + 0x10` — каталог `fd` (раньше `+5` пересекался со слотом
+  `cgroup` — исправлено в этом же срезе);
+- `pid_dir_ino(pid) + 0x11` — каталог `fdinfo`;
+- `pid_dir_ino(pid) + 0x100 + fd` — symlink `fd/<n>` (`pid_fd_ino`);
+- `pid_dir_ino(pid) + 0x1000 + fd` — файл `fdinfo/<n>` (`pid_fdinfo_ino`);
+- `+slot 1..7` — статические файлы pid-каталога (limits = 7).
+
+### 12.4 Тесты среза 5
+
+- host-tests: `properties/procfs_fdinfo_limits.rs` — точный порядок/формат четырёх
+  строк fdinfo, octal `flags`, round-trip pos/flags/mnt_id/ino, точный заголовок и
+  ширина колонок limits, `unlimited` ⇔ `RLIM_INFINITY`, таблица 16 имён и
+  непересечение inode'ов fd/fdinfo.
+- in-QEMU: `src/test.rs::procfs_tests::fdinfo_and_limits` — синтетический
+  `CompatState` с реальным `OpenObject::File` на `/proc/meminfo`: `pos=123`,
+  `flags=O_RDONLY|O_CLOEXEC`, `mnt_id` строки `/proc`, `ino` узла; закрытый fd и
+  мёртвый pid → `ENOENT`; limits с override `(123,456)` и `(7 MiB, unlimited)` плюс
+  `unlimited` для остальных; `/proc/self/{fdinfo,limits}`. Состояние реестра
+  сохраняется/восстанавливается.
+- E2E: `python3 tools/e2e.py selftest` прогоняет этот рутин в госте.
+
+### 12.5 Осознанные отклонения среза 5
+
+| # | Отклонение | Причина / допустимость |
+|---|---|---|
+| 18 | `mnt_id`/`ino` = 0 для stdio/pipe/socket/event-объектов и memfd | У этих объектов нет VFS-монтирования/узла; 0 — уже принятый в VFS sentinel «нет идентичности» (`fs_ino() == 0`), выдумывать id запрещено |
+| 19 | `pos` каталога — индекс `getdents64`, а не байтовый `f_pos` Linux | В ядре нет байтового курсора каталога; `index` — реальное состояние, которое меняет `lseek(SEEK_SET)` |
+| 20 | `flags` — сохранённые `open(2)`/`fcntl` флаги, а не полный Linux `file->f_flags` (нет `O_LARGEFILE`, `FMODE_*`) | В ядре нет этих понятий; печатается реально записанное значение, включая `O_CLOEXEC`, а не константа |
+| 21 | `fdinfo` существует только для открытых fd; для закрытого — `ENOENT` | Так же, как ядро удаляет запись `/proc/<pid>/fdinfo/<n>` при `close`; это и есть динамический lookup |

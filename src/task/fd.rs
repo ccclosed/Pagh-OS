@@ -8,7 +8,7 @@
 //! `Arc<dyn VfsNode>`) and the shared [`Errno`] mapping on top of it.
 #![allow(dead_code)]
 
-use alloc::collections::{BTreeSet, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -243,6 +243,40 @@ pub enum OpenObject {
     },
 }
 
+/// Linux `O_RDONLY` (access mode 0).
+pub const O_RDONLY: u64 = 0;
+/// Linux `O_WRONLY`.
+pub const O_WRONLY: u64 = 1;
+/// Linux `O_RDWR`.
+pub const O_RDWR: u64 = 2;
+/// Linux `O_NONBLOCK` (x86_64).
+pub const O_NONBLOCK: u64 = 0o4000;
+/// Linux `O_CLOEXEC` (x86_64). Tracked separately in [`FdTable::cloexec`] so
+/// `FD_CLOEXEC` can be toggled without rewriting the open flags.
+pub const O_CLOEXEC: u64 = 0o2000000;
+
+/// Default open/status flags for an object created without an explicit open
+/// flag set. These are the access modes the object actually has: stdio is
+/// one-directional, pipes are one-directional, every socket/event object is
+/// read-write. The open path overrides this with the caller's real flags via
+/// [`FdTable::alloc_with_flags`].
+fn default_object_flags(obj: &OpenObject) -> u64 {
+    match obj {
+        OpenObject::Stdin | OpenObject::PipeRead(_) => O_RDONLY,
+        OpenObject::Console | OpenObject::PipeWrite(_) => O_WRONLY,
+        OpenObject::File { .. } | OpenObject::Dir { .. } => O_RDONLY,
+        OpenObject::InetTcp(_)
+        | OpenObject::InetUdp(_)
+        | OpenObject::Socket { .. }
+        | OpenObject::UnixListener(_)
+        | OpenObject::UnixSocketUnbound { .. }
+        | OpenObject::Timerfd(_)
+        | OpenObject::Signalfd { .. }
+        | OpenObject::Eventfd { .. }
+        | OpenObject::Epoll { .. } => O_RDWR,
+    }
+}
+
 impl Clone for OpenObject {
     fn clone(&self) -> Self {
         self.dup_clone()
@@ -313,6 +347,11 @@ pub struct FdTable {
     /// Descriptors flagged close-on-exec (O_CLOEXEC / FD_CLOEXEC).
     /// Swept by execve; libuv's fork+exec error-pipe protocol depends on it.
     cloexec: BTreeSet<u32>,
+    /// The `f_flags` each descriptor was opened with (without `O_CLOEXEC`,
+    /// which lives in `cloexec`). This is the real source for `/proc/.../fdinfo`
+    /// `flags:`; `dup`/`dup2` copy it, `close` drops it, and the
+    /// `F_SETFL`/`FIONBIO` paths update `O_NONBLOCK` when they change it.
+    flags: BTreeMap<u32, u64>,
 }
 
 impl FdTable {
@@ -327,18 +366,62 @@ impl FdTable {
         initial.push(Some(OpenObject::Stdin)); // fd 0
         initial.push(Some(OpenObject::Console)); // fd 1
         initial.push(Some(OpenObject::Console)); // fd 2
+        let mut flags = BTreeMap::new();
+        flags.insert(0, O_RDONLY);
+        flags.insert(1, O_WRONLY);
+        flags.insert(2, O_WRONLY);
         Self {
             slots: FdSlots::from_slots(initial),
             cloexec: BTreeSet::new(),
+            flags,
         }
     }
 
     /// Allocate the lowest free descriptor `>= 3`, store `obj` there, and return
-    /// the descriptor, growing the table as needed (R2.4).
+    /// the descriptor, growing the table as needed (R2.4). The recorded open
+    /// flags are the object's real access mode ([`default_object_flags`]); paths
+    /// that know the caller's `open(2)` flags use [`Self::alloc_with_flags`].
     pub fn alloc(&mut self, obj: OpenObject) -> u32 {
+        let flags = default_object_flags(&obj);
+        self.alloc_with_flags(obj, flags)
+    }
+
+    /// Allocate a descriptor and record the exact open/status flags it was
+    /// created with. `O_CLOEXEC` is stripped here because it is tracked in
+    /// `cloexec`; [`Self::fdinfo_flags`] recombines the two.
+    pub fn alloc_with_flags(&mut self, obj: OpenObject, flags: u64) -> u32 {
         let fd = self.slots.alloc(Self::FIRST_DYNAMIC_FD, obj);
         self.cloexec.remove(&fd); // a recycled slot must not inherit the flag
+        self.flags.insert(fd, flags & !O_CLOEXEC);
         fd
+    }
+
+    /// Recorded open/status flags for `fd` (without `O_CLOEXEC`), or `None`
+    /// when the descriptor is absent.
+    pub fn open_flags(&self, fd: u32) -> Option<u64> {
+        self.flags.get(&fd).copied()
+    }
+
+    /// The `f_flags` value `/proc/<pid>/fdinfo/<fd>` reports: recorded open
+    /// flags plus `O_CLOEXEC` when `FD_CLOEXEC` is set on this descriptor.
+    pub fn fdinfo_flags(&self, fd: u32) -> Option<u64> {
+        let mut flags = self.open_flags(fd)?;
+        if self.cloexec.contains(&fd) {
+            flags |= O_CLOEXEC;
+        }
+        Some(flags)
+    }
+
+    /// Set or clear `O_NONBLOCK` in the recorded descriptor flags after an
+    /// `fcntl(F_SETFL)`/`ioctl(FIONBIO)` actually changed the object's state.
+    pub fn set_nonblocking_flag(&mut self, fd: u32, on: bool) {
+        if let Some(flags) = self.flags.get_mut(&fd) {
+            if on {
+                *flags |= O_NONBLOCK;
+            } else {
+                *flags &= !O_NONBLOCK;
+            }
+        }
     }
 
     /// Borrow the object referenced by `fd`, or `None` for an out-of-range/empty
@@ -369,8 +452,9 @@ impl FdTable {
             read_end: false,
             nonblocking,
         });
-        let rfd = self.alloc(OpenObject::PipeRead(r));
-        let wfd = self.alloc(OpenObject::PipeWrite(w));
+        let extra = if nonblocking { O_NONBLOCK } else { 0 };
+        let rfd = self.alloc_with_flags(OpenObject::PipeRead(r), O_RDONLY | extra);
+        let wfd = self.alloc_with_flags(OpenObject::PipeWrite(w), O_WRONLY | extra);
         (rfd, wfd)
     }
 
@@ -388,6 +472,7 @@ impl FdTable {
         let res = self.slots.close(fd).map_err(|_| Errno::EBADF);
         if res.is_ok() {
             self.cloexec.remove(&fd);
+            self.flags.remove(&fd);
         }
         res
     }
@@ -402,8 +487,14 @@ impl FdTable {
     /// `>= min`, returning the new descriptor. `EBADF` if `oldfd` is not open.
     pub fn dup_min(&mut self, oldfd: u32, min: u32) -> Result<u32, Errno> {
         let dup = self.slots.get(oldfd).ok_or(Errno::EBADF)?.dup_clone();
+        let flags = self
+            .flags
+            .get(&oldfd)
+            .copied()
+            .unwrap_or_else(|| default_object_flags(&dup));
         let fd = self.slots.alloc(min as usize, dup);
         self.cloexec.remove(&fd); // the duplicate starts without FD_CLOEXEC
+        self.flags.insert(fd, flags);
         Ok(fd)
     }
 
@@ -416,8 +507,14 @@ impl FdTable {
     /// they differ.
     pub fn dup_to(&mut self, oldfd: u32, newfd: u32) -> Result<u32, Errno> {
         let dup = self.slots.get(oldfd).ok_or(Errno::EBADF)?.dup_clone();
+        let flags = self
+            .flags
+            .get(&oldfd)
+            .copied()
+            .unwrap_or_else(|| default_object_flags(&dup));
         self.slots.set(newfd, dup);
         self.cloexec.remove(&newfd); // dup2/dup3 clear FD_CLOEXEC on the target
+        self.flags.insert(newfd, flags);
         Ok(newfd)
     }
 
@@ -464,6 +561,7 @@ impl FdTable {
         let fds = core::mem::take(&mut self.cloexec);
         for fd in fds {
             let _ = self.slots.close(fd);
+            self.flags.remove(&fd);
         }
     }
 
@@ -506,8 +604,9 @@ impl FdTable {
                 nonblocking,
             }),
         };
-        let fa = self.alloc(a);
-        let fb = self.alloc(b);
+        let extra = if nonblocking { O_NONBLOCK } else { 0 };
+        let fa = self.alloc_with_flags(a, O_RDWR | extra);
+        let fb = self.alloc_with_flags(b, O_RDWR | extra);
         // Which descriptor numbers the RPC channel ends get.
 
         (fa, fb)

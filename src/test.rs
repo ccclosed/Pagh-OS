@@ -1563,6 +1563,11 @@ mod vfs_tests {
 // exactly why the `/proc/self` half of the contract is asserted to be *invisible*
 // here (the Linux-process half is verified end to end from a guest binary).
 mod procfs_tests {
+    use crate::arch::x86_64::linux::mem::VmRegionSet;
+    use crate::sync::spinlock::Spinlock;
+    use crate::task::compat::{self, CompatState};
+    use crate::task::fd::{FdTable, OpenObject, O_CLOEXEC, O_RDONLY};
+    use crate::task::scheduler;
     use crate::vfs::{self, VfsError, VfsNode};
     use alloc::string::String;
     use alloc::sync::Arc;
@@ -2065,6 +2070,216 @@ mod procfs_tests {
             matches!(vfs::lookup_path("/proc/self"), Err(VfsError::NotFound)),
             "procfs: /proc/self is ENOENT without CompatState"
         );
+    }
+
+    /// A synthetic compat state for the fdinfo/limits checks. The pid is above
+    /// any real allocator range and no task is ever scheduled under it; the
+    /// state is removed before returning. Mirrors the signal tests' discipline.
+    fn synth(pid: u64) -> CompatState {
+        CompatState::new(
+            FdTable::with_standard_streams(),
+            Arc::new(Spinlock::new(VmRegionSet::new(0, 0))),
+            pid,
+        )
+    }
+
+    fn text_of(path: &str) -> String {
+        let bytes = read_path(path);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn line<'a>(text: &'a str, key: &str) -> &'a str {
+        text.lines()
+            .find(|l| l.starts_with(key))
+            .unwrap_or_else(|| panic!("missing limits row {key}"))
+    }
+
+    /// `/proc/<pid>/fdinfo/<n>` and `/proc/<pid>/limits` over a REAL synthetic
+    /// fd table: pos/flags/mnt_id/ino are the live descriptor's values,
+    /// `limits` renders the target's real rlimit overrides and kernel defaults,
+    /// a closed fd and a dead pid are ENOENT. Also proves the `/proc/self/*`
+    /// aliases and the absence of fabricated `mnt_id`/`ino` for stdio.
+    pub fn fdinfo_and_limits() {
+        const FAKE: u64 = 0x7F00_0111;
+        let me = scheduler::current_pid();
+        // Save/restore rather than assuming the shell task has no compat state.
+        let saved = compat::remove_compat(me);
+        compat::install_compat(me, synth(me));
+        compat::install_compat(FAKE, synth(FAKE));
+
+        let meminfo = match vfs::lookup_path("/proc/meminfo") {
+            Ok(n) => n,
+            Err(_) => {
+                assert_kernel!(false, "procfs fdinfo: /proc/meminfo lookup failed");
+                return;
+            }
+        };
+        let meminfo_ino = meminfo.fs_ino();
+
+        let file_fd = compat::with_pid_compat(FAKE, |cs| {
+            let fd = cs.fds.alloc_with_flags(
+                OpenObject::File {
+                    node: Arc::clone(&meminfo),
+                    path: String::from("/proc/meminfo"),
+                    offset: 123,
+                },
+                O_RDONLY,
+            );
+            cs.fds.set_cloexec(fd, true);
+            fd
+        })
+        .unwrap_or(0);
+
+        // ── fdinfo directory: numeric entries over the live fd table ────────
+        let dir = match vfs::lookup_path(&alloc::format!("/proc/{FAKE}/fdinfo")) {
+            Ok(n) => n,
+            Err(_) => {
+                assert_kernel!(false, "procfs fdinfo: directory lookup failed");
+                return;
+            }
+        };
+        assert_kernel!(dir.is_directory(), "procfs fdinfo: fdinfo is a directory");
+        let listed = names(&dir);
+        for fd in [0u32, 1, 2, file_fd] {
+            assert_kernel!(
+                listed.contains(&alloc::format!("{fd}")),
+                "procfs fdinfo: readdir lists an open fd"
+            );
+        }
+
+        let file_path = alloc::format!("/proc/{FAKE}/fdinfo/{file_fd}");
+        let text = text_of(&file_path);
+        assert_eq_kernel!(
+            line(&text, "pos:"),
+            "pos:	123",
+            "procfs fdinfo: pos is the real file offset"
+        );
+        // O_RDONLY (0) plus FD_CLOEXEC (0o2000000), in Linux's 0%o form.
+        assert_eq_kernel!(
+            line(&text, "flags:"),
+            &alloc::format!("flags:	0{:o}", O_CLOEXEC),
+            "procfs fdinfo: flags is the real open flags plus FD_CLOEXEC"
+        );
+        let want_proc_mnt = {
+            let mounts = vfs::mount_snapshot();
+            mounts
+                .iter()
+                .position(|m| m.point == "/proc")
+                .map(|i| i as u64 + 1)
+                .unwrap_or(u64::MAX)
+        };
+        assert_eq_kernel!(
+            line(&text, "mnt_id:"),
+            &alloc::format!("mnt_id:	{want_proc_mnt}"),
+            "procfs fdinfo: mnt_id matches the live mount table"
+        );
+        assert_eq_kernel!(
+            line(&text, "ino:"),
+            &alloc::format!("ino:	{meminfo_ino}"),
+            "procfs fdinfo: ino is the backing VFS inode"
+        );
+
+        // Stdio has no VFS mount/inode; 0 is the documented sentinel, never a
+        // fabricated id.
+        let stdio = text_of(&alloc::format!("/proc/{FAKE}/fdinfo/0"));
+        assert_eq_kernel!(
+            line(&stdio, "mnt_id:"),
+            "mnt_id:	0",
+            "procfs fdinfo: stdio reports no mount"
+        );
+        assert_eq_kernel!(
+            line(&stdio, "ino:"),
+            "ino:	0",
+            "procfs fdinfo: stdio reports no inode"
+        );
+
+        // ── dynamic lookup: closed fd and dead pid are ENOENT ───────────────
+        compat::with_pid_compat(FAKE, |cs| cs.fds.close(file_fd));
+        assert_kernel!(
+            matches!(vfs::lookup_path(&file_path), Err(VfsError::NotFound)),
+            "procfs fdinfo: a closed fd is ENOENT"
+        );
+        compat::remove_compat(FAKE);
+        assert_kernel!(
+            matches!(
+                vfs::lookup_path(&alloc::format!("/proc/{FAKE}/fdinfo/0")),
+                Err(VfsError::NotFound)
+            ),
+            "procfs fdinfo: a dead pid is ENOENT"
+        );
+
+        // ── limits: target overrides + kernel defaults + unlimited ──────────
+        compat::install_compat(FAKE, synth(FAKE));
+        compat::with_pid_compat(FAKE, |cs| {
+            cs.rlimits.insert(7, (123, 456)); // RLIMIT_NOFILE
+            cs.rlimits.insert(3, (7 * 1024 * 1024, u64::MAX)); // RLIMIT_STACK
+        });
+        let limits = text_of(&alloc::format!("/proc/{FAKE}/limits"));
+        assert_kernel!(
+            limits.starts_with(
+                "Limit                     Soft Limit           Hard Limit           Units     \n"
+            ),
+            "procfs limits: Linux header is byte-exact"
+        );
+        assert_eq_kernel!(
+            limits.lines().count(),
+            17,
+            "procfs limits: header plus 16 rlimit rows"
+        );
+        // Linux columns: name 0..25, soft 26..46, hard 47..67, unit 68..78.
+        let nofile = line(&limits, "Max open files");
+        assert_eq_kernel!(
+            &nofile[26..46],
+            "123                 ",
+            "procfs limits: per-process soft limit is rendered"
+        );
+        assert_eq_kernel!(
+            &nofile[47..67],
+            "456                 ",
+            "procfs limits: per-process hard limit is rendered"
+        );
+        let stack = line(&limits, "Max stack size");
+        assert_eq_kernel!(
+            stack[26..46].trim_end(),
+            "7340032",
+            "procfs limits: real soft stack value"
+        );
+        assert_eq_kernel!(
+            stack[47..67].trim_end(),
+            "unlimited",
+            "procfs limits: real unlimited hard stack"
+        );
+        let cpu = line(&limits, "Max cpu time");
+        assert_eq_kernel!(
+            cpu[26..46].trim_end(),
+            "unlimited",
+            "procfs limits: unmodelled soft limit is unlimited"
+        );
+        assert_eq_kernel!(
+            cpu[47..67].trim_end(),
+            "unlimited",
+            "procfs limits: unmodelled hard limit is unlimited"
+        );
+
+        // ── /proc/self/fdinfo + /proc/self/limits ───────────────────────────
+        let self_info = text_of("/proc/self/fdinfo/0");
+        assert_kernel!(
+            self_info.starts_with("pos:\t0\n"),
+            "procfs fdinfo: /proc/self/fdinfo resolves the calling process"
+        );
+        let self_limits = text_of("/proc/self/limits");
+        assert_eq_kernel!(
+            self_limits.lines().count(),
+            17,
+            "procfs limits: /proc/self/limits has the same 17 lines"
+        );
+
+        // Restore the pre-test registry state.
+        compat::remove_compat(FAKE);
+        compat::remove_compat(me);
+        if let Some(previous) = saved {
+            compat::install_compat(me, previous);
+        }
     }
 }
 
@@ -5904,6 +6119,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "procfs::tree, rendered files and ENOENT matrix",
             procfs_tests::tree_and_contents
+        ),
+        (
+            "procfs::fdinfo and limits (slice 5)",
+            procfs_tests::fdinfo_and_limits
         ),
         ("pmm::total_frames > 0", pmm_tests::total_frames),
         ("pmm::alloc+free cycle", pmm_tests::alloc_free),

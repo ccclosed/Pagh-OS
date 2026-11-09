@@ -5,7 +5,7 @@ use super::check_user_ptr;
 use crate::arch::x86_64::linux::errno::Errno;
 use crate::sync::spinlock::Spinlock;
 use crate::task::compat;
-use crate::task::fd::OpenObject;
+use crate::task::fd::{OpenObject, O_NONBLOCK, O_RDWR};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -47,10 +47,13 @@ pub fn sys_eventfd2(initval: u64, flags: u64) -> Result<u64, Errno> {
     let semaphore = flags & 1 != 0;
     let state = Arc::new(Spinlock::new(initval));
     let fd = compat::with_current_compat(|cs| {
-        let fd = cs.fds.alloc(OpenObject::Eventfd {
-            val: state,
-            semaphore,
-        });
+        let fd = cs.fds.alloc_with_flags(
+            OpenObject::Eventfd {
+                val: state,
+                semaphore,
+            },
+            O_RDWR | (flags & O_NONBLOCK),
+        );
         if flags & 0x80000 != 0 {
             cs.fds.set_cloexec(fd, true);
         } // EFD_CLOEXEC
@@ -67,7 +70,9 @@ pub fn sys_eventfd2(initval: u64, flags: u64) -> Result<u64, Errno> {
 pub fn sys_epoll_create1(flags: u64) -> Result<u64, Errno> {
     let interests: Arc<Spinlock<Vec<EpollEntry>>> = Arc::new(Spinlock::new(Vec::new()));
     let fd = compat::with_current_compat(|cs| {
-        let fd = cs.fds.alloc(OpenObject::Epoll { interests });
+        let fd = cs
+            .fds
+            .alloc_with_flags(OpenObject::Epoll { interests }, O_RDWR);
         if flags & 0x80000 != 0 {
             cs.fds.set_cloexec(fd, true);
         } // EPOLL_CLOEXEC

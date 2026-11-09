@@ -108,6 +108,12 @@ pub enum ProcKind {
     PidStatus,
     /// `/proc/<pid>/maps`.
     PidMaps,
+    /// `/proc/<pid>/limits` and `/proc/self/limits`.
+    PidLimits,
+    /// `/proc/self/limits`.
+    SelfLimits,
+    /// `/proc/<pid>/fdinfo/<n>` (the target pid and fd are carried by the node).
+    FdInfo,
 }
 
 /// One named entry: its `readdir` name, stable inode, and content kind.
@@ -188,7 +194,7 @@ pub const PROC_SYS_FILES: [ProcEntry; 3] = [
 /// pid-derived identity below instead; the two paths describe the same state but
 /// are distinct VFS nodes (this `self` is a directory, not a symlink to the pid
 /// directory).
-pub const PROC_SELF_FILES: [ProcEntry; 9] = [
+pub const PROC_SELF_FILES: [ProcEntry; 10] = [
     ProcEntry {
         name: "exe",
         ino: PROC_INO_BASE + 2,
@@ -234,6 +240,11 @@ pub const PROC_SELF_FILES: [ProcEntry; 9] = [
         ino: PROC_INO_BASE + 21,
         kind: ProcKind::SelfMountInfo,
     },
+    ProcEntry {
+        name: "limits",
+        ino: PROC_INO_BASE + 22,
+        kind: ProcKind::SelfLimits,
+    },
 ];
 
 /// `readdir` order of `/proc`'s **static** entries: `self`/`sys` first, then the
@@ -264,8 +275,11 @@ pub const PROC_ROOT_ORDER: [&str; 10] = [
 
 /// First inode of the `/proc/<pid>` directory range.
 pub const PROC_PID_DIR_INO_BASE: u64 = PROC_INO_BASE + 0x0000_0000_0010_0000;
-/// Inodes reserved per pid directory (`+0` dir, `+1..=4` files).
-pub const PROC_PID_INO_STRIDE: u64 = 8;
+/// Inodes reserved per pid directory. The stride also leaves room for the
+/// dynamic `/proc/<pid>/fd/<n>` (`+0x100`) and `/proc/<pid>/fdinfo/<n>`
+/// (`+0x1000`) identities, whose fd component is bounded by `NOFILE_MAX`
+/// (1024), well below `0x10000`.
+pub const PROC_PID_INO_STRIDE: u64 = 0x1_0000;
 /// Pids are masked to this many bits before deriving an inode.
 pub const PROC_PID_INO_MASK: u64 = 0xFFFF_FFFF;
 
@@ -279,6 +293,20 @@ pub fn pid_file_ino(pid: u64, slot: u64) -> u64 {
     pid_dir_ino(pid) + slot
 }
 
+/// Stable inode of the `/proc/<pid>/fd/<fd>` symlink (also used for
+/// `/proc/self/fd/<fd>`).
+pub fn pid_fd_ino(pid: u64, fd: u32) -> u64 {
+    pid_dir_ino(pid) + 0x100 + fd as u64
+}
+
+/// Stable inode of the `/proc/<pid>/fdinfo/<fd>` regular file.
+///
+/// Kept in a separate range from [`pid_fd_ino`]: the fd symlink and the fdinfo
+/// file are distinct directory entries with distinct inodes, as in Linux.
+pub fn pid_fdinfo_ino(pid: u64, fd: u32) -> u64 {
+    pid_dir_ino(pid) + 0x1000 + fd as u64
+}
+
 /// One file under `/proc/<pid>`: a static name, its inode slot, and its kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcPidEntry {
@@ -288,7 +316,7 @@ pub struct ProcPidEntry {
 }
 
 /// The files under every `/proc/<pid>` directory, in `readdir` order.
-pub const PROC_PID_FILES: [ProcPidEntry; 6] = [
+pub const PROC_PID_FILES: [ProcPidEntry; 7] = [
     ProcPidEntry {
         name: "cmdline",
         slot: 1,
@@ -319,10 +347,23 @@ pub const PROC_PID_FILES: [ProcPidEntry; 6] = [
         slot: 6,
         kind: ProcKind::PidMountInfo,
     },
+    ProcPidEntry {
+        name: "limits",
+        slot: 7,
+        kind: ProcKind::PidLimits,
+    },
 ];
 
 /// `readdir` order of `/proc/<pid>`.
-pub const PROC_PID_ORDER: [&str; 6] = ["cmdline", "stat", "status", "maps", "cgroup", "mountinfo"];
+pub const PROC_PID_ORDER: [&str; 7] = [
+    "cmdline",
+    "stat",
+    "status",
+    "maps",
+    "cgroup",
+    "mountinfo",
+    "limits",
+];
 
 /// Look up a `/proc/<pid>` file by name.
 pub fn proc_pid_file(name: &str) -> Option<ProcPidEntry> {
@@ -474,6 +515,166 @@ pub fn format_mounts(mounts: &[(&str, &str)]) -> Vec<u8> {
 /// no controllers. Linux's v2 format has one line per hierarchy: `0::/`.
 pub fn format_cgroup() -> Vec<u8> {
     Vec::from(&b"0::/\n"[..])
+}
+
+// ─── /proc/<pid>/fdinfo/<fd> ────────────────────────────────────────────────
+
+/// The real, kernel-owned fields of one open descriptor, as `/proc/.../fdinfo`
+/// reports them. `mnt_id`/`ino` are `0` for objects that have no VFS mount or
+/// VFS inode (pipes, sockets, event objects, stdio): this kernel's VFS defines
+/// `fs_ino() == 0` as "no real inode identity" and there is no mount behind
+/// those objects, so `0` is the honest sentinel rather than a fabricated id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FdInfo {
+    /// Current file position (`f_pos`); 0 for objects without one.
+    pub pos: u64,
+    /// Linux `f_flags`, including `O_CLOEXEC` when the descriptor carries it.
+    pub flags: u64,
+    /// Mount id from the VFS mount table, or 0 when no mount backs the object.
+    pub mnt_id: u64,
+    /// VFS inode number, or 0 when the object has no VFS inode.
+    pub ino: u64,
+}
+
+/// Render `/proc/<pid>/fdinfo/<fd>` in Linux `fs/proc/fd.c` order.
+///
+/// The leading `0` in `flags` is Linux's `0%o` format: the field is C-style
+/// octal, so `O_RDONLY` renders as `00` and `O_RDWR` as `02`.
+pub fn format_fdinfo(i: &FdInfo) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    push(
+        &mut out,
+        format_args!(
+            "pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{}\nino:\t{}\n",
+            i.pos, i.flags, i.mnt_id, i.ino
+        ),
+    );
+    out
+}
+
+// ─── /proc/<pid>/limits ─────────────────────────────────────────────────────
+
+/// Number of resource ids Linux defines (`RLIMIT_NLIMITS`); the rlimit table
+/// this kernel models is exactly this wide (`misc::RLIMIT_NLIMITS`).
+pub const RLIMIT_COUNT: usize = 16;
+/// Linux `RLIM_INFINITY`: the "no limit" value.
+pub const RLIM_INFINITY: u64 = u64::MAX;
+
+/// One row of `/proc/<pid>/limits`: Linux's name and unit. `units: None` means
+/// the row has no unit column (Linux prints a trailing space instead).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LimitRow {
+    pub name: &'static str,
+    pub units: Option<&'static str>,
+}
+
+/// Linux `RLIMIT_*` rows in resource-id order 0..15
+/// (`fs/proc/base.c::lnames`). The order is the ABI: `limits` is positional for
+/// scripts that compare it with `ulimit -a`.
+pub const LIMIT_ROWS: [LimitRow; RLIMIT_COUNT] = [
+    LimitRow {
+        name: "Max cpu time",
+        units: Some("seconds"),
+    },
+    LimitRow {
+        name: "Max file size",
+        units: Some("bytes"),
+    },
+    LimitRow {
+        name: "Max data size",
+        units: Some("bytes"),
+    },
+    LimitRow {
+        name: "Max stack size",
+        units: Some("bytes"),
+    },
+    LimitRow {
+        name: "Max core file size",
+        units: Some("bytes"),
+    },
+    LimitRow {
+        name: "Max resident set",
+        units: Some("bytes"),
+    },
+    LimitRow {
+        name: "Max processes",
+        units: Some("processes"),
+    },
+    LimitRow {
+        name: "Max open files",
+        units: Some("files"),
+    },
+    LimitRow {
+        name: "Max locked memory",
+        units: Some("bytes"),
+    },
+    LimitRow {
+        name: "Max address space",
+        units: Some("bytes"),
+    },
+    LimitRow {
+        name: "Max file locks",
+        units: Some("locks"),
+    },
+    LimitRow {
+        name: "Max pending signals",
+        units: Some("signals"),
+    },
+    LimitRow {
+        name: "Max msgqueue size",
+        units: Some("bytes"),
+    },
+    LimitRow {
+        name: "Max nice priority",
+        units: None,
+    },
+    LimitRow {
+        name: "Max realtime priority",
+        units: None,
+    },
+    LimitRow {
+        name: "Max realtime timeout",
+        units: Some("us"),
+    },
+];
+
+/// `unlimited` or the decimal value, exactly as Linux prints it.
+fn limit_value(value: u64) -> String {
+    if value == RLIM_INFINITY {
+        String::from("unlimited")
+    } else {
+        fmt::format(format_args!("{}", value))
+    }
+}
+
+/// Render `/proc/<pid>/limits`.
+///
+/// Header and row widths are Linux's byte-for-byte
+/// (`fs/proc/base.c::proc_pid_limits`): name 25 + space, soft 20 + space, hard
+/// 20 + space, then a 10-wide unit. The header is 78 bytes including the five
+/// trailing spaces after `Units`; a unitless row ("Max nice priority") ends
+/// with the single separator space after the hard column, as in Linux.
+pub fn format_limits(limits: &[(u64, u64); RLIMIT_COUNT]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 * 80);
+    out.extend_from_slice(
+        b"Limit                     Soft Limit           Hard Limit           Units     \n",
+    );
+    for (row, (cur, max)) in LIMIT_ROWS.iter().zip(limits.iter()) {
+        let cur = limit_value(*cur);
+        let max = limit_value(*max);
+        if let Some(unit) = row.units {
+            push(
+                &mut out,
+                format_args!("{:<25} {:<20} {:<20} {:<10}\n", row.name, cur, max, unit),
+            );
+        } else {
+            push(
+                &mut out,
+                format_args!("{:<25} {:<20} {:<20} \n", row.name, cur, max),
+            );
+        }
+    }
+    out
 }
 
 pub fn format_version(version: &str) -> Vec<u8> {

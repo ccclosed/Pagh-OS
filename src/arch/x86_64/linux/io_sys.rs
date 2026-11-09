@@ -954,8 +954,9 @@ fn walk(abs: &str, follow_final: bool) -> Result<Arc<dyn VfsNode>, Errno> {
 /// Build the [`OpenObject`] for an already-resolved absolute path, allocating a
 /// fresh descriptor for it. A directory becomes an [`OpenObject::Dir`] carrying a
 /// snapshot of its children (for `getdents64`); a file becomes an
-/// [`OpenObject::File`] at offset 0.
-fn open_resolved(abs: &str) -> Result<u64, Errno> {
+/// [`OpenObject::File`] at offset 0. `flags` are the caller's real `open(2)`
+/// flags, recorded for `/proc/<pid>/fdinfo/<n>`.
+fn open_resolved(abs: &str, flags: u64) -> Result<u64, Errno> {
     // `open(2)` follows a final symlink; `/proc/self/exe` is such a link, and
     // opening it must hand back the real image, not the link node.
     let node = walk(abs, true)?;
@@ -973,7 +974,7 @@ fn open_resolved(abs: &str) -> Result<u64, Errno> {
             offset: 0,
         }
     };
-    let fd = compat::with_current_compat(|cs| cs.fds.alloc(obj));
+    let fd = compat::with_current_compat(|cs| cs.fds.alloc_with_flags(obj, flags));
     match fd {
         Some(fd) => Ok(fd as u64),
         // No compat state (native task) — nowhere to record the descriptor.
@@ -1069,7 +1070,7 @@ fn open_path(path: &str, flags: u64, mode: u32) -> Result<u64, Errno> {
             let _ = apply_node_mode(&created, requested & !current_umask());
         }
     }
-    open_resolved(&abs)
+    open_resolved(&abs, flags)
 }
 
 /// `open` (2): open an existing ext2 path (resolved against the cwd if relative),
@@ -1177,7 +1178,8 @@ fn synth_ino(name: &str) -> u64 {
 /// The stat-identity inode of `node`: its filesystem ino when it has one, the
 /// synthetic FNV fallback otherwise. This is the key `mode_overrides` is
 /// indexed by, so it must match what `write_stat`/`write_statx` report.
-fn node_ino(node: &Arc<dyn VfsNode>) -> u64 {
+/// `/proc/<pid>/fdinfo/<n>` reuses it so an fd's `ino:` equals `stat`'s.
+pub(crate) fn node_ino(node: &Arc<dyn VfsNode>) -> u64 {
     match node.fs_ino() {
         0 => synth_ino(node.name()),
         ino => ino,
@@ -1548,6 +1550,7 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
                 }
                 _ => {}
             }
+            cs.fds.set_nonblocking_flag(fd as u32, on);
             Ok(0)
         })
         .unwrap_or(Err(Errno::EBADF));
@@ -1962,7 +1965,7 @@ pub fn sys_memfd_create(name: u64, flags: u64) -> Result<u64, Errno> {
         offset: 0,
     };
     let fd = compat::with_current_compat(|cs| {
-        let fd = cs.fds.alloc(obj);
+        let fd = cs.fds.alloc_with_flags(obj, crate::task::fd::O_RDWR);
         if flags & MFD_CLOEXEC != 0 {
             cs.fds.set_cloexec(fd, true);
         }
@@ -2654,6 +2657,7 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
                         }
                         _ => {}
                     }
+                    cs.fds.set_nonblocking_flag(fd as u32, on);
                     Ok(0)
                 }
             })

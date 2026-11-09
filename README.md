@@ -188,10 +188,11 @@ server certificate chain, hostname and validity checked before a byte of the ind
   delivery works at the syscall-return point (real `rt_sigaction`/`rt_sigprocmask`/
   `sigaltstack`/`rt_sigreturn`, `^C` → SIGINT with `EINTR` wake-ups in the blocking
   waits); a synthetic `procfs` serves
-  `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg}`, the read-only
-  `/proc/sys/kernel/{ostype,osrelease,hostname}` stubs and
-  `/proc/self/{exe,cmdline,status,maps}` — per-pid entries are
-  still missing, so `htop`/`ps` remain out of reach.
+  `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}`, the
+  read-only `/proc/sys/kernel/{ostype,osrelease,hostname}` stubs, `/proc/self/*`
+  and the per-pid tree `/proc/<pid>/{cmdline,stat,status,maps,cgroup,mountinfo,limits}`
+  plus `/proc/<pid>/{fd,fdinfo}/<n>`; `/proc/<pid>/fdinfo/<n>` reports the real
+  `pos`/`flags`/`mnt_id`/`ino` of the descriptor.
 - **Packages:** a by-name `apt` (`update`/`install`/`show`/`list`/`setmirror`) that fetches
   a Debian `Packages` index over HTTP/HTTPS, streams gzip/xz/zstd decompression into a
   compact in-RAM arena index, resolves dependencies, and installs `.deb`s onto ext2 `/mnt`
@@ -557,19 +558,25 @@ group, `SIGSTOP`/`SIGCONT` are real scheduler state (a stopped task keeps its sa
   sequences with `ONLCR`, `TCSETS*` applies real raw-mode (`ICANON`/`ECHO`) with
   kernel-side echo in raw mode, honest `tcgetattr` reports terminal state, and
   `ioctl(FIONBIO)` covers libuv's non-blocking path — `nvim` runs and saves its ShaDa.
-  A synthetic `/proc` (issue #11) now serves `/proc/cpuinfo`, `/proc/meminfo`,
+  A synthetic `/proc` (issue #11) serves `/proc/cpuinfo`, `/proc/meminfo`,
   `/proc/uptime`, `/proc/stat`, `/proc/version`, `/proc/filesystems`,
-  `/proc/loadavg`, the read-only `/proc/sys/kernel/{ostype,osrelease,hostname}`
-  stubs and `/proc/self/{exe,cmdline,status,maps}` from live kernel state
-  (CPUID, PMM counters, the tick clock, the scheduler's task counts, the calling
-  process's `CompatState`), with `readlink`/`lstat`/`getdents64` handling
-  `/proc/self/exe` as a real symlink. `/proc/loadavg` reports real 1/5/15-minute load
-  averages (there is no load accounting) plus live runnable/total counts and the
-  last allocated pid. What is still missing is the per-pid tree
-  (the mount table), so `htop` and
-  `ps` remain out of reach; `/proc/meminfo`-only consumers (busybox `free`, libuv's
-  `uv_get_total_memory`) and `/proc/uptime` consumers now work. See
-  `docs/procfs.md` for the exact contract and the deliberately deferred paths. Signal
+  `/proc/loadavg`, `/proc/mounts`, the read-only
+  `/proc/sys/kernel/{ostype,osrelease,hostname}` stubs, `/proc/self/*` and the
+  per-pid tree `/proc/<pid>/{cmdline,stat,status,maps,cgroup,mountinfo,limits}`
+  from live kernel state (CPUID, PMM counters, the tick clock, the scheduler's
+  task counts, the target process's `CompatState`), with
+  `readlink`/`lstat`/`getdents64` handling `/proc/self/exe` as a real symlink.
+  `/proc/<pid>/fd` exposes the fd table as numeric symlinks, and
+  `/proc/<pid>/fdinfo/<n>` reports the descriptor's real offset, open flags,
+  mount id (the same sorted mount table as mountinfo) and VFS inode — no
+  placeholder numbers; stdio/pipes/sockets, which have no VFS mount/inode,
+  report the documented 0 sentinel. `/proc/<pid>/limits` renders the 16 Linux
+  rlimit rows from the target's override table and the kernel defaults (stack
+  8 MiB, nofile 1024/1024, everything else `unlimited`). `/proc/loadavg` reports
+  real 1/5/15-minute load averages (there is no load accounting) plus live
+  runnable/total counts and the last allocated pid. Still deferred:
+  `/proc/<pid>/task/*` and mountinfo optional fields/statfs metadata. See
+  `docs/procfs.md` for the exact contract. Signal
   delivery is real at the syscall-return point (see above); asynchronous delivery
   from the timer-tick return path is not yet wired. See `LINUX-USERLAND.md` for the exact status.
 - **Transport.** Downloads use HTTP or HTTPS. HTTPS authenticates the peer fail-closed: the

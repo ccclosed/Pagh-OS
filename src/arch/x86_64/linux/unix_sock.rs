@@ -75,9 +75,12 @@ pub fn sys_socket(domain: u64, ty: u64, _protocol: u64) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     compat::with_current_compat(|cs| {
-        let fd = cs.fds.alloc(OpenObject::UnixSocketUnbound {
-            nonblocking: ty & SOCK_NONBLOCK != 0,
-        });
+        let fd = cs.fds.alloc_with_flags(
+            OpenObject::UnixSocketUnbound {
+                nonblocking: ty & SOCK_NONBLOCK != 0,
+            },
+            crate::task::fd::O_RDWR | (ty & SOCK_NONBLOCK),
+        );
         if ty & SOCK_CLOEXEC != 0 {
             cs.fds.set_cloexec(fd, true);
         }
@@ -167,7 +170,10 @@ pub fn sys_accept4(fd: u64, addr: u64, addrlen_ptr: u64, flags: u64) -> Result<u
                 let rx = rx.with_nonblocking(nb);
                 let tx = tx.with_nonblocking(nb);
                 drop(inner);
-                let newfd = cs.fds.alloc(OpenObject::Socket { rx, tx });
+                let newfd = cs.fds.alloc_with_flags(
+                    OpenObject::Socket { rx, tx },
+                    crate::task::fd::O_RDWR | (flags & SOCK_NONBLOCK),
+                );
                 if flags & SOCK_CLOEXEC != 0 {
                     cs.fds.set_cloexec(newfd, true);
                 }

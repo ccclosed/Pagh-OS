@@ -10,7 +10,7 @@ use alloc::sync::Arc;
 
 use crate::sync::spinlock::Spinlock;
 use crate::task::compat;
-use crate::task::fd::OpenObject;
+use crate::task::fd::{OpenObject, O_NONBLOCK, O_RDWR};
 
 use super::check_user_ptr;
 use super::errno::Errno;
@@ -35,7 +35,9 @@ fn create(mask: u64, flags: u64) -> Result<u64, Errno> {
     }
     let mask = Arc::new(Spinlock::new(mask));
     let fd = compat::with_current_compat(|cs| {
-        let fd = cs.fds.alloc(OpenObject::Signalfd { mask });
+        let fd = cs
+            .fds
+            .alloc_with_flags(OpenObject::Signalfd { mask }, O_RDWR | (flags & O_NONBLOCK));
         if flags & SFD_CLOEXEC != 0 {
             cs.fds.set_cloexec(fd, true);
         }

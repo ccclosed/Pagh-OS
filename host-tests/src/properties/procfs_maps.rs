@@ -247,7 +247,18 @@ fn procfs_table_is_stable_and_unique() {
     );
     assert_eq!(
         PROC_SELF_FILES.iter().map(|e| e.name).collect::<Vec<_>>(),
-        ["exe", "cmdline", "status", "maps", "stat", "statm", "mounts", "cgroup", "mountinfo"]
+        [
+            "exe",
+            "cmdline",
+            "status",
+            "maps",
+            "stat",
+            "statm",
+            "mounts",
+            "cgroup",
+            "mountinfo",
+            "limits",
+        ]
     );
     assert_eq!(
         PROC_PID_FILES.iter().map(|e| e.name).collect::<Vec<_>>(),
@@ -294,6 +305,7 @@ fn procfs_table_is_stable_and_unique() {
     assert!(crate::procfs_format::proc_self_file("mounts").is_some());
     assert!(crate::procfs_format::proc_file("devices").is_none());
     assert!(crate::procfs_format::proc_self_file("fd").is_none());
+    assert!(crate::procfs_format::proc_self_file("limits").is_some());
     assert!(crate::procfs_format::proc_self_file("status/x").is_none());
     assert!(crate::procfs_format::proc_self_file("").is_none());
     assert!(crate::procfs_format::proc_sys_file("kernel").is_none());
@@ -301,6 +313,7 @@ fn procfs_table_is_stable_and_unique() {
     assert!(crate::procfs_format::proc_sys_file("").is_none());
     assert!(proc_pid_file("exe").is_none());
     assert!(proc_pid_file("statm").is_none());
+    assert!(proc_pid_file("limits").is_some());
     assert!(proc_pid_file("stat/child").is_none());
 
     let mut inos: Vec<u64> = Vec::new();

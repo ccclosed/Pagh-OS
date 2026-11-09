@@ -422,6 +422,7 @@ mod properties {
     // streams.
     mod procfs_cmdline;
     mod procfs_cpuinfo;
+    mod procfs_fdinfo_limits;
     mod procfs_maps;
     mod procfs_meminfo;
     mod procfs_misc;

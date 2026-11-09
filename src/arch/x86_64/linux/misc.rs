@@ -890,12 +890,12 @@ const RLIMIT_STACK: u64 = 3;
 const RLIMIT_NOFILE: u64 = 7;
 /// Number of rlimit resources Linux defines (`RLIMIT_NLIMITS`); larger
 /// resource ids are rejected with `EINVAL`.
-const RLIMIT_NLIMITS: u64 = 16;
+pub(crate) const RLIMIT_NLIMITS: u64 = 16;
 
 /// Kernel-default `(cur, max)` rlimit pair for `resource` when the process has
 /// no `prlimit64`/`setrlimit` override. `RLIMIT_NOFILE`'s hard limit is the
 /// descriptor-table capacity (`io_sys::NOFILE_MAX`).
-fn default_rlimit(resource: u64) -> (u64, u64) {
+pub(crate) fn default_rlimit(resource: u64) -> (u64, u64) {
     match resource {
         RLIMIT_STACK => (8 * 1024 * 1024, RLIM_INFINITY), // 8 MiB soft stack
         RLIMIT_NOFILE => (1024, super::io_sys::NOFILE_MAX), // open-file limits

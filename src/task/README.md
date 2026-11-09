@@ -16,7 +16,7 @@
 | `switch.rs` | Контекст-свитч на asm: раскладка сохранённого фрейма, `yield_switch()`, `irq32_stub`, `kernel_thread_trampoline`, `scheduler_exit_thread` |
 | `process.rs` | Создание user-процессов: ring-3 стартовые фреймы, `create_user_process`, `run_linux_binary`, `exec_linux_image`, `fork_linux_process`, `spawn_linux_thread` |
 | `compat.rs` | Per-pid реестр `CompatState` (`COMPAT_STATES`): fd-таблица, VM-состояние, TLS, tid/tgid/ppid, cwd, umask, rlimits, exit-коды, зомби (`EXITED_CHILDREN`) |
-| `fd.rs` | Ядровая fd-таблица: `OpenObject` (консоль, файл, dir, pipes, сокеты, epoll, eventfd), `FdTable`, `PipeEndpoint`, plumbing AF_UNIX-слушателей |
+| `fd.rs` | Ядровая fd-таблица: `OpenObject` (консоль, файл, dir, pipes, сокеты, epoll, eventfd), `FdTable` с per-fd open/status flags (для `fdinfo`), `PipeEndpoint`, plumbing AF_UNIX-слушателей |
 | `fd_alloc.rs` | Чистая bookkeeping fd-слотов (`FdSlots<T>`, `lowest_free_index`); core+alloc, шарится в host-tests |
 | `fpu.rs` | FPU/SSE per-task: eager FXSAVE/FXRSTOR (`FxArea`, 512 B, align 64) |
 | `stack.rs` | Чистый энкодер стартового стека System V + auxv (`build_initial_stack`, `AuxInputs`); хост-тестируемый |
@@ -36,7 +36,7 @@
   `fork_current_compat/clone_current_compat`, `finish_compat_exit`, `reap_child/has_child`,
   `compat_is_raw(pid)`, `compat_lock_held()`.
 - `fd`: `OpenObject::{Console, Stdin, InetTcp, InetUdp, File, PipeRead/PipeWrite, Eventfd, Socket, UnixListener, UnixSocketUnbound, Epoll, Dir}`,
-  `FdTable::{alloc, get, close, dup, dup_min, dup_to, pipe, socketpair, set_cloexec}`,
+  `FdTable::{alloc, alloc_with_flags, get, close, dup, dup_min, dup_to, pipe, socketpair, set_cloexec, fdinfo_flags}`,
   `PipeEndpoint` c `PipeReadResult`/`PipeWriteResult`.
 - `fpu`: `FxArea`, `area_for(pid)`, `save_if_user/restore_if_user`.
 - `stack`: auxv-теги `at::*`, `build_initial_stack(...)`, `StackImage`, `arg_gate` (≤256 аргументов, ≤4096 байт).

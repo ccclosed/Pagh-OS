@@ -325,16 +325,19 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
 ## Known open gaps (good first issues, all documented in-code)
 
 
-- procfs covers slices 1–4 (issue #11, contract `docs/procfs.md`):
-  `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg}`,
-  `/proc/<pid>/{cmdline,stat,status,maps}`, `/proc/self/{exe,cmdline,status,maps,stat,statm}`
+- procfs covers slices 1–5 (issue #11, contract `docs/procfs.md`):
+  `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}`,
+  `/proc/<pid>/{cmdline,stat,status,maps,cgroup,mountinfo,limits}`,
+  `/proc/self/{exe,cmdline,status,maps,stat,statm,mounts,cgroup,mountinfo,limits}`
   and read-only `/proc/sys/kernel/{ostype,osrelease,hostname}` are rendered from
   live kernel state (CPUID, PMM counters, the tick clock, the scheduler's
   user/system/idle tick accounting and live task counts, and the target
   process's `CompatState` snapshot). `/proc/self/fd` and `/proc/<pid>/fd` expose
-  the fd table as numeric symlinks. `/proc/self/cgroup` and `/proc/<pid>/cgroup`
-  report the single root cgroup (`0::/`, no controllers). Deferred, returning
-  `ENOENT` today: mountinfo/statfs metadata.
+  the fd table as numeric symlinks; `/proc/<pid>/fdinfo/<n>` reports the real
+  `pos`/`flags`/`mnt_id`/`ino` of an open descriptor (0 for objects with no VFS
+  mount/inode), and `/proc/<pid>/limits` renders the 16 Linux rlimit rows from
+  the target's override table plus kernel defaults. Deferred: `/proc/<pid>/task/*`,
+  mountinfo optional fields and statfs metadata.
 - Signals (issue #12): `kill(2)` (nr 62), process-group addressing
   (`kill(0|-1|-pgid)`), `SIGSTOP`/`SIGCONT` scheduling, `wait4(WUNTRACED|WCONTINUED)`
   and timer-tick delivery to a syscall-free task are all implemented. SIGCHLD is

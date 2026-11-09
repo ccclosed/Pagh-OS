@@ -40,6 +40,7 @@
 //! invariant 4), while a cpu-bound target may be concurrently changing its
 //! `VmRegionSet`.
 
+use alloc::borrow::Cow;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -47,6 +48,7 @@ use alloc::vec::Vec;
 
 use crate::arch::x86_64::apic::TICK_HZ;
 use crate::arch::x86_64::cpuid;
+use crate::arch::x86_64::linux::misc;
 use crate::arch::x86_64::linux::signal_frame::{SIG_DFL, SIG_IGN};
 use crate::memory::layout::{PAGE_SIZE, USER_STACK_PAGES, USER_STACK_TOP};
 use crate::memory::pmm;
@@ -66,6 +68,11 @@ const _: () = assert!(TICK_HZ == stat::USER_HZ);
 /// The real crate version (`Cargo.toml` is the single source), the same value
 /// `provision.rs` writes to `/mnt/etc/pagh-release`.
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// `/proc/.../limits` renders one row per Linux resource id; the rlimit table and
+// the syscall layer must agree on that width or `limits` would silently omit or
+// invent a row.
+const _: () = assert!(fmt::RLIMIT_COUNT == misc::RLIMIT_NLIMITS as usize);
 
 /// The `/proc` subtree root, ready for `vfs::mount_at("/proc", …)`.
 pub fn root() -> Arc<dyn VfsNode> {
@@ -92,6 +99,8 @@ enum DirKind {
     Pid(u64),
     /// `/proc/self/fd` or `/proc/<pid>/fd`, carrying the target pid.
     FdDir(u64),
+    /// `/proc/self/fdinfo` or `/proc/<pid>/fdinfo`, carrying the target pid.
+    FdInfoDir(u64),
 }
 
 struct ProcDir {
@@ -205,9 +214,33 @@ fn fd_snapshot(pid: u64) -> Vec<(u32, String)> {
 fn fd_dir(pid: u64) -> Arc<dyn VfsNode> {
     Arc::new(ProcDir {
         name: String::from("fd"),
-        ino: fmt::pid_dir_ino(pid) + 5,
+        ino: fmt::pid_dir_ino(pid) + 0x10,
         kind: DirKind::FdDir(pid),
     })
+}
+
+/// `/proc/self/fdinfo` or `/proc/<pid>/fdinfo`: one regular file per open fd.
+fn fdinfo_dir(pid: u64) -> Arc<dyn VfsNode> {
+    Arc::new(ProcDir {
+        name: String::from("fdinfo"),
+        ino: fmt::pid_dir_ino(pid) + 0x11,
+        kind: DirKind::FdInfoDir(pid),
+    })
+}
+
+/// The target's open descriptors, as numbers only (the fdinfo renderer reads
+/// the object itself later, outside the registry lock).
+fn open_fds(pid: u64) -> Vec<u32> {
+    compat::with_pid_compat(pid, |cs| {
+        (0..cs.fds.capacity() as u32)
+            .filter(|fd| cs.fds.get(*fd).is_some())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn fd_is_open(pid: u64, fd: u32) -> bool {
+    compat::with_pid_compat(pid, |cs| cs.fds.get(fd).is_some()).unwrap_or(false)
 }
 
 impl VfsNode for ProcDir {
@@ -245,7 +278,9 @@ impl VfsNode for ProcDir {
                     out.push(file_for(e));
                 }
                 if compat::current_has_compat() {
-                    out.push(fd_dir(scheduler::current_pid()));
+                    let pid = scheduler::current_pid();
+                    out.push(fd_dir(pid));
+                    out.push(fdinfo_dir(pid));
                 }
             }
             DirKind::SysDir => {
@@ -261,14 +296,20 @@ impl VfsNode for ProcDir {
                     out.push(pid_file(pid, e));
                 }
                 out.push(fd_dir(pid));
+                out.push(fdinfo_dir(pid));
             }
             DirKind::FdDir(pid) => {
                 for (fd, target) in fd_snapshot(pid) {
                     out.push(Arc::new(ProcFdLink {
                         name: alloc::format!("{fd}"),
                         target,
-                        ino: fmt::pid_dir_ino(pid) + 0x100 + fd as u64,
+                        ino: fmt::pid_fd_ino(pid, fd),
                     }));
+                }
+            }
+            DirKind::FdInfoDir(pid) => {
+                for fd in open_fds(pid) {
+                    out.push(fdinfo_file(pid, fd));
                 }
             }
         }
@@ -308,6 +349,13 @@ impl VfsNode for ProcDir {
                         Err(VfsError::NotFound)
                     };
                 }
+                if name == "fdinfo" {
+                    return if compat::current_has_compat() {
+                        Ok(fdinfo_dir(scheduler::current_pid()))
+                    } else {
+                        Err(VfsError::NotFound)
+                    };
+                }
                 let e = fmt::proc_self_file(name).ok_or(VfsError::NotFound)?;
                 if e.kind == ProcKind::SelfExe && current_exe().is_none() {
                     // No image to point at (`readlink` used to answer ENOENT in
@@ -333,6 +381,9 @@ impl VfsNode for ProcDir {
                 if name == "fd" {
                     return Ok(fd_dir(pid));
                 }
+                if name == "fdinfo" {
+                    return Ok(fdinfo_dir(pid));
+                }
                 fmt::proc_pid_file(name)
                     .map(|e| pid_file(pid, e))
                     .ok_or(VfsError::NotFound)
@@ -347,8 +398,18 @@ impl VfsNode for ProcDir {
                 Ok(Arc::new(ProcFdLink {
                     name: String::from(name),
                     target,
-                    ino: fmt::pid_dir_ino(pid) + 0x100 + fd as u64,
+                    ino: fmt::pid_fd_ino(pid, fd),
                 }))
+            }
+            DirKind::FdInfoDir(pid) => {
+                if !compat::compat_exists(pid) {
+                    return Err(VfsError::NotFound);
+                }
+                let fd: u32 = name.parse().map_err(|_| VfsError::NotFound)?;
+                if !fd_is_open(pid, fd) {
+                    return Err(VfsError::NotFound);
+                }
+                Ok(fdinfo_file(pid, fd))
             }
         }
     }
@@ -358,20 +419,35 @@ impl VfsNode for ProcDir {
 
 fn file_for(e: fmt::ProcEntry) -> Arc<dyn VfsNode> {
     Arc::new(ProcFile {
-        name: e.name,
+        name: Cow::Borrowed(e.name),
         ino: e.ino,
         kind: e.kind,
         pid: 0,
+        fd: 0,
         buf: Spinlock::new(None),
     })
 }
 
 fn pid_file(pid: u64, e: fmt::ProcPidEntry) -> Arc<dyn VfsNode> {
     Arc::new(ProcFile {
-        name: e.name,
+        name: Cow::Borrowed(e.name),
         ino: fmt::pid_file_ino(pid, e.slot),
         kind: e.kind,
         pid,
+        fd: 0,
+        buf: Spinlock::new(None),
+    })
+}
+
+/// `/proc/<pid>/fdinfo/<fd>`: the text node is created only for a live pid and
+/// an open descriptor (the caller has already checked both).
+fn fdinfo_file(pid: u64, fd: u32) -> Arc<dyn VfsNode> {
+    Arc::new(ProcFile {
+        name: Cow::Owned(alloc::format!("{fd}")),
+        ino: fmt::pid_fdinfo_ino(pid, fd),
+        kind: fmt::ProcKind::FdInfo,
+        pid,
+        fd,
         buf: Spinlock::new(None),
     })
 }
@@ -382,11 +458,15 @@ fn current_exe() -> Option<String> {
 }
 
 struct ProcFile {
-    name: &'static str,
+    /// Static table name, or the decimal fd for a `fdinfo` node.
+    name: Cow<'static, str>,
     ino: u64,
     kind: ProcKind,
-    /// Target of a `ProcKind::Pid*` node; ignored by the `Self*`/static kinds.
+    /// Target of a `ProcKind::Pid*`/`FdInfo` node; ignored by the
+    /// `Self*`/static kinds.
     pid: u64,
+    /// Descriptor of a `ProcKind::FdInfo` node (0 for every other kind).
+    fd: u32,
     /// The render in use for the current reading pass. Filled on demand; a
     /// zero-offset read refreshes it (see the module docs).
     buf: Spinlock<Option<Vec<u8>>>,
@@ -448,6 +528,9 @@ impl ProcFile {
             ProcKind::SysOsrelease => fmt::format_sys_osrelease(KERNEL_VERSION),
             ProcKind::SysHostname => fmt::format_sys_hostname(),
             ProcKind::SelfCgroup | ProcKind::PidCgroup => fmt::format_cgroup(),
+            ProcKind::FdInfo => self.render_fdinfo(self.pid, self.fd),
+            ProcKind::SelfLimits => self.render_limits(scheduler::current_pid()),
+            ProcKind::PidLimits => self.render_limits(self.pid),
             ProcKind::SelfMountInfo | ProcKind::PidMountInfo => {
                 let snapshot = crate::vfs::mount_snapshot();
                 let owned: Vec<(String, &'static str)> = snapshot
@@ -558,6 +641,122 @@ impl ProcFile {
         };
         maps_text(&s)
     }
+
+    /// `/proc/<pid>/limits`: the target's effective `(soft, hard)` pair for
+    /// every Linux resource id. A per-process `prlimit64`/`setrlimit` override
+    /// wins; otherwise the kernel default (`misc::default_rlimit`) is reported,
+    /// which is exactly what `getrlimit(2)` returns for that target. Resources
+    /// the kernel does not model default to `RLIM_INFINITY` and render as
+    /// `unlimited` — never as an invented number.
+    fn render_limits(&self, pid: u64) -> Vec<u8> {
+        let Some(values) = compat::with_pid_compat(pid, |cs| {
+            let mut values = [(fmt::RLIM_INFINITY, fmt::RLIM_INFINITY); fmt::RLIMIT_COUNT];
+            for (resource, slot) in values.iter_mut().enumerate() {
+                *slot = cs
+                    .rlimits
+                    .get(&(resource as u64))
+                    .copied()
+                    .unwrap_or_else(|| misc::default_rlimit(resource as u64));
+            }
+            values
+        }) else {
+            return Vec::new();
+        };
+        fmt::format_limits(&values)
+    }
+
+    /// `/proc/<pid>/fdinfo/<fd>`: snapshot the descriptor's real position,
+    /// flags, mount and inode under the registry lock, then format after it is
+    /// released. `mnt_id`/`ino` stay 0 for objects with no VFS mount/inode.
+    fn render_fdinfo(&self, pid: u64, fd: u32) -> Vec<u8> {
+        let Some(s) = compat::with_pid_compat(pid, |cs| FdInfoSnap::from(cs, fd)).flatten() else {
+            return Vec::new();
+        };
+        let mnt_id = s.path.as_deref().map(mount_id_for_path).unwrap_or(0);
+        let ino = match &s.node {
+            Some(node) => crate::arch::x86_64::linux::io_sys::node_ino(node),
+            // A directory descriptor keeps only its path; resolve it outside
+            // the registry lock to report the directory's real inode.
+            None => s
+                .path
+                .as_deref()
+                .and_then(|path| super::lookup_path(path).ok())
+                .map(|node| crate::arch::x86_64::linux::io_sys::node_ino(&node))
+                .unwrap_or(0),
+        };
+        fmt::format_fdinfo(&fmt::FdInfo {
+            pos: s.pos,
+            flags: s.flags,
+            mnt_id,
+            ino,
+        })
+    }
+}
+
+/// Real descriptor fields copied out from under `COMPAT_STATES`.
+struct FdInfoSnap {
+    pos: u64,
+    flags: u64,
+    /// Absolute VFS path for a `File`/`Dir` descriptor; `None` for stdio,
+    /// pipes, sockets and the other anonymous objects.
+    path: Option<String>,
+    /// Backing VFS node for a `File` descriptor (cloned so `fs_ino()` runs
+    /// after the registry lock is released).
+    node: Option<Arc<dyn VfsNode>>,
+}
+
+impl FdInfoSnap {
+    fn from(cs: &CompatState, fd: u32) -> Option<Self> {
+        let flags = cs.fds.fdinfo_flags(fd)?;
+        match cs.fds.get(fd)? {
+            OpenObject::File { node, path, offset } => Some(FdInfoSnap {
+                pos: *offset,
+                flags,
+                path: Some(path.clone()),
+                node: Some(Arc::clone(node)),
+            }),
+            // The only position a directory descriptor has in this kernel is
+            // the `getdents64` child cursor (`lseek(SEEK_SET)` sets exactly
+            // this index), so report it as `pos` rather than inventing a byte
+            // offset Linux would report.
+            OpenObject::Dir { path, index, .. } => Some(FdInfoSnap {
+                pos: *index as u64,
+                flags,
+                path: Some(path.clone()),
+                node: None,
+            }),
+            _ => Some(FdInfoSnap {
+                pos: 0,
+                flags,
+                path: None,
+                node: None,
+            }),
+        }
+    }
+}
+
+/// Map a kernel VFS path to the id `/proc/*/mountinfo` assigns it: the
+/// 1-based index of the longest matching mount point in the sorted
+/// [`super::mount_snapshot`]. This is the same table and the same order, so a
+/// file's `mnt_id` and the corresponding mountinfo row agree. `memfd` paths are
+/// not mounted anywhere and report 0.
+fn mount_id_for_path(path: &str) -> u64 {
+    if path.starts_with("/memfd:") {
+        return 0;
+    }
+    let mut best: Option<(usize, u64)> = None;
+    for (index, entry) in super::mount_snapshot().iter().enumerate() {
+        let point = entry.point.as_str();
+        let matches = point == "/"
+            || path == point
+            || path
+                .strip_prefix(point)
+                .is_some_and(|rest| rest.starts_with('/'));
+        if matches && best.map_or(true, |(len, _)| point.len() > len) {
+            best = Some((point.len(), index as u64 + 1));
+        }
+    }
+    best.map(|(_, id)| id).unwrap_or(0)
 }
 
 /// Is the target task currently parked by a stop signal? This kernel tracks
@@ -795,7 +994,7 @@ fn page_up(addr: u64) -> u64 {
 
 impl VfsNode for ProcFile {
     fn name(&self) -> &str {
-        self.name
+        &self.name
     }
 
     fn is_directory(&self) -> bool {

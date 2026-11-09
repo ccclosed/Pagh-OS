@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 
 use crate::sync::spinlock::Spinlock;
 use crate::task::compat;
-use crate::task::fd::{OpenObject, TimerfdState};
+use crate::task::fd::{OpenObject, TimerfdState, O_NONBLOCK, O_RDWR};
 
 use super::check_user_ptr;
 use super::errno::Errno;
@@ -85,7 +85,9 @@ pub fn sys_timerfd_create(clockid: u64, flags: u64) -> Result<u64, Errno> {
         nonblocking: flags & TFD_NONBLOCK != 0,
     }));
     let fd = compat::with_current_compat(|cs| {
-        let fd = cs.fds.alloc(OpenObject::Timerfd(state));
+        let fd = cs
+            .fds
+            .alloc_with_flags(OpenObject::Timerfd(state), O_RDWR | (flags & O_NONBLOCK));
         if flags & TFD_CLOEXEC != 0 {
             cs.fds.set_cloexec(fd, true);
         }

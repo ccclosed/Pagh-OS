@@ -124,7 +124,10 @@ pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
                 connected: AtomicBool::new(false),
                 eof: AtomicBool::new(false),
             });
-            let fd = cs.fds.alloc(OpenObject::InetTcp(sock));
+            let fd = cs.fds.alloc_with_flags(
+                OpenObject::InetTcp(sock),
+                crate::task::fd::O_RDWR | (ty & SOCK_NONBLOCK),
+            );
             if cloexec {
                 cs.fds.set_cloexec(fd, true);
             }
@@ -137,7 +140,10 @@ pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
                 nonblocking: AtomicBool::new(nonblocking),
                 peer: crate::sync::spinlock::Spinlock::new(None),
             });
-            let fd = cs.fds.alloc(OpenObject::InetUdp(sock));
+            let fd = cs.fds.alloc_with_flags(
+                OpenObject::InetUdp(sock),
+                crate::task::fd::O_RDWR | (ty & SOCK_NONBLOCK),
+            );
             if cloexec {
                 cs.fds.set_cloexec(fd, true);
             }
