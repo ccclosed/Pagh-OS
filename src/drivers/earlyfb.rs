@@ -49,6 +49,10 @@ struct Console {
 
 static CONSOLE: Spinlock<Option<Console>> = Spinlock::new(None);
 static READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Set while a message is being drawn. A fault INSIDE the reporter would
+/// otherwise take the console lock a second time and deadlock, leaving the
+/// machine silent — the exact failure this module exists to prevent.
+static IN_REPORT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Colours (0x00RRGGBB), matching the normal console's defaults.
 const FG: u32 = 0xFF_AAAAAA;
@@ -179,8 +183,17 @@ fn emit(text: &str, colour: u32) {
     if !READY.load(core::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let mut guard = CONSOLE.lock();
+    // Re-entrancy guard: if the console is already drawing, a fault here means
+    // the reporter itself is broken, and re-locking would deadlock.
+    if IN_REPORT.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let Some(mut guard) = CONSOLE.try_lock() else {
+        IN_REPORT.store(false, core::sync::atomic::Ordering::Release);
+        return;
+    };
     let Some(c) = guard.as_mut() else {
+        IN_REPORT.store(false, core::sync::atomic::Ordering::Release);
         return;
     };
     let cols = c.width / CELL_W;
@@ -249,6 +262,8 @@ fn emit(text: &str, colour: u32) {
             c.row = rows - 1;
         }
     }
+    drop(guard);
+    IN_REPORT.store(false, core::sync::atomic::Ordering::Release);
 }
 
 /// Print a line of progress text (grey).
@@ -274,7 +289,9 @@ pub fn clear() {
     if !init() {
         return;
     }
-    let mut guard = CONSOLE.lock();
+    let Some(mut guard) = CONSOLE.try_lock() else {
+        return;
+    };
     let Some(c) = guard.as_mut() else {
         return;
     };

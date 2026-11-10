@@ -164,6 +164,11 @@ extern "x86-interrupt" fn device_not_available_handler(stack: InterruptStackFram
     halt();
 }
 extern "x86-interrupt" fn double_fault_handler(stack: InterruptStackFrame, error_code: u64) -> ! {
+    crate::drivers::earlyfb::errorln(format_args!(
+        "EXCEPTION #8 double fault err={:#x} RIP={:#x}",
+        error_code,
+        stack.instruction_pointer.as_u64()
+    ));
     crate::error!(
         "[EXC #8] DOUBLE FAULT err=0x{:x} RIP=0x{:016x}",
         error_code,
@@ -200,6 +205,11 @@ pub fn note_syscall(pid: u64, nr: u64) {
 }
 
 extern "x86-interrupt" fn gp_fault_handler(stack: InterruptStackFrame, error_code: u64) {
+    crate::drivers::earlyfb::errorln(format_args!(
+        "EXCEPTION #13 general protection err={:#x} RIP={:#x}",
+        error_code,
+        stack.instruction_pointer.as_u64()
+    ));
     crate::error!(
         "[EXC #13] GP Fault err=0x{:x} RIP=0x{:016x} RSP=0x{:016x}",
         error_code,
@@ -297,6 +307,14 @@ extern "x86-interrupt" fn page_fault_handler(
         return;
     }
 
+    // On a machine with no serial port the screen is the only witness to a
+    // fault, and a fault is exactly what "the boot stopped after step N" looks
+    // like: the handler logged to COM1 and halted. Report here too.
+    crate::drivers::earlyfb::errorln(format_args!(
+        "EXCEPTION #14 page fault addr={:#x} RIP={:#x}",
+        fault_addr.as_u64(),
+        stack.instruction_pointer.as_u64()
+    ));
     crate::error!(
         "[EXC #14] PAGE FAULT addr=0x{:016x} RIP=0x{:016x} RSP=0x{:016x} P={} W={} U={} I={} ec=0x{:x}",
         fault_addr.as_u64(),

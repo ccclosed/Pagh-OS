@@ -95,6 +95,21 @@ fn init_lapic() {
     let mut apic_base_msr = crate::arch::cpu::read_msr(0x1B);
     crate::debug!("LAPIC MSR before: 0x{:016x}", apic_base_msr);
 
+    // x2APIC (bit 10) puts the LAPIC behind MSRs and takes the memory-mapped
+    // register window away. Firmware on modern machines may hand over with it
+    // already enabled, and this driver is a memory-mapped one: every later
+    // `lapic_write` would go to a window the CPU no longer answers at, which is
+    // exactly a boot that stops right here with no output on a machine whose
+    // firmware enabled x2APIC. Disable it (the architectural way back to xAPIC)
+    // and say so, rather than reading registers that are no longer there.
+    if apic_base_msr & (1 << 10) != 0 {
+        crate::warn!("LAPIC: x2APIC was enabled by firmware; switching to xAPIC (MMIO)");
+        apic_base_msr &= !(1 << 10);
+        crate::drivers::earlyfb::println(format_args!(
+            "note: x2APIC was on, switched to xAPIC MMIO"
+        ));
+    }
+
     // Set bit 11 (global enable)
     apic_base_msr |= 1 << 11;
 

@@ -36,6 +36,18 @@ fn fatal(step: &str) -> ! {
     arch::cpu::halt_loop();
 }
 
+/// Announce that a boot step is about to run, on the emergency console.
+///
+/// Printed BEFORE the step: a step that hangs never prints its `ok`, so the row
+/// naming it in progress is exactly the one to look at. (This is how the "stops
+/// after heap" report is read: heap finished, so the hang is in the step named
+/// `> apic` below it.)
+fn step_begin(visible: bool, name: &str) {
+    if visible {
+        crate::drivers::earlyfb::println(format_args!("  >  {}", name));
+    }
+}
+
 /// Report a completed boot step on the emergency console (when there is one).
 fn step(visible: bool, name: &str) {
     if visible {
@@ -68,38 +80,55 @@ pub fn start() -> ! {
         ));
     }
 
+    step_begin(visible, "init_serial");
     init_serial();
     step(visible, "serial");
+    step_begin(visible, "check_base_revision");
     check_base_revision();
     step(visible, "base revision");
+    step_begin(visible, "read_limine_responses");
     read_limine_responses();
     step(visible, "limine responses");
+    step_begin(visible, "init_descriptor_tables");
     init_descriptor_tables();
     step(visible, "gdt + idt");
+    step_begin(visible, "init_syscalls");
     init_syscalls();
     step(visible, "syscalls");
+    step_begin(visible, "init_pmm");
     init_pmm();
     step(visible, "pmm");
+    step_begin(visible, "init_vmm");
     init_vmm();
     step(visible, "vmm");
+    step_begin(visible, "init_heap");
     init_heap();
     step(visible, "heap");
+    step_begin(visible, "init_apic");
     init_apic();
     step(visible, "apic");
+    step_begin(visible, "init_drivers");
     init_drivers();
     step(visible, "drivers");
+    step_begin(visible, "init_virtio");
     init_virtio();
     step(visible, "virtio");
+    step_begin(visible, "init_scheduler");
     init_scheduler();
     step(visible, "scheduler");
+    step_begin(visible, "init_usb");
     init_usb();
     step(visible, "usb");
+    step_begin(visible, "init_vfs");
     init_vfs();
     step(visible, "vfs");
+    step_begin(visible, "init_ramdisk");
     init_ramdisk();
     step(visible, "ramdisk");
+    step_begin(visible, "init_fs");
     init_fs();
     step(visible, "fs");
+    step_begin(visible, "init_net");
     init_net();
     step(visible, "net");
 
