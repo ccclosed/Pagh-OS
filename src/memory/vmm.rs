@@ -182,11 +182,30 @@ impl PageTableWalker {
         table: &mut PageTable,
         idx: PageTableIndex,
         flags: PageTableFlags,
+        level: EntryLevel,
     ) -> Result<&'static mut PageTable, VmError> {
         // Flags an intermediate entry should carry: present + writable, plus
         // user-accessibility only when the leaf mapping requested it.
         let user = flags & PageTableFlags::USER_ACCESSIBLE;
         let intermediate_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | user;
+
+        // A HUGE PAGE here is not a page table.
+        //
+        // Limine maps the HHDM with 2 MiB — and on some machines 1 GiB — pages,
+        // so a walk that reaches this level finds a present entry whose HUGE_PAGE
+        // bit is set and whose "frame address" is the start of a large region of
+        // RAM, not a table of 512 entries. Treating it as a table (the previous
+        // behaviour) walked into whatever bytes lived there and produced a
+        // non-canonical pointer — a GENERAL PROTECTION fault, not a page fault.
+        // That is what killed `map_mmio` on real hardware while QEMU, whose HHDM
+        // happened not to be covered by a huge page at that address, booted fine.
+        //
+        // The level decides what replaces it: a 2 MiB page becomes a full table
+        // of 4 KiB entries, a 1 GiB page becomes a table of 2 MiB huge entries
+        // (the next level down splits those again, on demand).
+        if table[idx].flags().contains(PageTableFlags::HUGE_PAGE) {
+            self.split_huge(table, idx, level)?;
+        }
 
         if !table[idx].flags().contains(PageTableFlags::PRESENT) {
             let frame = crate::memory::pmm::alloc_frame().ok_or(VmError::OutOfMemory)?;
@@ -209,6 +228,73 @@ impl PageTableWalker {
         }
         Ok(self.table_mut(table[idx].addr().as_u64()))
     }
+
+    /// Replace a huge-page entry with a real page table covering the same memory.
+    ///
+    /// `level` is the level of the entry being split: an entry in a PD (level
+    /// `Pd`) describes 2 MiB and is replaced by a PT of 4 KiB mappings; an entry
+    /// in a PDPT (`Pdpt`) describes 1 GiB and is replaced by a PD of 2 MiB huge
+    /// mappings. The huge page's own flags are copied into every leaf, so a
+    /// read-only or non-executable HHDM region keeps those properties — dropping
+    /// them would silently widen permissions on memory the kernel does not own.
+    fn split_huge(
+        &self,
+        table: &mut PageTable,
+        idx: PageTableIndex,
+        level: EntryLevel,
+    ) -> Result<(), VmError> {
+        let huge_flags = table[idx].flags();
+        let base = table[idx].addr().as_u64();
+        let leaf_flags = huge_flags & !PageTableFlags::HUGE_PAGE;
+
+        let frame = crate::memory::pmm::alloc_frame().ok_or(VmError::OutOfMemory)?;
+        // SAFETY: `frame` is a freshly allocated, HHDM-mapped page owned by us.
+        unsafe { ptr::write_bytes((frame + self.hhdm) as *mut u8, 0, 4096) };
+
+        // SAFETY: `frame` is our own HHDM-mapped page; the entries written to it
+        // reproduce exactly the region the huge entry described, so nothing that
+        // was mapped stops being mapped.
+        unsafe {
+            let new_table = &mut *((frame + self.hhdm) as *mut PageTable);
+            match level {
+                // 1 GiB entry -> 512 × 2 MiB entries (still huge, split later).
+                EntryLevel::Pdpt => {
+                    let sub = leaf_flags | PageTableFlags::HUGE_PAGE;
+                    for i in 0..512usize {
+                        new_table[i].set_addr(PhysAddr::new(base + (i as u64) * 0x20_0000), sub);
+                    }
+                }
+                // 2 MiB entry -> 512 × 4 KiB entries.
+                EntryLevel::Pd => {
+                    for i in 0..512usize {
+                        new_table[i]
+                            .set_addr(PhysAddr::new(base + (i as u64) * 0x1000), leaf_flags);
+                    }
+                }
+                // A huge page cannot legitimately appear at these levels; leaving
+                // the entry alone is safer than splitting something unknown.
+                EntryLevel::Pml4 | EntryLevel::Pt => {
+                    crate::warn!("[VMM] unexpected huge page at {:?}; not splitting", level);
+                    return Ok(());
+                }
+            }
+        }
+
+        table[idx].set_addr(PhysAddr::new(frame), leaf_flags);
+        Ok(())
+    }
+}
+
+/// Which level of the page-table hierarchy an entry belongs to.
+///
+/// Needed because the meaning of `HUGE_PAGE` depends on it: the bit is reserved
+/// in a PML4 and a PT entry, means 1 GiB in a PDPT entry and 2 MiB in a PD entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntryLevel {
+    Pml4,
+    Pdpt,
+    Pd,
+    Pt,
 }
 
 /// Walk page tables to translate a virtual address to a physical address.
@@ -309,9 +395,9 @@ pub fn map(phys_addr: u64, virt_addr: u64, flags: PageTableFlags) -> Result<(), 
     // Walk (allocating intermediates) down to the PT. The walker confines all
     // page-table-deref `unsafe`, so this reads as safe code.
     let pml4 = walker.root_mut();
-    let pdpt = walker.ensure_next(pml4, virt.p4_index(), flags)?;
-    let pd = walker.ensure_next(pdpt, virt.p3_index(), flags)?;
-    let pt = walker.ensure_next(pd, virt.p2_index(), flags)?;
+    let pdpt = walker.ensure_next(pml4, virt.p4_index(), flags, EntryLevel::Pml4)?;
+    let pd = walker.ensure_next(pdpt, virt.p3_index(), flags, EntryLevel::Pdpt)?;
+    let pt = walker.ensure_next(pd, virt.p2_index(), flags, EntryLevel::Pd)?;
 
     // Never silently overwrite a live translation. A present
     // PTE pointing at a *different* frame means two owners believe they own
@@ -590,20 +676,25 @@ pub fn clone_user_space(src_pml4: u64, dst_pml4: u64) -> Result<(), VmError> {
                     }
                     if dst1.is_none() {
                         let p4 = walker.table_mut(dst_pml4);
+                        // Levels are named for the ENTRY being walked through,
+                        // which is what decides the meaning of HUGE_PAGE there.
                         let p3 = walker.ensure_next(
                             p4,
                             x86_64::structures::paging::PageTableIndex::new(i4 as u16),
                             user,
+                            EntryLevel::Pml4,
                         )?;
                         let p2 = walker.ensure_next(
                             p3,
                             x86_64::structures::paging::PageTableIndex::new(i3 as u16),
                             user,
+                            EntryLevel::Pdpt,
                         )?;
                         let p1 = walker.ensure_next(
                             p2,
                             x86_64::structures::paging::PageTableIndex::new(i2 as u16),
                             user,
+                            EntryLevel::Pd,
                         )?;
                         dst1 = Some(p1);
                     }

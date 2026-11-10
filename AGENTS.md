@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.17.1** (the batch open with the
+  be reflected here. **`main` currently reads 2.17.2** (the batch open with the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
   **2.17.0** = the batch that made pagh run on real hardware, plus three
@@ -276,6 +276,17 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   architectural `0xFEE00000` instead of panicking, x2APIC-enabled handover is
   detected and switched back to xAPIC, and boot announces each step *before*
   running it so the step that hangs names itself.
+  **2.17.2** = the real cause of the field failure. The `#GP` was in `vmm::map`,
+  and the addresses firmware reported were correct (`0xfee00000`/`0xfec00000`):
+  the page-table walker treated a **huge page** as a page table. Limine maps the
+  HHDM with 2 MiB (sometimes 1 GiB) pages, so a walk into the LAPIC's HHDM
+  window found a present entry whose HUGE_PAGE bit was set and whose "frame
+  address" is the start of a large RAM region, not 512 entries — indexing that
+  produced a non-canonical pointer, which is a general-protection fault rather
+  than a page fault. QEMU booted only because its HHDM happened not to have a
+  huge page at that address. `ensure_next` now takes the entry's level, splits a
+  huge entry into a real table (2 MiB → 512 × 4 KiB, 1 GiB → 512 × 2 MiB, flags
+  preserved), and `map_mmio` refuses implausible physical bases.
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
   `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real
