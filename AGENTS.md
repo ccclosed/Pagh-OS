@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.18.4** (the batch open with the
+  be reflected here. **`main` currently reads 2.18.5** (the batch open with the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
   **2.17.0** = the batch that made pagh run on real hardware, plus three
@@ -359,6 +359,19 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   suspended are brought up with a warm reset when the hot reset times out, and a
   port whose enumeration fails is retried with growing spacing instead of being
   written off after one attempt.
+  **2.18.5** = the port-reset signal. The per-port diagnostic from 2.18.4 came
+  back with the key line: every port with a device reported `stage=address
+  code=0x4` (USB transaction error) and a settled `ccs=1 ped=0 pls=7` — devices
+  present, ports never ENABLED, and the address request sent to a device that had
+  never left Polling. The driver had been treating the port-reset-change bit (PRC)
+  as "reset done"; on real hardware a reset the device does not complete still
+  raises PRC while PED stays 0. Port bring-up now waits for PED, and only then
+  reads the speed and addresses the device; if a hot reset does not enable the
+  port it retries with a warm reset, then with a PP power-cycle, and reports
+  `reset-no-enable` with the before/after PORTSC snapshots if all three fail.
+  Those snapshots (`pre=`/`post=`) and the attempt counter are now part of the
+  on-screen port rows, so the next field report distinguishes "port never
+  enabled" from "enabled but the device did not answer".
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
   `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real

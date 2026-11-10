@@ -331,27 +331,34 @@ pub fn shell_main() -> ! {
     crate::fb_println!("input: {}", crate::drivers::input_summary());
     // The same per-port enumeration rows the boot menu shows: if the operator
     // boots past the menu, this screen still carries the evidence.
-    for (port, sc, stage, code, speed) in crate::drivers::xhci::diagnostics().into_iter().take(8) {
+    for (port, sc, stage, code, speed, pre, post, attempts) in
+        crate::drivers::xhci::diagnostics().into_iter().take(8)
+    {
         let (ccs, ped, pp, _, pls) = crate::drivers::xhci::decode_portsc(sc);
         crate::fb_println!(
-            "  usb {:>2}: PORTSC={:#010x} ccs={} ped={} pp={} spd={} pls={} stage={} code={:#x}",
+            "  usb {:>2}: ccs={} ped={} pp={} spd={} pls={} stage={} code={:#x} try={} pre={:#010x} post={:#010x}",
             port,
-            sc,
             ccs as u8,
             ped as u8,
             pp as u8,
             speed,
             pls,
             stage,
-            code
+            code,
+            attempts,
+            pre,
+            post
         );
         crate::kprintln!(
-            "usb {}: PORTSC={:#010x} ccs={} stage={} code={:#x}",
+            "usb {}: ccs={} spd={} stage={} code={:#x} try={} pre={:#010x} post={:#010x}",
             port,
-            sc,
             ccs as u8,
+            speed,
             stage,
-            code
+            code,
+            attempts,
+            pre,
+            post
         );
     }
     crate::fb_println!();

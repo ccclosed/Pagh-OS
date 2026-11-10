@@ -364,6 +364,11 @@ struct PortDiag {
     attempts: u8,
     /// Polls to wait before the next attempt (connect debounce needs time).
     retry_in: u8,
+    /// PORTSC just before the last reset and just after it. These two values are
+    /// the difference between "the port never enabled" and "the device did not
+    /// answer after it was enabled".
+    pre: u32,
+    post: u32,
 }
 
 struct Controller {
@@ -809,6 +814,8 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
                 speed: 0,
                 attempts: 0,
                 retry_in: 0,
+                pre: 0,
+                post: 0,
             };
             ports as usize
         ],
@@ -893,6 +900,9 @@ fn ctx_addr(phys: u64) -> (u32, u32) {
 fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
     let off = portsc(port);
     let mut sc = rd32(ctrl.op, off);
+    if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+        d.pre = sc;
+    }
     if sc & PORTSC_PP == 0 {
         wr32(ctrl.op, off, (sc & !PORTSC_RW1C) | PORTSC_PP);
         if !spin_until(|| rd32(ctrl.op, off) & PORTSC_PP != 0, 100_000) {
@@ -913,8 +923,7 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
         ctrl.stage(port, "no-device", sc);
         return None;
     }
-    // Consume stale change bits (the controller sets CSC on every port at reset)
-    // so the PRC below is the reset's own.
+    // Clear stale change bits so the PRC seen below belongs to OUR reset.
     wr32(
         ctrl.op,
         off,
@@ -922,22 +931,48 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
     );
     let sc = rd32(ctrl.op, off);
     wr32(ctrl.op, off, (sc & !PORTSC_RW1C) | PORTSC_PR);
-    let mut reset_ok = spin_until(
-        || rd32(ctrl.op, off) & (PORTSC_PRC | PORTSC_WPR) != 0,
-        200_000,
-    );
-    if !reset_ok {
-        // USB3 ports whose link is not in U0 (firmware left them in U3) do not
-        // answer a hot reset; a warm reset is the specified way to bring them
-        // back, so try that before writing the port off.
+
+    // WAIT FOR THE PORT TO ENABLE, not merely for PRC. A reset that the device
+    // does not complete still raises PRC on real controllers while PED stays 0 and
+    // the link falls back to Polling — that is exactly the state a real machine
+    // showed ("stage=address code=4": the address request was sent to a device
+    // that had never been enabled). QEMU sets both bits together.
+    let mut enabled = spin_until(|| rd32(ctrl.op, off) & PORTSC_PED != 0, 2_000_000);
+    if !enabled {
+        // A USB3 link that firmware left suspended (U3) does not answer a hot
+        // reset; warm reset is the specified recovery.
         let cur = rd32(ctrl.op, off);
         wr32(ctrl.op, off, (cur & !PORTSC_RW1C) | PORTSC_WPR);
-        reset_ok = spin_until(
-            || rd32(ctrl.op, off) & (PORTSC_PRC | PORTSC_WPR) != 0,
-            400_000,
+        enabled = spin_until(|| rd32(ctrl.op, off) & PORTSC_PED != 0, 2_000_000);
+    }
+    if !enabled {
+        // Last resort, tried only after earlier attempts: power-cycle the port.
+        // Firmware can hand over a controller whose ports are powered but not
+        // reset able; dropping PP and re-raising it makes the controller run the
+        // USB2 attach sequence again.
+        let cur = rd32(ctrl.op, off);
+        wr32(ctrl.op, off, cur & !PORTSC_PP);
+        let mut wait = 0u32;
+        while wait < 200_000 {
+            wait += 1;
+            core::hint::spin_loop();
+        }
+        let cur = rd32(ctrl.op, off);
+        wr32(ctrl.op, off, (cur & !PORTSC_RW1C) | PORTSC_PP);
+        spin_until(|| rd32(ctrl.op, off) & PORTSC_PP != 0, 200_000);
+        let sc = rd32(ctrl.op, off);
+        wr32(
+            ctrl.op,
+            off,
+            (sc & !PORTSC_RW1C) | PORTSC_CSC | PORTSC_PRC | PORTSC_WRC | PORTSC_PR,
         );
-        if !reset_ok {
-            ctrl.fail(port, "reset-timeout", rd32(ctrl.op, off));
+        enabled = spin_until(|| rd32(ctrl.op, off) & PORTSC_PED != 0, 2_000_000);
+        if !enabled {
+            let post = rd32(ctrl.op, off);
+            if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+                d.post = post;
+            }
+            ctrl.fail(port, "reset-no-enable", post);
             return None;
         }
     }
@@ -948,7 +983,10 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
         (cur & !PORTSC_RW1C) | PORTSC_PRC | PORTSC_WRC | PORTSC_CSC,
     );
     let cur = rd32(ctrl.op, off);
-    if cur & PORTSC_CCS == 0 {
+    if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+        d.post = cur;
+    }
+    if cur & PORTSC_CCS == 0 || cur & PORTSC_PED == 0 {
         ctrl.fail(port, "lost-after-reset", cur);
         return None;
     }
@@ -1583,7 +1621,7 @@ pub fn poll() {
                 }
                 continue;
             }
-            if attempts >= 40 {
+            if attempts >= 12 {
                 ctrl.brought_up.push(port);
                 continue;
             }
@@ -1596,7 +1634,7 @@ pub fn poll() {
                     ctrl.brought_up.push(port);
                 } else if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
                     // Give the next attempt breathing room before resetting again.
-                    d.retry_in = (10 + d.attempts.saturating_mul(4)).min(100);
+                    d.retry_in = (20 + d.attempts.saturating_mul(8)).min(120);
                 }
             } else {
                 // No device yet: try again soon (one PORTSC read per attempt).
@@ -1727,10 +1765,12 @@ pub fn usb_thread() {
 
 /// One row per port that has (or had) a device on it, for the boot menu.
 ///
-/// `(port, PORTSC, stage, code, speed)`: the stage is where enumeration stopped —
-/// `hid-ready` means the device types, anything else is the answer to "why does
-/// the keyboard not work".
-pub fn diagnostics() -> Vec<(u8, u32, &'static str, u32, u8)> {
+/// `(port, PORTSC, stage, code, speed, PORTSC before reset, PORTSC after reset,
+/// attempts)`. The stage is where enumeration stopped — `hid-ready` means the
+/// device types, anything else is the answer to "why does the keyboard not work";
+/// the two PORTSC snapshots separate "the port never enabled" (post has ped=0)
+/// from "the device did not answer after it was enabled".
+pub fn diagnostics() -> Vec<(u8, u32, &'static str, u32, u8, u32, u32, u8)> {
     let guard = CONTROLLER.lock();
     let Some(c) = guard.as_ref() else {
         return Vec::new();
@@ -1749,7 +1789,9 @@ pub fn diagnostics() -> Vec<(u8, u32, &'static str, u32, u8)> {
         if sc & PORTSC_CCS == 0 && d.stage == "no-device" {
             continue;
         }
-        rows.push((port, sc, d.stage, d.code, d.speed));
+        rows.push((
+            port, sc, d.stage, d.code, d.speed, d.pre, d.post, d.attempts,
+        ));
     }
     rows
 }
