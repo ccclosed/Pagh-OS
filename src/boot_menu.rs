@@ -480,6 +480,36 @@ fn draw(rows: &[Row], selected: usize, typed: Option<&str>, message: Option<&str
             if info.chosen { " <- using" } else { "" }
         );
     }
+    {
+        let ranges = crate::drivers::xhci::proto_ranges();
+        let text = |(first, count): (u8, u8)| {
+            if count == 0 {
+                alloc::string::String::from("-")
+            } else {
+                alloc::format!("{}-{}", first, first as u16 + count as u16 - 1)
+            }
+        };
+        crate::fb_println!(
+            "  xhci proto: usb2={} usb3={}",
+            text(ranges[0]),
+            text(ranges[1])
+        );
+    }
+    {
+        let ranges = crate::drivers::xhci::proto_ranges();
+        let text = |(first, count): (u8, u8)| {
+            if count == 0 {
+                alloc::string::String::from("-")
+            } else {
+                alloc::format!("{}-{}", first, first as u16 + count as u16 - 1)
+            }
+        };
+        crate::fb_println!(
+            "  xhci proto: usb2={} usb3={}",
+            text(ranges[0]),
+            text(ranges[1])
+        );
+    }
     if let Some(d) = crate::drivers::xhci::raw_dump() {
         crate::fb_println!(
             "  xhci caps: hciver={:#06x} hcsparams1={:#010x} hccparams1={:#010x} legacy={}",

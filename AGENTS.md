@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.18.10** (the batch open with the
+  be reflected here. **`main` currently reads 2.18.11** (the batch open with the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
   **2.17.0** = the batch that made pagh run on real hardware, plus three
@@ -433,6 +433,20 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   already enabled is adopted instead of reset back into Polling; and the PP
   power-cycle fallback now runs only every fourth attempt — it was what made the
   mouse's LED blink once every ~35 s, which the operator reported.
+  **2.18.11** = the menu that stopped counting. The 2.18.10 field report: the
+  20-second countdown never moved, the keyboard and mouse still did not work, and
+  the device LEDs blinked even more often. The cause was the driver itself: with
+  the extended-capability walk fixed, the handoff ran (`legacy=os-owned` — the
+  semaphore was already ours) and every port now really went through the reset
+  path, but `poll()` still processed ALL ports in one pass. On hardware a single
+  reset attempt costs hundreds of milliseconds of MMIO waits, so the first poll
+  blocked for many seconds inside the menu's one-second slice — the countdown
+  never got to tick, and the PP cycles of eight ports back to back is what made
+  the LEDs blink. `poll()` now initialises exactly ONE port per call, round-robin,
+  so the menu keeps drawing between attempts; the wait budgets are cut to fit a
+  fraction of a second; and the diagnostic prints the USB2/USB3 port ranges
+  (`xhci proto: usb2=1-10 usb3=11-26`), which is what the next field report needs
+  to tell a keyboard port from a SuperSpeed one.
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
   `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real

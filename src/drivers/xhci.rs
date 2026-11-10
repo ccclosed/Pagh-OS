@@ -421,6 +421,12 @@ struct Controller {
     /// Attached-port mask as the scan saw it BEFORE the controller reset. Ports
     /// present then and absent now are the ones the reset cost us.
     probe_mask: u32,
+    /// Round-robin cursor: at most ONE port is (re)initialised per poll so that a
+    /// slow reset attempt cannot stall the boot menu's countdown.
+    next_port: u8,
+    /// USB2 / USB3 port ranges from the Supported Protocol capabilities, as
+    /// `(first, count)`, for the on-screen diagnostic.
+    proto_ranges: [(u8, u8); 2],
     /// CAPLENGTH as read at init (the dump shows whether the operational base is
     /// where the driver thinks it is).
     caplength: u32,
@@ -477,6 +483,15 @@ pub struct RawDump {
     pub legacy: &'static str,
     pub port: u8,
     pub port_regs: [u32; 4],
+}
+
+/// USB2 / USB3 port ranges as `(first, count)`, for the diagnostic.
+pub fn proto_ranges() -> [(u8, u8); 2] {
+    CONTROLLER
+        .lock()
+        .as_ref()
+        .map(|c| c.proto_ranges)
+        .unwrap_or([(0, 0), (0, 0)])
 }
 
 pub fn raw_dump() -> Option<RawDump> {
@@ -611,7 +626,7 @@ fn wait_port(
 fn port_enabled_stable(ctrl: &Controller, off: usize) -> (bool, u32) {
     let mut i = 0u32;
     let mut sc = 0u32;
-    while i < 300_000 {
+    while i < 100_000 {
         sc = rd32(ctrl.op, off);
         if sc & PORTSC_PED == 0 {
             return (false, sc);
@@ -1009,6 +1024,7 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
     // capabilities. This is the difference between resetting a USB2 port (what a
     // keyboard needs) and poking a USB3 link that expects a different device.
     let mut protos: Vec<u8> = vec![0u8; ports as usize];
+    let mut proto_ranges: [(u8, u8); 2] = [(0, 0), (0, 0)];
     let xecp = ((hccparams1 >> 16) & 0xFFFF) as usize;
     {
         let mut off = if xecp != 0 { xecp * 4 } else { 0x20 };
@@ -1038,6 +1054,10 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
                     3 => 3u8,
                     _ => 0u8,
                 };
+                if (proto == 2 || proto == 3) && count != 0 {
+                    let slot = if proto == 2 { 0 } else { 1 };
+                    proto_ranges[slot] = (first as u8, count as u8);
+                }
                 for port in first..first.saturating_add(count) {
                     if port >= 1 && port <= ports as usize {
                         protos[port - 1] = proto;
@@ -1091,6 +1111,8 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
         brought_up: Vec::new(),
         logged_ports: false,
         probe_mask: ccs_mask_probe,
+        next_port: 1,
+        proto_ranges,
         caplength: caplength as u32,
         hciversion,
         hcsparams1,
@@ -1239,8 +1261,7 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
     // the link falls back to Polling — that is exactly the state a real machine
     // showed ("stage=address code=4": the address request was sent to a device
     // that had never been enabled). QEMU sets both bits together.
-    let (mut enabled, mut seen_prc, mut seen_ped, mut ped_sc) =
-        wait_port(ctrl, off, 2_000_000, true);
+    let (mut enabled, mut seen_prc, mut seen_ped, mut ped_sc) = wait_port(ctrl, off, 400_000, true);
     if enabled {
         let (stable, sc) = port_enabled_stable(ctrl, off);
         if !stable {
@@ -1257,7 +1278,7 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
         // reset; warm reset is the specified recovery.
         let cur = rd32(ctrl.op, off);
         wr32(ctrl.op, off, (cur & !PORTSC_RW1C) | PORTSC_WPR);
-        let (e, prc, ped, ps) = wait_port(ctrl, off, 2_000_000, true);
+        let (e, prc, ped, ps) = wait_port(ctrl, off, 400_000, true);
         seen_prc |= prc;
         seen_ped |= ped;
         if ps != 0 {
@@ -1291,14 +1312,14 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
         let cur = rd32(ctrl.op, off);
         wr32(ctrl.op, off, (cur & !PORTSC_RW1C) | PORTSC_PP);
         spin_until(|| rd32(ctrl.op, off) & PORTSC_PP != 0, 500_000);
-        spin_settle(2_000_000);
+        spin_settle(600_000);
         let sc = rd32(ctrl.op, off);
         wr32(
             ctrl.op,
             off,
             (sc & !PORTSC_RW1C) | PORTSC_CSC | PORTSC_PRC | PORTSC_WRC | PORTSC_PR,
         );
-        let (e, prc, ped, ps) = wait_port(ctrl, off, 2_000_000, true);
+        let (e, prc, ped, ps) = wait_port(ctrl, off, 400_000, true);
         seen_prc |= prc;
         seen_ped |= ped;
         if ps != 0 {
@@ -1986,85 +2007,14 @@ pub fn poll() {
     //    what appeared. `reset_port` reads the connect status before resetting, so
     //    an empty port costs one register read instead of a reset timeout. Ports
     //    are brought up exactly once, so the cost is per boot, not per poll.
-    for port in 1..=ctrl.ports {
-        if ctrl.slots.iter().any(|s| s.port == port) {
-            continue;
-        }
-        if !ctrl.brought_up.contains(&port) {
-            // A port that has not produced a DEVICE yet is retried — USB2 connect
-            // detection needs ~100 ms of debounce after the reset, so a one-shot
-            // check right after `HCRST` can miss a keyboard that is about to
-            // appear (QEMU's instant emulation hid that race). Retries are spaced
-            // out: the first ones are quick, later ones wait longer, and after 40
-            // attempts the port is left to the diagnostics instead of being reset
-            // forever. A port only leaves this set once a HID device works on it.
-            let (attempts, retry_in) = ctrl
-                .diag
-                .get(port as usize - 1)
-                .map(|d| (d.attempts, d.retry_in))
-                .unwrap_or((0, 0));
-            if retry_in > 0 {
-                if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
-                    d.retry_in = d.retry_in.saturating_sub(1);
-                }
-                continue;
-            }
-            let sc = rd32(ctrl.op, portsc(port));
-            let no_device_yet = sc & PORTSC_CCS == 0;
-            // A port is retried FOREVER (with backoff) until a HID device works on
-            // it. The field machine enabled a device and lost it on every attempt,
-            // and firmware-settling bugs on PCH USB2 PHYs are known to clear up
-            // after the controller has been running for a while — a bounded retry
-            // would have given up exactly before that.`
-            // A port with nothing on it is retried forever, slowly: a USB2 port can
-            // lose connect status across a controller reset and recover it later
-            // (the field machine lost port 26 exactly that way). Every 8th retry
-            // power-cycles the port, which makes the controller run the attach
-            // sequence again.
-            if no_device_yet {
-                if attempts % 8 == 3 {
-                    let sc = rd32(ctrl.op, portsc(port));
-                    wr32(ctrl.op, portsc(port), sc & !PORTSC_PP);
-                    spin_settle(300_000);
-                    let sc = rd32(ctrl.op, portsc(port));
-                    wr32(ctrl.op, portsc(port), (sc & !PORTSC_RW1C) | PORTSC_PP);
-                }
-                if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
-                    d.attempts = d.attempts.saturating_add(1);
-                    d.retry_in = 100;
-                }
-                continue;
-            }
-            if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
-                d.attempts = d.attempts.saturating_add(1);
-            }
-            if let Some(speed) = reset_port(ctrl, port) {
-                if enumerate_with_speed(ctrl, port, speed) {
-                    ctrl.devices += 1;
-                    ctrl.brought_up.push(port);
-                } else if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
-                    // Exponential backoff: the first tries are quick (settling), the
-                    // later ones slow enough not to burn the CPU (every few seconds).
-                    d.retry_in = d.retry_in.saturating_mul(2).max(60).min(250);
-                }
-            } else if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
-                d.retry_in = d.retry_in.saturating_mul(2).max(40).min(250);
-            }
-            continue;
-        }
-        // A device plugged in later shows up as a change on an already reset
-        // port: reset it again to bring the new device up.
-        let off = portsc(port);
-        let sc = rd32(ctrl.op, off);
-        if sc & PORTSC_CSC != 0 {
-            wr32(ctrl.op, off, (sc & !PORTSC_RW1C) | PORTSC_CSC);
-            if let Some(speed) = reset_port(ctrl, port) {
-                if enumerate_with_speed(ctrl, port, speed) {
-                    ctrl.devices += 1;
-                }
-            }
-        }
-    }
+    // 1. Bring up ONE port per poll, round-robin. A real PCH reset attempt costs
+    //    hundreds of milliseconds of MMIO waits, and doing all of them in one pass
+    //    froze the boot menu's countdown (field report: "the 20 s counter does not
+    //    work"). One port per poll keeps the caller responsive.
+    let port = ctrl.next_port;
+    ctrl.next_port = if port >= ctrl.ports { 1 } else { port + 1 };
+    poll_port(ctrl, port);
+
     // One-shot port map once every port has been through bring-up: on a machine
     // where nothing enumerates, this says whether the controller reports a device
     // at all, which separates "our reset/enumeration is wrong" from "the device
@@ -2150,6 +2100,87 @@ pub fn poll() {
                 );
                 ctrl.slots[index].hid = None;
                 break;
+            }
+        }
+    }
+}
+
+/// One port's share of [`poll`]: (re)initialise it if needed.
+fn poll_port(ctrl: &mut Controller, port: u8) {
+    if ctrl.slots.iter().any(|s| s.port == port) {
+        return;
+    }
+    if !ctrl.brought_up.contains(&port) {
+        // A port that has not produced a DEVICE yet is retried — USB2 connect
+        // detection needs ~100 ms of debounce after the reset, so a one-shot
+        // check right after `HCRST` can miss a keyboard that is about to
+        // appear (QEMU's instant emulation hid that race). Retries are spaced
+        // out: the first ones are quick, later ones wait longer, and after 40
+        // attempts the port is left to the diagnostics instead of being reset
+        // forever. A port only leaves this set once a HID device works on it.
+        let (attempts, retry_in) = ctrl
+            .diag
+            .get(port as usize - 1)
+            .map(|d| (d.attempts, d.retry_in))
+            .unwrap_or((0, 0));
+        if retry_in > 0 {
+            if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+                d.retry_in = d.retry_in.saturating_sub(1);
+            }
+            return;
+        }
+        let sc = rd32(ctrl.op, portsc(port));
+        let no_device_yet = sc & PORTSC_CCS == 0;
+        // A port is retried FOREVER (with backoff) until a HID device works on
+        // it. The field machine enabled a device and lost it on every attempt,
+        // and firmware-settling bugs on PCH USB2 PHYs are known to clear up
+        // after the controller has been running for a while — a bounded retry
+        // would have given up exactly before that.`
+        // A port with nothing on it is retried forever, slowly: a USB2 port can
+        // lose connect status across a controller reset and recover it later
+        // (the field machine lost port 26 exactly that way). Every 8th retry
+        // power-cycles the port, which makes the controller run the attach
+        // sequence again.
+        if no_device_yet {
+            if attempts % 8 == 3 {
+                let sc = rd32(ctrl.op, portsc(port));
+                wr32(ctrl.op, portsc(port), sc & !PORTSC_PP);
+                spin_settle(300_000);
+                let sc = rd32(ctrl.op, portsc(port));
+                wr32(ctrl.op, portsc(port), (sc & !PORTSC_RW1C) | PORTSC_PP);
+            }
+            if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+                d.attempts = d.attempts.saturating_add(1);
+                d.retry_in = 100;
+            }
+            return;
+        }
+        if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+            d.attempts = d.attempts.saturating_add(1);
+        }
+        if let Some(speed) = reset_port(ctrl, port) {
+            if enumerate_with_speed(ctrl, port, speed) {
+                ctrl.devices += 1;
+                ctrl.brought_up.push(port);
+            } else if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+                // Exponential backoff: the first tries are quick (settling), the
+                // later ones slow enough not to burn the CPU (every few seconds).
+                d.retry_in = d.retry_in.saturating_mul(2).max(60).min(250);
+            }
+        } else if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+            d.retry_in = d.retry_in.saturating_mul(2).max(40).min(250);
+        }
+        return;
+    }
+    // A device plugged in later shows up as a change on an already reset
+    // port: reset it again to bring the new device up.
+    let off = portsc(port);
+    let sc = rd32(ctrl.op, off);
+    if sc & PORTSC_CSC != 0 {
+        wr32(ctrl.op, off, (sc & !PORTSC_RW1C) | PORTSC_CSC);
+        if let Some(speed) = reset_port(ctrl, port) {
+            if enumerate_with_speed(ctrl, port, speed) {
+                ctrl.devices += 1;
             }
         }
     }
