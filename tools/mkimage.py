@@ -64,14 +64,16 @@ ESP_OFFSET = 1024 * 1024
 # El Torito boot image (which cannot exceed 32 MiB), so they are addressed by
 # volume label: Limine matches `fslabel` against ISO 9660 volume identifiers. With
 # `boot():` only the config would resolve and the kernel lookup would fail.
-ISO_MENU = """timeout: 10
+# ISO menu. Limine's CD loaders (limine-bios-cd.bin / limine-uefi-cd.bin) read
+# the ISO9660 volume, so `boot():` resolves to it and needs no volume label.
+ISO_MENU = """timeout: 5
 verbose: yes
 serial: yes
 
-/pagh OS (ISO, disk image in RAM)
+/pagh OS (CD, disk image in RAM)
     protocol: limine
-    kernel_path: fslabel(PAGH_OS):/pagh.elf
-    module_path: fslabel(PAGH_OS):/disk.img
+    kernel_path: boot():/pagh.elf
+    module_path: boot():/disk.img
 """
 
 BOOT_MENU = """timeout: 5
@@ -160,85 +162,71 @@ def find_xorriso() -> str | None:
 
 def build_iso_from(dest: str, loader: pathlib.Path, kernel: pathlib.Path,
                    diskimg: pathlib.Path) -> None:
-    """Write a UEFI-bootable ISO: FAT El Torito image + kernel/disk on ISO9660.
+    """Write a DUAL-FIRMWARE ISO using the official Limine CD recipe.
 
-    Layout and why each part is where it is:
+    WHY DUAL AND WHY THIS RECIPE. The first ISO here was UEFI-only (a single
+    El Torito EFI entry built from a FAT image). It booted under OVMF and did not
+    boot at all on a machine whose Ventoy entry ran in Legacy mode — the symptom
+    is exactly "no image, nothing happens". Limine ships two purpose-built CD
+    images, and xorriso takes them both:
 
-    * `efi.img` — a small FAT image holding `EFI/BOOT/BOOTX64.EFI` and
-      `limine.conf`. This is the El Torito boot image: firmware mounts it and runs
-      the loader, and Limine reads the config from it. It lives at the ISO root so
-      xorriso can reference it.
-    * `pagh.elf` and `disk.img` — on the ISO9660 volume, addressed from the config
-      as `fslabel(PAGH_OS):/…`. They cannot go in the boot image: an El Torito
-      entry describes at most 32 MiB and the kernel alone is 21 MiB. `fslabel` is
-      how Limine reaches the ISO9660 volume (its documentation says the label is
-      matched against ISO 9660 volume identifiers too).
+      * `limine-bios-cd.bin` as the BIOS El Torito boot image (+ `limine-bios.sys`
+        on the volume, which the loader reads at run time);
+      * `limine-uefi-cd.bin` as an EFI system partition image.
+
+    With both, the disc boots whichever way the firmware starts it, which is what
+    a Ventoy stick needs since Ventoy itself is offered in both modes.
+
+    THE KERNEL AND THE DISK IMAGE SIT ON THE ISO9660 VOLUME, not inside a boot
+    image: Limine's CD loaders understand the ISO volume, so `boot():/pagh.elf`
+    resolves there. A hand-built El Torito FAT image cannot hold them anyway (its
+    sector count tops out at 32 MiB and the kernel alone is 21 MiB).
     """
     xorriso = find_xorriso()
     if xorriso is None:
-        fail("xorriso not found: the ISO needs it (see the note in tools/README.md)")
+        fail("xorriso not found: the ISO needs it (apt/dnf install xorriso)")
 
-    env = dict(os.environ)
-    # A self-contained xorriso (an unpacked package, not an installed one) needs
-    # its own shared libraries on the search path; an installed one does not.
-    libdir = os.environ.get("XORRISO_LIBDIR")
-    if not libdir:
-        for cand in (pathlib.Path(xorriso).resolve().parents[1] / "lib64",
-                     pathlib.Path(xorriso).resolve().parents[1] / "lib"):
-            if cand.is_dir() and any(cand.glob("libisoburn.so*")):
-                libdir = str(cand)
-                break
-    if libdir:
-        prev = env.get("LD_LIBRARY_PATH")
-        env["LD_LIBRARY_PATH"] = libdir + (":" + prev if prev else "")
+    limine_dir = loader.parent
+    bios_cd = limine_dir / "limine-bios-cd.bin"
+    uefi_cd = limine_dir / "limine-uefi-cd.bin"
+    bios_sys = limine_dir / "limine-bios.sys"
+    for needed, what in ((bios_cd, "limine-bios-cd.bin"),
+                         (uefi_cd, "limine-uefi-cd.bin"),
+                         (bios_sys, "limine-bios.sys")):
+        if not needed.is_file():
+            fail(f"{what} missing from the Limine tree ({limine_dir}); the ISO "
+                 f"needs it for BIOS+UEFI boot — re-fetch Limine (tools/limine.py)")
 
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp)
-        (root / "EFI" / "BOOT").mkdir(parents=True)
-        shutil.copy2(loader, root / "EFI" / "BOOT" / "BOOTX64.EFI")
         shutil.copy2(kernel, root / "pagh.elf")
         shutil.copy2(diskimg, root / "disk.img")
-        conf = root / "limine.conf"
-        conf.write_text(ISO_MENU, encoding="utf-8")
-        shutil.copy2(conf, root / "EFI" / "BOOT" / "limine.conf")
-
-        # The FAT boot image: 4 MiB is enough for the loader and two copies of the
-        # config, and keeps the El Torito sector count far below its 16-bit limit.
-        efi = root / "efi.img"
-        with open(efi, "wb") as fh:
-            fh.truncate(4 * 1024 * 1024)
-        run([shutil.which("mformat") or "mformat", "-i", str(efi), "-v", "EFIBOOT", "::"],
-            "mformat efi.img")
-        mmd_bin = shutil.which("mmd") or "mmd"
-        mcopy_bin = shutil.which("mcopy") or "mcopy"
-        run([mmd_bin, "-i", str(efi), "::/EFI"], "mmd ::/EFI")
-        run([mmd_bin, "-i", str(efi), "::/EFI/BOOT"], "mmd ::/EFI/BOOT")
-        run([mcopy_bin, "-i", str(efi), "-o", str(loader), "::/EFI/BOOT/BOOTX64.EFI"],
-            "mcopy BOOTX64.EFI")
-        run([mcopy_bin, "-i", str(efi), "-o", str(conf), "::/limine.conf"],
-            "mcopy limine.conf")
-        run([mcopy_bin, "-i", str(efi), "-o", str(conf), "::/EFI/BOOT/limine.conf"],
-            "mcopy EFI/BOOT/limine.conf")
+        shutil.copy2(bios_cd, root / "limine-bios-cd.bin")
+        shutil.copy2(uefi_cd, root / "limine-uefi-cd.bin")
+        shutil.copy2(bios_sys, root / "limine-bios.sys")
+        (root / "limine.conf").write_text(ISO_MENU, encoding="utf-8")
 
         argv = [
             xorriso, "-as", "mkisofs",
             "-o", str(dest),
+            # BIOS El Torito entry; the loader then reads limine-bios.sys from
+            # the volume, so that file must sit next to limine.conf.
+            "-b", "limine-bios-cd.bin",
+            "-no-emul-boot", "-boot-load-size", "4", "-boot-info-table",
+            # UEFI: the whole ESP image, produced by Limine for CDs.
+            "--efi-boot", "limine-uefi-cd.bin",
+            "-efi-boot-part", "--efi-boot-image",
+            "--protective-msdos-label",
             "-V", "PAGH_OS",
-            "-R", "-J",
-            # UEFI-only: one El Torito alternative entry whose image is the FAT
-            # volume above. `-b` (the BIOS entry) is deliberately absent — pointing
-            # it at an EFI binary makes firmware find no bootable entry at all.
-            "-eltorito-alt-boot",
-            "-e", "efi.img", "-no-emul-boot",
-            "-isohybrid-gpt-basdat",
             str(root),
         ]
-        proc = subprocess.run(argv, capture_output=True, text=True, env=env)
+        proc = subprocess.run(argv, capture_output=True, text=True)
         if proc.returncode != 0:
-            fail(f"xorriso failed ({proc.returncode}): {(proc.stderr or proc.stdout).strip()[-400:]}")
+            fail(f"xorriso failed ({proc.returncode}): "
+                 f"{(proc.stderr or proc.stdout).strip()[-400:]}")
     size = pathlib.Path(dest).stat().st_size
     print(f"[mkimage] ISO image: {dest} ({size // (1024 * 1024)} MiB, "
-          f"El Torito EFI entry, kernel + disk.img on the ISO9660 volume)")
+          f"BIOS + UEFI boot, kernel + disk.img on the ISO9660 volume)")
 
 
 def run(argv: list[str], what: str) -> None:

@@ -103,10 +103,15 @@ fn panic(info: &PanicInfo) -> ! {
     arch::cpu::disable_interrupts();
     if let Some(loc) = info.location() {
         kprint!("[PANIC] {}:{} — ", loc.file(), loc.line());
+        // A panic is fatal (`panic = "abort"`): on a machine with no serial port
+        // the screen is the only witness, so say it there too.
+        drivers::earlyfb::errorln(format_args!("PANIC at {}:{}", loc.file(), loc.line()));
     } else {
         kprint!("[PANIC] ");
+        drivers::earlyfb::errorln(format_args!("PANIC (no location)"));
     }
     kprintln!("{}", info.message());
+    drivers::earlyfb::errorln(format_args!("{}", info.message()));
     debug::unwind::stack_trace();
     arch::cpu::halt_loop();
 }

@@ -3,6 +3,7 @@
 
 pub mod cursor;
 pub mod e1000;
+pub mod earlyfb;
 pub mod framebuffer;
 pub mod memdisk;
 pub mod nvme;

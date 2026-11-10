@@ -32,7 +32,15 @@ use crate::{HHDM_OFFSET, KERNEL_BASE, KERNEL_SIZE};
 /// forever via the safe `arch::cpu` halt primitive. Never returns.
 fn fatal(step: &str) -> ! {
     error!("boot: {} failed", step);
+    crate::drivers::earlyfb::errorln(format_args!("BOOT FAILED at step: {}", step));
     arch::cpu::halt_loop();
+}
+
+/// Report a completed boot step on the emergency console (when there is one).
+fn step(visible: bool, name: &str) {
+    if visible {
+        crate::drivers::earlyfb::println(format_args!("  ok  {}", name));
+    }
 }
 
 /// Run the ordered kernel initialization sequence, then enter the idle loop.
@@ -47,23 +55,59 @@ pub fn start() -> ! {
     // FP/SSE use and before interrupts are enabled. See `arch::cpu::enable_sse`.
     arch::cpu::enable_sse();
 
+    // The emergency console goes up before anything that can fail, and it does
+    // not need the heap: on a real PC there is no serial port, so without this a
+    // failure in any later step leaves a black screen and nothing else. From here
+    // on every step prints its name, so a machine that stops shows exactly where.
+    let visible = crate::drivers::earlyfb::init();
+    if visible {
+        crate::drivers::earlyfb::clear();
+        crate::drivers::earlyfb::println(format_args!(
+            "pagh {} booting (emergency console)",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+
     init_serial();
+    step(visible, "serial");
     check_base_revision();
+    step(visible, "base revision");
     read_limine_responses();
+    step(visible, "limine responses");
     init_descriptor_tables();
+    step(visible, "gdt + idt");
     init_syscalls();
+    step(visible, "syscalls");
     init_pmm();
+    step(visible, "pmm");
     init_vmm();
+    step(visible, "vmm");
     init_heap();
+    step(visible, "heap");
     init_apic();
+    step(visible, "apic");
     init_drivers();
+    step(visible, "drivers");
     init_virtio();
+    step(visible, "virtio");
     init_scheduler();
+    step(visible, "scheduler");
     init_usb();
+    step(visible, "usb");
     init_vfs();
+    step(visible, "vfs");
     init_ramdisk();
+    step(visible, "ramdisk");
     init_fs();
+    step(visible, "fs");
     init_net();
+    step(visible, "net");
+
+    // Boot is done: erase the emergency trace so the shell starts on a blank
+    // screen. The console stays usable — a panic later still prints here.
+    if visible {
+        crate::drivers::earlyfb::clear();
+    }
 
     // Hand off to the run phase (spawns the shell, enables interrupts, idles).
     kernel_main();
