@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.18.6** (the batch open with the
+  be reflected here. **`main` currently reads 2.18.7** (the batch open with the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
   **2.17.0** = the batch that made pagh run on real hardware, plus three
@@ -381,6 +381,19 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   dump of the selected port's four register-set dwords, USBCMD/USBSTS/CONFIG and
   CAPLENGTH, and a write-read-back test of a harmless register that says whether
   ANY write this driver issues reaches the controller.
+  **2.18.7** = the port reset that does not stick. The 2.18.6 photo settles two
+  questions: MMIO writes reach the controller (`writes=ok`, USBCMD shows RS=1 and
+  the command ring works), the port register is where the driver thinks it is
+  (PORTSC/PORTPMSC/PORTLI/PORTHLPMC read 0x6e1/0/0/0), and the chosen controller is
+  the 26-port Intel PCH one (8086:7a60; the discrete 10de:1ada has nothing
+  attached). The reset itself raises PRC and PED — and then loses PED while the
+  port falls back to Polling with `pre == post`. So a single PED sighting was
+  being accepted as success; the driver now requires a STABLE enabled state
+  (PED with link state U0), and only then addresses the device. A failed stability
+  check falls through to a warm reset and then to a PP power-cycle with real
+  settling delays, a settle delay is inserted after the controller reset, and the
+  diagnostics gained the port's USB protocol generation (parsed from the Supported
+  Protocol capabilities) and the PORTSC snapshot at the first PED sighting.
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
   `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real

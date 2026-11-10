@@ -479,25 +479,25 @@ fn draw(rows: &[Row], selected: usize, typed: Option<&str>, message: Option<&str
     // Per-port enumeration state. A few short lines are the difference between
     // "the keyboard does not work" and knowing WHICH step failed, on a machine
     // that cannot run a shell command to ask.
-    for (port, sc, stage, code, speed, pre, post, attempts, seen_prc, seen_ped) in
-        crate::drivers::xhci::diagnostics().into_iter().take(8)
-    {
-        let (ccs, ped, pp, _, pls) = crate::drivers::xhci::decode_portsc(sc);
+    for row in crate::drivers::xhci::diagnostics().into_iter().take(8) {
+        let (ccs, ped, pp, _, pls) = crate::drivers::xhci::decode_portsc(row.portsc);
         crate::fb_println!(
-            "  usb {:>2}: ccs={} ped={} pp={} spd={} pls={} stage={} code={:#x} try={} pre={:#010x} post={:#010x} prc={} ped_seen={}",
-            port,
+            "  usb {:>2}: proto=usb{} ccs={} ped={} pp={} spd={} pls={} stage={} code={:#x} try={} pre={:#010x} post={:#010x} prc={} ped_seen={} ped_sc={:#010x}",
+            row.port,
+            row.proto,
             ccs as u8,
             ped as u8,
             pp as u8,
-            speed,
+            row.speed,
             pls,
-            stage,
-            code,
-            attempts,
-            pre,
-            post,
-            seen_prc as u8,
-            seen_ped as u8
+            row.stage,
+            row.code,
+            row.attempts,
+            row.pre,
+            row.post,
+            row.seen_prc as u8,
+            row.seen_ped as u8,
+            row.ped_sc
         );
     }
     if typed.is_none() && !crate::drivers::any_keyboard() {

@@ -373,6 +373,15 @@ struct PortDiag {
     /// false means the controller never even acknowledged the reset request.
     seen_prc: bool,
     seen_ped: bool,
+    /// USB protocol generation of this port: 2, 3, or 0 when the controller did not
+    /// describe it (the Supported Protocol capabilities say which port ranges are
+    /// USB2 and which are USB3 — a keyboard is USB2 even when the port looks like a
+    /// USB3 one).
+    proto: u8,
+    /// PORTSC at the first PED sighting (shows whether the enable was even
+    /// plausible: PED with PLS=Polling is a reset in progress, not an enabled
+    /// port).
+    ped_sc: u32,
 }
 
 struct Controller {
@@ -533,9 +542,15 @@ pub fn summary() -> Summary {
 /// The flags are the difference between "the controller rejected the reset" and
 /// "the reset ran and the device did not answer": the former never raises PRC,
 /// the latter raises PRC/PED and then loses them.
-fn wait_port(ctrl: &mut Controller, off: usize, budget: u32, want_ped: bool) -> (bool, bool, bool) {
+fn wait_port(
+    ctrl: &mut Controller,
+    off: usize,
+    budget: u32,
+    want_ped: bool,
+) -> (bool, bool, bool, u32) {
     let mut seen_prc = false;
     let mut seen_ped = false;
+    let mut ped_sc = 0u32;
     let mut i = 0u32;
     while i < budget {
         let sc = rd32(ctrl.op, off);
@@ -544,14 +559,54 @@ fn wait_port(ctrl: &mut Controller, off: usize, budget: u32, want_ped: bool) -> 
         }
         if sc & PORTSC_PED != 0 {
             seen_ped = true;
+            if ped_sc == 0 {
+                ped_sc = sc;
+            }
             if want_ped {
-                return (true, seen_prc, seen_ped);
+                return (true, seen_prc, seen_ped, ped_sc);
             }
         }
         core::hint::spin_loop();
         i += 1;
     }
-    (false, seen_prc, seen_ped)
+    (false, seen_prc, seen_ped, ped_sc)
+}
+
+/// Is the port still enabled a moment later, and is its link in U0?
+///
+/// A PED bit seen once is not a reset: real controllers raise it while the reset
+/// is being processed and take it away again if the device does not finish
+/// training (the field log showed exactly that — PRC and PED both observed, then
+/// `pre == post` in Polling). Accepting only a stable U0 is what makes the retry
+/// path fall through to the stronger fallbacks instead of lying to itself.
+fn port_enabled_stable(ctrl: &Controller, off: usize) -> (bool, u32) {
+    let mut i = 0u32;
+    let mut sc = 0u32;
+    while i < 300_000 {
+        sc = rd32(ctrl.op, off);
+        if sc & PORTSC_PED == 0 {
+            return (false, sc);
+        }
+        if (sc & PORTSC_PLS_MASK) == 0 {
+            return (true, sc);
+        }
+        core::hint::spin_loop();
+        i += 1;
+    }
+    (false, sc)
+}
+
+/// Crude busy delay used only where a wrong-ordered reset costs a whole boot.
+///
+/// No PIT here on purpose: the boot menu programs PIT channel 2 itself and calls
+/// into this driver while it counts, so a second user of that channel would break
+/// the countdown.
+fn spin_settle(iterations: u32) {
+    let mut i = 0u32;
+    while i < iterations {
+        core::hint::spin_loop();
+        i += 1;
+    }
 }
 
 impl Controller {
@@ -888,6 +943,10 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
         );
     }
     crate::info!("xhci: running (ports={} cr={:#x})", ports, cmdr.base_phys());
+    // Give the PHYs a moment to settle before the first port reset: the firmware
+    // left these links in some state and USB2 wants ~100 ms after a controller
+    // reset. QEMU is instant, hardware is not.
+    spin_settle(4_000_000);
     // Port state at bring-up, at debug level: which ports have a device attached,
     // whether they are powered and at what speed is the first thing to look at
     // when enumeration does not happen.
@@ -903,6 +962,50 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
             (sc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT,
             (sc & PORTSC_PLS_MASK) >> 5
         );
+    }
+
+    // Which ports are USB2 and which are USB3, from the Supported Protocol
+    // capabilities. This is the difference between resetting a USB2 port (what a
+    // keyboard needs) and poking a USB3 link that expects a different device.
+    let mut protos: Vec<u8> = vec![0u8; ports as usize];
+    let xecp = ((hccparams1 >> 16) & 0xFFFF) as usize;
+    if xecp != 0 {
+        let mut off = xecp * 4;
+        let mut guard = 0;
+        while off + 16 <= 0x1000 && guard < 64 {
+            guard += 1;
+            let dw0 = rd32(base, off);
+            let id = dw0 & 0xFF;
+            let next = ((dw0 >> 8) & 0xFF) as usize;
+            if id == 2 {
+                // Supported Protocol: major revision in DW0 bits 31:24, port
+                // offset/count in DW2.
+                let major = ((dw0 >> 24) & 0xFF) as u8;
+                let dw2 = rd32(base, off + 8);
+                let first = ((dw2 >> 8) & 0xFF) as usize + 1;
+                let count = ((dw2 >> 16) & 0xFF) as usize;
+                let proto = match major {
+                    2 => 2u8,
+                    3 => 3u8,
+                    _ => 0u8,
+                };
+                for port in first..first.saturating_add(count) {
+                    if port >= 1 && port <= ports as usize {
+                        protos[port - 1] = proto;
+                    }
+                }
+                crate::info!(
+                    "xhci: protocol {} ports {}-{}",
+                    proto,
+                    first,
+                    first + count - 1
+                );
+            }
+            if next == 0 || next >= 0x100 {
+                break;
+            }
+            off += next * 4;
+        }
     }
 
     *CONTROLLER.lock() = Some(Controller {
@@ -934,6 +1037,8 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
                 post: 0,
                 seen_prc: false,
                 seen_ped: false,
+                ped_sc: 0,
+                proto: protos.get(0).copied().unwrap_or(0),
             };
             ports as usize
         ],
@@ -1055,48 +1160,84 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
     // the link falls back to Polling — that is exactly the state a real machine
     // showed ("stage=address code=4": the address request was sent to a device
     // that had never been enabled). QEMU sets both bits together.
-    let (mut enabled, mut seen_prc, mut seen_ped) = wait_port(ctrl, off, 2_000_000, true);
+    let (mut enabled, mut seen_prc, mut seen_ped, mut ped_sc) =
+        wait_port(ctrl, off, 2_000_000, true);
+    if enabled {
+        let (stable, sc) = port_enabled_stable(ctrl, off);
+        if !stable {
+            // The controller raised PED and took it away: the device did not
+            // finish training, so this attempt is not a success.
+            enabled = false;
+            if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+                d.post = sc;
+            }
+        }
+    }
     if !enabled {
         // A USB3 link that firmware left suspended (U3) does not answer a hot
         // reset; warm reset is the specified recovery.
         let cur = rd32(ctrl.op, off);
         wr32(ctrl.op, off, (cur & !PORTSC_RW1C) | PORTSC_WPR);
-        let (e, prc, ped) = wait_port(ctrl, off, 2_000_000, true);
-        enabled = e;
+        let (e, prc, ped, ps) = wait_port(ctrl, off, 2_000_000, true);
         seen_prc |= prc;
         seen_ped |= ped;
+        if ps != 0 {
+            ped_sc = ps;
+        }
+        enabled = e;
+        if enabled {
+            let (stable, sc) = port_enabled_stable(ctrl, off);
+            if !stable {
+                enabled = false;
+                if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+                    d.post = sc;
+                }
+            }
+        }
     }
     if !enabled {
-        // Last resort, tried only after earlier attempts: power-cycle the port.
-        // Firmware can hand over a controller whose ports are powered but not
-        // reset able; dropping PP and re-raising it makes the controller run the
-        // USB2 attach sequence again.
+        // Last resort: power-cycle the port. Firmware can hand over a controller
+        // whose ports are powered but never leave Polling; dropping PP and
+        // re-raising it after a settle delay makes the controller run the USB2
+        // attach sequence from scratch. This is tried repeatedly because a reset
+        // that raises PED and loses it (the field symptom) is exactly the case
+        // where the PHY needs the extra settling time.
         let cur = rd32(ctrl.op, off);
         wr32(ctrl.op, off, cur & !PORTSC_PP);
-        let mut wait = 0u32;
-        while wait < 200_000 {
-            wait += 1;
-            core::hint::spin_loop();
-        }
+        spin_settle(1_500_000);
         let cur = rd32(ctrl.op, off);
         wr32(ctrl.op, off, (cur & !PORTSC_RW1C) | PORTSC_PP);
-        spin_until(|| rd32(ctrl.op, off) & PORTSC_PP != 0, 200_000);
+        spin_until(|| rd32(ctrl.op, off) & PORTSC_PP != 0, 500_000);
+        spin_settle(1_500_000);
         let sc = rd32(ctrl.op, off);
         wr32(
             ctrl.op,
             off,
             (sc & !PORTSC_RW1C) | PORTSC_CSC | PORTSC_PRC | PORTSC_WRC | PORTSC_PR,
         );
-        let (e, prc, ped) = wait_port(ctrl, off, 2_000_000, true);
-        enabled = e;
+        let (e, prc, ped, ps) = wait_port(ctrl, off, 2_000_000, true);
         seen_prc |= prc;
         seen_ped |= ped;
+        if ps != 0 {
+            ped_sc = ps;
+        }
+        enabled = e;
+        if enabled {
+            let (stable, sc) = port_enabled_stable(ctrl, off);
+            if !stable {
+                enabled = false;
+                if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+                    d.post = sc;
+                }
+            }
+        }
         if !enabled {
             let post = rd32(ctrl.op, off);
             if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
                 d.post = post;
                 d.seen_prc = seen_prc;
                 d.seen_ped = seen_ped;
+                d.ped_sc = ped_sc;
             }
             ctrl.fail(port, "reset-no-enable", post);
             return None;
@@ -1113,8 +1254,9 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
         d.post = cur;
         d.seen_prc = seen_prc;
         d.seen_ped = seen_ped;
+        d.ped_sc = ped_sc;
     }
-    if cur & PORTSC_CCS == 0 || cur & PORTSC_PED == 0 {
+    if cur & PORTSC_CCS == 0 || cur & PORTSC_PED == 0 || (cur & PORTSC_PLS_MASK) != 0 {
         ctrl.fail(port, "lost-after-reset", cur);
         return None;
     }
@@ -1893,13 +2035,28 @@ pub fn usb_thread() {
 
 /// One row per port that has (or had) a device on it, for the boot menu.
 ///
-/// `(port, PORTSC, stage, code, speed, PORTSC before reset, PORTSC after reset,
-/// attempts, PRC ever seen, PED ever seen)`. The stage is where enumeration
-/// stopped — `hid-ready` means the
-/// device types, anything else is the answer to "why does the keyboard not work";
-/// the two PORTSC snapshots separate "the port never enabled" (post has ped=0)
-/// from "the device did not answer after it was enabled".
-pub fn diagnostics() -> Vec<(u8, u32, &'static str, u32, u8, u32, u32, u8, bool, bool)> {
+/// The stage is where enumeration stopped — `hid-ready` means the device types,
+/// anything else is the answer to "why does the keyboard not work". The two
+/// PORTSC snapshots separate "the port never enabled" from "the device did not
+/// answer after it was enabled", `ped_sc` shows what PORTSC looked like when PED
+/// was first seen, and `proto` says whether this is a USB2 port (where a keyboard
+/// lives) or a USB3 one.
+pub struct PortRow {
+    pub port: u8,
+    pub portsc: u32,
+    pub stage: &'static str,
+    pub code: u32,
+    pub speed: u8,
+    pub pre: u32,
+    pub post: u32,
+    pub attempts: u8,
+    pub seen_prc: bool,
+    pub seen_ped: bool,
+    pub ped_sc: u32,
+    pub proto: u8,
+}
+
+pub fn diagnostics() -> Vec<PortRow> {
     let guard = CONTROLLER.lock();
     let Some(c) = guard.as_ref() else {
         return Vec::new();
@@ -1918,9 +2075,20 @@ pub fn diagnostics() -> Vec<(u8, u32, &'static str, u32, u8, u32, u32, u8, bool,
         if sc & PORTSC_CCS == 0 && d.stage == "no-device" {
             continue;
         }
-        rows.push((
-            port, sc, d.stage, d.code, d.speed, d.pre, d.post, d.attempts, d.seen_prc, d.seen_ped,
-        ));
+        rows.push(PortRow {
+            port,
+            portsc: sc,
+            stage: d.stage,
+            code: d.code,
+            speed: d.speed,
+            pre: d.pre,
+            post: d.post,
+            attempts: d.attempts,
+            seen_prc: d.seen_prc,
+            seen_ped: d.seen_ped,
+            ped_sc: d.ped_sc,
+            proto: d.proto,
+        });
     }
     rows
 }
