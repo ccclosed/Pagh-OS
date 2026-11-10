@@ -329,14 +329,54 @@ pub fn shell_main() -> ! {
     crate::fb_println!("========================================");
     crate::fb_println!("Type 'help' for available commands");
     crate::fb_println!("input: {}", crate::drivers::input_summary());
+    // Controller scan and raw register state: the two things that decide whether
+    // "the port does not reset" is our bug or the platform's.
+    for (index, info) in crate::drivers::xhci::scan().into_iter().enumerate() {
+        crate::kprintln!(
+            "xhci {}: {:04x}:{:04x} ports={} attached={:#010x}{}",
+            index + 1,
+            info.vendor,
+            info.device,
+            info.ports,
+            info.attached,
+            if info.chosen { " <- using" } else { "" }
+        );
+        crate::fb_println!(
+            "  xhci {}: {:04x}:{:04x} ports={} attached={:#010x}{}",
+            index + 1,
+            info.vendor,
+            info.device,
+            info.ports,
+            info.attached,
+            if info.chosen { " <- using" } else { "" }
+        );
+    }
+    if let Some(d) = crate::drivers::xhci::raw_dump() {
+        crate::fb_println!(
+            "  xhci op: caplen={:#x} usbcmd={:#010x} usbsts={:#010x} config={:#x} writes={}",
+            d.caplength,
+            d.usbcmd,
+            d.usbsts,
+            d.config,
+            if d.writes_ok { "ok" } else { "IGNORED" }
+        );
+        crate::fb_println!(
+            "  xhci port {} regs: {:#010x} {:#010x} {:#010x} {:#010x}",
+            d.port,
+            d.port_regs[0],
+            d.port_regs[1],
+            d.port_regs[2],
+            d.port_regs[3]
+        );
+    }
     // The same per-port enumeration rows the boot menu shows: if the operator
     // boots past the menu, this screen still carries the evidence.
-    for (port, sc, stage, code, speed, pre, post, attempts) in
+    for (port, sc, stage, code, speed, pre, post, attempts, seen_prc, seen_ped) in
         crate::drivers::xhci::diagnostics().into_iter().take(8)
     {
         let (ccs, ped, pp, _, pls) = crate::drivers::xhci::decode_portsc(sc);
         crate::fb_println!(
-            "  usb {:>2}: ccs={} ped={} pp={} spd={} pls={} stage={} code={:#x} try={} pre={:#010x} post={:#010x}",
+            "  usb {:>2}: ccs={} ped={} pp={} spd={} pls={} stage={} code={:#x} try={} pre={:#010x} post={:#010x} prc={} ped_seen={}",
             port,
             ccs as u8,
             ped as u8,
@@ -347,10 +387,12 @@ pub fn shell_main() -> ! {
             code,
             attempts,
             pre,
-            post
+            post,
+            seen_prc as u8,
+            seen_ped as u8
         );
         crate::kprintln!(
-            "usb {}: ccs={} spd={} stage={} code={:#x} try={} pre={:#010x} post={:#010x}",
+            "usb {}: ccs={} spd={} stage={} code={:#x} try={} pre={:#010x} post={:#010x} prc={} ped_seen={}",
             port,
             ccs as u8,
             speed,
@@ -358,7 +400,9 @@ pub fn shell_main() -> ! {
             code,
             attempts,
             pre,
-            post
+            post,
+            seen_prc as u8,
+            seen_ped as u8
         );
     }
     crate::fb_println!();

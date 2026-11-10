@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.18.5** (the batch open with the
+  be reflected here. **`main` currently reads 2.18.6** (the batch open with the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
   **2.17.0** = the batch that made pagh run on real hardware, plus three
@@ -372,6 +372,15 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   Those snapshots (`pre=`/`post=`) and the attempt counter are now part of the
   on-screen port rows, so the next field report distinguishes "port never
   enabled" from "enabled but the device did not answer".
+  **2.18.6** = the port reset never takes effect. The 2.18.5 field photo shows
+  `stage=lost-after-reset` with `pre` and `post` PORTSC **identical** (0x6e1:
+  connected, powered, Polling, never enabled) — the controller ignores the port
+  writes, or the driver reads the wrong register. QEMU cannot distinguish those,
+  so the next build puts the ambiguity on screen: the controller scan (both PCI
+  controllers, their port counts and attached masks, which one is in use), a raw
+  dump of the selected port's four register-set dwords, USBCMD/USBSTS/CONFIG and
+  CAPLENGTH, and a write-read-back test of a harmless register that says whether
+  ANY write this driver issues reaches the controller.
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
   `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real

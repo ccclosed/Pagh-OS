@@ -369,6 +369,10 @@ struct PortDiag {
     /// answer after it was enabled".
     pre: u32,
     post: u32,
+    /// Whether PRC / PED were ever observed during the reset wait. `seen_prc`
+    /// false means the controller never even acknowledged the reset request.
+    seen_prc: bool,
+    seen_ped: bool,
 }
 
 struct Controller {
@@ -398,6 +402,12 @@ struct Controller {
     diag: Vec<PortDiag>,
     /// The last thing that went wrong anywhere, for the one-line status.
     last_fail: Option<(u8, &'static str, u32)>,
+    /// CAPLENGTH as read at init (the dump shows whether the operational base is
+    /// where the driver thinks it is).
+    caplength: u32,
+    /// A harmless register was written and read back at init: this separates "our
+    /// writes are ignored" from "the controller ignores this particular write".
+    writes_ok: bool,
 }
 
 static CONTROLLER: Spinlock<Option<Controller>> = Spinlock::new(None);
@@ -406,6 +416,59 @@ static CONTROLLER: Spinlock<Option<Controller>> = Spinlock::new(None);
 /// the screen-only diagnostic needs to tell "no controller" from "controller but
 /// no device".
 static CONTROLLERS_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+/// One PCI xHCI controller as the scan saw it, for the on-screen diagnostic. On a
+/// board with two controllers this is how the operator (and the developer reading
+/// a photo) sees which one has the keyboard.
+#[derive(Clone, Copy)]
+pub struct ControllerInfo {
+    pub vendor: u16,
+    pub device: u16,
+    pub ports: u8,
+    pub attached: u32,
+    pub chosen: bool,
+}
+
+static CONTROLLER_SCAN: Spinlock<Vec<ControllerInfo>> = Spinlock::new(Vec::new());
+
+/// What the controller scan found, in PCI order.
+pub fn scan() -> Vec<ControllerInfo> {
+    CONTROLLER_SCAN.lock().clone()
+}
+
+/// Raw register dump for the on-screen diagnostic: (`caplength`, `usbcmd`,
+/// `usbsts`, `config`, `write-ok`, first four dwords of the selected port's
+/// register set). This exists because "the port does not reset" has no other
+/// explanation channel on a machine without serial.
+pub struct RawDump {
+    pub caplength: u32,
+    pub usbcmd: u32,
+    pub usbsts: u32,
+    pub config: u32,
+    pub writes_ok: bool,
+    pub port: u8,
+    pub port_regs: [u32; 4],
+}
+
+pub fn raw_dump() -> Option<RawDump> {
+    let guard = CONTROLLER.lock();
+    let c = guard.as_ref()?;
+    let port = (1..=c.ports).find(|p| rd32(c.op, portsc(*p)) & PORTSC_CCS != 0)?;
+    Some(RawDump {
+        caplength: c.caplength,
+        usbcmd: rd32(c.op, OP_USBCMD),
+        usbsts: rd32(c.op, OP_USBSTS),
+        config: rd32(c.op, OP_CONFIG),
+        writes_ok: c.writes_ok,
+        port,
+        port_regs: [
+            rd32(c.op, portsc(port)),
+            rd32(c.op, portsc(port) + 4),
+            rd32(c.op, portsc(port) + 8),
+            rd32(c.op, portsc(port) + 12),
+        ],
+    })
+}
 
 /// What the USB driver can say about itself, for the boot menu, the shell banner
 /// and the `usb` command. On a machine with no serial port this struct IS the
@@ -463,6 +526,32 @@ pub fn summary() -> Summary {
             last_fail: None,
         },
     }
+}
+
+/// Poll PORTSC until `want` shows up, remembering whether PRC/PED were ever seen.
+///
+/// The flags are the difference between "the controller rejected the reset" and
+/// "the reset ran and the device did not answer": the former never raises PRC,
+/// the latter raises PRC/PED and then loses them.
+fn wait_port(ctrl: &mut Controller, off: usize, budget: u32, want_ped: bool) -> (bool, bool, bool) {
+    let mut seen_prc = false;
+    let mut seen_ped = false;
+    let mut i = 0u32;
+    while i < budget {
+        let sc = rd32(ctrl.op, off);
+        if sc & PORTSC_PRC != 0 {
+            seen_prc = true;
+        }
+        if sc & PORTSC_PED != 0 {
+            seen_ped = true;
+            if want_ped {
+                return (true, seen_prc, seen_ped);
+            }
+        }
+        core::hint::spin_loop();
+        i += 1;
+    }
+    (false, seen_prc, seen_ped)
 }
 
 impl Controller {
@@ -536,6 +625,7 @@ pub fn init(devices: &[PciDevice]) -> bool {
         candidates.len()
     );
     let mut best: Option<(usize, u32)> = None; // (index, attached ports)
+    let mut scan_infos: Vec<ControllerInfo> = Vec::new();
     for (index, dev) in candidates.iter().enumerate() {
         match probe_controller(dev) {
             Some((ports, mask)) => {
@@ -549,6 +639,13 @@ pub fn init(devices: &[PciDevice]) -> bool {
                     ports,
                     mask
                 );
+                scan_infos.push(ControllerInfo {
+                    vendor: dev.vendor_id,
+                    device: dev.device_id,
+                    ports,
+                    attached: mask,
+                    chosen: false,
+                });
                 if best.map_or(true, |(_, n)| attached > n) {
                     best = Some((index, attached));
                 }
@@ -567,6 +664,12 @@ pub fn init(devices: &[PciDevice]) -> bool {
     if candidates.len() > 1 {
         crate::info!("xhci: using controller {}/{}", index + 1, candidates.len());
     }
+    // Remember which one was chosen for the on-screen scan list.
+    let chosen_pair = (candidates[index].vendor_id, candidates[index].device_id);
+    for info in scan_infos.iter_mut() {
+        info.chosen = info.vendor == chosen_pair.0 && info.device == chosen_pair.1;
+    }
+    *CONTROLLER_SCAN.lock() = scan_infos;
     start_controller(candidates[index], candidates.len())
 }
 
@@ -773,6 +876,17 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
         );
         return false;
     }
+    // Write-read-back on a harmless register: if this fails, every port write in
+    // this driver is being dropped and no amount of reset logic can help.
+    let before = rd32(op, OP_CONFIG);
+    wr32(op, OP_CONFIG, before);
+    let writes_ok = rd32(op, OP_CONFIG) == before;
+    if !writes_ok {
+        crate::warn!(
+            "xhci: register write-readback failed (config {:#x})",
+            before
+        );
+    }
     crate::info!("xhci: running (ports={} cr={:#x})", ports, cmdr.base_phys());
     // Port state at bring-up, at debug level: which ports have a device attached,
     // whether they are powered and at what speed is the first thing to look at
@@ -807,6 +921,8 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
         devices: 0,
         brought_up: Vec::new(),
         logged_ports: false,
+        caplength: caplength as u32,
+        writes_ok,
         diag: vec![
             PortDiag {
                 stage: "",
@@ -816,6 +932,8 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
                 retry_in: 0,
                 pre: 0,
                 post: 0,
+                seen_prc: false,
+                seen_ped: false,
             };
             ports as usize
         ],
@@ -937,13 +1055,16 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
     // the link falls back to Polling — that is exactly the state a real machine
     // showed ("stage=address code=4": the address request was sent to a device
     // that had never been enabled). QEMU sets both bits together.
-    let mut enabled = spin_until(|| rd32(ctrl.op, off) & PORTSC_PED != 0, 2_000_000);
+    let (mut enabled, mut seen_prc, mut seen_ped) = wait_port(ctrl, off, 2_000_000, true);
     if !enabled {
         // A USB3 link that firmware left suspended (U3) does not answer a hot
         // reset; warm reset is the specified recovery.
         let cur = rd32(ctrl.op, off);
         wr32(ctrl.op, off, (cur & !PORTSC_RW1C) | PORTSC_WPR);
-        enabled = spin_until(|| rd32(ctrl.op, off) & PORTSC_PED != 0, 2_000_000);
+        let (e, prc, ped) = wait_port(ctrl, off, 2_000_000, true);
+        enabled = e;
+        seen_prc |= prc;
+        seen_ped |= ped;
     }
     if !enabled {
         // Last resort, tried only after earlier attempts: power-cycle the port.
@@ -966,11 +1087,16 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
             off,
             (sc & !PORTSC_RW1C) | PORTSC_CSC | PORTSC_PRC | PORTSC_WRC | PORTSC_PR,
         );
-        enabled = spin_until(|| rd32(ctrl.op, off) & PORTSC_PED != 0, 2_000_000);
+        let (e, prc, ped) = wait_port(ctrl, off, 2_000_000, true);
+        enabled = e;
+        seen_prc |= prc;
+        seen_ped |= ped;
         if !enabled {
             let post = rd32(ctrl.op, off);
             if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
                 d.post = post;
+                d.seen_prc = seen_prc;
+                d.seen_ped = seen_ped;
             }
             ctrl.fail(port, "reset-no-enable", post);
             return None;
@@ -985,6 +1111,8 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
     let cur = rd32(ctrl.op, off);
     if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
         d.post = cur;
+        d.seen_prc = seen_prc;
+        d.seen_ped = seen_ped;
     }
     if cur & PORTSC_CCS == 0 || cur & PORTSC_PED == 0 {
         ctrl.fail(port, "lost-after-reset", cur);
@@ -1766,11 +1894,12 @@ pub fn usb_thread() {
 /// One row per port that has (or had) a device on it, for the boot menu.
 ///
 /// `(port, PORTSC, stage, code, speed, PORTSC before reset, PORTSC after reset,
-/// attempts)`. The stage is where enumeration stopped — `hid-ready` means the
+/// attempts, PRC ever seen, PED ever seen)`. The stage is where enumeration
+/// stopped — `hid-ready` means the
 /// device types, anything else is the answer to "why does the keyboard not work";
 /// the two PORTSC snapshots separate "the port never enabled" (post has ped=0)
 /// from "the device did not answer after it was enabled".
-pub fn diagnostics() -> Vec<(u8, u32, &'static str, u32, u8, u32, u32, u8)> {
+pub fn diagnostics() -> Vec<(u8, u32, &'static str, u32, u8, u32, u32, u8, bool, bool)> {
     let guard = CONTROLLER.lock();
     let Some(c) = guard.as_ref() else {
         return Vec::new();
@@ -1790,7 +1919,7 @@ pub fn diagnostics() -> Vec<(u8, u32, &'static str, u32, u8, u32, u32, u8)> {
             continue;
         }
         rows.push((
-            port, sc, d.stage, d.code, d.speed, d.pre, d.post, d.attempts,
+            port, sc, d.stage, d.code, d.speed, d.pre, d.post, d.attempts, d.seen_prc, d.seen_ped,
         ));
     }
     rows
