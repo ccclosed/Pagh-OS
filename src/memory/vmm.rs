@@ -18,6 +18,9 @@ pub enum VmError {
     OutOfMemory,
     /// An entry along the page-table walk was not present.
     NotMapped,
+    /// The requested physical range is not addressable (implausible base, or a
+    /// virtual address the HHDM window cannot reach).
+    InvalidAddress,
 }
 
 impl core::fmt::Display for VmError {
@@ -25,6 +28,7 @@ impl core::fmt::Display for VmError {
         let s = match self {
             VmError::OutOfMemory => "out of memory",
             VmError::NotMapped => "not mapped",
+            VmError::InvalidAddress => "invalid address",
         };
         f.write_str(s)
     }
@@ -504,8 +508,32 @@ pub fn map_mmio(phys: u64, len: u64) -> Result<u64, VmError> {
         | PageTableFlags::NO_CACHE
         | PageTableFlags::NO_EXECUTE;
 
+    // Reject an address that cannot be mapped before walking the page tables.
+    //
+    // WHY: on a real machine `apic::init` took the LAPIC address from the MADT
+    // and called this, and the boot died with a GENERAL PROTECTION fault inside
+    // `map` — not a page fault. A #GP there means the computed virtual address
+    // was non-canonical, which can only happen if the physical base is garbage:
+    // a bogus BAR/MADT value such as all-ones makes `phys + hhdm` overflow into
+    // the non-canonical hole. Reporting the value beats faulting inside the page
+    // walker, where the address is long gone.
+    const MAX_PHYS: u64 = 0x0000_FFFF_FFFF_FFFF; // 52-bit physical address space
+    if phys > MAX_PHYS || start > MAX_PHYS {
+        crate::error!(
+            "[VMM] map_mmio: refusing implausible physical base 0x{:x}",
+            phys
+        );
+        crate::drivers::earlyfb::errorln(format_args!(
+            "map_mmio: refusing physical base {:#x} (implausible)",
+            phys
+        ));
+        return Err(VmError::InvalidAddress);
+    }
+
     let mut p = start;
     while p < end {
+        // `map` returns Err rather than faulting for the same reason: a bad
+        // physical range must surface as a boot error, not as a #GP.
         map(p, phys_to_virt(p), flags)?;
         p += page_size;
     }

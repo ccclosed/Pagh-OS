@@ -43,7 +43,7 @@ pub struct ApicAddrs {
 
 /// Architectural default LAPIC MMIO base used when the MADT does not provide
 /// one (Requirement 6.3).
-const DEFAULT_LAPIC_PHYS: u64 = 0xFEE0_0000;
+pub const DEFAULT_LAPIC_PHYS: u64 = 0xFEE0_0000;
 
 /// Cached parse result (Requirement 6.2). `None` until the first successful
 /// (or defaulted) parse, then holds the value served on every later call.

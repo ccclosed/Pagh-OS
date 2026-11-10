@@ -1,6 +1,7 @@
 // arch/x86_64/apic.rs — APIC subsystem: LAPIC timer, I/O APIC, IRQ dispatch
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
+use crate::arch::x86_64::acpi::DEFAULT_LAPIC_PHYS;
 use crate::sync::spinlock::Spinlock;
 use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -207,9 +208,49 @@ pub fn init() {
     // through the HHDM window and returns the virtual base, which equals
     // `phys + hhdm` — the same value previously computed by hand — so
     // LAPIC_BASE/IOAPIC_BASE are unchanged.
-    let lapic_virt = crate::memory::vmm::map_mmio(lapic_phys, 0x1000).expect("map LAPIC MMIO");
+    // Say what the firmware reported BEFORE touching it: on a real machine the
+    // only evidence of a bad MADT entry is the address itself, and the boot dies
+    // before anything else can print it.
+    crate::drivers::earlyfb::println(format_args!(
+        "acpi: lapic_phys={:#x} ioapic_phys={:#x}",
+        lapic_phys, ioapic_phys
+    ));
+
+    // A mapping failure is reported, not fatal, and falls back to the
+    // architectural LAPIC base: firmware that reports a bogus address should cost
+    // us one warning line, not the whole boot.
+    let lapic_virt = match crate::memory::vmm::map_mmio(lapic_phys, 0x1000) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::error!(
+                "apic: cannot map LAPIC at {:#x} ({}); falling back to {:#x}",
+                lapic_phys,
+                e,
+                DEFAULT_LAPIC_PHYS
+            );
+            crate::drivers::earlyfb::println(format_args!(
+                "apic: LAPIC {:#x} unusable, trying {:#x}",
+                lapic_phys, DEFAULT_LAPIC_PHYS
+            ));
+            crate::memory::vmm::map_mmio(DEFAULT_LAPIC_PHYS, 0x1000).expect("map LAPIC MMIO")
+        }
+    };
     let ioapic_virt = if ioapic_phys != 0 {
-        crate::memory::vmm::map_mmio(ioapic_phys, 0x1000).expect("map IOAPIC MMIO")
+        match crate::memory::vmm::map_mmio(ioapic_phys, 0x1000) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::error!(
+                    "apic: cannot map I/O APIC at {:#x} ({}); no IRQ routing",
+                    ioapic_phys,
+                    e
+                );
+                crate::drivers::earlyfb::println(format_args!(
+                    "apic: I/O APIC {:#x} unusable; no IRQ routing",
+                    ioapic_phys
+                ));
+                0
+            }
+        }
     } else {
         0
     };

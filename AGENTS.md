@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.17.0** (the batch open with the
+  be reflected here. **`main` currently reads 2.17.1** (the batch open with the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
   **2.17.0** = the batch that made pagh run on real hardware, plus three
@@ -266,6 +266,16 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   * `tools/mkimage.py` builds both artifacts people actually boot: a GPT+ESP USB
     image and a **BIOS+UEFI** ISO (Limine's own CD loaders), each carrying
     `disk.img`; the ISO is verified in both firmware modes.
+  **2.17.1** = the first field report from real hardware. The emergency console
+  named the step (`init_apic`) and caught a #GP inside the LAPIC page-table
+  walk — a general-protection fault rather than a page fault, which means the
+  virtual address computed from the MADT base was non-canonical, i.e. the
+  firmware reported a garbage LAPIC address. `vmm::map_mmio` now refuses an
+  implausible physical base with a message instead of faulting inside the walker,
+  `apic::init` prints the addresses it was given and falls back to the
+  architectural `0xFEE00000` instead of panicking, x2APIC-enabled handover is
+  detected and switched back to xAPIC, and boot announces each step *before*
+  running it so the step that hangs names itself.
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
   `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real
