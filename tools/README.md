@@ -87,20 +87,14 @@ ISO9660-томе и адресуются из конфига как `fslabel(PAG
 В загрузочный образ ядро положить нельзя: запись El Torito описывает максимум
 32 МиБ, а ядро занимает 21 МиБ.
 
-**Для ISO нужен `xorriso`** — `-eltorito-alt-boot -e efi.img -no-emul-boot`.
-Ручной ISO9660+El Torito не годится: том-то получается валидный (сторонний
-читатель перечисляет дерево и достаёт файлы), но диск не грузится. Проверено
-пошагово: прошивка запускает `EFI/BOOT/BOOTX64.EFI`, однако Limine пишет
-`[config file not found]` — El Torito-образ доезжает до загрузчика не как
-читаемый FAT. xorriso делает эту раскладку правильно. Если `xorriso` в системе
-нет, его можно распаковать локально без root:
-
-```sh
-dnf download --destdir /tmp/rpms xorriso libisoburn libisofs libburn
-mkdir -p /tmp/xroot && cd /tmp/xroot
-for r in /tmp/rpms/*.rpm; do rpm2cpio "$r" | cpio -idm; done
-# mkimage.py сам найдёт /tmp/xroot/usr/bin/xorriso и его библиотеки
-```
+**Для ISO нужен `xorriso`** (`dnf install xorriso` / `apt install xorriso`) —
+сборщик вызывает его с `-eltorito-alt-boot -e efi.img -no-emul-boot`. Ручной
+ISO9660+El Torito не годится: том получается валидный (сторонний читатель
+перечисляет дерево и достаёт файлы), но диск не грузится — прошивка запускает
+`EFI/BOOT/BOOTX64.EFI`, а Limine пишет `[config file not found]`, потому что
+загрузочный образ доезжает до него не как читаемый FAT. `mkimage.py --iso`
+падает с внятной ошибкой, если xorriso не найден, вместо того чтобы выдать
+негрузящийся диск.
 
 Записать на Ventoy — просто скопировать файл: Ventoy ищет `iso/wim/img/vhd(x)` в
 любых каталогах своей первой флешки, а `.img` грузит через memdisk.

@@ -141,29 +141,20 @@ def fat_partition(dest: pathlib.Path, payload: list[tuple[pathlib.Path, str]],
 
 
 def find_xorriso() -> str | None:
-    """Locate `xorriso`, including a locally extracted RPM.
+    """Locate `xorriso`; `$XORRISO` overrides.
 
-    WHY xorriso AND NOT THE IN-REPO WRITER. `tools/iso9660.py` builds a valid
-    ISO9660 volume (an independent reader lists the tree and extracts files), but
-    a disc built by hand does not BOOT: the El Torito boot image must reach the
-    bootloader as a FAT volume it can read, and get that wrong and Limine reports
-    `[config file not found]` while the firmware reports "Default entry is not
-    valid". xorriso's `-eltorito-alt-boot -e <fat.img> -no-emul-boot` produces the
-    layout firmware and Limine agree on, so the ISO path uses it and fails loudly
-    when it is absent instead of shipping a disc that does not boot.
-
-    A machine without xorriso installed can still build one:
-        dnf download --destdir /tmp/rpms xorriso libisoburn libisofs libburn
-        mkdir -p /tmp/xroot && cd /tmp/xroot
-        for r in /tmp/rpms/*.rpm; do rpm2cpio "$r" | cpio -idm; done
-    then point $XORRISO_LIBDIR at /tmp/xroot/usr/lib64.
+    WHY xorriso AND NOT A HAND-WRITTEN WRITER. A UEFI-bootable disc needs its El
+    Torito boot image to reach the bootloader as a FAT volume the bootloader can
+    read. An ISO9660 volume written by hand parses correctly — an independent
+    reader lists the tree and extracts files — but the disc does not boot:
+    firmware starts the loader and Limine reports `[config file not found]`.
+    xorriso's `-eltorito-alt-boot -e <fat.img> -no-emul-boot` produces the layout
+    firmware and Limine agree on, so the ISO path uses it and fails loudly when it
+    is absent rather than shipping a disc that does not boot.
     """
     for cand in (os.environ.get("XORRISO"), shutil.which("xorriso")):
         if cand and pathlib.Path(cand).is_file():
             return cand
-    local = pathlib.Path("/tmp/xroot/usr/bin/xorriso")
-    if local.is_file():
-        return str(local)
     return None
 
 
@@ -188,8 +179,8 @@ def build_iso_from(dest: str, loader: pathlib.Path, kernel: pathlib.Path,
         fail("xorriso not found: the ISO needs it (see the note in tools/README.md)")
 
     env = dict(os.environ)
-    # A locally extracted xorriso carries its own shared libraries; find them
-    # next to the binary (../lib64) unless the caller points somewhere else.
+    # A self-contained xorriso (an unpacked package, not an installed one) needs
+    # its own shared libraries on the search path; an installed one does not.
     libdir = os.environ.get("XORRISO_LIBDIR")
     if not libdir:
         for cand in (pathlib.Path(xorriso).resolve().parents[1] / "lib64",
