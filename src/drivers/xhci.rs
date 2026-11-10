@@ -818,7 +818,11 @@ fn bios_handoff(base: usize, hccparams1: u32) -> &'static str {
     let start = if xecp != 0 { xecp * 4 } else { 0x20 };
     let mut off = start;
     let mut guard = 0;
-    while off + 4 <= 0x1000 && guard < 64 {
+    // xECP is a dword offset and real controllers do use the far end of the BAR
+    // (this Intel PCH reports 0x2000 dwords = 32 KiB). The BAR is mapped for
+    // 64 KiB, so the walk may go there; the old 0x1000 limit aborted before the
+    // capabilities and silently skipped the BIOS handoff.
+    while off + 4 <= 0x10000 && guard < 64 {
         guard += 1;
         let cap = rd32(base, off);
         let id = cap & 0xFF;
@@ -1009,7 +1013,7 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
     {
         let mut off = if xecp != 0 { xecp * 4 } else { 0x20 };
         let mut guard = 0;
-        while off + 16 <= 0x1000 && guard < 64 {
+        while off + 16 <= 0x10000 && guard < 64 {
             guard += 1;
             let dw0 = rd32(base, off);
             let id = dw0 & 0xFF;
@@ -1198,6 +1202,29 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
         ctrl.stage(port, "no-device", sc);
         return None;
     }
+    // The controller can bring a port up on its own (PED=1, link in U0) — the field
+    // machine does exactly that after a power cycle, and the driver used to reset
+    // the port straight back into Polling. Adopt what is already working and go
+    // address the device.
+    let already_enabled = sc & PORTSC_PED != 0 && (sc & PORTSC_PLS_MASK) == 0;
+    if already_enabled {
+        let speed = ((sc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) as u8;
+        if speed != 0 {
+            let cur = rd32(ctrl.op, off);
+            wr32(
+                ctrl.op,
+                off,
+                (cur & !PORTSC_RW1C) | PORTSC_PRC | PORTSC_WRC | PORTSC_CSC,
+            );
+            let cur = rd32(ctrl.op, off);
+            if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+                d.speed = speed;
+                d.post = cur;
+            }
+            ctrl.stage(port, "already-enabled", sc);
+            return Some(speed);
+        }
+    }
     // Clear stale change bits so the PRC seen below belongs to OUR reset.
     wr32(
         ctrl.op,
@@ -1247,13 +1274,17 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
             }
         }
     }
-    if !enabled {
+    let attempts = ctrl
+        .diag
+        .get(port as usize - 1)
+        .map(|d| d.attempts)
+        .unwrap_or(0);
+    if !enabled && attempts % 4 == 0 {
         // Last resort: power-cycle the port. Firmware can hand over a controller
         // whose ports are powered but never leave Polling; dropping PP and
         // re-raising it after a settle delay makes the controller run the USB2
-        // attach sequence from scratch. This is tried repeatedly because a reset
-        // that raises PED and loses it (the field symptom) is exactly the case
-        // where the PHY needs the extra settling time.
+        // attach sequence from scratch. Not on every attempt: it is slow and it
+        // makes the device's LEDs blink (which the operator notices).
         let cur = rd32(ctrl.op, off);
         wr32(ctrl.op, off, cur & !PORTSC_PP);
         spin_settle(600_000);

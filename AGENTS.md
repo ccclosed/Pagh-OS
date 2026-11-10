@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.18.9** (the batch open with the
+  be reflected here. **`main` currently reads 2.18.10** (the batch open with the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
   **2.17.0** = the batch that made pagh run on real hardware, plus three
@@ -420,6 +420,19 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   after the controller reset is longer for the same reason, and the power-cycle
   fallback keeps its own pacing. Measured cost of one failing attempt is kept in
   the tens of milliseconds so the post-boot retry does not burn the CPU.
+  **2.18.10** = the extended capabilities were never reached. The 2.18.9 photo
+  finally shows HCCPARAMS1 = 0x20007FC1, i.e. xECP = 0x2000 dwords = 32 KiB — and
+  the capability walk gave up at 4 KiB, so on the field machine the driver had
+  NEVER performed the BIOS/USB-legacy handoff (`legacy=absent`) and never saw the
+  Supported Protocol entries (`proto=usb0` everywhere). That is one mechanism by
+  which a BIOS-owned controller keeps manipulating USB2 port state under SMM, and
+  it is exactly the kind of thing that makes a port enable and fall back to
+  Polling. The walk limit is now the mapped 64 KiB. Two more observations from the
+  same photo are addressed: the controller DOES bring ports up by itself (port 26
+  read PED=1, link U0 while the driver was waiting to retry), so a port that is
+  already enabled is adopted instead of reset back into Polling; and the PP
+  power-cycle fallback now runs only every fourth attempt — it was what made the
+  mouse's LED blink once every ~35 s, which the operator reported.
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
   `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real
