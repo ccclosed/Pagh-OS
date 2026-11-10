@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.18.3** (the batch open with the
+  be reflected here. **`main` currently reads 2.18.4** (the batch open with the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
   **2.17.0** = the batch that made pagh run on real hardware, plus three
@@ -346,6 +346,19 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   banner now print one line that makes the failure visible on screen: controllers
   seen, ports, which port has a device, how many HID devices were configured, and
   how many keyboard/mouse reports arrived.
+  **2.18.4** = the field test showed the USB count it was asked for — 2
+  controllers, 26 ports, devices on six ports — and **0 HID**: the controller saw
+  the keyboard, enumeration stopped somewhere, and the old build could not say
+  where. The boot menu now prints one row per port that has a device: PORTSC and
+  the enumeration stage it reached (`reset-ok`, `addressed`, `device-descriptor`,
+  `no-hid-interface`, `set-configuration`, `configure-endpoint`, …), the shell
+  banner carries the last failure, and the `usb` command prints the same plus
+  every PORTSC. Enumeration also got two more real-hardware fixes: EP0's max
+  packet size is updated from the device descriptor (full-speed devices start at
+  8 and the 18-byte read fails otherwise), USB3 ports whose link firmware left
+  suspended are brought up with a warm reset when the hot reset times out, and a
+  port whose enumeration fails is retried with growing spacing instead of being
+  written off after one attempt.
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
   `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real

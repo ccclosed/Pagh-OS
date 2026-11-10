@@ -27,6 +27,7 @@
 //! a hub is not reached (no hub class driver). Not implemented: isochronous
 //! transfers, suspend/resume, hot-unplug teardown, USB 3 link power management.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use core::ptr::{read_volatile, write_volatile};
@@ -117,6 +118,7 @@ const TRB_LINK: u8 = 6;
 const TRB_ENABLE_SLOT: u8 = 9;
 const TRB_ADDRESS_DEVICE: u8 = 11;
 const TRB_CONFIGURE_ENDPOINT: u8 = 12;
+const TRB_EVALUATE_CONTEXT: u8 = 13;
 const TRB_TRANSFER_EVENT: u8 = 32;
 const TRB_COMMAND_COMPLETION: u8 = 33;
 const TRB_PORT_STATUS_CHANGE: u8 = 34;
@@ -348,6 +350,22 @@ struct Slot {
     hid: Option<HidEndpoint>,
 }
 
+/// What the driver got out of one port. The boot menu prints this: on a machine
+/// with a dead keyboard and no serial port it is the entire bug report.
+#[derive(Clone, Copy)]
+struct PortDiag {
+    /// Last stage the port reached (`""` before the first attempt).
+    stage: &'static str,
+    /// Completion code (or PORTSC value) that ended it.
+    code: u32,
+    /// Speed reported at the last successful reset.
+    speed: u8,
+    /// Reset/enumeration attempts so far (the retry loop is bounded).
+    attempts: u8,
+    /// Polls to wait before the next attempt (connect debounce needs time).
+    retry_in: u8,
+}
+
 struct Controller {
     op: usize,
     db: usize,
@@ -371,6 +389,10 @@ struct Controller {
     brought_up: Vec<u8>,
     /// One-shot diagnostic: the port map after every port has been brought up.
     logged_ports: bool,
+    /// Per-port enumeration state for the on-screen diagnostic.
+    diag: Vec<PortDiag>,
+    /// The last thing that went wrong anywhere, for the one-line status.
+    last_fail: Option<(u8, &'static str, u32)>,
 }
 
 static CONTROLLER: Spinlock<Option<Controller>> = Spinlock::new(None);
@@ -394,6 +416,9 @@ pub struct Summary {
     pub devices: u64,
     /// HID reports handed to the input translator.
     pub reports: u64,
+    /// Last enumeration failure: port, stage, code. `None` when everything that
+    /// was attempted worked.
+    pub last_fail: Option<(u8, &'static str, u32)>,
 }
 
 impl Summary {
@@ -421,6 +446,7 @@ pub fn summary() -> Summary {
                 ccs_mask: mask,
                 devices: c.devices,
                 reports: c.reports,
+                last_fail: c.last_fail,
             }
         }
         None => Summary {
@@ -429,7 +455,28 @@ pub fn summary() -> Summary {
             ccs_mask: 0,
             devices: 0,
             reports: 0,
+            last_fail: None,
         },
+    }
+}
+
+impl Controller {
+    /// Record what happened on a port for the on-screen diagnostic.
+    fn stage(&mut self, port: u8, stage: &'static str, code: u32) {
+        if port == 0 {
+            return;
+        }
+        if let Some(d) = self.diag.get_mut(port as usize - 1) {
+            d.stage = stage;
+            d.code = code;
+        }
+    }
+
+    /// Record a FAILURE stage (and remember it as the last failure, which is what
+    /// the one-line status shows when no HID device came up).
+    fn fail(&mut self, port: u8, stage: &'static str, code: u32) {
+        self.stage(port, stage, code);
+        self.last_fail = Some((port, stage, code));
     }
 }
 
@@ -755,6 +802,17 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
         devices: 0,
         brought_up: Vec::new(),
         logged_ports: false,
+        diag: vec![
+            PortDiag {
+                stage: "",
+                code: 0,
+                speed: 0,
+                attempts: 0,
+                retry_in: 0,
+            };
+            ports as usize
+        ],
+        last_fail: None,
     });
     // The scratchpad pages must outlive every command the controller runs.
     core::mem::forget(scratchpad_pages);
@@ -838,6 +896,7 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
     if sc & PORTSC_PP == 0 {
         wr32(ctrl.op, off, (sc & !PORTSC_RW1C) | PORTSC_PP);
         if !spin_until(|| rd32(ctrl.op, off) & PORTSC_PP != 0, 100_000) {
+            ctrl.fail(port, "no-power", sc);
             return None;
         }
         sc = rd32(ctrl.op, off);
@@ -851,6 +910,7 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
         if sc & PORTSC_CSC != 0 {
             wr32(ctrl.op, off, (sc & !PORTSC_RW1C) | PORTSC_CSC);
         }
+        ctrl.stage(port, "no-device", sc);
         return None;
     }
     // Consume stale change bits (the controller sets CSC on every port at reset)
@@ -862,14 +922,24 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
     );
     let sc = rd32(ctrl.op, off);
     wr32(ctrl.op, off, (sc & !PORTSC_RW1C) | PORTSC_PR);
-    if !spin_until(
+    let mut reset_ok = spin_until(
         || rd32(ctrl.op, off) & (PORTSC_PRC | PORTSC_WPR) != 0,
         200_000,
-    ) {
-        // A device that is connected but does not complete the reset (a broken
-        // cable, a hub, a port we cannot drive) must not hang the caller.
-        crate::debug!("xhci: port {} reset not completed", port);
-        return None;
+    );
+    if !reset_ok {
+        // USB3 ports whose link is not in U0 (firmware left them in U3) do not
+        // answer a hot reset; a warm reset is the specified way to bring them
+        // back, so try that before writing the port off.
+        let cur = rd32(ctrl.op, off);
+        wr32(ctrl.op, off, (cur & !PORTSC_RW1C) | PORTSC_WPR);
+        reset_ok = spin_until(
+            || rd32(ctrl.op, off) & (PORTSC_PRC | PORTSC_WPR) != 0,
+            400_000,
+        );
+        if !reset_ok {
+            ctrl.fail(port, "reset-timeout", rd32(ctrl.op, off));
+            return None;
+        }
     }
     let cur = rd32(ctrl.op, off);
     wr32(
@@ -879,9 +949,15 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
     );
     let cur = rd32(ctrl.op, off);
     if cur & PORTSC_CCS == 0 {
+        ctrl.fail(port, "lost-after-reset", cur);
         return None;
     }
-    Some(((cur & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) as u8)
+    let speed = ((cur & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) as u8;
+    ctrl.stage(port, "reset-ok", cur);
+    if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+        d.speed = speed;
+    }
+    Some(speed)
 }
 
 /// EP0 max packet size before the device descriptor is known, by speed.
@@ -1027,6 +1103,8 @@ fn enable_slot(ctrl: &mut Controller) -> Option<usize> {
         crate::warn!("xhci: enable slot failed: cc={}", ev.completion_code());
         return None;
     }
+    // A per-port stage is recorded by the caller, which knows the port; the slot
+    // command itself only says whether the controller had a free slot.
     let id = ev.slot_id();
     if id == 0 {
         return None;
@@ -1118,13 +1196,76 @@ fn address_device(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
         ((TRB_ADDRESS_DEVICE as u32) << 10) | ((slot_id as u32) << 24),
     );
     match ev {
-        Some(ev) if ev.completion_code() == CC_SUCCESS => true,
+        Some(ev) if ev.completion_code() == CC_SUCCESS => {
+            ctrl.stage(port, "addressed", 0);
+            true
+        }
         Some(ev) => {
+            ctrl.fail(port, "address", ev.completion_code() as u32);
             crate::warn!("xhci: address device failed: cc={}", ev.completion_code());
             false
         }
-        None => false,
+        None => {
+            ctrl.fail(port, "address-noevent", 0);
+            false
+        }
     }
+}
+
+/// Update EP0's max packet size after the first descriptor read.
+///
+/// A full/low-speed device may start with an 8-byte EP0 and report its real
+/// `bMaxPacketSize0` only in the device descriptor; reading the 18-byte descriptor
+/// through an 8-byte EP0 then fails on real hardware (QEMU's keyboard is
+/// high-speed, so its 64-byte EP0 hid this). Evaluate Context is the specified way
+/// to change it: the input context carries the slot and EP0 contexts again.
+fn evaluate_ep0_max_packet(ctrl: &mut Controller, slot_index: usize, max_packet: u32) -> bool {
+    let ctx_size = ctrl.ctx_size;
+    let (input, input_phys, ep0_phys, slot_id, port, speed) = {
+        let Some(slot) = ctrl.slots.get(slot_index) else {
+            return false;
+        };
+        (
+            slot.input_ctx.virt(),
+            slot.input_ctx.phys(),
+            slot.ep0.base_phys(),
+            slot.id,
+            slot.port,
+            slot.speed,
+        )
+    };
+    // SAFETY: our own zeroed page; offsets are the spec's for this context size.
+    unsafe {
+        let p = input as *mut u32;
+        core::ptr::write_bytes(input as *mut u8, 0, PAGE_SIZE);
+        write_volatile(p, 0); // nothing to drop
+        write_volatile(p.add(1), 0b11); // add slot + EP0
+        let slot_ctx = p.add(8) as *mut u32;
+        write_volatile(
+            slot_ctx,
+            (1 << SLOT_CTX_ENTRIES_SHIFT) | ((speed as u32) << SLOT_CTX_SPEED_SHIFT),
+        );
+        write_volatile(slot_ctx.add(1), (port as u32) << SLOT_CTX_PORT_SHIFT);
+        let ep_ctx = (input + ctx_size * 2) as *mut u32;
+        write_volatile(ep_ctx, 0);
+        write_volatile(
+            ep_ctx.add(1),
+            (3 << EP_CTX_CERR_SHIFT)
+                | (EP_TYPE_CONTROL << EP_CTX_EP_TYPE_SHIFT)
+                | (max_packet << EP_CTX_MAX_PACKET_SHIFT),
+        );
+        write_volatile(ep_ctx.add(2), (ep0_phys | 1) as u32);
+        write_volatile(ep_ctx.add(3), (ep0_phys >> 32) as u32);
+    }
+    let (a0, a1) = ctx_addr(input_phys);
+    let ev = command(
+        ctrl,
+        a0,
+        a1,
+        0,
+        ((TRB_EVALUATE_CONTEXT as u32) << 10) | ((slot_id as u32) << 24),
+    );
+    matches!(ev, Some(ev) if ev.completion_code() == CC_SUCCESS)
 }
 
 /// Parsed configuration descriptor: the HID interface and its IN endpoint.
@@ -1278,6 +1419,7 @@ fn enumerate_with_speed(ctrl: &mut Controller, port: u8, speed: u8) -> bool {
         _ => "?",
     };
     let Some(slot_index) = enable_slot(ctrl) else {
+        ctrl.fail(port, "enable-slot", 0);
         return false;
     };
     ctrl.slots[slot_index].port = port;
@@ -1288,18 +1430,43 @@ fn enumerate_with_speed(ctrl: &mut Controller, port: u8, speed: u8) -> bool {
     // Device descriptor: 8 bytes first (a full-speed device may only have an
     // 8-byte EP0 at this point), then the whole 18.
     let Some(head) = get_descriptor(ctrl, slot_index, 1, 0, 8) else {
+        ctrl.fail(port, "device-descriptor", 0);
         crate::warn!("xhci: port {}: no device descriptor", port);
         return false;
     };
     if head.len() < 8 {
+        ctrl.fail(port, "device-descriptor-short", head.len() as u32);
         return false;
     }
-    let vendor = u16::from_le_bytes([head[8 - 8], head[9 - 8]]);
-    let product = u16::from_le_bytes([head[10 - 8], head[11 - 8]]);
+    let vendor = u16::from_le_bytes([head[0], head[1]]);
+    let product = u16::from_le_bytes([head[2], head[3]]);
+    // The first 8 bytes carry bMaxPacketSize0 at offset 7. For full/low speed the
+    // controller was told 8; if the device says otherwise, update EP0 before
+    // asking for the 18-byte descriptor, or the long read fails on real hardware.
+    let device_mps = head[7] as u32;
+    let assumed_mps = ep0_max_packet(speed);
+    if device_mps != assumed_mps && matches!(device_mps, 8 | 16 | 32 | 64) {
+        if evaluate_ep0_max_packet(ctrl, slot_index, device_mps) {
+            crate::debug!(
+                "xhci: port {}: EP0 max packet {} -> {}",
+                port,
+                assumed_mps,
+                device_mps
+            );
+        } else {
+            crate::warn!(
+                "xhci: port {}: EP0 max packet update to {} failed",
+                port,
+                device_mps
+            );
+        }
+    }
     let Some(dev) = get_descriptor(ctrl, slot_index, 1, 0, 18) else {
+        ctrl.fail(port, "device-descriptor-full", 0);
         return false;
     };
     if dev.len() < 18 {
+        ctrl.fail(port, "device-descriptor-full-short", dev.len() as u32);
         return false;
     }
     let max_packet0 = dev[7];
@@ -1312,28 +1479,36 @@ fn enumerate_with_speed(ctrl: &mut Controller, port: u8, speed: u8) -> bool {
         max_packet0
     );
     match dev[4] {
-        9 => crate::warn!(
+        9 => {
+            ctrl.fail(port, "hub-unsupported", 9);
+            crate::warn!(
             "xhci: port {} holds a USB hub; hubs are not supported (keyboard behind it is invisible)",
             port
-        ),
+        )
+        }
         0 => {}
         class => crate::info!("xhci: port {} device class {:#04x}", port, class),
     }
     // Configuration descriptor: 9 bytes for the total length, then the whole blob.
     let Some(head) = get_descriptor(ctrl, slot_index, 2, 0, 9) else {
+        ctrl.fail(port, "config-descriptor", 0);
         return false;
     };
     if head.len() < 9 {
+        ctrl.fail(port, "config-descriptor-short", head.len() as u32);
         return false;
     }
     let total = u16::from_le_bytes([head[2], head[3]]) as usize;
     if total < 9 || total > PAGE_SIZE {
+        ctrl.fail(port, "config-length", total as u32);
         return false;
     }
     let Some(conf) = get_descriptor(ctrl, slot_index, 2, 0, total) else {
+        ctrl.fail(port, "config-full", 0);
         return false;
     };
     let Some(iface) = parse_config(&conf) else {
+        ctrl.fail(port, "no-hid-interface", dev[4] as u32);
         crate::info!(
             "xhci: port {}: device {:04x}:{:04x} has no HID interrupt-IN interface",
             port,
@@ -1346,6 +1521,7 @@ fn enumerate_with_speed(ctrl: &mut Controller, port: u8, speed: u8) -> bool {
     // stalls), SET_PROTOCOL(1) selects the boot report layout this driver parses,
     // and SET_IDLE(0) stops the device NAKing reports when nothing changes.
     if !control_no_data(ctrl, slot_index, 0x00, 9, iface.config_value as u16, 0) {
+        ctrl.fail(port, "set-configuration", iface.config_value as u32);
         crate::warn!("xhci: port {}: SET_CONFIGURATION failed", port);
         return false;
     }
@@ -1356,8 +1532,10 @@ fn enumerate_with_speed(ctrl: &mut Controller, port: u8, speed: u8) -> bool {
         crate::warn!("xhci: port {}: SET_IDLE failed", port);
     }
     if !configure_hid_endpoint(ctrl, slot_index, &iface) {
+        ctrl.fail(port, "configure-endpoint", 0);
         return false;
     }
+    ctrl.stage(port, "hid-ready", iface.protocol as u32);
     // Boot protocol: 0 = none, 1 = keyboard, 2 = mouse.
     crate::info!(
         "xhci: HID device on port {}: iface={} subclass={} protocol={} ep={:#04x} report={}B",
@@ -1387,19 +1565,44 @@ pub fn poll() {
             continue;
         }
         if !ctrl.brought_up.contains(&port) {
-            // A port that has not produced a device yet is RETRIED on every poll
-            // instead of being given up on. USB2 connect detection has a debounce
-            // window of ~100 ms after a reset, so a one-shot check right after
-            // `HCRST` can see `ccs=false` on hardware that is about to report the
-            // keyboard — QEMU's instant answer made that race invisible here.
-            match reset_port(ctrl, port) {
-                Some(speed) => {
-                    ctrl.brought_up.push(port);
-                    if enumerate_with_speed(ctrl, port, speed) {
-                        ctrl.devices += 1;
-                    }
+            // A port that has not produced a DEVICE yet is retried — USB2 connect
+            // detection needs ~100 ms of debounce after the reset, so a one-shot
+            // check right after `HCRST` can miss a keyboard that is about to
+            // appear (QEMU's instant emulation hid that race). Retries are spaced
+            // out: the first ones are quick, later ones wait longer, and after 40
+            // attempts the port is left to the diagnostics instead of being reset
+            // forever. A port only leaves this set once a HID device works on it.
+            let (attempts, retry_in) = ctrl
+                .diag
+                .get(port as usize - 1)
+                .map(|d| (d.attempts, d.retry_in))
+                .unwrap_or((0, 0));
+            if retry_in > 0 {
+                if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+                    d.retry_in = d.retry_in.saturating_sub(1);
                 }
-                None => crate::debug!("xhci: port {} has no device yet", port),
+                continue;
+            }
+            if attempts >= 40 {
+                ctrl.brought_up.push(port);
+                continue;
+            }
+            if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+                d.attempts += 1;
+            }
+            if let Some(speed) = reset_port(ctrl, port) {
+                if enumerate_with_speed(ctrl, port, speed) {
+                    ctrl.devices += 1;
+                    ctrl.brought_up.push(port);
+                } else if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+                    // Give the next attempt breathing room before resetting again.
+                    d.retry_in = (10 + d.attempts.saturating_mul(4)).min(100);
+                }
+            } else {
+                // No device yet: try again soon (one PORTSC read per attempt).
+                if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+                    d.retry_in = 8;
+                }
             }
             continue;
         }
@@ -1520,6 +1723,35 @@ pub fn usb_thread() {
         poll();
         crate::task::scheduler::sleep_ticks(1);
     }
+}
+
+/// One row per port that has (or had) a device on it, for the boot menu.
+///
+/// `(port, PORTSC, stage, code, speed)`: the stage is where enumeration stopped —
+/// `hid-ready` means the device types, anything else is the answer to "why does
+/// the keyboard not work".
+pub fn diagnostics() -> Vec<(u8, u32, &'static str, u32, u8)> {
+    let guard = CONTROLLER.lock();
+    let Some(c) = guard.as_ref() else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for port in 1..=c.ports {
+        let sc = rd32(c.op, portsc(port));
+        let Some(d) = c.diag.get(port as usize - 1) else {
+            continue;
+        };
+        // Only ports that are interesting: a device is attached, or an attempt was
+        // made (a device that vanished), or the stage is a real failure.
+        if sc & PORTSC_CCS == 0 && d.stage.is_empty() {
+            continue;
+        }
+        if sc & PORTSC_CCS == 0 && d.stage == "no-device" {
+            continue;
+        }
+        rows.push((port, sc, d.stage, d.code, d.speed));
+    }
+    rows
 }
 
 /// Every port's raw PORTSC, for the shell's `usb` command.
