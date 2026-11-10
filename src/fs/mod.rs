@@ -23,6 +23,9 @@ pub enum FsError {
     BadSuperBlock,
     /// The WAL journal superblock magic did not validate.
     BadJournal,
+    /// The volume is a filesystem this driver must not write to (ext3/ext4-style
+    /// features, or a foreign journal). See `ext2::read_sb_gds`.
+    Unsupported,
     /// A bitmap (block or inode) had no free bit left.
     OutOfSpace,
     /// A path component / inode / directory entry was not found.

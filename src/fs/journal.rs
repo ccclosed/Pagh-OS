@@ -432,7 +432,7 @@ fn store_journal_super(buf: &mut [u8], js: &JournalSuper) {
 
 /// Read a journal superblock and verify its CRC32 (the trailing `checksum`
 /// field covers every preceding byte of the struct).
-fn load_journal_super(buf: &[u8]) -> Result<JournalSuper, FsError> {
+pub(crate) fn load_journal_super(buf: &[u8]) -> Result<JournalSuper, FsError> {
     let js: JournalSuper = unsafe { structs::read_struct(buf) };
     let size = core::mem::size_of::<JournalSuper>();
     let stored = structs::read_u32(buf, size - 4);

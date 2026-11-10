@@ -58,6 +58,17 @@ use crate::fs::journal::{Journal, JournalArea};
 use crate::fs::FsError;
 use crate::sync::spinlock::{Spinlock, SpinlockGuard};
 use crate::vfs::{FsStat, VfsError, VfsNode, VfsResult};
+use structs::JNL_MAGIC;
+
+/// Features this driver implements. Anything outside these masks belongs to
+/// ext3/ext4 (or a newer ext2 revision) and is refused: see `read_sb_gds`.
+const FEATURE_INCOMPAT_SUPPORTED: u32 = 0x2; // FILETYPE
+const FEATURE_RO_COMPAT_SUPPORTED: u32 = 0x1 | 0x2; // SPARSE_SUPER | LARGE_FILE
+/// Compatible features are ignorable BY DEFINITION, with one exception: a
+/// `HAS_JOURNAL` volume needs jbd2 replay before its metadata can be trusted, and
+/// this driver writes its own journal instead. Refusing it is what keeps a
+/// user's ext3/ext4 partition out of reach.
+const FEATURE_COMPAT_UNSUPPORTED: u32 = 0x4; // HAS_JOURNAL
 
 use structs::{
     inode_size, read_struct, read_u32, write_struct, write_u32, Ext2GroupDesc, Ext2Inode,
@@ -847,6 +858,35 @@ impl Ext2Fs {
 // ─── mount ────────────────────────────────────────────────────────────────
 
 impl Ext2Fs {
+    /// True when this volume carries pagh's own journal superblock.
+    ///
+    /// THE OWNERSHIP MARKER. A structurally valid ext2 volume is not proof that
+    /// pagh may write to it — a user's Linux partition is often plain ext2 or
+    /// ext4, and `disk format` is the only thing that ever puts pagh's WAL on a
+    /// device. So the WAL superblock is the marker: it is written by `format`
+    /// alone, it lives in a region ext2 does not otherwise use, and its magic
+    /// (`PAGHJNL\1`) is not something another filesystem produces by accident.
+    ///
+    /// Used by the boot path to decide what it may mount on its own. A volume
+    /// without the marker is never touched automatically.
+    pub fn is_pagh_volume(dev: &dyn BlockDevice) -> bool {
+        let Ok((sb, _)) = Self::read_sb_gds(dev) else {
+            return false;
+        };
+        let area = Self::journal_area(&sb);
+        let mut buf = vec![0u8; BS];
+        if dev
+            .read_block(area.super_block * SECTORS_PER_BLOCK, &mut buf)
+            .is_err()
+        {
+            return false;
+        }
+        match crate::fs::journal::load_journal_super(&buf) {
+            Ok(js) => js.magic == JNL_MAGIC && js.log_blocks != 0,
+            Err(_) => false,
+        }
+    }
+
     /// Read the superblock and the full group-descriptor table (one
     /// one descriptor per block group; the table starts at block 1). Old
     /// single-group images load unchanged (they simply yield one descriptor).
@@ -856,6 +896,30 @@ impl Ext2Fs {
         let sb: Ext2SuperBlock = unsafe { read_struct(&b0[SUPERBLOCK_OFFSET..]) };
         if sb.s_magic != EXT2_MAGIC {
             return Err(FsError::BadSuperBlock);
+        }
+        // `s_magic` is 0xEF53 for ext2, ext3 AND ext4 — they are one family, and
+        // an ext4 volume passes every structural check an ext2 one does. Mounting
+        // it would then mean writing: `reconcile_free_counts` rewrites group
+        // descriptors, and the WAL reserves blocks at the end of the volume. On a
+        // real machine that is somebody's Linux root filesystem.
+        //
+        // So the feature words are checked, not just the magic. The masks below
+        // are exactly the features this driver implements: `FILETYPE` (a
+        // directory entry carries its type) and the read-only `SPARSE_SUPER` /
+        // `LARGE_FILE`. Anything else — extents, 64-bit, flex_bg, a jbd2 journal
+        // (`HAS_JOURNAL`) — is a filesystem this code cannot keep consistent, and
+        // it is refused rather than read half-way.
+        if sb.s_feature_incompat & !FEATURE_INCOMPAT_SUPPORTED != 0
+            || sb.s_feature_ro_compat & !FEATURE_RO_COMPAT_SUPPORTED != 0
+            || sb.s_feature_compat & FEATURE_COMPAT_UNSUPPORTED != 0
+        {
+            crate::warn!(
+                "ext2: refusing a foreign/ext4-style volume (incompat={:#x} ro={:#x} compat={:#x})",
+                sb.s_feature_incompat,
+                sb.s_feature_ro_compat,
+                sb.s_feature_compat
+            );
+            return Err(FsError::Unsupported);
         }
         if (1024usize << sb.s_log_block_size) != BS {
             return Err(FsError::BadSuperBlock);

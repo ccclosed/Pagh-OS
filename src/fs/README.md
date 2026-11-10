@@ -9,7 +9,7 @@ write-ahead-log журналом для crash-consistency. Чистая логи
 | Файл | Роль |
 |---|---|
 | `mod.rs` | Корень; enum `FsError` |
-| `format_policy.rs` | Политика «можно ли форматировать это устройство»: чистый `core`-модуль **без I/O** — `Probe` (инкрементальный классификатор boot-области: ext2-magic / MBR+GPT / blank / foreign) и `format_allowed(layout, has_valid_superblock, allow_destructive)`; host-тесты гоняют его напрямую (P50, issue #33) |
+| `format_policy.rs` | Политика «можно ли форматировать это устройство»: чистый `core`-модуль **без I/O** — `Probe` (инкрементальный классификатор boot-области: ext2-magic / MBR+GPT / blank / foreign) и `format_allowed(layout, has_valid_superblock, allow_destructive)`; host-тесты гоняют его напрямую (P50, issue #33). Магия ext-семейства лежит по `SUPERBLOCK_OFFSET + SB_MAGIC_OFFSET` (1024 + 0x38), а не по 1024 |
 | `journal.rs` | WAL-журнал: `Journal`, `Txn`, `JournalArea` — кольцевой лог, атомарные мультиблочные транзакции, CRC-коммиты, crash-consistent `recover()` |
 | `ext2/mod.rs` | Ядро драйвера: `Ext2Fs` (format/mount), `Tx` (dirty-набор, аллокаторы, block-map), файловые операции, VfsNode-адаптеры `Ext2Dir`/`Ext2File`/`Ext2Symlink`/`Ext2Opaque`, маппинг ошибок `fs_to_vfs` |
 | `ext2/structs.rs` | On-disk `#[repr(C)]`-структуры с compile-time фиксацией размеров (`Ext2SuperBlock` 0x88 B, `Ext2GroupDesc` 32 B, `Ext2Inode` 128 B, `JournalSuper` 56 B и др.), магии (`S_IFREG/S_IFDIR/S_IFLNK`), unaligned read/write, CRC32 |
@@ -155,20 +155,27 @@ write-ahead-log журналом для crash-consistency. Чистая логи
   цепочке от `next_seq`, первая битая/незакоммиченная запись останавливает скан.
 - Тот же таргет, залогированный дважды: побеждает поздняя запись.
 
-### Монтирование (из `boot.rs::init_fs`)
-`has_valid_superblock` → `mount` → валидация (magic, block size, счётчики, `s_inode_size`) →
-`Journal::open` + `recover()` → `reconcile_free_counts` → `Arc<Ext2Fs>`. Boot выбирает
-virtio-blk, фоллбэк NVMe; маунт в `/mnt`.
+### Монтирование и владение томом (из `boot.rs::init_fs`)
+Владелец тома определяется WAL-суперблоком: `Ext2Fs::is_pagh_volume` читает
+`JournalArea` и сверяет `JNL_MAGIC = "PAGHJNL\1"` и `log_blocks != 0`. Маркер пишет
+только `Ext2Fs::format`, поэтому структурно валидный ext2 без него — **чужой** и
+автоматически не трогается. Загрузка монтирует только свой том: либо выбранный
+человеком в boot-меню (`src/boot_menu.rs`), либо (без выбора) первый найденный;
+чужой ext2/ext4 показывается в меню как `FOREIGN fs` и остаётся нетронутым.
+`mount` → валидация (magic, block size, счётчики, `s_inode_size`) → feature-слова
+(`FILETYPE`; read-only `SPARSE_SUPER`|`LARGE_FILE`; всё остальное — extents, 64BIT,
+FLEX_BG, `HAS_JOURNAL` — `FsError::Unsupported`) → `Journal::open` + `recover()` →
+`reconcile_free_counts` → `Arc<Ext2Fs>`.
 
-Форматирование разрешено **только для genuinely blank устройства** — либо для устройства с
-явным opt-in маркером (`PAGH-FORMAT` в секторе 0, см. `format_policy::OPT_IN_MARKER`) — и
-решается в `format_policy` (issue #33): провал `mount` больше не означает «диск пустой».
-Порядок правил — валидный (парсящийся) суперблок → отказ (`Refusal::ExistingFilesystem`,
-убитый WAL не даёт права стирать); таблица разделов MBR/GPT → отказ
-`Refusal::PartitionTable`; любые ненулевые данные → `Refusal::ForeignData`; формат — только
-если все спроецированные 1 MiB нулевые либо в секторе 0 стоит маркер. Зонд идёт по 4 KiB с
-ранним выходом и запускается **лишь после неудачного mount**, так что happy path ничего не
-платит.
+**Форматирование раздела возможно только из boot-меню**: `F`, затем имя устройства
+набирается целиком. `format_policy` больше не даёт автоматическому пути форматировать
+раздел — она осталась политикой для shell-команды `disk setup` и для RAM-диска с
+носителя (единственное устройство, которое автоматический путь может отформатировать
+сам: он исчезает при выключении, и терять в нём нечего). Правила `format_allowed` те же:
+валидный суперблок → `Refusal::ExistingFilesystem`; MBR/GPT → `Refusal::PartitionTable`;
+прочие ненулевые данные → `Refusal::ForeignData`; `PAGH-FORMAT`-маркер в секторе 0
+(`format_policy::OPT_IN_MARKER`) — разрешение. Зонд идёт по 4 KiB с ранним выходом и
+запускается **лишь после неудачного mount**, так что happy path ничего не платит.
 
 ## Зависимости
 
@@ -179,6 +186,11 @@ virtio-blk, фоллбэк NVMe; маунт в `/mnt`.
   journal recover), `test.rs` (fs_prop_tests, mock_block).
 
 ## Грабли
+
+- Детектор ext-суперблока сравнивал магию по смещению 1024 вместо 1024 + 0x38, из-за чего
+  **любой** ext2/ext4 определялся как `Foreign`, а `Refusal::Ext2Like` не мог сработать
+  вовсе; host-тест P50 писал магию туда же, поэтому пара оставалась зелёной. Константа
+  `SB_MAGIC_OFFSET` теперь экспортируется и тестом, и детектором.
 
 - `inode_location` отвергает мусорные inode-номера через `Corrupt`, а не клампит — кламп
   алиасил чужой слот inode-таблицы и освобождал произвольные блоки.

@@ -28,7 +28,7 @@
 
 use crate::format_policy::{
     format_allowed, Layout, Probe, Refusal, EXT2_MAGIC_LE, GPT_SIGNATURE, MBR_SIGNATURE, MIN_PROBE,
-    OPT_IN_MARKER, SUPERBLOCK_OFFSET,
+    OPT_IN_MARKER, SB_MAGIC_OFFSET, SUPERBLOCK_OFFSET,
 };
 use proptest::prelude::*;
 
@@ -66,7 +66,11 @@ fn mbr_boot_area() -> Vec<u8> {
 /// An ext2/ext4 superblock magic at the offset `read_sb_gds` looks at.
 fn ext2_boot_area() -> Vec<u8> {
     let mut b = vec![0u8; CHUNK];
-    b[SUPERBLOCK_OFFSET..MIN_PROBE].copy_from_slice(&EXT2_MAGIC_LE);
+    // The magic lives at 1024 + 0x38. Placing it at `SUPERBLOCK_OFFSET` alone
+    // (which is what this test used to do) agrees with a detector that makes the
+    // same mistake, so the pair stayed green while `Layout::Ext2` could never be
+    // produced for a real volume — see `SB_MAGIC_OFFSET` in `format_policy`.
+    b[SUPERBLOCK_OFFSET + SB_MAGIC_OFFSET..MIN_PROBE].copy_from_slice(&EXT2_MAGIC_LE);
     b
 }
 
@@ -112,8 +116,12 @@ proptest! {
         if gpt {
             b[512..520].copy_from_slice(GPT_SIGNATURE);
         }
-        b[SUPERBLOCK_OFFSET] = 0;
-        b[SUPERBLOCK_OFFSET + 1] = 0;
+        // Clear the magic where it actually lives; clearing it at
+        // `SUPERBLOCK_OFFSET` (as this used to) left the real magic intact, so the
+        // block was classified as ext2 and this assertion passed for the wrong
+        // reason only because the detector looked at the same wrong place.
+        b[SUPERBLOCK_OFFSET + SB_MAGIC_OFFSET] = 0;
+        b[SUPERBLOCK_OFFSET + SB_MAGIC_OFFSET + 1] = 0;
 
         let probe = Probe::new(&b);
         prop_assert_eq!(probe.layout(), Layout::PartitionTable);

@@ -25,6 +25,19 @@
 /// Byte offset of the ext2 superblock inside the first filesystem block.
 pub const SUPERBLOCK_OFFSET: usize = 1024;
 
+/// Offset of `s_magic` INSIDE the superblock (`0x38`, matching
+/// `Ext2SuperBlock::s_magic`, whose offset is asserted in `ext2::structs`).
+///
+/// This constant exists because its absence was a real bug: the detector compared
+/// the magic against `buf[SUPERBLOCK_OFFSET..SUPERBLOCK_OFFSET + 2]`, i.e. at byte
+/// 1024, while the magic actually lives at 1080. Every ext2/ext4 volume therefore
+/// probed as `Foreign`, and the `Ext2Like` refusal — "the magic is there but the
+/// superblock does not validate" — could never fire. The `has_valid_superblock`
+/// check in front of it masked the mistake for the format decision, and nothing
+/// displayed the layout, so it stayed invisible until a boot menu started printing
+/// what each partition holds.
+pub const SB_MAGIC_OFFSET: usize = 0x38;
+
 /// ext2/ext4 `s_magic` as it appears on disk (little-endian `0xEF53`).
 pub const EXT2_MAGIC_LE: [u8; 2] = [0x53, 0xEF];
 
@@ -35,7 +48,7 @@ pub const GPT_SIGNATURE: &[u8; 8] = b"EFI PART";
 pub const MBR_SIGNATURE: [u8; 2] = [0x55, 0xAA];
 
 /// Minimum probe length that can recognise every layout above (the ext2 magic).
-pub const MIN_PROBE: usize = SUPERBLOCK_OFFSET + 2;
+pub const MIN_PROBE: usize = SUPERBLOCK_OFFSET + SB_MAGIC_OFFSET + 2;
 
 /// Explicit opt-in marker an operator writes into sector 0 to authorise pagh to
 /// take over a device that already carries data.
@@ -241,7 +254,8 @@ pub fn format_allowed(
 
 /// ext2/ext4 superblock magic at [`SUPERBLOCK_OFFSET`].
 fn is_ext2_superblock(buf: &[u8]) -> bool {
-    buf.len() >= MIN_PROBE && buf[SUPERBLOCK_OFFSET..MIN_PROBE] == EXT2_MAGIC_LE
+    // The magic sits at 1024 + 0x38, not at 1024: see `SB_MAGIC_OFFSET`.
+    buf.len() >= MIN_PROBE && buf[SUPERBLOCK_OFFSET + SB_MAGIC_OFFSET..MIN_PROBE] == EXT2_MAGIC_LE
 }
 
 /// GPT header at LBA 1 or the MBR boot signature at the end of LBA 0.
@@ -277,7 +291,11 @@ mod tests {
 
     fn ext2_boot_block() -> [u8; 4096] {
         let mut b = [0u8; 4096];
-        b[SUPERBLOCK_OFFSET..MIN_PROBE].copy_from_slice(&EXT2_MAGIC_LE);
+        // At `SUPERBLOCK_OFFSET + SB_MAGIC_OFFSET`, the offset a real volume has.
+        // These tests previously wrote it at `SUPERBLOCK_OFFSET`, matching the
+        // detector's own mistake — which is why both stayed green while every
+        // ext2/ext4 volume probed as `Foreign`.
+        b[SUPERBLOCK_OFFSET + SB_MAGIC_OFFSET..MIN_PROBE].copy_from_slice(&EXT2_MAGIC_LE);
         b
     }
 
