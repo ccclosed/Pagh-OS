@@ -8,6 +8,7 @@ pub mod framebuffer;
 pub mod memdisk;
 pub mod nvme;
 pub mod nvme_prp;
+pub mod partition;
 pub mod pci;
 pub mod ps2_kbd;
 pub mod ps2_mouse;

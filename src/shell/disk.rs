@@ -202,7 +202,7 @@ pub fn cmd_mount(index: usize) {
 /// A device that is not blank needs `--force`, which is the same acknowledgement
 /// the wizard asks for by name; a script that passes it is saying the same thing
 /// an operator typing the device name says.
-pub fn cmd_format(index: usize, force: bool) {
+pub fn cmd_format(index: usize, force: bool, mount_after: bool) {
     let Some(entry) = entries().into_iter().nth(index) else {
         println_text(&format!("disk format: no device number {}", index + 1));
         return;
@@ -215,7 +215,7 @@ pub fn cmd_format(index: usize, force: bool) {
         ));
         return;
     }
-    format_and_mount(&entry.name, force);
+    format_and_mount_with(&entry.name, force, mount_after);
 }
 
 /// Feed one line of shell input to the pending wizard question.
@@ -280,16 +280,27 @@ pub fn feed_line(line: &str) {
 
 /// Format `name` and mount the result at `/mnt`.
 fn format_and_mount(name: &str, allow_destructive: bool) {
+    format_and_mount_with(name, allow_destructive, true)
+}
+
+/// Format `name`; mount it too unless `mount_after` is false.
+///
+/// `--no-mount` exists so a disk can be PREPARED while another filesystem owns
+/// `/mnt`: installing a filesystem onto a partition is the step a user wants
+/// before switching the mount over, and pagh has no unmount — the alternative
+/// would be "you cannot format anything while /mnt is busy".
+fn format_and_mount_with(name: &str, allow_destructive: bool, mount_after: bool) {
     let Some(blk) = crate::drivers::get_block(name) else {
         println_text(&format!("disk: {} disappeared", name));
         return;
     };
-    if crate::vfs::mount_snapshot()
-        .iter()
-        .any(|m| m.point == "/mnt")
+    if mount_after
+        && crate::vfs::mount_snapshot()
+            .iter()
+            .any(|m| m.point == "/mnt")
     {
         println_text(
-            "disk: /mnt is already mounted; pagh has no unmount yet — reboot to change the device",
+            "disk: /mnt is already mounted; use `--no-mount` to just format, or reboot to change the mounted device",
         );
         return;
     }
@@ -318,6 +329,13 @@ fn format_and_mount(name: &str, allow_destructive: bool) {
     ));
     if let Err(e) = crate::fs::ext2::Ext2Fs::format(Arc::clone(&blk) as Arc<dyn BlockDevice>) {
         println_text(&format!("disk: format failed: {:?}", e));
+        return;
+    }
+    if !mount_after {
+        println_text(&format!(
+            "disk: {} formatted as ext2 + WAL (not mounted; a reboot will use it)",
+            name
+        ));
         return;
     }
     match crate::fs::ext2::Ext2Fs::mount(Arc::clone(&blk) as Arc<dyn BlockDevice>) {
@@ -375,8 +393,12 @@ pub fn cmd(args: &[&str]) {
             _ => println_text("usage: disk mount <number>"),
         },
         Some("format") => match args.get(1).and_then(|a| a.parse::<usize>().ok()) {
-            Some(n) if n >= 1 => cmd_format(n - 1, args.iter().any(|a| *a == "--force")),
-            _ => println_text("usage: disk format <number> [--force]"),
+            Some(n) if n >= 1 => cmd_format(
+                n - 1,
+                args.iter().any(|a| *a == "--force"),
+                !args.iter().any(|a| *a == "--no-mount"),
+            ),
+            _ => println_text("usage: disk format <number> [--force] [--no-mount]"),
         },
         Some(other) => println_text(&format!("disk: unknown subcommand `{}`", other)),
     }

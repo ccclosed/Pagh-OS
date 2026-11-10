@@ -71,6 +71,12 @@ pub fn start() -> ! {
     // not need the heap: on a real PC there is no serial port, so without this a
     // failure in any later step leaves a black screen and nothing else. From here
     // on every step prints its name, so a machine that stops shows exactly where.
+    // Capture log lines into the file-mirror ring from the very first message:
+    // the boot log is what an operator needs after a failure, and it happens
+    // before any filesystem exists to write it to (the flusher thread drains the
+    // ring once /mnt is mounted).
+    crate::logfile::enable_buffering();
+
     let visible = crate::drivers::earlyfb::init();
     if visible {
         crate::drivers::earlyfb::clear();
@@ -372,27 +378,65 @@ fn init_fs() {
     use crate::fs::ext2::Ext2Fs;
     use crate::fs::format_policy::{format_allowed, Refusal};
 
+    // Attach NVMe first: on a real machine that is the disk with a partition
+    // table, and the partition walk below can only see what is registered.
+    {
+        let devices = crate::drivers::pci::enumerate();
+        if let Ok(true) = crate::drivers::nvme::attach(&devices) {
+            crate::drivers::nvme::register_block_device();
+            info!("fs: NVMe controller attached");
+        }
+    }
+
+    // Partitions, for every whole device registered so far: on a real machine the
+    // disk carries a partition table and pagh must be able to use ONE partition
+    // without touching the rest (see `drivers::partition`).
+    for (name, _sectors) in drivers::list_blocks() {
+        if let Some(dev) = drivers::get_block(&name) {
+            // Whole devices only: partitions themselves are never re-parsed.
+            let is_partition = match name.rfind('p') {
+                Some(pos) => {
+                    !name[pos + 1..].is_empty()
+                        && name[pos + 1..].chars().all(|c| c.is_ascii_digit())
+                }
+                None => false,
+            };
+            if !is_partition {
+                drivers::partition::register_partitions(&dev);
+            }
+        }
+    }
+
     // Storage priority: a disk image loaded from the boot medium wins (it is
     // the system the operator deliberately carried with them), then virtio-blk
     // (QEMU/dev images), then NVMe for real machines with an NVMe SSD.
-    let mut blk = match drivers::get_block("ram0") {
+    // A partition with a valid ext2 filesystem wins over everything: it is the
+    // case the operator set up on purpose (a 1 GiB partition on their own disk),
+    // and mounting it is what makes the logs and the filesystem persist.
+    let mut blk = match drivers::partition::find_ext2_partition() {
         Some(b) => {
-            info!("fs: using the RAM disk from the boot medium");
+            info!("fs: using partition {} (existing ext2)", b.name());
             Some(b)
         }
-        None => match drivers::get_block("virtio-blk0") {
-            Some(b) => Some(b),
-            None => {
-                let devices = crate::drivers::pci::enumerate();
-                match crate::drivers::nvme::attach(&devices) {
-                    Ok(true) => {
-                        crate::drivers::nvme::register_block_device();
-                        info!("fs: using NVMe block device");
-                    }
-                    _ => {}
-                }
-                drivers::get_block("nvme0")
+        None => match drivers::get_block("ram0") {
+            Some(b) => {
+                info!("fs: using the RAM disk from the boot medium");
+                Some(b)
             }
+            None => match drivers::get_block("virtio-blk0") {
+                Some(b) => Some(b),
+                None => {
+                    let devices = crate::drivers::pci::enumerate();
+                    match crate::drivers::nvme::attach(&devices) {
+                        Ok(true) => {
+                            crate::drivers::nvme::register_block_device();
+                            info!("fs: using NVMe block device");
+                        }
+                        _ => {}
+                    }
+                    drivers::get_block("nvme0")
+                }
+            },
         },
     };
     let blk = match blk.take() {
@@ -630,6 +674,11 @@ fn kernel_main() -> ! {
     // no-op, and gating it would need a second source of truth about the
     // hardware that the controller itself already provides.
     task::scheduler::kernel_thread_spawn_named(crate::drivers::xhci::usb_thread, "usb");
+
+    // Log mirror: drains the in-memory ring into /mnt/pagh-log.txt. A kernel
+    // thread rather than an inline write, because the logger also runs in
+    // interrupt and panic contexts, where touching the filesystem would deadlock.
+    task::scheduler::kernel_thread_spawn_named(crate::logfile::flush_thread, "logd");
     debug!("Net thread spawned");
 
     // Spawn the embedded ring-3 test user process (Requirements 13.1 / 13.4).

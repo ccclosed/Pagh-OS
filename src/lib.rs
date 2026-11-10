@@ -20,6 +20,7 @@ mod debug;
 mod drivers;
 mod fs;
 mod log;
+mod logfile;
 mod memory;
 mod net;
 mod pkg;

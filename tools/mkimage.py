@@ -96,6 +96,41 @@ def fail(msg: str) -> "NoReturn":  # type: ignore[name-defined]
     raise SystemExit(1)
 
 
+def build_disk_image(dest: pathlib.Path, size_mb: int, userland: pathlib.Path | None) -> None:
+    """Create a disk image: GPT with ONE ext2+WAL partition of `size_mb` MiB.
+
+    WHY A PARTITION AND NOT THE WHOLE DEVICE. The kernel used to take the entire
+    namespace, which is fine for a QEMU image that is nothing but a filesystem and
+    wrong on a real machine: the disk there already has a partition table, and a
+    kernel that only understands whole disks cannot share it. With a partition
+    table, pagh owns one 1 GiB partition and leaves everything else on the disk
+    alone — and `drivers::partition` exists to read exactly this layout.
+
+    The filesystem inside is ext2 + the kernel's WAL (formatted by the kernel on
+    first mount), carrying `userland` when given.
+    """
+    import subprocess
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "wb") as fh:
+        fh.truncate(size_mb * 1024 * 1024)
+    run(["parted", "-s", str(dest), "mklabel", "gpt"], "parted mklabel")
+    # The partition starts at 1 MiB: the conventional alignment, and it keeps the
+    # GPT primary array (LBA 1..33) clear of the filesystem.
+    run(["parted", "-s", str(dest), "mkpart", "pagh", "ext2", "1MiB", "100%"],
+        "parted mkpart")
+    if userland is not None and userland.is_dir():
+        # Fill the partition with a real ext2 tree when we have one to copy.
+        run(["mkfs.ext2", "-q", "-F", "-b", "4096", "-I", "128", "-L", "PAGH",
+             "-d", str(userland), "-E", "offset=1048576", str(dest)],
+            "mkfs.ext2 (offset)")
+        log(f"disk image: {dest} ({size_mb} MiB, GPT, one ext2 partition, "
+            f"populated from {userland})")
+    else:
+        log(f"disk image: {dest} ({size_mb} MiB, GPT, one empty partition — "
+            f"the kernel formats it on first mount)")
+
+
 def resolve_inputs(elf: str | None, disk: str | None) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
     """Locate the kernel, the disk image and the Limine UEFI loader."""
     import limine  # tools/limine.py — the repo's version-agnostic locator
@@ -270,12 +305,23 @@ def main() -> int:
     ap.add_argument("--usb", metavar="PATH", help="write a GPT+ESP USB image here")
     ap.add_argument("--iso", metavar="PATH", help="write an El Torito UEFI ISO here")
     ap.add_argument("--disk", metavar="PATH", help="disk image to embed (default disk.img)")
+    ap.add_argument("--make-disk", metavar="PATH",
+                    help="create a GPT disk image with one ext2 partition here and exit")
+    ap.add_argument("--disk-size-mb", type=int, default=1024,
+                    help="size of --make-disk (default 1024 = 1 GiB)")
+    ap.add_argument("--userland", metavar="DIR",
+                    help="populate --make-disk from this directory")
     ap.add_argument("--elf", metavar="PATH", help="kernel ELF (default iso_root/pagh.elf)")
     ap.add_argument("--size-mb", type=int, default=0,
                     help="minimum USB image size (default: sized to the payload)")
     args = ap.parse_args()
+    if args.make_disk:
+        build_disk_image(pathlib.Path(args.make_disk), args.disk_size_mb,
+                         pathlib.Path(args.userland) if args.userland else None)
+        if not args.usb and not args.iso:
+            return 0
     if not args.usb and not args.iso:
-        ap.error("nothing to do: pass --usb PATH and/or --iso PATH")
+        ap.error("nothing to do: pass --usb, --iso and/or --make-disk")
 
     kernel, diskimg, loader = resolve_inputs(args.elf, args.disk)
     log(f"kernel {kernel} ({kernel.stat().st_size // 1024} KiB)")

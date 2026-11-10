@@ -113,6 +113,19 @@ pub fn _log(level: Level, args: fmt::Arguments) {
 
     let tag = level.tag();
 
+    // File mirror: the ring is filled from the SAME formatted text as the
+    // consoles (see `logfile`), so the file a human reads after the fact matches
+    // what the screen showed. `push` is allocation-free and takes the ring with
+    // `try_lock`, so this is safe from interrupt and panic contexts too.
+    if crate::logfile::enabled() {
+        let mut line = crate::logfile::FixedLine::new();
+        // The consoles append the newline themselves; the file gets lines pushed
+        // raw, so the terminator has to be part of what is buffered — without it
+        // a whole boot ends up as one unreadable concatenated line.
+        let _ = core::fmt::Write::write_fmt(&mut line, format_args!("{}{}\n", tag, args));
+        crate::logfile::push(line.as_bytes());
+    }
+
     // Serial is the primary log sink and is always present.
     write_to(crate::drivers::serial::console(), tag, args);
 

@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.17.2** (the batch open with the
+  be reflected here. **`main` currently reads 2.18.0** (the batch open with the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
   **2.17.0** = the batch that made pagh run on real hardware, plus three
@@ -287,6 +287,19 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   huge page at that address. `ensure_next` now takes the entry's level, splits a
   huge entry into a real table (2 MiB → 512 × 4 KiB, 1 GiB → 512 × 2 MiB, flags
   preserved), and `map_mmio` refuses implausible physical bases.
+  **2.18.0** = the first fixes driven by a real machine reaching the shell:
+  * the LAPIC timer is **measured** against the PIT at boot instead of assuming
+    QEMU's 1 GHz bus clock. On real hardware the assumed constant made every tick
+    ~60x too long — the shell's clock advanced one second per minute and every
+    timeout was stretched the same way;
+  * `drivers::partition` reads GPT (and MBR) and publishes each partition as its
+    own block device, so pagh can own one partition instead of claiming the whole
+    disk; the boot path prefers a partition that already holds an ext2 filesystem;
+  * `logfile` mirrors every kernel log line into `/mnt/pagh-log.txt` — buffered in
+    a fixed ring from the first boot message (the logger runs in interrupt and
+    panic contexts, where touching a filesystem would deadlock) and drained by a
+    `logd` thread once `/mnt` is mounted, so a machine with no serial port leaves a
+    readable log on its disk.
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
   `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real

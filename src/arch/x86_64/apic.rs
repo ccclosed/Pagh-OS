@@ -11,6 +11,7 @@ const LAPIC_EOI: u32 = 0x0B0;
 const LAPIC_SPURIOUS: u32 = 0x0F0;
 const LAPIC_LVT_TIMER: u32 = 0x320;
 const LAPIC_TIMER_INIT: u32 = 0x380;
+const LAPIC_TIMER_CUR: u32 = 0x390;
 const LAPIC_TIMER_DIV: u32 = 0x3E0;
 
 const SPURIOUS_ENABLE: u32 = 0x100;
@@ -138,7 +139,45 @@ fn init_lapic() {
         );
 
         lapic_write(LAPIC_TIMER_DIV, 3); // Divide by 16
-        let init_count = APIC_TIMER_BASE_HZ / (APIC_TIMER_DIVIDER * TICK_HZ);
+
+        // MEASURE the timer instead of trusting a constant.
+        //
+        // The LAPIC timer counts at the platform's bus clock divided by the
+        // configured divider — 1 GHz / 16 under QEMU, tens of MHz on real
+        // hardware. Programming it from the QEMU constant made every tick worth
+        // ~1/60th of a millisecond on a real machine: the shell's clock advanced
+        // one second per minute and every timeout was 60x too long. The PIT is
+        // the only clock here that does not depend on the CPU, so it is the
+        // reference: count LAPIC ticks across a known PIT interval.
+        //
+        // The measurement is taken WITH the divider programmed, so it is the
+        // rate the counter itself runs at. Dividing by the divider again (the
+        // first version of this code) made each tick 16x too long.
+        let measured = unsafe { calibrate_timer_hz() };
+        let effective_hz = measured.unwrap_or(APIC_TIMER_BASE_HZ / APIC_TIMER_DIVIDER);
+        let init_count = (effective_hz / TICK_HZ).clamp(1, u32::MAX as u64);
+        match measured {
+            Some(hz) => crate::drivers::earlyfb::println(format_args!(
+                "lapic: {} Hz effective (PIT), {} counts/tick",
+                hz, init_count
+            )),
+            None => crate::warn!(
+                "LAPIC: PIT calibration failed; assuming {} Hz effective",
+                effective_hz
+            ),
+        }
+        crate::info!(
+            "LAPIC timer: {} Hz effective, divisor {}, {} counts per {} Hz tick{}",
+            effective_hz,
+            APIC_TIMER_DIVIDER,
+            init_count,
+            TICK_HZ,
+            if measured.is_some() {
+                " (measured)"
+            } else {
+                " (assumed)"
+            }
+        );
         lapic_write(LAPIC_TIMER_INIT, init_count as u32);
 
         let timer_cfg = 32 | (1 << 17); // Vector 32, periodic mode
@@ -155,6 +194,84 @@ fn init_lapic() {
         lapic_write(LAPIC_EOI, 0);
     }
     crate::debug!("LAPIC fully configured (vector 32, {} Hz)", TICK_HZ);
+}
+
+/// Measure the LAPIC timer's counting frequency in Hz using the PIT as the
+/// reference clock.
+///
+/// HOW. PIT channel 2 is put in mode 0 (interrupt on terminal count) with a count
+/// that expires after ~10 ms; the LAPIC timer is then started from its maximum
+/// count, and the two are compared when the PIT output goes high. The LAPIC value
+/// that elapsed in that window is the number of LAPIC ticks per 10 ms, i.e. the
+/// frequency with the configured divider.
+///
+/// WHY THE PIT. It runs at a fixed 1.193182 MHz from its own crystal and does not
+/// depend on the CPU, the bus clock or any ACPI table, which is exactly what is
+/// needed to measure a clock whose rate is the unknown. Reading the TSC instead
+/// would just measure one unknown against another.
+///
+/// Returns `None` if the PIT never reports completion (no PIT, or a firmware that
+/// traps port 0x42/0x43) — the caller then keeps its default constant.
+unsafe fn calibrate_timer_hz() -> Option<u64> {
+    use x86_64::instructions::port::Port;
+
+    const PIT_CHANNEL2: u16 = 0x42;
+    const PIT_COMMAND: u16 = 0x43;
+    const PIT_FREQ: u64 = 1_193_182;
+    /// ~10 ms.
+    const PIT_COUNT: u16 = 11_932;
+
+    let mut cmd: Port<u8> = Port::new(PIT_COMMAND);
+    let mut ch2: Port<u8> = Port::new(PIT_CHANNEL2);
+    let mut gate: Port<u8> = Port::new(0x61);
+
+    // SAFETY: ports 0x42/0x43/0x61 are the standard PIT/speaker ports; the writes
+    // program channel 2 as a one-shot counter with the speaker left off.
+    unsafe {
+        // Speaker off, channel-2 gate on (bit 0), so counting is enabled.
+        let p61 = gate.read();
+        gate.write((p61 & !0x02) | 0x01);
+        // Channel 2, lobyte/hibyte, mode 0 (terminal count), binary.
+        cmd.write(0b1011_0000);
+        ch2.write((PIT_COUNT & 0xFF) as u8);
+        ch2.write((PIT_COUNT >> 8) as u8);
+
+        // Start the LAPIC timer from its maximum so the elapsed value is the
+        // count that fits in the window.
+        lapic_write(LAPIC_TIMER_DIV, 3); // divide by 16, same as the real config
+        lapic_write(LAPIC_TIMER_INIT, 0xFFFF_FFFF);
+
+        // Wait for the PIT output to go high: bit 5 of port 0x61 is the channel-2
+        // output state, set when the count reaches zero.
+        let mut spins: u32 = 0;
+        while gate.read() & 0x20 == 0 {
+            spins += 1;
+            if spins > 50_000_000 {
+                // Restore the gate and give up rather than hanging the boot.
+                gate.write(p61);
+                return None;
+            }
+            core::hint::spin_loop();
+        }
+
+        let elapsed = 0xFFFF_FFFFu32.wrapping_sub(lapic_read(LAPIC_TIMER_CUR));
+        gate.write(p61);
+        // Stop the timer until the real configuration is programmed.
+        lapic_write(LAPIC_TIMER_INIT, 0);
+
+        if elapsed == 0 || elapsed == 0xFFFF_FFFF {
+            return None;
+        }
+        // elapsed counts per (PIT_COUNT / PIT_FREQ) seconds.
+        let hz = (elapsed as u64 * PIT_FREQ) / PIT_COUNT as u64;
+        // A plausible LAPIC frequency is between 1 MHz and 4 GHz; anything else
+        // means the measurement is bogus and the caller should keep its default.
+        if (1_000_000..=4_000_000_000).contains(&hz) {
+            Some(hz)
+        } else {
+            None
+        }
+    }
 }
 
 /// Scheduler timer tick rate (the LAPIC periodic timer). Every conversion
