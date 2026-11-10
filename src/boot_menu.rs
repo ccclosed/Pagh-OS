@@ -436,6 +436,28 @@ fn draw(rows: &[Row], selected: usize, typed: Option<&str>, message: Option<&str
     // the question "why is nothing happening" by itself.
     crate::fb_println!();
     crate::fb_println!("  {}", crate::drivers::input_summary());
+    {
+        let summary = crate::drivers::xhci::summary();
+        if summary.probe_mask != 0 {
+            let lost = summary.probe_mask & !summary.ccs_mask;
+            let mut lost_text = alloc::string::String::new();
+            for port in 1..=summary.ports {
+                if lost & (1 << (port as u32 - 1)) == 0 {
+                    continue;
+                }
+                if !lost_text.is_empty() {
+                    lost_text.push(',');
+                }
+                lost_text.push_str(&alloc::format!("{}", port));
+            }
+            crate::fb_println!(
+                "  xhci ports: attached before reset={:#010x} now={:#010x} lost=[{}]",
+                summary.probe_mask,
+                summary.ccs_mask,
+                lost_text
+            );
+        }
+    }
     // Controller scan and raw register state: the two things that decide whether
     // "the port does not reset" is our bug or the platform's.
     for (index, info) in crate::drivers::xhci::scan().into_iter().enumerate() {
@@ -459,6 +481,13 @@ fn draw(rows: &[Row], selected: usize, typed: Option<&str>, message: Option<&str
         );
     }
     if let Some(d) = crate::drivers::xhci::raw_dump() {
+        crate::fb_println!(
+            "  xhci caps: hciver={:#06x} hcsparams1={:#010x} hccparams1={:#010x} legacy={}",
+            d.hciversion,
+            d.hcsparams1,
+            d.hccparams1,
+            d.legacy
+        );
         crate::fb_println!(
             "  xhci op: caplen={:#x} usbcmd={:#010x} usbsts={:#010x} config={:#x} writes={}",
             d.caplength,

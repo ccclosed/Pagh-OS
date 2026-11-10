@@ -411,9 +411,18 @@ struct Controller {
     diag: Vec<PortDiag>,
     /// The last thing that went wrong anywhere, for the one-line status.
     last_fail: Option<(u8, &'static str, u32)>,
+    /// Attached-port mask as the scan saw it BEFORE the controller reset. Ports
+    /// present then and absent now are the ones the reset cost us.
+    probe_mask: u32,
     /// CAPLENGTH as read at init (the dump shows whether the operational base is
     /// where the driver thinks it is).
     caplength: u32,
+    hciversion: u32,
+    hcsparams1: u32,
+    hccparams1: u32,
+    /// What the BIOS/USB-legacy handoff found: `handoff`, `bios-owned`,
+    /// `absent`, or `bad-xecp`.
+    legacy: &'static str,
     /// A harmless register was written and read back at init: this separates "our
     /// writes are ignored" from "the controller ignores this particular write".
     writes_ok: bool,
@@ -451,10 +460,14 @@ pub fn scan() -> Vec<ControllerInfo> {
 /// explanation channel on a machine without serial.
 pub struct RawDump {
     pub caplength: u32,
+    pub hciversion: u32,
+    pub hcsparams1: u32,
+    pub hccparams1: u32,
     pub usbcmd: u32,
     pub usbsts: u32,
     pub config: u32,
     pub writes_ok: bool,
+    pub legacy: &'static str,
     pub port: u8,
     pub port_regs: [u32; 4],
 }
@@ -465,10 +478,14 @@ pub fn raw_dump() -> Option<RawDump> {
     let port = (1..=c.ports).find(|p| rd32(c.op, portsc(*p)) & PORTSC_CCS != 0)?;
     Some(RawDump {
         caplength: c.caplength,
+        hciversion: c.hciversion,
+        hcsparams1: c.hcsparams1,
+        hccparams1: c.hccparams1,
         usbcmd: rd32(c.op, OP_USBCMD),
         usbsts: rd32(c.op, OP_USBSTS),
         config: rd32(c.op, OP_CONFIG),
         writes_ok: c.writes_ok,
+        legacy: c.legacy,
         port,
         port_regs: [
             rd32(c.op, portsc(port)),
@@ -493,6 +510,9 @@ pub struct Summary {
     pub devices: u64,
     /// HID reports handed to the input translator.
     pub reports: u64,
+    /// Attached-port mask before the controller reset (what firmware left) versus
+    /// `ccs_mask` (what the driver sees now).
+    pub probe_mask: u32,
     /// Last enumeration failure: port, stage, code. `None` when everything that
     /// was attempted worked.
     pub last_fail: Option<(u8, &'static str, u32)>,
@@ -523,6 +543,7 @@ pub fn summary() -> Summary {
                 ccs_mask: mask,
                 devices: c.devices,
                 reports: c.reports,
+                probe_mask: c.probe_mask,
                 last_fail: c.last_fail,
             }
         }
@@ -532,6 +553,7 @@ pub fn summary() -> Summary {
             ccs_mask: 0,
             devices: 0,
             reports: 0,
+            probe_mask: 0,
             last_fail: None,
         },
     }
@@ -776,19 +798,21 @@ fn probe_controller(dev: &PciDevice) -> Option<(u8, u32)> {
 /// all. The standard handoff is: ask for ownership (OS-owned bit), wait for the
 /// BIOS-owned bit to clear, and if the firmware never answers, clear it yourself
 /// after a bounded wait so boot continues.
-fn bios_handoff(base: usize, hccparams1: u32) {
+fn bios_handoff(base: usize, hccparams1: u32) -> &'static str {
     const CAP_ID_USB_LEGACY: u32 = 1;
     const LEGSUP_BIOS_OWNED: u32 = 1 << 16;
     const LEGSUP_OS_OWNED: u32 = 1 << 24;
     let xecp = ((hccparams1 >> 16) & 0xFFFF) as usize;
-    if xecp == 0 {
-        return;
-    }
-    let mut off = xecp * 4;
-    for _ in 0..64 {
-        if off + 4 > 0x1000 {
-            return;
-        }
+    // The spec says extended capabilities start at xECP*4; firmware that reports
+    // xECP=0 may still expose them where QEMU puts them (0x20), so that area is
+    // scanned as a fallback. Getting this wrong means skipping the handoff, and a
+    // BIOS-owned controller can keep the USB ports under SMM control — one of the
+    // ways a port can enable and then be yanked back to Polling.
+    let start = if xecp != 0 { xecp * 4 } else { 0x20 };
+    let mut off = start;
+    let mut guard = 0;
+    while off + 4 <= 0x1000 && guard < 64 {
+        guard += 1;
         let cap = rd32(base, off);
         let id = cap & 0xFF;
         if id == CAP_ID_USB_LEGACY {
@@ -800,28 +824,27 @@ fn bios_handoff(base: usize, hccparams1: u32) {
                     value = rd32(base, off);
                     if value & LEGSUP_BIOS_OWNED == 0 {
                         crate::info!("xhci: BIOS handed the controller over");
-                        return;
+                        return "handoff";
                     }
                     spins += 1;
                     if spins > 2_000_000 {
-                        // Firmware never answered; take it anyway rather than
-                        // leaving the controller unusable for the whole boot.
                         wr32(base, off, (value & !LEGSUP_BIOS_OWNED) | LEGSUP_OS_OWNED);
                         crate::warn!("xhci: firmware did not release the controller; forced");
-                        return;
+                        return "forced";
                     }
                     core::hint::spin_loop();
                 }
             }
             wr32(base, off, value | LEGSUP_OS_OWNED);
-            return;
+            return "os-owned";
         }
         let next = ((cap >> 8) & 0xFF) as usize;
-        if next == 0 {
-            return;
+        if next == 0 || next >= 0x100 {
+            break;
         }
         off += next * 4;
     }
+    "absent"
 }
 
 /// Bring one controller all the way up: reset, rings, DCBAA, running.
@@ -829,13 +852,17 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
     let Some((base, bar)) = map_bar0(dev) else {
         return false;
     };
+    // Attached ports before the reset, counted here so the diagnostic can show
+    // exactly which connections the reset lost (firmware had them, we do not).
+    let mut ccs_mask_probe = 0u32;
 
     let caplength = (rd32(base, CAP_CAPLENGTH) & 0xFF) as usize;
     let op = base + caplength;
     let hcsparams1 = rd32(base, CAP_HCSPARAMS1);
     let hcsparams2 = rd32(base, CAP_HCSPARAMS2);
     let hccparams1 = rd32(base, CAP_HCCPARAMS1);
-    bios_handoff(base, hccparams1);
+    let hciversion = rd32(base, CAP_CAPLENGTH) >> 16;
+    let legacy = bios_handoff(base, hccparams1);
     let dboff = (rd32(base, CAP_DBOFF) & !0x3) as usize;
     let rtsoff = (rd32(base, CAP_RTSOFF) & !0x1F) as usize;
     let max_slots = (hcsparams1 & 0xFF) as usize;
@@ -862,6 +889,9 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
     // told us whether a reset (rather than our port handling) was losing them.
     for port in 1..=ports {
         let sc = rd32(op, portsc(port));
+        if sc & PORTSC_CCS != 0 {
+            ccs_mask_probe |= 1 << (port as u32 - 1);
+        }
         if sc != 0 {
             crate::debug!("xhci: pre-reset port {} PORTSC={:#010x}", port, sc);
         }
@@ -969,8 +999,8 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
     // keyboard needs) and poking a USB3 link that expects a different device.
     let mut protos: Vec<u8> = vec![0u8; ports as usize];
     let xecp = ((hccparams1 >> 16) & 0xFFFF) as usize;
-    if xecp != 0 {
-        let mut off = xecp * 4;
+    {
+        let mut off = if xecp != 0 { xecp * 4 } else { 0x20 };
         let mut guard = 0;
         while off + 16 <= 0x1000 && guard < 64 {
             guard += 1;
@@ -978,12 +1008,20 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
             let id = dw0 & 0xFF;
             let next = ((dw0 >> 8) & 0xFF) as usize;
             if id == 2 {
-                // Supported Protocol: major revision in DW0 bits 31:24, port
-                // offset/count in DW2.
+                // Supported Protocol: major revision in DW0 bits 31:24; DW2
+                // carries the compatible port offset (bits 15:8, 0-based) and
+                // count (bits 31:16). QEMU packs them differently (start port in
+                // bits 7:0, count in 15:8), so a spec-zero count is retried the
+                // emulator way — harmless on hardware, where the spec layout is
+                // what controllers implement.
                 let major = ((dw0 >> 24) & 0xFF) as u8;
                 let dw2 = rd32(base, off + 8);
-                let first = ((dw2 >> 8) & 0xFF) as usize + 1;
-                let count = ((dw2 >> 16) & 0xFF) as usize;
+                let spec_count = ((dw2 >> 16) & 0xFF) as usize;
+                let (first, count) = if spec_count != 0 {
+                    (((dw2 >> 8) & 0xFF) as usize + 1, spec_count)
+                } else {
+                    (((dw2 & 0xFF) as usize).max(1), ((dw2 >> 8) & 0xFF) as usize)
+                };
                 let proto = match major {
                     2 => 2u8,
                     3 => 3u8,
@@ -995,10 +1033,12 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
                     }
                 }
                 crate::info!(
-                    "xhci: protocol {} ports {}-{}",
+                    "xhci: protocol {} dw0={:#010x} dw2={:#010x} ports {}-{}",
                     proto,
+                    dw0,
+                    dw2,
                     first,
-                    first + count - 1
+                    first.saturating_add(count).saturating_sub(1)
                 );
             }
             if next == 0 || next >= 0x100 {
@@ -1008,6 +1048,21 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
         }
     }
 
+    let diag: Vec<PortDiag> = (0..ports as usize)
+        .map(|index| PortDiag {
+            stage: "",
+            code: 0,
+            speed: 0,
+            attempts: 0,
+            retry_in: 0,
+            pre: 0,
+            post: 0,
+            seen_prc: false,
+            seen_ped: false,
+            ped_sc: 0,
+            proto: protos.get(index).copied().unwrap_or(0),
+        })
+        .collect();
     *CONTROLLER.lock() = Some(Controller {
         op,
         db: base + dboff,
@@ -1024,24 +1079,14 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
         devices: 0,
         brought_up: Vec::new(),
         logged_ports: false,
+        probe_mask: ccs_mask_probe,
         caplength: caplength as u32,
+        hciversion,
+        hcsparams1,
+        hccparams1,
+        legacy,
         writes_ok,
-        diag: vec![
-            PortDiag {
-                stage: "",
-                code: 0,
-                speed: 0,
-                attempts: 0,
-                retry_in: 0,
-                pre: 0,
-                post: 0,
-                seen_prc: false,
-                seen_ped: false,
-                ped_sc: 0,
-                proto: protos.get(0).copied().unwrap_or(0),
-            };
-            ports as usize
-        ],
+        diag,
         last_fail: None,
     });
     // The scratchpad pages must outlive every command the controller runs.
@@ -1891,6 +1936,27 @@ pub fn poll() {
                 }
                 continue;
             }
+            let sc = rd32(ctrl.op, portsc(port));
+            let no_device_yet = sc & PORTSC_CCS == 0;
+            // A port with nothing on it is retried forever, slowly: a USB2 port can
+            // lose connect status across a controller reset and recover it later
+            // (the field machine lost port 26 exactly that way). Every 8th retry
+            // power-cycles the port, which makes the controller run the attach
+            // sequence again.
+            if no_device_yet {
+                if attempts % 8 == 3 {
+                    let sc = rd32(ctrl.op, portsc(port));
+                    wr32(ctrl.op, portsc(port), sc & !PORTSC_PP);
+                    spin_settle(300_000);
+                    let sc = rd32(ctrl.op, portsc(port));
+                    wr32(ctrl.op, portsc(port), (sc & !PORTSC_RW1C) | PORTSC_PP);
+                }
+                if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+                    d.attempts = d.attempts.saturating_add(1);
+                    d.retry_in = 100;
+                }
+                continue;
+            }
             if attempts >= 12 {
                 ctrl.brought_up.push(port);
                 continue;
@@ -1906,11 +1972,8 @@ pub fn poll() {
                     // Give the next attempt breathing room before resetting again.
                     d.retry_in = (20 + d.attempts.saturating_mul(8)).min(120);
                 }
-            } else {
-                // No device yet: try again soon (one PORTSC read per attempt).
-                if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
-                    d.retry_in = 8;
-                }
+            } else if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+                d.retry_in = 20;
             }
             continue;
         }

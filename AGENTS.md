@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.18.7** (the batch open with the
+  be reflected here. **`main` currently reads 2.18.8** (the batch open with the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
   **2.17.0** = the batch that made pagh run on real hardware, plus three
@@ -394,6 +394,21 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   settling delays, a settle delay is inserted after the controller reset, and the
   diagnostics gained the port's USB protocol generation (parsed from the Supported
   Protocol capabilities) and the PORTSC snapshot at the first PED sighting.
+  **2.18.8** = the brief enable, and the ports the reset costs. The 2.18.7 photo
+  shows what the reset does: `ped_sc=0x00200e03` is a *healthy* high-speed enable
+  (PED=1, U0, speed=3), and `post=0x6e1` is the same port back in Polling — the
+  controller enables the device and then loses it on every attempt. Two more
+  things became visible that the driver was blind to: the Supported Protocol
+  capabilities were never read (every port said `proto=usb0`, so the driver could
+  not tell a USB2 port — where a keyboard lives — from a USB3 one), and the
+  pre-reset scan had a device on port 26 that vanished after `HCRST` and was then
+  abandoned by the retry limit. Extended-capability walking now falls back to the
+  0x20 area when HCCPARAMS1 reports xECP=0 (which is also where the BIOS/USB-legacy
+  handoff starts looking, so a missed handoff cannot hide there); the raw dump
+  prints HCIVERSION/HCSPARAMS1/HCCPARAMS1 and the handoff result; the diagnostic
+  shows `attached before reset` versus `now` with the lost port list; ports with no
+  device are retried forever at a slow rate and power-cycled every eighth retry
+  instead of being dropped after twelve.
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
   `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real

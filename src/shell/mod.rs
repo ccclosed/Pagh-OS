@@ -329,6 +329,24 @@ pub fn shell_main() -> ! {
     crate::fb_println!("========================================");
     crate::fb_println!("Type 'help' for available commands");
     crate::fb_println!("input: {}", crate::drivers::input_summary());
+    {
+        let summary = crate::drivers::xhci::summary();
+        if summary.probe_mask != 0 {
+            let lost = summary.probe_mask & !summary.ccs_mask;
+            crate::kprintln!(
+                "xhci ports: before reset={:#010x} now={:#010x} lost={:#010x}",
+                summary.probe_mask,
+                summary.ccs_mask,
+                lost
+            );
+            crate::fb_println!(
+                "  xhci ports: before reset={:#010x} now={:#010x} lost={:#010x}",
+                summary.probe_mask,
+                summary.ccs_mask,
+                lost
+            );
+        }
+    }
     // Controller scan and raw register state: the two things that decide whether
     // "the port does not reset" is our bug or the platform's.
     for (index, info) in crate::drivers::xhci::scan().into_iter().enumerate() {
