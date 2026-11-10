@@ -67,54 +67,49 @@
 ## mkimage.py — загрузочный носитель для реального ПК
 
 ```sh
-python3 tools/build.py stage --release          # iso_root/pagh.elf
-python3 tools/mkimage.py --usb dist/pagh-usb.img [--disk disk.img]
+python3 tools/build.py stage --release                 # iso_root/pagh.elf
+python3 tools/mkimage.py --usb dist/pagh-usb.img       # GPT + ESP, для dd
+python3 tools/mkimage.py --iso dist/pagh.iso           # ISO для Ventoy / CD
 ```
 
-Образ UEFI-only: GPT + один FAT32 ESP (`EFI/BOOT/BOOTX64.EFI` от Limine,
-`limine.conf`, `pagh.elf`) и **сам `disk.img` рядом с ядром**. Диск-образ едет на
-носителе не для красоты: ядро монтирует только virtio-blk и NVMe, поэтому ПК без
-NVMe (например, только SATA) поднимался вообще без `/mnt` — шелл и ни одной
-программы. Limine отдаёт `disk.img` ядру как модуль, `drivers::memdisk` показывает
-его блочным устройством `ram0`, и `/mnt` монтируется из памяти.
+Оба образа UEFI-only и оба несут `disk.img`: ядро монтирует только virtio-blk и
+NVMe, поэтому ПК без такого диска поднимался вообще без `/mnt` — шелл и ни одной
+программы. Limine отдаёт образ ядру как модуль, `drivers::memdisk` показывает его
+блочным устройством `ram0`, `/mnt` монтируется из памяти.
 
-**Записать на флешку:**
+**USB-образ** (GPT + один FAT32 ESP): `sudo dd if=dist/pagh-usb.img of=/dev/sdX
+bs=4M status=progress conv=fsync`.
+
+**ISO**: GTP-таблица + один El Torito EFI-образ (`efi.img`, маленький FAT с
+`EFI/BOOT/BOOTX64.EFI` и `limine.conf`), а ядро и `disk.img` лежат на самом
+ISO9660-томе и адресуются из конфига как `fslabel(PAGH_OS):/pagh.elf` —
+`fslabel` у Limine сопоставляется в том числе с идентификатором тома ISO 9660.
+В загрузочный образ ядро положить нельзя: запись El Torito описывает максимум
+32 МиБ, а ядро занимает 21 МиБ.
+
+**Для ISO нужен `xorriso`** — `-eltorito-alt-boot -e efi.img -no-emul-boot`.
+Ручной ISO9660+El Torito не годится: том-то получается валидный (сторонний
+читатель перечисляет дерево и достаёт файлы), но диск не грузится. Проверено
+пошагово: прошивка запускает `EFI/BOOT/BOOTX64.EFI`, однако Limine пишет
+`[config file not found]` — El Torito-образ доезжает до загрузчика не как
+читаемый FAT. xorriso делает эту раскладку правильно. Если `xorriso` в системе
+нет, его можно распаковать локально без root:
 
 ```sh
-# вариант 1 — ровно этот образ как единственное содержимое флешки
-sudo dd if=dist/pagh-usb.img of=/dev/sdX bs=4M status=progress conv=fsync
-
-# вариант 2 — Ventoy: образ кладётся файлом, Ventoy грузит его через memdisk
-cp dist/pagh-usb.img /run/media/$USER/Ventoy/PAGH-OS.img
+dnf download --destdir /tmp/rpms xorriso libisoburn libisofs libburn
+mkdir -p /tmp/xroot && cd /tmp/xroot
+for r in /tmp/rpms/*.rpm; do rpm2cpio "$r" | cpio -idm; done
+# mkimage.py сам найдёт /tmp/xroot/usr/bin/xorriso и его библиотеки
 ```
 
-Ventoy из коробки ищет `iso/wim/img/vhd(x)` в любых каталогах своей первой
-флешки (док: «You can place the iso/wim/img/vhd(x) files any where»).
+Записать на Ventoy — просто скопировать файл: Ventoy ищет `iso/wim/img/vhd(x)` в
+любых каталогах своей первой флешки, а `.img` грузит через memdisk.
 
-Честно про ограничения: **запись идёт в ОЗУ и не переживает перезагрузку**, образ
-на носителе не меняется. Журнал на таком томе даёт только атомарность внутри
-сессии (`src/fs/README.md`, «Журнал на RAM-диске»). Нужно сохранение — настоящий
-носитель: NVMe с разделом ext2+WAL (в шелле `disk setup` отформатирует и
-смонтирует его).
-
-### ISO (`--iso`) — структура есть, загрузка пока нет
-
-`tools/iso9660.py` пишет ISO9660 + El Torito EFI без внешних инструментов, и его
-структуру подтверждает независимый читатель (`iso-info` перечисляет каталог и
-файлы, `iso-read` достаёт `pagh.elf`/`disk.img`). **Но диск пока не грузится:** под
-OVMF Limine загружается с El Torito-образа и пишет `[config file not found]` —
-прошивка отдаёт ему загрузочный FAT как раздел с 2048-байтными блоками, а
-собственный FAT-драйвер Limine (`common/fs/fat32.s2.c`) читает по BPB с
-512-байтными секторами и файлов не находит. Проверено и отсечено по шагам, что
-работает: каталог ISO9660 (после исправления трёх ошибок в записях — чётность
-длины, длина с байтом заголовка, фиксированные 34 байта корневой записи в PVD),
-каталог El Torito (валидация, контрольная сумма, ровно одна bootable-запись с
-точным числом секторов), поиск и запуск `EFI/BOOT/BOOTX64.EFI` прошивкой.
-
-Что делать дальше, если ISO нужен: собрать его через `xorriso` (у него El Torito
-и выравнивание сделаны правильно) — команда была в предыдущей редакции этого
-файла; либо сделать загрузочный образ с **собственным** разделом в формате,
-который Limine читает при 2048-байтных блоках.
+Честно про ограничения RAM-варианта: **запись идёт в ОЗУ и не переживает
+перезагрузку**, образ на носителе не меняется. Журнал на таком томе даёт только
+атомарность внутри сессии (`src/fs/README.md`, «Журнал на RAM-диске»). Нужно
+сохранение — настоящий носитель: NVMe с разделом ext2+WAL (в шелле `disk setup`
+отформатирует и смонтирует его).
 
 ## mini_repo.py
 
