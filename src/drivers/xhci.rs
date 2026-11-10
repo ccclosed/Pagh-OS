@@ -31,7 +31,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::drivers::pci::PciDevice;
 use crate::memory::pmm;
@@ -72,6 +72,105 @@ impl DmaFrame {
 
     fn virt(&self) -> usize {
         self.virt
+    }
+}
+
+// ─── Clock ───────────────────────────────────────────────────────────────────
+
+/// TSC ticks per microsecond, measured once at boot. 0 means "no usable clock".
+///
+/// WHY A CLOCK AT ALL. Every wait in this driver used to be "N spins", which is a
+/// different wall-clock duration on every machine. The field machine is a 26-port
+/// PCH where a USB2 port needs tens of milliseconds to finish a reset, while a
+/// spin budget that looked generous under QEMU can expire in the middle of one —
+/// and the driver then reports the port as failed without ever having given the
+/// link the time it asked for. The boot menu polls this driver with interrupts
+/// disabled (so `scheduler::ticks` never advances), but `rdtsc` works in every
+/// context; calibrating it against the PIT at boot turns every USB wait into a
+/// real deadline.
+static TSC_PER_US: AtomicU64 = AtomicU64::new(0);
+
+fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    // SAFETY: `rdtsc` only reads the time-stamp counter. It has no memory side
+    // effects, so the compiler is told so (`nomem`) and nothing is pushed.
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
+    }
+    ((hi as u64) << 32) | lo as u64
+}
+
+/// Measure the TSC against a 10 ms PIT channel-2 one-shot.
+///
+/// Runs from `init_usb`, i.e. before the boot menu starts using PIT channel 2 for
+/// its own countdown, so the two users never overlap.
+fn calibrate_clock() -> bool {
+    use x86_64::instructions::port::Port;
+    const PIT_HZ: u64 = 1_193_182;
+    // 10 ms one-shot on channel 2.
+    let count = (PIT_HZ / 100) as u16 - 1;
+    // SAFETY: port 0x61 gates PIT channel 2 and mirrors its output; 0x43/0x42 are
+    // the PIT command and channel-2 data ports. The gate value is restored on
+    // every return path, and the speaker is never enabled (bit 1 stays clear).
+    unsafe {
+        let mut gate: Port<u8> = Port::new(0x61);
+        let mut cmd: Port<u8> = Port::new(0x43);
+        let mut ch2: Port<u8> = Port::new(0x42);
+        let saved = gate.read();
+        gate.write((saved & !0x02) | 0x01);
+        cmd.write(0b1011_0000);
+        ch2.write((count & 0xFF) as u8);
+        ch2.write((count >> 8) as u8);
+        let start = rdtsc();
+        let mut spins = 0u32;
+        while gate.read() & 0x20 == 0 {
+            spins += 1;
+            if spins > 50_000_000 {
+                gate.write(saved);
+                crate::warn!("xhci: no clock (PIT channel 2 never timed out)");
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        let end = rdtsc();
+        gate.write(saved);
+        // The window is 10 ms, so ticks/second is the delta times 100.
+        let hz = end.wrapping_sub(start).saturating_mul(100);
+        if !(1_000_000..=100_000_000_000).contains(&hz) {
+            crate::warn!("xhci: no clock (implausible TSC rate {})", hz);
+            return false;
+        }
+        TSC_PER_US.store((hz / 1_000_000).max(1), Ordering::Relaxed);
+        crate::info!("xhci: clock: TSC ~{} MHz", hz / 1_000_000);
+    }
+    true
+}
+
+fn clock_ready() -> bool {
+    TSC_PER_US.load(Ordering::Relaxed) != 0
+}
+
+/// Microseconds from an arbitrary epoch; only differences are meaningful.
+fn now_us() -> u64 {
+    let per_us = TSC_PER_US.load(Ordering::Relaxed);
+    if per_us == 0 {
+        return 0;
+    }
+    rdtsc() / per_us
+}
+
+/// Busy-wait for at least `us` microseconds, where the spec mandates a delay
+/// (USB2 reset recovery, port power settle, firmware handoff timeout).
+fn settle_us(us: u64) {
+    if clock_ready() {
+        let deadline = now_us() + us;
+        while now_us() < deadline {
+            core::hint::spin_loop();
+        }
+    } else {
+        // No calibrated clock: fall back to the old spin-count behaviour.
+        spin_settle((us.saturating_mul(3)).min(u32::MAX as u64) as u32);
     }
 }
 
@@ -282,13 +381,25 @@ const _: () = assert!(portsc(5) == 0x440);
 const USBCMD_RS: u32 = 1 << 0;
 const USBCMD_HCRST: u32 = 1 << 1;
 const USBSTS_HCH: u32 = 1 << 0;
-const USBSTS_CNR: u32 = 1 << 11;
+const USBSTS_HSE: u32 = 1 << 1;
+const USBSTS_HCE: u32 = 1 << 11;
+const USBSTS_CNR: u32 = 1 << 12;
+
+/// Port Link State values this driver acts on (xHCI 1.2 table 5-27).
+const PLS_U0: u32 = 0;
+const PLS_U3: u32 = 3;
+const PLS_RXDETECT: u32 = 5;
+const PLS_POLLING: u32 = 7;
 
 const PORTSC_CCS: u32 = 1 << 0;
 const PORTSC_PED: u32 = 1 << 1;
 const PORTSC_PR: u32 = 1 << 4;
 const PORTSC_PLS_MASK: u32 = 0xF << 5;
+const PORTSC_PLS_SHIFT: u32 = 5;
 const PORTSC_PP: u32 = 1 << 9;
+/// Port Link State is writable only in the same write that sets this bit; a
+/// write of the field alone is ignored by the controller.
+const PORTSC_LWS: u32 = 1 << 16;
 const PORTSC_SPEED_MASK: u32 = 0xF << 10;
 const PORTSC_SPEED_SHIFT: u32 = 10;
 const PORTSC_CSC: u32 = 1 << 17;
@@ -389,6 +500,10 @@ struct PortDiag {
     /// plausible: PED with PLS=Polling is a reset in progress, not an enabled
     /// port).
     ped_sc: u32,
+    /// Wall-clock duration of the last attempt in milliseconds. Zero when the
+    /// clock is unavailable. This is what separates "the port needs more time"
+    /// from "the controller refuses" in a photo.
+    ms: u16,
 }
 
 struct Controller {
@@ -402,8 +517,23 @@ struct Controller {
     cmdr: Ring,
     event: Ring,
     erst: DmaFrame,
-    /// Device context array base (DCBAAP) and its scratchpad pages.
+    /// Device Context Base Address Array. The controller writes a device-context
+    /// pointer into this frame on Enable Slot and fetches it again for every later
+    /// command on that slot, so the frame belongs to the controller, not to this
+    /// function's stack: `dcbaa` used to be a local whose page was returned to the
+    /// PMM as soon as `start_controller` returned. Under QEMU the page is rarely
+    /// reused and the driver "works"; on hardware the first allocation to reuse it
+    /// makes the controller fetch a garbage device context — a Host Controller
+    /// Error, which halts the controller mid-boot and freezes every port with it.
+    dcbaa: DmaFrame,
+    /// Device context array base address (DCBAAP), kept for the release path.
     dcbaa_phys: u64,
+    /// Scratchpad buffer array (pointed at by DCBAA[0]) and the pages it points
+    /// to. Both must outlive the controller for the same reason as `dcbaa`.
+    #[allow(dead_code)] // kept alive: DMA state the controller reads
+    scratchpad_array: Option<DmaFrame>,
+    #[allow(dead_code)] // kept alive: DMA state the controller reads
+    scratchpad_pages: Vec<DmaFrame>,
     slots: Vec<Slot>,
     /// Reports delivered to `usb_hid` so far.
     reports: u64,
@@ -424,9 +554,18 @@ struct Controller {
     /// Round-robin cursor: at most ONE port is (re)initialised per poll so that a
     /// slow reset attempt cannot stall the boot menu's countdown.
     next_port: u8,
-    /// USB2 / USB3 port ranges from the Supported Protocol capabilities, as
-    /// `(first, count)`, for the on-screen diagnostic.
-    proto_ranges: [(u8, u8); 2],
+    /// Per-port USB protocol (2 or 3) derived from the Supported Protocol
+    /// capabilities, for the on-screen diagnostic. Mirrored into `PortDiag.proto`
+    /// (which is what the screens print); kept here for the shell `usb` command.
+    #[allow(dead_code)]
+    protos: Vec<u8>,
+    /// Port masks ([usb2, usb3]) as the Supported Protocol capabilities described
+    /// them. Masks, not (first, count): the field machine's controller reports two
+    /// entries whose ranges overlap, and a mask shows that honestly instead of
+    /// hiding it behind a pretty range.
+    proto_masks: [u32; 2],
+    /// Raw extended-capability entries, for the screen dump.
+    xcaps: Vec<XCap>,
     /// CAPLENGTH as read at init (the dump shows whether the operational base is
     /// where the driver thinks it is).
     caplength: u32,
@@ -439,6 +578,27 @@ struct Controller {
     /// A harmless register was written and read back at init: this separates "our
     /// writes are ignored" from "the controller ignores this particular write".
     writes_ok: bool,
+    /// PCI command register at init (bit 1 = memory space, bit 2 = bus mastering).
+    pci_cmd: u32,
+    /// Times the controller was found halted (USBSTS.HCH), and the values that
+    /// proved it. A halted controller ignores every port write, which looks
+    /// exactly like "the ports never enable": this counter is the difference.
+    halts: u32,
+    halt_cmd: u32,
+    halt_sts: u32,
+}
+
+/// One extended-capability entry, as the walk saw it: offset in the BAR, id,
+/// next-capability dword offset, and the two dwords a Supported Protocol entry
+/// keeps its port range in. Printed on screen when the ranges look wrong, which
+/// is exactly what the field machine did.
+#[derive(Clone, Copy)]
+pub struct XCap {
+    pub offset: u32,
+    pub id: u8,
+    pub next: u8,
+    pub dw1: u32,
+    pub dw2: u32,
 }
 
 static CONTROLLER: Spinlock<Option<Controller>> = Spinlock::new(None);
@@ -483,15 +643,31 @@ pub struct RawDump {
     pub legacy: &'static str,
     pub port: u8,
     pub port_regs: [u32; 4],
+    /// PCI command register (bit 2 = bus mastering; without it the controller's
+    /// ring DMA is aborted and it halts).
+    pub pci_cmd: u32,
+    /// Halts seen since boot, and the register values at the first one.
+    pub halts: u32,
+    pub halt_cmd: u32,
+    pub halt_sts: u32,
 }
 
-/// USB2 / USB3 port ranges as `(first, count)`, for the diagnostic.
-pub fn proto_ranges() -> [(u8, u8); 2] {
+/// Per-port protocol masks `[usb2, usb3]` (bit N = port N+1), for the diagnostic.
+pub fn proto_masks() -> [u32; 2] {
     CONTROLLER
         .lock()
         .as_ref()
-        .map(|c| c.proto_ranges)
-        .unwrap_or([(0, 0), (0, 0)])
+        .map(|c| c.proto_masks)
+        .unwrap_or([0, 0])
+}
+
+/// Raw extended-capability walk, for the diagnostic.
+pub fn xcaps() -> Vec<XCap> {
+    CONTROLLER
+        .lock()
+        .as_ref()
+        .map(|c| c.xcaps.clone())
+        .unwrap_or_default()
 }
 
 pub fn raw_dump() -> Option<RawDump> {
@@ -508,6 +684,10 @@ pub fn raw_dump() -> Option<RawDump> {
         config: rd32(c.op, OP_CONFIG),
         writes_ok: c.writes_ok,
         legacy: c.legacy,
+        pci_cmd: c.pci_cmd,
+        halts: c.halts,
+        halt_cmd: c.halt_cmd,
+        halt_sts: c.halt_sts,
         port,
         port_regs: [
             rd32(c.op, portsc(port)),
@@ -586,17 +766,28 @@ pub fn summary() -> Summary {
 /// The flags are the difference between "the controller rejected the reset" and
 /// "the reset ran and the device did not answer": the former never raises PRC,
 /// the latter raises PRC/PED and then loses them.
+/// Wait up to `budget_us` microseconds for the port, remembering whether PRC/PED
+/// were ever seen.
+///
+/// The budget is real time, not spins. A USB2 port needs up to 50 ms to complete
+/// a reset plus 10 ms of recovery (xHCI 1.2 §4.19.1); the old spin budgets were a
+/// few milliseconds of real time, so on hardware the driver gave up while the port
+/// was still in Polling and then reported "it enabled and fell back" — which was
+/// true, but it was our clock that made it fall back. Without a calibrated clock
+/// the old spin budget is used as a fallback.
 fn wait_port(
     ctrl: &mut Controller,
     off: usize,
-    budget: u32,
+    budget_us: u32,
     want_ped: bool,
 ) -> (bool, bool, bool, u32) {
     let mut seen_prc = false;
     let mut seen_ped = false;
     let mut ped_sc = 0u32;
-    let mut i = 0u32;
-    while i < budget {
+    let clock = clock_ready();
+    let start = if clock { now_us() } else { 0 };
+    let mut spins = 0u32;
+    loop {
         let sc = rd32(ctrl.op, off);
         if sc & PORTSC_PRC != 0 {
             seen_prc = true;
@@ -610,8 +801,17 @@ fn wait_port(
                 return (true, seen_prc, seen_ped, ped_sc);
             }
         }
+        if clock {
+            if now_us().wrapping_sub(start) >= budget_us as u64 {
+                break;
+            }
+        } else {
+            if spins >= 400_000 {
+                break;
+            }
+            spins += 1;
+        }
         core::hint::spin_loop();
-        i += 1;
     }
     (false, seen_prc, seen_ped, ped_sc)
 }
@@ -624,20 +824,28 @@ fn wait_port(
 /// `pre == post` in Polling). Accepting only a stable U0 is what makes the retry
 /// path fall through to the stronger fallbacks instead of lying to itself.
 fn port_enabled_stable(ctrl: &Controller, off: usize) -> (bool, u32) {
+    let clock = clock_ready();
+    let start = if clock { now_us() } else { 0 };
     let mut i = 0u32;
-    let mut sc = 0u32;
-    while i < 100_000 {
+    let mut sc;
+    loop {
         sc = rd32(ctrl.op, off);
         if sc & PORTSC_PED == 0 {
             return (false, sc);
         }
-        if (sc & PORTSC_PLS_MASK) == 0 {
+        if (sc & PORTSC_PLS_MASK) >> PORTSC_PLS_SHIFT == PLS_U0 {
             return (true, sc);
+        }
+        if clock {
+            if now_us().wrapping_sub(start) >= 20_000 {
+                return (false, sc);
+            }
+        } else if i >= 100_000 {
+            return (false, sc);
         }
         core::hint::spin_loop();
         i += 1;
     }
-    (false, sc)
 }
 
 /// Crude busy delay used only where a wrong-ordered reset costs a whole boot.
@@ -718,6 +926,12 @@ pub fn init(devices: &[PciDevice]) -> bool {
     if candidates.is_empty() {
         crate::warn!("xhci: no xHCI controller on the PCI bus");
         return false;
+    }
+    // The clock first: every wait below is expressed in microseconds, and the PIT
+    // channel-2 window this calibration uses is free only until the boot menu
+    // takes that channel for its own countdown.
+    if !clock_ready() {
+        calibrate_clock();
     }
     crate::info!(
         "xhci: {} xHCI controller(s) on the PCI bus",
@@ -845,6 +1059,13 @@ fn bios_handoff(base: usize, hccparams1: u32) -> &'static str {
             let mut value = cap;
             if value & LEGSUP_BIOS_OWNED != 0 {
                 wr32(base, off, value | LEGSUP_OS_OWNED);
+                // xHCI 1.2 §7.1.1: the OS gives the firmware up to one second, then
+                // takes ownership by force. The old two-million-spin budget was a
+                // guess; on a machine whose firmware really is slow it could expire
+                // in a few milliseconds and the "forced" path would run while the
+                // firmware was still in the middle of releasing the ports.
+                let clock = clock_ready();
+                let start_us = if clock { now_us() } else { 0 };
                 let mut spins = 0u32;
                 loop {
                     value = rd32(base, off);
@@ -853,7 +1074,12 @@ fn bios_handoff(base: usize, hccparams1: u32) -> &'static str {
                         return "handoff";
                     }
                     spins += 1;
-                    if spins > 2_000_000 {
+                    let expired = if clock {
+                        now_us().wrapping_sub(start_us) > 1_000_000
+                    } else {
+                        spins > 2_000_000
+                    };
+                    if expired {
                         wr32(base, off, (value & !LEGSUP_BIOS_OWNED) | LEGSUP_OS_OWNED);
                         crate::warn!("xhci: firmware did not release the controller; forced");
                         return "forced";
@@ -875,6 +1101,24 @@ fn bios_handoff(base: usize, hccparams1: u32) -> &'static str {
 
 /// Bring one controller all the way up: reset, rings, DCBAA, running.
 fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
+    // Memory space AND bus mastering, before anything else: the controller's
+    // command/event rings, DCBAA and scratchpads are all DMA, and a device with
+    // bus mastering off cannot touch any of them. Every other DMA driver in this
+    // kernel calls this; this one relied on firmware having left the bit set,
+    // which is exactly the kind of state QEMU does not enforce and hardware does.
+    crate::drivers::pci::enable_bus_master(dev.address);
+    let pci_cmd = crate::drivers::pci::config_read_u32(dev.address, 0x04) & 0xFFFF;
+    crate::info!(
+        "xhci: PCI command={:#06x} (memory={} bus-master={})",
+        pci_cmd,
+        if pci_cmd & 0x2 != 0 { "on" } else { "OFF" },
+        if pci_cmd & 0x4 != 0 { "on" } else { "OFF" }
+    );
+    // A real-time base for the port waits: USB2 reset/recovery/settle are tens of
+    // milliseconds by specification, and a spin count is not a millisecond.
+    if !clock_ready() {
+        calibrate_clock();
+    }
     let Some((base, bar)) = map_bar0(dev) else {
         return false;
     };
@@ -934,6 +1178,8 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
     let Some(dcbaa) = DmaFrame::new_zeroed("dcbaa") else {
         return false;
     };
+    let dcbaa_phys_value = dcbaa.phys();
+    let mut scratchpad_array: Option<DmaFrame> = None;
     let mut scratchpad_pages: Vec<DmaFrame> = Vec::new();
     if scratchpads > 0 {
         let Some(array) = DmaFrame::new_zeroed("scratchpad array") else {
@@ -950,6 +1196,10 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
         }
         // SAFETY: DCBAA[0] is the first 8 bytes of our own zeroed frame.
         unsafe { write_volatile(dcbaa.virt() as *mut u64, array.phys()) };
+        // The array page is DMA state too: DCBAA[0] points at it and the
+        // controller reads it whenever it needs a scratchpad. It travels into the
+        // Controller with the frame above, for the same lifetime reason.
+        scratchpad_array = Some(array);
     }
 
     let (Some(cmdr), Some(event), Some(erst)) = (
@@ -1001,8 +1251,8 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
     crate::info!("xhci: running (ports={} cr={:#x})", ports, cmdr.base_phys());
     // Give the PHYs a moment to settle before the first port reset: the firmware
     // left these links in some state and USB2 wants ~100 ms after a controller
-    // reset. QEMU is instant, hardware is not.
-    spin_settle(10_000_000);
+    // reset (xHCI 1.2 §4.19.1). QEMU is instant, hardware is not.
+    settle_us(100_000);
     // Port state at bring-up, at debug level: which ports have a device attached,
     // whether they are powered and at what speed is the first thing to look at
     // when enumeration does not happen.
@@ -1021,10 +1271,16 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
     }
 
     // Which ports are USB2 and which are USB3, from the Supported Protocol
-    // capabilities. This is the difference between resetting a USB2 port (what a
-    // keyboard needs) and poking a USB3 link that expects a different device.
+    // capabilities. This is DIAGNOSTIC, not policy: the reset path learns the
+    // protocol from the port's own reported speed, because the field machine
+    // shows how fragile this data can be (its controller reports two entries whose
+    // ranges overlap). The raw entries are kept for the screen so the next photo
+    // can be compared against the spec instead of against our parser — the old
+    // display printed `usb2=17-41 usb3=17-26`, which is what a parser that reads
+    // the wrong byte looks like.
     let mut protos: Vec<u8> = vec![0u8; ports as usize];
-    let mut proto_ranges: [(u8, u8); 2] = [(0, 0), (0, 0)];
+    let mut proto_masks: [u32; 2] = [0, 0];
+    let mut xcaps: Vec<XCap> = Vec::new();
     let xecp = ((hccparams1 >> 16) & 0xFFFF) as usize;
     {
         let mut off = if xecp != 0 { xecp * 4 } else { 0x20 };
@@ -1032,51 +1288,104 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
         while off + 16 <= 0x10000 && guard < 64 {
             guard += 1;
             let dw0 = rd32(base, off);
-            let id = dw0 & 0xFF;
-            let next = ((dw0 >> 8) & 0xFF) as usize;
+            let id = (dw0 & 0xFF) as u8;
+            let next = ((dw0 >> 8) & 0xFF) as u8;
+            let dw1 = rd32(base, off + 4);
+            let dw2 = rd32(base, off + 8);
+            if xcaps.len() < 12 && (id == 1 || id == 2 || id == 3) {
+                xcaps.push(XCap {
+                    offset: off as u32,
+                    id,
+                    next,
+                    dw1,
+                    dw2,
+                });
+            }
             if id == 2 {
-                // Supported Protocol: major revision in DW0 bits 31:24; DW2
-                // carries the compatible port offset (bits 15:8, 0-based) and
-                // count (bits 31:16). QEMU packs them differently (start port in
-                // bits 7:0, count in 15:8), so a spec-zero count is retried the
-                // emulator way — harmless on hardware, where the spec layout is
-                // what controllers implement.
+                // xHCI 1.2 table 7-4: DW2 = { PSIC:7:0, offset:15:8, count:31:16 },
+                // where `offset` is 0-based and `count` is in ports. (The previous
+                // code read `count` as a byte and applied a QEMU-specific fallback
+                // when it was zero; on this controller that produced the
+                // overlapping ranges. QEMU happens to use the same layout, so the
+                // fallback was never needed.)
                 let major = ((dw0 >> 24) & 0xFF) as u8;
-                let dw2 = rd32(base, off + 8);
-                let spec_count = ((dw2 >> 16) & 0xFF) as usize;
+                let spec_count = ((dw2 >> 16) & 0xFFFF) as usize;
+                // QEMU's xHCI (`hcd-xhci.c`, the "Supported Protocol:08" dwords)
+                // does not follow the spec here: it writes the per-protocol port
+                // COUNT into bits 15:8 and leaves the spec count field zero. A
+                // zero spec count is therefore read the emulator's way — USB2
+                // ports are 1..n and USB3 ports are the last n — while real
+                // hardware (this Intel PCH included) uses the spec layout.
                 let (first, count) = if spec_count != 0 {
-                    (((dw2 >> 8) & 0xFF) as usize + 1, spec_count)
+                    ((((dw2 >> 8) & 0xFF) as usize) + 1, spec_count)
                 } else {
-                    (((dw2 & 0xFF) as usize).max(1), ((dw2 >> 8) & 0xFF) as usize)
+                    let n = ((dw2 >> 8) & 0xFF) as usize;
+                    if major == 2 {
+                        (1, n)
+                    } else {
+                        ((ports as usize + 1).saturating_sub(n), n)
+                    }
                 };
-                let proto = match major {
-                    2 => 2u8,
-                    3 => 3u8,
-                    _ => 0u8,
+                crate::info!(
+                    "xhci: xcap {:#06x} id={} next={:#04x} major={} first={} count={} dw1={:#010x} dw2={:#010x}",
+                    off,
+                    id,
+                    next,
+                    major,
+                    first,
+                    count,
+                    dw1,
+                    dw2
+                );
+                let slot = match major {
+                    2 => Some(0usize),
+                    3 => Some(1usize),
+                    _ => None,
                 };
-                if (proto == 2 || proto == 3) && count != 0 {
-                    let slot = if proto == 2 { 0 } else { 1 };
-                    proto_ranges[slot] = (first as u8, count as u8);
-                }
-                for port in first..first.saturating_add(count) {
-                    if port >= 1 && port <= ports as usize {
-                        protos[port - 1] = proto;
+                if let Some(slot) = slot {
+                    if count != 0 {
+                        for port in first..first.saturating_add(count) {
+                            if port >= 1 && port <= ports as usize {
+                                proto_masks[slot] |= 1 << (port - 1);
+                            }
+                        }
                     }
                 }
-                crate::info!(
-                    "xhci: protocol {} dw0={:#010x} dw2={:#010x} ports {}-{}",
-                    proto,
-                    dw0,
-                    dw2,
-                    first,
-                    first.saturating_add(count).saturating_sub(1)
-                );
             }
-            if next == 0 || next >= 0x100 {
+            if next == 0 {
                 break;
             }
-            off += next * 4;
+            off += next as usize * 4;
         }
+    }
+    // A port belongs to one protocol at most. When the reported ranges overlap,
+    // USB3 wins: that is the port whose reset differs, so mislabelling it as USB2
+    // is the expensive direction to be wrong in.
+    let covered = proto_masks[0] | proto_masks[1];
+    proto_masks[0] &= !proto_masks[1];
+    for port in 1..=ports as usize {
+        let bit = 1u32 << (port - 1);
+        protos[port - 1] = if proto_masks[1] & bit != 0 {
+            3
+        } else if proto_masks[0] & bit != 0 {
+            2
+        } else {
+            0
+        };
+    }
+    let all_ports = if ports >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << ports) - 1
+    };
+    if covered != all_ports {
+        crate::warn!(
+            "xhci: protocol caps cover {:#010x} of {:#010x} ports (usb2={:#010x} usb3={:#010x})",
+            covered,
+            all_ports,
+            proto_masks[0],
+            proto_masks[1]
+        );
     }
 
     let diag: Vec<PortDiag> = (0..ports as usize)
@@ -1091,6 +1400,7 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
             seen_prc: false,
             seen_ped: false,
             ped_sc: 0,
+            ms: 0,
             proto: protos.get(index).copied().unwrap_or(0),
         })
         .collect();
@@ -1104,7 +1414,10 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
         cmdr,
         event,
         erst,
-        dcbaa_phys: dcbaa.phys(),
+        dcbaa,
+        dcbaa_phys: dcbaa_phys_value,
+        scratchpad_array,
+        scratchpad_pages,
         slots: Vec::new(),
         reports: 0,
         devices: 0,
@@ -1112,18 +1425,22 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
         logged_ports: false,
         probe_mask: ccs_mask_probe,
         next_port: 1,
-        proto_ranges,
+        protos,
+        proto_masks,
+        xcaps,
         caplength: caplength as u32,
         hciversion,
         hcsparams1,
         hccparams1,
         legacy,
         writes_ok,
+        pci_cmd,
+        halts: 0,
+        halt_cmd: 0,
+        halt_sts: 0,
         diag,
         last_fail: None,
     });
-    // The scratchpad pages must outlive every command the controller runs.
-    core::mem::forget(scratchpad_pages);
     true
 }
 
@@ -1190,14 +1507,23 @@ fn ctx_addr(phys: u64) -> (u32, u32) {
 
 // ─── Enumeration ─────────────────────────────────────────────────────────────
 
-/// Power `port` and run its reset sequence; return the speed of a device found.
+/// Power `port` and bring the device on it to U0; return its speed.
 ///
-/// The reset is what makes the connection visible. It is tempting to read
-/// PORTSC first and only reset a port that already reports a device, but that is
-/// precisely the order that does not work: a controller whose ports are in
-/// RxDetect (QEMU's model, and real hardware after the firmware has handed over)
-/// reports `CCS=0` until the reset sequence runs, so a "detect then reset" loop
-/// never detects anything. Power, reset, then read.
+/// The order matters and so do the waits. Three states are NOT a reset request:
+///
+/// * PED=1, PLS=U0 — the controller (or firmware) already brought the port up.
+///   Adopt it and go address the device;
+/// * PED=1, PLS=U3 — the link is suspended with the device enabled. This is the
+///   state the field machine's ports sit in after a reset (PED=1, PLS=3, speed=
+///   high), and resetting it again returns to the same state: a suspended link is
+///   resumed, not reset;
+/// * PED=0, PLS=Polling/RxDetect — the port is still detecting/training the
+///   device. Resetting here aborts that sequence and restarts it, which is the
+///   "PED appears, then the link is back in Polling" loop reported from hardware.
+///
+/// Everything else gets a real port reset, with a real-time budget, and a USB2
+/// port that will not enable gets its power cycled (USB3 gets a warm reset, which
+/// is the only place WPR is defined).
 fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
     let off = portsc(port);
     let mut sc = rd32(ctrl.op, off);
@@ -1210,13 +1536,10 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
             ctrl.fail(port, "no-power", sc);
             return None;
         }
+        // A port needs ~20 ms after power-on before its connect status is valid.
+        settle_us(20_000);
         sc = rd32(ctrl.op, off);
     }
-    // Look at the connect status BEFORE resetting. A port with nothing on it never
-    // reports a reset completion, so the old order — always reset, then spin for
-    // PRC — made every empty port burn a full spin budget on every call. That is
-    // what turned the menu's keyboard poll into a CPU hog once a controller was
-    // present (each poll reset eight ports and waited on seven of them).
     if sc & PORTSC_CCS == 0 {
         if sc & PORTSC_CSC != 0 {
             wr32(ctrl.op, off, (sc & !PORTSC_RW1C) | PORTSC_CSC);
@@ -1224,30 +1547,18 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
         ctrl.stage(port, "no-device", sc);
         return None;
     }
-    // The controller can bring a port up on its own (PED=1, link in U0) — the field
-    // machine does exactly that after a power cycle, and the driver used to reset
-    // the port straight back into Polling. Adopt what is already working and go
-    // address the device.
-    let already_enabled = sc & PORTSC_PED != 0 && (sc & PORTSC_PLS_MASK) == 0;
-    if already_enabled {
-        let speed = ((sc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) as u8;
-        if speed != 0 {
-            let cur = rd32(ctrl.op, off);
-            wr32(
-                ctrl.op,
-                off,
-                (cur & !PORTSC_RW1C) | PORTSC_PRC | PORTSC_WRC | PORTSC_CSC,
-            );
-            let cur = rd32(ctrl.op, off);
-            if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
-                d.speed = speed;
-                d.post = cur;
-            }
-            ctrl.stage(port, "already-enabled", sc);
-            return Some(speed);
-        }
+
+    let started = if clock_ready() { now_us() } else { 0 };
+
+    // 1. Adopt, resume, or wait: only reset what is not already on its way up.
+    if let Some(speed) = adopt_or_wake(ctrl, port, sc) {
+        record_duration(ctrl, port, started);
+        return Some(speed);
     }
-    // Clear stale change bits so the PRC seen below belongs to OUR reset.
+    sc = rd32(ctrl.op, off);
+
+    // 2. A real port reset. Clear stale change bits first so the PRC seen below
+    //    belongs to OUR reset.
     wr32(
         ctrl.op,
         off,
@@ -1255,87 +1566,92 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
     );
     let sc = rd32(ctrl.op, off);
     wr32(ctrl.op, off, (sc & !PORTSC_RW1C) | PORTSC_PR);
-
-    // WAIT FOR THE PORT TO ENABLE, not merely for PRC. A reset that the device
-    // does not complete still raises PRC on real controllers while PED stays 0 and
-    // the link falls back to Polling — that is exactly the state a real machine
-    // showed ("stage=address code=4": the address request was sent to a device
-    // that had never been enabled). QEMU sets both bits together.
-    let (mut enabled, mut seen_prc, mut seen_ped, mut ped_sc) = wait_port(ctrl, off, 400_000, true);
-    if enabled {
-        let (stable, sc) = port_enabled_stable(ctrl, off);
-        if !stable {
-            // The controller raised PED and took it away: the device did not
-            // finish training, so this attempt is not a success.
-            enabled = false;
-            if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
-                d.post = sc;
-            }
-        }
-    }
-    if !enabled {
-        // A USB3 link that firmware left suspended (U3) does not answer a hot
-        // reset; warm reset is the specified recovery.
-        let cur = rd32(ctrl.op, off);
-        wr32(ctrl.op, off, (cur & !PORTSC_RW1C) | PORTSC_WPR);
-        let (e, prc, ped, ps) = wait_port(ctrl, off, 400_000, true);
-        seen_prc |= prc;
-        seen_ped |= ped;
-        if ps != 0 {
-            ped_sc = ps;
-        }
-        enabled = e;
-        if enabled {
-            let (stable, sc) = port_enabled_stable(ctrl, off);
-            if !stable {
-                enabled = false;
-                if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
-                    d.post = sc;
-                }
-            }
-        }
-    }
+    // A USB2 reset needs ~50 ms (+10 ms recovery); the first attempts keep a short
+    // budget so one dead port cannot stall the boot menu's countdown, retries
+    // (which are spaced out) get the full one.
     let attempts = ctrl
         .diag
         .get(port as usize - 1)
         .map(|d| d.attempts)
         .unwrap_or(0);
-    if !enabled && attempts % 4 == 0 {
-        // Last resort: power-cycle the port. Firmware can hand over a controller
-        // whose ports are powered but never leave Polling; dropping PP and
-        // re-raising it after a settle delay makes the controller run the USB2
-        // attach sequence from scratch. Not on every attempt: it is slow and it
-        // makes the device's LEDs blink (which the operator notices).
-        let cur = rd32(ctrl.op, off);
-        wr32(ctrl.op, off, cur & !PORTSC_PP);
-        spin_settle(600_000);
-        let cur = rd32(ctrl.op, off);
-        wr32(ctrl.op, off, (cur & !PORTSC_RW1C) | PORTSC_PP);
-        spin_until(|| rd32(ctrl.op, off) & PORTSC_PP != 0, 500_000);
-        spin_settle(600_000);
-        let sc = rd32(ctrl.op, off);
-        wr32(
-            ctrl.op,
-            off,
-            (sc & !PORTSC_RW1C) | PORTSC_CSC | PORTSC_PRC | PORTSC_WRC | PORTSC_PR,
-        );
-        let (e, prc, ped, ps) = wait_port(ctrl, off, 400_000, true);
-        seen_prc |= prc;
-        seen_ped |= ped;
-        if ps != 0 {
-            ped_sc = ps;
-        }
-        enabled = e;
-        if enabled {
-            let (stable, sc) = port_enabled_stable(ctrl, off);
-            if !stable {
-                enabled = false;
-                if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
-                    d.post = sc;
-                }
+    let budget_us = if attempts < 2 { 25_000 } else { 150_000 };
+    let (mut enabled, mut seen_prc, mut seen_ped, mut ped_sc) =
+        wait_port(ctrl, off, budget_us, true);
+    if enabled {
+        let (stable, sc2) = port_enabled_stable(ctrl, off);
+        if !stable {
+            enabled = false;
+            if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+                d.post = sc2;
             }
         }
-        if !enabled {
+    }
+    // 3. A port that is enabled but suspended after the reset is resumed; one that
+    //    is not enabled at all gets a stronger fallback, chosen by protocol.
+    if !enabled {
+        if let Some(speed) = adopt_or_wake(ctrl, port, rd32(ctrl.op, off)) {
+            record_duration(ctrl, port, started);
+            return Some(speed);
+        }
+        let cur = rd32(ctrl.op, off);
+        let speed = ((cur & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) as u8;
+        if attempts % 4 == 0 {
+            // Last resort. USB2: drop and re-raise PP, which makes the controller
+            // run the attach sequence from scratch (and is what blinks the device
+            // LEDs the operator notices). USB3: a warm reset, which is the
+            // specified recovery for a link that came out of U3 without training.
+            if speed == SPEED_SUPER {
+                wr32(ctrl.op, off, (cur & !PORTSC_RW1C) | PORTSC_WPR);
+                let (e, prc, ped, ps) = wait_port(ctrl, off, 150_000, true);
+                seen_prc |= prc;
+                seen_ped |= ped;
+                if ps != 0 {
+                    ped_sc = ps;
+                }
+                enabled = e;
+            } else {
+                wr32(ctrl.op, off, cur & !PORTSC_PP);
+                settle_us(100_000);
+                let cur = rd32(ctrl.op, off);
+                wr32(ctrl.op, off, (cur & !PORTSC_RW1C) | PORTSC_PP);
+                spin_until(|| rd32(ctrl.op, off) & PORTSC_PP != 0, 500_000);
+                settle_us(100_000);
+                let sc = rd32(ctrl.op, off);
+                wr32(
+                    ctrl.op,
+                    off,
+                    (sc & !PORTSC_RW1C) | PORTSC_CSC | PORTSC_PRC | PORTSC_WRC | PORTSC_PR,
+                );
+                let (e, prc, ped, ps) = wait_port(ctrl, off, 150_000, true);
+                seen_prc |= prc;
+                seen_ped |= ped;
+                if ps != 0 {
+                    ped_sc = ps;
+                }
+                enabled = e;
+            }
+            if enabled {
+                let (stable, sc2) = port_enabled_stable(ctrl, off);
+                if !stable {
+                    enabled = false;
+                    if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+                        d.post = sc2;
+                    }
+                }
+            }
+            if !enabled {
+                let post = rd32(ctrl.op, off);
+                if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+                    d.post = post;
+                    d.seen_prc = seen_prc;
+                    d.seen_ped = seen_ped;
+                    d.ped_sc = ped_sc;
+                }
+                record_duration(ctrl, port, started);
+                ctrl.fail(port, "reset-no-enable", post);
+                return None;
+            }
+        } else {
             let post = rd32(ctrl.op, off);
             if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
                 d.post = post;
@@ -1343,10 +1659,15 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
                 d.seen_ped = seen_ped;
                 d.ped_sc = ped_sc;
             }
+            record_duration(ctrl, port, started);
             ctrl.fail(port, "reset-no-enable", post);
             return None;
         }
     }
+    // The spec requires software to give the device 10 ms after the port is
+    // enabled before it may be addressed (xHCI 1.2 §4.19.1); QEMU does not care,
+    // a real PHY does.
+    settle_us(10_000);
     let cur = rd32(ctrl.op, off);
     wr32(
         ctrl.op,
@@ -1360,7 +1681,11 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
         d.seen_ped = seen_ped;
         d.ped_sc = ped_sc;
     }
-    if cur & PORTSC_CCS == 0 || cur & PORTSC_PED == 0 || (cur & PORTSC_PLS_MASK) != 0 {
+    record_duration(ctrl, port, started);
+    if cur & PORTSC_CCS == 0
+        || cur & PORTSC_PED == 0
+        || (cur & PORTSC_PLS_MASK) >> PORTSC_PLS_SHIFT != PLS_U0
+    {
         ctrl.fail(port, "lost-after-reset", cur);
         return None;
     }
@@ -1370,6 +1695,139 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
         d.speed = speed;
     }
     Some(speed)
+}
+
+/// Record how long the last attempt on a port took, in milliseconds.
+fn record_duration(ctrl: &mut Controller, port: u8, started_us: u64) {
+    if started_us == 0 || !clock_ready() {
+        return;
+    }
+    let ms = now_us().saturating_sub(started_us) / 1000;
+    if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+        d.ms = ms.min(u16::MAX as u64) as u16;
+    }
+}
+
+/// Port link state from a PORTSC word.
+fn port_pls(sc: u32) -> u32 {
+    (sc & PORTSC_PLS_MASK) >> PORTSC_PLS_SHIFT
+}
+
+/// Port speed id from a PORTSC word.
+fn port_speed(sc: u32) -> u8 {
+    ((sc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) as u8
+}
+
+/// Adopt an enabled port, waiting for the attach/training sequence to finish.
+///
+/// Returns the speed when the port is at U0 and enabled (either already, or after
+/// waiting/resuming); `None` means "this port needs a real reset".
+fn adopt_or_wake(ctrl: &mut Controller, port: u8, sc: u32) -> Option<u8> {
+    let off = portsc(port);
+    if sc & PORTSC_PED != 0 {
+        let pls = port_pls(sc);
+        let speed = port_speed(sc);
+        if pls == PLS_U0 && speed != 0 {
+            return Some(adopt(ctrl, port, speed, "already-enabled", sc));
+        }
+        if pls == PLS_U3 {
+            return resume_port(ctrl, port);
+        }
+    }
+    // Not enabled (yet). While the controller is still detecting the device there
+    // is nothing to reset: waiting is the whole fix for the "PED appears and then
+    // the link is back in Polling" loop, because our reset was restarting the
+    // attach sequence before it could finish.
+    let pls = port_pls(sc);
+    let detecting = pls == PLS_POLLING || pls == PLS_RXDETECT;
+    if !detecting {
+        return None;
+    }
+    let clock = clock_ready();
+    let start = if clock { now_us() } else { 0 };
+    let mut spins = 0u32;
+    loop {
+        let cur = rd32(ctrl.op, off);
+        let pls = port_pls(cur);
+        let speed = port_speed(cur);
+        if cur & PORTSC_PED != 0 && pls == PLS_U0 && speed != 0 {
+            return Some(adopt(ctrl, port, speed, "adopt-after-detect", cur));
+        }
+        if cur & PORTSC_PED != 0 && pls == PLS_U3 {
+            return resume_port(ctrl, port);
+        }
+        if cur & PORTSC_PED == 0 && pls != PLS_POLLING && pls != PLS_RXDETECT {
+            return None; // left the detection states without enabling
+        }
+        if clock {
+            if now_us().wrapping_sub(start) >= 60_000 {
+                return None;
+            }
+        } else {
+            spins += 1;
+            if spins >= 600_000 {
+                return None;
+            }
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Software-resume a port whose link is suspended with the device enabled.
+///
+/// For a USB2 port, writing PLS=U0 with LWS=1 drives resume signalling (20 ms,
+/// USB2 §7.1.7.7); for USB3 it starts the link's resume. Both then report U0.
+fn resume_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
+    let off = portsc(port);
+    let cur = rd32(ctrl.op, off);
+    wr32(
+        ctrl.op,
+        off,
+        (cur & !PORTSC_RW1C & !PORTSC_PLS_MASK) | PORTSC_LWS | (PLS_U0 << PORTSC_PLS_SHIFT),
+    );
+    let clock = clock_ready();
+    let start = if clock { now_us() } else { 0 };
+    let mut spins = 0u32;
+    loop {
+        let sc = rd32(ctrl.op, off);
+        if port_pls(sc) == PLS_U0 && sc & PORTSC_PED != 0 {
+            let speed = port_speed(sc);
+            if speed != 0 {
+                // Resume signalling needs 20 ms to settle before traffic.
+                settle_us(20_000);
+                return Some(adopt(ctrl, port, speed, "resumed", sc));
+            }
+        }
+        if clock {
+            if now_us().wrapping_sub(start) >= 40_000 {
+                return None;
+            }
+        } else {
+            spins += 1;
+            if spins >= 400_000 {
+                return None;
+            }
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Take over an enabled port: acknowledge its change bits and record the speed.
+fn adopt(ctrl: &mut Controller, port: u8, speed: u8, stage: &'static str, sc: u32) -> u8 {
+    let off = portsc(port);
+    let cur = rd32(ctrl.op, off);
+    wr32(
+        ctrl.op,
+        off,
+        (cur & !PORTSC_RW1C) | PORTSC_PRC | PORTSC_WRC | PORTSC_CSC,
+    );
+    let cur = rd32(ctrl.op, off);
+    if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+        d.speed = speed;
+        d.post = cur;
+    }
+    ctrl.stage(port, stage, sc);
+    speed
 }
 
 /// EP0 max packet size before the device descriptor is known, by speed.
@@ -2003,6 +2461,38 @@ pub fn poll() {
     let Some(ctrl) = guard.as_mut() else {
         return;
     };
+    // A halted controller is the worst failure mode this driver has: HCH=1 means
+    // it stopped walking the rings, and every port register keeps the value it
+    // had at the moment it died. The old driver never looked, so the diagnostic
+    // screen presented a dead controller's frozen state as live ("all ports stuck
+    // in Polling, tries exhausted") and kept retrying port writes the controller
+    // could not see. Detect it, record the registers that prove it, and restart.
+    if rd32(ctrl.op, OP_USBSTS) & USBSTS_HCH != 0 {
+        ctrl.halts = ctrl.halts.saturating_add(1);
+        let cmd = rd32(ctrl.op, OP_USBCMD);
+        let sts = rd32(ctrl.op, OP_USBSTS);
+        if ctrl.halts == 1 {
+            ctrl.halt_cmd = cmd;
+            ctrl.halt_sts = sts;
+            crate::warn!(
+                "xhci: controller halted (usbcmd={:#010x} usbsts={:#010x} hse={} hce={}): restarting",
+                cmd,
+                sts,
+                (sts & USBSTS_HSE != 0) as u8,
+                (sts & USBSTS_HCE != 0) as u8
+            );
+        }
+        if !restart_controller(ctrl) {
+            crate::warn!(
+                "xhci: controller {} did not come back (usbcmd={:#010x} usbsts={:#010x})",
+                ctrl.halts,
+                rd32(ctrl.op, OP_USBCMD),
+                rd32(ctrl.op, OP_USBSTS)
+            );
+            return;
+        }
+        crate::info!("xhci: controller restarted (halt #{})", ctrl.halts);
+    }
     // 1. Bring up every port once (power, connect check, reset), then enumerate
     //    what appeared. `reset_port` reads the connect status before resetting, so
     //    an empty port costs one register read instead of a reset timeout. Ports
@@ -2103,6 +2593,52 @@ pub fn poll() {
             }
         }
     }
+}
+
+/// Bring a halted controller back: reset it, re-point it at our rings, run it.
+///
+/// Everything this needs is owned by the `Controller` (rings, DCBAA, scratchpad
+/// array), which is the reason those frames became fields: a reset makes the
+/// controller re-read them, so they must still be ours.
+fn restart_controller(ctrl: &mut Controller) -> bool {
+    // Stop, then reset. The halt may be an HCE; a port or command write will not
+    // clear it, a controller reset does.
+    wr32(ctrl.op, OP_USBCMD, 0);
+    let _ = spin_until(|| rd32(ctrl.op, OP_USBSTS) & USBSTS_HCH != 0, 200_000);
+    wr32(ctrl.op, OP_USBCMD, USBCMD_HCRST);
+    if !spin_until(|| rd32(ctrl.op, OP_USBCMD) & USBCMD_HCRST == 0, 2_000_000) {
+        return false;
+    }
+    if !spin_until(|| rd32(ctrl.op, OP_USBSTS) & USBSTS_CNR == 0, 2_000_000) {
+        return false;
+    }
+    let max_slots = (ctrl.hcsparams1 & 0xFF).min(u8::MAX as u32);
+    wr32(ctrl.op, OP_CONFIG, max_slots);
+    wr64(ctrl.op, OP_DCBAAP, ctrl.dcbaa.phys());
+    wr64(ctrl.op, OP_CRCR, ctrl.cmdr.base_phys() | TRB_CYCLE as u64);
+    wr32(ctrl.rt + RTS_IR0, IR_ERSTSZ, 1);
+    wr64(ctrl.rt + RTS_IR0, IR_ERSTBA, ctrl.erst.phys());
+    wr64(ctrl.rt + RTS_IR0, IR_ERDP, ctrl.event.base_phys());
+    wr32(ctrl.op, OP_USBCMD, USBCMD_RS);
+    if !spin_until(|| rd32(ctrl.op, OP_USBSTS) & USBSTS_HCH == 0, 2_000_000) {
+        return false;
+    }
+    // A controller reset forgets every slot and every port; the rings start from
+    // their first TRB with the cycle bit set again.
+    ctrl.slots.clear();
+    ctrl.brought_up.clear();
+    ctrl.devices = 0;
+    ctrl.cmdr.enqueue = 0;
+    ctrl.cmdr.cycle = TRB_CYCLE;
+    ctrl.cmdr.outstanding = false;
+    ctrl.event.dequeue = 0;
+    ctrl.event.cycle = TRB_CYCLE;
+    for d in ctrl.diag.iter_mut() {
+        d.stage = "";
+        d.attempts = 0;
+        d.retry_in = 0;
+    }
+    true
 }
 
 /// One port's share of [`poll`]: (re)initialise it if needed.
@@ -2223,6 +2759,8 @@ pub struct PortRow {
     pub seen_ped: bool,
     pub ped_sc: u32,
     pub proto: u8,
+    /// Duration of the last attempt in milliseconds (0 when no clock).
+    pub ms: u16,
 }
 
 pub fn diagnostics() -> Vec<PortRow> {
@@ -2257,6 +2795,7 @@ pub fn diagnostics() -> Vec<PortRow> {
             seen_ped: d.seen_ped,
             ped_sc: d.ped_sc,
             proto: d.proto,
+            ms: d.ms,
         });
     }
     rows

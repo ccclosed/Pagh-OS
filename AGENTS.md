@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.18.11** (the batch open with the
+  be reflected here. **`main` currently reads 2.18.12** (the batch open with the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
   **2.17.0** = the batch that made pagh run on real hardware, plus three
@@ -433,6 +433,48 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   already enabled is adopted instead of reset back into Polling; and the PP
   power-cycle fallback now runs only every fourth attempt — it was what made the
   mouse's LED blink once every ~35 s, which the operator reported.
+  **2.18.12** = the halted controller. The 2.18.11 field photos (the ones the
+  previous session never got to read) show `usbcmd=0x00000000 usbsts=0x00000015`
+  — HCH=1, the xHCI was **halted** at shell time — while `legacy=os-owned` and every
+  USB2 port sat in PLS=Polling with `try=19`. A halted controller ignores port writes
+  and freezes PORTSC, which is exactly the "ports never enable" symptom the last
+  three reports describe; the 2.18.9 photo of the same machine reads `usbcmd=1`
+  with `legacy=absent`, so the halt arrived with the extended-capability work. Three
+  real bugs came out of that comparison:
+  * `dcbaa` and the scratchpad ARRAY frame were locals in `start_controller`: only
+    their physical addresses were stored, and `DmaFrame::drop` (added in 2.18.9)
+    returned those pages to the PMM while the controller still owned them. QEMU
+    rarely reuses such a page during boot; hardware does, and the first reuse makes
+    the controller fetch a garbage device context — a Host Controller Error, which
+    halts the controller mid-boot. Both frames are `Controller` fields now (`dcbaa`,
+    `scratchpad_array`, `scratchpad_pages`), for the same reason `erst` always was.
+  * xHCI was the only DMA driver here that never called `pci::enable_bus_master`.
+    The command ring, event ring, DCBAA and scratchpads are all DMA; bus mastering
+    off is invisible under QEMU and fatal on hardware. It is enabled before the BAR
+    is touched and printed (`pci_cmd=` in the diagnostic).
+  * every USB wait was a spin count, i.e. a different wall-clock duration on every
+    machine. A USB2 reset needs ~50 ms plus 10 ms recovery (xHCI 1.2 §4.19.1), a
+    suspended link needs 20 ms of resume signalling, and the field budgets were a few
+    milliseconds of real time — which is why ports "enabled and then fell back to
+    Polling". The driver now calibrates the TSC against a 10 ms PIT channel-2
+    one-shot in `init_usb` (before the boot menu starts using that PIT channel) and
+    gives the port paths real deadlines; the per-port row prints `ms=`, the duration
+    the last attempt actually took, so the next photo can separate "needs more time"
+    from "the controller refuses".
+  The same photos made four smaller things visible, all fixed here: a port that is
+  mid-detect (PLS=Polling/RxDetect) is waited for instead of being reset mid-attach
+  (that reset was restarting the attach sequence — the PED-then-Polling loop); an
+  enabled-but-suspended port (PED=1, PLS=U3, the state the 2.18.10 photo shows right
+  after a reset) is resumed with PLS=U0|LWS instead of being reset again; WPR is only
+  issued to a SuperSpeed link (it is undefined on USB2, which now gets the PP power
+  cycle instead); and `poll()` detects a halted controller, records the registers
+  that prove it and restarts it (HCRST + re-point the rings), so a halt can no longer
+  masquerade as "no USB device". The Supported Protocol dump now prints **port masks
+  plus the raw capability entries**: the old line read
+  `usb2=17-41 usb3=17-26`, which is what a parser that reads the wrong DW2 looks like
+  (both entries appeared to start at port 17, so every real USB2 port printed
+  `proto=usb0`), and the duplicated `xhci proto:` line in the boot menu — visible as
+  the same line twice in every field photo — is gone.
   **2.18.11** = the menu that stopped counting. The 2.18.10 field report: the
   20-second countdown never moved, the keyboard and mouse still did not work, and
   the device LEDs blinked even more often. The cause was the driver itself: with

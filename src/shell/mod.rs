@@ -370,23 +370,40 @@ pub fn shell_main() -> ! {
         );
     }
     {
-        let ranges = crate::drivers::xhci::proto_ranges();
-        let text = |(first, count): (u8, u8)| {
-            if count == 0 {
-                alloc::string::String::from("-")
-            } else {
-                alloc::format!("{}-{}", first, first as u16 + count as u16 - 1)
-            }
-        };
+        // Port masks, not ranges: the field controller reports two Supported
+        // Protocol entries whose ranges overlap, and printing the pretty range hid
+        // that (`usb2=17-41 usb3=17-26`). A mask shows exactly which ports the
+        // controller claims for each protocol, and what it does not claim at all.
+        let masks = crate::drivers::xhci::proto_masks();
         crate::fb_println!(
-            "  xhci proto: usb2={} usb3={}",
-            text(ranges[0]),
-            text(ranges[1])
+            "  xhci proto: usb2={:#010x} usb3={:#010x}",
+            masks[0],
+            masks[1]
         );
         crate::kprintln!(
-            "xhci proto: usb2={} usb3={}",
-            text(ranges[0]),
-            text(ranges[1])
+            "xhci proto: usb2={:#010x} usb3={:#010x}",
+            masks[0],
+            masks[1]
+        );
+    }
+    // The raw extended-capability walk: when protocol parsing and the BIOS handoff
+    // disagree with the spec, this is the evidence that settles it.
+    for cap in crate::drivers::xhci::xcaps().into_iter().take(6) {
+        crate::fb_println!(
+            "  xhci xcap {:#06x}: id={} next={:#04x} dw1={:#010x} dw2={:#010x}",
+            cap.offset,
+            cap.id,
+            cap.next,
+            cap.dw1,
+            cap.dw2
+        );
+        crate::kprintln!(
+            "xhci xcap {:#06x}: id={} next={:#04x} dw1={:#010x} dw2={:#010x}",
+            cap.offset,
+            cap.id,
+            cap.next,
+            cap.dw1,
+            cap.dw2
         );
     }
     if let Some(d) = crate::drivers::xhci::raw_dump() {
@@ -398,12 +415,14 @@ pub fn shell_main() -> ! {
             d.legacy
         );
         crate::fb_println!(
-            "  xhci op: caplen={:#x} usbcmd={:#010x} usbsts={:#010x} config={:#x} writes={}",
+            "  xhci op: caplen={:#x} usbcmd={:#010x} usbsts={:#010x} config={:#x} writes={} halts={} pci_cmd={:#06x}",
             d.caplength,
             d.usbcmd,
             d.usbsts,
             d.config,
-            if d.writes_ok { "ok" } else { "IGNORED" }
+            if d.writes_ok { "ok" } else { "IGNORED" },
+            d.halts,
+            d.pci_cmd
         );
         crate::fb_println!(
             "  xhci port {} regs: {:#010x} {:#010x} {:#010x} {:#010x}",
@@ -413,13 +432,30 @@ pub fn shell_main() -> ! {
             d.port_regs[2],
             d.port_regs[3]
         );
+        if d.halts != 0 {
+            // The controller halted at least once; these are the register values
+            // at the first sighting, which is the only proof of WHY (HSE = DMA,
+            // HCE = internal error, RS cleared = software/firmware).
+            crate::fb_println!(
+                "  xhci halt: count={} usbcmd={:#010x} usbsts={:#010x}",
+                d.halts,
+                d.halt_cmd,
+                d.halt_sts
+            );
+            crate::kprintln!(
+                "xhci halt: count={} usbcmd={:#010x} usbsts={:#010x}",
+                d.halts,
+                d.halt_cmd,
+                d.halt_sts
+            );
+        }
     }
     // The same per-port enumeration rows the boot menu shows: if the operator
     // boots past the menu, this screen still carries the evidence.
     for row in crate::drivers::xhci::diagnostics().into_iter().take(8) {
         let (ccs, ped, pp, _, pls) = crate::drivers::xhci::decode_portsc(row.portsc);
         crate::fb_println!(
-            "  usb {:>2}: proto=usb{} ccs={} ped={} pp={} spd={} pls={} stage={} code={:#x} try={} pre={:#010x} post={:#010x} prc={} ped_seen={} ped_sc={:#010x}",
+            "  usb {:>2}: proto=usb{} ccs={} ped={} pp={} spd={} pls={} stage={} code={:#x} try={} ms={} pre={:#010x} post={:#010x} prc={} ped_seen={} ped_sc={:#010x}",
             row.port,
             row.proto,
             ccs as u8,
@@ -430,6 +466,7 @@ pub fn shell_main() -> ! {
             row.stage,
             row.code,
             row.attempts,
+            row.ms,
             row.pre,
             row.post,
             row.seen_prc as u8,

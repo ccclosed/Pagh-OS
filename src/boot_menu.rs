@@ -481,33 +481,24 @@ fn draw(rows: &[Row], selected: usize, typed: Option<&str>, message: Option<&str
         );
     }
     {
-        let ranges = crate::drivers::xhci::proto_ranges();
-        let text = |(first, count): (u8, u8)| {
-            if count == 0 {
-                alloc::string::String::from("-")
-            } else {
-                alloc::format!("{}-{}", first, first as u16 + count as u16 - 1)
-            }
-        };
+        // Masks, not ranges: see the note in the shell banner. This block used to
+        // be printed twice (a stale copy left by an edit), which is why the field
+        // photos show the same `xhci proto:` line twice.
+        let masks = crate::drivers::xhci::proto_masks();
         crate::fb_println!(
-            "  xhci proto: usb2={} usb3={}",
-            text(ranges[0]),
-            text(ranges[1])
+            "  xhci proto: usb2={:#010x} usb3={:#010x}",
+            masks[0],
+            masks[1]
         );
     }
-    {
-        let ranges = crate::drivers::xhci::proto_ranges();
-        let text = |(first, count): (u8, u8)| {
-            if count == 0 {
-                alloc::string::String::from("-")
-            } else {
-                alloc::format!("{}-{}", first, first as u16 + count as u16 - 1)
-            }
-        };
+    for cap in crate::drivers::xhci::xcaps().into_iter().take(6) {
         crate::fb_println!(
-            "  xhci proto: usb2={} usb3={}",
-            text(ranges[0]),
-            text(ranges[1])
+            "  xhci xcap {:#06x}: id={} next={:#04x} dw1={:#010x} dw2={:#010x}",
+            cap.offset,
+            cap.id,
+            cap.next,
+            cap.dw1,
+            cap.dw2
         );
     }
     if let Some(d) = crate::drivers::xhci::raw_dump() {
@@ -519,12 +510,14 @@ fn draw(rows: &[Row], selected: usize, typed: Option<&str>, message: Option<&str
             d.legacy
         );
         crate::fb_println!(
-            "  xhci op: caplen={:#x} usbcmd={:#010x} usbsts={:#010x} config={:#x} writes={}",
+            "  xhci op: caplen={:#x} usbcmd={:#010x} usbsts={:#010x} config={:#x} writes={} halts={} pci_cmd={:#06x}",
             d.caplength,
             d.usbcmd,
             d.usbsts,
             d.config,
-            if d.writes_ok { "ok" } else { "IGNORED" }
+            if d.writes_ok { "ok" } else { "IGNORED" },
+            d.halts,
+            d.pci_cmd
         );
         crate::fb_println!(
             "  xhci port {} regs: {:#010x} {:#010x} {:#010x} {:#010x}",
@@ -534,6 +527,23 @@ fn draw(rows: &[Row], selected: usize, typed: Option<&str>, message: Option<&str
             d.port_regs[2],
             d.port_regs[3]
         );
+        if d.halts != 0 {
+            // The controller halted at least once; these are the register values
+            // at the first sighting, which is the only proof of WHY (HSE = DMA,
+            // HCE = internal error, RS cleared = software/firmware).
+            crate::fb_println!(
+                "  xhci halt: count={} usbcmd={:#010x} usbsts={:#010x}",
+                d.halts,
+                d.halt_cmd,
+                d.halt_sts
+            );
+            crate::kprintln!(
+                "xhci halt: count={} usbcmd={:#010x} usbsts={:#010x}",
+                d.halts,
+                d.halt_cmd,
+                d.halt_sts
+            );
+        }
     }
     // Per-port enumeration state. A few short lines are the difference between
     // "the keyboard does not work" and knowing WHICH step failed, on a machine
@@ -541,7 +551,7 @@ fn draw(rows: &[Row], selected: usize, typed: Option<&str>, message: Option<&str
     for row in crate::drivers::xhci::diagnostics().into_iter().take(8) {
         let (ccs, ped, pp, _, pls) = crate::drivers::xhci::decode_portsc(row.portsc);
         crate::fb_println!(
-            "  usb {:>2}: proto=usb{} ccs={} ped={} pp={} spd={} pls={} stage={} code={:#x} try={} pre={:#010x} post={:#010x} prc={} ped_seen={} ped_sc={:#010x}",
+            "  usb {:>2}: proto=usb{} ccs={} ped={} pp={} spd={} pls={} stage={} code={:#x} try={} ms={} pre={:#010x} post={:#010x} prc={} ped_seen={} ped_sc={:#010x}",
             row.port,
             row.proto,
             ccs as u8,
@@ -552,6 +562,7 @@ fn draw(rows: &[Row], selected: usize, typed: Option<&str>, message: Option<&str
             row.stage,
             row.code,
             row.attempts,
+            row.ms,
             row.pre,
             row.post,
             row.seen_prc as u8,
