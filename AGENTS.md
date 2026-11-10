@@ -234,16 +234,38 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   be reflected here. **`main` currently reads 2.17.0** (the batch open with the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
-  **2.17.0** = a peer that answers and closes in one burst now completes
-  `connect(2)`: the completion test is `ever_established` (the handshake
-  happened), not `state == Established` (a window a reply+FIN skips straight
-  through), and `tools/e2e.py tcp-shot` pins that down; the VT emulator and the
-  text console share one coordinate system (cell `(col,row)` is
-  `row*CHAR_HEIGHT`, no status-bar offset) and hand the cursor over in both
-  directions inside the spawn's `without_interrupts` window, so `lxrun` no
-  longer clears the screen black and no longer marches the prompt downwards;
-  `ps` lists kernel threads (`[shell]`, `[net]`, …) and `df` reports the bytes a
-  ramfs is holding.
+  **2.17.0** = the batch that made pagh run on real hardware, plus three
+  long-standing display/network defects:
+  * a peer that answers and closes in one burst now completes `connect(2)`: the
+    completion test is `ever_established` (the handshake happened), not
+    `state == Established`, a window a reply+FIN skips straight through — this
+    is what made the clipboard bridge work once and then fail. `tools/e2e.py
+    tcp-shot` pins it down with a negative control;
+  * the VT emulator and the text console share one coordinate system (cell
+    `(col,row)` is `row*CHAR_HEIGHT`, no status-bar offset) and hand the cursor
+    over in both directions inside the spawn's `without_interrupts` window, so
+    `lxrun` no longer clears the screen black and no longer marches the prompt
+    downwards;
+  * `ps` lists kernel threads (`[shell]`, `[net]`, `[usb]`, …) and `df` reports
+    the bytes a ramfs is holding;
+  * `disk` gives the operator a way to choose a block device, format it ext2 and
+    mount it at `/mnt` (the boot path still refuses to erase anything on its
+    own), and a disk image can travel on the boot medium as a RAM disk
+    (`drivers::memdisk`, first `*.img` Limine module) — which is what makes a
+    machine with no supported drive usable at all;
+  * USB input: `drivers::xhci` drives an xHCI controller itself (polled, in the
+    `usb` thread) and `drivers::usb_hid` translates boot-protocol reports into
+    the same PS/2 scancode stream every consumer already reads. Controller
+    bring-up and the translation are verified; **device enumeration is not** —
+    see the input-device gap below;
+  * `drivers::earlyfb` — an emergency console that draws straight into the
+    Limine framebuffer with no allocator and no locks, so a failure before the
+    real console (or a panic) is visible on a machine with no serial port
+    instead of leaving a black screen; boot prints its steps and erases them at
+    handoff;
+  * `tools/mkimage.py` builds both artifacts people actually boot: a GPT+ESP USB
+    image and a **BIOS+UEFI** ISO (Limine's own CD loaders), each carrying
+    `disk.img`; the ISO is verified in both firmware modes.
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
   `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real
