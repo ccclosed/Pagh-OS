@@ -49,6 +49,12 @@ struct DmaFrame {
     virt: usize,
 }
 
+impl Drop for DmaFrame {
+    fn drop(&mut self) {
+        crate::memory::pmm::free_frame(self.phys);
+    }
+}
+
 impl DmaFrame {
     fn new_zeroed(what: &str) -> Option<Self> {
         let phys = pmm::alloc_frame()?;
@@ -116,6 +122,7 @@ const TRB_DATA: u8 = 3;
 const TRB_STATUS: u8 = 4;
 const TRB_LINK: u8 = 6;
 const TRB_ENABLE_SLOT: u8 = 9;
+const TRB_DISABLE_SLOT: u8 = 10;
 const TRB_ADDRESS_DEVICE: u8 = 11;
 const TRB_CONFIGURE_ENDPOINT: u8 = 12;
 const TRB_EVALUATE_CONTEXT: u8 = 13;
@@ -976,7 +983,7 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
     // Give the PHYs a moment to settle before the first port reset: the firmware
     // left these links in some state and USB2 wants ~100 ms after a controller
     // reset. QEMU is instant, hardware is not.
-    spin_settle(4_000_000);
+    spin_settle(10_000_000);
     // Port state at bring-up, at debug level: which ports have a device attached,
     // whether they are powered and at what speed is the first thing to look at
     // when enumeration does not happen.
@@ -1249,11 +1256,11 @@ fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
         // where the PHY needs the extra settling time.
         let cur = rd32(ctrl.op, off);
         wr32(ctrl.op, off, cur & !PORTSC_PP);
-        spin_settle(1_500_000);
+        spin_settle(600_000);
         let cur = rd32(ctrl.op, off);
         wr32(ctrl.op, off, (cur & !PORTSC_RW1C) | PORTSC_PP);
         spin_until(|| rd32(ctrl.op, off) & PORTSC_PP != 0, 500_000);
-        spin_settle(1_500_000);
+        spin_settle(2_000_000);
         let sc = rd32(ctrl.op, off);
         wr32(
             ctrl.op,
@@ -1764,6 +1771,47 @@ fn configure_hid_endpoint(ctrl: &mut Controller, slot_index: usize, iface: &HidI
 /// Enumerate the device on `port`, returning true when a HID interface was
 /// configured. Logs what it found either way.
 fn enumerate_with_speed(ctrl: &mut Controller, port: u8, speed: u8) -> bool {
+    let Some(slot_index) = enable_slot(ctrl) else {
+        ctrl.fail(port, "enable-slot", 0);
+        return false;
+    };
+    ctrl.slots[slot_index].port = port;
+    ctrl.slots[slot_index].speed = speed;
+    let ok = enumerate_slot(ctrl, slot_index, port, speed);
+    if !ok {
+        // A failed enumeration must NOT leave the slot behind: the poll loop skips
+        // any port whose slot exists (so the retry would never run), and the
+        // controller only has 64 slots in total.
+        release_slot(ctrl, slot_index);
+    }
+    ok
+}
+
+/// Disable a slot the controller gave us and drop its bookkeeping.
+fn release_slot(ctrl: &mut Controller, slot_index: usize) {
+    let Some(slot) = ctrl.slots.get(slot_index) else {
+        return;
+    };
+    let slot_id = slot.id;
+    let _ = command(
+        ctrl,
+        0,
+        0,
+        0,
+        ((TRB_DISABLE_SLOT as u32) << 10) | ((slot_id as u32) << 24),
+    );
+    // Clear the DCBAA entry so a later slot id cannot alias the old context.
+    // SAFETY: DCBAA is our own frame and `slot_id` was handed out by the controller.
+    unsafe {
+        let entry =
+            (crate::memory::vmm::phys_to_virt(ctrl.dcbaa_phys) as *mut u64).add(slot_id as usize);
+        write_volatile(entry, 0);
+    }
+    ctrl.slots.remove(slot_index);
+}
+
+/// Everything after Enable Slot: address, descriptors, configuration, HID endpoint.
+fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8) -> bool {
     let speed_name = match speed {
         SPEED_LOW => "low",
         SPEED_FULL => "full",
@@ -1771,12 +1819,6 @@ fn enumerate_with_speed(ctrl: &mut Controller, port: u8, speed: u8) -> bool {
         SPEED_SUPER => "super",
         _ => "?",
     };
-    let Some(slot_index) = enable_slot(ctrl) else {
-        ctrl.fail(port, "enable-slot", 0);
-        return false;
-    };
-    ctrl.slots[slot_index].port = port;
-    ctrl.slots[slot_index].speed = speed;
     if !address_device(ctrl, slot_index, port, speed) {
         return false;
     }
@@ -1938,6 +1980,11 @@ pub fn poll() {
             }
             let sc = rd32(ctrl.op, portsc(port));
             let no_device_yet = sc & PORTSC_CCS == 0;
+            // A port is retried FOREVER (with backoff) until a HID device works on
+            // it. The field machine enabled a device and lost it on every attempt,
+            // and firmware-settling bugs on PCH USB2 PHYs are known to clear up
+            // after the controller has been running for a while — a bounded retry
+            // would have given up exactly before that.`
             // A port with nothing on it is retried forever, slowly: a USB2 port can
             // lose connect status across a controller reset and recover it later
             // (the field machine lost port 26 exactly that way). Every 8th retry
@@ -1957,23 +2004,20 @@ pub fn poll() {
                 }
                 continue;
             }
-            if attempts >= 12 {
-                ctrl.brought_up.push(port);
-                continue;
-            }
             if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
-                d.attempts += 1;
+                d.attempts = d.attempts.saturating_add(1);
             }
             if let Some(speed) = reset_port(ctrl, port) {
                 if enumerate_with_speed(ctrl, port, speed) {
                     ctrl.devices += 1;
                     ctrl.brought_up.push(port);
                 } else if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
-                    // Give the next attempt breathing room before resetting again.
-                    d.retry_in = (20 + d.attempts.saturating_mul(8)).min(120);
+                    // Exponential backoff: the first tries are quick (settling), the
+                    // later ones slow enough not to burn the CPU (every few seconds).
+                    d.retry_in = d.retry_in.saturating_mul(2).max(60).min(250);
                 }
             } else if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
-                d.retry_in = 20;
+                d.retry_in = d.retry_in.saturating_mul(2).max(40).min(250);
             }
             continue;
         }

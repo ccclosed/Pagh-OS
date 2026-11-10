@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.18.8** (the batch open with the
+  be reflected here. **`main` currently reads 2.18.9** (the batch open with the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
   **2.17.0** = the batch that made pagh run on real hardware, plus three
@@ -409,6 +409,17 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   shows `attached before reset` versus `now` with the lost port list; ports with no
   device are retried forever at a slow rate and power-cycled every eighth retry
   instead of being dropped after twelve.
+  **2.18.9** = retries that outlive the settle. Two consequences of the 2.18.8
+  work are fixed here: a failed enumeration used to leave its xHCI slot enabled,
+  and the poll loop skips any port that has a slot — so a retry could never happen
+  again for the ports that got furthest (the driver now sends Disable Slot, clears
+  the DCBAA entry and drops the slot's rings, whose DMA pages are freed by a Drop
+  impl); and ports are now retried FOREVER with exponential backoff instead of a
+  bounded count, because a PCH USB2 PHY settling after `HCRST` can take seconds and
+  a retry loop that gives up in the first second would never see it. The settle
+  after the controller reset is longer for the same reason, and the power-cycle
+  fallback keeps its own pacing. Measured cost of one failing attempt is kept in
+  the tens of milliseconds so the post-boot retry does not burn the CPU.
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
   `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real
