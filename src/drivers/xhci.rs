@@ -247,6 +247,28 @@ const OP_DCBAAP: usize = 0x30;
 const OP_CONFIG: usize = 0x38;
 const OP_PORTS: usize = 0x400;
 
+/// Bytes between neighbouring port register sets.
+///
+/// Each port has four 32-bit registers (PORTSC, PORTPMSC, PORTLI, PORTHLPMC), so
+/// the stride is 16 — this used to be 4, which made ports 2..=8 read and write
+/// their neighbours' registers (the "5th port" was really the 2nd port's PORTSC).
+/// The consequence was that a device on a USB2 port was never seen: QEMU puts its
+/// emulated keyboard on port 5 of 8, so the whole enumeration path never ran.
+const OP_PORT_STRIDE: usize = 0x10;
+
+/// PORTSC register offset for a 1-based port number.
+///
+/// The arithmetic is pinned by a const assertion below, because this is exactly the
+/// kind of constant that is invisible until hardware shows up.
+const fn portsc(port: u8) -> usize {
+    OP_PORTS + (port as usize - 1) * OP_PORT_STRIDE
+}
+
+// Port 1 is at 0x400 and each port takes 16 bytes: port 5 (the first USB2 port on
+// a 4+4 controller) is at 0x440.
+const _: () = assert!(portsc(1) == 0x400);
+const _: () = assert!(portsc(5) == 0x440);
+
 const USBCMD_RS: u32 = 1 << 0;
 const USBCMD_HCRST: u32 = 1 << 1;
 const USBSTS_HCH: u32 = 1 << 0;
@@ -428,7 +450,7 @@ pub fn init(devices: &[PciDevice]) -> bool {
     // brought devices up, and comparing this with the post-reset state is what
     // told us whether a reset (rather than our port handling) was losing them.
     for port in 1..=ports {
-        let sc = rd32(op, OP_PORTS + (port as usize - 1) * 4);
+        let sc = rd32(op, portsc(port));
         if sc != 0 {
             crate::debug!("xhci: pre-reset port {} PORTSC={:#010x}", port, sc);
         }
@@ -503,7 +525,7 @@ pub fn init(devices: &[PciDevice]) -> bool {
     // whether they are powered and at what speed is the first thing to look at
     // when enumeration does not happen.
     for port in 1..=ports {
-        let sc = rd32(op, OP_PORTS + (port as usize - 1) * 4);
+        let sc = rd32(op, portsc(port));
         crate::debug!(
             "xhci: port {} PORTSC={:#010x} ccs={} ped={} pp={} speed={} pls={}",
             port,
@@ -609,27 +631,50 @@ fn ctx_addr(phys: u64) -> (u32, u32) {
 /// reports `CCS=0` until the reset sequence runs, so a "detect then reset" loop
 /// never detects anything. Power, reset, then read.
 fn reset_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
-    let off = OP_PORTS + (port as usize - 1) * 4;
-    let sc = rd32(ctrl.op, off);
+    let off = portsc(port);
+    let mut sc = rd32(ctrl.op, off);
     if sc & PORTSC_PP == 0 {
         wr32(ctrl.op, off, (sc & !PORTSC_RW1C) | PORTSC_PP);
         if !spin_until(|| rd32(ctrl.op, off) & PORTSC_PP != 0, 100_000) {
             return None;
         }
+        sc = rd32(ctrl.op, off);
     }
+    // Look at the connect status BEFORE resetting. A port with nothing on it never
+    // reports a reset completion, so the old order — always reset, then spin for
+    // PRC — made every empty port burn a full spin budget on every call. That is
+    // what turned the menu's keyboard poll into a CPU hog once a controller was
+    // present (each poll reset eight ports and waited on seven of them).
+    if sc & PORTSC_CCS == 0 {
+        if sc & PORTSC_CSC != 0 {
+            wr32(ctrl.op, off, (sc & !PORTSC_RW1C) | PORTSC_CSC);
+        }
+        return None;
+    }
+    // Consume stale change bits (the controller sets CSC on every port at reset)
+    // so the PRC below is the reset's own.
+    wr32(
+        ctrl.op,
+        off,
+        (sc & !PORTSC_RW1C) | PORTSC_CSC | PORTSC_PRC | PORTSC_WRC,
+    );
     let sc = rd32(ctrl.op, off);
     wr32(ctrl.op, off, (sc & !PORTSC_RW1C) | PORTSC_PR);
     if !spin_until(
         || rd32(ctrl.op, off) & (PORTSC_PRC | PORTSC_WPR) != 0,
-        1_000_000,
+        200_000,
     ) {
-        // An empty port may simply never report a reset completion; that is not
-        // an error worth a warning line per poll pass.
+        // A device that is connected but does not complete the reset (a broken
+        // cable, a hub, a port we cannot drive) must not hang the caller.
         crate::debug!("xhci: port {} reset not completed", port);
         return None;
     }
     let cur = rd32(ctrl.op, off);
-    wr32(ctrl.op, off, (cur & !PORTSC_RW1C) | PORTSC_PRC | PORTSC_WRC);
+    wr32(
+        ctrl.op,
+        off,
+        (cur & !PORTSC_RW1C) | PORTSC_PRC | PORTSC_WRC | PORTSC_CSC,
+    );
     let cur = rd32(ctrl.op, off);
     if cur & PORTSC_CCS == 0 {
         return None;
@@ -704,6 +749,56 @@ fn control_in(
     result
 }
 
+/// Run a control transfer with NO data stage (a standard OUT request).
+///
+/// WHY THIS EXISTS: enumeration used to go straight from GET_DESCRIPTOR to the
+/// xHCI Configure Endpoint command, never sending USB SET_CONFIGURATION. The
+/// device therefore stayed unconfigured, its interrupt endpoint answered STALL,
+/// and the report path read `cc=6` (stall) forever — a keyboard that enumerates
+/// but never types.
+fn control_no_data(
+    ctrl: &mut Controller,
+    slot_index: usize,
+    request_type: u8,
+    request: u8,
+    value: u16,
+    index: u16,
+) -> bool {
+    let slot_id = {
+        let Some(slot) = ctrl.slots.get_mut(slot_index) else {
+            return false;
+        };
+        let dw0 = request_type as u32 | ((request as u32) << 8) | ((value as u32) << 16);
+        let dw1 = index as u32;
+        let dw3 = ((TRB_SETUP as u32) << 10) | TRB_IDT | TRT_NO_DATA;
+        // The Setup TRB's status field is the transfer length of the SETUP PACKET,
+        // which is always 8 — even for a request with no data stage (the stage is
+        // signalled by TRT=0 instead). Writing 0 here made the controller reject
+        // the whole transfer before the device ever saw it.
+        slot.ep0.push(dw0, dw1, 8, dw3);
+        // Status stage: for a transfer without a data stage the status is IN.
+        slot.ep0
+            .push(0, 0, 0, ((TRB_STATUS as u32) << 10) | TRB_DIR_IN | TRB_IOC);
+        slot.id
+    };
+    ring_doorbell(ctrl, slot_id, 1);
+    for _ in 0..8 {
+        let Some(ev) = next_event(ctrl, 1_000_000) else {
+            return false;
+        };
+        if ev.trb_type() != TRB_TRANSFER_EVENT || ev.endpoint_id() != 1 {
+            continue;
+        }
+        let cc = ev.completion_code();
+        if cc == CC_SUCCESS || cc == CC_SHORT_PACKET {
+            return true;
+        }
+        crate::warn!("xhci: control request {:#04x} failed: cc={}", request, cc);
+        return false;
+    }
+    false
+}
+
 /// Read a descriptor: `kind` is the descriptor type, `index` its index.
 fn get_descriptor(
     ctrl: &mut Controller,
@@ -767,6 +862,7 @@ fn address_device(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
         return false;
     };
     let input = slot.input_ctx.virt();
+    let input_phys = slot.input_ctx.phys();
     let ep0_phys = slot.ep0.base_phys();
     let device_ctx_phys = slot.device_ctx.phys();
     let slot_id = slot.id;
@@ -787,19 +883,31 @@ fn address_device(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
             (1 << SLOT_CTX_ENTRIES_SHIFT) | ((speed as u32) << SLOT_CTX_SPEED_SHIFT),
         );
         write_volatile(slot_ctx.add(1), (port as u32) << SLOT_CTX_PORT_SHIFT);
-        // EP0 context: CErr=3, control type, max packet, DCS + ring pointer.
+        // EP0 context. DWORD 0 carries only the interval (0 for a control
+        // endpoint); CErr, the endpoint type and the max packet size live in
+        // DWORD 1. This layout matters: the first version put CErr and the max
+        // packet in DWORD 0, which put the packet size in the interval field and
+        // left EP info 2 empty — control transfers survived on the device's own
+        // EP0 defaults, which is exactly why the mistake stayed invisible until
+        // an interrupt endpoint had to be configured.
         let ep_ctx = (input + ctx_size * 2) as *mut u32;
+        write_volatile(ep_ctx, 0);
         write_volatile(
-            ep_ctx,
-            (3 << EP_CTX_CERR_SHIFT) | ((max_packet) << EP_CTX_MAX_PACKET_SHIFT),
+            ep_ctx.add(1),
+            (3 << EP_CTX_CERR_SHIFT)
+                | ((EP_TYPE_CONTROL) << EP_CTX_EP_TYPE_SHIFT)
+                | ((max_packet) << EP_CTX_MAX_PACKET_SHIFT),
         );
-        write_volatile(ep_ctx.add(1), ((EP_TYPE_CONTROL) << EP_CTX_EP_TYPE_SHIFT));
         write_volatile(ep_ctx.add(2), (ep0_phys | 1) as u32);
         write_volatile(ep_ctx.add(3), (ep0_phys >> 32) as u32);
     }
     let _ = device_ctx_phys;
 
-    let (a0, a1) = ctx_addr(input as u64);
+    // The TRB parameter is a GUEST-PHYSICAL address; `input` is the HHDM virtual
+    // one. Handing the controller the virtual address made it read unrelated
+    // memory and reject the command with a TRB error (cc=5) — the second half of
+    // why enumeration had never worked.
+    let (a0, a1) = ctx_addr(input_phys);
     let ev = command(
         ctrl,
         a0,
@@ -819,6 +927,7 @@ fn address_device(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
 
 /// Parsed configuration descriptor: the HID interface and its IN endpoint.
 struct HidIface {
+    config_value: u8,
     interface: u8,
     subclass: u8,
     protocol: u8,
@@ -830,6 +939,8 @@ struct HidIface {
 /// Walk the configuration descriptor looking for a HID interface with an
 /// interrupt-IN endpoint.
 fn parse_config(conf: &[u8]) -> Option<HidIface> {
+    // bConfigurationValue is what SET_CONFIGURATION takes (offset 5).
+    let config_value = *conf.get(5)?;
     let mut i = 0usize;
     let mut current: Option<(u8, u8, u8)> = None;
     while i + 2 <= conf.len() {
@@ -856,6 +967,7 @@ fn parse_config(conf: &[u8]) -> Option<HidIface> {
             let attrs = conf[i + 3];
             if attrs & 0x03 == 3 && addr & 0x80 != 0 {
                 return Some(HidIface {
+                    config_value,
                     interface: number,
                     subclass,
                     protocol,
@@ -880,13 +992,15 @@ fn configure_hid_endpoint(ctrl: &mut Controller, slot_index: usize, iface: &HidI
     let Some(buf) = DmaFrame::new_zeroed("hid buffer") else {
         return false;
     };
-    let (input, ring_phys, buf_phys, slot_id, max_packet, interval) = {
+    let (input, input_phys, ring_phys, buf_phys, slot_id, speed, max_packet, interval) = {
         let slot = &mut ctrl.slots[slot_index];
         (
             slot.input_ctx.virt(),
+            slot.input_ctx.phys(),
             ring.base_phys(),
             buf.phys(),
             slot.id,
+            slot.speed,
             iface.max_packet as u32,
             iface.interval,
         )
@@ -901,20 +1015,26 @@ fn configure_hid_endpoint(ctrl: &mut Controller, slot_index: usize, iface: &HidI
         let slot_ctx = p.add(8) as *mut u32;
         write_volatile(slot_ctx, (dci as u32) << SLOT_CTX_ENTRIES_SHIFT);
         let ep_ctx = (input + ctx_size * (1 + dci as usize)) as *mut u32;
-        let interval_field = (interval as u32) << EP_CTX_INTERVAL_SHIFT;
+        // xHCI stores the polling interval as log2(microframes) for high/super
+        // speed devices (so USB bInterval=1 is field 0) and as the frame count for
+        // full/low speed. Writing bInterval raw gave an interval of 2^bInterval.
+        let interval_field: u32 = if speed == SPEED_HIGH || speed == SPEED_SUPER {
+            (interval.saturating_sub(1) & 0x0F) as u32
+        } else {
+            (interval & 0x0F) as u32
+        };
+        write_volatile(ep_ctx, interval_field << EP_CTX_INTERVAL_SHIFT);
         write_volatile(
-            ep_ctx,
+            ep_ctx.add(1),
             (3 << EP_CTX_CERR_SHIFT)
                 | (EP_TYPE_INTERRUPT_IN << EP_CTX_EP_TYPE_SHIFT)
-                | (max_packet << EP_CTX_MAX_PACKET_SHIFT)
-                | interval_field,
+                | (max_packet << EP_CTX_MAX_PACKET_SHIFT),
         );
-        // Average TRB length for an interrupt endpoint: the report size.
-        write_volatile(ep_ctx.add(1), 8);
         write_volatile(ep_ctx.add(2), (ring_phys | 1) as u32);
         write_volatile(ep_ctx.add(3), (ring_phys >> 32) as u32);
     }
-    let (a0, a1) = ctx_addr(input as u64);
+    // Physical address: see the same note in `address_device`.
+    let (a0, a1) = ctx_addr(input_phys);
     let ev = command(
         ctrl,
         a0,
@@ -1012,6 +1132,19 @@ fn enumerate_with_speed(ctrl: &mut Controller, port: u8, speed: u8) -> bool {
         );
         return false;
     };
+    // SET_CONFIGURATION activates the interface (without it the HID endpoint
+    // stalls), SET_PROTOCOL(1) selects the boot report layout this driver parses,
+    // and SET_IDLE(0) stops the device NAKing reports when nothing changes.
+    if !control_no_data(ctrl, slot_index, 0x00, 9, iface.config_value as u16, 0) {
+        crate::warn!("xhci: port {}: SET_CONFIGURATION failed", port);
+        return false;
+    }
+    if !control_no_data(ctrl, slot_index, 0x21, 0x0B, 1, iface.interface as u16) {
+        crate::warn!("xhci: port {}: SET_PROTOCOL(boot) failed", port);
+    }
+    if !control_no_data(ctrl, slot_index, 0x21, 0x0A, 0, iface.interface as u16) {
+        crate::warn!("xhci: port {}: SET_IDLE failed", port);
+    }
     if !configure_hid_endpoint(ctrl, slot_index, &iface) {
         return false;
     }
@@ -1035,12 +1168,10 @@ pub fn poll() {
     let Some(ctrl) = guard.as_mut() else {
         return;
     };
-    // 1. Bring up every port once (power + reset), then enumerate what appeared.
-    //
-    //    A port is reset even when it looks empty: connect status only becomes
-    //    visible after the reset sequence, so "skip ports without a device" is a
-    //    loop that can never find one. Ports are brought up exactly once, so the
-    //    cost is per boot, not per poll.
+    // 1. Bring up every port once (power, connect check, reset), then enumerate
+    //    what appeared. `reset_port` reads the connect status before resetting, so
+    //    an empty port costs one register read instead of a reset timeout. Ports
+    //    are brought up exactly once, so the cost is per boot, not per poll.
     for port in 1..=ctrl.ports {
         if ctrl.slots.iter().any(|s| s.port == port) {
             continue;
@@ -1059,7 +1190,7 @@ pub fn poll() {
         }
         // A device plugged in later shows up as a change on an already reset
         // port: reset it again to bring the new device up.
-        let off = OP_PORTS + (port as usize - 1) * 4;
+        let off = portsc(port);
         let sc = rd32(ctrl.op, off);
         if sc & PORTSC_CSC != 0 {
             wr32(ctrl.op, off, (sc & !PORTSC_RW1C) | PORTSC_CSC);
@@ -1077,7 +1208,7 @@ pub fn poll() {
     if !ctrl.logged_ports && ctrl.brought_up.len() >= ctrl.ports as usize {
         ctrl.logged_ports = true;
         for port in 1..=ctrl.ports {
-            let sc = rd32(ctrl.op, OP_PORTS + (port as usize - 1) * 4);
+            let sc = rd32(ctrl.op, portsc(port));
             if sc != 0 {
                 crate::info!(
                     "xhci: port {} after bring-up PORTSC={:#010x} ccs={} ped={} pp={} speed={} pls={}",
@@ -1124,7 +1255,7 @@ pub fn poll() {
         // Collect a completion if one is waiting.
         let mut events = 0;
         while events < 4 {
-            let Some(ev) = next_event(ctrl, 50_000) else {
+            let Some(ev) = next_event(ctrl, 0) else {
                 break;
             };
             if ev.trb_type() != TRB_TRANSFER_EVENT || ev.endpoint_id() != dci {
@@ -1144,6 +1275,17 @@ pub fn poll() {
                     crate::drivers::usb_hid::feed(report, hid.protocol);
                     ctrl.reports += 1;
                 }
+            } else {
+                // A stalled or overrun endpoint cannot be fixed by re-arming it;
+                // re-arming is what turns one bad context into a thousand events a
+                // second. Say so once and stop listening on this device.
+                crate::warn!(
+                    "xhci: HID endpoint (DCI {}) gave up: cc={}; input from it is off until reboot",
+                    dci,
+                    cc
+                );
+                ctrl.slots[index].hid = None;
+                break;
             }
         }
     }
@@ -1179,7 +1321,7 @@ pub fn port_status() -> Vec<(u8, u32)> {
     };
     (1..=ctrl.ports)
         .map(|port| {
-            let sc = rd32(ctrl.op, OP_PORTS + (port as usize - 1) * 4);
+            let sc = rd32(ctrl.op, portsc(port));
             (port, sc)
         })
         .collect()

@@ -203,8 +203,10 @@ pub fn run(partitions: &[(Arc<dyn BlockDevice>, PartitionContent)]) -> Choice {
 ///
 /// PS/2 is still polled afterwards, for free: machines that do have it work
 /// without any USB at all.
-fn poll_key() -> Option<u8> {
-    crate::drivers::xhci::poll();
+fn poll_key(usb: bool) -> Option<u8> {
+    if usb {
+        crate::drivers::xhci::poll();
+    }
     if let Some(byte) = crate::drivers::ps2_kbd::take_scancode() {
         return Some(byte);
     }
@@ -251,7 +253,12 @@ fn wait_ms_polling(ms: u32, decoder: &mut Decoder) -> Vec<KeyEvent> {
 
             let mut spins = 0u32;
             loop {
-                if let Some(byte) = poll_key() {
+                // The xHCI poll costs MMIO reads and a report-ring walk, so it is
+                // throttled: the PS/2 status port is polled every spin, USB every
+                // 256 spins (a fraction of a millisecond). Polling the controller
+                // at the spin rate made the countdown far slower than real time.
+                let usb = spins % 256 == 0;
+                if let Some(byte) = poll_key(usb) {
                     if let Some(event) = decoder.feed(byte) {
                         events.push(event);
                     }
