@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.18.1** (the batch open with the
+  be reflected here. **`main` currently reads 2.18.2** (the batch open with the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
   **2.17.0** = the batch that made pagh run on real hardware, plus three
@@ -319,6 +319,19 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   (a latent overflow the partition code's extra call depth turned into a page fault on
   BIOS boots); and the boot menu first rendered half its text in Cyrillic, which the
   kernel font does not cover — its UI is ASCII.
+  **2.18.2** = USB input that actually works. The xHCI driver had never run its
+  enumeration path, and the reason was a chain of four defects: xHCI port
+  registers were addressed with a 4-byte stride instead of 16 (so "port 5" was
+  really port 2's PORTSC, and QEMU's keyboard is on port 5 of 8); Address Device
+  was handed the HDM-virtual address of the input context instead of its physical
+  one; SET_CONFIGURATION was never sent, leaving the HID endpoint stalled; and the
+  endpoint context put CErr and MaxPacket in the wrong dword and the polling
+  interval in raw form, so the interrupt-IN endpoint was configured as ISO OUT with
+  a zero packet size. With those fixed, an emulated USB keyboard enumerates,
+  reports, and types into both the shell and the boot menu (arrows/Enter/Esc
+  included). Two performance fixes came with it: the report poll no longer spins
+  50 000 iterations per empty poll, and the boot menu polls the controller once per
+  256 spin steps — the old busy-wait could stretch boot into minutes under TCG.
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
   `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real
@@ -444,16 +457,17 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   returns `EINTR` instead of being restarted after `SIGCONT`, and `TOSTOP`
   defaults ON where Linux defaults it off.
 
-- Input devices: PS/2 keyboard/mouse (IRQ1/IRQ12) and, as of this batch, USB HID
-  through an xHCI controller the kernel drives itself (`drivers::xhci`,
-  `drivers::usb_hid`, polled from the `usb` thread). The HID translation is
-  covered by six in-QEMU routines. **Not verified: device enumeration** — QEMU's
-  emulated controller never reports a connected device, so the port→slot→address
-  →descriptor→endpoint path has never actually run; the shell's `usb` command
-  exists to diagnose that on real hardware. Not implemented anywhere: hubs
-  (root ports only), isochronous transfers, hot-unplug teardown, and USB mass
-  storage — which is why the boot medium's disk image is mounted as a RAM disk
-  rather than read from the stick.
+- Input devices: PS/2 keyboard/mouse (IRQ1/IRQ12) and USB HID through an xHCI
+  controller the kernel drives itself (`drivers::xhci`, `drivers::usb_hid`, polled
+  from the `usb` thread and directly from the boot menu). The whole path is
+  verified in QEMU with an emulated controller and keyboard: port detection, Enable
+  Slot, Address Device, descriptors, SET_CONFIGURATION, boot protocol, interrupt-IN
+  reports, and typed text reaching both the shell and the boot menu. Four real bugs
+  sat between "code written" and "code runs", all fixed in 2.18.2 — see the release
+  note. **Not verified: real hardware** (the next field test runs it); not
+  implemented anywhere: hubs (root ports only), isochronous transfers, slot
+  teardown on unplug, and USB mass storage — which is why the boot medium's disk
+  image is mounted as a RAM disk rather than read from the stick.
 
 - NVMe driver is polled (no IRQs) with multi-page PRP lists and four commands in
   flight; FLUSH (opcode 0x00) is issued at WAL transaction boundaries. Still
