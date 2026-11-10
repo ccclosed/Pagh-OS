@@ -106,6 +106,34 @@ def key_name(ch: str) -> str:
     raise SystemExit(f"error: no key mapping for {ch!r} (extend KEY_NAMES)")
 
 
+# Keys with no character of their own, as QEMU spells them. `send_keys` types TEXT
+# (one sendkey per character), so "down" there really types d-o-w-n — the arrows,
+# Enter, Escape, Tab, Backspace and the function keys need `Monitor.send_key`.
+NAMED_KEYS = {
+    "esc",
+    "ret",
+    "tab",
+    "backspace",
+    "spc",
+    "up",
+    "down",
+    "left",
+    "right",
+    "home",
+    "end",
+    "insert",
+    "delete",
+    "pgup",
+    "pgdn",
+    "caps_lock",
+    "num_lock",
+    "scroll_lock",
+    "print",
+    "pause",
+    *[f"f{n}" for n in range(1, 13)],
+}
+
+
 class Monitor:
     """Minimal QEMU monitor client (unix socket, or ``tcp:host:port``)."""
 
@@ -176,6 +204,27 @@ class Monitor:
             cmd = f"sendkey {key_name(ch)}"
             self._check(self.command(cmd), cmd)
             time.sleep(delay)
+
+    def send_key(self, name: str, delay: float = 0.12) -> None:
+        """Press one key named the way QEMU names it (``down``, ``ret``, ``esc``).
+
+        `send_keys` types text: it sends one QEMU key per character, so
+        ``send_keys("down")`` types the four letters d-o-w-n rather than pressing
+        the Down arrow. Anything without a character of its own — arrows, Enter,
+        Escape, Tab, function keys — goes through this method instead; a single
+        character is accepted too, so ``send_key("f")`` and ``send_keys("f")`` mean
+        the same thing.
+        """
+        if len(name) == 1:
+            cmd = f"sendkey {key_name(name)}"
+        elif name in NAMED_KEYS:
+            cmd = f"sendkey {name}"
+        else:
+            raise SystemExit(
+                f"error: unknown key name {name!r} — use one character or one of {sorted(NAMED_KEYS)}"
+            )
+        self._check(self.command(cmd), cmd)
+        time.sleep(delay)
 
     def screendump(self, path: pathlib.Path) -> None:
         """Capture the guest framebuffer to `path` (PNG).
@@ -306,6 +355,12 @@ def main() -> int:
     p.add_argument("--out", default="/tmp/pagh_shot.png", help="screenshot path (PNG; replaced only by a successful dump)")
     p.add_argument("--keys", default="", help="text to type before the screenshot, e.g. 'selftest\\n'")
     p.add_argument(
+        "--key",
+        action="append",
+        default=[],
+        help="named key to press after --keys (repeatable): down, ret, esc, f1 …",
+    )
+    p.add_argument(
         "--answer-n",
         action="store_true",
         help="answer the legacy first-boot base-package Y/n question with 'n' (no-op on "
@@ -345,6 +400,9 @@ def main() -> int:
             keys = decode_keys(args.keys)
             print(f"typing {keys!r}", file=sys.stderr)
             mon.send_keys(keys)
+        for key in args.key:
+            print(f"pressing {key}", file=sys.stderr)
+            mon.send_key(key)
         if args.settle:
             time.sleep(args.settle)
 
