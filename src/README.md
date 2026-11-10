@@ -27,8 +27,8 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
 - Атрибуты: `no_std`, `no_main`, фичи (`abi_x86_interrupt`, `allocator_api`,
   `custom_test_frameworks`, `sync_unsafe_cell`); `#![test_runner]` — пустой стаб,
   реальный харнесс — `test::run_all()` из shell.
-- Дерево модулей: `arch, boot, debug, drivers, fs, log, memory, net, pkg, provision,
-  security, shell, sync, task, test, vfs`; `selftest_lx` — под feature-гейтами
+- Дерево модулей: `arch, boot, boot_menu, debug, drivers, fs, log, memory, net, pkg,
+  provision, security, shell, sync, task, test, vfs`; `selftest_lx` — под feature-гейтами
   (`lx_selftest`/`lx_livetest`/`lx_bigindex`/`lx_tlsbig`).
 - Limine-запросы в секции `.requests`: `BASE_REVISION` (rev 2), `HHDM_REQUEST`,
   `MEMMAP_REQUEST`, `KERNEL_ADDR_REQUEST`, `FRAMEBUFFER_REQUEST`, `RSDP_REQUEST`.
@@ -52,10 +52,17 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
 10. `scheduler::init`, `vfs::init` (монтирует `/dev`, ramfs `/tmp` и синтетический
     `/proc` — issue #11; содержимое `/proc` рендерится лениво, поэтому порядок
     boot-фаз не меняется, но к этому моменту уже готовы PMM, heap и тик-клок).
-11. `init_fs`: virtio-blk → NVMe фоллбэк; `Ext2Fs::mount`; формат — **только если устройство
-    целиком нулевое** (решение принимает `fs::format_policy`, issue #33: валидный суперблок,
-    таблица разделов MBR/GPT или любые другие ненулевые данные = отказ, а не стирание);
-    `vfs::mount_at("/mnt", root)`; `fs_boot_demo()`; `provision::seed()`.
+11. `init_fs`: attach NVMe → разбор GPT/MBR (`drivers::partition`, каждый раздел — своё
+    устройство `nvme0p1`/`virtio-blk0p1`) → `boot_menu::run()`: список разделов и
+    RAM-диска с тем, что каждый держит (`pagh volume` по WAL-маркеру, `empty`,
+    `FOREIGN fs`, `unknown data`). `Enter` монтирует, `F` форматирует **только после
+    ввода имени устройства**, таймаут 20 с уходит в недеструктивный выбор. Без выбора:
+    свой том (WAL-маркер) → RAM-диск с носителя → virtio-blk0 → NVMe.
+    Раздел форматируется исключительно по явной команде человека из меню;
+    автоматически форматируется лишь RAM-диск (scratch). `fs::format_policy` осталась
+    политикой для `disk setup` и для этого автоматического пути; ext3/ext4 отсекаются по
+    feature-словам, чужой ext2 — по отсутствию WAL. Затем `vfs::mount_at("/mnt", root)`;
+    `fs_boot_demo()`; `provision::seed()`.
 12. `net::init()` + echo-сервисы на порту 7.
 `kernel_main`: спавн `shell_thread` (PID 1) и `net::net_thread`; feature-гейтнутые selftest-хуки;
 `enable_interrupts()`; main-поток — `halt_loop()`. `shell_thread` после стабилизации
@@ -67,6 +74,20 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
 оба входных стаба передают 1 (настоящий syscall на планируемой задаче), а boot-selftest —
 0, потому что загрузочный поток ещё не планируемая задача и размаскировка там паркует его
 навсегда на первом же тике.
+
+### `boot_menu.rs` — меню выбора диска на загрузке
+Единственное место, где раздел может быть отформатирован. Рисует список устройств прямо в
+фреймбуфер (до существования shell и до готовности ФС), у каждой строки — что она держит:
+`pagh volume (ext2+wal)` (в томе есть WAL-суперблок pagh), `empty`, `FOREIGN fs
+(ext2/ext4)`, `unknown data`; RAM-диск с носителя помечен `[RAM]`. `Enter` монтирует
+только заведомо монтируемое — на пустом разделе ответ объясняет, что нужен `F`, на чужой
+ФС предупреждает; `F` открывает ввод имени устройства, и формат происходит лишь при
+точном совпадении; `Esc`/`S` — пропустить; 20 с без клавиш — недеструктивный дефолт.
+Ввод: `xhci::poll()` (USB HID) опрашивается напрямую, затем PS/2-порт и `ps2_kbd::take_scancode`
+— меню бежит в `init_fs`, когда прерывания ещё выключены, поэтому оба драйвера
+опрашиваются синхронно, и это же делает меню рабочим на машине без PS/2.
+Между `framebuffer::is_initialized()` и пустым списком устройств меню не показывается
+вовсе, так что неинтерактивная загрузка не блокируется.
 
 ### `log.rs`, `logfile.rs` (зеркало лога в файл на диске) — логгирование
 Leveled-фасад: `error!/warn!/info!/debug!/trace!` + runtime-фильтр (`ACTIVE_LEVEL`, дефолт Info).

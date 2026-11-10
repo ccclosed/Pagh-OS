@@ -161,10 +161,17 @@ server certificate chain, hostname and validity checked before a byte of the ind
   offline into `assets/font8x18.bin` by `tools/gen_font.py` — the kernel blends
   8-bit coverage per pixel, so glyph edges are antialiased, and it ships no TrueType
   parser.
-- **Storage:** PCI enumeration, virtio-blk block device, a multi-block-group ext2-compatible
-  read/write filesystem mounted at `/mnt` (GiB-scale disks), protected by a
-  write-ahead-log (WAL) journal for crash consistency — large writes are committed in
-  bounded per-transaction chunks. The on-disk image is host-mountable (`mount -t ext2 -o loop disk.img`).
+- **Storage:** PCI enumeration, virtio-blk and NVMe block devices, **GPT/MBR partition
+  support** (each partition becomes its own block device, so pagh can own one partition
+  instead of the whole disk), and a multi-block-group ext2-compatible read/write
+  filesystem mounted at `/mnt` (GiB-scale volumes), protected by a write-ahead-log (WAL)
+  journal for crash consistency — large writes are committed in bounded per-transaction
+  chunks. At boot a **disk menu** lists what every partition holds (pagh's own volume, an
+  empty region, somebody else's filesystem) and is the only place a partition can be
+  formatted: `Enter` mounts, `F` formats once the device name is typed back, a stray key
+  cannot erase anything, and a 20 s timeout takes the non-destructive path. A volume is
+  pagh's own iff it carries pagh's WAL superblock; ext3/ext4 are recognised as foreign and
+  refused. The on-disk image is host-mountable (`mount -t ext2 -o loop disk.img`).
 - **Networking:** the kernel's OWN dual-stack TCP/IP implementation (no external
   networking crate) over an own Intel e1000 NIC driver:
   IPv4 (ARP, fragmentation/reassembly, ICMP echo + `ping`, DHCPv4) and
@@ -252,21 +259,28 @@ install in the background; `N` skips it (`apt update` + `apt install python3` fr
 shell installs it later). Delete `disk.img` to get a clean re-provisioned system on the
 next boot.
 
-> **Data safety when booting real hardware.** pagh formats a block device **only when the
-> probed first MiB is entirely zero**, or when it carries the explicit opt-in marker (write
-> `PAGH-FORMAT` into sector 0 of that disk: `printf 'PAGH-FORMAT' | sudo dd of=/dev/nvme0n1
-> bs=1 conv=notrunc`); the decision is `fs::format_policy` (issue #33). A valid ext2
-> superblock, an MBR/GPT partition table, or any other non-zero data in that window makes the
-> kernel refuse to format and log why. Two caveats matter: the probe **stops at 1 MiB**, so a
-> layout that keeps all of its metadata past that point (a `mkswap` signature at the end of
-> the device, an mdadm 1.0 superblock, external RAID metadata) looks blank and *is* formatted;
-> and the marker is itself destructive — it overwrites the first 11 bytes of sector 0, which
-> on a partitioned disk is the bootstrap area. A device refused because its ext2 superblock
-> parses but its mount fails cannot be rescued by the marker; zero its start (`wipefs -a`)
-> and it becomes blank, which is formatted without any marker. Attach pagh to a dedicated
-> blank disk — never to a disk that holds data you care about. Note that the NVMe fallback
-> takes the first active namespace, i.e. the **whole SSD**, not a partition; there is no
-> bootloader flag or config file that can turn formatting of a populated disk on by accident.
+> **Data safety when booting real hardware.** pagh does not format a disk on its own at
+> boot. It lists the partitions it can see and waits; formatting a partition happens only
+> when a human presses `F` in that menu and then types the partition's name back — a stray
+> Enter mounts or explains, it never erases — and the menu's timeout chooses the
+> non-destructive path (mount pagh's own volume when there is one, otherwise the RAM disk).
+> A volume counts as pagh's own only when it carries pagh's WAL superblock
+> (`PAGHJNL\1`), which `Ext2Fs::format` and nothing else writes; an ext2/ext3/ext4
+> filesystem is shown as `FOREIGN` and left untouched (ext3/ext4 are additionally refused
+> at mount time by their feature words). The one device the automatic path may format is
+> the **RAM disk from the boot medium** (`disk.img` next to the kernel), which is scratch
+> by definition and disappears at power-off. The shell's `disk setup` stays the
+> deliberate, whole-device route: the explicit opt-in marker (write `PAGH-FORMAT` into
+> sector 0 of that device: `printf 'PAGH-FORMAT' | sudo dd of=/dev/nvme0n1 bs=1
+> conv=notrunc`) still authorises it, and the marker is itself destructive — it overwrites
+> the first 11 bytes of sector 0, which on a partitioned disk is the bootstrap area. Two
+> caveats matter: the probe **stops at 1 MiB**, so a layout that keeps all of its metadata
+> past that point (a `mkswap` signature at the end of a device, an mdadm 1.0 superblock,
+> external RAID metadata) looks like free space — the menu labels it `empty`, and
+> formatting it is then a human decision, not an accident; and a device refused because
+> its ext2 superblock parses but its mount fails cannot be rescued by the marker — zero
+> its start (`wipefs -a`) and it becomes blank. Attach pagh to a dedicated blank partition
+> or disk — never to one that holds data you care about.
 
 The cross-platform Python equivalents remain available through `tools/build.py`
 and the `Makefile`.

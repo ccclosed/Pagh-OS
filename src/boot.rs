@@ -387,14 +387,7 @@ fn init_fs() {
     // `nvme::bar0_mmio`: a BAR reading back all ones was mapped as if it were a
     // device). It is exercised now, so it is validated now.
     {
-        // EXPERIMENT: enumerate and list.
         let devices = crate::drivers::pci::enumerate();
-        for d in &devices {
-            info!(
-                "fs: pci {:02x}:{:02x}.{} class={:02x}/{:02x}",
-                d.address.bus, d.address.device, d.address.function, d.class, d.subclass
-            );
-        }
         if let Ok(true) = crate::drivers::nvme::attach(&devices) {
             crate::drivers::nvme::register_block_device();
             info!("fs: NVMe controller attached");
@@ -420,55 +413,69 @@ fn init_fs() {
         }
     }
 
-    // Storage priority: a disk image loaded from the boot medium wins (it is
-    // the system the operator deliberately carried with them), then virtio-blk
-    // (QEMU/dev images), then NVMe for real machines with an NVMe SSD.
-    // A partition with a valid ext2 filesystem wins over everything: it is the
-    // case the operator set up on purpose (a 1 GiB partition on their own disk),
-    // and mounting it is what makes the logs and the filesystem persist.
-    // A partition on a real disk is the volume that persists, so it comes first:
-    // an existing ext2 is mounted as-is, and an EMPTY partition is formatted and
-    // mounted (a blank region has nothing to lose, which is exactly the case
-    // `format_policy` permits without the opt-in marker). A partition holding
-    // anything else is left alone and the boot falls back to the RAM disk.
-    let partition = drivers::partition::candidates()
-        .into_iter()
-        .find(|(_, content)| {
-            matches!(
-                content,
-                drivers::partition::PartitionContent::Ext2
-                    | drivers::partition::PartitionContent::Blank
-            )
-        });
-    let mut blk = match partition {
-        Some((b, content)) => {
-            if content == drivers::partition::PartitionContent::Ext2 {
-                info!("fs: using partition {} (existing ext2)", b.name());
-            } else {
-                info!("fs: using blank partition {} (will format)", b.name());
-            }
-            Some(b)
+    // The operator looks at the list before the kernel decides anything. This is
+    // the ONLY place a partition may be formatted or a foreign filesystem taken
+    // over: the kernel cannot tell a partition meant for pagh from one that
+    // merely looks empty, and guessing wrong costs data. The menu times out into
+    // the non-destructive default, so an unattended boot is unchanged.
+    //
+    // Classify once and hand the same list to the menu: what the operator sees
+    // must be exactly what the boot path acts on. A skipped menu then reuses it,
+    // so no partition is probed twice on the same boot.
+    let partitions = drivers::partition::candidates();
+    let menu = crate::boot_menu::run(&partitions);
+
+    // SAFETY-CRITICAL, and the reason nothing below formats on its own: absent a
+    // menu choice, the boot path only ever MOUNTS a volume that already carries
+    // pagh's own journal marker. A structurally valid ext2/ext4 filesystem
+    // belonging to somebody else is somebody's Linux system — mounting it rewrites
+    // group descriptors and reserves WAL blocks inside it, and formatting it would
+    // be worse. Those partitions are listed in the menu and left alone here.
+    for (dev, content) in &partitions {
+        if matches!(content, drivers::partition::PartitionContent::ForeignExt2) {
+            warn!(
+                "fs: {} holds a foreign (non-pagh) filesystem; leaving it untouched",
+                dev.name()
+            );
         }
-        None => match drivers::get_block("ram0") {
-            Some(b) => {
-                info!("fs: using the RAM disk from the boot medium");
-                Some(b)
-            }
-            None => match drivers::get_block("virtio-blk0") {
-                Some(b) => Some(b),
-                None => {
-                    let devices = crate::drivers::pci::enumerate();
-                    match crate::drivers::nvme::attach(&devices) {
-                        Ok(true) => {
-                            crate::drivers::nvme::register_block_device();
-                            info!("fs: using NVMe block device");
-                        }
-                        _ => {}
-                    }
-                    drivers::get_block("nvme0")
+    }
+
+    // Storage priority: what the operator picked, else the volume pagh itself
+    // formatted on the attached disk, else a disk image from the boot medium
+    // (the system carried along on the stick), else virtio-blk (QEMU/dev images),
+    // else NVMe.
+    let mut blk = match &menu {
+        crate::boot_menu::Choice::Mount(dev) => {
+            info!("fs: operator chose to mount {}", dev.name());
+            Some(alloc::sync::Arc::clone(dev))
+        }
+        crate::boot_menu::Choice::Format(dev) => {
+            warn!("fs: operator chose to format {}", dev.name());
+            Some(alloc::sync::Arc::clone(dev))
+        }
+        crate::boot_menu::Choice::Skip => partitions
+            .iter()
+            .find(|(_, content)| {
+                matches!(content, drivers::partition::PartitionContent::PaghVolume)
+            })
+            .map(|(dev, _)| {
+                info!("fs: using partition {} (pagh volume)", dev.name());
+                alloc::sync::Arc::clone(dev)
+            })
+            .or_else(|| {
+                drivers::get_block("ram0").inspect(|_| {
+                    info!("fs: using the RAM disk from the boot medium");
+                })
+            })
+            .or_else(|| drivers::get_block("virtio-blk0"))
+            .or_else(|| {
+                let devices = crate::drivers::pci::enumerate();
+                if let Ok(true) = crate::drivers::nvme::attach(&devices) {
+                    crate::drivers::nvme::register_block_device();
+                    info!("fs: using NVMe block device");
                 }
-            },
-        },
+                drivers::get_block("nvme0")
+            }),
     };
     let blk = match blk.take() {
         Some(b) => b,
@@ -480,76 +487,115 @@ fn init_fs() {
         }
     };
 
-    // Format only a genuinely blank device. A valid ext2 superblock with a
-    // damaged/missing private WAL is an error, never permission to erase user
-    // data — and neither is a partition table or any other on-disk data.
-    let root = match Ext2Fs::mount(blk.clone()) {
-        Ok(root) => root,
-        Err(first_error) => {
-            let has_superblock = Ext2Fs::has_valid_superblock(&*blk);
-            // The probe runs only here: a failed mount is the sole situation in
-            // which erasing the device is even on the table, so the happy path
-            // pays nothing for it.
-            let probe = crate::fs::device::probe_boot_area(&*blk);
-            // The one way to authorise formatting a device that is not blank: an
-            // operator deliberately wrote `format_policy::OPT_IN_MARKER` into
-            // sector 0. Nothing else — no bootloader flag, no config file — can
-            // turn this on, and the marker cannot appear by accident.
-            let allow_destructive = probe.is_marked();
-            if allow_destructive {
-                warn!(
-                    "fs: {} carries the PAGH-FORMAT opt-in marker; formatting over existing data",
-                    blk.name()
-                );
+    // Format only what a human explicitly asked to format, in the menu, after
+    // typing the device name. Everything else here mounts or refuses.
+    //
+    // This used to key on `fs::format_policy` alone, which meant a blank partition
+    // the boot path happened to select was formatted without asking. It is not
+    // selected any more unless the operator chose it (menu) or it is the RAM disk
+    // (a scratch volume that disappears at power-off) — see below.
+    let root = match menu {
+        crate::boot_menu::Choice::Format(_) => {
+            warn!(
+                "fs: formatting {} on the operator's explicit instruction (menu)",
+                blk.name()
+            );
+            if let Err(e) = Ext2Fs::format(blk.clone()) {
+                error!("fs: format failed: {:?}; /mnt not mounted", e);
+                return;
             }
-            match format_allowed(probe.layout(), has_superblock, allow_destructive) {
-                Ok(()) => {
-                    info!(
-                        "fs: formatting {} ({}), ext2 + WAL...",
-                        blk.name(),
-                        probe.layout().name()
-                    );
-                    if let Err(e) = Ext2Fs::format(blk.clone()) {
-                        error!("fs: format failed: {:?}; /mnt not mounted", e);
-                        return;
-                    }
-                    match Ext2Fs::mount(blk.clone()) {
-                        Ok(root) => root,
-                        Err(e) => {
-                            error!("fs: post-format mount failed: {:?}", e);
-                            return;
-                        }
-                    }
-                }
-                Err(refusal) => {
-                    match refusal {
-                        // Wording kept byte-identical: it is the historical
-                        // refusal line and the docs quote it.
-                        Refusal::ExistingFilesystem => error!(
-                            "fs: existing ext2 mount failed: {:?}; refusing destructive reformat",
-                            first_error
-                        ),
-                        other => error!(
-                            "fs: refusing to format {} ({}): {:?}",
-                            blk.name(),
-                            other.reason(),
-                            first_error
-                        ),
-                    }
-                    // No in-guest route forward exists (there is no `mkfs` in the
-                    // shell), so name the operator's options instead of leaving
-                    // the refusal as the last word on the serial line.
-                    error!(
-                        "fs: {} left untouched; run `disk setup` at the shell to format it \
-                         deliberately, or zero the start of the device (`wipefs -a` / `dd` \
-                         from another system) / write the {} marker",
-                        blk.name(),
-                        crate::fs::format_policy::OPT_IN_MARKER_NAME
-                    );
+            match Ext2Fs::mount(blk.clone()) {
+                Ok(root) => root,
+                Err(e) => {
+                    error!("fs: post-format mount failed: {:?}", e);
                     return;
                 }
             }
         }
+        // An explicit "mount this" is NEVER silently upgraded to "format this":
+        // erasing a volume is not a recovery step, and the operator who picked the
+        // row did not ask for it. The message says how to get there on purpose.
+        crate::boot_menu::Choice::Mount(_) => match Ext2Fs::mount(blk.clone()) {
+            Ok(root) => root,
+            Err(e) => {
+                error!(
+                    "fs: mounting {} failed: {:?}; nothing was written - reboot and press F in the disk menu to format it",
+                    blk.name(),
+                    e
+                );
+                info!("fs (mount failed, nothing formatted)");
+                return;
+            }
+        },
+        crate::boot_menu::Choice::Skip => match Ext2Fs::mount(blk.clone()) {
+            Ok(root) => root,
+            Err(first_error) => {
+                let has_superblock = Ext2Fs::has_valid_superblock(&*blk);
+                // The probe runs only here: a failed mount is the sole situation in
+                // which erasing the device is even on the table, so the happy path
+                // pays nothing for it.
+                let probe = crate::fs::device::probe_boot_area(&*blk);
+                // The one way to authorise formatting a device that is not blank: an
+                // operator deliberately wrote `format_policy::OPT_IN_MARKER` into
+                // sector 0. Nothing else — no bootloader flag, no config file — can
+                // turn this on, and the marker cannot appear by accident.
+                let allow_destructive = probe.is_marked();
+                if allow_destructive {
+                    warn!(
+                        "fs: {} carries the PAGH-FORMAT opt-in marker; formatting over existing data",
+                        blk.name()
+                    );
+                }
+                match format_allowed(probe.layout(), has_superblock, allow_destructive) {
+                    Ok(()) => {
+                        info!(
+                            "fs: formatting {} ({}), ext2 + WAL...",
+                            blk.name(),
+                            probe.layout().name()
+                        );
+                        if let Err(e) = Ext2Fs::format(blk.clone()) {
+                            error!("fs: format failed: {:?}; /mnt not mounted", e);
+                            return;
+                        }
+                        match Ext2Fs::mount(blk.clone()) {
+                            Ok(root) => root,
+                            Err(e) => {
+                                error!("fs: post-format mount failed: {:?}", e);
+                                return;
+                            }
+                        }
+                    }
+                    Err(refusal) => {
+                        match refusal {
+                            // Wording kept byte-identical: it is the historical
+                            // refusal line and the docs quote it.
+                            Refusal::ExistingFilesystem => error!(
+                                "fs: existing ext2 mount failed: {:?}; refusing destructive reformat",
+                                first_error
+                            ),
+                            other => error!(
+                                "fs: refusing to format {} ({}): {:?}",
+                                blk.name(),
+                                other.reason(),
+                                first_error
+                            ),
+                        }
+                        // No in-guest route forward exists (there is no `mkfs` in the
+                        // shell), so name the operator's options instead of leaving
+                        // the refusal as the last word on the serial line.
+                        error!(
+                            "fs: {} left untouched; reboot and use the disk menu (F + the typed \
+                             device name), or run `disk setup` at the shell to format it \
+                             deliberately, or zero the start of the device (`wipefs -a` / `dd` \
+                             from another system) / write the {} marker",
+                            blk.name(),
+                            crate::fs::format_policy::OPT_IN_MARKER_NAME
+                        );
+                        return;
+                    }
+                }
+            }
+        },
     };
 
     match vfs::mount_at_named("/mnt", root, "ext2") {

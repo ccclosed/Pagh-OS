@@ -1051,6 +1051,13 @@ impl FbWriter {
         }
     }
 
+    /// Whether a framebuffer is attached, i.e. whether anything drawn here can
+    /// be seen. A serial-only boot has none, and a UI that would otherwise block
+    /// waiting for input must know to skip itself.
+    pub fn is_ready(&self) -> bool {
+        self.inner.lock().is_some()
+    }
+
     /// Sets the framebuffer foreground (glyph) color, locking the inner writer.
     /// No-op if the framebuffer never initialized.
     pub fn set_fg_color(&self, color: u32) {
@@ -1261,6 +1268,11 @@ pub fn init() {
 /// handle, for use by the logging facade and other consumers.
 pub fn console() -> &'static FbWriter {
     &FB_WRITER
+}
+
+/// Whether the framebuffer console can display anything yet.
+pub fn is_initialized() -> bool {
+    FB_WRITER.is_ready()
 }
 
 pub fn _print(args: fmt::Arguments) {

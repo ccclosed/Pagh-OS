@@ -322,8 +322,13 @@ fn is_partition(name: &str) -> bool {
 /// What a partition holds, as far as the boot path is concerned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PartitionContent {
-    /// A filesystem pagh can mount right now.
-    Ext2,
+    /// An ext2 volume carrying pagh's own journal marker — a volume pagh
+    /// formatted, and the only kind it mounts by itself.
+    PaghVolume,
+    /// A structurally valid ext2/ext4 filesystem that is NOT pagh's. Never
+    /// touched automatically: it is somebody's data. (Read-only inspection is not
+    /// offered either — the driver writes group descriptors during mount.)
+    ForeignExt2,
     /// No filesystem and no other recognisable data: safe to format, which the
     /// boot path may do on its own.
     Blank,
@@ -332,18 +337,36 @@ pub enum PartitionContent {
     Other,
 }
 
+/// What `dev` holds, from the boot path's point of view.
+///
+/// THE PROBE DECIDES THE LABEL, `is_pagh_volume` DECIDES THE OWNERSHIP. They are
+/// separate questions: `probe_boot_area` recognises the ext-family superblock
+/// magic whether or not this driver could mount it (ext4 is recognised and
+/// deliberately not mountable), which is exactly what the operator needs to see —
+/// "a filesystem lives here and it is not yours". A volume is pagh's own only if
+/// it carries the WAL superblock that `Ext2Fs::format` writes; nothing else can
+/// produce that marker, and no other filesystem reads ext2's layout that way.
+pub fn classify(dev: &dyn BlockDevice) -> PartitionContent {
+    if crate::fs::ext2::Ext2Fs::is_pagh_volume(dev) {
+        return PartitionContent::PaghVolume;
+    }
+    match crate::fs::device::probe_boot_area(dev).layout() {
+        crate::fs::format_policy::Layout::Ext2 => PartitionContent::ForeignExt2,
+        crate::fs::format_policy::Layout::Blank => PartitionContent::Blank,
+        _ => PartitionContent::Other,
+    }
+}
+
 /// Classify every registered partition, best candidate first.
 ///
-/// The order is deliberate: an existing ext2 beats a blank partition (mounting
-/// something is always safer than creating something), and both beat "other",
-/// which the boot path leaves alone.
+/// The order is deliberate: an existing pagh volume beats a blank partition
+/// (mounting something is always safer than creating something), and both beat
+/// "other", which the boot path leaves alone entirely.
 ///
-/// WHY THE BOOT PATH MAY FORMAT A BLANK PARTITION BY ITSELF. On a machine whose
-/// only medium is the boot stick, a user who carved out a partition and left it
-/// empty has already said what they want it for — and a machine with no keyboard
-/// cannot run `disk setup` to confirm it. A blank region carries no data to lose,
-/// which is exactly the case `fs::format_policy` allows formatting without the
-/// opt-in marker; nothing else is ever touched automatically.
+/// NO PARTITION IS FORMATTED FROM THIS LIST. Only the boot menu offers that, and
+/// only after the operator presses `F` and types the device name; the menu uses
+/// [`PartitionContent`] to say what each row holds and [`classify`] to label a
+/// device that is not a partition at all (the RAM disk from the boot medium).
 pub fn candidates() -> alloc::vec::Vec<(Arc<dyn BlockDevice>, PartitionContent)> {
     let mut ext2 = alloc::vec::Vec::new();
     let mut blank = alloc::vec::Vec::new();
@@ -355,18 +378,11 @@ pub fn candidates() -> alloc::vec::Vec<(Arc<dyn BlockDevice>, PartitionContent)>
         let Some(dev) = crate::drivers::get_block(&name) else {
             continue;
         };
-        let content = if crate::fs::ext2::Ext2Fs::has_valid_superblock(&*dev) {
-            PartitionContent::Ext2
-        } else {
-            match crate::fs::device::probe_boot_area(&*dev).layout() {
-                crate::fs::format_policy::Layout::Blank => PartitionContent::Blank,
-                _ => PartitionContent::Other,
-            }
-        };
+        let content = classify(&*dev);
         match content {
-            PartitionContent::Ext2 => ext2.push((dev, content)),
+            PartitionContent::PaghVolume => ext2.push((dev, content)),
             PartitionContent::Blank => blank.push((dev, content)),
-            PartitionContent::Other => other.push((dev, content)),
+            PartitionContent::ForeignExt2 | PartitionContent::Other => other.push((dev, content)),
         }
     }
     let mut out = ext2;
@@ -376,10 +392,10 @@ pub fn candidates() -> alloc::vec::Vec<(Arc<dyn BlockDevice>, PartitionContent)>
 }
 
 /// The first registered partition that already carries an ext2 filesystem.
-pub fn find_ext2_partition() -> Option<Arc<dyn BlockDevice>> {
+pub fn find_pagh_partition() -> Option<Arc<dyn BlockDevice>> {
     candidates()
         .into_iter()
-        .find(|(_, c)| *c == PartitionContent::Ext2)
+        .find(|(_, c)| *c == PartitionContent::PaghVolume)
         .map(|(dev, _)| dev)
 }
 

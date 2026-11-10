@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.18.0** (the batch open with the
+  be reflected here. **`main` currently reads 2.18.1** (the batch open with the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
   **2.17.0** = the batch that made pagh run on real hardware, plus three
@@ -248,11 +248,13 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
     downwards;
   * `ps` lists kernel threads (`[shell]`, `[net]`, `[usb]`, …) and `df` reports
     the bytes a ramfs is holding;
-  * `disk` gives the operator a way to choose a block device, format it ext2 and
-    mount it at `/mnt` (the boot path still refuses to erase anything on its
-    own), and a disk image can travel on the boot medium as a RAM disk
-    (`drivers::memdisk`, first `*.img` Limine module) — which is what makes a
-    machine with no supported drive usable at all;
+  * the boot path shows a **disk menu** (`src/boot_menu.rs`) of the partitions it
+    can see and what each holds; `Enter` mounts, `F` formats only after the device
+    name is typed back, and a 20 s timeout takes the non-destructive choice.
+    A partition is formatted **only** from this menu; the shell `disk` command
+    stays the deliberate whole-device route, and a disk image can travel on the
+    boot medium as a RAM disk (`drivers::memdisk`, first `*.img` Limine module) —
+    which is what makes a machine with no supported drive usable at all;
   * USB input: `drivers::xhci` drives an xHCI controller itself (polled, in the
     `usb` thread) and `drivers::usb_hid` translates boot-protocol reports into
     the same PS/2 scancode stream every consumer already reads. Controller
@@ -294,12 +296,29 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
     timeout was stretched the same way;
   * `drivers::partition` reads GPT (and MBR) and publishes each partition as its
     own block device, so pagh can own one partition instead of claiming the whole
-    disk; the boot path prefers a partition that already holds an ext2 filesystem;
+    disk; the boot path prefers a partition that already holds pagh's own volume;
   * `logfile` mirrors every kernel log line into `/mnt/pagh-log.txt` — buffered in
     a fixed ring from the first boot message (the logger runs in interrupt and
     panic contexts, where touching a filesystem would deadlock) and drained by a
     `logd` thread once `/mnt` is mounted, so a machine with no serial port leaves a
     readable log on its disk.
+  **2.18.1** = the disk menu and the ownership rule. Booting now shows a menu of the
+  partitions it can see (`src/boot_menu.rs`, drawn straight into the framebuffer before
+  the shell exists) with what each holds: pagh's own volume, an empty region, a
+  `FOREIGN` filesystem, or unknown data. `Enter` mounts, `F` formats only after the
+  device name is typed back, `Esc` skips, and a 20 s timeout takes the non-destructive
+  default; the menu polls USB HID and PS/2 synchronously because it runs before
+  interrupts are on. A volume is pagh's own iff it carries pagh's WAL superblock
+  (`Ext2Fs::is_pagh_volume`), so the boot path no longer mounts "whatever ext2 it
+  finds": ext3/ext4 are refused by their feature words, a foreign ext2 is left
+  untouched, and the only device the automatic path may format is the RAM disk from the
+  boot medium. Three bugs surfaced while building this: the ext-family superblock magic
+  was probed at 1024 instead of 1024+0x38 (`SB_MAGIC_OFFSET`), which made every real
+  ext2/ext4 volume classify as `Foreign` while the host test agreed with the mistake;
+  the boot path now runs on its own 128 KiB stack because Limine hands over a small one
+  (a latent overflow the partition code's extra call depth turned into a page fault on
+  BIOS boots); and the boot menu first rendered half its text in Cyrillic, which the
+  kernel font does not cover — its UI is ASCII.
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
   `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real
@@ -438,8 +457,8 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
 
 - NVMe driver is polled (no IRQs) with multi-page PRP lists and four commands in
   flight; FLUSH (opcode 0x00) is issued at WAL transaction boundaries. Still
-  missing: the driver takes the whole namespace (no partition parsing, one
-  namespace), one I/O queue pair (admin commands are serialized), no timeout
+  missing: the driver attaches the first active namespace only (partitions are
+  sliced by `drivers::partition` into `nvme0pN`), one I/O queue pair (admin commands are serialized), no timeout
   recovery (a completion timeout marks the device failed until reboot), no
   SMART/self-test or shutdown notification, and unaligned writes are
   read-modify-write per LBA rather than batched.

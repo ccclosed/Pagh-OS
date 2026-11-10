@@ -16,6 +16,7 @@ use core::sync::atomic::AtomicU64;
 
 mod arch;
 mod boot;
+mod boot_menu;
 mod debug;
 mod drivers;
 mod fs;
