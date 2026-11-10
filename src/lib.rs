@@ -94,9 +94,47 @@ pub(crate) static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KERNEL_BASE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KERNEL_SIZE: AtomicU64 = AtomicU64::new(0);
 
+/// The kernel's own boot stack.
+///
+/// WHY THE KERNEL DOES NOT USE THE BOOTLOADER'S STACK. Limine hands over with a
+/// stack it sized for its own purposes, and every call the kernel makes before
+/// the scheduler installs a per-task stack runs on it. That works until it does
+/// not: on a BIOS boot, adding one call to the boot path pushed a legitimate
+/// depth over the limit, the overflow landed on memory Limine had put below the
+/// stack, and the kernel died fetching an instruction from a page that was no
+/// longer mapped — a crash that appears and disappears with unrelated code
+/// changes, which is the signature of a stack overflow rather than a logic bug.
+/// Owning the stack makes the boot path independent of the loader's sizing.
+///
+/// 128 KiB matches half of a kernel task stack (`KERNEL_STACK_PAGES`), which is
+/// far more than the boot path has ever used, and it is `.bss`: it costs no
+/// space in the image.
+#[repr(align(16))]
+struct BootStack([u8; BOOT_STACK_BYTES]);
+
+/// Size of the kernel's boot stack.
+const BOOT_STACK_BYTES: usize = 128 * 1024;
+
+static mut BOOT_STACK: BootStack = BootStack([0; BOOT_STACK_BYTES]);
+
 #[no_mangle]
 pub fn _start() -> ! {
-    crate::boot::start()
+    // SAFETY: this runs once, before any other code in the kernel, and the only
+    // reference to `BOOT_STACK` is the address taken here (the stack is used by
+    // value, never read through the static). Setting RSP to its top does not
+    // invalidate anything the compiler holds in registers: the `asm!` block
+    // diverges, so no stack slot of this function is live across it.
+    unsafe {
+        let top = core::ptr::addr_of!(BOOT_STACK) as u64;
+        let top = (top + BOOT_STACK_BYTES as u64) & !0xF;
+        core::arch::asm!(
+            "mov rsp, {stack}",
+            "call {entry}",
+            stack = in(reg) top,
+            entry = sym crate::boot::start,
+            options(noreturn)
+        );
+    }
 }
 
 #[panic_handler]

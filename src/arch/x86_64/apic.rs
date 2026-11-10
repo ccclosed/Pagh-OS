@@ -153,7 +153,7 @@ fn init_lapic() {
         // The measurement is taken WITH the divider programmed, so it is the
         // rate the counter itself runs at. Dividing by the divider again (the
         // first version of this code) made each tick 16x too long.
-        let measured = unsafe { calibrate_timer_hz() };
+        let measured = None; // EXPERIMENT: calibration disabled
         let effective_hz = measured.unwrap_or(APIC_TIMER_BASE_HZ / APIC_TIMER_DIVIDER);
         let init_count = (effective_hz / TICK_HZ).clamp(1, u32::MAX as u64);
         match measured {

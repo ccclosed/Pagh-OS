@@ -309,29 +309,78 @@ pub fn list() -> alloc::vec::Vec<(String, String)> {
         .collect()
 }
 
-/// The first registered partition that already carries an ext2 filesystem.
+/// Is `name` a partition (`virtio-blk0p1`, `nvme0p1`)?
+fn is_partition(name: &str) -> bool {
+    match name.rfind('p') {
+        Some(pos) => {
+            !name[pos + 1..].is_empty() && name[pos + 1..].chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// What a partition holds, as far as the boot path is concerned.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PartitionContent {
+    /// A filesystem pagh can mount right now.
+    Ext2,
+    /// No filesystem and no other recognisable data: safe to format, which the
+    /// boot path may do on its own.
+    Blank,
+    /// Something else is there (another filesystem, a boot record, data). Never
+    /// touched without the operator saying so.
+    Other,
+}
+
+/// Classify every registered partition, best candidate first.
 ///
-/// Used by the boot path to give such a partition priority: an operator who
-/// carved out a partition and formatted it did so deliberately, and that is the
-/// volume whose contents (and logs) should persist.
-pub fn find_ext2_partition() -> Option<Arc<dyn BlockDevice>> {
+/// The order is deliberate: an existing ext2 beats a blank partition (mounting
+/// something is always safer than creating something), and both beat "other",
+/// which the boot path leaves alone.
+///
+/// WHY THE BOOT PATH MAY FORMAT A BLANK PARTITION BY ITSELF. On a machine whose
+/// only medium is the boot stick, a user who carved out a partition and left it
+/// empty has already said what they want it for — and a machine with no keyboard
+/// cannot run `disk setup` to confirm it. A blank region carries no data to lose,
+/// which is exactly the case `fs::format_policy` allows formatting without the
+/// opt-in marker; nothing else is ever touched automatically.
+pub fn candidates() -> alloc::vec::Vec<(Arc<dyn BlockDevice>, PartitionContent)> {
+    let mut ext2 = alloc::vec::Vec::new();
+    let mut blank = alloc::vec::Vec::new();
+    let mut other = alloc::vec::Vec::new();
     for (name, _) in crate::drivers::list_blocks() {
-        let is_partition = match name.rfind('p') {
-            Some(pos) => {
-                !name[pos + 1..].is_empty() && name[pos + 1..].chars().all(|c| c.is_ascii_digit())
-            }
-            None => false,
-        };
-        if !is_partition {
+        if !is_partition(&name) {
             continue;
         }
-        if let Some(dev) = crate::drivers::get_block(&name) {
-            if crate::fs::ext2::Ext2Fs::has_valid_superblock(&*dev) {
-                return Some(dev);
+        let Some(dev) = crate::drivers::get_block(&name) else {
+            continue;
+        };
+        let content = if crate::fs::ext2::Ext2Fs::has_valid_superblock(&*dev) {
+            PartitionContent::Ext2
+        } else {
+            match crate::fs::device::probe_boot_area(&*dev).layout() {
+                crate::fs::format_policy::Layout::Blank => PartitionContent::Blank,
+                _ => PartitionContent::Other,
             }
+        };
+        match content {
+            PartitionContent::Ext2 => ext2.push((dev, content)),
+            PartitionContent::Blank => blank.push((dev, content)),
+            PartitionContent::Other => other.push((dev, content)),
         }
     }
-    None
+    let mut out = ext2;
+    out.append(&mut blank);
+    out.append(&mut other);
+    out
+}
+
+/// The first registered partition that already carries an ext2 filesystem.
+pub fn find_ext2_partition() -> Option<Arc<dyn BlockDevice>> {
+    candidates()
+        .into_iter()
+        .find(|(_, c)| *c == PartitionContent::Ext2)
+        .map(|(dev, _)| dev)
 }
 
 /// Serialises partition registration (called once per device at boot).

@@ -378,10 +378,23 @@ fn init_fs() {
     use crate::fs::ext2::Ext2Fs;
     use crate::fs::format_policy::{format_allowed, Refusal};
 
-    // Attach NVMe first: on a real machine that is the disk with a partition
-    // table, and the partition walk below can only see what is registered.
+    // Attach NVMe before the partition walk: on a real machine that disk is the
+    // one with a partition table, and a partition holding an ext2 filesystem has
+    // to be visible before the RAM-disk fallback is chosen.
+    //
+    // This path used to run only when there was no RAM disk, which under BIOS
+    // meant it never ran at all — and it turned out to be broken there (see
+    // `nvme::bar0_mmio`: a BAR reading back all ones was mapped as if it were a
+    // device). It is exercised now, so it is validated now.
     {
+        // EXPERIMENT: enumerate and list.
         let devices = crate::drivers::pci::enumerate();
+        for d in &devices {
+            info!(
+                "fs: pci {:02x}:{:02x}.{} class={:02x}/{:02x}",
+                d.address.bus, d.address.device, d.address.function, d.class, d.subclass
+            );
+        }
         if let Ok(true) = crate::drivers::nvme::attach(&devices) {
             crate::drivers::nvme::register_block_device();
             info!("fs: NVMe controller attached");
@@ -413,9 +426,27 @@ fn init_fs() {
     // A partition with a valid ext2 filesystem wins over everything: it is the
     // case the operator set up on purpose (a 1 GiB partition on their own disk),
     // and mounting it is what makes the logs and the filesystem persist.
-    let mut blk = match drivers::partition::find_ext2_partition() {
-        Some(b) => {
-            info!("fs: using partition {} (existing ext2)", b.name());
+    // A partition on a real disk is the volume that persists, so it comes first:
+    // an existing ext2 is mounted as-is, and an EMPTY partition is formatted and
+    // mounted (a blank region has nothing to lose, which is exactly the case
+    // `format_policy` permits without the opt-in marker). A partition holding
+    // anything else is left alone and the boot falls back to the RAM disk.
+    let partition = drivers::partition::candidates()
+        .into_iter()
+        .find(|(_, content)| {
+            matches!(
+                content,
+                drivers::partition::PartitionContent::Ext2
+                    | drivers::partition::PartitionContent::Blank
+            )
+        });
+    let mut blk = match partition {
+        Some((b, content)) => {
+            if content == drivers::partition::PartitionContent::Ext2 {
+                info!("fs: using partition {} (existing ext2)", b.name());
+            } else {
+                info!("fs: using blank partition {} (will format)", b.name());
+            }
             Some(b)
         }
         None => match drivers::get_block("ram0") {

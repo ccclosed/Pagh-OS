@@ -647,10 +647,37 @@ pub fn max_io_batch_depth() -> u32 {
 fn bar0_mmio(dev_addr: pci::PciAddress) -> Result<usize, ()> {
     let lo = pci::config_read_u32(dev_addr, 0x10);
     let hi = pci::config_read_u32(dev_addr, 0x14);
+    // An I/O-space BAR (bit 0 set) is not MMIO at all.
     if lo & 1 != 0 {
         return Err(());
     }
-    let bar0 = (((hi as u64) << 32) | (lo & 0xFFFF_FFF0) as u64) & !0xF;
+    let base_lo = lo & 0xFFFF_FFF0;
+    // A BAR that reads back all ones (or zero) means the device implements no
+    // address here. Mapping it anyway asked `map_mmio` for a region at
+    // 0xFFFFFFF0, and on a BIOS boot that walk split a huge page in a part of the
+    // address space shared with the kernel image — the boot then died on an
+    // instruction fetch into its own text. Validate before mapping: a device
+    // without a usable BAR0 is not a device we can drive.
+    if base_lo == 0 || base_lo == 0xFFFF_FFF0 || (base_lo == 0 && hi == 0) {
+        crate::warn!(
+            "nvme: BAR0 of {:02x}:{:02x}.{} reads {:#010x}{:08x}; no address assigned",
+            dev_addr.bus,
+            dev_addr.device,
+            dev_addr.function,
+            hi,
+            lo
+        );
+        return Err(());
+    }
+    if hi == 0xFFFF_FFFF {
+        crate::warn!("nvme: BAR0 high half is all ones; ignoring device");
+        return Err(());
+    }
+    let bar0 = (((hi as u64) << 32) | base_lo as u64) & !0xF;
+    // The controller's registers must live in real physical address space.
+    if bar0 == 0 || bar0 >= 0x0000_FFFF_FFFF_F000 {
+        return Err(());
+    }
     crate::memory::vmm::map_mmio(bar0, 0x4000)
         .map(|v| v as usize)
         .map_err(|_| ())
