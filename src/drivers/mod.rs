@@ -106,6 +106,64 @@ pub fn init() {
     crate::info!("Device manager ready");
 }
 
+/// One line describing every input device the kernel can see.
+///
+/// WHY ON ONE LINE, ON SCREEN. pagh is tested on machines with no serial port:
+/// when a keyboard does not type, the only evidence available is what the screen
+/// shows. This compresses the whole answer — is there an xHCI controller, does any
+/// port have a device, did the device reach a configured HID interface, are
+/// reports arriving, is there a PS/2 controller — into one line the boot menu and
+/// the shell banner can print. It separates the three failures that look identical
+/// from the outside ("no controller", "controller but nothing attached", "attached
+/// but silent").
+pub fn input_summary() -> alloc::string::String {
+    use alloc::format;
+    use alloc::string::String;
+    let usb = xhci::summary();
+    let (kbd_reports, mouse_reports, unmapped) = usb_hid::stats();
+    let ports = if usb.ccs_mask == 0 {
+        String::from("none")
+    } else {
+        let mut text = String::new();
+        for port in 1..=usb.ports {
+            if usb.ccs_mask & (1 << (port - 1)) == 0 {
+                continue;
+            }
+            if !text.is_empty() {
+                text.push(',');
+            }
+            text.push_str(&format!("{}", port));
+        }
+        text
+    };
+    format!(
+        "usb: {} ctrl, {} ports, device on [{}], {} HID, kbd {} / mouse {} reports{} | ps2: {}",
+        usb.controllers,
+        usb.ports,
+        ports,
+        usb.devices,
+        kbd_reports,
+        mouse_reports,
+        if unmapped > 0 {
+            format!(", {} unmapped", unmapped)
+        } else {
+            String::new()
+        },
+        if ps2_kbd::controller_present() {
+            "yes"
+        } else {
+            "no"
+        }
+    )
+}
+
+/// Whether anything that can produce a keystroke exists: a USB HID device, or an
+/// 8042 controller (whose keyboard may simply be quiet). Used by the boot menu to
+/// say out loud when it is waiting for a keyboard that the machine does not have.
+pub fn any_keyboard() -> bool {
+    xhci::summary().devices > 0 || ps2_kbd::controller_present()
+}
+
 /// Register a character device in the global manager.
 pub fn register_char(dev: Arc<dyn CharacterDevice>) {
     DEVICE_MANAGER.lock().register_char(dev);

@@ -74,6 +74,22 @@ pub fn init() {
     crate::debug!("[PS2KBD] Keyboard driver initialized (IRQ1 not wired)");
 }
 
+/// Whether an 8042 controller answers at all.
+///
+/// The status port reads back as `0xFF` on machines without one (the bus floats
+/// high), which is exactly the machine this kernel's USB path exists for. The
+/// boot menu prints this so a screen-only field report can tell "no keyboard
+/// because no PS/2" from "PS/2 present but silent".
+pub fn controller_present() -> bool {
+    use x86_64::instructions::port::Port;
+    // SAFETY: port 0x64 is the 8042 status register; a read has no side effects
+    // beyond consuming a pending output byte's status.
+    unsafe {
+        let mut status: Port<u8> = Port::new(0x64);
+        status.read() != 0xFF
+    }
+}
+
 /// Take one scancode out of the ring, if any is queued.
 ///
 /// The shell reads the ring through its own decoder; this is the same operation

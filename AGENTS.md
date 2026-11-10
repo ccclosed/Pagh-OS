@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.18.2** (the batch open with the
+  be reflected here. **`main` currently reads 2.18.3** (the batch open with the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
   **2.17.0** = the batch that made pagh run on real hardware, plus three
@@ -332,6 +332,20 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   included). Two performance fixes came with it: the report poll no longer spins
   50 000 iterations per empty poll, and the boot menu polls the controller once per
   256 spin steps — the old busy-wait could stretch boot into minutes under TCG.
+  **2.18.3** = the first field report after the disk menu: the clock still ran
+  slow and the USB keyboard/mouse were dead on the real machine. The clock had one
+  cause — the LAPIC calibration call site had been left disabled during the BIOS
+  stack debugging (fixed in the previous commit). For the input, the driver now
+  finds the keyboard whichever xHCI controller it is plugged into (probe every
+  controller, count attached ports, start the best), takes ownership from the
+  firmware's USB legacy support, and RETRIES ports that have not produced a device
+  yet instead of giving up on the first look — USB2 connect needs ~100 ms of
+  debounce after the controller reset, which QEMU's instant answer had hidden.
+  A device behind a hub is detected and said out loud (hubs are still not
+  supported). Because that machine has no serial port, the boot menu and the shell
+  banner now print one line that makes the failure visible on screen: controllers
+  seen, ports, which port has a device, how many HID devices were configured, and
+  how many keyboard/mouse reports arrived.
   **2.8.0** = the security model: per-process real/effective/saved uid+gid in
   `CompatState`, the `set*id` family, POSIX owner/group/other enforcement on
   `open`/`execve`/directory mutation/`chmod`/`chown`/`kill`/`access` against real

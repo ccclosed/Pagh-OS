@@ -429,6 +429,18 @@ fn draw(rows: &[Row], selected: usize, typed: Option<&str>, message: Option<&str
         };
         crate::fb_println!("{}", footer);
     }
+    // The field report for a machine with no serial port: one line that says
+    // whether there is a controller, whether any port has a device, whether the
+    // device reached a HID interface and whether reports are arriving. The menu is
+    // the only screen a machine with a dead keyboard shows, so it has to answer
+    // the question "why is nothing happening" by itself.
+    crate::fb_println!();
+    crate::fb_println!("  {}", crate::drivers::input_summary());
+    if typed.is_none() && !crate::drivers::any_keyboard() {
+        crate::fb_println!(
+            "  NO KEYBOARD DETECTED - the menu will continue unchanged when it times out"
+        );
+    }
     framebuffer::flush();
 }
 

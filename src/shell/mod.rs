@@ -317,6 +317,10 @@ pub fn shell_main() -> ! {
     crate::kprintln!("   Welcome to pagh OS Shell!");
     crate::kprintln!("========================================");
     crate::kprintln!("Type 'help' for available commands");
+    crate::kprintln!("input: {}", crate::drivers::input_summary());
+    if !crate::drivers::any_keyboard() {
+        crate::kprintln!("warning: no keyboard detected (USB device count above, PS/2 absent)");
+    }
     crate::kprintln!();
 
     crate::fb_println!();
@@ -324,6 +328,7 @@ pub fn shell_main() -> ! {
     crate::fb_println!("   Welcome to pagh OS Shell!");
     crate::fb_println!("========================================");
     crate::fb_println!("Type 'help' for available commands");
+    crate::fb_println!("input: {}", crate::drivers::input_summary());
     crate::fb_println!();
 
     // Optional one-shot autorun: if `/mnt/etc/autorun` exists, its first line

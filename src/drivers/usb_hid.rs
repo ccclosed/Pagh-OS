@@ -24,6 +24,7 @@
 
 use crate::drivers::{ps2_kbd, ps2_mouse};
 use crate::sync::spinlock::Spinlock;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// USB HID usage ids → PS/2 set-1 scancodes (without the `0xE0` prefix).
 ///
@@ -169,6 +170,8 @@ struct KeyboardState {
     unmapped: u64,
 }
 
+static MOUSE_REPORTS: AtomicU64 = AtomicU64::new(0);
+
 static KEYBOARD: Spinlock<KeyboardState> = Spinlock::new(KeyboardState {
     keys: [0; 6],
     modifiers: 0,
@@ -263,6 +266,7 @@ fn feed_mouse(report: &[u8]) {
     if report.len() < 3 {
         return;
     }
+    MOUSE_REPORTS.fetch_add(1, Ordering::Relaxed);
     let buttons = report[0] & 0x07;
     let dx = report[1] as i8;
     let dy = report[2] as i8;
@@ -286,5 +290,5 @@ pub fn feed(report: &[u8], protocol: u8) {
 /// `(keyboard reports, mouse reports, unmapped keys)` for diagnostics.
 pub fn stats() -> (u64, u64, u64) {
     let k = KEYBOARD.lock();
-    (k.reports, 0, k.unmapped)
+    (k.reports, MOUSE_REPORTS.load(Ordering::Relaxed), k.unmapped)
 }

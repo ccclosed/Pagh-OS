@@ -30,6 +30,7 @@
 use alloc::vec::Vec;
 
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::drivers::pci::PciDevice;
 use crate::memory::pmm;
@@ -352,6 +353,8 @@ struct Controller {
     db: usize,
     rt: usize,
     ctx_size: usize,
+    /// xHCI controllers found on the PCI bus (this one is the chosen one).
+    controllers: usize,
     ports: u8,
     cmdr: Ring,
     event: Ring,
@@ -371,6 +374,64 @@ struct Controller {
 }
 
 static CONTROLLER: Spinlock<Option<Controller>> = Spinlock::new(None);
+
+/// How many xHCI controllers PCI enumeration saw, kept even when none started:
+/// the screen-only diagnostic needs to tell "no controller" from "controller but
+/// no device".
+static CONTROLLERS_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+/// What the USB driver can say about itself, for the boot menu, the shell banner
+/// and the `usb` command. On a machine with no serial port this struct IS the
+/// field report.
+pub struct Summary {
+    /// xHCI controllers found on the PCI bus.
+    pub controllers: usize,
+    /// Ports on the controller this driver runs (0 when none started).
+    pub ports: u8,
+    /// Bit N set = port N+1 reports a connected device right now.
+    pub ccs_mask: u32,
+    /// Devices that made it all the way to a configured HID interface.
+    pub devices: u64,
+    /// HID reports handed to the input translator.
+    pub reports: u64,
+}
+
+impl Summary {
+    /// True when some port reports a connected device — the first thing to look
+    /// at when a keyboard does not type.
+    pub fn any_attached(&self) -> bool {
+        self.ccs_mask != 0
+    }
+}
+
+/// Snapshot of the driver's state, cheap enough to call from a redraw loop.
+pub fn summary() -> Summary {
+    let guard = CONTROLLER.lock();
+    match guard.as_ref() {
+        Some(c) => {
+            let mut mask = 0u32;
+            for port in 1..=c.ports {
+                if rd32(c.op, portsc(port)) & PORTSC_CCS != 0 {
+                    mask |= 1 << (port - 1);
+                }
+            }
+            Summary {
+                controllers: c.controllers,
+                ports: c.ports,
+                ccs_mask: mask,
+                devices: c.devices,
+                reports: c.reports,
+            }
+        }
+        None => Summary {
+            controllers: CONTROLLERS_SEEN.load(Ordering::Relaxed),
+            ports: 0,
+            ccs_mask: 0,
+            devices: 0,
+            reports: 0,
+        },
+    }
+}
 
 // ─── MMIO ────────────────────────────────────────────────────────────────────
 
@@ -397,34 +458,174 @@ fn wr64(base: usize, off: usize, v: u64) {
 
 // ─── Init ────────────────────────────────────────────────────────────────────
 
-/// Find and start an xHCI controller. `false` means "no controller, or it
-/// refused to start" — USB input is simply unavailable then, and the PS/2 path
-/// (plus any firmware translation) is all the machine has.
+/// Find, choose and start an xHCI controller.
+///
+/// A machine may expose MORE THAN ONE controller — desktop boards often pair the
+/// chipset xHCI with a discrete one for the front-panel ports — and the keyboard
+/// is on whichever one it was plugged into, so the driver probes every controller,
+/// counts the ports that already report a connected device, and starts the one
+/// with the most. Ties go to the first (stable PCI order).
+///
+/// `false` means "no controller, or none could be started" — USB input is simply
+/// unavailable then, and PS/2 (plus any firmware translation) is all the machine
+/// has.
 pub fn init(devices: &[PciDevice]) -> bool {
-    let Some(dev) = devices
+    let candidates: Vec<&PciDevice> = devices
         .iter()
-        .find(|d| d.class == 0x0C && d.subclass == 0x03)
-    else {
+        .filter(|d| d.class == 0x0C && d.subclass == 0x03)
+        .collect();
+    CONTROLLERS_SEEN.store(candidates.len(), Ordering::Relaxed);
+    if candidates.is_empty() {
+        crate::warn!("xhci: no xHCI controller on the PCI bus");
+        return false;
+    }
+    crate::info!(
+        "xhci: {} xHCI controller(s) on the PCI bus",
+        candidates.len()
+    );
+    let mut best: Option<(usize, u32)> = None; // (index, attached ports)
+    for (index, dev) in candidates.iter().enumerate() {
+        match probe_controller(dev) {
+            Some((ports, mask)) => {
+                let attached = mask.count_ones();
+                crate::info!(
+                    "xhci: controller {}/{} {:04x}:{:04x} ports={} attached_mask={:#010x}",
+                    index + 1,
+                    candidates.len(),
+                    dev.vendor_id,
+                    dev.device_id,
+                    ports,
+                    mask
+                );
+                if best.map_or(true, |(_, n)| attached > n) {
+                    best = Some((index, attached));
+                }
+            }
+            None => crate::warn!(
+                "xhci: controller {}/{} is unusable",
+                index + 1,
+                candidates.len()
+            ),
+        }
+    }
+    let Some((index, _)) = best else {
+        crate::warn!("xhci: no xHCI controller could be mapped");
         return false;
     };
+    if candidates.len() > 1 {
+        crate::info!("xhci: using controller {}/{}", index + 1, candidates.len());
+    }
+    start_controller(candidates[index], candidates.len())
+}
+
+/// Map BAR0 of a controller, or say why not.
+fn map_bar0(dev: &PciDevice) -> Option<(usize, u64)> {
     let lo = crate::drivers::pci::config_read_u32(dev.address, 0x10);
     let hi = crate::drivers::pci::config_read_u32(dev.address, 0x14);
     let bar = ((hi as u64) << 32) | (lo as u64 & 0xFFFF_FFF0);
     if bar == 0 || lo & 0x6 != 0x4 {
         crate::warn!("xhci: BAR0 is not a 64-bit memory BAR (lo={:#x})", lo);
-        return false;
+        return None;
     }
-    let Ok(virt) = crate::memory::vmm::map_mmio(bar, 64 * 1024) else {
-        crate::warn!("xhci: cannot map BAR0 {:#x}", bar);
+    match crate::memory::vmm::map_mmio(bar, 64 * 1024) {
+        Ok(virt) => Some((virt as usize, bar)),
+        Err(_) => {
+            crate::warn!("xhci: cannot map BAR0 {:#x}", bar);
+            None
+        }
+    }
+}
+
+/// Read the attached-device mask without disturbing the controller.
+///
+/// Runs before the BIOS handoff and the hardware reset, so on a real machine it
+/// shows what firmware left behind; ports that are still in RxDetect simply read
+/// as not attached and are retried after the reset by the port bring-up loop.
+fn probe_controller(dev: &PciDevice) -> Option<(u8, u32)> {
+    let (base, _bar) = map_bar0(dev)?;
+    let caplength = (rd32(base, CAP_CAPLENGTH) & 0xFF) as usize;
+    let op = base + caplength;
+    let hcsparams1 = rd32(base, CAP_HCSPARAMS1);
+    let ports = ((hcsparams1 >> 24) & 0xFF) as u8;
+    let hccparams1 = rd32(base, CAP_HCCPARAMS1);
+    bios_handoff(base, hccparams1);
+    let mut mask = 0u32;
+    for port in 1..=ports {
+        if rd32(op, portsc(port)) & PORTSC_CCS != 0 {
+            mask |= 1 << (port - 1);
+        }
+    }
+    Some((ports, mask))
+}
+
+/// Take ownership of the controller from the firmware's USB legacy support.
+///
+/// WHY: xHCI carries a "USB Legacy Support" extended capability. While the BIOS
+/// owns the semaphore it may keep SMI handlers trapping port accesses, and some
+/// firmware leaves the controller in a state where the OS sees no port state at
+/// all. The standard handoff is: ask for ownership (OS-owned bit), wait for the
+/// BIOS-owned bit to clear, and if the firmware never answers, clear it yourself
+/// after a bounded wait so boot continues.
+fn bios_handoff(base: usize, hccparams1: u32) {
+    const CAP_ID_USB_LEGACY: u32 = 1;
+    const LEGSUP_BIOS_OWNED: u32 = 1 << 16;
+    const LEGSUP_OS_OWNED: u32 = 1 << 24;
+    let xecp = ((hccparams1 >> 16) & 0xFFFF) as usize;
+    if xecp == 0 {
+        return;
+    }
+    let mut off = xecp * 4;
+    for _ in 0..64 {
+        if off + 4 > 0x1000 {
+            return;
+        }
+        let cap = rd32(base, off);
+        let id = cap & 0xFF;
+        if id == CAP_ID_USB_LEGACY {
+            let mut value = cap;
+            if value & LEGSUP_BIOS_OWNED != 0 {
+                wr32(base, off, value | LEGSUP_OS_OWNED);
+                let mut spins = 0u32;
+                loop {
+                    value = rd32(base, off);
+                    if value & LEGSUP_BIOS_OWNED == 0 {
+                        crate::info!("xhci: BIOS handed the controller over");
+                        return;
+                    }
+                    spins += 1;
+                    if spins > 2_000_000 {
+                        // Firmware never answered; take it anyway rather than
+                        // leaving the controller unusable for the whole boot.
+                        wr32(base, off, (value & !LEGSUP_BIOS_OWNED) | LEGSUP_OS_OWNED);
+                        crate::warn!("xhci: firmware did not release the controller; forced");
+                        return;
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+            wr32(base, off, value | LEGSUP_OS_OWNED);
+            return;
+        }
+        let next = ((cap >> 8) & 0xFF) as usize;
+        if next == 0 {
+            return;
+        }
+        off += next * 4;
+    }
+}
+
+/// Bring one controller all the way up: reset, rings, DCBAA, running.
+fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
+    let Some((base, bar)) = map_bar0(dev) else {
         return false;
     };
-    let base = virt as usize;
 
     let caplength = (rd32(base, CAP_CAPLENGTH) & 0xFF) as usize;
     let op = base + caplength;
     let hcsparams1 = rd32(base, CAP_HCSPARAMS1);
     let hcsparams2 = rd32(base, CAP_HCSPARAMS2);
     let hccparams1 = rd32(base, CAP_HCCPARAMS1);
+    bios_handoff(base, hccparams1);
     let dboff = (rd32(base, CAP_DBOFF) & !0x3) as usize;
     let rtsoff = (rd32(base, CAP_RTSOFF) & !0x1F) as usize;
     let max_slots = (hcsparams1 & 0xFF) as usize;
@@ -543,6 +744,7 @@ pub fn init(devices: &[PciDevice]) -> bool {
         db: base + dboff,
         rt,
         ctx_size,
+        controllers,
         ports,
         cmdr,
         event,
@@ -1109,6 +1311,14 @@ fn enumerate_with_speed(ctrl: &mut Controller, port: u8, speed: u8) -> bool {
         speed_name,
         max_packet0
     );
+    match dev[4] {
+        9 => crate::warn!(
+            "xhci: port {} holds a USB hub; hubs are not supported (keyboard behind it is invisible)",
+            port
+        ),
+        0 => {}
+        class => crate::info!("xhci: port {} device class {:#04x}", port, class),
+    }
     // Configuration descriptor: 9 bytes for the total length, then the whole blob.
     let Some(head) = get_descriptor(ctrl, slot_index, 2, 0, 9) else {
         return false;
@@ -1177,14 +1387,19 @@ pub fn poll() {
             continue;
         }
         if !ctrl.brought_up.contains(&port) {
-            ctrl.brought_up.push(port);
+            // A port that has not produced a device yet is RETRIED on every poll
+            // instead of being given up on. USB2 connect detection has a debounce
+            // window of ~100 ms after a reset, so a one-shot check right after
+            // `HCRST` can see `ccs=false` on hardware that is about to report the
+            // keyboard — QEMU's instant answer made that race invisible here.
             match reset_port(ctrl, port) {
                 Some(speed) => {
+                    ctrl.brought_up.push(port);
                     if enumerate_with_speed(ctrl, port, speed) {
                         ctrl.devices += 1;
                     }
                 }
-                None => crate::debug!("xhci: port {} has no device", port),
+                None => crate::debug!("xhci: port {} has no device yet", port),
             }
             continue;
         }

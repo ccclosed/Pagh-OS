@@ -1654,18 +1654,31 @@ fn cmd_apt_setmirror(args: &[&str]) {
 /// `HID device on port N` line in the log means enumeration (the steps in
 /// `drivers::xhci`) did not get through.
 pub(super) fn cmd_usb(_ctx: &mut ShellCtx, _args: &[&str]) {
-    let (present, ports, reports) = crate::drivers::xhci::status();
-    let (kb_reports, _, unmapped) = crate::drivers::usb_hid::stats();
-    if !present {
-        shell_println("usb: no xHCI controller");
+    let summary = crate::drivers::xhci::summary();
+    let (kb_reports, mouse_reports, unmapped) = crate::drivers::usb_hid::stats();
+    if summary.controllers == 0 {
+        shell_println("usb: no xHCI controller on the PCI bus");
         shell_println("usb: the kernel drives xHCI only; a PS/2 keyboard needs no driver");
         return;
     }
+    if summary.ports == 0 {
+        shell_println(&alloc::format!(
+            "usb: {} controller(s) found, none could be started (see the boot log)",
+            summary.controllers
+        ));
+        return;
+    }
     shell_println(&alloc::format!(
-        "usb: xHCI up, {} ports, {} report(s), {} key report(s), {} unmapped usage(s)",
-        ports,
-        reports,
+        "usb: {} controller(s), active one {} ports, {} HID device(s), {} report(s)",
+        summary.controllers,
+        summary.ports,
+        summary.devices,
+        summary.reports
+    ));
+    shell_println(&alloc::format!(
+        "usb: key reports {}, mouse reports {}, unmapped usages {}",
         kb_reports,
+        mouse_reports,
         unmapped
     ));
     shell_println("  PORT  PORTSC      CONNECT  ENABLED  POWER  SPEED  LINK");
