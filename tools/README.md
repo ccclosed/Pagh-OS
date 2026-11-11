@@ -10,6 +10,8 @@
 | `limine.py` | Версионно-независимый локатор/установщик `BOOTX64.EFI`: ищет любой локальный `limine*/` (или `LIMINE_EFI`/`LIMINE_DIR`), иначе качает последний бинарный релиз Limine (`limine-binary.zip`) в `limine/`; путь на stdout, прогресс на stderr |
 | `host_tests.py` | Обёртка: определяет host triple через `rustc -vV`, запускает `cargo test --locked --target <host>` в `host-tests/` |
 | `toolchain.sh` | Guard для `build.sh`/`run.sh`: отказывается собирать ненайтовым (stable/дистрибутивным) `cargo` — тот падает с `-Zjson-target-spec` и не называет настоящую причину. `tools/build.py` его не требует |
+| `check_agents_md.py` | Гейт утверждений `AGENTS.md` против дерева (шесть гейтов, канонические entry points, версия/теги, release-notes) в обе стороны; `--probe` ломает каждый класс утверждений в scratch-копии и требует находку на каждую поломку; `--quiet` — только вердикт |
+| `e2e.py` | Кроссплатформенный (Linux/CI, без pwsh) in-guest E2E-драйвер: режимы `selftest`, `local-mirror`, `live-update`, `bigindex`, `shell`, `tcp-shot`, `smoke`; общие флаги `--features`/`--debug`/`--cpu`/`--disk`/`--nvme`/`--timeout`/`--settle`/`--expect`/`--keep-artifacts` |
 | `check_safety.py` | CI-гейт unsafe-политики: сканирует `src/security/`, `src/arch/x86_64/linux/mod.rs`, `src/memory/vmm.rs`, `src/net/tls.rs`, `src/pkg/apt.rs` — каждый `unsafe {` обязан иметь `SAFETY:`-коммент в предыдущих 6 строках, иначе exit 1 |
 | `gen_ca_bundle.py` | Генератор trust-anchor бандла TLS-верификатора: скачивает curl/Mozilla CA extract, выбирает корни по subject CN (ISRG Root X1/X2, GTS R1/R4), пишет детерминированный `src/net/ca_bundle.rs` (DER-массивы + метки); сгенерированный файл коммитится, перегенерация — только осознанно |
 | `fetch_p44_fixtures.py` | Генератор фикстур host-свойства P44: скачивает реальные ISRG Root X1 и лист `deb.debian.org`, пишет `host-tests/src/properties/p44_fixture_{root,leaf}.rs` (закоммичены; перегенерация — осознанно) |
@@ -72,29 +74,38 @@ python3 tools/mkimage.py --usb dist/pagh-usb.img       # GPT + ESP, для dd
 python3 tools/mkimage.py --iso dist/pagh.iso           # ISO для Ventoy / CD
 ```
 
-Оба образа UEFI-only и оба несут `disk.img`: ядро монтирует только virtio-blk и
+Оба образа несут `disk.img`: ядро монтирует только virtio-blk и
 NVMe, поэтому ПК без такого диска поднимался вообще без `/mnt` — шелл и ни одной
 программы. Limine отдаёт образ ядру как модуль, `drivers::memdisk` показывает его
-блочным устройством `ram0`, `/mnt` монтируется из памяти.
+блочным устройством `ram0`, `/mnt` монтируется из памяти. USB-образ — UEFI-only;
+ISO — **dual-firmware (BIOS + UEFI)**.
 
 **USB-образ** (GPT + один FAT32 ESP): `sudo dd if=dist/pagh-usb.img of=/dev/sdX
 bs=4M status=progress conv=fsync`.
 
-**ISO**: GTP-таблица + один El Torito EFI-образ (`efi.img`, маленький FAT с
-`EFI/BOOT/BOOTX64.EFI` и `limine.conf`), а ядро и `disk.img` лежат на самом
-ISO9660-томе и адресуются из конфига как `fslabel(PAGH_OS):/pagh.elf` —
-`fslabel` у Limine сопоставляется в том числе с идентификатором тома ISO 9660.
+**ISO**: гибридный BIOS+UEFI диск, собранный из **штатных CD-загрузчиков Limine**
+(`limine-bios-cd.bin` как BIOS El Torito + `limine-bios.sys` на томе и
+`limine-uefi-cd.bin` как EFI boot image), а ядро и `disk.img` лежат на самом
+ISO9660-томе и адресуются из конфига как `boot():/pagh.elf` / `boot():/disk.img`
+(CD-загрузчики Limine читают ISO-том). Гибрид нужен Ventoy: он предлагает
+Legacy- и UEFI-режимы, а ISO с одним EFI-записью в Legacy не грузится вообще.
 В загрузочный образ ядро положить нельзя: запись El Torito описывает максимум
-32 МиБ, а ядро занимает 21 МиБ.
+32 МиБ, а ядро занимает ~21 МиБ.
 
 **Для ISO нужен `xorriso`** (`dnf install xorriso` / `apt install xorriso`) —
-сборщик вызывает его с `-eltorito-alt-boot -e efi.img -no-emul-boot`. Ручной
-ISO9660+El Torito не годится: том получается валидный (сторонний читатель
-перечисляет дерево и достаёт файлы), но диск не грузится — прошивка запускает
-`EFI/BOOT/BOOTX64.EFI`, а Limine пишет `[config file not found]`, потому что
-загрузочный образ доезжает до него не как читаемый FAT. `mkimage.py --iso`
-падает с внятной ошибкой, если xorriso не найден, вместо того чтобы выдать
-негрузящийся диск.
+сборщик вызывает его с `-b limine-bios-cd.bin -no-emul-boot -boot-load-size 4
+-boot-info-table --efi-boot limine-uefi-cd.bin -efi-boot-part --efi-boot-image
+--protective-msdos-label -V PAGH_OS`. Ручной ISO9660+El Torito (или UEFI-only
+EFI-образ) не годится: том получается валидный (сторонний читатель перечисляет
+дерево и достаёт файлы), но диск не грузится — прошивка запускает EFI-образ, а
+Limine не находит конфиг; поэтому же первый ISO здесь был заменён на
+`limine-uefi-cd.bin`. `mkimage.py --iso` падает с внятной ошибкой, если xorriso
+не найден, вместо того чтобы выдать негрузящийся диск.
+
+Прочие флаги: `--elf` (ядро, дефолт `iso_root/pagh.elf`), `--disk` (какой
+`disk.img` вкладывать, дефолт одноимённый), `--size-mb` (минимальный размер
+USB-образа), `--make-disk PATH [--disk-size-mb 1024] [--userland DIR]` — собрать
+GPT-диск с одним ext2-разделом и выйти (или вложить его в образ тем же прогоном).
 
 Записать на Ventoy — просто скопировать файл: Ventoy ищет `iso/wim/img/vhd(x)` в
 любых каталогах своей первой флешки, а `.img` грузит через memdisk.

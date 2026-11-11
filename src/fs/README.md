@@ -11,6 +11,7 @@ write-ahead-log журналом для crash-consistency. Чистая логи
 | `mod.rs` | Корень; enum `FsError` |
 | `format_policy.rs` | Политика «можно ли форматировать это устройство»: чистый `core`-модуль **без I/O** — `Probe` (инкрементальный классификатор boot-области: ext2-magic / MBR+GPT / blank / foreign) и `format_allowed(layout, has_valid_superblock, allow_destructive)`; host-тесты гоняют его напрямую (P50, issue #33). Магия ext-семейства лежит по `SUPERBLOCK_OFFSET + SB_MAGIC_OFFSET` (1024 + 0x38), а не по 1024 |
 | `journal.rs` | WAL-журнал: `Journal`, `Txn`, `JournalArea` — кольцевой лог, атомарные мультиблочные транзакции, CRC-коммиты, crash-consistent `recover()` |
+| `device.rs` | I/O-половина решения «можно ли форматировать»: `probe_boot_area(dev)` читает первые 1 MiB чанками по 4 KiB с ранним выходом и кормит `format_policy::Probe`; общий код boot-пути и shell-меню `disk` |
 | `ext2/mod.rs` | Ядро драйвера: `Ext2Fs` (format/mount), `Tx` (dirty-набор, аллокаторы, block-map), файловые операции, VfsNode-адаптеры `Ext2Dir`/`Ext2File`/`Ext2Symlink`/`Ext2Opaque`, маппинг ошибок `fs_to_vfs` |
 | `ext2/structs.rs` | On-disk `#[repr(C)]`-структуры с compile-time фиксацией размеров (`Ext2SuperBlock` 0x88 B, `Ext2GroupDesc` 32 B, `Ext2Inode` 128 B, `JournalSuper` 56 B и др.), магии (`S_IFREG/S_IFDIR/S_IFLNK`), unaligned read/write, CRC32 |
 | `ext2/alloc.rs` | Битмап-примитивы: `alloc_bit`, `set/clear/test_bit`, `count_set_bits`; `alloc_block`/`free_block`/`alloc_inode`/`free_inode` с синком счётчиков sb/GD |
@@ -135,8 +136,8 @@ write-ahead-log журналом для crash-consistency. Чистая логи
   устройствах без кэша `flush` — no-op по умолчанию в трейте.
   **Best-effort:** если устройство не объявляет `VIRTIO_BLK_F_FLUSH`, крейт завершает запрос как
   no-op (`vendor/virtio-drivers/src/device/blk.rs:143`), и барьер на нём ничего не гарантирует —
-  ядро этого не проверяет и не логирует. NVMe FLUSH (opcode 0x08) шлётся безусловно, там барьер
-  честный. P24 проверяет, что барьеры действительно дают crash-consistency при волатильном кэше.
+  ядро этого не проверяет и не логирует. NVMe FLUSH (opcode 0x00) шлётся безусловно, там
+  барьер честный. P24 проверяет, что барьеры действительно дают crash-consistency при волатильном кэше.
 - `commit`: проверка лимитов, reclaim всего лога при нехватке места (чекпойнтинг синхронный),
   валидация таргетов. Reclaim персистит новый `tail` **до** записи транзакции: завёрнутая запись
   ложится ровно на слот, который называл старый `tail`, и без этого крах после коммит-записи

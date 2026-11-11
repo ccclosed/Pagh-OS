@@ -2,7 +2,7 @@
 
 Единый node-трейт `VfsNode`, резолв путей, монтирование, синтетический `/dev`, ramfs для
 `/tmp` и загрузчик ELF64 (нативные и Linux-бинари). Инициализация — `vfs::init()` из `boot.rs`,
-затем `boot.rs` подключает ext2-корень: `vfs::mount_at("/mnt", root)`.
+затем `boot.rs` подключает ext2-корень: `vfs::mount_at_named("/mnt", root, "ext2")`.
 
 Синтетический `/proc` (issue #11) реализован срезами 1–5: контракт — пути, байтовые
 форматы файлов, семантика `lstat`/`readdir`/`getdents64`/`readlink`, список отложенного —
@@ -98,11 +98,12 @@
 - `/proc/filesystems` — только реально реализованные драйверы: `nodev\tproc`,
   `nodev\tramfs`, `\text2`. Это статическая таблица (`procfs_format::FILESYSTEMS`),
   а не wildcard; новый драйвер обязан добавить строку в тот же коммит.
-- `/proc/loadavg` — `0.00 0.00 0.00 <runnable>/<total> <last_pid>\n`. Средние
-  честно нулевые (учёта загрузки нет; libuv падает обратно на `sysinfo(2)`, где
-  `loads = [0;3]`), `runnable/total` — живые счётчики планировщика (ready+running
-  против ready+running+parked), `last_pid` — последний выданный pid (`0` до
-  первого). Доступ — `scheduler::loadavg_counts()`.
+- `/proc/loadavg` — `X.XX X.XX X.XX <runnable>/<total> <last_pid>\n`. Средние —
+  реальные экспоненциально затухающие 1/5/15-минутные значения в fixed point 16.16
+  (`scheduler::loadavg_*`, ленивое обновление, без FPU), а не заглушка `0.00`;
+  `runnable/total` — живые счётчики планировщика (ready+running против
+  ready+running+parked), `last_pid` — последний выданный pid (`0` до первого).
+  Доступ — `scheduler::loadavg_counts()`.
 - `/proc/sys/kernel/{ostype,osrelease,hostname}` (+ каталоги `/proc/sys`,
   `/proc/sys/kernel`) — read-only константы: `Pagh`, реальная версия, `pagh`
   (совпадает с `uname(2).nodename`). Записываемого sysctl нет, wildcard нет.
