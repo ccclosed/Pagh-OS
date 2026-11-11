@@ -370,10 +370,11 @@ pub fn shell_main() -> ! {
         );
     }
     {
-        // Port masks, not ranges: the field controller reports two Supported
-        // Protocol entries whose ranges overlap, and printing the pretty range hid
-        // that (`usb2=17-41 usb3=17-26`). A mask shows exactly which ports the
-        // controller claims for each protocol, and what it does not claim at all.
+        // Port masks, not pretty ranges: a mask shows exactly which ports the
+        // controller claims for each protocol, cannot be "wrapped" by a bad offset,
+        // and makes an uncovered port obvious. The field machine printed
+        // `usb2=17-41 usb3=17-26` until 2.18.13 fixed the port-info word; with
+        // masks the same photo would have shown the overlap immediately.
         let masks = crate::drivers::xhci::proto_masks();
         crate::fb_println!(
             "  xhci proto: usb2={:#010x} usb3={:#010x}",
@@ -390,17 +391,21 @@ pub fn shell_main() -> ! {
     // disagree with the spec, this is the evidence that settles it.
     for cap in crate::drivers::xhci::xcaps().into_iter().take(6) {
         crate::fb_println!(
-            "  xhci xcap {:#06x}: id={} next={:#04x} dw1={:#010x} dw2={:#010x}",
+            "  xhci xcap {:#06x}: id={} major={} minor={} next={:#04x} dw1={:#010x} dw2={:#010x}",
             cap.offset,
             cap.id,
+            cap.major,
+            cap.minor,
             cap.next,
             cap.dw1,
             cap.dw2
         );
         crate::kprintln!(
-            "xhci xcap {:#06x}: id={} next={:#04x} dw1={:#010x} dw2={:#010x}",
+            "xhci xcap {:#06x}: id={} major={} minor={} next={:#04x} dw1={:#010x} dw2={:#010x}",
             cap.offset,
             cap.id,
+            cap.major,
+            cap.minor,
             cap.next,
             cap.dw1,
             cap.dw2

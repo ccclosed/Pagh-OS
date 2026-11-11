@@ -231,7 +231,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.18.12** (the batch open with the
+  be reflected here. **`main` currently reads 2.18.13** (the batch open with the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
   **2.17.0** = the batch that made pagh run on real hardware, plus three
@@ -433,6 +433,21 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   already enabled is adopted instead of reset back into Polling; and the PP
   power-cycle fallback now runs only every fourth attempt — it was what made the
   mouse's LED blink once every ~35 s, which the operator reported.
+  **2.18.13** = the field photo explains `usb2=17-41 usb3=17-26`. That line was
+  not the controller's answer: the Supported Protocol port-info word was read with
+  the spec fields swapped. xHCI 1.2 table 7-4 puts PSIC in bits 31:28, the port
+  COUNT in 15:8 and the port OFFSET in 7:0 — and the offset is **1-based** (Linux:
+  `XHCI_EXT_PORT_OFF`/`XHCI_EXT_PORT_COUNT`, "port count includes the current port
+  offset"). The driver read the count from 31:16 and the offset from 15:8 plus one,
+  with a QEMU-only fallback that did the same thing in another order. The raw dwords
+  in the 2.18.12 photo are clean under the real layout: USB2 `dw2=0x30191001` =
+  offset 1, count 16 → **ports 1–16**, USB3 `dw2=0x40000a11` = offset 17, count 10
+  → **ports 17–26**, and the legacy handoff capability sits at 0x846c. So on this
+  machine every real USB2 port (1,5,6,9,10,11) should have printed `proto=usb2` and
+  printed `proto=usb0` instead — a diagnostic bug, not a port bug, and one that made
+  the previous three reports harder to read than they had to be. The dump now prints
+  the major/minor revision and the parsed offset/count/PSIC, and masks are computed
+  from the corrected fields.
   **2.18.12** = the halted controller. The 2.18.11 field photos (the ones the
   previous session never got to read) show `usbcmd=0x00000000 usbsts=0x00000015`
   — HCH=1, the xHCI was **halted** at shell time — while `legacy=os-owned` and every
