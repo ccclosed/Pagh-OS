@@ -638,8 +638,31 @@ struct Sysinfo {
     _f: [u8; 0],
 }
 
+/// The 1/5/15-minute load averages in the 16.16 fixed-point form
+/// `struct sysinfo` uses (Linux ABI: `si_loads[i] = load * 65536`).
+///
+/// WHY THIS EXISTS. `sysinfo(2)` used to fill `loads` with hard-coded zeros while
+/// `/proc/loadavg` printed the scheduler's real decayed averages: one kernel, two
+/// answers for the same question, so a userspace tool reading `sysinfo` showed
+/// `0.00 0.00 0.00` on a loaded machine. Both views now come from
+/// [`crate::task::scheduler::load_averages`]; this function only converts its
+/// hundredths (`123` = 1.23) to the kernel's fixed-point ABI. The conversion is
+/// pinned by an in-QEMU selftest, because "raw hundredths where the ABI says
+/// 16.16" is exactly the kind of unit mistake that reads as a plausible number.
+pub fn sysinfo_loads() -> [u64; 3] {
+    let (one, five, fifteen) = scheduler::load_averages();
+    let fixed = |hundredths: u32| -> u64 {
+        (hundredths as u64).saturating_mul(SYSTEM_LOAD_FIXED_ONE) / 100
+    };
+    [fixed(one), fixed(five), fixed(fifteen)]
+}
+
+/// One unit of load in the `struct sysinfo` 16.16 fixed-point representation.
+pub const SYSTEM_LOAD_FIXED_ONE: u64 = 1 << 16;
+
 /// `sysinfo` (99): fill the user `struct sysinfo` with the uptime (from the tick
-/// clock) and total/free RAM (from the PMM frame counts), returning 0.
+/// clock), the load averages (16.16 fixed point, same source as
+/// `/proc/loadavg`) and total/free RAM (from the PMM frame counts), returning 0.
 pub fn sys_sysinfo(info: u64) -> Result<u64, Errno> {
     check_user_ptr(info, core::mem::size_of::<Sysinfo>() as u64)?;
     let uptime = (scheduler::ticks() / TICK_HZ) as i64;
@@ -647,7 +670,7 @@ pub fn sys_sysinfo(info: u64) -> Result<u64, Errno> {
     let freeram = crate::memory::pmm::free_frames() as u64 * 4096;
     let si = Sysinfo {
         uptime,
-        loads: [0; 3],
+        loads: sysinfo_loads(),
         totalram,
         freeram,
         sharedram: 0,
