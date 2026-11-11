@@ -33,8 +33,8 @@ with the `synth` theme and a live wallpaper.
    ```
 
    Frames come from monitor `screendump … -f png`; the sequence drives `clear`,
-   `ls /mnt`, `ifconfig`, `paint` (mouse strokes), `nano /mnt/pagh-log.txt`, then
-   `settings` (theme + wallpaper cycling). Frames captured while the kernel was
+   `ls /mnt`, `paint` (mouse strokes), `ifconfig` (by then the DHCP lease is live),
+   `nano /mnt/pagh-log.txt`, then `settings` (theme + wallpaper cycling). Frames captured while the kernel was
    mid-repaint (the shadow-buffer→VGA copy takes a few milliseconds) are dropped,
    so the video only shows fully rendered frames.
 
@@ -48,10 +48,9 @@ with the `synth` theme and a live wallpaper.
    ```
 
 `paint` is driven by a **USB HID mouse** in the capture (`-device qemu-xhci
--device usb-mouse`) because synthetic PS/2 deltas are lossy at scripted rates.
-Note that 2.18.12 moves a USB mouse vertically inverted on the PS/2 fallback path;
-the capture script compensates on the host side and the fix itself is a separate
-commit. The default PS/2 mouse under QEMU is unaffected.
+-device usb-mouse`) because synthetic PS/2 deltas are lossy at scripted rates. The
+capture runs on a kernel with the USB-HID Y-sign fix (`1a54396`), so no host-side
+compensation is needed; the default PS/2 mouse under QEMU is unaffected either way.
 
 ## The `pagh-demo-x86_64.tar.gz` bundle
 
