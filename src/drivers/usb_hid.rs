@@ -269,7 +269,11 @@ fn feed_mouse(report: &[u8]) {
     MOUSE_REPORTS.fetch_add(1, Ordering::Relaxed);
     let buttons = report[0] & 0x07;
     let dx = report[1] as i8;
-    let dy = report[2] as i8;
+    // HID boot-mouse reports are Y-down (positive dy = towards the bottom of
+    // the screen), while the PS/2 convention the decoder below implements is
+    // Y-up (the driver computes `y - dy`). Flip the sign so a USB mouse moves
+    // the cursor the same way a PS/2 one does.
+    let dy = (report[2] as i8).wrapping_neg();
     // PS/2 packet: flags (bit 3 always set, bits 0-2 buttons, bits 4/5 the sign
     // of dx/dy), then the two deltas as 9-bit two's complement bytes.
     let flags = 0x08 | buttons | if dx < 0 { 0x10 } else { 0 } | if dy < 0 { 0x20 } else { 0 };
