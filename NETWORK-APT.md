@@ -14,33 +14,32 @@ apt setmirror https://deb.debian.org /debian
 apt update
 apt install busybox-static
 lxrun /mnt/bin/busybox
-python            # CPython 3.13, installed by first-boot provisioning
+apt install python3   # the base userland is installed from the shell, not by boot
+python
 ```
 
 ## First-boot provisioning
 
 On the first boot with a fresh `disk.img`, the kernel seeds `/mnt` (release metadata, home
-skeleton, mini-Rust example). Installing the base glibc + CPython 3.13 userland (≈35 packages,
-≈50 MB of downloads — the equivalent of `apt update && apt install python3`) is **opt-in**: the
-the shell runs `apt update` + `apt install python3` on demand; boot itself never blocks on a console question.
-It is idempotent — on later boots it detects the installed userland and exits. Progress is
-reported on serial; the framebuffer log mirror is paused while it runs so the shell stays usable.
-Delete `disk.img` to re-provision from scratch.
+skeleton, mini-Rust example) from `src/provision.rs::seed()`, guarded by
+`/mnt/etc/pagh-release`, so later boots are no-ops. Boot installs nothing over the network
+and never blocks on a console question: the base glibc + CPython userland (≈35 packages,
+≈50 MB of downloads) is installed **on demand from the shell** with `apt update` +
+`apt install python3`. Progress appears on serial through the normal apt logging. Delete
+`disk.img` to re-seed from scratch.
 
 ## Index decode robustness
 
 `apt update` tries the `Packages.gz`, `Packages.xz`, and plain `Packages` variants in
-order — but only those the signed `Release` lists, with the digest and size it declares.
-A decode failure in one variant (e.g. a corrupt gzip stream) logs an honest
-`deb:`/`apt:` diagnostic on serial and falls through to the next variant instead of
-
-aborting; a **digest or size mismatch** does not fall through — it aborts the update,
-because a mismatch means the mirror served bytes that differ from the signed metadata. Package payloads unpack with tar symlinks/hardlinks materialized as file
-copies, since the ext2 writer has no symlink support.
-aborting. Package payloads unpack with tar symlinks and hardlinks **created as real
-links**: symlink inodes and shared inodes through the ext2 writer (issue #18), with
-the `tar` `'1'`/`'2'`/GNU-long-name/pax-prefix forms parsed and no silent
-truncation of paths over 100 bytes.
+order — but only those the signed `Release` lists, with the digest and size it declares
+(the variant list in `src/pkg/apt.rs::update`). A decode failure in one variant (e.g. a corrupt gzip stream)
+logs an honest `deb:`/`apt:` diagnostic on serial and falls through to the next variant;
+a **digest or size mismatch** does not fall through — it aborts the update, because a
+mismatch means the mirror served bytes that differ from the signed metadata. Package
+payloads unpack with tar symlinks and hardlinks **created as real links**: symlink inodes
+and shared inodes through the ext2 writer (issue #18), with the `tar`
+`'1'`/`'2'`/GNU-long-name/pax-prefix forms parsed and no silent truncation of paths over
+100 bytes.
 
 
 ## Trust status
