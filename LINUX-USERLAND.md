@@ -44,24 +44,29 @@ full-screen TUIs such as `nvim`.
   `uv__nonblock`); `TIOCGWINSZ`/`TIOCSWINSZ` work. The VT driver emulates CSI/ECMA-48
   sequences (including cursor interrogation replies, charset designation `ESC ( B`,
   and `ONLCR`).
-- Job control probes: `setpgid`/`getpgid`/`getpgrp` stubs (single process group),
-  `TIOCGPGRP`/`TIOCSPGRP`, and `wait4` accepting `WUNTRACED`/`WCONTINUED` — enough for
-  bash's job-control hot loop not to spin.
+- Job control: real process groups (`pgid` in `CompatState`, `setpgid`/`getpgid`/
+  `getpgrp`/`setsid`, `kill(0)`/`kill(-pgid)` addressing the group), a kernel-side
+  foreground process group on the console terminal (`TIOCGPGRP`/`TIOCSPGRP`),
+  `SIGTTIN`/`SIGTTOU` on background tty I/O, `wait4` with `WUNTRACED`/`WCONTINUED`,
+  `SIGCHLD` queued on child exit/stop/continue, and `^Z` stopping the foreground
+  *group* (`SIGTSTP`); the shell keeps a job table (`jobs`/`fg`/`bg`).
 
 ## First-boot provisioning
 
-A background kernel thread (`src/provision.rs`) makes this work out of the box on a
-fresh `disk.img` — **after an opt-in confirmation**:
+`src/provision.rs::seed()` runs once per freshly formatted disk, straight from the boot
+path after `/mnt` is mounted, and is idempotent (its guard is `/mnt/etc/pagh-release`):
 
-1. Seeds `/mnt` with release metadata, a home skeleton, and a mini-Rust example.
-2. Does not ask: the base userland is installed from the shell (`apt update` + `apt install python3`), so boot never waits on a keystroke.
-   `N` skips everything; `apt update` + `apt install python3` from the shell installs
-   the userland later at any time.
-3. On `Y`, runs `apt update` — streaming the Debian `Packages` index with a gz → xz →
-   plain decode fallback and honest `deb:`/`apt:` serial diagnostics on decode failure.
-4. Installs `python3` and its dependency closure (≈35 packages, ≈50 MB).
+1. Seeds `/mnt` with release metadata (`etc/pagh-release`) and a motd that carry the same
+   crate version, a home skeleton (`home/user/`), `/usr/share/pagh/`, a `resolv.conf`
+   pointing at slirp's DNS (`10.0.2.3`), and a mini-Rust example (`examples/hello`).
+2. Installs nothing over the network and asks nothing on the console: boot no longer
+   stops at a Y/n question, because a console prompt without a timeout is not something
+   boot may do.
 
-The thread is idempotent; delete `disk.img` to re-provision from scratch.
+The glibc + CPython userland is installed on demand from the shell instead:
+`apt update` streams the Debian `Packages` index (gz/xz/zstd decode, honest `deb:`/`apt:`
+diagnostics on failure), then `apt install python3` pulls its dependency closure
+(≈35 packages, ≈50 MB). Delete `disk.img` to re-seed from scratch.
 
 ## Installer details
 
@@ -74,29 +79,33 @@ The thread is idempotent; delete `disk.img` to re-provision from scratch.
 
 ## What does not work yet
 
-These return `-ENOSYS` or a stub (logged once per syscall number per process):
+Most of the Linux surface this document used to list is now implemented. The gaps that
+remain are named here rather than implied:
 
-- Signals: delivery is real at the syscall-return point AND from the timer-tick
-  return path (`rt_sigaction` handlers get a real `rt_sigframe`, `rt_sigreturn`
-  restores the context, `EINTR` wakes the patched blocking waits, `kill(2)`/`tgkill`
-  send signals including process-group broadcasts, `SIGSTOP`/`SIGCONT` park/resume
-  with `wait4(WUNTRACED)`/`WCONTINUED`, and a CPU-bound loop with no syscalls is
-  interrupted by the tick). Still missing: `SIGCHLD` on stop/continue, job-control
-  `^Z`, and a real process-group model.
-- `timerfd` — programs needing timerfd descriptors still fail.
-- `procfs` covers slices 1–3 (issue #11): `/proc/{cpuinfo,meminfo,uptime,stat,version,
-  filesystems,loadavg}`, the read-only `/proc/sys/kernel/{ostype,osrelease,hostname}`
-  stubs and `/proc/self/{exe,cmdline,status,maps}`, rendered from live kernel state
-  (contract: `docs/procfs.md`). `/proc/loadavg` reports honest `0.00` load averages
-  (no load accounting) plus live task counts. `/proc/<pid>`, `/proc/mounts` and
-  `/proc/self/{fd,stat,statm}` return `ENOENT`, so `htop`/`ps` still do not work;
-  `sysfs` does not exist at all.
-- Symbolic/hard links exist on ext2, resolve through the VFS and are what a `.deb` unpacks to
-  (issue #18): `lstat` differs from `stat`, `readlink` reports the stored target, two hard links
-  share `st_ino` with `st_nlink == 2`.
+Signals and the shell job table are implemented (syscall-return and timer-tick
+delivery, real `rt_sigframe`/`rt_sigreturn`, `kill(2)`/`tgkill` with process groups,
+`SIGSTOP`/`SIGCONT`, `SIGCHLD` on exit/stop/continue, `^Z` on the foreground group);
+`timerfd`/`signalfd`/`memfd_create` exist, and procfs covers slices 1–5 (issue #11):
+`/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts,self/*,<pid>/*}`,
+`/proc/<pid>/{fd,fdinfo,limits,cgroup,mountinfo}` and read-only
+`/proc/sys/kernel/{ostype,osrelease,hostname}`, all rendered from live kernel state
+(contract: `docs/procfs.md`; `/proc/loadavg` carries real decayed 1/5/15-minute
+averages). What this document still lists as missing, per that contract:
+
+- `sysfs` does not exist at all.
+- procfs deferrals: `/proc/<pid>/task/*`, mountinfo optional fields and statfs metadata.
+- tty/job-control deviations (stated in `AGENTS.md` and `drivers::tty` rather than
+  implied): no sessions (`getsid`/the `tcsetpgrp` session rule are approximated), a
+  background tty access returns `EINTR` instead of being restarted after `SIGCONT`,
+  `TOSTOP` defaults **on** where Linux defaults it off, `tcsetattr` from a background
+  group does not raise `SIGTTOU`, and `kill(-pgid)` queues one copy on the group leader
+  rather than one per thread group (the terminal/shell stop/continue broadcasts do use
+  per-thread-group delivery).
+- The `pkg <host> <path>` (index-free) downloader stays unverified by construction;
+  `apt` is the verified path (`SECURITY.md`).
 
 So: batch/console programs, the CPython REPL, and event-loop TUIs (`nvim`) run; the
-remaining gaps are timer-tick signal delivery/SIGSTOP-SIGCONT, timerfd, and the per-pid procfs tree.
+gaps left are the ones named above, plus the deliberately unverified manual `pkg` path.
 
 ## Troubleshooting
 

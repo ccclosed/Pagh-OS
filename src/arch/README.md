@@ -11,11 +11,12 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 |---|---|
 | `mod.rs` | Корень: `cpu`, `x86_64` |
 | `cpu.rs` | Безопасные обёртки: `enable_sse()`, `hlt`, `cli/sti`, `interrupts_enabled()`, `without_interrupts(f)`, `read_msr/write_msr` |
-| `x86_64/mod.rs` | Корень x86_64: `acpi`, `apic`, `gdt`, `idt`, `linux`, `syscall` |
+| `x86_64/mod.rs` | Корень x86_64: `acpi`, `apic`, `cpuid`, `gdt`, `idt`, `linux`, `syscall` |
 | `x86_64/gdt.rs` | GDT + TSS + IST-стеки, RSP0, селекторы |
 | `x86_64/idt.rs` | IDT: все исключения CPU, IRQ-векторы 32–47, гейт `int 0x80`, постмортем page-fault/#GP |
 | `x86_64/apic.rs` | LAPIC-таймер + I/O APIC роутинг + таблица обработчиков + EOI; гасит legacy 8259 PIC |
 | `x86_64/acpi.rs` | Разбор MADT через крейт `acpi`; кэш `ApicAddrs` |
+| `x86_64/cpuid.rs` | CPUID-половина `/proc/cpuinfo` (issue #11): читает листья в `CpuInfoData`, неподдерживаемые листья оставляет `None`; всё форматирование — в чистом `vfs::procfs_format` |
 | `x86_64/syscall.rs` | MSRs SYSCALL/SYSRET (STAR/LSTAR/SFMASK/EFER), голые стабы `int80_stub`/`syscall_entry`, legacy-диспетчер, `sys_write`/`sys_exit` |
 | `x86_64/linux/` | Слой совместимости с Linux x86_64 бинарями (см. ниже) |
 

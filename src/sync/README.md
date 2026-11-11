@@ -25,9 +25,11 @@
 ## Зависимости
 
 - **От:** `arch::cpu::{interrupts_enabled, disable_interrupts, enable_interrupts}`. Больше ни от чего.
-- **На неё:** ~34 файла ядра. Все глобалы — `Spinlock<...>`: планировщик
+- **На неё:** почти всё ядро — все глобалы это `Spinlock<...>`: планировщик
   (`READY_QUEUE`, `COMPAT_STATES`, `EXITING_PIDS`, `PENDING_REAPS`), FPU-области,
   futex-очереди, pipes, Unix-слушатели, `VmRegionSet`, watchdog syscall'ов, net и драйверы.
+  Точный список пользователей: `grep -rl 'Spinlock' src --include=*.rs` (число меняется с
+  каждым новым модулем, поэтому здесь не фиксируется).
 
 ## Правила (грабли)
 

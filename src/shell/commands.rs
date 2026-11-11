@@ -887,8 +887,9 @@ pub(super) fn cmd_nano(_ctx: &mut ShellCtx, args: &[&str]) {
     super::nano::run(args[0]);
 }
 
-/// `rust <path> [args...]`: run a statically linked Rust Linux binary.
-/// This is a friendly alias for the Linux compatibility loader.
+/// `rust <path> [args...]`: run a mini-Rust source/package, or a Linux ELF.
+/// A `.rs`/`.pbc` path goes to the embedded mini-Rust toolchain; anything else
+/// is handed to the Linux compatibility loader (`cmd_lxrun`).
 pub(super) fn cmd_rust(ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
         shell_println("usage: rust <file.rs|file.pbc|static-elf> [args...]");
