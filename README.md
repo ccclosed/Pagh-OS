@@ -430,7 +430,7 @@ framebuffer (serial stays plain text).
 | `sleep <seconds>`    | Sleep for N seconds                                             |
 | `nano <path>`        | Full-screen editor: undo/redo, search/replace, goto, clipboard  |
 | `rust <path> [...]`  | Run `.rs`/`.pbc` with mini-Rust, or any ELF via the Linux layer |
-| `rustc <file.rs>`    | Compile mini-Rust source into an offline `.pbc` package         |
+| `rustc <file.rs>`    | Compile Rust source to a `.pbc` (real `/mnt/usr/bin/rustc` if installed, else embedded mini-Rust) |
 | `cargo …`            | Real `/mnt/usr/bin/cargo` if installed, else embedded mini-Rust |
 | `rustup …`           | Inspect the built-in offline mini-Rust toolchain                |
 | `lua [file\|-e code]` | Run Lua 5.5 (installed via apt)                                |
