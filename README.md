@@ -11,7 +11,48 @@
   <img alt="no_std" src="https://img.shields.io/badge/%23!%5Bno__std%5D-yes-informational.svg">
   <img alt="Bootloader: Limine" src="https://img.shields.io/badge/boot-Limine-purple.svg">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green.svg">
+  <a href="https://github.com/ccclosed/Pagh-OS/releases/tag/2.18.12-demo"><img alt="Try it: bootable demo image" src="https://img.shields.io/badge/try%20it-bootable%20demo%20image-brightgreen.svg"></a>
 </p>
+
+<p align="center">
+  <a href="docs/demo.mp4"><img src="docs/demo.gif" width="960" alt="pagh booting in QEMU: the shell, the paint app drawing a house, the nano+ editor and the settings panel with live themes"></a>
+  <br>
+  <sub><i>24 s of a real QEMU/OVMF boot, recorded from the framebuffer — boot, shell, paint, nano+, themes. <a href="docs/demo.mp4">MP4</a></i></sub>
+</p>
+
+<p align="center">
+  <b>Try it in one command — no Rust toolchain needed:</b><br>
+  <code>tar xzf pagh-demo-x86_64.tar.gz &amp;&amp; cd pagh-demo-x86_64 &amp;&amp; ./run.sh</code><br>
+  <sub>download the bootable image from the <a href="https://github.com/ccclosed/Pagh-OS/releases/tag/2.18.12-demo">demo bundle release</a> · needs <code>qemu-system-x86_64</code> + OVMF · <code>Ctrl+Alt+G</code> releases the mouse, then <code>quit</code></sub>
+</p>
+
+### What works today
+
+- **Boot:** Limine/UEFI → 1280×800 framebuffer console with a coloured prompt and status bar.
+- **Shell:** line editing, history, tab completion, `ls`/`df`/`ifconfig`/`ps`, ext2 file ops, `selftest`.
+- **GUI apps:** the mouse-driven `paint` (shape tools, 16-colour palette, brush sizes, undo, save to ext2), the full-screen `nano+` editor, and `settings` with live colour themes + wallpapers.
+- **Storage:** ext2-compatible read/write filesystem with a write-ahead-log journal, on a real virtio-blk disk.
+- **Networking:** the kernel's own e1000 + TCP/IP stack (DHCP/ARP/TCP/UDP; `ifconfig` shows the live lease).
+- **Processes:** preemptive ~1 kHz scheduler, ring-3 user processes, `SYSCALL`/`int 0x80`.
+
+*Not shown in the demo above (implemented, but not exercised in this capture):* the
+`apt`-style Debian package manager over HTTPS/TLS with OpenPGP-verified metadata, the
+Linux-x86_64 binary compatibility layer with CPython 3.16, and ext2 WAL crash/replay
+recovery (`fscrash`). See the deep docs below.
+
+**Build and run from source** (Rust nightly with `rust-src`, QEMU + OVMF; Limine is
+fetched automatically):
+
+```sh
+git clone https://github.com/ccclosed/Pagh-OS && cd Pagh-OS
+./run.sh --release
+```
+
+**Deep docs:** [Quick start](#quick-start) · [Boot output](#boot-output) ·
+[Shell commands](#shell-commands) · [Graphics & paint](#graphics--the-paint-app) ·
+[Architecture](#architecture) · [Correctness & testing](#correctness-properties--testing) ·
+[Linux binaries & packages](#linux-binaries--debian-packages) · [Security model](SECURITY.md) ·
+[Contributing](CONTRIBUTING.md)
 
 ---
 
