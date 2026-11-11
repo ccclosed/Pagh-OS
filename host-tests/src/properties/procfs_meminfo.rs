@@ -1,5 +1,6 @@
-// Feature: procfs (issue #11), contract `docs/procfs.md` §4.1/§7.2 (property topic
-// P51). `/proc/meminfo` is read by libuv (`uv_get_total_memory` /
+// Feature: procfs (issue #11), contract `docs/procfs.md` §4.1/§7.2. The p51-p55
+// numbers from the original plan are now other properties (OpenPGP); this one is
+// named after what it covers. `/proc/meminfo` is read by libuv (`uv_get_total_memory` /
 // `uv_get_free_memory`: `strstr(buf, "MemTotal:")` then `sscanf("%llu kB")`),
 // busybox `free`, htop and psutil. Those parsers split on whitespace but require
 // the `Key:` + value + `" kB"` shape exactly, so the formatter — not the kernel

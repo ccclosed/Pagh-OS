@@ -1,5 +1,6 @@
-// Feature: procfs (issue #11), contract `docs/procfs.md` §4.2/§7.2 (property topic
-// P52). `/proc/cpuinfo` is parsed by libuv's `uv_cpu_info` with byte-exact
+// Feature: procfs (issue #11), contract `docs/procfs.md` §4.2/§7.2. (The p51-p55
+// numbers from the original plan now belong to other properties: OpenPGP.)
+// `/proc/cpuinfo` is parsed by libuv's `uv_cpu_info` with byte-exact
 // formats — `fscanf(fp, "processor\t: %u\n", &cpu)` and the literal
 // `"model name\t: "` — by Python's `platform` module, and by busybox applets.
 //

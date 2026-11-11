@@ -1,5 +1,6 @@
-// Feature: procfs (issue #11), contract `docs/procfs.md` §4.6/§5.3/§7.2 (property
-// topic P55). `/proc/self/maps` is the address-space map read by sanitizers,
+// Feature: procfs (issue #11), contract `docs/procfs.md` §4.6/§5.3/§7.2. (The
+// p51-p55 numbers from the original plan now belong to other properties: OpenPGP.)
+// `/proc/self/maps` is the address-space map read by sanitizers,
 // `addr2line`-style symbolizers, Go's `runtime.dumpregs` and debuggers. Those
 // consumers parse the fixed fields positionally and binary-search the range list,
 // so the line shape, the ordering and the absence of overlap are all contract.

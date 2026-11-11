@@ -1,5 +1,6 @@
-// Feature: procfs (issue #11), contract `docs/procfs.md` §4.4/§7.2 (property topic
-// P54). `/proc/self/cmdline` is the NUL-separated argv: procps `ps`, busybox and
+// Feature: procfs (issue #11), contract `docs/procfs.md` §4.4/§7.2. (The p51-p55
+// numbers from the original plan now belong to other properties: OpenPGP.)
+// `/proc/self/cmdline` is the NUL-separated argv: procps `ps`, busybox and
 // every "what is this process running" tool parse it. Byte fidelity matters more
 // than anywhere else in procfs — argv is `&[u8]` all the way from `execve`, and
 // anything that round-trips through `String` would corrupt a non-UTF-8 argument.
