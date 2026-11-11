@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Build the bootable media pagh runs from on real hardware.
 
-The kernel is a Limine UEFI payload, so the image is UEFI-only:
-
 * ``--usb dist/pagh-usb.img`` — a GPT image with one FAT32 EFI System Partition
   holding the loader, the kernel and the disk image. ``dd`` it onto a USB stick
   and any UEFI machine boots it. This is the artifact for a real PC: an optical
   drive is the exception now, a USB port is not.
-* ``--iso dist/pagh.iso`` — an ISO9660 disc with an El Torito EFI entry, which
-  is what a Ventoy stick (or a virtual machine, or an optical drive) wants. The
-  writer is `tools/iso9660.py`; its docstring records the exact conditions
-  firmware checks, taken from EDK2's El Torito source, because guessing them cost
-  several non-booting images.
+* ``--iso dist/pagh.iso`` — a DUAL-FIRMWARE ISO9660 disc: Limine's own CD
+  loaders, ``limine-bios-cd.bin`` as the BIOS El Torito entry (plus
+  ``limine-bios.sys`` on the volume) and ``limine-uefi-cd.bin`` as the EFI boot
+  image, which is what a Ventoy stick (offered in both Legacy and UEFI mode), a
+  virtual machine or an optical drive wants. Built with ``xorriso -as mkisofs``;
+  a UEFI-only disc was the first version here and does not boot at all when
+  Ventoy starts it in Legacy mode.
 
 WHY THE DISK IMAGE IS ON THE MEDIA. The kernel mounts virtio-blk or NVMe and
 nothing else, so a PC with only SATA comes up with no ``/mnt`` — a shell and no
@@ -19,15 +19,11 @@ programs. Limine loads ``disk.img`` next to the kernel and ``drivers::memdisk``
 presents it as a block device, so the medium carries the system. Writes go to
 RAM and are lost on reboot; the boot menu says so.
 
-WHY NOT xorriso. Building a UEFI-bootable ISO normally means ``xorriso -as
-mkisofs --efi-boot-part``. That tool is not part of a base system, so the ISO
-writer here is a small, self-contained implementation of exactly what the
-firmware needs (ISO9660 primary volume descriptor + El Torito EFI entry). It has
-no dependency beyond the Python standard library and the repo's own Limine tree.
-
-The FAT partition is written with ``mtools`` (``mformat``/``mcopy``), which is
-the one external tool required — and it is only needed for the partition
-formatting, not for the ISO layout.
+TOOLS REQUIRED. ``parted`` writes the GPT (both images and ``--make-disk``);
+``mtools`` (``mformat``/``mcopy``/``mmd``) fills the ESP without loop devices or
+root; ``xorriso`` builds the ISO and is the only tool the ISO path needs beyond
+the repo's own Limine tree (which ``tools/limine.py`` locates/fetches and which
+must contain the CD loaders).
 
 Usage:
     python3 tools/mkimage.py --usb dist/pagh-usb.img
@@ -303,7 +299,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--usb", metavar="PATH", help="write a GPT+ESP USB image here")
-    ap.add_argument("--iso", metavar="PATH", help="write an El Torito UEFI ISO here")
+    ap.add_argument("--iso", metavar="PATH", help="write a BIOS+UEFI ISO here")
     ap.add_argument("--disk", metavar="PATH", help="disk image to embed (default disk.img)")
     ap.add_argument("--make-disk", metavar="PATH",
                     help="create a GPT disk image with one ext2 partition here and exit")
