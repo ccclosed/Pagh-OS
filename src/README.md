@@ -132,7 +132,7 @@ Sinks: serial всегда, framebuffer условно. Гейты fb-зерка
 убила бы харнесс (`panic = "abort"`). Хелпер `with_synth_compat` ставит временный
 `CompatState`; scratch-страница на `0x0000_4000_0000_0000` для user-указателей.
 
-### `test.rs` — in-QEMU kernel self-test suite (89 рутин)
+### `test.rs` — in-QEMU kernel self-test suite (список рутин — `all_tests()`)
 - `assert_kernel!`/`assert_eq_kernel!` печатают `FAIL: file:line: msg` и продолжают (не аборт).
 - `all_tests() -> Vec<(&'static str, fn())>`; `run_all()` — вызывается вручную командой
   `selftest` в shell, не на буте. Все рутины неразрушающие (восстанавливают PMM, кучу, IF, VFS).

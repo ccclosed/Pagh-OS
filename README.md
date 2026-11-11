@@ -632,8 +632,9 @@ python
   report the documented 0 sentinel. `/proc/<pid>/limits` renders the 16 Linux
   rlimit rows from the target's override table and the kernel defaults (stack
   8 MiB, nofile 1024/1024, everything else `unlimited`). `/proc/loadavg` reports
-  real 1/5/15-minute load averages (there is no load accounting) plus live
-  runnable/total counts and the last allocated pid. Still deferred:
+  real exponentially decayed 1/5/15-minute load averages (fixed point 16.16,
+  displayed with two decimals) plus live runnable/total counts and the last allocated
+  pid. Still deferred:
   `/proc/<pid>/task/*` and mountinfo optional fields/statfs metadata. See
   `docs/procfs.md` for the exact contract. Signal
   delivery is real both at the syscall-return point and on the timer-tick return
@@ -880,12 +881,12 @@ comments.
 
 ## Correctness properties & testing
 
-The kernel ships an in-QEMU harness (`src/test.rs`): 89 routines, of which the 29 numbered
-correctness properties are the core (the rest are issue-regression routines — signals,
-job control, USB HID, NVMe PRP lists, procfs, and so on). Each property routine runs ≥100
-randomized iterations against pure logic or a RAM-mock
-device (no hardware dependency). Run them from the shell with `selftest`; results print
-over serial as `ok`/`FAIL` lines.
+The kernel ships an in-QEMU harness (`src/test.rs`): `all_tests()` lists dozens of
+routines, of which the 29 numbered correctness properties (P1–P29) are the core — the
+rest are issue-regression routines (signals, job control, USB HID, NVMe PRP lists,
+procfs, and so on). Each property routine runs ≥100 randomized iterations against pure
+logic or a RAM-mock device (no hardware dependency). Run them from the shell with
+`selftest`; results print over serial as `ok`/`FAIL` lines.
 
 For logic that is cleanly extractable to the host, a separate, workspace-excluded
 `host-tests/` crate runs [`proptest`](https://crates.io/crates/proptest)-based property
