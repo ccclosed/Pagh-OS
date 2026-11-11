@@ -13,6 +13,7 @@ in-guest verification the project does:
     tools/smoke_assertions.ps1   ->  python3 tools/e2e.py smoke
     (new)                        ->  python3 tools/e2e.py selftest
     (new, generic)               ->  python3 tools/e2e.py shell --cmd '...' --expect '...'
+    (new, USB input)             ->  python3 tools/e2e.py usb
 
 BOOT IDENTITY (why a green run is trustworthy): `elf_sha256` is the hash of the
 BUILT artifact, which by itself proves nothing about what the guest executed — an
@@ -37,6 +38,12 @@ into the guest through the QEMU monitor (`-monitor unix:<sock>`, `sendkey`),
 exactly like a human at the keyboard, while the guest's own serial output is read
 back from the `-serial file:` log. This is what makes the in-guest `selftest`
 shell command scriptable.
+
+The `usb` mode turns that input path into the thing under test: it boots with an
+emulated xHCI controller plus a USB keyboard and mouse, drives the boot-time disk
+menu and the shell through them with the same `sendkey`, and asserts the driver's
+own HID evidence on serial (`input: usb: ... kbd N reports`, `HID device on
+port ...`) instead of assuming the keystrokes took the PS/2 route.
 
 THE DEFAULT ARTIFACTS ARE NEVER LOST: `iso_root/pagh.elf` (and the linked
 `target/<triple>/<profile>/pagh.elf`) are backed up before staging and restored
@@ -81,6 +88,10 @@ MINI_REPO_BACKUP = CACHE / "e2e_mini_repo_backup"
 sys.path.insert(0, str(TOOLS))
 import build as build_driver  # noqa: E402
 import limine  # noqa: E402
+# The project's monitor client (sendkey validation, named keys, screendump). The
+# `usb` mode drives the emulated USB HID devices through it rather than growing a
+# second implementation of the monitor protocol next to `Keyboard`.
+import qemu_shot  # noqa: E402
 
 EXIT_PASS = 0
 EXIT_FAIL = 1
@@ -118,6 +129,10 @@ MODE_DEFAULTS = {
     "live-update": {"timeout": 1200.0, "serial": "serial_live.log"},
     "bigindex": {"timeout": 300.0, "serial": "serial_bigindex.log"},
     "shell": {"timeout": 180.0, "serial": "serial_shell.log"},
+    # USB input: boot (menu appears once init_fs runs) + drive + shell + `usb`.
+    # The waits are generous on purpose: this runs under TCG, and a timeout is a
+    # verdict, not a retry knob.
+    "usb": {"timeout": 180.0, "serial": "serial_usb.log"},
 }
 
 # Features a mode cannot work without; `--features` only ADDS to this list.
@@ -145,6 +160,10 @@ MODE_EVIDENCE = {
     ),
     "shell": (
         r"SELFTEST|LXSELFTEST|EXC #|FAIL|PASS|hello|apt:|pagh:/>",
+    ),
+    "usb": (
+        r"input: usb:|xhci: HID device on port|usb: \d+ controller|usb: key reports|"
+        r"fs: operator chose to format|ext2 mounted at /mnt|pagh:/>",
     ),
 }
 
@@ -493,6 +512,42 @@ def prepare_disk(explicit: str | None, reuse_scratch: bool) -> pathlib.Path:
     return scratch
 
 
+def prepare_usb_menu_disk(path: pathlib.Path) -> pathlib.Path:
+    """Write the deterministic data disk the `usb` mode's boot menu needs.
+
+    WHY a generated image: the boot-time disk menu only appears when the machine
+    exposes at least one partition, and the repo's `disk.img` is a git-ignored
+    developer artifact — a clean checkout has none, and `prepare_disk`'s fallback
+    is a *whole-disk* blank image, which the boot path formats without asking and
+    which therefore gives the menu nothing to show. An MBR with two blank Linux
+    partitions is the smallest deterministic state that yields a menu (two rows,
+    so both arrow keys are meaningful) and is exactly what
+    `drivers::partition::parse_mbr` reads.
+
+    Two blank partitions, not one: on row 1 Enter must be refused ("nothing to
+    mount here"), `F` must open the typed-confirmation prompt, Esc must cancel it,
+    and `F` + the exact device name must be the only route that formats. That is
+    the path the `usb` scenario drives with real keystrokes, so it exercises more
+    than "one key was seen".
+
+    Deterministic: byte-identical every run, freshly written into `.cache/`
+    (git-ignored), never staged or committed.
+    """
+    total = 64 * 1024 * 1024  # same size `prepare_disk` uses for a scratch disk
+    image = bytearray(total)
+    for index, (first_lba, sectors) in enumerate(((2048, 60_000), (62_048, 60_000))):
+        entry = 446 + index * 16  # MBR partition entry `index`
+        image[entry + 4] = 0x83  # Linux partition type -> `...p1`/`...p2` slices
+        struct.pack_into("<I", image, entry + 8, first_lba)
+        struct.pack_into("<I", image, entry + 12, sectors)
+    image[510], image[511] = 0x55, 0xAA  # MBR boot signature
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(image)
+    log(f"usb: deterministic menu disk {rel(path)} "
+        f"(64 MiB, MBR, 2 blank partitions at LBA 2048/62048)")
+    return path
+
+
 def _elf_load_ranges(data: bytes) -> list[tuple[int, int]]:
     """File-offset range of every PT_LOAD segment of an ELF64 LSB image.
 
@@ -786,6 +841,60 @@ class Keyboard:
             except OSError:
                 pass
             self.sock = None
+
+
+class QemuShotKeyboard:
+    """Monitor client for the `usb` mode, backed by `tools/qemu_shot.py`.
+
+    WHY NOT `Keyboard`: the USB acceptance scenario needs a little more than
+    `sendkey` — it captures the framebuffer as evidence and wants every monitor
+    command validated, and both are what `qemu_shot.Monitor` already does (it is
+    also the client the docs point users at). Growing a second copy of the
+    protocol here would be the thing the repo keeps deleting. This adapter only
+    exposes the surface the shared helpers use (`key`/`text`, so `wait_for_shell`
+    can take it) and translates qemu_shot's `SystemExit` into `HarnessError`, so a
+    dead monitor is reported as a harness failure with the run's own summary
+    instead of escaping through the top level.
+
+    ONE CLIENT AT A TIME: QEMU's monitor chardev answers one connection; the
+    harness's own `Keyboard` is not used in this mode for that reason.
+    """
+
+    def __init__(self, monitor_path: pathlib.Path, key_delay: float = 0.15) -> None:
+        self.path = monitor_path
+        self.key_delay = key_delay
+        self.mon: qemu_shot.Monitor | None = None
+
+    def connect(self, timeout: float = 120.0) -> None:
+        try:
+            self.mon = qemu_shot.Monitor(str(self.path), timeout=timeout)
+        except SystemExit as exc:
+            raise HarnessError(f"QEMU monitor unreachable ({self.path}): {exc}") from exc
+
+    def _guard(self, what: str, call, *args, **kwargs):
+        if self.mon is None:
+            raise HarnessError("QEMU monitor not connected")
+        try:
+            return call(*args, **kwargs)
+        except SystemExit as exc:
+            raise HarnessError(f"QEMU monitor command failed ({what}): {exc}") from exc
+
+    def key(self, name: str, delay: float | None = None) -> None:
+        """Press one named QEMU key (`down`, `ret`, `esc`, or a single character)."""
+        self._guard("sendkey", self.mon.send_key, name,
+                    delay=self.key_delay if delay is None else delay)
+
+    def text(self, text: str) -> None:
+        """Type text one `sendkey` per character."""
+        self._guard("sendkey", self.mon.send_keys, text, delay=self.key_delay)
+
+    def screenshot(self, path: pathlib.Path) -> None:
+        self._guard("screendump", self.mon.screendump, pathlib.Path(path))
+
+    def close(self) -> None:
+        if self.mon is not None:
+            self.mon.close()
+            self.mon = None
 
 
 # ───────────────────────── serial waiting ─────────────────────────
@@ -1157,11 +1266,25 @@ class Harness:
                  + " — a green verdict from this run does NOT prove which image the guest ran; "
                    "apply tools/e2e_bootid_kernel.patch and re-run")
 
-    def boot(self, *, net: bool = True, need_keyboard: bool = False) -> None:
+    def boot(self, *, net: bool = True, need_keyboard: bool = False,
+             usb_hid: bool = False, disk: pathlib.Path | None = None) -> None:
+        """Start one headless QEMU instance.
+
+        `usb_hid=True` attaches the device set the USB-input scenario needs — an
+        emulated xHCI controller with a USB keyboard and mouse on it; the kernel
+        drives that controller itself. PS/2 is still emulated by the q35 machine
+        and cannot be removed, so the mode proves the USB path with the xHCI HID
+        report counters, not with an absence of PS/2.
+
+        `disk` overrides the data image (`prepare_disk` is skipped): the `usb`
+        mode supplies its own deterministic MBR-partitioned image so the boot
+        menu always has a row to drive.
+        """
         a = self.a
         if not shutil.which("qemu-system-x86_64"):
             raise SetupError("qemu-system-x86_64 not found in PATH")
-        disk = prepare_disk(a.disk, a.reuse_scratch_disk)
+        disk = (pathlib.Path(disk) if disk is not None
+                else prepare_disk(a.disk, a.reuse_scratch_disk))
         self.run_dir.mkdir(parents=True, exist_ok=True)
         _, ovmf_args = resolve_ovmf(a.ovmf, self.vars_path)
         argv = ["qemu-system-x86_64", "-cpu", a.cpu, "-m", a.memory]
@@ -1174,6 +1297,15 @@ class Harness:
         argv += ["-drive", f"file=fat:rw:{self.stage_dir},format=raw",
                  "-drive", f"file={disk},format=raw,if=none,id=hd0",
                  "-device", data_device]
+        if usb_hid:
+            # Physical-machine shape: a controller the kernel owns, with the two
+            # boot-protocol HID devices a keyboard and a mouse present. QEMU's
+            # `sendkey` (and the monitor generally) then feeds the emulated USB
+            # devices; the boot menu polls the controller synchronously because it
+            # runs before interrupts are enabled.
+            argv += ["-device", "qemu-xhci,id=xhci",
+                     "-device", "usb-kbd,bus=xhci.0",
+                     "-device", "usb-mouse,bus=xhci.0"]
         if net:
             # QEMU user-net: the guest reaches a host-side mirror on 10.0.2.2:8000
             # and, for the live mode, the outside world.
@@ -1447,6 +1579,227 @@ def mode_bigindex(h: Harness) -> tuple[str, int]:
     return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
 
 
+def mode_usb(h: Harness) -> tuple[str, int]:
+    """USB-input acceptance: the emulated USB HID devices drive menu AND shell.
+
+    THE CLAIM THIS PINS DOWN: `src/drivers/README.md` (USB xHCI + HID) and the
+    AGENTS 2.18.x notes say the whole input path works in QEMU with `-device
+    qemu-xhci -device usb-kbd`, but the harness that showed it lived outside the
+    repository, so CI and a contributor from a clean checkout could not re-run the
+    claim. This mode is that harness, committed:
+
+    1. boot the staged image with an emulated xHCI controller plus a USB keyboard
+       and mouse (`Harness.boot(usb_hid=True)`) and a deterministic MBR data disk
+       (`prepare_usb_menu_disk`) that gives the boot-time disk menu two rows;
+    2. as soon as the menu is drawn, drive it over the emulated USB keyboard:
+       Down/Up (both arrows), Enter on the blank row (must be refused), `F` (opens
+       the typed confirmation), Esc (must cancel it), `F` again, type the exact
+       device name, Enter — the only menu path that formats;
+    3. wait for `operator chose to format <device>p1` + `ext2 mounted at /mnt`,
+       then for the shell prompt;
+    4. type `usb` in the shell over the same USB keyboard and assert the driver's
+       own evidence: `input: usb: ... 2 HID, kbd N reports`, `xhci: HID device on
+       port ...` with protocol=1 (keyboard) and protocol=2 (mouse), and the `usb`
+       command's port table showing both devices connected/enabled at high speed.
+
+    WHY THE REPORT COUNTERS ARE THE PROOF: q35 always emulates i8042 (`ps2: yes`
+    in the banner) and QEMU cannot be told to remove it, so a keystroke could in
+    principle travel the PS/2 route. The xHCI HID report counters move only when
+    the kernel's own driver consumes a boot-protocol report from the emulated USB
+    device, so `kbd reports` growing across the menu AND again after typing in the
+    shell is evidence the USB path carried them. The typed device name is a
+    second, independent check: a wrong or dropped character would format nothing.
+    """
+    a = h.a
+    device = "virtio-blk0"  # main() refuses --nvme for this mode (see there)
+    disk = prepare_usb_menu_disk(CACHE / "e2e_usb_disk.img")
+    h.boot(usb_hid=True, disk=disk)
+    assert h.guest is not None
+    guest = h.guest
+    kb = QemuShotKeyboard(h.monitor, a.key_delay)
+    menu_shot = CACHE / "e2e_usb_menu.png"
+    menu_driven_shot = CACHE / "e2e_usb_menu_driven.png"
+    shell_shot = CACHE / "e2e_usb_shell.png"
+    timeout = h.timeout
+    try:
+        kb.connect(timeout=min(a.boot_timeout, 180.0))
+        # The disk menu is drawn to the framebuffer only, so the serial line that
+        # immediately precedes it is the readiness signal: init_fs registers the
+        # partitions (`part:` lines), then calls boot_menu::run, which polls the
+        # xHCI controller synchronously for at most 20 s. Keys sent after this
+        # marker therefore land in the menu, not before it.
+        menu_marker = rf"part: MBR on {re.escape(device)}: 2 partition\(s\)"
+        if wait_for(guest, [menu_marker], min(a.boot_timeout, 180.0),
+                    label="boot disk menu") is None:
+            raise HarnessError(
+                f"the boot disk menu never appeared: no partition report for {device} "
+                f"on serial; serial tail:\n{tail(guest.serial())}")
+        log("disk menu up; waiting for its first xHCI enumeration poll")
+        # The menu's first poll enumerates the controller synchronously — that is
+        # the design point being tested (the menu must work before interrupts).
+        # Waiting for the mouse's HID line is a deterministic "the menu is polling
+        # USB now" signal, and it makes the baseline screenshot show the devices.
+        if wait_for(guest, [r"xhci: HID device on port \d+: .*protocol=2"],
+                    min(a.boot_timeout, 120.0), label="USB HID enumeration in the menu") is None:
+            raise HarnessError(
+                "the disk menu never enumerated the USB HID devices; serial tail:\n"
+                + tail(guest.serial()))
+        log("USB HID devices enumerated; driving the menu over the emulated keyboard")
+        time.sleep(0.3)  # let the frame with the enumeration line land
+        kb.screenshot(menu_shot)
+        # Down: selection moves to row 2, and the menu's own input summary gains
+        # keyboard reports — the screenshot below is the kept evidence for it.
+        kb.key("down")
+        time.sleep(1.2)  # the menu redraws once a second
+        kb.screenshot(menu_driven_shot)
+        # Up: both arrow keys must reach the menu. Selection is back on row 1,
+        # which the typed name below proves (a stale row 2 would mismatch).
+        kb.key("up")
+        time.sleep(0.2)
+        # Enter on the blank row must be REFUSED (it never formats); the menu
+        # stays up with "nothing to mount here".
+        kb.key("ret")
+        time.sleep(0.2)
+        # F opens the typed confirmation, Esc must cancel it without formatting.
+        kb.key("f")
+        time.sleep(0.2)
+        kb.key("esc")
+        time.sleep(0.2)
+        # F again + the EXACT device name + Enter: the only menu action that
+        # formats. Every character below travels over the emulated USB keyboard.
+        kb.key("f")
+        time.sleep(0.2)
+        kb.text(f"{device}p1")
+        kb.key("ret")
+        log(f"typed {device}p1 in the menu; waiting for the format/mount pair")
+        if wait_for(guest, [r"ext2 mounted at /mnt"], timeout,
+                    label="partition formatted from the menu") is None:
+            raise HarnessError(
+                "the partition chosen in the menu was not formatted and mounted "
+                f"(the typed confirmation did not go through?); serial tail:\n"
+                f"{tail(guest.serial())}")
+        if not wait_for_shell(guest, kb, a, a.boot_timeout):
+            raise HarnessError(f"the shell prompt never appeared within "
+                               f"{a.boot_timeout:.0f}s; serial tail:\n{tail(guest.serial())}")
+        if wait_for(guest, [r"input: usb:"], timeout, label="USB input summary") is None:
+            raise HarnessError("the shell banner never reported the USB input summary; "
+                               f"serial tail:\n{tail(guest.serial())}")
+        log("shell prompt reached; typing `usb` over the same USB keyboard")
+        kb.text("usb")
+        kb.key("ret")
+        if wait_for(guest, [r"usb: key reports \d+, mouse reports \d+"], timeout,
+                    label="`usb` command output") is None:
+            raise HarnessError("the in-guest `usb` command produced no report counters; "
+                               f"serial tail:\n{tail(guest.serial())}")
+        time.sleep(a.settle)  # let the port-table lines land before the screenshot
+        kb.screenshot(shell_shot)
+    finally:
+        kb.close()
+
+    text = guest.serial()
+
+    # ── the run really used the USB device set ──
+    argv = guest.argv
+    ok = h.check(
+        "QEMU command line carries qemu-xhci + usb-kbd + usb-mouse",
+        any(token.startswith("qemu-xhci") for token in argv)
+        and "usb-kbd,bus=xhci.0" in argv
+        and "usb-mouse,bus=xhci.0" in argv,
+        "-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 "
+        "-device usb-mouse,bus=xhci.0")
+
+    # ── enumeration (boot log): the controller configured both HID devices ──
+    kbd_hid = regex_first(
+        r"xhci: HID device on port \d+: iface=0 subclass=1 protocol=1[^\r\n]*", text)
+    mouse_hid = regex_first(
+        r"xhci: HID device on port \d+: iface=0 subclass=1 protocol=2[^\r\n]*", text)
+    ok &= h.check("xHCI enumerated the USB keyboard (boot-protocol HID)", bool(kbd_hid),
+                  kbd_hid or "not found")
+    ok &= h.check("xHCI enumerated the USB mouse too (boot-protocol HID)",
+                  bool(mouse_hid), mouse_hid or "not found")
+
+    # ── the menu decision: only the typed confirmation can format ──
+    chose = regex_first(
+        rf"fs: operator chose to format {re.escape(device)}p1[^\r\n]*", text)
+    ok &= h.check("the menu's typed confirmation selected the format path",
+                  bool(chose), chose or "not found")
+    mounted = regex_first(r"ext2 mounted at /mnt", text)
+    ok &= h.check("/mnt mounted on the partition formatted from the menu",
+                  bool(mounted), mounted or "not found")
+
+    # ── the shell banner's input summary ──
+    banner = re.search(
+        r"input: usb: (\d+) ctrl, (\d+) ports, device on \[([0-9,]*)\], "
+        r"(\d+) HID, kbd (\d+) / mouse (\d+) reports(?:, (\d+) unmapped)? \| ps2: (yes|no)",
+        text)
+    ok &= h.check("shell banner prints the USB input summary", bool(banner),
+                  banner.group(0) if banner else "no `input: usb:` line")
+    kbd_before = -1
+    if banner:
+        hid, kbd_before = int(banner.group(4)), int(banner.group(5))
+        ok &= h.check("two HID devices configured (USB keyboard + mouse)", hid == 2,
+                      f"{hid} HID device(s)")
+        ok &= h.check(
+            "xHCI received keyboard reports before the shell typed anything "
+            "(the menu keystrokes took the USB path)",
+            kbd_before > 0, f"{kbd_before} key report(s) at the shell banner")
+
+    # ── the `usb` command typed over USB in the shell ──
+    summary = re.search(
+        r"usb: (\d+) controller\(s\), active one (\d+) ports, (\d+) HID device\(s\), "
+        r"(\d+) report\(s\)", text)
+    stats = re.search(
+        r"usb: key reports (\d+), mouse reports (\d+), unmapped usages (\d+)", text)
+    ok &= h.check("in-guest `usb` command reported the controller", bool(summary),
+                  summary.group(0) if summary else "not found")
+    ok &= h.check("in-guest `usb` command reported the HID report counters", bool(stats),
+                  stats.group(0) if stats else "not found")
+    if summary:
+        ok &= h.check("the xHCI controller was found and started",
+                      int(summary.group(1)) >= 1, f"{summary.group(1)} controller(s)")
+        ok &= h.check("two HID devices are attached to the active controller",
+                      int(summary.group(3)) == 2, f"{summary.group(3)} HID device(s)")
+    if stats:
+        final_kbd = int(stats.group(1))
+        ok &= h.check("keyboard reports > 0", final_kbd > 0, f"{final_kbd} report(s)")
+        if banner:
+            ok &= h.check(
+                "the shell command's keystrokes also arrived over the USB path",
+                final_kbd > kbd_before,
+                f"{kbd_before} -> {final_kbd} report(s) after typing `usb`")
+    enabled = re.findall(r"^\s*\d+\s+0x[0-9a-f]+\s+true\s+true\s+true\s+high\s+U0\s*$",
+                         text, re.M)
+    ok &= h.check("the `usb` port table shows both devices connected/enabled at high "
+                  "speed", len(enabled) >= 2, f"{len(enabled)} enabled high-speed port row(s)")
+
+    # ── screenshot evidence (framebuffer; serial is the verdict) ──
+    ok &= h.check("boot menu screenshot captured",
+                  menu_shot.is_file() and menu_shot.stat().st_size > 0, rel(menu_shot))
+    ok &= h.check("menu screenshot after a USB keypress captured",
+                  menu_driven_shot.is_file() and menu_driven_shot.stat().st_size > 0,
+                  rel(menu_driven_shot))
+    ok &= h.check("shell screenshot captured",
+                  shell_shot.is_file() and shell_shot.stat().st_size > 0, rel(shell_shot))
+
+    h.metrics.update({
+        "keyboard reports (banner)": kbd_before if kbd_before >= 0 else "n/a",
+        "keyboard reports (after `usb`)": int(stats.group(1)) if stats else "n/a",
+        "mouse": "enumerated as boot-protocol HID; reports stay 0 because q35 routes "
+                 "the monitor's pointer to the PS/2 mouse",
+        "menu screenshots": f"{rel(menu_shot)}, {rel(menu_driven_shot)}",
+        "shell screenshot": rel(shell_shot),
+    })
+    for pattern in a.expect or []:
+        found = re.search(pattern, text)
+        ok &= h.check(f"expected /{pattern}/", bool(found),
+                      found.group(0).strip() if found else "not found")
+    for extra in h.extra_evidence:
+        found = re.search(extra, text)
+        h.check(f"extra marker /{extra}/ (best effort)", bool(found),
+                found.group(0).strip() if found else "not observed")
+    return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
+
+
 def parse_script(path: pathlib.Path) -> list[dict]:
     steps: list[dict] = []
     for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -1696,6 +2049,7 @@ MODES = {
     "bigindex": mode_bigindex,
     "shell": mode_shell,
     "tcp-shot": mode_tcp_shot,
+    "usb": mode_usb,
     "smoke": mode_smoke,
     "boot-check": mode_boot_check,
     "restore": mode_restore,
@@ -1823,6 +2177,12 @@ def build_parser() -> argparse.ArgumentParser:
     ts.add_argument("--port", type=int, default=8099,
                     help="host TCP port the guest reaches as 10.0.2.2:<port> (default 8099)")
 
+    sub.add_parser("usb", parents=[common],
+                   help="USB-input acceptance: boot the staged image with an "
+                        "emulated xHCI controller + USB keyboard + USB mouse, drive "
+                        "the boot disk menu and the shell through them, and assert "
+                        "the driver's HID evidence on serial")
+
     sm = sub.add_parser("smoke", parents=[common],
                         help="log-based smoke criteria R4.1/R4.2/R7.4 (replaces "
                              "smoke_assertions.ps1)")
@@ -1859,6 +2219,21 @@ def main(argv: list[str] | None = None) -> int:
               f"to run (exit 2); pass --allow-small-index only for a deliberate "
               f"sub-scale control run.", file=sys.stderr, flush=True)
         print("\nE2E RESULT: REFUSED (sub-scale index) (exit 2)", flush=True)
+        return EXIT_SETUP
+    # The USB scenario owns its data disk: it must be a deterministic
+    # MBR-partitioned image (the boot menu needs rows to drive), and the menu
+    # format path names the virtio-blk partition in the typed confirmation. An
+    # operator-supplied --disk or the NVMe layout would change what the scenario
+    # claims it proved, so refuse before the build instead of silently ignoring it.
+    if mode == "usb" and (args.disk or getattr(args, "nvme", False)):
+        print("[e2e] usb: --disk/--nvme are not supported by this mode: it writes its "
+              "own deterministic MBR-partitioned 64 MiB disk (.cache/e2e_usb_disk.img) "
+              "so the boot disk menu always has rows the USB keyboard can drive, and it "
+              "types the virtio-blk partition name in the menu's typed confirmation. "
+              "Run `python3 tools/e2e.py usb` for the acceptance claim, or `shell`/"
+              "`selftest` with --disk/--nvme for those options.", file=sys.stderr,
+              flush=True)
+        print("\nE2E RESULT: REFUSED (usb mode owns its disk) (exit 2)", flush=True)
         return EXIT_SETUP
     h = Harness(args, mode)
     verdict, code = "FAIL", EXIT_FAIL
