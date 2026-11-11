@@ -103,8 +103,19 @@ impl FixedLine {
 impl core::fmt::Write for FixedLine {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for b in s.bytes() {
+            // Already truncated by an EARLIER `write_str` call. The formatting
+            // machinery splits one message into many `write_str` calls (one per
+            // literal piece and per argument), so reaching LINE_MAX on one call
+            // does not end the message: without this guard the next call skipped
+            // the `== LINE_MAX - 1` test, wrote `buf[LINE_MAX]` and panicked with
+            // `index out of bounds: len is 200 but index is 200` — a real crash
+            // (`panic = "abort"`) found by an E2E run on a long `[ERROR]` line.
+            if self.len >= LINE_MAX {
+                return Ok(());
+            }
             if self.len == LINE_MAX - 1 {
-                // Truncate rather than fail: a long line still gets recorded.
+                // Truncate rather than fail: a long line still gets recorded,
+                // marked by the trailing newline so a reader can see the cut.
                 self.buf[self.len] = b'\n';
                 self.len += 1;
                 return Ok(());
