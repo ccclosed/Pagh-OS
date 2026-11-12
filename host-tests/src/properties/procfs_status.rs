@@ -1,5 +1,6 @@
-// Feature: procfs (issue #11), contract `docs/procfs.md` §4.3/§4.5/§7.2 (property
-// topic P53). Two files share this property because the same consumers read both as
+// Feature: procfs (issue #11), contract `docs/procfs.md` §4.3/§4.5/§7.2. (The p51-p55
+// numbers from the original plan now belong to other properties: OpenPGP.)
+// Two files share this property because the same consumers read both as
 // plain text — libuv for `/proc/uptime`, htop/procps/gdb and Go's runtime dumps for
 // `/proc/self/status` — and both are pure formatting over scalars.
 
