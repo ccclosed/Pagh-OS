@@ -7,11 +7,22 @@ build. Git tags / GitHub releases exist for `2.17.0` (2026-11-10), `2.18.6`
 (2026-11-10) and the `2.18.12-demo` bundle (2026-11-11, the demo media captured from
 2.18.12); `2.17.1`, `2.17.2` and the `2.18.0`-`2.18.12` field-fix series are version
 bumps whose notes are recorded here and in `AGENTS.md`, and they roll into the next
-tagged release (`2.18.13`, open in PR #56). The full technical story of every release
+tagged release (`2.18.13`, merged as PR #56). The full technical story of every release
 is the release-note block in `AGENTS.md`; the paragraphs here name the user-visible
 change and point there rather than duplicating it.
 
-## 2.18.13 (in PR #56, not on `main` yet)
+## 2.19.0
+
+A `free` shell command: physical memory total/used/free (from the PMM frame
+counters) and the fixed kernel heap (region size, bytes handed out, remainder), in
+busybox `free` layout and KiB units, printed beside `df`. Before it the only memory
+numbers visible without a debugger were the boot-time `[selftest] PMM hygiene`
+ledger pair; with the region mapped up front, the `Heap` row also makes heap growth
+observable instead of hidden inside `Mem used`. No `/proc/meminfo` or sysinfo
+syscall exists here yet, so `shared`/`buffers` are honest zeros and `Swap` is zero
+because there is no swap device. Full story: `AGENTS.md`, 2.19.0.
+
+## 2.18.13
 
 xHCI diagnostics: the Supported Protocol PORT INFO word is now parsed as the spec
 defines it (PSIC in bits 31:28, count in 15:8, 1-based offset in 7:0). The old parser

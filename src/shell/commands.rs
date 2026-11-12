@@ -1799,6 +1799,55 @@ fn tree_bytes(node: &alloc::sync::Arc<dyn crate::vfs::VfsNode>, depth: usize) ->
         .fold(0u64, |acc, n| acc.saturating_add(n))
 }
 
+/// `free`: physical-memory and kernel-heap usage.
+///
+/// The layout is busybox `free` (one header row, KiB columns), but the numbers
+/// are Pagh's own: `Mem` comes straight from the PMM frame counters
+/// (`total_frames` / `free_frames` × 4096), so `total` is the RAM the allocator
+/// was handed at boot, `free` is what is still available to any later PMM user,
+/// and `used` is everything else (kernel image, page tables, the backing frames
+/// of the kernel heap and the pages of live user programs). There is no swap
+/// device, so that row is a constant zero, and no block cache, so `buffers` is
+/// zero as well.
+///
+/// The `Heap` row reports the fixed kernel heap region, not a Linux memory
+/// class: `used` is what the global allocator has handed out, `free` is the rest
+/// of the region. It is worth its own row because the region is mapped at boot
+/// and therefore always counts into `Mem used`, while only a fraction of it is
+/// actually occupied — an oversized or leaking heap shows up here long before
+/// physical memory runs out.
+pub(super) fn cmd_free(_ctx: &mut ShellCtx, _args: &[&str]) {
+    const PAGE_SIZE: usize = 4096;
+    let total = crate::memory::pmm::total_frames().saturating_mul(PAGE_SIZE);
+    let free = crate::memory::pmm::free_frames().saturating_mul(PAGE_SIZE);
+    let used = total.saturating_sub(free);
+    let (heap_size, heap_used, heap_free) = crate::memory::heap::stats();
+
+    // The header is formatted through the same widths as the rows so the
+    // columns cannot drift apart when a row gains a field.
+    shell_println(&format!(
+        "{:<6} {:>13} {:>12} {:>12} {:>12} {:>12}",
+        "", "total", "used", "free", "shared", "buffers"
+    ));
+    shell_println(&format!(
+        "{:<6} {:>13} {:>12} {:>12} {:>12} {:>12}",
+        "Mem:",
+        total / 1024,
+        used / 1024,
+        free / 1024,
+        0,
+        0
+    ));
+    shell_println(&format!("{:<6} {:>13} {:>12} {:>12}", "Swap:", 0, 0, 0));
+    shell_println(&format!(
+        "{:<6} {:>13} {:>12} {:>12}",
+        "Heap:",
+        heap_size / 1024,
+        heap_used / 1024,
+        heap_free / 1024
+    ));
+}
+
 /// `ps`: the live compat-process table, rendered from `/proc/<pid>/*`.
 ///
 /// Header and columns mimic `ps` (`PID PPID STAT COMMAND`), but the state

@@ -231,9 +231,20 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.18.13** (the batch open with the
-  `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
-  kernel-thread rows in `ps`; the tag lands at the end of the batch).
+  be reflected here. **`main` currently reads 2.19.0** (the `free` shell
+  command on top of the 2.18.13 batch: `connect(2)` reply-and-close, the
+  VT/console coordinates and the kernel-thread rows in `ps`).
+  **2.19.0** = the `free` shell command: physical memory total/used/free from
+  the PMM frame counters, plus the fixed kernel heap from the global
+  allocator's counters, printed busybox-style in KiB next to `df`. This kernel
+  has no `/proc/meminfo` and no sysinfo syscall, so before this the only
+  memory numbers a human could see were the boot-time `[selftest] PMM hygiene`
+  ledger pair; `free` is the interactive counterpart, and it also makes heap
+  growth observable (the region is mapped at boot, so it always counts as
+  `Mem used` — only the `Heap` row shows how much of it is actually handed
+  out). It reports physical frames, not Linux memory classes: `shared` and
+  `buffers` are honest zeros (no shared-memory accounting, no block cache),
+  and the `Swap` row is zero because there is no swap device.
   **2.17.0** = the batch that made pagh run on real hardware, plus three
   long-standing display/network defects:
   * a peer that answers and closes in one burst now completes `connect(2)`: the

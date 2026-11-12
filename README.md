@@ -29,7 +29,7 @@
 ### What works today
 
 - **Boot:** Limine/UEFI → 1280×800 framebuffer console with a coloured prompt and status bar.
-- **Shell:** line editing, history, tab completion, `ls`/`df`/`ifconfig`/`ps`, ext2 file ops, `selftest`.
+- **Shell:** line editing, history, tab completion, `ls`/`df`/`free`/`ifconfig`/`ps`, ext2 file ops, `selftest`.
 - **GUI apps:** the mouse-driven `paint` (shape tools, 16-colour palette, brush sizes, undo, save to ext2), the full-screen `nano+` editor, and `settings` with live colour themes + wallpapers.
 - **Storage:** ext2-compatible read/write filesystem with a write-ahead-log journal, on a real virtio-blk or NVMe disk (or a RAM disk carried on the boot medium).
 - **Networking:** the kernel's own e1000 + TCP/IP stack (DHCP/ARP/TCP/UDP; `ifconfig` shows the live lease).
@@ -443,6 +443,7 @@ framebuffer (serial stays plain text).
 | `ifconfig`           | Show the network interface (IP, gateway, MAC)                   |
 | `ping <ip>`          | Send one ICMP echo request and print the RTT                    |
 | `df`                 | Mounted filesystems: 1K blocks, used, available, use%, mount point |
+| `free`               | RAM and kernel heap: total/used/free in KiB (busybox-style `free`) |
 | `ps`                 | Processes: PID, PPID, STAT, COMMAND — compat processes from `/proc/<pid>/*`, kernel threads as `[shell]`/`[net]`/`[usb]` |
 | `nc <ip> <port> [text]` | Open a TCP connection and echo a line over it                |
 | `jobs` / `fg` / `bg` | Shell job table; resume the most recent stopped job in the foreground / background |

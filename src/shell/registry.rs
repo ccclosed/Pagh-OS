@@ -163,6 +163,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_df,
     },
     CommandSpec {
+        name: "free",
+        description: "Show physical memory and kernel heap usage",
+        usage: "free",
+        handler: super::commands::cmd_free,
+    },
+    CommandSpec {
         name: "ps",
         description: "List compat processes (PID/PPID/STAT/COMMAND)",
         usage: "ps",
