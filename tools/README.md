@@ -11,6 +11,7 @@
 | `host_tests.py` | Обёртка: определяет host triple через `rustc -vV`, запускает `cargo test --locked --target <host>` в `host-tests/` |
 | `toolchain.sh` | Guard для `build.sh`/`run.sh`: отказывается собирать ненайтовым (stable/дистрибутивным) `cargo` — тот падает с `-Zjson-target-spec` и не называет настоящую причину. `tools/build.py` его не требует |
 | `check_safety.py` | CI-гейт unsafe-политики: сканирует `src/security/`, `src/arch/x86_64/linux/mod.rs`, `src/memory/vmm.rs`, `src/net/tls.rs`, `src/pkg/apt.rs` — каждый `unsafe {` обязан иметь `SAFETY:`-коммент в предыдущих 6 строках, иначе exit 1 |
+| `worktrees.py` | Гигиена worktree по правилу AGENTS.md «после мержа PR ветку удаляют»: таблица всех worktree (state `merged`/`unique`/`dirty`/`detached`, ahead/unique по `git cherry`, число грязных путей), `--prune` (dry-run без `--yes`; не трогает грязные/уникальные/detached и «активные» — тронутые меньше `--min-idle-minutes`, по умолчанию 30), `--self-test` собирает временный репозиторий и проверяет классификатор и правила prune на нём) |
 | `gen_ca_bundle.py` | Генератор trust-anchor бандла TLS-верификатора: скачивает curl/Mozilla CA extract, выбирает корни по subject CN (ISRG Root X1/X2, GTS R1/R4), пишет детерминированный `src/net/ca_bundle.rs` (DER-массивы + метки); сгенерированный файл коммитится, перегенерация — только осознанно |
 | `fetch_p44_fixtures.py` | Генератор фикстур host-свойства P44: скачивает реальные ISRG Root X1 и лист `deb.debian.org`, пишет `host-tests/src/properties/p44_fixture_{root,leaf}.rs` (закоммичены; перегенерация — осознанно) |
 | `gen_debian_keyring.py` | Генератор пиннутого Debian-keyring'а OpenPGP-верификатора (issue #32): качает зафиксированный по sha256 `debian-archive-keyring_*.deb` (или берёт `--deb FILE`), выбирает ключи **по v4-фингерпринту**, сверяет UID/алгоритм/размер/создание/истечение/подключи, пишет детерминированный `src/pkg/openpgp_keys.rs` (блоки байт + таблица пинов); `--check` — diff без записи, `--print-keyring` — тот же набор как бинарный keyring для `gpg --list-packets`. Перегенерация — только осознанно |
@@ -203,6 +204,36 @@ body=13332733 raw_in=… read_polls=… pending_polls=… bytes_per_s=…`
 (≈2 MB/s под QEMU/TCG). Если трансфер встанет, watchdog печатает
 `stage=stall … sock=state=… rx=…/… free=… adv_wnd=… wnd_update=…` — по этой
 строке видно, кто встал: сокет, транспорт или record-слой.
+
+
+## worktrees.py — гигиена worktree
+
+Правило AGENTS.md («сразу после мержа PR удалить ветку — remote и local — и
+перецелить стеки на `main`») до сих пор жило только текстом: один checkout
+успел накопить 24 worktree и 28 полностью смерженных локальных веток, часть —
+с грязным деревом из старого коммита. `worktrees.py` отвечает на два вопроса,
+которые решают судьбу worktree: **смержен ли патч** (не «ветка является
+предком»: ребейзнутая/черри-пикнутая ветка смержена, и арбитр здесь
+`git cherry`) и **чисто ли дерево** (грязное не удаляется никогда).
+
+```sh
+python3 tools/worktrees.py                      # таблица: state/ahead/unique/dirty, ничего не меняет
+python3 tools/worktrees.py --prune              # план + вопрос; dry-run без --yes
+python3 tools/worktrees.py --prune --yes        # удалить смерженные и чистые
+python3 tools/worktrees.py --prune --min-idle-minutes 0   # не жалеть «активные»
+python3 tools/worktrees.py --self-test          # доказать классификатор на временном репозитории
+```
+
+Почему `git cherry`, а не `git rev-list --count`: ветка, чей патч уже в `main`
+через cherry-pick или ребейз, остаётся «впереди на N», хотя терять в ней нечего —
+`cherry` сравнивает патчи и помечает такие строки `-`.
+
+Что тулинг **сознательно не делает**: не удаляет remote-ветки (это решение не
+про локальную уборку), не трогает главный checkout и тот, из которого запущен,
+не делает `--force` по грязному дереву: такая строка печатается с причиной, а
+решает человек. `--prune` дополнительно пропускает worktree, тронутые меньше
+`--min-idle-minutes` минут (gitdir/index/HEAD), чтобы не снести checkout, в
+котором прямо сейчас работают.
 
 
 ## Грабли
