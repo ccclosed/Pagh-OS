@@ -481,9 +481,9 @@ fn draw(rows: &[Row], selected: usize, typed: Option<&str>, message: Option<&str
         );
     }
     {
-        // Masks, not ranges: see the note in the shell banner. This block used to
-        // be printed twice (a stale copy left by an edit), which is why the field
-        // photos show the same `xhci proto:` line twice.
+        // Masks, not ranges: see the note in the shell banner. This block also
+        // used to be printed twice (a stale copy left by an edit), which is why
+        // the 2.18.11/2.18.12 field photos show the `xhci proto:` line twice.
         let masks = crate::drivers::xhci::proto_masks();
         crate::fb_println!(
             "  xhci proto: usb2={:#010x} usb3={:#010x}",
@@ -493,9 +493,11 @@ fn draw(rows: &[Row], selected: usize, typed: Option<&str>, message: Option<&str
     }
     for cap in crate::drivers::xhci::xcaps().into_iter().take(6) {
         crate::fb_println!(
-            "  xhci xcap {:#06x}: id={} next={:#04x} dw1={:#010x} dw2={:#010x}",
+            "  xhci xcap {:#06x}: id={} major={} minor={} next={:#04x} dw1={:#010x} dw2={:#010x}",
             cap.offset,
             cap.id,
+            cap.major,
+            cap.minor,
             cap.next,
             cap.dw1,
             cap.dw2

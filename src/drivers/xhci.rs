@@ -597,6 +597,10 @@ pub struct XCap {
     pub offset: u32,
     pub id: u8,
     pub next: u8,
+    /// Major revision from DW0 bits 31:24 (2 = USB2 protocol, 3 = USB3).
+    pub major: u8,
+    /// Minor revision from DW0 bits 23:16.
+    pub minor: u8,
     pub dw1: u32,
     pub dw2: u32,
 }
@@ -1297,43 +1301,44 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
                     offset: off as u32,
                     id,
                     next,
+                    // DW0 is the capability header for every extended capability,
+                    // not only the protocol ones.
+                    major: ((dw0 >> 24) & 0xFF) as u8,
+                    minor: ((dw0 >> 16) & 0xFF) as u8,
                     dw1,
                     dw2,
                 });
             }
             if id == 2 {
-                // xHCI 1.2 table 7-4: DW2 = { PSIC:7:0, offset:15:8, count:31:16 },
-                // where `offset` is 0-based and `count` is in ports. (The previous
-                // code read `count` as a byte and applied a QEMU-specific fallback
-                // when it was zero; on this controller that produced the
-                // overlapping ranges. QEMU happens to use the same layout, so the
-                // fallback was never needed.)
+                // Supported Protocol capability, xHCI 1.2 section 7.2 / table 7-4:
+                // DW0 is the header (major revision bits 31:24, minor 23:16), DW1
+                // is the name string, DW2 is the PORT INFO word:
+                //     bits 31:28 PSIC (speed-ID count), 15:8 port count, 7:0 port
+                //     offset — and the offset is 1-BASED (Linux: XHCI_EXT_PORT_OFF
+                //     / XHCI_EXT_PORT_COUNT, "port count includes the current port
+                //     offset").
+                // This is the bug the 2.18.12 field photo caught: the driver read
+                // the count from bits 31:16 and the offset from 15:8 plus one, so
+                // the machine's two clean entries (USB2 dw2=0x30191001 -> offset 1,
+                // count 16; USB3 dw2=0x40000a11 -> offset 17, count 10) printed as
+                // the impossible `usb2=17-41 usb3=17-26` and every real USB2 port
+                // came out as proto=usb0. QEMU writes the same field layout
+                // (`hcd-xhci.c` 0x28/0x38), so no emulator special case is needed.
                 let major = ((dw0 >> 24) & 0xFF) as u8;
-                let spec_count = ((dw2 >> 16) & 0xFFFF) as usize;
-                // QEMU's xHCI (`hcd-xhci.c`, the "Supported Protocol:08" dwords)
-                // does not follow the spec here: it writes the per-protocol port
-                // COUNT into bits 15:8 and leaves the spec count field zero. A
-                // zero spec count is therefore read the emulator's way — USB2
-                // ports are 1..n and USB3 ports are the last n — while real
-                // hardware (this Intel PCH included) uses the spec layout.
-                let (first, count) = if spec_count != 0 {
-                    ((((dw2 >> 8) & 0xFF) as usize) + 1, spec_count)
-                } else {
-                    let n = ((dw2 >> 8) & 0xFF) as usize;
-                    if major == 2 {
-                        (1, n)
-                    } else {
-                        ((ports as usize + 1).saturating_sub(n), n)
-                    }
-                };
+                let minor = ((dw0 >> 16) & 0xFF) as u8;
+                let first = (dw2 & 0xFF) as usize;
+                let count = ((dw2 >> 8) & 0xFF) as usize;
+                let psic = (dw2 >> 28) & 0xF;
                 crate::info!(
-                    "xhci: xcap {:#06x} id={} next={:#04x} major={} first={} count={} dw1={:#010x} dw2={:#010x}",
+                    "xhci: xcap {:#06x} id={} next={:#04x} major={} minor={} offset={} count={} psic={} dw1={:#010x} dw2={:#010x}",
                     off,
                     id,
                     next,
                     major,
+                    minor,
                     first,
                     count,
+                    psic,
                     dw1,
                     dw2
                 );
