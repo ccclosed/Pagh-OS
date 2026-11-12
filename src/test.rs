@@ -6955,6 +6955,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             "usb: HID mouse report reaches the cursor",
             usb_hid_tests::mouse_report_moves_cursor
         ),
+        (
+            "sysinfo::loads match /proc/loadavg in 16.16 fixed point",
+            sysinfo_tests::loads_match_the_procfs_view_in_fixed_point
+        ),
     ]
 }
 
@@ -8330,5 +8334,50 @@ mod at_random_tests {
             seed_fp,
             crate::security::entropy::capabilities_str()
         );
+    }
+}
+
+/// `sysinfo(2)` vs `/proc/loadavg`: one kernel, one answer.
+///
+/// This is the regression guard for a real inconsistency: `sys_sysinfo` filled
+/// `loads` with zeros while `/proc/loadavg` printed the scheduler's decayed
+/// averages, so a tool reading `sysinfo` showed `0.00` on a loaded machine. The
+/// two now share one source; this routine pins the *unit conversion* (Linux's
+/// `struct sysinfo` uses 16.16 fixed point, the scheduler returns hundredths),
+/// which is the part a future edit can silently break while both readers stay
+/// self-consistent.
+mod sysinfo_tests {
+    use crate::arch::x86_64::linux::misc::{sysinfo_loads, SYSTEM_LOAD_FIXED_ONE};
+    use crate::task::scheduler;
+
+    pub fn loads_match_the_procfs_view_in_fixed_point() {
+        let (one, five, fifteen) = scheduler::load_averages();
+        let loads = sysinfo_loads();
+        let convert = |hundredths: u32| -> u64 {
+            (hundredths as u64).saturating_mul(SYSTEM_LOAD_FIXED_ONE) / 100
+        };
+        assert_eq_kernel!(
+            loads[0],
+            convert(one),
+            "sysinfo 1-minute load is the scheduler average in 16.16"
+        );
+        assert_eq_kernel!(
+            loads[1],
+            convert(five),
+            "sysinfo 5-minute load is the scheduler average in 16.16"
+        );
+        assert_eq_kernel!(
+            loads[2],
+            convert(fifteen),
+            "sysinfo 15-minute load is the scheduler average in 16.16"
+        );
+        // A whole-number load is exactly one fixed-point unit; hundredths are
+        // scaled, not passed through raw.
+        assert_eq_kernel!(
+            convert(100),
+            SYSTEM_LOAD_FIXED_ONE,
+            "load 1.00 converts to exactly one fixed-point unit"
+        );
+        assert_eq_kernel!(convert(0), 0, "load 0.00 converts to zero");
     }
 }
