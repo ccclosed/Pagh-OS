@@ -103,6 +103,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_ls,
     },
     CommandSpec {
+        name: "tree",
+        description: "Recursive directory listing (depth-limited)",
+        usage: "tree [-L DEPTH] [PATH]",
+        handler: super::commands::cmd_tree,
+    },
+    CommandSpec {
         name: "cat",
         description: "Print file contents",
         usage: "cat <path>",

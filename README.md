@@ -29,7 +29,7 @@
 ### What works today
 
 - **Boot:** Limine/UEFI → 1280×800 framebuffer console with a coloured prompt and status bar.
-- **Shell:** line editing, history, tab completion, `ls`/`ls -l`/`chmod`/`chown`/`df`/`free`/`date`/`head`/`tail`/`wc`/`grep`/`ifconfig`/`ps`, ext2 file ops, `selftest`.
+- **Shell:** line editing, history, tab completion, `ls`/`ls -l`/`tree`/`chmod`/`chown`/`df`/`free`/`date`/`head`/`tail`/`wc`/`grep`/`ifconfig`/`ps`, ext2 file ops, `selftest`.
 - **GUI apps:** the mouse-driven `paint` (shape tools, 16-colour palette, brush sizes, undo, save to ext2), the full-screen `nano+` editor, and `settings` with live colour themes + wallpapers.
 - **Storage:** ext2-compatible read/write filesystem with a write-ahead-log journal, on a real virtio-blk or NVMe disk (or a RAM disk carried on the boot medium).
 - **Networking:** the kernel's own e1000 + TCP/IP stack (DHCP/ARP/TCP/UDP; `ifconfig` shows the live lease).
@@ -417,6 +417,7 @@ framebuffer (serial stays plain text).
 | `pwd`                | Print the current working directory                             |
 | `cd [path]`          | Change directory (relative or absolute; no arg → `/`)           |
 | `ls [-l] [path]`     | List a directory; `-l` adds mode, links, owner/group and size  |
+| `tree [-L N] [path]` | Recursive listing, depth-limited (default 4), counts at the end |
 | `cat path`           | Print the contents of a file                                    |
 | `head [-n N] path`   | Print the first N lines of a file (default 10)                  |
 | `tail [-n N] path`   | Print the last N lines of a file (default 10)                   |

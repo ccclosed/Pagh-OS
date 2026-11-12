@@ -33,6 +33,13 @@ cmd head -n 2 /proc/meminfo
 expect MemTotal:\s+\d+ kB
 expect MemFree:\s+\d+ kB
 
+# tree: recursive listing with the counts trailer (depth 1 = /mnt entries only).
+cmd tree -L 1 /mnt
+expect etc/
+expect \d+ directories, \d+ files
+cmd tree /mnt/definitely-missing
+expect tree: /mnt/definitely-missing: not found
+
 # ls -l: mode word, link count, owner/group, size.
 cmd ls -l /mnt/etc/hosts
 expect -rw-r--r--\s+1\s+0\s+0\s+\d+ hosts

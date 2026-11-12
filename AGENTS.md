@@ -235,7 +235,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `head`, `tail`, `wc` and `grep` shell commands on top of the 2.18.13 batch:
   `connect(2)` reply-and-close, the VT/console coordinates and the
   kernel-thread rows in `ps`).
-  **2.19.0** = eight new shell commands plus a long listing for `ls`, one batch
+  **2.19.0** = nine new shell commands plus a long listing for `ls`, one batch
   of "ask the machine instead of reading a log":
   * `free` — physical memory total/used/free from the PMM frame counters plus
     the fixed kernel heap from the global allocator's counters, in the busybox
@@ -270,6 +270,10 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
     kernel has no user database to resolve names against; a name fails instead
     of silently becoming uid 0. ext2 persists the owner, other filesystems
     answer per path as in `chmod`.
+  * `tree [-L N] PATH` — recursive listing, two ASCII spaces of indent per depth
+    and a `N directories, M files` trailer. ASCII because the console font has no
+    box-drawing glyphs; depth capped (default 4) and every level goes through
+    `readdir`, so a symlink loop cannot recurse without end.
   * `head`, `tail`, `wc`, `grep` — inspect a file without dumping it: first or
     last N lines, line/word/byte counts, and the lines containing a pattern
     (`-i` `-n` `-c` `-v`). All four share one streaming walk

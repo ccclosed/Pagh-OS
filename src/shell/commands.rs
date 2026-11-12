@@ -319,7 +319,98 @@ fn ls_long_line(node: &dyn crate::vfs::VfsNode) -> alloc::string::String {
     line
 }
 
-/// `cat <path>`: print a file's contents, capping the total bytes read so an
+/// `tree [-L N] [path]`: recursive directory listing.
+///
+/// `ls` shows one level; the editor's sidebar shows a tree only while editing. This
+/// prints the whole tree below `path` (sorted, two spaces of indent per depth), which
+/// is what a human wants when looking around `/mnt` or a freshly unpacked package.
+///
+/// The rendering is ASCII on purpose: the console font covers ASCII 0x20..0x7E and
+/// has no box-drawing glyphs, so `|--`/backtick art would print as blanks.
+///
+/// Depth is capped by `-L` (default 4) and every directory is read through `readdir`,
+/// so a symlink loop cannot recurse without end. The counts in the trailer cover
+/// everything below the printed root, not the root itself.
+pub(super) fn cmd_tree(_ctx: &mut ShellCtx, args: &[&str]) {
+    let mut limit = 4usize;
+    let mut path_arg: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "-L" {
+            i += 1;
+            let Some(n) = args.get(i).and_then(|s| s.parse::<usize>().ok()) else {
+                shell_println("tree: usage: tree [-L DEPTH] [PATH]");
+                return;
+            };
+            limit = n;
+        } else if a.starts_with('-') && a.len() > 1 {
+            shell_println(&alloc::format!("tree: unknown option: {}", a));
+            return;
+        } else if path_arg.is_none() {
+            path_arg = Some(a);
+        } else {
+            shell_println("tree: too many operands");
+            return;
+        }
+        i += 1;
+    }
+    let path = match path_arg {
+        Some(p) => resolve_arg(p),
+        None => super::path::cwd(),
+    };
+    match crate::vfs::lookup_path(&path) {
+        Ok(node) => {
+            if node.is_directory() {
+                let (mut dirs, mut files) = (0usize, 0usize);
+                shell_println(&path);
+                tree_walk(&*node, "", 0, limit, &mut dirs, &mut files);
+                shell_println(&alloc::format!("{} directories, {} files", dirs, files));
+            } else {
+                shell_println(node.name());
+            }
+        }
+        Err(_) => shell_println(&alloc::format!("tree: {}: not found", path)),
+    }
+}
+
+/// Depth-first half of [`cmd_tree`]: print `node`'s children sorted by name, then
+/// recurse into the directories. A child whose `readdir` fails is printed but not
+/// descended into (the diagnostic clutter is not worth it for a listing command).
+fn tree_walk(
+    node: &dyn crate::vfs::VfsNode,
+    prefix: &str,
+    depth: usize,
+    limit: usize,
+    dirs: &mut usize,
+    files: &mut usize,
+) {
+    if depth >= limit {
+        return;
+    }
+    let Ok(children) = node.readdir() else {
+        return;
+    };
+    let mut items: alloc::vec::Vec<&alloc::sync::Arc<dyn crate::vfs::VfsNode>> =
+        children.iter().collect();
+    items.sort_by(|a, b| a.name().cmp(b.name()));
+    for child in items {
+        let is_dir = child.is_directory();
+        if is_dir {
+            *dirs += 1;
+            shell_println(&alloc::format!("{}{}/", prefix, child.name()));
+        } else {
+            *files += 1;
+            shell_println(&alloc::format!("{}{}", prefix, child.name()));
+        }
+        if is_dir {
+            let next = alloc::format!("{}  ", prefix);
+            tree_walk(&**child, &next, depth + 1, limit, dirs, files);
+        }
+    }
+}
+
+/// `cat <path>`: print a file's contents/// `cat <path>`: print a file's contents, capping the total bytes read so an
 /// endless device cannot spin forever, and end the transcript on a fresh line
 /// so the next prompt cannot be glued onto the file's last line.
 pub(super) fn cmd_cat(_ctx: &mut ShellCtx, args: &[&str]) {
