@@ -641,7 +641,10 @@ python
   `docs/procfs.md` for the exact contract. `/proc/loadavg` reports
   real exponentially decayed 1/5/15-minute load averages (fixed point 16.16,
   displayed with two decimals) plus live runnable/total counts and the last allocated
-  pid. Signal
+  pid. `/proc/<pid>/maps` names the file behind each file-backed region (image
+  segments, interpreter, `mmap`s) with the same `08:00` device and inode `stat`
+  reports, and the real `mmap` file offset; `[heap]`/`[stack]`/anonymous
+  mappings keep the honest `00:00 0`. Signal
   delivery is real both at the syscall-return point and on the timer-tick return
   (`signal::tick_action`, so a task that never enters a syscall is still signalled).
   See `LINUX-USERLAND.md` for the exact status.

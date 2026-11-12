@@ -4,12 +4,14 @@
 `/tmp` и загрузчик ELF64 (нативные и Linux-бинари). Инициализация — `vfs::init()` из `boot.rs`,
 затем `boot.rs` подключает ext2-корень: `vfs::mount_at_named("/mnt", root, "ext2")`.
 
-Синтетический `/proc` (issue #11) реализован срезами 1–6: контракт — пути, байтовые
+Синтетический `/proc` (issue #11) реализован срезами 1–7: контракт — пути, байтовые
 форматы файлов, семантика `lstat`/`readdir`/`getdents64`/`readlink`, список отложенного —
 зафиксирован в **`docs/procfs.md`**, он же приёмка. Срез 5 добавил
 `/proc/<pid>/fdinfo/<n>` (и `self`-алиас) и `/proc/<pid>/limits` (и `self`-алиас),
 срез 6 (`2.19.0`) — per-thread view `/proc/<pid>/task/` и `/proc/self/task/`
-(каталог треда — тот же VFS-объект, что `/proc/<tid>`); отложены необязательные поля
+(каталог треда — тот же VFS-объект, что `/proc/<tid>`), срез 7 (`2.20.0`) — реальные
+`dev`/`ino`/`offset`/`pathname` в `/proc/<pid>/maps` для file-backed-строк
+(DEVIATION-7 сужена до анонимных регионов); отложены необязательные поля
 mountinfo/statfs и не смоделированные Linux-файлы per-thread view (`sched`, `syscall`,
 `comm`, ...).
 
@@ -71,7 +73,7 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
 - `/tmp` появился из-за nvim: `vim_mktempdir` делает `mkdir("/tmp/nvim.XXXXXX")`.
 
 ### procfs (issue #11 — контракт `docs/procfs.md`)
-- Срезы 1–6: `/proc` + `/proc/self` + `self/{exe,cmdline,status,maps,stat,statm,mounts,cgroup,mountinfo,limits}`
+- Срезы 1–7: `/proc` + `/proc/self` + `self/{exe,cmdline,status,maps,stat,statm,mounts,cgroup,mountinfo,limits}`
   + `{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}` + read-only
   `/proc/sys/kernel/{ostype,osrelease,hostname}` + per-pid
   `{cmdline,stat,status,maps,cgroup,mountinfo,limits,fd/*,fdinfo/*,task/*}`.
@@ -81,7 +83,10 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
   inode, что `/proc/<tid>` (Linux-идентичность «один тред = один inode»), поэтому
   `stat`/`status`/`cmdline` (и остальные pid-файлы) рендерятся существующими
   рендерерами per-thread. Мёртвый pid, тред чужой группы и неназванный tid — `ENOENT`
-  (`docs/procfs.md` §13).
+  (`docs/procfs.md` §13). Срез 7: строки maps для PT_LOAD-сегментов образа/
+  интерпретатора и file-backed `mmap` печатают реальные `08:00`/`st_ino`/offset/pathname
+  из VFS (`CompatState::image_ino`/`interp_ino`, `MmapBacking`); `[heap]`/`[stack]`/
+  анонимные — честные `00:00 0` (§14).
   `/proc/mounts` читает реестр `vfs::mount_snapshot()`, `/proc/*/fd` — снимок fd-таблицы,
   `/proc/*/fdinfo/<n>` — живые offset/flags дескриптора и `node_ino` его VFS-узла
   (`mnt_id` — тот же отсортированный mount-реестр, что у mountinfo; 0 для объектов без

@@ -11,6 +11,22 @@ tagged release (`2.18.13`, open in PR #56). The full technical story of every re
 is the release-note block in `AGENTS.md`; the paragraphs here name the user-visible
 change and point there rather than duplicating it.
 
+## 2.20.0 (in this stacked PR, not on `main` yet)
+
+`/proc/<pid>/maps` stops claiming `00:00 0` for files. The map's `PT_LOAD` segments
+(image and interpreter) and file-backed `mmap`s now print the `st_dev`/`st_ino` and
+pathname `stat(2)`/`fdinfo` already report for the same VFS node — `08:00` is exactly
+the `major:minor` this kernel's `stat` returns for a VFS node — plus the real file
+offset of a `mmap` (shifted correctly when a partial `munmap`/`mprotect` splits a
+region). `[heap]`, `[stack]` and anonymous mappings keep the honest `00:00 0` and no
+pathname: they have no backing file. The kernel still keeps no VMA list, so the map
+shows exactly what it knows (image, interpreter, heap, tracked `mmap`s, stack) and
+nothing invented; DEVIATION-7 is narrowed to those cases. Contract: `docs/procfs.md`
+§14. Evidence: the `procfs::maps file identity` in-QEMU selftest,
+`properties/procfs_maps.rs` and the `lx_selftest` `maps_metadata` fixture — a real
+guest ELF that maps its own file, reads `/proc/self/maps` and writes the dump for the
+harness to verify against the VFS.
+
 ## 2.19.0 (in this PR, not on `main` yet)
 
 The per-thread procfs view. `/proc/<pid>/task/` and `/proc/self/task/` now list one

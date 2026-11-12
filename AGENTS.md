@@ -231,10 +231,23 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.19.0** (the batch open with the
-  per-thread procfs view `/proc/<pid>/task/` + `/proc/self/task/`; 2.18.13
-  carried the `connect(2)` reply-and-close fix, the VT/console coordinate fix
-  and the kernel-thread rows in `ps`; the tag lands at the end of the batch).
+  be reflected here. **`main` currently reads 2.20.0** (the batch open with the
+  procfs per-thread view and, on top of it, real file identity in
+  `/proc/<pid>/maps`; 2.18.13 carried the `connect(2)` reply-and-close fix, the
+  VT/console coordinate fix and the kernel-thread rows in `ps`; the tag lands at
+  the end of the batch).
+  **2.20.0** = `/proc/<pid>/maps` stops claiming `00:00 0` for files. The map's
+  PT_LOAD segments (image and interpreter) and file-backed `mmap`s now print the
+  `st_dev`/`st_ino` and pathname `stat(2)`/`fdinfo` already report for the same
+  VFS node, plus the real file offset of a `mmap` (shifted correctly when a
+  partial `munmap`/`mprotect` splits a region). `[heap]`, `[stack]` and
+  anonymous mappings keep the honest `00:00 0` and no pathname: they have no
+  backing file. The kernel still keeps no VMA list, so the map shows exactly
+  what it knows (image, interpreter, heap, tracked `mmap`s, stack) and nothing
+  invented. Contract: `docs/procfs.md` §14 (DEVIATION-7 narrowed). Evidence:
+  `procfs::maps file identity` selftest routine, `properties/procfs_maps.rs`
+  and the `lx_selftest` `maps_metadata` fixture (a real guest ELF that maps its
+  own file, reads `/proc/self/maps` and writes the dump for the harness).
   **2.19.0** = the per-thread procfs view. `/proc/<pid>/task/` (and
   `/proc/self/task/`) list one directory per live task of the process's thread
   group — pagh models a thread as a scheduled task registered under its own pid
@@ -614,7 +627,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
 ## Known open gaps (good first issues, all documented in-code)
 
 
-- procfs covers slices 1–6 (issue #11, contract `docs/procfs.md`):
+- procfs covers slices 1–7 (issue #11, contract `docs/procfs.md`):
   `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}`,
   `/proc/<pid>/{cmdline,stat,status,maps,cgroup,mountinfo,limits}`,
   `/proc/<pid>/task/<tid>/*` (the per-thread view; a thread directory is the same
@@ -629,9 +642,13 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   the fd table as numeric symlinks; `/proc/<pid>/fdinfo/<n>` reports the real
   `pos`/`flags`/`mnt_id`/`ino` of an open descriptor (0 for objects with no VFS
   mount/inode), and `/proc/<pid>/limits` renders the 16 Linux rlimit rows from
-  the target's override table plus kernel defaults. Deferred: mountinfo optional
-  fields, statfs metadata and the Linux per-thread files the kernel does not
-  model (`sched`, `syscall`, per-thread `comm`).
+  the target's override table plus kernel defaults. `/proc/<pid>/maps` prints
+  the real `st_dev`/`st_ino` (and, for `mmap`, offset and pathname) of
+  file-backed regions; `[heap]`/`[stack]`/anonymous mappings keep the honest
+  `00:00 0` because they have no backing file. Deferred: mountinfo optional
+  fields, statfs metadata, a real VMA list (which would also cover ld.so-built
+  segments) and the Linux per-thread files the kernel does not model (`sched`,
+  `syscall`, per-thread `comm`).
 - Signals (issue #12): `kill(2)` (nr 62), process-group addressing
   (`kill(0|-1|-pgid)`), `SIGSTOP`/`SIGCONT` scheduling, `wait4(WUNTRACED|WCONTINUED)`
   and timer-tick delivery to a syscall-free task are all implemented. SIGCHLD is
