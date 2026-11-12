@@ -39,7 +39,9 @@ This document explains what to do and how, so your contribution gets merged smoo
 
 ## 2. Build and run
 
-The whole build/link/run pipeline goes through `run.cmd` (Windows):
+On Windows the whole build/link/run pipeline goes through `run.cmd`; on Linux it is
+`./build.sh`/`./run.sh`, and both are wrappers over the same `tools/build.py` driver
+(which is also what `make build|run|test|fmt` runs):
 
 ```bat
 run.cmd build           :: cargo build + link PAGH.elf
@@ -63,11 +65,15 @@ Exit QEMU: `Ctrl-A`, then `X`.
 Any logic change must be covered and/or verified by tests. The project has two testing
 layers:
 
-1. **In-QEMU self-test** (`src/test.rs`) — 27 kernel-core correctness properties (P1–P27).
-   Run it from the shell with `selftest`; results print over serial as `ok`/`FAIL` lines.
+1. **In-QEMU self-test** (`src/test.rs`) — kernel correctness properties **P1–P29**
+   (the numbered `Property N` labels in the routine names; issue-regression routines sit
+   alongside them). The full list is `all_tests()` in `src/test.rs`. Run it from the shell
+   with `selftest`; results print over serial as `ok`/`FAIL` lines.
 2. **Host property tests** (`host-tests/`) — `proptest` for logic that extracts cleanly to
-   the host (currently **41** modules, `p01`–`p41`, covering the kernel core plus the
-   Linux-compat ABI and the `apt`/`deb`/`tar` pipeline). A separate, workspace-excluded
+   the host. The numbered modules are `p01`–`p56` (one file per property under
+   `host-tests/src/properties/`), plus named ones (`tty_job`, `kill_target`, `ext2_links`,
+   `procfs_*`, …), covering the kernel core plus the
+   Linux-compat ABI and the `apt`/`deb`/`tar` pipeline. A separate, workspace-excluded
    crate that builds for the host triple:
    ```sh
    cd host-tests && cargo test
@@ -89,7 +95,7 @@ Rules:
   `host-tests/` property and, where effectful, the `lx_selftest` boot check.
 - If you touch a hardware-dependent path, run `selftest` in QEMU and confirm every line is
   `ok`.
-- A PR must not break the existing P1–P27 properties.
+- A PR must not break the existing P1–P29 properties.
 
 > Don't pull in test frameworks or dependencies for a single test — use the mechanisms the
 > project already adopts (`src/test.rs` and `host-tests/`).
@@ -117,8 +123,9 @@ These constraints are enforced across the codebase and must be preserved:
 
 ## 5. Code style
 
-- **Zero-warning build.** The tree builds with zero warnings — keep that bar. Before a PR,
-  run:
+- **No new warnings.** The build is warning-heavy at the moment: warnings are reviewed and
+  cleanup PRs are welcome, but the gates do not fail on them. Your change must not add new
+  warnings. Before a PR, run and read the output:
   ```sh
   cargo fmt --all
   cargo clippy
@@ -149,12 +156,12 @@ These constraints are enforced across the codebase and must be preserved:
 
 ### Pre-PR checklist
 
-- [ ] `run.cmd build` (debug) passes with no errors and no warnings.
+- [ ] `run.cmd build` (debug) passes with no errors (the tree has warnings today — add none).
 - [ ] `cargo fmt --all` and `cargo clippy` are clean.
 - [ ] `cd host-tests && cargo test` is green (if portable logic was touched).
 - [ ] `selftest` in QEMU passes with no `FAIL` (if kernel code was touched).
-- [ ] If you built with `lx_selftest`/`lx_livetest`, the default (feature-off) kernel was
-      rebuilt and restored into `iso_root/pagh.elf`.
+- [ ] If you built with `lx_selftest`/`lx_livetest`/`lx_bigindex`/`lx_tlsbig`, the default
+      (feature-off) kernel was rebuilt and restored into `iso_root/pagh.elf`.
 - [ ] The build invariants from section 4 are preserved.
 - [ ] New `unsafe` is annotated with `// SAFETY:`.
 - [ ] Docs (`README.md`, comments) updated if behavior changed.

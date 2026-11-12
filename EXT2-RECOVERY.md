@@ -59,8 +59,15 @@ per group. Free-block/inode counters are reconciled from the bitmaps on every mo
 
 ## Journal capacity vs. large writes
 
-The WAL journal area is fixed at 64 blocks, so a single transaction can carry at most
-≈62 dirty blocks. `write_file` therefore commits large files in bounded chunks (32 data
-blocks plus metadata per transaction) instead of one whole-file transaction. Whole-file
-atomicity is not required by any caller: the package installer removes partial files on
-error, and each chunk commit is still crash-atomic.
+The WAL journal area is fixed at 64 blocks (`FMT_LOG_BLOCKS`), and `Journal::commit`
+requires `count + 3 <= log_blocks` (descriptor + data + commit, plus a spare slot so the
+ring can never fill exactly), so a transaction carries at most **61 dirty blocks**. The
+source of truth is `src/fs/journal.rs::commit` and `src/fs/ext2/mod.rs`.
+
+`write_file` therefore commits large files in bounded chunks of up to `TX_DATA_BLOCKS = 64`
+data blocks plus metadata per transaction instead of one whole-file transaction. The data
+blocks are not journaled at all: they are written to their final location before the
+metadata transaction commits (ordered mode), so only metadata (bitmaps, inode table,
+indirect blocks, superblock + group descriptors) counts against the 61-block cap.
+Whole-file atomicity is not required by any caller: the package installer removes partial
+files on error, and each chunk commit is still crash-atomic.

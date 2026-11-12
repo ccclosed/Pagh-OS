@@ -8,8 +8,9 @@ Implemented Linux x86_64 syscalls: `poll(7)`, `pipe(22)`, `pipe2(293)`, `select(
 - `O_NONBLOCK` returns `EAGAIN` for empty/full queues.
 - Closing the final writer produces EOF and `POLLHUP` on readers.
 - Closing the final reader produces `EPIPE` and `POLLERR` on writers.
-- `O_CLOEXEC` is accepted (also via the `FIOCLEX`/`FIONCLEX` ioctls); descriptor
-  closing will become active with `execve`.
+- `O_CLOEXEC` is accepted (also via the `FIOCLEX`/`FIONCLEX` ioctls) and is honoured:
+  `execve` sweeps descriptors flagged close-on-exec (`FdTable::close_cloexec`, called from
+  `task::process::exec_linux_image` — libuv's fork error pipe relies on it).
 - `select`/`pselect6` report the cooked-tty stdin as readable and pipes by real queue
   state; timeouts are polled with cooperative yields (this is what unblocks GNU
   readline in the CPython REPL).
