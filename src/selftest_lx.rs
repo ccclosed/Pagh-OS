@@ -285,6 +285,10 @@ pub fn run_post_net_checks() {
     // scheduled again (see the `REENTRY_ALLOWED` note in `linux::mod`). A spawned
     // kernel thread is schedulable, so waiting here is safe (and the same reason
     // every other waiting check in this file lives in a spawned harness).
+    // Slice 6: the per-thread procfs view over a REAL threaded guest process.
+    // First, because it needs no network and it spawns/kills a process that must
+    // not be alive while the apt install runs.
+    check_thread_task_dir();
     check_tick_delivery();
     run_apt_e2e();
     // Give the scheduler a window to run the just-enqueued hello-pagh process so
@@ -1562,6 +1566,289 @@ fn build_linux_test_elf() -> Vec<u8> {
     debug_assert_eq!(elf.len() as u64, total_len);
 
     elf
+}
+
+/// Static guest ELF for the per-thread procfs check ([`check_thread_task_dir`]).
+///
+/// Hand-assembled exactly like [`build_linux_test_elf`] (the kernel ships no
+/// compiler into the image): one `PT_LOAD` RWX segment whose `p_memsz` is larger
+/// than its `p_filesz`, so the loader zero-fills the child stack the code needs.
+///
+/// The code performs the thread-clone shape `sys_clone` supports —
+/// `clone(CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|
+/// SIGCHLD, child_stack, 0, 0, 0)` — and then both the parent thread and the
+/// cloned thread park in a `pause; jmp` loop. Neither ever exits, so the harness
+/// observes a live two-task thread group and then ends it through the real
+/// `SIGKILL` path (never by yanking the scheduler): this is what makes the check
+/// evidence that `/proc/<pid>/task` lists REAL `clone(CLONE_THREAD)` tasks, not
+/// registry entries the test wrote itself.
+fn build_thread_test_elf() -> Vec<u8> {
+    const VBASE: u64 = 0x40_0000;
+    const EHSIZE: usize = 64;
+    const PHSIZE: usize = 56;
+    /// Total image span; the top 16-byte-aligned slot becomes the child stack.
+    const MEMSZ: u64 = 0x4000;
+    const STACK_TOP: u64 = VBASE + MEMSZ - 0x10;
+    /// CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
+    /// CLONE_SYSVSEM | SIGCHLD (`process_sys::CLONE_SUPPORTED` accepts it).
+    const CLONE_FLAGS: u32 = 0x0005_0F11;
+
+    let code_off = EHSIZE + PHSIZE;
+
+    let mut code: Vec<u8> = Vec::with_capacity(29);
+    code.push(0xBF); // mov edi, CLONE_FLAGS
+    code.extend_from_slice(&CLONE_FLAGS.to_le_bytes());
+    code.push(0xBE); // mov esi, STACK_TOP (the child's initial rsp)
+    code.extend_from_slice(&(STACK_TOP as u32).to_le_bytes());
+    code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx    (parent_tid = NULL)
+    code.extend_from_slice(&[0x45, 0x31, 0xD2]); // xor r10d, r10d (child_tid = NULL)
+    code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d   (tls = NULL)
+    code.extend_from_slice(&[0xB8, 0x38, 0x00, 0x00, 0x00]); // mov eax, 56 (clone)
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+                                           // Both threads land here: pause; jmp -4 (back to the pause).
+    code.extend_from_slice(&[0xF3, 0x90, 0xEB, 0xFC]);
+    debug_assert_eq!(code.len(), 29);
+
+    let entry = VBASE + code_off as u64;
+    let total_len = (code_off + code.len()) as u64;
+
+    let mut elf: Vec<u8> = Vec::new();
+    // ELF64 header (64 bytes).
+    elf.extend_from_slice(&[0x7F, b'E', b'L', b'F']);
+    elf.push(2); // ELFCLASS64
+    elf.push(1); // ELFDATA2LSB
+    elf.push(1); // EI_VERSION
+    elf.push(0); // System V
+    elf.extend_from_slice(&[0u8; 8]); // EI_ABIVERSION + padding
+    elf.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+    elf.extend_from_slice(&0x3Eu16.to_le_bytes()); // e_machine = EM_X86_64
+    elf.extend_from_slice(&1u32.to_le_bytes()); // e_version
+    elf.extend_from_slice(&entry.to_le_bytes()); // e_entry
+    elf.extend_from_slice(&(EHSIZE as u64).to_le_bytes()); // e_phoff
+    elf.extend_from_slice(&0u64.to_le_bytes()); // e_shoff
+    elf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    elf.extend_from_slice(&(EHSIZE as u16).to_le_bytes()); // e_ehsize
+    elf.extend_from_slice(&(PHSIZE as u16).to_le_bytes()); // e_phentsize
+    elf.extend_from_slice(&1u16.to_le_bytes()); // e_phnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+    debug_assert_eq!(elf.len(), EHSIZE);
+
+    // Program header (56 bytes): PT_LOAD PF_R|PF_W|PF_X, filesz < memsz.
+    elf.extend_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    elf.extend_from_slice(&7u32.to_le_bytes()); // PF_R|PF_W|PF_X
+    elf.extend_from_slice(&0u64.to_le_bytes()); // p_offset
+    elf.extend_from_slice(&VBASE.to_le_bytes()); // p_vaddr
+    elf.extend_from_slice(&VBASE.to_le_bytes()); // p_paddr
+    elf.extend_from_slice(&total_len.to_le_bytes()); // p_filesz
+    elf.extend_from_slice(&MEMSZ.to_le_bytes()); // p_memsz
+    elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
+    debug_assert_eq!(elf.len(), EHSIZE + PHSIZE);
+
+    elf.extend_from_slice(&code);
+    debug_assert_eq!(elf.len() as u64, total_len);
+    elf
+}
+
+/// Read a whole (small) VFS file as text; `None` when the path does not resolve.
+fn read_vfs_text(path: &str) -> Option<alloc::string::String> {
+    let node = vfs::lookup_path(path).ok()?;
+    let mut out: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 512];
+    let mut off = 0u64;
+    loop {
+        match node.read(off, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                off += n as u64;
+                if out.len() > 16 * 1024 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    Some(alloc::string::String::from_utf8_lossy(&out).into_owned())
+}
+
+/// The `Name:`-style value of a `/proc` text line, trimmed.
+fn proc_field(text: &str, key: &str) -> Option<alloc::string::String> {
+    text.lines()
+        .find(|l| l.starts_with(key))
+        .map(|l| alloc::string::String::from(l[key.len()..].trim()))
+}
+
+/// Slice 6 (`docs/procfs.md` §13): `/proc/<pid>/task` over a REAL thread clone.
+///
+/// Runs in the post-network harness because it waits on ticks (a spawned kernel
+/// thread; `run()` executes on the boot thread and must not sleep — see
+/// [`run_post_net_checks`]). Steps: build + write a static ELF that clones a
+/// thread and parks both threads, spawn it, wait until `/proc/<pid>/task` lists
+/// exactly two live tasks, verify the per-thread files (`stat` pid/comm/field 20,
+/// `status` Tgid/Pid/Threads, inherited `cmdline`, inode identity), then terminate
+/// the group with the real `SIGKILL` path and confirm the directory disappears.
+fn check_thread_task_dir() {
+    let name = "thread_task_dir";
+
+    let elf = build_thread_test_elf();
+    if let Err(d) = write_mnt_file("lxthread", &elf) {
+        fail(name, d);
+        return;
+    }
+    let pid = match run_linux_binary("/mnt/lxthread", &[b"lxthread"], &[]) {
+        Ok(pid) => pid,
+        Err(RunError::ArgsTooLarge) => return fail(name, "run returned ArgsTooLarge"),
+        Err(RunError::NotFound) => return fail(name, "run returned NotFound"),
+        Err(RunError::LoadFailed(c)) => return fail(name, c),
+        Err(RunError::StackFailed) => return fail(name, "run returned StackFailed"),
+    };
+    // The harness is not a wait4 parent of this test image: a zombie record for
+    // pid 1's "child" would outlive the check for no reason.
+    compat::with_pid_compat(pid, |cs| cs.waitable = false);
+
+    // ── Wait for the clone to land: two live tasks in the group ─────────────
+    let task_path = alloc::format!("/proc/{}/task", pid);
+    let mut listed: Vec<alloc::string::String> = Vec::new();
+    let deadline = scheduler::ticks() + 3 * crate::arch::x86_64::apic::TICK_HZ;
+    while scheduler::ticks() < deadline {
+        listed = match vfs::lookup_path(&task_path) {
+            Ok(node) => node
+                .readdir()
+                .map(|children| {
+                    children
+                        .iter()
+                        .map(|c| alloc::string::String::from(c.name()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            // The process may not have been scheduled yet (compat entry exists,
+            // so this is unexpected) — retry until the deadline.
+            Err(_) => Vec::new(),
+        };
+        if listed.len() >= 2 {
+            break;
+        }
+        scheduler::sleep_ticks(1);
+    }
+    if listed.len() != 2 {
+        let detail = alloc::format!("task dir lists {:?} (want the 2 cloned tasks)", listed);
+        // Do not leave the spinning process behind on this path.
+        let _ = crate::arch::x86_64::linux::signal::send_signal(
+            pid,
+            crate::arch::x86_64::linux::signal_frame::SIGKILL,
+        );
+        return fail(name, &detail);
+    }
+    // Parent is the task the launcher returned; the sibling is the clone.
+    let leader_name = alloc::format!("{}", pid);
+    let sibling = match listed.iter().find(|t| **t != leader_name) {
+        Some(t) => t.clone(),
+        None => {
+            let _ = crate::arch::x86_64::linux::signal::send_signal(
+                pid,
+                crate::arch::x86_64::linux::signal_frame::SIGKILL,
+            );
+            return fail(name, "task dir lists the leader twice / no sibling tid");
+        }
+    };
+
+    // ── Per-thread stat/status/cmdline of the CLONED task ───────────────────
+    let child_stat =
+        read_vfs_text(&alloc::format!("/proc/{}/task/{}/stat", pid, sibling)).unwrap_or_default();
+    let child_status =
+        read_vfs_text(&alloc::format!("/proc/{}/task/{}/status", pid, sibling)).unwrap_or_default();
+    let child_cmdline = read_vfs_text(&alloc::format!("/proc/{}/task/{}/cmdline", pid, sibling))
+        .unwrap_or_default();
+
+    let stat_pid_ok = child_stat
+        .split('(')
+        .next()
+        .map(|p| p.trim() == sibling)
+        .unwrap_or(false);
+    let stat_comm_ok = child_stat.contains("(lxthread)");
+    let stat_threads_ok = {
+        let close = child_stat.rfind(')').unwrap_or(0);
+        child_stat[close + 1..]
+            .split_whitespace()
+            .nth(17) // field 20 (num_threads): fields 3..52 start after the comm
+            .map(|f| f == "2")
+            .unwrap_or(false)
+    };
+    let status_tgid_ok =
+        proc_field(&child_status, "Tgid:").as_deref() == Some(alloc::format!("{}", pid).as_str());
+    let status_pid_ok = proc_field(&child_status, "Pid:").as_deref() == Some(sibling.as_str());
+    let status_threads_ok = proc_field(&child_status, "Threads:").as_deref() == Some("2");
+    let cmdline_ok = child_cmdline.as_bytes() == b"lxthread\0";
+    // The thread directory is the same VFS object as /proc/<tid>.
+    let same_inode = match (
+        vfs::lookup_path(&alloc::format!("/proc/{}/task/{}", pid, sibling)),
+        vfs::lookup_path(&alloc::format!("/proc/{}", sibling)),
+    ) {
+        (Ok(a), Ok(b)) => a.fs_ino() == b.fs_ino() && a.is_directory(),
+        _ => false,
+    };
+    // The process-level status agrees on the group size.
+    let proc_threads_ok = proc_field(
+        &read_vfs_text(&alloc::format!("/proc/{}/status", pid)).unwrap_or_default(),
+        "Threads:",
+    )
+    .as_deref()
+        == Some("2");
+
+    // ── End the group through the real kill path, then re-check ─────────────
+    let killed = crate::arch::x86_64::linux::signal::send_signal(
+        pid,
+        crate::arch::x86_64::linux::signal_frame::SIGKILL,
+    )
+    .is_ok();
+    let gone_deadline = scheduler::ticks() + crate::arch::x86_64::apic::TICK_HZ;
+    let mut gone = false;
+    while scheduler::ticks() < gone_deadline {
+        if vfs::lookup_path(&task_path).is_err() {
+            gone = true;
+            break;
+        }
+        scheduler::sleep_ticks(1);
+    }
+    // Drop the test image from `/mnt` so the rest of the harness sees a clean
+    // filesystem (the apt e2e runs right after this check).
+    if let Ok(dir) = vfs::lookup_path("/mnt") {
+        let _ = dir.remove("lxthread");
+    }
+
+    if stat_pid_ok
+        && stat_comm_ok
+        && stat_threads_ok
+        && status_tgid_ok
+        && status_pid_ok
+        && status_threads_ok
+        && cmdline_ok
+        && same_inode
+        && proc_threads_ok
+        && killed
+        && gone
+    {
+        pass(name);
+    } else {
+        let detail = alloc::format!(
+            "stat(pid={} comm={} threads={}) status(tgid={} pid={} threads={}) cmdline={} \
+             same_inode={} proc_threads={} killed={} gone={}",
+            stat_pid_ok,
+            stat_comm_ok,
+            stat_threads_ok,
+            status_tgid_ok,
+            status_pid_ok,
+            status_threads_ok,
+            cmdline_ok,
+            same_inode,
+            proc_threads_ok,
+            killed,
+            gone
+        );
+        fail(name, &detail);
+    }
 }
 
 // ─────────────────────────────────── checks ──────────────────────────────────
