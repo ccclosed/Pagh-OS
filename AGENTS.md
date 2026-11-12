@@ -235,8 +235,8 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `head`, `tail`, `wc` and `grep` shell commands on top of the 2.18.13 batch:
   `connect(2)` reply-and-close, the VT/console coordinates and the
   kernel-thread rows in `ps`).
-  **2.19.0** = six new shell commands, one batch of "ask the machine instead
-  of reading a log":
+  **2.19.0** = six new shell commands plus a long listing for `ls`, one batch
+  of "ask the machine instead of reading a log":
   * `free` — physical memory total/used/free from the PMM frame counters plus
     the fixed kernel heap from the global allocator's counters, in the busybox
     `free` layout and KiB. `/proc/meminfo` already exposed `MemTotal`/
@@ -254,6 +254,11 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
     implemented, and the kernel assumes the RTC keeps UTC everywhere, so a
     machine set to local time shows it labelled `UTC` rather than a guessed
     correction.
+  * `ls -l` — long listing: type letter + nine permission bits (with the
+    setuid/setgid/sticky markers in the execute slot), link count, owner,
+    group, size and name, plus `-> target` for symlinks. Deliberately no
+    timestamp column: `VfsNode` has no `mtime`, and a fake `Jan 1 1970` would
+    read as real data.
   * `head`, `tail`, `wc`, `grep` — inspect a file without dumping it: first or
     last N lines, line/word/byte counts, and the lines containing a pattern
     (`-i` `-n` `-c` `-v`). All four share one streaming walk

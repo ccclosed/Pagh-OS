@@ -98,8 +98,8 @@ pub static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "ls",
-        description: "List directory entries",
-        usage: "ls [path]",
+        description: "List a directory; -l shows mode, links, owner and size",
+        usage: "ls [-l] [path]",
         handler: super::commands::cmd_ls,
     },
     CommandSpec {

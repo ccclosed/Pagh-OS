@@ -201,12 +201,27 @@ pub(super) fn cmd_cd(_ctx: &mut ShellCtx, args: &[&str]) {
 /// `ls [path]`: list a directory's entries (directories shown with a trailing
 /// `/`), or print a file's own name. Defaults to `/` when no path is given.
 pub(super) fn cmd_ls(_ctx: &mut ShellCtx, args: &[&str]) {
-    // No arg: list the current working directory (R9.2). With an arg, resolve
-    // it against the CWD so relative paths and `.`/`..` work (R4.6).
-    let path = if !args.is_empty() {
-        resolve_arg(args[0])
-    } else {
-        super::path::cwd()
+    // `-l`: long form — mode, links, owner/group, size, name. Anything else is a
+    // path. No path: the CWD (R9.2); a relative path resolves against the CWD so
+    // `.`/`..` work (R4.6).
+    let mut long = false;
+    let mut path_arg: Option<&str> = None;
+    for a in args {
+        if *a == "-l" {
+            long = true;
+        } else if a.starts_with('-') && a.len() > 1 && path_arg.is_none() {
+            shell_println(&alloc::format!("ls: unknown option: {}", a));
+            return;
+        } else if path_arg.is_none() {
+            path_arg = Some(a);
+        } else {
+            shell_println("ls: too many operands");
+            return;
+        }
+    }
+    let path = match path_arg {
+        Some(p) => resolve_arg(p),
+        None => super::path::cwd(),
     };
     match crate::vfs::lookup_path(&path) {
         Ok(node) => {
@@ -214,7 +229,9 @@ pub(super) fn cmd_ls(_ctx: &mut ShellCtx, args: &[&str]) {
                 match node.readdir() {
                     Ok(children) => {
                         for child in children.iter() {
-                            if child.is_directory() {
+                            if long {
+                                shell_println(&ls_long_line(&**child));
+                            } else if child.is_directory() {
                                 shell_println(&alloc::format!("{}/", child.name()));
                             } else {
                                 shell_println(child.name());
@@ -225,6 +242,9 @@ pub(super) fn cmd_ls(_ctx: &mut ShellCtx, args: &[&str]) {
                         shell_println(&alloc::format!("ls: {}: cannot read directory", path));
                     }
                 }
+            } else if long {
+                // `ls -l file`: the same line the directory listing would show.
+                shell_println(&ls_long_line(&*node));
             } else {
                 // Non-directory: print just its name, like `ls file`.
                 shell_println(node.name());
@@ -234,6 +254,69 @@ pub(super) fn cmd_ls(_ctx: &mut ShellCtx, args: &[&str]) {
             shell_println(&alloc::format!("ls: {}: not found", path));
         }
     }
+}
+
+/// The `-rw-r--r--`-style mode word for `ls -l`: type letter, the nine
+/// permission bits, and the setuid/setgid/sticky markers in the execute slot
+/// (`s`/`S`/`t`/`T`), exactly like coreutils.
+///
+/// The kernel has no `mtime`/`ctime` accessor on `VfsNode`, so the long listing
+/// deliberately stops at mode/links/owner/size instead of printing a timestamp
+/// the VFS cannot supply (a fake `Jan 1 1970` column would read as real data).
+fn ls_mode_string(node: &dyn crate::vfs::VfsNode) -> alloc::string::String {
+    let mode = node.mode();
+    let type_char = if node.is_directory() {
+        'd'
+    } else if node.is_symlink() {
+        'l'
+    } else {
+        '-'
+    };
+    let mut out = alloc::string::String::with_capacity(10);
+    out.push(type_char);
+    // (read bit, write bit, execute bit, special bit, special-if-exec, special-if-not)
+    let triplets = [
+        (0o400u32, 0o200, 0o100, 0o4000u32, 's', 'S'), // user + setuid
+        (0o040, 0o020, 0o010, 0o2000u32, 's', 'S'),    // group + setgid
+        (0o004, 0o002, 0o001, 0o1000u32, 't', 'T'),    // other + sticky
+    ];
+    for (r, w, x, special_bit, special_x, special_no_x) in triplets {
+        out.push(if mode & r != 0 { 'r' } else { '-' });
+        out.push(if mode & w != 0 { 'w' } else { '-' });
+        let special = mode & special_bit != 0;
+        out.push(if special && mode & x != 0 {
+            special_x
+        } else if special {
+            special_no_x
+        } else if mode & x != 0 {
+            'x'
+        } else {
+            '-'
+        });
+    }
+    out
+}
+
+/// One `ls -l` row: mode, link count, owner, group, size, name (plus `-> target`
+/// for symlinks).
+fn ls_long_line(node: &dyn crate::vfs::VfsNode) -> alloc::string::String {
+    let (uid, gid) = node.owner();
+    let mut line = alloc::format!(
+        "{} {:>3} {:>5} {:>5} {:>9} {}",
+        ls_mode_string(node),
+        node.nlink(),
+        uid,
+        gid,
+        node.size(),
+        node.name()
+    );
+    if node.is_symlink() {
+        if let Some(target) = node.read_link() {
+            line.push_str(" -> ");
+            line.push_str(&target);
+        }
+    }
+    line
 }
 
 /// `cat <path>`: print a file's contents, capping the total bytes read so an
