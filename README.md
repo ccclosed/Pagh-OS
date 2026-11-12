@@ -108,7 +108,6 @@ userland** onto its ext2 disk, on demand from the shell (`apt update` +
 > without `Valid-Until`, the index-free `pkg` command) are listed in `SECURITY.md`.
 > Use `cargo build --no-default-features` for a fail-closed build. See `HARDENING.md`.
 
-> **Authorship:** this kernel was written by AI under human supervision.
 
 ---
 
