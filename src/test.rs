@@ -1522,6 +1522,63 @@ mod log_tests {
     }
 }
 
+/// Regression tests for the log mirror's fixed-size line buffer.
+///
+/// These live in the in-QEMU suite rather than in `host-tests` because
+/// `logfile.rs` pulls in the ring's spinlock and the VFS flusher; only
+/// `FixedLine` is pure, and that is the type the test drives. The bug it pins
+/// down is a real crash: `panic = "abort"`, so an out-of-bounds write in the
+/// formatter is not a red test, it is a dead machine.
+mod logfile_tests {
+    use core::fmt::Write;
+
+    /// A log line longer than `LINE_MAX` must be truncated, never overrun.
+    ///
+    /// `FixedLine::write_str` used to truncate by writing the newline marker
+    /// when `len == LINE_MAX - 1` and returning; the `core::fmt` machinery then
+    /// kept calling `write_str` for the remaining pieces of the same message,
+    /// and the next call wrote `buf[LINE_MAX]` — `index out of bounds: len is
+    /// 200 but index is 200`. An E2E run hit it while formatting an ext2
+    /// superblock dump into an `[ERROR]` line; on a real machine the same panic
+    /// kills the kernel, because `panic = "abort"`.
+    pub fn overlong_line_is_truncated_not_panicking() {
+        let limit = crate::logfile::LINE_MAX;
+        let long = "x".repeat(limit * 2);
+        let mut line = crate::logfile::FixedLine::new();
+        // Several `write_str` calls, exactly like a multi-argument `write!`.
+        let formatted = write!(line, "prefix: {}{}{}", long, long, "tail").is_ok();
+        assert_kernel!(formatted, "formatting an overlong line must not fail");
+        let bytes = line.as_bytes();
+        assert_kernel!(bytes.len() <= limit, "truncated line fits LINE_MAX");
+        assert_kernel!(
+            bytes.last() == Some(&b'\n'),
+            "a truncated line ends with the truncation marker"
+        );
+
+        // A line that fits exactly to the limit is stored whole, without marker.
+        let mut exact = crate::logfile::FixedLine::new();
+        let fit = "y".repeat(limit - 1);
+        let _ = write!(exact, "{}", fit);
+        assert_eq_kernel!(
+            exact.as_bytes().len(),
+            limit - 1,
+            "an exact-fit line is not truncated"
+        );
+
+        // And the very next byte truncates instead of overrunning the buffer.
+        let _ = write!(exact, "{}", "z");
+        assert_eq_kernel!(
+            exact.as_bytes().len(),
+            limit,
+            "an overlong line fills the buffer and stops"
+        );
+        assert_kernel!(
+            exact.as_bytes().last() == Some(&b'\n'),
+            "the buffer's last byte is the truncation marker"
+        );
+    }
+}
+
 mod vfs_tests {
     use crate::vfs::VfsNode;
     struct Null;
@@ -6701,6 +6758,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "log::level filter monotonicity",
             log_tests::level_filter_monotonicity
+        ),
+        (
+            "logfile::overlong line truncates instead of panicking",
+            logfile_tests::overlong_line_is_truncated_not_panicking
         ),
         ("vfs::null read 0", vfs_tests::read_zero),
         ("vfs::null write all", vfs_tests::write_all),
