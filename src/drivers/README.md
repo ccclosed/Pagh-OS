@@ -22,6 +22,8 @@ framebuffer-консоль, VT-эмулятор, курсор, serial. Коор�
 | `vt.rs` | ANSI/VT-100 эмулятор поверх framebuffer (`Vt`: CSI/OSC/DCS, 256 цветов, scroll regions, ответы на запросы) — stdout compat-программ |
 | `cursor.rs` | Программный курсор мыши 12×19 (save/restore фона); `text_begin`/`text_end` для курсор-безопасного текста |
 | `serial.rs` | COM1 UART консоль (`init`, `write_bytes`, `console()`, макросы `kprint!`/`kprintln!`) |
+| `earlyfb.rs` | Аварийная консоль прямо в Limine-фреймбуфер: без аллокатора, без локов, без `format!` — шаги boot печатают себя до/после запуска, а `fatal()` и panic-handler видны на машине без serial. Тот же глиф-ассет (`assets/font8x18.bin`), шаг печатается ДО выполнения, чтобы повисший шаг назвал себя |
+| `memdisk.rs` | RAM-диск `ram0`: `BlockDevice` над Limine-модулем `*.img` с загрузочного носителя (образ едет рядом с ядром), секторы 512 B; запись идёт в память и не переживает перезагрузку |
 
 ## Ключевые символы
 
@@ -106,7 +108,8 @@ PRP-list страница. `rw_common` режет запрос на LBA-выро
 отказавшим (`io_failed`) вместо рискованного сопоставления. Невыровненные записи
 идут read-modify-write по LBA, чтобы не затирать соседние сектора. `sector_count()`
 отдаёт весь namespace в 512-байтных секторах (нужно `ext2::format`).
-Не реализовано: IRQ, несколько namespace, разбор партиций (берётся весь namespace),
+Не реализовано: IRQ, несколько namespace, разбор партиций *внутри драйвера* (он отдаёт
+весь namespace как `nvme0`, а GPT/MBR режет `drivers::partition` — см. «Разделы»),
 несколько I/O-очередей, SMART/self-test и shutdown-notification.
 
 ### Консоль / VT / курсор

@@ -106,7 +106,9 @@ Shift+букву строчной при выключенном CapsLock.
 `apt <update|install|show|list|setmirror>`, `lxrun <path> [args]` (Linux ELF в ring 3,
 fixed env `TERM=xterm`, `PATH=/mnt/usr/bin`; забирает терминал у shell'а на время
 работы — см. «Job control»), `jobs`, `fg`, `bg`, `warn <on|off>` (тумблер fb-зеркала
-warn-логов).
+warn-логов), `usb` (состояние xHCI и PORTSC каждого порта), `disk`
+(`list`/`setup`/`mount <n>`/`format <n> [--force]`/`cancel` — блочные устройства и
+явное форматирование), `settings`/`theme`/`wallpaper` (тема, фон, статус-бар, каретка).
 
 ## Команды `ps` и `df`: что они честно показывают
 

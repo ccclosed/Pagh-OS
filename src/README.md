@@ -27,11 +27,12 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
 - Атрибуты: `no_std`, `no_main`, фичи (`abi_x86_interrupt`, `allocator_api`,
   `custom_test_frameworks`, `sync_unsafe_cell`); `#![test_runner]` — пустой стаб,
   реальный харнесс — `test::run_all()` из shell.
-- Дерево модулей: `arch, boot, boot_menu, debug, drivers, fs, log, memory, net, pkg,
+- Дерево модулей: `arch, boot, boot_menu, debug, drivers, fs, log, logfile, memory, net, pkg,
   provision, security, shell, sync, task, test, vfs`; `selftest_lx` — под feature-гейтами
   (`lx_selftest`/`lx_livetest`/`lx_bigindex`/`lx_tlsbig`).
 - Limine-запросы в секции `.requests`: `BASE_REVISION` (rev 2), `HHDM_REQUEST`,
-  `MEMMAP_REQUEST`, `KERNEL_ADDR_REQUEST`, `FRAMEBUFFER_REQUEST`, `RSDP_REQUEST`.
+  `MEMMAP_REQUEST`, `KERNEL_ADDR_REQUEST`, `FRAMEBUFFER_REQUEST`, `RSDP_REQUEST`,
+  `MODULES_REQUEST` (диск-образ с загрузочного носителя, см. `drivers::memdisk`).
 - Глобалы: `HHDM_OFFSET`, `KERNEL_BASE`, `KERNEL_SIZE` (заполняет `boot::start`).
 - `_start() -> !` → `boot::start()`.
 - `#[panic_handler]`: cli → `[PANIC] file:line — msg` → `debug::unwind::stack_trace()` → halt.
@@ -49,10 +50,14 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
 7. `apic::init` + роутинг IRQ1/IRQ12 (клавиатура/мышь).
 8. `drivers::init` (PS/2 + framebuffer).
 9. virtio: `pci::enumerate()` → `virtio::blk::init_blk` (после кучи — enumerate аллоцирует Vec).
-10. `scheduler::init`, `vfs::init` (монтирует `/dev`, ramfs `/tmp` и синтетический
-    `/proc` — issue #11; содержимое `/proc` рендерится лениво, поэтому порядок
-    boot-фаз не меняется, но к этому моменту уже готовы PMM, heap и тик-клок).
-11. `init_fs`: attach NVMe → разбор GPT/MBR (`drivers::partition`, каждый раздел — своё
+10. `scheduler::init`, `init_usb` (xHCI-контроллер, если он есть в PCI; провал не
+    фатален — остаётся PS/2-путь), `vfs::init` (монтирует `/dev`, ramfs `/tmp` и
+    синтетический `/proc` — issue #11; содержимое `/proc` рендерится лениво, поэтому
+    порядок boot-фаз не меняется, но к этому моменту уже готовы PMM, heap и тик-клок).
+11. `init_ramdisk`: первый Limine-модуль с именем `*.img` регистрируется как RAM-диск
+    `ram0` (`drivers::memdisk`) — на машине без поддерживаемого диска система едет на
+    загрузочном носителе.
+12. `init_fs`: attach NVMe → разбор GPT/MBR (`drivers::partition`, каждый раздел — своё
     устройство `nvme0p1`/`virtio-blk0p1`) → `boot_menu::run()`: список разделов и
     RAM-диска с тем, что каждый держит (`pagh volume` по WAL-маркеру, `empty`,
     `FOREIGN fs`, `unknown data`). `Enter` монтирует, `F` форматирует **только после
@@ -61,12 +66,13 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
     Раздел форматируется исключительно по явной команде человека из меню;
     автоматически форматируется лишь RAM-диск (scratch). `fs::format_policy` осталась
     политикой для `disk setup` и для этого автоматического пути; ext3/ext4 отсекаются по
-    feature-словам, чужой ext2 — по отсутствию WAL. Затем `vfs::mount_at("/mnt", root)`;
-    `fs_boot_demo()`; `provision::seed()`.
-12. `net::init()` + echo-сервисы на порту 7.
-`kernel_main`: спавн `shell_thread` (PID 1) и `net::net_thread`; feature-гейтнутые selftest-хуки;
-`enable_interrupts()`; main-поток — `halt_loop()`. `shell_thread` после стабилизации
-запускает shell (никаких вопросов на консоли: юзерленд ставится из shell через `apt`).
+    feature-словам, чужой ext2 — по отсутствию WAL. Затем
+    `vfs::mount_at_named("/mnt", root, "ext2")`; `fs_boot_demo()`; `provision::seed()`.
+13. `net::init()` + echo-сервисы на порту 7 (UDP и TCP).
+`kernel_main`: спавн `shell_thread` (PID 1), `net::net_thread`, `drivers::xhci::usb_thread` и
+`logfile::flush_thread`; feature-гейтнутые selftest-хуки; `enable_interrupts()`; main-поток —
+`halt_loop()`. `shell_thread` после стабилизации запускает shell (никаких вопросов на
+консоли: юзерленд ставится из shell через `apt`).
 
 Грабли: `create_user_process` обязан идти с выключенными прерываниями (тик, увидев чужой CR3,
 ломает планирование); отсутствие диска/NIC — warn, не fatal; ext2-маунт до включения прерываний.
@@ -100,9 +106,8 @@ Sinks: serial всегда, framebuffer условно. Гейты fb-зерка
 - `seed()` — идемпотентный посев ФС первого бута (guard `/mnt/etc/pagh-release`):
   `etc/`, `home/user/`, `usr/share/pagh/`, `examples/hello/`; `resolv.conf` (10.0.2.3),
   `hosts`, `motd`, README, LICENSE-NOTICE, hello-пример. `write_once` — не перезаписывает.
-  n=0x31); false, если python уже стоит.
-  до 6 ретраев `apt::update()`, затем `apt::install("python3")` (тянет libc6, libpython).
-  Зависит от `pkg::apt`, `vfs`, `scheduler::sleep_ticks`, `drivers` (клавиатура).
+  Зависит только от `vfs` (`VfsNode`/`VfsError`): никакого apt/python в этой функции уже
+  нет — юзерленд ставится из shell по явной команде (`apt update` + `apt install python3`).
 
 ### `selftest_lx.rs` — Linux-совместимость selftests (feature-gated)
 Компилируется только под `lx_selftest`/`lx_livetest`/`lx_bigindex`/`lx_tlsbig`.
@@ -127,7 +132,7 @@ Sinks: serial всегда, framebuffer условно. Гейты fb-зерка
 убила бы харнесс (`panic = "abort"`). Хелпер `with_synth_compat` ставит временный
 `CompatState`; scratch-страница на `0x0000_4000_0000_0000` для user-указателей.
 
-### `test.rs` — in-QEMU kernel self-test suite (56 рутин)
+### `test.rs` — in-QEMU kernel self-test suite (список рутин — `all_tests()`)
 - `assert_kernel!`/`assert_eq_kernel!` печатают `FAIL: file:line: msg` и продолжают (не аборт).
 - `all_tests() -> Vec<(&'static str, fn())>`; `run_all()` — вызывается вручную командой
   `selftest` в shell, не на буте. Все рутины неразрушающие (восстанавливают PMM, кучу, IF, VFS).
@@ -136,7 +141,7 @@ Sinks: serial всегда, framebuffer условно. Гейты fb-зерка
 - Покрытие: PMM (P1/P2/P15), VMM (P3/P4), heap (P5), spinlock (P6), планировщик + 21-словный
   фрейм (P7), ELF reject-матрица + фаззинг (P8), log-монотонность (P9), journal
   replay/atomicity/idempotence/corruption (P10–P13), virtio-blk roundtrip (P14/P16),
-  net RX-ring модель (P17), ext2 (P18–P20), shell-инварианты (P21–P27).
+  net RX-ring модель (P17), ext2 (P18–P20), shell-инварианты (P21–P29).
 - Детерминизм: приватный XorShift64 с фиксированными сидами; near-OOM — skip, не fail.
 
 ## Зависимости крейта (кратко)

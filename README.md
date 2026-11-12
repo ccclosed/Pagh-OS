@@ -31,7 +31,7 @@
 - **Boot:** Limine/UEFI → 1280×800 framebuffer console with a coloured prompt and status bar.
 - **Shell:** line editing, history, tab completion, `ls`/`df`/`ifconfig`/`ps`, ext2 file ops, `selftest`.
 - **GUI apps:** the mouse-driven `paint` (shape tools, 16-colour palette, brush sizes, undo, save to ext2), the full-screen `nano+` editor, and `settings` with live colour themes + wallpapers.
-- **Storage:** ext2-compatible read/write filesystem with a write-ahead-log journal, on a real virtio-blk disk.
+- **Storage:** ext2-compatible read/write filesystem with a write-ahead-log journal, on a real virtio-blk or NVMe disk (or a RAM disk carried on the boot medium).
 - **Networking:** the kernel's own e1000 + TCP/IP stack (DHCP/ARP/TCP/UDP; `ifconfig` shows the live lease).
 - **Processes:** preemptive ~1 kHz scheduler, ring-3 user processes, `SYSCALL`/`int 0x80`.
 
@@ -73,8 +73,9 @@ binaries — statically linked or dynamically linked against glibc (up to CPytho
 in ring 3 through a Linux syscall-compatibility layer (`fork`/`clone` + threads,
 `epoll`/`eventfd`, unix sockets, and a VT100-style terminal with raw-mode `termios`
 included), includes an **`apt`-style package manager** that fetches and installs Debian
-`.deb` packages by name over HTTP/HTTPS, and can **provision a base glibc + Python
-userland** onto its ext2 disk after an opt-in confirmation at first boot.
+`.deb` packages by name over HTTP/HTTPS, and can **install a base glibc + Python
+userland** onto its ext2 disk, on demand from the shell (`apt update` +
+`apt install python3`) — boot itself never stops to ask.
 
 > Hobby/educational kernel — **not a security boundary.** Ring 3 is isolated from the
 > kernel by paging (the U/S bit, W^X/NX leaves, and device MMIO never user-accessible)
@@ -294,11 +295,11 @@ The scripts automatically detect common system OVMF locations. Override with
 are `LIMINE_DIR`, `LIMINE_EFI`, and `PAGH_DISK`. QEMU exits with `Ctrl-A`, then `X`.
 
 `run.sh` creates a 1 GiB raw `disk.img` on first run and boots QEMU with 1 GiB of RAM.
-On the first boot with networking, the boot asks whether to download & install the base
-`python3` userland from the shell (`apt install python3`; ≈50 MB of downloads). It runs the
-install in the background; `N` skips it (`apt update` + `apt install python3` from the
-shell installs it later). Delete `disk.img` to get a clean re-provisioned system on the
-next boot.
+The first boot only seeds the filesystem skeleton; the base `python3` userland is not
+installed from a boot prompt (a console question without a timeout is not something boot
+may do). Install it from the shell when you want it: `apt update` then `apt install
+python3` (≈50 MB of downloads, progress on serial). Delete `disk.img` to get a clean,
+re-seeded system on the next boot.
 
 > **Data safety when booting real hardware.** pagh does not format a disk on its own at
 > boot. It lists the partitions it can see and waits; formatting a partition happens only
@@ -399,10 +400,10 @@ touches vector registers), then each step logs one concise `info!` line. The `ex
 journaled write/read self-demo. The `Hello from ring3 user process!` line is printed by an
 embedded ELF executing in ring 3 via a `SYS_WRITE` system call. The DHCP lease is acquired
 asynchronously by the network poll thread once interrupts are enabled, so it appears after
-the prompt. On a fresh disk the boot asks `download & install glibc + python3 in the
-background` — the install path runs `apt update`
-and installs the base `python3` userland (progress on serial; the framebuffer log mirror is
-paused while it runs). The prompt shows the current working directory and is rendered in color on the
+the prompt. On a fresh disk the boot only seeds the file skeleton (release metadata,
+`/etc`, an example); the glibc + `python3` userland is installed on demand from the shell
+with `apt update` + `apt install python3` (progress on serial; the framebuffer log mirror
+is paused while it runs). The prompt shows the current working directory and is rendered in color on the
 framebuffer (serial stays plain text).
 
 ### Shell commands
@@ -429,7 +430,7 @@ framebuffer (serial stays plain text).
 | `sleep <seconds>`    | Sleep for N seconds                                             |
 | `nano <path>`        | Full-screen editor: undo/redo, search/replace, goto, clipboard  |
 | `rust <path> [...]`  | Run `.rs`/`.pbc` with mini-Rust, or any ELF via the Linux layer |
-| `rustc <file.rs>`    | Compile mini-Rust source into an offline `.pbc` package         |
+| `rustc <file.rs>`    | Compile Rust source to a `.pbc` (real `/mnt/usr/bin/rustc` if installed, else embedded mini-Rust) |
 | `cargo …`            | Real `/mnt/usr/bin/cargo` if installed, else embedded mini-Rust |
 | `rustup …`           | Inspect the built-in offline mini-Rust toolchain                |
 | `lua [file\|-e code]` | Run Lua 5.5 (installed via apt)                                |
@@ -438,16 +439,21 @@ framebuffer (serial stays plain text).
 | `pythonc <file.py>`  | Compile Python source to bytecode                               |
 | `paint`              | Launch the windowed, mouse-driven framebuffer paint app         |
 | `pci`                | List enumerated PCI devices (virtio tagged)                     |
+| `usb`                | xHCI controller state and per-port status (diagnostics)         |
+| `disk [list\|setup\|mount <n>\|format <n> [--force]\|cancel]` | List block devices; format one as ext2 and mount it at `/mnt` |
 | `ifconfig`           | Show the network interface (IP, gateway, MAC)                   |
+| `ping <ip>`          | Send one ICMP echo request and print the RTT                    |
 | `df`                 | Mounted filesystems: 1K blocks, used, available, use%, mount point |
-| `ps`                 | Live compat processes: PID, PPID, STAT, COMMAND (from `/proc/<pid>/*`) |
-| `nc <ip> <port> [t]` | Open a TCP connection and echo a line over it                   |
+| `ps`                 | Processes: PID, PPID, STAT, COMMAND — compat processes from `/proc/<pid>/*`, kernel threads as `[shell]`/`[net]`/`[usb]` |
+| `nc <ip> <port> [text]` | Open a TCP connection and echo a line over it                |
+| `jobs` / `fg` / `bg` | Shell job table; resume the most recent stopped job in the foreground / background |
 | `lxrun <path> […]`   | Load and run a Linux x86_64 ELF (static or glibc) in ring 3    |
 | `pkg <host> <path> [port]` | Download a `.deb` over HTTP(S) and install it under /mnt  |
 | `apt <subcmd> …`     | Package manager: `update`/`install`/`show`/`list`/`setmirror`   |
 | `warn <on\|off>`     | Show/hide kernel `[WARN]` lines on screen (serial always logs)  |
+| `settings` / `theme` / `wallpaper` | Customize the terminal: themes, wallpaper, status bar, caret |
 | `exec`               | Run the embedded ring-3 test process                            |
-| `selftest`           | Run the in-kernel correctness self-test suite (serial)          |
+| `selftest [passes]`  | Run the in-kernel correctness self-test suite (serial; N passes add an idempotency check) |
 
 **Line editing & UX.** The shell supports a movable cursor (Left/Right/Home/End),
 mid-line insert/Backspace/Delete, command history (Up/Down), and Tab completion for
@@ -560,8 +566,8 @@ Open or create a file with `nano /mnt/file.rs`. The editor provides:
 ## Linux binaries & Debian packages
 
 `pagh` can run Linux x86_64 programs — statically linked or glibc-dynamic — and install
-Debian packages by name. On the first boot it offers to provision a base userland
-(installed on demand from the shell), so `python` works once you ask for it.
+Debian packages by name. The base userland is not installed by the boot: install it on
+demand from the shell, so `python` works once you ask for it.
 
 ```text
 # run a Linux ELF already on the filesystem
@@ -573,7 +579,7 @@ apt update
 apt install busybox-static
 lxrun /mnt/bin/busybox
 
-# CPython 3.16 (installed after confirming the first-boot prompt)
+# CPython 3.16 (installed from the shell with `apt install python3`)
 python
 ```
 
@@ -626,12 +632,14 @@ python
   report the documented 0 sentinel. `/proc/<pid>/limits` renders the 16 Linux
   rlimit rows from the target's override table and the kernel defaults (stack
   8 MiB, nofile 1024/1024, everything else `unlimited`). `/proc/loadavg` reports
-  real 1/5/15-minute load averages (there is no load accounting) plus live
-  runnable/total counts and the last allocated pid. Still deferred:
+  real exponentially decayed 1/5/15-minute load averages (fixed point 16.16,
+  displayed with two decimals) plus live runnable/total counts and the last allocated
+  pid. Still deferred:
   `/proc/<pid>/task/*` and mountinfo optional fields/statfs metadata. See
   `docs/procfs.md` for the exact contract. Signal
-  delivery is real at the syscall-return point (see above); asynchronous delivery
-  from the timer-tick return path is not yet wired. See `LINUX-USERLAND.md` for the exact status.
+  delivery is real both at the syscall-return point and on the timer-tick return
+  (`signal::tick_action`, so a task that never enters a syscall is still signalled).
+  See `LINUX-USERLAND.md` for the exact status.
 - **Transport.** Downloads use HTTP or HTTPS. HTTPS authenticates the peer fail-closed: the
   server certificate chain is validated against the committed CA bundle, the hostname against
   the leaf SAN entries, validity windows are enforced (with a hard clock gate — an unset RTC
@@ -641,16 +649,7 @@ python
   §4.4.2.4), and `net::tls` independently requires its authentication counter to advance before
   any application byte moves. Trust is limited to the bundle's four pinned roots (ISRG Root
   X1/X2, GTS R1/R4), and revocation (CRL/OCSP) is not checked, so an HTTPS mirror outside that
-
-  issuance is refused rather than trusted. What is still missing is repository-side trust:
-  Debian metadata signatures and complete per-package digest verification. Plain-HTTP mirrors
-  (`apt setmirror http://…`) remain unauthenticated by construction, but the live `apt update`
-  now runs over the authenticated HTTPS transport end to end, large index included (issue #19:
-  the reported "embedded-tls hangs on streams past ~12 MiB" is not reproducible on the current
-  TCP stack — a 13.3 MB index fetch completes in seconds with a byte trace to match, and
-  `lx_tlsbig` pins that; see `src/net/README.md`). The MITM negative tests for these paths are
-  not written yet — see `SECURITY.md`.
-issuance is refused rather than trusted. Repository-side trust is implemented on top of
+  issuance is refused rather than trusted. Repository-side trust is implemented on top of
   that: `apt update` verifies `InRelease`/`Release.gpg` against the committed, fingerprint-pinned
   Debian keyring (subkey bindings, expiry, revocation, 2025 clock gate) and refuses an unsigned
   mirror outright, the `Packages` body must match the signed `SHA-256` **and** size before it is
@@ -692,9 +691,9 @@ src/
 ├── lib.rs              # crate attrs, Limine request statics, global cells, panic handler, _start
 ├── boot.rs             # boot orchestrator: ordered, fallible init steps (incl. storage + net)
 ├── log.rs              # leveled logging facade (error!/warn!/info!/debug!/trace!)
-├── provision.rs        # idempotent first-boot provisioning (seed files + base apt userland)
-├── test.rs             # in-kernel test/self-test harness (Properties P1–P27)
-├── selftest_lx.rs      # boot-time Linux-compat + apt self-tests (cargo feature `lx_selftest`)
+├── provision.rs        # idempotent first-boot seeding (release metadata, /etc, examples)
+├── test.rs             # in-kernel test/self-test harness (Properties P1–P29)
+├── selftest_lx.rs      # boot-time Linux-compat + apt self-tests (features lx_selftest/lx_livetest/lx_bigindex/lx_tlsbig)
 ├── shell/              # interactive shell (thin I/O loop over pure-logic modules)
 │   ├── mod.rs          #   prompt loop: Decoder + LineEditor + History + completion + dispatch
 │   ├── keys.rs         #   KeyEvent + scancode Decoder (0xE0 extended-prefix state machine)
@@ -857,7 +856,9 @@ comments.
   (`lxrun`). `clone` covers both thread and fork paths (real address-space fork via
   `fork_linux_process`), `epoll`/`eventfd` and unix sockets are backed by real
   implementations, and the VT driver gives TUIs a terminal. POSIX signal delivery is
-  still stubbed (`futex` supports glibc locking).
+  implemented (`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`, `kill(2)` with process
+  groups, `SIGSTOP`/`SIGCONT`, `SIGCHLD`, delivery at both the syscall return and the
+  timer-tick return), and `futex` supports glibc locking.
 - **Packages (apt).** `apt` fetches a Debian `Packages` index and parses it incrementally
   from a streaming gzip/xz/zstd decompressor into a **compact byte-arena index** — one
   growable byte arena plus `(offset,len)` references and integer-keyed sorted lookup tables,
@@ -880,10 +881,12 @@ comments.
 
 ## Correctness properties & testing
 
-The kernel ships an in-QEMU harness (`src/test.rs`) covering 27 correctness properties.
-Each property routine runs ≥100 randomized iterations against pure logic or a RAM-mock
-device (no hardware dependency). Run them from the shell with `selftest`; results print
-over serial as `ok`/`FAIL` lines.
+The kernel ships an in-QEMU harness (`src/test.rs`): `all_tests()` lists dozens of
+routines, of which the 29 numbered correctness properties (P1–P29) are the core — the
+rest are issue-regression routines (signals, job control, USB HID, NVMe PRP lists,
+procfs, and so on). Each property routine runs ≥100 randomized iterations against pure
+logic or a RAM-mock device (no hardware dependency). Run them from the shell with
+`selftest`; results print over serial as `ok`/`FAIL` lines.
 
 For logic that is cleanly extractable to the host, a separate, workspace-excluded
 `host-tests/` crate runs [`proptest`](https://crates.io/crates/proptest)-based property
@@ -894,7 +897,9 @@ it from that directory:
 cd host-tests && cargo test
 ```
 
-The host suite now carries **41** property modules (`p01`–`p41`). Beyond the kernel-core
+The host suite carries the numbered property modules `p01`–`p56` plus named modules for
+the areas added since (`tty_job`, `kill_target`, `ext2_links`, `link_walk_paths`,
+`nvme_io`, `at_random`, `signal_stop`, the `procfs_*` family, …). Beyond the kernel-core
 properties listed below it covers the Linux-compat and package logic added since: the ELF
 classifier and static-PIE bias, the SysV stack/auxv encoder, fd-number bookkeeping, DNS
 query/response and HTTP head parsing, `.deb`/`ar`/`tar` handling, gzip/xz/zstd decode
@@ -930,6 +935,8 @@ query-equivalence against a reference `String`-backed model.
 | P25   | Extended scancodes decode to navigation keys, never to characters   |
 | P26   | Typo suggestion picks a true nearest command                        |
 | P27   | The decoder and editor never panic on arbitrary input               |
+| P28   | The blinking caret cell tracks the logical cursor                   |
+| P29   | A mouse selection range maps to the console's line indices          |
 
 ---
 
