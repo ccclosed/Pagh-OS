@@ -1,4 +1,4 @@
-# Контракт procfs для issue #11 — срезы 1–5
+# Контракт procfs для issue #11 — срезы 1–6
 
 **Статус:** требования (задача `t3`, kind=work). Документ — приёмка: реализация issue #11
 обязана соответствовать ему по путям, содержимому и поведению syscall-поверхности.
@@ -7,9 +7,10 @@
 read-only `/proc/sys/kernel/*`), срез 4 — в 2.11.0 (per-pid `cmdline/stat/status/maps`,
 `/proc/self/{stat,statm}`, mountinfo/mounts/cgroup — в 2.12–2.15), срез 5 — в 2.16.0
 (`/proc/<pid>/fdinfo/<n>`, `/proc/self/fdinfo/<n>`, `/proc/<pid>/limits`,
-`/proc/self/limits`; §12). Отступления от текста ниже, если они есть, перечислены в
-коде и в `src/vfs/README.md`; DEVIATION-2 уточнён: рендер ленивый и живёт один проход
-чтения (`read(offset == 0)` перерисовывает), а не снимок на `open()`.
+`/proc/self/limits`; §12), срез 6 — в 2.19.0 (`/proc/<pid>/task/`,
+`/proc/self/task/` — per-thread view; §13). Отступления от текста ниже, если они есть,
+перечислены в коде и в `src/vfs/README.md`; DEVIATION-2 уточнён: рендер ленивый и живёт
+один проход чтения (`read(offset == 0)` перерисовывает), а не снимок на `open()`.
 Ссылки на код и номера строк — исторические (контракт писался на `cd542bb`), сверяйтесь
 с текущим деревом: имена файлов и функций стабильнее номеров строк.
 
@@ -128,7 +129,7 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 
 ---
 
-## 2. Дерево (срезы 1–5)
+## 2. Дерево (срезы 1–6)
 
 ### 2.1 Что входит
 
@@ -137,7 +138,7 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 /proc                 каталог, readdir → ["self","sys","cpuinfo","meminfo","uptime",
                               "stat","version","filesystems","loadavg","mounts"]
 /proc/self            каталог, readdir → ["exe","cmdline","status","maps","stat","statm",
-                              "mounts","cgroup","mountinfo","limits","fd","fdinfo"]
+                              "mounts","cgroup","mountinfo","limits","fd","fdinfo","task"]
 /proc/self/exe        симлинк (readlink → exe_path текущего процесса)
 /proc/self/cmdline    обычный файл, снимок argv
 /proc/self/status     обычный файл, Linux-поля процесса
@@ -145,8 +146,15 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 /proc/self/fd/<n>     симлинк на объект открытого fd
 /proc/self/fdinfo/<n> обычный файл: pos/flags/mnt_id/ino (срез 5)
 /proc/self/limits     обычный файл: 16 строк rlimit (срез 5)
+/proc/self/task/      каталог: по каталогу на каждый живой тред СВОЕЙ группы (срез 6)
 /proc/<pid>/          каталог на каждый живой pid; {cmdline,stat,status,maps,
-                              cgroup,mountinfo,limits,fd,fdinfo} (срезы 4–5)
+                              cgroup,mountinfo,limits,fd,fdinfo,task} (срезы 4–6)
+/proc/<pid>/task/     каталог: по каталогу на каждый живой тред группы pid,
+                              ascending tid (срез 6)
+/proc/<pid>/task/<tid>/  каталог треда — ТОТ ЖЕ VFS-объект, что /proc/<tid>
+                              (один тред = один inode), поэтому под ним весь набор
+                              файлов pid-каталога: {cmdline,stat,status,maps,
+                              cgroup,mountinfo,limits,fd,fdinfo,task}
 /proc/cpuinfo         обычный файл, CPUID
 /proc/meminfo         обычный файл, счётчики PMM/heap
 /proc/uptime          обычный файл, тики планировщика
@@ -170,6 +178,7 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 | `/proc/self/cmdline` | procps `ps`, busybox, любой `ps`-подобный код | Единственный способ узнать argv процесса; требует нового поля в `CompatState` (§4.4) |
 | `/proc/self/status` | htop, procps, Go-runtime (дампы), gdb (`TracerPid`) | Базовая идентичность процесса + `Sig*`-маски, которые уже есть в `CompatState` |
 | `/proc/self/maps` | ASan/TSan/UBSan, `addr2line`-символизатор, Go `runtime.dumpregs`, отладчики | Санитайзеры/Go отказываются или деградируют без него (issue #11, Impact) |
+| `/proc/<pid>/task/`, `/proc/self/task/` | `ps -L`/`procps`, `top -H`, gdb/`perf` (перечисление тредов), Go-runtime (ищет `/proc/self/task`), `pthread_getname_np`-диагностика | Треды в pagh — реальные задачи планировщика (`clone(CLONE_THREAD)`), но до среза 6 их нельзя было перечислить per-process; контракт и отклонения — §13 |
 | `/proc/cpuinfo` | libuv `uv_cpu_info` (Node `os.cpus()`), Python `platform.processor()`, busybox | Единственный источник «какой это CPU» для userland |
 | `/proc/meminfo` | libuv `uv_get_total_memory`/`uv_get_free_memory` (`MemTotal:`, `MemAvailable:`), busybox `free`, htop, psutil | glibc с 2.23 берёт физические страницы из `sysinfo(2)` (см. §4.2), поэтому meminfo нужен именно этим потребителям |
 | `/proc/uptime` | libuv `uv_uptime` (`sscanf("%lf")`), busybox `uptime` | Тривиально и переиспользует уже существующий тик-клок |
@@ -182,7 +191,7 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 
 | Путь | Причина отложенности |
 |---|---|
-| `/proc/self/task/*` | Требует per-thread состояния, которого планировщик не хранит (треды видны только как pid в `COMPAT_STATES`); `/proc/self/fd/*` и `fdinfo/*` реализованы в 2.13.0/срезе 5. |
+| `/proc/<tid>/{sched,syscall,stack,comm,wchan,…}`, `/proc/<pid>/task/<tid>/children` и прочие Linux-файлы per-thread view | В ядре нет per-thread CPU-аккаунтинга (`utime`/`stime`), `sched_*`-полей, стека в терминах Linux и записи `comm`; выдумывать их запрещено (§13.5). Реализованы `stat`/`status`/`cmdline` (и весь остальной pid-набор) через алиас `task/<tid> → /proc/<tid>`. |
 | `/proc/devices`, прочие имена в `/proc/sys/*` | Сверх трёх read-only файлов `/proc/sys/kernel` нет ни sysctl-реестра, ни списка устройств; неизвестное имя обязано оставаться `ENOENT` (§5.6), а не «пустым успехом». |
 | `[vdso]`, `[vvar]`, `[vsyscall]` в maps | В ядре их физически нет — строки не должны появляться (это не «не реализовано», а «отсутствует»). |
 
@@ -203,7 +212,10 @@ pub const PROC_INO_BASE: u64 = 0x00F0_0000_0000; // 1.03e12, < 2^63
 // /proc/sys = base+10, /proc/sys/kernel = base+11,
 // /proc/sys/kernel/{ostype,osrelease,hostname} = base+12..14,
 // /proc/{version,filesystems,loadavg,mounts} = base+15..18
-// (срезы 4–5 добавляют pid-каталоги и fd/fdinfo — их схема в §12.3)
+// (срезы 4–5 добавляют pid-каталоги и fd/fdinfo — их схема в §12.3;
+//  срез 6 добавляет /proc/<pid>/task = pid_dir_ino(pid) + 0x30 — §13.3, а
+//  /proc/<tgid>/task/<tid> намеренно НЕ получает своего inode: это тот же
+//  объект, что /proc/<tid>, то есть pid_dir_ino(tid))
 ```
 
 - Обёртка `MountNode` `fs_ino` не форвардит (`src/vfs/README.md`, «Грабли»), поэтому
@@ -688,6 +700,10 @@ nodev\tramfs\n
 | `open("/proc/meminfo")` и прочие файлы | файл-fd, `read(2)` отдаёт снимок, EOF по `size()` |
 | `open("/proc/self/exe")` | **следование по ссылке** (один уровень) → fd настоящего файла образа |
 | `open("/proc/<неизвестное>")` | `ENOENT` (маппинг `VfsError::NotFound` → `ENOENT` в `open_path`, `io_sys.rs:790`) |
+| `open("/proc/<pid>/task")`, `open("/proc/self/task")` | каталог-fd; `getdents64` отдаёт по одной записи на живой тред группы; для мёртвого `pid`/без `CompatState` у читателя — `ENOENT` (§13.4) |
+| `open("/proc/<pid>/task/<tid>")` | каталог-fd, если `tid` — живой тред ИМЕННО этой группы; иначе `ENOENT` (нет wildcard) |
+| `read("/proc/<pid>/task/<tid>/stat")` | та же строка Linux-семантики, что `/proc/<tid>/stat`, но `Pid` = `tid` (§13.2) |
+| `read("/proc/<pid>/task/<tid>/status")` | `Tgid` = pid группы, `Pid` = `tid`, `Threads` = размер группы; per-thread `Sig*`/`FDSize` берутся из состояния треда (§13.2) |
 | `open("/proc/cpuinfo/child")` | `ENOENT` (DEVIATION-10: Linux даёт `ENOTDIR`; дефолтный `lookup` трейта возвращает `NotFound`) |
 | `write(2)` на fd procfs-файла | `EACCES` (требуется правка маппинга, §6.3) |
 | `stat`/`lstat` (`newfstatat`) | см. §5.2 |
@@ -732,12 +748,20 @@ DEVIATION-1 (size ≠ 0), DEVIATION-11 (права: `stat_mode_for` даёт д�
 ### 5.3 `readdir` / `getdents64`
 
 - `readdir()` каталогов procfs возвращает ровно детей из §2.1 в фиксированном порядке:
-  `/proc` → `["self","sys","cpuinfo","meminfo","uptime","stat","version","filesystems","loadavg"]`,
-  `/proc/self` → `["exe","cmdline","status","maps"]`,
-  `/proc/sys` → `["kernel"]`,
+  `/proc` → `["self","sys",<живые pid по возрастанию>,"cpuinfo","meminfo","uptime",
+  "stat","version","filesystems","loadavg","mounts"]`,
+  `/proc/self` → `["exe","cmdline","status","maps","stat","statm","mounts","cgroup",
+  "mountinfo","limits","fd","fdinfo","task"]` (последние три — только когда у читателя
+  есть `CompatState`, §5.5), `/proc/self/task` и `/proc/<pid>/task` → по одной записи
+  на живой тред группы, **по возрастанию tid** (треды — снапшот реестра `COMPAT_STATES`,
+  `BTreeMap`, поэтому порядок детерминирован),
+  `/proc/<pid>` → `["cmdline","stat","status","maps","cgroup","mountinfo","limits",
+  "fd","fdinfo","task"]`, `/proc/sys` → `["kernel"]`,
   `/proc/sys/kernel` → `["ostype","osrelease","hostname"]`.
   Порядок стабилен между вызовами при неизменном дереве (Linux порядок не гарантирует;
-  нашим потребителям он безразличен, а тесты на нём стоят).
+  нашим потребителям он безразличен, а тесты на нём стоят). `task` стоит последним в
+  `/proc/<pid>` и `/proc/self`. Содержимое `task`-каталога — живой снапшот: тред,
+  завершившийся между `readdir` и `lookup`, даёт `ENOENT` на своё имя (как в Linux).
 - `getdents64` (`io_sys.rs:1706-1750`) отдаёт записи `linux_dirent64`
   (`dirent.rs::encode_dirent64`), уже снапшотнутые при `open()`.
   **Обязательная правка**: сейчас `d_ino = index + 1` (`io_sys.rs:1727`) — это не inode,
@@ -791,6 +815,9 @@ DEVIATION-1 (size ≠ 0), DEVIATION-11 (права: `stat_mode_for` даёт д�
   `ls /proc/self` → `ENOENT`. В Linux такой ситуации не бывает (там syscall'ы делает
   только процесс), поэтому сравнения с Linux тут нет: мы сознательно не выдумываем
   фальшивый процесс для задачи без `CompatState`.
+- то же правило распространяется на `/proc/self/task` и `/proc/self/task/<tid>`:
+  без `CompatState` у читателя каталог не резолвится (`ENOENT`), даже если в реестре
+  есть живые треды других процессов (§13.4).
 
 ### 5.6 Неизвестные `/proc`-пути
 
@@ -802,7 +829,10 @@ DEVIATION-1 (size ≠ 0), DEVIATION-11 (права: `stat_mode_for` даёт д�
 
 - **ENOENT**: `/proc/self/status/x`,
   `/proc/devices`, `/proc/sys/kernel/nonexistent`,
-  `/proc/version/child`, `/proc/nonexistent`.
+  `/proc/version/child`, `/proc/nonexistent`,
+  `/proc/<мёртвый pid>/task`, `/proc/<pid>/task/<не-тред>`,
+  `/proc/<pid>/task/<тред чужой группы>`, `/proc/<pid>/task/notanumber`,
+  `/proc/<pid>/task/<tid>/nosuchfile`.
 - **Существуют** (после срезов 2–3): `/proc/version`, `/proc/filesystems`,
   `/proc/loadavg`, `/proc/sys`, `/proc/sys/kernel`,
   `/proc/sys/kernel/{ostype,osrelease,hostname}` — для них проверяется содержимое,
@@ -947,6 +977,21 @@ pub struct MapsRegion { pub start: u64, pub end: u64, pub prot: u32, pub file_of
 pub fn format_maps(regions: &[MapsRegion]) -> Vec<u8>;       // сортирует и сливает
 ```
 
+Идентичность pid-каталогов и их динамических детей (срезы 4–6) — тоже чистые функции
+этого модуля (проверяются `procfs_pid.rs`, `procfs_fdinfo_limits.rs`, `procfs_task.rs`):
+
+```rust
+pub fn pid_dir_ino(pid: u64) -> u64;
+pub fn pid_file_ino(pid: u64, slot: u64) -> u64;   // slot 1..7: cmdline..limits
+pub fn pid_fd_ino(pid: u64, fd: u32) -> u64;       // pid_dir_ino + 0x100 + fd
+pub fn pid_fdinfo_ino(pid: u64, fd: u32) -> u64;   // pid_dir_ino + 0x1000 + fd
+pub fn pid_task_dir_ino(pid: u64) -> u64;          // pid_dir_ino + 0x30 (срез 6)
+pub fn parse_pid_component(name: &str) -> Option<u64>;  // тот же парсер для tid
+```
+
+`/proc/<tgid>/task/<tid>` намеренно **не** имеет своей inode-функции: узел треда — это
+`pid_dir_ino(tid)`, то есть тот же inode, что у `/proc/<tid>` (§13.3).
+
 ### 7.2 Свойства (реализовано; нумерация `p51..` из первоначального плана не использовалась)
 
 Первоначальный план резервировал номера `p51`–`p55` под procfs. Пока срезы 3–5 писались,
@@ -964,6 +1009,7 @@ pub fn format_maps(regions: &[MapsRegion]) -> Vec<u8>;       // сортируе
 | `properties/procfs_stat.rs` | `/proc/stat`: 10 числовых колонок на `cpu`/`cpu0`, `ctxt`/`btime`/`processes`/`procs_running`/`procs_blocked`, монотонность user/system/idle-аккаунтинга |
 | `properties/procfs_pid.rs` | per-pid `cmdline`/`stat`/`status`/`maps` рендер из `PidStatInputs` (pid/tgid/ppid/state, нумерация `statm`-страниц, `[stack]`/`[heap]` в maps) |
 | `properties/procfs_fdinfo_limits.rs` | точный порядок/формат четырёх строк fdinfo, octal `flags`, round-trip pos/flags/mnt_id/ino, точный заголовок и ширина колонок limits, `unlimited` ⇔ `RLIM_INFINITY`, таблица 16 имён и непересечение inode'ов fd/fdinfo |
+| `properties/procfs_task.rs` | срез 6: inode `/proc/<pid>/task` уникален внутри страйда pid (не совпадает с `pid_dir_ino`, слотами 1..7, `fd`/`fdinfo`-каталогами и всеми динамическими `fd/<n>`/`fdinfo/<n>` при fd ≤ 1023); bit 63 = 0, значение стабильно для пути и различается у разных pid; `PROC_PID_TASK_DIR_OFFSET == 0x30`; десятичный tid разбирается тем же `parse_pid_component`, что и pid |
 
 Регистрация — в `host-tests/src/lib.rs` (`#[path]`-include `procfs_format` + модули в
 `properties`). `procfs_format` ссылается на `super::signal_frame` (для `sig_masks`) —
@@ -1018,7 +1064,15 @@ python3 tools/host_tests.py          # + 6 новых property-наборов
   `"/proc/version/child"`, `"/proc/sys/kernel/nonexistent"`,
   `"/proc/cpuinfo/child"` → `Err(VfsError::NotFound)`;
 - `lookup_path("/proc/self")` → `Err(NotFound)` **в контексте boot-thread** (нет compat
-  состояния — §5.5), и это утверждение фиксирует контракт.
+  состояния — §5.5), и это утверждение фиксирует контракт;
+- срез 6 — рутина `procfs::per-thread task directories`: на синтетической группе
+  тредов в реестре (`src/test.rs::procfs_tests::task_tree`, тот же инструмент, что у
+  fdinfo/limits) `/proc/<pid>/task` отдаёт ровно живые треды по возрастанию; каждый
+  `task/<tid>` — тот же inode, что `/proc/<tid>`; `stat`/`status` каждого треда несут
+  собственные `Pid`/`SigPnd`, а `Tgid`/`Threads` — значения группы; `cmdline`
+  наследуется; `/proc/<tid>/task` не-лидера показывает всю группу;
+  `/proc/<pid>/task/<чужой>/<мёртвый>/notanumber` → `ENOENT`; `/proc/self/task` без
+  `CompatState` → `ENOENT`. Реестр восстанавливается в конце рутины.
 - Вердикт рутина виден как `RUN`/`ok` + `SELFTEST SUMMARY: N routines, 0 failed checks`
   (сводка печатается `test::run_all`), то есть проверяется штатным
   `python3 tools/e2e.py selftest`.
@@ -1035,6 +1089,12 @@ python3 tools/host_tests.py          # + 6 новых property-наборов
   `--cmd 'lxrun /mnt/bin/busybox cat /proc/self/cmdline' --expect 'busybox'`,
   `… /proc/self/status' --expect 'Pid:'`, `… /proc/self/maps' --expect '[stack]'`,
   `--cmd 'lxrun /mnt/bin/busybox ls -l /proc/self' --expect 'exe'`.
+- срез 6 (треды): `/proc/self/task` читается **только из Linux-процесса** (та же причина,
+  §5.5): `--cmd 'lxrun /mnt/bin/busybox ls /proc/self/task' --expect '<pid>'`
+  (busybox — однопоточный, поэтому листинг содержит его собственный tid, и это
+  положительный контроль: каталог существует и непуст). Реальный тред-клон
+  проверяется in-QEMU рутиной `selftest` (§8.2) и `lx_selftest`-сценарием
+  `thread_task_dir` (реальный `clone(CLONE_THREAD)` из гостевого ELF, §13.6).
 
 ### 8.4 Обязательные обновления документации
 `src/vfs/README.md`, `README.md`, `LINUX-USERLAND.md` — см. §6.7 (по `AGENTS.md`
@@ -1104,6 +1164,10 @@ python3 tools/host_tests.py          # + 6 новых property-наборов
 5. Обновлены `src/vfs/README.md`, `README.md`, `AGENTS.md` (текущая версия и история),
    `docs/procfs.md`; MINOR-бамп версии вместе с `Cargo.lock`.
 6. Каждое отклонение §9 имеет комментарий в коде рядом с местом отклонения.
+7. Срез 6 (§13): `/proc/<pid>/task/` и `/proc/self/task/` листают живые треды группы,
+   `task/<tid>` — тот же VFS-объект, что `/proc/<tid>`; `stat`/`status`/`cmdline`
+   доступны per-thread; ENOENT/ENOTDIR-матрица §13.4 покрыта in-QEMU рутиной §13.6;
+   `properties/procfs_task.rs` и контракт обновлены.
 ---
 
 ## 12. Срез 5 (2.16.0 batch): fdinfo и limits
@@ -1193,7 +1257,8 @@ Limit                     Soft Limit           Hard Limit           Units
 - `pid_dir_ino(pid) + 0x11` — каталог `fdinfo`;
 - `pid_dir_ino(pid) + 0x100 + fd` — symlink `fd/<n>` (`pid_fd_ino`);
 - `pid_dir_ino(pid) + 0x1000 + fd` — файл `fdinfo/<n>` (`pid_fdinfo_ino`);
-- `+slot 1..7` — статические файлы pid-каталога (limits = 7).
+- `+slot 1..7` — статические файлы pid-каталога (limits = 7);
+- `pid_dir_ino(pid) + 0x30` — каталог `task` (`pid_task_dir_ino`, срез 6; §13.3).
 
 ### 12.4 Тесты среза 5
 
@@ -1217,3 +1282,119 @@ Limit                     Soft Limit           Hard Limit           Units
 | 19 | `pos` каталога — индекс `getdents64`, а не байтовый `f_pos` Linux | В ядре нет байтового курсора каталога; `index` — реальное состояние, которое меняет `lseek(SEEK_SET)` |
 | 20 | `flags` — сохранённые `open(2)`/`fcntl` флаги, а не полный Linux `file->f_flags` (нет `O_LARGEFILE`, `FMODE_*`) | В ядре нет этих понятий; печатается реально записанное значение, включая `O_CLOEXEC`, а не константа |
 | 21 | `fdinfo` существует только для открытых fd; для закрытого — `ENOENT` | Так же, как ядро удаляет запись `/proc/<pid>/fdinfo/<n>` при `close`; это и есть динамический lookup |
+
+---
+
+## 13. Срез 6 (2.19.0): per-thread view `/proc/<pid>/task/<tid>/*`
+
+**Мотивация.** В pagh есть настоящие треды: `clone(CLONE_VM|CLONE_THREAD)` создаёт
+задачу планировщика и регистрирует её в `COMPAT_STATES` (pid = tid, `CompatState.tgid` =
+pid процесса), `clone_current_compat` клонирует состояние группы. До этого среза треды
+были видны только как отдельные верхнеуровневые `/proc/<tid>`, а Linux-совместимого
+per-process перечисления (`ps -L`, `top -H`, gdb, Go runtime) не было. Срез добавляет
+ровно два каталога и **ноль новых форматов файлов**: каталог треда — это существующий
+pid-каталог (алиас), поэтому `stat`/`status`/`cmdline` (и `maps`, `limits`, `fd`,
+`fdinfo`) получаются из уже реализованных рендереров.
+
+### 13.1 Пути и дерево
+
+```
+/proc/<pid>/task/            каталог; readdir → по каталогу на каждый живой тред
+                             группы pid, по возрастанию tid (снапшот COMPAT_STATES)
+/proc/<pid>/task/<tid>/      каталог треда == /proc/<tid> (тот же VFS-объект/inode)
+/proc/self/task/             то же для группы вызывающего
+/proc/self/task/<tid>/       то же для треда своей группы
+```
+
+`task` — **последний** элемент `readdir` каталога `/proc/<pid>` и `/proc/self`
+(§5.3). Все файлы под `task/<tid>/` — ровно файлы pid-каталога (§2.1):
+`cmdline, stat, status, maps, cgroup, mountinfo, limits, fd, fdinfo, task`. Отдельного
+набора «из трёх файлов» нет — он был бы несовместим с Linux-идентичностью «один тред =
+один inode».
+
+### 13.2 Что такое «треды процесса» в модели pagh
+
+- Тред = живая запись `COMPAT_STATES`, у которой `CompatState.tgid` равен pid процесса.
+  Лидер группы — запись с `pid == tgid`; остальные — треды, созданные
+  `clone(CLONE_VM|CLONE_THREAD)` (`src/arch/x86_64/linux/process_sys.rs::sys_clone` →
+  `compat::clone_current_compat`).
+- Список берётся из реестра одним снапшотом: `compat::thread_group_pids(tgid)`
+  (`src/task/compat.rs`), `BTreeMap` ⇒ ascending, без дублей. Это ровно то же
+  множество, из которого `/proc/<pid>/status` считает `Threads` (§4.5): `Threads`
+  == число записей `thread_group_pids(tgid)`, и оба места обязаны меняться вместе.
+- `/proc/<pid>/task` резолвится **для любого живого pid**, включая не-лидера: узел
+  `DirKind::TaskDir` хранит `tgid` цели, поэтому `/proc/<tid>/task` показывает всю
+  группу, а не пустой каталог (Linux ведёт себя так же).
+- `/proc/self/task` резолвится только при наличии `CompatState` у читателя (§5.5) и
+  берёт `tgid` из него (`compat::current_tgid()`).
+
+### 13.3 Идентичность и inode
+
+- `/proc/<pid>/task` — `pid_task_dir_ino(pid) = pid_dir_ino(pid) + 0x30`; не пересекается
+  со слотами 1..7, `fd` (`+0x10`), `fdinfo` (`+0x11`) и динамическими
+  `+0x100+fd`/`+0x1000+fd` (§12.3). Property — `properties/procfs_task.rs`.
+- `/proc/<tgid>/task/<tid>` **не** имеет своей inode-функции: `lookup` возвращает
+  `pid_dir(tid)`, у которого `fs_ino() == pid_dir_ino(tid)` — inode `/proc/<tid>`.
+  Так `stat` и `getdents64.d_ino` двух путей к одному треду совпадают, как в Linux.
+  Следствие: содержимое `task/<tid>/` — все файлы pid-каталога, включая вложенный
+  `task` (у треда та же группа).
+
+### 13.4 Поведение syscall-поверхности (ENOENT/ENOTDIR)
+
+| Операция | Результат |
+|---|---|
+| `open("/proc/<pid>/task")` | каталог-fd; мёртвый/незарегистрированный pid → `ENOENT` |
+| `open("/proc/self/task")` | каталог-fd; без `CompatState` у читателя → `ENOENT` |
+| `getdents64` на `task` | по одной записи на живой тред; `d_type = DT_DIR` (4), `d_ino = pid_dir_ino(tid)` |
+| `open("/proc/<pid>/task/<tid>")` | каталог-fd, если `tid` жив И `tgid(tid) == группа`; иначе `ENOENT` |
+| `open("/proc/<pid>/task/notanumber")` | `ENOENT` (тот же парсер `parse_pid_component`, что у pid) |
+| `open("/proc/<pid>/task/<tid>/nosuchfile")` | `ENOENT` (дефолт `lookup`; `ENOTDIR` не вводится — DEVIATION-10) |
+| `open("/proc/<pid>/task/<tid>")`, где `tid` — тред ЧУЖОЙ группы | `ENOENT` (проверяется членство, а не только существование pid) |
+| `open("/proc/<dead>/task")` | `ENOENT` |
+| `write(2)` в любой файл под `task` | `EACCES` (общий procfs-путь, §6.3) |
+
+Правила «пустой успех» нет: неизвестное имя — всегда `ENOENT` (§5.6). Новых записей в
+`/proc` верхнего уровня срез не добавляет (numeric там — живые pid, как и было).
+
+### 13.5 Содержимое файлов треда
+
+Каталог треда — алиас pid-каталога, поэтому форматы — §4.x без изменений; семантика
+полей per-thread там, где Linux её per-thread:
+
+| Файл | Семантика для `task/<tid>/` |
+|---|---|
+| `stat` | строка 52 полей ровно как `/proc/<pid>/stat` (§4.5), но `Pid` = `tid`, `comm` — из образа треда, `state` — состояние ЭТОЙ задачи (`R`/`T`, `scheduler::is_stopped(tid)`), `ppid` — записанный родитель треда, `num_threads` (поле 20) — размер группы, `vsize`/`rss`/`start_brk` — из общего адресного пространства группы |
+| `status` | `Tgid` = pid группы, `Pid` = `tid`, `Threads` = размер группы; `SigPnd`/`SigBlk`/`SigIgn`/`SigCgt`/`FDSize` — из `CompatState` ИМЕННО ЭТОГО треда (у тредов свои pending/blocked маски; disposition-таблица общая через `Arc`); `Vm*` — общие для группы (общий `VmRegionSet`) |
+| `cmdline` | argv-снимок, унаследованный тредом при `clone` (§4.4, байт-в-байт). Обычно совпадает с cmdline процесса; при `execve` из одного треда обновляется только его запись — pagh не переписывает состояния остальных тредов (предсуществующее ограничение модели, #24) |
+| `maps`, `cgroup`, `mountinfo` | как у pid-каталога: `maps` — общее адресное пространство группы; `cgroup`/`mountinfo` — те же константы/таблица |
+| `limits`, `fd`, `fdinfo/<n>` | снимок `FdTable`/rlimit-таблицы треда; см. #22 |
+| `task` | вложенный per-thread view — та же группа |
+
+### 13.6 Тесты
+
+- host-tests: `properties/procfs_task.rs` (§7.2) — inode-идентичность `task`-каталога.
+- in-QEMU, штатный `selftest` (`src/test.rs::procfs_tests::task_tree`): синтетическая
+  группа лидер+2 треда в реестре (реестр — модель тредов); проверяются листинг,
+  алиас-inode, per-thread `stat`/`status`/`SigPnd`, `cmdline`, `/proc/self/task`,
+  non-leader `/proc/<tid>/task`, ENOENT-матрица; состояние реестра восстанавливается.
+- in-QEMU с РЕАЛЬНЫМ клоном (`lx_selftest`, `src/selftest_lx.rs::check_thread_task_dir`):
+  гостевой статический ELF собирается самим тестом (как `build_linux_test_elf`), делает
+  `clone(CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|SIGCHLD)`
+  с собственным стеком; оба треда крутятся в user-loop, харнесс ждёт появления второго
+  треда в `/proc/<pid>/task`, читает `stat`/`status` каждого, затем завершает группу
+  реальным `SIGKILL`-путём. Это доказательство, что фича видит реальные треды, а не
+  только записи реестра.
+- E2E: `python3 tools/e2e.py selftest` (штатный `selftest` — проверяет рутину
+  `src/test.rs`) и `python3 tools/e2e.py local-mirror` (собирает с `lx_selftest`,
+  запускает boot-харнесс `run_post_net_checks`; реальный клон виден на serial как
+  `LXSELFTEST thread_task_dir PASS`, а `--extra-wait 'LXSELFTEST thread_task_dir PASS'`
+  делает его обязательным для вердикта E2E).
+
+### 13.7 Осознанные отклонения среза 6
+
+| # | Отклонение | Причина / допустимость |
+|---|---|---|
+| 22 | `fd`/`fdinfo`/`limits` под `task/<tid>` отражают `CompatState` ИМЕННО ЭТОГО треда: `clone_current_compat` клонирует таблицу fd и rlimit на момент клона, тогда как Linux держит их общими для процесса | Предсуществующая модель клонирования pagh (`CompatState: Clone`); срез 6 её не меняет, а делает наблюдаемой. Совпадает с тем, что `/proc/<tid>` показывал и раньше. Исправить = перевести fd/rlimit на общий `Arc` — отдельная работа, не в этом срезе |
+| 23 | `/proc` верхнего уровня перечисляет и не-лидеров-треды как numeric-каталоги (Linux — только tgid) | Предсуществующее поведение с момента появления тредов: `DirKind::Root::readdir` берёт все записи реестра. Срез 6 добавляет Linux-стандартный путь (`/proc/<tgid>/task`), но не убирает уже наблюдаемые пути (совместимость с `ps`/скриптами). Отдельное решение — отдельный PR |
+| 24 | `ppid` треда в `stat`/`status` — pid создавшей задачи (может быть не-лидером), а не tgid родительского процесса, как в Linux | Так `clone_current_compat` записывает `CompatState.ppid`; `getppid(2)` в pagh отвечает тем же значением. Выдумывать «правильный» tgid в procfs значило бы расходиться с syscall-поверхностью |
+| 25 | Нет per-thread `comm` (`prctl(PR_SET_NAME)`/`pthread_setname_np`): `Name:`/`comm` — имя образа; нет `voluntary_ctxt_switches` и прочих не смоделированных полей | В ядре нет per-thread имени и per-task ctxt-счётчиков; печатаются те же честные нули/общие значения, что и в pid-каталоге (§4.5), а не выдумка |

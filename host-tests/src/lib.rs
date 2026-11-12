@@ -438,6 +438,7 @@ mod properties {
     mod procfs_pid;
     mod procfs_stat;
     mod procfs_status;
+    mod procfs_task;
 
     // Boot-time device safety (issue #33): only a genuinely blank device is
     // formatted; GPT/MBR/foreign/ext2-like layouts are refused.

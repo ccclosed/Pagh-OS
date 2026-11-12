@@ -85,15 +85,19 @@ remain are named here rather than implied:
 Signals and the shell job table are implemented (syscall-return and timer-tick
 delivery, real `rt_sigframe`/`rt_sigreturn`, `kill(2)`/`tgkill` with process groups,
 `SIGSTOP`/`SIGCONT`, `SIGCHLD` on exit/stop/continue, `^Z` on the foreground group);
-`timerfd`/`signalfd`/`memfd_create` exist, and procfs covers slices 1–5 (issue #11):
+`timerfd`/`signalfd`/`memfd_create` exist, and procfs covers slices 1–6 (issue #11):
 `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts,self/*,<pid>/*}`,
-`/proc/<pid>/{fd,fdinfo,limits,cgroup,mountinfo}` and read-only
+`/proc/<pid>/{fd,fdinfo,limits,cgroup,mountinfo}`, the per-thread view
+`/proc/<pid>/task/` + `/proc/self/task/` (one directory per live task of the thread
+group, `task/<tid>` is the same VFS object as `/proc/<tid>`, so `stat`/`status`/
+`cmdline` are per-thread) and read-only
 `/proc/sys/kernel/{ostype,osrelease,hostname}`, all rendered from live kernel state
 (contract: `docs/procfs.md`; `/proc/loadavg` carries real decayed 1/5/15-minute
 averages). What this document still lists as missing, per that contract:
 
 - `sysfs` does not exist at all.
-- procfs deferrals: `/proc/<pid>/task/*`, mountinfo optional fields and statfs metadata.
+- procfs deferrals: mountinfo optional fields, statfs metadata and the Linux
+  per-thread files the kernel does not model (`sched`, `syscall`, per-thread `comm`).
 - tty/job-control deviations (stated in `AGENTS.md` and `drivers::tty` rather than
   implied): no sessions (`getsid`/the `tcsetpgrp` session rule are approximated), a
   background tty access returns `EINTR` instead of being restarted after `SIGCONT`,

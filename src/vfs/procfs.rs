@@ -31,7 +31,11 @@
 //!   * 3 (2.10.0): `/proc/version`, `/proc/filesystems`, `/proc/loadavg`,
 //!     `/proc/sys/kernel/{ostype,osrelease,hostname}` and the per-pid tree
 //!     `/proc/<pid>/{status,stat,cmdline,maps}`, plus
-//!     `/proc/self/{stat,statm}`.
+//!     `/proc/self/{stat,statm}`;
+//!   * 6 (2.19.0): the per-thread view — `/proc/<pid>/task/` and
+//!     `/proc/self/task/` list one directory per live task of the thread group,
+//!     and `/proc/<tgid>/task/<tid>/` resolves to that task's pid directory
+//!     (Linux identity: one task, one inode, one set of files).
 //!
 //! The per-pid files snapshot the TARGET's state (not the reader's) under
 //! `COMPAT_STATES`, release the registry lock, and only then format the text.
@@ -101,6 +105,11 @@ enum DirKind {
     FdDir(u64),
     /// `/proc/self/fdinfo` or `/proc/<pid>/fdinfo`, carrying the target pid.
     FdInfoDir(u64),
+    /// `/proc/self/task` or `/proc/<pid>/task`, carrying the **thread-group**
+    /// id (the process whose threads are listed), not the path component it was
+    /// reached through: a non-leader thread's `/proc/<tid>/task` is the same
+    /// thread group as its leader's.
+    TaskDir(u64),
 }
 
 struct ProcDir {
@@ -147,6 +156,21 @@ fn pid_dir(pid: u64) -> Arc<dyn VfsNode> {
         name: format!("{}", pid),
         ino: fmt::pid_dir_ino(pid),
         kind: DirKind::Pid(pid),
+    })
+}
+
+/// A fresh `/proc/<pid>/task` node.
+///
+/// `tgid` is the thread group whose tasks the directory lists. It is resolved
+/// once, from the path component the caller used (`pid_dir(pid)` stores its own
+/// pid; the node asks the registry for that pid's `tgid`), so
+/// `/proc/<tid>/task` lists the group of a non-leader thread rather than an
+/// empty directory named after its tid.
+fn task_dir(tgid: u64) -> Arc<dyn VfsNode> {
+    Arc::new(ProcDir {
+        name: String::from("task"),
+        ino: fmt::pid_task_dir_ino(tgid),
+        kind: DirKind::TaskDir(tgid),
     })
 }
 
@@ -281,6 +305,7 @@ impl VfsNode for ProcDir {
                     let pid = scheduler::current_pid();
                     out.push(fd_dir(pid));
                     out.push(fdinfo_dir(pid));
+                    out.push(task_dir(compat::current_tgid()));
                 }
             }
             DirKind::SysDir => {
@@ -297,6 +322,21 @@ impl VfsNode for ProcDir {
                 }
                 out.push(fd_dir(pid));
                 out.push(fdinfo_dir(pid));
+                // Every live task has a `task` directory (Linux): for a
+                // non-leader thread it lists the whole thread group, not just
+                // the thread itself.
+                if let Some(tgid) = compat::with_pid_compat(pid, |cs| cs.tgid) {
+                    out.push(task_dir(tgid));
+                }
+            }
+            DirKind::TaskDir(tgid) => {
+                // One numeric directory per live task of the group, ascending
+                // (the registry is a `BTreeMap`). Each entry IS the task's pid
+                // directory, so `/proc/<tgid>/task/<tid>` and `/proc/<tid>` are
+                // the same VFS object.
+                for tid in compat::thread_group_pids(tgid) {
+                    out.push(pid_dir(tid));
+                }
             }
             DirKind::FdDir(pid) => {
                 for (fd, target) in fd_snapshot(pid) {
@@ -356,6 +396,15 @@ impl VfsNode for ProcDir {
                         Err(VfsError::NotFound)
                     };
                 }
+                if name == "task" {
+                    // The reader's own thread group; a caller without
+                    // `CompatState` has no threads to describe (§5.5).
+                    return if compat::current_has_compat() {
+                        Ok(task_dir(compat::current_tgid()))
+                    } else {
+                        Err(VfsError::NotFound)
+                    };
+                }
                 let e = fmt::proc_self_file(name).ok_or(VfsError::NotFound)?;
                 if e.kind == ProcKind::SelfExe && current_exe().is_none() {
                     // No image to point at (`readlink` used to answer ENOENT in
@@ -384,9 +433,34 @@ impl VfsNode for ProcDir {
                 if name == "fdinfo" {
                     return Ok(fdinfo_dir(pid));
                 }
+                if name == "task" {
+                    // Resolved through the target's `tgid`, so a non-leader
+                    // thread gets its whole thread group here (Linux does the
+                    // same) and the directory name stays a property of the
+                    // group, not of the path component that reached it.
+                    return match compat::with_pid_compat(pid, |cs| cs.tgid) {
+                        Some(tgid) => Ok(task_dir(tgid)),
+                        None => Err(VfsError::NotFound),
+                    };
+                }
                 fmt::proc_pid_file(name)
                     .map(|e| pid_file(pid, e))
                     .ok_or(VfsError::NotFound)
+            }
+            DirKind::TaskDir(tgid) => {
+                // A numeric component resolves only when that pid is a LIVE
+                // task of THIS thread group; a registered task from another
+                // process, a dead pid and a non-numeric name are all ENOENT.
+                // That liveness + membership check is what keeps the directory
+                // a namespace instead of a wildcard (`docs/procfs.md` §5.6).
+                let tid = fmt::parse_pid_component(name).ok_or(VfsError::NotFound)?;
+                let actual = compat::with_pid_compat(tid, |cs| cs.tgid);
+                if actual != Some(tgid) {
+                    return Err(VfsError::NotFound);
+                }
+                // Same VFS object as `/proc/<tid>`: one task, one inode, one
+                // set of files (`docs/procfs.md` §13).
+                Ok(pid_dir(tid))
             }
             DirKind::FdDir(pid) => {
                 let fd: u32 = name.parse().map_err(|_| VfsError::NotFound)?;

@@ -4,11 +4,14 @@
 `/tmp` и загрузчик ELF64 (нативные и Linux-бинари). Инициализация — `vfs::init()` из `boot.rs`,
 затем `boot.rs` подключает ext2-корень: `vfs::mount_at_named("/mnt", root, "ext2")`.
 
-Синтетический `/proc` (issue #11) реализован срезами 1–5: контракт — пути, байтовые
+Синтетический `/proc` (issue #11) реализован срезами 1–6: контракт — пути, байтовые
 форматы файлов, семантика `lstat`/`readdir`/`getdents64`/`readlink`, список отложенного —
 зафиксирован в **`docs/procfs.md`**, он же приёмка. Срез 5 добавил
-`/proc/<pid>/fdinfo/<n>` (и `self`-алиас) и `/proc/<pid>/limits` (и `self`-алиас);
-отложены `/proc/<pid>/task/*` и необязательные поля mountinfo/statfs.
+`/proc/<pid>/fdinfo/<n>` (и `self`-алиас) и `/proc/<pid>/limits` (и `self`-алиас),
+срез 6 (`2.19.0`) — per-thread view `/proc/<pid>/task/` и `/proc/self/task/`
+(каталог треда — тот же VFS-объект, что `/proc/<tid>`); отложены необязательные поля
+mountinfo/statfs и не смоделированные Linux-файлы per-thread view (`sched`, `syscall`,
+`comm`, ...).
 
 ## Файлы
 
@@ -16,8 +19,8 @@
 |---|---|
 | `mod.rs` | Ядро VFS: трейт `VfsNode`, `VfsError`, `FsStat`, резолв путей (`lookup_path`), монтирование (`mount_at`/`MountNode`), синтетический `/dev` (`NullDevice`, `SerialDevice`, `DevDirectory`), корень (`RootDirectory`), `init()` |
 | `ramfs.rs` | In-memory ФС для `/tmp`; единственная in-memory-ФС с настоящими `create_dir`/`create_file`/`remove` (на диске то же умеет ext2-каталог под `/mnt`) |
-| `procfs.rs` | Синтетический `/proc`: узлы `ProcDir`/`ProcFile`, ленивый рендер текста на `size()`/`read()`, источники — PMM/heap/тики/счётчики планировщика/`CompatState`/CPUID. Kernel-only |
-| `procfs_format.rs` | Чистое (`core`+`alloc`) форматирование текстов procfs (включая `/proc/version`, `/proc/filesystems`, `/proc/loadavg`, `/proc/sys/kernel/*`, `fdinfo` и `limits`), таблица путей и inode'ов — включается в host-tests (свойства `procfs_*`) |
+| `procfs.rs` | Синтетический `/proc`: узлы `ProcDir`/`ProcFile`, ленивый рендер текста на `size()`/`read()`, источники — PMM/heap/тики/счётчики планировщика/`CompatState`/CPUID. `DirKind::TaskDir(tgid)` листает живые треды группы из `compat::thread_group_pids`, узел `task/<tid>` — это `pid_dir(tid)`. Kernel-only |
+| `procfs_format.rs` | Чистое (`core`+`alloc`) форматирование текстов procfs (включая `/proc/version`, `/proc/filesystems`, `/proc/loadavg`, `/proc/sys/kernel/*`, `fdinfo` и `limits`), таблица путей и inode'ов (`pid_task_dir_ino` — срез 6) — включается в host-tests (свойства `procfs_*`) |
 | `elf.rs` | Эффектный загрузчик ELF64: `ElfLoader::load` (нативный `ET_EXEC`), `ElfLoader::load_linux` (`ET_EXEC`, static-PIE `ET_DYN` и glibc-dynamic образы — `PT_INTERP` подшивается отдельно через `map_interpreter`), `ElfLoader::map_interpreter`; `ElfProcess` |
 | `elf_classify.rs` | Чистый core-only классификатор ELF (`classify_elf`, `ElfKind`, `ElfVerdict`) и выбор bias для static-PIE (`choose_bias`, `PIE_BASE`); включается в host-tests |
 | `link_walk.rs` | Чистый (`core`+`alloc`, self-contained) резолвер симлинков (issue #18): компонентный обход, стек `..`, относительные/абсолютные цели, бюджет `SYMLOOP_MAX=40`, `MAX_EXPANDED_BYTES`; host-свойства `link_walk_paths` (включая сравнение с независимым оракулом) |
@@ -68,10 +71,17 @@
 - `/tmp` появился из-за nvim: `vim_mktempdir` делает `mkdir("/tmp/nvim.XXXXXX")`.
 
 ### procfs (issue #11 — контракт `docs/procfs.md`)
-- Срезы 1–5: `/proc` + `/proc/self` + `self/{exe,cmdline,status,maps,stat,statm,mounts,cgroup,mountinfo,limits}`
+- Срезы 1–6: `/proc` + `/proc/self` + `self/{exe,cmdline,status,maps,stat,statm,mounts,cgroup,mountinfo,limits}`
   + `{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}` + read-only
   `/proc/sys/kernel/{ostype,osrelease,hostname}` + per-pid
-  `{cmdline,stat,status,maps,cgroup,mountinfo,limits,fd/*,fdinfo/*}`.
+  `{cmdline,stat,status,maps,cgroup,mountinfo,limits,fd/*,fdinfo/*,task/*}`.
+  `/proc/<pid>/task/` (и `/proc/self/task/`) — per-thread view: по каталогу на каждый
+  живой тред группы (`COMPAT_STATES`-запись с `tgid == pid`), сортировка по tid;
+  `task/<tgid>/task/<tid>` резолвится в `pid_dir(tid)`, то есть это ТОТ ЖЕ VFS-объект/
+  inode, что `/proc/<tid>` (Linux-идентичность «один тред = один inode»), поэтому
+  `stat`/`status`/`cmdline` (и остальные pid-файлы) рендерятся существующими
+  рендерерами per-thread. Мёртвый pid, тред чужой группы и неназванный tid — `ENOENT`
+  (`docs/procfs.md` §13).
   `/proc/mounts` читает реестр `vfs::mount_snapshot()`, `/proc/*/fd` — снимок fd-таблицы,
   `/proc/*/fdinfo/<n>` — живые offset/flags дескриптора и `node_ino` его VFS-узла
   (`mnt_id` — тот же отсортированный mount-реестр, что у mountinfo; 0 для объектов без

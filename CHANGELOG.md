@@ -11,6 +11,23 @@ tagged release (`2.18.13`, open in PR #56). The full technical story of every re
 is the release-note block in `AGENTS.md`; the paragraphs here name the user-visible
 change and point there rather than duplicating it.
 
+## 2.19.0 (in this PR, not on `main` yet)
+
+The per-thread procfs view. `/proc/<pid>/task/` and `/proc/self/task/` now list one
+numeric directory per **live task of the process's thread group** — pagh has real
+threads (`clone(CLONE_THREAD)` registers a scheduled task under its own pid with a
+shared `tgid`), but until now they could only be seen as top-level `/proc/<tid>`
+entries. Each thread's directory is deliberately the **same VFS object as
+`/proc/<tid>`** (Linux identity: one task, one inode), so `stat`, `status`, `cmdline`
+and the rest of the pid-directory files are the per-thread view with Linux's 52-field
+`stat` line and `Tgid`/`Pid`/`Threads` in `status`. A dead pid, a tid from another
+thread group and a non-numeric component are `ENOENT` — the directory is a namespace,
+not a wildcard. `/proc/self/task` follows the reader's own group and is `ENOENT` for a
+task without `CompatState`, like the rest of `/proc/self`. Contract (paths, semantics,
+inode identity and the deviations the model keeps) in `docs/procfs.md` §13; evidence is
+the `procfs::per-thread task directories` in-QEMU selftest, a real-`clone` `lx_selftest`
+check and `properties/procfs_task.rs`.
+
 ## 2.18.13 (in PR #56, not on `main` yet)
 
 xHCI diagnostics: the Supported Protocol PORT INFO word is now parsed as the spec

@@ -231,9 +231,22 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.18.13** (the batch open with the
-  `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
-  kernel-thread rows in `ps`; the tag lands at the end of the batch).
+  be reflected here. **`main` currently reads 2.19.0** (the batch open with the
+  per-thread procfs view `/proc/<pid>/task/` + `/proc/self/task/`; 2.18.13
+  carried the `connect(2)` reply-and-close fix, the VT/console coordinate fix
+  and the kernel-thread rows in `ps`; the tag lands at the end of the batch).
+  **2.19.0** = the per-thread procfs view. `/proc/<pid>/task/` (and
+  `/proc/self/task/`) list one directory per live task of the process's thread
+  group — pagh models a thread as a scheduled task registered under its own pid
+  with a shared `tgid` — and `/proc/<pid>/task/<tid>/` is **the same VFS object
+  as `/proc/<tid>`**, so `stat`, `status` and `cmdline` (plus the rest of the
+  pid-directory files) are the per-thread view with Linux's 52-field `stat`,
+  `Tgid`/`Pid`/`Threads` and inherited argv; `/proc/self/task` follows the
+  reader's own group and is `ENOENT` for a task without `CompatState`. A dead
+  pid, a task of another thread group and a non-numeric tid are all `ENOENT`
+  (no wildcard). Contract and deviations: `docs/procfs.md` §13; evidence is the
+  `procfs::per-thread task directories` selftest routine, the `lx_selftest`
+  real-`clone` check and `properties/procfs_task.rs`.
   **2.17.0** = the batch that made pagh run on real hardware, plus three
   long-standing display/network defects:
   * a peer that answers and closes in one burst now completes `connect(2)`: the
@@ -600,19 +613,24 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
 ## Known open gaps (good first issues, all documented in-code)
 
 
-- procfs covers slices 1–5 (issue #11, contract `docs/procfs.md`):
+- procfs covers slices 1–6 (issue #11, contract `docs/procfs.md`):
   `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}`,
   `/proc/<pid>/{cmdline,stat,status,maps,cgroup,mountinfo,limits}`,
+  `/proc/<pid>/task/<tid>/*` (the per-thread view; a thread directory is the same
+  VFS object as `/proc/<tid>`),
   `/proc/self/{exe,cmdline,status,maps,stat,statm,mounts,cgroup,mountinfo,limits}`
   and read-only `/proc/sys/kernel/{ostype,osrelease,hostname}` are rendered from
   live kernel state (CPUID, PMM counters, the tick clock, the scheduler's
   user/system/idle tick accounting and live task counts, and the target
-  process's `CompatState` snapshot). `/proc/self/fd` and `/proc/<pid>/fd` expose
+  process's `CompatState` snapshot). `/proc/self/task` and `/proc/<pid>/task`
+  list the live tasks of a thread group from the compat registry
+  (`compat::thread_group_pids`). `/proc/self/fd` and `/proc/<pid>/fd` expose
   the fd table as numeric symlinks; `/proc/<pid>/fdinfo/<n>` reports the real
   `pos`/`flags`/`mnt_id`/`ino` of an open descriptor (0 for objects with no VFS
   mount/inode), and `/proc/<pid>/limits` renders the 16 Linux rlimit rows from
-  the target's override table plus kernel defaults. Deferred: `/proc/<pid>/task/*`,
-  mountinfo optional fields and statfs metadata.
+  the target's override table plus kernel defaults. Deferred: mountinfo optional
+  fields, statfs metadata and the Linux per-thread files the kernel does not
+  model (`sched`, `syscall`, per-thread `comm`).
 - Signals (issue #12): `kill(2)` (nr 62), process-group addressing
   (`kill(0|-1|-pgid)`), `SIGSTOP`/`SIGCONT` scheduling, `wait4(WUNTRACED|WCONTINUED)`
   and timer-tick delivery to a syscall-free task are all implemented. SIGCHLD is

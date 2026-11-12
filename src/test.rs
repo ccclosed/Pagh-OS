@@ -2360,6 +2360,256 @@ mod procfs_tests {
             compat::install_compat(me, previous);
         }
     }
+
+    /// A synthetic task of thread group `tgid`: the same shape `synth` builds,
+    /// plus the fields `clone_current_compat` rewrites for a real thread clone
+    /// (`tid` = pid, shared `tgid`/`pgid`, the creating task as parent) and the
+    /// process image inherited by every thread.
+    fn thread_state(pid: u64, tgid: u64, ppid: u64) -> CompatState {
+        let mut st = synth(pid);
+        st.tid = pid;
+        st.tgid = tgid;
+        st.pgid = tgid;
+        st.ppid = ppid;
+        st.exe_path = String::from("/mnt/tasktest");
+        st.cmdline = Vec::from(&b"tasktest\0--flag\0"[..]);
+        st
+    }
+
+    /// `/proc/<pid>/task` and `/proc/self/task` (slice 6, `docs/procfs.md`
+    /// §13): the per-thread view over the live compat registry.
+    ///
+    /// Synthetic registry entries are the same instrument `fdinfo_and_limits`
+    /// uses: the registry IS the kernel's thread model (a thread is a pid whose
+    /// `CompatState.tgid` is its process id), so this routine drives the real
+    /// directory/`stat`/`status` code paths over a real thread GROUP. It also
+    /// saves and restores the calling task's own entry, so the routine is
+    /// non-destructive (AGENTS.md invariant 8).
+    pub fn task_tree() {
+        // Above any pid the allocator hands out during the suite; all four are
+        // valid `/proc` components (`parse_pid_component` caps at `i32::MAX`).
+        const LEADER: u64 = 0x7F00_2001;
+        const THREAD1: u64 = 0x7F00_2002;
+        const THREAD2: u64 = 0x7F00_2003;
+        const OTHER: u64 = 0x7F00_3001;
+        const DEAD: u64 = 0x7F00_3FFF;
+        let me = scheduler::current_pid();
+
+        // ── the task directory is part of the pid directory ─────────────────
+        let saved = compat::remove_compat(me);
+        compat::install_compat(LEADER, thread_state(LEADER, LEADER, 1));
+        compat::install_compat(THREAD1, thread_state(THREAD1, LEADER, LEADER));
+        compat::install_compat(THREAD2, thread_state(THREAD2, LEADER, LEADER));
+        compat::install_compat(OTHER, thread_state(OTHER, OTHER, 1));
+        // Per-thread state, not group state: THREAD1 has a pending signal that
+        // its leader and sibling do not.
+        compat::with_pid_compat(THREAD1, |cs| cs.sig_pending = 0b1);
+
+        let pid_dir = match vfs::lookup_path(&alloc::format!("/proc/{LEADER}")) {
+            Ok(n) => n,
+            Err(_) => {
+                assert_kernel!(false, "procfs task: /proc/<pid> lookup failed");
+                return;
+            }
+        };
+        let pid_children = names(&pid_dir);
+        assert_eq_kernel!(
+            pid_children.last().map(String::as_str),
+            Some("task"),
+            "procfs task: `task` is the last entry of /proc/<pid>"
+        );
+
+        // ── /proc/<pid>/task lists exactly the live threads of the group ────
+        let task_path = alloc::format!("/proc/{LEADER}/task");
+        let task_dir = match vfs::lookup_path(&task_path) {
+            Ok(n) => n,
+            Err(_) => {
+                assert_kernel!(false, "procfs task: /proc/<pid>/task lookup failed");
+                return;
+            }
+        };
+        assert_kernel!(task_dir.is_directory(), "procfs task: task is a directory");
+        assert_eq_kernel!(
+            task_dir.fs_ino(),
+            crate::vfs::procfs_format::pid_task_dir_ino(LEADER),
+            "procfs task: the task directory reports its table inode"
+        );
+        assert_eq_kernel!(
+            names(&task_dir),
+            alloc::vec![
+                alloc::format!("{LEADER}"),
+                alloc::format!("{THREAD1}"),
+                alloc::format!("{THREAD2}"),
+            ],
+            "procfs task: readdir lists the live threads, ascending"
+        );
+
+        // ── task/<tid> IS the pid directory (one task, one inode) ───────────
+        for tid in [LEADER, THREAD1, THREAD2] {
+            let thread_path = alloc::format!("/proc/{LEADER}/task/{tid}");
+            let thread = match vfs::lookup_path(&thread_path) {
+                Ok(n) => n,
+                Err(_) => {
+                    assert_kernel!(false, "procfs task: task/<tid> lookup failed");
+                    continue;
+                }
+            };
+            let own = match vfs::lookup_path(&alloc::format!("/proc/{tid}")) {
+                Ok(n) => n,
+                Err(_) => {
+                    assert_kernel!(false, "procfs task: /proc/<tid> lookup failed");
+                    continue;
+                }
+            };
+            assert_eq_kernel!(
+                thread.fs_ino(),
+                crate::vfs::procfs_format::pid_dir_ino(tid),
+                "procfs task: task/<tid> has the pid-directory inode"
+            );
+            assert_eq_kernel!(
+                thread.fs_ino(),
+                own.fs_ino(),
+                "procfs task: task/<tid> and /proc/<tid> are the same object"
+            );
+        }
+
+        // ── task/<tid>/stat is the per-TASK stat line ───────────────────────
+        let stat = text_of(&alloc::format!("/proc/{LEADER}/task/{THREAD1}/stat"));
+        let open = stat.find('(').unwrap_or(0);
+        assert_eq_kernel!(
+            stat[..open].trim_end(),
+            alloc::format!("{THREAD1}"),
+            "procfs task: task/<tid>/stat reports the THREAD pid"
+        );
+        assert_kernel!(
+            stat.contains("(tasktest)"),
+            "procfs task: task/<tid>/stat carries the inherited comm"
+        );
+        let close = stat.rfind(')').unwrap_or(stat.len());
+        let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+        // Fields 3..52 => 50 tokens after the comm; thread count is field 20,
+        // i.e. index 17 (`docs/procfs.md` §4.5/§13).
+        assert_eq_kernel!(
+            fields.len(),
+            50,
+            "procfs task: task/<tid>/stat has the Linux 52-field width"
+        );
+        assert_eq_kernel!(
+            fields.get(17).copied(),
+            Some("3"),
+            "procfs task: task/<tid>/stat field 20 is the group thread count"
+        );
+        assert_eq_kernel!(
+            fields.get(1).copied(),
+            Some(alloc::format!("{LEADER}").as_str()),
+            "procfs task: task/<tid>/stat ppid is the recorded parent task"
+        );
+
+        // ── task/<tid>/status is the per-THREAD status ──────────────────────
+        let status = text_of(&alloc::format!("/proc/{LEADER}/task/{THREAD1}/status"));
+        assert_kernel!(
+            status.contains(&alloc::format!("Tgid:\t{LEADER}\n")),
+            "procfs task: task/<tid>/status reports the target's Tgid"
+        );
+        assert_kernel!(
+            status.contains(&alloc::format!("Pid:\t{THREAD1}\n")),
+            "procfs task: task/<tid>/status reports the THREAD pid"
+        );
+        assert_kernel!(
+            status.contains("Threads:\t3\n"),
+            "procfs task: task/<tid>/status reports the group thread count"
+        );
+        assert_kernel!(
+            status.contains("SigPnd:\t0000000000000001\n"),
+            "procfs task: task/<tid>/status reports the target's own pending set"
+        );
+        let leader_status = text_of(&alloc::format!("/proc/{LEADER}/task/{LEADER}/status"));
+        assert_kernel!(
+            leader_status.contains("SigPnd:\t0000000000000000\n"),
+            "procfs task: a sibling's status is not the querying thread's"
+        );
+
+        // ── cmdline is the image argv the thread inherited ──────────────────
+        assert_eq_kernel!(
+            read_path(&alloc::format!("/proc/{LEADER}/task/{THREAD2}/cmdline")),
+            Vec::from(&b"tasktest\0--flag\0"[..]),
+            "procfs task: task/<tid>/cmdline is the inherited argv snapshot"
+        );
+
+        // ── a non-leader thread's `task` is the whole group ─────────────────
+        let thread_task = match vfs::lookup_path(&alloc::format!("/proc/{THREAD1}/task")) {
+            Ok(n) => n,
+            Err(_) => {
+                assert_kernel!(false, "procfs task: non-leader task dir lookup failed");
+                return;
+            }
+        };
+        assert_eq_kernel!(
+            names(&thread_task),
+            names(&task_dir),
+            "procfs task: /proc/<tid>/task is the thread's group, not an empty dir"
+        );
+
+        // ── ENOENT matrix: no wildcard, no cross-group task ─────────────────
+        for path in [
+            alloc::format!("/proc/{LEADER}/task/{OTHER}"), // live, other group
+            alloc::format!("/proc/{LEADER}/task/{DEAD}"),  // never registered
+            alloc::format!("/proc/{LEADER}/task/notanumber"),
+            alloc::format!("/proc/{DEAD}/task"), // dead pid: the dir itself
+            alloc::format!("/proc/{DEAD}/task/{DEAD}"),
+        ] {
+            assert_kernel!(
+                matches!(vfs::lookup_path(&path), Err(VfsError::NotFound)),
+                "procfs task: a non-thread path is ENOENT"
+            );
+        }
+
+        // ── /proc/self/task is the reader's own thread group ────────────────
+        compat::install_compat(me, thread_state(me, LEADER, LEADER));
+        let self_task = match vfs::lookup_path("/proc/self/task") {
+            Ok(n) => n,
+            Err(_) => {
+                assert_kernel!(false, "procfs task: /proc/self/task lookup failed");
+                return;
+            }
+        };
+        let mut want = alloc::vec![LEADER, THREAD1, THREAD2, me,];
+        want.sort_unstable();
+        let want_names: Vec<String> = want.iter().map(|p| alloc::format!("{p}")).collect();
+        assert_eq_kernel!(
+            names(&self_task),
+            want_names,
+            "procfs task: /proc/self/task lists the reader's thread group"
+        );
+        let self_thread = text_of(&alloc::format!("/proc/self/task/{THREAD1}/status"));
+        assert_kernel!(
+            self_thread.contains(&alloc::format!("Tgid:\t{LEADER}\n")),
+            "procfs task: /proc/self/task/<tid> resolves a sibling thread"
+        );
+
+        // ── a task without CompatState has no `/proc/self/task` (§5.5) ─────
+        compat::remove_compat(me);
+        assert_kernel!(
+            matches!(vfs::lookup_path("/proc/self/task"), Err(VfsError::NotFound)),
+            "procfs task: /proc/self/task is ENOENT without CompatState"
+        );
+
+        // ── restore the pre-test registry state ─────────────────────────────
+        compat::remove_compat(LEADER);
+        compat::remove_compat(THREAD1);
+        compat::remove_compat(THREAD2);
+        compat::remove_compat(OTHER);
+        if let Some(previous) = saved {
+            compat::install_compat(me, previous);
+        }
+        assert_kernel!(
+            matches!(
+                vfs::lookup_path(&alloc::format!("/proc/{LEADER}/task")),
+                Err(VfsError::NotFound)
+            ),
+            "procfs task: a dead process's task directory is ENOENT"
+        );
+    }
 }
 
 mod integration {
@@ -6684,6 +6934,13 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "procfs::fdinfo and limits (slice 5)",
             procfs_tests::fdinfo_and_limits
+        ),
+        // Slice 6 (2.19.0): the per-thread view `/proc/<pid>/task` and
+        // `/proc/self/task` over a synthetic thread group (registry entries are
+        // the kernel's thread model); registry state is restored.
+        (
+            "procfs::per-thread task directories (slice 6)",
+            procfs_tests::task_tree
         ),
         ("pmm::total_frames > 0", pmm_tests::total_frames),
         ("pmm::alloc+free cycle", pmm_tests::alloc_free),
