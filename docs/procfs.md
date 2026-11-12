@@ -1093,8 +1093,9 @@ python3 tools/host_tests.py          # + 6 новых property-наборов
   §5.5): `--cmd 'lxrun /mnt/bin/busybox ls /proc/self/task' --expect '<pid>'`
   (busybox — однопоточный, поэтому листинг содержит его собственный tid, и это
   положительный контроль: каталог существует и непуст). Реальный тред-клон
-  проверяется in-QEMU рутиной `selftest` (§8.2) и `lx_selftest`-сценарием
-  `thread_task_dir` (реальный `clone(CLONE_THREAD)` из гостевого ELF, §13.6).
+  проверяется in-QEMU рутиной `selftest` (§8.2) и `lx_selftest`-сценариями
+  `thread_task_dir`/`thread_exit_task` (реальный `clone(CLONE_THREAD)` из гостевого ELF
+  и реальный выход треда, §13.6).
 
 ### 8.4 Обязательные обновления документации
 `src/vfs/README.md`, `README.md`, `LINUX-USERLAND.md` — см. §6.7 (по `AGENTS.md`
@@ -1384,11 +1385,20 @@ pid-каталог (алиас), поэтому `stat`/`status`/`cmdline` (и `m
   треда в `/proc/<pid>/task`, читает `stat`/`status` каждого, затем завершает группу
   реальным `SIGKILL`-путём. Это доказательство, что фича видит реальные треды, а не
   только записи реестра.
+- in-QEMU, живучесть (`lx_selftest`, `check_thread_exit_task_dir`): второй гостевой
+  фикстур клонирует тред, который ~2 с крутит неблокирующий `clock_gettime(CLOCK_MONOTONIC)`
+  (маркеры `A`/`C`/`B` на serial) и затем делает `exit(60)` — этот syscall завершает
+  ТОЛЬКО этот тред (R7.2). Харнесс сначала видит в `/proc/<pid>/task` две записи, затем
+  требует ровно одну (лидер) при живом процессе, `ENOENT` на исчезнувший tid и
+  `Threads: 1` в `/proc/<pid>/status`, и лишь потом убивает лидера. Это фиксирует
+  «каталог перечисляет ЖИВЫЕ треды», а не одноразовый снимок группы. (Родитель в этом
+  фикстуре игнорирует `SIGCHLD`: выход треда в pagh уведомляет создателя сигналом,
+  чего Linux для тредов не делает; см. 13.6-примечание и отклонение #23.)
 - E2E: `python3 tools/e2e.py selftest` (штатный `selftest` — проверяет рутину
   `src/test.rs`) и `python3 tools/e2e.py local-mirror` (собирает с `lx_selftest`,
-  запускает boot-харнесс `run_post_net_checks`; реальный клон виден на serial как
-  `LXSELFTEST thread_task_dir PASS`, а `--extra-wait 'LXSELFTEST thread_task_dir PASS'`
-  делает его обязательным для вердикта E2E).
+  запускает boot-харнесс `run_post_net_checks`; оба реальных клона видны на serial как
+  `LXSELFTEST thread_task_dir PASS` и `LXSELFTEST thread_exit_task PASS`, а
+  `--extra-wait` для каждого из них делает маркер обязательным для вердикта E2E).
 
 ### 13.7 Осознанные отклонения среза 6
 

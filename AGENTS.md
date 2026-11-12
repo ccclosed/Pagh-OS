@@ -246,7 +246,8 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   pid, a task of another thread group and a non-numeric tid are all `ENOENT`
   (no wildcard). Contract and deviations: `docs/procfs.md` §13; evidence is the
   `procfs::per-thread task directories` selftest routine, the `lx_selftest`
-  real-`clone` check and `properties/procfs_task.rs`.
+  real-`clone` checks (thread listing and thread-exit shrink) and
+  `properties/procfs_task.rs`.
   **2.17.0** = the batch that made pagh run on real hardware, plus three
   long-standing display/network defects:
   * a peer that answers and closes in one burst now completes `connect(2)`: the

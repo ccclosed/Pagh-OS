@@ -25,8 +25,8 @@ thread group and a non-numeric component are `ENOENT` — the directory is a nam
 not a wildcard. `/proc/self/task` follows the reader's own group and is `ENOENT` for a
 task without `CompatState`, like the rest of `/proc/self`. Contract (paths, semantics,
 inode identity and the deviations the model keeps) in `docs/procfs.md` §13; evidence is
-the `procfs::per-thread task directories` in-QEMU selftest, a real-`clone` `lx_selftest`
-check and `properties/procfs_task.rs`.
+the `procfs::per-thread task directories` in-QEMU selftest, real-`clone` `lx_selftest`
+checks (thread listing and thread-exit shrink) and `properties/procfs_task.rs`.
 
 ## 2.18.13 (in PR #56, not on `main` yet)
 
