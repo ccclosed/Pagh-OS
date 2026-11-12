@@ -60,7 +60,7 @@ pub(super) fn shell_print_bytes(bytes: &[u8]) {
 /// `/mnt/...` behave exactly as before; relative inputs and `.`/`..` are folded
 /// against the CWD (R4.6, R9.5). All path-taking handlers route their user
 /// argument through this so relative paths work everywhere.
-fn resolve_arg(arg: &str) -> String {
+pub(super) fn resolve_arg(arg: &str) -> String {
     super::path::resolve(&super::path::cwd(), arg)
 }
 

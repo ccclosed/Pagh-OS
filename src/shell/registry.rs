@@ -235,6 +235,30 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_pwd,
     },
     CommandSpec {
+        name: "head",
+        description: "Print the first lines of a file",
+        usage: "head [-n LINES] FILE",
+        handler: super::texttools::cmd_head,
+    },
+    CommandSpec {
+        name: "tail",
+        description: "Print the last lines of a file",
+        usage: "tail [-n LINES] FILE",
+        handler: super::texttools::cmd_tail,
+    },
+    CommandSpec {
+        name: "wc",
+        description: "Count lines, words and bytes in a file",
+        usage: "wc [-l] [-w] [-c] FILE",
+        handler: super::texttools::cmd_wc,
+    },
+    CommandSpec {
+        name: "grep",
+        description: "Print the lines of a file that contain PATTERN",
+        usage: "grep [-i] [-n] [-c] [-v] PATTERN FILE",
+        handler: super::texttools::cmd_grep,
+    },
+    CommandSpec {
         name: "cp",
         description: "Copy a file (cp <src> <dst>)",
         usage: "cp <src> <dst>",

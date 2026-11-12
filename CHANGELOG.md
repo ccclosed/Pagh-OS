@@ -13,14 +13,17 @@ change and point there rather than duplicating it.
 
 ## 2.19.0
 
-A `free` shell command: physical memory total/used/free (from the PMM frame
-counters) and the fixed kernel heap (region size, bytes handed out, remainder), in
-busybox `free` layout and KiB units, printed beside `df`. Before it the only memory
-numbers visible without a debugger were the boot-time `[selftest] PMM hygiene`
-ledger pair; with the region mapped up front, the `Heap` row also makes heap growth
-observable instead of hidden inside `Mem used`. No `/proc/meminfo` or sysinfo
-syscall exists here yet, so `shared`/`buffers` are honest zeros and `Swap` is zero
-because there is no swap device. Full story: `AGENTS.md`, 2.19.0.
+Five new shell commands. `free` prints physical-memory total/used/free (the PMM
+frame counters) and the fixed kernel heap (region size, bytes handed out,
+remainder) in busybox `free` layout and KiB units; `/proc/meminfo` already gave
+programs `MemTotal`/`MemFree`, but the shell had no view and meminfo has no heap
+row, and `free` reads the same PMM counters so the two cannot disagree. `head`,
+`tail`, `wc` and `grep` inspect a file without dumping it — first/last N lines,
+line/word/byte counts, and the lines matching a pattern — through one streaming
+walk with a 4 MiB cap and a transcript-terminating last line. The limits are
+stated rather than stubbed: `shared`, `buffers` and `Swap` read zero because this
+kernel has no shared-memory accounting, no block cache and no swap device. Full
+story: `AGENTS.md`, 2.19.0.
 
 ## 2.18.13
 

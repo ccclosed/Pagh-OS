@@ -29,7 +29,7 @@
 ### What works today
 
 - **Boot:** Limine/UEFI → 1280×800 framebuffer console with a coloured prompt and status bar.
-- **Shell:** line editing, history, tab completion, `ls`/`df`/`free`/`ifconfig`/`ps`, ext2 file ops, `selftest`.
+- **Shell:** line editing, history, tab completion, `ls`/`df`/`free`/`head`/`tail`/`wc`/`grep`/`ifconfig`/`ps`, ext2 file ops, `selftest`.
 - **GUI apps:** the mouse-driven `paint` (shape tools, 16-colour palette, brush sizes, undo, save to ext2), the full-screen `nano+` editor, and `settings` with live colour themes + wallpapers.
 - **Storage:** ext2-compatible read/write filesystem with a write-ahead-log journal, on a real virtio-blk or NVMe disk (or a RAM disk carried on the boot medium).
 - **Networking:** the kernel's own e1000 + TCP/IP stack (DHCP/ARP/TCP/UDP; `ifconfig` shows the live lease).
@@ -417,6 +417,10 @@ framebuffer (serial stays plain text).
 | `cd [path]`          | Change directory (relative or absolute; no arg → `/`)           |
 | `ls [path]`          | List a directory (defaults to the CWD; dirs shown with `/`)     |
 | `cat path`           | Print the contents of a file                                    |
+| `head [-n N] path`   | Print the first N lines of a file (default 10)                  |
+| `tail [-n N] path`   | Print the last N lines of a file (default 10)                   |
+| `wc [-l\|-w\|-c] path` | Count lines, words and bytes in a file                       |
+| `grep [-i] [-n] [-c] [-v] pattern path` | Print the lines of a file that contain pattern |
 | `cp src dst`         | Copy a file                                                     |
 | `mv src dst`         | Move/rename a file                                              |
 | `stat path`          | Show file/directory info                                        |

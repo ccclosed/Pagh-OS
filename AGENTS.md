@@ -231,20 +231,29 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.19.0** (the `free` shell
-  command on top of the 2.18.13 batch: `connect(2)` reply-and-close, the
-  VT/console coordinates and the kernel-thread rows in `ps`).
-  **2.19.0** = the `free` shell command: physical memory total/used/free from
-  the PMM frame counters, plus the fixed kernel heap from the global
-  allocator's counters, printed busybox-style in KiB next to `df`. This kernel
-  has no `/proc/meminfo` and no sysinfo syscall, so before this the only
-  memory numbers a human could see were the boot-time `[selftest] PMM hygiene`
-  ledger pair; `free` is the interactive counterpart, and it also makes heap
-  growth observable (the region is mapped at boot, so it always counts as
-  `Mem used` — only the `Heap` row shows how much of it is actually handed
-  out). It reports physical frames, not Linux memory classes: `shared` and
-  `buffers` are honest zeros (no shared-memory accounting, no block cache),
-  and the `Swap` row is zero because there is no swap device.
+  be reflected here. **`main` currently reads 2.19.0** (the `free`, `head`,
+  `tail`, `wc` and `grep` shell commands on top of the 2.18.13 batch:
+  `connect(2)` reply-and-close, the VT/console coordinates and the
+  kernel-thread rows in `ps`).
+  **2.19.0** = five new shell commands, one batch of "ask the machine instead
+  of reading a log":
+  * `free` — physical memory total/used/free from the PMM frame counters plus
+    the fixed kernel heap from the global allocator's counters, in the busybox
+    `free` layout and KiB. `/proc/meminfo` already exposed `MemTotal`/
+    `MemFree` to programs, but the shell had no view and meminfo has no heap
+    row; `free` reads the same PMM counters, so the two views cannot disagree,
+    and the `Heap` row makes heap growth observable (the region is mapped at
+    boot, so it always counts as `Mem used` — only the `Heap` row shows how
+    much is actually handed out). Truthful limits, not stubs: `shared` and
+    `buffers` are zeros because this kernel keeps no shared-memory accounting
+    and no block cache, and `Swap` is zero because there is no swap device.
+  * `head`, `tail`, `wc`, `grep` — inspect a file without dumping it: first or
+    last N lines, line/word/byte counts, and the lines containing a pattern
+    (`-i` `-n` `-c` `-v`). All four share one streaming walk
+    (`shell::texttools::walk`): 256-byte reads, a 4 MiB cap so an endless
+    device (`/dev/serial`) cannot wedge the shell, `tail` keeps only N lines,
+    `wc`/`grep` keep counters. `head`/`tail` always terminate the last line so
+    the next prompt stays on its own row — the same transcript rule as `cat`.
   **2.17.0** = the batch that made pagh run on real hardware, plus three
   long-standing display/network defects:
   * a peer that answers and closes in one burst now completes `connect(2)`: the
