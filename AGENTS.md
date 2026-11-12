@@ -231,11 +231,11 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.19.0** (the `free`, `head`,
-  `tail`, `wc` and `grep` shell commands on top of the 2.18.13 batch:
+  be reflected here. **`main` currently reads 2.19.0** (the `free`, `date`,
+  `head`, `tail`, `wc` and `grep` shell commands on top of the 2.18.13 batch:
   `connect(2)` reply-and-close, the VT/console coordinates and the
   kernel-thread rows in `ps`).
-  **2.19.0** = five new shell commands, one batch of "ask the machine instead
+  **2.19.0** = six new shell commands, one batch of "ask the machine instead
   of reading a log":
   * `free` — physical memory total/used/free from the PMM frame counters plus
     the fixed kernel heap from the global allocator's counters, in the busybox
@@ -247,6 +247,13 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
     much is actually handed out). Truthful limits, not stubs: `shared` and
     `buffers` are zeros because this kernel keeps no shared-memory accounting
     and no block cache, and `Swap` is zero because there is no swap device.
+  * `date` — the CMOS RTC wall clock in UTC (ISO date/time, weekday and Unix
+    seconds). `uptime` only ever showed monotonic ticks, even though the same
+    RTC reader already feeds `clock_gettime(2)` and TLS validation; `date` is
+    that clock in the shell, so a transcript can be timestamped. NTP is not
+    implemented, and the kernel assumes the RTC keeps UTC everywhere, so a
+    machine set to local time shows it labelled `UTC` rather than a guessed
+    correction.
   * `head`, `tail`, `wc`, `grep` — inspect a file without dumping it: first or
     last N lines, line/word/byte counts, and the lines containing a pattern
     (`-i` `-n` `-c` `-v`). All four share one streaming walk

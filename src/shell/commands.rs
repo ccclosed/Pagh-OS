@@ -136,6 +136,35 @@ pub(super) fn cmd_uptime(_ctx: &mut ShellCtx, _args: &[&str]) {
     );
 }
 
+/// `date`: print the CMOS RTC wall clock in UTC.
+///
+/// `uptime` reports monotonic ticks since boot; the shell had no way to see the
+/// actual time even though the same RTC reader already feeds
+/// `clock_gettime(2)` and TLS certificate validation. `date` prints that clock
+/// in ISO form plus the Unix seconds and the weekday, so a log line or a
+/// transcript can be timestamped without a userspace program.
+///
+/// The fields come from [`crate::arch::x86_64::linux::rtc::read_date`], i.e. the
+/// same read-twice guarded snapshot the kernel uses, so they belong to one
+/// consistent second. The kernel assumes the RTC keeps UTC everywhere (NTP is
+/// not implemented yet); a machine whose RTC is on local time will therefore
+/// show its local time labelled `UTC` — the command cannot guess which, and a
+/// wrong timezone is preferable to a made-up correction.
+pub(super) fn cmd_date(_ctx: &mut ShellCtx, _args: &[&str]) {
+    let d = crate::arch::x86_64::linux::rtc::read_date();
+    let secs = crate::arch::x86_64::linux::timeconv::civil_to_unix(
+        d.year, d.month, d.day, d.hour, d.minute, d.second,
+    );
+    let unix = if secs < 0 { 0 } else { secs as u64 };
+    // 1970-01-01 was a Thursday, so epoch day 0 is index 4.
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let weekday = WEEKDAYS[((unix / 86_400 + 4) % 7) as usize];
+    shell_println(&format!(
+        "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC (unix {})",
+        weekday, d.year, d.month, d.day, d.hour, d.minute, d.second, unix
+    ));
+}
+
 /// `pwd` (R4.2): print the absolute current working directory.
 pub(super) fn cmd_pwd(_ctx: &mut ShellCtx, _args: &[&str]) {
     shell_println(&super::path::cwd());

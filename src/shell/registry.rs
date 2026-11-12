@@ -91,6 +91,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_uptime,
     },
     CommandSpec {
+        name: "date",
+        description: "Show the wall clock (UTC) and Unix seconds",
+        usage: "date",
+        handler: super::commands::cmd_date,
+    },
+    CommandSpec {
         name: "ls",
         description: "List directory entries",
         usage: "ls [path]",

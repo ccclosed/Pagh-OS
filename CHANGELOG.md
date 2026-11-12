@@ -13,12 +13,14 @@ change and point there rather than duplicating it.
 
 ## 2.19.0
 
-Five new shell commands. `free` prints physical-memory total/used/free (the PMM
+Six new shell commands. `free` prints physical-memory total/used/free (the PMM
 frame counters) and the fixed kernel heap (region size, bytes handed out,
 remainder) in busybox `free` layout and KiB units; `/proc/meminfo` already gave
 programs `MemTotal`/`MemFree`, but the shell had no view and meminfo has no heap
-row, and `free` reads the same PMM counters so the two cannot disagree. `head`,
-`tail`, `wc` and `grep` inspect a file without dumping it — first/last N lines,
+row, and `free` reads the same PMM counters so the two cannot disagree. `date`
+prints the CMOS RTC wall clock in UTC (ISO date/time, weekday, Unix seconds) —
+`uptime` only ever showed monotonic ticks. `head`, `tail`, `wc` and `grep`
+inspect a file without dumping it — first/last N lines,
 line/word/byte counts, and the lines matching a pattern — through one streaming
 walk with a 4 MiB cap and a transcript-terminating last line. The limits are
 stated rather than stubbed: `shared`, `buffers` and `Swap` read zero because this
