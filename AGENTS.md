@@ -235,7 +235,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `head`, `tail`, `wc` and `grep` shell commands on top of the 2.18.13 batch:
   `connect(2)` reply-and-close, the VT/console coordinates and the
   kernel-thread rows in `ps`).
-  **2.19.0** = nine new shell commands plus a long listing for `ls`, one batch
+  **2.19.0** = nine new shell commands, a long listing for `ls` and `-h` units, one batch
   of "ask the machine instead of reading a log":
   * `free` — physical memory total/used/free from the PMM frame counters plus
     the fixed kernel heap from the global allocator's counters, in the busybox
@@ -259,6 +259,10 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
     group, size and name, plus `-> target` for symlinks. Deliberately no
     timestamp column: `VfsNode` has no `mtime`, and a fake `Jan 1 1970` would
     read as real data.
+  * `free -h` / `df -h` — the two memory/disk commands in coreutils' human
+    units (`992.9 MiB`, `1.0 GiB`), integer-arithmetic rounding to a tenth, so
+    the same numbers in a readable form. Unknown flags are rejected instead of
+    silently ignored.
   * `chmod OCTAL-MODE PATH…` — set permission bits. The same nine bits plus
     setuid/setgid/sticky that the VFS `set_mode` contract already stores: ext2
     persists them (visible immediately in `ls -l`), while ramfs/`/dev`/`/proc`

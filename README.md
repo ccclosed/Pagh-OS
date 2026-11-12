@@ -450,8 +450,8 @@ framebuffer (serial stays plain text).
 | `disk [list\|setup\|mount <n>\|format <n> [--force]\|cancel]` | List block devices; format one as ext2 and mount it at `/mnt` |
 | `ifconfig`           | Show the network interface (IP, gateway, MAC)                   |
 | `ping <ip>`          | Send one ICMP echo request and print the RTT                    |
-| `df`                 | Mounted filesystems: 1K blocks, used, available, use%, mount point |
-| `free`               | RAM and kernel heap: total/used/free in KiB (busybox-style `free`) |
+| `df [-h]`            | Mounted filesystems: blocks/size, used, available, use%, mount point |
+| `free [-h]`          | RAM and kernel heap: total/used/free in KiB, `-h` for human units |
 | `ps`                 | Processes: PID, PPID, STAT, COMMAND — compat processes from `/proc/<pid>/*`, kernel threads as `[shell]`/`[net]`/`[usb]` |
 | `nc <ip> <port> [text]` | Open a TCP connection and echo a line over it                |
 | `jobs` / `fg` / `bg` | Shell job table; resume the most recent stopped job in the foreground / background |

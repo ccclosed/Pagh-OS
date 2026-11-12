@@ -13,7 +13,7 @@ change and point there rather than duplicating it.
 
 ## 2.19.0
 
-Nine new shell commands plus `ls -l`. `free` prints physical-memory total/used/free (the PMM
+Nine new shell commands plus `ls -l` and `-h` human units for `free`/`df`. `free` prints physical-memory total/used/free (the PMM
 frame counters) and the fixed kernel heap (region size, bytes handed out,
 remainder) in busybox `free` layout and KiB units; `/proc/meminfo` already gave
 programs `MemTotal`/`MemFree`, but the shell had no view and meminfo has no heap

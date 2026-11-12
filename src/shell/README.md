@@ -97,8 +97,9 @@ Shift+букву строчной при выключенном CapsLock.
 `help`, `clear`, `echo`, `uptime`, `date` (RTC в UTC: ISO-время, день недели, unix-секунды),
 `ls [-l]`, `tree [-L N]` (рекурсивный ASCII-листинг с итогами), `cat` (cap 64 KiB; если файл не заканчивается
 `\n`, вывод завершается переводом строки, чтобы промпт не приклеился к последней строке),
-`head`/`tail` (`-n N`), `wc` (`-l -w -c`), `grep` (`-i -v -n -c`), `free` (RAM + kernel heap
-в busybox-раскладке, честные нули shared/buffers/swap),
+`head`/`tail` (`-n N`), `wc` (`-l -w -c`), `grep` (`-i -v -n -c`), `free [-h]` (RAM + kernel heap
+в busybox-раскладке, честные нули shared/buffers/swap; `-h` — человеческие единицы),
+`df [-h]` (ёмкость точек монтирования; `-h` — то же в KiB/MiB/GiB),
 `mkdir`, `touch`, `write`
 (заменяет содержимое: `truncate(0)` + запись, поэтому короткий текст не оставляет хвоста),
 `rm` (`-r`/`-rf`, post-order, depth cap 24), `sync`, `fscrash` (демо journal replay:

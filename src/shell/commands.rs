@@ -2038,8 +2038,29 @@ pub(super) fn cmd_disk(_ctx: &mut ShellCtx, args: &[&str]) {
     crate::shell::disk::cmd(args);
 }
 
-pub(super) fn cmd_df(_ctx: &mut ShellCtx, _args: &[&str]) {
-    shell_println("Filesystem     1K-blocks  Used Available Use% Mounted on");
+pub(super) fn cmd_df(_ctx: &mut ShellCtx, args: &[&str]) {
+    let mut human = false;
+    for a in args {
+        if *a == "-h" {
+            human = true;
+        } else {
+            shell_println(&alloc::format!("df: unknown option: {}", a));
+            shell_println("df: usage: df [-h]");
+            return;
+        }
+    }
+    if human {
+        shell_println("Filesystem       Size   Used  Avail Use% Mounted on");
+    } else {
+        shell_println("Filesystem     1K-blocks  Used Available Use% Mounted on");
+    }
+    let size_cell = |bytes: u64| -> alloc::string::String {
+        if human {
+            human_size(bytes.saturating_mul(1024))
+        } else {
+            alloc::format!("{}", bytes)
+        }
+    };
     for mount in crate::vfs::mount_snapshot() {
         let fs = mount.fs;
         let point = &mount.point;
@@ -2057,10 +2078,22 @@ pub(super) fn cmd_df(_ctx: &mut ShellCtx, _args: &[&str]) {
                 } else {
                     used.saturating_mul(100) / total
                 };
-                shell_println(&format!(
-                    "{:<12} {:>9} {:>5} {:>9} {:>3}% {}",
-                    fs, total, used, free, pct, point
-                ));
+                if human {
+                    shell_println(&format!(
+                        "{:<12} {:>11} {:>9} {:>11} {:>3}% {}",
+                        fs,
+                        size_cell(total),
+                        size_cell(used),
+                        size_cell(free),
+                        pct,
+                        point
+                    ));
+                } else {
+                    shell_println(&format!(
+                        "{:<12} {:>9} {:>5} {:>9} {:>3}% {}",
+                        fs, total, used, free, pct, point
+                    ));
+                }
             }
             // No capacity to report (VFS contract: `fs_stat() == None`). A
             // ramfs still knows how many bytes it is HOLDING, and that is worth
@@ -2074,14 +2107,31 @@ pub(super) fn cmd_df(_ctx: &mut ShellCtx, _args: &[&str]) {
                     .map(|node| tree_bytes(&node, 0))
                     .unwrap_or(0);
                 if matches!(fs, "ramfs" | "rootfs") && used > 0 {
+                    if human {
+                        shell_println(&format!(
+                            "{:<12} {:>11} {:>9} {:>11} {:>3}% {}",
+                            fs,
+                            "-",
+                            human_size(used),
+                            "-",
+                            "-",
+                            point
+                        ));
+                    } else {
+                        shell_println(&format!(
+                            "{:<12} {:>9} {:>5} {:>9} {:>3}% {}",
+                            fs,
+                            "-",
+                            used.div_ceil(1024),
+                            "-",
+                            "-",
+                            point
+                        ));
+                    }
+                } else if human {
                     shell_println(&format!(
-                        "{:<12} {:>9} {:>5} {:>9} {:>3}% {}",
-                        fs,
-                        "-",
-                        used.div_ceil(1024),
-                        "-",
-                        "-",
-                        point
+                        "{:<12} {:>11} {:>9} {:>11} {:>3}% {}",
+                        fs, "-", "-", "-", "-", point
                     ));
                 } else {
                     shell_println(&format!(
@@ -2118,6 +2168,31 @@ fn tree_bytes(node: &alloc::sync::Arc<dyn crate::vfs::VfsNode>, depth: usize) ->
         .fold(0u64, |acc, n| acc.saturating_add(n))
 }
 
+/// Format a byte count the way `-h` does: binary units, one decimal for KiB and
+/// above, integer `B` below 1 KiB — coreutils' convention, computed with integer
+/// arithmetic so the output is exact and no float formatting is involved.
+pub(crate) fn human_size(bytes: u64) -> alloc::string::String {
+    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes < 1024 {
+        return alloc::format!("{} B", bytes);
+    }
+    let mut scale: u64 = 1024;
+    let mut unit = 0usize;
+    while unit + 1 < UNITS.len() && bytes / scale >= 1024 {
+        scale *= 1024;
+        unit += 1;
+    }
+    let whole = bytes / scale;
+    let remainder = bytes % scale;
+    // Round to the nearest tenth so 1023.96 MiB prints as 1024.0 MiB, not 1023.9.
+    let tenths = (remainder * 10 + scale / 2) / scale;
+    if tenths >= 10 {
+        alloc::format!("{}.0 {}", whole + 1, UNITS[unit])
+    } else {
+        alloc::format!("{}.{} {}", whole, tenths, UNITS[unit])
+    }
+}
+
 /// `free`: physical-memory and kernel-heap usage.
 ///
 /// The layout is busybox `free` (one header row, KiB columns), but the numbers
@@ -2135,12 +2210,23 @@ fn tree_bytes(node: &alloc::sync::Arc<dyn crate::vfs::VfsNode>, depth: usize) ->
 /// and therefore always counts into `Mem used`, while only a fraction of it is
 /// actually occupied — an oversized or leaking heap shows up here long before
 /// physical memory runs out.
-pub(super) fn cmd_free(_ctx: &mut ShellCtx, _args: &[&str]) {
+pub(super) fn cmd_free(_ctx: &mut ShellCtx, args: &[&str]) {
+    let mut human = false;
+    for a in args {
+        if *a == "-h" {
+            human = true;
+        } else {
+            shell_println(&alloc::format!("free: unknown option: {}", a));
+            shell_println("free: usage: free [-h]");
+            return;
+        }
+    }
     const PAGE_SIZE: usize = 4096;
-    let total = crate::memory::pmm::total_frames().saturating_mul(PAGE_SIZE);
-    let free = crate::memory::pmm::free_frames().saturating_mul(PAGE_SIZE);
+    let total = crate::memory::pmm::total_frames().saturating_mul(PAGE_SIZE) as u64;
+    let free = crate::memory::pmm::free_frames().saturating_mul(PAGE_SIZE) as u64;
     let used = total.saturating_sub(free);
     let (heap_size, heap_used, heap_free) = crate::memory::heap::stats();
+    let (heap_size, heap_used, heap_free) = (heap_size as u64, heap_used as u64, heap_free as u64);
 
     // The header is formatted through the same widths as the rows so the
     // columns cannot drift apart when a row gains a field.
@@ -2148,22 +2234,35 @@ pub(super) fn cmd_free(_ctx: &mut ShellCtx, _args: &[&str]) {
         "{:<6} {:>13} {:>12} {:>12} {:>12} {:>12}",
         "", "total", "used", "free", "shared", "buffers"
     ));
+    let cell = |v: u64| -> alloc::string::String {
+        if human {
+            human_size(v)
+        } else {
+            alloc::format!("{}", v / 1024)
+        }
+    };
     shell_println(&format!(
         "{:<6} {:>13} {:>12} {:>12} {:>12} {:>12}",
         "Mem:",
-        total / 1024,
-        used / 1024,
-        free / 1024,
-        0,
-        0
+        cell(total),
+        cell(used),
+        cell(free),
+        cell(0),
+        cell(0)
     ));
-    shell_println(&format!("{:<6} {:>13} {:>12} {:>12}", "Swap:", 0, 0, 0));
+    shell_println(&format!(
+        "{:<6} {:>13} {:>12} {:>12}",
+        "Swap:",
+        cell(0),
+        cell(0),
+        cell(0)
+    ));
     shell_println(&format!(
         "{:<6} {:>13} {:>12} {:>12}",
         "Heap:",
-        heap_size / 1024,
-        heap_used / 1024,
-        heap_free / 1024
+        cell(heap_size),
+        cell(heap_used),
+        cell(heap_free)
     ));
 }
 

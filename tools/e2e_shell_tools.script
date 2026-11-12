@@ -16,6 +16,18 @@ expect Mem:\s+\d+\s+\d+\s+\d+\s+0\s+0
 expect Swap:\s+0\s+0\s+0
 expect Heap:\s+\d+\s+\d+\s+\d+
 
+# free -h / df -h: the same commands in human units.
+cmd free -h
+expect Mem:\s+\d+\.\d (MiB|GiB)
+expect Heap:\s+\d+\.\d (KiB|MiB|GiB)
+cmd free -q
+expect free: unknown option: -q
+cmd df -h
+expect Filesystem\s+Size\s+Used\s+Avail
+expect \d+\.\d (KiB|MiB|GiB)
+cmd df -q
+expect df: unknown option: -q
+
 # date: ISO date/time, UTC, Unix seconds (the exact clock depends on the RTC).
 cmd date
 expect [A-Z][a-z]{2} \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC \(unix \d+\)
