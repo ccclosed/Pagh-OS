@@ -13,7 +13,7 @@ change and point there rather than duplicating it.
 
 ## 2.19.0
 
-Six new shell commands plus `ls -l`. `free` prints physical-memory total/used/free (the PMM
+Eight new shell commands plus `ls -l`. `free` prints physical-memory total/used/free (the PMM
 frame counters) and the fixed kernel heap (region size, bytes handed out,
 remainder) in busybox `free` layout and KiB units; `/proc/meminfo` already gave
 programs `MemTotal`/`MemFree`, but the shell had no view and meminfo has no heap
@@ -21,7 +21,10 @@ row, and `free` reads the same PMM counters so the two cannot disagree. `date`
 prints the CMOS RTC wall clock in UTC (ISO date/time, weekday, Unix seconds) —
 `uptime` only ever showed monotonic ticks. `ls -l` prints mode, links,
 owner/group, size and symlink targets in long form (no timestamp column: the VFS
-has no mtime). `head`, `tail`, `wc` and `grep`
+has no mtime). `chmod` sets the permission bits `ls -l` prints: ext2 persists
+them, filesystems without on-disk metadata report "operation not supported" per
+path. `chown` sets the owner/group the same way (numeric ids; ext2 persists,
+other filesystems report per path). `head`, `tail`, `wc` and `grep`
 inspect a file without dumping it — first/last N lines,
 line/word/byte counts, and the lines matching a pattern — through one streaming
 walk with a 4 MiB cap and a transcript-terminating last line. The limits are

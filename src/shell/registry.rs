@@ -109,6 +109,18 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_cat,
     },
     CommandSpec {
+        name: "chmod",
+        description: "Change permission bits of files (octal mode)",
+        usage: "chmod OCTAL-MODE PATH...",
+        handler: super::commands::cmd_chmod,
+    },
+    CommandSpec {
+        name: "chown",
+        description: "Change owner and group of files (numeric uid[:gid])",
+        usage: "chown UID[:GID] PATH...",
+        handler: super::commands::cmd_chown,
+    },
+    CommandSpec {
         name: "mkdir",
         description: "Create a directory (e.g. mkdir /mnt/d)",
         usage: "mkdir <path>",

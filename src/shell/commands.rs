@@ -973,6 +973,122 @@ pub(super) fn cmd_stat(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
+/// `chmod <octal-mode> <path>…`: change permission bits.
+///
+/// The bits are the same nine permission bits plus setuid/setgid/sticky that
+/// `chmod(2)` accepts (the VFS `set_mode` contract), so an octal argument is
+/// validated against `0o7777` and nothing else: a mode with higher bits set is a
+/// typo, not a request to stamp file-type bits from userspace. Filesystems
+/// without on-disk metadata (ramfs, `/dev`, `/proc`) answer `NotSupported`; the
+/// command reports that per path instead of failing the whole invocation, so
+/// `chmod 600 /mnt/etc/hosts /tmp/x` still fixes the ext2 file.
+pub(super) fn cmd_chmod(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.len() < 2 {
+        shell_println("chmod: usage: chmod OCTAL-MODE PATH...");
+        return;
+    }
+    let Ok(mode) = u32::from_str_radix(args[0], 8) else {
+        shell_println(&alloc::format!("chmod: invalid mode: '{}'", args[0]));
+        return;
+    };
+    if mode & !0o7777 != 0 {
+        shell_println(&alloc::format!(
+            "chmod: invalid mode: '{}' (only permission bits, e.g. 755)",
+            args[0]
+        ));
+        return;
+    }
+    for raw in &args[1..] {
+        let path = resolve_arg(raw);
+        match crate::vfs::lookup_path(&path) {
+            Ok(node) => match node.set_mode(mode) {
+                Ok(()) => {}
+                Err(crate::vfs::VfsError::NotSupported) => {
+                    shell_println(&alloc::format!(
+                        "chmod: {}: operation not supported (no on-disk mode)",
+                        path
+                    ));
+                }
+                Err(e) => shell_println(&alloc::format!("chmod: {}: {:?}", path, e)),
+            },
+            Err(_) => shell_println(&alloc::format!("chmod: {}: not found", path)),
+        }
+    }
+}
+
+/// `chown <uid>[:<gid>] <path>…`: change a node's owner and/or group.
+///
+/// The spec is Linux-shaped: `1000:1000` sets both, `1000` keeps the group and
+/// `:1000` keeps the owner. Only numeric ids are accepted — this kernel has no
+/// user database to resolve names against, and a bogus name should fail rather
+/// than silently become uid 0. Like [`cmd_chmod`], paths without on-disk
+/// metadata answer `NotSupported` per path and the remaining paths are still
+/// tried.
+pub(super) fn cmd_chown(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.len() < 2 {
+        shell_println("chown: usage: chown UID[:GID] PATH...");
+        return;
+    }
+    let spec = args[0];
+    let (uid_part, gid_part) = match spec.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (spec, None),
+    };
+    let uid = if uid_part.is_empty() {
+        None
+    } else {
+        match uid_part.parse::<u32>() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                shell_println(&alloc::format!(
+                    "chown: invalid user: '{}' (numeric uid expected)",
+                    uid_part
+                ));
+                return;
+            }
+        }
+    };
+    let gid = match gid_part {
+        None => None,
+        Some("") => None,
+        Some(g) => match g.parse::<u32>() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                shell_println(&alloc::format!(
+                    "chown: invalid group: '{}' (numeric gid expected)",
+                    g
+                ));
+                return;
+            }
+        },
+    };
+    if uid.is_none() && gid.is_none() {
+        shell_println("chown: usage: chown UID[:GID] PATH...");
+        return;
+    }
+    for raw in &args[1..] {
+        let path = resolve_arg(raw);
+        match crate::vfs::lookup_path(&path) {
+            Ok(node) => {
+                let (cur_uid, cur_gid) = node.owner();
+                let new_uid = uid.unwrap_or(cur_uid);
+                let new_gid = gid.unwrap_or(cur_gid);
+                match node.set_owner(new_uid, new_gid) {
+                    Ok(()) => {}
+                    Err(crate::vfs::VfsError::NotSupported) => {
+                        shell_println(&alloc::format!(
+                            "chown: {}: operation not supported (no on-disk owner)",
+                            path
+                        ));
+                    }
+                    Err(e) => shell_println(&alloc::format!("chown: {}: {:?}", path, e)),
+                }
+            }
+            Err(_) => shell_println(&alloc::format!("chown: {}: not found", path)),
+        }
+    }
+}
+
 /// `sleep <seconds>`: block the shell for the given whole number of seconds,
 /// halting between timer ticks instead of busy-spinning.
 pub(super) fn cmd_sleep(_ctx: &mut ShellCtx, args: &[&str]) {
