@@ -11,6 +11,7 @@ Framebuffer-shell с редактированием строки, историе
 | `mod.rs` | I/O-слой REPL: REPL-цикл (`shell_main`), диспетч через реестр, Tab, autorun, dual serial+framebuffer печать, status bar |
 | `commands.rs` | Тела всех команд (`cmd_help`, `cmd_ls`, `cmd_apt`, …) + хелперы `shell_println`, `resolve_arg`, `rm_path` и др. |
 | `cat.rs` | Чистое ядро `cat`: потоковое чтение чанками 256 Б с капом 64 KiB, дословный вывод и завершающий `\n`, если файл не заканчивается переводом строки (иначе следующий промпт приклеивался к последней строке файла — QA F-04) |
+| `texttools.rs` | Чистое ядро `head`/`tail`/`wc`/`grep`: один потоковый обход строк (чанки 256 Б, кап 4 MiB), ring на N строк для `tail`, счётчики для `wc`, ASCII case-fold подмножество для `grep -i`; сюда же тонкий VFS-слой этих четырёх команд |
 | `registry.rs` | Статическая таблица `COMMANDS: &[CommandSpec]`; `lookup()`, `command_names()` |
 | `editor.rs` | `LineEditor` — чистая буфер+курсор модель (курсор в чар-юнитах, cap 256) |
 | `history.rs` | `History` — bounded ring (CAP=64), recall вверх/вниз, stash текущей строки, дедуп подряд идущих |
@@ -93,14 +94,18 @@ Shift+букву строчной при выключенном CapsLock.
 
 ## Команды (полный список)
 
-`help`, `clear`, `echo`, `uptime`, `ls`, `cat` (cap 64 KiB; если файл не заканчивается
+`help`, `clear`, `echo`, `uptime`, `date` (RTC в UTC: ISO-время, день недели, unix-секунды),
+`ls [-l]`, `tree [-L N]` (рекурсивный ASCII-листинг с итогами), `cat` (cap 64 KiB; если файл не заканчивается
 `\n`, вывод завершается переводом строки, чтобы промпт не приклеился к последней строке),
+`head`/`tail` (`-n N`), `wc` (`-l -w -c`), `grep` (`-i -v -n -c`), `free` (RAM + kernel heap
+в busybox-раскладке, честные нули shared/buffers/swap),
 `mkdir`, `touch`, `write`
 (заменяет содержимое: `truncate(0)` + запись, поэтому короткий текст не оставляет хвоста),
 `rm` (`-r`/`-rf`, post-order, depth cap 24), `sync`, `fscrash` (демо journal replay:
 запись, ремоунт ext2, `journal.recover()`, верификация), `pci`, `exec` (встроенный
 тестовый ring-3 процесс), `ifconfig`, `ping`, `nc`, `selftest` (`test::run_all()`),
-`cd`, `pwd`, `cp` (cap 16 MiB), `mv` (только файлы), `stat`, `sleep`, `nano`, `lua`,
+`cd`, `pwd`, `cp` (cap 16 MiB), `mv` (только файлы), `stat`, `chmod` (октальный режим),
+`chown` (числовой `uid[:gid]`), `sleep`, `nano`, `lua`,
 `python`/`python3`, `pythonc`, `cargo`, `rustc`, `rustup`, `rust`, `paint`,
 `pkg <host> <path> [port]` (HTTP GET .deb → ar → decompress → tar → install в /mnt),
 `apt <update|install|show|list|setmirror>`, `lxrun <path> [args]` (Linux ELF в ring 3,
