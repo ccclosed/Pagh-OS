@@ -7,11 +7,11 @@ build. Git tags / GitHub releases exist for `2.17.0` (2026-11-10), `2.18.6`
 (2026-11-10) and the `2.18.12-demo` bundle (2026-11-11, the demo media captured from
 2.18.12); `2.17.1`, `2.17.2` and the `2.18.0`-`2.18.12` field-fix series are version
 bumps whose notes are recorded here and in `AGENTS.md`, and they roll into the next
-tagged release (`2.18.13`, open in PR #56). The full technical story of every release
+tagged release (`2.18.13`, merged as PR #56). The full technical story of every release
 is the release-note block in `AGENTS.md`; the paragraphs here name the user-visible
 change and point there rather than duplicating it.
 
-## 2.20.0 (in this stacked PR, not on `main` yet)
+## 2.20.0
 
 `/proc/<pid>/maps` stops claiming `00:00 0` for files. The map's `PT_LOAD` segments
 (image and interpreter) and file-backed `mmap`s now print the `st_dev`/`st_ino` and
@@ -27,7 +27,27 @@ nothing invented; DEVIATION-7 is narrowed to those cases. Contract: `docs/procfs
 guest ELF that maps its own file, reads `/proc/self/maps` and writes the dump for the
 harness to verify against the VFS.
 
-## 2.19.0 (in this PR, not on `main` yet)
+## 2.19.0
+
+Nine new shell commands plus `ls -l` and `-h` human units for `free`/`df`. `free` prints physical-memory total/used/free (the PMM
+frame counters) and the fixed kernel heap (region size, bytes handed out,
+remainder) in busybox `free` layout and KiB units; `/proc/meminfo` already gave
+programs `MemTotal`/`MemFree`, but the shell had no view and meminfo has no heap
+row, and `free` reads the same PMM counters so the two cannot disagree. `date`
+prints the CMOS RTC wall clock in UTC (ISO date/time, weekday, Unix seconds) —
+`uptime` only ever showed monotonic ticks. `ls -l` prints mode, links,
+owner/group, size and symlink targets in long form (no timestamp column: the VFS
+has no mtime). `chmod` sets the permission bits `ls -l` prints: ext2 persists
+them, filesystems without on-disk metadata report "operation not supported" per
+path. `chown` sets the owner/group the same way (numeric ids; ext2 persists,
+other filesystems report per path). `tree` prints a recursive ASCII listing with
+a counts trailer. `head`, `tail`, `wc` and `grep`
+inspect a file without dumping it — first/last N lines,
+line/word/byte counts, and the lines matching a pattern — through one streaming
+walk with a 4 MiB cap and a transcript-terminating last line. The limits are
+stated rather than stubbed: `shared`, `buffers` and `Swap` read zero because this
+kernel has no shared-memory accounting, no block cache and no swap device. Full
+story: `AGENTS.md`, 2.19.0.
 
 The per-thread procfs view. `/proc/<pid>/task/` and `/proc/self/task/` now list one
 numeric directory per **live task of the process's thread group** — pagh has real
@@ -44,7 +64,7 @@ inode identity and the deviations the model keeps) in `docs/procfs.md` §13; evi
 the `procfs::per-thread task directories` in-QEMU selftest, real-`clone` `lx_selftest`
 checks (thread listing and thread-exit shrink) and `properties/procfs_task.rs`.
 
-## 2.18.13 (in PR #56, not on `main` yet)
+## 2.18.13
 
 xHCI diagnostics: the Supported Protocol PORT INFO word is now parsed as the spec
 defines it (PSIC in bits 31:28, count in 15:8, 1-based offset in 7:0). The old parser

@@ -91,16 +91,40 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_uptime,
     },
     CommandSpec {
+        name: "date",
+        description: "Show the wall clock (UTC) and Unix seconds",
+        usage: "date",
+        handler: super::commands::cmd_date,
+    },
+    CommandSpec {
         name: "ls",
-        description: "List directory entries",
-        usage: "ls [path]",
+        description: "List a directory; -l shows mode, links, owner and size",
+        usage: "ls [-l] [path]",
         handler: super::commands::cmd_ls,
+    },
+    CommandSpec {
+        name: "tree",
+        description: "Recursive directory listing (depth-limited)",
+        usage: "tree [-L DEPTH] [PATH]",
+        handler: super::commands::cmd_tree,
     },
     CommandSpec {
         name: "cat",
         description: "Print file contents",
         usage: "cat <path>",
         handler: super::commands::cmd_cat,
+    },
+    CommandSpec {
+        name: "chmod",
+        description: "Change permission bits of files (octal mode)",
+        usage: "chmod OCTAL-MODE PATH...",
+        handler: super::commands::cmd_chmod,
+    },
+    CommandSpec {
+        name: "chown",
+        description: "Change owner and group of files (numeric uid[:gid])",
+        usage: "chown UID[:GID] PATH...",
+        handler: super::commands::cmd_chown,
     },
     CommandSpec {
         name: "mkdir",
@@ -161,6 +185,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         description: "Show mounted filesystems and capacity",
         usage: "df",
         handler: super::commands::cmd_df,
+    },
+    CommandSpec {
+        name: "free",
+        description: "Show physical memory and kernel heap usage",
+        usage: "free",
+        handler: super::commands::cmd_free,
     },
     CommandSpec {
         name: "ps",
@@ -227,6 +257,30 @@ pub static COMMANDS: &[CommandSpec] = &[
         description: "Print the current directory",
         usage: "pwd",
         handler: super::commands::cmd_pwd,
+    },
+    CommandSpec {
+        name: "head",
+        description: "Print the first lines of a file",
+        usage: "head [-n LINES] FILE",
+        handler: super::texttools::cmd_head,
+    },
+    CommandSpec {
+        name: "tail",
+        description: "Print the last lines of a file",
+        usage: "tail [-n LINES] FILE",
+        handler: super::texttools::cmd_tail,
+    },
+    CommandSpec {
+        name: "wc",
+        description: "Count lines, words and bytes in a file",
+        usage: "wc [-l] [-w] [-c] FILE",
+        handler: super::texttools::cmd_wc,
+    },
+    CommandSpec {
+        name: "grep",
+        description: "Print the lines of a file that contain PATTERN",
+        usage: "grep [-i] [-n] [-c] [-v] PATTERN FILE",
+        handler: super::texttools::cmd_grep,
     },
     CommandSpec {
         name: "cp",

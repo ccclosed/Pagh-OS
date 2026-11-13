@@ -7306,6 +7306,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             shell_prop_tests::unit_cat_stream_ends_transcript_on_fresh_line
         ),
         (
+            "shell::head, tail, wc, grep agree on the line model (Property 30)",
+            texttools_tests::text_tools_line_model
+        ),
+        (
             "entropy::AT_RANDOM blocks distinct and non-degenerate (issue #16)",
             at_random_tests::blocks_are_distinct_and_mixed
         ),
@@ -8776,5 +8780,205 @@ mod sysinfo_tests {
             "load 1.00 converts to exactly one fixed-point unit"
         );
         assert_eq_kernel!(convert(0), 0, "load 0.00 converts to zero");
+    }
+}
+
+// ============================================================================
+// text inspection tools: the `head`/`tail`/`wc`/`grep` line model
+// ============================================================================
+
+/// The four text tools share one streaming walk (`shell::texttools::walk`), so
+/// they must agree on what a line is, where the file ends, and where a partial
+/// last line goes. These checks pin that model without a VFS or a console:
+/// synthetic readers feed exact byte sequences through the same functions the
+/// commands call, so a regression in the walk shows up as a wrong transcript
+/// here instead of as a confusing shell output.
+///
+/// Non-destructive: no VFS, no console, no task; it allocates only the small
+/// vectors these checks build and drops them.
+mod texttools_tests {
+    use alloc::vec::Vec;
+
+    use crate::shell::texttools::{self, Counts, GrepOpts};
+
+    /// A synthetic file: `read` serves `data` in whatever chunk the walker asks
+    /// for, which is how the 256-byte chunk boundary gets exercised without a
+    /// physical file.
+    struct Reader<'a> {
+        data: &'a [u8],
+    }
+
+    impl Reader<'_> {
+        fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize, ()> {
+            let off = offset as usize;
+            if off >= self.data.len() {
+                return Ok(0);
+            }
+            let n = (self.data.len() - off).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[off..off + n]);
+            Ok(n)
+        }
+    }
+
+    fn head_of(data: &[u8], limit: usize) -> Vec<u8> {
+        let mut r = Reader { data };
+        let mut out = Vec::new();
+        texttools::head(limit, |o, b| r.read(o, b), |s| out.extend_from_slice(s));
+        out
+    }
+
+    fn tail_of(data: &[u8], limit: usize) -> Vec<u8> {
+        let mut r = Reader { data };
+        let mut out = Vec::new();
+        texttools::tail(limit, |o, b| r.read(o, b), |s| out.extend_from_slice(s));
+        out
+    }
+
+    fn wc_of(data: &[u8]) -> Counts {
+        let mut r = Reader { data };
+        texttools::word_count(|o, b| r.read(o, b))
+    }
+
+    fn grep_of(data: &[u8], pattern: &[u8], opts: GrepOpts) -> (Vec<u8>, u64) {
+        let mut r = Reader { data };
+        let mut out = Vec::new();
+        let g = texttools::grep(
+            pattern,
+            opts,
+            |o, b| r.read(o, b),
+            |s| out.extend_from_slice(s),
+        );
+        (out, g.matched)
+    }
+
+    /// One check per rule of the line model, plus the cases where a naive
+    /// implementation gets it wrong: the unterminated last line, an empty file,
+    /// a limit larger than the file, and a line that spans read chunks.
+    pub fn text_tools_line_model() {
+        // Three terminated lines: head takes the front, tail the back, and both
+        // terminate every emitted line.
+        assert_eq_kernel!(
+            head_of(b"a\nb\nc\n", 2).as_slice(),
+            b"a\nb\n".as_slice(),
+            "head: first two of three lines"
+        );
+        assert_eq_kernel!(
+            tail_of(b"a\nb\nc\n", 2).as_slice(),
+            b"b\nc\n".as_slice(),
+            "tail: last two of three lines"
+        );
+        // A limit past the file is the whole file, not a blank padded block.
+        assert_eq_kernel!(
+            tail_of(b"a\nb\n", 10).as_slice(),
+            b"a\nb\n".as_slice(),
+            "tail: limit larger than the file prints the whole file"
+        );
+        assert_eq_kernel!(
+            head_of(b"a\nb\n", 10).as_slice(),
+            b"a\nb\n".as_slice(),
+            "head: limit larger than the file prints the whole file"
+        );
+        // The last text run is a line even without a terminator, and the tools
+        // terminate it so the next prompt starts on a fresh row.
+        assert_eq_kernel!(
+            head_of(b"x\ny", 2).as_slice(),
+            b"x\ny\n".as_slice(),
+            "head: unterminated last line is printed and terminated"
+        );
+        assert_eq_kernel!(
+            tail_of(b"a\nb\nc", 2).as_slice(),
+            b"b\nc\n".as_slice(),
+            "tail: unterminated last line is included"
+        );
+        // A trailing newline does NOT create an empty last line.
+        assert_eq_kernel!(
+            tail_of(b"a\n", 5).as_slice(),
+            b"a\n".as_slice(),
+            "tail: a final newline does not add an empty line"
+        );
+        // Empty file: no bytes, no lines, and `head -n 0` reads nothing.
+        assert_eq_kernel!(
+            head_of(b"", 10).as_slice(),
+            b"".as_slice(),
+            "head: empty file"
+        );
+        assert_eq_kernel!(
+            head_of(b"a\n", 0).as_slice(),
+            b"".as_slice(),
+            "head: -n 0 prints nothing"
+        );
+
+        // wc: lines are newline characters, words are non-whitespace runs, bytes
+        // are the bytes read. `a b\nc` is one line, three words, five bytes.
+        let c = wc_of(b"one two\nthree\n");
+        assert_eq_kernel!(c.lines, 2, "wc: two newline-terminated lines");
+        assert_eq_kernel!(c.words, 3, "wc: three whitespace-separated words");
+        assert_eq_kernel!(c.bytes, 14, "wc: fourteen bytes");
+        let c = wc_of(b"a b\nc");
+        assert_eq_kernel!(c.lines, 1, "wc: a final partial line is not a newline");
+        assert_eq_kernel!(c.words, 3, "wc: the final partial line still has words");
+        assert_eq_kernel!(c.bytes, 5, "wc: five bytes");
+        let c = wc_of(b"");
+        assert_eq_kernel!(
+            (c.lines, c.words, c.bytes),
+            (0, 0, 0),
+            "wc: empty file is all zeros"
+        );
+
+        // grep: plain match, line numbers, case folding, inverted match and
+        // count-only are the five switches the handler advertises.
+        let (out, n) = grep_of(b"a\nb\nc\n", b"b", GrepOpts::default());
+        assert_eq_kernel!(out.as_slice(), b"b\n".as_slice(), "grep: prints matches");
+        assert_eq_kernel!(n, 1, "grep: one match counted");
+        let (out, n) = grep_of(
+            b"a\nb\nc\n",
+            b"b",
+            GrepOpts {
+                line_numbers: true,
+                ..GrepOpts::default()
+            },
+        );
+        assert_eq_kernel!(out.as_slice(), b"2:b\n".as_slice(), "grep -n: line number");
+        assert_eq_kernel!(n, 1, "grep -n: one match counted");
+        let (out, n) = grep_of(
+            b"a\nb\n",
+            b"B",
+            GrepOpts {
+                ignore_case: true,
+                ..GrepOpts::default()
+            },
+        );
+        assert_eq_kernel!(out.as_slice(), b"b\n".as_slice(), "grep -i: folds ASCII");
+        assert_eq_kernel!(n, 1, "grep -i: one match counted");
+        let (out, n) = grep_of(
+            b"a\nb\nc\n",
+            b"b",
+            GrepOpts {
+                invert: true,
+                ..GrepOpts::default()
+            },
+        );
+        assert_eq_kernel!(out.as_slice(), b"a\nc\n".as_slice(), "grep -v: skips match");
+        assert_eq_kernel!(n, 2, "grep -v: two non-matches counted");
+        let (out, n) = grep_of(
+            b"a\nb\nb\n",
+            b"b",
+            GrepOpts {
+                count_only: true,
+                ..GrepOpts::default()
+            },
+        );
+        assert_eq_kernel!(out.as_slice(), b"".as_slice(), "grep -c: prints no lines");
+        assert_eq_kernel!(n, 2, "grep -c: count is of matching lines");
+
+        // A line longer than the read chunk must come out whole: this is the
+        // case a chunk-boundary bug (dropping or repeating the split line)
+        // would turn into a corrupted file view.
+        let mut long = Vec::new();
+        long.extend(core::iter::repeat(b'x').take(600));
+        long.push(b'\n');
+        let out = head_of(&long, 1);
+        assert_eq_kernel!(out.len(), 601, "head: a 600-byte line spans chunks");
+        assert_eq_kernel!(out[600], b'\n', "head: the spanning line is terminated");
     }
 }
