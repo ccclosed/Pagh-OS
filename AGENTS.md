@@ -391,8 +391,13 @@ the full model is in `BRANCHING.md`.
     pagh-riscv 0.24.1, `ld-pagh`/`vsnprintf` F-rt-1…3 in pagh-libc 0.15.1, and
     the parser recursion F-rt-4 in pagh-python 0.9.1. `SECURITY.md` lists every
     fix with its evidence; no finding from that audit is left silently open.
-    The round-2 audit's package-installer alias bypass (F-r2-vfs-1) is closed in
-    2.22.5 above, with `attack/r2/vfs/attack-alias.deb` as its reproducer.
+    The second audit round is closed too: the x86 fork-COW ownership UAF
+    (F-r2-arch-1/2) in 2.22.4 and the package-installer hard-link alias bypass
+    (F-r2-vfs-1) in 2.22.5 above; RISC-V non-canonical pointers (F-r2-rv-1) in
+    pagh-riscv 0.24.2, unchecked `DT_INIT` calls (F-r2-libc-1) in pagh-libc
+    0.15.2, and evaluator/generator stack exhaustion (F-r2-py-1/2) in
+    pagh-python 0.9.2. `SECURITY.md` records all of them with evidence and lists
+    the round-2 `verified: no` leads that remain untriaged.
   **2.22.1** = the package installer is confined to its install root. A `.deb`
   could ship a symlink member and then a member *below* it; the installer resolved
   later members' parents through the package's own link in the guest namespace,
