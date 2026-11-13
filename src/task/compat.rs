@@ -618,6 +618,22 @@ pub fn group_member_pids(tgid: u64, except: u64) -> alloc::vec::Vec<u64> {
         .collect()
 }
 
+/// Every registered task of thread group `tgid`, the leader included, ascending
+/// (the registry is a `BTreeMap`, so iteration order is pid order).
+///
+/// This is the live thread list behind `/proc/<tgid>/task` (and
+/// `/proc/self/task`): pagh models a thread as a registered pid whose
+/// [`CompatState::tgid`] is its process id, so "threads of p" is exactly "pids
+/// whose `tgid == p`". The result is a SNAPSHOT — the registry lock is released
+/// before the caller turns the pids into VFS nodes (AGENTS.md invariant 4).
+pub fn thread_group_pids(tgid: u64) -> alloc::vec::Vec<u64> {
+    COMPAT_STATES
+        .lock()
+        .iter()
+        .filter_map(|(pid, s)| (s.tgid == tgid).then_some(*pid))
+        .collect()
+}
+
 /// Every registered pid in thread group `tgid`, the given pid included,
 /// ascending (the registry is a `BTreeMap`, so iteration order is pid order).
 ///

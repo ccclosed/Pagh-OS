@@ -307,6 +307,25 @@ pub fn pid_fdinfo_ino(pid: u64, fd: u32) -> u64 {
     pid_dir_ino(pid) + 0x1000 + fd as u64
 }
 
+/// Offset of the `/proc/<pid>/task` directory within the pid's inode stride.
+///
+/// Chosen below the fd symlink range (`+0x100`) and disjoint from the static
+/// file slots (`+1..=7`) and the fd/fdinfo directory offsets (`+0x10`, `+0x11`),
+/// so every entry below one pid directory keeps a unique, path-stable identity.
+pub const PROC_PID_TASK_DIR_OFFSET: u64 = 0x30;
+
+/// Stable inode of the `/proc/<pid>/task` directory.
+///
+/// A thread's own directory `/proc/<tgid>/task/<tid>` is deliberately **not**
+/// given a new inode: it is the same VFS object as `/proc/<tid>`, exactly as in
+/// Linux, where one task has one inode reachable through both paths. That is why
+/// this module has no `pid_task_tid_ino` — the kernel-facing node layer resolves
+/// `<tid>` to the existing pid directory ([`pid_dir_ino`]), and the two paths
+/// stat identically.
+pub fn pid_task_dir_ino(pid: u64) -> u64 {
+    pid_dir_ino(pid) + PROC_PID_TASK_DIR_OFFSET
+}
+
 /// One file under `/proc/<pid>`: a static name, its inode slot, and its kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcPidEntry {

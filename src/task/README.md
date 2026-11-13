@@ -34,7 +34,9 @@
   `spawn_linux_thread(regs, user_rsp)`, `RunError::{ArgsTooLarge, NotFound, LoadFailed, StackFailed}`.
 - `compat`: `CompatState`, `install_compat/remove_compat/with_current_compat`,
   `fork_current_compat/clone_current_compat`, `finish_compat_exit`, `reap_child/has_child`,
-  `compat_is_raw(pid)`, `compat_lock_held()`.
+  `compat_is_raw(pid)`, `compat_lock_held()`, `thread_group_pids(tgid)` (снапшот живых
+  тредов группы — источник `/proc/<pid>/task`, тот же набор, из которого `/proc/<pid>/status`
+  считает `Threads`).
 - `fd`: `OpenObject::{Console, Stdin, InetTcp, InetUdp, File, PipeRead/PipeWrite, Eventfd, Socket, UnixListener, UnixSocketUnbound, Epoll, Dir}`,
   `FdTable::{alloc, alloc_with_flags, get, close, dup, dup_min, dup_to, pipe, socketpair, set_cloexec, fdinfo_flags}`,
   `PipeEndpoint` c `PipeReadResult`/`PipeWriteResult`.
@@ -99,6 +101,10 @@
   `CLONE_THREAD` (vfork/posix_spawn) — сознательно ENOSYS, чтобы libuv шла через fork+exec.
 - Зомби: `finish_compat_exit` кладёт детей в `EXITED_CHILDREN`; `sys_wait4` опрашивает
   `reap_child`, уступая между проверками.
+- Треды: `clone_current_compat` регистрирует тред под его pid с общим `tgid` и общим
+  `Arc`-ом сигнальной таблицы; `/proc/<pid>/task` (`src/vfs/procfs.rs`, срез 6) листает
+  живые треды группы через `compat::thread_group_pids(tgid)`, а `task/<tid>` — это тот
+  же VFS-объект, что `/proc/<tid>` (контракт `docs/procfs.md` §13).
 - Креденшелы: `CompatState.creds` (шесть id, `Creds::ROOT` по умолчанию) — единственный
   владелец личности процесса; fork/clone наследуют, execve сохраняет (setuid-бинарей
   нет). Проверки прав — в syscall-слое (`arch/.../linux/cred.rs` +

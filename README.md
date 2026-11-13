@@ -239,7 +239,8 @@ server certificate chain, hostname and validity checked before a byte of the ind
   `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}`, the
   read-only `/proc/sys/kernel/{ostype,osrelease,hostname}` stubs, `/proc/self/*`
   and the per-pid tree `/proc/<pid>/{cmdline,stat,status,maps,cgroup,mountinfo,limits}`
-  plus `/proc/<pid>/{fd,fdinfo}/<n>`; `/proc/<pid>/fdinfo/<n>` reports the real
+  plus `/proc/<pid>/{fd,fdinfo}/<n>` and the per-thread view `/proc/<pid>/task/<tid>/`
+  (with `/proc/self/task`); `/proc/<pid>/fdinfo/<n>` reports the real
   `pos`/`flags`/`mnt_id`/`ino` of the descriptor.
 - **Packages:** a by-name `apt` (`update`/`install`/`show`/`list`/`setmirror`) that fetches
   a Debian `Packages` index over HTTP/HTTPS, streams gzip/xz/zstd decompression into a
@@ -639,12 +640,17 @@ python
   placeholder numbers; stdio/pipes/sockets, which have no VFS mount/inode,
   report the documented 0 sentinel. `/proc/<pid>/limits` renders the 16 Linux
   rlimit rows from the target's override table and the kernel defaults (stack
-  8 MiB, nofile 1024/1024, everything else `unlimited`). `/proc/loadavg` reports
+  8 MiB, nofile 1024/1024, everything else `unlimited`). The per-thread view is
+  `/proc/<pid>/task/` (and `/proc/self/task/`): one numeric directory per live
+  scheduler task of the process's thread group, ascending tid — a thread's
+  directory is the same VFS object as `/proc/<tid>`, so `stat`, `status`,
+  `cmdline` (and the rest of the pid files) are per-thread there. Still deferred:
+  mountinfo optional fields/statfs metadata and the Linux per-thread files this
+  kernel does not model (`sched`, `syscall`, per-thread `comm`). See
+  `docs/procfs.md` for the exact contract. `/proc/loadavg` reports
   real exponentially decayed 1/5/15-minute load averages (fixed point 16.16,
   displayed with two decimals) plus live runnable/total counts and the last allocated
-  pid. Still deferred:
-  `/proc/<pid>/task/*` and mountinfo optional fields/statfs metadata. See
-  `docs/procfs.md` for the exact contract. Signal
+  pid. Signal
   delivery is real both at the syscall-return point and on the timer-tick return
   (`signal::tick_action`, so a task that never enters a syscall is still signalled).
   See `LINUX-USERLAND.md` for the exact status.

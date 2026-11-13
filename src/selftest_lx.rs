@@ -285,6 +285,11 @@ pub fn run_post_net_checks() {
     // scheduled again (see the `REENTRY_ALLOWED` note in `linux::mod`). A spawned
     // kernel thread is schedulable, so waiting here is safe (and the same reason
     // every other waiting check in this file lives in a spawned harness).
+    // Slice 6: the per-thread procfs view over a REAL threaded guest process.
+    // First, because it needs no network and it spawns/kills a process that must
+    // not be alive while the apt install runs.
+    check_thread_task_dir();
+    check_thread_exit_task_dir();
     check_tick_delivery();
     run_apt_e2e();
     // Give the scheduler a window to run the just-enqueued hello-pagh process so
@@ -1562,6 +1567,573 @@ fn build_linux_test_elf() -> Vec<u8> {
     debug_assert_eq!(elf.len() as u64, total_len);
 
     elf
+}
+
+/// Virtual base shared by the hand-built guest fixtures in this file.
+const FIXTURE_VBASE: u64 = 0x40_0000;
+/// Total span of a fixture image: the loader zero-fills `[p_filesz, p_memsz)`,
+/// which is where the clone fixtures put their child stacks.
+const FIXTURE_MEMSZ: u64 = 0x4000;
+/// Top (16-byte aligned) of the clone fixtures' child stack, inside the image.
+const FIXTURE_STACK_TOP: u64 = FIXTURE_VBASE + FIXTURE_MEMSZ - 0x10;
+/// `CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
+/// CLONE_SYSVSEM | SIGCHLD` — the thread-clone shape `sys_clone` supports.
+const FIXTURE_CLONE_FLAGS: u32 = 0x0005_0F11;
+
+/// A one-segment RWX static ELF, assembled in the kernel: `code` first (the
+/// entry point), `data` right after it, one `PT_LOAD` spanning `memsz` bytes.
+/// The same shape as [`build_linux_test_elf`], but reusable for the fixtures
+/// below, whose behaviour is a few hand-encoded instructions each.
+struct StaticElf {
+    bytes: Vec<u8>,
+    /// Guest virtual address of the first byte of `data`.
+    data_addr: u64,
+}
+
+fn build_rwx_static_elf(code: &[u8], data: &[u8], memsz: u64) -> StaticElf {
+    const EHSIZE: usize = 64;
+    const PHSIZE: usize = 56;
+    const CODE_OFF: usize = EHSIZE + PHSIZE;
+
+    let entry = FIXTURE_VBASE + CODE_OFF as u64;
+    let data_addr = entry + code.len() as u64;
+    let total_len = (CODE_OFF + code.len() + data.len()) as u64;
+    debug_assert!(total_len <= memsz);
+
+    let mut elf: Vec<u8> = Vec::with_capacity(total_len as usize);
+    // ELF64 header (64 bytes).
+    elf.extend_from_slice(&[0x7F, b'E', b'L', b'F']);
+    elf.push(2); // ELFCLASS64
+    elf.push(1); // ELFDATA2LSB
+    elf.push(1); // EI_VERSION
+    elf.push(0); // System V
+    elf.extend_from_slice(&[0u8; 8]); // EI_ABIVERSION + padding
+    elf.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+    elf.extend_from_slice(&0x3Eu16.to_le_bytes()); // e_machine = EM_X86_64
+    elf.extend_from_slice(&1u32.to_le_bytes()); // e_version
+    elf.extend_from_slice(&entry.to_le_bytes()); // e_entry
+    elf.extend_from_slice(&(EHSIZE as u64).to_le_bytes()); // e_phoff
+    elf.extend_from_slice(&0u64.to_le_bytes()); // e_shoff
+    elf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    elf.extend_from_slice(&(EHSIZE as u16).to_le_bytes()); // e_ehsize
+    elf.extend_from_slice(&(PHSIZE as u16).to_le_bytes()); // e_phentsize
+    elf.extend_from_slice(&1u16.to_le_bytes()); // e_phnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+    debug_assert_eq!(elf.len(), EHSIZE);
+
+    // Program header (56 bytes): PT_LOAD PF_R|PF_W|PF_X, filesz < memsz.
+    elf.extend_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    elf.extend_from_slice(&7u32.to_le_bytes()); // PF_R|PF_W|PF_X
+    elf.extend_from_slice(&0u64.to_le_bytes()); // p_offset
+    elf.extend_from_slice(&FIXTURE_VBASE.to_le_bytes()); // p_vaddr
+    elf.extend_from_slice(&FIXTURE_VBASE.to_le_bytes()); // p_paddr
+    elf.extend_from_slice(&total_len.to_le_bytes()); // p_filesz
+    elf.extend_from_slice(&memsz.to_le_bytes()); // p_memsz
+    elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
+    debug_assert_eq!(elf.len(), EHSIZE + PHSIZE);
+
+    elf.extend_from_slice(code);
+    elf.extend_from_slice(data);
+    debug_assert_eq!(elf.len() as u64, total_len);
+    StaticElf {
+        bytes: elf,
+        data_addr,
+    }
+}
+
+/// Static guest ELF for [`check_thread_task_dir`]: a thread clone, both threads
+/// then park forever in a `pause; jmp` loop, so the harness observes a live
+/// two-task thread group and ends it through the real `SIGKILL` path (never by
+/// yanking the scheduler). That is what makes the check evidence that
+/// `/proc/<pid>/task` lists REAL `clone(CLONE_THREAD)` tasks, not registry
+/// entries the test wrote itself.
+fn build_thread_test_elf() -> Vec<u8> {
+    let mut code: Vec<u8> = Vec::with_capacity(29);
+    code.push(0xBF); // mov edi, CLONE_FLAGS
+    code.extend_from_slice(&FIXTURE_CLONE_FLAGS.to_le_bytes());
+    code.push(0xBE); // mov esi, STACK_TOP (the child's initial rsp)
+    code.extend_from_slice(&(FIXTURE_STACK_TOP as u32).to_le_bytes());
+    code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx    (parent_tid = NULL)
+    code.extend_from_slice(&[0x45, 0x31, 0xD2]); // xor r10d, r10d (child_tid = NULL)
+    code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d   (tls = NULL)
+    code.extend_from_slice(&[0xB8, 0x38, 0x00, 0x00, 0x00]); // mov eax, 56 (clone)
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+                                           // Both threads land here: pause; jmp -4 (back to the pause).
+    code.extend_from_slice(&[0xF3, 0x90, 0xEB, 0xFC]);
+    debug_assert_eq!(code.len(), 29);
+    build_rwx_static_elf(&code, &[], FIXTURE_MEMSZ).bytes
+}
+
+/// Static guest ELF for [`check_thread_exit_task_dir`]: the parent thread parks,
+/// the cloned thread runs for ~2 s and then exits with syscall 60 — which, in
+/// this kernel, terminates ONLY that task (`sys_exit`, R7.2). The harness
+/// therefore sees `/proc/<pid>/task` shrink from two entries to one while the
+/// process is still alive: that is the live-namespace claim of the slice, not a
+/// one-shot listing.
+///
+/// The delay is a **user-space busy wait** on `clock_gettime(CLOCK_MONOTONIC)`,
+/// deliberately not `nanosleep`: this fixture must not depend on any another
+/// blocking syscall being correct for a cloned task, and a non-blocking syscall
+/// loop gives an exact, profile-independent 2 s window (the first version slept
+/// in the child and observed neither the wake-up nor the exit, which says
+/// nothing about `/proc`).
+///
+/// Both paths write a one-byte stage marker to fd 1 (`P` = parent parked,
+/// `A` = cloned thread running, `B` = cloned thread done waiting) so a serial
+/// log can tell "the child never resumed" from "the child never exited".
+fn build_thread_exit_test_elf() -> Vec<u8> {
+    const ENTRY: u64 = FIXTURE_VBASE + 64 + 56;
+    /// `CLOCK_MONOTONIC`.
+    const CLOCK_MONOTONIC: u32 = 1;
+    /// `__NR_clock_gettime`.
+    const SYS_CLOCK_GETTIME: u32 = 228;
+    /// Seconds the child waits before exiting.
+    const WAIT_SECS: i64 = 2;
+
+    // write(1, marker, 1) — 22 bytes; fd 1 is the console/serial in this image.
+    let write_marker = |code: &mut Vec<u8>, addr: u64| {
+        code.push(0xBE); // mov esi, addr
+        code.extend_from_slice(&(addr as u32).to_le_bytes());
+        code.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1
+        code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]); // mov edi, 1
+        code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1 (write)
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    };
+    let exit_with = |code: &mut Vec<u8>, status: u32| {
+        code.extend_from_slice(&[0xBF]); // mov edi, status
+        code.extend_from_slice(&status.to_le_bytes());
+        code.extend_from_slice(&[0xB8, 0x3C, 0x00, 0x00, 0x00]); // mov eax, 60 (exit)
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    };
+    let clock_gettime = |code: &mut Vec<u8>, slot: u64| {
+        code.extend_from_slice(&[0xBF]); // mov edi, CLOCK_MONOTONIC
+        code.extend_from_slice(&CLOCK_MONOTONIC.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xBE]); // mov rsi, slot
+        code.extend_from_slice(&slot.to_le_bytes());
+        code.extend_from_slice(&[0xB8]); // mov eax, SYS_CLOCK_GETTIME
+        code.extend_from_slice(&SYS_CLOCK_GETTIME.to_le_bytes());
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    };
+
+    // Two-pass build: the code embeds absolute guest addresses of its own data,
+    // and the data offset depends on the code length. The first pass is only a
+    // length probe (placeholder addresses), so a later edit that changes the
+    // instruction count cannot silently shift the data — the exact class of bug
+    // that made an earlier version of this fixture sleep on a garbage timespec.
+    let build = |start_slot: u64,
+                 now_slot: u64,
+                 marker_a: u64,
+                 marker_b: u64,
+                 marker_c: u64,
+                 marker_p: u64|
+     -> Vec<u8> {
+        let mut code: Vec<u8> = Vec::with_capacity(256);
+        code.push(0xBF); // mov edi, CLONE_FLAGS
+        code.extend_from_slice(&FIXTURE_CLONE_FLAGS.to_le_bytes());
+        code.push(0xBE); // mov esi, STACK_TOP
+        code.extend_from_slice(&(FIXTURE_STACK_TOP as u32).to_le_bytes());
+        code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+        code.extend_from_slice(&[0x45, 0x31, 0xD2]); // xor r10d, r10d
+        code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+        code.extend_from_slice(&[0xB8, 0x38, 0x00, 0x00, 0x00]); // mov eax, 56 (clone)
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+        code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+        code.extend_from_slice(&[0x74, 26]); // jz parent_block_len -> child path
+                                             // Parent: mark P, then pause; jmp -4 (park forever).
+        write_marker(&mut code, marker_p);
+        code.extend_from_slice(&[0xF3, 0x90, 0xEB, 0xFC]);
+        // Child: mark A, sample the monotonic clock, mark C once the syscall
+        // returned, then poll it until WAIT_SECS have elapsed; mark B and
+        // exit(0). A negative clock_gettime result exits with status 7 so a
+        // serial log names the failure instead of hiding it in a spin loop.
+        write_marker(&mut code, marker_a);
+        clock_gettime(&mut code, start_slot);
+        code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+        code.extend_from_slice(&[0x79, 12]); // jns ok
+        exit_with(&mut code, 7); // clock_gettime(start) failed
+        write_marker(&mut code, marker_c);
+        let loop_start = code.len();
+        clock_gettime(&mut code, now_slot);
+        // rax = now.tv_sec - start.tv_sec (load now FIRST: `sub rax, rcx`
+        // computes rax - rcx, and the earlier build subtracted them the other
+        // way round, so the busy loop spun forever).
+        code.extend_from_slice(&[0x48, 0xA1]); // mov rax, [now_slot]
+        code.extend_from_slice(&now_slot.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x25]); // mov rcx, [start_slot]
+        code.extend_from_slice(&(start_slot as u32).to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x29, 0xC8]); // sub rax, rcx
+        code.extend_from_slice(&[0x48, 0x83, 0xF8]); // cmp rax, WAIT_SECS
+        code.push(WAIT_SECS as u8);
+        let back = (loop_start as i64) - (code.len() as i64 + 2);
+        code.extend_from_slice(&[0x7C, back as u8]); // jl loop_start
+        write_marker(&mut code, marker_b);
+        exit_with(&mut code, 0);
+        code
+    };
+
+    let probe = build(0, 0, 0, 0, 0, 0);
+    let data_addr = ENTRY + probe.len() as u64;
+    let start_slot = data_addr;
+    let now_slot = data_addr + 16;
+    let code = build(
+        start_slot,
+        now_slot,
+        data_addr + 32, // 'A'
+        data_addr + 34, // 'B'
+        data_addr + 35, // 'C'
+        data_addr + 33, // 'P'
+    );
+    debug_assert_eq!(code.len(), probe.len());
+
+    let mut data: Vec<u8> = Vec::with_capacity(36);
+    data.extend_from_slice(&[0u8; 32]); // start_slot + now_slot (written by the guest)
+    data.push(b'A');
+    data.push(b'P');
+    data.push(b'B');
+    data.push(b'C');
+    build_rwx_static_elf(&code, &data, FIXTURE_MEMSZ).bytes
+}
+
+/// Read a whole (small) VFS file as text; `None` when the path does not resolve.
+fn read_vfs_text(path: &str) -> Option<alloc::string::String> {
+    let node = vfs::lookup_path(path).ok()?;
+    let mut out: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 512];
+    let mut off = 0u64;
+    loop {
+        match node.read(off, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                off += n as u64;
+                if out.len() > 16 * 1024 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    Some(alloc::string::String::from_utf8_lossy(&out).into_owned())
+}
+
+/// The `Name:`-style value of a `/proc` text line, trimmed.
+fn proc_field(text: &str, key: &str) -> Option<alloc::string::String> {
+    text.lines()
+        .find(|l| l.starts_with(key))
+        .map(|l| alloc::string::String::from(l[key.len()..].trim()))
+}
+
+/// The entries of a (procfs) directory as names, in the kernel's readdir order.
+/// An unresolvable directory reads as empty — callers check the length.
+fn dir_names(dir: &str) -> Vec<alloc::string::String> {
+    match vfs::lookup_path(dir) {
+        Ok(node) => node
+            .readdir()
+            .map(|children| {
+                children
+                    .iter()
+                    .map(|c| alloc::string::String::from(c.name()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Slice 6 (`docs/procfs.md` §13): `/proc/<pid>/task` over a REAL thread clone.
+///
+/// Runs in the post-network harness because it waits on ticks (a spawned kernel
+/// thread; `run()` executes on the boot thread and must not sleep — see
+/// [`run_post_net_checks`]). Steps: build + write a static ELF that clones a
+/// thread and parks both threads, spawn it, wait until `/proc/<pid>/task` lists
+/// exactly two live tasks, verify the per-thread files (`stat` pid/comm/field 20,
+/// `status` Tgid/Pid/Threads, inherited `cmdline`, inode identity), then terminate
+/// the group with the real `SIGKILL` path and confirm the directory disappears.
+fn check_thread_task_dir() {
+    let name = "thread_task_dir";
+
+    let elf = build_thread_test_elf();
+    if let Err(d) = write_mnt_file("lxthread", &elf) {
+        fail(name, d);
+        return;
+    }
+    let pid = match run_linux_binary("/mnt/lxthread", &[b"lxthread"], &[]) {
+        Ok(pid) => pid,
+        Err(RunError::ArgsTooLarge) => return fail(name, "run returned ArgsTooLarge"),
+        Err(RunError::NotFound) => return fail(name, "run returned NotFound"),
+        Err(RunError::LoadFailed(c)) => return fail(name, c),
+        Err(RunError::StackFailed) => return fail(name, "run returned StackFailed"),
+    };
+    // The harness is not a wait4 parent of this test image: a zombie record for
+    // pid 1's "child" would outlive the check for no reason.
+    compat::with_pid_compat(pid, |cs| cs.waitable = false);
+
+    // ── Wait for the clone to land: two live tasks in the group ─────────────
+    let task_path = alloc::format!("/proc/{}/task", pid);
+    let mut listed: Vec<alloc::string::String> = Vec::new();
+    let deadline = scheduler::ticks() + 3 * crate::arch::x86_64::apic::TICK_HZ;
+    while scheduler::ticks() < deadline {
+        listed = match vfs::lookup_path(&task_path) {
+            Ok(node) => node
+                .readdir()
+                .map(|children| {
+                    children
+                        .iter()
+                        .map(|c| alloc::string::String::from(c.name()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            // The process may not have been scheduled yet (compat entry exists,
+            // so this is unexpected) — retry until the deadline.
+            Err(_) => Vec::new(),
+        };
+        if listed.len() >= 2 {
+            break;
+        }
+        scheduler::sleep_ticks(1);
+    }
+    if listed.len() != 2 {
+        let detail = alloc::format!("task dir lists {:?} (want the 2 cloned tasks)", listed);
+        // Do not leave the spinning process behind on this path.
+        let _ = crate::arch::x86_64::linux::signal::send_signal(
+            pid,
+            crate::arch::x86_64::linux::signal_frame::SIGKILL,
+        );
+        return fail(name, &detail);
+    }
+    // Parent is the task the launcher returned; the sibling is the clone.
+    let leader_name = alloc::format!("{}", pid);
+    let sibling = match listed.iter().find(|t| **t != leader_name) {
+        Some(t) => t.clone(),
+        None => {
+            let _ = crate::arch::x86_64::linux::signal::send_signal(
+                pid,
+                crate::arch::x86_64::linux::signal_frame::SIGKILL,
+            );
+            return fail(name, "task dir lists the leader twice / no sibling tid");
+        }
+    };
+
+    // ── Per-thread stat/status/cmdline of the CLONED task ───────────────────
+    let child_stat =
+        read_vfs_text(&alloc::format!("/proc/{}/task/{}/stat", pid, sibling)).unwrap_or_default();
+    let child_status =
+        read_vfs_text(&alloc::format!("/proc/{}/task/{}/status", pid, sibling)).unwrap_or_default();
+    let child_cmdline = read_vfs_text(&alloc::format!("/proc/{}/task/{}/cmdline", pid, sibling))
+        .unwrap_or_default();
+
+    let stat_pid_ok = child_stat
+        .split('(')
+        .next()
+        .map(|p| p.trim() == sibling)
+        .unwrap_or(false);
+    let stat_comm_ok = child_stat.contains("(lxthread)");
+    let stat_threads_ok = {
+        let close = child_stat.rfind(')').unwrap_or(0);
+        child_stat[close + 1..]
+            .split_whitespace()
+            .nth(17) // field 20 (num_threads): fields 3..52 start after the comm
+            .map(|f| f == "2")
+            .unwrap_or(false)
+    };
+    let status_tgid_ok =
+        proc_field(&child_status, "Tgid:").as_deref() == Some(alloc::format!("{}", pid).as_str());
+    let status_pid_ok = proc_field(&child_status, "Pid:").as_deref() == Some(sibling.as_str());
+    let status_threads_ok = proc_field(&child_status, "Threads:").as_deref() == Some("2");
+    let cmdline_ok = child_cmdline.as_bytes() == b"lxthread\0";
+    // The thread directory is the same VFS object as /proc/<tid>.
+    let same_inode = match (
+        vfs::lookup_path(&alloc::format!("/proc/{}/task/{}", pid, sibling)),
+        vfs::lookup_path(&alloc::format!("/proc/{}", sibling)),
+    ) {
+        (Ok(a), Ok(b)) => a.fs_ino() == b.fs_ino() && a.is_directory(),
+        _ => false,
+    };
+    // The process-level status agrees on the group size.
+    let proc_threads_ok = proc_field(
+        &read_vfs_text(&alloc::format!("/proc/{}/status", pid)).unwrap_or_default(),
+        "Threads:",
+    )
+    .as_deref()
+        == Some("2");
+
+    // ── End the group through the real kill path, then re-check ─────────────
+    let killed = crate::arch::x86_64::linux::signal::send_signal(
+        pid,
+        crate::arch::x86_64::linux::signal_frame::SIGKILL,
+    )
+    .is_ok();
+    let gone_deadline = scheduler::ticks() + crate::arch::x86_64::apic::TICK_HZ;
+    let mut gone = false;
+    while scheduler::ticks() < gone_deadline {
+        if vfs::lookup_path(&task_path).is_err() {
+            gone = true;
+            break;
+        }
+        scheduler::sleep_ticks(1);
+    }
+    // Drop the test image from `/mnt` so the rest of the harness sees a clean
+    // filesystem (the apt e2e runs right after this check).
+    if let Ok(dir) = vfs::lookup_path("/mnt") {
+        let _ = dir.remove("lxthread");
+    }
+
+    if stat_pid_ok
+        && stat_comm_ok
+        && stat_threads_ok
+        && status_tgid_ok
+        && status_pid_ok
+        && status_threads_ok
+        && cmdline_ok
+        && same_inode
+        && proc_threads_ok
+        && killed
+        && gone
+    {
+        pass(name);
+    } else {
+        let detail = alloc::format!(
+            "stat(pid={} comm={} threads={}) status(tgid={} pid={} threads={}) cmdline={} \
+             same_inode={} proc_threads={} killed={} gone={}",
+            stat_pid_ok,
+            stat_comm_ok,
+            stat_threads_ok,
+            status_tgid_ok,
+            status_pid_ok,
+            status_threads_ok,
+            cmdline_ok,
+            same_inode,
+            proc_threads_ok,
+            killed,
+            gone
+        );
+        fail(name, &detail);
+    }
+}
+
+/// Slice 6, liveness half (`docs/procfs.md` §13.2/§13.4): a thread that EXITS
+/// leaves its task directory.
+///
+/// `/proc/<pid>/task` is documented as "one directory per LIVE thread", not as a
+/// one-shot group listing. The fixture ([`build_thread_exit_test_elf`]) clones a
+/// thread whose user code sleeps 2 s and then calls `exit` (syscall 60, which
+/// terminates only that task in this kernel), while the parent parks. The check
+/// first observes two entries, then requires the directory to shrink to the
+/// leader, the exited tid's path to be `ENOENT` and the process's `Threads:` to
+/// be 1 — with the leader still alive throughout.
+fn check_thread_exit_task_dir() {
+    let name = "thread_exit_task";
+
+    let elf = build_thread_exit_test_elf();
+    if let Err(d) = write_mnt_file("lxthreadexit", &elf) {
+        fail(name, d);
+        return;
+    }
+    let pid = match run_linux_binary("/mnt/lxthreadexit", &[b"lxthreadexit"], &[]) {
+        Ok(pid) => pid,
+        Err(RunError::ArgsTooLarge) => return fail(name, "run returned ArgsTooLarge"),
+        Err(RunError::NotFound) => return fail(name, "run returned NotFound"),
+        Err(RunError::LoadFailed(c)) => return fail(name, c),
+        Err(RunError::StackFailed) => return fail(name, "run returned StackFailed"),
+    };
+    compat::with_pid_compat(pid, |cs| cs.waitable = false);
+    // A thread exit in this kernel notifies the creating task with SIGCHLD
+    // (Linux does not send SIGCHLD for a thread exit at all). For a parent
+    // spinning in USER mode that pending SIGCHLD hits a pre-existing tick
+    // delivery gap: `tick_action` handles `SIG_DFL|Term`, `SIG_DFL|Stop` and
+    // `SIG_IGN`, but not `SIG_DFL|Ignore`, so a default-ignore signal (SIGCHLD)
+    // falls through to handler delivery with handler = 0 and the task faults at
+    // RIP 0. Ignoring SIGCHLD explicitly — normal for a multi-threaded program
+    // and exactly what the process would do in userland — keeps this check about
+    // `/proc`, not about that signal-path gap (reported separately).
+    {
+        use crate::arch::x86_64::linux::signal_frame::{SignalAction, SIGCHLD, SIG_IGN};
+        compat::with_pid_compat(pid, |cs| {
+            cs.sig.lock().handlers[(SIGCHLD - 1) as usize] = SignalAction {
+                handler: SIG_IGN,
+                ..Default::default()
+            };
+        });
+    }
+
+    let task_path = alloc::format!("/proc/{}/task", pid);
+    let leader_name = alloc::format!("{}", pid);
+    let kill_group = || {
+        let _ = crate::arch::x86_64::linux::signal::send_signal(
+            pid,
+            crate::arch::x86_64::linux::signal_frame::SIGKILL,
+        );
+    };
+
+    // 1. The clone lands: two live tasks.
+    let deadline = scheduler::ticks() + 3 * crate::arch::x86_64::apic::TICK_HZ;
+    let mut sibling: Option<alloc::string::String> = None;
+    while scheduler::ticks() < deadline {
+        let listed = dir_names(&task_path);
+        if listed.len() == 2 {
+            sibling = listed.iter().find(|t| **t != leader_name).cloned();
+            break;
+        }
+        scheduler::sleep_ticks(1);
+    }
+    let Some(sibling) = sibling else {
+        kill_group();
+        return fail(
+            name,
+            "never observed the two-task group in /proc/<pid>/task",
+        );
+    };
+
+    // 2. The sleeping thread exits: the directory shrinks to the leader.
+    let deadline = scheduler::ticks() + 10 * crate::arch::x86_64::apic::TICK_HZ;
+    let mut shrunk = false;
+    while scheduler::ticks() < deadline {
+        let listed = dir_names(&task_path);
+        if listed.len() == 1 && listed[0] == leader_name {
+            shrunk = true;
+            break;
+        }
+        scheduler::sleep_ticks(1);
+    }
+
+    // 3. The exited tid's own directory is gone and the group size agrees.
+    let tid_gone = vfs::lookup_path(&alloc::format!("/proc/{}/task/{}", pid, sibling)).is_err();
+    let process_alive = crate::task::compat::compat_exists(pid);
+    let threads_one = {
+        let status = read_vfs_text(&alloc::format!("/proc/{}/status", pid)).unwrap_or_default();
+        proc_field(&status, "Threads:").as_deref() == Some("1")
+    };
+
+    // 4. End the leader and require the whole directory to disappear.
+    kill_group();
+    let gone_deadline = scheduler::ticks() + crate::arch::x86_64::apic::TICK_HZ;
+    let mut gone = false;
+    while scheduler::ticks() < gone_deadline {
+        if vfs::lookup_path(&task_path).is_err() {
+            gone = true;
+            break;
+        }
+        scheduler::sleep_ticks(1);
+    }
+    if let Ok(dir) = vfs::lookup_path("/mnt") {
+        let _ = dir.remove("lxthreadexit");
+    }
+
+    if shrunk && tid_gone && process_alive && threads_one && gone {
+        pass(name);
+    } else {
+        let detail = alloc::format!(
+            "shrunk={} tid_gone={} process_alive={} Threads==1:{} gone={}",
+            shrunk,
+            tid_gone,
+            process_alive,
+            threads_one,
+            gone
+        );
+        fail(name, &detail);
+    }
 }
 
 // ─────────────────────────────────── checks ──────────────────────────────────

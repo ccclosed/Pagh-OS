@@ -231,10 +231,10 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.19.0** (the `free`, `date`,
-  `head`, `tail`, `wc` and `grep` shell commands on top of the 2.18.13 batch:
-  `connect(2)` reply-and-close, the VT/console coordinates and the
-  kernel-thread rows in `ps`).
+  be reflected here. **`main` currently reads 2.19.0** (nine new shell commands
+  plus the per-thread procfs view, on top of the 2.18.13 batch: `connect(2)`
+  reply-and-close, the VT/console coordinates and the kernel-thread rows in
+  `ps`; the tag lands at the end of the batch).
   **2.19.0** = nine new shell commands, a long listing for `ls` and `-h` units, one batch
   of "ask the machine instead of reading a log":
   * `free` — physical memory total/used/free from the PMM frame counters plus
@@ -285,6 +285,19 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
     device (`/dev/serial`) cannot wedge the shell, `tail` keeps only N lines,
     `wc`/`grep` keep counters. `head`/`tail` always terminate the last line so
     the next prompt stays on its own row — the same transcript rule as `cat`.
+  * `procfs` — the per-thread procfs view. `/proc/<pid>/task/` (and
+    `/proc/self/task/`) list one directory per live task of the process's thread
+    group — pagh models a thread as a scheduled task registered under its own pid
+    with a shared `tgid` — and `/proc/<pid>/task/<tid>/` is **the same VFS object
+    as `/proc/<tid>`**, so `stat`, `status` and `cmdline` (plus the rest of the
+    pid-directory files) are the per-thread view with Linux's 52-field `stat`,
+    `Tgid`/`Pid`/`Threads` and inherited argv; `/proc/self/task` follows the
+    reader's own group and is `ENOENT` for a task without `CompatState`. A dead
+    pid, a task of another thread group and a non-numeric tid are all `ENOENT`
+    (no wildcard). Contract and deviations: `docs/procfs.md` §13; evidence is the
+    `procfs::per-thread task directories` selftest routine, the `lx_selftest`
+    real-`clone` checks (thread listing and thread-exit shrink) and
+    `properties/procfs_task.rs`.
   **2.17.0** = the batch that made pagh run on real hardware, plus three
   long-standing display/network defects:
   * a peer that answers and closes in one burst now completes `connect(2)`: the
