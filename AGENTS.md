@@ -231,23 +231,73 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.19.0** (the batch open with the
-  per-thread procfs view `/proc/<pid>/task/` + `/proc/self/task/`; 2.18.13
-  carried the `connect(2)` reply-and-close fix, the VT/console coordinate fix
-  and the kernel-thread rows in `ps`; the tag lands at the end of the batch).
-  **2.19.0** = the per-thread procfs view. `/proc/<pid>/task/` (and
-  `/proc/self/task/`) list one directory per live task of the process's thread
-  group — pagh models a thread as a scheduled task registered under its own pid
-  with a shared `tgid` — and `/proc/<pid>/task/<tid>/` is **the same VFS object
-  as `/proc/<tid>`**, so `stat`, `status` and `cmdline` (plus the rest of the
-  pid-directory files) are the per-thread view with Linux's 52-field `stat`,
-  `Tgid`/`Pid`/`Threads` and inherited argv; `/proc/self/task` follows the
-  reader's own group and is `ENOENT` for a task without `CompatState`. A dead
-  pid, a task of another thread group and a non-numeric tid are all `ENOENT`
-  (no wildcard). Contract and deviations: `docs/procfs.md` §13; evidence is the
-  `procfs::per-thread task directories` selftest routine, the `lx_selftest`
-  real-`clone` checks (thread listing and thread-exit shrink) and
-  `properties/procfs_task.rs`.
+  be reflected here. **`main` currently reads 2.19.0** (nine new shell commands
+  plus the per-thread procfs view, on top of the 2.18.13 batch: `connect(2)`
+  reply-and-close, the VT/console coordinates and the kernel-thread rows in
+  `ps`; the tag lands at the end of the batch).
+  **2.19.0** = nine new shell commands, a long listing for `ls` and `-h` units, one batch
+  of "ask the machine instead of reading a log":
+  * `free` — physical memory total/used/free from the PMM frame counters plus
+    the fixed kernel heap from the global allocator's counters, in the busybox
+    `free` layout and KiB. `/proc/meminfo` already exposed `MemTotal`/
+    `MemFree` to programs, but the shell had no view and meminfo has no heap
+    row; `free` reads the same PMM counters, so the two views cannot disagree,
+    and the `Heap` row makes heap growth observable (the region is mapped at
+    boot, so it always counts as `Mem used` — only the `Heap` row shows how
+    much is actually handed out). Truthful limits, not stubs: `shared` and
+    `buffers` are zeros because this kernel keeps no shared-memory accounting
+    and no block cache, and `Swap` is zero because there is no swap device.
+  * `date` — the CMOS RTC wall clock in UTC (ISO date/time, weekday and Unix
+    seconds). `uptime` only ever showed monotonic ticks, even though the same
+    RTC reader already feeds `clock_gettime(2)` and TLS validation; `date` is
+    that clock in the shell, so a transcript can be timestamped. NTP is not
+    implemented, and the kernel assumes the RTC keeps UTC everywhere, so a
+    machine set to local time shows it labelled `UTC` rather than a guessed
+    correction.
+  * `ls -l` — long listing: type letter + nine permission bits (with the
+    setuid/setgid/sticky markers in the execute slot), link count, owner,
+    group, size and name, plus `-> target` for symlinks. Deliberately no
+    timestamp column: `VfsNode` has no `mtime`, and a fake `Jan 1 1970` would
+    read as real data.
+  * `free -h` / `df -h` — the two memory/disk commands in coreutils' human
+    units (`992.9 MiB`, `1.0 GiB`), integer-arithmetic rounding to a tenth, so
+    the same numbers in a readable form. Unknown flags are rejected instead of
+    silently ignored.
+  * `chmod OCTAL-MODE PATH…` — set permission bits. The same nine bits plus
+    setuid/setgid/sticky that the VFS `set_mode` contract already stores: ext2
+    persists them (visible immediately in `ls -l`), while ramfs/`/dev`/`/proc`
+    answer "operation not supported" per path and the other paths are still
+    tried. Invalid octal (or a mode above `0o7777`) is rejected rather than
+    silently masked.
+  * `chown UID[:GID] PATH…` — set owner/group, Linux-shaped (`1000:1000`,
+    `1000` keeps group, `:1000` keeps owner), numeric ids only because the
+    kernel has no user database to resolve names against; a name fails instead
+    of silently becoming uid 0. ext2 persists the owner, other filesystems
+    answer per path as in `chmod`.
+  * `tree [-L N] PATH` — recursive listing, two ASCII spaces of indent per depth
+    and a `N directories, M files` trailer. ASCII because the console font has no
+    box-drawing glyphs; depth capped (default 4) and every level goes through
+    `readdir`, so a symlink loop cannot recurse without end.
+  * `head`, `tail`, `wc`, `grep` — inspect a file without dumping it: first or
+    last N lines, line/word/byte counts, and the lines containing a pattern
+    (`-i` `-n` `-c` `-v`). All four share one streaming walk
+    (`shell::texttools::walk`): 256-byte reads, a 4 MiB cap so an endless
+    device (`/dev/serial`) cannot wedge the shell, `tail` keeps only N lines,
+    `wc`/`grep` keep counters. `head`/`tail` always terminate the last line so
+    the next prompt stays on its own row — the same transcript rule as `cat`.
+  * `procfs` — the per-thread procfs view. `/proc/<pid>/task/` (and
+    `/proc/self/task/`) list one directory per live task of the process's thread
+    group — pagh models a thread as a scheduled task registered under its own pid
+    with a shared `tgid` — and `/proc/<pid>/task/<tid>/` is **the same VFS object
+    as `/proc/<tid>`**, so `stat`, `status` and `cmdline` (plus the rest of the
+    pid-directory files) are the per-thread view with Linux's 52-field `stat`,
+    `Tgid`/`Pid`/`Threads` and inherited argv; `/proc/self/task` follows the
+    reader's own group and is `ENOENT` for a task without `CompatState`. A dead
+    pid, a task of another thread group and a non-numeric tid are all `ENOENT`
+    (no wildcard). Contract and deviations: `docs/procfs.md` §13; evidence is the
+    `procfs::per-thread task directories` selftest routine, the `lx_selftest`
+    real-`clone` checks (thread listing and thread-exit shrink) and
+    `properties/procfs_task.rs`.
   **2.17.0** = the batch that made pagh run on real hardware, plus three
   long-standing display/network defects:
   * a peer that answers and closes in one burst now completes `connect(2)`: the
@@ -614,24 +664,19 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
 ## Known open gaps (good first issues, all documented in-code)
 
 
-- procfs covers slices 1–6 (issue #11, contract `docs/procfs.md`):
+- procfs covers slices 1–5 (issue #11, contract `docs/procfs.md`):
   `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}`,
   `/proc/<pid>/{cmdline,stat,status,maps,cgroup,mountinfo,limits}`,
-  `/proc/<pid>/task/<tid>/*` (the per-thread view; a thread directory is the same
-  VFS object as `/proc/<tid>`),
   `/proc/self/{exe,cmdline,status,maps,stat,statm,mounts,cgroup,mountinfo,limits}`
   and read-only `/proc/sys/kernel/{ostype,osrelease,hostname}` are rendered from
   live kernel state (CPUID, PMM counters, the tick clock, the scheduler's
   user/system/idle tick accounting and live task counts, and the target
-  process's `CompatState` snapshot). `/proc/self/task` and `/proc/<pid>/task`
-  list the live tasks of a thread group from the compat registry
-  (`compat::thread_group_pids`). `/proc/self/fd` and `/proc/<pid>/fd` expose
+  process's `CompatState` snapshot). `/proc/self/fd` and `/proc/<pid>/fd` expose
   the fd table as numeric symlinks; `/proc/<pid>/fdinfo/<n>` reports the real
   `pos`/`flags`/`mnt_id`/`ino` of an open descriptor (0 for objects with no VFS
   mount/inode), and `/proc/<pid>/limits` renders the 16 Linux rlimit rows from
-  the target's override table plus kernel defaults. Deferred: mountinfo optional
-  fields, statfs metadata and the Linux per-thread files the kernel does not
-  model (`sched`, `syscall`, per-thread `comm`).
+  the target's override table plus kernel defaults. Deferred: `/proc/<pid>/task/*`,
+  mountinfo optional fields and statfs metadata.
 - Signals (issue #12): `kill(2)` (nr 62), process-group addressing
   (`kill(0|-1|-pgid)`), `SIGSTOP`/`SIGCONT` scheduling, `wait4(WUNTRACED|WCONTINUED)`
   and timer-tick delivery to a syscall-free task are all implemented. SIGCHLD is

@@ -1,0 +1,79 @@
+# 2.19.0 shell-tool regression: memory, clock, text and metadata commands.
+#
+# Run from the repository root:
+#   python3 tools/e2e.py shell --script tools/e2e_shell_tools.script
+#
+# It boots the staged image, types the commands a user would, and asserts the
+# output from the serial log at the end. Every expect is a regular expression
+# over the raw serial text; keep them anchored on distinctive output, not on
+# column alignment (the columns are unit-tested separately by `Property 30` and
+# the live checks in pull request #66).
+
+# free: the three rows and their numeric columns.
+cmd free
+expect total\s+used\s+free\s+shared\s+buffers
+expect Mem:\s+\d+\s+\d+\s+\d+\s+0\s+0
+expect Swap:\s+0\s+0\s+0
+expect Heap:\s+\d+\s+\d+\s+\d+
+
+# free -h / df -h: the same commands in human units.
+cmd free -h
+expect Mem:\s+\d+\.\d (MiB|GiB)
+expect Heap:\s+\d+\.\d (KiB|MiB|GiB)
+cmd free -q
+expect free: unknown option: -q
+cmd df -h
+expect Filesystem\s+Size\s+Used\s+Avail
+expect \d+\.\d (KiB|MiB|GiB)
+cmd df -q
+expect df: unknown option: -q
+
+# date: ISO date/time, UTC, Unix seconds (the exact clock depends on the RTC).
+cmd date
+expect [A-Z][a-z]{2} \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC \(unix \d+\)
+
+# head/tail/wc/grep over the provisioned /mnt/etc/hosts (two lines).
+cmd head -n 1 /mnt/etc/hosts
+expect 127\.0\.0\.1 localhost
+cmd tail -n 1 /mnt/etc/hosts
+expect ::1 localhost
+cmd wc -l /mnt/etc/hosts
+expect 2 /mnt/etc/hosts
+cmd grep -n ::1 /mnt/etc/hosts
+expect 2:::1 localhost
+cmd head -n 2 /proc/meminfo
+expect MemTotal:\s+\d+ kB
+expect MemFree:\s+\d+ kB
+
+# tree: recursive listing with the counts trailer (depth 1 = /mnt entries only).
+cmd tree -L 1 /mnt
+expect etc/
+expect \d+ directories, \d+ files
+cmd tree /mnt/definitely-missing
+expect tree: /mnt/definitely-missing: not found
+
+# ls -l: mode word, link count, owner/group, size.
+cmd ls -l /mnt/etc/hosts
+expect -rw-r--r--\s+1\s+0\s+0\s+\d+ hosts
+
+# chmod round-trip: the mode word changes and comes back.
+cmd chmod 600 /mnt/etc/hosts
+cmd ls -l /mnt/etc/hosts
+expect -rw-------\s+1\s+0\s+0\s+\d+ hosts
+cmd chmod 644 /mnt/etc/hosts
+cmd ls -l /mnt/etc/hosts
+expect -rw-r--r--\s+1\s+0\s+0\s+\d+ hosts
+
+# chown round-trip: numeric uid:gid, then back to root.
+cmd chown 1000:1000 /mnt/etc/hosts
+cmd ls -l /mnt/etc/hosts
+expect 1000\s+1000\s+\d+ hosts
+cmd chown 0:0 /mnt/etc/hosts
+cmd ls -l /mnt/etc/hosts
+expect 0\s+0\s+\d+ hosts
+
+# Diagnostics: a missing file and an unsupported target.
+cmd head -n 1 /mnt/definitely-missing
+expect head: /mnt/definitely-missing: not found
+cmd chmod 600 /tmp
+expect chmod: /tmp: operation not supported

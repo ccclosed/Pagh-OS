@@ -29,7 +29,7 @@
 ### What works today
 
 - **Boot:** Limine/UEFI → 1280×800 framebuffer console with a coloured prompt and status bar.
-- **Shell:** line editing, history, tab completion, `ls`/`df`/`ifconfig`/`ps`, ext2 file ops, `selftest`.
+- **Shell:** line editing, history, tab completion, `ls`/`ls -l`/`tree`/`chmod`/`chown`/`df`/`free`/`date`/`head`/`tail`/`wc`/`grep`/`ifconfig`/`ps`, ext2 file ops, `selftest`.
 - **GUI apps:** the mouse-driven `paint` (shape tools, 16-colour palette, brush sizes, undo, save to ext2), the full-screen `nano+` editor, and `settings` with live colour themes + wallpapers.
 - **Storage:** ext2-compatible read/write filesystem with a write-ahead-log journal, on a real virtio-blk or NVMe disk (or a RAM disk carried on the boot medium).
 - **Networking:** the kernel's own e1000 + TCP/IP stack (DHCP/ARP/TCP/UDP; `ifconfig` shows the live lease).
@@ -414,13 +414,21 @@ framebuffer (serial stays plain text).
 | `clear`              | Clear the framebuffer screen                                    |
 | `echo …`             | Echo the arguments                                              |
 | `uptime`             | Show scheduler ticks (~1000 Hz)                                 |
+| `date`               | Show the RTC wall clock in UTC (ISO date, time, Unix seconds)   |
 | `pwd`                | Print the current working directory                             |
 | `cd [path]`          | Change directory (relative or absolute; no arg → `/`)           |
-| `ls [path]`          | List a directory (defaults to the CWD; dirs shown with `/`)     |
+| `ls [-l] [path]`     | List a directory; `-l` adds mode, links, owner/group and size  |
+| `tree [-L N] [path]` | Recursive listing, depth-limited (default 4), counts at the end |
 | `cat path`           | Print the contents of a file                                    |
+| `head [-n N] path`   | Print the first N lines of a file (default 10)                  |
+| `tail [-n N] path`   | Print the last N lines of a file (default 10)                   |
+| `wc [-l\|-w\|-c] path` | Count lines, words and bytes in a file                       |
+| `grep [-i] [-n] [-c] [-v] pattern path` | Print the lines of a file that contain pattern |
 | `cp src dst`         | Copy a file                                                     |
 | `mv src dst`         | Move/rename a file                                              |
 | `stat path`          | Show file/directory info                                        |
+| `chmod MODE path…`   | Change permission bits (octal, e.g. `chmod 644 file`)           |
+| `chown UID[:GID] path…` | Change owner/group (numeric; `chown 1000:1000 file`)         |
 | `mkdir path`         | Create a directory                                              |
 | `touch path`         | Create an empty file                                            |
 | `write path text`    | Write text to a file (journaled)                                |
@@ -443,7 +451,8 @@ framebuffer (serial stays plain text).
 | `disk [list\|setup\|mount <n>\|format <n> [--force]\|cancel]` | List block devices; format one as ext2 and mount it at `/mnt` |
 | `ifconfig`           | Show the network interface (IP, gateway, MAC)                   |
 | `ping <ip>`          | Send one ICMP echo request and print the RTT                    |
-| `df`                 | Mounted filesystems: 1K blocks, used, available, use%, mount point |
+| `df [-h]`            | Mounted filesystems: blocks/size, used, available, use%, mount point |
+| `free [-h]`          | RAM and kernel heap: total/used/free in KiB, `-h` for human units |
 | `ps`                 | Processes: PID, PPID, STAT, COMMAND — compat processes from `/proc/<pid>/*`, kernel threads as `[shell]`/`[net]`/`[usb]` |
 | `nc <ip> <port> [text]` | Open a TCP connection and echo a line over it                |
 | `jobs` / `fg` / `bg` | Shell job table; resume the most recent stopped job in the foreground / background |
