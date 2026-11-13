@@ -60,7 +60,7 @@ pub(super) fn shell_print_bytes(bytes: &[u8]) {
 /// `/mnt/...` behave exactly as before; relative inputs and `.`/`..` are folded
 /// against the CWD (R4.6, R9.5). All path-taking handlers route their user
 /// argument through this so relative paths work everywhere.
-fn resolve_arg(arg: &str) -> String {
+pub(super) fn resolve_arg(arg: &str) -> String {
     super::path::resolve(&super::path::cwd(), arg)
 }
 
@@ -136,6 +136,35 @@ pub(super) fn cmd_uptime(_ctx: &mut ShellCtx, _args: &[&str]) {
     );
 }
 
+/// `date`: print the CMOS RTC wall clock in UTC.
+///
+/// `uptime` reports monotonic ticks since boot; the shell had no way to see the
+/// actual time even though the same RTC reader already feeds
+/// `clock_gettime(2)` and TLS certificate validation. `date` prints that clock
+/// in ISO form plus the Unix seconds and the weekday, so a log line or a
+/// transcript can be timestamped without a userspace program.
+///
+/// The fields come from [`crate::arch::x86_64::linux::rtc::read_date`], i.e. the
+/// same read-twice guarded snapshot the kernel uses, so they belong to one
+/// consistent second. The kernel assumes the RTC keeps UTC everywhere (NTP is
+/// not implemented yet); a machine whose RTC is on local time will therefore
+/// show its local time labelled `UTC` — the command cannot guess which, and a
+/// wrong timezone is preferable to a made-up correction.
+pub(super) fn cmd_date(_ctx: &mut ShellCtx, _args: &[&str]) {
+    let d = crate::arch::x86_64::linux::rtc::read_date();
+    let secs = crate::arch::x86_64::linux::timeconv::civil_to_unix(
+        d.year, d.month, d.day, d.hour, d.minute, d.second,
+    );
+    let unix = if secs < 0 { 0 } else { secs as u64 };
+    // 1970-01-01 was a Thursday, so epoch day 0 is index 4.
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let weekday = WEEKDAYS[((unix / 86_400 + 4) % 7) as usize];
+    shell_println(&format!(
+        "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC (unix {})",
+        weekday, d.year, d.month, d.day, d.hour, d.minute, d.second, unix
+    ));
+}
+
 /// `pwd` (R4.2): print the absolute current working directory.
 pub(super) fn cmd_pwd(_ctx: &mut ShellCtx, _args: &[&str]) {
     shell_println(&super::path::cwd());
@@ -172,12 +201,27 @@ pub(super) fn cmd_cd(_ctx: &mut ShellCtx, args: &[&str]) {
 /// `ls [path]`: list a directory's entries (directories shown with a trailing
 /// `/`), or print a file's own name. Defaults to `/` when no path is given.
 pub(super) fn cmd_ls(_ctx: &mut ShellCtx, args: &[&str]) {
-    // No arg: list the current working directory (R9.2). With an arg, resolve
-    // it against the CWD so relative paths and `.`/`..` work (R4.6).
-    let path = if !args.is_empty() {
-        resolve_arg(args[0])
-    } else {
-        super::path::cwd()
+    // `-l`: long form — mode, links, owner/group, size, name. Anything else is a
+    // path. No path: the CWD (R9.2); a relative path resolves against the CWD so
+    // `.`/`..` work (R4.6).
+    let mut long = false;
+    let mut path_arg: Option<&str> = None;
+    for a in args {
+        if *a == "-l" {
+            long = true;
+        } else if a.starts_with('-') && a.len() > 1 && path_arg.is_none() {
+            shell_println(&alloc::format!("ls: unknown option: {}", a));
+            return;
+        } else if path_arg.is_none() {
+            path_arg = Some(a);
+        } else {
+            shell_println("ls: too many operands");
+            return;
+        }
+    }
+    let path = match path_arg {
+        Some(p) => resolve_arg(p),
+        None => super::path::cwd(),
     };
     match crate::vfs::lookup_path(&path) {
         Ok(node) => {
@@ -185,7 +229,9 @@ pub(super) fn cmd_ls(_ctx: &mut ShellCtx, args: &[&str]) {
                 match node.readdir() {
                     Ok(children) => {
                         for child in children.iter() {
-                            if child.is_directory() {
+                            if long {
+                                shell_println(&ls_long_line(&**child));
+                            } else if child.is_directory() {
                                 shell_println(&alloc::format!("{}/", child.name()));
                             } else {
                                 shell_println(child.name());
@@ -196,6 +242,9 @@ pub(super) fn cmd_ls(_ctx: &mut ShellCtx, args: &[&str]) {
                         shell_println(&alloc::format!("ls: {}: cannot read directory", path));
                     }
                 }
+            } else if long {
+                // `ls -l file`: the same line the directory listing would show.
+                shell_println(&ls_long_line(&*node));
             } else {
                 // Non-directory: print just its name, like `ls file`.
                 shell_println(node.name());
@@ -207,7 +256,161 @@ pub(super) fn cmd_ls(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `cat <path>`: print a file's contents, capping the total bytes read so an
+/// The `-rw-r--r--`-style mode word for `ls -l`: type letter, the nine
+/// permission bits, and the setuid/setgid/sticky markers in the execute slot
+/// (`s`/`S`/`t`/`T`), exactly like coreutils.
+///
+/// The kernel has no `mtime`/`ctime` accessor on `VfsNode`, so the long listing
+/// deliberately stops at mode/links/owner/size instead of printing a timestamp
+/// the VFS cannot supply (a fake `Jan 1 1970` column would read as real data).
+fn ls_mode_string(node: &dyn crate::vfs::VfsNode) -> alloc::string::String {
+    let mode = node.mode();
+    let type_char = if node.is_directory() {
+        'd'
+    } else if node.is_symlink() {
+        'l'
+    } else {
+        '-'
+    };
+    let mut out = alloc::string::String::with_capacity(10);
+    out.push(type_char);
+    // (read bit, write bit, execute bit, special bit, special-if-exec, special-if-not)
+    let triplets = [
+        (0o400u32, 0o200, 0o100, 0o4000u32, 's', 'S'), // user + setuid
+        (0o040, 0o020, 0o010, 0o2000u32, 's', 'S'),    // group + setgid
+        (0o004, 0o002, 0o001, 0o1000u32, 't', 'T'),    // other + sticky
+    ];
+    for (r, w, x, special_bit, special_x, special_no_x) in triplets {
+        out.push(if mode & r != 0 { 'r' } else { '-' });
+        out.push(if mode & w != 0 { 'w' } else { '-' });
+        let special = mode & special_bit != 0;
+        out.push(if special && mode & x != 0 {
+            special_x
+        } else if special {
+            special_no_x
+        } else if mode & x != 0 {
+            'x'
+        } else {
+            '-'
+        });
+    }
+    out
+}
+
+/// One `ls -l` row: mode, link count, owner, group, size, name (plus `-> target`
+/// for symlinks).
+fn ls_long_line(node: &dyn crate::vfs::VfsNode) -> alloc::string::String {
+    let (uid, gid) = node.owner();
+    let mut line = alloc::format!(
+        "{} {:>3} {:>5} {:>5} {:>9} {}",
+        ls_mode_string(node),
+        node.nlink(),
+        uid,
+        gid,
+        node.size(),
+        node.name()
+    );
+    if node.is_symlink() {
+        if let Some(target) = node.read_link() {
+            line.push_str(" -> ");
+            line.push_str(&target);
+        }
+    }
+    line
+}
+
+/// `tree [-L N] [path]`: recursive directory listing.
+///
+/// `ls` shows one level; the editor's sidebar shows a tree only while editing. This
+/// prints the whole tree below `path` (sorted, two spaces of indent per depth), which
+/// is what a human wants when looking around `/mnt` or a freshly unpacked package.
+///
+/// The rendering is ASCII on purpose: the console font covers ASCII 0x20..0x7E and
+/// has no box-drawing glyphs, so `|--`/backtick art would print as blanks.
+///
+/// Depth is capped by `-L` (default 4) and every directory is read through `readdir`,
+/// so a symlink loop cannot recurse without end. The counts in the trailer cover
+/// everything below the printed root, not the root itself.
+pub(super) fn cmd_tree(_ctx: &mut ShellCtx, args: &[&str]) {
+    let mut limit = 4usize;
+    let mut path_arg: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "-L" {
+            i += 1;
+            let Some(n) = args.get(i).and_then(|s| s.parse::<usize>().ok()) else {
+                shell_println("tree: usage: tree [-L DEPTH] [PATH]");
+                return;
+            };
+            limit = n;
+        } else if a.starts_with('-') && a.len() > 1 {
+            shell_println(&alloc::format!("tree: unknown option: {}", a));
+            return;
+        } else if path_arg.is_none() {
+            path_arg = Some(a);
+        } else {
+            shell_println("tree: too many operands");
+            return;
+        }
+        i += 1;
+    }
+    let path = match path_arg {
+        Some(p) => resolve_arg(p),
+        None => super::path::cwd(),
+    };
+    match crate::vfs::lookup_path(&path) {
+        Ok(node) => {
+            if node.is_directory() {
+                let (mut dirs, mut files) = (0usize, 0usize);
+                shell_println(&path);
+                tree_walk(&*node, "", 0, limit, &mut dirs, &mut files);
+                shell_println(&alloc::format!("{} directories, {} files", dirs, files));
+            } else {
+                shell_println(node.name());
+            }
+        }
+        Err(_) => shell_println(&alloc::format!("tree: {}: not found", path)),
+    }
+}
+
+/// Depth-first half of [`cmd_tree`]: print `node`'s children sorted by name, then
+/// recurse into the directories. A child whose `readdir` fails is printed but not
+/// descended into (the diagnostic clutter is not worth it for a listing command).
+fn tree_walk(
+    node: &dyn crate::vfs::VfsNode,
+    prefix: &str,
+    depth: usize,
+    limit: usize,
+    dirs: &mut usize,
+    files: &mut usize,
+) {
+    if depth >= limit {
+        return;
+    }
+    let Ok(children) = node.readdir() else {
+        return;
+    };
+    let mut items: alloc::vec::Vec<&alloc::sync::Arc<dyn crate::vfs::VfsNode>> =
+        children.iter().collect();
+    items.sort_by(|a, b| a.name().cmp(b.name()));
+    for child in items {
+        let is_dir = child.is_directory();
+        if is_dir {
+            *dirs += 1;
+            shell_println(&alloc::format!("{}{}/", prefix, child.name()));
+        } else {
+            *files += 1;
+            shell_println(&alloc::format!("{}{}", prefix, child.name()));
+        }
+        if is_dir {
+            let next = alloc::format!("{}  ", prefix);
+            tree_walk(&**child, &next, depth + 1, limit, dirs, files);
+        }
+    }
+}
+
+/// `cat <path>`: print a file's contents/// `cat <path>`: print a file's contents, capping the total bytes read so an
 /// endless device cannot spin forever, and end the transcript on a fresh line
 /// so the next prompt cannot be glued onto the file's last line.
 pub(super) fn cmd_cat(_ctx: &mut ShellCtx, args: &[&str]) {
@@ -858,6 +1061,122 @@ pub(super) fn cmd_stat(_ctx: &mut ShellCtx, args: &[&str]) {
             }
         }
         Err(_) => shell_println(&alloc::format!("stat: {}: not found", path)),
+    }
+}
+
+/// `chmod <octal-mode> <path>…`: change permission bits.
+///
+/// The bits are the same nine permission bits plus setuid/setgid/sticky that
+/// `chmod(2)` accepts (the VFS `set_mode` contract), so an octal argument is
+/// validated against `0o7777` and nothing else: a mode with higher bits set is a
+/// typo, not a request to stamp file-type bits from userspace. Filesystems
+/// without on-disk metadata (ramfs, `/dev`, `/proc`) answer `NotSupported`; the
+/// command reports that per path instead of failing the whole invocation, so
+/// `chmod 600 /mnt/etc/hosts /tmp/x` still fixes the ext2 file.
+pub(super) fn cmd_chmod(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.len() < 2 {
+        shell_println("chmod: usage: chmod OCTAL-MODE PATH...");
+        return;
+    }
+    let Ok(mode) = u32::from_str_radix(args[0], 8) else {
+        shell_println(&alloc::format!("chmod: invalid mode: '{}'", args[0]));
+        return;
+    };
+    if mode & !0o7777 != 0 {
+        shell_println(&alloc::format!(
+            "chmod: invalid mode: '{}' (only permission bits, e.g. 755)",
+            args[0]
+        ));
+        return;
+    }
+    for raw in &args[1..] {
+        let path = resolve_arg(raw);
+        match crate::vfs::lookup_path(&path) {
+            Ok(node) => match node.set_mode(mode) {
+                Ok(()) => {}
+                Err(crate::vfs::VfsError::NotSupported) => {
+                    shell_println(&alloc::format!(
+                        "chmod: {}: operation not supported (no on-disk mode)",
+                        path
+                    ));
+                }
+                Err(e) => shell_println(&alloc::format!("chmod: {}: {:?}", path, e)),
+            },
+            Err(_) => shell_println(&alloc::format!("chmod: {}: not found", path)),
+        }
+    }
+}
+
+/// `chown <uid>[:<gid>] <path>…`: change a node's owner and/or group.
+///
+/// The spec is Linux-shaped: `1000:1000` sets both, `1000` keeps the group and
+/// `:1000` keeps the owner. Only numeric ids are accepted — this kernel has no
+/// user database to resolve names against, and a bogus name should fail rather
+/// than silently become uid 0. Like [`cmd_chmod`], paths without on-disk
+/// metadata answer `NotSupported` per path and the remaining paths are still
+/// tried.
+pub(super) fn cmd_chown(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.len() < 2 {
+        shell_println("chown: usage: chown UID[:GID] PATH...");
+        return;
+    }
+    let spec = args[0];
+    let (uid_part, gid_part) = match spec.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (spec, None),
+    };
+    let uid = if uid_part.is_empty() {
+        None
+    } else {
+        match uid_part.parse::<u32>() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                shell_println(&alloc::format!(
+                    "chown: invalid user: '{}' (numeric uid expected)",
+                    uid_part
+                ));
+                return;
+            }
+        }
+    };
+    let gid = match gid_part {
+        None => None,
+        Some("") => None,
+        Some(g) => match g.parse::<u32>() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                shell_println(&alloc::format!(
+                    "chown: invalid group: '{}' (numeric gid expected)",
+                    g
+                ));
+                return;
+            }
+        },
+    };
+    if uid.is_none() && gid.is_none() {
+        shell_println("chown: usage: chown UID[:GID] PATH...");
+        return;
+    }
+    for raw in &args[1..] {
+        let path = resolve_arg(raw);
+        match crate::vfs::lookup_path(&path) {
+            Ok(node) => {
+                let (cur_uid, cur_gid) = node.owner();
+                let new_uid = uid.unwrap_or(cur_uid);
+                let new_gid = gid.unwrap_or(cur_gid);
+                match node.set_owner(new_uid, new_gid) {
+                    Ok(()) => {}
+                    Err(crate::vfs::VfsError::NotSupported) => {
+                        shell_println(&alloc::format!(
+                            "chown: {}: operation not supported (no on-disk owner)",
+                            path
+                        ));
+                    }
+                    Err(e) => shell_println(&alloc::format!("chown: {}: {:?}", path, e)),
+                }
+            }
+            Err(_) => shell_println(&alloc::format!("chown: {}: not found", path)),
+        }
     }
 }
 
@@ -1719,8 +2038,29 @@ pub(super) fn cmd_disk(_ctx: &mut ShellCtx, args: &[&str]) {
     crate::shell::disk::cmd(args);
 }
 
-pub(super) fn cmd_df(_ctx: &mut ShellCtx, _args: &[&str]) {
-    shell_println("Filesystem     1K-blocks  Used Available Use% Mounted on");
+pub(super) fn cmd_df(_ctx: &mut ShellCtx, args: &[&str]) {
+    let mut human = false;
+    for a in args {
+        if *a == "-h" {
+            human = true;
+        } else {
+            shell_println(&alloc::format!("df: unknown option: {}", a));
+            shell_println("df: usage: df [-h]");
+            return;
+        }
+    }
+    if human {
+        shell_println("Filesystem       Size   Used  Avail Use% Mounted on");
+    } else {
+        shell_println("Filesystem     1K-blocks  Used Available Use% Mounted on");
+    }
+    let size_cell = |bytes: u64| -> alloc::string::String {
+        if human {
+            human_size(bytes.saturating_mul(1024))
+        } else {
+            alloc::format!("{}", bytes)
+        }
+    };
     for mount in crate::vfs::mount_snapshot() {
         let fs = mount.fs;
         let point = &mount.point;
@@ -1738,10 +2078,22 @@ pub(super) fn cmd_df(_ctx: &mut ShellCtx, _args: &[&str]) {
                 } else {
                     used.saturating_mul(100) / total
                 };
-                shell_println(&format!(
-                    "{:<12} {:>9} {:>5} {:>9} {:>3}% {}",
-                    fs, total, used, free, pct, point
-                ));
+                if human {
+                    shell_println(&format!(
+                        "{:<12} {:>11} {:>9} {:>11} {:>3}% {}",
+                        fs,
+                        size_cell(total),
+                        size_cell(used),
+                        size_cell(free),
+                        pct,
+                        point
+                    ));
+                } else {
+                    shell_println(&format!(
+                        "{:<12} {:>9} {:>5} {:>9} {:>3}% {}",
+                        fs, total, used, free, pct, point
+                    ));
+                }
             }
             // No capacity to report (VFS contract: `fs_stat() == None`). A
             // ramfs still knows how many bytes it is HOLDING, and that is worth
@@ -1755,14 +2107,31 @@ pub(super) fn cmd_df(_ctx: &mut ShellCtx, _args: &[&str]) {
                     .map(|node| tree_bytes(&node, 0))
                     .unwrap_or(0);
                 if matches!(fs, "ramfs" | "rootfs") && used > 0 {
+                    if human {
+                        shell_println(&format!(
+                            "{:<12} {:>11} {:>9} {:>11} {:>3}% {}",
+                            fs,
+                            "-",
+                            human_size(used),
+                            "-",
+                            "-",
+                            point
+                        ));
+                    } else {
+                        shell_println(&format!(
+                            "{:<12} {:>9} {:>5} {:>9} {:>3}% {}",
+                            fs,
+                            "-",
+                            used.div_ceil(1024),
+                            "-",
+                            "-",
+                            point
+                        ));
+                    }
+                } else if human {
                     shell_println(&format!(
-                        "{:<12} {:>9} {:>5} {:>9} {:>3}% {}",
-                        fs,
-                        "-",
-                        used.div_ceil(1024),
-                        "-",
-                        "-",
-                        point
+                        "{:<12} {:>11} {:>9} {:>11} {:>3}% {}",
+                        fs, "-", "-", "-", "-", point
                     ));
                 } else {
                     shell_println(&format!(
@@ -1797,6 +2166,104 @@ fn tree_bytes(node: &alloc::sync::Arc<dyn crate::vfs::VfsNode>, depth: usize) ->
         .iter()
         .map(|child| tree_bytes(child, depth + 1))
         .fold(0u64, |acc, n| acc.saturating_add(n))
+}
+
+/// Format a byte count the way `-h` does: binary units, one decimal for KiB and
+/// above, integer `B` below 1 KiB — coreutils' convention, computed with integer
+/// arithmetic so the output is exact and no float formatting is involved.
+pub(crate) fn human_size(bytes: u64) -> alloc::string::String {
+    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes < 1024 {
+        return alloc::format!("{} B", bytes);
+    }
+    let mut scale: u64 = 1024;
+    let mut unit = 0usize;
+    while unit + 1 < UNITS.len() && bytes / scale >= 1024 {
+        scale *= 1024;
+        unit += 1;
+    }
+    let whole = bytes / scale;
+    let remainder = bytes % scale;
+    // Round to the nearest tenth so 1023.96 MiB prints as 1024.0 MiB, not 1023.9.
+    let tenths = (remainder * 10 + scale / 2) / scale;
+    if tenths >= 10 {
+        alloc::format!("{}.0 {}", whole + 1, UNITS[unit])
+    } else {
+        alloc::format!("{}.{} {}", whole, tenths, UNITS[unit])
+    }
+}
+
+/// `free`: physical-memory and kernel-heap usage.
+///
+/// The layout is busybox `free` (one header row, KiB columns), but the numbers
+/// are Pagh's own: `Mem` comes straight from the PMM frame counters
+/// (`total_frames` / `free_frames` × 4096), so `total` is the RAM the allocator
+/// was handed at boot, `free` is what is still available to any later PMM user,
+/// and `used` is everything else (kernel image, page tables, the backing frames
+/// of the kernel heap and the pages of live user programs). There is no swap
+/// device, so that row is a constant zero, and no block cache, so `buffers` is
+/// zero as well.
+///
+/// The `Heap` row reports the fixed kernel heap region, not a Linux memory
+/// class: `used` is what the global allocator has handed out, `free` is the rest
+/// of the region. It is worth its own row because the region is mapped at boot
+/// and therefore always counts into `Mem used`, while only a fraction of it is
+/// actually occupied — an oversized or leaking heap shows up here long before
+/// physical memory runs out.
+pub(super) fn cmd_free(_ctx: &mut ShellCtx, args: &[&str]) {
+    let mut human = false;
+    for a in args {
+        if *a == "-h" {
+            human = true;
+        } else {
+            shell_println(&alloc::format!("free: unknown option: {}", a));
+            shell_println("free: usage: free [-h]");
+            return;
+        }
+    }
+    const PAGE_SIZE: usize = 4096;
+    let total = crate::memory::pmm::total_frames().saturating_mul(PAGE_SIZE) as u64;
+    let free = crate::memory::pmm::free_frames().saturating_mul(PAGE_SIZE) as u64;
+    let used = total.saturating_sub(free);
+    let (heap_size, heap_used, heap_free) = crate::memory::heap::stats();
+    let (heap_size, heap_used, heap_free) = (heap_size as u64, heap_used as u64, heap_free as u64);
+
+    // The header is formatted through the same widths as the rows so the
+    // columns cannot drift apart when a row gains a field.
+    shell_println(&format!(
+        "{:<6} {:>13} {:>12} {:>12} {:>12} {:>12}",
+        "", "total", "used", "free", "shared", "buffers"
+    ));
+    let cell = |v: u64| -> alloc::string::String {
+        if human {
+            human_size(v)
+        } else {
+            alloc::format!("{}", v / 1024)
+        }
+    };
+    shell_println(&format!(
+        "{:<6} {:>13} {:>12} {:>12} {:>12} {:>12}",
+        "Mem:",
+        cell(total),
+        cell(used),
+        cell(free),
+        cell(0),
+        cell(0)
+    ));
+    shell_println(&format!(
+        "{:<6} {:>13} {:>12} {:>12}",
+        "Swap:",
+        cell(0),
+        cell(0),
+        cell(0)
+    ));
+    shell_println(&format!(
+        "{:<6} {:>13} {:>12} {:>12}",
+        "Heap:",
+        cell(heap_size),
+        cell(heap_used),
+        cell(heap_free)
+    ));
 }
 
 /// `ps`: the live compat-process table, rendered from `/proc/<pid>/*`.
