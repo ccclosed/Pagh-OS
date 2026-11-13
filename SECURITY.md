@@ -85,13 +85,29 @@ succeed on stock 2.21.0):
   serial and framebuffer from the exploit loop) is rate-limited to one line per
   second.
 
+**Fixed in 2.22.1 (this branch):**
+
+* **F-x86n-1 (high, verified).** A `.deb` carried a symlink member pointing
+  outside the installation root (`./y -> /etc`), and later archive members
+  resolved their parents through it: `./y/autorun` passed the `..` check and was
+  written to `/mnt/etc/autorun`, executed as root at the next boot
+  (`./x -> /` + `./x/pwned_root` wrote `/mnt/pwned_root` the same way). Two
+  independent layers now refuse it: the pure planner drops any member or
+  hard-link target whose ancestor component is a symlink the same archive
+  creates, and `install_data_tar` refuses the whole package
+  (`InstallError::UnsafePath`) before creating an inode; the effectful parent
+  resolver starts at the install-root node, never follows a package-created or
+  absolute-target link (the guest namespace maps `/etc` to `/mnt/etc`, which is
+  exactly the escape), keeps every `..` and spliced relative target under the
+  root, and resolves hard-link targets through the same walker. A pre-existing
+  *relative* in-root link (`lib64 -> usr/lib64`) is still followed. Evidence:
+  F-x86n-1 host properties, the in-QEMU `install_symlink_confinement` selftest,
+  and the committed live harness `tests/pkg/e2e_pkg_escape.py` (the audit's
+  crafted `.deb` refused with the offending path named, `/mnt/etc/autorun`
+  absent, a normal `.deb` still installs).
+
 **Still open from the same audit** (no claim that they are fixed; next batches):
 
-* **F-x86n-1 (high, verified).** A `.deb` may carry a symlink member that points
-  outside the installation root; later archive members resolve through it, so a
-  package installs `/mnt/etc/autorun` and the shell executes it as root on the
-  next boot. Fix: confine symlink targets to the install root and resolve parents
-  without following package-created links.
 * **F-x86v-1 / F-rv-1 (medium, verified).** Crafted ext2 symlink inodes with a
   huge `i_size` make `read_symlink()` allocate `vec![0; i_size]` (4 GiB) →
   allocation panic, machine dead. Fix: bound symlink sizes (fast inline; slow

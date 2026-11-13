@@ -11,6 +11,27 @@ tagged release (`2.18.13`, merged as PR #56). The full technical story of every 
 is the release-note block in `AGENTS.md`; the paragraphs here name the user-visible
 change and point there rather than duplicating it.
 
+## 2.22.1
+
+Package installer confined to its root (F-x86n-1, high, verified). A `.deb` could
+carry a symlink member and then a member *below* it: parent resolution followed
+the package's own link, interpreted in the guest namespace where `/etc` means
+`/mnt/etc`, so `./y -> /etc` + `./y/autorun` wrote `/mnt/etc/autorun` (executed as
+root at the next boot) and `./x -> /` + `./x/pwned_root` wrote the install root —
+neither member path contains `..`, so the archive-path normalization could not see
+it. The pure planner now refuses any member or hard-link target whose ancestor is
+a symlink the same archive creates, and the installer rejects the whole package
+atomically (`UnsafePath`) before writing anything; the parent resolver walks
+lstat-style from the install-root node, never follows a package-created or
+absolute-target link, keeps every `..`/relative splice under the root, and
+resolves hard-link targets through the same walker, while a pre-existing relative
+in-root link (`lib64 -> usr/lib64`) still resolves inside its target. Evidence: the
+F-x86n-1 properties in `host-tests/src/properties/tar_links.rs`, the in-QEMU
+`install_symlink_confinement` selftest and the committed live harness
+`tests/pkg/e2e_pkg_escape.py` (crafted packages refused with a named path,
+`/mnt/etc/autorun` absent, plain `..` still skipped, normal `.deb` still installs).
+Full story: `AGENTS.md`, 2.22.1.
+
 ## 2.22.0
 
 Ring-3 isolation hardening from the 2026-11-13 attack audit. Three independent

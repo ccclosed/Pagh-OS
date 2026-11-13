@@ -231,11 +231,34 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.22.0** (the ring-3 isolation
-  hardening batch from the 2026-11-13 attack audit, on top of the console
-  scrollback and the shell/procfs batches; 2.18.13 carried the `connect(2)`
-  reply-and-close fix, the VT/console coordinate fix and the kernel-thread
-  rows in `ps`; the tag lands at the end of the batch).
+  be reflected here. **`main` currently reads 2.22.1** (the package-installer
+  confinement batch from the 2026-11-13 attack audit, on top of the ring-3
+  isolation hardening, the console scrollback and the shell/procfs batches;
+  2.18.13 carried the `connect(2)` reply-and-close fix, the VT/console
+  coordinate fix and the kernel-thread rows in `ps`; the tag lands at the end of
+  the batch).
+  **2.22.1** = the package installer is confined to its install root. A `.deb`
+  could ship a symlink member and then a member *below* it; the installer resolved
+  later members' parents through the package's own link in the guest namespace,
+  so `./y -> /etc` + `./y/autorun` wrote `/mnt/etc/autorun` (executed as root at
+  the next boot) and `./x -> /` + `./x/pwned_root` wrote the install root. Neither
+  path contains `..`, so the archive-path normalization accepted it (F-x86n-1,
+  high, verified by the audit). Two independent layers now refuse it: the pure
+  planner drops any member or hard-link target whose ancestor component is a
+  symlink the same archive creates and reports it, and the effectful installer
+  turns that into a whole-package refusal (`InstallError::UnsafePath`) **before
+  writing a byte**; the parent resolver walks lstat-style from the install-root
+  node, never follows a package-created link, refuses absolute link targets
+  outright (the guest namespace maps them install-root-relative — that mapping
+  was the attack), keeps every `..` and every spliced relative target under the
+  root, and resolves hard-link targets through the same walker. A pre-existing
+  *relative* in-root link (`lib64 -> usr/lib64`) is still followed, so the
+  documented placement rule survives. Evidence: the F-x86n-1 host properties in
+  `host-tests/src/properties/tar_links.rs`, the in-QEMU
+  `install_symlink_confinement` selftest, and the committed live harness
+  `tests/pkg/e2e_pkg_escape.py` (crafted packages refused with a named path,
+  `/mnt/etc/autorun` absent, plain `..` still skipped, a normal `.deb` still
+  installs including its absolute symlink).
   **2.22.0** = ring-3 isolation hardened after the attack audit. The audit found
   three independent ring3-to-ring0 paths on the stock 2.21.0 guest and one
   one-syscall machine kill; this batch closes all four and adds the regression
@@ -275,11 +298,12 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
     `recvfrom` returns before the write; baseline runs on the stock kernel still
     `SUCCESS`/PCI-read, so the contrast is the same host, same PoCs, only the
     kernel differs. Host tests cover the flag mask and the user-range boundary.
-  * Still open from that audit (next batches, tracked in `SECURITY.md`): the
-    `.deb` symlink escape into `/mnt/etc/autorun` (F-x86n-1), crafted-ext2 huge
-    symlink sizes (F-x86v-1 / F-rv-1), missing search-permission checks in
-    `walk()` (F-x86v-3), the RISC-V userland-runtime findings (F-rt-1…4), and
-    the TOCTOU/static items. They are not silently considered fixed.
+  * Still open from that audit (next batches, tracked in `SECURITY.md`):
+    crafted-ext2 huge symlink sizes (F-x86v-1 / F-rv-1), missing
+    search-permission checks in `walk()` (F-x86v-3), the RISC-V
+    userland-runtime findings (F-rt-1…4), and the TOCTOU/static items
+    (the `.deb` symlink escape, F-x86n-1, is fixed in 2.22.1). They are not
+    silently considered fixed.
   **2.21.0** = the console scrolls back. The framebuffer console used to hold
   exactly the rows that fit on screen, so anything printed above the view was
   gone. It now keeps a bounded ring of scrolled-off *rows* — characters plus the
