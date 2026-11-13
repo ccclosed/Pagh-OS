@@ -18,6 +18,7 @@
 
 use crate::regs::SavedRegs;
 use crate::signal_frame::*;
+use crate::validate::USER_ADDR_MAX;
 use crate::trap_frame::*;
 use proptest::prelude::*;
 
@@ -44,8 +45,16 @@ fn gpr_strategy() -> impl Strategy<Value = SavedRegs> {
 }
 
 fn frame_strategy() -> impl Strategy<Value = IrqFrame> {
-    (any::<u64>(), gpr_strategy(), any::<u64>(), any::<u64>()).prop_map(
-        |(popfq_rflags, gpr, rip, cs)| IrqFrame {
+    // `rip` is a user address: `decode_rt_sigframe` now rejects a frame whose
+    // ip/sp leave the user half (a kernel IP would make `sysret` enter ring 3 at
+    // a supervisor address — F-LEAD-2 hardening).
+    (
+        any::<u64>(),
+        gpr_strategy(),
+        1u64..USER_ADDR_MAX,
+        any::<u64>(),
+    )
+        .prop_map(|(popfq_rflags, gpr, rip, cs)| IrqFrame {
             popfq_rflags,
             gpr,
             rip,
@@ -53,8 +62,7 @@ fn frame_strategy() -> impl Strategy<Value = IrqFrame> {
             rflags: 0x202,
             rsp: 0x7000_0000_0000,
             ss: 0x10,
-        },
-    )
+        })
 }
 
 /// Independent expectation for the interrupted user context.

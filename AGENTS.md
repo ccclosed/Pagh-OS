@@ -231,11 +231,55 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.21.0** (console scrollback on
-  top of the shell batch of nine commands, the per-thread procfs view and the
-  real file identity in `/proc/<pid>/maps`; 2.18.13 carried the `connect(2)`
+  be reflected here. **`main` currently reads 2.22.0** (the ring-3 isolation
+  hardening batch from the 2026-11-13 attack audit, on top of the console
+  scrollback and the shell/procfs batches; 2.18.13 carried the `connect(2)`
   reply-and-close fix, the VT/console coordinate fix and the kernel-thread
   rows in `ps`; the tag lands at the end of the batch).
+  **2.22.0** = ring-3 isolation hardened after the attack audit. The audit found
+  three independent ring3-to-ring0 paths on the stock 2.21.0 guest and one
+  one-syscall machine kill; this batch closes all four and adds the regression
+  evidence:
+  * `mprotect(2)` accepted kernel virtual addresses. `sys_mprotect` had no
+    `USER_ADDR_MAX` gate (unlike `mmap`/`brk`), its coverage guard inverted to
+    "allowed" for a fully-mapped kernel range, and it re-mapped the found frames
+    with `leaf_flags()` — a *user*-page flag builder that always sets
+    `USER_ACCESSIBLE`. Shared kernel leaf page tables turned that into a ring-3
+    W+X alias of kernel memory; scanning the heap for the process's six `u32`
+    credentials and zeroing them gave uid 0 (F-LEAD-1, critical). Fixes:
+    `mprotect`/`munmap`/`mremap` share one pure user-range gate (`user_pages`,
+    built on `validate::check_user_range`), the `PROT_NONE` frame-free path can
+    only free user pages, and `vmm::map` now refuses `USER_ACCESSIBLE` mappings
+    of a kernel VA at the single mapping choke point.
+  * `rt_sigreturn(2)` restored a user-forged `eflags` verbatim into `r11`, which
+    `sysretq` loads as RFLAGS: setting `IOPL=3` gave ring 3 the I/O ports and PCI
+    config space (F-LEAD-2, critical). Fixes: `decode_rt_sigframe` rejects
+    `ip`/`sp` outside the user half and masks the flags down to
+    `USER_RFLAGS_MASK` (CF/PF/AF/ZF/SF/TF/IF/DF/OF; IOPL/NT/VM/RF/AC cleared) —
+    the one decode path every restore goes through; the TSS has no I/O bitmap, so
+    a future path that raises IOPL still has to change the TSS to reach ports.
+  * `recvfrom(2)` wrote the source `sockaddr`/`socklen_t` through raw user
+    pointers that were never validated: 16 attacker-influenced bytes plus a
+    constant 4 at two arbitrary addresses, proven against the kernel tick counter
+    (F-x86a-1, critical — a one-shot arbitrary kernel write). `connect(2)`
+    dereferenced the caller's `sockaddr` after checking only its *length*, so a
+    non-canonical pointer caused a ring-0 #GP and the fault handler halted the
+    machine (F-x86a-3, medium). Both now go through `check_user_ptr` before any
+    read/write; the EINVAL syscall diagnostic is rate-limited to one line per
+    second, because the exploit loop otherwise flooded serial *and* framebuffer
+    with >1000 lines (attacker-triggerable console DoS).
+  * Evidence: the audit's own PoCs against the fixed kernel — `kheap` reports
+    `mprotected pages=0x0` and `creds pattern not found` (uid stays 1000),
+    `iopl` resumes with `RFLAGS=0x202` and dies on the first port access instead
+    of reading PCI config, `connect` survives with `EFAULT` instead of halting,
+    `recvfrom` returns before the write; baseline runs on the stock kernel still
+    `SUCCESS`/PCI-read, so the contrast is the same host, same PoCs, only the
+    kernel differs. Host tests cover the flag mask and the user-range boundary.
+  * Still open from that audit (next batches, tracked in `SECURITY.md`): the
+    `.deb` symlink escape into `/mnt/etc/autorun` (F-x86n-1), crafted-ext2 huge
+    symlink sizes (F-x86v-1 / F-rv-1), missing search-permission checks in
+    `walk()` (F-x86v-3), the RISC-V userland-runtime findings (F-rt-1…4), and
+    the TOCTOU/static items. They are not silently considered fixed.
   **2.21.0** = the console scrolls back. The framebuffer console used to hold
   exactly the rows that fit on screen, so anything printed above the view was
   gone. It now keeps a bounded ring of scrolled-off *rows* — characters plus the

@@ -386,7 +386,29 @@ pub fn page_flags(virt: u64) -> Option<PageTableFlags> {
 /// Map a physical frame to a virtual page.
 ///
 /// Allocates intermediate page tables as needed via PMM.
+/// Exclusive upper bound of the lower-half user address range.
+///
+/// Mirrors `linux::validate::USER_ADDR_MAX` (which is `core`-only and
+/// host-testable, while this module is kernel-only). Keeping the value here lets
+/// [`map`] enforce the invariant "a kernel virtual address is never mapped
+/// `USER_ACCESSIBLE`" at the one place every mapping goes through, instead of
+/// trusting each caller's flags.
+const USER_ADDR_MAX: u64 = 0x0000_8000_0000_0000;
+
 pub fn map(phys_addr: u64, virt_addr: u64, flags: PageTableFlags) -> Result<(), VmError> {
+    // A `USER_ACCESSIBLE` leaf in the kernel half is always a bug: ring 3 could
+    // then read/write that kernel page (the F-LEAD-1 mprotect chain got exactly
+    // this by running its user-page flag builder over a kernel VA). Refuse it at
+    // the choke point; `mem_sys` also validates its ranges, so this is the
+    // defense-in-depth copy of the same rule.
+    if virt_addr >= USER_ADDR_MAX && flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+        crate::error!(
+            "[VMM] refusing USER_ACCESSIBLE mapping of kernel VA {:#x} (phys {:#x})",
+            virt_addr,
+            phys_addr
+        );
+        return Err(VmError::InvalidAddress);
+    }
     let phys = PhysAddr::new(phys_addr);
     let virt = VirtAddr::new(virt_addr);
 

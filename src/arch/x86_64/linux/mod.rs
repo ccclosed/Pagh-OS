@@ -56,6 +56,26 @@ use regs::SavedRegs;
 /// every 4 KiB page the buffer spans, confirming each is mapped in the CURRENT
 /// address space via [`crate::memory::vmm::virt_to_phys`] (R1.6). Any failure yields
 /// `EFAULT` without the buffer ever being read or written. A zero-length buffer is
+/// Rate limit for the `EINVAL` syscall diagnostic (defense against log flooding).
+///
+/// The diagnostic exists to name a misbehaving syscall on the next run, but it is
+/// attacker-triggerable: a ring-3 loop over `mprotect()` on kernel addresses (the
+/// F-LEAD-1 exploit) produced >1000 `[linux] EINVAL diag` lines per second, and
+/// every `warn!` reaches both the serial log and the framebuffer — a cheap DoS of
+/// the console/log. At most one line per second is enough to identify the culprit.
+fn einval_diag_allowed() -> bool {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::task::scheduler::ticks();
+    let last = LAST.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) >= crate::arch::x86_64::apic::TICK_HZ {
+        LAST.store(now, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
 /// always accepted (it dereferences nothing).
 pub(crate) fn check_user_ptr(start: u64, len: u64) -> Result<(), Errno> {
     use validate::PtrCheck;
@@ -172,8 +192,13 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::CONNECT => {
             // Peek the sockaddr family to pick the stack (AF_UNIX registry vs AF_INET own stack).
             let fam = if a[1] != 0 && a[2] >= 2 {
-                // SAFETY: 2-byte user read behind check_user_ptr-style bounds guard
-                // (a[2] >= 2) on a syscall-supplied buffer; unaligned read of the
+                // The old comment claimed a "check_user_ptr-style bounds guard",
+                // but only `a[2]` (the length) was checked: `a[1] = 0x8000...`
+                // made the ring-0 read take a #GP and the fault handler halted
+                // the machine (F-x86a-3). Validate the address, then read.
+                check_user_ptr(a[1], 2)?;
+                // SAFETY: 2-byte user read after `check_user_ptr` proved
+                // `[a[1], a[1]+2)` is inside the user half; unaligned read of the
                 // sa_family field only, never dereferenced past 2 bytes.
                 (unsafe { core::ptr::read_unaligned(a[1] as *const u16) }) as u64
             } else {
@@ -231,12 +256,26 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
                 return Err(Errno::EINVAL);
             }
             check_user_ptr(a[1], a[2].min(1 << 20))?;
+            // The payload buffer was checked, but this arm is the one socket
+            // path that writes a sockaddr back to user memory. Both outputs are
+            // plain user pointers (F-x86a-1: 16 bytes reached a kernel address
+            // and rewrote TICK_COUNT). Validate them before the receive so no
+            // peer-controlled data can reach an unchecked address.
+            if a[4] != 0 && a[5] != 0 {
+                // `addrlen` is a socklen_t (4 bytes); the sockaddr is 16 bytes
+                // (sockaddr_in) or 28 (sockaddr_in6), validated per family below.
+                check_user_ptr(a[5], 4)?;
+            } else {
+                // One pointer without the other is a nonsense request; Linux
+                // ignores the output in that case, and so do we.
+            }
             let mut buf = alloc::vec![0u8; a[2] as usize];
             let (n, src) = crate::arch::x86_64::linux::inet_sock::udp_recvfrom_fd(a[0], &mut buf)?;
             crate::arch::x86_64::linux::io_sys::copy_out_pub(a[1], &buf[..n]);
             if a[4] != 0 && a[5] != 0 {
                 match src.addr {
                     crate::net::IpAddr::V4(v4) => {
+                        check_user_ptr(a[4], 16)?;
                         // struct sockaddr_in { family=2, port(be16), addr, zero }
                         let mut sa = [0u8; 16];
                         sa[0..2].copy_from_slice(&2u16.to_ne_bytes());
@@ -251,6 +290,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
                         }
                     }
                     crate::net::IpAddr::V6(v6) => {
+                        check_user_ptr(a[4], 28)?;
                         // struct sockaddr_in6 { family=10, port(be16), flowinfo,
                         // addr(16), scope_id }
                         let mut sa = [0u8; 28];
@@ -558,7 +598,7 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs, reentry_allowed: u64) -> 
             // produced it; this pinpoints the culprit on the next run.
             // readlink's EINVAL means "not a symlink" — a legitimate answer
             // for a regular file, not a misbehaving syscall.
-            if matches!(e, Errno::EINVAL) && nr != sysno::READLINK {
+            if matches!(e, Errno::EINVAL) && nr != sysno::READLINK && einval_diag_allowed() {
                 crate::warn!(
                     "[linux] EINVAL diag: nr={} args=[{:#x}, {:#x}, {:#x}, {:#x}]",
                     nr,

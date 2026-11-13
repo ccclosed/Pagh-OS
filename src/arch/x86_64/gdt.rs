@@ -103,6 +103,12 @@ pub fn set_kernel_stack(rsp0: u64) {
 
 // ─── init() ─────────────────────────────────────────────────────────────
 
+/// I/O-permission posture: the TSS carries no I/O bitmap (`iomap_base` points past
+/// the segment limit), so with `IOPL=0` every ring-3 `in`/`out`/PCI-config access
+/// is a #GP. That is intentional defense in depth: the `rt_sigreturn` fix masks
+/// IOPL out of restored RFLAGS (F-LEAD-2); the absent bitmap means even a future
+/// path that raises IOPL still has to change this TSS to get ports.
+///
 /// Initialize GDT, TSS with IST stacks, and load them into the CPU.
 ///
 /// SAFETY: Must be called once during early boot, before interrupts are enabled.

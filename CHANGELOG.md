@@ -11,6 +11,32 @@ tagged release (`2.18.13`, merged as PR #56). The full technical story of every 
 is the release-note block in `AGENTS.md`; the paragraphs here name the user-visible
 change and point there rather than duplicating it.
 
+## 2.22.0
+
+Ring-3 isolation hardening from the 2026-11-13 attack audit. Three independent
+ring3-to-ring0 paths and a one-syscall machine kill are closed:
+
+* `mprotect(2)` no longer accepts kernel virtual addresses: `mprotect`/`munmap`/
+  `mremap` share a pure user-range gate, the `PROT_NONE` path can only free user
+  frames, and `vmm::map` refuses `USER_ACCESSIBLE` mappings of kernel addresses
+  (F-LEAD-1: a kernel-heap W+X alias reachable from ring 3, used to zero the
+  process's own credentials).
+* `rt_sigreturn(2)` rejects frames whose `ip`/`sp` leave the user half and masks
+  restored RFLAGS to user-settable bits, so a forged frame can no longer set
+  `IOPL=3` and reach I/O ports/PCI config (F-LEAD-2).
+* `recvfrom(2)` validates the source-address outputs before writing them (the
+  16-byte arbitrary kernel write, F-x86a-1) and `connect(2)` validates the
+  caller's `sockaddr` before reading its family (the ring-0 #GP that halted the
+  machine, F-x86a-3).
+* The EINVAL syscall diagnostic is rate-limited: it is attacker-triggerable and
+  left the exploit loop flooding serial and framebuffer.
+
+Verified with the audit's own PoCs against the fixed kernel (exploits now fail
+safely; the same PoCs still succeed on the stock 2.21.0 image) and host tests for
+the new flag/range rules. Remaining audit findings (package symlink escape,
+crafted-ext2 sizes, path search permissions, RISC-V runtime) are listed in
+`SECURITY.md` and land in follow-up batches. Full story: `AGENTS.md`, 2.22.0.
+
 ## 2.21.0
 
 Console scrollback. The framebuffer console keeps a bounded ring of the rows it

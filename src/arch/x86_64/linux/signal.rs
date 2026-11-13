@@ -809,6 +809,9 @@ pub fn sys_rt_sigreturn(regs: &mut SavedRegs) -> Result<u64, Errno> {
     regs.rbx = fr.bx;
     regs.rdx = fr.dx;
     regs.rcx = fr.ip; // sysretq RIP
+                      // `decode_rt_sigframe` has already validated ip/sp and masked the flags down
+                      // to user-settable bits: `sysretq` restores RFLAGS verbatim, so IOPL/NT/VM/
+                      // RF/AC must never reach it from a user-forged frame (F-LEAD-2).
     regs.r11 = fr.flags; // sysretq RFLAGS
                          // SAFETY: the per-task user-RSP slot is this task's own kernel-stack
                          // storage (same slot execve/clone rewrite).

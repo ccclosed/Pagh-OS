@@ -38,6 +38,30 @@
 /// Highest signal number the table covers (Linux `_NSIG/64-bit` is 64).
 pub const SIGNAL_COUNT: usize = 64;
 
+/// RFLAGS bits a ring-3 `rt_sigreturn` frame may restore.
+///
+/// The frame is entirely user-controlled (the kernel cannot authenticate it, and
+/// does not need to: Linux trusts it too), so every *privileged* bit has to be
+/// masked out before the value reaches the `sysret` return path, which does not
+/// sanitise RFLAGS:
+///
+/// * `IOPL` (0x3000) — ring-3 `in`/`out` and PCI config space. A forged frame
+///   used to set it (F-LEAD-2), handing ring 3 the I/O ports.
+/// * `NT` (0x4000), `VM` (0x20000) — task/VM86 state that has no meaning here.
+/// * `RF` (0x10000), `AC` (0x40000) — resume/alignment-check overrides; `AC=1`
+///   would defeat SMAP if it is ever enabled.
+///
+/// Everything a user program may legitimately own is kept: CF/PF/AF/ZF/SF/TF/IF/
+/// DF/OF, plus EFLAGS bit 1 (reserved, architecturally always 1), so a
+/// `siglongjmp`-style handler sees the same flags it had. `0xFD7` is `0xFD5`
+/// (the nine arithmetic/control bits) with that fixed bit set.
+pub const USER_RFLAGS_MASK: u64 = 0x0000_0000_0000_0FD7;
+
+/// Mask `flags` down to the user-settable RFLAGS bits ([`USER_RFLAGS_MASK`]).
+pub fn sanitize_user_rflags(flags: u64) -> u64 {
+    flags & USER_RFLAGS_MASK
+}
+
 // ─── Signal numbers (x86_64 Linux) ───────────────────────────────────────────
 
 pub const SIGHUP: u64 = 1;
@@ -423,10 +447,22 @@ pub fn decode_rt_sigframe(uc: &[u8; 304]) -> Option<RestoredFrame> {
         &uc[MCONTEXT_OFFSET as usize - UC_OFFSET as usize
             ..MCONTEXT_OFFSET as usize - UC_OFFSET as usize + 256],
     );
-    let regs = SigFrameRegs::get(&mc);
-    if regs.ip == 0 {
+    let mut regs = SigFrameRegs::get(&mc);
+    // A frame may only send execution/stack back to the user half. A kernel IP
+    // would make `sysret` enter ring 3 with CPL=3 at a supervisor address (the
+    // CPU faults, but the frame is nonsense); a kernel SP would park the user
+    // stack in the kernel half and fault on the handler's first push. Reject
+    // both at decode time, like the null-IP guard.
+    if regs.ip == 0 || regs.ip >= super::validate::USER_ADDR_MAX {
         return None;
     }
+    if regs.sp >= super::validate::USER_ADDR_MAX {
+        return None;
+    }
+    // `sys_rt_sigreturn` writes this straight into the register `sysret` restores
+    // as RFLAGS, which does not sanitise them (F-LEAD-2). Mask privileged bits
+    // here so every decode path gets the sanitised value.
+    regs.flags = sanitize_user_rflags(regs.flags);
     let mut m = [0u8; 8];
     m.copy_from_slice(&uc[296..304]);
     Some(RestoredFrame {
@@ -438,6 +474,22 @@ pub fn decode_rt_sigframe(uc: &[u8; 304]) -> Option<RestoredFrame> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_rflags_mask_drops_privileged_bits() {
+        // IOPL=3 (the F-LEAD-2 attack), NT, VM, RF, AC must all vanish.
+        let attack = 0x3000u64 | 0x4000 | 0x20000 | 0x10000 | 0x40000;
+        assert_eq!(sanitize_user_rflags(attack), 0);
+        // Bits a user program legitimately owns survive: CF, PF, AF, ZF, SF, TF,
+        // IF, DF, OF, and the fixed reserved bit 1.
+        assert_eq!(sanitize_user_rflags(0xFD7), 0xFD7);
+        // IF (0x200) is the one every signal handler needs to keep interrupts on.
+        assert_eq!(sanitize_user_rflags(0x202), 0x202);
+        // Idempotent: masking an already-masked value changes nothing.
+        let once = sanitize_user_rflags(0xFFFF_FFFF_FFFF_FFFF);
+        assert_eq!(once, USER_RFLAGS_MASK);
+        assert_eq!(sanitize_user_rflags(once), once);
+    }
 
     #[test]
     fn sigbit_basics() {

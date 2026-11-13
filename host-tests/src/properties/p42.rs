@@ -2,6 +2,7 @@
 // ABI round-trips and the placement/alignment contract holds for any inputs.
 
 use crate::signal_frame::*;
+use crate::validate::USER_ADDR_MAX;
 use proptest::prelude::*;
 
 fn action_strategy() -> impl Strategy<Value = SignalAction> {
@@ -29,7 +30,7 @@ proptest! {
         r8 in any::<u64>(), r9 in any::<u64>(), r10 in any::<u64>(), r11 in any::<u64>(),
         r12 in any::<u64>(), r13 in any::<u64>(), r14 in any::<u64>(), r15 in any::<u64>(),
         di in any::<u64>(), si in any::<u64>(), bp in any::<u64>(), bx in any::<u64>(),
-        dx in any::<u64>(), ax in any::<u64>(), cx in any::<u64>(), sp in any::<u64>(),
+        dx in any::<u64>(), ax in any::<u64>(), cx in any::<u64>(), sp in 0u64..USER_ADDR_MAX,
         ip in 1u64..0x4000_0000u64, // NULL ip is the decode-reject sentinel
         flags in any::<u64>(),
         mask in any::<u64>(),
@@ -43,8 +44,16 @@ proptest! {
         encode_rt_sigframe(&mut buf, restorer, sig, &saved, mask, &alt);
         let mut uc = [0u8; 304];
         uc.copy_from_slice(&buf[UC_OFFSET as usize..UC_OFFSET as usize + 304]);
-        let r = decode_rt_sigframe(&uc).expect("non-null ip decodes");
-        prop_assert_eq!(r.regs, saved);
+        let r = decode_rt_sigframe(&uc).expect("non-null user ip decodes");
+        // `decode` masks privileged RFLAGS bits (IOPL/NT/VM/RF/AC) out of the
+        // frame — `sysretq` restores RFLAGS verbatim, so the ABI-visible
+        // contract is "the user-settable subset survives", not round-trip of an
+        // arbitrary kernel-controlled word (F-LEAD-2).
+        let expected = SigFrameRegs {
+            flags: sanitize_user_rflags(flags),
+            ..saved
+        };
+        prop_assert_eq!(r.regs, expected);
         prop_assert_eq!(r.mask, mask & !UNBLOCKABLE_MASK);
 
         let mut w = [0u8; 8];

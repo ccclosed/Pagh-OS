@@ -47,6 +47,35 @@ use super::validate::USER_ADDR_MAX;
 /// Architectural page size (4 KiB).
 const PAGE_SIZE: u64 = 4096;
 
+/// Validate that a memory-syscall range lies in the user half and return its page
+/// count.
+///
+/// This is the range gate for `mprotect`/`munmap`/`mremap`. Those syscalls used
+/// to trust `addr`/`len`: `mprotect` on a *kernel* virtual address walked the
+/// kernel's own page tables, remapped kernel pages with `USER_ACCESSIBLE` (via
+/// `leaf_flags`) and, for `PROT_NONE`, returned kernel frames to the PMM — a
+/// ring-3 → ring-0 memory primitive. The pure [`check_user_range`] helper already
+/// existed for copy-in/copy-out; this wraps it with the page-count arithmetic the
+/// memory syscalls need.
+///
+/// Returns `EINVAL` for an unaligned base or a non-user/overflowing range (the
+/// page-table operations below assume 4 KiB-aligned user VAs), and the page count
+/// otherwise (`len == 0` → 0 pages, a no-op).
+fn user_pages(addr: u64, len: u64) -> Result<u64, Errno> {
+    if addr & (PAGE_SIZE - 1) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    if super::validate::check_user_range(addr, len) != super::validate::PtrCheck::Ok {
+        return Err(Errno::EINVAL);
+    }
+    len.checked_add(PAGE_SIZE - 1)
+        .map(|n| n / PAGE_SIZE)
+        .ok_or(Errno::EINVAL)
+}
+
 /// Zero the 4 KiB physical frame at `frame` through the HHDM alias.
 fn zero_frame(frame: u64) {
     // SAFETY: `frame` was just allocated from the PMM and is mapped into the HHDM
@@ -335,6 +364,14 @@ pub fn sys_mmap(
 /// `munmap` (11): unmap a previously-`mmap`ped range (R4.3) or reject an
 /// unaligned/uncovered request with `-EINVAL` (R4.7).
 pub fn sys_munmap(addr: u64, len: u64) -> Result<u64, Errno> {
+    // `munmap` only unmaps tracked regions, so a kernel address was rejected
+    // indirectly; validate the range up front all the same, so the three
+    // memory-length syscalls share one gate instead of relying on three
+    // different code paths to reject a kernel VA.
+    let pages = user_pages(addr, len)?;
+    if pages == 0 {
+        return Ok(0);
+    }
     compat::with_current_compat(|cs| munmap_impl(&mut cs.vm.lock(), addr, len))
         .unwrap_or(Err(Errno::EINVAL))
 }
@@ -355,7 +392,18 @@ pub fn sys_mremap(
     _new_addr: u64,
 ) -> Result<u64, Errno> {
     const MREMAP_MAYMOVE: u64 = 1;
-    if old_addr & (PAGE_SIZE - 1) != 0 || old_size == 0 || new_size == 0 {
+    if old_size == 0 || new_size == 0 {
+        return Err(Errno::EINVAL);
+    }
+    // Same user-half gate as mprotect/munmap: `old_addr` feeds page-table and
+    // frame arithmetic, and `new_size` decides how many pages are allocated and
+    // mapped. A length cannot be "in the user half" (it is not an address), so
+    // it is bounded by the user half size instead: no single mremap may ask for
+    // more VA than that half can hold.
+    if user_pages(old_addr, old_size)? == 0 {
+        return Err(Errno::EINVAL);
+    }
+    if new_size > USER_ADDR_MAX {
         return Err(Errno::EINVAL);
     }
     if flags & !MREMAP_MAYMOVE != 0 {
@@ -371,6 +419,9 @@ pub fn sys_mremap(
         .checked_add(PAGE_SIZE - 1)
         .map(|n| n / PAGE_SIZE)
         .ok_or(Errno::ENOMEM)?;
+    if new_pages == 0 {
+        return Err(Errno::EINVAL);
+    }
     compat::with_current_compat(|cs| -> Result<u64, Errno> {
         let vm = &mut cs.vm.lock();
         // The whole old range must lie inside one tracked mmap region; its
@@ -565,16 +616,10 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> Result<u64, Errno> {
 }
 
 fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result<u64, Errno> {
-    if addr & (PAGE_SIZE - 1) != 0 {
-        return Err(Errno::EINVAL);
-    }
-    if len == 0 {
+    let pages = user_pages(addr, len)?;
+    if pages == 0 {
         return Ok(0);
     }
-    let pages = len
-        .checked_add(PAGE_SIZE - 1)
-        .map(|n| n / PAGE_SIZE)
-        .ok_or(Errno::EINVAL)?;
 
     // Coverage check: every page in the range must be mapped in the caller's
     // address space. Most pages are tracked as mmap regions or the brk heap,
@@ -615,6 +660,13 @@ fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result
     // everything else is re-mapped in place with the new bits.
     for i in 0..pages {
         let page = addr + i * PAGE_SIZE;
+        // `user_pages` already proved the whole span is below `USER_ADDR_MAX`;
+        // the check is repeated so the invariant lives next to the page-table
+        // calls that depend on it. A kernel frame must never be unmapped, freed
+        // (PROT_NONE path: PMM UAF) or re-mapped with user flags here.
+        if page >= USER_ADDR_MAX {
+            return Err(Errno::EINVAL);
+        }
         if let Some(frame) = vmm::virt_to_phys(page) {
             let _ = vmm::unmap(page);
             if prot_none {
