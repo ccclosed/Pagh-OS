@@ -11,12 +11,13 @@ RANGE=/home/oleg/Projects/pagh-os/attack/range   # private range from the report
 
 ## What each PoC proves
 
-| File | Finding | Vulnerable 2.21.0 | Fixed (2.22.0) |
+| File | Finding | Vulnerable 2.21.0 | Fixed (2.22.0-2.22.3) |
 |---|---|---|---|
 | `kheap.c` | F-LEAD-1: `mprotect()` on kernel VAs → ring-3 W+X alias of the kernel heap → zero the process's `Creds` → uid 0 | `PWN-KHEAP: SUCCESS root file contents: ROOT-ONLY-SECRET-7f3a` | `PWN-KHEAP: mprotected pages=0x0` + `creds pattern not found` (uid stays 1000) |
 | `iopl.c` | F-LEAD-2: forged `rt_sigreturn` frame sets `RFLAGS.IOPL=3` → ring 3 I/O ports / PCI config | `PWN-IOPL: RFLAGS=0x…3202` then `PWN-IO: port 0x80`, `PWN-IO: pci dev=3 id=0x10011af4` | `PWN-IOPL: RFLAGS=0x…0202`, dies on the first port access; no `PWN-IO:` lines |
 | `poc_connect_gp.c` | F-x86a-3: `connect()` reads `sa_family` through an unvalidated pointer → ring-0 #GP → machine halt | no shell prompt after `[autorun]` (machine halted) | `POC-CONNECT-GP: SURVIVED r=-1 errno=14` (EFAULT), shell prompt returns |
 | `poc_recvfrom_write.c` | F-x86a-1: `recvfrom()` writes `sockaddr`/`socklen_t` through unvalidated pointers (16-byte arbitrary kernel write) | `PWN-RECVFROM: arbitrary kernel write confirmed: MONOTONIC jumped …` | the validated write path refuses, so no datagram is reported as received; `PWN-RECVFROM` never prints |
+| `poc_poll_toctou.c` | F-x86a-4: blocking syscalls (`poll`/`ppoll`/`select`/`epoll_wait`, plus `clone` TID outputs) use a user buffer after a `yield`; a CLONE_VM sibling munmaps it → kernel-mode #PF → machine halt. Modes: `poll`, `ppoll`, `select`, `epoll`, `futex` | `poll` mode: no shell prompt after `[autorun]`; serial ends with `[EXC #14] PAGE FAULT … U=false` at the pollfd page (kernel-mode fault, machine halted) | `POC-TOCTOU[poll]: SURVIVED poll r=-1 errno=14` (EFAULT) and the shell prompt returns; same EFAULT for `ppoll`/`select`/`epoll_wait`/`futex` |
 
 ## Reproduction (same host, two kernels)
 
@@ -33,6 +34,14 @@ cd /tmp/range-fixed
 ./run.sh --expect 'PWN-KHEAP: creds pattern not found' /tmp/kheap
 ./run.sh --expect 'PWN-IOPL: RFLAGS=0x0000000000000202' /tmp/iopl
 
+# The F-x86a-4 TOCTOU PoC (2.22.1): one static ELF, one mode per syscall. The
+# sibling is raw assembly because a libc clone wrapper returns the child
+# through the parent's call frame (see the source header).
+"$RANGE/cc-static" -O2 -o /tmp/poc_poll_toctou tools/security/poc/poc_poll_toctou.c
+for mode in poll ppoll select epoll futex; do
+    ./run.sh --expect "POC-TOCTOU\[$mode\]: SURVIVED" /tmp/poc_poll_toctou "$mode"
+done
+
 # static PoCs, built against the symbols of the kernel under test
 TICK=$(nm esp/pagh.elf | awk '$3 ~ /TICK_COUNT$/ {print $1; exit}')
 "$RANGE/cc-static" -O2 -o /tmp/poc_connect tools/security/poc/poc_connect_gp.c
@@ -47,9 +56,9 @@ The vulnerable side is the same commands with the **unmodified** range (no
 
 ## Not covered yet
 
-These four findings were the 2.22.0 batch. The audit's other items (package
-symlink escape, crafted-ext2 sizes, `walk()` search permissions, TOCTOU, RISC-V
-runtime) are listed in `SECURITY.md` and do not have a committed PoC here yet.
+These five findings were the 2.22.0-2.22.3 batches. The audit's remaining items
+(RISC-V userland runtime) are listed in `SECURITY.md`; the x86 findings now have
+committed PoCs here (the F-x86a-4 TOCTOU PoC is `poc_poll_toctou.c`, above).
 
 ## VFS/ext2 regressions (2.22.2) — the crafted-ext2 / `walk()` items above
 

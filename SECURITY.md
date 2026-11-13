@@ -55,8 +55,9 @@ is root.
 An external red-team pass ran stock ring-3 Linux ELFs on a private QEMU range
 (attachments: PoC sources, serial logs and per-area reports). It found three
 independent ring3-to-ring0 paths and a one-syscall machine kill on the 2.21.0
-image. **Fixed in 2.22.0** (each reproduced before and after; the same PoCs still
-succeed on stock 2.21.0):
+image. **Fixed in 2.22.0** for the ring3-to-ring0 paths and in **2.22.3** for
+the user-buffer TOCTOU class (each reproduced before and after; the same PoCs
+still succeed on stock 2.21.0):
 
 * **F-LEAD-1 (critical, verified).** `mprotect(2)` accepted kernel virtual
   addresses: no `USER_ADDR_MAX` gate, a coverage guard that inverted to "allowed"
@@ -85,6 +86,22 @@ succeed on stock 2.21.0):
 * Also in 2.22.0: the EINVAL syscall diagnostic (attacker-triggerable, flooded
   serial and framebuffer from the exploit loop) is rate-limited to one line per
   second.
+* **F-x86a-4 (medium, fixed in 2.22.3).** `poll`/`ppoll`, `select`/`pselect6`
+  and `epoll_wait` validated their user-visible array once and then kept
+  publishing into it after a `yield`; a sibling `CLONE_VM` thread could munmap
+  (or `mprotect PROT_NONE`) that page in the window, so the next ring-0 access
+  faulted in kernel mode and halted the machine. The wait loops now work on
+  private kernel copies, re-validate the user range after every yield and
+  return `EFAULT` when it vanished — and the same "validate, block, publish"
+  pattern is closed in the read family, the `readv`/`writev` iovec entries,
+  `wait4` and `sendfile`. `clone`'s `parent_tid`/`child_tid` writes are
+  validated and written inside the interrupt-disabled spawn/fork window (a bad
+  pointer is `EFAULT` before the child exists), `ioctl(TCSETS*)` honours its
+  validation result (it used to read anyway), and a kernel-mode page fault on a
+  user address now kills only the faulting compat process instead of the
+  machine (kernel-address and NULL faults stay fatal). PoC:
+  `tools/security/poc/poc_poll_toctou.c` (`poll`/`ppoll`/`select`/`epoll`/
+  `futex` modes).
 
 **Fixed in 2.22.1 (this branch):**
 
@@ -141,10 +158,10 @@ the stock 2.21.0 range and re-run against the fixed kernel):
 
 **Still open from the same audit** (no claim that they are fixed; next batches):
 
-* **F-x86a-4 / F-rv-1/2/3 (static; x86 TOCTOU and RISC-V kernel).** TOCTOU on
-  user buffers that are validated once and then used across a `yield`; RISC-V
-  symlink-size bounds, W^X flag merge and `mprotect` root confusion. To be
-  reproduced, then fixed.
+* **F-rv-1/2/3 (static; RISC-V kernel).** RISC-V symlink-size bounds, W^X flag
+  merge and `mprotect` root confusion. To be reproduced, then fixed. (The x86
+  user-buffer TOCTOU half of the original item, F-x86a-4, is fixed in 2.22.3
+  above; the crafted-ext2 and path-search items were fixed in 2.22.2.)
 * **F-rt-1…4 (RISC-V userland runtime, high/medium/low, verified).** `ld-pagh`
   symbol/`PT_DYNAMIC` bounds (arbitrary write / OOB read), `pagh-libc`
   `vsnprintf` precision overflow (stack smash), `pagh-python` parser recursion
