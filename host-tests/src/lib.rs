@@ -148,6 +148,15 @@ pub mod diag;
 #[path = "../../src/arch/x86_64/linux/mem.rs"]
 pub mod mem;
 
+// `cow` is the pure COW frame-ownership accounting behind fork copy-on-write
+// (round-2 audit F-r2-arch-1): one reference per address space that maps a
+// shared leaf, and the frame returns to the PMM only when the LAST reference is
+// released. `core` + `alloc` only and self-contained, so the same source the
+// kernel's `memory::pmm` wraps is property-tested here (property
+// `cow_ownership`).
+#[path = "../../src/memory/cow.rs"]
+pub mod cow;
+
 // `dirent` is the pure `getdents64` record packer (Feature: linux-binary-compat).
 // `core` + `alloc` only and self-contained, so the standalone `#[path]` include
 // resolves with no extra wiring (P32).
@@ -552,6 +561,12 @@ mod properties {
     // MMIO/PMM code and cannot run on the host; this is the half that decides
     // which physical pages a command names.
     mod nvme_io;
+
+    // Fork-COW frame ownership (round-2 audit F-r2-arch-1/2): the release rule
+    // and `CowRefs` accounting over a model PMM + address spaces. Pins that a
+    // frame is freed exactly once and only when no PTE maps it anymore;
+    // descriptive name, same policy as `page_fault`/`irq_frame`.
+    mod cow_ownership;
 
 }
 

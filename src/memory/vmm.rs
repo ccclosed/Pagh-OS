@@ -21,6 +21,11 @@ pub enum VmError {
     /// The requested physical range is not addressable (implausible base, or a
     /// virtual address the HHDM window cannot reach).
     InvalidAddress,
+    /// A leaf PTE is COW-shared and the operation would overwrite it or grant
+    /// hardware write access to the shared frame. Detaching it must go through
+    /// [`release_user_leaf`]/[`cow_copy_page`], which keep the PMM reference
+    /// count correct.
+    CowShared,
 }
 
 impl core::fmt::Display for VmError {
@@ -29,6 +34,7 @@ impl core::fmt::Display for VmError {
             VmError::OutOfMemory => "out of memory",
             VmError::NotMapped => "not mapped",
             VmError::InvalidAddress => "invalid address",
+            VmError::CowShared => "COW-shared leaf",
         };
         f.write_str(s)
     }
@@ -421,19 +427,46 @@ pub fn map(phys_addr: u64, virt_addr: u64, flags: PageTableFlags) -> Result<(), 
     let pd = walker.ensure_next(pdpt, virt.p3_index(), flags, EntryLevel::Pdpt)?;
     let pt = walker.ensure_next(pd, virt.p2_index(), flags, EntryLevel::Pd)?;
 
-    // Never silently overwrite a live translation. A present
-    // PTE pointing at a *different* frame means two owners believe they own
-    // this virtual page: the old frame leaks and whoever still uses the old
-    // mapping is one re-allocation away from reading someone else's memory.
-    // Keep the overwrite (previous behaviour, nothing regresses) but log it.
+    // Never silently overwrite a live translation.
+    //
+    // A present COW leaf is REFUSED: its frame is refcounted and another
+    // address space may still map it, so overwriting the PTE here either leaks
+    // that frame or (worse) installs a writable alias of memory this side no
+    // longer owns. Callers that replace a mapping must release it first
+    // (`release_user_leaf`) or copy it private (`cow_copy_page`).
+    //
+    // A present non-COW PTE pointing at a *different* frame means two owners
+    // believe they own this virtual page: the old frame leaks and whoever still
+    // uses the old mapping is one re-allocation away from reading someone
+    // else's memory. Keep the historical overwrite but log it.
     {
         let entry = &pt[virt.p1_index()];
-        if entry.flags().contains(PageTableFlags::PRESENT) && entry.addr().as_u64() != phys.as_u64()
-        {
-            crate::warn!(
-                "[VMM] remap virt=0x{:016x}: old_phys=0x{:x} -> new_phys=0x{:x} (old frame leaked/aliased)",
-                virt_addr, entry.addr().as_u64(), phys.as_u64()
-            );
+        if entry.flags().contains(PageTableFlags::PRESENT) {
+            let old_flags = entry.flags();
+            let old_phys = entry.addr().as_u64();
+            if old_flags.contains(COW_BIT) {
+                // A COW leaf is shared with at least one other address space and
+                // its frame is refcounted in the PMM. Overwriting it here would
+                // either leak the old frame while another side keeps mapping it,
+                // or install write access to memory that is still shared — the
+                // F-r2-arch-1 UAF. Detach it through `release_user_leaf`, or
+                // copy it private first (`cow_copy_page`).
+                if old_phys != phys.as_u64()
+                    || !flags.contains(COW_BIT)
+                    || flags.contains(PageTableFlags::WRITABLE)
+                {
+                    crate::error!(
+                        "[VMM] refusing to overwrite COW leaf virt=0x{:016x} old_phys=0x{:x} new_phys=0x{:x} flags={:?}",
+                        virt_addr, old_phys, phys.as_u64(), flags
+                    );
+                    return Err(VmError::CowShared);
+                }
+            } else if old_phys != phys.as_u64() {
+                crate::warn!(
+                    "[VMM] remap virt=0x{:016x}: old_phys=0x{:x} -> new_phys=0x{:x} (old frame leaked/aliased)",
+                    virt_addr, old_phys, phys.as_u64()
+                );
+            }
         }
     }
     // Set the PTE (Page Table Entry)
@@ -478,37 +511,6 @@ pub fn walk_pte(virt_addr: u64) -> Option<PageTableEntry> {
         return None;
     }
     Some(pte)
-}
-
-/// Set the WRITABLE bit on the leaf PTE for `virt_addr` in the CURRENT
-/// address space and invalidate the TLB entry. Returns false if the walk is
-/// not fully present. Used by the page-fault handler to fix up pages whose
-/// VmRegion tracking says "writable" but whose PTE lost the bit.
-pub fn set_pte_writable(virt_addr: u64) -> bool {
-    const SHIFTS: [u64; 3] = [39, 30, 21];
-    let mut table_phys = current_pml4_phys();
-    for shift in SHIFTS {
-        let idx = ((virt_addr >> shift) & 0x1ff) as usize;
-        // SAFETY: page-table frames are always readable through the HHDM.
-        let entry =
-            unsafe { core::ptr::read_volatile((phys_to_virt(table_phys) as *const u64).add(idx)) };
-        if entry & 1 == 0 {
-            return false;
-        }
-        table_phys = entry & 0x000f_ffff_ffff_f000;
-    }
-    let idx = (virt_addr >> 12) & 0x1ff;
-    let pte_virt = phys_to_virt(table_phys) + idx * 8;
-    // SAFETY: PTE slot in a mapped page table.
-    let pte = unsafe { core::ptr::read_volatile(pte_virt as *const u64) };
-    if pte & 1 == 0 {
-        return false;
-    }
-    unsafe {
-        core::ptr::write_volatile(pte_virt as *mut u64, pte | PageTableFlags::WRITABLE.bits())
-    };
-    x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(virt_addr));
-    true
 }
 
 pub fn dump_translation(virt_addr: u64) {
@@ -778,7 +780,176 @@ pub fn virt_to_phys_in(pml4: u64, virt: u64) -> Option<u64> {
 /// [`fork_user_space_cow`]; cleared when a side copies the page private
 /// ([`cow_copy_page`]) or when it exits (`drop_user_space` unrefs instead of
 /// freeing).
-const COW_BIT: PageTableFlags = PageTableFlags::BIT_9;
+pub(crate) const COW_BIT: PageTableFlags = PageTableFlags::BIT_9;
+
+/// Result of detaching one user leaf through [`release_user_leaf`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafRelease {
+    /// The frame was returned to the PMM: privately owned, or the last COW sharer.
+    Freed,
+    /// The leaf was COW-shared and another address space still maps it; only
+    /// this side's PMM reference was dropped. The PTE is gone, the frame stays.
+    Shared,
+}
+
+/// Release one leaf frame according to its COW ownership marker.
+///
+/// The SINGLE place where a user leaf frame goes back to the PMM (or stays
+/// owned by other sharers): `munmap`, `mprotect(PROT_NONE)`, `MAP_FIXED`
+/// replacement, `mremap` and address-space teardown all funnel their leaf
+/// frees here. A `COW_BIT` leaf consumes one `pmm::cow_unref` reference and is
+/// freed only when that call reports the last one; an ordinary private leaf is
+/// freed directly. No caller may call `pmm::free_frame` on a user leaf it
+/// detached itself.
+fn release_leaf_frame(frame: u64, flags: PageTableFlags) -> bool {
+    if flags.contains(COW_BIT) {
+        if crate::memory::pmm::cow_unref(frame) {
+            crate::memory::pmm::free_frame(frame);
+            true
+        } else {
+            false
+        }
+    } else {
+        crate::memory::pmm::free_frame(frame);
+        true
+    }
+}
+
+/// Detach the 4 KiB leaf at `virt_addr` from the ACTIVE user address space and
+/// release its frame exactly once according to COW ownership.
+///
+/// This is the release half of the ownership invariant: the PTE is cleared
+/// before the frame is (possibly) returned to the PMM, so no live translation
+/// ever points at a free frame, and a COW-shared frame is not freed while the
+/// other address space still maps it.
+///
+/// Returns [`VmError::NotMapped`] when no 4 KiB leaf is present (huge pages in
+/// the user half are a kernel bug and are refused rather than mis-walked), and
+/// [`VmError::InvalidAddress`] for a non-user address — this helper exists for
+/// user leaves only.
+pub fn release_user_leaf(virt_addr: u64) -> Result<LeafRelease, VmError> {
+    if virt_addr >= USER_ADDR_MAX {
+        return Err(VmError::InvalidAddress);
+    }
+    let walker = PageTableWalker::new();
+    let virt = VirtAddr::new(virt_addr);
+    let pml4 = walker.root_mut();
+    let p4e = &pml4[virt.p4_index()];
+    if !p4e.flags().contains(PageTableFlags::PRESENT)
+        || p4e.flags().contains(PageTableFlags::HUGE_PAGE)
+    {
+        return Err(VmError::NotMapped);
+    }
+    let Some(pdpt) = walker.next_mut(p4e) else {
+        return Err(VmError::NotMapped);
+    };
+    let p3e = &pdpt[virt.p3_index()];
+    if !p3e.flags().contains(PageTableFlags::PRESENT)
+        || p3e.flags().contains(PageTableFlags::HUGE_PAGE)
+    {
+        return Err(VmError::NotMapped);
+    }
+    let Some(pd) = walker.next_mut(p3e) else {
+        return Err(VmError::NotMapped);
+    };
+    let p2e = &pd[virt.p2_index()];
+    if !p2e.flags().contains(PageTableFlags::PRESENT)
+        || p2e.flags().contains(PageTableFlags::HUGE_PAGE)
+    {
+        return Err(VmError::NotMapped);
+    }
+    let Some(pt) = walker.next_mut(p2e) else {
+        return Err(VmError::NotMapped);
+    };
+    let entry = &mut pt[virt.p1_index()];
+    if !entry.flags().contains(PageTableFlags::PRESENT) {
+        return Err(VmError::NotMapped);
+    }
+    let frame = entry.addr().as_u64();
+    let flags = entry.flags();
+    // Clear the translation BEFORE the frame can become free: a TLB miss must
+    // never resurrect a stale translation to a frame the PMM can hand out.
+    entry.set_unused();
+    tlb::flush(virt);
+    Ok(if release_leaf_frame(frame, flags) {
+        LeafRelease::Freed
+    } else {
+        LeafRelease::Shared
+    })
+}
+
+/// Re-flag an existing 4 KiB leaf of the ACTIVE user address space WITHOUT
+/// changing its frame. Used by `mprotect(2)`: it needs no PMM allocation and
+/// therefore cannot fail with `ENOMEM` half-way through the range.
+///
+/// A COW leaf keeps its `COW_BIT` and is never made hardware-writable: write
+/// permission is delivered lazily by the next write fault ([`cow_copy_page`]),
+/// exactly like Linux's `can_change_pte_writable` keeps a write-protected PTE
+/// when the page is still shared. Clearing the marker or setting `WRITABLE`
+/// here would silently create a writable alias of a frame another address
+/// space still owns.
+pub fn set_user_leaf_flags(virt_addr: u64, flags: PageTableFlags) -> Result<(), VmError> {
+    if virt_addr >= USER_ADDR_MAX {
+        return Err(VmError::InvalidAddress);
+    }
+    if flags.contains(COW_BIT) && flags.contains(PageTableFlags::WRITABLE) {
+        crate::error!(
+            "[VMM] refusing WRITABLE|COW leaf flags for virt=0x{:016x}",
+            virt_addr
+        );
+        return Err(VmError::CowShared);
+    }
+    let walker = PageTableWalker::new();
+    let virt = VirtAddr::new(virt_addr);
+    let pml4 = walker.root_mut();
+    let p4e = &pml4[virt.p4_index()];
+    if !p4e.flags().contains(PageTableFlags::PRESENT)
+        || p4e.flags().contains(PageTableFlags::HUGE_PAGE)
+    {
+        return Err(VmError::NotMapped);
+    }
+    let Some(pdpt) = walker.next_mut(p4e) else {
+        return Err(VmError::NotMapped);
+    };
+    let p3e = &pdpt[virt.p3_index()];
+    if !p3e.flags().contains(PageTableFlags::PRESENT)
+        || p3e.flags().contains(PageTableFlags::HUGE_PAGE)
+    {
+        return Err(VmError::NotMapped);
+    }
+    let Some(pd) = walker.next_mut(p3e) else {
+        return Err(VmError::NotMapped);
+    };
+    let p2e = &pd[virt.p2_index()];
+    if !p2e.flags().contains(PageTableFlags::PRESENT)
+        || p2e.flags().contains(PageTableFlags::HUGE_PAGE)
+    {
+        return Err(VmError::NotMapped);
+    }
+    let Some(pt) = walker.next_mut(p2e) else {
+        return Err(VmError::NotMapped);
+    };
+    let entry = &mut pt[virt.p1_index()];
+    if !entry.flags().contains(PageTableFlags::PRESENT) {
+        return Err(VmError::NotMapped);
+    }
+    let old_flags = entry.flags();
+    if old_flags.contains(COW_BIT)
+        && (!flags.contains(COW_BIT) || flags.contains(PageTableFlags::WRITABLE))
+    {
+        crate::error!(
+            "[VMM] refusing to clear COW marker on virt=0x{:016x} (old={:?} new={:?})",
+            virt_addr,
+            old_flags,
+            flags
+        );
+        return Err(VmError::CowShared);
+    }
+    let frame = entry.addr();
+    entry.set_addr(frame, flags | PageTableFlags::PRESENT);
+    tlb::flush(virt);
+    Ok(())
+}
 
 /// Release every frame owned by a *private* user address space: all mapped
 /// 4 KiB leaf frames in the lower half (PML4 entries 0..256), the intermediate
@@ -807,7 +978,10 @@ pub fn drop_user_space(pml4: u64) {
             if e3.flags().contains(PageTableFlags::HUGE_PAGE) {
                 // 1 GiB leaf: the entry's frame IS the mapped page (there is
                 // no PD table behind it). Nothing else is freed at this level.
-                crate::memory::pmm::free_frame(e3.addr().as_u64());
+                // COW cannot currently produce huge leaves (fork falls back to
+                // the eager copier), but the shared release helper keeps the
+                // accounting correct if that ever changes.
+                release_leaf_frame(e3.addr().as_u64(), e3.flags());
                 continue;
             }
             let p2_phys = e3.addr().as_u64();
@@ -819,7 +993,7 @@ pub fn drop_user_space(pml4: u64) {
                 }
                 if e2.flags().contains(PageTableFlags::HUGE_PAGE) {
                     // 2 MiB leaf: the entry's frame IS the mapped page.
-                    crate::memory::pmm::free_frame(e2.addr().as_u64());
+                    release_leaf_frame(e2.addr().as_u64(), e2.flags());
                     continue;
                 }
                 let p1_phys = e2.addr().as_u64();
@@ -829,17 +1003,11 @@ pub fn drop_user_space(pml4: u64) {
                     if !e1.flags().contains(PageTableFlags::PRESENT) {
                         continue;
                     }
-                    let frame = e1.addr().as_u64();
-                    if e1.flags().contains(COW_BIT) {
-                        // Shared with another address space: only drop this
-                        // side's reference. The last departing side frees —
-                        // `cow_unref` reports that via its return value.
-                        if crate::memory::pmm::cow_unref(frame) {
-                            crate::memory::pmm::free_frame(frame);
-                        }
-                    } else {
-                        crate::memory::pmm::free_frame(frame);
-                    }
+                    // Shared with another address space: only drop this
+                    // side's reference. The last departing side frees —
+                    // `release_leaf_frame`'s cow_unref reports that via its
+                    // return value. Private leaves are freed directly.
+                    release_leaf_frame(e1.addr().as_u64(), e1.flags());
                 }
                 // The PT frame itself: free even when every leaf was
                 // unmapped earlier (munmap clears leaf PTEs but leaves the

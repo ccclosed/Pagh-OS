@@ -1,3 +1,4 @@
+pub mod cow;
 pub mod heap;
 pub mod layout;
 pub mod pmm;

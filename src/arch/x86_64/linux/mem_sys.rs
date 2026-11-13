@@ -14,8 +14,8 @@
 //! ## Address space
 //!
 //! During a syscall the active CR3 is the calling process's user PML4, so
-//! `vmm::map`/`vmm::unmap`/`vmm::virt_to_phys` operate directly on that process's
-//! address space — no CR3 switch is needed here. PMM/VMM use their own brief
+//! `vmm::map`/`vmm::release_user_leaf`/`vmm::virt_to_phys` operate directly on
+//! that process's address space — no CR3 switch is needed here. PMM/VMM use their own brief
 //! spinlocks and never wait on a device interrupt, so it is safe to run this work
 //! inside the [`crate::task::compat::with_current_compat`] closure (which holds the
 //! `COMPAT_STATES` lock).
@@ -24,9 +24,10 @@
 //!
 //! `brk`-grow and `mmap` allocate frames page-by-page; on the first
 //! `pmm::alloc_frame` failure (or a `vmm::map` failure) every page mapped so far in
-//! that call is unwound (`vmm::unmap` + `pmm::free_frame`) and the operation returns
-//! with the process's memory state unchanged: `brk` reports the unchanged break,
-//! `mmap` returns `-ENOMEM`.
+//! that call is unwound through the single leaf-release path
+//! (`vmm::release_user_leaf`, which honours COW ownership) and the operation
+//! returns with the process's memory state unchanged: `brk` reports the unchanged
+//! break, `mmap` returns `-ENOMEM`.
 #![allow(dead_code)]
 
 use alloc::vec::Vec;
@@ -135,10 +136,11 @@ fn map_zeroed_range(from: u64, to: u64, flags: PageTableFlags) -> bool {
 /// Unmap a set of pages this call mapped, returning their frames to the PMM.
 fn unwind(pages: &[u64]) {
     for &p in pages {
-        if let Some(phys) = vmm::virt_to_phys(p) {
-            let _ = vmm::unmap(p);
-            pmm::free_frame(phys & !(PAGE_SIZE - 1));
-        }
+        // The single leaf-release path: unwinds frames this call mapped itself
+        // (never COW-shared, so they are freed), but a COW leaf at the same VA
+        // is accounted for instead of being freed behind another address
+        // space's back.
+        let _ = vmm::release_user_leaf(p);
     }
 }
 
@@ -284,15 +286,15 @@ pub fn sys_mmap(
             return Err(Errno::ENOMEM);
         }
         if fixed {
-            // MAP_FIXED replaces whatever was there: return the old frames so
+            // MAP_FIXED replaces whatever was there: release the old leaves so
             // `map_zeroed_range` backs the whole span with fresh zeroed pages,
             // and cut the replaced span out of the tracked regions.
             for i in 0..pages {
                 let page = base + i * PAGE_SIZE;
-                if let Some(phys) = vmm::virt_to_phys(page) {
-                    let _ = vmm::unmap(page);
-                    pmm::free_frame(phys & !(PAGE_SIZE - 1));
-                }
+                // The replaced pages may be COW-shared with another address
+                // space (the loader re-maps over a forked image): unref instead
+                // of freeing a frame the other side still maps.
+                let _ = vmm::release_user_leaf(page);
             }
             cut_regions(&mut vm.mmaps, base, pages);
         }
@@ -549,10 +551,10 @@ fn munmap_impl(vm: &mut VmRegionSet, base: u64, len: u64) -> Result<u64, Errno> 
         MunmapPlan::Unmap { base, pages } => {
             for i in 0..pages {
                 let page = base + i * PAGE_SIZE;
-                if let Some(phys) = vmm::virt_to_phys(page) {
-                    let _ = vmm::unmap(page);
-                    pmm::free_frame(phys & !(PAGE_SIZE - 1));
-                }
+                // One release path for every detached leaf: private frames are
+                // freed, COW-shared frames only lose this address space's
+                // reference and stay mapped in the other one.
+                let _ = vmm::release_user_leaf(page);
             }
             cut_regions(&mut vm.mmaps, base, pages);
             Ok(0)
@@ -667,12 +669,32 @@ fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result
         if page >= USER_ADDR_MAX {
             return Err(Errno::EINVAL);
         }
-        if let Some(frame) = vmm::virt_to_phys(page) {
-            let _ = vmm::unmap(page);
+        if vmm::virt_to_phys(page).is_some() {
             if prot_none {
-                pmm::free_frame(frame & !(PAGE_SIZE - 1));
+                // PROT_NONE drops the translation; a COW-shared frame is
+                // unref'd (freed only when this was the last sharer), never
+                // freed unconditionally.
+                let _ = vmm::release_user_leaf(page);
             } else {
-                let _ = vmm::map(frame & !(PAGE_SIZE - 1), page, leaf_flags(writable, nx));
+                // Raw leaf flags (`page_flags` intersects the whole walk and
+                // therefore masks software leaf-only bits like COW_BIT; the
+                // ownership marker must be read from the leaf PTE itself).
+                let Some(old_flags) = vmm::walk_pte(page).map(|pte| pte.flags()) else {
+                    continue;
+                };
+                // A COW leaf stays shared: keep its marker and never install
+                // hardware write access to a frame another address space still
+                // maps. Write permission is granted by the next write fault,
+                // which copies the page private (cow_copy_page) and restores
+                // WRITABLE on the private copy only.
+                let mut new_flags = leaf_flags(writable, nx);
+                if old_flags.contains(vmm::COW_BIT) {
+                    new_flags |= vmm::COW_BIT;
+                    new_flags = new_flags - PageTableFlags::WRITABLE;
+                }
+                // Re-flag in place: same frame, no PMM allocation, so an OOM
+                // cannot leave half the range detached.
+                let _ = vmm::set_user_leaf_flags(page, new_flags);
             }
         }
     }
