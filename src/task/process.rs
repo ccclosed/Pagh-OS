@@ -829,24 +829,48 @@ pub fn spawn_linux_thread(
 /// Runs with interrupts disabled so (a) the page-copy walk sees a stable
 /// parent address space and (b) the child cannot be scheduled before its
 /// CompatState is registered.
+///
+/// `parent_tid` / `child_tid` are the `CLONE_PARENT_SETTID` /
+/// `CLONE_CHILD_SETTID` output pointers (0 = that flag was not requested). Both
+/// the validation and the writes happen inside this interrupt-disabled window:
+/// a sibling thread of the caller can share its address space (`CLONE_VM`), so
+/// validating before the fork and writing after it let that sibling munmap the
+/// page in between — and the ring-0 write then faulted in kernel mode and
+/// halted the machine (F-x86a-4 clone residue). Masking interrupts makes the
+/// checked mapping impossible to change until both writes are done; the child
+/// is enqueued but cannot run either. The child-side write lands in the child's
+/// already-copied address space through the HHDM window (the parent's own page
+/// keeps its value); without this window the child could run, munmap its
+/// `child_tid` page and leave the translate-then-write writing into a freed
+/// frame.
 pub fn fork_linux_process(
     regs: &crate::arch::x86_64::linux::regs::SavedRegs,
     clear_child_tid: u64,
-) -> Result<(u64, u64), &'static str> {
+    parent_tid: u64,
+    child_tid: u64,
+) -> Result<(u64, u64), crate::arch::x86_64::linux::errno::Errno> {
+    use crate::arch::x86_64::linux::errno::Errno;
     crate::arch::cpu::without_interrupts(|| {
+        // Validate the TID outputs BEFORE the child exists, so a bad pointer
+        // returns EFAULT with nothing half-created to unwind.
+        if parent_tid != 0 && crate::arch::x86_64::linux::check_user_ptr(parent_tid, 4).is_err() {
+            return Err(Errno::EFAULT);
+        }
+        if child_tid != 0 && crate::arch::x86_64::linux::check_user_ptr(child_tid, 4).is_err() {
+            return Err(Errno::EFAULT);
+        }
         let parent = scheduler::current_pid();
         let child = scheduler::next_pid();
         let parent_pml4 = vmm::current_pml4_phys();
-        let child_pml4 = vmm::new_user_pml4().map_err(|_| "fork: no frame for child PML4")?;
+        let child_pml4 = vmm::new_user_pml4().map_err(|_| Errno::ENOMEM)?;
         // Copy-on-write share: the child mirrors the parent's leaf frames
         // (refcounted), writable entries flip RO on both sides, and the next
         // write on either side copies the page private. Falls back to the
         // eager copier if the space uses huge pages (none do today).
         if vmm::fork_user_space_cow(parent_pml4, child_pml4).is_err() {
-            vmm::clone_user_space(parent_pml4, child_pml4)
-                .map_err(|_| "fork: user-space copy failed")?;
+            vmm::clone_user_space(parent_pml4, child_pml4).map_err(|_| Errno::ENOMEM)?;
         }
-        let child_top = setup_task_kernel_stack(child)?;
+        let child_top = setup_task_kernel_stack(child).map_err(|_| Errno::ENOMEM)?;
         // setup_task_kernel_stack points TSS RSP0 / the syscall stack at the
         // CHILD; the PARENT keeps running after this syscall, so point them back
         // (same pattern as spawn_linux_thread above).
@@ -863,9 +887,22 @@ pub fn fork_linux_process(
         // Register the child's CompatState BEFORE enqueue so its very first
         // syscall is already routed with full Linux semantics.
         if !compat::fork_current_compat(child, clear_child_tid) {
-            return Err("fork: parent has no compat state");
+            return Err(Errno::EINVAL);
         }
         scheduler::spawn(Tcb::new(child, krsp, child_pml4));
+        // SAFETY: both pointers were validated above, still inside this
+        // interrupt-disabled window — no task can have changed either mapping,
+        // and the parent's CR3 is active, so the parent-address-space write is
+        // direct. The child-side write goes through the child PML4's physical
+        // frame (HHDM), also under the same window.
+        if parent_tid != 0 {
+            unsafe { (parent_tid as *mut u32).write_unaligned(child as u32) }
+        }
+        if child_tid != 0 {
+            if let Some(phys) = vmm::virt_to_phys_in(child_pml4, child_tid) {
+                unsafe { (vmm::phys_to_virt(phys) as *mut u32).write_unaligned(child as u32) }
+            }
+        }
         crate::info!(
             "[linux] fork: parent pid={} pml4=0x{:x} -> child pid={} pml4=0x{:x}",
             parent,
