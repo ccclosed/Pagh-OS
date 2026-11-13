@@ -42,8 +42,9 @@ list/setmirror), парсер индекса `Packages`, резолвер зав
 - `deb`: `parse_ar`, `locate_members`, `compression_of`, `decompress_data`,
   `decompress_bytes_capped`, `decompress_stream(data, c, max, sink)`.
 - `tar`: `read_tar(buf) -> Vec<TarEntry>`, `write_tar(entries)`; `TarType::{Regular, Directory, Symlink, Other}`.
-- `install_fs`: `install_data_tar(entries, root) -> usize`; `InstallError::{NoSpace, Vfs}`.
-- `install`: `plan_install(entries) -> InstallPlan` — чистый планировщик (файлы, симлинки, порядок хардлинков, `deferred`/`unresolved`, счётчики пропусков).
+- `install_fs`: `install_data_tar(entries, root) -> usize`; `InstallError::{NoSpace, Vfs, UnsafePath}`
+  (`UnsafePath` — пакет отвергнут целиком до записи, F-x86n-1);
+- `install`: `plan_install(entries) -> InstallPlan` — чистый планировщик (файлы, симлинки, порядок хардлинков, `deferred`/`unresolved`, `unsafe_members`, счётчики пропусков).
 - `tar`: ещё `write_tar_members(members, TarFormat)` + `TarMember` (фикстуры со ссылками и длинными именами), `effective_path(entry)` (склейка ustar `prefix`).
 
 ## Как работает
@@ -85,14 +86,20 @@ fetch `{base}/{filename}` → сверка SHA-256 **и размера ДО** `p
 Порядок и выбор членов архива решает **чистый** `install::plan_install` (host-свойства
 `tar_links`), а `install_data_tar` его исполняет:
 - регулярные файлы — как раньше: нормализация пути (`..`-выход за корень → `SkipUnsafe`),
-  создание недостающих родителей (резолв **со следованием по ссылкам**, поэтому `lib64 → usr/lib64`
-  кладёт файл внутрь цели), удаление+пересоздание существующей записи (ext2 `write_file` только
-  растит `i_size`);
+  создание недостающих родителей **строго внутри install-root** (конфайнмент F-x86n-1: резолвер
+  идёт lstat-style от узла `/mnt`, не проходит сквозь симлинки, созданные самим пакетом, не
+  следует абсолютным целям и не выпускает `..` за корень; существующая *относительная* ссылка
+  внутри корня — `lib64 → usr/lib64` — по-прежнему разворачивается), удаление+пересоздание
+  существующей записи (ext2 `write_file` только растит `i_size`);
 - **симлинки создаются как симлинки** (`VfsNode::create_symlink`), цель хранится дословно;
   висячая цель — норма (альтернативы/`ld-linux`);
 - **хардлинки — как хардлинки** (`VfsNode::link`, общий inode, `st_nlink == 2`), цель берётся из
   ФС без следования по конечной ссылке; цели, которых ещё нет, повторяются фикспойнтом, а
   неразрешимые пропускаются с одним warn — **копией не становится ничто**;
+- **член, лежащий под симлинком самого пакета** (или хардлинк с такой целью), отвергает весь
+  пакет атомарно до первой записи: `install::plan_install` собирает `unsafe_members`,
+  `install_data_tar` возвращает `InstallError::UnsafePath` (F-x86n-1, `./y -> /etc` +
+  `./y/autorun` больше не пишет `/mnt/etc/autorun`);
 - существующий каталог на пути члена — пропуск с warn (рекурсивного удаления нет);
 - `VfsError::IoError` от ext2 = out-of-space → частичный файл удаляется, `InstallError::NoSpace`.
 

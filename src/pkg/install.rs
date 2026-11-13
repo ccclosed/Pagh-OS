@@ -23,7 +23,7 @@
 //! `pub mod tar;`). One source, two crates, no shim.
 #![allow(dead_code)]
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -37,6 +37,42 @@ pub enum NormPath {
     /// The entry must be skipped: its path escapes the root via `..`, or it
     /// normalizes to the empty path (R10.8).
     SkipUnsafe,
+}
+
+/// One member the planner refuses because its path would be materialized through
+/// a symbolic link the same archive creates (F-x86n-1).
+///
+/// A member written through a link the archive itself planted lands wherever that
+/// link points, not where the member's path says: `./y -> /etc` followed by
+/// `./y/autorun` used to write `/mnt/etc/autorun`, which the shell executes as
+/// root at boot. The effectful installer refuses the **whole package** when this
+/// list is non-empty, before it writes anything.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct UnsafeMember {
+    /// The refused root-relative path — a member path, or (see
+    /// [`is_hardlink_target`](Self::is_hardlink_target)) a hard link's target.
+    pub path: String,
+    /// The archive path of the symlink the refused path would descend through.
+    pub link: String,
+    /// `true` when [`path`](Self::path) is a hard link's target, not a member.
+    pub is_hardlink_target: bool,
+}
+
+/// Does `path` descend through one of the root-relative `links`?
+///
+/// Only real path components are compared: `x/y` descends through `x`, never
+/// through `xy`. The input is a normalized root-relative path (no `..`, no empty
+/// components), so a plain ancestor scan is exact. Pure and panic-free.
+pub fn symlink_ancestor<'a>(path: &str, links: &'a BTreeSet<String>) -> Option<&'a str> {
+    let mut start = 0usize;
+    while let Some(pos) = path[start..].find('/') {
+        let end = start + pos;
+        if let Some(link) = links.get(&path[..end]) {
+            return Some(link.as_str());
+        }
+        start = end + 1;
+    }
+    None
 }
 
 /// Normalize an archived tar path to a safe, root-relative path (R10.1, R10.8).
@@ -127,6 +163,10 @@ pub struct InstallPlan<'a> {
     /// Hard links that reference each other in a cycle inside this archive and so
     /// can never be created; skipped with one diagnostic each.
     pub unresolved: Vec<String>,
+    /// Members dropped because an ancestor component of their path is a symlink
+    /// **this archive** creates (F-x86n-1). They never reach [`InstallPlan::ops`];
+    /// a non-empty list makes the effectful installer refuse the whole package.
+    pub unsafe_members: Vec<UnsafeMember>,
     /// Members dropped because their path escapes the install root (R10.8).
     pub skipped_unsafe: usize,
     /// Link members with an empty target: creating them would be meaningless.
@@ -150,15 +190,37 @@ pub struct InstallPlan<'a> {
 ///     provides, are collected in [`InstallPlan::unresolved`] /
 ///     [`InstallPlan::deferred`] instead of being silently turned into copies;
 ///   * paths escaping the root (`..`), and link members with an empty target, are
-///     counted and dropped.
+///     counted and dropped;
+///   * a member (or hard-link target) whose **ancestor component is a symlink this
+///     archive creates** is collected in [`InstallPlan::unsafe_members`] and
+///     dropped: following that link would write wherever it points, not at the
+///     planned path (F-x86n-1). The check is made against every symlink the
+///     archive plans, regardless of archive order, because hard links execute
+///     after all file/symlink operations.
 ///
-/// Pure and allocation-bounded.
+/// Pure and allocation-bounded. The symlink-ancestry refusal deliberately
+/// over-approximates: a pathological archive that both creates `x` as a directory
+/// tree and later replaces `x` with a symlink is refused entirely instead of
+/// relying on install order.
 pub fn plan_install<'a>(entries: &[TarEntry<'a>]) -> InstallPlan<'a> {
     let mut plan = InstallPlan::default();
     // Paths this archive creates, used to order hard links.
     let mut created: Vec<String> = Vec::new();
     // Hard links still to be ordered: (member path, normalized target).
     let mut pending: Vec<(String, String)> = Vec::new();
+
+    // F-x86n-1: the symlinks this archive plans to create, collected up front so a
+    // member is judged against every link in the archive (hard links are executed
+    // after all links, so archive order alone would miss `file x/y` + `link x`).
+    let mut own_links: BTreeSet<String> = BTreeSet::new();
+    for entry in entries {
+        if entry.kind != TarType::Symlink || entry.link_target.is_empty() {
+            continue;
+        }
+        if let NormPath::Keep(p) = normalize_entry_path(&effective_path(entry)) {
+            own_links.insert(p);
+        }
+    }
 
     for entry in entries {
         // Long paths arrive through the GNU `'L'` header or the ustar `prefix`
@@ -171,6 +233,17 @@ pub fn plan_install<'a>(entries: &[TarEntry<'a>]) -> InstallPlan<'a> {
                 continue;
             }
         };
+        // A member below a symlink this archive creates would be materialized
+        // through that link (F-x86n-1): refuse it here and let the effectful
+        // installer refuse the whole package.
+        if let Some(link) = symlink_ancestor(&path, &own_links) {
+            plan.unsafe_members.push(UnsafeMember {
+                path,
+                link: String::from(link),
+                is_hardlink_target: false,
+            });
+            continue;
+        }
         match entry.kind {
             TarType::Regular => {
                 plan.ops.push(InstallOp::File {
@@ -202,7 +275,20 @@ pub fn plan_install<'a>(entries: &[TarEntry<'a>]) -> InstallPlan<'a> {
                 // Tar stores the target as the *archive* path of the first
                 // occurrence, so it is normalized like any other member path.
                 match normalize_entry_path(entry.link_target) {
-                    NormPath::Keep(t) => pending.push((path, t)),
+                    NormPath::Keep(t) => {
+                        // The hard-link target is resolved on the installed tree;
+                        // if it descends through a link this archive creates, the
+                        // link would be materialized outside its planned path.
+                        if let Some(link) = symlink_ancestor(&t, &own_links) {
+                            plan.unsafe_members.push(UnsafeMember {
+                                path: t,
+                                link: String::from(link),
+                                is_hardlink_target: true,
+                            });
+                            continue;
+                        }
+                        pending.push((path, t));
+                    }
                     NormPath::SkipUnsafe => {
                         plan.skipped_unsafe += 1;
                         continue;
@@ -275,7 +361,11 @@ pub fn plan_install<'a>(entries: &[TarEntry<'a>]) -> InstallPlan<'a> {
 ///     because entries are processed in order and each insert overwrites the prior.
 ///
 /// The resulting [`BTreeMap`] is the model filesystem property test P26 asserts over.
-/// Pure and panic-free.
+///
+/// The model deliberately covers only the regular-file selection semantics: a
+/// package that would be refused by the symlink-ancestry rule (F-x86n-1) has no
+/// `path -> content` image at all, so this map describes member selection, not
+/// whether [`plan_install`] accepts the archive. Pure and panic-free.
 pub fn install_model<'a>(entries: &[TarEntry<'a>]) -> BTreeMap<String, Vec<u8>> {
     let mut model: BTreeMap<String, Vec<u8>> = BTreeMap::new();
 

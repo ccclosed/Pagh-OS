@@ -1497,7 +1497,9 @@ pub(super) fn cmd_pkg(_ctx: &mut ShellCtx, args: &[&str]) {
             }
             shell_println("pkg: done. Run an installed binary with: lxrun /mnt/<path>");
         }
-        Err(e) => shell_println(&alloc::format!("pkg: install failed: {:?}", e)),
+        // `Display` names the refused path and reason (F-x86n-1); the installer has
+        // already emitted the structured diagnostic.
+        Err(e) => shell_println(&alloc::format!("pkg: install failed: {}", e)),
     }
 }
 

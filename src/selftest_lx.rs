@@ -58,7 +58,7 @@ use crate::arch::x86_64::linux::{io_sys, linux_dispatch, mem_sys, misc};
 use crate::memory::layout::USER_MMAP_BASE;
 use crate::memory::{pmm, vmm};
 use crate::net::http_fetch::{fetch_deb, FetchError};
-use crate::pkg::install_fs::install_data_tar;
+use crate::pkg::install_fs::{install_data_tar, InstallError};
 use crate::pkg::tar::{read_tar, write_tar, write_tar_members, TarFormat, TarMember};
 use crate::task::compat::{self, CompatState};
 use crate::task::fd::FdTable;
@@ -91,6 +91,7 @@ pub fn run() {
     check_oom_rollback();
     check_fetch_no_network();
     check_ext2_install_roundtrip();
+    check_install_symlink_confinement();
 
     // ── New "no new process model" syscalls (Feature: linux-binary-compat) ──
     check_getcwd();
@@ -2692,6 +2693,202 @@ fn check_ext2_install_roundtrip() {
     }
 
     pass(name);
+}
+
+/// F-x86n-1 — a package cannot redirect its own members outside the install root
+/// with a symlink, and the installer still follows pre-existing *relative* in-root
+/// links.
+///
+/// The 2026-11-13 audit package (`data.tar` members in order `./y -> /etc`, then
+/// `./y/autorun`) contains no `..`, so archive-path normalization accepted it;
+/// parent resolution then followed the package's own link and the file landed at
+/// `/mnt/etc/autorun`, which the shell executes as root at the next boot.
+/// `./x -> /` + `./x/pwned_root` wrote `/mnt/pwned_root` the same way. The
+/// installer must refuse the whole package **atomically** (`UnsafePath`, no
+/// partial tree) and its confined resolver must not follow absolute link targets.
+///
+/// Controls in the same routine:
+///   * a pre-existing relative in-root link is still followed (a member under
+///     `/mnt/pkgpre/link -> real` lands in `real/`, the `/lib64 -> usr/lib64`
+///     behaviour the installer documents);
+///   * a pre-existing absolute link target is refused (`UnsafePath`);
+///   * a pre-existing link whose relative target escapes the root is refused;
+///   * a normal archive still installs and reads back byte-for-byte.
+fn check_install_symlink_confinement() {
+    let name = "install_symlink_confinement";
+    const MARK: &[u8] = b"PWN-PKG-SYMLINK-ESCAPE\n";
+    const PAYLOAD: &[u8] = b"positive-control\n";
+
+    // Scratch paths this check owns; leftovers from an earlier boot are removed
+    // first so the routine is repeatable on the persistent data disk.
+    let scratch: [&str; 17] = [
+        "/mnt/pkgesc/y/autorun",
+        "/mnt/pkgesc/y/pwned",
+        "/mnt/pkgesc/y",
+        "/mnt/pkgesc",
+        "/mnt/pkgpre/real/leaf",
+        "/mnt/pkgpre/link/leaf",
+        "/mnt/pkgpre/abs/leaf",
+        "/mnt/pkgpre/out/leaf",
+        "/mnt/pkgpre/link",
+        "/mnt/pkgpre/abs",
+        "/mnt/pkgpre/out",
+        "/mnt/pkgpre/real",
+        "/mnt/pkgpre",
+        "/mnt/pkgok/usr/bin/tool",
+        "/mnt/pkgok/usr/bin",
+        "/mnt/pkgok/usr",
+        "/mnt/pkgok",
+    ];
+    for p in scratch {
+        remove_leaf(p);
+    }
+
+    // 1) The attack's own archive: `./y -> /etc` then `./y/autorun` and
+    //    `./y/pwned`. Refused as a whole, before any inode is written.
+    let attack = [
+        TarMember::Symlink {
+            path: "pkgesc/y",
+            target: "/etc",
+        },
+        TarMember::File {
+            path: "pkgesc/y/autorun",
+            content: MARK,
+        },
+        TarMember::File {
+            path: "pkgesc/y/pwned",
+            content: MARK,
+        },
+    ];
+    if let Err(d) = install_archive("/mnt", &attack, 0) {
+        fail(name, d);
+        return;
+    }
+    if vfs::lookup_path("/mnt/pkgesc").is_ok() {
+        fail(name, "the refused package left a partial tree");
+        return;
+    }
+    // The package must not have overwritten the boot-time autorun file.
+    if let Ok(node) = vfs::lookup_path("/mnt/etc/autorun") {
+        let size = node.size() as usize;
+        let mut buf = alloc::vec![0u8; size];
+        let n = node.read(0, &mut buf).unwrap_or(0);
+        if n == MARK.len() && buf.get(..n) == Some(MARK) {
+            fail(name, "the attack wrote /mnt/etc/autorun");
+            return;
+        }
+    }
+
+    // 2) A pre-existing *relative* in-root link is still followed: this is the
+    //    documented `lib64 -> usr/lib64` placement rule.
+    let mnt = match vfs::lookup_path("/mnt") {
+        Ok(n) => n,
+        Err(_) => {
+            fail(name, "/mnt is not mounted");
+            return;
+        }
+    };
+    let pre = match mnt.create_dir("pkgpre") {
+        Ok(n) => n,
+        Err(_) => {
+            fail(name, "cannot create the scratch directory");
+            return;
+        }
+    };
+    let links_ok = pre.create_dir("real").is_ok()
+        && pre.create_symlink("link", b"real").is_ok()
+        && pre.create_symlink("abs", b"/etc").is_ok()
+        && pre.create_symlink("out", b"../../etc").is_ok();
+    if !links_ok {
+        fail(name, "cannot create the scratch links");
+        return;
+    }
+    let under_rel = [TarMember::File {
+        path: "pkgpre/link/leaf",
+        content: PAYLOAD,
+    }];
+    if let Err(d) = install_archive("/mnt", &under_rel, 1) {
+        fail(name, d);
+        return;
+    }
+    if let Err(d) = verify_file("/mnt/pkgpre/real/leaf", PAYLOAD) {
+        fail(name, d);
+        return;
+    }
+    match vfs::lookup_path("/mnt/pkgpre/link") {
+        Ok(n) if n.is_symlink() => {}
+        _ => {
+            fail(name, "the pre-existing link was replaced");
+            return;
+        }
+    }
+
+    // 3) A pre-existing *absolute* link target must be refused: the guest
+    //    namespace would remap `/etc` to `/mnt/etc`, i.e. the attack path.
+    let under_abs = [TarMember::File {
+        path: "pkgpre/abs/leaf",
+        content: MARK,
+    }];
+    if let Err(d) = install_archive("/mnt", &under_abs, 0) {
+        fail(name, d);
+        return;
+    }
+    // 4) A pre-existing relative target that pops above the root is refused too.
+    let under_out = [TarMember::File {
+        path: "pkgpre/out/leaf",
+        content: MARK,
+    }];
+    if let Err(d) = install_archive("/mnt", &under_out, 0) {
+        fail(name, d);
+        return;
+    }
+
+    // 5) Positive control: a normal archive still installs byte-for-byte.
+    let normal = [TarMember::File {
+        path: "pkgok/usr/bin/tool",
+        content: PAYLOAD,
+    }];
+    if let Err(d) = install_archive("/mnt", &normal, 1) {
+        fail(name, d);
+        return;
+    }
+    if let Err(d) = verify_file("/mnt/pkgok/usr/bin/tool", PAYLOAD) {
+        fail(name, d);
+        return;
+    }
+
+    for p in scratch {
+        remove_leaf(p);
+    }
+    pass(name);
+}
+
+/// Install an in-memory tar through the real [`install_data_tar`] and require
+/// exactly `expected` created entries — or, when `expected == 0`, exactly an
+/// [`InstallError::UnsafePath`] refusal (F-x86n-1 test helper).
+fn install_archive(
+    root: &str,
+    members: &[TarMember<'_>],
+    expected: usize,
+) -> Result<(), &'static str> {
+    let tar = write_tar_members(members, TarFormat::UstarPrefix);
+    let entries = read_tar(&tar).map_err(|_| "read_tar refused a written archive")?;
+    match install_data_tar(&entries, root) {
+        Ok(n) if n == expected => Ok(()),
+        Ok(_) => Err("install_data_tar created the wrong number of entries"),
+        Err(InstallError::UnsafePath { .. }) if expected == 0 => Ok(()),
+        Err(_) => Err("install_data_tar returned the wrong error"),
+    }
+}
+
+/// Remove `path`'s final component through its parent directory (test cleanup;
+/// ignores every error, e.g. an absent path).
+fn remove_leaf(path: &str) {
+    if let Ok((parent, leaf)) = split_parent(path) {
+        if let Ok(dir) = vfs::lookup_path(parent) {
+            let _ = dir.remove(leaf);
+        }
+    }
 }
 
 // ───────── new directory / fd / time syscall checks (linux-binary-compat) ─────────

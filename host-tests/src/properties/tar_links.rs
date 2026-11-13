@@ -361,3 +361,217 @@ proptest! {
         }
     }
 }
+
+// ─────────── F-x86n-1: members below the archive's own symlinks ───────────
+//
+// The installer used to resolve later members' parent directories through *any*
+// symlink in the tree. Because link targets are interpreted in the guest
+// namespace, `./y -> /etc` maps to `/mnt/etc`, so `./y/autorun` (no `..` anywhere)
+// wrote `/mnt/etc/autorun` — executed as root at next boot. The pure planner now
+// refuses any member (or hard-link target) whose ancestor component is a symlink
+// the same archive plans, and the effectful installer turns a non-empty refusal
+// list into a whole-package rejection before writing anything.
+
+/// The F-x86n-1 reproducer archive: `./y -> /etc` then `./y/autorun`.
+#[test]
+fn plan_refuses_member_below_the_archives_own_symlink() {
+    let members = [
+        TarMember::Symlink {
+            path: "y",
+            target: "/etc",
+        },
+        TarMember::File {
+            path: "y/autorun",
+            content: b"echo PWN-AUTORUN-VIA-PKG\n",
+        },
+        TarMember::File {
+            path: "usr/bin/ok",
+            content: b"ok\n",
+        },
+    ];
+    let buf = write_tar_members(&members, TarFormat::UstarPrefix);
+    let entries = read_tar(&buf).expect("stream reads back");
+    let plan = plan_install(&entries);
+
+    assert_eq!(plan.unsafe_members.len(), 1, "exactly the child is refused");
+    let refused = &plan.unsafe_members[0];
+    assert_eq!(refused.path, "y/autorun");
+    assert_eq!(refused.link, "y");
+    assert!(!refused.is_hardlink_target);
+    assert!(
+        !plan
+            .ops
+            .iter()
+            .any(|op| matches!(op, InstallOp::File { path, .. } if path == "y/autorun")),
+        "a refused member must not be planned"
+    );
+    // The harmless member is still planned; the installer refuses the package.
+    assert!(plan.ops.iter().any(
+        |op| matches!(op, InstallOp::File { path, .. } if path == "usr/bin/ok")
+    ));
+}
+
+/// The same refusal when the archive's symlink target is relative and escapes the
+/// root: the target string does not matter — descending through the link is what
+/// is refused.
+#[test]
+fn plan_refuses_member_below_a_relative_escaping_symlink() {
+    let members = [
+        TarMember::Symlink {
+            path: "x",
+            target: "../../..",
+        },
+        TarMember::File {
+            path: "x/pwned_root",
+            content: b"PWN\n",
+        },
+    ];
+    let buf = write_tar_members(&members, TarFormat::UstarPrefix);
+    let entries = read_tar(&buf).expect("stream reads back");
+    let plan = plan_install(&entries);
+    assert_eq!(plan.unsafe_members.len(), 1);
+    assert_eq!(plan.unsafe_members[0].path, "x/pwned_root");
+    assert_eq!(plan.unsafe_members[0].link, "x");
+}
+
+/// The check is against every symlink the archive plans, not only the ones that
+/// precede the member: hard links execute after all file/symlink operations.
+#[test]
+fn plan_refuses_member_below_a_later_symlink() {
+    let members = [
+        TarMember::File {
+            path: "x/pwned",
+            content: b"PWN\n",
+        },
+        TarMember::Symlink {
+            path: "x",
+            target: "/",
+        },
+    ];
+    let buf = write_tar_members(&members, TarFormat::UstarPrefix);
+    let entries = read_tar(&buf).expect("stream reads back");
+    let plan = plan_install(&entries);
+    assert_eq!(plan.unsafe_members.len(), 1);
+    assert_eq!(plan.unsafe_members[0].path, "x/pwned");
+}
+
+/// A hard link whose **member path** is below the archive's own symlink.
+#[test]
+fn plan_refuses_hardlink_below_the_archives_own_symlink() {
+    let members = [
+        TarMember::Symlink {
+            path: "y",
+            target: "/etc",
+        },
+        TarMember::File {
+            path: "usr/bin/real",
+            content: b"data",
+        },
+        TarMember::Hardlink {
+            path: "y/hard",
+            target: "usr/bin/real",
+        },
+    ];
+    let buf = write_tar_members(&members, TarFormat::UstarPrefix);
+    let entries = read_tar(&buf).expect("stream reads back");
+    let plan = plan_install(&entries);
+    assert_eq!(plan.unsafe_members.len(), 1);
+    assert_eq!(plan.unsafe_members[0].path, "y/hard");
+    assert!(!plan.unsafe_members[0].is_hardlink_target);
+    assert!(!plan
+        .ops
+        .iter()
+        .any(|op| matches!(op, InstallOp::Hardlink { path, .. } if path == "y/hard")));
+}
+
+/// A hard link whose **target** is below the archive's own symlink (the target is
+/// resolved on the installed tree, so it would be reached through the link).
+#[test]
+fn plan_refuses_hardlink_target_below_the_archives_own_symlink() {
+    let members = [
+        TarMember::Symlink {
+            path: "y",
+            target: "/etc",
+        },
+        TarMember::File {
+            path: "y/real",
+            content: b"data",
+        },
+        TarMember::Hardlink {
+            path: "h",
+            target: "y/real",
+        },
+    ];
+    let buf = write_tar_members(&members, TarFormat::UstarPrefix);
+    let entries = read_tar(&buf).expect("stream reads back");
+    let plan = plan_install(&entries);
+    // The target is refused for descending through `y`; the hard link that needed
+    // it is refused with it (not deferred, not copied).
+    assert_eq!(plan.unsafe_members.len(), 2);
+    assert_eq!(plan.unsafe_members[0].path, "y/real");
+    assert!(!plan.unsafe_members[0].is_hardlink_target);
+    assert_eq!(plan.unsafe_members[1].path, "y/real");
+    assert!(plan.unsafe_members[1].is_hardlink_target);
+    assert!(plan.deferred.is_empty());
+    assert!(!plan
+        .ops
+        .iter()
+        .any(|op| matches!(op, InstallOp::Hardlink { .. })));
+}
+
+/// The refusal is by path component: `xy` is not below the link `x`.
+#[test]
+fn plan_does_not_refuse_a_sibling_with_a_shared_prefix() {
+    let members = [
+        TarMember::Symlink {
+            path: "x",
+            target: "target",
+        },
+        TarMember::File {
+            path: "xy/file",
+            content: b"ok",
+        },
+    ];
+    let buf = write_tar_members(&members, TarFormat::UstarPrefix);
+    let entries = read_tar(&buf).expect("stream reads back");
+    let plan = plan_install(&entries);
+    assert!(plan.unsafe_members.is_empty());
+    assert!(plan
+        .ops
+        .iter()
+        .any(|op| matches!(op, InstallOp::File { path, .. } if path == "xy/file")));
+}
+
+/// Negative control: the shipped link fixture (`links-pagh`) has symlinks but no
+/// member below them, so the planner must accept it unchanged.
+#[test]
+fn plan_accepts_the_links_fixture() {
+    let members = [
+        TarMember::File {
+            path: "usr/share/links-pagh/real",
+            content: b"payload",
+        },
+        TarMember::Symlink {
+            path: "usr/share/links-pagh/rel",
+            target: "real",
+        },
+        TarMember::Symlink {
+            path: "usr/share/links-pagh/abs",
+            target: "/usr/share/links-pagh/real",
+        },
+        TarMember::Hardlink {
+            path: "usr/share/links-pagh/hard",
+            target: "usr/share/links-pagh/real",
+        },
+        TarMember::File {
+            path: "usr/share/links-pagh/deep/file.txt",
+            content: b"txt",
+        },
+    ];
+    let buf = write_tar_members(&members, TarFormat::UstarPrefix);
+    let entries = read_tar(&buf).expect("stream reads back");
+    let plan = plan_install(&entries);
+    assert!(plan.unsafe_members.is_empty());
+    assert_eq!(plan.ops.len(), 5);
+    assert!(plan.skipped_unsafe == 0 && plan.skipped_empty_target == 0);
+}
