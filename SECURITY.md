@@ -50,14 +50,18 @@ Root bypasses read and write, but **not** execute: a `0644` file cannot be exece
 anyone. That rule is what makes the model meaningful even though the default identity
 is root.
 
-## Attack audit (2026-11-13): fixed
+## Attack audits (2026-11-13 and round 2): fixed
 
 An external red-team pass ran stock ring-3 Linux ELFs on a private QEMU range
 (attachments: PoC sources, serial logs and per-area reports). It found three
 independent ring3-to-ring0 paths and a one-syscall machine kill on the 2.21.0
-image. **Fixed in 2.22.0** for the ring3-to-ring0 paths and in **2.22.3** for
-the user-buffer TOCTOU class (each reproduced before and after; the same PoCs
-still succeed on stock 2.21.0):
+image, and a second, independent round on the 2.22.3 tree found seven more
+(a fork-COW ownership UAF that also reached uid 0, a package-installer hard-link
+alias bypass, and RISC-V kernel/runtime issues). **Fixed in 2.22.0** for the
+round-1 ring3-to-ring0 paths, **2.22.3** for the round-1 user-buffer TOCTOU
+class, **2.22.4/2.22.5** for the round-2 x86 items, with the RISC-V items fixed
+in the sibling repositories. Each finding was reproduced before and after; the
+same PoCs still succeed on the stock images:
 
 * **F-LEAD-1 (critical, verified).** `mprotect(2)` accepted kernel virtual
   addresses: no `USER_ADDR_MAX` gate, a coverage guard that inverted to "allowed"
@@ -136,6 +140,40 @@ still succeed on stock 2.21.0):
   `tests/pkg/e2e_pkg_escape.py` (round-1 packages still refused, a normal `.deb`
   with a regular-file hard link still installs).
 
+**Fixed in 2.22.4 (round-2 audit):**
+
+* **F-r2-arch-1 (critical, verified).** `fork_user_space_cow` shares leaf
+  frames with `COW_BIT` and `pmm::cow_ref` = 2, but only `cow_copy_page` and
+  `drop_user_space` honoured the reference count. `munmap`, `mprotect(PROT_NONE)`,
+  `mmap(MAP_FIXED)` replacement, `mremap` and `vmm::unmap` freed or re-flagged
+  the shared frame unconditionally; `mprotect(RW)` even dropped `COW_BIT` and
+  made the shared frame hardware-writable. The exploit: parent `mprotect(RW)` on
+  a forked range, child `munmap` returns the frames to the PMM, a later `mmap`
+  hands them out as page tables, and the parent's stale writable PTE rewrites
+  them (512 present user PTEs for a chosen physical frame) — a physical-memory
+  read/write primitive that scans for the caller's `Creds` and zeroes them to
+  reach uid 0. The fix is one invariant with one enforcement point:
+  `vmm::release_user_leaf` clears the PTE/TLB first, consumes exactly one
+  `cow_unref` for a COW leaf and frees only on the last reference; it is used by
+  `munmap`, `PROT_NONE`, MAP_FIXED, `mremap`, OOM unwind and `drop_user_space`.
+  `mprotect` now re-flags the leaf in place and keeps `COW_BIT` (first write
+  goes through `cow_copy_page`); `vmm::map` refuses to overwrite a live COW
+  leaf; `pmm::free_frame` refuses and logs a frame with live COW references.
+  The accounting itself is pure and host-tested (`memory/cow.rs`,
+  property `cow_ownership`: model PMM rejects double-free and free-of-mapped
+  under random fork/write/unmap/MAP_FIXED/mprotect/exit). Evidence on the
+  audit's rig: `cow_root` on fixed reports `hijacked PT count=0` and
+  `no page-table reuse observed`, uid stays 1000, zero `DOUBLE FREE` lines and
+  the shell returns; stock 2.22.3 reports uid 0 + root-file read + 1017
+  `[PMM] DOUBLE FREE` lines. `cow_min` reports no frame reuse and no double
+  free; in-QEMU selftest 96 routines pass with two new COW routines.
+* **F-r2-arch-2 (high, verified).** The same ownership bug made
+  `drop_user_space` free PTE frames that had already been returned and reused as
+  live page tables (1017 `DOUBLE FREE` frames in the audit run). The
+  `release_user_leaf` invariant above removes the class: exit, munmap and
+  replacement now agree on who owns a frame, and the selftest's two-pass check
+  confirms frames are not retained or double-freed.
+
 **Fixed in 2.22.1 (this branch):**
 
 * **F-x86n-1 (high, verified).** A `.deb` carried a symlink member pointing
@@ -189,6 +227,39 @@ the stock 2.21.0 range and re-run against the fixed kernel):
   walk. Image size is capped at 256 MiB with a fallible reserve, and the exec
   path is credential-checked.
 
+**Fixed in the sibling repositories (round 2 as well):**
+
+* **F-r2-rv-1 (high, verified; pagh-riscv 0.24.2, PR #14).** A non-canonical
+  user pointer passed `user_range_valid` because the Sv39 walk ignores bits
+  63..39 (`mmu::vpn`), so `openat(0xdead_0000_0000_0000|path)` produced a
+  supervisor-mode load page fault and `park_forever()` — a one-ecall machine
+  kill. The validator now requires `mmu::is_canonical` at both range ends plus
+  the lower-half `USER_TOP` bound before the per-page U/R/W walk (the canonical
+  *supervisor* half was a second aliasing variant found while fixing); the page
+  walk and `protect_in`/`unmap_in` reject non-canonical/upper-half VAs; a
+  34-case in-guest ABI matrix and a committed `noncanon.elf` harness cover the
+  class. Fixed: syscall returns `-EFAULT`, shell survives; stock: `[EXC] load
+  page fault … [EXC] halting`.
+* **F-r2-libc-1 (high, verified; pagh-libc 0.15.2, PR #11).** `ld-pagh`
+  validated the *addresses* of dynamic tables but called the pointers read from
+  them: every `DT_INIT`/`DT_INIT_ARRAY` (and `DT_FINI*`) target must now be
+  inside an executable file-backed `PT_LOAD` of the same object, the table
+  itself inside writable non-executable file-backed data, and `SHN_ABS`
+  relocation values inside the defining image; tables and entry are validated
+  before the first constructor, and `dlopen()` validates the whole group first.
+  Fixed: crafted ELFs exit 1 with "malformed ELF: unsafe DT_INIT_ARRAY" instead
+  of jumping to `0x4141414141414140`; normal DSO constructors still run.
+* **F-r2-py-1/2 (medium, verified; pagh-python 0.9.2, PR #8).** The parser-depth
+  fix was bypassed by a left-associative `1+1+…` chain (the parser folds it in a
+  loop, so the nesting counter never grew) and `eval_expr` recursed without a
+  limit; the same expression on a generator's 64 KiB heap-fiber stack produced
+  wild-pointer faults. `eval_expr` now has an expression-depth limit (256, above
+  the parser's 200 so legitimate nesting still evaluates), checks process/fiber
+  stack headroom at every node, and tracks depth per current stack across fiber
+  switches; chains beyond the limit raise a catchable `RecursionError`, the
+  generator path reports "generator stack exhausted" instead of faulting, and
+  the audit's 720/740/800-term bombs are clean errors.
+
 **Fixed in the sibling repositories** (not this kernel; each has its own
 release notes, PoC and live transcript):
 
@@ -216,6 +287,16 @@ No finding from the 2026-11-13 audit remains unaddressed. Two new findings were
 made while fixing this batch and are fixed in the same releases: F-x86v-6
 (unbounded `execve` image allocation, 2.22.2) and F-x86a-6 (`sendto`/`recvfrom`
 payload count bypassing the validated length cap, 2.22.3).
+
+**Unverified leads from round 2** (not claimed fixed; next triage):
+F-r2-vfs-2/F-r2-vfs-3 (crafted ext2 superblock free-count reconciliation span
+and journal `fs_blocks`/`log_blocks` bounds at mount, both `verified: no`),
+F-r2-net-1 (recvfrom `socklen_t` TOCTOU after a yield; user address, the
+kernel-mode fault backstop would kill only the process), and the RISC-V
+`verified: no` candidates (overlapping-PT_LOAD W^X, `mprotect` cross-root,
+execve sibling retirement, ext2 mount/block bounds, unbounded
+`read_dir_entries`). They are recorded here so they are not silently considered
+closed.
 
 Known structural limitations the audit reconfirmed: **no KASLR** (heap base and
 kernel symbols are fixed, which is why the PoCs hardcode/scan addresses), **no
