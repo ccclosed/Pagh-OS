@@ -50,7 +50,7 @@ Root bypasses read and write, but **not** execute: a `0644` file cannot be exece
 anyone. That rule is what makes the model meaningful even though the default identity
 is root.
 
-## Attack audit (2026-11-13): fixed and still open
+## Attack audit (2026-11-13): fixed
 
 An external red-team pass ran stock ring-3 Linux ELFs on a private QEMU range
 (attachments: PoC sources, serial logs and per-area reports). It found three
@@ -167,18 +167,33 @@ the stock 2.21.0 range and re-run against the fixed kernel):
   walk. Image size is capped at 256 MiB with a fallible reserve, and the exec
   path is credential-checked.
 
-**Still open from the same audit** (no claim that they are fixed; next batches):
+**Fixed in the sibling repositories** (not this kernel; each has its own
+release notes, PoC and live transcript):
 
-* **F-rv-1/2/3 (static; RISC-V kernel).** RISC-V symlink-size bounds, W^X flag
-  merge and `mprotect` root confusion. To be reproduced, then fixed. (The x86
-  user-buffer TOCTOU half of the original item, F-x86a-4, is fixed in 2.22.3
-  above; the crafted-ext2 and path-search items were fixed in 2.22.2.)
-* **F-rt-1…4 (RISC-V userland runtime, high/medium/low, verified).** `ld-pagh`
-  symbol/`PT_DYNAMIC` bounds (arbitrary write / OOB read), `pagh-libc`
-  `vsnprintf` precision overflow (stack smash), `pagh-python` parser recursion
-  (stack exhaustion). These live in `pagh-libc`/`pagh-python`, not this kernel.
-* **F-rt-4 and the RISC-V items** are tracked in those repositories' own
-  `SECURITY`/report files; the x86_64 kernel audit items above are the kernel's.
+* **F-rv-1/2/3 (RISC-V kernel, pagh-riscv 0.24.1, PR #12).** Crafted-ext2
+  symlink `i_size` is bounded before allocation (fast ≤ inline capacity, slow ≤
+  one block, else `FsError::Corrupt`); overlapping `PT_LOAD` segments that would
+  merge to W+X are rejected with `ElfError::WxOverlap`; `mprotect` validates
+  that it writes the process's own page-table root (`protect_in`), not whichever
+  root is active. Evidence: crafted ext2/W^X ELFs refused in live QEMU/OpenSBI,
+  `cat` of the crafted link prints "filesystem is corrupt" and the machine
+  stays up, regression `sv39-map-roundtrip`/reject matrix.
+* **F-rt-1/2/3 (pagh-libc 0.15.1, PR #9).** `ld-pagh` no longer publishes
+  `__pagh_dl_state` through an untrusted self-scope `SHN_ABS` symbol and rejects
+  out-of-image symbol/`PT_DYNAMIC` values as malformed; `vsnprintf` clamps
+  integer precision and writes zero-extension directly into the output field
+  (no `memmove` into the 32-byte stack scratch), with a host-differential test
+  against glibc (1.3M checks) and an ASAN regression.
+* **F-rt-4 (pagh-python 0.9.1, PR #6).** Lexer and parser enforce a nesting
+  limit (CPython's 200) on brackets and on non-bracket recursion; pagh-riscv
+  additionally guards stack headroom. The audit's 506-byte 200-paren PoC now
+  fails with `SyntaxError: maximum recursion depth exceeded` instead of
+  exhausting the stack.
+
+No finding from the 2026-11-13 audit remains unaddressed. Two new findings were
+made while fixing this batch and are fixed in the same releases: F-x86v-6
+(unbounded `execve` image allocation, 2.22.2) and F-x86a-6 (`sendto`/`recvfrom`
+payload count bypassing the validated length cap, 2.22.3).
 
 Known structural limitations the audit reconfirmed: **no KASLR** (heap base and
 kernel symbols are fixed, which is why the PoCs hardcode/scan addresses), **no

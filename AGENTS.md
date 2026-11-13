@@ -322,10 +322,13 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
     stock 2.21.0 range and shows the safe result on 2.22.2 (the vulnerable
     kernel panics or returns the protected contents, the fixed one returns
     `ENOENT`/`EACCES`/`ENOMEM`/`ENOEXEC` and keeps running).
-  * still open from that audit (next batches, tracked in `SECURITY.md`): the
-    RISC-V userland-runtime findings (F-rt-1…4). The `.deb` symlink escape
-    (F-x86n-1) was fixed in 2.22.1 and the x86 user-buffer TOCTOU (F-x86a-4)
-    in 2.22.3 (below). None of these are silently considered fixed.
+  * the audit was closed in four kernel batches (2.22.0–2.22.3 below) and three
+    sibling repositories: `.deb` symlink escape (F-x86n-1) in 2.22.1, the x86
+    user-buffer TOCTOU (F-x86a-4) and the `sendto`/`recvfrom` payload cap
+    (F-x86a-6, found in review) in 2.22.3; RISC-V kernel F-rv-1…3 in
+    pagh-riscv 0.24.1, `ld-pagh`/`vsnprintf` F-rt-1…3 in pagh-libc 0.15.1, and
+    the parser recursion F-rt-4 in pagh-python 0.9.1. `SECURITY.md` lists every
+    fix with its evidence; no finding from the audit is left silently open.
   **2.22.1** = the package installer is confined to its install root. A `.deb`
   could ship a symlink member and then a member *below* it; the installer resolved
   later members' parents through the package's own link in the guest namespace,
@@ -388,12 +391,14 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
     `recvfrom` returns before the write; baseline runs on the stock kernel still
     `SUCCESS`/PCI-read, so the contrast is the same host, same PoCs, only the
     kernel differs. Host tests cover the flag mask and the user-range boundary.
-  * Still open from that audit (next batches, tracked in `SECURITY.md`):
-    the RISC-V userland-runtime findings (F-rt-1…4) and the TOCTOU/static
-    items. The `.deb` symlink escape (F-x86n-1) is fixed in 2.22.1, and the
-    crafted-ext2 sizes (F-x86v-1), `walk()` search permissions (F-x86v-3) and
-    the static x86 VFS items (F-x86v-2/4/5, plus the F-x86v-6 found in that
-    batch) are fixed in 2.22.2. None of them are silently considered fixed.
+  * the remaining audit findings were closed right after this batch: `.deb`
+    symlink escape (F-x86n-1) in 2.22.1, the crafted-ext2 sizes (F-x86v-1),
+    `walk()` search permissions (F-x86v-3) and the static x86 VFS items
+    (F-x86v-2/4/5, plus F-x86v-6 found in that batch) in 2.22.2, and the
+    user-buffer TOCTOU class (F-x86a-4) plus `sendto`/`recvfrom` payload cap
+    (F-x86a-6) in 2.22.3. RISC-V kernel and userland-runtime findings were
+    fixed in pagh-riscv 0.24.1, pagh-libc 0.15.1 and pagh-python 0.9.1.
+    `SECURITY.md` is the single status page.
   **2.21.0** = the console scrolls back. The framebuffer console used to hold
   exactly the rows that fit on screen, so anything printed above the view was
   gone. It now keeps a bounded ring of scrolled-off *rows* — characters plus the
