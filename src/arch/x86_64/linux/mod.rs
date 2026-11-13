@@ -234,8 +234,13 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             if !is_inet_udp {
                 return Err(Errno::EINVAL);
             }
-            check_user_ptr(a[1], a[2].min(1 << 20))?;
-            let data = crate::arch::x86_64::linux::io_sys::copy_in_pub(a[1], a[2]);
+            // F-x86v-1 class: the pointer walk below is capped but the COPY
+            // must use the same bound, or a caller with only 1 MiB mapped can
+            // make the kernel allocate/copy the raw (attacker-chosen) count.
+            // Oversized datagrams are EMSGSIZE before any allocation.
+            let len = crate::arch::x86_64::linux::abi::socket_payload_len(a[2], true)?;
+            check_user_ptr(a[1], len)?;
+            let data = crate::arch::x86_64::linux::io_sys::copy_in_pub(a[1], len);
             let n = if a[4] != 0 && a[5] >= 8 {
                 crate::arch::x86_64::linux::inet_sock::udp_sendto_fd(a[0], &data, a[4], a[5])?
             } else {
@@ -255,7 +260,12 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             if !is_inet_udp {
                 return Err(Errno::EINVAL);
             }
-            check_user_ptr(a[1], a[2].min(1 << 20))?;
+            // Same allocation-bound bug as sendto: the count is only the
+            // caller's buffer capacity, so cap it to MAX_SOCKET_IO, validate
+            // exactly the range the kernel will allocate/copy, and never ask
+            // for the raw u64 count.
+            let len = crate::arch::x86_64::linux::abi::socket_payload_len(a[2], false)?;
+            check_user_ptr(a[1], len)?;
             // The payload buffer was checked, but this arm is the one socket
             // path that writes a sockaddr back to user memory. Both outputs are
             // plain user pointers (F-x86a-1: 16 bytes reached a kernel address
@@ -269,7 +279,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
                 // One pointer without the other is a nonsense request; Linux
                 // ignores the output in that case, and so do we.
             }
-            let mut buf = alloc::vec![0u8; a[2] as usize];
+            let mut buf = alloc::vec![0u8; len as usize];
             let (n, src) = crate::arch::x86_64::linux::inet_sock::udp_recvfrom_fd(a[0], &mut buf)?;
             crate::arch::x86_64::linux::io_sys::copy_out_pub(a[1], &buf[..n]);
             if a[4] != 0 && a[5] != 0 {

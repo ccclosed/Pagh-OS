@@ -343,6 +343,38 @@ pub fn marshal_args(
     (rax, [rdi, rsi, rdx, r10, r8, r9])
 }
 
+/// Largest single user payload the socket layer will validate, allocate and
+/// copy for `sendto`/`recvfrom` (1 MiB).
+///
+/// The pointer walk for those syscalls has always been capped at this value
+/// (`check_user_ptr(buf, len.min(MAX_SOCKET_IO))`), but the allocation and the
+/// copy used the raw `len`: a process needed only 1 MiB of mapped pages to make
+/// the kernel ask the allocator for `len` bytes, and `len` is a `u64` under
+/// attacker control — a multi-gigabyte allocation, i.e. an allocation abort /
+/// OOM DoS (same class as the crafted-ext2 `i_size` allocations, F-x86v-1).
+/// Everything that touches the payload must agree with the cap; see
+/// [`socket_payload_len`].
+pub const MAX_SOCKET_IO: u64 = 1 << 20;
+
+/// Effective user-payload length for a socket syscall, from the raw count.
+///
+/// `send = true` (`sendto`): a count above [`MAX_SOCKET_IO`] is refused with
+/// `EMSGSIZE` BEFORE any allocation — silently sending a truncated datagram
+/// would be a correctness bug of its own.
+/// `send = false` (`recvfrom`): the count is the caller's buffer *capacity*;
+/// Linux accepts a capacity larger than the datagram, so the kernel truncates
+/// it to the cap and then validates, allocates and copies exactly that range.
+pub fn socket_payload_len(count: u64, send: bool) -> Result<u64, super::errno::Errno> {
+    if send && count > MAX_SOCKET_IO {
+        return Err(super::errno::Errno::EMSGSIZE);
+    }
+    Ok(if count > MAX_SOCKET_IO {
+        MAX_SOCKET_IO
+    } else {
+        count
+    })
+}
+
 /// The complete `Supported_Syscall_Set` (R2.1) — the single source of truth for
 /// both the dispatch gate and the exactness test.
 ///

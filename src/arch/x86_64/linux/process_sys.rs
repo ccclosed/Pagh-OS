@@ -207,6 +207,34 @@ pub const WNOHANG: u64 = 1;
 pub const WUNTRACED: u64 = 2;
 pub const WCONTINUED: u64 = 8;
 const RUSAGE_SIZE: u64 = 18 * 8;
+
+/// Publish a `wait4(2)` result to the caller's status/rusage pointers.
+///
+/// The two output pointers were validated once at syscall entry, but the wait
+/// loop below yields for an unbounded time and a sibling CLONE_VM thread can
+/// munmap them in that window (F-x86a-4). Re-validating both immediately before
+/// writing keeps a vanished buffer at `-EFAULT` instead of a ring-0 write that
+/// faults in kernel mode and halts the machine; validating both before writing
+/// either means no partial result is published.
+fn publish_wait_result(status: u64, rusage: u64, code: u32) -> Result<(), Errno> {
+    if status != 0 {
+        check_user_ptr(status, 4)?;
+    }
+    if rusage != 0 {
+        check_user_ptr(rusage, RUSAGE_SIZE)?;
+    }
+    if status != 0 {
+        // SAFETY: `status` was just validated for 4 bytes; the active CR3 is
+        // the calling process's, and no yield separates check from write.
+        unsafe { ptr::write_unaligned(status as *mut u32, code) }
+    }
+    if rusage != 0 {
+        // SAFETY: `rusage` was just validated for RUSAGE_SIZE bytes.
+        unsafe { ptr::write_bytes(rusage as *mut u8, 0, RUSAGE_SIZE as usize) }
+    }
+    Ok(())
+}
+
 pub fn sys_wait4(pid: u64, status: u64, options: u64, rusage: u64) -> Result<u64, Errno> {
     use crate::arch::x86_64::linux::signal_frame::{
         wait_status_exited, wait_status_stopped, WAIT_STATUS_CONTINUED,
@@ -230,38 +258,18 @@ pub fn sys_wait4(pid: u64, status: u64, options: u64, rusage: u64) -> Result<u64
         // the child's pending stop/continue reports), then the stop (WUNTRACED),
         // then the continue (WCONTINUED). Each arm consumes its event.
         if let Some((child, code)) = crate::task::compat::reap_child(parent, wanted) {
-            if status != 0 {
-                unsafe { ptr::write_unaligned(status as *mut u32, wait_status_exited(code)) }
-            }
-            if rusage != 0 {
-                unsafe { ptr::write_bytes(rusage as *mut u8, 0, RUSAGE_SIZE as usize) }
-            }
+            publish_wait_result(status, rusage, wait_status_exited(code))?;
             return Ok(child);
         }
         if options & WUNTRACED != 0 {
             if let Some((child, stopsig)) = crate::task::compat::reap_child_stop(parent, wanted) {
-                if status != 0 {
-                    unsafe {
-                        ptr::write_unaligned(
-                            status as *mut u32,
-                            wait_status_stopped(stopsig as u64),
-                        )
-                    }
-                }
-                if rusage != 0 {
-                    unsafe { ptr::write_bytes(rusage as *mut u8, 0, RUSAGE_SIZE as usize) }
-                }
+                publish_wait_result(status, rusage, wait_status_stopped(stopsig as u64))?;
                 return Ok(child);
             }
         }
         if options & WCONTINUED != 0 {
             if let Some(child) = crate::task::compat::reap_child_continued(parent, wanted) {
-                if status != 0 {
-                    unsafe { ptr::write_unaligned(status as *mut u32, WAIT_STATUS_CONTINUED) }
-                }
-                if rusage != 0 {
-                    unsafe { ptr::write_bytes(rusage as *mut u8, 0, RUSAGE_SIZE as usize) }
-                }
+                publish_wait_result(status, rusage, WAIT_STATUS_CONTINUED)?;
                 return Ok(child);
             }
         }
@@ -410,17 +418,19 @@ pub fn sys_clone(
             child_stack
         };
         check_user_ptr(stack.saturating_sub(8), 8)?;
-        if flags & CLONE_PARENT_SETTID != 0 {
-            check_user_ptr(parent_tid, 4)?
-        }
-        if flags & CLONE_CHILD_SETTID != 0 {
-            check_user_ptr(child_tid, 4)?
-        }
         // Register the child's CompatState BEFORE it can ever run: spawn
         // enqueues the child, so both the enqueue and the compat registration
         // happen with interrupts disabled (same pattern as
         // `fork_linux_process`). Otherwise the tick could schedule the child
         // between the two steps and route its first syscalls as native.
+        //
+        // F-x86a-4 (clone residue): the TID output pointers are validated and
+        // written INSIDE that same interrupt-disabled window. Validating before
+        // the spawn and writing after it left a preemption window in which a
+        // sibling thread sharing this address space (CLONE_VM) could munmap the
+        // page, so the ring-0 write faulted and halted the machine. With
+        // interrupts masked no other task can run between the check and the
+        // write, and a bad pointer fails before the child exists.
         let tls_value = if flags & CLONE_SETTLS != 0 {
             Some(tls)
         } else {
@@ -432,6 +442,12 @@ pub fn sys_clone(
             0
         };
         let child = crate::arch::cpu::without_interrupts(|| {
+            if flags & CLONE_PARENT_SETTID != 0 {
+                check_user_ptr(parent_tid, 4)?;
+            }
+            if flags & CLONE_CHILD_SETTID != 0 {
+                check_user_ptr(child_tid, 4)?;
+            }
             let child =
                 crate::task::process::spawn_linux_thread(regs, stack).map_err(|_| Errno::ENOMEM)?;
             if !crate::task::compat::clone_current_compat(child, tls_value, clear) {
@@ -440,14 +456,16 @@ pub fn sys_clone(
                 crate::task::scheduler::remove_ready_pids(&[child]);
                 return Err(Errno::EINVAL);
             }
+            // SAFETY: both pointers were just validated in this same
+            // non-preemptible window, so the mappings cannot have changed.
+            if flags & CLONE_PARENT_SETTID != 0 {
+                unsafe { ptr::write_unaligned(parent_tid as *mut u32, child as u32) }
+            }
+            if flags & CLONE_CHILD_SETTID != 0 {
+                unsafe { ptr::write_unaligned(child_tid as *mut u32, child as u32) }
+            }
             Ok(child)
         })?;
-        if flags & CLONE_PARENT_SETTID != 0 {
-            unsafe { ptr::write_unaligned(parent_tid as *mut u32, child as u32) }
-        }
-        if flags & CLONE_CHILD_SETTID != 0 {
-            unsafe { ptr::write_unaligned(child_tid as *mut u32, child as u32) }
-        }
         return Ok(child);
     }
     // ── fork path ──
@@ -458,38 +476,35 @@ pub fn sys_clone(
     if child_stack != 0 {
         return Err(Errno::EINVAL);
     } // fork(2) never passes a stack
-    if flags & CLONE_PARENT_SETTID != 0 {
-        check_user_ptr(parent_tid, 4)?
-    }
-    if flags & CLONE_CHILD_SETTID != 0 {
-        check_user_ptr(child_tid, 4)?
-    }
     let clear = if flags & CLONE_CHILD_CLEARTID != 0 {
         child_tid
     } else {
         0
     };
-    let (child, child_pml4) =
-        crate::task::process::fork_linux_process(regs, clear).map_err(|e| {
-            crate::error!("[linux] fork failed: {}", e);
-            Errno::ENOMEM
-        })?;
-    if flags & CLONE_PARENT_SETTID != 0 {
-        unsafe { ptr::write_unaligned(parent_tid as *mut u32, child as u32) }
-    }
-    if flags & CLONE_CHILD_SETTID != 0 {
-        // Land the tid write in the CHILD's already-copied address space (the
-        // parent's own page must keep its value): translate through the child
-        // PML4 and write via the HHDM window.
-        if let Some(phys) = crate::memory::vmm::virt_to_phys_in(child_pml4, child_tid) {
-            unsafe {
-                ptr::write_unaligned(
-                    crate::memory::vmm::phys_to_virt(phys) as *mut u32,
-                    child as u32,
-                )
-            }
-        }
-    }
+    // F-x86a-4 (clone residue): both TID outputs are handed to
+    // `fork_linux_process`, which validates and publishes them inside its
+    // interrupt-disabled window, right after the child is enqueued. Doing the
+    // pre-check here and the write after the fork left two windows in which a
+    // sibling thread sharing the parent's address space (CLONE_VM) could
+    // munmap the buffer — the ring-0 write then halted the machine — and the
+    // child itself could run and unmap its `child_tid` page before a post-fork
+    // translation wrote through it.
+    let parent_tid_out = if flags & CLONE_PARENT_SETTID != 0 {
+        parent_tid
+    } else {
+        0
+    };
+    let child_tid_out = if flags & CLONE_CHILD_SETTID != 0 {
+        child_tid
+    } else {
+        0
+    };
+    let (child, _child_pml4) =
+        crate::task::process::fork_linux_process(regs, clear, parent_tid_out, child_tid_out)
+            .map_err(|e| {
+                crate::error!("[linux] fork failed: {:?}", e);
+                e
+            })?;
     Ok(child)
 }
 const FUTEX_WAITERS: u32 = 0x8000_0000;

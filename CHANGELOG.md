@@ -11,6 +11,31 @@ tagged release (`2.18.13`, merged as PR #56). The full technical story of every 
 is the release-note block in `AGENTS.md`; the paragraphs here name the user-visible
 change and point there rather than duplicating it.
 
+## 2.22.3
+
+TOCTOU on user buffers in blocking syscalls (attack-audit F-x86a-4). A sibling
+`CLONE_VM` thread could munmap a buffer that `poll`/`ppoll`/`select`/
+`epoll_wait` had validated once, after which the kernel touched the stale user
+pointer from ring 0 and the page fault halted the machine. The wait loops now
+work on kernel copies and re-validate the user range after every yield
+(`-EFAULT` when the buffer vanished); the same "validate, block, publish"
+pattern was fixed in the read family, the `readv`/`writev` iovec iteration,
+`wait4` and `sendfile`. `clone`'s `parent_tid`/`child_tid` writes moved inside
+the interrupt-disabled spawn/fork window, and `ioctl(TCSETS*)` now honours its
+pointer validation (it used to discard it and read `c_lflag` anyway). Defense
+in depth: a kernel-mode page fault on a *user* address kills only the faulting
+process; kernel-address and NULL faults stay fatal. Verified with the audit's
+PoC (`tools/security/poc/poc_poll_toctou.c`) against the fixed kernel and the
+stock 2.22.0 image; the `page_fault` host property covers the fault policy.
+
+Full story: `AGENTS.md`, 2.22.3.
+Also fixed in the same batch, found in review: `sendto(2)`/`recvfrom(2)`
+validated a capped user range but allocated/copied the raw `u64` count, so a
+process with 1 MiB mapped could force a multi-gigabyte kernel allocation
+(abort/OOM DoS). Oversized `sendto` is now `EMSGSIZE` before allocation and
+`recvfrom` caps the capacity at 1 MiB, with the `p57` host property and
+`tools/security/poc/poc_sock_large_count.c` as regressions.
+
 ## 2.22.2
 
 The filesystem half of the 2026-11-13 attack-audit batch: crafted ext2 images

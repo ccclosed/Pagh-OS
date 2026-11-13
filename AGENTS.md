@@ -231,12 +231,50 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.22.2** (the VFS/ext2 hardening
-  batch from the 2026-11-13 attack audit, following the package-installer
-  confinement batch, the ring-3 isolation hardening, the console scrollback and
-  the shell/procfs batches; 2.18.13 carried the `connect(2)` reply-and-close
-  fix, the VT/console coordinate fix and the kernel-thread rows in `ps`; the tag
-  lands at the end of the batch).
+  be reflected here. **`main` currently reads 2.22.3** (the 2026-11-13 attack
+  audit batches: 2.22.0 closed the ring3-to-ring0 paths, 2.22.1 confined the
+  package installer, 2.22.2 hardened VFS/ext2, 2.22.3 closed the user-buffer
+  TOCTOU class, on top of the console scrollback and the shell/procfs batches;
+  2.18.13 carried the `connect(2)` reply-and-close fix, the VT/console
+  coordinate fix and the kernel-thread rows in `ps`; the tag lands at the end
+  of the batch).
+  **2.22.3** = the user-buffer TOCTOU class from the same audit is closed
+  (F-x86a-4). Blocking syscalls validated their user-visible buffer once and
+  then kept touching it inside a `yield_current()` wait loop; a sibling
+  `CLONE_VM` thread could `munmap` that page in the window, and the ring-0
+  access then took a kernel-mode #PF, which halted the machine. The audit's own
+  PoC (a never-ready `poll` whose pollfd array is unmapped 150 ms in) halts
+  stock 2.22.0 exactly that way; on this kernel it returns `EFAULT`.
+  `poll`/`ppoll`, `select`/`pselect6` and `epoll_wait` now work on private
+  kernel copies and re-validate the user range after every yield; so does every
+  "block, then publish" arm (stdin/timerfd/eventfd/pipe/TCP/signalfd reads, the
+  `readv`/`writev` iovec entries, `wait4` status/rusage and the `sendfile`
+  offset). A buffer unmapped during the wait is `-EFAULT`, never a ring-0 touch.
+  `clone`'s `CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID` writes moved inside the
+  interrupt-disabled spawn/fork window (validated and written with no
+  schedulable gap, and a bad TID pointer fails with `EFAULT` before the child
+  exists). `ioctl(TCSETS*)` no longer discards its pointer validation — it used
+  to read `c_lflag` anyway, the F-x86a-3 class through an unchecked ioctl. As
+  defense in depth a kernel-mode #PF on a *user* address now kills only the
+  offending compat process instead of halting; kernel-address and NULL faults
+  stay fatal, so the backstop cannot swallow a real kernel bug. Evidence: the
+  committed `tools/security/poc/poc_poll_toctou.c` reports
+  `SURVIVED ... r=-1 errno=14` on the fixed kernel for
+  poll/ppoll/select/epoll_wait/futex, halts stock 2.22.0 with a kernel-mode
+  `PAGE FAULT`, and on a backstop-only kernel kills the faulting process while
+  the shell keeps running; the `page_fault` host property pins the fault policy.
+  Found in review and fixed in the same batch: `sendto(2)`/`recvfrom(2)`
+  validated the payload with a capped length (`count.min(1 MiB)`) and then
+  allocated/copied the RAW `u64` count, so 1 MiB of mapped pages was enough to
+  make the kernel request a ~4 GiB allocation (allocation abort, machine dead —
+  the same class as the crafted-ext2 `i_size` allocations, F-x86v-1).
+  `abi::socket_payload_len` is now the single policy: oversized `sendto` is
+  `EMSGSIZE` before any allocation, `recvfrom` truncates the capacity to the
+  1 MiB cap and validates/allocates/copies exactly that much; the `p57` host
+  property pins it and `tools/security/poc/poc_sock_large_count.c` reproduces
+  the panic on the stock image and the clean errno on this kernel. There is no
+  `sendmsg`/`recvmsg` in this layer (no handlers, not in the supported set), so
+  the pattern has no second copy.
   **2.22.2** = the filesystem half of the attack-audit batch: crafted ext2
   images and missing path-traversal permission checks. All five x86 VFS
   findings are fixed, plus one allocation site found while fixing them:
@@ -285,9 +323,9 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
     kernel panics or returns the protected contents, the fixed one returns
     `ENOENT`/`EACCES`/`ENOMEM`/`ENOEXEC` and keeps running).
   * still open from that audit (next batches, tracked in `SECURITY.md`): the
-    poll/select/futex user-buffer TOCTOU (F-x86a-4) and the RISC-V
-    userland-runtime findings (F-rt-1…4). The `.deb` symlink escape (F-x86n-1)
-    was fixed in 2.22.1. None of these are silently considered fixed.
+    RISC-V userland-runtime findings (F-rt-1…4). The `.deb` symlink escape
+    (F-x86n-1) was fixed in 2.22.1 and the x86 user-buffer TOCTOU (F-x86a-4)
+    in 2.22.3 (below). None of these are silently considered fixed.
   **2.22.1** = the package installer is confined to its install root. A `.deb`
   could ship a symlink member and then a member *below* it; the installer resolved
   later members' parents through the package's own link in the guest namespace,
@@ -310,6 +348,7 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `tests/pkg/e2e_pkg_escape.py` (crafted packages refused with a named path,
   `/mnt/etc/autorun` absent, plain `..` still skipped, a normal `.deb` still
   installs including its absolute symlink).
+
   **2.22.0** = ring-3 isolation hardened after the attack audit. The audit found
   three independent ring3-to-ring0 paths on the stock 2.21.0 guest and one
   one-syscall machine kill; this batch closes all four and adds the regression
@@ -817,7 +856,6 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
 - CI does not enforce the bump (yet); reviewers and agents must.
 
 ## Known open gaps (good first issues, all documented in-code)
-
 
 - procfs covers slices 1–5 (issue #11, contract `docs/procfs.md`):
   `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}`,

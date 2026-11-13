@@ -31,6 +31,8 @@ pub enum Errno {
     EAGAIN = 11,
     /// Socket operation on non-socket.
     ENOTSOCK = 88,
+    /// Message too long (a datagram payload above the socket I/O cap).
+    EMSGSIZE = 90,
     /// Address family not supported by protocol (AF_INET6 etc.).
     EAFNOSUPPORT = 97,
     /// Network is unreachable.

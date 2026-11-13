@@ -14,7 +14,7 @@ use crate::task::fd::{OpenObject, O_NONBLOCK, O_RDWR};
 
 use super::check_user_ptr;
 use super::errno::Errno;
-use super::io_sys::{copy_in_pub, copy_out_pub};
+use super::io_sys::{copy_in_pub, copy_out_checked};
 
 const SFD_NONBLOCK: u64 = 0o4000;
 const SFD_CLOEXEC: u64 = 0o2000000;
@@ -92,7 +92,10 @@ pub fn read_signalfd(mask: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         if let Some(signal) = compat::take_signalfd_signal(mask) {
             let mut record = [0u8; SIGNALFD_SIGINFO_SIZE];
             record[..4].copy_from_slice(&(signal as u32).to_le_bytes());
-            copy_out_pub(buf, &record);
+            // The wait above yields; re-validate the 128-byte record pointer
+            // before publishing. A CLONE_VM sibling may have unmapped it
+            // (F-x86a-4) — EFAULT, not a kernel-mode #PF that halts the machine.
+            copy_out_checked(buf, &record)?;
             return Ok(SIGNALFD_SIGINFO_SIZE as u64);
         }
         if super::signal::has_deliverable_current() {

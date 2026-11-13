@@ -134,6 +134,19 @@ pub(crate) fn copy_out_pub(buf: u64, data: &[u8]) {
     copy_out(buf, data)
 }
 
+/// Re-validate `ptr` for `src.len()` bytes, then copy `src` out.
+///
+/// WHY: a handler that checks a buffer once at entry and then blocks in a
+/// `yield_current()` loop leaves a TOCTOU window — a sibling `CLONE_VM` thread
+/// can munmap/mprotect the page while the handler is descheduled (F-x86a-4).
+/// A stale ring-0 write takes a kernel-mode #PF, which halts the machine;
+/// re-checking immediately before the write turns it into `-EFAULT`.
+pub(crate) fn copy_out_checked(ptr: u64, src: &[u8]) -> Result<(), Errno> {
+    check_user_ptr(ptr, src.len() as u64)?;
+    copy_out(ptr, src);
+    Ok(())
+}
+
 /// Map a VFS write failure to errno.
 ///
 /// A node that does not implement `write` is a read-only file — `/proc` files
@@ -379,7 +392,9 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             loop {
                 let due = state.lock().take(crate::task::scheduler::ticks());
                 if due > 0 {
-                    copy_out_pub(buf, &due.to_le_bytes());
+                    // The loop above yields: re-validate before publishing
+                    // (F-x86a-4; a vanished buffer is EFAULT, not a ring-0 #PF).
+                    copy_out_checked(buf, &due.to_le_bytes())?;
                     return Ok(8);
                 }
                 if state.lock().nonblocking {
@@ -409,10 +424,9 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
                         r
                     };
                     drop(v);
-                    // SAFETY: validated above
-                    unsafe {
-                        core::ptr::write_unaligned(buf as *mut u64, out);
-                    }
+                    // The wait loop yields: re-validate before publishing
+                    // (F-x86a-4; a vanished buffer is EFAULT, not a ring-0 #PF).
+                    copy_out_checked(buf, &out.to_ne_bytes())?;
                     return Ok(8);
                 }
                 drop(v);
@@ -423,7 +437,7 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         Some(Resolved::InetTcp(t)) => {
             let mut data = vec![0u8; count as usize];
             let n = crate::arch::x86_64::linux::inet_sock::tcp_read(fd, &mut data)?;
-            copy_out(buf, &data[..n]);
+            copy_out_checked(buf, &data[..n])?;
             return Ok(n as u64);
         }
         Some(Resolved::InetUdp(_)) => Err(Errno::ENOTCONN), // recvfrom only
@@ -431,7 +445,7 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             let mut data = vec![0u8; count as usize];
             let n = read_pipe(&e, &mut data)?;
             if n > 0 {}
-            copy_out(buf, &data[..n]);
+            copy_out_checked(buf, &data[..n])?;
             Ok(n as u64)
         }
         Some(Resolved::Socket { rx, .. }) => {
@@ -440,7 +454,7 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             if n > 0 {
                 diag_count(&DIAG_SOCK_R, "sock read", n as u64, 16384);
             }
-            copy_out(buf, &data[..n]);
+            copy_out_checked(buf, &data[..n])?;
             Ok(n as u64)
         }
         Some(Resolved::File { node, offset }) => {
@@ -462,7 +476,7 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
                 );
                 Errno::EIO
             })?;
-            copy_out(buf, &kbuf[..n]);
+            copy_out_checked(buf, &kbuf[..n])?;
             let new_off = offset + n as u64;
             set_fd_offset(fd as u32, new_off);
             Ok(n as u64)
@@ -613,7 +627,10 @@ pub fn sys_sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<
         }
     }
     if offset != 0 {
-        copy_out_pub(offset, &in_offset.to_le_bytes());
+        // The copy loop above can block on a pipe/socket and yield; the offset
+        // pointer was validated once before the loop, so re-validate it before
+        // publishing (F-x86a-4).
+        copy_out_checked(offset, &in_offset.to_le_bytes())?;
     } else {
         set_fd_offset(in_fd as u32, in_offset);
     }
@@ -714,6 +731,9 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
         let mut total: u64 = 0;
         for i in 0..iovcnt {
             let entry = iov + i * 16;
+            // Same re-validation as the generic loop below: `tcp_write` can
+            // block and yield, and a sibling may unmap the array (F-x86a-4).
+            check_user_ptr(entry, IOV_SIZE)?;
             let base = unsafe { *(entry as *const u64) };
             let len = unsafe { *((entry + 8) as *const u64) };
             if len == 0 {
@@ -748,7 +768,12 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
 
     for i in 0..iovcnt {
         let entry = iov + i * IOV_SIZE;
-        // SAFETY: the whole iovec array range was validated above.
+        // Re-validate the single entry every iteration: the scalar read/write
+        // for the previous entry can block and yield, letting a CLONE_VM
+        // sibling unmap the iovec array (F-x86a-4). Without this the ring-0
+        // read of `entry` faulted in kernel mode and halted the machine.
+        check_user_ptr(entry, IOV_SIZE)?;
+        // SAFETY: the 16-byte entry was just validated.
         let base = unsafe { *(entry as *const u64) };
         let len = unsafe { *((entry + 8) as *const u64) };
         if len == 0 {
@@ -814,7 +839,12 @@ pub fn sys_readv(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
     let mut total: u64 = 0;
     for i in 0..iovcnt {
         let entry = iov + i * IOV_SIZE;
-        // SAFETY: the whole iovec array range was validated above.
+        // Re-validate the single entry every iteration: the scalar read/write
+        // for the previous entry can block and yield, letting a CLONE_VM
+        // sibling unmap the iovec array (F-x86a-4). Without this the ring-0
+        // read of `entry` faulted in kernel mode and halted the machine.
+        check_user_ptr(entry, IOV_SIZE)?;
+        // SAFETY: the 16-byte entry was just validated.
         let base = unsafe { *(entry as *const u64) };
         let len = unsafe { *((entry + 8) as *const u64) };
         if len == 0 {
@@ -844,7 +874,12 @@ pub fn sys_preadv(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, Er
     let mut total: u64 = 0;
     for i in 0..iovcnt {
         let entry = iov + i * IOV_SIZE;
-        // SAFETY: the whole iovec array range was validated above.
+        // Re-validate the single entry every iteration: the scalar read/write
+        // for the previous entry can block and yield, letting a CLONE_VM
+        // sibling unmap the iovec array (F-x86a-4). Without this the ring-0
+        // read of `entry` faulted in kernel mode and halted the machine.
+        check_user_ptr(entry, IOV_SIZE)?;
+        // SAFETY: the 16-byte entry was just validated.
         let base = unsafe { *(entry as *const u64) };
         let len = unsafe { *((entry + 8) as *const u64) };
         if len == 0 {
@@ -874,7 +909,12 @@ pub fn sys_pwritev(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, E
     let mut total: u64 = 0;
     for i in 0..iovcnt {
         let entry = iov + i * IOV_SIZE;
-        // SAFETY: the whole iovec array range was validated above.
+        // Re-validate the single entry every iteration: the scalar read/write
+        // for the previous entry can block and yield, letting a CLONE_VM
+        // sibling unmap the iovec array (F-x86a-4). Without this the ring-0
+        // read of `entry` faulted in kernel mode and halted the machine.
+        check_user_ptr(entry, IOV_SIZE)?;
+        // SAFETY: the 16-byte entry was just validated.
         let base = unsafe { *(entry as *const u64) };
         let len = unsafe { *((entry + 8) as *const u64) };
         if len == 0 {
@@ -1687,7 +1727,11 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
         // return one byte at a time (nvim/less/vim need this).
         TCSETS | TCSETSW | TCSETSF => {
             if arg != 0 {
-                let _ = check_user_ptr(arg, TERMIOS_SIZE as u64);
+                // F-x86a-4 audit: the old code DISCARDED the validation result
+                // (`let _ = check_user_ptr(...)`) and read `c_lflag` anyway, so
+                // a bad pointer was dereferenced from ring 0 — the F-x86a-3
+                // class (kernel #GP/#PF -> halt) through an unchecked ioctl.
+                check_user_ptr(arg, TERMIOS_SIZE as u64)?;
                 // c_lflag is at offset 12; ICANON = 0x02
                 let c_lflag = unsafe { core::ptr::read_unaligned((arg + 12) as *const u32) };
                 let raw = c_lflag & 0x02 == 0; // ICANON cleared => raw mode
@@ -1820,7 +1864,7 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
         if !pending.is_empty() {
             let n = core::cmp::min(count as usize, pending.len());
             let head: alloc::vec::Vec<u8> = pending.drain(..n).collect();
-            copy_out(buf, &head);
+            copy_out_checked(buf, &head)?;
             return Ok(n as u64);
         }
     }
@@ -1898,7 +1942,7 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
             }
         }
         let n = core::cmp::min(count as usize, bytes.len());
-        copy_out(buf, &bytes[..n]);
+        copy_out_checked(buf, &bytes[..n])?;
         if n < bytes.len() {
             STDIN_PENDING.lock().extend_from_slice(&bytes[n..]);
         }
@@ -1916,7 +1960,7 @@ fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
         if !pending.is_empty() {
             let n = core::cmp::min(count as usize, pending.len());
             let head: alloc::vec::Vec<u8> = pending.drain(..n).collect();
-            copy_out(buf, &head);
+            copy_out_checked(buf, &head)?;
             return Ok(n as u64);
         }
     }
@@ -1978,7 +2022,7 @@ fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
         }
     }
     let n = core::cmp::min(count as usize, line.len());
-    copy_out(buf, &line[..n]);
+    copy_out_checked(buf, &line[..n])?;
     if n < line.len() {
         // Stash the tail: readline asks for one byte per read(2).
         STDIN_PENDING.lock().extend_from_slice(&line[n..]);
@@ -3091,12 +3135,34 @@ fn poll_revents(fd: i32, events: i16) -> i16 {
         Some(Resolved::File { .. }) | Some(Resolved::Dir) => events & (POLLIN | POLLOUT),
     }
 }
+/// Publish the kernel copy of a pollfd array to the user pointer, re-validating
+/// the range first.
+///
+/// WHY: `poll`/`ppoll` may block for an unbounded time; the array was validated
+/// only once, at entry (F-x86a-4). A sibling `CLONE_VM` thread can munmap or
+/// mprotect that page while this call is descheduled, and a stale ring-0 write
+/// took a kernel-mode #PF, which the fault handler turned into a machine halt.
+/// Re-checking immediately before the write turns that class into `-EFAULT`.
+fn publish_pollfds(fds: u64, bytes: u64, kfds: &[u8]) -> Result<(), Errno> {
+    check_user_ptr(fds, bytes)?;
+    copy_out(fds, kfds);
+    Ok(())
+}
+
 pub fn sys_poll(fds: u64, nfds: u64, timeout: u64) -> Result<u64, Errno> {
     const SZ: u64 = 8;
     if nfds > 1024 {
         return Err(Errno::EINVAL);
     }
-    check_user_ptr(fds, nfds.checked_mul(SZ).ok_or(Errno::EINVAL)?)?;
+    let bytes = nfds.checked_mul(SZ).ok_or(Errno::EINVAL)?;
+    check_user_ptr(fds, bytes)?;
+    // F-x86a-4: the pollfd array is user memory and every wait iteration used to
+    // re-dereference it after `yield_current()`. Take a private kernel copy once
+    // (validated immediately above, no yield in between), drive the whole wait
+    // on the copy, and publish it only through `publish_pollfds`, which
+    // re-validates the destination. A buffer unmapped during the wait now
+    // reports `-EFAULT` instead of faulting in ring 0 and halting the machine.
+    let mut kfds = copy_in(fds, bytes);
     let ms = timeout as i64;
     let deadline = if ms < 0 {
         None
@@ -3104,22 +3170,33 @@ pub fn sys_poll(fds: u64, nfds: u64, timeout: u64) -> Result<u64, Errno> {
         Some(crate::task::scheduler::ticks().saturating_add((ms as u64).saturating_add(9) / 10))
     };
     loop {
+        // Liveness check after every yield (and before the first scan): the
+        // kernel copy above keeps the wait itself fault-free, but the syscall
+        // must not keep blocking for a buffer the caller no longer owns. A
+        // range unmapped by a sibling thread is -EFAULT, exactly like the
+        // entry-time check — not an eternal wait (F-x86a-4).
+        check_user_ptr(fds, bytes)?;
         let mut ready = 0;
         for i in 0..nfds {
-            let p = fds + i * SZ;
-            let fd = unsafe { *(p as *const i32) };
-            let ev = unsafe { *((p + 4) as *const i16) };
+            let off = (i * SZ) as usize;
+            // `off + 8 <= kfds.len()` by construction (`nfds * 8` bytes).
+            let fd = i32::from_ne_bytes([kfds[off], kfds[off + 1], kfds[off + 2], kfds[off + 3]]);
+            let ev = i16::from_ne_bytes([kfds[off + 4], kfds[off + 5]]);
             let rev = poll_revents(fd, ev);
-            unsafe { *((p + 6) as *mut i16) = rev }
+            kfds[off + 6..off + 8].copy_from_slice(&rev.to_ne_bytes());
             if rev != 0 {
                 ready += 1
             }
         }
         if ready != 0 || ms == 0 {
+            publish_pollfds(fds, bytes, &kfds)?;
             return Ok(ready);
         }
         if let Some(end) = deadline {
             if crate::task::scheduler::ticks() >= end {
+                // Timeout: Linux leaves every revents field zeroed, which is
+                // exactly what the scan above wrote into the kernel copy.
+                publish_pollfds(fds, bytes, &kfds)?;
                 return Ok(0);
             }
         }
@@ -3185,6 +3262,8 @@ fn load_fdset(ptr: u64, nfds: u64) -> Result<[u64; FDSET_WORDS], Errno> {
     Ok(set)
 }
 
+/// Write one result fdset at a pointer that has ALREADY been validated by
+/// [`store_fdsets`] (the caller validates all three before writing any of them).
 fn store_fdset(ptr: u64, nfds: u64, set: &[u64; FDSET_WORDS]) {
     if ptr == 0 {
         return;
@@ -3193,6 +3272,41 @@ fn store_fdset(ptr: u64, nfds: u64, set: &[u64; FDSET_WORDS]) {
     for w in 0..words {
         unsafe { *((ptr + (w as u64) * 8) as *mut u64) = set[w] };
     }
+}
+
+/// Publish the three `select(2)` result fdsets, re-validating every non-null
+/// destination BEFORE writing any of them.
+///
+/// WHY: `select`/`pselect6` block for an unbounded time across
+/// `yield_current()`. The fdsets were validated once at entry, and a sibling
+/// `CLONE_VM` thread can munmap one of them while this call is descheduled
+/// (F-x86a-4) — the stale ring-0 write would take a kernel-mode #PF and halt
+/// the machine. Validating all three first means a vanished buffer reports
+/// `-EFAULT` and no partial result reaches the surviving sets.
+fn check_fdsets_out(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64) -> Result<(), Errno> {
+    let bytes = ((nfds + 63) / 64) * 8;
+    for ptr in [readfds, writefds, exceptfds] {
+        if ptr != 0 {
+            check_user_ptr(ptr, bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn store_fdsets(
+    nfds: u64,
+    readfds: u64,
+    writefds: u64,
+    exceptfds: u64,
+    got_r: &[u64; FDSET_WORDS],
+    got_w: &[u64; FDSET_WORDS],
+) -> Result<(), Errno> {
+    check_fdsets_out(nfds, readfds, writefds, exceptfds)?;
+    store_fdset(readfds, nfds, got_r);
+    store_fdset(writefds, nfds, got_w);
+    // Exceptional conditions never fire in this layer; report an empty set.
+    store_fdset(exceptfds, nfds, &[0u64; FDSET_WORDS]);
+    Ok(())
 }
 
 fn do_select(
@@ -3214,6 +3328,11 @@ fn do_select(
         ),
     };
     loop {
+        // Liveness check after every yield: the loop works on the kernel copies
+        // loaded above, so a sibling that unmapped an output fdset must turn
+        // into -EFAULT on the next iteration instead of an endless wait
+        // (F-x86a-4).
+        check_fdsets_out(nfds, readfds, writefds, exceptfds)?;
         let mut got_r = [0u64; FDSET_WORDS];
         let mut got_w = [0u64; FDSET_WORDS];
         let mut ready = 0u64;
@@ -3233,9 +3352,9 @@ fn do_select(
             None => false,
         };
         if ready != 0 || timed_out {
-            store_fdset(readfds, nfds, &got_r);
-            store_fdset(writefds, nfds, &got_w);
-            store_fdset(exceptfds, nfds, &[0u64; FDSET_WORDS]);
+            // Re-validate the outputs after the (possibly long) wait above —
+            // see `store_fdsets` (F-x86a-4).
+            store_fdsets(nfds, readfds, writefds, exceptfds, &got_r, &got_w)?;
             return Ok(ready);
         }
         if super::signal::has_deliverable_current() {

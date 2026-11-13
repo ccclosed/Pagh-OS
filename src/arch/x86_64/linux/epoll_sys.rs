@@ -194,28 +194,39 @@ pub fn sys_epoll_wait(
     };
 
     loop {
+        // Liveness check after every yield: the event records are built in
+        // kernel memory, so a sibling that unmapped the user array must turn
+        // into -EFAULT on the next iteration instead of an endless wait
+        // (F-x86a-4).
+        check_user_ptr(events_ptr, maxevents * event_sz)?;
         let snapshot: Vec<EpollEntry> = interests.lock().clone();
-        let mut out = 0usize;
+        // Collect the ready events in KERNEL memory, not straight into the user
+        // array: the array was validated once at entry, but this loop yields
+        // between iterations and a sibling CLONE_VM thread can munmap it in that
+        // window (F-x86a-4 — same class as poll/select). A stale ring-0 write
+        // takes a kernel-mode #PF, which halted the machine; the re-validated
+        // publish below reports -EFAULT instead.
+        let mut out: Vec<u8> = Vec::with_capacity(maxevents as usize * event_sz as usize);
         for entry in &snapshot {
-            if out >= maxevents as usize {
+            if (out.len() as u64) / event_sz >= maxevents {
                 break;
             }
             let revents = poll_fd(entry.fd, entry.events);
             if revents != 0 {
-                let dst = events_ptr + (out as u64) * event_sz;
-                // SAFETY: buffer validated above
-                unsafe {
-                    core::ptr::write_unaligned(dst as *mut u32, revents);
-                    core::ptr::write_unaligned((dst + 4) as *mut u64, entry.data);
-                }
-                out += 1;
+                // `struct epoll_event` is packed on x86_64: { u32 events, u64 data }.
+                out.extend_from_slice(&revents.to_ne_bytes());
+                out.extend_from_slice(&entry.data.to_ne_bytes());
             }
         }
         let timed_out = deadline
             .map(|d| crate::task::scheduler::ticks() >= d)
             .unwrap_or(false);
-        if out > 0 || timed_out || timeout_i == 0 {
-            return Ok(out as u64);
+        if !out.is_empty() || timed_out || timeout_i == 0 {
+            if !out.is_empty() {
+                // Re-validate the destination after the wait before writing.
+                super::io_sys::copy_out_checked(events_ptr, &out)?;
+            }
+            return Ok((out.len() as u64) / event_sz);
         }
         // Deliverable signal → -EINTR (libuv's `errno == EINTR` assertion
         // already expects this shape); the dispatch epilogue delivers.
