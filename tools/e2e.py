@@ -14,6 +14,7 @@ in-guest verification the project does:
     (new)                        ->  python3 tools/e2e.py selftest
     (new, generic)               ->  python3 tools/e2e.py shell --cmd '...' --expect '...'
     (new, USB input)             ->  python3 tools/e2e.py usb
+    (new, console scroll)        ->  python3 tools/e2e.py scroll
 
 BOOT IDENTITY (why a green run is trustworthy): `elf_sha256` is the hash of the
 BUILT artifact, which by itself proves nothing about what the guest executed — an
@@ -133,6 +134,8 @@ MODE_DEFAULTS = {
     # The waits are generous on purpose: this runs under TCG, and a timeout is a
     # verdict, not a retry knob.
     "usb": {"timeout": 180.0, "serial": "serial_usb.log"},
+    # Console scroll: boot + help screenful + wheel/PageUp/PageDown + screenshots.
+    "scroll": {"timeout": 180.0, "serial": "serial_scroll.log"},
 }
 
 # Features a mode cannot work without; `--features` only ADDS to this list.
@@ -843,6 +846,85 @@ class Keyboard:
             self.sock = None
 
 
+class QmpClient:
+    """Minimal QMP client for input events the HMP monitor cannot send.
+
+    The wheel is the motivating case: HMP has `sendkey`/`mouse_move`/
+    `mouse_button` but no relative wheel axis, while QMP's `input-send-event`
+    carries `{"type": "rel", "data": {"axis": "wheel", "value": N}}`. One
+    connection per run; QMP greets with a banner and expects
+    `qmp_capabilities` before any command.
+    """
+
+    def __init__(self, path: pathlib.Path) -> None:
+        self.path = path
+        self.sock: socket.socket | None = None
+        self.buf = b""
+
+    def _read_message(self) -> dict:
+        while True:
+            while b"\n" not in self.buf:
+                assert self.sock is not None
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    raise HarnessError(f"QMP socket {self.path} closed")
+                self.buf += chunk
+            line, self.buf = self.buf.split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            message = json.loads(line)
+            if "event" in message:
+                continue  # async events are not replies
+            return message
+
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(10.0)
+        sock.connect(str(self.path))
+        self.sock = sock
+        self._read_message()  # greeting
+        reply = self._command({"execute": "qmp_capabilities"})
+        if "return" not in reply:
+            raise HarnessError(f"QMP capabilities refused: {reply}")
+
+    def _command(self, command: dict) -> dict:
+        assert self.sock is not None
+        self.sock.sendall((json.dumps(command) + "\n").encode())
+        return self._read_message()
+
+    def wheel(self, delta: int) -> None:
+        """Send `delta` wheel notches (positive = away from the user).
+
+        QEMU models a wheel notch as a button pair, not a relative axis: the QAPI
+        `InputButton` enum has `wheel-up`/`wheel-down`, and the emulated PS/2
+        mouse turns the press into the fourth IntelliMouse packet byte. The
+        release follows the press so the next notch is a fresh edge.
+        """
+        button = "wheel-up" if delta > 0 else "wheel-down"
+        for _ in range(abs(int(delta))):
+            for down in (True, False):
+                reply = self._command({
+                    "execute": "input-send-event",
+                    "arguments": {"events": [{"type": "btn",
+                                              "data": {"down": down, "button": button}}]},
+                })
+                if "return" not in reply:
+                    raise HarnessError(f"QMP input-send-event refused: {reply}")
+                # Pacing matters: QEMU's PS/2 mouse drops a notch whose
+                # press/release pair lands inside one emulated packet interval,
+                # which made a 3-notch burst deliver as one.
+                time.sleep(0.05)
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+
 class QemuShotKeyboard:
     """Monitor client for the `usb` mode, backed by `tools/qemu_shot.py`.
 
@@ -1110,6 +1192,11 @@ class Harness:
         if not self.serial_log.is_absolute():
             self.serial_log = ROOT / self.serial_log
         self.monitor = CACHE / f"e2e_{mode.replace('-', '_')}_monitor.sock"
+        # QMP exists for input the HMP monitor cannot express: `sendkey` types
+        # keys, but a mouse wheel is a relative axis event that only the QMP
+        # `input-send-event` command carries. One socket per run, like the monitor.
+        self.qmp_path = CACHE / f"e2e_{mode.replace('-', '_')}_qmp.sock"
+        self.qmp: "QmpClient | None" = None
         self.qemu_stderr = CACHE / f"e2e_{mode.replace('-', '_')}_qemu_stderr.log"
         self.qemu_log = ROOT / f"qemu_{mode.replace('-', '_')}_debug.log"
         self.mirror_out = CACHE / f"e2e_{mode.replace('-', '_')}_mirror.log"
@@ -1315,8 +1402,13 @@ class Harness:
             # `--rtc base=2020-01-01` boots before the committed certificate's
             # validity window, which must make the fail-closed verifier refuse.
             argv += ["-rtc", a.rtc]
+        try:
+            self.qmp_path.unlink()
+        except FileNotFoundError:
+            pass
         argv += ["-serial", f"file:{self.serial_log}",
                  "-monitor", f"unix:{self.monitor},server,nowait",
+                 "-qmp", f"unix:{self.qmp_path},server,nowait",
                  "-display", "none", "-no-reboot",
                  "-d", "guest_errors", "-D", str(self.qemu_log)]
         self.guest = Guest(argv, self.serial_log, self.monitor, self.qemu_stderr)
@@ -1333,6 +1425,9 @@ class Harness:
             self.mirror.stop()
         if self.kb is not None:
             self.kb.close()
+        if self.qmp is not None:
+            self.qmp.close()
+            self.qmp = None
         if self.guest is not None:
             self.guest.stop()
         self.mini_repo_snapshot.restore()
@@ -1823,6 +1918,14 @@ def parse_script(path: pathlib.Path) -> list[dict]:
                 steps.append({"op": "wait", "regex": pat.strip(), "timeout": seconds})
             except ValueError:
                 steps.append({"op": "wait", "regex": rest, "timeout": None})
+        elif head == "wheel":
+            # Relative wheel event through QMP: positive scrolls away from the
+            # user (console history / older text).
+            try:
+                delta = int(rest)
+            except ValueError:
+                raise SetupError(f"{path}:{lineno}: wheel wants an integer delta, got {rest!r}")
+            steps.append({"op": "wheel", "delta": delta})
         elif head == "expect":
             steps.append({"op": "expect", "regex": rest})
         elif head == "note":
@@ -1830,6 +1933,153 @@ def parse_script(path: pathlib.Path) -> list[dict]:
         else:
             raise SetupError(f"{path}:{lineno}: unknown script op {head!r}")
     return steps
+
+
+def mode_scroll(h: Harness) -> tuple[str, int]:
+    """Console scroll regression: wheel, PageUp/PageDown and the reset rules.
+
+    THE CLAIM THIS PINS DOWN: the framebuffer console keeps scrolled-off rows and
+    shows them again when the PS/2 wheel (or PageUp/PageDown) moves the view, and
+    any ordinary key returns to the live bottom. Two things could silently rot:
+    the IntelliMouse negotiation (without it QEMU only sends 3-byte packets and
+    the wheel never reaches the view) and the view/offset bookkeeping (a scroll
+    that moves pixels without a matching model, or a caret left painted into
+    history).
+
+    The wheel cannot be sent through the HMP monitor (it has `sendkey` and
+    `mouse_move`, not a wheel axis), so this mode drives QEMU's QMP
+    `input-send-event` with `InputButton wheel-up/wheel-down`; the emulated PS/2
+    mouse turns those into the fourth IntelliMouse byte. Assertions are the
+    kernel's own `[DIAG] console scroll` lines plus two framebuffer screenshots
+    that must differ between the live and scrolled views.
+    """
+    a = h.a
+    h.boot()
+    assert h.guest is not None
+    guest = h.guest
+    kb = QemuShotKeyboard(h.monitor, a.key_delay)
+    live_shot = CACHE / "e2e_scroll_live.png"
+    history_shot = CACHE / "e2e_scroll_history.png"
+    ok = True
+    try:
+        kb.connect(timeout=min(a.boot_timeout, 180.0))
+        if not wait_for_shell(guest, kb, a, a.boot_timeout):
+            raise HarnessError(f"the shell prompt never appeared within "
+                               f"{a.boot_timeout:.0f}s; serial tail:\n{tail(guest.serial())}")
+        # The wheel negotiation is reported at mouse init; without this line the
+        # rest of the run would test PageUp only.
+        if wait_for(guest, [r"\[PS2MOUSE\] wheel: IntelliMouse"],
+                    a.boot_timeout, label="IntelliMouse wheel negotiation") is None:
+            raise HarnessError("the PS/2 mouse never negotiated IntelliMouse wheel mode; "
+                               f"serial tail:\n{tail(guest.serial())}")
+        log("typing `help` to fill the screen and scroll some rows into history")
+        kb.text("help")
+        kb.key("ret")
+        time.sleep(2.0)
+        kb.screenshot(live_shot)
+        # Wheel up: three notches. QEMU models a notch as a button press/release
+        # pair; the decoded IntelliMouse delta must reach the console view.
+        if h.qmp is None:
+            h.qmp = QmpClient(h.qmp_path)
+            h.qmp.connect()
+        log("sending 3 wheel-up notches through QMP")
+        h.qmp.wheel(3)
+        wheel_line = wait_for(guest, [r"\[DIAG\] console scroll wheel view=(\d+)"],
+                              h.timeout, label="wheel scroll diagnostic")
+        ok &= h.check("wheel moved the console view", wheel_line is not None,
+                      wheel_line or "no [DIAG] console scroll wheel line")
+        m = re.search(r"\[DIAG\] console scroll wheel view=(\d+)", guest.serial())
+        if m:
+            ok &= h.check("view offset is non-zero after scrolling", int(m.group(1)) > 0,
+                          f"view={m.group(1)}")
+        time.sleep(1.0)
+        kb.screenshot(history_shot)
+        # The two frames must differ: a scroll that only changed a counter and not
+        # the pixels is the failure mode the model tests cannot see.
+        same = (live_shot.read_bytes() == history_shot.read_bytes()
+                if live_shot.exists() and history_shot.exists() else True)
+        ok &= h.check("scrolled view repainted the framebuffer", not same,
+                      f"{history_shot.name} differs from {live_shot.name}" if not same
+                      else "screenshots are byte-identical")
+        # PageUp scrolls further back, PageDown returns; both are pure keyboard
+        # paths and would not be exercised by the wheel.
+        kb.key("pgup")
+        ok &= h.check("PageUp scrolled the view", wait_for(
+            guest, [r"\[DIAG\] console scroll pageup view=(\d+)"], 30.0,
+            label="PageUp scroll") is not None)
+        kb.key("pgdn")
+        ok &= h.check("PageDown moved the view back", wait_for(
+            guest, [r"\[DIAG\] console scroll pagedown view=(\d+)"], 30.0,
+            label="PageDown scroll") is not None)
+        # Leave the view scrolled back before testing the reset rule; PageDown is
+        # allowed to have returned it to the live bottom already.
+        h.qmp.wheel(1)
+        time.sleep(0.5)
+        # An ordinary key is input: it must return the view to the live bottom and
+        # the shell must still accept the next command.
+        kb.key("esc")
+        ok &= h.check("Escape reset the view to the live bottom", wait_for(
+            guest, [r"\[DIAG\] console scroll reset"], 30.0,
+            label="scroll reset") is not None)
+        kb.text("echo SCROLL-OK")
+        kb.key("ret")
+        ok &= h.check("shell still runs commands after scrolling", wait_for(
+            guest, [r"SCROLL-OK"], 30.0, label="post-scroll echo") is not None)
+        # Wallpaper path: a scrolled view paints opaque cells (a history row must
+        # replace what was there), so returning to the bottom has to put the
+        # wallpaper back before the live grid is drawn over it. This is the code
+        # path a themed user hits on every wheel notch; a panic or a ghosted
+        # wallpaper here would not show up in the console-only checks above.
+        wall_hist = CACHE / "e2e_scroll_wallpaper_history.png"
+        wall_live = CACHE / "e2e_scroll_wallpaper_live.png"
+        kb.text("wallpaper scanlines")
+        kb.key("ret")
+        ok &= h.check("wallpaper command applied", wait_for(
+            guest, [r"wallpaper: scanlines"], 30.0, label="wallpaper switch") is not None)
+        time.sleep(0.5)
+
+        def wait_new(pattern: str, before: int, label: str) -> bool:
+            """Wait for `pattern` in serial output appended after offset `before`.
+
+            The earlier part of the log already contains scroll diagnostics; a
+            plain `re.search` would match those and report a scroll/reset that
+            never happened in the wallpaper phase.
+            """
+            deadline = time.time() + 30.0
+            compiled = re.compile(pattern)
+            while time.time() < deadline:
+                text = guest.serial()
+                if len(text) > before and compiled.search(text[before:]):
+                    return True
+                time.sleep(0.2)
+            log(f"timeout waiting for {label}")
+            return False
+
+        before = len(guest.serial())
+        h.qmp.wheel(2)
+        ok &= h.check("wheel scrolls with a wallpaper active",
+                      wait_new(r"\[DIAG\] console scroll wheel view=[1-9]\d*", before,
+                               "wallpaper wheel scroll"))
+        time.sleep(0.8)
+        kb.screenshot(wall_hist)
+        before = len(guest.serial())
+        kb.key("esc")
+        ok &= h.check("reset restores the live view over a wallpaper",
+                      wait_new(r"\[DIAG\] console scroll reset", before,
+                               "wallpaper scroll reset"))
+        time.sleep(0.8)
+        kb.screenshot(wall_live)
+        if wall_hist.exists() and wall_live.exists():
+            ok &= h.check("wallpaper view and live view differ",
+                          wall_hist.read_bytes() != wall_live.read_bytes(),
+                          f"{wall_hist.name} vs {wall_live.name}")
+        kb.text("echo WALLPAPER-OK")
+        kb.key("ret")
+        ok &= h.check("shell works after wallpaper scroll", wait_for(
+            guest, [r"WALLPAPER-OK"], 30.0, label="wallpaper echo") is not None)
+    finally:
+        kb.close()
+    return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
 
 
 def mode_shell(h: Harness) -> tuple[str, int]:
@@ -1840,6 +2090,7 @@ def mode_shell(h: Harness) -> tuple[str, int]:
         cmd lxrun /mnt/usr/bin/hello-pagh     # type + Enter
         type selftest                          # type without Enter
         key ret                                # raw QEMU key name
+        wheel 1                                # relative wheel notch via QMP (positive = up)
         wait LXSELFTEST end_to_end_run PASS 30 # block until this regex (timeout s)
         sleep 2
         expect hello from apt                  # asserted at the end
@@ -1864,6 +2115,12 @@ def mode_shell(h: Harness) -> tuple[str, int]:
             h.kb.text(step["text"])
         elif step["op"] == "key":
             h.kb.key(step["name"])
+        elif step["op"] == "wheel":
+            log(f"wheel: {step['delta']:+d}")
+            if h.qmp is None:
+                h.qmp = QmpClient(h.qmp_path)
+                h.qmp.connect()
+            h.qmp.wheel(step["delta"])
         elif step["op"] == "sleep":
             time.sleep(step["sec"])
         elif step["op"] == "note":
@@ -2050,6 +2307,7 @@ MODES = {
     "shell": mode_shell,
     "tcp-shot": mode_tcp_shot,
     "usb": mode_usb,
+    "scroll": mode_scroll,
     "smoke": mode_smoke,
     "boot-check": mode_boot_check,
     "restore": mode_restore,
@@ -2176,6 +2434,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "(exercises connect(2) completion and the shell's `nc`)")
     ts.add_argument("--port", type=int, default=8099,
                     help="host TCP port the guest reaches as 10.0.2.2:<port> (default 8099)")
+
+    sub.add_parser("scroll", parents=[common],
+                   help="console scroll acceptance: PS/2 wheel (QMP), PageUp/PageDown, "
+                        "reset to the live bottom, and a pixel-diffing screenshot pair")
 
     sub.add_parser("usb", parents=[common],
                    help="USB-input acceptance: boot the staged image with an "

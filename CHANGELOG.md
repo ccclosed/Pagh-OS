@@ -11,6 +11,23 @@ tagged release (`2.18.13`, merged as PR #56). The full technical story of every 
 is the release-note block in `AGENTS.md`; the paragraphs here name the user-visible
 change and point there rather than duplicating it.
 
+## 2.21.0
+
+Console scrollback. The framebuffer console keeps a bounded ring of the rows it
+scrolls off (characters and per-cell colour) and shows them again when the view
+scrolls: PS/2 mouse wheel (IntelliMouse four-byte packets, negotiated at mouse
+init), PageUp/PageDown on the keyboard, three lines per notch. New output keeps
+the same absolute rows in view, the status strip reports `scroll N/M`, and an
+ordinary key or click returns to the live bottom; `clear` forgets the history. The
+view is repainted from the model, so the live grid, caret and selection are
+untouched; with a wallpaper active the history view is opaque and the wallpaper is
+repainted on return. A USB HID boot mouse has no wheel axis in its protocol, so a
+USB mouse scrolls with PageUp/PageDown (stated in `README.md`). The same work fixed
+the `wallpaper` shell command never calling `theme::apply`, which made every
+wallpaper invisible inside the text grid. Evidence: `drivers::scrollback` host
+unit tests and the committed `tools/e2e.py scroll` scenario (QMP wheel, paging,
+reset, screenshot diff, wallpaper round-trip). Full story: `AGENTS.md`, 2.21.0.
+
 ## 2.20.0
 
 `/proc/<pid>/maps` stops claiming `00:00 0` for files. The map's `PT_LOAD` segments

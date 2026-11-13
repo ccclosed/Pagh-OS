@@ -23,6 +23,12 @@ const MAX_LINES: usize = 37;
 /// `paint`'s taskbar uses this same constant, so the two bars stay aligned.
 pub const STATUS_BAR_HEIGHT: usize = CHAR_HEIGHT;
 
+/// How many scrolled-off console rows the scrollback keeps. One row is
+/// `CHARS_PER_LINE` characters plus their `u32` colours (~500 bytes), so this
+/// caps the history at ~256 KiB — memory is allocated lazily as output scrolls,
+/// and a wheel-scrolled session never reaches the cap on a normal boot.
+const SCROLLBACK_ROWS: usize = 512;
+
 /// The console typeface: Fira Code (the host's terminal font), rasterised offline
 /// by `tools/gen_font.py` into one **8-bit coverage** glyph per printable ASCII
 /// codepoint.
@@ -165,6 +171,11 @@ pub struct FramebufferWriter {
     /// console default. Without this, selecting the green prompt and releasing
     /// would leave it white: the pixels carry no record of how they were drawn.
     grid_fg: alloc::vec::Vec<u32>,
+    /// Console history: every row that has scrolled off the top of the grid, plus
+    /// the user's scroll view offset. The wheel and PageUp/PageDown move `view`;
+    /// drawing a history view repaints cells but never touches the live grid, so
+    /// the shell's model (caret, selection, next output) stays where it was.
+    scroll: super::scrollback::Scrollback<CHARS_PER_LINE>,
     /// Shadow copy of the screen in ordinary RAM.
     ///
     /// All drawing goes here first, because the framebuffer itself is MMIO: every
@@ -244,6 +255,7 @@ impl FramebufferWriter {
             // model cannot grow with output volume.
             grid: alloc::vec![b' '; MAX_LINES * CHARS_PER_LINE],
             grid_fg: alloc::vec![0xFFFFFF; MAX_LINES * CHARS_PER_LINE],
+            scroll: super::scrollback::Scrollback::new(SCROLLBACK_ROWS),
             // Zeroed, matching what the device shows after `clear`. Sized by PITCH,
             // not by width: every offset in this file is `y * pitch + x * bpp`, so a
             // buffer of `width * bpp` per row would be read at the wrong stride
@@ -258,6 +270,9 @@ impl FramebufferWriter {
     pub fn clear(&mut self) {
         self.col = 0;
         self.row = 0;
+        // A cleared screen has no history to scroll back into: keeping it would
+        // let the wheel resurrect output the user just wiped (`clear`).
+        self.scroll.clear();
         for cell in self.grid.iter_mut() {
             *cell = b' ';
         }
@@ -514,6 +529,11 @@ impl FramebufferWriter {
         // Scroll only the text region (the usable rows), leaving the reserved
         // status-bar strip at the bottom of the screen untouched.
         let rows = self.text_rows();
+        // The row that is about to leave the top of the grid becomes history.
+        // Taken from the model (chars + per-cell colour), not from the pixels:
+        // the pixels of a transparent console have a wallpaper behind them and
+        // cannot be read back as text.
+        self.scroll.push(self.row_snapshot(0));
         {
             let line_bytes = CHAR_HEIGHT * self.pitch;
             let text_px = rows * CHAR_HEIGHT;
@@ -550,6 +570,109 @@ impl FramebufferWriter {
             self.grid_fg[last + col] = self.fg_color;
         }
         self.row = rows - 1;
+        // A scrolled-back view must not jump when output arrives: `push` moved the
+        // view offset with the ring, and the pixels are re-rendered so the user
+        // keeps reading the same absolute rows.
+        if self.scroll.view() > 0 {
+            self.render_view();
+        }
+    }
+
+    /// Copy grid row `row` into an owned history row.
+    fn row_snapshot(&self, row: usize) -> super::scrollback::Row<CHARS_PER_LINE> {
+        let base = row.min(MAX_LINES - 1) * CHARS_PER_LINE;
+        let mut out = super::scrollback::Row::<CHARS_PER_LINE>::blank(self.fg_color);
+        out.chars
+            .copy_from_slice(&self.grid[base..base + CHARS_PER_LINE]);
+        out.fg
+            .copy_from_slice(&self.grid_fg[base..base + CHARS_PER_LINE]);
+        out
+    }
+
+    /// Paint the current scroll view into the shadow buffer.
+    ///
+    /// Screen row `r` shows history row `len - view + r` while `r < view`, and
+    /// live grid row `r - view` below that. The live grid itself is untouched —
+    /// this is a view, not a scroll — so the caret/selection model still describes
+    /// the live screen and returning to the bottom is a repaint, not a restore.
+    ///
+    /// Cells are painted with an explicit background: a history row must fully
+    /// replace what was on screen. On a transparent console (wallpaper active)
+    /// this means the wallpaper is not visible *through* the text while scrolled
+    /// back; the shell repaints the wallpaper when the view returns to the bottom.
+    fn render_view(&mut self) {
+        let (cols, rows) = self.text_grid();
+        let view = self.scroll.view();
+        let bg = self.bg_color;
+        for row in 0..rows {
+            if row < view {
+                let Some(hist) = self.scroll.view_row(row) else {
+                    continue;
+                };
+                let chars = hist.chars;
+                let fg = hist.fg;
+                for col in 0..cols {
+                    self.paint_cell_with_bg(col, row, chars[col], fg[col], bg, true);
+                }
+            } else {
+                let grid_row = row - view;
+                for col in 0..cols {
+                    let ch = self.cell_char(col, grid_row);
+                    let fg = self.cell_fg(col, grid_row);
+                    self.paint_cell_with_bg(col, row, ch, fg, bg, true);
+                }
+            }
+        }
+        // `paint_cell_with_bg` widens the dirty box per pixel; force the whole
+        // text region so a view that happens to repaint identical cells still
+        // reaches the device after a wallpaper repaint.
+        self.dirty = Some(match self.dirty {
+            None => (
+                0,
+                0,
+                self.width.saturating_sub(1),
+                (rows * CHAR_HEIGHT).saturating_sub(1),
+            ),
+            Some((x0, y0, x1, y1)) => (
+                x0.min(0),
+                y0.min(0),
+                x1.max(self.width.saturating_sub(1)),
+                y1.max((rows * CHAR_HEIGHT).saturating_sub(1)),
+            ),
+        });
+    }
+
+    /// Scroll the console view by `delta` rows (positive = older). Returns whether
+    /// the view moved; the caller flushes.
+    pub fn scroll_view(&mut self, delta: i32) -> bool {
+        if !self.scroll.scroll(delta) {
+            return false;
+        }
+        if self.scroll.view() > 0 {
+            self.render_view();
+        } else {
+            self.repaint_grid();
+        }
+        true
+    }
+
+    /// Jump the console view back to the live bottom. Returns whether it moved.
+    pub fn scroll_reset(&mut self) -> bool {
+        if !self.scroll.reset() {
+            return false;
+        }
+        self.repaint_grid();
+        true
+    }
+
+    /// `(view offset, retained history rows)` for the status bar and diagnostics.
+    pub fn scroll_state(&self) -> (usize, usize) {
+        (self.scroll.view(), self.scroll.len())
+    }
+
+    /// Text of the top visible history row while scrolled, for `[DIAG]` evidence.
+    pub fn scroll_top_text(&self) -> Option<alloc::string::String> {
+        self.scroll.view_top_text()
     }
 
     pub fn write_string(&mut self, s: &str) {
@@ -1199,6 +1322,39 @@ impl FbWriter {
         }
     }
 
+    /// Scroll the console view by `delta` rows (positive = older). See
+    /// [`FramebufferWriter::scroll_view`]; no-op before initialization.
+    pub fn scroll_view(&self, delta: i32) -> bool {
+        self.inner
+            .lock()
+            .as_mut()
+            .map(|w| w.scroll_view(delta))
+            .unwrap_or(false)
+    }
+
+    /// Return the console view to the live bottom, repainting the live grid.
+    pub fn scroll_reset(&self) -> bool {
+        self.inner
+            .lock()
+            .as_mut()
+            .map(|w| w.scroll_reset())
+            .unwrap_or(false)
+    }
+
+    /// `(view offset, retained history rows)`, or `(0, 0)` before initialization.
+    pub fn scroll_state(&self) -> (usize, usize) {
+        self.inner
+            .lock()
+            .as_ref()
+            .map(|w| w.scroll_state())
+            .unwrap_or((0, 0))
+    }
+
+    /// Top visible history row text while scrolled (diagnostics).
+    pub fn scroll_top_text(&self) -> Option<alloc::string::String> {
+        self.inner.lock().as_ref().and_then(|w| w.scroll_top_text())
+    }
+
     /// The console's current text cursor cell as `(col, row)`, or `None` when the
     /// framebuffer is uninitialized (serial-only boot).
     pub fn cursor_cell(&self) -> Option<(usize, usize)> {
@@ -1370,6 +1526,27 @@ pub fn with<R>(f: impl FnOnce(&mut FramebufferWriter) -> R) -> Option<R> {
 /// Repaint the bottom status bar with left/right aligned text.
 pub fn draw_status_bar(left: &str, right: &str) {
     FB_WRITER.draw_status_bar(left, right);
+}
+
+/// Scroll the console view by `delta` rows (positive = older text); returns
+/// whether anything moved. The caller is responsible for flushing.
+pub fn scroll_view(delta: i32) -> bool {
+    FB_WRITER.scroll_view(delta)
+}
+
+/// Return the console view to the live bottom; returns whether it moved.
+pub fn scroll_reset() -> bool {
+    FB_WRITER.scroll_reset()
+}
+
+/// `(view offset, retained history rows)` for the status bar and diagnostics.
+pub fn scroll_state() -> (usize, usize) {
+    FB_WRITER.scroll_state()
+}
+
+/// Text of the top visible history row while scrolled (diagnostics only).
+pub fn scroll_top_text() -> Option<alloc::string::String> {
+    FB_WRITER.scroll_top_text()
 }
 
 #[macro_export]

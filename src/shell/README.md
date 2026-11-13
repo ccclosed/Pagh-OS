@@ -92,6 +92,14 @@ Shift+букву строчной при выключенном CapsLock.
 Без whitespace → `complete_command`; иначе `readdir()` родителя токена через VFS →
 чистая `complete_path`. `Single` заменяет токен; `Multiple` расширяет до LCP и листит кандидатов.
 
+## Консоль: скроллбек
+
+Колесо PS/2-мыши и `PageUp`/`PageDown` листают историю консоли (3 строки на щелчок
+колеса, экран на клавишу); любая обычная клавиша или клик возвращают вниз, `clear`
+историю забывает, status bar показывает `scroll N/M`. Модель — `drivers::scrollback`
+(ring строк), отрисовка — `drivers::framebuffer::render_view`; live-сетка, каретка и
+выделение при этом не двигаются.
+
 ## Команды (полный список)
 
 `help`, `clear`, `echo`, `uptime`, `date` (RTC в UTC: ISO-время, день недели, unix-секунды),

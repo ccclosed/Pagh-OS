@@ -29,7 +29,7 @@
 ### What works today
 
 - **Boot:** Limine/UEFI → 1280×800 framebuffer console with a coloured prompt and status bar.
-- **Shell:** line editing, history, tab completion, `ls`/`ls -l`/`tree`/`chmod`/`chown`/`df`/`free`/`date`/`head`/`tail`/`wc`/`grep`/`ifconfig`/`ps`, ext2 file ops, `selftest`.
+- **Shell:** line editing, history, tab completion, console scrollback (mouse wheel / PageUp / PageDown), `ls`/`ls -l`/`tree`/`chmod`/`chown`/`df`/`free`/`date`/`head`/`tail`/`wc`/`grep`/`ifconfig`/`ps`, ext2 file ops, `selftest`.
 - **GUI apps:** the mouse-driven `paint` (shape tools, 16-colour palette, brush sizes, undo, save to ext2), the full-screen `nano+` editor, and `settings` with live colour themes + wallpapers.
 - **Storage:** ext2-compatible read/write filesystem with a write-ahead-log journal, on a real virtio-blk or NVMe disk (or a RAM disk carried on the boot medium).
 - **Networking:** the kernel's own e1000 + TCP/IP stack (DHCP/ARP/TCP/UDP; `ifconfig` shows the live lease).
@@ -405,6 +405,23 @@ the prompt. On a fresh disk the boot only seeds the file skeleton (release metad
 with `apt update` + `apt install python3` (progress on serial; the framebuffer log mirror
 is paused while it runs). The prompt shows the current working directory and is rendered in color on the
 framebuffer (serial stays plain text).
+
+### Console scrollback
+
+The console keeps the rows that scroll off the top and shows them again when you
+scroll back:
+
+- **Mouse wheel** — three text lines per notch (PS/2 mouse; the driver negotiates
+  the IntelliMouse four-byte protocol at boot, and the serial log says
+  `[PS2MOUSE] wheel: IntelliMouse ...`).
+- **PageUp / PageDown** — one screenful per press. This also covers a USB HID
+  mouse: its boot protocol has no wheel axis, so only the keyboard can page there.
+- **Any other key or a click** returns to the live bottom; the status strip shows
+  `scroll N/M` while you are back in history. `clear` forgets the history.
+- With a wallpaper active the history view is painted opaque (a history row has to
+  replace what was on screen); returning to the bottom repaints the wallpaper.
+
+The history is bounded (512 rows, ~256 KiB) and allocated as output scrolls.
 
 ### Shell commands
 

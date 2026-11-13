@@ -231,11 +231,34 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.20.0** (the shell batch of nine
-  new commands, the per-thread procfs view and, on top of it, real file
-  identity in `/proc/<pid>/maps`; 2.18.13 carried the `connect(2)`
+  be reflected here. **`main` currently reads 2.21.0** (console scrollback on
+  top of the shell batch of nine commands, the per-thread procfs view and the
+  real file identity in `/proc/<pid>/maps`; 2.18.13 carried the `connect(2)`
   reply-and-close fix, the VT/console coordinate fix and the kernel-thread
   rows in `ps`; the tag lands at the end of the batch).
+  **2.21.0** = the console scrolls back. The framebuffer console used to hold
+  exactly the rows that fit on screen, so anything printed above the view was
+  gone. It now keeps a bounded ring of scrolled-off *rows* — characters plus the
+  per-cell colour, the same model the grid already held — and shows them again
+  when the view scrolls: the PS/2 wheel (IntelliMouse extension negotiated at
+  init: three magic sample rates, then device id 3 and four-byte packets whose
+  fourth byte is the axis), PageUp/PageDown for the keyboard, three lines per
+  wheel notch. While scrolled, new output keeps the same absolute rows in view
+  (`push` moves the offset with the ring), the status strip reports
+  `scroll N/M`, and any ordinary key or click returns to the live bottom (Escape
+  included). `clear` forgets the history. The view is a repaint from the model,
+  not a pixel shift: the live grid is untouched, so the caret and selection
+  semantics stay exactly where they were; a transparent console (wallpaper
+  active) paints the history view opaque and `theme::repaint` puts the wallpaper
+  back on the return to live. One limit is named, not hidden: the wheel works on
+  the PS/2 mouse (a USB HID *boot* mouse has no wheel axis in the protocol, so USB
+  users scroll with PageUp/PageDown). Evidence: pure ring/view unit tests in
+  `drivers::scrollback` (host-tests, properties in the module), and the committed
+  `tools/e2e.py scroll` scenario — QMP wheel notches (the HMP monitor has no wheel
+  command), PageUp/PageDown, reset-on-key, live-vs-history screenshots that must
+  differ, and a wallpaper round-trip; it also caught the `wallpaper` shell command
+  never calling `theme::apply` (the opaque-console knob stayed on, so every
+  wallpaper was invisible inside the text grid — fixed here).
   **2.20.0** = `/proc/<pid>/maps` stops claiming `00:00 0` for files. The map's
   PT_LOAD segments (image and interpreter) and file-backed `mmap`s now print the
   `st_dev`/`st_ino` and pathname `stat(2)`/`fdinfo` already report for the same
