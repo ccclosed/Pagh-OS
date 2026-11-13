@@ -39,8 +39,8 @@ use crate::task::compat;
 
 use super::errno::Errno;
 use super::mem::{
-    plan_brk, plan_mmap_base, plan_munmap, prot_to_flags, range_is_free, BrkOutcome, MmapRegion,
-    MunmapPlan, VmRegionSet, MAP_ANONYMOUS, MAP_PRIVATE,
+    plan_brk, plan_mmap_base, plan_munmap, prot_to_flags, range_is_free, BrkOutcome, MmapBacking,
+    MmapRegion, MunmapPlan, VmRegionSet, MAP_ANONYMOUS, MAP_PRIVATE,
 };
 use super::validate::USER_ADDR_MAX;
 
@@ -199,8 +199,10 @@ pub fn sys_mmap(
     let anon = flags & MAP_ANONYMOUS != 0;
     let fixed = flags & MAP_FIXED != 0;
 
-    // File-backed: resolve and clone the backing node BEFORE taking the compat
-    // lock, mirroring `read`/`pread64` (VFS I/O must run with the lock dropped).
+    // File-backed: resolve and clone the backing node (and its VFS path, for
+    // `/proc/<pid>/maps`) BEFORE taking the compat lock, mirroring
+    // `read`/`pread64` (VFS I/O must run with the lock dropped).
+    let mut backing: Option<MmapBacking> = None;
     let node = if anon {
         None
     } else {
@@ -210,8 +212,16 @@ pub fn sys_mmap(
         if (fd as i64) < 0 {
             return Err(Errno::EBADF);
         }
-        match super::io_sys::file_node_for_fd(fd as u32) {
-            Some(n) => Some(n),
+        match super::io_sys::file_backing_for_fd(fd as u32) {
+            Some((n, path)) => {
+                backing = Some(MmapBacking {
+                    path,
+                    // Same identity `stat(2)`/`fdinfo` report for this file.
+                    ino: super::io_sys::node_ino(&n),
+                    file_offset: off,
+                });
+                Some(n)
+            }
             None => return Err(Errno::EBADF),
         }
     };
@@ -272,6 +282,7 @@ pub fn sys_mmap(
             nx,
             prot: prot as u32,
             anon,
+            backing: backing.clone(),
         });
         if !fixed && end > vm.mmap_next_hint {
             vm.mmap_next_hint = end;
@@ -370,7 +381,7 @@ pub fn sys_mremap(
             .iter()
             .position(|r| r.base <= old_addr && old_addr + old_span <= r.base + r.pages * PAGE_SIZE)
             .ok_or(Errno::EFAULT)?;
-        let old = vm.mmaps[idx];
+        let old = vm.mmaps[idx].clone();
         let flags_of = leaf_flags(old.writable, old.nx);
 
         if new_pages <= old_pages {
@@ -466,6 +477,10 @@ pub fn sys_mremap(
                 nx: old.nx,
                 prot: old.prot,
                 anon: old.anon,
+                // A moved mapping keeps its file identity; the tail pages past
+                // the old end are zero-filled by the copy above, exactly like
+                // the eager file copy leaves a short file's tail zeroed.
+                backing: old.backing.clone(),
             },
         );
         if end > vm.mmap_next_hint {
@@ -505,7 +520,7 @@ fn cut_regions(regions: &mut Vec<MmapRegion>, base: u64, pages: u64) {
         let rend = r.base + r.pages * PAGE_SIZE;
         if rend <= ustart || rstart >= uend {
             // No overlap: keep intact.
-            out.push(*r);
+            out.push(r.clone());
             continue;
         }
         // Surviving left sub-range.
@@ -517,10 +532,13 @@ fn cut_regions(regions: &mut Vec<MmapRegion>, base: u64, pages: u64) {
                 nx: r.nx,
                 prot: r.prot,
                 anon: r.anon,
+                backing: r.backing.clone(),
             });
         }
-        // Surviving right sub-range.
+        // Surviving right sub-range: its first page maps a later file offset,
+        // so the backing's `file_offset` shifts by the bytes cut away.
         if rend > uend {
+            let shift = uend - rstart;
             out.push(MmapRegion {
                 base: uend,
                 pages: (rend - uend) / PAGE_SIZE,
@@ -528,6 +546,10 @@ fn cut_regions(regions: &mut Vec<MmapRegion>, base: u64, pages: u64) {
                 nx: r.nx,
                 prot: r.prot,
                 anon: r.anon,
+                backing: r.backing.clone().map(|mut b| {
+                    b.file_offset = b.file_offset.saturating_add(shift);
+                    b
+                }),
             });
         }
     }
@@ -571,6 +593,7 @@ fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result
                 nx: true,
                 prot: super::mem::PROT_READ | super::mem::PROT_WRITE,
                 anon: true,
+                backing: None,
             });
         }
         let region_rejected = matches!(plan_munmap(addr, len, &covered), MunmapPlan::Reject(_));

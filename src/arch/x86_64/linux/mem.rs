@@ -30,9 +30,29 @@ pub const MAP_PRIVATE: u32 = 0x2;
 /// `mmap` flag: the mapping is not backed by any file (zero-filled).
 pub const MAP_ANONYMOUS: u32 = 0x20;
 
-/// A previously-mapped anonymous region, as tracked by the per-process
-/// `VmRegionSet`. Used by [`plan_munmap`] to confirm a requested range is covered.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A file-backed mapping's backing file identity, for `/proc/<pid>/maps`.
+///
+/// The pure planners ([`plan_mmap_base`], [`plan_munmap`], …) have no business
+/// knowing about the VFS, but the maps file must print what the mapping is
+/// actually backed by: without this table every file-backed line would have to
+/// claim `00:00 0` and no pathname (`docs/procfs.md` DEVIATION-7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MmapBacking {
+    /// VFS path the descriptor mapping the region was opened with; the same
+    /// pathname Linux prints for the mapping.
+    pub path: alloc::string::String,
+    /// `st_ino` the VFS reports for that path (`io_sys::node_ino`), so the maps
+    /// line agrees with `stat(2)`/`fdinfo` on the same file.
+    pub ino: u64,
+    /// File offset (bytes) this region's first page maps from. Kept
+    /// page-aligned at map time; partial `munmap`/`mprotect` splits shift it so
+    /// each surviving sub-range reports its own true offset.
+    pub file_offset: u64,
+}
+
+/// A previously-mapped region, as tracked by the per-process `VmRegionSet`.
+/// Used by [`plan_munmap`] to confirm a requested range is covered.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MmapRegion {
     /// 4 KiB-aligned base virtual address of the region.
     pub base: u64,
@@ -51,6 +71,10 @@ pub struct MmapRegion {
     /// on first touch by the page-fault handler) as opposed to file-backed
     /// (eagerly copied at `mmap` time by the kernel handler).
     pub anon: bool,
+    /// File identity of a file-backed region; `None` for anonymous ones (and
+    /// for the synthetic heap coverage region). `/proc/<pid>/maps` prints it
+    /// as `maj:min ino pathname`.
+    pub backing: Option<MmapBacking>,
 }
 
 /// Outcome of a pure `brk` planning step (R3.1–R3.6).

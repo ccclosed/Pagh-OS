@@ -93,8 +93,15 @@ pub struct CompatState {
     pub cmdline: Vec<u8>,
     /// Mapped `PT_LOAD` segments of the executable, for `/proc/self/maps`.
     pub image_segments: Vec<LoadSegment>,
+    /// `st_ino` of the executable's VFS node, as `stat(2)` reports it. The maps
+    /// file prints it on the image's segment lines so a file-backed mapping is
+    /// identifiable (0 when the image had no VFS identity).
+    pub image_ino: u64,
     /// Mapped `PT_LOAD` segments of the ELF interpreter (empty for static images).
     pub interp_segments: Vec<LoadSegment>,
+    /// `st_ino` of the interpreter's VFS node (0 for static images), for
+    /// `/proc/self/maps`; the path itself lives in [`CompatState::interp_path`].
+    pub interp_ino: u64,
     /// Path of the ELF interpreter, when one was loaded (for `/proc/self/maps`).
     pub interp_path: String,
     /// What fds 0/1/2 were AT execve time (after the
@@ -190,7 +197,9 @@ impl CompatState {
             exe_path: String::new(),
             cmdline: Vec::new(),
             image_segments: Vec::new(),
+            image_ino: 0,
             interp_segments: Vec::new(),
+            interp_ino: 0,
             interp_path: String::new(),
             exec_stdio: ["?", "?", "?"],
             rlimits: BTreeMap::new(),

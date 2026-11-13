@@ -1621,7 +1621,7 @@ mod vfs_tests {
 // exactly why the `/proc/self` half of the contract is asserted to be *invisible*
 // here (the Linux-process half is verified end to end from a guest binary).
 mod procfs_tests {
-    use crate::arch::x86_64::linux::mem::VmRegionSet;
+    use crate::arch::x86_64::linux::mem::{MmapBacking, MmapRegion, VmRegionSet};
     use crate::sync::spinlock::Spinlock;
     use crate::task::compat::{self, CompatState};
     use crate::task::fd::{FdTable, OpenObject, O_CLOEXEC, O_RDONLY};
@@ -2374,6 +2374,140 @@ mod procfs_tests {
         st.exe_path = String::from("/mnt/tasktest");
         st.cmdline = Vec::from(&b"tasktest\0--flag\0"[..]);
         st
+    }
+
+    /// `/proc/<pid>/maps` file identity (slice 7, `docs/procfs.md` §14).
+    ///
+    /// The maps renderer used to print `00:00 0` for every line, including the
+    /// PT_LOAD segments of the executable and file-backed `mmap`s — files that
+    /// do have a real `stat(2)` identity. This routine drives the renderer over
+    /// a synthetic `CompatState` with a known image inode and a file-backed
+    /// `mmap` (same instrument as the fdinfo/limits and task-tree routines) and
+    /// pins the exact columns: a file-backed line carries `08:00 <ino> <path>`
+    /// (the values `stat` reports) and the captured file offset, while
+    /// anonymous/heap/stack lines keep the honest `00:00 0` with no pathname.
+    pub fn maps_file_identity() {
+        const FAKE: u64 = 0x7F00_4001;
+        /// The image inode the launch path would have captured (`path_ino`).
+        const IMAGE_INO: u64 = 0x00AB_CDEF;
+        /// The backing file of the file-backed mmap.
+        const MMAP_INO: u64 = 0x0001_2345;
+        /// Page-aligned offset of that mapping inside the file.
+        const MMAP_OFF: u64 = 0x2000;
+
+        let me = scheduler::current_pid();
+        let saved = compat::remove_compat(me);
+        compat::install_compat(FAKE, synth(FAKE));
+
+        // The synthetic process image: one PT_R|W|X segment at 4 MiB.
+        let image_seg = crate::vfs::elf::LoadSegment {
+            start: 0x40_0000,
+            end: 0x40_1000,
+            prot: 7,
+            file_offset: 0,
+        };
+        compat::with_pid_compat(FAKE, |cs| {
+            cs.exe_path = String::from("/mnt/lxselftest");
+            cs.image_segments = alloc::vec![image_seg];
+            cs.image_ino = IMAGE_INO;
+            cs.interp_segments.clear();
+            cs.interp_ino = 0;
+            cs.interp_path.clear();
+            let mut vm = cs.vm.lock();
+            // A file-backed mapping at 0x2000_0000 and an anonymous one at
+            // 0x3000_0000; the heap/stack lines come from the renderer itself.
+            vm.mmaps.push(MmapRegion {
+                base: 0x2000_0000,
+                pages: 1,
+                writable: false,
+                nx: true,
+                prot: crate::arch::x86_64::linux::mem::PROT_READ,
+                anon: false,
+                backing: Some(MmapBacking {
+                    path: String::from("/mnt/lxselftest.data"),
+                    ino: MMAP_INO,
+                    file_offset: MMAP_OFF,
+                }),
+            });
+            vm.mmaps.push(MmapRegion {
+                base: 0x3000_0000,
+                pages: 1,
+                writable: true,
+                nx: true,
+                prot: crate::arch::x86_64::linux::mem::PROT_READ
+                    | crate::arch::x86_64::linux::mem::PROT_WRITE,
+                anon: true,
+                backing: None,
+            });
+        });
+
+        let maps = text_of(&alloc::format!("/proc/{FAKE}/maps"));
+
+        // Image segment: real `08:00 <ino>` + pathname, no invented zeros.
+        let image_line = alloc::format!(
+            "00400000-00401000 rwxp 00000000 08:00 {} /mnt/lxselftest",
+            IMAGE_INO
+        );
+        assert_kernel!(
+            maps.contains(&image_line),
+            "procfs maps: image segment carries the real dev/inode/path"
+        );
+
+        // File-backed mmap: real identity AND the captured file offset.
+        let mmap_line = alloc::format!(
+            "20000000-20001000 r--p {:08x} 08:00 {} /mnt/lxselftest.data",
+            MMAP_OFF,
+            MMAP_INO
+        );
+        assert_kernel!(
+            maps.contains(&mmap_line),
+            "procfs maps: file-backed mmap carries dev/inode/offset/path"
+        );
+
+        // Anonymous mmap: honest `00:00 0`, no pathname, no trailing space.
+        assert_kernel!(
+            maps.contains("30000000-30001000 rw-p 00000000 00:00 0\n"),
+            "procfs maps: anonymous mmap keeps the 00:00 0 sentinel"
+        );
+        // Stack is always printed; it has no backing file.
+        let stack_ok = maps.lines().any(|l| {
+            l.contains(" [stack]")
+                && l.contains(" 00:00 0 ")
+                && !l.contains(" 08:00 ")
+                && l.ends_with("[stack]")
+        });
+        assert_kernel!(
+            stack_ok,
+            "procfs maps: [stack] has no invented file identity"
+        );
+        // Every emitted line has the Linux field shape.
+        let mut lines = 0;
+        let mut malformed = 0;
+        for line in maps.lines() {
+            lines += 1;
+            let mut it = line.splitn(6, ' ');
+            let range = it.next().unwrap_or("");
+            let perms = it.next().unwrap_or("");
+            let off = it.next().unwrap_or("");
+            let dev = it.next().unwrap_or("");
+            let ino = it.next().unwrap_or("");
+            let ok = range.split_once('-').is_some()
+                && perms.len() == 4
+                && off.len() == 8
+                && dev.split_once(':').is_some()
+                && ino.parse::<u64>().is_ok();
+            if !ok {
+                malformed += 1;
+            }
+        }
+        assert_kernel!(lines >= 3, "procfs maps: the map is not empty");
+        assert_eq_kernel!(malformed, 0, "procfs maps: every line is well formed");
+
+        // Restore the registry.
+        compat::remove_compat(FAKE);
+        if let Some(previous) = saved {
+            compat::install_compat(me, previous);
+        }
     }
 
     /// `/proc/<pid>/task` and `/proc/self/task` (slice 6, `docs/procfs.md`
@@ -6941,6 +7075,12 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "procfs::per-thread task directories (slice 6)",
             procfs_tests::task_tree
+        ),
+        // Slice 7: `/proc/<pid>/maps` prints the real `stat(2)` identity of
+        // file-backed regions instead of `00:00 0`.
+        (
+            "procfs::maps file identity (slice 7)",
+            procfs_tests::maps_file_identity
         ),
         ("pmm::total_frames > 0", pmm_tests::total_frames),
         ("pmm::alloc+free cycle", pmm_tests::alloc_free),

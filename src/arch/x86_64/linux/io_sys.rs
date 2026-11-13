@@ -210,6 +210,17 @@ pub fn file_node_for_fd(fd: u32) -> Option<Arc<dyn VfsNode>> {
     }
 }
 
+/// The backing node of an open file descriptor **and the VFS path it was opened
+/// with**. `mmap` needs both: the node to copy the file bytes in, and the path
+/// for the `/proc/<pid>/maps` pathname column (`docs/procfs.md` §14).
+pub fn file_backing_for_fd(fd: u32) -> Option<(Arc<dyn VfsNode>, String)> {
+    compat::with_current_compat(|cs| match cs.fds.get(fd) {
+        Some(OpenObject::File { node, path, .. }) => Some((Arc::clone(node), path.clone())),
+        _ => None,
+    })
+    .flatten()
+}
+
 /// Commit a new offset for an open file descriptor (no-op if it is not currently
 /// an open `File`). Used after a `read`/`write`/`lseek` advances the offset.
 fn set_fd_offset(fd: u32, new_off: u64) {
@@ -1183,7 +1194,7 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> Result<u64, Errno> {
 }
 
 /// `st_dev` reported for all VFS-backed files (arbitrary but nonzero; 8:0).
-const STAT_DEV_VFS: u64 = 0x0800;
+pub(crate) const STAT_DEV_VFS: u64 = 0x0800;
 
 /// Nonzero fallback inode for synthetic nodes without filesystem identity:
 /// FNV-1a of the node name with the top bit set, so it can never collide with

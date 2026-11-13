@@ -231,10 +231,23 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.19.0** (nine new shell commands
-  plus the per-thread procfs view, on top of the 2.18.13 batch: `connect(2)`
-  reply-and-close, the VT/console coordinates and the kernel-thread rows in
-  `ps`; the tag lands at the end of the batch).
+  be reflected here. **`main` currently reads 2.20.0** (the shell batch of nine
+  new commands, the per-thread procfs view and, on top of it, real file
+  identity in `/proc/<pid>/maps`; 2.18.13 carried the `connect(2)`
+  reply-and-close fix, the VT/console coordinate fix and the kernel-thread
+  rows in `ps`; the tag lands at the end of the batch).
+  **2.20.0** = `/proc/<pid>/maps` stops claiming `00:00 0` for files. The map's
+  PT_LOAD segments (image and interpreter) and file-backed `mmap`s now print the
+  `st_dev`/`st_ino` and pathname `stat(2)`/`fdinfo` already report for the same
+  VFS node, plus the real file offset of a `mmap` (shifted correctly when a
+  partial `munmap`/`mprotect` splits a region). `[heap]`, `[stack]` and
+  anonymous mappings keep the honest `00:00 0` and no pathname: they have no
+  backing file. The kernel still keeps no VMA list, so the map shows exactly
+  what it knows (image, interpreter, heap, tracked `mmap`s, stack) and nothing
+  invented. Contract: `docs/procfs.md` §14 (DEVIATION-7 narrowed). Evidence:
+  `procfs::maps file identity` selftest routine, `properties/procfs_maps.rs`
+  and the `lx_selftest` `maps_metadata` fixture (a real guest ELF that maps its
+  own file, reads `/proc/self/maps` and writes the dump for the harness).
   **2.19.0** = nine new shell commands, a long listing for `ls` and `-h` units, one batch
   of "ask the machine instead of reading a log":
   * `free` — physical memory total/used/free from the PMM frame counters plus

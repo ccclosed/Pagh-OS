@@ -1,4 +1,4 @@
-# Контракт procfs для issue #11 — срезы 1–6
+# Контракт procfs для issue #11 — срезы 1–7
 
 **Статус:** требования (задача `t3`, kind=work). Документ — приёмка: реализация issue #11
 обязана соответствовать ему по путям, содержимому и поведению syscall-поверхности.
@@ -8,7 +8,8 @@ read-only `/proc/sys/kernel/*`), срез 4 — в 2.11.0 (per-pid `cmdline/stat
 `/proc/self/{stat,statm}`, mountinfo/mounts/cgroup — в 2.12–2.15), срез 5 — в 2.16.0
 (`/proc/<pid>/fdinfo/<n>`, `/proc/self/fdinfo/<n>`, `/proc/<pid>/limits`,
 `/proc/self/limits`; §12), срез 6 — в 2.19.0 (`/proc/<pid>/task/`,
-`/proc/self/task/` — per-thread view; §13). Отступления от текста ниже, если они есть,
+`/proc/self/task/` — per-thread view; §13), срез 7 — в 2.20.0 (достоверные
+`maj:min`/`ino`/`pathname` в `/proc/<pid>/maps` для file-backed строк; §14). Отступления от текста ниже, если они есть,
 перечислены в коде и в `src/vfs/README.md`; DEVIATION-2 уточнён: рендер ленивый и живёт
 один проход чтения (`read(offset == 0)` перерисовывает), а не снимок на `open()`.
 Ссылки на код и номера строк — исторические (контракт писался на `cd542bb`), сверяйтесь
@@ -129,7 +130,7 @@ pub fn guest_path_keeps_root(abs: &str) -> bool {
 
 ---
 
-## 2. Дерево (срезы 1–6)
+## 2. Дерево (срезы 1–7)
 
 ### 2.1 Что входит
 
@@ -515,7 +516,9 @@ pub cmdline: Vec<u8>,
 
 ### 4.6 `/proc/self/maps`
 
-Строка (Linux `fs/proc/task_mmu.c::show_map_vma`), байтовая точность полей:
+Строка (Linux `fs/proc/task_mmu.c::show_map_vma`), байтовая точность полей.
+Срез 7 (§14) наполняет `dev`/`ino`/`offset`/`path` реальными значениями для
+file-backed-строк; анонимные/`[heap]`/`[stack]` остаются `00:00 0` без пути:
 
 ```
 {start:08x}-{end:08x} {r}{w}{x}{p} {offset:08x} {maj:02x}:{min:02x} {ino} {path}\n
@@ -526,12 +529,17 @@ pub cmdline: Vec<u8>,
 - `perms` — четыре символа: `r`/`-`, `w`/`-`, `x`/`-`, затем `p` (все маппинги private;
   `s` не эмитится);
 - `offset` — 8 hex-цифр (для анонимных 0);
-- `maj:min` — `00:00` для анонимных и для file-backed, у которых (dev, ino) не захвачены
-  (DEVIATION-7); `ino` — десятичный;
-- `path` — абсолютный гостевой путь образа/интерпретатора, либо метка в квадратных
-  скобках (`[heap]`, `[stack]`), либо отсутствует (анонимные). Перед `path` ровно один
-  пробел; лишнее выравнивание не нужно (парсеры — `sscanf` по whitespace).
-  Для анонимной строки **пробела в конце нет**.
+- `maj:min` — `08:00` для file-backed-строк (это `major:minor` от `STAT_DEV_VFS`, того
+  же значения, что `stat(2)` отдаёт для VFS-узла) и `00:00` для анонимных/`[heap]`/
+  `[stack]` (DEVIATION-7 в редакции §14.2); `ino` — десятичный, реальный `st_ino`
+  (та же identity, что у `stat`/`fdinfo`), `0` — честный sentinel «нет файла»;
+- `offset` — 8 hex-цифр: для file-backed-строк реальный `off` (у образа/интерпретатора —
+  `p_offset` сегмента, у `mmap` — аргумент `off`, с пересчётом при частичном
+  `munmap`/`mprotect`); для анонимных — 0.
+- `path` — абсолютный гостевой путь образа/интерпретатора или файла file-backed
+  `mmap`, либо метка в квадратных скобках (`[heap]`, `[stack]`), либо отсутствует
+  (анонимные). Перед `path` ровно один пробел; лишнее выравнивание не нужно
+  (парсеры — `sscanf` по whitespace). Для анонимной строки **пробела в конце нет**.
 
 Состав и порядок:
 
@@ -550,7 +558,7 @@ pub cmdline: Vec<u8>,
    (объединение прав, приоритет — первое имя), чтобы вывод всегда был парсабельным.
    `[vdso]`/`[vvar]`/`[vsyscall]` не печатаются (их нет).
 
-Для пунктов 1–2 нужны данные, которых в ядре сейчас нет: `ElfProcess`
+Для пунктов 1–2 нужны данные, которых в ядре сначала не было: `ElfProcess`
 (`src/vfs/elf.rs:73-90`) не хранит сегменты. Требуется:
 
 ```rust
@@ -1004,7 +1012,7 @@ pub fn parse_pid_component(name: &str) -> Option<u64>;  // тот же парс�
 | `properties/procfs_cpuinfo.rs` | для случайного набора CPUID-слов: ровно один блок на CPU, блок кончается `\n\n`; первая строка каждого блока ровно `processor\t: {i}\n`; есть литерал `model name\t: `; `flags` — **точное равенство** «таблица ∩ биты» (для всех нулевых слов список имён пуст — `flags\t\t: \n`, ни одного выдуманного имени); `model name` не пуст; `cpu MHz`/`cache size`/`bogomips` присутствуют ⇔ соответствуют `Some`; `bugs\t\t:` присутствует; ключи не дублируются |
 | `properties/procfs_status.rs` | `status`: каждая обязательная строка ровно один раз, `Pid`/`Tgid`/`PPid` равны входу, `SigPnd`/`SigBlk`/`SigIgn`/`SigCgt` — ровно 16 строчных hex, `Name` = `task_name` и ≤ 15 байт, `VmSize ≥ VmRSS`, нет NUL, каждая строка кончается `\n` |
 | `properties/procfs_cmdline.rs` | `format_cmdline(a)` == конкатенация `a[i] + \0`; расщепление по NUL (без последнего пустого) байт-в-байт возвращает `a`; пустой argv → пустой вывод; при лимите отбрасываются только целые аргументы, вывод кончается NUL, `len ≤ cap`; аргументы с невалидным UTF-8 и с внутренними `\n` проходят без изменений |
-| `properties/procfs_maps.rs` | maps: результат парсится regex'ом `^[0-9a-f]{8,16}-[0-9a-f]{8,16} [r-][w-][x-]p [0-9a-f]{8} [0-9a-f]{2}:[0-9a-f]{2} [0-9]+( \S.*)?$`, отсортирован, `start<end`, не пересекается, ни одного `0x`, пустой путь ⇒ нет хвостового пробела |
+| `properties/procfs_maps.rs` | maps: результат парсится regex'ом `^[0-9a-f]{8,16}-[0-9a-f]{8,16} [r-][w-][x-]p [0-9a-f]{8} [0-9a-f]{2}:[0-9a-f]{2} [0-9]+( \S.*)?$`, отсортирован, `start<end`, не пересекается, ни одного `0x`, пустой путь ⇒ нет хвостового пробела; срез 7: dev/ino/offset/path file-backed-строки возвращаются байт-в-байт, `dev_bytes(0x0800)==(8,0)`, анонимная строка ровно `… 00:00 0` без хвостового пробела |
 | `properties/procfs_misc.rs` | таблица путей/inode'ов (`proc_entry` для всех имён из контракта → `Some`, для `"1"`, `"self/fd"`, `"cpuinfo/x"`, `""`, `"devices"` → `None`; все inode'ы различны, bit 63 = 0, `> 0x540000`); `guest_path_keeps_root`: `true` ⇔ первый компонент ∈ {mnt,dev,proc,sys,tmp}, и `/proc/...` **всегда** true; `format_version` — ровно одна строка `pagh {version} (x86_64) #1 SMP\n` без `Linux version`; `format_filesystems` — `nodev\t<name>`/`\t<name>`, `FILESYSTEMS` == ровно `proc/ramfs/ext2`; `format_loadavg` — три поля в сотых долях плюс `runnable/total`/`last_pid`, нулевой случай `0.00 0.00 0.00 0/0 0`; sys-файлы — ровно `Pagh\n`, `<version>\n`, `pagh\n`, имена/порядок `PROC_SYS_FILES` |
 | `properties/procfs_stat.rs` | `/proc/stat`: 10 числовых колонок на `cpu`/`cpu0`, `ctxt`/`btime`/`processes`/`procs_running`/`procs_blocked`, монотонность user/system/idle-аккаунтинга |
 | `properties/procfs_pid.rs` | per-pid `cmdline`/`stat`/`status`/`maps` рендер из `PidStatInputs` (pid/tgid/ppid/state, нумерация `statm`-страниц, `[stack]`/`[heap]` в maps) |
@@ -1065,6 +1073,10 @@ python3 tools/host_tests.py          # + 6 новых property-наборов
   `"/proc/cpuinfo/child"` → `Err(VfsError::NotFound)`;
 - `lookup_path("/proc/self")` → `Err(NotFound)` **в контексте boot-thread** (нет compat
   состояния — §5.5), и это утверждение фиксирует контракт;
+- срез 7 — рутина `procfs::maps file identity`: синтетический `CompatState` с
+  `image_ino` и file-backed `mmap`; строка образа печатает `08:00 <ino> /mnt/lxselftest`,
+  строка mmap — `08:00 <ino> <offset> /mnt/lxselftest.data`, анонимная — `00:00 0`, у
+  `[stack]` нет выдуманного file identity, каждая строка имеет Linux-форму;
 - срез 6 — рутина `procfs::per-thread task directories`: на синтетической группе
   тредов в реестре (`src/test.rs::procfs_tests::task_tree`, тот же инструмент, что у
   fdinfo/limits) `/proc/<pid>/task` отдаёт ровно живые треды по возрастанию; каждый
@@ -1096,6 +1108,11 @@ python3 tools/host_tests.py          # + 6 новых property-наборов
   проверяется in-QEMU рутиной `selftest` (§8.2) и `lx_selftest`-сценариями
   `thread_task_dir`/`thread_exit_task` (реальный `clone(CLONE_THREAD)` из гостевого ELF
   и реальный выход треда, §13.6).
+- срез 7 (maps): `--cmd 'lxrun /mnt/lxm ...'` не нужен — `lx_selftest`-фикстура сама
+  читает `/proc/self/maps` (это и есть live `cat /proc/self/maps` из гостя) и пишет
+  копию на `/mnt/lxm.out`; serial: `LXSELFTEST maps_metadata PASS`, а
+  `--extra-wait 'LXSELFTEST maps_metadata PASS'` делает маркер обязательным для E2E
+  (`tools/e2e.py local-mirror`).
 
 ### 8.4 Обязательные обновления документации
 `src/vfs/README.md`, `README.md`, `LINUX-USERLAND.md` — см. §6.7 (по `AGENTS.md`
@@ -1116,7 +1133,7 @@ python3 tools/host_tests.py          # + 6 новых property-наборов
 | 4 | `/proc/uptime` второе поле = `0.00` | Учёта idle нет; потребители читают первое поле |
 | 5 | `VmPeak == VmSize`, `VmHWM == VmRSS`, RSS без residency-учёта | Постраничного учёта нет; врут оба варианта, но этот — минимально |
 | 6 | `cat /proc/self/exe` из kernel-shell печатает пусто | Kernel-side `cat` не следует ссылкам; syscall-путь (`open`) следует (§5.4) |
-| 7 | `[stack]` — весь регион; `maj:min/ino` образа могут быть `00:00 0`; file-backed mmap без пути | Не хранится residency/путь в `VmRegionSet`; диапазон и права при этом верны |
+| 7 | `[heap]`/`[stack]`/анонимные `mmap` — `00:00 0` без пути; `[stack]` — весь регион, а не использованная часть; ld.so-сегменты (RELRO и т.п.) не показываются | Backing-файла у этих регионов нет, residency и VMA-списка ядро не ведёт. **Срез 7 (§14.2) сузил отклонение:** образ, интерпретатор и file-backed `mmap` печатают настоящие `08:00`/`st_ino`/offset/pathname |
 | 8 | Относительный `proc/...` из cwd `/mnt` не виден; `readlink("/proc/self")` → `EINVAL`; `exe_path` с префиксом `/mnt` | Следствие chroot-маппинга и отсутствия общего следования по ссылкам; абсолютные пути покрывают всех потребителей |
 | 9 | Покомпонентный предикат исключений (`/process` теперь маппится в `/mnt/process`) | Исправление латентного дефекта префиксного сравнения |
 | 10 | `open("/proc/cpuinfo/x")` → `ENOENT`, а не `ENOTDIR` | Дефолтный `lookup` трейта; `ENOTDIR` потребует отдельной проверки в `lookup_path` |
@@ -1169,6 +1186,10 @@ python3 tools/host_tests.py          # + 6 новых property-наборов
    `task/<tid>` — тот же VFS-объект, что `/proc/<tid>`; `stat`/`status`/`cmdline`
    доступны per-thread; ENOENT/ENOTDIR-матрица §13.4 покрыта in-QEMU рутиной §13.6;
    `properties/procfs_task.rs` и контракт обновлены.
+8. Срез 7 (§14): file-backed-строки `/proc/<pid>/maps` несут реальные
+   `maj:min`/`ino`/`offset`/`pathname` (образ, интерпретатор, file-backed `mmap`),
+   анонимные/`[heap]`/`[stack]` остаются `00:00 0`; поведение покрыто host-свойством,
+   in-QEMU рутиной и live-фикстурой; DEVIATION-7 в §9 и §4.6 приведена в соответствие.
 ---
 
 ## 12. Срез 5 (2.16.0 batch): fdinfo и limits
@@ -1408,3 +1429,73 @@ pid-каталог (алиас), поэтому `stat`/`status`/`cmdline` (и `m
 | 23 | `/proc` верхнего уровня перечисляет и не-лидеров-треды как numeric-каталоги (Linux — только tgid) | Предсуществующее поведение с момента появления тредов: `DirKind::Root::readdir` берёт все записи реестра. Срез 6 добавляет Linux-стандартный путь (`/proc/<tgid>/task`), но не убирает уже наблюдаемые пути (совместимость с `ps`/скриптами). Отдельное решение — отдельный PR |
 | 24 | `ppid` треда в `stat`/`status` — pid создавшей задачи (может быть не-лидером), а не tgid родительского процесса, как в Linux | Так `clone_current_compat` записывает `CompatState.ppid`; `getppid(2)` в pagh отвечает тем же значением. Выдумывать «правильный» tgid в procfs значило бы расходиться с syscall-поверхностью |
 | 25 | Нет per-thread `comm` (`prctl(PR_SET_NAME)`/`pthread_setname_np`): `Name:`/`comm` — имя образа; нет `voluntary_ctxt_switches` и прочих не смоделированных полей | В ядре нет per-thread имени и per-task ctxt-счётчиков; печатаются те же честные нули/общие значения, что и в pid-каталоге (§4.5), а не выдумка |
+
+---
+
+## 14. Срез 7 (2.20.0): достоверные `maj:min`/`ino`/`pathname` в `/proc/<pid>/maps`
+
+**Мотивация.** `/proc/<pid>/maps` реализован в 2.11.0 (§4.6) и печатал `00:00 0` для
+**всех** строк (DEVIATION-7). Для анонимных регионов это честно, но PT_LOAD-сегменты
+образа, сегменты интерпретатора и file-backed `mmap` имеют настоящий VFS-узел: у них
+есть `st_dev`/`st_ino` (те же, что отдаёт `stat(2)`) и путь. Срез 7 закрывает эту
+неточность: строка файлового маппинга называет реальный файл, а не нули.
+
+### 14.1 Что печатается в каждой строке
+
+| Источник строки | `dev` | `ino` | `offset` | `pathname` |
+|---|---|---|---|---|
+| PT_LOAD-сегмент образа (`exe`) | `08:00` | `st_ino` файла образа, захваченный при запуске (`CompatState::image_ino`) | `p_offset` сегмента (page-aligned) | `exe_path` |
+| PT_LOAD-сегмент интерпретатора | `08:00` | `st_ino` реально загруженного файла (`CompatState::interp_ino`) | `p_offset` | гостевое имя из `PT_INTERP` (`interp_path`) |
+| file-backed `mmap` | `08:00` | `st_ino` файла, чей fd мапили (`MmapBacking::ino`) | `off`, переданный в `mmap` (пересчитывается при частичном `munmap`/`mprotect`) | путь, с которым fd был открыт (`MmapBacking::path`) |
+| anonymous `mmap` | `00:00` | `0` | `0` | нет |
+| `[heap]`, `[stack]` | `00:00` | `0` | `0` | метка в квадратных скобках |
+
+- `08:00` — это ровно `major:minor` от `STAT_DEV_VFS = 0x0800`, который `stat(2)` этого
+  ядра отдаёт для **любого** VFS-узла (`io_sys::write_stat`), поэтому maps и stat
+  согласованы. Отдельного block-устройства у ext2 в модели нет — печатать выдуманный
+  номер диска запрещено.
+- `ino` — та же identity, что `stat`/`fdinfo` (`io_sys::node_ino`: `fs_ino()`, для
+  синтетики — FNV-fallback). Для образа/интерпретатора ino захватывается в момент
+  запуска (`path_ino` в `src/task/process.rs`), для `mmap` — в `sys_mmap` из
+  `OpenObject::File`.
+- `offset` file-backed `mmap` — реальный аргумент `off` (ядро требует page-alignment);
+  при разрезании региона частичным `munmap`/`mprotect` смещение пересчитывается, чтобы
+  каждая выжившая часть называла свой истинный файловый offset.
+- `pathname` — путь, с которым дескриптор был открыт (без канонизации — тот же принцип,
+  что `exe_path` с префиксом `/mnt`, DEVIATION-8).
+- Если у узла нет VFS identity (`fs_ino() == 0`), строка остаётся `00:00 0` — это
+  sentinel «нет файла», а не выдуманный inode.
+
+### 14.2 Что осталось в DEVIATION-7
+
+- `[heap]`, `[stack]` и анонимные `mmap` — `00:00 0` без pathname: backing-файла нет.
+- `[stack]` печатается целиком (весь замапленный регион), а не «использованная» часть.
+- `[vdso]`/`[vvar]`/`[vsyscall]` не печатаются (в ядре их физически нет).
+- VMA-списка ядро не ведёт: maps показывает ровно то, что реально знает — образ,
+  интерпретатор, heap, tracked `mmap`, stack (§4.6). Сегменты, которые glibc ld.so
+  мапит сам после exec (RELRO и т.п.), в `image_segments` не попадают, и выдумывать их
+  нельзя.
+
+### 14.3 Совместимость и тесты
+
+- Форма строки, сортировка и слияние диапазонов не изменились
+  (`procfs_format::format_maps`); изменились только значения полей, которые раньше
+  были нулями.
+- `/proc/<pid>/task/<tid>/maps` (срез 6) — тот же рендер адресного пространства
+  (`Arc<Spinlock<VmRegionSet>>` общий на группу), поэтому метаданные там те же.
+- host-property: `properties/procfs_maps.rs` — round-trip dev/ino/offset/path,
+  `dev_bytes(0x0800) == (8, 0)`, анонимная строка ровно `… 00:00 0` без хвостового
+  пробела.
+- in-QEMU: `src/test.rs::procfs_tests::maps_file_identity` — синтетический
+  `CompatState` с `image_ino` и file-backed `mmap`: точные колонки образа/mmap,
+  `[stack]` без выдуманной identity, Linux-форма каждой строки; состояние реестра
+  восстанавливается.
+- live: `lx_selftest` `check_maps_metadata` — реальный гостевой ELF (`/mnt/lxm`),
+  который сам `mmap`-ит свой файл, читает `/proc/self/maps` и пишет копию в
+  `/mnt/lxm.out`; харнесс сверяет `08:00 <ino> /mnt/lxm` для сегмента образа и для
+  file-backed `mmap`, `[stack]` = `00:00 0`, форму всех строк. Serial:
+  `LXSELFTEST maps_metadata PASS`; E2E —
+  `python3 tools/e2e.py local-mirror --extra-wait 'LXSELFTEST maps_metadata PASS'`.
+- ENOENT-правила не изменились: `/proc/<pid>/maps` существует для каждого живого pid,
+  мёртвый pid — `ENOENT`, синтетические узлы (без `CompatState`) — `ENOENT` для
+  `/proc/self/maps` (§5.5).

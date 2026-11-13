@@ -5,13 +5,18 @@
 // consumers parse the fixed fields positionally and binary-search the range list,
 // so the line shape, the ordering and the absence of overlap are all contract.
 //
+// Slice 7 (§14) gives file-backed lines their real `st_dev`/`st_ino` and, for
+// `mmap`s, the file offset and pathname: the properties below pin that a real
+// identity is rendered verbatim and only anonymous regions keep `00:00 0`.
+//
 // The same file covers the procfs path/inode table (identity must be stable across
 // `readdir`/`stat`) and the chroot predicate that keeps `/proc` reachable
 // (`docs/procfs.md` §1.3).
 
 use crate::io::guest_path_keeps_root;
 use crate::procfs_format::{
-    format_maps, parse_pid_component, pid_dir_ino, pid_file_ino, proc_pid_file, MapsRegion,
+    dev_bytes, format_maps, parse_pid_component, pid_dir_ino, pid_file_ino, proc_pid_file,
+    MapsRegion,
     PROC_FILES, PROC_INO_BASE, PROC_PID_FILES, PROC_PID_INO_MASK, PROC_PID_INO_STRIDE,
     PROC_PID_ORDER, PROC_ROOT_ORDER, PROC_SELF_FILES, PROC_SYS_FILES, PROT_EXEC, PROT_READ,
     PROT_WRITE,
@@ -61,7 +66,9 @@ fn parse_line(line: &str) -> Option<(u64, u64, String, u64, (u8, u8), u64, Optio
         start,
         end,
         perms.to_string(),
-        offset.parse().ok()?,
+        // `offset` is hex on the line (Linux), so parse it as hex even though
+        // the validator above already proved it is 8 hex digits.
+        u64::from_str_radix(offset, 16).ok()?,
         (maj, min),
         ino,
         path,
@@ -422,4 +429,83 @@ fn mounts_format_is_linux_shaped() {
         assert_eq!(fields[4], "0");
         assert_eq!(fields[5], "0");
     }
+}
+
+/// A file-backed line's device, inode, offset and pathname survive rendering
+/// verbatim. This is the slice-7 contract (`docs/procfs.md` §14): the maps line
+/// must agree with `stat(2)`/`fdinfo` on the same file instead of claiming
+/// `00:00 0`.
+proptest! {
+    #[test]
+    fn file_backed_identity_round_trips(
+        start in 0u64..(1u64 << 40),
+        len in 1u64..(1u64 << 20),
+        file_offset in (0u64..1024).prop_map(|n| n * 4096),
+        dev_major in any::<u8>(),
+        dev_minor in any::<u8>(),
+        ino in 1u64..u64::MAX,
+        path in "[a-z][a-z0-9/._-]{0,31}",
+    ) {
+        let region = MapsRegion {
+            start,
+            end: start + len,
+            prot: PROT_READ,
+            file_offset,
+            dev_major,
+            dev_minor,
+            ino,
+            path: Some(path.as_str()),
+        };
+        let out = format_maps(&[region]);
+        let text = core::str::from_utf8(&out).unwrap().trim_end_matches('\n');
+        let (s, e, perms, off, dev, got_ino, got_path) = parse_line(text).unwrap();
+        prop_assert_eq!(s, start);
+        prop_assert_eq!(e, start + len);
+        prop_assert_eq!(&perms, "r--p");
+        prop_assert_eq!(off, file_offset);
+        prop_assert_eq!(dev, (dev_major, dev_minor));
+        prop_assert_eq!(got_ino, ino);
+        prop_assert_eq!(got_path, Some(path.as_str()));
+    }
+}
+
+/// The `08:00` every VFS node reports through `stat(2)` is exactly the
+/// `major:minor` a file-backed maps line prints (`STAT_DEV_VFS = 0x0800`).
+#[test]
+fn stat_dev_renders_as_08_00() {
+    assert_eq!(dev_bytes(0x0800), (8, 0));
+    let out = format_maps(&[MapsRegion {
+        start: 0x0040_0000,
+        end: 0x0040_1000,
+        prot: PROT_READ | PROT_EXEC,
+        file_offset: 0,
+        dev_major: 8,
+        dev_minor: 0,
+        ino: 42,
+        path: Some("/mnt/lxselftest"),
+    }]);
+    assert_eq!(
+        core::str::from_utf8(&out).unwrap(),
+        "00400000-00401000 r-xp 00000000 08:00 42 /mnt/lxselftest\n"
+    );
+}
+
+/// Anonymous regions and the synthetic `[heap]`/`[stack]` labels carry the
+/// honest "no backing file" identity: `00:00 0`, and no pathname means no
+/// trailing space.
+#[test]
+fn anonymous_lines_keep_the_nil_identity() {
+    let out = format_maps(&[MapsRegion {
+        start: 0x7fff_0000,
+        end: 0x7fff_1000,
+        prot: PROT_READ | PROT_WRITE,
+        file_offset: 0,
+        dev_major: 0,
+        dev_minor: 0,
+        ino: 0,
+        path: None,
+    }]);
+    let text = core::str::from_utf8(&out).unwrap();
+    assert_eq!(text, "7fff0000-7fff1000 rw-p 00000000 00:00 0\n");
+    assert!(!text.contains("  "));
 }

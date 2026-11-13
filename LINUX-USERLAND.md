@@ -87,7 +87,8 @@ delivery, real `rt_sigframe`/`rt_sigreturn`, `kill(2)`/`tgkill` with process gro
 `SIGSTOP`/`SIGCONT`, `SIGCHLD` on exit/stop/continue, `^Z` on the foreground group);
 `timerfd`/`signalfd`/`memfd_create` exist, and procfs covers slices 1–6 (issue #11):
 `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts,self/*,<pid>/*}`,
-`/proc/<pid>/{fd,fdinfo,limits,cgroup,mountinfo}`, the per-thread view
+`/proc/<pid>/{fd,fdinfo,limits,cgroup,mountinfo}`, `/proc/<pid>/maps` with the
+real `st_dev`/`st_ino`/offset/pathname of file-backed regions, the per-thread view
 `/proc/<pid>/task/` + `/proc/self/task/` (one directory per live task of the thread
 group, `task/<tid>` is the same VFS object as `/proc/<tid>`, so `stat`/`status`/
 `cmdline` are per-thread) and read-only

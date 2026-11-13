@@ -290,6 +290,7 @@ pub fn run_post_net_checks() {
     // not be alive while the apt install runs.
     check_thread_task_dir();
     check_thread_exit_task_dir();
+    check_maps_metadata();
     check_tick_delivery();
     run_apt_e2e();
     // Give the scheduler a window to run the just-enqueued hello-pagh process so
@@ -1796,6 +1797,129 @@ fn build_thread_exit_test_elf() -> Vec<u8> {
     build_rwx_static_elf(&code, &data, FIXTURE_MEMSZ).bytes
 }
 
+/// Static guest ELF for [`check_maps_metadata`]: a real user process that opens
+/// `/proc/self/maps` itself, copies it to `/mnt/lxm.out`, and exits.
+///
+/// Before dumping the map, the process `mmap`s its own image file read-only —
+/// so the dump exercises all three map sources at once: the PT_LOAD segment of
+/// the running image, a file-backed `mmap`, and the anonymous `[stack]`. The
+/// caller compares the dumped columns against the real VFS inode of
+/// `/mnt/lxm` (`docs/procfs.md` §14).
+///
+/// Hand-assembled with the shared segmented builder: the paths live in the
+/// image's zero-filled tail (`data`), the read buffer at
+/// `FIXTURE_VBASE + 0x2000`, and fd 12/13 hold the two open files across
+/// syscalls.
+fn build_maps_test_elf() -> Vec<u8> {
+    const ENTRY: u64 = FIXTURE_VBASE + 64 + 56;
+    const BUF: u64 = FIXTURE_VBASE + 0x2000;
+    const O_RDONLY: u32 = 0;
+    const O_WRONLY: u32 = 1;
+    const O_CREAT: u32 = 0o100;
+    const O_TRUNC: u32 = 0o1000;
+    const OUT_FLAGS: u32 = O_WRONLY | O_CREAT | O_TRUNC;
+    const MODE_0644: u32 = 0o644;
+    const PROT_READ: u32 = 1;
+    const MAP_PRIVATE: u32 = 2;
+    const PAGE: u32 = 4096;
+
+    let build = |maps_path: u64, self_path: u64, out_path: u64| -> Vec<u8> {
+        let mut code: Vec<u8> = Vec::with_capacity(220);
+
+        // mov edi, imm32 / mov esi, imm32 / mov edx, imm32 / mov eax, imm32 / syscall
+        let open = |code: &mut Vec<u8>, path: u64, flags: u32, mode: u32| {
+            code.extend_from_slice(&[0xBF]);
+            code.extend_from_slice(&(path as u32).to_le_bytes());
+            code.extend_from_slice(&[0xBE]);
+            code.extend_from_slice(&flags.to_le_bytes());
+            code.extend_from_slice(&[0xBA]);
+            code.extend_from_slice(&mode.to_le_bytes());
+            code.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]); // mov eax, 2 (open)
+            code.extend_from_slice(&[0x0F, 0x05]); // syscall
+        };
+
+        // r12 = open(maps_path, O_RDONLY)
+        open(&mut code, maps_path, O_RDONLY, 0);
+        code.extend_from_slice(&[0x49, 0x89, 0xC4]); // mov r12, rax
+                                                     // r13 = open(self_path, O_RDONLY)
+        open(&mut code, self_path, O_RDONLY, 0);
+        code.extend_from_slice(&[0x49, 0x89, 0xC5]); // mov r13, rax
+                                                     // mmap(0, PAGE, PROT_READ, MAP_PRIVATE, r13, 0)
+        code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
+        code.extend_from_slice(&[0xBE]);
+        code.extend_from_slice(&PAGE.to_le_bytes());
+        code.extend_from_slice(&[0xBA]);
+        code.extend_from_slice(&PROT_READ.to_le_bytes());
+        code.extend_from_slice(&[0x41, 0xBA]); // mov r10d, MAP_PRIVATE
+        code.extend_from_slice(&MAP_PRIVATE.to_le_bytes());
+        code.extend_from_slice(&[0x4D, 0x89, 0xE8]); // mov r8, r13 (fd)
+        code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d (offset 0)
+        code.extend_from_slice(&[0xB8, 0x09, 0x00, 0x00, 0x00]); // mov eax, 9 (mmap)
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+                                               // close(r13)
+        code.extend_from_slice(&[0x44, 0x89, 0xEF]); // mov edi, r13
+        code.extend_from_slice(&[0xB8, 0x03, 0x00, 0x00, 0x00]); // mov eax, 3 (close)
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+                                               // r13 = open(out_path, OUT_FLAGS, 0644)
+        open(&mut code, out_path, OUT_FLAGS, MODE_0644);
+        code.extend_from_slice(&[0x49, 0x89, 0xC5]); // mov r13, rax
+
+        // Loop: read(r12, BUF, PAGE); if n <= 0 break; write(r13, BUF, n).
+        let loop_start = code.len();
+        code.extend_from_slice(&[0x44, 0x89, 0xE7]); // mov edi, r12
+        code.extend_from_slice(&[0xBE]);
+        code.extend_from_slice(&(BUF as u32).to_le_bytes());
+        code.extend_from_slice(&[0xBA]);
+        code.extend_from_slice(&PAGE.to_le_bytes());
+        code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax (read)
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+        code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+        let jle_at = code.len();
+        code.extend_from_slice(&[0x7E, 0x00]); // jle done (patched below)
+        code.extend_from_slice(&[0x44, 0x89, 0xEF]); // mov edi, r13
+        code.extend_from_slice(&[0xBE]);
+        code.extend_from_slice(&(BUF as u32).to_le_bytes());
+        code.extend_from_slice(&[0x89, 0xC2]); // mov edx, eax (n)
+        code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1 (write)
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+        let back = (loop_start as i64) - (code.len() as i64 + 2);
+        code.extend_from_slice(&[0xEB, back as u8]); // jmp loop_start
+        let done = code.len();
+        code[jle_at + 1] = (done as i64 - (jle_at as i64 + 2)) as u8;
+
+        // close(r12); close(r13); exit(0)
+        code.extend_from_slice(&[0x44, 0x89, 0xE7]); // mov edi, r12
+        code.extend_from_slice(&[0xB8, 0x03, 0x00, 0x00, 0x00]); // mov eax, 3
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+        code.extend_from_slice(&[0x44, 0x89, 0xEF]); // mov edi, r13
+        code.extend_from_slice(&[0xB8, 0x03, 0x00, 0x00, 0x00]); // mov eax, 3
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+        code.extend_from_slice(&[0xB8, 0x3C, 0x00, 0x00, 0x00]); // mov eax, 60 (exit)
+        code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+        code
+    };
+
+    let maps_str = b"/proc/self/maps\0";
+    let self_str = b"/mnt/lxm\0";
+    let out_str = b"/mnt/lxm.out\0";
+    let data_len = maps_str.len() + self_str.len() + out_str.len();
+
+    let probe = build(0, 0, 0);
+    let data_addr = ENTRY + probe.len() as u64;
+    let maps_path = data_addr;
+    let self_path = maps_path + maps_str.len() as u64;
+    let out_path = self_path + self_str.len() as u64;
+    let code = build(maps_path, self_path, out_path);
+    debug_assert_eq!(code.len(), probe.len());
+
+    let mut data: Vec<u8> = Vec::with_capacity(data_len);
+    data.extend_from_slice(maps_str);
+    data.extend_from_slice(self_str);
+    data.extend_from_slice(out_str);
+    build_rwx_static_elf(&code, &data, FIXTURE_MEMSZ).bytes
+}
+
 /// Read a whole (small) VFS file as text; `None` when the path does not resolve.
 fn read_vfs_text(path: &str) -> Option<alloc::string::String> {
     let node = vfs::lookup_path(path).ok()?;
@@ -2131,6 +2255,117 @@ fn check_thread_exit_task_dir() {
             process_alive,
             threads_one,
             gone
+        );
+        fail(name, &detail);
+    }
+}
+
+/// Slice 7 (`docs/procfs.md` §14): `/proc/<pid>/maps` carries the real file
+/// identity of file-backed regions, observed from a REAL guest process.
+///
+/// [`build_maps_test_elf`] runs as a normal static executable, maps its own
+/// image file read-only, reads `/proc/self/maps` and copies it to
+/// `/mnt/lxm.out`. The harness then checks the dump against the VFS:
+/// `08:00 <ino>/mnt/lxm` must appear for both the executable segment and the
+/// `mmap`, `[stack]` must keep the honest `00:00 0`, and every line must have
+/// the Linux field shape. Before slice 7 the same dump said `00:00 0` with no
+/// pathname for both file-backed lines (DEVIATION-7).
+fn check_maps_metadata() {
+    let name = "maps_metadata";
+
+    let elf = build_maps_test_elf();
+    if let Err(d) = write_mnt_file("lxm", &elf) {
+        fail(name, d);
+        return;
+    }
+    // The image inode that `stat` reports for the file the fixture maps.
+    let file_ino = vfs::lookup_path_walk("/mnt/lxm", true)
+        .ok()
+        .map(|node| crate::arch::x86_64::linux::io_sys::node_ino(&node))
+        .unwrap_or(0);
+    if file_ino == 0 {
+        fail(name, "could not resolve /mnt/lxm inode");
+        return;
+    }
+
+    let pid = match run_linux_binary("/mnt/lxm", &[b"lxm"], &[]) {
+        Ok(pid) => pid,
+        Err(RunError::ArgsTooLarge) => return fail(name, "run returned ArgsTooLarge"),
+        Err(RunError::NotFound) => return fail(name, "run returned NotFound"),
+        Err(RunError::LoadFailed(c)) => return fail(name, c),
+        Err(RunError::StackFailed) => return fail(name, "run returned StackFailed"),
+    };
+    compat::with_pid_compat(pid, |cs| cs.waitable = false);
+
+    // Wait for the process to exit (its own `exit(0)` removes the registry
+    // entry) — the dump file is complete before that.
+    let deadline = scheduler::ticks() + 5 * crate::arch::x86_64::apic::TICK_HZ;
+    while scheduler::ticks() < deadline && crate::task::compat::compat_exists(pid) {
+        scheduler::sleep_ticks(1);
+    }
+
+    let dump = read_vfs_text("/mnt/lxm.out").unwrap_or_default();
+    let cleanup = || {
+        if let Ok(dir) = vfs::lookup_path("/mnt") {
+            let _ = dir.remove("lxm");
+            let _ = dir.remove("lxm.out");
+        }
+    };
+
+    if dump.is_empty() {
+        cleanup();
+        return fail(name, "the guest wrote no /mnt/lxm.out (maps not read?)");
+    }
+
+    let lines: Vec<&str> = dump.lines().collect();
+    // 1. The executable's PT_LOAD segment: real 08:00 inode + pathname.
+    let image_line = alloc::format!("{file_ino} /mnt/lxm");
+    let image_ok = lines
+        .iter()
+        .any(|l| l.contains(" 08:00 ") && l.ends_with(image_line.as_str()) && l.contains("rwxp"));
+    // 2. The file-backed mmap of the same file: r--p, real identity.
+    let mmap_ok = lines
+        .iter()
+        .any(|l| l.contains(" r--p ") && l.contains(" 08:00 ") && l.ends_with(image_line.as_str()));
+    // 3. [stack] is anonymous: honest 00:00 0, never 08:00.
+    let stack_ok = lines
+        .iter()
+        .any(|l| l.ends_with("[stack]") && l.contains(" 00:00 0 ") && !l.contains(" 08:00 "));
+    // 4. Every line has the Linux column shape.
+    let mut malformed = 0;
+    for line in &lines {
+        let mut it = line.splitn(6, ' ');
+        let range = it.next().unwrap_or("");
+        let perms = it.next().unwrap_or("");
+        let off = it.next().unwrap_or("");
+        let dev = it.next().unwrap_or("");
+        let ino = it.next().unwrap_or("");
+        let ok = range.split_once('-').is_some()
+            && range
+                .split_once('-')
+                .map(|(s, e)| s.len() >= 8 && e.len() >= 8)
+                == Some(true)
+            && perms.len() == 4
+            && off.len() == 8
+            && dev.len() == 5
+            && ino.parse::<u64>().is_ok();
+        if !ok {
+            malformed += 1;
+        }
+    }
+
+    cleanup();
+    if image_ok && mmap_ok && stack_ok && malformed == 0 {
+        pass(name);
+    } else {
+        let detail = alloc::format!(
+            "image={} mmap={} stack={} malformed={} lines={} ino={}",
+            image_ok,
+            mmap_ok,
+            stack_ok,
+            malformed,
+            lines.len(),
+            file_ino
         );
         fail(name, &detail);
     }

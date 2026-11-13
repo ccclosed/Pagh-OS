@@ -912,7 +912,11 @@ impl StatusSnap {
 /// `/proc/<pid>/maps` inputs, snapshotted under the registry lock.
 struct MapsSnap {
     exe_path: String,
+    /// `st_ino` of the image's VFS node (`stat(2)` identity), 0 when unknown.
+    image_ino: u64,
     interp_path: String,
+    /// `st_ino` of the interpreter's VFS node, 0 for static images.
+    interp_ino: u64,
     image_segments: Vec<LoadSegment>,
     interp_segments: Vec<LoadSegment>,
     initial_brk: u64,
@@ -925,7 +929,9 @@ impl MapsSnap {
         let guard = cs.vm.lock();
         MapsSnap {
             exe_path: cs.exe_path.clone(),
+            image_ino: cs.image_ino,
             interp_path: cs.interp_path.clone(),
+            interp_ino: cs.interp_ino,
             image_segments: cs.image_segments.clone(),
             interp_segments: cs.interp_segments.clone(),
             initial_brk: guard.initial_brk,
@@ -937,12 +943,28 @@ impl MapsSnap {
 
 /// Render a `/proc/<pid>/maps` snapshot (shared by `self` and pid nodes).
 fn maps_text(s: &MapsSnap) -> Vec<u8> {
+    // File-backed lines carry the real `st_dev`/`st_ino` that `stat(2)` reports
+    // for the same VFS node, and file-backed `mmap`s also carry their pathname
+    // and file offset (`docs/procfs.md` §14). A node without a VFS identity
+    // keeps the honest `00:00 0`.
     let mut regions: Vec<fmt::MapsRegion> = Vec::new();
+    let (image_dev, image_ino) = file_identity(s.image_ino);
     for seg in &s.image_segments {
-        regions.push(seg_region(seg, Some(s.exe_path.as_str())));
+        regions.push(seg_region(
+            seg,
+            Some(s.exe_path.as_str()),
+            image_dev,
+            image_ino,
+        ));
     }
+    let (interp_dev, interp_ino) = file_identity(s.interp_ino);
     for seg in &s.interp_segments {
-        regions.push(seg_region(seg, Some(s.interp_path.as_str())));
+        regions.push(seg_region(
+            seg,
+            Some(s.interp_path.as_str()),
+            interp_dev,
+            interp_ino,
+        ));
     }
 
     let heap_lo = page_down(s.initial_brk);
@@ -961,17 +983,23 @@ fn maps_text(s: &MapsSnap) -> Vec<u8> {
     }
 
     for m in &s.mmaps {
+        let (maj, min, ino, offset, path) = match &m.backing {
+            Some(b) => {
+                let (maj, min) = fmt::dev_bytes(vfs_dev());
+                (maj, min, b.ino, b.file_offset, Some(b.path.as_str()))
+            }
+            // Anonymous mapping: no backing file, so no file identity to print.
+            None => (0, 0, 0, 0, None),
+        };
         regions.push(fmt::MapsRegion {
             start: m.base,
             end: m.base.saturating_add(m.pages * PAGE_SIZE),
             prot: m.prot,
-            file_offset: 0,
-            dev_major: 0,
-            dev_minor: 0,
-            ino: 0,
-            // A file-backed `mmap` has no recorded pathname in
-            // `VmRegionSet` (docs/procfs.md DEVIATION-7).
-            path: None,
+            file_offset: offset,
+            dev_major: maj,
+            dev_minor: min,
+            ino,
+            path,
         });
     }
 
@@ -990,16 +1018,38 @@ fn maps_text(s: &MapsSnap) -> Vec<u8> {
     fmt::format_maps(&regions)
 }
 
+/// The `st_dev` every VFS node reports through `stat(2)` (`08:00`); a maps line
+/// for a file-backed mapping must print the same device `stat` would.
+fn vfs_dev() -> u64 {
+    crate::arch::x86_64::linux::io_sys::STAT_DEV_VFS
+}
+
+/// `(dev, ino)` for a file-backed region: the real `stat(2)` identity when the
+/// node has one, otherwise the honest `00:00 0` sentinel.
+fn file_identity(ino: u64) -> (u64, u64) {
+    if ino == 0 {
+        (0, 0)
+    } else {
+        (vfs_dev(), ino)
+    }
+}
+
 /// One `/proc/<pid>/maps` line for a loaded `PT_LOAD` segment.
-fn seg_region<'a>(seg: &LoadSegment, path: Option<&'a str>) -> fmt::MapsRegion<'a> {
+fn seg_region<'a>(
+    seg: &LoadSegment,
+    path: Option<&'a str>,
+    dev: u64,
+    ino: u64,
+) -> fmt::MapsRegion<'a> {
+    let (dev_major, dev_minor) = fmt::dev_bytes(dev);
     fmt::MapsRegion {
         start: seg.start,
         end: seg.end,
         prot: prot_bits(seg.prot),
         file_offset: seg.file_offset,
-        dev_major: 0,
-        dev_minor: 0,
-        ino: 0,
+        dev_major,
+        dev_minor,
+        ino,
         path,
     }
 }

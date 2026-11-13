@@ -332,6 +332,19 @@ fn read_file_all(path: &str) -> Result<Vec<u8>, RunError> {
     Ok(data)
 }
 
+/// `st_ino` of the VFS node a launch reads its image (or interpreter) from,
+/// exactly as `stat(2)` reports it; `0` when the path has no VFS identity.
+///
+/// `/proc/<pid>/maps` prints it on the file-backed segment lines (`docs/procfs.md`
+/// §14) — the alternative would be claiming `00:00 0` for a file that does have
+/// a real inode.
+fn path_ino(path: &str) -> u64 {
+    crate::vfs::lookup_path_walk(path, true)
+        .ok()
+        .map(|node| crate::arch::x86_64::linux::io_sys::node_ino(&node))
+        .unwrap_or(0)
+}
+
 const PT_INTERP: u32 = 3;
 const INTERP_BASE: u64 = 0x0000_7000_0000_0000;
 
@@ -374,10 +387,12 @@ fn elf_interpreter_path(data: &[u8]) -> Result<Option<String>, RunError> {
     Ok(None)
 }
 
-/// Resolve the ELF interpreter: returns the **guest-visible** interpreter path
+/// Resolve the ELF interpreter: returns the **guest-visible** interpreter path,
+/// the **kernel** path that was actually read (for `/proc/<pid>/maps` inode
+/// identity), and the bytes.
 /// (as named by `PT_INTERP`) together with its on-disk bytes. The path is what
 /// `/proc/self/maps` reports for the loader's own segments.
-fn read_interpreter(data: &[u8]) -> Result<Option<(String, Vec<u8>)>, RunError> {
+fn read_interpreter(data: &[u8]) -> Result<Option<(String, String, Vec<u8>)>, RunError> {
     let Some(path) = elf_interpreter_path(data)? else {
         return Ok(None);
     };
@@ -391,7 +406,7 @@ fn read_interpreter(data: &[u8]) -> Result<Option<(String, Vec<u8>)>, RunError> 
     // /usr/lib/x86_64-linux-gnu. Try the literal path first, then the known
     // merged-usr locations, so a missing symlink cannot break every launch.
     if let Ok(data) = read_file_all(&disk_path) {
-        return Ok(Some((path, data)));
+        return Ok(Some((path, disk_path, data)));
     }
     let base = path.rsplit('/').next().unwrap_or(path.as_str());
     let usr_cand = if path.starts_with('/') {
@@ -413,11 +428,11 @@ fn read_interpreter(data: &[u8]) -> Result<Option<(String, Vec<u8>)>, RunError> 
                 disk_path,
                 cand
             );
-            return Ok(Some((path, data)));
+            return Ok(Some((path.clone(), cand.clone(), data)));
         }
     }
     // Nothing matched: surface the original error for the literal path.
-    read_file_all(&disk_path).map(|data| Some((path, data)))
+    read_file_all(&disk_path).map(|data| Some((path, disk_path, data)))
 }
 
 struct LoadedLinux {
@@ -493,11 +508,18 @@ pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u6
     // ── 2. Read the ext2 file (R7.4) — interrupts enabled (may block on I/O) ─
     let data = read_file_all(path)?;
     let interpreter = read_interpreter(&data)?;
+    // File identity of the image and its interpreter for `/proc/<pid>/maps`
+    // (captured from the same VFS nodes the launch reads; 0 for static images).
+    let image_ino = path_ino(path);
+    let interp_ino = interpreter
+        .as_ref()
+        .map(|(_, disk_path, _)| path_ino(disk_path))
+        .unwrap_or(0);
 
     // ── 3–6. CR3-sensitive launch, interrupts disabled (like create_user_process) ─
     crate::arch::cpu::without_interrupts(|| {
         // 3. Load the ELF into a fresh user PML4 (segments USER_ACCESSIBLE, R7.6).
-        let loaded = map_linux_images(&data, interpreter.as_ref().map(|(_, d)| d.as_slice()))?;
+        let loaded = map_linux_images(&data, interpreter.as_ref().map(|(_, _, d)| d.as_slice()))?;
         let elf = loaded.elf;
 
         // 4. Build the SysV initial stack and map it (USER_ACCESSIBLE, R7.6).
@@ -546,10 +568,12 @@ pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u6
         state.cmdline =
             crate::vfs::procfs_format::format_cmdline(argv, crate::vfs::procfs_format::CMDLINE_CAP);
         state.image_segments = elf.segments.clone();
+        state.image_ino = image_ino;
         state.interp_segments = loaded.interp_segments.clone();
+        state.interp_ino = interp_ino;
         state.interp_path = interpreter
             .as_ref()
-            .map(|(p, _)| p.clone())
+            .map(|(p, _, _)| p.clone())
             .unwrap_or_default();
         // Register BEFORE enqueue so the first syscall the process makes already
         // sees its CompatState (and so the dispatcher routes it as a Linux task).
@@ -632,8 +656,15 @@ pub fn exec_linux_image(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<Ex
     let path = resolved.as_str();
     let data = read_file_all(path)?;
     let interpreter = read_interpreter(&data)?;
+    // File identity of the new image and its interpreter for
+    // `/proc/<pid>/maps` (the old image's segments are replaced below).
+    let image_ino = path_ino(path);
+    let interp_ino = interpreter
+        .as_ref()
+        .map(|(_, disk_path, _)| path_ino(disk_path))
+        .unwrap_or(0);
     crate::arch::cpu::without_interrupts(|| {
-        let loaded = map_linux_images(&data, interpreter.as_ref().map(|(_, d)| d.as_slice()))?;
+        let loaded = map_linux_images(&data, interpreter.as_ref().map(|(_, _, d)| d.as_slice()))?;
         let elf = loaded.elf;
         let aux = AuxInputs {
             phdr: elf.phdr_vaddr,
@@ -679,10 +710,12 @@ pub fn exec_linux_image(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<Ex
                 crate::vfs::procfs_format::CMDLINE_CAP,
             );
             st.image_segments = elf.segments.clone();
+            st.image_ino = image_ino;
             st.interp_segments = loaded.interp_segments.clone();
+            st.interp_ino = interp_ino;
             st.interp_path = interpreter
                 .as_ref()
-                .map(|(p, _)| p.clone())
+                .map(|(p, _, _)| p.clone())
                 .unwrap_or_default();
         })
         .ok_or(RunError::LoadFailed("execve without compat state"))?;
