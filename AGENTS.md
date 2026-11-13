@@ -219,6 +219,17 @@ Semver `MAJOR.MINOR.PATCH` — in that standard order (major, *then* minor,
 into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
 (`provision.rs`), so a stale version is user-visible at boot.
 
+**Branching and release channels.** `main` is the stable branch; `dev` is the
+experimental integration branch. Feature and fix PRs target `dev` (CI green
+before merge); release stabilisation merges `dev` into `main`, and a hotfix
+branches from `main` and is merged back into `dev` afterwards. Pre-releases and
+experimental snapshots are tagged from `dev` (`vX.Y.Z-rc.N`, `-pre.N`) and
+published as GitHub pre-releases; stable releases are tagged from `main` and may
+keep the repository's historical bare-version spelling (`X.Y.Z` as well as
+`vX.Y.Z`). `.github/workflows/release.yml` refuses a tag whose commit is not
+reachable from the branch implied by the suffix and attaches the release kernel;
+the full model is in `BRANCHING.md`.
+
 - **MAJOR** — image-level breaks: on-disk/boot format changes, removed
   syscall families, incompatible userland expectations. Rare; last was
   2.0.0 (own TCP/IP stack + e1000 replacing smoltcp + virtio-net).

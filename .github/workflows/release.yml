@@ -1,0 +1,60 @@
+name: release
+
+# Tag-driven GitHub releases.
+#
+#   stable tag      vX.Y.Z       must be reachable from `main`  -> full release
+#   pre-release tag vX.Y.Z-rc.N  must be reachable from `dev`   -> GitHub pre-release
+#
+# Bare numeric tags (`2.8.0`) are accepted for repositories that already use
+# them; anything with a `-` suffix (for example `-rc.1`, `-pre.3`) is published
+# as a pre-release. `release.yml` refuses a tag cut from the wrong branch, so a
+# stable release can never point at unmerged `dev` work by accident.
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check the tag source branch
+        shell: bash
+        run: |
+          git fetch --no-tags origin main dev
+          tag="$GITHUB_REF_NAME"
+          case "$tag" in
+            *-*) branch=dev ;;
+            *)   branch=main ;;
+          esac
+          echo "tag=$tag expected-branch=$branch"
+          git merge-base --is-ancestor "$GITHUB_SHA" "origin/$branch" || {
+            echo "::error::tag $tag must point to a commit reachable from $branch"
+            exit 1
+          }
+
+      - name: Set up the release toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-12
+          components: rust-src,llvm-tools-preview
+
+      - name: Build the release kernel
+        run: python3 tools/build.py build --release
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: target/x86_64-unknown-none/release/pagh.elf

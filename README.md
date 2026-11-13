@@ -1013,6 +1013,15 @@ on first run.
 
 ---
 
+## Branching and releases
+
+`main` is the stable branch; `dev` is the experimental integration branch. Feature
+and fix PRs target `dev`; stable releases are tagged from `main`, release
+candidates/pre-releases from `dev` (`vX.Y.Z-rc.N`). The release workflow refuses a
+tag cut from the wrong branch. See [BRANCHING.md](BRANCHING.md).
+
+---
+
 ## Contributing
 
 Contributions are welcome. Please read the contributing guide before opening a PR — it
