@@ -29,6 +29,12 @@ PoC (`tools/security/poc/poc_poll_toctou.c`) against the fixed kernel and the
 stock 2.22.0 image; the `page_fault` host property covers the fault policy.
 
 Full story: `AGENTS.md`, 2.22.3.
+Also fixed in the same batch, found in review: `sendto(2)`/`recvfrom(2)`
+validated a capped user range but allocated/copied the raw `u64` count, so a
+process with 1 MiB mapped could force a multi-gigabyte kernel allocation
+(abort/OOM DoS). Oversized `sendto` is now `EMSGSIZE` before allocation and
+`recvfrom` caps the capacity at 1 MiB, with the `p57` host property and
+`tools/security/poc/poc_sock_large_count.c` as regressions.
 
 ## 2.22.2
 

@@ -18,6 +18,7 @@ RANGE=/home/oleg/Projects/pagh-os/attack/range   # private range from the report
 | `poc_connect_gp.c` | F-x86a-3: `connect()` reads `sa_family` through an unvalidated pointer → ring-0 #GP → machine halt | no shell prompt after `[autorun]` (machine halted) | `POC-CONNECT-GP: SURVIVED r=-1 errno=14` (EFAULT), shell prompt returns |
 | `poc_recvfrom_write.c` | F-x86a-1: `recvfrom()` writes `sockaddr`/`socklen_t` through unvalidated pointers (16-byte arbitrary kernel write) | `PWN-RECVFROM: arbitrary kernel write confirmed: MONOTONIC jumped …` | the validated write path refuses, so no datagram is reported as received; `PWN-RECVFROM` never prints |
 | `poc_poll_toctou.c` | F-x86a-4: blocking syscalls (`poll`/`ppoll`/`select`/`epoll_wait`, plus `clone` TID outputs) use a user buffer after a `yield`; a CLONE_VM sibling munmaps it → kernel-mode #PF → machine halt. Modes: `poll`, `ppoll`, `select`, `epoll`, `futex` | `poll` mode: no shell prompt after `[autorun]`; serial ends with `[EXC #14] PAGE FAULT … U=false` at the pollfd page (kernel-mode fault, machine halted) | `POC-TOCTOU[poll]: SURVIVED poll r=-1 errno=14` (EFAULT) and the shell prompt returns; same EFAULT for `ppoll`/`select`/`epoll_wait`/`futex` |
+| `poc_sock_large_count.c` | F-x86a-6 (found in review): `sendto`/`recvfrom` validate a capped user range but allocate/copy the raw `u64` count → 1 MiB mapped is enough for a ~4 GiB kernel allocation → allocation abort (machine dead) | `[PANIC] memory allocation of 4294967295 bytes failed` (machine dead) | `POC-SOCKCAP[send]: SURVIVED r=-1 errno=90` (EMSGSIZE); `POC-SOCKCAP[recv]: SURVIVED r=-1 errno=11` (EAGAIN); shell prompt returns |
 
 ## Reproduction (same host, two kernels)
 
@@ -42,6 +43,13 @@ for mode in poll ppoll select epoll futex; do
     ./run.sh --expect "POC-TOCTOU\[$mode\]: SURVIVED" /tmp/poc_poll_toctou "$mode"
 done
 
+# F-x86a-6 socket payload cap (needs the range's user-net for AF_INET sockets):
+# 1 MiB mapped + a ~4 GiB count. Stock image panics in the allocator; this
+# kernel refuses sendto before allocating and truncates recvfrom's capacity.
+"$RANGE/cc-static" -O2 -o /tmp/poc_sockcap tools/security/poc/poc_sock_large_count.c
+./run.sh --net --expect 'POC-SOCKCAP\[send\]: SURVIVED r=-1 errno=90' /tmp/poc_sockcap send
+./run.sh --net --expect 'POC-SOCKCAP\[recv\]: SURVIVED r=-1 errno=11' /tmp/poc_sockcap recv
+
 # static PoCs, built against the symbols of the kernel under test
 TICK=$(nm esp/pagh.elf | awk '$3 ~ /TICK_COUNT$/ {print $1; exit}')
 "$RANGE/cc-static" -O2 -o /tmp/poc_connect tools/security/poc/poc_connect_gp.c
@@ -56,7 +64,7 @@ The vulnerable side is the same commands with the **unmodified** range (no
 
 ## Not covered yet
 
-These five findings were the 2.22.0-2.22.3 batches. The audit's remaining items
+These six findings were the 2.22.0-2.22.3 batches. The audit's remaining items
 (RISC-V userland runtime) are listed in `SECURITY.md`; the x86 findings now have
 committed PoCs here (the F-x86a-4 TOCTOU PoC is `poc_poll_toctou.c`, above).
 

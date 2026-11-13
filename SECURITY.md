@@ -102,6 +102,17 @@ still succeed on stock 2.21.0):
   machine (kernel-address and NULL faults stay fatal). PoC:
   `tools/security/poc/poc_poll_toctou.c` (`poll`/`ppoll`/`select`/`epoll`/
   `futex` modes).
+* **F-x86a-6 (medium, found in review, fixed in 2.22.3).** `sendto(2)` and
+  `recvfrom(2)` validated the caller's payload with a capped length
+  (`count.min(1 MiB)`) but then allocated/copied the RAW `u64` count: 1 MiB of
+  mapped pages was enough to make the kernel request a ~4 GiB allocation, which
+  aborts the kernel on a 1 GiB guest (the crafted-ext2 `i_size` class, F-x86v-1,
+  through one socket syscall). `abi::socket_payload_len` now refuses an
+  oversized `sendto` with `EMSGSIZE` before allocating and truncates
+  `recvfrom`'s capacity to the 1 MiB cap (the buffer is validated, allocated and
+  copied at exactly that length). `sendmsg`/`recvmsg` are not implemented in
+  this layer, so the pattern has no second copy. PoC:
+  `tools/security/poc/poc_sock_large_count.c`.
 
 **Fixed in 2.22.1 (this branch):**
 

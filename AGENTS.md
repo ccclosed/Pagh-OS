@@ -263,6 +263,18 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   poll/ppoll/select/epoll_wait/futex, halts stock 2.22.0 with a kernel-mode
   `PAGE FAULT`, and on a backstop-only kernel kills the faulting process while
   the shell keeps running; the `page_fault` host property pins the fault policy.
+  Found in review and fixed in the same batch: `sendto(2)`/`recvfrom(2)`
+  validated the payload with a capped length (`count.min(1 MiB)`) and then
+  allocated/copied the RAW `u64` count, so 1 MiB of mapped pages was enough to
+  make the kernel request a ~4 GiB allocation (allocation abort, machine dead —
+  the same class as the crafted-ext2 `i_size` allocations, F-x86v-1).
+  `abi::socket_payload_len` is now the single policy: oversized `sendto` is
+  `EMSGSIZE` before any allocation, `recvfrom` truncates the capacity to the
+  1 MiB cap and validates/allocates/copies exactly that much; the `p57` host
+  property pins it and `tools/security/poc/poc_sock_large_count.c` reproduces
+  the panic on the stock image and the clean errno on this kernel. There is no
+  `sendmsg`/`recvmsg` in this layer (no handlers, not in the supported set), so
+  the pattern has no second copy.
   **2.22.2** = the filesystem half of the attack-audit batch: crafted ext2
   images and missing path-traversal permission checks. All five x86 VFS
   findings are fixed, plus one allocation site found while fixing them:

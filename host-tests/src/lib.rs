@@ -542,6 +542,11 @@ mod properties {
     // number.
     mod p56;
 
+    // Socket payload cap (`sendto`/`recvfrom`): the kernel validated with a
+    // capped length and then allocated/copied the raw u64 count (2026-11-13
+    // audit follow-up, F-x86v-1 allocation class). P57 pins the single policy.
+    mod p57;
+
     // NVMe PRP lists + queue-depth arithmetic (PRP1/PRP2/list page, LBA chunk
     // planning, polled CQ phase tags, CAP.MQES clamping). The driver itself is
     // MMIO/PMM code and cannot run on the host; this is the half that decides
