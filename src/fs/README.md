@@ -17,7 +17,8 @@ write-ahead-log журналом для crash-consistency. Чистая логи
 | `ext2/alloc.rs` | Битмап-примитивы: `alloc_bit`, `set/clear/test_bit`, `count_set_bits`; `alloc_block`/`free_block`/`alloc_inode`/`free_inode` с синком счётчиков sb/GD |
 | `ext2/dir.rs` | Движок каталогов: `iter_entries` (строгая валидация тайлинга `rec_len`), `find`, `init_dot_entries`, `insert_into_block` (расщепление slack донора), `remove_from_block` (слияние `rec_len` с предыдущей), `DirEntry`, `min_rec_len` |
 | `ext2/inode.rs` | Чтение block map: `block_for_offset` — 12 direct + single/double/triple indirect (`PTRS_PER_BLOCK=1024`); дыры → `None` |
-| `ext2/symlink.rs` | Чистый (`core`-only, host-тестируемый) расчёт формы симлинка и учёта ссылок: `plan` (fast ⟺ цель+NUL ≤ 60 байт, иначе slow), `is_fast`, `fast_target`, `inline_words`/`inline_bytes`, `unlink_action`, `link_bump`; host-свойства — `host-tests/src/properties/ext2_links.rs` (issue #18) |
+| `ext2/symlink.rs` | Чистый (`core`-only, host-тестируемый) расчёт формы симлинка и учёта ссылок: `plan` (fast ⟺ цель+NUL ≤ 60 байт, иначе slow), `is_fast`, `target_shape` (Fast/Slow/Corrupt — границы `i_size` до аллокации, аудит 2.22.2), `owns_data_block` (удаление решает по `i_blocks`, не по `i_size`), `fast_target`, `inline_words`/`inline_bytes`, `unlink_action`, `link_bump`; host-свойства — `host-tests/src/properties/ext2_links.rs` (issue #18, аудит 2.22.2) |
+| `ext2/bounds.rs` | Чистые (`core`-only, host-тестируемые) границы полей из образа: `dir_blocks(i_size, fs_blocks)` — `i_size` каталога обязан быть кратен `BS` и ≤ размера ФС, иначе `Corrupt` **до** цикла по блокам (аудит 2.22.2, F-x86v-5); host-свойства — `ext2_bounds.rs` |
 
 ## Ключевые символы
 
@@ -82,6 +83,15 @@ write-ahead-log журналом для crash-consistency. Чистая логи
   i_size ≤ 60` (у нас xattr выключен, `i_file_acl == 0`, поэтому linux-тест
   `i_blocks - ea_blocks == 0` сводится к `i_blocks == 0`). Нет первого блока у slow-ссылки или
   inode не симлинк → `Corrupt` (обрезанная цель молча увела бы вызывающего на другой путь).
+  **Границы (аудит 2.22.2, F-x86v-1/4):** `i_size` — недоверенный ввод; slow-цель ≤ одного
+  блока (`BS`), fast — ≤ 60 inline-байт, всё иное (`i_size > BS`, или `i_blocks == 0 &&
+  i_size > 60`) → `Corrupt` **до** аллокации: `vec![0u8; i_size]` из 4-гигабайтного поля
+  убивал ядро, а текст цели нельзя читать как карту блоков. Форма классифицируется один раз
+  (`symlink::target_shape`), удаление решает только по `i_blocks` (`symlink::owns_data_block`).
+- **Каталоги (аудит 2.22.2, F-x86v-5):** число блоков каталога — из `bounds::dir_blocks`
+  (кратность `BS`, ≤ `s_blocks_count`) во всех путях (`read_dir_entries`, `lookup_entry`,
+  `insert_dirent`, `unlink`); иначе crafted `i_size` заставлял один lookup сканировать
+  ~1M блоков.
 - **Цель хранится дословно** — это сырые байты (не обязательно UTF-8), никакой нормализации.
 - **Хардлинк**: `link(parent, name, target_ino)` — тот же inode, `i_links_count += 1`, один
   dirent, ни одного нового блока (проверяется host-свойством и in-guest тестом). Цель-каталог

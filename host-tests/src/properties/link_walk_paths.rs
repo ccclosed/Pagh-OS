@@ -500,3 +500,107 @@ proptest! {
         }
     }
 }
+
+// ─────────────────── search (`x`) permission on traversal ───────────────────
+
+/// A [`Tree`] wrapper that denies directory search for a chosen set of node
+/// ids, the way the kernel adapter answers [`LinkTree::may_search`] from the
+/// process's effective credentials (security batch after 2.22.0, F-x86v-3).
+struct DenyTree {
+    inner: Tree,
+    deny: std::collections::BTreeSet<usize>,
+}
+
+impl DenyTree {
+    fn new(paths: &[&str]) -> DenyTree {
+        let inner = fixture();
+        let deny = paths
+            .iter()
+            .map(|p| inner.id(p).unwrap_or_else(|| panic!("no {p}")))
+            .collect();
+        DenyTree { inner, deny }
+    }
+}
+
+impl LinkTree for DenyTree {
+    fn root(&self) -> usize {
+        self.inner.root()
+    }
+    fn lookup(&mut self, id: usize, name: &str) -> Option<usize> {
+        self.inner.lookup(id, name)
+    }
+    fn is_dir(&self, id: usize) -> bool {
+        self.inner.is_dir(id)
+    }
+    fn link_target(&self, id: usize) -> Option<LinkTarget> {
+        self.inner.link_target(id)
+    }
+    fn may_search(&self, id: usize) -> bool {
+        !self.deny.contains(&id)
+    }
+}
+
+/// Every intermediate directory of a path must be searchable. The walker asks
+/// before each lookup, so the failure is `AccessDenied` for the *directory the
+/// name would be read from* — including `/` itself and the directory a link
+/// target lands in (a target's components are spliced into the same walk, so an
+/// unsearchable ancestor inside a link target is caught too).
+#[test]
+fn traversal_requires_search_permission_on_each_directory() {
+    // Baseline: nothing denied resolves.
+    let mut t = DenyTree::new(&[]);
+    assert_eq!(
+        t.inner.id("mnt/a/f"),
+        Some(resolve(&mut t, "/mnt/a/f", true).unwrap())
+    );
+
+    // The directory holding the final name is not searchable: uid 1000 trying
+    // to read `/mnt/a/f` inside a mode-0700 `/mnt/a`.
+    let mut t = DenyTree::new(&["mnt/a"]);
+    assert_eq!(resolve(&mut t, "/mnt/a/f", true), Err(WalkError::AccessDenied));
+    // `lstat`-style (final component not followed) needs the same search on
+    // the parent, so it fails identically — readlink/lstat are not weakened.
+    assert_eq!(
+        resolve(&mut t, "/mnt/a/f", false),
+        Err(WalkError::AccessDenied)
+    );
+
+    // `/` itself not searchable: nothing can be resolved at all.
+    let mut t = DenyTree::new(&[]);
+    let root = t.inner.root();
+    t.deny.insert(root);
+    assert_eq!(resolve(&mut t, "/mnt", true), Err(WalkError::AccessDenied));
+}
+
+/// A symlink target's components are resolved by the same walk, so search
+/// permission is enforced there as well: `/mnt/a/link` → `/b/c` and a denied
+/// `/mnt/b` stops the lookup of `c` *inside the target*, not only the lookup of
+/// the components written in the syscall argument.
+#[test]
+fn search_permission_follows_spliced_link_targets() {
+    let mut t = DenyTree::new(&["mnt/b"]);
+    assert_eq!(
+        resolve(&mut t, "/mnt/a/link/f", true),
+        Err(WalkError::AccessDenied)
+    );
+
+    // Denying a directory that is not actually traversed changes nothing.
+    let mut t = DenyTree::new(&["mnt/x"]);
+    let f = t.inner.id("mnt/b/c/f").unwrap();
+    assert_eq!(resolve(&mut t, "/mnt/a/link/f", true), Ok(f));
+}
+
+/// A directory's *own* search bit is not needed to stat/resolve its name — only
+/// the parent's is. `/mnt/a` denied still resolves as a name (POSIX: `stat` on
+/// a non-searchable directory succeeds; entering it would not).
+#[test]
+fn final_directory_name_needs_only_the_parent_search_bit() {
+    let mut t = DenyTree::new(&["mnt/a"]);
+    let a = t.inner.id("mnt/a").unwrap();
+    assert_eq!(resolve(&mut t, "/mnt/a", true), Ok(a));
+    // But resolving anything *through* it fails.
+    assert_eq!(
+        resolve(&mut t, "/mnt/a/deep", true),
+        Err(WalkError::AccessDenied)
+    );
+}

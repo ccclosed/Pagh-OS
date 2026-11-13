@@ -29,6 +29,65 @@ pub const INLINE_WORDS: usize = 15;
 /// Longest target that still fits inline *with* its terminating NUL.
 pub const FAST_MAX_TARGET: usize = INLINE_CAPACITY - 1;
 
+/// Largest target a **slow** symlink may have: one ext2 filesystem block.
+///
+/// ext2 stores a slow target in a single data block (e2fsprogs refuses to
+/// create a longer link), so a larger `i_size` on an `S_IFLNK` inode is a
+/// corrupt/crafted image, never a legitimate target. The reader uses this as a
+/// hard allocation bound: a crafted `i_size = 0xFFFFFFF0` used to reach
+/// `vec![0u8; 0xFFFFFFF0]` in `Ext2Fs::read_symlink` and abort the kernel
+/// (F-x86v-1). Keep it in sync with `structs::BS` — the value is duplicated so
+/// this module stays self-contained for the host `#[path]` include.
+pub const SLOW_MAX_TARGET: usize = 4096;
+
+/// What an attacker-controlled `(i_blocks, i_size)` pair means for a symlink.
+///
+/// One decision for every consumer (read and delete), so a corrupt inode cannot
+/// be "fast" for one and "slow" for the other (F-x86v-4: `unlink` used to take
+/// the slow branch for an `i_blocks == 0, i_size > 60` inode and free
+/// `i_block[0]` — the first four bytes of the *target text* — as a block
+/// number).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum TargetShape {
+    /// Inline target of this many bytes (`i_blocks == 0`, `i_size <= 60`).
+    Fast(usize),
+    /// Target in one data block, this many bytes (`i_blocks != 0`).
+    Slow(usize),
+    /// Inconsistent shape: report [`FsError::Corrupt`], allocate nothing.
+    Corrupt,
+}
+
+/// Classify an on-disk symlink target strictly from its inode fields.
+///
+/// Fast requires `i_blocks == 0` *and* the inline capacity (`is_fast`); a
+/// `i_blocks == 0` inode claiming a longer target is inconsistent — its
+/// `i_block` bytes are text, not a block map — and must never be read through
+/// the slow path. Slow requires a plausible one-block target; anything longer
+/// than [`SLOW_MAX_TARGET`] is corrupt *before* any allocation.
+pub fn target_shape(i_blocks: u32, i_size: u32) -> TargetShape {
+    let size = i_size as usize;
+    if is_fast(i_blocks, i_size) {
+        TargetShape::Fast(size)
+    } else if i_blocks == 0 {
+        // Text in `i_block`, but `i_size` > inline capacity: neither layout.
+        TargetShape::Corrupt
+    } else if size <= SLOW_MAX_TARGET {
+        TargetShape::Slow(size)
+    } else {
+        TargetShape::Corrupt
+    }
+}
+
+/// Does a symlink inode own a data block?
+///
+/// Deletion decides **only** from `i_blocks`, exactly like Linux's
+/// `ext2_inode_is_fast_symlink` (`i_blocks - ea_blocks == 0`): an inline target
+/// is text in `i_block` whatever `i_size` claims, so no block may be freed for
+/// it and no `i_size` may be used to pick the slow branch.
+pub fn owns_data_block(i_blocks: u32) -> bool {
+    i_blocks != 0
+}
+
 /// Which on-disk shape a symlink target must use.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SymlinkLayout {

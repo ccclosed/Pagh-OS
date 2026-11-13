@@ -306,6 +306,14 @@ pub mod scrollback;
 #[path = "../../src/fs/ext2/symlink.rs"]
 pub mod ext2_symlink;
 
+// `ext2::bounds` is the pure validation of attacker-controlled ext2 size
+// fields (VFS security batch: F-x86v-1/F-x86v-5): the symlink target-shape
+// classifier and the directory block-count bound. `core`-only and
+// self-contained, so the host tests drive the same rules the kernel runs
+// (properties in `ext2_bounds`, plus the shape properties in `ext2_links`).
+#[path = "../../src/fs/ext2/bounds.rs"]
+pub mod ext2_bounds;
+
 
 // ── OpenPGP repository-metadata verification (issue #32) ─────────────────────
 // The pure verifier the `apt` trust chain will use: packet/armor parsing,
@@ -463,6 +471,11 @@ mod properties {
     // `i_block` word reshape, and the link-count accounting that `unlink` and
     // `link` must obey (a name is only freed at the last link).
     mod ext2_links;
+    // Crafted ext2 size fields (VFS security batch, F-x86v-1/F-x86v-5): a
+    // symlink target shape and a huge directory `i_size` are bounded *before*
+    // any allocation or block loop; the tests include the audit's exact crafted
+    // inode values as regression cases.
+    mod ext2_bounds;
     // Symbolic-link path resolution (issue #18, contract `EXT2-LINKS.md` §4.6,
     // §7.4): Linux-verified cases plus a randomized comparison against an
     // independent restart-based oracle.

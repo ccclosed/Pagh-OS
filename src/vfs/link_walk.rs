@@ -9,6 +9,15 @@
 //! `ELOOP` (Linux `SYMLOOP_MAX`), and the expanded path is capped so an
 //! attacker-controlled image cannot grow the walk without bound.
 //!
+//! The walker itself knows nothing about credentials; it asks its [`LinkTree`]
+//! whether a directory may be searched ([`LinkTree::may_search`]) before every
+//! lookup. The kernel adapter answers with the calling process's effective
+//! credentials, which is how POSIX search (`x`) permission is enforced on
+//! **every** component — including components of a link target the walk splices
+//! in, not just on the components written in the syscall argument
+//! (F-x86v-3: a `0700` root-owned directory did not stop uid 1000 from reading
+//! a world-readable file inside it).
+//!
 //! This module owns the whole algorithm and is `core` + `alloc` only: the
 //! kernel's `vfs::lookup_path_walk` supplies a [`LinkTree`] adapter over
 //! `Arc<dyn VfsNode>` handles, and `host-tests` drives the same source with an
@@ -61,6 +70,9 @@ pub enum WalkError {
     TooManyLinks,
     /// The expanded path exceeded [`MAX_EXPANDED_BYTES`].
     TooLong,
+    /// The caller may not search one of the directories the path traverses
+    /// (POSIX needs the `x` bit on every intermediate directory).
+    AccessDenied,
 }
 
 /// A symlink target as the walker must interpret it.
@@ -130,6 +142,18 @@ pub trait LinkTree {
     /// whose target cannot be read returns an empty `path` so the walk fails
     /// with [`WalkError::NotFound`] instead of treating it as a plain file.
     fn link_target(&self, id: usize) -> Option<LinkTarget>;
+
+    /// May the caller search (look up a name in) directory `id`?
+    ///
+    /// The walker asks this before **every** lookup. The default is `true`:
+    /// the pure algorithm models no permissions, and host properties drive it
+    /// with a permissive tree; the kernel adapter overrides it with the
+    /// process's effective credentials so traversal requires the `x` bit on
+    /// each directory entered (F-x86v-3). Returning `false` makes the walk
+    /// fail with [`WalkError::AccessDenied`].
+    fn may_search(&self, _id: usize) -> bool {
+        true
+    }
 }
 
 /// Resolve `path` against `tree`, returning the node id it names.
@@ -163,6 +187,12 @@ pub fn resolve<T: LinkTree>(
             continue;
         }
         let dir = *stack.last().expect("the stack always holds the root");
+        // Search permission is checked on the directory the component is
+        // looked up in, i.e. on every component passed through — including
+        // the ones a followed link spliced into the pending list.
+        if !tree.may_search(dir) {
+            return Err(WalkError::AccessDenied);
+        }
         let child = tree.lookup(dir, &comp).ok_or(WalkError::NotFound)?;
         let is_last = pending.is_empty();
 

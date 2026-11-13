@@ -41,6 +41,7 @@
 #![allow(dead_code)]
 
 pub mod alloc;
+pub mod bounds;
 pub mod dir;
 pub mod inode;
 pub mod structs;
@@ -76,7 +77,7 @@ use structs::{
     SECTORS_PER_BLOCK, S_IFDIR, S_IFLNK, S_IFREG,
 };
 
-use symlink::{SymlinkLayout, UnlinkAction};
+use symlink::{SymlinkLayout, TargetShape, UnlinkAction};
 
 // ─── format layout constants (single block group) ───────────────────────────
 
@@ -185,6 +186,22 @@ impl Ext2Fs {
 
     pub fn superblock(&self) -> Ext2SuperBlock {
         self.inner.lock().sb
+    }
+
+    /// The filesystem's declared block count (`s_blocks_count`): the hard
+    /// upper bound for any inode's block map.
+    fn total_blocks(&self) -> u64 {
+        self.superblock().s_blocks_count as u64
+    }
+
+    /// Validated block count of a **directory** inode (F-x86v-5).
+    ///
+    /// A directory is block-aligned and can never be larger than the
+    /// filesystem, so a crafted `i_size` is [`FsError::Corrupt`] *before*
+    /// the caller starts looping over blocks — otherwise one `lookup`/`readdir`
+    /// on `i_size = 0xFFFFF000` issues up to ~1M block reads.
+    fn dir_blocks(&self, inode: &Ext2Inode) -> Result<u64, FsError> {
+        bounds::dir_blocks(inode.i_size, self.total_blocks()).map_err(|_| FsError::Corrupt)
     }
 
     pub fn group_desc(&self) -> Ext2GroupDesc {
@@ -561,7 +578,12 @@ impl<'a> Tx<'a> {
     /// uses the normal map.
     fn free_inode_blocks(&mut self, inode: &Ext2Inode) -> Result<(), FsError> {
         if inode.is_symlink() {
-            if symlink::is_fast(inode.i_blocks, inode.i_size) {
+            // Decide from `i_blocks` ALONE, never from `i_size` (F-x86v-4):
+            // an inline target is text in `i_block` whatever `i_size` claims,
+            // so it owns no block to free; a `i_size > 60, i_blocks == 0`
+            // inode used to take the slow branch here and free a block number
+            // spelled by the target text.
+            if !symlink::owns_data_block(inode.i_blocks) {
                 return Ok(()); // inline target: no data block exists
             }
             if inode.i_block[0] != 0 {
@@ -1170,7 +1192,7 @@ impl Ext2Fs {
         if !inode.is_dir() {
             return Err(FsError::NotFound);
         }
-        let nblocks = (inode.i_size as usize + BS - 1) / BS;
+        let nblocks = self.dir_blocks(&inode)?;
         let mut out = Vec::new();
         for lbn in 0..nblocks as u64 {
             if let Some(blk) = inode::block_for_offset(self, &inode, lbn * BS as u64)? {
@@ -1191,8 +1213,8 @@ impl Ext2Fs {
         if !inode.is_dir() {
             return Err(FsError::NotFound);
         }
-        let nblocks = (inode.i_size as usize + BS - 1) / BS;
-        for lbn in 0..nblocks as u64 {
+        let nblocks = self.dir_blocks(&inode)?;
+        for lbn in 0..nblocks {
             if let Some(blk) = inode::block_for_offset(self, &inode, lbn * BS as u64)? {
                 let buf = self.read_fs_block(blk as u64)?;
                 if let Some((ino, _)) = dir::find(&buf, name)? {
@@ -1210,14 +1232,14 @@ impl Ext2Fs {
             return Err(FsError::NameTooLong);
         }
         let mut dinode = tx.read_inode(dir_ino)?;
-        let nblocks = (dinode.i_size as usize + BS - 1) / BS;
+        let nblocks = tx.fs.dir_blocks(&dinode)?;
 
         // Full in-transaction duplicate scan. Callers probe with `lookup_entry`
         // first, but that probe runs outside the tx lock; inserting a second
         // entry with the same name would leave two directory entries for one
         // inode and silently break the link count. The blocks read here are
         // cached in the transaction, so the insertion loop below re-reads none.
-        for lbn in 0..nblocks as u64 {
+        for lbn in 0..nblocks {
             let Some(blk) = inode::block_for_offset(tx.fs, &dinode, lbn * BS as u64)? else {
                 continue;
             };
@@ -1234,7 +1256,7 @@ impl Ext2Fs {
         // map_or_alloc here — that would allocate a block (and bump
         // i_blocks/bitmaps) just to look for a name, leaking the allocation
         // whenever the scan ends in an early error path.
-        for lbn in 0..nblocks as u64 {
+        for lbn in 0..nblocks {
             let Some(blk) = inode::block_for_offset(tx.fs, &dinode, lbn * BS as u64)? else {
                 continue;
             };
@@ -1414,22 +1436,31 @@ impl Ext2Fs {
         if !inode.is_symlink() {
             return Err(FsError::Corrupt);
         }
-        if symlink::is_fast(inode.i_blocks, inode.i_size) {
-            let inline = symlink::inline_bytes(&inode.i_block);
-            let target = symlink::fast_target(&inline, inode.i_size).ok_or(FsError::Corrupt)?;
-            return Ok(target.to_vec());
+        // The layout decision is bounded by the on-disk shape (F-x86v-1): a
+        // crafted `i_blocks = 8, i_size = 0xFFFFFFF0` is `Corrupt`, never a
+        // `vec![0u8; i_size]`. `i_blocks == 0` with an oversized `i_size` is
+        // also corrupt, not slow: those bytes are target text, not a block map
+        // (F-x86v-4).
+        match symlink::target_shape(inode.i_blocks, inode.i_size) {
+            TargetShape::Fast(size) => {
+                let inline = symlink::inline_bytes(&inode.i_block);
+                let target = symlink::fast_target(&inline, size as u32).ok_or(FsError::Corrupt)?;
+                Ok(target.to_vec())
+            }
+            TargetShape::Slow(size) => {
+                if size == 0 {
+                    return Ok(Vec::new());
+                }
+                if inode::block_for_offset(self, &inode, 0)?.is_none() {
+                    return Err(FsError::Corrupt);
+                }
+                let mut out = vec![0u8; size];
+                let n = self.read_file(ino, 0, &mut out)?;
+                out.truncate(n);
+                Ok(out)
+            }
+            TargetShape::Corrupt => Err(FsError::Corrupt),
         }
-        let size = inode.i_size as usize;
-        if size == 0 {
-            return Ok(Vec::new());
-        }
-        if inode::block_for_offset(self, &inode, 0)?.is_none() {
-            return Err(FsError::Corrupt);
-        }
-        let mut out = vec![0u8; size];
-        let n = self.read_file(ino, 0, &mut out)?;
-        out.truncate(n);
-        Ok(out)
     }
 
     /// Add the hard link `name` under `parent_ino`, pointing at the existing
@@ -1480,9 +1511,9 @@ impl Ext2Fs {
         }
 
         // Locate the entry's directory block and the child inode.
-        let nblocks = (pinode.i_size as usize + BS - 1) / BS;
+        let nblocks = tx.fs.dir_blocks(&pinode)?;
         let mut found: Option<(u64, u32)> = None; // (dir block, child ino)
-        for lbn in 0..nblocks as u64 {
+        for lbn in 0..nblocks {
             // Read-only scan (see insert_dirent): never allocate on a lookup.
             let Some(blk) = inode::block_for_offset(tx.fs, &pinode, lbn * BS as u64)? else {
                 continue;
@@ -1501,8 +1532,8 @@ impl Ext2Fs {
 
         // Empty-directory check (read committed state; child is unmodified here).
         if child.is_dir() {
-            let cblocks = (child.i_size as usize + BS - 1) / BS;
-            for lbn in 0..cblocks as u64 {
+            let cblocks = tx.fs.dir_blocks(&child)?;
+            for lbn in 0..cblocks {
                 if let Some(cb) = inode::block_for_offset(self, &child, lbn * BS as u64)? {
                     let buf = self.read_fs_block(cb as u64)?;
                     if dir::live_entry_count(&buf)? != 0 {

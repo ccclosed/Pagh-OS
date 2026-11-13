@@ -1749,6 +1749,9 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
                 crate::task::process::RunError::NotFound => "file not found or unreadable",
                 crate::task::process::RunError::LoadFailed(c) => c,
                 crate::task::process::RunError::StackFailed => "initial stack construction failed",
+                crate::task::process::RunError::AccessDenied => {
+                    "search permission denied on the path"
+                }
             };
             shell_println(&alloc::format!("lxrun: {}: {}", path, detail));
         }

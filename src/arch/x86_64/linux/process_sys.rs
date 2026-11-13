@@ -321,6 +321,7 @@ fn runerr(e: crate::task::process::RunError) -> Errno {
         crate::task::process::RunError::NotFound => Errno::ENOENT,
         crate::task::process::RunError::LoadFailed(_) => Errno::ENOEXEC,
         crate::task::process::RunError::StackFailed => Errno::ENOMEM,
+        crate::task::process::RunError::AccessDenied => Errno::EACCES,
     }
 }
 /// execve(59), syscall-instruction path: replace CR3/image and return through
