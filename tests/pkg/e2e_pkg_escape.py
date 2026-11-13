@@ -15,9 +15,18 @@ guest's own unauthenticated `pkg` downloader, and asserts on the serial log:
   * the plain `..` control (`evil-dotdot.deb`) is still skipped, not installed;
   * the negative marker strings (`PWN-AUTORUN-VIA-PKG`, `PWN-SYMLINK-ESCAPE`,
     `PWN-RELATIVE-ESCAPE`, `PWN-DOTDOT`) appear nowhere in the serial log;
+  * **round-2 F-r2-vfs-1**: `evil-hardlink-alias.deb` (`d/y -> ../etc`, `d/h` a
+    hard link to the symlink inode, `d/h/autorun` a hard link to the payload) and
+    `evil-hardlink-chain.deb` (alias of alias + `..`-normalized paths) are refused
+    as whole packages, and `/mnt/etc/autorun` stays absent;
   * **positive control**: `normal-hello.deb` (two files + one absolute symlink with
     no member below it) installs (`pkg: installed 3 files under /mnt`), its binary
-    reads back, and the installed symlink is followed.
+    reads back, and the installed symlink is followed; `normal-hardlink.deb`
+    installs a regular hard link (two names, one inode), so the fix does not turn
+    normal hard links into copies or refusals;
+  * **second boot**: the same data disk is booted again without any injection and
+    must not execute a payload (`/mnt/etc/autorun` still absent, no PWN marker in
+    the second serial log) — the persistence half of the F-r2-vfs-1 claim.
 
 Run from the repository root:
 
@@ -55,6 +64,9 @@ PWN_MARKERS = (
     "PWN-SYMLINK-ESCAPE",
     "PWN-RELATIVE-ESCAPE",
     "PWN-DOTDOT",
+    # Round-2 F-r2-vfs-1 payloads.
+    "PWN-R2-HARDLINK-ALIAS",
+    "PWN-R2-HARDLINK-CHAIN",
 )
 
 
@@ -103,9 +115,25 @@ def build_script(port: int) -> str:
         "wait cat: /mnt/pwned_root: not found 30",
         f"cmd {p} /evil-relative.deb {port}",
         "wait pkg: install failed: refused unsafe install path 120",
+        # Round-2 F-r2-vfs-1: a hard-link alias of an archive symlink is refused
+        # as a whole package; nothing lands at the boot-time autorun path.
+        f"cmd {p} /evil-hardlink-alias.deb {port}",
+        "wait pkg: install failed: refused unsafe install path 120",
+        "cmd cat /mnt/etc/autorun",
+        "wait cat: /mnt/etc/autorun: not found 30",
+        # Same primitive through an alias of an alias and `..`-normalized paths.
+        f"cmd {p} /evil-hardlink-chain.deb {port}",
+        "wait pkg: install failed: refused unsafe install path 120",
         # Plain `..` control: member skipped, package completes (0 members).
         f"cmd {p} /evil-dotdot.deb {port}",
         "wait pkg: installed 0 files under /mnt 60",
+        # Positive control: a normal hard link to a regular file still installs.
+        f"cmd {p} /normal-hardlink.deb {port}",
+        "wait pkg: installed 2 files under /mnt 60",
+        "cmd cat /mnt/usr/bin/hello-hard",
+        "wait hello from hardlink control 30",
+        "cmd ls -l /mnt/usr/bin",
+        "wait hello-hard 30",
         # Positive control: a normal package still installs, links included.
         f"cmd {p} /normal-hello.deb {port}",
         "wait pkg: done 120",
@@ -118,7 +146,7 @@ def build_script(port: int) -> str:
     return "\n".join(lines) + "\n"
 
 
-def run_e2e(script: pathlib.Path, serial: pathlib.Path) -> int:
+def run_e2e(script: pathlib.Path, serial: pathlib.Path, *extra: str) -> int:
     cmd = [
         sys.executable,
         str(E2E),
@@ -133,9 +161,21 @@ def run_e2e(script: pathlib.Path, serial: pathlib.Path) -> int:
         "8",
         "--timeout",
         "240",
+        *extra,
     ]
     log("running: " + " ".join(str(c) for c in cmd))
     return subprocess.call(cmd, cwd=str(ROOT))
+
+
+SECOND_BOOT_SCRIPT = """# Second boot of the same data disk: no payload may run.
+# `/mnt/etc/autorun` is executed by the shell at boot when present, so its
+# absence plus the marker scan below is the persistence half of the proof.
+cmd cat /mnt/etc/autorun
+wait cat: /mnt/etc/autorun: not found 30
+cmd ls -l /mnt/usr/bin
+wait hello-real 30
+sleep 2
+"""
 
 
 def main() -> int:
@@ -174,7 +214,12 @@ def main() -> int:
     server = start_server(out, args.port)
     log(f"serving {out} on 0.0.0.0:{args.port} (guest: 10.0.2.2)")
 
-    # 3. Drive the real guest through the qemu monitor.
+    # 3. Drive the real guest through the qemu monitor. Both boots share
+    #    `.cache/e2e_disk.img` (`--reuse-scratch-disk`), so the second boot sees
+    #    exactly what the first one left behind; start from a clean scratch image
+    #    so a leftover from an aborted run cannot be mistaken for evidence.
+    scratch_disk = ROOT / ".cache" / "e2e_disk.img"
+    scratch_disk.unlink(missing_ok=True)
     script = pathlib.Path(args.out) / "pkg_escape_e2e.script"
     script.write_text(build_script(args.port), encoding="utf-8")
     serial = pathlib.Path(args.serial_log)
@@ -182,7 +227,7 @@ def main() -> int:
     if serial.exists():
         serial.unlink()
     try:
-        rc = run_e2e(script, serial)
+        rc = run_e2e(script, serial, "--reuse-scratch-disk")
     finally:
         server.shutdown()
         server.server_close()
@@ -222,8 +267,24 @@ def main() -> int:
             "pkg: installed 0 files under /mnt" in text,
         ),
         (
+            "round-2 hardlink alias refused at /mnt/d/h",
+            "/mnt/d/h" in refused,
+        ),
+        (
+            "round-2 hardlink alias chain refused at /mnt/d/h1",
+            "/mnt/d/h1" in refused,
+        ),
+        (
             "normal package installs",
             "pkg: installed 3 files under /mnt" in text,
+        ),
+        (
+            "normal hard-link package installs",
+            "pkg: installed 2 files under /mnt" in text,
+        ),
+        (
+            "normal hard link reads back",
+            "hello from hardlink control" in text,
         ),
         ("normal package binary reads back", "hello from normal-hello" in text),
         (
@@ -246,6 +307,8 @@ def main() -> int:
                 "cat: /mnt/pwned_root",
                 "hello from normal-hello",
                 "hello-alias",
+                "hello from hardlink control",
+                "hello-hard",
             )
         )
     ]
@@ -253,6 +316,42 @@ def main() -> int:
     print("== serial evidence ==")
     for line in evidence[-40:]:
         print(f"  {line.strip()}")
+    # 5. Second boot of the SAME data disk, no injection: the shell executes
+    #    /mnt/etc/autorun at boot when it exists, so an absent file plus a
+    #    marker-free serial log is the persistence half of the proof.
+    second_script = pathlib.Path(args.out) / "pkg_escape_second_boot.script"
+    second_script.write_text(SECOND_BOOT_SCRIPT, encoding="utf-8")
+    second_serial = serial.with_name(serial.stem + "_boot2" + serial.suffix)
+    if second_serial.exists():
+        second_serial.unlink()
+    try:
+        rc2 = run_e2e(second_script, second_serial, "--reuse-scratch-disk")
+    finally:
+        if not args.keep_script:
+            second_script.unlink(missing_ok=True)
+    text2 = (
+        second_serial.read_text(encoding="utf-8", errors="replace")
+        if second_serial.is_file()
+        else ""
+    )
+    leaked2 = [m for m in PWN_MARKERS if m in text2]
+    checks += [
+        ("second boot starts", rc2 == 0 and bool(text2)),
+        (
+            "second boot: /mnt/etc/autorun still absent",
+            "cat: /mnt/etc/autorun: not found" in text2,
+        ),
+        ("second boot: no PWN marker executed", not leaked2),
+    ]
+
+    print()
+    print("== second-boot evidence ==")
+    for line in text2.splitlines():
+        if any(
+            key in line
+            for key in ("cat: /mnt/etc/autorun", "hello-real", "PWN-")
+        ):
+            print(f"  {line.strip()}")
     print()
     print("== checks ==")
     for label, passed in checks:
@@ -260,7 +359,10 @@ def main() -> int:
         ok = ok and passed
     if leaked:
         print(f"  leaked markers: {leaked}")
+    if leaked2:
+        print(f"  leaked markers on second boot: {leaked2}")
     print(f"\nserial log: {serial}")
+    print(f"second-boot serial log: {second_serial}")
     print(f"crafted packages: {out}")
     print(f"verdict: {'PASS' if ok else 'FAIL'}")
     return EXIT_PASS if ok else EXIT_FAIL

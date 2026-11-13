@@ -14,7 +14,7 @@
 //     reported instead of silently becoming copies, and symlinks keep archive
 //     order and verbatim targets.
 
-use crate::install::{plan_install, InstallOp};
+use crate::install::{plan_install, InstallOp, UnsafeKind};
 use crate::tar::{
     effective_path, read_tar, write_tar_members, TarEntry, TarError, TarFormat, TarMember, TarType,
 };
@@ -331,6 +331,27 @@ proptest! {
         let entries: Vec<TarEntry> = read_tar(&buf).expect("written stream reads back");
         let plan = plan_install(&entries);
 
+        // F-r2-vfs-1: no planned hard link may target an archive symlink — that
+        // would be a second name for the link inode, a construct the installer
+        // must refuse rather than plan.
+        let symlink_paths: Vec<&str> = members
+            .iter()
+            .filter_map(|m| match m {
+                TarMember::Symlink { path, .. } => Some(*path),
+                _ => None,
+            })
+            .collect();
+        for op in &plan.ops {
+            if let InstallOp::Hardlink { path, target } = op {
+                prop_assert!(
+                    !symlink_paths.contains(&target.as_str()),
+                    "hard link {} planned onto the archive symlink {}",
+                    path,
+                    target
+                );
+            }
+        }
+
         let mut created: Vec<String> = Vec::new();
         for op in &plan.ops {
             match op {
@@ -397,7 +418,7 @@ fn plan_refuses_member_below_the_archives_own_symlink() {
     let refused = &plan.unsafe_members[0];
     assert_eq!(refused.path, "y/autorun");
     assert_eq!(refused.link, "y");
-    assert!(!refused.is_hardlink_target);
+    assert_eq!(refused.kind, UnsafeKind::MemberBelowSymlink);
     assert!(
         !plan
             .ops
@@ -477,7 +498,7 @@ fn plan_refuses_hardlink_below_the_archives_own_symlink() {
     let plan = plan_install(&entries);
     assert_eq!(plan.unsafe_members.len(), 1);
     assert_eq!(plan.unsafe_members[0].path, "y/hard");
-    assert!(!plan.unsafe_members[0].is_hardlink_target);
+    assert_eq!(plan.unsafe_members[0].kind, UnsafeKind::MemberBelowSymlink);
     assert!(!plan
         .ops
         .iter()
@@ -509,9 +530,12 @@ fn plan_refuses_hardlink_target_below_the_archives_own_symlink() {
     // it is refused with it (not deferred, not copied).
     assert_eq!(plan.unsafe_members.len(), 2);
     assert_eq!(plan.unsafe_members[0].path, "y/real");
-    assert!(!plan.unsafe_members[0].is_hardlink_target);
+    assert_eq!(plan.unsafe_members[0].kind, UnsafeKind::MemberBelowSymlink);
     assert_eq!(plan.unsafe_members[1].path, "y/real");
-    assert!(plan.unsafe_members[1].is_hardlink_target);
+    assert_eq!(
+        plan.unsafe_members[1].kind,
+        UnsafeKind::HardlinkTargetBelowSymlink
+    );
     assert!(plan.deferred.is_empty());
     assert!(!plan
         .ops
@@ -574,4 +598,243 @@ fn plan_accepts_the_links_fixture() {
     assert!(plan.unsafe_members.is_empty());
     assert_eq!(plan.ops.len(), 5);
     assert!(plan.skipped_unsafe == 0 && plan.skipped_empty_target == 0);
+}
+
+// ─────── F-r2-vfs-1: hard links that alias a symlink (round-2 audit) ───────
+//
+// `link(2)` does not follow the final component, so a tar hard-link member whose
+// target is an archive symlink is a **second name for the symlink inode**. The
+// round-2 PoC (`attack/r2/vfs/attack-alias.deb`) is
+//
+//     ./d/pwn       regular payload
+//     ./d/y -> ../etc
+//     ./d/h         HARDLINK -> ./d/y      (alias of the link inode)
+//     ./d/h/autorun HARDLINK -> ./d/pwn    (parent is the alias)
+//
+// The old plan knew only `d/y`, accepted `d/h`, and the effectful resolver wrote
+// `/mnt/etc/autorun`. The planner now treats aliases as links and refuses the
+// whole package; these tests pin both the refusal classes and the boundaries.
+
+/// The audit's four-member reproducer: the alias member and the member named
+/// below it are refused; the harmless file and the link itself are still planned
+/// so the effectful installer can refuse the package atomically.
+#[test]
+fn plan_refuses_the_round2_hardlink_alias_package() {
+    let members = [
+        TarMember::File {
+            path: "d/pwn",
+            content: b"echo R2-VFS-ALIAS-AUTORUN-EXECUTED\n",
+        },
+        TarMember::Symlink {
+            path: "d/y",
+            target: "../etc",
+        },
+        TarMember::Hardlink {
+            path: "d/h",
+            target: "d/y",
+        },
+        TarMember::Hardlink {
+            path: "d/h/autorun",
+            target: "d/pwn",
+        },
+    ];
+    let buf = write_tar_members(&members, TarFormat::UstarPrefix);
+    let entries = read_tar(&buf).expect("stream reads back");
+    let plan = plan_install(&entries);
+
+    let alias = plan
+        .unsafe_members
+        .iter()
+        .find(|m| m.path == "d/h")
+        .expect("the hard link to the archive symlink is refused");
+    assert_eq!(alias.kind, UnsafeKind::HardlinkAliasesSymlink);
+    assert_eq!(alias.link, "d/y");
+
+    let child = plan
+        .unsafe_members
+        .iter()
+        .find(|m| m.path == "d/h/autorun")
+        .expect("the member named below the alias is refused");
+    assert_eq!(child.kind, UnsafeKind::MemberBelowSymlink);
+    assert_eq!(child.link, "d/h");
+
+    // The refused members never reach the executable plan; the file and the link
+    // themselves are planned (the package is refused as a whole before any write).
+    assert!(!plan
+        .ops
+        .iter()
+        .any(|op| matches!(op, InstallOp::Hardlink { .. })));
+    assert!(plan
+        .ops
+        .iter()
+        .any(|op| matches!(op, InstallOp::File { path, .. } if path == "d/pwn")));
+    assert!(plan
+        .ops
+        .iter()
+        .any(|op| matches!(op, InstallOp::Symlink { path, .. } if path == "d/y")));
+}
+
+/// The alias alone is enough: a hard link to an archive symlink is refused even
+/// when no member descends through it (the primitive itself is the violation).
+#[test]
+fn plan_refuses_a_hardlink_to_an_archive_symlink() {
+    let members = [
+        TarMember::Symlink {
+            path: "y",
+            target: "target",
+        },
+        TarMember::Hardlink {
+            path: "h",
+            target: "y",
+        },
+    ];
+    let buf = write_tar_members(&members, TarFormat::UstarPrefix);
+    let entries = read_tar(&buf).expect("stream reads back");
+    let plan = plan_install(&entries);
+    assert!(plan.unsafe_members.iter().any(|m| {
+        m.path == "h" && m.link == "y" && m.kind == UnsafeKind::HardlinkAliasesSymlink
+    }));
+    assert!(!plan
+        .ops
+        .iter()
+        .any(|op| matches!(op, InstallOp::Hardlink { .. })));
+}
+
+/// Alias of alias, with the aliases stored before their target (archive order
+/// must not matter): `h2 -> h1 -> y`.
+#[test]
+fn plan_refuses_alias_of_alias_and_members_below_the_chain() {
+    let members = [
+        TarMember::Symlink {
+            path: "d/y",
+            target: "../etc",
+        },
+        TarMember::Hardlink {
+            path: "d/h2",
+            target: "d/h1",
+        },
+        TarMember::Hardlink {
+            path: "d/h1",
+            target: "d/y",
+        },
+        TarMember::File {
+            path: "d/h2/leaf",
+            content: b"PWN-R2-ALIAS-CHAIN\n",
+        },
+    ];
+    let buf = write_tar_members(&members, TarFormat::UstarPrefix);
+    let entries = read_tar(&buf).expect("stream reads back");
+    let plan = plan_install(&entries);
+
+    let refused: Vec<(&str, UnsafeKind)> = plan
+        .unsafe_members
+        .iter()
+        .map(|m| (m.path.as_str(), m.kind))
+        .collect();
+    assert!(refused.contains(&("d/h1", UnsafeKind::HardlinkAliasesSymlink)));
+    assert!(refused.contains(&("d/h2", UnsafeKind::HardlinkAliasesSymlink)));
+    assert!(refused.contains(&("d/h2/leaf", UnsafeKind::MemberBelowSymlink)));
+    assert!(!plan
+        .ops
+        .iter()
+        .any(|op| matches!(op, InstallOp::Hardlink { .. })));
+}
+
+/// `..` components are normalized before the alias check, on both the member path
+/// and the hard-link target: `d/x/../h -> d/x/../y` is the same construct.
+#[test]
+fn plan_refuses_dotdot_normalized_alias_paths() {
+    let members = [
+        TarMember::Symlink {
+            path: "d/y",
+            target: "../etc",
+        },
+        TarMember::Hardlink {
+            path: "d/x/../h",
+            target: "d/x/../y",
+        },
+        TarMember::File {
+            path: "d/q/../h/autorun",
+            content: b"PWN-R2-ALIAS-DOTDOT\n",
+        },
+    ];
+    let buf = write_tar_members(&members, TarFormat::UstarPrefix);
+    let entries = read_tar(&buf).expect("stream reads back");
+    let plan = plan_install(&entries);
+    assert!(plan.unsafe_members.iter().any(|m| {
+        m.path == "d/h" && m.link == "d/y" && m.kind == UnsafeKind::HardlinkAliasesSymlink
+    }));
+    assert!(plan
+        .unsafe_members
+        .iter()
+        .any(|m| m.path == "d/h/autorun" && m.kind == UnsafeKind::MemberBelowSymlink));
+}
+
+/// Boundary: a hard link to a **regular file** is a normal hard link, not an
+/// alias, and keeps its place in the executable plan.
+#[test]
+fn plan_keeps_normal_hardlinks_to_regular_files() {
+    let members = [
+        TarMember::File {
+            path: "usr/bin/real",
+            content: b"payload",
+        },
+        TarMember::Hardlink {
+            path: "usr/bin/hard",
+            target: "usr/bin/real",
+        },
+    ];
+    let buf = write_tar_members(&members, TarFormat::UstarPrefix);
+    let entries = read_tar(&buf).expect("stream reads back");
+    let plan = plan_install(&entries);
+    assert!(plan.unsafe_members.is_empty());
+    assert_eq!(plan.ops.len(), 2);
+    assert!(plan.ops.iter().any(|op| matches!(
+        op, InstallOp::Hardlink { path, target }
+            if path == "usr/bin/hard" && target == "usr/bin/real"
+    )));
+}
+
+/// Boundary: the planner cannot know about links that already exist on the
+/// installed tree, so a hard link to an unknown target is deferred, never
+/// guessed into a refusal.
+#[test]
+fn plan_defers_a_hardlink_to_a_link_it_did_not_create() {
+    let members = [TarMember::Hardlink {
+        path: "h",
+        target: "lib64",
+    }];
+    let buf = write_tar_members(&members, TarFormat::UstarPrefix);
+    let entries = read_tar(&buf).expect("stream reads back");
+    let plan = plan_install(&entries);
+    assert!(plan.unsafe_members.is_empty());
+    assert_eq!(plan.deferred, vec!["h".to_string()]);
+}
+
+/// The alias refusal is by exact path, not by a shared prefix: a hard link to
+/// `y2` is not an alias of the archive link `y`.
+#[test]
+fn plan_does_not_refuse_a_hardlink_to_a_sibling_of_the_link() {
+    let members = [
+        TarMember::Symlink {
+            path: "y",
+            target: "target",
+        },
+        TarMember::File {
+            path: "y2",
+            content: b"regular",
+        },
+        TarMember::Hardlink {
+            path: "h",
+            target: "y2",
+        },
+    ];
+    let buf = write_tar_members(&members, TarFormat::UstarPrefix);
+    let entries = read_tar(&buf).expect("stream reads back");
+    let plan = plan_install(&entries);
+    assert!(plan.unsafe_members.is_empty());
+    assert!(plan
+        .ops
+        .iter()
+        .any(|op| matches!(op, InstallOp::Hardlink { path, .. } if path == "h")));
 }

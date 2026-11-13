@@ -92,6 +92,7 @@ pub fn run() {
     check_fetch_no_network();
     check_ext2_install_roundtrip();
     check_install_symlink_confinement();
+    check_install_hardlink_alias_confinement();
 
     // ── New "no new process model" syscalls (Feature: linux-binary-compat) ──
     check_getcwd();
@@ -473,6 +474,7 @@ pub fn run_live_update_check() {
             RunError::NotFound => fail(name, "run returned NotFound"),
             RunError::LoadFailed(c) => fail(name, c),
             RunError::StackFailed => fail(name, "run returned StackFailed"),
+            RunError::AccessDenied => fail(name, "run was denied search permission"),
         },
     }
 }
@@ -876,6 +878,7 @@ pub fn run_apt_e2e() {
             RunError::NotFound => fail(name, "run returned NotFound"),
             RunError::LoadFailed(c) => fail(name, c),
             RunError::StackFailed => fail(name, "run returned StackFailed"),
+            RunError::AccessDenied => fail(name, "run was denied search permission"),
         },
     }
 }
@@ -1990,6 +1993,7 @@ fn check_thread_task_dir() {
         Err(RunError::NotFound) => return fail(name, "run returned NotFound"),
         Err(RunError::LoadFailed(c)) => return fail(name, c),
         Err(RunError::StackFailed) => return fail(name, "run returned StackFailed"),
+        Err(RunError::AccessDenied) => return fail(name, "run was denied search permission"),
     };
     // The harness is not a wait4 parent of this test image: a zombie record for
     // pid 1's "child" would outlive the check for no reason.
@@ -2162,6 +2166,7 @@ fn check_thread_exit_task_dir() {
         Err(RunError::NotFound) => return fail(name, "run returned NotFound"),
         Err(RunError::LoadFailed(c)) => return fail(name, c),
         Err(RunError::StackFailed) => return fail(name, "run returned StackFailed"),
+        Err(RunError::AccessDenied) => return fail(name, "run was denied search permission"),
     };
     compat::with_pid_compat(pid, |cs| cs.waitable = false);
     // A thread exit in this kernel notifies the creating task with SIGCHLD
@@ -2295,6 +2300,7 @@ fn check_maps_metadata() {
         Err(RunError::NotFound) => return fail(name, "run returned NotFound"),
         Err(RunError::LoadFailed(c)) => return fail(name, c),
         Err(RunError::StackFailed) => return fail(name, "run returned StackFailed"),
+        Err(RunError::AccessDenied) => return fail(name, "run was denied search permission"),
     };
     compat::with_pid_compat(pid, |cs| cs.waitable = false);
 
@@ -2415,6 +2421,7 @@ fn check_end_to_end_run() {
             RunError::NotFound => fail(name, "run returned NotFound"),
             RunError::LoadFailed(c) => fail(name, c),
             RunError::StackFailed => fail(name, "run returned StackFailed"),
+            RunError::AccessDenied => fail(name, "run was denied search permission"),
         },
     }
 }
@@ -2860,6 +2867,255 @@ fn check_install_symlink_confinement() {
     for p in scratch {
         remove_leaf(p);
     }
+    pass(name);
+}
+
+/// F-r2-vfs-1 — a hard link to an archive symlink is a second name for the link
+/// inode and must never become an unmarked redirector for later members.
+///
+/// Round-2 audit construct (verified on stock 2.22.3):
+///
+/// ```text
+/// ./d/pwn         regular payload (a shell command)
+/// ./d/y -> ../etc
+/// ./d/h           HARDLINK -> ./d/y      second name for the *symlink* inode
+/// ./d/h/autorun   HARDLINK -> ./d/pwn    parent path is the alias
+/// ```
+///
+/// The old planner only registered `d/y` as a link, so `d/h` was accepted; the
+/// effectful resolver followed the alias and created `/mnt/etc/autorun`, which
+/// the shell executes as root at the next boot. Covered here:
+///
+///   * the audit's four members are refused atomically (no partial tree, the
+///     boot-time `/mnt/etc/autorun` is untouched);
+///   * the same refusal for an alias chain `h1 -> y`, `h2 -> h1` with a member
+///     below `h2`;
+///   * a **normal** hard link to a regular file still installs (both names, one
+///     inode, `nlink == 2`);
+///   * a pre-existing *relative in-root* symlink with a single name is still
+///     followed (the documented `lib64 -> usr/lib64` placement rule);
+///   * a pre-existing hard-link alias of a symlink is not traversed even though
+///     the alias path was created by an earlier install and is absent from this
+///     install's `own_links` (the `nlink > 1` backstop).
+fn check_install_hardlink_alias_confinement() {
+    let name = "install_hardlink_alias_confinement";
+    const MARK: &[u8] = b"PWN-R2-HARDLINK-ALIAS-AUTORUN\n";
+    const PAYLOAD: &[u8] = b"r2-vfs-positive-control\n";
+
+    // Scratch paths this check owns; leftovers from an earlier boot are removed
+    // first so the routine is repeatable on the persistent data disk.
+    let scratch: [&str; 25] = [
+        "/mnt/pkgha/y/autorun",
+        "/mnt/pkgha/h/autorun",
+        "/mnt/pkgha/y",
+        "/mnt/pkgha/h",
+        "/mnt/pkgha/pwn",
+        "/mnt/pkgha",
+        "/mnt/pkghc/h2/leaf",
+        "/mnt/pkghc/h2",
+        "/mnt/pkghc/h1",
+        "/mnt/pkghc/y",
+        "/mnt/pkghc/pwn",
+        "/mnt/pkghc",
+        "/mnt/pkghb/usr/bin/hard",
+        "/mnt/pkghb/usr/bin/real",
+        "/mnt/pkghb/usr/bin",
+        "/mnt/pkghb/usr",
+        "/mnt/pkghb",
+        "/mnt/pkgpc/link/leaf-ok",
+        "/mnt/pkgpc/real/leaf-ok",
+        "/mnt/pkgpc/link",
+        "/mnt/pkgpc/real",
+        "/mnt/pkgpc",
+        "/mnt/pkgpd/h",
+        "/mnt/pkgpd/link",
+        "/mnt/pkgpd/real",
+    ];
+    for p in scratch {
+        remove_leaf(p);
+    }
+
+    // 1) The audit's archive: refused as a whole before the first inode.
+    let attack = [
+        TarMember::File {
+            path: "pkgha/pwn",
+            content: MARK,
+        },
+        TarMember::Symlink {
+            path: "pkgha/y",
+            target: "../etc",
+        },
+        TarMember::Hardlink {
+            path: "pkgha/h",
+            target: "pkgha/y",
+        },
+        TarMember::Hardlink {
+            path: "pkgha/h/autorun",
+            target: "pkgha/pwn",
+        },
+    ];
+    if let Err(d) = install_archive("/mnt", &attack, 0) {
+        fail(name, d);
+        return;
+    }
+    if vfs::lookup_path("/mnt/pkgha").is_ok() {
+        fail(name, "the refused alias package left a partial tree");
+        return;
+    }
+    // The boot-time autorun file must not have been replaced by the payload.
+    if let Ok(node) = vfs::lookup_path("/mnt/etc/autorun") {
+        let size = node.size() as usize;
+        let mut buf = alloc::vec![0u8; size];
+        let n = node.read(0, &mut buf).unwrap_or(0);
+        if n == MARK.len() && buf.get(..n) == Some(MARK) {
+            fail(name, "the alias package wrote /mnt/etc/autorun");
+            return;
+        }
+    }
+
+    // 2) Alias of alias, with a member below the second alias.
+    let chain = [
+        TarMember::File {
+            path: "pkghc/pwn",
+            content: MARK,
+        },
+        TarMember::Symlink {
+            path: "pkghc/y",
+            target: "../etc",
+        },
+        TarMember::Hardlink {
+            path: "pkghc/h1",
+            target: "pkghc/y",
+        },
+        TarMember::Hardlink {
+            path: "pkghc/h2",
+            target: "pkghc/h1",
+        },
+        TarMember::Hardlink {
+            path: "pkghc/h2/leaf",
+            target: "pkghc/pwn",
+        },
+    ];
+    if let Err(d) = install_archive("/mnt", &chain, 0) {
+        fail(name, d);
+        return;
+    }
+    if vfs::lookup_path("/mnt/pkghc").is_ok() {
+        fail(name, "the refused alias chain left a partial tree");
+        return;
+    }
+
+    // 3) Positive control: a normal hard link to a regular file still installs,
+    //    producing one inode with two names.
+    let normal = [
+        TarMember::File {
+            path: "pkghb/usr/bin/real",
+            content: PAYLOAD,
+        },
+        TarMember::Hardlink {
+            path: "pkghb/usr/bin/hard",
+            target: "pkghb/usr/bin/real",
+        },
+    ];
+    if let Err(d) = install_archive("/mnt", &normal, 2) {
+        fail(name, d);
+        return;
+    }
+    if let Err(d) = verify_file("/mnt/pkghb/usr/bin/hard", PAYLOAD) {
+        fail(name, d);
+        return;
+    }
+    match (
+        vfs::lookup_path("/mnt/pkghb/usr/bin/real"),
+        vfs::lookup_path("/mnt/pkghb/usr/bin/hard"),
+    ) {
+        (Ok(a), Ok(b)) if a.nlink() == 2 && b.nlink() == 2 && a.fs_ino() == b.fs_ino() => {}
+        _ => {
+            fail(name, "a normal hard link did not share one inode");
+            return;
+        }
+    }
+
+    // 4) Round-1 behaviour stays: a pre-existing *relative, single-name* in-root
+    //    link is followed (the `/lib64 -> usr/lib64` placement rule).
+    let mnt = match vfs::lookup_path("/mnt") {
+        Ok(n) => n,
+        Err(_) => {
+            fail(name, "/mnt is not mounted");
+            return;
+        }
+    };
+    let pc = match mnt.create_dir("pkgpc") {
+        Ok(n) => n,
+        Err(_) => {
+            fail(
+                name,
+                "cannot create the pre-existing-link scratch directory",
+            );
+            return;
+        }
+    };
+    if pc.create_dir("real").is_err() || pc.create_symlink("link", b"real").is_err() {
+        fail(name, "cannot create the pre-existing link");
+        return;
+    }
+    let under_rel = [TarMember::File {
+        path: "pkgpc/link/leaf-ok",
+        content: PAYLOAD,
+    }];
+    if let Err(d) = install_archive("/mnt", &under_rel, 1) {
+        fail(name, d);
+        return;
+    }
+    if let Err(d) = verify_file("/mnt/pkgpc/real/leaf-ok", PAYLOAD) {
+        fail(name, d);
+        return;
+    }
+
+    // 5) An alias created by an earlier install (or a planner regression) is not
+    //    in this install's `own_links`; the `nlink > 1` backstop must still refuse
+    //    to traverse it. The alias creation itself targets a *pre-existing* link,
+    //    which the planner cannot know about, so it is allowed — as a second name
+    //    for the pre-existing link inode, with no member written through it here.
+    let pd = match mnt.create_dir("pkgpd") {
+        Ok(n) => n,
+        Err(_) => {
+            fail(name, "cannot create the alias scratch directory");
+            return;
+        }
+    };
+    if pd.create_dir("real").is_err() || pd.create_symlink("link", b"real").is_err() {
+        fail(name, "cannot create the alias-scratch link");
+        return;
+    }
+    let make_alias = [TarMember::Hardlink {
+        path: "pkgpd/h",
+        target: "pkgpd/link",
+    }];
+    if let Err(d) = install_archive("/mnt", &make_alias, 1) {
+        fail(name, d);
+        return;
+    }
+    let through_alias = [TarMember::File {
+        path: "pkgpd/h/leaf",
+        content: MARK,
+    }];
+    if let Err(d) = install_archive("/mnt", &through_alias, 0) {
+        fail(name, d);
+        return;
+    }
+    if vfs::lookup_path("/mnt/pkgpd/real/leaf").is_ok() {
+        fail(
+            name,
+            "a member was written through an unmarked hard-link alias",
+        );
+        return;
+    }
+
+    for p in scratch {
+        remove_leaf(p);
+    }
+    remove_leaf("/mnt/pkgpd");
     pass(name);
 }
 

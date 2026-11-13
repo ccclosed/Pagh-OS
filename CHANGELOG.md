@@ -11,6 +11,39 @@ tagged release (`2.18.13`, merged as PR #56). The full technical story of every 
 is the release-note block in `AGENTS.md`; the paragraphs here name the user-visible
 change and point there rather than duplicating it.
 
+## 2.22.5
+
+Round-2 audit finding F-r2-vfs-1 (high, verified): a hard-link alias of a package
+symlink still escaped the `.deb` installer's install root. `link(2)` does not
+follow the final component, so a tar hard-link member whose target is a symlink
+member is a *second name for the symlink inode*, invisible to the 2.22.1
+path-based `own_links` check. The audit's package (`./d/pwn`, `./d/y -> ../etc`,
+`./d/h` hardlink to `./d/y`, `./d/h/autorun` hardlink to `./d/pwn`) was accepted
+and wrote `/mnt/etc/autorun`, which the shell executes as root at the next boot.
+The pure planner now computes the hard-link/symlink equivalence closure up front
+(aliases of aliases and `..`-normalized targets included, archive order
+irrelevant) and refuses the alias member and every member below it, turning the
+non-empty refusal list into the same atomic whole-package
+`InstallError::UnsafePath` before any write. The effectful layer never creates a
+second name for an archive symlink and never traverses a symlink that has more
+than one hard link (the backstop for an unmarked alias left by an earlier
+install). Normal hard links to regular files and round-1 relative in-root links
+(`lib64 -> usr/lib64`) keep working, and the round-1 F-x86n-1 packages are still
+refused. Verified with the audit's `attack/r2/vfs/attack-alias.deb` (package
+refused as a whole, `/mnt/etc/autorun` absent, a second boot executes no
+payload), new `tar_links` host properties, the in-QEMU
+`install_hardlink_alias_confinement` selftest and the committed
+`tests/pkg/e2e_pkg_escape.py` harness; a normal `.deb` with a regular-file hard
+link still installs.
+
+Also fixed, found while producing the in-QEMU evidence: the `lx_selftest`
+feature build (not part of CI's six default-profile gates) had been broken since
+2.22.2 added `RunError::AccessDenied` — the six `RunError` matches in
+`src/selftest_lx.rs` lacked the new arm, so the LXSELFTEST harness could not be
+compiled. The arms now report the denial; the default build is unchanged.
+
+Full story: `AGENTS.md`, 2.22.5.
+
 ## 2.22.4
 
 Fork-COW frame ownership (round-2 attack audit F-r2-arch-1, critical, and

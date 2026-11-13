@@ -51,6 +51,21 @@
 //! unfollowed, as `link(2)` requires), so a hostile archive cannot hard-link a
 //! node from outside the root either.
 //!
+//! ## Hard-link aliases of symlinks (F-r2-vfs-1)
+//!
+//! `link(2)` does not follow the final component, so a hard link whose target is a
+//! symlink is a **second name for the link inode**. The round-2 audit used that to
+//! bypass both layers above (`./d/y -> ../etc`, `./d/h -> ./d/y`, then
+//! `./d/h/autorun -> ./d/pwn`): the planner knew only `d/y`, `d/h` looked like an
+//! ordinary hard link, and the member named `d/h/autorun` landed at
+//! `/mnt/etc/autorun`. The fix has two independent halves, matching the layers
+//! above: the pure planner treats every hard-link alias as a link (equivalence
+//! closure, so aliases of aliases and `..`-normalized targets are covered) and
+//! rejects the whole package before any write; the effectful layer never creates a
+//! second name for an archive symlink and never traverses a symlink that has more
+//! than one name — an alias that no path-based `own_links` entry marks, e.g. one
+//! left by an earlier install or a planner regression.
+//!
 //! ## No-space detection through the VFS boundary
 //!
 //! ext2 reports an exhausted block/inode bitmap as `FsError::OutOfSpace`, which the
@@ -68,7 +83,7 @@ use alloc::vec::Vec;
 
 use crate::vfs::{self, VfsError, VfsNode};
 
-use super::install::{plan_install, InstallOp};
+use super::install::{plan_install, InstallOp, UnsafeKind};
 use super::tar::TarEntry;
 
 /// Failure modes of the effectful ext2 install (design component 10).
@@ -140,10 +155,14 @@ pub fn install_data_tar(entries: &[TarEntry<'_>], root: &str) -> Result<usize, I
     // confusing state, and the archive has already proven it cannot be trusted.
     if let Some(m) = plan.unsafe_members.first() {
         let abs = join_abs(root, &m.path);
-        let reason = if m.is_hardlink_target {
-            "hard-link target descends through an archive symlink"
-        } else {
-            "member path descends through an archive symlink"
+        let reason = match m.kind {
+            UnsafeKind::MemberBelowSymlink => "member path descends through an archive symlink",
+            UnsafeKind::HardlinkTargetBelowSymlink => {
+                "hard-link target descends through an archive symlink"
+            }
+            UnsafeKind::HardlinkAliasesSymlink => {
+                "hard link aliases an archive symlink (second name for the link inode)"
+            }
         };
         return Err(unsafe_path_with_link(&abs, reason, &m.link));
     }
@@ -182,7 +201,7 @@ pub fn install_data_tar(entries: &[TarEntry<'_>], root: &str) -> Result<usize, I
                 installed += 1;
             }
             InstallOp::Hardlink { path, target } => {
-                match install_hardlink(root, path, target, &own_links) {
+                match install_hardlink(root, path, target, &mut own_links) {
                     Ok(()) => installed += 1,
                     // The target is not on the tree yet: a later member (or an
                     // earlier package) may still provide it.
@@ -205,7 +224,7 @@ pub fn install_data_tar(entries: &[TarEntry<'_>], root: &str) -> Result<usize, I
             let InstallOp::Hardlink { path, target } = op else {
                 continue;
             };
-            match install_hardlink(root, path, target, &own_links) {
+            match install_hardlink(root, path, target, &mut own_links) {
                 Ok(()) => {
                     installed += 1;
                     progressed = true;
@@ -282,11 +301,18 @@ fn install_symlink(
 
 /// Create `rel` as a hard link to the existing entry at `target` (a
 /// root-relative path from the archive).
+///
+/// `own_links` is `&mut`: a hard link whose target is a symlink (one this archive
+/// created, or a pre-existing one) makes `rel` a second name for that link inode,
+/// so `rel` is registered there exactly like a symlink member. Later members whose
+/// parent path runs through it are refused instead of being written wherever the
+/// link points (F-r2-vfs-1). An alias of an *archive-created* symlink is refused
+/// outright: creating it is the primitive the round-2 audit needed.
 fn install_hardlink(
     root: &str,
     rel: &str,
     target: &str,
-    own_links: &BTreeSet<String>,
+    own_links: &mut BTreeSet<String>,
 ) -> Result<(), HardlinkOutcome> {
     let abs = join_abs(root, rel);
     let target_abs = join_abs(root, target);
@@ -316,6 +342,15 @@ fn install_hardlink(
         );
         return Ok(());
     }
+    // F-r2-vfs-1 layer 2: an alias of a link this install created would be an
+    // unregistered second name for it. The pure planner refuses this package
+    // atomically; this check keeps the guarantee if that layer ever regresses.
+    if target_node.is_symlink() && own_links.contains(target) {
+        return Err(HardlinkOutcome::Failed(unsafe_path(
+            &abs,
+            "hard link to a symlink created by this archive",
+        )));
+    }
 
     let (dir, filename) = match resolve_parent(root, rel, &abs, own_links) {
         Ok(v) => v,
@@ -339,7 +374,16 @@ fn install_hardlink(
     }
 
     match dir.link(filename, &target_node) {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            // The new name is a second name for the link inode when the target is
+            // a symlink (a pre-existing one here: archive aliases were refused
+            // above/atomically). Register it so no later member is resolved
+            // through it (F-r2-vfs-1).
+            if target_node.is_symlink() {
+                own_links.insert(String::from(rel));
+            }
+            Ok(())
+        }
         Err(VfsError::IoError) => Err(HardlinkOutcome::Failed(no_space("link", &abs))),
         Err(e) => Err(HardlinkOutcome::Failed(vfs_err("link", &abs, e))),
     }
@@ -376,7 +420,9 @@ const INSTALL_MAX_EXPANDED_BYTES: usize = 4096;
 /// like any other component (so `..` inside a target cannot escape either).
 /// Absolute targets are refused outright, because the guest namespace maps them to
 /// install-root-relative paths — that mapping is exactly what the attack relied on.
-/// A link this same install created (`own_links`) is never followed at all.
+/// A link this same install created (`own_links`) is never followed at all, and
+/// neither is a symlink that has more than one hard link: it may be reached through
+/// an unmarked hard-link alias (F-r2-vfs-1).
 ///
 /// `follow_final` selects `true` for a parent directory (a member is placed
 /// inside it) and `false` for a hard-link target (`link(2)` does not follow the
@@ -460,6 +506,17 @@ fn resolve_confined(
             if own_links.contains(&link_rel) {
                 return Err(ResolveFailure::Unsafe(
                     "descends through a symlink created by this archive",
+                ));
+            }
+            // F-r2-vfs-1: `link(2)` created a second name for this link inode
+            // somewhere (`nlink > 1`). The path walked here may be that unmarked
+            // alias — from an earlier install, or from a planner regression — so a
+            // name-based `own_links` check alone cannot prove it is a link the
+            // archive legitimately created. Refuse to traverse any multiply-linked
+            // symlink; the archive's own aliases are refused before creation.
+            if node.nlink() > 1 {
+                return Err(ResolveFailure::Unsafe(
+                    "descends through a symlink with a hard-link alias",
                 ));
             }
             let target = match node.read_link() {

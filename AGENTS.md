@@ -242,14 +242,38 @@ the full model is in `BRANCHING.md`.
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.22.4** (the 2026-11-13 attack
-  audit batches: 2.22.0 closed the ring3-to-ring0 paths, 2.22.1 confined the
-  package installer, 2.22.2 hardened VFS/ext2, 2.22.3 closed the user-buffer
-  TOCTOU class, 2.22.4 closed the fork-COW frame-ownership use-after-free
-  found by the round-2 audit, on top of the console scrollback and the
-  shell/procfs batches; 2.18.13 carried the `connect(2)` reply-and-close fix,
-  the VT/console coordinate fix and the kernel-thread rows in `ps`; the tag
-  lands at the end of the batch).
+  be reflected here. **`main` currently reads 2.22.5** (round-2 attack-audit
+  hotfixes: 2.22.4 closed the fork-COW frame-ownership use-after-free
+  (F-r2-arch-1/2), 2.22.5 closes the package-installer hard-link alias bypass
+  (F-r2-vfs-1); on top of the 2026-11-13 attack audit batches: 2.22.0 closed
+  the ring3-to-ring0 paths, 2.22.1 confined the package installer, 2.22.2
+  hardened VFS/ext2, 2.22.3 closed the user-buffer TOCTOU class, on top of the
+  console scrollback and the shell/procfs batches; 2.18.13 carried the
+  `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
+  kernel-thread rows in `ps`; the tag lands at the end of the batch).
+  **2.22.5** = the round-2 package-installer confinement bypass is closed
+  (F-r2-vfs-1, high, verified). The 2.22.1 fix modelled only *symlink members*
+  as redirectors: `link(2)` does not follow the final component, so a tar
+  hard-link member whose target is an archive symlink creates a second name for
+  the **symlink inode** that no path-based check can see. The audit's package
+  (`./d/pwn`, `./d/y -> ../etc`, `./d/h` hardlink to `./d/y`,
+  `./d/h/autorun` hardlink to `./d/pwn`) was accepted and wrote
+  `/mnt/etc/autorun`, executed as root at the next boot. The pure planner now
+  computes the hard-link/symlink equivalence closure up front (aliases of
+  aliases, `..`-normalized targets, order-independent), refuses the alias member
+  with `UnsafeKind::HardlinkAliasesSymlink` and turns the non-empty refusal list
+  into the same atomic whole-package `InstallError::UnsafePath` before any
+  write; the effectful layer never creates a second name for an archive symlink
+  and never traverses a symlink with more than one hard link — the backstop for
+  an unmarked alias left by an earlier install or a planner regression. Normal
+  hard links to regular files and round-1 relative in-root links still work.
+  Evidence: the audit's `attack/r2/vfs/attack-alias.deb` is refused with no
+  `/mnt/etc/autorun` and the next boot executes no payload; the new
+  `tar_links` host properties (`plan_refuses_the_round2_hardlink_alias_package`
+  and the alias/`..`/chain boundaries), the in-QEMU
+  `install_hardlink_alias_confinement` selftest, and the committed live harness
+  `tests/pkg/e2e_pkg_escape.py`; round-1 `evil-autorun.deb`/`evil-symlink.deb`
+  and a normal `.deb` still behave as documented.
   **2.22.4** = fork-COW frame ownership is closed (round-2 audit F-r2-arch-1,
   critical, and F-r2-arch-2, high). `fork_user_space_cow` shares each leaf frame
   with `COW_BIT` and a PMM refcount, but only process exit honoured it:
@@ -366,7 +390,9 @@ the full model is in `BRANCHING.md`.
     (F-x86a-6, found in review) in 2.22.3; RISC-V kernel F-rv-1…3 in
     pagh-riscv 0.24.1, `ld-pagh`/`vsnprintf` F-rt-1…3 in pagh-libc 0.15.1, and
     the parser recursion F-rt-4 in pagh-python 0.9.1. `SECURITY.md` lists every
-    fix with its evidence; no finding from the audit is left silently open.
+    fix with its evidence; no finding from that audit is left silently open.
+    The round-2 audit's package-installer alias bypass (F-r2-vfs-1) is closed in
+    2.22.5 above, with `attack/r2/vfs/attack-alias.deb` as its reproducer.
   **2.22.1** = the package installer is confined to its install root. A `.deb`
   could ship a symlink member and then a member *below* it; the installer resolved
   later members' parents through the package's own link in the guest namespace,
