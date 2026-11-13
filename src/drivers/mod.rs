@@ -12,6 +12,7 @@ pub mod partition;
 pub mod pci;
 pub mod ps2_kbd;
 pub mod ps2_mouse;
+pub mod scrollback;
 pub mod serial;
 pub mod tty;
 pub mod usb_hid;

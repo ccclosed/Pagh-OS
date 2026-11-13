@@ -237,14 +237,23 @@ pub fn status_left() -> alloc::string::String {
 pub fn status_right(mouse: &crate::drivers::ps2_mouse::MouseState) -> alloc::string::String {
     let secs = crate::task::scheduler::ticks() / crate::arch::x86_64::apic::TICK_HZ;
     let s = snapshot();
+    // A scrolled-back console says so in the strip: without it there is no visible
+    // difference between "reading history" and "the shell has stopped printing".
+    let (view, history) = crate::drivers::framebuffer::scroll_state();
+    let scroll = if view > 0 {
+        alloc::format!("   scroll {}/{}", view, history)
+    } else {
+        alloc::string::String::new()
+    };
     if !s.status_mouse {
-        return alloc::format!("up {}s", secs);
+        return alloc::format!("up {}s{}", secs, scroll);
     }
     alloc::format!(
-        "up {}s   mouse({},{})",
+        "up {}s   mouse({},{}){}",
         secs,
         mouse.x / crate::drivers::framebuffer::CHAR_WIDTH,
-        mouse.y / crate::drivers::framebuffer::CHAR_HEIGHT
+        mouse.y / crate::drivers::framebuffer::CHAR_HEIGHT,
+        scroll
     )
 }
 

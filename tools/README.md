@@ -11,7 +11,7 @@
 | `host_tests.py` | Обёртка: определяет host triple через `rustc -vV`, запускает `cargo test --locked --target <host>` в `host-tests/` |
 | `toolchain.sh` | Guard для `build.sh`/`run.sh`: отказывается собирать ненайтовым (stable/дистрибутивным) `cargo` — тот падает с `-Zjson-target-spec` и не называет настоящую причину. `tools/build.py` его не требует |
 | `check_agents_md.py` | Гейт утверждений `AGENTS.md` против дерева (шесть гейтов, канонические entry points, версия/теги, release-notes) в обе стороны; `--probe` ломает каждый класс утверждений в scratch-копии и требует находку на каждую поломку; `--quiet` — только вердикт |
-| `e2e.py` | Кроссплатформенный (Linux/CI, без pwsh) in-guest E2E-драйвер: режимы `selftest`, `local-mirror`, `live-update`, `bigindex`, `shell`, `tcp-shot`, `smoke`; общие флаги `--features`/`--debug`/`--cpu`/`--disk`/`--nvme`/`--timeout`/`--settle`/`--expect`/`--keep-artifacts` |
+| `e2e.py` | Кроссплатформенный (Linux/CI, без pwsh) in-guest E2E-драйвер: режимы `selftest`, `local-mirror`, `live-update`, `bigindex`, `shell`, `tcp-shot`, `smoke`, `usb`, `scroll`; общие флаги `--features`/`--debug`/`--cpu`/`--disk`/`--nvme`/`--timeout`/`--settle`/`--expect`/`--keep-artifacts` |
 | `check_safety.py` | CI-гейт unsafe-политики: сканирует `src/security/`, `src/arch/x86_64/linux/mod.rs`, `src/memory/vmm.rs`, `src/net/tls.rs`, `src/pkg/apt.rs` — каждый `unsafe {` обязан иметь `SAFETY:`-коммент в предыдущих 6 строках, иначе exit 1 |
 | `worktrees.py` | Гигиена worktree по правилу AGENTS.md «после мержа PR ветку удаляют»: таблица всех worktree (state `merged`/`unique`/`dirty`/`detached`, ahead/unique по `git cherry`, число грязных путей), `--prune` (dry-run без `--yes`; не трогает грязные/уникальные/detached и «активные» — тронутые меньше `--min-idle-minutes`, по умолчанию 30), `--self-test` собирает временный репозиторий и проверяет классификатор и правила prune на нём) |
 | `gen_ca_bundle.py` | Генератор trust-anchor бандла TLS-верификатора: скачивает curl/Mozilla CA extract, выбирает корни по subject CN (ISRG Root X1/X2, GTS R1/R4), пишет детерминированный `src/net/ca_bundle.rs` (DER-массивы + метки); сгенерированный файл коммитится, перегенерация — только осознанно |
@@ -231,6 +231,22 @@ body=13332733 raw_in=… read_polls=… pending_polls=… bytes_per_s=…`
 (≈2 MB/s под QEMU/TCG). Если трансфер встанет, watchdog печатает
 `stage=stall … sock=state=… rx=…/… free=… adv_wnd=… wnd_update=…` — по этой
 строке видно, кто встал: сокет, транспорт или record-слой.
+
+### Приёмка скроллбека консоли (`scroll`)
+
+`python3 tools/e2e.py scroll` — boot, `help` до заполнения экрана, затем:
+
+- три щелчка колеса вверх через **QMP** `input-send-event` (HMP-монитор умеет
+  `sendkey`/`mouse_move`, но не колесо): гость должен напечатать
+  `[DIAG] console scroll wheel view=N` с N>0;
+- `PageUp`/`PageDown` — маркеры `[DIAG] console scroll pageup/pagedown`;
+- `Esc` (обычная клавиша) — `[DIAG] console scroll reset` и рабочая команда после;
+- два скриншота live/history обязаны побайтово различаться (скролл без перерисовки
+  кадра — провал, который модельные тесты не видят);
+- `wallpaper scanlines` + колесо + сброс: обои должны вернуться (внутри текстовой
+  сетки тоже), раунд-трип проверяется по пикселям скриншотов.
+
+Скриншоты остаются в `.cache/e2e_scroll_*.png`.
 
 ### Регрессия shell-команд 2.19.0 (`free`, `date`, текст, `ls -l`, `chmod`/`chown`)
 

@@ -1352,6 +1352,11 @@ pub(super) fn cmd_wallpaper(_ctx: &mut ShellCtx, args: &[&str]) {
         Some(name) => match Wallpaper::from_name(name) {
             Some(w) => {
                 theme::with(|s| s.wallpaper = w);
+                // `repaint` re-emits the grid, and the console's opaque/transparent
+                // knob is what decides whether that re-emit stamps its background
+                // over the picture. Without `apply` the knob still says "opaque"
+                // and every wallpaper was invisible inside the text grid.
+                theme::apply();
                 theme::repaint();
                 shell_println(&format!("wallpaper: {}", w.name()));
             }

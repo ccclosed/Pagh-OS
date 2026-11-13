@@ -534,6 +534,10 @@ pub fn shell_main() -> ! {
     let mut selection = selection::Selection::new();
     let mut clipboard = String::new();
     let mut prev_left = false;
+    // Last wheel counter seen, so a poll can turn the cumulative PS/2 counter
+    // into this pass's delta (the shell wakes on `mouse.seq`, which the wheel
+    // packet bumps like any other).
+    let mut last_wheel = crate::drivers::ps2_mouse::poll().wheel;
     let mut status_cache: Option<(alloc::string::String, alloc::string::String)> = None;
 
     loop {
@@ -549,6 +553,11 @@ pub fn shell_main() -> ! {
 
         // CWD-aware prompt, e.g. `pagh:/> ` (R5.1–R5.3).
         render::prompt(&path::cwd());
+        // Drop wheel packets generated while a command owned the keyboard/screen
+        // (`paint`, `nano`, a full-screen program): they were not meant for the
+        // console view, and replaying the accumulated delta here would scroll the
+        // fresh prompt.
+        last_wheel = crate::drivers::ps2_mouse::poll().wheel;
 
         // Fresh editor per prompt; `shown` tracks rendered input width.
         let mut editor = editor::LineEditor::new();
@@ -597,6 +606,22 @@ pub fn shell_main() -> ! {
             // mouse over an otherwise idle shell.
             crate::drivers::cursor::hide_deferred();
 
+            // Mouse wheel: one detent scrolls the console three text lines. The
+            // view is a repaint of the text region from the scrollback model, so
+            // the caret and any selection are dropped first — they describe the
+            // live grid and would otherwise paint a bar or a highlight into the
+            // middle of the history view.
+            let wheel_delta = mouse.wheel.wrapping_sub(last_wheel);
+            last_wheel = mouse.wheel;
+            if wheel_delta != 0 {
+                // PS/2 IntelliMouse reports "away from the user" as a negative
+                // delta; the console view treats positive as older text. Flip the
+                // sign once here so the convention stays in one place instead of
+                // every caller having to remember it.
+                let lines = -wheel_delta.clamp(-16, 16) * 3;
+                scroll_console(lines, "wheel", &mut caret, &mut selection);
+            }
+
             // Mouse selection: a press anchors, a drag extends, a release copies the
             // text to the clipboard. Cell coordinates divide the pointer's pixels by
             // the framebuffer's real cell size, and `Selection` clips anything left
@@ -605,6 +630,12 @@ pub fn shell_main() -> ! {
             let pressed = mouse.left && !prev_left;
             let released = !mouse.left && prev_left;
             prev_left = mouse.left;
+            // A click is input: leaving the user scrolled back while the live grid
+            // is what a drag would highlight would select invisible cells. Click
+            // means "back to the live screen", like every terminal emulator.
+            if pressed && console_scrolled() {
+                reset_console_view(&mut caret, &mut selection);
+            }
             if pressed || (mouse.left && selection.is_active()) {
                 let cell = caret::Cell {
                     col: mouse.x / crate::drivers::framebuffer::CHAR_WIDTH,
@@ -675,6 +706,14 @@ pub fn shell_main() -> ! {
                     None => continue,
                 };
 
+                // PageUp/PageDown are console-scroll keys; every other key is
+                // input, and input means the user is done reading history: return
+                // to the live screen before the key is applied, so typed text and
+                // the caret land on what is actually on screen.
+                let scroll_key = matches!(event, keys::KeyEvent::PageUp | keys::KeyEvent::PageDown);
+                if !scroll_key && console_scrolled() {
+                    reset_console_view(&mut caret, &mut selection);
+                }
                 match event {
                     // A visible selection is real input state, not decoration: typing
                     // or deleting replaces it, the way every text field behaves. The
@@ -802,10 +841,27 @@ pub fn shell_main() -> ! {
                             redraw_line(&editor, &mut shown, &mut caret);
                         }
                     }
-                    keys::KeyEvent::Ctrl(_)
-                    | keys::KeyEvent::Escape
-                    | keys::KeyEvent::PageUp
-                    | keys::KeyEvent::PageDown => {}
+                    keys::KeyEvent::Ctrl(_) | keys::KeyEvent::Escape => {}
+                    // Terminal paging: one screenful minus the overlap row, the
+                    // same step a wheel notch times three gives for a mouse.
+                    keys::KeyEvent::PageUp => {
+                        let rows = crate::drivers::framebuffer::console().text_grid().1;
+                        scroll_console(
+                            rows.saturating_sub(1).max(1) as i32,
+                            "pageup",
+                            &mut caret,
+                            &mut selection,
+                        );
+                    }
+                    keys::KeyEvent::PageDown => {
+                        let rows = crate::drivers::framebuffer::console().text_grid().1;
+                        scroll_console(
+                            -(rows.saturating_sub(1).max(1) as i32),
+                            "pagedown",
+                            &mut caret,
+                            &mut selection,
+                        );
+                    }
                     keys::KeyEvent::Enter => {
                         crate::kprintln!();
                         crate::fb_println!();
@@ -840,7 +896,11 @@ pub fn shell_main() -> ! {
             // scheduler's millisecond tick. The console is exactly at the end of
             // the buffer here (`redraw_line` leaves it there), so the cell is
             // found by walking back over the characters that follow the cursor.
-            if let Some(cell) = caret_cell(&editor) {
+            if console_scrolled() {
+                // The view repainted the text region from history; the live caret
+                // belongs to the live grid and must not be painted into the view.
+                caret.reset();
+            } else if let Some(cell) = caret_cell(&editor) {
                 // `Caret::place` is still called when the caret is switched off —
                 // with `on = false` — so it erases wherever it currently is instead
                 // of leaving a bar stranded on screen after the toggle.
@@ -929,6 +989,61 @@ fn caret_cell(editor: &editor::LineEditor) -> Option<caret::Cell> {
 /// Try to read a scancode from the keyboard.
 pub(super) fn try_read_scancode() -> Option<u8> {
     crate::drivers::get_char("keyboard").and_then(|kbd| kbd.read_char())
+}
+
+/// Whether the console is showing history instead of the live bottom.
+fn console_scrolled() -> bool {
+    crate::drivers::framebuffer::scroll_state().0 > 0
+}
+
+/// Scroll the console view by `delta` rows (positive = older) and announce it on
+/// the serial log.
+///
+/// The caret and the selection describe the *live* grid; a history view is painted
+/// from the scrollback model, so both are dropped before the repaint. The serial
+/// `[DIAG]` line is the E2E harness's proof that a wheel/key event really moved the
+/// view (and how far back it is), and it is deliberately serial-only: printing it
+/// through the console would add a line for every wheel notch.
+fn scroll_console(
+    delta: i32,
+    source: &str,
+    caret: &mut caret::Caret,
+    selection: &mut selection::Selection,
+) {
+    // Repaint first: it overwrites any caret bar or selection highlight painted
+    // over the text, and only then are their models dropped. Clearing them before
+    // a no-op scroll would forget the selection while leaving its pixels on screen.
+    if !crate::drivers::framebuffer::scroll_view(delta) {
+        return;
+    }
+    caret.reset();
+    selection.clear();
+    let (view, history) = crate::drivers::framebuffer::scroll_state();
+    let top = crate::drivers::framebuffer::scroll_top_text().unwrap_or_default();
+    crate::kprintln!(
+        "[DIAG] console scroll {} view={} history={} top=\"{}\"",
+        source,
+        view,
+        history,
+        top
+    );
+}
+
+/// Return the console to the live bottom (a click, Escape, or typing).
+///
+/// On a transparent console (wallpaper active) the history view painted opaque
+/// cells, so the wallpaper has to be put back before the live grid is drawn over
+/// it; the theme module owns that repaint.
+fn reset_console_view(caret: &mut caret::Caret, selection: &mut selection::Selection) {
+    caret.reset();
+    selection.clear();
+    if !crate::drivers::framebuffer::scroll_reset() {
+        return;
+    }
+    if theme::snapshot().wallpaper != theme::Wallpaper::None {
+        theme::repaint();
+    }
+    crate::kprintln!("[DIAG] console scroll reset");
 }
 
 /// The status bar's text for the current state, or `None` when it would repeat the

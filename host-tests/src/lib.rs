@@ -289,6 +289,13 @@ pub mod format_policy;
 #[path = "../../src/drivers/nvme_prp.rs"]
 pub mod nvme_prp;
 
+// Console scrollback: the ring of rows the framebuffer console has scrolled off,
+// plus the view-offset rules that map a screen row back to a history row. Pure
+// (no pixel, no lock), so the host tests drive the exact source the kernel
+// compiles; unit tests live in the module next to the rules they pin.
+#[path = "../../src/drivers/scrollback.rs"]
+pub mod scrollback;
+
 // `ext2::symlink` is the pure symlink-layout + hard-link accounting core of the
 // ext2 writer (issue #18, contract `EXT2-LINKS.md` §2/§3): which targets stay
 // inline in the inode's `i_block` (≤ 59 bytes) and which need a data block, how

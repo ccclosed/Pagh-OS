@@ -22,6 +22,11 @@ pub struct MouseState {
     pub left: bool,
     pub right: bool,
     pub middle: bool,
+    /// Accumulated vertical wheel delta in detents: positive is away from the
+    /// user (scroll up / older text). The counter is cumulative and wrapping, so
+    /// a consumer that polls at its own pace subtracts the previous value instead
+    /// of racing a consume-on-read flag. A plain 3-byte mouse never changes it.
+    pub wheel: i32,
     /// Monotonically increasing counter bumped on every processed packet, so
     /// consumers can cheaply detect "did anything change since last poll".
     pub seq: u64,
@@ -36,8 +41,11 @@ struct MouseInner {
     right: bool,
     middle: bool,
     seq: u64,
-    // Packet assembly.
-    packet: [u8; 3],
+    wheel: i32,
+    // Packet assembly. IntelliMouse wheel mode reports four bytes per packet
+    // (the fourth is the wheel axis); a plain mouse reports three.
+    packet: [u8; 4],
+    packet_len: usize,
     index: usize,
 }
 
@@ -50,7 +58,9 @@ static MOUSE: Spinlock<MouseInner> = Spinlock::new(MouseInner {
     right: false,
     middle: false,
     seq: 0,
-    packet: [0; 3],
+    wheel: 0,
+    packet: [0; 4],
+    packet_len: 3,
     index: 0,
 });
 
@@ -70,6 +80,7 @@ pub fn poll() -> MouseState {
         left: m.left,
         right: m.right,
         middle: m.middle,
+        wheel: m.wheel,
         seq: m.seq,
     }
 }
@@ -159,14 +170,52 @@ pub fn init(screen_w: usize, screen_h: usize) -> bool {
     write_cmd(0x60);
     write_data(config);
 
-    // Set defaults, then enable data reporting. Expect 0xFA acks.
+    // Set defaults, then negotiate the IntelliMouse wheel extension: the magic
+    // sample-rate sequence 200/100/80 followed by "get device id". A device that
+    // answers id 3 reports four-byte packets, the fourth byte being the wheel
+    // axis; anything else keeps the 3-byte packet the driver always had.
+    //
+    // This is the standard PS/2 tap into the wheel (the same one Linux's psmouse
+    // uses). Without it QEMU's mouse emits only 3-byte packets and wheel events
+    // are dropped by the emulation, so a wheel that "works sometimes" would be
+    // this negotiation failing, not the scroll code.
     let ack1 = mouse_write(0xF6);
+    let mut wheel = false;
+    if ack1 == 0xFA {
+        let magic_ok = [200u8, 100, 80]
+            .iter()
+            .all(|rate| mouse_write(0xF3) == 0xFA && mouse_write(*rate) == 0xFA);
+        if magic_ok {
+            let ack_id = mouse_write(0xF2);
+            let id = read_data();
+            wheel = ack_id == 0xFA && id == 0x03;
+        }
+    }
+    // Enable data reporting only after the id probe: the probe itself does not
+    // produce movement packets, and enabling first lets a wheel packet race the
+    // id response.
     let ack2 = mouse_write(0xF4);
 
     let ok = ack1 == 0xFA && ack2 == 0xFA;
     INITIALIZED.store(ok, core::sync::atomic::Ordering::Relaxed);
+    {
+        let mut m = MOUSE.lock();
+        m.packet_len = if wheel { 4 } else { 3 };
+        m.index = 0;
+    }
     if ok {
         crate::info!("[PS2MOUSE] mouse enabled ({}x{})", screen_w, screen_h);
+        // Serial-only: a boot-screen line for a diagnostics feature would push
+        // the console one row for every user, so the wheel report goes to the
+        // log stream the E2E harness reads.
+        crate::kprintln!(
+            "[PS2MOUSE] wheel: {}",
+            if wheel {
+                "IntelliMouse 4-byte packets (id 3)"
+            } else {
+                "not reported (3-byte packets)"
+            }
+        );
     } else {
         crate::warn!(
             "[PS2MOUSE] mouse not detected (acks {:#x}/{:#x})",
@@ -192,8 +241,8 @@ pub fn irq_handler() {
 /// state and `seq` semantics identical for both sources.
 pub fn inject_packet(packet: [u8; 3]) {
     let mut m = MOUSE.lock();
-    m.packet = packet;
-    m.index = 3;
+    m.packet = [packet[0], packet[1], packet[2], 0];
+    m.index = 0;
     decode_packet(&mut m);
 }
 
@@ -218,6 +267,18 @@ fn decode_packet(m: &mut MouseInner) {
     m.left = flags & 0x01 != 0;
     m.right = flags & 0x02 != 0;
     m.middle = flags & 0x04 != 0;
+    // IntelliMouse wheel: the fourth byte carries the vertical delta as a signed
+    // 4-bit value in its low nibble (the high nibble is button/sign state that
+    // this driver does not use). Sign-extend before accumulating.
+    if m.packet_len >= 4 {
+        let nibble = m.packet[3] & 0x0F;
+        let dz = if nibble & 0x08 != 0 {
+            nibble as i8 - 16
+        } else {
+            nibble as i8
+        };
+        m.wheel = m.wheel.wrapping_add(dz as i32);
+    }
     m.seq = m.seq.wrapping_add(1);
 }
 
@@ -235,7 +296,7 @@ fn decode_byte(byte: u8) {
     m.packet[idx] = byte;
     m.index += 1;
 
-    if m.index < 3 {
+    if m.index < m.packet_len {
         return;
     }
     m.index = 0;
