@@ -231,12 +231,63 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.22.1** (the package-installer
-  confinement batch from the 2026-11-13 attack audit, on top of the ring-3
-  isolation hardening, the console scrollback and the shell/procfs batches;
-  2.18.13 carried the `connect(2)` reply-and-close fix, the VT/console
-  coordinate fix and the kernel-thread rows in `ps`; the tag lands at the end of
-  the batch).
+  be reflected here. **`main` currently reads 2.22.2** (the VFS/ext2 hardening
+  batch from the 2026-11-13 attack audit, following the package-installer
+  confinement batch, the ring-3 isolation hardening, the console scrollback and
+  the shell/procfs batches; 2.18.13 carried the `connect(2)` reply-and-close
+  fix, the VT/console coordinate fix and the kernel-thread rows in `ps`; the tag
+  lands at the end of the batch).
+  **2.22.2** = the filesystem half of the attack-audit batch: crafted ext2
+  images and missing path-traversal permission checks. All five x86 VFS
+  findings are fixed, plus one allocation site found while fixing them:
+  * `read_symlink()` allocated `vec![0u8; i_size]` from the on-disk size: a
+    crafted `S_IFLNK` inode with `i_blocks = 8, i_size = 0xFFFFFFF0` made any
+    `lstat`/`readlink` of it ask for ~4 GiB and abort the kernel (F-x86v-1).
+    The target shape is now classified from the inode fields before any
+    allocation: fast only when `i_blocks == 0 && i_size <= 60`, slow only for a
+    real data-block link with `i_size <= BS` (one 4096-byte block, the ext2
+    limit), everything else `FsError::Corrupt`; an inline-shaped inode with an
+    oversized `i_size` is corrupt rather than read through the block map.
+  * the path walker required no permission on intermediate directories, so uid
+    1000 could `open`/`stat`/`readlink`/`chdir`/`statfs` a world-readable file
+    inside a root-owned `0700` directory (F-x86v-3). The pure link walker now
+    asks its `LinkTree` `may_search` before every lookup; the syscall adapter
+    answers with `Creds::may(..., Access::Execute)` of the effective ids
+    (`access(2)` with its real ids), including components spliced in from a
+    followed link target, and maps a denial to `EACCES`. `chdir(2)` also checks
+    search on the directory itself; `execve`'s image read uses the same checked
+    walk. `lstat`/`readlink` keep no-follow semantics and fail only on the same
+    traversal rules as Linux.
+  * `rename(2)` is a copy emulation and copied `i_size` bytes into one `Vec`:
+    a sparse file claiming ~4 GiB aborted the kernel (F-x86v-2). The copy is
+    capped at 64 MiB (larger sources report `ENOMEM`; a real dirent rename is
+    future work) and the buffer is reserved fallibly, so allocation failure is
+    an errno, not a panic.
+  * `unlink` decided fast/slow for a symlink from `is_fast(i_blocks, i_size)`,
+    so an `i_blocks = 0, i_size > 60` crafted link took the slow branch and
+    freed `i_block[0]` — the first four bytes of the target text — as a block
+    number (F-x86v-4). Deletion now decides from `i_blocks` alone
+    (`symlink::owns_data_block`): an inline link owns no block, a slow link owns
+    exactly the block in `i_block[0]`.
+  * `lookup`/`readdir`/`unlink` derived a directory's block count from
+    `i_size` without a bound, so a crafted directory `i_size = 0xFFFFF000`
+    made one lookup issue up to ~1M block reads (F-x86v-5). Directory sizes are
+    validated first: block-aligned and no larger than the filesystem's block
+    count, else `FsError::Corrupt`.
+  * found while fixing the batch: `read_file_all` (the `execve`/`PT_INTERP`
+    image reader) had the same unbounded `vec![0u8; i_size]`, reachable from
+    ring 3 by `execve`-ing a crafted huge file (F-x86v-6). Image size is capped
+    at 256 MiB and reserved fallibly; the exec walk is credential-checked too.
+  * host properties pin the pure rules (`target_shape`, `owns_data_block`,
+    `dir_blocks` and the walker's `may_search`), including the audit's exact
+    crafted inode values; the committed ring-3 PoC reproduces every find on the
+    stock 2.21.0 range and shows the safe result on 2.22.2 (the vulnerable
+    kernel panics or returns the protected contents, the fixed one returns
+    `ENOENT`/`EACCES`/`ENOMEM`/`ENOEXEC` and keeps running).
+  * still open from that audit (next batches, tracked in `SECURITY.md`): the
+    poll/select/futex user-buffer TOCTOU (F-x86a-4) and the RISC-V
+    userland-runtime findings (F-rt-1…4). The `.deb` symlink escape (F-x86n-1)
+    was fixed in 2.22.1. None of these are silently considered fixed.
   **2.22.1** = the package installer is confined to its install root. A `.deb`
   could ship a symlink member and then a member *below* it; the installer resolved
   later members' parents through the package's own link in the guest namespace,
@@ -299,11 +350,11 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
     `SUCCESS`/PCI-read, so the contrast is the same host, same PoCs, only the
     kernel differs. Host tests cover the flag mask and the user-range boundary.
   * Still open from that audit (next batches, tracked in `SECURITY.md`):
-    crafted-ext2 huge symlink sizes (F-x86v-1 / F-rv-1), missing
-    search-permission checks in `walk()` (F-x86v-3), the RISC-V
-    userland-runtime findings (F-rt-1…4), and the TOCTOU/static items
-    (the `.deb` symlink escape, F-x86n-1, is fixed in 2.22.1). They are not
-    silently considered fixed.
+    the RISC-V userland-runtime findings (F-rt-1…4) and the TOCTOU/static
+    items. The `.deb` symlink escape (F-x86n-1) is fixed in 2.22.1, and the
+    crafted-ext2 sizes (F-x86v-1), `walk()` search permissions (F-x86v-3) and
+    the static x86 VFS items (F-x86v-2/4/5, plus the F-x86v-6 found in that
+    batch) are fixed in 2.22.2. None of them are silently considered fixed.
   **2.21.0** = the console scrolls back. The framebuffer console used to hold
   exactly the rows that fit on screen, so anything printed above the view was
   gone. It now keeps a bounded ring of scrolled-off *rows* — characters plus the

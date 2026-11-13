@@ -2,6 +2,7 @@
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
 use crate::arch::x86_64::gdt;
+use crate::arch::x86_64::linux::cred::Access;
 use crate::arch::x86_64::linux::mem::VmRegionSet;
 use crate::memory::{pmm, vmm};
 use crate::task::compat::{self, CompatState};
@@ -303,6 +304,9 @@ pub enum RunError {
     /// The initial stack could not be built/mapped (encoder `TooLarge` or a
     /// mapping failure); the process is not started (R7.3).
     StackFailed,
+    /// A directory on the exec path is not searchable by the caller (POSIX
+    /// `x` permission; F-x86v-3).
+    AccessDenied,
 }
 
 /// Read the entire contents of an ext2 file reachable through the VFS at `path`.
@@ -313,13 +317,38 @@ pub enum RunError {
 fn read_file_all(path: &str) -> Result<Vec<u8>, RunError> {
     // Follow symbolic links (issue #18): a Debian image is usually reached
     // through one (`/usr/bin/python3` → `python3.11`, `/lib64/ld-linux…`).
-    let node = crate::vfs::lookup_path_walk(path, true).map_err(|_| RunError::NotFound)?;
+    //
+    // The walk is credential-checked: `execve(2)` must not reach an image
+    // through a directory the caller may not search (F-x86v-3; this path is
+    // kernel-internal for the boot selftests and `lxrun`, which run as root and
+    // therefore behave exactly as before).
+    let may_search = |node: &Arc<dyn crate::vfs::VfsNode>| {
+        compat::current_creds().may(node.mode(), node.owner(), Access::Execute)
+    };
+    let node = crate::vfs::lookup_path_walk_checked(path, true, &may_search).map_err(|e| {
+        if e == crate::vfs::link_walk::WalkError::AccessDenied {
+            RunError::AccessDenied
+        } else {
+            RunError::NotFound
+        }
+    })?;
     if node.is_directory() {
         return Err(RunError::NotFound);
     }
 
+    // `i_size` is image-controlled: an attacker can mount a file that claims
+    // ~4 GiB while owning no data block, so `vec![0u8; size]` here was another
+    // allocation-abort site (same class as F-x86v-1/F-x86v-2). Cap the image
+    // size and reserve fallibly; a real userland ELF is a few MiB.
+    const MAX_EXEC_IMAGE: usize = 256 * 1024 * 1024;
     let size = node.size() as usize;
-    let mut data = alloc::vec![0u8; size];
+    if size > MAX_EXEC_IMAGE {
+        return Err(RunError::LoadFailed("ELF: image too large"));
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(size)
+        .map_err(|_| RunError::LoadFailed("ELF: image too large"))?;
+    data.resize(size, 0u8);
     let mut off: usize = 0;
     while off < size {
         match node.read(off as u64, &mut data[off..]) {

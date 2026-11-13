@@ -6,9 +6,10 @@ pagh is an educational kernel, not a production operating system.
 
 pagh aims at **kernel integrity** (ring 3 cannot read or write kernel memory,
 execute writable memory, or touch device MMIO — paging is supposed to enforce it).
-That boundary was **violated in 2.21.0** and the three demonstrated ring3-to-ring0
-paths were closed in 2.22.0 (see "Attack audit" below); the remaining audit findings
-are listed there and are not claimed fixed. pagh gives you **package
+That boundary was **violated in 2.21.0**: the three demonstrated ring3-to-ring0
+paths were closed in 2.22.0 and the filesystem findings in 2.22.2 (see "Attack
+audit" below); the remaining audit findings are listed there and are not claimed
+fixed. pagh gives you **package
 authenticity** (the TLS/OpenPGP/digest chain above refuses a mirror that cannot prove
 what it served), and a **filesystem permission model between processes** (per-process
 `uid`/`gid`/`euid`/`egid`/`suid`/`sgid`, POSIX owner/group/other checks on `open`,
@@ -106,19 +107,44 @@ succeed on stock 2.21.0):
   crafted `.deb` refused with the offending path named, `/mnt/etc/autorun`
   absent, a normal `.deb` still installs).
 
+**Fixed in 2.22.2** (the x86 VFS/ext2 batch; each reproduced on
+the stock 2.21.0 range and re-run against the fixed kernel):
+
+* **F-x86v-1 (medium, verified).** Crafted ext2 symlink inodes with a huge
+  `i_size` made `read_symlink()` allocate `vec![0; i_size]` (4 GiB) →
+  allocation panic, machine dead. The target shape is now classified from the
+  inode fields before allocation: fast only for a genuinely inline target
+  (`i_blocks == 0`, ≤ 60 bytes), slow only for a one-block data link
+  (≤ 4096 bytes), everything else `FsError::Corrupt`.
+* **F-x86v-3 (medium, verified).** The path walker required no search (`x`)
+  permission on intermediate directories, so uid 1000 could read a 0644 file
+  inside a root-owned 0700 directory. The pure link walker now asks
+  `may_search` before every lookup; the syscall layer answers with
+  `Creds::may(..., Access::Execute)` of the effective ids (`access(2)` with its
+  real ids), including components spliced in from a followed link target, and
+  maps a denial to `EACCES`. `chdir(2)` also needs search on the target
+  directory itself, and `execve`'s image read uses the checked walk.
+* **F-x86v-2 (static).** `rename`'s copy emulation allocated the source
+  `i_size` in one `Vec`; a sparse ~4 GiB file aborted the kernel. The copy is
+  capped at 64 MiB (`ENOMEM` above) and reserved fallibly.
+* **F-x86v-4 (static).** Fast/slow symlink confusion on `unlink`: an
+  `i_blocks == 0, i_size > 60` inode took the slow branch and freed its target
+  text bytes as a block number. Deletion now decides from `i_blocks` alone;
+  the read path reports that shape as corrupt.
+* **F-x86v-5 (static).** Crafted directory `i_size` made one lookup/readdir
+  scan up to ~1M blocks (kernel stall). Directory sizes are validated
+  (block-aligned, not larger than the filesystem) before the loop.
+* **F-x86v-6 (found while fixing the batch).** The `execve`/`PT_INTERP` image
+  reader had the same unbounded `i_size` allocation and an unchecked exec
+  walk. Image size is capped at 256 MiB with a fallible reserve, and the exec
+  path is credential-checked.
+
 **Still open from the same audit** (no claim that they are fixed; next batches):
 
-* **F-x86v-1 / F-rv-1 (medium, verified).** Crafted ext2 symlink inodes with a
-  huge `i_size` make `read_symlink()` allocate `vec![0; i_size]` (4 GiB) →
-  allocation panic, machine dead. Fix: bound symlink sizes (fast inline; slow
-  ≤ one block) and report `Corrupt`.
-* **F-x86v-3 (medium, verified).** The path walker does not require search
-  (`x`) permission on intermediate directories, so uid 1000 can read a 0644 file
-  inside a root-owned 0700 directory. Fix: `Access::Execute` on every component.
-* **F-x86a-4 / F-x86v-2/4/5 / F-rv-2/3 (static).** TOCTOU on user buffers that
-  are validated once and then used across a `yield`; `rename` copying a sparse
-  `i_size`; fast/slow symlink confusion; RISC-V W^X flag merge and `mprotect`
-  root confusion. To be reproduced, then fixed.
+* **F-x86a-4 / F-rv-1/2/3 (static; x86 TOCTOU and RISC-V kernel).** TOCTOU on
+  user buffers that are validated once and then used across a `yield`; RISC-V
+  symlink-size bounds, W^X flag merge and `mprotect` root confusion. To be
+  reproduced, then fixed.
 * **F-rt-1…4 (RISC-V userland runtime, high/medium/low, verified).** `ld-pagh`
   symbol/`PT_DYNAMIC` bounds (arbitrary write / OOB read), `pagh-libc`
   `vsnprintf` precision overflow (stack smash), `pagh-python` parser recursion

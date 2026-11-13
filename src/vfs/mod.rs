@@ -573,6 +573,25 @@ pub fn lookup_path_walk(
     path: &str,
     follow_final: bool,
 ) -> Result<Arc<dyn VfsNode>, link_walk::WalkError> {
+    lookup_path_walk_checked(path, follow_final, &|_| true)
+}
+
+/// Like [`lookup_path_walk`], but consults `may_search` before every directory
+/// lookup: the syscall layer passes the calling process's effective
+/// credentials, which is what enforces POSIX search (`x`) permission on
+/// **every** traversed directory, including directories reached through a
+/// followed symlink (F-x86v-3).
+///
+/// The VFS itself stays credential-free — `may_search` is a caller-supplied
+/// predicate over node metadata (`mode`/`owner`), exactly like the other
+/// syscall-boundary permission checks. Kernel-internal callers (boot
+/// provisioning, the package installer, `lxrun`) keep using the unchecked
+/// [`lookup_path_walk`].
+pub fn lookup_path_walk_checked(
+    path: &str,
+    follow_final: bool,
+    may_search: &dyn Fn(&Arc<dyn VfsNode>) -> bool,
+) -> Result<Arc<dyn VfsNode>, link_walk::WalkError> {
     if !path.starts_with('/') {
         return Err(link_walk::WalkError::NotFound);
     }
@@ -585,6 +604,7 @@ pub fn lookup_path_walk(
     let mut nodes = WalkNodes {
         nodes: alloc::vec![Arc::clone(&root)],
         root: 0,
+        may_search,
     };
     let id = link_walk::resolve(&mut nodes, path, follow_final)?;
     nodes
@@ -595,12 +615,14 @@ pub fn lookup_path_walk(
 }
 
 /// `Arc<dyn VfsNode>` interner behind [`lookup_path_walk`].
-struct WalkNodes {
+struct WalkNodes<'a> {
     nodes: alloc::vec::Vec<Arc<dyn VfsNode>>,
     root: usize,
+    /// Credential decision for a directory the walk is about to search.
+    may_search: &'a dyn Fn(&Arc<dyn VfsNode>) -> bool,
 }
 
-impl WalkNodes {
+impl WalkNodes<'_> {
     fn intern(&mut self, node: Arc<dyn VfsNode>) -> usize {
         for (i, existing) in self.nodes.iter().enumerate() {
             if Arc::ptr_eq(existing, &node) {
@@ -612,9 +634,17 @@ impl WalkNodes {
     }
 }
 
-impl link_walk::LinkTree for WalkNodes {
+impl link_walk::LinkTree for WalkNodes<'_> {
     fn root(&self) -> usize {
         self.root
+    }
+
+    fn may_search(&self, id: usize) -> bool {
+        match self.nodes.get(id) {
+            Some(node) => (self.may_search)(node),
+            // An id the adapter never interned cannot be searched; fail closed.
+            None => false,
+        }
     }
 
     fn lookup(&mut self, id: usize, name: &str) -> Option<usize> {

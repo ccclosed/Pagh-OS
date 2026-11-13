@@ -50,3 +50,58 @@ The vulnerable side is the same commands with the **unmodified** range (no
 These four findings were the 2.22.0 batch. The audit's other items (package
 symlink escape, crafted-ext2 sizes, `walk()` search permissions, TOCTOU, RISC-V
 runtime) are listed in `SECURITY.md` and do not have a committed PoC here yet.
+
+## VFS/ext2 regressions (2.22.2) — the crafted-ext2 / `walk()` items above
+
+The x86 VFS/ext2 batch from the same audit (crafted ext2 size fields, missing
+path-traversal permission checks, `rename`'s sparse copy, fast/slow symlink
+confusion) now has committed PoCs too. `poc/x86vfs_poc.c` is a raw-syscall ELF
+that drops to uid 1000 and exercises one selector per finding;
+`poc/x86vfs_craft.py` builds the crafted image by patching the audit's exact
+inode values into a copy of the range's base disk (`debugfs` + raw inode
+surgery, no kernel code involved):
+
+```sh
+RANGE=/home/oleg/Projects/pagh-os/attack/range
+WORK=/home/oleg/vfs-evidence
+python3 tools/security/poc/x86vfs_craft.py --base "$RANGE/base-disk.img" --out "$WORK/vfs.img"
+gcc -static -O2 -nostdlib -no-pie -fno-builtin -e _start \
+    -o "$WORK/x86vfs_poc" tools/security/poc/x86vfs_poc.c
+
+# fixed kernel: private range copy with the built 2.22.2 kernel swapped in
+cp -a "$RANGE" "$WORK/range-fixed"
+cp target/x86_64-unknown-none/release/pagh.elf "$WORK/range-fixed/esp/pagh.elf"
+cd "$WORK/range-fixed"
+for sel in 1 2 3 4 5 6 7 8 9; do
+  printf '%s' "$sel" > "$WORK/sel"
+  ./run.sh --timeout 120 --disk "$WORK/vfs.img" --inject "$WORK/sel:/sel" \
+      --expect 'POC-done' "$WORK/x86vfs_poc"
+done
+```
+
+The vulnerable contrast is the same loop on an unmodified range copy (stock
+2.21.0 kernel, sha256 `0bf8485f…62ffc5a`), with `--expect` set to the marker the
+vulnerable side is expected to print instead of `POC-done`.
+
+| sel | finding | 2.21.0 (stock range) | 2.22.2 (fixed) |
+|---|---|---|---|
+| 1 | F-x86v-1: `lstat` crafted symlink `i_blocks=8, i_size=0xFFFFFFF0` | `[PANIC] … memory allocation of 4294967280 bytes failed` (machine dead) | `POC:newfstatat-noFollow rc=0`, `T1: st_size=0`, `POC-done` |
+| 2 | F-x86v-1: `readlink` the same inode | same allocation panic | `POC:readlink rc=-2` (ENOENT) |
+| 3 | F-x86v-2: `rename` of a file claiming ~4 GiB | `[PANIC] … memory allocation of 4294963200 bytes failed` | `POC:rename-huge rc=-12` (ENOMEM) |
+| 4 | F-x86v-3: uid 1000 opens `/rootdir/secret` (0644 inside root-owned 0700) | `T4: content=ROOT-SECRET-42` (bypass) | `POC:open-rootdir-secret rc=-13` (EACCES) |
+| 5 | F-x86v-4: `unlink` a fast/slow-confused symlink whose `i_block[0]` is a live block; statfs free-block delta | `delta=1` — the live block was freed | `delta=0`, `POC:unlink-evil4 rc=0` |
+| 6 | F-x86v-5: lookup inside a directory claiming `i_size=0xFFFFF000` | still inside the block scan after the 20 s timeout: `T6: open` printed, no `POC-done`, no panic (a kernel stall — the serial log simply stops); fixed returns immediately | `POC:open-in-bigdir rc=-2` (ENOENT) + `POC-done`, full boot+autorun 17 s |
+| 7 | F-x86v-6 (found in this batch): `execve` a crafted regular file claiming ~4 GiB | `[PANIC] … memory allocation of 4294967280 bytes failed` | `POC:execve-bigfile rc=-8` (ENOEXEC) |
+| 8 | sanity: valid fast symlink → lstat / readlink / open-through | `st_size=6`, `target=target`, content `TARGET-CONTENT` | same |
+| 9 | sanity: create/write/rename/read in `/w` as uid 1000 | works (`rc=0`, content read back) | same |
+
+Selectors 8–9 are the negative control: the fixes do not break normal
+symlink/rename/traversal behaviour, and every fixed run ends with the shell
+prompt after `POC-done` (the guest program returned). The 2.21.0 panic runs end
+in `[PANIC]` with the machine dead (`panic=abort`), which is the vulnerability.
+
+Host-side regressions (`python3 tools/host_tests.py`, CI): the audit's exact
+crafted inode values are pinned by
+`ext2_links::{crafted_symlink_shape_is_bounded, audit_crafted_symlink_inodes_are_corrupt_not_allocations}`,
+by `ext2_bounds::*`, and by
+`link_walk_paths::{traversal_requires_search_permission_on_each_directory, search_permission_follows_spliced_link_targets, final_directory_name_needs_only_the_parent_search_bit}`.

@@ -11,6 +11,47 @@ tagged release (`2.18.13`, merged as PR #56). The full technical story of every 
 is the release-note block in `AGENTS.md`; the paragraphs here name the user-visible
 change and point there rather than duplicating it.
 
+## 2.22.2
+
+The filesystem half of the 2026-11-13 attack-audit batch: crafted ext2 images
+and missing path-traversal permission checks. All five x86 VFS findings are
+fixed, plus one allocation site of the same class found while fixing them.
+
+* Crafted ext2 symlink inodes no longer drive kernel allocations: the target
+  shape is classified from `i_blocks`/`i_size` before anything is allocated —
+  fast only when the target is genuinely inline (≤ 60 bytes, `i_blocks == 0`),
+  slow only for a one-block data link (≤ 4096 bytes), everything else
+  `FsError::Corrupt` (F-x86v-1: `lstat`/`readlink` used to request ~4 GiB and
+  abort the kernel).
+* Path traversal now requires search (`x`) permission on every intermediate
+  directory, checked through the pure link walker's `may_search` hook with the
+  process's effective credentials (`access(2)` uses its real ids), including
+  directories reached through a followed symlink; denial is `EACCES`, and
+  `chdir(2)` additionally needs search on the target directory itself
+  (F-x86v-3: uid 1000 could read a 0644 file inside a root-owned 0700
+  directory). `lstat`/`readlink` keep no-follow semantics.
+* `rename(2)`'s copy emulation is bounded (64 MiB, `ENOMEM` above it) and
+  reserves fallibly, so a sparse file claiming ~4 GiB no longer aborts the
+  kernel (F-x86v-2).
+* `unlink` decides fast/slow for a symlink from `i_blocks` alone, so a crafted
+  `i_blocks == 0, i_size > 60` inode can no longer free the block number
+  spelled by its target text (F-x86v-4); the read path treats that shape as
+  corrupt rather than as a block map.
+* Directory block counts are validated (`i_size` block-aligned and not larger
+  than the filesystem) before any lookup/readdir/unlink scan, closing the
+  ~1M-block crafted-directory stall (F-x86v-5).
+* Same class, found in the batch: the `execve`/`PT_INTERP` image reader had an
+  unbounded `i_size` allocation and bypassed traversal checks — image size is
+  now capped at 256 MiB with a fallible reserve, and the exec path is
+  credential-checked (F-x86v-6).
+
+Host properties pin the pure rules (with the audit's exact crafted values) and
+the committed ring-3 PoC reproduces every finding on the stock 2.21.0 range
+(panics / protected contents / block-count change) while 2.22.2 returns
+`ENOENT`/`EACCES`/`ENOMEM`/`ENOEXEC` and stays alive. Remaining audit findings
+(the user-buffer TOCTOU and RISC-V runtime items) are listed in
+`SECURITY.md` and land in follow-up batches. Full story: `AGENTS.md`, 2.22.2.
+
 ## 2.22.1
 
 Package installer confined to its root (F-x86n-1, high, verified). A `.deb` could

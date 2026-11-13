@@ -85,6 +85,7 @@ All checks live in `src/arch/x86_64/linux/`; the VFS remains credential-free.
 
 | operation | rule | errno |
 |---|---|---|
+| path traversal (every handler that resolves a path) | search (`x`) on every intermediate directory, effective ids (`access(2)` uses its real ids); components spliced in from a followed symlink target are checked too | `EACCES` |
 | `open`/`openat` existing node | read for `O_RDONLY`; write for `O_WRONLY`/`O_RDWR`; both for `O_RDWR`; write additionally for `O_TRUNC` (checked before truncation) | `EACCES` |
 | `open`/`openat` `O_CREAT` | write **and** execute on the parent directory | `EACCES` |
 | `execve` | execute on the target; root still needs one x bit | `EACCES` |
@@ -94,8 +95,22 @@ All checks live in `src/arch/x86_64/linux/`; the VFS remains credential-free.
 | `chown`/`fchown` | root only; `(uid_t)-1` keeps the current id | `EPERM` |
 | `kill` | sender euid is root, or equals the target's real or effective uid; a group/broadcast send delivers to the permitted subset | `EPERM` if none permitted |
 | `tgkill` | same rule for the addressed thread | `EPERM` |
-| `access` | the real-id variant of the `may` matrix (`R_OK`/`W_OK`/`X_OK`; `F_OK` is existence); follows symlinks | `EACCES` |
+| `access` | the real-id variant of the `may` matrix (`R_OK`/`W_OK`/`X_OK`; `F_OK` is existence); follows symlinks; the traversal check uses the same real ids | `EACCES` |
+| `chdir` | search (`x`) on the target directory itself as well as on every intermediate one | `EACCES` |
 | `stat`/`lstat`/`fstat` | reports the inode's real permission bits, type and `st_uid`/`st_gid` (the per-process override is only for nodes that cannot store metadata) | — |
+
+Directory-search permission is enforced inside the **pure link walker**
+(`vfs::link_walk`): before every name lookup the walker asks its `LinkTree`
+adapter `may_search`, and the syscall-layer adapter (`io_sys::walk_as`) answers
+with `Creds::may(node.mode(), node.owner(), Access::Execute)` for the effective
+ids. This covers every component a syscall path passes through — including the
+components a followed symbolic link splices into the walk, which a prefix check
+over the written path would miss — while the final component's own permissions
+stay the syscall's business (`open` needs read/write, `stat` needs none).
+`lstat`/`readlink` keep their no-follow semantics: search is required on the
+directories they pass through, but not on the link itself. The VFS still holds
+no credentials; `may_search` is a caller-supplied predicate over the metadata
+the VFS already exposes, exactly like the other boundary checks on this page.
 
 `chmod` writes the ext2 inode and also records the historical per-process stat override;
 `stat` prefers that override (it is what keeps synthetic nodes coherent) and otherwise

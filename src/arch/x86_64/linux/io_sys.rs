@@ -967,11 +967,26 @@ fn resolve_path(path: &str) -> String {
 /// lives in the host-property-tested `vfs::link_walk`; this is only the
 /// `WalkError` → `Errno` mapping.
 fn walk(abs: &str, follow_final: bool) -> Result<Arc<dyn VfsNode>, Errno> {
-    match vfs::lookup_path_walk(abs, follow_final) {
+    walk_as(abs, follow_final, current_creds())
+}
+
+/// [`walk`] with explicit credentials.
+///
+/// The linker walker asks a credential predicate before looking a name up in a
+/// directory, so this is where POSIX directory-search (`x`) permission is
+/// enforced on **every** intermediate component — not just on the final node
+/// (F-x86v-3: uid 1000 read a 0644 file inside a root-owned 0700 directory).
+/// `access(2)` passes its real-id credential set; every other syscall uses the
+/// effective ids.
+fn walk_as(abs: &str, follow_final: bool, creds: Creds) -> Result<Arc<dyn VfsNode>, Errno> {
+    let may_search =
+        |node: &Arc<dyn VfsNode>| creds.may(node.mode(), node.owner(), Access::Execute);
+    match vfs::lookup_path_walk_checked(abs, follow_final, &may_search) {
         Ok(node) => Ok(node),
         Err(vfs::link_walk::WalkError::NotFound) => Err(Errno::ENOENT),
         Err(vfs::link_walk::WalkError::NotDir) => Err(Errno::ENOTDIR),
         Err(vfs::link_walk::WalkError::TooLong) => Err(Errno::ENAMETOOLONG),
+        Err(vfs::link_walk::WalkError::AccessDenied) => Err(Errno::EACCES),
         Err(vfs::link_walk::WalkError::TooManyLinks) => {
             crate::warn!(
                 "[linux] symlink budget {} exhausted at '{}': ELOOP",
@@ -1976,18 +1991,20 @@ fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
 pub fn sys_access(path: u64, mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
-    // `access(2)` follows symlinks (a dangling link is ENOENT).
-    let node = walk(&abs, true)?;
     if mode & !0o7 != 0 {
         return Err(Errno::EINVAL);
     }
     // POSIX: access(2) checks the REAL ids (not the effective ones); the
     // root bypass still applies, but a setuid-style elevation cannot be used
-    // to probe rights the process would not have after dropping back.
+    // to probe rights the process would not have after dropping back. That
+    // includes directory-search permission on the traversal, which is why the
+    // walk takes the real ids too, not just the final permission check.
     let creds = current_creds();
     let real = Creds::new(
         creds.uid, creds.gid, creds.uid, creds.gid, creds.uid, creds.gid,
     );
+    // `access(2)` follows symlinks (a dangling link is ENOENT).
+    let node = walk_as(&abs, true, real)?;
     let owner = node.owner();
     let file_mode = node.mode();
     let wanted = [
@@ -2057,7 +2074,10 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
     if oldabs == newabs {
         return Ok(0);
     }
-    let node = vfs::lookup_path(oldabs).map_err(|_| Errno::ENOENT)?;
+    // The source is resolved by the credential-checked walker with the final
+    // component NOT followed (rename acts on the link itself): traversal needs
+    // `x` on every parent, exactly like the destination side below.
+    let node = walk(oldabs, false)?;
     if node.is_directory() {
         crate::warn!(
             "[linux] rename: directory rename not supported: {} -> {}",
@@ -2095,8 +2115,29 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
     let odir = walk(oparent, true)?;
     check_dir_mutation(&odir)?;
     // Read the whole source file.
-    let size = node.size() as usize;
+    //
+    // `i_size` is image-controlled and may be a sparse ~4 GiB claim backed by a
+    // handful of blocks, so this copy is bounded and fallible (F-x86v-2):
+    // `data.resize(i_size, 0)` used to allocate the claimed size in one go and
+    // abort the kernel, then walk it block by block. A file above the cap is
+    // refused with ENOMEM (rename is a copy emulation; a real ext2 dirent
+    // rename — which is O(1) — is not implemented).
+    const RENAME_COPY_MAX: u64 = 64 * 1024 * 1024;
+    let size = node.size();
+    if size > RENAME_COPY_MAX {
+        crate::warn!(
+            "[linux] rename: source too large to copy ({} bytes): {} -> {}",
+            size,
+            oldabs,
+            newabs
+        );
+        return Err(Errno::ENOMEM);
+    }
+    let size = size as usize;
     let mut data = ::alloc::vec::Vec::new();
+    // `try_reserve` refuses instead of aborting when the allocator cannot serve
+    // the request — the same rule `ramfs` already follows for writes.
+    data.try_reserve_exact(size).map_err(|_| Errno::ENOMEM)?;
     data.resize(size, 0u8);
     let mut off = 0usize;
     while off < size {
@@ -2178,7 +2219,9 @@ pub fn sys_mkdir(path: u64, mode: u64) -> Result<u64, Errno> {
     if trimmed.is_empty() {
         return Err(Errno::EEXIST); // "/" always exists
     }
-    if vfs::lookup_path(trimmed).is_ok() {
+    // Probe through the credential-checked walker (not the raw VFS lookup) so a
+    // missing `x` on an ancestor is EACCES rather than a create attempt.
+    if walk(trimmed, false).is_ok() {
         return Err(Errno::EEXIST);
     }
     let (parent, name) = match trimmed.rfind('/') {
@@ -2222,7 +2265,7 @@ pub fn sys_unlink(path: u64) -> Result<u64, Errno> {
     if trimmed.is_empty() {
         return Err(Errno::EISDIR); // cannot unlink "/"
     }
-    let node = vfs::lookup_path(trimmed).map_err(|_| Errno::ENOENT)?;
+    let node = walk(trimmed, false)?;
     if node.is_directory() {
         return Err(Errno::EISDIR);
     }
@@ -2250,7 +2293,7 @@ pub fn sys_rmdir(path: u64) -> Result<u64, Errno> {
     if trimmed.is_empty() {
         return Err(Errno::EINVAL); // cannot remove "/"
     }
-    let node = vfs::lookup_path(trimmed).map_err(|_| Errno::ENOENT)?;
+    let node = walk(trimmed, false)?;
     if !node.is_directory() {
         return Err(Errno::ENOTDIR);
     }
@@ -2331,7 +2374,6 @@ pub fn sys_faccessat(dirfd: u64, path: u64, mode: u64, flags: u64) -> Result<u64
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-    let node = walk(&abs, follow)?;
     let creds = current_creds();
     let check = if flags & AT_EACCESS != 0 {
         creds
@@ -2340,6 +2382,7 @@ pub fn sys_faccessat(dirfd: u64, path: u64, mode: u64, flags: u64) -> Result<u64
             creds.uid, creds.gid, creds.uid, creds.gid, creds.uid, creds.gid,
         )
     };
+    let node = walk_as(&abs, follow, check)?;
     let owner = node.owner();
     let file_mode = node.mode();
     for (bit, access) in [
@@ -2537,6 +2580,10 @@ pub fn sys_chdir(path: u64) -> Result<u64, Errno> {
     if !node.is_directory() {
         return Err(Errno::ENOTDIR);
     }
+    // The walk checks search permission on the parents; `chdir(2)` additionally
+    // needs `x` on the directory itself (POSIX), else a process could make a
+    // non-searchable directory its cwd and then read relative entries.
+    check_node_access(&node, Access::Execute)?;
     compat::with_current_compat(|cs| cs.cwd = abs).ok_or(Errno::EBADF)?;
     Ok(0)
 }

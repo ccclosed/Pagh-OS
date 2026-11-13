@@ -144,6 +144,17 @@ xattr-фича выключена и `i_file_acl` всегда 0. Чтение f
 создают). Slow — обычный `read_file`-путь на `i_size` байт; отсутствующий первый блок →
 `FsError::Corrupt`.
 
+**REQ-L2a (граница из аудита 2.22.2, F-x86v-1/F-x86v-4).** `i_size` — поле из
+образа, ему нельзя верить до проверки формы. Slow-цель ограничена **одним блоком**
+(`i_size <= BS = 4096`, предел ext2); fast-цель — 60 байтами inline. Всё остальное —
+`FsError::Corrupt` **до** любой аллокации и до любых чтений блоков:
+`vec![u8; i_size]` из 4-гигабайтного `i_size` aborts ядро (panic=abort), а форма
+`i_blocks == 0 && i_size > 60` — это текст цели в `i_block`, который нельзя
+интерпретировать как карту блоков. Одно решение для чтения и удаления:
+`symlink::target_shape(i_blocks, i_size)` (Fast/Slow/Corrupt) и
+`symlink::owns_data_block(i_blocks)`, host-свойства `ext2_links`/`ext2_bounds`,
+ring-3 PoC `tools/security/poc/x86vfs_poc.c` (селекторы 1, 2).
+
 **REQ-L3 (граница).** Порог именно **59/60**, а не «60 байт»: fast хранит цель вместе с
 терминирующим NUL в 60 байтах `i_block`. Цель ровно 60 байт обязана стать slow —
 иначе Linux потеряет последний символ при чтении (проверено на e2fsprogs, §1.4).
@@ -497,6 +508,16 @@ sb, GD. Удаление dirent и `free_inode_bit` **обязаны быть в
   освобождения). Fast-ссылка не владеет ни одним блоком, slow-ссылка — ровно одним
   (`i_block[0]`), и только REG/DIR идут обычной картой (`mod.rs::Tx::free_inode_blocks`).
 
+**В 2.22.2** решение об удалении принимается только по `i_blocks == 0`
+(`symlink::owns_data_block`), без участия `i_size`: иначе fast-инод с `i_size > 60`
+уходил в slow-ветку и освобождал блок, номер которого складывается из байтов цели
+(F-x86v-4, ring-3 PoC `x86vfs_poc.c` селектор 5).
+- **I8 (аудит 2.22.2, F-x86v-5)** `i_size` каталога обязан быть кратен `BS` и не
+  превышать `s_blocks_count * BS` (каталог не может быть больше своей ФС). Нарушение →
+  `FsError::Corrupt` **до** цикла по блокам (`bounds::dir_blocks`): иначе один
+  `lookup`/`readdir`/`unlink`-скан crafted-каталога с `i_size = 0xFFFFF000` делает до
+  ~1M device-read'ов (host-свойство `ext2_bounds`, ring-3 PoC селектор 6).
+
 ### 6.5 Чего журнал НЕ делает
 
 `recover()` реплеит только закоммиченные транзакции и идемпотентен; `reconcile_free_counts`
@@ -796,3 +817,26 @@ python3 tools/e2e.py local-mirror  # in-guest
 13. **Двойной учёт в `install_one`**: удаление существующего пути перед созданием ссылки
     обязано проходить через link-aware `unlink` (§3), иначе удаление одного имени из N
     освободит inode целиком и «обнулит» остальные имена.
+
+---
+
+## 13. Аудит 2026-11-13 (2.22.2): жёсткие границы полей из образа
+
+Пять находок x86 VFS-аудита и одна того же класса, найденная при исправлении.
+Правило общее: **поле из ext2-образа — недоверенный ввод**, оно не может задавать
+размер аллокации, число итераций или номер освобождаемого блока, пока форма inode
+не проверена.
+
+| находка | что было | где закрыто (2.22.2) | регрессия |
+|---|---|---|---|
+| F-x86v-1 | `read_symlink` → `vec![0u8; i_size]`, crafted `i_blocks=8, i_size=0xFFFFFFF0` → alloc-panic | `symlink::target_shape` (Fast ≤ 60 / Slow ≤ `BS` / Corrupt), границы до аллокации | host `ext2_links::crafted_symlink_shape_is_bounded` + PoC sel 1/2 |
+| F-x86v-2 | `rename` копирует `i_size` в один `Vec` (sparse ~4 GiB → alloc) | `RENAME_COPY_MAX = 64 MiB`, `try_reserve`, `ENOMEM` вместо аллокации | PoC sel 3 |
+| F-x86v-3 | `walk()` не проверяет `x` на промежуточных каталогах (uid 1000 читает файл в 0700) | `LinkTree::may_search` в чистом walker'е; `io_sys::walk_as` отвечает `Creds::may(Access::Execute)` эффективных id (`access(2)` — реальных), включая компоненты цели ссылки; `EACCES`; `chdir` — ещё и на самом каталоге | host `link_walk_paths::{traversal_requires_search_permission_on_each_directory, search_permission_follows_spliced_link_targets}` + PoC sel 4, 8, 9 |
+| F-x86v-4 | `free_inode_blocks` брал slow-ветку по `i_size`; `i_blocks=0, i_size=61` → освобождался блок-номер из текста цели | `symlink::owns_data_block` — только по `i_blocks`; на чтении такая форма = `Corrupt` | host `ext2_links::audit_crafted_symlink_inodes_are_corrupt_not_allocations` + PoC sel 5 (free-blocks delta = 0) |
+| F-x86v-5 | `lookup`/`readdir`/`unlink` считали блоки каталога из `i_size` без границы (~1M device-read'ов) | `bounds::dir_blocks`: кратность `BS` и `≤ s_blocks_count`, иначе `Corrupt` до цикла | host `ext2_bounds::*` + PoC sel 6 |
+| F-x86v-6 (новая) | `read_file_all` (`execve`/`PT_INTERP`) — тот же `vec![u8; i_size]` и обход проверок traversal | лимит 256 MiB + `try_reserve` (`ENOEXEC`), credential-checked walk | PoC sel 7 |
+
+Семантика §4–§7 не меняется: `lstat`/`readlink` по-прежнему не следуют за конечной
+ссылкой, `SYMLOOP_MAX`/`PATH_MAX` те же; добавляется только поиск (`x`) на каждом
+пройденном каталоге, как в Linux. Команды воспроизведения (тот же QEMU-стенд, что у
+аудита) — `tools/security/README.md`, раздел «VFS/ext2 regressions (2.22.2)».

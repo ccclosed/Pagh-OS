@@ -88,6 +88,44 @@ proptest! {
         }
     }
 
+    /// A crafted symlink inode can never drive an unbounded allocation or a
+    /// block-map interpretation (security batch after 2.22.0):
+    ///
+    ///   * F-x86v-1: `read_symlink` sized its output from `i_size` alone, so a
+    ///     slow link with `i_size = 0xFFFFFFF0` asked for a 4 GiB `Vec` and
+    ///     aborted the kernel. The shape classifier bounds every accepted
+    ///     target: fast ≤ 60 inline bytes, slow ≤ one 4096-byte block;
+    ///   * F-x86v-4: `unlink` picked the slow branch from `i_size`, so an
+    ///     `i_blocks == 0, i_size > 60` inode had its target text read as a
+    ///     block number and freed that block. `owns_data_block` decides from
+    ///     `i_blocks` only, so an inline inode owns nothing to free.
+    #[test]
+    fn crafted_symlink_shape_is_bounded(i_blocks in any::<u32>(), i_size in any::<u32>()) {
+        match target_shape(i_blocks, i_size) {
+            TargetShape::Fast(len) => {
+                prop_assert_eq!(i_blocks, 0);
+                prop_assert!(len <= INLINE_CAPACITY);
+                prop_assert!(is_fast(i_blocks, i_size));
+            }
+            TargetShape::Slow(len) => {
+                prop_assert!(i_blocks != 0);
+                prop_assert!(!is_fast(i_blocks, i_size));
+                prop_assert!(len <= SLOW_MAX_TARGET);
+            }
+            TargetShape::Corrupt => {
+                // Exactly the two inconsistent shapes: inline text claiming to
+                // be longer than the inline capacity, or a slow target larger
+                // than a block.
+                prop_assert!(
+                    (i_blocks == 0 && i_size as usize > INLINE_CAPACITY)
+                        || (i_blocks != 0 && i_size as usize > SLOW_MAX_TARGET)
+                );
+            }
+        }
+        // The delete decision depends on `i_blocks` alone, never on `i_size`.
+        prop_assert_eq!(owns_data_block(i_blocks), i_blocks != 0);
+    }
+
     /// Hard-link accounting: after any sequence of link/unlink operations the
     /// count equals the number of names, an inode is freed exactly when its last
     /// name disappears, and `i_links_count` never wraps its 16-bit field.
@@ -159,4 +197,35 @@ proptest! {
             Some(UnlinkAction::FreeInode) => prop_assert_eq!(count, 1),
         }
     }
+}
+
+/// The two crafted inodes from the audit report, verbatim, plus the valid
+/// shapes on both sides of each boundary. These are the exact values the guest
+/// PoCs patch into the ext2 image (F-x86v-1: `i_blocks = 8`,
+/// `i_size = 0xFFFFFFF0`; F-x86v-4: `i_blocks = 0`, `i_size = 61`).
+#[test]
+fn audit_crafted_symlink_inodes_are_corrupt_not_allocations() {
+    // F-x86v-1: used to reach `vec![0u8; 4_294_967_280]` and abort the kernel.
+    assert_eq!(target_shape(8, 0xFFFF_FFF0), TargetShape::Corrupt);
+    // F-x86v-4: used to free the block number spelled by this target text.
+    assert_eq!(target_shape(0, 61), TargetShape::Corrupt);
+    assert!(!owns_data_block(0));
+
+    // Valid shapes: 60 bytes still fit inline (a foreign image may have it);
+    // the writer itself only creates fast links up to 59 bytes.
+    assert_eq!(target_shape(0, 0), TargetShape::Fast(0));
+    assert_eq!(target_shape(0, 59), TargetShape::Fast(59));
+    assert_eq!(target_shape(0, 60), TargetShape::Fast(60));
+    assert_eq!(target_shape(8, 60), TargetShape::Slow(60));
+    assert_eq!(
+        target_shape(8, SLOW_MAX_TARGET as u32),
+        TargetShape::Slow(SLOW_MAX_TARGET)
+    );
+    assert_eq!(
+        target_shape(8, SLOW_MAX_TARGET as u32 + 1),
+        TargetShape::Corrupt
+    );
+    // A slow inode owns exactly one block, whatever its target length.
+    assert!(owns_data_block(8));
+    assert!(owns_data_block(u32::MAX));
 }

@@ -552,6 +552,11 @@ fn walk_err(e: crate::vfs::link_walk::WalkError) -> VfsError {
     use crate::vfs::link_walk::WalkError;
     match e {
         WalkError::NotFound => VfsError::NotFound,
+        // `AccessDenied` is unreachable from this caller (the installer uses
+        // the unchecked walker: it is a privileged kernel action, like boot
+        // provisioning), but the match is exhaustive so a future credential-
+        // aware installer cannot silently treat it as "not found".
+        WalkError::AccessDenied => VfsError::InvalidArgument,
         WalkError::NotDir | WalkError::TooManyLinks | WalkError::TooLong => {
             VfsError::InvalidArgument
         }

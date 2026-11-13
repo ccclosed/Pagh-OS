@@ -36,8 +36,12 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
   `Err(NotSupported)`, `lookup` → `Err(NotFound)`, `fs_stat` → `None`, `size`/`fs_ino` → `0`,
   `is_symlink` → `false`, `read_link` → `None`, `nlink` → `1`, `sync` → no-op.
 - `init()`, `mount_at(path, node)`, `lookup_path(path)` (одношаговый, **не** следует за ссылкой),
-  `lookup_path_walk(path, follow_final)` (обход с переходом по ссылкам → `link_walk::WalkError`).
-- `link_walk::{resolve, LinkTree, WalkError, SYMLOOP_MAX, map_guest_target, guest_path_keeps_root}`.
+  `lookup_path_walk(path, follow_final)` (обход с переходом по ссылкам → `link_walk::WalkError`)
+  и `lookup_path_walk_checked(path, follow_final, may_search)` — тот же обход с предикатом
+  поиска (`x`) на каждом каталоге (его использует syscall-слой; ядро-внутренние вызовы
+  остаются на непроверяемом варианте).
+- `link_walk::{resolve, LinkTree, WalkError, SYMLOOP_MAX, map_guest_target, guest_path_keeps_root}`;
+  `LinkTree::may_search` — хук прав поиска, который спрашивает чистый walker перед каждым lookup.
 - `VfsNode::is_symlink()` / `read_link() -> Option<String>` — понятие ссылки в трейте
   (дефолты `false`/`None`; переопределён у `/proc/self/exe`, будет переиспользован
   ext2-симлинками из issue #18). `MountNode` форвардит оба метода.
@@ -157,6 +161,14 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
   цикл → `ELOOP`); `open` следует, `O_NOFOLLOW` на ссылке → `ELOOP`, `O_CREAT|O_EXCL` при
   существующем имени (даже висячей ссылке) → `EEXIST`; `readlink` отдаёт `min(bufsiz, len)`
   байт без NUL, `bufsiz == 0` → `EINVAL`, не-ссылка → `EINVAL`.
+- **Права поиска на обходе (аудит 2.22.2, F-x86v-3):** чистый `link_walk` перед каждым
+  `lookup` спрашивает `LinkTree::may_search`; ядро-адаптер `io_sys::walk_as` отвечает
+  `Creds::may(node.mode(), node.owner(), Access::Execute)` эффективных id (`access(2)` —
+  реальных). Проверяются все пройденные каталоги, **включая компоненты цели ссылки**,
+  вставленные обходом; отказ → `EACCES`. `chdir(2)` дополнительно требует `x` на самом
+  каталоге; `lstat`/`readlink` сохраняют no-follow-семантику. Host-свойства —
+  `link_walk_paths::{traversal_requires_search_permission_on_each_directory,
+  search_permission_follows_spliced_link_targets, final_directory_name_needs_only_the_parent_search_bit}`.
 - `getdents64`: `d_type = DT_LNK` для ссылок, `d_ino` — реальный номер inode.
 - Известные отклонения: цель хранится как `String`, поэтому не-UTF-8 цель чужого образа
   отдаётся lossy; `st_blocks` ссылки — 0 (у slow-ссылки реально 1 блок); `rename`
