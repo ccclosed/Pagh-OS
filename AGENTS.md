@@ -242,13 +242,40 @@ the full model is in `BRANCHING.md`.
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.22.3** (the 2026-11-13 attack
+  be reflected here. **`main` currently reads 2.22.4** (the 2026-11-13 attack
   audit batches: 2.22.0 closed the ring3-to-ring0 paths, 2.22.1 confined the
   package installer, 2.22.2 hardened VFS/ext2, 2.22.3 closed the user-buffer
-  TOCTOU class, on top of the console scrollback and the shell/procfs batches;
-  2.18.13 carried the `connect(2)` reply-and-close fix, the VT/console
-  coordinate fix and the kernel-thread rows in `ps`; the tag lands at the end
-  of the batch).
+  TOCTOU class, 2.22.4 closed the fork-COW frame-ownership use-after-free
+  found by the round-2 audit, on top of the console scrollback and the
+  shell/procfs batches; 2.18.13 carried the `connect(2)` reply-and-close fix,
+  the VT/console coordinate fix and the kernel-thread rows in `ps`; the tag
+  lands at the end of the batch).
+  **2.22.4** = fork-COW frame ownership is closed (round-2 audit F-r2-arch-1,
+  critical, and F-r2-arch-2, high). `fork_user_space_cow` shares each leaf frame
+  with `COW_BIT` and a PMM refcount, but only process exit honoured it:
+  `munmap`, `mprotect(PROT_NONE)`, `mprotect(RW)` and `MAP_FIXED` replacement
+  freed or re-flagged a shared frame without `cow_unref`. On 2.22.3 a uid-1000
+  process could `mprotect(RW)` the parent's COW leaves, `munmap` them in the
+  forked child, then allocate fresh page tables: the freed frames came back as
+  the parent's still-writable user PTEs alias, giving arbitrary physical
+  read/write, zeroed `Creds` and uid 0 (the audit's `cow_root` PoC). The same
+  missing accounting made the exit path free already reallocated frames (1017
+  `[PMM] DOUBLE FREE` lines). Every user-leaf release now funnels through
+  `vmm::release_user_leaf`: the PTE is dropped first, a `COW_BIT` leaf consumes
+  exactly one `pmm::cow_unref` reference and the frame is freed only when that
+  reports the last one; `mprotect` re-flags a COW leaf in place, keeps the
+  marker and defers write access to the next write fault (`cow_copy_page`);
+  `vmm::map` refuses to overwrite a live COW leaf; and `pmm::free_frame` refuses
+  (logs) a frame that still has registered COW sharers. The accounting is the
+  pure `memory::cow` module, host-tested by property `cow_ownership` (random
+  fork/write/unmap/`MAP_FIXED`/`mprotect`/exit sequences over a model PMM that
+  rejects double frees and frees of mapped frames) plus two in-QEMU self-test
+  routines on the real PMM/page tables. Evidence: on the round-2 range the
+  audit's `cow_root`/`cow_min` PoCs leave uid 1000, print no page-table reuse /
+  no `SUCCESS`, log no `DOUBLE FREE`, and the shell keeps running; stock 2.22.3
+  reaches uid 0 and logs 1017 double frees. `cow_root` also pins the
+  `mprotect(RW)` step: the COW marker survives, so the parent's next write takes
+  the COW fault instead of writing the shared frame.
   **2.22.3** = the user-buffer TOCTOU class from the same audit is closed
   (F-x86a-4). Blocking syscalls validated their user-visible buffer once and
   then kept touching it inside a `yield_current()` wait loop; a sibling

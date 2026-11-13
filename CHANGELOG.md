@@ -11,6 +11,33 @@ tagged release (`2.18.13`, merged as PR #56). The full technical story of every 
 is the release-note block in `AGENTS.md`; the paragraphs here name the user-visible
 change and point there rather than duplicating it.
 
+## 2.22.4
+
+Fork-COW frame ownership (round-2 attack audit F-r2-arch-1, critical, and
+F-r2-arch-2, high). `fork_user_space_cow` shares leaf frames with `COW_BIT` and
+a PMM refcount, but only the exit path honoured it: `munmap`,
+`mprotect(PROT_NONE)`, `mprotect(RW)` and `MAP_FIXED` replacement freed or
+re-flagged the shared frame without `cow_unref`. An unprivileged process could
+`mprotect(RW)` the parent's share, `munmap` it in the forked child, and have the
+still-writable parent PTE alias frames the allocator then handed out as kernel
+page tables — arbitrary physical read/write, `Creds` zeroed, uid 0. The same
+missing accounting freed already-reallocated frames during process exit (1017
+PMM double frees). Every user-leaf release now goes through one helper
+(`vmm::release_user_leaf`) that frees a frame only when `cow_unref` reports the
+last reference and drops the PTE first; `mprotect` re-flags a COW leaf in place,
+keeping `COW_BIT` and deferring write access to the next write fault
+(`cow_copy_page`); `vmm::map` refuses to overwrite a live COW leaf; the PMM
+refuses to free a frame that still has registered COW sharers. The accounting
+lives in the pure, host-tested `memory::cow` module (property `cow_ownership`
+models fork/write/unmap/MAP_FIXED/mprotect/exit over a PMM that rejects double
+frees and frees of mapped frames), and two in-QEMU self-test routines exercise
+the real PMM/page tables. Verified with the audit's `cow_root`/`cow_min` PoCs on
+the round-2 range: stock 2.22.3 reaches uid 0 and logs the 1017 double frees;
+2.22.4 leaves uid 1000, reports no page-table reuse and no `DOUBLE FREE`, and
+the shell stays alive.
+
+Full story: `AGENTS.md`, 2.22.4.
+
 ## 2.22.3
 
 TOCTOU on user buffers in blocking syscalls (attack-audit F-x86a-4). A sibling

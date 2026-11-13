@@ -11,7 +11,8 @@
 | `mod.rs` | Корень модуля: `heap`, `layout`, `pmm`, `vmm` |
 | `layout.rs` | Единственный источник правды о фиксированных виртуальных регионах: стеки ядра per-PID, user-стек, mmap-база, размер кучи; хелперы границ образа ядра |
 | `pmm.rs` | Physical Memory Manager — битовый аллокатор кадров 4 KiB + счётчики COW |
-| `vmm.rs` | Virtual Memory Manager — 4-уровневый paging, map/unmap/translate, clone/fork/drop user-space, MMIO, управление CR3 |
+| `cow.rs` | Чистый (host-testable) учёт владения COW-кадрами: счётчик шарящих адресных пространств, `CowRefs` |
+| `vmm.rs` | Virtual Memory Manager — 4-уровневый paging, map/unmap/translate, единый release листов, clone/fork/drop user-space, MMIO, управление CR3 |
 | `heap.rs` | Ядровая куча, `#[global_allocator]` (обёртка над `good_memory_allocator` с маскировкой прерываний) |
 
 ## Ключевые символы
@@ -21,10 +22,13 @@
   `USER_STACK_PAGES=2048` (8 MiB), `USER_MMAP_BASE=0x2000_0000_0000`, `HEAP_INITIAL_PAGES` (512 MiB),
   `kernel_start()/kernel_end()/kernel_size()/heap_base()` (из linker-символов).
 - `pmm`: `init(&MemmapResponse)`, `alloc_frame()`, `free_frame()`, `alloc_frames_contiguous(n)`,
-  `free_frames_contiguous()`, `cow_ref()/cow_unref()`, `total_frames()/free_frames()`.
+  `free_frames_contiguous()`, `cow_ref()/cow_unref()/cow_refs()`, `total_frames()/free_frames()`.
+- `cow`: `CowRefs::{new, acquire, release, refs, tracked_frames}` — чистый учёт без локов
+  и paging; `pmm` оборачивает один экземпляр в `Spinlock`.
 - `vmm`: `init(hhdm_offset)`, `kernel_pml4_phys()`, `phys_to_virt()/virt_to_phys()`,
-  `virt_to_phys_in(pml4, virt)`, `map()/unmap()`, `map_mmio(phys, len)`, `load_cr3(phys)`,
-  `new_user_pml4()`, `clone_user_space()`, `fork_user_space_cow()`, `cow_copy_page()`, `drop_user_space()`.
+  `virt_to_phys_in(pml4, virt)`, `map()/unmap()`, `release_user_leaf()`, `set_user_leaf_flags()`,
+  `map_mmio(phys, len)`, `load_cr3(phys)`, `new_user_pml4()`, `clone_user_space()`,
+  `fork_user_space_cow()`, `cow_copy_page()`, `drop_user_space()`.
 - `heap`: `init()`, `stats() -> (size, used, free)`.
 
 ## Как работает
@@ -37,8 +41,11 @@
   Limine помечает его `MEMMAP_EXECUTABLE_AND_MODULES`. Захватывается до `MAX_KERNEL_RANGES=16` диапазонов.
 - `alloc_frame` — линейный поиск первого ненулевого слова + `trailing_zeros`. Double free
   детектится и логируется (`[PMM] DOUBLE FREE`), но не фатален.
-- COW-счётчики: `COW_REFS: Spinlock<BTreeMap<u64, u32>>` (адрес кадра → число шарящих).
+- COW-счётчики: `COW_REFS: Spinlock<CowRefs>` (`memory/cow.rs`, адрес кадра → число шарящих).
   Входит при fork со значением 2; `cow_unref` возвращает `true`, когда вызывающий должен освободить кадр.
+  `free_frame` отказывается (с `[PMM] refusing to free COW-shared frame`) освобождать кадр,
+  у которого ещё есть зарегистрированные шарящие: легитимный путь сначала `cow_unref`, и только
+  при последней ссылке — `free_frame`. Это ловит регрессию владения, а не молча отдаёт живой кадр.
 
 ### VMM (`vmm.rs`)
 - Ходит по **активному** CR3 PML4 (не по кэшированному корню). Все разыменования таблиц —
@@ -46,13 +53,22 @@
 - Промежуточные таблицы выделяются из PMM и обнуляются; получают `PRESENT|WRITABLE`,
   `USER_ACCESSIBLE` — только если лист его запросил (с апгрейдом существующих).
 - Транслируются и 1 GiB, и 2 MiB huge pages.
-- `map` при ремапе-перезаписи логирует утечку, но не падает.
+- `map` при ремапе-перезаписи чужого кадра логирует утечку, но не падает; **живой COW-лист
+  он не перезаписывает** — возвращает `VmError::CowShared` (иначе можно молча потерять
+  refcount и получить writable-алиас общего кадра, F-r2-arch-1).
 - COW: `COW_BIT = BIT_9` (software-бит PTE). `fork_user_space_cow` двухпроходный:
   проход 1 отбрасывает huge pages до мутаций, проход 2 шарит листы, снимает WRITABLE,
   ставит COW_BIT обеим сторонам, `cow_ref` + полный TLB flush. Промежуточные таблицы НЕ шарятся.
-- `drop_user_space`: освобождает листы (с `cow_unref` для COW), затем PT/PD/PDPT/PML4 —
-  по одному кадру промежуточного уровня строго **после** внутреннего цикла (ранний баг
-  освобождал PD на каждый PT-entry и ловил double-free детектор).
+- **Единый release листа** (`release_user_leaf`, F-r2-arch-1/2): снимает PTE (и TLB) **до**
+  возможного free; для `COW_BIT`-листа делает ровно один `cow_unref` и освобождает кадр только
+  при `true`. Через него идут `munmap`, `mprotect(PROT_NONE)`, замена `MAP_FIXED`, `mremap`
+  (через `munmap_impl`), `unwind` и `drop_user_space`. `mprotect` не-PROT_NONE листа меняет
+  только флаги (`set_user_leaf_flags`), не кадр: COW-лист сохраняет `COW_BIT` и остаётся
+  RO в железе — write-fault позже делает `cow_copy_page`; очистить маркер или поставить
+  WRITABLE общий кадр нельзя (`VmError::CowShared`).
+- `drop_user_space`: освобождает листы через `release_leaf_frame` (с `cow_unref` для COW),
+  затем PT/PD/PDPT/PML4 — по одному кадру промежуточного уровня строго **после** внутреннего
+  цикла (ранний баг освобождал PD на каждый PT-entry и ловил double-free детектор).
 - `map_mmio` маппит `PRESENT|WRITABLE|NO_CACHE|NO_EXECUTE` в `virt = phys_to_virt(phys)`
   (конвенция: MMIO живёт в HHDM-окне, отдельного окна нет).
 - `load_cr3` — **единственное место записи CR3** (оба пути, tick и yield, идут через него).
@@ -103,6 +119,13 @@
   `tlb::flush_all()`. Вызов из `fork_linux_process` идёт из syscall-контекста
   родителя, поэтому контракт выполняется; в debug-сборке это проверяется
   утверждением (`parent_pml4 == current_pml4_phys()`), а не только комментарием.
+- Инвариант владения: кадр освобождается ровно один раз и только когда ни один PTE
+  его больше не отображает. Любой новый путь, снимающий user-лист, обязан идти через
+  `vmm::release_user_leaf`, а не через `vmm::unmap` + `pmm::free_frame`; `unmap` —
+  сырой примитив «снять PTE без освобождения» для код-путей, которые владеют кадром
+  сами (re-map флагов, unwind свежих кадров). Хост-свойство `cow_ownership` и
+  in-QEMU routine'ы `cow::refcount accounting` / `cow::leaf release/re-flag`
+  проверяют это на реальных структурах.
 - `layout.rs` — единственный источник истины: `task::scheduler` и
   `task::process` уже вызывают `kernel_stack_for_pid`/`KERNEL_STACK_PAGES`/
   `USER_STACK_TOP`/`USER_STACK_PAGES`/`USER_MMAP_BASE`/`heap_base`; пункт про

@@ -1,8 +1,8 @@
 // memory/pmm.rs — Physical Memory Manager (bitmap allocator)
 // 64-bit x86_64 OS kernel in Rust (#![no_std])
 
+use crate::memory::cow::CowRefs;
 use crate::sync::spinlock::Spinlock;
-use alloc::collections::BTreeMap;
 use limine::memmap;
 use limine::request::MemmapResponse;
 
@@ -456,7 +456,24 @@ pub fn free_frames_contiguous(base: u64, count: usize) {
 }
 
 /// Free a previously allocated physical frame.
+///
+/// A frame that still has registered COW sharers is REFUSED (logged) rather
+/// than returned to the bitmap: every one of those sharers has a live PTE into
+/// the frame, so freeing it here would hand still-mapped memory to the next
+/// `alloc_frame` — the F-r2-arch-1 use-after-free. The legitimate release path
+/// ([`crate::memory::vmm::release_user_leaf`]) calls [`cow_unref`] first and
+/// reaches this function only when the last reference is gone.
 pub fn free_frame(addr: u64) {
+    // The ownership check takes COW_REFS before PMM and releases it first; no
+    // path holds COW_REFS across a PMM acquisition, so the two spinlocks are
+    // never nested (both mask interrupts while held).
+    if frame_is_cow_shared(addr) {
+        crate::error!(
+            "[PMM] refusing to free COW-shared frame=0x{:016x} - release path must cow_unref first",
+            addr
+        );
+        return;
+    }
     let mut guard = PMM.lock();
     let pmm = match *guard {
         Some(ref mut pmm) => pmm,
@@ -504,48 +521,55 @@ pub fn free_frame(addr: u64) {
 //
 // `fork_user_space_cow` shares every leaf frame between the parent and the
 // child address space instead of copying it. The frame's physical address is
-// keyed here with the number of address spaces that reference it as COW
-// sharers. Frames enter the map with count 2 at fork time and leave it either
-// via a copy-on-write fault (one side gets a private copy) or via an exit
-// reaper unref. The frame is returned to the free bitmap exactly when the
-// count reaches zero — never before, so a child exiting first cannot pull the
+// keyed in [`CowRefs`] with the number of address spaces that reference it as
+// COW sharers. Frames enter with count 2 at fork time and leave either via a
+// copy-on-write fault (one side gets a private copy) or via a leaf release
+// (`munmap`, `mprotect(PROT_NONE)`, `MAP_FIXED` replacement, address-space
+// teardown). The frame is returned to the free bitmap exactly when the count
+// reaches zero — never before, so a child exiting first cannot pull the
 // parent's data out from under it.
 //
-// The map is deliberately tiny-typed and separate from the bitmap: only COW
-// frames are counted, kernel frames and pre-fork private frames keep the
-// plain alloc/free protocol.
+// The map is deliberately separate from the bitmap: only COW frames are
+// counted, kernel frames and pre-fork private frames keep the plain
+// alloc/free protocol.
+//
+// The accounting lives in `memory::cow` (a pure, host-tested module) so the
+// ownership rules are exercised by `host-tests` against the same source the
+// kernel compiles. This file only wraps it in the interrupt-safe spinlock.
 
-static COW_REFS: Spinlock<BTreeMap<u64, u32>> = Spinlock::new(BTreeMap::new());
+static COW_REFS: Spinlock<CowRefs> = Spinlock::new(CowRefs::new());
 
 /// Register one additional COW sharer of `frame`. `fork_user_space_cow`
 /// calls this once per side that newly references the leaf as COW: two calls
 /// for a previously-private leaf (parent enters the map along with the
 /// child), one call when forking an already-shared leaf.
 pub fn cow_ref(frame: u64) {
-    let mut m = COW_REFS.lock();
-    let e = m.entry(frame & !(FRAME_SIZE - 1)).or_insert(0);
-    *e += 1;
+    COW_REFS.lock().acquire(frame);
 }
 
 /// Drop one COW sharer of `frame`. Returns `true` when the caller must hand
 /// the frame back to the free bitmap (no address space references it
 /// anymore); `false` while at least one sharer remains.
 pub fn cow_unref(frame: u64) -> bool {
-    let mut m = COW_REFS.lock();
-    let key = frame & !(FRAME_SIZE - 1);
-    match m.get_mut(&key) {
-        Some(1) => {
-            m.remove(&key);
-            true
-        }
-        Some(n) => {
-            *n -= 1;
-            false
-        }
-        // Not (or no longer) a tracked COW frame — treat as exclusively
-        // owned: the caller frees it.
-        None => true,
-    }
+    COW_REFS.lock().release(frame)
+}
+
+/// Current COW share count of `frame` (0 when privately owned/untracked).
+///
+/// Diagnostics and the in-QEMU ownership self-test use this; the release paths
+/// must use [`cow_unref`]'s return value, never a read-then-free sequence.
+pub fn cow_refs(frame: u64) -> u32 {
+    COW_REFS.lock().refs(frame)
+}
+
+/// Number of frames currently tracked as COW-shared (diagnostics/selftest).
+pub fn cow_tracked_frames() -> usize {
+    COW_REFS.lock().tracked_frames()
+}
+
+/// `true` while `frame` has at least one registered COW sharer.
+fn frame_is_cow_shared(frame: u64) -> bool {
+    COW_REFS.lock().refs(frame) != 0
 }
 
 /// Total number of frames tracked.

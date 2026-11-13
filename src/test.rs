@@ -643,6 +643,233 @@ mod vmm_prop_tests {
     }
 }
 
+// Fork-COW frame ownership (round-2 audit F-r2-arch-1 / F-r2-arch-2).
+//
+// `fork_user_space_cow` shares leaves with `COW_BIT` + `pmm::cow_ref`; every
+// path that detaches a leaf must release exactly one reference and free the
+// frame only when it was the last one. These routines drive the real PMM and
+// page tables for the three properties the audit broke:
+//
+//   * `cow_ref`/`cow_unref` account per address space and never free early
+//     (F-r2-arch-1 root cause; also pins the PMM free guard);
+//   * `vmm::release_user_leaf` frees a private leaf, only unrefs a shared one,
+//     and frees the shared frame when the last PTE goes away (munmap /
+//     mprotect(PROT_NONE) / MAP_FIXED replacement path);
+//   * `vmm::map` refuses to overwrite a live COW leaf, and
+//     `vmm::set_user_leaf_flags` keeps the marker (the exploit's
+//     mprotect(RW) step).
+//
+// Non-destructive: each leaf data frame is allocated and freed exactly once;
+// the intermediate page-table frames `vmm::map` creates for the never-used
+// scratch VAs are a documented leak (same as the existing VMM property tests).
+mod cow_ownership_tests {
+    use crate::memory::pmm;
+    use crate::memory::vmm::{self, LeafRelease, VmError};
+    use x86_64::structures::paging::PageTableFlags;
+
+    /// Lower-half scratch candidates (same set as `vmm_prop_tests`). They are
+    /// verified to be unmapped before use.
+    const USER_TEST_VIRTS: [u64; 3] = [
+        0x0000_6000_0000_0000,
+        0x0000_6000_0010_0000,
+        0x0000_6000_0020_0000,
+    ];
+
+    fn free_user_virts() -> alloc::vec::Vec<u64> {
+        USER_TEST_VIRTS
+            .iter()
+            .copied()
+            .filter(|&v| vmm::virt_to_phys(v).is_none())
+            .collect()
+    }
+
+    /// COW accounting: two sharers, one release does not free, the second does;
+    /// the PMM's ownership guard refuses an early `free_frame`.
+    pub fn refcount_accounting() {
+        let before = pmm::free_frames();
+        let Some(frame) = pmm::alloc_frame() else {
+            crate::skip_kernel!("PMM exhausted", "cow accounting: no frame");
+            return;
+        };
+
+        assert_eq_kernel!(pmm::cow_refs(frame), 0, "private frame starts untracked");
+        pmm::cow_ref(frame);
+        pmm::cow_ref(frame);
+        assert_eq_kernel!(pmm::cow_refs(frame), 2, "two address spaces register");
+        assert_kernel!(
+            pmm::cow_tracked_frames() >= 1,
+            "the shared test frame is registered in the COW table"
+        );
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            before - 1,
+            "sharing does not change the free count"
+        );
+
+        // The PMM guard must refuse a free of a frame that is still shared.
+        pmm::free_frame(frame);
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            before - 1,
+            "early free_frame of a COW frame is refused"
+        );
+        assert_eq_kernel!(pmm::cow_refs(frame), 2, "refused free keeps the count");
+
+        assert_kernel!(
+            !pmm::cow_unref(frame),
+            "first unref: another sharer remains"
+        );
+        assert_eq_kernel!(pmm::cow_refs(frame), 1, "one sharer left");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            before - 1,
+            "shared frame not freed after first unref"
+        );
+        assert_kernel!(pmm::cow_unref(frame), "last unref reports the free");
+        assert_eq_kernel!(pmm::cow_refs(frame), 0, "untracked after last unref");
+
+        pmm::free_frame(frame);
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            before,
+            "frame returned to the PMM exactly once"
+        );
+    }
+
+    /// The real leaf-release/re-flag helpers on two PTEs of one shared frame.
+    pub fn leaf_release_and_reflag() {
+        let virts = free_user_virts();
+        if virts.len() < 2 {
+            crate::skip_kernel!(
+                "scratch VAs in use",
+                "cow leaf release: fewer than two free user test VAs"
+            );
+            return;
+        }
+        let (va1, va2) = (virts[0], virts[1]);
+
+        let frame = match pmm::alloc_frame() {
+            Some(f) => f,
+            None => {
+                crate::skip_kernel!("PMM exhausted", "cow leaf release: no frame");
+                return;
+            }
+        };
+        // COW leaves are read-only in hardware: write access is granted by a
+        // copy-on-write fault, never by a writable shared PTE.
+        let cow_flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE
+            | vmm::COW_BIT;
+
+        if vmm::map(frame, va1, cow_flags).is_err() || vmm::map(frame, va2, cow_flags).is_err() {
+            // Roll back whatever got mapped; the frame itself was never freed.
+            let _ = vmm::release_user_leaf(va1);
+            let _ = vmm::release_user_leaf(va2);
+            pmm::free_frame(frame);
+            crate::skip_kernel!("vmm map failed", "cow leaf release: scratch map failed");
+            return;
+        }
+        pmm::cow_ref(frame);
+        pmm::cow_ref(frame);
+        let mapped_free = pmm::free_frames();
+
+        // 1) `vmm::map` must not silently overwrite the COW leaf.
+        let other = match pmm::alloc_frame() {
+            Some(f) => f,
+            None => {
+                crate::skip_kernel!("PMM exhausted", "cow leaf release: no second frame");
+                let _ = vmm::release_user_leaf(va1);
+                let _ = vmm::release_user_leaf(va2);
+                return;
+            }
+        };
+        let plain = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+        assert_eq_kernel!(
+            vmm::map(other, va1, plain),
+            Err(VmError::CowShared),
+            "vmm::map refuses to overwrite a COW leaf"
+        );
+        assert_eq_kernel!(
+            vmm::virt_to_phys(va1),
+            Some(frame),
+            "refused overwrite leaves the COW PTE intact"
+        );
+        pmm::free_frame(other); // never mapped
+
+        // 2) The mprotect re-flag path must preserve COW_BIT.
+        assert_eq_kernel!(
+            vmm::set_user_leaf_flags(va1, cow_flags),
+            Ok(()),
+            "re-flagging a COW leaf keeps the marker"
+        );
+        // Read the raw leaf PTE: `page_flags` intersects the walk hierarchy and
+        // masks leaf-only software bits such as COW_BIT.
+        let flags = vmm::walk_pte(va1).expect("COW leaf present").flags();
+        assert_kernel!(flags.contains(vmm::COW_BIT), "COW_BIT survives mprotect");
+        assert_kernel!(
+            !flags.contains(PageTableFlags::WRITABLE),
+            "a COW leaf is never made hardware-writable"
+        );
+
+        // 3) One release keeps the frame (the other VA/address space owns it).
+        assert_eq_kernel!(
+            vmm::release_user_leaf(va1),
+            Ok(LeafRelease::Shared),
+            "releasing one COW PTE only drops one reference"
+        );
+        assert_eq_kernel!(pmm::cow_refs(frame), 1, "one reference left");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            mapped_free,
+            "shared frame not freed while the second PTE lives"
+        );
+        assert_kernel!(vmm::virt_to_phys(va1).is_none(), "detached PTE is gone");
+
+        // 4) The last release returns the frame exactly once.
+        assert_eq_kernel!(
+            vmm::release_user_leaf(va2),
+            Ok(LeafRelease::Freed),
+            "last COW release frees the frame"
+        );
+        assert_eq_kernel!(pmm::cow_refs(frame), 0, "no references left");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            mapped_free + 1,
+            "frame returned to the PMM"
+        );
+        assert_kernel!(vmm::virt_to_phys(va2).is_none(), "last PTE detached");
+
+        // 5) A private leaf is freed directly (no refcount involved).
+        let private = match pmm::alloc_frame() {
+            Some(f) => f,
+            None => {
+                crate::skip_kernel!("PMM exhausted", "cow leaf release: no private frame");
+                return;
+            }
+        };
+        if vmm::map(private, va1, plain).is_ok() {
+            let private_free = pmm::free_frames();
+            assert_eq_kernel!(
+                vmm::release_user_leaf(va1),
+                Ok(LeafRelease::Freed),
+                "private leaf release frees directly"
+            );
+            assert_eq_kernel!(
+                pmm::free_frames(),
+                private_free + 1,
+                "private frame returned to the PMM"
+            );
+        } else {
+            pmm::free_frame(private);
+            crate::skip_kernel!("vmm map failed", "cow leaf release: private map failed");
+        }
+    }
+}
+
 // Property 5: Heap allocations are non-overlapping and aligned.
 //
 // For any sequence of `alloc`/`dealloc` calls, every live allocation returns a
@@ -7104,6 +7331,14 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "vmm::USER_ACCESSIBLE propagates to intermediates",
             vmm_prop_tests::user_accessible_propagates_to_intermediates
+        ),
+        (
+            "cow::refcount accounting and PMM free guard (F-r2-arch-1/2)",
+            cow_ownership_tests::refcount_accounting
+        ),
+        (
+            "cow::leaf release/re-flag ownership (F-r2-arch-1)",
+            cow_ownership_tests::leaf_release_and_reflag
         ),
         (
             "heap::allocations non-overlapping and aligned",
