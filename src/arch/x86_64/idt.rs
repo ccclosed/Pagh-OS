@@ -332,6 +332,31 @@ extern "x86-interrupt" fn page_fault_handler(
     // that was live at the fault. Then park (do not return: returning would just
     // re-execute the faulting instruction and loop).
     if !error_code.contains(PageFaultErrorCode::USER_MODE) {
+        // F-x86a-4 backstop: a ring-0 fault on a USER address means a syscall
+        // handler read or wrote a user buffer that a sibling CLONE_VM thread
+        // unmapped after the entry-time validation. Ring 3 could trigger that at
+        // will, and it used to halt the whole machine; instead kill only the
+        // offending Compat_Process. The decision is pure and host-tested
+        // (`trap_frame::page_fault_action`): a ring-0 fault on a KERNEL address
+        // still takes the fatal path below, so a genuine kernel bug cannot hide
+        // behind this backstop.
+        let pid = crate::task::scheduler::current_pid();
+        let action = crate::arch::x86_64::linux::trap_frame::page_fault_action(
+            false,
+            fault_addr.as_u64(),
+            crate::arch::x86_64::linux::validate::USER_ADDR_MAX,
+            crate::task::compat::compat_exists(pid),
+        );
+        if action == crate::arch::x86_64::linux::trap_frame::PageFaultAction::KillProcess {
+            crate::error!(
+                "[EXC #14] kernel-mode fault on USER address addr=0x{:016x} RIP=0x{:016x} pid={} — killing that Compat_Process, machine stays up (F-x86a-4 backstop)",
+                fault_addr.as_u64(),
+                stack.instruction_pointer.as_u64(),
+                pid
+            );
+            crate::task::compat::with_current_compat(|cs| cs.exit_code = Some(139));
+            crate::task::scheduler::exit_current();
+        }
         crate::debug::unwind::stack_scan_backtrace(rsp, 8192);
         crate::arch::cpu::halt_loop();
     }

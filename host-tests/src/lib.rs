@@ -529,6 +529,12 @@ mod properties {
     // `kill_target`.
     mod irq_frame;
 
+    // Page-fault disposition policy (2026-11-13 security audit, F-x86a-4
+    // backstop): ring-0 faults on user addresses kill only the faulting process,
+    // while ring-0 faults on kernel addresses stay fatal. Same descriptive-name
+    // policy as `irq_frame`/`kill_target`.
+    mod page_fault;
+
     // Process credentials + filesystem permission enforcement (security model):
     // the POSIX owner/group/other matrix with the root execute rule, and every
     // set*id transition's ownership invariant, over arbitrary ids. `p55` is

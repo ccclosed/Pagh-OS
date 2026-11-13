@@ -150,6 +150,51 @@ pub fn plan_irq_delivery(frame_addr: u64, sig: u64, handler: u64, user_rflags: u
     }
 }
 
+// ─── Page-fault disposition policy (F-x86a-4 backstop) ───────────────────────
+
+/// What the page-fault handler must do with a fault the demand-paging path
+/// could not service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageFaultAction {
+    /// Terminate only the faulting Compat_Process; the machine keeps running.
+    KillProcess,
+    /// Dump the faulting frame and halt: a genuine kernel fault must stay fatal.
+    Halt,
+}
+
+/// Decide the disposition of a page fault `mem_sys::handle_user_page_fault`
+/// refused.
+///
+/// `user_mode` mirrors `PageFaultErrorCode::USER_MODE` (the faulting CS was ring
+/// 3), `fault_addr` is CR2, `user_addr_max` the exclusive user-half bound and
+/// `current_is_compat` says whether the CPU is running a Linux compat process.
+///
+/// Ring-3 faults keep their historical rule: a compat process is killed, any
+/// other task takes the fatal path. The case this policy adds is a **ring-0
+/// fault on a user address**: a syscall handler read or wrote a user buffer that
+/// a sibling `CLONE_VM` thread unmapped after the entry-time validation
+/// (F-x86a-4). That is never worth a machine halt — kill the process that
+/// triggered it. A ring-0 fault on a *kernel* address, by contrast, is a real
+/// kernel bug (the LIEDTKE case the handler exists for) and still halts, so the
+/// backstop cannot silently swallow one.
+pub fn page_fault_action(
+    user_mode: bool,
+    fault_addr: u64,
+    user_addr_max: u64,
+    current_is_compat: bool,
+) -> PageFaultAction {
+    // The first page is never mappable in this kernel (`mmap(0,...)` is
+    // rejected), so a ring-0 fault at address ~0 is a kernel NULL-pointer bug,
+    // not a user-buffer race: it must stay fatal, not be blamed on a process.
+    const MIN_USER_FAULT_ADDR: u64 = 4096;
+    let on_user_address = (MIN_USER_FAULT_ADDR..user_addr_max).contains(&fault_addr);
+    if (user_mode || on_user_address) && current_is_compat {
+        PageFaultAction::KillProcess
+    } else {
+        PageFaultAction::Halt
+    }
+}
+
 // ─── Layout assertions (the `src/test.rs` contract, in type form) ─────────────
 
 const _: () = {
