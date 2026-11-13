@@ -80,3 +80,35 @@ pub fn spanned_pages(start: u64, len: u64) -> impl Iterator<Item = u64> {
 fn page_base(addr: u64) -> u64 {
     addr & !(PAGE_SIZE - 1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_range_rejects_kernel_and_out_of_half() {
+        // Anything at or above the boundary is a kernel address — this is the
+        // exact class of value F-LEAD-1 passed to mprotect().
+        assert_eq!(check_user_range(USER_ADDR_MAX, 4096), PtrCheck::Efault);
+        assert_eq!(
+            check_user_range(0xffff_ffff_801b_f000, 4096),
+            PtrCheck::Efault
+        );
+        // The last user page is accepted; one byte past the boundary is not.
+        assert_eq!(check_user_range(USER_ADDR_MAX - 4096, 4096), PtrCheck::Ok);
+        assert_eq!(check_user_range(USER_ADDR_MAX - 1, 2), PtrCheck::Efault);
+        // An empty range dereferences nothing and is always acceptable.
+        assert_eq!(check_user_range(USER_ADDR_MAX, 0), PtrCheck::Ok);
+        // Length that overflows u64 is refused, not wrapped.
+        assert_eq!(check_user_range(u64::MAX - 10, 100), PtrCheck::Efault);
+        // Ordinary user buffers (glibc's stacks/heaps) stay accepted.
+        assert_eq!(check_user_range(0x7fff_ffff_f000, 4096), PtrCheck::Ok);
+    }
+
+    #[test]
+    fn spanned_pages_is_bounded_by_the_range() {
+        let pages: alloc::vec::Vec<u64> = spanned_pages(0x1000, 3 * 4096 + 1).collect();
+        assert_eq!(pages, alloc::vec![0x1000, 0x2000, 0x3000, 0x4000]);
+        assert_eq!(spanned_pages(0x1000, 0).count(), 0);
+    }
+}

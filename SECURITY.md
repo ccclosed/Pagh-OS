@@ -4,8 +4,11 @@ pagh is an educational kernel, not a production operating system.
 
 ## Threat model in one paragraph
 
-pagh gives you **kernel integrity** (ring 3 cannot read or write kernel memory,
-execute writable memory, or touch device MMIO — paging enforces it), **package
+pagh aims at **kernel integrity** (ring 3 cannot read or write kernel memory,
+execute writable memory, or touch device MMIO — paging is supposed to enforce it).
+That boundary was **violated in 2.21.0** and the three demonstrated ring3-to-ring0
+paths were closed in 2.22.0 (see "Attack audit" below); the remaining audit findings
+are listed there and are not claimed fixed. pagh gives you **package
 authenticity** (the TLS/OpenPGP/digest chain above refuses a mirror that cannot prove
 what it served), and a **filesystem permission model between processes** (per-process
 `uid`/`gid`/`euid`/`egid`/`suid`/`sgid`, POSIX owner/group/other checks on `open`,
@@ -45,6 +48,74 @@ VFS — consults them:
 Root bypasses read and write, but **not** execute: a `0644` file cannot be execed by
 anyone. That rule is what makes the model meaningful even though the default identity
 is root.
+
+## Attack audit (2026-11-13): fixed and still open
+
+An external red-team pass ran stock ring-3 Linux ELFs on a private QEMU range
+(attachments: PoC sources, serial logs and per-area reports). It found three
+independent ring3-to-ring0 paths and a one-syscall machine kill on the 2.21.0
+image. **Fixed in 2.22.0** (each reproduced before and after; the same PoCs still
+succeed on stock 2.21.0):
+
+* **F-LEAD-1 (critical, verified).** `mprotect(2)` accepted kernel virtual
+  addresses: no `USER_ADDR_MAX` gate, a coverage guard that inverted to "allowed"
+  for a fully mapped kernel range, and `leaf_flags()` (a user-page flag builder
+  that always sets `USER_ACCESSIBLE`) re-mapping the found kernel frames. The
+  kernel's leaf page tables are shared between the user PML4 and the kernel, so
+  this produced a ring-3 W+X alias of kernel memory; scanning the heap for the
+  process's credentials and zeroing them gave uid 0. `mprotect`/`munmap`/`mremap`
+  now share a user-range gate, the `PROT_NONE` path can free only user frames, and
+  `vmm::map` refuses `USER_ACCESSIBLE` kernel mappings.
+* **F-LEAD-2 (critical, verified).** A forged `rt_sigreturn(2)` frame restored
+  user-controlled `eflags` into `r11`; `sysretq` loaded them as RFLAGS, so
+  `IOPL=3` gave ring 3 I/O ports and PCI config space (virtio-blk BAR observed).
+  Frame decode now rejects `ip`/`sp` outside the user half and masks restored
+  flags to `USER_RFLAGS_MASK` (IOPL/NT/VM/RF/AC cleared); the TSS carries no I/O
+  bitmap, so ports need both this mask changed and a new TSS to become reachable.
+* **F-x86a-1 (critical, verified).** `recvfrom(2)` wrote the source `sockaddr`
+  and `socklen_t` through unvalidated user pointers: 16 bytes plus a constant 4
+  at two arbitrary addresses, proven against the kernel tick counter (a one-shot
+  arbitrary kernel write, and with a known `Creds` address a direct privesc).
+  Both outputs are now `check_user_ptr`-validated before the write.
+* **F-x86a-3 (medium, verified).** `connect(2)` read `sa_family` through the
+  caller's pointer after checking only the *length*, so a non-canonical pointer
+  caused a ring-0 #GP and the fault handler halted the machine. The pointer is
+  now validated before the read.
+* Also in 2.22.0: the EINVAL syscall diagnostic (attacker-triggerable, flooded
+  serial and framebuffer from the exploit loop) is rate-limited to one line per
+  second.
+
+**Still open from the same audit** (no claim that they are fixed; next batches):
+
+* **F-x86n-1 (high, verified).** A `.deb` may carry a symlink member that points
+  outside the installation root; later archive members resolve through it, so a
+  package installs `/mnt/etc/autorun` and the shell executes it as root on the
+  next boot. Fix: confine symlink targets to the install root and resolve parents
+  without following package-created links.
+* **F-x86v-1 / F-rv-1 (medium, verified).** Crafted ext2 symlink inodes with a
+  huge `i_size` make `read_symlink()` allocate `vec![0; i_size]` (4 GiB) →
+  allocation panic, machine dead. Fix: bound symlink sizes (fast inline; slow
+  ≤ one block) and report `Corrupt`.
+* **F-x86v-3 (medium, verified).** The path walker does not require search
+  (`x`) permission on intermediate directories, so uid 1000 can read a 0644 file
+  inside a root-owned 0700 directory. Fix: `Access::Execute` on every component.
+* **F-x86a-4 / F-x86v-2/4/5 / F-rv-2/3 (static).** TOCTOU on user buffers that
+  are validated once and then used across a `yield`; `rename` copying a sparse
+  `i_size`; fast/slow symlink confusion; RISC-V W^X flag merge and `mprotect`
+  root confusion. To be reproduced, then fixed.
+* **F-rt-1…4 (RISC-V userland runtime, high/medium/low, verified).** `ld-pagh`
+  symbol/`PT_DYNAMIC` bounds (arbitrary write / OOB read), `pagh-libc`
+  `vsnprintf` precision overflow (stack smash), `pagh-python` parser recursion
+  (stack exhaustion). These live in `pagh-libc`/`pagh-python`, not this kernel.
+* **F-rt-4 and the RISC-V items** are tracked in those repositories' own
+  `SECURITY`/report files; the x86_64 kernel audit items above are the kernel's.
+
+Known structural limitations the audit reconfirmed: **no KASLR** (heap base and
+kernel symbols are fixed, which is why the PoCs hardcode/scan addresses), **no
+SMAP**, SMEP only when CPUID reports it, shared kernel leaf page tables between
+address spaces, and **no authenticated boot**. The login/accounts feature planned
+in `AUTH.md` does not change this: it protects against casual use, not against a
+process that can still reach ring 0.
 
 ## Safe defaults
 
