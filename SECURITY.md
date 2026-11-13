@@ -114,6 +114,28 @@ still succeed on stock 2.21.0):
   this layer, so the pattern has no second copy. PoC:
   `tools/security/poc/poc_sock_large_count.c`.
 
+**Fixed in 2.22.5 (round-2 audit):**
+
+* **F-r2-vfs-1 (high, verified).** A hard-link alias of an archive symlink
+  bypassed both F-x86n-1 layers. `link(2)` does not follow the final component,
+  so `./d/y -> ../etc` + `./d/h` HARDLINK to `./d/y` created a second name for
+  the *symlink inode*; the planner only knew `d/y` as a link and the effectful
+  resolver followed the alias, so `./d/h/autorun` (HARDLINK to `./d/pwn`) was
+  written to `/mnt/etc/autorun` and executed as root at the next boot. The pure
+  planner now computes the hard-link/symlink equivalence closure up front
+  (aliases of aliases and `..`-normalized targets included, archive order
+  irrelevant), reports the alias with `UnsafeKind::HardlinkAliasesSymlink` and
+  every member below it, and the installer refuses the whole package
+  (`InstallError::UnsafePath`) before writing anything. The effectful layer
+  never creates a second name for an archive symlink and never traverses a
+  symlink with `nlink > 1`, which also covers an unmarked alias left by an
+  earlier install or a planner regression. Evidence: the audit's
+  `attack/r2/vfs/attack-alias.deb` refused as a whole with `/mnt/etc/autorun`
+  absent and a clean next boot, the new `tar_links` host properties, the
+  in-QEMU `install_hardlink_alias_confinement` selftest, and the extended
+  `tests/pkg/e2e_pkg_escape.py` (round-1 packages still refused, a normal `.deb`
+  with a regular-file hard link still installs).
+
 **Fixed in 2.22.1 (this branch):**
 
 * **F-x86n-1 (high, verified).** A `.deb` carried a symlink member pointing

@@ -26,6 +26,9 @@ Packages produced (deterministic bytes; mtimes are zero):
 | `evil-symlink.deb`   | `x -> /` + `x/pwned_root`: write at the install root        |
 | `evil-relative.deb`  | `z -> ../../..` + `z/escape`: relative escaping target      |
 | `evil-dotdot.deb`    | plain `../../pwned_dotdot` (control: always refused)        |
+| `evil-hardlink-alias.deb` | `d/y -> ../etc`, `d/h` HARDLINK to `d/y`, `d/h/autorun` HARDLINK to payload (F-r2-vfs-1) |
+| `evil-hardlink-chain.deb` | alias of alias + `..`-normalized alias/member paths (F-r2-vfs-1) |
+| `normal-hardlink.deb` | positive control: a hard link to a regular file (one inode, two names) |
 | `normal-hello.deb`   | positive control: two files + one absolute symlink, no child |
 
 `normal-hello.deb` deliberately keeps an absolute symlink member that nothing
@@ -76,6 +79,12 @@ def data_tar(members):
             info.mtime = MTIME
             if kind == "sym":
                 info.type = tarfile.SYMTYPE
+                info.linkname = payload
+                tf.addfile(info)
+            elif kind == "hard":
+                # POSIX hard link: `link(2)` on the target entry itself, without
+                # following a final symlink (round-2 F-r2-vfs-1 primitive).
+                info.type = tarfile.LNKTYPE
                 info.linkname = payload
                 tf.addfile(info)
             elif kind == "dir":
@@ -151,6 +160,42 @@ def build_all(out: pathlib.Path) -> dict[str, pathlib.Path]:
             "evil-dotdot",
             [("../../pwned_dotdot", "file", b"PWN-DOTDOT\n", 0o644)],
             out / "evil-dotdot.deb",
+        ),
+        # F-r2-vfs-1 (round-2 audit): hard-link alias of an archive symlink. The
+        # linker writes `./d/h/autorun` through the alias and lands at
+        # `/mnt/etc/autorun`; a fixed installer refuses the whole package.
+        "evil-hardlink-alias.deb": deb(
+            "evil-hardlink-alias",
+            [
+                ("./d/pwn", "file", b"echo PWN-R2-HARDLINK-ALIAS\n", 0o755),
+                ("./d/y", "sym", "../etc", 0o777),
+                ("./d/h", "hard", "./d/y", 0o777),
+                ("./d/h/autorun", "hard", "./d/pwn", 0o755),
+            ],
+            out / "evil-hardlink-alias.deb",
+        ),
+        # The same primitive with an alias of an alias, a `..`-normalized target
+        # and a `..`-normalized member path below the second alias.
+        "evil-hardlink-chain.deb": deb(
+            "evil-hardlink-chain",
+            [
+                ("./d/pwn", "file", b"echo PWN-R2-HARDLINK-CHAIN\n", 0o755),
+                ("./d/y", "sym", "../etc", 0o777),
+                ("./d/h1", "hard", "./d/y", 0o777),
+                ("./d/h2", "hard", "./d/h1", 0o777),
+                ("./d/x/../h2/autorun", "hard", "./d/pwn", 0o755),
+            ],
+            out / "evil-hardlink-chain.deb",
+        ),
+        # Positive control: a normal hard link to a regular file still installs
+        # (two names, one inode, never a copy).
+        "normal-hardlink.deb": deb(
+            "normal-hardlink",
+            [
+                ("./usr/bin/hello-real", "file", b"hello from hardlink control\n", 0o755),
+                ("./usr/bin/hello-hard", "hard", "./usr/bin/hello-real", 0o755),
+            ],
+            out / "normal-hardlink.deb",
         ),
         # Positive control: a normal package still installs; includes an absolute
         # symlink with no member below it, which is legitimate and must survive.

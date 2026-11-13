@@ -39,23 +39,46 @@ pub enum NormPath {
     SkipUnsafe,
 }
 
+/// Why the planner refused a member (F-x86n-1, F-r2-vfs-1).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum UnsafeKind {
+    /// The member path descends through a symlink this archive creates.
+    MemberBelowSymlink,
+    /// The hard link's **target** path descends through such a symlink: resolving
+    /// it on the installed tree would traverse the link.
+    HardlinkTargetBelowSymlink,
+    /// The hard link's target is itself a symlink this archive creates (or another
+    /// such alias): `link(2)` does not follow the final component, so the new name
+    /// becomes a second name for the **symlink inode** (F-r2-vfs-1).
+    HardlinkAliasesSymlink,
+}
+
 /// One member the planner refuses because its path would be materialized through
-/// a symbolic link the same archive creates (F-x86n-1).
+/// a symbolic link the same archive creates (F-x86n-1), or because it would create
+/// a second name for such a link (F-r2-vfs-1).
 ///
 /// A member written through a link the archive itself planted lands wherever that
 /// link points, not where the member's path says: `./y -> /etc` followed by
 /// `./y/autorun` used to write `/mnt/etc/autorun`, which the shell executes as
 /// root at boot. The effectful installer refuses the **whole package** when this
 /// list is non-empty, before it writes anything.
+///
+/// F-r2-vfs-1 (round-2 audit) is the same escape through an unmarked alias: a
+/// hard link to an archive symlink (`./d/h -> ./d/y`) is a second directory entry
+/// for the *link inode*, so `./d/h/autorun` was materialized at `../etc/autorun`
+/// even though `d/h` was never a symlink member and `d/y` itself was never
+/// traversed by name. The planner therefore tracks hard-link aliases as links
+/// too, and refuses the alias member outright.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct UnsafeMember {
-    /// The refused root-relative path — a member path, or (see
-    /// [`is_hardlink_target`](Self::is_hardlink_target)) a hard link's target.
+    /// The refused root-relative path: a member path, or (see
+    /// [`UnsafeKind::HardlinkTargetBelowSymlink`]) a hard link's target.
     pub path: String,
-    /// The archive path of the symlink the refused path would descend through.
+    /// The archive path of the symlink the refused path would descend through (or,
+    /// for [`UnsafeKind::HardlinkAliasesSymlink`], the symlink/alias being linked).
     pub link: String,
-    /// `true` when [`path`](Self::path) is a hard link's target, not a member.
-    pub is_hardlink_target: bool,
+    /// Which construct the planner refused.
+    pub kind: UnsafeKind,
 }
 
 /// Does `path` descend through one of the root-relative `links`?
@@ -196,12 +219,20 @@ pub struct InstallPlan<'a> {
 ///     dropped: following that link would write wherever it points, not at the
 ///     planned path (F-x86n-1). The check is made against every symlink the
 ///     archive plans, regardless of archive order, because hard links execute
-///     after all file/symlink operations.
+///     after all file/symlink operations;
+///   * a **hard link whose target is such a symlink** is refused as well
+///     ([`UnsafeKind::HardlinkAliasesSymlink`]): `link(2)` does not follow the
+///     final component, so it would create a second name for the symlink inode —
+///     an alias that no later name-based check would recognize (F-r2-vfs-1). The
+///     equivalence closure is computed up front, so aliases of aliases and of
+///     `..`-normalized targets are refused too.
 ///
 /// Pure and allocation-bounded. The symlink-ancestry refusal deliberately
 /// over-approximates: a pathological archive that both creates `x` as a directory
 /// tree and later replaces `x` with a symlink is refused entirely instead of
-/// relying on install order.
+/// relying on install order. Refusing a hard link to an archive symlink is
+/// likewise deliberate: Debian package builders do not emit hard links for symlink
+/// members, while the alias is exactly the primitive F-r2-vfs-1 needs.
 pub fn plan_install<'a>(entries: &[TarEntry<'a>]) -> InstallPlan<'a> {
     let mut plan = InstallPlan::default();
     // Paths this archive creates, used to order hard links.
@@ -219,6 +250,43 @@ pub fn plan_install<'a>(entries: &[TarEntry<'a>]) -> InstallPlan<'a> {
         }
         if let NormPath::Keep(p) = normalize_entry_path(&effective_path(entry)) {
             own_links.insert(p);
+        }
+    }
+
+    // F-r2-vfs-1: a hard link whose target is one of those symlinks is a second
+    // *name for the link inode*, so it is a link for every later ancestry check
+    // too. The audit's construct is `./d/y -> ../etc`, `./d/h -> ./d/y`,
+    // `./d/h/autorun -> ./d/pwn`: the planner used to see only `d/y` as a link,
+    // accepted `d/h` as a harmless hard link and wrote the member named
+    // `d/h/autorun` to `/mnt/etc/autorun`.
+    //
+    // Compute the equivalence closure up front because a hard link may alias
+    // another alias (`h2 -> h1`, `h1 -> y`) and because the target may be written
+    // with harmless `..` components. A single ordered pass would miss `h2` when it
+    // appears before `h1` in the archive; the fixpoint terminates because it only
+    // ever adds paths.
+    let mut hardlink_pairs: Vec<(String, String)> = Vec::new();
+    for entry in entries {
+        if entry.kind != TarType::Hardlink || entry.link_target.is_empty() {
+            continue;
+        }
+        let NormPath::Keep(path) = normalize_entry_path(&effective_path(entry)) else {
+            continue;
+        };
+        let NormPath::Keep(target) = normalize_entry_path(entry.link_target) else {
+            continue;
+        };
+        hardlink_pairs.push((path, target));
+    }
+    loop {
+        let mut changed = false;
+        for (path, target) in hardlink_pairs.iter() {
+            if own_links.contains(target) && own_links.insert(path.clone()) {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
 
@@ -240,7 +308,7 @@ pub fn plan_install<'a>(entries: &[TarEntry<'a>]) -> InstallPlan<'a> {
             plan.unsafe_members.push(UnsafeMember {
                 path,
                 link: String::from(link),
-                is_hardlink_target: false,
+                kind: UnsafeKind::MemberBelowSymlink,
             });
             continue;
         }
@@ -283,7 +351,21 @@ pub fn plan_install<'a>(entries: &[TarEntry<'a>]) -> InstallPlan<'a> {
                             plan.unsafe_members.push(UnsafeMember {
                                 path: t,
                                 link: String::from(link),
-                                is_hardlink_target: true,
+                                kind: UnsafeKind::HardlinkTargetBelowSymlink,
+                            });
+                            continue;
+                        }
+                        // F-r2-vfs-1: `t` is a symlink this archive creates (or an
+                        // alias of one). Creating this hard link would make `path`
+                        // a second name for the link inode, which the effectful
+                        // resolver would then traverse as if it were the archive
+                        // path. Refuse the alias member; the whole package is
+                        // rejected atomically by the installer.
+                        if own_links.contains(&t) {
+                            plan.unsafe_members.push(UnsafeMember {
+                                path,
+                                link: t,
+                                kind: UnsafeKind::HardlinkAliasesSymlink,
                             });
                             continue;
                         }
