@@ -14,7 +14,7 @@
 //     reported instead of silently becoming copies, and symlinks keep archive
 //     order and verbatim targets.
 
-use crate::install::{plan_install, InstallOp, UnsafeKind};
+use crate::install::{descends_through, plan_install, InstallOp, UnsafeKind};
 use crate::tar::{
     effective_path, read_tar, write_tar_members, TarEntry, TarError, TarFormat, TarMember, TarType,
 };
@@ -837,4 +837,66 @@ fn plan_does_not_refuse_a_hardlink_to_a_sibling_of_the_link() {
         .ops
         .iter()
         .any(|op| matches!(op, InstallOp::Hardlink { path, .. } if path == "h")));
+}
+
+// ── F-r3-vfs-1: resolved-spelling split predicate ────────────────────────────
+//
+// The effectful installer preflights a planned symlink whose parent resolution
+// walks a *pre-existing* redirector: the link is materialized at the resolved
+// spelling, and a later member spelled through that path would be written
+// through the archive's own link. `descends_through` is the pure component
+// test that decision uses; these cases pin the boundaries (component-exact, no
+// prefix false positives, root/empty safety).
+
+#[test]
+fn resolved_spelling_descendant_detection() {
+    // The audit's resolved spelling vs the member it would materialize.
+    assert!(descends_through(
+        "usr/share/doc/gcc-14-base/evil/autorun",
+        "usr/share/doc/gcc-14-base/evil"
+    ));
+    assert!(descends_through("lib/evil/autorun", "lib/evil"));
+    // The path itself is not a descendant (it replaces the link; no traversal).
+    assert!(!descends_through("lib/evil", "lib/evil"));
+    // Component-exact: a shared byte prefix is not a path prefix.
+    assert!(!descends_through("lib/evil2/autorun", "lib/evil"));
+    assert!(!descends_through("lib/evil-other", "lib/evil"));
+    // Unrelated and reversed paths.
+    assert!(!descends_through("usr/share/doc/libgcc-s1/evil", "lib/evil"));
+    assert!(!descends_through("lib", "lib/evil"));
+    // The empty directory must never match (root is not a redirector).
+    assert!(!descends_through("etc/autorun", ""));
+    assert!(!descends_through("", ""));
+}
+
+#[test]
+fn spelling_split_plan_boundaries() {
+    // The planner keeps the archive spelling and (correctly) accepts the
+    // package; the split only becomes visible against the pre-existing tree, so
+    // the effectful layer must catch it. Here we pin the planner half: the
+    // archive symlink `libgcc-s1/evil` is not an ancestor of the member spelled
+    // through `gcc-14-base/evil`, exactly the blind spot F-r3-vfs-1 names.
+    let entries = [
+        TarEntry {
+            kind: TarType::Symlink,
+            path: "usr/share/doc/libgcc-s1/evil",
+            prefix: "",
+            link_target: "../../../../etc",
+            content: &[],
+            mode: 0o777,
+            size: 0,
+        },
+        TarEntry {
+            kind: TarType::Regular,
+            path: "usr/share/doc/gcc-14-base/evil/autorun",
+            prefix: "",
+            link_target: "",
+            content: b"payload",
+            mode: 0o755,
+            size: 7,
+        },
+    ];
+    let plan = plan_install(&entries);
+    assert!(plan.unsafe_members.is_empty(), "the planner is spelling-blind");
+    assert_eq!(plan.ops.len(), 2);
 }

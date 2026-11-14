@@ -324,7 +324,14 @@ fn poll_fd(fd: i32, events: u32) -> u32 {
             }
             Some(OpenObject::UnixSocketUnbound { .. }) => 0,
             Some(OpenObject::Signalfd { mask }) => {
-                if crate::task::compat::signalfd_readable(*mask.lock()) {
+                // F-r3-life-2: this arm runs INSIDE `with_current_compat`, so
+                // `COMPAT_STATES` is already held by this context. Calling
+                // `compat::signalfd_readable` here would take the non-reentrant
+                // spinlock a second time and deadlock the CPU with interrupts
+                // disabled (the round-3 audit's 4-syscall machine hang). Compute
+                // readiness from the state the closure already owns.
+                let mask = *mask.lock();
+                if cs.sig_pending & mask & !cs.sig_blocked != 0 {
                     EPOLLIN
                 } else {
                     0

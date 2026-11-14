@@ -61,6 +61,8 @@ pub enum Errno {
     EISDIR = 21,
     /// Invalid argument.
     EINVAL = 22,
+    /// Too many open files (the descriptor table's hard slot bound).
+    EMFILE = 24,
     /// Inappropriate ioctl for device (not a tty).
     ENOTTY = 25,
     /// Illegal seek (pipe/non-seekable).

@@ -2667,7 +2667,14 @@ pub fn sys_dup(oldfd: u64) -> Result<u64, Errno> {
 /// `dup2`/`dup3` must reject a `newfd` at or above this instead of growing the
 /// fd table to the (u32) requested index — a hostile or buggy `dup2(fd, 0x7FFFFFFF)`
 /// would otherwise attempt an ~8-billion-slot allocation and abort the kernel.
+/// `fcntl(F_DUPFD/F_DUPFD_CLOEXEC)` applies the same bound to its `arg` (the
+/// minimum descriptor): round-3 audit F-r3-life-1 showed that arm was missed,
+/// so `fcntl(fd, F_DUPFD, 0x2A000000)` grew the table to 704 MiB and the
+/// allocation panic halted the machine.
 pub const NOFILE_MAX: u64 = 1024;
+// The table-level backstop (`FdSlots::try_alloc`) and this syscall-layer bound
+// must stay the same number, or one of the two layers would be dead code.
+const _: () = assert!(NOFILE_MAX as usize == crate::task::fd_alloc::FD_TABLE_LIMIT);
 
 /// `dup2` (33): duplicate `oldfd` into the explicit descriptor `newfd`, closing
 /// whatever occupies `newfd` first. If `oldfd == newfd` and `oldfd` is valid, it is
@@ -2741,12 +2748,21 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
     if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC {}
     const FD_CLOEXEC: u64 = 1;
     match cmd {
-        F_DUPFD | F_DUPFD_CLOEXEC => compat::with_current_compat(|cs| {
-            let newfd = cs.fds.dup_min(fd as u32, arg as u32)?;
-            cs.fds.set_cloexec(newfd, cmd == F_DUPFD_CLOEXEC);
-            Ok(newfd as u64)
-        })
-        .unwrap_or(Err(Errno::EBADF)),
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            // F-r3-life-1: `arg` is a caller-chosen minimum descriptor number.
+            // Linux rejects a negative or `>= RLIMIT_NOFILE` argument with EINVAL;
+            // reject here — on the full u64, before truncating to u32 — so the fd
+            // table is never asked to grow to an attacker index at all.
+            if arg >= NOFILE_MAX {
+                return Err(Errno::EINVAL);
+            }
+            compat::with_current_compat(|cs| {
+                let newfd = cs.fds.dup_min(fd as u32, arg as u32)?;
+                cs.fds.set_cloexec(newfd, cmd == F_DUPFD_CLOEXEC);
+                Ok(newfd as u64)
+            })
+            .unwrap_or(Err(Errno::EBADF))
+        }
         F_GETFD => compat::with_current_compat(|cs| {
             if cs.fds.get(fd as u32).is_none() {
                 return Err(Errno::EBADF);

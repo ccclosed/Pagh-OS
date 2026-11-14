@@ -84,6 +84,13 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
   kernel-mode фолт → backtrace + halt; ring-3 фолт → SIGSEGV (код 139), убивает только Compat_Process.
 - `gp_fault_handler` дамплит слова вокруг RSP (с проверкой `virt_to_phys`, чтобы не каскадить
   PF на guard-странице).
+- **Политика пользовательских исключений (F-r3-arch-1, 2.22.6).** `#DE`/`#DB`/`#UD`/`#OF`/`#BR`/
+  `#NM`/`#AC` (и user-reachable `#MF`/`#XM`) идут через чистую `linux::trap_frame::exception_action`
+  (host-свойство `exception_trap`): исключение из ring 3 (или с user-RIP) у Compat_Process →
+  `exit_code = 128 + signal` и `exit_current()` («[EXC #N] killing Compat_Process …»), машина
+  живёт; ring 0 на kernel-RIP → `halt()`, настоящая ошибка ядра остаётся фатальной. `syscall`
+  маскирует TF в kernel-RFLAGS (`SFMASK`), чтобы пользовательский single-step не превращался
+  в kernel-mode `#DB`; сам TF сохраняется в r11/sysretq.
 
 ### APIC / ACPI
 - 8259 замаскирован; LAPIC включается через MSR 0x1B. MMIO LAPIC/IOAPIC маппится самим модулем

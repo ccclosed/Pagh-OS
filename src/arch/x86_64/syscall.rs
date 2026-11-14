@@ -56,7 +56,14 @@ pub fn init() {
         // exit tail runs `cli` before unwinding, so preemption never straddles
         // the frame pops.
         LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
-        SFMask::write(RFlags::INTERRUPT_FLAG);
+        // F-r3-arch-1: clear TF as well as IF on `syscall` entry. A user can set
+        // RFLAGS.TF with a plain `popfq`; without this bit the first kernel
+        // instruction after `syscall` would raise #DB with a *kernel* CS/RIP and
+        // the exception handler would (correctly) treat it as a kernel fault and
+        // halt the machine. SYSCALL still saves the user RFLAGS (including TF)
+        // in r11 and `sysretq` restores it, so the user's single-step state is
+        // not lost — it simply cannot leak into the kernel.
+        SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG);
     }
     // NOTE: the boot orchestrator's `init_syscalls` step emits the single
     // concise `info!("syscalls")` line; we deliberately avoid double-logging here.

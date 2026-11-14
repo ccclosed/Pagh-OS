@@ -93,6 +93,7 @@ pub fn run() {
     check_ext2_install_roundtrip();
     check_install_symlink_confinement();
     check_install_hardlink_alias_confinement();
+    check_install_spelling_split_confinement();
 
     // ── New "no new process model" syscalls (Feature: linux-binary-compat) ──
     check_getcwd();
@@ -3117,6 +3118,220 @@ fn check_install_hardlink_alias_confinement() {
     }
     remove_leaf("/mnt/pkgpd");
     pass(name);
+}
+
+/// F-r3-vfs-1 — a package cannot write a member through a symlink it created
+/// when a **pre-existing** redirector desynchronises the archive and resolved
+/// spellings.
+///
+/// Round-3 audit construct (verified on 2.22.5, the shipped tree has
+/// `/usr/share/doc/libgcc-s1 -> gcc-14-base`):
+///
+/// ```text
+/// ./usr/share/doc/libgcc-s1/evil         symlink -> ../../../../etc
+/// ./usr/share/doc/gcc-14-base/evil/autorun   regular payload
+/// ```
+///
+/// The link is created at the *resolved* path (`gcc-14-base/evil`) while the
+/// planner's `own_links` held only the archive spelling, so the second member
+/// walked through the link and wrote `/mnt/etc/autorun`. Covered here:
+///
+///   * the audit's single package is refused atomically (no link created, no
+///     `/mnt/etc/autorun` payload) — the F-r3-vfs-1 preflight;
+///   * the fully self-contained variant works across two packages: package 1
+///     plants `lib -> usr/lib`, package 2 is refused whole;
+///   * the documented placement rule still works: a *regular* member under a
+///     pre-existing relative in-root link installs at the resolved path;
+///   * a normal archive with a symlink member and normal files still installs.
+fn check_install_spelling_split_confinement() {
+    let name = "install_spelling_split_confinement";
+    const MARK: &[u8] = b"PWN-R3-SPELLING-AUTORUN\n";
+    const PAYLOAD: &[u8] = b"r3-spelling-positive-control\n";
+
+    let scratch: [&str; 19] = [
+        "/mnt/pkgsd/gcc-14-base/evil/autorun",
+        "/mnt/pkgsd/gcc-14-base/evil",
+        "/mnt/pkgsd/gcc-14-base/plain",
+        "/mnt/pkgsd/gcc-14-base",
+        "/mnt/pkgsd/redirect",
+        "/mnt/pkgsd",
+        "/mnt/pkgsd2/usr/lib/evil/autorun",
+        "/mnt/pkgsd2/usr/lib/evil",
+        "/mnt/pkgsd2/usr/lib/.keep",
+        "/mnt/pkgsd2/usr/lib",
+        "/mnt/pkgsd2/usr",
+        "/mnt/pkgsd2/lib",
+        "/mnt/pkgsd2",
+        "/mnt/pkgsd3/usr/bin/alias",
+        "/mnt/pkgsd3/usr/bin/tool",
+        "/mnt/pkgsd3/usr/bin/other",
+        "/mnt/pkgsd3/usr/bin",
+        "/mnt/pkgsd3/usr",
+        "/mnt/pkgsd3",
+    ];
+    for p in scratch {
+        remove_leaf(p);
+    }
+
+    // A pre-existing relative, single-name, in-root redirector — the shipped
+    // base disk's `libgcc-s1 -> gcc-14-base` in miniature.
+    let mnt = match vfs::lookup_path("/mnt") {
+        Ok(n) => n,
+        Err(_) => {
+            fail(name, "/mnt is not mounted");
+            return;
+        }
+    };
+    let base = match mnt.create_dir("pkgsd") {
+        Ok(n) => n,
+        Err(_) => {
+            fail(name, "cannot create the spelling-split scratch directory");
+            return;
+        }
+    };
+    if base.create_dir("gcc-14-base").is_err()
+        || base.create_symlink("redirect", b"gcc-14-base").is_err()
+    {
+        fail(name, "cannot create the pre-existing redirector");
+        return;
+    }
+
+    // 1) The audit's package: refused as a whole before the link is created.
+    let attack = [
+        TarMember::Symlink {
+            path: "pkgsd/redirect/evil",
+            target: "../../etc",
+        },
+        TarMember::File {
+            path: "pkgsd/gcc-14-base/evil/autorun",
+            content: MARK,
+        },
+    ];
+    if let Err(d) = install_archive("/mnt", &attack, 0) {
+        fail(name, d);
+        return;
+    }
+    if vfs::lookup_path("/mnt/pkgsd/gcc-14-base/evil").is_ok() {
+        fail(
+            name,
+            "the refused package still created its redirector at the resolved path",
+        );
+        return;
+    }
+    if autorun_holds(MARK) {
+        fail(name, "the spelling-split package wrote /mnt/etc/autorun");
+        return;
+    }
+
+    // 2) Fully self-contained variant: package 1 plants the redirector, package
+    //    2 exploits the spelling split and must be refused whole.
+    let plant = [
+        TarMember::Symlink {
+            path: "pkgsd2/lib",
+            target: "usr/lib",
+        },
+        TarMember::File {
+            path: "pkgsd2/usr/lib/.keep",
+            content: PAYLOAD,
+        },
+    ];
+    if let Err(d) = install_archive("/mnt", &plant, 2) {
+        fail(name, d);
+        return;
+    }
+    let exploit = [
+        TarMember::Symlink {
+            path: "pkgsd2/lib/evil",
+            target: "../../etc",
+        },
+        TarMember::File {
+            path: "pkgsd2/usr/lib/evil/autorun",
+            content: MARK,
+        },
+    ];
+    if let Err(d) = install_archive("/mnt", &exploit, 0) {
+        fail(name, d);
+        return;
+    }
+    if vfs::lookup_path("/mnt/pkgsd2/usr/lib/evil").is_ok() {
+        fail(
+            name,
+            "the self-contained variant planted its redirector at the resolved path",
+        );
+        return;
+    }
+    if autorun_holds(MARK) {
+        fail(name, "the two-package variant wrote /mnt/etc/autorun");
+        return;
+    }
+
+    // 3) Documented placement rule intact: a *regular* member under a
+    //    pre-existing relative in-root link still follows the link.
+    let under_rel = [TarMember::File {
+        path: "pkgsd/redirect/plain",
+        content: PAYLOAD,
+    }];
+    if let Err(d) = install_archive("/mnt", &under_rel, 1) {
+        fail(name, d);
+        return;
+    }
+    if let Err(d) = verify_file("/mnt/pkgsd/gcc-14-base/plain", PAYLOAD) {
+        fail(name, d);
+        return;
+    }
+
+    // 4) Positive control: a normal archive with a symlink member and a file
+    //    installs — the preflight must not refuse ordinary packages.
+    let normal = [
+        TarMember::File {
+            path: "pkgsd3/usr/bin/tool",
+            content: PAYLOAD,
+        },
+        TarMember::Symlink {
+            path: "pkgsd3/usr/bin/alias",
+            target: "tool",
+        },
+        TarMember::File {
+            path: "pkgsd3/usr/bin/other",
+            content: PAYLOAD,
+        },
+    ];
+    if let Err(d) = install_archive("/mnt", &normal, 3) {
+        fail(name, d);
+        return;
+    }
+    if let Err(d) = verify_file("/mnt/pkgsd3/usr/bin/tool", PAYLOAD) {
+        fail(name, d);
+        return;
+    }
+    match vfs::lookup_path("/mnt/pkgsd3/usr/bin/alias") {
+        Ok(n) if n.is_symlink() => {}
+        _ => {
+            fail(name, "a normal symlink member was not installed as a link");
+            return;
+        }
+    }
+
+    for p in scratch {
+        remove_leaf(p);
+    }
+    pass(name);
+}
+
+/// Does `/mnt/etc/autorun` currently contain exactly `mark`? Used by the
+/// installer-confinement checks to prove a hostile package did not plant the
+/// boot-time payload.
+fn autorun_holds(mark: &[u8]) -> bool {
+    let Ok(node) = vfs::lookup_path("/mnt/etc/autorun") else {
+        return false;
+    };
+    let size = node.size() as usize;
+    if size != mark.len() {
+        return false;
+    }
+    let mut buf = alloc::vec![0u8; size];
+    let n = node.read(0, &mut buf).unwrap_or(0);
+    n == mark.len() && buf.get(..n) == Some(mark)
 }
 
 /// Install an in-memory tar through the real [`install_data_tar`] and require

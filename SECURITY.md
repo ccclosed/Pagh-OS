@@ -57,10 +57,11 @@ An external red-team pass ran stock ring-3 Linux ELFs on a private QEMU range
 independent ring3-to-ring0 paths and a one-syscall machine kill on the 2.21.0
 image, and a second, independent round on the 2.22.3 tree found seven more
 (a fork-COW ownership UAF that also reached uid 0, a package-installer hard-link
-alias bypass, and RISC-V kernel/runtime issues). **Fixed in 2.22.0** for the
+alias bypass, and RISC-V kernel/runtime issues). A third round against 2.22.5
+found four more x86 highs, all fixed here. **Fixed in 2.22.0** for the
 round-1 ring3-to-ring0 paths, **2.22.3** for the round-1 user-buffer TOCTOU
-class, **2.22.4/2.22.5** for the round-2 x86 items, with the RISC-V items fixed
-in the sibling repositories. Each finding was reproduced before and after; the
+class, **2.22.4/2.22.5** for the round-2 x86 items, **2.22.6** for the round-3
+x86 items, with the RISC-V items fixed in the sibling repositories. Each finding was reproduced before and after; the
 same PoCs still succeed on the stock images:
 
 * **F-LEAD-1 (critical, verified).** `mprotect(2)` accepted kernel virtual
@@ -117,6 +118,53 @@ same PoCs still succeed on the stock images:
   copied at exactly that length). `sendmsg`/`recvmsg` are not implemented in
   this layer, so the pattern has no second copy. PoC:
   `tools/security/poc/poc_sock_large_count.c`.
+
+**Fixed in 2.22.6 (round-3 audit):**
+
+* **F-r3-arch-1 (high, verified).** User-reachable CPU exceptions other than
+  `#GP`/`#PF` ended in `halt()`: a ring-3 `1/0` (#DE), `ud2` (#UD) or
+  `pushfq/orq $0x100/popfq` (#DB, TF is not IOPL-protected) parked the whole
+  machine from an unprivileged ELF. `#DE`/`#DB`/`#UD`/`#OF`/`#BR`/`#NM`/`#AC`
+  (and the user-reachable `#MF`/`#XM`) now share the pure, host-tested
+  `trap_frame::exception_action` policy: a ring-3 fault (or a user RIP) in a
+  `Compat_Process` is killed with `exit_code = 128 + signal`, a ring-0 fault
+  on a kernel address stays fatal. `SYSCALL` masks TF out of the kernel RFLAGS
+  so a user-set single-step flag cannot become a kernel-mode `#DB`. Evidence:
+  the audit's `mk_de`/`mk_ud`/`mk_db` PoCs return to the prompt on the fixed
+  kernel; `mk_bp` (`int3` from ring 3 → `#GP`) still kills only the process.
+* **F-r3-life-1 (high, verified).** `fcntl(F_DUPFD/F_DUPFD_CLOEXEC, arg)` had
+  no `NOFILE_MAX`/`RLIMIT_NOFILE` clamp (unlike `dup2`/`dup3`), so
+  `fcntl(fd, F_DUPFD, 0x2A000000)` grew the fd-slot vector toward a 704 MiB
+  allocation, the allocator aborted and the machine halted. The syscall now
+  rejects `arg >= NOFILE_MAX` with `EINVAL` before allocation and
+  `FdSlots::try_alloc` independently refuses a slot index at or above the same
+  bound with `EMFILE`; both rules are host-property-tested.
+* **F-r3-life-2 (high, verified).** `epoll_wait` over a registered signalfd
+  called `signalfd_readable()` from inside `poll_fd`'s `with_current_compat`
+  closure, re-entering the non-reentrant `COMPAT_STATES` spinlock with
+  interrupts disabled: a four-syscall, uid-1000 hard hang. The arm now
+  computes readiness from the `CompatState` the closure already owns, and
+  `signalfd_readable` debug-asserts that the registry is not held. Evidence:
+  the PoC returns (`EAGAIN`/`EINTR`) and the prompt stays alive; ordinary
+  epoll/signalfd use works.
+* **F-r3-vfs-1 (high, verified).** The installer's `own_links` recorded the
+  *archive* spelling of a created symlink while the effectful resolver
+  compared the *walked* spelling. With a pre-existing relative in-root
+  redirector (`/usr/share/doc/libgcc-s1 -> gcc-14-base` on the shipped tree),
+  `./usr/share/doc/libgcc-s1/evil -> ../../../../etc` was materialized at
+  `gcc-14-base/evil`; a later member spelled
+  `gcc-14-base/evil/autorun` then traversed the archive's own link and wrote
+  `/mnt/etc/autorun`, which the shell executes as root at the next boot. The
+  effectful layer now preflights every planned symlink against the pre-existing
+  tree and refuses the package as a whole (`UnsafePath`) before the first
+  inode when a member descends through the materialized spelling; it also
+  registers both spellings and the created link inode, and the resolver never
+  traverses a symlink inode the install created. Evidence: the audit's
+  `attack-final.deb` refused atomically with `/mnt/etc/autorun` absent and a
+  clean second boot, the self-contained two-package variant refused, round-1/2
+  constructs still refused, a normal `.deb` still installs; new
+  `tar_links`/`exception_trap`/fd host properties and the in-QEMU
+  `install_spelling_split_confinement` selftest.
 
 **Fixed in 2.22.5 (round-2 audit):**
 

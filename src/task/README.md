@@ -142,7 +142,14 @@ sched_yield, tgkill и др.).
 
 - `COMPAT_STATES` спинлок **нереентерабелен**: замыкания `with_current_compat` не должны
   блокироваться на device I/O и не должны реэнтерить реестр; page-fault-обработчик
-  проверяет `compat_lock_held()` (`COMPAT_DEPTH`), чтобы не дедлокнуться.
+  проверяет `compat_lock_held()` (`COMPAT_DEPTH`), чтобы не дедлокнуться. F-r3-life-2
+  (2.22.6): `epoll_wait`→`poll_fd` уже держит реестр, поэтому signalfd-ветка читает
+  `sig_pending`/`sig_blocked` из уже захваченного `CompatState`, а не зовёт
+  `signalfd_readable()` (тот теперь debug-assert'ит, что реестр не удерживается).
+- **fd-таблица ограничена `NOFILE_MAX`/`FD_TABLE_LIMIT` = 1024** (F-r3-life-1, 2.22.6):
+  `dup2`/`dup3`/`fcntl(F_DUPFD/F_DUPFD_CLOEXEC)` отвергают номер ≥ предела до аллокации
+  (`EINVAL`), а `FdSlots::try_alloc` независимо не даёт вектору вырасти за предел (`EMFILE`);
+  `FdSlots::alloc` остаётся только для внутренних вызовов с `FIRST_DYNAMIC_FD`.
 - `spawn`/`requeue` дропают дубликат уже стоящего в очереди pid (лог `[SCHED] DOUBLE ENQUEUE`).
 - `setup_task_kernel_stack` перепрограммирует единственный глобальный слот RSP0/syscall-стека —
   fork/clone обязаны вернуть его на РОДИТЕЛЯ перед возвратом.
