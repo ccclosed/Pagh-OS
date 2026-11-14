@@ -83,7 +83,7 @@ use alloc::vec::Vec;
 
 use crate::vfs::{self, VfsError, VfsNode};
 
-use super::install::{plan_install, InstallOp, UnsafeKind};
+use super::install::{descends_through, plan_install, InstallOp, InstallPlan, UnsafeKind};
 use super::tar::TarEntry;
 
 /// Failure modes of the effectful ext2 install (design component 10).
@@ -175,11 +175,25 @@ pub fn install_data_tar(entries: &[TarEntry<'_>], root: &str) -> Result<usize, I
         );
     }
 
+    // F-r3-vfs-1: a symlink planned at an archive path can be *materialized* at a
+    // different path when a pre-existing in-root redirector is followed (the
+    // planner only knows archive spellings). If a later member is spelled through
+    // the materialized path it would be written through the archive's own link.
+    // Refuse that package here, before the first inode, so the refusal stays atomic.
+    refuse_spelling_split(root, &plan)?;
+
     let mut installed = 0usize;
     // Symlink paths this same install creates. Layer 2 (the effectful resolver)
     // uses this to refuse any traversal through them even if the plan-level check
-    // were ever bypassed or regressed.
+    // were ever bypassed or regressed. F-r3-vfs-1 registers BOTH spellings — the
+    // archive path and the resolved (walked) path — plus the created link inode,
+    // which is spelling-independent.
     let mut own_links: BTreeSet<String> = BTreeSet::new();
+    // Inodes of symlinks this install created (F-r3-vfs-1): the resolver refuses
+    // to traverse any symlink whose inode is in this set, so a spelling the
+    // string set does not know (a pre-existing redirector in the parent chain)
+    // cannot be used to walk through a link the archive just planted.
+    let mut own_link_inos: BTreeSet<u64> = BTreeSet::new();
 
     // Hard links needing a target that this archive does not create (or that was
     // created later in the plan): retried after the first pass.
@@ -192,16 +206,15 @@ pub fn install_data_tar(entries: &[TarEntry<'_>], root: &str) -> Result<usize, I
                 content,
                 mode,
             } => {
-                install_one(root, path, content, *mode, &own_links)?;
+                install_one(root, path, content, *mode, &own_links, &own_link_inos)?;
                 installed += 1;
             }
             InstallOp::Symlink { path, target } => {
-                install_symlink(root, path, target, &own_links)?;
-                own_links.insert(path.clone());
+                install_symlink(root, path, target, &mut own_links, &mut own_link_inos)?;
                 installed += 1;
             }
             InstallOp::Hardlink { path, target } => {
-                match install_hardlink(root, path, target, &mut own_links) {
+                match install_hardlink(root, path, target, &mut own_links, &mut own_link_inos) {
                     Ok(()) => installed += 1,
                     // The target is not on the tree yet: a later member (or an
                     // earlier package) may still provide it.
@@ -224,7 +237,7 @@ pub fn install_data_tar(entries: &[TarEntry<'_>], root: &str) -> Result<usize, I
             let InstallOp::Hardlink { path, target } = op else {
                 continue;
             };
-            match install_hardlink(root, path, target, &mut own_links) {
+            match install_hardlink(root, path, target, &mut own_links, &mut own_link_inos) {
                 Ok(()) => {
                     installed += 1;
                     progressed = true;
@@ -254,6 +267,74 @@ pub fn install_data_tar(entries: &[TarEntry<'_>], root: &str) -> Result<usize, I
     Ok(installed)
 }
 
+/// F-r3-vfs-1 preflight — refuse a package whose planned symlink would be
+/// materialized at a path other than its archive spelling while a later member
+/// is spelled through that materialized path.
+///
+/// The planner (`plan_install`) only knows archive spellings, so it cannot see
+/// this construct: the archive creates `usr/share/doc/libgcc-s1/evil`, a
+/// **pre-existing** `libgcc-s1 -> gcc-14-base` redirector makes the effectful
+/// resolver create that link at `usr/share/doc/gcc-14-base/evil`, and a later
+/// member is spelled `usr/share/doc/gcc-14-base/evil/autorun` — descending
+/// through the archive's own link. The round-3 audit used exactly that to plant
+/// `/mnt/etc/autorun`.
+///
+/// This check runs before the first inode is written so the refusal stays a
+/// whole-package `UnsafePath` (the string/inode registration in
+/// [`install_symlink`] remains the effectful backstop). It resolves the planned
+/// link's parent against the tree as it exists **before** the install and only
+/// when that resolution succeeds without creating anything: a parent the archive
+/// creates itself cannot be a pre-existing redirector, and members below an
+/// archive-created link are already refused by the planner.
+fn refuse_spelling_split(root: &str, plan: &InstallPlan<'_>) -> Result<(), InstallError> {
+    // Every path this plan would materialize, hard links included.
+    let mut members: Vec<&str> = Vec::new();
+    for op in plan.ops.iter() {
+        match op {
+            InstallOp::File { path, .. }
+            | InstallOp::Symlink { path, .. }
+            | InstallOp::Hardlink { path, .. } => members.push(path.as_str()),
+        }
+    }
+    let no_links: BTreeSet<String> = BTreeSet::new();
+    let no_inos: BTreeSet<u64> = BTreeSet::new();
+
+    for op in plan.ops.iter() {
+        let InstallOp::Symlink { path, .. } = op else {
+            continue;
+        };
+        let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        if comps.is_empty() {
+            continue;
+        }
+        let (parents, filename) = comps.split_at(comps.len() - 1);
+        let dir_rel = parents.join("/");
+        let dir_abs = join_abs(root, &dir_rel);
+        let Ok((_dir, walked)) =
+            resolve_confined(root, &dir_rel, &dir_abs, true, false, &no_links, &no_inos)
+        else {
+            // The parent does not exist yet (the archive creates it) or is not a
+            // traversable in-root directory: no pre-existing spelling split.
+            continue;
+        };
+        let resolved_rel = join_rel(&walked, filename[0]);
+        if resolved_rel == *path {
+            continue;
+        }
+        for member in members.iter() {
+            if *member != path.as_str() && descends_through(member, &resolved_rel) {
+                return Err(unsafe_path_with_link(
+                    &join_abs(root, member),
+                    "member path descends through a symlink the archive creates \
+                     (resolved spelling differs from the archive spelling)",
+                    path,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Outcome of one hard-link attempt.
 enum HardlinkOutcome {
     /// The target does not exist (yet) — the caller may retry.
@@ -267,10 +348,11 @@ fn install_symlink(
     root: &str,
     rel: &str,
     target: &str,
-    own_links: &BTreeSet<String>,
+    own_links: &mut BTreeSet<String>,
+    own_link_inos: &mut BTreeSet<u64>,
 ) -> Result<(), InstallError> {
     let abs = join_abs(root, rel);
-    let (dir, filename) = resolve_parent(root, rel, &abs, own_links)?;
+    let (dir, filename, resolved_dir) = resolve_parent(root, rel, &abs, own_links, own_link_inos)?;
 
     // Replace any existing entry (link-aware removal), but never a directory.
     match dir.lookup(filename) {
@@ -290,12 +372,39 @@ fn install_symlink(
     }
 
     match dir.create_symlink(filename, target.as_bytes()) {
-        Ok(_) => {
+        Ok(node) => {
+            // F-r3-vfs-1: the link may have been created at a *resolved* path
+            // (a pre-existing redirector in the parent chain was followed while
+            // `rel` is the archive spelling). Register both spellings and the
+            // inode: the effectful resolver refuses to traverse either spelling
+            // and, independently of any string, any symlink with this inode.
+            own_links.insert(String::from(rel));
+            let resolved_rel = join_rel(&resolved_dir, filename);
+            if resolved_rel != rel {
+                own_links.insert(resolved_rel);
+            }
+            let ino = node.fs_ino();
+            if ino != 0 {
+                own_link_inos.insert(ino);
+            }
             crate::debug!("Package_Installer: link {} -> {}", abs, target);
             Ok(())
         }
         Err(VfsError::IoError) => Err(no_space("symlink", &abs)),
         Err(e) => Err(vfs_err("symlink", &abs, e)),
+    }
+}
+
+/// Join a resolved directory spelling (root-relative, possibly empty) and a
+/// final component into a normalized root-relative path.
+fn join_rel(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        String::from(name)
+    } else {
+        let mut s = String::from(dir);
+        s.push('/');
+        s.push_str(name);
+        s
     }
 }
 
@@ -313,6 +422,7 @@ fn install_hardlink(
     rel: &str,
     target: &str,
     own_links: &mut BTreeSet<String>,
+    own_link_inos: &mut BTreeSet<u64>,
 ) -> Result<(), HardlinkOutcome> {
     let abs = join_abs(root, rel);
     let target_abs = join_abs(root, target);
@@ -321,8 +431,16 @@ fn install_hardlink(
     // hard-links the entry itself, and a hard link to a symlink is legal. It goes
     // through the same confined walker as the parents (F-x86n-1), so a hostile
     // archive cannot hard-link a node from outside the install root.
-    let target_node = match resolve_confined(root, target, &target_abs, false, false, own_links) {
-        Ok(n) => n,
+    let target_node = match resolve_confined(
+        root,
+        target,
+        &target_abs,
+        false,
+        false,
+        own_links,
+        own_link_inos,
+    ) {
+        Ok((n, _walked)) => n,
         // Not on the tree yet: a later member (or an earlier package) may still
         // provide it.
         Err(ResolveFailure::NotFound) => return Err(HardlinkOutcome::Missing),
@@ -352,10 +470,11 @@ fn install_hardlink(
         )));
     }
 
-    let (dir, filename) = match resolve_parent(root, rel, &abs, own_links) {
-        Ok(v) => v,
-        Err(e) => return Err(HardlinkOutcome::Failed(e)),
-    };
+    let (dir, filename, resolved_dir) =
+        match resolve_parent(root, rel, &abs, own_links, own_link_inos) {
+            Ok(v) => v,
+            Err(e) => return Err(HardlinkOutcome::Failed(e)),
+        };
     match dir.lookup(filename) {
         Ok(existing) => {
             if existing.is_directory() {
@@ -380,7 +499,18 @@ fn install_hardlink(
             // above/atomically). Register it so no later member is resolved
             // through it (F-r2-vfs-1).
             if target_node.is_symlink() {
+                // F-r3-vfs-1: register both spellings and the inode, exactly as
+                // for a symlink member — the alias can be reached by the
+                // resolved spelling too.
                 own_links.insert(String::from(rel));
+                let resolved_rel = join_rel(&resolved_dir, filename);
+                if resolved_rel != rel {
+                    own_links.insert(resolved_rel);
+                }
+                let ino = target_node.fs_ino();
+                if ino != 0 {
+                    own_link_inos.insert(ino);
+                }
             }
             Ok(())
         }
@@ -435,7 +565,8 @@ fn resolve_confined(
     follow_final: bool,
     create_missing: bool,
     own_links: &BTreeSet<String>,
-) -> Result<Arc<dyn VfsNode>, ResolveFailure> {
+    own_link_inos: &BTreeSet<u64>,
+) -> Result<(Arc<dyn VfsNode>, String), ResolveFailure> {
     let trimmed = root.trim_end_matches('/');
     let root_path = if trimmed.is_empty() { "/" } else { trimmed };
     let root_node =
@@ -493,7 +624,7 @@ fn resolve_confined(
         if node.is_symlink() {
             if pending.is_empty() && !follow_final {
                 // lstat-style: a hard link to a symlink links the link itself.
-                return Ok(node);
+                return Ok((node, join_walked(&dirs)));
             }
             // The root-relative path of the link itself, to compare against the
             // links this install created.
@@ -506,6 +637,17 @@ fn resolve_confined(
             if own_links.contains(&link_rel) {
                 return Err(ResolveFailure::Unsafe(
                     "descends through a symlink created by this archive",
+                ));
+            }
+            // F-r3-vfs-1: the string sets know the archive spelling and the
+            // resolved spelling of every link this install created; the inode
+            // check is the spelling-independent backstop. A pre-existing
+            // redirector in the parent chain can make the walked spelling differ
+            // from both, but the node identity cannot be forged.
+            let ino = node.fs_ino();
+            if ino != 0 && own_link_inos.contains(&ino) {
+                return Err(ResolveFailure::Unsafe(
+                    "descends through a symlink created by this archive (inode identity)",
                 ));
             }
             // F-r2-vfs-1: `link(2)` created a second name for this link inode
@@ -545,7 +687,7 @@ fn resolve_confined(
         }
         if !node.is_directory() {
             if pending.is_empty() && !follow_final {
-                return Ok(node);
+                return Ok((node, join_walked(&dirs)));
             }
             return Err(ResolveFailure::Vfs(VfsError::InvalidArgument));
         }
@@ -553,7 +695,21 @@ fn resolve_confined(
         stack.push(node);
     }
 
-    stack.pop().ok_or(ResolveFailure::Vfs(VfsError::NotFound))
+    let node = stack.pop().ok_or(ResolveFailure::Vfs(VfsError::NotFound))?;
+    Ok((node, join_walked(&dirs)))
+}
+
+/// Join the directories actually walked by [`resolve_confined`] into a
+/// root-relative spelling (empty for the install root).
+fn join_walked(dirs: &[String]) -> String {
+    let mut s = String::new();
+    for (i, d) in dirs.iter().enumerate() {
+        if i > 0 {
+            s.push('/');
+        }
+        s.push_str(d);
+    }
+    s
 }
 
 /// Resolve the parent directory of a normalized root-relative path, creating any
@@ -568,7 +724,8 @@ fn resolve_parent<'a>(
     rel: &'a str,
     abs: &str,
     own_links: &BTreeSet<String>,
-) -> Result<(Arc<dyn VfsNode>, &'a str), InstallError> {
+    own_link_inos: &BTreeSet<u64>,
+) -> Result<(Arc<dyn VfsNode>, &'a str, String), InstallError> {
     let comps: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
     if comps.is_empty() {
         return Err(vfs_err("resolve", abs, VfsError::InvalidArgument));
@@ -585,12 +742,15 @@ fn resolve_parent<'a>(
         }
         dir_rel.push_str(comp);
     }
-    let dir = resolve_confined(root, &dir_rel, abs, true, true, own_links)
+    let (dir, walked) = resolve_confined(root, &dir_rel, abs, true, true, own_links, own_link_inos)
         .map_err(|failure| resolve_failure("resolve", abs, failure))?;
     if !dir.is_directory() {
         return Err(vfs_err("resolve", abs, VfsError::InvalidArgument));
     }
-    Ok((dir, filename))
+    // The walked spelling is the resolved root-relative parent directory; a
+    // member materialized under a pre-existing redirector differs from `dir_rel`
+    // (F-r3-vfs-1 records both spellings in `own_links`).
+    Ok((dir, filename, walked))
 }
 
 /// Map a confined-resolution failure onto the public [`InstallError`] (with one
@@ -627,13 +787,14 @@ fn install_one(
     content: &[u8],
     mode: u32,
     own_links: &BTreeSet<String>,
+    own_link_inos: &BTreeSet<u64>,
 ) -> Result<(), InstallError> {
     let abs = join_abs(root, rel);
 
     // R10.2: walk (and create) the parent chain inside the install root. An
     // existing in-root relative link such as `/lib64 -> usr/lib64` is still
     // followed; a link this package creates is not (F-x86n-1).
-    let (dir, filename) = resolve_parent(root, rel, &abs, own_links)?;
+    let (dir, filename, _resolved_dir) = resolve_parent(root, rel, &abs, own_links, own_link_inos)?;
 
     // R10.7: replace an existing regular file so the stored size matches the new
     // content length. ext2 `write_file` only ever GROWS `i_size`, so overwriting in

@@ -249,15 +249,59 @@ the operational checklist in `RELEASING.md`.
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.22.5** (round-2 attack-audit
-  hotfixes: 2.22.4 closed the fork-COW frame-ownership use-after-free
-  (F-r2-arch-1/2), 2.22.5 closes the package-installer hard-link alias bypass
+  be reflected here. **`main` currently reads 2.22.6** (round-3 attack-audit
+  hotfix: 2.22.6 closes the ring-3 CPU-exception machine-kill class, the
+  uncapped `fcntl(F_DUPFD)` allocation and the epoll/signalfd registry
+  self-deadlock, plus the installer spelling-split bypass; on top of the
+  round-2 hotfixes: 2.22.4 closed the fork-COW frame-ownership use-after-free
+  (F-r2-arch-1/2), 2.22.5 closed the package-installer hard-link alias bypass
   (F-r2-vfs-1); on top of the 2026-11-13 attack audit batches: 2.22.0 closed
   the ring3-to-ring0 paths, 2.22.1 confined the package installer, 2.22.2
   hardened VFS/ext2, 2.22.3 closed the user-buffer TOCTOU class, on top of the
   console scrollback and the shell/procfs batches; 2.18.13 carried the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
+  **2.22.6** = the round-3 audit's four high x86 findings are closed
+  (F-r3-arch-1, F-r3-life-1/2, F-r3-vfs-1; reports in the external
+  `attack/r3/*/REPORT.md` tree). (1) `#DE`/`#DB`/`#UD` (and `#OF`/`#BR`/`#NM`/
+  `#AC`, plus the user-reachable `#MF`/`#XM`) used to end in `halt()`, so a
+  single unprivileged `1/0`, `ud2` or `popfq` with `RFLAGS.TF` parked the
+  machine; they now share the pure, host-tested `trap_frame::exception_action`
+  policy with `#GP`/`#PF` — a ring-3 fault (or a user RIP) in a
+  `Compat_Process` sets `exit_code = 128 + signal` and kills only that process,
+  a ring-0 fault on a kernel address stays fatal — and `SYSCALL` masks TF out
+  of the kernel RFLAGS so a user-set trap flag cannot leak into ring 0. The
+  audit's `mk_de`/`mk_ud`/`mk_db` PoCs now return to the prompt while `mk_bp`
+  still exits through `#GP`. (2) `fcntl(F_DUPFD/F_DUPFD_CLOEXEC, arg)` grew
+  the fd table to the caller-chosen index (704 MiB at the audit's `arg`) and
+  the allocator panic halted the machine; the syscall now rejects
+  `arg >= NOFILE_MAX` (1024) with `EINVAL` before touching the table and
+  `FdSlots::try_alloc` independently refuses a slot index at or above the
+  bound with `EMFILE`, both sides host-property-tested. (3) `epoll_wait` over
+  a registered signalfd re-entered the non-reentrant `COMPAT_STATES` spinlock
+  (`poll_fd` → `signalfd_readable` → `with_current_compat`) and hung the CPU
+  with interrupts disabled; the readiness arm now reads the state the closure
+  already owns, and `signalfd_readable` debug-asserts that the registry is not
+  held. A four-syscall PoC returns (`EAGAIN`/`EINTR`), the prompt stays alive,
+  and ordinary epoll/signalfd use is unchanged. (4) the installer's
+  `own_links` held the *archive* spelling of a created symlink while the
+  resolver compared the *walked* spelling, so a pre-existing in-root
+  redirector (`/usr/share/doc/libgcc-s1 -> gcc-14-base` on the shipped tree)
+  let `./usr/share/doc/libgcc-s1/evil -> ../../../../etc` materialize at
+  `gcc-14-base/evil` and a later member spelled
+  `gcc-14-base/evil/autorun` was written through it to `/mnt/etc/autorun`
+  (root code at the next boot). The effectful installer preflights every
+  planned symlink against the pre-existing tree, refuses the package whole
+  before the first inode when a member descends through its materialized
+  spelling, registers both spellings and the created link **inode**, and the
+  resolver refuses to traverse any symlink inode the install created.
+  Evidence: `attack-final.deb` refused atomically (`UnsafePath`, no link, no
+  `/mnt/etc/autorun`, clean second boot), the two-package self-contained
+  variant refused too, round-1/2 constructs still refused and a normal `.deb`
+  installed; new host properties (`exception_trap`, bounded fd allocation,
+  resolved-spelling detection) and the in-QEMU
+  `install_spelling_split_confinement` selftest; the round-1/2/3 PoC matrix
+  re-run on the round-3 QEMU range.
   **2.22.5** = the round-2 package-installer confinement bypass is closed
   (F-r2-vfs-1, high, verified). The 2.22.1 fix modelled only *symlink members*
   as redirectors: `link(2)` does not follow the final component, so a tar

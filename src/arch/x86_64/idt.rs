@@ -3,8 +3,11 @@
 
 use core::cell::SyncUnsafeCell;
 use x86_64::registers::control::Cr2;
+use x86_64::registers::rflags::RFlags;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::VirtAddr;
+
+use crate::arch::x86_64::linux::trap_frame::{exception_action, TrapAction};
 
 // The IDT lives in a `SyncUnsafeCell` rather than a `static mut` so that all
 // access goes through the cell's `.get()` raw pointer, never through a
@@ -112,14 +115,20 @@ extern "x86-interrupt" fn divide_error_handler(stack: InterruptStackFrame) {
         "[EXC #0] Divide Error RIP: 0x{:016x}",
         stack.instruction_pointer.as_u64()
     );
-    halt();
+    user_exception_or_halt(&stack, 0, SIGFPE, "SIGFPE");
 }
 extern "x86-interrupt" fn debug_handler(stack: InterruptStackFrame) {
     crate::error!(
         "[EXC #1] Debug RIP: 0x{:016x}",
         stack.instruction_pointer.as_u64()
     );
-    halt();
+    // F-r3-arch-1: RFLAGS.TF is writable from ring 3 (`pushfq/orq $0x100/popfq`),
+    // so a #DB with the trap flag set is a userspace-induced single-step trap even
+    // if the saved frame describes ring 0 (the user set TF and immediately issued
+    // a syscall; `syscall::init` also masks TF out of the kernel RFLAGS, but keep
+    // this classification as the belt). Both cases are the user's bug, never a
+    // kernel fault.
+    user_exception_or_halt_flagged(&stack, 1, SIGTRAP, "SIGTRAP");
 }
 extern "x86-interrupt" fn nmi_handler(stack: InterruptStackFrame) {
     crate::error!(
@@ -140,28 +149,29 @@ extern "x86-interrupt" fn overflow_handler(stack: InterruptStackFrame) {
         "[EXC #4] Overflow RIP: 0x{:016x}",
         stack.instruction_pointer.as_u64()
     );
-    halt();
+    // Linux delivers #OF (INTO/into overflow) as SIGSEGV, not SIGFPE.
+    user_exception_or_halt(&stack, 4, SIGSEGV, "SIGSEGV");
 }
 extern "x86-interrupt" fn bound_range_handler(stack: InterruptStackFrame) {
     crate::error!(
         "[EXC #5] Bound Range RIP: 0x{:016x}",
         stack.instruction_pointer.as_u64()
     );
-    halt();
+    user_exception_or_halt(&stack, 5, SIGSEGV, "SIGSEGV");
 }
 extern "x86-interrupt" fn invalid_opcode_handler(stack: InterruptStackFrame) {
     crate::error!(
         "[EXC #6] Invalid Opcode RIP: 0x{:016x}",
         stack.instruction_pointer.as_u64()
     );
-    halt();
+    user_exception_or_halt(&stack, 6, SIGILL, "SIGILL");
 }
 extern "x86-interrupt" fn device_not_available_handler(stack: InterruptStackFrame) {
     crate::error!(
         "[EXC #7] Device NA RIP: 0x{:016x}",
         stack.instruction_pointer.as_u64()
     );
-    halt();
+    user_exception_or_halt(&stack, 7, SIGSEGV, "SIGSEGV");
 }
 extern "x86-interrupt" fn double_fault_handler(stack: InterruptStackFrame, error_code: u64) -> ! {
     crate::drivers::earlyfb::errorln(format_args!(
@@ -384,11 +394,16 @@ extern "x86-interrupt" fn x87_fpu_handler(stack: InterruptStackFrame) {
         "[EXC #16] x87 FPU RIP=0x{:016x}",
         stack.instruction_pointer.as_u64()
     );
-    halt();
+    user_exception_or_halt(&stack, 16, SIGFPE, "SIGFPE");
 }
-extern "x86-interrupt" fn alignment_check_handler(_stack: InterruptStackFrame, error_code: u64) {
-    crate::error!("[EXC #17] Alignment err=0x{:x}", error_code);
-    halt();
+extern "x86-interrupt" fn alignment_check_handler(stack: InterruptStackFrame, error_code: u64) {
+    crate::error!(
+        "[EXC #17] Alignment err=0x{:x} RIP: 0x{:016x}",
+        error_code,
+        stack.instruction_pointer.as_u64()
+    );
+    // User code can set RFLAGS.AC itself; Linux reports #AC as SIGBUS.
+    user_exception_or_halt(&stack, 17, SIGBUS, "SIGBUS");
 }
 extern "x86-interrupt" fn machine_check_handler(_stack: InterruptStackFrame) -> ! {
     crate::error!("[EXC #18] Machine Check — halting");
@@ -399,7 +414,7 @@ extern "x86-interrupt" fn simd_fpu_handler(stack: InterruptStackFrame) {
         "[EXC #19] SIMD FPU RIP=0x{:016x}",
         stack.instruction_pointer.as_u64()
     );
-    halt();
+    user_exception_or_halt(&stack, 19, SIGFPE, "SIGFPE");
 }
 extern "x86-interrupt" fn virtualization_handler(stack: InterruptStackFrame) {
     crate::error!(
@@ -450,6 +465,75 @@ irq_handler!(irq44_handler, 44);
 irq_handler!(irq45_handler, 45);
 irq_handler!(irq46_handler, 46);
 irq_handler!(irq47_handler, 47);
+
+// Linux signal numbers used by the user-exception policy, taken from the one
+// compat table so a future renumbering cannot make the two disagree.
+const SIGILL: u8 = crate::arch::x86_64::linux::signal_frame::SIGILL as u8;
+const SIGTRAP: u8 = crate::arch::x86_64::linux::signal_frame::SIGTRAP as u8;
+const SIGBUS: u8 = crate::arch::x86_64::linux::signal_frame::SIGBUS as u8;
+const SIGFPE: u8 = crate::arch::x86_64::linux::signal_frame::SIGFPE as u8;
+const SIGSEGV: u8 = crate::arch::x86_64::linux::signal_frame::SIGSEGV as u8;
+
+/// F-r3-arch-1: disposition of a synchronous CPU exception with no kernel
+/// handler of its own (#DE/#DB/#UD/#OF/#BR/#NM/#AC/#MF/#XM).
+///
+/// The round-3 audit showed that a single ring-3 instruction (`1/0`, `ud2`, a
+/// `popfq` with TF) parked the whole machine in `halt()`: only #GP and #PF had
+/// the "user fault kills the process, kernel keeps running" policy. This helper
+/// applies the same contract (`trap_frame::exception_action`) to every such
+/// vector: a Linux Compat_Process found in ring 3 (or faulting on a user RIP)
+/// gets `exit_code = 128 + signal` and is terminated; anything else still
+/// halts, so a real ring-0 kernel bug cannot hide behind the policy.
+fn user_exception_or_halt(
+    stack: &InterruptStackFrame,
+    vector: u8,
+    signal: u8,
+    signal_name: &str,
+) -> ! {
+    user_exception_or_halt_inner(stack, vector, signal, signal_name, false)
+}
+/// [`user_exception_or_halt`] for #DB: a saved RFLAGS.TF also marks the trap as
+/// user-induced even when the saved frame itself is ring 0 (see `debug_handler`).
+fn user_exception_or_halt_flagged(
+    stack: &InterruptStackFrame,
+    vector: u8,
+    signal: u8,
+    signal_name: &str,
+) -> ! {
+    let user_tf = stack.cpu_flags.contains(RFlags::TRAP_FLAG);
+    user_exception_or_halt_inner(stack, vector, signal, signal_name, user_tf)
+}
+
+fn user_exception_or_halt_inner(
+    stack: &InterruptStackFrame,
+    vector: u8,
+    signal: u8,
+    signal_name: &str,
+    force_user: bool,
+) -> ! {
+    let rip = stack.instruction_pointer.as_u64();
+    let user_mode = force_user || (stack.code_segment.0 & 3) == 3;
+    let pid = crate::task::scheduler::current_pid();
+    let action = exception_action(
+        user_mode,
+        rip,
+        crate::arch::x86_64::linux::validate::USER_ADDR_MAX,
+        crate::task::compat::compat_exists(pid),
+    );
+    if action == TrapAction::KillProcess {
+        crate::task::compat::with_current_compat(|cs| cs.exit_code = Some(128 + signal));
+        crate::error!(
+            "[EXC #{}] killing Compat_Process pid={} ({}) - kernel keeps running",
+            vector,
+            pid,
+            signal_name
+        );
+        crate::task::scheduler::exit_current();
+    }
+    // Ring 0 on a kernel address (or no compat state to blame): a genuine
+    // kernel/hardware fault. The handler already logged the vector and RIP.
+    halt();
+}
 
 fn halt() -> ! {
     crate::arch::cpu::halt_loop()

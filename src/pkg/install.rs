@@ -98,6 +98,22 @@ pub fn symlink_ancestor<'a>(path: &str, links: &'a BTreeSet<String>) -> Option<&
     None
 }
 
+/// Does the normalized root-relative `path` descend through the directory
+/// `dir`? Component-exact: `usr/lib/evil2` does **not** descend through
+/// `usr/lib/evil`. Pure and panic-free.
+///
+/// F-r3-vfs-1: when a planned symlink is materialized at a path other than its
+/// archive spelling (a pre-existing in-root redirector is followed), a later
+/// member spelled through the materialized path would traverse the link. The
+/// effectful layer checks the planned members against that resolved spelling
+/// with this predicate before writing anything.
+pub fn descends_through(path: &str, dir: &str) -> bool {
+    !dir.is_empty()
+        && path.len() > dir.len()
+        && path.starts_with(dir)
+        && path.as_bytes().get(dir.len()) == Some(&b'/')
+}
+
 /// Normalize an archived tar path to a safe, root-relative path (R10.1, R10.8).
 ///
 /// The archived path is first stripped of any leading `./` and `/` components,
