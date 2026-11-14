@@ -220,15 +220,22 @@ into `/mnt/etc/pagh-release` and the motd via `env!("CARGO_PKG_VERSION")`
 (`provision.rs`), so a stale version is user-visible at boot.
 
 **Branching and release channels.** `main` is the stable branch; `dev` is the
-experimental integration branch. Feature and fix PRs target `dev` (CI green
-before merge); release stabilisation merges `dev` into `main`, and a hotfix
-branches from `main` and is merged back into `dev` afterwards. Pre-releases and
-experimental snapshots are tagged from `dev` (`vX.Y.Z-rc.N`, `-pre.N`) and
-published as GitHub pre-releases; stable releases are tagged from `main` and may
-keep the repository's historical bare-version spelling (`X.Y.Z` as well as
-`vX.Y.Z`). `.github/workflows/release.yml` refuses a tag whose commit is not
-reachable from the branch implied by the suffix and attaches the release kernel;
-the full model is in `BRANCHING.md`.
+experimental integration branch and carries the version of the *next* release.
+Feature and fix PRs target `dev` (CI green before merge); release stabilisation
+merges `dev` into `main` with `--no-ff` and no code changes beyond release
+metadata. Release candidates come from `dev` only, and only as `vX.Y.Z-rc.N`
+(there is no `-pre.N` channel); stable releases are tagged `vX.Y.Z` from
+`main`, and the repository's older bare-numeric tags stay history. A hotfix is
+limited to a critical/high verified security finding or a release-blocking
+regression in a released version: it branches from `main`, is tagged straight
+to stable **without** an RC, and is merged back into `dev` with `--no-ff`. The
+`main currently reads` line below describes the stable release only — `dev`
+never rewrites it. `.github/workflows/release.yml` refuses a stable tag not
+reachable from `main`, a `-rc.N` tag not reachable from `dev` or already on
+`main`, any other suffix, and a tag whose base version disagrees with
+`Cargo.toml`; it attaches the release kernel (`pagh-vTAG.elf`, with `.sha256`)
+and the checksummed source archive. The full model is in `BRANCHING.md` and
+the operational checklist in `RELEASING.md`.
 
 - **MAJOR** — image-level breaks: on-disk/boot format changes, removed
   syscall families, incompatible userland expectations. Rare; last was
