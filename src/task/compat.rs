@@ -344,7 +344,19 @@ pub fn take_signalfd_signal(mask: u64) -> Option<u64> {
 }
 
 /// Whether a signalfd with `mask` is readable right now.
+///
+/// MUST be called without `COMPAT_STATES` held. `with_current_compat` is
+/// non-reentrant: a caller already inside the registry (e.g. an fd-readiness
+/// check running under the lock) has to read `cs.sig_pending`/`cs.sig_blocked`
+/// from the state it already has instead of calling this helper. Round-3 audit
+/// F-r3-life-2 was exactly that re-entry through `epoll_wait`'s signalfd arm;
+/// the debug assert below turns any reintroduction into a loud failure in debug
+/// builds instead of a silent machine hang.
 pub fn signalfd_readable(mask: u64) -> bool {
+    debug_assert!(
+        !compat_lock_held(),
+        "signalfd_readable re-entered COMPAT_STATES (non-reentrant spinlock)"
+    );
     with_current_compat(|cs| cs.sig_pending & mask & !cs.sig_blocked != 0).unwrap_or(false)
 }
 

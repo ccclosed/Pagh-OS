@@ -195,6 +195,49 @@ pub fn page_fault_action(
     }
 }
 
+// ─── CPU-exception disposition policy (F-r3-arch-1) ─────────────────────────
+
+/// What a synchronous CPU-exception handler (#DE/#DB/#UD/#OF/#BR/#NM/#AC/#MF/#XM)
+/// must do when the exception is not one the kernel itself expects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrapAction {
+    /// Terminate only the faulting Compat_Process; the machine keeps running.
+    KillProcess,
+    /// Dump what the handler logged and halt: an exception in ring 0 is a
+    /// genuine kernel bug (or hardware failure) and must stay fatal.
+    Halt,
+}
+
+/// Decide the disposition of a synchronous CPU exception.
+///
+/// F-r3-arch-1 (round-3 audit, high): only `#GP` and `#PF` implemented the
+/// "a user-mode exception is a userspace bug, not a machine fault" rule; every
+/// other user-reachable vector ended in `halt()`, so `1/0`, `ud2` or a
+/// ring-3 `popfq` with TF set parked the whole machine from an unprivileged
+/// process. The rule here is the same one `#GP`/`#PF` use: if the faulting
+/// context is ring 3 (or the saved RIP is a user address) **and** the current
+/// task is a Linux Compat_Process, kill only that process; otherwise halt.
+///
+/// `user_mode` is derived from the saved CS RPL; `fault_rip < user_addr_max`
+/// is the same user-address check the `#GP`/`#PF` paths apply. Both are needed:
+/// a kernel-mode exception on a user RIP (e.g. a future emulation path) should
+/// not take the machine down, while an exception in ring 0 on a kernel RIP is
+/// exactly the case that must remain fatal. Only a compat task can be killed;
+/// a native kernel task has no Compat_Process to terminate, so it stays fatal.
+pub fn exception_action(
+    user_mode: bool,
+    fault_rip: u64,
+    user_addr_max: u64,
+    current_is_compat: bool,
+) -> TrapAction {
+    let on_user_rip = fault_rip < user_addr_max;
+    if current_is_compat && (user_mode || on_user_rip) {
+        TrapAction::KillProcess
+    } else {
+        TrapAction::Halt
+    }
+}
+
 // ─── Layout assertions (the `src/test.rs` contract, in type form) ─────────────
 
 const _: () = {

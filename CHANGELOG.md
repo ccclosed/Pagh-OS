@@ -11,6 +11,64 @@ tagged release (`2.18.13`, merged as PR #56). The full technical story of every 
 is the release-note block in `AGENTS.md`; the paragraphs here name the user-visible
 change and point there rather than duplicating it.
 
+## 2.22.6
+
+Round-3 audit hotfix: four high, verified findings (three x86 machine-kill /
+lifetime primitives and one package-installer confinement bypass). The round-3
+reports live in `attack/r3/{arch,life,vfs}/REPORT.md` (external audit tree).
+
+* **F-r3-arch-1 (high, verified): ring-3 CPU exceptions halted the machine.**
+  Only `#GP`/`#PF` implemented the "a userspace exception kills the process,
+  the kernel keeps running" rule; `1/0`, `ud2` or `pushfq/orq $0x100/popfq`
+  from an unprivileged ELF parked the CPU forever. `#DE`/`#DB`/`#UD` (and
+  `#OF`/`#BR`/`#NM`/`#AC`, plus the user-reachable `#MF`/`#XM`) now share the
+  pure, host-tested `trap_frame::exception_action` policy: a ring-3 fault (or a
+  user RIP) in a Compat_Process sets `exit_code = 128 + signal` and terminates
+  only that process; a ring-0 fault on a kernel address stays fatal. `syscall`
+  also masks TF out of the kernel RFLAGS, so a user-set single-step flag cannot
+  turn a syscall into a kernel-mode `#DB`. PoCs `mk_de`/`mk_ud`/`mk_db` now
+  return to the prompt; `mk_bp` (ring-3 `int3` → `#GP`) still kills only the
+  process.
+* **F-r3-life-1 (high, verified): `fcntl(F_DUPFD)` had no descriptor cap.**
+  `dup2`/`dup3` were bounded by `NOFILE_MAX = 1024`, but the `F_DUPFD`/
+  `F_DUPFD_CLOEXEC` arm passed the caller's `arg` straight into
+  `FdTable::dup_min`, so `fcntl(fd, F_DUPFD, 0x2A000000)` grew the slot vector
+  toward a 704 MiB allocation and the allocator panic halted the machine. The
+  syscall now rejects `arg >= NOFILE_MAX` with `EINVAL` before touching the
+  table, and `FdSlots::try_alloc` independently refuses any slot index at or
+  above the same bound (`EMFILE`) before growing the vector — both sides of the
+  bound are host-property-tested.
+* **F-r3-life-2 (high, verified): `epoll_wait` over a signalfd self-deadlocked
+  `COMPAT_STATES`.** `poll_fd` already ran inside `with_current_compat`; its
+  signalfd arm called `signalfd_readable()`, which took the same non-reentrant
+  spinlock again — a hard hang with interrupts disabled (no timer, no
+  watchdog). The arm now computes readiness from the compat state the closure
+  already owns, and `signalfd_readable` carries a debug assert so the
+  re-entrancy class fails loudly instead of hanging. A four-syscall PoC now
+  returns; ordinary epoll/signalfd combinations still work.
+* **F-r3-vfs-1 (high, verified): installer spelling split.** `own_links`
+  tracked the *archive* spelling of a created symlink while the effectful
+  resolver compared the *walked* spelling. A pre-existing relative in-root
+  redirector (the shipped tree has `/usr/share/doc/libgcc-s1 -> gcc-14-base`)
+  made `./usr/share/doc/libgcc-s1/evil -> ../../../../etc` materialize at
+  `gcc-14-base/evil`, after which a member spelled
+  `gcc-14-base/evil/autorun` was written through that link to
+  `/mnt/etc/autorun` (root at next boot). The installer now preflights every
+  planned symlink against the pre-existing tree and refuses the package whole
+  (`UnsafePath`) before the first inode when a member descends through its
+  materialized spelling; the effectful layer additionally registers both
+  spellings and the created link **inode**, and the resolver refuses to
+  traverse any symlink inode the install created. `attack-final.deb` is
+  refused atomically, the two-package self-contained variant too, round-1/2
+  constructs stay refused and a normal `.deb` still installs.
+
+Gates: the six documented commands, new host properties
+(`exception_trap`, bounded fd allocation, resolved-spelling detection), the
+in-QEMU `install_spelling_split_confinement` selftest, and the round-1/2/3 PoC
+regression matrix on the round-3 QEMU range.
+
+Full story: `AGENTS.md`, 2.22.6.
+
 ## 2.22.5
 
 Round-2 audit finding F-r2-vfs-1 (high, verified): a hard-link alias of a package

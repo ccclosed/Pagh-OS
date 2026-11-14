@@ -544,6 +544,12 @@ mod properties {
     // policy as `irq_frame`/`kill_target`.
     mod page_fault;
 
+    // Synchronous CPU-exception disposition policy (round-3 audit F-r3-arch-1):
+    // #DE/#DB/#UD/#OF/#BR/#NM/#AC/#MF/#XM taken from ring 3 kill only the
+    // Compat_Process, kernel-mode faults stay fatal — the #GP/#PF rule applied
+    // to every other user-reachable vector. Same descriptive-name policy.
+    mod exception_trap;
+
     // Process credentials + filesystem permission enforcement (security model):
     // the POSIX owner/group/other matrix with the root execute rule, and every
     // set*id transition's ownership invariant, over arbitrary ids. `p55` is

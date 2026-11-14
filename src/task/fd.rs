@@ -505,7 +505,14 @@ impl FdTable {
             .get(&oldfd)
             .copied()
             .unwrap_or_else(|| default_object_flags(&dup));
-        let fd = self.slots.alloc(min as usize, dup);
+        // F-r3-life-1: `min` is caller-controlled (`fcntl(F_DUPFD, arg)`). The
+        // syscall layer rejects `arg >= NOFILE_MAX` with EINVAL, but the table
+        // itself refuses to grow past `FD_TABLE_LIMIT` so no path can turn a
+        // huge minimum into a multi-hundred-MiB allocation (EMFILE).
+        let fd = self
+            .slots
+            .try_alloc(min as usize, super::fd_alloc::FD_TABLE_LIMIT, dup)
+            .map_err(|_| Errno::EMFILE)?;
         self.cloexec.remove(&fd); // the duplicate starts without FD_CLOEXEC
         self.flags.insert(fd, flags);
         Ok(fd)

@@ -19,6 +19,20 @@ use alloc::vec::Vec;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BadFd;
 
+/// Error from [`FdSlots::try_alloc`]: placing the object at the lowest free
+/// index `>= min` would grow the descriptor table past the enforced limit.
+/// The syscall layer maps this to `EMFILE`; nothing is allocated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableFull;
+
+/// Hard upper bound on the number of slots a per-process descriptor table may
+/// hold (Linux's default `RLIMIT_NOFILE`). The kernel syscall layer enforces
+/// the same bound on every caller-supplied descriptor number (`dup2`/`dup3`/
+/// `fcntl(F_DUPFD)`), and [`FdSlots::try_alloc`] enforces it on the table
+/// itself so no future caller can grow the `Vec` to an attacker-chosen index
+/// and abort the kernel on an unserviceable allocation (F-r3-life-1: 704 MiB).
+pub const FD_TABLE_LIMIT: usize = 1024;
+
 /// Return the lowest index `>= min` whose slot is free.
 ///
 /// A slot is free when it is `Some(None)` (an explicitly empty slot) or lies past
@@ -61,8 +75,35 @@ impl<T> FdSlots<T> {
 
     /// Allocate the lowest free index `>= min`, growing the vector with empty
     /// slots as needed, store `obj` there, and return the index (R2.4).
+    ///
+    /// Infallible by design: every kernel caller other than `fcntl(F_DUPFD)`
+    /// passes [`super::fd::FdTable::FIRST_DYNAMIC_FD`], so the index is bounded
+    /// by the number of open descriptors. A caller-supplied minimum must go
+    /// through [`FdSlots::try_alloc`] instead.
     pub fn alloc(&mut self, min: usize, obj: T) -> u32 {
         let idx = lowest_free_index(&self.slots, min);
+        self.store(idx, obj)
+    }
+
+    /// [`FdSlots::alloc`] with a hard index bound: if the lowest free index
+    /// `>= min` would be `>= limit`, return [`TableFull`] **before** growing
+    /// the vector or allocating anything (F-r3-life-1).
+    ///
+    /// This is the call `fcntl(F_DUPFD)` must use: `min` is the caller's `arg`
+    /// and `limit` is [`FD_TABLE_LIMIT`]. The check is on the slot index, not
+    /// on `min` alone, so a full table still reports `EMFILE` rather than
+    /// growing without bound.
+    pub fn try_alloc(&mut self, min: usize, limit: usize, obj: T) -> Result<u32, TableFull> {
+        let idx = lowest_free_index(&self.slots, min);
+        if idx >= limit {
+            return Err(TableFull);
+        }
+        Ok(self.store(idx, obj))
+    }
+
+    /// Place `obj` at `idx`, growing with empty slots first. `idx` must have
+    /// been produced by [`lowest_free_index`].
+    fn store(&mut self, idx: usize, obj: T) -> u32 {
         if idx < self.slots.len() {
             self.slots[idx] = Some(obj);
         } else {
