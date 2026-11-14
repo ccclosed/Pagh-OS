@@ -6518,6 +6518,153 @@ mod linux_stop_tests {
         compat::remove_compat(FAKE_CHILD);
     }
 }
+
+// ─── execve / exit address-space teardown accounting (round 3, F-r3-lead-1) ──
+//
+// `execve` swaps to a fresh CRT3 and may free the old PML4 tree. That free is
+// only safe when NO live task still runs on the old space. The buggy rule
+// looked at the ready queue and pending reaps only, so a sibling thread parked
+// by SIGSTOP/SIGTSTP (`STOPPED_TASKS`, out of rotation until SIGCONT) was
+// invisible and its page tables were freed under it.
+//
+// This routine drives the real scheduler registries with synthetic Tcbs and
+// real freshly-allocated user PML4 frames (so a `true` result really frees a
+// frame tree, and a wrong `true` would be an immediate double free caught by
+// the PMM's own detectors). It runs with interrupts masked for the whole
+// duration: every synthetic frame is a rsp sentinel that must never be
+// restored, and `quiesce`/`resume` keep the real tasks out of rotation while
+// the fake ones are queued.
+mod exec_as_tests {
+    use crate::arch::cpu::{disable_interrupts, enable_interrupts, interrupts_enabled};
+    use crate::memory::vmm;
+    use crate::task::scheduler::{self, Tcb};
+    use alloc::vec::Vec;
+
+    /// Drain the ready queue (masking ticks) so this routine's synthetic Tcbs
+    /// are the only ones the accounting helper can see. `resume` restores the
+    /// real tasks.
+    fn quiesce() -> (bool, Vec<Tcb>) {
+        let entry_if = interrupts_enabled();
+        disable_interrupts();
+        let mut saved: Vec<Tcb> = Vec::new();
+        while let Some(t) = scheduler::schedule() {
+            saved.push(t);
+        }
+        (entry_if, saved)
+    }
+
+    fn resume(entry_if: bool, saved: Vec<Tcb>) {
+        for t in saved {
+            scheduler::requeue(t);
+        }
+        if entry_if {
+            enable_interrupts();
+        }
+    }
+
+    /// Spawn a sentinel task that owns `cr3` (it must never be scheduled: the
+    /// accounting checks below run with interrupts masked and the frame is
+    /// removed from rotation before that changes).
+    fn spawn_owner(cr3: u64) -> u64 {
+        let pid = scheduler::next_pid();
+        scheduler::spawn(Tcb::new(pid, 0x8000, cr3));
+        pid
+    }
+
+    /// `execve`/exit teardown must not free an address space a live task still
+    /// uses — including a task parked by SIGSTOP, which is NOT in the ready
+    /// queue — and must still free a genuinely exclusive space.
+    pub fn blocked_sibling_keeps_address_space() {
+        let (entry_if, saved) = quiesce();
+
+        // Three real user PML4 frames: a wrong `true` from the helper frees a
+        // frame tree (and the PMM's double-free detector/allocator state would
+        // catch the collision later), while a correct `false` leaves it owned
+        // by the reaper.
+        let (exclusive, ready_space, pending_space) = match (
+            vmm::new_user_pml4(),
+            vmm::new_user_pml4(),
+            vmm::new_user_pml4(),
+        ) {
+            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+            _ => {
+                resume(entry_if, saved);
+                assert_kernel!(false, "exec-as: PML4 allocation failed (PMM starved)");
+                return;
+            }
+        };
+
+        // 1. Baseline: an exclusively owned, really-allocated user PML4 is
+        //    freed (the helper must not become "never free": the ELF loader's
+        //    fuzz test relies on this to release its throwaway spaces).
+        assert_kernel!(
+            scheduler::drop_exclusive_user_space(exclusive),
+            "exec-as: an exclusive address space is freed"
+        );
+
+        // 2. A task in the READY QUEUE that shares the CR3 keeps it alive.
+        let ready_pid = spawn_owner(ready_space);
+        assert_kernel!(
+            !scheduler::drop_exclusive_user_space(ready_space),
+            "exec-as: a ready sibling keeps the address space"
+        );
+
+        // 3. Park it exactly like a delivered SIGSTOP does. The parked task
+        //    lives in STOPPED_TASKS only — the registry the old rule missed.
+        scheduler::mark_stop_requested(ready_pid);
+        let _ = scheduler::stop_ready_pids(&[ready_pid]);
+        assert_kernel!(
+            scheduler::is_stopped(ready_pid),
+            "exec-as: the sibling is parked"
+        );
+        assert_kernel!(
+            !scheduler::drop_exclusive_user_space(ready_space),
+            "exec-as: a SIGSTOP-parked sibling keeps the address space (F-r3-lead-1)"
+        );
+
+        // 4. After SIGCONT-style resume it is back in the ready queue; once the
+        //    last reference is gone the space IS freed.
+        assert_kernel!(
+            scheduler::resume_stopped(ready_pid),
+            "exec-as: the parked sibling resumes"
+        );
+        assert_kernel!(
+            !scheduler::drop_exclusive_user_space(ready_space),
+            "exec-as: the resumed sibling still keeps the address space"
+        );
+        scheduler::remove_ready_pids(&[ready_pid]);
+        assert_kernel!(
+            scheduler::drop_exclusive_user_space(ready_space),
+            "exec-as: the last reference released -> freed"
+        );
+
+        // 5. A pending exit reap still owns its CR3: freeing it here would be
+        //    a double free when the reaper runs. `request_exit` on a parked
+        //    task moves its frame out of STOPPED_TASKS into PENDING_REAPS with
+        //    that task's own cr3.
+        let pending_pid = spawn_owner(pending_space);
+        scheduler::mark_stop_requested(pending_pid);
+        let _ = scheduler::stop_ready_pids(&[pending_pid]);
+        assert_kernel!(
+            scheduler::is_stopped(pending_pid),
+            "exec-as: the killed sibling is parked"
+        );
+        scheduler::request_exit(pending_pid);
+        assert_kernel!(
+            !scheduler::is_stopped(pending_pid),
+            "exec-as: request_exit took the parked frame"
+        );
+        assert_kernel!(
+            !scheduler::drop_exclusive_user_space(pending_space),
+            "exec-as: a pending reap keeps the space (the reaper frees it exactly once)"
+        );
+
+        // Interrupts are still masked, so the reaper has not run yet: it will
+        // free `pending_space` on a later tick, after `resume` restores the
+        // real tasks. Nothing else touches it here.
+        resume(entry_if, saved);
+    }
+}
 // ─── Timer-tick signal delivery, in-guest (issue #12, task t9) ───────────────
 //
 // The tick path is the LAST chance for a CPU-bound task that never enters a
@@ -7277,6 +7424,14 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "linux::SIGSTOP/SIGCONT park+resume+kill (issue #12)",
             linux_stop_tests::stop_continue_and_kill
+        ),
+        // Round-3 F-r3-lead-1: `execve`/exit must not free an address space a
+        // live task still runs on — including a SIGSTOP-parked sibling, which
+        // is outside the ready queue. Runs early because it allocates three
+        // user PML4 frames and spawns synthetic Tcbs.
+        (
+            "scheduler::execve/exit address-space teardown accounting (F-r3-lead-1)",
+            exec_as_tests::blocked_sibling_keeps_address_space
         ),
         // Terminal job control (2.16.0): the foreground pgid, TIOCGPGRP/
         // TIOCSPGRP, SIGTTIN/SIGTTOU on background tty I/O, the non-job
