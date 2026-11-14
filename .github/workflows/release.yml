@@ -1,23 +1,31 @@
 name: release
 
-# Tag-driven GitHub releases.
+# Tag-driven GitHub releases. New tags must match exactly one of:
 #
-#   stable tag      vX.Y.Z       must be reachable from `main`  -> full release
-#   pre-release tag vX.Y.Z-rc.N  must be reachable from `dev`   -> GitHub pre-release
+#   stable      vX.Y.Z       must be reachable from `main`  -> Release
+#   pre-release vX.Y.Z-rc.N  must be reachable from `dev` AND not from `main`
+#                            -> Pre-release (release-candidate lane only)
 #
-# Bare numeric tags (`2.8.0`) are accepted for repositories that already use
-# them; anything with a `-` suffix (for example `-rc.1`, `-pre.3`) is published
-# as a pre-release. `release.yml` refuses a tag cut from the wrong branch, so a
-# stable release can never point at unmerged `dev` work by accident.
+# Anything else (`X.Y.Z`, `-pre.N`, a suffix after `-rc.N`, arbitrary spellings)
+# is refused by the format guard. Historical bare-numeric tags stay in the
+# repository as history but are never re-pushed and produce no release, so the
+# trigger below is `v*` only: a tag that cannot pass the guard is not a trigger.
+# The base version `X.Y.Z` must equal the repository's version source
+# (Cargo.toml/VERSION; see `VERSION_FILE`): the tag is not allowed to disagree
+# with what the build reports. Every release gets the built artifact (where the
+# repository builds one) plus a source archive, and a `.sha256` next to each
+# file.
 
 on:
   push:
     tags:
       - 'v*'
-      - '[0-9]*'
 
 permissions:
   contents: write
+
+env:
+  VERSION_FILE: Cargo.toml
 
 jobs:
   release:
@@ -28,20 +36,38 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check the tag source branch
+      - name: Validate tag branch and version
         shell: bash
         run: |
+          set -euo pipefail
           git fetch --no-tags origin main dev
-          tag="$GITHUB_REF_NAME"
-          case "$tag" in
-            *-*) branch=dev ;;
-            *)   branch=main ;;
-          esac
-          echo "tag=$tag expected-branch=$branch"
-          git merge-base --is-ancestor "$GITHUB_SHA" "origin/$branch" || {
-            echo "::error::tag $tag must point to a commit reachable from $branch"
-            exit 1
-          }
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "::error::new tags must match vX.Y.Z or vX.Y.Z-rc.N (got $tag)"; exit 1
+          fi
+          base="${tag#v}"
+          base="${base%%-*}"
+          if [[ "$tag" =~ -rc\.[0-9]+$ ]]; then
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/dev || {
+              echo "::error::pre-release $tag must be reachable from dev"; exit 1; }
+            if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::pre-release $tag must not point at a commit already on main"; exit 1
+            fi
+          else
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+              echo "::error::stable release $tag must be reachable from main"; exit 1; }
+          fi
+          if [ -f "$VERSION_FILE" ]; then
+            version="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' "$VERSION_FILE" | head -n1)"
+          elif [ -f VERSION ]; then
+            version="$(tr -d '[:space:]' < VERSION)"
+          else
+            echo "::error::no version source at $VERSION_FILE"; exit 1
+          fi
+          if [ -z "$version" ] || [ "$version" != "$base" ]; then
+            echo "::error::tag base $base does not match version source $VERSION_FILE ($version)"; exit 1
+          fi
+          echo "tag=$tag version=$version" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up the release toolchain
         uses: dtolnay/rust-toolchain@master
@@ -52,9 +78,26 @@ jobs:
       - name: Build the release kernel
         run: python3 tools/build.py build --release
 
+      - name: Create the release artifacts and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          elf="pagh-${GITHUB_REF_NAME}.elf"
+          cp target/x86_64-unknown-none/release/pagh.elf "$elf"
+          sha256sum "$elf" > "$elf.sha256"
+          echo "KERNEL_ELF=$elf" >> "$GITHUB_ENV"
+          name="$(basename "$GITHUB_REPOSITORY")-${GITHUB_REF_NAME}.tar.gz"
+          git archive --format=tar.gz --prefix="${GITHUB_REF_NAME}/" -o "$name" "$GITHUB_SHA"
+          sha256sum "$name" > "$name.sha256"
+          echo "ARCHIVE=$name" >> "$GITHUB_ENV"
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(github.ref_name, '-rc.') }}
           generate_release_notes: true
-          files: target/x86_64-unknown-none/release/pagh.elf
+          files: |
+            ${{ env.KERNEL_ELF }}
+            ${{ env.KERNEL_ELF }}.sha256
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256

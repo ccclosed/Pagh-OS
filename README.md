@@ -1015,10 +1015,16 @@ on first run.
 
 ## Branching and releases
 
-`main` is the stable branch; `dev` is the experimental integration branch. Feature
-and fix PRs target `dev`; stable releases are tagged from `main`, release
-candidates/pre-releases from `dev` (`vX.Y.Z-rc.N`). The release workflow refuses a
-tag cut from the wrong branch. See [BRANCHING.md](BRANCHING.md).
+`main` is the stable branch; `dev` is the experimental integration branch and
+carries the next release. Feature and fix PRs target `dev`. Release candidates are
+tagged from `dev` and only as `vX.Y.Z-rc.N` (there is no `-pre.N` channel); stable
+releases are tagged `vX.Y.Z` from `main`. A hotfix — limited to a critical/high
+verified security finding or a release-blocking regression — branches from `main`,
+ships straight to stable without an RC, and is merged back into `dev`. The release
+workflow refuses a tag cut from the wrong branch or one whose base version
+disagrees with `Cargo.toml`, and publishes the kernel (`pagh-vX.Y.Z.elf`) plus a
+checksummed source archive. See [BRANCHING.md](BRANCHING.md) for the model and
+[RELEASING.md](RELEASING.md) for the release checklist.
 
 ---
 
