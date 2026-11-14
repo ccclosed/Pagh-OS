@@ -691,6 +691,17 @@ fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result
                 if old_flags.contains(vmm::COW_BIT) {
                     new_flags |= vmm::COW_BIT;
                     new_flags = new_flags - PageTableFlags::WRITABLE;
+                    // Record the MAPPING's write permission on the shared
+                    // leaf: `RO_BIT` is what tells the next write fault
+                    // "the mapping denies write -> SIGSEGV" instead of
+                    // "COW write pending -> copy the page private"
+                    // (F-r3-arch-3(a): mprotect(PROT_READ) used to be
+                    // advisory on every fork-shared page).
+                    if writable {
+                        new_flags = new_flags - vmm::RO_BIT;
+                    } else {
+                        new_flags |= vmm::RO_BIT;
+                    }
                 }
                 // Re-flag in place: same frame, no PMM allocation, so an OOM
                 // cannot leave half the range detached.
@@ -703,12 +714,25 @@ fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result
     Ok(0)
 }
 
-/// Update the tracked `(writable, nx)`/`prot` of any region whose pages fall
-/// entirely inside the reprotected span. Partial-overlap bookkeeping is
-/// intentionally coarse: only fully-covered regions have their recorded flags
-/// refreshed (the page tables themselves are always updated above).
+/// Refresh the tracked protection of the region bytes `mprotect` covers,
+/// splitting any region the span only partially overlaps into its
+/// before/covered/after sub-ranges.
+///
+/// The page tables are always updated above, but the bookkeeping matters for
+/// pages that are NOT resident yet: the page-fault handler backs an anonymous
+/// page with `leaf_flags(r.writable, r.nx)` and treats `r.prot == 0` as a true
+/// `PROT_NONE` fault. The previous "only fully-covered regions" rule left a
+/// partially covered region entirely stale, so `mprotect(page, PAGE,
+/// PROT_NONE)` on the first page of an 8-page mapping dropped the PTE (correct)
+/// and then the next touch re-mapped that page **writable** from the old
+/// region record (round-3 F-r3-arch-3(b)). Splitting makes the record match the
+/// bytes the syscall actually reprotected.
+///
+/// The right-hand sub-range of a file-backed region keeps mapping the same file
+/// bytes, so its `backing.file_offset` shifts by the bytes spliced in front of
+/// it — the same rule [`cut_regions`] uses for `munmap`.
 fn update_region_flags(
-    regions: &mut [MmapRegion],
+    regions: &mut Vec<MmapRegion>,
     base: u64,
     pages: u64,
     writable: bool,
@@ -717,33 +741,86 @@ fn update_region_flags(
 ) {
     let ustart = base;
     let uend = base.saturating_add(pages.saturating_mul(PAGE_SIZE));
-    for r in regions.iter_mut() {
+    if uend <= ustart {
+        return;
+    }
+    let mut out: Vec<MmapRegion> = Vec::with_capacity(regions.len().saturating_add(2));
+    for r in regions.iter() {
         let rstart = r.base;
         let rend = r.base.saturating_add(r.pages.saturating_mul(PAGE_SIZE));
-        if rstart >= ustart && rend <= uend {
-            r.writable = writable;
-            r.nx = nx;
-            r.prot = prot;
+        if rend <= ustart || rstart >= uend {
+            // No overlap: unchanged.
+            out.push(r.clone());
+            continue;
+        }
+        // Surviving left sub-range keeps the old protection.
+        if rstart < ustart {
+            out.push(MmapRegion {
+                base: rstart,
+                pages: (ustart - rstart) / PAGE_SIZE,
+                writable: r.writable,
+                nx: r.nx,
+                prot: r.prot,
+                anon: r.anon,
+                backing: r.backing.clone(),
+            });
+        }
+        // The covered middle gets the new protection. For a file-backed region
+        // its first page maps a later file offset, so `backing` shifts by the
+        // bytes now in front of it.
+        let mstart = core::cmp::max(rstart, ustart);
+        let mend = core::cmp::min(rend, uend);
+        out.push(MmapRegion {
+            base: mstart,
+            pages: (mend - mstart) / PAGE_SIZE,
+            writable,
+            nx,
+            prot,
+            anon: r.anon,
+            backing: r.backing.clone().map(|mut b| {
+                b.file_offset = b.file_offset.saturating_add(mstart - rstart);
+                b
+            }),
+        });
+        // Surviving right sub-range keeps the old protection and its shifted
+        // file offset.
+        if rend > uend {
+            out.push(MmapRegion {
+                base: uend,
+                pages: (rend - uend) / PAGE_SIZE,
+                writable: r.writable,
+                nx: r.nx,
+                prot: r.prot,
+                anon: r.anon,
+                backing: r.backing.clone().map(|mut b| {
+                    b.file_offset = b.file_offset.saturating_add(uend - rstart);
+                    b
+                }),
+            });
         }
     }
+    *regions = out;
 }
 
-/// Write-fault on a present page: copy-on-write service. The page must be a
-/// `COW_BIT` leaf left by [`fork_user_space_cow`] AND live inside a writable
-/// VMA (or the brk heap) — a write into read-only ELF text still SIGSEGVs.
-/// Works for ring-3 faults and kernel-mode faults on user addresses
-/// (`copy_out` over a fork-shared buffer).
+/// Write-fault on a present page: copy-on-write service. The leaf must be
+/// COW-shared (`COW_BIT`, left by [`crate::memory::vmm::fork_user_space_cow`])
+/// AND its mapping must allow writing: `mprotect(PROT_READ)` on a shared page
+/// marks the leaf read-only (`RO_BIT`), so a write there still SIGSEGVs
+/// instead of becoming a private writable copy. Works for ring-3 faults and
+/// kernel-mode faults on user addresses (`copy_out` over a fork-shared
+/// buffer).
 fn handle_cow_fault(addr: u64, caused_by_write: bool) -> bool {
     if !caused_by_write || compat::compat_lock_held() {
         return false;
     }
-    // `cow_copy_page` itself verifies the `COW_BIT`: a present read-only page
-    // WITHOUT that bit (ELF text/rodata, PROT_READ mmap) still returns false
-    // and keeps the SIGSEGV path. Gating on VMA bookkeeping here was wrong:
-    // the user stack, thread stacks and fork-shared heap pages are real
-    // writable mappings that `fork_user_space_cow` turns read-only, and a
-    // bookkeeping miss killed fastfetch in both the child and the parent
-    // immediately after fork.
+    // `cow_copy_page` itself validates both markers: a present read-only page
+    // without `COW_BIT` (ELF text/rodata, PROT_READ mmap) and a COW leaf
+    // whose mapping denies write (`RO_BIT`) both return false and keep the
+    // SIGSEGV path. Gating on VMA bookkeeping here was wrong: the user stack,
+    // thread stacks and fork-shared heap pages are real writable mappings
+    // that `fork_user_space_cow` turns read-only, and a bookkeeping miss
+    // killed fastfetch in both the child and the parent immediately after
+    // fork. The per-leaf marker is the authoritative answer.
     let page = addr & !(PAGE_SIZE - 1);
     crate::memory::vmm::cow_copy_page(page)
 }

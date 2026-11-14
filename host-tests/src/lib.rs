@@ -323,6 +323,13 @@ pub mod ext2_symlink;
 #[path = "../../src/fs/ext2/bounds.rs"]
 pub mod ext2_bounds;
 
+// Round-3 F-r3-lead-1: pure address-space (CR3) reference accounting for the
+// execve/exit teardown decision. `core`-only and self-contained, so the host
+// tests drive the exact policy the kernel's `scheduler` applies over its three
+// live-task registries.
+#[path = "../../src/task/as_refs.rs"]
+pub mod as_refs;
+
 
 // ── OpenPGP repository-metadata verification (issue #32) ─────────────────────
 // The pure verifier the `apt` trust chain will use: packet/armor parsing,
@@ -485,6 +492,15 @@ mod properties {
     // any allocation or block loop; the tests include the audit's exact crafted
     // inode values as regression cases.
     mod ext2_bounds;
+    // Round-3 F-r3-vfs-2: superblock group/inode counts. A bitmap block
+    // describes 32768 entries, so a crafted `s_inodes_count =
+    // s_inodes_per_group = 0xFFFFFFFF` is refused before the mount-time
+    // scan, and the scan span is clamped to one bitmap even if it were not.
+    mod ext2_group_counts;
+    // Round-3 F-r3-lead-1: address-space (CR3) reference accounting for the
+    // execve/exit teardown — every live-task registry (ready, SIGSTOP-parked,
+    // pending reap) must block freeing a PML4 another task still runs on.
+    mod as_refs;
     // Symbolic-link path resolution (issue #18, contract `EXT2-LINKS.md` §4.6,
     // §7.4): Linux-verified cases plus a randomized comparison against an
     // independent restart-based oracle.

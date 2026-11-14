@@ -782,6 +782,25 @@ pub fn virt_to_phys_in(pml4: u64, virt: u64) -> Option<u64> {
 /// freeing).
 pub(crate) const COW_BIT: PageTableFlags = PageTableFlags::BIT_9;
 
+/// Software PTE bit (available bit 10) meaning "this leaf's MAPPING denies
+/// write": the hardware `WRITABLE` bit is cleared because the protection is
+/// read-only (or execute-only), not because the frame is COW-shared.
+///
+/// It exists because those two reasons are otherwise indistinguishable on a
+/// COW leaf — both leave a present, read-only PTE — and the write-fault
+/// service ([`cow_copy_page`]) must only copy the page private when the
+/// mapping actually allows writing. Without this bit `mprotect(PROT_READ)` on
+/// a fork-shared page was advisory: the next write fault copied the page and
+/// installed `WRITABLE` on the private copy (round-3 audit F-r3-arch-3(a)).
+///
+/// Maintained on COW leaves only (a private read-only leaf needs no marker:
+/// [`cow_copy_page`] refuses it for lack of `COW_BIT`):
+///   * [`fork_user_space_cow`] sets it on leaves whose mapping was read-only
+///     and keeps it on already-COW leaves (a deferred COW write has no bit);
+///   * `mprotect` sets/clears it together with the tracked protection;
+///   * [`cow_copy_page`] clears it when it makes the page privately writable.
+pub(crate) const RO_BIT: PageTableFlags = PageTableFlags::BIT_10;
+
 /// Result of detaching one user leaf through [`release_user_leaf`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeafRelease {
@@ -888,6 +907,10 @@ pub fn release_user_leaf(virt_addr: u64) -> Result<LeafRelease, VmError> {
 /// when the page is still shared. Clearing the marker or setting `WRITABLE`
 /// here would silently create a writable alias of a frame another address
 /// space still owns.
+///
+/// The caller decides the MAPPING protection: `mprotect` sets [`RO_BIT`] when
+/// it makes a COW leaf read-only and clears it when it grants write access, so
+/// the fault service can tell "protected read-only" from "COW write pending".
 pub fn set_user_leaf_flags(virt_addr: u64, flags: PageTableFlags) -> Result<(), VmError> {
     if virt_addr >= USER_ADDR_MAX {
         return Err(VmError::InvalidAddress);
@@ -1030,8 +1053,10 @@ pub fn drop_user_space(pml4: u64) {
 /// `pmm::cow_ref`), both PTEs are marked with the `COW_BIT` software bit, and
 /// formerly-writable entries lose the WRITABLE bit on both sides so the next
 /// write traps into the page-fault handler, which copies the page private
-/// ([`cow_copy_page`]). Read-only leaves (ELF text/rodata) keep their flags —
-/// writes there segfault as before; only their ownership is refcounted.
+/// ([`cow_copy_page`]). Read-only leaves (ELF text/rodata, `PROT_READ` mmaps)
+/// keep their flags AND carry [`RO_BIT`], so a write there still segfaults
+/// instead of turning into a private writable copy; only their ownership is
+/// refcounted.
 ///
 /// Intermediate page-table frames are NOT shared: the child gets fresh zeroed
 /// tables, so each side's table mutations stay independent.
@@ -1117,10 +1142,27 @@ pub fn fork_user_space_cow(parent_pml4: u64, child_pml4: u64) -> Result<(), VmEr
                     }
                     let frame = e1.addr();
                     let flags = e1.flags();
+                    // Two distinct reasons for a non-writable leaf must stay
+                    // distinct across the fork:
+                    //   * writable mapping  -> COW with a deferred write: a
+                    //     write fault copies the page private (no RO_BIT);
+                    //   * read-only mapping -> COW without write permission:
+                    //     a write fault must SIGSEGV (RO_BIT set).
+                    // An already-COW leaf keeps its RO_BIT as-is: its mapping
+                    // protection was already recorded by the first fork or by
+                    // mprotect, and "no WRITABLE bit" alone cannot tell a
+                    // deferred COW write from a read-only mapping.
                     let shared = if flags.contains(PageTableFlags::WRITABLE) {
-                        (flags - PageTableFlags::WRITABLE) | COW_BIT
-                    } else {
+                        ((flags - PageTableFlags::WRITABLE) | COW_BIT) - RO_BIT
+                    } else if flags.contains(COW_BIT) {
+                        // Already a COW leaf: `RO_BIT` records whether its
+                        // mapping denies write; preserve it.
                         flags | COW_BIT
+                    } else {
+                        // Private read-only leaf (ELF text/rodata, a PROT_READ
+                        // mapping): the child/this side must not gain write
+                        // access through the COW fault service.
+                        (flags | COW_BIT) | RO_BIT
                     };
                     p1p[i1].set_addr(frame, shared);
                     p1c[i1].set_addr(frame, shared);
@@ -1168,7 +1210,9 @@ fn fork_child_table_phys(parent: u64, idx: PageTableIndex) -> Result<u64, VmErro
 /// the shared contents, re-point the PTE at the private copy with WRITABLE
 /// restored, drop this side's share of the old frame (freeing it when this was
 /// the last sharer) and flush the TLB. Returns `false` when the PTE is not a
-/// COW leaf (caller's SIGSEGV path applies) or the PMM is exhausted.
+/// COW leaf (caller's SIGSEGV path applies), when the mapping explicitly
+/// denies write ([`RO_BIT`]: `mprotect(PROT_READ)` after fork) or the PMM is
+/// exhausted.
 pub fn cow_copy_page(virt_addr: u64) -> bool {
     let walker = PageTableWalker::new();
     let virt = VirtAddr::new(virt_addr);
@@ -1188,6 +1232,17 @@ pub fn cow_copy_page(virt_addr: u64) -> bool {
     if !flags.contains(PageTableFlags::PRESENT) || !flags.contains(COW_BIT) {
         return false;
     }
+    // The mapping itself forbids writing (it was read-only before the fork, or
+    // `mprotect` made it so): a write fault must become a SIGSEGV, never a
+    // private writable copy. This is the round-3 F-r3-arch-3(a) gate.
+    if flags.contains(RO_BIT) {
+        crate::debug!(
+            "[VMM] write fault on read-only COW leaf virt=0x{:x} flags={:?} -> SIGSEGV",
+            virt_addr,
+            flags
+        );
+        return false;
+    }
     let old = entry.addr().as_u64();
     let Some(new) = crate::memory::pmm::alloc_frame() else {
         return false;
@@ -1203,7 +1258,7 @@ pub fn cow_copy_page(virt_addr: u64) -> bool {
     }
     entry.set_addr(
         PhysAddr::new(new),
-        (flags - COW_BIT) | PageTableFlags::WRITABLE | PageTableFlags::PRESENT,
+        (((flags - COW_BIT) - RO_BIT) | PageTableFlags::WRITABLE) | PageTableFlags::PRESENT,
     );
     tlb::flush(virt);
     if crate::memory::pmm::cow_unref(old) {

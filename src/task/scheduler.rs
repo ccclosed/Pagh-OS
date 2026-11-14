@@ -1,5 +1,6 @@
 use crate::memory::{pmm, vmm};
 use crate::sync::spinlock::Spinlock;
+use crate::task::as_refs;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::structures::paging::PageTableFlags;
@@ -352,15 +353,22 @@ fn reap_exited_tasks() {
     }
 
     // Private user address space.
-    if cr3 != vmm::kernel_pml4_phys()
-        && cr3 != vmm::current_pml4_phys()
-        && !READY_QUEUE.lock().iter().any(|t| t.cr3 == cr3)
-        && !PENDING_REAPS
-            .lock()
-            .iter()
-            .any(|(p, r)| *p != pid && r.cr3 == cr3)
-    {
-        vmm::drop_user_space(cr3);
+    if cr3 != vmm::kernel_pml4_phys() && cr3 != vmm::current_pml4_phys() {
+        // Same accounting as `drop_exclusive_user_space`: a live task in ANY
+        // registry keeps the space alive (a SIGSTOP-parked sibling thread used
+        // to be invisible here too and was left with freed page tables), and a
+        // task that is itself pending reaping forbids a second free.
+        if let Some((other, registry)) = cr3_referenced_by(cr3, pid) {
+            crate::trace!(
+                "[SCHED] reap pid={}: user space 0x{:x} still used by {} task {}",
+                pid,
+                cr3,
+                registry.name(),
+                other
+            );
+        } else {
+            vmm::drop_user_space(cr3);
+        }
     }
 
     // Release the task's FXSAVE area.
@@ -1095,22 +1103,89 @@ pub fn kernel_thread_finished() {
 }
 
 /// Free the frame tree behind `cr3` when THIS task is its exclusive owner:
-/// not the kernel PML4, not shared with any queued task (threads share CR3)
-/// and not referenced by a pending exit reap. COW leaves inside are unref'd
+/// not the kernel PML4, not shared with any live task (threads share CR3: the
+/// ready queue, SIGSTOP-parked tasks and pending exit reaps) and not
+/// referenced by a pending exit reap. COW leaves inside are unref'd
 /// (`drop_user_space`), so an exec'ing fork child releases its parent's
 /// shared frames instead of pinning them forever. Returns `true` when freed.
 ///
 /// Used by the execve path right after switching to the freshly loaded image.
+///
+/// ROUND-3 FIX (F-r3-lead-1): the previous version only looked at
+/// `READY_QUEUE` and `PENDING_REAPS`, so a sibling thread parked by
+/// SIGSTOP/SIGTSTP (`STOPPED_TASKS`, outside the ready queue until SIGCONT)
+/// was invisible and its shared address space was freed under it — a
+/// page-table use-after-free waiting for the SIGCONT. All registries are
+/// consulted now. `exclude_pid` is the caller (its own Tcb is not registered
+/// while it runs).
 pub fn drop_exclusive_user_space(cr3: u64) -> bool {
     if cr3 == 0 || cr3 == vmm::kernel_pml4_phys() {
         return false;
     }
-    if READY_QUEUE.lock().iter().any(|t| t.cr3 == cr3) {
-        return false;
-    }
-    if PENDING_REAPS.lock().iter().any(|(_, r)| r.cr3 == cr3) {
+    let me = current_pid();
+    if let Some((pid, registry)) = cr3_referenced_by(cr3, me) {
+        // Rare by construction (execve from a CLONE_VM thread group, or a
+        // SIGSTOP-parked sibling): say why the old image was NOT released
+        // instead of leaving a silent `freed=false` in the execve line.
+        crate::warn!(
+            "[SCHED] user space 0x{:x} still referenced by {} task {} - not freeing (execve keeps it alive)",
+            cr3,
+            registry.name(),
+            pid
+        );
         return false;
     }
     vmm::drop_user_space(cr3);
     true
+}
+
+/// First live task (other than `exclude_pid`) still running on `cr3`, and the
+/// scheduler registry it was found in. Takes the three registry locks ONE AT A
+/// TIME, in the documented order (`READY_QUEUE` → `STOPPED_TASKS` →
+/// `PENDING_REAPS`), because the scheduler spinlocks are non-reentrant and mask
+/// interrupts.
+///
+/// "Blocked" tasks are NOT missing from these registries: a syscall parked in
+/// `nanosleep`/`futex`/`read` yields cooperatively and stays in the ready
+/// queue. The two states that genuinely leave the queue are SIGSTOP-parked
+/// tasks (`STOPPED_TASKS`) and dropped-but-not-yet-reaped tasks
+/// (`PENDING_REAPS`) — both must block a teardown.
+fn cr3_referenced_by(cr3: u64, exclude_pid: u64) -> Option<(u64, as_refs::Registry)> {
+    use as_refs::{AsRef, Registry};
+    {
+        let q = READY_QUEUE.lock();
+        if let Some(pid) = as_refs::referencing_pid(
+            cr3,
+            exclude_pid,
+            q.iter().map(|t| AsRef {
+                pid: t.pid,
+                cr3: t.cr3,
+            }),
+        ) {
+            return Some((pid, Registry::Ready));
+        }
+    }
+    {
+        let s = STOPPED_TASKS.lock();
+        if let Some(pid) = as_refs::referencing_pid(
+            cr3,
+            exclude_pid,
+            s.iter().map(|(pid, (_rsp, cr3))| AsRef {
+                pid: *pid,
+                cr3: *cr3,
+            }),
+        ) {
+            return Some((pid, Registry::Stopped));
+        }
+    }
+    let r = PENDING_REAPS.lock();
+    as_refs::referencing_pid(
+        cr3,
+        exclude_pid,
+        r.iter().map(|(pid, reap)| AsRef {
+            pid: *pid,
+            cr3: reap.cr3,
+        }),
+    )
+    .map(|pid| (pid, Registry::PendingReap))
 }

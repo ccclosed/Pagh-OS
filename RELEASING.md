@@ -13,7 +13,7 @@ refuses a tag whose base version disagrees with it.
 
 `dev` carries the **next release** version; `main` keeps the last **released**
 version. The first feature after a release bumps MINOR, the first fix bumps
-PATCH. The `AGENTS.md` "`main` currently reads" line describes the latest
+PATCH. The `AGENTS.md` `main` version line describes the latest
 **stable** release only: an in-flight bump on `dev` does not rewrite it, and it
 is updated together with the stable release.
 

@@ -963,6 +963,29 @@ impl Ext2Fs {
         if groups == 0 || groups > 65536 {
             return Err(FsError::BadSuperBlock);
         }
+        // The per-group counts drive bitmap scans whose length is taken from
+        // them (`reconcile_free_counts`). A bitmap block describes exactly
+        // `BS * 8` entries, so anything larger is not "a big filesystem" but a
+        // corrupt/forged superblock: reject it before a single bit is read
+        // (round-3 audit F-r3-vfs-2: `s_inodes_count = s_inodes_per_group =
+        // 0xFFFFFFFF` made every mount scan 2^32 bits — 28 s of boot — and
+        // wrote a bogus `s_free_inodes_count` back to the volume).
+        if let Err(e) = bounds::validate_group_counts(
+            sb.s_blocks_per_group,
+            sb.s_inodes_per_group,
+            sb.s_inodes_count,
+            groups as u32,
+        ) {
+            crate::warn!(
+                "ext2: refusing impossible superblock counts inodes={} per_group={} blocks_per_group={} groups={} ({:?})",
+                sb.s_inodes_count,
+                sb.s_inodes_per_group,
+                sb.s_blocks_per_group,
+                groups,
+                e
+            );
+            return Err(FsError::Corrupt);
+        }
         let gd_size = core::mem::size_of::<Ext2GroupDesc>();
         let mut gds = Vec::with_capacity(groups);
         let mut buf = vec![0u8; BS];
@@ -1001,14 +1024,20 @@ impl Ext2Fs {
         let mut changed = false;
         for (g, gd) in gds.iter_mut().enumerate() {
             let base = sb.s_first_data_block + g as u32 * bpg;
-            let span = core::cmp::min(bpg, sb.s_blocks_count.saturating_sub(base));
+            // `span`/`ispan` bound the bitmap scan. Both are clamped to one
+            // bitmap block's capacity (`BS * 8` bits): `read_sb_gds` has
+            // already refused impossible counts, and this is the belt-and-
+            // braces copy that keeps a corrupt value from ever turning this
+            // mount into a 2^32-bit scan (F-r3-vfs-2).
+            let span = core::cmp::min(bpg, sb.s_blocks_count.saturating_sub(base))
+                .min(bounds::BITMAP_BITS);
             let mut bbm = vec![0u8; BS];
             dev.read_block(gd.bg_block_bitmap as u64 * SECTORS_PER_BLOCK, &mut bbm)
                 .map_err(|_| FsError::IoError)?;
             let mut ibm = vec![0u8; BS];
             dev.read_block(gd.bg_inode_bitmap as u64 * SECTORS_PER_BLOCK, &mut ibm)
                 .map_err(|_| FsError::IoError)?;
-            let ispan = core::cmp::min(ipg, sb.s_inodes_count.saturating_sub(g as u32 * ipg));
+            let ispan = bounds::clamp_group_span(sb.s_inodes_count, ipg, g as u32);
             let free_b = span.saturating_sub(alloc::count_set_bits(&bbm, span));
             let free_i = ispan.saturating_sub(alloc::count_set_bits(&ibm, ispan));
             if gd.bg_free_blocks_count as u32 != free_b || gd.bg_free_inodes_count as u32 != free_i
@@ -1017,8 +1046,8 @@ impl Ext2Fs {
                 gd.bg_free_inodes_count = free_i.min(u16::MAX as u32) as u16;
                 changed = true;
             }
-            free_blocks_total += free_b;
-            free_inodes_total += free_i;
+            free_blocks_total = free_blocks_total.saturating_add(free_b);
+            free_inodes_total = free_inodes_total.saturating_add(free_i);
         }
         if sb.s_free_blocks_count != free_blocks_total
             || sb.s_free_inodes_count != free_inodes_total

@@ -755,7 +755,12 @@ pub fn exec_linux_image(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<Ex
         }
         // The replaced address space is dead: return its frames (COW leaves
         // are unref'd, so a fork child exec'ing releases the parent's shared
-        // frames). Skipped when another task still shares the CR3.
+        // frames). Kept alive when another live task still runs on it — a
+        // sibling thread (CLONE_VM) that is ready, SIGSTOP-parked or awaiting
+        // reaping. Linux would kill the sibling thread group here; this
+        // kernel keeps the thread alive in the old image instead, which is
+        // memory-safe (the page tables stay owned until the last user exits)
+        // and is the round-3 F-r3-lead-1 fix for the page-table UAF.
         let freed = scheduler::drop_exclusive_user_space(old_cr3);
         crate::info!(
             "[linux] execve pid={} '{}' new_pml4=0x{:x} entry=0x{:x} old_cr3=0x{:x} freed={}",

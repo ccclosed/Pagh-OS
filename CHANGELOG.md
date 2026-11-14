@@ -11,6 +11,61 @@ tagged release (`2.18.13`, merged as PR #56). The full technical story of every 
 is the release-note block in `AGENTS.md`; the paragraphs here name the user-visible
 change and point there rather than duplicating it.
 
+## 2.22.7
+
+Round-3 audit follow-up on `dev` (the 2.22.6 hotfix kept the four high findings;
+these three lower-severity x86 findings land in the next release). The round-3
+reports live in `attack/r3/{arch,vfs,lead}/REPORT.md` and the top-level
+`attack/r3/REPORT.md` (external audit tree); `main` stays at 2.22.6.
+
+* **F-r3-arch-3 (low, verified): `mprotect` protections were advisory on
+  fork-shared and partially covered pages.** After `fork`, a write to a page a
+  child had just made `PROT_READ` still copied the page private and installed
+  `WRITABLE`, and `mprotect(PROT_NONE)` over only part of a `VmRegion` left the
+  region record stale, so the next touch lazily re-mapped the page writable
+  (stack guards did not guard). A new software PTE bit (`RO_BIT`, available bit
+  10) now records that the *mapping* denies write on a COW leaf; `cow_copy_page`
+  copies only when the mapping is writable, so a write to a read-only mapping
+  keeps its SIGSEGV path, and `fork` preserves the distinction between a
+  deferred COW write and a read-only mapping. `update_region_flags` splits a
+  region that `mprotect` only partially covers into before/covered/after
+  sub-ranges (file-backed offsets shift exactly like `munmap`'s `cut_regions`),
+  so a `PROT_NONE` sub-range is a genuine fault, not a lazy-mapping
+  opportunity. Evidence: the audit's `attack/r3/arch/prot_bypass.c` now dies
+  with SIGSEGV while the shell stays alive; ordinary COW fork/write (the
+  round-3 `sweep` matrix) and a dynamically linked glibc binary (`fastfetch`)
+  are unaffected.
+
+* **F-r3-vfs-2 (low-medium, verified): a crafted ext2 superblock made every
+  mount scan 2^32 bits.** `s_inodes_count = s_inodes_per_group = 0xFFFFFFFF`
+  passed the non-zero checks, so `reconcile_free_counts` scanned a 2^32-bit
+  span (~28 s of boot CPU), computed a bogus free-inode total and wrote it back
+  to block 0. `ext2::bounds::validate_group_counts` now rejects before reading a
+  single bitmap bit: per-group counts above one bitmap block (`BS * 8`), zero
+  counts, and an inode count that exceeds `s_inodes_per_group * groups` all
+  produce `FsError::Corrupt` (the crafted image is refused cleanly at mount).
+  The scan span is additionally clamped to one bitmap block
+  (`clamp_group_span`) and the free totals saturate, so a superblock that
+  changes under the mount cannot reintroduce the unbounded loop. Host
+  properties: `ext2_group_counts`.
+
+* **F-r3-lead-1 (high, static): `execve` could free the address space of a
+  sibling task that is not in the ready queue.** `drop_exclusive_user_space`
+  looked only at the ready queue and pending reaps, so a sibling thread parked
+  by SIGSTOP/SIGTSTP (`STOPPED_TASKS`, out of rotation until SIGCONT) was
+  invisible and its shared CR3 was freed under it — page tables a later SIGCONT
+  would run on. The teardown decision now lives in a pure, host-property-tested
+  policy (`src/task/as_refs.rs`) consulted by both `execve` and the exit
+  reaper: a space is freed only when no live Tcb in any registry references it,
+  and the execve log names the registry that kept it alive. In this cooperative
+  scheduler a task blocked in `nanosleep`/`futex`/`read` stays in the ready
+  queue; the two states that leave it are the stopped set and the pending-reap
+  set, so those are exactly what the fix adds. An in-QEMU scheduler selftest
+  drives the real registries with allocated PML4s (exclusive → freed, ready →
+  kept, stopped → kept, resumed → kept until the last reference, pending reap →
+  kept). The audit's raw-`clone` reproducer never created its second thread, so
+  the impact remains static; the fix is the accounting invariant.
+
 ## 2.22.6
 
 Round-3 audit hotfix: four high, verified findings (three x86 machine-kill /
