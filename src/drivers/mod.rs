@@ -28,6 +28,14 @@ pub mod usb_rndis;
 pub mod usb_rndis_proto;
 pub mod virtio;
 pub mod vt;
+/// Чистый ABI `/dev/vtconsole0` (128-байтный заголовок + 16-байтные клетки).
+pub mod vt_abi;
+/// Чистый переводчик VT-байтов `/dev/vtinput` в PS/2 set-1.
+pub mod vt_keys;
+/// `/dev/vtinput`: VT-байты → вход kernel-shell.
+pub mod vtinput;
+/// Разделяемая VT-поверхность (публикация из shell/VT, mmap/read).
+pub mod vtsurface;
 pub mod xhci;
 mod xhci_hub;
 
@@ -109,6 +117,11 @@ pub fn init() {
     crate::debug!("Initializing device manager...");
     ps2_kbd::init();
     framebuffer::init();
+    // Shared VT surface для desktop-терминала: страницы аллоцируются один раз
+    // на boot (геометрия берётся из уже поднятого framebuffer'а), поэтому
+    // открытие /dev/vtconsole0 не аллоцирует PMM и selftest остаётся
+    // детерминированным.
+    vtsurface::init();
     // The mouse needs the framebuffer dimensions for cursor clamping, so it is
     // brought up after the framebuffer. Failure is non-fatal (no cursor).
     let (w, h) = framebuffer::dimensions();

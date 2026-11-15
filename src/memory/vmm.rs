@@ -469,7 +469,10 @@ pub fn map(phys_addr: u64, virt_addr: u64, flags: PageTableFlags) -> Result<(), 
                     );
                     return Err(VmError::CowShared);
                 }
-            } else if old_flags.contains(SHARED_BIT) || old_flags.contains(MMIO_BIT) {
+            } else if old_flags.contains(SHARED_BIT)
+                || old_flags.contains(VT_RO_BIT)
+                || old_flags.contains(MMIO_BIT)
+            {
                 // MAP_SHARED/MMIO-лист нельзя молча перезаписать другой
                 // трансляцией: у первого есть посчитанная ссылка владения, у
                 // второго кадр вообще не из PMM. Заменяющие пути обязаны сперва
@@ -749,10 +752,10 @@ pub fn clone_user_space(src_pml4: u64, dst_pml4: u64) -> Result<(), VmError> {
                         }
                         continue;
                     }
-                    if e1.flags().contains(SHARED_BIT) {
-                        // MAP_SHARED: копия адресного пространства разделяет
-                        // кадр, а не дублирует его; ссылка учитывается так же,
-                        // как в fork-COW.
+                    if e1.flags().contains(SHARED_BIT) || e1.flags().contains(VT_RO_BIT) {
+                        // MAP_SHARED/VT-поверхность: копия адресного
+                        // пространства разделяет кадр, а не дублирует его;
+                        // ссылка учитывается так же, как в fork-COW.
                         crate::memory::pmm::cow_ref(e1.addr().as_u64());
                         if let Some(pt) = dst1.as_deref_mut() {
                             pt[i1].set_addr(e1.addr(), e1.flags());
@@ -856,6 +859,12 @@ pub(crate) const SHARED_BIT: PageTableFlags = PageTableFlags::BIT_11;
 /// программные биты уже заняты `COW_BIT`/`RO_BIT`/`SHARED_BIT`.
 pub(crate) const MMIO_BIT: PageTableFlags = PageTableFlags::BIT_52;
 
+/// Программный бит PTE (свободный бит 53), помечающий лист read-only
+/// shared-поверхности ядра (`/dev/vtconsole0`): кадр запинен поверхностью,
+/// отображение пользователя не должно становиться записываемым через
+/// `mprotect`, а `munmap`/exit лишь отпускают ссылку (`cow_unref`).
+pub(crate) const VT_RO_BIT: PageTableFlags = PageTableFlags::BIT_53;
+
 /// Результат отцепления одного пользовательского листа через [`release_user_leaf`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeafRelease {
@@ -879,7 +888,7 @@ fn release_leaf_frame(frame: u64, flags: PageTableFlags) -> bool {
     if flags.contains(MMIO_BIT) {
         // Физический кадр устройства: PMM им не владеет, возвращать нечего.
         false
-    } else if flags.contains(SHARED_BIT) {
+    } else if flags.contains(VT_RO_BIT) || flags.contains(SHARED_BIT) {
         // MAP_SHARED: ушла наша ссылка отображения; кадр живёт, пока его держит
         // файл-кэш или другое адресное пространство.
         if crate::memory::pmm::cow_unref(frame) {
@@ -1224,7 +1233,7 @@ pub fn fork_user_space_cow(parent_pml4: u64, child_pml4: u64) -> Result<(), VmEr
                         p1c[i1].set_addr(frame, flags);
                         continue;
                     }
-                    if flags.contains(SHARED_BIT) {
+                    if flags.contains(SHARED_BIT) || flags.contains(VT_RO_BIT) {
                         p1p[i1].set_addr(frame, flags);
                         p1c[i1].set_addr(frame, flags);
                         crate::memory::pmm::cow_ref(frame.as_u64());

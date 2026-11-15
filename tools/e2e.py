@@ -1509,6 +1509,16 @@ def mode_selftest(h: Harness) -> tuple[str, int]:
     lx_fails = re.findall(r"LXSELFTEST \S+ FAIL[^\r\n]*", text)
     ok &= h.check("no LXSELFTEST case failures", not lx_fails,
                   lx_fails[0] if lx_fails else "none")
+    # `/dev/vtinput` ABI: во время self-test kernel-cli пишет команду в
+    # `/dev/vtinput`; после возврата shell обязан выполнить её обычным путём
+    # (set-1 scancodes → line editor → echo). Строка вывода `vtinput-ok`
+    # отличается от эха набранной команды (`echo vtinput-ok`) и доказывает, что
+    # ввод реально дошёл до shell, а не только до очереди драйвера.
+    vt_marker = wait_for(h.guest, [r"(?:^|\n)vtinput-ok\r?\n"], 15,
+                         label="vtinput shell reaction")
+    ok &= h.check(
+        "vtinput bytes reached the shell (echo ran after selftest)",
+        bool(vt_marker), vt_marker or "vtinput-ok output line not observed")
     for extra in h.extra_evidence:
         found = re.search(extra, text)
         h.check(f"extra marker /{extra}/ (best effort)", bool(found),

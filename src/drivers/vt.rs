@@ -135,6 +135,39 @@ impl Vt {
         crate::drivers::framebuffer::with(|fb| {
             fb.draw_glyph_px(c.ch, px, py, c.fg, c.bg);
         });
+        crate::drivers::vtsurface::publish_vt_cell(x, y, c.ch, c.fg, c.bg);
+    }
+
+    /// Опубликовать позицию курсора/scroll region в `/dev/vtconsole0`.
+    fn publish_cursor(&self) {
+        crate::drivers::vtsurface::publish_vt_cursor(
+            self.cx as u16,
+            self.cy as u16,
+            true,
+            self.scroll_top as u16,
+            self.scroll_bot as u16,
+        );
+    }
+
+    /// Полная публикация после scroll/erase: меняется не одна клетка, а вся
+    /// видимая матрица (или её существенная часть).
+    fn publish_full(&self) {
+        let mut cells = alloc::vec::Vec::with_capacity(self.cols * self.rows);
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                let c = self.get(col, row);
+                cells.push((c.ch, c.fg, c.bg));
+            }
+        }
+        crate::drivers::vtsurface::publish_vt_full(
+            &cells,
+            self.cols as u16,
+            self.rows as u16,
+            self.cx as u16,
+            self.cy as u16,
+            self.scroll_top as u16,
+            self.scroll_bot as u16,
+        );
     }
     fn paint_all(&self) {
         for row in 0..self.rows {
@@ -175,6 +208,7 @@ impl Vt {
             }
         }
         self.paint_all();
+        self.publish_full();
     }
     fn scroll_dn(&mut self, n: usize) {
         let (top, bot) = (self.scroll_top, self.scroll_bot);
@@ -196,6 +230,7 @@ impl Vt {
             }
         }
         self.paint_all();
+        self.publish_full();
     }
     fn erase_disp(&mut self, m: u32) {
         let (s, e) = match m {
@@ -207,6 +242,7 @@ impl Vt {
             self.cells[i] = self.blank();
         }
         self.paint_all();
+        self.publish_full();
     }
     fn erase_line(&mut self, m: u32) {
         let (s, e) = match m {
@@ -466,6 +502,11 @@ impl Vt {
         });
     }
     pub fn feed(&mut self, b: u8) {
+        self.feed_inner(b);
+        self.publish_cursor();
+    }
+
+    fn feed_inner(&mut self, b: u8) {
         match self.state {
             Es::Normal => match b {
                 0x07 => {} // BEL
@@ -689,6 +730,7 @@ pub fn cursor_from_console() {
         // The console's row counts from the top of the text area, like the VT's.
         vt.cx = col.min(vt.cols.saturating_sub(1));
         vt.cy = row.min(vt.rows.saturating_sub(1));
+        vt.publish_cursor();
     }
 }
 

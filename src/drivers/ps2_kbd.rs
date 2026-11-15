@@ -120,6 +120,17 @@ pub fn inject_scancode(byte: u8) {
     }
 }
 
+/// Положить скан-код в shell-кольцо, НЕ дублируя его в evdev.
+///
+/// Используется `/dev/vtinput`: терминал уже получает ввод из evdev-очереди
+/// desktop'а, и эхо его же синтетических клавиш обратно в event0 дало бы цикл.
+/// Шеллу нужен именно scancode-ring, поэтому evdev-путь здесь пропускается.
+pub fn inject_scancode_from_vt(byte: u8) {
+    if let Some(kbd) = KEYBOARD.lock().as_ref() {
+        kbd.push_scancode(byte);
+    }
+}
+
 /// Whether at least one scancode is currently queued (non-destructive).
 ///
 /// The shell's REPL wakes on every timer tick; this is how it tells a real

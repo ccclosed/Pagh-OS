@@ -44,7 +44,7 @@ use crate::vfs::VfsNode;
 use super::errno::Errno;
 use super::mem::{
     plan_brk, plan_mmap_base, plan_munmap, prot_to_flags, range_is_free, BrkOutcome, MmapBacking,
-    MmapRegion, MunmapPlan, VmRegionSet, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED,
+    MmapRegion, MunmapPlan, VmRegionSet, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, PROT_READ,
 };
 use super::validate::USER_ADDR_MAX;
 
@@ -290,6 +290,20 @@ pub fn sys_mmap(
             return Err(Errno::EINVAL);
         }
         return mmap_fb(info, &backing, fixed, addr, len, writable, nx, off);
+    }
+
+    // `/dev/vtconsole0`: read-only shared снимок kernel-VT/shell. Адресное
+    // пространство пользователя получает те же кадры, что пишет ядро, но PTE
+    // без WRITABLE и с `VT_RO_BIT`; mprotect(PROT_WRITE) отвергается.
+    if let Some(info) = node.as_ref().and_then(|n| n.vtconsole_info()) {
+        if !shared || prot != PROT_READ as u64 || off != 0 || len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        if len > info.total_bytes as u64 {
+            return Err(Errno::EINVAL);
+        }
+        let node = node.as_ref().expect("vtconsole node");
+        return mmap_vtconsole(node, &backing, fixed, addr, len);
     }
 
     // MAP_SHARED: общие физические кадры (memfd) либо общие анонимные страницы.
@@ -618,6 +632,80 @@ fn mmap_fb(
     Ok(base)
 }
 
+/// `mmap(/dev/vtconsole0)`: read-only отображение shared VT surface.
+///
+/// Кадры поверхности запинены ядром; каждый лист получает ссылку отображения
+/// (`cow_ref`), которая отпускается `munmap`/exit. `WRITABLE` не ставится
+/// никогда, а `VT_RO_BIT` заставляет `mprotect` отказать в попытке добавить
+/// запись — userspace не может подменить экран, который публикует только ядро.
+fn mmap_vtconsole(
+    node: &Arc<dyn VfsNode>,
+    backing: &Option<MmapBacking>,
+    fixed: bool,
+    addr: u64,
+    len: u64,
+) -> Result<u64, Errno> {
+    let pages = len
+        .checked_add(PAGE_SIZE - 1)
+        .map(|n| n / PAGE_SIZE)
+        .ok_or(Errno::ENOMEM)?;
+    let span = pages.checked_mul(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
+    let base = compat::with_current_compat(|cs| -> Result<u64, Errno> {
+        let vm = &mut cs.vm.lock();
+        let base = if fixed {
+            if addr == 0 || addr & (PAGE_SIZE - 1) != 0 {
+                return Err(Errno::EINVAL);
+            }
+            addr
+        } else {
+            plan_mmap_base(&vm.mmaps, vm.mmap_floor, pages, USER_ADDR_MAX).ok_or(Errno::ENOMEM)?
+        };
+        let end = base.checked_add(span).ok_or(Errno::ENOMEM)?;
+        if end > USER_ADDR_MAX {
+            return Err(Errno::ENOMEM);
+        }
+        if fixed {
+            for i in 0..pages {
+                let _ = vmm::release_user_leaf(base + i * PAGE_SIZE);
+            }
+            cut_regions(&mut vm.mmaps, base, pages);
+        }
+        let pte_flags = leaf_flags(false, true) | vmm::VT_RO_BIT;
+        let mut mapped: Vec<u64> = Vec::new();
+        for i in 0..pages {
+            let Some(frame) = node.vtconsole_page(i) else {
+                unwind(&mapped);
+                return Err(Errno::ENOMEM);
+            };
+            pmm::cow_ref(frame);
+            let page = base + i * PAGE_SIZE;
+            if vmm::map(frame, page, pte_flags).is_err() {
+                if pmm::cow_unref(frame) {
+                    pmm::free_frame(frame);
+                }
+                unwind(&mapped);
+                return Err(Errno::ENOMEM);
+            }
+            mapped.push(page);
+        }
+        vm.mmaps.push(MmapRegion {
+            base,
+            pages,
+            writable: false,
+            nx: true,
+            prot: PROT_READ,
+            anon: false,
+            backing: backing.clone(),
+        });
+        if !fixed && end > vm.mmap_next_hint {
+            vm.mmap_next_hint = end;
+        }
+        Ok(base)
+    })
+    .unwrap_or(Err(Errno::EINVAL))?;
+    Ok(base)
+}
+
 /// `munmap` (11): снять отображение ранее `mmap`-нутого диапазона (R4.3) или
 /// отвергнуть невыровненный/непокрытый запрос с `-EINVAL` (R4.7).
 pub fn sys_munmap(addr: u64, len: u64) -> Result<u64, Errno> {
@@ -685,7 +773,10 @@ pub fn sys_mremap(
     for i in 0..old_pages {
         if let Some(pte) = vmm::walk_pte(old_addr + i * PAGE_SIZE) {
             let f = pte.flags();
-            if f.contains(vmm::SHARED_BIT) || f.contains(vmm::MMIO_BIT) {
+            if f.contains(vmm::SHARED_BIT)
+                || f.contains(vmm::VT_RO_BIT)
+                || f.contains(vmm::MMIO_BIT)
+            {
                 return Err(Errno::EINVAL);
             }
         }
@@ -929,6 +1020,18 @@ fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result
 
     let (writable, nx) = prot_to_flags(prot);
     let prot_none = prot == 0;
+    // Read-only shared VT surface нельзя сделать записываемой: экран публикует
+    // только ядро. Проверяем ВЕСЬ диапазон до первой мутации, чтобы отказ не
+    // оставил половину диапазона перезащищённой.
+    if writable {
+        for i in 0..pages {
+            if let Some(pte) = vmm::walk_pte(addr + i * PAGE_SIZE) {
+                if pte.flags().contains(vmm::VT_RO_BIT) {
+                    return Err(Errno::EACCES);
+                }
+            }
+        }
+    }
     // Второй проход: аппаратное состояние меняют только резидентные страницы.
     // PROT_NONE полностью убирает PTE (последующее касание обязано дать SIGSEGV,
     // а не заново подпереть страницу); всё остальное переотображается на месте с
@@ -968,6 +1071,10 @@ fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result
                     // устройства в PMM.
                     new_flags |=
                         vmm::MMIO_BIT | PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH;
+                } else if old_flags.contains(vmm::VT_RO_BIT) {
+                    // Read-only VT-поверхность: маркер владения сохраняется,
+                    // WRITABLE сюда не приходит (см. pre-scan выше).
+                    new_flags |= vmm::VT_RO_BIT;
                 } else if old_flags.contains(vmm::SHARED_BIT) {
                     // MAP_SHARED: кадр общий с файлом/другим процессом. Права
                     // отображения меняются на месте, маркер и ссылка владения

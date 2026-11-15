@@ -358,6 +358,15 @@ pub mod fb_abi;
 #[path = "../../src/drivers/input_event.rs"]
 pub mod input_event;
 
+// Shared VT surface ABI (`/dev/vtconsole0`) и перевод VT-байтов в PS/2
+// scancodes (`/dev/vtinput`). Оба модуля `core`-only: host-тесты проверяют
+// байтовую раскладку/валидатор/seqlock и таблицу ввода без QEMU.
+#[path = "../../src/drivers/vt_abi.rs"]
+pub mod vt_abi;
+
+#[path = "../../src/drivers/vt_keys.rs"]
+pub mod vt_keys;
+
 // Протокол RNDIS: сообщения управления и data-конверты. Модуль `core`+`alloc`
 // и самодостаточен, поэтому host-тесты разбирают точный исходник ядра и подают
 // ему усечённые/лживые ответы устройства.
