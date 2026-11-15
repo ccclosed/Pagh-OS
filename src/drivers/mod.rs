@@ -4,7 +4,13 @@
 pub mod cursor;
 pub mod e1000;
 pub mod earlyfb;
+/// Очередь evdev-событий и дублирование PS/2/USB-ввода в `/dev/input/event0`.
+pub mod evdev;
+/// Чистый ABI `fbdev` (`struct fb_var/fix_screeninfo`), host-тестируемый.
+pub mod fb_abi;
 pub mod framebuffer;
+/// Чистый кодек `struct input_event` + set-1 → Linux keycodes, host-тестируемый.
+pub mod input_event;
 pub mod memdisk;
 pub mod nvme;
 pub mod nvme_prp;

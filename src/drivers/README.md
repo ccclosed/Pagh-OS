@@ -24,7 +24,10 @@ PS/2 клавиатура и мышь, framebuffer-консоль, VT-эмуля
 | `usb_rndis_proto.rs` | Чистый протокол RNDIS: INIT/QUERY/SET/KEEPALIVE, разбор ответов по `RequestId`/статусу, data-конверты с 8-байтным префиксом и батчами; host-tests |
 | `usb_rndis.rs` | RNDIS-канал: управляющая последовательность, MAC, packet filter, keepalive, ограниченные RX/TX-очереди и 64-битные счётчики |
 | `xhci_hub.rs` | Чистая (`core` только) политика корневого порта xHCI по `hub.c`/`xhci-hub.c`: neutral-запись PORTSC (PED/PR/WPR/change bits не пишутся обратно), `hub_port_debounce` (25 мс шаг, 100 мс стабильного CCS, 2 с бюджет), `hub_port_wait_reset` (10/200 мс, 800 мс на запись, 5 попыток), 100 мс power settle, стабильность PED+U0 200 мс, backoff ≥1 с, без PP power-cycle; включается в host-tests как есть |
-| `framebuffer.rs` | Limine framebuffer текстовая консоль + 2D-графика: шрифт Fira Code 8×18 (`assets/font8x18.bin` — 8-битное **покрытие** на пиксель, генерируется `tools/gen_font.py`), `FbWriter`, скролл + скроллбек (см. `scrollback.rs`), status bar, макросы `fb_print!` |
+| `framebuffer.rs` | Limine framebuffer текстовая консоль + 2D-графика: шрифт Fira Code 8×18 (`assets/font8x18.bin` — 8-битное **покрытие** на пиксель, генерируется `tools/gen_font.py`), `FbWriter`, скролл + скроллбек (см. `scrollback.rs`), status bar, макросы `fb_print!`; `FbInfo`/`fb_info()` — геометрия для `/dev/fb0`, `takeover_{acquire,active,release}()` — handover экрана userspace-композитору (flush консоли останавливается, serial-логи идут) |
+| `fb_abi.rs` | Чистый (`core`) ABI fbdev: `struct fb_var_screeninfo` (160 байт) и `fb_fix_screeninfo` (80 байт), `FBIOGET_VSCREENINFO` 0x4600 / `FBIOGET_FSCREENINFO` 0x4602; host-тесты сверяют размеры/смещения с Linux UAPI |
+| `evdev.rs` | evdev-подобная очередь `/dev/input/event0`: кольцо 256 событий, `feed_scancode` из PS/2 IRQ1 и USB HID, `feed_mouse` (BTN_*/REL_X/REL_Y/REL_WHEEL) из PS/2 IRQ12 и USB HID, `read_event`/`has_events`; ввод дублируется, shell-stdin не затрагивается |
+| `input_event.rs` | Чистый (`core`) кодек `struct input_event` (24 байта), set-1 → Linux keycodes (extended-таблица, fake shift/ACK/Pause отбрасываются); включается в host-tests |
 | `vt.rs` | ANSI/VT-100 эмулятор поверх framebuffer (`Vt`: CSI/OSC/DCS, 256 цветов, scroll regions, ответы на запросы) — stdout compat-программ |
 | `cursor.rs` | Программный курсор мыши 12×19 (save/restore фона); `text_begin`/`text_end` для курсор-безопасного текста |
 | `serial.rs` | COM1 UART консоль (`init`, `write_bytes`, `console()`, макросы `kprint!`/`kprintln!`) |
@@ -49,7 +52,8 @@ PS/2 клавиатура и мышь, framebuffer-консоль, VT-эмуля
 - `ps2_mouse`: `init(screen_w, screen_h) -> bool`, `irq_handler()`, `poll()`,
   `MouseState { x, y, left, right, middle, seq }`.
 - `framebuffer`: `init()`, `console()`, `clear_screen()`, `set_fg_color()`, `dimensions()`,
-  `with(f)`, `draw_status_bar(left, right)`, `fb_print!/fb_println!`;
+  `with(f)`, `draw_status_bar(left, right)`, `fb_print!/fb_println!`; `fb_info() -> Option<FbInfo>`,
+  `takeover_active()/acquire()/release()` (release — только in-QEMU selftest);
   константы `CHAR_WIDTH=8`, `CHAR_HEIGHT=18`, `CHARS_PER_LINE=100`, `MAX_LINES=37`,
   `STATUS_BAR_HEIGHT=18`. Размер глифа экспортируется **намеренно**: VT, маппинг мыши в
   клетку и тулбар `paint` берут его отсюда, а не заводят свою копию (вторая копия —

@@ -111,6 +111,10 @@ pub fn take_scancode() -> Option<u8> {
 /// Ctrl press that arrived on both paths (firmware PS/2 translation plus a real
 /// USB device) and latch `^C` without a keypress.
 pub fn inject_scancode(byte: u8) {
+    // Дублировать в evdev ДО кольца: `/dev/input/event0` получает тот же
+    // set-1-поток, что и shell, но читает его независимо. USB HID-путь зовёт
+    // именно эту функцию, поэтому одна точка покрывает оба источника.
+    crate::drivers::evdev::feed_scancode(byte);
     if let Some(kbd) = KEYBOARD.lock().as_ref() {
         kbd.push_scancode(byte);
     }
@@ -204,6 +208,9 @@ pub fn irq_handler() {
     if let Some(ref kbd) = *KEYBOARD.lock() {
         kbd.push_scancode(scancode);
     }
+    // Тот же байт в evdev-очередь `/dev/input/event0`. Кольцо shell не
+    // затрагивается: читатель event0 не вынимает скан-коды у stdin.
+    crate::drivers::evdev::feed_scancode(scancode);
 }
 
 /// True when the ring buffer holds an unread scancode. Lets

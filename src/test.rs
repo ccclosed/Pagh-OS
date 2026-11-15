@@ -7466,6 +7466,720 @@ mod usb_hid_tests {
     }
 }
 
+// ─── Desktop-вариант B: kernel-примитивы (2.24.0) ───────────────────────────
+//
+// In-QEMU проверки того, что host-тесты доказать не могут: реальные syscall'ы
+// `memfd_create`/`ftruncate`/`mmap(MAP_SHARED)`, ioctl+mmap физического
+// framebuffer'а Limine и evdev-очередь `/dev/input/event0`, питаемая тем же
+// PS/2/USB-путём, что и shell.
+//
+// NON-DESTRUCTIVE: каждый syscall-тест выполняется в СВЕЖЕМ пользовательском
+// PML4 (`vmm::new_user_pml4` + `drop_user_space`): страницы, таблицы и scratch
+// возвращаются в PMM, kernel-PML4 не получает нижнеполовинных отображений, а
+// `/dev/fb0` отпускает экран через `release_takeover`. События/скан-коды,
+// которые тест инжектит в USB HID, вычитываются из PS/2-кольца, чтобы не
+// напечататься в shell после `selftest`; `evdev::reset` чистит очередь.
+mod desktop_b_tests {
+    use crate::arch::x86_64::linux::errno::Errno;
+    use crate::arch::x86_64::linux::mem::{VmRegionSet, MAP_SHARED, PROT_READ, PROT_WRITE};
+    use crate::arch::x86_64::linux::{io_sys, mem_sys};
+    use crate::drivers::fb_abi::{
+        FBIOGET_FSCREENINFO, FBIOGET_VSCREENINFO, FB_FIX_SIZE, FB_VAR_SIZE,
+    };
+    use crate::drivers::input_event::{
+        BTN_LEFT, EV_KEY, EV_REL, EV_SYN, INPUT_EVENT_SIZE, REL_X, REL_Y,
+    };
+    use crate::drivers::{evdev, usb_hid};
+    use crate::memory::layout::USER_MMAP_BASE;
+    use crate::memory::{pmm, vmm};
+    use crate::sync::spinlock::Spinlock;
+    use crate::task::compat::{self, CompatState};
+    use crate::task::fd::FdTable;
+    use crate::task::scheduler;
+    use alloc::sync::Arc;
+    use x86_64::structures::paging::PageTableFlags;
+
+    /// Scratch-страница пользовательских аргументов (путь, ioctl-структуры,
+    /// pollfd, буфер события). Адрес ниже `USER_ADDR_MAX` и вдали от
+    /// `USER_MMAP_BASE`, куда `mmap` кладёт свои регионы.
+    const SCRATCH_VA: u64 = 0x0000_4002_0000_0000;
+    /// Отдельный VA для shared-страницы в fork-тесте.
+    const FORK_VA: u64 = 0x0000_5000_0000_0000;
+
+    const O_RDONLY: u64 = 0;
+    const O_RDWR: u64 = 2;
+    const F_SETFL: u64 = 4;
+    const O_NONBLOCK: u64 = 0o4000;
+    const POLLIN: i16 = 0x001;
+
+    /// Синтетический `Compat_Process` для вызывающей задачи: syscall-слой
+    /// ищет состояние по `scheduler::current_pid()`.
+    fn synth(pid: u64) -> CompatState {
+        CompatState::new(
+            FdTable::with_standard_streams(),
+            Arc::new(Spinlock::new(VmRegionSet::new(
+                USER_MMAP_BASE,
+                USER_MMAP_BASE,
+            ))),
+            pid,
+        )
+    }
+
+    fn install_synth() -> (u64, Option<CompatState>) {
+        let me = scheduler::current_pid();
+        let saved = compat::remove_compat(me);
+        compat::install_compat(me, synth(me));
+        (me, saved)
+    }
+
+    fn restore_synth(me: u64, saved: Option<CompatState>) {
+        compat::remove_compat(me);
+        if let Some(st) = saved {
+            compat::install_compat(me, st);
+        }
+    }
+
+    /// Отобразить scratch-страницу в АКТИВНОМ адресном пространстве.
+    fn map_scratch() -> Option<u64> {
+        let frame = pmm::alloc_frame()?;
+        // SAFETY: кадр только что выделен и доступен через HHDM.
+        unsafe {
+            core::ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, 4096);
+        }
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+        vmm::map(frame, SCRATCH_VA, flags).ok()?;
+        Some(frame)
+    }
+
+    /// Выполнить `f` в свежем пользовательском PML4, где отображена только
+    /// scratch-страница. После возврата адресное пространство сносится целиком
+    /// (`drop_user_space`), поэтому все кадры и таблицы возвращаются в PMM.
+    ///
+    /// `f` НЕ должен переключать CR3 сам и не должен ожидать, что в нижней
+    /// половине есть что-то, кроме scratch/своих отображений.
+    fn with_user_space<R>(f: impl FnOnce() -> R) -> Option<R> {
+        let pml4 = vmm::new_user_pml4().ok()?;
+        let saved = vmm::current_pml4_phys();
+        // SAFETY: новый PML4 построен `new_user_pml4` из текущего и содержит все
+        // ядерные отображения верхней половины, поэтому код ядра, стек и heap
+        // остаются доступны; возврат на `saved` — обязанность этой функции.
+        unsafe {
+            vmm::load_cr3(pml4);
+        }
+        if map_scratch().is_none() {
+            // SAFETY: возвращаем исходный PML4 до освобождения нового.
+            unsafe {
+                vmm::load_cr3(saved);
+            }
+            vmm::drop_user_space(pml4);
+            return None;
+        }
+        let out = Some(f());
+        // SAFETY: сносим адресное пространство только после возврата на
+        // исходный CR3.
+        unsafe {
+            vmm::load_cr3(saved);
+        }
+        vmm::drop_user_space(pml4);
+        out
+    }
+
+    fn put(offset: u64, bytes: &[u8]) {
+        assert!(offset as usize + bytes.len() <= 4096);
+        // SAFETY: scratch-страница отображена writable в `with_user_space`;
+        // диапазон проверен выше.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (SCRATCH_VA + offset) as *mut u8,
+                bytes.len(),
+            );
+        }
+    }
+
+    fn get_u32(offset: u64) -> u32 {
+        // SAFETY: scratch-страница отображена; смещение внутри 4 КиБ.
+        unsafe { core::ptr::read_unaligned((SCRATCH_VA + offset) as *const u32) }
+    }
+
+    fn get_i16(offset: u64) -> i16 {
+        // SAFETY: как выше.
+        unsafe { core::ptr::read_unaligned((SCRATCH_VA + offset) as *const i16) }
+    }
+
+    fn put_cstr(offset: u64, s: &[u8]) {
+        put(offset, s);
+        put(offset + s.len() as u64, &[0]);
+    }
+
+    /// `/dev/fb0`: open → ioctl var/fix → mmap физического scanout → пиксель
+    /// через пользовательское отображение → `munmap`; takeover включён, пока
+    /// экран у desktop, и снят в конце.
+    pub fn fbdev_ioctl_mmap_pixel() {
+        let info = match crate::drivers::framebuffer::fb_info() {
+            Some(i) => i,
+            None => {
+                crate::skip_kernel!("no framebuffer", "fb0: serial-only boot");
+                return;
+            }
+        };
+        let frames_before = pmm::free_frames();
+        // Тест забирает экран; предыдущий (если был) обязан был его вернуть.
+        crate::drivers::framebuffer::release_takeover();
+
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            put_cstr(0, b"/dev/fb0");
+            let fd = match io_sys::sys_open(SCRATCH_VA, O_RDWR, 0) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    assert_eq_kernel!(0, 1, "fb0: open must succeed");
+                    return;
+                }
+            };
+            assert_kernel!(
+                crate::drivers::framebuffer::takeover_active(),
+                "fb0: open must take the screen over from the kernel console"
+            );
+
+            // FBIOGET_VSCREENINFO: 160-байтная структура в scratch+0x100.
+            assert_eq_kernel!(
+                io_sys::sys_ioctl(fd, FBIOGET_VSCREENINFO, SCRATCH_VA + 0x100),
+                Ok(0),
+                "fb0: FBIOGET_VSCREENINFO succeeds"
+            );
+            assert_eq_kernel!(get_u32(0x100), info.width, "fb0: var.xres");
+            assert_eq_kernel!(get_u32(0x104), info.height, "fb0: var.yres");
+            assert_eq_kernel!(get_u32(0x100 + 24), info.bpp, "fb0: var.bits_per_pixel");
+            // red.offset/length по смещениям 32/36.
+            assert_eq_kernel!(get_u32(0x100 + 32), info.red_offset, "fb0: var.red.offset");
+            assert_eq_kernel!(get_u32(0x100 + 36), info.red_length, "fb0: var.red.length");
+
+            // FBIOGET_FSCREENINFO: id/smem_start/smem_len/type/visual/stride.
+            assert_eq_kernel!(
+                io_sys::sys_ioctl(fd, FBIOGET_FSCREENINFO, SCRATCH_VA + 0x200),
+                Ok(0),
+                "fb0: FBIOGET_FSCREENINFO succeeds"
+            );
+            // SAFETY: scratch writable, id — 16 байт.
+            let id = unsafe { core::slice::from_raw_parts((SCRATCH_VA + 0x200) as *const u8, 16) };
+            assert_eq_kernel!(&id[..6], b"paghfb", "fb0: fix.id");
+            assert_eq_kernel!(
+                u64::from_le_bytes(unsafe {
+                    core::ptr::read_unaligned((SCRATCH_VA + 0x210) as *const [u8; 8])
+                }),
+                info.phys,
+                "fb0: fix.smem_start is the physical scanout base"
+            );
+            assert_eq_kernel!(
+                get_u32(0x200 + 24),
+                info.smem_len as u32,
+                "fb0: fix.smem_len"
+            );
+            assert_eq_kernel!(get_u32(0x200 + 28), 0, "fb0: FB_TYPE_PACKED_PIXELS");
+            assert_eq_kernel!(get_u32(0x200 + 36), 2, "fb0: FB_VISUAL_TRUECOLOR");
+            assert_eq_kernel!(get_u32(0x200 + 48), info.pitch, "fb0: fix.line_length");
+
+            // Приватный fbdev-маппинг — отказ, а не копия экрана.
+            assert_eq_kernel!(
+                mem_sys::sys_mmap(
+                    0,
+                    4096,
+                    (PROT_READ | PROT_WRITE) as u64,
+                    2u64, /*MAP_PRIVATE*/
+                    fd,
+                    0
+                ),
+                Err(Errno::EINVAL),
+                "fb0: MAP_PRIVATE must be EINVAL"
+            );
+
+            let map_len = (info.smem_len + 4095) & !4095;
+            let base = match mem_sys::sys_mmap(
+                0,
+                map_len,
+                (PROT_READ | PROT_WRITE) as u64,
+                MAP_SHARED as u64,
+                fd,
+                0,
+            ) {
+                Ok(b) => b,
+                Err(_) => {
+                    crate::skip_kernel!("mmap failed", "fb0: scanout mmap failed");
+                    return;
+                }
+            };
+            assert_kernel!(base != 0, "fb0: mmap returned an address");
+
+            // Пиксель в правом нижнем углу: он не занят текстовой сеткой, но
+            // сохраняется/восстанавливается независимо от этого.
+            let off = ((info.height as u64 - 2) * info.pitch as u64 + (info.width as u64 - 2) * 4)
+                as usize;
+            assert_kernel!(
+                (off + 4) as u64 <= info.smem_len,
+                "fb0: pixel inside scanout"
+            );
+            // SAFETY: страница scanout отображена пользователю writable этим
+            // вызовом; `off+4` внутри `smem_len`.
+            let orig = unsafe { core::ptr::read_unaligned((base + off as u64) as *const u32) };
+            const MAGIC: u32 = 0x00FF_00FF;
+            // SAFETY: как выше.
+            unsafe {
+                core::ptr::write_unaligned((base + off as u64) as *mut u32, MAGIC);
+            }
+            // SAFETY: пользовательское отображение читается обратно.
+            let seen = unsafe { core::ptr::read_unaligned((base + off as u64) as *const u32) };
+            assert_eq_kernel!(
+                seen,
+                MAGIC,
+                "fb0: pixel written through the mapping reads back"
+            );
+            // SAFETY: HHDM-алиас физического кадра framebuffer валиден; проверяем,
+            // что запись реально дошла до scanout, а не осталась в кэше CPU.
+            let phys_seen = unsafe {
+                core::ptr::read_volatile(vmm::phys_to_virt(info.phys + off as u64) as *const u32)
+            };
+            assert_eq_kernel!(phys_seen, MAGIC, "fb0: pixel reached the physical scanout");
+
+            // Второе отображение того же fd видит тот же пиксель.
+            let base2 = mem_sys::sys_mmap(
+                0,
+                map_len,
+                (PROT_READ | PROT_WRITE) as u64,
+                MAP_SHARED as u64,
+                fd,
+                0,
+            )
+            .expect("fb0 second mmap");
+            // SAFETY: как выше.
+            let seen2 = unsafe { core::ptr::read_unaligned((base2 + off as u64) as *const u32) };
+            assert_eq_kernel!(seen2, MAGIC, "fb0: second mmap aliases the same scanout");
+
+            // Восстановить пиксель и снять отображения.
+            // SAFETY: оба отображения живут до munmap ниже.
+            unsafe {
+                core::ptr::write_unaligned((base2 + off as u64) as *mut u32, orig);
+            }
+            assert_eq_kernel!(mem_sys::sys_munmap(base2, map_len), Ok(0), "fb0: munmap #2");
+            assert_eq_kernel!(mem_sys::sys_munmap(base, map_len), Ok(0), "fb0: munmap #1");
+            assert_kernel!(
+                vmm::virt_to_phys(base).is_none(),
+                "fb0: unmapped scanout leaves no translation"
+            );
+            assert_eq_kernel!(io_sys::sys_close(fd), Ok(0), "fb0: close");
+        })
+        .is_some();
+        restore_synth(me, saved);
+        // Вернуть экран консоли и перерисовать её из shadow-буфера.
+        crate::drivers::framebuffer::release_takeover();
+        crate::drivers::framebuffer::repaint_grid();
+        assert_kernel!(ran, "fb0: syscall test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "fb0: routine returned every PMM frame (fresh AS teardown)"
+        );
+    }
+
+    /// `/dev/input/event0`: open → EAGAIN без событий (O_NONBLOCK) → HID
+    /// keyboard report → poll POLLIN → read EV_KEY/KEY_A + SYN → HID mouse
+    /// report → BTN_LEFT/REL_X/REL_Y.
+    pub fn evdev_read_poll_keyboard_mouse() {
+        let frames_before = pmm::free_frames();
+        evdev::reset();
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            put_cstr(0, b"/dev/input/event0");
+            let fd = match io_sys::sys_open(SCRATCH_VA, O_RDONLY, 0) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    crate::skip_kernel!("open failed", "event0: open failed");
+                    return;
+                }
+            };
+
+            // Пустая очередь + O_NONBLOCK → EAGAIN.
+            assert_eq_kernel!(
+                io_sys::sys_fcntl(fd, F_SETFL, O_NONBLOCK),
+                Ok(0),
+                "event0: F_SETFL(O_NONBLOCK)"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_read(fd, SCRATCH_VA + 0x400, INPUT_EVENT_SIZE as u64),
+                Err(Errno::EAGAIN),
+                "event0: read with no events is EAGAIN"
+            );
+
+            // poll без событий — 0.
+            put(0x300, &(fd as i32).to_le_bytes());
+            put(0x304, &POLLIN.to_le_bytes());
+            put(0x306, &0i16.to_le_bytes());
+            assert_eq_kernel!(
+                io_sys::sys_poll(SCRATCH_VA + 0x300, 1, 0),
+                Ok(0),
+                "event0: poll before any event is 0"
+            );
+
+            // USB HID keyboard report: 'a' (usage 0x04). Он попадает и в
+            // evdev-очередь, и в PS/2-кольцо shell (ниже кольцо вычитывается).
+            usb_hid::feed(&[0, 0, 0x04, 0, 0, 0, 0, 0], 1);
+            assert_kernel!(evdev::has_events(), "event0: HID key queued an event");
+            assert_eq_kernel!(
+                io_sys::sys_poll(SCRATCH_VA + 0x300, 1, 0),
+                Ok(1),
+                "event0: poll reports an event"
+            );
+            assert_eq_kernel!(
+                get_i16(0x306) & POLLIN,
+                POLLIN,
+                "event0: revents has POLLIN"
+            );
+
+            // Первое событие — нажатие 'a' (KEY_A=30).
+            assert_eq_kernel!(
+                io_sys::sys_read(fd, SCRATCH_VA + 0x400, INPUT_EVENT_SIZE as u64),
+                Ok(INPUT_EVENT_SIZE as u64),
+                "event0: read returns one full input_event"
+            );
+            assert_eq_kernel!(get_i16(0x400 + 16), EV_KEY as i16, "event0: EV_KEY type");
+            assert_eq_kernel!(get_i16(0x400 + 18), 30, "event0: KEY_A code");
+            assert_eq_kernel!(get_u32(0x400 + 20), 1, "event0: pressed value");
+            // Второе — SYN_REPORT.
+            assert_eq_kernel!(
+                io_sys::sys_read(fd, SCRATCH_VA + 0x400, INPUT_EVENT_SIZE as u64),
+                Ok(INPUT_EVENT_SIZE as u64),
+                "event0: packet ends with a SYN event"
+            );
+            assert_eq_kernel!(get_i16(0x400 + 16), EV_SYN as i16, "event0: EV_SYN type");
+
+            // HID mouse: left button, dx=+4, dy=+2 (screen down).
+            usb_hid::feed(&[0x01, 0x04, 0x02], 2);
+            // BTN_LEFT press.
+            assert_eq_kernel!(
+                io_sys::sys_read(fd, SCRATCH_VA + 0x400, INPUT_EVENT_SIZE as u64),
+                Ok(INPUT_EVENT_SIZE as u64),
+                "event0: mouse packet event"
+            );
+            assert_eq_kernel!(
+                get_i16(0x400 + 16),
+                EV_KEY as i16,
+                "event0: mouse button EV_KEY"
+            );
+            assert_eq_kernel!(get_i16(0x400 + 18), BTN_LEFT as i16, "event0: BTN_LEFT");
+            assert_eq_kernel!(get_u32(0x400 + 20), 1, "event0: BTN_LEFT pressed");
+            // REL_X +4.
+            assert_eq_kernel!(
+                io_sys::sys_read(fd, SCRATCH_VA + 0x400, INPUT_EVENT_SIZE as u64),
+                Ok(INPUT_EVENT_SIZE as u64),
+                "event0: mouse packet event"
+            );
+            assert_eq_kernel!(get_i16(0x400 + 16), EV_REL as i16, "event0: EV_REL type");
+            assert_eq_kernel!(get_i16(0x400 + 18), REL_X as i16, "event0: REL_X");
+            assert_eq_kernel!(get_u32(0x400 + 20), 4, "event0: REL_X +4");
+            // REL_Y +2: HID-отчёт `dy=+2` (вниз) переворачивается в PS/2-
+            // соглашение, а evdev REL_Y снова screen-вниз — итог +2.
+            assert_eq_kernel!(
+                io_sys::sys_read(fd, SCRATCH_VA + 0x400, INPUT_EVENT_SIZE as u64),
+                Ok(INPUT_EVENT_SIZE as u64),
+                "event0: mouse packet event"
+            );
+            assert_eq_kernel!(get_i16(0x400 + 18), REL_Y as i16, "event0: REL_Y");
+            assert_eq_kernel!(get_u32(0x400 + 20), 2, "event0: REL_Y +2 (screen down)");
+            // SYN.
+            assert_eq_kernel!(
+                io_sys::sys_read(fd, SCRATCH_VA + 0x400, INPUT_EVENT_SIZE as u64),
+                Ok(INPUT_EVENT_SIZE as u64),
+                "event0: mouse packet event"
+            );
+            assert_eq_kernel!(get_i16(0x400 + 16), EV_SYN as i16, "event0: mouse SYN");
+
+            assert_eq_kernel!(io_sys::sys_close(fd), Ok(0), "event0: close");
+        })
+        .is_some();
+        restore_synth(me, saved);
+        // Отпустить клавишу/кнопку и вычистить оба потока: PS/2-кольцо не
+        // должно напечатать 'a' в shell после selftest.
+        usb_hid::feed(&[0, 0, 0, 0, 0, 0, 0, 0], 1);
+        usb_hid::feed(&[0, 0, 0], 2);
+        let mut guard = 0;
+        while crate::drivers::ps2_kbd::take_scancode().is_some() && guard < 1024 {
+            guard += 1;
+        }
+        evdev::reset();
+        assert_kernel!(ran, "event0: syscall test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "event0: routine returned every PMM frame"
+        );
+    }
+
+    /// memfd + ftruncate + MAP_SHARED: два отображения одного fd видят одни
+    /// байты, fd/read и mapping согласованы, mprotect сохраняет SHARED-маркер,
+    /// а MAP_SHARED обычного файла честно отвергается.
+    pub fn memfd_mmap_shared_coherent() {
+        let frames_before = pmm::free_frames();
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            put_cstr(0, b"desktop-shm");
+            let fd = match io_sys::sys_memfd_create(SCRATCH_VA, 0) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    crate::skip_kernel!("memfd_create failed", "memfd: no fd");
+                    return;
+                }
+            };
+            // ftruncate задаёт размер SHM-буфера; read() до записи даёт нули.
+            assert_eq_kernel!(
+                io_sys::sys_ftruncate(fd, 8192),
+                Ok(0),
+                "memfd: ftruncate(8192)"
+            );
+            let node = match io_sys::file_node_for_fd(fd as u32) {
+                Some(n) => n,
+                None => {
+                    crate::skip_kernel!("no node", "memfd: fd has no VFS node");
+                    return;
+                }
+            };
+            assert_eq_kernel!(node.size(), 8192, "memfd: size after ftruncate");
+            assert_eq_kernel!(
+                io_sys::sys_pread64(fd, SCRATCH_VA + 0x500, 8, 0),
+                Ok(8),
+                "memfd: pread of a zero page"
+            );
+            assert_eq_kernel!(get_u32(0x500), 0, "memfd: page starts zeroed");
+
+            let len = 8192;
+            let base = match mem_sys::sys_mmap(
+                0,
+                len,
+                (PROT_READ | PROT_WRITE) as u64,
+                MAP_SHARED as u64,
+                fd,
+                0,
+            ) {
+                Ok(b) => b,
+                Err(_) => {
+                    crate::skip_kernel!("mmap failed", "memfd: MAP_SHARED mmap failed");
+                    return;
+                }
+            };
+            const MAGIC: u64 = 0x1122_3344_5566_7788;
+            // SAFETY: отображение MAP_SHARED writable длиной 8192.
+            unsafe {
+                core::ptr::write_unaligned(base as *mut u64, MAGIC);
+                core::ptr::write_unaligned((base + 4096) as *mut u64, !MAGIC);
+            }
+            // fd-чтение видит запись через отображение (один page cache).
+            assert_eq_kernel!(
+                io_sys::sys_pread64(fd, SCRATCH_VA + 0x500, 8, 0),
+                Ok(8),
+                "memfd: pread sees the shared-mapping write"
+            );
+            // SAFETY: scratch readable.
+            let seen = unsafe { core::ptr::read_unaligned((SCRATCH_VA + 0x500) as *const u64) };
+            assert_eq_kernel!(seen, MAGIC, "memfd: fd and mapping are coherent");
+
+            // Второе отображение того же fd — те же физические страницы.
+            let base2 = mem_sys::sys_mmap(
+                0,
+                len,
+                (PROT_READ | PROT_WRITE) as u64,
+                MAP_SHARED as u64,
+                fd,
+                0,
+            )
+            .expect("memfd second mmap");
+            // SAFETY: оба отображения валидны.
+            let seen2 = unsafe { core::ptr::read_unaligned(base2 as *const u64) };
+            assert_eq_kernel!(seen2, MAGIC, "memfd: second mmap aliases the page");
+            // SAFETY: как выше.
+            unsafe {
+                core::ptr::write_unaligned((base2 + 4096) as *mut u64, 0xA5A5_5A5A_A5A5_5A5A);
+            }
+            // SAFETY: как выше.
+            let cross = unsafe { core::ptr::read_unaligned((base + 4096) as *const u64) };
+            assert_eq_kernel!(
+                cross,
+                0xA5A5_5A5A_A5A5_5A5A,
+                "memfd: write through the second mapping is visible through the first"
+            );
+
+            // mprotect(PROT_READ) сохраняет SHARED_BIT и снимает WRITABLE.
+            assert_eq_kernel!(
+                mem_sys::sys_mprotect(base, 4096, PROT_READ as u64),
+                Ok(0),
+                "memfd: mprotect(PROT_READ)"
+            );
+            let pte = vmm::walk_pte(base).expect("memfd: PTE exists");
+            assert_kernel!(
+                pte.flags().contains(vmm::SHARED_BIT),
+                "memfd: mprotect preserves the SHARED marker"
+            );
+            assert_kernel!(
+                !pte.flags().contains(PageTableFlags::WRITABLE),
+                "memfd: mprotect(PROT_READ) removes WRITABLE"
+            );
+            assert_eq_kernel!(
+                mem_sys::sys_mprotect(base, 4096, (PROT_READ | PROT_WRITE) as u64),
+                Ok(0),
+                "memfd: mprotect(RW) again"
+            );
+            assert_kernel!(
+                vmm::walk_pte(base)
+                    .map(|p| p.flags().contains(PageTableFlags::WRITABLE))
+                    .unwrap_or(false),
+                "memfd: mprotect(RW) restores WRITABLE"
+            );
+
+            // MAP_SHARED обычного файла не должен притворяться memfd.
+            put_cstr(0x600, b"/dev/null");
+            let null_fd =
+                io_sys::sys_open(SCRATCH_VA + 0x600, O_RDWR, 0).expect("memfd: /dev/null open");
+            assert_eq_kernel!(
+                mem_sys::sys_mmap(0, 4096, PROT_READ as u64, MAP_SHARED as u64, null_fd, 0),
+                Err(Errno::EINVAL),
+                "memfd: MAP_SHARED on a non-memfd file is EINVAL"
+            );
+            assert_eq_kernel!(io_sys::sys_close(null_fd), Ok(0), "memfd: close /dev/null");
+
+            assert_eq_kernel!(mem_sys::sys_munmap(base2, len), Ok(0), "memfd: munmap #2");
+            assert_eq_kernel!(mem_sys::sys_munmap(base, len), Ok(0), "memfd: munmap #1");
+            assert_eq_kernel!(
+                io_sys::sys_close(fd),
+                Ok(0),
+                "memfd: close drops the page cache"
+            );
+        })
+        .is_some();
+        restore_synth(me, saved);
+        assert_kernel!(ran, "memfd: syscall test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "memfd: routine returned every PMM frame"
+        );
+    }
+
+    /// fork-семантика MAP_SHARED: общая страница memfd видна родителю и
+    /// ребёнку, запись родителя после fork видна ребёнку, обе стороны держат
+    /// ровно одну ссылку владения, `drop_user_space` всё возвращает.
+    pub fn memfd_mmap_shared_survives_fork() {
+        let frames_before = pmm::free_frames();
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            put_cstr(0, b"fork-shm");
+            let fd = io_sys::sys_memfd_create(SCRATCH_VA, 0).expect("fork-shm: memfd_create");
+            io_sys::sys_ftruncate(fd, 4096).expect("fork-shm: ftruncate");
+            let node = io_sys::file_node_for_fd(fd as u32).expect("fork-shm: node");
+
+            let parent = vmm::current_pml4_phys();
+            let child = vmm::new_user_pml4().expect("fork-shm: child PML4");
+
+            // Parent AS: одна SHARED-страница memfd по FORK_VA.
+            let frame = node.shared_page(0).expect("fork-shm: page");
+            pmm::cow_ref(frame); // ссылка отображения родителя
+            let flags = PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::USER_ACCESSIBLE
+                | PageTableFlags::NO_EXECUTE
+                | vmm::SHARED_BIT;
+            vmm::map(frame, FORK_VA, flags).expect("fork-shm: map parent");
+            const BEFORE: u64 = 0x0123_4567_89AB_CDEF;
+            // SAFETY: FORK_VA отображён writable в активном (parent) AS.
+            unsafe {
+                core::ptr::write_unaligned(FORK_VA as *mut u64, BEFORE);
+            }
+
+            // fork-COW должен СОХРАНИТЬ общий кадр, а не сделать COW-копию.
+            vmm::fork_user_space_cow(parent, child).expect("fork-shm: fork_user_space_cow");
+            let child_phys = vmm::virt_to_phys_in(child, FORK_VA).expect("fork-shm: child PTE");
+            assert_eq_kernel!(
+                child_phys,
+                frame,
+                "fork-shm: child maps the SAME physical page, not a COW copy"
+            );
+            // SAFETY: кадр доступен через HHDM, ребёнок его отображает.
+            let child_sees =
+                unsafe { core::ptr::read_volatile(vmm::phys_to_virt(child_phys) as *const u64) };
+            assert_eq_kernel!(child_sees, BEFORE, "fork-shm: child sees pre-fork data");
+
+            // Запись родителя ПОСЛЕ fork видна ребёнку (общая, не COW).
+            const AFTER: u64 = 0x0FED_CBA9_8765_4321;
+            // SAFETY: parent AS активен, FORK_VA writable.
+            unsafe {
+                core::ptr::write_unaligned(FORK_VA as *mut u64, AFTER);
+            }
+            // SAFETY: как выше.
+            let child_after =
+                unsafe { core::ptr::read_volatile(vmm::phys_to_virt(child_phys) as *const u64) };
+            assert_eq_kernel!(
+                child_after,
+                AFTER,
+                "fork-shm: post-fork write is shared, not copy-on-write"
+            );
+
+            // Флаги ребёнка: SHARED + WRITABLE (не COW/RO).
+            // SAFETY: переключаем CR3 на ребёнка и сразу возвращаемся.
+            unsafe {
+                vmm::load_cr3(child);
+            }
+            let child_flags = vmm::walk_pte(FORK_VA).map(|p| p.flags());
+            // SAFETY: возврат на parent AS.
+            unsafe {
+                vmm::load_cr3(parent);
+            }
+            let cf = child_flags.expect("fork-shm: child leaf");
+            assert_kernel!(
+                cf.contains(vmm::SHARED_BIT),
+                "fork-shm: child leaf keeps SHARED_BIT"
+            );
+            assert_kernel!(
+                cf.contains(PageTableFlags::WRITABLE),
+                "fork-shm: child leaf stays writable"
+            );
+            assert_kernel!(
+                !cf.contains(vmm::COW_BIT),
+                "fork-shm: child leaf is not COW"
+            );
+
+            // Ребёнок не должен освободить кадр, который родитель ещё держит.
+            let saved_cr3 = vmm::current_pml4_phys();
+            // SAFETY: child inactive, drop идёт через HHDM.
+            vmm::drop_user_space(child);
+            // SAFETY: parent всё ещё активен.
+            assert_eq_kernel!(saved_cr3, parent, "fork-shm: parent AS stayed active");
+            assert_kernel!(
+                vmm::virt_to_phys(FORK_VA).is_some(),
+                "fork-shm: child teardown leaves the parent mapping alive"
+            );
+            // SAFETY: parent AS активен, отображение валидно.
+            let still = unsafe { core::ptr::read_unaligned(FORK_VA as *const u64) };
+            assert_eq_kernel!(
+                still,
+                AFTER,
+                "fork-shm: parent mapping survives child teardown"
+            );
+
+            // Родительское отображение снимается вместе с его AS (`with_user_space`
+            // сделает drop_user_space); закрытие fd отпускает кэш-страницу.
+            assert_eq_kernel!(io_sys::sys_close(fd), Ok(0), "fork-shm: close");
+        })
+        .is_some();
+        restore_synth(me, saved);
+        assert_kernel!(ran, "fork-shm: test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "fork-shm: routine returned every PMM frame"
+        );
+    }
+}
+
 pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
     alloc::vec![
         (
@@ -7823,6 +8537,23 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "sysinfo::loads match /proc/loadavg in 16.16 fixed point",
             sysinfo_tests::loads_match_the_procfs_view_in_fixed_point
+        ),
+        // Desktop-вариант B (2.24.0): kernel-примитивы под userspace-композитор.
+        (
+            "desktop-b::/dev/fb0 ioctl + mmap scanout pixel",
+            desktop_b_tests::fbdev_ioctl_mmap_pixel
+        ),
+        (
+            "desktop-b::/dev/input/event0 keyboard + mouse read/poll",
+            desktop_b_tests::evdev_read_poll_keyboard_mouse
+        ),
+        (
+            "desktop-b::memfd ftruncate + MAP_SHARED coherence",
+            desktop_b_tests::memfd_mmap_shared_coherent
+        ),
+        (
+            "desktop-b::MAP_SHARED memfd survives fork",
+            desktop_b_tests::memfd_mmap_shared_survives_fork
         ),
     ]
 }
