@@ -1679,6 +1679,11 @@ def mode_bench(h: Harness) -> tuple[str, int]:
     install_marker = re.search(
         r"LXSELFTEST apt_bench install pkgs=(\d+) total_ms=(\d+)", text)
     payload = regex_first(r"LXSELFTEST apt_bench payload [^\r\n]*", text)
+    spool = re.search(
+        r"LXSELFTEST apt_bench spool probe_bytes=(\d+) write_ms=(\d+) read_ms=(\d+)", text)
+    if spool:
+        h.metrics["spool write ms/8MiB"] = spool.group(2)
+        h.metrics["spool read ms/8MiB"] = spool.group(3)
     install_line = install_lines[-1] if install_lines else ""
     heap_m = re.search(r"heap_peak_kib=(\d+)", install_line)
     files_m = re.search(r"files=(\d+)", install_line)
@@ -1707,6 +1712,8 @@ def mode_bench(h: Harness) -> tuple[str, int]:
     ok &= h.check("install timing carries phase fields & heap_peak_kib",
                   heap_kib >= 0 and files > 0, install_line)
     ok &= h.check("install payload verified in guest", bool(payload), payload or "")
+    ok &= h.check("temp-file spool cost probe ran", bool(spool),
+                  spool.group(0) if spool else "no probe line")
     ok &= h.check("install planned the multi-package transaction",
                   bool(install_marker) and int(install_marker.group(1)) >= 2,
                   install_marker.group(0) if install_marker else "no marker")

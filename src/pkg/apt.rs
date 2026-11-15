@@ -958,6 +958,20 @@ const MAX_INDEX_CACHE_BYTES: usize = 48 * 1024 * 1024;
 /// payload length(8) + payload SHA-256(32).
 const INDEX_CACHE_HEADER_FIXED: usize = 16 + 4 + 32 + 6 + 8 + 32;
 
+/// Whether the persistent index cache is active in this build.
+///
+/// The cache is a production optimization. The diagnostic harnesses that exist to
+/// exercise the REAL download+decompress+parse path (`lx_bigindex`,
+/// `lx_bigindex_inram`, and the live-mirror `lx_livetest`) must never be short-
+/// circuited by a cache left on a reused disk, so it is compiled out there.
+fn index_cache_enabled() -> bool {
+    !cfg!(any(
+        feature = "lx_bigindex",
+        feature = "lx_bigindex_inram",
+        feature = "lx_livetest"
+    ))
+}
+
 /// Create (or look up) every component of an absolute directory path.
 fn ensure_dir_path(path: &str) -> Result<Arc<dyn crate::vfs::VfsNode>, crate::vfs::VfsError> {
     use crate::vfs::VfsError;
@@ -1295,13 +1309,16 @@ fn update_timed(t: &mut Timings) -> Result<usize, AptOpError> {
     // Release policy checks above, so the cache can never bypass them; a miss or
     // any inconsistency falls through to the normal verified path below.
     let release_digest = openpgp_crypto::sha256(&signed.text);
-    if let Some((index, bytes)) = load_index_cache(&cfg, &release_digest) {
-        t.phase("cache_load_ms");
-        t.count("cache_bytes", bytes as u64);
-        let count = index.len();
-        *INDEX.lock() = Some(index);
-        crate::info!("apt: index ready - {} packages (cache)", count);
-        return Ok(count);
+    let cache_enabled = index_cache_enabled();
+    if cache_enabled {
+        if let Some((index, bytes)) = load_index_cache(&cfg, &release_digest) {
+            t.phase("cache_load_ms");
+            t.count("cache_bytes", bytes as u64);
+            let count = index.len();
+            *INDEX.lock() = Some(index);
+            crate::info!("apt: index ready - {} packages (cache)", count);
+            return Ok(count);
+        }
     }
     t.phase("cache_load_ms");
 
@@ -1378,9 +1395,10 @@ fn update_timed(t: &mut Timings) -> Result<usize, AptOpError> {
                 // W3: persist the parsed index for the next update, keyed by the
                 // signed Release digest + this configuration. Failure to cache is
                 // only a warning: the update itself already succeeded.
-                match store_index_cache(&cfg, &release_digest, &index) {
-                    Ok(bytes) => t.count("cache_store_bytes", bytes as u64),
-                    Err(()) => {}
+                if cache_enabled {
+                    if let Ok(bytes) = store_index_cache(&cfg, &release_digest, &index) {
+                        t.count("cache_store_bytes", bytes as u64);
+                    }
                 }
                 t.phase("cache_store_ms");
                 let count = index.len();

@@ -888,6 +888,62 @@ pub fn run_apt_e2e() {
 
 // ───────────────────────── apt performance benchmark ─────────────────────────
 
+/// Measure the cost a **temp-file spool** alternative to the two-pass streaming
+/// install would pay, for the W1 design decision.
+///
+/// The alternative design is "decompress `data.tar` once into a temp file, then
+/// read it twice (plan + extract)". It saves one decompression pass but must write
+/// and re-read the whole decompressed tar on ext2. `bytes` are written
+/// sequentially in 256 KiB pieces and read back the same way (the data content is
+/// irrelevant to the throughput); the scratch file is removed afterwards.
+///
+/// Returns `(write_ms, read_ms)`, or `None` if the probe could not run (no space,
+/// VFS refusal) — a benchmark footnote, never a failure.
+#[cfg(feature = "lx_apt_bench")]
+fn bench_spool_probe(bytes: usize) -> Option<(u64, u64)> {
+    const CHUNK: usize = 256 * 1024;
+    const NAME: &str = "apt-spool-probe";
+    let root = crate::vfs::lookup_path("/mnt").ok()?;
+    if !root.is_directory() {
+        return None;
+    }
+    let _ = root.remove(NAME);
+    let file = root.create_file(NAME).ok()?;
+
+    let chunk = alloc::vec![0xA5u8; CHUNK];
+    let mut written = 0usize;
+    let write_start = scheduler::ticks();
+    while written < bytes {
+        let n = core::cmp::min(CHUNK, bytes - written);
+        match file.write(written as u64, &chunk[..n]) {
+            Ok(k) if k == n => written += n,
+            _ => {
+                let _ = root.remove(NAME);
+                return None;
+            }
+        }
+    }
+    let write_ms = scheduler::ticks().saturating_sub(write_start);
+
+    let mut buf = alloc::vec![0u8; CHUNK];
+    let mut read = 0usize;
+    let read_start = scheduler::ticks();
+    while read < bytes {
+        let n = core::cmp::min(CHUNK, bytes - read);
+        match file.read(read as u64, &mut buf[..n]) {
+            Ok(k) if k > 0 => read += k,
+            _ => {
+                let _ = root.remove(NAME);
+                return None;
+            }
+        }
+    }
+    let read_ms = scheduler::ticks().saturating_sub(read_start);
+
+    let _ = root.remove(NAME);
+    Some((write_ms, read_ms))
+}
+
 /// In-guest apt performance benchmark (cargo feature `lx_apt_bench`).
 ///
 /// Spawned as a kernel thread from `boot::kernel_main` (after interrupts/DHCP).
@@ -999,6 +1055,23 @@ pub fn run_apt_bench() {
             crate::error!("LXSELFTEST apt_bench FAIL install: {}", e.message());
             return;
         }
+    }
+
+    // W1 decision evidence: what the temp-file (spool) alternative would cost on
+    // this exact filesystem. 8 MiB is enough to measure sequential throughput and
+    // small enough that it cannot exhaust the 64 MiB disk after the install.
+    if let Some((write_ms, read_ms)) = bench_spool_probe(8 * 1024 * 1024) {
+        let per_mib = |ms: u64| -> u64 { (ms.saturating_mul(1024) / 8192) as u64 };
+        crate::info!(
+            "LXSELFTEST apt_bench spool probe_bytes=8388608 write_ms={} read_ms={} \
+             write_ms_per_mib={} read_ms_per_mib={}",
+            write_ms,
+            read_ms,
+            per_mib(write_ms),
+            per_mib(read_ms)
+        );
+    } else {
+        crate::warn!("LXSELFTEST apt_bench spool probe skipped (no space/VFS refusal)");
     }
 
     // Correctness: the last package to write `file-0000` is `bench-large`
