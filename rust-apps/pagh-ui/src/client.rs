@@ -96,6 +96,10 @@ impl DesktopClient {
         loop {
             match self.read_available() {
                 Ok(()) => {}
+                // Истёк read timeout — ждём welcome дальше до общего дедлайна.
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.kind() == io::ErrorKind::TimedOut => {}
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -201,12 +205,25 @@ impl DesktopClient {
     }
 
     /// Прочитать все доступные сообщения композитора (неблокирующе).
+    ///
+    /// Запись (`commit`) остаётся блокирующей: кадр в 4 МиБ не должен
+    /// обрываться на `WouldBlock`. Неблокирующим делается только чтение.
     pub fn poll(&mut self) -> io::Result<Vec<Incoming>> {
-        match self.read_available() {
+        self.stream.set_nonblocking(true)?;
+        let read_result = self.read_available();
+        let restore = self.stream.set_nonblocking(false);
+        match read_result {
             Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(Vec::new()),
-            Err(error) => return Err(error),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                restore?;
+                return Ok(Vec::new());
+            }
+            Err(error) => {
+                restore?;
+                return Err(error);
+            }
         }
+        restore?;
         let mut incoming = Vec::new();
         while let Some(payload) = self.reader.next_payload().map_err(protocol_error)? {
             let message = protocol::decode_server(&payload).map_err(protocol_error)?;
@@ -447,6 +464,81 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         let error = DesktopClient::connect(&path, "x").err().expect("ошибка");
         assert!(error.to_string().contains("нет места"), "error = {error}");
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn handshake_waits_for_delayed_welcome() {
+        let path = socket_path("slow");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = FrameReader::new();
+            let mut buffer = [0u8; 1024];
+            use std::io::Read as _;
+            let count = stream.read(&mut buffer).unwrap();
+            reader.feed(&buffer[..count]);
+            assert!(reader.next_payload().unwrap().is_some());
+            // Композитор «думает» дольше одного read timeout (100 мс).
+            thread::sleep(Duration::from_millis(250));
+            stream
+                .write_all(&protocol::encode_server(&ServerMessage::Welcome {
+                    protocol: protocol::VERSION,
+                    server_pid: 1,
+                    screen_width: 640,
+                    screen_height: 480,
+                    format: PixelFormat::Argb8888,
+                    max_frame: MAX_FRAME,
+                }))
+                .unwrap();
+            stream.read(&mut buffer).unwrap();
+        });
+        thread::sleep(Duration::from_millis(20));
+        let client = DesktopClient::connect(&path, "slow").expect("рукопожатие с паузой");
+        assert_eq!(client.screen(), Size::new(640, 480));
+        assert_eq!(client.format(), PixelFormat::Argb8888);
+        drop(client);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn poll_is_non_blocking_when_compositor_is_silent() {
+        let path = socket_path("silent");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = FrameReader::new();
+            let mut buffer = [0u8; 1024];
+            use std::io::Read as _;
+            let count = stream.read(&mut buffer).unwrap();
+            reader.feed(&buffer[..count]);
+            assert!(reader.next_payload().unwrap().is_some());
+            stream
+                .write_all(&protocol::encode_server(&ServerMessage::Welcome {
+                    protocol: protocol::VERSION,
+                    server_pid: 1,
+                    screen_width: 1280,
+                    screen_height: 800,
+                    format: PixelFormat::Xrgb8888,
+                    max_frame: MAX_FRAME,
+                }))
+                .unwrap();
+            // Молчим: клиент не должен зависнуть в poll().
+            thread::sleep(Duration::from_millis(400));
+        });
+        thread::sleep(Duration::from_millis(20));
+        let mut client = DesktopClient::connect(&path, "silent").unwrap();
+        let started = Instant::now();
+        let incoming = client.poll().unwrap();
+        assert!(incoming.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "poll заблокировался на {:?}",
+            started.elapsed()
+        );
+        drop(client);
         server.join().unwrap();
         let _ = std::fs::remove_file(&path);
     }
