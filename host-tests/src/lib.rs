@@ -330,6 +330,18 @@ pub mod ext2_bounds;
 #[path = "../../src/task/as_refs.rs"]
 pub mod as_refs;
 
+// USB HID boot/report policy and configuration-descriptor parsing (2.22.7 field
+// fix). Both modules are `core`+`alloc` only and self-contained, so the host
+// tests exercise the exact source the kernel compiles: buffer sizing from
+// `wMaxPacketSize` (the 4-byte buffer vs the field mouse's 7-byte report), boot
+// vs report-protocol mouse layouts, and the composite-device descriptor walk
+// that binds every boot keyboard/mouse interface.
+#[path = "../../src/drivers/usb_desc.rs"]
+pub mod usb_desc;
+
+#[path = "../../src/drivers/usb_hid_proto.rs"]
+pub mod usb_hid_proto;
+
 
 // ── OpenPGP repository-metadata verification (issue #32) ─────────────────────
 // The pure verifier the `apt` trust chain will use: packet/armor parsing,
@@ -501,6 +513,11 @@ mod properties {
     // execve/exit teardown — every live-task registry (ready, SIGSTOP-parked,
     // pending reap) must block freeing a PML4 another task still runs on.
     mod as_refs;
+    // USB HID boot/report policy + configuration-descriptor walk (2.22.7):
+    // transfer length from wMaxPacketSize (never shorter than a packet, so a
+    // 7-byte report cannot babble a 4-byte buffer), boot vs report mouse
+    // layouts, and every boot keyboard/mouse interface of a composite device.
+    mod usb_hid_proto;
     // Symbolic-link path resolution (issue #18, contract `EXT2-LINKS.md` §4.6,
     // §7.4): Linux-verified cases plus a randomized comparison against an
     // independent restart-based oracle.

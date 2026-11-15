@@ -20,12 +20,17 @@
 //! physically contiguous and zeroed (the `DmaFrame`/`Ring` helpers), and every
 //! action is "write a TRB, ring the doorbell, wait for the matching event".
 //!
-//! SCOPE. Enumeration brings a device to the point of a configured HID interface
-//! with one interrupt-IN endpoint, which is exactly what a boot-protocol keyboard
-//! or mouse needs; [`crate::drivers::usb_hid`] turns those reports into the
-//! scancode stream the shell already consumes. Root ports only — a device behind
-//! a hub is not reached (no hub class driver). Not implemented: isochronous
-//! transfers, suspend/resume, hot-unplug teardown, USB 3 link power management.
+//! SCOPE. Enumeration brings a device to the point of configured HID interfaces
+//! with interrupt-IN endpoints, which is exactly what boot-protocol keyboards
+//! and mice need; [`crate::drivers::usb_hid`] turns those reports into the
+//! scancode stream the shell already consumes. Every boot-class keyboard/mouse
+//! interface of a device is bound (a combo keyboard's consumer/system
+//! collections are skipped: they have no layout this driver parses), all of them
+//! are configured with one xHCI Configure Endpoint command and polled together.
+//! Root ports only — a device behind a hub is not reached (no hub class driver).
+//! Not implemented: isochronous transfers, suspend/resume, hot-unplug teardown,
+//! USB 3 link power management, HID report-descriptor parsing (report-protocol
+//! support is best effort; see `usb_hid`), keyboard LED output reports.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -34,6 +39,8 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::drivers::pci::PciDevice;
+use crate::drivers::usb_desc::{self, HidIface};
+use crate::drivers::usb_hid_proto::{self, RecoveryAction, ReportMode};
 use crate::memory::pmm;
 use crate::sync::spinlock::Spinlock;
 
@@ -225,6 +232,10 @@ const TRB_DISABLE_SLOT: u8 = 10;
 const TRB_ADDRESS_DEVICE: u8 = 11;
 const TRB_CONFIGURE_ENDPOINT: u8 = 12;
 const TRB_EVALUATE_CONTEXT: u8 = 13;
+/// Reset Endpoint (xHCI 1.2 table 6-91): recovers a halted endpoint so its
+/// transfer ring can be re-armed after a babble/stall instead of disabling input
+/// until reboot.
+const TRB_RESET_ENDPOINT: u8 = 14;
 const TRB_TRANSFER_EVENT: u8 = 32;
 const TRB_COMMAND_COMPLETION: u8 = 33;
 const TRB_PORT_STATUS_CHANGE: u8 = 34;
@@ -444,15 +455,34 @@ const SPEED_SUPER: u8 = 4;
 
 // ─── Slots ───────────────────────────────────────────────────────────────────
 
-/// One HID interrupt-IN endpoint: its ring, its report buffer and its DCI.
+/// One HID interrupt-IN endpoint: its ring, its report buffer, its DCI and what
+/// SET_PROTOCOL left the interface in.
 struct HidEndpoint {
+    /// Interface number, for the diagnostic lines.
+    iface: u8,
+    /// `bInterfaceSubClass` (1 = boot) and `bInterfaceProtocol` (1 keyboard,
+    /// 2 mouse): what the report parser needs to know.
+    subclass: u8,
+    protocol: u8,
+    /// Boot or report protocol as SET_PROTOCOL's result left it.
+    mode: ReportMode,
+    /// Device endpoint context index (2 * endpoint number + direction).
     dci: u8,
     ring: Ring,
     buf: DmaFrame,
-    /// Report size in bytes (8 for a boot keyboard, 3-4 for a boot mouse).
+    /// Transfer buffer size: at least the endpoint's wMaxPacketSize, so a report
+    /// longer than the old hard-coded 4 bytes cannot babble the endpoint.
     len: usize,
-    class: u8,
-    protocol: u8,
+    /// Reset Endpoint attempts made since configuration (bounded by
+    /// `usb_hid_proto::MAX_RECOVERIES`).
+    recoveries: u8,
+    /// Reports shorter than the layout's minimum, counted in diagnostics.
+    bad_reports: u64,
+    /// Whether the wrong-size report was already logged (one line, not one per
+    /// poll: a broken device must not flood the serial log).
+    bad_report_logged: bool,
+    /// Set once the recovery budget is spent; the endpoint is no longer polled.
+    disabled: bool,
 }
 
 /// One addressed device.
@@ -465,7 +495,10 @@ struct Slot {
     device_ctx: DmaFrame,
     /// Data buffer for control transfers (one at a time, single-threaded poll).
     ctrl_buf: DmaFrame,
-    hid: Option<HidEndpoint>,
+    /// Every bound HID interrupt-IN endpoint of this device. A combo device can
+    /// have several (keyboard + consumer/system collections); the old driver kept
+    /// only the first.
+    hid: Vec<HidEndpoint>,
 }
 
 /// What the driver got out of one port. The boot menu prints this: on a machine
@@ -586,6 +619,15 @@ struct Controller {
     halts: u32,
     halt_cmd: u32,
     halt_sts: u32,
+    /// Transfer events that arrived while a command (Reset Endpoint,
+    /// Configure Endpoint, …) was waiting for its completion. `command()` cannot
+    /// drop them: the owning endpoint would stay "outstanding" forever and never
+    /// be re-armed. The poll loop drains this queue before the event ring.
+    deferred_events: Vec<Trb>,
+    /// Successful Reset Endpoint recoveries since boot, for diagnostics.
+    hid_recoveries: u64,
+    /// Reports that were shorter than their layout's minimum, for diagnostics.
+    hid_bad_reports: u64,
 }
 
 /// One extended-capability entry, as the walk saw it: offset in the BAR, id,
@@ -722,6 +764,12 @@ pub struct Summary {
     /// Last enumeration failure: port, stage, code. `None` when everything that
     /// was attempted worked.
     pub last_fail: Option<(u8, &'static str, u32)>,
+    /// HID endpoints reset after a transfer error (babble/stall/…) instead of
+    /// being disabled until reboot.
+    pub hid_recoveries: u64,
+    /// Reports shorter than their layout's minimum (counted, logged once per
+    /// endpoint).
+    pub hid_bad_reports: u64,
 }
 
 impl Summary {
@@ -751,6 +799,8 @@ pub fn summary() -> Summary {
                 reports: c.reports,
                 probe_mask: c.probe_mask,
                 last_fail: c.last_fail,
+                hid_recoveries: c.hid_recoveries,
+                hid_bad_reports: c.hid_bad_reports,
             }
         }
         None => Summary {
@@ -761,6 +811,8 @@ pub fn summary() -> Summary {
             reports: 0,
             probe_mask: 0,
             last_fail: None,
+            hid_recoveries: 0,
+            hid_bad_reports: 0,
         },
     }
 }
@@ -1445,6 +1497,9 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
         halt_sts: 0,
         diag,
         last_fail: None,
+        deferred_events: Vec::new(),
+        hid_recoveries: 0,
+        hid_bad_reports: 0,
     });
     true
 }
@@ -1487,6 +1542,28 @@ fn next_event(ctrl: &mut Controller, budget: u32) -> Option<Trb> {
     Some(ev)
 }
 
+/// Park a transfer event that arrived while a command was waiting, so the poll
+/// loop can still deliver it. Dropping it would leave its endpoint marked
+/// "outstanding" forever: it would never be re-armed and its input would die
+/// silently — the exact class of bug this driver exists to avoid.
+fn defer_event(ctrl: &mut Controller, ev: Trb) {
+    // Bounded: the queue is drained every poll, and a command waits for one
+    // completion. A full queue means something is very wrong; dropping a report
+    // is still better than growing kernel heap without a bound.
+    if ctrl.deferred_events.len() < 64 {
+        ctrl.deferred_events.push(ev);
+    }
+}
+
+/// Next event for the poll loop: deferred transfer events first (they are older
+/// than whatever is still on the event ring), then the ring itself.
+fn next_poll_event(ctrl: &mut Controller, budget: u32) -> Option<Trb> {
+    if let Some(ev) = ctrl.deferred_events.pop() {
+        return Some(ev);
+    }
+    next_event(ctrl, budget)
+}
+
 /// Submit a command TRB and return its completion event.
 fn command(ctrl: &mut Controller, dw0: u32, dw1: u32, dw2: u32, dw3: u32) -> Option<Trb> {
     ctrl.cmdr.push(dw0, dw1, dw2, dw3);
@@ -1499,6 +1576,8 @@ fn command(ctrl: &mut Controller, dw0: u32, dw1: u32, dw2: u32, dw3: u32) -> Opt
                 let port = (ev.dw0 >> 24) & 0xFF;
                 crate::debug!("xhci: port {} status change", port);
             }
+            // Not ours: a HID interrupt-IN completion for another endpoint.
+            TRB_TRANSFER_EVENT => defer_event(ctrl, ev),
             _ => {}
         }
     }
@@ -1883,7 +1962,13 @@ fn control_in(
     let mut result = None;
     for _ in 0..8 {
         let ev = next_event(ctrl, 1_000_000)?;
-        if ev.trb_type() != TRB_TRANSFER_EVENT || ev.endpoint_id() != 1 {
+        if ev.trb_type() != TRB_TRANSFER_EVENT {
+            continue;
+        }
+        if ev.endpoint_id() != 1 {
+            // A HID endpoint's transfer completed while we wait for EP0: keep it
+            // for the poll loop instead of swallowing the report.
+            defer_event(ctrl, ev);
             continue;
         }
         let cc = ev.completion_code();
@@ -1939,7 +2024,13 @@ fn control_no_data(
         let Some(ev) = next_event(ctrl, 1_000_000) else {
             return false;
         };
-        if ev.trb_type() != TRB_TRANSFER_EVENT || ev.endpoint_id() != 1 {
+        if ev.trb_type() != TRB_TRANSFER_EVENT {
+            continue;
+        }
+        if ev.endpoint_id() != 1 {
+            // A HID endpoint's transfer completed while ENUMERATION was sending a
+            // control request; preserve it for the poll loop.
+            defer_event(ctrl, ev);
             continue;
         }
         let cc = ev.completion_code();
@@ -2005,7 +2096,7 @@ fn enable_slot(ctrl: &mut Controller) -> Option<usize> {
         input_ctx,
         device_ctx,
         ctrl_buf,
-        hid: None,
+        hid: Vec::new(),
     });
     Some(ctrl.slots.len() - 1)
 }
@@ -2143,113 +2234,111 @@ fn evaluate_ep0_max_packet(ctrl: &mut Controller, slot_index: usize, max_packet:
     matches!(ev, Some(ev) if ev.completion_code() == CC_SUCCESS)
 }
 
-/// Parsed configuration descriptor: the HID interface and its IN endpoint.
-struct HidIface {
-    config_value: u8,
-    interface: u8,
-    subclass: u8,
-    protocol: u8,
-    ep_addr: u8,
-    max_packet: u16,
-    interval: u8,
-}
-
-/// Walk the configuration descriptor looking for a HID interface with an
-/// interrupt-IN endpoint.
-fn parse_config(conf: &[u8]) -> Option<HidIface> {
-    // bConfigurationValue is what SET_CONFIGURATION takes (offset 5).
-    let config_value = *conf.get(5)?;
-    let mut i = 0usize;
-    let mut current: Option<(u8, u8, u8)> = None;
-    while i + 2 <= conf.len() {
-        let len = conf[i] as usize;
-        if len < 2 || i + len > conf.len() {
-            break;
-        }
-        let kind = conf[i + 1];
-        if kind == 4 && len >= 9 {
-            // INTERFACE: class 3 (HID), and remember its subclass/protocol.
-            let number = conf[i + 2];
-            let class = conf[i + 5];
-            let subclass = conf[i + 6];
-            let protocol = conf[i + 7];
-            current = if class == 3 {
-                Some((number, subclass, protocol))
-            } else {
-                None
-            };
-        } else if kind == 5 && len >= 7 {
-            // ENDPOINT: attributes bit 0-1 == 3 means interrupt.
-            let (number, subclass, protocol) = current?;
-            let addr = conf[i + 2];
-            let attrs = conf[i + 3];
-            if attrs & 0x03 == 3 && addr & 0x80 != 0 {
-                return Some(HidIface {
-                    config_value,
-                    interface: number,
-                    subclass,
-                    protocol,
-                    ep_addr: addr,
-                    max_packet: u16::from_le_bytes([conf[i + 4], conf[i + 5]]),
-                    interval: conf[i + 6],
-                });
-            }
-        }
-        i += len;
+/// Configure every bindable HID interrupt-IN endpoint in ONE xHCI Configure
+/// Endpoint command.
+///
+/// WHY ONE COMMAND: the slot context's "Context Entries" field must be the
+/// highest DCI the device context carries, so adding endpoints one at a time
+/// would re-write the slot context and issue N commands for N interfaces. The
+/// device may have several (a combo keyboard's boot keyboard plus
+/// consumer/system collections); configuring them together is also what makes
+/// the xHCI endpoint state consistent with the single SET_CONFIGURATION.
+///
+/// The endpoint's `wMaxPacketSize` is the transfer buffer's lower bound: an
+/// interrupt transfer may legitimately deliver a full packet, and a request
+/// shorter than that is a babble (completion code 3) — the field mouse's 7-byte
+/// report against the old 4-byte buffer.
+fn configure_hid_endpoints(
+    ctrl: &mut Controller,
+    slot_index: usize,
+    ifaces: &[HidIface],
+    modes: &[ReportMode],
+) -> bool {
+    if ifaces.is_empty() || ifaces.len() != modes.len() {
+        return false;
     }
-    None
-}
-
-/// Configure the HID interrupt-IN endpoint (DCI = 2*number + 1 for IN).
-fn configure_hid_endpoint(ctrl: &mut Controller, slot_index: usize, iface: &HidIface) -> bool {
-    let dci = (iface.ep_addr & 0x0F) * 2 + 1;
     let ctx_size = ctrl.ctx_size;
-    let Some(ring) = Ring::new("hid ring") else {
-        return false;
-    };
-    let Some(buf) = DmaFrame::new_zeroed("hid buffer") else {
-        return false;
-    };
-    let (input, input_phys, ring_phys, buf_phys, slot_id, speed, max_packet, interval) = {
-        let slot = &mut ctrl.slots[slot_index];
+    let (input, input_phys, slot_id, speed) = {
+        let slot = &ctrl.slots[slot_index];
         (
             slot.input_ctx.virt(),
             slot.input_ctx.phys(),
-            ring.base_phys(),
-            buf.phys(),
             slot.id,
             slot.speed,
-            iface.max_packet as u32,
-            iface.interval,
         )
     };
-    // SAFETY: `input` is our own page, and the contexts are written at the
-    // offsets the controller's context size dictates.
+    // Rings and buffers first: their physical addresses go into the endpoint
+    // contexts. Dropping this Vec on a failure returns the frames to the PMM, so
+    // a failed Configure Endpoint leaves nothing behind.
+    let mut eps: Vec<HidEndpoint> = Vec::with_capacity(ifaces.len());
+    for (i, iface) in ifaces.iter().enumerate() {
+        let Some(ring) = Ring::new("hid ring") else {
+            return false;
+        };
+        let Some(buf) = DmaFrame::new_zeroed("hid buffer") else {
+            return false;
+        };
+        let len = usb_hid_proto::transfer_len(iface.max_packet);
+        if (iface.max_packet & 0x07FF) as usize > usb_hid_proto::MAX_REPORT {
+            crate::warn!(
+                "xhci: iface {}: wMaxPacketSize {} exceeds the {}B transfer buffer; clamped (a longer report would babble)",
+                iface.interface,
+                iface.max_packet,
+                len
+            );
+        }
+        eps.push(HidEndpoint {
+            iface: iface.interface,
+            subclass: iface.subclass,
+            protocol: iface.protocol,
+            mode: modes[i],
+            dci: (iface.ep_addr & 0x0F) * 2 + 1,
+            ring,
+            buf,
+            len,
+            recoveries: 0,
+            bad_reports: 0,
+            bad_report_logged: false,
+            disabled: false,
+        });
+    }
+    // Highest DCI present decides the slot context's Context Entries field.
+    let max_dci = eps.iter().map(|ep| ep.dci).max().unwrap_or(1);
+    // SAFETY: `input` is our own zeroed page; the contexts are written at the
+    // offsets the controller's context size dictates, and every DCI is <= 31
+    // (device endpoint numbers are 4 bits), so the writes stay in the page.
     unsafe {
         let p = input as *mut u32;
-        // Clear the previous input context, then declare the new endpoint.
         core::ptr::write_bytes(input as *mut u8, 0, PAGE_SIZE);
-        write_volatile(p.add(1), (1 << 0) | (1u32 << dci)); // A0 + A(dci)
+        // Input Control Context: A0 (slot context) plus one Add flag per DCI.
+        let mut add = 1u32;
+        for ep in &eps {
+            add |= 1u32 << ep.dci;
+        }
+        write_volatile(p.add(1), add);
         let slot_ctx = p.add(8) as *mut u32;
-        write_volatile(slot_ctx, (dci as u32) << SLOT_CTX_ENTRIES_SHIFT);
-        let ep_ctx = (input + ctx_size * (1 + dci as usize)) as *mut u32;
-        // xHCI stores the polling interval as log2(microframes) for high/super
-        // speed devices (so USB bInterval=1 is field 0) and as the frame count for
-        // full/low speed. Writing bInterval raw gave an interval of 2^bInterval.
-        let interval_field: u32 = if speed == SPEED_HIGH || speed == SPEED_SUPER {
-            (interval.saturating_sub(1) & 0x0F) as u32
-        } else {
-            (interval & 0x0F) as u32
-        };
-        write_volatile(ep_ctx, interval_field << EP_CTX_INTERVAL_SHIFT);
-        write_volatile(
-            ep_ctx.add(1),
-            (3 << EP_CTX_CERR_SHIFT)
-                | (EP_TYPE_INTERRUPT_IN << EP_CTX_EP_TYPE_SHIFT)
-                | (max_packet << EP_CTX_MAX_PACKET_SHIFT),
-        );
-        write_volatile(ep_ctx.add(2), (ring_phys | 1) as u32);
-        write_volatile(ep_ctx.add(3), (ring_phys >> 32) as u32);
+        write_volatile(slot_ctx, (max_dci as u32) << SLOT_CTX_ENTRIES_SHIFT);
+        for (ep, iface) in eps.iter().zip(ifaces.iter()) {
+            let ep_ctx = (input + ctx_size * (1 + ep.dci as usize)) as *mut u32;
+            // xHCI stores the polling interval as log2(microframes) for high/super
+            // speed devices (so USB bInterval=1 is field 0) and as the frame count
+            // for full/low speed. Writing bInterval raw gave 2^bInterval.
+            let interval_field: u32 = if speed == SPEED_HIGH || speed == SPEED_SUPER {
+                (iface.interval.saturating_sub(1) & 0x0F) as u32
+            } else {
+                (iface.interval & 0x0F) as u32
+            };
+            write_volatile(ep_ctx, interval_field << EP_CTX_INTERVAL_SHIFT);
+            write_volatile(
+                ep_ctx.add(1),
+                (3 << EP_CTX_CERR_SHIFT)
+                    | (EP_TYPE_INTERRUPT_IN << EP_CTX_EP_TYPE_SHIFT)
+                    | ((iface.max_packet as u32) << EP_CTX_MAX_PACKET_SHIFT),
+            );
+            let ring_phys = ep.ring.base_phys();
+            write_volatile(ep_ctx.add(2), (ring_phys | 1) as u32);
+            write_volatile(ep_ctx.add(3), (ring_phys >> 32) as u32);
+        }
     }
     // Physical address: see the same note in `address_device`.
     let (a0, a1) = ctx_addr(input_phys);
@@ -2264,22 +2353,14 @@ fn configure_hid_endpoint(ctrl: &mut Controller, slot_index: usize, iface: &HidI
         Some(ev) if ev.completion_code() == CC_SUCCESS => {}
         other => {
             crate::warn!(
-                "xhci: configure endpoint failed (cc={:?})",
+                "xhci: configure endpoint ({} HID iface(s)) failed (cc={:?})",
+                eps.len(),
                 other.map(|e| e.completion_code())
             );
             return false;
         }
     }
-    let _ = buf_phys;
-    let report_len = if iface.protocol == 1 { 8 } else { 4 };
-    ctrl.slots[slot_index].hid = Some(HidEndpoint {
-        dci,
-        ring,
-        buf,
-        len: report_len,
-        class: iface.subclass,
-        protocol: iface.protocol,
-    });
+    ctrl.slots[slot_index].hid = eps;
     true
 }
 
@@ -2417,7 +2498,8 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
         ctrl.fail(port, "config-full", 0);
         return false;
     };
-    let Some(iface) = parse_config(&conf) else {
+    let ifaces = usb_desc::parse_hid_interfaces(&conf);
+    if ifaces.is_empty() {
         ctrl.fail(port, "no-hid-interface", dev[4] as u32);
         crate::info!(
             "xhci: port {}: device {:04x}:{:04x} has no HID interrupt-IN interface",
@@ -2426,36 +2508,104 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
             product
         );
         return false;
+    }
+    // Bind only boot-class keyboard/mouse interfaces. A HID interface with
+    // protocol 0 (consumer/system/vendor collections, even on a keyboard that
+    // also exposes a boot keyboard) has no report layout this driver parses;
+    // binding it would burn a ring and a buffer to feed reports `usb_hid` must
+    // ignore. The skipped interfaces are logged so the decision is visible.
+    let mut chosen: Vec<HidIface> = Vec::new();
+    for iface in ifaces {
+        if !usb_hid_proto::bindable(iface.subclass, iface.protocol) {
+            crate::info!(
+                "xhci: port {}: iface {} (subclass={} protocol={}) is not a boot keyboard/mouse; not bound",
+                port,
+                iface.interface,
+                iface.subclass,
+                iface.protocol
+            );
+            continue;
+        }
+        // One device endpoint number must not be configured twice: two HID
+        // interfaces sharing an endpoint cannot both own the same DCI.
+        if chosen
+            .iter()
+            .any(|c| c.ep_addr & 0x0F == iface.ep_addr & 0x0F)
+        {
+            crate::warn!(
+                "xhci: port {}: iface {} reuses endpoint {:#04x}; keeping the first interface",
+                port,
+                iface.interface,
+                iface.ep_addr
+            );
+            continue;
+        }
+        chosen.push(iface);
+    }
+    let Some(config_value) = chosen.first().map(|i| i.config_value) else {
+        ctrl.fail(port, "no-boot-hid", dev[4] as u32);
+        crate::info!(
+            "xhci: port {}: device {:04x}:{:04x} has HID interfaces but none is a boot keyboard/mouse",
+            port,
+            vendor,
+            product
+        );
+        return false;
     };
-    // SET_CONFIGURATION activates the interface (without it the HID endpoint
-    // stalls), SET_PROTOCOL(1) selects the boot report layout this driver parses,
-    // and SET_IDLE(0) stops the device NAKing reports when nothing changes.
-    if !control_no_data(ctrl, slot_index, 0x00, 9, iface.config_value as u16, 0) {
-        ctrl.fail(port, "set-configuration", iface.config_value as u32);
+    // SET_CONFIGURATION activates the device (without it every endpoint stalls).
+    if !control_no_data(ctrl, slot_index, 0x00, 9, config_value as u16, 0) {
+        ctrl.fail(port, "set-configuration", config_value as u32);
         crate::warn!("xhci: port {}: SET_CONFIGURATION failed", port);
         return false;
     }
-    if !control_no_data(ctrl, slot_index, 0x21, 0x0B, 1, iface.interface as u16) {
-        crate::warn!("xhci: port {}: SET_PROTOCOL(boot) failed", port);
+    // SET_PROTOCOL(0) = BOOT (HID 1.11 §7.2.6; the old code sent wValue=1, which
+    // is REPORT protocol, while its comment claimed boot). Boot pins the report
+    // layout to 8-byte keyboard / 3-byte mouse. A device may refuse (STALL): stay
+    // in report protocol, record that so the parser does not pretend it is boot,
+    // and keep the endpoint — `usb_hid`'s best-effort layouts are still better
+    // than a dead keyboard. SET_IDLE(0) = report on change only.
+    let mut modes: Vec<ReportMode> = Vec::with_capacity(chosen.len());
+    for iface in &chosen {
+        let mode = if control_no_data(ctrl, slot_index, 0x21, 0x0B, 0, iface.interface as u16) {
+            ReportMode::Boot
+        } else {
+            crate::warn!(
+                "xhci: port {}: iface {} rejected SET_PROTOCOL(boot); staying in report protocol (best-effort layout)",
+                port,
+                iface.interface
+            );
+            ReportMode::Report
+        };
+        if !control_no_data(ctrl, slot_index, 0x21, 0x0A, 0, iface.interface as u16) {
+            crate::warn!(
+                "xhci: port {}: iface {}: SET_IDLE failed",
+                port,
+                iface.interface
+            );
+        }
+        modes.push(mode);
     }
-    if !control_no_data(ctrl, slot_index, 0x21, 0x0A, 0, iface.interface as u16) {
-        crate::warn!("xhci: port {}: SET_IDLE failed", port);
-    }
-    if !configure_hid_endpoint(ctrl, slot_index, &iface) {
+    if !configure_hid_endpoints(ctrl, slot_index, &chosen, &modes) {
         ctrl.fail(port, "configure-endpoint", 0);
         return false;
     }
-    ctrl.stage(port, "hid-ready", iface.protocol as u32);
-    // Boot protocol: 0 = none, 1 = keyboard, 2 = mouse.
-    crate::info!(
-        "xhci: HID device on port {}: iface={} subclass={} protocol={} ep={:#04x} report={}B",
-        port,
-        iface.interface,
-        iface.subclass,
-        iface.protocol,
-        iface.ep_addr,
-        if (iface.protocol == 1) { 8 } else { 4 }
-    );
+    ctrl.stage(port, "hid-ready", chosen.len() as u32);
+    for (iface, ep) in chosen.iter().zip(ctrl.slots[slot_index].hid.iter()) {
+        // Boot class: 0 = none, 1 = keyboard, 2 = mouse. `mode` is what
+        // SET_PROTOCOL actually achieved; `report` is the transfer buffer size
+        // derived from wMaxPacketSize (>= a whole packet, so no babble).
+        crate::info!(
+            "xhci: HID device on port {}: iface={} subclass={} protocol={} ep={:#04x} report={}B mode={} maxpkt={}",
+            port,
+            iface.interface,
+            iface.subclass,
+            iface.protocol,
+            iface.ep_addr,
+            ep.len,
+            ep.mode.as_str(),
+            iface.max_packet
+        );
+    }
     true
 }
 
@@ -2533,71 +2683,170 @@ pub fn poll() {
         }
     }
 
-    // 2. Drain reports from every configured HID endpoint.
-    for index in 0..ctrl.slots.len() {
-        let Some(hid) = ctrl.slots[index].hid.as_ref() else {
-            continue;
-        };
-        let dci = hid.dci;
-        let len = hid.len;
-        let slot_id = ctrl.slots[index].id;
-        // Re-arm a single interrupt-IN transfer if none is outstanding.
-        let armed = {
-            let hid = ctrl.slots[index].hid.as_mut().unwrap();
-            if hid.ring.outstanding {
-                true
-            } else {
-                let buf_phys = hid.buf.phys();
-                hid.ring.push(
-                    buf_phys as u32,
-                    (buf_phys >> 32) as u32,
-                    len as u32,
-                    ((TRB_NORMAL as u32) << 10) | TRB_IOC,
-                );
-                hid.ring.outstanding = true;
-                false
-            }
-        };
-        if !armed {
-            ring_doorbell(ctrl, slot_id, dci);
-        }
-        // Collect a completion if one is waiting.
-        let mut events = 0;
-        while events < 4 {
-            let Some(ev) = next_event(ctrl, 0) else {
-                break;
-            };
-            if ev.trb_type() != TRB_TRANSFER_EVENT || ev.endpoint_id() != dci {
-                continue;
-            }
-            events += 1;
-            let slot = &mut ctrl.slots[index];
-            let Some(hid) = slot.hid.as_mut() else { break };
-            hid.ring.outstanding = false;
-            let cc = ev.completion_code();
-            if cc == CC_SUCCESS || cc == CC_SHORT_PACKET {
-                let got = len.saturating_sub(ev.residual() as usize);
-                if got > 0 {
-                    // SAFETY: the buffer is our own page and `got <= len`.
-                    let report =
-                        unsafe { core::slice::from_raw_parts(hid.buf.virt() as *const u8, got) };
-                    crate::drivers::usb_hid::feed(report, hid.protocol);
-                    ctrl.reports += 1;
+    // 2. Arm every idle HID interrupt-IN endpoint. Completions are drained
+    //    afterwards, not per endpoint, so one device's completion cannot be
+    //    swallowed while another endpoint is being serviced.
+    for si in 0..ctrl.slots.len() {
+        let slot_id = ctrl.slots[si].id;
+        for hi in 0..ctrl.slots[si].hid.len() {
+            let dci = {
+                let hid = &mut ctrl.slots[si].hid[hi];
+                if hid.disabled || hid.ring.outstanding {
+                    None
+                } else {
+                    let buf_phys = hid.buf.phys();
+                    hid.ring.push(
+                        buf_phys as u32,
+                        (buf_phys >> 32) as u32,
+                        hid.len as u32,
+                        ((TRB_NORMAL as u32) << 10) | TRB_IOC,
+                    );
+                    hid.ring.outstanding = true;
+                    Some(hid.dci)
                 }
-            } else {
-                // A stalled or overrun endpoint cannot be fixed by re-arming it;
-                // re-arming is what turns one bad context into a thousand events a
-                // second. Say so once and stop listening on this device.
-                crate::warn!(
-                    "xhci: HID endpoint (DCI {}) gave up: cc={}; input from it is off until reboot",
-                    dci,
-                    cc
-                );
-                ctrl.slots[index].hid = None;
-                break;
+            };
+            if let Some(dci) = dci {
+                ring_doorbell(ctrl, slot_id, dci);
             }
         }
     }
+    // 3. Drain completion events. Every transfer event names its slot and
+    //    endpoint; route it to that endpoint. (The old loop matched only the
+    //    single endpoint it was currently looking at and dropped the rest.)
+    let mut events = 0usize;
+    while events < 64 {
+        let Some(ev) = next_poll_event(ctrl, 0) else {
+            break;
+        };
+        if ev.trb_type() != TRB_TRANSFER_EVENT {
+            continue;
+        }
+        events += 1;
+        let slot_id = ev.slot_id();
+        let dci = ev.endpoint_id();
+        let Some(si) = ctrl.slots.iter().position(|s| s.id == slot_id) else {
+            continue;
+        };
+        let Some(hi) = ctrl.slots[si]
+            .hid
+            .iter()
+            .position(|h| h.dci == dci && !h.disabled)
+        else {
+            continue;
+        };
+        // Snapshot what the completion needs; keep every borrow of the slot short
+        // because recovery issues a command through `ctrl`.
+        let (len, mode, subclass, protocol, buf_virt) = {
+            let hid = &ctrl.slots[si].hid[hi];
+            (
+                hid.len,
+                hid.mode,
+                hid.subclass,
+                hid.protocol,
+                hid.buf.virt(),
+            )
+        };
+        ctrl.slots[si].hid[hi].ring.outstanding = false;
+        let cc = ev.completion_code();
+        if cc == CC_SUCCESS || cc == CC_SHORT_PACKET {
+            let got = len.saturating_sub(ev.residual() as usize);
+            if got == 0 {
+                continue;
+            }
+            let mut report = [0u8; usb_hid_proto::MAX_REPORT];
+            let n = got.min(report.len());
+            // SAFETY: the buffer is our own DMA page, `n <= len <= MAX_REPORT`,
+            // and the controller wrote at most `len` bytes into it before
+            // publishing this transfer event.
+            unsafe {
+                core::ptr::copy_nonoverlapping(buf_virt as *const u8, report.as_mut_ptr(), n);
+            }
+            let report = &report[..n];
+            let required = usb_hid_proto::minimum_report_len(subclass, protocol, mode);
+            if n < required {
+                ctrl.hid_bad_reports += 1;
+                let hid = &mut ctrl.slots[si].hid[hi];
+                hid.bad_reports += 1;
+                if !hid.bad_report_logged {
+                    hid.bad_report_logged = true;
+                    crate::warn!(
+                        "xhci: HID iface {} (DCI {}) got a {}B report, layout needs {}B (mode={}); report dropped (logging once)",
+                        hid.iface,
+                        dci,
+                        n,
+                        required,
+                        mode.as_str()
+                    );
+                }
+            } else {
+                crate::drivers::usb_hid::feed_iface(report, subclass, protocol, mode);
+                ctrl.reports += 1;
+            }
+            continue;
+        }
+        // Transfer error (babble, data-buffer error, stall, USB transaction
+        // error, …): recover instead of disabling the endpoint on the first one.
+        // The old "input off until reboot" is now the LAST resort, after
+        // `MAX_RECOVERIES` failed resets.
+        let (previous, iface) = {
+            let hid = &ctrl.slots[si].hid[hi];
+            (hid.recoveries, hid.iface)
+        };
+        match usb_hid_proto::recovery_action(previous) {
+            RecoveryAction::ResetEndpoint => {
+                ctrl.slots[si].hid[hi].recoveries += 1;
+                let attempt = ctrl.slots[si].hid[hi].recoveries;
+                let ok = reset_hid_endpoint(ctrl, slot_id, dci);
+                if ok {
+                    ctrl.hid_recoveries += 1;
+                }
+                crate::warn!(
+                    "xhci: HID iface {} (DCI {}) transfer error cc={}: Reset Endpoint {} ({}/{})",
+                    iface,
+                    dci,
+                    cc,
+                    if ok { "ok, re-arming" } else { "failed" },
+                    attempt,
+                    usb_hid_proto::MAX_RECOVERIES
+                );
+                // The errored TRB produced this event, so the transfer ring has
+                // no outstanding TRB: the next poll pushes a fresh Normal TRB.
+                ctrl.slots[si].hid[hi].ring.outstanding = false;
+            }
+            RecoveryAction::Disable => {
+                let hid = &mut ctrl.slots[si].hid[hi];
+                hid.disabled = true;
+                hid.ring.outstanding = false;
+                crate::warn!(
+                    "xhci: HID iface {} (DCI {}) still failing cc={} after {} Reset Endpoint attempt(s); input from it is off until reboot",
+                    hid.iface,
+                    dci,
+                    cc,
+                    usb_hid_proto::MAX_RECOVERIES
+                );
+            }
+        }
+    }
+}
+
+/// Recover one halted HID endpoint with the xHCI Reset Endpoint command (TRB
+/// type 14: slot id in bits 24-31, DCI in bits 16-20).
+///
+/// WHY NOT JUST RE-ARM: a transfer error moves the endpoint to the Halted state,
+/// and re-arming a halted endpoint only produces the same error event again. The
+/// old driver read that as "this device is broken" and disabled input until
+/// reboot — which is exactly what the field mouse looked like after its first
+/// 7-byte report hit the 4-byte buffer. Reset Endpoint returns the endpoint to
+/// Stopped/Running so the next poll's Normal TRB executes.
+fn reset_hid_endpoint(ctrl: &mut Controller, slot_id: u8, dci: u8) -> bool {
+    let ev = command(
+        ctrl,
+        0,
+        0,
+        0,
+        ((TRB_RESET_ENDPOINT as u32) << 10) | ((dci as u32) << 16) | ((slot_id as u32) << 24),
+    );
+    matches!(ev, Some(ev) if ev.completion_code() == CC_SUCCESS)
 }
 
 /// Bring a halted controller back: reset it, re-point it at our rings, run it.
@@ -2631,6 +2880,7 @@ fn restart_controller(ctrl: &mut Controller) -> bool {
     // A controller reset forgets every slot and every port; the rings start from
     // their first TRB with the cycle bit set again.
     ctrl.slots.clear();
+    ctrl.deferred_events.clear();
     ctrl.brought_up.clear();
     ctrl.devices = 0;
     ctrl.cmdr.enqueue = 0;

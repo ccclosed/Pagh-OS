@@ -2011,6 +2011,15 @@ pub(super) fn cmd_usb(_ctx: &mut ShellCtx, _args: &[&str]) {
         mouse_reports,
         unmapped
     ));
+    // Endpoint recovery: a non-zero reset count is the proof that a device sent a
+    // report the buffer could not hold and the driver recovered instead of
+    // disabling input (the 2.22.7 HID fix). `bad reports` counts reports shorter
+    // than their layout needs (dropped, logged once per endpoint).
+    shell_println(&alloc::format!(
+        "usb: HID endpoint reset(s) {}, bad report(s) {}",
+        summary.hid_recoveries,
+        summary.hid_bad_reports
+    ));
     shell_println("  PORT  PORTSC      CONNECT  ENABLED  POWER  SPEED  LINK");
     for (port, sc) in crate::drivers::xhci::port_status() {
         let (ccs, ped, pp, speed, pls) = crate::drivers::xhci::decode_portsc(sc);

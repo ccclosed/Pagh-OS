@@ -10,18 +10,33 @@
 //! the same ring. Nothing downstream knows the difference, which is also why
 //! `^C` from a USB keyboard stops a `lxrun`ed program like it always did.
 //!
-//! Boot protocol, not report protocol: a boot keyboard always sends the fixed
-//! 8-byte report `[modifiers, reserved, key0..key5]` and a boot mouse the 3-byte
-//! `[buttons, dx, dy]`, so no report-descriptor parser is needed (and none is
-//! implemented). Devices default to boot protocol on the interface; the driver
-//! does not have to send SET_PROTOCOL for the common case, though the
-//! descriptors' protocol byte is logged so a report-protocol-only device is
-//! identifiable.
+//! Boot protocol first, report protocol only as a documented fallback. A boot
+//! keyboard always sends the fixed 8-byte report `[modifiers, reserved,
+//! key0..key5]` and a boot mouse the 3-byte `[buttons, dx, dy]`, so no
+//! report-descriptor parser is needed for the normal path (and none is
+//! implemented). The xHCI driver now sends SET_PROTOCOL(0) — boot — to every
+//! boot-class interface, which is what the HID spec's value 0 actually means; the
+//! old code sent 1 (report protocol) while its comment said boot.
+//!
+//! REPORT-PROTOCOL FALLBACK. A device may refuse SET_PROTOCOL(0) (a STALL). Then
+//! it keeps sending its own report descriptor's layout, which this driver cannot
+//! know without parsing that descriptor. It does not blind-parse boot format in
+//! that case: a keyboard's 8-byte boot-like layout is still assumed (most
+//! report-protocol keyboards use it, including the field R82HE), and a mouse is
+//! decoded by [`crate::drivers::usb_hid_proto::mouse_report`], which knows the
+//! 7-byte E-Signal/Holtek 16-bit layout seen on the field mouse and otherwise
+//! assumes 8-bit axes. Wheel/pan axes are decoded but not delivered (the PS/2
+//! path this feeds has no wheel byte); this is a documented limitation, not a
+//! silent one.
+//!
+//! The buffer/format decisions themselves live in `usb_hid_proto`, a pure module
+//! the host tests include, so the layout rules are tested without a USB device.
 //!
 //! STATE. A boot report is a *snapshot* of the keys currently held, not a stream
 //! of events: the translator keeps the previously seen set to derive make/break
 //! codes, and the modifier byte is diffed the same way.
 
+use crate::drivers::usb_hid_proto::{self, HidClass, ReportMode};
 use crate::drivers::{ps2_kbd, ps2_mouse};
 use crate::sync::spinlock::Spinlock;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -203,19 +218,12 @@ fn emit(usage: u8, make: bool) {
     ps2_kbd::inject_scancode(if make { code } else { code | 0x80 });
 }
 
-/// Translate one boot keyboard report (8 bytes) into PS/2 scancodes.
+/// Translate one keyboard report (8 bytes, boot or boot-like) into PS/2
+/// scancodes.
 fn feed_keyboard(report: &[u8]) {
-    if report.len() < 8 {
+    let Some((mods, held)) = usb_hid_proto::keyboard_report(report) else {
         return;
-    }
-    let mods = report[0];
-    let mut held = [0u8; 6];
-    for (i, slot) in held.iter_mut().enumerate() {
-        let usage = report[2 + i];
-        // 0 = no key, 1 = ErrorRollOver (the keyboard is asked for more keys
-        // than it can report); neither is a key press.
-        *slot = if usage <= 1 { 0 } else { usage };
-    }
+    };
 
     let mut state = KEYBOARD.lock();
     state.reports += 1;
@@ -260,35 +268,50 @@ fn feed_keyboard(report: &[u8]) {
     state.keys = held;
 }
 
-/// Translate one boot mouse report into the PS/2 packet the mouse driver
-/// assembles, so the cursor moves through exactly the same path.
-fn feed_mouse(report: &[u8]) {
-    if report.len() < 3 {
+/// Translate one mouse report into the PS/2 packet the mouse driver assembles,
+/// so the cursor moves through exactly the same path.
+///
+/// Boot reports are the fixed 3-byte layout; report-protocol reports are decoded
+/// by the pure layout policy (7-byte 16-bit axes, or 8-bit axes), and the deltas
+/// are clamped to the PS/2 packet's range instead of wrapping.
+fn feed_mouse(report: &[u8], mode: ReportMode) {
+    let Some(decoded) = usb_hid_proto::mouse_report(report, mode) else {
         return;
-    }
+    };
     MOUSE_REPORTS.fetch_add(1, Ordering::Relaxed);
-    let buttons = report[0] & 0x07;
-    let dx = report[1] as i8;
+    let buttons = decoded.buttons;
+    let dx = usb_hid_proto::clamp_delta(decoded.dx);
     // HID boot-mouse reports are Y-down (positive dy = towards the bottom of
     // the screen), while the PS/2 convention the decoder below implements is
     // Y-up (the driver computes `y - dy`). Flip the sign so a USB mouse moves
-    // the cursor the same way a PS/2 one does.
-    let dy = (report[2] as i8).wrapping_neg();
+    // the cursor the same way a PS/2 one does. `saturating_neg` keeps a
+    // report-protocol i16::MIN from overflowing.
+    let dy = usb_hid_proto::clamp_delta(decoded.dy.saturating_neg());
     // PS/2 packet: flags (bit 3 always set, bits 0-2 buttons, bits 4/5 the sign
     // of dx/dy), then the two deltas as 9-bit two's complement bytes.
     let flags = 0x08 | buttons | if dx < 0 { 0x10 } else { 0 } | if dy < 0 { 0x20 } else { 0 };
     ps2_mouse::inject_packet([flags, dx as u8, dy as u8]);
 }
 
-/// Feed one HID report. `protocol` is the interface's boot protocol byte:
-/// 1 = keyboard, 2 = mouse, anything else is ignored (and counted by the caller
-/// as a report that produced no input).
-pub fn feed(report: &[u8], protocol: u8) {
-    match protocol {
-        1 => feed_keyboard(report),
-        2 => feed_mouse(report),
-        _ => {}
+/// Feed one HID report from an interface whose `subclass`/`protocol` identify it
+/// as a boot keyboard or mouse, in the report layout the interface is currently
+/// sending. Interfaces that are not a boot keyboard/mouse are ignored.
+pub fn feed_iface(report: &[u8], subclass: u8, protocol: u8, mode: ReportMode) {
+    match usb_hid_proto::class_of(subclass, protocol) {
+        HidClass::Keyboard => feed_keyboard(report),
+        HidClass::Mouse => feed_mouse(report, mode),
+        HidClass::Unsupported => {}
     }
+}
+
+/// Feed one boot-protocol report (the in-QEMU selftest entry point).
+pub fn feed(report: &[u8], protocol: u8) {
+    feed_iface(
+        report,
+        usb_hid_proto::SUBCLASS_BOOT,
+        protocol,
+        ReportMode::Boot,
+    );
 }
 
 /// `(keyboard reports, mouse reports, unmapped keys)` for diagnostics.
