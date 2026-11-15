@@ -13,6 +13,7 @@ pub mod regs;
 // каждый вначале компилируется как чистая заготовка и наполняется в своём
 // обработчике.
 pub mod abi;
+pub mod cmsg;
 pub mod cred;
 pub mod diag;
 pub mod dirent;
@@ -380,6 +381,9 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             }
             Ok(n as u64)
         }
+        // ── AF_UNIX SCM_RIGHTS: fd passing для userspace-композитора ──
+        sysno::SENDMSG => unix_sock::sys_sendmsg(a[0], a[1], a[2]),
+        sysno::RECVMSG => unix_sock::sys_recvmsg(a[0], a[1], a[2]),
         sysno::ACCEPT => unix_sock::sys_accept(a[0], a[1], a[2]),
         sysno::BIND => unix_sock::sys_bind(a[0], a[1], a[2]),
         sysno::LISTEN => unix_sock::sys_listen(a[0], a[1]),
