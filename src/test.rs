@@ -2405,17 +2405,21 @@ mod procfs_tests {
         let meminfo_ino = meminfo.fs_ino();
 
         let file_fd = compat::with_pid_compat(FAKE, |cs| {
-            let fd = cs.fds.alloc_with_flags(
-                OpenObject::File {
-                    node: Arc::clone(&meminfo),
-                    path: String::from("/proc/meminfo"),
-                    offset: 123,
-                },
-                O_RDONLY,
-            );
+            let fd = cs
+                .fds
+                .alloc_with_flags(
+                    OpenObject::File {
+                        node: Arc::clone(&meminfo),
+                        path: String::from("/proc/meminfo"),
+                        offset: 123,
+                    },
+                    O_RDONLY,
+                )
+                .ok()?;
             cs.fds.set_cloexec(fd, true);
-            fd
+            Some(fd)
         })
+        .flatten()
         .unwrap_or(0);
 
         // ── fdinfo directory: numeric entries over the live fd table ────────
@@ -2470,15 +2474,18 @@ mod procfs_tests {
         // Creation-only flags (`O_CREAT`, `O_TRUNC`) are not part of Linux's
         // `f_flags`; fdinfo must show only the flags the descriptor keeps.
         let created_fd = compat::with_pid_compat(FAKE, |cs| {
-            cs.fds.alloc_with_flags(
-                OpenObject::File {
-                    node: Arc::clone(&meminfo),
-                    path: String::from("/proc/meminfo"),
-                    offset: 0,
-                },
-                O_RDONLY | 0o100 | 0o1000, // O_CREAT | O_TRUNC
-            )
+            cs.fds
+                .alloc_with_flags(
+                    OpenObject::File {
+                        node: Arc::clone(&meminfo),
+                        path: String::from("/proc/meminfo"),
+                        offset: 0,
+                    },
+                    O_RDONLY | 0o100 | 0o1000, // O_CREAT | O_TRUNC
+                )
+                .ok()
         })
+        .flatten()
         .unwrap_or(0);
         let created = text_of(&alloc::format!("/proc/{FAKE}/fdinfo/{created_fd}"));
         assert_eq_kernel!(

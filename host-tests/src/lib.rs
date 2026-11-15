@@ -596,6 +596,12 @@ mod properties {
     // to every other user-reachable vector. Same descriptive-name policy.
     mod exception_trap;
 
+    // Round-4 hotfix, host-testable halves: F-r4-arch-3 (the Linux `SFMask`
+    // bit set — TF|DF|IF|IOPL|AC|NT — is the only thing QEMU cannot verify) and
+    // F-r4-vfs-1 (the exact `(link, target)` provisioning allowlist the
+    // installer may traverse; everything else is a cross-package redirector).
+    mod r4_hotfix;
+
     // Process credentials + filesystem permission enforcement (security model):
     // the POSIX owner/group/other matrix with the root execute rule, and every
     // set*id transition's ownership invariant, over arbitrary ids. `p55` is

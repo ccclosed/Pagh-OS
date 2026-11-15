@@ -1,7 +1,7 @@
 //! Syscall'ы таймеров/часов, eventfd и epoll: clock_getres(229),
 //! eventfd2(290), epoll_create1(291), epoll_ctl(233), epoll_wait(232).
 #![allow(dead_code)]
-use super::check_user_ptr;
+use super::{check_user_ptr, check_user_ptr_writable};
 use crate::arch::x86_64::linux::errno::Errno;
 use crate::sync::spinlock::Spinlock;
 use crate::task::compat;
@@ -27,7 +27,7 @@ pub fn sys_clock_getres(clock_id: u64, ts_ptr: u64) -> Result<u64, Errno> {
     if ts_ptr == 0 {
         return Ok(0);
     } // null-буфер допустим: проверяем только id
-    check_user_ptr(ts_ptr, 16)?;
+    check_user_ptr_writable(ts_ptr, 16)?;
     // struct timespec { tv_sec: i64, tv_nsec: i64 } — разрешение 1 мс
     let sec: i64 = 0;
     let nsec: i64 = (1_000_000_000 / crate::arch::x86_64::apic::TICK_HZ) as i64; // один тик LAPIC
@@ -53,14 +53,14 @@ pub fn sys_eventfd2(initval: u64, flags: u64) -> Result<u64, Errno> {
                 semaphore,
             },
             O_RDWR | (flags & O_NONBLOCK),
-        );
+        )?;
         if flags & 0x80000 != 0 {
             cs.fds.set_cloexec(fd, true);
         } // EFD_CLOEXEC
-        fd
+        Ok::<u64, Errno>(fd as u64)
     })
-    .ok_or(Errno::EBADF)?;
-    Ok(fd as u64)
+    .ok_or(Errno::EBADF)??;
+    Ok(fd)
 }
 
 // ── epoll_create1 (291) ──────────────────────────────────────────────────────
@@ -72,14 +72,14 @@ pub fn sys_epoll_create1(flags: u64) -> Result<u64, Errno> {
     let fd = compat::with_current_compat(|cs| {
         let fd = cs
             .fds
-            .alloc_with_flags(OpenObject::Epoll { interests }, O_RDWR);
+            .alloc_with_flags(OpenObject::Epoll { interests }, O_RDWR)?;
         if flags & 0x80000 != 0 {
             cs.fds.set_cloexec(fd, true);
         } // EPOLL_CLOEXEC
-        fd
+        Ok::<u64, Errno>(fd as u64)
     })
-    .ok_or(Errno::EBADF)?;
-    Ok(fd as u64)
+    .ok_or(Errno::EBADF)??;
+    Ok(fd)
 }
 
 // ── epoll_ctl (233) ──────────────────────────────────────────────────────────
@@ -176,7 +176,7 @@ pub fn sys_epoll_wait(
         return Err(Errno::EINVAL);
     }
     let event_sz: u64 = 12; // sizeof(struct epoll_event) = 4+8
-    check_user_ptr(events_ptr, maxevents * event_sz)?;
+    check_user_ptr_writable(events_ptr, maxevents * event_sz)?;
 
     let interests = compat::with_current_compat(|cs| match cs.fds.get(epfd as u32) {
         Some(OpenObject::Epoll { interests }) => Some(Arc::clone(interests)),
@@ -198,7 +198,7 @@ pub fn sys_epoll_wait(
         // памяти ядра, поэтому сосед, снявший пользовательский массив, обязан
         // превратиться в -EFAULT на следующей итерации, а не в бесконечное
         // ожидание.
-        check_user_ptr(events_ptr, maxevents * event_sz)?;
+        check_user_ptr_writable(events_ptr, maxevents * event_sz)?;
         let snapshot: Vec<EpollEntry> = interests.lock().clone();
         // Собирать готовые события в памяти ЯДРА, а не прямо в массив
         // пользователя: массив проверялся один раз на входе, а цикл уступает CPU

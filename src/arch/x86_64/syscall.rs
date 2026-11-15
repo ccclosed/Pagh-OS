@@ -63,7 +63,13 @@ pub fn init() {
         // SYSCALL по-прежнему сохраняет user RFLAGS (включая TF) в r11, а
         // `sysretq` восстанавливает его, поэтому состояние пошагового
         // выполнения пользователя не теряется — оно просто не протекает в ядро.
-        SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG);
+        // F-r4-arch-3: маска как в Linux — TF|DF|IF|IOPL|AC|NT. Прежние IF|TF
+        // оставляли AC/DF/NT/IOPL в силе на всём syscall-окне; AC на реальном
+        // CPU с CR0.AM давал #AC в ring 0 и halt. Битсет живёт в host-тестируемом
+        // `abi::SYSCALL_SFMASK`.
+        SFMask::write(RFlags::from_bits_truncate(
+            crate::arch::x86_64::linux::abi::SYSCALL_SFMASK,
+        ));
     }
     // ЗАМЕЧАНИЕ: шаг `init_syscalls` оркестратора загрузки печатает одну
     // краткую строку `info!("syscalls")`; здесь намеренно не дублируем лог.

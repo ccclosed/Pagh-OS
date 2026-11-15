@@ -18,13 +18,13 @@ use x86_64::VirtAddr;
 use crate::task::compat;
 use crate::task::scheduler;
 
-use super::check_user_ptr;
 use super::cred::Creds;
 use super::diag::exit_code_byte;
 use super::errno::Errno;
 use super::rand_clock::{getrandom_plan, ticks_to_timespec, Timespec, CLOCK_REALTIME};
 use super::rtc;
 use super::timeconv::{encode_timeval, Timeval};
+use super::{check_user_ptr, check_user_ptr_writable};
 
 /// Частота тика периодического таймера LAPIC (см. `arch::x86_64::apic`).
 /// Передаётся чистому [`ticks_to_timespec`], чтобы `clock_gettime` сообщал
@@ -65,7 +65,7 @@ fn field(s: &str) -> [u8; 65] {
 /// `uname` (63): заполнить пользовательский `struct utsname` фиксированными
 /// строками идентификации и вернуть 0 (R2.11).
 pub fn sys_uname(buf: u64) -> Result<u64, Errno> {
-    check_user_ptr(buf, core::mem::size_of::<Utsname>() as u64)?;
+    check_user_ptr_writable(buf, core::mem::size_of::<Utsname>() as u64)?;
     let uts = Utsname {
         sysname: field("Linux"),
         nodename: field("pagh"),
@@ -102,7 +102,7 @@ pub fn sys_arch_prctl(code: u64, addr: u64) -> Result<u64, Errno> {
             Ok(0)
         }
         ARCH_GET_FS => {
-            check_user_ptr(addr, 8)?;
+            check_user_ptr_writable(addr, 8)?;
             let base = compat::with_current_compat(|cs| cs.fs_base).unwrap_or(0);
             // SAFETY: `addr` проверен на 8 байт выше.
             unsafe {
@@ -117,8 +117,10 @@ pub fn sys_arch_prctl(code: u64, addr: u64) -> Result<u64, Errno> {
 /// `set_tid_address` (218): вернуть tid вызывающего потока (R2.10). Переданный
 /// `clear_child_tid` принимается, но не используется (сноса потоков здесь нет).
 pub fn sys_set_tid_address(tidptr: u64) -> Result<u64, Errno> {
+    // clear_child_tid ядро очищает при выходе потока, поэтому это out-указатель:
+    // read-only страница дала бы store из kill/exit-пути.
     if tidptr != 0 {
-        check_user_ptr(tidptr, 4)?;
+        check_user_ptr_writable(tidptr, 4)?;
     }
     let tid = compat::with_current_compat(|cs| {
         cs.clear_child_tid = tidptr;
@@ -143,7 +145,7 @@ pub fn sys_clock_gettime(clock_id: u64, tsptr: u64) -> Result<u64, Errno> {
         // 5 = CLOCK_REALTIME_COARSE — те же стенные часы, ниже точность.
         ts.tv_sec = rtc::now_unix() as i64;
     }
-    check_user_ptr(tsptr, core::mem::size_of::<Timespec>() as u64)?;
+    check_user_ptr_writable(tsptr, core::mem::size_of::<Timespec>() as u64)?;
     let bytes = unsafe {
         core::slice::from_raw_parts(
             &ts as *const Timespec as *const u8,
@@ -165,7 +167,7 @@ pub fn sys_getrandom(buf: u64, count: u64, _flags: u64) -> Result<u64, Errno> {
     if n == 0 {
         return Ok(0);
     }
-    check_user_ptr(buf, n)?;
+    check_user_ptr_writable(buf, n)?;
     let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, n as usize) };
     crate::security::entropy::fill(out).map_err(|_| Errno::EAGAIN)?;
     Ok(n)
@@ -366,7 +368,7 @@ fn optional_id_arg(raw: u64) -> Option<u32> {
 
 /// Записать один `u32` в проверенный пользовательский указатель.
 fn put_u32(ptr: u64, value: u32) -> Result<(), Errno> {
-    check_user_ptr(ptr, 4)?;
+    check_user_ptr_writable(ptr, 4)?;
     // SAFETY: `ptr` проверен на четыре байта выше; `write_unaligned` не требует
     // выравнивания, а обход присутствия страниц уже выполнен.
     unsafe {
@@ -413,9 +415,9 @@ pub fn sys_getegid() -> Result<u64, Errno> {
 /// проверяются до первой записи, поэтому частичный результат ненаблюдаем.
 pub fn sys_getresuid(ruid: u64, euid: u64, suid: u64) -> Result<u64, Errno> {
     let c = compat::current_creds();
-    check_user_ptr(ruid, 4)?;
-    check_user_ptr(euid, 4)?;
-    check_user_ptr(suid, 4)?;
+    check_user_ptr_writable(ruid, 4)?;
+    check_user_ptr_writable(euid, 4)?;
+    check_user_ptr_writable(suid, 4)?;
     put_u32(ruid, c.uid)?;
     put_u32(euid, c.euid)?;
     put_u32(suid, c.suid)?;
@@ -426,9 +428,9 @@ pub fn sys_getresuid(ruid: u64, euid: u64, suid: u64) -> Result<u64, Errno> {
 /// указателя.
 pub fn sys_getresgid(rgid: u64, egid: u64, sgid: u64) -> Result<u64, Errno> {
     let c = compat::current_creds();
-    check_user_ptr(rgid, 4)?;
-    check_user_ptr(egid, 4)?;
-    check_user_ptr(sgid, 4)?;
+    check_user_ptr_writable(rgid, 4)?;
+    check_user_ptr_writable(egid, 4)?;
+    check_user_ptr_writable(sgid, 4)?;
     put_u32(rgid, c.gid)?;
     put_u32(egid, c.egid)?;
     put_u32(sgid, c.sgid)?;
@@ -516,7 +518,7 @@ pub fn sys_gettimeofday(tvptr: u64, _tzptr: u64) -> Result<u64, Errno> {
     if tvptr == 0 {
         return Ok(0);
     }
-    check_user_ptr(tvptr, core::mem::size_of::<Timeval>() as u64)?;
+    check_user_ptr_writable(tvptr, core::mem::size_of::<Timeval>() as u64)?;
     let secs = rtc::now_unix() as i64;
     let usecs = ((scheduler::ticks() % TICK_HZ) * (NS_PER_TICK / 1000)) as i64;
     let tv = encode_timeval(secs, usecs);
@@ -538,7 +540,7 @@ pub fn sys_gettimeofday(tvptr: u64, _tzptr: u64) -> Result<u64, Errno> {
 pub fn sys_time(tptr: u64) -> Result<u64, Errno> {
     let secs = rtc::now_unix();
     if tptr != 0 {
-        check_user_ptr(tptr, 8)?;
+        check_user_ptr_writable(tptr, 8)?;
         // SAFETY: `tptr` проверен на 8 байт выше.
         unsafe {
             *(tptr as *mut i64) = secs as i64;
@@ -674,7 +676,7 @@ pub const SYSTEM_LOAD_FIXED_ONE: u64 = 1 << 16;
 /// `/proc/loadavg`) и общим/свободным объёмом RAM (из счётчиков кадров PMM),
 /// вернув 0.
 pub fn sys_sysinfo(info: u64) -> Result<u64, Errno> {
-    check_user_ptr(info, core::mem::size_of::<Sysinfo>() as u64)?;
+    check_user_ptr_writable(info, core::mem::size_of::<Sysinfo>() as u64)?;
     let uptime = (scheduler::ticks() / TICK_HZ) as i64;
     let totalram = crate::memory::pmm::total_frames() as u64 * 4096;
     let freeram = crate::memory::pmm::free_frames() as u64 * 4096;
@@ -766,7 +768,7 @@ pub fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> Res
     }
     if oldact != 0 {
         let cur = compat::current_action(sig).ok_or(Errno::EINVAL)?;
-        check_user_ptr(oldact, 32)?;
+        check_user_ptr_writable(oldact, 32)?;
         let mut b = [0u8; 32];
         b[0..8].copy_from_slice(&cur.handler.to_le_bytes());
         b[8..16].copy_from_slice(&cur.flags.to_le_bytes());
@@ -791,38 +793,49 @@ pub fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> R
     if size < 8 {
         return Err(Errno::EINVAL);
     }
-    let outcome: Option<Result<u64, Errno>> = compat::with_current_compat(|cs| {
-        if set != 0 {
-            if let Err(e) = check_user_ptr(set, 8) {
-                return Err(e);
-            }
-            let mut b = [0u8; 8];
-            // SAFETY: диапазон проверен выше.
-            unsafe {
-                core::ptr::copy_nonoverlapping(set as *const u8, b.as_mut_ptr(), 8);
-            }
-            match crate::arch::x86_64::linux::signal_frame::apply_mask_op(
-                how,
-                cs.sig_blocked,
-                u64::from_le_bytes(b),
-            ) {
+    // F-r4-arch-1: user-память не трогается под `COMPAT_STATES`. Входную маску
+    // читаем и входной указатель проверяем ДО реестра; выходной указатель
+    // проверяем на право записи тоже до него. Раньше store в present-read-only
+    // `oldset` шёл ВНУТРИ замыкания, давал ring-0 #PF, а kill-путь повторно
+    // брал нереентерабельный спинлок и вешал CPU.
+    let requested = if set != 0 {
+        check_user_ptr(set, 8)?;
+        let mut b = [0u8; 8];
+        // SAFETY: диапазон проверен выше.
+        unsafe {
+            core::ptr::copy_nonoverlapping(set as *const u8, b.as_mut_ptr(), 8);
+        }
+        Some(u64::from_le_bytes(b))
+    } else {
+        None
+    };
+    if oldset != 0 {
+        check_user_ptr_writable(oldset, 8)?;
+    }
+    // Под локом — только чтение/запись compat-состояния: вычислить старую маску
+    // и применить новую. `oldset` в Linux — ПРЕДЫДУЩАЯ маска, поэтому снимок
+    // берётся до применения.
+    let previous = compat::with_current_compat(|cs| {
+        let previous = cs.sig_blocked;
+        if let Some(mask) = requested {
+            match crate::arch::x86_64::linux::signal_frame::apply_mask_op(how, cs.sig_blocked, mask)
+            {
                 Some(new) => cs.sig_blocked = new,
                 None => return Err(Errno::EINVAL),
             }
         }
-        if oldset != 0 {
-            if let Err(e) = check_user_ptr(oldset, 8) {
-                return Err(e);
-            }
-            let le = cs.sig_blocked.to_le_bytes();
-            // SAFETY: диапазон проверен выше.
-            unsafe {
-                core::ptr::copy_nonoverlapping(le.as_ptr(), oldset as *mut u8, 8);
-            }
+        Ok(previous)
+    })
+    .ok_or(Errno::EINVAL)??;
+    if oldset != 0 {
+        let le = previous.to_le_bytes();
+        // SAFETY: указатель проверен (включая право записи) до входа в реестр;
+        // COW-страница будет скопирована обработчиком #PF уже БЕЗ лока.
+        unsafe {
+            core::ptr::copy_nonoverlapping(le.as_ptr(), oldset as *mut u8, 8);
         }
-        Ok(0)
-    });
-    outcome.ok_or(Errno::EINVAL)?
+    }
+    Ok(0)
 }
 
 /// `sigaltstack` (131): зарегистрировать или прочитать альтернативный стек
@@ -833,43 +846,49 @@ pub fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> R
 /// прерванный RSP, которого этот обработчик не получает); glibc никогда не
 /// переключает altstack изнутри обработчика, так что упущение безвредно.
 pub fn sys_sigaltstack(ss: u64, old_ss: u64) -> Result<u64, Errno> {
-    let outcome: Option<Result<u64, Errno>> = compat::with_current_compat(|cs| {
-        if old_ss != 0 {
-            if let Err(e) = check_user_ptr(old_ss, 24) {
-                return Err(e);
-            }
-            let mut b = [0u8; 24];
-            b[0..8].copy_from_slice(&cs.sig_altstack.sp.to_le_bytes());
-            b[8..12].copy_from_slice(&cs.sig_altstack.flags.to_le_bytes());
-            b[16..24].copy_from_slice(&cs.sig_altstack.size.to_le_bytes());
-            // SAFETY: диапазон проверен выше.
-            unsafe {
-                core::ptr::copy_nonoverlapping(b.as_ptr(), old_ss as *mut u8, 24);
-            }
+    // F-r4-arch-1: см. `sys_rt_sigprocmask`. 24-байтный `old_ss` копировался в
+    // user-память внутри реестра; вход разбирается до лока, выход пишется после.
+    let requested = if ss != 0 {
+        check_user_ptr(ss, 24)?;
+        let mut b = [0u8; 24];
+        // SAFETY: диапазон проверен выше.
+        unsafe {
+            core::ptr::copy_nonoverlapping(ss as *const u8, b.as_mut_ptr(), 24);
         }
-        if ss != 0 {
-            if let Err(e) = check_user_ptr(ss, 24) {
-                return Err(e);
-            }
-            let mut b = [0u8; 24];
-            // SAFETY: диапазон проверен выше.
-            unsafe {
-                core::ptr::copy_nonoverlapping(ss as *const u8, b.as_mut_ptr(), 24);
-            }
-            let sp = u64::from_le_bytes(b[0..8].try_into().unwrap());
-            let flags = u32::from_le_bytes(b[8..12].try_into().unwrap());
-            let size = u64::from_le_bytes(b[16..24].try_into().unwrap());
-            if flags & crate::arch::x86_64::linux::signal_frame::SS_DISABLE == 0
-                && size < crate::arch::x86_64::linux::signal_frame::MINSIGSTKSZ
-            {
-                return Err(Errno::EINVAL);
-            }
-            cs.sig_altstack =
-                crate::arch::x86_64::linux::signal_frame::SigAltStack { sp, flags, size };
+        let sp = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let flags = u32::from_le_bytes(b[8..12].try_into().unwrap());
+        let size = u64::from_le_bytes(b[16..24].try_into().unwrap());
+        if flags & crate::arch::x86_64::linux::signal_frame::SS_DISABLE == 0
+            && size < crate::arch::x86_64::linux::signal_frame::MINSIGSTKSZ
+        {
+            return Err(Errno::EINVAL);
         }
-        Ok(0)
-    });
-    outcome.ok_or(Errno::EINVAL)?
+        Some(crate::arch::x86_64::linux::signal_frame::SigAltStack { sp, flags, size })
+    } else {
+        None
+    };
+    if old_ss != 0 {
+        check_user_ptr_writable(old_ss, 24)?;
+    }
+    let previous = compat::with_current_compat(|cs| {
+        let previous = cs.sig_altstack;
+        if let Some(next) = requested {
+            cs.sig_altstack = next;
+        }
+        previous
+    })
+    .ok_or(Errno::EINVAL)?;
+    if old_ss != 0 {
+        let mut b = [0u8; 24];
+        b[0..8].copy_from_slice(&previous.sp.to_le_bytes());
+        b[8..12].copy_from_slice(&previous.flags.to_le_bytes());
+        b[16..24].copy_from_slice(&previous.size.to_le_bytes());
+        // SAFETY: указатель проверен (включая право записи) до входа в реестр.
+        unsafe {
+            core::ptr::copy_nonoverlapping(b.as_ptr(), old_ss as *mut u8, 24);
+        }
+    }
+    Ok(0)
 }
 
 /// `set_robust_list` (273): принять и вернуть 0 (поддержки futex/robust-списков
@@ -892,8 +911,8 @@ pub fn sys_get_robust_list(pid: u64, head_ptr: u64, len_ptr: u64) -> Result<u64,
     if pid != 0 && pid != current {
         return Err(Errno::ESRCH);
     }
-    check_user_ptr(head_ptr, 8)?;
-    check_user_ptr(len_ptr, 8)?;
+    check_user_ptr_writable(head_ptr, 8)?;
+    check_user_ptr_writable(len_ptr, 8)?;
     let (head, len) = compat::current_robust_list();
     unsafe {
         core::ptr::write_unaligned(head_ptr as *mut u64, head);
@@ -954,7 +973,7 @@ fn write_rlimit(ptr: u64, resource: u64) -> Result<(), Errno> {
     if resource >= RLIMIT_NLIMITS {
         return Err(Errno::EINVAL);
     }
-    check_user_ptr(ptr, core::mem::size_of::<Rlimit>() as u64)?;
+    check_user_ptr_writable(ptr, core::mem::size_of::<Rlimit>() as u64)?;
     let (cur, max) = current_rlimit(resource);
     let rl = Rlimit {
         rlim_cur: cur,
@@ -1075,9 +1094,8 @@ pub fn sys_flock(_fd: u64, _op: u64) -> Result<u64, Errno> {
 
 /// Записать один `u32` в проверенный пользовательский указатель.
 fn write_user_u32(ptr: u64, value: u32) -> Result<(), Errno> {
-    check_user_ptr(ptr, 4)?;
-    super::io_sys::copy_out_pub(ptr, &value.to_le_bytes());
-    Ok(())
+    check_user_ptr_writable(ptr, 4)?;
+    super::io_sys::copy_out_pub(ptr, &value.to_le_bytes())
 }
 
 /// `getcpu` (309): pagh — один CPU, один NUMA-узел.
@@ -1104,8 +1122,8 @@ pub fn sys_sched_getaffinity(pid: u64, cpusetsize: u64, mask: u64) -> Result<u64
     if cpusetsize < 8 || mask == 0 {
         return Err(Errno::EINVAL);
     }
-    check_user_ptr(mask, 8)?;
-    super::io_sys::copy_out_pub(mask, &1u64.to_le_bytes());
+    check_user_ptr_writable(mask, 8)?;
+    super::io_sys::copy_out_pub(mask, &1u64.to_le_bytes())?;
     Ok(8)
 }
 
@@ -1156,16 +1174,16 @@ pub fn sys_getrusage(who: u64, usage: u64) -> Result<u64, Errno> {
     if usage == 0 {
         return Err(Errno::EFAULT);
     }
-    check_user_ptr(usage, 144)?;
-    super::io_sys::copy_out_pub(usage, &[0u8; 144]);
+    check_user_ptr_writable(usage, 144)?;
+    super::io_sys::copy_out_pub(usage, &[0u8; 144])?;
     Ok(0)
 }
 
 /// `times` (100): вернуть счётчик тиков планировщика и обнулённый `struct tms`.
 pub fn sys_times(tms: u64) -> Result<u64, Errno> {
     if tms != 0 {
-        check_user_ptr(tms, 32)?;
-        super::io_sys::copy_out_pub(tms, &[0u8; 32]);
+        check_user_ptr_writable(tms, 32)?;
+        super::io_sys::copy_out_pub(tms, &[0u8; 32])?;
     }
     Ok(scheduler::ticks())
 }
@@ -1221,8 +1239,8 @@ pub fn sys_sched_setscheduler(_pid: u64, policy: u64, _param: u64) -> Result<u64
 
 /// `sched_rr_get_interval` (148): нулевой timespec; SCHED_RR не реализован.
 pub fn sys_sched_rr_get_interval(_pid: u64, interval: u64) -> Result<u64, Errno> {
-    check_user_ptr(interval, 16)?;
-    super::io_sys::copy_out_pub(interval, &[0u8; 16]);
+    check_user_ptr_writable(interval, 16)?;
+    super::io_sys::copy_out_pub(interval, &[0u8; 16])?;
     Ok(0)
 }
 
@@ -1231,8 +1249,8 @@ pub fn sys_rt_sigpending(set: u64, sigsetsize: u64) -> Result<u64, Errno> {
     if sigsetsize != 8 {
         return Err(Errno::EINVAL);
     }
-    check_user_ptr(set, 8)?;
-    super::io_sys::copy_out_pub(set, &0u64.to_le_bytes());
+    check_user_ptr_writable(set, 8)?;
+    super::io_sys::copy_out_pub(set, &0u64.to_le_bytes())?;
     Ok(0)
 }
 

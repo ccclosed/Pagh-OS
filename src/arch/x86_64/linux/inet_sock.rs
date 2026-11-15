@@ -128,7 +128,7 @@ pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
             let fd = cs.fds.alloc_with_flags(
                 OpenObject::InetTcp(sock),
                 crate::task::fd::O_RDWR | (ty & SOCK_NONBLOCK),
-            );
+            )?;
             if cloexec {
                 cs.fds.set_cloexec(fd, true);
             }
@@ -144,7 +144,7 @@ pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
             let fd = cs.fds.alloc_with_flags(
                 OpenObject::InetUdp(sock),
                 crate::task::fd::O_RDWR | (ty & SOCK_NONBLOCK),
-            );
+            )?;
             if cloexec {
                 cs.fds.set_cloexec(fd, true);
             }
@@ -364,13 +364,13 @@ pub fn getsockopt_in(
 }
 
 pub(super) fn write_opt(optval: u64, optlen: u64, value: u32) -> Result<u64, Errno> {
-    use super::check_user_ptr;
-    check_user_ptr(optlen, 4)?;
+    use super::check_user_ptr_writable;
+    check_user_ptr_writable(optlen, 4)?;
     let want = unsafe { core::ptr::read_unaligned(optlen as *const u32) };
     if want < 4 {
         return Err(Errno::EINVAL);
     }
-    check_user_ptr(optval, 4)?;
+    check_user_ptr_writable(optval, 4)?;
     unsafe {
         core::ptr::write_unaligned(optval as *mut u32, value);
         core::ptr::write_unaligned(optlen as *mut u32, 4u32);

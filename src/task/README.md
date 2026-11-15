@@ -146,10 +146,14 @@ sched_yield, tgkill и др.).
   `epoll_wait`→`poll_fd` уже держит реестр, поэтому signalfd-ветка читает
   `sig_pending`/`sig_blocked` из уже захваченного `CompatState`, а не зовёт
   `signalfd_readable()` (тот теперь debug-assert'ит, что реестр не удерживается).
+  Kill-путь исключений (#PF/#GP/синхронные) отвечает `compat_exists_for_exit` без входа в
+  реестр и `abandon_held_registry` аварийно отпускает лок, удерживаемый прерванным
+  замыканием, прежде чем завершить задачу.
 - **fd-таблица ограничена `NOFILE_MAX`/`FD_TABLE_LIMIT` = 1024** (см. `SECURITY.md`):
-  `dup2`/`dup3`/`fcntl(F_DUPFD/F_DUPFD_CLOEXEC)` отвергают номер ≥ предела до аллокации
-  (`EINVAL`), а `FdSlots::try_alloc` независимо не даёт вектору вырасти за предел (`EMFILE`);
-  `FdSlots::alloc` остаётся только для внутренних вызовов с `FIRST_DYNAMIC_FD`.
+  `dup2`/`dup3` отвергают `newfd >= предела` с `EBADF`, `fcntl(F_DUPFD/F_DUPFD_CLOEXEC)` —
+  `EINVAL` до аллокации; `FdSlots::alloc`/`try_alloc`/`try_set` независимо не дают вектору
+  вырасти за предел (`EMFILE`), поэтому `open`/`pipe`/`socketpair` на полной таблице
+  возвращают `EMFILE`, а `pipe` освобождает первый конец, если второй не помещается.
 - `spawn`/`requeue` дропают дубликат уже стоящего в очереди pid (лог `[SCHED] DOUBLE ENQUEUE`).
 - `setup_task_kernel_stack` перепрограммирует единственный глобальный слот RSP0/syscall-стека —
   fork/clone обязаны вернуть его на РОДИТЕЛЯ перед возвратом.

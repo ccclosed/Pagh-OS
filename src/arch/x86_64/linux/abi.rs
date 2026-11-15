@@ -16,6 +16,31 @@
 //! не голыми литералами.
 #![allow(dead_code)]
 
+/// Биты RFLAGS, которые `syscall` сбрасывает на входе в ядро (IA32_FMASK /
+/// `SFMask`), как в Linux: `X86_EFLAGS_TF|DF|IF|IOPL|AC|NT`.
+///
+/// F-r4-arch-3: pagh маскировал только `IF|TF`, поэтому AC, DF, NT и IOPL
+/// переживали вход в ring 0. AC опаснее всех: interrupt gates его не чистят, и
+/// на железе с `CR0.AM=1` первый невыровненный доступ ядра в syscall-окне
+/// (обработчики читают user-указатели `read_unaligned`) даёт #AC с ядерным RIP,
+/// то есть остановку машины. QEMU #AC не моделирует, поэтому здесь закреплён
+/// сам битсет — Linux-значение, проверяемое host-тестом.
+pub const SYSCALL_SFMASK: u64 =
+    RFLAGS_TF | RFLAGS_DF | RFLAGS_IF | RFLAGS_IOPL | RFLAGS_AC | RFLAGS_NT;
+/// Trap Flag: пошаговое исполнение пользователя не должно протекать в ядро.
+pub const RFLAGS_TF: u64 = 1 << 8;
+/// Interrupt Flag: окно `syscall` идёт с выключенными прерываниями.
+pub const RFLAGS_IF: u64 = 1 << 9;
+/// Direction Flag: Rust/LLVM требуют DF=0 на входе в любой код.
+pub const RFLAGS_DF: u64 = 1 << 10;
+/// IOPL (два бита): ring 3 не должен влиять на привилегию I/O в ядре.
+pub const RFLAGS_IOPL: u64 = (1 << 12) | (1 << 13);
+/// Nested Task: у long mode нет аппаратного task switch, но бит обязан быть
+/// сброшен, как в Linux.
+pub const RFLAGS_NT: u64 = 1 << 14;
+/// Alignment Check: ядро не должно получать #AC из-за флага пользователя.
+pub const RFLAGS_AC: u64 = 1 << 18;
+
 /// Номера syscall'ов Linux x86_64 из `Supported_Syscall_Set` (R2.1).
 pub mod nr {
     /// `read` — чтение из дескриптора файла.
