@@ -1960,6 +1960,30 @@ mod tests {
     }
 
     #[test]
+    fn f10_opens_menu_and_damages_screen() {
+        let mut compositor = compositor();
+        let _ = compositor.render_full();
+        let events = compositor.key_event(key::F10, true, 0);
+        assert!(events.is_empty(), "F10 — серверный shortcut");
+        let menu = compositor
+            .context_menu()
+            .expect("F10 открывает меню")
+            .clone();
+        assert!(
+            !compositor.damage.take().is_empty(),
+            "меню должно добавить damage"
+        );
+        let before = compositor
+            .frame()
+            .get(menu.rect.center().x, menu.rect.center().y);
+        let _ = compositor.render_full();
+        let after = compositor
+            .frame()
+            .get(menu.rect.center().x, menu.rect.center().y);
+        assert_ne!(before, after, "центр меню должен перерисоваться");
+    }
+
+    #[test]
     fn escape_closes_menu_and_flyout() {
         let mut compositor = compositor();
         compositor.pointer_motion(Point::new(1000, 300));

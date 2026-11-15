@@ -1,23 +1,44 @@
-//! Backend вывода: headless (PNG/PPM) сейчас, fb0/DRM — позже.
+//! Backend вывода: headless (PNG) и `/dev/fb0` (mmap scanout).
 //!
 //! Композитор ничего не знает о том, куда выводится кадр: он передаёт непрозрачный
-//! холст и список повреждённых прямоугольников. Headless-backend складывает кадры в
-//! PNG для тестов и демонстраций; backend `/dev/fb0` (mmap) реализуется отдельно,
-//! когда kernel-ветка предоставит fbdev-ABI.
+//! холст и список повреждённых прямоугольников. `OutputBackend` выбирается при
+//! старте сервера (`auto|headless|fbdev`); headless складывает кадры в PNG для
+//! тестов, fbdev пишет damage прямо в физический scanout через `FbdevBackend`.
 
 use crate::canvas::Canvas;
+use crate::fbdev::FbdevBackend;
 use crate::geometry::Rect;
 use crate::png;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Тип backend'а (для логов/selfcheck).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendKind {
+    Headless,
+    Fbdev,
+}
+
+impl BackendKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Headless => "headless",
+            Self::Fbdev => "fbdev",
+        }
+    }
+}
+
 /// Приёмник готовых кадров.
 pub trait Backend {
     fn size(&self) -> (u32, u32);
 
-    /// Показать кадр; `damage` — перерисованные области (backend может копировать
-    /// только их, если у него есть сохранённый предыдущий буфер).
+    /// Показать кадр; `damage` — перерисованные области.
     fn present(&mut self, canvas: &Canvas, damage: &[Rect]) -> io::Result<()>;
+
+    /// Сколько кадров уже показано.
+    fn frames(&self) -> u64;
+
+    fn kind(&self) -> BackendKind;
 }
 
 /// Headless-вывод: считает кадры и (опционально) пишет каждый кадр в PNG.
@@ -89,6 +110,71 @@ impl Backend for HeadlessBackend {
             self.last_path = Some(path);
         }
         Ok(())
+    }
+
+    fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    fn kind(&self) -> BackendKind {
+        BackendKind::Headless
+    }
+}
+
+/// Backend, выбранный при старте сервера.
+pub enum OutputBackend {
+    Headless(HeadlessBackend),
+    Fbdev(FbdevBackend),
+}
+
+impl OutputBackend {
+    pub fn kind(&self) -> BackendKind {
+        match self {
+            Self::Headless(_) => BackendKind::Headless,
+            Self::Fbdev(_) => BackendKind::Fbdev,
+        }
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Headless(backend) => backend.size(),
+            Self::Fbdev(backend) => backend.size(),
+        }
+    }
+
+    pub fn frames(&self) -> u64 {
+        match self {
+            Self::Headless(backend) => backend.frames(),
+            Self::Fbdev(backend) => backend.frames(),
+        }
+    }
+
+    pub fn as_fbdev(&self) -> Option<&FbdevBackend> {
+        match self {
+            Self::Fbdev(backend) => Some(backend),
+            Self::Headless(_) => None,
+        }
+    }
+}
+
+impl Backend for OutputBackend {
+    fn size(&self) -> (u32, u32) {
+        self.size()
+    }
+
+    fn present(&mut self, canvas: &Canvas, damage: &[Rect]) -> io::Result<()> {
+        match self {
+            Self::Headless(backend) => backend.present(canvas, damage),
+            Self::Fbdev(backend) => backend.present(canvas, damage),
+        }
+    }
+
+    fn frames(&self) -> u64 {
+        self.frames()
+    }
+
+    fn kind(&self) -> BackendKind {
+        self.kind()
     }
 }
 

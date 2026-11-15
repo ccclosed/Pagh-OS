@@ -6,7 +6,7 @@
 //! ```
 
 use pagh_desktop::demo;
-use pagh_desktop::server::{LaunchTarget, Server, ServerOptions};
+use pagh_desktop::server::{InputChoice, LaunchTarget, OutputChoice, Server, ServerOptions};
 use std::env;
 use std::io;
 use std::path::PathBuf;
@@ -19,7 +19,11 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
-    let mut options = ServerOptions::default();
+    let mut options = ServerOptions {
+        backend: OutputChoice::Auto,
+        input: InputChoice::Auto,
+        ..ServerOptions::default()
+    };
     let mut clock_now = false;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -36,6 +40,70 @@ fn run() -> io::Result<()> {
                     "--max-frames",
                 )?)
             }
+            "--backend" => {
+                let value = value(&mut args, "--backend")?;
+                options.backend = match value.as_str() {
+                    "auto" => OutputChoice::Auto,
+                    "headless" => OutputChoice::Headless,
+                    "fbdev" => OutputChoice::Fbdev,
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("--backend принимает auto|headless|fbdev, получено {other:?}"),
+                        ))
+                    }
+                };
+            }
+            "--fbdev" => options.fbdev_path = PathBuf::from(value(&mut args, "--fbdev")?),
+            "--input" => {
+                let value = value(&mut args, "--input")?;
+                options.input = match value.as_str() {
+                    "auto" => InputChoice::Auto,
+                    "none" => InputChoice::None,
+                    "evdev" => InputChoice::Evdev,
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("--input принимает auto|none|evdev, получено {other:?}"),
+                        ))
+                    }
+                };
+            }
+            "--evdev" => options.evdev_path = PathBuf::from(value(&mut args, "--evdev")?),
+            "--input-trace" => options.input_trace = true,
+            "--full-render" => options.full_render = true,
+            // Однокнопочный режим для QEMU e2e: auto backend/input, демо-окно,
+            // ограниченное время жизни и selfcheck. Остальные флаги могут
+            // переопределить значения после --e2e.
+            "--e2e" => {
+                options.backend = OutputChoice::Auto;
+                options.input = InputChoice::Auto;
+                options.demo_window = true;
+                options.input_trace = true;
+                // QEMU screendump читает поверхность дисплея; полный present
+                // делает обновление детерминированным (production damage не
+                // меняется, --full-render остаётся явным флагом).
+                options.full_render = true;
+                if options.exit_after_ms.is_none() {
+                    options.exit_after_ms = Some(15_000);
+                }
+                if options.fbdev_selfcheck_ms.is_none() {
+                    options.fbdev_selfcheck_ms = Some(3_000);
+                }
+            }
+            "--exit-after-ms" => {
+                options.exit_after_ms = Some(parse_u64(
+                    value(&mut args, "--exit-after-ms")?,
+                    "--exit-after-ms",
+                )?)
+            }
+            "--selfcheck-ms" => {
+                options.fbdev_selfcheck_ms = Some(parse_u64(
+                    value(&mut args, "--selfcheck-ms")?,
+                    "--selfcheck-ms",
+                )?)
+            }
+            "--demo-window" => options.demo_window = true,
             "--spawn-demo" => options.spawn_demo = true,
             "--demo-binary" => {
                 options.demo_binary = Some(PathBuf::from(value(&mut args, "--demo-binary")?))
@@ -135,21 +203,28 @@ fn parse_u64(value: String, flag: &str) -> io::Result<u64> {
 
 fn print_help() {
     println!(
-        "pagh-desktop — userspace-композитор Pagh-OS (PDP/1)\n\
-         \n\
-         Использование:\n\
-           pagh-desktop [--socket PATH] [--width N] [--height N]\n\
-                        [--screenshot-dir DIR] [--max-frames N]\n\
-                        [--spawn-demo] [--demo-binary PATH]\n\
-                        [--launch-target APP=PROGRAM[|ARG…]]\n\
-                        [--clock now|fixed] [--quiet]\n\
-         \n\
-         По умолчанию: /tmp/pagh-desktop.sock, 1280x720, часы 23:38 / 15.11.2026,\n\
-         headless-backend (PNG только при --screenshot-dir).\n\
-         \n\
-         --launch-target задаёт приложение для PDP/1 launch (type 13):\n\
-           --launch-target 'terminal=/usr/bin/pagh-terminal|--socket|{{socket}}'\n\
-         Токен {{socket}} заменяется путём сокета; без него добавится --connect.\n\
-         Протокол: PROTOCOL.md; демо-клиент: pagh-desktop-demo."
+        "pagh-desktop — userspace-композитор Pagh-OS (PDP/1)
+
+Использование:
+  pagh-desktop [--socket PATH] [--width N] [--height N]
+               [--backend auto|headless|fbdev] [--fbdev PATH]
+               [--input auto|none|evdev] [--evdev PATH] [--input-trace]
+               [--screenshot-dir DIR] [--max-frames N] [--exit-after-ms N]
+               [--selfcheck-ms N] [--demo-window] [--e2e] [--full-render]
+               [--spawn-demo] [--demo-binary PATH]
+               [--launch-target APP=PROGRAM[|ARG…]]
+               [--clock now|fixed] [--quiet]
+
+По умолчанию: /tmp/pagh-desktop.sock, backend=auto (fbdev, иначе headless),
+input=auto (evdev при fbdev), часы 23:38 / 15.11.2026.
+fbdev забирает экран у kernel-консоли (takeover односторонний, см.
+docs/desktop-b.md); --input-trace печатает evdev-события в serial.
+--e2e = auto backend/input + demo-окно + exit-after-ms 15000 + selfcheck 3000 +
+input-trace + full-render (для QEMU-приёмки tools/e2e.py desktop).
+
+--launch-target задаёт приложение для PDP/1 launch (type 13):
+  --launch-target 'terminal=/usr/bin/pagh-terminal|--socket|{{socket}}'
+Токен {{socket}} заменяется путём сокета; без него добавится --connect.
+Протокол: PROTOCOL.md; демо-клиент: pagh-desktop-demo."
     );
 }

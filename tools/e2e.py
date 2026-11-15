@@ -924,6 +924,36 @@ class QmpClient:
                 # which made a 3-notch burst deliver as one.
                 time.sleep(0.05)
 
+    def _input(self, events: list[dict]) -> None:
+        reply = self._command({
+            "execute": "input-send-event",
+            "arguments": {"events": events},
+        })
+        if "return" not in reply:
+            raise HarnessError(f"QMP input-send-event refused: {reply}")
+
+    def rel(self, dx: int, dy: int) -> None:
+        """Relative pointer motion (PS/2 mouse path)."""
+        events = []
+        if dx:
+            events.append({"type": "rel", "data": {"axis": "x", "value": int(dx)}})
+        if dy:
+            events.append({"type": "rel", "data": {"axis": "y", "value": int(dy)}})
+        if events:
+            self._input(events)
+
+    def button(self, button: str, down: bool) -> None:
+        self._input([{"type": "btn", "data": {"down": bool(down), "button": button}}])
+
+    def key(self, key: str) -> None:
+        """Press one QKeyCode (e.g. ``f10``, ``esc``, ``a``) via QMP send-key."""
+        reply = self._command({
+            "execute": "send-key",
+            "arguments": {"keys": [key], "hold-time": 50},
+        })
+        if "return" not in reply:
+            raise HarnessError(f"QMP send-key refused: {reply}")
+
     def close(self) -> None:
         if self.sock is not None:
             try:
@@ -2469,6 +2499,240 @@ def mode_restore(_h: Harness) -> tuple[str, int]:
     return "RESTORED", EXIT_PASS
 
 
+def _desktop_bins(skip_build: bool) -> tuple[pathlib.Path, pathlib.Path]:
+    """Build the static musl desktop binaries through the crate's own script."""
+    crate = ROOT / "rust-apps" / "pagh-desktop"
+    script = crate / "build-static.sh"
+    if not script.is_file():
+        raise SetupError(f"desktop: {script} missing")
+    if not skip_build:
+        log("desktop: building static pagh-desktop binaries ...")
+        proc = subprocess.run([str(script)], cwd=crate, capture_output=True, text=True)
+        if proc.returncode != 0:
+            tail_out = (proc.stderr or proc.stdout).strip().splitlines()[-8:]
+            raise SetupError("desktop build failed: " + " | ".join(tail_out))
+    out = crate / "target" / "x86_64-unknown-linux-musl" / "release"
+    bins = (out / "pagh-desktop", out / "pagh-desktop-demo")
+    for path in bins:
+        if not path.is_file():
+            raise SetupError(f"desktop binary missing: {path}")
+    return bins
+
+
+def _debugfs_stat(image: pathlib.Path, name: str) -> str | None:
+    proc = subprocess.run(
+        ["debugfs", "-R", f"stat /{name}", str(image)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0 or "File not found" in (proc.stdout + proc.stderr):
+        return None
+    return proc.stdout
+
+
+def _desktop_inject(image: pathlib.Path, bins: tuple[pathlib.Path, pathlib.Path]) -> None:
+    for src, name in zip(bins, ("pd", "pagh-desktop-demo")):
+        proc = subprocess.run(
+            ["debugfs", "-w", "-R", f"write {src} /{name}", str(image)],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise SetupError(f"debugfs write {name} failed: {proc.stderr.strip()}")
+        proc = subprocess.run(
+            ["debugfs", "-w", "-R", f"sif /{name} mode 0100755", str(image)],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise SetupError(f"debugfs chmod {name} failed: {proc.stderr.strip()}")
+        stat = _debugfs_stat(image, name)
+        if stat is None or "Mode:  0755" not in stat:
+            raise SetupError(f"debugfs: /{name} is not executable after injection")
+
+
+def _desktop_prepare_disk(h: "Harness", image: pathlib.Path,
+                          bins: tuple[pathlib.Path, pathlib.Path]) -> None:
+    """Create a pagh-owned ext2 volume, then inject the binaries with debugfs.
+
+    The kernel only mounts a volume carrying its WAL superblock, and a host
+    ``mkfs.ext2`` image does not have one. So the first boot lets the kernel
+    format a blank whole-disk image itself (the normal first-boot path), QEMU is
+    stopped, and the static binaries are written into that already-owned ext2
+    with debugfs. The second boot mounts it without any prompt.
+    """
+    if not shutil.which("qemu-img") or not shutil.which("debugfs"):
+        raise SetupError("desktop: qemu-img and debugfs are required")
+    image.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        image.unlink()
+    except FileNotFoundError:
+        pass
+    run_checked([shutil.which("qemu-img"), "create", "-f", "raw", str(image), "64M"],
+                "qemu-img create (desktop format)", timeout=60)
+    log("desktop: first boot on a blank disk to let the kernel format ext2+WAL")
+    h.boot(need_keyboard=True, disk=image, net=False)
+    assert h.guest is not None and h.kb is not None
+    if not wait_for_shell(h.guest, h.kb, h.a, h.a.boot_timeout):
+        raise HarnessError(f"desktop: shell never appeared on the blank disk; "
+                           f"serial tail:\n{tail(h.guest.serial())}")
+    if wait_for(h.guest, [r"ext2 mounted at /mnt"], 30.0, label="ext2 mount") is None:
+        raise HarnessError("desktop: kernel did not mount the freshly formatted volume")
+    time.sleep(2.0)
+    h.guest.stop()
+    h.guest = None
+    h.kb.close()
+    h.kb = None
+    if not image.is_file():
+        raise SetupError("desktop: formatted disk image disappeared")
+    _desktop_inject(image, bins)
+    log(f"desktop: injected static binaries into {rel(image)}")
+
+
+def mode_desktop(h: "Harness") -> tuple[str, int]:
+    """Desktop B acceptance on real kernel ABI: /dev/fb0 + /dev/input/event0.
+
+    The mode boots a pagh-owned disk carrying static ``pagh-desktop`` (``/mnt/pd``)
+    and ``pagh-desktop-demo``, starts ``rust /mnt/pd --e2e`` in the shell and
+    proves, with the QEMU framebuffer and serial trace:
+
+    * the fbdev backend opened ``/dev/fb0``, read both ioctl structs, mapped the
+      scanout and drew the desktop (selfcheck reads pixels back from the mapping);
+    * the evdev backend opened ``/dev/input/event0`` and decoded real keyboard and
+      relative-mouse events (F10, pointer motion, BTN_LEFT) from QEMU;
+    * after the desktop exits, the kernel console does not repaint the screen
+      (takeover is one-way by ABI) while the serial shell remains alive.
+    """
+    a = h.a
+    bins = _desktop_bins(a.skip_build)
+    disk = CACHE / "e2e_desktop_disk.img"
+    if not (a.reuse_desktop_disk
+            and _debugfs_stat(disk, "pd") is not None
+            and _debugfs_stat(disk, "pagh-desktop-demo") is not None):
+        _desktop_prepare_disk(h, disk, bins)
+    else:
+        log(f"desktop: reusing {rel(disk)}")
+
+    h.boot(need_keyboard=False, disk=disk, net=False)
+    assert h.guest is not None
+    guest = h.guest
+    kb = QemuShotKeyboard(h.monitor, a.key_delay)
+    ok = True
+    baseline = CACHE / "e2e_desktop_shell.png"
+    desktop = CACHE / "e2e_desktop.png"
+    menu = CACHE / "e2e_desktop_menu.png"
+    moved = CACHE / "e2e_desktop_pointer.png"
+    after_exit = CACHE / "e2e_desktop_after_exit.png"
+    after_cmd = CACHE / "e2e_desktop_after_cmd.png"
+    try:
+        kb.connect(timeout=min(a.boot_timeout, 180.0))
+        if not wait_for_shell(guest, kb, a, a.boot_timeout):
+            raise HarnessError(f"desktop: shell prompt never appeared; "
+                               f"serial tail:\n{tail(guest.serial())}")
+        kb.screenshot(baseline)
+        cmd = (f"rust /mnt/pd --e2e --exit-after-ms {a.run_ms} "
+               f"--selfcheck-ms {a.selfcheck_ms}")
+        log(f"type: {cmd}")
+        kb.text(cmd)
+        kb.key("ret")
+        marker = wait_for(guest, [r"pagh-desktop: fbdev selfcheck (PASS|FAIL)"],
+                          90.0, label="fbdev selfcheck")
+        text = guest.serial()
+        selfcheck = regex_first(r"pagh-desktop: fbdev selfcheck [^\r\n]*", text) or ""
+        ok &= h.check("fbdev backend opened /dev/fb0", "backend=fbdev" in text,
+                      regex_first(r"pagh-desktop: backend=fbdev [^\r\n]*", text) or "")
+        ok &= h.check("fbdev reported takeover", "takeover acquired" in text,
+                      regex_first(r"pagh-desktop: fbdev takeover[^\r\n]*", text) or "")
+        ok &= h.check("evdev backend opened /dev/input/event0", "input=evdev" in text,
+                      regex_first(r"pagh-desktop: input=evdev[^\r\n]*", text) or "")
+        ok &= h.check("embedded demo window committed", "embedded demo window" in text,
+                      regex_first(r"pagh-desktop: embedded demo window[^\r\n]*", text) or "")
+        ok &= h.check("fbdev selfcheck PASS (scanout pixels read back)",
+                      "fbdev selfcheck PASS" in selfcheck, selfcheck or marker or "not found")
+        time.sleep(0.4)
+        kb.screenshot(desktop)
+        changed = (baseline.is_file() and desktop.is_file()
+                   and baseline.read_bytes() != desktop.read_bytes())
+        ok &= h.check("QEMU framebuffer shows the desktop (differs from shell)",
+                      changed, f"{desktop.name} vs {baseline.name}")
+        ok &= h.check("desktop screenshot was captured", desktop.is_file(),
+                      str(rel(desktop)) if desktop.is_file() else "missing")
+
+        # Keyboard path: F10 is a compositor shortcut -> context menu must repaint.
+        kb.key("f10")
+        f10 = wait_for(guest, [r"evdev: key code=68 down"], 15.0, label="F10 trace")
+        ok &= h.check("evdev delivered F10 (KEY_F10=68)", f10 is not None,
+                      f10 or "no evdev F10 trace")
+        # Дисплей QEMU обновляет поверхность не в тот же миг, что гость пишет в
+        # VRAM: даём один refresh-интервал и повторяем дамп, если первый пришёл
+        # со старым кадром (на TCG это наблюдалось).
+        time.sleep(1.0)
+        kb.screenshot(menu)
+        if (menu.is_file() and desktop.is_file()
+                and menu.read_bytes() == desktop.read_bytes()):
+            time.sleep(1.5)
+            kb.screenshot(menu)
+        menu_changed = (menu.is_file() and desktop.is_file()
+                        and menu.read_bytes() != desktop.read_bytes())
+        ok &= h.check("F10 opened a menu and repainted the framebuffer",
+                      menu_changed, f"{menu.name} differs={menu_changed}")
+        kb.key("esc")
+        time.sleep(0.4)
+
+        # Pointer path: QMP relative motion + BTN_LEFT -> evdev REL/KEY.
+        if h.qmp is None:
+            h.qmp = QmpClient(h.qmp_path)
+            h.qmp.connect()
+        for _ in range(6):
+            h.qmp.rel(24, 12)
+            time.sleep(0.04)
+        rel_ok = wait_for(guest, [r"evdev: rel dx=\d+"], 15.0, label="evdev REL")
+        ok &= h.check("evdev decoded relative mouse motion", rel_ok is not None,
+                      regex_first(r"evdev: rel[^\r\n]*", guest.serial()) or "")
+        h.qmp.button("left", True)
+        time.sleep(0.15)
+        h.qmp.button("left", False)
+        btn = wait_for(guest, [r"evdev: button left (down|up)"], 15.0, label="evdev BTN_LEFT")
+        ok &= h.check("evdev delivered BTN_LEFT press/release", btn is not None,
+                      " / ".join(re.findall(r"evdev: button left \w+", guest.serial())) or "")
+        time.sleep(0.5)
+        kb.screenshot(moved)
+        pointer_changed = (moved.is_file() and desktop.is_file()
+                           and moved.read_bytes() != desktop.read_bytes())
+        ok &= h.check("pointer motion/click repainted the framebuffer",
+                      pointer_changed, f"{moved.name} differs={pointer_changed}")
+
+        # Exit + one-way takeover: shell keeps running on serial, but the kernel
+        # console must not repaint the screen over the last desktop frame.
+        exited = wait_for(guest, [r"pagh-desktop: exit-after-ms reached"],
+                          max(30.0, a.run_ms / 1000.0 + 30.0), label="desktop exit")
+        ok &= h.check("desktop exited via --exit-after-ms", exited is not None,
+                      exited or "no exit marker")
+        time.sleep(2.0)
+        kb.screenshot(after_exit)
+        kb.text("echo E2E_ALIVE_AFTER_DESKTOP")
+        kb.key("ret")
+        alive = wait_for(guest, [r"E2E_ALIVE_AFTER_DESKTOP"], 20.0, label="shell after desktop")
+        ok &= h.check("serial shell alive after desktop exit", alive is not None,
+                      alive or "no echo")
+        time.sleep(0.5)
+        kb.screenshot(after_cmd)
+        same = (after_exit.is_file() and after_cmd.is_file()
+                and after_exit.read_bytes() == after_cmd.read_bytes())
+        ok &= h.check("kernel console did not repaint after desktop exit (takeover)",
+                      same, "frames identical" if same else "console repainted")
+        text = guest.serial()
+        ok &= h.check("fbdev close reports one-way takeover",
+                      "takeover remains armed" in text,
+                      regex_first(r"pagh-desktop: fbdev closed[^\r\n]*", text) or "")
+        crashes = re.findall(r"PANIC|\[EXC [^\]]+\]|DOUBLE FREE", text)
+        ok &= h.check("no panic/exception in guest", not crashes,
+                      crashes[0] if crashes else "none")
+        h.metrics["desktop screenshots"] = ", ".join(
+            rel(p) for p in (baseline, desktop, menu, moved, after_exit, after_cmd)
+        )
+        return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
+    finally:
+        kb.close()
+
+
 MODES = {
     "selftest": mode_selftest,
     "local-mirror": mode_local_mirror,
@@ -2479,6 +2743,7 @@ MODES = {
     "usb": mode_usb,
     "rndis": mode_rndis,
     "scroll": mode_scroll,
+    "desktop": mode_desktop,
     "smoke": mode_smoke,
     "boot-check": mode_boot_check,
     "restore": mode_restore,
@@ -2610,6 +2875,21 @@ def build_parser() -> argparse.ArgumentParser:
                    help="console scroll acceptance: PS/2 wheel (QMP), PageUp/PageDown, "
                         "reset to the live bottom, and a pixel-diffing screenshot pair")
 
+    dp = sub.add_parser(
+        "desktop", parents=[common],
+        help="Desktop B acceptance: static pagh-desktop on /dev/fb0 + "
+             "/dev/input/event0, QEMU framebuffer screenshots, evdev keyboard/mouse, "
+             "console takeover after exit")
+    dp.add_argument("--skip-build", action="store_true",
+                    help="use existing static pagh-desktop binaries in "
+                         "rust-apps/pagh-desktop/target/x86_64-unknown-linux-musl/release")
+    dp.add_argument("--reuse-desktop-disk", action="store_true",
+                    help="reuse .cache/e2e_desktop_disk.img (already formatted/injected)")
+    dp.add_argument("--run-ms", type=int, default=20_000,
+                    help="desktop lifetime passed as --exit-after-ms (default 20000)")
+    dp.add_argument("--selfcheck-ms", type=int, default=3_000,
+                    help="delay of the in-guest fbdev selfcheck (default 3000)")
+
     sub.add_parser("usb", parents=[common],
                    help="USB-input acceptance: boot the staged image with an "
                         "emulated xHCI controller + USB keyboard + USB mouse, drive "
@@ -2664,6 +2944,14 @@ def main(argv: list[str] | None = None) -> int:
     # format path names the virtio-blk partition in the typed confirmation. An
     # operator-supplied --disk or the NVMe layout would change what the scenario
     # claims it proved, so refuse before the build instead of silently ignoring it.
+    if mode == "desktop" and args.disk:
+        print("[e2e] desktop: --disk is not supported: the mode prepares its own "
+              "pagh-owned ext2 disk (.cache/e2e_desktop_disk.img) because the kernel "
+              "only auto-mounts a volume carrying its WAL marker; pass "
+              "--reuse-desktop-disk to iterate on an already prepared image.",
+              file=sys.stderr, flush=True)
+        print("\nE2E RESULT: REFUSED (desktop mode owns its disk) (exit 2)", flush=True)
+        return EXIT_SETUP
     if mode == "usb" and (args.disk or getattr(args, "nvme", False)):
         print("[e2e] usb: --disk/--nvme are not supported by this mode: it writes its "
               "own deterministic MBR-partitioned 64 MiB disk (.cache/e2e_usb_disk.img) "

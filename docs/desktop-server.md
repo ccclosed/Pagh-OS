@@ -2,10 +2,10 @@
 
 Этот документ описывает вертикальный срез userspace-десктопа варианта B: отдельный
 процесс `pagh-desktop` владеет экраном, клиенты рисуют окна и общаются с ним по
-собственному протоколу **PDP/1**. Срез намеренно не зависит от kernel-ветки
-`feat/desktop-kernel`: вывод идёт в headless-backend (PNG), ввод приходит командами
-сервера/тестами, а `/dev/fb0` и `/dev/input/event0` подключаются позже как ещё один
-backend.
+собственному протоколу **PDP/1**. Два backend'а выбираются при старте: headless
+(PNG для тестов/скриншотов) и **fbdev** (`/dev/fb0` + `/dev/input/event0` из
+kernel-ABI 2.24.0). Headless-путь полностью автономен и не требует QEMU; реальный
+backend проверяется отдельным QEMU-сценарием `tools/e2e.py desktop`.
 
 ## Зачем отдельный протокол
 
@@ -47,8 +47,8 @@ Wayland в Pagh-OS пока отсутствует (нет `wl_display`, xdg-she
                                         │            │                     │
                                         │     ┌──────┴──────┐              │
                                         │     ▼             ▼              │
-                                        │ HeadlessBackend  fb0 backend     │
-                                        │ (PNG/PPM)        (позже)         │
+                                        │ HeadlessBackend  FbdevBackend    │
+                                        │ (PNG)            (mmap scanout)  │
                                         └──────────────────────────────────┘
 ```
 
@@ -83,6 +83,41 @@ Files/Paint, Change Wallpaper, Move/Minimize/Maximize/Close для окна). М
 
 Оформление — в духе KDE Breeze Dark: тёмные обои с бирюзовым свечением, скруглённые
 окна, мягкие программные тени, акцентная линия фокуса, полупрозрачная подсветка hover.
+
+## Реальный backend: fbdev + evdev
+
+`OutputBackend` выбирается в `Server::bind`:
+
+* `--backend auto` — пробует `/dev/fb0`; на хосте/без Limine-framebuffer молча
+  откатывается в headless;
+* `--backend fbdev` — обязателен `/dev/fb0` (иначе ошибка, а не тихий fallback);
+* `--backend headless` — как раньше, PNG-вывод.
+
+`FbdevBackend` (src/fbdev.rs) делает ровно ABI из `docs/desktop-b.md`:
+
+1. `open("/dev/fb0", O_RDWR)` — первый open включает takeover (консоль перестаёт
+   flush'ить кадр);
+2. `FBIOGET_VSCREENINFO` (160 байт) и `FBIOGET_FSCREENINFO` (80 байт) — геометрия,
+   bpp, маски red/green/blue, stride и smem_len;
+3. `mmap(NULL, smem_len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)` — scanout;
+4. `present()` пишет только damage-прямоугольники: пиксель упаковывается по маскам
+   `var` (bpp 16/24/32), строка сдвигается на `fix.line_length`.
+
+`EvdevInput` (src/evdev.rs) открывает `/dev/input/event0` неблокирующе, читает
+24-байтные `struct input_event`, собирает `REL_X`/`REL_Y` до `SYN_REPORT`, превращает
+`REL_WHEEL` в axis, `BTN_LEFT/MIDDLE/RIGHT` — в кнопки, отслеживает модификаторы
+(Shift/Ctrl/Alt/Super) и отбрасывает события, накопившиеся до открытия (строка
+запуска из shell). Сервер опрашивает fd в своём цикле (без futex-ожиданий), поэтому
+ввод обрабатывается с задержкой ~2 мс.
+
+Серверный цикл больше не блокируется на `mpsc::recv_timeout` (futex-таймаут в
+compat-слое просыпался с задержкой в секунды): он неблокирующе дренирует канал,
+опрашивает evdev и спит 2 мс. Это то, что делает `F10`/мышь отзывчивыми под QEMU.
+
+**Takeover односторонний** (`docs/desktop-b.md` §3.1): после открытия `/dev/fb0`
+kernel-консоль не перерисовывает экран, serial-логи/shell продолжают работать, но
+закрытие fd экран не возвращает — в QEMU e2e это проверяется как «после выхода
+desktop новый вывод shell не меняет кадр», а не как возврат консоли.
 
 ## Damage/repaint
 
@@ -120,8 +155,8 @@ value }` (24 байта) → EV_KEY/EV_REL/EV_SYN → те же `Compositor::poi
 
 | Компонент | Здесь | В kernel-ветке (`feat/desktop-kernel`) |
 |---|---|---|
-| экран | headless PNG | `/dev/fb0` mmap + `FBIOGET_VSCREENINFO`/`FBIOGET_FSCREENINFO` |
-| ввод | команды/тесты | `/dev/input/event0` (evdev) |
+| экран | headless PNG; **fbdev уже реализован** | `/dev/fb0` mmap + `FBIOGET_VSCREENINFO`/`FBIOGET_FSCREENINFO` |
+| ввод | команды/тесты; **evdev уже реализован** | `/dev/input/event0` (evdev) |
 | общие буферы | frame upload по сокету | `MAP_SHARED` memfd + будущий `ShmSurface` |
 | консоль | нет | takeover флага консоли/fb, serial остаётся |
 
@@ -132,10 +167,18 @@ value }` (24 байта) → EV_KEY/EV_REL/EV_SYN → те же `Compositor::poi
 
 ## Проверено
 
-* `cargo test` в `rust-apps/pagh-desktop`: **69 unit + 5 integration** (e2e по реальному
-  AF_UNIX-сокету: hello/create/configure/commit/input/key/screenshot/close; два клиента
-  и маршрутизация фокуса; повреждённый клиент получает `error` и не роняет сервер;
-  `max_frames`/устаревший сокет; скриншот-сценарий с проверкой PNG и уникальности).
+* `cargo test` в `rust-apps/pagh-desktop`: **89 unit + 5 integration** (e2e по
+  реальному AF_UNIX-сокету: hello/create/configure/commit/input/key/screenshot/close;
+  два клиента и маршрутизация фокуса; повреждённый клиент получает `error` и не роняет
+  сервер; `max_frames`/устаревший сокет; скриншот-сценарий с проверкой PNG и
+  уникальности; host-тесты fbdev-упаковки/stride/damage и evdev-декодера).
+* `cargo clippy --all-targets` — без предупреждений; `cargo fmt --check` — чисто.
+* QEMU e2e `python3 tools/e2e.py desktop`: готовит pagh-ext2 диск (первая загрузка
+  kernel-format + инъекция статических бинарников через debugfs), запускает
+  `rust /mnt/pd --e2e`, проверяет serial/скриншоты: fbdev ioctl+mmap, takeover,
+  selfcheck пикселей scanout, F10-меню, REL/BTN_LEFT через QMP, выход и отсутствие
+  перерисовки консоли. Скриншоты: `screenshots/11-fbdev-qemu.png` (desktop на
+  реальном scanout) и `screenshots/12-fbdev-context-menu.png` (меню).
 * `cargo fmt --all -- --check` — чисто.
 * `./build-static.sh`: `x86_64-unknown-linux-musl`, оба бинарника `static-pie`,
   ~585 KiB сервер и ~497 KiB демо-клиент.
@@ -163,12 +206,15 @@ value }` (24 байта) → EV_KEY/EV_REL/EV_SYN → те же `Compositor::poi
 
 ## Остаток
 
-1. `FbdevBackend`: mmap `/dev/fb0`, ioctl, damage-present; ждёт kernel-ABI.
-2. `EvdevInput`: `/dev/input/event0` + EV_KEY/EV_REL/EV_SYN, absolute mouse, hotplug.
-3. `ShmSurface` (`SCM_RIGHTS`, memfd) и частичный commit; frame upload остаётся fallback.
-4. Реестр приложений и `.desktop`-подобные записи для `launch` (сейчас — явные
+1. `ShmSurface` (`SCM_RIGHTS`, memfd) и частичный commit; frame upload остаётся fallback.
+2. Реестр приложений и `.desktop`-подобные записи для `launch` (сейчас — явные
    `launch_targets`/`--spawn-demo`); управление дочерними процессами и перезапуск.
-5. Клиентские popup/меню, курсоры, DnD, outputs/scale/rotation, анимации.
-6. Kernel-console/VT bridge: общий текстовый surface, чтобы shell стал окном Terminal.
-7. Ввод с реального железа (PS/2/USB HID через event0) и проверка в QEMU с
-   `desktop-kernel`; headless-срез уже даёт воспроизводимый regression-набор.
+3. Клиентские popup/меню, курсоры, DnD, outputs/scale/rotation, анимации.
+4. Kernel-console/VT bridge: общий текстовый surface, чтобы shell стал окном Terminal.
+5. Ввод с реального железа уже идёт через `/dev/input/event0` (PS/2/USB HID), но
+   EV_ABS/touch, hotplug и автоповтор в kernel-ABI отсутствуют; проверено в QEMU,
+   реальное железо — за оператором.
+6. Возврат kernel-консоли после выхода desktop невозможен по текущему ABI
+   (takeover односторонний); нужен отдельный kernel-примитив, если это требование
+   появится.
+7. Курсор в fbdev рисуется программно в кадре; аппаратного курсора нет.
