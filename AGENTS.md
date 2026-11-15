@@ -333,7 +333,14 @@ the operational checklist in `RELEASING.md`.
   mouse through menu and shell; PS/2 unaffected), `selftest` and the
   `xhci_port` host properties; real hardware was not available, so this needs a
   user test — the serial lines to watch are named in
-  `src/drivers/README.md`. Version
+  `src/drivers/README.md`. A third field round then showed input dying after a
+  minute of use: the HID transfer ring holds 63 usable TRBs and the wrap-around
+  Link TRB was written with the *next* producer cycle instead of the current one
+  (and without `TRB_TOGGLE`), so the controller never followed the link and the
+  endpoint went silent at the first wrap — the mouse after ~63 reports, the
+  keyboard shortly after. The Link TRB now carries the current cycle and the
+  toggle bit, and `tools/e2e.py usb` types across the wrap (241 reports) as the
+  regression. Version
   2.22.7 is the `dev` PATCH bump; `main` stays 2.22.6.
   **2.22.6** = the round-3 audit's four high x86 findings are closed
   (F-r3-arch-1, F-r3-life-1/2, F-r3-vfs-1; reports in the external

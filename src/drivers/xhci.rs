@@ -248,6 +248,9 @@ const CC_SUCCESS: u8 = 1;
 const CC_SHORT_PACKET: u8 = 13;
 
 const TRB_CYCLE: u32 = 1 << 0;
+/// Link TRB Toggle Cycle: the controller toggles its consumer cycle bit when it
+/// follows a Link TRB back to the start of the ring.
+const TRB_TOGGLE: u32 = 1 << 1;
 const TRB_IOC: u32 = 1 << 5;
 const TRB_IDT: u32 = 1 << 6;
 const TRB_DIR_IN: u32 = 1 << 16;
@@ -310,8 +313,18 @@ impl Ring {
         self.write(index, Trb::new(dw0, dw1, dw2, dw3 | self.cycle));
         self.enqueue += 1;
         if self.enqueue >= RING_TRBS - 1 {
-            // The link TRB carries the *next* cycle state: the controller reads
-            // the ring again with the toggled bit after following it.
+            // WRAP-AROUND. The Link TRB belongs to the *current* producer cycle
+            // (that is how the controller recognises it as ready); `TRB_TOGGLE`
+            // tells the controller to flip its consumer cycle bit when it follows
+            // the link, and only then does the producer flip its own bit for the
+            // TRBs written at the start of the ring.
+            //
+            // Writing `next_cycle` into the Link TRB itself (the old code) made
+            // the controller skip it — the ring is scanned for the current cycle
+            // bit — so after RING_TRBS-1 transfers the endpoint simply stopped:
+            // a HID device that works for a minute (or a few dozen keystrokes)
+            // and then goes silent. `TRB_IOC` is not a Link-TRB field; the toggle
+            // bit is what the wrap needs.
             let next_cycle = if self.cycle == TRB_CYCLE {
                 0
             } else {
@@ -323,7 +336,7 @@ impl Ring {
                     self.base_phys() as u32,
                     (self.base_phys() >> 32) as u32,
                     0,
-                    ((TRB_LINK as u32) << 10) | TRB_IOC | next_cycle,
+                    ((TRB_LINK as u32) << 10) | TRB_TOGGLE | self.cycle,
                 ),
             );
             self.enqueue = 0;
