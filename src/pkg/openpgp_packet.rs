@@ -1,29 +1,28 @@
-//! Pure OpenPGP *packet* layer: ASCII armor, packet framing, public keys,
-//! signatures and the `Release.gpg`/`InRelease` clearsign framing (issue #32).
+//! Чистый слой OpenPGP *пакетов*: ASCII armor, framing пакетов, публичные ключи,
+//! подписи и clearsign-framing `Release.gpg`/`InRelease` (issue #32).
 //!
-//! `core` + `alloc` only, no globals, no hardware — the kernel compiles this
-//! source for the bare-metal target and `host-tests` `#[path]`-includes it, so
-//! the properties P51/P52 run against the same bytes the kernel will parse.
+//! Только `core` + `alloc`, без глобалов и железа — ядро компилирует этот исходник
+//! для bare-metal, а `host-tests` `#[path]`-включает его, так что свойства P51/P52
+//! идут по тем же байтам, которые будет разбирать ядро.
 //!
-//! Everything here is **panic-free and bounded**: every read is bounds-checked,
-//! every length is capped ([`MAX_ARMOR_BYTES`], [`MAX_PACKETS`],
-//! [`MAX_PACKET_BODY`], [`MAX_SIGNATURES`], [`MAX_KEY_BLOCK_BYTES`]), and
-//! malformed input produces an [`PacketError`] rather than a panic. That matters
-//! twice over: `panic = "abort"` kills the machine, and this parser eats bytes
-//! served by a mirror we do not trust yet.
+//! Всё здесь **panic-free и bounded**: каждое чтение проверено на границы, каждая
+//! длина ограничена ([`MAX_ARMOR_BYTES`], [`MAX_PACKETS`], [`MAX_PACKET_BODY`],
+//! [`MAX_SIGNATURES`], [`MAX_KEY_BLOCK_BYTES`]), и некорректный ввод даёт
+//! [`PacketError`], а не панику. Это важно дважды: `panic = "abort"` убивает машину,
+//! а парсер ест байты, отданные зеркалом, которому мы ещё не доверяем.
 //!
-//! Only the packet tags the verifier needs are interpreted (6 public key, 14
-//! public subkey, 13 user ID, 2 signature); every other tag is skipped by
-//! length. Partial body lengths and indeterminate lengths are **refused** rather
-//! than reassembled — real Debian signatures and our pinned keyring blocks use
-//! definite lengths only, and refusing keeps the parser free of an incremental
-//! buffering path that would need its own memory bound.
+//! Интерпретируются только теги пакетов, нужные верификатору (6 public key, 14
+//! public subkey, 13 user ID, 2 signature); все прочие теги пропускаются по длине.
+//! Partial body lengths и indeterminate lengths **отвергаются**, а не собираются —
+//! реальные подписи Debian и наши закреплённые keyring-блоки используют только
+//! definite lengths, и отказ держит парсер без пути инкрементального буферизации,
+//! которому нужен собственный лимит памяти.
 //!
-//! Parsing is deliberately tolerant of *unsupported* algorithms (they are
-//! recorded and refused by the policy layer) but strict about *framing*: a
-//! truncated packet, a v5/v6 key, or a signature packet with trailing bytes is
-//! an error, never a silent skip — the pinned keyring and the mirror's signature
-//! blob are both attacker-adjacent inputs.
+//! Разбор намеренно терпим к *неподдерживаемым* алгоритмам (они записываются и
+//! отвергаются слоем политики), но строг к *framing*: усечённый пакет, v5/v6-ключ
+//! или signature-пакет с хвостовыми байтами — ошибка, никогда не молчаливый
+//! пропуск: и закреплённый keyring, и signature-blob зеркала — входы, смежные с
+//! атакующим.
 
 #![allow(dead_code)]
 

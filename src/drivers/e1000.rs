@@ -1,37 +1,35 @@
-//! Intel 8254x-family (e1000) NIC driver — QEMU `-device e1000`.
+//! Драйвер NIC Intel 8254x (e1000) — QEMU `-device e1000`.
 //!
-//! This is the kernel's own NIC driver: it replaces `virtio-net` entirely and
-//! needs no external crate. It works on real Intel PRO/1000 hardware, QEMU,
-//! VirtualBox and VMware. The device is driven in POLLING mode from the network
-//! thread (`net::poll`) — no IRQ handler is registered, which keeps the whole
-//! stack out of interrupt context (the locking discipline the rest of the
-//! networking code relies on: every entry point runs in thread context).
+//! Это собственный драйвер NIC ядра: полностью заменяет `virtio-net` и не требует
+//! внешнего крейта. Работает на реальном Intel PRO/1000, QEMU, VirtualBox и VMware.
+//! Устройство ведётся в POLLING-режиме из сетевого потока (`net::poll`) — IRQ-
+//! обработчик не регистрируется, что держит весь стек вне контекста прерываний
+//! (дисциплина локинга, на которую опирается остальной сетевой код: каждая точка
+//! входа выполняется в thread-контексте).
 //!
-//! ## Hardware model
+//! ## Модель железа
 //!
-//! * BAR 0 (MMIO, 128 KiB) holds the register file. Every access is a volatile
-//!   u32 read/write at a fixed offset.
-//! * The MAC address lives in the attached EEPROM; it is read word-by-word
-//!   through the EERD register.
-//! * TX and RX are descriptor rings in physically contiguous memory:
-//!   * legacy TX descriptor: 16 bytes {addr, len, cso, cmd, status, css, special}
-//!   * legacy RX descriptor: same 16-byte shape {addr, len, checksum, status,
+//! * BAR 0 (MMIO, 128 KiB) держит файл регистров. Каждый доступ — volatile u32
+//!   чтение/запись по фиксированному смещению.
+//! * MAC-адрес живёт в подключённой EEPROM; читается пословно через регистр EERD.
+//! * TX и RX — descriptor ring'и в физически непрерывной памяти:
+//!   * legacy TX descriptor: 16 байт {addr, len, cso, cmd, status, css, special}
+//!   * legacy RX descriptor: та же 16-байтовая форма {addr, len, checksum, status,
 //!     errors, special}
 //!
-//!   The NIC DMAs frames to/from per-descriptor data buffers that this driver
-//!   also allocates from physically contiguous PMM frames.
-//! * Polling RX: a received descriptor has STATUS.DD set; after consuming we
-//!   clear DD and return the buffer by advancing RDT.
-//! * Polling TX: CMD.RS asks the NIC to write STATUS.DD when the frame left;
-//!   a descriptor may be reused only once its DD bit is observed.
+//!   NIC DMA'ит кадры в/из per-descriptor data-буферов, которые драйвер тоже
+//!   аллоцирует из физически непрерывных кадров PMM.
+//! * Polling RX: у принятого дескриптора выставлен STATUS.DD; после потребления мы
+//!   сбрасываем DD и возвращаем буфер, продвигая RDT.
+//! * Polling TX: CMD.RS просит NIC выставить STATUS.DD, когда кадр ушёл;
+//!   дескриптор можно переиспользовать, только увидев его DD.
 //!
-//! ## Memory discipline
+//! ## Дисциплина памяти
 //!
-//! All DMA memory comes from `pmm::alloc_frames_contiguous` and is accessed
-//! through the HHDM window (`vmm::phys_to_virt`). Descriptor rings and both
-//! buffer pools are allocated once at attach time and never freed while the
-//! kernel runs (the device owns them for its lifetime). No heap allocation
-//! happens on the send/receive paths.
+//! Вся DMA-память берётся из `pmm::alloc_frames_contiguous` и доступна через окно
+//! HHDM (`vmm::phys_to_virt`). Descriptor ring'и и оба пула буферов аллоцируются
+//! один раз при attach и никогда не освобождаются, пока работает ядро (устройство
+//! владеет ими всю жизнь). На путях send/receive heap-аллокаций нет.
 
 use crate::drivers::pci::{PciDevice, VENDOR_INTEL};
 use crate::sync::spinlock::Spinlock;

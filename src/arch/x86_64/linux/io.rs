@@ -1,74 +1,73 @@
-//! File I/O syscall planning and effectful handlers.
+//! Планирование файловых I/O syscall'ов и эффектные обработчики.
 //!
-//! This task (2.1) implements only the **pure** planning logic for `read` and
-//! `lseek`: allocation-free, `core`-only functions that compute outcomes without
-//! touching the VFS, the per-process `FdTable`, hardware, or global mutable state
-//! (R11.6). The effectful handlers that wire these plans to real descriptors land
-//! in task 12.1.
+//! Здесь только **чистая** логика планирования `read` и `lseek`: функции без
+//! аллокаций, только `core`, вычисляющие результат без обращения к VFS,
+//! per-process `FdTable`, железу или глобальному изменяемому состоянию (R11.6).
+//! Эффектные обработчики, связывающие эти планы с реальными дескрипторами,
+//! живут в `io_sys`.
 //!
-//! The `Errno` type is shared from the sibling `errno` module via `super::errno` so
-//! the same source compiles both in the kernel
-//! (`crate::arch::x86_64::linux::errno`) and when included into the `host-tests`
-//! crate as a crate-root sibling module (R11.6).
+//! Тип `Errno` берётся из соседнего модуля `errno` через `super::errno`, чтобы
+//! один и тот же исходник компилировался и в ядре
+//! (`crate::arch::x86_64::linux::errno`), и будучи включённым в крейт
+//! `host-tests` как соседний модуль корня (R11.6).
 #![allow(dead_code)]
 
 use super::errno::Errno;
 
-/// `lseek` whence: set the offset to `delta` relative to the start of the file.
+/// `whence` для `lseek`: поставить смещение `delta` от начала файла.
 pub const SEEK_SET: u32 = 0;
-/// `lseek` whence: set the offset to `delta` relative to the current offset.
+/// `whence` для `lseek`: поставить смещение `delta` от текущего смещения.
 pub const SEEK_CUR: u32 = 1;
-/// `lseek` whence: set the offset to `delta` relative to the end of the file.
+/// `whence` для `lseek`: поставить смещение `delta` от конца файла.
 pub const SEEK_END: u32 = 2;
 
-/// First path components that keep the VFS root as their base.
+/// Первые компоненты пути, которые сохраняют корень VFS своей базой.
 ///
-/// `/proc` (issue #11) is the reason this predicate exists as a named, testable
-/// unit: `resolve_path` must NOT rewrite `/proc/...` into `/mnt/proc/...`, or the
-/// synthetic tree would be unreachable for Linux programs. The comparison is by
-/// **whole component** — a path like `/process` is a guest path under `/mnt`, not
-/// a `/proc` path (`docs/procfs.md` §1.3).
+/// `/proc` — причина, по которой этот предикат существует как именованная,
+/// тестируемая единица: `resolve_path` НЕ должен переписывать `/proc/...` в
+/// `/mnt/proc/...`, иначе синтетическое дерево станет недостижимо для
+/// Linux-программ. Сравнение идёт по **целым компонентам**: путь `/process` —
+/// гостевой путь под `/mnt`, а не путь `/proc` (`docs/procfs.md` §1.3).
 pub const ROOT_KEEPING_COMPONENTS: [&str; 5] = ["mnt", "dev", "proc", "sys", "tmp"];
 
-/// Does `abs` (an absolute, normalized guest path) resolve against the VFS root
-/// instead of being remapped under `/mnt`?
+/// Разрешается ли `abs` (абсолютный нормализованный гостевой путь) от корня
+/// VFS, а не переносится под `/mnt`?
 pub fn guest_path_keeps_root(abs: &str) -> bool {
     let first = abs.trim_start_matches('/').split('/').next().unwrap_or("");
     ROOT_KEEPING_COMPONENTS.contains(&first)
 }
 
-/// Plan a `read` of `count` bytes from offset `off` of a file of length `size`.
+/// Спланировать `read` `count` байт со смещения `off` файла длины `size`.
 ///
-/// Returns `(copied, new_off)` where the byte count is clamped to what remains
-/// before EOF and the descriptor offset is advanced by exactly that many bytes
-/// (R2.3, Property 5):
+/// Возвращает `(copied, new_off)`: число байт урезано до остатка до EOF, а
+/// смещение дескриптора сдвигается ровно на это число (R2.3, Property 5):
 ///
 /// * `copied = min(count, size.saturating_sub(off))`
 /// * `new_off = off + copied`
 ///
-/// `saturating_sub` makes an offset at or beyond EOF yield `copied == 0` (and thus
-/// `new_off == off`) rather than underflowing. `off + copied` cannot overflow
-/// because `copied <= size - off` whenever `off <= size`, and `copied == 0`
-/// otherwise.
+/// `saturating_sub` делает смещение на EOF или за ним дающим `copied == 0` (и
+/// значит `new_off == off`) вместо underflow. `off + copied` переполниться не
+/// может, потому что при `off <= size` выполнено `copied <= size - off`, иначе
+/// `copied == 0`.
 pub fn plan_read(size: u64, off: u64, count: u64) -> (u64, u64) {
     let copied = core::cmp::min(count, size.saturating_sub(off));
     let new_off = off + copied;
     (copied, new_off)
 }
 
-/// Plan an `lseek` to a new absolute offset.
+/// Спланировать `lseek` к новому абсолютному смещению.
 ///
-/// `whence` selects the base the signed `delta` is applied to:
+/// `whence` выбирает базу, к которой применяется знаковый `delta`:
 ///
-/// * [`SEEK_SET`] → base `0`
-/// * [`SEEK_CUR`] → base `cur` (the descriptor's current offset)
-/// * [`SEEK_END`] → base `size` (the file length)
+/// * [`SEEK_SET`] → база `0`
+/// * [`SEEK_CUR`] → база `cur` (текущее смещение дескриптора)
+/// * [`SEEK_END`] → база `size` (длина файла)
 ///
-/// The absolute offset is computed in `i128` to avoid overflow at the `u64`
-/// boundary, then validated: a non-negative result that fits in a `u64` is returned
-/// as `Ok`; a negative result, a result exceeding `u64::MAX`, or an unrecognized
-/// `whence` yields `Err(Errno::EINVAL)`, leaving the caller's offset unchanged
-/// (R2.7, R2.15, Property 6).
+/// Абсолютное смещение считается в `i128`, чтобы не переполниться на границе
+/// `u64`, затем проверяется: неотрицательный результат, влезающий в `u64`,
+/// возвращается как `Ok`; отрицательный результат, результат за `u64::MAX` или
+/// неизвестный `whence` дают `Err(Errno::EINVAL)`, оставляя смещение вызывающего
+/// неизменным (R2.7, R2.15, Property 6).
 pub fn plan_lseek(whence: u32, cur: u64, size: u64, delta: i64) -> Result<u64, Errno> {
     let base: u64 = match whence {
         SEEK_SET => 0,

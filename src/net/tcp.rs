@@ -1,31 +1,32 @@
-//! Own TCP implementation (RFC 793 + modern practice subset).
+//! Своя TCP-реализация (RFC 793 + подмножество современной практики).
 //!
-//! What is implemented (honest scope):
-//!   * Full connection state machine: CLOSED/LISTEN/SYN-SENT/SYN-RCVD/
+//! Что реализовано (честный охват):
+//!   * Полный автомат соединения: CLOSED/LISTEN/SYN-SENT/SYN-RCVD/
 //!     ESTABLISHED/FIN-WAIT-1/FIN-WAIT-2/CLOSE-WAIT/LAST-ACK/CLOSING/TIME-WAIT.
-//!   * Active open (`connect`) and passive open (`listen`, multiple concurrent
-//!     children per listener).
-//!   * Sliding-window flow control WITH window scaling (RFC 7323), MSS
-//!     negotiation, immediate ACKs (no delayed-ACK).
-//!   * Retransmission with Jacobson/Karels RTO estimation, Karn's algorithm,
-//!     exponential backoff, persist-style zero-window probing, and a bounded
-//!     retry budget per phase (connect give-up => refused).
+//!   * Активное открытие (`connect`) и пассивное (`listen`, несколько
+//!     одновременных детей на листенер).
+//!   * Sliding-window flow control С window scaling (RFC 7323), согласование MSS,
+//!     немедленные ACK (без delayed-ACK).
+//!   * Ретрансмиссия с оценкой RTO Jacobson/Karels, алгоритм Karn,
+//!     экспоненциальный backoff, persist-style зондирование нулевого окна и
+//!     ограниченный бюджет повторов на фазу (сдача connect => refused).
 //!   * Congestion control: slow start + congestion avoidance (Reno), fast
-//!     retransmit on three duplicate ACKs. No SACK yet (documented gap; Reno
-//!     recovery remains correct without it, just less efficient under loss).
-//!   * Out-of-order receive queue with duplicate-ACK generation.
-//!   * Graceful close both directions; RST handling/generation; TIME-WAIT with
-//!     a shortened (2 s) 2*MSL appropriate for a hobby kernel.
+//!     retransmit по трём дублирующим ACK. SACK пока нет (задокументированный
+//!     пробел; Reno-recovery остаётся корректным и без него, просто менее
+//!     эффективен при потерях).
+//!   * Очередь приёма вне порядка с генерацией duplicate-ACK.
+//!   * Graceful close в обе стороны; обработка/генерация RST; TIME-WAIT с
+//!     сокращённым (2 с) 2*MSL, уместным для hobby kernel.
 //!
-//! Deliberate simplifications (documented, safe over sane paths):
-//!   * Segments starting BEFORE rcv_nxt are treated as pure duplicates and
-//!     answered with a fresh ACK (no partial-overlap coalescing).
-//!   * No SACK / timestamps options.
-//!   * The urgent pointer is parsed and ignored.
+//! Осознанные упрощения (задокументированы, безопасны на разумных путях):
+//!   * Сегменты, начинающиеся ДО rcv_nxt, трактуются как чистые дубликаты и
+//!     отвечаются свежим ACK (без частичного overlap coalescing).
+//!   * Нет опций SACK / timestamps.
+//!   * Urgent pointer парсится и игнорируется.
 //!
-//! Every entry point runs under the stack lock from thread context (net poll
-//! thread or syscall threads calling the `net::` primitives), so no internal
-//! locking is needed here.
+//! Каждая точка входа выполняется под локом стека из thread-контекста (поток
+//! опроса сети или потоки сисколлов, зовущие примитивы `net::`), так что
+//! внутренний локинг здесь не нужен.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;

@@ -1,47 +1,47 @@
-//! Boot-time Linux-compatibility self-test harness (cargo feature `lx_selftest`).
+//! Boot-time harness self-test Linux-совместимости (cargo feature `lx_selftest`).
 //!
-//! This module is a single consolidated on-target smoke/integration harness for the
-//! Linux binary-compatibility layer. It is gated behind the `lx_selftest` cargo
-//! feature so the normal boot/shell is byte-for-byte unchanged when the feature is
-//! off: `src/lib.rs` only declares `mod selftest_lx;` under the feature, and
-//! `boot.rs` only calls [`run`] under `cfg!(feature = "lx_selftest")`.
+//! Модуль — единый консолидированный on-target smoke/integration harness для слоя
+//! бинарной совместимости Linux. Он закрыт cargo-фичей `lx_selftest`, так что
+//! обычная загрузка/shell байт-в-байт не меняются при выключенной фиче: `src/lib.rs`
+//! объявляет `mod selftest_lx;` только под фичей, а `boot.rs` зовёт [`run`] только
+//! под `cfg!(feature = "lx_selftest")`.
 //!
-//! It consolidates the on-target tasks from the spec's Testing Strategy
-//! (integration/smoke list):
+//! Он консолидирует on-target задачи из Testing Strategy спецификации
+//! (integration/smoke-список):
 //!   * 13.4 end-to-end load + run + exit isolation + load-failure-no-enqueue
-//!   * 12.2 `open`/`openat` of an absent path -> `-ENOENT`
+//!   * 12.2 `open`/`openat` отсутствующего пути -> `-ENOENT`
 //!   * 12.6 `arch_prctl(ARCH_SET_FS)` / `set_tid_address` / `uname`
-//!   * 12.8 register preservation across a syscall (R1.7)
-//!   * 12.4 OOM/over-limit rollback for `brk`/`mmap` (state unchanged)
-//!   * 14.2 `fetch_deb` returns `NoNetwork` when no interface address is configured
-//!   * 14.4 ext2 `data.tar` install round trip (read back byte-for-byte)
+//!   * 12.8 сохранение регистров через syscall (R1.7)
+//!   * 12.4 OOM/over-limit откат для `brk`/`mmap` (состояние неизменно)
+//!   * 14.2 `fetch_deb` возвращает `NoNetwork`, когда адрес интерфейса не настроен
+//!   * 14.4 round trip установки ext2 `data.tar` (чтение обратно байт-в-байт)
 //!
-//! Each check prints exactly one line `LXSELFTEST <name> PASS` or
-//! `LXSELFTEST <name> FAIL <detail>` through the kernel's existing `info!`/`error!`
-//! serial path. Every check is defensive: a failing step prints a `FAIL` line and
-//! returns rather than panicking (the kernel is `panic = "abort"`, so a panic would
-//! triple-fault the harness), and one failing check never prevents the others from
-//! running.
+//! Каждая проверка печатает ровно одну строку `LXSELFTEST <name> PASS` или
+//! `LXSELFTEST <name> FAIL <detail>` через существующий serial-путь `info!`/`error!`
+//! ядра. Каждая проверка защитна: упавший шаг печатает строку `FAIL` и возвращается,
+//! а не паникует (ядро собрано с `panic = "abort"`, так что паника сделала бы
+//! triple-fault harness'у), и одна упавшая проверка никогда не мешает остальным.
 //!
-//! ## When this runs
+//! ## Когда это работает
 //!
-//! [`run`] is invoked from `boot::kernel_main` *after* the ext2 mount and networking
-//! init but *before* interrupts are enabled — the same window in which the existing
-//! `spawn_test_user_process` runs. This ordering matters:
-//!   * a `Compat_Process` can be enqueued exactly like the native test process, and
-//!   * DHCP has not yet run (the net thread services it only after interrupts are
-//!     enabled), so no interface address is configured and the `fetch_no_network`
-//!     check observes the `NoNetwork` preflight path (R8.7).
+//! [`run`] вызывается из `boot::kernel_main` *после* монтирования ext2 и init сети,
+//! но *до* включения прерываний — в том же окне, где работает существующий
+//! `spawn_test_user_process`. Этот порядок важен:
+//!   * `Compat_Process` можно поставить в очередь ровно как нативный тестовый
+//!     процесс, и
+//!   * DHCP ещё не прошёл (сетевой поток обслуживает его только после включения
+//!     прерываний), так что адрес интерфейса не настроен и проверка
+//!     `fetch_no_network` наблюдает preflight-путь `NoNetwork` (R8.7).
 //!
-//! ## Direct-handler checks
+//! ## Проверки прямых обработчиков
 //!
-//! Several checks invoke the effectful handlers directly in a kernel context. They
-//! need a per-process [`CompatState`] registered for the running pid (the boot/idle
-//! pid `0`) and, for the pointer-taking handlers, a scratch page mapped at a
-//! user-half virtual address so the single `check_user_ptr` choke point accepts it.
-//! [`with_synth_compat`] and [`map_scratch`]/[`unmap_scratch`] provide these and tear
-//! them down afterwards, so the harness leaves no persistent compat state on the idle
-//! task.
+//! Несколько проверок вызывают эффектные обработчики напрямую в контексте ядра.
+//! Им нужен per-process [`CompatState`], зарегистрированный для работающего pid
+//! (boot/idle pid `0`), а для берущих указатели обработчиков — scratch-страница,
+//! замапленная на user-half виртуальный адрес, чтобы единственная горловина
+//! `check_user_ptr` её приняла. [`with_synth_compat`] и
+//! [`map_scratch`]/[`unmap_scratch`] дают это и сносят за собой, так что harness не
+//! оставляет постоянного compat-состояния на idle-задаче.
 
 use alloc::sync::Arc;
 use alloc::vec;

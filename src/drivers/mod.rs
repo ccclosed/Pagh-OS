@@ -1,5 +1,5 @@
-// drivers/mod.rs — Device Manager and driver traits
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// drivers/mod.rs — Device Manager и трейты драйверов
+// 64-битное ядро ОС x86_64 на Rust (#![no_std])
 
 pub mod cursor;
 pub mod e1000;
@@ -28,13 +28,13 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-/// A text console sink (serial, framebuffer, ...). Implementations must be
-/// safe to share across threads/IRQ context (interior-mutability behind a lock).
+/// Приёмник текстовой консоли (serial, framebuffer, ...). Реализации должны
+/// быть безопасны при совместном использовании потоками/IRQ-контекстом (внутренняя изменяемость под локом).
 pub trait Console: Send + Sync {
     fn write_str(&self, s: &str);
 }
 
-/// Trait for character-device drivers (keyboard, serial, etc.).
+/// Трейт драйверов символьных устройств (клавиатура, serial и т.п.).
 pub trait CharacterDevice: Send + Sync {
     fn name(&self) -> &str;
     fn read_char(&self) -> Option<u8>;

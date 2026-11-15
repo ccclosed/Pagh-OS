@@ -1,49 +1,49 @@
-//! Pure time conversions for the Linux compatibility layer
-//! (Feature: linux-binary-compat).
+//! Чистые преобразования времени для слоя совместимости с Linux.
 //!
-//! Pure, allocation-free, `core`-only logic shared with the `host-tests` crate
-//! (R11.6). It holds the byte/field decoding and calendar math that back the
-//! real-wall-clock syscalls (`gettimeofday`/`time`/`CLOCK_REALTIME`) and the CMOS
-//! RTC reader — keeping the actual port I/O effectful in `rtc.rs` while every
-//! arithmetic step here is host-testable against known dates:
+//! Только `core`, без аллокаций, общая с крейтом `host-tests` (R11.6). Здесь
+//! декодирование байт/полей и календарная математика под syscall'ами реальных
+//! часов (`gettimeofday`/`time`/`CLOCK_REALTIME`) и читателем CMOS RTC: реальный
+//! port I/O остаётся эффектным в `rtc.rs`, а каждый арифметический шаг здесь
+//! host-тестируем на известных датах:
 //!
-//!   * [`bcd_to_bin`] — CMOS BCD byte → binary (the RTC reports BCD by default).
-//!   * [`days_from_civil`] — Howard Hinnant's proleptic-Gregorian day count
-//!     (days since 1970-01-01), valid for any civil date.
-//!   * [`civil_to_unix`] — a full `(Y,M,D,h,m,s)` breakdown → Unix seconds.
-//!   * [`encode_timeval`] — build the x86_64 `struct timeval`.
+//!   * [`bcd_to_bin`] — байт BCD CMOS → двоичное (RTC по умолчанию отдаёт BCD).
+//!   * [`days_from_civil`] — пролептический григорианский счёт дней Ховарда
+//!     Хиннанта (дней с 1970-01-01), верен для любой гражданской даты.
+//!   * [`civil_to_unix`] — полная раскладка `(Y,M,D,h,m,s)` → Unix-секунды.
+//!   * [`encode_timeval`] — собрать `struct timeval` x86_64.
 #![allow(dead_code)]
 
-/// Seconds in one day.
+/// Секунд в сутках.
 const SECS_PER_DAY: i64 = 86_400;
 
-/// Linux `struct timeval` as laid out by the x86_64 ABI: two signed 64-bit
-/// fields. `gettimeofday` writes one of these to the user buffer.
+/// Linux `struct timeval` в раскладке ABI x86_64: два знаковых 64-битных поля.
+/// `gettimeofday` пишет одну такую структуру в буфер пользователя.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timeval {
-    /// Whole seconds since the Unix epoch.
+    /// Целые секунды с Unix-эпохи.
     pub tv_sec: i64,
-    /// Sub-second remainder in microseconds, normally in `[0, 1_000_000)`.
+    /// Дробный остаток в микросекундах, обычно в `[0, 1_000_000)`.
     pub tv_usec: i64,
 }
 
-/// Decode a CMOS BCD byte (e.g. `0x59`) into its binary value (`59`).
+/// Декодировать байт CMOS BCD (например, `0x59`) в двоичное значение (`59`).
 ///
-/// The RTC stores each two-digit field as packed binary-coded decimal: the high
-/// nibble is the tens digit, the low nibble the units. `((v >> 4) * 10) + (v & 0x0F)`.
+/// RTC хранит каждое двузначное поле как упакованный двоично-десятичный код:
+/// старший ниббл — десятки, младший — единицы.
+/// `((v >> 4) * 10) + (v & 0x0F)`.
 #[inline]
 pub fn bcd_to_bin(v: u8) -> u8 {
     ((v >> 4) * 10) + (v & 0x0F)
 }
 
-/// Days since the Unix epoch (1970-01-01) for the proleptic-Gregorian civil date
-/// `(y, m, d)`, where `m ∈ [1, 12]` and `d ∈ [1, 31]` (Howard Hinnant's algorithm).
+/// Дней с Unix-эпохи (1970-01-01) для пролептической григорианской даты
+/// `(y, m, d)`, где `m ∈ [1, 12]`, `d ∈ [1, 31]` (алгоритм Ховарда Хиннанта).
 ///
-/// Returns a signed count so dates before 1970 yield negatives. The algorithm
-/// shifts the year so March is the first month (making the leap day the last day
-/// of the year), then composes the day-of-era and era to land exactly on the days
-/// elapsed since the epoch.
+/// Возвращает знаковое число, поэтому даты до 1970 дают отрицательные. Алгоритм
+/// сдвигает год так, что первым месяцем становится март (делая високосный день
+/// последним днём года), затем складывает день эры и эру, чтобы точно попасть в
+/// число дней от эпохи.
 pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -55,16 +55,17 @@ pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146097 + doe - 719468
 }
 
-/// Convert a full civil `(year, month, day, hour, minute, second)` breakdown into
-/// Unix seconds (seconds since 1970-01-01T00:00:00Z), assuming UTC.
+/// Преобразовать полную гражданскую раскладку `(год, месяц, день, час, минута,
+/// секунда)` в Unix-секунды (секунды с 1970-01-01T00:00:00Z) в предположении UTC.
 ///
-/// Pure calendar math built on [`days_from_civil`]; total for every input.
+/// Чистая календарная математика на [`days_from_civil`]; тотальна для любого
+/// входа.
 pub fn civil_to_unix(year: i64, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> i64 {
     let days = days_from_civil(year, month, day);
     days * SECS_PER_DAY + (hour as i64) * 3600 + (minute as i64) * 60 + (second as i64)
 }
 
-/// Build a [`Timeval`] from whole `secs` and a sub-second `usecs` remainder.
+/// Построить [`Timeval`] из целых `secs` и дробного остатка `usecs`.
 #[inline]
 pub fn encode_timeval(secs: i64, usecs: i64) -> Timeval {
     Timeval {
@@ -94,10 +95,10 @@ mod tests {
 
     #[test]
     fn known_dates() {
-        // 2000-01-01 is 30 years after the epoch: 10957 days.
+        // 2000-01-01 — это 30 лет после эпохи: 10957 дней.
         assert_eq!(days_from_civil(2000, 1, 1), 10957);
         assert_eq!(civil_to_unix(2000, 1, 1, 0, 0, 0), 946_684_800);
-        // 2024-02-29 leap day.
+        // Високосный день 2024-02-29.
         assert_eq!(civil_to_unix(2024, 2, 29, 0, 0, 0), 1_709_164_800);
     }
 }

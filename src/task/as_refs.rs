@@ -1,54 +1,54 @@
-//! Pure address-space (CR3) reference accounting for teardown decisions.
+//! Чистый учёт ссылок на адресное пространство (CR3) для решений о сносе.
 //!
-//! A user PML4 frame may be freed only while NO live task can still run on it:
-//! freeing it under a task that later wakes up is a use-after-free of page
-//! tables, and every page-table page it contained can already have been
-//! recycled into an unrelated mapping (round-3 audit F-r3-lead-1).
+//! Кадр пользовательского PML4 можно освобождать, только пока НИ ОДНА живая
+//! задача не может на нём выполниться: освобождение под задачей, которая позже
+//! проснётся, — use-after-free таблиц страниц, и каждая страница таблиц, которую
+//! он содержал, может уже быть отдана под постороннее отображение.
 //!
-//! The kernel's scheduler keeps live tasks in three separate registries, and a
-//! teardown path must consult ALL of them:
+//! Планировщик ядра держит живые задачи в трёх отдельных реестрах, и путь сноса
+//! обязан consult ВСЕ:
 //!
-//!   * [`Registry::Ready`] — the ready queue. Note that this scheduler has no
-//!     sleeping TCB state: a task blocked in `nanosleep`/`futex`/`read`/`wait4`
-//!     yields cooperatively and stays RUNNABLE in this queue, so a "sleeping
-//!     sibling" is found here too.
-//!   * [`Registry::Stopped`] — tasks parked by SIGSTOP/SIGTSTP. Their saved
-//!     frame is OUT of the ready queue until SIGCONT, and this is the state
-//!     that made `execve`-time `drop_exclusive_user_space` free the shared
-//!     address space of a stopped sibling thread.
-//!   * [`Registry::PendingReap`] — tasks dropped by a tick whose resources are
-//!     reclaimed by a later tick. Their CR3 is still owned and will be freed
-//!     by the reaper, so a second free from another path is a double free.
+//!   * [`Registry::Ready`] — ready-очередь. Спящего состояния TCB здесь нет:
+//!     задача, блокированная в `nanosleep`/`futex`/`read`/`wait4`, кооперативно
+//!     уступает CPU и остаётся RUNNABLE в этой очереди, поэтому «спящий сосед»
+//!     находится и здесь.
+//!   * [`Registry::Stopped`] — задачи, припаркованные SIGSTOP/SIGTSTP. Их
+//!     сохранённый фрейм ВНЕ ready-очереди до SIGCONT, и именно это состояние
+//!     позволяло `drop_exclusive_user_space` при `execve` освободить разделяемое
+//!     адресное пространство остановленного потока-соседа.
+//!   * [`Registry::PendingReap`] — задачи, снятые тиком, чьи ресурсы освободит
+//!     более поздний тик. Их CR3 ещё во владении и будет освобождён reaper'ом,
+//!     поэтому второе освобождение из другого пути — double free.
 //!
-//! This module is `core`-only and dependency-free, so `host-tests` includes the
-//! exact same source with `#[path]` and property-tests the policy the kernel
-//! runs (R11.6).
+//! Модуль только `core` и без зависимостей, поэтому `host-tests` включает тот же
+//! исходник через `#[path]` и проверяет свойствами ту же политику, что исполняет
+//! ядро (R11.6).
 
 #![allow(dead_code)]
 
-/// One live task registration: its pid and the physical PML4 it runs on.
+/// Одна регистрация живой задачи: её pid и физический PML4, на котором она работает.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AsRef {
-    /// Task id.
+    /// Идентификатор задачи.
     pub pid: u64,
-    /// Physical address of the task's user PML4 (`Tcb::cr3`).
+    /// Физический адрес пользовательского PML4 задачи (`Tcb::cr3`).
     pub cr3: u64,
 }
 
-/// Which scheduler registry a blocking reference was found in. Reported for
-/// the log line that explains why an address space was not freed.
+/// В каком реестре планировщика найдена блокирующая ссылка. Сообщается в
+/// строке лога, объясняющей, почему адресное пространство не освободили.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Registry {
-    /// Ready queue (includes cooperatively blocked syscalls).
+    /// Ready-очередь (включая кооперативно блокированные syscall'ы).
     Ready,
-    /// `STOPPED_TASKS` (SIGSTOP/SIGTSTP parked frames).
+    /// `STOPPED_TASKS` (фреймы, припаркованные SIGSTOP/SIGTSTP).
     Stopped,
-    /// `PENDING_REAPS` (dropped, not yet reclaimed).
+    /// `PENDING_REAPS` (сняты, ещё не собраны).
     PendingReap,
 }
 
 impl Registry {
-    /// Short name for kernel log lines.
+    /// Короткое имя для строк лога ядра.
     pub fn name(self) -> &'static str {
         match self {
             Registry::Ready => "ready",
@@ -58,12 +58,12 @@ impl Registry {
     }
 }
 
-/// First registration in ONE registry snapshot that references `cr3` and is not
-/// `exclude_pid`.
+/// Первая регистрация в снимке ОДНОГО реестра, которая ссылается на `cr3` и не
+/// является `exclude_pid`.
 ///
-/// `exclude_pid` is the task asking (the exec'ing task is not in any registry,
-/// but the reaper IS in `PENDING_REAPS` with its own pid and must not count
-/// itself).
+/// `exclude_pid` — задача, которая спрашивает (exec'ающая задача не входит ни в
+/// один реестр, но reaper ЕСТЬ в `PENDING_REAPS` со своим pid и не должен
+/// считать себя).
 pub fn referencing_pid<I>(cr3: u64, exclude_pid: u64, tasks: I) -> Option<u64>
 where
     I: IntoIterator<Item = AsRef>,
@@ -74,14 +74,14 @@ where
         .map(|t| t.pid)
 }
 
-/// The complete teardown policy over all three registry snapshots: the first
-/// task (and the registry it came from) that still references `cr3`.
+/// Полная политика сноса по снимкам всех трёх реестров: первая задача (и реестр,
+/// откуда она взята), всё ещё ссылающаяся на `cr3`.
 ///
-/// A result of `None` means the address space is exclusively owned by the
-/// caller and may be freed. Registries are scanned in the order the kernel
-/// takes their locks (`READY_QUEUE` → `STOPPED_TASKS` → `PENDING_REAPS`); the
-/// kernel applies [`referencing_pid`] one lock at a time, and this combined
-/// form exists so the host property test can pin the full policy.
+/// `None` означает, что адресное пространство принадлежит вызывающему
+/// эксклюзивно и может быть освобождено. Реестры сканируются в порядке
+/// захвата их локов ядром (`READY_QUEUE` → `STOPPED_TASKS` → `PENDING_REAPS`);
+/// ядро применяет [`referencing_pid`] по одному локу за раз, а эта
+/// объединённая форма нужна, чтобы host-property-тест закрепил полную политику.
 pub fn referenced_by(
     cr3: u64,
     exclude_pid: u64,

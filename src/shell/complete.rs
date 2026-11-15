@@ -1,47 +1,46 @@
-//! Tab completion: command-name and path completion plus longest-common-prefix
-//! logic (R3).
+//! Tab-дополнение: имена команд и путей плюс логика longest-common-prefix (R3).
 //!
-//! Everything here is **pure logic over plain data** — no console, keyboard, or
-//! VFS calls. Directory entries are supplied by the caller (the interactive
-//! loop reads them from the VFS and hands them in as a `&[&str]`), so the
-//! matching and longest-common-prefix computation can be exercised
-//! deterministically by the in-kernel property tests (Property 24, task 6.2).
+//! Всё здесь — **чистая логика над данными**: без консоли, клавиатуры и VFS.
+//! Записи каталога передаёт вызывающий (интерактивный цикл читает их из VFS и
+//! передаёт как `&[&str]`), поэтому сопоставление и вычисление
+//! longest-common-prefix детерминированно проверяются in-kernel property-тестами
+//! (Property 24).
 //!
-//! These items are consumed by the interactive loop wired in task 10; until
-//! then they are not referenced internally, hence the `#[allow(dead_code)]`
-//! annotations that keep the `#![no_std]` build warning-free.
+//! Эти элементы потребляет интерактивный цикл; до подключения они не
+//! упоминаются внутри, отсюда `#[allow(dead_code)]`, чтобы сборка `#![no_std]`
+//! оставалась без предупреждений.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-/// The char-wise longest common prefix of `candidates`.
+/// Посимвольный longest common prefix `candidates`.
 ///
-/// The result is guaranteed to be (a) a prefix of *every* candidate and (b)
-/// **maximal** — there is no longer string that is also a prefix of every
-/// candidate. Comparison operates on Unicode scalar values (`char`s), never raw
-/// bytes, so the returned `String` is always valid UTF-8 and never splits a
-/// multi-byte character (R11.6).
+/// Результат гарантированно (a) префикс *каждого* кандидата и (b) **максимальный** —
+/// нет более длинной строки, которая тоже префикс каждого кандидата. Сравнение
+/// идёт по Unicode scalar values (`char`), никогда по сырым байтам, поэтому
+/// возвращённый `String` всегда валидный UTF-8 и никогда не разрезает
+/// многобайтовый символ (R11.6).
 ///
-/// Edge cases:
-/// - an empty slice returns `""` (there is no common content),
-/// - a single candidate returns that candidate unchanged.
+/// Крайние случаи:
+/// - пустой срез возвращает `""` (общего содержимого нет),
+/// - единственный кандидат возвращается без изменений.
 #[allow(dead_code)]
 pub fn longest_common_prefix(candidates: &[&str]) -> String {
-    // No candidates: nothing is common.
+    // Нет кандидатов: общего ничего.
     let (first, rest) = match candidates.split_first() {
         Some(parts) => parts,
         None => return String::new(),
     };
 
-    // Walk the chars of the first candidate; the prefix can never be longer
-    // than the shortest candidate, and the first candidate bounds it.
+    // Идти по символам первого кандидата; префикс не может быть длиннее
+    // самого короткого кандидата, и первый кандидат его ограничивает.
     let mut prefix = String::new();
     for (idx, ch) in first.char_indices() {
-        // Every other candidate must have exactly this char at this char
-        // position. We compare by char, advancing each candidate's iterator in
-        // lockstep with `idx` via `char_indices` lookups.
+        // Каждый другой кандидат должен иметь ровно этот символ на этой позиции.
+        // Сравниваем по символам, двигая итератор каждого кандидата синхронно с
+        // `idx` через поиск `char_indices`.
         let all_match = rest.iter().all(|cand| {
-            // The char of `cand` starting at the same char index as `ch`.
+            // Символ `cand`, начинающийся с того же char-индекса, что и `ch`.
             cand[idx..].chars().next() == Some(ch)
         });
 
@@ -55,36 +54,35 @@ pub fn longest_common_prefix(candidates: &[&str]) -> String {
     prefix
 }
 
-/// The outcome of a completion request (R3.3/R3.4/R3.5).
+/// Результат запроса дополнения (R3.3/R3.4/R3.5).
 ///
-/// Contract for the caller (the interactive loop, task 10):
-/// - [`Completion::None`] — no candidate matched; leave the line unchanged
-///   (R3.5).
-/// - [`Completion::Single`] — exactly one candidate matched; the wrapped string
-///   is the **full completed token/segment**, so the application makes the
-///   token equal that string (R3.3, Property 24).
-/// - [`Completion::Multiple`] — several candidates matched; `lcp` is the
-///   longest common prefix to extend the token to, and `candidates` is the list
-///   to display. Every entry in `candidates` (and `lcp` itself) starts with the
-///   originally typed prefix/segment (R3.4).
+/// Контракт для вызывающего (интерактивный цикл):
+/// - [`Completion::None`] — ни один кандидат не совпал; оставить строку без изменений
+/// - [`Completion::Single`] — совпал ровно один кандидат; обёрнутая строка —
+///   **полный дополненный токен/сегмент**, так что приложение приравнивает
+///   токен к этой строке (R3.3, Property 24).
+/// - [`Completion::Multiple`] — совпало несколько кандидатов; `lcp` — longest
+///   common prefix, до которого расширить токен, а `candidates` — список для
+///   показа. Каждая запись `candidates` (и сам `lcp`) начинается с
+///   изначально набранного префикса/сегмента (R3.4).
 #[allow(dead_code)]
 pub enum Completion {
-    /// No match — caller leaves the line unchanged (R3.5).
+    /// Нет совпадения — вызывающий оставляет строку без изменений (R3.5).
     None,
-    /// Unique match — the wrapped value is the full completed token (R3.3).
+    /// Единственное совпадение — обёрнутое значение — полный дополненный токен (R3.3).
     Single(String),
-    /// Several matches — extend to `lcp`, then display `candidates` (R3.4).
+    /// Несколько совпадений — расширить до `lcp`, затем показать `candidates` (R3.4).
     Multiple {
-        /// Longest common prefix of all matches (>= the typed prefix).
+        /// Longest common prefix всех совпадений (>= набранного префикса).
         lcp: String,
-        /// The matching candidate strings, to be listed for the user.
+        /// Совпавшие строки-кандидаты для показа пользователю.
         candidates: Vec<String>,
     },
 }
 
-/// Build a [`Completion`] from the set of matching strings.
+/// Построить [`Completion`] из набора совпавших строк.
 ///
-/// Shared by [`complete_command`] and [`complete_path`]: 0 matches → `None`,
+/// Общий для [`complete_command`] и [`complete_path`]: 0 совпадений → `None`,
 /// 1 → `Single`, `>= 2` → `Multiple { lcp, candidates }`.
 fn from_matches(matches: Vec<&str>) -> Completion {
     match matches.len() {
@@ -98,13 +96,13 @@ fn from_matches(matches: Vec<&str>) -> Completion {
     }
 }
 
-/// Complete a command name against the registry (R3.1).
+/// Дополнить имя команды по реестру (R3.1).
 ///
-/// Collects every registered command name (via
-/// [`crate::shell::registry::command_names`]) that starts with `prefix`, then:
-/// 0 matches → [`Completion::None`] (R3.5), 1 → [`Completion::Single`] (R3.3),
-/// `>= 2` → [`Completion::Multiple`] with the longest common prefix and the
-/// candidate list (R3.4). Every returned candidate starts with `prefix`.
+/// Собирает каждое зарегистрированное имя команды (через
+/// [`crate::shell::registry::command_names`]), начинающееся с `prefix`, затем:
+/// 0 совпадений → [`Completion::None`] (R3.5), 1 → [`Completion::Single`] (R3.3),
+/// `>= 2` → [`Completion::Multiple`] с longest common prefix и списком
+/// кандидатов (R3.4). Каждый возвращённый кандидат начинается с `prefix`.
 #[allow(dead_code)]
 pub fn complete_command(prefix: &str) -> Completion {
     let matches: Vec<&str> = crate::shell::registry::command_names()
@@ -113,24 +111,24 @@ pub fn complete_command(prefix: &str) -> Completion {
     from_matches(matches)
 }
 
-/// Complete a filesystem path segment against supplied directory entries (R3.2).
+/// Дополнить сегмент файлового пути по переданным записям каталога (R3.2).
 ///
-/// This is **pure**: `dir_entries` are the names in the relevant directory,
-/// supplied by the caller as data (no VFS calls happen here). Matching is done
-/// against the **last path segment** of `partial` — i.e. the text after the
-/// final `/` — so the caller is responsible for splicing the completed segment
-/// back into the full token. The returned [`Completion::Single`] /
-/// [`Completion::Multiple`] therefore carry the matched **entry name(s)**, each
-/// of which starts with that last segment (Property 24).
+/// Это **чисто**: `dir_entries` — имена в соответствующем каталоге, переданные
+/// вызывающим как данные (VFS здесь не вызывается). Сопоставление идёт по
+/// **последнему сегменту** `partial` — тексту после финального `/`, — поэтому
+/// вызывающий отвечает за вставку дополненного сегмента обратно в полный токен.
+/// Возвращаемые [`Completion::Single`] / [`Completion::Multiple`] несут поэтому
+/// совпавшее **имя записи**, каждое из которых начинается с этого последнего
+/// сегмента (Property 24).
 ///
-/// `cwd` is kept for signature compatibility with the design; the prefix logic
-/// here depends only on `partial`'s last segment and the supplied entries.
+/// `cwd` сохранён для совместимости сигнатуры; логика префикса здесь зависит
+/// только от последнего сегмента `partial` и переданных записей.
 #[allow(dead_code)]
 pub fn complete_path(cwd: &str, partial: &str, dir_entries: &[&str]) -> Completion {
     let _ = cwd; // retained per design signature; matching uses `partial`.
 
-    // The segment being completed is the text after the final '/'. When there
-    // is no '/', the whole `partial` is the segment.
+    // Дополняемый сегмент — текст после последнего '/'. Если '/' нет,
+    // весь `partial` и есть сегмент.
     let segment = match partial.rfind('/') {
         Some(idx) => &partial[idx + 1..],
         None => partial,

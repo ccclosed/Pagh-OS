@@ -1,42 +1,41 @@
-//! ext2-compatible filesystem (read + write) with a write-ahead-log journal.
+//! ext2-совместимая ФС (чтение + запись) с журналом write-ahead-log.
 //!
-//! `format` writes a host-mountable ext2 image (superblock @ byte 1024,
-//! `s_magic = 0xEF53`, `s_log_block_size = 2`, a single block group with block
-//! and inode bitmaps + inode table, root inode 2 carrying `.`/`..`, all
-//! `feature_*` cleared so a Linux host mounts it as plain ext2), plus an empty
-//! WAL journal region in the reserved space after the ext2 region.
+//! `format` пишет маунтабельный на хосте образ ext2 (суперблок @ байт 1024,
+//! `s_magic = 0xEF53`, `s_log_block_size = 2`, группы блоков с битмапами и
+//! inode-таблицей, корневой inode 2 с `.`/`..`, все `feature_*` сняты — Linux
+//! маунтит как обычный ext2) плюс пустую область журнала WAL в зарезервированном
+//! месте после региона ext2.
 //!
-//! `mount` validates the superblock, runs `journal.recover()` to replay any
-//! committed-but-uncheckpointed transactions, then builds the root `VfsNode`.
-//! Every mutating operation (data + inode + bitmap + dirent block writes) is
-//! batched into a single journal transaction so the host-visible ext2 state
-//! only ever advances atomically.
+//! `mount` валидирует суперблок, запускает `journal.recover()` для реплея
+//! закоммиченных, но не зачекпойнченных транзакций, затем строит корневой
+//! `VfsNode`. Каждая мутация (данные + inode + битмап + блок dirent) идёт одной
+//! транзакцией журнала, поэтому видимое хосту состояние ext2 меняется только
+//! атомарно.
 //!
-//! # Links (issue #18)
+//! # Ссылки
 //!
-//! The writer creates all three on-disk inode kinds a Debian `data.tar`
-//! carries: regular files, directories and **symbolic links** (`S_IFLNK`), and
-//! it supports **hard links** as ext2 does natively — several directory
-//! entries sharing one inode, kept honest by `i_links_count`:
+//! Писатель создаёт все три вида inode, которые несёт Debian `data.tar`:
+//! обычные файлы, каталоги и **симлинки** (`S_IFLNK`), и поддерживает
+//! **хардлинки** как ext2: несколько записей каталога делят один inode, учёт
+//! ведёт `i_links_count`:
 //!
-//!   * [`Ext2Fs::create_symlink`] picks the fast/slow layout via
-//!     [`symlink::plan`] (target ≤ 59 bytes inline in `i_block`, longer ones in
-//!     one data block written through `Tx::data_block`, i.e. ordered-mode);
-//!   * [`Ext2Fs::link`] bumps `i_links_count` and adds a directory entry, never
-//!     a block;
-//!   * [`Ext2Fs::unlink`] reads the link count: it frees blocks + inode only for
-//!     the **last** name, otherwise it just decrements — so deleting one name of
-//!     a hard-linked file cannot free data another name still uses.
+//!   * [`Ext2Fs::create_symlink`] выбирает fast/slow-раскладку через
+//!     [`symlink::plan`] (цель ≤ 59 байт inline в `i_block`, длиннее — в одном
+//!     блоке данных через `Tx::data_block`, то есть ordered-mode);
+//!   * [`Ext2Fs::link`] увеличивает `i_links_count` и добавляет запись каталога,
+//!     но не блок;
+//!   * [`Ext2Fs::unlink`] смотрит счётчик ссылок: освобождает блоки + inode
+//!     только для **последнего** имени, иначе лишь уменьшает счётчик — удаление
+//!     одного имени хардлинка не освобождает данные, которые читает другое имя.
 //!
-//! `i_links_count` is never repaired by `recover()` or `reconcile_free_counts`,
-//! and this filesystem has no fsck, so the accounting is authoritative: the
-//! rules are pinned in the pure `symlink` module and property-tested on the
-//! host. A symlink inode must never be handed out as an [`Ext2File`] — `read`
-//! on a fast link would interpret the target text as block pointers; see
-//! [`Ext2Fs::node_for`].
+//! `i_links_count` не чинят ни `recover()`, ни `reconcile_free_counts`, а fsck
+//! здесь нет, поэтому учёт авторитетен: правила зафиксированы в чистом модуле
+//! `symlink` и покрыты host-свойствами. Inode симлинка никогда не отдаётся как
+//! [`Ext2File`]: `read` fast-ссылки истолковал бы текст цели как указатели на
+//! блоки; см. [`Ext2Fs::node_for`].
 //!
-//! This module is pure logic exercised over a RAM-mock `BlockDevice`
-//! (`crate::test`); it is not wired into boot or the VFS mount table here.
+//! Модуль — чистая логика над RAM-моком `BlockDevice` (`crate::test`); в boot
+//! и таблицу монтирования VFS он не подключён.
 
 #![allow(dead_code)]
 
@@ -45,7 +44,8 @@ pub mod bounds;
 pub mod dir;
 pub mod inode;
 pub mod structs;
-/// Pure symlink-layout / hard-link accounting rules (host-testable, R11.6).
+/// Чистые правила раскладки симлинков и учёта хардлинков (host-тестируемо,
+/// R11.6).
 pub mod symlink;
 
 use ::alloc::collections::BTreeMap;
@@ -61,14 +61,14 @@ use crate::sync::spinlock::{Spinlock, SpinlockGuard};
 use crate::vfs::{FsStat, VfsError, VfsNode, VfsResult};
 use structs::JNL_MAGIC;
 
-/// Features this driver implements. Anything outside these masks belongs to
-/// ext3/ext4 (or a newer ext2 revision) and is refused: see `read_sb_gds`.
+/// Features, которые реализует драйвер. Всё вне этих масок принадлежит
+/// ext3/ext4 (или более новой ревизии ext2) и отвергается: см. `read_sb_gds`.
 const FEATURE_INCOMPAT_SUPPORTED: u32 = 0x2; // FILETYPE
 const FEATURE_RO_COMPAT_SUPPORTED: u32 = 0x1 | 0x2; // SPARSE_SUPER | LARGE_FILE
-/// Compatible features are ignorable BY DEFINITION, with one exception: a
-/// `HAS_JOURNAL` volume needs jbd2 replay before its metadata can be trusted, and
-/// this driver writes its own journal instead. Refusing it is what keeps a
-/// user's ext3/ext4 partition out of reach.
+/// Compatible-фичи по определению игнорируемы, кроме одной: тому с
+/// `HAS_JOURNAL` нужен реплей jbd2, прежде чем доверять метаданным, а этот
+/// драйвер пишет свой журнал. Отказ держит ext3/ext4-раздел пользователя
+/// недосягаемым.
 const FEATURE_COMPAT_UNSUPPORTED: u32 = 0x4; // HAS_JOURNAL
 
 use structs::{
@@ -79,28 +79,28 @@ use structs::{
 
 use symlink::{SymlinkLayout, TargetShape, UnlinkAction};
 
-// ─── format layout constants (single block group) ───────────────────────────
+// ─── константы раскладки формата ────────────────────────────────────────────
 
-/// Circular WAL log blocks (excludes the journal superblock).
+/// Блоки кольцевого лога WAL (без суперблока журнала).
 const FMT_LOG_BLOCKS: u64 = 64;
 
-/// FS blocks reserved at the device tail for the WAL journal: the journal
-/// superblock (1 block) plus the circular log.
+/// Блоки ФС, зарезервированные в конце устройства под журнал WAL: суперблок
+/// журнала (1 блок) плюс кольцевой лог.
 const JOURNAL_RESERVE_BLOCKS: u64 = FMT_LOG_BLOCKS + 1;
 
-/// Maximum blocks (and inodes) a single block group can describe with one
-/// 4096-byte bitmap block (`BS * 8 = 32768` bits). Clamping the derived counts
-/// to this bound keeps the single-group layout valid AND keeps every per-group
-/// on-disk `u16` count (`bg_free_blocks_count` / `bg_free_inodes_count`) within
-/// range, since `32768 < u16::MAX`.
+/// Максимум блоков (и inode), которые описывает одна группа одним 4096-байтным
+/// битмапом (`BS * 8 = 32768` бит). Кламп выведенных счётчиков к этой границе
+/// сохраняет валидность раскладки и держит каждый on-disk `u16`-счётчик группы
+/// (`bg_free_blocks_count` / `bg_free_inodes_count`) в диапазоне, так как
+/// `32768 < u16::MAX`.
 const MAX_GROUP_BLOCKS: u32 = (BS * 8) as u32;
 const MAX_GROUP_INODES: u32 = (BS * 8) as u32;
 
-/// Inode density: provision roughly one inode per this many bytes of capacity.
+/// Плотность inode: примерно один inode на столько байт ёмкости.
 const BYTES_PER_INODE: u64 = 16 * 1024;
 
-/// Floor on the inode count so even a tiny freshly-formatted FS keeps a few
-/// usable inodes beyond the reserved set (inodes `1..=EXT2_FIRST_INO-1`).
+/// Нижняя граница числа inode, чтобы даже крошечная свежая ФС сохраняла
+/// несколько пригодных inode сверх резерва (inode `1..=EXT2_FIRST_INO-1`).
 const MIN_INODES: u32 = 32;
 
 const SUPERBLOCK_OFFSET: usize = 1024;
@@ -109,27 +109,28 @@ const SUPERBLOCK_OFFSET: usize = 1024;
 
 struct Ext2Inner {
     sb: Ext2SuperBlock,
-    // The full group-descriptor table (one entry per block group).
+    // Полная таблица групповых дескрипторов (по записи на группу).
     gds: Vec<Ext2GroupDesc>,
 }
 
-/// A mounted ext2 filesystem over a `BlockDevice`, with a WAL journal.
+/// Смонтированная ФС ext2 над `BlockDevice`, с журналом WAL.
 pub struct Ext2Fs {
     dev: Arc<dyn BlockDevice>,
     inner: Spinlock<Ext2Inner>,
     journal: Spinlock<Journal>,
-    /// Serializes mutating transactions: a `Tx` snapshots `sb`/`gds` and
-    /// writes them back at `commit`, so two concurrent mutations would race
-    /// their bitmap/free-count updates (lost updates, double allocation).
+    /// Сериализует мутирующие транзакции: `Tx` снимает снимок `sb`/`gds` и
+    /// записывает их обратно на `commit`, поэтому две конкурентные мутации
+    /// гонялись бы за обновления битмапов/счётчиков (потерянные обновления,
+    /// двойная аллокация).
     tx_lock: Spinlock<()>,
 }
 
-/// Locate inode `ino` in its group's inode table.
+/// Находит inode `ino` в inode-таблице его группы.
 ///
-/// Validates the inode number: garbage (0 / past `s_inodes_count` / a group
-/// beyond the descriptor table) is `Corrupt` — silently clamping the group
-/// used to alias another inode's table slot, which later freed arbitrary
-/// blocks out of a corrupted directory entry.
+/// Валидирует номер inode: мусор (0 / больше `s_inodes_count` / группа за
+/// таблицей дескрипторов) — `Corrupt`. Молчаливый кламп группы заалиасил бы
+/// чужой слот таблицы inode, и позже из испорченной записи каталога
+/// освобождались бы произвольные блоки.
 fn inode_location(
     sb: &Ext2SuperBlock,
     gds: &[Ext2GroupDesc],
@@ -153,7 +154,7 @@ fn inode_location(
 }
 
 impl Ext2Fs {
-    // ── low-level device IO (4096-byte FS blocks over 512-byte sectors) ──
+    // ── низкоуровневый I/O (блоки ФС 4096 байт через секторы 512) ──
 
     pub fn read_fs_block(&self, block: u64) -> Result<Vec<u8>, FsError> {
         let mut buf = vec![0u8; BS];
@@ -188,18 +189,18 @@ impl Ext2Fs {
         self.inner.lock().sb
     }
 
-    /// The filesystem's declared block count (`s_blocks_count`): the hard
-    /// upper bound for any inode's block map.
+    /// Объявленное число блоков ФС (`s_blocks_count`): жёсткая верхняя граница
+    /// для карты блоков любого inode.
     fn total_blocks(&self) -> u64 {
         self.superblock().s_blocks_count as u64
     }
 
-    /// Validated block count of a **directory** inode (F-x86v-5).
+    /// Проверенное число блоков **каталога**.
     ///
-    /// A directory is block-aligned and can never be larger than the
-    /// filesystem, so a crafted `i_size` is [`FsError::Corrupt`] *before*
-    /// the caller starts looping over blocks — otherwise one `lookup`/`readdir`
-    /// on `i_size = 0xFFFFF000` issues up to ~1M block reads.
+    /// Каталог выровнен по блокам и не может быть больше ФС, поэтому
+    /// подделанный `i_size` — [`FsError::Corrupt`] *до* того, как вызывающий
+    /// начнёт цикл по блокам: иначе один `lookup`/`readdir` при
+    /// `i_size = 0xFFFFF000` делает до ~1M чтений блоков.
     fn dir_blocks(&self, inode: &Ext2Inode) -> Result<u64, FsError> {
         bounds::dir_blocks(inode.i_size, self.total_blocks()).map_err(|_| FsError::Corrupt)
     }
@@ -217,22 +218,22 @@ impl Ext2Fs {
     }
 }
 
-// ─── transaction context ──────────────────────────────────────────────────────
+// ─── контекст транзакции ────────────────────────────────────────────────────
 
-/// In-memory working set of dirty blocks plus working `sb`/`gd`. On `commit`
-/// every dirty block (including the patched superblock and group descriptor) is
-/// handed to the journal as a single atomic transaction.
+/// Рабочий набор грязных блоков в памяти плюс рабочие `sb`/`gd`. На `commit`
+/// каждый грязный блок (включая пропатченные суперблок и групповой дескриптор)
+/// передаётся журналу одной атомарной транзакцией.
 struct Tx<'a> {
     fs: &'a Ext2Fs,
-    /// Held for the whole Tx lifetime: mutating transactions are serialized
-    /// per-fs (see `Ext2Fs::tx_lock`).
+    /// Держится всё время жизни Tx: мутирующие транзакции сериализуются на
+    /// ФС (см. `Ext2Fs::tx_lock`).
     _tx_guard: SpinlockGuard<'a, ()>,
     sb: Ext2SuperBlock,
     gds: Vec<Ext2GroupDesc>,
     dirty: BTreeMap<u64, Vec<u8>>,
-    /// Blocks in `dirty` that are FILE DATA. Ordered mode: on
-    /// commit they are written straight to their final location and are NOT
-    /// copied through the WAL (metadata-only journaling).
+    /// Блоки в `dirty`, являющиеся ДАННЫМИ ФАЙЛА. Ordered mode: на commit они
+    /// пишутся сразу на финальное место и НЕ проходят через WAL (журналируются
+    /// только метаданные).
     data: ::alloc::collections::BTreeSet<u64>,
 }
 
@@ -258,9 +259,9 @@ impl<'a> Tx<'a> {
         Ok(self.dirty.get_mut(&blk).unwrap())
     }
 
-    /// Fetch a FILE DATA block into the dirty set. When the whole
-    /// block is about to be overwritten the disk read is skipped —
-    /// read-modify-write halved sequential write throughput for nothing.
+    /// Подтягивает блок ДАННЫХ ФАЙЛА в грязный набор. Если блок будет
+    /// перезаписан целиком, чтение с диска пропускается: read-modify-write
+    /// вдвое резал последовательный throughput без пользы.
     fn data_block(&mut self, blk: u64, full_overwrite: bool) -> Result<&mut Vec<u8>, FsError> {
         if !self.dirty.contains_key(&blk) {
             let data = if full_overwrite {
@@ -274,9 +275,7 @@ impl<'a> Tx<'a> {
         Ok(self.dirty.get_mut(&blk).unwrap())
     }
 
-    /// Allocate a zeroed data block from the first group with a
-    /// free block (previously only group 0 was ever consulted, capping every
-    /// filesystem at 128 MiB regardless of the device size).
+    /// Выделяет обнулённый data-блок из первой группы со свободным блоком.
     fn alloc_zeroed_block(&mut self) -> Result<u32, FsError> {
         let bpg = self.sb.s_blocks_per_group;
         let first = self.sb.s_first_data_block;
@@ -291,15 +290,15 @@ impl<'a> Tx<'a> {
                 alloc::alloc_bit(bm)
             };
             let Some(bit) = bit else {
-                // Bitmap disagrees with the cached free count: mark the group
-                // exhausted and move on.
+                // Битмап расходится с кэшированным счётчиком: помечаем группу
+                // исчерпанной и идём дальше.
                 self.gds[g].bg_free_blocks_count = 0;
                 continue;
             };
             let blk = first + g as u32 * bpg + bit;
             if blk >= self.sb.s_blocks_count {
-                // Past the declared region (padding bits normally prevent
-                // this): undo and treat the group as full.
+                // За объявленным регионом (обычно не бывает из-за padding-
+                // битов): откат и считаем группу полной.
                 let bm = self.dirty.get_mut(&bbm).unwrap();
                 alloc::clear_bit(bm, bit);
                 self.gds[g].bg_free_blocks_count = 0;
@@ -334,7 +333,7 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
-    /// Allocate an inode from the first group with a free slot.
+    /// Выделяет inode из первой группы со свободным слотом.
     fn alloc_new_inode(&mut self) -> Result<u32, FsError> {
         let ipg = self.sb.s_inodes_per_group;
         for g in 0..self.gds.len() {
@@ -387,8 +386,9 @@ impl<'a> Tx<'a> {
     }
 
     fn read_inode(&mut self, ino: u32) -> Result<Ext2Inode, FsError> {
-        // inode_location rejects 0 / out-of-range inos: a garbage dirent inode
-        // must never resolve to a clamped table slot (arbitrary block frees).
+        // inode_location отвергает 0 / out-of-range: мусорный inode из dirent
+        // не должен резолвиться в клампленный слот таблицы (произвольные
+        // освобождения блоков).
         let (block, off) = inode_location(&self.sb, &self.gds, ino)?;
         self.block(block)?;
         let buf = self.dirty.get(&block).unwrap();
@@ -402,9 +402,9 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
-    /// Clear the mapping for logical block `lbn`, freeing the data block and
-    /// any indirect block that becomes empty. Returns the number of freed
-    /// blocks (data + indirect) so the caller can adjust `i_blocks`.
+    /// Снимает маппинг логического блока `lbn`, освобождая его data-блок и
+    /// любой indirect-блок, ставший пустым. Возвращает число освобождённых
+    /// блоков (data + indirect), чтобы вызывающий скорректировал `i_blocks`.
     fn clear_mapping(&mut self, inode: &mut Ext2Inode, lbn: u64) -> Result<u32, FsError> {
         if lbn < 12 {
             let i = lbn as usize;
@@ -425,7 +425,7 @@ impl<'a> Tx<'a> {
         } else {
             let t = l - ppb * ppb;
             if t >= ppb * ppb * ppb {
-                return Ok(0); // beyond the triple-indirect range
+                return Ok(0); // за пределами triple-indirect
             }
             (
                 14,
@@ -449,9 +449,9 @@ impl<'a> Tx<'a> {
         Ok(freed)
     }
 
-    /// Free the leaf (and any emptied child indirect blocks) under `ind`,
-    /// zeroing the traversed pointer slots. Returns `(ind became fully
-    /// empty, blocks freed below ind)`.
+    /// Освобождает лист (и опустевшие дочерние indirect-блоки) под `ind`,
+    /// обнуляя пройденные слоты указателей. Возвращает `(ind стал полностью
+    /// пустым, число блоков, освобождённых ниже ind)`.
     fn clear_slot(&mut self, ind: u32, path: &[u32], level: u32) -> Result<(bool, u32), FsError> {
         let slot = path[0] as usize;
         self.block(ind as u64)?;
@@ -477,8 +477,8 @@ impl<'a> Tx<'a> {
         Ok((empty, freed))
     }
 
-    /// Map (allocating as needed) logical block `lbn` of `inode` to an ext2
-    /// block, walking 12 direct + single/double/triple indirect pointers.
+    /// Отображает (аллоцируя по необходимости) логический блок `lbn` inode в
+    /// блок ext2, проходя 12 direct + single/double/triple indirect.
     fn map_or_alloc(&mut self, inode: &mut Ext2Inode, lbn: u64) -> Result<u32, FsError> {
         let ppb = PTRS_PER_BLOCK as u64;
         let sectors = (BS / 512) as u32;
@@ -550,10 +550,10 @@ impl<'a> Tx<'a> {
         Ok(nb)
     }
 
-    /// Free every data + indirect block referenced by `inode`.
+    /// Освобождает все data- и indirect-блоки, на которые ссылается `inode`.
     ///
-    /// Only valid for inodes whose `i_block` really is a block map — regular
-    /// files and directories. Symlinks must go through
+    /// Годится только для inode, чей `i_block` действительно карта блоков, —
+    /// обычные файлы и каталоги. Симлинки обязаны идти через
     /// [`Self::free_inode_blocks`].
     fn free_all_blocks(&mut self, inode: &Ext2Inode) -> Result<(), FsError> {
         for i in 0..12 {
@@ -567,24 +567,22 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
-    /// Delete-path counterpart of `free_all_blocks` that honors the inode kind
-    /// (issue #18).
+    /// Аналог `free_all_blocks` для удаления, учитывающий вид inode.
     ///
-    /// A **fast** symlink keeps its target *text* in `i_block`, so walking it as
-    /// a block map would free the blocks whose numbers happen to spell the
-    /// target — arbitrary block frees out of a corrupt-but-plausible inode. A
-    /// **slow** symlink owns exactly the single block in `i_block[0]` and has no
-    /// indirect tree at all. Everything else is a regular file or a directory and
-    /// uses the normal map.
+    /// **Fast**-симлинк держит *текст* цели в `i_block`, поэтому обход его как
+    /// карты блоков освободил бы блоки, чьи номера случайно совпадают с текстом
+    /// цели, — произвольные освобождения из испорченного, но правдоподобного
+    /// inode. **Slow**-симлинк владеет ровно одним блоком в `i_block[0]` и
+    /// indirect-дерева не имеет. Всё остальное — обычный файл или каталог с
+    /// обычной картой.
     fn free_inode_blocks(&mut self, inode: &Ext2Inode) -> Result<(), FsError> {
         if inode.is_symlink() {
-            // Decide from `i_blocks` ALONE, never from `i_size` (F-x86v-4):
-            // an inline target is text in `i_block` whatever `i_size` claims,
-            // so it owns no block to free; a `i_size > 60, i_blocks == 0`
-            // inode used to take the slow branch here and free a block number
-            // spelled by the target text.
+            // Решаем ТОЛЬКО по `i_blocks`, никогда по `i_size`: inline-цель —
+            // это текст в `i_block` при любом `i_size`, поэтому освобождать
+            // нечего; иначе inode с `i_size > 60, i_blocks == 0` пошёл бы по
+            // slow-ветке и освободил номер блока, составленный из текста цели.
             if !symlink::owns_data_block(inode.i_blocks) {
-                return Ok(()); // inline target: no data block exists
+                return Ok(()); // inline-цель: блока данных не существует
             }
             if inode.i_block[0] != 0 {
                 self.free_data_block(inode.i_block[0])?;
@@ -614,9 +612,9 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
-    /// Commit: patch the superblock + every group descriptor into their
-    /// blocks, then hand every dirty block to the journal as one atomic
-    /// transaction. On success the in-memory `sb`/`gds` are published.
+    /// Commit: патчит суперблок и каждый групповой дескриптор в их блоки, затем
+    /// отдаёт все грязные блоки журналу одной атомарной транзакцией. При успехе
+    /// in-memory `sb`/`gds` публикуются.
     fn commit(mut self) -> Result<(), FsError> {
         {
             let sb = self.sb;
@@ -634,18 +632,18 @@ impl<'a> Tx<'a> {
             }
         }
 
-        // File data goes straight to its final
-        // location BEFORE the metadata transaction commits (so committed
-        // metadata never points at unwritten data), and only metadata rides
-        // the WAL. This removes the double write of every data block, which
-        // dominated apt/dpkg unpack time.
+        // Данные файла идут сразу на финальное место ДО коммита транзакции
+        // метаданных (чтобы закоммиченные метаданные никогда не указывали на
+        // незаписанные данные), а через WAL едут только метаданные. Это убирает
+        // двойную запись каждого data-блока, которая доминировала во времени
+        // распаковки apt/dpkg.
         for (blk, data) in self.dirty.iter() {
             if self.data.contains(blk) {
                 Ext2Fs::write_fs_block_direct(&*self.fs.dev, *blk, data)?;
             }
         }
-        // Hand the remaining (metadata) dirty blocks to the journal as one
-        // atomic transaction.
+        // Остальные (метаданные) грязные блоки отдаём журналу одной атомарной
+        // транзакцией.
         {
             let mut j = self.fs.journal.lock();
             let mut txn = j.begin();
@@ -657,7 +655,7 @@ impl<'a> Tx<'a> {
             j.commit(txn)?;
         }
 
-        // Publish the new superblock / group descriptors.
+        // Публикуем новый суперблок / групповые дескрипторы.
         let mut inner = self.fs.inner.lock();
         inner.sb = self.sb;
         inner.gds = self.gds;
@@ -665,22 +663,21 @@ impl<'a> Tx<'a> {
     }
 }
 
-// ─── format ───────────────────────────────────────────────────────────────
+// ─── формат ─────────────────────────────────────────────────────────────────
 
 impl Ext2Fs {
-    /// Produce a fresh, host-mountable ext2 image plus an empty WAL journal.
+    /// Создаёт свежий маунтабельный на хосте образ ext2 плюс пустой журнал WAL.
     ///
-    /// Multi-group layout. The filesystem now spans the whole
-    /// device (minus the WAL reserve) with as many 32768-block (128 MiB)
-    /// groups as fit, instead of clamping everything to a single group.
-    /// Every group starts with a superblock + GD-table backup (no
-    /// sparse_super), then its block bitmap, inode bitmap, inode table, and
-    /// data blocks.
+    /// Многогрупповая раскладка: ФС занимает всё устройство (минус резерв WAL)
+    /// столькими группами по 32768 блоков (128 MiB), сколько помещается. Каждая
+    /// группа начинается с суперблока + резервной GD-таблицы (без
+    /// sparse_super), затем идут битмап блоков, битмап inode, inode-таблица и
+    /// блоки данных.
     pub fn format(dev: Arc<dyn BlockDevice>) -> Result<(), FsError> {
-        // Device capacity in 4 KiB FS blocks.
+        // Ёмкость устройства в 4-КиБ блоках ФС.
         let device_blocks = dev.sector_count() / SECTORS_PER_BLOCK;
 
-        // Minimum-capacity guard (R7.4), sized for one small group.
+        // Защита минимальной ёмкости (R7.4), рассчитана на одну малую группу.
         let min_inode_table_blocks = ((MIN_INODES as usize * INODE_SIZE) + BS - 1) / BS; // ceil
         let min_ext2_blocks = 4u64 + min_inode_table_blocks as u64 + 1 + 1;
         let min_layout_blocks = min_ext2_blocks + JOURNAL_RESERVE_BLOCKS;
@@ -688,10 +685,10 @@ impl Ext2Fs {
             return Err(FsError::OutOfSpace);
         }
 
-        // ext2 region = device minus the WAL journal reserve at the tail.
+        // Регион ext2 = устройство минус резерв журнала WAL в хвосте.
         let data_blocks = device_blocks.saturating_sub(JOURNAL_RESERVE_BLOCKS);
 
-        let bpg = MAX_GROUP_BLOCKS; // 32768 blocks (128 MiB) per group
+        let bpg = MAX_GROUP_BLOCKS; // 32768 блоков (128 MiB) на группу
         let mut total_blocks = data_blocks.min(u32::MAX as u64) as u32;
         let mut groups = ((total_blocks as u64 + bpg as u64 - 1) / bpg as u64) as u32;
 
@@ -699,18 +696,19 @@ impl Ext2Fs {
         let gd_blocks =
             |groups: u32| -> u32 { (((groups as usize * gd_size) + BS - 1) / BS) as u32 };
 
-        // Inode density: one inode per BYTES_PER_INODE across the region,
-        // spread uniformly (s_inodes_per_group must be identical in every
-        // group), rounded to whole inode-table blocks, one bitmap per group.
+        // Плотность inode: один inode на BYTES_PER_INODE по региону, равномерно
+        // (`s_inodes_per_group` одинаков во всех группах), с округлением до
+        // целых блоков inode-таблицы, по одному битмапу на группу.
         let inodes_per_block = (BS / INODE_SIZE) as u64;
         let scaled = (total_blocks as u64 * BS as u64) / BYTES_PER_INODE;
         let per_group = (scaled.max(MIN_INODES as u64) / groups as u64).max(inodes_per_block);
         let per_group =
             per_group.saturating_add(inodes_per_block - 1) / inodes_per_block * inodes_per_block;
         let ipg = per_group.min(MAX_GROUP_INODES as u64) as u32;
-        let itb = ipg / (BS / INODE_SIZE) as u32; // inode-table blocks/group
+        let itb = ipg / (BS / INODE_SIZE) as u32; // блоков inode-таблицы/группу
 
-        // Drop a tail group too small to hold its own metadata + some data.
+        // Отбрасываем хвостовую группу, слишком малую для своих метаданных и
+        // хотя бы немного данных.
         loop {
             let base = (groups - 1) * bpg;
             let span = total_blocks - base;
@@ -723,17 +721,17 @@ impl Ext2Fs {
             }
         }
         let gdb = gd_blocks(groups);
-        let meta = 1 + gdb + 2 + itb; // per-group metadata block count
+        let meta = 1 + gdb + 2 + itb; // число метаблоков на группу
         let total_inodes = groups * ipg;
-        let reserved_inodes = EXT2_FIRST_INO - 1; // inodes 1..=10 marked used
+        let reserved_inodes = EXT2_FIRST_INO - 1; // inode 1..=10 помечены занятыми
 
-        // Root directory: first data block of group 0.
+        // Корневой каталог: первый блок данных группы 0.
         let root_dir_block = meta;
         if total_blocks <= root_dir_block + 1 {
             return Err(FsError::OutOfSpace);
         }
 
-        // Used blocks: per-group metadata everywhere + root dir in group 0.
+        // Занятые блоки: метаданные каждой группы + корневой каталог в группе 0.
         let used_total = meta * groups + 1;
         if total_blocks <= used_total {
             return Err(FsError::OutOfSpace);
@@ -775,12 +773,12 @@ impl Ext2Fs {
             s_volume_name: [0; 16],
         };
 
-        // Build every group descriptor (the GD table is replicated).
+        // Строим все групповые дескрипторы (GD-таблица реплицируется).
         let mut gds: Vec<Ext2GroupDesc> = Vec::with_capacity(groups as usize);
         for g in 0..groups {
             let base = g * bpg;
             let span = core::cmp::min(bpg, total_blocks - base);
-            let used = if g == 0 { meta + 1 } else { meta }; // + root dir
+            let used = if g == 0 { meta + 1 } else { meta }; // + корневой каталог
             gds.push(Ext2GroupDesc {
                 bg_block_bitmap: base + 1 + gdb,
                 bg_inode_bitmap: base + 1 + gdb + 1,
@@ -797,11 +795,11 @@ impl Ext2Fs {
             });
         }
 
-        // Superblock block image (SB @ byte 1024 of the group's first block).
+        // Образ блока суперблока (SB @ байт 1024 первого блока группы).
         let mut sb_block = vec![0u8; BS];
         unsafe { write_struct(&mut sb_block[SUPERBLOCK_OFFSET..], &sb) };
 
-        // GD table image (gdb blocks), replicated into every group.
+        // Образ GD-таблицы (`gdb` блоков), реплицируется в каждую группу.
         let mut gd_table = vec![0u8; gdb as usize * BS];
         for (g, gd) in gds.iter().enumerate() {
             unsafe { write_struct(&mut gd_table[g * gd_size..], gd) };
@@ -811,15 +809,15 @@ impl Ext2Fs {
         for g in 0..groups {
             let base = g * bpg;
             let span = core::cmp::min(bpg, total_blocks - base);
-            // SB backup + GD table copy at the group start (group 0: primary).
+            // Резерв SB + копия GD-таблицы в начале группы (группа 0: основная).
             Self::write_fs_block_direct(&*dev, base as u64, &sb_block)?;
             for i in 0..gdb {
                 let src = &gd_table[i as usize * BS..(i as usize + 1) * BS];
                 Self::write_fs_block_direct(&*dev, (base + 1 + i) as u64, src)?;
             }
-            // Block bitmap: metadata (+ root dir in group 0) used; padding
-            // bits beyond the declared span are set so allocation can never
-            // run past the filesystem end.
+            // Битмап блоков: заняты метаданные (+ корневой каталог в группе 0);
+            // padding-биты за объявленным диапазоном выставлены, чтобы аллокация
+            // никогда не вышла за конец ФС.
             let mut bbm = vec![0u8; BS];
             let used = if g == 0 { meta + 1 } else { meta };
             for b in 0..used {
@@ -829,8 +827,8 @@ impl Ext2Fs {
                 alloc::set_bit(&mut bbm, b);
             }
             Self::write_fs_block_direct(&*dev, gds[g as usize].bg_block_bitmap as u64, &bbm)?;
-            // Inode bitmap: group 0 reserves the classic system inodes; every
-            // group marks the padding bits beyond s_inodes_per_group.
+            // Битмап inode: группа 0 резервирует классические системные inode;
+            // каждая группа помечает padding-биты за s_inodes_per_group.
             let mut ibm = vec![0u8; BS];
             if g == 0 {
                 for i in 0..reserved_inodes {
@@ -841,8 +839,8 @@ impl Ext2Fs {
                 alloc::set_bit(&mut ibm, i);
             }
             Self::write_fs_block_direct(&*dev, gds[g as usize].bg_inode_bitmap as u64, &ibm)?;
-            // Zero the inode table (data blocks need no wipe: the bitmaps
-            // declare them free, and the block allocator zeroes on alloc).
+            // Обнуляем inode-таблицу (data-блоки обнулять не нужно: битмапы
+            // объявляют их свободными, а аллокатор обнуляет при выделении).
             for b in 0..itb {
                 Self::write_fs_block_direct(
                     &*dev,
@@ -852,15 +850,15 @@ impl Ext2Fs {
             }
         }
 
-        // Root directory data block with "." and "..".
+        // Блок данных корневого каталога с "." и "..".
         let mut root_block = vec![0u8; BS];
         dir::init_dot_entries(&mut root_block, EXT2_ROOT_INO, EXT2_ROOT_INO);
         Self::write_fs_block_direct(&*dev, root_dir_block as u64, &root_block)?;
 
-        // Root inode (inode 2): directory, size = one block.
+        // Корневой inode (inode 2): каталог, размер = один блок.
         let mut root_inode = Ext2Inode::zeroed();
         root_inode.i_mode = S_IFDIR | 0o755;
-        root_inode.i_links_count = 2; // "." and ".."
+        root_inode.i_links_count = 2; // "." и ".."
         root_inode.i_size = BS as u32;
         root_inode.i_blocks = (BS / 512) as u32;
         root_inode.i_block[0] = root_dir_block;
@@ -870,27 +868,27 @@ impl Ext2Fs {
         unsafe { write_struct(&mut itbuf[roff..], &root_inode) };
         Self::write_fs_block_direct(&*dev, rblock, &itbuf)?;
 
-        // Empty WAL journal in the reserved region after the ext2 area.
+        // Пустой журнал WAL в зарезервированной области после ext2.
         let area = Self::journal_area(&sb);
         Journal::format(&*dev, area)?;
         Ok(())
     }
 }
 
-// ─── mount ────────────────────────────────────────────────────────────────
+// ─── монтирование ───────────────────────────────────────────────────────────
 
 impl Ext2Fs {
-    /// True when this volume carries pagh's own journal superblock.
+    /// True, когда том несёт собственный суперблок журнала pagh.
     ///
-    /// THE OWNERSHIP MARKER. A structurally valid ext2 volume is not proof that
-    /// pagh may write to it — a user's Linux partition is often plain ext2 or
-    /// ext4, and `disk format` is the only thing that ever puts pagh's WAL on a
-    /// device. So the WAL superblock is the marker: it is written by `format`
-    /// alone, it lives in a region ext2 does not otherwise use, and its magic
-    /// (`PAGHJNL\1`) is not something another filesystem produces by accident.
+    /// МАРКЕР ВЛАДЕНИЯ. Структурно валидный том ext2 — не доказательство, что
+    /// pagh можно в него писать: Linux-раздел пользователя часто обычный ext2
+    /// или ext4, а WAL pagh кладёт на устройство только `disk format`. Поэтому
+    /// маркер — суперблок WAL: его пишет только `format`, он лежит в области,
+    /// которую ext2 иначе не использует, и его магию (`PAGHJNL\1`) другая ФС
+    /// случайно не создаст.
     ///
-    /// Used by the boot path to decide what it may mount on its own. A volume
-    /// without the marker is never touched automatically.
+    /// Boot-путь по нему решает, что можно монтировать самому. Том без маркера
+    /// автоматически не трогается никогда.
     pub fn is_pagh_volume(dev: &dyn BlockDevice) -> bool {
         let Ok((sb, _)) = Self::read_sb_gds(dev) else {
             return false;
@@ -909,9 +907,10 @@ impl Ext2Fs {
         }
     }
 
-    /// Read the superblock and the full group-descriptor table (one
-    /// one descriptor per block group; the table starts at block 1). Old
-    /// single-group images load unchanged (they simply yield one descriptor).
+    /// Читает суперблок и полную таблицу групповых дескрипторов (по одному
+    /// дескриптору на группу; таблица начинается с блока 1). Старые
+    /// одногрупповые образы загружаются без изменений — просто дают один
+    /// дескриптор.
     fn read_sb_gds(dev: &dyn BlockDevice) -> Result<(Ext2SuperBlock, Vec<Ext2GroupDesc>), FsError> {
         let mut b0 = vec![0u8; BS];
         dev.read_block(0, &mut b0).map_err(|_| FsError::IoError)?;
@@ -919,18 +918,17 @@ impl Ext2Fs {
         if sb.s_magic != EXT2_MAGIC {
             return Err(FsError::BadSuperBlock);
         }
-        // `s_magic` is 0xEF53 for ext2, ext3 AND ext4 — they are one family, and
-        // an ext4 volume passes every structural check an ext2 one does. Mounting
-        // it would then mean writing: `reconcile_free_counts` rewrites group
-        // descriptors, and the WAL reserves blocks at the end of the volume. On a
-        // real machine that is somebody's Linux root filesystem.
+        // `s_magic` равен 0xEF53 у ext2, ext3 И ext4: это одно семейство, и
+        // том ext4 проходит все структурные проверки ext2. Смонтировать его
+        // значило бы писать: `reconcile_free_counts` переписывает групповые
+        // дескрипторы, а WAL резервирует блоки в конце тома. На реальной машине
+        // это чей-то Linux-root.
         //
-        // So the feature words are checked, not just the magic. The masks below
-        // are exactly the features this driver implements: `FILETYPE` (a
-        // directory entry carries its type) and the read-only `SPARSE_SUPER` /
-        // `LARGE_FILE`. Anything else — extents, 64-bit, flex_bg, a jbd2 journal
-        // (`HAS_JOURNAL`) — is a filesystem this code cannot keep consistent, and
-        // it is refused rather than read half-way.
+        // Поэтому проверяются слова features, а не только магия. Маски ниже —
+        // ровно то, что реализует драйвер: `FILETYPE` (запись каталога несёт
+        // свой тип) и read-only `SPARSE_SUPER` / `LARGE_FILE`. Всё остальное —
+        // extents, 64-bit, flex_bg, jbd2-журнал (`HAS_JOURNAL`) — ФС, которую
+        // этот код не удержит консистентной; отказ, а не чтение наполовину.
         if sb.s_feature_incompat & !FEATURE_INCOMPAT_SUPPORTED != 0
             || sb.s_feature_ro_compat & !FEATURE_RO_COMPAT_SUPPORTED != 0
             || sb.s_feature_compat & FEATURE_COMPAT_UNSUPPORTED != 0
@@ -949,8 +947,9 @@ impl Ext2Fs {
         if sb.s_blocks_per_group == 0 || sb.s_inodes_per_group == 0 {
             return Err(FsError::BadSuperBlock);
         }
-        // Rev >= 1 must declare a sane inode size; address math would land on
-        // arbitrary table bytes otherwise. Rev 0 images always use 128.
+        // Rev >= 1 обязан объявлять разумный размер inode; иначе арифметика
+        // адресов попадёт в произвольные байты таблицы. Образы rev 0 всегда
+        // используют 128.
         if sb.s_rev_level >= 1 {
             let isz = sb.s_inode_size as usize;
             if isz < INODE_SIZE || isz > BS || !isz.is_power_of_two() {
@@ -963,13 +962,13 @@ impl Ext2Fs {
         if groups == 0 || groups > 65536 {
             return Err(FsError::BadSuperBlock);
         }
-        // The per-group counts drive bitmap scans whose length is taken from
-        // them (`reconcile_free_counts`). A bitmap block describes exactly
-        // `BS * 8` entries, so anything larger is not "a big filesystem" but a
-        // corrupt/forged superblock: reject it before a single bit is read
-        // (round-3 audit F-r3-vfs-2: `s_inodes_count = s_inodes_per_group =
-        // 0xFFFFFFFF` made every mount scan 2^32 bits — 28 s of boot — and
-        // wrote a bogus `s_free_inodes_count` back to the volume).
+        // Счётчики на группу задают длину сканов битмапов
+        // (`reconcile_free_counts`). Блок битмапа описывает ровно `BS * 8`
+        // записей, поэтому всё большее — не «большая ФС», а испорченный или
+        // подделанный суперблок: отказ до чтения первого бита (см. SECURITY.md:
+        // `s_inodes_count = s_inodes_per_group = 0xFFFFFFFF` превращал каждый
+        // mount в скан 2^32 бит и записывал мусорный `s_free_inodes_count`
+        // обратно в том).
         if let Err(e) = bounds::validate_group_counts(
             sb.s_blocks_per_group,
             sb.s_inodes_per_group,
@@ -1003,15 +1002,15 @@ impl Ext2Fs {
         Ok((sb, gds))
     }
 
-    /// True when the device contains a structurally valid ext2 superblock/group.
-    /// Boot uses this to distinguish an empty disk from an existing filesystem
-    /// whose private WAL is damaged; only the former may be auto-formatted.
+    /// True, когда на устройстве структурно валидный суперблок ext2.
+    /// Boot отличает так пустой диск от существующей ФС с повреждённым
+    /// собственным WAL; автоматически форматировать можно только первый.
     pub fn has_valid_superblock(dev: &dyn BlockDevice) -> bool {
         Self::read_sb_gds(dev).is_ok()
     }
 
-    /// Repair stale free-space counters from the authoritative bitmaps of
-    /// every block group before exposing the mount.
+    /// Чинит устаревшие счётчики свободного места по авторитетным битмапам
+    /// каждой группы блоков до публикации монтирования.
     fn reconcile_free_counts(
         dev: &dyn BlockDevice,
         mut sb: Ext2SuperBlock,
@@ -1024,11 +1023,10 @@ impl Ext2Fs {
         let mut changed = false;
         for (g, gd) in gds.iter_mut().enumerate() {
             let base = sb.s_first_data_block + g as u32 * bpg;
-            // `span`/`ispan` bound the bitmap scan. Both are clamped to one
-            // bitmap block's capacity (`BS * 8` bits): `read_sb_gds` has
-            // already refused impossible counts, and this is the belt-and-
-            // braces copy that keeps a corrupt value from ever turning this
-            // mount into a 2^32-bit scan (F-r3-vfs-2).
+            // `span`/`ispan` ограничивают скан битмапа и клампятся к ёмкости
+            // одного блока битмапа (`BS * 8` бит): `read_sb_gds` уже отверг
+            // невозможные счётчики, а это страховка, чтобы испорченное значение
+            // не превратило mount в скан 2^32 бит.
             let span = core::cmp::min(bpg, sb.s_blocks_count.saturating_sub(base))
                 .min(bounds::BITMAP_BITS);
             let mut bbm = vec![0u8; BS];
@@ -1080,19 +1078,20 @@ impl Ext2Fs {
         Ok((sb, gds))
     }
 
-    /// Mount the filesystem: validate the superblock, recover the journal, then
-    /// build the `Ext2Fs`. Returns the live filesystem handle.
+    /// Монтирует ФС: валидирует суперблок, восстанавливает журнал, затем строит
+    /// `Ext2Fs`. Возвращает живой дескриптор ФС.
     pub fn mount_fs(dev: Arc<dyn BlockDevice>) -> Result<Arc<Ext2Fs>, FsError> {
-        // 1. Validate superblock + block size.
+        // 1. Валидация суперблока + размера блока.
         let (sb, _gds) = Self::read_sb_gds(&*dev)?;
 
-        // 2. Recover the journal BEFORE building the root (replay committed txns).
+        // 2. Восстановление журнала ДО построения корня (реплей коммитов).
         let area = Self::journal_area(&sb);
         let mut journal = Journal::open(dev.clone(), area)?;
         journal.recover()?;
 
-        // 3. Re-read metadata after replay, then repair stale free-space
-        // counters from the authoritative bitmaps before exposing the mount.
+        // 3. Перечитываем метаданные после реплея, затем чиним устаревшие
+        // счётчики свободного места по авторитетным битмапам до публикации
+        // монтирования.
         let (sb, gds) = Self::read_sb_gds(&*dev)?;
         let (sb, gds) = Self::reconcile_free_counts(&*dev, sb, gds)?;
 
@@ -1104,13 +1103,13 @@ impl Ext2Fs {
         }))
     }
 
-    /// Mount and return the root directory `VfsNode` (design entry point).
+    /// Монтирует и возвращает корневой `VfsNode` каталога (точка входа).
     pub fn mount(dev: Arc<dyn BlockDevice>) -> Result<Arc<dyn VfsNode>, FsError> {
         let fs = Self::mount_fs(dev)?;
         Ok(fs.root_node())
     }
 
-    /// Build the root directory node (inode 2).
+    /// Строит узел корневого каталога (inode 2).
     pub fn root_node(self: &Arc<Self>) -> Arc<dyn VfsNode> {
         let cached_size = self
             .read_inode(EXT2_ROOT_INO)
@@ -1124,15 +1123,14 @@ impl Ext2Fs {
         })
     }
 
-    /// Build a child node by inode/name, dispatching on the inode's `i_mode`.
+    /// Строит дочерний узел по inode/имени, диспетчеризуя по `i_mode` inode.
     ///
-    /// The dispatch is explicit and must stay that way: handing a symlink inode
-    /// to [`Ext2File`] would let `read` run the block map over `i_block`, where a
-    /// *fast* symlink stores its target text — i.e. the target bytes would be
-    /// interpreted as block numbers and an arbitrary disk block returned
-    /// (issue #18). Anything that is neither a directory, a regular file nor a
-    /// symlink (a foreign image's device node, fifo, ...) becomes an
-    /// [`Ext2Opaque`] node with no readable content at all.
+    /// Диспетчеризация явная и обязана такой остаться: отдай inode симлинка
+    /// [`Ext2File`] — и `read` прогонит карту блоков по `i_block`, где
+    /// *fast*-симлинк держит текст цели, то есть байты цели будут поняты как
+    /// номера блоков и вернётся произвольный блок диска. Всё, что не каталог,
+    /// не обычный файл и не симлинк (device-узел чужого образа, fifo, ...),
+    /// становится узлом [`Ext2Opaque`] без читаемого содержимого.
     fn node_for(fs: &Arc<Ext2Fs>, ino: u32, name: &str) -> Result<Arc<dyn VfsNode>, FsError> {
         let inode = fs.read_inode(ino)?;
         let cached_size = inode.i_size as u64;
@@ -1167,12 +1165,12 @@ impl Ext2Fs {
         }
     }
 
-    /// Flush is a no-op: every mutation is already durably journaled+checkpointed
-    /// at `commit` time. Provided for API completeness.
+    /// Flush — no-op: каждая мутация уже прочно зажурналирована и
+    /// зачекпойнчена на `commit`. Оставлен для полноты API.
     pub fn sync(&self) {}
 
-    /// Permission bits of `ino` (`i_mode & 0o7777`), or `fallback` when the
-    /// inode cannot be read (a device error must not turn a file executable).
+    /// Биты прав `ino` (`i_mode & 0o7777`) либо `fallback`, если inode не
+    /// читается (ошибка устройства не должна делать файл исполняемым).
     pub fn node_mode(&self, ino: u32, fallback: u32) -> u32 {
         match self.read_inode(ino) {
             Ok(inode) => (inode.i_mode as u32) & 0o7777,
@@ -1180,8 +1178,8 @@ impl Ext2Fs {
         }
     }
 
-    /// `(i_uid, i_gid)` of `ino`, `(0, 0)` when the inode cannot be read (the
-    /// writer stamps root on every inode it creates).
+    /// `(i_uid, i_gid)` для `ino`, `(0, 0)`, если inode не читается (писатель
+    /// ставит root на каждый создаваемый inode).
     pub fn node_owner(&self, ino: u32) -> (u32, u32) {
         match self.read_inode(ino) {
             Ok(inode) => (inode.i_uid as u32, inode.i_gid as u32),
@@ -1189,8 +1187,8 @@ impl Ext2Fs {
         }
     }
 
-    /// Write the permission bits of `ino` through the journal, preserving the
-    /// inode's type bits. One committed transaction, like every other mutation.
+    /// Пишет биты прав `ino` через журнал, сохраняя типовые биты inode. Одна
+    /// закоммиченная транзакция, как и любая другая мутация.
     pub fn set_inode_mode(&self, ino: u32, mode: u32) -> Result<(), FsError> {
         let mut tx = Tx::new(self);
         let mut inode = tx.read_inode(ino)?;
@@ -1199,8 +1197,8 @@ impl Ext2Fs {
         tx.commit()
     }
 
-    /// Write `i_uid`/`i_gid` of `ino` through the journal. ext2 stores both as
-    /// `u16`; the syscall layer has already rejected values that do not fit.
+    /// Пишет `i_uid`/`i_gid` для `ino` через журнал. ext2 хранит оба как `u16`;
+    /// syscall-слой уже отверг не помещающиеся значения.
     pub fn set_inode_owner(&self, ino: u32, uid: u16, gid: u16) -> Result<(), FsError> {
         let mut tx = Tx::new(self);
         let mut inode = tx.read_inode(ino)?;
@@ -1211,11 +1209,11 @@ impl Ext2Fs {
     }
 }
 
-// ─── directory + file operations ──────────────────────────────────────────────
+// ─── операции с каталогами и файлами ────────────────────────────────────────
 
 impl Ext2Fs {
-    /// Enumerate a directory's live entries as `(name, inode)` (excludes free
-    /// slots; includes `.`/`..`).
+    /// Перечисляет живые записи каталога как `(имя, inode)` (без свободных
+    /// слотов; включает `.`/`..`).
     pub fn read_dir_entries(&self, dir_ino: u32) -> Result<Vec<(String, u32)>, FsError> {
         let inode = self.read_inode(dir_ino)?;
         if !inode.is_dir() {
@@ -1236,7 +1234,7 @@ impl Ext2Fs {
         Ok(out)
     }
 
-    /// Look up `name` in directory `dir_ino`, returning the child inode number.
+    /// Ищет `name` в каталоге `dir_ino` и возвращает номер дочернего inode.
     pub fn lookup_entry(&self, dir_ino: u32, name: &str) -> Result<u32, FsError> {
         let inode = self.read_inode(dir_ino)?;
         if !inode.is_dir() {
@@ -1254,8 +1252,8 @@ impl Ext2Fs {
         Err(FsError::NotFound)
     }
 
-    /// Insert `(name -> child_ino)` into directory `dir_ino`, growing a new dir
-    /// block if no existing block has room.
+    /// Вставляет `(name -> child_ino)` в каталог `dir_ino`, при нехватке места
+    /// выделяя новый блок каталога.
     fn insert_dirent(tx: &mut Tx, dir_ino: u32, name: &str, child_ino: u32) -> Result<(), FsError> {
         if name.as_bytes().len() > 255 {
             return Err(FsError::NameTooLong);
@@ -1263,11 +1261,11 @@ impl Ext2Fs {
         let mut dinode = tx.read_inode(dir_ino)?;
         let nblocks = tx.fs.dir_blocks(&dinode)?;
 
-        // Full in-transaction duplicate scan. Callers probe with `lookup_entry`
-        // first, but that probe runs outside the tx lock; inserting a second
-        // entry with the same name would leave two directory entries for one
-        // inode and silently break the link count. The blocks read here are
-        // cached in the transaction, so the insertion loop below re-reads none.
+        // Полный скан дублей внутри транзакции. Вызывающие сначала проверяют
+        // `lookup_entry`, но эта проверка идёт вне tx-лока; вторая запись с тем
+        // же именем оставила бы два dirent на один inode и тихо сломала бы учёт
+        // ссылок. Прочитанные здесь блоки кэшируются в транзакции, поэтому цикл
+        // вставки ниже ничего не перечитывает.
         for lbn in 0..nblocks {
             let Some(blk) = inode::block_for_offset(tx.fs, &dinode, lbn * BS as u64)? else {
                 continue;
@@ -1281,10 +1279,10 @@ impl Ext2Fs {
             }
         }
 
-        // Try existing blocks. Read-only scan: holes must NOT be mapped with
-        // map_or_alloc here — that would allocate a block (and bump
-        // i_blocks/bitmaps) just to look for a name, leaking the allocation
-        // whenever the scan ends in an early error path.
+        // Пробуем существующие блоки. Скан read-only: дыры здесь НЕЛЬЗЯ
+        // мапить через map_or_alloc — это выделило бы блок (и сдвинуло
+        // i_blocks/битмапы) просто ради поиска имени, а при ранней ошибке скан
+        // утёк бы аллокацией.
         for lbn in 0..nblocks {
             let Some(blk) = inode::block_for_offset(tx.fs, &dinode, lbn * BS as u64)? else {
                 continue;
@@ -1299,7 +1297,7 @@ impl Ext2Fs {
             }
         }
 
-        // Grow a new directory block.
+        // Выделяем новый блок каталога.
         let new_lbn = nblocks as u64;
         let blk = tx.map_or_alloc(&mut dinode, new_lbn)?;
         {
@@ -1315,20 +1313,20 @@ impl Ext2Fs {
         Ok(())
     }
 
-    /// Shared pre-flight for a new directory entry: reject unusable names and a
-    /// name that already exists in `parent_ino`. Used by `create`,
-    /// `create_symlink` and `link` so all three report identical errors.
+    /// Общая предпроверка новой записи каталога: отказ непригодным именам и
+    /// имени, которое уже есть в `parent_ino`. Используется `create`,
+    /// `create_symlink` и `link`, чтобы все три давали одинаковые ошибки.
     ///
-    /// The duplicate probe is an optimization only — `insert_dirent` re-checks
-    /// it inside the transaction.
+    /// Проверка дубля — только оптимизация: `insert_dirent` перепроверяет её
+    /// внутри транзакции.
     fn check_new_entry(&self, parent_ino: u32, name: &str) -> Result<(), FsError> {
         if name.is_empty() || name == "." || name == ".." {
             return Err(FsError::Corrupt);
         }
-        // A directory entry name never contains a separator: every caller splits
-        // the path first, and an entry created with a '/' in its name could never
-        // be looked up again (`lookup_entry` splits on '/') — an unreachable,
-        // unremovable file. Refuse it at the writer.
+        // Имя записи каталога никогда не содержит разделителя: вызывающие уже
+        // разбили путь, а запись с '/' в имени больше никогда не нашлась бы
+        // (`lookup_entry` режет по '/') — недостижимый и неудаляемый файл.
+        // Отказываем на стороне писателя.
         if name.contains('/') {
             return Err(FsError::Corrupt);
         }
@@ -1341,8 +1339,8 @@ impl Ext2Fs {
         Ok(())
     }
 
-    /// Create a regular file or directory named `name` under `parent_ino`.
-    /// Returns the new inode number.
+    /// Создаёт обычный файл или каталог `name` в `parent_ino`. Возвращает номер
+    /// нового inode.
     pub fn create(&self, parent_ino: u32, name: &str, is_dir: bool) -> Result<u32, FsError> {
         self.check_new_entry(parent_ino, name)?;
 
@@ -1351,14 +1349,14 @@ impl Ext2Fs {
 
         let mut inode = Ext2Inode::zeroed();
         if is_dir {
-            // Allocate and initialize the new directory's data block.
+            // Выделяем и инициализируем блок данных нового каталога.
             let dblock = tx.alloc_zeroed_block()?;
             {
                 let buf = tx.block(dblock as u64)?;
                 dir::init_dot_entries(buf, new_ino, parent_ino);
             }
             inode.i_mode = S_IFDIR | 0o755;
-            inode.i_links_count = 2; // "." + entry in parent
+            inode.i_links_count = 2; // "." + запись в родителе
             inode.i_size = BS as u32;
             inode.i_blocks = (BS / 512) as u32;
             inode.i_block[0] = dblock;
@@ -1370,11 +1368,11 @@ impl Ext2Fs {
         }
         tx.write_inode(new_ino, &inode)?;
 
-        // Link into the parent directory.
+        // Привязываем в родительский каталог.
         Self::insert_dirent(&mut tx, parent_ino, name, new_ino)?;
 
         if is_dir {
-            // The child's ".." adds a hard link to the parent; bump used_dirs.
+            // ".." ребёнка добавляет хардлинк на родителя; увеличиваем used_dirs.
             let mut pinode = tx.read_inode(parent_ino)?;
             pinode.i_links_count += 1;
             tx.write_inode(parent_ino, &pinode)?;
@@ -1386,27 +1384,26 @@ impl Ext2Fs {
         Ok(new_ino)
     }
 
-    /// Create a symbolic link named `name` under `parent_ino` whose target is
-    /// the raw bytes `target` (a link target is stored verbatim — it is never
-    /// resolved or normalized against anything). Returns the new inode number.
+    /// Создаёт симлинк `name` в `parent_ino` с целью из сырых байт `target`
+    /// (цель хранится дословно — она никогда не резолвится и не нормализуется).
+    /// Возвращает номер нового inode.
     ///
-    /// The on-disk shape comes from [`symlink::plan`] (issue #18):
+    /// On-disk форму выбирает [`symlink::plan`]:
     ///
-    ///   * **fast** — `target.len() <= 59`: the target plus its terminating NUL
-    ///     fit in `i_block`, `i_blocks == 0`, and no data block is allocated;
-    ///   * **slow** — longer targets: one zeroed data block carries the target
-    ///     (its tail is a NUL by construction) and `i_blocks == BS/512`.
+    ///   * **fast** — `target.len() <= 59`: цель с завершающим NUL помещается в
+    ///     `i_block`, `i_blocks == 0`, блок данных не выделяется;
+    ///   * **slow** — цели длиннее: один обнулённый блок данных несёт цель (его
+    ///     хвост по построению нулевой), `i_blocks == BS/512`.
     ///
-    /// The slow block is fetched through `Tx::data_block`, so it is written to
-    /// its final location *before* the metadata transaction commits (ordered
-    /// mode): a committed symlink inode can never point at an unwritten block.
-    /// One transaction covers the inode, its bitmap bit, the parent directory
-    /// entry and the superblock/group counters — no state is written outside the
-    /// usual transactional boundaries.
+    /// Медленный блок берётся через `Tx::data_block`, поэтому пишется на
+    /// финальное место *до* коммита транзакции метаданных (ordered mode):
+    /// закоммиченный inode симлинка не может указывать на незаписанный блок. Одна
+    /// транзакция покрывает inode, его бит в битмапе, запись в родительском
+    /// каталоге и счётчики суперблока/группы — ничего не пишется вне обычных
+    /// транзакционных границ.
     ///
-    /// An empty target is refused ([`FsError::Corrupt`]): silently creating a
-    /// link with no target is exactly the kind of corruption `tar` extraction
-    /// must not introduce.
+    /// Пустая цель отвергается ([`FsError::Corrupt`]): молча созданная ссылка
+    /// без цели — ровно та порча, которую не должна вносить распаковка `tar`.
     pub fn create_symlink(
         &self,
         parent_ino: u32,
@@ -1424,7 +1421,7 @@ impl Ext2Fs {
         let new_ino = tx.alloc_new_inode()?;
 
         let mut inode = Ext2Inode::zeroed();
-        inode.i_mode = S_IFLNK | 0o777; // ext2 symlinks are always rwxrwxrwx
+        inode.i_mode = S_IFLNK | 0o777; // у симлинков ext2 всегда rwxrwxrwx
         inode.i_size = plan.size as u32;
         inode.i_links_count = 1;
         match plan.layout {
@@ -1445,31 +1442,29 @@ impl Ext2Fs {
         }
         tx.write_inode(new_ino, &inode)?;
 
-        // Link into the parent directory.
+        // Привязываем в родительский каталог.
         Self::insert_dirent(&mut tx, parent_ino, name, new_ino)?;
 
         tx.commit()?;
         Ok(new_ino)
     }
 
-    /// Read the target of symlink `ino`: exactly `i_size` bytes, no trailing
-    /// NUL, in the frozen image of the inode.
+    /// Читает цель симлинка `ino`: ровно `i_size` байт, без хвостового NUL, из
+    /// зафиксированного образа inode.
     ///
-    /// Fast links are decoded from `i_block` (`read` must never touch them:
-    /// the inline bytes are not block pointers); slow links are read from their
-    /// single data block. A non-symlink inode — and a slow link whose first
-    /// block is missing — is [`FsError::Corrupt`]: returning a truncated target
-    /// would silently send the caller to a different path.
+    /// Fast-ссылки декодируются из `i_block` (`read` не должен их трогать:
+    /// inline-байты не указатели на блоки); slow читаются из единственного блока
+    /// данных. Не-симлинк и slow-ссылка без первого блока — [`FsError::Corrupt`]:
+    /// обрезанная цель молча увела бы вызывающего на другой путь.
     pub fn read_symlink(&self, ino: u32) -> Result<Vec<u8>, FsError> {
         let inode = self.read_inode(ino)?;
         if !inode.is_symlink() {
             return Err(FsError::Corrupt);
         }
-        // The layout decision is bounded by the on-disk shape (F-x86v-1): a
-        // crafted `i_blocks = 8, i_size = 0xFFFFFFF0` is `Corrupt`, never a
-        // `vec![0u8; i_size]`. `i_blocks == 0` with an oversized `i_size` is
-        // also corrupt, not slow: those bytes are target text, not a block map
-        // (F-x86v-4).
+        // Решение о раскладке ограничено on-disk формой: подделанный
+        // `i_blocks = 8, i_size = 0xFFFFFFF0` — `Corrupt`, а не
+        // `vec![0u8; i_size]`. `i_blocks == 0` при огромном `i_size` тоже порча,
+        // а не slow: эти байты — текст цели, а не карта блоков.
         match symlink::target_shape(inode.i_blocks, inode.i_size) {
             TargetShape::Fast(size) => {
                 let inline = symlink::inline_bytes(&inode.i_block);
@@ -1492,19 +1487,18 @@ impl Ext2Fs {
         }
     }
 
-    /// Add the hard link `name` under `parent_ino`, pointing at the existing
-    /// inode `target_ino`: the same inode, one more `i_links_count`, no new
-    /// blocks and no content copy.
+    /// Добавляет хардлинк `name` в `parent_ino` на существующий inode
+    /// `target_ino`: тот же inode, `i_links_count` на единицу больше, ни одного
+    /// нового блока и без копирования содержимого.
     ///
-    /// Refused for a directory target — ext2 has no directory hard links, and
-    /// `i_links_count` on a directory counts `.`/`..` rather than names — and
-    /// for an inode that is already free. Both a duplicate name and a
-    /// non-linkable target report [`FsError::AlreadyExists`], matching how
-    /// `unlink` reports a non-empty directory.
+    /// Отказ для каталога-цели — хардлинков на каталоги в ext2 нет, а
+    /// `i_links_count` каталога считает `.`/`..`, а не имена — и для уже
+    /// свободного inode. И дубль имени, и нелинкуемая цель дают
+    /// [`FsError::AlreadyExists`], как `unlink` сообщает о непустом каталоге.
     ///
-    /// The count bump and the directory entry are committed in **one**
-    /// transaction, so the on-disk state never shows a link count that does not
-    /// match the number of names pointing at the inode.
+    /// Инкремент счётчика и запись каталога коммитятся в **одной** транзакции,
+    /// поэтому on-disk состояние никогда не покажет счётчик ссылок, не
+    /// совпадающий с числом имён, указывающих на inode.
     pub fn link(&self, parent_ino: u32, name: &str, target_ino: u32) -> Result<(), FsError> {
         self.check_new_entry(parent_ino, name)?;
 
@@ -1521,14 +1515,14 @@ impl Ext2Fs {
         tx.commit()
     }
 
-    /// Remove `name` from `parent_ino`.
+    /// Удаляет `name` из `parent_ino`.
     ///
-    /// Directories must be empty and are always released completely. For every
-    /// other inode the link count decides (issue #18): with more than one name
-    /// pointing at it only `i_links_count` is decremented, and the data/indirect
-    /// blocks plus the inode are freed only for the **last** name. Both branches
-    /// commit inside the same transaction as the directory-entry removal, so a
-    /// crash can never leave an entry pointing at a free inode.
+    /// Каталоги обязаны быть пустыми и освобождаются целиком всегда. Для
+    /// остальных inode решает счётчик ссылок: если на него указывает больше
+    /// одного имени, уменьшается только `i_links_count`, а data/indirect-блоки и
+    /// inode освобождаются лишь для **последнего** имени. Обе ветки коммитятся в
+    /// той же транзакции, что и удаление записи каталога, поэтому крах не может
+    /// оставить запись, указывающую на свободный inode.
     pub fn unlink(&self, parent_ino: u32, name: &str) -> Result<(), FsError> {
         if name == "." || name == ".." {
             return Err(FsError::Corrupt);
@@ -1539,11 +1533,11 @@ impl Ext2Fs {
             return Err(FsError::NotFound);
         }
 
-        // Locate the entry's directory block and the child inode.
+        // Находим блок каталога с записью и дочерний inode.
         let nblocks = tx.fs.dir_blocks(&pinode)?;
-        let mut found: Option<(u64, u32)> = None; // (dir block, child ino)
+        let mut found: Option<(u64, u32)> = None; // (блок каталога, ino ребёнка)
         for lbn in 0..nblocks {
-            // Read-only scan (see insert_dirent): never allocate on a lookup.
+            // Скан read-only (см. insert_dirent): при поиске ничего не аллоцируем.
             let Some(blk) = inode::block_for_offset(tx.fs, &pinode, lbn * BS as u64)? else {
                 continue;
             };
@@ -1559,34 +1553,35 @@ impl Ext2Fs {
         let (dir_block, child_ino) = found.ok_or(FsError::NotFound)?;
         let mut child = tx.read_inode(child_ino)?;
 
-        // Empty-directory check (read committed state; child is unmodified here).
+        // Проверка пустоты каталога (читаем закоммиченное состояние; child здесь
+        // не изменён).
         if child.is_dir() {
             let cblocks = tx.fs.dir_blocks(&child)?;
             for lbn in 0..cblocks {
                 if let Some(cb) = inode::block_for_offset(self, &child, lbn * BS as u64)? {
                     let buf = self.read_fs_block(cb as u64)?;
                     if dir::live_entry_count(&buf)? != 0 {
-                        return Err(FsError::AlreadyExists); // non-empty directory
+                        return Err(FsError::AlreadyExists); // непустой каталог
                     }
                 }
             }
         }
 
-        // Remove the directory entry.
+        // Удаляем запись каталога.
         {
             let buf = tx.block(dir_block as u64)?;
             dir::remove_from_block(buf, name)?;
         }
 
-        // Release the child according to its link count (issue #18).
+        // Освобождаем ребёнка по счётчику ссылок.
         //
-        // A directory is always released whole: its `i_links_count` counts
-        // `.`/`..` links rather than names, and a hard link to a directory
-        // cannot exist, so the "another name still points here" case is
-        // impossible (empty-directory `rmdir` arrives through `remove`).
-        // Everything else uses the pure `symlink::unlink_action` rule: several
-        // names share the inode, so only the last one frees its blocks — freeing
-        // them early would destroy data the surviving names still read.
+        // Каталог освобождается целиком всегда: его `i_links_count` считает
+        // ссылки `.`/`..`, а не имена, и хардлинка на каталог быть не может,
+        // поэтому случай «на него ещё указывает другое имя» невозможен
+        // (непустой `rmdir` приходит через `remove`). Всё остальное использует
+        // чистое правило `symlink::unlink_action`: несколько имён делят inode,
+        // поэтому только последнее освобождает блоки — раннее освобождение
+        // уничтожило бы данные, которые читают оставшиеся имена.
         let released = if child.is_dir() {
             true
         } else {
@@ -1596,8 +1591,9 @@ impl Ext2Fs {
                     false
                 }
                 Some(UnlinkAction::FreeInode) => true,
-                // A live directory entry pointing at a free inode is already
-                // corrupt; freeing "again" could release a reallocated inode.
+                // Живая запись каталога на свободный inode — уже порча;
+                // повторное «освобождение» могло бы освободить переиспользованный
+                // inode.
                 None => return Err(FsError::Corrupt),
             }
         };
@@ -1618,8 +1614,7 @@ impl Ext2Fs {
         tx.commit()
     }
 
-    /// Read up to `buf.len()` bytes of file `ino` starting at `offset`,
-    /// clamped to `i_size`.
+    /// Читает до `buf.len()` байт файла `ino` с `offset`, с клампом по `i_size`.
     pub fn read_file(&self, ino: u32, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         let inode = self.read_inode(ino)?;
         let size = inode.i_size as u64;
@@ -1649,21 +1644,21 @@ impl Ext2Fs {
         Ok(to_read)
     }
 
-    /// Truncate a regular file to `new_size` bytes.
+    /// Усекает обычный файл до `new_size` байт.
     ///
-    /// Shrinking frees the blocks beyond the new size in one journal
-    /// transaction (clearing their tree pointers and freeing indirect blocks
-    /// that become empty) and zeroes the tail of the boundary block. Growing
-    /// zero-fills the gap through the regular write path. `i_size` is a
-    /// 32-bit field, so larger sizes are `FileTooBig`.
+    /// Усадка освобождает блоки за новым размером одной транзакцией журнала
+    /// (снимая указатели дерева и освобождая опустевшие indirect-блоки) и
+    /// обнуляет хвост граничного блока. Рост заливает промежуток нулями через
+    /// обычный путь записи. `i_size` — 32-битное поле, поэтому большие размеры —
+    /// `FileTooBig`.
     pub fn truncate_file(&self, ino: u32, new_size: u64) -> Result<(), FsError> {
         if new_size > u32::MAX as u64 {
             return Err(FsError::FileTooBig);
         }
         let inode0 = self.read_inode(ino)?;
-        // Only regular files have data blocks. A symlink inode keeps its target
-        // in `i_block` (fast) or in its single block (slow) — truncating it
-        // would rewrite the link target as block pointers (issue #18).
+        // Блоки данных есть только у обычных файлов. Inode симлинка держит цель
+        // в `i_block` (fast) или в своём единственном блоке (slow) — усечение
+        // переписало бы цель ссылки как указатели на блоки.
         if !inode0.is_reg() {
             return Err(FsError::Corrupt);
         }
@@ -1683,7 +1678,7 @@ impl Ext2Fs {
             return Ok(());
         }
 
-        // Shrink.
+        // Усадка.
         let mut tx = Tx::new(self);
         let mut inode = tx.read_inode(ino)?;
         if !inode.is_reg() {
@@ -1695,8 +1690,8 @@ impl Ext2Fs {
         for lbn in new_nblocks..old_nblocks {
             freed += tx.clear_mapping(&mut inode, lbn as u64)?;
         }
-        // Zero the tail of the boundary block when the new size is not
-        // block-aligned and that block is materialized.
+        // Обнуляем хвост граничного блока, если новый размер не выровнен по
+        // блоку и этот блок материализован.
         if new_size % BS as u64 != 0 && new_nblocks > 0 {
             let lbn = (new_nblocks - 1) as u64;
             if let Some(blk) = inode::block_for_offset(tx.fs, &inode, lbn * BS as u64)? {
@@ -1712,31 +1707,28 @@ impl Ext2Fs {
         tx.commit()
     }
 
-    /// Write `data` to file `ino` at `offset`, allocating blocks and growing
-    /// `i_size` as needed. Each chunk is atomic via the journal.
+    /// Пишет `data` в файл `ino` с `offset`, аллоцируя блоки и увеличивая
+    /// `i_size` по необходимости. Каждый чанк атомарен через журнал.
     ///
-    /// The journal log holds only `FMT_LOG_BLOCKS`
-    /// (64) blocks, and `Journal::commit` rejects any transaction with more
-    /// than `log_blocks - 2` dirty blocks (`FsError::OutOfSpace`). The old
-    /// single-transaction write therefore made every file larger than
-    /// ~248 KiB fail with a bogus "NoSpace" even on a nearly empty disk
-    /// (first seen on libc6's gconv/BIG5HKSCS.so, ~450 KiB). Large writes
-    /// are now split into multiple transactions of at most `TX_DATA_BLOCKS`
-    /// data blocks each; dirty metadata (bitmaps, inode table, indirect
-    /// blocks, superblock + group descriptors) stays well under the WAL cap.
-    /// Whole-file atomicity is not required here: the installer already
-    /// removes partially written files on error (R10.4).
+    /// Лог журнала вмещает только `FMT_LOG_BLOCKS` (64) блока, а
+    /// `Journal::commit` отвергает транзакцию с более чем `log_blocks - 2`
+    /// грязными блоками (`FsError::OutOfSpace`). Поэтому большие записи режутся
+    /// на несколько транзакций не более чем по `TX_DATA_BLOCKS` data-блоков;
+    /// грязные метаданные (битмапы, inode-таблица, indirect-блоки, суперблок и
+    /// групповые дескрипторы) остаются заметно ниже лимита WAL. Атомарность
+    /// всего файла здесь не требуется: установщик сам удаляет частично
+    /// записанные файлы при ошибке (R10.4).
     pub fn write_file(&self, ino: u32, offset: u64, data: &[u8]) -> Result<usize, FsError> {
         if data.is_empty() {
             return Ok(0);
         }
-        // `i_size` is a 32-bit field: a write past 4 GiB would wrap `i_size`
-        // and alias the file to its low 4 GiB.
+        // `i_size` — 32-битное поле: запись за 4 ГиБ завернула бы `i_size` и
+        // заалиасила файл на его младшие 4 ГиБ.
         if offset.saturating_add(data.len() as u64) > u32::MAX as u64 {
             return Err(FsError::FileTooBig);
         }
-        // 64 data blocks per Tx — data is no longer journaled,
-        // so the WAL cap only has to fit the metadata blocks.
+        // 64 data-блока на Tx — данные больше не журналируются, поэтому лимит
+        // WAL должен вмещать только метаблоки.
         const TX_DATA_BLOCKS: usize = 64;
 
         let mut written = 0usize;
@@ -1744,8 +1736,8 @@ impl Ext2Fs {
         while written < data.len() {
             let mut tx = Tx::new(self);
             let mut inode = tx.read_inode(ino)?;
-            // Only regular files have data blocks (see `truncate_file`): for a
-            // symlink inode `map_or_alloc` would overwrite the inline target.
+            // Блоки данных есть только у обычных файлов (см. `truncate_file`):
+            // у inode симлинка `map_or_alloc` затёр бы inline-цель.
             if !inode.is_reg() {
                 return Err(FsError::Corrupt);
             }
@@ -1775,7 +1767,7 @@ impl Ext2Fs {
     }
 }
 
-// ─── VfsNode adapters ──────────────────────────────────────────────────────────
+// ─── адаптеры VfsNode ───────────────────────────────────────────────────────
 
 fn fs_to_vfs(e: FsError) -> VfsError {
     match e {
@@ -1788,9 +1780,9 @@ fn fs_to_vfs(e: FsError) -> VfsError {
     }
 }
 
-/// Write `(uid, gid)` to an inode. ext2 stores both as `u16`, so a value that
-/// does not fit is refused instead of silently truncated — a `chown(70000)`
-/// must not become owner 4464.
+/// Пишет `(uid, gid)` в inode. ext2 хранит оба как `u16`, поэтому не
+/// помещающееся значение отвергается, а не обрезается молча: `chown(70000)` не
+/// должен стать владельцем 4464.
 fn ext2_set_owner(fs: &Arc<Ext2Fs>, ino: u32, uid: u32, gid: u32) -> VfsResult<()> {
     if uid > u16::MAX as u32 || gid > u16::MAX as u32 {
         return Err(VfsError::InvalidArgument);
@@ -1803,9 +1795,9 @@ struct Ext2Dir {
     fs: Arc<Ext2Fs>,
     ino: u32,
     name: String,
-    /// Size observed when the node was created (after a successful inode
-    /// read). Fallback for `size()` when a later `read_inode` hits a device
-    /// error: reporting 0 made installers copy empty files (ld-linux.so).
+    /// Размер, снятый при создании узла (после успешного чтения inode). Фоллбэк
+    /// для `size()`, если последующий `read_inode` упрётся в ошибку устройства:
+    /// ответ 0 заставлял установщики копировать пустые файлы (ld-linux.so).
     cached_size: u64,
 }
 
@@ -1865,7 +1857,7 @@ impl VfsNode for Ext2Dir {
         let ino = self.fs.create(self.ino, name, false).map_err(fs_to_vfs)?;
         Ext2Fs::node_for(&self.fs, ino, name).map_err(fs_to_vfs)
     }
-    /// `ln -s`: the target bytes are stored verbatim (issue #18).
+    /// `ln -s`: байты цели сохраняются дословно.
     fn create_symlink(&self, name: &str, target: &[u8]) -> VfsResult<Arc<dyn VfsNode>> {
         let ino = self
             .fs
@@ -1873,7 +1865,7 @@ impl VfsNode for Ext2Dir {
             .map_err(fs_to_vfs)?;
         Ext2Fs::node_for(&self.fs, ino, name).map_err(fs_to_vfs)
     }
-    /// `ln` (hard link): a second name for the target's inode, never a copy.
+    /// `ln` (хардлинк): второе имя для inode цели, никогда не копия.
     fn link(&self, name: &str, target: &Arc<dyn VfsNode>) -> VfsResult<Arc<dyn VfsNode>> {
         let ino = target.fs_ino();
         if ino == 0 || ino > u32::MAX as u64 {
@@ -1908,7 +1900,7 @@ struct Ext2File {
     fs: Arc<Ext2Fs>,
     ino: u32,
     name: String,
-    /// See `Ext2Dir::cached_size`.
+    /// См. `Ext2Dir::cached_size`.
     cached_size: u64,
 }
 
@@ -1953,8 +1945,8 @@ impl VfsNode for Ext2File {
     fn truncate(&self, size: u64) -> VfsResult<()> {
         self.fs.truncate_file(self.ino, size).map_err(fs_to_vfs)
     }
-    /// `i_links_count` in both directions: a hard-linked file reports the number
-    /// of names pointing at it (issue #18).
+    /// `i_links_count` в обе стороны: файл с хардлинками сообщает число имён,
+    /// указывающих на него.
     fn nlink(&self) -> u64 {
         self.fs
             .read_inode(self.ino)
@@ -1969,27 +1961,27 @@ impl VfsNode for Ext2File {
     }
 }
 
-/// A symbolic link (ext2 `S_IFLNK`, issue #18).
+/// Симлинк (ext2 `S_IFLNK`).
 ///
-/// The node carries no readable content: `read`/`write`/`truncate` stay
-/// `NotSupported` because for a *fast* link those bytes are the target text
-/// living in `i_block`, not data blocks. `size()` is `i_size`, i.e. the target
-/// length — what `lstat` reports and the upper bound `readlink` may return.
+/// Читаемого содержимого у узла нет: `read`/`write`/`truncate` остаются
+/// `NotSupported`, потому что у *fast*-ссылки эти байты — текст цели в `i_block`,
+/// а не data-блоки. `size()` — это `i_size`, то есть длина цели: её показывает
+/// `lstat` и она же верхняя граница ответа `readlink`.
 ///
-/// The guest-visible side is task t15's: it adds the additive
-/// `VfsNode::readlink() -> Option<String>` (introduced by the procfs slice,
-/// `docs/procfs.md` §6.1) and overrides it here with [`Self::target_bytes`].
+/// Guest-видимая сторона — аддитивный `VfsNode::readlink() -> Option<String>`
+/// (введён для procfs, `docs/procfs.md` §6.1), переопределённый здесь через
+/// [`Self::target_bytes`].
 struct Ext2Symlink {
     fs: Arc<Ext2Fs>,
     ino: u32,
     name: String,
-    /// See `Ext2Dir::cached_size`.
+    /// См. `Ext2Dir::cached_size`.
     cached_size: u64,
 }
 
 impl Ext2Symlink {
-    /// The link target exactly as stored (no trailing NUL), or `None` when the
-    /// inode is not a well-formed symlink or the device read fails.
+    /// Цель ссылки ровно как хранится (без хвостового NUL), либо `None`, если
+    /// inode не является корректным симлинком или чтение с устройства не удалось.
     fn target_bytes(&self) -> Option<Vec<u8>> {
         self.fs.read_symlink(self.ino).ok()
     }
@@ -2002,16 +1994,16 @@ impl VfsNode for Ext2Symlink {
     fn is_directory(&self) -> bool {
         false
     }
-    /// Wired into the VFS link machinery (issue #18, t15): `readlink(2)`,
-    /// `lstat` and `d_type` all branch on this, and `vfs::lookup_path_walk`
-    /// follows the link only when it is true.
+    /// Подключено к механике ссылок VFS: `readlink(2)`, `lstat` и `d_type`
+    /// ветвятся по этому, а `vfs::lookup_path_walk` следует по ссылке только
+    /// когда это true.
     fn is_symlink(&self) -> bool {
         true
     }
-    /// The stored target. The VFS models targets as `String` (kernel paths are
-    /// UTF-8 throughout), so a target that is not valid UTF-8 — possible only in
-    /// a foreign image, this writer stores what `tar` gave it — is reported
-    /// lossily; the walker then simply fails to resolve it (`ENOENT`).
+    /// Сохранённая цель. VFS моделирует цели как `String` (пути ядра везде
+    /// UTF-8), поэтому невалидная UTF-8 цель — возможна только в чужом образе,
+    /// этот писатель хранит то, что дал `tar`, — отдаётся lossy; walker затем
+    /// просто не сможет её разрешить (`ENOENT`).
     fn read_link(&self) -> Option<String> {
         self.target_bytes()
             .map(|b| String::from_utf8_lossy(&b).into_owned())
@@ -2055,14 +2047,14 @@ impl VfsNode for Ext2Symlink {
     }
 }
 
-/// An inode of a kind this writer never creates (a foreign image's device node,
-/// fifo, socket, ...): visible and stat-able, but never readable as a file, so
-/// no unknown `i_mode` can reach the regular-file block map.
+/// Inode вида, который этот писатель не создаёт (device-узел чужого образа,
+/// fifo, socket, ...): виден и stat-абелен, но никогда не читается как файл,
+/// поэтому неизвестный `i_mode` не попадает в карту блоков обычного файла.
 struct Ext2Opaque {
     fs: Arc<Ext2Fs>,
     ino: u32,
     name: String,
-    /// See `Ext2Dir::cached_size`.
+    /// См. `Ext2Dir::cached_size`.
     cached_size: u64,
 }
 

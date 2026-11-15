@@ -1,23 +1,22 @@
-//! `paint` — a framebuffer drawing application that runs in a window.
+//! `paint` — framebuffer-приложение рисования, работающее в окне.
 //!
-//! Driven directly by the PS/2 mouse ([`crate::drivers::ps2_mouse`]) and the
-//! keyboard, `paint` draws itself as a desktop window with a title bar
-//! (minimize / maximize / close buttons) and a matching taskbar button, so it
-//! can be hidden, stretched to full screen, or closed. It keeps an
-//! authoritative backing canvas in the heap (one `u32` per pixel) so it can
-//! offer features that need to read the image back — shape preview
-//! (rubber-banding), flood fill, undo, and save/load to disk.
+//! Управляемое напрямую PS/2 мышью ([`crate::drivers::ps2_mouse`]) и
+//! клавиатурой, `paint` рисует себя как desktop-окно с title bar
+//! (кнопки minimize / maximize / close) и соответствующей кнопкой taskbar, так
+//! что его можно скрыть, растянуть на весь экран или закрыть. Приложение держит
+//! авторитетный backing-canvas в heap (один `u32` на пиксель), чтобы предлагать
+//! функции, которым нужно читать изображение обратно: preview фигур
+//! (rubber-banding), flood fill, undo и save/load на диск.
 //!
-//! Layout (top → bottom):
-//!   * the window title bar (drag strip + window controls),
-//!   * a toolbar strip (palette swatches + current tool / color / brush size),
-//!   * the canvas (the drawing surface), and
-//!   * the taskbar at the very bottom (OS label + "Paint" button + live info).
+//! Раскладка (сверху вниз):
+//!   * title bar окна (полоса перетаскивания + кнопки окна),
+//!   * полоса toolbar (палитра + текущий инструмент / цвет / размер кисти),
+//!   * canvas (поверхность рисования) и
+//!   * taskbar в самом низу (метка ОС + кнопка "Paint" + живая информация).
 //!
-//! Tools: Pencil, Eraser, Line, Rectangle, Filled Rectangle, Circle, Disc,
-//! Bucket fill, and color Picker. The current color comes from a 16-entry
-//! palette; the left mouse button paints with it and the right button paints
-//! with white (quick erase).
+//! Инструменты: карандаш, ластик, линия, прямоугольник, залитый прямоугольник,
+//! окружность, диск, заливка и пипетка. Текущий цвет берётся из палитры на 16
+//! записей; левая кнопка мыши рисует им, правая — белым (быстрое стирание).
 
 use alloc::format;
 use alloc::string::String;
@@ -27,40 +26,39 @@ use alloc::vec::Vec;
 use super::keys::{Decoder, KeyEvent};
 use crate::drivers::{cursor, framebuffer, ps2_mouse};
 
-/// Top row of the toolbar holds the palette + current-color chip + label.
+/// Верхняя строка toolbar: палитра + чип текущего цвета + метка.
 const PALETTE_ROW_H: usize = 28;
-/// Second row holds the clickable tool buttons.
+/// Вторая строка: кликабельные кнопки инструментов.
 const TOOL_ROW_H: usize = 24;
-/// Total toolbar height (both rows stacked).
+/// Полная высота toolbar (две строки вместе).
 const TOOLBAR_H: usize = PALETTE_ROW_H + TOOL_ROW_H;
 const SWATCH: usize = 22; // palette swatch width/height in px
 
 const WHITE: u32 = 0xFFFFFF;
 const TOOLBAR_BG: u32 = 0x2C2C34;
 
-/// Height of the window title bar (drag strip + window buttons).
+/// Высота title bar окна (полоса перетаскивания + кнопки окна).
 const TITLEBAR_H: usize = 22;
-/// Width/height padding of the window's drawn border.
+/// Отступы ширины/высоты нарисованной рамки окна.
 const BORDER: usize = 2;
-/// Desktop backdrop painted behind the window in windowed/minimized states.
+/// Фон рабочего стола, рисуемый за окном в оконном/свёрнутом состоянии.
 const DESKTOP_BG: u32 = 0x0E5A6E;
-/// Title-bar background when the window has focus.
+/// Фон title bar, когда окно в фокусе.
 const TITLE_BG: u32 = 0x1B3A5B;
-/// Square size (px) of each title-bar button (minimize / maximize / close).
+/// Размер стороны (px) каждой кнопки title bar (minimize / maximize / close).
 const WIN_BTN_W: usize = 18;
 
-/// Window placement state. `paint` is a single, modal window; these describe
-/// whether it occupies a floating rectangle, the whole screen, or is hidden to
-/// the taskbar.
+/// Состояние размещения окна. `paint` — одно модальное окно; это описывает,
+/// занимает ли оно плавающий прямоугольник, весь экран или скрыто в taskbar.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WinMode {
-    /// Floating window centered on the desktop.
+    /// Плавающее окно по центру рабочего стола.
     Windowed,
-    /// Window stretched to fill the screen (above the taskbar).
+    /// Окно, растянутое на весь экран (над taskbar).
     Maximized,
 }
 
-/// A title-bar window control.
+/// Одна кнопка окна в title bar.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TitleBtn {
     Minimize,
@@ -68,7 +66,7 @@ enum TitleBtn {
     Close,
 }
 
-/// Tools shown as buttons on the second toolbar row, left to right.
+/// Инструменты в виде кнопок второй строки toolbar, слева направо.
 const TOOLS: [Tool; 9] = [
     Tool::Pencil,
     Tool::Eraser,
@@ -81,8 +79,8 @@ const TOOLS: [Tool; 9] = [
     Tool::Picker,
 ];
 
-/// Compute the `(tool, x, width)` layout of the tool-button row. Shared by the
-/// renderer and the click hit-test so they can never disagree.
+/// Вычислить `(tool, x, width)`-раскладку строки кнопок инструментов. Общая для
+/// рендерера и hit-test кликов, чтобы они не могли разойтись.
 fn tool_buttons() -> impl Iterator<Item = (Tool, usize, usize)> {
     let mut x = 4usize;
     TOOLS.iter().map(move |&t| {
@@ -93,10 +91,10 @@ fn tool_buttons() -> impl Iterator<Item = (Tool, usize, usize)> {
     })
 }
 
-/// Width (px) of the brush `-` / `+` buttons.
+/// Ширина (px) кнопок кисти `-` / `+`.
 const BRUSH_BTN_W: usize = 22;
 
-/// Pixel layout of the brush-size controls (right of the tool buttons).
+/// Пиксельная раскладка управления размером кисти (справа от кнопок инструментов).
 struct BrushUi {
     minus_x: usize,
     label_x: usize,
@@ -104,7 +102,7 @@ struct BrushUi {
     end_x: usize,
 }
 
-/// X coordinate just past the last tool button.
+/// X-координата сразу за последней кнопкой инструмента.
 fn tools_end_x() -> usize {
     let mut x = 4usize;
     for &t in TOOLS.iter() {
@@ -113,8 +111,8 @@ fn tools_end_x() -> usize {
     x
 }
 
-/// Layout for the brush `-`, size label, and `+` controls. Shared by the
-/// renderer and the click hit-test.
+/// Раскладка для `-`, метки размера и `+` кисти. Общая для рендерера и
+/// hit-test кликов.
 fn brush_ui() -> BrushUi {
     let minus_x = tools_end_x() + 16;
     let label_x = minus_x + BRUSH_BTN_W + 6;
@@ -129,7 +127,7 @@ fn brush_ui() -> BrushUi {
     }
 }
 
-/// 16-color palette (indices 0..15; number keys 1..0 pick the first ten).
+/// Палитра на 16 цветов (индексы 0..15; цифровые клавиши 1..0 выбирают первые десять).
 const PALETTE: [u32; 16] = [
     0x000000, // black
     0xFFFFFF, // white
@@ -177,7 +175,7 @@ impl Tool {
         }
     }
 
-    /// True for the click-drag-release shape tools that show a live preview.
+    /// True для инструментов фигур click-drag-release, показывающих живой preview.
     fn is_shape(self) -> bool {
         matches!(
             self,
@@ -187,27 +185,27 @@ impl Tool {
 }
 
 struct PaintApp {
-    /// Full framebuffer dimensions (the desktop extent).
+    /// Полные размеры framebuffer (размер рабочего стола).
     screen_w: usize,
     screen_h: usize,
 
-    // Window geometry (outer rectangle, including title bar + border).
+    // Геометрия окна (внешний прямоугольник, включая title bar + рамку).
     win_x: usize,
     win_y: usize,
     win_w: usize,
     win_h: usize,
     mode: WinMode,
-    /// When true the window is hidden and only its taskbar button shows.
+    /// Когда true, окно скрыто и видна только его кнопка в taskbar.
     minimized: bool,
-    /// True while the title bar is being dragged with the left button held.
+    /// True, пока title bar перетаскивается левой кнопкой.
     win_drag: bool,
-    /// Mouse offset from the window origin captured when the drag began.
+    /// Смещение мыши от начала окна, захваченное при старте перетаскивания.
     win_drag_dx: i32,
     win_drag_dy: i32,
 
     cw: usize,
     ch: usize,
-    /// Framebuffer X/Y of canvas pixel (0, 0).
+    /// Framebuffer X/Y пикселя canvas (0, 0).
     canvas_left: usize,
     canvas_top: usize,
     canvas: Vec<u32>,
@@ -219,7 +217,7 @@ struct PaintApp {
     pal_index: usize,
     brush: i32,
 
-    // Active drag (shape tools / freehand).
+    // Активное перетаскивание (инструменты фигур / freehand).
     drawing: bool,
     drag_sx: i32,
     drag_sy: i32,
@@ -231,14 +229,14 @@ struct PaintApp {
     prev_right: bool,
     prev_mid: bool,
 
-    /// Last scheduler tick at which the status bar was repainted (throttle).
+    /// Последний тик планировщика, на котором перерисовывался status bar (throttle).
     last_info_tick: u64,
 
-    /// Set by the title-bar close button; the main loop exits when true.
+    /// Ставится кнопкой close в title bar; главный цикл выходит, когда true.
     quit_requested: bool,
 }
 
-/// Entry point invoked by the `paint` shell command.
+/// Точка входа, вызываемая командой `paint`.
 pub fn run() {
     let (w, h) = framebuffer::dimensions();
     if w == 0 || h == 0 {
@@ -256,9 +254,9 @@ pub fn run() {
         return;
     }
 
-    // Start as a floating window centered on the desktop. `apply_layout` derives
-    // the canvas geometry from the window rectangle and allocates the backing
-    // buffers, so seed the fields with placeholders first.
+    // Начать плавающим окном по центру рабочего стола. `apply_layout` выводит
+    // геометрию canvas из прямоугольника окна и аллоцирует backing-буферы, так
+    // что сначала заполнить поля заглушками.
     let mut app = PaintApp {
         screen_w: w,
         screen_h: h,
@@ -295,7 +293,7 @@ pub fn run() {
         quit_requested: false,
     };
 
-    // Compute the initial window rectangle + canvas, allocating fresh buffers.
+    // Вычислить начальный прямоугольник окна + canvas, аллоцируя свежие буферы.
     app.apply_layout(true);
     if app.cw == 0 || app.ch == 0 {
         crate::fb_println!("paint: screen too small");
@@ -304,28 +302,27 @@ pub fn run() {
 
     app.run_loop();
 
-    // Restore the shell screen: clear to black and reset the text cursor so the
-    // next prompt renders from the top.
+    // Восстановить экран shell: очистить в чёрный и сбросить текстовый курсор,
+    // чтобы следующий промпт рисовался сверху.
     cursor::hide();
     framebuffer::clear_screen();
 }
 
-/// Read one raw scancode from the keyboard device, if available.
+/// Прочитать один сырой сканкод с устройства клавиатуры, если доступно.
 fn read_scancode() -> Option<u8> {
     crate::drivers::get_char("keyboard").and_then(|kbd| kbd.read_char())
 }
 
 impl PaintApp {
-    // ─── Main loop ───────────────────────────────────────────────────────
+    // ─── Главный цикл ───────────────────────────────────────────────────
 
     fn run_loop(&mut self) {
-        // Paint the initial desktop + window UI.
+        // Нарисовать начальный рабочий стол + UI окна.
         let init = ps2_mouse::poll();
         self.redraw_all(&init);
-        // The console draws into a RAM shadow buffer; the cursor is part of the
-        // frame and is drawn before the flush, so one push shows both. Without
-        // the flush the window would be correct in RAM while the device still
-        // shows the shell screen underneath.
+        // Консоль рисует в RAM shadow-буфер; курсор — часть кадра и рисуется
+        // до flush, так что один push показывает оба. Без flush окно было бы
+        // правильным в RAM, а устройство всё ещё показывало экран shell под ним.
         cursor::move_to(init.x, init.y);
         framebuffer::flush();
 
@@ -335,8 +332,8 @@ impl PaintApp {
         loop {
             crate::arch::cpu::halt();
 
-            // Keyboard: Esc (raw 0x01) quits; everything else goes through the
-            // shared decoder so tool/color shortcuts work.
+            // Клавиатура: Esc (сырой 0x01) выходит; всё остальное идёт через
+            // общий decoder, чтобы работали сокращения инструментов/цветов.
             let mut quit = false;
             while let Some(sc) = read_scancode() {
                 if sc == 0x01 {
@@ -354,32 +351,32 @@ impl PaintApp {
                 break;
             }
 
-            // Mouse: only act when something changed.
+            // Мышь: реагировать только когда что-то изменилось.
             let ms = ps2_mouse::poll();
             if ms.seq != last_seq {
                 last_seq = ms.seq;
                 self.handle_mouse(&ms);
             }
 
-            // Push the frame once per pass. `flush` is a no-op when nothing was
-            // drawn (`dirty` is empty), so idling on `halt` stays free; every
-            // canvas edit, toolbar repaint and taskbar update lands on the device
-            // here. This is the paint-side equivalent of the shell's once-per-pass
-            // flush — without it the app drew entirely into RAM.
+            // Пушить кадр один раз за проход. `flush` — no-op, когда ничего не
+            // нарисовано (`dirty` пуст), так что idle на `halt` остаётся бесплатным;
+            // каждая правка canvas, перерисовка toolbar и обновление taskbar
+            // попадают на устройство здесь. Это paint-эквивалент flush'а shell раз
+            // за проход — без него приложение рисовало бы целиком в RAM.
             framebuffer::flush();
 
-            // The title-bar close button requests quit asynchronously.
+            // Кнопка close в title bar асинхронно запрашивает выход.
             if self.quit_requested {
                 break;
             }
         }
     }
 
-    // ─── Input handling ────────────────────────────────────────────────────
+    // ─── Обработка ввода ────────────────────────────────────────────────────
 
-    /// Returns `true` to request quitting paint.
+    /// Возвращает `true`, чтобы запросить выход из paint.
     fn handle_key(&mut self, c: char) -> bool {
-        // While minimized the window is hidden; only quit is honored.
+        // Пока свёрнуто, окно скрыто; учитывается только выход.
         if self.minimized {
             return matches!(c, 'q' | 'Q');
         }
@@ -448,10 +445,10 @@ impl PaintApp {
         let right_edge = ms.right && !self.prev_right;
         let mid_edge = ms.middle && !self.prev_mid;
 
-        // Hide the cursor before touching the framebuffer beneath it.
+        // Скрыть курсор перед тем, как трогать framebuffer под ним.
         cursor::hide();
 
-        // The taskbar button is always live: it minimizes/restores the window.
+        // Кнопка taskbar всегда жива: она сворачивает/восстанавливает окно.
         if left_edge && self.hit_taskbar_button(mx, my) {
             self.set_minimized(!self.minimized, ms);
             self.commit_input_state(ms);
@@ -459,13 +456,13 @@ impl PaintApp {
         }
 
         if self.minimized {
-            // Nothing else is interactive while hidden.
+            // Пока скрыто, остальное не интерактивно.
             self.commit_input_state(ms);
             cursor::move_to(ms.x, ms.y);
             return;
         }
 
-        // Continue or finish an in-progress window drag before anything else.
+        // Продолжить или закончить текущее перетаскивание окна прежде всего.
         if self.win_drag {
             if ms.left {
                 self.drag_window_to(mx, my, ms);
@@ -477,7 +474,7 @@ impl PaintApp {
             return;
         }
 
-        // Title-bar window controls (minimize / maximize / close) and drag.
+        // Кнопки окна (minimize / maximize / close) и перетаскивание.
         if left_edge {
             match self.hit_title_button(mx, my) {
                 Some(TitleBtn::Minimize) => {
@@ -495,8 +492,8 @@ impl PaintApp {
                     return;
                 }
                 None => {
-                    // A press on the title bar (not a button) begins a drag.
-                    // Maximized windows are pinned, so dragging is windowed-only.
+                    // Нажатие на title bar (не на кнопку) начинает перетаскивание.
+                    // Максимизированные окна закреплены, так что drag только в оконном режиме.
                     if self.mode == WinMode::Windowed && self.in_titlebar(mx, my) {
                         self.win_drag = true;
                         self.win_drag_dx = mx - self.win_x as i32;
@@ -515,12 +512,12 @@ impl PaintApp {
         let in_window_x = mx >= win_left && mx < win_right;
 
         if in_window_x && my >= tb_top && my < tb_bottom {
-            // Toolbar clicks (relative to the window origin).
+            // Клики по toolbar (относительно начала окна).
             if left_edge {
                 let rel_y = (my - tb_top) as usize;
                 let px = (mx - win_left) as usize;
                 if rel_y < PALETTE_ROW_H {
-                    // Top row: pick a palette color.
+                    // Верхняя строка: выбрать цвет палитры.
                     let sw = px / SWATCH;
                     if sw < PALETTE.len() {
                         self.pal_index = sw;
@@ -528,7 +525,7 @@ impl PaintApp {
                         self.draw_toolbar();
                     }
                 } else {
-                    // Second row: select a tool or adjust the brush size.
+                    // Вторая строка: выбрать инструмент или изменить размер кисти.
                     let mut hit = false;
                     for (t, bx, bw) in tool_buttons() {
                         if px >= bx && px < bx + bw {
@@ -555,8 +552,8 @@ impl PaintApp {
         } else {
             let canvas_x0 = self.canvas_left as i32;
             let canvas_y0 = self.canvas_top as i32;
-            // Only act on the canvas when the pointer is within it. (Clicks on
-            // the title bar, border, or desktop fall through and are ignored.)
+            // Реагировать на canvas, только когда указатель внутри него. (Клики по
+            // title bar, рамке или рабочему столу проходят мимо и игнорируются.)
             let in_canvas = mx >= canvas_x0
                 && mx < canvas_x0 + self.cw as i32
                 && my >= canvas_y0
@@ -570,9 +567,10 @@ impl PaintApp {
 
         self.commit_input_state(ms);
 
-        // Repainting the taskbar is comparatively slow (full-width fill + text
-        // into uncached framebuffer memory), so throttle it to a few updates per
-        // second. The cursor still moves every event since move_to is cheap.
+        // Перерисовка taskbar сравнительно медленная (заливка во всю ширину + текст
+        // в некэшированную память framebuffer), поэтому throttle до нескольких
+        // обновлений в секунду. Курсор всё равно двигается на каждое событие, так
+        // как move_to дёшев.
         let now = crate::task::scheduler::ticks();
         if now.wrapping_sub(self.last_info_tick) >= 6 {
             self.draw_bottom_bar(ms);
@@ -581,7 +579,7 @@ impl PaintApp {
         cursor::move_to(ms.x, ms.y);
     }
 
-    /// Record the current button state for next-frame edge detection.
+    /// Запомнить текущее состояние кнопок для определения фронтов на следующем кадре.
     #[inline]
     fn commit_input_state(&mut self, ms: &ps2_mouse::MouseState) {
         self.prev_left = ms.left;
@@ -655,7 +653,7 @@ impl PaintApp {
 }
 
 impl PaintApp {
-    // ─── Canvas primitives (operate on the backing buffer) ─────────────────
+    // ─── Примитивы canvas (работают с backing-буфером) ─────────────────────
 
     #[inline]
     fn in_bounds(&self, x: i32, y: i32) -> bool {
@@ -678,7 +676,7 @@ impl PaintApp {
         }
     }
 
-    /// Fill a `b×b` square centered on `(cx, cy)` (the brush footprint).
+    /// Залить квадрат `b×b` с центром `(cx, cy)` (отпечаток кисти).
     fn c_square(&mut self, cx: i32, cy: i32, b: i32, color: u32) {
         let r = b / 2;
         for dy in 0..b {
@@ -688,14 +686,14 @@ impl PaintApp {
         }
     }
 
-    /// Paint a single brush dot and blit it.
+    /// Нарисовать одну точку кисти и blit её.
     fn draw_dot(&mut self, cx: i32, cy: i32, color: u32) {
         self.c_square(cx, cy, self.brush, color);
         let r = self.brush / 2 + 1;
         self.blit_canvas_rect_i(cx - r, cy - r, self.brush + 2, self.brush + 2);
     }
 
-    /// Brush-thick line on the canvas, then blit the bounding box once.
+    /// Линия толщиной кисти на canvas, затем blit ограничивающего прямоугольника один раз.
     fn commit_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
         let b = self.brush;
         let (mut x, mut y) = (x0, y0);
@@ -727,7 +725,7 @@ impl PaintApp {
         self.blit_canvas_rect_i(bx, by, bw, bh);
     }
 
-    /// Commit a shape tool's final geometry to the canvas (start → end).
+    /// Зафиксировать финальную геометрию инструмента фигур на canvas (start → end).
     fn commit_shape(&mut self, sx: i32, sy: i32, ex: i32, ey: i32) {
         let color = self.color;
         let b = self.brush;
@@ -768,7 +766,7 @@ impl PaintApp {
         }
     }
 
-    /// Brush-thick circle outline (center, radius).
+    /// Контур окружности толщиной кисти (центр, радиус).
     fn c_circle(&mut self, cx: i32, cy: i32, r: i32, b: i32, color: u32) {
         if r <= 0 {
             return;
@@ -799,7 +797,7 @@ impl PaintApp {
         }
     }
 
-    /// Filled disc (center, radius).
+    /// Залитый диск (центр, радиус).
     fn c_disc(&mut self, cx: i32, cy: i32, r: i32, color: u32) {
         if r <= 0 {
             return;
@@ -814,10 +812,10 @@ impl PaintApp {
         }
     }
 
-    // ─── Shape preview (rubber-banding, framebuffer-only) ──────────────────
+    // ─── Preview фигур (rubber-banding, только framebuffer) ──────────────────
 
     fn update_preview(&mut self, cx: i32, cy: i32) {
-        // Restore the previously-previewed region from the canvas.
+        // Восстановить ранее показанную область из canvas.
         self.clear_preview();
 
         let top = self.canvas_top as isize;
@@ -826,7 +824,7 @@ impl PaintApp {
         let b = self.brush as isize;
         let (sx, sy) = (self.drag_sx, self.drag_sy);
 
-        // Draw the new preview directly onto the framebuffer (transient).
+        // Нарисовать новый preview прямо во framebuffer (временно).
         framebuffer::with(|fb| match self.tool {
             Tool::Line => {
                 fb.draw_thick_line(
@@ -869,7 +867,7 @@ impl PaintApp {
             _ => {}
         });
 
-        // Record the canvas-space bounding box to restore next frame.
+        // Запомнить bounding box в canvas-координатах для восстановления на следующем кадре.
         let bbox = match self.tool {
             Tool::Circle | Tool::Disc => {
                 let r = radius(sx, sy, cx, cy);
@@ -891,7 +889,7 @@ impl PaintApp {
         }
     }
 
-    // ─── Flood fill (scanline) ─────────────────────────────────────────────
+    // ─── Flood fill (построчно) ─────────────────────────────────────────────
 
     fn flood_fill(&mut self, sx: i32, sy: i32, new: u32) {
         let target = self.get_px(sx, sy);
@@ -904,7 +902,7 @@ impl PaintApp {
             if self.get_px(x, y) != target {
                 continue;
             }
-            // Extend the span left and right.
+            // Расширить пробег влево и вправо.
             let mut lx = x;
             while lx > 0 && self.get_px(lx - 1, y) == target {
                 lx -= 1;
@@ -916,7 +914,7 @@ impl PaintApp {
             for px in lx..=rx {
                 self.c_set(px, y, new);
             }
-            // Seed the rows above and below at each run of target pixels.
+            // Посеять строки выше и ниже на каждом пробеге целевых пикселей.
             for &ny in &[y - 1, y + 1] {
                 if ny < 0 || ny >= self.ch as i32 {
                     continue;
@@ -936,7 +934,7 @@ impl PaintApp {
         }
     }
 
-    // ─── Blitting (canvas → framebuffer) ───────────────────────────────────
+    // ─── Blit (canvas → framebuffer) ───────────────────────────────────────
 
     fn clamp_box(&self, x: i32, y: i32, w: i32, h: i32) -> (usize, usize, usize, usize) {
         let x0 = x.max(0).min(self.cw as i32) as usize;
@@ -969,7 +967,7 @@ impl PaintApp {
         self.blit_canvas_rect(0, 0, self.cw, self.ch);
     }
 
-    // ─── Undo / clear ──────────────────────────────────────────────────────
+    // ─── Undo / очистка ────────────────────────────────────────────────────
 
     fn snapshot_undo(&mut self) {
         self.undo.copy_from_slice(&self.canvas);
@@ -980,7 +978,7 @@ impl PaintApp {
         if !self.has_undo {
             return;
         }
-        // Swap so a second undo acts as redo.
+        // Поменять местами, чтобы второй undo работал как redo.
         core::mem::swap(&mut self.canvas, &mut self.undo);
         cursor::hide();
         self.blit_all();
@@ -1014,7 +1012,7 @@ impl PaintApp {
         let aw = self.win_w;
         framebuffer::with(|fb| {
             fb.fill_rect(ox, oy, aw, TOOLBAR_H, TOOLBAR_BG);
-            // Palette swatches (top row).
+            // Образцы палитры (верхняя строка).
             for (i, &col) in PALETTE.iter().enumerate() {
                 let x = ox + i * SWATCH;
                 if x + SWATCH > ox + aw {
@@ -1026,14 +1024,14 @@ impl PaintApp {
                     fb.draw_rect(x + 1, oy + 3, SWATCH - 2, SWATCH - 2, 0x000000);
                 }
             }
-            // Current color chip + tool/size label (top row).
+            // Чип текущего цвета + метка инструмента/размера (верхняя строка).
             let tx = PALETTE.len() * SWATCH + 10;
             if tx + 24 < aw {
                 fb.fill_rect(ox + tx, oy + 4, 22, 22, color);
                 fb.draw_rect(ox + tx, oy + 4, 22, 22, 0xFFFFFF);
                 fb.draw_text_px(ox + tx + 30, oy + 8, &label, 0xE6E6E6, TOOLBAR_BG);
             }
-            // Tool buttons (second row).
+            // Кнопки инструментов (вторая строка).
             let ty = oy + PALETTE_ROW_H + TOOL_ROW_H.saturating_sub(framebuffer::CHAR_HEIGHT) / 2;
             for (t, bx, bw) in tool_buttons() {
                 if bx + bw > aw {
@@ -1053,13 +1051,13 @@ impl PaintApp {
                 }
                 fb.draw_text_px(ox + bx + 4, ty, t.name(), 0xE6E6E6, bg);
             }
-            // Brush-size controls (second row, right of the tools).
+            // Управление размером кисти (вторая строка, справа от инструментов).
             let bu = brush_ui();
             if bu.end_x <= aw {
                 let by = oy + PALETTE_ROW_H + 2;
                 let bh = TOOL_ROW_H - 4;
                 let btn_bg = 0x3A3A44;
-                // Minus button.
+                // Кнопка минус.
                 fb.fill_rect(ox + bu.minus_x, by, BRUSH_BTN_W, bh, btn_bg);
                 fb.draw_text_px(
                     ox + bu.minus_x + (BRUSH_BTN_W - framebuffer::CHAR_WIDTH) / 2,
@@ -1068,10 +1066,10 @@ impl PaintApp {
                     0xE6E6E6,
                     btn_bg,
                 );
-                // Size label.
+                // Метка размера.
                 let s = format!("Sz:{}", brush);
                 fb.draw_text_px(ox + bu.label_x, ty, &s, 0xE6E6E6, TOOLBAR_BG);
-                // Plus button.
+                // Кнопка плюс.
                 fb.fill_rect(ox + bu.plus_x, by, BRUSH_BTN_W, bh, btn_bg);
                 fb.draw_text_px(
                     ox + bu.plus_x + (BRUSH_BTN_W - framebuffer::CHAR_WIDTH) / 2,
@@ -1084,9 +1082,9 @@ impl PaintApp {
         });
     }
 
-    // ─── Window layout ─────────────────────────────────────────────────────
+    // ─── Раскладка окна ────────────────────────────────────────────────────
 
-    /// Outer window rectangle `(x, y, w, h)` for a given placement mode.
+    /// Внешний прямоугольник окна `(x, y, w, h)` для заданного режима размещения.
     fn window_rect_for(&self, mode: WinMode) -> (usize, usize, usize, usize) {
         let avail_h = self.screen_h.saturating_sub(framebuffer::STATUS_BAR_HEIGHT);
         match mode {
@@ -1101,9 +1099,9 @@ impl PaintApp {
         }
     }
 
-    /// Recompute window geometry + canvas dimensions from `self.mode`. On the
-    /// initial call the backing buffers are freshly allocated; afterwards the
-    /// canvas is resized in place (preserving the overlapping pixels).
+    /// Пересчитать геометрию окна + размеры canvas из `self.mode`. На первом
+    /// вызове backing-буферы аллоцируются заново; после canvas меняется на месте
+    /// (сохраняя перекрывающиеся пиксели).
     fn apply_layout(&mut self, initial: bool) {
         let (x, y, w, h) = self.window_rect_for(self.mode);
         self.win_x = x;
@@ -1125,8 +1123,8 @@ impl PaintApp {
         }
     }
 
-    /// Resize the canvas to `new_w × new_h`, copying the overlapping top-left
-    /// region so existing artwork survives a maximize/restore.
+    /// Изменить размер canvas на `new_w × new_h`, скопировав перекрывающуюся
+    /// верхне-левую область, чтобы рисунок выжил maximize/restore.
     fn resize_canvas(&mut self, new_w: usize, new_h: usize) {
         if new_w == self.cw && new_h == self.ch {
             return;
@@ -1148,7 +1146,7 @@ impl PaintApp {
         self.preview_bbox = None;
     }
 
-    /// Toggle between the floating and full-screen window placements.
+    /// Переключиться между плавающим и полноэкранным размещением окна.
     fn toggle_maximize(&mut self) {
         self.mode = match self.mode {
             WinMode::Windowed => WinMode::Maximized,
@@ -1161,7 +1159,7 @@ impl PaintApp {
         cursor::move_to(ms.x, ms.y);
     }
 
-    /// Hide (or restore) the window to/from the taskbar.
+    /// Скрыть (или восстановить) окно в taskbar/из taskbar.
     fn set_minimized(&mut self, value: bool, ms: &ps2_mouse::MouseState) {
         if self.minimized == value {
             return;
@@ -1174,10 +1172,10 @@ impl PaintApp {
         cursor::move_to(ms.x, ms.y);
     }
 
-    // ─── Window chrome ─────────────────────────────────────────────────────
+    // ─── Chrome окна ──────────────────────────────────────────────────────
 
-    /// Repaint the whole screen: desktop backdrop, the window (unless hidden),
-    /// and the taskbar.
+    /// Перерисовать весь экран: фон рабочего стола, окно (если не скрыто) и
+    /// taskbar.
     fn redraw_all(&self, ms: &ps2_mouse::MouseState) {
         self.draw_desktop();
         if !self.minimized {
@@ -1188,7 +1186,7 @@ impl PaintApp {
         self.draw_bottom_bar(ms);
     }
 
-    /// Fill the desktop area (everything above the taskbar) with the backdrop.
+    /// Залить область рабочего стола (всё выше taskbar) фоном.
     fn draw_desktop(&self) {
         let h = self.screen_h.saturating_sub(framebuffer::STATUS_BAR_HEIGHT);
         framebuffer::with(|fb| {
@@ -1197,7 +1195,7 @@ impl PaintApp {
         });
     }
 
-    /// Title-bar button rectangles: `(min_x, max_x, close_x, y, w, h)`.
+    /// Прямоугольники кнопок title bar: `(min_x, max_x, close_x, y, w, h)`.
     fn title_button_rects(&self) -> (usize, usize, usize, usize, usize, usize) {
         let bw = WIN_BTN_W;
         let bh = TITLEBAR_H.saturating_sub(2);
@@ -1225,7 +1223,7 @@ impl PaintApp {
         }
     }
 
-    /// True when `(mx, my)` lies on the window's title-bar strip.
+    /// True, когда `(mx, my)` лежит на полосе title bar окна.
     fn in_titlebar(&self, mx: i32, my: i32) -> bool {
         mx >= self.win_x as i32
             && mx < (self.win_x + self.win_w) as i32
@@ -1233,8 +1231,8 @@ impl PaintApp {
             && my < (self.win_y + TITLEBAR_H) as i32
     }
 
-    /// Move the window so its origin tracks the dragged pointer, clamped to the
-    /// desktop, then repaint. No-op when the position is unchanged.
+    /// Двигать окно так, чтобы его начало следовало за указателем, с клампом по
+    /// рабочему столу, затем перерисовать. No-op, когда позиция не изменилась.
     fn drag_window_to(&mut self, mx: i32, my: i32, ms: &ps2_mouse::MouseState) {
         let avail_h = self.screen_h.saturating_sub(framebuffer::STATUS_BAR_HEIGHT);
         let max_x = self.screen_w.saturating_sub(self.win_w) as i32;
@@ -1253,7 +1251,7 @@ impl PaintApp {
         cursor::move_to(ms.x, ms.y);
     }
 
-    /// Draw the title bar, window border, and the three window buttons.
+    /// Нарисовать title bar, рамку окна и три кнопки окна.
     fn draw_window_frame(&self) {
         let (mnx, mxx, clx, by, bw, bh) = self.title_button_rects();
         let title = match self.mode {
@@ -1265,7 +1263,7 @@ impl PaintApp {
         let ww = self.win_w;
         let wh = self.win_h;
         framebuffer::with(|fb| {
-            // Title bar + caption.
+            // Title bar + заголовок.
             fb.fill_rect(wx, wy, ww, TITLEBAR_H, TITLE_BG);
             fb.draw_text_px(
                 wx + 8,
@@ -1274,18 +1272,18 @@ impl PaintApp {
                 0xFFFFFF,
                 TITLE_BG,
             );
-            // Window outline (double line for a slight bevel).
+            // Контур окна (двойная линия для лёгкого скоса).
             fb.draw_rect(wx, wy, ww, wh, 0x05151F);
             if ww > 2 && wh > 2 {
                 fb.draw_rect(wx + 1, wy + 1, ww - 2, wh - 2, 0x6FA8C8);
             }
-            // Minimize button (underline glyph).
+            // Кнопка minimize (глиф-подчёркивание).
             fb.fill_rect(mnx, by, bw, bh, 0x3A5A74);
             fb.fill_rect(mnx + 4, by + bh - 6, bw - 8, 2, 0xFFFFFF);
-            // Maximize button (square glyph).
+            // Кнопка maximize (квадратный глиф).
             fb.fill_rect(mxx, by, bw, bh, 0x3A5A74);
             fb.draw_rect(mxx + 4, by + 4, bw - 8, bh - 8, 0xFFFFFF);
-            // Close button (red, "X" glyph).
+            // Кнопка close (красная, глиф "X").
             fb.fill_rect(clx, by, bw, bh, 0xC0392B);
             fb.draw_text_px(
                 clx + (bw - framebuffer::CHAR_WIDTH) / 2,
@@ -1297,9 +1295,9 @@ impl PaintApp {
         });
     }
 
-    // ─── Taskbar ─────────────────────────────────────────────────────────
+    // ─── Taskbar ──────────────────────────────────────────────────────────
 
-    /// Rectangle of the "Paint" taskbar button `(x, y, w, h)`.
+    /// Прямоугольник кнопки "Paint" в taskbar `(x, y, w, h)`.
     fn taskbar_button_rect(&self) -> (usize, usize, usize, usize) {
         let bar_top = self.screen_h.saturating_sub(framebuffer::STATUS_BAR_HEIGHT);
         let bw = 7 * framebuffer::CHAR_WIDTH; // " Paint "
@@ -1314,7 +1312,7 @@ impl PaintApp {
         mx >= bx as i32 && mx < (bx + bw) as i32 && my >= by as i32 && my < (by + bh) as i32
     }
 
-    /// Repaint the taskbar with the live paint state.
+    /// Перерисовать taskbar с живым состоянием paint.
     fn draw_bottom_bar(&self, ms: &ps2_mouse::MouseState) {
         let cx = ms.x as i32 - self.canvas_left as i32;
         let cy = ms.y as i32 - self.canvas_top as i32;
@@ -1335,7 +1333,7 @@ impl PaintApp {
         self.draw_bottom_bar_msg(&info);
     }
 
-    /// Draw the taskbar background, the "Paint" button, and `msg` on the right.
+    /// Нарисовать фон taskbar, кнопку "Paint" и `msg` справа.
     fn draw_bottom_bar_msg(&self, msg: &str) {
         const BG: u32 = 0x1B3A5B;
         const FG: u32 = 0xE6F0FF;
@@ -1349,12 +1347,12 @@ impl PaintApp {
             fb.fill_rect(0, bar_top, w, 1, 0x3C6FA0); // separator highlight
             let ty = bar_top + (bar_h.saturating_sub(framebuffer::CHAR_HEIGHT)) / 2;
             fb.draw_text_px(6, ty, "pagh OS", FG, BG);
-            // Taskbar button for the paint window (dim when minimized).
+            // Кнопка taskbar для окна paint (тусклая, когда свёрнута).
             let btn_bg = if minimized { 0x10324F } else { 0x2E5C86 };
             fb.fill_rect(bx, by, bw, bh, btn_bg);
             fb.draw_rect(bx, by, bw, bh, 0x6FA8C8);
             fb.draw_text_px(bx + framebuffer::CHAR_WIDTH, ty, "Paint", FG, btn_bg);
-            // Right-aligned status message.
+            // Право-выровненное сообщение состояния.
             let rw = msg.len() * framebuffer::CHAR_WIDTH;
             if rw + 8 < w {
                 fb.draw_text_px(w - rw - 6, ty, msg, FG, BG);
@@ -1362,7 +1360,7 @@ impl PaintApp {
         });
     }
 
-    // ─── Save / load (raw image to /mnt/paint.img) ─────────────────────────
+    // ─── Save / load (сырое изображение в /mnt/paint.img) ───────────────────
 
     fn save(&self) {
         let mut bytes: Vec<u8> = Vec::with_capacity(16 + self.canvas.len() * 4);
@@ -1395,7 +1393,7 @@ impl PaintApp {
                 return;
             }
         };
-        // Read the whole file.
+        // Прочитать файл целиком.
         let mut data: Vec<u8> = Vec::new();
         let mut buf = [0u8; 4096];
         let mut off: u64 = 0;
@@ -1448,9 +1446,9 @@ impl PaintApp {
     }
 }
 
-// ─── Free geometry helpers ───────────────────────────────────────────────────
+// ─── Свободные геометрические хелперы ─────────────────────────────────────────
 
-/// Normalize two corners into `(x, y, w, h)` with positive extents.
+/// Нормализовать два угла в `(x, y, w, h)` с положительными размерами.
 fn norm_rect(x0: i32, y0: i32, x1: i32, y1: i32) -> (i32, i32, i32, i32) {
     let x = x0.min(x1);
     let y = y0.min(y1);
@@ -1459,14 +1457,14 @@ fn norm_rect(x0: i32, y0: i32, x1: i32, y1: i32) -> (i32, i32, i32, i32) {
     (x, y, w, h)
 }
 
-/// Euclidean radius between two points (rounded down).
+/// Евклидов радиус между двумя точками (округлённый вниз).
 fn radius(x0: i32, y0: i32, x1: i32, y1: i32) -> i32 {
     let dx = (x1 - x0) as i64;
     let dy = (y1 - y0) as i64;
     isqrt(dx * dx + dy * dy) as i32
 }
 
-/// Integer square root (Newton's method).
+/// Целочисленный квадратный корень (метод Ньютона).
 fn isqrt(n: i64) -> i64 {
     if n <= 0 {
         return 0;

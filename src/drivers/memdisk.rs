@@ -1,32 +1,31 @@
-//! RAM disk: a block device backed by a boot-loaded image in memory.
+//! RAM-диск: блочное устройство над загруженным в память образом.
 //!
-//! WHY THIS EXISTS. On real hardware the kernel can only mount a filesystem
-//! from a device it has a driver for, and the driver list is short: virtio-blk
-//! (QEMU) and NVMe. A machine with only SATA, or one where the operator does not
-//! want to give pagh a whole disk, had nothing to mount: the boot log said
-//! `fs (no disk)` and the system came up on ramfs alone — a shell with no
-//! programs, because everything lives in the ext2 image at `/mnt`.
+//! Зачем: на реальном железе ядро может смонтировать ФС только с устройства, для
+//! которого есть драйвер, а список драйверов короток: virtio-blk (QEMU) и NVMe.
+//! Машина только с SATA — или та, где оператор не хочет отдавать pagh целый диск, —
+//! не имела что монтировать: boot-лог говорил `fs (no disk)`, и система поднималась
+//! на одном ramfs — shell без программ, потому что всё живёт в ext2-образе в `/mnt`.
 //!
-//! Limine can load arbitrary files next to the kernel and hand them to it in
-//! memory, so the image the system runs from can travel on the same USB stick or
-//! ISO as `pagh.elf`. This module is the `BlockDevice` half of that: a 512-byte
-//! sector view over one such buffer. `boot.rs` finds the module whose name ends
-//! in `.img` and registers it, and the ordinary ext2 mount path takes it from
-//! there — no filesystem code changes at all.
+//! Limine умеет загружать произвольные файлы рядом с ядром и отдавать их в память,
+//! так что образ, с которого работает система, может ехать на той же USB-флешке или
+//! ISO, что и `pagh.elf`. Модуль — половина `BlockDevice` этого: 512-байтовый
+//! посекторный вид над одним таким буфером. `boot.rs` находит модуль с именем на
+//! `.img`, регистрирует его, а обычный путь монтирования ext2 берёт дальше — без
+//! каких-либо изменений кода ФС.
 //!
-//! WRITES GO TO MEMORY. The buffer is the Limine module, which the PMM keeps
-//! reserved (it is part of the kernel-and-modules memmap region), so writes are
-//! safe but do not survive a reboot: a RAM-disk boot is a live system whose
-//! changes are discarded, like a live CD. Persisting them needs a writable
-//! medium, which means a real storage driver (NVMe today, USB mass storage
-//! later).
+//! ЗАПИСИ ИДУТ В ПАМЯТЬ. Буфер — это Limine-модуль, который PMM держит
+//! зарезервированным (часть memmap-региона kernel-and-modules), так что записи
+//! безопасны, но не переживают перезагрузку: загрузка с RAM-диска — живая система,
+//! чьи изменения отбрасываются, как live CD. Для персистентности нужен записываемый
+//! носитель, то есть настоящий драйвер хранения (NVMe сегодня, USB mass storage
+//! позже).
 //!
-//! The WAL on such a volume is therefore NOT a durability mechanism — the
-//! medium dies with the boot and the image on the boot medium is never
-//! modified, so there is nothing to replay on the next start. It still earns its
-//! keep as intra-session atomicity (a mutation interrupted halfway leaves the
-//! live tree consistent), and `fs/README.md` states the distinction rather than
-//! letting "WAL" imply "safe across power loss" where it cannot be.
+//! Поэтому WAL на таком томе — НЕ механизм durability: носитель умирает с
+//! загрузкой, а образ на загрузочном носителе никогда не модифицируется, так что
+//! воспроизводить на следующем старте нечего. Он всё равно ценен как
+//! внутрисессионная атомарность (прерванная на середине мутация оставляет живое
+//! дерево консистентным), и `fs/README.md` фиксирует различие, а не позволяет «WAL»
+//! подразумевать «безопасно при потере питания» там, где это невозможно.
 
 use alloc::sync::Arc;
 

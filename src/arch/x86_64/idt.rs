@@ -1,5 +1,4 @@
-// arch/x86_64/idt.rs — Interrupt Descriptor Table and exception handlers
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// arch/x86_64/idt.rs — Interrupt Descriptor Table и обработчики исключений.
 
 use core::cell::SyncUnsafeCell;
 use x86_64::registers::control::Cr2;
@@ -9,21 +8,21 @@ use x86_64::VirtAddr;
 
 use crate::arch::x86_64::linux::trap_frame::{exception_action, TrapAction};
 
-// The IDT lives in a `SyncUnsafeCell` rather than a `static mut` so that all
-// access goes through the cell's `.get()` raw pointer, never through a
-// reference to a mutable static (which the `static_mut_refs` lint forbids).
-// `InterruptDescriptorTable` is not `Sync`, but `SyncUnsafeCell` provides the
-// `Sync` impl required of a `static`; soundness is upheld by the init-once,
-// single-threaded, pre-interrupt invariant documented at each access site.
+// IDT живёт в `SyncUnsafeCell`, а не в `static mut`, чтобы весь доступ шёл
+// через сырой указатель `.get()`, никогда через ссылку на изменяемый static
+// (это запрещает lint `static_mut_refs`). `InterruptDescriptorTable` не `Sync`,
+// но `SyncUnsafeCell` даёт реализацию `Sync`, требуемую static; корректность
+// держится на инварианте «инициализация один раз, однопоточно, до прерываний»,
+// описанном в каждом месте доступа.
 static IDT: SyncUnsafeCell<InterruptDescriptorTable> =
     SyncUnsafeCell::new(InterruptDescriptorTable::new());
 
 pub fn init() {
-    // SAFETY: `init` is called exactly once during early boot, on the bootstrap
-    // CPU, with interrupts still disabled and before any other code can observe
-    // the IDT. No other thread or interrupt handler can access `IDT` while we
-    // hold this `&mut`, so building the table through the cell's raw pointer is
-    // free of aliasing.
+    // SAFETY: `init` вызывается ровно один раз при ранней загрузке, на
+    // bootstrap-CPU, с ещё выключенными прерываниями и до того, как IDT сможет
+    // увидеть другой код. Никакой поток и обработчик прерываний не обращается к
+    // `IDT`, пока мы держим этот `&mut`, поэтому построение таблицы через сырой
+    // указатель ячейки свободно от алиасинга.
     let idt = unsafe { &mut *IDT.get() };
 
     idt.divide_error.set_handler_fn(divide_error_handler);
@@ -55,15 +54,15 @@ pub fn init() {
         .set_handler_fn(vmm_comm_handler);
     idt.security_exception.set_handler_fn(security_handler);
 
-    // Vector 32: custom assembly stub for preemptive context switch.
-    // SAFETY: the address is the entry point of the naked `irq32_stub`, which
-    // implements the full interrupt prologue/epilogue contract for vector 32.
+    // Вектор 32: собственный asm-стаб для вытесняющего переключения контекста.
+    // SAFETY: адрес — точка входа naked-функции `irq32_stub`, реализующей полный
+    // контракт пролога/эпилога прерывания для вектора 32.
     unsafe {
         idt[32].set_handler_addr(VirtAddr::new(
             crate::task::switch::irq32_stub as *const () as u64,
         ));
     }
-    // Vectors 33–47: standard IRQ handlers
+    // Векторы 33–47: стандартные обработчики IRQ
     idt[33].set_handler_fn(irq33_handler);
     idt[34].set_handler_fn(irq34_handler);
     idt[35].set_handler_fn(irq35_handler);
@@ -80,13 +79,13 @@ pub fn init() {
     idt[46].set_handler_fn(irq46_handler);
     idt[47].set_handler_fn(irq47_handler);
 
-    // Vector 0x80: ring-3-invokable system-call gate. DPL=3 so user code is
-    // permitted to execute `int 0x80`; the naked stub marshals args and
-    // dispatches (see `arch::x86_64::syscall::int80_stub`). Using a software
-    // interrupt for syscalls reuses the CPU's automatic RSP0 stack switch and
-    // clean `iretq` return to ring 3.
-    // SAFETY: the address is the entry point of the naked `int80_stub`, which
-    // honors the interrupt-gate calling contract for vector 0x80.
+    // Вектор 0x80: syscall-гейт, вызываемый из ring 3. DPL=3, чтобы
+    // пользовательский код мог исполнить `int 0x80`; naked-стаб маршаллит
+    // аргументы и диспетчеризует (см. `arch::x86_64::syscall::int80_stub`).
+    // Программное прерывание для syscall переиспользует автоматическое
+    // переключение стека через RSP0 и чистый возврат `iretq` в ring 3.
+    // SAFETY: адрес — точка входа naked-функции `int80_stub`, соблюдающей
+    // контракт вызова шлюза прерывания для вектора 0x80.
     unsafe {
         idt[0x80]
             .set_handler_addr(VirtAddr::new(
@@ -95,19 +94,19 @@ pub fn init() {
             .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
     }
 
-    // SAFETY: `load()` requires `&'static self`. The shared reference is derived
-    // from the `'static` cell's pointer and is sound because the table is now
-    // fully initialized and is never mutated again after this point — all later
-    // access is read-only by the CPU when dispatching interrupts. The init-once
-    // invariant above guarantees no concurrent `&mut` exists.
+    // SAFETY: `load()` требует `&'static self`. Общая ссылка берётся из
+    // указателя `'static`-ячейки и корректна, потому что таблица теперь
+    // полностью инициализирована и больше не меняется — весь последующий доступ
+    // при диспетчеризации прерываний только читающий. Инвариант инициализации
+    // выше гарантирует отсутствие конкурентного `&mut`.
     unsafe { &*IDT.get() }.load();
 
     crate::debug!("IDT loaded: 32 exceptions + 16 IRQ (vec32=stub)");
 }
 
-// ─── Exception handlers ──────────────────────────────────────────────────
+// ─── Обработчики исключений ──────────────────────────────────────────────
 
-/// When true, exception handlers dump the raw kernel stack (debugging aid).
+/// Если true, обработчики исключений печатают сырой стек ядра (отладка).
 pub static STACK_DUMP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 extern "x86-interrupt" fn divide_error_handler(stack: InterruptStackFrame) {
@@ -122,12 +121,12 @@ extern "x86-interrupt" fn debug_handler(stack: InterruptStackFrame) {
         "[EXC #1] Debug RIP: 0x{:016x}",
         stack.instruction_pointer.as_u64()
     );
-    // F-r3-arch-1: RFLAGS.TF is writable from ring 3 (`pushfq/orq $0x100/popfq`),
-    // so a #DB with the trap flag set is a userspace-induced single-step trap even
-    // if the saved frame describes ring 0 (the user set TF and immediately issued
-    // a syscall; `syscall::init` also masks TF out of the kernel RFLAGS, but keep
-    // this classification as the belt). Both cases are the user's bug, never a
-    // kernel fault.
+    // RFLAGS.TF записывается из ring 3 (`pushfq/orq $0x100/popfq`), поэтому #DB
+    // с установленным trap-флагом — это вызванная userland'ом ловушка
+    // пошагового выполнения, даже если сохранённый фрейм описывает ring 0
+    // (пользователь поставил TF и сразу выдал syscall; `syscall::init` ещё и
+    // маскирует TF в RFLAGS ядра, но оставляем эту классификацию как страховку).
+    // Оба случая — ошибка пользователя, а не отказ ядра.
     user_exception_or_halt_flagged(&stack, 1, SIGTRAP, "SIGTRAP");
 }
 extern "x86-interrupt" fn nmi_handler(stack: InterruptStackFrame) {
@@ -149,7 +148,7 @@ extern "x86-interrupt" fn overflow_handler(stack: InterruptStackFrame) {
         "[EXC #4] Overflow RIP: 0x{:016x}",
         stack.instruction_pointer.as_u64()
     );
-    // Linux delivers #OF (INTO/into overflow) as SIGSEGV, not SIGFPE.
+    // Linux доставляет #OF (INTO/переполнение при into) как SIGSEGV, а не SIGFPE.
     user_exception_or_halt(&stack, 4, SIGSEGV, "SIGSEGV");
 }
 extern "x86-interrupt" fn bound_range_handler(stack: InterruptStackFrame) {
@@ -201,14 +200,15 @@ extern "x86-interrupt" fn stack_segment_handler(_stack: InterruptStackFrame, err
     crate::error!("[EXC #12] Stack Fault err=0x{:x}", error_code);
     halt();
 }
-/// Last syscall observed by `linux_dispatch`, for #GP post-mortem context
-/// (pid in the high-level sense, raw syscall nr). Written on every dispatch.
+/// Последний syscall, замеченный `linux_dispatch`, для контекста постмортема
+/// #GP (pid в высокоуровневом смысле, сырой номер syscall). Пишется при каждой
+/// диспетчеризации.
 pub static LAST_SYSCALL_PID: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(u64::MAX);
 pub static LAST_SYSCALL_NR: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(u64::MAX);
 
-/// Record the syscall a task is about to run (called from `linux_dispatch`).
+/// Записать syscall, который задача собирается выполнить (зовётся из `linux_dispatch`).
 pub fn note_syscall(pid: u64, nr: u64) {
     LAST_SYSCALL_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
     LAST_SYSCALL_NR.store(nr, core::sync::atomic::Ordering::Relaxed);
@@ -233,8 +233,8 @@ extern "x86-interrupt" fn gp_fault_handler(stack: InterruptStackFrame, error_cod
         LAST_SYSCALL_PID.load(core::sync::atomic::Ordering::Relaxed),
         LAST_SYSCALL_NR.load(core::sync::atomic::Ordering::Relaxed)
     );
-    // For iretq/sysretq exit faults: dump the words the return instruction
-    // was consuming (at RSP) plus the GPR area popped just before it.
+    // Для отказов на выходе iretq/sysretq: напечатать слова, которые
+    // потребляла инструкция возврата (по RSP), и область GPR, снятую перед ней.
     let frsp = stack.stack_pointer.as_u64();
     if frsp >= 0xffff_8000_0000_0000 {
         crate::error!("--- Words around fault RSP 0x{:x} ---", frsp);
@@ -242,9 +242,9 @@ extern "x86-interrupt" fn gp_fault_handler(stack: InterruptStackFrame, error_cod
         while off <= 0x28 {
             let addr = (frsp as i64 + off) as u64;
             let sign = if off < 0 { "-" } else { "+" };
-            // Never touch unmapped memory from inside the #GP handler: the
-            // fault RSP can sit right at the stack top, and reading past it
-            // cascades into a page fault on the guard page.
+            // Никогда не трогать неотображённую память из обработчика #GP:
+            // RSP на момент отказа может стоять ровно на вершине стека, и чтение
+            // дальше каскадируется в page fault на guard-странице.
             if crate::memory::vmm::virt_to_phys(addr).is_none() {
                 crate::error!("  [rsp{}0x{:02x}] <unmapped>", sign, off.unsigned_abs());
             } else {
@@ -254,13 +254,13 @@ extern "x86-interrupt" fn gp_fault_handler(stack: InterruptStackFrame, error_cod
             off += 8;
         }
     }
-    // Post-mortem for syscall-exit faults (iretq/sysretq in the stubs): by the
-    // time the exit tail faults, the window frame has been popped but its
-    // bytes are still intact at the top of the task's kernel stack. Dump them:
-    //   [top-0x08] per-task user-RSP slot   [top-0x10] rax  [top-0x18] rbx
-    //   [top-0x20] rcx (sysretq user RIP!)  [top-0x60] r11 (user RFLAGS) ...
-    // The full 24-word dump lives behind a flag (it is scary and noisy for a
-    // normal userspace crash); enable with `warn on`-style tooling later.
+    // Постмортем для отказов на выходе из syscall (iretq/sysretq в стабах): к
+    // моменту отказа хвоста выхода оконный фрейм уже снят, но его байты целы на
+    // вершине стека ядра задачи. Напечатать их:
+    //   [top-0x08] слот user-RSP задачи   [top-0x10] rax  [top-0x18] rbx
+    //   [top-0x20] rcx (user RIP для sysretq!)  [top-0x60] r11 (user RFLAGS) ...
+    // Полный 24-словный дамп — за флагом (он страшный и шумный для обычного
+    // падения userspace); включать позже инструментами вроде `warn on`.
     if !crate::task::scheduler::is_idle(pid)
         && STACK_DUMP.load(core::sync::atomic::Ordering::Relaxed)
     {
@@ -278,11 +278,10 @@ extern "x86-interrupt" fn gp_fault_handler(stack: InterruptStackFrame, error_cod
             i -= 1;
         }
     }
-    // A #GP taken while executing ring-3
-    // code is a bug in the user program (or our compat layer), not in the
-    // kernel. Kill only the offending Compat_Process (exit code 139 =
-    // 128+SIGSEGV) and keep the kernel and shell running; previously this
-    // halted the whole machine.
+    // #GP, полученный при исполнении кода ring 3, — ошибка пользовательской
+    // программы (или нашего compat-слоя), а не ядра. Убить только виновный
+    // Compat_Process (код выхода 139 = 128+SIGSEGV), оставив ядро и шелл
+    // работать; раньше это останавливало всю машину.
     if stack.instruction_pointer.as_u64() < 0x8000_0000_0000
         && crate::task::compat::compat_exists(pid)
     {
@@ -302,13 +301,13 @@ extern "x86-interrupt" fn page_fault_handler(
     let fault_addr = Cr2::read().unwrap_or(VirtAddr::new(0));
     let rsp = stack.stack_pointer.as_u64();
 
-    // Demand paging first: a not-present fault on a lazily-mapped user page
-    // (anonymous mmap region or the brk heap) is serviced by mapping a zero
-    // frame; the faulting instruction then retries on IRET. Covers BOTH
-    // ring-3 faults and kernel-mode faults on user addresses (copy_in/
-    // copy_out over a never-touched buffer). The handler rejects protection
-    // violations, kernel addresses, PROT_NONE regions and eager regions, so
-    // everything below stays a genuine fault.
+    // Сначала demand paging: fault not-present на лениво отображённой странице
+    // пользователя (анонимный mmap-регион или куча brk) обслуживается
+    // отображением нулевого кадра; инструкция с отказом затем повторяется на
+    // IRET. Покрывает И отказы ring 3, И отказы режима ядра на пользовательских
+    // адресах (copy_in/copy_out по нетронутому буферу). Обработчик отвергает
+    // нарушения защиты, адреса ядра, PROT_NONE-регионы и eager-регионы, поэтому
+    // всё ниже остаётся настоящим отказом.
     if crate::arch::x86_64::linux::mem_sys::handle_user_page_fault(
         fault_addr.as_u64(),
         error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION),
@@ -317,9 +316,9 @@ extern "x86-interrupt" fn page_fault_handler(
         return;
     }
 
-    // On a machine with no serial port the screen is the only witness to a
-    // fault, and a fault is exactly what "the boot stopped after step N" looks
-    // like: the handler logged to COM1 and halted. Report here too.
+    // На машине без serial-порта экран — единственный свидетель отказа, а отказ
+    // выглядит ровно как «загрузка встала после шага N»: обработчик писал в COM1
+    // и останавливался. Сообщаем и сюда.
     crate::drivers::earlyfb::errorln(format_args!(
         "EXCEPTION #14 page fault addr={:#x} RIP={:#x}",
         fault_addr.as_u64(),
@@ -336,20 +335,20 @@ extern "x86-interrupt" fn page_fault_handler(
         error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH),
         error_code.bits(),
     );
-    // For a kernel-mode fault, RIP/RBP may be garbage (control-flow corruption,
-    // e.g. RIP=0x1), so dump a heap-free stack scan of the faulting stack for
-    // return addresses in the kernel image — this reconstructs the call chain
-    // that was live at the fault. Then park (do not return: returning would just
-    // re-execute the faulting instruction and loop).
+    // При отказе в режиме ядра RIP/RBP могут быть мусором (порча потока
+    // управления, например RIP=0x1), поэтому печатаем свободное от кучи
+    // сканирование стека с адресами возврата в образе ядра — это восстанавливает
+    // цепочку вызовов, живую на момент отказа. Затем паркуемся (не возвращаемся:
+    // возврат просто повторил бы инструкцию с отказом и зациклился).
     if !error_code.contains(PageFaultErrorCode::USER_MODE) {
-        // F-x86a-4 backstop: a ring-0 fault on a USER address means a syscall
-        // handler read or wrote a user buffer that a sibling CLONE_VM thread
-        // unmapped after the entry-time validation. Ring 3 could trigger that at
-        // will, and it used to halt the whole machine; instead kill only the
-        // offending Compat_Process. The decision is pure and host-tested
-        // (`trap_frame::page_fault_action`): a ring-0 fault on a KERNEL address
-        // still takes the fatal path below, so a genuine kernel bug cannot hide
-        // behind this backstop.
+        // Заслон: отказ ring 0 на ПОЛЬЗОВАТЕЛЬСКОМ адресе означает, что
+        // обработчик syscall читал или писал пользовательский буфер, который
+        // соседний поток CLONE_VM снял после проверки на входе. Ring 3 мог бы
+        // вызывать это по своему желанию, и раньше это останавливало всю машину;
+        // вместо этого убиваем только виновный Compat_Process. Решение чистое и
+        // host-тестируемое (`trap_frame::page_fault_action`): отказ ring 0 на
+        // адресе ЯДРА по-прежнему идёт фатальным путём ниже, поэтому настоящая
+        // ошибка ядра не спрячется за этим заслоном.
         let pid = crate::task::scheduler::current_pid();
         let action = crate::arch::x86_64::linux::trap_frame::page_fault_action(
             false,
@@ -370,8 +369,8 @@ extern "x86-interrupt" fn page_fault_handler(
         crate::debug::unwind::stack_scan_backtrace(rsp, 8192);
         crate::arch::cpu::halt_loop();
     }
-    // A ring-3 page fault must not take the machine down: report one concise
-    // SIGSEGV line and kill only the faulting Compat_Process.
+    // Page fault ring 3 не должен ронять машину: сообщить одну краткую строку
+    // SIGSEGV и убить только виновный Compat_Process.
     let pid = crate::task::scheduler::current_pid();
     crate::error!(
         "[EXC #14] SIGSEGV pid={} addr=0x{:016x} RIP=0x{:016x}",
@@ -402,7 +401,7 @@ extern "x86-interrupt" fn alignment_check_handler(stack: InterruptStackFrame, er
         error_code,
         stack.instruction_pointer.as_u64()
     );
-    // User code can set RFLAGS.AC itself; Linux reports #AC as SIGBUS.
+    // Пользовательский код может сам поставить RFLAGS.AC; Linux сообщает #AC как SIGBUS.
     user_exception_or_halt(&stack, 17, SIGBUS, "SIGBUS");
 }
 extern "x86-interrupt" fn machine_check_handler(_stack: InterruptStackFrame) -> ! {
@@ -439,7 +438,7 @@ extern "x86-interrupt" fn security_handler(_stack: InterruptStackFrame, error_co
     halt();
 }
 
-// ─── IRQ handlers (vectors 33–47) ───────────────────────────────────────
+// ─── Обработчики IRQ (векторы 33–47) ────────────────────────────────────
 
 macro_rules! irq_handler {
     ($name:ident, $vec:expr) => {
@@ -466,24 +465,24 @@ irq_handler!(irq45_handler, 45);
 irq_handler!(irq46_handler, 46);
 irq_handler!(irq47_handler, 47);
 
-// Linux signal numbers used by the user-exception policy, taken from the one
-// compat table so a future renumbering cannot make the two disagree.
+// Номера сигналов Linux для политики пользовательских исключений берутся из
+// единой compat-таблицы, чтобы будущая перенумерация не развела их.
 const SIGILL: u8 = crate::arch::x86_64::linux::signal_frame::SIGILL as u8;
 const SIGTRAP: u8 = crate::arch::x86_64::linux::signal_frame::SIGTRAP as u8;
 const SIGBUS: u8 = crate::arch::x86_64::linux::signal_frame::SIGBUS as u8;
 const SIGFPE: u8 = crate::arch::x86_64::linux::signal_frame::SIGFPE as u8;
 const SIGSEGV: u8 = crate::arch::x86_64::linux::signal_frame::SIGSEGV as u8;
 
-/// F-r3-arch-1: disposition of a synchronous CPU exception with no kernel
-/// handler of its own (#DE/#DB/#UD/#OF/#BR/#NM/#AC/#MF/#XM).
+/// Диспозиция синхронного исключения CPU без собственного обработчика ядра
+/// (#DE/#DB/#UD/#OF/#BR/#NM/#AC/#MF/#XM).
 ///
-/// The round-3 audit showed that a single ring-3 instruction (`1/0`, `ud2`, a
-/// `popfq` with TF) parked the whole machine in `halt()`: only #GP and #PF had
-/// the "user fault kills the process, kernel keeps running" policy. This helper
-/// applies the same contract (`trap_frame::exception_action`) to every such
-/// vector: a Linux Compat_Process found in ring 3 (or faulting on a user RIP)
-/// gets `exit_code = 128 + signal` and is terminated; anything else still
-/// halts, so a real ring-0 kernel bug cannot hide behind the policy.
+/// Одна инструкция ring 3 (`1/0`, `ud2`, `popfq` с TF) раньше парковала всю
+/// машину в `halt()`: политика «пользовательский отказ убивает процесс, ядро
+/// живёт» была только у #GP и #PF. Этот хелпер применяет тот же контракт
+/// (`trap_frame::exception_action`) ко всем таким векторам: Compat_Process,
+/// найденный в ring 3 (или с отказом на user RIP), получает
+/// `exit_code = 128 + signal` и завершается; всё остальное по-прежнему
+/// останавливается, чтобы настоящая ошибка ring 0 не спряталась за политикой.
 fn user_exception_or_halt(
     stack: &InterruptStackFrame,
     vector: u8,
@@ -492,8 +491,9 @@ fn user_exception_or_halt(
 ) -> ! {
     user_exception_or_halt_inner(stack, vector, signal, signal_name, false)
 }
-/// [`user_exception_or_halt`] for #DB: a saved RFLAGS.TF also marks the trap as
-/// user-induced even when the saved frame itself is ring 0 (see `debug_handler`).
+/// [`user_exception_or_halt`] для #DB: сохранённый RFLAGS.TF тоже помечает
+/// ловушку как вызванную пользователем, даже если сохранённый фрейм — ring 0
+/// (см. `debug_handler`).
 fn user_exception_or_halt_flagged(
     stack: &InterruptStackFrame,
     vector: u8,
@@ -530,8 +530,8 @@ fn user_exception_or_halt_inner(
         );
         crate::task::scheduler::exit_current();
     }
-    // Ring 0 on a kernel address (or no compat state to blame): a genuine
-    // kernel/hardware fault. The handler already logged the vector and RIP.
+    // Ring 0 на адресе ядра (или нет compat-состояния, чтобы кого-то винить):
+    // настоящий отказ ядра/железа. Обработчик уже напечатал вектор и RIP.
     halt();
 }
 

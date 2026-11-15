@@ -1,31 +1,31 @@
-//! NVMe host-controller driver over PCIe — polled, no IRQs.
+//! Драйвер NVMe host-controller поверх PCIe — поллинг, без IRQ.
 //!
-//! Bring-up: PCI probe (class 01h/08h) → map BAR0 → disable controller →
-//! program AQA/ASQ/ACQ → enable → Identify Controller → Create I/O CQ + SQ →
-//! Identify active namespaces → ready.
+//! Bring-up: PCI probe (class 01h/08h) → map BAR0 → выключить контроллер →
+//! запрограммировать AQA/ASQ/ACQ → включить → Identify Controller → создать I/O CQ + SQ →
+//! Identify активных namespace'ов → готово.
 //!
-//! Block I/O is **PRP-list based and batched**:
+//! Block I/O **на PRP-list и пакетный**:
 //!
-//! * A command may transfer up to `IO_BUFFER_PAGES * 4 KiB` (capped by the
-//!   controller's Identify-Controller MDTS). PRP1 names the first page, PRP2 the
-//!   second page for a two-page transfer, and otherwise points at a 4 KiB PRP
-//!   list whose entries are the second, third, … pages. The pure arithmetic
-//!   lives in [`crate::drivers::nvme_prp`] so it is host property-tested.
-//! * Up to [`IO_QUEUE_DEPTH`] commands are submitted before the first completion
-//!   is reaped. Each in-flight command owns a physically-contiguous data slot
-//!   plus its own PRP-list page, so submissions do not alias. Completions are
-//!   matched to commands by CID, not by arrival order, and the SQ doorbell is
-//!   rung once per batch.
+//! * Команда может передать до `IO_BUFFER_PAGES * 4 KiB` (с капом по MDTS из
+//!   Identify Controller). PRP1 называет первую страницу, PRP2 — вторую для
+//!   двухстраничной передачи, иначе указывает на 4-KiB PRP-list, чьи записи —
+//!   вторая, третья, … страницы. Чистая арифметика живёт в
+//!   [`crate::drivers::nvme_prp`], так что property-тестируется на хосте.
+//! * До [`IO_QUEUE_DEPTH`] команд отправляются до вычерпывания первого завершения.
+//!   Каждая in-flight команда владеет физически непрерывным data-слотом плюс своей
+//!   PRP-list-страницей, так что отправки не пересекаются. Завершения сопоставляются
+//!   командам по CID, а не по порядку прихода, а SQ doorbell звонится один раз на
+//!   пакет.
 //!
-//! Completion queues are POLLED via the phase bit in the status word;
-//! interrupts stay masked. All register accesses are volatile u32s.
+//! Очереди завершения ПОЛЛЯТСЯ по phase bit в слове статуса; прерывания остаются
+//! замаскированными. Все доступы к регистрам — volatile u32.
 //!
-//! Writes whose byte range is not LBA-aligned take a read-modify-write path
-//! (read the containing LBA, patch the caller's bytes, write it back) instead
-//! of zeroing (and therefore corrupting) the neighbouring sectors.
+//! Записи с не-LBA-выровненным диапазоном идут read-modify-write путём (прочитать
+//! содержащий LBA, пропатчить байты вызывающего, записать обратно) вместо
+//! зануления (и порчи) соседних секторов.
 //!
-//! Queue sizes handed to the controller are *zero-based* (`QSIZE = entries - 1`)
-//! and clamped to CAP.MQES; the host rings use the same entry count.
+//! Размеры очередей, отдаваемые контроллеру, *zero-based* (`QSIZE = entries - 1`)
+//! и клампятся к CAP.MQES; host-ring'и используют то же число записей.
 
 use crate::drivers::nvme_prp::{
     build_prp, plan_chunk, queue_entries, CqRing, SqRing, PAGE_SIZE, PRP_LIST_ENTRIES,

@@ -1,14 +1,14 @@
-// shell/mod.rs — Interactive command-line shell
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// shell/mod.rs — интерактивный shell командной строки
+// 64-битное ядро ОС x86_64 на Rust (#![no_std])
 
-// Submodule landing spots for the user-friendly-shell feature. Each is a pure
-// or thin-I/O unit; `mod.rs` owns the only place that touches the keyboard,
-// framebuffer, serial, and VFS.
+// Точки размещения подмодулей user-friendly shell. Каждый — чистый или
+// тонкий I/O-модуль; `mod.rs` — единственное место, которое трогает клавиатуру,
+// framebuffer, serial и VFS.
 mod commands;
-// The pure-logic submodules are exposed `pub(crate)` so the in-kernel property
-// suite in `src/test.rs` can exercise them directly (design properties P21–P29
-// and the registry/render/path/cat unit tests). They remain crate-private —
-// nothing leaves the crate. `commands` stays private (it is thin VFS/console I/O).
+// Чистые подмодули открыты как `pub(crate)`, чтобы in-kernel набор свойств в
+// `src/test.rs` мог прямо их проверять (свойства P21–P29 и unit-тесты
+// registry/render/path/cat). Они остаются приватными для крейта — наружу
+// ничего не выходит. `commands` приватный (это тонкий VFS/console I/O).
 pub(crate) mod caret;
 pub(crate) mod cat;
 pub(crate) mod complete;
@@ -34,19 +34,19 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// Print a string to both consoles (serial + framebuffer) with no newline.
+/// Напечатать строку в обе консоли (serial + framebuffer) без перевода строки.
 fn print_both(s: &str) {
     crate::kprint!("{}", s);
     crate::fb_print!("{}", s);
 }
 
-/// Destructively erase `n` visible characters to the left on both consoles.
+/// Разрушающе стереть `n` видимых символов слева в обеих консолях.
 ///
-/// The framebuffer console only supports a destructive backspace (`0x08`,
-/// which moves the column back one and blanks that cell); it has no
-/// non-destructive cursor positioning. The classic `backspace, space,
-/// backspace` triplet erases one rendered glyph and leaves the column one to
-/// the left. Serial terminals interpret the same sequence sensibly.
+/// Framebuffer-консоль поддерживает только разрушающий backspace (`0x08`,
+/// сдвигает колонку на одну назад и затирает клетку); неразрушающего
+/// позиционирования курсора у неё нет. Классическая тройка `backspace, space,
+/// backspace` стирает один отрисованный глиф и оставляет колонку на одну левее.
+/// Serial-терминалы трактуют ту же последовательность разумно.
 fn erase_visible(n: usize) {
     for _ in 0..n {
         crate::kprint!("\x08 \x08");
@@ -54,21 +54,21 @@ fn erase_visible(n: usize) {
     }
 }
 
-/// Number of visible columns a string occupies on the console.
+/// Число видимых колонок, которые занимает строка на консоли.
 ///
-/// Keyboard input is ASCII, so one `char` maps to one rendered column. This
-/// drives the erase count in [`redraw_line`].
+/// Ввод с клавиатуры — ASCII, поэтому один `char` соответствует одной колонке.
+/// Это задаёт число стираний в [`redraw_line`].
 fn visible_len(s: &str) -> usize {
     s.chars().count()
 }
 
-/// Delete the active selection from the line, telling the caller whether there
-/// was one to delete.
+/// Удалить активное выделение из строки, сообщив вызывающему, было ли что удалять.
 ///
-/// The line indices come from the keyboard selection's own record when it has one
-/// (`Ctrl+A` builds the selection from the buffer, so its indices are exact);
-/// a mouse drag is mapped back from cells. When neither yields a range the
-/// selection is dropped — a highlight that cannot be edited is a lie.
+/// Индексы строки берутся из собственной записи клавиатурного выделения, когда
+/// она есть (`Ctrl+A` строит выделение из буфера, поэтому индексы точны);
+/// перетаскивание мышью мапится обратно из клеток. Если ни один источник не даёт
+/// диапазон, выделение сбрасывается — подсветка, которую нельзя редактировать,
+/// это ложь.
 fn delete_selection(editor: &mut editor::LineEditor, selection: &mut selection::Selection) -> bool {
     let Some(range) = selection.range() else {
         return false;
@@ -81,27 +81,27 @@ fn delete_selection(editor: &mut editor::LineEditor, selection: &mut selection::
         selection.clear();
         return false;
     };
-    // Clear first: `unpaint` restores the cells the highlight covered, and the
-    // caller's `redraw_line` then reprints the shortened buffer over them.
+    // Сначала очистить: `unpaint` восстанавливает клетки под подсветкой, а
+    // вызывающий `redraw_line` затем печатает укороченный буфер поверх них.
     selection.clear();
     editor.replace_range(from, to);
     true
 }
 
-/// Redraw the current input region so the console reflects the editor buffer
-/// exactly (R1.6).
+/// Перерисовать текущую область ввода, чтобы консоль точно отражала буфер
+/// редактора (R1.6).
 ///
-/// `shown` tracks how many visible characters of input are currently rendered
-/// after the prompt. We destructively erase that whole region, then reprint the
-/// full current buffer and update `shown`.
+/// `shown` — сколько видимых символов ввода отрисовано после промпта. Мы
+/// разрушающе стираем всю эту область, затем печатаем полный текущий буфер и
+/// обновляем `shown`.
 ///
-/// The framebuffer console stays destructive here — the line is erased and
-/// reprinted — but the caret is no longer tied to that: `caret.rs` draws it at
-/// the cell the logical cursor occupies, so a mid-line edit shows the caret
-/// exactly where the next character will land (see `caret_cell`).
+/// Framebuffer-консоль здесь остаётся разрушающей — строка стирается и
+/// печатается заново, — но каретка больше не привязана к этому: `caret.rs`
+/// рисует её в клетке логического курсора, так что правка в середине строки
+/// показывает каретку там, куда попадёт следующий символ (см. `caret_cell`).
 fn redraw_line(editor: &editor::LineEditor, shown: &mut usize, caret: &mut caret::Caret) {
-    // The caret is an overlay on the text being replaced: erase it first, or the
-    // glyphs printed over it bake its bar into their cells.
+    // Каретка — оверлей поверх заменяемого текста: сотрите её первой, иначе
+    // глифы, напечатанные поверх, «запекут» её полосу в своих клетках.
     caret.erase();
     erase_visible(*shown);
     let buf = editor.buffer();
@@ -109,9 +109,9 @@ fn redraw_line(editor: &editor::LineEditor, shown: &mut usize, caret: &mut caret
     *shown = visible_len(buf);
 }
 
-/// Drop to a fresh line, re-render the prompt, and reprint the current buffer.
-/// Used after listing Tab-completion candidates (R3.4). Resets `shown` to the
-/// reprinted buffer width.
+/// Перейти на свежую строку, перерисовать промпт и напечатать текущий буфер
+/// заново. Используется после вывода кандидатов Tab-дополнения (R3.4). Сбрасывает
+/// `shown` к ширине напечатанного буфера.
 fn reprompt_with_buffer(editor: &editor::LineEditor, shown: &mut usize, caret: &mut caret::Caret) {
     caret.erase();
     crate::kprintln!();
@@ -122,7 +122,7 @@ fn reprompt_with_buffer(editor: &editor::LineEditor, shown: &mut usize, caret: &
     *shown = visible_len(buf);
 }
 
-/// List completion candidates on a new line, then re-render the prompt+buffer.
+/// Вывести кандидатов дополнения на новой строке, затем перерисовать промпт и буфер.
 fn list_candidates(
     editor: &editor::LineEditor,
     shown: &mut usize,
@@ -138,17 +138,17 @@ fn list_candidates(
     reprompt_with_buffer(editor, shown, caret);
 }
 
-/// Execute a command line by dispatching through the command registry.
+/// Выполнить строку команды через диспетчеризацию по реестру команд.
 ///
-/// The line is tokenized with `split_whitespace`: `parts[0]` is the command
-/// name and `parts[1..]` are the arguments passed to the handler. An
-/// empty/whitespace-only line is a no-op. Unknown commands name the offending
-/// token (R7.1) and, when a near match exists, append a "did you mean" hint
+/// Строка токенизируется через `split_whitespace`: `parts[0]` — имя команды,
+/// `parts[1..]` — аргументы обработчика. Пустая строка или строка из пробелов —
+/// no-op. Неизвестная команда называет виновный токен (R7.1) и, если есть близкое
+/// совпадение, добавляет подсказку «did you mean»
 /// (R7.2).
 fn execute_command(cmd: &str) {
-    // Minimal `&&` chaining: run each part sequentially, stopping at the
-    // first failure signal we can observe (unknown command). Used by the
-    // autorun file (`rm -r X && lxrun ...`).
+    // Минимальная цепочка `&&`: выполнять части последовательно, останавливаясь
+    // на первом наблюдаемом сигнале сбоя (неизвестная команда). Используется
+    // файлом autorun (`rm -r X && lxrun ...`).
     if cmd.contains("&&") {
         for part in cmd.split("&&") {
             if !part.trim().is_empty() {
@@ -171,8 +171,8 @@ fn execute_command(cmd: &str) {
             (spec.handler)(&mut ctx, args);
         }
         None => {
-            // Unknown command: name the token (R7.1), then offer the nearest
-            // registry command within a small edit-distance threshold (R7.2).
+            // Неизвестная команда: назвать токен (R7.1), затем предложить
+            // ближайшую команду реестра в небольшом пороге edit-distance (R7.2).
             render::error_line(&format!("Unknown command: '{}'", name));
             let names: Vec<&str> = registry::command_names().collect();
             if let Some(suggestion) = suggest::nearest_command(name, &names, 2) {
@@ -182,19 +182,18 @@ fn execute_command(cmd: &str) {
     }
 }
 
-/// Handle a Tab keypress: complete the token under the cursor (R3.3/3.4/3.5).
+/// Обработать нажатие Tab: дополнить токен под курсором (R3.3/3.4/3.5).
 ///
-/// Completion target selection (per task 10.1): if the line has no whitespace
-/// (a single/first token) it is completed against command names; otherwise the
-/// text after the final whitespace is treated as a path token and completed
-/// against the VFS entries of its parent directory. VFS reads happen here and
-/// are passed to the pure `complete` functions as data — the completion logic
-/// itself performs no I/O.
+/// Выбор цели дополнения: если в строке нет пробелов (единственный/первый
+/// токен), она дополняется по именам команд; иначе текст после последнего
+/// пробела трактуется как путь и дополняется по записям VFS родительского
+/// каталога. Чтения VFS происходят здесь и передаются чистым функциям `complete`
+/// как данные — сама логика дополнения не делает I/O.
 fn handle_tab(editor: &mut editor::LineEditor, shown: &mut usize, caret: &mut caret::Caret) {
     let line = String::from(editor.buffer());
 
     match line.rfind(|c: char| c == ' ' || c == '\t') {
-        // No whitespace -> first/only token: complete a command name.
+        // Нет пробелов -> первый/единственный токен: дополнить имя команды.
         None => {
             apply_completion(
                 editor,
@@ -205,20 +204,20 @@ fn handle_tab(editor: &mut editor::LineEditor, shown: &mut usize, caret: &mut ca
                 complete::complete_command(&line),
             );
         }
-        // Whitespace present -> complete the trailing token as a path.
+        // Пробел есть -> дополнить хвостовой токен как путь.
         Some(idx) => {
             let before = &line[..=idx]; // command + args + separating space
             let token = &line[idx + 1..]; // the path partial being completed
 
-            // Split the token into its directory part (up to and including the
-            // last '/') and the segment being completed.
+            // Разбить токен на каталог (до последнего '/' включительно) и
+            // дополняемый сегмент.
             let dir_part = match token.rfind('/') {
                 Some(i) => &token[..=i],
                 None => "",
             };
 
-            // Resolve the parent directory against the CWD and read its
-            // entries from the VFS (as data for the pure completer).
+            // Разрешить родительский каталог относительно CWD и прочитать его
+            // записи из VFS (как данные для чистого completer'а).
             let cwd = path::cwd();
             let parent = if dir_part.is_empty() {
                 cwd.clone()
@@ -241,12 +240,12 @@ fn handle_tab(editor: &mut editor::LineEditor, shown: &mut usize, caret: &mut ca
     }
 }
 
-/// Apply a [`complete::Completion`] to the editor.
+/// Применить [`complete::Completion`] к редактору.
 ///
-/// `prefix` is the text preceding the token being completed (empty for command
-/// completion); `dir_part` is the leading directory portion of a path token
-/// that must be preserved in front of the completed segment (empty for command
-/// completion, where the completion already carries the full token).
+/// `prefix` — текст перед дополняемым токеном (пусто для командного
+/// дополнения); `dir_part` — ведущая часть пути, которую надо сохранить перед
+/// дополненным сегментом (пусто для командного, где дополнение уже несёт полный
+/// токен).
 fn apply_completion(
     editor: &mut editor::LineEditor,
     shown: &mut usize,
@@ -256,16 +255,16 @@ fn apply_completion(
     comp: complete::Completion,
 ) {
     match comp {
-        // No match: leave the line unchanged (R3.5).
+        // Нет совпадений: оставить строку без изменений (R3.5).
         complete::Completion::None => {}
-        // Unique match: replace the token with the full completion (R3.3).
+        // Единственное совпадение: заменить токен полным дополнением (R3.3).
         complete::Completion::Single(s) => {
             let new_line = format!("{}{}{}", prefix, dir_part, s);
             editor.set_line(&new_line);
             redraw_line(editor, shown, caret);
         }
-        // Several matches: extend to the longest common prefix, then list the
-        // candidates and redraw the prompt + buffer (R3.4).
+        // Несколько совпадений: расширить до longest common prefix, затем
+        // перечислить кандидатов и перерисовать промпт + буфер (R3.4).
         complete::Completion::Multiple { lcp, candidates } => {
             let new_line = format!("{}{}{}", prefix, dir_part, lcp);
             editor.set_line(&new_line);
@@ -274,14 +273,14 @@ fn apply_completion(
     }
 }
 
-/// Main shell loop.
+/// Главный цикл shell.
 ///
-/// Prints the welcome banner once (R10.1–R10.3), then runs one `LineEditor` per
-/// prompt. A single `Decoder` and `History` persist across the whole session so
-/// Shift/extended-prefix state and recall survive between prompts.
-/// Execute the first line of `/mnt/etc/autorun` (if present) as a shell
-/// command, before the interactive loop starts. Bounded at 512 bytes; a
-/// missing file is silent.
+/// Один раз печатает приветственный баннер (R10.1–R10.3), затем запускает один
+/// `LineEditor` на промпт. Один `Decoder` и `History` живут весь сеанс, чтобы
+/// состояние Shift/расширенных префиксов и recall переживали промпты.
+/// Выполнить первую строку `/mnt/etc/autorun` (если есть) как команду shell
+/// перед интерактивным циклом. Ограничение 512 байт; отсутствующий файл
+/// молчит.
 fn run_autorun() {
     const MAX: u64 = 512;
     let node = match crate::vfs::lookup_path("/mnt/etc/autorun") {
@@ -305,14 +304,14 @@ fn run_autorun() {
 }
 
 pub fn shell_main() -> ! {
-    // The console is the controlling terminal, and the shell is its default
-    // owner: record the shell's own process group now so `lxrun` can hand the
-    // terminal to a child and give it back afterwards (terminal access control
-    // compares a process's pgid against this).
+    // Консоль — управляющий терминал, и shell — его владелец по умолчанию:
+    // записать собственную группу процессов сейчас, чтобы `lxrun` мог передать
+    // терминал ребёнку и вернуть обратно (контроль доступа терминала сравнивает
+    // pgid процесса с этим).
     crate::drivers::tty::init_shell(crate::task::scheduler::current_pid());
 
-    // Welcome banner — named OS + `help` hint, on both consoles, before the
-    // first prompt with no perceptible delay (R10.1, R10.2, R10.3).
+    // Приветственный баннер — имя ОС + подсказка `help`, в обеих консолях, до
+    // первого промпта и без заметной задержки (R10.1, R10.2, R10.3).
     crate::kprintln!();
     crate::kprintln!("========================================");
     crate::kprintln!("   Welcome to pagh OS Shell!");
@@ -348,8 +347,8 @@ pub fn shell_main() -> ! {
             );
         }
     }
-    // Controller scan and raw register state: the two things that decide whether
-    // "the port does not reset" is our bug or the platform's.
+    // Сканирование контроллера и сырое состояние регистров: две вещи, решающие,
+    // «порт не сбрасывается» — наш баг или платформы.
     for (index, info) in crate::drivers::xhci::scan().into_iter().enumerate() {
         crate::kprintln!(
             "xhci {}: {:04x}:{:04x} ports={} attached={:#010x}{}",
@@ -371,11 +370,10 @@ pub fn shell_main() -> ! {
         );
     }
     {
-        // Port masks, not pretty ranges: a mask shows exactly which ports the
-        // controller claims for each protocol, cannot be "wrapped" by a bad offset,
-        // and makes an uncovered port obvious. The field machine printed
-        // `usb2=17-41 usb3=17-26` until 2.18.13 fixed the port-info word; with
-        // masks the same photo would have shown the overlap immediately.
+        // Маски портов, а не красивые диапазоны: маска показывает, какие порты
+        // контроллер заявляет для каждого протокола, её нельзя «обернуть» неверным
+        // смещением, и незакрытый порт сразу виден. Маски сразу показали бы
+        // пересечение протоколов, которое диапазоны скрывали.
         let masks = crate::drivers::xhci::proto_masks();
         crate::fb_println!(
             "  xhci proto: usb2={:#010x} usb3={:#010x}",
@@ -388,8 +386,8 @@ pub fn shell_main() -> ! {
             masks[1]
         );
     }
-    // The raw extended-capability walk: when protocol parsing and the BIOS handoff
-    // disagree with the spec, this is the evidence that settles it.
+    // Сырой обход extended capabilities: когда разбор протоколов и BIOS handoff
+    // расходятся со спецификацией, это доказательство, которое решает спор.
     for cap in crate::drivers::xhci::xcaps().into_iter().take(6) {
         crate::fb_println!(
             "  xhci xcap {:#06x}: id={} major={} minor={} next={:#04x} dw1={:#010x} dw2={:#010x}",
@@ -439,9 +437,9 @@ pub fn shell_main() -> ! {
             d.port_regs[3]
         );
         if d.halts != 0 {
-            // The controller halted at least once; these are the register values
-            // at the first sighting, which is the only proof of WHY (HSE = DMA,
-            // HCE = internal error, RS cleared = software/firmware).
+            // Контроллер останавливался хотя бы раз; это значения регистров в
+            // первое наблюдение — единственное доказательство ПОЧЕМУ (HSE = DMA,
+            // HCE = внутренняя ошибка, RS снят = софт/прошивка).
             crate::fb_println!(
                 "  xhci halt: count={} usbcmd={:#010x} usbsts={:#010x}",
                 d.halts,
@@ -456,8 +454,8 @@ pub fn shell_main() -> ! {
             );
         }
     }
-    // The same per-port enumeration rows the boot menu shows: if the operator
-    // boots past the menu, this screen still carries the evidence.
+    // Те же строки per-port перечисления, что показывает boot-меню: если
+    // оператор прошёл мимо меню, этот экран всё равно несёт доказательства.
     for row in crate::drivers::xhci::diagnostics().into_iter().take(8) {
         let (ccs, ped, pp, _, pls) = crate::drivers::xhci::decode_portsc(row.portsc);
         crate::fb_println!(
@@ -499,90 +497,90 @@ pub fn shell_main() -> ! {
     }
     crate::fb_println!();
 
-    // Optional one-shot autorun: if `/mnt/etc/autorun` exists, its first line
-    // is executed exactly like a typed command (a poor man's rc.local — handy
-    // for repro test commands like `lxrun ... git clone ...`). Delete the
-    // file to disable.
+    // Опциональный одноразовый autorun: если `/mnt/etc/autorun` существует, его
+    // первая строка исполняется как набранная команда (бедняцкий rc.local —
+    // удобно для воспроизводимых тестовых команд вроде `lxrun ... git clone ...`).
+    // Удалите файл, чтобы отключить.
     run_autorun();
 
-    // Session-long state: the decoder keeps Shift/0xE0-prefix state across
-    // prompts; history accumulates recalled lines.
+    // Состояние на весь сеанс: decoder хранит состояние Shift/0xE0 между
+    // промптами; history накапливает вызванные строки.
     let mut decoder = keys::Decoder::new();
     let mut history = history::History::new();
 
-    // Place the mouse cursor at the center of the screen and prime the status
-    // bar. The overlay below redraws it on every wake.
+    // Поставить курсор мыши в центр экрана и подготовить status bar. Оверлей
+    // ниже перерисовывает его на каждом пробуждении.
     let (fw, fh) = crate::drivers::framebuffer::dimensions();
     if fw != 0 {
         crate::drivers::cursor::move_to(fw / 2, fh / 2);
     }
 
-    // Push the saved theme into the drivers before the first prompt. Without this
-    // the palette reaches the screen only when a command changes it, and the console
-    // keeps the driver defaults (black background, white text) until then — the
-    // wallpaper then paints the area *outside* the text grid, because every grid
-    // cell repaints its own background in the old colour.
+    // Протолкнуть сохранённую тему в драйверы до первого промпта. Без этого
+    // палитра доходит до экрана только когда её сменит команда, и консоль
+    // остаётся на дефолтах драйвера (чёрный фон, белый текст); обои тогда
+    // закрашивают область *вне* текстовой сетки, потому что каждая клетка сетки
+    // перерисовывает свой фон старым цветом.
     theme::apply();
 
-    // One caret for the whole session: it must erase itself at the cell it was
-    // drawn at, and that cell is not recoverable from the buffer alone.
-    // The caret is tracked even when hidden: `Caret` remembers the cell it erased,
-    // so turning it back on draws it where the cursor actually is instead of at a
-    // stale position.
+    // Одна каретка на весь сеанс: она должна стирать себя в той клетке, где
+    // была нарисована, а эту клетку не восстановить из буфера.
+    // Каретка отслеживается и скрытой: `Caret` помнит стёртую клетку, поэтому
+    // повторное включение рисует её там, где курсор на самом деле, а не в
+    // устаревшей позиции.
     let mut caret = caret::Caret::new();
-    // One selection for the whole session (a drag outlives a single loop pass), and
-    // the clipboard it feeds. The clipboard is session-scoped on purpose: it is
-    // filled by copying text off the screen and consumed by Ctrl+Y / Ctrl+X.
+    // Одно выделение на сеанс (перетаскивание живёт дольше одного прохода цикла)
+    // и буфер обмена, который оно питает. Буфер намеренно сеансный: заполняется
+    // копированием текста с экрана и потребляется Ctrl+Y / Ctrl+X.
     let mut selection = selection::Selection::new();
     let mut clipboard = String::new();
     let mut prev_left = false;
-    // Last wheel counter seen, so a poll can turn the cumulative PS/2 counter
-    // into this pass's delta (the shell wakes on `mouse.seq`, which the wheel
-    // packet bumps like any other).
+    // Последний виденный счётчик колеса, чтобы poll мог превратить накопительный
+    // счётчик PS/2 в дельту текущего прохода (shell просыпается по `mouse.seq`,
+    // который пакет колеса увеличивает как любой другой).
     let mut last_wheel = crate::drivers::ps2_mouse::poll().wheel;
     let mut status_cache: Option<(alloc::string::String, alloc::string::String)> = None;
 
     loop {
-        // A theme switch invalidates everything drawn so far: the *model* stores a
-        // colour per cell (`grid_fg`), and that colour is whatever was current when
-        // the cell was written. Repainting pixels is not enough — the cells have to
-        // be reprinted through the new palette, so the prompt is redrawn on a fresh
-        // line and the status text is forgotten so the strip repaints too.
+        // Смена темы инвалидирует всё нарисованное: *модель* хранит цвет на
+        // клетку (`grid_fg`), и это цвет, актуальный в момент записи клетки.
+        // Перерисовать пиксели недостаточно — клетки надо напечатать заново через
+        // новую палитру, поэтому промпт перерисовывается на свежей строке, а текст
+        // статуса забывается, чтобы полоса тоже перерисовалась.
         if theme::take_force_redraw() {
             crate::fb_println!();
             status_cache = None;
         }
 
-        // CWD-aware prompt, e.g. `pagh:/> ` (R5.1–R5.3).
+        // Промпт с учётом CWD, например `pagh:/> ` (R5.1–R5.3).
         render::prompt(&path::cwd());
-        // Drop wheel packets generated while a command owned the keyboard/screen
-        // (`paint`, `nano`, a full-screen program): they were not meant for the
-        // console view, and replaying the accumulated delta here would scroll the
-        // fresh prompt.
+        // Отбросить пакеты колеса, сгенерированные, пока клавиатурой/экраном
+        // владела команда (`paint`, `nano`, полноэкранная программа): они не для
+        // консольного вида, и воспроизведение накопленной дельты здесь прокрутило
+        // бы свежий промпт.
         last_wheel = crate::drivers::ps2_mouse::poll().wheel;
 
-        // Fresh editor per prompt; `shown` tracks rendered input width.
+        // Свежий редактор на каждый промпт; `shown` отслеживает ширину отрисованного ввода.
         let mut editor = editor::LineEditor::new();
         let mut shown: usize = 0;
         caret.reset();
 
-        // Read keys until Enter.
-        // Wake-up bookkeeping for the idle skip below: sentinels force the first
-        // pass to run (`mouse.seq` is never `u64::MAX`).
+        // Читать клавиши до Enter.
+        // Учёт пробуждений для пропуска idle ниже: sentinel'ы заставляют первый
+        // проход выполниться (`mouse.seq` никогда не `u64::MAX`).
         let mut last_mouse_seq = u64::MAX;
         let mut last_secs = u64::MAX;
         let mut last_blink = caret::Caret::blink_on(crate::task::scheduler::ticks());
         loop {
-            // Idle on halt until an interrupt delivers an event (R11.5).
+            // Idle на halt, пока прерывание не доставит событие (R11.5).
             crate::arch::cpu::halt();
 
-            // A timer tick wakes the shell every millisecond, but there is only
-            // work when something that can change the screen changed: a scancode
-            // arrived, the pointer moved (a button packet bumps the same `seq`),
-            // the status strip's clock ticked over, or the caret's blink phase
-            // flipped. Skipping the overlay cycle otherwise keeps an idle shell
-            // idle: every pass ends in a frame flush, and a frame flush copies the
-            // whole shadow surface to the device.
+            // Тик таймера будит shell каждую миллисекунду, но работа есть,
+            // только если изменилось что-то, что может менять экран: пришёл
+            // сканкод, сдвинулся указатель (пакет кнопки увеличивает тот же
+            // `seq`), сменилась секунда часов status strip или переключилась фаза
+            // мигания каретки. Пропуск цикла оверлея в остальное время держит
+            // idle-shell простаивающим: каждый проход кончается flush кадра, а он
+            // копирует всю shadow surface в устройство.
             let mouse = crate::drivers::ps2_mouse::poll();
             let ticks = crate::task::scheduler::ticks();
             let secs = ticks / crate::arch::x86_64::apic::TICK_HZ;
@@ -599,42 +597,42 @@ pub fn shell_main() -> ! {
             last_secs = secs;
             last_blink = blink;
 
-            // Live overlay: take the arrow down for this pass, repaint the status
-            // bar, then drain and process ALL pending scancodes with it hidden (so
-            // glyph output never clobbers its saved background). The restored
-            // background is *deferred* into this frame's damage rather than pushed
-            // immediately: pushing it here would take the arrow off the device for
-            // the whole pass, which is exactly the flicker you see when moving the
-            // mouse over an otherwise idle shell.
+            // Живой оверлей: убрать стрелку на этот проход, перерисовать status
+            // bar, затем до конца обработать ВСЕ ожидающие сканкоды, пока она
+            // скрыта (чтобы вывод глифов не затирал её сохранённый фон).
+            // Восстановленный фон *откладывается* в damage этого кадра, а не
+            // пушится сразу: пуш здесь убрал бы стрелку с устройства на весь
+            // проход — ровно тот мерцающий эффект, когда двигаешь мышь над
+            // простаивающим shell.
             crate::drivers::cursor::hide_deferred();
 
-            // Mouse wheel: one detent scrolls the console three text lines. The
-            // view is a repaint of the text region from the scrollback model, so
-            // the caret and any selection are dropped first — they describe the
-            // live grid and would otherwise paint a bar or a highlight into the
-            // middle of the history view.
+            // Колесо мыши: один щелчок прокручивает консоль на три текстовые
+            // строки. Вид — перерисовка текстовой области из модели scrollback,
+            // поэтому каретка и выделение сначала сбрасываются — они описывают
+            // живую сетку и иначе нарисовали бы полосу или подсветку посреди
+            // истории.
             let wheel_delta = mouse.wheel.wrapping_sub(last_wheel);
             last_wheel = mouse.wheel;
             if wheel_delta != 0 {
-                // PS/2 IntelliMouse reports "away from the user" as a negative
-                // delta; the console view treats positive as older text. Flip the
-                // sign once here so the convention stays in one place instead of
-                // every caller having to remember it.
+                // PS/2 IntelliMouse сообщает «от пользователя» отрицательной
+                // дельтой; консольный вид считает положительное более старым
+                // текстом. Сменить знак один раз здесь, чтобы соглашение жило в
+                // одном месте, а не в каждом вызывающем.
                 let lines = -wheel_delta.clamp(-16, 16) * 3;
                 scroll_console(lines, "wheel", &mut caret, &mut selection);
             }
 
-            // Mouse selection: a press anchors, a drag extends, a release copies the
-            // text to the clipboard. Cell coordinates divide the pointer's pixels by
-            // the framebuffer's real cell size, and `Selection` clips anything left
-            // of the prompt away, so a drag that starts on the prompt still selects
-            // usable line text.
+            // Выделение мышью: нажатие задаёт якорь, перетаскивание расширяет,
+            // отпускание копирует текст в буфер. Координаты клеток — пиксели
+            // указателя, делённые на реальный размер клетки framebuffer, а
+            // `Selection` отсекает всё левее промпта, так что перетаскивание,
+            // начатое на промпте, всё равно выделяет пригодный текст строки.
             let pressed = mouse.left && !prev_left;
             let released = !mouse.left && prev_left;
             prev_left = mouse.left;
-            // A click is input: leaving the user scrolled back while the live grid
-            // is what a drag would highlight would select invisible cells. Click
-            // means "back to the live screen", like every terminal emulator.
+            // Клик — это ввод: оставлять пользователя в прокрученной истории,
+            // пока перетаскивание подсвечивало бы невидимые клетки, — неправильно.
+            // Клик означает «назад к живому экрану», как в любом терминале.
             if pressed && console_scrolled() {
                 reset_console_view(&mut caret, &mut selection);
             }
@@ -651,28 +649,28 @@ pub fn shell_main() -> ! {
                 }
             } else if released {
                 if let Some(range) = selection.finish() {
-                    // Copy is silent on purpose: it is a mouse gesture, and printing
-                    // into the console for it would push the very text the user just
-                    // selected off the screen.
+                    // Копирование молчит намеренно: это жест мышью, а печать в
+                    // консоль вытолкнула бы с экрана тот самый текст, который
+                    // пользователь только что выделил.
                     let text = range.text(console_cols());
                     if !text.is_empty() {
                         clipboard = text;
                     }
-                    // The highlight stays after the release: it shows what was taken,
-                    // and it is what Ctrl+X / Ctrl+Y then act on.
+                    // Подсветка остаётся после отпускания: она показывает, что
+                    // взято, и именно с ней работают Ctrl+X / Ctrl+Y.
                     selection.paint(console_cols());
                 }
             }
-            // NOTE: the caret is NOT erased here. It is erased by the functions
-            // that repaint the line (`redraw_line`/`list_candidates`), which is
-            // where it actually matters. Erasing it on every loop pass would make
-            // it nearly invisible: `halt()` returns on every timer tick, so the
-            // erase would follow the draw within microseconds and the caret would
-            // be absent for almost the whole blink period.
+            // ВНИМАНИЕ: каретка здесь НЕ стирается. Её стирают функции,
+            // перерисовывающие строку (`redraw_line`/`list_candidates`), где это
+            // действительно важно. Стирание на каждом проходе цикла сделало бы её
+            // почти невидимой: `halt()` возвращается на каждом тике таймера, так
+            // что стирание шло бы за рисованием через микросекунды, и каретка
+            // отсутствовала бы почти весь период мигания.
             //
-            // The status strip is redrawn only when its text actually changes: it
-            // is the one thing on screen that changes on its own (the clock, the
-            // pointer), and rebuilding it per tick was the shell's main cost.
+            // Status strip перерисовывается только при реальном изменении
+            // текста: это единственное на экране, что меняется само (часы,
+            // указатель), а пересборка на каждый тик была главной ценой shell.
             let mut status_dirty = false;
             if theme::snapshot().status_bar {
                 if shell_status_text(&mouse, &mut status_cache) {
@@ -682,9 +680,9 @@ pub fn shell_main() -> ! {
                     }
                 }
             } else if status_cache.is_some() {
-                // Just switched off: wipe the strip once and remember that the
-                // cache no longer describes the screen, so switching it back on
-                // repaints instead of believing the stale text is still there.
+                // Только что выключили: стереть полосу один раз и запомнить, что
+                // кэш больше не описывает экран, чтобы повторное включение
+                // перерисовало, а не считало устаревший текст на месте.
                 crate::drivers::framebuffer::with(|fb| {
                     let (w, h) = fb.dimensions();
                     fb.fill_rect(
@@ -701,27 +699,28 @@ pub fn shell_main() -> ! {
 
             let mut entered = false;
             while let Some(scancode) = try_read_scancode() {
-                // Unsupported / mid-prefix / break codes decode to None and are
-                // ignored without panicking (R11.2).
+                // Неподдерживаемые / mid-prefix / break-коды декодируются в None
+                // и игнорируются без паники (R11.2).
                 let event = match decoder.feed(scancode) {
                     Some(e) => e,
                     None => continue,
                 };
 
-                // PageUp/PageDown are console-scroll keys; every other key is
-                // input, and input means the user is done reading history: return
-                // to the live screen before the key is applied, so typed text and
-                // the caret land on what is actually on screen.
+                // PageUp/PageDown — клавиши прокрутки консоли; любая другая
+                // клавиша — ввод, а ввод означает, что пользователь закончил
+                // читать историю: вернуться к живому экрану до применения клавиши,
+                // чтобы набранный текст и каретка попали на то, что реально на экране.
                 let scroll_key = matches!(event, keys::KeyEvent::PageUp | keys::KeyEvent::PageDown);
                 if !scroll_key && console_scrolled() {
                     reset_console_view(&mut caret, &mut selection);
                 }
                 match event {
-                    // A visible selection is real input state, not decoration: typing
-                    // or deleting replaces it, the way every text field behaves. The
-                    // `Ctrl+A` + Delete combination is the one users reach for to
-                    // clear the line, and it did nothing before because these arms
-                    // ignored the selection and acted on the bare cursor.
+                    // Видимое выделение — реальное состояние ввода, а не декор:
+                    // набор или удаление заменяет его, как в любом текстовом поле.
+                    // Комбинация `Ctrl+A` + Delete — то, за чем тянутся
+                    // пользователи, чтобы очистить строку, а раньше она ничего не
+                    // делала, потому что эти ветки игнорировали выделение и
+                    // действовали по голому курсору.
                     keys::KeyEvent::Char(c) => {
                         delete_selection(&mut editor, &mut selection);
                         editor.insert(c);
@@ -739,15 +738,15 @@ pub fn shell_main() -> ! {
                         }
                         redraw_line(&editor, &mut shown, &mut caret);
                     }
-                    // Cursor moves change only the logical cursor; the caret is
-                    // placed at that cursor's cell by the overlay below, so a
-                    // mid-line position is now what the user actually sees.
+                    // Перемещение курсора меняет только логический курсор;
+                    // каретку в его клетку ставит оверлей ниже, так что позиция в
+                    // середине строки теперь — то, что пользователь действительно видит.
                     //
-                    // Moving also drops the selection, like every text field: a
-                    // highlight that survives a caret move is still "edited" by the
-                    // next Delete/Backspace, so `Ctrl+A`, Left, Delete used to wipe
-                    // the whole line — the selection was invisible state the arrows
-                    // did not touch.
+                    // Перемещение также сбрасывает выделение, как в любом
+                    // текстовом поле: подсветка, переживающая сдвиг каретки, всё
+                    // равно «редактируется» следующим Delete/Backspace, поэтому
+                    // `Ctrl+A`, Left, Delete раньше стирали всю строку — выделение
+                    // было невидимым состоянием, которое стрелки не трогали.
                     keys::KeyEvent::Left => {
                         selection.clear();
                         editor.move_left();
@@ -764,15 +763,15 @@ pub fn shell_main() -> ! {
                         selection.clear();
                         editor.move_end();
                     }
-                    // Up: recall an older entry, stashing the live line (R2.2).
+                    // Вверх: вызвать более старую запись, отложив живую строку (R2.2).
                     keys::KeyEvent::Up => {
                         if let Some(line) = history.recall_prev(editor.buffer()) {
                             editor.set_line(line);
                             redraw_line(&editor, &mut shown, &mut caret);
                         }
                     }
-                    // Down: recall a newer entry, or restore the stashed live
-                    // line when stepping past the newest (R2.3).
+                    // Вниз: вызвать более новую запись или восстановить
+                    // отложенную живую строку при выходе за самую новую (R2.3).
                     keys::KeyEvent::Down => {
                         match history.recall_next() {
                             Some(line) => editor.set_line(line),
@@ -783,17 +782,16 @@ pub fn shell_main() -> ! {
                     keys::KeyEvent::Tab => {
                         handle_tab(&mut editor, &mut shown, &mut caret);
                     }
-                    // Enter: finish the line. Non-empty lines are recorded
-                    // (with dedup) and dispatched; navigation is always reset.
-                    // Ctrl+X cuts the selected text out of the line, Ctrl+Y pastes
-                    // the clipboard back. Between them they are what makes a copy
-                    // observable: the text that was copied is the text that comes
-                    // back, and nothing else.
+                    // Enter: завершить строку. Непустые строки записываются
+                    // (с дедупом) и диспетчеризуются; навигация всегда сбрасывается.
+                    // Ctrl+X вырезает выделенный текст из строки, Ctrl+Y вставляет
+                    // буфер обратно. Вместе они делают копирование наблюдаемым:
+                    // скопированный текст — тот, что вернётся, и ничего больше.
                     keys::KeyEvent::Ctrl('a') => {
-                        // Select the whole input line. The range is built from the
-                        // prompt's width, so this doubles as the mouse-free path to a
-                        // selection: typing, Ctrl+A, Ctrl+X, Ctrl+V exercises the
-                        // clipboard without needing a mouse in the test rig.
+                        // Выделить всю строку ввода. Диапазон строится из ширины
+                        // промпта, так что это заодно путь к выделению без мыши:
+                        // набор, Ctrl+A, Ctrl+X, Ctrl+V упражняет буфер обмена без
+                        // мыши в тестовом стенде.
                         let line_len = editor.buffer().chars().count();
                         if line_len > 0 {
                             if let Some(cells) = line_cells(&editor) {
@@ -810,9 +808,9 @@ pub fn shell_main() -> ! {
                     keys::KeyEvent::Ctrl('x') => {
                         if let Some(range) = selection.range() {
                             let cols = console_cols();
-                            // Prefer the exact indices a keyboard selection already
-                            // knows; fall back to deriving them from cells for a
-                            // mouse drag.
+                            // Предпочесть точные индексы, которые уже знает
+                            // клавиатурное выделение; иначе вывести их из клеток
+                            // для перетаскивания мышью.
                             let idx = selection.known_line_range().or_else(|| {
                                 range.line_indices(
                                     prompt_cols(),
@@ -833,9 +831,9 @@ pub fn shell_main() -> ! {
                     }
                     keys::KeyEvent::Ctrl('y') | keys::KeyEvent::Ctrl('v') => {
                         if !clipboard.is_empty() {
-                            // A multi-line clipboard is pasted with newlines folded to
-                            // spaces: the line editor holds one line, and dropping the
-                            // rest silently would lose text.
+                            // Многострочный буфер вставляется со свёрткой переводов
+                            // строк в пробелы: редактор строки держит одну строку, а
+                            // молча выбросить остальное — потерять текст.
                             let text = clipboard.replace('\n', " ");
                             for ch in text.chars() {
                                 editor.insert(ch);
@@ -844,8 +842,9 @@ pub fn shell_main() -> ! {
                         }
                     }
                     keys::KeyEvent::Ctrl(_) | keys::KeyEvent::Escape => {}
-                    // Terminal paging: one screenful minus the overlap row, the
-                    // same step a wheel notch times three gives for a mouse.
+                    // Постраничная прокрутка терминала: один экран минус строка
+                    // перекрытия — тот же шаг, что даёт щелчок колеса, умноженный на
+                    // три, для мыши.
                     keys::KeyEvent::PageUp => {
                         let rows = crate::drivers::framebuffer::console().text_grid().1;
                         scroll_console(
@@ -871,10 +870,10 @@ pub fn shell_main() -> ! {
                             history.reset_nav();
                         } else {
                             history.push(editor.buffer());
-                            // A pending `disk` question owns this line: its answer
-                            // ("2", or the device name) is not a command, and
-                            // running it through the dispatcher would print
-                            // "Unknown command: 2" and leave the wizard waiting.
+                            // Ожидающий вопрос `disk` владеет этой строкой: его
+                            // ответ ("2" или имя устройства) — не команда, и прогон
+                            // через диспетчер напечатал бы "Unknown command: 2" и
+                            // оставил мастер ждать.
                             if disk::pending() {
                                 disk::feed_line(editor.buffer());
                             } else {
@@ -888,81 +887,80 @@ pub fn shell_main() -> ! {
             }
 
             if entered {
-                // Re-prompt on the next outer-loop pass; the cursor is redrawn
-                // by the next wake's overlay so the fresh prompt isn't clobbered.
+                // Пере-промпт на следующем проходе внешнего цикла; курсор
+                // перерисует оверлей следующего пробуждения, чтобы свежий промпт не затёрся.
                 caret.erase();
                 break;
             }
 
-            // Place the caret at the logical cursor's cell, blinking on the
-            // scheduler's millisecond tick. The console is exactly at the end of
-            // the buffer here (`redraw_line` leaves it there), so the cell is
-            // found by walking back over the characters that follow the cursor.
+            // Поставить каретку в клетку логического курсора, мигая по
+            // millisecond-тику планировщика. Консоль здесь ровно в конце буфера
+            // (`redraw_line` оставляет её там), так что клетка находится проходом
+            // назад по символам после курсора.
             if console_scrolled() {
-                // The view repainted the text region from history; the live caret
-                // belongs to the live grid and must not be painted into the view.
+                // Вид перерисовал текстовую область из истории; живая каретка
+                // принадлежит живой сетке и не должна рисоваться в виде.
                 caret.reset();
             } else if let Some(cell) = caret_cell(&editor) {
-                // `Caret::place` is still called when the caret is switched off —
-                // with `on = false` — so it erases wherever it currently is instead
-                // of leaving a bar stranded on screen after the toggle.
+                // `Caret::place` вызывается и при выключенной каретке — с
+                // `on = false`, — чтобы стереть её там, где она сейчас, а не
+                // оставить полосу на экране после переключения.
                 let blink = theme::snapshot().caret
                     && caret::Caret::blink_on(crate::task::scheduler::ticks());
                 caret.place(cell, blink);
             }
-            // Push whatever this pass drew first, then draw the arrow on top of the
-            // finished frame. The console is RAM-backed, so both flushes are small:
-            // the frame one carries only the dirty rectangle, and `move_to` pushes
-            // just the 12x19 arrow. Doing it in this order means the device shows
-            // the old frame with the arrow until the new frame replaces it, and the
-            // arrow comes back immediately afterwards — no gap, and never two
-            // arrows on screen at once.
+            // Сначала запушить нарисованное за проход, затем нарисовать стрелку
+            // поверх готового кадра. Консоль в RAM, так что оба flush малы:
+            // кадровый несёт только dirty-прямоугольник, а `move_to` пушит только
+            // стрелку 12x19. Такой порядок значит, что устройство показывает
+            // старый кадр со стрелкой, пока новый кадр его не заменит, а стрелка
+            // сразу возвращается — без разрыва и никогда двух стрелок одновременно.
             let _ = status_dirty;
-            // Draw the arrow into the same shadow frame and push both at once:
-            // the old arrow's restored background, this pass's changes and the new
-            // arrow reach the device in one flush, so there is never a frame with
-            // no pointer.
+            // Нарисовать стрелку в тот же shadow-кадр и запушить оба сразу:
+            // восстановленный фон старой стрелки, изменения прохода и новая
+            // стрелка доходят до устройства одним flush, так что кадра без
+            // указателя не бывает.
             crate::drivers::cursor::place_deferred(mouse.x, mouse.y);
             crate::drivers::framebuffer::flush();
         }
     }
 }
 
-/// Visible width of the prompt (`pagh:{cwd}> `) in cells. The prompt is what
-/// separates console cells from line indices, so selection needs it to know where
-/// the editable text starts.
+/// Видимая ширина промпта (`pagh:{cwd}> `) в клетках. Промпт разделяет клетки
+/// консоли и индексы строки, поэтому выделению нужно знать, где начинается
+/// редактируемый текст.
 fn prompt_cols() -> usize {
     let cwd = path::cwd();
     "pagh:".chars().count() + cwd.chars().count() + "> ".chars().count()
 }
 
-/// Console width in cells, or 0 when the framebuffer never initialized.
+/// Ширина консоли в клетках или 0, если framebuffer не инициализировался.
 fn console_cols() -> usize {
     crate::drivers::framebuffer::console().text_grid().0
 }
 
-/// The console rows the current input line occupies, `(first_row, last_row)`, with
-/// the columns of its first and last character.
+/// Строки консоли, которые занимает текущая строка ввода, `(first_row, last_row)`,
+/// с колонками первого и последнего символа.
 ///
-/// The line is printed after the prompt, so it does not start at grid row 0: boot
-/// output and earlier commands have scrolled the console, and the prompt can itself
-/// wrap. Everything that has to touch the line's cells — the caret, `Ctrl+A`'s
-/// selection, and the mapping back to line indices — must agree on these rows, so
-/// they are computed in one place. Deriving them from "the line starts at row 0"
-/// is the bug this exists to prevent: a selection built on row 0 copies whatever
-/// boot text happens to be there.
+/// Строка печатается после промпта, поэтому не начинается с grid row 0:
+/// boot-вывод и прошлые команды прокрутили консоль, да и промпт может
+/// переноситься. Всё, что трогает клетки строки — каретка, выделение `Ctrl+A` и
+/// отображение обратно в индексы, — должно сходиться на этих строках, поэтому они
+/// вычисляются в одном месте. Вывод «строка начинается с row 0» — баг, который
+/// это предотвращает: выделение, построенное на row 0, скопирует случайный
+/// boot-текст.
 fn line_cells(editor: &editor::LineEditor) -> Option<caret::CellRangeCells> {
     let (cols, _rows) = crate::drivers::framebuffer::console().text_grid();
     let (ccol, crow) = crate::drivers::framebuffer::console().cursor_cell()?;
     if cols == 0 {
         return None;
     }
-    // The console is exactly past the last printed character of the line.
+    // Консоль ровно за последним напечатанным символом строки.
     let end = crow * cols + ccol;
     let start = end.checked_sub(editor.buffer().chars().count())?;
     let first_row = start / cols;
-    // `Ctrl+A` selects the whole buffer, so the range spans whole rows: from the
-    // line's first character to the console's last printed cell.
+    // `Ctrl+A` выделяет весь буфер, поэтому диапазон покрывает целые строки: от
+    // первого символа строки до последней напечатанной клетки консоли.
     Some(caret::CellRangeCells {
         first: caret::Cell {
             col: start % cols,
@@ -975,46 +973,46 @@ fn line_cells(editor: &editor::LineEditor) -> Option<caret::CellRangeCells> {
     })
 }
 
-/// The cell the caret belongs in for the current line.
+/// Клетка, в которой должна быть каретка для текущей строки.
 ///
-/// The console is exactly at the end of the printed buffer when this runs
-/// (`redraw_line` leaves it there), so its cursor cell plus the number of
-/// characters after the logical cursor pins the caret. Returns `None` when the
-/// framebuffer never initialized (serial-only boot), in which case no caret is
-/// drawn and the console behaves exactly as it did before.
+/// Консоль ровно в конце напечатанного буфера (`redraw_line` оставляет её там),
+/// поэтому клетка курсора плюс число символов после логического курсора
+/// фиксируют каретку. Возвращает `None`, если framebuffer не инициализировался
+/// (serial-only boot) — тогда каретка не рисуется, и консоль ведёт себя как
+/// раньше.
 fn caret_cell(editor: &editor::LineEditor) -> Option<caret::Cell> {
     let (cols, _rows) = crate::drivers::framebuffer::console().text_grid();
     let console_cell = crate::drivers::framebuffer::console().cursor_cell()?;
     caret::Caret::cell_for(console_cell, editor, cols)
 }
 
-/// Try to read a scancode from the keyboard.
+/// Попробовать прочитать сканкод с клавиатуры.
 pub(super) fn try_read_scancode() -> Option<u8> {
     crate::drivers::get_char("keyboard").and_then(|kbd| kbd.read_char())
 }
 
-/// Whether the console is showing history instead of the live bottom.
+/// Показывает ли консоль историю вместо живого низа.
 fn console_scrolled() -> bool {
     crate::drivers::framebuffer::scroll_state().0 > 0
 }
 
-/// Scroll the console view by `delta` rows (positive = older) and announce it on
-/// the serial log.
+/// Прокрутить вид консоли на `delta` строк (положительное = старее) и
+/// объявить об этом в serial-логе.
 ///
-/// The caret and the selection describe the *live* grid; a history view is painted
-/// from the scrollback model, so both are dropped before the repaint. The serial
-/// `[DIAG]` line is the E2E harness's proof that a wheel/key event really moved the
-/// view (and how far back it is), and it is deliberately serial-only: printing it
-/// through the console would add a line for every wheel notch.
+/// Каретка и выделение описывают *живую* сетку; вид истории рисуется из модели
+/// scrollback, поэтому оба сбрасываются перед перерисовкой. Serial-строка
+/// `[DIAG]` — доказательство для E2E-стенда, что событие колеса/клавиши
+/// действительно сдвинуло вид (и насколько назад), и намеренно только serial:
+/// печать через консоль добавляла бы строку на каждый щелчок колеса.
 fn scroll_console(
     delta: i32,
     source: &str,
     caret: &mut caret::Caret,
     selection: &mut selection::Selection,
 ) {
-    // Repaint first: it overwrites any caret bar or selection highlight painted
-    // over the text, and only then are their models dropped. Clearing them before
-    // a no-op scroll would forget the selection while leaving its pixels on screen.
+    // Сначала перерисовать: это затирает полосу каретки или подсветку выделения
+    // поверх текста, и только потом их модели сбрасываются. Очистка до no-op
+    // прокрутки забыла бы выделение, оставив его пиксели на экране.
     if !crate::drivers::framebuffer::scroll_view(delta) {
         return;
     }
@@ -1031,11 +1029,11 @@ fn scroll_console(
     );
 }
 
-/// Return the console to the live bottom (a click, Escape, or typing).
+/// Вернуть консоль к живому низу (клик, Escape или набор).
 ///
-/// On a transparent console (wallpaper active) the history view painted opaque
-/// cells, so the wallpaper has to be put back before the live grid is drawn over
-/// it; the theme module owns that repaint.
+/// На прозрачной консоли (активные обои) вид истории рисовал непрозрачные
+/// клетки, поэтому обои надо вернуть до рисования живой сетки поверх них; этот
+/// перерис владеет модуль темы.
 fn reset_console_view(caret: &mut caret::Caret, selection: &mut selection::Selection) {
     caret.reset();
     selection.clear();
@@ -1048,21 +1046,21 @@ fn reset_console_view(caret: &mut caret::Caret, selection: &mut selection::Selec
     crate::kprintln!("[DIAG] console scroll reset");
 }
 
-/// The status bar's text for the current state, or `None` when it would repeat the
-/// string already on screen.
+/// Текст status bar для текущего состояния или `None`, если он повторил бы
+/// строку, уже висящую на экране.
 ///
-/// The strip mentions the mouse position, so redrawing it on every loop pass meant
-/// rebuilding its glyphs ~1000 times a second (once per timer tick) for a line that
-/// changes only when the pointer moves a cell or a second passes. That repaint is
-/// what made the shell feel sluggish: it is on the shell's own thread, between
-/// keystrokes. Caching the text turns it into a comparison per pass.
+/// Полоса упоминает позицию мыши, поэтому перерисовка на каждом проходе означала
+/// пересборку глифов ~1000 раз в секунду (на каждый тик таймера) для строки,
+/// меняющейся только когда указатель сдвинулся на клетку или прошла секунда.
+/// Эта перерисовка и делала shell вялым: она на его собственном потоке, между
+/// нажатиями. Кэширование текста превращает её в сравнение на проход.
 fn shell_status_text(
     mouse: &crate::drivers::ps2_mouse::MouseState,
     cached: &mut Option<(alloc::string::String, alloc::string::String)>,
 ) -> bool {
-    // The two halves live in `theme` because the theme switch has to repaint the
-    // strip itself (its colours change without its text changing) and a second
-    // copy of this format string would drift from the one the switch draws.
+    // Две половины живут в `theme`, потому что смена темы должна перерисовывать
+    // саму полосу (её цвета меняются без изменения текста), а вторая копия этой
+    // format-строки разошлась бы с той, что рисует переключатель.
     let next = (theme::status_left(), theme::status_right(mouse));
     if cached.as_ref() == Some(&next) {
         return false;

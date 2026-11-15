@@ -1,9 +1,10 @@
-//! `nano+` — a small full-screen text editor for the framebuffer shell.
+//! `nano+` — небольшой полноэкранный текстовый редактор для framebuffer-shell.
 //!
-//! Compared with classic nano it adds line numbers, a persistent status bar,
-//! bounded undo/redo, incremental search, go-to-line, horizontal scrolling and
-//! a dirty-file quit guard. Input remains ASCII because the PS/2 keyboard map is
-//! ASCII; existing UTF-8 bytes are displayed lossily rather than split unsafely.
+//! По сравнению с классическим nano он добавляет номера строк, постоянный
+//! status bar, ограниченные undo/redo, инкрементальный поиск, переход к строке,
+//! горизонтальную прокрутку и защиту от выхода с несохранённым файлом. Ввод
+//! остаётся ASCII, потому что раскладка PS/2-клавиатуры — ASCII; существующие
+//! байты UTF-8 показываются lossy, а не режутся небезопасно.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -18,17 +19,17 @@ use crate::vfs::{VfsError, VfsNode};
 const MAX_FILE: usize = 64 * 1024;
 const MAX_LINE: usize = 4096;
 const UNDO_LIMIT: usize = 32;
-// Cell geometry comes from the console and nowhere else. These were `8`/`16`
-// while the console rendered 8x16 glyphs; after the switch to the Fira Code
-// 8x18 cell the editor kept laying every row out at 16 pixels and drew each row
-// two pixels into the next one (and its caret was two pixels short).
+// Геометрия клеток приходит из консоли и больше ниоткуда. Здесь были `8`/`16`,
+// пока консоль рисовала глифы 8x16; после перехода на клетку 8x18 у Fira Code
+// редактор раскладывал каждую строку по 16 пикселей и залезал каждой строкой на
+// два пикселя в следующую (а каретка была на два пикселя короче).
 const CHAR_W: usize = framebuffer::CHAR_WIDTH;
 const CHAR_H: usize = framebuffer::CHAR_HEIGHT;
-/// Title strip: one glyph row plus a small margin.
+/// Полоса заголовка: одна строка глифов плюс небольшой отступ.
 const HEADER_H: usize = CHAR_H + 4;
-/// Footer: two text lines (status, key hints) plus a small margin.
+/// Подвал: две текстовые строки (статус, подсказки клавиш) плюс небольшой отступ.
 const FOOTER_H: usize = 2 * CHAR_H + 2;
-/// Sidebar width in character cells.
+/// Ширина сайдбара в символьных клетках.
 const TREE_COLS: usize = 24;
 
 #[derive(Clone)]
@@ -46,22 +47,23 @@ enum PromptMode {
     ReplaceWith,
 }
 
-/// A position in the document: a line and a byte column in it.
+/// Позиция в документе: строка и байтовая колонка в ней.
 ///
-/// Columns are "just past the last character" at `line.len()`, so a selection can
-/// end at the end of a line without pointing at a character.
+/// Колонки — «сразу за последним символом» на `line.len()`, так что выделение
+/// может кончаться в конце строки, не указывая на символ.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SelPoint {
     row: usize,
     col: usize,
 }
 
-/// A text selection in document coordinates.
+/// Текстовое выделение в координатах документа.
 ///
-/// `anchor` is where a drag started (or one end of a keyboard selection) and stays
-/// put; `head` is the moving end. Both are kept in the order the user created them
-/// and normalised by [`Self::ordered`] wherever reading order matters, so a drag in
-/// any direction selects the same text.
+/// `anchor` — где началось перетаскивание (или один конец клавиатурного
+/// выделения) и стоит на месте; `head` — движущийся конец. Оба хранятся в
+/// порядке создания пользователем и нормализуются [`Self::ordered`] везде, где
+/// важен порядок чтения, так что перетаскивание в любую сторону выделяет один и
+/// тот же текст.
 #[derive(Clone, Copy)]
 struct Selection {
     anchor: Option<SelPoint>,
@@ -76,7 +78,7 @@ impl Selection {
         }
     }
 
-    /// The two ends in reading order, or `None` when no selection exists.
+    /// Два конца в порядке чтения или `None`, когда выделения нет.
     fn ordered(&self) -> Option<(SelPoint, SelPoint)> {
         let (a, h) = (self.anchor?, self.head?);
         if (a.row, a.col) <= (h.row, h.col) {
@@ -99,11 +101,11 @@ impl Selection {
     }
 }
 
-/// Where a mouse click landed.
+/// Куда попал клик мыши.
 enum Hit {
-    /// A document position in the text pane.
+    /// Позиция документа в текстовой панели.
     Text(SelPoint),
-    /// A row index into the sidebar's visible list.
+    /// Индекс строки в видимом списке сайдбара.
     Tree(usize),
 }
 
@@ -124,19 +126,19 @@ pub struct Editor {
     config: NanoConfig,
     clipboard: Vec<String>,
     replace_needle: Option<String>,
-    /// Directory the sidebar should open at, when the editor starts with one.
+    /// Каталог, который сайдбар должен открыть, когда редактор стартует с ним.
     tree_root: Option<String>,
-    /// The buffer as of the last save/open, so "is this modified?" is answered by the
-    /// text itself instead of by "did a keystroke happen".
+    /// Буфер на момент последнего save/open, поэтому «изменён ли?» решается
+    /// самим текстом, а не «было ли нажатие».
     ///
-    /// A counter of edits is what marked the file dirty after typing a character and
-    /// deleting it again: the buffer was identical, the flag was not. Comparing the
-    /// lines is the only answer that cannot lie about it.
+    /// Счётчик правок помечал файл грязным после набора символа и его удаления:
+    /// буфер был идентичен, флаг — нет. Сравнение строк — единственный ответ,
+    /// который не может соврать.
     clean: Vec<String>,
-    /// Active text selection (mouse drag or `^A`).
+    /// Активное текстовое выделение (перетаскивание мышью или `^A`).
     sel: Selection,
-    /// Clipboard for a copied/cut *selection*, as opposed to the line-oriented
-    /// clipboard `^C`/`^K` use when nothing is selected.
+    /// Буфер обмена для скопированного/вырезанного *выделения*, в отличие от
+    /// построчного буфера, который используют `^C`/`^K`, когда ничего не выделено.
     sel_clip: String,
 }
 
@@ -171,10 +173,10 @@ impl Editor {
         }
     }
 
-    /// Point this editor at a different file, keeping the configuration.
+    /// Направить редактор на другой файл, сохранив конфигурацию.
     ///
-    /// Undo history is dropped deliberately: it belongs to the previous file, and
-    /// keeping it would let an undo in one file rewrite another.
+    /// История undo намеренно сбрасывается: она принадлежит прошлому файлу, и её
+    /// сохранение позволило бы undo в одном файле переписать другой.
     fn reload(&mut self, path: &str, text: &str) {
         self.path = path.to_string();
         self.lines = {
@@ -198,17 +200,17 @@ impl Editor {
         self.status = alloc::format!("opened {}", path);
     }
 
-    /// Recompute `dirty` from the buffer — the only honest definition of "modified".
+    /// Пересчитать `dirty` из буфера — единственное честное определение «изменён».
     fn refresh_dirty(&mut self) {
         self.dirty = self.lines != self.clean;
         if !self.dirty {
-            // Back to the saved text: there is nothing to lose, so the two-step quit
-            // guard has nothing to guard either.
+            // Вернулись к сохранённому тексту: терять нечего, так что двухшаговой
+            // защите выхода тоже нечего защищать.
             self.quit_armed = false;
         }
     }
 
-    /// Remember the current buffer as the saved state (open, reload, save).
+    /// Запомнить текущий буфер как сохранённое состояние (open, reload, save).
     fn mark_clean(&mut self) {
         self.clean = self.lines.clone();
         self.dirty = false;
@@ -228,8 +230,8 @@ impl Editor {
         }
         self.undo.push(self.snapshot());
         self.redo.clear();
-        // `dirty` is decided by the text, not by the keystroke: the caller mutates and
-        // then calls `refresh_dirty`.
+        // `dirty` решает текст, а не нажатие: вызывающий меняет и затем вызывает
+        // `refresh_dirty`.
         self.quit_armed = false;
     }
     fn restore(&mut self, s: Snapshot) {
@@ -521,12 +523,12 @@ impl Editor {
         self.lines.join("\n")
     }
 
-    // ── selection ────────────────────────────────────────────────────────
+    // ── выделение ────────────────────────────────────────────────────────
 
-    /// The selected range as `(start, end)` in reading order, or `None` for an
-    /// empty/absent selection. `start` is included, `end` is the position just
-    /// past the last selected character in the same row, or a character position
-    /// on the last row for a multi-row selection.
+    /// Выделенный диапазон как `(start, end)` в порядке чтения или `None` для
+    /// пустого/отсутствующего выделения. `start` включается, `end` — позиция сразу
+    /// за последним выделенным символом той же строки или символьная позиция в
+    /// последней строке для многострочного выделения.
     fn sel_bounds(&self) -> Option<(SelPoint, SelPoint)> {
         match self.sel.ordered() {
             Some((a, b)) if a != b => Some((a, b)),
@@ -551,8 +553,8 @@ impl Editor {
         self.sel.head = Some(p);
     }
 
-    /// Move the caret to `p`, clamped into the document and scrolled into view.
-    /// Returns whether the viewport scrolled (the caller then repaints the frame).
+    /// Переместить каретку в `p`, с клампом в документ и прокруткой в вид.
+    /// Возвращает, прокрутился ли viewport (тогда вызывающий перерисовывает кадр).
     fn set_cursor(&mut self, p: SelPoint) -> bool {
         let (top, left) = (self.top, self.left);
         self.row = p.row.min(self.lines.len().saturating_sub(1));
@@ -561,7 +563,7 @@ impl Editor {
         self.top != top || self.left != left
     }
 
-    /// Select the whole buffer and put the caret at its end.
+    /// Выделить весь буфер и поставить каретку в его конец.
     fn select_all(&mut self) {
         let last = self.lines.len() - 1;
         let end = self.lines[last].len();
@@ -574,10 +576,10 @@ impl Editor {
         self.status = alloc::format!("Selected {} line(s)", self.lines.len());
     }
 
-    /// The selected text, or `None` when nothing is selected.
+    /// Выделенный текст или `None`, когда ничего не выделено.
     ///
-    /// Both ends are *character* positions (see [`Selection`]): a row-to-row drag
-    /// includes the character under the pointer, which is what the highlight shows.
+    /// Оба конца — *символьные* позиции (см. [`Selection`]): перетаскивание от
+    /// строки к строке включает символ под указателем, что и показывает подсветка.
     fn sel_text(&self) -> Option<String> {
         let (a, b) = self.sel_bounds()?;
         let mut out = String::new();
@@ -601,18 +603,17 @@ impl Editor {
         Some(out)
     }
 
-    /// Delete the selected text, dropping the selection and leaving the caret at
-    /// its start. Returns whether there was a selection to delete.
+    /// Удалить выделенный текст, сбросив выделение и оставив каретку в его начале.
+    /// Возвращает, было ли что удалять.
     fn delete_selection(&mut self) -> bool {
         let Some((a, b)) = self.sel_bounds() else {
             self.sel.clear();
             return false;
         };
         self.checkpoint();
-        // Both ends are inclusive character positions: same row deletes
-        // `[a.col, b.col]`, a multi-row range deletes the tail of the first row,
-        // the whole middle rows and the head of the last row, joining the two
-        // remains into one line.
+        // Оба конца — включительные символьные позиции: в одной строке удаляется
+        // `[a.col, b.col]`, многострочный диапазон удаляет хвост первой строки,
+        // целиком средние строки и начало последней, склеивая остатки в одну строку.
         if a.row == b.row {
             let line = &mut self.lines[a.row];
             let ac = a.col.min(line.len());
@@ -636,8 +637,8 @@ impl Editor {
         true
     }
 
-    /// Insert `text` at the caret (newlines split lines). Used by the pastes;
-    /// a selection is deleted first by the caller.
+    /// Вставить `text` в каретку (newlines разбивают строки). Используется вставками;
+    /// выделение сначала удаляет вызывающий.
     fn insert_text(&mut self, text: &str) {
         for (i, part) in text.split('\n').enumerate() {
             if i > 0 {
@@ -758,42 +759,41 @@ fn clipped_ascii(s: &str, start: usize, width: usize, spaces: bool) -> String {
         .collect()
 }
 
-// ─── rendering ────────────────────────────────────────────────────────────
+// ─── рендеринг ────────────────────────────────────────────────────────────
 //
-// Three rules keep the drawing paths honest:
+// Три правила держат пути рисования честными:
 //
-// * **Damage, not frames.** A keystroke changes one line and the caret.
-//   Repainting the whole surface for it was measured at tens of milliseconds
-//   under TCG (a full frame is ~10 000 glyphs = ~1.4 M pixel writes) and is what
-//   made typing feel laggy. Each entry point below repaints the smallest region
-//   that can have changed; the console's dirty-rect flush then copies only that
-//   region to the device.
-// * **The arrow is re-shown after every frame.** Full-screen drawers hide the
-//   software mouse cursor before painting and must put it back on top of the
-//   finished frame — a path that hides it and never shows it leaves the pointer
-//   invisible for as long as the editor is open.
-// * **RAM, then exactly one flush.** Pixels only reach the screen through
-//   `framebuffer::flush`; a path that returns without it leaves its work in the
-//   shadow buffer (that is how the caret vanished: the blink wrote the bar but
-//   never pushed it).
+// * **Damage, а не кадры.** Нажатие меняет одну строку и каретку. Перерисовка
+//   всей поверхности для него измерялась десятками миллисекунд под TCG (полный
+//   кадр — ~10 000 глифов = ~1.4 M записей пикселей) и делала набор вязким.
+//   Каждая точка входа ниже перерисовывает наименьшую область, которая могла
+//   измениться; dirty-rect flush консоли затем копирует только эту область на
+//   устройство.
+// * **Стрелка показывается заново после каждого кадра.** Полноэкранные рисовальщики
+//   скрывают программный курсор мыши перед рисованием и должны вернуть его поверх
+//   готового кадра — путь, который скрыл и не показал, оставляет указатель
+//   невидимым, пока редактор открыт.
+// * **RAM, затем ровно один flush.** Пиксели доходят до экрана только через
+//   `framebuffer::flush`; путь, вернувшийся без него, оставляет работу в shadow-буфере
+//   (так и пропала каретка: мигание писало полосу, но никогда её не пушило).
 
-/// Pixel geometry of the editor frame, derived once per draw.
+/// Пиксельная геометрия кадра редактора, выводимая один раз на отрисовку.
 struct Layout {
     w: usize,
     h: usize,
-    /// Sidebar width in cells (0 when the sidebar is hidden).
+    /// Ширина сайдбара в клетках (0, когда сайдбар скрыт).
     tree_cols: usize,
-    /// Text columns beside the sidebar.
+    /// Текстовые колонки рядом с сайдбаром.
     cols: usize,
-    /// Visible editor rows.
+    /// Видимые строки редактора.
     rows: usize,
-    /// Line-number gutter width in cells (0 when line numbers are off).
+    /// Ширина gutter номеров строк в клетках (0, когда номера выключены).
     gutter: usize,
-    /// Top pixel of the footer strip.
+    /// Верхний пиксель полосы подвала.
     foot: usize,
 }
 
-/// Visible editor rows for a screen `h` pixels tall.
+/// Видимые строки редактора для экрана высотой `h` пикселей.
 fn body_rows(h: usize) -> usize {
     h.saturating_sub(HEADER_H + FOOTER_H) / CHAR_H
 }
@@ -815,13 +815,13 @@ fn layout(editor: &Editor, tree: Option<&super::tree::FileTree>) -> Option<Layou
     })
 }
 
-/// Title strip at the top: path and modified marker.
+/// Полоса заголовка сверху: путь и маркер изменений.
 fn paint_header(fb: &mut framebuffer::FramebufferWriter, editor: &Editor, l: &Layout) {
     let blue = editor.config.palette()[4];
     fb.fill_rect(0, 0, l.w, HEADER_H, blue);
-    // Unsaved work is stated in the title, in words rather than a lone asterisk:
-    // "did my edit do anything" should be answerable at a glance, and an `*` next
-    // to a long path is not.
+    // Несохранённая работа сказана в заголовке словами, а не одинокой звёздочкой:
+    // «сделала ли моя правка что-нибудь» должно отвечаться с одного взгляда, а `*`
+    // рядом с длинным путём — нет.
     let title = if editor.dirty {
         format!(" nano+  {}   [modified - ^S saves]", editor.path)
     } else {
@@ -836,7 +836,7 @@ fn paint_header(fb: &mut framebuffer::FramebufferWriter, editor: &Editor, l: &La
     );
 }
 
-/// The sidebar: the project tree rooted at the edited file's directory.
+/// Сайдбар: дерево проекта с корнем в каталоге редактируемого файла.
 fn paint_tree(
     fb: &mut framebuffer::FramebufferWriter,
     editor: &Editor,
@@ -868,7 +868,7 @@ fn paint_tree(
             break;
         };
         let y = list_y + vr * CHAR_H;
-        // Indent per depth, and a marker that says open/closed at a glance.
+        // Отступ на глубину и маркер, который сразу говорит open/closed.
         let indent = row.depth * 2;
         let mark = if row.is_dir {
             if row.expanded {
@@ -897,10 +897,10 @@ fn paint_tree(
     }
 }
 
-/// Repaint one editor row (background, gutter, text, search hit).
+/// Перерисовать одну строку редактора (фон, gutter, текст, попадание поиска).
 ///
-/// Fills its own background: incremental callers have no full-frame fill behind
-/// them, so the tail of a line that just got shorter must be wiped here.
+/// Заливает собственный фон: у инкрементальных вызывающих нет полной заливки
+/// кадра позади, так что хвост только что укоротившейся строки надо стереть здесь.
 fn paint_editor_row(
     fb: &mut framebuffer::FramebufferWriter,
     editor: &Editor,
@@ -944,9 +944,10 @@ fn paint_editor_row(
         }
         _ => fb.draw_text_px(tx, y, &visible, text, bg),
     }
-    // Selection highlight goes on last, over the text and over a search hit: what
-    // the user selected is what they will act on. The console has no blending, so
-    // this repaints the covered cells inverted (black on light) instead of tinting.
+    // Подсветка выделения идёт последней, поверх текста и поверх попадания
+    // поиска: то, что пользователь выделил, — то, с чем он будет действовать. У
+    // консоли нет blending, поэтому здесь перекрашиваются покрытые клетки
+    // инверсией (чёрным по светлому), а не тонированием.
     if let Some((c0, c1)) = selected_cols(editor, r) {
         let vis_last = editor.left + visible.len().saturating_sub(1);
         if !visible.is_empty() && c0 <= vis_last && c1 >= editor.left {
@@ -971,12 +972,13 @@ fn paint_editor_row(
     }
 }
 
-/// The document columns of line `r` covered by the selection, inclusive, or `None`
-/// when this row has no selected characters.
+/// Колонки документа строки `r`, покрытые выделением, включительно, или `None`,
+/// когда в этой строке нет выделенных символов.
 ///
-/// Selection ends are character positions (a drag includes the character under the
-/// pointer); the last character of a multi-row selection's last row is `b.col`, and
-/// rows in between are fully selected. An empty line has nothing to highlight.
+/// Концы выделения — символьные позиции (перетаскивание включает символ под
+/// указателем); последний символ последней строки многострочного выделения —
+/// `b.col`, а строки между ними выделены целиком. В пустой строке подсвечивать
+/// нечего.
 fn selected_cols(editor: &Editor, r: usize) -> Option<(usize, usize)> {
     let (a, b) = editor.sel_bounds()?;
     if r < a.row || r > b.row {
@@ -995,12 +997,12 @@ fn selected_cols(editor: &Editor, r: usize) -> Option<(usize, usize)> {
     Some((from, to))
 }
 
-/// Map a pixel position to a document position when it is over the text pane.
+/// Отобразить пиксельную позицию в позицию документа, когда она над текстовой панелью.
 ///
-/// The screen is cells of [`CHAR_W`]×[`CHAR_H`] pixels starting below the header;
-/// the sidebar and the line-number gutter are subtracted before the column is
-/// translated by the horizontal scroll offset. A click past the end of a line puts
-/// the caret at its end, never on a non-existent character.
+/// Экран — клетки [`CHAR_W`]×[`CHAR_H`] начиная ниже заголовка; сайдбар и gutter
+/// номеров строк вычитаются до того, как колонка переводится смещением
+/// горизонтальной прокрутки. Клик за концом строки ставит каретку в её конец,
+/// никогда — на несуществующий символ.
 fn mouse_text_point(
     editor: &Editor,
     tree: Option<&super::tree::FileTree>,
@@ -1026,7 +1028,7 @@ fn mouse_text_point(
     Some(SelPoint { row, col })
 }
 
-/// What a click at `(mx, my)` hits: a document position, a sidebar row, or nothing.
+/// Что попадает под клик в `(mx, my)`: позиция документа, строка сайдбара или ничего.
 fn mouse_target(
     editor: &Editor,
     tree: Option<&super::tree::FileTree>,
@@ -1039,7 +1041,8 @@ fn mouse_target(
     }
     if let Some(t) = tree {
         if mx < l.tree_cols * CHAR_W {
-            // Same rows `paint_tree` lists: the root line, then one row per entry.
+            // Те же строки, что перечисляет `paint_tree`: строка корня, затем по
+            // строке на запись.
             let list_y = HEADER_H + CHAR_H + 4;
             if my < list_y {
                 return None;
@@ -1055,7 +1058,7 @@ fn mouse_target(
     mouse_text_point(editor, tree, mx, my).map(Hit::Text)
 }
 
-/// Draw the footer strip: the status line (or the active prompt) and key hints.
+/// Нарисовать полосу подвала: строку статуса (или активный prompt) и подсказки клавиш.
 fn paint_footer(fb: &mut framebuffer::FramebufferWriter, editor: &Editor, l: &Layout) {
     let [_, surface, text, _, _, green, red, _] = editor.config.palette();
     let foot = l.foot;
@@ -1106,8 +1109,8 @@ fn paint_footer(fb: &mut framebuffer::FramebufferWriter, editor: &Editor, l: &La
     );
 }
 
-/// The caret's pixel position, or `None` when it is off-screen or a prompt owns
-/// the footer.
+/// Пиксельная позиция каретки или `None`, когда она за экраном или подвалом
+/// владеет prompt.
 fn caret_position(editor: &Editor, l: &Layout) -> Option<(usize, usize)> {
     if editor.prompt.is_some() || editor.row < editor.top || editor.col < editor.left {
         return None;
@@ -1123,10 +1126,10 @@ fn caret_position(editor: &Editor, l: &Layout) -> Option<(usize, usize)> {
     Some((cx, HEADER_H + vr * CHAR_H))
 }
 
-/// Draw the caret bar on top of a row that has just been repainted.
+/// Нарисовать полосу каретки поверх только что перерисованной строки.
 ///
-/// Only the "on" phase needs drawing: the row under it was repainted immediately
-/// before, which is what restores the character the bar covers.
+/// Рисовать нужно только фазу «включена»: строка под ней перерисована
+/// непосредственно перед этим, что и восстанавливает символ под полосой.
 fn paint_caret_bar(
     fb: &mut framebuffer::FramebufferWriter,
     editor: &Editor,
@@ -1141,13 +1144,13 @@ fn paint_caret_bar(
     }
 }
 
-/// Repaint the whole frame: header, sidebar, every editor row, footer, caret.
+/// Перерисовать весь кадр: заголовок, сайдбар, каждую строку редактора, подвал, каретку.
 fn render_full(editor: &Editor, caret_on: bool, tree: Option<&super::tree::FileTree>) {
     let Some(l) = layout(editor, tree) else {
         return;
     };
-    // Deferred: the restored background rides along with the frame flush below, so
-    // the arrow stays on the device while the frame is being painted.
+    // Отложено: восстановленный фон едет вместе с flush кадра ниже, так что
+    // стрелка остаётся на устройстве, пока кадр рисуется.
     cursor::hide_deferred();
     let _ = framebuffer::with(|fb| {
         let bg = editor.config.palette()[0];
@@ -1166,8 +1169,8 @@ fn render_full(editor: &Editor, caret_on: bool, tree: Option<&super::tree::FileT
     framebuffer::flush();
 }
 
-/// Repaint body rows `first..=last` (visible row indices), the footer and the
-/// caret. The header and sidebar are left alone.
+/// Перерисовать строки тела `first..=last` (индексы видимых строк), подвал и
+/// каретку. Заголовок и сайдбар не трогаются.
 fn render_body(
     editor: &Editor,
     caret_on: bool,
@@ -1183,8 +1186,8 @@ fn render_body(
     }
     let last = last.min(l.rows - 1);
     let first = first.min(last);
-    // Deferred: the restored background rides along with the frame flush below, so
-    // the arrow stays on the device while the frame is being painted.
+    // Отложено: восстановленный фон едет вместе с flush кадра ниже, так что
+    // стрелка остаётся на устройстве, пока кадр рисуется.
     cursor::hide_deferred();
     let _ = framebuffer::with(|fb| {
         for vr in first..=last {
@@ -1197,14 +1200,14 @@ fn render_body(
     framebuffer::flush();
 }
 
-/// Repaint the sidebar and footer (tree focus), plus the caret row so a blinking
-/// bar cannot be left stranded while the text pane is not being edited.
+/// Перерисовать сайдбар и подвал (фокус дерева), плюс строку каретки, чтобы
+/// мигающая полоса не осталась висеть, пока текстовую панель не редактируют.
 fn render_tree(editor: &Editor, caret_on: bool, tree: Option<&super::tree::FileTree>) {
     let Some(l) = layout(editor, tree) else {
         return;
     };
-    // Deferred: the restored background rides along with the frame flush below, so
-    // the arrow stays on the device while the frame is being painted.
+    // Отложено: восстановленный фон едет вместе с flush кадра ниже, так что
+    // стрелка остаётся на устройстве, пока кадр рисуется.
     cursor::hide_deferred();
     let _ = framebuffer::with(|fb| {
         if let Some(t) = tree {
@@ -1224,8 +1227,8 @@ fn render_tree(editor: &Editor, caret_on: bool, tree: Option<&super::tree::FileT
     framebuffer::flush();
 }
 
-/// Repaint only the footer (a live prompt is being typed into). No caret is drawn
-/// while a prompt owns the footer, so nothing else can have changed.
+/// Перерисовать только подвал (в него набирают живой prompt). Каретка не
+/// рисуется, пока подвалом владеет prompt, так что больше ничего измениться не могло.
 fn render_footer_only(editor: &Editor, tree: Option<&super::tree::FileTree>) {
     let Some(l) = layout(editor, tree) else {
         return;
@@ -1236,11 +1239,11 @@ fn render_footer_only(editor: &Editor, tree: Option<&super::tree::FileTree>) {
     framebuffer::flush();
 }
 
-/// Repaint the caret's row and the caret itself — the blink path.
+/// Перерисовать строку каретки и саму каретку — путь мигания.
 ///
-/// Erasing the bar means putting the character underneath back, so the row is
-/// repainted rather than blanked with the background colour: a 2-pixel background
-/// strip would erase the left column of a mid-line glyph on every blink.
+/// Стереть полосу значит вернуть символ под ней, поэтому строка перерисовывается,
+/// а не забивается цветом фона: 2-пиксельная фоновая полоса стирала бы левую
+/// колонку глифа в середине строки на каждом мигании.
 fn render_blink(editor: &Editor, caret_on: bool, tree: Option<&super::tree::FileTree>) {
     let Some(l) = layout(editor, tree) else {
         return;
@@ -1248,8 +1251,8 @@ fn render_blink(editor: &Editor, caret_on: bool, tree: Option<&super::tree::File
     let Some(vr) = caret_position(editor, &l).map(|(_, y)| (y - HEADER_H) / CHAR_H) else {
         return;
     };
-    // Deferred: the restored background rides along with the frame flush below, so
-    // the arrow stays on the device while the frame is being painted.
+    // Отложено: восстановленный фон едет вместе с flush кадра ниже, так что
+    // стрелка остаётся на устройстве, пока кадр рисуется.
     cursor::hide_deferred();
     let _ = framebuffer::with(|fb| {
         paint_editor_row(fb, editor, &l, editor.top + vr, vr);
@@ -1271,8 +1274,8 @@ pub fn run(path_arg: &str) {
     let node = node;
     let mut editor = Editor::new(&path, &text, NanoConfig::load());
     editor.tree_root = Some(parent_dir(&path));
-    // The sidebar is visible from the start: seeing the project is the point of an
-    // IDE-like editor, and `^B` hides it for a full-width view of the text.
+    // Сайдбар виден с самого начала: видеть проект — смысл IDE-подобного
+    // редактора, а `^B` скрывает его для текста во всю ширину.
     let mut tree: Option<super::tree::FileTree> = None;
     let mut tree_focus = false;
     crate::kprintln!("nano+: editing {}", path);
@@ -1282,18 +1285,18 @@ pub fn run(path_arg: &str) {
     crate::kprintln!("nano+: closed {}", path);
 }
 
-/// Which pane the keyboard drives. The sidebar is only reachable while it is open.
+/// Какая панель управляется клавиатурой. Сайдбар достижим, только пока открыт.
 #[derive(PartialEq, Clone, Copy)]
 enum Pane {
     Text,
     Tree,
 }
 
-/// The editor's event loop, with the sidebar threaded through it.
+/// Цикл событий редактора с продетым через него сайдбаром.
 ///
-/// Split out of [`run`] so the tree and the editor are separate borrows: the loop
-/// needs `&mut` on both, and holding them as two locals of one frame is what keeps
-/// that legal without interior mutability.
+/// Выделен из [`run`], чтобы дерево и редактор были отдельными заимствованиями:
+/// циклу нужны `&mut` на оба, и два локальных значения одного кадра — то, что
+/// делает это легальным без внутренней изменяемости.
 fn event_loop(
     mut editor: Editor,
     mut node: alloc::sync::Arc<dyn crate::vfs::VfsNode>,
@@ -1301,20 +1304,20 @@ fn event_loop(
     tree_focus: &mut bool,
 ) {
     let mut decoder = Decoder::new();
-    // The keyboard starts in the TEXT, always — including when the sidebar is open.
-    // Opening a file is an intent to edit it; routing the first keystroke into a
-    // file browser instead made the editor look broken (you could not type, and
-    // `^Q` did nothing because the sidebar owned the keys). `Tab` moves into the
-    // tree when it is wanted.
+    // Клавиатура стартует в ТЕКСТЕ, всегда — в том числе когда сайдбар открыт.
+    // Открытие файла — намерение его редактировать; направление первого нажатия в
+    // файловый браузер вместо этого делало редактор сломанным (печатать нельзя, а
+    // `^Q` ничего не делает, потому что клавиши у сайдбара). `Tab` переводит в
+    // дерево, когда это нужно.
     let mut pane = Pane::Text;
-    // Open the sidebar at the edited file's directory.
+    // Открыть сайдбар в каталоге редактируемого файла.
     if let Some(root) = editor.tree_root.clone() {
         *tree = Some(super::tree::FileTree::new(&root));
         if let Some(t) = tree.as_mut() {
             let (_, h) = framebuffer::dimensions();
             t.view_rows = body_rows(h).saturating_sub(1);
-            // Put the highlight on the file being edited, not on the first entry:
-            // the tree should show where you are.
+            // Поставить подсветку на редактируемый файл, а не на первую запись:
+            // дерево должно показывать, где вы находитесь.
             let current = editor.path.clone();
             if let Some(i) = t.rows().iter().position(|r| r.path == current) {
                 t.cursor = i;
@@ -1323,8 +1326,8 @@ fn event_loop(
         }
     }
     let mut last_phase = blink();
-    // Previous left-button state, for edge detection. The PS/2 driver reports the
-    // button as a level, so "pressed" is a rising edge, not `left == true`.
+    // Предыдущее состояние левой кнопки для определения фронтов. Драйвер PS/2
+    // сообщает кнопку уровнем, так что «нажато» — это фронт, а не `left == true`.
     let mut prev_left = false;
     render_full(&editor, last_phase, tree.as_ref());
     'app: loop {
@@ -1335,9 +1338,9 @@ fn event_loop(
             };
             if editor.prompt.is_some() {
                 editor.handle_prompt(event);
-                // A committed/cancelled prompt moves the cursor and may highlight a
-                // search hit elsewhere on screen; typing into it only changes the
-                // footer line.
+                // Завершённый/отменённый prompt двигает курсор и может подсветить
+                // попадание поиска в другом месте экрана; набор в него меняет только
+                // строку подвала.
                 if matches!(
                     event,
                     KeyEvent::Enter | KeyEvent::Escape | KeyEvent::Ctrl('q')
@@ -1351,10 +1354,10 @@ fn event_loop(
                 continue;
             }
 
-            // ── Keys that belong to the editor no matter where the focus is ──
-            // `^Q`, `^S` and `^B` are how you leave, save and get back; a focus
-            // state that swallows them is a trap, which is exactly what happened
-            // when the sidebar opened focused.
+            // ── Клавиши, принадлежащие редактору независимо от фокуса ──
+            // `^Q`, `^S` и `^B` — как выйти, сохранить и вернуться; состояние фокуса,
+            // которое их проглатывает, — ловушка, и именно это случилось, когда
+            // сайдбар открывался в фокусе.
             match event {
                 KeyEvent::Ctrl('q') => {
                     if editor.dirty && !editor.quit_armed {
@@ -1395,12 +1398,12 @@ fn event_loop(
                 _ => {}
             }
 
-            // ── Sidebar focus: the tree owns the arrow keys and Enter ──
+            // ── Фокус сайдбара: дерево владеет стрелками и Enter ──
             if pane == Pane::Tree {
                 let mut switched = false;
-                // Set when a file switch was refused because the buffer is dirty: the
-                // sidebar must then snap its highlight back to the file that is
-                // actually open, or it claims you are editing a file you are not.
+                // Ставится, когда смена файла отвергнута из-за грязного буфера:
+                // тогда сайдбар должен вернуть подсветку на файл, который реально
+                // открыт, иначе он утверждает, что вы правите файл, который не правите.
                 let mut refused = false;
                 match event {
                     KeyEvent::Up => {
@@ -1420,8 +1423,8 @@ fn event_loop(
                     }
                     KeyEvent::Right | KeyEvent::Enter => {
                         if let Some(path) = tree.as_mut().and_then(|t| t.activate()) {
-                            // Switching files with unsaved changes would silently
-                            // drop them, so it is refused instead.
+                            // Смена файла с несохранёнными изменениями молча их бы
+                            // потеряла, поэтому она отвергается.
                             if editor.dirty {
                                 editor.status =
                                     "Unsaved changes — ^S to save, ^Q to discard".into();
@@ -1430,17 +1433,17 @@ fn event_loop(
                                 editor.reload(&path, &text);
                                 node = n;
                                 switched = true;
-                                // Opening a file is an intent to edit it: the keyboard
-                                // goes back to the text, so the very next keystroke is
-                                // typing instead of tree navigation. (Opening a
-                                // directory keeps the focus here for arrow-key walking.)
+                                // Открытие файла — намерение его редактировать:
+                                // клавиатура возвращается в текст, так что следующее
+                                // нажатие — набор, а не навигация по дереву. (Открытие
+                                // каталога оставляет фокус здесь для ходьбы стрелками.)
                                 pane = Pane::Text;
                                 *tree_focus = false;
                             }
                         }
                     }
-                    // `Tab` returns to the text; `Esc` too. The editor-level
-                    // `^Q`/`^S`/`^B` above are already handled.
+                    // `Tab` возвращает в текст; `Esc` тоже. Редакторные
+                    // `^Q`/`^S`/`^B` выше уже обработаны.
                     KeyEvent::Tab | KeyEvent::Escape => {
                         pane = Pane::Text;
                         *tree_focus = false;
@@ -1451,8 +1454,8 @@ fn event_loop(
                     let (_, h) = framebuffer::dimensions();
                     t.view_rows = body_rows(h).saturating_sub(1);
                     if refused {
-                        // The switch was refused: the highlight had already moved to
-                        // the clicked row, so put it back on the open file.
+                        // Смена отвергнута: подсветка уже сдвинулась на кликнутую
+                        // строку, так что вернуть её на открытый файл.
                         focus_tree_on(&editor, t);
                     }
                     t.ensure_visible();
@@ -1466,7 +1469,7 @@ fn event_loop(
                 continue;
             }
 
-            // ── Text focus ──
+            // ── Фокус текста ──
             let before = (
                 editor.row,
                 editor.col,
@@ -1475,11 +1478,11 @@ fn event_loop(
                 editor.lines.len(),
             );
             match event {
-                // Editing keys act on the selection when there is one: typing
-                // replaces it, Backspace/Delete remove it, and `^A` + Delete clears
-                // the whole line (or the whole file) instead of deleting one
-                // character. Ignoring the visible selection here was the bug the
-                // first user hit within a minute of opening the editor.
+                // Клавиши редактирования действуют на выделение, когда оно есть:
+                // набор заменяет его, Backspace/Delete удаляют, а `^A` + Delete
+                // очищает всю строку (или весь файл) вместо удаления одного
+                // символа. Игнорирование видимого выделения здесь было багом,
+                // который первый пользователь встретил через минуту после открытия.
                 KeyEvent::Char(c) => {
                     editor.delete_selection();
                     editor.insert(c)
@@ -1498,7 +1501,7 @@ fn event_loop(
                         editor.delete()
                     }
                 }
-                // Plain caret movement cancels the selection, like every editor.
+                // Обычное движение каретки отменяет выделение, как в любом редакторе.
                 KeyEvent::Left => {
                     editor.clear_selection();
                     editor.left()
@@ -1545,7 +1548,7 @@ fn event_loop(
                 }
                 KeyEvent::Escape => {
                     if editor.has_selection() {
-                        // Esc first drops a selection; quitting is the next key.
+                        // Esc сначала сбрасывает выделение; выход — следующая клавиша.
                         editor.clear_selection();
                     } else if editor.dirty && !editor.quit_armed {
                         editor.quit_armed = true;
@@ -1554,7 +1557,7 @@ fn event_loop(
                         break 'app;
                     }
                 }
-                // Enter the sidebar without the mouse.
+                // Войти в сайдбар без мыши.
                 KeyEvent::Ctrl('t') => {
                     if tree.is_some() {
                         pane = Pane::Tree;
@@ -1566,10 +1569,10 @@ fn event_loop(
                 KeyEvent::Ctrl('g') => editor.begin_prompt(PromptMode::Goto),
                 KeyEvent::Ctrl('z') => editor.undo(),
                 KeyEvent::Ctrl('y') => editor.redo(),
-                // `^A` selects everything; `^C`/`^K`/`^X` copy and cut the
-                // selection when one exists and fall back to their line behaviour
-                // when none does. That keeps the classic bindings and gives the
-                // mouse selection somewhere to go.
+                // `^A` выделяет всё; `^C`/`^K`/`^X` копируют и вырезают
+                // выделение, когда оно есть, и откатываются к построчному поведению,
+                // когда нет. Это сохраняет классические привязки и даёт выделению
+                // мышью куда деться.
                 KeyEvent::Ctrl('a') => editor.select_all(),
                 KeyEvent::Ctrl('c') => {
                     if let Some(text) = editor.sel_text() {
@@ -1604,14 +1607,14 @@ fn event_loop(
             }
             last_phase = blink();
             if editor.prompt.is_some() {
-                // ^F/^R/^G opened a prompt: repaint the frame so the caret bar on
-                // its old row is erased and the footer shows the prompt.
+                // ^F/^R/^G открыли prompt: перерисовать кадр, чтобы полоса каретки
+                // на старой строке стёрлась, а подвал показал prompt.
                 render_full(&editor, last_phase, tree.as_ref());
             } else if editor.top != before.2 || editor.left != before.3 {
-                // Scrolling (or a very long line) moved the whole viewport.
+                // Прокрутка (или очень длинная строка) сдвинула весь viewport.
                 render_full(&editor, last_phase, tree.as_ref());
             } else if editor.lines.len() != before.4 {
-                // Rows below the edit shifted: repaint from the changed row down.
+                // Строки ниже правки сдвинулись: перерисовать от изменившейся строки вниз.
                 let first = before.0.min(editor.row).saturating_sub(editor.top);
                 render_body(
                     &editor,
@@ -1621,17 +1624,17 @@ fn event_loop(
                     body_rows(framebuffer::dimensions().1).saturating_sub(1),
                 );
             } else {
-                // Only the rows the caret moved between (usually one) changed.
+                // Изменились только строки между старым и новым положением каретки
+                // (обычно одна).
                 let a = before.0.saturating_sub(editor.top);
                 let b = editor.row.saturating_sub(editor.top);
                 render_body(&editor, last_phase, tree.as_ref(), a.min(b), a.max(b));
             }
         }
-        // ── Mouse ────────────────────────────────────────────────────────
-        // Clicking used to do nothing at all in the editor: the arrow was drawn,
-        // the buttons were never read. A click places the caret, a drag selects
-        // text (and the caret follows the drag), and a click on a sidebar row
-        // focuses/activates it.
+        // ── Мышь ────────────────────────────────────────────────────────
+        // Раньше клик в редакторе не делал ничего: стрелка рисовалась, а кнопки
+        // никогда не читались. Клик ставит каретку, перетаскивание выделяет текст
+        // (и каретка следует за ним), а клик по строке сайдбара фокусирует/активирует её.
         let mouse = crate::drivers::ps2_mouse::poll();
         let pressed = mouse.left && !prev_left;
         let released = !mouse.left && prev_left;
@@ -1659,8 +1662,8 @@ fn event_loop(
                     if let Some(t) = tree.as_mut() {
                         t.cursor = i;
                     }
-                    // A click on a file row opens it; on a directory it just
-                    // focuses the row (Enter/Right still expands).
+                    // Клик по строке файла открывает его; по каталогу — только
+                    // фокусирует строку (Enter/Right всё равно разворачивают).
                     let target = tree.as_mut().and_then(|t| t.activate());
                     if let Some(path) = target {
                         if editor.dirty {
@@ -1671,10 +1674,10 @@ fn event_loop(
                         } else if let Ok((n, text)) = open_or_create(&path) {
                             editor.reload(&path, &text);
                             node = n;
-                            // Clicking a file row opens it *and* hands the keyboard
-                            // back to the text: leaving the sidebar focused is what made
-                            // the editor look dead after a few file switches — every
-                            // key was going to the tree.
+                            // Клик по строке файла открывает его *и* возвращает
+                            // клавиатуру тексту: оставленный в фокусе сайдбар делал
+                            // редактор мёртвым после нескольких смен файла — каждое
+                            // нажатие уходило в дерево.
                             pane = Pane::Text;
                             *tree_focus = false;
                         }
@@ -1685,8 +1688,9 @@ fn event_loop(
                 None => {}
             }
         } else if mouse.left && editor.sel.anchor.is_some() {
-            // Drag: extend the selection to the cell under the pointer and move the
-            // caret with it, so typing after a drag lands at the pointer.
+            // Перетаскивание: расширить выделение до клетки под указателем и
+            // двигать каретку вместе с ним, чтобы набор после перетаскивания попал
+            // под указатель.
             if let Some(p) = mouse_text_point(&editor, tree.as_ref(), mouse.x, mouse.y) {
                 let prev_head = editor.sel.head.map(|q| q.row);
                 let old_row = editor.row;
@@ -1721,12 +1725,12 @@ fn event_loop(
             last_phase = blink();
             render_full(&editor, last_phase, tree.as_ref());
         }
-        // The arrow: `move_to` is idempotent (it returns early when the pointer
-        // has not moved), so this is a comparison per timer tick, not a redraw.
+        // Стрелка: `move_to` идемпотентен (рано выходит, когда указатель не
+        // двигался), так что это сравнение на каждый тик, а не перерисовка.
         cursor::move_to(mouse.x, mouse.y);
-        // Blink: repaint the caret's row and the bar, only when the phase changed.
-        // 1 kHz wakes are too fast for that to be anything but two screen changes
-        // per second.
+        // Мигание: перерисовать строку каретки и полосу, только когда сменилась
+        // фаза. Пробуждения на 1 кГц слишком часты, чтобы это было чем-то, кроме
+        // двух изменений экрана в секунду.
         let phase = blink();
         if phase != last_phase {
             last_phase = phase;
@@ -1736,16 +1740,16 @@ fn event_loop(
     let _ = tree_focus;
 }
 
-/// The caret's blink phase, shared with the shell so both carets blink together.
+/// Фаза мигания каретки, общая с shell, чтобы обе каретки мигали вместе.
 fn blink() -> bool {
     super::caret::Caret::blink_on(crate::task::scheduler::ticks())
 }
 
-/// Put the sidebar highlight back on the file that is actually open.
+/// Вернуть подсветку сайдбара на файл, который реально открыт.
 ///
-/// Used when a switch is refused (unsaved changes): the tree had already moved its
-/// highlight to the clicked row, and leaving it there claims the editor is showing a
-/// file it is not. Returns whether the highlight moved.
+/// Используется, когда смена отвергнута (несохранённые изменения): дерево уже
+/// сдвинуло подсветку на кликнутую строку, и оставлять её там — утверждать, что
+/// редактор показывает не тот файл. Возвращает, сдвинулась ли подсветка.
 fn focus_tree_on(editor: &Editor, tree: &mut super::tree::FileTree) -> bool {
     let current = editor.path.clone();
     match tree.rows().iter().position(|r| r.path == current) {
@@ -1758,7 +1762,7 @@ fn focus_tree_on(editor: &Editor, tree: &mut super::tree::FileTree) -> bool {
     }
 }
 
-/// The directory containing `path`, used to root the tree beside the edited file.
+/// Каталог, содержащий `path`, — корень дерева рядом с редактируемым файлом.
 fn parent_dir(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     match trimmed.rfind('/') {

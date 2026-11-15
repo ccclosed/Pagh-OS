@@ -1,100 +1,94 @@
-//! Pure, host-testable symbolic-link path resolution (issue #18).
+//! Чистый host-тестируемый резолвер путей с симлинками.
 //!
-//! The kernel resolves a path component by component: `..` moves up the
-//! directory stack, a final symlink is followed only when the syscall asks for
-//! it, and intermediates are followed always. A crossed link splices its target
-//! **in front of** the remaining components, and the walk restarts from the VFS
-//! root for an absolute target but keeps the current directory for a relative
-//! one. Crossing more than [`SYMLOOP_MAX`] links during one resolution is
-//! `ELOOP` (Linux `SYMLOOP_MAX`), and the expanded path is capped so an
-//! attacker-controlled image cannot grow the walk without bound.
+//! Ядро резолвит путь покомпонентно: `..` поднимает стек каталогов, конечная
+//! ссылка следуется только если syscall этого просит, промежуточные — всегда.
+//! Пересечённая ссылка вставляет цель **перед** оставшимися компонентами: для
+//! абсолютной цели обход начинается от корня VFS, для относительной сохраняет
+//! текущий каталог. Больше [`SYMLOOP_MAX`] переходов за один резолв — `ELOOP`
+//! (Linux `SYMLOOP_MAX`), а разросшийся путь ограничен, чтобы управляемый
+//! атакующим образ не растил обход без предела.
 //!
-//! The walker itself knows nothing about credentials; it asks its [`LinkTree`]
-//! whether a directory may be searched ([`LinkTree::may_search`]) before every
-//! lookup. The kernel adapter answers with the calling process's effective
-//! credentials, which is how POSIX search (`x`) permission is enforced on
-//! **every** component — including components of a link target the walk splices
-//! in, not just on the components written in the syscall argument
-//! (F-x86v-3: a `0700` root-owned directory did not stop uid 1000 from reading
-//! a world-readable file inside it).
+//! Walker ничего не знает о credentials: перед каждым lookup он спрашивает
+//! [`LinkTree::may_search`], можно ли искать в каталоге. Адаптер ядра отвечает
+//! эффективными credentials процесса — так POSIX-право поиска (`x`) проверяется
+//! на **каждом** компоненте, включая компоненты подставленной цели ссылки, а не
+//! только на компонентах из аргумента syscall.
 //!
-//! This module owns the whole algorithm and is `core` + `alloc` only: the
-//! kernel's `vfs::lookup_path_walk` supplies a [`LinkTree`] adapter over
-//! `Arc<dyn VfsNode>` handles, and `host-tests` drives the same source with an
-//! in-memory tree and an independent oracle (so the semantics — not just the
-//! compilation — are covered on the host, per R11.6).
+//! Модуль владеет всем алгоритмом и использует только `core` + `alloc`: ядро
+//! подаёт адаптер [`LinkTree`] над `Arc<dyn VfsNode>`, а `host-tests` гоняют тот
+//! же исходник на in-memory дереве с независимым оракулом (семантика, а не только
+//! компиляция, проверяется на хосте — R11.6).
 //!
-//! [`guest_path_keeps_root`] mirrors the guest-namespace policy that lives next
-//! to the syscall layer (`arch::x86_64::linux::io`); the two copies are kept
-//! honest by the host property `link_walk_agrees_with_io_guest_root`.
+//! [`guest_path_keeps_root`] зеркалит гостевую политику рядом с syscall-слоем
+//! (`arch::x86_64::linux::io`); две копии сверяет host-свойство
+//! `link_walk_agrees_with_io_guest_root`.
 #![allow(dead_code)]
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// Maximum number of symbolic links crossed while resolving one path.
+/// Максимум симлинков, пересекаемых при резолве одного пути.
 ///
-/// Linux's `SYMLOOP_MAX`; the 41st crossing is `ELOOP`.
+/// Linux `SYMLOOP_MAX`; 41-й переход — `ELOOP`.
 pub const SYMLOOP_MAX: u32 = 40;
 
-/// Cap on the expanded path length of one resolution (`ENAMETOOLONG` beyond).
+/// Предел длины разросшегося пути за один резолв (дальше `ENAMETOOLONG`).
 ///
-/// Every link target comes from disk and may be attacker-controlled, so the walk
-/// must not be able to grow its pending list without bound: 40 targets of
-/// `PATH_MAX` each would otherwise be materialized before the budget stops it.
+/// Каждая цель ссылки приходит с диска и может управляться атакующим, поэтому
+/// список ожидания не должен расти без предела: иначе 40 целей по `PATH_MAX`
+/// материализовались бы раньше, чем бюджет остановит обход.
 pub const MAX_EXPANDED_BYTES: usize = 4096;
 
-/// Guest-namespace path components that resolve against the VFS root instead of
-/// being remapped under `/mnt` — the kernel's own trees (`/dev`, `/tmp`, the
-/// synthetic `/proc`) plus the explicit `/mnt` view itself.
+/// Компоненты гостевых путей, резолвящиеся от корня VFS, а не перенаправляемые
+/// под `/mnt`, — собственные деревья ядра (`/dev`, `/tmp`, синтетический
+/// `/proc`) плюс сам явный вид `/mnt`.
 pub const ROOT_KEEPING_COMPONENTS: [&str; 5] = ["mnt", "dev", "proc", "sys", "tmp"];
 
-/// Does an absolute guest path resolve against the VFS root (rather than being
-/// remapped under `/mnt`)? Mirrors
-/// `arch::x86_64::linux::io::guest_path_keeps_root`.
+/// Резолвится ли абсолютный гостевой путь от корня VFS (а не под `/mnt`)?
+/// Зеркалит `arch::x86_64::linux::io::guest_path_keeps_root`.
 pub fn guest_path_keeps_root(abs: &str) -> bool {
     let first = abs.trim_start_matches('/').split('/').next().unwrap_or("");
     ROOT_KEEPING_COMPONENTS.contains(&first)
 }
 
-/// Why a path could not be resolved. The syscall layer maps these to `ENOENT`,
-/// `ENOTDIR`, `ELOOP` and `ENAMETOOLONG`.
+/// Почему путь не разрешился. Syscall-слой отображает это в `ENOENT`,
+/// `ENOTDIR`, `ELOOP` и `ENAMETOOLONG`.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum WalkError {
-    /// Some component does not exist (including a dangling link that had to be
-    /// followed).
+    /// Какой-то компонент не существует (включая висячую ссылку, по которой
+    /// нужно было пройти).
     NotFound,
-    /// An intermediate component is not a directory.
+    /// Промежуточный компонент — не каталог.
     NotDir,
-    /// More than [`SYMLOOP_MAX`] links were crossed.
+    /// Пересечено больше [`SYMLOOP_MAX`] ссылок.
     TooManyLinks,
-    /// The expanded path exceeded [`MAX_EXPANDED_BYTES`].
+    /// Разросшийся путь превысил [`MAX_EXPANDED_BYTES`].
     TooLong,
-    /// The caller may not search one of the directories the path traverses
-    /// (POSIX needs the `x` bit on every intermediate directory).
+    /// Вызывающему нельзя искать в одном из каталогов пути (POSIX требует бит
+    /// `x` на каждом промежуточном каталоге).
     AccessDenied,
 }
 
-/// A symlink target as the walker must interpret it.
+/// Цель симлинка в том виде, в каком её должен интерпретировать walker.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct LinkTarget {
-    /// The target in the walker's namespace. An absolute target is already
-    /// mapped to the kernel namespace (see [`map_guest_target`]); a relative one
-    /// is resolved against the directory holding the link.
+    /// Цель в пространстве walker. Абсолютная цель уже отображена в
+    /// пространство ядра (см. [`map_guest_target`]); относительная резолвится от
+    /// каталога, где лежит ссылка.
     pub path: String,
-    /// True for an absolute target: the walk restarts at the tree root.
+    /// True для абсолютной цели: обход начинается с корня дерева.
     pub absolute: bool,
 }
 
-/// Map a link target (a *guest* path, stored verbatim on disk) into the walker's
-/// namespace.
+/// Отображает цель ссылки (*гостевой* путь, хранимый на диске дословно) в
+/// пространство walker.
 ///
-/// Absolute targets get the same mapping a syscall path gets — `/x` becomes
-/// `/mnt/x` unless `x` is a kernel-owned tree — while relative targets are left
-/// untouched (they resolve against the link's directory). `..` is deliberately
-/// **not** collapsed here: the walker's directory stack must see it, so
-/// `/a/link/..` with `link → /b/c` behaves like Linux and not like a lexical
-/// `format!`-prefix.
+/// Абсолютные цели отображаются так же, как пути syscall: `/x` становится
+/// `/mnt/x`, если `x` не дерево ядра; относительные остаются нетронутыми (они
+/// резолвятся от каталога ссылки). `..` здесь намеренно **не** схлопывается:
+/// стек каталогов walker обязан его увидеть, поэтому `/a/link/..` при
+/// `link → /b/c` ведёт себя как в Linux, а не как лексический префикс из
+/// `format!`.
 pub fn map_guest_target(target: &str) -> LinkTarget {
     if !target.starts_with('/') {
         return LinkTarget {
@@ -116,8 +110,8 @@ pub fn map_guest_target(target: &str) -> LinkTarget {
     }
 }
 
-/// Split a path into components, dropping empty ones and `.` and keeping `..`
-/// (the caller decides what `..` means for its directory stack).
+/// Режет путь на компоненты, выбрасывая пустые и `.` и сохраняя `..`
+/// (что значит `..` для стека каталогов, решает вызывающий).
 pub fn components(path: &str) -> Vec<&str> {
     let mut out = Vec::new();
     for comp in path.split('/') {
@@ -129,67 +123,66 @@ pub fn components(path: &str) -> Vec<&str> {
     out
 }
 
-/// The filesystem as the walker sees it: opaque node handles plus the three
-/// questions resolution needs to ask.
+/// ФС глазами walker: непрозрачные хендлы узлов плюс три вопроса, нужные
+/// резолву.
 pub trait LinkTree {
-    /// The node a resolution starts from (the tree's root directory).
+    /// Узел, с которого начинается резолв (корневой каталог дерева).
     fn root(&self) -> usize;
-    /// Look `name` up in directory `id`; `None` when it is absent.
+    /// Ищет `name` в каталоге `id`; `None`, если его нет.
     fn lookup(&mut self, id: usize, name: &str) -> Option<usize>;
-    /// Is `id` a directory?
+    /// Является ли `id` каталогом?
     fn is_dir(&self, id: usize) -> bool;
-    /// [`LinkTarget`] when `id` is a symbolic link, `None` otherwise. A link
-    /// whose target cannot be read returns an empty `path` so the walk fails
-    /// with [`WalkError::NotFound`] instead of treating it as a plain file.
+    /// [`LinkTarget`], когда `id` — симлинк, иначе `None`. Ссылка с нечитаемой
+    /// целью отдаёт пустой `path`, и обход проваливается с
+    /// [`WalkError::NotFound`], а не трактует её как обычный файл.
     fn link_target(&self, id: usize) -> Option<LinkTarget>;
 
-    /// May the caller search (look up a name in) directory `id`?
+    /// Можно ли вызывающему искать (находить имя) в каталоге `id`?
     ///
-    /// The walker asks this before **every** lookup. The default is `true`:
-    /// the pure algorithm models no permissions, and host properties drive it
-    /// with a permissive tree; the kernel adapter overrides it with the
-    /// process's effective credentials so traversal requires the `x` bit on
-    /// each directory entered (F-x86v-3). Returning `false` makes the walk
-    /// fail with [`WalkError::AccessDenied`].
+    /// Walker спрашивает это перед **каждым** lookup. По умолчанию `true`:
+    /// чистый алгоритм не моделирует права, и host-свойства гоняют его на
+    /// вседозволенном дереве; адаптер ядра переопределяет метод эффективными
+    /// credentials процесса, поэтому обход требует бита `x` на каждом входимом
+    /// каталоге. `false` проваливает обход с [`WalkError::AccessDenied`].
     fn may_search(&self, _id: usize) -> bool {
         true
     }
 }
 
-/// Resolve `path` against `tree`, returning the node id it names.
+/// Резолвит `path` в `tree` и возвращает id названного узла.
 ///
-/// `path` is already in the walker's namespace (the kernel hands over the
-/// guest-mapped absolute path). `follow_final` selects `stat`/`open` (true) or
-/// `lstat`/`readlink`/`unlink` (false) semantics for the **last** component;
-/// intermediate links are always followed.
+/// `path` уже в пространстве walker (ядро передаёт guest-mapped абсолютный
+/// путь). `follow_final` выбирает семантику `stat`/`open` (true) или
+/// `lstat`/`readlink`/`unlink` (false) для **последнего** компонента;
+/// промежуточные ссылки следуются всегда.
 pub fn resolve<T: LinkTree>(
     tree: &mut T,
     path: &str,
     follow_final: bool,
 ) -> Result<usize, WalkError> {
     let mut pending: Vec<String> = components(path).iter().map(|c| String::from(*c)).collect();
-    pending.reverse(); // LIFO: the next component is at the end.
+    pending.reverse(); // LIFO: следующий компонент — в конце.
     let mut expanded = path.len();
     let mut links: u32 = 0;
     let mut stack: Vec<usize> = alloc::vec![tree.root()];
 
     loop {
         let Some(comp) = pending.pop() else {
-            // Path fully consumed: the current directory is the result ("/"
-            // resolves to the root).
+            // Путь израсходован: результат — текущий каталог ("/"
+            // резолвится в корень).
             return Ok(*stack.last().expect("the stack always holds the root"));
         };
         if comp == ".." {
-            // Never above the root: "/.." is "/".
+            // Никогда выше корня: "/.." — это "/".
             if stack.len() > 1 {
                 stack.pop();
             }
             continue;
         }
         let dir = *stack.last().expect("the stack always holds the root");
-        // Search permission is checked on the directory the component is
-        // looked up in, i.e. on every component passed through — including
-        // the ones a followed link spliced into the pending list.
+        // Право поиска проверяется на каталоге, в котором ищется компонент, то
+        // есть на каждом пройденном компоненте — включая подставленные
+        // переходом по ссылке.
         if !tree.may_search(dir) {
             return Err(WalkError::AccessDenied);
         }
@@ -203,8 +196,8 @@ pub fn resolve<T: LinkTree>(
                     return Err(WalkError::TooManyLinks);
                 }
                 if target.path.is_empty() {
-                    // A link whose target could not be read: `ENOENT`, not a
-                    // silent fallback to the link node.
+                    // Ссылка с нечитаемой целью: `ENOENT`, а не молчаливый
+                    // откат к узлу ссылки.
                     return Err(WalkError::NotFound);
                 }
                 expanded += target.path.len();
@@ -212,14 +205,14 @@ pub fn resolve<T: LinkTree>(
                     return Err(WalkError::TooLong);
                 }
                 if target.absolute {
-                    // An absolute target restarts the walk at the root: the
-                    // directory stack forgets where the link was. The *pending*
-                    // components after the link are kept — `/a/link/..` must
-                    // still apply its `..` to the target's directory.
+                    // Абсолютная цель начинает обход с корня: стек каталогов
+                    // забывает, где была ссылка. Компоненты *pending* после
+                    // ссылки сохраняются — `/a/link/..` обязан применить `..` к
+                    // каталогу цели.
                     stack.truncate(1);
                 }
-                // LIFO: the target's components are consumed before whatever
-                // followed the link.
+                // LIFO: компоненты цели расходуются раньше того, что шло после
+                // ссылки.
                 for c in components(&target.path).iter().rev() {
                     pending.push(String::from(*c));
                 }

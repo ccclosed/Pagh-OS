@@ -1,20 +1,19 @@
-//! Trust-anchor bundle for the TLS certificate verifier (issue #14).
+//! Бандл trust-anchor'ов для верификатора TLS-сертификатов (issue #14).
 //!
-//! GENERATED FILE — do not edit by hand; regenerate with
-//! `tools/gen_ca_bundle.py` (source: the curl/Mozilla CA extract,
-//! `https://curl.se/ca/cacert.pem`; every root is pinned by sha256 inside the
-//! generator and the run fails closed on any mismatch), then commit
-//! the result. The pipeline is `generate` + `rustfmt`, so a plain
-//! regeneration is byte-identical to this file.
+//! СГЕНЕРИРОВАННЫЙ ФАЙЛ — не редактировать вручную; перегенерировать через
+//! `tools/gen_ca_bundle.py` (источник: CA-извлечение curl/Mozilla,
+//! `https://curl.se/ca/cacert.pem`; каждый корень закреплён sha256 внутри
+//! генератора, и прогон fail-closed при любом несовпадении), затем закоммитить
+//! результат. Конвейер — `generate` + `rustfmt`, так что обычная перегенерация
+//! байт-в-байт совпадает с этим файлом.
 //!
-//! Each entry is one self-signed root CA: raw DER plus a human label
-//! (the subject CN, cross-checked against the DER at generation time
-//! and re-checked by property P48 against the committed bytes).
-//! `net::tls_chain::TrustAnchor` pairs the root's subject with its
-//! key at verifier start-up. Pure `core` — also `#[path]`-included
-//! by the host tests (P48).
+//! Каждая запись — один самоподписанный корневой CA: сырой DER плюс метка
+//! (subject CN, сверенный с DER при генерации и перепроверенный свойством P48 по
+//! закоммиченным байтам). `net::tls_chain::TrustAnchor` связывает subject корня с
+//! его ключом при старте верификатора. Чистый `core` — также `#[path]`-включается
+//! host-тестами (P48).
 
-/// One trust anchor: label (subject CN) + raw DER of the root certificate.
+/// Один trust anchor: метка (subject CN) + сырой DER корневого сертификата.
 pub static CA_BUNDLE: &[(&str, &[u8])] = &[
     // sha256 96bcec06264976f37460779acf28c5a7cfe8a3c0aae11a8ffcee05c0bddf08c6
     (

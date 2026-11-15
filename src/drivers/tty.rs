@@ -1,33 +1,32 @@
-//! Kernel-side controlling-terminal state: the foreground process group.
+//! Kernel-side состояние управляющего терминала: foreground process group.
 //!
-//! The console is pagh's controlling terminal. Every `Compat_Process` starts
-//! with stdin/stdout/stderr bound to it, and — exactly like a Linux tty — the
-//! terminal is owned by ONE process group at a time (`tcgetpgrp`/`tcsetpgrp`,
-//! i.e. `TIOCGPGRP`/`TIOCSPGRP`). The pure decision model (which group owns it,
-//! what a background access does, how a `TIOCSPGRP` argument is validated) lives
-//! in [`crate::arch::x86_64::linux::tty`] and is host-property-tested; this
-//! module is the kernel-side state and the effectful edge:
+//! Консоль — управляющий терминал pagh. Каждый `Compat_Process` стартует с
+//! stdin/stdout/stderr, привязанными к ней, и — ровно как Linux tty — терминалом
+//! владеет ОДНА группа процессов за раз (`tcgetpgrp`/`tcsetpgrp`, то есть
+//! `TIOCGPGRP`/`TIOCSPGRP`). Чистая модель решения (какая группа владеет, что делает
+//! фоновый доступ, как валидируется аргумент `TIOCSPGRP`) живёт в
+//! [`crate::arch::x86_64::linux::tty`] и host-property-тестируется; этот модуль —
+//! kernel-side состояние и эффектный край:
 //!
-//! * it owns the [`Spinlock`] holding the foreground pgid + `TOSTOP`;
-//! * it resolves "no owner yet" to the kernel shell's own group (the terminal's
-//!   default owner is the shell, which is PID 1 — see [`init_shell`]);
-//! * [`check_access`] is the hook the stdin/console read and write paths call:
-//!   a background job gets `SIGTTIN` (read) or `SIGTTOU` (write under `TOSTOP`)
-//!   queued on its whole process group and the syscall fails with `EINTR`, so
-//!   the ordinary delivery path stops it at syscall return.
+//! * владеет [`Spinlock`], держащим foreground pgid + `TOSTOP`;
+//! * резолвит «владельца ещё нет» в собственную группу shell ядра (владелец
+//!   терминала по умолчанию — shell, PID 1 — см. [`init_shell`]);
+//! * [`check_access`] — хук, который зовут пути чтения stdin/консоли и записи:
+//!   фоновое задание получает `SIGTTIN` (чтение) или `SIGTTOU` (запись при `TOSTOP`)
+//!   в очередь на всю свою группу процессов, а syscall падает с `EINTR`, так что
+//!   обычный путь доставки останавливает его на возврате из syscall.
 //!
-//! WHO IS A JOB. Only a process the shell handed the terminal to (through
-//! `lxrun`/`fg`, see `CompatState::tty_job`) is subject to terminal access
-//! control. The kernel's own non-interactive spawns (apt's verification
-//! binaries, the selftest harness) were never given the terminal, and stopping
-//! one of them because the shell happens to own the tty would hang the boot or
-//! E2E flow that is waiting for it. A forked child inherits the flag, so a
-//! job's own subprocesses stay governed by the terminal.
+//! КТО ТАКОЕ JOB. Управлению доступом к терминалу подлежит только процесс, которому
+//! shell передал терминал (через `lxrun`/`fg`, см. `CompatState::tty_job`). Собственные
+//! неинтерактивные spawn'ы ядра (верификационные бинарники apt, selftest harness)
+//! терминал никогда не получали, и остановка одного из них из-за того, что shell
+//! владеет tty, подвесила бы загрузку или E2E-поток, который его ждёт. Форк-ребёнок
+//! наследует флаг, так что подпроцессы задания остаются под управлением терминала.
 //!
-//! Delivery limits are the signal layer's, not this module's: a signal is
-//! queued and observed at syscall return (or by a blocking wait's `EINTR`
-//! check), so a background job parked in a long kernel computation is stopped
-//! at its next syscall boundary, not instantly.
+//! Пределы доставки — сигнального слоя, не этого модуля: сигнал ставится в очередь и
+//! наблюдается на возврате из syscall (или проверкой `EINTR` блокирующего ожидания),
+//! так что фоновое задание, припаркованное в долгом вычислении ядра, остановится на
+//! следующей границе syscall, а не мгновенно.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

@@ -16,7 +16,7 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 | `x86_64/idt.rs` | IDT: все исключения CPU, IRQ-векторы 32–47, гейт `int 0x80`, постмортем page-fault/#GP |
 | `x86_64/apic.rs` | LAPIC-таймер + I/O APIC роутинг + таблица обработчиков + EOI; гасит legacy 8259 PIC |
 | `x86_64/acpi.rs` | Разбор MADT через крейт `acpi`; кэш `ApicAddrs` |
-| `x86_64/cpuid.rs` | CPUID-половина `/proc/cpuinfo` (issue #11): читает листья в `CpuInfoData`, неподдерживаемые листья оставляет `None`; всё форматирование — в чистом `vfs::procfs_format` |
+| `x86_64/cpuid.rs` | CPUID-половина `/proc/cpuinfo`: читает листья в `CpuInfoData`, неподдерживаемые листья оставляет `None`; всё форматирование — в чистом `vfs::procfs_format` |
 | `x86_64/syscall.rs` | MSRs SYSCALL/SYSRET (STAR/LSTAR/SFMASK/EFER), голые стабы `int80_stub`/`syscall_entry`, legacy-диспетчер, `sys_write`/`sys_exit` |
 | `x86_64/linux/` | Слой совместимости с Linux x86_64 бинарями (см. ниже) |
 
@@ -29,7 +29,7 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 | `abi.rs` | Чистый маршаллинг аргументов (`marshal_args`), полный перечень поддерживаемого набора `SUPPORTED_SYSCALLS` (единственный источник истины, `is_supported` — бинарный поиск по нему), константы номеров |
 | `validate.rs` | Чистая валидация user-указателей (`spanned_pages`, границы/переполнение, без разыменований) |
 | `trap_frame.rs` | Чистое зеркало фрейма `irq32_stub` (21 слово: popfq, 15 GPR в порядке `SavedRegs`, iret-слова) и план доставки сигнала с тика: ring-3 классификация, точный набор мутаций входа в обработчик, проверка «доставлен тот же сигнал» (хост-тестируемый, свойство `irq_frame`; const-asserts против индексов из `src/test.rs`) |
-| `kill.rs` | Чистая модель `kill(2)` (issue #12): 32-битное декодирование `pid_t`/`int`, классификация цели (`pid>0`, `0`, `-1`, `-pgid`, `INT_MIN → ESRCH`), политика прав `kill_permits` (root / real uid / effective uid цели; EPERM реально достижим), выбор одного потока на группу (хост-тестируемая, свойство `kill_target`) |
+| `kill.rs` | Чистая модель `kill(2)`: 32-битное декодирование `pid_t`/`int`, классификация цели (`pid>0`, `0`, `-1`, `-pgid`, `INT_MIN → ESRCH`), политика прав `kill_permits` (root / real uid / effective uid цели; EPERM реально достижим), выбор одного потока на группу (хост-тестируемая, свойство `kill_target`) |
 | `tty.rs` | Чистая модель управления терминалом (job control): foreground-pgid + `TOSTOP`, вердикт доступа (`SIGTTIN` на фоновое чтение, `SIGTTOU` на фоновую запись при `TOSTOP`), декодирование `int`-аргумента `TIOCSPGRP` (отрицательный → `EINVAL`) и `may_set_foreground` (живая группа / текущая / группа shell; иначе `EPERM`), константы `TIOCGPGRP` 0x540F / `TIOCSPGRP` 0x5410 и `TOSTOP` (хост-тестируемая, свойство `tty_job`; состояние — в `drivers/tty.rs`) |
 | `cred.rs` | Чистая модель креденшелов: `Creds` (6 id), `Access`, POSIX `may` (owner/group/other по effective id, root bypass r/w, execute требует x), переходы setuid/setgid/setreuid/setregid/setresuid/setresgid, `may_chmod`/`may_chown` (хост-тестируемая, свойство P56) |
 | `errno.rs` | Модель errno; ядро складывает `Err(e)` в rax как `-errno` (`-4095..=-1`) |
@@ -84,7 +84,7 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
   kernel-mode фолт → backtrace + halt; ring-3 фолт → SIGSEGV (код 139), убивает только Compat_Process.
 - `gp_fault_handler` дамплит слова вокруг RSP (с проверкой `virt_to_phys`, чтобы не каскадить
   PF на guard-странице).
-- **Политика пользовательских исключений (F-r3-arch-1, 2.22.6).** `#DE`/`#DB`/`#UD`/`#OF`/`#BR`/
+- **Политика пользовательских исключений (см. `SECURITY.md`).** `#DE`/`#DB`/`#UD`/`#OF`/`#BR`/
   `#NM`/`#AC` (и user-reachable `#MF`/`#XM`) идут через чистую `linux::trap_frame::exception_action`
   (host-свойство `exception_trap`): исключение из ring 3 (или с user-RIP) у Compat_Process →
   `exit_code = 128 + signal` и `exit_current()` («[EXC #N] killing Compat_Process …»), машина

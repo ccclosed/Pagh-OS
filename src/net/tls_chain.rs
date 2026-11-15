@@ -1,42 +1,41 @@
-//! Trust anchors + certificate chain building for the TLS server verifier
-//! (issue #14 series) — pure `core` + `alloc`, panic-free, self-contained.
+//! Trust anchors + построение цепочки сертификатов для серверного TLS-верификатора
+//! (серия issue #14) — чистый `core` + `alloc`, panic-free, самодостаточный.
 //!
-//! This module turns the primitives of the previous PRs into a complete
-//! path-validation decision for one server chain:
+//! Модуль превращает примитивы предыдущих PR в полное решение path-validation
+//! для одной серверной цепочки:
 //!
-//!   * [`TrustAnchor`] — a self-signed root the kernel is configured to trust,
-//!     as a raw DER `Name` (byte-compared, never parsed) plus its public key;
-//!   * [`verify_chain`] — builds leaf → intermediates → anchor by **byte
-//!     equality** of `issuer`/`subject` DER names, checks every signature with
-//!     [`super::tls_verify::verify_certificate_signature`], enforces
-//!     `basicConstraints cA=TRUE` on every issuer (intermediates and roots),
-//!     checks each certificate's validity window against the caller-provided
-//!     `now`, and applies the **clock gate** below.
+//!   * [`TrustAnchor`] — самоподписанный корень, которому ядро доверяет, как сырой
+//!     DER `Name` (сравнивается байтами, никогда не парсится) плюс его публичный ключ;
+//!   * [`verify_chain`] — строит leaf → intermediates → anchor по **байтовому
+//!     равенству** DER-имён `issuer`/`subject`, проверяет каждую подпись через
+//!     [`super::tls_verify::verify_certificate_signature`], требует
+//!     `basicConstraints cA=TRUE` у каждого эмитента (intermediate и root),
+//!     сверяет окно валидности каждого сертификата с переданным вызывающим
+//!     `now` и применяет **clock gate** ниже.
 //!
-//! Fail-closed rules (issue #14 is exactly about removing fail-open paths):
+//! Правила fail-closed (issue #14 именно про удаление fail-open путей):
 //!
-//!   * **Clock gate**: a `now` below [`CLOCK_FLOOR`] (2025-01-01T00:00:00Z) is
-//!     a hard [`ChainError::Clock`] reject. At boot the CMOS RTC may be unset
-//!     (counting from 1970), and "I do not know what time it is" must refuse
-//!     the handshake, never pass it: every real-world certificate on a current
-//!     mirror is already inside 2025+, so treating pre-2025 clocks as unset is
-//!     safe and eliminates the whole class of "RTC not set ⇒ everything
-//!     validates" fail-open windows.
-//!   * A chain that never reaches an anchor is a reject ([`ChainError::NoAnchor`]
-//!     when nothing matches the issuer name at all); a name match whose
-//!     signature does not verify is [`ChainError::Verify`] — never a pass.
-//!   * Intermediate/root certificates without `basicConstraints cA=TRUE` are
-//!     rejected ([`ChainError::NotCa`]) — RFC 5280 §4.2.1.9: DER omits the
-//!     defaulted `FALSE`, so a *missing* extension is also a reject here.
-//!   * Extra certificates in the DER after a complete path is found are
-//!     ignored (RFC 8446 §4.4.2 lets servers send entries the client does not
-//!     need); they are never trusted for anything, so ignoring them removes no
-//!     check.
+//!   * **Clock gate**: `now` ниже [`CLOCK_FLOOR`] (2025-01-01T00:00:00Z) — жёсткий
+//!     отказ [`ChainError::Clock`]. При загрузке CMOS RTC может быть не выставлен
+//!     (счёт с 1970), и «я не знаю, который час» должен отказывать в handshake,
+//!     никогда его не пропускать: каждый реальный сертификат на текущем зеркале
+//!     уже внутри 2025+, так что трактовка до-2025 часов как невыставленных
+//!     безопасна и устраняет весь класс fail-open окон «RTC не выставлен ⇒ всё
+//!     валидно».
+//!   * Цепочка, не доходящая до anchor, — отказ ([`ChainError::NoAnchor`], когда
+//!     имя эмитента вообще ни с чем не совпало); совпадение имени, чья подпись не
+//!     проверяется, — [`ChainError::Verify`], никогда не pass.
+//!   * Intermediate/root без `basicConstraints cA=TRUE` отвергаются
+//!     ([`ChainError::NotCa`]) — RFC 5280 §4.2.1.9: DER опускает дефолтный
+//!     `FALSE`, так что *отсутствующее* расширение здесь тоже отказ.
+//!   * Лишние сертификаты в DER после найденного полного пути игнорируются
+//!     (RFC 8446 §4.4.2 позволяет серверам слать ненужные клиенту записи); им
+//!     никогда не доверяют, так что их игнор не убирает ни одной проверки.
 //!
-//! No kernel services, no RNG, no host calls: `now` is a parameter, so the
-//! kernel call site (`net::tls`, through `tls_auth::authenticate_server`) passes
-//! `rtc::now_unix() as i64` and the host property test P47 drives the exact same
-//! code with synthetic values.
+//! Без сервисов ядра, RNG и host-вызовов: `now` — параметр, так что kernel call
+//! site (`net::tls`, через `tls_auth::authenticate_server`) передаёт
+//! `rtc::now_unix() as i64`, а host property-тест P47 гоняет тот же код с
+//! синтетическими значениями.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -47,32 +46,32 @@ use super::x509::{
     OID_EXT_BASIC_CONSTRAINTS,
 };
 
-/// Clock gate floor: 2025-01-01T00:00:00Z as Unix seconds.
+/// Нижняя граница clock gate: 2025-01-01T00:00:00Z в Unix-секундах.
 ///
-/// A system clock below this value is treated as "not actually set" (fresh
-/// UEFI/CMOS boots commonly start at the build epoch or 1970) and fails the
-/// handshake closed — see the module docs.
+/// Системные часы ниже этого значения считаются «реально не выставленными»
+/// (свежие UEFI/CMOS загрузки часто стартуют с epoch сборки или 1970) и валят
+/// handshake закрыто — см. docs модуля.
 pub const CLOCK_FLOOR: i64 = 1_735_689_600;
 
-/// Why a chain was rejected. Every variant is a hard reject; `PartialEq` so
-/// the host property tests can assert exact failure classes.
+/// Почему цепочка отвергнута. Каждый вариант — жёсткий отказ; `PartialEq`, чтобы
+/// host property-тесты могли утверждать точные классы сбоя.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainError {
-    /// No trust anchor matches the final issuer name in the chain.
+    /// Ни один trust anchor не совпал с финальным именем эмитента в цепочке.
     NoAnchor,
-    /// The chain is unusable as given: a certificate failed to parse, or the
-    /// path between the leaf and the anchors is broken (missing intermediate).
+    /// Цепочка непригодна как есть: сертификат не распарсился или путь между
+    /// leaf и anchor'ами порван (нет intermediate).
     IncompleteChain,
-    /// A certificate in the path is past its `notAfter`.
+    /// Сертификат в пути за своим `notAfter`.
     Expired,
-    /// A certificate in the path is before its `notBefore`.
+    /// Сертификат в пути до своего `notBefore`.
     NotYetValid,
-    /// The system clock is below the floor — the time of day is unknown, so
-    /// validity cannot be decided and the handshake is refused.
+    /// Системные часы ниже нижней границы — время суток неизвестно, поэтому
+    /// валидность решить нельзя и handshake отвергается.
     Clock,
-    /// An issuer certificate (intermediate or root) is not `cA=TRUE`.
+    /// Сертификат-эмитент (intermediate или root) не `cA=TRUE`.
     NotCa,
-    /// A signature check failed, with the underlying reason from
+    /// Проверка подписи упала, с нижележащей причиной из
     /// [`super::tls_verify::SigVerifyError`].
     Verify(super::tls_verify::SigVerifyError),
 }
@@ -83,57 +82,56 @@ impl From<SigVerifyError> for ChainError {
     }
 }
 
-// Keep the alias unambiguous at the use sites below.
+// Держать alias однозначным в местах использования ниже.
 use super::tls_verify::SigVerifyError;
 
-/// A self-signed root the kernel trusts: the raw DER `Name` (compared by byte
-/// equality against certificate `issuer` fields) and the public key the root
-/// signs with. No certificate parsing is done on trust — the anchor is a
-/// configured fact, not a parsed claim.
+/// Самоподписанный корень, которому доверяет ядро: сырой DER `Name` (сравнивается
+/// побайтно с полями `issuer` сертификатов) и публичный ключ, которым корень
+/// подписывает. Парсинга сертификата на доверии нет — anchor есть настроенный
+/// факт, а не разобранное утверждение.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrustAnchor<'a> {
-    /// Raw DER of the anchor's subject `Name` (same encoding certificates
-    /// carry, so comparison against `CertificateRef::issuer` is a plain
+    /// Сырой DER subject `Name` anchor'а (та же кодировка, что несут сертификаты,
+    /// так что сравнение с `CertificateRef::issuer` — простое побайтовое).
     /// byte-slice compare).
     pub subject: &'a [u8],
-    /// The anchor's public key (must be one the verifier supports).
+    /// Публичный ключ anchor'а (должен быть поддерживаемым верификатором).
     pub key: SpkiKey<'a>,
 }
 
-/// Validate one server certificate chain against the given anchors.
+/// Провалидировать одну серверную цепочку сертификатов против заданных anchor'ов.
 ///
-/// * `anchors` — the configured trust anchors (root CAs);
-/// * `der` — the DER of the leaf certificate followed by any intermediates the
-///   server sent (exactly the layout of a TLS `Certificate` message);
-/// * `now` — the current Unix time in seconds (`rtc::now_unix() as i64` at
-///   the kernel call site).
+/// * `anchors` — настроенные trust anchors (корневые CA);
+/// * `der` — DER leaf-сертификата, за которым идут любые intermediates, присланные
+///   сервером (ровно раскладка TLS-сообщения `Certificate`);
+/// * `now` — текущее Unix-время в секундах (`rtc::now_unix() as i64` в kernel call
+///   site).
 ///
-/// Returns `Ok(())` only if a complete path leaf → … → anchor exists where
-/// every signature verifies against the parent key, every issuer in the path
-/// (intermediates and the root, when carried as a certificate) is `cA=TRUE`,
-/// every certificate in the path is within its validity window, and `now` is
-/// at or above [`CLOCK_FLOOR`].
+/// Возвращает `Ok(())`, только если существует полный путь leaf → … → anchor,
+/// где каждая подпись проверяется ключом родителя, каждый эмитент в пути
+/// (intermediates и root, когда он пришёл сертификатом) — `cA=TRUE`, каждый
+/// сертификат пути в своём окне валидности, а `now` на нижней границе
+/// [`CLOCK_FLOOR`] или выше.
 ///
-/// Fallback and error-choice semantics: a same-named intermediate that fails
-/// (bad signature, non-CA, unparseable basicConstraints) NEVER shadows the
-/// configured anchors — after the message's candidate list is exhausted the
-/// anchors are always consulted, and the path succeeds if any name-matching
-/// anchor verifies. When nothing verifies, the returned error is the FIRST
-/// failing name-match in message order (message entries rank before the
-/// anchor set; no last-candidate overwrite); an anchor that matched by name
-/// but failed to verify is reported only when no intermediate candidate
-/// failed, and a name with neither a matching certificate nor a matching
-/// anchor is [`ChainError::NoAnchor`].
+/// Семантика fallback и выбора ошибки: одноимённый intermediate, который падает
+/// (плохая подпись, non-CA, непарсящийся basicConstraints), НИКОГДА не затеняет
+/// настроенные anchor'ы — после исчерпания списка кандидатов сообщения anchor'ы
+/// всегда опрашиваются, и путь успешен, если проверяется любой anchor с
+/// совпавшим именем. Когда не проверяется ничего, возвращается ПЕРВАЯ падающая
+/// name-match запись в порядке сообщения (записи сообщения ранжируются раньше
+/// набора anchor'ов; без перезаписи последним кандидатом); anchor, совпавший по
+/// имени, но не прошедший проверку, сообщается только когда ни один intermediate-
+/// кандидат не упал, а имя без подходящего сертификата и без подходящего anchor —
+/// [`ChainError::NoAnchor`].
 pub fn verify_chain(anchors: &[TrustAnchor<'_>], der: &[u8], now: i64) -> Result<(), ChainError> {
-    // CLOCK GATE, before anything else: an unset RTC must never look like a
-    // valid time for a certificate whose window happens to include it.
+    // CLOCK GATE, прежде всего: невыставленный RTC не должен выглядеть как
+    // валидное время для сертификата, чьё окно случайно его включает.
     if now < CLOCK_FLOOR {
         return Err(ChainError::Clock);
     }
 
-    // Parse every certificate the peer sent. A malformed entry anywhere is a
-    // reject (IncompleteChain) — the peer does not get to choose which parts
-    // of its garbage we ignore.
+    // Разобрать каждый сертификат, присланный peer'ом. Любая некорректная запись —
+    // отказ (IncompleteChain) — peer не выбирает, какие части его мусора мы игнорируем.
     let mut rest = der;
     let mut certs: Vec<CertificateRef<'_>> = Vec::new();
     while !rest.is_empty() {
@@ -146,38 +144,37 @@ pub fn verify_chain(anchors: &[TrustAnchor<'_>], der: &[u8], now: i64) -> Result
         None => return Err(ChainError::IncompleteChain),
     };
 
-    // Validity of every certificate in the message is checked up front (even
-    // for entries that may not end up in the path — they were sent as part of
-    // the chain, and a peer sending expired chain material is not a peer this
-    // verifier trusts to pass).
+    // Валидность каждого сертификата сообщения проверяется сразу (даже для
+    // записей, которые могут не попасть в путь — они присланы как часть цепочки,
+    // а peer, шлющий просроченный материал, не тот peer, которому этот верификатор
+    // доверит пройти).
     for cert in &certs {
         check_validity(cert, now)?;
     }
 
-    // Walk the path. `used` tracks which message entries were consumed as
-    // issuers so a hostile peer cannot reuse the same entry twice (a
-    // self-issued loop would otherwise let a chain "verify" against itself).
+    // Идти по пути. `used` отслеживает, какие записи сообщения потреблены как
+    // эмитенты, чтобы враждебный peer не мог переиспользовать одну запись дважды
+    // (иначе self-issued цикл позволил бы цепочке «провериться» сама на себя).
     let mut used = vec![false; certs.len()];
     used[0] = true;
     let mut current = leaf;
     loop {
-        // Does an unused intermediate certificate in the message name itself
-        // as the issuer of `current`? Try each candidate; a failed candidate
-        // (bad signature, non-CA, unparseable basicConstraints) never stops
-        // the search: later candidates and — see below — the configured
-        // anchors still get their chance.
+        // Есть ли неиспользованный intermediate в сообщении, называющий себя
+        // эмитентом `current`? Пробовать каждого кандидата; упавший кандидат
+        // (плохая подпись, non-CA, непарсящийся basicConstraints) никогда не
+        // останавливает поиск: более поздние кандидаты и — см. ниже — настроенные
+        // anchor'ы всё ещё получают шанс.
         let mut name_match_err: Option<ChainError> = None;
         let mut advanced = false;
         for (i, cand) in certs.iter().enumerate() {
             if used[i] || cand.subject != current.issuer {
                 continue;
             }
-            // An intermediate MUST be a CA (fail closed on a missing
-            // basicConstraints too — DER omits the defaulted FALSE). A
-            // candidate whose basicConstraints does not even parse is
-            // skipped like a non-CA, with the parse error remembered as a
-            // candidate result (it maps to IncompleteChain if nothing else
-            // verifies).
+            // Intermediate ОБЯЗАН быть CA (fail closed и на отсутствующем
+            // basicConstraints — DER опускает дефолтный FALSE). Кандидат, чей
+            // basicConstraints даже не парсится, пропускается как non-CA, с
+            // запоминанием ошибки парсинга как результата кандидата (она
+            // отображается в IncompleteChain, если больше ничего не проверится).
             let ca = match is_ca(cand) {
                 Ok(ca) => ca,
                 Err(e) => {
@@ -216,12 +213,11 @@ pub fn verify_chain(anchors: &[TrustAnchor<'_>], der: &[u8], now: i64) -> Result
             continue;
         }
 
-        // NO candidate verified — fall through to the configured anchors
-        // UNCONDITIONALLY. A same-named intermediate that fails (rotated
-        // root key, cross-sign, stale copy) must never shadow a trust
-        // anchor: the anchor set is the configured fact, the message is
-        // only a claim. The path succeeds if ANY name-matching anchor
-        // verifies the signature.
+        // Ни один кандидат не проверился — БЕЗУСЛОВНО перейти к настроенным
+        // anchor'ам. Одноимённый intermediate, который падает (ротированный ключ
+        // корня, cross-sign, устаревшая копия), никогда не должен затенять trust
+        // anchor: набор anchor'ов — настроенный факт, сообщение — лишь утверждение.
+        // Путь успешен, если ЛЮБОЙ anchor с совпавшим именем проверяет подпись.
         let mut anchor_err: Option<ChainError> = None;
         for anchor in anchors {
             if anchor.subject != current.issuer {
@@ -242,25 +238,25 @@ pub fn verify_chain(anchors: &[TrustAnchor<'_>], der: &[u8], now: i64) -> Result
             }
         }
 
-        // Deterministic error choice: the FIRST failing name-match in
-        // message order wins (message entries come before the anchor set,
-        // and no last-candidate overwrite). An anchor that matched by name
-        // but failed to verify is reported only when no intermediate
-        // candidate failed; a name with neither a matching certificate nor
-        // a matching anchor is NoAnchor.
+        // Детерминированный выбор ошибки: побеждает ПЕРВАЯ падающая name-match
+        // запись в порядке сообщения (записи сообщения идут до набора anchor'ов,
+        // без перезаписи последним кандидатом). Anchor, совпавший по имени, но не
+        // прошедший проверку, сообщается только когда ни один intermediate-
+        // кандидат не упал; имя без подходящего сертификата и без подходящего
+        // anchor — NoAnchor.
         if let Some(e) = name_match_err {
             return Err(e);
         }
         if let Some(e) = anchor_err {
             return Err(e);
         }
-        // Nothing names the issuer of `current`: the path is broken (missing
-        // intermediate or an untrusted root).
+        // Ничто не называет эмитента `current`: путь порван (нет intermediate или
+        // недоверенный корень).
         return Err(ChainError::NoAnchor);
     }
 }
 
-/// Check `not_before <= now <= not_after` for one certificate.
+/// Проверить `not_before <= now <= not_after` для одного сертификата.
 fn check_validity(cert: &CertificateRef<'_>, now: i64) -> Result<(), ChainError> {
     if now > cert.validity.not_after {
         return Err(ChainError::Expired);
@@ -271,8 +267,8 @@ fn check_validity(cert: &CertificateRef<'_>, now: i64) -> Result<(), ChainError>
     Ok(())
 }
 
-/// Does this certificate carry `basicConstraints cA=TRUE`? A missing extension
-/// or a parse failure is NOT a CA (fail closed).
+/// Несёт ли сертификат `basicConstraints cA=TRUE`? Отсутствующее расширение или
+/// ошибка парсинга — НЕ CA (fail closed).
 fn is_ca(cert: &CertificateRef<'_>) -> Result<bool, ChainError> {
     match find_extension(cert, OID_EXT_BASIC_CONSTRAINTS) {
         Ok(Some(octets)) => parse_basic_constraints(octets).map_err(der_to_chain),
@@ -281,8 +277,8 @@ fn is_ca(cert: &CertificateRef<'_>) -> Result<bool, ChainError> {
     }
 }
 
-/// Map a DER failure of chain material onto the chain error (malformed input
-/// in the middle of a chain is an incomplete chain, not a parse report).
+/// Отобразить DER-сбой материала цепочки в ошибку цепочки (некорректный ввод
+/// посреди цепочки — неполная цепочка, а не отчёт о парсинге).
 fn der_to_chain(e: DerError) -> ChainError {
     let _ = e;
     ChainError::IncompleteChain
@@ -294,20 +290,20 @@ fn der_to_chain(e: DerError) -> ChainError {
 mod tests {
     use super::*;
 
-    /// A `TrustAnchor` shaped from raw bytes for dispatcher-level checks.
+    /// `TrustAnchor`, собранный из сырых байтов для проверок диспетчера.
     #[test]
     fn clock_gate_rejects_below_floor() {
         let anchor = TrustAnchor {
             subject: &[0x30, 0x00],
             key: SpkiKey::Unsupported,
         };
-        // One second before the floor: "the clock is not really set".
+        // На секунду раньше нижней границы: «часы реально не выставлены».
         assert_eq!(
             verify_chain(&[anchor], &[], CLOCK_FLOOR - 1),
             Err(ChainError::Clock)
         );
-        // At the floor and above the gate passes (empty DER fails later, but
-        // with IncompleteChain, never Clock).
+        // На нижней границе и выше гейт пропускает (пустой DER падает позже, но
+        // с IncompleteChain, никогда с Clock).
         assert_eq!(
             verify_chain(&[anchor], &[], CLOCK_FLOOR),
             Err(ChainError::IncompleteChain)

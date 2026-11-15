@@ -1,23 +1,24 @@
-// vfs/mod.rs — Virtual File System: trait VfsNode, /dev/null, /dev/serial
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// vfs/mod.rs — виртуальная файловая система: трейт VfsNode, /dev/null, /dev/serial
+// 64-битное ядро ОС x86_64 на Rust (#![no_std])
 
 pub mod elf;
-/// Pure, `core`-only ELF classifier + static-PIE bias selection (host-testable,
-/// R11.6). Kept separate from `elf` so it carries no kernel/paging dependencies;
-/// `elf` re-exports its public items.
+/// Чистый `core`-only классификатор ELF + выбор bias для static-PIE
+/// (host-тестируемо, R11.6). Отделён от `elf`, чтобы не тянуть зависимости ядра и
+/// пейджинга; `elf` реэкспортирует его публичные элементы.
 pub mod elf_classify;
-/// Pure, host-testable symbolic-link path resolution (issue #18): component
-/// walk, `..` stack, relative/absolute link targets, `SYMLOOP_MAX` budget. The
-/// adapter below feeds it `Arc<dyn VfsNode>` handles.
+/// Чистый host-тестируемый резолвер путей с симлинками: обход по компонентам,
+/// стек `..`, относительные/абсолютные цели ссылок, бюджет `SYMLOOP_MAX`.
+/// Адаптер ниже подаёт ему хендлы `Arc<dyn VfsNode>`.
 pub mod link_walk;
-/// In-memory `/tmp` (the only part of the tree with real
-/// `create_dir`/`create_file` support).
+/// Синтетический `/proc`: узлы, ленивый рендер, per-pid и per-thread view.
 pub mod procfs;
-/// Pure, `core`+`alloc`-only text rendering + path/inode table for the
-/// synthetic `/proc` (issue #11). Split out so `host-tests` can
-/// `#[path]`-include it and property-test the exact formats the kernel emits
-/// (contract `docs/procfs.md` §7).
+/// Чистый (`core`+`alloc`) рендеринг текста + таблица путей/inode для
+/// синтетического `/proc`. Выделен, чтобы `host-tests` включали его через
+/// `#[path]` и проверяли свойства ровно тех форматов, что печатает ядро
+/// (контракт `docs/procfs.md` §7).
 pub mod procfs_format;
+/// In-memory `/tmp` — единственная часть дерева с настоящими
+/// `create_dir`/`create_file`.
 pub mod ramfs;
 
 use alloc::string::String;
@@ -36,13 +37,13 @@ pub enum VfsError {
     AlreadyExists,
 }
 
-/// Replace a regular file's contents with `bytes`.
+/// Заменяет содержимое обычного файла на `bytes`.
 ///
-/// POSIX `open(..., O_TRUNC)` semantics: nothing of the old contents beyond
-/// `bytes.len()` may survive. Writing at offset 0 is *not* replacement — `write
-/// f BBB` over a 20-byte file used to leave `BBBAAAAAAAAAAAAAAAAA` behind (and
-/// `nano f` then displayed that stale tail). Truncation lives here rather than at
-/// each call site because the next caller forgets it.
+/// Семантика POSIX `open(..., O_TRUNC)`: за пределами `bytes.len()` не должно
+/// остаться ничего от старого содержимого. Запись со смещения 0 — *не* замена:
+/// `write f BBB` поверх 20-байтного файла оставлял хвост `AAAAAAAAAAAAAAAAA`.
+/// Усечение живёт здесь, а не в каждом месте вызова, иначе следующий вызывающий
+/// о нём забудет.
 pub fn replace_contents(node: &Arc<dyn VfsNode>, bytes: &[u8]) -> VfsResult<usize> {
     node.truncate(0)?;
     if bytes.is_empty() {
@@ -51,10 +52,10 @@ pub fn replace_contents(node: &Arc<dyn VfsNode>, bytes: &[u8]) -> VfsResult<usiz
     node.write(0, bytes)
 }
 
-/// Filesystem capacity snapshot for `statfs`/`fstatfs`: block counts are in
-/// units of `block_size`. Reported by filesystems that track their usage
-/// (ext2); `fs_stat()` returning `None` (the trait default) means the node's
-/// filesystem has no capacity to report (ramfs, synthetic /dev nodes).
+/// Снимок ёмкости ФС для `statfs`/`fstatfs`: счётчики блоков — в единицах
+/// `block_size`. Отдают ФС, которые ведут учёт (ext2); `fs_stat() == None`
+/// (дефолт трейта) означает, что у ФС узла нет ёмкости для отчёта (ramfs,
+/// синтетические узлы /dev).
 #[derive(Debug, Clone, Copy)]
 pub struct FsStat {
     pub block_size: u64,
@@ -67,7 +68,7 @@ pub struct FsStat {
 pub trait VfsNode: Send + Sync {
     fn name(&self) -> &str;
     fn is_directory(&self) -> bool;
-    /// Filesystem capacity behind this node, when the filesystem tracks it.
+    /// Ёмкость ФС за этим узлом, если ФС её ведёт.
     fn fs_stat(&self) -> Option<FsStat> {
         None
     }
@@ -77,7 +78,7 @@ pub trait VfsNode: Send + Sync {
     fn write(&self, _offset: u64, _buf: &[u8]) -> VfsResult<usize> {
         Err(VfsError::NotSupported)
     }
-    /// Resize a regular file. Implementations must zero newly exposed bytes.
+    /// Изменяет размер обычного файла. Реализации обязаны обнулять новые байты.
     fn truncate(&self, _size: u64) -> VfsResult<()> {
         Err(VfsError::NotSupported)
     }
@@ -90,24 +91,24 @@ pub trait VfsNode: Send + Sync {
     fn size(&self) -> u64 {
         0
     }
-    /// Stable, filesystem-unique inode number for `stat`-style identity, or 0
-    /// when the node has no real identity (synthetic /dev nodes).
+    /// Стабильный, уникальный в пределах ФС номер inode для идентичности в
+    /// стиле `stat`, либо 0, когда у узла нет настоящей идентичности (синтетика
+    /// /dev).
     ///
-    /// glibc's ld.so deduplicates loaded shared objects by the (st_dev, st_ino)
-    /// pair returned from `fstat`, so distinct files must never share a pair.
+    /// glibc ld.so дедуплицирует загруженные объекты по паре `(st_dev, st_ino)`
+    /// из `fstat`, поэтому разные файлы не должны делить пару.
     fn fs_ino(&self) -> u64 {
         0
     }
 
-    /// Permission bits (`0o7777`) and type information are not returned here —
-    /// only the nine permission bits plus setuid/setgid/sticky, exactly what
-    /// `chmod(2)` accepts.
+    /// Здесь возвращаются не биты прав (`0o7777`) с типом, а только девять бит
+    /// прав плюс setuid/setgid/sticky — ровно то, что принимает `chmod(2)`.
     ///
-    /// Defaults to `0o755` for directories and `0o644` for files. Metadata is
-    /// **data**, not policy: the VFS never checks a caller's credentials. The
-    /// syscall layer reads these values and enforces access; kernel-internal
-    /// callers (boot provisioning, the package installer, the shell) continue to
-    /// use the VFS without a credential.
+    /// По умолчанию `0o755` для каталогов и `0o644` для файлов. Метаданные —
+    /// это **данные**, а не политика: VFS никогда не проверяет credentials
+    /// вызывающего. Syscall-слой читает эти значения и обеспечивает доступ;
+    /// ядро-внутренние вызывающие (boot provisioning, установщик пакетов, shell)
+    /// продолжают ходить через VFS без credential.
     fn mode(&self) -> u32 {
         if self.is_directory() {
             0o755
@@ -116,85 +117,83 @@ pub trait VfsNode: Send + Sync {
         }
     }
 
-    /// `(uid, gid)` of the node's owner. Synthetic nodes default to `(0, 0)`
-    /// (root), which is also what the ext2 writer stamps on new inodes.
+    /// `(uid, gid)` владельца узла. Синтетические узлы по умолчанию `(0, 0)`
+    /// (root) — то же ставит ext2-писатель на новые inode.
     fn owner(&self) -> (u32, u32) {
         (0, 0)
     }
 
-    /// Persist new permission bits. Default `NotSupported`: nodes without
-    /// on-disk metadata (`/dev`, `/proc`, ramfs) cannot store a mode, and the
-    /// syscall layer keeps its historical per-process override for exactly that
-    /// case.
+    /// Сохраняет новые биты прав. По умолчанию `NotSupported`: узлы без on-disk
+    /// метаданных (`/dev`, `/proc`, ramfs) не могут хранить mode, и syscall-слой
+    /// держит для этого случая прежний per-process override.
     fn set_mode(&self, _mode: u32) -> VfsResult<()> {
         Err(VfsError::NotSupported)
     }
 
-    /// Persist a new owner. Default `NotSupported` (see [`VfsNode::set_mode`]);
-    /// only ext2-backed inodes have an `i_uid`/`i_gid` to write.
+    /// Сохраняет нового владельца. По умолчанию `NotSupported` (см.
+    /// [`VfsNode::set_mode`]); писать `i_uid`/`i_gid` есть только у ext2-inode.
     fn set_owner(&self, _uid: u32, _gid: u32) -> VfsResult<()> {
         Err(VfsError::NotSupported)
     }
 
-    /// Is this node a symbolic link?
+    /// Является ли узел симлинком?
     ///
-    /// Default `false`: the VFS had no notion of links before `/proc/self/exe`
-    /// (issue #11) and ext2 links (issue #18) — those are the two overriders.
-    /// `readlink(2)`, `lstat` and `d_type` all branch on this.
+    /// По умолчанию `false`; переопределяют только `/proc/self/exe` и ext2.
+    /// `readlink(2)`, `lstat` и `d_type` ветвятся по этому.
     fn is_symlink(&self) -> bool {
         false
     }
 
-    /// The link target when [`is_symlink`](VfsNode::is_symlink) is true.
+    /// Цель ссылки, когда [`is_symlink`](VfsNode::is_symlink) истинно.
     ///
-    /// Paths are UTF-8 `String`s in this kernel (`read_user_cstr`, `resolve_path`),
-    /// so a target is a `String` too. `None` means "not a link, or a link with no
-    /// target".
+    /// Пути в этом ядре — UTF-8 `String` (`read_user_cstr`, `resolve_path`),
+    /// поэтому и цель — `String`. `None` означает «не ссылка или ссылка без
+    /// цели».
     fn read_link(&self) -> Option<String> {
         None
     }
 
-    /// Number of hard links to this node — Linux's `st_nlink`.
+    /// Число хардлинков на узел — Linux `st_nlink`.
     ///
-    /// ext2 overrides this with `i_links_count` (a hard-linked file reports how
-    /// many names point at it, a directory `2 + subdirs`); synthetic nodes
-    /// (`/dev`, `/proc`) keep the default of one.
+    /// ext2 переопределяет через `i_links_count` (файл сообщает число имён на
+    /// него, каталог — `2 + подкаталоги`); синтетические узлы (`/dev`, `/proc`)
+    /// остаются с дефолтной единицей.
     fn nlink(&self) -> u64 {
         1
     }
 
-    /// Create a symbolic link `name` pointing at the raw bytes `target`
-    /// (issue #18). Default `NotSupported`: only writable directories (ext2)
-    /// can hold one.
+    /// Создаёт симлинк `name` на сырые байты `target`. По умолчанию
+    /// `NotSupported`: держать его могут только записываемые каталоги (ext2).
     fn create_symlink(&self, _name: &str, _target: &[u8]) -> VfsResult<Arc<dyn VfsNode>> {
         Err(VfsError::NotSupported)
     }
 
-    /// Create the hard link `name` pointing at the existing node `target` — the
-    /// same inode under a second name (issue #18). Default `NotSupported`.
+    /// Создаёт хардлинк `name` на существующий узел `target` — тот же inode под
+    /// вторым именем. По умолчанию `NotSupported`.
     fn link(&self, _name: &str, _target: &Arc<dyn VfsNode>) -> VfsResult<Arc<dyn VfsNode>> {
         Err(VfsError::NotSupported)
     }
 
-    // ── mutating directory operations (Task 5.2) ──
+    // ── мутирующие операции каталога ──
     //
-    // Default to `NotSupported` so read-only nodes (e.g. `/dev`) need no change;
-    // the ext2 directory node overrides these to route through the journaled
-    // write path.
+    // По умолчанию `NotSupported`, чтобы read-only узлам (например, `/dev`) не
+    // требовалось изменений; ext2-каталог переопределяет их, направляя в
+    // журналируемый путь записи.
 
-    /// Create a child directory named `name`, returning its node.
+    /// Создаёт дочерний каталог `name` и возвращает его узел.
     fn create_dir(&self, _name: &str) -> VfsResult<Arc<dyn VfsNode>> {
         Err(VfsError::NotSupported)
     }
-    /// Create an empty child file named `name`, returning its node.
+    /// Создаёт пустой дочерний файл `name` и возвращает его узел.
     fn create_file(&self, _name: &str) -> VfsResult<Arc<dyn VfsNode>> {
         Err(VfsError::NotSupported)
     }
-    /// Remove the child entry named `name` (file or empty directory).
+    /// Удаляет дочернюю запись `name` (файл или пустой каталог).
     fn remove(&self, _name: &str) -> VfsResult<()> {
         Err(VfsError::NotSupported)
     }
-    /// Flush any buffered state to stable storage. Default no-op.
+    /// Сбрасывает буферизованное состояние на стабильный носитель. По умолчанию
+    /// no-op.
     fn sync(&self) {}
 }
 
@@ -235,7 +234,7 @@ impl VfsNode for SerialDevice {
         if buf.is_empty() {
             return Ok(0);
         }
-        // SAFETY: Reading from COM1 LSR and DATA ports.
+        // SAFETY: Чтение портов LSR и DATA COM1.
         unsafe {
             let mut lsr = x86_64::instructions::port::Port::<u8>::new(0x3FD);
             if lsr.read() & 1 != 0 {
@@ -249,17 +248,15 @@ impl VfsNode for SerialDevice {
     }
 
     fn write(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
-        // Emit each byte verbatim over COM1. The previous implementation routed
-        // bytes through `format_args!("{}", byte as char)`, which UTF-8-encodes
-        // any byte >= 0x80 into two bytes and corrupts binary/non-ASCII data.
-        // The byte-level API transmits every byte unchanged (R8.1, R8.2) and the
-        // write always succeeds, so we return the full input length (R8.3).
+        // Каждый байт уходит в COM1 дословно. Байтовый API передаёт байт без
+        // изменений (R8.1, R8.2), а запись всегда успешна, поэтому возвращается
+        // полная длина входа (R8.3).
         crate::drivers::serial::write_bytes(buf);
         Ok(buf.len())
     }
 }
 
-// ─── /dev directory ───────────────────────────────────────────────────────
+// ─── каталог /dev ───────────────────────────────────────────────────────────
 
 struct DevDirectory {
     children: Vec<Arc<dyn VfsNode>>,
@@ -287,15 +284,15 @@ impl VfsNode for DevDirectory {
     }
 }
 
-// ─── Mount point wrapper ────────────────────────────────────────────────────
+// ─── обёртка точки монтирования ─────────────────────────────────────────────
 
-/// Presents an arbitrary `VfsNode` subtree under a chosen mount name.
+/// Показывает произвольное поддерево `VfsNode` под выбранным именем монтирования.
 ///
-/// `mount_at("/mnt", ext2_root)` wraps the filesystem's root (whose own
-/// `name()` is `"/"`) in a `MountNode` named `"mnt"` and splices it into the
-/// VFS root's children, so `lookup_path("/mnt")` finds it and
-/// `lookup_path("/mnt/<file>")` delegates straight into the mounted tree. Every
-/// `VfsNode` method forwards to the inner node.
+/// `mount_at("/mnt", ext2_root)` оборачивает корень ФС (чей собственный `name()`
+/// — `"/"`) в `MountNode` с именем `"mnt"` и вставляет его в детей корня VFS,
+/// так что `lookup_path("/mnt")` его находит, а `lookup_path("/mnt/<file>")`
+/// уходит прямо в смонтированное дерево. Каждый метод `VfsNode` форвардится во
+/// внутренний узел.
 struct MountNode {
     name: String,
     inner: Arc<dyn VfsNode>,
@@ -370,11 +367,12 @@ impl VfsNode for MountNode {
     }
 }
 
-// ─── Root directory ─────────────────────────────────────────────────────────
+// ─── корневой каталог ───────────────────────────────────────────────────────
 
 struct RootDirectory {
-    // Mutable so `mount_at` can splice in new top-level entries (e.g. `/mnt`)
-    // after boot. Guarded by a spinlock; `lookup`/`readdir` take it briefly.
+    // Мутабельно, чтобы `mount_at` мог вставлять новые записи верхнего уровня
+    // (например, `/mnt`) после boot. Под спинлоком; `lookup`/`readdir` берут его
+    // ненадолго.
     children: Spinlock<Vec<Arc<dyn VfsNode>>>,
 }
 
@@ -405,16 +403,16 @@ impl VfsNode for RootDirectory {
 use crate::sync::spinlock::Spinlock;
 
 static VFS_ROOT: Spinlock<Option<Arc<dyn VfsNode>>> = Spinlock::new(None);
-/// Typed handle to the same root node held in `VFS_ROOT`, so `mount_at` can
-/// splice into its mutable children without downcasting a `dyn VfsNode`.
+/// Типизированный хендл того же корня, что и в `VFS_ROOT`: `mount_at` вставляет
+/// детей, не разыменовывая `dyn VfsNode` вниз.
 static ROOT_DIR: Spinlock<Option<Arc<RootDirectory>>> = Spinlock::new(None);
 
-/// One entry of the VFS mount table, as `/proc/mounts` reports it.
+/// Одна запись таблицы монтирования VFS — как её показывает `/proc/mounts`.
 #[derive(Clone, Debug)]
 pub struct MountInfo {
-    /// Absolute mount point (`"/"`, `"/mnt"`, `"/proc"`, ...).
+    /// Абсолютная точка монтирования (`"/"`, `"/mnt"`, `"/proc"`, ...).
     pub point: alloc::string::String,
-    /// Filesystem driver name shown in field 3 (`rootfs`, `ext2`, `proc`, ...).
+    /// Имя драйвера ФС для третьего поля (`rootfs`, `ext2`, `proc`, ...).
     pub fs: &'static str,
 }
 
@@ -430,7 +428,7 @@ fn record_mount(point: &str, fs: &'static str) {
     });
 }
 
-/// Snapshot of the mount table, sorted by mount point, for `/proc/mounts`.
+/// Снимок таблицы монтирования, отсортированный по точке, для `/proc/mounts`.
 pub fn mount_snapshot() -> Vec<MountInfo> {
     let mut out = MOUNTS.lock().clone().unwrap_or_default();
     out.sort_by(|a, b| a.point.cmp(&b.point));
@@ -446,10 +444,8 @@ pub fn init() {
     let dev = Arc::new(DevDirectory {
         children: vec![Arc::clone(&null), Arc::clone(&serial)],
     }) as Arc<dyn VfsNode>;
-    // Writable in-memory /tmp. Linux userspace assumes it exists:
-    // nvim's vim_mktempdir does mkdir("/tmp/nvim.XXXXXX"), which previously
-    // died with NotSupported because no node in the tree implemented
-    // create_dir.
+    // Записываемый in-memory /tmp: Linux-userspace считает, что он есть, —
+    // nvim в vim_mktempdir делает mkdir("/tmp/nvim.XXXXXX").
     let tmp = Arc::new(ramfs::RamDir::new("tmp")) as Arc<dyn VfsNode>;
     crate::debug!("/tmp (ramfs) - ready");
     let root = Arc::new(RootDirectory {
@@ -460,12 +456,12 @@ pub fn init() {
     record_mount("/", "rootfs");
     record_mount("/dev", "devtmpfs");
     record_mount("/tmp", "ramfs");
-    // Synthetic /proc (issue #11). Mounted here, not in `boot::init_fs`, so it
-    // exists even when the ext2 tree is absent or refused by `format_policy` —
-    // /proc/meminfo and /proc/cpuinfo are exactly the diagnostics wanted in that
-    // situation. Everything procfs reads (PMM, heap, tick clock, scheduler) is
-    // already up: `pmm::init`/`vmm::init`/`heap::init`/`scheduler::init` all run
-    // earlier in `boot.rs`, and nothing is rendered at mount time.
+    // Синтетический /proc монтируется здесь, а не в `boot::init_fs`, чтобы
+    // существовать и когда дерева ext2 нет или его отверг `format_policy`:
+    // /proc/meminfo и /proc/cpuinfo — ровно нужная в этой ситуации диагностика.
+    // Всё, что читает procfs (PMM, heap, тик-клок, планировщик), уже поднято:
+    // `pmm::init`/`vmm::init`/`heap::init`/`scheduler::init` идут раньше в
+    // `boot.rs`, а при монтировании ничего не рендерится.
     if let Err(e) = mount_at_named("/proc", procfs::root(), "proc") {
         crate::warn!("vfs: mounting /proc failed: {:?}", e);
     } else {
@@ -474,28 +470,30 @@ pub fn init() {
     crate::debug!("VFS Initialized");
 }
 
-/// Attach an arbitrary `VfsNode` subtree into the VFS tree at an absolute path.
+/// Подсоединяет произвольное поддерево `VfsNode` в дерево VFS по абсолютному
+/// пути.
 ///
-/// v1 simplification: only **single-component** mount points are supported
-/// (e.g. `"/mnt"`, not `"/a/b"`). The node is spliced in as a child of the root
-/// under the path's single name, wrapped in a [`MountNode`] so it presents that
-/// name (the filesystem's own root reports `"/"`). After this,
-/// `lookup_path("/mnt")` resolves to the mount and `lookup_path("/mnt/<file>")`
-/// delegates into the mounted tree (the mounted root's own `lookup`/`readdir`
-/// handle deeper path components). Existing top-level entries such as `/dev`
-/// are untouched. Re-mounting the same name replaces the previous entry.
+/// Упрощение v1: поддерживаются только **однокомпонентные** точки монтирования
+/// (`"/mnt"`, но не `"/a/b"`). Узел вставляется ребёнком корня под этим именем,
+/// обёрнутый в [`MountNode`], чтобы представлять это имя (собственный корень ФС
+/// сообщает `"/"`). После этого `lookup_path("/mnt")` резолвится в монтирование,
+/// а `lookup_path("/mnt/<file>")` уходит в смонтированное дерево (его собственные
+/// `lookup`/`readdir` обрабатывают более глубокие компоненты). Существующие
+/// записи верхнего уровня вроде `/dev` не трогаются. Повторное монтирование того
+/// же имени заменяет прежнюю запись.
 pub fn mount_at(path: &str, node: Arc<dyn VfsNode>) -> VfsResult<()> {
     mount_at_named(path, node, "unknown")
 }
 
-/// Like [`mount_at`], but also records the filesystem driver name for
-/// `/proc/mounts` (`"ext2"`, `"proc"`, ...).
+/// Как [`mount_at`], но ещё записывает имя драйвера ФС для `/proc/mounts`
+/// (`"ext2"`, `"proc"`, ...).
 pub fn mount_at_named(path: &str, node: Arc<dyn VfsNode>, fs: &'static str) -> VfsResult<()> {
     let name = match path.strip_prefix('/') {
         Some(rest) => rest.trim_end_matches('/'),
         None => return Err(VfsError::InvalidArgument),
     };
-    // Single-level mount points only (v1): reject empty and nested paths.
+    // Только одноуровневые точки монтирования (v1): пустые и вложенные пути
+    // отвергаются.
     if name.is_empty() || name.contains('/') {
         return Err(VfsError::InvalidArgument);
     }
@@ -518,24 +516,24 @@ pub fn mount_at_named(path: &str, node: Arc<dyn VfsNode>, fs: &'static str) -> V
     Ok(())
 }
 
-// ─── Path resolution ──────────────────────────────────────────────────────
+// ─── резолвинг путей ────────────────────────────────────────────────────────
 
-/// Resolves an absolute path from the VFS root to a node.
+/// Резолвит абсолютный путь от корня VFS до узла.
 ///
-/// - The path MUST start with `/` (otherwise `VfsError::InvalidArgument`).
-/// - `/` resolves to the root node itself.
-/// - Empty components are skipped, so `/dev/serial`, `/dev/serial/`, and
-///   `//dev//serial` all resolve identically.
-/// - Any component that cannot be found yields `VfsError::NotFound`.
+/// - путь ОБЯЗАН начинаться с `/` (иначе `VfsError::InvalidArgument`);
+/// - `/` резолвится в сам корневой узел;
+/// - пустые компоненты пропускаются, поэтому `/dev/serial`, `/dev/serial/` и
+///   `//dev//serial` резолвятся одинаково;
+/// - любой ненайденный компонент даёт `VfsError::NotFound`.
 pub fn lookup_path(path: &str) -> VfsResult<Arc<dyn VfsNode>> {
     if !path.starts_with('/') {
         return Err(VfsError::InvalidArgument);
     }
 
-    // Take a clone of the root Arc, then release the VFS_ROOT lock before
-    // walking the tree. The nodes are independently reference-counted and
-    // internally synchronized/immutable, so we must not hold the VFS_ROOT
-    // spinlock while calling `lookup` (avoids re-entrancy/deadlock).
+    // Снимаем клон Arc корня и отпускаем спинлок VFS_ROOT до обхода дерева.
+    // Узлы независимо подсчитаны и внутренне синхронизированы/иммутабельны,
+    // поэтому держать спинлок VFS_ROOT во время `lookup` нельзя — иначе
+    // реентерабельность/дедлок.
     let mut node = match VFS_ROOT.lock().clone() {
         Some(root) => root,
         None => return Err(VfsError::NotFound),
@@ -551,24 +549,24 @@ pub fn lookup_path(path: &str) -> VfsResult<Arc<dyn VfsNode>> {
     Ok(node)
 }
 
-/// Resolve an absolute path, following symbolic links (issue #18).
+/// Резолвит абсолютный путь, переходя по симлинкам.
 ///
-/// `lookup_path` above stays the single-step, no-follow primitive (it returns the
-/// link node itself), which is what `readlink`, `lstat`, `unlink` and `rmdir`
-/// need. Everything that talks about "the file the path names" —
-/// `stat`/`open`/`access`/`chdir`/`execve` — goes through this walker instead:
+/// `lookup_path` выше остаётся одношаговым примитивом без перехода (возвращает
+/// сам узел ссылки) — это нужно `readlink`, `lstat`, `unlink` и `rmdir`. Всё, что
+/// говорит о «файле, на который указывает путь», — `stat`/`open`/`access`/
+/// `chdir`/`execve` — идёт через этот обход:
 ///
-///   * intermediate links are always followed, the last one only when
-///     `follow_final` is set;
-///   * a crossed link splices its target ahead of the remaining components
-///     (relative targets against the link's directory, absolute ones from the
-///     root), with Linux's `SYMLOOP_MAX` budget → [`link_walk::WalkError::TooManyLinks`];
-///   * an intermediate non-directory is [`link_walk::WalkError::NotDir`], and the
-///     expanded path is capped ([`link_walk::WalkError::TooLong`]).
+///   * промежуточные ссылки следуются всегда, конечная — только при
+///     `follow_final`;
+///   * пересечённая ссылка вставляет цель перед оставшимися компонентами
+///     (относительная — от каталога ссылки, абсолютная — от корня), с бюджетом
+///     `SYMLOOP_MAX` → [`link_walk::WalkError::TooManyLinks`];
+///   * промежуточный не-каталог — [`link_walk::WalkError::NotDir`], разросшийся
+///     путь ограничен ([`link_walk::WalkError::TooLong`]).
 ///
-/// The algorithm itself lives in the pure [`link_walk`] module; this function is
-/// only the `Arc<dyn VfsNode>` adapter, so the walk is property-tested on the
-/// host (R11.6).
+/// Сам алгоритм живёт в чистом модуле [`link_walk`]; эта функция — только
+/// адаптер над `Arc<dyn VfsNode>`, поэтому обход проверяется свойствами на хосте
+/// (R11.6).
 pub fn lookup_path_walk(
     path: &str,
     follow_final: bool,
@@ -576,17 +574,15 @@ pub fn lookup_path_walk(
     lookup_path_walk_checked(path, follow_final, &|_| true)
 }
 
-/// Like [`lookup_path_walk`], but consults `may_search` before every directory
-/// lookup: the syscall layer passes the calling process's effective
-/// credentials, which is what enforces POSIX search (`x`) permission on
-/// **every** traversed directory, including directories reached through a
-/// followed symlink (F-x86v-3).
+/// Как [`lookup_path_walk`], но спрашивает `may_search` перед каждым lookup
+/// каталога: syscall-слой передаёт эффективные credentials вызвавшего процесса,
+/// и это обеспечивает POSIX-право поиска (`x`) на **каждом** пройденном
+/// каталоге, включая каталоги, достигнутые переходом по ссылке.
 ///
-/// The VFS itself stays credential-free — `may_search` is a caller-supplied
-/// predicate over node metadata (`mode`/`owner`), exactly like the other
-/// syscall-boundary permission checks. Kernel-internal callers (boot
-/// provisioning, the package installer, `lxrun`) keep using the unchecked
-/// [`lookup_path_walk`].
+/// Сам VFS остаётся без credential: `may_search` — предикат вызывающего над
+/// метаданными узла (`mode`/`owner`), как и остальные проверки прав на границе
+/// syscall. Ядро-внутренние вызывающие (boot provisioning, установщик пакетов,
+/// `lxrun`) продолжают использовать непроверяемый [`lookup_path_walk`].
 pub fn lookup_path_walk_checked(
     path: &str,
     follow_final: bool,
@@ -599,8 +595,8 @@ pub fn lookup_path_walk_checked(
         .lock()
         .clone()
         .ok_or(link_walk::WalkError::NotFound)?;
-    // Node handles for this resolution: the pure walker works on `usize` ids and
-    // never sees an `Arc`, so the adapter interns every node it hands out.
+    // Хендлы узлов для этого резолва: чистый walker работает на `usize`-id и
+    // никогда не видит `Arc`, поэтому адаптер интернирует каждый выдаваемый узел.
     let mut nodes = WalkNodes {
         nodes: alloc::vec![Arc::clone(&root)],
         root: 0,
@@ -614,11 +610,11 @@ pub fn lookup_path_walk_checked(
         .ok_or(link_walk::WalkError::NotFound)
 }
 
-/// `Arc<dyn VfsNode>` interner behind [`lookup_path_walk`].
+/// Интернер `Arc<dyn VfsNode>` за [`lookup_path_walk`].
 struct WalkNodes<'a> {
     nodes: alloc::vec::Vec<Arc<dyn VfsNode>>,
     root: usize,
-    /// Credential decision for a directory the walk is about to search.
+    /// Решение о credential для каталога, который обход собирается искать.
     may_search: &'a dyn Fn(&Arc<dyn VfsNode>) -> bool,
 }
 
@@ -642,7 +638,7 @@ impl link_walk::LinkTree for WalkNodes<'_> {
     fn may_search(&self, id: usize) -> bool {
         match self.nodes.get(id) {
             Some(node) => (self.may_search)(node),
-            // An id the adapter never interned cannot be searched; fail closed.
+            // Id, который адаптер не интернировал, искать нельзя; fail closed.
             None => false,
         }
     }
@@ -665,10 +661,11 @@ impl link_walk::LinkTree for WalkNodes<'_> {
             return None;
         }
         match node.read_link() {
-            // Target read: interpret it in the guest namespace (`/x` → `/mnt/x`).
+            // Цель прочитана: интерпретируем её в гостевом пространстве
+            // (`/x` → `/mnt/x`).
             Some(target) if !target.is_empty() => Some(link_walk::map_guest_target(&target)),
-            // A link whose target is empty or unreadable must fail the walk
-            // (`ENOENT`), never silently resolve to the link node itself.
+            // Ссылка с пустой или нечитаемой целью обязана провалить обход
+            // (`ENOENT`), а не молча резолвиться в сам узел ссылки.
             _ => Some(link_walk::LinkTarget {
                 path: String::new(),
                 absolute: false,

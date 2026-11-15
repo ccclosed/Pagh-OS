@@ -1,50 +1,51 @@
-//! Pure Linux x86_64 syscall ABI marshalling and supported-set membership.
+//! Чистый маршаллинг ABI syscall'ов Linux x86_64 и проверка принадлежности
+//! supported-set.
 //!
-//! Pure, allocation-free, `core`-only logic shared with the `host-tests` crate
-//! (R11.6). Two responsibilities live here:
+//! Только `core`, без аллокаций, общая с крейтом `host-tests` (R11.6). Здесь две
+//! обязанности:
 //!
-//!   * [`marshal_args`] — decode the Linux x86_64 calling convention from the saved
-//!     general-purpose registers into a `(nr, args)` pair the dispatcher consumes
+//!   * [`marshal_args`] — декодировать соглашение вызова Linux x86_64 из
+//!     сохранённых GPR в пару `(nr, args)`, которую потребляет диспетчер
 //!     (R1.1, R1.8).
-//!   * [`is_supported`] — exact membership test for the fixed `Supported_Syscall_Set`
-//!     (R2.1), used to gate dispatch and return `-ENOSYS` for everything else
-//!     (R1.4, R11.4, R11.5).
+//!   * [`is_supported`] — точная проверка принадлежности фиксированному
+//!     `Supported_Syscall_Set` (R2.1); гейт диспетчеризации и `-ENOSYS` для
+//!     всего остального (R1.4, R11.4, R11.5).
 //!
-//! The numeric syscall constants are exposed as `pub const`s so later tasks (the
-//! effectful io/mem/misc handlers and `linux_dispatch`) match against shared names
-//! rather than bare literals.
+//! Числовые константы syscall'ов экспонируются как `pub const`, чтобы позже
+//! обработчики io/mem/misc и `linux_dispatch` сопоставлялись с общими именами, а
+//! не голыми литералами.
 #![allow(dead_code)]
 
-/// Linux x86_64 syscall numbers in the `Supported_Syscall_Set` (R2.1).
+/// Номера syscall'ов Linux x86_64 из `Supported_Syscall_Set` (R2.1).
 pub mod nr {
-    /// `read` — read from a file descriptor.
+    /// `read` — чтение из дескриптора файла.
     pub const READ: u64 = 0;
-    /// `write` — write to a file descriptor.
+    /// `write` — запись в дескриптор файла.
     pub const WRITE: u64 = 1;
-    /// `open` — open/create a file.
+    /// `open` — открыть/создать файл.
     pub const OPEN: u64 = 2;
-    /// `close` — close a file descriptor.
+    /// `close` — закрыть дескриптор файла.
     pub const CLOSE: u64 = 3;
-    /// `fstat` — file status by descriptor.
+    /// `fstat` — статус файла по дескриптору.
     pub const FSTAT: u64 = 5;
     pub const POLL: u64 = 7;
-    /// `select` — synchronous fd multiplexing (timeval timeout).
+    /// `select` — синхронное мультиплексирование fd (таймаут timeval).
     pub const SELECT: u64 = 23;
-    /// `pselect6` — select with timespec + sigmask (readline waits on this).
+    /// `pselect6` — select с timespec + sigmask (на нём ждёт readline).
     pub const EPOLL_WAIT: u64 = 232;
     pub const EPOLL_CTL: u64 = 233;
     pub const PSELECT6: u64 = 270;
-    /// `ppoll` — poll with timespec + sigmask.
+    /// `ppoll` — poll с timespec + sigmask.
     pub const PPOLL: u64 = 271;
     pub const EVENTFD2: u64 = 290;
     pub const EPOLL_CREATE1: u64 = 291;
-    /// `epoll_pwait` — epoll_wait with a sigmask (mask accepted and ignored).
+    /// `epoll_pwait` — epoll_wait с sigmask (маска принимается и игнорируется).
     pub const EPOLL_PWAIT: u64 = 281;
-    /// `socketpair` — pair of connected AF_UNIX stream sockets.
+    /// `socketpair` — пара связанных AF_UNIX stream-сокетов.
     pub const SOCKETPAIR: u64 = 53;
-    /// `statx` — extended file status.
+    /// `statx` — расширенный статус файла.
     pub const STATX: u64 = 332;
-    /// AF_UNIX stream sockets (nvim's msgpack-rpc server).
+    /// AF_UNIX stream-сокеты (msgpack-rpc-сервер nvim).
     pub const SOCKET: u64 = 41;
     pub const CONNECT: u64 = 42;
     pub const ACCEPT: u64 = 43;
@@ -54,80 +55,81 @@ pub mod nr {
     pub const ACCEPT4: u64 = 288;
     pub const SETSOCKOPT: u64 = 54;
     pub const GETSOCKOPT: u64 = 55;
-    /// Session/permission/locking stubs.
+    /// Заглушки сессий/прав/локов.
     pub const SETSID: u64 = 112;
-    /// Job-control family bash probes at startup.
+    /// Семейство job control, которое bash пробует при старте.
     pub const SETPGID: u64 = 109;
     pub const GETPGRP: u64 = 111;
     pub const GETPGID: u64 = 121;
     pub const UMASK: u64 = 95;
     pub const FLOCK: u64 = 73;
-    /// Vectored / positional-vectored I/O + file sync. nvim's
-    /// ShaDa reader hit ENOSYS here (E886 "function not implemented").
+    /// Vectored / позиционно-vectored I/O + синхронизация файлов. Читатель
+    /// ShaDa в nvim получал здесь ENOSYS (E886 "function not implemented").
     pub const READV: u64 = 19;
     pub const PREADV: u64 = 295;
     pub const PWRITEV: u64 = 296;
     pub const FSYNC: u64 = 74;
     pub const FDATASYNC: u64 = 75;
-    /// Rename family. nvim writes ShaDa to a tmp file and
-    /// renames it into place; missing rename left "E136: Can't rename ShaDa"
-    /// + a Press-ENTER prompt wedged on every exit.
+    /// Семейство rename. nvim пишет ShaDa во временный файл и переименовывает
+    /// его на место; отсутствие rename давало «E136: Can't rename ShaDa» и
+    /// вечный экран Press-ENTER при каждом выходе.
     pub const RENAME: u64 = 82;
     pub const RENAMEAT: u64 = 264;
     pub const RENAMEAT2: u64 = 316;
-    /// Real x86_64 numbers (asm/unistd_64.h): settime=227, gettime=228,
-    /// getres=229, nanosleep=230, exit_group=231. Verified against
-    /// /usr/include/asm/unistd_64.h after a wrong "off by one" fix collided
-    /// nanosleep with exit_group and made process exit impossible.
+    /// Реальные номера x86_64 (asm/unistd_64.h): settime=227, gettime=228,
+    /// getres=229, nanosleep=230, exit_group=231. Проверено по
+    /// /usr/include/asm/unistd_64.h после ошибочного «off by one», который
+    /// столкнул nanosleep с exit_group и сделал выход процесса невозможным.
     pub const CLOCK_SETTIME: u64 = 227;
     pub const CLOCK_GETTIME: u64 = 228;
     pub const CLOCK_GETRES: u64 = 229;
-    /// `lseek` — reposition a descriptor's offset.
+    /// `lseek` — переместить смещение дескриптора.
     pub const LSEEK: u64 = 8;
-    /// `mmap` — map memory.
+    /// `mmap` — отобразить память.
     pub const MMAP: u64 = 9;
-    /// `mprotect` — change memory protection.
+    /// `mprotect` — сменить защиту памяти.
     pub const MPROTECT: u64 = 10;
-    /// `munmap` — unmap memory.
+    /// `munmap` — снять отображение памяти.
     pub const MUNMAP: u64 = 11;
-    /// `mremap` — resize a mapping (glibc realloc fast path).
+    /// `mremap` — изменить размер отображения (быстрый путь realloc в glibc).
     pub const MREMAP: u64 = 25;
-    /// `brk` — change the program break.
+    /// `brk` — изменить program break.
     pub const BRK: u64 = 12;
-    /// `rt_sigaction` — examine/change a signal action.
+    /// `rt_sigaction` — прочитать/сменить действие сигнала.
     pub const RT_SIGACTION: u64 = 13;
-    /// `rt_sigprocmask` — examine/change the blocked-signal mask.
+    /// `rt_sigprocmask` — прочитать/сменить маску заблокированных сигналов.
     pub const RT_SIGPROCMASK: u64 = 14;
-    /// `rt_sigreturn` — return from a signal handler (restores the context
-    /// saved in the `rt_sigframe` the restorer stands on).
+    /// `rt_sigreturn` — вернуться из обработчика сигнала (восстанавливает
+    /// контекст, сохранённый в `rt_sigframe`, на котором стоит restorer).
     pub const RT_SIGRETURN: u64 = 15;
-    /// `ioctl` — device control.
+    /// `ioctl` — управление устройством.
     pub const IOCTL: u64 = 16;
-    /// `pread64` — positional read (offset not advanced).
+    /// `pread64` — позиционное чтение (смещение не сдвигается).
     pub const PREAD64: u64 = 17;
-    /// `pwrite64` — positional write (offset not advanced).
+    /// `pwrite64` — позиционная запись (смещение не сдвигается).
     pub const PWRITE64: u64 = 18;
-    /// `writev` — gathered write.
+    /// `writev` — gather-запись.
     pub const WRITEV: u64 = 20;
-    /// `access` — check file accessibility.
+    /// `access` — проверить доступность файла.
     pub const ACCESS: u64 = 21;
-    /// `sendfile` (40) — copy a regular file to a stream/file descriptor.
+    /// `sendfile` (40) — скопировать regular-файл в поток/дескриптор файла.
     pub const SENDFILE: u64 = 40;
-    /// `copy_file_range` (326) — copy a byte range between two regular files.
+    /// `copy_file_range` (326) — скопировать диапазон байт между двумя regular-
+    /// файлами.
     pub const COPY_FILE_RANGE: u64 = 326;
-    /// `faccessat2` (439) — flags-carrying faccessat.
+    /// `faccessat2` (439) — faccessat с флагами.
     pub const FACCESSAT2: u64 = 439;
-    /// `readahead` (187) — advisory prefetch.
+    /// `readahead` (187) — рекомендательная предвыборка.
     pub const READAHEAD: u64 = 187;
-    /// `sync` (162) — flush all filesystems.
+    /// `sync` (162) — сбросить все файловые системы.
     pub const SYNC: u64 = 162;
-    /// `syncfs` (306) — flush the filesystem behind an fd.
+    /// `syncfs` (306) — сбросить файловую систему за fd.
     pub const SYNCFS: u64 = 306;
     /// `getpriority` (140).
     pub const GETPRIORITY: u64 = 140;
     /// `setpriority` (141).
     pub const SETPRIORITY: u64 = 141;
-    /// `personality` (135) — single personality.
+    /// `personality` (135) — единственная personality.
     pub const PERSONALITY: u64 = 135;
     /// `sched_getparam` (143).
     pub const SCHED_GETPARAM: u64 = 143;
@@ -145,9 +147,9 @@ pub mod nr {
     pub const RT_SIGPENDING: u64 = 127;
     /// `sync_file_range` (277).
     pub const SYNC_FILE_RANGE: u64 = 277;
-    /// `fallocate` (285), mode 0 only.
+    /// `fallocate` (285), только режим 0.
     pub const FALLOCATE: u64 = 285;
-    /// `memfd_create` (319) — an anonymous in-memory file.
+    /// `memfd_create` (319) — анонимный файл в памяти.
     pub const MEMFD_CREATE: u64 = 319;
     /// `timerfd_create` (283).
     pub const TIMERFD_CREATE: u64 = 283;
@@ -159,176 +161,176 @@ pub mod nr {
     pub const SIGNALFD: u64 = 282;
     /// `signalfd4` (289).
     pub const SIGNALFD4: u64 = 289;
-    /// `sched_setaffinity` (203) — single-CPU mask.
+    /// `sched_setaffinity` (203) — маска одного CPU.
     pub const SCHED_SETAFFINITY: u64 = 203;
-    /// `sched_getaffinity` (204) — single-CPU mask.
+    /// `sched_getaffinity` (204) — маска одного CPU.
     pub const SCHED_GETAFFINITY: u64 = 204;
-    /// `epoll_create` (213) — legacy size argument, same object as create1.
+    /// `epoll_create` (213) — legacy-аргумент размера, тот же объект, что create1.
     pub const EPOLL_CREATE: u64 = 213;
-    /// `fadvise64` (221) — advisory only.
+    /// `fadvise64` (221) — только рекомендательно.
     pub const FADVISE64: u64 = 221;
-    /// `eventfd` (284) — legacy flags-less eventfd.
+    /// `eventfd` (284) — legacy eventfd без флагов.
     pub const EVENTFD: u64 = 284;
-    /// `getcpu` (309) — the single CPU and NUMA node.
+    /// `getcpu` (309) — единственный CPU и NUMA-узел.
     pub const GETCPU: u64 = 309;
     pub const PIPE: u64 = 22;
-    /// `sched_yield` — yield the CPU.
+    /// `sched_yield` — уступить CPU.
     pub const SCHED_YIELD: u64 = 24;
-    /// `dup` — duplicate a file descriptor (lowest free).
+    /// `dup` — продублировать дескриптор (наименьший свободный).
     pub const DUP: u64 = 32;
-    /// `dup2` — duplicate a file descriptor to an explicit target.
+    /// `dup2` — продублировать дескриптор в явную цель.
     pub const DUP2: u64 = 33;
-    /// `nanosleep` — high-resolution sleep.
+    /// `nanosleep` — высокоточный сон.
     pub const NANOSLEEP: u64 = 35;
-    /// `getpid` — get process id.
+    /// `getpid` — получить id процесса.
     pub const GETPID: u64 = 39;
-    /// `clone` — create a thread sharing the address space.
+    /// `clone` — создать поток, разделяющий адресное пространство.
     pub const CLONE: u64 = 56;
-    /// `execve` — replace the current process image.
+    /// `execve` — заменить образ текущего процесса.
     pub const EXECVE: u64 = 59;
-    /// `exit` — terminate the calling task.
+    /// `exit` — завершить вызывающую задачу.
     pub const EXIT: u64 = 60;
-    /// wait4 — wait for a child process.
+    /// wait4 — ждать дочерний процесс.
     pub const WAIT4: u64 = 61;
-    /// `kill` — send a signal to a process, process group, or every process.
-    /// Argument decoding + target classification live in [`super::kill`]
-    /// (host-tested by `p51`); the effectful handler is
+    /// `kill` — послать сигнал процессу, группе процессов или всем процессам.
+    /// Декодирование аргументов и классификация целей — в [`super::kill`]
+    /// (host-тестируется `p51`); эффектный обработчик —
     /// [`super::signal::sys_kill`].
     pub const KILL: u64 = 62;
-    /// `uname` — get system identification.
+    /// `uname` — идентификация системы.
     pub const UNAME: u64 = 63;
-    /// `fcntl` — file descriptor control.
+    /// `fcntl` — управление дескриптором файла.
     pub const FCNTL: u64 = 72;
-    /// `getcwd` — get the current working directory.
+    /// `getcwd` — получить текущий рабочий каталог.
     pub const GETCWD: u64 = 79;
-    /// `chdir` — change the current working directory.
+    /// `chdir` — сменить текущий рабочий каталог.
     pub const CHDIR: u64 = 80;
-    /// `fchdir` — change the cwd to a directory fd's path.
+    /// `fchdir` — сменить cwd на путь дескриптора каталога.
     pub const FCHDIR: u64 = 81;
-    /// `readlink` — read the target of a symbolic link.
-    /// `mkdir` — create a directory.
+    /// `readlink` — прочитать цель символической ссылки.
+    /// `mkdir` — создать каталог.
     pub const MKDIR: u64 = 83;
-    /// `rmdir` (84) — git removes empty temp dirs during cleanup.
+    /// `rmdir` (84) — git удаляет пустые временные каталоги при уборке.
     pub const RMDIR: u64 = 84;
-    /// `sendto` (44) — glibc resolver DNS queries over UDP.
+    /// `sendto` (44) — DNS-запросы резолвера glibc по UDP.
     pub const SENDTO: u64 = 44;
-    /// `recvfrom` (45) — DNS replies.
+    /// `recvfrom` (45) — DNS-ответы.
     pub const RECVFROM: u64 = 45;
-    /// `unlink` (87) — git removes its `*.lock` files.
+    /// `unlink` (87) — git удаляет свои `*.lock`-файлы.
     pub const UNLINK: u64 = 87;
-    /// `mkdirat` (258) — mkdir relative to AT_FDCWD/dirfd.
+    /// `mkdirat` (258) — mkdir относительно AT_FDCWD/dirfd.
     pub const MKDIRAT: u64 = 258;
-    /// `fchownat` (260) — chown relative to AT_FDCWD/dirfd.
+    /// `fchownat` (260) — chown относительно AT_FDCWD/dirfd.
     pub const FCHOWNAT: u64 = 260;
-    /// `unlinkat` (263) — unlink/rmdir relative to AT_FDCWD/dirfd.
+    /// `unlinkat` (263) — unlink/rmdir относительно AT_FDCWD/dirfd.
     pub const UNLINKAT: u64 = 263;
-    /// `chmod` (90) — git chmods `.git/config.lock` during init.
+    /// `chmod` (90) — git меняет режим `.git/config.lock` при init.
     pub const CHMOD: u64 = 90;
-    /// `fchmod` (91) — change the mode of an open file descriptor.
+    /// `fchmod` (91) — сменить режим открытого дескриптора файла.
     pub const FCHMOD: u64 = 91;
-    /// `fchmodat` (268) — `chmod` with an AT_FDCWD/dirfd base and flags.
+    /// `fchmodat` (268) — `chmod` с базой AT_FDCWD/dirfd и флагами.
     pub const FCHMODAT: u64 = 268;
-    /// `faccessat` (269) — `access` with an AT_FDCWD/dirfd base and AT_EACCESS.
+    /// `faccessat` (269) — `access` с базой AT_FDCWD/dirfd и AT_EACCESS.
     pub const FACCESSAT: u64 = 269;
-    /// `chown` (92) — change a path's owner (root only).
+    /// `chown` (92) — сменить владельца пути (только root).
     pub const CHOWN: u64 = 92;
-    /// `fchown` (93) — change an open descriptor's owner (root only).
+    /// `fchown` (93) — сменить владельца открытого дескриптора (только root).
     pub const FCHOWN: u64 = 93;
     pub const READLINK: u64 = 89;
-    /// `gettimeofday` — get wall-clock time as a `timeval`.
+    /// `gettimeofday` — получить стенное время как `timeval`.
     pub const GETTIMEOFDAY: u64 = 96;
-    /// `getrlimit` — get a resource limit.
+    /// `getrlimit` — получить лимит ресурса.
     pub const GETRLIMIT: u64 = 97;
-    /// `sysinfo` — get system statistics.
+    /// `sysinfo` — статистика системы.
     pub const SYSINFO: u64 = 99;
-    /// `getuid` — get real user id.
+    /// `getuid` — real user id.
     pub const GETUID: u64 = 102;
-    /// `getgid` — get real group id.
+    /// `getgid` — real group id.
     pub const GETGID: u64 = 104;
-    /// `setuid` — set the real/effective/saved user id.
+    /// `setuid` — задать real/effective/saved user id.
     pub const SETUID: u64 = 105;
-    /// `setgid` — set the real/effective/saved group id.
+    /// `setgid` — задать real/effective/saved group id.
     pub const SETGID: u64 = 106;
-    /// `geteuid` — get effective user id.
+    /// `geteuid` — effective user id.
     pub const GETEUID: u64 = 107;
-    /// `getegid` — get effective group id.
+    /// `getegid` — effective group id.
     pub const GETEGID: u64 = 108;
-    /// `setreuid` — set the real/effective user id.
+    /// `setreuid` — задать real/effective user id.
     pub const SETREUID: u64 = 113;
-    /// `setregid` — set the real/effective group id.
+    /// `setregid` — задать real/effective group id.
     pub const SETREGID: u64 = 114;
-    /// `setresuid` — set any subset of the real/effective/saved user ids.
+    /// `setresuid` — задать любое подмножество real/effective/saved user id.
     pub const SETRESUID: u64 = 117;
-    /// `getresuid` — read the real/effective/saved user ids.
+    /// `getresuid` — прочитать real/effective/saved user id.
     pub const GETRESUID: u64 = 118;
-    /// `setresgid` — set any subset of the real/effective/saved group ids.
+    /// `setresgid` — задать любое подмножество real/effective/saved group id.
     pub const SETRESGID: u64 = 119;
-    /// `getresgid` — read the real/effective/saved group ids.
+    /// `getresgid` — прочитать real/effective/saved group id.
     pub const GETRESGID: u64 = 120;
-    /// `getppid` — get parent process id.
+    /// `getppid` — id родительского процесса.
     pub const GETPPID: u64 = 110;
-    /// `statfs` — filesystem statistics by path.
+    /// `statfs` — статистика файловой системы по пути.
     pub const STATFS: u64 = 137;
-    /// `fstatfs` — filesystem statistics by fd.
+    /// `fstatfs` — статистика файловой системы по fd.
     pub const FSTATFS: u64 = 138;
-    /// `arch_prctl` — set/get architecture-specific thread state.
+    /// `arch_prctl` — задать/прочитать архитектурное состояние потока.
     pub const ARCH_PRCTL: u64 = 158;
-    /// `gettid` — get thread id.
+    /// `gettid` — id потока.
     pub const GETTID: u64 = 186;
-    /// `time` — get wall-clock seconds.
+    /// `time` — стенные секунды.
     pub const TIME: u64 = 201;
-    /// `futex` — userspace synchronization primitive.
+    /// `futex` — примитив синхронизации userspace.
     pub const FUTEX: u64 = 202;
-    /// `getdents64` — read directory entries.
+    /// `getdents64` — прочитать записи каталога.
     pub const GETDENTS64: u64 = 217;
-    /// `set_tid_address` — set pointer to thread id.
+    /// `set_tid_address` — задать указатель на thread id.
     pub const SET_TID_ADDRESS: u64 = 218;
-    /// `clock_gettime` — read a POSIX clock.
-    /// `clock_nanosleep` — high-resolution sleep against a clock.
+    /// `clock_gettime` — прочитать POSIX-часы.
+    /// `clock_nanosleep` — высокоточный сон относительно часов.
     pub const CLOCK_NANOSLEEP: u64 = 230;
-    /// `exit_group` — terminate the calling task (thread-group form).
+    /// `exit_group` — завершить вызывающую задачу (форма группы потоков).
     pub const EXIT_GROUP: u64 = 231;
-    /// `openat` — open relative to a directory fd.
+    /// `openat` — открыть относительно дескриптора каталога.
     pub const OPENAT: u64 = 257;
-    /// `newfstatat` — file status relative to a directory fd.
+    /// `newfstatat` — статус файла относительно дескриптора каталога.
     pub const NEWFSTATAT: u64 = 262;
-    /// `readlinkat` — read a symlink target relative to a directory fd.
+    /// `readlinkat` — прочитать цель симлинка относительно дескриптора каталога.
     pub const READLINKAT: u64 = 267;
-    /// `set_robust_list` / `get_robust_list` — robust futex ownership.
+    /// `set_robust_list` / `get_robust_list` — владение robust futex.
     pub const SET_ROBUST_LIST: u64 = 273;
     pub const GET_ROBUST_LIST: u64 = 274;
-    /// `dup3` — duplicate a file descriptor to an explicit target with flags.
+    /// `dup3` — продублировать дескриптор в явную цель с флагами.
     pub const DUP3: u64 = 292;
     pub const PIPE2: u64 = 293;
-    /// `madvise` — advisory memory-usage hints (accepted and ignored).
+    /// `madvise` — рекомендательные подсказки памяти (принимаются и игнорируются).
     pub const MADVISE: u64 = 28;
-    /// `tgkill` — send a signal to a specific thread (single-thread model: self).
+    /// `tgkill` — послать сигнал конкретному потоку (модель одного потока: себе).
     pub const TGKILL: u64 = 234;
-    /// `prlimit64` — get/set a resource limit.
+    /// `prlimit64` — получить/задать лимит ресурса.
     pub const PRLIMIT64: u64 = 302;
-    /// `setrlimit` (160) — prlimit64 with the caller as the target.
+    /// `setrlimit` (160) — prlimit64 с вызывающим в качестве цели.
     pub const SETRLIMIT: u64 = 160;
-    /// `getrusage` (98) — zeroed CPU/fault accounting.
+    /// `getrusage` (98) — обнулённый учёт CPU/fault.
     pub const GETRUSAGE: u64 = 98;
-    /// `times` (100) — tick counter plus zeroed tms.
+    /// `times` (100) — счётчик тиков плюс обнулённый tms.
     pub const TIMES: u64 = 100;
-    /// `getrandom` — fill a buffer with random bytes.
+    /// `getrandom` — заполнить буфер случайными байтами.
     pub const GETRANDOM: u64 = 318;
-    /// `rseq` — restartable sequences registration (stub).
+    /// `rseq` — регистрация restartable sequences (заглушка).
     pub const RSEQ: u64 = 334;
-    /// `sigaltstack` — set/get the signal stack (stub).
+    /// `sigaltstack` — задать/прочитать стек сигналов (заглушка).
     pub const SIGALTSTACK: u64 = 131;
 }
 
-/// Marshal the saved Linux x86_64 syscall registers into `(nr, args)`.
+/// Смаршаллить сохранённые регистры syscall Linux x86_64 в `(nr, args)`.
 ///
-/// Per the Linux x86_64 convention the syscall number is in `rax` and the six
-/// arguments are in `rdi, rsi, rdx, r10, r8, r9` — note `r10`, not `rcx`, holds the
-/// fourth argument. This function applies exactly that permutation and always copies
-/// all six argument registers regardless of how many the named syscall actually
-/// consumes (R1.1, R1.8).
+/// По соглашению Linux x86_64 номер syscall в `rax`, а шесть аргументов — в
+/// `rdi, rsi, rdx, r10, r8, r9`; заметьте, четвёртый аргумент лежит в `r10`, а не
+/// `rcx`. Функция применяет ровно эту перестановку и всегда копирует все шесть
+/// регистров-аргументов, сколько бы из них ни потреблял названный syscall
+/// (R1.1, R1.8).
 ///
-/// Returns `(nr, [a1, a2, a3, a4, a5, a6])` where
+/// Возвращает `(nr, [a1, a2, a3, a4, a5, a6])`, где
 /// `[a1..a6] == [rdi, rsi, rdx, r10, r8, r9]`.
 #[inline]
 pub fn marshal_args(
@@ -343,27 +345,27 @@ pub fn marshal_args(
     (rax, [rdi, rsi, rdx, r10, r8, r9])
 }
 
-/// Largest single user payload the socket layer will validate, allocate and
-/// copy for `sendto`/`recvfrom` (1 MiB).
+/// Наибольшая одиночная пользовательская полезная нагрузка, которую слой сокетов
+/// валидирует, выделяет и копирует для `sendto`/`recvfrom` (1 МиБ).
 ///
-/// The pointer walk for those syscalls has always been capped at this value
-/// (`check_user_ptr(buf, len.min(MAX_SOCKET_IO))`), but the allocation and the
-/// copy used the raw `len`: a process needed only 1 MiB of mapped pages to make
-/// the kernel ask the allocator for `len` bytes, and `len` is a `u64` under
-/// attacker control — a multi-gigabyte allocation, i.e. an allocation abort /
-/// OOM DoS (same class as the crafted-ext2 `i_size` allocations, F-x86v-1).
-/// Everything that touches the payload must agree with the cap; see
-/// [`socket_payload_len`].
+/// Обход указателя для этих syscall'ов всегда ограничивался этим значением
+/// (`check_user_ptr(buf, len.min(MAX_SOCKET_IO))`), но аллокация и копирование
+/// использовали сырой `len`: процессу хватало 1 МиБ отображённых страниц, чтобы
+/// заставить ядро попросить у аллокатора `len` байт, а `len` — контролируемый
+/// атакующим `u64`: многогигабайтная аллокация, то есть abort/OOM DoS (тот же
+/// класс, что аллокации по crafted-ext2 `i_size`). Всё, что трогает полезную
+/// нагрузку, обязано согласоваться с пределом; см. [`socket_payload_len`].
 pub const MAX_SOCKET_IO: u64 = 1 << 20;
 
-/// Effective user-payload length for a socket syscall, from the raw count.
+/// Эффективная длина пользовательской полезной нагрузки для сокетного syscall из
+/// сырого счётчика.
 ///
-/// `send = true` (`sendto`): a count above [`MAX_SOCKET_IO`] is refused with
-/// `EMSGSIZE` BEFORE any allocation — silently sending a truncated datagram
-/// would be a correctness bug of its own.
-/// `send = false` (`recvfrom`): the count is the caller's buffer *capacity*;
-/// Linux accepts a capacity larger than the datagram, so the kernel truncates
-/// it to the cap and then validates, allocates and copies exactly that range.
+/// `send = true` (`sendto`): счётчик выше [`MAX_SOCKET_IO`] отвергается с
+/// `EMSGSIZE` ДО любой аллокации — молча отправить усечённую датаграмму было бы
+/// отдельным багом корректности.
+/// `send = false` (`recvfrom`): счётчик — *ёмкость* буфера вызывающего; Linux
+/// принимает ёмкость больше датаграммы, поэтому ядро урезает её до предела и
+/// затем валидирует, выделяет и копирует ровно этот диапазон.
 pub fn socket_payload_len(count: u64, send: bool) -> Result<u64, super::errno::Errno> {
     if send && count > MAX_SOCKET_IO {
         return Err(super::errno::Errno::EMSGSIZE);
@@ -375,39 +377,36 @@ pub fn socket_payload_len(count: u64, send: bool) -> Result<u64, super::errno::E
     })
 }
 
-/// The complete `Supported_Syscall_Set` (R2.1) — the single source of truth for
-/// both the dispatch gate and the exactness test.
+/// Полный `Supported_Syscall_Set` (R2.1) — единственный источник правды и для
+/// гейта диспетчеризации, и для теста точности.
 ///
-/// Written as `nr::` NAMES, not bare numbers, so the list is self-documenting and
-/// cannot drift from the constants the dispatcher matches on. Every entry has a
-/// real arm in `linux::dispatch_supported` (the two entries routed specially by
-/// `linux_dispatch` itself — `execve`, `clone`, `rt_sigreturn` — are members
-/// too, since they pass the gate on the way there); a number NOT here returns
-/// `-ENOSYS` before any argument pointer is inspected (R1.4, R11.4, R11.5).
-/// The list is strictly ascending, so [`is_supported`] can binary-search it.
+/// Записан ИМЕНАМИ `nr::`, а не голыми числами, чтобы список был
+/// самодокументируемым и не мог разойтись с константами, по которым
+/// сопоставляется диспетчер. У каждой записи есть реальная ветка в
+/// `linux::dispatch_supported` (три особые записи, маршрутизируемые самим
+/// `linux_dispatch` — `execve`, `clone`, `rt_sigreturn` — тоже члены, потому что
+/// проходят гейт по пути туда); число НЕ отсюда возвращает `-ENOSYS` до
+/// инспекции любого указателя-аргумента (R1.4, R11.4, R11.5). Список строго
+/// возрастает, поэтому [`is_supported`] может искать двоичным поиском.
 ///
-/// ## Maintenance contract (three edits, same commit)
+/// ## Контракт сопровождения (три правки в одном коммите)
 ///
-/// Adding a syscall means: an `nr::` constant, a `dispatch_supported` arm, and
-/// this list. The two runtime-visible halves are then checked from both ends:
+/// Добавить syscall — значит: константа `nr::`, ветка `dispatch_supported` и
+/// этот список. Затем обе видимые в рантайме половины проверяются с двух
+/// сторон:
 ///
-///   * the `supported_set_is_exact` test compares this list against an
-///     INDEPENDENT literal enumeration of the numbers (so a typo in a constant
-///     or a missing/extra entry fails on the host), asserts strict ascending
-///     order (so a duplicated or misplaced entry fails), and walks `0..=600`
-///     in BOTH directions (accepted here ⇒ gated in; not here ⇒ `-ENOSYS`);
-///   * the `dispatch_supported` fallback arm logs
-///     `nr has NO dispatch arm` and returns `ENOSYS` — the reverse drift
-///     (gated in, no arm) therefore announces itself instead of silently
-///     turning a syscall into a permanent `ENOSYS`.
+///   * тест `supported_set_is_exact` сравнивает список с НЕЗАВИСИМЫМ литеральным
+///     перечислением номеров (так опечатка в константе или пропущенная/лишняя
+///     запись падает на хосте), требует строгого возрастания (дубликат или
+///     перестановка падают) и проходит `0..=600` в ОБЕ стороны (принято здесь ⇒
+///     пропущено гейтом; нет здесь ⇒ `-ENOSYS`);
+///   * запасная ветка `dispatch_supported` логирует `nr has NO dispatch arm` и
+///     возвращает `ENOSYS` — обратный дрейф (гейт пустил, ветки нет) заявляет о
+///     себе, а не молча превращает syscall в вечный `ENOSYS`.
 ///
-/// Match arms cannot be introspected from a test, so this list is the manual
-/// enumeration of the dispatcher's coverage; the test locks the numbers and the
-/// fallback tripwire locks the arms.
-///
-/// History note: the previous test asserted membership for only 69 of the 109
-/// numbers the gate accepted and never asserted that anything was *unsupported*,
-/// so it could not catch either class of drift.
+/// Ветки match не интроспектируются из теста, поэтому список — ручное
+/// перечисление покрытия диспетчера; тест закрепляет числа, а запасная растяжка —
+/// ветки.
 pub const SUPPORTED_SYSCALLS: [u64; 159] = [
     nr::READ,
     nr::WRITE,
@@ -570,13 +569,13 @@ pub const SUPPORTED_SYSCALLS: [u64; 159] = [
     nr::FACCESSAT2,
 ];
 
-/// Test whether `nr` is a member of the `Supported_Syscall_Set` (R2.1).
+/// Проверить, входит ли `nr` в `Supported_Syscall_Set` (R2.1).
 ///
-/// A binary search of [`SUPPORTED_SYSCALLS`], so the gate and the enumerated
-/// table can never disagree. Returns `false` for every number not in the table,
-/// including the still-out-of-scope `fork` (57) and `vfork` (58) and any
-/// graphical/windowing syscall number (R1.4, R11.4, R11.5). The dispatcher uses
-/// this gate to return `-ENOSYS` before inspecting any argument pointer.
+/// Двоичный поиск по [`SUPPORTED_SYSCALLS`], так что гейт и перечисленная
+/// таблица не могут разойтись. `false` для любого номера не из таблицы, включая
+/// всё ещё вне области `fork` (57) и `vfork` (58) и любой графический/оконный
+/// номер (R1.4, R11.4, R11.5). Диспетчер использует гейт, чтобы вернуть
+/// `-ENOSYS` до инспекции любого указателя-аргумента.
 #[inline]
 pub fn is_supported(nr: u64) -> bool {
     SUPPORTED_SYSCALLS.binary_search(&nr).is_ok()
@@ -595,29 +594,25 @@ mod tests {
 
     #[test]
     fn marshal_r10_is_fourth_arg() {
-        // r10 (not rcx) is a4; confirm positions are exactly rdi,rsi,rdx,r10,r8,r9.
+        // r10 (не rcx) — это a4; подтвердить, что позиции ровно rdi,rsi,rdx,r10,r8,r9.
         let (_, args) = marshal_args(0, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60);
         assert_eq!(args, [0x10, 0x20, 0x30, 0x40, 0x50, 0x60]);
     }
 
-    /// The gate and the enumerated `Supported_Syscall_Set` are the same set —
-    /// checked in BOTH directions against an independent literal enumeration of
-    /// the Linux x86_64 numbers the dispatcher implements.
+    /// Гейт и перечисленный `Supported_Syscall_Set` — одно множество, проверенное
+    /// в ОБЕ стороны против независимого литерального перечисления номеров Linux
+    /// x86_64, которые реализует диспетчер.
     ///
-    /// `EXPECTED` is deliberately NOT derived from [`SUPPORTED_SYSCALLS`] or from
-    /// [`is_supported`]: it is the independent half of a double-entry check
-    /// (`nr::` names vs bare numbers), so a wrong constant value, a missing
-    /// entry, or a duplicated one fails here instead of shipping. The reverse
-    /// drift (a number gated in with no `dispatch_supported` arm) is caught by
-    /// that function's fallback tripwire at runtime.
-    ///
-    /// The old version of this test asserted membership for only 69 of the 109
-    /// numbers the gate accepted, never asserted that anything was unsupported,
-    /// and compared against a subset instead of the whole `0..=600` domain.
+    /// `EXPECTED` намеренно НЕ выводится из [`SUPPORTED_SYSCALLS`] или
+    /// [`is_supported`]: это независимая половина двойной проверки (имена `nr::`
+    /// против голых чисел), поэтому неверное значение константы, пропуск или
+    /// дубликат падают здесь, а не уходят в релиз. Обратный дрейф (число
+    /// пропущено гейтом, а ветки `dispatch_supported` нет) ловит запасная
+    /// растяжка той функции в рантайме.
     #[test]
     fn supported_set_is_exact() {
-        // Independent enumeration: the Linux x86_64 syscall numbers with a real
-        // dispatcher arm, in ascending order (keep it sorted!).
+        // Независимое перечисление: номера syscall'ов Linux x86_64 с реальной
+        // веткой диспетчера, по возрастанию (держать отсортированным!).
         const EXPECTED: [u64; 159] = [
             0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
             28, 32, 33, 35, 39, 40, 41, 42, 43, 44, 45, 49, 50, 51, 53, 54, 55, 56, 59, 60, 61, 62,
@@ -630,9 +625,9 @@ mod tests {
             318, 319, 326, 332, 334, 439,
         ];
 
-        // 1. The two independent enumerations agree element-wise, and both are
-        //    strictly ascending (the gate's binary search depends on it; a
-        //    duplicated or misplaced entry cannot hide behind a passing check).
+        // 1. Два независимых перечисления совпадают поэлементно, и оба строго
+        //    возрастают (на этом держится двоичный поиск гейта; дубликат или
+        //    перестановка не спрячутся за проходящей проверкой).
         assert_eq!(
             SUPPORTED_SYSCALLS, EXPECTED,
             "nr:: names and the literal number list disagree"
@@ -646,8 +641,9 @@ mod tests {
             );
         }
 
-        // 2. Two-way exactness over a superset of every defined number: the gate
-        //    accepts `n` iff the independent enumeration contains `n`.
+        // 2. Двусторонняя точность над надмножеством всех определённых номеров:
+        //    гейт принимает `n` тогда и только тогда, когда независимое
+        //    перечисление содержит `n`.
         for n in 0..=600u64 {
             assert_eq!(
                 is_supported(n),
@@ -659,10 +655,10 @@ mod tests {
             assert!(!is_supported(n), "nr={n} must stay unsupported");
         }
 
-        // 3. Spot checks for the numbers whose treatment the docs got wrong:
-        //    clone(56) and futex(202) ARE supported (the previous doc comment
-        //    claimed they were out of scope), kill(62) is the newest member,
-        //    and fork/vfork/stat never are.
+        // 3. Точечные проверки номеров, трактовку которых документация путала:
+        //    clone(56) и futex(202) ПОДДЕРЖИВАЮТСЯ (прежний doc-комментарий
+        //    утверждал обратное), kill(62) — новейший член, а fork/vfork/stat —
+        //    никогда.
         for n in [nr::CLONE, nr::FUTEX, nr::KILL] {
             assert!(is_supported(n), "nr={n} must be supported");
         }
@@ -677,7 +673,8 @@ mod tests {
 
     #[test]
     fn process_model_syscalls_stay_unsupported() {
-        // The "later milestone" process-model syscalls must remain ENOSYS.
+        // Syscall'ы модели процессов из «более поздней вехи» должны остаться
+        // ENOSYS.
         for nr in [57u64 /* fork */, 58 /* vfork */] {
             assert!(!is_supported(nr), "{nr} must stay unsupported");
         }

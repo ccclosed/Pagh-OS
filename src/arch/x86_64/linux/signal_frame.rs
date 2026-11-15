@@ -1,68 +1,71 @@
-//! Pure x86_64 Linux signal ABI: signal numbers, disposition records, sigset
-//! algebra, default-action classification, and the `rt_sigframe`
-//! encode/decode used by signal delivery (`super::signal`) and
+//! Чистый ABI сигналов x86_64 Linux: номера сигналов, записи диспозиций,
+//! алгебра sigset, классификация действий по умолчанию и encode/decode
+//! `rt_sigframe`, используемые доставкой сигналов (`super::signal`) и
 //! `rt_sigreturn`.
 //!
-//! This module is deliberately `core`-only and free of kernel dependencies
-//! (R11.6): it is `#[path]`-included by `host-tests` (`p42`), so the property
-//! tests exercise the EXACT bytes the kernel writes into ring-3 stacks.
+//! Модуль намеренно только `core` и без ядерных зависимостей (R11.6): он
+//! включается в `host-tests` через `#[path]` (`p42`), поэтому property-тесты
+//! упражняют ТОЧНЫЕ байты, которые ядро пишет в стеки ring 3.
 //!
-//! ## Frame layout contract (x86_64 Linux, `arch/x86/kernel/signal.c`)
+//! ## Контракт раскладки фрейма (x86_64 Linux, `arch/x86/kernel/signal.c`)
 //!
-//! A delivered signal builds, on the user stack below the interrupted RSP:
+//! Доставленный сигнал строит на пользовательском стеке ниже прерванного RSP:
 //!
 //! ```text
-//! frame+0    : pretcode  = sa_restorer (glibc's sigreturn trampoline)
-//! frame+8    : struct ucontext uc        (304 bytes)
-//! frame+312  : struct siginfo info       (128 bytes, zeros + si_signo/si_code)
+//! frame+0    : pretcode  = sa_restorer (трамплин sigreturn glibc)
+//! frame+8    : struct ucontext uc        (304 байта)
+//! frame+312  : struct siginfo info       (128 байт, нули + si_signo/si_code)
 //! total      : RT_SIGFRAME_SIZE = 440
 //! ```
 //!
-//! The interrupted GPR state is stored in `uc.uc_mcontext` (a
-//! `sigcontext_64`, 256 bytes at `frame+48`), and the signal mask to restore
-//! on `rt_sigreturn` in `uc.uc_sigmask` (`frame+304`).
+//! Прерванное состояние GPR хранится в `uc.uc_mcontext` (`sigcontext_64`,
+//! 256 байт по `frame+48`), а маска сигналов для восстановления на
+//! `rt_sigreturn` — в `uc.uc_sigmask` (`frame+304`).
 //!
-//! Handler-entry register contract (matching Linux on the syscall-return
-//! path): `RSP = frame`, `RIP = sa_handler`, `RDI = signo`, `RSI = &info`,
-//! `RDX = &uc`. `rcx`/`r11` at delivery hold the interrupted user RIP /
-//! RFLAGS (the `syscall` instruction's own clobber), so `sigcontext.cx` and
-//! `sigcontext.ip` carry the same value — identical to what Linux shows.
+//! Контракт регистров при входе в обработчик (как в Linux на пути возврата из
+//! syscall): `RSP = frame`, `RIP = sa_handler`, `RDI = signo`, `RSI = &info`,
+//! `RDX = &uc`. `rcx`/`r11` при доставке несут прерванный user RIP / RFLAGS
+//! (собственный clobber инструкции `syscall`), поэтому `sigcontext.cx` и
+//! `sigcontext.ip` несут одно значение — так же, как показывает Linux.
 //!
-//! ## Return-to-frame contract for `rt_sigreturn`
+//! ## Контракт возврата к фрейму для `rt_sigreturn`
 //!
-//! The restorer runs with `RSP = frame + 8` (the `ret` popped `pretcode`), so
-//! `rt_sigreturn` finds `uc` exactly at the entry RSP: mcontext at `+40`,
-//! sigmask at `+296`.
+//! Restorer работает с `RSP = frame + 8` (`ret` снял `pretcode`), поэтому
+//! `rt_sigreturn` находит `uc` ровно по входному RSP: mcontext по `+40`,
+//! sigmask по `+296`.
 #![allow(dead_code)]
 
-/// Highest signal number the table covers (Linux `_NSIG/64-bit` is 64).
+/// Наибольший номер сигнала, который покрывает таблица (Linux `_NSIG/64-bit` —
+/// 64).
 pub const SIGNAL_COUNT: usize = 64;
 
-/// RFLAGS bits a ring-3 `rt_sigreturn` frame may restore.
+/// Биты RFLAGS, которые может восстановить ring-3 `rt_sigreturn`-фрейм.
 ///
-/// The frame is entirely user-controlled (the kernel cannot authenticate it, and
-/// does not need to: Linux trusts it too), so every *privileged* bit has to be
-/// masked out before the value reaches the `sysret` return path, which does not
-/// sanitise RFLAGS:
+/// Фрейм полностью контролируется пользователем (ядро не может его
+/// аутентифицировать и не должно: Linux тоже доверяет), поэтому каждый
+/// *привилегированный* бит нужно вымаскировать до того, как значение дойдёт до
+/// пути возврата `sysret`, который не санирует RFLAGS:
 ///
-/// * `IOPL` (0x3000) — ring-3 `in`/`out` and PCI config space. A forged frame
-///   used to set it (F-LEAD-2), handing ring 3 the I/O ports.
-/// * `NT` (0x4000), `VM` (0x20000) — task/VM86 state that has no meaning here.
-/// * `RF` (0x10000), `AC` (0x40000) — resume/alignment-check overrides; `AC=1`
-///   would defeat SMAP if it is ever enabled.
+/// * `IOPL` (0x3000) — ring-3 `in`/`out` и PCI config space. Поддельный фрейм
+///   когда-то ставил его, отдавая ring 3 порты I/O.
+/// * `NT` (0x4000), `VM` (0x20000) — состояние задачи/VM86, здесь бессмысленное.
+/// * `RF` (0x10000), `AC` (0x40000) — переопределения resume/alignment-check;
+///   `AC=1` свёл бы на нет SMAP, если его когда-нибудь включат.
 ///
-/// Everything a user program may legitimately own is kept: CF/PF/AF/ZF/SF/TF/IF/
-/// DF/OF, plus EFLAGS bit 1 (reserved, architecturally always 1), so a
-/// `siglongjmp`-style handler sees the same flags it had. `0xFD7` is `0xFD5`
-/// (the nine arithmetic/control bits) with that fixed bit set.
+/// Всё, чем пользовательская программа может законно владеть, сохраняется:
+/// CF/PF/AF/ZF/SF/TF/IF/DF/OF плюс бит 1 EFLAGS (зарезервированный,
+/// архитектурно всегда 1), чтобы обработчик в стиле `siglongjmp` видел те же
+/// флаги. `0xFD7` — это `0xFD5` (девять арифметических/управляющих битов) с
+/// этим фиксированным битом.
 pub const USER_RFLAGS_MASK: u64 = 0x0000_0000_0000_0FD7;
 
-/// Mask `flags` down to the user-settable RFLAGS bits ([`USER_RFLAGS_MASK`]).
+/// Урезать `flags` до пользовательски устанавливаемых битов RFLAGS
+/// ([`USER_RFLAGS_MASK`]).
 pub fn sanitize_user_rflags(flags: u64) -> u64 {
     flags & USER_RFLAGS_MASK
 }
 
-// ─── Signal numbers (x86_64 Linux) ───────────────────────────────────────────
+// ─── Номера сигналов (x86_64 Linux) ───────────────────────────────────────────
 
 pub const SIGHUP: u64 = 1;
 pub const SIGINT: u64 = 2;
@@ -73,16 +76,16 @@ pub const SIGABRT: u64 = 6;
 pub const SIGBUS: u64 = 7;
 pub const SIGFPE: u64 = 8;
 pub const SIGKILL: u64 = 9;
-/// `SIGUSR1` — the first user-defined signal, the natural choice for
-/// tests and for programs that want a purely application-level notification.
+/// `SIGUSR1` — первый пользовательский сигнал, естественный выбор для тестов и
+/// программ, которым нужно чисто прикладное уведомление.
 pub const SIGUSR1: u64 = 10;
 pub const SIGSEGV: u64 = 11;
-/// `SIGUSR2` — the second user-defined signal.
+/// `SIGUSR2` — второй пользовательский сигнал.
 pub const SIGUSR2: u64 = 12;
 pub const SIGPIPE: u64 = 13;
 pub const SIGALRM: u64 = 14;
-/// `SIGTERM` — the standard polite termination request (`kill -TERM`); its
-/// default action is `Term`.
+/// `SIGTERM` — стандартный вежливый запрос завершения (`kill -TERM`); его
+/// действие по умолчанию — `Term`.
 pub const SIGTERM: u64 = 15;
 pub const SIGCHLD: u64 = 17;
 pub const SIGCONT: u64 = 18;
@@ -93,21 +96,22 @@ pub const SIGTTOU: u64 = 22;
 pub const SIGURG: u64 = 23;
 pub const SIGWINCH: u64 = 28;
 
-/// `sigaction(2)`: reset the disposition to `SIG_DFL`.
+/// `sigaction(2)`: сбросить диспозицию в `SIG_DFL`.
 pub const SIG_DFL: u64 = 0;
-/// `sigaction(2)`: ignore the signal.
+/// `sigaction(2)`: игнорировать сигнал.
 pub const SIG_IGN: u64 = 1;
 
-// ─── `sa_flags` bits ─────────────────────────────────────────────────────────
+// ─── биты `sa_flags` ─────────────────────────────────────────────────────────
 
-/// Run the handler on the alternate signal stack (`sigaltstack(2)`).
+/// Выполнять обработчик на альтернативном стеке сигналов (`sigaltstack(2)`).
 pub const SA_ONSTACK: u64 = 0x0800_0000;
-/// `sa_restorer` is valid (glibc always sets this on x86_64).
+/// `sa_restorer` валиден (glibc на x86_64 всегда его ставит).
 pub const SA_RESTORER: u64 = 0x0400_0000;
-/// Handler takes `(signo, &siginfo, &ucontext)` — we pass all three either way.
+/// Обработчик принимает `(signo, &siginfo, &ucontext)` — мы всё равно передаём
+/// все три.
 pub const SA_SIGINFO: u64 = 0x0000_0004;
 
-// ─── `sigprocmask` `how` values ──────────────────────────────────────────────
+// ─── значения `how` для `sigprocmask` ────────────────────────────────────────
 
 pub const SIG_BLOCK: u64 = 0;
 pub const SIG_UNBLOCK: u64 = 1;
@@ -115,14 +119,15 @@ pub const SIG_SETMASK: u64 = 2;
 
 // ─── `sigaltstack` ───────────────────────────────────────────────────────────
 
-/// Minimum alternate-stack size we accept (`MINSIGSTKSZ` on Linux x86_64).
+/// Минимальный размер альтернативного стека, который принимаем
+/// (`MINSIGSTKSZ` в Linux x86_64).
 pub const MINSIGSTKSZ: u64 = 2048;
-/// `stack_t.ss_flags`: the alternate stack is disabled.
+/// `stack_t.ss_flags`: альтернативный стек отключён.
 pub const SS_DISABLE: u32 = 2;
 
-// ─── sigset algebra (u64 bitset, bit N == signal N) ──────────────────────────
+// ─── алгебра sigset (битсет u64, бит N == сигнал N) ──────────────────────────
 
-/// Bit mask for signal `sig` (1..=64); `sig == 0` yields 0 (no signal).
+/// Битовая маска сигнала `sig` (1..=64); `sig == 0` даёт 0 (нет сигнала).
 #[inline]
 pub const fn sigbit(sig: u64) -> u64 {
     if sig == 0 || sig > SIGNAL_COUNT as u64 {
@@ -132,53 +137,54 @@ pub const fn sigbit(sig: u64) -> u64 {
     }
 }
 
-/// Kernel-enforced unblockable signals: `SIGKILL` and `SIGSTOP`.
+/// Неблокируемые на уровне ядра сигналы: `SIGKILL` и `SIGSTOP`.
 pub const UNBLOCKABLE_MASK: u64 = sigbit(SIGKILL) | sigbit(SIGSTOP);
 
-/// Clean x86_64 user RFLAGS for handler entry: reserved bit 1 set, IF set, all
-/// system flags clear. Both delivery paths (syscall return via `sysretq`, timer
-/// tick via `iretq`) enter the handler with exactly these flags; Linux sanitizes
-/// the interrupted flags the same way when delivering a signal.
+/// Чистый пользовательский RFLAGS x86_64 для входа в обработчик: зарезервированный
+/// бит 1 установлен, IF установлен, все системные флаги сброшены. Оба пути
+/// доставки (возврат syscall через `sysretq`, тик через `iretq`) входят в
+/// обработчик ровно с этими флагами; Linux санирует прерванные флаги так же при
+/// доставке сигнала.
 pub const USER_RFLAGS: u64 = 0x202;
 
-/// The stop-class signals (`SIG_KERNEL_STOP_MASK` in Linux): their default action
-/// is Stop, and generating `SIGCONT` discards all of them from the pending sets
+/// Сигналы класса остановки (`SIG_KERNEL_STOP_MASK` в Linux): их действие по
+/// умолчанию — Stop, а генерация `SIGCONT` удаляет их все из pending-наборов
 /// (POSIX 2.4.1 / Linux `prepare_signal`).
 pub const SIG_KERNEL_STOP_MASK: u64 =
     sigbit(SIGSTOP) | sigbit(SIGTSTP) | sigbit(SIGTTIN) | sigbit(SIGTTOU);
 
-/// Is `sig` a stop-class signal (default action Stop)?
+/// `sig` — сигнал класса остановки (действие по умолчанию Stop)?
 pub fn is_stop_signal(sig: u64) -> bool {
     sig != 0 && sigbit(sig) & SIG_KERNEL_STOP_MASK != 0
 }
 
-/// Drop every pending stop-class bit (a `SIGCONT` generation does this).
+/// Сбросить все ожидающие биты класса остановки (это делает генерация `SIGCONT`).
 pub fn flush_stop_bits(pending: u64) -> u64 {
     pending & !SIG_KERNEL_STOP_MASK
 }
 
-/// Drop a pending `SIGCONT` (generating a stop signal does this — POSIX: "when
-/// any stop signal is generated ... any pending SIGCONT shall be discarded").
+/// Сбросить ожидающий `SIGCONT` (это делает генерация stop-сигнала — POSIX: «при
+/// генерации любого stop-сигнала ... любой ожидающий SIGCONT отбрасывается»).
 pub fn flush_cont_bits(pending: u64) -> u64 {
     pending & !sigbit(SIGCONT)
 }
 
-// ─── `wait(2)` status words ──────────────────────────────────────────────────
+// ─── статусные слова `wait(2)` ──────────────────────────────────────────────
 
-/// `wait(2)` status of a child STOPPED by signal `sig`: `(sig << 8) | 0x7f`, the
-/// Linux encoding in which `WIFSTOPPED(status)` is exactly `status & 0xff == 0x7f`.
-/// `WSTOPSIG(status)` is `status >> 8`.
+/// `wait(2)`-статус ребёнка, ОСТАНОВЛЕННОГО сигналом `sig`: `(sig << 8) | 0x7f`,
+/// кодировка Linux, в которой `WIFSTOPPED(status)` — ровно `status & 0xff ==
+/// 0x7f`. `WSTOPSIG(status)` — `status >> 8`.
 #[inline]
 pub const fn wait_status_stopped(sig: u64) -> u32 {
     (((sig as u32) & 0xff) << 8) | 0x7f
 }
 
-/// `wait(2)` status of a child RESUMED by `SIGCONT`: `0xffff`
-/// (`WIFCONTINUED(status)` is exactly `status == 0xffff`).
+/// `wait(2)`-статус ребёнка, ВОЗОБНОВЛЁННОГО `SIGCONT`: `0xffff`
+/// (`WIFCONTINUED(status)` — ровно `status == 0xffff`).
 pub const WAIT_STATUS_CONTINUED: u32 = 0xffff;
 
-/// `wait(2)` status of a normally exiting child: the exit code in the high byte
-/// (pagh's convention: `128 + sig` for a signal-terminated child).
+/// `wait(2)`-статус нормально вышедшего ребёнка: код выхода в старшем байте
+/// (соглашение pagh: `128 + sig` для завершённого сигналом ребёнка).
 #[inline]
 pub const fn wait_status_exited(code: u8) -> u32 {
     (code as u32) << 8
@@ -196,8 +202,9 @@ pub const fn wait_status_is_continued(status: u32) -> bool {
     status == WAIT_STATUS_CONTINUED
 }
 
-/// Apply a `sigprocmask` operation. `SIGKILL`/`SIGSTOP` bits can never end up
-/// blocked; an unknown `how` is `None` (caller maps to `EINVAL`).
+/// Применить операцию `sigprocmask`. Биты `SIGKILL`/`SIGSTOP` никогда не могут
+/// оказаться заблокированными; неизвестный `how` — `None` (вызывающий отображает
+/// в `EINVAL`).
 pub fn apply_mask_op(how: u64, old: u64, set: u64) -> Option<u64> {
     let mut new = match how {
         SIG_BLOCK => old | set,
@@ -209,24 +216,24 @@ pub fn apply_mask_op(how: u64, old: u64, set: u64) -> Option<u64> {
     Some(new)
 }
 
-// ─── Default actions (`signal(7)` table) ─────────────────────────────────────
+// ─── действия по умолчанию (таблица `signal(7)`) ────────────────────────────
 
-/// What the kernel does with a signal whose disposition is `SIG_DFL`.
+/// Что ядро делает с сигналом, чья диспозиция — `SIG_DFL`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DefaultAction {
-    /// Terminate the process (exit status `128 + sig`).
+    /// Завершить процесс (статус выхода `128 + sig`).
     Term,
-    /// Ignore the signal.
+    /// Игнорировать сигнал.
     Ignore,
-    /// Stop the process (delivered as a scheduler park: the task's saved frame
-    /// moves to `STOPPED_TASKS` and stays there until `SIGCONT`).
+    /// Остановить процесс (доставляется как парковка планировщиком: сохранённый
+    /// фрейм задачи уходит в `STOPPED_TASKS` и остаётся там до `SIGCONT`).
     Stop,
-    /// Continue the process if stopped, else ignore.
+    /// Продолжить процесс, если он остановлен, иначе игнорировать.
     Cont,
 }
 
-/// Default action for signals 1..=31 plus the common RT numbers; everything
-/// beyond 34 defaults to Term (Linux: real-time signals default-terminate).
+/// Действие по умолчанию для сигналов 1..=31 плюс обычные RT-номера; всё свыше
+/// 34 по умолчанию завершает (в Linux real-time сигналы по умолчанию завершают).
 pub fn default_action(sig: u64) -> DefaultAction {
     match sig {
         SIGCHLD | SIGURG | SIGWINCH => DefaultAction::Ignore,
@@ -236,25 +243,27 @@ pub fn default_action(sig: u64) -> DefaultAction {
     }
 }
 
-/// Is this signal's default action process termination? Used by `tgkill` to
-/// keep its "fatal signal to self without a handler exits the group" behavior.
+/// Действие этого сигнала по умолчанию — завершение процесса? Используется
+/// `tgkill`, чтобы сохранить поведение «фатальный сигнал самому себе без
+/// обработчика завершает группу».
 pub fn default_is_fatal(sig: u64) -> bool {
     default_action(sig) == DefaultAction::Term
 }
 
-// ─── Disposition + alternate stack records ───────────────────────────────────
+// ─── записи диспозиций + альтернативного стека ──────────────────────────────
 
-/// Kernel-side copy of one disposition (`struct kernel_sigaction`, 32-byte
-/// user ABI when `sigsetsize == 8`: handler, flags, restorer, mask).
+/// Ядерная копия одной диспозиции (`struct kernel_sigaction`, 32-байтный
+/// пользовательский ABI при `sigsetsize == 8`: handler, flags, restorer, mask).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SignalAction {
-    /// `SIG_DFL` (0), `SIG_IGN` (1), or the user handler virtual address.
+    /// `SIG_DFL` (0), `SIG_IGN` (1) или виртуальный адрес пользовательского
+    /// обработчика.
     pub handler: u64,
     /// `sa_flags` (`SA_RESTORER`, `SA_ONSTACK`, ...).
     pub flags: u64,
-    /// `sa_restorer` — the sigreturn trampoline glibc provides.
+    /// `sa_restorer` — трамплин sigreturn, который предоставляет glibc.
     pub restorer: u64,
-    /// Mask to block while the handler runs (`sa_mask`, low 64 bits).
+    /// Маска, блокируемая на время обработчика (`sa_mask`, младшие 64 бита).
     pub mask: u64,
 }
 
@@ -269,19 +278,20 @@ impl Default for SignalAction {
     }
 }
 
-/// Does this disposition run user code (neither `SIG_DFL` nor `SIG_IGN`)?
+/// Запускает ли эта диспозиция пользовательский код (ни `SIG_DFL`, ни `SIG_IGN`)?
 pub fn is_user_handler(a: &SignalAction) -> bool {
     a.handler != SIG_DFL && a.handler != SIG_IGN
 }
 
-/// Kernel-side `stack_t` (24-byte user ABI: sp, flags(+pad), size).
+/// Ядерная копия `stack_t` (24-байтный пользовательский ABI: sp, flags(+pad),
+/// size).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SigAltStack {
-    /// Base of the alternate stack region.
+    /// База региона альтернативного стека.
     pub sp: u64,
-    /// `SS_DISABLE` or 0 (enabled).
+    /// `SS_DISABLE` или 0 (включён).
     pub flags: u32,
-    /// Region size in bytes.
+    /// Размер региона в байтах.
     pub size: u64,
 }
 
@@ -295,21 +305,21 @@ impl Default for SigAltStack {
     }
 }
 
-// ─── Frame geometry ──────────────────────────────────────────────────────────
+// ─── геометрия фрейма ───────────────────────────────────────────────────────
 
-/// Offset of `ucontext` within the frame (after `pretcode`).
+/// Смещение `ucontext` во фрейме (после `pretcode`).
 pub const UC_OFFSET: u64 = 8;
-/// Offset of `sigcontext_64` (mcontext) within `ucontext`
+/// Смещение `sigcontext_64` (mcontext) внутри `ucontext`
 /// (`uc_flags` 8 + `uc_link` 8 + `uc_stack` 24).
 pub const MCONTEXT_OFFSET: u64 = UC_OFFSET + 40;
-/// Offset of `uc_sigmask` within `ucontext` (after the 256-byte mcontext).
+/// Смещение `uc_sigmask` внутри `ucontext` (после 256-байтного mcontext).
 pub const SIGMASK_OFFSET: u64 = UC_OFFSET + 40 + 256;
-/// Offset of `siginfo` within the frame (after the 304-byte ucontext).
+/// Смещение `siginfo` во фрейме (после 304-байтного ucontext).
 pub const SIGINFO_OFFSET: u64 = UC_OFFSET + 304;
-/// Total frame size: pretcode(8) + ucontext(304) + siginfo(128).
+/// Полный размер фрейма: pretcode(8) + ucontext(304) + siginfo(128).
 pub const RT_SIGFRAME_SIZE: u64 = 440;
 
-/// The GPR snapshot stored in / restored from the frame's `sigcontext`.
+/// Снимок GPR, хранимый в `sigcontext` фрейма и восстанавливаемый из него.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SigFrameRegs {
     pub r8: u64,
@@ -341,8 +351,8 @@ impl SigFrameRegs {
         for (i, v) in fields.iter().enumerate() {
             buf[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
         }
-        // cs/gs/fs/ss (u16s at 144..152) and err/trapno/oldmask/cr2 are left
-        // zero — the kernel-side reader restores only GPRs/IP/FLAGS/SP.
+        // cs/gs/fs/ss (u16 по 144..152) и err/trapno/oldmask/cr2 остаются
+        // нулевыми — ядерный читатель восстанавливает только GPR/IP/FLAGS/SP.
     }
 
     fn get(buf: &[u8; 256]) -> SigFrameRegs {
@@ -375,13 +385,13 @@ impl SigFrameRegs {
     }
 }
 
-/// Where the kernel places the frame below the interrupted RSP.
+/// Куда ядро кладёт фрейм ниже прерванного RSP.
 ///
-/// The address is ≡ 8 (mod 16): at handler entry `RSP = frame` looks exactly
-/// like a normal `call`-pushed return address from the SysV alignment
-/// standpoint, so handler prologues using `movaps` keep their ABI guarantee.
-/// `SA_ONSTACK` with an enabled, large-enough alternate stack places the frame
-/// at the TOP of that stack instead (still ≡ 8 mod 16).
+/// Адрес ≡ 8 (mod 16): при входе в обработчик `RSP = frame` выглядит ровно как
+/// обычный адрес возврата, положенный `call`, с точки зрения выравнивания SysV,
+/// поэтому прологи обработчиков с `movaps` сохраняют ABI-гарантию. `SA_ONSTACK`
+/// с включённым и достаточно большим альтернативным стеком кладёт фрейм на
+/// ВЕРШИНУ того стека (тоже ≡ 8 mod 16).
 pub fn frame_location(user_rsp: u64, action: &SignalAction, alt: &SigAltStack) -> u64 {
     let base =
         if action.flags & SA_ONSTACK != 0 && alt.flags & SS_DISABLE == 0 && alt.size >= MINSIGSTKSZ
@@ -393,9 +403,9 @@ pub fn frame_location(user_rsp: u64, action: &SignalAction, alt: &SigAltStack) -
     ((base.saturating_sub(RT_SIGFRAME_SIZE)) & !0xF) - 8
 }
 
-/// Encode a complete `rt_sigframe` into `out` (exactly `RT_SIGFRAME_SIZE`
-/// bytes). `restorer` becomes `pretcode`; `newmask` is the mask `rt_sigreturn`
-/// restores (the pre-delivery mask ORed with the action's `sa_mask`).
+/// Закодировать полный `rt_sigframe` в `out` (ровно `RT_SIGFRAME_SIZE` байт).
+/// `restorer` становится `pretcode`; `newmask` — маска, которую восстановит
+/// `rt_sigreturn` (маска до доставки, объединённая с `sa_mask` действия).
 pub fn encode_rt_sigframe(
     out: &mut [u8; RT_SIGFRAME_SIZE as usize],
     restorer: u64,
@@ -407,8 +417,8 @@ pub fn encode_rt_sigframe(
     *out = [0u8; RT_SIGFRAME_SIZE as usize];
     // pretcode
     out[0..8].copy_from_slice(&restorer.to_le_bytes());
-    // ucontext: uc_flags = 0, uc_link = NULL, uc_stack = the CURRENT altstack
-    // state (Linux reports the active one; SS_DISABLE when unset).
+    // ucontext: uc_flags = 0, uc_link = NULL, uc_stack = ТЕКУЩЕЕ состояние
+    // altstack (Linux сообщает активное; SS_DISABLE, когда не задан).
     // uc_stack = { ss_sp @ uc+16, ss_flags @ uc+24, ss_size @ uc+28 }.
     out[UC_OFFSET as usize + 24..UC_OFFSET as usize + 28].copy_from_slice(&alt.flags.to_le_bytes());
     out[UC_OFFSET as usize + 28..UC_OFFSET as usize + 36].copy_from_slice(&alt.size.to_le_bytes());
@@ -419,28 +429,28 @@ pub fn encode_rt_sigframe(
     // uc_sigmask
     out[SIGMASK_OFFSET as usize..SIGMASK_OFFSET as usize + 8]
         .copy_from_slice(&newmask.to_le_bytes());
-    // siginfo: si_signo, si_errno=0, si_code=SI_KERNEL (0x80); rest zeros.
+    // siginfo: si_signo, si_errno=0, si_code=SI_KERNEL (0x80); остальное нули.
     out[SIGINFO_OFFSET as usize..SIGINFO_OFFSET as usize + 4]
         .copy_from_slice(&(sig as u32).to_le_bytes());
     out[SIGINFO_OFFSET as usize + 8..SIGINFO_OFFSET as usize + 12]
         .copy_from_slice(&0x80u32.to_le_bytes());
 }
 
-/// Result of decoding a frame on `rt_sigreturn`.
+/// Результат декодирования фрейма на `rt_sigreturn`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RestoredFrame {
-    /// Full GPR snapshot (restore all except `rcx`/`r11` — see below).
+    /// Полный снимок GPR (восстанавливаются все, кроме `rcx`/`r11` — см. ниже).
     pub regs: SigFrameRegs,
-    /// Signal mask to reinstate (the pre-delivery mask).
+    /// Маска сигналов для восстановления (маска до доставки).
     pub mask: u64,
 }
 
-/// Decode the frame at `uc_addr` from the 304 bytes starting there
-/// (`ucontext`): mcontext at `+40`, sigmask at `+296`.
+/// Декодировать фрейм по `uc_addr` из 304 байт, начинающихся там (`ucontext`):
+/// mcontext по `+40`, sigmask по `+296`.
 ///
-/// Returns `None` when the mcontext RIP is NULL — a sanity guard against
-/// `rt_sigreturn` misuse (there is no kernel-side way to authenticate the
-/// frame; Linux trusts it likewise).
+/// `None`, когда mcontext RIP нулевой — защита от неверного использования
+/// `rt_sigreturn` (аутентифицировать фрейм на стороне ядра нельзя; Linux тоже
+/// доверяет).
 pub fn decode_rt_sigframe(uc: &[u8; 304]) -> Option<RestoredFrame> {
     let mut mc = [0u8; 256];
     mc.copy_from_slice(
@@ -448,20 +458,20 @@ pub fn decode_rt_sigframe(uc: &[u8; 304]) -> Option<RestoredFrame> {
             ..MCONTEXT_OFFSET as usize - UC_OFFSET as usize + 256],
     );
     let mut regs = SigFrameRegs::get(&mc);
-    // A frame may only send execution/stack back to the user half. A kernel IP
-    // would make `sysret` enter ring 3 with CPL=3 at a supervisor address (the
-    // CPU faults, but the frame is nonsense); a kernel SP would park the user
-    // stack in the kernel half and fault on the handler's first push. Reject
-    // both at decode time, like the null-IP guard.
+    // Фрейм может вернуть исполнение/стек только в пользовательскую половину.
+    // Ядерный IP заставил бы `sysret` войти в ring 3 с CPL=3 по supervisor-
+    // адресу (CPU упадёт, но фрейм бессмыслен); ядерный SP припарковал бы
+    // пользовательский стек в ядерной половине и упал на первом push'е
+    // обработчика. Отвергаем оба на этапе декодирования, как и нулевой IP.
     if regs.ip == 0 || regs.ip >= super::validate::USER_ADDR_MAX {
         return None;
     }
     if regs.sp >= super::validate::USER_ADDR_MAX {
         return None;
     }
-    // `sys_rt_sigreturn` writes this straight into the register `sysret` restores
-    // as RFLAGS, which does not sanitise them (F-LEAD-2). Mask privileged bits
-    // here so every decode path gets the sanitised value.
+    // `sys_rt_sigreturn` пишет это прямо в регистр, который `sysret` восстановит
+    // как RFLAGS, а тот их не санирует. Маскируем привилегированные биты здесь,
+    // чтобы каждый путь декодирования получал уже санированное значение.
     regs.flags = sanitize_user_rflags(regs.flags);
     let mut m = [0u8; 8];
     m.copy_from_slice(&uc[296..304]);
@@ -477,15 +487,17 @@ mod tests {
 
     #[test]
     fn user_rflags_mask_drops_privileged_bits() {
-        // IOPL=3 (the F-LEAD-2 attack), NT, VM, RF, AC must all vanish.
+        // IOPL=3 (атака), NT, VM, RF, AC должны исчезнуть.
         let attack = 0x3000u64 | 0x4000 | 0x20000 | 0x10000 | 0x40000;
         assert_eq!(sanitize_user_rflags(attack), 0);
-        // Bits a user program legitimately owns survive: CF, PF, AF, ZF, SF, TF,
-        // IF, DF, OF, and the fixed reserved bit 1.
+        // Биты, законно принадлежащие пользовательской программе, выживают: CF,
+        // PF, AF, ZF, SF, TF, IF, DF, OF и фиксированный зарезервированный бит 1.
         assert_eq!(sanitize_user_rflags(0xFD7), 0xFD7);
-        // IF (0x200) is the one every signal handler needs to keep interrupts on.
+        // IF (0x200) — тот единственный, который нужен каждому обработчику,
+        // чтобы прерывания оставались включены.
         assert_eq!(sanitize_user_rflags(0x202), 0x202);
-        // Idempotent: masking an already-masked value changes nothing.
+        // Идемпотентно: маскирование уже замаскированного значения ничего не
+        // меняет.
         let once = sanitize_user_rflags(0xFFFF_FFFF_FFFF_FFFF);
         assert_eq!(once, USER_RFLAGS_MASK);
         assert_eq!(sanitize_user_rflags(once), once);
@@ -494,7 +506,7 @@ mod tests {
     #[test]
     fn sigbit_basics() {
         assert_eq!(sigbit(1), 1);
-        assert_eq!(sigbit(SIGINT), 0b10); // bit N-1 for signal N
+        assert_eq!(sigbit(SIGINT), 0b10); // бит N-1 для сигнала N
         assert_eq!(sigbit(0), 0);
         assert_eq!(sigbit(65), 0);
         assert_eq!(UNBLOCKABLE_MASK, sigbit(9) | sigbit(19));
@@ -537,7 +549,7 @@ mod tests {
         let mut a = SignalAction::default();
         a.flags = SA_ONSTACK;
         let mut alt = SigAltStack::default();
-        // Disabled → falls back to the regular stack.
+        // Отключён → откат к обычному стеку.
         assert_eq!(
             frame_location(0x8000, &a, &alt),
             frame_location(0x8000, &SignalAction::default(), &alt)
@@ -548,7 +560,7 @@ mod tests {
         let f = frame_location(0x8000, &a, &alt);
         assert!(f >= 0x10_0000 && f + RT_SIGFRAME_SIZE <= 0x10_0000 + MINSIGSTKSZ);
         assert_eq!(f % 16, 8);
-        // Too-small altstack is ignored.
+        // Слишком маленький altstack игнорируется.
         alt.size = 64;
         assert_eq!(
             frame_location(0x8000, &a, &alt),
@@ -601,7 +613,7 @@ mod tests {
     #[test]
     fn decode_rejects_null_ip() {
         let mut uc = [0u8; 304];
-        // All-zero mcontext → ip == 0 → rejected.
+        // Полностью нулевой mcontext → ip == 0 → отвергается.
         assert!(decode_rt_sigframe(&uc).is_none());
     }
 }

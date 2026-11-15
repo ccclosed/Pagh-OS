@@ -4,12 +4,11 @@
 `/tmp` и загрузчик ELF64 (нативные и Linux-бинари). Инициализация — `vfs::init()` из `boot.rs`,
 затем `boot.rs` подключает ext2-корень: `vfs::mount_at_named("/mnt", root, "ext2")`.
 
-Синтетический `/proc` (issue #11) реализован срезами 1–7: контракт — пути, байтовые
-форматы файлов, семантика `lstat`/`readdir`/`getdents64`/`readlink`, список отложенного —
-зафиксирован в **`docs/procfs.md`**, он же приёмка. Срез 5 добавил
-`/proc/<pid>/fdinfo/<n>` (и `self`-алиас) и `/proc/<pid>/limits` (и `self`-алиас),
-срез 6 (`2.19.0`) — per-thread view `/proc/<pid>/task/` и `/proc/self/task/`
-(каталог треда — тот же VFS-объект, что `/proc/<tid>`), срез 7 (`2.20.0`) — реальные
+Синтетический `/proc` реализован по контракту **`docs/procfs.md`**: пути, байтовые
+форматы файлов, семантика `lstat`/`readdir`/`getdents64`/`readlink`, список
+отложенного — там же, он же приёмка. Есть `/proc/<pid>/fdinfo/<n>` и
+`/proc/<pid>/limits` (и `self`-алиасы), per-thread view `/proc/<pid>/task/` и
+`/proc/self/task/` (каталог треда — тот же VFS-объект, что `/proc/<tid>`), реальные
 `dev`/`ino`/`offset`/`pathname` в `/proc/<pid>/maps` для file-backed-строк
 (DEVIATION-7 сужена до анонимных регионов); отложены необязательные поля
 mountinfo/statfs и не смоделированные Linux-файлы per-thread view (`sched`, `syscall`,
@@ -22,10 +21,10 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
 | `mod.rs` | Ядро VFS: трейт `VfsNode`, `VfsError`, `FsStat`, резолв путей (`lookup_path`), монтирование (`mount_at`/`MountNode`), синтетический `/dev` (`NullDevice`, `SerialDevice`, `DevDirectory`), корень (`RootDirectory`), `init()` |
 | `ramfs.rs` | In-memory ФС для `/tmp`; единственная in-memory-ФС с настоящими `create_dir`/`create_file`/`remove` (на диске то же умеет ext2-каталог под `/mnt`) |
 | `procfs.rs` | Синтетический `/proc`: узлы `ProcDir`/`ProcFile`, ленивый рендер текста на `size()`/`read()`, источники — PMM/heap/тики/счётчики планировщика/`CompatState`/CPUID. `DirKind::TaskDir(tgid)` листает живые треды группы из `compat::thread_group_pids`, узел `task/<tid>` — это `pid_dir(tid)`. Kernel-only |
-| `procfs_format.rs` | Чистое (`core`+`alloc`) форматирование текстов procfs (включая `/proc/version`, `/proc/filesystems`, `/proc/loadavg`, `/proc/sys/kernel/*`, `fdinfo` и `limits`), таблица путей и inode'ов (`pid_task_dir_ino` — срез 6) — включается в host-tests (свойства `procfs_*`) |
+| `procfs_format.rs` | Чистое (`core`+`alloc`) форматирование текстов procfs (включая `/proc/version`, `/proc/filesystems`, `/proc/loadavg`, `/proc/sys/kernel/*`, `fdinfo` и `limits`), таблица путей и inode'ов (`pid_task_dir_ino`) — включается в host-tests (свойства `procfs_*`) |
 | `elf.rs` | Эффектный загрузчик ELF64: `ElfLoader::load` (нативный `ET_EXEC`), `ElfLoader::load_linux` (`ET_EXEC`, static-PIE `ET_DYN` и glibc-dynamic образы — `PT_INTERP` подшивается отдельно через `map_interpreter`), `ElfLoader::map_interpreter`; `ElfProcess` |
 | `elf_classify.rs` | Чистый core-only классификатор ELF (`classify_elf`, `ElfKind`, `ElfVerdict`) и выбор bias для static-PIE (`choose_bias`, `PIE_BASE`); включается в host-tests |
-| `link_walk.rs` | Чистый (`core`+`alloc`, self-contained) резолвер симлинков (issue #18): компонентный обход, стек `..`, относительные/абсолютные цели, бюджет `SYMLOOP_MAX=40`, `MAX_EXPANDED_BYTES`; host-свойства `link_walk_paths` (включая сравнение с независимым оракулом) |
+| `link_walk.rs` | Чистый (`core`+`alloc`, self-contained) резолвер симлинков: компонентный обход, стек `..`, относительные/абсолютные цели, бюджет `SYMLOOP_MAX=40`, `MAX_EXPANDED_BYTES`; host-свойства `link_walk_paths` (включая сравнение с независимым оракулом) |
 
 ## Ключевые символы
 
@@ -43,8 +42,8 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
 - `link_walk::{resolve, LinkTree, WalkError, SYMLOOP_MAX, map_guest_target, guest_path_keeps_root}`;
   `LinkTree::may_search` — хук прав поиска, который спрашивает чистый walker перед каждым lookup.
 - `VfsNode::is_symlink()` / `read_link() -> Option<String>` — понятие ссылки в трейте
-  (дефолты `false`/`None`; переопределён у `/proc/self/exe`, будет переиспользован
-  ext2-симлинками из issue #18). `MountNode` форвардит оба метода.
+  (дефолты `false`/`None`; переопределён у `/proc/self/exe` и ext2-симлинков).
+  `MountNode` форвардит оба метода.
 - `VfsNode::{mode, owner, set_mode, set_owner}` — **метаданные**, не политика:
   дефолты `0o755`/`0o644` по `is_directory`, владелец `(0, 0)`, set*-методы →
   `NotSupported`. ext2 читает/пишет `i_mode`, `i_uid`, `i_gid` через журнал;
@@ -74,10 +73,10 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
   выше диапазона, который выдаёт ext2-форматтер на дисках примерно до 84 ГиБ (`st_dev` у всех
   VFS-файлов один, поэтому пары `(st_dev, st_ino)` не должны пересекаться), чтобы glibc ld.so
   дедуплицировал корректно.
-- `/tmp` появился из-за nvim: `vim_mktempdir` делает `mkdir("/tmp/nvim.XXXXXX")`.
+- `/tmp` обязателен: Linux-userspace делает там `mkdir` (nvim в `vim_mktempdir`).
 
-### procfs (issue #11 — контракт `docs/procfs.md`)
-- Срезы 1–7: `/proc` + `/proc/self` + `self/{exe,cmdline,status,maps,stat,statm,mounts,cgroup,mountinfo,limits}`
+### procfs (контракт `docs/procfs.md`)
+- Поверхность: `/proc` + `/proc/self` + `self/{exe,cmdline,status,maps,stat,statm,mounts,cgroup,mountinfo,limits}`
   + `{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}` + read-only
   `/proc/sys/kernel/{ostype,osrelease,hostname}` + per-pid
   `{cmdline,stat,status,maps,cgroup,mountinfo,limits,fd/*,fdinfo/*,task/*}`.
@@ -87,7 +86,7 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
   inode, что `/proc/<tid>` (Linux-идентичность «один тред = один inode»), поэтому
   `stat`/`status`/`cmdline` (и остальные pid-файлы) рендерятся существующими
   рендерерами per-thread. Мёртвый pid, тред чужой группы и неназванный tid — `ENOENT`
-  (`docs/procfs.md` §13). Срез 7: строки maps для PT_LOAD-сегментов образа/
+  (`docs/procfs.md` §13). Строки maps для PT_LOAD-сегментов образа/
   интерпретатора и file-backed `mmap` печатают реальные `08:00`/`st_ino`/offset/pathname
   из VFS (`CompatState::image_ino`/`interp_ino`, `MmapBacking`); `[heap]`/`[stack]`/
   анонимные — честные `00:00 0` (§14).
@@ -137,7 +136,7 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
   дерево и тексты — in-QEMU рутинами `procfs::tree, rendered files and ENOENT matrix` и
   `procfs::fdinfo and limits (slice 5)` в `src/test.rs`.
 
-### Симлинки и обход путей (issue #18, контракт `EXT2-LINKS.md` §4/§7)
+### Симлинки и обход путей (контракт `EXT2-LINKS.md` §4/§7)
 - Трейт расширен аддитивно: `is_symlink()`, `read_link() -> Option<String>`, `nlink()`,
   `create_symlink(name, target)`, `link(name, target_node)`; `MountNode` форвардит их
   (`nlink` — чтобы `stat("/mnt")` показывал `i_links_count` корня ext2).
@@ -161,7 +160,7 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
   цикл → `ELOOP`); `open` следует, `O_NOFOLLOW` на ссылке → `ELOOP`, `O_CREAT|O_EXCL` при
   существующем имени (даже висячей ссылке) → `EEXIST`; `readlink` отдаёт `min(bufsiz, len)`
   байт без NUL, `bufsiz == 0` → `EINVAL`, не-ссылка → `EINVAL`.
-- **Права поиска на обходе (аудит 2.22.2, F-x86v-3):** чистый `link_walk` перед каждым
+- **Права поиска на обходе:** чистый `link_walk` перед каждым
   `lookup` спрашивает `LinkTree::may_search`; ядро-адаптер `io_sys::walk_as` отвечает
   `Creds::may(node.mode(), node.owner(), Access::Execute)` эффективных id (`access(2)` —
   реальных). Проверяются все пройденные каталоги, **включая компоненты цели ссылки**,
@@ -207,14 +206,14 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
 - glibc ld.so дедуплицирует загруженные объекты по `(st_dev, st_ino)` — разные файлы не должны
   делить пару; отсюда старт ramfs-ino с `0x0054_0000`.
 - `lookup_path` не должен держать `VFS_ROOT`-спинлок во время `lookup` (дедлок).
-- Serial-write раньше портил байты ≥ 0x80 через `format_args!` (UTF-8) — фикс: байтовый API.
+- Serial-write обязан идти байтовым API, не через `format_args!`: UTF-8-энкодинг
+  портит байты ≥ 0x80.
 - `elf_classify.rs` сознательно дублирует `USER_ADDR_MAX` вместо импорта (иначе в host-tests
   протекают kernel-зависимости).
 - Нулевой `e_phnum` допустим; валидация phdr идёт до аллокаций — битые бинари не трогают память.
 - Абсолютная цель ссылки **не** очищает оставшиеся компоненты пути: `/a/link/..` обязан
-  применить `..` к каталогу цели (`/b/c/..` = `/b`). Ранний вариант резолвера чистил список
-  компонентов при абсолютной цели и возвращал `/b/c` — поймано host-свойством против
-  независимого оракула (`link_walk_paths`).
+  применить `..` к каталогу цели (`/b/c/..` = `/b`); это закреплено host-свойством
+  против независимого оракула (`link_walk_paths`).
 - Адаптер `WalkNodes` интернирует узлы по `Arc::ptr_eq`: узел, возвращённый `lookup`,
   должен быть тем же `Arc`, иначе один и тот же inode получит разные id и решение
   «туда ли мы пришли» разъедется.

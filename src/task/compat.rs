@@ -1,16 +1,15 @@
-//! Per-`Compat_Process` compatibility state (design "Compat_Process additions").
+//! Состояние совместимости на `Compat_Process` (design "Compat_Process additions").
 //!
-//! A Linux `Compat_Process` carries more state than a pagh-native task: its
-//! file-descriptor table (R2.4/R2.6/R2.14), its program-break + anonymous-`mmap`
-//! bookkeeping (R3/R4), the `FS.base` set via `arch_prctl(ARCH_SET_FS)` (R2.9),
-//! its thread id returned by `set_tid_address` (R2.10/R7.2), the set of
-//! already-reported unsupported syscall numbers for the at-most-once `nosys`
-//! diagnostic (R12.2), and the normalized exit code (R12.3).
+//! Linux-процесс несёт больше состояния, чем нативная задача pagh: таблицу
+//! дескрипторов (R2.4/R2.6/R2.14), учёт program break + анонимных `mmap`
+//! (R3/R4), `FS.base` из `arch_prctl(ARCH_SET_FS)` (R2.9), thread id из
+//! `set_tid_address` (R2.10/R7.2), набор уже сообщённых неподдерживаемых
+//! syscall'ов для диагностики `nosys` не чаще одного раза (R12.2) и
+//! нормализованный код выхода (R12.3).
 //!
-//! This bundle hangs off the scheduler [`Tcb`](super::scheduler::Tcb) as an
-//! `Option<CompatState>`: it is `None` for the existing pagh-native tasks
-//! (`spawn_test_user_process`) and only `Some` once `run_linux_binary` (task 13.3)
-//! populates it for a real Linux binary.
+//! Комплект висит на [`Tcb`](super::scheduler::Tcb) как `Option<CompatState>`:
+//! `None` у нативных задач pagh (`spawn_test_user_process`), `Some` только после
+//! того, как `run_linux_binary` заполнит его для настоящего Linux-бинаря.
 #![allow(dead_code)]
 
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -30,143 +29,146 @@ use crate::vfs::elf::LoadSegment;
 
 use super::fd::FdTable;
 
-/// All Linux-compatibility state attached to a `Compat_Process`.
+/// Всё состояние совместимости с Linux, привязанное к `Compat_Process`.
 #[derive(Clone)]
 pub struct CompatState {
-    /// The process's open file descriptors (0/1/2 pre-bound to the std streams).
+    /// Открытые дескрипторы процесса (0/1/2 заранее привязаны к std-потокам).
     pub fds: FdTable,
-    /// Program break + anonymous `mmap` region tracking.
+    /// Program break + учёт регионов анонимных `mmap`.
     pub vm: Arc<Spinlock<VmRegionSet>>,
-    /// `FS.base`, settable via `arch_prctl(ARCH_SET_FS)` (R2.9).
+    /// `FS.base`, задаётся через `arch_prctl(ARCH_SET_FS)` (R2.9).
     pub fs_base: u64,
-    /// The thread id reported by `set_tid_address` (R2.10).
+    /// Thread id, сообщённый `set_tid_address` (R2.10).
     pub tid: u64,
-    /// Parent process id used by getppid/wait4.
+    /// Id родительского процесса для getppid/wait4.
     pub ppid: u64,
-    /// Process id shared by all threads in the group.
+    /// Id процесса, общий для всех потоков группы.
     pub tgid: u64,
-    /// Process group id (Linux `pgid`), independent of the thread group.
-    /// `setpgid` changes it; `kill(-pgid)` and `kill(0)` address this group.
+    /// Id группы процессов (Linux `pgid`), независимый от группы потоков.
+    /// Меняется `setpgid`; `kill(-pgid)` и `kill(0)` адресуют эту группу.
     pub pgid: u64,
-    /// Whether the shell has handed this process the controlling terminal as a
-    /// JOB (`lxrun` / `fg` → `drivers::tty`). Only a job is subject to terminal
-    /// access control (`SIGTTIN` on background reads, `SIGTTOU` on background
-    /// writes under `TOSTOP`); the kernel's own non-interactive spawns (apt
-    /// verification binaries, the selftest harness) were never given the
-    /// terminal and must not be stopped by it. Inherited by `fork`/`clone`, so
-    /// a job's subprocesses stay governed by the terminal it owns.
+    /// Передан ли процессу шеллом управляющий терминал как JOB'у (`lxrun` /
+    /// `fg` → `drivers::tty`). Управлению доступа к терминалу подлежит только
+    /// job (`SIGTTIN` на фоновое чтение, `SIGTTOU` на фоновую запись при
+    /// `TOSTOP`); ядерные неинтерактивные запуски (верификационные бинари apt,
+    /// harness selftest'а) терминала не получали и не должны им
+    /// останавливаться. Наследуется `fork`/`clone`, поэтому подпроцессы job'а
+    /// остаются под его терминалом.
     pub tty_job: bool,
-    /// Address cleared and futex-woken at thread exit.
+    /// Адрес, очищаемый и будимый futex'ом при выходе потока.
     pub clear_child_tid: u64,
-    /// Whether exit creates a wait4-visible zombie.
+    /// Создаёт ли выход зомби, видимого для wait4.
     pub waitable: bool,
-    /// Linux robust-futex list head and ABI structure size.
+    /// Голова списка robust-futex Linux и размер ABI-структуры.
     pub robust_head: u64,
     pub robust_len: u64,
-    /// The process's current working directory, in *kernel* path form (a fresh
-    /// process starts at `/mnt`, the writable ext2 tree — see [`CompatState::new`]).
-    /// Relative `open`/`openat`/`access`/`chdir` paths resolve against this, so the
-    /// stored value must be the kernel path `resolve_path` returns; `getcwd` reports
-    /// it verbatim, which is why a guest-visible `/usr` comes back as `/mnt/usr`
+    /// Текущий рабочий каталог процесса в *ядерной* форме пути (свежий процесс
+    /// стартует с `/mnt`, записываемого дерева ext2 — см. [`CompatState::new`]).
+    /// Относительные пути `open`/`openat`/`access`/`chdir` разрешаются
+    /// относительно него, поэтому хранимое значение обязано быть ядерным путём,
+    /// который возвращает `resolve_path`; `getcwd` сообщает его дословно — потому
+    /// гостевой `/usr` возвращается как `/mnt/usr`
     /// (`selftest_lx::check_cwd_relative_create`, `docs/procfs.md` §1.2).
     pub cwd: String,
-    /// Distinct unsupported syscall numbers already logged, so the `nosys`
-    /// diagnostic is emitted at most once per number per process (R12.2).
+    /// Уже залогированные неподдерживаемые номера syscall'ов, чтобы диагностика
+    /// `nosys` выдавалась не чаще одного раза на номер на процесс (R12.2).
     pub nosys_logged: BTreeSet<u64>,
-    /// Whether the controlling tty is in raw mode (ICANON cleared via TCSETS).
+    /// Находится ли управляющий tty в raw-режиме (ICANON снят через TCSETS).
     pub raw_mode: bool,
-    /// STAGE 16.16: whether the controlling tty still echoes typed characters
-    /// (ECHO in c_lflag). A real tty echoes even in raw mode; only programs
-    /// that draw their own input (nvim, full readline) clear this bit.
+    /// Эхо-печатает ли управляющий tty введённые символы (ECHO в c_lflag).
+    /// Настоящий tty эхо-печатает и в raw-режиме; снимают бит только программы,
+    /// сами рисующие ввод (nvim, полный readline).
     pub echo: bool,
-    /// The normalized exit code (low byte of the requested code), once the
-    /// process has exited (R12.3).
+    /// Нормализованный код выхода (младший байт запрошенного кода) после
+    /// завершения процесса (R12.3).
     pub exit_code: Option<u8>,
-    /// Absolute VFS path of the exec'd image, reported through
-    /// `readlink("/proc/self/exe")` (libuv's uv_exepath / nvim's progpath).
+    /// Абсолютный путь VFS exec'нутого образа, сообщаемый через
+    /// `readlink("/proc/self/exe")` (uv_exepath libuv / progpath nvim).
     pub exe_path: String,
-    /// `/proc/self/cmdline`: the process's argv, each argument followed by a NUL
-    /// (Linux format). Captured at launch/exec from the same `argv` slice that
-    /// builds the initial stack — the initial stack itself is user memory and
-    /// cannot be read back from a VFS node (`docs/procfs.md` §4.4). `fork`/`clone`
-    /// inherit it, `execve` replaces it.
+    /// `/proc/self/cmdline`: argv процесса, каждый аргумент с NUL на конце
+    /// (формат Linux). Снимается при запуске/exec из того же среза `argv`, что
+    /// строит начальный стек — сам стек живёт в памяти пользователя, и прочитать
+    /// его из узла VFS нельзя (`docs/procfs.md` §4.4). `fork`/`clone` наследуют,
+    /// `execve` заменяет.
     pub cmdline: Vec<u8>,
-    /// Mapped `PT_LOAD` segments of the executable, for `/proc/self/maps`.
+    /// Отображённые `PT_LOAD` сегменты исполняемого файла для `/proc/self/maps`.
     pub image_segments: Vec<LoadSegment>,
-    /// `st_ino` of the executable's VFS node, as `stat(2)` reports it. The maps
-    /// file prints it on the image's segment lines so a file-backed mapping is
-    /// identifiable (0 when the image had no VFS identity).
+    /// `st_ino` узла VFS исполняемого файла, как его сообщает `stat(2)`. Файл
+    /// maps печатает его в строках сегментов образа, чтобы file-backed
+    /// отображение было опознаваемо (0, когда у образа нет идентичности VFS).
     pub image_ino: u64,
-    /// Mapped `PT_LOAD` segments of the ELF interpreter (empty for static images).
+    /// Отображённые `PT_LOAD` сегменты ELF-интерпретатора (пусто для статических образов).
     pub interp_segments: Vec<LoadSegment>,
-    /// `st_ino` of the interpreter's VFS node (0 for static images), for
-    /// `/proc/self/maps`; the path itself lives in [`CompatState::interp_path`].
+    /// `st_ino` узла VFS интерпретатора (0 для статических образов) для
+    /// `/proc/self/maps`; сам путь лежит в [`CompatState::interp_path`].
     pub interp_ino: u64,
-    /// Path of the ELF interpreter, when one was loaded (for `/proc/self/maps`).
+    /// Путь ELF-интерпретатора, если он загружался (для `/proc/self/maps`).
     pub interp_path: String,
-    /// What fds 0/1/2 were AT execve time (after the
-    /// close-on-exec sweep). The spawn-time [DIAG] lines are wiped by the
-    /// TUI screen clear, so the watchdog re-prints this snapshot instead.
+    /// Что было на fd 0/1/2 НА МОМЕНТ execve (после вычистки close-on-exec).
+    /// Строки [DIAG] времени spawn стираются очисткой экрана TUI, поэтому
+    /// watchdog печатает этот снимок заново.
     pub exec_stdio: [&'static str; 3],
-    /// Per-process rlimit overrides set via `prlimit64`/`setrlimit` (resource
-    /// id -> (soft, hard)). Resources absent here fall back to the kernel
-    /// defaults (`misc::default_rlimit`); `fork`/`clone` inherit the table.
+    /// Переопределения rlimit на процесс из `prlimit64`/`setrlimit`
+    /// (resource id -> (soft, hard)). Отсутствующие ресурсы берут умолчания ядра
+    /// (`misc::default_rlimit`); `fork`/`clone` наследуют таблицу.
     pub rlimits: BTreeMap<u64, (u64, u64)>,
-    /// The process's file-mode creation mask (`umask(2)`); applied to the
-    /// permission bits of freshly created files/directories.
+    /// Маска создания режима файлов процесса (`umask(2)`); применяется к битам
+    /// прав свежесозданных файлов/каталогов.
     pub umask: u32,
-    /// Process credentials (real/effective/saved user and group ids). Starts as
-    /// [`Creds::ROOT`] for every kernel-spawned process, is inherited unchanged
-    /// by `fork`/`clone`, and survives `execve` (pagh does not model setuid
-    /// binaries, so exec never changes the ids). All permission checks at the
-    /// syscall boundary read this; the VFS itself never sees a credential.
+    /// Креденшелы процесса (real/effective/saved id пользователя и группы).
+    /// Стартуют как [`Creds::ROOT`] у каждого запущенного ядром процесса,
+    /// наследуются без изменений `fork`/`clone` и переживают `execve` (pagh не
+    /// моделирует setuid-бинари, поэтому exec никогда не меняет id). Все проверки
+    /// прав на границе syscall читают это; VFS креденшелов не видит.
     pub creds: Creds,
-    /// Permission-bit overrides keyed by VFS inode identity (`fs_ino`, or the
-    /// FNV fallback for synthetic nodes). Written by `chmod` and at creation
-    /// time (default mode masked by `umask`); consulted by `stat`-family
-    /// handlers when reporting `st_mode`. Forked/cloned children inherit it.
+    /// Переопределения битов прав по идентичности inode VFS (`fs_ino` или
+    /// FNV-запасной для синтетических узлов). Пишутся `chmod` и при создании
+    /// (режим по умолчанию, урезанный `umask`); читаются обработчиками семейства
+    /// `stat` при выводе `st_mode`. Форкнутые/клонированные дети наследуют.
     pub mode_overrides: BTreeMap<u64, u32>,
-    /// Shared signal-disposition table (the `sigaction` state). Wrapped in an
-    /// `Arc` so thread clones (`CLONE_VM|CLONE_THREAD`, like Linux
-    /// `CLONE_SIGHAND`) SHARE one table, while `fork` deep-copies it.
+    /// Общая таблица диспозиций сигналов (`sigaction`). В `Arc`, чтобы клоны
+    /// потоков (`CLONE_VM|CLONE_THREAD`, как Linux `CLONE_SIGHAND`) ДЕЛИЛИ одну
+    /// таблицу, а `fork` глубоко копировал её.
     pub sig: Arc<Spinlock<SignalTable>>,
-    /// Per-thread pending-signal bitset (Linux pending signals are per-thread
-    /// unless sent via `kill_pgrp`-style group paths, which Phase 1 omits).
+    /// Битсет ожидающих сигналов потока (в Linux pending-сигналы принадлежат
+    /// потоку, если не посланы групповыми путями вроде `kill_pgrp`, которых здесь
+    /// нет).
     pub sig_pending: u64,
-    /// Per-thread blocked-signal mask (`rt_sigprocmask`). `SIGKILL`/`SIGSTOP`
-    /// bits are never set (enforced by `signal_frame::apply_mask_op`).
+    /// Маска заблокированных сигналов потока (`rt_sigprocmask`). Биты
+    /// `SIGKILL`/`SIGSTOP` никогда не ставятся (соблюдает
+    /// `signal_frame::apply_mask_op`).
     pub sig_blocked: u64,
-    /// Alternate signal stack registered via `sigaltstack(2)`.
+    /// Альтернативный стек сигналов, зарегистрированный `sigaltstack(2)`.
     pub sig_altstack: SigAltStack,
-    /// Set once the process has been observed entering a syscall through the
-    /// `int 0x80` gate (`linux::INT80_ENTRY`). AGENTS.md invariant 2 forbids that
-    /// entry for a Compat_Process: on it the saved `rcx`/`r11` are ordinary GPRs
-    /// and the `+120` slot is the CPU-pushed user RIP, so the register meaning
-    /// that `execve`/`clone`/signal delivery rely on does not hold. The signal
-    /// path refuses frame delivery for such a process instead of writing the
-    /// `rt_sigframe` over the user's code (see `signal::deliver_one_pending_syscall`).
-    /// Reset to `false` for forked/cloned children (their own first syscall sets
-    /// it again if they take that path).
+    /// Ставится, когда процесс замечен входящим в syscall через гейт `int 0x80`
+    /// (`linux::INT80_ENTRY`). Инвариант 2 из AGENTS.md запрещает такой вход для
+    /// Compat_Process: сохранённые `rcx`/`r11` там — обычные GPR, а слот `+120` —
+    /// положенный CPU user RIP, поэтому смысл регистров, на который опираются
+    /// `execve`/`clone`/доставка сигналов, не выполняется. Сигнальный путь
+    /// отказывается доставлять фрейм такому процессу, вместо того чтобы писать
+    /// `rt_sigframe` поверх кода пользователя (см.
+    /// `signal::deliver_one_pending_syscall`). Сбрасывается в `false` у
+    /// форкнутых/клонированных детей (их первый syscall поставит его снова, если
+    /// они пойдут этим путём).
     pub int80_entry: bool,
-    /// Whether the int80-entry delivery refusal has already been reported for
-    /// this process (keeps the diagnostic at one line per process).
+    /// Сообщён ли уже отказ доставки при входе через int80 для этого процесса
+    /// (диагностика не чаще строки на процесс).
     pub int80_refused_logged: bool,
 }
 
-/// The disposition table shared by a thread group.
+/// Таблица диспозиций, общая для группы потоков.
 #[derive(Clone)]
 pub struct SignalTable {
-    /// Disposition for signals 1..=64 (index `sig - 1`); all `SIG_DFL` at
-    /// process creation, matching Linux.
+    /// Диспозиция сигналов 1..=64 (индекс `sig - 1`); при создании процесса все
+    /// `SIG_DFL`, как в Linux.
     pub handlers: [SignalAction; SIGNAL_COUNT],
 }
 
 impl CompatState {
-    /// Build the initial compat state for a freshly launched Linux binary:
-    /// the supplied descriptor table and VM bookkeeping, `FS.base` cleared to 0,
-    /// the given thread id, cwd `/mnt` (the writable ext2 tree; `/` has no
-    /// `create_dir`), an empty `nosys` log, and no exit
-    /// code yet.
+    /// Построить начальное compat-состояние свежезапущенного Linux-бинаря:
+    /// переданная таблица дескрипторов и учёт VM, `FS.base` = 0, заданный thread
+    /// id, cwd `/mnt` (записываемое дерево ext2; у `/` нет `create_dir`), пустой
+    /// лог `nosys` и кода выхода ещё нет.
     pub fn new(fds: FdTable, vm: Arc<Spinlock<VmRegionSet>>, tid: u64) -> Self {
         Self::new_with_parent(fds, vm, tid, 1)
     }
@@ -218,58 +220,56 @@ impl CompatState {
     }
 }
 
-// ─── Current-process CompatState registry ────────────────────────────────────
+// ─── реестр CompatState текущего процесса ────────────────────────────────────
 //
-// ARCHITECTURE NOTE (the single source of truth for a RUNNING Compat_Process).
+// АРХИТЕКТУРНАЯ ЗАМЕТКА (единственный источник правды для РАБОТАЮЩЕГО
+// Compat_Process).
 //
-// The scheduler keeps NO persistent `Tcb` for the running task — it stores only
-// `CURRENT_PID` and rebuilds the `Tcb` from the kernel RSP on each tick (see
-// `scheduler::scheduler_tick_irq`), discarding any `Tcb.compat` field on requeue.
-// Effectful syscall handlers, however, need mutable access to the *running*
-// process's `CompatState` (its `FdTable`, `VmRegionSet`, `fs_base`, `tid`, and
-// `nosys_logged` set). A field on the transient `Tcb` therefore cannot be the
-// owner of that state.
+// Планировщик НЕ держит постоянного `Tcb` для текущей задачи — он хранит только
+// `CURRENT_PID` и пересобирает `Tcb` из RSP ядра на каждом тике (см.
+// `scheduler::scheduler_tick_irq`), отбрасывая поле `Tcb.compat` при requeue.
+// Эффектным обработчикам syscall'ов нужен изменяемый доступ к `CompatState`
+// *работающего* процесса (его `FdTable`, `VmRegionSet`, `fs_base`, `tid` и
+// `nosys_logged`). Поле в транзиентном `Tcb` поэтому не может владеть этим
+// состоянием.
 //
-// We resolve this with a global registry keyed by pid. This registry — NOT any
-// field on the transient `Tcb` (the field was removed: the `Tcb` is rebuilt
-// from the saved RSP on every tick and can never carry authoritative state) —
-// is the authoritative home of a Compat_Process's Linux state while it runs.
-// It is consulted via [`with_current_compat`].
+// Решение — глобальный реестр по pid. Именно он, а НЕ любое поле транзиентного
+// `Tcb` (поле удалено: `Tcb` пересобирается из сохранённого RSP на каждом тике и
+// не может нести авторитетное состояние), — авторитетный дом Linux-состояния
+// Compat_Process, пока тот работает. Доступ — через [`with_current_compat`].
 //
-// `run_linux_binary` (task 13.3) calls [`install_compat`] to register a freshly
-// launched process's state; [`remove_compat`] tears it down. `exit_current`
-// already removes the entry for the calling pid (wired in
-// `scheduler::exit_current`), so an exiting Compat_Process drops its registry
-// entry as part of termination.
+// `run_linux_binary` зовёт [`install_compat`] для регистрации состояния свежего
+// процесса; [`remove_compat`] сносит его. `exit_current` уже удаляет запись
+// вызывающего pid (связано в `scheduler::exit_current`), поэтому выходящий
+// Compat_Process теряет запись реестра как часть завершения.
 
-/// The authoritative registry of per-process [`CompatState`], keyed by pid.
+/// Авторитетный реестр [`CompatState`] по pid.
 ///
-/// Guarded by a [`Spinlock`] (which disables interrupts while held). Handlers
-/// must therefore NOT hold this lock across operations that block waiting for a
-/// device interrupt (e.g. ext2/VFS disk I/O): they extract what they need under
-/// the lock, release it, perform the blocking work, then re-acquire briefly to
-/// commit results (the pattern used by the `io` handlers). Page-table/PMM work
-/// (`brk`/`mmap`/`munmap`/`mprotect`) does not wait on interrupts, so it may run
-/// inside the [`with_current_compat`] closure.
+/// Защищён [`Spinlock`] (выключает прерывания на время удержания). Обработчики
+/// НЕ должны держать этот лок через операции, блокирующиеся в ожидании
+/// прерывания устройства (дисковый I/O ext2/VFS): они извлекают нужное под
+/// локом, отпускают его, выполняют блокирующую работу, затем ненадолго берут
+/// снова для фиксации результатов (шаблон обработчиков `io`). Работа с
+/// таблицами страниц/PMM (`brk`/`mmap`/`munmap`/`mprotect`) не ждёт прерываний,
+/// поэтому может идти внутри замыкания [`with_current_compat`].
 static COMPAT_STATES: Spinlock<BTreeMap<u64, CompatState>> = Spinlock::new(BTreeMap::new());
 static EXITED_CHILDREN: Spinlock<BTreeMap<(u64, u64), u8>> = Spinlock::new(BTreeMap::new());
 
-/// Register `state` as the [`CompatState`] for process `pid`, replacing any
-/// previous entry. Called by `run_linux_binary` (task 13.3) when launching a
-/// Compat_Process.
+/// Зарегистрировать `state` как [`CompatState`] процесса `pid`, заменив прежнюю
+/// запись. Вызывается `run_linux_binary` при запуске Compat_Process.
 pub fn install_compat(pid: u64, state: CompatState) {
     COMPAT_STATES.lock().insert(pid, state);
 }
 
-/// Remove and return the [`CompatState`] for process `pid`, if any. Called when
-/// a process terminates (`scheduler::exit_current`).
-/// Is `pid`'s stdin currently in raw mode? The ^C kill path consults this so
-/// full-screen programs that consume ^C as a key (nvim) keep their binding,
-/// while canonical-mode programs (python, bash) get the classic SIGINT-ish
-/// terminate.
-/// Does the CURRENT task's mmap tracking contain `addr` inside a region that
-/// was created with PROT_WRITE? Used by the page-fault handler to decide
-/// whether a write-to-RO-page fault is a fixable mapping inconsistency.
+/// Удалить и вернуть [`CompatState`] процесса `pid`, если он есть. Вызывается
+/// при завершении процесса (`scheduler::exit_current`).
+/// Находится ли stdin процесса `pid` сейчас в raw-режиме? Путь убийства по ^C
+/// смотрит сюда, чтобы полноэкранные программы, трактующие ^C как клавишу
+/// (nvim), сохраняли привязку, а программы в canonical-режиме (python, bash)
+/// получали классическое завершение по SIGINT.
+/// Содержит ли mmap-учёт ТЕКУЩЕЙ задачи `addr` внутри региона, созданного с
+/// PROT_WRITE? Нужно обработчику page fault, чтобы решить, является ли отказ
+/// записи в RO-страницу исправимой несогласованностью отображений.
 pub fn current_addr_in_writable_mmap(addr: u64) -> bool {
     with_current_compat(|cs| {
         cs.vm
@@ -292,17 +292,16 @@ pub fn compat_is_raw(pid: u64) -> bool {
 pub fn remove_compat(pid: u64) -> Option<CompatState> {
     COMPAT_STATES.lock().remove(&pid)
 }
-/// Whether a compat process/thread with this pid still exists (used by the
-/// shell's foreground wait after `lxrun`).
+/// Существует ли ещё compat-процесс/поток с этим pid (используется foreground-
+/// ожиданием шелла после `lxrun`).
 pub fn compat_exists(pid: u64) -> bool {
     COMPAT_STATES.lock().contains_key(&pid)
 }
-/// Notify `parent` that `child` changed state, matching Linux's SIGCHLD.
+/// Уведомить `parent`, что `child` сменил состояние, как SIGCHLD в Linux.
 ///
-/// This is a best-effort queue: a parent that is gone (or is not a compat
-/// process) simply does not receive the signal. The call happens after the
-/// registry locks are released, so `send_signal` may re-enter `COMPAT_STATES`
-/// safely.
+/// Очередь best-effort: ушедший (или не-compat) родитель просто не получает
+/// сигнал. Вызов идёт после отпускания локов реестра, поэтому `send_signal` может
+/// безопасно войти в `COMPAT_STATES` повторно.
 fn notify_parent_sigchld(parent: u64) {
     if parent == 0 {
         return;
@@ -320,17 +319,18 @@ pub fn finish_compat_exit(pid: u64) {
                 .lock()
                 .insert((state.ppid, pid), state.exit_code.unwrap_or(0));
         }
-        // An exit SUPERSEDES any pending stop/continue report for this child: the
-        // parent's next `wait4` must see the exit, not a stale "stopped" event.
+        // Выход ПЕРЕКРЫВАЕТ любой ожидающий отчёт о stop/continue для этого
+        // ребёнка: следующий `wait4` родителя должен увидеть выход, а не
+        // устаревшее событие «остановлен».
         clear_child_state_events(state.ppid, pid);
         notify_parent_sigchld(state.ppid);
     }
 }
-/// Consume one pending signal matching `mask` for signalfd.
+/// Потребить один ожидающий сигнал по `mask` для signalfd.
 ///
-/// Signalfd reads the process's pending set in mask order and clears the bit it
-/// returns, exactly like `read(2)` on a signalfd: the signal is not delivered
-/// through the normal handler path. `None` means nothing matching is pending.
+/// Signalfd читает pending-набор процесса в порядке маски и очищает бит,
+/// который вернул, точно как `read(2)` на signalfd: сигнал не доставляется через
+/// обычный путь обработчика. `None` — ничего подходящего не ожидает.
 pub fn take_signalfd_signal(mask: u64) -> Option<u64> {
     let mut states = COMPAT_STATES.lock();
     let state = states.get_mut(&crate::task::scheduler::current_pid())?;
@@ -343,15 +343,15 @@ pub fn take_signalfd_signal(mask: u64) -> Option<u64> {
     Some(signal)
 }
 
-/// Whether a signalfd with `mask` is readable right now.
+/// Читаем ли signalfd с `mask` прямо сейчас.
 ///
-/// MUST be called without `COMPAT_STATES` held. `with_current_compat` is
-/// non-reentrant: a caller already inside the registry (e.g. an fd-readiness
-/// check running under the lock) has to read `cs.sig_pending`/`cs.sig_blocked`
-/// from the state it already has instead of calling this helper. Round-3 audit
-/// F-r3-life-2 was exactly that re-entry through `epoll_wait`'s signalfd arm;
-/// the debug assert below turns any reintroduction into a loud failure in debug
-/// builds instead of a silent machine hang.
+/// ОБЯЗАН вызываться без удержания `COMPAT_STATES`. `with_current_compat`
+/// нереентерабелен: вызывающий, уже находящийся внутри реестра (например,
+/// проверка готовности fd под локом), должен читать `cs.sig_pending`/
+/// `cs.sig_blocked` из уже имеющегося состояния, а не звать этот хелпер.
+/// Повторный вход именно через signalfd-ветку `epoll_wait` давал тихое
+/// зависание машины; debug-assert ниже превращает любое повторное появление в
+/// громкий отказ debug-сборки.
 pub fn signalfd_readable(mask: u64) -> bool {
     debug_assert!(
         !compat_lock_held(),
@@ -388,22 +388,23 @@ pub fn has_child(parent: u64, wanted: i64) -> bool {
         .any(|(p, c)| *p == parent && child_matches(wanted, *c))
 }
 
-// ─── Child stop/continue events (`wait4` WUNTRACED / WCONTINUED) ─────────────
+// ─── события stop/continue детей (`wait4` WUNTRACED / WCONTINUED) ────────────
 //
-// `EXITED_CHILDREN` above carries exit codes only; the two registries here carry
-// the other two state changes `wait(2)` reports. Each event is reported AT MOST
-// ONCE and the report consumes it, which is what makes a `wait4(WUNTRACED)` loop
-// terminate instead of reporting the same stop forever. Lock order for all four
-// helpers below: STOPPED_CHILDREN, then CONTINUED_CHILDREN (never the reverse),
-// and never nested inside a `COMPAT_STATES` guard.
+// `EXITED_CHILDREN` выше несёт только коды выхода; два реестра здесь несут два
+// других изменения состояния, о которых сообщает `wait(2)`. Каждое событие
+// сообщается НЕ БОЛЕЕ ОДНОГО РАЗА, и отчёт его потребляет — именно поэтому цикл
+// `wait4(WUNTRACED)` завершается, а не повторяет один и тот же stop вечно.
+// Порядок локов для всех четырёх хелперов ниже: STOPPED_CHILDREN, затем
+// CONTINUED_CHILDREN (никогда наоборот), и никогда внутри guard'а
+// `COMPAT_STATES`.
 
-/// Children parked in the stopped state: `(parent, child) -> stop signal`.
+/// Дети в состоянии остановки: `(parent, child) -> сигнал остановки`.
 static STOPPED_CHILDREN: Spinlock<BTreeMap<(u64, u64), u8>> = Spinlock::new(BTreeMap::new());
-/// Children resumed by `SIGCONT` since their parent last asked: `(parent, child)`.
+/// Дети, возобновлённые `SIGCONT` после последнего запроса родителя: `(parent, child)`.
 static CONTINUED_CHILDREN: Spinlock<BTreeSet<(u64, u64)>> = Spinlock::new(BTreeSet::new());
 
-/// The parent a stop/continue report belongs to (`None` when the child has no
-/// compat state, or is not a waitable child).
+/// Родитель, которому принадлежит отчёт stop/continue (`None`, когда у ребёнка
+/// нет compat-состояния или он не waitable-ребёнок).
 fn reporting_parent(child: u64) -> Option<u64> {
     COMPAT_STATES
         .lock()
@@ -412,8 +413,8 @@ fn reporting_parent(child: u64) -> Option<u64> {
         .map(|cs| cs.ppid)
 }
 
-/// Record that `child` stopped on `sig`: its parent's next `wait4(WUNTRACED)`
-/// reports `wait_status_stopped(sig)`.
+/// Записать, что `child` остановился по `sig`: следующий `wait4(WUNTRACED)`
+/// родителя сообщит `wait_status_stopped(sig)`.
 pub fn note_child_stopped(child: u64, sig: u64) {
     let Some(parent) = reporting_parent(child) else {
         return;
@@ -423,13 +424,14 @@ pub fn note_child_stopped(child: u64, sig: u64) {
     notify_parent_sigchld(parent);
 }
 
-/// Record that `child` was resumed: its parent's next `wait4(WCONTINUED)`
-/// reports `0xffff`.
+/// Записать, что `child` возобновлён: следующий `wait4(WCONTINUED)` родителя
+/// сообщит `0xffff`.
 ///
-/// The caller only calls this for a child it has just taken out of the parked
-/// state (see `signal::resume_group`), so there is no "was it stopped?" check
-/// here — the child's stopped STATE lives in the scheduler (`STOPPED_TASKS`),
-/// while this registry carries only the *unreported event*.
+/// Вызывающий делает это только для ребёнка, которого только что вывел из
+/// припаркованного состояния (см. `signal::resume_group`), поэтому проверки «а
+/// был ли он остановлен?» здесь нет — СОСТОЯНИЕ остановки ребёнка живёт в
+/// планировщике (`STOPPED_TASKS`), а этот реестр несёт только *несообщённое
+/// событие*.
 pub fn note_child_continued(child: u64) {
     let Some(parent) = reporting_parent(child) else {
         return;
@@ -439,14 +441,16 @@ pub fn note_child_continued(child: u64) {
     notify_parent_sigchld(parent);
 }
 
-/// Drop every pending stop/continue report for `(parent, child)`: the child
-/// exited, so its exit status supersedes any state change it reported before.
+/// Убрать все ожидающие отчёты stop/continue для `(parent, child)`: ребёнок
+/// вышел, и его код выхода перекрывает любое ранее сообщённое изменение
+/// состояния.
 fn clear_child_state_events(parent: u64, child: u64) {
     STOPPED_CHILDREN.lock().remove(&(parent, child));
     CONTINUED_CHILDREN.lock().remove(&(parent, child));
 }
 
-/// Pop one pending stop report for `parent` matching `wanted`, consuming it.
+/// Извлечь один ожидающий отчёт об остановке для `parent`, подходящий под
+/// `wanted`, и потребить его.
 pub fn reap_child_stop(parent: u64, wanted: i64) -> Option<(u64, u8)> {
     let mut m = STOPPED_CHILDREN.lock();
     let k = m
@@ -456,7 +460,8 @@ pub fn reap_child_stop(parent: u64, wanted: i64) -> Option<(u64, u8)> {
     m.remove(&k).map(|sig| (k.1, sig))
 }
 
-/// Pop one pending continue report for `parent` matching `wanted`, consuming it.
+/// Извлечь один ожидающий отчёт о продолжении для `parent`, подходящий под
+/// `wanted`, и потребить его.
 pub fn reap_child_continued(parent: u64, wanted: i64) -> Option<u64> {
     let mut s = CONTINUED_CHILDREN.lock();
     let k = s
@@ -467,19 +472,19 @@ pub fn reap_child_continued(parent: u64, wanted: i64) -> Option<u64> {
     Some(k.1)
 }
 
-/// Is `child` currently reported as stopped (per the event registry)?
+/// Сообщается ли `child` сейчас как остановленный (по реестру событий)?
 pub fn child_is_stopped(child: u64) -> bool {
     STOPPED_CHILDREN.lock().keys().any(|(_, c)| *c == child)
 }
 
-// ─── Pending-bit surgery for the stop/continue magic ─────────────────────────
+// ─── правка pending-битов для магии stop/continue ───────────────────────────
 
-/// Clear every pending stop-class bit of `pid` (a `SIGCONT` generation does
-/// this). Returns `false` when the process is gone.
+/// Снять все ожидающие биты класса остановки у `pid` (это делает генерация
+/// `SIGCONT`). Возвращает `false`, когда процесса нет.
 ///
-/// `PENDING_APPROX` is deliberately NOT decremented: the counter is documented to
-/// overcount (it is an optimistic "is anything deliverable" guard), and
-/// overcounting only costs the real check on the next syscall return.
+/// `PENDING_APPROX` намеренно НЕ уменьшается: счётчик документированно завышает
+/// (это оптимистичный заслон «есть ли что доставить»), а завышение стоит лишь
+/// реальной проверки на следующем возврате из syscall.
 pub fn clear_stop_pending(pid: u64) -> bool {
     COMPAT_STATES
         .lock()
@@ -488,7 +493,7 @@ pub fn clear_stop_pending(pid: u64) -> bool {
         .is_some()
 }
 
-/// Clear a pending `SIGCONT` bit of `pid` (generating a stop signal does this).
+/// Снять ожидающий бит `SIGCONT` у `pid` (это делает генерация stop-сигнала).
 pub fn clear_cont_pending(pid: u64) -> bool {
     COMPAT_STATES
         .lock()
@@ -497,7 +502,7 @@ pub fn clear_cont_pending(pid: u64) -> bool {
         .is_some()
 }
 
-/// The pending bit set of `pid` (diagnostics + in-QEMU tests).
+/// Битсет ожидающих сигналов `pid` (диагностика + in-QEMU тесты).
 pub fn pending_of(pid: u64) -> u64 {
     COMPAT_STATES
         .lock()
@@ -506,11 +511,11 @@ pub fn pending_of(pid: u64) -> u64 {
         .unwrap_or(0)
 }
 
-/// Whether the currently-running process (per `scheduler::current_pid`) has a
-/// registered [`CompatState`] — i.e. is a Linux `Compat_Process` rather than a
-/// pagh-native task. The dispatcher uses this to decide precedence: a process
-/// with compat state gets full Linux syscall semantics; a native task without
-/// it keeps the legacy pagh-native routing.
+/// Клонировать compat-состояние текущего процесса для нового потока `child`.
+/// Его `tid` — новый pid, `tgid` — общий с группой, таблица диспозиций сигналов
+/// разделяется по `Arc` (Linux `CLONE_SIGHAND`), а fd-таблица и адресное
+/// пространство наследуются по семантике clone. Новый поток не наследует
+/// очередь сигналов: pending-набор начинается пустым.
 pub fn clone_current_compat(child: u64, tls: Option<u64>, clear_child_tid: u64) -> bool {
     let parent = super::scheduler::current_pid();
     let mut states = COMPAT_STATES.lock();
@@ -522,10 +527,10 @@ pub fn clone_current_compat(child: u64, tls: Option<u64>, clear_child_tid: u64) 
     child_state.waitable = false;
     child_state.clear_child_tid = clear_child_tid;
     child_state.exit_code = None;
-    // A new thread has no signals queued (Linux: the child's pending set starts
-    // empty; only the disposition table is shared with the group).
+    // У нового потока нет сигналов в очереди (в Linux pending-набор ребёнка
+    // стартует пустым; с группой разделяется только таблица диспозиций).
     child_state.sig_pending = 0;
-    // The entry path is per-thread: the new thread's first syscall decides.
+    // Входной путь у каждого потока свой: его определяет первый syscall нового потока.
     child_state.int80_entry = false;
     child_state.int80_refused_logged = false;
     if let Some(base) = tls {
@@ -535,11 +540,11 @@ pub fn clone_current_compat(child: u64, tls: Option<u64>, clear_child_tid: u64) 
     true
 }
 
-/// Clone the parent's full compat state for a forked child.
-/// The child becomes its own thread-group leader (tid = tgid = child pid), is
-/// waitable (a future wait4 zombie for the parent), and inherits the fd table
-/// (Arc-shared pipe/socket endpoints — Linux dup semantics), cwd, fs_base,
-/// raw_mode, robust-list registration, and exe_path.
+/// Клонировать полное compat-состояние родителя для форкнутого ребёнка.
+/// Ребёнок становится лидером собственной группы потоков (tid = tgid = pid
+/// ребёнка), waitable (будущий зомби wait4 для родителя) и наследует fd-таблицу
+/// (Arc-разделяемые концы pipe/сокетов — семантика Linux dup), cwd, fs_base,
+/// raw_mode, регистрацию robust-списка и exe_path.
 pub fn fork_current_compat(child: u64, clear_child_tid: u64) -> bool {
     let parent = super::scheduler::current_pid();
     let mut states = COMPAT_STATES.lock();
@@ -548,16 +553,16 @@ pub fn fork_current_compat(child: u64, clear_child_tid: u64) -> bool {
     };
     let parent_tgid = parent_state.tgid;
     let mut child_state = parent_state.clone();
-    // Fork: the child owns a private address space (deep-copied by
-    // `clone_user_space`), so give it a private copy of the mmap/brk tracking
-    // rather than sharing the parent's VmRegionSet.
+    // Fork: ребёнок владеет приватным адресным пространством (глубоко
+    // скопированным `clone_user_space`), поэтому получает приватную копию учёта
+    // mmap/brk, а не общий VmRegionSet родителя.
     {
         let vm_copy = child_state.vm.lock().clone();
         child_state.vm = Arc::new(Spinlock::new(vm_copy));
     }
-    // Fork deep-copies the signal-disposition table too (Linux: the child gets
-    // its own `struct sighand_struct`, unlike CLONE_SIGHAND thread clones,
-    // which share the parent's `Arc` via the `CompatState` clone above).
+    // Fork глубоко копирует и таблицу диспозиций сигналов (в Linux ребёнок
+    // получает свой `struct sighand_struct`, в отличие от thread-клонов
+    // CLONE_SIGHAND, делящих `Arc` родителя через клон `CompatState` выше).
     {
         let sig_copy = child_state.sig.lock().clone();
         child_state.sig = Arc::new(Spinlock::new(sig_copy));
@@ -568,9 +573,9 @@ pub fn fork_current_compat(child: u64, clear_child_tid: u64) -> bool {
     child_state.waitable = true;
     child_state.clear_child_tid = clear_child_tid;
     child_state.exit_code = None;
-    // Fork does not inherit queued signals (Linux: the child's pending set is
-    // empty even though it inherits the dispositions and the blocked mask), and
-    // its own first syscall decides the entry path observation.
+    // Fork не наследует поставленные в очередь сигналы (в Linux pending-набор
+    // ребёнка пуст, хотя диспозиции и маску блокировки он наследует), и его
+    // собственный первый syscall определяет наблюдение входного пути.
     child_state.sig_pending = 0;
     child_state.int80_entry = false;
     child_state.int80_refused_logged = false;
@@ -581,18 +586,18 @@ pub fn fs_base_for(pid: u64) -> Option<u64> {
     COMPAT_STATES.lock().get(&pid).map(|s| s.fs_base)
 }
 
-/// Snapshot of the CURRENT process's credentials, or [`Creds::ROOT`] for a
-/// native task (which has no compat state and no user-visible identity).
+/// Снимок креденшелов ТЕКУЩЕГО процесса или [`Creds::ROOT`] для нативной
+/// задачи (у неё нет compat-состояния и видимой пользователю идентичности).
 ///
-/// This is what the syscall-layer permission checks call: credentials are a
-/// property of the `Compat_Process`, never of the VFS node.
+/// Это то, что зовут проверки прав слоя syscall: креденшелы — свойство
+/// `Compat_Process`, никогда не узла VFS.
 pub fn current_creds() -> Creds {
     with_current_compat(|cs| cs.creds).unwrap_or(Creds::ROOT)
 }
 
-/// Replace the CURRENT process's credentials. Returns `false` when the caller
-/// has no compat state (a native task cannot change an identity it does not
-/// have).
+/// Заменить креденшелы ТЕКУЩЕГО процесса. Возвращает `false`, когда у
+/// вызывающего нет compat-состояния (нативная задача не может сменить
+/// идентичность, которой у неё нет).
 pub fn set_current_creds(creds: Creds) -> bool {
     with_current_compat(|cs| {
         cs.creds = creds;
@@ -600,9 +605,9 @@ pub fn set_current_creds(creds: Creds) -> bool {
     .is_some()
 }
 
-/// Credentials of an arbitrary registered process (used by `kill` to decide
-/// whether the caller may signal each target). `None` when `pid` is not a
-/// registered compat process/thread.
+/// Креденшелы произвольного зарегистрированного процесса (используются `kill`,
+/// чтобы решить, может ли вызывающий сигнализировать каждую цель). `None`, когда
+/// `pid` — не зарегистрированный compat-процесс/поток.
 pub fn creds_of(pid: u64) -> Option<Creds> {
     COMPAT_STATES.lock().get(&pid).map(|s| s.creds)
 }
@@ -615,8 +620,8 @@ pub fn current_clear_child_tid() -> u64 {
 pub fn current_robust_list() -> (u64, u64) {
     with_current_compat(|s| (s.robust_head, s.robust_len)).unwrap_or((0, 0))
 }
-/// Restored during the origin/main merge: futex cleanup on thread exit needs
-/// these by pid (not just for the current task).
+/// Восстановлено при слиянии origin/main: очистке futex при выходе потока это
+/// нужно по pid (не только для текущей задачи).
 pub fn clear_tid_for(pid: u64) -> u64 {
     COMPAT_STATES
         .lock()
@@ -639,14 +644,14 @@ pub fn group_member_pids(tgid: u64, except: u64) -> alloc::vec::Vec<u64> {
         .collect()
 }
 
-/// Every registered task of thread group `tgid`, the leader included, ascending
-/// (the registry is a `BTreeMap`, so iteration order is pid order).
+/// Все зарегистрированные задачи группы потоков `tgid`, включая лидера, по
+/// возрастанию (реестр — `BTreeMap`, порядок обхода = порядок pid).
 ///
-/// This is the live thread list behind `/proc/<tgid>/task` (and
-/// `/proc/self/task`): pagh models a thread as a registered pid whose
-/// [`CompatState::tgid`] is its process id, so "threads of p" is exactly "pids
-/// whose `tgid == p`". The result is a SNAPSHOT — the registry lock is released
-/// before the caller turns the pids into VFS nodes (AGENTS.md invariant 4).
+/// Это живой список потоков для `/proc/<tgid>/task` (и `/proc/self/task`): pagh
+/// моделирует поток как зарегистрированный pid, чей [`CompatState::tgid`] равен
+/// id процесса, поэтому «потоки p» — это ровно «pid, у которых `tgid == p`».
+/// Результат — СНИМОК: лок реестра отпускается до того, как вызывающий
+/// превращает pid в узлы VFS (AGENTS.md, инвариант 4).
 pub fn thread_group_pids(tgid: u64) -> alloc::vec::Vec<u64> {
     COMPAT_STATES
         .lock()
@@ -655,13 +660,10 @@ pub fn thread_group_pids(tgid: u64) -> alloc::vec::Vec<u64> {
         .collect()
 }
 
-/// Every registered pid in thread group `tgid`, the given pid included,
-/// ascending (the registry is a `BTreeMap`, so iteration order is pid order).
+/// Все зарегистрированные pid группы процессов `pgid`, по возрастанию.
 ///
-/// Every registered pid in process group `pgid`, ascending.
-///
-/// `kill(-pgid)`/`kill(0)` resolve their targets through this. The result is a
-/// SNAPSHOT: callers release the registry lock, then deliver (invariant 4).
+/// `kill(-pgid)`/`kill(0)` находят цели через это. Результат — СНИМОК:
+/// вызывающие отпускают лок реестра, затем доставляют сигналы (инвариант 4).
 pub fn group_pids(pgid: u64) -> alloc::vec::Vec<u64> {
     COMPAT_STATES
         .lock()
@@ -670,25 +672,25 @@ pub fn group_pids(pgid: u64) -> alloc::vec::Vec<u64> {
         .collect()
 }
 
-/// The caller's process group (falls back to its tgid).
+/// Группа процессов вызывающего (с откатом к его tgid).
 pub fn current_pgid() -> u64 {
     with_current_compat(|cs| cs.pgid).unwrap_or_else(current_tgid)
 }
 
-/// Set the process group of `pid`.
+/// Задать группу процессов `pid`.
 pub fn set_pgid(pid: u64, pgid: u64) {
     if let Some(state) = COMPAT_STATES.lock().get_mut(&pid) {
         state.pgid = pgid;
     }
 }
 
-/// The process group of `pid`, or `None` when it has no compat state.
+/// Группа процессов `pid` или `None`, когда у него нет compat-состояния.
 pub fn pgid_of(pid: u64) -> Option<u64> {
     COMPAT_STATES.lock().get(&pid).map(|s| s.pgid)
 }
 
-/// Mark `pid` as a terminal JOB: the shell handed it the controlling terminal
-/// (`lxrun`, `fg`). Only jobs are subject to terminal access control
+/// Пометить `pid` как терминальный JOB: шелл передал ему управляющий терминал
+/// (`lxrun`, `fg`). Управлению доступа к терминалу подлежат только job'ы
 /// ([`crate::drivers::tty::check_access`]).
 pub fn mark_tty_job(pid: u64) {
     if let Some(state) = COMPAT_STATES.lock().get_mut(&pid) {
@@ -696,7 +698,7 @@ pub fn mark_tty_job(pid: u64) {
     }
 }
 
-/// Is `pid` a terminal job? `false` for an unknown pid.
+/// Является ли `pid` терминальным job'ом? `false` для неизвестного pid.
 pub fn is_tty_job(pid: u64) -> bool {
     COMPAT_STATES
         .lock()
@@ -705,10 +707,10 @@ pub fn is_tty_job(pid: u64) -> bool {
         .unwrap_or(false)
 }
 
-/// Snapshot of `(pid, tgid)` for every registered compat process/thread, pid
-/// ascending. One lock acquisition for the whole target resolution of a
-/// `kill(-1)` broadcast, which must not iterate the registry while signals are
-/// being delivered into it.
+/// Снимок `(pid, tgid)` всех зарегистрированных compat-процессов/потоков по
+/// возрастанию pid. Одно взятие лока на весь поиск целей для широковещательного
+/// `kill(-1)`, который не должен обходить реестр, пока в него доставляются
+/// сигналы.
 pub fn compat_pid_tgid_snapshot() -> alloc::vec::Vec<(u64, u64)> {
     COMPAT_STATES
         .lock()
@@ -717,7 +719,7 @@ pub fn compat_pid_tgid_snapshot() -> alloc::vec::Vec<(u64, u64)> {
         .collect()
 }
 
-/// `tgid` of `pid` (falling back to `pid` itself when it has no compat state).
+/// `tgid` процесса `pid` (с откатом к самому `pid`, когда compat-состояния нет).
 pub fn tgid_of(pid: u64) -> u64 {
     COMPAT_STATES
         .lock()
@@ -726,8 +728,9 @@ pub fn tgid_of(pid: u64) -> u64 {
         .unwrap_or(pid)
 }
 
-/// Overwrite the recorded exit code of a still-registered process (used by the
-/// signal force-terminate path so `wait4` reports `128 + sig`).
+/// Перезаписать записанный код выхода ещё зарегистрированного процесса
+/// (используется путём принудительного завершения по сигналу, чтобы `wait4`
+/// сообщил `128 + sig`).
 pub fn set_exit_code_of(pid: u64, code: u8) -> bool {
     COMPAT_STATES
         .lock()
@@ -738,8 +741,8 @@ pub fn set_exit_code_of(pid: u64, code: u8) -> bool {
         .is_some()
 }
 
-/// Mark signal `sig` pending for process `pid`. Returns false when the process
-/// is gone (caller maps to `ESRCH`).
+/// Пометить сигнал `sig` ожидающим для процесса `pid`. Возвращает false, когда
+/// процесса нет (вызывающий отображает в `ESRCH`).
 pub fn set_pending(pid: u64, sig: u64) -> bool {
     COMPAT_STATES
         .lock()
@@ -750,12 +753,12 @@ pub fn set_pending(pid: u64, sig: u64) -> bool {
         .is_some()
 }
 
-/// Atomically pick the lowest-numbered deliverable signal for the CURRENT
-/// process (pending AND not blocked), clearing its pending bit.
+/// Атомарно выбрать доставимый сигнал с наименьшим номером для ТЕКУЩЕГО процесса
+/// (ожидает И не заблокирован), очистив его pending-бит.
 ///
-/// Returns the signal number, its disposition, the current blocked mask (the
-/// caller ORs the action's `sa_mask` into it for the handler's lifetime), and
-/// the registered alternate stack (for `SA_ONSTACK` placement).
+/// Возвращает номер сигнала, его диспозицию, текущую маску блокировки
+/// (вызывающий добавит в неё `sa_mask` действия на время работы обработчика) и
+/// зарегистрированный альтернативный стек (для размещения `SA_ONSTACK`).
 pub fn pick_pending_signal() -> Option<(u64, SignalAction, u64, SigAltStack)> {
     let pid = super::scheduler::current_pid();
     let mut states = COMPAT_STATES.lock();
@@ -764,36 +767,36 @@ pub fn pick_pending_signal() -> Option<(u64, SignalAction, u64, SigAltStack)> {
     if deliverable == 0 {
         return None;
     }
-    // `sigbit(N)` is `1 << (N - 1)`, so the signal number is the index of the
-    // lowest set bit PLUS ONE. Without the +1 this delivered signal N-1 with
-    // N-1's disposition (the real bit stayed pending and was re-picked on every
-    // syscall return), and a pending SIGHUP underflowed `sig - 1` into an
-    // out-of-bounds disposition-table index — a kernel panic (`panic = "abort"`)
-    // on an ordinary self-signal.
+    // `sigbit(N)` — это `1 << (N - 1)`, поэтому номер сигнала — индекс младшего
+    // установленного бита ПЛЮС ОДИН. Без +1 доставлялся сигнал N-1 с
+    // диспозицией N-1 (настоящий бит оставался ожидающим и выбирался заново на
+    // каждом возврате из syscall), а ожидающий SIGHUP заворачивал `sig - 1` в
+    // индекс таблицы диспозиций вне диапазона — паника ядра при обычном
+    // self-signal.
     let sig = deliverable.trailing_zeros() as u64 + 1;
     cs.sig_pending &= !(1u64 << (sig - 1));
     let action = cs.sig.lock().handlers[(sig - 1) as usize];
     Some((sig, action, cs.sig_blocked, cs.sig_altstack))
 }
 
-/// Run `f` against the [`CompatState`] of `pid` (any process, not just the
-/// current one), returning `None` when that pid has no compat state.
+/// Выполнить `f` над [`CompatState`] процесса `pid` (любого, не только текущего),
+/// вернув `None`, когда у этого pid нет compat-состояния.
 ///
-/// The lock is held for the duration of `f` (the same rule as
-/// [`with_current_compat`]: `f` must not block or re-enter the registry).
+/// Лок держится всё время `f` (то же правило, что у [`with_current_compat`]: `f`
+/// не должен блокироваться или повторно входить в реестр).
 pub fn with_pid_compat<R>(pid: u64, f: impl FnOnce(&mut CompatState) -> R) -> Option<R> {
     COMPAT_STATES.lock().get_mut(&pid).map(f)
 }
 
-/// The lowest-numbered deliverable signal for the CURRENT process WITHOUT
-/// consuming it: `(signal, disposition, blocked mask, altstack)`.
+/// Доставимый сигнал с наименьшим номером для ТЕКУЩЕГО процесса БЕЗ потребления:
+/// `(сигнал, диспозиция, маска блокировки, altstack)`.
 ///
-/// The timer-tick delivery needs this to decide what a pending signal WOULD do
-/// (terminate? stop? frame delivery?) before it consumes the bit, because a bit
-/// consumed on a frame it cannot write into (a task interrupted inside a syscall)
-/// would be lost for good — nothing re-queues a signal.
+/// Доставке с тика это нужно, чтобы решить, что ожидающий сигнал СДЕЛАЕТ
+/// (завершит? остановит? доставит фрейм?), до потребления бита: бит, потреблённый
+/// на фрейме, в который нельзя записать (задача прервана внутри syscall), был бы
+/// потерян навсегда — сигнал никто не переставит в очередь.
 ///
-/// The signal number is the index of the lowest set bit PLUS ONE: `sigbit(N)` is
+/// Номер сигнала — индекс младшего установленного бита ПЛЮС ОДИН: `sigbit(N)` —
 /// `1 << (N - 1)`.
 pub fn peek_deliverable_signal() -> Option<(u64, SignalAction, u64, SigAltStack)> {
     let pid = super::scheduler::current_pid();
@@ -808,17 +811,16 @@ pub fn peek_deliverable_signal() -> Option<(u64, SignalAction, u64, SigAltStack)
     Some((sig, action, cs.sig_blocked, cs.sig_altstack))
 }
 
-/// Block `mask` in the CURRENT process for the handler's lifetime (the
-/// pre-delivery mask is already saved inside the frame; `rt_sigreturn`
-/// reinstates it).
+/// Заблокировать `mask` в ТЕКУЩЕМ процессе на время работы обработчика
+/// (маска до доставки уже сохранена во фрейме; `rt_sigreturn` её восстановит).
 pub fn block_during_handler(mask: u64) {
     with_current_compat(|cs| {
         cs.sig_blocked |= mask & !crate::arch::x86_64::linux::signal_frame::UNBLOCKABLE_MASK
     });
 }
 
-/// Disposition currently installed for `sig` in the CURRENT process
-/// (`None` when the process has no compat state).
+/// Диспозиция, установленная сейчас для `sig` в ТЕКУЩЕМ процессе (`None`, когда
+/// у процесса нет compat-состояния).
 pub fn current_action(sig: u64) -> Option<SignalAction> {
     COMPAT_STATES
         .lock()
@@ -831,21 +833,21 @@ pub fn current_has_compat() -> bool {
     COMPAT_STATES.lock().contains_key(&pid)
 }
 
-/// Record that the CURRENT process entered a syscall through `int 0x80`
-/// (AGENTS.md invariant 2 violation for a Compat_Process). No-op for a native
-/// task — it has no compat state to mark.
+/// Записать, что ТЕКУЩИЙ процесс вошёл в syscall через `int 0x80` (нарушение
+/// инварианта 2 из AGENTS.md для Compat_Process). No-op для нативной задачи — у
+/// неё нет compat-состояния, чтобы пометить.
 pub fn note_int80_entry() {
     with_current_compat(|cs| cs.int80_entry = true);
 }
 
-/// Has the CURRENT process been observed on the `int 0x80` entry path?
+/// Замечен ли ТЕКУЩИЙ процесс на входном пути `int 0x80`?
 pub fn current_int80_entry() -> bool {
     with_current_compat(|cs| cs.int80_entry).unwrap_or(false)
 }
 
-/// Mark the int80-entry delivery refusal as reported for the CURRENT process.
-/// Returns `true` on the first call, so the diagnostic is logged once per
-/// process instead of on every syscall return.
+/// Пометить отказ доставки при входе через int80 как сообщённый для ТЕКУЩЕГО
+/// процесса. Возвращает `true` при первом вызове, чтобы диагностика логировалась
+/// раз на процесс, а не на каждом возврате из syscall.
 pub fn note_int80_refused() -> bool {
     with_current_compat(|cs| {
         let first = !cs.int80_refused_logged;
@@ -855,13 +857,13 @@ pub fn note_int80_refused() -> bool {
     .unwrap_or(false)
 }
 
-/// Run `f` against the currently-running process's [`CompatState`], returning
-/// `Some(f(..))` when that process has registered compat state and `None`
-/// otherwise (e.g. a native task, or before `install_compat`).
+/// Выполнить `f` над [`CompatState`] текущего процесса, вернув `Some(f(..))`,
+/// когда у процесса зарегистрировано compat-состояние, и `None` иначе (например,
+/// нативная задача или состояние до `install_compat`).
 ///
-/// The `COMPAT_STATES` lock is held for the duration of `f`, so `f` must not
-/// block on a device interrupt (see the [`COMPAT_STATES`] note) nor call back
-/// into [`with_current_compat`] (which would deadlock on the same lock).
+/// Лок `COMPAT_STATES` держится всё время `f`, поэтому `f` не должен
+/// блокироваться на прерывании устройства (см. заметку о [`COMPAT_STATES`]) и не
+/// должен звать [`with_current_compat`] повторно (дедлок на том же локе).
 pub fn with_current_compat<R>(f: impl FnOnce(&mut CompatState) -> R) -> Option<R> {
     let pid = super::scheduler::current_pid();
     COMPAT_DEPTH.fetch_add(1, Ordering::Relaxed);
@@ -873,14 +875,14 @@ pub fn with_current_compat<R>(f: impl FnOnce(&mut CompatState) -> R) -> Option<R
     out
 }
 
-/// Reentrance depth of [`with_current_compat`] on this (single) CPU. The
-/// page-fault handler consults it: a fault raised INSIDE a
-/// `with_current_compat` closure (kernel code touching user memory under the
-/// lock) must not re-enter the registry — the spinlock is not reentrant and a
-/// second `lock()` would deadlock the CPU.
+/// Глубина повторного входа [`with_current_compat`] на этом (единственном) CPU.
+/// Её смотрит обработчик page fault: отказ, случившийся ВНУТРИ замыкания
+/// `with_current_compat` (код ядра трогает память пользователя под локом), не
+/// должен повторно входить в реестр — спинлок не реентерабелен, и второй
+/// `lock()` заблокировал бы CPU.
 static COMPAT_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether the current context is already inside [`with_current_compat`].
+/// Находится ли текущий контекст уже внутри [`with_current_compat`].
 pub fn compat_lock_held() -> bool {
     COMPAT_DEPTH.load(Ordering::Relaxed) > 0
 }

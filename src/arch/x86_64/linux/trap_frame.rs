@@ -1,80 +1,80 @@
-//! Pure mirror of the frame `task::switch::irq32_stub` leaves on the kernel stack,
-//! plus the byte-level plan for delivering a signal from the timer-tick return
-//! path.
+//! Чистое зеркало фрейма, который `task::switch::irq32_stub` оставляет на стеке
+//! ядра, плюс байтовый план доставки сигнала с пути возврата тика таймера.
 //!
-//! ## Why this module exists (and why the `SavedRegs` cast is forbidden)
+//! ## Зачем модуль (и почему приведение к `SavedRegs` запрещено)
 //!
-//! The tick handler receives `current_rsp`, the RSP right after `irq32_stub`
-//! pushed its frame:
+//! Обработчик тика получает `current_rsp` — RSP сразу после того, как
+//! `irq32_stub` положил свой фрейм:
 //!
 //! ```text
-//!   [rsp+0]    RFLAGS consumed by `popfq` (0x002: IF stays masked until `iretq`)
-//!   [+8..+127] 15 GPRs in SavedRegs field order: r15@+8 … rax@+120
-//!   [+128]     RIP     (the interrupted instruction)
-//!   [+136]     CS      (RPL 3 = the task was in ring 3 when it was interrupted)
-//!   [+144]     RFLAGS  (the interrupted user RFLAGS)
-//!   [+152]     RSP     (the interrupted user RSP)
+//!   [rsp+0]    RFLAGS, снимаемый `popfq` (0x002: IF замаскирован до `iretq`)
+//!   [+8..+127] 15 GPR в порядке полей SavedRegs: r15@+8 … rax@+120
+//!   [+128]     RIP     (прерванная инструкция)
+//!   [+136]     CS      (RPL 3 = задача была в ring 3, когда её прервали)
+//!   [+144]     RFLAGS  (прерванный пользовательский RFLAGS)
+//!   [+152]     RSP     (прерванный пользовательский RSP)
 //!   [+160]     SS
 //! ```
 //!
-//! The word at `+120` is `rax` — NOT the per-task user-RSP slot of the syscall
-//! frame, which lives at `SavedRegs + 120` (i.e. `+128` here). Casting
-//! `(current_rsp + 8) as *mut SavedRegs` and calling the syscall-path delivery
-//! would therefore read the user's `rax` as a user stack pointer, write the frame
-//! base into `rax`, and rewrite `rcx`/`r11` — which `iretq`, unlike `sysretq`,
-//! never consumes: the handler would not run and the `rt_sigframe` would land on
-//! whatever address `rax` happened to hold. This module is the typed, asserted
-//! alternative; the two adapters (syscall frame vs IRQ frame) share only the
-//! pure `signal_frame` encoder.
+//! Слово по `+120` — это `rax`, а НЕ per-task слот user-RSP syscall-фрейма,
+//! который живёт по `SavedRegs + 120` (то есть `+128` здесь). Приведение
+//! `(current_rsp + 8) as *mut SavedRegs` и вызов syscall-пути доставки прочитали
+//! бы пользовательский `rax` как указатель на пользовательский стек, записали бы
+//! базу фрейма в `rax` и переписали `rcx`/`r11` — которые `iretq`, в отличие от
+//! `sysretq`, никогда не потребляет: обработчик не запустился бы, а `rt_sigframe`
+//! лёг бы по случайному адресу из `rax`. Этот модуль — типизированная, проверяемая
+//! альтернатива; два адаптера (syscall-фрейм и IRQ-фрейм) делят только чистый
+//! кодировщик `signal_frame`.
 //!
-//! ## Contract with `src/test.rs`
+//! ## Контракт с `src/test.rs`
 //!
-//! `scheduler_layout_tests` asserts the same layout byte-for-byte with sentinel
-//! values (word indices 0 = popfq, 10 = rdi, 16 = RIP, 19 = RSP); the `const`
-//! assertions at the bottom of this file pin the SAME offsets against the real
-//! `SavedRegs` type, so a reordering of either side stops the build.
+//! `scheduler_layout_tests` проверяет ту же раскладку побайтно на сентинел-
+//! значениях (индексы слов 0 = popfq, 10 = rdi, 16 = RIP, 19 = RSP); `const`
+//! проверки в конце файла закрепляют ТЕ ЖЕ смещения против реального типа
+//! `SavedRegs`, поэтому перестановка любой стороны ломает сборку.
 #![allow(dead_code)]
 
 use super::regs::SavedRegs;
 use super::signal_frame::{SigFrameRegs, SIGINFO_OFFSET, UC_OFFSET};
 
-/// The complete 21-word frame `irq32_stub` builds (168 bytes).
+/// Полный 21-словный фрейм, который строит `irq32_stub` (168 байт).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IrqFrame {
-    /// `+0`: the RFLAGS word the restore path consumes with `popfq`. It stays
-    /// `0x002` (IF masked) for the whole restore tail — `iretq` restores the real
-    /// user IF from [`IrqFrame::rflags`]. Never set IF here: the window between
-    /// `popfq` and `iretq` must not be interruptible.
+    /// `+0`: слово RFLAGS, снимаемое путём восстановления через `popfq`. Оно
+    /// остаётся `0x002` (IF замаскирован) на весь хвост восстановления — `iretq`
+    /// восстанавливает настоящий пользовательский IF из [`IrqFrame::rflags`].
+    /// Никогда не ставить IF здесь: окно между `popfq` и `iretq` не должно быть
+    /// прерываемым.
     pub popfq_rflags: u64,
-    /// `+8 .. +127`: the 15 GPRs, in `SavedRegs` order (`r15` lowest, `rax` at
-    /// absolute `+120`).
+    /// `+8 .. +127`: 15 GPR в порядке `SavedRegs` (`r15` младший, `rax` по
+    /// абсолютному `+120`).
     pub gpr: SavedRegs,
-    /// `+128`: the interrupted RIP.
+    /// `+128`: прерванный RIP.
     pub rip: u64,
-    /// `+136`: the interrupted CS.
+    /// `+136`: прерванный CS.
     pub cs: u64,
-    /// `+144`: the interrupted RFLAGS.
+    /// `+144`: прерванный RFLAGS.
     pub rflags: u64,
-    /// `+152`: the interrupted RSP.
+    /// `+152`: прерванный RSP.
     pub rsp: u64,
-    /// `+160`: the interrupted SS.
+    /// `+160`: прерванный SS.
     pub ss: u64,
 }
 
 impl IrqFrame {
-    /// Was the task interrupted in ring 3? Only then does the frame carry a user
-    /// context that an `rt_sigframe` may be built from: for a task preempted
-    /// inside a syscall the CS is a kernel selector and the user context lives in
-    /// the syscall entry frame up-stack, reachable only through that syscall's
-    /// return epilogue (or its `EINTR` checks).
+    /// Была ли задача прервана в ring 3? Только тогда фрейм несёт пользовательский
+    /// контекст, из которого можно построить `rt_sigframe`: у задачи, вытесненной
+    /// внутри syscall, CS — ядерный селектор, а пользовательский контекст живёт в
+    /// фрейме входа syscall выше по стеке и достижим только через эпилог возврата
+    /// этого syscall (или его проверки `EINTR`).
     #[inline]
     pub fn is_user_frame(&self) -> bool {
         self.cs & 3 == 3 && self.cs != 0
     }
 
-    /// The user context this frame describes, in the shape
-    /// [`super::signal_frame::encode_rt_sigframe`] consumes.
+    /// Пользовательский контекст, который описывает этот фрейм, в форме, которую
+    /// потребляет [`super::signal_frame::encode_rt_sigframe`].
     pub fn user_context(&self) -> SigFrameRegs {
         SigFrameRegs {
             r8: self.gpr.r8,
@@ -98,13 +98,13 @@ impl IrqFrame {
         }
     }
 
-    /// Enter `handler` at the next `iretq`: the exact in-place mutation set.
+    /// Войти в `handler` на ближайшем `iretq`: точный набор мутаций на месте.
     ///
-    /// `rax` (the live user `rax`, which is also the `sigcontext.rax` the
-    /// `rt_sigreturn` will restore), `cs`, `ss` and the `popfq` word are NOT
-    /// touched — the handler runs in ring 3, on the user stack, with a clean
-    /// user RFLAGS, and the interrupted context is reachable only through the
-    /// `rt_sigframe` written at `frame_addr`.
+    /// `rax` (живой пользовательский `rax`, он же `sigcontext.rax`, который
+    /// восстановит `rt_sigreturn`), `cs`, `ss` и слово для `popfq` НЕ трогаются —
+    /// обработчик выполняется в ring 3, на пользовательском стеке, с чистым
+    /// пользовательским RFLAGS, а прерванный контекст достижим только через
+    /// `rt_sigframe`, записанный по `frame_addr`.
     pub fn enter_handler(&mut self, plan: &IrqDelivery) {
         self.rip = plan.rip;
         self.rflags = plan.rflags;
@@ -115,14 +115,15 @@ impl IrqFrame {
     }
 }
 
-/// Where the handler must be entered, and with which argument registers.
+/// Куда входить в обработчик и с какими регистрами-аргументами.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IrqDelivery {
-    /// `sa_handler` — the `iretq` target.
+    /// `sa_handler` — цель `iretq`.
     pub rip: u64,
-    /// Clean user RFLAGS (`IF` set, reserved bit 1 set).
+    /// Чистый пользовательский RFLAGS (`IF` установлен, зарезервированный бит 1
+    /// установлен).
     pub rflags: u64,
-    /// The `rt_sigframe` base (≡ 8 mod 16, `pretcode` at its first word).
+    /// База `rt_sigframe` (≡ 8 mod 16, `pretcode` в её первом слове).
     pub rsp: u64,
     /// `signo`.
     pub rdi: u64,
@@ -130,14 +131,14 @@ pub struct IrqDelivery {
     pub rsi: u64,
     /// `&ucontext`.
     pub rdx: u64,
-    /// The signal this delivery carries — kept explicitly so the handler-entry
-    /// plan can be checked against the pending bit's signal (the off-by-one class:
-    /// delivering signal N-1 for a pending N).
+    /// Сигнал, который несёт эта доставка — явно, чтобы план входа в обработчик
+    /// можно было сверить с сигналом pending-бита (класс off-by-one: доставка
+    /// сигнала N-1 для ожидающего N).
     pub sig: u64,
 }
 
-/// Build the delivery plan for `sig` handled by `handler`, whose `rt_sigframe`
-/// starts at `frame_addr`.
+/// Построить план доставки для `sig`, обрабатываемого `handler`, чей
+/// `rt_sigframe` начинается по `frame_addr`.
 pub fn plan_irq_delivery(frame_addr: u64, sig: u64, handler: u64, user_rflags: u64) -> IrqDelivery {
     IrqDelivery {
         rip: handler,
@@ -150,42 +151,44 @@ pub fn plan_irq_delivery(frame_addr: u64, sig: u64, handler: u64, user_rflags: u
     }
 }
 
-// ─── Page-fault disposition policy (F-x86a-4 backstop) ───────────────────────
+// ─── политика обработки page fault (заслон read-only COW) ───────────────────
 
-/// What the page-fault handler must do with a fault the demand-paging path
-/// could not service.
+/// Что обработчик page fault обязан сделать с отказом, который путь
+/// demand-paging не смог обслужить.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageFaultAction {
-    /// Terminate only the faulting Compat_Process; the machine keeps running.
+    /// Завершить только виновный Compat_Process; машина продолжает работать.
     KillProcess,
-    /// Dump the faulting frame and halt: a genuine kernel fault must stay fatal.
+    /// Напечатать фрейм отказа и остановиться: настоящий отказ ядра должен
+    /// оставаться фатальным.
     Halt,
 }
 
-/// Decide the disposition of a page fault `mem_sys::handle_user_page_fault`
-/// refused.
+/// Решить судьбу page fault, который отказался обслужить
+/// `mem_sys::handle_user_page_fault`.
 ///
-/// `user_mode` mirrors `PageFaultErrorCode::USER_MODE` (the faulting CS was ring
-/// 3), `fault_addr` is CR2, `user_addr_max` the exclusive user-half bound and
-/// `current_is_compat` says whether the CPU is running a Linux compat process.
+/// `user_mode` зеркалит `PageFaultErrorCode::USER_MODE` (отказ пришёл из ring 3),
+/// `fault_addr` — CR2, `user_addr_max` — исключающая граница пользовательской
+/// половины, а `current_is_compat` говорит, выполняется ли Linux compat-процесс.
 ///
-/// Ring-3 faults keep their historical rule: a compat process is killed, any
-/// other task takes the fatal path. The case this policy adds is a **ring-0
-/// fault on a user address**: a syscall handler read or wrote a user buffer that
-/// a sibling `CLONE_VM` thread unmapped after the entry-time validation
-/// (F-x86a-4). That is never worth a machine halt — kill the process that
-/// triggered it. A ring-0 fault on a *kernel* address, by contrast, is a real
-/// kernel bug (the LIEDTKE case the handler exists for) and still halts, so the
-/// backstop cannot silently swallow one.
+/// Отказы ring 3 сохраняют прежнее правило: compat-процесс убивается, любая
+/// другая задача идёт фатальным путём. Этот политика добавляет случай **отказа
+/// ring 0 на пользовательском адресе**: обработчик syscall читал или писал
+/// пользовательский буфер, который поток-сосед по `CLONE_VM` снял после проверки
+/// на входе. Это никогда не стоит остановки машины — убиваем процесс, который это
+/// вызвал. Отказ ring 0 на *ядерном* адресе, напротив, — настоящая ошибка ядра
+/// (случай LIEDTKE, для которого обработчик и существует), и он по-прежнему
+/// останавливает машину, так что заслон не может молча её проглотить.
 pub fn page_fault_action(
     user_mode: bool,
     fault_addr: u64,
     user_addr_max: u64,
     current_is_compat: bool,
 ) -> PageFaultAction {
-    // The first page is never mappable in this kernel (`mmap(0,...)` is
-    // rejected), so a ring-0 fault at address ~0 is a kernel NULL-pointer bug,
-    // not a user-buffer race: it must stay fatal, not be blamed on a process.
+    // Первая страница в этом ядре никогда не отображается (`mmap(0,...)`
+    // отвергается), поэтому отказ ring 0 по адресу ~0 — баг NULL-указателя ядра,
+    // а не гонка за пользовательским буфером: он должен остаться фатальным, а не
+    // списан на процесс.
     const MIN_USER_FAULT_ADDR: u64 = 4096;
     let on_user_address = (MIN_USER_FAULT_ADDR..user_addr_max).contains(&fault_addr);
     if (user_mode || on_user_address) && current_is_compat {
@@ -195,35 +198,37 @@ pub fn page_fault_action(
     }
 }
 
-// ─── CPU-exception disposition policy (F-r3-arch-1) ─────────────────────────
+// ─── политика обработки синхронных исключений CPU ───────────────────────────
 
-/// What a synchronous CPU-exception handler (#DE/#DB/#UD/#OF/#BR/#NM/#AC/#MF/#XM)
-/// must do when the exception is not one the kernel itself expects.
+/// Что обработчик синхронного исключения CPU (#DE/#DB/#UD/#OF/#BR/#NM/#AC/#MF/#XM)
+/// обязан сделать, когда исключение не ожидается самим ядром.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrapAction {
-    /// Terminate only the faulting Compat_Process; the machine keeps running.
+    /// Завершить только виновный Compat_Process; машина продолжает работать.
     KillProcess,
-    /// Dump what the handler logged and halt: an exception in ring 0 is a
-    /// genuine kernel bug (or hardware failure) and must stay fatal.
+    /// Напечатать, что залогировал обработчик, и остановиться: исключение в
+    /// ring 0 — настоящий баг ядра (или отказ железа) и должен оставаться
+    /// фатальным.
     Halt,
 }
 
-/// Decide the disposition of a synchronous CPU exception.
+/// Решить судьбу синхронного исключения CPU.
 ///
-/// F-r3-arch-1 (round-3 audit, high): only `#GP` and `#PF` implemented the
-/// "a user-mode exception is a userspace bug, not a machine fault" rule; every
-/// other user-reachable vector ended in `halt()`, so `1/0`, `ud2` or a
-/// ring-3 `popfq` with TF set parked the whole machine from an unprivileged
-/// process. The rule here is the same one `#GP`/`#PF` use: if the faulting
-/// context is ring 3 (or the saved RIP is a user address) **and** the current
-/// task is a Linux Compat_Process, kill only that process; otherwise halt.
+/// Только `#GP` и `#PF` реализовывали правило «исключение пользовательского
+/// режима — баг userspace, а не отказ машины»; любой другой достижимый из
+/// пользователя вектор заканчивался `halt()`, поэтому `1/0`, `ud2` или ring-3
+/// `popfq` с TF парковали всю машину из непривилегированного процесса. Правило
+/// здесь то же, что у `#GP`/`#PF`: если контекст отказа — ring 3 (или
+/// сохранённый RIP — пользовательский адрес) **и** текущая задача — Linux
+/// Compat_Process, убить только этот процесс; иначе остановиться.
 ///
-/// `user_mode` is derived from the saved CS RPL; `fault_rip < user_addr_max`
-/// is the same user-address check the `#GP`/`#PF` paths apply. Both are needed:
-/// a kernel-mode exception on a user RIP (e.g. a future emulation path) should
-/// not take the machine down, while an exception in ring 0 on a kernel RIP is
-/// exactly the case that must remain fatal. Only a compat task can be killed;
-/// a native kernel task has no Compat_Process to terminate, so it stays fatal.
+/// `user_mode` выводится из RPL сохранённого CS; `fault_rip < user_addr_max` —
+/// та же проверка пользовательского адреса, что применяют пути `#GP`/`#PF`. Нужны
+/// обе: исключение в режиме ядра на пользовательском RIP (например, будущий путь
+/// эмуляции) не должно ронять машину, а исключение ring 0 на ядерном RIP — ровно
+/// случай, который обязан остаться фатальным. Убить можно только compat-задачу;
+/// у нативной ядерной задачи нет Compat_Process для завершения, поэтому она
+/// остаётся фатальной.
 pub fn exception_action(
     user_mode: bool,
     fault_rip: u64,
@@ -238,11 +243,11 @@ pub fn exception_action(
     }
 }
 
-// ─── Layout assertions (the `src/test.rs` contract, in type form) ─────────────
+// ─── проверки раскладки (контракт `src/test.rs` в типовой форме) ─────────────
 
 const _: () = {
     use core::mem::{offset_of, size_of};
-    // The whole frame: 1 popfq word + 15 GPRs + RIP/CS/RFLAGS/RSP/SS.
+    // Весь фрейм: 1 слово popfq + 15 GPR + RIP/CS/RFLAGS/RSP/SS.
     assert!(size_of::<IrqFrame>() == 21 * 8);
     assert!(offset_of!(IrqFrame, popfq_rflags) == 0);
     assert!(offset_of!(IrqFrame, gpr) == 8);
@@ -251,9 +256,9 @@ const _: () = {
     assert!(offset_of!(IrqFrame, rflags) == 144);
     assert!(offset_of!(IrqFrame, rsp) == 152);
     assert!(offset_of!(IrqFrame, ss) == 160);
-    // `SavedRegs` field offsets inside the GPR block. `rax` at absolute +120 is
-    // the trap this module exists for: it is NOT the syscall frame's user-RSP
-    // slot (which is at `SavedRegs + 120`).
+    // Смещения полей `SavedRegs` внутри блока GPR. `rax` по абсолютному +120 —
+    // та самая ловушка, для которой существует этот модуль: это НЕ per-task слот
+    // user-RSP syscall-фрейма (тот по `SavedRegs + 120`).
     assert!(size_of::<SavedRegs>() == 15 * 8);
     assert!(offset_of!(SavedRegs, r15) == 0);
     assert!(offset_of!(SavedRegs, rax) == 112);

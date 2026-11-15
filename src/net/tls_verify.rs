@@ -1,60 +1,56 @@
-//! Signature verification for the X.509 certificate verifier (issue #14
-//! series) — pure `core` + `alloc`, panic-free, self-contained.
+//! Проверка подписей для верификатора X.509-сертификатов (серия issue #14) —
+//! чистый `core` + `alloc`, panic-free, самодостаточный.
 //!
-//! `verify_certificate_signature` dispatches on the certificate's
-//! `tbsCertificate.signature` AlgorithmIdentifier OID (validated to equal the
-//! outer field by `x509::parse_certificate`) and checks the raw
-//! `signatureValue` bytes (from [`CertificateRef::signature`]) over the exact
-//! `tbs` bytes against the ISSUER's public key ([`SpkiKey`] from the issuer
-//! certificate's SPKI). No kernel services, no RNG, no host calls.
+//! `verify_certificate_signature` диспетчеризует по OID AlgorithmIdentifier из
+//! `tbsCertificate.signature` (валидируется на равенство внешнему полю через
+//! `x509::parse_certificate`) и проверяет сырые байты `signatureValue` (из
+//! [`CertificateRef::signature`]) над точными байтами `tbs` публичным ключом
+//! ЭМИТЕНТА ([`SpkiKey`] из SPKI сертификата эмитента). Без сервисов ядра, RNG и
+//! host-вызовов.
 //!
-//! Supported surface (each mapping is fixed, no algorithm agility beyond it):
+//! Поддерживаемая поверхность (каждое отображение фиксировано, без
+//! algorithm agility сверх неё):
 //!   * `sha256WithRSAEncryption` / `sha384WithRSAEncryption` /
-//!     `sha512WithRSAEncryption` — RSASSA-PKCS1-v1_5 over an RSA SPKI;
-//!   * `ecdsa-with-SHA256` — ECDSA (P-256) over an `ecPublicKey/prime256v1` SPKI;
-//!   * `ecdsa-with-SHA384` — ECDSA (P-384) over an `ecPublicKey/secp384r1` SPKI;
-//!   * `Ed25519` — pure Ed25519 over a raw 32-byte SPKI key.
+//!     `sha512WithRSAEncryption` — RSASSA-PKCS1-v1_5 над RSA SPKI;
+//!   * `ecdsa-with-SHA256` — ECDSA (P-256) над `ecPublicKey/prime256v1` SPKI;
+//!   * `ecdsa-with-SHA384` — ECDSA (P-384) над `ecPublicKey/secp384r1` SPKI;
+//!   * `Ed25519` — чистый Ed25519 над сырым 32-байтовым SPKI-ключом.
 //!
-//! Fail-closed rules:
-//!   * RSA-PSS certificates (`rsaEncryption`-family PSS OID) are explicitly
-//!     REJECTED: the scheme lives in the AlgorithmIdentifier parameters, and
-//!     mis-parsed PSS parameters are a classic downgrade vector. Real Debian
-//!     mirror chains are PKCS1-v1_5 or ECDSA, so availability is unaffected;
-//!     PSS support is a documented follow-up, not a lax fallback.
-//!   * RSA moduli below 2048 bits are rejected (`MalformedKey`) regardless of
-//!     signature validity (NIST SP 800-57 / CA/B minimum).
-//!   * Any key/signature shape mismatch between the algorithm OID and the
-//!     SPKI key type is a hard error (`KeyTypeMismatch`), never a lax try.
+//! Правила fail-closed:
+//!   * RSA-PSS-сертификаты (PSS OID семейства `rsaEncryption`) явно ОТВЕРГАЮТСЯ:
+//!     схема живёт в параметрах AlgorithmIdentifier, а неверно разобранные
+//!     PSS-параметры — классический вектор downgrade. Реальные цепочки Debian-
+//!     зеркал — PKCS1-v1_5 или ECDSA, так что доступность не страдает;
+//!     поддержка PSS — задокументированный follow-up, не мягкий fallback.
+//!   * RSA-модули меньше 2048 бит отвергаются (`MalformedKey`) независимо от
+//!     валидности подписи (минимум NIST SP 800-57 / CA/B).
+//!   * Любое несоответствие формы ключа/подписи между OID алгоритма и типом
+//!     ключа SPKI — жёсткая ошибка (`KeyTypeMismatch`), никогда не мягкая попытка.
 //!
-//! ## TLS 1.3 CertificateVerify backends
+//! Кроме подписей X.509-цепочки модуль также проверяет сообщение TLS 1.3
+//! `CertificateVerify` (RFC 8446 §4.4.3) для `net::tls_auth`:
+//! [`verify_certificate_verify_signature`] диспетчеризует по согласованной
+//! [`Tls13Scheme`]. RSA-PSS там ОБЯЗАТЕЛЕН (RFC 8446 §4.2.3) и однозначен:
+//! идентификатор схемы фиксирует хеш, длину salt (= длину хеша) и trailer, так что
+//! поверхности параметров нет — это иное решение, чем отказ PSS OID выше, который
+//! существует потому, что внутри X.509 параметры PSS живут в сертификате, где ими
+//! управляет peer.
 //!
-//! Besides the X.509 chain signatures this module also verifies the TLS 1.3
-//! `CertificateVerify` message (RFC 8446 §4.4.3) for `net::tls_auth`:
-//! [`verify_certificate_verify_signature`] dispatches on the negotiated
-//! [`Tls13Scheme`]. RSA-PSS is REQUIRED there (RFC 8446 §4.2.3) and is
-//! unambiguous: the scheme identifier fixes the hash, the salt length (=
-//! hash length) and the trailer, so there is no parameters surface — this is
-//! a different decision from the PSS OID rejection above, which exists
-//! because inside X.509 the PSS parameters live in the certificate where a
-//! peer controls them.
+//! В этом сообщении появляются два РАЗНЫХ хеша (RFC 8446 §4.4.3), и их смешение —
+//! баг, который API модуля спроектирован предотвращать:
 //!
-//! Two DISTINCT hashes appear in that message (RFC 8446 §4.4.3), and
-//! conflating them is a bug this module's API is shaped to prevent:
+//!   * **transcript hash** считается хешем согласованного CIPHER SUITE — всегда 32
+//!     байта (SHA-256) для единственного suite, который согласует это ядро,
+//!     `Aes128GcmSha256`;
+//!   * **signature digest** — тот, что назван схемой подписи (SHA-384 для
+//!     `ecdsa_secp384r1_sha384`, …).
 //!
-//!   * the **transcript hash** is computed with the hash of the negotiated
-//!     CIPHER SUITE — always 32 bytes (SHA-256) for the only suite this kernel
-//!     negotiates, `Aes128GcmSha256`;
-//!   * the **signature digest** is the one named by the signature SCHEME
-//!     (SHA-384 for `ecdsa_secp384r1_sha384`, …).
-//!
-//! They are independent: a P-384 server signs a SHA-384 digest *of* the
-//! 32-byte transcript hash, and RFC 8446 permits that combination. Gating the
-//! transcript hash on the scheme's own digest width therefore rejected every
-//! SHA-384/SHA-512-scheme leaf although the negotiated suite's hash was 32
-//! bytes. The width gate belongs to the suite alone:
-//! [`crate::net::tls_auth::verify_certificate_verify`] takes the negotiated
-//! suite's hash length as an explicit parameter and does not look at the
-//! scheme's width at all.
+//! Они независимы: P-384-сервер подписывает SHA-384-дайджест *от* 32-байтового
+//! транскрипт-хеша, и RFC 8446 это допускает. Гейтинг транскрипт-хеша по ширине
+//! дайджеста самой схемы поэтому отвергал каждый leaf схем SHA-384/SHA-512, хотя
+//! хеш согласованного suite был 32 байта. Гейт ширины принадлежит только suite:
+//! [`crate::net::tls_auth::verify_certificate_verify`] принимает длину хеша
+//! согласованного suite явным параметром и вообще не смотрит на ширину схемы.
 
 use super::x509::SpkiKey;
 use sha2::{Digest, Sha256, Sha384, Sha512};

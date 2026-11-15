@@ -1,44 +1,46 @@
-//! Pure user-pointer range validation for the Linux compatibility layer.
+//! Чистая валидация диапазонов пользовательских указателей для слоя
+//! совместимости с Linux.
 //!
-//! Pure, allocation-free, `core`-only logic shared with the `host-tests` crate
-//! (R11.6). This is the *range* half of the syscall pointer choke point: it rejects
-//! buffers that start at or above the user/kernel boundary, that overflow when their
-//! length is added, or whose end exceeds the boundary — all **without dereferencing**
-//! anything (R1.5). The effectful *page-presence* walk (R1.6) lives in a later task
-//! and enumerates the same page bases produced by [`spanned_pages`].
+//! Только `core`, без аллокаций, общая с крейтом `host-tests` (R11.6). Это
+//! *диапазонная* половина точки контроля указателей syscall: она отвергает
+//! буферы, начинающиеся на границе user/kernel или выше, переполняющиеся при
+//! прибавлении длины или заканчивающиеся за границей, — и всё это **без
+//! разыменования** (R1.5). Эффектный обход *присутствия страниц* (R1.6) живёт
+//! в обработчиках и перечисляет те же базы страниц, что даёт [`spanned_pages`].
 #![allow(dead_code)]
 
-/// Page size used for the spanned-page enumeration (x86_64 4 KiB pages).
+/// Размер страницы для перечисления охваченных страниц (x86_64, 4 КиБ).
 const PAGE_SIZE: u64 = 4096;
 
-/// Exclusive upper bound of the lower-half canonical user address range
-/// (`User_Addr_Max`). A buffer is in range only when it lies strictly below this.
+/// Исключающая верхняя граница канонического пользовательского диапазона
+/// нижней половины (`User_Addr_Max`). Буфер в диапазоне, только если строго ниже
+/// неё.
 ///
-/// NOTE: this is intentionally a standalone copy rather than a re-export of the
-/// `const` in `src/vfs/elf.rs`. That module pulls in kernel-only dependencies
-/// (the VMM/PMM and the `x86_64` paging crate), so importing it would make this
-/// pure module — and therefore the `host-tests` crate that `#[path]`-includes it —
-/// impossible to build on the host. The value is fixed by the architecture.
+/// ПРИМЕЧАНИЕ: намеренно самостоятельная копия, а не реэкспорт `const` из
+/// `src/vfs/elf.rs`. Тот модуль тянет ядерные зависимости (VMM/PMM и крейт
+/// `x86_64` paging), поэтому его импорт сделал бы этот чистый модуль — и значит
+/// крейт `host-tests`, включающий его через `#[path]`, — неспособным собраться
+/// на хосте. Значение фиксировано архитектурой.
 pub const USER_ADDR_MAX: u64 = 0x0000_8000_0000_0000;
 
-/// Outcome of a pure user-pointer range check.
+/// Итог чистой проверки диапазона пользовательского указателя.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum PtrCheck {
-    /// The range is wholly within the user half (or empty) and may be walked.
+    /// Диапазон целиком в пользовательской половине (или пуст) и может обходиться.
     Ok,
-    /// The range is out of bounds; the syscall must return `-EFAULT` (R1.5).
+    /// Диапазон вне границ; syscall обязан вернуть `-EFAULT` (R1.5).
     Efault,
 }
 
-/// Pure range validation for a user buffer `[start, start + len)`.
+/// Чистая проверка диапазона пользовательского буфера `[start, start + len)`.
 ///
-/// Returns [`PtrCheck::Ok`] when `len == 0` (an empty buffer is always acceptable
-/// and dereferences nothing). Otherwise returns [`PtrCheck::Efault`] when:
+/// Возвращает [`PtrCheck::Ok`], когда `len == 0` (пустой буфер допустим всегда и
+/// ничего не разыменовывает). Иначе [`PtrCheck::Efault`], когда:
 ///   * `start >= USER_ADDR_MAX`,
-///   * `start + len` overflows `u64`, or
+///   * `start + len` переполняет `u64`, или
 ///   * `start + len > USER_ADDR_MAX`.
-/// In every other case it returns [`PtrCheck::Ok`]. This function never reads from
-/// the supplied address (R1.5).
+/// Во всех прочих случаях — [`PtrCheck::Ok`]. Функция никогда не читает по
+/// переданному адресу (R1.5).
 pub fn check_user_range(start: u64, len: u64) -> PtrCheck {
     if len == 0 {
         return PtrCheck::Ok;
@@ -52,21 +54,21 @@ pub fn check_user_range(start: u64, len: u64) -> PtrCheck {
     }
 }
 
-/// Pure enumerator of the 4 KiB page bases spanned by `[start, start + len)`.
+/// Чистый перечислитель баз страниц 4 КиБ, охваченных `[start, start + len)`.
 ///
-/// For `len == 0` the iterator is empty. For `len > 0` it yields every page base
-/// from `first_page` (the page containing `start`) through `last_page` (the page
-/// containing the final byte `start + len - 1`) inclusive, stepping by
-/// [`PAGE_SIZE`]. The effectful page-presence walk and the property test use this
-/// to confirm each spanned page is mapped (R1.6).
+/// При `len == 0` итератор пуст. При `len > 0` он выдаёт каждую базу страницы от
+/// `first_page` (страница, содержащая `start`) до `last_page` (страница,
+/// содержащая последний байт `start + len - 1`), включительно, с шагом
+/// [`PAGE_SIZE`]. Эффектный обход присутствия страниц и property-тест используют
+/// это, чтобы подтвердить отображение каждой охваченной страницы (R1.6).
 ///
-/// Inputs are expected to have already passed [`check_user_range`], so
-/// `start + len - 1` does not overflow; the saturating arithmetic keeps the
-/// enumerator total regardless.
+/// Ожидается, что входы уже прошли [`check_user_range`], поэтому
+/// `start + len - 1` не переполняется; saturating-арифметика всё равно делает
+/// перечислитель тотальным.
 pub fn spanned_pages(start: u64, len: u64) -> impl Iterator<Item = u64> {
-    // Choose bounds so the inclusive range is empty when `len == 0`.
+    // Границы выбраны так, чтобы включительный диапазон был пуст при `len == 0`.
     let (first_page, last_page) = if len == 0 {
-        // `1..=0` is an empty RangeInclusive, so no page bases are produced.
+        // `1..=0` — пустой RangeInclusive, поэтому ни одной базы страницы не выдаётся.
         (1, 0)
     } else {
         let last_addr = start.saturating_add(len - 1);
@@ -75,7 +77,7 @@ pub fn spanned_pages(start: u64, len: u64) -> impl Iterator<Item = u64> {
     (first_page..=last_page).step_by(PAGE_SIZE as usize)
 }
 
-/// Round an address down to its containing page base.
+/// Округлить адрес вниз до базы содержащей его страницы.
 #[inline]
 fn page_base(addr: u64) -> u64 {
     addr & !(PAGE_SIZE - 1)
@@ -87,21 +89,21 @@ mod tests {
 
     #[test]
     fn user_range_rejects_kernel_and_out_of_half() {
-        // Anything at or above the boundary is a kernel address — this is the
-        // exact class of value F-LEAD-1 passed to mprotect().
+        // Всё на границе и выше — адрес ядра; ровно этот класс значений
+        // раньше доходил до mprotect() (см. `SECURITY.md`).
         assert_eq!(check_user_range(USER_ADDR_MAX, 4096), PtrCheck::Efault);
         assert_eq!(
             check_user_range(0xffff_ffff_801b_f000, 4096),
             PtrCheck::Efault
         );
-        // The last user page is accepted; one byte past the boundary is not.
+        // Последняя пользовательская страница принимается; один байт за границей — нет.
         assert_eq!(check_user_range(USER_ADDR_MAX - 4096, 4096), PtrCheck::Ok);
         assert_eq!(check_user_range(USER_ADDR_MAX - 1, 2), PtrCheck::Efault);
-        // An empty range dereferences nothing and is always acceptable.
+        // Пустой диапазон ничего не разыменовывает и всегда допустим.
         assert_eq!(check_user_range(USER_ADDR_MAX, 0), PtrCheck::Ok);
-        // Length that overflows u64 is refused, not wrapped.
+        // Длина, переполняющая u64, отвергается, а не заворачивается.
         assert_eq!(check_user_range(u64::MAX - 10, 100), PtrCheck::Efault);
-        // Ordinary user buffers (glibc's stacks/heaps) stay accepted.
+        // Обычные пользовательские буферы (стеки/кучи glibc) остаются принятыми.
         assert_eq!(check_user_range(0x7fff_ffff_f000, 4096), PtrCheck::Ok);
     }
 

@@ -1,82 +1,78 @@
-// arch/cpu.rs — Safe wrappers around privileged x86_64 CPU instructions.
+// arch/cpu.rs — безопасные обёртки над привилегированными инструкциями x86_64.
 //
-// This module is the single safe boundary for privileged instructions that
-// were previously written as ad-hoc inline `asm!` scattered across the tree
-// (`hlt`, `cli`, `sti`, `pushfq`, `rdmsr`, `wrmsr`). The module name is
-// architecture-neutral (`arch::cpu`) per the design; the implementation here
-// is x86_64-specific.
+// Модуль — единственная безопасная граница для привилегированных инструкций
+// (`hlt`, `cli`, `sti`, `pushfq`, `rdmsr`, `wrmsr`); раньше это были разрозненные
+// inline `asm!` по всему дереву. Имя модуля архитектурно-нейтральное
+// (`arch::cpu`), реализация — x86_64-specific.
 //
-// Design goal (Requirements 2.1, 2.2, 7.3): expose operations that cannot
-// violate Rust's memory model as *safe* functions, keep operations whose
-// soundness depends on caller context (`write_msr`) as `unsafe`, and document
-// the soundness invariant on every remaining `unsafe` block.
+// Цель (Requirements 2.1, 2.2, 7.3): операции, не нарушающие модель памяти Rust,
+// экспонировать как *безопасные* функции, а зависящие от контекста вызывающего
+// (`write_msr`) оставить `unsafe` с документированным инвариантом.
 
-/// RFLAGS interrupt-enable flag (IF) bit position.
+/// Позиция бита разрешения прерываний (IF) в RFLAGS.
 const RFLAGS_IF: u64 = 1 << 9;
 
-/// Set while a task is parked in [`halt`] waiting for an interrupt.
+/// Установлен, пока задача припаркована в [`halt`] в ожидании прерывания.
 ///
-/// The timer-tick accounting (`crate::task::stat`) samples this to charge the
-/// interrupted tick to `idle` instead of `system`: with the CPU actually halted
-/// there is no runnable work even when the parked task is not the idle task
-/// (e.g. the shell's read loop or a `sleep_ticks` wait). This is a sampling
-/// hint, not a state machine: an interrupt delivered in the few instructions
-/// between `hlt` returning and the flag being cleared can still be charged to
-/// idle, which is no less truthful than the wake-up boundary itself.
+/// Учёт тиков таймера (`crate::task::stat`) сэмплирует его, чтобы отнести
+/// прерванный тик к `idle`, а не `system`: при реально остановленном CPU
+/// запускаемой работы нет, даже если припаркована не idle-задача (цикл чтения
+/// шелла, ожидание `sleep_ticks`). Это подсказка для сэмплирования, а не
+/// состояние: прерывание между возвратом из `hlt` и сбросом флага всё ещё может
+/// засчитаться как idle — не менее честно, чем сама граница пробуждения.
 static IN_HALT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Was the CPU parked in [`halt`] when the timer tick interrupted it?
+/// Был ли CPU остановлен в [`halt`], когда его прервал тик таймера?
 #[inline]
 pub fn in_halt() -> bool {
     IN_HALT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-// CR0 bits relevant to FPU/SSE.
-const CR0_EM: u64 = 1 << 2; // Emulation: must be CLEAR to use SSE.
-const CR0_MP: u64 = 1 << 1; // Monitor coprocessor: set alongside clearing EM.
+// Биты CR0, относящиеся к FPU/SSE.
+const CR0_EM: u64 = 1 << 2; // Эмуляция: должен быть СБРОШЕН, чтобы работал SSE.
+const CR0_MP: u64 = 1 << 1; // Monitor coprocessor: ставится вместе со сбросом EM.
 
-// CR4 bits relevant to SSE.
-const CR4_OSFXSR: u64 = 1 << 9; // OS supports FXSAVE/FXRSTOR and SSE.
-const CR4_OSXMMEXCPT: u64 = 1 << 10; // OS supports unmasked SSE exceptions (#XM).
+// Биты CR4, относящиеся к SSE.
+const CR4_OSFXSR: u64 = 1 << 9; // ОС поддерживает FXSAVE/FXRSTOR и SSE.
+const CR4_OSXMMEXCPT: u64 = 1 << 10; // ОС поддерживает немаскируемые SSE-исключения (#XM).
 
-// Supervisor-mode execution prevention: ring 0 may not execute user pages.
-// Enabled only when CPUID leaf 7 EBX bit 7 reports support. SMAP (bit 21) and
-// KPTI are NOT implemented — see `SECURITY.md`.
+// Supervisor-mode execution prevention: ring 0 не может исполнять страницы
+// пользователя. Включается только если CPUID leaf 7 EBX бит 7 сообщает
+// поддержку. SMAP (бит 21) и KPTI НЕ реализованы — см. `SECURITY.md`.
 const CR4_SMEP: u64 = 1 << 20;
 
-/// Enable SSE so XMM/`movaps`-style instructions execute instead of faulting
-/// with #UD.
+/// Включить SSE, чтобы инструкции вида XMM/`movaps` исполнялись, а не падали
+/// с #UD.
 ///
-/// The kernel is built for `x86_64-unknown-none`, whose default codegen
-/// features include SSE/SSE2. In particular, Rust's `extern "x86-interrupt"`
-/// handlers emit `movaps` to save/restore the XMM registers in their prologue.
-/// Limine hands control over with SSE *not* OS-enabled (CR4.OSFXSR clear), so
-/// the first such instruction raises #UD — and because the #UD handler itself
-/// has a `movaps` prologue, it recurses until the stack overflows and the CPU
-/// triple-faults. Enabling SSE once, before any interrupts are enabled, avoids
-/// this entirely.
+/// Ядро собрано под `x86_64-unknown-none`, чьи codegen-фичи по умолчанию
+/// включают SSE/SSE2. В частности, обработчики `extern "x86-interrupt"` Rust
+/// генерируют `movaps` для сохранения/восстановления XMM в прологе. Limine
+/// передаёт управление с НЕ включённым в OS SSE (CR4.OSFXSR сброшен), поэтому
+/// первая такая инструкция даёт #UD, а обработчик #UD сам имеет пролог с
+/// `movaps` — рекурсия до переполнения стека и triple fault. Однократное
+/// включение SSE до разрешения прерываний полностью это снимает.
 ///
-/// This must run as the very first boot step, before any code that may touch
-/// XMM registers and before interrupts are enabled.
+/// Обязан выполняться самым первым шагом загрузки, до любого кода, трогающего
+/// XMM, и до включения прерываний.
 ///
-/// Sequence (Intel SDM Vol. 3A, §13.1.4 "Initialization of SSE Extensions"):
-///   CR0.EM = 0, CR0.MP = 1, CR4.OSFXSR = 1, CR4.OSXMMEXCPT = 1.
+/// Последовательность (Intel SDM Vol. 3A, §13.1.4 "Initialization of SSE
+/// Extensions"): CR0.EM = 0, CR0.MP = 1, CR4.OSFXSR = 1, CR4.OSXMMEXCPT = 1.
 ///
-/// Additionally enables **SMEP** (`CR4.SMEP`, bit 20) when CPUID leaf 7 EBX
-/// bit 7 reports support, so the kernel cannot fetch instructions from a user
-/// page. This is cheap (one control-register bit) and does not need paging
-/// changes because the kernel never executes user mappings by design. SMAP
-/// (`CR4.SMAP`) and KPTI are deliberately not enabled: SMAP would require every
-/// kernel access to user memory to be wrapped in `stac`/`clac`, and KPTI would
-/// need a full separate page-table hierarchy — neither exists in this tree, and
-/// claiming them would be false.
+/// Дополнительно включает **SMEP** (`CR4.SMEP`, бит 20), если CPUID leaf 7 EBX
+/// бит 7 сообщает поддержку: ядро не сможет выбирать инструкции со страниц
+/// пользователя. Это дёшево (один бит управляющего регистра) и не требует
+/// менять paging, потому что ядро по устройству никогда не исполняет
+/// пользовательские отображения. SMAP (`CR4.SMAP`) и KPTI намеренно не
+/// включаются: SMAP потребовал бы оборачивать каждое обращение ядра к памяти
+/// пользователя в `stac`/`clac`, а KPTI — полную отдельную иерархию таблиц
+/// страниц; ни того, ни другого в дереве нет, и заявлять их было бы ложью.
 pub fn enable_sse() {
-    // SAFETY: Reading and writing CR0/CR4 with the standard SSE-enable bit
-    // pattern is the architecturally defined way to turn on SSE. We only clear
-    // EM and set MP/OSFXSR/OSXMMEXCPT (plus SMEP when CPUID reports it), leaving
-    // all other control bits (paging, PAE, etc. established by Limine)
-    // untouched. This touches no Rust-visible memory and is performed once
-    // during early boot before interrupts.
+    // SAFETY: чтение и запись CR0/CR4 со стандартным набором битов включения
+    // SSE — архитектурно определённый способ включить SSE. Мы только сбрасываем
+    // EM и ставим MP/OSFXSR/OSXMMEXCPT (плюс SMEP при поддержке CPUID), не
+    // трогая остальные управляющие биты (paging, PAE и т. п., установленные
+    // Limine). Память, видимая Rust, не затрагивается; выполняется однократно
+    // при ранней загрузке до прерываний.
     unsafe {
         let mut cr0: u64;
         core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
@@ -94,12 +90,13 @@ pub fn enable_sse() {
     }
 }
 
-/// Does the CPU support SMEP? Guarded by CPUID leaf 0's maximum basic leaf: a
-/// leaf-7 read on a CPU that does not define it returns unspecified data, so the
-/// feature bit must never be trusted unguarded.
+/// Поддерживает ли CPU SMEP? С защитой по максимальному базовому листу CPUID:
+/// чтение листа 7 на CPU, который его не определяет, вернёт неопределённые
+/// данные, поэтому биту фичи нельзя доверять без проверки.
 fn cpu_has_smep() -> bool {
-    // CPUID is an unprivileged architectural query; leaf 0 is defined on every
-    // x86_64 CPU. The same guard pattern is used by `arch/x86_64/cpuid.rs`.
+    // CPUID — непривилегированный архитектурный запрос; лист 0 определён на
+    // каждом CPU x86_64. Тот же шаблон защиты используется в
+    // `arch/x86_64/cpuid.rs`.
     let max_basic = core::arch::x86_64::__cpuid(0).eax;
     if max_basic < 7 {
         return false;
@@ -107,73 +104,73 @@ fn cpu_has_smep() -> bool {
     core::arch::x86_64::__cpuid_count(7, 0).ebx & (1 << 7) != 0
 }
 
-/// Halt the CPU forever in a low-power wait loop.
+/// Остановить CPU навсегда в цикле ожидания низкого энергопотребления.
 ///
-/// This never returns. It is the canonical "we are done / fatal error" sink
-/// for the boot path and panic handler.
+/// Не возвращается никогда. Канонический сток «всё сделано / фатальная ошибка»
+/// для пути загрузки и panic-обработчика.
 pub fn halt_loop() -> ! {
     loop {
-        // SAFETY: `hlt` only places the CPU in a halt state until the next
-        // interrupt. It has no effect on memory and cannot violate Rust's
-        // memory model. We never leave this loop, so control flow is sound.
+        // SAFETY: `hlt` лишь переводит CPU в состояние остановки до следующего
+        // прерывания, не влияет на память и не может нарушить модель памяти
+        // Rust. Из цикла мы не выходим, поэтому поток управления корректен.
         unsafe {
             core::arch::asm!("hlt", options(nomem, nostack));
         }
     }
 }
 
-/// Halt the CPU once until the next interrupt arrives (`hlt`).
+/// Остановить CPU один раз до следующего прерывания (`hlt`).
 ///
-/// Unlike [`halt_loop`], this executes a *single* `hlt` and returns after the
-/// CPU wakes (e.g. from a timer or device IRQ). It is the one-shot primitive
-/// for IRQ-wait spin loops (the shell read loop, keyboard wait paths) that need
-/// to sleep until an interrupt then continue, rather than halt forever.
+/// В отличие от [`halt_loop`], выполняет *один* `hlt` и возвращается после
+/// пробуждения (таймер или IRQ устройства). Это одноразовый примитив для
+/// спин-циклов ожидания IRQ (цикл чтения шелла, пути ожидания клавиатуры),
+/// которым нужно поспать до прерывания и продолжить, а не стоять вечно.
 ///
-/// The [`IN_HALT`] flag is published for the timer-tick accounting; it is
-/// cleared as soon as the CPU wakes. Interrupts must be enabled by the caller
-/// (otherwise the `hlt` never wakes), exactly as before.
+/// Флаг [`IN_HALT`] публикуется для учёта тиков таймера и сбрасывается сразу
+/// после пробуждения. Прерывания должен разрешить вызывающий (иначе `hlt` не
+/// проснётся), как и раньше.
 pub fn halt() {
     IN_HALT.store(true, core::sync::atomic::Ordering::SeqCst);
-    // SAFETY: `hlt` only places the CPU in a halt state until the next
-    // interrupt. It accesses no memory and cannot violate Rust's memory model.
+    // SAFETY: `hlt` лишь переводит CPU в состояние остановки до следующего
+    // прерывания. Память не трогает и модель памяти Rust нарушить не может.
     unsafe {
         core::arch::asm!("hlt", options(nomem, nostack));
     }
     IN_HALT.store(false, core::sync::atomic::Ordering::SeqCst);
 }
 
-/// Enable maskable interrupts on the current CPU (`sti`).
+/// Разрешить маскируемые прерывания на текущем CPU (`sti`).
 ///
-/// Exposed as safe per the design: `sti` only changes interrupt *delivery*;
-/// it does not read or write memory and cannot by itself violate Rust's
-/// memory model. Callers relying on interrupts being disabled for mutual
-/// exclusion should use [`without_interrupts`] instead.
+/// Безопасно по устройству: `sti` меняет только *доставку* прерываний, не
+/// читает и не пишет память и сам по себе не может нарушить модель памяти Rust.
+/// Вызывающим, которым прерывания нужны выключенными для взаимного исключения,
+/// следует использовать [`without_interrupts`].
 pub fn enable_interrupts() {
-    // SAFETY: `sti` sets RFLAGS.IF to enable interrupt delivery. It touches no
-    // memory and does not invalidate any Rust invariant.
+    // SAFETY: `sti` ставит RFLAGS.IF, разрешая доставку прерываний. Память не
+    // трогает и инвариантов Rust не нарушает.
     unsafe {
         core::arch::asm!("sti", options(nomem, nostack));
     }
 }
 
-/// Disable maskable interrupts on the current CPU (`cli`).
+/// Выключить маскируемые прерывания на текущем CPU (`cli`).
 ///
-/// Exposed as safe per the design: `cli` only changes interrupt delivery and
-/// cannot violate Rust's memory model.
+/// Безопасно по устройству: `cli` меняет только доставку прерываний и не может
+/// нарушить модель памяти Rust.
 pub fn disable_interrupts() {
-    // SAFETY: `cli` clears RFLAGS.IF to mask interrupt delivery. It touches no
-    // memory and does not invalidate any Rust invariant.
+    // SAFETY: `cli` сбрасывает RFLAGS.IF, маскируя доставку прерываний. Память
+    // не трогает и инвариантов Rust не нарушает.
     unsafe {
         core::arch::asm!("cli", options(nomem, nostack));
     }
 }
 
-/// Returns `true` if maskable interrupts are currently enabled (RFLAGS.IF set).
+/// `true`, если маскируемые прерывания сейчас разрешены (RFLAGS.IF установлен).
 pub fn interrupts_enabled() -> bool {
     let flags: u64;
-    // SAFETY: `pushfq` pushes RFLAGS and we immediately pop it into a register.
-    // This has no observable side effects and preserves all flags; the stack is
-    // balanced by the matching push/pop pair.
+    // SAFETY: `pushfq` кладёт RFLAGS в стек, и мы сразу снимаем его в регистр.
+    // Наблюдаемых побочных эффектов нет, все флаги сохраняются, стек
+    // сбалансирован парой push/pop.
     unsafe {
         core::arch::asm!(
             "pushfq",
@@ -185,15 +182,15 @@ pub fn interrupts_enabled() -> bool {
     (flags & RFLAGS_IF) != 0
 }
 
-/// Run `f` with interrupts disabled, restoring the prior interrupt state after.
+/// Выполнить `f` с выключенными прерываниями, восстановив прежнее состояние.
 ///
-/// Reads the current IF, disables interrupts, runs `f`, then re-enables
-/// interrupts only if they were enabled on entry. This is the single primitive
-/// other modules (e.g. `sync::spinlock`) build interrupt-safe critical sections
-/// on top of.
+/// Читает текущий IF, выключает прерывания, выполняет `f`, затем снова включает
+/// их, только если они были включены на входе. На этом примитиве другие модули
+/// (например, `sync::spinlock`) строят критическиe секции, безопасные к
+/// прерываниям.
 ///
-/// Note: `panic = "abort"` for this kernel, so there is no unwinding path to
-/// worry about; the restore simply runs after `f` returns.
+/// Примечание: в ядре `panic = "abort"`, поэтому раскрутки нет и восстанавливать
+/// что-либо после паники не нужно; восстановление просто идёт после возврата `f`.
 pub fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
     let were_enabled = interrupts_enabled();
     disable_interrupts();
@@ -207,15 +204,15 @@ pub fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
     result
 }
 
-/// Read a model-specific register via `rdmsr`.
+/// Прочитать model-specific register через `rdmsr`.
 ///
-/// Safe: reading an MSR has no effect on Rust-visible memory. Reading an
-/// unimplemented MSR can `#GP`, but that is a hardware fault, not memory
-/// unsafety; callers pass well-known MSR numbers.
+/// Безопасно: чтение MSR не влияет на видимую Rust память. Чтение
+/// нереализованного MSR может дать `#GP`, но это аппаратная ошибка, а не
+/// нарушение памяти; вызывающие передают известные номера MSR.
 pub fn read_msr(msr: u32) -> u64 {
     let (high, low): (u32, u32);
-    // SAFETY: `rdmsr` reads the MSR named by ECX into EDX:EAX. It performs no
-    // memory access and cannot violate Rust's memory model.
+    // SAFETY: `rdmsr` читает MSR из ECX в EDX:EAX. Память не трогает и модель
+    // памяти Rust нарушить не может.
     unsafe {
         core::arch::asm!(
             "rdmsr",
@@ -228,22 +225,22 @@ pub fn read_msr(msr: u32) -> u64 {
     ((high as u64) << 32) | (low as u64)
 }
 
-/// Write a model-specific register via `wrmsr`.
+/// Записать model-specific register через `wrmsr`.
 ///
-/// Stays `unsafe`: writing an MSR can reconfigure the CPU (e.g. enabling
-/// `SYSCALL`/`SYSRET`, relocating the LAPIC base, toggling features) in ways
-/// whose soundness depends entirely on caller context.
+/// Остаётся `unsafe`: запись MSR переконфигурирует CPU (включение
+/// `SYSCALL`/`SYSRET`, перенос базы LAPIC, переключение фич), и корректность
+/// целиком зависит от контекста вызывающего.
 ///
 /// # Safety
-/// The caller must ensure that writing `value` to `msr` keeps the system in a
-/// well-defined state — for example, that any addresses programmed into the MSR
-/// are valid and that dependent subsystems expect the new configuration.
+/// Вызывающий должен гарантировать, что запись `value` в `msr` оставляет
+/// систему в определённом состоянии: например, адреса, заносимые в MSR,
+/// валидны, а зависимые подсистемы ждут новой конфигурации.
 pub unsafe fn write_msr(msr: u32, value: u64) {
     let low = value as u32;
     let high = (value >> 32) as u32;
-    // SAFETY: The caller guarantees (per this fn's `# Safety` contract) that the
-    // write leaves the CPU in a sound state. `wrmsr` writes EDX:EAX to the MSR
-    // named by ECX and accesses no Rust-visible memory.
+    // SAFETY: вызывающий по `# Safety`-контракту функции гарантирует, что
+    // запись оставляет CPU в корректном состоянии. `wrmsr` пишет EDX:EAX в MSR
+    // из ECX и не трогает видимую Rust память.
     unsafe {
         core::arch::asm!(
             "wrmsr",

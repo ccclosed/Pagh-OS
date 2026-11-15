@@ -1,39 +1,38 @@
-// drivers/virtio/blk.rs — virtio-blk driver: attach `VirtIOBlk`, expose a `BlockDevice`
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// drivers/virtio/blk.rs — драйвер virtio-blk: подключить `VirtIOBlk`, выставить `BlockDevice`
+// 64-битное ядро ОС x86_64 на Rust (#![no_std])
 //
-// Component 3 of the networking-and-storage design. This module attaches the
-// QEMU `virtio-blk` disk discovered by `pci::enumerate()` using the
-// `virtio-drivers` 0.11 crate's PCI transport, wraps the resulting `VirtIOBlk`
-// behind a `Spinlock`, and registers it in the global `DeviceManager` as the
-// kernel `BlockDevice` named "virtio-blk0" (R3.1).
+// Component 3 дизайна networking-and-storage. Модуль подключает диск QEMU
+// `virtio-blk`, найденный `pci::enumerate()`, через PCI transport крейта
+// `virtio-drivers` 0.11, оборачивает полученный `VirtIOBlk` в `Spinlock` и
+// регистрирует его в глобальном `DeviceManager` как kernel `BlockDevice` с именем
+// "virtio-blk0" (R3.1).
 //
-// ## virtio-drivers 0.11 PCI transport init flow
+// ## Поток init PCI transport virtio-drivers 0.11
 //
-// The crate's PCI transport is built from two pieces:
+// PCI transport крейта собирается из двух частей:
 //
-//   * a `PciRoot<C: ConfigurationAccess>` — the root complex, parameterized
-//     over a `ConfigurationAccess` implementation that performs raw 32-bit
-//     config-space reads/writes for a `(bus, device, function)` + register
-//     offset. We supply [`PaghPciAccess`], a zero-sized adapter that forwards
-//     to pagh's `pci::config_read_u32` / `pci::config_write_u32`.
-//   * a `DeviceFunction { bus, device, function }` naming the target device.
+//   * `PciRoot<C: ConfigurationAccess>` — root complex, параметризованный по
+//     реализации `ConfigurationAccess`, выполняющей сырые 32-битные чтения/записи
+//     config space для `(bus, device, function)` + смещения регистра. Мы
+//     предоставляем [`PaghPciAccess`], zero-sized адаптер, переадресующий в
+//     `pci::config_read_u32` / `pci::config_write_u32` pagh.
+//   * `DeviceFunction { bus, device, function }`, называющий целевое устройство.
 //
-// `ConfigurationAccess` (from `transport::pci::bus`) has exactly three methods:
+// `ConfigurationAccess` (из `transport::pci::bus`) имеет ровно три метода:
 //   - `fn read_word(&self, df: DeviceFunction, offset: u8) -> u32`
 //   - `fn write_word(&mut self, df: DeviceFunction, offset: u8, data: u32)`
-//   - `unsafe fn unsafe_clone(&self) -> Self`   (read-only-fields clone)
+//   - `unsafe fn unsafe_clone(&self) -> Self`   (клон только для чтения полей)
 //
-// The flow is: build `PaghPciAccess`, wrap it in `PciRoot::new(access)`, form
-// the `DeviceFunction` from the `PciDevice` our enumerate() found, enable
-// bus-mastering (`pci::enable_bus_master`, which also sets memory-space enable
-// so the transport can reach the device's MMIO BARs), then
-// `PciTransport::new::<PaghHal, _>(&mut root, device_function)`. The transport
-// probes the device's virtio PCI capabilities, locating the common-config /
-// notify / ISR / device-config structures inside the device's *already
-// allocated* memory BARs (QEMU + OVMF program the BARs before our kernel runs),
-// mapping each via `PaghHal::mmio_phys_to_virt`. Finally
-// `VirtIOBlk::<PaghHal, _>::new(transport)` performs the virtio device
-// handshake + feature negotiation and sets up the request virtqueue.
+// Поток: собрать `PaghPciAccess`, обернуть в `PciRoot::new(access)`, сформировать
+// `DeviceFunction` из `PciDevice`, найденного enumerate(), включить bus-mastering
+// (`pci::enable_bus_master`, который также включает memory-space, чтобы transport
+// достал MMIO BAR'ы устройства), затем `PciTransport::new::<PaghHal, _>(&mut root,
+// device_function)`. Transport читает virtio PCI capabilities устройства, находя
+// структуры common-config / notify / ISR / device-config внутри *уже
+// аллоцированных* memory BAR'ов (QEMU + OVMF программируют BAR'ы до запуска
+// нашего ядра), мапя каждую через `PaghHal::mmio_phys_to_virt`. Наконец
+// `VirtIOBlk::<PaghHal, _>::new(transport)` выполняет handshake virtio-устройства
+// + переговоры фич и настраивает request virtqueue.
 
 use alloc::sync::Arc;
 

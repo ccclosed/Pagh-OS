@@ -1,13 +1,13 @@
-//! Own link layer: Ethernet + ARP (RFC 826).
+//! Свой link-слой: Ethernet + ARP (RFC 826).
 //!
-//! [`ArpTable`] answers "which MAC belongs to IPv4 address X?" for the stack.
-//! When the answer is unknown, outgoing frames are parked in a bounded pending
-//! queue and an ARP request is broadcast (rate-limited to one request per
-//! target per second); replies populate the cache and flush pending frames in
-//! arrival order. Entries age out; pending frames expire.
+//! [`ArpTable`] отвечает на «какой MAC принадлежит IPv4-адресу X?» для стека.
+//! Когда ответ неизвестен, исходящие кадры паркуются в ограниченной очереди
+//! ожидания, а ARP-запрос широковещательно рассылается (rate-limited до одного
+//! запроса на цель в секунду); ответы заполняют кэш и сливают ожидающие кадры в
+//! порядке прихода. Записи стареют; ожидающие кадры истекают.
 //!
-//! Everything runs under the stack lock in thread context (the net poll loop),
-//! so no internal locking is needed.
+//! Всё выполняется под локом стека в thread-контексте (цикл опроса сети), так
+//! что внутренний локинг не нужен.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -17,17 +17,17 @@ use super::wire::{
 };
 use super::Stack;
 
-/// Cache capacity. QEMU user-net has exactly one peer; real LANs a handful.
+/// Ёмкость кэша. У QEMU user-net ровно один peer; у реальных LAN — единицы.
 const CACHE_SIZE: usize = 16;
-/// Frames parked while awaiting resolution.
+/// Кадры, припаркованные в ожидании разрешения.
 const PENDING_CAP: usize = 32;
-/// Cache entry lifetime (ticks).
+/// Время жизни записи кэша (тики).
 const ENTRY_TTL_TICKS: u64 = 60 * 1000;
-/// Give up on a pending frame after this long.
+/// Сдаться на ожидающем кадре после стольких тиков.
 const PENDING_TTL_TICKS: u64 = 5 * 1000;
-/// Minimum interval between re-requests for the same target.
+/// Минимальный интервал между повторными запросами для одной цели.
 const REQUEST_RETRY_TICKS: u64 = 1000;
-/// How many retries before dropping the resolution attempt (and its frames).
+/// Сколько попыток до отказа от разрешения (и его кадров).
 const MAX_REQUESTS: usize = 3;
 
 #[derive(Clone, Copy)]
@@ -35,21 +35,21 @@ struct Entry {
     ip: Ipv4Addr,
     mac: Mac,
     expires: u64,
-    /// Last time this mapping was (re)learned — LRU victim selection.
+    /// Когда это соответствие последний раз (пере)изучено — выбор LRU-жертвы.
     updated: u64,
 }
 
 struct Pending {
     dst_ip: Ipv4Addr,
     ethertype: u16,
-    /// Frame payload AFTER the Ethernet header (the L3 packet).
+    /// Payload кадра ПОСЛЕ Ethernet-заголовка (пакет L3).
     payload: Vec<u8>,
     enqueued: u64,
 }
 
 pub struct ArpTable {
     entries: [Option<Entry>; CACHE_SIZE],
-    /// Last-request bookkeeping per unresolved target: (ip, last_req_tick, tries).
+    /// Учёт последнего запроса на неразрешённую цель: (ip, tick последнего запроса, попытки).
     inflight: Vec<(Ipv4Addr, u64, usize)>,
     pending: VecDeque<Pending>,
 }
@@ -70,7 +70,7 @@ impl ArpTable {
     }
 
     fn insert(&mut self, ip: Ipv4Addr, mac: Mac, now: u64) {
-        // Update in place if present.
+        // Обновить на месте, если уже есть.
         for slot in self.entries.iter_mut().flatten() {
             if slot.ip == ip {
                 slot.mac = mac;
@@ -79,9 +79,9 @@ impl ArpTable {
                 return;
             }
         }
-        // Otherwise: prefer a free slot, then an expired one, then evict the
-        // least recently (re)learned entry (LRU). The index-0 fallback is
-        // unreachable while CACHE_SIZE > 0 but keeps the lookup total.
+        // Иначе: предпочесть свободный слот, затем истёкший, затем вытеснить
+        // наименее недавно (пере)изученную запись (LRU). Фолбэк на индекс 0
+        // недостижим, пока CACHE_SIZE > 0, но держит поиск тотальным.
         let victim = self
             .entries
             .iter()
@@ -107,8 +107,8 @@ impl ArpTable {
         });
     }
 
-    /// Queue `payload` (an L3 packet) for delivery to `dst_ip` once its MAC is
-    /// known. Returns false when the queue is full (frame dropped).
+    /// Поставить `payload` (пакет L3) в очередь на доставку `dst_ip`, как только
+    /// его MAC станет известен. Возвращает false, когда очередь полна (кадр отброшен).
     pub fn enqueue_pending(
         &mut self,
         dst_ip: Ipv4Addr,
@@ -128,8 +128,8 @@ impl ArpTable {
         true
     }
 
-    /// Broadcast an ARP request for `ip` (rate-limited). `my_ip` may be
-    /// unspecified during DHCP (sender protocol address 0.0.0.0).
+    /// Широковещательный ARP-запрос для `ip` (rate-limited). `my_ip` может быть
+    /// не задан во время DHCP (sender protocol address 0.0.0.0).
     pub fn request(&mut self, my_mac: Mac, my_ip: Ipv4Addr, ip: Ipv4Addr, now: u64) {
         match self.inflight.iter_mut().find(|(t, _, _)| *t == ip) {
             Some((_, last, tries)) => {
@@ -145,18 +145,18 @@ impl ArpTable {
         }
 
         let pkt = wire::arp_build(wire::ARP_REQUEST, my_mac, my_ip, Mac([0; 6]), ip);
-        // Requests are broadcast: never go through resolution ourselves.
+        // Запросы широковещательные: сами никогда не проходим через разрешение.
         let frame = eth_frame(Mac::BROADCAST, my_mac, ETHERTYPE_ARP, &pkt);
         crate::drivers::e1000::send(&frame);
     }
 
-    /// Handle an incoming ARP packet. On REQUEST for our address reply with
-    /// our MAC; on a REPLY to one of OUR outstanding resolutions learn
-    /// sender_ip -> sender_mac and flush pending frames.
+    /// Обработать входящий ARP-пакет. На REQUEST для нашего адреса ответить нашим
+    /// MAC; на REPLY на одно из НАШИХ ожидающих разрешений изучить
+    /// sender_ip -> sender_mac и слить ожидающие кадры.
     ///
-    /// Learning is deliberately restricted (anti-spoofing): unsolicited
-    /// replies and requests about third parties never touch the cache — an
-    /// attacker cannot remap an arbitrary IP by broadcasting crafted packets.
+    /// Изучение намеренно ограничено (anti-spoofing): незапрошенные ответы и
+    /// запросы о третьих лицах никогда не трогают кэш — атакующий не может
+    /// переназначить произвольный IP широковещательным crafted-пакетом.
     pub fn input(&mut self, my_mac: Mac, my_ip: Option<Ipv4Addr>, pkt: &[u8], now: u64) {
         let Some(p) = wire::arp_parse(pkt) else {
             return;
@@ -164,10 +164,10 @@ impl ArpTable {
 
         match p.operation {
             wire::ARP_REQUEST => {
-                // Reply only when someone asks for US. Such a request is a
-                // legitimate first contact from the requester, so its sender
-                // mapping may be learned (sender/target pair consistent with
-                // a request for our address).
+                // Отвечать, только когда спрашивают про НАС. Такой запрос —
+                // легитимный первый контакт от запрашивающего, так что его
+                // sender-соответствие можно изучить (пара sender/target
+                // согласуется с запросом нашего адреса).
                 let wants_us = my_ip.map(|i| i == p.target_ip).unwrap_or(false);
                 if wants_us {
                     if !p.sender_ip.is_unspecified() {
@@ -180,15 +180,15 @@ impl ArpTable {
                         p.sender_mac,
                         p.sender_ip,
                     );
-                    // Unicast reply straight to the requester's MAC.
+                    // Unicast-ответ прямо на MAC запрашивающего.
                     let frame = eth_frame(p.sender_mac, my_mac, ETHERTYPE_ARP, &reply);
                     crate::drivers::e1000::send(&frame);
                 }
             }
             wire::ARP_REPLY => {
-                // Resolution result: accepted only while WE have a request
-                // outstanding for this address. Then stop requesting and
-                // flush the frames parked for it.
+                // Результат разрешения: принимается, только пока у НАС есть
+                // ожидающий запрос на этот адрес. Тогда прекратить запросы и
+                // слить припаркованные для него кадры.
                 let expected = self
                     .inflight
                     .iter()
@@ -212,7 +212,7 @@ impl ArpTable {
         }
     }
 
-    /// Age out entries, expired pending frames, and dead resolution attempts.
+    /// Старение записей, истёкших ожидающих кадров и мёртвых попыток разрешения.
     pub fn on_tick(&mut self, now: u64) {
         for slot in self.entries.iter_mut() {
             if let Some(e) = slot {
@@ -227,14 +227,14 @@ impl ArpTable {
             .retain(|(_, last, tries)| now < *last + PENDING_TTL_TICKS && *tries <= MAX_REQUESTS);
     }
 
-    /// Number of frames currently waiting for resolution (diagnostics/tests).
+    /// Число кадров, ждущих разрешения (диагностика/тесты).
     #[allow(dead_code)]
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
 }
 
-/// Total Ethernet overhead constant re-exported for callers sizing buffers.
+/// Константа полных Ethernet-накладных, ре-экспортируется для вызывающих, считающих буферы.
 #[allow(dead_code)]
 pub const FRAME_MAX: usize = ETH_HDR_LEN + 1500;
 
@@ -256,13 +256,13 @@ mod tests {
     }
 }
 
-// ─── IPv6 neighbor table (NDP) ───────────────────────────────────────────────
-//
-// Mirrors the ARP table: cache + pending queue + rate-limited solicitations.
-// The wire exchange is Neighbor Solicitation / Advertisement instead of ARP,
-// and requests go to the target's solicited-node multicast address.
+// ─── Таблица соседей IPv6 (NDP) ───────────────────────────────────────────────
 
-/// Hop limit for all NDP exchanges (RFC 4861: must be 255).
+// Зеркалит ARP-таблицу: кэш + очередь ожидания + rate-limited solicitation'ы.
+// Обмен по проводу — Neighbor Solicitation / Advertisement вместо ARP, а запросы
+// идут на solicited-node multicast-адрес цели.
+
+/// Hop limit для всех обменов NDP (RFC 4861: должен быть 255).
 const ND_HOP_LIMIT: u8 = 255;
 
 pub struct NdpTable {
@@ -313,7 +313,7 @@ impl NdpTable {
         self.entries[victim] = Some((ip, mac, now + ENTRY_TTL_TICKS));
     }
 
-    /// Queue an L3 packet for `dst` while its MAC is unresolved.
+    /// Поставить пакет L3 в очередь для `dst`, пока его MAC не разрешён.
     #[allow(dead_code)]
     pub fn enqueue_pending(&mut self, dst: Ipv6Addr, payload: Vec<u8>, now: u64) -> bool {
         if self.pending.len() >= PENDING_CAP {
@@ -323,7 +323,7 @@ impl NdpTable {
         true
     }
 
-    /// Broadcast a Neighbor Solicitation for `ip`.
+    /// Широковещательный Neighbor Solicitation для `ip`.
     pub fn solicit(&mut self, my_mac: Mac, my_ip: Ipv6Addr, ip: Ipv6Addr, now: u64) {
         match self.inflight.iter_mut().find(|(t, _, _)| *t == ip) {
             Some((_, last, tries)) => {
@@ -337,7 +337,7 @@ impl NdpTable {
                 self.inflight.push((ip, now, 1));
             }
         }
-        // Full IPv6 packet to the solicited-node multicast address.
+        // Полный IPv6-пакет на solicited-node multicast-адрес.
         let icmp = wire::neighbor_solicit(my_ip, my_mac, ip);
         let mcast_ip = ip.solicited_node();
         let pkt = wire::ipv6_build(my_ip, mcast_ip, wire::PROTO_ICMPV6, ND_HOP_LIMIT, &icmp);
@@ -350,10 +350,10 @@ impl NdpTable {
         crate::drivers::e1000::send(&frame);
     }
 
-    /// Handle an incoming ICMPv6 NDP packet (already checksum-verified).
-    /// `eth_src` is the Ethernet-level sender (used for learning when the
-    /// packet carries no link-layer address option). Solicitations for one of
-    /// OUR addresses are answered with a Neighbor Advertisement.
+    /// Обработать входящий ICMPv6 NDP-пакет (уже проверенный по checksum).
+    /// `eth_src` — отправитель на Ethernet-уровне (используется для изучения,
+    /// когда пакет не несёт опции link-layer address). Solicitations на один из
+    /// НАШИХ адресов отвечаются Neighbor Advertisement.
     pub fn input(
         &mut self,
         st: &mut Stack,
@@ -364,13 +364,13 @@ impl NdpTable {
     ) {
         let my_mac = st.mac;
         if p.is_solicit {
-            // Learn the sender even from solicitations (RFC 4861 §7.2.3).
+            // Изучить отправителя даже из solicitation (RFC 4861 §7.2.3).
             if !src_ip.is_unspecified() {
                 if let Some(mac) = p.ll_addr {
                     self.insert(src_ip, mac, now);
                 }
             }
-            // Answer only when someone asks for one of OUR addresses.
+            // Отвечать, только когда спрашивают про один из НАШИХ адресов.
             let wants_us = st.cidr6.map(|c| c.addr) == Some(p.target) || st.ll_addr6 == p.target;
             if wants_us {
                 let adv = wire::neighbor_advert(
@@ -385,11 +385,11 @@ impl NdpTable {
                 crate::drivers::e1000::send(&frame);
             }
         } else {
-            // Advertisement: learn target -> link-layer mapping.
+            // Advertisement: изучить target -> link-layer mapping.
             let learned = p.ll_addr.unwrap_or(eth_src);
             self.insert(p.target, learned, now);
             self.inflight.retain(|(t, _, _)| *t != p.target);
-            // Flush frames waiting on this neighbor.
+            // Слить кадры, ждущие этого соседа.
             let mut keep: VecDeque<(Ipv6Addr, Vec<u8>, u64)> = VecDeque::new();
             while let Some(fr) = self.pending.pop_front() {
                 if fr.0 == p.target {

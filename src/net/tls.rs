@@ -1,96 +1,91 @@
-//! HTTPS over TLS 1.3 for the package manager — **fail-closed server
-//! authentication** (issue #14).
+//! HTTPS через TLS 1.3 для пакетного менеджера — **fail-closed серверная
+//! аутентификация** (issue #14).
 //!
-//! Every handshake authenticates the peer before a single HTTP byte is sent:
+//! Каждый handshake аутентифицирует peer до отправки первого HTTP-байта:
 //!
-//!   * the server certificate chain is validated down to a committed trust
-//!     anchor ([`super::ca_bundle::CA_BUNDLE`]) — signatures, `cA=TRUE` on
-//!     every issuer, validity windows ([`super::tls_chain::verify_chain`]);
-//!   * the connection target is authorized against the leaf's SAN entries
-//!     (RFC 6125, DNS names and IP literals; no CN fallback)
-//!     ([`super::tls_auth::authenticate_server`]);
-//!   * the system clock is gated: an unset RTC (below 2025-01-01) refuses the
-//!     handshake rather than validating against a bogus "now"
+//!   * цепочка серверных сертификатов валидируется до закоммиченного trust
+//!     anchor ([`super::ca_bundle::CA_BUNDLE`]) — подписи, `cA=TRUE` у каждого
+//!     эмитента, окна валидности ([`super::tls_chain::verify_chain`]);
+//!   * цель соединения авторизуется по SAN-записям leaf (RFC 6125, DNS-имена и
+//!     IP-литералы; без CN-fallback) ([`super::tls_auth::authenticate_server`]);
+//!   * системные часы гейтятся: невыставленный RTC (ниже 2025-01-01) отвергает
+//!     handshake вместо валидации против фиктивного «now»
 //!     ([`super::tls_chain::CLOCK_FLOOR`]);
-//!   * the handshake's `CertificateVerify` signature is checked against the
-//!     verified leaf key ([`super::tls_auth::verify_certificate_verify`]).
-//!     The transcript hash it signs is the CIPHER SUITE's hash
-//!     ([`CIPHER_SUITE_HASH_LEN`]); the signature scheme only picks the digest
-//!     the peer signed with, so SHA-384/512 schemes over this SHA-256 suite
-//!     stay verifiable instead of becoming dead backends.
+//!   * подпись `CertificateVerify` handshake проверяется проверенным leaf-ключом
+//!     ([`super::tls_auth::verify_certificate_verify`]). Транскрипт-хеш, который
+//!     она подписывает, — хеш CIPHER SUITE ([`CIPHER_SUITE_HASH_LEN`]); схема
+//!     подписи выбирает только дайджест peer'а, так что схемы SHA-384/512 над
+//!     этим SHA-256 suite остаются проверяемыми, а не мёртвыми бэкендами.
 //!
-//! Any failure aborts the handshake — there is no fallback path that keeps
-//! the connection. The session RNG is backed by RDSEED/RDRAND and the
-//! connection likewise fails closed when hardware entropy is unavailable.
+//! Любой сбой обрывает handshake — нет fallback-пути, сохраняющего соединение.
+//! Session RNG опирается на RDSEED/RDRAND, и соединение точно так же fail-closed,
+//! когда аппаратная энтропия недоступна.
 //!
-//! ## Where the diagnostics are
+//! ## Где диагностика
 //!
-//! The verifier reports every rejection through `error!` under the stable
-//! marker `Package_Fetcher(tls): stage=verify cause=…` (`InvalidCertificate`,
-//! `InvalidSignatureScheme`, `InvalidSignature`). `embedded-tls`'s own
-//! handshake messages are `debug!`-level and do NOT reach the log: the facade
-//! defaults to `Info`, which filters `debug!`/`trace!` out. Those `error!`
-//! lines — not any embedded-tls output — are therefore the whole verifier
-//! diagnostic surface, and what the smoke/E2E assertions grep.
+//! Верификатор сообщает каждый отказ через `error!` под стабильным маркером
+//! `Package_Fetcher(tls): stage=verify cause=…` (`InvalidCertificate`,
+//! `InvalidSignatureScheme`, `InvalidSignature`). Собственные handshake-сообщения
+//! `embedded-tls` — уровня `debug!` и до лога НЕ доходят: facade по умолчанию
+//! `Info`, а он фильтрует `debug!`/`trace!`. Эти строки `error!` — а не какой-либо
+//! вывод embedded-tls — и есть вся диагностическая поверхность верификатора, и
+//! именно их грепают smoke/E2E-проверки.
 //!
-//! ## How it is wired (kernel-only module)
+//! ## Как подключено (kernel-only модуль)
 //!
-//! `embedded-tls` is async (`embedded-io-async`). We do not have an async runtime,
-//! so three small pieces bridge it onto the kernel's own TCP stack:
+//! `embedded-tls` асинхронный (`embedded-io-async`), async-runtime у нас нет, так
+//! что три небольшие части мостят его на собственный TCP-стек:
 //!
-//!   1. [`block_on`] — a minimal executor: it polls a pinned future in a loop with
-//!      a no-op waker until it is `Ready`, spinning briefly between polls so the
-//!      timer tick and QEMU can advance.
-//!   2. [`TlsTransport`] — implements [`embedded_io_async::Read`]/[`Write`] over a
-//!      TCP socket handle from the own stack. Each poll takes the `NET` lock,
-//!      advances the stack once, then drains/fills the socket. It NEVER holds
-//!      the `NET` lock across an `await`, mirrors the bounded locked-step +
-//!      `spin_loop` discipline of `nc_echo`/`http_get`, and carries an
-//!      inactivity budget so a stall returns an error instead of hanging.
-//!   3. [`KernelRng`] — adapts the fail-closed hardware entropy API to the
-//!      `RngCore + CryptoRng` traits required by `embedded-tls`.
+//!   1. [`block_on`] — минимальный executor: опрашивает pinned future в цикле с
+//!      no-op waker до `Ready`, коротко spin'уя между опросами, чтобы тик
+//!      таймера и QEMU могли продвинуться.
+//!   2. [`TlsTransport`] — реализует [`embedded_io_async::Read`]/[`Write`] поверх
+//!      TCP-хэндла своего стека. Каждый poll берёт лок `NET`, продвигает стек на
+//!      шаг, затем вычерпывает/заполняет сокет. Он НИКОГДА не держит лок `NET`
+//!      через `await`, повторяет bounded locked-step + `spin_loop` дисциплину
+//!      `nc_echo`/`http_get` и несёт бюджет неактивности, чтобы застревание
+//!      возвращало ошибку, а не висело.
+//!   3. [`KernelRng`] — адаптирует fail-closed API аппаратной энтропии к трейтам
+//!      `RngCore + CryptoRng`, нужным `embedded-tls`.
 //!
-//! [`KernelProvider`] supplies both that RNG and [`KernelVerifier`], the
-//! `embedded-tls` `TlsVerifier` implementation that adapts the handshake's
-//! borrowed certificate entries and negotiated signature scheme onto the pure
-//! decision layer in [`super::tls_auth`]. Because it always returns a
-//! verifier, `embedded-tls`'s "no verifier ⇒ skip verification" path can
-//! never be taken.
+//! [`KernelProvider`] поставляет и этот RNG, и [`KernelVerifier`] — реализацию
+//! `TlsVerifier` из `embedded-tls`, адаптирующую заимствованные записи
+//! сертификатов handshake и согласованную схему подписи на чистое решающее ядро
+//! в [`super::tls_auth`]. Поскольку он всегда возвращает верификатор, путь
+//! `embedded-tls` «нет верификатора ⇒ пропустить проверку» недостижим.
 //!
-//! [`https_get`] ties them together: resolve → connect → handshake → HTTP GET →
-//! collect the `Content-Length` body, reusing the pure
+//! [`https_get`] связывает всё: resolve → connect → handshake → HTTP GET →
+//! собрать тело по `Content-Length`, переиспользуя чистые
 //! [`build_get_request`](super::http::build_get_request) /
-//! [`parse_http_head`](super::http::parse_http_head) for all wire formatting.
+//! [`parse_http_head`](super::http::parse_http_head) для всего wire-форматирования.
 //!
-//! ## Large streams (issue #19)
+//! ## Большие потоки (issue #19)
 //!
-//! #19 reported a deterministic `embedded-tls` stall "at ~12 MiB". It is **not
-//! reproducible** on the current TCP stack: the 13,332,733-byte
-//! `Packages.gz` of `stable/main/amd64` is decrypted end to end in one fetch
-//! (≈2.1 MB/s under QEMU/TCG), and the live `apt update` completes over HTTPS
-//! with the full ~13 MB index. The claim dates from the smoltcp-backed stack —
-//! the transport code has been unchanged since, but the stack underneath it was
-//! replaced (`net: replace smoltcp…`) and the window-update-ACK fix (x40)
-//! landed in the same series; the live harness kept forcing cleartext HTTP
-//! afterwards, so nobody re-measured.
+//! #19 сообщал о детерминированном стопоре `embedded-tls` «на ~12 MiB». Он **не
+//! воспроизводится** на текущем TCP-стеке: 13 332 733-байтовый `Packages.gz` из
+//! `stable/main/amd64` расшифровывается end-to-end за один fetch (≈2.1 MB/s под
+//! QEMU/TCG), а живой `apt update` завершается по HTTPS с полным ~13 MB индексом.
+//! Утверждение родом из стека на smoltcp; транспортный код с тех пор не менялся,
+//! но стек под ним заменён, а фикс window-update-ACK (x40) попал в ту же серию;
+//! живой стенд после этого продолжал форсить cleartext HTTP, так что никто не
+//! перемерил.
 //!
-//! What this module keeps from that investigation, because it is what turns a
-//! mystery stall into a named one:
+//! Что модуль сохраняет из того расследования (это превращает загадочный стопор
+//! в именованный):
 //!
-//!   * the byte-trace counters ([`TLS_RAW_IN`], [`TLS_READ_POLLS`],
-//!     [`TLS_READ_PENDING`]) and the `stage=done` completion line, so every fetch
-//!     is measurable from the serial log;
-//!   * the `stage=stall` watchdog: if the decrypted body stops growing for
-//!     [`TLS_STALL_REPORT_TICKS`], one line names the stuck layer — socket (no
-//!     `raw_in` growth), transport (polls grow, `raw_in` does not) or record layer
-//!     (both grow, the body does not) — together with the TCP flow-control
-//!     snapshot from [`super::tcp::TcpSock::diag`];
-//!   * the read-error diagnostic at the end of the stream, which preserves the
-//!     `TlsError` and the exact shortfall instead of collapsing everything into a
-//!     bare `FetchError::Incomplete`.
+//!   * счётчики байтового трейса ([`TLS_RAW_IN`], [`TLS_READ_POLLS`],
+//!     [`TLS_READ_PENDING`]) и строку завершения `stage=done`, так что каждый fetch
+//!     измерим по serial-логу;
+//!   * watchdog `stage=stall`: если расшифрованное тело перестало расти на
+//!     [`TLS_STALL_REPORT_TICKS`], одна строка называет застрявший слой — socket
+//!     (нет роста `raw_in`), transport (polls растут, `raw_in` нет) или record
+//!     layer (растут оба, тело нет) — вместе со снимком TCP flow-control из
+//!     [`super::tcp::TcpSock::diag`];
+//!   * диагностику ошибки чтения в конце потока, сохраняющую `TlsError` и точный
+//!     недобор вместо свёртки всего в голый `FetchError::Incomplete`.
 //!
-//! The regression pin is `lx_tlsbig` (`selftest_lx::run_tls_big_check`): one
-//! multi-MB GET against the same object, before any decompress/parse work.
+//! Регрессионный пин — `lx_tlsbig` (`selftest_lx::run_tls_big_check`): один
+//! multi-MB GET того же объекта до любой распаковки/разбора.
 
 use alloc::string::String;
 use alloc::sync::Arc;

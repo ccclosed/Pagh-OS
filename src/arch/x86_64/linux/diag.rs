@@ -1,38 +1,40 @@
-//! Diagnostics pure logic for the x86_64 binary-compatibility layer.
+//! Чистая логика диагностики для слоя совместимости с x86_64-бинарями.
 //!
-//! Pure, `core`+`alloc`-only logic shared with the `host-tests` crate (R11.6).
-//! Covers two observability rules:
-//!   * nosys de-duplication (R12.2 / Property 27): a per-process record of which
-//!     unsupported syscall numbers have already been logged, so the `-ENOSYS`
-//!     diagnostic is emitted at most once per distinct number per process.
-//!   * exit-code normalization (R12.3 / Property 28): the recorded/logged exit
-//!     code is the low byte of the requested code, hence always in `0..=255`.
+//! Только `core`+`alloc`, общая с крейтом `host-tests` (R11.6). Покрывает два
+//! правила наблюдаемости:
+//!   * дедупликация nosys (R12.2 / Property 27): per-process запись уже
+//!     залогированных неподдерживаемых номеров syscall'ов, чтобы диагностика
+//!     `-ENOSYS` выдавалась не чаще раза на номер на процесс.
+//!   * нормализация кода выхода (R12.3 / Property 28): записанный/логируемый код
+//!     выхода — младший байт запрошенного кода, то есть всегда в `0..=255`.
 //!
-//! Both functions are free of hardware access, privileged instructions, and global
-//! mutable state — all inputs arrive as parameters (the caller owns the per-process
-//! `BTreeSet`), so the `host-tests` crate can assert their behavior on the host.
+//! Обе функции без доступа к железу, привилегированных инструкций и глобального
+//! изменяемого состояния — все входы приходят параметрами (per-process
+//! `BTreeSet` принадлежит вызывающему), поэтому `host-tests` может проверить их
+//! поведение на хосте.
 #![allow(dead_code)]
 
 use alloc::collections::BTreeSet;
 
-/// Decide whether the `-ENOSYS` diagnostic should be logged for syscall number
-/// `nr`, recording the decision in the per-process `seen` set (R12.2 / P27).
+/// Решить, логировать ли диагностику `-ENOSYS` для номера syscall `nr`, записав
+/// решение в per-process множество `seen` (R12.2 / P27).
 ///
-/// Returns `true` exactly once per distinct `nr` — on its first occurrence — and
-/// `false` for every subsequent occurrence of that same number. This is precisely
-/// [`BTreeSet::insert`]'s contract (`true` when the value was newly inserted), so
-/// the caller emits the log entry iff this returns `true`.
+/// Возвращает `true` ровно один раз на отдельный `nr` — при первом появлении — и
+/// `false` для каждого следующего появления того же номера. Это в точности
+/// контракт [`BTreeSet::insert`] (`true`, когда значение вставлено впервые),
+/// поэтому вызывающий печатает лог тогда и только тогда, когда вернулось
+/// `true`.
 pub fn should_log_nosys(seen: &mut BTreeSet<u64>, nr: u64) -> bool {
     seen.insert(nr)
 }
 
-/// Normalize a requested process exit code to the value Linux reports to a waiter
-/// (R12.3 / P28).
+/// Нормализовать запрошенный код выхода процесса к значению, которое Linux
+/// сообщает ожидающему (R12.3 / P28).
 ///
-/// Linux passes the exit status through the low 8 bits, so the recorded exit code
-/// is `code & 0xFF`, which always lies in `0..=255`. The requested code is taken as
-/// `u64` (the raw syscall argument register width); only the low byte is
-/// significant, so any wider bits are discarded.
+/// Linux передаёт статус выхода через младшие 8 бит, поэтому записанный код —
+/// `code & 0xFF`, всегда в `0..=255`. Запрошенный код берётся как `u64` (ширина
+/// регистра сырого аргумента syscall); значим только младший байт, поэтому более
+/// широкие биты отбрасываются.
 pub fn exit_code_byte(code: u64) -> u8 {
     (code & 0xFF) as u8
 }

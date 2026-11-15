@@ -1,107 +1,110 @@
-//! Pure `kill(2)` argument decoding, target classification and the errno
-//! matrix — the decisions `signal::sys_kill` makes before it touches the
-//! compat registry or the scheduler.
+//! Чистое декодирование аргументов `kill(2)`, классификация цели и матрица
+//! errno — решения, которые `signal::sys_kill` принимает до обращения к
+//! compat-реестру или планировщику.
 //!
-//! Deliberately `core`-only and dependency-free (R11.6): it is `#[path]`-included
-//! by `host-tests` (property `kill_target`), so the classification every errno is
-//! derived from is exercised on the host for the WHOLE `i64` input space, not
-//! just the paths a guest run happens to hit.
+//! Намеренно только `core` и без зависимостей (R11.6): включается в `host-tests`
+//! через `#[path]` (свойство `kill_target`), поэтому классификация, из которой
+//! выводится каждый errno, проверяется на хосте для ВСЕГО пространства входов
+//! `i64`, а не только для путей, куда случайно попадает гость.
 //!
-//! ## Why the arguments need decoding at all
+//! ## Зачем вообще декодировать аргументы
 //!
-//! `kill`'s prototype is `int kill(pid_t pid, int sig)` — both arguments are
-//! 32-bit. On x86_64 the dispatcher reads the full 64-bit registers
-//! (`linux::abi::marshal_args`), so the upper halves carry whatever the caller's
-//! codegen left there. Linux truncates the C arguments, and so must we:
-//! `pid = (raw as u32) as i32`, `sig = (raw as u32) as i32`. Skipping that step
-//! misreads a negative `sig` (`0xFFFF_FFFF` as `int` = -1) as a huge positive
-//! number, and a negative `pid` (`kill(-pgid)`) as a huge positive pid — the
-//! exact bug class the `kill_target` property locks down.
+//! Прототип `kill` — `int kill(pid_t pid, int sig)`, оба аргумента 32-битные. На
+//! x86_64 диспетчер читает полные 64-битные регистры
+//! (`linux::abi::marshal_args`), поэтому старшие половины несут то, что оставил
+//! кодогенератор вызывающего. Linux усекает C-аргументы, и мы обязаны так же:
+//! `pid = (raw as u32) as i32`, `sig = (raw as u32) as i32`. Без этого
+//! отрицательный `sig` (`0xFFFF_FFFF` как `int` = -1) читается как огромное
+//! положительное число, а отрицательный `pid` (`kill(-pgid)`) — как огромный
+//! положительный pid; ровно этот класс ошибок и закрепляет свойство
+//! `kill_target`.
 //!
-//! ## Errno matrix (man7 kill(2) + `kill_something_info`)
+//! ## Матрица errno (man7 kill(2) + `kill_something_info`)
 //!
-//! Resolution order matters: signal validity is checked FIRST, then the target
-//! is resolved, then permission.
+//! Порядок важен: сначала проверяется валидность сигнала, затем находится цель,
+//! затем права.
 //!
-//! | argument | meaning | result |
+//! | аргумент | смысл | результат |
 //! |---|---|---|
-//! | `sig == 0` | existence probe, no signal is sent | `Ok` if a target exists |
-//! | `sig < 0` or `sig > 64` (`_NSIG-1`) | invalid signal | `EINVAL` (before any target lookup) |
-//! | `pid > 0` | that process (thread) | `ESRCH` if it has no compat state |
-//! | `pid == 0` | every process in the caller's process group | `ESRCH` if the group is empty |
-//! | `pid == -1` | every process the caller may signal, except its own thread group and pid 1 | `ESRCH` if there is no candidate at all |
-//! | `pid < -1` | every process in process group `-pid` | `ESRCH` if the group is empty |
-//! | `pid == INT_MIN` | `-INT_MIN` overflows, so Linux returns | `ESRCH` (NOT `EINVAL`) |
-//! | any | no permission to signal ANY target | `EPERM` |
+//! | `sig == 0` | проба существования, сигнал не шлётся | `Ok`, если цель есть |
+//! | `sig < 0` или `sig > 64` | неверный сигнал | `EINVAL` (до поиска цели) |
+//! | `pid > 0` | тот процесс (поток) | `ESRCH`, если нет compat-состояния |
+//! | `pid == 0` | все процессы группы вызывающего | `ESRCH`, если группа пуста |
+//! | `pid == -1` | все процессы, которым можно, кроме своей группы потоков и pid 1 | `ESRCH`, если кандидатов нет |
+//! | `pid < -1` | все процессы группы `-pid` | `ESRCH`, если группа пуста |
+//! | `pid == INT_MIN` | `-INT_MIN` переполняется, поэтому Linux даёт | `ESRCH` (НЕ `EINVAL`) |
+//! | любой | нет права сигнализировать НИ ОДНОЙ цели | `EPERM` |
 //!
-//! `EPERM` is real: a caller may signal a target only when its **effective**
-//! user id equals the target's real or effective user id, or when the caller is
-//! root (`kill_permits`). The `kill(-1)` broadcast applies the same rule per
-//! target and delivers to the permitted subset (Linux's `kill_something_info`),
-//! so one un-signalable process does not turn the whole broadcast into `EPERM`.
-//! The handler snapshots credentials from the compat registry; the decision
-//! itself is the pure [`kill_permits`] exercised by the `kill_target` property.
+//! `EPERM` реален: сигнализировать цели можно, только когда **effective** uid
+//! вызывающего равен real или effective uid цели, либо вызывающий — root
+//! (`kill_permits`). Широковещательный `kill(-1)` применяет то же правило к
+//! каждой цели и доставляет разрешённому подмножеству (как
+//! `kill_something_info`), поэтому один несигнализируемый процесс не превращает
+//! всю рассылку в `EPERM`. Обработчик снимает креденшелы из compat-реестра;
+//! само решение — чистая [`kill_permits`], проверяемая свойством `kill_target`.
 //!
-//! ## Process groups in pagh
+//! ## Группы процессов в pagh
 //!
-//! `misc::sys_getpgid` reports `compat::current_tgid()` and `sys_setpgid` is a
-//! documented no-op, so the modeled process group id of a process IS its thread
-//! group id. `kill(-pgid)` therefore selects the registered compat threads whose
-//! `tgid == pgid` — the same set the current shell/job-control flow produces
-//! (`setpgid(0,0)` / `setpgid(child, 0)` both mean "your own group").
-//! Moving a process into ANOTHER group is not modeled; if that ever changes,
-//! only the group lookup in `signal::resolve_kill_targets` needs updating.
+//! `misc::sys_getpgid` сообщает `compat::current_tgid()`, а `sys_setpgid` —
+//! документированный no-op, поэтому моделируемый pgid процесса ЕСТЬ его tgid.
+//! `kill(-pgid)` выбирает зарегистрированные compat-потоки с `tgid == pgid` —
+//! тот же набор, что даёт текущий шелл/job-control (`setpgid(0,0)` /
+//! `setpgid(child, 0)` оба означают «свою группу»). Перевод процесса в ДРУГУЮ
+//! группу не моделируется; если появится, менять нужно только поиск группы в
+//! `signal::resolve_kill_targets`.
 //!
-//! ## What counts as "existing"
+//! ## Что считается «существующим»
 //!
-//! Existence is the compat registry (`compat::compat_exists`). A child that has
-//! already exited lives there only as a `wait4` record, so `kill(pid, 0)` on it
-//! reports `ESRCH` where Linux would still accept the pid while the zombie
-//! exists. Explicitly accepted deviation: `kill(pid, 0)` answers "running and
-//! signalable", not "pid slot occupied" (which is the question a shell probing a
-//! job actually asks). Native/kernel tasks are never signalable for the same
-//! reason — they have no compat state.
+//! Существование — это compat-реестр (`compat::compat_exists`). Уже вышедший
+//! ребёнок живёт там только как запись `wait4`, поэтому `kill(pid, 0)` на нём
+//! сообщает `ESRCH`, тогда как Linux ещё принял бы pid, пока зомби существует.
+//! Явно принятое отклонение: `kill(pid, 0)` отвечает «работает и сигнализируем»,
+//! а не «слот pid занят» (именно это спрашивает шелл, пробуя job). Нативные и
+//! ядерные задачи по той же причине несигнализируемы — у них нет
+//! compat-состояния.
 #![allow(dead_code)]
 
 use super::errno::Errno;
 
-/// Highest valid signal number (`_NSIG - 1` on Linux x86_64).
+/// Наибольший валидный номер сигнала (`_NSIG - 1` в Linux x86_64).
 pub const NSIG_MAX: i64 = 64;
-/// `INT_MIN`: `kill(INT_MIN, sig)` underflows `-pid` in Linux and returns
-/// `ESRCH` (`kill_something_info` guards this case explicitly).
+/// `INT_MIN`: `kill(INT_MIN, sig)` в Linux переполняет `-pid` и возвращает
+/// `ESRCH` (`kill_something_info` явно оберегает этот случай).
 pub const INT_MIN: i64 = i32::MIN as i64;
-/// `init` (pid 1) is excluded from the `kill(-1, ...)` broadcast (man7 kill(2)
-/// NOTES: "the only signals that can be sent to process ID 1 ... are those for
-/// which init has explicitly installed signal handlers").
+/// `init` (pid 1) исключён из широковещательного `kill(-1, ...)` (man7 kill(2)
+/// NOTES: «единственные сигналы, которые можно послать процессу 1 ... — те, для
+/// которых init явно установил обработчики»).
 pub const INIT_PID: u64 = 1;
 
-/// `pid_t pid` as the kernel sees it: truncate to 32 bits, then sign-extend.
+/// `pid_t pid` в том виде, как его видит ядро: усечь до 32 бит, затем расширить
+/// знаково.
 #[inline]
 pub const fn decode_pid(raw: u64) -> i64 {
     (raw as u32) as i32 as i64
 }
 
-/// `int sig` as the kernel sees it: truncate to 32 bits, then sign-extend.
+/// `int sig` в том виде, как его видит ядро: усечь до 32 бит, затем расширить
+/// знаково.
 #[inline]
 pub const fn decode_sig(raw: u64) -> i64 {
     (raw as u32) as i32 as i64
 }
 
-/// What `kill(pid, sig)` addresses.
+/// Что адресует `kill(pid, sig)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KillTarget {
-    /// `pid > 0`: exactly this process/thread id.
+    /// `pid > 0`: ровно этот процесс/поток.
     Pid(u64),
-    /// `pid == 0`: the calling process's own process group.
+    /// `pid == 0`: собственная группа процессов вызывающего.
     OwnGroup,
-    /// `pid == -1`: every signalable process except the caller's thread group.
+    /// `pid == -1`: каждый сигнализируемый процесс, кроме группы потоков вызывающего.
     All,
-    /// `pid < -1`: the process group with id `-pid`.
+    /// `pid < -1`: группа процессов с id `-pid`.
     Group(u64),
 }
 
-/// Validate `sig` and classify `pid` (Linux: signal validity first, then the
-/// target; `INT_MIN` is an `ESRCH`, see [`INT_MIN`]).
+/// Проверить `sig` и классифицировать `pid` (Linux: сначала валидность сигнала,
+/// затем цель; `INT_MIN` — это `ESRCH`, см. [`INT_MIN`]).
 pub fn kill_args(pid: i64, sig: i64) -> Result<(KillTarget, u64), Errno> {
     if !kill_sig_valid(sig) {
         return Err(Errno::EINVAL);
@@ -110,15 +113,14 @@ pub fn kill_args(pid: i64, sig: i64) -> Result<(KillTarget, u64), Errno> {
     Ok((target, sig as u64))
 }
 
-/// Is this a signal number `kill(2)` accepts? `0` is the existence probe and is
-/// valid; everything outside `0..=_NSIG-1` (including negative `int`s) is
-/// `EINVAL`.
+/// Принимает ли `kill(2)` такой номер сигнала? `0` — проба существования и
+/// валиден; всё вне `0..=_NSIG-1` (включая отрицательные `int`) — `EINVAL`.
 #[inline]
 pub fn kill_sig_valid(sig: i64) -> bool {
     sig >= 0 && sig <= NSIG_MAX
 }
 
-/// Classify a `pid_t` already sign-extended to `i64`.
+/// Классифицировать `pid_t`, уже знаково расширенный до `i64`.
 pub fn kill_target(pid: i64) -> Result<KillTarget, Errno> {
     match pid {
         INT_MIN => Err(Errno::ESRCH),
@@ -129,27 +131,28 @@ pub fn kill_target(pid: i64) -> Result<KillTarget, Errno> {
     }
 }
 
-/// May a process with effective uid `sender_euid` signal a target whose real
-/// uid is `target_uid` and effective uid is `target_euid`?
+/// Может ли процесс с effective uid `sender_euid` сигнализировать цель с real uid
+/// `target_uid` и effective uid `target_euid`?
 ///
-/// Linux (`check_kill_permission`): permitted when the sender's effective uid is
-/// root, or equals the target's real **or** effective uid. Supplementary groups
-/// and capabilities are not modelled, and there is no `uids` namespace.
+/// Linux (`check_kill_permission`): можно, когда effective uid отправителя — root
+/// либо равен real **или** effective uid цели. Дополнительные группы и
+/// capabilities не моделируются, namespace `uids` нет.
 #[inline]
 pub fn kill_permits(sender_euid: u32, target_uid: u32, target_euid: u32) -> bool {
     sender_euid == 0 || sender_euid == target_uid || sender_euid == target_euid
 }
 
-/// Pick the ONE thread a group-wide signal is queued on.
+/// Выбрать ЕДИНСТВЕННЫЙ поток, на который ставится групповой сигнал.
 ///
-/// Linux queues a group signal on the thread group's shared pending list, so the
-/// handler of a multi-threaded process runs ONCE, not once per thread. pagh's
-/// pending set is per-thread, so the group path must pick a single thread:
-/// the group leader (`tgid`, deterministic and the thread a `kill(-pgid)` caller
-/// usually means) when it is still registered, else the lowest live member
-/// (`members` arrives in ascending pid order from the registry's `BTreeMap`).
+/// Linux ставит групповой сигнал в общий pending-список группы потоков, поэтому
+/// обработчик многопоточного процесса выполняется ОДИН раз, а не на каждый
+/// поток. В pagh pending-набор по-потоковый, поэтому групповой путь обязан
+/// выбрать один поток: лидера группы (`tgid`, детерминированно и именно его
+/// обычно имеет в виду вызывающий `kill(-pgid)`), если он ещё
+/// зарегистрирован, иначе живой член с наименьшим pid (`members` приходят по
+/// возрастанию pid из `BTreeMap` реестра).
 ///
-/// `None` means the group has no live member → `ESRCH` at the call site.
+/// `None` — у группы нет живых членов → `ESRCH` в точке вызова.
 pub fn pick_group_target(members: &[u64], tgid: u64) -> Option<u64> {
     if members.contains(&tgid) {
         return Some(tgid);
@@ -164,7 +167,7 @@ mod tests {
     #[test]
     fn pid_truncates_to_32_bits_then_sign_extends() {
         assert_eq!(decode_pid(0x1_0000_0005), 5);
-        // -5 as an `int` lives in the low 32 bits; the upper half is ignored.
+        // -5 как `int` живёт в младших 32 битах; старшая половина игнорируется.
         assert_eq!(decode_pid(0xFFFF_FFFF_FFFF_FFFB), -5);
         assert_eq!(decode_pid(0xFFFF_FFFB), -5);
         assert_eq!(decode_pid(0xFFFF_FFFF_8000_0000), INT_MIN);
@@ -190,8 +193,8 @@ mod tests {
 
     #[test]
     fn invalid_sig_wins_over_target_lookup() {
-        // Linux validates the signal before resolving the pid, so a bogus pid
-        // together with a bogus signal reports EINVAL (not ESRCH).
+        // Linux проверяет сигнал до разрешения pid, поэтому плохой pid вместе с
+        // плохим сигналом даёт EINVAL (а не ESRCH).
         assert_eq!(kill_args(0xDEAD, 65), Err(Errno::EINVAL));
         assert_eq!(kill_args(0xDEAD, 0), Ok((KillTarget::Pid(0xDEAD), 0)));
     }

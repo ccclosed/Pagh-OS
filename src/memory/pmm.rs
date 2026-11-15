@@ -1,5 +1,4 @@
-// memory/pmm.rs — Physical Memory Manager (bitmap allocator)
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// memory/pmm.rs — Physical Memory Manager (битовый аллокатор кадров).
 
 use crate::memory::cow::CowRefs;
 use crate::sync::spinlock::Spinlock;
@@ -8,52 +7,53 @@ use limine::request::MemmapResponse;
 
 const FRAME_SIZE: u64 = 4096;
 
-/// Everything below 1 MB is permanently reserved (real-mode IVT, BIOS data
-/// area, and assorted legacy/firmware structures). A free call for any address
-/// below this threshold is always a no-op.
+/// Всё ниже 1 МиБ зарезервировано навсегда (IVT реального режима, BIOS data
+/// area и прочие legacy/прошивочные структуры). Освобождение адреса ниже этого
+/// порога — всегда no-op.
 const LOW_RESERVED: u64 = 0x100000;
 
-/// Maximum number of kernel-image physical ranges captured at [`init`] from the
-/// Limine `MEMMAP_EXECUTABLE_AND_MODULES` (kernel-and-modules) memmap entries.
-/// A fixed-size store is used because the PMM is initialized before the heap
-/// allocator exists, so no dynamic allocation is available here.
+/// Максимальное число физических диапазонов образа ядра, захватываемых в
+/// [`init`] из записей memmap Limine `MEMMAP_EXECUTABLE_AND_MODULES`
+/// (ядро и модули). Хранилище фиксированного размера используется потому, что
+/// PMM инициализируется до появления аллокатора кучи, и динамической аллокации
+/// здесь нет.
 const MAX_KERNEL_RANGES: usize = 16;
 
-/// Physical Memory Manager state (bitmap allocator).
+/// Состояние Physical Memory Manager (битовый аллокатор).
 ///
-/// All PMM state lives here, behind the single [`PMM`] spinlock. The bitmap
-/// is placed in usable RAM during [`init`] and accessed via the HHDM mapping,
-/// so the `&'static mut [u64]` is valid for the lifetime of the kernel.
+/// Всё состояние PMM живёт здесь, за единым спинлоком [`PMM`]. Битмап
+/// размещается в пригодной RAM в [`init`] и доступен через отображение HHDM,
+/// поэтому `&'static mut [u64]` валиден всё время жизни ядра.
 struct Pmm {
-    /// Bitmap: one bit per 4KB frame. 1 = free, 0 = used.
+    /// Битмап: один бит на кадр 4 КБ. 1 = свободен, 0 = занят.
     bitmap: &'static mut [u64],
-    /// Total number of frames tracked.
+    /// Общее число отслеживаемых кадров.
     total_frames: usize,
-    /// Number of free frames.
+    /// Число свободных кадров.
     free_count: usize,
-    /// Base physical address the bitmap starts tracking from.
+    /// База физического адреса, с которой битмап начинает отсчёт.
     base_addr: u64,
-    /// Highest address tracked + 1.
+    /// Старший отслеживаемый адрес + 1.
     top_addr: u64,
-    /// Physical base address of the bitmap's own storage.
+    /// Физическая база собственного хранилища битмапа.
     bitmap_phys: u64,
-    /// Size in bytes of the bitmap's own storage.
+    /// Размер собственного хранилища битмапа в байтах.
     bitmap_bytes: u64,
-    /// Kernel-image physical ranges `[start, end)` captured from the Limine
-    /// `MEMMAP_EXECUTABLE_AND_MODULES` entries at init. A free call for any
-    /// address inside one of these ranges is refused.
+    /// Физические диапазоны `[start, end)` образа ядра, захваченные в init из
+    /// записей Limine `MEMMAP_EXECUTABLE_AND_MODULES`. Освобождение любого адреса
+    /// внутри такого диапазона отвергается.
     kernel_ranges: [(u64, u64); MAX_KERNEL_RANGES],
-    /// Number of valid entries in [`Pmm::kernel_ranges`].
+    /// Число валидных записей в [`Pmm::kernel_ranges`].
     kernel_range_count: usize,
 }
 
 impl Pmm {
-    /// Returns `true` if `addr` falls in a permanently-reserved region that a
-    /// free call must never return to the allocatable pool: below 1 MB, within
-    /// the bitmap's own frames, or within a captured kernel-image range.
+    /// `true`, если `addr` попадает в постоянно зарезервированный регион,
+    /// который освобождение никогда не должно возвращать в пул: ниже 1 МиБ,
+    /// внутрь собственных кадров битмапа или в захваченный диапазон образа ядра.
     ///
-    /// These frames were never marked free at init, so flipping their bit on a
-    /// stray free would corrupt the allocatable pool (Property 4).
+    /// На init эти кадры не помечались свободными, поэтому выставление их бита
+    /// при случайном free испортило бы пул (Property 4).
     fn is_reserved(&self, addr: u64) -> bool {
         if addr < LOW_RESERVED {
             return true;
@@ -71,22 +71,23 @@ impl Pmm {
     }
 }
 
-/// Global PMM state, protected by a single spinlock.
+/// Глобальное состояние PMM под единым спинлоком.
 ///
-/// `None` until [`init`] runs. The lock provides exclusive access, which is
-/// what makes holding a `&'static mut [u64]` inside sound across callers.
+/// `None`, пока не выполнен [`init`]. Лок даёт эксклюзивный доступ, и именно
+/// поэтому хранение `&'static mut [u64]` внутри остаётся корректным между
+/// вызывающими.
 static PMM: Spinlock<Option<Pmm>> = Spinlock::new(None);
 
-/// Initialize the Physical Memory Manager from the Limine memory map.
+/// Инициализировать Physical Memory Manager по карте памяти Limine.
 pub fn init(memmap: &MemmapResponse) {
     let entries = memmap.entries();
 
-    // Find the address range: lowest usable base and highest usable top.
+    // Найти диапазон: минимальная пригодная база и максимальная пригодная вершина.
     let mut base = u64::MAX;
     let mut top = 0u64;
     let mut total_usable = 0u64;
 
-    // First pass: determine the total range and usable memory size.
+    // Первый проход: определить общий диапазон и объём пригодной памяти.
     for entry in entries {
         if entry.type_ == memmap::MEMMAP_USABLE {
             if entry.base < base {
@@ -105,12 +106,12 @@ pub fn init(memmap: &MemmapResponse) {
         return;
     }
 
-    // Align base down and top up to FRAME_SIZE.
+    // Выровнять базу вниз, вершину — вверх до FRAME_SIZE.
     base &= !(FRAME_SIZE - 1);
     top = (top + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
 
     let total_frames = ((top - base) / FRAME_SIZE) as usize;
-    // Bitmap size in bytes: total_frames / 8, rounded up to 8-byte alignment.
+    // Размер битмапа в байтах: total_frames / 8 с округлением до выравнивания на 8.
     let bitmap_words = (total_frames + 63) / 64;
     let bitmap_bytes = bitmap_words * 8;
 
@@ -126,19 +127,19 @@ pub fn init(memmap: &MemmapResponse) {
         bitmap_bytes
     );
 
-    // Find a usable region large enough to hold the bitmap.
-    // Every candidate is fully fit-checked: prefer 2 MB into the region (the
-    // bitmap's own frames are reserved explicitly below, so the offset is
-    // just a placement choice), fall back to the region start; a region only
-    // qualifies when the ENTIRE bitmap lands inside it. Scanning all usable
-    // regions (not just the first) means a small low-memory hole cannot win
-    // the placement over a later region that truly fits.
+    // Найти пригодный регион, достаточно большой для битмапа.
+    // Каждый кандидат проверяется целиком: предпочесть 2 МиБ внутрь региона
+    // (собственные кадры битмапа резервируются явно ниже, так что смещение —
+    // лишь выбор места), иначе начало региона; регион годится, только когда ВЕСЬ
+    // битмап помещается в него. Сканирование всех пригодных регионов (а не
+    // только первого) не даёт маленькой низкой дыре выиграть у более позднего
+    // региона, который действительно подходит.
     let mut bitmap_phys_addr: u64 = 0;
     for entry in entries {
         if entry.type_ == memmap::MEMMAP_USABLE {
             let region_end = entry.base + entry.length;
             if entry.length >= bitmap_bytes as u64 {
-                let candidate = (entry.base + 0x200000) & !(FRAME_SIZE - 1); // 2MB offset
+                let candidate = (entry.base + 0x200000) & !(FRAME_SIZE - 1); // смещение 2 МиБ
                 if candidate + bitmap_bytes as u64 <= region_end {
                     bitmap_phys_addr = candidate;
                     break;
@@ -150,10 +151,10 @@ pub fn init(memmap: &MemmapResponse) {
     }
 
     if bitmap_phys_addr == 0 {
-        // No usable region can hold the full bitmap. Continuing with a
-        // truncated bitmap (or one spilling past its region) would let the
-        // allocator hand out or corrupt frames outside the covered range, so
-        // refuse to boot instead of failing silently later.
+        // Ни один пригодный регион не вмещает весь битмап. Продолжать с
+        // урезанным битмапом (или вылезающим за регион) значило бы позволить
+        // аллокатору выдавать или портить кадры вне покрытого диапазона, поэтому
+        // отказываемся грузиться, а не падаем молча позже.
         panic!(
             "[PMM] no usable memory region fits the {}-byte frame bitmap ({} frames in 0x{:x}..0x{:x}); cannot initialize the frame allocator",
             bitmap_bytes, total_frames, base, top
@@ -162,11 +163,11 @@ pub fn init(memmap: &MemmapResponse) {
 
     crate::debug!("Bitmap at physical: 0x{:x}", bitmap_phys_addr);
 
-    // Capture the kernel-image physical range(s) from the Limine
-    // kernel-and-modules memmap entries. These frames are reserved (never
-    // freed at init) and must never be returned to the pool by a stray free
-    // (R6.1/R6.2). We page-align each range outward so a partial-frame entry
-    // still fully covers the frames it touches.
+    // Захватить физический диапазон(ы) образа ядра из записей memmap Limine
+    // «ядро и модули». Эти кадры зарезервированы (на init не освобождаются) и
+    // никогда не должны вернуться в пул при случайном free (R6.1/R6.2). Каждый
+    // диапазон выравниваем по страницам наружу, чтобы частично-кадровая запись
+    // полностью покрывала затронутые кадры.
     let mut kernel_ranges = [(0u64, 0u64); MAX_KERNEL_RANGES];
     let mut kernel_range_count = 0usize;
     for entry in entries {
@@ -189,20 +190,20 @@ pub fn init(memmap: &MemmapResponse) {
         }
     }
 
-    // Map the bitmap into kernel address space via HHDM.
+    // Отобразить битмап в адресное пространство ядра через HHDM.
     let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
     let bitmap_virt = (bitmap_phys_addr + hhdm) as *mut u64;
     let bitmap_slice: &'static mut [u64];
 
-    // SAFETY: The bitmap region is in usable RAM, so accessing it via HHDM
-    // is valid. We zero it first.
+    // SAFETY: регион битмапа находится в пригодной RAM, поэтому доступ через
+    // HHDM валиден. Сначала обнуляем его.
     unsafe {
         let slice_ptr = core::slice::from_raw_parts_mut(bitmap_virt, bitmap_words);
         slice_ptr.fill(0);
         bitmap_slice = slice_ptr;
     }
 
-    // Mark all frames as used initially, then free usable regions.
+    // Пометить все кадры занятыми, затем освободить пригодные регионы.
     let mut pmm = Pmm {
         bitmap: bitmap_slice,
         total_frames,
@@ -215,43 +216,42 @@ pub fn init(memmap: &MemmapResponse) {
         kernel_range_count,
     };
 
-    // ─── Reservation logic (frame free/reserve) ──────────────────────────
-    // Precise reservation (task 6.2). There are only two *explicit*
-    // reservations here:
-    //   1. Below 1 MB (`addr < 0x100000`): low memory holds the real-mode IVT,
-    //      BIOS data area, and assorted legacy/firmware structures. These must
-    //      never be handed out (Property 2), so we skip every frame below 1 MB.
-    //   2. The bitmap's own physical frames (skipped below and re-asserted as
-    //      used in the follow-up pass).
+    // ─── Логика резервирования (free/reserve кадра) ─────────────────────
+    // Точное резервирование. Явных резерваций здесь только две:
+    //   1. Ниже 1 МиБ (`addr < 0x100000`): там IVT реального режима, BIOS data
+    //      area и legacy/прошивочные структуры. Их нельзя выдавать (Property 2),
+    //      поэтому пропускаем каждый кадр ниже 1 МиБ.
+    //   2. Собственные физические кадры битмапа (пропускаются ниже и повторно
+    //      утверждаются занятыми на завершающем проходе).
     //
-    // The kernel image itself is reserved *implicitly* by classification, not
-    // by any magic address threshold: this loop only ever frees frames that
-    // Limine reports as MEMMAP_USABLE, and the kernel's physical frames are
-    // reported as MEMMAP_KERNEL_AND_MODULES (not usable). They are therefore
-    // never freed, and remain marked used (0) — so no address within the
-    // reserved kernel image range can ever be returned by `alloc_frame`
-    // (Property 2). The same holds for MMIO/reserved/ACPI regions. This
-    // replaces the old crude "first 8 MB" (`addr < 0x800000`) over-reservation,
-    // which needlessly withheld usable RAM above the kernel.
+    // Сам образ ядра резервируется *неявно* классификацией, а не магическим
+    // порогом: цикл освобождает только кадры, помеченные Limine как
+    // MEMMAP_USABLE, а физические кадры ядра помечены как
+    // MEMMAP_KERNEL_AND_MODULES (не usable). Поэтому они никогда не
+    // освобождаются и остаются занятыми (0) — так ни один адрес зарезервированного
+    // образа ядра не может вернуться из `alloc_frame` (Property 2). То же для
+    // регионов MMIO/reserved/ACPI. Это заменяет прежнее грубое резервирование
+    // «первые 8 МиБ» (`addr < 0x800000`), без нужды отнимавшее пригодную RAM
+    // выше ядра.
 
-    // Free frames in usable regions, BUT protect the bitmap itself.
+    // Освободить кадры в пригодных регионах, но защитить сам битмап.
     for entry in entries {
         if entry.type_ == memmap::MEMMAP_USABLE {
             let region_start = entry.base;
             let region_end = entry.base + entry.length;
 
-            // Mark frames in this region as free, except those used by the bitmap.
+            // Пометить кадры региона свободными, кроме занятых битмапом.
             let frame_start = align_up(region_start, FRAME_SIZE);
             let frame_end = align_down(region_end, FRAME_SIZE);
 
             let mut addr = frame_start;
             while addr < frame_end {
-                // (1) Reserve everything below 1 MB (legacy/BIOS/IVT).
+                // (1) Зарезервировать всё ниже 1 МиБ (legacy/BIOS/IVT).
                 if addr < 0x100000 {
                     addr += FRAME_SIZE;
                     continue;
                 }
-                // (2) Skip the bitmap's own physical frames.
+                // (2) Пропустить собственные физические кадры битмапа.
                 if addr >= bitmap_phys_addr && addr < bitmap_phys_addr + bitmap_bytes as u64 {
                     addr += FRAME_SIZE;
                     continue;
@@ -269,7 +269,7 @@ pub fn init(memmap: &MemmapResponse) {
         }
     }
 
-    // Also mark the bitmap's own frames as used.
+    // Также пометить собственные кадры битмапа занятыми.
     let mut bm_addr = bitmap_phys_addr;
     while bm_addr < bitmap_phys_addr + bitmap_bytes as u64 {
         let idx = ((bm_addr - base) / FRAME_SIZE) as usize;
@@ -287,7 +287,7 @@ pub fn init(memmap: &MemmapResponse) {
     let free_count = pmm.free_count;
     let total = pmm.total_frames;
 
-    // Publish the fully-built state. Keep logging outside the locked section.
+    // Опубликовать полностью собранное состояние. Логирование держать вне секции лока.
     *PMM.lock() = Some(pmm);
 
     crate::debug!(
@@ -301,18 +301,18 @@ pub fn init(memmap: &MemmapResponse) {
     let _ = total_usable;
 }
 
-/// Allocate a single physical frame (4KB).
-/// Returns the physical address of the frame, or None if out of memory.
+/// Выделить один физический кадр (4 КБ).
+/// Возвращает физический адрес кадра или None при нехватке памяти.
 pub fn alloc_frame() -> Option<u64> {
     let mut guard = PMM.lock();
     let pmm = match *guard {
         Some(ref mut pmm) => pmm,
-        None => return None, // Not initialized
+        None => return None, // Не инициализирован
     };
 
     let base_addr = pmm.base_addr;
 
-    // Simple linear scan for a free frame.
+    // Простой линейный поиск свободного кадра.
     for word_idx in 0..pmm.bitmap.len() {
         let word = pmm.bitmap[word_idx];
         if word != 0 {
@@ -329,27 +329,24 @@ pub fn alloc_frame() -> Option<u64> {
     None
 }
 
-/// Allocate `count` physically-contiguous 4 KiB frames.
+/// Выделить `count` физически непрерывных кадров по 4 КиБ.
 ///
-/// Scans the bitmap for the first run of `count` consecutive *free* frames
-/// (bit == 1), marks them all used (bit == 0), and returns the physical base
-/// address of the run. Returns `None` if `count == 0`, the PMM is
-/// uninitialized, or no contiguous run of `count` free frames exists.
+/// Сканирует битмап в поисках первого прогона из `count` подряд *свободных*
+/// кадров (бит == 1), помечает их занятыми (бит == 0) и возвращает физическую
+/// базу прогона. `None`, если `count == 0`, PMM не инициализирован или
+/// непрерывного прогона из `count` свободных кадров нет.
 ///
-/// Guarantees (mirroring [`alloc_frame`]):
-/// - the returned base is 4096-byte page-aligned,
-/// - the base is `>= 0x100000` — frames below 1 MB (and every other reserved
-///   region: the kernel image, the bitmap's own frames, MMIO/ACPI) are marked
-///   used at [`init`] time, so they can never appear inside a free run and are
-///   never returned here,
-/// - all `count` frames were previously free and are now used, so the run does
-///   not overlap any other live allocation.
+/// Гарантии (как у [`alloc_frame`]): возвращённая база выровнена на страницу
+/// 4096; база `>= 0x100000` — кадры ниже 1 МиБ и все прочие зарезервированные
+/// регионы (образ ядра, кадры битмапа, MMIO/ACPI) помечены занятыми в [`init`],
+/// поэтому не могут попасть в свободный прогон и не возвращаются здесь; все
+/// `count` кадров были свободны и стали заняты, так что прогон не пересекается
+/// с другой живой аллокацией.
 ///
-/// `count == 1` behaves exactly like [`alloc_frame`] (returns the first free
-/// frame). Operates under the single [`PMM`] spinlock, leaving the existing
-/// single-frame API untouched. Pair every successful call with exactly one
-/// [`free_frames_contiguous`] of the same `base`/`count` to restore the free
-/// count.
+/// `count == 1` ведёт себя как [`alloc_frame`] (первый свободный кадр). Работает
+/// под единым спинлоком [`PMM`], не трогая существующий API одиночных кадров.
+/// Каждый успешный вызов пар должен иметь ровно один
+/// [`free_frames_contiguous`] с теми же `base`/`count`.
 pub fn alloc_frames_contiguous(count: usize) -> Option<u64> {
     if count == 0 {
         return None;
@@ -358,7 +355,7 @@ pub fn alloc_frames_contiguous(count: usize) -> Option<u64> {
     let mut guard = PMM.lock();
     let pmm = match *guard {
         Some(ref mut pmm) => pmm,
-        None => return None, // Not initialized
+        None => return None, // Не инициализирован
     };
 
     let total = pmm.total_frames;
@@ -366,12 +363,12 @@ pub fn alloc_frames_contiguous(count: usize) -> Option<u64> {
         return None;
     }
 
-    // Linear scan for the first run of `count` consecutive free frames.
+    // Линейный поиск первого прогона из `count` идущих подряд свободных кадров.
     //
-    // Loop invariant: when `run_len > 0`, the frames in
-    // `[run_start, run_start + run_len)` are all free for the current `run_len`.
-    // Bits beyond `total_frames` in the final bitmap word are zero (used) and
-    // are never scanned, so out-of-range frames cannot form part of a run.
+    // Инвариант цикла: при `run_len > 0` кадры в
+    // `[run_start, run_start + run_len)` все свободны для текущего `run_len`.
+    // Биты за `total_frames` в последнем слове битмапа нулевые (заняты) и не
+    // сканируются, поэтому кадры вне диапазона не могут стать частью прогона.
     let mut run_start: usize = 0;
     let mut run_len: usize = 0;
     let mut found: Option<usize> = None;
@@ -399,7 +396,7 @@ pub fn alloc_frames_contiguous(count: usize) -> Option<u64> {
 
     let start = found?;
 
-    // Mark the whole run used.
+    // Пометить весь прогон занятым.
     for i in start..start + count {
         let word = i / 64;
         let bit = i % 64;
@@ -411,14 +408,14 @@ pub fn alloc_frames_contiguous(count: usize) -> Option<u64> {
     Some(addr)
 }
 
-/// Free a `count`-frame physically-contiguous run previously returned by
+/// Освободить `count`-кадровый физически непрерывный прогон, ранее выданный
 /// [`alloc_frames_contiguous`].
 ///
-/// Clears (marks free) `count` consecutive frames starting at `base`,
-/// restoring the free-frame count by exactly the number of frames that were
-/// actually used (idempotent per-frame, like [`free_frame`]). Out-of-range
-/// frames are skipped. `base` must be the page-aligned base returned by a
-/// matching `alloc_frames_contiguous(count)`.
+/// Очищает (помечает свободными) `count` идущих подряд кадров от `base`,
+/// восстанавливая счётчик свободных ровно на число реально занятых кадров
+/// (идемпотентно покадрово, как [`free_frame`]). Кадры вне диапазона
+/// пропускаются. `base` должен быть выровненной на страницу базой, возвращённой
+/// парным `alloc_frames_contiguous(count)`.
 pub fn free_frames_contiguous(base: u64, count: usize) {
     if count == 0 {
         return;
@@ -427,11 +424,11 @@ pub fn free_frames_contiguous(base: u64, count: usize) {
     let mut guard = PMM.lock();
     let pmm = match *guard {
         Some(ref mut pmm) => pmm,
-        None => return, // Not initialized
+        None => return, // Не инициализирован
     };
 
     if base < pmm.base_addr || base >= pmm.top_addr {
-        return; // Not in our range
+        return; // Вне нашего диапазона
     }
 
     let start = ((base - pmm.base_addr) / FRAME_SIZE) as usize;
@@ -440,9 +437,9 @@ pub fn free_frames_contiguous(base: u64, count: usize) {
             break;
         }
         let addr = pmm.base_addr + (i as u64) * FRAME_SIZE;
-        // Refuse to free reserved frames (below 1 MB, the bitmap's own frames,
-        // or a kernel-image range). Leave free_count and the bitmap unchanged
-        // for those frames (R6.1).
+        // Отказать в освобождении зарезервированных кадров (ниже 1 МиБ, кадры
+        // битмапа или диапазон образа ядра). Для них free_count и битмап не
+        // меняются (R6.1).
         if pmm.is_reserved(addr) {
             continue;
         }
@@ -455,18 +452,18 @@ pub fn free_frames_contiguous(base: u64, count: usize) {
     }
 }
 
-/// Free a previously allocated physical frame.
+/// Освободить ранее выделенный физический кадр.
 ///
-/// A frame that still has registered COW sharers is REFUSED (logged) rather
-/// than returned to the bitmap: every one of those sharers has a live PTE into
-/// the frame, so freeing it here would hand still-mapped memory to the next
-/// `alloc_frame` — the F-r2-arch-1 use-after-free. The legitimate release path
-/// ([`crate::memory::vmm::release_user_leaf`]) calls [`cow_unref`] first and
-/// reaches this function only when the last reference is gone.
+/// Кадр, у которого ещё есть зарегистрированные COW-шарящие, ОТВЕРГАЕТСЯ
+/// (с логом), а не возвращается в битмап: у каждого такого шарящего есть живой
+/// PTE в кадр, и освобождение отдало бы всё ещё отображённую память следующему
+/// `alloc_frame` — use-after-free. Легитимный путь освобождения
+/// ([`crate::memory::vmm::release_user_leaf`]) сначала зовёт [`cow_unref`] и
+/// приходит сюда только когда последняя ссылка ушла.
 pub fn free_frame(addr: u64) {
-    // The ownership check takes COW_REFS before PMM and releases it first; no
-    // path holds COW_REFS across a PMM acquisition, so the two spinlocks are
-    // never nested (both mask interrupts while held).
+    // Проверка владения берёт COW_REFS до PMM и отпускает его первым; ни один
+    // путь не держит COW_REFS во время захвата PMM, поэтому два спинлока никогда
+    // не вложены (оба маскируют прерывания на время удержания).
     if frame_is_cow_shared(addr) {
         crate::error!(
             "[PMM] refusing to free COW-shared frame=0x{:016x} - release path must cow_unref first",
@@ -477,15 +474,15 @@ pub fn free_frame(addr: u64) {
     let mut guard = PMM.lock();
     let pmm = match *guard {
         Some(ref mut pmm) => pmm,
-        None => return, // Not initialized
+        None => return, // Не инициализирован
     };
 
     if addr < pmm.base_addr || addr >= pmm.top_addr {
-        return; // Not in our range
+        return; // Вне нашего диапазона
     }
 
-    // Refuse to free reserved frames (below 1 MB, the bitmap's own frames, or a
-    // kernel-image range). Leave free_count and the bitmap unchanged (R6.1).
+    // Отказать в освобождении зарезервированных кадров (ниже 1 МиБ, кадры
+    // битмапа или диапазон образа ядра). free_count и битмап не меняются (R6.1).
     if pmm.is_reserved(addr) {
         return;
     }
@@ -500,11 +497,11 @@ pub fn free_frame(addr: u64) {
             pmm.bitmap[word] |= 1u64 << bit;
             pmm.free_count += 1;
         } else {
-            // The frame is already marked free -> double free
-            // (or a free of a frame this caller never owned). This is exactly
-            // the accounting bug that later surfaces as "an unrelated process's
-            // page suddenly reads as zeroes" once the frame is re-allocated and
-            // zero-filled by its new owner.
+            // Кадр уже помечен свободным -> double free (или освобождение кадра,
+            // которым этот вызывающий никогда не владел). Это ровно та ошибка
+            // учёта, которая позже проявляется как «страница постороннего
+            // процесса вдруг читается нулями», когда кадр заново выделяется и
+            // обнуляется новым владельцем.
             double_free = true;
         }
     }
@@ -517,62 +514,62 @@ pub fn free_frame(addr: u64) {
     }
 }
 
-// ─── COW frame sharing (fork copy-on-write) ──────────────────────────────────
+// ─── разделение COW-кадров (fork copy-on-write) ──────────────────────────────
 //
-// `fork_user_space_cow` shares every leaf frame between the parent and the
-// child address space instead of copying it. The frame's physical address is
-// keyed in [`CowRefs`] with the number of address spaces that reference it as
-// COW sharers. Frames enter with count 2 at fork time and leave either via a
-// copy-on-write fault (one side gets a private copy) or via a leaf release
-// (`munmap`, `mprotect(PROT_NONE)`, `MAP_FIXED` replacement, address-space
-// teardown). The frame is returned to the free bitmap exactly when the count
-// reaches zero — never before, so a child exiting first cannot pull the
-// parent's data out from under it.
+// `fork_user_space_cow` разделяет каждый листовой кадр между адресными
+// пространствами родителя и ребёнка вместо копирования. Физический адрес кадра
+// индексируется в [`CowRefs`] с числом адресных пространств, ссылающихся на него
+// как COW-шарящие. При fork кадр входит со счётчиком 2, а уходит либо через
+// copy-on-write fault (одна сторона получает приватную копию), либо через
+// освобождение листа (`munmap`, `mprotect(PROT_NONE)`, замена `MAP_FIXED`, снос
+// адресного пространства). Кадр возвращается в битмап ровно когда счётчик
+// достигает нуля — никогда раньше, поэтому первым вышедший ребёнок не вырвет
+// данные родителя.
 //
-// The map is deliberately separate from the bitmap: only COW frames are
-// counted, kernel frames and pre-fork private frames keep the plain
-// alloc/free protocol.
+// Карта намеренно отделена от битмапа: считаются только COW-кадры, ядерные и
+// приватные доку-кадры держат обычный протокол alloc/free.
 //
-// The accounting lives in `memory::cow` (a pure, host-tested module) so the
-// ownership rules are exercised by `host-tests` against the same source the
-// kernel compiles. This file only wraps it in the interrupt-safe spinlock.
+// Учёт живёт в `memory::cow` (чистый, host-тестируемый модуль), поэтому правила
+// владения проверяются `host-tests` по тому же исходнику, что компилирует ядро.
+// Этот файл лишь оборачивает его в безопасный к прерываниям спинлок.
 
 static COW_REFS: Spinlock<CowRefs> = Spinlock::new(CowRefs::new());
 
-/// Register one additional COW sharer of `frame`. `fork_user_space_cow`
-/// calls this once per side that newly references the leaf as COW: two calls
-/// for a previously-private leaf (parent enters the map along with the
-/// child), one call when forking an already-shared leaf.
+/// Зарегистрировать ещё одного COW-шарящего `frame`. `fork_user_space_cow`
+/// зовёт это по разу на каждую сторону, которая заново ссылается на лист как
+/// COW: два вызова для прежде приватного листа (родитель входит в карту вместе
+/// с ребёнком), один — при fork уже разделяемого листа.
 pub fn cow_ref(frame: u64) {
     COW_REFS.lock().acquire(frame);
 }
 
-/// Drop one COW sharer of `frame`. Returns `true` when the caller must hand
-/// the frame back to the free bitmap (no address space references it
-/// anymore); `false` while at least one sharer remains.
+/// Отпустить одного COW-шарящего `frame`. Возвращает `true`, когда вызывающий
+/// обязан вернуть кадр в битмап свободных (на него больше не ссылается ни одно
+/// адресное пространство); `false`, пока остался хотя бы один шарящий.
 pub fn cow_unref(frame: u64) -> bool {
     COW_REFS.lock().release(frame)
 }
 
-/// Current COW share count of `frame` (0 when privately owned/untracked).
+/// Текущий COW-счётчик `frame` (0, когда кадр приватный/неучтённый).
 ///
-/// Diagnostics and the in-QEMU ownership self-test use this; the release paths
-/// must use [`cow_unref`]'s return value, never a read-then-free sequence.
+/// Используется диагностикой и in-QEMU self-тестом владения; пути
+/// освобождения обязаны использовать возврат [`cow_unref`], а не
+/// последовательность «прочитать, потом освободить».
 pub fn cow_refs(frame: u64) -> u32 {
     COW_REFS.lock().refs(frame)
 }
 
-/// Number of frames currently tracked as COW-shared (diagnostics/selftest).
+/// Число кадров, отслеживаемых сейчас как COW-разделяемые (диагностика/selftest).
 pub fn cow_tracked_frames() -> usize {
     COW_REFS.lock().tracked_frames()
 }
 
-/// `true` while `frame` has at least one registered COW sharer.
+/// `true`, пока у `frame` есть хотя бы один зарегистрированный COW-шарящий.
 fn frame_is_cow_shared(frame: u64) -> bool {
     COW_REFS.lock().refs(frame) != 0
 }
 
-/// Total number of frames tracked.
+/// Общее число отслеживаемых кадров.
 pub fn total_frames() -> usize {
     match *PMM.lock() {
         Some(ref pmm) => pmm.total_frames,
@@ -580,7 +577,7 @@ pub fn total_frames() -> usize {
     }
 }
 
-/// Number of free frames.
+/// Число свободных кадров.
 pub fn free_frames() -> usize {
     match *PMM.lock() {
         Some(ref pmm) => pmm.free_count,
@@ -588,7 +585,7 @@ pub fn free_frames() -> usize {
     }
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────
+// ─── Хелперы ─────────────────────────────────────────────────────────────
 
 fn align_up(addr: u64, align: u64) -> u64 {
     (addr + align - 1) & !(align - 1)

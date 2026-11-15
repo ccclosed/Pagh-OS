@@ -1,31 +1,30 @@
-//! Terminal customization: colour themes, wallpaper, and the live `settings` panel.
+//! Настройка терминала: цветовые темы, обои и живая панель `settings`.
 //!
-//! Everything here is cosmetic and reversible. The console has one knob that
-//! actually matters — the foreground colour (`framebuffer::set_fg_color`) — plus a
-//! background knob and a wallpaper layer, and this module owns the choices made on
-//! top of them. Three rules keep it from becoming a source of "hardware" bugs:
+//! Всё здесь косметическое и обратимое. У консоли одна ручка, которая реально
+//! важна, — foreground-цвет (`framebuffer::set_fg_color`), — плюс ручка фона и
+//! слой обоев; модуль владеет выбором поверх них. Три правила не дают ему стать
+//! источником «аппаратных» багов:
 //!
-//! * **State is one small struct in one lock.** [`settings()`] hands out a guard;
-//!   anything that needs several fields reads them together, so a half-applied
-//!   theme cannot be observed.
-//! * **Applying is explicit.** Mutating the struct does not touch the screen;
-//!   [`apply`] pushes the palette into the drivers, and callers repaint. A panel
-//!   that changed five colours and then hit an error would otherwise leave the
-//!   console striped.
-//! * **No allocation on the paint path.** Wallpapers are computed from the pixel
-//!   coordinates, not from a stored image, so a 1280×800 gradient costs arithmetic
-//!   and a `settings` change costs nothing.
+//! * **Состояние — одна маленькая структура под одним локом.** [`settings()`]
+//!   выдаёт guard; всё, что нужно читать несколько полей, читает их вместе, так
+//!   что полуприменённую тему наблюдать нельзя.
+//! * **Применение явное.** Мутация структуры не трогает экран; [`apply`]
+//!   проталкивает палитру в драйверы, а вызывающие перерисовывают. Панель,
+//!   сменившая пять цветов и затем упавшая, иначе оставила бы консоль полосатой.
+//! * **Никаких аллокаций на пути рисования.** Обои считаются из пиксельных
+//!   координат, а не из сохранённого изображения, так что градиент 1280×800
+//!   стоит арифметики, а смена `settings` не стоит ничего.
 //!
-//! The panel ([`run_panel`]) is a modal screen, not a shell command: it owns the
-//! keyboard until the user leaves, because every keystroke in it means "change
-//! something and show me", which is exactly what the shell's line editor would
-//! otherwise consume. `paint` takes the same approach.
+//! Панель ([`run_panel`]) — модальный экран, а не команда shell: она владеет
+//! клавиатурой, пока пользователь не выйдет, потому что каждое нажатие там
+//! означает «поменяй и покажи», а именно это построчный редактор shell иначе бы
+//! проглотил. `paint` придерживается того же подхода.
 
 use crate::shell::keys::{Decoder, KeyEvent};
 use crate::sync::spinlock::Spinlock;
 
-/// Built-in colour schemes. The index into this table is what the `theme` command
-/// and the panel store, so adding a scheme is a single row here.
+/// Встроенные цветовые схемы. Индекс в этой таблице — то, что хранят команда
+/// `theme` и панель, так что добавление схемы — одна строка здесь.
 pub static THEMES: &[Theme] = &[
     Theme {
         name: "classic",
@@ -79,7 +78,7 @@ pub static THEMES: &[Theme] = &[
     },
 ];
 
-/// One colour scheme. All values are `0xRRGGBB`, matching the framebuffer driver.
+/// Одна цветовая схема. Все значения — `0xRRGGBB`, как у framebuffer-драйвера.
 #[derive(Clone, Copy)]
 pub struct Theme {
     pub name: &'static str,
@@ -92,20 +91,20 @@ pub struct Theme {
     pub status_text: u32,
 }
 
-/// A wallpaper layer painted behind the text.
+/// Слой обоев, рисуемый за текстом.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Wallpaper {
-    /// Plain background colour.
+    /// Обычный цвет фона.
     None,
-    /// Vertical gradient between two colours, derived from the theme.
+    /// Вертикальный градиент между двумя цветами, производными от темы.
     Gradient,
-    /// Horizontal gradient.
+    /// Горизонтальный градиент.
     GradientX,
-    /// Gradient plus a darker band every third scanline (CRT-ish).
+    /// Градиент плюс более тёмная полоса каждую третью строку развёртки (в духе CRT).
     Scanlines,
-    /// Deterministic starfield from a fixed hash — no RNG state to keep.
+    /// Детерминированное звёздное поле из фиксированного хеша — без состояния RNG.
     Stars,
-    /// A coarser checkerboard, useful to see exactly which cells are repainted.
+    /// Более крупная шахматка — удобно видеть, какие именно клетки перерисовываются.
     Grid,
 }
 
@@ -135,16 +134,16 @@ impl Wallpaper {
     }
 }
 
-/// The whole customization state.
+/// Всё состояние кастомизации.
 #[derive(Clone, Copy)]
 pub struct Settings {
     pub theme: usize,
     pub wallpaper: Wallpaper,
-    /// Status bar text/background come from the theme; this hides the bar instead.
+    /// Текст/фон status bar берутся из темы; этот флаг вместо этого скрывает полосу.
     pub status_bar: bool,
-    /// Show the mouse position in the status bar (`mouse(x,y)`).
+    /// Показывать позицию мыши в status bar (`mouse(x,y)`).
     pub status_mouse: bool,
-    /// Whether the blinking caret is drawn in the shell.
+    /// Рисуется ли мигающая каретка в shell.
     pub caret: bool,
 }
 
@@ -159,12 +158,12 @@ impl Settings {
         }
     }
 
-    /// The active theme.
+    /// Активная тема.
     pub fn theme(&self) -> &'static Theme {
         &THEMES[self.theme.min(THEMES.len() - 1)]
     }
 
-    /// Cycle to the next scheme and return its name.
+    /// Переключиться на следующую схему и вернуть её имя.
     pub fn next_theme(&mut self) -> &'static str {
         self.theme = (self.theme + 1) % THEMES.len();
         self.theme().name
@@ -173,72 +172,73 @@ impl Settings {
 
 static SETTINGS: Spinlock<Settings> = Spinlock::new(Settings::new());
 
-/// Set when the palette changed under the shell's feet.
+/// Ставится, когда палитра сменилась под ногами shell.
 ///
-/// The console model remembers the colour each cell was drawn in, so changing the
-/// palette makes the pixels *behind* the text wrong, not the text itself: a pixel
-/// repaint shows the new background under the old colours. The shell consumes this
-/// flag and reprints its own line, which is the only place that can re-emit the
-/// prompt in the new colours.
+/// Модель консоли помнит цвет каждой клетки, так что смена палитры делает
+/// неверными пиксели *за* текстом, а не сам текст: перерисовка пикселей
+/// показывает новый фон под старыми цветами. Shell потребляет этот флаг и
+/// перепечатывает свою строку — единственное место, которое может заново выдать
+/// промпт в новых цветах.
 static FORCE_REDRAW: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Ask the shell to reprint its prompt and re-read the status bar on its next pass.
+/// Попросить shell перепечатать промпт и перечитать status bar на следующем проходе.
 pub fn request_redraw() {
     FORCE_REDRAW.store(true, core::sync::atomic::Ordering::SeqCst);
 }
 
-/// Take the pending redraw request (and clear it).
+/// Забрать ожидающий запрос перерисовки (и очистить его).
 pub fn take_force_redraw() -> bool {
     FORCE_REDRAW.swap(false, core::sync::atomic::Ordering::SeqCst)
 }
 
-/// Run `f` with the settings. Keep the closure short: the lock masks interrupts.
+/// Выполнить `f` с настройками. Держите замыкание коротким: лок маскирует прерывания.
 pub fn with<R>(f: impl FnOnce(&mut Settings) -> R) -> R {
     let mut guard = SETTINGS.lock();
     f(&mut guard)
 }
 
-/// A snapshot, for callers that need several fields at once without holding the lock.
+/// Снимок для вызывающих, которым нужно несколько полей сразу без удержания лока.
 pub fn snapshot() -> Settings {
     *SETTINGS.lock()
 }
 
-/// Push the palette into the drivers. Does not repaint: the caller decides when
-/// the screen catches up, so a multi-step change is never shown half-applied.
+/// Протолкнуть палитру в драйверы. Не перерисовывает: вызывающий решает, когда
+/// экран догонит, так что многошаговая смена никогда не показывается наполовину применённой.
 pub fn apply() {
     let s = snapshot();
     let theme = s.theme();
     crate::drivers::framebuffer::set_fg_color(theme.text);
     crate::drivers::framebuffer::set_bg_color(theme.background);
-    // The strip has its own two colours in the theme; deriving them from the text
-    // colours made every scheme's bar look like the default one.
+    // У полосы в теме свои два цвета; вывод их из цветов текста делал полосу
+    // каждой схемы похожей на дефолтную.
     crate::drivers::framebuffer::set_status_colors(theme.status_bar, theme.status_text);
-    // A wallpaper only shows *through* text when the console stops stamping its
-    // background behind every glyph. On a plain background that stamp is what keeps
-    // a re-printed cell clean, so it goes back on.
+    // Обои видны *сквозь* текст, только когда консоль перестаёт штамповать свой
+    // фон за каждым глифом. На обычном фоне этот штамп и держит перепечатанную
+    // клетку чистой, так что его надо вернуть.
     crate::drivers::framebuffer::set_opaque_bg(s.wallpaper == Wallpaper::None);
     crate::shell::render::set_colors(theme.text, theme.prompt, theme.error, theme.success);
-    // The status strip is drawn with its own two colours and no text of its own
-    // changes when the theme does, so it has to be repainted here — the shell only
-    // redraws it when its *text* changes, which may be seconds later.
+    // Status strip рисуется своими двумя цветами, и его текст сам по себе не
+    // меняется вместе с темой, поэтому его надо перерисовать здесь — shell
+    // перерисовывает полосу только когда меняется её *текст*, а это может быть
+    // секундами позже.
     let mouse = crate::drivers::ps2_mouse::poll();
     crate::drivers::framebuffer::draw_status_bar(&status_left(), &status_right(&mouse));
-    // Anything else already on screen was drawn with the old palette and is wrong.
+    // Всё остальное на экране нарисовано старой палитрой и неверно.
     request_redraw();
 }
 
-/// `pagh OS   <cwd>` — the strip's left half. Public because the shell's own
-/// repaint path shares it (see `shell::shell_status_text`).
+/// `pagh OS   <cwd>` — левая половина полосы. Публична, потому что её делит
+/// собственный путь перерисовки shell (см. `shell::shell_status_text`).
 pub fn status_left() -> alloc::string::String {
     alloc::format!("pagh OS   {}", crate::shell::path::cwd())
 }
 
-/// `up Ns   mouse(x,y)` — the strip's right half, with the mouse readout optional.
+/// `up Ns   mouse(x,y)` — правая половина полосы, с необязательным показанием мыши.
 pub fn status_right(mouse: &crate::drivers::ps2_mouse::MouseState) -> alloc::string::String {
     let secs = crate::task::scheduler::ticks() / crate::arch::x86_64::apic::TICK_HZ;
     let s = snapshot();
-    // A scrolled-back console says so in the strip: without it there is no visible
-    // difference between "reading history" and "the shell has stopped printing".
+    // Прокрученная консоль сообщает об этом в полосе: без этого нет видимой
+    // разницы между «читаю историю» и «shell перестал печатать».
     let (view, history) = crate::drivers::framebuffer::scroll_state();
     let scroll = if view > 0 {
         alloc::format!("   scroll {}/{}", view, history)
@@ -257,23 +257,23 @@ pub fn status_right(mouse: &crate::drivers::ps2_mouse::MouseState) -> alloc::str
     )
 }
 
-/// Repaint the whole surface for the current settings: wallpaper, then the console
-/// grid that was on screen. Called after a theme or wallpaper change.
+/// Перерисовать всю поверхность для текущих настроек: обои, затем сетку
+/// консоли, которая была на экране. Вызывается после смены темы или обоев.
 pub fn repaint() {
     let s = snapshot();
     let theme = s.theme();
-    // The wallpaper owns the text area only; the status strip keeps its own two
-    // colours, so it is repainted explicitly after the background is replaced.
-    // Hide the arrow for the whole repaint: it would otherwise be drawn over by the
-    // wallpaper/grid and its saved background would describe a frame that no longer
-    // exists (see drivers::cursor's ordering contract).
+    // Обои владеют только текстовой областью; status strip держит свои два
+    // цвета, поэтому он перерисовывается явно после замены фона.
+    // Скрыть стрелку на всю перерисовку: иначе её закрасят обои/сетка, а её
+    // сохранённый фон будет описывать кадр, которого больше нет (см. контракт
+    // порядка в drivers::cursor).
     crate::drivers::cursor::hide();
-    // Order matters. `repaint_grid` re-emits every cell, and a cell carries the
-    // background it was last drawn with (black on a fresh console) — so it puts the
-    // old, opaque background back over the picture. Painting the wallpaper *last*
-    // is what makes it visible inside the text grid instead of only in the margins
-    // the grid does not cover; the glyphs printed from here on are transparent
-    // (`set_opaque_bg(false)` in `apply`), so text keeps sitting on the picture.
+    // Порядок важен. `repaint_grid` заново выдаёт каждую клетку, а клетка несёт
+    // фон, которым была нарисована последней (чёрный на свежей консоли), — так
+    // что он кладёт старый непрозрачный фон поверх картинки. Обои, нарисованные
+    // ПОСЛЕДНИМИ, и делают их видимыми внутри текстовой сетки, а не только на
+    // полях, которые сетка не покрывает; глифы, напечатанные отсюда, прозрачны
+    // (`set_opaque_bg(false)` в `apply`), так что текст остаётся на картинке.
     crate::drivers::framebuffer::repaint_grid();
     crate::drivers::framebuffer::with(|fb| paint_wallpaper(fb, s.wallpaper, theme));
     crate::drivers::framebuffer::repaint_grid();
@@ -282,10 +282,10 @@ pub fn repaint() {
     crate::drivers::cursor::show();
 }
 
-/// Fill the text area (everything above the status bar) with the wallpaper.
+/// Заполнить текстовую область (всё выше status bar) обоями.
 ///
-/// Wallpapers are computed per pixel from `(x, y)` and the theme, so this needs no
-/// stored image and cannot drift out of sync with the palette.
+/// Обои считаются на каждый пиксель из `(x, y)` и темы, так что не требуют
+/// сохранённого изображения и не могут разойтись с палитрой.
 fn paint_wallpaper(
     fb: &mut crate::drivers::framebuffer::FramebufferWriter,
     wallpaper: Wallpaper,
@@ -297,15 +297,15 @@ fn paint_wallpaper(
     match wallpaper {
         Wallpaper::None => fb.fill_rect(0, 0, w, bottom, bg),
         Wallpaper::Gradient | Wallpaper::Scanlines => {
-            // The ramp runs from a tinted shade to the background colour itself.
-            // Scaling the background (the obvious implementation) does nothing on a
-            // black-based theme — 0x000000 times anything is still black, so classic
-            // showed no wallpaper at all. Blending *towards* a fixed tint works on
-            // every theme; on a light one the same tint darkens instead, which is
-            // what "gradient" should look like there.
-            // The bright end has to be clearly brighter than the background, or the
-            // "gradient" is a two-colour ramp nobody can see: blending 21% of a
-            // grey into black is 0x0A0C0F, which reads as black on any monitor.
+            // Рампа идёт от тонированного оттенка к самому цвету фона.
+            // Масштабирование фона (очевидная реализация) ничего не делает на
+            // чёрной теме — 0x000000 на что угодно всё равно чёрный, так что classic
+            // не показывала обоев вообще. Смешивание *к* фиксированному оттенку
+            // работает на любой теме; на светлой тот же оттенок затемняет — так и
+            // должен выглядеть «градиент» там.
+            // Светлый конец должен быть явно светлее фона, иначе «градиент» —
+            // двухцветная рампа, которую никто не видит: 21% серого в чёрном — это
+            // 0x0A0C0F, что читается как чёрный на любом мониторе.
             let tint = if brightness(bg) < 400 {
                 0x8A_9CC8
             } else {
@@ -343,8 +343,8 @@ fn paint_wallpaper(
             let tint = 0xB0_BCD8;
             let bright = mix(bg, tint, 200);
             let dim = mix(bg, tint, 96);
-            // A hash, not an RNG: the field is identical after every repaint, so a
-            // theme change does not make the sky jump.
+            // Хеш, а не RNG: поле одинаково после каждой перерисовки, так что
+            // смена темы не заставляет небо прыгать.
             let mut i = 0u32;
             while i < 900 {
                 let hx = hash(i.wrapping_mul(2654435761));
@@ -357,8 +357,8 @@ fn paint_wallpaper(
             }
         }
         Wallpaper::Grid => {
-            // A faint field first, then the lines: on a black-based theme lines drawn
-            // straight onto the background are 0x0A0A0C and simply invisible.
+            // Сначала слабое поле, затем линии: на чёрной теме линии, нарисованные
+            // прямо по фону, — 0x0A0A0C и просто невидимы.
             fb.fill_rect(0, 0, w, bottom, mix(bg, 0x8A_9CC8, 40));
             let line = mix(bg, 0xB0_BCD8, 130);
             let (cw, ch) = (
@@ -379,13 +379,13 @@ fn paint_wallpaper(
     }
 }
 
-/// Perceived brightness (0..765), used to decide whether a wallpaper should lighten
-/// or darken its theme's background.
+/// Воспринимаемая яркость (0..765), нужна, чтобы решить, осветлять обоям фон
+/// темы или затемнять.
 fn brightness(color: u32) -> u32 {
     ((color >> 16) & 0xFF) + ((color >> 8) & 0xFF) + (color & 0xFF)
 }
 
-/// Multiply a colour's channels, clamping at 0xFF. `f < 1` darkens, `f > 1` lightens.
+/// Умножить каналы цвета с клампом в 0xFF. `f < 1` затемняет, `f > 1` осветляет.
 fn shade(color: u32, f: f32) -> u32 {
     let ch = |shift: u32| {
         let v = ((color >> shift) & 0xFF) as f32 * f;
@@ -395,7 +395,7 @@ fn shade(color: u32, f: f32) -> u32 {
     (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
-/// Linear blend: `t = 0` gives `a`, `t = 256` gives `b`.
+/// Линейное смешивание: `t = 0` даёт `a`, `t = 256` даёт `b`.
 fn mix(a: u32, b: u32, t: u32) -> u32 {
     let ch = |shift: u32| {
         let (x, y) = ((a >> shift) & 0xFF, (b >> shift) & 0xFF);
@@ -404,7 +404,7 @@ fn mix(a: u32, b: u32, t: u32) -> u32 {
     (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
-/// Cheap integer hash for the starfield.
+/// Дешёвый целочисленный хеш для звёздного поля.
 fn hash(mut x: u32) -> u32 {
     x ^= x >> 16;
     x = x.wrapping_mul(0x7FEB_352D);
@@ -414,36 +414,38 @@ fn hash(mut x: u32) -> u32 {
     x
 }
 
-// ─── the `settings` panel ───
+// ─── панель `settings` ───
 
-/// One row of the panel: a label, its current value, and how to change it.
+/// Одна строка панели: метка, текущее значение и как его менять.
 struct Row {
     label: &'static str,
     value: alloc::string::String,
 }
 
-/// Run the interactive settings panel until the user leaves.
+/// Запустить интерактивную панель настроек, пока пользователь не выйдет.
 ///
-/// Keys: `↑`/`↓` or `k`/`j` move, `←`/`→` or `h`/`l` change, `t` cycles the theme,
-/// `w` the wallpaper, `r` resets, `q`/`Esc`/`Enter` leaves. Every change is applied
-/// and repainted immediately, so the panel is the preview.
+/// Клавиши: `↑`/`↓` или `k`/`j` — движение, `←`/`→` или `h`/`l` — изменение,
+/// `t` — циклическая смена темы, `w` — обоев, `r` — сброс, `q`/`Esc`/`Enter` —
+/// выход. Каждое изменение применяется и перерисовывается сразу, так что панель
+/// и есть preview.
 pub fn run_panel() {
     let mut sel = 0usize;
     let mut decoder = Decoder::new();
     loop {
-        // The panel is a full-screen frame: hide the arrow while it is painted, then
-        // put it back on top of the finished frame (the same contract as `paint`).
+        // Панель — полноэкранный кадр: скрыть стрелку, пока он рисуется, затем
+        // вернуть её поверх готового кадра (тот же контракт, что у `paint`).
         crate::drivers::cursor::hide();
         draw_panel(sel);
         crate::drivers::framebuffer::flush();
         let mouse = crate::drivers::ps2_mouse::poll();
         crate::drivers::cursor::move_to(mouse.x, mouse.y);
-        // Sleep until a scancode actually arrives. A bare `halt()` returns on
-        // every timer tick, and redrawing a full-screen panel plus flushing the
-        // whole surface at 1 kHz would spend the CPU on frames nobody asked for.
+        // Спать, пока действительно не придёт сканкод. Голый `halt()`
+        // возвращается на каждом тике таймера, а перерисовка полноэкранной панели
+        // плюс flush всей поверхности на 1 кГц тратила бы CPU на кадры, которых
+        // никто не просил.
         while !crate::drivers::ps2_kbd::has_scancode() {
             crate::arch::cpu::halt();
-            // The pointer keeps working over the panel while waiting for a key.
+            // Указатель продолжает работать над панелью во время ожидания клавиши.
             let mouse = crate::drivers::ps2_mouse::poll();
             crate::drivers::cursor::move_to(mouse.x, mouse.y);
         }
@@ -485,8 +487,8 @@ pub fn run_panel() {
             repaint();
         }
     }
-    // Leaving the panel: put the console back the way the shell expects it, with a
-    // fresh prompt on a cleared screen.
+    // Выход из панели: вернуть консоль в вид, который ждёт shell, со свежим
+    // промптом на очищенном экране.
     apply();
     crate::drivers::framebuffer::clear_screen();
     crate::shell::render::prompt(&crate::shell::path::cwd());
@@ -562,7 +564,7 @@ fn on_off(v: bool) -> alloc::string::String {
     alloc::string::String::from(if v { "on" } else { "off" })
 }
 
-/// Draw the panel: a framed list with the selected row highlighted.
+/// Нарисовать панель: рамка-список с подсвеченной выбранной строкой.
 fn draw_panel(sel: usize) {
     let s = snapshot();
     let theme = s.theme();

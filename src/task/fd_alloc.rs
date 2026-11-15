@@ -1,98 +1,97 @@
-//! Pure, host-testable file-descriptor bookkeeping (R2.4, R2.6, R2.14).
+//! Чистый, host-тестируемый учёт файловых дескрипторов (R2.4, R2.6, R2.14).
 //!
-//! The "lowest free descriptor >= 3" allocation rule and the EBADF-on-absent-fd
-//! semantics are pure index arithmetic over a slot vector. They are factored out
-//! here — `core` + `alloc` only, with **no** dependency on `VfsNode`, `Errno`, the
-//! VMM, or any global mutable state — so the kernel-facing [`super::fd::FdTable`]
-//! (whose `OpenObject` embeds `Arc<dyn VfsNode>`) stays out of the host build while
-//! Property 7 can still exercise this logic with a dummy stored type `T` on the
-//! host (R11.6).
+//! Правило «наименьший свободный дескриптор >= 3» и семантика EBADF на
+//! отсутствующий fd — чистая арифметика индексов по вектору слотов. Она вынесена
+//! сюда — только `core` + `alloc`, БЕЗ зависимости от `VfsNode`, `Errno`, VMM или
+//! глобального изменяемого состояния, — чтобы ядерный [`super::fd::FdTable`]
+//! (чей `OpenObject` встраивает `Arc<dyn VfsNode>`) не попадал в host-сборку, а
+//! Property 7 всё равно проверялось на хосте с фиктивным типом `T` (R11.6).
 //!
-//! This module is the host-testable seam wired into `host-tests/src/lib.rs`.
+//! Модуль — host-тестируемый шов, подключённый в `host-tests/src/lib.rs`.
 #![allow(dead_code)]
 
 use alloc::vec::Vec;
 
-/// Marker error for an fd that refers to no open slot. The kernel-facing wrapper
-/// maps this to `Errno::EBADF` (R2.6, R2.14); keeping it dependency-free here is
-/// what lets this module compile into the host-tests crate.
+/// Маркерная ошибка для fd, не указывающего ни на какой открытый слот. Ядерная
+/// обёртка отображает её в `Errno::EBADF` (R2.6, R2.14); отсутствие зависимостей
+/// здесь и позволяет модулю компилироваться в host-tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BadFd;
 
-/// Error from [`FdSlots::try_alloc`]: placing the object at the lowest free
-/// index `>= min` would grow the descriptor table past the enforced limit.
-/// The syscall layer maps this to `EMFILE`; nothing is allocated.
+/// Ошибка [`FdSlots::try_alloc`]: размещение объекта в наименьшем свободном
+/// индексе `>= min` вырастило бы таблицу дескрипторов сверх предела. Слой
+/// syscall отображает её в `EMFILE`; ничего не аллоцируется.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TableFull;
 
-/// Hard upper bound on the number of slots a per-process descriptor table may
-/// hold (Linux's default `RLIMIT_NOFILE`). The kernel syscall layer enforces
-/// the same bound on every caller-supplied descriptor number (`dup2`/`dup3`/
-/// `fcntl(F_DUPFD)`), and [`FdSlots::try_alloc`] enforces it on the table
-/// itself so no future caller can grow the `Vec` to an attacker-chosen index
-/// and abort the kernel on an unserviceable allocation (F-r3-life-1: 704 MiB).
+/// Жёсткий предел числа слотов в таблице дескрипторов процесса (дефолтный
+/// `RLIMIT_NOFILE` Linux). Слой syscall обеспечивает тот же предел для любого
+/// переданного вызывающим номера (`dup2`/`dup3`/`fcntl(F_DUPFD)`), а
+/// [`FdSlots::try_alloc`] — для самой таблицы, чтобы будущий вызывающий не
+/// вырастил `Vec` до выбранного атакующим индекса и не уронил ядро на
+/// необслуживаемой аллокации.
 pub const FD_TABLE_LIMIT: usize = 1024;
 
-/// Return the lowest index `>= min` whose slot is free.
+/// Вернуть наименьший индекс `>= min`, чей слот свободен.
 ///
-/// A slot is free when it is `Some(None)` (an explicitly empty slot) or lies past
-/// the end of `slots` (`None` from `slice::get`). Occupied slots (`Some(Some(_))`)
-/// are skipped. The returned index may equal or exceed `slots.len()`, meaning the
-/// caller must grow the vector to store there. Pure and total (R2.4).
+/// Слот свободен, когда он `Some(None)` (явно пустой) или лежит за концом
+/// `slots` (`None` из `slice::get`). Занятые слоты (`Some(Some(_))`)
+/// пропускаются. Возвращённый индекс может быть равен или больше `slots.len()`,
+/// то есть вызывающему нужно вырастить вектор. Чисто и полно (R2.4).
 pub fn lowest_free_index<T>(slots: &[Option<T>], min: usize) -> usize {
     let mut i = min;
     loop {
         match slots.get(i) {
-            // Occupied: keep scanning.
+            // Занят: продолжаем сканирование.
             Some(Some(_)) => i += 1,
-            // Explicitly empty, or past the end: this index is free.
+            // Явно пуст или за концом: индекс свободен.
             Some(None) | None => return i,
         }
     }
 }
 
-/// Generic descriptor table: a vector of optional slots with lowest-free-index
-/// allocation and EBADF-style absence reporting.
+/// Обобщённая таблица дескрипторов: вектор опциональных слотов с выделением по
+/// наименьшему свободному индексу и сообщением об отсутствии в стиле EBADF.
 ///
-/// Carries no kernel or VFS dependencies, so it is host-testable for Property 7
-/// with any dummy stored type `T`. The kernel composes it as `FdSlots<OpenObject>`
-/// inside [`super::fd::FdTable`].
+/// Не несёт ядерных или VFS-зависимостей, поэтому host-тестируется для
+/// Property 7 с любым фиктивным типом `T`. Ядро собирает её как
+/// `FdSlots<OpenObject>` внутри [`super::fd::FdTable`].
 #[derive(Clone, Debug, Default)]
 pub struct FdSlots<T> {
     slots: Vec<Option<T>>,
 }
 
 impl<T> FdSlots<T> {
-    /// An empty table with no slots.
+    /// Пустая таблица без слотов.
     pub fn new() -> Self {
         Self { slots: Vec::new() }
     }
 
-    /// A table pre-seeded with the given slots (e.g. standard streams at 0/1/2).
+    /// Таблица, заранее заполненная слотами (например, стандартные потоки в 0/1/2).
     pub fn from_slots(slots: Vec<Option<T>>) -> Self {
         Self { slots }
     }
 
-    /// Allocate the lowest free index `>= min`, growing the vector with empty
-    /// slots as needed, store `obj` there, and return the index (R2.4).
+    /// Выделить наименьший свободный индекс `>= min`, при необходимости вырастив
+    /// вектор пустыми слотами, положить туда `obj` и вернуть индекс (R2.4).
     ///
-    /// Infallible by design: every kernel caller other than `fcntl(F_DUPFD)`
-    /// passes [`super::fd::FdTable::FIRST_DYNAMIC_FD`], so the index is bounded
-    /// by the number of open descriptors. A caller-supplied minimum must go
-    /// through [`FdSlots::try_alloc`] instead.
+    /// Непогрешимо по устройству: каждый ядерный вызывающий, кроме
+    /// `fcntl(F_DUPFD)`, передаёт [`super::fd::FdTable::FIRST_DYNAMIC_FD`],
+    /// поэтому индекс ограничен числом открытых дескрипторов. Переданный
+    /// вызывающим минимум должен идти через [`FdSlots::try_alloc`].
     pub fn alloc(&mut self, min: usize, obj: T) -> u32 {
         let idx = lowest_free_index(&self.slots, min);
         self.store(idx, obj)
     }
 
-    /// [`FdSlots::alloc`] with a hard index bound: if the lowest free index
-    /// `>= min` would be `>= limit`, return [`TableFull`] **before** growing
-    /// the vector or allocating anything (F-r3-life-1).
+    /// [`FdSlots::alloc`] с жёстким пределом индекса: если наименьший свободный
+    /// индекс `>= min` окажется `>= limit`, вернуть [`TableFull`] **до** роста
+    /// вектора и любой аллокации.
     ///
-    /// This is the call `fcntl(F_DUPFD)` must use: `min` is the caller's `arg`
-    /// and `limit` is [`FD_TABLE_LIMIT`]. The check is on the slot index, not
-    /// on `min` alone, so a full table still reports `EMFILE` rather than
-    /// growing without bound.
+    /// Это вызов, который обязан использовать `fcntl(F_DUPFD)`: `min` — `arg`
+    /// вызывающего, `limit` — [`FD_TABLE_LIMIT`]. Проверка идёт по индексу слота,
+    /// а не только по `min`, поэтому полная таблица всё равно сообщает `EMFILE`,
+    /// а не растёт безгранично.
     pub fn try_alloc(&mut self, min: usize, limit: usize, obj: T) -> Result<u32, TableFull> {
         let idx = lowest_free_index(&self.slots, min);
         if idx >= limit {
@@ -101,13 +100,13 @@ impl<T> FdSlots<T> {
         Ok(self.store(idx, obj))
     }
 
-    /// Place `obj` at `idx`, growing with empty slots first. `idx` must have
-    /// been produced by [`lowest_free_index`].
+    /// Положить `obj` по `idx`, при необходимости вырастив пустыми слотами. `idx`
+    /// должен быть получен из [`lowest_free_index`].
     fn store(&mut self, idx: usize, obj: T) -> u32 {
         if idx < self.slots.len() {
             self.slots[idx] = Some(obj);
         } else {
-            // Grow with empty slots up to `idx`, then place `obj` at `idx`.
+            // Вырасти пустыми слотами до `idx`, затем положить `obj` по `idx`.
             while self.slots.len() < idx {
                 self.slots.push(None);
             }
@@ -116,10 +115,10 @@ impl<T> FdSlots<T> {
         idx as u32
     }
 
-    /// Place `obj` at the explicit index `idx`, growing the vector with empty
-    /// slots as needed and replacing (dropping) any object already there. Returns
-    /// the object that previously occupied the slot, if any. Used by `dup2`/`dup3`
-    /// which name an explicit target descriptor.
+    /// Положить `obj` по явному индексу `idx`, вырастив вектор пустыми слотами
+    /// при необходимости и заменив (освободив) уже лежащий там объект. Вернуть
+    /// ранее занимавший слот объект, если он был. Используется `dup2`/`dup3`,
+    /// которые называют явный целевой дескриптор.
     pub fn set(&mut self, idx: u32, obj: T) -> Option<T> {
         let idx = idx as usize;
         while self.slots.len() <= idx {
@@ -128,23 +127,23 @@ impl<T> FdSlots<T> {
         self.slots[idx].replace(obj)
     }
 
-    /// Borrow the object at `fd`, or `None` for an out-of-range/empty slot
-    /// (caller maps `None` -> EBADF, R2.14).
+    /// Позаимствовать объект по `fd` или `None` для слота вне диапазона/пустого
+    /// (вызывающий отображает `None` -> EBADF, R2.14).
     pub fn get(&self, fd: u32) -> Option<&T> {
         self.slots.get(fd as usize).and_then(|slot| slot.as_ref())
     }
 
-    /// Mutably borrow the object at `fd`, or `None` for an out-of-range/empty slot
-    /// (caller maps `None` -> EBADF, R2.14).
+    /// Изменяемо позаимствовать объект по `fd` или `None` для слота вне
+    /// диапазона/пустого (вызывающий отображает `None` -> EBADF, R2.14).
     pub fn get_mut(&mut self, fd: u32) -> Option<&mut T> {
         self.slots
             .get_mut(fd as usize)
             .and_then(|slot| slot.as_mut())
     }
 
-    /// Free the slot at `fd`. Returns [`BadFd`] when the slot is out of range or
-    /// already empty, leaving the table unchanged; otherwise clears the slot and
-    /// returns `Ok` (R2.6, R2.14).
+    /// Освободить слот `fd`. Возвращает [`BadFd`], когда слот вне диапазона или
+    /// уже пуст, оставляя таблицу неизменной; иначе очищает слот и возвращает
+    /// `Ok` (R2.6, R2.14).
     pub fn close(&mut self, fd: u32) -> Result<(), BadFd> {
         match self.slots.get_mut(fd as usize) {
             Some(slot) if slot.is_some() => {
@@ -155,12 +154,12 @@ impl<T> FdSlots<T> {
         }
     }
 
-    /// Number of slots currently tracked (including empty ones).
+    /// Число отслеживаемых слотов (включая пустые).
     pub fn len(&self) -> usize {
         self.slots.len()
     }
 
-    /// Whether the table tracks no slots at all.
+    /// Отслеживает ли таблица вообще хоть один слот.
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
