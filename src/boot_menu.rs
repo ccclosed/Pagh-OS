@@ -553,7 +553,7 @@ fn draw(rows: &[Row], selected: usize, typed: Option<&str>, message: Option<&str
     for row in crate::drivers::xhci::diagnostics().into_iter().take(8) {
         let (ccs, ped, pp, _, pls) = crate::drivers::xhci::decode_portsc(row.portsc);
         crate::fb_println!(
-            "  usb {:>2}: proto=usb{} ccs={} ped={} pp={} spd={} pls={} stage={} code={:#x} try={} ms={} pre={:#010x} post={:#010x} prc={} ped_seen={} ped_sc={:#010x}",
+            "  usb {:>2}: proto=usb{} ccs={} ped={} pp={} spd={} pls={} stage={} code={:#x} try={} ms={} pre={:#010x} post={:#010x} prc={} ped_seen={} ped_u0={} ped_sc={:#010x}",
             row.port,
             row.proto,
             ccs as u8,
@@ -569,6 +569,7 @@ fn draw(rows: &[Row], selected: usize, typed: Option<&str>, message: Option<&str
             row.post,
             row.seen_prc as u8,
             row.seen_ped as u8,
+            row.seen_ped_u0 as u8,
             row.ped_sc
         );
     }

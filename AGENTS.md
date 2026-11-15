@@ -229,8 +229,8 @@ metadata. Release candidates come from `dev` only, and only as `vX.Y.Z-rc.N`
 limited to a critical/high verified security finding or a release-blocking
 regression in a released version: it branches from `main`, is tagged straight
 to stable **without** an RC, and is merged back into `dev` with `--no-ff`. The
-`main currently reads` line below describes the stable release only — `dev`
-never rewrites it. `.github/workflows/release.yml` refuses a stable tag not
+`main` version line below describes the stable release only — `dev` never
+rewrites it (a dev-only bump states its own `currently reads` version below). `.github/workflows/release.yml` refuses a stable tag not
 reachable from `main`, a `-rc.N` tag not reachable from `dev` or already on
 `main`, any other suffix, and a tag whose base version disagrees with
 `Cargo.toml`; it attaches the release kernel (`pagh-vTAG.elf`, with `.sha256`)
@@ -249,7 +249,7 @@ the operational checklist in `RELEASING.md`.
   `Cargo.toml` is the source of truth, and
   a feature in flight lands its own MINOR bump in the PR that ships it — 2.4.0
   arrived with the format-guard PR, and a branch that has not merged yet must not
-  be reflected here. **`main` currently reads 2.22.6** (round-3 attack-audit
+  be reflected here. **`main` reads 2.22.6** (round-3 attack-audit
   hotfix: 2.22.6 closes the ring-3 CPU-exception machine-kill class, the
   uncapped `fcntl(F_DUPFD)` allocation and the epoll/signalfd registry
   self-deadlock, plus the installer spelling-split bypass; on top of the
@@ -261,6 +261,83 @@ the operational checklist in `RELEASING.md`.
   console scrollback and the shell/procfs batches; 2.18.13 carried the
   `connect(2)` reply-and-close fix, the VT/console coordinate fix and the
   kernel-thread rows in `ps`; the tag lands at the end of the batch).
+  **`dev` currently reads 2.22.7** = the three round-3 x86 findings that were
+  not high enough for the 2.22.6 hotfix are closed on `dev` (F-r3-arch-3,
+  F-r3-vfs-2, F-r3-lead-1; reports in the external `attack/r3/*/REPORT.md`
+  tree). (1) `mprotect` protections used to be advisory on fork-shared pages
+  and on partially covered `VmRegion`s: a new software leaf bit (`RO_BIT`) now
+  records "this mapping denies write" on a COW leaf, so `cow_copy_page` only
+  copies when the mapping is writable and a write to `mprotect(PROT_READ)`
+  fault SIGSEGVs; `update_region_flags` splits a region the span only partially
+  overlaps, so `PROT_NONE` pages in a partially covered mapping are not
+  lazily re-backed writable on the next touch. The audit's `prot_bypass` PoC
+  dies with SIGSEGV and the shell stays alive, while ordinary COW
+  fork/write and a dynamically linked glibc binary (`fastfetch`) still work.
+  (2) a crafted ext2 superblock with
+  `s_inodes_count = s_inodes_per_group = 0xFFFFFFFF` made every mount scan
+  `2^32` bitmap bits (28 s of boot CPU) and write a bogus
+  `s_free_inodes_count`; `ext2::bounds::validate_group_counts` now refuses
+  impossible per-group counts (`FsError::Corrupt`, clean mount refusal) before
+  the scan and the scan span is additionally clamped to one bitmap block
+  (`clamp_group_span`) with saturating totals. (3) `execve` used to free the
+  replaced address space while a sibling `CLONE_VM` task that was not in the
+  ready queue (SIGSTOP-parked in `STOPPED_TASKS`) still ran on it — a page-table
+  UAF waiting for `SIGCONT`; `scheduler::cr3_referenced_by` now consults all
+  three live-task registries (ready, stopped, pending reap) for both
+  `drop_exclusive_user_space` and the exit reaper, with a pure host-tested
+  policy (`src/task/as_refs.rs`), an in-QEMU scheduler selftest, and the
+  `freed=false` log line naming the registry that kept the space alive.
+  The audit's raw-`clone` reproducer never created its second thread, so the
+  finding's impact remains static (no UAF demonstrated); the fix is the
+  accounting invariant, not a PoC-driven crash. (4) в той же версии `dev` — исправления USB HID по реальным устройствам
+  (R82HE keyboard 3151:502d, E-Signal LUOM G10 mouse 04d9:a09f): SET_PROTOCOL
+  отправлялся с `wValue=1`, то есть *report* protocol, хотя комментарий и доки
+  говорили boot (HID 1.11 §7.2.6: boot = 0); interrupt-IN буфер был жёстко
+  8/4 байта, поэтому 7-байтный report-protocol отчёт мыши вызывал babble и
+  эндпоинт отключался до перезагрузки. Теперь SET_PROTOCOL(0) уходит на каждый
+  boot-интерфейс с проверкой результата (`mode=boot|report`), буфер равен
+  `wMaxPacketSize` (clamp 8..=64), ошибка передачи восстанавливается xHCI Reset
+  Endpoint с переармированием (до трёх попыток), а композитное устройство
+  разбирается целиком: все HID-интерфейсы, привязка всех boot-клавиатур/мышей
+  (`Slot.hid` — `Vec`, SET_PROTOCOL/SET_IDLE на интерфейс, одна Configure
+  Endpoint со всеми DCI). Ограничения названы: хабы не поддерживаются,
+  `protocol = 0`/vendor-коллекции логируются и не привязываются, устройства
+  только-report-protocol — best effort (клавиатура — boot-подобные 8 байт;
+  мышь — 7-байтная 16-битная E-Signal или 8-битные оси, дельты клампятся в
+  диапазон PS/2-пакета, wheel/pan декодируются, но не доставляются), LED
+  output report не реализован. Evidence: host-свойства
+  `usb_hid_report`/`usb_desc` (размер буфера, раскладки, композитный/усечённый
+  дескриптор), новые in-QEMU selftest-кейсы report-режима, `tools/e2e.py usb`
+  и PS/2-путь зелёные; реального железа не было, так что это QEMU.
+  (5) затем тот же аппарат показал более глубокую ошибку порта xHCI ниже
+  HID-исправления, в двух итерациях. Первая убрала reset каждые ~124 мс, но
+  следующий дамп показал PP power-cycle после 16 неудач: все порты `pp=0 ccs=0`,
+  PED+U0 лишь на мгновение, speed id 1 (FS) там, где ожидается 3 (HS). Причина
+  была в самой записи PORTSC: драйвер возвращал маскированную копию регистра и
+  тем самым нёс `PED` (бит 1, write-1-to-disable), `PR`/`WPR` и change-биты;
+  подтверждение PRC/CSC на только что включённом порту отключало его, что и даёт
+  `post=0x6e1` (Polling, PED=0). Теперь каждая запись PORTSC идёт через
+  neutral-маску (`port_state_to_neutral`: только RO/RWS биты), reset —
+  `neutral | PR` (USB2) или `neutral | WPR` (USB3) без очистки change-битов в той
+  же записи, а политика следует `hub.c`/`xhci-hub.c`: `hub_port_debounce`
+  (шаг 25 мс, 100 мс стабильного подключения, бюджет 2 с) до первого reset,
+  100 мс power settle после PP, `hub_port_wait_reset` (10 мс, затем 200 мс,
+  800 мс на запись, проверка PED, до `PORT_RESET_TRIES`=5 записей), 200 мс
+  стабильного PED+U0 до адресации, подтверждение change-битов после этого
+  включения, пауза ≥1 с после потерянного PED и новый debounce, и никакого
+  PP power-cycle (PP только поднимается с readback/повтором). Один порт
+  продвигается за `poll()`, поэтому boot-меню продолжает считать. Диагностика:
+  короткий `warn` о реальных отказах, одна строка `xhci: HID device on port N:
+  ... mode=boot`, полное состояние — команда `usb`. Evidence: QEMU
+  `tools/e2e.py usb` (клавиатура и мышь через меню и shell; PS/2 не затронут),
+  `selftest` и host-свойства `xhci_hub`; реального железа не было — нужен тест
+  пользователя. Затем третий прогон показал отказ ввода после минуты работы:
+  HID-кольцо вмещает 63 TRB, а замыкающий Link TRB писался со *следующим*
+  циклом производителя и без `TRB_TOGGLE`, поэтому контроллер не шёл по ссылке
+  и эндпоинт замолкал на первом замыкании — мышь через ~63 отчёта, клавиатура
+  чуть позже. Теперь Link TRB несёт текущий цикл и toggle-бит, а
+  `tools/e2e.py usb` печатает через замыкание (241 отчёт) как регрессию. Version
+  2.22.7 is the `dev` PATCH bump; `main` stays 2.22.6.
   **2.22.6** = the round-3 audit's four high x86 findings are closed
   (F-r3-arch-1, F-r3-life-1/2, F-r3-vfs-1; reports in the external
   `attack/r3/*/REPORT.md` tree). (1) `#DE`/`#DB`/`#UD` (and `#OF`/`#BR`/`#NM`/

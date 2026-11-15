@@ -58,10 +58,12 @@ independent ring3-to-ring0 paths and a one-syscall machine kill on the 2.21.0
 image, and a second, independent round on the 2.22.3 tree found seven more
 (a fork-COW ownership UAF that also reached uid 0, a package-installer hard-link
 alias bypass, and RISC-V kernel/runtime issues). A third round against 2.22.5
-found four more x86 highs, all fixed here. **Fixed in 2.22.0** for the
-round-1 ring3-to-ring0 paths, **2.22.3** for the round-1 user-buffer TOCTOU
-class, **2.22.4/2.22.5** for the round-2 x86 items, **2.22.6** for the round-3
-x86 items, with the RISC-V items fixed in the sibling repositories. Each finding was reproduced before and after; the
+found four more x86 highs, all fixed in 2.22.6, plus three lower-severity x86
+findings fixed in the next release (2.22.7 on `dev`). **Fixed in 2.22.0** for
+the round-1 ring3-to-ring0 paths, **2.22.3** for the round-1 user-buffer TOCTOU
+class, **2.22.4/2.22.5** for the round-2 x86 items, **2.22.6** for the four high
+round-3 x86 items, **2.22.7 (dev)** for the remaining round-3 x86 items, with
+the RISC-V items fixed in the sibling repositories. Each finding was reproduced before and after; the
 same PoCs still succeed on the stock images:
 
 * **F-LEAD-1 (critical, verified).** `mprotect(2)` accepted kernel virtual
@@ -118,6 +120,55 @@ same PoCs still succeed on the stock images:
   copied at exactly that length). `sendmsg`/`recvmsg` are not implemented in
   this layer, so the pattern has no second copy. PoC:
   `tools/security/poc/poc_sock_large_count.c`.
+
+**Fixed in 2.22.7 (round-3 audit, dev — next release, not yet stable):**
+
+* **F-r3-arch-3 (low, verified).** `mprotect` protections were advisory in two
+  cases. (a) A write to a `PROT_READ` page that was fork-shared (COW) went
+  through `cow_copy_page`, which unconditionally installed `WRITABLE` on the
+  private copy, so the read-only mapping accepted writes and an executable
+  page could become W+X. A software leaf bit (`RO_BIT`, available bit 10) now
+  records that the mapping denies write; `cow_copy_page` refuses the copy when
+  it is set and the write fault keeps its SIGSEGV path, `fork` preserves the
+  deferred-write/read-only distinction across generations, and `mprotect`
+  maintains the bit with the tracked protection. (b) `mprotect(PROT_NONE)` over
+  a range that only partially covered a `VmRegion` refreshed only fully covered
+  regions, so the next touch found the stale region and lazily re-mapped the
+  page writable (a stack/guard page did not guard). `update_region_flags` now
+  splits the region into before/covered/after sub-ranges (file-backed offsets
+  shift like `munmap`), so `PROT_NONE` bytes stay a genuine fault. Evidence:
+  the audit's `attack/r3/arch/prot_bypass.c` dies with SIGSEGV on both edges
+  and the shell stays alive; ordinary COW fork/write (the round-3 `sweep`
+  matrix) and a dynamically linked glibc binary (`fastfetch`) are unchanged. Residual (documented, out of this finding): `mprotect(PROT_NONE)`
+  on a `brk` heap page is still re-backed by the brk fast path in
+  `handle_user_page_fault` — same self-protection class, not exploitable
+  cross-process, left for a follow-up.
+* **F-r3-vfs-2 (low-medium, verified).** A crafted ext2 image with
+  `s_inodes_count = s_inodes_per_group = 0xFFFFFFFF` (blocks/WAL untouched, so
+  `is_pagh_volume` accepts it) made `reconcile_free_counts` scan a 2^32-bit
+  bitmap span at every mount (~28 s of boot CPU) and write a bogus
+  `s_free_inodes_count` (≈2^32) back to block 0. `ext2::bounds::validate_group_counts`
+  now rejects an impossible superblock before any bitmap read: a per-group
+  count above the bitmap capacity (`BS * 8`), a zero count, or an inode count
+  above `s_inodes_per_group * groups` fails the mount with `FsError::Corrupt`.
+  The scan span is also clamped to one bitmap block and the free totals
+  saturate, so a superblock that changes after validation cannot reintroduce
+  the loop. Evidence: `attack/r3/vfs/img/ext2-bad-inodes.img` is refused
+  quickly and the bogus count is never written; host properties
+  (`ext2_group_counts`) pin the acceptance rule and the clamp.
+* **F-r3-lead-1 (high, static; no UAF demonstrated).** `exec_linux_image` frees
+  the replaced address space through `scheduler::drop_exclusive_user_space`,
+  which only looked at `READY_QUEUE` and `PENDING_REAPS`. A `CLONE_VM` sibling
+  parked by SIGSTOP/SIGTSTP lives in `STOPPED_TASKS`, so its shared page tables
+  could be freed under it (the audit log shows `old_cr3=… freed=true`; its raw
+  `clone` reproducer failed before creating the thread, so the UAF effect was
+  never demonstrated). The teardown policy is now pure and host-tested
+  (`src/task/as_refs.rs`): a space is freed only when no live Tcb in the ready
+  queue, the stopped set or the pending-reap set references it, and the same
+  rule now guards the exit reaper (which had the same hole). The execve log
+  names the registry that kept the space alive. This kernel keeps the sibling
+  alive in the old image instead of killing the thread group on execve;
+  Linux would kill it, and the deviation is documented in the release notes.
 
 **Fixed in 2.22.6 (round-3 audit):**
 

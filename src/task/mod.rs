@@ -1,3 +1,4 @@
+pub mod as_refs;
 pub mod compat;
 pub mod fd;
 pub mod fd_alloc;

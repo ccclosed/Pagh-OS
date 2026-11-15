@@ -1786,6 +1786,31 @@ def mode_usb(h: Harness) -> tuple[str, int]:
                     label="`usb` command output") is None:
             raise HarnessError("the in-guest `usb` command produced no report counters; "
                                f"serial tail:\n{tail(guest.serial())}")
+        # RING-WRAP REGRESSION. The HID transfer ring holds RING_TRBS-1 = 63
+        # usable TRBs; the wrap-around Link TRB has to be written with the
+        # *current* producer cycle and TRB_TOGGLE (the controller skips a link
+        # tagged with the next cycle). The old code got that wrong, so the
+        # endpoint went silent after 63 reports — a mouse dying after a minute of
+        # movement and a keyboard after a few dozen keystrokes. Type enough keys
+        # to cross the wrap and prove the counters keep growing.
+        long_before = len(guest.serial())
+        kb.text("x" * 90)
+        kb.key("ret")
+        time.sleep(0.4)  # let the unknown-command line and the next prompt land
+        kb.text("usb")
+        kb.key("ret")
+        long_deadline = time.time() + timeout
+        long_text = ""
+        while time.time() < long_deadline:
+            text = guest.serial()
+            if len(text) > long_before:
+                long_text = text[long_before:]
+                if re.search(r"usb: key reports \d+, mouse reports \d+", long_text):
+                    break
+            time.sleep(0.2)
+        else:
+            raise HarnessError("the post-wrap `usb` command produced no report "
+                               f"counters; serial tail:\n{tail(guest.serial())}")
         time.sleep(a.settle)  # let the port-table lines land before the screenshot
         kb.screenshot(shell_shot)
     finally:
@@ -1812,6 +1837,48 @@ def mode_usb(h: Harness) -> tuple[str, int]:
                   kbd_hid or "not found")
     ok &= h.check("xHCI enumerated the USB mouse too (boot-protocol HID)",
                   bool(mouse_hid), mouse_hid or "not found")
+
+    # ── the 2.22.7 field fixes, pinned in the committed scenario ──
+    # SET_PROTOCOL(0) = boot: the old driver sent wValue=1 (report protocol)
+    # while claiming boot. QEMU's usb-kbd/usb-mouse accept boot, so `mode=boot`
+    # is the positive evidence that the request and its result check work.
+    ok &= h.check(
+        "both HID interfaces negotiated boot protocol (SET_PROTOCOL 0)",
+        bool(kbd_hid and "mode=boot" in kbd_hid)
+        and bool(mouse_hid and "mode=boot" in mouse_hid),
+        f"kbd: {kbd_hid or 'not found'}; mouse: {mouse_hid or 'not found'}")
+    # The transfer buffer is sized from wMaxPacketSize (floor 8B), not the old
+    # hard-coded 4B mouse buffer that turned the field mouse's 7-byte report into
+    # a babble. Both emulated endpoints declare <= 8B, so 8B is the expected size
+    # and anything below 7B would be the bug.
+    report_sizes = [int(n) for n in re.findall(
+        r"xhci: HID device on port \d+: .* report=(\d+)B", text)]
+    ok &= h.check(
+        "interrupt-IN buffers are packet-sized (>= 8B, not the old 4B mouse buffer)",
+        len(report_sizes) >= 2 and min(report_sizes) >= 8,
+        f"report buffer sizes: {report_sizes}")
+    # A transfer error must not end in the old permanent-disable line in this
+    # clean run: QEMU's devices are well-behaved, so any such line is a recovery
+    # regression (the recovery path itself is exercised by host properties and
+    # the in-QEMU report-mode selftests, not by a babble this emulation can make).
+    ok &= h.check(
+        "no HID endpoint was disabled after a transfer error",
+        "input from it is off until reboot" not in text,
+        "endpoint-disabled line present" if "input from it is off until reboot" in text
+        else "no endpoint-disabled line")
+    # Ring wrap: after >63 reports the endpoint must still be alive. This is the
+    # regression for the Link-TRB cycle/TOGGLE bug; without the fix the driver
+    # stops consuming reports at the wrap and the shell stops seeing keys.
+    wrap_reports = [int(n) for n in re.findall(
+        r"usb: key reports (\d+), mouse reports", long_text)]
+    ok &= h.check(
+        "HID ring wrap: keyboard keeps reporting across >63 transfer TRBs",
+        bool(wrap_reports) and max(wrap_reports) > 90,
+        f"post-wrap key reports: {wrap_reports[-1] if wrap_reports else 'none'}")
+    ok &= h.check(
+        "HID ring wrap: no endpoint gave up after the wrap",
+        "gave up" not in long_text and "input from it is off" not in long_text,
+        "no endpoint-disabled line after wrap")
 
     # ── the menu decision: only the typed confirmation can format ──
     chose = regex_first(

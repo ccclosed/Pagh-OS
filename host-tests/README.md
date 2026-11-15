@@ -3,7 +3,7 @@
 Отдельный хост-крейт (`pagh-host-tests`), **исключён из workspace** ядра
 (`[workspace].exclude` в корневом `Cargo.toml`): ядро `no_std` bare-metal и не может
 хост-компилироваться. Тесты — proptest-свойства P1–P56 (плюс именованные модули вроде
-`tty_job`, `kill_target`, `ext2_links`, `procfs_*`) над чистой логикой ядра.
+`tty_job`, `kill_target`, `ext2_links`, `procfs_*`, `xhci_hub`) над чистой логикой ядра.
 
 ## Как включается код ядра
 
@@ -13,7 +13,7 @@
 `dns`, `deb`, `tar`, `install`, `apt_index`, `apt_resolve`, `mirror`, `diag`, `mem`, `dirent`,
 `timeconv`, `fd_alloc`, `x509`, `hostname`, `tls_verify`, `tls_chain`, `ca_bundle`, `tls_auth`,
 `seed`, `link_walk`, `format_policy`, `nvme_prp`, `ext2/symlink`, `openpgp{,_crypto,_packet,_keys}`,
-`release_file`, `procfs_format` — тесты исполняют точный исходник
+`release_file`, `procfs_format`, `usb_desc`, `usb_hid_report`, `xhci_hub` — тесты исполняют точный исходник
 ядра (нет копий и дрейфа). Плюс no-op `warn!`-шим и `extern crate alloc`.
 Эти модули обязаны быть только `core`+`alloc`.
 
@@ -23,7 +23,7 @@
 |---|---|
 | `Cargo.toml` | Зависимости зеркалят ядро: `miniz_oxide =0.8.9`, `ruzstd =0.8.3` (без default features — иначе тянет `twox-hash`, которого нет в `vendor/`), `xz4rust =0.2.1`; dev-dep `proptest = "1"` |
 | `.cargo/config.toml` | Переопределяет `build.target` (хардкод `x86_64-pc-windows-msvc`) и расширяет `build-std` — cargo КОНКАТЕНИРУЕТ наследуемые массивы, очистить `-Zbuild-std` из корневого конфига нельзя |
-| `src/lib.rs` | Ядро харнесса: `#[path]`-инклюды, список тест-модулей `p01`–`p56` (плюс именованные `tty_job`, `kill_target`, `ext2_links`, `link_walk_paths`, `nvme_io`, `at_random`, `signal_stop`, `procfs_*`), `det_rng`, `chain_der`, `p29_fixtures`, `bigindex` |
+| `src/lib.rs` | Ядро харнесса: `#[path]`-инклюды, список тест-модулей `p01`–`p56` (плюс именованные `tty_job`, `kill_target`, `ext2_links`, `link_walk_paths`, `nvme_io`, `at_random`, `signal_stop`, `procfs_*`, `xhci_hub`), `det_rng`, `chain_der`, `p29_fixtures`, `bigindex` |
 | `src/properties/p01.rs` … `p56.rs` | по файлу на свойство (`ls host-tests/src/properties/p*.rs`): DMA share/unshare, консервация PMM, контекст-фреймы, ext2 sizing/roundtrip, классификация ELF, парсинг HTTP/DNS/deb/tar, apt index/resolve, dirent, конверсия времени, fd-аллокация, xz/zstd (P29), сигнальный ABI (P42), DER-ридер + X.509-время (P43), парсер сертификатов (P44), hostname/SAN (P45), подписи сертификатов (P46), цепочка + clock gate (P47), CA-бандл (P48), server-auth + `CertificateVerify` (P49), OpenPGP-верификация метаданных репозитория (P51–P55), креды и POSIX-права (P56) и др. |
 | `src/properties/det_rng.rs`, `chain_der.rs` | Общие хелперы: детерминированный RNG (вынесен из P46) и сборка синтетических DER-цепочек (вынесена из P47) |
 | `src/properties/p44_fixture_root.rs`, `p44_fixture_leaf.rs` | `@generated` фикстуры сертификатов для P44 |

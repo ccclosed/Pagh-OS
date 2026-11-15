@@ -11,6 +11,135 @@ tagged release (`2.18.13`, merged as PR #56). The full technical story of every 
 is the release-note block in `AGENTS.md`; the paragraphs here name the user-visible
 change and point there rather than duplicating it.
 
+## 2.22.7
+
+Round-3 audit follow-up on `dev` (the 2.22.6 hotfix kept the four high findings;
+these three lower-severity x86 findings land in the next release). The round-3
+reports live in `attack/r3/{arch,vfs,lead}/REPORT.md` and the top-level
+`attack/r3/REPORT.md` (external audit tree); `main` stays at 2.22.6.
+
+* **F-r3-arch-3 (low, verified): `mprotect` protections were advisory on
+  fork-shared and partially covered pages.** After `fork`, a write to a page a
+  child had just made `PROT_READ` still copied the page private and installed
+  `WRITABLE`, and `mprotect(PROT_NONE)` over only part of a `VmRegion` left the
+  region record stale, so the next touch lazily re-mapped the page writable
+  (stack guards did not guard). A new software PTE bit (`RO_BIT`, available bit
+  10) now records that the *mapping* denies write on a COW leaf; `cow_copy_page`
+  copies only when the mapping is writable, so a write to a read-only mapping
+  keeps its SIGSEGV path, and `fork` preserves the distinction between a
+  deferred COW write and a read-only mapping. `update_region_flags` splits a
+  region that `mprotect` only partially covers into before/covered/after
+  sub-ranges (file-backed offsets shift exactly like `munmap`'s `cut_regions`),
+  so a `PROT_NONE` sub-range is a genuine fault, not a lazy-mapping
+  opportunity. Evidence: the audit's `attack/r3/arch/prot_bypass.c` now dies
+  with SIGSEGV while the shell stays alive; ordinary COW fork/write (the
+  round-3 `sweep` matrix) and a dynamically linked glibc binary (`fastfetch`)
+  are unaffected.
+
+* **F-r3-vfs-2 (low-medium, verified): a crafted ext2 superblock made every
+  mount scan 2^32 bits.** `s_inodes_count = s_inodes_per_group = 0xFFFFFFFF`
+  passed the non-zero checks, so `reconcile_free_counts` scanned a 2^32-bit
+  span (~28 s of boot CPU), computed a bogus free-inode total and wrote it back
+  to block 0. `ext2::bounds::validate_group_counts` now rejects before reading a
+  single bitmap bit: per-group counts above one bitmap block (`BS * 8`), zero
+  counts, and an inode count that exceeds `s_inodes_per_group * groups` all
+  produce `FsError::Corrupt` (the crafted image is refused cleanly at mount).
+  The scan span is additionally clamped to one bitmap block
+  (`clamp_group_span`) and the free totals saturate, so a superblock that
+  changes under the mount cannot reintroduce the unbounded loop. Host
+  properties: `ext2_group_counts`.
+
+* **F-r3-lead-1 (high, static): `execve` could free the address space of a
+  sibling task that is not in the ready queue.** `drop_exclusive_user_space`
+  looked only at the ready queue and pending reaps, so a sibling thread parked
+  by SIGSTOP/SIGTSTP (`STOPPED_TASKS`, out of rotation until SIGCONT) was
+  invisible and its shared CR3 was freed under it — page tables a later SIGCONT
+  would run on. The teardown decision now lives in a pure, host-property-tested
+  policy (`src/task/as_refs.rs`) consulted by both `execve` and the exit
+  reaper: a space is freed only when no live Tcb in any registry references it,
+  and the execve log names the registry that kept it alive. In this cooperative
+  scheduler a task blocked in `nanosleep`/`futex`/`read` stays in the ready
+  queue; the two states that leave it are the stopped set and the pending-reap
+  set, so those are exactly what the fix adds. An in-QEMU scheduler selftest
+  drives the real registries with allocated PML4s (exclusive → freed, ready →
+  kept, stopped → kept, resumed → kept until the last reference, pending reap →
+  kept). The audit's raw-`clone` reproducer never created its second thread, so
+  the impact remains static; the fix is the accounting invariant.
+
+* **USB HID: boot protocol, буферы по размеру пакета, восстановление
+  эндпоинта, композитные интерфейсы.** Устройства R82HE keyboard 3151:502d и
+  E-Signal LUOM G10 mouse 04d9:a09f выявили четыре дефекта: мышь не работала, а
+  клавиатура работала частично. (1) `SET_PROTOCOL` отправлялся с `wValue=1` —
+  *report* protocol — хотя код и доки говорили boot; HID 1.11 §7.2.6 определяет
+  boot как 0. Теперь для каждого boot-интерфейса уходит 0, результат проверяется
+  и логируется как `mode=boot|report`, а устройство, отказавшее boot, остаётся в
+  report protocol с best-effort разбором вместо потери ввода. (2) interrupt-IN
+  буфер был жёстко 8/4 байта; 7-байтный report-protocol отчёт мыши переполнял
+  4 байта, контроллер сообщал babble, и эндпоинт отключался до перезагрузки.
+  Теперь буфер равен `wMaxPacketSize` с clamp 8..=64, то есть не короче одного
+  пакета. (3) Ошибка передачи теперь выдаёт xHCI Reset Endpoint (TRB type 14) и
+  переармирует передачу, до трёх попыток, вместо отключения с первой ошибкой;
+  команда `usb` печатает счётчики reset/bad report. (4) `Slot.hid` был одним
+  `Option<HidEndpoint>`, поэтому остальные HID-интерфейсы композитного
+  устройства игнорировались; теперь это `Vec`, разбирается каждый HID-интерфейс
+  с interrupt-IN эндпоинтом, привязываются только boot-клавиатуры/мыши
+  (protocol 0 и vendor-коллекции логируются и пропускаются), одна Configure
+  Endpoint добавляет все DCI, а опрос идёт по всем эндпоинтам с маршрутизацией
+  событий по slot/endpoint. Раскладки: boot-отчёты как раньше; report-мышь
+  декодирует 7-байтную 16-битную X/Y E-Signal/Holtek (дельты клампятся в
+  диапазон PS/2-пакета; wheel/pan декодируются, но не доставляются) и
+  3-6-байтные 8-битные раскладки best effort; report-клавиатура использует
+  boot-подобные 8 байт. Host-свойства `usb_hid_report`/`usb_desc`, новые
+  in-QEMU selftest-кейсы report-режима, `tools/e2e.py usb` и PS/2-путь зелёные.
+  Реального железа для этого изменения не было (только QEMU); serial-строки для
+  проверки на железе названы в `src/drivers/README.md`.
+
+* **Подъём корневого порта xHCI: neutral-записи PORTSC и последовательность
+  сброса по `hub.c` (2.22.7, вторая итерация).** Та же машина (Intel 8086:7a60,
+  26 портов, `attached=0x02000731`) сообщала о каждом подключённом USB2-порте
+  `ccs=1 ped=0 pp=1 pls=7 stage=lost-after-reset code=0x6e1 try=19 ms=124 ...
+  prc=1 ped_seen=1 ped_sc=0x00200e03` при 0 HID-устройств. Первая итерация
+  заменила цикл reset 25/20/60 мс чистой политикой (`src/drivers/xhci_hub.rs`,
+  свойства `xhci_hub`), но следующий дамп показал оставшийся отказ: после 16
+  неудачных попыток PP power-cycle оставил все порты в `pp=0 ccs=0`
+  (`stage=power-cycle try=16 ms=159`), PED+U0 был виден на мгновение
+  (`ped_seen=1 ped_u0=1 ped_sc=0x00200603`), а порт откатывался в Polling на
+  speed id 1 (FS) там, где ожидается 3 (HS). Причина — в записи PORTSC: она
+  маскировала write-1-to-clear *change*-биты, но возвращала остальное значение
+  обратно, включая **PED (бит 1), который является write-1-to-disable**;
+  подтверждение PRC/CSC на только что включённом порту отключало его (в дампе
+  `post=0x6e1`). Теперь каждая запись PORTSC идёт через
+  `port_state_to_neutral()` — маску `xhci_hub_state_to_neutral()` (RO-биты:
+  CCS/бит 3/speed/бит 30; RWS-биты: PLS/PP/биты 14-15/25-27; всё остальное
+  пишется нулём), — а reset это `neutral | PR` (USB2) или `neutral | WPR`
+  (USB3) без очистки change-битов в той же записи. Политика использует
+  последовательность и числа `hub.c`: `hub_port_debounce` (шаг 25 мс, 100 мс
+  неизменного CCS, бюджет 2 с) до первого reset; 100 мс power settle после
+  PP=1; `hub_port_wait_reset` (10 мс дважды, затем 200 мс, 800 мс на запись,
+  успех `!PR && CCS`, затем PED, нет PED — reset снова, до
+  `PORT_RESET_TRIES`=5); PED+U0 должен держаться 200 мс до адресации;
+  PRC/WRC/CSC подтверждаются только после этого включения
+  (`ClearPortFeature(C_PORT_RESET)`); потерянный PED даёт паузу ≥1 с, затем
+  debounce и только потом новый reset. PP power-cycle удалён полностью: PP
+  только поднимается, с readback и повторами, а неудачная запись повторяется
+  после backoff, поэтому порт не может остаться обесточенным. Диагностика:
+  короткий `warn` о реальных отказах, одна строка `xhci: HID device on port N:
+  ... mode=boot`, полный снимок портов — команда `usb`. Evidence: QEMU
+  `tools/e2e.py usb` (клавиатура и мышь через меню и shell, PS/2 не затронут),
+  `selftest`, host-свойства `xhci_hub` (включая свойство, закрепляющее
+  neutral-маску) и все шесть гейтов; реального железа не было, поэтому это
+  только QEMU-доказательство и нужен тест пользователя.
+
+* **Замыкание HID transfer-кольца:** ввод работал, затем мышь умирала примерно
+  через минуту, а клавиатура — на десять секунд позже. HID-кольцо вмещает 63
+  полезных TRB; замыкающий Link TRB писался со следующим циклом производителя
+  (и с `TRB_IOC` вместо `TRB_TOGGLE`), поэтому контроллер пропускал ссылку и
+  эндпоинт переставал потреблять отчёты на первом замыкании. Теперь Link TRB
+  несёт текущий цикл и toggle-бит; `tools/e2e.py usb` печатает через замыкание и
+  требует, чтобы счётчик клавиатуры продолжал расти (241 отчёт в закоммиченном
+  прогоне). Отказ масштабируется числом отчётов, поэтому короткие QEMU-прогоны
+  его не видели.
+
 ## 2.22.6
 
 Round-3 audit hotfix: four high, verified findings (three x86 machine-kill /

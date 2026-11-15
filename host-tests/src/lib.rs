@@ -323,6 +323,32 @@ pub mod ext2_symlink;
 #[path = "../../src/fs/ext2/bounds.rs"]
 pub mod ext2_bounds;
 
+// Round-3 F-r3-lead-1: pure address-space (CR3) reference accounting for the
+// execve/exit teardown decision. `core`-only and self-contained, so the host
+// tests drive the exact policy the kernel's `scheduler` applies over its three
+// live-task registries.
+#[path = "../../src/task/as_refs.rs"]
+pub mod as_refs;
+
+// Политика boot/report USB HID и разбор configuration descriptor. Оба модуля
+// только `core`+`alloc` и самодостаточны, поэтому host-тесты исполняют точный
+// исходник ядра: размер буфера из `wMaxPacketSize` (4-байтный буфер против
+// 7-байтного отчёта), boot/report-раскладки мыши и обход дескриптора
+// композитного устройства, привязывающий каждый boot-интерфейс клавиатуры/мыши.
+#[path = "../../src/drivers/usb_desc.rs"]
+pub mod usb_desc;
+
+#[path = "../../src/drivers/usb_hid_report.rs"]
+pub mod usb_hid_report;
+
+// Политика сброса корневого порта xHCI. Только `core`, самодостаточна: state
+// machine порта для USB2 debounce/training, ожиданий PRC/PED+U0, стабильности и
+// backoff, без PP power-cycle. Host-тесты симулируют порты (Polling сотни
+// миллисекунд, потерянные PED, постоянный отказ), потому что QEMU включает порты
+// мгновенно и этого не воспроизводит.
+#[path = "../../src/drivers/xhci_hub.rs"]
+pub mod xhci_hub;
+
 
 // ── OpenPGP repository-metadata verification (issue #32) ─────────────────────
 // The pure verifier the `apt` trust chain will use: packet/armor parsing,
@@ -485,6 +511,26 @@ mod properties {
     // any allocation or block loop; the tests include the audit's exact crafted
     // inode values as regression cases.
     mod ext2_bounds;
+    // Round-3 F-r3-vfs-2: superblock group/inode counts. A bitmap block
+    // describes 32768 entries, so a crafted `s_inodes_count =
+    // s_inodes_per_group = 0xFFFFFFFF` is refused before the mount-time
+    // scan, and the scan span is clamped to one bitmap even if it were not.
+    mod ext2_group_counts;
+    // Round-3 F-r3-lead-1: address-space (CR3) reference accounting for the
+    // execve/exit teardown — every live-task registry (ready, SIGSTOP-parked,
+    // pending reap) must block freeing a PML4 another task still runs on.
+    mod as_refs;
+    // Политика подъёма порта xHCI: шторм reset был ошибкой таймингов, а
+    // потерянное включение — ошибкой записи PORTSC (PED — write-1-to-disable).
+    // Свойства закрепляют neutral-маску, последовательность
+    // hub_port_debounce/hub_port_wait_reset, 200-мс окно стабильности и backoff
+    // ≥1 с. Симулированные порты покрывают то, чего не может QEMU.
+    mod xhci_hub;
+    // Политика boot/report USB HID + обход configuration descriptor: длина
+    // передачи из wMaxPacketSize (не короче пакета, поэтому 7-байтный отчёт не
+    // вызывает babble на 4-байтном буфере), boot/report-раскладки мыши и каждый
+    // boot-интерфейс клавиатуры/мыши композитного устройства.
+    mod usb_hid_report;
     // Symbolic-link path resolution (issue #18, contract `EXT2-LINKS.md` §4.6,
     // §7.4): Linux-verified cases plus a randomized comparison against an
     // independent restart-based oracle.

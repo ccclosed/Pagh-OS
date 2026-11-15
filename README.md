@@ -202,6 +202,31 @@ server certificate chain, hostname and validity checked before a byte of the ind
   offline into `assets/font8x18.bin` by `tools/gen_font.py` — the kernel blends
   8-bit coverage per pixel, so glyph edges are antialiased, and it ships no TrueType
   parser.
+- **USB-ввод (xHCI + HID).** Встроенный драйвер xHCI без прерываний
+  (`drivers/xhci.rs`) перечисляет устройства на корневых портах, а
+  `drivers/usb_hid.rs` переводит их отчёты ровно в тот поток PS/2-сканкодов и
+  пакетов, который даёт путь 8042, поэтому shell, boot-меню, `^C`/`^Z` и stdin
+  `lxrun` работают без изменений. Каждый boot-интерфейс HID переводится в
+  **boot protocol** (SET_PROTOCOL 0, не report protocol), все boot-клавиатуры и
+  мыши композитного устройства привязываются и опрашиваются, interrupt-IN буфер
+  имеет размер `wMaxPacketSize` (поэтому длинный отчёт не вызывает babble), а
+  остановленный эндпоинт восстанавливается xHCI **Reset Endpoint** (ограниченное
+  число попыток), а не отключением ввода до перезагрузки. Подъём корневых портов
+  следует `hub.c`/`xhci-hub.c` в чистой политике с host-тестами
+  (`drivers/xhci_hub.rs`): каждая запись PORTSC идёт через neutral-маску (так
+  подтверждение reset больше не пишет `PED=1` и не отключает порт), подключение
+  должно быть неизменным 100 мс до reset (шаг 25 мс, бюджет 2 с), reset ждётся
+  как `hub_port_wait_reset` (опрос 10 мс, затем 200 мс, 800 мс на запись, до
+  пяти записей, затем `PED`), включение должно продержаться 200 мс до адресации,
+  потеря включения даёт паузу ≥1 с и новый debounce вместо reset каждые ~100 мс,
+  а PP power-cycle отсутствует вовсе (PP только поднимается, читается обратно и
+  повторяется). Ограничения честно названы: хабы не поддерживаются (устройство
+  за хабом невидимо); устройства только-report-protocol — best effort
+  (предполагается boot-раскладка клавиатуры, мышь поддерживает 7-байтную
+  16-битную E-Signal или 8-битные оси); wheel/pan декодируются, но не
+  доставляются; LED output report (`SET_REPORT`) не реализован. Проверено в
+  QEMU (`tools/e2e.py usb`, host-свойства, `selftest`); на реальном железе не
+  проверялось.
 - **Storage:** PCI enumeration, virtio-blk and NVMe block devices, **GPT/MBR partition
   support** (each partition becomes its own block device, so pagh can own one partition
   instead of the whole disk), and a multi-block-group ext2-compatible read/write
@@ -415,7 +440,9 @@ scroll back:
   the IntelliMouse four-byte protocol at boot, and the serial log says
   `[PS2MOUSE] wheel: IntelliMouse ...`).
 - **PageUp / PageDown** — one screenful per press. This also covers a USB HID
-  mouse: its boot protocol has no wheel axis, so only the keyboard can page there.
+  mouse: its boot protocol has no wheel axis, and the report-protocol wheel/pan
+  bytes are decoded but not delivered to the PS/2 path, so only the keyboard can
+  page there.
 - **Any other key or a click** returns to the live bottom; the status strip shows
   `scroll N/M` while you are back in history. `clear` forgets the history.
 - With a wallpaper active the history view is painted opaque (a history row has to
