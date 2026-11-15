@@ -1786,6 +1786,31 @@ def mode_usb(h: Harness) -> tuple[str, int]:
                     label="`usb` command output") is None:
             raise HarnessError("the in-guest `usb` command produced no report counters; "
                                f"serial tail:\n{tail(guest.serial())}")
+        # RING-WRAP REGRESSION. The HID transfer ring holds RING_TRBS-1 = 63
+        # usable TRBs; the wrap-around Link TRB has to be written with the
+        # *current* producer cycle and TRB_TOGGLE (the controller skips a link
+        # tagged with the next cycle). The old code got that wrong, so the
+        # endpoint went silent after 63 reports — a mouse dying after a minute of
+        # movement and a keyboard after a few dozen keystrokes. Type enough keys
+        # to cross the wrap and prove the counters keep growing.
+        long_before = len(guest.serial())
+        kb.text("x" * 90)
+        kb.key("ret")
+        time.sleep(0.4)  # let the unknown-command line and the next prompt land
+        kb.text("usb")
+        kb.key("ret")
+        long_deadline = time.time() + timeout
+        long_text = ""
+        while time.time() < long_deadline:
+            text = guest.serial()
+            if len(text) > long_before:
+                long_text = text[long_before:]
+                if re.search(r"usb: key reports \d+, mouse reports \d+", long_text):
+                    break
+            time.sleep(0.2)
+        else:
+            raise HarnessError("the post-wrap `usb` command produced no report "
+                               f"counters; serial tail:\n{tail(guest.serial())}")
         time.sleep(a.settle)  # let the port-table lines land before the screenshot
         kb.screenshot(shell_shot)
     finally:
@@ -1841,6 +1866,19 @@ def mode_usb(h: Harness) -> tuple[str, int]:
         "input from it is off until reboot" not in text,
         "endpoint-disabled line present" if "input from it is off until reboot" in text
         else "no endpoint-disabled line")
+    # Ring wrap: after >63 reports the endpoint must still be alive. This is the
+    # regression for the Link-TRB cycle/TOGGLE bug; without the fix the driver
+    # stops consuming reports at the wrap and the shell stops seeing keys.
+    wrap_reports = [int(n) for n in re.findall(
+        r"usb: key reports (\d+), mouse reports", long_text)]
+    ok &= h.check(
+        "HID ring wrap: keyboard keeps reporting across >63 transfer TRBs",
+        bool(wrap_reports) and max(wrap_reports) > 90,
+        f"post-wrap key reports: {wrap_reports[-1] if wrap_reports else 'none'}")
+    ok &= h.check(
+        "HID ring wrap: no endpoint gave up after the wrap",
+        "gave up" not in long_text and "input from it is off" not in long_text,
+        "no endpoint-disabled line after wrap")
 
     # ── the menu decision: only the typed confirmation can format ──
     chose = regex_first(

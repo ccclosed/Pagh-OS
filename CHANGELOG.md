@@ -137,6 +137,16 @@ reports live in `attack/r3/{arch,vfs,lead}/REPORT.md` and the top-level
   issued (... try=1/5 ...)`, `reset-ok ... speed_before=... speed_after=...`,
   `HID device on port N`, `usb: key reports`).
 
+* **HID transfer-ring wrap (field round 3):** input worked, then the mouse died
+  after about a minute and the keyboard about ten seconds later. The HID ring has
+  63 usable TRBs; the wrap-around Link TRB was written with the next producer
+  cycle (and `TRB_IOC` instead of `TRB_TOGGLE`), so the controller skipped the
+  link and the endpoint stopped consuming reports at the first wrap. The Link TRB
+  now carries the current cycle and the toggle bit; `tools/e2e.py usb` types
+  across the wrap and requires the keyboard counter to keep growing (241 reports
+  in the committed run). The failure scales with report count, which is why
+  short QEMU runs never saw it.
+
 ## 2.22.6
 
 Round-3 audit hotfix: four high, verified findings (three x86 machine-kill /
