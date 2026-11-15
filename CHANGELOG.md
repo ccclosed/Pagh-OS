@@ -1,733 +1,207 @@
 # Changelog
 
-Newest first, one paragraph per `Cargo.toml` version.
+Новое сверху, один раздел на версию `Cargo.toml`.
 
-**How to read this file.** A heading is a version bump, not necessarily a released
-build. Git tags / GitHub releases exist for `2.17.0` (2026-11-10), `2.18.6`
-(2026-11-10) and the `2.18.12-demo` bundle (2026-11-11, the demo media captured from
-2.18.12); `2.17.1`, `2.17.2` and the `2.18.0`-`2.18.12` field-fix series are version
-bumps whose notes are recorded here and in `AGENTS.md`, and they roll into the next
-tagged release (`2.18.13`, merged as PR #56). The full technical story of every release
-is the release-note block in `AGENTS.md`; the paragraphs here name the user-visible
-change and point there rather than duplicating it.
+**Как читать этот файл.** Заголовок — это bump версии, не обязательно выпущенная сборка. Git-теги / GitHub-релизы существуют для `2.17.0` (2026-11-10), `2.18.6` (2026-11-10) и бандла `2.18.12-demo` (2026-11-11, демо-медиа снято с 2.18.12); `2.17.1`, `2.17.2` и серия исправлений по реальному железу `2.18.0`–`2.18.12` — это bump'ы версии, чьи заметки записаны здесь и в `AGENTS.md` и входят в следующий тегированный релиз (`2.18.13`, влит как PR #56). Полная техническая история каждого релиза — в release-note блоке `AGENTS.md`; разделы здесь называют видимое пользователю изменение и указывают туда, а не дублируют. Единственная статусная страница по находкам безопасности — `SECURITY.md`.
 
 ## 2.22.7
 
-Round-3 audit follow-up on `dev` (the 2.22.6 hotfix kept the four high findings;
-these three lower-severity x86 findings land in the next release). The round-3
-reports live in `attack/r3/{arch,vfs,lead}/REPORT.md` and the top-level
-`attack/r3/REPORT.md` (external audit tree); `main` stays at 2.22.6.
+Follow-up раунда 3 на `dev`: hotfix 2.22.6 закрыл четыре high-находки, эти три x86-находки меньшей серьёзности выходят в следующем релизе; `main` остаётся на 2.22.6.
 
-* **F-r3-arch-3 (low, verified): `mprotect` protections were advisory on
-  fork-shared and partially covered pages.** After `fork`, a write to a page a
-  child had just made `PROT_READ` still copied the page private and installed
-  `WRITABLE`, and `mprotect(PROT_NONE)` over only part of a `VmRegion` left the
-  region record stale, so the next touch lazily re-mapped the page writable
-  (stack guards did not guard). A new software PTE bit (`RO_BIT`, available bit
-  10) now records that the *mapping* denies write on a COW leaf; `cow_copy_page`
-  copies only when the mapping is writable, so a write to a read-only mapping
-  keeps its SIGSEGV path, and `fork` preserves the distinction between a
-  deferred COW write and a read-only mapping. `update_region_flags` splits a
-  region that `mprotect` only partially covers into before/covered/after
-  sub-ranges (file-backed offsets shift exactly like `munmap`'s `cut_regions`),
-  so a `PROT_NONE` sub-range is a genuine fault, not a lazy-mapping
-  opportunity. Evidence: the audit's `attack/r3/arch/prot_bypass.c` now dies
-  with SIGSEGV while the shell stays alive; ordinary COW fork/write (the
-  round-3 `sweep` matrix) and a dynamically linked glibc binary (`fastfetch`)
-  are unaffected.
-
-* **F-r3-vfs-2 (low-medium, verified): a crafted ext2 superblock made every
-  mount scan 2^32 bits.** `s_inodes_count = s_inodes_per_group = 0xFFFFFFFF`
-  passed the non-zero checks, so `reconcile_free_counts` scanned a 2^32-bit
-  span (~28 s of boot CPU), computed a bogus free-inode total and wrote it back
-  to block 0. `ext2::bounds::validate_group_counts` now rejects before reading a
-  single bitmap bit: per-group counts above one bitmap block (`BS * 8`), zero
-  counts, and an inode count that exceeds `s_inodes_per_group * groups` all
-  produce `FsError::Corrupt` (the crafted image is refused cleanly at mount).
-  The scan span is additionally clamped to one bitmap block
-  (`clamp_group_span`) and the free totals saturate, so a superblock that
-  changes under the mount cannot reintroduce the unbounded loop. Host
-  properties: `ext2_group_counts`.
-
-* **F-r3-lead-1 (high, static): `execve` could free the address space of a
-  sibling task that is not in the ready queue.** `drop_exclusive_user_space`
-  looked only at the ready queue and pending reaps, so a sibling thread parked
-  by SIGSTOP/SIGTSTP (`STOPPED_TASKS`, out of rotation until SIGCONT) was
-  invisible and its shared CR3 was freed under it — page tables a later SIGCONT
-  would run on. The teardown decision now lives in a pure, host-property-tested
-  policy (`src/task/as_refs.rs`) consulted by both `execve` and the exit
-  reaper: a space is freed only when no live Tcb in any registry references it,
-  and the execve log names the registry that kept it alive. In this cooperative
-  scheduler a task blocked in `nanosleep`/`futex`/`read` stays in the ready
-  queue; the two states that leave it are the stopped set and the pending-reap
-  set, so those are exactly what the fix adds. An in-QEMU scheduler selftest
-  drives the real registries with allocated PML4s (exclusive → freed, ready →
-  kept, stopped → kept, resumed → kept until the last reference, pending reap →
-  kept). The audit's raw-`clone` reproducer never created its second thread, so
-  the impact remains static; the fix is the accounting invariant.
-
-* **USB HID: boot protocol, буферы по размеру пакета, восстановление
-  эндпоинта, композитные интерфейсы.** Устройства R82HE keyboard 3151:502d и
-  E-Signal LUOM G10 mouse 04d9:a09f выявили четыре дефекта: мышь не работала, а
-  клавиатура работала частично. (1) `SET_PROTOCOL` отправлялся с `wValue=1` —
-  *report* protocol — хотя код и доки говорили boot; HID 1.11 §7.2.6 определяет
-  boot как 0. Теперь для каждого boot-интерфейса уходит 0, результат проверяется
-  и логируется как `mode=boot|report`, а устройство, отказавшее boot, остаётся в
-  report protocol с best-effort разбором вместо потери ввода. (2) interrupt-IN
-  буфер был жёстко 8/4 байта; 7-байтный report-protocol отчёт мыши переполнял
-  4 байта, контроллер сообщал babble, и эндпоинт отключался до перезагрузки.
-  Теперь буфер равен `wMaxPacketSize` с clamp 8..=64, то есть не короче одного
-  пакета. (3) Ошибка передачи теперь выдаёт xHCI Reset Endpoint (TRB type 14) и
-  переармирует передачу, до трёх попыток, вместо отключения с первой ошибкой;
-  команда `usb` печатает счётчики reset/bad report. (4) `Slot.hid` был одним
-  `Option<HidEndpoint>`, поэтому остальные HID-интерфейсы композитного
-  устройства игнорировались; теперь это `Vec`, разбирается каждый HID-интерфейс
-  с interrupt-IN эндпоинтом, привязываются только boot-клавиатуры/мыши
-  (protocol 0 и vendor-коллекции логируются и пропускаются), одна Configure
-  Endpoint добавляет все DCI, а опрос идёт по всем эндпоинтам с маршрутизацией
-  событий по slot/endpoint. Раскладки: boot-отчёты как раньше; report-мышь
-  декодирует 7-байтную 16-битную X/Y E-Signal/Holtek (дельты клампятся в
-  диапазон PS/2-пакета; wheel/pan декодируются, но не доставляются) и
-  3-6-байтные 8-битные раскладки best effort; report-клавиатура использует
-  boot-подобные 8 байт. Host-свойства `usb_hid_report`/`usb_desc`, новые
-  in-QEMU selftest-кейсы report-режима, `tools/e2e.py usb` и PS/2-путь зелёные.
-  Реального железа для этого изменения не было (только QEMU); serial-строки для
-  проверки на железе названы в `src/drivers/README.md`.
-
-* **Подъём корневого порта xHCI: neutral-записи PORTSC и последовательность
-  сброса по `hub.c` (2.22.7, вторая итерация).** Та же машина (Intel 8086:7a60,
-  26 портов, `attached=0x02000731`) сообщала о каждом подключённом USB2-порте
-  `ccs=1 ped=0 pp=1 pls=7 stage=lost-after-reset code=0x6e1 try=19 ms=124 ...
-  prc=1 ped_seen=1 ped_sc=0x00200e03` при 0 HID-устройств. Первая итерация
-  заменила цикл reset 25/20/60 мс чистой политикой (`src/drivers/xhci_hub.rs`,
-  свойства `xhci_hub`), но следующий дамп показал оставшийся отказ: после 16
-  неудачных попыток PP power-cycle оставил все порты в `pp=0 ccs=0`
-  (`stage=power-cycle try=16 ms=159`), PED+U0 был виден на мгновение
-  (`ped_seen=1 ped_u0=1 ped_sc=0x00200603`), а порт откатывался в Polling на
-  speed id 1 (FS) там, где ожидается 3 (HS). Причина — в записи PORTSC: она
-  маскировала write-1-to-clear *change*-биты, но возвращала остальное значение
-  обратно, включая **PED (бит 1), который является write-1-to-disable**;
-  подтверждение PRC/CSC на только что включённом порту отключало его (в дампе
-  `post=0x6e1`). Теперь каждая запись PORTSC идёт через
-  `port_state_to_neutral()` — маску `xhci_hub_state_to_neutral()` (RO-биты:
-  CCS/бит 3/speed/бит 30; RWS-биты: PLS/PP/биты 14-15/25-27; всё остальное
-  пишется нулём), — а reset это `neutral | PR` (USB2) или `neutral | WPR`
-  (USB3) без очистки change-битов в той же записи. Политика использует
-  последовательность и числа `hub.c`: `hub_port_debounce` (шаг 25 мс, 100 мс
-  неизменного CCS, бюджет 2 с) до первого reset; 100 мс power settle после
-  PP=1; `hub_port_wait_reset` (10 мс дважды, затем 200 мс, 800 мс на запись,
-  успех `!PR && CCS`, затем PED, нет PED — reset снова, до
-  `PORT_RESET_TRIES`=5); PED+U0 должен держаться 200 мс до адресации;
-  PRC/WRC/CSC подтверждаются только после этого включения
-  (`ClearPortFeature(C_PORT_RESET)`); потерянный PED даёт паузу ≥1 с, затем
-  debounce и только потом новый reset. PP power-cycle удалён полностью: PP
-  только поднимается, с readback и повторами, а неудачная запись повторяется
-  после backoff, поэтому порт не может остаться обесточенным. Диагностика:
-  короткий `warn` о реальных отказах, одна строка `xhci: HID device on port N:
-  ... mode=boot`, полный снимок портов — команда `usb`. Evidence: QEMU
-  `tools/e2e.py usb` (клавиатура и мышь через меню и shell, PS/2 не затронут),
-  `selftest`, host-свойства `xhci_hub` (включая свойство, закрепляющее
-  neutral-маску) и все шесть гейтов; реального железа не было, поэтому это
-  только QEMU-доказательство и нужен тест пользователя.
-
-* **Замыкание HID transfer-кольца:** ввод работал, затем мышь умирала примерно
-  через минуту, а клавиатура — на десять секунд позже. HID-кольцо вмещает 63
-  полезных TRB; замыкающий Link TRB писался со следующим циклом производителя
-  (и с `TRB_IOC` вместо `TRB_TOGGLE`), поэтому контроллер пропускал ссылку и
-  эндпоинт переставал потреблять отчёты на первом замыкании. Теперь Link TRB
-  несёт текущий цикл и toggle-бит; `tools/e2e.py usb` печатает через замыкание и
-  требует, чтобы счётчик клавиатуры продолжал расти (241 отчёт в закоммиченном
-  прогоне). Отказ масштабируется числом отчётов, поэтому короткие QEMU-прогоны
-  его не видели.
+* **`mprotect` на fork-shared и частично покрытых страницах (low):** `mprotect`-защиты были совещательными на fork-shared и частично покрытых страницах. Новый программный бит листа `RO_BIT` фиксирует, что маппинг запрещает запись, `cow_copy_page` копирует только при записываемом маппинге, а `update_region_flags` делит частично покрытый регион на before/covered/after, поэтому `PROT_NONE` — настоящий fault. Остаток: `PROT_NONE` на `brk`-странице всё ещё переподкрепляется brk-fast-path — задокументированный follow-up.
+* **crafted ext2 superblock с невозможными счётчиками inode (low-medium):** crafted ext2 superblock с `s_inodes_count = s_inodes_per_group = 0xFFFFFFFF` заставлял mount сканировать 2^32-битный span и портил `s_free_inodes_count`. `ext2::bounds::validate_group_counts` отвергает невозможный superblock до чтения bitmap; span клампится до одного блока.
+* **`execve` и sibling, припаркованный в `STOPPED_TASKS` (high, static):** `execve` мог освободить адресное пространство sibling-задачи, припаркованной SIGSTOP/SIGTSTP. Политика teardown теперь чистая и host-тестируемая (`src/task/as_refs.rs`) и учитывает ready queue, stopped set и pending-reap set.
+* **USB HID:** boot protocol, буферы по `wMaxPacketSize`, Reset Endpoint при ошибке передачи, композитные интерфейсы (`Vec` HID-эндпоинтов вместо одного `Option`), report-протокол best effort. Host-свойства `usb_hid_report`/`usb_desc`, in-QEMU selftest, `tools/e2e.py usb` и PS/2-путь зелёные; реального железа не было.
+* **Подъём корневого порта xHCI:** neutral-записи PORTSC (`port_state_to_neutral()`), последовательность сброса по `hub.c`, без PP power-cycle; диагностика ограничена warn'ами и командой `usb`. Доказательство — QEMU `tools/e2e.py usb`, `selftest`, host-свойства `xhci_hub`.
+* **Замыкание HID transfer-кольца:** Link TRB теперь несёт текущий цикл и toggle-бит; `tools/e2e.py usb` печатает через замыкание и требует роста счётчика клавиатуры.
 
 ## 2.22.6
 
-Round-3 audit hotfix: four high, verified findings (three x86 machine-kill /
-lifetime primitives and one package-installer confinement bypass). The round-3
-reports live in `attack/r3/{arch,life,vfs}/REPORT.md` (external audit tree).
+Hotfix раунда 3: четыре high-находки (три x86 machine-kill/lifetime и один обход confinement установщика).
 
-* **F-r3-arch-1 (high, verified): ring-3 CPU exceptions halted the machine.**
-  Only `#GP`/`#PF` implemented the "a userspace exception kills the process,
-  the kernel keeps running" rule; `1/0`, `ud2` or `pushfq/orq $0x100/popfq`
-  from an unprivileged ELF parked the CPU forever. `#DE`/`#DB`/`#UD` (and
-  `#OF`/`#BR`/`#NM`/`#AC`, plus the user-reachable `#MF`/`#XM`) now share the
-  pure, host-tested `trap_frame::exception_action` policy: a ring-3 fault (or a
-  user RIP) in a Compat_Process sets `exit_code = 128 + signal` and terminates
-  only that process; a ring-0 fault on a kernel address stays fatal. `syscall`
-  also masks TF out of the kernel RFLAGS, so a user-set single-step flag cannot
-  turn a syscall into a kernel-mode `#DB`. PoCs `mk_de`/`mk_ud`/`mk_db` now
-  return to the prompt; `mk_bp` (ring-3 `int3` → `#GP`) still kills only the
-  process.
-* **F-r3-life-1 (high, verified): `fcntl(F_DUPFD)` had no descriptor cap.**
-  `dup2`/`dup3` were bounded by `NOFILE_MAX = 1024`, but the `F_DUPFD`/
-  `F_DUPFD_CLOEXEC` arm passed the caller's `arg` straight into
-  `FdTable::dup_min`, so `fcntl(fd, F_DUPFD, 0x2A000000)` grew the slot vector
-  toward a 704 MiB allocation and the allocator panic halted the machine. The
-  syscall now rejects `arg >= NOFILE_MAX` with `EINVAL` before touching the
-  table, and `FdSlots::try_alloc` independently refuses any slot index at or
-  above the same bound (`EMFILE`) before growing the vector — both sides of the
-  bound are host-property-tested.
-* **F-r3-life-2 (high, verified): `epoll_wait` over a signalfd self-deadlocked
-  `COMPAT_STATES`.** `poll_fd` already ran inside `with_current_compat`; its
-  signalfd arm called `signalfd_readable()`, which took the same non-reentrant
-  spinlock again — a hard hang with interrupts disabled (no timer, no
-  watchdog). The arm now computes readiness from the compat state the closure
-  already owns, and `signalfd_readable` carries a debug assert so the
-  re-entrancy class fails loudly instead of hanging. A four-syscall PoC now
-  returns; ordinary epoll/signalfd combinations still work.
-* **F-r3-vfs-1 (high, verified): installer spelling split.** `own_links`
-  tracked the *archive* spelling of a created symlink while the effectful
-  resolver compared the *walked* spelling. A pre-existing relative in-root
-  redirector (the shipped tree has `/usr/share/doc/libgcc-s1 -> gcc-14-base`)
-  made `./usr/share/doc/libgcc-s1/evil -> ../../../../etc` materialize at
-  `gcc-14-base/evil`, after which a member spelled
-  `gcc-14-base/evil/autorun` was written through that link to
-  `/mnt/etc/autorun` (root at next boot). The installer now preflights every
-  planned symlink against the pre-existing tree and refuses the package whole
-  (`UnsafePath`) before the first inode when a member descends through its
-  materialized spelling; the effectful layer additionally registers both
-  spellings and the created link **inode**, and the resolver refuses to
-  traverse any symlink inode the install created. `attack-final.deb` is
-  refused atomically, the two-package self-contained variant too, round-1/2
-  constructs stay refused and a normal `.deb` still installs.
-
-Gates: the six documented commands, new host properties
-(`exception_trap`, bounded fd allocation, resolved-spelling detection), the
-in-QEMU `install_spelling_split_confinement` selftest, and the round-1/2/3 PoC
-regression matrix on the round-3 QEMU range.
-
-Full story: `AGENTS.md`, 2.22.6.
+* **Исключения ring 3 вместо `halt()`:** ring-3 `#DE`/`#DB`/`#UD` (и `#OF`/`#BR`/`#NM`/`#AC`) уходили в `halt()`. Теперь они делят политику `trap_frame::exception_action`: fault ring 3 убивает только процесс, fault ring 0 на адресе ядра фатален; `SYSCALL` маскирует TF.
+* **Неограниченный `fcntl(F_DUPFD)`:** `fcntl(F_DUPFD)` без cap: `arg >= NOFILE_MAX` теперь `EINVAL` до аллокации, `FdSlots::try_alloc` независимо отказывает с `EMFILE`.
+* **Самодеадлок `epoll_wait` поверх signalfd:** `epoll_wait` по signalfd самодеадлочил `COMPAT_STATES`; ветка вычисляет готовность из уже принадлежащего замыканию `CompatState`, `signalfd_readable` debug-assert'ит неудержание реестра.
+* **Spelling-split в установщике пакетов:** installer spelling desync: `own_links` хранил архивное написание symlink, резолвер сравнивал пройденное; `attack-final.deb` писал `/mnt/etc/autorun`. Планировщик отвергает пакет целиком (`UnsafePath`) до первого inode; регистрируются оба написания и inode созданной ссылки.
+* Гейты: шесть команд, новые host-свойства (`exception_trap`, bounded fd allocation, resolved-spelling detection), in-QEMU `install_spelling_split_confinement`, регрессия PoC раундов 1/2/3.
 
 ## 2.22.5
 
-Round-2 audit finding F-r2-vfs-1 (high, verified): a hard-link alias of a package
-symlink still escaped the `.deb` installer's install root. `link(2)` does not
-follow the final component, so a tar hard-link member whose target is a symlink
-member is a *second name for the symlink inode*, invisible to the 2.22.1
-path-based `own_links` check. The audit's package (`./d/pwn`, `./d/y -> ../etc`,
-`./d/h` hardlink to `./d/y`, `./d/h/autorun` hardlink to `./d/pwn`) was accepted
-and wrote `/mnt/etc/autorun`, which the shell executes as root at the next boot.
-The pure planner now computes the hard-link/symlink equivalence closure up front
-(aliases of aliases and `..`-normalized targets included, archive order
-irrelevant) and refuses the alias member and every member below it, turning the
-non-empty refusal list into the same atomic whole-package
-`InstallError::UnsafePath` before any write. The effectful layer never creates a
-second name for an archive symlink and never traverses a symlink that has more
-than one hard link (the backstop for an unmarked alias left by an earlier
-install). Normal hard links to regular files and round-1 relative in-root links
-(`lib64 -> usr/lib64`) keep working, and the round-1 F-x86n-1 packages are still
-refused. Verified with the audit's `attack/r2/vfs/attack-alias.deb` (package
-refused as a whole, `/mnt/etc/autorun` absent, a second boot executes no
-payload), new `tar_links` host properties, the in-QEMU
-`install_hardlink_alias_confinement` selftest and the committed
-`tests/pkg/e2e_pkg_escape.py` harness; a normal `.deb` with a regular-file hard
-link still installs.
-
-Also fixed, found while producing the in-QEMU evidence: the `lx_selftest`
-feature build (not part of CI's six default-profile gates) had been broken since
-2.22.2 added `RunError::AccessDenied` — the six `RunError` matches in
-`src/selftest_lx.rs` lacked the new arm, so the LXSELFTEST harness could not be
-compiled. The arms now report the denial; the default build is unchanged.
-
-Full story: `AGENTS.md`, 2.22.5.
+* **Hardlink-алиас symlink в `.deb` (high):** hardlink-алиас symlink обходил confinement `.deb`. Планировщик вычисляет замыкание эквивалентности hardlink/symlink и отвергает алиас с каждым членом под ним (`UnsafeKind::HardlinkAliasesSymlink` → `InstallError::UnsafePath`); эффектный слой не создаёт второе имя архивной symlink и не идёт через symlink с `nlink > 1`. PoC `attack-alias.deb` отвергнут целиком, `/mnt/etc/autorun` отсутствует.
+* Попутно исправлена сборка `lx_selftest`: шесть match'ей `RunError` в `src/selftest_lx.rs` не имели ветки для добавленного в 2.22.2 `RunError::AccessDenied`.
 
 ## 2.22.4
 
-Fork-COW frame ownership (round-2 attack audit F-r2-arch-1, critical, and
-F-r2-arch-2, high). `fork_user_space_cow` shares leaf frames with `COW_BIT` and
-a PMM refcount, but only the exit path honoured it: `munmap`,
-`mprotect(PROT_NONE)`, `mprotect(RW)` and `MAP_FIXED` replacement freed or
-re-flagged the shared frame without `cow_unref`. An unprivileged process could
-`mprotect(RW)` the parent's share, `munmap` it in the forked child, and have the
-still-writable parent PTE alias frames the allocator then handed out as kernel
-page tables — arbitrary physical read/write, `Creds` zeroed, uid 0. The same
-missing accounting freed already-reallocated frames during process exit (1017
-PMM double frees). Every user-leaf release now goes through one helper
-(`vmm::release_user_leaf`) that frees a frame only when `cow_unref` reports the
-last reference and drops the PTE first; `mprotect` re-flags a COW leaf in place,
-keeping `COW_BIT` and deferring write access to the next write fault
-(`cow_copy_page`); `vmm::map` refuses to overwrite a live COW leaf; the PMM
-refuses to free a frame that still has registered COW sharers. The accounting
-lives in the pure, host-tested `memory::cow` module (property `cow_ownership`
-models fork/write/unmap/MAP_FIXED/mprotect/exit over a PMM that rejects double
-frees and frees of mapped frames), and two in-QEMU self-test routines exercise
-the real PMM/page tables. Verified with the audit's `cow_root`/`cow_min` PoCs on
-the round-2 range: stock 2.22.3 reaches uid 0 and logs the 1017 double frees;
-2.22.4 leaves uid 1000, reports no page-table reuse and no `DOUBLE FREE`, and
-the shell stays alive.
-
-Full story: `AGENTS.md`, 2.22.4.
+* **Владение fork-COW кадрами (critical/high):** fork-COW кадры не unref'ились на `munmap`/`mprotect(PROT_NONE)`/`mprotect(RW)`/`MAP_FIXED`/`mremap`; эксплойт давал произвольное чтение/запись физической памяти и uid 0, а exit — 1017 `DOUBLE FREE`. Единая точка `vmm::release_user_leaf` очищает PTE/TLB, потребляет один `cow_unref` и освобождает только на последней ссылке; `mprotect` сохраняет `COW_BIT`, `vmm::map` не перезаписывает живой COW-лист, PMM отказывает кадру с живыми COW-ссылками. Учёт — `memory/cow.rs`, свойство `cow_ownership`; PoC `cow_root`/`cow_min` на исправленном: uid 1000, нет reuse и `DOUBLE FREE`, shell жив.
 
 ## 2.22.3
 
-TOCTOU on user buffers in blocking syscalls (attack-audit F-x86a-4). A sibling
-`CLONE_VM` thread could munmap a buffer that `poll`/`ppoll`/`select`/
-`epoll_wait` had validated once, after which the kernel touched the stale user
-pointer from ring 0 and the page fault halted the machine. The wait loops now
-work on kernel copies and re-validate the user range after every yield
-(`-EFAULT` when the buffer vanished); the same "validate, block, publish"
-pattern was fixed in the read family, the `readv`/`writev` iovec iteration,
-`wait4` and `sendfile`. `clone`'s `parent_tid`/`child_tid` writes moved inside
-the interrupt-disabled spawn/fork window, and `ioctl(TCSETS*)` now honours its
-pointer validation (it used to discard it and read `c_lflag` anyway). Defense
-in depth: a kernel-mode page fault on a *user* address kills only the faulting
-process; kernel-address and NULL faults stay fatal. Verified with the audit's
-PoC (`tools/security/poc/poc_poll_toctou.c`) against the fixed kernel and the
-stock 2.22.0 image; the `page_fault` host property covers the fault policy.
-
-Full story: `AGENTS.md`, 2.22.3.
-Also fixed in the same batch, found in review: `sendto(2)`/`recvfrom(2)`
-validated a capped user range but allocated/copied the raw `u64` count, so a
-process with 1 MiB mapped could force a multi-gigabyte kernel allocation
-(abort/OOM DoS). Oversized `sendto` is now `EMSGSIZE` before allocation and
-`recvfrom` caps the capacity at 1 MiB, with the `p57` host property and
-`tools/security/poc/poc_sock_large_count.c` as regressions.
+* **TOCTOU пользовательских буферов в блокирующих сисколлах:** TOCTOU на пользовательских буферах в блокирующих сисколлах. Циклы ожидания `poll`/`select`/`epoll_wait` работают на приватных копиях и перепроверяют диапазон после каждого `yield`; тот же паттерн закрыт в read-семействе, iovec `readv`/`writev`, `wait4`, `sendfile`; записи `clone` в `parent_tid`/`child_tid` — внутри окна с выключенными прерываниями; `ioctl(TCSETS*)` уважает валидацию. Page fault режима ядра на пользовательском адресе убивает только процесс. PoC: `tools/security/poc/poc_poll_toctou.c`.
+* **Сырой `u64` count в `sendto`/`recvfrom`:** `sendto`/`recvfrom` валидировали урезанную длину, но аллоцировали сырой `u64` count. `abi::socket_payload_len` даёт `EMSGSIZE` до аллокации, `recvfrom` урезает ёмкость до 1 MiB. PoC: `tools/security/poc/poc_sock_large_count.c`.
 
 ## 2.22.2
 
-The filesystem half of the 2026-11-13 attack-audit batch: crafted ext2 images
-and missing path-traversal permission checks. All five x86 VFS findings are
-fixed, plus one allocation site of the same class found while fixing them.
+Файловая половина пакета аудита 2026-11-13: crafted ext2-образы и отсутствующие проверки прав обхода пути.
 
-* Crafted ext2 symlink inodes no longer drive kernel allocations: the target
-  shape is classified from `i_blocks`/`i_size` before anything is allocated —
-  fast only when the target is genuinely inline (≤ 60 bytes, `i_blocks == 0`),
-  slow only for a one-block data link (≤ 4096 bytes), everything else
-  `FsError::Corrupt` (F-x86v-1: `lstat`/`readlink` used to request ~4 GiB and
-  abort the kernel).
-* Path traversal now requires search (`x`) permission on every intermediate
-  directory, checked through the pure link walker's `may_search` hook with the
-  process's effective credentials (`access(2)` uses its real ids), including
-  directories reached through a followed symlink; denial is `EACCES`, and
-  `chdir(2)` additionally needs search on the target directory itself
-  (F-x86v-3: uid 1000 could read a 0644 file inside a root-owned 0700
-  directory). `lstat`/`readlink` keep no-follow semantics.
-* `rename(2)`'s copy emulation is bounded (64 MiB, `ENOMEM` above it) and
-  reserves fallibly, so a sparse file claiming ~4 GiB no longer aborts the
-  kernel (F-x86v-2).
-* `unlink` decides fast/slow for a symlink from `i_blocks` alone, so a crafted
-  `i_blocks == 0, i_size > 60` inode can no longer free the block number
-  spelled by its target text (F-x86v-4); the read path treats that shape as
-  corrupt rather than as a block map.
-* Directory block counts are validated (`i_size` block-aligned and not larger
-  than the filesystem) before any lookup/readdir/unlink scan, closing the
-  ~1M-block crafted-directory stall (F-x86v-5).
-* Same class, found in the batch: the `execve`/`PT_INTERP` image reader had an
-  unbounded `i_size` allocation and bypassed traversal checks — image size is
-  now capped at 256 MiB with a fallible reserve, and the exec path is
-  credential-checked (F-x86v-6).
+* **Crafted ext2 symlink `i_size`:** crafted ext2 symlink-inode с огромным `i_size` заставлял `read_symlink()` аллоцировать до 4 GiB → panic. Форма цели классифицируется по `i_blocks`/`i_size` до аллокации (fast ≤ 60 байт inline, slow ≤ 4096 байт один блок, иначе `FsError::Corrupt`).
+* **Отсутствие search-права при обходе пути:** обход пути не требовал search (`x`) на промежуточных каталогах — uid 1000 читал `0644`-файл в root-owned `0700`-каталоге. Чистый обходчик спрашивает `may_search`, отказ → `EACCES`; `chdir` требует search и на цели.
+* **Неограниченное копирование в `rename`:** копирование в `rename` ограничено 64 MiB (`ENOMEM` выше) и резервируется fallible.
+* **Fast/slow symlink на `unlink`:** `unlink` решает fast/slow по одному `i_blocks`; `i_blocks == 0, i_size > 60` больше не освобождает текст цели как номер блока.
+* **Crafted размер каталога:** размеры каталогов валидируются до lookup/readdir/unlink (закрыт stall на ~1M блоков).
+* **Неограниченная аллокация образа в `execve`:** читатель `execve`/`PT_INTERP` ограничен 256 MiB с failible-резервом и проверяет права на exec-пути.
 
-Host properties pin the pure rules (with the audit's exact crafted values) and
-the committed ring-3 PoC reproduces every finding on the stock 2.21.0 range
-(panics / protected contents / block-count change) while 2.22.2 returns
-`ENOENT`/`EACCES`/`ENOMEM`/`ENOEXEC` and stays alive. Remaining audit findings
-(the user-buffer TOCTOU and RISC-V runtime items) are listed in
-`SECURITY.md` and land in follow-up batches. Full story: `AGENTS.md`, 2.22.2.
+Host-свойства закрепляют чистые правила, ring-3 PoC воспроизводит каждую находку на стоковом 2.21.0 и получает `ENOENT`/`EACCES`/`ENOMEM`/`ENOEXEC` на 2.22.2.
 
 ## 2.22.1
 
-Package installer confined to its root (F-x86n-1, high, verified). A `.deb` could
-carry a symlink member and then a member *below* it: parent resolution followed
-the package's own link, interpreted in the guest namespace where `/etc` means
-`/mnt/etc`, so `./y -> /etc` + `./y/autorun` wrote `/mnt/etc/autorun` (executed as
-root at the next boot) and `./x -> /` + `./x/pwned_root` wrote the install root —
-neither member path contains `..`, so the archive-path normalization could not see
-it. The pure planner now refuses any member or hard-link target whose ancestor is
-a symlink the same archive creates, and the installer rejects the whole package
-atomically (`UnsafePath`) before writing anything; the parent resolver walks
-lstat-style from the install-root node, never follows a package-created or
-absolute-target link, keeps every `..`/relative splice under the root, and
-resolves hard-link targets through the same walker, while a pre-existing relative
-in-root link (`lib64 -> usr/lib64`) still resolves inside its target. Evidence: the
-F-x86n-1 properties in `host-tests/src/properties/tar_links.rs`, the in-QEMU
-`install_symlink_confinement` selftest and the committed live harness
-`tests/pkg/e2e_pkg_escape.py` (crafted packages refused with a named path,
-`/mnt/etc/autorun` absent, plain `..` still skipped, normal `.deb` still installs).
-Full story: `AGENTS.md`, 2.22.1.
+* **Symlink-член `.deb` вне корня установки (high):** symlink-член `.deb` с целью вне корня установки (`./y -> /etc`) позволял записать `/mnt/etc/autorun`, исполняемый как root при следующей загрузке. Планировщик отвергает члена или hard-link-цель, чей предок — symlink того же архива; `install_data_tar` отвергает пакет целиком (`UnsafePath`) до создания inode; резолвер родителей стартует от узла корня установки и не идёт через созданные пакетом или абсолютные ссылки. Доказательство: host-свойства `tar_links`, in-QEMU `install_symlink_confinement`, `tests/pkg/e2e_pkg_escape.py`.
 
 ## 2.22.0
 
-Ring-3 isolation hardening from the 2026-11-13 attack audit. Three independent
-ring3-to-ring0 paths and a one-syscall machine kill are closed:
+Изоляция ring 3 по аудиту 2026-11-13: закрыты три пути ring3-to-ring0 и убийство машины одним сисколлом.
 
-* `mprotect(2)` no longer accepts kernel virtual addresses: `mprotect`/`munmap`/
-  `mremap` share a pure user-range gate, the `PROT_NONE` path can only free user
-  frames, and `vmm::map` refuses `USER_ACCESSIBLE` mappings of kernel addresses
-  (F-LEAD-1: a kernel-heap W+X alias reachable from ring 3, used to zero the
-  process's own credentials).
-* `rt_sigreturn(2)` rejects frames whose `ip`/`sp` leave the user half and masks
-  restored RFLAGS to user-settable bits, so a forged frame can no longer set
-  `IOPL=3` and reach I/O ports/PCI config (F-LEAD-2).
-* `recvfrom(2)` validates the source-address outputs before writing them (the
-  16-byte arbitrary kernel write, F-x86a-1) and `connect(2)` validates the
-  caller's `sockaddr` before reading its family (the ring-0 #GP that halted the
-  machine, F-x86a-3).
-* The EINVAL syscall diagnostic is rate-limited: it is attacker-triggerable and
-  left the exploit loop flooding serial and framebuffer.
-
-Verified with the audit's own PoCs against the fixed kernel (exploits now fail
-safely; the same PoCs still succeed on the stock 2.21.0 image) and host tests for
-the new flag/range rules. Remaining audit findings (package symlink escape,
-crafted-ext2 sizes, path search permissions, RISC-V runtime) are listed in
-`SECURITY.md` and land in follow-up batches. Full story: `AGENTS.md`, 2.22.0.
+* **`mprotect` принимал адреса ядра (critical):** `mprotect` принимал адреса ядра; `mprotect`/`munmap`/`mremap` теперь делят пользовательский гейт диапазона, `PROT_NONE` освобождает только пользовательские кадры, `vmm::map` отвергает `USER_ACCESSIBLE`-маппинг ядра.
+* **Поддельный `rt_sigreturn` и `IOPL=3` (critical):** поддельный `rt_sigreturn` ставил `IOPL=3`. Декодер отвергает `ip`/`sp` вне пользовательской половины и маскирует RFLAGS в `USER_RFLAGS_MASK`.
+* **`recvfrom` писал через непроверенные указатели:** `recvfrom` писал `sockaddr`/`socklen_t` через непроверенные указатели; оба выхода валидируются `check_user_ptr`.
+* **`connect` читал `sa_family` через непроверенный указатель:** `connect` читал `sa_family` через непроверенный указатель и валил машину ring-0 #GP; теперь проверка до чтения.
+* Диагностика EINVAL-сисколлов ограничена одной строкой в секунду.
 
 ## 2.21.0
 
-Console scrollback. The framebuffer console keeps a bounded ring of the rows it
-scrolls off (characters and per-cell colour) and shows them again when the view
-scrolls: PS/2 mouse wheel (IntelliMouse four-byte packets, negotiated at mouse
-init), PageUp/PageDown on the keyboard, three lines per notch. New output keeps
-the same absolute rows in view, the status strip reports `scroll N/M`, and an
-ordinary key or click returns to the live bottom; `clear` forgets the history. The
-view is repainted from the model, so the live grid, caret and selection are
-untouched; with a wallpaper active the history view is opaque and the wallpaper is
-repainted on return. A USB HID boot mouse has no wheel axis in its protocol, so a
-USB mouse scrolls with PageUp/PageDown (stated in `README.md`). The same work fixed
-the `wallpaper` shell command never calling `theme::apply`, which made every
-wallpaper invisible inside the text grid. Evidence: `drivers::scrollback` host
-unit tests and the committed `tools/e2e.py scroll` scenario (QMP wheel, paging,
-reset, screenshot diff, wallpaper round-trip). Full story: `AGENTS.md`, 2.21.0.
+Console scrollback: framebuffer-консоль держит ограниченное кольцо ушедших вверх строк (символы и цвет ячеек) и показывает их при прокрутке — колесо PS/2-мыши (IntelliMouse, четырёхбайтные пакеты), PageUp/PageDown по три строки. Новый вывод удерживает те же абсолютные строки, статус-строка печатает `scroll N/M`, обычная клавиша или клик возвращают к живому низу, `clear` забывает историю. USB HID boot-мышь не имеет оси wheel, поэтому прокручивает PageUp/PageDown (`README.md`). Попутно `wallpaper` теперь действительно вызывает `theme::apply`. Доказательство: host-тесты `drivers::scrollback` и `tools/e2e.py scroll`.
 
 ## 2.20.0
 
-`/proc/<pid>/maps` stops claiming `00:00 0` for files. The map's `PT_LOAD` segments
-(image and interpreter) and file-backed `mmap`s now print the `st_dev`/`st_ino` and
-pathname `stat(2)`/`fdinfo` already report for the same VFS node — `08:00` is exactly
-the `major:minor` this kernel's `stat` returns for a VFS node — plus the real file
-offset of a `mmap` (shifted correctly when a partial `munmap`/`mprotect` splits a
-region). `[heap]`, `[stack]` and anonymous mappings keep the honest `00:00 0` and no
-pathname: they have no backing file. The kernel still keeps no VMA list, so the map
-shows exactly what it knows (image, interpreter, heap, tracked `mmap`s, stack) and
-nothing invented; DEVIATION-7 is narrowed to those cases. Contract: `docs/procfs.md`
-§14. Evidence: the `procfs::maps file identity` in-QEMU selftest,
-`properties/procfs_maps.rs` and the `lx_selftest` `maps_metadata` fixture — a real
-guest ELF that maps its own file, reads `/proc/self/maps` and writes the dump for the
-harness to verify against the VFS.
+`/proc/<pid>/maps` перестал печатать `00:00 0` для файлов: сегменты `PT_LOAD` образа и интерпретатора и file-backed `mmap` печатают `st_dev`/`st_ino` и pathname из `stat(2)`/`fdinfo` (`08:00` — это реальный `major:minor` этого ядра), плюс реальное смещение файла у `mmap`. `[heap]`, `[stack]` и анонимные маппинги сохраняют честные `00:00 0` без pathname: у них нет backing-файла. VMA-списка ядро по-прежнему не держит, поэтому карта показывает ровно то, что знает; DEVIATION-7 сужен до этих случаев. Контракт: `docs/procfs.md` §14. Доказательство: in-QEMU `procfs::maps file identity`, `properties/procfs_maps.rs` и фикстура `lx_selftest` `maps_metadata`.
 
 ## 2.19.0
 
-Nine new shell commands plus `ls -l` and `-h` human units for `free`/`df`. `free` prints physical-memory total/used/free (the PMM
-frame counters) and the fixed kernel heap (region size, bytes handed out,
-remainder) in busybox `free` layout and KiB units; `/proc/meminfo` already gave
-programs `MemTotal`/`MemFree`, but the shell had no view and meminfo has no heap
-row, and `free` reads the same PMM counters so the two cannot disagree. `date`
-prints the CMOS RTC wall clock in UTC (ISO date/time, weekday, Unix seconds) —
-`uptime` only ever showed monotonic ticks. `ls -l` prints mode, links,
-owner/group, size and symlink targets in long form (no timestamp column: the VFS
-has no mtime). `chmod` sets the permission bits `ls -l` prints: ext2 persists
-them, filesystems without on-disk metadata report "operation not supported" per
-path. `chown` sets the owner/group the same way (numeric ids; ext2 persists,
-other filesystems report per path). `tree` prints a recursive ASCII listing with
-a counts trailer. `head`, `tail`, `wc` and `grep`
-inspect a file without dumping it — first/last N lines,
-line/word/byte counts, and the lines matching a pattern — through one streaming
-walk with a 4 MiB cap and a transcript-terminating last line. The limits are
-stated rather than stubbed: `shared`, `buffers` and `Swap` read zero because this
-kernel has no shared-memory accounting, no block cache and no swap device. Full
-story: `AGENTS.md`, 2.19.0.
+Девять новых shell-команд плюс `ls -l` и человеческие единицы `-h` для `free`/`df`. `free` печатает total/used/free физической памяти (счётчики PMM) и фиксированную кучу ядра в busybox-раскладке; `date` — CMOS RTC в UTC; `ls -l` — mode, links, owner/group, размер и цели symlink (без колонки timestamp: у VFS нет mtime); `chmod`/`chown` пишут метаданные ext2, а файловые системы без on-disk метаданных отвечают «operation not supported» по пути; `tree` — рекурсивный ASCII-листинг со счётчиками; `head`/`tail`/`wc`/`grep` — потоковый обход с лимитом 4 MiB. `shared`, `buffers` и `Swap` читаются нулём, потому что в ядре нет учёта shared-памяти, block cache и swap.
 
-The per-thread procfs view. `/proc/<pid>/task/` and `/proc/self/task/` now list one
-numeric directory per **live task of the process's thread group** — pagh has real
-threads (`clone(CLONE_THREAD)` registers a scheduled task under its own pid with a
-shared `tgid`), but until now they could only be seen as top-level `/proc/<tid>`
-entries. Each thread's directory is deliberately the **same VFS object as
-`/proc/<tid>`** (Linux identity: one task, one inode), so `stat`, `status`, `cmdline`
-and the rest of the pid-directory files are the per-thread view with Linux's 52-field
-`stat` line and `Tgid`/`Pid`/`Threads` in `status`. A dead pid, a tid from another
-thread group and a non-numeric component are `ENOENT` — the directory is a namespace,
-not a wildcard. `/proc/self/task` follows the reader's own group and is `ENOENT` for a
-task without `CompatState`, like the rest of `/proc/self`. Contract (paths, semantics,
-inode identity and the deviations the model keeps) in `docs/procfs.md` §13; evidence is
-the `procfs::per-thread task directories` in-QEMU selftest, real-`clone` `lx_selftest`
-checks (thread listing and thread-exit shrink) and `properties/procfs_task.rs`.
+Per-thread procfs: `/proc/<pid>/task/` и `/proc/self/task/` листят по одному числовому каталогу на живую задачу thread group; каталог потока намеренно **тот же VFS-объект, что `/proc/<tid>`** (Linux identity: одна задача — один inode). Мёртвый pid, tid чужой thread group и нечисловой компонент — `ENOENT`. Контракт — `docs/procfs.md` §13; доказательство — in-QEMU `procfs::per-thread task directories`, `lx_selftest`-проверки реального `clone` и `properties/procfs_task.rs`.
 
 ## 2.18.13
 
-xHCI diagnostics: the Supported Protocol PORT INFO word is now parsed as the spec
-defines it (PSIC in bits 31:28, count in 15:8, 1-based offset in 7:0). The old parser
-read the count from 31:16 and the offset from 15:8 + 1, which is why every real USB2
-port printed `proto=usb0` in the 2.18.12 field photo. Diagnostics only: the port
-reset/adopt policy is unchanged. Full story: `AGENTS.md`, 2.18.13.
+xHCI diagnostics: слово Supported Protocol PORT INFO теперь разбирается по спецификации (PSIC в битах 31:28, count в 15:8, 1-based offset в 7:0). Старый парсер читал count из 31:16, offset из 15:8 + 1, поэтому каждый реальный USB2-порт печатал `proto=usb0`. Только диагностика; политика reset/adopt не менялась.
 
 ## 2.18.12
 
-The halted-controller release. The 2.18.11 field photos showed `usbcmd=0`,
-`usbsts=0x15`: the xHCI was **halted** at shell time and every USB2 port sat in Polling
-with `try=19`. Three real bugs followed: the DCBAA and the scratchpad-array frame were
-`start_controller` locals that `DmaFrame::drop` returned to the PMM while the
-controller still owned them; xHCI was the only DMA driver here that never called
-`pci::enable_bus_master`; and every USB wait was a spin count, i.e. a different
-wall-clock duration on every machine, so the port budgets were a few milliseconds of
-real time. The driver now owns those frames, enables bus mastering before touching the
-BAR, calibrates the TSC against a PIT channel-2 one-shot and uses real deadlines, and
-`poll()` detects a halted controller and restarts it. Smaller fixes: wait out a
-mid-detect port instead of resetting it mid-attach, resume an enabled-but-suspended one
-(PLS=U3), issue WPR only on a SuperSpeed link, and print the protocol port masks plus
-the raw capability entries. Full story: `AGENTS.md`, 2.18.12.
+Релиз остановленного контроллера. Полевые отчёты 2.18.11 показывали `usbcmd=0`, `usbsts=0x15`: xHCI **остановлен** ко времени shell, все USB2-порты в Polling с `try=19`. Три реальных бага: DCBAA и кадр scratchpad-array были локальными в `start_controller`, и `DmaFrame::drop` возвращал их в PMM, пока контроллер ими владел; xHCI был единственным DMA-драйвером, не вызывавшим `pci::enable_bus_master`; все USB-ожидания были спин-счётчиками, то есть разной длительностью на разных машинах. Драйвер теперь владеет кадрами, включает bus mastering до BAR, калибрует TSC по PIT channel-2 one-shot и использует реальные дедлайны; `poll()` замечает остановленный контроллер и перезапускает его. Плюс: дождаться порта в mid-detect вместо reset, resume для enabled-but-suspended (PLS=U3), WPR только на SuperSpeed, печать протокольных масок и raw capability.
 
 ## 2.18.11
 
-The boot menu that stopped counting: `xhci::poll()` processed every port in one call, and
-on hardware a single reset attempt costs hundreds of milliseconds of MMIO waits, so the
-first poll blocked for seconds inside the menu's one-second slice and the 20 s countdown
-never ticked. `poll()` now initialises exactly one port per call, round-robin, the wait
-budgets were cut to a fraction of a second, and the diagnostic prints the USB2/USB3 port
-ranges. Full story: `AGENTS.md`, 2.18.11.
+Boot-меню, переставшее считать: `xhci::poll()` обрабатывал все порты за один вызов, а одна попытка reset на железе стоит сотни миллисекунд MMIO-ожиданий, поэтому первый poll блокировал меню на секунды и 20-секундный отсчёт не тикал. Теперь `poll()` инициализирует ровно один порт за вызов round-robin, бюджеты ожидания урезаны до долей секунды, диагностика печатает диапазоны USB2/USB3-портов.
 
 ## 2.18.10
 
-The extended capabilities were never reached: the walk gave up at 4 KiB while the field
-machine reports HCCPARAMS1 xECP = 32 KiB, so the BIOS/USB-legacy handoff had never run
-(`legacy=absent`) and the Supported Protocol entries had never been seen (`proto=usb0`
-everywhere). The walk limit is now the mapped 64 KiB. A port the controller has already
-enabled is adopted instead of being reset back into Polling, and the PP power-cycle
-fallback runs every fourth attempt instead of every attempt (it was what made the mouse
-LED blink). Full story: `AGENTS.md`, 2.18.10.
+Extended capabilities не достигались: обход обрывался на 4 KiB, тогда как полевая машина сообщает HCCPARAMS1 xECP = 32 KiB, поэтому BIOS/USB-legacy handoff никогда не запускался, а Supported Protocol не читались. Лимит обхода — замапленные 64 KiB. Уже включённый контроллером порт усыновляется вместо reset в Polling, PP power-cycle выполняется каждый четвёртый раз, а не каждый (именно он мигал светодиодом мыши).
 
 ## 2.18.9
 
-Retries that outlive the settle: a failed enumeration used to leave its xHCI slot
-enabled, and the poll loop skips any port that has a slot, so the ports that got furthest
-could never be retried. The driver now sends Disable Slot, clears the DCBAA entry and
-drops the slot's rings (freeing their DMA pages through a `Drop` impl), and ports are
-retried forever with exponential backoff instead of a bounded count, because a PCH USB2
-PHY settling after `HCRST` can take seconds. Full story: `AGENTS.md`, 2.18.9.
+Retry, переживающий settle: неудачная энумерация оставляла xHCI-слот включённым, а poll пропускает порт со слотом, поэтому «дальше всех ушедшие» порты не могли повториться. Драйвер шлёт Disable Slot, очищает DCBAA и освобождает кольца слота через `Drop`, а порты ретраятся вечно с экспоненциальным backoff: PCH USB2 PHY после `HCRST` может успокаиваться секундами.
 
 ## 2.18.8
 
-The brief enable, and the ports the reset costs: the controller enables the device and
-then loses it again on every attempt (`ped_sc` is a healthy high-speed enable,
-`post=0x6e1` is back in Polling). Two blind spots were fixed: the Supported Protocol
-capabilities were never read (so every port said `proto=usb0` and a USB2 keyboard port
-could not be told from a USB3 one), and the extended-capability walk now falls back to
-the 0x20 area when HCCPARAMS1 reports xECP=0. Diagnostics gained HCIVERSION /
-HCSPARAMS1 / HCCPARAMS1 and the attached-before-reset vs now lists; ports with no
-device are retried forever at a slow rate. Full story: `AGENTS.md`, 2.18.8.
+Короткое включение и цена reset: контроллер включает устройство и снова теряет его (`ped_sc` — здоровое high-speed enable, `post=0x6e1` — снова Polling). Исправлены две слепые зоны: Supported Protocol capabilities не читались (`proto=usb0` везде), а обход extended capability получил fallback на область 0x20 при xECP=0. Диагностика: HCIVERSION/HCSPARAMS1/HCCPARAMS1, списки attached-before-reset и now; порты без устройства ретраятся вечно с медленной частотой.
 
 ## 2.18.7
 
-The port reset that does not stick: a single PED sighting was being accepted as success,
-and the port then fell back to Polling. The driver now requires a STABLE enabled state
-(PED with link state U0) before addressing the device; a failed stability check falls
-through to a warm reset and then to a PP power-cycle with real settling delays, and the
-diagnostics gained the port's USB protocol generation plus the PORTSC snapshot at the
-first PED sighting. Full story: `AGENTS.md`, 2.18.7.
+Reset, который не держится: одиночное появление PED принималось за успех, затем порт падал обратно в Polling. Теперь требуется стабильное enabled-состояние (PED с link state U0) до адресации; провал стабильности ведёт к warm reset, затем к PP power-cycle с реальными задержками; диагностика дополнена поколением USB-протокола и снимком PORTSC в первое появление PED.
 
 ## 2.18.6 — released 2026-11-10
 
-The 2.18.5 photo shows the port reset never taking effect and QEMU cannot distinguish
-"the controller ignores the writes" from "the driver reads the wrong register", so this
-release puts the ambiguity on screen: the controller scan (both PCI controllers, their
-port counts and attached masks, which one is in use), a raw dump of the selected port's
-four register-set dwords, USBCMD/USBSTS/CONFIG and CAPLENGTH, and a write-read-back test
-of a harmless register that says whether ANY write this driver issues reaches the
-controller. Full story: `AGENTS.md`, 2.18.6.
+Порт-reset не даёт эффекта, а QEMU не отличает «контроллер игнорирует записи» от «драйвер читает не тот регистр». Релиз выводит неоднозначность на экран: скан контроллеров (оба PCI-контроллера, число портов, attached-маски, какой используется), raw-дамп четырёх регистров выбранного порта, USBCMD/USBSTS/CONFIG и CAPLENGTH, а также write-read-back тест безвредного регистра, показывающий, доходит ли вообще хоть одна запись драйвера.
 
 ## 2.18.5
 
-The port-reset signal. The 2.18.4 per-port diagnostic came back with
-`stage=address code=0x4` and a settled `ccs=1 ped=0 pls=7`: devices present, ports never
-ENABLED, the address request sent to a device that had never left Polling. The driver had
-been treating port-reset-change (PRC) as "reset done", but on real hardware a reset the
-device does not complete still raises PRC while PED stays 0. Port bring-up now waits for
-PED and only then reads the speed and addresses the device; a hot reset that does not
-enable the port retries with a warm reset, then with a PP power-cycle, and the failure
-row carries the before/after PORTSC snapshots. Full story: `AGENTS.md`, 2.18.5.
+Сигнал port reset: диагностика 2.18.4 вернула `stage=address code=0x4` и устойчивое `ccs=1 ped=0 pls=7` — устройства есть, порты никогда не ENABLED, Address Device ушёл устройству, не покидавшему Polling. Драйвер считал port-reset-change (PRC) признаком «reset завершён», но на реальном железе незавершённый reset всё равно поднимает PRC при PED=0. Теперь bring-up ждёт PED и только затем читает скорость и адресует устройство; hot reset без enable ретраится warm reset'ом, затем PP power-cycle; строка отказа несёт снимки PORTSC до/после.
 
 ## 2.18.4
 
-The field test answered the 2.18.3 counter with its own numbers ("2 controllers, 26
-ports, devices on six ports") and **0 HID**: the controller saw the keyboard and
-enumeration stopped somewhere the old build could not name. Boot now prints one row per
-port with the enumeration stage it reached, the shell banner carries the last failure,
-and the `usb` command prints the same plus every PORTSC. Three real-hardware fixes: EP0's
-max packet size is updated from the device descriptor (full-speed devices start at 8 and
-the 18-byte read fails otherwise), USB3 ports whose link firmware left suspended get a
-warm reset, and a port whose enumeration fails is retried with growing spacing. Full
-story: `AGENTS.md`, 2.18.4.
+Полевой тест ответил на счётчик 2.18.3 своими числами («2 контроллера, 26 портов, устройства на шести») и **0 HID**: контроллер видел клавиатуру, а энумерация останавливалась там, где старая сборка не могла это назвать. Загрузка печатает по строке на порт с достигнутой стадией энумерации, баннер shell несёт последний отказ, команда `usb` — то же плюс PORTSC. Три исправления: max packet size EP0 обновляется из device descriptor (full-speed стартует с 8, иначе 18-байтное чтение падает); USB3-порты с suspended link получают warm reset; неудачная энумерация ретраится с растущим интервалом.
 
 ## 2.18.3
 
-The first field report after the disk menu: the clock still ran slow and the USB
-keyboard/mouse were dead on the real machine. The clock had one cause — the LAPIC
-calibration call site had been left disabled during the BIOS-stack debugging. For input,
-the driver now finds the keyboard whichever xHCI controller it is plugged into (probe
-every controller, count attached ports, start the best), takes ownership from the
-firmware's USB legacy support, and RETRIES ports that have not produced a device yet
-instead of giving up on the first look, because USB2 connect needs ~100 ms of debounce
-that QEMU's instant answer had hidden. A device behind a hub is detected and said out
-loud (hubs are still not supported), and the boot menu and shell banner print one line —
-controllers, ports, HID devices, reports — so a no-serial failure is visible on screen.
-Full story: `AGENTS.md`, 2.18.3.
+Первый полевой отчёт после disk-меню: на реальной машине часы шли медленно, USB-клавиатура и мышь мертвы. У часов одна причина — вызов калибровки LAPIC остался отключён при отладке BIOS-стека. Для ввода драйвер находит клавиатуру на любом xHCI-контроллере (пробует все, считает attached-порты, стартует лучший), забирает владение у firmware USB legacy и ретраит порты, ещё не давшие устройства, вместо отказа после первого взгляда: USB2-connect требует ~100 мс debounce, которые мгновенный ответ QEMU скрывал. Устройство за хабом детектируется и называется вслух (хабы всё ещё не поддерживаются); boot-меню и баннер shell печатают строку — контроллеры, порты, HID, report'ы.
 
 ## 2.18.2
 
-USB input that actually works in QEMU: the enumeration path had never run, because four
-defects stacked — xHCI port registers were addressed with a 4-byte stride instead of 16
-(so "port 5" was really port 2's PORTSC), Address Device was handed the HDM-virtual
-address of the input context instead of its physical one, SET_CONFIGURATION was never
-sent (leaving the HID endpoint stalled), and the endpoint context put CErr/MaxPacket in
-the wrong dword with a raw `bInterval`, so the interrupt-IN endpoint was configured as
-ISO OUT with a zero packet size. With those fixed an emulated USB keyboard enumerates,
-reports, and types into both the shell and the boot menu, including arrows/Enter/Esc;
-the report poll no longer spins 50 000 iterations per empty poll. Full story:
-`AGENTS.md`, 2.18.2.
+USB-ввод, работающий в QEMU: путь энумерации никогда не исполнялся из-за четырёх дефектов — регистры портов xHCI адресовались с шагом 4 байта вместо 16 («порт 5» был PORTSC порта 2), Address Device получал HDM-виртуальный адрес input context вместо физического, SET_CONFIGURATION не отправлялся (HID-эндпоинт оставался stalled), а контекст эндпоинта клал CErr/MaxPacket не в тот dword с сырым `bInterval`, из-за чего interrupt-IN конфигурировался как ISO OUT с нулевым пакетом. После исправлений эмулированная USB-клавиатура энумерируется, отчитывается и печатает в shell и boot-меню, включая стрелки/Enter/Esc.
 
 ## 2.18.1
 
-The disk menu and the ownership rule: boot shows a menu of the partitions it can see
-(drawn straight into the framebuffer before the shell exists) with what each holds —
-pagh's own volume, an empty region, a `FOREIGN` filesystem, or unknown data. `Enter`
-mounts, `F` formats only after the device name is typed back, `Esc` skips, and a 20 s
-timeout takes the non-destructive choice. A volume is pagh's own iff it carries pagh's
-WAL superblock (`Ext2Fs::is_pagh_volume`), so ext3/ext4 are refused by their feature
-words, a foreign ext2 is left untouched, and the only device the automatic path may
-format is the RAM disk from the boot medium. Three bugs surfaced while building it: the
-ext-family superblock magic was probed at 1024 instead of 1024+0x38 (every real ext2/ext4
-volume classified as `Foreign`), the boot path now runs on its own 128 KiB stack because
-Limine's is too small on BIOS boots, and the boot menu is ASCII (the kernel font covers
-no Cyrillic). Full story: `AGENTS.md`, 2.18.1.
+Disk-меню и правило владения: загрузка показывает меню видимых разделов (рисуется прямо в framebuffer до появления shell) с содержимым — собственный том pagh, пустая область, `FOREIGN`-файловая система или неизвестные данные. `Enter` монтирует, `F` форматирует только после ввода имени устройства обратно, `Esc` пропускает, 20-секундный таймаут выбирает неразрушающий вариант. Том считается своим, только если несёт WAL-superblock pagh (`Ext2Fs::is_pagh_volume`), поэтому ext3/ext4 отвергаются по feature-словам, чужой ext2 не трогается, а автоматический путь может форматировать только RAM-диск с загрузочного носителя. Попутно: магия superblock ext-семейства проверялась по 1024 вместо 1024+0x38; загрузочный путь получил собственный стек 128 KiB (стека Limine на BIOS-загрузке мало); меню — ASCII (шрифт ядра не содержит кириллицы).
 
 ## 2.18.0
 
-The first fixes driven by a real machine reaching the shell: the LAPIC timer is
-**measured** against the PIT at boot instead of assuming QEMU's 1 GHz bus clock (on
-hardware the assumed constant made every tick ~60x too long, so the shell's clock
-advanced one second per minute and every timeout stretched the same way);
-`drivers::partition` reads GPT (and MBR) and publishes each partition as its own block
-device, so pagh can own one partition instead of claiming the whole disk; and `logfile`
-mirrors every kernel log line into `/mnt/pagh-log.txt` — buffered in a fixed ring from
-the first boot message (the logger runs in interrupt and panic contexts, where touching
-a filesystem would deadlock) and drained by a `logd` thread once `/mnt` is mounted — so a
-machine with no serial port leaves a readable log on its disk. Full story: `AGENTS.md`,
-2.18.0.
+Первые исправления по реальной машине, дошедшей до shell: LAPIC-таймер **измеряется** против PIT при загрузке вместо предположения о шине QEMU 1 ГГц (на железе это растягивало тик ~в 60 раз, и часы shell шли секундой в минуту); `drivers::partition` читает GPT (и MBR) и публикует каждый раздел отдельным блочным устройством, чтобы pagh мог владеть одним разделом, а не всем диском; `logfile` зеркалит каждую строку лога ядра в `/mnt/pagh-log.txt` — буферизуется в фиксированном кольце с первого сообщения загрузки и выливается потоком `logd` после монтирования `/mnt`, поэтому машина без serial оставляет читаемый лог на диске.
 
 ## 2.17.2
 
-The real cause of the 2.17.1 field failure. The `#GP` was in `vmm::map`, and the LAPIC
-addresses firmware reported were correct: the page-table walker treated a **huge page**
-as a page table. Limine maps the HHDM with 2 MiB (sometimes 1 GiB) pages, so a walk into
-the LAPIC's HHDM window found a present entry whose HUGE_PAGE bit was set and whose
-"frame address" is the start of a large RAM region, not 512 entries; indexing that
-produced a non-canonical pointer, which is a general-protection fault rather than a page
-fault. `ensure_next` now takes the entry's level and splits a huge entry into a real table
-(2 MiB -> 512 x 4 KiB, 1 GiB -> 512 x 2 MiB, flags preserved), and `map_mmio` refuses
-implausible physical bases. QEMU had booted only because its HHDM happened to have no
-huge page at that address. Full story: `AGENTS.md`, 2.17.2.
+Реальная причина полевого отказа 2.17.1: `#GP` был в `vmm::map`, а адреса LAPIC от firmware корректны — обходчик таблиц страниц принимал **huge page** за таблицу страниц. Limine мапит HHDM страницами 2 MiB (иногда 1 GiB), поэтому обход в окно LAPIC находил present-запись с HUGE_PAGE и «адресом кадра», указывающим на начало крупной области RAM, а не на 512 записей; индексация давала неканонический указатель — general-protection fault, а не page fault. `ensure_next` теперь учитывает уровень записи и расщепляет huge-запись в реальную таблицу (2 MiB → 512 × 4 KiB, 1 GiB → 512 × 2 MiB, флаги сохраняются), а `map_mmio` отвергает неправдоподобные физические базы.
 
 ## 2.17.1
 
-The first field report from real hardware. The emergency console named the step
-(`init_apic`) and caught a `#GP` inside the LAPIC page-table walk — a general-protection
-fault rather than a page fault, which means the virtual address computed from the MADT
-base was non-canonical, i.e. the firmware reported a garbage LAPIC address. `vmm::map_mmio`
-now refuses an implausible physical base with a message instead of faulting inside the
-walker, `apic::init` prints the addresses it was given and falls back to the architectural
-`0xFEE00000` instead of panicking, x2APIC-enabled handover is detected and switched back
-to xAPIC, and boot announces each step *before* running it so the step that hangs names
-itself. Full story: `AGENTS.md`, 2.17.1.
+Первый полевой отчёт с реального железа. Аварийная консоль назвала шаг (`init_apic`) и поймала `#GP` внутри обхода таблиц страниц LAPIC: general-protection fault, а не page fault, значит виртуальный адрес из базы MADT был неканоническим — firmware сообщил мусорный адрес LAPIC. `vmm::map_mmio` теперь отвергает неправдоподобную физическую базу с сообщением вместо fault внутри обходчика; `apic::init` печатает полученные адреса и откатывается на архитектурный `0xFEE00000` вместо panic; handover с x2APIC детектируется и переключается обратно на xAPIC; загрузка объявляет каждый шаг *до* его выполнения, чтобы зависший шаг называл себя.
 
 ## 2.17.0 — released 2026-11-10
 
-The batch that made pagh run on real hardware, plus three long-standing display/network
-defects: a peer that answers and closes in one burst now completes `connect(2)` — the
-completion test is `ever_established` (the handshake happened), not
-`state == Established`, a window a reply+FIN skips straight through, which is what made
-the clipboard bridge work once and then fail; the VT emulator and the text console share
-one coordinate system and hand the cursor over in both directions inside the spawn's
-`without_interrupts` window, so `lxrun` no longer clears the screen black or marches the
-prompt downwards; and `ps` lists kernel threads (`[shell]`, `[net]`, `[usb]`, ...) while
-`df` reports the bytes a ramfs is holding. Boot now shows a disk menu
-(`src/boot_menu.rs`), USB input goes through `drivers::xhci` + `drivers::usb_hid`
-(controller bring-up and report translation verified; device enumeration was not yet),
-`drivers::earlyfb` gives a machine with no serial port a visible boot trace, and
-`tools/mkimage.py` builds both artifacts people actually boot — a GPT+ESP USB image and
-a BIOS+UEFI ISO — each carrying `disk.img`. Full story: `AGENTS.md`, "2.17.0".
+Пакет, который заставил pagh работать на реальном железе, плюс три давних дефекта отображения/сети: пир, отвечающий и закрывающийся одним burst'ом, теперь завершает `connect(2)` — тест завершения `ever_established` (рукопожатие состоялось), а не `state == Established`, окно, которое reply+FIN проскакивает (из-за этого clipboard bridge работал один раз и падал); VT-эмулятор и текстовая консоль делят одну систему координат и передают курсор в обе стороны внутри `without_interrupts` спавна, поэтому `lxrun` больше не заливает экран чёрным и не уводит prompt вниз; `ps` листит потоки ядра (`[shell]`, `[net]`, `[usb]`, ...), а `df` сообщает байты, которые держит ramfs. Загрузка показывает disk-меню (`src/boot_menu.rs`), USB-ввод идёт через `drivers::xhci` + `drivers::usb_hid` (подъём контроллера и трансляция отчётов проверены; энумерация устройств ещё нет), `drivers::earlyfb` даёт машине без serial видимый boot-trace, а `tools/mkimage.py` собирает оба реально загружаемых артефакта — GPT+ESP USB-образ и BIOS+UEFI ISO, каждый с `disk.img`.
 
 ## 2.16.1 — 2026-11-09
 
-Fixes found by running real apt-installed binaries (fastfetch) and a persistent
-disk:
+Исправления, найденные прогоном реальных apt-бинарников (fastfetch) и persistent-диска:
 
-- `mprotect` no longer returns ENOMEM for a range whose pages are resident but
-  not tracked as mmap/brk regions (the ELF loader maps PT_LOAD segments without
-  a VmRegionSet entry). glibc's ld.so reported this as "cannot apply additional
-  memory protection after relocation"; fastfetch now starts.
-- COW write faults are serviced for every `COW_BIT` page, not only pages inside
-  a tracked writable VMA or the brk heap: the user stack, thread stacks and
-  fork-shared heap pages are real writable mappings, and a bookkeeping miss
-  killed both parent and child immediately after `fork` in fastfetch.
-- The boot fs demo truncates `bootdemo.txt` before rewriting it, so a shorter
-  demo string on a persistent disk no longer leaves the previous run's tail and
-  reports a false read-back MISMATCH.
+- `mprotect` больше не возвращает ENOMEM для диапазона, чьи страницы резидентны, но не отслежены как mmap/brk-регионы (загрузчик ELF мапит `PT_LOAD` без записи в `VmRegionSet`); ld.so glibc сообщал это как «cannot apply additional memory protection after relocation», fastfetch теперь стартует.
+- COW-write-fault обслуживается для каждой страницы с `COW_BIT`, а не только внутри отслеживаемого writable VMA или brk-кучи: стек пользователя, стеки потоков и fork-shared страницы кучи — настоящие writable-маппинги, и промах учёта убивал и родителя, и ребёнка сразу после `fork`.
+- Boot fs demo усекает `bootdemo.txt` перед перезаписью, поэтому более короткая демо-строка на persistent-диске не оставляет хвост прошлого прогона и ложный MISMATCH.
 
-Verified live: `lxrun /mnt/usr/bin/fastfetch` prints Kernel/Uptime/Terminal/
-CPU/Memory/Disk and exits cleanly; the fs demo is PASS again; 414 host tests and
-the 82/83-routine e2e selftest remain green.
+Live: `lxrun /mnt/usr/bin/fastfetch` печатает Kernel/Uptime/Terminal/CPU/Memory/Disk и чисто выходит; fs demo снова PASS; 414 host-тестов и e2e selftest 82/83 зелёные.
 
 ## 2.16.0 — 2026-11-09
 
-Batch release: Linux compat, procfs slice 5, job control and the NVMe rewrite.
+Пакетный релиз: Linux compat, срез 5 procfs, job control и переписанный NVMe.
 
 ### Linux compat
-- `signalfd`/`signalfd4`: readable fd over pending signals, `POLLIN` in poll/select/epoll.
-- Real process groups: `pgid` in `CompatState`, `setpgid`/`getpgid`/`getpgrp`/`setsid`, group `kill`.
-- `memfd_create`, `timerfd_create/settime/gettime` (read/poll/epoll integrated).
-- Broad syscall batches: `*at` family, `sendfile`, `copy_file_range`, legacy/advisory
-  calls, `setrlimit`/`getrusage`/`times`.
+- `signalfd`/`signalfd4`: читаемый fd над ожидающими сигналами, `POLLIN` в poll/select/epoll.
+- Настоящие process groups: `pgid` в `CompatState`, `setpgid`/`getpgid`/`getpgrp`/`setsid`, групповой `kill`.
+- `memfd_create`, `timerfd_create/settime/gettime` (интеграция с read/poll/epoll).
+- Широкие батчи сисколлов: семейство `*at`, `sendfile`, `copy_file_range`, legacy/advisory-вызовы, `setrlimit`/`getrusage`/`times`.
 
 ### Job control
-- Ctrl+Z stops the foreground process group (SIGTSTP); shell job table with
-  `jobs`/`fg`/`bg` and SIGCONT resume.
-- Kernel controlling-terminal foreground pgid, `TIOCGPGRP`/`TIOCSPGRP`,
-  SIGTTIN/SIGTTOU on background tty I/O; `lxrun` hands the terminal to the job
-  and restores it.
+- Ctrl+Z останавливает foreground process group (SIGTSTP); таблица jobs в shell с `jobs`/`fg`/`bg` и возобновлением по SIGCONT.
+- Управляющий терминал ядра ведёт foreground pgid, `TIOCGPGRP`/`TIOCSPGRP`, SIGTTIN/SIGTTOU на фоновом tty I/O; `lxrun` передаёт терминал job'у и восстанавливает.
 
-### procfs slice 5
-- `/proc/<pid>/fdinfo/<n>` (real `pos`/`flags`/`mnt_id`/`ino`) and
-  `/proc/<pid>/limits` (16 Linux rlimit rows), plus `self` variants.
+### procfs, срез 5
+- `/proc/<pid>/fdinfo/<n>` (реальные `pos`/`flags`/`mnt_id`/`ino`) и `/proc/<pid>/limits` (16 строк Linux rlimit), плюс `self`-варианты.
 
 ### NVMe
-- Multi-page PRP lists, up to 64 KiB per command, four commands in flight,
-  completion reaping by CID, and the bring-up/protocol fixes that made QEMU NVMe
-  usable (Identify NN offset, Create-IOCQ/IOSQ fields, Write/Flush opcodes).
+- Многостраничные PRP-списки, до 64 KiB на команду, четыре команды в полёте, сбор завершений по CID и bring-up/протокольные исправления, сделавшие QEMU NVMe пригодным (смещение Identify NN, поля Create-IOCQ/IOSQ, opcode Write/Flush).
 
-Gates: 414 host tests, e2e selftest 83 routines / 0 failed, all AGENTS gates green.
+Гейты: 414 host-тестов, e2e selftest 83 рутины / 0 отказов, все AGENTS-гейты зелёные.
 
 ## 2.15.0 — 2026-11-08
 
-Batch release: 15 commits, focused on the Linux compatibility layer and two GUI
-fixes.
+Пакетный релиз: 15 коммитов, сфокусирован на слое совместимости с Linux и двух GUI-исправлениях.
 
 ### Linux compat
-- `faccessat`/`fchmodat`, `mkdirat`/`unlinkat`/`fchownat` — modern `*at` family
-  (AT_FDCWD-equivalent dirfd model; `AT_EACCESS`/`AT_SYMLINK_NOFOLLOW`).
-- `sendfile` (regular-file input to file/console/pipe/socket) and
-  `copy_file_range` between regular files.
-- Legacy/auxiliary numbers: `eventfd`, `epoll_create`, `getcpu`,
-  `sched_getaffinity`/`sched_setaffinity`, `fadvise64`.
-- `setrlimit`, `getrusage` (honest zeroed fields), `times`.
-- Broad advisory/runtime batch: `faccessat2`, `readahead`, `sync`, `syncfs`,
-  `getpriority`, `setpriority`, `personality`, `sched_getparam`,
-  `sched_setscheduler`, `sched_getscheduler`, `sched_get_priority_{max,min}`,
-  `sched_rr_get_interval`, `rt_sigpending`, `sync_file_range`, `fallocate`
-  (mode 0).
-- `memfd_create`: anonymous RAM-backed fd (`MFD_CLOEXEC`,
-  `MFD_ALLOW_SEALING` accepted; no seal syscalls).
-- `timerfd_create`/`settime`/`gettime`, integrated with read/poll/select/epoll.
-- SIGCHLD is queued to the parent on child exit/stop/continue (job-control
-  process groups and `^Z` tty stops remain open).
+- `faccessat`/`fchmodat`, `mkdirat`/`unlinkat`/`fchownat` — современное семейство `*at` (dirfd-модель с AT_FDCWD; `AT_EACCESS`/`AT_SYMLINK_NOFOLLOW`).
+- `sendfile` (regular-file → файл/консоль/pipe/socket) и `copy_file_range` между regular-файлами.
+- Legacy/auxiliary-номера: `eventfd`, `epoll_create`, `getcpu`, `sched_getaffinity`/`sched_setaffinity`, `fadvise64`.
+- `setrlimit`, `getrusage` (честные обнулённые поля), `times`.
+- Широкий advisory/runtime-батч: `faccessat2`, `readahead`, `sync`, `syncfs`, `getpriority`, `setpriority`, `personality`, `sched_getparam`, `sched_setscheduler`, `sched_getscheduler`, `sched_get_priority_{max,min}`, `sched_rr_get_interval`, `rt_sigpending`, `sync_file_range`, `fallocate` (mode 0).
+- `memfd_create`: анонимный RAM-backed fd (`MFD_CLOEXEC`, `MFD_ALLOW_SEALING` принимаются; seal-сисколлов нет).
+- `timerfd_create`/`settime`/`gettime`, интегрированные с read/poll/select/epoll.
+- SIGCHLD ставится родителю в очередь на exit/stop/continue ребёнка (process groups job control и `^Z` tty-стопы остаются открытыми).
 
 ### procfs / shell
-- `/proc/self/mountinfo` and `/proc/<pid>/mountinfo` with Linux's field order.
-- Shell `df` (real ext2 capacity, `-` for synthetic filesystems) and `ps`
-  (PID/PPID/STAT/COMMAND from `/proc/<pid>`).
-- `/proc/self/cgroup` + `/proc/<pid>/cgroup` (`0::/`, no controllers).
+- `/proc/self/mountinfo` и `/proc/<pid>/mountinfo` с порядком полей Linux.
+- Shell `df` (реальная ёмкость ext2, `-` для синтетических файловых систем) и `ps` (PID/PPID/STAT/COMMAND из `/proc/<pid>`).
+- `/proc/self/cgroup` + `/proc/<pid>/cgroup` (`0::/`, без контроллеров).
 
 ### GUI
-- Mouse selection repaints incrementally: a large drag no longer repaints the
-  whole range on every mouse event (fixes the FPS drop while selecting text).
+- Выделение мышью перерисовывается инкрементально: большой drag больше не перерисовывает весь диапазон на каждое событие мыши (исправлено падение FPS при выделении текста).
 
 ### Tooling
-- Removed the unused `pagh_mcp.py` helper.
-- Release cadence is 15 commits per tag; version = highest-impact change.
+- Удалён неиспользуемый хелпер `pagh_mcp.py`.
+- Каденция релизов — 15 коммитов на тег; версия = изменение с наибольшим влиянием.
