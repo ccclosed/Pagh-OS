@@ -1,16 +1,16 @@
 # pagh-desktop — userspace-композитор Pagh-OS (вариант B)
 
 Отдельный Rust-крейт: desktop-сервер, который владеет экраном в userspace и обслуживает
-клиентов по собственному протоколу **PDP/1** поверх `AF_UNIX SOCK_STREAM`. Сейчас
-backend — headless (PNG/PPM); `/dev/fb0` и `/dev/input/event0` подключаются после
-kernel-ветки `feat/desktop-kernel` (ABI `/dev/fb0`, evdev, `MAP_SHARED` memfd).
+клиентов по собственному протоколу **PDP/1** поверх `AF_UNIX SOCK_STREAM`. Два
+backend'а: headless (PNG для тестов/скриншотов) и **fbdev** (`/dev/fb0` mmap +
+`/dev/input/event0` из kernel-ABI 2.24.0, см. `docs/desktop-b.md`).
 
 ```text
 clients (pagh-desktop-demo, pagh-terminal, pagh-files, …)
       │  PDP/1: hello/create/commit/input/close
       ▼
 pagh-desktop server ──► Compositor ──► damage-регионы ──► HeadlessBackend (PNG)
-      ▲                      │
+      ▲                      │                         └─► FbdevBackend (/dev/fb0 mmap)
       └──── input/focus ─────┘   окна, z-order, панель 44 px, меню, flyout
 ```
 
@@ -40,7 +40,7 @@ pagh-desktop server ──► Compositor ──► damage-регионы ──�
   полнокадровый damage.
 * Демо-клиенты: Terminal, Files, Paint (рисуются тем же холстом, что и композитор),
   `pagh-desktop-demo --scenario` генерирует 9 скриншотов сценария.
-* Тесты: 69 unit + 5 integration (AF_UNIX e2e с реальными сокетами, два клиента,
+* Тесты: 89 unit + 5 integration (AF_UNIX e2e с реальными сокетами, два клиента,
   повреждённый клиент, скриншот-сценарий). Сборка — host и `static-pie` musl.
 
 ## Сборка и запуск
@@ -97,6 +97,48 @@ file target/x86_64-unknown-linux-musl/release/pagh-desktop
 подхватывается bare-metal `.cargo/config.toml` репозитория (cargo ищет конфиг от
 текущего каталога, а не от `--manifest-path`).
 
+## Реальное железо: `/dev/fb0` + `/dev/input/event0`
+
+Сервер умеет работать с kernel-ABI из `docs/desktop-b.md` (Pagh-OS 2.24.0), без
+изменений протокола и композитора:
+
+```bash
+# backend auto: fbdev, если /dev/fb0 доступен, иначе headless
+cargo run --bin pagh-desktop -- --backend auto --input auto
+# явно и с трейсом evdev-событий в serial
+cargo run --bin pagh-desktop -- --backend fbdev --fbdev /dev/fb0 \
+    --input evdev --evdev /dev/input/event0 --input-trace
+```
+
+* `FbdevBackend`: `open /dev/fb0` (первый open/mmap включает kernel takeover),
+  `FBIOGET_VSCREENINFO`/`FBIOGET_FSCREENINFO`, `mmap(MAP_SHARED)` scanout,
+  упаковка пикселей по маскам `var.red/green/blue` (bpp 16/24/32), запись только
+  damage-прямоугольников с учётом `fix.line_length`.
+* `EvdevInput`: неблокирующий `/dev/input/event0`, 24-байтные `input_event`,
+  EV_REL/EV_KEY/EV_SYN, накопление REL_X/REL_Y до SYN, BTN_LEFT/MIDDLE/RIGHT,
+  REL_WHEEL → axis, модификаторы для `Input`-сообщений. Устаревшие события,
+  накопившиеся до `open` (строка запуска из shell), отбрасываются.
+* `--e2e` — короткий режим для QEMU: `backend=auto`, `input=auto`, одно демо-окно
+  вместо AF_UNIX-клиента, `--exit-after-ms 15000`, selfcheck через 3 с,
+  `--input-trace` и полный кадр на каждый present (иначе QEMU screendump может
+  отдать устаревшую surface).
+* Runtime выбор: `--backend auto|headless|fbdev`, `--input auto|none|evdev`;
+  headless-путь и его PIL/PNG-тесты не меняются.
+
+**Takeover односторонний по kernel-ABI:** после старта композитора kernel-консоль
+не перерисовывает экран, но закрытие fd (выход desktop) экран не возвращает —
+это документированное поведение `docs/desktop-b.md` §3.1, а не потеря функции.
+Shell/serial продолжают работать; после выхода desktop кадр остаётся на экране.
+
+QEMU-приёмка (сама собирает static musl бинарники, готовит pagh-ext2 диск,
+запускает desktop и проверяет framebuffer/serial):
+
+```bash
+python3 tools/e2e.py desktop
+# быстрый повтор на уже подготовленном диске:
+python3 tools/e2e.py desktop --reuse-desktop-disk --skip-build
+```
+
 ## Скриншоты
 
 | | |
@@ -111,6 +153,8 @@ file target/x86_64-unknown-linux-musl/release/pagh-desktop
 | Календарь November 2026 | Maximized с клиентским configure |
 | ![live](screenshots/10-live-demo-client.png) | |
 | Живой кадр: отдельный процесс demo-клиента по реальному AF_UNIX-сокету | |
+| ![fbdev](screenshots/11-fbdev-qemu.png) | ![fbdev menu](screenshots/12-fbdev-context-menu.png) |
+| QEMU framebuffer: desktop на `/dev/fb0` (1280×800) | F10-меню на реальном scanout |
 
 `09-restored.png` — возврат окна в прежнюю геометрию; `screenshots/scenario.txt` —
 транскрипт шагов.

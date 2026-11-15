@@ -8,7 +8,7 @@
 //! См. `PROTOCOL.md` (ABI), `README.md` (сборка/запуск) и `docs/desktop-server.md`
 //! в корне репозитория (архитектура и остаток работ).
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod color;
 pub mod context_menu;
@@ -25,18 +25,22 @@ pub mod client;
 pub mod compositor;
 pub mod deflate;
 pub mod demo;
+pub mod evdev;
+pub mod fbdev;
 pub mod font;
 pub mod scenario;
 pub mod server;
 pub mod surface;
 
-pub use backend::{Backend, HeadlessBackend};
+pub use backend::{Backend, BackendKind, HeadlessBackend, OutputBackend};
 pub use canvas::Canvas;
 pub use client::{Client, Welcome};
 pub use color::Color;
 pub use compositor::{
     AppKind, Compositor, DragState, FlyoutKind, HostEvent, MouseButton, WindowError,
 };
+pub use evdev::{EvdevInput, InputAction};
+pub use fbdev::{FbFixInfo, FbLayout, FbVarInfo, FbdevBackend};
 pub use geometry::{Point, Rect, Size};
 pub use panel::{Panel, PanelHit, PanelIcon};
 pub use protocol::{InputEvent, Message};

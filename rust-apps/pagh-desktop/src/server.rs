@@ -5,9 +5,12 @@
 //! обрабатывает канал, рассылает `configure`/`input`/`focus`/`close` и после каждого
 //! пакета событий перерисовывает только повреждённые области.
 
-use crate::backend::{Backend, HeadlessBackend};
+use crate::backend::{Backend, BackendKind, HeadlessBackend, OutputBackend};
 use crate::client::Welcome;
 use crate::compositor::{AppKind, Compositor, HostEvent, MouseButton};
+use crate::demo;
+use crate::evdev::{EvdevInput, InputAction};
+use crate::fbdev::FbdevBackend;
 use crate::geometry::Point;
 use crate::protocol::{
     self, Decoder, Message, ERR_BAD_MESSAGE, ERR_INTERNAL, ERR_INVALID_SURFACE, ERR_NOT_HELLO,
@@ -23,7 +26,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Выбор backend'а при старте.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputChoice {
+    /// Попробовать `/dev/fb0`; если его нет — headless.
+    Auto,
+    Headless,
+    Fbdev,
+}
+
+/// Выбор источника ввода.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputChoice {
+    /// Evdev, только если выбран fbdev backend; иначе без ввода.
+    Auto,
+    None,
+    Evdev,
+}
 
 /// Команда запуска приложения по запросу `LAUNCH` (расширение PDP/1, type 13).
 ///
@@ -80,12 +101,30 @@ impl LaunchTarget {
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
     pub socket: PathBuf,
+    /// Размер headless-экрана (для fbdev берётся из `FBIOGET_VSCREENINFO`).
     pub width: u32,
     pub height: u32,
     /// Если задано — каждый presented-кадр пишется в `frame_NNNNN.png` этого каталога.
     pub screenshot_dir: Option<PathBuf>,
     /// Остановиться после N presented-кадров (headless smoke-тест).
     pub max_frames: Option<u64>,
+    /// Остановиться через N миллисекунд после старта (QEMU e2e / демо).
+    pub exit_after_ms: Option<u64>,
+    /// `--fbdev-selfcheck` через N мс после старта (только fbdev).
+    pub fbdev_selfcheck_ms: Option<u64>,
+    /// Backend: auto/headless/fbdev.
+    pub backend: OutputChoice,
+    pub fbdev_path: PathBuf,
+    /// Ввод: auto/none/evdev.
+    pub input: InputChoice,
+    pub evdev_path: PathBuf,
+    /// Печатать каждое декодированное evdev-событие (QEMU e2e evidence).
+    pub input_trace: bool,
+    /// Всегда презентовать полный кадр (QEMU screendump обновляет поверхность
+    /// надёжнее; в headless/damage-тестах остаётся частичная отрисовка).
+    pub full_render: bool,
+    /// Создать одно демонстрационное окно без AF_UNIX-клиента (fbdev e2e).
+    pub demo_window: bool,
     /// Не печатать диагностику подключений.
     pub quiet: bool,
     /// Запускать `pagh-desktop-demo` по запросам панели/меню.
@@ -107,6 +146,15 @@ impl Default for ServerOptions {
             height: 720,
             screenshot_dir: None,
             max_frames: None,
+            exit_after_ms: None,
+            fbdev_selfcheck_ms: None,
+            backend: OutputChoice::Headless,
+            fbdev_path: PathBuf::from("/dev/fb0"),
+            input: InputChoice::None,
+            evdev_path: PathBuf::from("/dev/input/event0"),
+            input_trace: false,
+            full_render: false,
+            demo_window: false,
             quiet: false,
             spawn_demo: false,
             demo_binary: None,
@@ -238,7 +286,8 @@ pub struct Server {
     options: ServerOptions,
     listener: UnixListener,
     compositor: Compositor,
-    backend: HeadlessBackend,
+    backend: OutputBackend,
+    input: Option<EvdevInput>,
     clients: Vec<ClientConn>,
     incoming_tx: Sender<Incoming>,
     incoming_rx: Receiver<Incoming>,
@@ -247,6 +296,90 @@ pub struct Server {
     next_client: u64,
     children: Vec<Child>,
     demo_started: bool,
+    demo_window_created: bool,
+    exit_due: Option<Instant>,
+    selfcheck_due: Option<Instant>,
+    selfcheck_done: bool,
+    selfcheck_failed: bool,
+}
+
+fn open_backend(options: &ServerOptions) -> io::Result<OutputBackend> {
+    match options.backend {
+        OutputChoice::Headless => Ok(OutputBackend::Headless(HeadlessBackend::new(
+            options.width,
+            options.height,
+        ))),
+        OutputChoice::Fbdev => {
+            let backend = FbdevBackend::open(&options.fbdev_path).map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("fbdev {}: {err}", options.fbdev_path.display()),
+                )
+            })?;
+            if !options.quiet {
+                println!("pagh-desktop: backend=fbdev {}", backend.describe());
+                println!(
+                    "pagh-desktop: fbdev takeover acquired (kernel console flush suspended; ABI one-way)"
+                );
+            }
+            Ok(OutputBackend::Fbdev(backend))
+        }
+        OutputChoice::Auto => match FbdevBackend::open(&options.fbdev_path) {
+            Ok(backend) => {
+                if !options.quiet {
+                    println!("pagh-desktop: backend=fbdev {}", backend.describe());
+                    println!(
+                        "pagh-desktop: fbdev takeover acquired (kernel console flush suspended; ABI one-way)"
+                    );
+                }
+                Ok(OutputBackend::Fbdev(backend))
+            }
+            Err(err) => {
+                if !options.quiet {
+                    eprintln!(
+                        "pagh-desktop: fbdev {} недоступен ({err}); backend=headless",
+                        options.fbdev_path.display()
+                    );
+                }
+                Ok(OutputBackend::Headless(HeadlessBackend::new(
+                    options.width,
+                    options.height,
+                )))
+            }
+        },
+    }
+}
+
+fn open_input(options: &ServerOptions, backend: BackendKind) -> io::Result<Option<EvdevInput>> {
+    let wanted = match options.input {
+        InputChoice::None => false,
+        InputChoice::Evdev => true,
+        InputChoice::Auto => backend == BackendKind::Fbdev,
+    };
+    if !wanted {
+        return Ok(None);
+    }
+    match EvdevInput::open(&options.evdev_path) {
+        Ok(input) => {
+            if !options.quiet {
+                println!("pagh-desktop: input=evdev {}", options.evdev_path.display());
+            }
+            Ok(Some(input))
+        }
+        Err(err) if options.input == InputChoice::Evdev => Err(io::Error::new(
+            err.kind(),
+            format!("evdev {}: {err}", options.evdev_path.display()),
+        )),
+        Err(err) => {
+            if !options.quiet {
+                eprintln!(
+                    "pagh-desktop: evdev {} недоступен ({err}); input выключен",
+                    options.evdev_path.display()
+                );
+            }
+            Ok(None)
+        }
+    }
 }
 
 impl Server {
@@ -262,8 +395,16 @@ impl Server {
             ));
         }
         if let Some(parent) = options.socket.parent() {
+            // На Pagh `/tmp` уже существует (ramfs), а `Path::exists()`/`stat(2)`
+            // в compat-слое не поддерживаются (ENOSYS), поэтому проверять
+            // существование нельзя: mkdir существующего каталога штатно отвечает
+            // EEXIST — это и есть «каталог уже на месте».
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
+                match std::fs::create_dir_all(parent) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+                    Err(err) => return Err(err),
+                }
             }
         }
         if options.socket.exists() {
@@ -282,17 +423,48 @@ impl Server {
         }
         let listener = UnixListener::bind(&options.socket)?;
         listener.set_nonblocking(true)?;
-        let (tx, rx) = channel();
-        let compositor = Compositor::new(options.width, options.height);
-        let mut backend = HeadlessBackend::new(options.width, options.height);
-        if let Some(dir) = &options.screenshot_dir {
-            backend.set_screenshot_dir(dir);
+        let backend = match open_backend(&options) {
+            Ok(backend) => backend,
+            Err(err) => {
+                let _ = std::fs::remove_file(&options.socket);
+                return Err(err);
+            }
+        };
+        let (width, height) = backend.size();
+        let input = match open_input(&options, backend.kind()) {
+            Ok(input) => input,
+            Err(err) => {
+                let _ = std::fs::remove_file(&options.socket);
+                return Err(err);
+            }
+        };
+        if !options.quiet {
+            println!(
+                "pagh-desktop: backend={} {}x{}",
+                backend.kind().name(),
+                width,
+                height
+            );
         }
+        let (tx, rx) = channel();
+        let compositor = Compositor::new(width, height);
+        let now = Instant::now();
+        let exit_due = options
+            .exit_after_ms
+            .map(|ms| now + Duration::from_millis(ms));
+        let selfcheck_due = if backend.kind() == BackendKind::Fbdev {
+            options
+                .fbdev_selfcheck_ms
+                .map(|ms| now + Duration::from_millis(ms))
+        } else {
+            None
+        };
         Ok(Self {
             options,
             listener,
             compositor,
             backend,
+            input,
             clients: Vec::new(),
             incoming_tx: tx,
             incoming_rx: rx,
@@ -301,6 +473,11 @@ impl Server {
             next_client: 1,
             children: Vec::new(),
             demo_started: false,
+            demo_window_created: false,
+            exit_due,
+            selfcheck_due,
+            selfcheck_done: false,
+            selfcheck_failed: false,
         })
     }
 
@@ -330,34 +507,34 @@ impl Server {
 
     pub fn take_screenshot(&mut self, path: impl AsRef<std::path::Path>) -> io::Result<()> {
         self.compositor.render_full();
-        self.backend.screenshot(path, self.compositor.frame())
+        crate::png::write_png(path, self.compositor.frame())
     }
 
-    /// Основной цикл. Завершается по shutdown, лимиту кадров или ошибке сокета.
+    /// Основной цикл. Завершается по shutdown, лимиту кадров, `exit-after-ms`
+    /// или ошибке backend'а.
     pub fn run(mut self) -> io::Result<()> {
+        let screen = self.compositor.screen();
         if !self.options.quiet {
             println!(
-                "pagh-desktop: слушаю {} ({}x{}, backend=headless)",
+                "pagh-desktop: слушаю {} ({}x{}, backend={})",
                 self.options.socket.display(),
-                self.options.width,
-                self.options.height
+                screen.w,
+                screen.h,
+                self.backend.kind().name()
             );
         }
+        self.ensure_demo_window();
         loop {
             if !self.running.load(Ordering::SeqCst) {
                 break;
             }
+            self.poll_input();
             self.accept_pending();
             let mut shutdown = false;
-            match self.incoming_rx.recv_timeout(Duration::from_millis(4)) {
-                Ok(incoming) => {
-                    if !self.handle_incoming(incoming) {
-                        shutdown = true;
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
-            }
+            // Неблокирующий дренаж: `recv_timeout` опирается на futex-таймаут,
+            // который в compat-слое просыпается с большой задержкой, из-за чего
+            // evdev не опрашивался секундами. Композитор и так должен тикать
+            // коротко (input + damage), поэтому спим явно в конце итерации.
             while let Ok(incoming) = self.incoming_rx.try_recv() {
                 if !self.handle_incoming(incoming) {
                     shutdown = true;
@@ -373,14 +550,199 @@ impl Server {
                 self.demo_started = true;
                 self.launch(AppKind::Terminal);
             }
+            self.maybe_selfcheck();
             if let Some(max) = self.options.max_frames {
-                if self.backend.frames >= max {
+                if self.backend.frames() >= max {
                     break;
                 }
             }
+            if let Some(due) = self.exit_due {
+                if Instant::now() >= due {
+                    println!("pagh-desktop: exit-after-ms reached");
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(2));
         }
+        let failed = self.selfcheck_failed;
         self.cleanup();
-        Ok(())
+        if failed {
+            Err(io::Error::other("fbdev selfcheck failed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Создать одно демонстрационное окно без AF_UNIX-клиента (QEMU e2e).
+    fn ensure_demo_window(&mut self) {
+        if !self.options.demo_window || self.demo_window_created {
+            return;
+        }
+        self.demo_window_created = true;
+        let (width, height) = (640u32, 400u32);
+        let events = match self.compositor.add_window(
+            0,
+            1,
+            "Terminal - pagh",
+            width,
+            height,
+            PixelFormat::Xrgb8888,
+        ) {
+            Ok(events) => events,
+            Err(err) => {
+                eprintln!("pagh-desktop: demo window: {err}");
+                return;
+            }
+        };
+        self.dispatch(events);
+        let state = demo::DemoState {
+            focused: true,
+            mouse: Some(Point::new(280, 160)),
+            last_input: "move 280,160".into(),
+            ..demo::DemoState::default()
+        };
+        let surface = demo::terminal_surface(width, height, &state);
+        if let Err(err) = self.compositor.commit_surface(0, 1, surface) {
+            eprintln!("pagh-desktop: demo frame: {err}");
+            return;
+        }
+        // Не вызываем render_full() здесь: он бы погасил damage до первого
+        // present, и fbdev остался бы с неотрисованным кадром.
+        println!("pagh-desktop: embedded demo window id=1 {width}x{height}");
+    }
+
+    /// Прочитать все накопленные evdev-события (неблокирующе).
+    fn poll_input(&mut self) {
+        let Some(input) = self.input.as_mut() else {
+            return;
+        };
+        match input.poll() {
+            Ok(actions) => {
+                if !actions.is_empty() {
+                    self.apply_input_actions(actions);
+                }
+            }
+            Err(err) => {
+                eprintln!("pagh-desktop: evdev: {err}; input отключён");
+                self.input = None;
+            }
+        }
+    }
+
+    fn apply_input_actions(&mut self, actions: Vec<InputAction>) {
+        for action in actions {
+            if self.options.input_trace {
+                match action {
+                    InputAction::Motion { dx, dy } => println!("evdev: rel dx={dx} dy={dy}"),
+                    InputAction::Wheel { delta } => println!("evdev: wheel {delta}"),
+                    InputAction::Button { button, pressed } => println!(
+                        "evdev: button {} {}",
+                        button_name(button),
+                        if pressed { "down" } else { "up" }
+                    ),
+                    InputAction::Key {
+                        code,
+                        pressed,
+                        modifiers,
+                    } => println!(
+                        "evdev: key code={code} {} mods={modifiers:#x}",
+                        if pressed { "down" } else { "up" }
+                    ),
+                }
+            }
+            let events = match action {
+                InputAction::Motion { dx, dy } => self.compositor.pointer_motion_relative(dx, dy),
+                InputAction::Wheel { delta } => self.compositor.axis(0, delta),
+                InputAction::Button { button, pressed } => {
+                    self.compositor.pointer_button(button, pressed)
+                }
+                InputAction::Key {
+                    code,
+                    pressed,
+                    modifiers,
+                } => {
+                    let events = self.compositor.key_event(code, pressed, modifiers);
+                    if code == crate::protocol::key::F10 && pressed && self.options.input_trace {
+                        println!(
+                            "pagh-desktop: shortcut F10 menu_open={} pointer=({}, {})",
+                            self.compositor.context_menu().is_some(),
+                            self.compositor.pointer().x,
+                            self.compositor.pointer().y
+                        );
+                    }
+                    events
+                }
+            };
+            self.dispatch(events);
+        }
+    }
+
+    /// Проверка, что fbdev-кадр реально попал в scanout (панель/обои/окно).
+    fn maybe_selfcheck(&mut self) {
+        if self.selfcheck_done {
+            return;
+        }
+        let Some(due) = self.selfcheck_due else {
+            return;
+        };
+        if Instant::now() < due {
+            return;
+        }
+        self.selfcheck_done = true;
+        if self.backend.as_fbdev().is_none() {
+            return;
+        }
+        // Гарантировать, что накопленный damage уже в scanout (selfcheck может
+        // сработать раньше, чем серверный цикл сделал следующий present).
+        if let Err(err) = self.render_if_needed() {
+            eprintln!("pagh-desktop: selfcheck present: {err}");
+        }
+        let Some(fbdev) = self.backend.as_fbdev() else {
+            return;
+        };
+        let screen = self.compositor.screen();
+        let panel = fbdev.sample(screen.w / 2, screen.h - 4);
+        let wallpaper = fbdev.sample(4, 4);
+        let window_count = self
+            .compositor
+            .windows()
+            .iter()
+            .filter(|window| !window.minimized)
+            .count();
+        let window_pixel = self
+            .compositor
+            .windows()
+            .iter()
+            .find(|window| !window.minimized)
+            .and_then(|window| {
+                let content = window.content_rect();
+                fbdev.sample(content.center().x, content.center().y)
+            });
+        let pass = wallpaper.is_some()
+            && panel.is_some()
+            && panel != wallpaper
+            && panel
+                .map(|color| (color & 0x00FF_FFFF) != 0)
+                .unwrap_or(false)
+            && (window_count == 0 || window_pixel.is_some_and(|pixel| Some(pixel) != wallpaper));
+        let fmt = |value: Option<u32>| match value {
+            Some(color) => format!("#{:06x}", color & 0x00FF_FFFF),
+            None => "none".to_string(),
+        };
+        let canvas_panel = self.compositor.frame().get(screen.w / 2, screen.h - 4) & 0x00FF_FFFF;
+        let canvas_wallpaper = self.compositor.frame().get(4, 4) & 0x00FF_FFFF;
+        println!(
+            "pagh-desktop: fbdev selfcheck {} panel={} wallpaper={} windows={} window_px={} frames={} canvas_panel=#{:06x} canvas_wall=#{:06x}",
+            if pass { "PASS" } else { "FAIL" },
+            fmt(panel),
+            fmt(wallpaper),
+            window_count,
+            fmt(window_pixel),
+            self.backend.frames(),
+            canvas_panel,
+            canvas_wallpaper
+        );
+        self.selfcheck_failed = !pass;
     }
 
     fn accept_pending(&mut self) {
@@ -528,8 +890,8 @@ impl Server {
                     &Message::Welcome {
                         version: VERSION,
                         client_id: id,
-                        width: self.options.width,
-                        height: self.options.height,
+                        width: self.compositor.screen().w as u32,
+                        height: self.compositor.screen().h as u32,
                         flags: WELCOME_FORMAT_XRGB8888 | WELCOME_FORMAT_RGB565,
                     },
                 );
@@ -799,11 +1161,22 @@ impl Server {
     }
 
     fn render_if_needed(&mut self) -> io::Result<()> {
-        let damage = self.compositor.render();
+        let damage = if self.options.full_render {
+            self.compositor.render_full()
+        } else {
+            self.compositor.render()
+        };
         if damage.is_empty() {
             return Ok(());
         }
-        self.backend.present(self.compositor.frame(), &damage)
+        self.backend.present(self.compositor.frame(), &damage)?;
+        if let Some(dir) = &self.options.screenshot_dir {
+            let path = dir.join(format!("frame_{:05}.png", self.backend.frames()));
+            if let Err(err) = crate::png::write_png(&path, self.compositor.frame()) {
+                eprintln!("pagh-desktop: screenshot {}: {err}", path.display());
+            }
+        }
+        Ok(())
     }
 
     fn cleanup(&mut self) {
@@ -822,8 +1195,11 @@ impl Server {
         if !self.options.quiet {
             println!(
                 "pagh-desktop: остановлен, кадров отрисовано {}",
-                self.backend.frames
+                self.backend.frames()
             );
+            if self.backend.as_fbdev().is_some() {
+                println!("pagh-desktop: fbdev closed; screen takeover remains armed (ABI one-way)");
+            }
         }
     }
 
@@ -831,7 +1207,10 @@ impl Server {
     pub fn welcome_for(&self, client_id: u64) -> Welcome {
         Welcome {
             client_id,
-            screen: crate::geometry::Size::new(self.options.width, self.options.height),
+            screen: crate::geometry::Size::new(
+                self.compositor.screen().w as u32,
+                self.compositor.screen().h as u32,
+            ),
             flags: WELCOME_FORMAT_XRGB8888 | WELCOME_FORMAT_RGB565,
         }
     }
@@ -843,6 +1222,15 @@ impl Drop for Server {
         if self.options.socket.exists() {
             let _ = std::fs::remove_file(&self.options.socket);
         }
+    }
+}
+
+fn button_name(button: MouseButton) -> &'static str {
+    match button {
+        MouseButton::Left => "left",
+        MouseButton::Middle => "middle",
+        MouseButton::Right => "right",
+        MouseButton::Other(_) => "other",
     }
 }
 
@@ -906,4 +1294,87 @@ pub fn unique_socket_path(tag: &str) -> PathBuf {
         "pagh-desktop-{tag}-{}-{nanos}.sock",
         std::process::id()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headless_options(tag: &str) -> ServerOptions {
+        ServerOptions {
+            socket: unique_socket_path(tag),
+            width: 640,
+            height: 480,
+            quiet: true,
+            backend: OutputChoice::Headless,
+            input: InputChoice::None,
+            ..ServerOptions::default()
+        }
+    }
+
+    #[test]
+    fn auto_backend_falls_back_to_headless_without_fb0() {
+        let options = ServerOptions {
+            backend: OutputChoice::Auto,
+            fbdev_path: PathBuf::from("/dev/definitely-no-fb0"),
+            ..headless_options("auto")
+        };
+        let socket = options.socket.clone();
+        let server = Server::bind(options).expect("auto должен откатиться в headless");
+        assert_eq!(server.backend.kind(), BackendKind::Headless);
+        assert_eq!(server.compositor.screen().w, 640);
+        assert!(server.input.is_none());
+        drop(server);
+        assert!(!socket.exists(), "сокет должен удаляться при Drop");
+    }
+
+    #[test]
+    fn explicit_fbdev_without_device_is_an_error() {
+        let options = ServerOptions {
+            backend: OutputChoice::Fbdev,
+            fbdev_path: PathBuf::from("/dev/definitely-no-fb0"),
+            ..headless_options("nofb")
+        };
+        let socket = options.socket.clone();
+        match Server::bind(options) {
+            Ok(_) => panic!("явный fbdev без устройства должен падать"),
+            Err(err) => assert!(matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            )),
+        }
+        assert!(!socket.exists(), "неудачный bind не должен оставлять сокет");
+    }
+
+    #[test]
+    fn demo_window_is_committed_without_a_client() {
+        let options = ServerOptions {
+            demo_window: true,
+            ..headless_options("demo-window")
+        };
+        let mut server = Server::bind(options).unwrap();
+        server.ensure_demo_window();
+        assert_eq!(server.compositor.windows().len(), 1);
+        let window = &server.compositor.windows()[0];
+        assert_eq!(window.id, 1);
+        assert!(window.surface.is_some());
+        assert_eq!(window.content_size.w, 640);
+        let _ = server.compositor.render_full();
+        assert!(server.compositor.frame().get(100, 100) != 0);
+    }
+
+    #[test]
+    fn welcome_reports_the_actual_screen_size() {
+        let server = Server::bind(headless_options("welcome")).unwrap();
+        let welcome = server.welcome_for(7);
+        assert_eq!(welcome.screen.w, 640);
+        assert_eq!(welcome.screen.h, 480);
+    }
+
+    #[test]
+    fn headless_options_keep_input_disabled() {
+        let server = Server::bind(headless_options("noinput")).unwrap();
+        assert!(server.input.is_none());
+        assert_eq!(server.backend.kind(), BackendKind::Headless);
+    }
 }
