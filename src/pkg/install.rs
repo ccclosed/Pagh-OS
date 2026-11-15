@@ -1,26 +1,26 @@
-//! Pure install-path normalization and a host-testable install model
-//! (design component 10, `Package_Installer`).
+//! Чистая нормализация установочных путей и host-тестируемая модель установки
+//! (компонент дизайна 10, `Package_Installer`).
 //!
-//! This module factors the *selection semantics* of the package installer into pure,
-//! `core` + `alloc` logic (R11.6) so the same source is exercised on the host by
-//! property test P26 and compiled identically by the `#![no_std]` kernel. The
-//! effectful ext2 install (`install_data_tar`) is added by a later task (14.3) and
-//! reuses [`normalize_entry_path`] from here.
+//! Модуль выносит *семантику выбора* пакетного инсталлятора в чистую логику
+//! `core` + `alloc` (R11.6), чтобы тот же исходник проверялся на хосте property-
+//! тестом P26 и одинаково компилировался `#![no_std]`-ядром. Эффектная ext2-
+//! установка (`install_data_tar`) подключается отдельно и переиспользует
+//! [`normalize_entry_path`] отсюда.
 //!
-//! [`normalize_entry_path`] turns an archived tar path into either a safe,
-//! root-relative path or a `SkipUnsafe` verdict for entries that would escape the
-//! installation root via `..` (R10.1, R10.8). [`install_model`] is a *pure* model of
-//! the effectful install: it folds a slice of [`TarEntry`] records into the
-//! `path -> content` map that a faithful install would produce, capturing R10.5/R10.6/
-//! R10.7/R10.8 (regular-files-only, skip-unsafe, last-writer-wins).
+//! [`normalize_entry_path`] превращает путь из tar-архива либо в безопасный
+//! root-relative путь, либо в вердикт `SkipUnsafe` для записей, которые вышли бы за
+//! установочный корень через `..` (R10.1, R10.8). [`install_model`] — *чистая*
+//! модель эффектной установки: она сводит срез записей [`TarEntry`] в карту
+//! `path -> content`, которую дала бы честная установка, фиксируя R10.5/R10.6/
+//! R10.7/R10.8 (только regular files, skip-unsafe, last-writer-wins).
 //!
-//! ## Cross-crate module path
+//! ## Межкрейтовый путь модуля
 //!
-//! [`TarEntry`]/[`TarType`] are imported via `super::tar`, which resolves in BOTH
-//! crates: in the kernel this module is `crate::pkg::install`, so `super` is
-//! `crate::pkg` (which declares `pub mod tar;`); in `host-tests` it is included at the
-//! crate root as `crate::install`, so `super` is the crate root (which also declares
-//! `pub mod tar;`). One source, two crates, no shim.
+//! [`TarEntry`]/[`TarType`] импортируются через `super::tar`, который разрешается в
+//! ОБОИХ крейтах: в ядре модуль — `crate::pkg::install`, так что `super` — `crate::pkg`
+//! (объявляющий `pub mod tar;`); в `host-tests` он включён в корень крейта как
+//! `crate::install`, так что `super` — корень крейта (тоже объявляющий `pub mod tar;`).
+//! Один исходник, два крейта, без шима.
 #![allow(dead_code)]
 
 use alloc::collections::{BTreeMap, BTreeSet};

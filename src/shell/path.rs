@@ -1,46 +1,44 @@
-//! CWD state and pure path normalization/resolution (`.`/`..` folding,
-//! clamping at root).
+//! Состояние CWD и чистая нормализация/разрешение путей (свёртка `.`/`..`,
+//! кламп в корне).
 //!
-//! `normalize` and `resolve` are pure functions over `&str`: they perform no
-//! console or VFS I/O, so they are deterministic and trivially testable. The
-//! shell-global current working directory lives behind a [`Spinlock`] and is
-//! always stored as a normalized absolute path.
+//! `normalize` и `resolve` — чистые функции над `&str`: без консольного и VFS
+//! I/O, поэтому детерминированы и легко тестируемы. Глобальный CWD shell живёт
+//! под [`Spinlock`] и всегда хранится нормализованным абсолютным путём.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::sync::spinlock::Spinlock;
 
-/// Shell-global current working directory.
+/// Глобальный CWD shell.
 ///
-/// Stored as a normalized absolute path. Initialized lazily: an empty string
-/// (the const-constructible default) is treated as the root `/`, so the
-/// observable initial CWD is `/` (R4.1) without needing runtime init.
+/// Хранится нормализованным абсолютным путём. Инициализируется лениво: пустая
+/// строка (const-конструируемый дефолт) трактуется как корень `/`, так что
+/// наблюдаемый начальный CWD — `/` (R4.1) без runtime-инициализации.
 static CWD: Spinlock<String> = Spinlock::new(String::new());
 
-/// Fold an absolute path into canonical form.
+/// Свернуть абсолютный путь в каноническую форму.
 ///
-/// Applies `.` (current) and `..` (parent) components, collapses runs of `/`,
-/// and clamps `..` at the root (excess `..` cannot escape `/`). The result
-/// always:
-/// - begins with `/`,
-/// - contains no `.`, `..`, or empty (`//`) components,
-/// - has no trailing `/` except the root, which is exactly `"/"`.
+/// Применяет компоненты `.` (текущий) и `..` (родитель), схлопывает серии `/` и
+/// клампит `..` в корне (лишние `..` не могут выйти за `/`). Результат всегда:
+/// - начинается с `/`,
+/// - не содержит `.`, `..` или пустых (`//`) компонент,
+/// - не имеет завершающего `/`, кроме корня, который ровно `"/"`.
 ///
-/// An empty input is treated as `/`. The function is idempotent:
+/// Пустой вход трактуется как `/`. Функция идемпотентна:
 /// `normalize(normalize(p)) == normalize(p)`.
 #[allow(dead_code)]
 pub fn normalize(abs: &str) -> String {
-    // Stack of surviving components (no leading '/', no '.'/'..', non-empty).
+    // Стек выживших компонент (без ведущего '/', без '.'/'..', непустых).
     let mut stack: Vec<&str> = Vec::new();
 
     for comp in abs.split('/') {
         match comp {
-            // Empty components arise from leading '/', trailing '/', or runs of
-            // '//'; "." is the current directory. Both are dropped.
+            // Пустые компоненты возникают из ведущего '/', завершающего '/' или
+            // серий '//'; "." — текущий каталог. Оба отбрасываются.
             "" | "." => {}
-            // Parent: pop one component, or stay at root when already empty
-            // (clamp — `..` never escapes `/`).
+            // Родитель: снять одну компоненту или остаться в корне, когда стек
+            // уже пуст (кламп — `..` никогда не выходит за `/`).
             ".." => {
                 stack.pop();
             }
@@ -60,19 +58,20 @@ pub fn normalize(abs: &str) -> String {
     out
 }
 
-/// Resolve a possibly-relative user path against `base`, then normalize.
+/// Разрешить возможно относительный пользовательский путь относительно `base`,
+/// затем нормализовать.
 ///
-/// If `input` begins with `/` it is absolute and `base` is ignored. Otherwise
-/// the result is `base` joined with `input` (separated by `/`). `base` is
-/// assumed to already be an absolute path (default `/`). The return value
-/// satisfies the same canonical contract as [`normalize`].
+/// Если `input` начинается с `/`, он абсолютный и `base` игнорируется. Иначе
+/// результат — `base`, соединённый с `input` (через `/`). `base` предполагается
+/// уже абсолютным путём (по умолчанию `/`). Возвращаемое значение удовлетворяет
+/// тому же каноническому контракту, что и [`normalize`].
 #[allow(dead_code)]
 pub fn resolve(base: &str, input: &str) -> String {
     if input.starts_with('/') {
         normalize(input)
     } else {
-        // Join base + "/" + input; normalize folds any duplicate separators
-        // (e.g. when base is "/" or already ends in '/').
+        // Соединить base + "/" + input; normalize свернёт любые дубли
+        // разделителей (например, когда base — "/" или уже кончается на '/').
         let mut joined = String::from(base);
         joined.push('/');
         joined.push_str(input);
@@ -80,11 +79,11 @@ pub fn resolve(base: &str, input: &str) -> String {
     }
 }
 
-/// Snapshot of the shell-global current working directory.
+/// Снимок глобального CWD shell.
 ///
-/// Returns an owned clone so callers do not hold the lock while using it. The
-/// value is always a normalized absolute path; an uninitialized store reads
-/// back as `/`.
+/// Возвращает owned-клон, чтобы вызывающие не держали лок во время
+/// использования. Значение всегда нормализованный абсолютный путь;
+/// неинициализированное хранилище читается как `/`.
 #[allow(dead_code)]
 pub fn cwd() -> String {
     let guard = CWD.lock();
@@ -95,8 +94,8 @@ pub fn cwd() -> String {
     }
 }
 
-/// Store a new current working directory, normalizing it first so the global
-/// invariant (a canonical absolute path) is preserved.
+/// Сохранить новый текущий рабочий каталог, сначала нормализовав его, чтобы
+/// глобальный инвариант (канонический абсолютный путь) сохранялся.
 #[allow(dead_code)]
 pub fn set_cwd(abs: &str) {
     let normalized = normalize(abs);

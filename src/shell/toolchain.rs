@@ -1,8 +1,8 @@
-//! Embedded `pagh-mini` Rust toolchain.
+//! Встроенный `pagh-mini` Rust toolchain.
 //!
-//! This is intentionally a small, offline Rust-like language rather than the
-//! upstream rustc compiler. It makes source written in nano directly runnable
-//! and provides familiar `cargo`, `rustc`, `rust`, and `rustup` workflows.
+//! Это намеренно небольшой офлайн Rust-подобный язык, а не upstream-компилятор
+//! rustc. Он делает исходники, написанные в nano, прямо запускаемыми и даёт
+//! знакомые рабочие процессы `cargo`, `rustc`, `rust` и `rustup`.
 
 use crate::vfs::{VfsError, VfsNode};
 use alloc::collections::BTreeMap;

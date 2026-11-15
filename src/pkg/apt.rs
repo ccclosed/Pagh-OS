@@ -1,56 +1,55 @@
-//! Effectful `apt` package-manager front end (the by-name install pipeline).
+//! Эффектный фронтенд пакетного менеджера `apt` (конвейер установки по имени).
 //!
-//! This is the **kernel-only** orchestration layer that ties the existing pure
-//! pieces together into an `apt`-style workflow driven entirely by *package
-//! name* — no manual host/port/path as the lower-level `pkg` command requires:
+//! Это **kernel-only** слой оркестрации, связывающий существующие чистые части в
+//! apt-подобный рабочий процесс, ведомый целиком *именем пакета* — без ручных
+//! host/port/path, которых требует низкоуровневая команда `pkg`:
 //!
-//!   * [`update`] downloads and parses a Debian binary-repository `Packages`
-//!     index into an in-RAM [`PackageIndex`] (the read side, [`super::apt_index`]).
-//!   * [`install`] plans a dependency-first transaction with the pure resolver
-//!     ([`super::apt_resolve`]), then for each package fetches the `.deb`
-//!     ([`crate::net::http_fetch::http_get`]), parses + decompresses it
-//!     ([`super::deb`]), enumerates its `data.tar` ([`super::tar`]), and writes the
-//!     files onto ext2 under `/mnt` ([`super::install_fs`]).
-//!   * [`show`] / [`list`] are read-only queries over the cached index.
+//!   * [`update`] скачивает и разбирает индекс `Packages` бинарного Debian-
+//!     репозитория в in-RAM [`PackageIndex`] (сторона чтения, [`super::apt_index`]).
+//!   * [`install`] планирует dependency-first транзакцию чистым резолвером
+//!     ([`super::apt_resolve`]), затем для каждого пакета качает `.deb`
+//!     ([`crate::net::http_fetch::http_get`]), разбирает и распаковывает
+//!     ([`super::deb`]), перечисляет его `data.tar` ([`super::tar`]) и пишет файлы
+//!     на ext2 под `/mnt` ([`super::install_fs`]).
+//!   * [`show`] / [`list`] — read-only запросы к кэшированному индексу.
 //!
-//! ## State
+//! ## Состояние
 //!
-//! Three process-global, spinlock-guarded singletons hold the session state:
+//! Три process-global, защищённых спинлоком синглтона держат состояние сессии:
 //!
-//!   * [`struct@CONFIG`] — the active mirror/suite/component/arch (see
-//!     [`AptConfig`]), mutated by [`set_mirror`].
-//!   * [`struct@INDEX`] — the parsed [`PackageIndex`], populated by [`update`].
-//!     It is kept **only in RAM and never persisted to ext2**: the on-disk image
-//!     is just 64 MiB, far too small for a real `main` index (see
-//!     [`super::deb::MAX_INDEX_DECOMPRESSED`] for the decompressed-size note), so
-//!     it is rebuilt by `apt update` each boot.
-//!   * [`struct@INSTALLED`] — the set of package names installed *this session*,
-//!     used as `already_installed` for the resolver so re-installs and shared
-//!     dependencies are skipped. It is not a real dpkg status database.
+//!   * [`struct@CONFIG`] — активные mirror/suite/component/arch (см. [`AptConfig`]),
+//!     меняются [`set_mirror`].
+//!   * [`struct@INDEX`] — разобранный [`PackageIndex`], заполняется [`update`].
+//!     Хранится **только в RAM и никогда не персистится на ext2**: диск всего 64 MiB,
+//!     слишком мало для реального индекса `main` (см.
+//!     [`super::deb::MAX_INDEX_DECOMPRESSED`]), так что индекс пересобирается
+//!     `apt update` каждую загрузку.
+//!   * [`struct@INSTALLED`] — множество имён пакетов, установленных *в этой сессии*,
+//!     используемое как `already_installed` резолвера, чтобы пропускать повторные
+//!     установки и общие зависимости. Это не настоящая dpkg status database.
 //!
-//! Network I/O is performed with **no apt lock held**: each global is locked only
-//! long enough to read/clone what is needed (the index lock is never held across
-//! an `http_get`, which itself disables interrupts while pumping the socket).
+//! Сетевой I/O выполняется **без удержания лока apt**: каждый глобал лочится лишь
+//! настолько, чтобы прочитать/склонировать нужное (лок индекса никогда не держится
+//! через `http_get`, который сам выключает прерывания при прокачке сокета).
 //!
-//! ## Trust chain
+//! ## Цепочка доверия
 //!
-//! Nothing from the mirror is used before the signature chain checks out
+//! Ничто с зеркала не используется, пока не прошла проверка цепочки подписей
 //! (issue #32, `OPENPGP-VERIFY-CONTRACT.md`):
 //!
 //! ```text
-//! InRelease | Release.gpg+Release   (OpenPGP, pinned Debian keyring)
+//! InRelease | Release.gpg+Release   (OpenPGP, закреплённый Debian-keyring)
 //!        |
-//!        +-- SHA-256 + size of the Packages variant actually fetched
+//!        +-- SHA-256 + размер реально скачанного варианта Packages
 //!                 |
-//!                 +-- per-.deb SHA-256 + size from the signed index,
-//!                     checked after the download and BEFORE deb::parse_ar
+//!                 +-- SHA-256 + размер каждого .deb из подписанного индекса,
+//!                     проверяются после скачивания и ДО deb::parse_ar
 //! ```
 //!
-//! A mirror that serves no signatures is refused loudly
-//! ([`AptOpError::Unsigned`]); a mismatch anywhere is fatal and there is no flag,
-//! feature or environment variable that turns verification off. The only
-//! unverified build is `--no-default-features`, where `update`/`install` return
-//! [`AptOpError::NetworkDisabled`].
+//! Зеркало, не отдающее подписи, отвергается громко ([`AptOpError::Unsigned`]);
+//! несовпадение где угодно фатально, и нет флага, фичи или переменной окружения,
+//! отключающей проверку. Единственная непроверяемая сборка — `--no-default-features`,
+//! где `update`/`install` возвращают [`AptOpError::NetworkDisabled`].
 
 #![allow(dead_code)]
 

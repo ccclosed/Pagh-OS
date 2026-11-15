@@ -1,61 +1,62 @@
-//! A file-tree sidebar for the editor.
+//! Сайдбар дерева файлов для редактора.
 //!
-//! The editor had no way to see the filesystem while editing: you opened one path
-//! and that was the whole context. This is the sidebar half of the "looks like an
-//! IDE" change — a project tree beside the text, with directories that open and
-//! close, keyboard navigation, and Enter to swap the edited file.
+//! У редактора не было способа видеть файловую систему во время правки: вы
+//! открывали один путь, и это был весь контекст. Это половина изменения
+//! «выглядит как IDE» — дерево проекта рядом с текстом, с раскрывающимися и
+//! сворачивающимися каталогами, навигацией с клавиатуры и Enter для смены
+//! редактируемого файла.
 //!
-//! The tree is stored **flattened**: `rows` holds exactly what is displayed, in
-//! order, each row carrying its own indent depth. Drawing and moving the cursor are
-//! then both a walk over one `Vec`, and collapsing a directory is a rebuild rather
-//! than a recursive skip. The visible list is rebuilt from the filesystem, so a
-//! file created by a command (or by `apt install`) shows up without a refresh.
+//! Дерево хранится **плоско**: `rows` держит ровно то, что отображается, по
+//! порядку, каждая строка несёт свою глубину отступа. Рисование и перемещение
+//! курсора — тогда обход одного `Vec`, а сворачивание каталога — перестройка, а не
+//! рекурсивный пропуск. Видимый список перестраивается из файловой системы, так
+//! что файл, созданный командой (или `apt install`), появляется без refresh.
 //!
-//! Sizing is bounded on purpose: directories are sorted, hidden dotfiles are
-//! skipped (the shell's own dotfiles are not project content), and the depth is
-//! capped so a symlink loop cannot grow the list without end.
+//! Размеры ограничены намеренно: каталоги сортируются, скрытые dotfiles
+//! пропускаются (собственные dotfiles shell — не содержимое проекта), а глубина
+//! ограничена, чтобы цикл симлинков не растил список бесконечно.
 
 use crate::vfs;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-/// One visible line of the tree.
+/// Одна видимая строка дерева.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
-    /// Display name (no path).
+    /// Отображаемое имя (без пути).
     pub name: String,
-    /// Absolute path, used to open the file.
+    /// Абсолютный путь, используется для открытия файла.
     pub path: String,
-    /// Indent level: 0 for an entry of the root, 1 for its children, …
+    /// Уровень отступа: 0 для записи корня, 1 для его детей, …
     pub depth: usize,
     pub is_dir: bool,
-    /// Whether the entry is expanded (always false for a file).
+    /// Раскрыта ли запись (для файла всегда false).
     pub expanded: bool,
 }
 
-/// The sidebar: a root path, the expanded set, and the flattened visible rows.
+/// Сайдбар: корневой путь, множество раскрытых и плоский список видимых строк.
 pub struct FileTree {
     root: String,
     rows: Vec<Row>,
-    /// Index into `rows` of the highlighted entry.
+    /// Индекс в `rows` подсвеченной записи.
     pub cursor: usize,
-    /// Top offset for scrolling, maintained by [`Self::ensure_visible`].
+    /// Верхнее смещение прокрутки, поддерживается [`Self::ensure_visible`].
     pub top: usize,
-    /// How many rows fit on screen; set by the renderer each frame.
+    /// Сколько строк влезает на экран; ставится рендерером каждый кадр.
     pub view_rows: usize,
     expanded: Vec<String>,
 }
 
-/// Directories deeper than this are not descended into. Symlinks to a parent would
-/// otherwise make the visible list unbounded.
+/// Каталоги глубже этого не обходятся. Иначе симлинки на родителя делали бы
+/// видимый список неограниченным.
 const MAX_DEPTH: usize = 8;
 
-/// Entries listed per directory. A `/usr/bin`-sized directory is not project
-/// content, and an unbounded row list is a memory leak with a nice name.
+/// Записей на каталог. Каталог размера `/usr/bin` — не содержимое проекта, а
+/// неограниченный список строк — утечка памяти с красивым названием.
 const MAX_ENTRIES: usize = 512;
 
 impl FileTree {
-    /// Build a tree rooted at `root` (a directory path), with `root` expanded.
+    /// Построить дерево с корнем `root` (путь каталога), с раскрытым `root`.
     pub fn new(root: &str) -> Self {
         let mut t = FileTree {
             root: root.to_string(),
@@ -77,13 +78,13 @@ impl FileTree {
         &self.rows
     }
 
-    /// The highlighted entry, if the tree is non-empty.
+    /// Подсвеченная запись, если дерево непусто.
     pub fn selected(&self) -> Option<&Row> {
         self.rows.get(self.cursor)
     }
 
-    /// Rebuild the visible rows from the filesystem, keeping the cursor on the same
-    /// path when that path still exists.
+    /// Перестроить видимые строки из файловой системы, удерживая курсор на том же
+    /// пути, пока этот путь существует.
     pub fn rebuild(&mut self) {
         let keep = self.selected().map(|r| r.path.clone());
         let mut rows = Vec::new();
@@ -99,12 +100,11 @@ impl FileTree {
         }
     }
 
-    /// Append `dir`'s entries to `out`, then recurse into expanded subdirectories.
+    /// Дописать записи `dir` в `out`, затем рекурсивно войти в раскрытые подкаталоги.
     ///
-    /// Errors are swallowed: a directory that cannot be read simply contributes no
-    /// rows. The editor is not the place to report a filesystem problem, and a
-    /// sidebar that refuses to draw because one entry is unreadable is worse than
-    /// one that is short a row.
+    /// Ошибки проглатываются: нечитаемый каталог просто не даёт строк. Редактор —
+    /// не место сообщать о проблеме файловой системы, и сайдбар, отказывающийся
+    /// рисоваться из-за одной нечитаемой записи, хуже сайдбара без одной строки.
     fn walk(&self, dir: &str, depth: usize, out: &mut Vec<Row>) {
         if depth > MAX_DEPTH || out.len() >= MAX_ENTRIES {
             return;
@@ -124,7 +124,7 @@ impl FileTree {
             let path = join(dir, &name);
             entries.push((name.to_string(), child.is_directory(), path));
         }
-        // Directories first, then alphabetically: the order a project explorer shows.
+        // Сначала каталоги, затем по алфавиту: порядок, в котором показывает project explorer.
         entries.sort_by(|a, b| match (a.1, b.1) {
             (true, false) => core::cmp::Ordering::Less,
             (false, true) => core::cmp::Ordering::Greater,
@@ -152,8 +152,8 @@ impl FileTree {
         self.expanded.iter().any(|p| p == path)
     }
 
-    /// Open the highlighted directory, or close it when it is already open.
-    /// Returns the path to open when the highlight is a file.
+    /// Открыть подсвеченный каталог или закрыть его, если он уже открыт.
+    /// Возвращает путь для открытия, когда подсвечен файл.
     pub fn activate(&mut self) -> Option<String> {
         let row = self.selected()?.clone();
         if row.is_dir {
@@ -169,8 +169,8 @@ impl FileTree {
         }
     }
 
-    /// Collapse the highlighted directory, or move to the parent directory.
-    /// Returns `true` when the tree changed.
+    /// Свернуть подсвеченный каталог или перейти в родительский каталог.
+    /// Возвращает `true`, когда дерево изменилось.
     pub fn collapse_or_parent(&mut self) -> bool {
         let Some(row) = self.selected().cloned() else {
             return false;
@@ -182,7 +182,7 @@ impl FileTree {
             self.rebuild();
             return true;
         }
-        // Jump to the enclosing directory's row.
+        // Прыгнуть на строку объемлющего каталога.
         let depth = row.depth;
         if depth == 0 {
             return false;
@@ -207,7 +207,7 @@ impl FileTree {
         }
     }
 
-    /// Keep the cursor inside the visible window.
+    /// Держать курсор внутри видимого окна.
     pub fn ensure_visible(&mut self) {
         let view = self.view_rows.max(1);
         if self.cursor < self.top {
@@ -218,7 +218,7 @@ impl FileTree {
     }
 }
 
-/// Join a directory path and a name, tolerating a trailing slash on the directory.
+/// Соединить путь каталога и имя, терпя завершающий слэш у каталога.
 fn join(dir: &str, name: &str) -> String {
     if dir.ends_with('/') {
         alloc::format!("{}{}", dir, name)

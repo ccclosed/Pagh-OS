@@ -1,7 +1,7 @@
-//! ANSI/VT-100 terminal emulator rendered on the framebuffer.
+//! Эмулятор терминала ANSI/VT-100, рендеримый во framebuffer.
 #![allow(dead_code)]
-// Glyph cell geometry and the status-bar strip belong to the framebuffer/font:
-// the VT lays out in cells, so it must not re-declare the size it is drawn at.
+// Геометрия глиф-клетки и полоса status bar принадлежат framebuffer/шрифту:
+// VT раскладывается по клеткам, так что не должен заново объявлять размер, в котором рисуется.
 use crate::drivers::framebuffer::{CHAR_HEIGHT, CHAR_WIDTH, STATUS_BAR_HEIGHT};
 use crate::sync::spinlock::Spinlock;
 use alloc::vec::Vec;

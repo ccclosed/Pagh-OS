@@ -1,61 +1,57 @@
-//! One-shot TLS 1.3 server authentication (issue #14 series) — the decision
-//! layer that ties the previous PRs into a single "may I talk to this peer?"
-//! answer. Pure `core` + `alloc`, panic-free, self-contained: no kernel
-//! services, no RNG, no embedded-tls types. The kernel call site
-//! (`net::tls`) adapts the handshake's borrowed certificate entries and the
-//! negotiated `SignatureScheme` onto the small own types below, and the host
-//! property P49 drives the exact same source with synthetic chains.
+//! Одноразовая TLS 1.3 server authentication (серия issue #14) — слой решения,
+//! связывающий предыдущие PR в один ответ «можно ли говорить с этим peer'ом?».
+//! Чистый `core` + `alloc`, panic-free, самодостаточный: без сервисов ядра, RNG и
+//! типов embedded-tls. Kernel call site (`net::tls`) адаптирует заимствованные
+//! записи сертификатов handshake и согласованную `SignatureScheme` на небольшие
+//! собственные типы ниже, а host-property P49 гоняет тот же исходник на
+//! синтетических цепочках.
 //!
-//! Three decisions, all fail-closed, all mandatory, in this order:
+//! Три решения, все fail-closed, все обязательные, в этом порядке:
 //!
-//!   1. **Chain** — [`tls_chain::verify_chain`] links the server's
-//!      certificates to the configured trust anchors (byte-equal names, every
-//!      signature verified, `cA=TRUE` on every issuer, validity windows plus
-//!      the 2025 clock gate against the caller-provided `now`).
-//!   2. **Hostname** — RFC 6125 authorization of the connection target
-//!      against the LEAF's SAN entries only: dNSName entries through
-//!      [`hostname::hostname_matches`] for a DNS target, iPAddress entries
-//!      through [`hostname::ip_matches`] for an IP-literal target. There is
-//!      deliberately NO CommonName fallback (CN matching was deprecated by
-//!      CA/B Forum in 2017; every current mirror certificate carries SAN) and
-//!      NO cross-type matching (an IP host never matches a dNSName entry and
-//!      vice versa). A missing or malformed SAN extension is a reject, not a
-//!      pass; a missing host (`None`) is a reject too — a verifier without a
-//!      name to check has nothing to authorize.
-//!   3. **Leaf key export** — the TLS 1.3 `CertificateVerify` message (a
-//!      signature over the handshake transcript, sent AFTER the certificate)
-//!      must be checked with the LEAF's public key. [`authenticate_server`]
-//!      copies the leaf SPKI into an owned [`LeafKey`]; a leaf whose
-//!      algorithm is outside the supported surface fails the handshake here
-//!      rather than at the signature step (same fail-closed surface as
-//!      [`super::x509::SpkiKey::Unsupported`]).
+//!   1. **Цепочка** — [`tls_chain::verify_chain`] связывает сертификаты сервера с
+//!      настроенными trust anchor'ами (байт-равные имена, каждая подпись
+//!      проверена, `cA=TRUE` у каждого эмитента, окна валидности плюс clock gate
+//!      2025 против переданного вызывающим `now`).
+//!   2. **Hostname** — авторизация цели соединения по RFC 6125 только по
+//!      SAN-записям LEAF: dNSName через [`hostname::hostname_matches`] для
+//!      DNS-цели, iPAddress через [`hostname::ip_matches`] для IP-литерала.
+//!      CN-fallback намеренно ОТСУТСТВУЕТ (CN-матчинг был deprecated CA/B Forum
+//!      в 2017; каждый текущий сертификат зеркала несёт SAN), и нет
+//!      cross-type-матчинга (IP-host никогда не совпадает с dNSName и наоборот).
+//!      Отсутствующее или битое SAN-расширение — отказ, не pass; отсутствующий
+//!      host (`None`) — тоже отказ: верификатору без имени нечего авторизовать.
+//!   3. **Экспорт leaf-ключа** — `CertificateVerify` (TLS 1.3: подпись над
+//!      транскриптом handshake, посылаемая ПОСЛЕ сертификата) должна проверяться
+//!      публичным ключом LEAF. [`authenticate_server`] копирует leaf SPKI в
+//!      owned [`LeafKey`]; leaf, чей алгоритм вне поддерживаемой поверхности,
+//!      валит handshake здесь, а не на шаге подписи (та же fail-closed
+//!      поверхность, что [`super::x509::SpkiKey::Unsupported`]).
 //!
-//! The `CertificateVerify` check itself lives here too:
-//! [`certificate_verify_message`] builds the exact signed message
-//! (RFC 8446 §4.4.3: 64 spaces + context string + transcript hash) and
-//! [`verify_certificate_verify`] dispatches on the negotiated
-//! [`Tls13Scheme`]. Unlike the X.509 chain signatures — where RSA-PSS is
-//! rejected outright (parameters-driven OID, see `tls_verify` module docs) —
-//! TLS 1.3 REQUIRES RSA `CertificateVerify` signatures to be PSS
-//! (`rsa_pss_rsae_*`, RFC 8446 §4.2.3): the scheme is fully determined by the
-//! negotiated identifier (hash = suffix, salt length = hash length, trailer
-//! fixed), so there is no parameter surface to downgrade. A chain signed
-//! PKCS1-v1_5 with an RSA leaf therefore verifies its chain in PKCS1-v1_5 and
-//! its `CertificateVerify` in PSS — that combination is what real Debian
-//! mirrors serve.
+//! Сама проверка `CertificateVerify` тоже здесь: [`certificate_verify_message`]
+//! строит точное подписываемое сообщение (RFC 8446 §4.4.3: 64 пробела +
+//! context string + транскрипт-хеш), а [`verify_certificate_verify`]
+//! диспетчеризует по согласованной [`Tls13Scheme`]. В отличие от подписей
+//! X.509-цепочки — где RSA-PSS отвергается сразу (OID с параметрами, см. docs
+//! `tls_verify`) — TLS 1.3 ТРЕБУЕТ RSA `CertificateVerify` в PSS
+//! (`rsa_pss_rsae_*`, RFC 8446 §4.2.3): схема полностью определена согласованным
+//! идентификатором (hash = суффикс, salt length = длина хеша, trailer
+//! фиксирован), так что поверхности параметров для downgrade нет. Цепочка,
+//! подписанная PKCS1-v1_5 с RSA-leaf, поэтому проверяет цепочку в PKCS1-v1_5, а
+//! `CertificateVerify` в PSS — ровно такую комбинацию отдают реальные Debian-
+//! зеркала.
 //!
-//! ## The two hashes of RFC 8446 §4.4.3
+//! ## Два хеша RFC 8446 §4.4.3
 //!
-//! The transcript hash in that message comes from the negotiated CIPHER SUITE
-//! (`Aes128GcmSha256` ⇒ SHA-256 ⇒ 32 bytes on this path), while the signature
-//! scheme only selects the digest the peer signs with. The two are NOT the same
-//! width in general — and RFC 8446 deliberately allows that:
-//! `ecdsa_secp384r1_sha384` means "a SHA-384 digest *of* the 32-byte transcript
-//! hash". [`verify_certificate_verify`] therefore takes the suite's hash length
-//! as an explicit parameter and gates the transcript hash on it alone; it never
-//! compares that hash against the scheme's digest width. Doing so was the bug:
-//! every P-384 / RSA-PSS-384 / RSA-PSS-512 leaf was refused as if its signature
-//! were bad, and three of the module's backends were unreachable.
+//! Транскрипт-хеш в этом сообщении берётся из согласованного CIPHER SUITE
+//! (`Aes128GcmSha256` => SHA-256 => 32 байта на этом пути), а схема подписи
+//! выбирает только дайджест, которым подписывает peer. Ширины у них в общем
+//! случае НЕ одинаковые — и RFC 8446 это намеренно допускает:
+//! `ecdsa_secp384r1_sha384` означает «SHA-384 дайджест *от* 32-байтового
+//! транскрипт-хеша». [`verify_certificate_verify`] поэтому принимает длину хеша
+//! suite явным параметром и гейтит транскрипт-хеш только по ней; он никогда не
+//! сравнивает этот хеш с шириной дайджеста схемы. Именно это было багом: каждый
+//! P-384 / RSA-PSS-384 / RSA-PSS-512 leaf отвергался, будто подпись плоха, и три
+//! бэкенда модуля были недостижимы.
 
 use alloc::vec::Vec;
 

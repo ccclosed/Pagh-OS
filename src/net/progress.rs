@@ -1,19 +1,19 @@
-//! Single-line, in-place download progress bar for the package fetchers.
+//! Однострочный прогресс-бар загрузки на месте для загрузчиков пакетов.
 //!
-//! Both the cleartext HTTP ([`super::http_fetch`]) and the TLS
-//! ([`super::tls`]) download loops call [`show`] as body bytes arrive and
-//! [`finish`] once the transfer ends (success or failure). The line is redrawn
-//! in place using a leading carriage return (`\r`) and **no** trailing newline,
-//! so it overwrites itself instead of scrolling: the framebuffer console honours
-//! `\r` (it resets the column) and repaints each glyph cell opaquely, and a host
-//! serial terminal does the same. [`finish`] prints the closing newline exactly
-//! once, and only if a bar was actually drawn, so callers can invoke it
-//! unconditionally on every exit path without leaving a stray blank line.
+//! И cleartext HTTP ([`super::http_fetch`]), и TLS ([`super::tls`]) циклы загрузки
+//! вызывают [`show`] по мере прихода байтов тела и [`finish`] по окончании
+//! передачи (успех или сбой). Строка перерисовывается на месте ведущим возвратом
+//! каретки (`\r`) и **без** завершающего newline, поэтому перезаписывает себя, а
+//! не прокручивается: framebuffer-консоль понимает `\r` (сбрасывает колонку) и
+//! перекрашивает каждую глиф-клетку непрозрачно, host-serial-терминал делает то
+//! же. [`finish`] печатает закрывающий newline ровно один раз и только если бар
+//! реально рисовался, так что вызывающие могут звать его безусловно на каждом
+//! пути выхода, не оставляя лишней пустой строки.
 //!
-//! Output goes to both serial and the framebuffer (mirroring the rest of the
-//! kernel's console I/O); no ANSI/escape bytes are emitted, only printable ASCII
-//! plus `\r`/`\n`, so the console's bitmap font (Fira Code 8×18, see
-//! [`crate::drivers::framebuffer`]) renders it verbatim.
+//! Вывод идёт и в serial, и во framebuffer (как остальной консольный I/O ядра);
+//! ANSI/escape-байты не эмитятся, только печатный ASCII плюс `\r`/`\n`, так что
+//! bitmap-шрифт консоли (Fira Code 8×18, см. [`crate::drivers::framebuffer`])
+//! рендерит это дословно.
 
 #![allow(dead_code)]
 
@@ -21,17 +21,18 @@ use alloc::format;
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-/// Visible width, in cells, of the `[####    ]` bar.
+/// Видимая ширина в клетках бара `[####    ]`.
 const BAR_WIDTH: usize = 28;
 
-/// Whether a progress line is currently drawn (so [`finish`] knows to terminate
-/// it). Downloads are serialized (one fetch at a time, driven by the single net
-/// pump), so a plain flag is sufficient.
+/// Нарисована ли сейчас строка прогресса (чтобы [`finish`] знал, что её надо
+/// завершить). Загрузки сериализованы (одна за раз, ведомая одним сетевым
+/// насосом), так что простого флага достаточно.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Format a byte count as a short `B`/`KiB`/`MiB` string with one decimal place.
-/// Integer-only and panic-free. Local copy (kept tiny) so the low-level `net`
-/// layer does not depend on the higher-level `pkg` module for formatting.
+/// Форматировать число байт как короткую строку `B`/`KiB`/`MiB` с одним знаком
+/// после точки. Только целые числа, panic-free. Локальная копия (держится
+/// крошечной), чтобы низкоуровневый слой `net` не зависел от более высокого
+/// модуля `pkg` ради форматирования.
 fn human(n: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * 1024;
@@ -44,11 +45,11 @@ fn human(n: u64) -> String {
     }
 }
 
-/// Build the progress line for `received` bytes out of an optional `total` (the
-/// parsed `Content-Length`). With a known total it renders a filled bar plus a
-/// percentage and `recv / total`; before the head is parsed (`None`) it shows
-/// just the running byte count. Trailing spaces pad the line so a shorter redraw
-/// fully erases the previous, longer one.
+/// Построить строку прогресса для `received` байт из необязательного `total`
+/// (разобранный `Content-Length`). При известном total рисуется заполненный бар
+/// плюс процент и `recv / total`; до разбора головы (`None`) показывается только
+/// текущий счётчик байт. Хвостовые пробелы добивают строку, чтобы более короткая
+/// перерисовка полностью стёрла предыдущую длинную.
 pub fn line(received: u64, total: Option<u64>) -> String {
     match total {
         Some(total) if total > 0 => {
@@ -71,21 +72,21 @@ pub fn line(received: u64, total: Option<u64>) -> String {
     }
 }
 
-/// Redraw the progress `text` in place (leading `\r`, no newline) on serial and
-/// the framebuffer. Marks a bar as active so [`finish`] will terminate it.
+/// Перерисовать прогресс `text` на месте (ведущий `\r`, без newline) в serial и
+/// framebuffer. Помечает бар активным, чтобы [`finish`] его завершил.
 pub fn show(text: &str) {
     ACTIVE.store(true, Ordering::Relaxed);
     crate::kprint!("\r{}", text);
-    // While the framebuffer log mirror is paused (background
-    // provisioning), the bar stays on serial only -- the interactive console
-    // is not redrawn hundreds of times by a background download.
+    // Пока зеркало лога framebuffer на паузе (фоновый provisioning), бар
+    // остаётся только в serial — интерактивная консоль не перерисовывается
+    // сотни раз фоновой загрузкой.
     if !crate::log::fb_mirror_paused() {
         crate::fb_print!("\r{}", text);
     }
 }
 
-/// Terminate the current progress line with a newline, if one was drawn. A no-op
-/// otherwise, so it is safe to call on both success and failure exit paths.
+/// Завершить текущую строку прогресса newline, если она рисовалась. Иначе no-op,
+/// так что безопасно звать на путях и успеха, и сбоя.
 pub fn finish() {
     if ACTIVE.swap(false, Ordering::Relaxed) {
         crate::kprintln!("");

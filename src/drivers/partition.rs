@@ -1,24 +1,22 @@
-//! Partition-table parsing: a view of one partition as its own block device.
+//! Разбор таблицы разделов: вид одного раздела как собственного блочного устройства.
 //!
-//! WHY THIS EXISTS. The drivers took whole devices: the NVMe driver claimed the
-//! entire namespace and ext2 was formatted over it. That is fine for a QEMU image
-//! that is nothing but a filesystem, and wrong on a real machine — the operator's
-//! disk already has a partition table, and "pagh wants the whole disk" means pagh
-//! cannot coexist with anything else. This module reads GPT (and MBR as the
-//! fallback) and exposes each partition as an independent `BlockDevice`
-//! (`nvme0p1`, `nvme0p2`, …), so the filesystem layer can mount one partition and
-//! leave the rest of the disk alone.
+//! Зачем: драйверы брали целые устройства — NVMe-драйвер забирал весь namespace,
+//! и ext2 форматировался поверх него. Это нормально для QEMU-образа, который есть
+//! просто файловая система, и неправильно на реальной машине — диск оператора уже
+//! имеет таблицу разделов, и «pagh хочет весь диск» означает, что pagh не может
+//! сосуществовать ни с чем. Модуль читает GPT (и MBR как fallback) и выставляет
+//! каждый раздел независимым `BlockDevice` (`nvme0p1`, `nvme0p2`, …), так что слой
+//! ФС может смонтировать один раздел и оставить остальной диск в покое.
 //!
-//! READ-ONLY VIEW. A `PartitionSlice` forwards to the parent device with an
-//! offset, bounds-checked against the partition's own length: a read past the end
-//! of a partition fails instead of silently reading the next one's data, which is
-//! what would happen if the slice simply forwarded larger offsets.
+//! READ-ONLY ВИД. `PartitionSlice` переадресует родительскому устройству со
+//! смещением, проверенным на границы по длине самого раздела: чтение за концом
+//! раздела падает вместо молчаливого чтения данных следующего — что произошло бы,
+//! если бы срез просто переадресовал большие смещения.
 //!
-//! WHAT IS PARSED. GPT with a valid header and entry array (LBA 1, signature
-//! `EFI PART`), including the backup-header sanity check; MBR with its four
-//! primary entries otherwise. Logical (extended) partitions are NOT parsed —
-//! named here rather than implied, because a disk laid out that way will show its
-//! primary entries only.
+//! ЧТО РАЗБИРАЕТСЯ. GPT с валидным заголовком и массивом записей (LBA 1, сигнатура
+//! `EFI PART`), включая проверку backup-заголовка; MBR с четырьмя primary-записями
+//! иначе. Логические (extended) разделы НЕ разбираются — названо явно, а не
+//! подразумевается, потому что диск с такой раскладкой покажет только primary-записи.
 
 use alloc::format;
 use alloc::string::String;

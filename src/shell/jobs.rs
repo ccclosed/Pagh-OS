@@ -1,16 +1,16 @@
-//! Minimal job table for the shell's foreground programs.
+//! Минимальная таблица заданий для foreground-программ shell.
 //!
-//! `lxrun` puts a stopped program here when Ctrl+Z parks its process group;
-//! `jobs` lists it, `fg` resumes the group and waits, `bg` resumes it in the
-//! background. There is one job table per boot and no job control for native
-//! kernel threads.
+//! `lxrun` кладёт сюда остановленную программу, когда Ctrl+Z паркует её группу
+//! процессов; `jobs` перечисляет её, `fg` возобновляет группу и ждёт, `bg`
+//! возобновляет в фоне. Таблица заданий одна на загрузку, и для нативных
+//! потоков ядра управления заданиями нет.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::sync::spinlock::Spinlock;
 
-/// One remembered job.
+/// Одно запомненное задание.
 pub struct Job {
     pub pid: u64,
     pub pgid: u64,
@@ -20,7 +20,7 @@ pub struct Job {
 
 static JOBS: Spinlock<Vec<Job>> = Spinlock::new(Vec::new());
 
-/// Record (or replace) a job by pid.
+/// Записать (или заменить) задание по pid.
 pub fn record(pid: u64, pgid: u64, command: String, stopped: bool) {
     let mut jobs = JOBS.lock();
     if let Some(job) = jobs.iter_mut().find(|job| job.pid == pid) {
@@ -37,12 +37,12 @@ pub fn record(pid: u64, pgid: u64, command: String, stopped: bool) {
     });
 }
 
-/// Drop a job (it exited).
+/// Убрать задание (оно вышло).
 pub fn remove(pid: u64) {
     JOBS.lock().retain(|job| job.pid != pid);
 }
 
-/// Snapshot for `jobs`.
+/// Снимок для `jobs`.
 pub fn snapshot() -> Vec<(u64, u64, String, bool)> {
     JOBS.lock()
         .iter()
@@ -50,14 +50,14 @@ pub fn snapshot() -> Vec<(u64, u64, String, bool)> {
         .collect()
 }
 
-/// The most recently recorded job, if any.
+/// Самое недавно записанное задание, если есть.
 pub fn last() -> Option<(u64, u64, String)> {
     JOBS.lock()
         .last()
         .map(|job| (job.pid, job.pgid, job.command.clone()))
 }
 
-/// Set the stopped flag for `pid`.
+/// Поставить флаг stopped для `pid`.
 pub fn set_stopped(pid: u64, stopped: bool) {
     if let Some(job) = JOBS.lock().iter_mut().find(|job| job.pid == pid) {
         job.stopped = stopped;

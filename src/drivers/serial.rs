@@ -1,5 +1,5 @@
-// drivers/serial.rs — COM1 UART driver (minimal, no FIFO)
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// drivers/serial.rs — драйвер COM1 UART (минимальный, без FIFO)
+// 64-битное ядро ОС x86_64 на Rust (#![no_std])
 
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -7,16 +7,16 @@ use x86_64::instructions::port::Port;
 
 const COM1: u16 = 0x3F8;
 
-/// Tracks whether [`init`] has completed the COM1 bring-up sequence.
+/// Отслеживает, завершил ли [`init`] bring-up COM1.
 ///
-/// INVARIANT: the UART at the fixed `COM1` base is fully described by that
-/// constant address, so no port *value* needs to be stored across calls. We
-/// only need to remember whether the device has been programmed yet. A
-/// `Port<u8>` is a zero-cost wrapper over a port number, so it is reconstructed
-/// (`Port::new(COM1)`) on demand at each access instead of being cached in a
-/// `static mut`. This flag is written exactly once in `init` (before
-/// interrupts/other CPUs touch the port) and only read afterwards, so a
-/// `Relaxed` ordering is sufficient.
+/// ИНВАРИАНТ: UART по фиксированному базовому адресу `COM1` полностью описывается
+/// этой константой, так что никакое *значение* порта не нужно хранить между
+/// вызовами. Надо помнить только, было ли устройство уже запрограммировано.
+/// `Port<u8>` — zero-cost обёртка над номером порта, так что он пересоздаётся
+/// (`Port::new(COM1)`) по требованию при каждом доступе, а не кэшируется в
+/// `static mut`. Флаг пишется ровно один раз в `init` (до прерываний/других CPU,
+/// трогающих порт) и дальше только читается, так что `Relaxed`-упорядочивания
+/// достаточно.
 static SERIAL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 pub fn init() {

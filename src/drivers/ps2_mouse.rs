@@ -1,12 +1,12 @@
-// drivers/ps2_mouse.rs — PS/2 mouse driver (IRQ12)
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// drivers/ps2_mouse.rs — драйвер PS/2 мыши (IRQ12)
+// 64-битное ядро ОС x86_64 на Rust (#![no_std])
 //
-// Standard PS/2 "aux device" bring-up via the 8042 controller, plus a 3-byte
-// packet assembler driven from the IRQ12 handler. The driver maintains an
-// absolute cursor position (accumulated from relative movement packets and
-// clamped to the screen) and the current button state, both readable through
-// [`poll`]. It performs no rendering — the software cursor (`drivers::cursor`)
-// and `paint` consume the state.
+// Стандартный bring-up PS/2 «aux device» через контроллер 8042 плюс сборщик
+// 3-байтовых пакетов, ведомый обработчиком IRQ12. Драйвер держит абсолютную
+// позицию курсора (накапливаемую из относительных пакетов движения и клампленную
+// по экрану) и текущее состояние кнопок, оба читаются через [`poll`]. Рендерингом
+// он не занимается — состояние потребляют программный курсор (`drivers::cursor`)
+// и `paint`.
 
 use crate::sync::spinlock::Spinlock;
 use x86_64::instructions::port::Port;
@@ -14,7 +14,7 @@ use x86_64::instructions::port::Port;
 const DATA_PORT: u16 = 0x60;
 const CMD_PORT: u16 = 0x64;
 
-/// A snapshot of the mouse state at a moment in time.
+/// Снимок состояния мыши на момент времени.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MouseState {
     pub x: usize,

@@ -1,29 +1,28 @@
-//! Pure parser for a Debian `Release` / `InRelease` body (issue #32).
+//! Чистый парсер тела Debian `Release` / `InRelease` (issue #32).
 //!
-//! A `Release` file is RFC822-ish: `Key: value` fields, then one or more digest
-//! *sections* (`MD5Sum:`, `SHA1:`, `SHA256:`, `SHA512:`) whose entries are
-//! continuation lines of the form
+//! `Release` — RFC822-подобный: поля `Key: value`, затем одна или несколько
+//! digest-*секций* (`MD5Sum:`, `SHA1:`, `SHA256:`, `SHA512:`), чьи записи —
+//! continuation-строки вида
 //!
 //! ```text
 //!  <64 hex> <size> <pool-relative path>
 //! ```
 //!
-//! The apt trust chain uses exactly one thing from it: the **SHA-256 and size**
-//! of the `Packages` variant it is about to parse. Everything else (suite,
-//! codename, dates, `Acquire-By-Hash`) is read for the policy checks in
-//! `pkg::apt` and for diagnostics.
+//! Цепочка доверия apt использует из него ровно одно: **SHA-256 и размер** варианта
+//! `Packages`, который собирается разбирать. Всё остальное (suite, codename, даты,
+//! `Acquire-By-Hash`) читается для policy-проверок в `pkg::apt` и диагностики.
 //!
-//! ## Why the section header matters
+//! ## Почему важен заголовок секции
 //!
-//! `MD5Sum` entries are 32 hex characters and `SHA1` entries are 40: a parser
-//! that scans the whole file for "hex + size + path" would happily accept an MD5
-//! line as the digest of `Packages.gz`. This parser therefore tracks the current
-//! section and only collects entries inside `SHA256:`, which is the section the
-//! signature actually covers — a deliberate fail-closed choice, since a malformed
-//! or unknown section simply yields no entry and the caller refuses.
+//! Записи `MD5Sum` — 32 hex-символа, `SHA1` — 40: парсер, сканирующий весь файл на
+//! «hex + size + path», с удовольствием принял бы MD5-строку за дайджест
+//! `Packages.gz`. Поэтому парсер отслеживает текущую секцию и собирает записи только
+//! внутри `SHA256:`, которую покрывает подпись — намеренный fail-closed выбор:
+//! некорректная или неизвестная секция просто не даёт записи, и вызывающий
+//! отказывает.
 //!
-//! Everything here is `core` + `alloc` only, so the kernel compiles this source
-//! for the bare-metal target and `host-tests` `#[path]`-includes it (P54).
+//! Всё здесь только `core` + `alloc`, так что ядро компилирует исходник для
+//! bare-metal, а `host-tests` `#[path]`-включает его (P54).
 
 #![allow(dead_code)]
 

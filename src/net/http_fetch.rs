@@ -1,23 +1,22 @@
-//! Effectful `.deb` fetch over the kernel's own TCP stack (Component 7,
+//! Эффектная загрузка `.deb` поверх собственного TCP-стека ядра (Component 7,
 //! `Package_Fetcher`).
 //!
-//! This is the **kernel-only** half of the `Package_Fetcher`. The pure
-//! request-building and response-head parsing live in [`crate::net::http`]
-//! (`parse_http_head` / `build_get_request`, task 7.1) and are shared into the
-//! `host-tests` crate via a `#[path]` include; keeping the socket pump in this
-//! separate file means `net/http.rs` stays purely host-includable (no network
-//! stack types, no globals) for properties P20/P21 (R11.6).
+//! Это **kernel-only** половина `Package_Fetcher`. Чистое построение запроса и
+//! разбор головы ответа живут в [`crate::net::http`] (`parse_http_head` /
+//! `build_get_request`) и шарятся в `host-tests` через `#[path]`; сокетный насос
+//! в отдельном файле держит `net/http.rs` чисто host-includable (без типов
+//! сетевого стека и глобалов) для свойств P20/P21 (R11.6).
 //!
-//! [`fetch_deb`] performs one HTTP/1.1 `GET` over a freshly-opened TCP socket and
-//! collects a `Content-Length`-sized body. It reuses the existing networking
-//! primitives owned by the parent [`crate::net`] module — [`super::tcp_connect`]
-//! to open the connection and the module-global `NET` stack lock to pump it —
-//! and the pure [`parse_http_head`]/[`build_get_request`] for all wire parsing.
+//! [`fetch_deb`] выполняет один HTTP/1.1 `GET` через свежеоткрытый TCP-сокет и
+//! собирает тело размера `Content-Length`. Он переиспользует существующие
+//! сетевые примитивы родительского [`crate::net`]: [`super::tcp_connect`] для
+//! открытия соединения и module-global лок `NET` для его прокрутки, а также
+//! чистые [`parse_http_head`]/[`build_get_request`] для всего wire-разбора.
 //!
-//! Failure handling (R8.3–R8.7, R12.4, R12.5): each distinct failure maps to a
-//! [`FetchError`] variant, the partial buffer is discarded, the socket is
-//! released, and exactly one structured diagnostic is emitted naming
-//! `component=Package_Fetcher`, the stage, and the resource (host/path).
+//! Обработка сбоев (R8.3–R8.7, R12.4, R12.5): каждый отдельный сбой отображается
+//! в вариант [`FetchError`], частичный буфер отбрасывается, сокет освобождается,
+//! и выдаётся ровно одна структурированная диагностика с
+//! `component=Package_Fetcher`, стадией и ресурсом (host/path).
 
 use alloc::vec::Vec;
 
