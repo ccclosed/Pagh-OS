@@ -95,6 +95,37 @@ reports live in `attack/r3/{arch,vfs,lead}/REPORT.md` and the top-level
   for this change (QEMU evidence only); the serial lines to watch on hardware are
   named in `src/drivers/README.md`.
 
+* **xHCI root-port reset: stop resetting ports that are still detecting (2.22.7
+  field fix).** The same field machine (Intel 8086:7a60, 26 ports,
+  `attached=0x02000731`) reported every attached USB2 port as `ccs=1 ped=0
+  pp=1 pls=7 stage=lost-after-reset code=0x6e1 try=19 ms=124 ... prc=1
+  ped_seen=1 ped_sc=0x00200e03` with 0 HID devices: the device was detected, the
+  port enabled for a moment after reset, and then fell back to Polling before
+  enumeration could start. The old `reset_port` waited only 60 ms for PED+U0,
+  reset anyway while the USB2 PHY was still debouncing/training (first reset
+  budget 25 ms, stability window 20 ms, PP power-cycled every 4 attempts), so
+  each reset restarted the attach sequence the previous one had interrupted —
+  a reset loop every ~124 ms. The decision logic is now a pure, host-tested
+  policy (`src/drivers/xhci_port.rs`, properties `xhci_port`): a port in
+  Polling/RxDetect gets 400 ms of undisturbed detect/training and is adopted
+  without any reset if it enables on its own; after PR (USB2) or WPR (USB3) the
+  driver awaits PRC and a PED+U0 enable for up to 500 ms and never writes a
+  second reset inside that window; the enable must hold for 80 ms before the
+  device is addressed; a lost enable backs off 250 ms → 500 ms → 1 s and is
+  re-observed (fresh 400 ms window) instead of reset immediately; PP is
+  power-cycled only after 16 failed attempts, with PP off for 500 ms and a fresh
+  debounce afterwards. The driver still advances one port per `poll()` and all
+  waiting is deadline-based between polls, so the boot menu's countdown stays
+  responsive. Diagnostics now print `ped_u0=`: the field's identical `ped_sc`
+  was a per-port reset-time transient (CCS+PED+PP+speed=high+PRC), not a shared
+  diagnostic value, and `ped_sc` is now the last PED+U0 sighting per port (or
+  the last transient when no real enable occurred). Evidence: QEMU `tools/e2e.py
+  usb` (keyboard + mouse through the menu and shell, PS/2 unaffected),
+  `selftest`, and the new host properties; real hardware was not available, so
+  this is QEMU evidence only and needs a user test. The serial lines to watch are
+  named in `src/drivers/README.md` (`port N: reset #K issued`, `reset-ok`,
+  `lost-after-reset`/`reset-no-prc`, `HID device on port N`, `usb: key reports`).
+
 ## 2.22.6
 
 Round-3 audit hotfix: four high, verified findings (three x86 machine-kill /

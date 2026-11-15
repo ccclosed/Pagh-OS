@@ -21,6 +21,7 @@ pub mod usb_hid_proto;
 pub mod virtio;
 pub mod vt;
 pub mod xhci;
+mod xhci_port;
 
 use crate::sync::spinlock::Spinlock;
 use alloc::collections::BTreeMap;

@@ -211,7 +211,16 @@ server certificate chain, hostname and validity checked before a byte of the ind
   composite device is bound and polled, the interrupt-IN transfer buffer is sized
   from `wMaxPacketSize` (so a longer report cannot babble the endpoint), and a
   halted endpoint is recovered with xHCI **Reset Endpoint** (bounded retries)
-  instead of disabling input until reboot. Honest limitations: hubs are not
+  instead of disabling input until reboot. Root-port bring-up is a Linux-hub-like
+  state machine (`drivers/xhci_port.rs`, host-tested): a port still in USB2
+  Polling/RxDetect is never reset out of its debounce/training window, a reset is
+  awaited for PRC and PED+U0 up to 500 ms without a second reset, an enable must
+  stay stable before the device is addressed, a lost enable backs off (250 ms–1 s)
+  and is re-observed instead of reset every ~100 ms, and PP is power-cycled only
+  after many failures. The field machine that motivated this (Intel 8086:7a60, 26
+  ports) detected devices but reset them every ~124 ms; real hardware was not
+  available for this change, so it is QEMU evidence and the serial lines to look
+  for are named in `src/drivers/README.md`. Honest limitations: hubs are not
   supported (a device behind one is invisible); report-protocol-only devices are
   best effort (boot keyboard layout assumed, mouse supports the 7-byte 16-bit
   E-Signal layout or 8-bit axes); wheel/pan are decoded but not delivered; keyboard

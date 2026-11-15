@@ -342,6 +342,14 @@ pub mod usb_desc;
 #[path = "../../src/drivers/usb_hid_proto.rs"]
 pub mod usb_hid_proto;
 
+// xHCI root-port reset policy (2.22.7 field fix). `core`-only and self-contained:
+// the port state machine the driver runs for USB2 debounce/training, PRC/PED+U0
+// waits, stability, backoff and the late PP power-cycle. Host tests simulate the
+// field machine's ports (Polling for hundreds of ms, PED glimpses that are lost,
+// permanent failure) because QEMU ports enable instantly and cannot reproduce it.
+#[path = "../../src/drivers/xhci_port.rs"]
+pub mod xhci_port;
+
 
 // ── OpenPGP repository-metadata verification (issue #32) ─────────────────────
 // The pure verifier the `apt` trust chain will use: packet/armor parsing,
@@ -513,6 +521,11 @@ mod properties {
     // execve/exit teardown — every live-task registry (ready, SIGSTOP-parked,
     // pending reap) must block freeing a PML4 another task still runs on.
     mod as_refs;
+    // xHCI port reset policy (2.22.7): the `lost-after-reset` field loop was a
+    // timing bug — a Polling/RxDetect port must be allowed to finish debounce/
+    // training, a reset is waited on for 500 ms, an enable must be stable, and
+    // retries back off. Simulated ports cover what QEMU cannot.
+    mod xhci_port;
     // USB HID boot/report policy + configuration-descriptor walk (2.22.7):
     // transfer length from wMaxPacketSize (never shorter than a packet, so a
     // 7-byte report cannot babble a 4-byte buffer), boot vs report mouse
