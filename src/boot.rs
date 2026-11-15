@@ -809,6 +809,13 @@ fn kernel_main() -> ! {
         "lx-selftest",
     );
 
+    // In-guest apt performance benchmark (cargo feature `lx_apt_bench`).
+    // Spawned as its own thread so it runs after interrupts/DHCP are up, and
+    // separate from `lx_selftest` so the benchmark is not preceded by the whole
+    // Linux-compat suite (which itself writes to /mnt).
+    #[cfg(feature = "lx_apt_bench")]
+    task::scheduler::kernel_thread_spawn_named(crate::selftest_lx::run_apt_bench, "lx-apt-bench");
+
     // Живая проверка полного обновления (cargo feature `lx_livetest`).
     // Спавнится отдельным потоком, чтобы идти после поднятия прерываний/DHCP.
     // Отделён от `lx_selftest`: он ходит на живое зеркало `deb.debian.org`

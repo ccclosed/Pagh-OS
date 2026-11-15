@@ -308,7 +308,7 @@ fn parse_decimal(field: &[u8]) -> Result<usize, DebError> {
 /// moment the running output would exceed this cap, so a hostile member can
 /// never drive unbounded allocation. 64 MiB comfortably covers a real
 /// `data.tar` while staying within kernel memory bounds.
-const MAX_DECOMPRESSED: usize = 64 * 1024 * 1024;
+pub const MAX_DECOMPRESSED: usize = 64 * 1024 * 1024;
 
 /// A higher decompression cap for whole-buffer (non-streaming) decompression.
 ///

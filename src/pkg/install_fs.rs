@@ -89,15 +89,15 @@
 //! (R10.4). Любая другая [`VfsError`] сообщается дословно через [`InstallError::Vfs`].
 #![allow(dead_code)]
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::vfs::{self, VfsError, VfsNode};
 
-use super::install::{descends_through, plan_install, InstallOp, InstallPlan, UnsafeKind};
-use super::tar::TarEntry;
+use super::install::{descends_through, plan_install_meta, MetaOp, MetaPlan, UnsafeKind};
+use super::tar::{TarEntry, TarMeta, TarType};
 
 /// Failure modes of the effectful ext2 install (design component 10).
 #[derive(Debug)]
@@ -160,129 +160,362 @@ impl core::fmt::Display for InstallError {
 /// is returned (R10.4); every failure emits one structured diagnostic (R12.4,
 /// R12.5). Nothing is ever materialized as a copy.
 pub fn install_data_tar(entries: &[TarEntry<'_>], root: &str) -> Result<usize, InstallError> {
-    let plan = plan_install(entries);
+    // W1 (apt-fast): the eager in-memory entry list is now a thin feeder over the
+    // SAME metadata-plan + streaming executor the apt `.deb` path uses. This keeps
+    // one implementation of the ordering/preflight/atomicity rules: the property
+    // and in-QEMU tests that call this function exercise the streaming path.
+    let metas: Vec<TarMeta> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let mut meta = TarMeta::from_entry(entry);
+            meta.index = index;
+            meta
+        })
+        .collect();
+    let plan = plan_install_meta(&metas);
+    let mut install = StreamingInstall::prepare(&plan, root)?;
+    for (index, entry) in entries.iter().enumerate() {
+        install.accept_entry(&metas[index])?;
+        if !entry.content.is_empty() {
+            install.accept_chunk(entry.content)?;
+        }
+    }
+    install.finish()
+}
 
-    // F-x86n-1, layer 1 (pure plan): a member below a symlink this archive creates
-    // would be written wherever that link points. Refuse the whole package before
-    // creating a single inode — a partially installed hostile package is a
-    // confusing state, and the archive has already proven it cannot be trusted.
-    if let Some(m) = plan.unsafe_members.first() {
-        let abs = join_abs(root, &m.path);
-        let reason = match m.kind {
-            UnsafeKind::MemberBelowSymlink => "member path descends through an archive symlink",
-            UnsafeKind::HardlinkTargetBelowSymlink => {
-                "hard-link target descends through an archive symlink"
+/// The buffered-write size used by the streaming installer.
+///
+/// 256 KiB is ext2's 64-block metadata transaction size ([`Ext2File::write`]
+/// commits per 64 data blocks), so one buffered flush is one transaction and one
+/// inode round trip, matching the eager installer's one-shot `write` cost while
+/// keeping the extra resident bytes to a quarter MiB. Smaller flushes would make
+/// the streaming path pay a journal commit per decompressor chunk (8 KiB).
+const STREAM_WRITE_BUFFER: usize = 256 * 1024;
+
+/// A regular file whose content is still streaming in.
+struct CurrentFile {
+    /// Parent directory, kept so a failure can remove the partial file.
+    dir: Arc<dyn VfsNode>,
+    /// Final component within `dir`.
+    filename: String,
+    /// Absolute path for diagnostics.
+    abs: String,
+    /// The freshly created file node.
+    node: Arc<dyn VfsNode>,
+    /// Archive permission bits to apply on completion.
+    mode: u32,
+    /// Content size the plan recorded for this member.
+    expected: u64,
+    /// Bytes already written to the filesystem.
+    written: u64,
+    /// Buffered bytes not yet written.
+    buf: Vec<u8>,
+}
+
+/// The effectful executor of a [`MetaPlan`], fed by a **streaming** tar walk.
+///
+/// This is the W1 replacement for installing a fully materialized `data.tar`:
+///
+///   1. [`StreamingInstall::prepare`] runs the three atomic preflight checks
+///      (F-x86n-1 planner verdict, F-r3-vfs-1 resolved-spelling split,
+///      F-r4-vfs-1 pre-existing redirectors) before any inode exists;
+///   2. [`StreamingInstall::accept_entry`] is called for each [`TarMeta`] in
+///      archive order — a planned regular file starts a buffered writer, a planned
+///      symlink is created, anything the planner dropped is skipped;
+///   3. [`StreamingInstall::accept_chunk`] appends the current file's decompressed
+///      bytes; it flushes in [`STREAM_WRITE_BUFFER`] pieces so peak memory stays
+///      bounded by the metadata plan plus one buffer;
+///   4. [`StreamingInstall::finish`] completes the last file and runs the bounded
+///      hard-link fixpoint, exactly like the eager installer.
+///
+/// Security semantics are unchanged: the plan is validated in full before the
+/// first inode, a member is written only if the plan accepted its archive
+/// ordinal, and the confined resolver (`own_links`/`own_link_inos`) still guards
+/// every write. As in the eager path, a no-space failure removes the partial file
+/// and returns [`InstallError::NoSpace`].
+pub struct StreamingInstall {
+    root: String,
+    /// Symlink spellings this install created (F-x86n-1/F-r3-vfs-1).
+    own_links: BTreeSet<String>,
+    /// Inodes of symlinks this install created (spelling-independent backstop).
+    own_link_inos: BTreeSet<u64>,
+    /// Planned file/symlink operations keyed by their source member ordinal.
+    by_member: BTreeMap<usize, MetaOp>,
+    /// Hard links to attempt after all files/symlinks (plan order preserved).
+    deferred: Vec<(String, String)>,
+    /// The regular file whose content is currently streaming, if any.
+    current: Option<CurrentFile>,
+    /// Operations materialized so far.
+    installed: usize,
+}
+
+impl StreamingInstall {
+    /// Validate `plan` against the tree as it exists now and return an executor.
+    ///
+    /// All three preflight refusals happen here — **before** the caller writes a
+    /// single inode — preserving the installer's atomic-refusal property.
+    pub fn prepare(plan: &MetaPlan, root: &str) -> Result<StreamingInstall, InstallError> {
+        // F-x86n-1, layer 1 (pure plan): a member below a symlink this archive
+        // creates would be written wherever that link points. Refuse the whole
+        // package before creating a single inode.
+        if let Some(m) = plan.unsafe_members.first() {
+            let abs = join_abs(root, &m.path);
+            let reason = match m.kind {
+                UnsafeKind::MemberBelowSymlink => "member path descends through an archive symlink",
+                UnsafeKind::HardlinkTargetBelowSymlink => {
+                    "hard-link target descends through an archive symlink"
+                }
+                UnsafeKind::HardlinkAliasesSymlink => {
+                    "hard link aliases an archive symlink (second name for the link inode)"
+                }
+            };
+            return Err(unsafe_path_with_link(&abs, reason, &m.link));
+        }
+
+        if plan.skipped_unsafe > 0 || plan.skipped_empty_target > 0 {
+            crate::warn!(
+                "Package_Installer: skipped {} path-unsafe and {} empty-target members",
+                plan.skipped_unsafe,
+                plan.skipped_empty_target
+            );
+        }
+
+        // F-r3-vfs-1: a symlink planned at an archive path can be *materialized*
+        // at a different path when a pre-existing in-root redirector is followed
+        // (the planner only knows archive spellings). If a later member is spelled
+        // through the materialized path it would be written through the archive's
+        // own link. Refuse before the first inode, so the refusal stays atomic.
+        refuse_spelling_split(root, plan)?;
+        // F-r4-vfs-1: the same split across packages. A pre-existing link created
+        // by an earlier package cannot be told apart from a provisioned one, so
+        // the only links the resolver may follow are the exact documented pairs.
+        refuse_preexisting_redirectors(root, plan)?;
+
+        let mut by_member: BTreeMap<usize, MetaOp> = BTreeMap::new();
+        let mut deferred: Vec<(String, String)> = Vec::new();
+        for op in plan.ops.iter() {
+            match op {
+                MetaOp::File { member, .. } | MetaOp::Symlink { member, .. } => {
+                    by_member.insert(*member, op.clone());
+                }
+                MetaOp::Hardlink { path, target } => {
+                    deferred.push((path.clone(), target.clone()));
+                }
             }
-            UnsafeKind::HardlinkAliasesSymlink => {
-                "hard link aliases an archive symlink (second name for the link inode)"
-            }
+        }
+        if plan.unresolved.len() > 0 {
+            crate::warn!(
+                "Package_Installer: {} hard link(s) form an unresolvable cycle and will be skipped",
+                plan.unresolved.len()
+            );
+        }
+
+        Ok(StreamingInstall {
+            root: String::from(root),
+            own_links: BTreeSet::new(),
+            own_link_inos: BTreeSet::new(),
+            by_member,
+            deferred,
+            current: None,
+            installed: 0,
+        })
+    }
+
+    /// Handle one member header in archive order. A previous file's stream is
+    /// complete by construction here (the tar walker serializes content), so this
+    /// first finishes it, then starts/creates whatever the plan assigned to this
+    /// member ordinal — or ignores the member when the planner dropped it.
+    pub fn accept_entry(&mut self, meta: &TarMeta) -> Result<(), InstallError> {
+        self.complete_current()?;
+        let Some(op) = self.by_member.get(&meta.index).cloned() else {
+            return Ok(());
         };
-        return Err(unsafe_path_with_link(&abs, reason, &m.link));
-    }
-
-    if plan.skipped_unsafe > 0 || plan.skipped_empty_target > 0 {
-        crate::warn!(
-            "Package_Installer: skipped {} path-unsafe and {} empty-target members",
-            plan.skipped_unsafe,
-            plan.skipped_empty_target
-        );
-    }
-
-    // F-r3-vfs-1: a symlink planned at an archive path can be *materialized* at a
-    // different path when a pre-existing in-root redirector is followed (the
-    // planner only knows archive spellings). If a later member is spelled through
-    // the materialized path it would be written through the archive's own link.
-    // Refuse that package here, before the first inode, so the refusal stays atomic.
-    refuse_spelling_split(root, &plan)?;
-    // F-r4-vfs-1: the same split across packages. A pre-existing link created by
-    // an earlier package cannot be told apart from a provisioned one, so the only
-    // links the resolver may follow are the exact documented pairs. Refuse the
-    // whole package before the first inode.
-    refuse_preexisting_redirectors(root, &plan)?;
-
-    let mut installed = 0usize;
-    // Symlink paths this same install creates. Layer 2 (the effectful resolver)
-    // uses this to refuse any traversal through them even if the plan-level check
-    // were ever bypassed or regressed. F-r3-vfs-1 registers BOTH spellings — the
-    // archive path and the resolved (walked) path — plus the created link inode,
-    // which is spelling-independent.
-    let mut own_links: BTreeSet<String> = BTreeSet::new();
-    // Inodes of symlinks this install created (F-r3-vfs-1): the resolver refuses
-    // to traverse any symlink whose inode is in this set, so a spelling the
-    // string set does not know (a pre-existing redirector in the parent chain)
-    // cannot be used to walk through a link the archive just planted.
-    let mut own_link_inos: BTreeSet<u64> = BTreeSet::new();
-
-    // Hard links needing a target that this archive does not create (or that was
-    // created later in the plan): retried after the first pass.
-    let mut deferred: Vec<&InstallOp<'_>> = Vec::new();
-
-    for op in plan.ops.iter() {
         match op {
-            InstallOp::File {
-                path,
-                content,
-                mode,
-            } => {
-                install_one(root, path, content, *mode, &own_links, &own_link_inos)?;
-                installed += 1;
+            MetaOp::File {
+                path, mode, size, ..
+            } if meta.kind == TarType::Regular => self.begin_file(&path, mode, size),
+            MetaOp::Symlink { path, target, .. } if meta.kind == TarType::Symlink => {
+                install_symlink(
+                    &self.root,
+                    &path,
+                    &target,
+                    &mut self.own_links,
+                    &mut self.own_link_inos,
+                )?;
+                self.installed += 1;
+                Ok(())
             }
-            InstallOp::Symlink { path, target } => {
-                install_symlink(root, path, target, &mut own_links, &mut own_link_inos)?;
-                installed += 1;
+            // A kind mismatch cannot happen for a plan built from this same
+            // stream; if it ever did, skipping is the safe outcome (never write
+            // content the plan did not accept for that ordinal).
+            _ => Ok(()),
+        }
+    }
+
+    /// Append decompressed content for the current regular file (no-op when the
+    /// current member was skipped, e.g. a file blocked by a directory).
+    pub fn accept_chunk(&mut self, chunk: &[u8]) -> Result<(), InstallError> {
+        let Some(current) = self.current.as_mut() else {
+            return Ok(());
+        };
+        let mut rest = chunk;
+        while !rest.is_empty() {
+            let room = STREAM_WRITE_BUFFER - current.buf.len();
+            let take = core::cmp::min(room, rest.len());
+            current.buf.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if current.buf.len() == STREAM_WRITE_BUFFER {
+                flush_current_file(current)?;
             }
-            InstallOp::Hardlink { path, target } => {
-                match install_hardlink(root, path, target, &mut own_links, &mut own_link_inos) {
-                    Ok(()) => installed += 1,
-                    // The target is not on the tree yet: a later member (or an
-                    // earlier package) may still provide it.
-                    Err(HardlinkOutcome::Missing) => deferred.push(op),
+        }
+        Ok(())
+    }
+
+    /// Complete the install: finish the last file, then create deferred hard
+    /// links (bounded fixpoint) and warn about any that never found a target.
+    pub fn finish(mut self) -> Result<usize, InstallError> {
+        self.complete_current()?;
+        let mut deferred = core::mem::take(&mut self.deferred);
+        loop {
+            if deferred.is_empty() {
+                break;
+            }
+            let mut progressed = false;
+            let mut remaining: Vec<(String, String)> = Vec::new();
+            for (path, target) in deferred {
+                match install_hardlink(
+                    &self.root,
+                    &path,
+                    &target,
+                    &mut self.own_links,
+                    &mut self.own_link_inos,
+                ) {
+                    Ok(()) => {
+                        self.installed += 1;
+                        progressed = true;
+                    }
+                    Err(HardlinkOutcome::Missing) => remaining.push((path, target)),
                     Err(HardlinkOutcome::Failed(e)) => return Err(e),
                 }
             }
-        }
-    }
-
-    // Bounded fixpoint over the deferred hard links: each pass must create at
-    // least one, otherwise the rest can never resolve.
-    loop {
-        if deferred.is_empty() {
-            break;
-        }
-        let mut progressed = false;
-        let mut remaining: Vec<&InstallOp<'_>> = Vec::new();
-        for op in deferred {
-            let InstallOp::Hardlink { path, target } = op else {
-                continue;
-            };
-            match install_hardlink(root, path, target, &mut own_links, &mut own_link_inos) {
-                Ok(()) => {
-                    installed += 1;
-                    progressed = true;
-                }
-                Err(HardlinkOutcome::Missing) => remaining.push(op),
-                Err(HardlinkOutcome::Failed(e)) => return Err(e),
+            deferred = remaining;
+            if !progressed {
+                break;
             }
         }
-        deferred = remaining;
-        if !progressed {
-            break;
-        }
-    }
-
-    // One diagnostic per hard link that never found its target. It is skipped —
-    // turning it into a copy is exactly what issue #18 removed.
-    for op in deferred {
-        if let InstallOp::Hardlink { path, target } = op {
+        // One diagnostic per hard link that never found its target. It is
+        // skipped — turning it into a copy is exactly what issue #18 removed.
+        for (path, target) in deferred {
             crate::warn!(
                 "Package_Installer: hard link '{}' -> '{}' skipped (target missing after all passes)",
                 path,
                 target
             );
         }
+        Ok(self.installed)
     }
 
-    Ok(installed)
+    /// Create (or replace) the destination and start a buffered writer for it.
+    fn begin_file(&mut self, rel: &str, mode: u32, expected: u64) -> Result<(), InstallError> {
+        let abs = join_abs(&self.root, rel);
+        let (dir, filename, _resolved_dir) =
+            resolve_parent(&self.root, rel, &abs, &self.own_links, &self.own_link_inos)?;
+        // R10.7: replace an existing entry so the stored size matches the new
+        // content exactly (ext2 `write_file` only grows `i_size`).
+        match dir.lookup(filename) {
+            Ok(existing) => {
+                if existing.is_directory() {
+                    crate::warn!(
+                        "Package_Installer: file '{}' skipped (a directory is in the way)",
+                        abs
+                    );
+                    return Ok(());
+                }
+                if let Err(e) = dir.remove(filename) {
+                    return Err(vfs_err("replace", &abs, e));
+                }
+            }
+            Err(VfsError::NotFound) => {}
+            Err(e) => return Err(vfs_err("create", &abs, e)),
+        }
+        let node: Arc<dyn VfsNode> = match dir.create_file(filename) {
+            Ok(n) => n,
+            Err(VfsError::IoError) => return Err(no_space("create", &abs)),
+            Err(e) => return Err(vfs_err("create", &abs, e)),
+        };
+        self.current = Some(CurrentFile {
+            dir,
+            filename: String::from(filename),
+            abs,
+            node,
+            mode,
+            expected,
+            written: 0,
+            buf: Vec::with_capacity(STREAM_WRITE_BUFFER),
+        });
+        Ok(())
+    }
+
+    /// Flush the buffered tail of the current file, check the declared size,
+    /// apply the archive mode and count the operation.
+    fn complete_current(&mut self) -> Result<(), InstallError> {
+        let Some(mut current) = self.current.take() else {
+            return Ok(());
+        };
+        flush_current_file(&mut current)?;
+        if current.written != current.expected {
+            // The tar walker forwards exactly the declared content, so a mismatch
+            // means the stream and the plan disagreed: never leave a truncated
+            // file behind (R10.3/R10.4).
+            let _ = current.dir.remove(&current.filename);
+            return Err(vfs_err("write", &current.abs, VfsError::InvalidArgument));
+        }
+        // Preserve the archive's permission bits (see `install_one`).
+        let perms = current.mode & 0o7777;
+        if perms != 0 {
+            if let Err(e) = current.node.set_mode(perms) {
+                crate::warn!(
+                    "Package_Installer: could not apply mode {:04o} to '{}': {:?}",
+                    perms,
+                    current.abs,
+                    e
+                );
+            }
+        }
+        self.installed += 1;
+        Ok(())
+    }
+}
+
+/// Write the buffered bytes of `current` at its current offset, mapping a short
+/// write / `IoError` to [`InstallError::NoSpace`] and removing the partial file.
+fn flush_current_file(current: &mut CurrentFile) -> Result<(), InstallError> {
+    if current.buf.is_empty() {
+        return Ok(());
+    }
+    let len = current.buf.len() as u64;
+    match current.node.write(current.written, &current.buf) {
+        Ok(written) if written as u64 == len => {
+            current.written += len;
+            current.buf.clear();
+            Ok(())
+        }
+        // A short write without an explicit error still means the full content did
+        // not land (most plausibly an exhausted bitmap) → no-space + cleanup.
+        Ok(_) => {
+            let _ = current.dir.remove(&current.filename);
+            Err(no_space("write", &current.abs))
+        }
+        Err(VfsError::IoError) => {
+            let _ = current.dir.remove(&current.filename);
+            Err(no_space("write", &current.abs))
+        }
+        Err(e) => {
+            let _ = current.dir.remove(&current.filename);
+            Err(vfs_err("write", &current.abs, e))
+        }
+    }
 }
 
 /// F-r3-vfs-1 preflight — refuse a package whose planned symlink would be
@@ -304,21 +537,21 @@ pub fn install_data_tar(entries: &[TarEntry<'_>], root: &str) -> Result<usize, I
 /// when that resolution succeeds without creating anything: a parent the archive
 /// creates itself cannot be a pre-existing redirector, and members below an
 /// archive-created link are already refused by the planner.
-fn refuse_spelling_split(root: &str, plan: &InstallPlan<'_>) -> Result<(), InstallError> {
+fn refuse_spelling_split(root: &str, plan: &MetaPlan) -> Result<(), InstallError> {
     // Every path this plan would materialize, hard links included.
     let mut members: Vec<&str> = Vec::new();
     for op in plan.ops.iter() {
         match op {
-            InstallOp::File { path, .. }
-            | InstallOp::Symlink { path, .. }
-            | InstallOp::Hardlink { path, .. } => members.push(path.as_str()),
+            MetaOp::File { path, .. }
+            | MetaOp::Symlink { path, .. }
+            | MetaOp::Hardlink { path, .. } => members.push(path.as_str()),
         }
     }
     let no_links: BTreeSet<String> = BTreeSet::new();
     let no_inos: BTreeSet<u64> = BTreeSet::new();
 
     for op in plan.ops.iter() {
-        let InstallOp::Symlink { path, .. } = op else {
+        let MetaOp::Symlink { path, .. } = op else {
             continue;
         };
         let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
@@ -370,14 +603,14 @@ fn refuse_spelling_split(root: &str, plan: &InstallPlan<'_>) -> Result<(), Insta
 /// ещё не существующим каталогом быть не может. `Unsafe` возвращается сразу,
 /// поэтому отказ атомарный; прочие ошибки игнорируются — их сообщит настоящая
 /// установка с точным путём.
-fn refuse_preexisting_redirectors(root: &str, plan: &InstallPlan<'_>) -> Result<(), InstallError> {
+fn refuse_preexisting_redirectors(root: &str, plan: &MetaPlan) -> Result<(), InstallError> {
     let no_links: BTreeSet<String> = BTreeSet::new();
     let no_inos: BTreeSet<u64> = BTreeSet::new();
     let mut paths: Vec<&str> = Vec::with_capacity(plan.ops.len());
     for op in plan.ops.iter() {
         match op {
-            InstallOp::File { path, .. } | InstallOp::Symlink { path, .. } => paths.push(path),
-            InstallOp::Hardlink { path, target } => {
+            MetaOp::File { path, .. } | MetaOp::Symlink { path, .. } => paths.push(path),
+            MetaOp::Hardlink { path, target } => {
                 paths.push(path);
                 paths.push(target);
             }

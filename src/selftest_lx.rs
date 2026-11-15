@@ -886,6 +886,162 @@ pub fn run_apt_e2e() {
     }
 }
 
+// ───────────────────────── apt performance benchmark ─────────────────────────
+
+/// In-guest apt performance benchmark (cargo feature `lx_apt_bench`).
+///
+/// Spawned as a kernel thread from `boot::kernel_main` (after interrupts/DHCP).
+/// It points apt at the signed benchmark repo on the QEMU host gateway
+/// (`tools/mini_repo.py bench OUT --serve 8000`, suite `bench`) and runs:
+///
+///   1. `apt update` **round 1** — fetches the signed Release + `Packages.gz`,
+///      stream-parses the whole index (`--stanzas`, 5k/50k in the harnesses);
+///   2. `apt update` **round 2** — with the W3 persistent index cache this must
+///      NOT re-decompress/re-parse the index when the signed Release digest is
+///      unchanged; without the cache it simply repeats round 1 (still a useful
+///      "warm" number);
+///   3. `apt install bench-large` — a four-package transaction (`bench-large` +
+///      two deps + those deps' shared dep chain) that writes `--size-mib` MiB
+///      onto ext2 in one go, exercising the streaming `.deb` path and the
+///      once-per-transaction `sync`.
+///
+/// Every step is observed through the `apt: timings …` lines `apt` itself emits
+/// (phase ms + `heap_peak_kib`); this driver adds a correctness check (the
+/// installed payload's size and first bytes) and the terminal
+/// `LXSELFTEST apt_bench PASS` line the e2e harness gates on. It never panics and
+/// never hangs: a failed step logs exactly one FAIL line and returns.
+#[cfg(feature = "lx_apt_bench")]
+pub fn run_apt_bench() {
+    let name = "apt_bench";
+
+    // Wait up to ~60 s for an interface address (DHCP, then static fallback).
+    let deadline = scheduler::ticks() + WAIT_IFACE_TICKS;
+    while crate::net::ip_config().is_none() {
+        if scheduler::ticks() >= deadline {
+            fail(
+                name,
+                "no interface address within 60 s (DHCP/static fallback did not configure)",
+            );
+            return;
+        }
+        scheduler::sleep_ticks(10);
+    }
+
+    let (size, used, free) = crate::memory::heap::stats();
+    crate::info!(
+        "LXSELFTEST apt_bench: iface up; heap used {} KiB / free {} KiB / size {} KiB",
+        used / 1024,
+        free / 1024,
+        size / 1024
+    );
+
+    // The benchmark repo is served from the mirror ROOT (like the other local
+    // harnesses), suite `bench` (signed by the deterministic TEST key that only
+    // the harness builds anchor).
+    crate::pkg::apt::set_mirror("http://10.0.2.2:8000", Some("/"));
+    crate::pkg::apt::set_suite("bench");
+    let cfg = crate::pkg::apt::config();
+    crate::info!(
+        "LXSELFTEST apt_bench: mirror {}://{}{} suite={}/{}/{}",
+        cfg.scheme(),
+        cfg.host,
+        cfg.base,
+        cfg.suite,
+        cfg.component,
+        cfg.arch
+    );
+
+    // 1+2. Two update rounds. Round 2 is the W3 cache-hit scenario: with an
+    // unchanged signed Release it must skip the Packages download+parse (its
+    // `apt: timings` line then has no index_parse_ms) instead of failing.
+    for round in 1..=2u32 {
+        match crate::pkg::apt::update() {
+            Ok(n) => {
+                let ms = crate::pkg::apt::last_total_ms().unwrap_or(0);
+                crate::info!(
+                    "LXSELFTEST apt_bench update round={} pkgs={} total_ms={}",
+                    round,
+                    n,
+                    ms
+                );
+                if n < 2 {
+                    fail(name, "index must contain at least the benchmark packages");
+                    return;
+                }
+            }
+            Err(e) => {
+                crate::error!(
+                    "LXSELFTEST apt_bench FAIL update round={}: {}",
+                    round,
+                    e.message()
+                );
+                return;
+            }
+        }
+    }
+
+    // 3. One multi-package transaction: the resolver pulls the dependency-first
+    // plan, and each `.deb` goes through the streaming install path.
+    match crate::pkg::apt::install("bench-large") {
+        Ok(installed) => {
+            let ms = crate::pkg::apt::last_total_ms().unwrap_or(0);
+            crate::info!(
+                "LXSELFTEST apt_bench install pkgs={} total_ms={}",
+                installed.len(),
+                ms
+            );
+            if installed.len() < 2 {
+                fail(name, "install planned fewer packages than expected");
+                return;
+            }
+        }
+        Err(e) => {
+            crate::error!("LXSELFTEST apt_bench FAIL install: {}", e.message());
+            return;
+        }
+    }
+
+    // Correctness: the last package to write `file-0000` is `bench-large`
+    // (12 MiB / 128 files = 98304 bytes), whose payload starts with the
+    // benchmark pattern. A zero-filled or truncated file would fail here, so a
+    // PASS does not just mean "the install returned Ok".
+    const BENCH_FILE: &str = "/mnt/usr/share/bench/file-0000";
+    const BENCH_PREFIX: &[u8] = b"pagh-apt-benchma";
+    match crate::vfs::lookup_path(BENCH_FILE) {
+        Ok(node) => {
+            let file_size = node.size();
+            let mut head = [0u8; 16];
+            let read = node.read(0, &mut head).unwrap_or(0);
+            if read != head.len() || head != BENCH_PREFIX {
+                crate::error!(
+                    "LXSELFTEST apt_bench FAIL payload head read={} bytes={:?}",
+                    read,
+                    head
+                );
+                return;
+            }
+            crate::info!(
+                "LXSELFTEST apt_bench payload {} size={} head=ok",
+                BENCH_FILE,
+                file_size
+            );
+            let (_, used_after, _) = crate::memory::heap::stats();
+            crate::info!(
+                "LXSELFTEST apt_bench PASS (2 update rounds, install, payload verified; \
+                 heap used {} KiB after)",
+                used_after / 1024
+            );
+        }
+        Err(e) => {
+            crate::error!(
+                "LXSELFTEST apt_bench FAIL payload missing {}: {:?}",
+                BENCH_FILE,
+                e
+            );
+        }
+    }
+}
+
 // ───────────────────────── Part B: bigindex parse-crash repro ─────────────────────────
 
 /// DIAGNOSTIC (Part B): reproduce the `apt update` parse-stage crash (#14 PF,

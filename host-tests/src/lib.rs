@@ -574,6 +574,17 @@ mod properties {
     // (issue #18, contract `EXT2-LINKS.md` §5): `'1'` vs `'2'`, GNU `'L'`/`'K'`,
     // ustar `prefix`, pax records, and the hard-link ordering rules.
     mod tar_links;
+    // apt-fast W1: the incremental `TarWalker`/`scan_tar_meta` path must agree
+    // with `read_tar` at every chunk boundary and on every fixture, and the
+    // metadata plan must equal the eager plan (operations, order,
+    // deferred/unresolved, atomic-refusal counters). Also covers truncation,
+    // oversized extensions and byte-level panic-freedom.
+    mod tar_stream;
+    // apt-fast W3: the compact/versioned `PackageIndex` encoding behind the
+    // persistent index cache — lossless round-trip through the production
+    // streaming builder, strict structural validation (magic/version/lengths/
+    // StrRef ranges/no trailing bytes) and byte-level panic-freedom.
+    mod apt_index_cache;
     // OpenPGP repository-metadata verification (issue #32), contract
     // OPENPGP-VERIFY-CONTRACT.md §2/§3/§7.
     //   P51 — armor/packet framing: bounded, panic-free parsing of hostile bytes.

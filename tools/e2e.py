@@ -131,6 +131,11 @@ MODE_DEFAULTS = {
     "local-mirror": {"timeout": 240.0, "serial": "serial_e2e.log"},
     "live-update": {"timeout": 1200.0, "serial": "serial_live.log"},
     "bigindex": {"timeout": 300.0, "serial": "serial_bigindex.log"},
+    # apt performance benchmark (apt-fast): build a signed local benchmark repo
+    # (5k/50k stanzas + a multi-package 24 MiB install), boot `lx_apt_bench`, and
+    # read the `apt: timings` phase lines. Generous timeout: the 50k index parse
+    # and the ext2 writes both run under TCG.
+    "bench": {"timeout": 900.0, "serial": "serial_bench.log"},
     "shell": {"timeout": 180.0, "serial": "serial_shell.log"},
     # USB input: boot (menu appears once init_fs runs) + drive + shell + `usb`.
     # The waits are generous on purpose: this runs under TCG, and a timeout is a
@@ -148,6 +153,7 @@ MODE_REQUIRED_FEATURES = {
     "local-mirror": ["lx_selftest"],
     "live-update": ["lx_livetest"],
     "bigindex": ["lx_bigindex"],
+    "bench": ["lx_apt_bench"],
 }
 
 # Default evidence filters per mode (the `[WATCHDOG]`/`[DIAG]`/`LXSELFTEST`/`[EXC #N]`
@@ -165,6 +171,10 @@ MODE_EVIDENCE = {
     ),
     "bigindex": (
         r"apt:|BIGINDEX|LXSELFTEST bigindex|EXC #\d+|PAGE FAULT|RIP=",
+    ),
+    "bench": (
+        r"apt: timings|LXSELFTEST apt_bench|apt: \[\d+/\d+\] Unpacked|EXC #\d+|"
+        r"PAGE FAULT|RIP=",
     ),
     "shell": (
         r"SELFTEST|LXSELFTEST|EXC #|FAIL|PASS|hello|apt:|pagh:/>",
@@ -1485,9 +1495,13 @@ class Harness:
             warn("--keep-artifacts: the feature ELF is left in place; "
                  "run 'python3 tools/e2e.py restore' to put the default ELF back")
 
-    def mirror_start(self, args: list[str], port: int) -> None:
+    def mirror_start(self, args: list[str], port: int,
+                     ready_path: str | None = None) -> None:
         self.mirror = Mirror(args, port, self.mirror_out)
-        self.mirror.start()
+        if ready_path is None:
+            self.mirror.start()
+        else:
+            self.mirror.start(ready_path=ready_path)
 
 
 # ───────────────────────── modes ─────────────────────────
@@ -1605,6 +1619,103 @@ def mode_local_mirror(h: Harness) -> tuple[str, int]:
     ok &= h.check("installed static binary ran ('hello from apt')", "hello from apt" in text)
     ok &= h.check("no FAIL marker on serial",
                   not re.search(r"LXSELFTEST apt_e2e FAIL", text))
+    for extra in h.extra_evidence:
+        found_extra = re.search(extra, text)
+        h.check(f"extra marker /{extra}/ (best effort)", bool(found_extra),
+                found_extra.group(0).strip() if found_extra else "not observed")
+    return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
+
+
+def mode_bench(h: Harness) -> tuple[str, int]:
+    """apt performance benchmark (`lx_apt_bench`): signed local benchmark repo,
+    in-guest two `apt update` rounds + one multi-package `apt install`.
+
+    The mode itself is the **after** regression gate: it requires the streaming
+    install to keep `heap_peak_kib` for the large package below
+    `--max-heap-kib` (0 disables the bound, for baseline measurements), and it
+    asserts the exact `apt: timings` phase-line surface exists. The before/after
+    numeric comparison lives in the task report; the harness preserves every
+    timings line in the serial log this mode prints.
+    """
+    a = h.a
+    cache_root = pathlib.Path(CACHE)
+    out = (pathlib.Path(a.bench_out) if a.bench_out
+           else cache_root / f"apt_bench_{a.stanzas}_{a.size_mib}")
+    out = out.resolve()
+    if a.bench_out:
+        if not str(out).startswith(str(cache_root.resolve())):
+            raise SetupError(f"--bench-out must live under {cache_root}: {out}")
+    # Rebuild from scratch so a stale signed index can never be measured.
+    if out.exists():
+        shutil.rmtree(out)
+    run_checked(
+        [sys.executable, str(TOOLS / "mini_repo.py"), "bench", str(out),
+         "--stanzas", str(a.stanzas), "--size-mib", str(a.size_mib)],
+        "mini_repo bench",
+    )
+
+    h.boot()
+    assert h.guest is not None
+    h.mirror_start(["serve-dir", str(out), str(a.port)], a.port,
+                   ready_path="/dists/bench/main/binary-amd64/Packages.gz")
+
+    def on_tick(text: str) -> None:
+        last = re.findall(r"apt: (?:reading package lists[^\r\n]*|index ready[^\r\n]*)", text)
+        if last:
+            log(f"... {last[-1]}")
+
+    found = wait_for(h.guest, [r"LXSELFTEST apt_bench (?:PASS|FAIL)"], h.timeout,
+                     on_tick=on_tick, label="apt_bench verdict")
+    text = h.guest.serial()
+
+    timings = re.findall(r"apt: timings cmd=(\w+)[^\r\n]*", text)
+    full_lines = re.findall(r"apt: timings cmd=\w+[^\r\n]*", text)
+    for line in full_lines:
+        log(f"timing: {line}")
+    update_lines = [l for l in full_lines if "cmd=update" in l]
+    install_lines = [l for l in full_lines if "cmd=install" in l]
+    round_markers = re.findall(
+        r"LXSELFTEST apt_bench update round=(\d+) pkgs=(\d+) total_ms=(\d+)", text)
+    install_marker = re.search(
+        r"LXSELFTEST apt_bench install pkgs=(\d+) total_ms=(\d+)", text)
+    payload = regex_first(r"LXSELFTEST apt_bench payload [^\r\n]*", text)
+    install_line = install_lines[-1] if install_lines else ""
+    heap_m = re.search(r"heap_peak_kib=(\d+)", install_line)
+    files_m = re.search(r"files=(\d+)", install_line)
+    heap_kib = int(heap_m.group(1)) if heap_m else -1
+    files = int(files_m.group(1)) if files_m else 0
+
+    h.metrics["stanzas"] = a.stanzas
+    h.metrics["size MiB"] = a.size_mib
+    h.metrics["update rounds"] = len(update_lines)
+    h.metrics["install pkgs"] = install_marker.group(1) if install_marker else "n/a"
+    h.metrics["install files"] = files
+    h.metrics["install heap KiB"] = heap_kib
+    h.metrics["install line"] = install_line
+    for m in round_markers:
+        h.metrics[f"update r{m[0]} pkgs"] = m[1]
+        h.metrics[f"update r{m[0]} ms"] = m[2]
+
+    ok = h.check("apt_bench verdict marker reached", bool(found),
+                 regex_first(r"LXSELFTEST apt_bench (?:PASS|FAIL)[^\r\n]*", text)
+                 or "timeout")
+    ok &= h.check("apt_bench PASS", bool(re.search(r"LXSELFTEST apt_bench PASS", text)),
+                  regex_first(r"LXSELFTEST apt_bench PASS[^\r\n]*", text) or "no PASS line")
+    ok &= h.check("two apt: timings update phase lines", len(update_lines) >= 2,
+                  f"{len(update_lines)} update timing line(s)")
+    ok &= h.check("one apt: timings install phase line", bool(install_lines), install_line)
+    ok &= h.check("install timing carries phase fields & heap_peak_kib",
+                  heap_kib >= 0 and files > 0, install_line)
+    ok &= h.check("install payload verified in guest", bool(payload), payload or "")
+    ok &= h.check("install planned the multi-package transaction",
+                  bool(install_marker) and int(install_marker.group(1)) >= 2,
+                  install_marker.group(0) if install_marker else "no marker")
+    if a.max_heap_kib > 0:
+        ok &= h.check(f"install heap_peak_kib <= {a.max_heap_kib} (streaming bound)",
+                      heap_kib >= 0 and heap_kib <= a.max_heap_kib,
+                      f"heap_peak_kib={heap_kib}")
+    ok &= h.check("no FAIL marker on serial",
+                  not re.search(r"LXSELFTEST apt_bench FAIL", text))
     for extra in h.extra_evidence:
         found_extra = re.search(extra, text)
         h.check(f"extra marker /{extra}/ (best effort)", bool(found_extra),
@@ -2738,6 +2849,7 @@ MODES = {
     "local-mirror": mode_local_mirror,
     "live-update": mode_live_update,
     "bigindex": mode_bigindex,
+    "bench": mode_bench,
     "shell": mode_shell,
     "tcp-shot": mode_tcp_shot,
     "usb": mode_usb,
@@ -2857,6 +2969,21 @@ def build_parser() -> argparse.ArgumentParser:
                          "BIGINDEX_MIN_STANZAS); the verdict is then NOT #17 evidence")
     bi.add_argument("--expect-crash", action="store_true",
                     help="invert the verdict: PASS iff [EXC #14] is reproduced")
+
+    bn = sub.add_parser("bench", parents=[common],
+                        help="apt performance benchmark: signed local bench repo, "
+                             "two `apt update` rounds + one multi-package install "
+                             "(`lx_apt_bench`)")
+    bn.add_argument("--stanzas", type=int, default=5000,
+                    help="Packages stanzas in the benchmark index (5k/50k)")
+    bn.add_argument("--size-mib", type=int, default=24,
+                    help="total decompressed .deb payload installed in the transaction")
+    bn.add_argument("--port", type=int, default=8000)
+    bn.add_argument("--bench-out", default=None,
+                    help="benchmark repo directory (default .cache/apt_bench_<stanzas>_<mib>)")
+    bn.add_argument("--max-heap-kib", type=int, default=16384,
+                    help="fail if the install's heap_peak_kib exceeds this (0 = no bound, "
+                         "for baseline measurements)")
 
     sh = sub.add_parser("shell", parents=[common],
                         help="generic interactive mode: type shell commands, assert on serial")
