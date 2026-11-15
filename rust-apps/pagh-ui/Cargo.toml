@@ -1,0 +1,26 @@
+[package]
+name = "pagh-ui"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Pagh desktop B UI toolkit: widgets, theme, headless RGBA renderer, protocol client"
+
+# Отдельный workspace: корневой workspace репозитория собирает bare-metal ядро
+# под кастомный target и с -Zbuild-std (см. корневой .cargo/config.toml), а
+# пользовательские приложения собираются под хост (тесты) и статический musl.
+[workspace]
+
+[lib]
+name = "pagh_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pagh-ui-gallery"
+path = "src/bin/gallery.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+strip = true

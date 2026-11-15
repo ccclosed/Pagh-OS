@@ -1,0 +1,27 @@
+[package]
+name = "pagh-files"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Files — файловый менеджер рабочего стола Pagh (клиент Pagh desktop B)"
+
+# Отдельный workspace: см. комментарий в rust-apps/pagh-ui/Cargo.toml.
+[workspace]
+
+[lib]
+name = "pagh_files"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pagh-files"
+path = "src/main.rs"
+
+[dependencies]
+pagh-ui = { path = "../pagh-ui" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+strip = true
