@@ -20,6 +20,8 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
 |---|---|
 | `mod.rs` | Ядро VFS: трейт `VfsNode`, `VfsError`, `FsStat`, резолв путей (`lookup_path`), монтирование (`mount_at`/`MountNode`), синтетический `/dev` (`NullDevice`, `SerialDevice`, `DevDirectory`), корень (`RootDirectory`), `init()` |
 | `ramfs.rs` | In-memory ФС для `/tmp`; единственная in-memory-ФС с настоящими `create_dir`/`create_file`/`remove` (на диске то же умеет ext2-каталог под `/mnt`) |
+| `memfd.rs` | `memfd_create`-узел: анонимный файл, чьи страницы — кадры PMM в карте `page_index -> phys`. `read`/`write`/`truncate` и `mmap(MAP_SHARED)` видят одни байты; файл держит pin-ссылку кэша, отображения — свои (`SHARED_BIT`), поэтому `munmap`/exit/fork не вырывают страницы из-под живого отображения. Kernel-only |
+| `desktop_dev.rs` | Символьные устройства desktop-варианта B: `/dev/fb0` (`FramebufferDevice`, `fb_info`/`is_fbdev`) и `/dev/input/event0` (`EventDevice`, `is_evdev`) + `DeviceDirectory` для `/dev/input`. Реальная работа (ioctl/mmap/read/poll) — в syscall-слое |
 | `procfs.rs` | Синтетический `/proc`: узлы `ProcDir`/`ProcFile`, ленивый рендер текста на `size()`/`read()`, источники — PMM/heap/тики/счётчики планировщика/`CompatState`/CPUID. `DirKind::TaskDir(tgid)` листает живые треды группы из `compat::thread_group_pids`, узел `task/<tid>` — это `pid_dir(tid)`. Kernel-only |
 | `procfs_format.rs` | Чистое (`core`+`alloc`) форматирование текстов procfs (включая `/proc/version`, `/proc/filesystems`, `/proc/loadavg`, `/proc/sys/kernel/*`, `fdinfo` и `limits`), таблица путей и inode'ов (`pid_task_dir_ino`) — включается в host-tests (свойства `procfs_*`) |
 | `elf.rs` | Эффектный загрузчик ELF64: `ElfLoader::load` (нативный `ET_EXEC`), `ElfLoader::load_linux` (`ET_EXEC`, static-PIE `ET_DYN` и glibc-dynamic образы — `PT_INTERP` подшивается отдельно через `map_interpreter`), `ElfLoader::map_interpreter`; `ElfProcess` |
@@ -34,6 +36,8 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
   `read/write/truncate/readdir/create_dir/create_file/remove/create_symlink/link` →
   `Err(NotSupported)`, `lookup` → `Err(NotFound)`, `fs_stat` → `None`, `size`/`fs_ino` → `0`,
   `is_symlink` → `false`, `read_link` → `None`, `nlink` → `1`, `sync` → no-op.
+  Desktop-устройства добавляют `fb_info()`/`is_fbdev()`/`is_evdev()`/`shared_page()`/
+  `is_memfd()` (все с дефолтами `None`/`false`; `MountNode` форвардит).
 - `init()`, `mount_at(path, node)`, `lookup_path(path)` (одношаговый, **не** следует за ссылкой),
   `lookup_path_walk(path, follow_final)` (обход с переходом по ссылкам → `link_walk::WalkError`)
   и `lookup_path_walk_checked(path, follow_final, may_search)` — тот же обход с предикатом

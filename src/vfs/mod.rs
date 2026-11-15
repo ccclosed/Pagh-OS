@@ -1,6 +1,8 @@
 // vfs/mod.rs — виртуальная файловая система: трейт VfsNode, /dev/null, /dev/serial
 // 64-битное ядро ОС x86_64 на Rust (#![no_std])
 
+/// Символьные устройства варианта B: `/dev/fb0` и `/dev/input/event0`.
+pub mod desktop_dev;
 pub mod elf;
 /// Чистый `core`-only классификатор ELF + выбор bias для static-PIE
 /// (host-тестируемо, R11.6). Отделён от `elf`, чтобы не тянуть зависимости ядра и
@@ -10,6 +12,8 @@ pub mod elf_classify;
 /// стек `..`, относительные/абсолютные цели ссылок, бюджет `SYMLOOP_MAX`.
 /// Адаптер ниже подаёт ему хендлы `Arc<dyn VfsNode>`.
 pub mod link_walk;
+/// `memfd_create`: анонимный файл с общими страницами для `mmap(MAP_SHARED)`.
+pub mod memfd;
 /// Синтетический `/proc`: узлы, ленивый рендер, per-pid и per-thread view.
 pub mod procfs;
 /// Чистый (`core`+`alloc`) рендеринг текста + таблица путей/inode для
@@ -195,6 +199,47 @@ pub trait VfsNode: Send + Sync {
     /// Сбрасывает буферизованное состояние на стабильный носитель. По умолчанию
     /// no-op.
     fn sync(&self) {}
+
+    // ── символьные устройства варианта B (desktop) ─────────────────────────
+    //
+    // Трейт описывает и обычные файлы, и устройства, поэтому device-specific
+    // ответы — это дефолтные `None`/`false`: ext2/ramfs/proc о них не знают, а
+    // syscall-слой (open/mmap/ioctl/read/poll) ветвится по ним. Сами узлы живут
+    // в [`desktop_dev`]; здесь только контракт, чтобы `VfsNode` оставался
+    // единственной точкой, через которую syscall-слой видит открытый объект.
+
+    /// Геометрия Limine-фреймбуфера, если узел — `/dev/fb0`.
+    fn fb_info(&self) -> Option<crate::drivers::framebuffer::FbInfo> {
+        None
+    }
+
+    /// Является ли узел `/dev/fb0` (даже если фреймбуфер не поднялся —
+    /// `open(2)` должен вернуть `ENODEV`, а не открыть обычный «файл»).
+    fn is_fbdev(&self) -> bool {
+        false
+    }
+
+    /// Является ли узел `/dev/input/event0` (read/poll идут через очередь
+    /// [`crate::drivers::evdev`], а не через байтовое смещение файла).
+    fn is_evdev(&self) -> bool {
+        false
+    }
+
+    /// Кадр страницы `index` файла для `mmap(MAP_SHARED)`, либо `None`, если
+    /// узел не поддерживает общие страницы (тогда `MAP_SHARED` — `EINVAL`).
+    ///
+    /// Возвращённый кадр пинится самим файлом; вызывающий обязан добавить
+    /// ссылку отображения (`pmm::cow_ref`) и пометить лист `SHARED_BIT`.
+    fn shared_page(&self, _index: u64) -> Option<u64> {
+        None
+    }
+
+    /// Является ли узел `memfd` (единственный файловый тип с общими
+    /// страницами). `MAP_SHARED` на обычном файле отвергается, а не
+    /// превращается в приватную копию.
+    fn is_memfd(&self) -> bool {
+        false
+    }
 }
 
 // ─── /dev/null ────────────────────────────────────────────────────────────
@@ -365,6 +410,21 @@ impl VfsNode for MountNode {
     fn sync(&self) {
         self.inner.sync()
     }
+    fn fb_info(&self) -> Option<crate::drivers::framebuffer::FbInfo> {
+        self.inner.fb_info()
+    }
+    fn is_fbdev(&self) -> bool {
+        self.inner.is_fbdev()
+    }
+    fn is_evdev(&self) -> bool {
+        self.inner.is_evdev()
+    }
+    fn shared_page(&self, index: u64) -> Option<u64> {
+        self.inner.shared_page(index)
+    }
+    fn is_memfd(&self) -> bool {
+        self.inner.is_memfd()
+    }
 }
 
 // ─── корневой каталог ───────────────────────────────────────────────────────
@@ -441,8 +501,20 @@ pub fn init() {
     crate::debug!("/dev/null — ready");
     let serial = Arc::new(SerialDevice) as Arc<dyn VfsNode>;
     crate::debug!("/dev/serial — ready");
+    // Устройства desktop-варианта B. Узлы создаются всегда: если фреймбуфера
+    // нет (serial-only boot), open(/dev/fb0) сообщит ENODEV, а не ENOENT — так
+    // композитор отличает «железа нет» от «путь не смонтирован».
+    let fb0 = desktop_dev::fb0();
+    crate::debug!("/dev/fb0 — ready");
+    let input = desktop_dev::input_dir();
+    crate::debug!("/dev/input/event0 — ready");
     let dev = Arc::new(DevDirectory {
-        children: vec![Arc::clone(&null), Arc::clone(&serial)],
+        children: vec![
+            Arc::clone(&null),
+            Arc::clone(&serial),
+            Arc::clone(&fb0),
+            Arc::clone(&input),
+        ],
     }) as Arc<dyn VfsNode>;
     // Записываемый in-memory /tmp: Linux-userspace считает, что он есть, —
     // nvim в vim_mktempdir делает mkdir("/tmp/nvim.XXXXXX").

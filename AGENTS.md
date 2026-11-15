@@ -231,7 +231,7 @@ critical/high verified security finding или регрессией, блоки�
 - **PATCH** — фиксы, диагностика, доки, тулинг, обновления vendored-зависимостей без
   изменения поведения. Docs-only коммиты (этот файл, README'шки) версию не бампают.
 
-**Текущие версии и недавняя история.** **`dev` currently reads 2.23.0**; **`main` reads 2.22.9** — hotfix раунда 4:
+**Текущие версии и недавняя история.** **`dev` currently reads 2.24.0**; **`main` reads 2.22.9** — hotfix раунда 4:
 read-only out-указатель сисколла больше не вешает CPU, FPU/SSE изолированы между
 процессами, установщик не разворачивает чужие pre-existing symlink'и, `SFMASK` как в
 Linux, fd-таблица ограничена на всех путях. До него 2.22.8 — перевод комментариев и
@@ -245,7 +245,25 @@ installer spelling-split;
 2026-11-13 audit-пакеты: 2.22.0 закрыл пути ring3-to-ring0, 2.22.1 ограничил установщик
 пакетов, 2.22.2 ужесточил VFS/ext2, 2.22.3 закрыл класс user-buffer TOCTOU.
 
-**`dev`** (2.23.0) — USB-тетеринг телефона: нативный RNDIS поверх xHCI.
+**`dev`** (2.24.0) — desktop-вариант B: kernel-примитивы userspace-композитора.
+`/dev/fb0` — Limine scanout: `open`/`mmap(MAP_SHARED)` забирают экран (kernel
+console flush останавливается, serial-логи идут), `FBIOGET_VSCREENINFO`
+(0x4600)/`FBIOGET_FSCREENINFO` (0x4602) отдают точные `fb_var/fix_screeninfo`
+(160/80 байт, сверено с Linux UAPI); fb-листья помечены MMIO-битом и никогда не
+возвращаются в PMM. `memfd_create` + `ftruncate` (76/77) + `mmap(MAP_SHARED)`:
+общие физические страницы одного файла в нескольких отображениях, `fork`
+разделяет их без COW, `munmap`/exit отпускают ссылку, кадр живёт пока его держит
+файл или другое отображение; `MAP_SHARED` не-memfd — честный `EINVAL`.
+`/dev/input/event0` — evdev-подобный поток 24-байтных `input_event` (timeval,
+EV_KEY/EV_REL/EV_SYN) из PS/2 и USB HID, blocking/`O_NONBLOCK`/`poll`/`select`,
+кольцо 256 событий; ввод дублируется, поэтому shell-stdin и `/dev/stdin` не
+ломаются. ABI и ограничения — `docs/desktop-b.md`. Проверка: host-тесты ABI
+(`fb_abi`, `input_event`) + четыре in-QEMU routine `desktop-b::*` (fb ioctl/mmap/
+пиксель, event0 read/poll, memfd coherence, MAP_SHARED после fork).
+Пробелы: SCM_RIGHTS/fd passing, DMA-BUF/GPU, Wayland, EV_ABS/touch, fb modeset.
+Предыдущая версия `dev`:
+
+**`dev` до 2.24.0** (2.23.0) — USB-тетеринг телефона: нативный RNDIS поверх xHCI.
 `drivers/usb_desc.rs` находит communication+CDC Data пару по тройкам
 `EF/04/01`, `E0/01/03`, `02/02/FF` (VID:PID не используются), `drivers/xhci.rs`
 получил control-OUT с data-стадией, bulk-кольца/контексты и bulk-IN разбор
