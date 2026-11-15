@@ -1,43 +1,42 @@
-//! Storage filesystem subsystem.
+//! Подсистема файловых систем хранения.
 //!
-//! Hosts the ext2-compatible filesystem (`fs::ext2`) and the write-ahead-log
-//! journal (`fs::journal`) described in the `networking-and-storage` spec.
+//! Здесь живут ext2-совместимая ФС (`fs::ext2`) и журнал write-ahead-log
+//! (`fs::journal`).
 //!
-//! Task 4 implements the entire ext2 + WAL journal layer as **pure logic** that
-//! is exercised over a RAM-mock `BlockDevice` (see `crate::test`); it carries no
-//! real-disk dependency and is not wired into boot or the VFS mount table here
-//! (that is Task 5).
+//! Слой ext2 + WAL — **чистая логика** над `BlockDevice`: ядро-тесты гоняют её
+//! через RAM-мок (см. `crate::test`), реального диска ей не нужно. Подключение к
+//! boot и таблице монтирования VFS — в `boot.rs`.
 
 pub mod device;
 pub mod ext2;
 pub mod format_policy;
 pub mod journal;
 
-/// Errors produced by the filesystem subsystem.
+/// Ошибки подсистемы файловых систем.
 ///
-/// Mirrors the error model in the design document (`FsError`).
+/// Модель ошибок подсистемы (`FsError`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsError {
-    /// The on-disk ext2 superblock is missing/invalid (`s_magic != 0xEF53`) or
-    /// declares a block size that does not match the compiled `BS`.
+    /// Суперблок ext2 на диске отсутствует/невалиден (`s_magic != 0xEF53`) или
+    /// объявляет размер блока, не совпадающий скомпилированным `BS`.
     BadSuperBlock,
-    /// The WAL journal superblock magic did not validate.
+    /// Магия суперблока журнала WAL не прошла проверку.
     BadJournal,
-    /// The volume is a filesystem this driver must not write to (ext3/ext4-style
-    /// features, or a foreign journal). See `ext2::read_sb_gds`.
+    /// Том — ФС, в которую драйвер писать не должен (features уровня ext3/ext4
+    /// или чужой журнал). См. `ext2::read_sb_gds`.
     Unsupported,
-    /// A bitmap (block or inode) had no free bit left.
+    /// В битмапе (блоков или inode) не осталось свободного бита.
     OutOfSpace,
-    /// A path component / inode / directory entry was not found.
+    /// Компонент пути / inode / запись каталога не найдены.
     NotFound,
-    /// An entry with the same name already exists in the directory.
+    /// Запись с таким именем уже существует в каталоге.
     AlreadyExists,
-    /// The underlying block device returned an error.
+    /// Блочное устройство вернуло ошибку.
     IoError,
-    /// A directory entry name exceeded 255 bytes.
+    /// Имя записи каталога длиннее 255 байт.
     NameTooLong,
-    /// A structural invariant was violated (corrupt/out-of-range field).
+    /// Нарушен структурный инвариант (испорченное/выходящее за границы поле).
     Corrupt,
-    /// A write would exceed the 32-bit `i_size` limit of the format.
+    /// Запись превысила бы 32-битный предел `i_size`, заданный форматом.
     FileTooBig,
 }

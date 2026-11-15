@@ -1,13 +1,13 @@
-//! ext2 directory entries: `rec_len`-walked iteration, insertion (split slack),
-//! and removal (merge `rec_len` into the previous entry) within a single 4 KiB
-//! directory block.
+//! Записи каталога ext2: обход по цепочке `rec_len`, вставка (с расщеплением
+//! запаса) и удаление (со слиянием `rec_len` с предыдущей записью) в пределах
+//! одного 4-КиБ блока каталога.
 //!
-//! Invariant maintained over every block: the `rec_len` chain exactly tiles
-//! `[0, BS)` — no gaps, no overlap, no entry crossing the block boundary, and
-//! the last entry's `rec_len` reaches `BS`.
+//! Инвариант для каждого блока: цепочка `rec_len` точно замощает `[0, BS)` —
+//! без дыр, без перекрытий, ни одна запись не пересекает границу блока, а
+//! `rec_len` последней записи доходит до `BS`.
 //!
-//! With `s_feature_incompat == 0` (no FILETYPE feature) the `file_type` byte is
-//! written as 0; entry types are determined from the target inode's `i_mode`.
+//! При `s_feature_incompat == 0` (без FILETYPE) байт `file_type` пишется нулём;
+//! тип записи определяется по `i_mode` целевого inode.
 
 #![allow(dead_code)]
 
@@ -17,13 +17,13 @@ use alloc::vec::Vec;
 use super::structs::{align4, Ext2DirEntryHeader, BS};
 use crate::fs::FsError;
 
-/// Minimum record length for a name of `name_len` bytes.
+/// Минимальная длина записи для имени из `name_len` байт.
 #[inline]
 pub fn min_rec_len(name_len: usize) -> usize {
     align4(8 + name_len)
 }
 
-/// A decoded directory entry within a block.
+/// Разобранная запись каталога внутри блока.
 #[derive(Clone)]
 pub struct DirEntry {
     pub pos: usize,
@@ -46,12 +46,12 @@ fn write_header(block: &mut [u8], pos: usize, inode: u32, rec_len: u16, name_len
     block[pos..pos + 4].copy_from_slice(&inode.to_le_bytes());
     block[pos + 4..pos + 6].copy_from_slice(&rec_len.to_le_bytes());
     block[pos + 6] = name_len;
-    block[pos + 7] = 0; // file_type unused (feature_incompat == 0)
+    block[pos + 7] = 0; // file_type не используется (feature_incompat == 0)
 }
 
-/// Walk the entries of a directory block, returning all decoded entries.
+/// Обходит записи блока каталога и возвращает их разобранными.
 ///
-/// Returns `Corrupt` if the `rec_len` chain does not tile `[0, BS)` cleanly.
+/// `Corrupt`, если цепочка `rec_len` не замощает `[0, BS)` точно.
 pub fn iter_entries(block: &[u8]) -> Result<Vec<DirEntry>, FsError> {
     let mut out = Vec::new();
     let mut pos = 0usize;
@@ -61,7 +61,7 @@ pub fn iter_entries(block: &[u8]) -> Result<Vec<DirEntry>, FsError> {
         }
         let h = read_header(block, pos);
         let rec_len = h.rec_len as usize;
-        // rec_len must be a positive multiple of 4 and stay within the block.
+        // rec_len обязан быть положительным кратным 4 и не выходить за блок.
         if rec_len < 8 || rec_len % 4 != 0 || pos + rec_len > BS {
             return Err(FsError::Corrupt);
         }
@@ -89,7 +89,7 @@ pub fn iter_entries(block: &[u8]) -> Result<Vec<DirEntry>, FsError> {
     Ok(out)
 }
 
-/// Find an entry by name; returns `(inode, file_type)` on a match.
+/// Ищет запись по имени; при совпадении отдаёт `(inode, file_type)`.
 pub fn find(block: &[u8], name: &str) -> Result<Option<(u32, u8)>, FsError> {
     for e in iter_entries(block)? {
         if e.inode != 0 && e.name == name {
@@ -99,8 +99,8 @@ pub fn find(block: &[u8], name: &str) -> Result<Option<(u32, u8)>, FsError> {
     Ok(None)
 }
 
-/// Initialize a freshly allocated directory block as a single free record that
-/// spans the whole block.
+/// Инициализирует свежевыделенный блок каталога одной свободной записью на
+/// весь блок.
 pub fn init_empty_block(block: &mut [u8]) {
     for b in block.iter_mut() {
         *b = 0;
@@ -108,8 +108,8 @@ pub fn init_empty_block(block: &mut [u8]) {
     write_header(block, 0, 0, BS as u16, 0);
 }
 
-/// Write a `.`/`..` pair into a freshly zeroed directory block (used by mkfs and
-/// `mkdir`). `self_ino` is this directory, `parent_ino` its parent.
+/// Пишет пару `.`/`..` в свежеобнулённый блок каталога (используется mkfs и
+/// `mkdir`). `self_ino` — сам каталог, `parent_ino` — его родитель.
 pub fn init_dot_entries(block: &mut [u8], self_ino: u32, parent_ino: u32) {
     for b in block.iter_mut() {
         *b = 0;
@@ -118,7 +118,7 @@ pub fn init_dot_entries(block: &mut [u8], self_ino: u32, parent_ino: u32) {
     let dot_rec = min_rec_len(1) as u16;
     write_header(block, 0, self_ino, dot_rec, 1);
     block[8] = b'.';
-    // ".." — rec_len extends to end of block
+    // ".." — rec_len тянется до конца блока
     let ddot_pos = dot_rec as usize;
     let ddot_rec = (BS - ddot_pos) as u16;
     write_header(block, ddot_pos, parent_ino, ddot_rec, 2);
@@ -126,9 +126,9 @@ pub fn init_dot_entries(block: &mut [u8], self_ino: u32, parent_ino: u32) {
     block[ddot_pos + 9] = b'.';
 }
 
-/// Attempt to insert `(name, ino)` into the directory block by splitting the
-/// slack of an existing record. Returns `Ok(true)` on success, `Ok(false)` if
-/// the block has no room (caller should grow a new block), or `NameTooLong`.
+/// Пытается вставить `(name, ino)` в блок каталога, расщепив запас существующей
+/// записи. `Ok(true)` при успехе, `Ok(false)`, если места нет (вызывающий
+/// выделяет новый блок), либо `NameTooLong`.
 pub fn insert_into_block(block: &mut [u8], name: &str, ino: u32) -> Result<bool, FsError> {
     let name_bytes = name.as_bytes();
     if name_bytes.len() > 255 {
@@ -153,7 +153,7 @@ pub fn insert_into_block(block: &mut [u8], name: &str, ino: u32) -> Result<bool,
             write_header(block, new_pos, ino, new_rec_len, name_bytes.len() as u8);
             block[new_pos + 8..new_pos + 8 + name_bytes.len()].copy_from_slice(name_bytes);
             if e.inode != 0 {
-                // Shrink the donor record to its ideal size.
+                // Сжимаем запись-донор до её идеального размера.
                 let cur = read_header(block, e.pos);
                 write_header(block, e.pos, cur.inode, ideal as u16, cur.name_len);
             }
@@ -163,11 +163,10 @@ pub fn insert_into_block(block: &mut [u8], name: &str, ino: u32) -> Result<bool,
     Ok(false)
 }
 
-/// Remove the entry named `name` from the block, merging its `rec_len` into the
-/// previous entry (or zeroing its inode if it is the first record).
+/// Удаляет запись `name` из блока, сливая её `rec_len` с предыдущей записью
+/// (или обнуляя inode, если это первая запись).
 ///
-/// Returns `Ok(Some(inode))` with the removed entry's inode, or `Ok(None)` if
-/// no such entry exists.
+/// `Ok(Some(inode))` — inode удалённой записи; `Ok(None)`, если такой записи нет.
 pub fn remove_from_block(block: &mut [u8], name: &str) -> Result<Option<u32>, FsError> {
     let entries = iter_entries(block)?;
     let mut prev_pos: Option<usize> = None;
@@ -176,13 +175,13 @@ pub fn remove_from_block(block: &mut [u8], name: &str) -> Result<Option<u32>, Fs
             let removed = e.inode;
             match prev_pos {
                 Some(pp) => {
-                    // Merge this record's rec_len into the previous record.
+                    // Сливаем rec_len этой записи с предыдущей.
                     let prev = read_header(block, pp);
                     let merged = prev.rec_len + e.rec_len;
                     write_header(block, pp, prev.inode, merged, prev.name_len);
                 }
                 None => {
-                    // First record: just free it in place (keep its rec_len).
+                    // Первая запись: просто освобождаем на месте (rec_len сохраняем).
                     write_header(block, e.pos, 0, e.rec_len, 0);
                 }
             }
@@ -193,7 +192,7 @@ pub fn remove_from_block(block: &mut [u8], name: &str) -> Result<Option<u32>, Fs
     Ok(None)
 }
 
-/// Count the live (non-free, non-dot) entries in a directory block.
+/// Считает живые (не свободные и не `.`/`..`) записи в блоке каталога.
 pub fn live_entry_count(block: &[u8]) -> Result<usize, FsError> {
     let mut n = 0;
     for e in iter_entries(block)? {
