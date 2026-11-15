@@ -1,8 +1,9 @@
 # `src/net/` — собственный TCP/IP-стек
 
 Полностью своя реализация (без сетевых крейтов): IPv4/IPv6, ARP/NDP, ICMP/ICMPv6, DHCP,
-TCP с window scaling/SACK/Reno, UDP, DNS, HTTP(S). Всё изменяемое — в одном `Stack` под
-одним спинлоком (`static NET: Spinlock<Option<Stack>>`).
+TCP с window scaling/SACK/Reno, UDP, DNS, HTTP(S). Канал — `e1000` или USB-RNDIS
+(`link.rs`), стек не знает, какой драйвер его обслуживает. Всё изменяемое — в одном
+`Stack` под одним спинлоком (`static NET: Spinlock<Option<Stack>>`).
 
 Дисциплина локинга: **каждая точка входа исполняется в thread-контексте** (выделенный
 net-поток или bounded locked-step помпы); из IRQ-контекста стек не трогается — вложенность
@@ -13,6 +14,7 @@ net-поток или bounded locked-step помпы); из IRQ-контекст
 | Файл | Роль |
 |---|---|
 | `mod.rs` | Корень: `Stack`, лок `NET`, init, poll-цикл, `net_thread`, публичный TCP/UDP API, DNS `resolve`, `ping`, `nc_echo`, demo echo-сервисы |
+| `link.rs` | Канальный уровень: `Link::{E1000, UsbRndis}`, активный канал, `send`/`recv`, позднее подключение RNDIS |
 | `wire.rs` | Чистые wire-форматы + encode/decode: Ethernet, ARP, IPv4/IPv6 (+ext headers), ICMP/ICMPv6/NDP/RA, UDP, TCP (MSS/WS/SACK-опции), internet checksum. Юнит-тесты инлайн |
 | `arp.rs` | Link-слой: `ArpTable` (IPv4, RFC 826), `NdpTable` (IPv6, RFC 4861); парковка кадров + rate-limited запросы |
 | `ip.rs` | IPv4/IPv6: next-hop роутинг, TX-фрагментация v4, RX-реассемблинг обоих семейств, ICMP echo-ответы, SLAAC (`ra_apply`), разрешение ping-waiter'ов |
@@ -32,8 +34,10 @@ net-поток или bounded locked-step помпы); из IRQ-контекст
 
 ## Ключевые символы
 
-- `init() -> Result<(), NetError>` — PCI enumerate + attach e1000 + неконфигурированный `Stack`;
-  без NIC — `Err(NoDevice)`, boot продолжается.
+- `init() -> Result<(), NetError>` — PCI enumerate, затем канал: e1000, иначе USB-RNDIS;
+  если есть xHCI, но телефон ещё не перечислен, строится `Stack` без канала, и `step`
+  подхватывает RNDIS, как только он появится. Без e1000 и xHCI — `Err(NoDevice)`,
+  boot продолжается.
 - `poll()`, `net_thread()` (спавнится из `boot.rs`), `Stack::step()`, `Stack::input_frame()`.
 - **«Установилось» = рукопожатие состоялось, а не `state == Established`.** Пир,
   который отвечает и закрывается одним залпом (HTTP/1.0 `Connection: close`,
@@ -61,17 +65,24 @@ net-поток или bounded locked-step помпы); из IRQ-контекст
 
 ### RX-поток
 `net_thread` → `poll()` → `NET.lock()` → `Stack::step()`:
-1. Дренаж RX-кадров e1000 в стековый буфер 2048; `input_frame` парсит Ethernet, фильтрует
-   адресата (свой unicast / broadcast / 33:33 multicast; NIC в promiscuous), диспетчер по ethertype.
+0. Если канал ещё не выбран, `link::attach()` пытается найти RNDIS (e1000 выбирается при
+   `init`); до появления канала шаг ничего не делает.
+1. Дренаж RX-кадров активного канала (`link::recv`) в стековый буфер 2048; `input_frame`
+   парсит Ethernet, фильтрует адресата (свой unicast / broadcast / 33:33 multicast; NIC
+   в promiscuous), диспетчер по ethertype.
 2. Старение соседей/фрагментов; разовый IPv6 Router Solicitation.
 3. `DhcpClient::drive` (лизина применяется по ACK).
-4. Таймаут DHCP (~5 c) → статический QEMU-фоллбэк `10.0.2.15/24`, gw `10.0.2.2` — один раз.
+4. Таймаут DHCP → статический фоллбэк: e1000 — QEMU `10.0.2.15/24`, gw `10.0.2.2`
+   (5 c); USB-RNDIS — телефонный `192.168.42.21/24`, gw `192.168.42.129` (15 c). Fallback
+   применяется один раз и перекрывается пришедшим позже lease.
 5. `TcpTable::poll_all` (TX/ретрансмиты) + demo echo-сервисы (порты UDP/TCP 7).
 
 ### TX-поток
 Приложение → tcp/udp API → `ip::output` → выбор next-hop (broadcast/in-subnet/gateway;
 v6: multicast MAC, link-local/on-link, RA-роутер; v6 на TX не фрагментируется) →
-ARP/NDP lookup; не резолвится → парковка кадра + rate-limited запрос → `e1000::send`.
+ARP/NDP lookup; не резолвится → парковка кадра + rate-limited запрос → `link::send`.
+`arp`/`ip` не держат `Stack` и берут активный канал из отдельного локата `link.rs`, поэтому
+отправка не может задедлочить сетевой лок.
 
 ### IPv4/IPv6
 - IPv4: приём только своих/broadcast адресов; реассемблер ≤4 буферов, выравнивание 8 байт;
@@ -149,4 +160,7 @@ QEMU/TCG). Исторически стойка наблюдалась ещё н�
 - `udp.demux` дропает при полной очереди (ICMP port-unreachable нет — задокументированный gap);
   датаграммы режутся до 2048.
 - Парсер v6 ext-заголовков bounds-check'ит (крафтеные пакеты раньше читали OOB).
-- QEMU-допущения захардкожены: `10.0.2.15/2.2/2.3`.
+- QEMU-допущения захардкожены: `10.0.2.15/2.2/2.3`. Для USB-RNDIS без DHCP-lease DNS
+  не подставляется (QEMU-резолвер там чужой); HTTP по IP-литералу работает.
+- Очереди RNDIS ограничены (64 кадра) и лежат вне `NET`: переполнение — потеря кадра,
+  а не ожидание сетевого стека.

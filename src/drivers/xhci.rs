@@ -34,8 +34,10 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::drivers::pci::PciDevice;
-use crate::drivers::usb_desc::{self, HidIface};
+use crate::drivers::usb_desc::{self, HidIface, RndisIface};
 use crate::drivers::usb_hid_report::{self, RecoveryAction, ReportMode};
+use crate::drivers::usb_rndis::{self, RndisTransport};
+use crate::drivers::usb_rndis_proto;
 use crate::drivers::xhci_hub::{
     self, port_state_to_neutral, FailReason, Phase, PortObservation, PortPolicy, Step,
 };
@@ -444,6 +446,8 @@ const EP_CTX_MAX_PACKET_SHIFT: u32 = 16;
 const EP_CTX_INTERVAL_SHIFT: u32 = 16;
 const EP_TYPE_CONTROL: u32 = 4;
 const EP_TYPE_INTERRUPT_IN: u32 = 7;
+const EP_TYPE_BULK_OUT: u32 = 2;
+const EP_TYPE_BULK_IN: u32 = 6;
 
 /// Speed id из PORTSC (таблица 5-27).
 const SPEED_LOW: u8 = 2;
@@ -483,6 +487,43 @@ struct HidEndpoint {
     disabled: bool,
 }
 
+/// Номер эндпоинта в device context: 2 * номер + направление (IN — 1).
+fn dci_of(ep_addr: u8) -> u8 {
+    (ep_addr & 0x0F) * 2 + u8::from(ep_addr & 0x80 != 0)
+}
+
+/// Один RNDIS-канал на устройстве: bulk-пара, её кольца и буферы передачи.
+///
+/// Уведомления communication-интерфейса не опрашиваются: ответы RNDIS драйвер
+/// забирает GET_ENCAPSULATED_RESPONSE на EP0, а события link state не влияют на
+/// готовность канала (после успешного SET filter он уже data-initialized).
+struct RndisEndpoint {
+    iface: RndisIface,
+    bulk_in_dci: u8,
+    bulk_out_dci: u8,
+    /// Кольцо и буфер приёма; один Normal TRB в полёте за раз.
+    in_ring: Ring,
+    in_buf: DmaFrame,
+    in_len: usize,
+    in_outstanding: bool,
+    /// Кольцо и буфер передачи; сюда пишется 44-байтный конверт и кадр.
+    out_ring: Ring,
+    out_buf: DmaFrame,
+    out_len: usize,
+    out_outstanding: bool,
+    in_recoveries: u8,
+    out_recoveries: u8,
+    /// Эндпоинт отключён после исчерпания Reset Endpoint; опрос прекращается, чтобы
+    /// мёртвое устройство не заливало serial и не жгло кольцо.
+    in_disabled: bool,
+    out_disabled: bool,
+    /// Ошибка уже залогирована: одна строка на эндпоинт, а не на каждый poll.
+    in_error_logged: bool,
+    out_error_logged: bool,
+    /// Xid для keepalive; обычные управляющие запросы идут при подъёме.
+    keepalive_xid: u32,
+}
+
 /// Одно адресованное устройство.
 struct Slot {
     id: u8,
@@ -496,6 +537,8 @@ struct Slot {
     /// Все привязанные HID interrupt-IN эндпоинты устройства. У композитного
     /// устройства их несколько (клавиатура + consumer/system-коллекции).
     hid: Vec<HidEndpoint>,
+    /// RNDIS-канал, если конфигурация его выставила.
+    rndis: Option<RndisEndpoint>,
 }
 
 /// Что драйвер узнал о порте. Boot-меню печатает это: на машине с мёртвой
@@ -780,6 +823,13 @@ impl Summary {
     pub fn any_attached(&self) -> bool {
         self.ccs_mask != 0
     }
+}
+
+/// Есть ли запущенный xHCI-контроллер. Нужно сетевому слою, чтобы отличить
+/// «канала нет и не будет» от «канал появится, когда поток `usb` перечислит
+/// телефон»: второй случай требует построить стек заранее и ждать.
+pub fn present() -> bool {
+    CONTROLLER.lock().is_some()
 }
 
 /// Снимок состояния драйвера, достаточно дешёвый для цикла перерисовки.
@@ -1995,6 +2045,124 @@ fn control_no_data(
     false
 }
 
+/// Выполнить control-передачу с data-стадией OUT.
+///
+/// SEND_ENCAPSULATED_COMMAND несёт сообщение RNDIS в data-стадии: setup TRB
+/// объявляет длину и `TRT_OUT`, data TRB идёт OUT без IOC (завершение несёт
+/// status-стадия), status TRB — IN с IOC. Порядок важен: без `TRT_OUT`
+/// контроллер ждал бы данные в другую сторону, а устройство не увидело бы
+/// команду вовсе.
+fn control_out(
+    ctrl: &mut Controller,
+    slot_index: usize,
+    request_type: u8,
+    request: u8,
+    value: u16,
+    index: u16,
+    data: &[u8],
+) -> bool {
+    if data.len() > PAGE_SIZE {
+        return false;
+    }
+    let slot_id = {
+        let Some(slot) = ctrl.slots.get_mut(slot_index) else {
+            return false;
+        };
+        // SAFETY: `ctrl_buf` — наша страница; `data.len() <= PAGE_SIZE`, копия
+        // не выходит за её границы.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                slot.ctrl_buf.virt() as *mut u8,
+                data.len(),
+            );
+        }
+        let dw0 = request_type as u32 | ((request as u32) << 8) | ((value as u32) << 16);
+        let dw1 = index as u32 | ((data.len() as u32) << 16);
+        slot.ep0
+            .push(dw0, dw1, 8, ((TRB_SETUP as u32) << 10) | TRB_IDT | TRT_OUT);
+        let buf_phys = slot.ctrl_buf.phys();
+        // Data-стадия OUT: бит направления не ставится, IOC — на status-стадии.
+        slot.ep0.push(
+            buf_phys as u32,
+            (buf_phys >> 32) as u32,
+            data.len() as u32,
+            ((TRB_DATA as u32) << 10),
+        );
+        slot.ep0
+            .push(0, 0, 0, ((TRB_STATUS as u32) << 10) | TRB_DIR_IN | TRB_IOC);
+        slot.id
+    };
+    ring_doorbell(ctrl, slot_id, 1);
+    for _ in 0..8 {
+        let Some(ev) = next_event(ctrl, 1_000_000) else {
+            return false;
+        };
+        if ev.trb_type() != TRB_TRANSFER_EVENT {
+            continue;
+        }
+        if ev.endpoint_id() != 1 {
+            defer_event(ctrl, ev);
+            continue;
+        }
+        let cc = ev.completion_code();
+        if cc == CC_SUCCESS || cc == CC_SHORT_PACKET {
+            return true;
+        }
+        crate::warn!(
+            "xhci: control-OUT request {:#04x} failed: cc={}",
+            request,
+            cc
+        );
+        return false;
+    }
+    false
+}
+
+/// EP0 как транспорт RNDIS: одна class-команда и один ответ.
+struct Ep0Transport<'a> {
+    ctrl: &'a mut Controller,
+    slot_index: usize,
+    iface: u8,
+}
+
+impl RndisTransport for Ep0Transport<'_> {
+    fn command(&mut self, request: &[u8], response: &mut [u8]) -> Option<usize> {
+        // SEND_ENCAPSULATED_COMMAND: class, interface, OUT (0x21/0x00).
+        if !control_out(
+            self.ctrl,
+            self.slot_index,
+            0x21,
+            0x00,
+            0,
+            self.iface as u16,
+            request,
+        ) {
+            return None;
+        }
+        // GET_ENCAPSULATED_RESPONSE: class, interface, IN (0xA1/0x01). Устройство
+        // может ответить не сразу; несколько GET подряд покрывают эту задержку,
+        // не пересылая команду повторно.
+        for _ in 0..4 {
+            let got = control_in(
+                self.ctrl,
+                self.slot_index,
+                0xA1,
+                0x01,
+                0,
+                self.iface as u16,
+                response.len(),
+            )?;
+            if got.len() >= 8 {
+                let n = got.len().min(response.len());
+                response[..n].copy_from_slice(&got[..n]);
+                return Some(n);
+            }
+        }
+        None
+    }
+}
+
 /// Прочитать дескриптор: `kind` — тип дескриптора, `index` — его индекс.
 fn get_descriptor(
     ctrl: &mut Controller,
@@ -2049,6 +2217,7 @@ fn enable_slot(ctrl: &mut Controller) -> Option<usize> {
         device_ctx,
         ctrl_buf,
         hid: Vec::new(),
+        rndis: None,
     });
     Some(ctrl.slots.len() - 1)
 }
@@ -2183,25 +2352,26 @@ fn evaluate_ep0_max_packet(ctrl: &mut Controller, slot_index: usize, max_packet:
     matches!(ev, Some(ev) if ev.completion_code() == CC_SUCCESS)
 }
 
-/// Сконфигурировать все привязываемые HID interrupt-IN эндпоинты ОДНОЙ командой
-/// Configure Endpoint.
+/// Сконфигурировать все эндпоинты устройства ОДНОЙ командой Configure Endpoint.
 ///
 /// Поле «Context Entries» slot context должно быть старшим DCI, который несёт
 /// device context; добавление эндпоинтов по одному переписывало бы slot context и
-/// слало N команд на N интерфейсов. Устройство может иметь несколько интерфейсов
-/// (boot-клавиатура плюс consumer/system-коллекции); совместная конфигурация ещё и
-/// согласует состояние эндпоинтов xHCI с единственным SET_CONFIGURATION.
+/// слало N команд на N интерфейсов. Совместная конфигурация HID и RNDIS ещё и
+/// согласует состояние эндпоинтов xHCI с единственным SET_CONFIGURATION: у
+/// телефона communication- и data-интерфейсы принадлежат одной конфигурации, и
+/// раздельные Configure Endpoint оставили бы часть эндпоинтов без контекста.
 ///
 /// `wMaxPacketSize` эндпоинта — нижняя граница буфера передачи: interrupt-передача
 /// может законно доставить полный пакет, а запрос короче — это babble (код
-/// завершения 3).
-fn configure_hid_endpoints(
+/// завершения 3). Bulk-буферы берутся с запасом на целый Ethernet-кадр.
+fn configure_endpoints(
     ctrl: &mut Controller,
     slot_index: usize,
     ifaces: &[HidIface],
     modes: &[ReportMode],
+    rndis: Option<&RndisIface>,
 ) -> bool {
-    if ifaces.is_empty() || ifaces.len() != modes.len() {
+    if ifaces.len() != modes.len() || (ifaces.is_empty() && rndis.is_none()) {
         return false;
     }
     let ctx_size = ctrl.ctx_size;
@@ -2215,7 +2385,7 @@ fn configure_hid_endpoints(
         )
     };
     // Сначала кольца и буферы: их физические адреса идут в контексты эндпоинтов. При
-    // отказе Vec дропается и возвращает кадры в PMM, так что неудачный Configure
+    // отказе Vec/Option дропаются и возвращают кадры в PMM, так что неудачный Configure
     // Endpoint ничего не оставляет.
     let mut eps: Vec<HidEndpoint> = Vec::with_capacity(ifaces.len());
     for (i, iface) in ifaces.iter().enumerate() {
@@ -2239,7 +2409,7 @@ fn configure_hid_endpoints(
             subclass: iface.subclass,
             protocol: iface.protocol,
             mode: modes[i],
-            dci: (iface.ep_addr & 0x0F) * 2 + 1,
+            dci: dci_of(iface.ep_addr),
             ring,
             buf,
             len,
@@ -2249,8 +2419,73 @@ fn configure_hid_endpoints(
             disabled: false,
         });
     }
+    let rndis_ep = match rndis {
+        Some(iface) => {
+            let in_mps = (iface.bulk_in_max_packet & 0x07FF) as u32;
+            let out_mps = (iface.bulk_out_max_packet & 0x07FF) as u32;
+            if in_mps == 0 || out_mps == 0 {
+                crate::warn!(
+                    "xhci: RNDIS bulk endpoint has zero wMaxPacketSize (in={} out={})",
+                    iface.bulk_in_max_packet,
+                    iface.bulk_out_max_packet
+                );
+                return false;
+            }
+            let Some(in_ring) = Ring::new("rndis in ring") else {
+                return false;
+            };
+            let Some(in_buf) = DmaFrame::new_zeroed("rndis in buffer") else {
+                return false;
+            };
+            let Some(out_ring) = Ring::new("rndis out ring") else {
+                return false;
+            };
+            let Some(out_buf) = DmaFrame::new_zeroed("rndis out buffer") else {
+                return false;
+            };
+            let in_dci = dci_of(iface.bulk_in_addr);
+            let out_dci = dci_of(iface.bulk_out_addr);
+            // Один DCI не может принадлежать двум эндпоинтам: композитный
+            // дескриптор, переиспользующий номер, отвергается до Configure Endpoint.
+            if in_dci == out_dci || eps.iter().any(|e| e.dci == in_dci || e.dci == out_dci) {
+                crate::warn!(
+                    "xhci: RNDIS endpoints {:#04x}/{:#04x} collide with another interface's DCI",
+                    iface.bulk_in_addr,
+                    iface.bulk_out_addr
+                );
+                return false;
+            }
+            Some(RndisEndpoint {
+                iface: *iface,
+                bulk_in_dci: in_dci,
+                bulk_out_dci: out_dci,
+                in_ring,
+                in_buf,
+                in_len: usb_rndis_proto::MAX_TRANSFER,
+                in_outstanding: false,
+                out_ring,
+                out_buf,
+                out_len: PAGE_SIZE,
+                out_outstanding: false,
+                in_recoveries: 0,
+                out_recoveries: 0,
+                in_disabled: false,
+                out_disabled: false,
+                in_error_logged: false,
+                out_error_logged: false,
+                keepalive_xid: 1,
+            })
+        }
+        None => None,
+    };
     // Старший присутствующий DCI задаёт поле Context Entries slot context.
-    let max_dci = eps.iter().map(|ep| ep.dci).max().unwrap_or(1);
+    let max_dci = eps
+        .iter()
+        .map(|ep| ep.dci)
+        .chain(rndis_ep.as_ref().map(|r| r.bulk_in_dci))
+        .chain(rndis_ep.as_ref().map(|r| r.bulk_out_dci))
+        .max()
+        .unwrap_or(1);
     // SAFETY: `input` — наша обнулённая страница; контексты пишутся по смещениям,
     // которые диктует размер контекста контроллера, и каждый DCI <= 31 (номер
     // эндпоинта устройства — 4 бита), поэтому записи остаются в странице.
@@ -2261,6 +2496,10 @@ fn configure_hid_endpoints(
         let mut add = 1u32;
         for ep in &eps {
             add |= 1u32 << ep.dci;
+        }
+        if let Some(r) = rndis_ep.as_ref() {
+            add |= 1u32 << r.bulk_in_dci;
+            add |= 1u32 << r.bulk_out_dci;
         }
         write_volatile(p.add(1), add);
         let slot_ctx = p.add(8) as *mut u32;
@@ -2286,6 +2525,35 @@ fn configure_hid_endpoints(
             write_volatile(ep_ctx.add(2), (ring_phys | 1) as u32);
             write_volatile(ep_ctx.add(3), (ring_phys >> 32) as u32);
         }
+        if let Some(r) = rndis_ep.as_ref() {
+            // Bulk-эндпоинты: interval 0, CErr 3, тип 6 (IN) / 2 (OUT). wMaxPacketSize
+            // передаётся маской: биты множителя high-speed у bulk не используются.
+            for (dci, ep_type, mps, ring_phys) in [
+                (
+                    r.bulk_in_dci,
+                    EP_TYPE_BULK_IN,
+                    (r.iface.bulk_in_max_packet & 0x07FF) as u32,
+                    r.in_ring.base_phys(),
+                ),
+                (
+                    r.bulk_out_dci,
+                    EP_TYPE_BULK_OUT,
+                    (r.iface.bulk_out_max_packet & 0x07FF) as u32,
+                    r.out_ring.base_phys(),
+                ),
+            ] {
+                let ep_ctx = (input + ctx_size * (1 + dci as usize)) as *mut u32;
+                write_volatile(ep_ctx, 0);
+                write_volatile(
+                    ep_ctx.add(1),
+                    (3 << EP_CTX_CERR_SHIFT)
+                        | (ep_type << EP_CTX_EP_TYPE_SHIFT)
+                        | (mps << EP_CTX_MAX_PACKET_SHIFT),
+                );
+                write_volatile(ep_ctx.add(2), (ring_phys | 1) as u32);
+                write_volatile(ep_ctx.add(3), (ring_phys >> 32) as u32);
+            }
+        }
     }
     // Физический адрес: см. тот же комментарий в `address_device`.
     let (a0, a1) = ctx_addr(input_phys);
@@ -2300,14 +2568,16 @@ fn configure_hid_endpoints(
         Some(ev) if ev.completion_code() == CC_SUCCESS => {}
         other => {
             crate::warn!(
-                "xhci: configure endpoint ({} HID iface(s)) failed (cc={:?})",
+                "xhci: configure endpoint ({} HID, {} RNDIS) failed (cc={:?})",
                 eps.len(),
+                rndis_ep.is_some() as u8,
                 other.map(|e| e.completion_code())
             );
             return false;
         }
     }
     ctrl.slots[slot_index].hid = eps;
+    ctrl.slots[slot_index].rndis = rndis_ep;
     true
 }
 
@@ -2335,6 +2605,10 @@ fn release_slot(ctrl: &mut Controller, slot_index: usize) {
         return;
     };
     let slot_id = slot.id;
+    if slot.rndis.is_some() {
+        // Сетевой поток не должен видеть канал, чьи bulk-эндпоинты уже не существуют.
+        usb_rndis::reset();
+    }
     let _ = command(
         ctrl,
         0,
@@ -2426,35 +2700,43 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
         0 => {}
         class => crate::debug!("xhci: port {} device class {:#04x}", port, class),
     }
-    // Дескриптор конфигурации: 9 байт для общей длины, затем весь блок.
-    let Some(head) = get_descriptor(ctrl, slot_index, 2, 0, 9) else {
-        ctrl.fail(port, "config-descriptor", 0);
-        return false;
-    };
-    if head.len() < 9 {
-        ctrl.fail(port, "config-descriptor-short", head.len() as u32);
-        return false;
+    // Конфигурация: перебрать индексы, пока не найдётся RNDIS или HID. Устройство
+    // может выставить RNDIS не первой конфигурацией; QEMU — первой, телефон —
+    // обычно единственной. Ограничение четырьмя не даёт лживому bNumConfigurations
+    // крутить цикл на мс.
+    let n_configs = dev[17].max(1).min(4);
+    let mut parsed: Option<(Vec<HidIface>, Option<RndisIface>)> = None;
+    for ci in 0..n_configs {
+        let Some(head) = get_descriptor(ctrl, slot_index, 2, ci, 9) else {
+            continue;
+        };
+        if head.len() < 9 {
+            continue;
+        }
+        let total = u16::from_le_bytes([head[2], head[3]]) as usize;
+        if total < 9 || total > PAGE_SIZE {
+            continue;
+        }
+        let Some(blob) = get_descriptor(ctrl, slot_index, 2, ci, total) else {
+            continue;
+        };
+        let hid = usb_desc::parse_hid_interfaces(&blob);
+        let rndis = usb_desc::parse_rndis_interfaces(&blob);
+        if !hid.is_empty() || rndis.is_some() {
+            parsed = Some((hid, rndis));
+            break;
+        }
     }
-    let total = u16::from_le_bytes([head[2], head[3]]) as usize;
-    if total < 9 || total > PAGE_SIZE {
-        ctrl.fail(port, "config-length", total as u32);
-        return false;
-    }
-    let Some(conf) = get_descriptor(ctrl, slot_index, 2, 0, total) else {
-        ctrl.fail(port, "config-full", 0);
-        return false;
-    };
-    let ifaces = usb_desc::parse_hid_interfaces(&conf);
-    if ifaces.is_empty() {
-        ctrl.fail(port, "no-hid-interface", dev[4] as u32);
+    let Some((ifaces, rndis)) = parsed else {
+        ctrl.fail(port, "no-supported-interface", dev[4] as u32);
         crate::debug!(
-            "xhci: port {}: device {:04x}:{:04x} has no HID interrupt-IN interface",
+            "xhci: port {}: device {:04x}:{:04x} has no HID or RNDIS interface",
             port,
             vendor,
             product
         );
         return false;
-    }
+    };
     // Привязывать только boot-интерфейсы клавиатуры/мыши. HID-интерфейс с protocol 0
     // (consumer/system/vendor-коллекции, даже у клавиатуры с boot-интерфейсом) не
     // имеет раскладки, которую драйвер разбирает; привязка сожгла бы кольцо и буфер
@@ -2488,7 +2770,11 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
         }
         chosen.push(iface);
     }
-    let Some(config_value) = chosen.first().map(|i| i.config_value) else {
+    let config_value = rndis
+        .as_ref()
+        .map(|r| r.config_value)
+        .or_else(|| chosen.first().map(|i| i.config_value));
+    let Some(config_value) = config_value else {
         ctrl.fail(port, "no-boot-hid", dev[4] as u32);
         crate::debug!(
             "xhci: port {}: device {:04x}:{:04x} has HID interfaces but none is a boot keyboard/mouse",
@@ -2498,11 +2784,41 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
         );
         return false;
     };
-    // SET_CONFIGURATION активирует устройство (без него все эндпоинты отвечают STALL).
+    // SET_CONFIGURATION активирует устройство (без него все эндпоинты отвечают STALL), и
+    // именно по bConfigurationValue устройство решает, какой из наборов интерфейсов
+    // (RNDIS против CDC ECM у QEMU) сейчас активно.
     if !control_no_data(ctrl, slot_index, 0x00, 9, config_value as u16, 0) {
         ctrl.fail(port, "set-configuration", config_value as u32);
         crate::warn!("xhci: port {}: SET_CONFIGURATION failed", port);
         return false;
+    }
+    // RNDIS поднимается до Configure Endpoint: INIT/QUERY/SET идут через EP0 и не
+    // требуют bulk-контекстов, зато после неудачи незачем конфигурировать пару,
+    // которой никто не будет пользоваться.
+    let mut rndis_link: Option<(RndisIface, usb_rndis::LinkInfo)> = None;
+    if let Some(iface) = rndis {
+        let mut transport = Ep0Transport {
+            ctrl,
+            slot_index,
+            iface: iface.comm_interface,
+        };
+        match usb_rndis::bring_up(&mut transport) {
+            Some(info) => rndis_link = Some((iface, info)),
+            None => {
+                crate::warn!(
+                    "usb-rndis: port {}: init failed (iface={} data={}); link is down",
+                    port,
+                    iface.comm_interface,
+                    iface.data_interface
+                );
+                // Если HID на этом устройстве нет, слот бесполезен: без RNDIS здесь
+                // нечего привязывать, и повтор с reset — правильный путь.
+                if chosen.is_empty() {
+                    ctrl.fail(port, "rndis-init", 0);
+                    return false;
+                }
+            }
+        }
     }
     // SET_PROTOCOL(0) = BOOT (HID 1.11 §7.2.6): boot фиксирует раскладку 8 байт для
     // клавиатуры и 3 для мыши. Устройство может отказать (STALL): остаёмся в report
@@ -2530,11 +2846,20 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
         }
         modes.push(mode);
     }
-    if !configure_hid_endpoints(ctrl, slot_index, &chosen, &modes) {
+    let rndis_iface = rndis_link.as_ref().map(|(iface, _)| iface);
+    if !configure_endpoints(ctrl, slot_index, &chosen, &modes, rndis_iface) {
+        // Configure Endpoint не состоялся: состояние RNDIS уже выставлено, и без
+        // сброса сетевой поток увидел бы «готовый» канал без единого эндпоинта.
+        usb_rndis::reset();
         ctrl.fail(port, "configure-endpoint", 0);
         return false;
     }
-    ctrl.stage(port, "hid-ready", chosen.len() as u32);
+    let stage = match (chosen.is_empty(), rndis_link.is_some()) {
+        (true, true) => "rndis-ready",
+        (false, true) => "hid+rndis-ready",
+        _ => "hid-ready",
+    };
+    ctrl.stage(port, stage, chosen.len() as u32);
     for (iface, ep) in chosen.iter().zip(ctrl.slots[slot_index].hid.iter()) {
         // Boot class: 0 — нет, 1 — клавиатура, 2 — мышь. `mode` — чего достиг
         // SET_PROTOCOL; `report` — размер буфера передачи из wMaxPacketSize (>= целого
@@ -2549,6 +2874,24 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
             ep.len,
             ep.mode.as_str(),
             iface.max_packet
+        );
+    }
+    if let Some((iface, info)) = rndis_link {
+        // Строка, которую E2E-сценарий и человек ищут в serial: интерфейсы, MAC и
+        // состояние канала. medium=0 — 802.3; max_transfer — то, что объявило
+        // устройство, и по нему видно, влезает ли кадр в один конверт.
+        crate::info!(
+            "usb-rndis: iface={} data={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link=up medium={} max_transfer={}",
+            iface.comm_interface,
+            iface.data_interface,
+            info.mac[0],
+            info.mac[1],
+            info.mac[2],
+            info.mac[3],
+            info.mac[4],
+            info.mac[5],
+            info.medium,
+            info.max_transfer
         );
     }
     true
@@ -2629,7 +2972,95 @@ pub fn poll() {
             }
         }
     }
-    // 3. Собрать события завершения. Каждое transfer event несёт slot и эндпоинт;
+    // 3. RNDIS: вооружить bulk-IN и отправить не больше одного кадра из TX-очереди.
+    //    Кольца и очереди разные, поэтому отправка кадра не может задержать приём.
+    for si in 0..ctrl.slots.len() {
+        let slot_id = ctrl.slots[si].id;
+        let in_dci = {
+            let Some(r) = ctrl.slots[si].rndis.as_mut() else {
+                continue;
+            };
+            if r.in_disabled || r.in_outstanding {
+                None
+            } else {
+                let buf_phys = r.in_buf.phys();
+                r.in_ring.push(
+                    buf_phys as u32,
+                    (buf_phys >> 32) as u32,
+                    r.in_len as u32,
+                    ((TRB_NORMAL as u32) << 10) | TRB_IOC,
+                );
+                r.in_outstanding = true;
+                Some(r.bulk_in_dci)
+            }
+        };
+        if let Some(dci) = in_dci {
+            ring_doorbell(ctrl, slot_id, dci);
+        }
+        let out_ready = ctrl.slots[si]
+            .rndis
+            .as_ref()
+            .map_or(false, |r| !r.out_disabled && !r.out_outstanding);
+        if !out_ready {
+            continue;
+        }
+        let Some(frame) = usb_rndis::take_tx() else {
+            continue;
+        };
+        let out_dci = {
+            let Some(r) = ctrl.slots[si].rndis.as_mut() else {
+                continue;
+            };
+            // SAFETY: `out_buf` — наша DMA-страница, `out_len` — её размер; срез живёт
+            // до конца этой записи, а контроллер читает буфер только после doorbell.
+            let buf =
+                unsafe { core::slice::from_raw_parts_mut(r.out_buf.virt() as *mut u8, r.out_len) };
+            match usb_rndis_proto::encode_data_into(&frame, buf) {
+                Some(n) => {
+                    let buf_phys = r.out_buf.phys();
+                    r.out_ring.push(
+                        buf_phys as u32,
+                        (buf_phys >> 32) as u32,
+                        n as u32,
+                        ((TRB_NORMAL as u32) << 10) | TRB_IOC,
+                    );
+                    r.out_outstanding = true;
+                    Some(r.bulk_out_dci)
+                }
+                None => {
+                    usb_rndis::note_tx_error();
+                    None
+                }
+            }
+        };
+        if let Some(dci) = out_dci {
+            ring_doorbell(ctrl, slot_id, dci);
+        }
+    }
+    // Keepalive — обычный control-запрос, bulk-трафику он не мешает: у EP0 своё
+    // кольцо. Опрос идёт по счётчику poll'ов, а не по тикам, чтобы работать и в
+    // boot-меню, где тик планировщика может не двигаться.
+    if usb_rndis::keepalive_due() {
+        if let Some(si) = ctrl.slots.iter().position(|s| s.rndis.is_some()) {
+            let (iface, xid) = {
+                let r = ctrl.slots[si].rndis.as_ref().unwrap();
+                (r.iface.comm_interface, r.keepalive_xid)
+            };
+            let ok = {
+                let mut transport = Ep0Transport {
+                    ctrl,
+                    slot_index: si,
+                    iface,
+                };
+                usb_rndis::keepalive(&mut transport, xid)
+            };
+            if let Some(r) = ctrl.slots[si].rndis.as_mut() {
+                r.keepalive_xid = xid.wrapping_add(1).max(1);
+            }
+            usb_rndis::note_keepalive(ok);
+        }
+    }
+    // 4. Собрать события завершения. Каждое transfer event несёт slot и эндпоинт;
     //    маршрутизировать по ним.
     let mut events = 0usize;
     while events < 64 {
@@ -2645,6 +3076,24 @@ pub fn poll() {
         let Some(si) = ctrl.slots.iter().position(|s| s.id == slot_id) else {
             continue;
         };
+        // RNDIS bulk-эндпоинты имеют собственные DCI; HID-поиск ниже их не
+        // перехватывает, но явная ветка делает маршрут читаемым.
+        if ctrl.slots[si]
+            .rndis
+            .as_ref()
+            .map_or(false, |r| r.bulk_in_dci == dci)
+        {
+            handle_rndis_in(ctrl, si, ev);
+            continue;
+        }
+        if ctrl.slots[si]
+            .rndis
+            .as_ref()
+            .map_or(false, |r| r.bulk_out_dci == dci)
+        {
+            handle_rndis_out(ctrl, si, ev);
+            continue;
+        }
         let Some(hi) = ctrl.slots[si]
             .hid
             .iter()
@@ -2712,7 +3161,7 @@ pub fn poll() {
             RecoveryAction::ResetEndpoint => {
                 ctrl.slots[si].hid[hi].recoveries += 1;
                 let attempt = ctrl.slots[si].hid[hi].recoveries;
-                let ok = reset_hid_endpoint(ctrl, slot_id, dci);
+                let ok = reset_endpoint(ctrl, slot_id, dci);
                 if ok {
                     ctrl.hid_recoveries += 1;
                 }
@@ -2745,13 +3194,139 @@ pub fn poll() {
     }
 }
 
-/// Восстановить остановленный HID-эндпоинт командой xHCI Reset Endpoint (TRB
+/// Завершение bulk-IN RNDIS: разобрать батч конвертов и отдать кадры сетевому
+/// стеку. Ошибка передачи восстанавливается Reset Endpoint, как у HID: без этого
+/// одна babble-передача выключила бы сеть до перезагрузки.
+fn handle_rndis_in(ctrl: &mut Controller, si: usize, ev: Trb) {
+    let (len, buf_virt, dci) = {
+        let Some(r) = ctrl.slots[si].rndis.as_ref() else {
+            return;
+        };
+        (r.in_len, r.in_buf.virt(), r.bulk_in_dci)
+    };
+    if let Some(r) = ctrl.slots[si].rndis.as_mut() {
+        r.in_outstanding = false;
+    }
+    let cc = ev.completion_code();
+    if cc == CC_SUCCESS || cc == CC_SHORT_PACKET {
+        let got = len.saturating_sub(ev.residual() as usize).min(len);
+        if got == 0 {
+            return;
+        }
+        // SAFETY: контроллер записал в `in_buf` не больше `len` байт и опубликовал
+        // transfer event; срез не переживает этот обработчик.
+        let data = unsafe { core::slice::from_raw_parts(buf_virt as *const u8, got) };
+        let count = usb_rndis_proto::for_each_data_packet(data, 32, |frame| {
+            usb_rndis::push_rx_frame(frame);
+        });
+        if count == 0 {
+            // Конверт целиком битый: это не «нет данных», а ошибка протокола.
+            usb_rndis::note_rx_error();
+        } else if let Some(r) = ctrl.slots[si].rndis.as_mut() {
+            r.in_recoveries = 0;
+            r.in_error_logged = false;
+        }
+        return;
+    }
+    usb_rndis::note_rx_error();
+    let (previous, iface) = {
+        let Some(r) = ctrl.slots[si].rndis.as_ref() else {
+            return;
+        };
+        (r.in_recoveries, r.iface.comm_interface)
+    };
+    if previous < usb_hid_report::MAX_RECOVERIES {
+        if let Some(r) = ctrl.slots[si].rndis.as_mut() {
+            r.in_recoveries = previous + 1;
+        }
+        let ok = reset_endpoint(ctrl, ctrl.slots[si].id, dci);
+        if let Some(r) = ctrl.slots[si].rndis.as_mut() {
+            if !r.in_error_logged {
+                r.in_error_logged = true;
+                crate::warn!(
+                    "usb-rndis: iface {} bulk-IN transfer error cc={}: Reset Endpoint {} ({}/{})",
+                    iface,
+                    cc,
+                    if ok { "ok, re-arming" } else { "failed" },
+                    previous + 1,
+                    usb_hid_report::MAX_RECOVERIES
+                );
+            }
+        }
+    } else if let Some(r) = ctrl.slots[si].rndis.as_mut() {
+        r.in_disabled = true;
+        crate::warn!(
+            "usb-rndis: iface {} bulk-IN still failing cc={} after {} Reset Endpoint attempt(s); RX is off until the device is re-enumerated",
+            iface,
+            cc,
+            usb_hid_report::MAX_RECOVERIES
+        );
+    }
+}
+
+/// Завершение bulk-OUT RNDIS. Кадр уже в TX-очереди не хранится: потеря
+/// восстанавливается ретрансмиссией TCP, а не повтором на уровне USB.
+fn handle_rndis_out(ctrl: &mut Controller, si: usize, ev: Trb) {
+    let (dci, iface) = {
+        let Some(r) = ctrl.slots[si].rndis.as_ref() else {
+            return;
+        };
+        (r.bulk_out_dci, r.iface.comm_interface)
+    };
+    if let Some(r) = ctrl.slots[si].rndis.as_mut() {
+        r.out_outstanding = false;
+    }
+    let cc = ev.completion_code();
+    if cc == CC_SUCCESS || cc == CC_SHORT_PACKET {
+        usb_rndis::note_tx_done();
+        if let Some(r) = ctrl.slots[si].rndis.as_mut() {
+            r.out_recoveries = 0;
+            r.out_error_logged = false;
+        }
+        return;
+    }
+    usb_rndis::note_tx_error();
+    let previous = ctrl.slots[si]
+        .rndis
+        .as_ref()
+        .map(|r| r.out_recoveries)
+        .unwrap_or(0);
+    if previous < usb_hid_report::MAX_RECOVERIES {
+        if let Some(r) = ctrl.slots[si].rndis.as_mut() {
+            r.out_recoveries = previous + 1;
+        }
+        let ok = reset_endpoint(ctrl, ctrl.slots[si].id, dci);
+        if let Some(r) = ctrl.slots[si].rndis.as_mut() {
+            if !r.out_error_logged {
+                r.out_error_logged = true;
+                crate::warn!(
+                    "usb-rndis: iface {} bulk-OUT transfer error cc={}: Reset Endpoint {} ({}/{})",
+                    iface,
+                    cc,
+                    if ok { "ok, re-arming" } else { "failed" },
+                    previous + 1,
+                    usb_hid_report::MAX_RECOVERIES
+                );
+            }
+        }
+    } else if let Some(r) = ctrl.slots[si].rndis.as_mut() {
+        r.out_disabled = true;
+        crate::warn!(
+            "usb-rndis: iface {} bulk-OUT still failing cc={} after {} Reset Endpoint attempt(s); TX is off until the device is re-enumerated",
+            iface,
+            cc,
+            usb_hid_report::MAX_RECOVERIES
+        );
+    }
+}
+
+/// Восстановить остановленный эндпоинт командой xHCI Reset Endpoint (TRB
 /// type 14: slot id в битах 24-31, DCI в 16-20).
 ///
 /// Просто переармировать нельзя: ошибка передачи переводит эндпоинт в Halted, и
 /// повторная постановка TRB даёт ту же ошибку. Reset Endpoint возвращает эндпоинт
 /// в Stopped/Running, чтобы Normal TRB следующего poll выполнился.
-fn reset_hid_endpoint(ctrl: &mut Controller, slot_id: u8, dci: u8) -> bool {
+fn reset_endpoint(ctrl: &mut Controller, slot_id: u8, dci: u8) -> bool {
     let ev = command(
         ctrl,
         0,
@@ -2794,6 +3369,8 @@ fn restart_controller(ctrl: &mut Controller) -> bool {
     // Сброс контроллера забывает все слоты и порты; кольца начинаются с первого TRB
     // снова с установленным cycle bit.
     ctrl.slots.clear();
+    // Сброс контроллера забыл все эндпоинты: RNDIS-канал больше не существует.
+    usb_rndis::reset();
     ctrl.deferred_events.clear();
     ctrl.brought_up.clear();
     ctrl.devices = 0;

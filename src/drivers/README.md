@@ -1,7 +1,8 @@
 # `src/drivers/` — драйверы и device manager
 
-Все устройства: PCI-энумерация, e1000, virtio-blk, NVMe, PS/2 клавиатура и мышь,
-framebuffer-консоль, VT-эмулятор, курсор, serial. Координируются `drivers::mod`.
+Все устройства: PCI-энумерация, e1000, virtio-blk, NVMe, xHCI (HID и USB-RNDIS),
+PS/2 клавиатура и мышь, framebuffer-консоль, VT-эмулятор, курсор, serial.
+Координируются `drivers::mod`.
 
 ## Файлы
 
@@ -19,6 +20,9 @@ framebuffer-консоль, VT-эмулятор, курсор, serial. Коор�
 | `tty.rs` | Управляющий терминал консоли: foreground process group (kernel-side, по умолчанию — группа shell) + `TOSTOP`, `TIOCGPGRP`/`TIOCSPGRP` через чистую модель `linux::tty`, `check_access(kind)` — фоновое чтение/запись JOB-процесса получает `SIGTTIN`/`SIGTTOU` на всю группу и `EINTR` (не-JOB'ы, т.е. служебные spawn'ы ядра, не останавливаются) |
 | `ps2_mouse.rs` | PS/2 мышь (IRQ12) через 8042 aux: IntelliMouse-негоциация (3 magic sample rate + id 3), 4-байтовые пакеты с колесом (Z в младшем ниббле 4-го байта), зажатые координаты + кнопки + `wheel` + `seq`; без колеса — 3-байтовый режим |
 | `scrollback.rs` | Чистое ядро скроллбека консоли: ring прокрученных строк (символы + цвет) и view-offset; `push`/`scroll`/`reset`/`view_row`, тесты в host-tests |
+| `usb_desc.rs` | Чистый обход configuration descriptor: HID-интерфейсы и пара RNDIS (communication + CDC Data), эндпоинты и wMaxPacketSize; host-tests |
+| `usb_rndis_proto.rs` | Чистый протокол RNDIS: INIT/QUERY/SET/KEEPALIVE, разбор ответов по `RequestId`/статусу, data-конверты с 8-байтным префиксом и батчами; host-tests |
+| `usb_rndis.rs` | RNDIS-канал: управляющая последовательность, MAC, packet filter, keepalive, ограниченные RX/TX-очереди и 64-битные счётчики |
 | `xhci_hub.rs` | Чистая (`core` только) политика корневого порта xHCI по `hub.c`/`xhci-hub.c`: neutral-запись PORTSC (PED/PR/WPR/change bits не пишутся обратно), `hub_port_debounce` (25 мс шаг, 100 мс стабильного CCS, 2 с бюджет), `hub_port_wait_reset` (10/200 мс, 800 мс на запись, 5 попыток), 100 мс power settle, стабильность PED+U0 200 мс, backoff ≥1 с, без PP power-cycle; включается в host-tests как есть |
 | `framebuffer.rs` | Limine framebuffer текстовая консоль + 2D-графика: шрифт Fira Code 8×18 (`assets/font8x18.bin` — 8-битное **покрытие** на пиксель, генерируется `tools/gen_font.py`), `FbWriter`, скролл + скроллбек (см. `scrollback.rs`), status bar, макросы `fb_print!` |
 | `vt.rs` | ANSI/VT-100 эмулятор поверх framebuffer (`Vt`: CSI/OSC/DCS, 256 цветов, scroll regions, ответы на запросы) — stdout compat-программ |
@@ -245,6 +249,30 @@ PRP-list страница. `rw_common` режет запрос на LBA-выро
   усечённый дескриптор), in-QEMU selftest (report-режим), `tools/e2e.py usb`
   (клавиатура и мышь в меню и shell, PS/2 не затронут); на реальном железе не
   проверялось — нужен тест пользователя.
+
+
+- **USB-RNDIS (телефон в режиме USB-тетеринга).** `usb_rndis.rs` +
+  `usb_rndis_proto.rs` поднимают Ethernet поверх bulk-пары RNDIS. Устройство
+  распознаётся по паре интерфейсов: communication (`EF/04/01`, `E0/01/03` или
+  `02/02/FF`) с interrupt-IN статусом и CDC Data (`0A/00/00`) с bulk-IN/OUT;
+  VID:PID не используются, поэтому подходит и телефон, и эмулятор. Подъём:
+  INITIALIZE 1.0 → QUERY physical medium (необязательно) → QUERY
+  permanent/current MAC → SET packet filter (`0x0F`), всё через
+  SEND/GET_ENCAPSULATED_COMMAND на EP0. Ненулевой фильтр переводит устройство в
+  состояние, в котором оно начинает гонять кадры; без него DHCP молчит.
+  Данные идут 44-байтным конвертом: `MessageLength`, `DataOffset` (отсчитывается
+  от конца 8-байтного префикса) и `DataLength`; один bulk-IN URB может нести
+  несколько конвертов, разбор проверяет каждую длину и батч ограничен 32
+  кадрами. TX — один 44-байтный конверт на кадр, без ZLP. Ошибка передачи
+  восстанавливается Reset Endpoint (до 3 попыток) и переармированием, как у HID.
+  Очереди RX/TX ограничены 64 кадрами и не находятся под локом сетевого стека:
+  поток `usb` не ждёт `net`, а `net` не ждёт контроллер. Keepalive уходит каждые
+  ~5 с по счётчику poll'ов, а не по тикам планировщика.
+  Ограничения: interrupt-IN уведомления не опрашиваются (ответы берутся на EP0);
+  хабы не поддерживаются; hot-unplug не разбирается; реальное железо проверяет
+  пользователь. Проверено: host-tests `usb_rndis` (QEMU/телефонные дескрипторы,
+  любые байты, батчи, усечение) и `tools/e2e.py rndis` — без e1000, на
+  `usb-net`: MAC, DHCP `10.0.2.15`, ping `10.0.2.2`, HTTP GET.
 
 - **Разделы.** `partition.rs` разбирает GPT (заголовок LBA 1, массив записей) и,
   как запасной вариант, MBR, и публикует каждый раздел отдельным блочным

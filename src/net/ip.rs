@@ -311,7 +311,7 @@ fn ra_apply(st: &mut Stack, router: Ipv6Addr, pi: wire::PrefixInfo) {
         );
         let pkt = wire::ipv6_build(addr, Ipv6Addr::ALL_NODES, wire::PROTO_ICMPV6, 255, &adv);
         let frame = eth_frame(Mac::BROADCAST, st.mac, ETHERTYPE_IPV6, &pkt);
-        crate::drivers::e1000::send(&frame);
+        crate::net::link::send(&frame);
     }
 }
 
@@ -585,7 +585,7 @@ fn fragment_chunks(payload: &[u8], max_payload: usize) -> Vec<Chunk<'_>> {
 fn send_v4(st: &mut Stack, next_hop: Ipv4Addr, packet: &[u8], now: u64) {
     if next_hop.is_broadcast() {
         let frame = eth_frame(Mac::BROADCAST, st.mac, ETHERTYPE_IPV4, packet);
-        crate::drivers::e1000::send(&frame);
+        crate::net::link::send(&frame);
         return;
     }
     let mac = match st.arp.lookup(next_hop) {
@@ -604,7 +604,7 @@ fn send_v4(st: &mut Stack, next_hop: Ipv4Addr, packet: &[u8], now: u64) {
         }
     };
     let frame = eth_frame(mac, st.mac, ETHERTYPE_IPV4, packet);
-    crate::drivers::e1000::send(&frame);
+    crate::net::link::send(&frame);
 }
 
 /// Отдать IPv6-пакет link-слою, разрешив MAC next-hop через NDP (multicast-
@@ -629,7 +629,7 @@ fn send_v6(st: &mut Stack, next_hop: Ipv6Addr, packet: &[u8]) {
         }
     };
     let frame = eth_frame(dst_mac, st.mac, ETHERTYPE_IPV6, packet);
-    crate::drivers::e1000::send(&frame);
+    crate::net::link::send(&frame);
 }
 
 // ─── Ожидающие ping ──────────────────────────────────────────────────────────

@@ -147,7 +147,7 @@ impl ArpTable {
         let pkt = wire::arp_build(wire::ARP_REQUEST, my_mac, my_ip, Mac([0; 6]), ip);
         // Запросы широковещательные: сами никогда не проходим через разрешение.
         let frame = eth_frame(Mac::BROADCAST, my_mac, ETHERTYPE_ARP, &pkt);
-        crate::drivers::e1000::send(&frame);
+        crate::net::link::send(&frame);
     }
 
     /// Обработать входящий ARP-пакет. На REQUEST для нашего адреса ответить нашим
@@ -182,7 +182,7 @@ impl ArpTable {
                     );
                     // Unicast-ответ прямо на MAC запрашивающего.
                     let frame = eth_frame(p.sender_mac, my_mac, ETHERTYPE_ARP, &reply);
-                    crate::drivers::e1000::send(&frame);
+                    crate::net::link::send(&frame);
                 }
             }
             wire::ARP_REPLY => {
@@ -200,7 +200,7 @@ impl ArpTable {
                     while let Some(fr) = self.pending.pop_front() {
                         if fr.dst_ip == p.sender_ip {
                             let frame = eth_frame(p.sender_mac, my_mac, fr.ethertype, &fr.payload);
-                            crate::drivers::e1000::send(&frame);
+                            crate::net::link::send(&frame);
                         } else {
                             ready.push_back(fr);
                         }
@@ -347,7 +347,7 @@ impl NdpTable {
             ETHERTYPE_IPV6,
             &pkt,
         );
-        crate::drivers::e1000::send(&frame);
+        crate::net::link::send(&frame);
     }
 
     /// Обработать входящий ICMPv6 NDP-пакет (уже проверенный по checksum).
@@ -382,7 +382,7 @@ impl NdpTable {
                 let pkt =
                     wire::ipv6_build(p.target, src_ip, wire::PROTO_ICMPV6, ND_HOP_LIMIT, &adv);
                 let frame = eth_frame(eth_src, my_mac, ETHERTYPE_IPV6, &pkt);
-                crate::drivers::e1000::send(&frame);
+                crate::net::link::send(&frame);
             }
         } else {
             // Advertisement: изучить target -> link-layer mapping.
@@ -394,7 +394,7 @@ impl NdpTable {
             while let Some(fr) = self.pending.pop_front() {
                 if fr.0 == p.target {
                     let frame = eth_frame(learned, my_mac, ETHERTYPE_IPV6, &fr.1);
-                    crate::drivers::e1000::send(&frame);
+                    crate::net::link::send(&frame);
                 } else {
                     keep.push_back(fr);
                 }

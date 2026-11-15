@@ -76,6 +76,13 @@
   шелла — `.cache/e2e_usb_*.png`; новых зависимостей нет (python3, qemu-system-x86_64, OVMF —
   как у остальных режимов, monitor-протокол — через `tools/qemu_shot.py`). `--disk`/`--nvme`
   режим не принимает: диск для меню он пишет сам.
+- `python3 tools/e2e.py rndis` — приёмка **USB-тетеринга**: QEMU поднимается **без
+  e1000**, с `-device qemu-xhci -device usb-net,msos-desc=on` (RNDIS-конфигурация
+  QEMU), и проверяет, что зелёный результат нельзя объяснить Intel-NIC. Утверждения:
+  `usb-rndis: iface=… data=… mac=… link=up`, DHCP-lease `10.0.2.15/24` в `ifconfig`,
+  `ping: reply from 10.0.2.2` и HTTP GET (`pkg 10.0.2.2 /README.md`, локальный
+  `http.server`) — то есть путь до данных, а не только MAC. Требует QEMU с `usb-net`
+  (проверено на 10.2.2) и OVMF; реальное железо режим не заменяет.
 - Env-оверрады: `LIMINE_DIR`/`LIMINE_EFI` (иначе автопоиск/автоскачивание), `OVMF`/`--ovmf`
   (если заданы и файл существует — берутся они; иначе `OVMF.fd` из корня репо; иначе системный
   `OVMF_CODE.fd`, напр. `/usr/share/edk2/ovmf/`), `PAGH_DISK` (дефолт `disk.img`),
