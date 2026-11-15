@@ -1,51 +1,46 @@
-// memory/heap.rs — Kernel heap / global allocator.
-// 64-bit x86_64 Limine kernel in Rust (#![no_std])
+// memory/heap.rs — куча ядра / глобальный аллокатор.
 //
-// The kernel uses `good_memory_allocator` (galloc) as its `#[global_allocator]`
-// so the `alloc` types (Vec, Box, Arc, ...) work.
+// Ядро использует `good_memory_allocator` (galloc) как `#[global_allocator]`,
+// чтобы работали типы `alloc` (Vec, Box, Arc, ...).
 //
-// WHY NOT linked_list_allocator: that allocator is a pure first-fit free list,
-// O(n) per allocation in the number of free blocks. Under the `apt` package
-// index parser — which allocates and frees tens of thousands of small objects
-// (a per-stanza `BTreeMap<String,String>` plus its `String`s, ~10 per stanza ×
-// ~60k stanzas) — the free list grows huge and the per-alloc scan degrades to
-// roughly O(n²). That showed up as a multi-minute "hang" parsing a large index
-// and was the leading suspect for heap corruption at scale. galloc keeps a free
-// list but adds size-binned "smallbins" (dlmalloc-style), giving ~O(1) typical
-// allocate/free, so the churn stays linear.
+// ПОЧЕМУ НЕ linked_list_allocator: это чистый first-fit список свободных
+// блоков, O(n) на аллокацию по числу свободных блоков. На разборе индекса
+// пакетов `apt` — десятки тысяч мелких объектов на стадию — список разрастается,
+// и скан на каждую аллокацию деградирует почти до O(n²), что выглядело как
+// многоминутное зависание. galloc добавляет «smallbins» по размерам
+// (в стиле dlmalloc) и даёт типично ~O(1) на allocate/free.
 //
-// The heap is a FIXED-SIZE region: `init()` maps `HEAP_INITIAL_PAGES` pages
-// starting at `layout::heap_base()` and hands that contiguous region to the
-// allocator. galloc does not grow on demand — when an allocation cannot be
-// satisfied it returns a null pointer (Requirement 10.4), which the `alloc`
-// machinery turns into an allocation-error abort. If the kernel ever needs a
-// larger heap, raise `HEAP_INITIAL_PAGES` in `memory::layout`.
+// Куча — регион ФИКСИРОВАННОГО размера: `init()` отображает
+// `HEAP_INITIAL_PAGES` страниц начиная с `layout::heap_base()` и отдаёт этот
+// непрерывный регион аллокатору. galloc не растёт по требованию — если
+// запрос не удовлетворить, он возвращает null (Requirement 10.4), и обвязка
+// `alloc` превращает это в abort. Нужна куча больше — поднять
+// `HEAP_INITIAL_PAGES` в `memory::layout`.
 //
-// `HEAP_INITIAL_PAGES` is the desired size for the reference configuration
-// (≥ 1 GiB RAM). On machines with less RAM `init` caps the heap to what the
-// PMM can spare (see `cap_to_available`) instead of exhausting the frame
-// pool and panicking at boot.
+// `HEAP_INITIAL_PAGES` — желаемый размер для эталонной конфигурации (≥ 1 ГиБ
+// RAM). На машинах с меньшей памятью `init` урезает кучу до того, что PMM может
+// отдать (см. `cap_to_available`), вместо исчерпания пула кадров и паники при
+// загрузке.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use good_memory_allocator::SpinLockedAllocator;
 
-/// Interrupt-safe wrapper around galloc.
+/// Обёртка над galloc, безопасная к прерываниям.
 ///
-/// `SpinLockedAllocator`'s internal spin lock does NOT disable interrupts, so
-/// the timer could preempt a thread MID-ALLOCATION while it held the heap
-/// lock. Any other context that then allocated while holding one of the
-/// kernel's interrupt-disabling `Spinlock`s (VFS, ext2, console, ...) would
-/// spin on the heap lock with interrupts off -- the descheduled owner could
-/// never run again and the whole kernel froze. The apt index parser allocates
-/// millions of times, which made first-boot provisioning the reliable
-/// trigger.
+/// Внутренний спинлок `SpinLockedAllocator` НЕ выключает прерывания, поэтому
+/// таймер мог вытеснить поток ПОСРЕДИ АЛЛОКАЦИИ, пока тот держал лок кучи.
+/// Любой другой контекст, аллоцирующий под одним из выключающих прерывания
+/// `Spinlock` ядра (VFS, ext2, консоль, ...), крутился бы на локе кучи с
+/// выключенными прерываниями, а вытесненный владелец никогда бы не
+/// выполнился — ядро замирало. Разбор индекса apt аллоцирует миллионы раз,
+/// что делало первый провижининг надёжным триггером.
 ///
-/// Fix: disable interrupts for the (microsecond-scale) duration of every
-/// heap operation, exactly like `crate::sync::spinlock::Spinlock` does. The
-/// heap-lock owner can then never be preempted mid-hold, so every waiter is
-/// spinning against a RUNNING owner and the wait is bounded.
+/// Исправление: выключать прерывания на (микросекундное) время каждой операции
+/// с кучей, как делает `crate::sync::spinlock::Spinlock`. Тогда владелец лока
+/// кучи не может быть вытеснен посреди удержания, и каждый ожидающий крутится
+/// против РАБОТАЮЩЕГО владельца — ожидание ограничено.
 struct IrqSafeAllocator {
     inner: SpinLockedAllocator,
 }
@@ -63,14 +58,14 @@ impl IrqSafeAllocator {
     }
 }
 
-/// Live bytes handed out by successful allocations (each request's size is
-/// added on alloc/realloc-grow and subtracted on free/shrink). Diagnostics
-/// only (`stats`); it counts requested bytes, not allocator overhead, so the
-/// real footprint is slightly higher.
+/// Живые байты, выданные успешными аллокациями (размер запроса прибавляется на
+/// alloc/realloc-grow и вычитается на free/shrink). Только диагностика
+/// (`stats`); считаются запрошенные байты, а не накладные расходы аллокатора,
+/// поэтому реальный объём чуть больше.
 static HEAP_USED: AtomicUsize = AtomicUsize::new(0);
 
-/// Subtract `bytes` from [`HEAP_USED`] without underflowing (a stray/double
-/// free must not wrap the counter into astronomic "used" values).
+/// Вычесть `bytes` из [`HEAP_USED`] без underflow (случайный/двойной free не
+/// должен завернуть счётчик в астрономическое «used»).
 fn heap_used_sub(bytes: usize) {
     let mut cur = HEAP_USED.load(Ordering::Relaxed);
     loop {
@@ -89,9 +84,9 @@ fn heap_used_sub(bytes: usize) {
     }
 }
 
-// SAFETY: delegates to `SpinLockedAllocator` (a correct `GlobalAlloc`); the
-// wrapper only adds interrupt masking around each operation and live-byte
-// accounting for `stats`.
+// SAFETY: делегирует `SpinLockedAllocator` (корректный `GlobalAlloc`); обёртка
+// лишь добавляет маскирование прерываний вокруг каждой операции и учёт живых
+// байт для `stats`.
 unsafe impl GlobalAlloc for IrqSafeAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = self.guarded(|a| a.alloc(layout));
@@ -114,8 +109,9 @@ unsafe impl GlobalAlloc for IrqSafeAllocator {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new_ptr = self.guarded(|a| a.realloc(ptr, layout, new_size));
         if !new_ptr.is_null() {
-            // On failure galloc leaves the original allocation live, so only
-            // a successful resize moves the counter (old size out, new in).
+            // При ошибке galloc оставляет исходную аллокацию живой, поэтому
+            // только успешное изменение размера двигает счётчик (старый размер
+            // вычесть, новый прибавить).
             heap_used_sub(layout.size());
             HEAP_USED.fetch_add(new_size, Ordering::Relaxed);
         }
@@ -123,41 +119,40 @@ unsafe impl GlobalAlloc for IrqSafeAllocator {
     }
 }
 
-/// The global allocator instance (Requirement 10.1). Declared exactly once.
+/// Экземпляр глобального аллокатора (Requirement 10.1). Объявлен ровно один раз.
 #[global_allocator]
 static ALLOCATOR: IrqSafeAllocator = IrqSafeAllocator {
     inner: SpinLockedAllocator::empty(),
 };
 
-/// Total bytes handed to the allocator at [`init`], recorded for [`stats`].
+/// Всего байт, отданных аллокатору в [`init`], записано для [`stats`].
 static HEAP_SIZE: AtomicUsize = AtomicUsize::new(0);
 
-/// Initialize the kernel heap.
+/// Инициализировать кучу ядра.
 ///
-/// Derives the heap base/size from `memory::layout` (Requirement 4.3), maps the
-/// backing physical frames, then initializes the allocator over that region.
-/// The heap is boot-critical, so mapping failures panic.
+/// Берёт базу/размер кучи из `memory::layout` (Requirement 4.3), отображает
+/// физические кадры и инициализирует аллокатор над этим регионом. Куча
+/// критична для загрузки, поэтому ошибка отображения — паника.
 ///
-/// The heap is FIXED-SIZE, but `HEAP_INITIAL_PAGES` documents the *desired*
-/// size for the reference configuration (≥ 1 GiB RAM — see `layout.rs`), not a
-/// requirement the machine must satisfy. A guest with less RAM would other-
-/// wise have the mapping loop below consume every free PMM frame (including
-/// the ones page tables and later user pages still need) and panic at boot.
-/// So the loop below caps the heap at what the PMM can actually give up
-/// without starving the rest of the kernel: it reserves a quarter of the free
-/// frames (at least 8 MiB) for post-boot PMM users (user pages, COW forks,
-/// kernel stacks, the heap's own intermediate page tables) and caps the heap
-/// at the remainder, warning at `Warn` level when the cap engages. On the
-/// reference configuration the cap never engages and the full 512 MiB heap is
-/// mapped, unchanged.
+/// Куча ФИКСИРОВАННОГО размера, но `HEAP_INITIAL_PAGES` описывает *желаемый*
+/// размер для эталонной конфигурации (≥ 1 ГиБ RAM — см. `layout.rs`), а не
+/// требование к машине. Гость с меньшей памятью иначе съел бы циклом
+/// отображения все свободные кадры PMM (включая нужные таблицам страниц и
+/// будущим пользовательским страницам) и упал бы при загрузке. Поэтому цикл
+/// ниже ограничивает кучу тем, что PMM реально может отдать, не морируя
+/// остальное ядро: резервирует четверть свободных кадров (минимум 8 МиБ) под
+/// пост-загрузочных потребителей PMM (пользовательские страницы, COW-fork,
+/// стеки ядра, промежуточные таблицы страниц самой кучи) и урезает кучу до
+/// остатка, предупреждая на уровне `Warn`. На эталонной конфигурации предел не
+/// срабатывает, и отображается вся куча 512 МиБ.
 pub fn init() {
     let heap_base = crate::memory::layout::heap_base();
     let initial_pages = crate::memory::layout::HEAP_INITIAL_PAGES;
     let initial_pages = cap_to_available(initial_pages);
     let heap_size = initial_pages * crate::memory::layout::PAGE_SIZE;
 
-    // Map the initial heap pages: one physical frame per page, mapped W^X
-    // (writable, never executable).
+    // Отобразить начальные страницы кучи: один физический кадр на страницу,
+    // отображение W^X (запись, никогда исполнение).
     let mut addr = heap_base;
     for _ in 0..initial_pages {
         let frame = crate::memory::pmm::alloc_frame()
@@ -169,13 +164,14 @@ pub fn init() {
         addr += crate::memory::layout::PAGE_SIZE;
     }
 
-    // Hand the freshly mapped region to the allocator.
+    // Отдать только что отображённый регион аллокатору.
     //
-    // SAFETY: the region `[heap_base, heap_base + heap_size)` was just mapped
-    // above as present + writable and is owned exclusively by the heap. It is
-    // valid for the `'static` lifetime (kernel heap is never torn down). `init`
-    // must be called exactly once, before any allocation; boot calls it in the
-    // ordered init sequence before any heap user runs.
+    // SAFETY: регион `[heap_base, heap_base + heap_size)` только что отображён
+    // выше как present + writable и принадлежит исключительно куче. Он валиден
+    // на всё время `'static` (куча ядра никогда не сносится). `init` обязан
+    // вызываться ровно один раз, до любой аллокации; загрузка вызывает его в
+    // упорядоченной последовательности инициализации до запуска потребителей
+    // кучи.
     unsafe {
         ALLOCATOR.inner.init(heap_base as usize, heap_size as usize);
     }
@@ -189,13 +185,12 @@ pub fn init() {
     );
 }
 
-/// Cap `requested` heap pages to what the PMM can spare at boot.
+/// Урезать `requested` страниц кучи до того, что PMM может отдать при загрузке.
 ///
-/// See [`init`]: the kernel keeps a quarter of the free frames (at least
-/// `HEAP_MIN_RESERVE_FRAMES`) for everything the PMM must still serve after
-/// boot. Returns `requested` unchanged when the machine has enough RAM, so
-/// behavior on the reference configuration is identical to the fixed-size
-/// heap of previous releases.
+/// См. [`init`]: ядро оставляет четверть свободных кадров (минимум
+/// `HEAP_MIN_RESERVE_FRAMES`) всему, что PMM должен обслужить после загрузки.
+/// Возвращает `requested` без изменений, когда RAM хватает, поэтому поведение
+/// на эталонной конфигурации идентично фиксированной куче прошлых релизов.
 fn cap_to_available(requested: u64) -> u64 {
     let free = crate::memory::pmm::free_frames() as u64;
     let reserve = (free / 4).max(HEAP_MIN_RESERVE_FRAMES);
@@ -214,18 +209,18 @@ fn cap_to_available(requested: u64) -> u64 {
     capped
 }
 
-/// Frames kept out of the heap's reach on RAM-starved machines (8 MiB): the
-/// heap's own page tables, user pages and COW forks must not be starved to
-/// zero by the heap mapping loop.
+/// Кадры, недоступные куче на машинах с дефицитом RAM (8 МиБ): собственные
+/// таблицы страниц кучи, пользовательские страницы и COW-fork не должны быть
+/// обнулены циклом отображения кучи.
 const HEAP_MIN_RESERVE_FRAMES: u64 = 8 * 1024 * 1024 / crate::memory::layout::PAGE_SIZE;
 
-/// Report the kernel heap accounting as `(size, used, free)` bytes.
+/// Сообщить учёт кучи ядра как `(size, used, free)` в байтах.
 ///
-/// DIAGNOSTIC helper (apt-update parse-stage crash investigation): used by the
-/// `lx_bigindex` self-test and `apt::update`'s feature-gated progress logging.
-/// `used` counts the live requested bytes (successful allocations minus
-/// frees), so it excludes per-chunk allocator overhead — the real footprint is
-/// slightly higher. `free` is the configured heap size minus `used`.
+/// ДИАГНОСТИЧЕСКИЙ хелпер: используется self-тестом `lx_bigindex` и
+/// feature-гейтованным прогресс-логом `apt::update`. `used` — живые
+/// запрошенные байты (успешные аллокации минус освобождения), без накладных
+/// расходов на чанк; реальный объём чуть больше. `free` — размер кучи минус
+/// `used`.
 pub fn stats() -> (usize, usize, usize) {
     let size = HEAP_SIZE.load(Ordering::Relaxed);
     let used = HEAP_USED.load(Ordering::Relaxed).min(size);

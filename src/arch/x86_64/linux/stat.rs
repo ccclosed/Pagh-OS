@@ -1,79 +1,79 @@
-//! `struct stat` encoding for the x86_64 binary-compatibility layer.
+//! Кодирование `struct stat` для слоя совместимости с x86_64-бинарями.
 //!
-//! Pure, allocation-free, `core`-only logic shared with the `host-tests` crate
-//! (R11.6). `fstat`/`newfstatat` populate a [`LinuxStat`] from a file's size and
-//! mode and copy it into the user buffer; the encoding here is the pure core those
-//! handlers reuse (R2.8).
+//! Только `core`, без аллокаций, общая с крейтом `host-tests` (R11.6).
+//! `fstat`/`newfstatat` заполняют [`LinuxStat`] из размера и режима файла и
+//! копируют его в буфер пользователя; кодирование здесь — чистое ядро, которое
+//! переиспользуют эти обработчики (R2.8).
 #![allow(dead_code)]
 
-/// File-type bits for a regular file (`S_IFREG`).
+/// Биты типа файла для regular-файла (`S_IFREG`).
 ///
-/// Combined with permission bits to form the `st_mode` value a Linux binary
-/// expects (R2.8).
+/// Комбинируются с битами прав в значение `st_mode`, которого ждёт Linux-бинарь
+/// (R2.8).
 pub const S_IFREG: u32 = 0o100000;
 
-/// File-type bits for a directory (`S_IFDIR`).
+/// Биты типа файла для каталога (`S_IFDIR`).
 pub const S_IFDIR: u32 = 0o040000;
 
-/// File-type bits for a symbolic link (`S_IFLNK`).
+/// Биты типа файла для символической ссылки (`S_IFLNK`).
 ///
-/// `/proc/self/exe` is the first node in this VFS that reports it: `lstat`
-/// (`newfstatat` with `AT_SYMLINK_NOFOLLOW`) uses `S_IFLNK | 0o777` and the
-/// link's target length as `st_size`, exactly like Linux.
+/// `/proc/self/exe` — первый узел в этом VFS, который их сообщает: `lstat`
+/// (`newfstatat` с `AT_SYMLINK_NOFOLLOW`) использует `S_IFLNK | 0o777` и длину
+/// цели ссылки как `st_size`, точно как Linux.
 pub const S_IFLNK: u32 = 0o120000;
 
-/// A sane default block size reported in `st_blksize`.
+/// Разумный размер блока по умолчанию, сообщаемый в `st_blksize`.
 pub const DEFAULT_BLKSIZE: i64 = 4096;
 
-/// The x86_64 Linux `struct stat` layout (subset populated).
+/// Раскладка Linux `struct stat` x86_64 (заполняется подмножество).
 ///
-/// Field order, sizes, and padding match the architectural layout exactly so a
-/// byte-for-byte copy into the user buffer is interpreted correctly by a Linux
-/// binary. `fstat`/`newfstatat` populate `st_size`, `st_mode` (type bits | perms),
-/// and `st_blksize`; the remaining fields are zeroed (R2.8).
+/// Порядок полей, размеры и паддинг точно соответствуют архитектурной
+/// раскладке, поэтому побайтовая копия в буфер пользователя правильно
+/// интерпретируется Linux-бинарём. `fstat`/`newfstatat` заполняют `st_size`,
+/// `st_mode` (биты типа | права) и `st_blksize`; остальные поля нулевые (R2.8).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LinuxStat {
-    /// Device id containing the file.
+    /// Id устройства, содержащего файл.
     pub st_dev: u64,
-    /// Inode number.
+    /// Номер inode.
     pub st_ino: u64,
-    /// Number of hard links.
+    /// Число жёстких ссылок.
     pub st_nlink: u64,
-    /// File type and mode (e.g. `S_IFREG | 0o644`).
+    /// Тип и режим файла (например, `S_IFREG | 0o644`).
     pub st_mode: u32,
-    /// Owning user id.
+    /// Id владеющего пользователя.
     pub st_uid: u32,
-    /// Owning group id.
+    /// Id владеющей группы.
     pub st_gid: u32,
-    /// Padding to align `st_rdev`.
+    /// Паддинг для выравнивания `st_rdev`.
     pub __pad0: u32,
-    /// Device id (if the file is a special file).
+    /// Id устройства (если файл — специальный).
     pub st_rdev: u64,
-    /// Total size in bytes.
+    /// Полный размер в байтах.
     pub st_size: i64,
-    /// Preferred block size for filesystem I/O.
+    /// Предпочтительный размер блока для I/O файловой системы.
     pub st_blksize: i64,
-    /// Number of 512-byte blocks allocated.
+    /// Число выделенных 512-байтных блоков.
     pub st_blocks: i64,
-    /// Time of last access (seconds).
+    /// Время последнего доступа (секунды).
     pub st_atime: i64,
-    /// Time of last access (nanoseconds).
+    /// Время последнего доступа (наносекунды).
     pub st_atime_nsec: i64,
-    /// Time of last modification (seconds).
+    /// Время последней модификации (секунды).
     pub st_mtime: i64,
-    /// Time of last modification (nanoseconds).
+    /// Время последней модификации (наносекунды).
     pub st_mtime_nsec: i64,
-    /// Time of last status change (seconds).
+    /// Время последнего изменения статуса (секунды).
     pub st_ctime: i64,
-    /// Time of last status change (nanoseconds).
+    /// Время последнего изменения статуса (наносекунды).
     pub st_ctime_nsec: i64,
-    /// Reserved, unused fields.
+    /// Зарезервированные неиспользуемые поля.
     pub __unused: [i64; 3],
 }
 
 impl LinuxStat {
-    /// An all-zero [`LinuxStat`]. Internal seed for [`encode_stat`].
+    /// Полностью нулевой [`LinuxStat`]. Внутренняя заготовка для [`encode_stat`].
     const fn zeroed() -> Self {
         LinuxStat {
             st_dev: 0,
@@ -97,26 +97,26 @@ impl LinuxStat {
         }
     }
 
-    /// Read back the encoded size from its architectural offset (`st_size`).
+    /// Прочитать закодированный размер по его архитектурному смещению (`st_size`).
     ///
-    /// Pure accessor used by Property P8 to recover the input. (R2.8)
+    /// Чистый аксессор для Property P8, восстанавливающий вход. (R2.8)
     pub fn stat_size(&self) -> i64 {
         self.st_size
     }
 
-    /// Read back the encoded mode from its architectural offset (`st_mode`).
+    /// Прочитать закодированный режим по его архитектурному смещению (`st_mode`).
     ///
-    /// Pure accessor used by Property P8 to recover the input. (R2.8)
+    /// Чистый аксессор для Property P8, восстанавливающий вход. (R2.8)
     pub fn stat_mode(&self) -> u32 {
         self.st_mode
     }
 }
 
-/// Encode a [`LinuxStat`] from a file's `size` and `mode`.
+/// Закодировать [`LinuxStat`] из `size` и `mode` файла.
 ///
-/// `size` is placed in `st_size` and `mode` (which already carries the file-type
-/// bits such as [`S_IFREG`]) in `st_mode`. `st_blksize` is set to a sane value and
-/// every other field is zeroed (R2.8).
+/// `size` кладётся в `st_size`, `mode` (уже несущий биты типа файла вроде
+/// [`S_IFREG`]) — в `st_mode`. `st_blksize` ставится разумным значением, все
+/// остальные поля обнуляются (R2.8).
 pub fn encode_stat(size: u64, mode: u32, uid: u32, gid: u32) -> LinuxStat {
     let mut stat = LinuxStat::zeroed();
     stat.st_size = size as i64;

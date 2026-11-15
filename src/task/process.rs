@@ -1,5 +1,4 @@
-// task/process.rs — User process creation
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// task/process.rs — создание пользовательских процессов.
 
 use crate::arch::x86_64::gdt;
 use crate::arch::x86_64::linux::cred::Access;
@@ -22,15 +21,16 @@ use crate::memory::layout::{
     KERNEL_STACK_PAGES, PAGE_SIZE, USER_MMAP_BASE, USER_STACK_PAGES, USER_STACK_TOP,
 };
 
-/// Allocate and map a fresh per-PID kernel stack in the kernel higher-half and
-/// program the TSS `RSP0` (and the `syscall`-instruction kernel stack) to its
-/// top, returning the (exclusive) stack top.
+/// Выделить и отобразить свежий стек ядра на PID в ядерной верхней половине и
+/// запрограммировать TSS `RSP0` (и стек ядра для инструкции `syscall`) на его
+/// вершину, вернув (исключающую) вершину стека.
 ///
-/// Shared by [`create_user_process`] and [`run_linux_binary`]. The kernel
-/// higher-half PML4 entries are shared by reference into every user PML4 (cloned
-/// in `new_user_pml4`), so a mapping added here under an already-present
-/// top-level entry is visible while a user CR3 is active — exactly what the
-/// ring-3 → ring-0 entry (which lands on RSP0) needs.
+/// Общий код для [`create_user_process`] и [`run_linux_binary`]. Записи PML4
+/// ядерной верхней половины разделяются по ссылке в каждый пользовательский
+/// PML4 (клонируются в `new_user_pml4`), поэтому отображение, добавленное здесь
+/// под уже присутствующей записью верхнего уровня, видно при активном
+/// пользовательском CR3 — ровно это нужно входу ring-3 → ring-0, который
+/// попадает на RSP0.
 fn setup_task_kernel_stack(pid: u64) -> Result<u64, &'static str> {
     let (_guard_base, kstack_base, kstack_top) = crate::memory::layout::kernel_stack_for_pid(pid);
 
@@ -41,102 +41,106 @@ fn setup_task_kernel_stack(pid: u64) -> Result<u64, &'static str> {
         vmm::map(frame, vaddr, kflags).map_err(|_| "process: VMM map failed (kernel stack)")?;
     }
 
-    // Program RSP0 so ring-3 → ring-0 transitions land on this kernel stack.
-    // (Single-task limitation documented on `gdt::set_kernel_stack`.)
+    // Запрограммировать RSP0, чтобы переходы ring-3 → ring-0 попадали на этот
+    // стек ядра. (Ограничение одной задачи описано у `gdt::set_kernel_stack`.)
     gdt::set_kernel_stack(kstack_top);
-    // Mirror the same stack top for the `syscall`-instruction entry, which (unlike
-    // `int 0x80`) gets no automatic CPU stack switch and reads this value directly.
+    // Отразить ту же вершину стека для входа по инструкции `syscall`, который (в
+    // отличие от `int 0x80`) не получает автоматического переключения стека от
+    // CPU и читает это значение напрямую.
     crate::arch::x86_64::syscall::set_syscall_kernel_stack(kstack_top);
 
     Ok(kstack_top)
 }
 
-/// Build the initial ring-3 kernel-stack frame at `kstack_top` and return the
-/// resulting `kernel_rsp` the scheduler resumes from.
+/// Построить начальный ring-3 фрейм стека ядра по `kstack_top` и вернуть
+/// получившийся `kernel_rsp`, с которого возобновляется планировщик.
 ///
-/// The frame MUST match — byte for byte — the order in which the scheduler
-/// restore path consumes it (see `irq32_stub` / `kernel_thread_spawn`):
+/// Фрейм ОБЯЗАН побайтно совпадать с порядком, в котором его снимает путь
+/// восстановления планировщика (см. `irq32_stub` / `kernel_thread_spawn`):
 ///
 /// ```text
 ///     mov rsp, kernel_rsp
-///     popfq                     ; RFLAGS-for-popfq word (lowest address)
-///     pop r15 … pop rax         ; 15 GPR slots
+///     popfq                     ; слово RFLAGS для popfq (младший адрес)
+///     pop r15 … pop rax         ; 15 слотов GPR
 ///     iretq                     ; RIP, CS, RFLAGS, RSP, SS
 /// ```
 ///
-/// The `iretq` frame carries a ring-3 CS/SS (RPL 3), so `iretq` performs a
-/// privilege change to ring 3, loading `RSP = user_rsp` and `RIP = entry` with
-/// `RFLAGS.IF` set. All 15 GPR slots are zero: a fresh Linux/native program
-/// starts with no register contract. We OR `3` into the user selectors
-/// defensively so the RPL bits are set regardless of how the GDT crate builds
-/// them.
+/// iretq-фрейм несёт ring-3 CS/SS (RPL 3), поэтому `iretq` меняет привилегии на
+/// ring 3, загружая `RSP = user_rsp` и `RIP = entry` с `RFLAGS.IF`. Все 15
+/// слотов GPR нулевые: свежая Linux/нативная программа начинается без контракта
+/// регистров. Мы защитно ставим `3` в пользовательские селекторы, чтобы биты RPL
+/// были выставлены независимо от того, как их строит крейт GDT.
 ///
 /// # Safety
-/// `kstack_top` must be the exclusive top of a freshly mapped, writable kernel
-/// stack with at least `18 * 8` bytes available below it; this function writes
-/// into `[kernel_rsp, kstack_top)`.
+/// `kstack_top` обязан быть исключающей вершиной свежеотображённого
+/// записываемого стека ядра, под которой есть хотя бы `18 * 8` байт; функция
+/// пишет в `[kernel_rsp, kstack_top)`.
 unsafe fn build_ring3_frame(kstack_top: u64, entry: u64, user_rsp: u64) -> u64 {
     let user_cs = (gdt::Selectors::user_code().0 | 3) as u64;
     let user_ss = (gdt::Selectors::user_data().0 | 3) as u64;
 
     let mut rsp = kstack_top;
 
-    // iretq frame (highest addresses), consumed by `iretq`.
+    // iretq-фрейм (старшие адреса), снимается `iretq`.
     rsp -= 8;
     (rsp as *mut u64).write(user_ss); // SS  (RPL 3)
     rsp -= 8;
-    (rsp as *mut u64).write(user_rsp); // RSP (user stack pointer)
+    (rsp as *mut u64).write(user_rsp); // RSP (указатель пользовательского стека)
     rsp -= 8;
-    (rsp as *mut u64).write(0x202u64); // RFLAGS (IF set)
+    (rsp as *mut u64).write(0x202u64); // RFLAGS (IF установлен)
     rsp -= 8;
     (rsp as *mut u64).write(user_cs); // CS  (RPL 3)
     rsp -= 8;
-    (rsp as *mut u64).write(entry); // RIP = user entry
+    (rsp as *mut u64).write(entry); // RIP = пользовательская точка входа
 
-    // 15 GPR slots (rax highest .. r15 lowest), all zero.
+    // 15 слотов GPR (rax старший .. r15 младший), все нулевые.
     for _ in 0..15 {
         rsp -= 8;
         (rsp as *mut u64).write(0);
     }
 
-    // RFLAGS word consumed by `popfq` (lowest address = final kernel_rsp).
-    // IF=0 invariant: the restore tail must run with interrupts OFF until
-    // `iretq` re-enables them from the iret-frame RFLAGS slot above.
+    // Слово RFLAGS, снимаемое `popfq` (младший адрес = итоговый kernel_rsp).
+    // Инвариант IF=0: хвост восстановления идёт с ВЫКЛЮЧЕННЫМИ прерываниями до
+    // `iretq`, который снова включит их из слота RFLAGS iret-фрейма выше.
     rsp -= 8;
     (rsp as *mut u64).write(0x002u64);
 
     rsp
 }
 
-/// Create a ring-3 user process from an in-memory ELF image and add it to the
-/// scheduler's ready queue (Requirements 13.1, 13.4, 4.4).
+/// Создать ring-3 пользовательский процесс из ELF-образа в памяти и добавить его
+/// в ready-очередь планировщика (Requirements 13.1, 13.4, 4.4).
 ///
-/// Steps:
-///  1. `ElfLoader::load` parses/validates the ELF and maps its `PT_LOAD`
-///     segments into a fresh user PML4 (the loader switches CR3 internally for
-///     the segment maps and restores the kernel CR3 before returning).
-///  2. Map the user stack at `memory::layout::USER_STACK_TOP` into the user
-///     PML4 (CR3 switched around the maps, then restored).
-///  3. Allocate this task's kernel stack in the kernel higher-half (shared by
-///     reference into the user PML4) and program TSS RSP0 to its top so the
-///     CPU has a valid stack for ring-3 → ring-0 transitions (timer / int 0x80).
-///  4. Build the initial kernel-stack frame in EXACTLY the byte layout the
-///     scheduler restore path consumes, whose `iretq` frame drops to ring 3 at
-///     the ELF entry point on the user stack.
+/// Шаги:
+///  1. `ElfLoader::load` разбирает/валидирует ELF и отображает его `PT_LOAD`
+///     сегменты в свежий пользовательский PML4 (загрузчик внутри переключает CR3
+///     на время отображения сегментов и восстанавливает ядерный CR3 перед
+///     возвратом).
+///  2. Отобразить пользовательский стек по
+///     `memory::layout::USER_STACK_TOP` в пользовательский PML4 (CR3
+///     переключается вокруг отображений, затем восстанавливается).
+///  3. Выделить стек ядра этой задачи в ядерной верхней половине (разделён по
+///     ссылке в пользовательский PML4) и запрограммировать TSS RSP0 на его
+///     вершину, чтобы у CPU был валидный стек для переходов ring-3 → ring-0
+///     (таймер / int 0x80).
+///  4. Построить начальный фрейм стека ядра РОВНО в той байтовой раскладке,
+///     которую снимает путь восстановления планировщика, чей `iretq`-фрейм
+///     опускается в ring 3 на точку входа ELF на пользовательском стеке.
 ///
-/// PRECONDITION: the caller must run this with interrupts disabled — it briefly
-/// installs the user CR3 while still executing kernel code, and a timer tick in
-/// that window would let the scheduler observe the foreign CR3. `kernel_main`
-/// spawns the test process before enabling interrupts, satisfying this.
+/// ПРЕДУСЛОВИЕ: вызывающий выполняет это с выключенными прерываниями — на время
+/// исполнения кода ядра ставится пользовательский CR3, и тик таймера в этом окне
+/// дал бы планировщику увидеть чужой CR3. `kernel_main` запускает тестовый
+/// процесс до включения прерываний, так что условие выполнено.
 pub fn create_user_process(elf_data: &[u8]) -> Result<u64, &'static str> {
-    // ── 1. Load the ELF into a fresh user PML4 ───────────────────────────────
+    // ── 1. Загрузить ELF в свежий пользовательский PML4 ────────────────────
     let elf_proc = ElfLoader::load(elf_data)?;
     let pml4_phys = elf_proc.pml4_phys;
     let entry = elf_proc.entry;
 
-    // ── 2. Map the user stack into the user PML4 ─────────────────────────────
+    // ── 2. Отобразить пользовательский стек в пользовательский PML4 ─────────
     let user_stack_bottom = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
-    // Initial user RSP: 16-byte aligned, one slot below the (exclusive) top.
+    // Начальный пользовательский RSP: выровнен на 16, на один слот ниже
+    // (исключающей) вершины.
     let user_rsp = USER_STACK_TOP - 16;
 
     let uflags = PageTableFlags::PRESENT
@@ -145,8 +149,9 @@ pub fn create_user_process(elf_data: &[u8]) -> Result<u64, &'static str> {
         | PageTableFlags::NO_EXECUTE;
 
     let kernel_cr3 = vmm::current_pml4_phys();
-    // SAFETY: `pml4_phys` is a valid PML4 with the kernel higher-half cloned in,
-    // so kernel code/stack/heap remain mapped while it is installed.
+    // SAFETY: `pml4_phys` — валидный PML4 с клонированной ядерной верхней
+    // половиной, поэтому код/стек/куча ядра остаются отображёнными, пока он
+    // установлен.
     unsafe {
         vmm::load_cr3(pml4_phys);
     }
@@ -166,7 +171,7 @@ pub fn create_user_process(elf_data: &[u8]) -> Result<u64, &'static str> {
             }
         }
     }
-    // SAFETY: restore the kernel PML4 before doing anything else.
+    // SAFETY: сначала восстановить ядерный PML4.
     unsafe {
         vmm::load_cr3(kernel_cr3);
     }
@@ -174,12 +179,12 @@ pub fn create_user_process(elf_data: &[u8]) -> Result<u64, &'static str> {
         return Err(e);
     }
 
-    // ── 3. Allocate the task's kernel stack + program TSS RSP0 ───────────────
+    // ── 3. Выделить стек ядра задачи + запрограммировать TSS RSP0 ──────────
     let pid = scheduler::next_pid();
     let kstack_top = setup_task_kernel_stack(pid)?;
 
-    // ── 4. Build the initial kernel-stack frame ──────────────────────────────
-    // SAFETY: writing into the freshly mapped kernel stack we just allocated.
+    // ── 4. Построить начальный фрейм стека ядра ─────────────────────────────
+    // SAFETY: пишем в только что выделенный и отображённый стек ядра.
     let kernel_rsp = unsafe { build_ring3_frame(kstack_top, entry, user_rsp) };
 
     let tcb = Tcb::new(pid, kernel_rsp, pml4_phys);
@@ -190,26 +195,28 @@ pub fn create_user_process(elf_data: &[u8]) -> Result<u64, &'static str> {
     Ok(pid)
 }
 
-/// Build, in memory, a minimal statically-linked `ET_EXEC` x86_64 ELF whose
-/// program issues `SYS_WRITE(fd=1, msg, len)` then `SYS_EXIT(0)` via `int 0x80`.
+/// Собрать в памяти минимальный статически слинкованный `ET_EXEC` x86_64 ELF,
+/// чья программа выдаёт `SYS_WRITE(fd=1, msg, len)`, затем `SYS_EXIT(0)` через
+/// `int 0x80`.
 ///
-/// The whole image is a single `PT_LOAD` RWX segment loaded at virtual base
-/// `0x40_0000` (lower-half canonical, so `sys_write`'s pointer validation
-/// accepts the message buffer). The message lives inside that mapped segment,
-/// so it is `USER_ACCESSIBLE` in the user PML4 and reachable from ring 3.
+/// Всё изображение — один `PT_LOAD` RWX-сегмент, загруженный по виртуальной базе
+/// `0x40_0000` (каноническая нижняя половина, поэтому валидация указателя в
+/// `sys_write` принимает буфер сообщения). Сообщение живёт внутри отображённого
+/// сегмента, то есть `USER_ACCESSIBLE` в пользовательском PML4 и достижимо из
+/// ring 3.
 ///
-/// The bytes are assembled here rather than committed as a binary so the kernel
-/// needs no external assembler/linker to build.
+/// Байты собираются здесь, а не коммитятся бинарём, чтобы ядру не нужен был
+/// внешний ассемблер/линкер при сборке.
 fn build_test_elf() -> Vec<u8> {
     const VBASE: u64 = 0x40_0000;
     const EHSIZE: usize = 64; // sizeof(Elf64Header)
     const PHSIZE: usize = 56; // sizeof(Elf64ProgramHeader)
-    let code_off = EHSIZE + PHSIZE; // file offset (and vaddr offset) of the code
+    let code_off = EHSIZE + PHSIZE; // файловое смещение (и смещение vaddr) кода
 
     let msg: &[u8] = b"Hello from ring3 user process!\n";
 
-    // ── Hand-assembled machine code (see byte comments) ──────────────────────
-    // The message immediately follows the code, so compute its address first.
+    // ── Машинный код, собранный вручную (см. комментарии к байтам) ───────────
+    // Сообщение идёт сразу за кодом, поэтому сначала вычисляем его адрес.
     const CODE_LEN: usize = 33;
     let msg_off = code_off + CODE_LEN;
     let msg_addr = VBASE + msg_off as u64;
@@ -224,9 +231,9 @@ fn build_test_elf() -> Vec<u8> {
     code.extend_from_slice(&len.to_le_bytes()); // mov edx, len
     code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
     code.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]); // mov eax, 2  (SYS_EXIT)
-    code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi (code = 0)
+    code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi (код = 0)
     code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
-    code.extend_from_slice(&[0xEB, 0xFE]); // 1: jmp 1b (fallback)
+    code.extend_from_slice(&[0xEB, 0xFE]); // 1: jmp 1b (запасной цикл)
     debug_assert_eq!(code.len(), CODE_LEN);
 
     let entry = VBASE + code_off as u64;
@@ -234,13 +241,13 @@ fn build_test_elf() -> Vec<u8> {
 
     let mut elf: Vec<u8> = Vec::new();
 
-    // ── ELF64 header (64 bytes) ──────────────────────────────────────────────
+    // ── Заголовок ELF64 (64 байта) ──────────────────────────────────────────
     elf.extend_from_slice(&[0x7F, b'E', b'L', b'F']); // EI_MAG
     elf.push(2); // EI_CLASS = ELFCLASS64
     elf.push(1); // EI_DATA  = ELFDATA2LSB
     elf.push(1); // EI_VERSION
     elf.push(0); // EI_OSABI = System V
-                 // EI_ABIVERSION + 7 padding bytes
+                 // EI_ABIVERSION + 7 байт паддинга
     elf.extend_from_slice(&[0u8; 8]);
     elf.extend_from_slice(&2u16.to_le_bytes()); // e_type    = ET_EXEC
     elf.extend_from_slice(&0x3Eu16.to_le_bytes()); // e_machine = EM_X86_64
@@ -257,7 +264,7 @@ fn build_test_elf() -> Vec<u8> {
     elf.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
     debug_assert_eq!(elf.len(), EHSIZE);
 
-    // ── Program header (56 bytes): one PT_LOAD covering the whole image ──────
+    // ── Program header (56 байт): один PT_LOAD на весь образ ────────────────
     elf.extend_from_slice(&1u32.to_le_bytes()); // p_type  = PT_LOAD
     elf.extend_from_slice(&7u32.to_le_bytes()); // p_flags = PF_R|PF_W|PF_X
     elf.extend_from_slice(&0u64.to_le_bytes()); // p_offset (segment starts at file 0)
@@ -268,7 +275,7 @@ fn build_test_elf() -> Vec<u8> {
     elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
     debug_assert_eq!(elf.len(), EHSIZE + PHSIZE);
 
-    // ── Code + message ───────────────────────────────────────────────────────
+    // ── Код + сообщение ──────────────────────────────────────────────────────
     elf.extend_from_slice(&code);
     elf.extend_from_slice(msg);
     debug_assert_eq!(elf.len() as u64, total_len);
@@ -276,52 +283,52 @@ fn build_test_elf() -> Vec<u8> {
     elf
 }
 
-/// Build the embedded test ELF and launch it as a ring-3 user process.
+/// Собрать встроенный тестовый ELF и запустить его как ring-3 пользовательский
+/// процесс.
 ///
-/// Used by the boot path (and exercisable from the shell) to drive the
-/// user-mode + syscall round trip end to end: the process performs a
-/// `SYS_WRITE` (observable on serial) followed by `SYS_EXIT`.
+/// Используется путём загрузки (и вызывается из шелла), чтобы прогнать полный
+/// цикл user-mode + syscall: процесс выполняет `SYS_WRITE` (наблюдаемо на
+/// serial), затем `SYS_EXIT`.
 pub fn spawn_test_user_process() -> Result<u64, &'static str> {
     let elf = build_test_elf();
     create_user_process(&elf)
 }
 
-/// Failure modes of [`run_linux_binary`] (R7.3, R7.4, R7.5).
+/// Режимы отказа [`run_linux_binary`] (R7.3, R7.4, R7.5).
 ///
-/// In every error case the function returns *before* adding any task to the
-/// scheduler ready queue, so a failed launch never leaves a half-built
-/// `Compat_Process` running (R7.3).
+/// При любой ошибке функция возвращается ДО добавления задачи в ready-очередь
+/// планировщика, поэтому неудачный запуск никогда не оставляет полупостроенный
+/// `Compat_Process` работающим (R7.3).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RunError {
-    /// The argument list exceeded the run-request gate (>256 args or >4096
-    /// combined bytes); the request is rejected before any work (R7.5).
+    /// Список аргументов превысил гейт run-запроса (>256 аргументов или >4096
+    /// суммарных байт); запрос отвергается до любой работы (R7.5).
     ArgsTooLarge,
-    /// The requested path does not exist or could not be read from ext2 (R7.4).
+    /// Запрошенный путь не существует или не читается с ext2 (R7.4).
     NotFound,
-    /// The ELF loader rejected the binary; carries the loader's descriptive
-    /// cause string (R7.3).
+    /// ELF-загрузчик отверг бинарь; несёт описательную причину от загрузчика
+    /// (R7.3).
     LoadFailed(&'static str),
-    /// The initial stack could not be built/mapped (encoder `TooLarge` or a
-    /// mapping failure); the process is not started (R7.3).
+    /// Начальный стек не удалось построить/отобразить (кодировщик `TooLarge` или
+    /// отказ отображения); процесс не запускается (R7.3).
     StackFailed,
-    /// A directory on the exec path is not searchable by the caller (POSIX
-    /// `x` permission; F-x86v-3).
+    /// Каталог на пути exec непросматриваем вызывающим (POSIX-право `x`).
     AccessDenied,
 }
 
-/// Read the entire contents of an ext2 file reachable through the VFS at `path`.
+/// Прочитать всё содержимое файла ext2, достижимого через VFS по `path`.
 ///
-/// Returns [`RunError::NotFound`] when the path does not resolve, names a
-/// directory, or cannot be read (R7.4). Runs with interrupts enabled because the
-/// ext2/VFS read path may block waiting on a device interrupt.
+/// Возвращает [`RunError::NotFound`], когда путь не разрешается, называет
+/// каталог или не читается (R7.4). Идёт с включёнными прерываниями, потому что
+/// путь чтения ext2/VFS может блокироваться в ожидании прерывания устройства.
 fn read_file_all(path: &str) -> Result<Vec<u8>, RunError> {
-    // Follow symbolic links (issue #18): a Debian image is usually reached
-    // through one (`/usr/bin/python3` → `python3.11`, `/lib64/ld-linux…`).
+    // Разыменовывать символические ссылки: образ Debian обычно достижим через
+    // одну из них (`/usr/bin/python3` → `python3.11`, `/lib64/ld-linux…`).
     //
-    // The walk is credential-checked: `execve(2)` must not reach an image
-    // through a directory the caller may not search (F-x86v-3; this path is
-    // kernel-internal for the boot selftests and `lxrun`, which run as root and
-    // therefore behave exactly as before).
+    // Обход проверяет креденшелы: `execve(2)` не должен достигать образа через
+    // каталог, который вызывающему нельзя просматривать (этот путь внутри ядра
+    // для boot-selftest'ов и `lxrun`, работающих под root и потому ведущих себя
+    // как раньше).
     let may_search = |node: &Arc<dyn crate::vfs::VfsNode>| {
         compat::current_creds().may(node.mode(), node.owner(), Access::Execute)
     };
@@ -336,10 +343,10 @@ fn read_file_all(path: &str) -> Result<Vec<u8>, RunError> {
         return Err(RunError::NotFound);
     }
 
-    // `i_size` is image-controlled: an attacker can mount a file that claims
-    // ~4 GiB while owning no data block, so `vec![0u8; size]` here was another
-    // allocation-abort site (same class as F-x86v-1/F-x86v-2). Cap the image
-    // size and reserve fallibly; a real userland ELF is a few MiB.
+    // `i_size` контролируется образом: атакующий может смонтировать файл,
+    // заявляющий ~4 ГиБ без единого блока данных, поэтому `vec![0u8; size]` был
+    // ещё одной точкой abort по аллокации. Ограничиваем размер образа и
+    // резервируем с возможностью отказа; настоящий userland-ELF — несколько МиБ.
     const MAX_EXEC_IMAGE: usize = 256 * 1024 * 1024;
     let size = node.size() as usize;
     if size > MAX_EXEC_IMAGE {
@@ -352,7 +359,7 @@ fn read_file_all(path: &str) -> Result<Vec<u8>, RunError> {
     let mut off: usize = 0;
     while off < size {
         match node.read(off as u64, &mut data[off..]) {
-            Ok(0) => break, // short read / EOF
+            Ok(0) => break, // короткое чтение / EOF
             Ok(n) => off += n,
             Err(_) => return Err(RunError::NotFound),
         }
@@ -361,12 +368,12 @@ fn read_file_all(path: &str) -> Result<Vec<u8>, RunError> {
     Ok(data)
 }
 
-/// `st_ino` of the VFS node a launch reads its image (or interpreter) from,
-/// exactly as `stat(2)` reports it; `0` when the path has no VFS identity.
+/// `st_ino` узла VFS, из которого запуск читает образ (или интерпретатор),
+/// ровно как его сообщает `stat(2)`; `0`, когда у пути нет идентичности VFS.
 ///
-/// `/proc/<pid>/maps` prints it on the file-backed segment lines (`docs/procfs.md`
-/// §14) — the alternative would be claiming `00:00 0` for a file that does have
-/// a real inode.
+/// `/proc/<pid>/maps` печатает его в строках file-backed сегментов
+/// (`docs/procfs.md` §14) — альтернативой было бы заявлять `00:00 0` для файла,
+/// у которого на самом деле есть реальный inode.
 fn path_ino(path: &str) -> u64 {
     crate::vfs::lookup_path_walk(path, true)
         .ok()
@@ -416,11 +423,10 @@ fn elf_interpreter_path(data: &[u8]) -> Result<Option<String>, RunError> {
     Ok(None)
 }
 
-/// Resolve the ELF interpreter: returns the **guest-visible** interpreter path,
-/// the **kernel** path that was actually read (for `/proc/<pid>/maps` inode
-/// identity), and the bytes.
-/// (as named by `PT_INTERP`) together with its on-disk bytes. The path is what
-/// `/proc/self/maps` reports for the loader's own segments.
+/// Разрешить ELF-интерпретатор: вернуть **гостевой** путь интерпретатора,
+/// **ядерный** путь, который реально прочитали (для идентичности inode в
+/// `/proc/<pid>/maps`), и байты. Путь — тот, что называет `PT_INTERP`, и именно
+/// его `/proc/self/maps` сообщает для сегментов самого загрузчика.
 fn read_interpreter(data: &[u8]) -> Result<Option<(String, String, Vec<u8>)>, RunError> {
     let Some(path) = elf_interpreter_path(data)? else {
         return Ok(None);
@@ -430,10 +436,10 @@ fn read_interpreter(data: &[u8]) -> Result<Option<(String, String, Vec<u8>)>, Ru
     } else {
         format!("/mnt/{}", path)
     };
-    // PT_INTERP names /lib64/ld-linux-x86-64.so.2,
-    // which in Debian debs exists only as a symlink; the real loader lives in
-    // /usr/lib/x86_64-linux-gnu. Try the literal path first, then the known
-    // merged-usr locations, so a missing symlink cannot break every launch.
+    // PT_INTERP называет /lib64/ld-linux-x86-64.so.2, который в Debian-пакетах
+    // существует только как симлинк; настоящий загрузчик лежит в
+    // /usr/lib/x86_64-linux-gnu. Пробуем буквальный путь первым, затем известные
+    // merged-usr места, чтобы отсутствующий симлинк не ломал каждый запуск.
     if let Ok(data) = read_file_all(&disk_path) {
         return Ok(Some((path, disk_path, data)));
     }
@@ -460,7 +466,7 @@ fn read_interpreter(data: &[u8]) -> Result<Option<(String, String, Vec<u8>)>, Ru
             return Ok(Some((path.clone(), cand.clone(), data)));
         }
     }
-    // Nothing matched: surface the original error for the literal path.
+    // Ничего не совпало: вернуть исходную ошибку для буквального пути.
     read_file_all(&disk_path).map(|data| Some((path, disk_path, data)))
 }
 
@@ -468,8 +474,8 @@ struct LoadedLinux {
     elf: crate::vfs::elf::ElfProcess,
     start_entry: u64,
     interp_base: u64,
-    /// Mapped PT_LOAD segments of the ELF interpreter (empty for static images),
-    /// collected for `/proc/self/maps`.
+    /// Отображённые PT_LOAD-сегменты ELF-интерпретатора (пусто для статических
+    /// образов), собраны для `/proc/self/maps`.
     interp_segments: Vec<crate::vfs::elf::LoadSegment>,
 }
 
@@ -497,61 +503,62 @@ fn map_linux_images(data: &[u8], interpreter: Option<&[u8]>) -> Result<LoadedLin
     }
 }
 
-/// Read a static Linux binary from ext2, load it, build its System V initial
-/// stack with `argv`/`envp`, register its per-process `Compat_Process` state, and
-/// enqueue it as a ring-3 task (design component 6; R7.1–R7.6).
+/// Прочитать статический Linux-бинарь с ext2, загрузить его, построить
+/// начальный стек System V с `argv`/`envp`, зарегистрировать per-process
+/// состояние `Compat_Process` и поставить его в очередь как ring-3 задачу
+/// (design component 6; R7.1–R7.6).
 ///
-/// Pipeline:
-///   1. **Argument gate (R7.5).** [`arg_gate`] enforces ≤256 args and ≤4096
-///      combined bytes; over-limit → [`RunError::ArgsTooLarge`] before any work.
-///   2. **Read the file (R7.4).** Resolve and read the ext2 path; missing or
-///      unreadable → [`RunError::NotFound`].
-///   3. **Load the ELF (R7.3).** [`ElfLoader::load_linux`] maps `PT_LOAD`
-///      segments `USER_ACCESSIBLE` into a fresh user PML4 (R7.6); a rejection →
-///      [`RunError::LoadFailed`] with **no** task enqueued.
-///   4. **Build + map the stack (R7.6, R7.3).** Generate 16 `AT_RANDOM` bytes,
-///      assemble [`AuxInputs`] from the loader outputs, and
-///      [`map_initial_stack`] the SysV image into the user stack (also
-///      `USER_ACCESSIBLE`); any failure → [`RunError::StackFailed`], no enqueue.
-///   5. **Construct the `Compat_Process`.** Allocate a pid, set up its kernel
-///      stack + TSS `RSP0`, seed [`CompatState`] (a [`FdTable`] with the standard
-///      streams + a [`VmRegionSet`] from `initial_brk`/the lower-half mmap hint
-///      base + `tid = pid`), and register it via
-///      [`compat::install_compat`] **before** enqueue so the very first syscall
-///      observes it.
-///   6. **Enqueue.** Build the ring-3 `iretq` frame at `entry`/`initial_rsp` and
-///      `scheduler::spawn` the task. `exit`/`exit_group` later terminate only
-///      this task and drop its registry entry (R7.2).
+/// Конвейер:
+///   1. **Гейт аргументов (R7.5).** [`arg_gate`] требует ≤256 аргументов и ≤4096
+///      суммарных байт; превышение → [`RunError::ArgsTooLarge`] до любой работы.
+///   2. **Прочитать файл (R7.4).** Разрешить и прочитать путь ext2; отсутствует
+///      или не читается → [`RunError::NotFound`].
+///   3. **Загрузить ELF (R7.3).** [`ElfLoader::load_linux`] отображает `PT_LOAD`
+///      сегменты `USER_ACCESSIBLE` в свежий пользовательский PML4 (R7.6); отказ →
+///      [`RunError::LoadFailed`] с **не** поставленной в очередь задачей.
+///   4. **Построить + отобразить стек (R7.6, R7.3).** Сгенерировать 16 байт
+///      `AT_RANDOM`, собрать [`AuxInputs`] из выходов загрузчика и
+///      [`map_initial_stack`] для SysV-образа в пользовательский стек (тоже
+///      `USER_ACCESSIBLE`); любая ошибка → [`RunError::StackFailed`], без
+///      постановки в очередь.
+///   5. **Собрать `Compat_Process`.** Выделить pid, подготовить стек ядра + TSS
+///      `RSP0`, засеять [`CompatState`] ([`FdTable`] со стандартными потоками +
+///      [`VmRegionSet`] из `initial_brk`/mmap-подсказки нижней половины +
+///      `tid = pid`) и зарегистрировать через [`compat::install_compat`] **до**
+///      постановки в очередь, чтобы первый же syscall её увидел.
+///   6. **В очередь.** Построить ring-3 `iretq`-фрейм на `entry`/`initial_rsp` и
+///      `scheduler::spawn` задачу. `exit`/`exit_group` позже завершают только
+///      эту задачу и удаляют её запись из реестра (R7.2).
 ///
-/// Steps 3–6 run with interrupts disabled: [`ElfLoader::load_linux`] and
-/// [`map_initial_stack`] each briefly install the user CR3 while executing kernel
-/// code, exactly like [`create_user_process`], so a timer tick must not observe
-/// the foreign address space. The ext2 read in step 2 runs *before* the guard so
-/// it may block on disk I/O.
+/// Шаги 3–6 идут с выключенными прерываниями: [`ElfLoader::load_linux`] и
+/// [`map_initial_stack`] ненадолго ставят пользовательский CR3, пока исполняется
+/// код ядра, как и [`create_user_process`], поэтому тик таймера не должен видеть
+/// чужое адресное пространство. Чтение ext2 на шаге 2 выполняется *до* заслона,
+/// поэтому может блокироваться на дисковом I/O.
 pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u64, RunError> {
-    // ── 1. Argument gate (R7.5) ──────────────────────────────────────────────
+    // ── 1. Гейт аргументов (R7.5) ────────────────────────────────────────────
     if !arg_gate(argv) {
         return Err(RunError::ArgsTooLarge);
     }
 
-    // ── 2. Read the ext2 file (R7.4) — interrupts enabled (may block on I/O) ─
+    // ── 2. Прочитать файл ext2 (R7.4) — прерывания включены (может ждать I/O) ─
     let data = read_file_all(path)?;
     let interpreter = read_interpreter(&data)?;
-    // File identity of the image and its interpreter for `/proc/<pid>/maps`
-    // (captured from the same VFS nodes the launch reads; 0 for static images).
+    // Идентичность файла образа и его интерпретатора для `/proc/<pid>/maps`
+    // (снята с тех же узлов VFS, что читает запуск; 0 для статических образов).
     let image_ino = path_ino(path);
     let interp_ino = interpreter
         .as_ref()
         .map(|(_, disk_path, _)| path_ino(disk_path))
         .unwrap_or(0);
 
-    // ── 3–6. CR3-sensitive launch, interrupts disabled (like create_user_process) ─
+    // ── 3–6. Запуск, чувствительный к CR3, с выключенными прерываниями ─────────
     crate::arch::cpu::without_interrupts(|| {
-        // 3. Load the ELF into a fresh user PML4 (segments USER_ACCESSIBLE, R7.6).
+        // 3. Загрузить ELF в свежий пользовательский PML4 (сегменты USER_ACCESSIBLE, R7.6).
         let loaded = map_linux_images(&data, interpreter.as_ref().map(|(_, _, d)| d.as_slice()))?;
         let elf = loaded.elf;
 
-        // 4. Build the SysV initial stack and map it (USER_ACCESSIBLE, R7.6).
+        // 4. Построить начальный SysV-стек и отобразить его (USER_ACCESSIBLE, R7.6).
         let random16 = crate::arch::x86_64::linux::misc::random_bytes_16();
         let aux = AuxInputs {
             phdr: elf.phdr_vaddr,
@@ -560,14 +567,14 @@ pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u6
             entry: elf.entry,
             pagesz: PAGE_SIZE,
             base: loaded.interp_base,
-            // The encoder owns the random block placement and ignores this field.
+            // Кодировщик сам владеет размещением случайного блока и игнорирует это поле.
             random_ptr: 0,
         };
         let initial_rsp = map_initial_stack(elf.pml4_phys, argv, envp, &aux, random16).map_err(
             |e: StackMapError| {
-                // Any stack failure (encoder TooLarge or a mapping fault) aborts
-                // the launch without enqueuing; the loader's PML4 is simply
-                // abandoned (not handed to the scheduler), satisfying R7.3.
+                // Любая ошибка стека (кодировщик TooLarge или отказ отображения)
+                // обрывает запуск без постановки в очередь; PML4 загрузчика просто
+                // бросается (не передаётся планировщику), что выполняет R7.3.
                 crate::error!(
                     "[linux] run '{}': initial stack construction failed: {:?}",
                     path,
@@ -577,7 +584,7 @@ pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u6
             },
         )?;
 
-        // 5. Build the Compat_Process: pid, kernel stack + TSS RSP0, compat state.
+        // 5. Собрать Compat_Process: pid, стек ядра + TSS RSP0, compat-состояние.
         let pid = scheduler::next_pid();
         let kstack_top = setup_task_kernel_stack(pid).map_err(RunError::LoadFailed)?;
 
@@ -589,11 +596,11 @@ pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u6
             ))),
             pid,
         );
-        // Remember the image path for readlink("/proc/self/exe").
+        // Запомнить путь образа для readlink("/proc/self/exe").
         state.exe_path = path.to_string();
-        // Procfs state (issue #11): the argv NUL-joined for /proc/self/cmdline
-        // (the initial stack holds a copy, but that lives in user memory), the
-        // loaded PT_LOAD segments for /proc/self/maps, and the interpreter path.
+        // Состояние procfs: argv, склеенные NUL для /proc/self/cmdline
+        // (начальный стек хранит копию, но она живёт в памяти пользователя),
+        // загруженные PT_LOAD сегменты для /proc/self/maps и путь интерпретатора.
         state.cmdline =
             crate::vfs::procfs_format::format_cmdline(argv, crate::vfs::procfs_format::CMDLINE_CAP);
         state.image_segments = elf.segments.clone();
@@ -604,13 +611,14 @@ pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u6
             .as_ref()
             .map(|(p, _, _)| p.clone())
             .unwrap_or_default();
-        // Register BEFORE enqueue so the first syscall the process makes already
-        // sees its CompatState (and so the dispatcher routes it as a Linux task).
+        // Регистрировать ДО постановки в очередь, чтобы первый же syscall
+        // процесса уже видел его CompatState (и диспетчер маршрутизировал его как
+        // Linux-задачу).
         compat::install_compat(pid, state);
 
-        // 6. Seed the ring-3 iretq frame at the ELF entry on the SysV stack and
-        //    enqueue the task.
-        // SAFETY: writing into the freshly mapped kernel stack from step 5.
+        // 6. Засеять ring-3 iretq-фрейм на точке входа ELF на SysV-стеке и
+        //    поставить задачу в очередь.
+        // SAFETY: пишем в только что отображённый стек ядра из шага 5.
         let kernel_rsp = unsafe { build_ring3_frame(kstack_top, loaded.start_entry, initial_rsp) };
 
         let tcb = Tcb::new(pid, kernel_rsp, elf.pml4_phys);
@@ -635,10 +643,10 @@ pub struct ExecImage {
     pub pml4_phys: u64,
 }
 
-/// Resolve an execve path against the process cwd and the /mnt ext2
-/// root. The forked nvim child execs the /proc/self/exe target or a $PATH hit
-/// like "/mnt/usr/bin/nvim" directly; plain Linux paths ("/usr/bin/x") fall
-/// through to the /mnt-prefixed form.
+/// Разрешить путь execve относительно cwd процесса и корня ext2 /mnt.
+/// Форк-ребёнок nvim делает exec цели /proc/self/exe или попадания $PATH вида
+/// "/mnt/usr/bin/nvim" напрямую; обычные Linux-пути ("/usr/bin/x") откатываются
+/// к форме с префиксом /mnt.
 fn resolve_exec_path(path: &str) -> String {
     let abs = if path.starts_with('/') {
         path.to_string()
@@ -661,32 +669,33 @@ fn resolve_exec_path(path: &str) -> String {
     abs
 }
 
-/// Resolve `path` exactly as [`exec_linux_image`] would and return the VFS node
-/// that would be execed (`None` when the path does not resolve, in which case
-/// the exec itself reports the error).
+/// Разрешить `path` точно так же, как это сделал бы [`exec_linux_image`], и
+/// вернуть узел VFS, который будет exec'нут (`None`, когда путь не разрешается —
+/// тогда exec сам сообщит ошибку).
 ///
-/// The syscall layer (`process_sys::sys_execve`) uses this to enforce the
-/// execute permission; the kernel-internal launcher (`run_linux_binary`, used by
-/// the boot selftests and the shell's `lxrun`) deliberately does not go through
-/// this check — it is a privileged kernel caller, like the package installer.
+/// Слой syscall (`process_sys::sys_execve`) использует это для проверки права на
+/// исполнение; ядерный запускатель (`run_linux_binary`, boot-selftest'ы и `lxrun`
+/// шелла) намеренно не проходит эту проверку — это привилегированный ядерный
+/// вызывающий, как и установщик пакетов.
 pub fn exec_target_node(path: &str) -> Option<Arc<dyn crate::vfs::VfsNode>> {
     let resolved = resolve_exec_path(path);
     crate::vfs::lookup_path_walk(&resolved, true).ok()
 }
 
-/// Prepare and install a fresh ELF address space for the current pid. Open file
-/// descriptors, cwd, ppid and pid survive; VM/TLS/image state is reset.
+/// Подготовить и установить свежее ELF-адресное пространство для текущего pid.
+/// Открытые дескрипторы, cwd, ppid и pid сохраняются; состояние VM/TLS/образа
+/// сбрасывается.
 pub fn exec_linux_image(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<ExecImage, RunError> {
     if !arg_gate(argv) || !arg_gate(envp) {
         return Err(RunError::ArgsTooLarge);
     }
-    // Resolve the path the way Linux userspace sees the tree.
+    // Разрешить путь так, как его видит Linux-userspace.
     let resolved = resolve_exec_path(path);
     let path = resolved.as_str();
     let data = read_file_all(path)?;
     let interpreter = read_interpreter(&data)?;
-    // File identity of the new image and its interpreter for
-    // `/proc/<pid>/maps` (the old image's segments are replaced below).
+    // Идентичность файла нового образа и его интерпретатора для
+    // `/proc/<pid>/maps` (сегменты старого образа заменяются ниже).
     let image_ino = path_ino(path);
     let interp_ino = interpreter
         .as_ref()
@@ -722,11 +731,11 @@ pub fn exec_linux_image(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<Ex
             st.tid = pid;
             st.nosys_logged.clear();
             st.exit_code = None;
-            // The close-on-exec sweep (libuv's fork error pipe
-            // relies on it) + record the new image for /proc/self/exe.
+            // Вычистка close-on-exec (на ней держится error-pipe fork у libuv) +
+            // запись нового образа для /proc/self/exe.
             st.fds.close_cloexec();
-            // What the fresh image actually sees on stdio —
-            // answers whether the spawn wired the RPC socket onto fds 0/1.
+            // Что свежий образ реально видит на stdio — отвечает, подключил ли
+            // spawn RPC-сокет к fd 0/1.
             st.exec_stdio = [
                 st.fds.describe_fd(0),
                 st.fds.describe_fd(1),
@@ -748,19 +757,19 @@ pub fn exec_linux_image(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<Ex
                 .unwrap_or_default();
         })
         .ok_or(RunError::LoadFailed("execve without compat state"))?;
-        // SAFETY: loader built a valid PML4 with shared kernel higher-half mappings.
+        // SAFETY: загрузчик построил валидный PML4 с разделяемыми ядерными отображениями верхней половины.
         let old_cr3 = vmm::current_pml4_phys();
         unsafe {
             vmm::load_cr3(elf.pml4_phys);
         }
-        // The replaced address space is dead: return its frames (COW leaves
-        // are unref'd, so a fork child exec'ing releases the parent's shared
-        // frames). Kept alive when another live task still runs on it — a
-        // sibling thread (CLONE_VM) that is ready, SIGSTOP-parked or awaiting
-        // reaping. Linux would kill the sibling thread group here; this
-        // kernel keeps the thread alive in the old image instead, which is
-        // memory-safe (the page tables stay owned until the last user exits)
-        // and is the round-3 F-r3-lead-1 fix for the page-table UAF.
+        // Заменённое адресное пространство мертво: вернуть его кадры (COW-листья
+        // делают unref, поэтому exec'нувшийся ребёнок fork освобождает
+        // разделяемые кадры родителя). Оно остаётся живым, пока на нём ещё
+        // выполняется другая живая задача — поток-сосед (CLONE_VM), который
+        // готов, припаркован SIGSTOP или ждёт reaping. Linux убил бы группу
+        // потоков здесь; это ядро оставляет поток живым в старом образе, что
+        // безопасно по памяти (таблицы страниц остаются во владении до выхода
+        // последнего пользователя) и является исправлением page-table UAF.
         let freed = scheduler::drop_exclusive_user_space(old_cr3);
         crate::info!(
             "[linux] execve pid={} '{}' new_pml4=0x{:x} entry=0x{:x} old_cr3=0x{:x} freed={}",
@@ -808,7 +817,7 @@ unsafe fn build_clone_frame(
     }
     sp -= 8;
     (sp as *mut u64).write(0x002);
-    sp // popfq slot: IF=0 invariant (restore tail runs with IRQs off)
+    sp // слот popfq: инвариант IF=0 (хвост восстановления идёт с выключенными IRQ)
 }
 pub fn spawn_linux_thread(
     regs: &crate::arch::x86_64::linux::regs::SavedRegs,
@@ -825,29 +834,29 @@ pub fn spawn_linux_thread(
     Ok(child)
 }
 
-/// Duplicate the current Compat_Process into a fresh pid with a
-/// deep-copied address space (eager page copy — no COW). The child resumes at
-/// the same user RIP (`regs.rcx` on the syscall path) with `rax = 0` (the zero
-/// rax slot in `build_clone_frame`) on its private copy of the parent's user
-/// stack; the parent receives the child pid from `sys_clone`'s return value.
+/// Продублировать текущий Compat_Process в свежий pid с глубоко скопированным
+/// адресным пространством (жадное копирование страниц — без COW). Ребёнок
+/// возобновляется с тем же user RIP (`regs.rcx` на пути syscall) с `rax = 0`
+/// (нулевой слот rax в `build_clone_frame`) на своей приватной копии
+/// пользовательского стека родителя; родитель получает pid ребёнка как возврат
+/// `sys_clone`.
 ///
-/// Runs with interrupts disabled so (a) the page-copy walk sees a stable
-/// parent address space and (b) the child cannot be scheduled before its
-/// CompatState is registered.
+/// Идёт с выключенными прерываниями, чтобы (а) обход копирования страниц видел
+/// стабильное адресное пространство родителя и (б) ребёнка нельзя было
+/// запланировать до регистрации его CompatState.
 ///
-/// `parent_tid` / `child_tid` are the `CLONE_PARENT_SETTID` /
-/// `CLONE_CHILD_SETTID` output pointers (0 = that flag was not requested). Both
-/// the validation and the writes happen inside this interrupt-disabled window:
-/// a sibling thread of the caller can share its address space (`CLONE_VM`), so
-/// validating before the fork and writing after it let that sibling munmap the
-/// page in between — and the ring-0 write then faulted in kernel mode and
-/// halted the machine (F-x86a-4 clone residue). Masking interrupts makes the
-/// checked mapping impossible to change until both writes are done; the child
-/// is enqueued but cannot run either. The child-side write lands in the child's
-/// already-copied address space through the HHDM window (the parent's own page
-/// keeps its value); without this window the child could run, munmap its
-/// `child_tid` page and leave the translate-then-write writing into a freed
-/// frame.
+/// `parent_tid` / `child_tid` — выходные указатели `CLONE_PARENT_SETTID` /
+/// `CLONE_CHILD_SETTID` (0 = флаг не запрошен). И проверка, и записи происходят
+/// внутри этого окна с выключенными прерываниями: поток-сосед вызывающего может
+/// делить его адресное пространство (`CLONE_VM`), поэтому проверка до fork и
+/// запись после него дали бы соседу munmap страницы между ними — и запись из
+/// ring 0 упала бы в режиме ядра, остановив машину. Маскирование прерываний
+/// делает проверенное отображение неизменным до завершения обеих записей;
+/// ребёнок поставлен в очередь, но тоже не может выполняться. Запись на стороне
+/// ребёнка попадает в уже скопированное адресное пространство ребёнка через окно
+/// HHDM (собственная страница родителя сохраняет значение); без этого окна
+/// ребёнок мог бы выполниться, munmap свою страницу `child_tid` и оставить
+/// translate-then-write пишущим в освобождённый кадр.
 pub fn fork_linux_process(
     regs: &crate::arch::x86_64::linux::regs::SavedRegs,
     clear_child_tid: u64,
@@ -856,8 +865,8 @@ pub fn fork_linux_process(
 ) -> Result<(u64, u64), crate::arch::x86_64::linux::errno::Errno> {
     use crate::arch::x86_64::linux::errno::Errno;
     crate::arch::cpu::without_interrupts(|| {
-        // Validate the TID outputs BEFORE the child exists, so a bad pointer
-        // returns EFAULT with nothing half-created to unwind.
+        // Проверить выходы TID ДО появления ребёнка, чтобы плохой указатель дал
+        // EFAULT без полупостроенного состояния для отката.
         if parent_tid != 0 && crate::arch::x86_64::linux::check_user_ptr(parent_tid, 4).is_err() {
             return Err(Errno::EFAULT);
         }
@@ -868,38 +877,39 @@ pub fn fork_linux_process(
         let child = scheduler::next_pid();
         let parent_pml4 = vmm::current_pml4_phys();
         let child_pml4 = vmm::new_user_pml4().map_err(|_| Errno::ENOMEM)?;
-        // Copy-on-write share: the child mirrors the parent's leaf frames
-        // (refcounted), writable entries flip RO on both sides, and the next
-        // write on either side copies the page private. Falls back to the
-        // eager copier if the space uses huge pages (none do today).
+        // Разделение copy-on-write: ребёнок отражает листовые кадры родителя
+        // (с подсчётом ссылок), записываемые записи с обеих сторон флипаются в
+        // RO, а следующая запись любой стороны копирует страницу приватно.
+        // Откат к жадному копированию, если пространство использует огромные
+        // страницы (сегодня таких нет).
         if vmm::fork_user_space_cow(parent_pml4, child_pml4).is_err() {
             vmm::clone_user_space(parent_pml4, child_pml4).map_err(|_| Errno::ENOMEM)?;
         }
         let child_top = setup_task_kernel_stack(child).map_err(|_| Errno::ENOMEM)?;
-        // setup_task_kernel_stack points TSS RSP0 / the syscall stack at the
-        // CHILD; the PARENT keeps running after this syscall, so point them back
-        // (same pattern as spawn_linux_thread above).
+        // setup_task_kernel_stack направляет TSS RSP0 / стек syscall на РЕБЁНКА;
+        // РОДИТЕЛЬ продолжает выполняться после этого syscall, поэтому
+        // возвращаем их назад (та же схема, что в spawn_linux_thread выше).
         let parent_top = crate::memory::layout::kernel_stack_for_pid(parent).2;
         gdt::set_kernel_stack(parent_top);
         crate::arch::x86_64::syscall::set_syscall_kernel_stack(parent_top);
-        // Child resumes at the parent's return RIP with the parent's user RSP
-        // from the per-task slot at +120 above the SavedRegs frame.
+        // Ребёнок возобновляется на return RIP родителя с user RSP родителя из
+        // per-task слота по +120 над фреймом SavedRegs.
         let user_rsp = unsafe {
             ((regs as *const crate::arch::x86_64::linux::regs::SavedRegs as *const u64).add(15))
                 .read()
         };
         let krsp = unsafe { build_clone_frame(child_top, regs, regs.rcx, user_rsp) };
-        // Register the child's CompatState BEFORE enqueue so its very first
-        // syscall is already routed with full Linux semantics.
+        // Зарегистрировать CompatState ребёнка ДО постановки в очередь, чтобы его
+        // первый же syscall уже шёл с полной семантикой Linux.
         if !compat::fork_current_compat(child, clear_child_tid) {
             return Err(Errno::EINVAL);
         }
         scheduler::spawn(Tcb::new(child, krsp, child_pml4));
-        // SAFETY: both pointers were validated above, still inside this
-        // interrupt-disabled window — no task can have changed either mapping,
-        // and the parent's CR3 is active, so the parent-address-space write is
-        // direct. The child-side write goes through the child PML4's physical
-        // frame (HHDM), also under the same window.
+        // SAFETY: оба указателя проверены выше, всё ещё внутри окна с
+        // выключенными прерываниями — ни одна задача не могла изменить эти
+        // отображения, а CR3 родителя активен, поэтому запись в пространство
+        // родителя прямая. Запись на стороне ребёнка идёт через физический кадр
+        // PML4 ребёнка (HHDM), тоже в том же окне.
         if parent_tid != 0 {
             unsafe { (parent_tid as *mut u32).write_unaligned(child as u32) }
         }

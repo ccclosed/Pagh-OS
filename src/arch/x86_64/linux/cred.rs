@@ -1,59 +1,61 @@
-//! Process credentials and POSIX permission decisions.
+//! Креденшелы процесса и решения о правах POSIX.
 //!
-//! Pure, allocation-free, `core`-only logic shared with the `host-tests` crate
-//! (`#[path]` include, property `p56`). It answers three questions and nothing
-//! else:
+//! Только `core`, без аллокаций, общая с крейтом `host-tests` (включение через
+//! `#[path]`, свойство `p56`). Отвечает ровно на три вопроса:
 //!
-//!   * [`Creds::may`] — may a process with these credentials access a file with
-//!     this `mode` and `(uid, gid)` owner, for [`Access::Read`]/[`Access::Write`]/
-//!     [`Access::Execute`]? Owner/group/other bits use the **effective** ids;
-//!     root bypasses read/write but, exactly like Linux, still needs at least one
-//!     execute bit for `X`.
-//!   * [`Creds::setuid`]/[`Creds::setgid`] — the `setuid(2)`/`setgid(2)`
-//!     transition, including the saved-set-id rules.
-//!   * [`Creds::setreuid`]/[`Creds::setresuid`] and the group analogues — the
-//!     more granular `set[res][ug]id` transitions.
+//!   * [`Creds::may`] — может ли процесс с такими креденшелами обратиться к
+//!     файлу с этим `mode` и владельцем `(uid, gid)` для
+//!     [`Access::Read`]/[`Access::Write`]/[`Access::Execute`]? Биты
+//!     owner/group/other используют **effective** id; root обходит read/write,
+//!     но, точно как в Linux, всё равно нуждается хотя бы в одном
+//!     execute-бите для `X`.
+//!   * [`Creds::setuid`]/[`Creds::setgid`] — переход `setuid(2)`/`setgid(2)`,
+//!     включая правила saved-set-id.
+//!   * [`Creds::setreuid`]/[`Creds::setresuid`] и групповые аналоги — более
+//!     гранулярные переходы `set[res][ug]id`.
 //!
-//! ## Why this is separate from the syscall handlers
+//! ## Почему отдельно от обработчиков syscall
 //!
-//! These are the decisions a reviewer must be able to check without reading the
-//! VFS, the scheduler or the syscall arms. Keeping them here also means the
-//! host property test executes the *same* source the kernel compiles instead of
-//! a copy that can drift.
+//! Это решения, которые рецензент должен уметь проверить, не читая VFS,
+//! планировщик и ветки syscall'ов. Хранение здесь также означает, что
+//! host-property-тест исполняет *тот же* исходник, что компилирует ядро, а не
+//! копию, которая может разойтись.
 //!
-//! ## What is deliberately not modelled
+//! ## Что намеренно не моделируется
 //!
-//! There are no supplementary groups, no capabilities and no user namespace.
-//! [`Creds::gid`]/[`Creds::egid`] are the only group identity a permission
-//! check sees. `fsuid`/`fsgid` (Linux's separate filesystem identity) are not
-//! modelled either: permission checks use `euid`/`egid`, which is what
-//! `setuid(2)` documents for a process that never calls `setfsuid(2)`.
+//! Дополнительных групп, capabilities и user namespace нет.
+//! [`Creds::gid`]/[`Creds::egid`] — единственная групповая идентичность, которую
+//! видит проверка прав. `fsuid`/`fsgid` (отдельная идентичность файловой системы
+//! в Linux) тоже не моделируются: проверки прав используют `euid`/`egid`, что и
+//! документирует `setuid(2)` для процесса, никогда не звавшего `setfsuid(2)`.
 #![allow(dead_code)]
 
-/// The six POSIX ids a process carries.
+/// Шесть POSIX-идентичностей процесса.
 ///
-/// Every field is a plain `u32` (Linux `uid_t`/`gid_t`); the kernel never hands
-/// out `(uid_t)-1` as a real identity.
+/// Каждое поле — простой `u32` (Linux `uid_t`/`gid_t`); ядро никогда не выдаёт
+/// `(uid_t)-1` как реальную идентичность.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Creds {
-    /// Real user id.
+    /// Real user id (идентификатор владельца).
     pub uid: u32,
-    /// Real group id.
+    /// Real group id (идентификатор группы владельца).
     pub gid: u32,
-    /// Effective user id — what permission checks use.
+    /// Effective user id — то, что используют проверки прав.
     pub euid: u32,
-    /// Effective group id — what permission checks use.
+    /// Effective group id — то, что используют проверки прав.
     pub egid: u32,
-    /// Saved set-user-ID (restored by `execve` on a privileged binary; pagh
-    /// preserves it across `exec` because setuid binaries are not modelled).
+    /// Saved set-user-ID (восстанавливается `execve` на привилегированном
+    /// бинаре; pagh сохраняет его через `exec`, поскольку setuid-бинари не
+    /// моделируются).
     pub suid: u32,
-    /// Saved set-group-ID.
+    /// Saved set-group-ID (сохранённый group id).
     pub sgid: u32,
 }
 
 impl Creds {
-    /// The identity every kernel-spawned process and the boot shell starts
-    /// with. Keeping this root preserves the existing userland (CPython, apt).
+    /// Идентичность, с которой стартуют все запущенные ядром процессы и шелл
+    /// загрузки. Сохранение root поддерживает существующий userland (CPython,
+    /// apt).
     pub const ROOT: Creds = Creds {
         uid: 0,
         gid: 0,
@@ -63,7 +65,7 @@ impl Creds {
         sgid: 0,
     };
 
-    /// Convenience constructor for tests and for a non-root spawn policy.
+    /// Удобный конструктор для тестов и для политики запуска не от root.
     pub const fn new(uid: u32, gid: u32, euid: u32, egid: u32, suid: u32, sgid: u32) -> Self {
         Creds {
             uid,
@@ -75,39 +77,38 @@ impl Creds {
         }
     }
 
-    /// The effective user id (`geteuid(2)` and the permission check identity).
+    /// Effective user id (`geteuid(2)` и идентичность проверки прав).
     #[inline]
     pub const fn effective_uid(&self) -> u32 {
         self.euid
     }
 
-    /// The effective group id (`getegid(2)`).
+    /// Effective group id (`getegid(2)`) — используется проверками прав.
     #[inline]
     pub const fn effective_gid(&self) -> u32 {
         self.egid
     }
 
-    /// Is this process privileged for filesystem purposes?
+    /// Привилегирован ли процесс для целей файловой системы?
     ///
-    /// pagh models root's `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH` as
-    /// `euid == 0`; there are no capability sets.
+    /// pagh моделирует `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH` root как
+    /// `euid == 0`; наборов capabilities нет.
     #[inline]
     pub const fn is_root(&self) -> bool {
         self.euid == 0
     }
 
-    /// POSIX permission check for `access` against `mode` and owner
-    /// `(uid, gid)`.
+    /// Проверка прав POSIX для `access` по `mode` и владельцу `(uid, gid)`.
     ///
-    /// * Effective ids select the class: `euid == owner uid` → owner bits;
-    ///   otherwise `egid == owner gid` → group bits; otherwise other bits.
-    /// * `euid == 0` bypasses read and write entirely (Linux capability
-    ///   semantics), but **not** execute: root still needs at least one of the
-    ///   three execute bits. This is the rule that stops a non-executable file
-    ///   from being execed just because the caller is root.
+    /// * Effective id выбирает класс: `euid == uid владельца` → биты owner; иначе
+    ///   `egid == gid владельца` → биты group; иначе биты other.
+    /// * `euid == 0` полностью обходит read и write (семантика capabilities
+    ///   Linux), но **не** execute: root всё равно нуждается хотя бы в одном из
+    ///   трёх execute-битов. Это правило не даёт исполнить неисполняемый файл
+    ///   только потому, что вызывающий — root.
     ///
-    /// `mode` may carry type bits (`S_IFREG` etc.); only the low nine permission
-    /// bits participate.
+    /// `mode` может нести биты типа (`S_IFREG` и т. п.); участвуют только
+    /// младшие девять битов прав.
     pub fn may(&self, mode: u32, owner: (u32, u32), access: Access) -> bool {
         let perms = mode & 0o777;
         if self.euid == 0 {
@@ -126,31 +127,31 @@ impl Creds {
         (perms >> class_shift) & access.bit() != 0
     }
 
-    /// May a process with these credentials change the mode of a node owned by
-    /// `owner`? Linux: root, or the file's owner (`CAP_FOWNER` collapsed to
+    /// Может ли процесс с такими креденшелами сменить режим узла, принадлежащего
+    /// `owner`? Linux: root или владелец файла (`CAP_FOWNER` сведён к
     /// `euid == 0`).
     #[inline]
     pub fn may_chmod(&self, owner: (u32, u32)) -> bool {
         self.euid == 0 || self.euid == owner.0
     }
 
-    /// May a process with these credentials change the owner of a node? Linux:
-    /// root only (`CAP_CHOWN` collapsed to `euid == 0`).
+    /// Может ли процесс с такими креденшелами сменить владельца узла? Linux:
+    /// только root (`CAP_CHOWN` сведён к `euid == 0`).
     #[inline]
     pub fn may_chown(&self) -> bool {
         self.euid == 0
     }
 
-    /// `setuid(2)`: set the real/effective/saved user ids.
+    /// `setuid(2)`: задать real/effective/saved user id.
     ///
-    /// * privileged (`euid == 0`): any target; all three become `uid` (Linux
-    ///   clears any elevated saved id on this path);
-    /// * otherwise `uid` must be the current real or saved id; the effective id
-    ///   is changed and, per this kernel's small model, the saved id follows it
-    ///   (so a process that gives up or re-acquires a permitted identity cannot
-    ///   keep an unreachable third state).
+    /// * привилегированный (`euid == 0`): любая цель; все три становятся `uid`
+    ///   (Linux очищает повышенный saved id на этом пути);
+    /// * иначе `uid` должен быть текущим real или saved id; effective id
+    ///   меняется и, по малой модели этого ядра, saved id следует за ним (чтобы
+    ///   процесс, отказавшийся от разрешённой идентичности или вернувший её, не
+    ///   мог удержать недостижимое третье состояние).
     ///
-    /// `None` is `EPERM` at the syscall boundary.
+    /// `None` — `EPERM` на границе syscall.
     pub fn setuid(&self, uid: u32) -> Option<Creds> {
         let mut next = *self;
         if self.euid == 0 {
@@ -167,7 +168,7 @@ impl Creds {
         None
     }
 
-    /// `setgid(2)`: the group analogue of [`Creds::setuid`].
+    /// `setgid(2)`: групповой аналог [`Creds::setuid`].
     pub fn setgid(&self, gid: u32) -> Option<Creds> {
         let mut next = *self;
         if self.euid == 0 {
@@ -184,17 +185,17 @@ impl Creds {
         None
     }
 
-    /// `setreuid(2)`: set the real and/or effective user id.
+    /// `setreuid(2)`: задать real и/или effective user id.
     ///
-    /// * privileged: either id may be changed (`None` means "leave unchanged");
-    /// * unprivileged: the real id may only be the current real or saved id, and
-    ///   the effective id may only be the current real, effective or saved id;
-    /// * following Linux, the saved id changes only when a transition is actually
-    ///   requested: a requested real-id change, or an effective-id change that
-    ///   leaves `euid != ruid`, resets the saved id to the new effective id.
-    ///   `setreuid(-1, -1)` is a no-op.
+    /// * привилегированный: можно менять любой id (`None` — «не менять»);
+    /// * непривилегированный: real id может стать только текущим real или saved
+    ///   id, а effective — только текущим real, effective или saved id;
+    /// * как в Linux, saved id меняется, только когда переход реально запрошен:
+    ///   запрошенная смена real id или смена effective, после которой
+    ///   `euid != ruid`, сбрасывает saved id в новый effective id.
+    ///   `setreuid(-1, -1)` — no-op.
     ///
-    /// `None` is `EPERM` at the syscall boundary.
+    /// `None` — `EPERM` на границе syscall.
     pub fn setreuid(&self, uid: Option<u32>, euid: Option<u32>) -> Option<Creds> {
         let mut next = *self;
         if self.euid != 0 {
@@ -221,7 +222,7 @@ impl Creds {
         Some(next)
     }
 
-    /// `setregid(2)`: the group analogue of [`Creds::setreuid`].
+    /// `setregid(2)`: групповой аналог [`Creds::setreuid`].
     pub fn setregid(&self, gid: Option<u32>, egid: Option<u32>) -> Option<Creds> {
         let mut next = *self;
         if self.euid != 0 {
@@ -248,11 +249,13 @@ impl Creds {
         Some(next)
     }
 
-    /// `setresuid(2)`: set any subset of real/effective/saved user ids.
+    /// `setresuid(2)`: задать произвольное подмножество real/effective/saved
+    /// user id.
     ///
-    /// An unprivileged caller may only move each specified id within the set
-    /// `{uid, euid, suid}` (the values it already owns); a privileged caller may
-    /// set any value. `None` in an argument means "unchanged" (`(uid_t)-1`).
+    /// Непривилегированный вызывающий может двигать каждый заданный id только
+    /// внутри набора `{uid, euid, suid}` (значений, которыми уже владеет);
+    /// привилегированный может задать любое. `None` в аргументе — «не менять»
+    /// (`(uid_t)-1`).
     pub fn setresuid(
         &self,
         uid: Option<u32>,
@@ -279,7 +282,7 @@ impl Creds {
         Some(next)
     }
 
-    /// `setresgid(2)`: the group analogue of [`Creds::setresuid`].
+    /// `setresgid(2)`: групповой аналог [`Creds::setresuid`].
     pub fn setresgid(
         &self,
         gid: Option<u32>,
@@ -307,7 +310,7 @@ impl Creds {
     }
 }
 
-/// What kind of access a permission check is about.
+/// О каком виде доступа идёт проверка прав.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
     Read,
@@ -316,7 +319,7 @@ pub enum Access {
 }
 
 impl Access {
-    /// The permission bit for this access in one owner/group/other triad.
+    /// Бит права для этого доступа в одной триаде owner/group/other.
     #[inline]
     const fn bit(self) -> u32 {
         match self {
@@ -350,17 +353,17 @@ mod tests {
     #[test]
     fn owner_group_other_selection_uses_effective_ids() {
         let c = Creds::new(7, 8, 7, 8, 7, 8);
-        // Owner class wins even when the group bits would deny.
+        // Класс owner побеждает, даже когда групповые биты запретили бы.
         assert!(c.may(OWNER_RW, (7, 8), Access::Read));
         assert!(c.may(OWNER_RW, (7, 8), Access::Write));
         assert!(!c.may(OWNER_RW, (7, 8), Access::Execute));
-        // Group class when not the owner.
+        // Класс group, когда не владелец.
         assert!(c.may(0o040, (1, 8), Access::Read));
         assert!(!c.may(0o400, (1, 8), Access::Read));
-        // Other class when neither.
+        // Класс other, когда ни то ни другое.
         assert!(c.may(WORLD_READ, (1, 2), Access::Read));
         assert!(!c.may(WORLD_READ, (1, 2), Access::Write));
-        // Owner test is on euid, not uid.
+        // Проверка владельца идёт по euid, а не по uid.
         let c = Creds::new(1000, 8, 7, 8, 1000, 8);
         assert!(c.may(0o400, (7, 8), Access::Read));
         assert!(!c.may(0o040, (7, 8), Access::Read));
@@ -380,7 +383,7 @@ mod tests {
         let c = root.setuid(1000).expect("root may setuid");
         assert_eq!((c.uid, c.euid, c.suid), (1000, 1000, 1000));
 
-        // A setuid-root child: ruid 1000, euid/suid 0.
+        // Ребёнок setuid-root: ruid 1000, euid/suid 0.
         let setuid_root = Creds::new(1000, 1000, 0, 1000, 0, 1000);
         let released = setuid_root.setuid(1000).expect("back to real uid");
         assert_eq!(
@@ -390,8 +393,8 @@ mod tests {
         let back = setuid_root.setuid(0).expect("saved id is permitted");
         assert_eq!(back.euid, 0);
 
-        // A NON-root process with a saved id it may revisit: it can switch to
-        // that saved id, but cannot invent a third one.
+        // НЕ-root процесс с saved id, к которому может вернуться: может
+        // переключиться на этот saved id, но не изобрести третий.
         let saved_zero = Creds::new(1000, 1000, 1000, 1000, 0, 1000);
         assert!(saved_zero.setuid(0).is_some(), "saved id is permitted");
         assert_eq!(saved_zero.setuid(1001), None);
@@ -420,16 +423,17 @@ mod tests {
         assert_eq!((c.uid, c.euid, c.suid), (1000, 1000, 1000));
 
         let saved_zero = Creds::new(1000, 1000, 1000, 1000, 0, 1000);
-        // The real id may only become the current real or saved id; 1001 is
-        // neither.
+        // Real id может стать только текущим real или saved id; 1001 — ни тем,
+        // ни другим.
         assert_eq!(saved_zero.setreuid(Some(1001), Some(1001)), None);
-        // Both requested ids are owned (real = saved = 0 is reachable), so the
-        // transition succeeds and the saved id follows the new effective id.
+        // Оба запрошенных id принадлежат процессу (real = saved = 0
+        // достижимы), поэтому переход удаётся, а saved id следует за новым
+        // effective id.
         assert_eq!(
             saved_zero.setreuid(Some(0), Some(0)),
             Some(Creds::new(0, 1000, 0, 1000, 0, 1000))
         );
-        // A no-op request leaves every id alone.
+        // Запрос no-op не трогает ни один id.
         assert_eq!(saved_zero.setreuid(None, None), Some(saved_zero));
         assert_eq!(
             saved_zero.setreuid(Some(1000), Some(1000)),

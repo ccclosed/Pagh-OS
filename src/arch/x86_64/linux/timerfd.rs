@@ -1,9 +1,10 @@
 //! `timerfd_create` (283) / `timerfd_settime` (286) / `timerfd_gettime` (287).
 //!
-//! A timerfd is a thin state object in the per-process fd table; no timer IRQ
-//! walks it. `read`/`poll`/`epoll` compare the deadline with the scheduler tick
-//! clock and consume due expirations, which matches the observable Linux
-//! behaviour for the single-CPU kernel without adding a second timer queue.
+//! Timerfd — тонкий объект состояния в per-process таблице fd; ни один IRQ
+//! таймера его не обходит. `read`/`poll`/`epoll` сравнивают deadline с часами
+//! тиков планировщика и потребляют наступившие истечения, что совпадает с
+//! наблюдаемым поведением Linux для однопроцессорного ядра без добавления второй
+//! очереди таймеров.
 
 use alloc::sync::Arc;
 
@@ -38,7 +39,7 @@ fn state_for(fd: u64) -> Result<Arc<Spinlock<TimerfdState>>, Errno> {
     .ok_or(Errno::EBADF)
 }
 
-/// Read a Linux `struct itimerspec` (32 B).
+/// Прочитать Linux `struct itimerspec` (32 байта).
 fn read_itimerspec(ptr: u64) -> Result<(u64, u64, u64, u64), Errno> {
     check_user_ptr(ptr, 32)?;
     let raw = copy_in_pub(ptr, 32);

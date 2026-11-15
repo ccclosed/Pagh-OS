@@ -1,15 +1,15 @@
-//! Effectful misc Linux syscall handlers (task 12.5):
+//! Эффектные misc-обработчики syscall'ов Linux:
 //! `getpid`/`uname`/`arch_prctl`/`set_tid_address`/`clock_gettime`/`getrandom`/
 //! `exit`/`exit_group`.
 //!
-//! This is a **kernel-only** module (it is not `#[path]`-included by `host-tests`),
-//! so it freely uses the scheduler, the per-process [`CompatState`], the FS-base
-//! MSR, and the kernel logging facade. It reuses the pure planners in
-//! [`super::rand_clock`] (`getrandom_plan`/`ticks_to_timespec`) and the diagnostics
-//! helpers in [`super::diag`] (`exit_code_byte`).
+//! Модуль **только для ядра** (не включается в `host-tests` через `#[path]`),
+//! поэтому свободно использует планировщик, per-process [`CompatState`], MSR
+//! FS-base и фасад логирования ядра. Переиспользует чистые планировщики
+//! [`super::rand_clock`] (`getrandom_plan`/`ticks_to_timespec`) и
+//! диагностические хелперы [`super::diag`] (`exit_code_byte`).
 //!
-//! Every user pointer is validated through the single [`super::check_user_ptr`]
-//! choke point before being dereferenced.
+//! Каждый пользовательский указатель проверяется через единую точку
+//! [`super::check_user_ptr`] до разыменования.
 #![allow(dead_code)]
 
 use x86_64::registers::model_specific::FsBase;
@@ -26,22 +26,23 @@ use super::rand_clock::{getrandom_plan, ticks_to_timespec, Timespec, CLOCK_REALT
 use super::rtc;
 use super::timeconv::{encode_timeval, Timeval};
 
-/// LAPIC periodic-timer tick rate (see `arch::x86_64::apic`). Supplied to
-/// the pure [`ticks_to_timespec`] so `clock_gettime` reports wall-ish time from the
-/// scheduler tick counter.
+/// Частота тика периодического таймера LAPIC (см. `arch::x86_64::apic`).
+/// Передаётся чистому [`ticks_to_timespec`], чтобы `clock_gettime` сообщал
+/// близкое к стенному время из счётчика тиков планировщика.
 use crate::arch::x86_64::apic::TICK_HZ;
 
-/// `arch_prctl` subfunction: set the `FS.base` register.
+/// Подфункция `arch_prctl`: записать регистр `FS.base`.
 const ARCH_SET_FS: u64 = 0x1002;
-/// `arch_prctl` subfunction: read the `FS.base` register into a user `u64`.
+/// Подфункция `arch_prctl`: прочитать регистр `FS.base` в пользовательский
+/// `u64`.
 const ARCH_GET_FS: u64 = 0x1003;
 
-/// `getpid` (39): return the calling process's pid.
+/// `getpid` (39): вернуть pid вызывающего процесса.
 pub fn sys_getpid() -> Result<u64, Errno> {
     Ok(compat::current_tgid())
 }
 
-/// The x86_64 Linux `struct utsname`: six fixed-size NUL-terminated fields.
+/// Linux x86_64 `struct utsname`: шесть полей фиксированного размера с NUL.
 #[repr(C)]
 struct Utsname {
     sysname: [u8; 65],
@@ -52,7 +53,7 @@ struct Utsname {
     domainname: [u8; 65],
 }
 
-/// Copy `s` into a 65-byte field, NUL-padded (truncated if longer than 64).
+/// Скопировать `s` в 65-байтное поле с паддингом NUL (усечь, если длиннее 64).
 fn field(s: &str) -> [u8; 65] {
     let mut out = [0u8; 65];
     let bytes = s.as_bytes();
@@ -61,8 +62,8 @@ fn field(s: &str) -> [u8; 65] {
     out
 }
 
-/// `uname` (63): populate the user `struct utsname` with fixed identifying
-/// strings and return 0 (R2.11).
+/// `uname` (63): заполнить пользовательский `struct utsname` фиксированными
+/// строками идентификации и вернуть 0 (R2.11).
 pub fn sys_uname(buf: u64) -> Result<u64, Errno> {
     check_user_ptr(buf, core::mem::size_of::<Utsname>() as u64)?;
     let uts = Utsname {
@@ -79,31 +80,31 @@ pub fn sys_uname(buf: u64) -> Result<u64, Errno> {
             core::mem::size_of::<Utsname>(),
         )
     };
-    // SAFETY: `buf` validated for the full struct length above; active CR3 is the
-    // calling process's user PML4.
+    // SAFETY: `buf` проверен на полную длину структуры выше; активный CR3 —
+    // пользовательский PML4 вызывающего процесса.
     unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
     }
     Ok(0)
 }
 
-/// `arch_prctl` (158): `ARCH_SET_FS` sets the calling process's `FS.base` (and
-/// records it in the [`CompatState`]) and returns 0 (R2.9); `ARCH_GET_FS` writes
-/// the recorded base to the user pointer. Other subfunctions are `EINVAL`.
+/// `arch_prctl` (158): `ARCH_SET_FS` задаёт `FS.base` вызывающего процесса (и
+/// запоминает его в [`CompatState`]) и возвращает 0 (R2.9); `ARCH_GET_FS` пишет
+/// запомненную базу в пользовательский указатель. Прочие подфункции — `EINVAL`.
 pub fn sys_arch_prctl(code: u64, addr: u64) -> Result<u64, Errno> {
     match code {
         ARCH_SET_FS => {
-            // Set the architectural FS.base for the running thread...
+            // Задать архитектурный FS.base выполняющегося потока...
             FsBase::write(VirtAddr::new(addr));
-            // ...and record it in the process's compat state so it survives in
-            // the per-process model (R2.9).
+            // ...и запомнить его в compat-состоянии процесса, чтобы он жил в
+            // per-process модели (R2.9).
             compat::with_current_compat(|cs| cs.fs_base = addr);
             Ok(0)
         }
         ARCH_GET_FS => {
             check_user_ptr(addr, 8)?;
             let base = compat::with_current_compat(|cs| cs.fs_base).unwrap_or(0);
-            // SAFETY: `addr` validated for 8 bytes above.
+            // SAFETY: `addr` проверен на 8 байт выше.
             unsafe {
                 *(addr as *mut u64) = base;
             }
@@ -113,8 +114,8 @@ pub fn sys_arch_prctl(code: u64, addr: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `set_tid_address` (218): return the calling thread's tid (R2.10). The supplied
-/// `clear_child_tid` pointer is accepted but unused (no thread teardown here).
+/// `set_tid_address` (218): вернуть tid вызывающего потока (R2.10). Переданный
+/// `clear_child_tid` принимается, но не используется (сноса потоков здесь нет).
 pub fn sys_set_tid_address(tidptr: u64) -> Result<u64, Errno> {
     if tidptr != 0 {
         check_user_ptr(tidptr, 4)?;
@@ -127,17 +128,19 @@ pub fn sys_set_tid_address(tidptr: u64) -> Result<u64, Errno> {
     Ok(tid)
 }
 
-/// `clock_gettime` (228): populate the user `struct timespec` from the kernel tick
-/// clock for `CLOCK_MONOTONIC`/`CLOCK_REALTIME` and return 0 (R2.13); `EINVAL` for
-/// an unsupported clock id, leaving the buffer unmodified (R2.16).
+/// `clock_gettime` (228): заполнить пользовательский `struct timespec` из
+/// счётчика тиков ядра для `CLOCK_MONOTONIC`/`CLOCK_REALTIME` и вернуть 0
+/// (R2.13); `EINVAL` для неподдерживаемого id часов, оставляя буфер неизменным
+/// (R2.16).
 pub fn sys_clock_gettime(clock_id: u64, tsptr: u64) -> Result<u64, Errno> {
-    // Validate the clock id BEFORE touching the user buffer so an unsupported id
-    // leaves it unmodified (R2.16).
+    // Проверить id часов ДО касания буфера пользователя, чтобы
+    // неподдерживаемый id оставил его неизменным (R2.16).
     let mut ts = ticks_to_timespec(scheduler::ticks(), clock_id as u32, TICK_HZ)?;
-    // CLOCK_REALTIME is wall-clock: take whole seconds from the CMOS RTC and keep
-    // the tick-derived sub-second nanoseconds. CLOCK_MONOTONIC stays tick-based.
+    // CLOCK_REALTIME — стенные часы: целые секунды берём с CMOS RTC, а
+    // производные от тиков наносекунды оставляем. CLOCK_MONOTONIC остаётся на
+    // тиках.
     if clock_id as u32 == CLOCK_REALTIME || clock_id as u32 == 5 {
-        // 5 = CLOCK_REALTIME_COARSE — same wall clock, lower precision.
+        // 5 = CLOCK_REALTIME_COARSE — те же стенные часы, ниже точность.
         ts.tv_sec = rtc::now_unix() as i64;
     }
     check_user_ptr(tsptr, core::mem::size_of::<Timespec>() as u64)?;
@@ -147,16 +150,16 @@ pub fn sys_clock_gettime(clock_id: u64, tsptr: u64) -> Result<u64, Errno> {
             core::mem::size_of::<Timespec>(),
         )
     };
-    // SAFETY: `tsptr` validated for the timespec length above.
+    // SAFETY: `tsptr` проверен на длину timespec выше.
     unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), tsptr as *mut u8, bytes.len());
     }
     Ok(0)
 }
 
-/// `getrandom` (318): fill a user buffer from the hardware-backed entropy API.
-/// Fails with `EAGAIN` instead of silently returning predictable timestamp-based
-/// bytes when RDSEED/RDRAND is unavailable.
+/// `getrandom` (318): заполнить пользовательский буфер из аппаратного API
+/// энтропии. Падает с `EAGAIN`, а не молча возвращает предсказуемые байты на
+/// основе времени, когда RDSEED/RDRAND недоступны.
 pub fn sys_getrandom(buf: u64, count: u64, _flags: u64) -> Result<u64, Errno> {
     let n = getrandom_plan(count, count)?;
     if n == 0 {
@@ -168,28 +171,26 @@ pub fn sys_getrandom(buf: u64, count: u64, _flags: u64) -> Result<u64, Errno> {
     Ok(n)
 }
 
-/// Produce the ELF `AT_RANDOM` block. Hardware entropy (RDSEED/RDRAND) is
-/// preferred. When the platform exposes none, the block is derived from the
-/// **mixed boot seed** ([`crate::security::entropy::mixed_fill`]): several
-/// independent boot-time sources folded through SHA-256, plus a per-call counter
-/// and the observable inputs (issue #16).
+/// Построить ELF-блок `AT_RANDOM`. Предпочтительна аппаратная энтропия
+/// (RDSEED/RDRAND). Когда платформа не даёт ни одной, блок выводится из
+/// **смешанного boot-seed** ([`crate::security::entropy::mixed_fill`]):
+/// несколько независимых источников времени загрузки, свёрнутых через SHA-256,
+/// плюс счётчик на вызов и наблюдаемые входы.
 ///
-/// WHY NOT A FALLBACK PRNG: the previous implementation mixed the tick clock, the
-/// RTC, the pid and a fixed constant (the hardware-entropy term —
-/// `secure_u64().unwrap_or(0)` — is necessarily zero on this path, and there was
-/// no free-running counter, whatever the old comment claimed) through a 64-bit
-/// xorshift. That is a *linear* stream over values an attacker observes or
-/// guesses, so every process's glibc stack-canary/pointer-mangling key was
-/// predictable whenever RDSEED/RDRAND was absent, and it did not even guarantee a
-/// non-zero block (zero is reachable for particular tick values; issue #16). The
-/// boot seed is not derivable from those observables, and the degradation is
-/// announced once at boot (`stage=degraded` in the entropy warning) instead of
-/// being silent. `sys_getrandom` keeps failing closed with `EAGAIN`; it never
-/// serves these bytes.
+/// ПОЧЕМУ НЕ FALLBACK-PRNG: прежняя реализация смешивала тиковые часы, RTC, pid и
+/// фиксированную константу (аппаратный терм — `secure_u64().unwrap_or(0)` — на
+/// этом пути необходимо нулевой, а свободно бегущего счётчика не было) через
+/// 64-битный xorshift. Это *линейный* поток по наблюдаемым или угадываемым
+/// значениям, поэтому ключ stack-canary/pointer-mangling каждой программы был
+/// предсказуем при отсутствии RDSEED/RDRAND, и даже ненулевой блок не
+/// гарантировался (ноль достижим для отдельных значений тика). Boot-seed из этих
+/// наблюдаемых не выводится, а деградация сообщается один раз при загрузке
+/// (`stage=degraded` в предупреждении энтропии), а не молча. `sys_getrandom`
+/// по-прежнему отказывает с `EAGAIN`; эти байты он не отдаёт никогда.
 ///
-/// Never panics and never fails: glibc reads `AT_RANDOM` unconditionally at
-/// process start, so refusing to produce it would mean refusing to start the
-/// process.
+/// Никогда не паникует и не отказывает: glibc читает `AT_RANDOM` безусловно при
+/// старте процесса, поэтому отказ произвести его означал бы отказ запускать
+/// процесс.
 pub fn random_bytes_16() -> [u8; 16] {
     let mut out = [0u8; 16];
     if crate::security::entropy::fill(&mut out).is_ok() {
@@ -199,9 +200,10 @@ pub fn random_bytes_16() -> [u8; 16] {
     out
 }
 
-/// `exit` (60) / `exit_group` (231): record the normalized exit code (low byte,
-/// R12.3), log the pid + code (R12.3/R12.5), then terminate only the calling
-/// process and yield to the scheduler forever (R7.2). Never returns.
+/// `exit` (60) / `exit_group` (231): записать нормализованный код выхода
+/// (младший байт, R12.3), залогировать pid + код (R12.3/R12.5), затем завершить
+/// только вызывающий процесс и навсегда уступить планировщику (R7.2). Не
+/// возвращается.
 pub fn sys_exit(code: u64) -> ! {
     super::process_sys::cleanup_current_thread_exit();
     let byte = exit_code_byte(code);
@@ -212,7 +214,7 @@ pub fn sys_exit(code: u64) -> ! {
         pid,
         byte
     );
-    // Terminates only this task; the scheduler keeps running others (R7.2).
+    // Завершает только эту задачу; планировщик продолжает другие (R7.2).
     scheduler::exit_current()
 }
 
@@ -232,38 +234,39 @@ pub fn sys_exit_group(code: u64) -> ! {
     scheduler::exit_current()
 }
 
-/// `tgkill` (234): send a signal to a thread of the CALLING thread group.
-/// Phase 1 semantics:
-///   * with a user handler installed for `sig` (via `rt_sigaction`): the
-///     signal is queued pending and delivered at this syscall's return point
-///     ([`super::signal::deliver_one_pending_syscall`]) — so `raise()`/`abort()`-style
-///     self-signals run the handler before anything else;
-///   * without a handler and a default-fatal `sig`: exit the thread group
-///     with `128 + sig` (Phase-0 behavior kept: an `ENOSYS` here made glibc's
-///     `abort()` fall through to a ring-3 `hlt`, surfacing as a spurious #GP
-///     after every "Fatal Python error");
-///   * without a handler and a non-fatal `sig`: accepted and ignored
-///     (`SIGCHLD`, `SIGCONT`, `SIGWINCH`, ... must not self-destruct).
+/// `tgkill` (234): послать сигнал потоку ГРУППЫ ПОТОКОВ вызывающего.
+/// Семантика:
+///   * при установленном пользовательском обработчике для `sig` (через
+///     `rt_sigaction`): сигнал ставится ожидающим и доставляется в точке возврата
+///     этого syscall'а ([`super::signal::deliver_one_pending_syscall`]) — так
+///     self-сигналы в стиле `raise()`/`abort()` запускают обработчик раньше всего
+///     остального;
+///   * без обработчика и с фатальным по умолчанию `sig`: завершить группу
+///     потоков с `128 + sig` (поведение сохранено: `ENOSYS` здесь заставлял
+///     `abort()` из glibc проваливаться в ring-3 `hlt`, что проявлялось ложным
+///     #GP после каждого «Fatal Python error»);
+///   * без обработчика и с нефатальным `sig`: принять и игнорировать
+///     (`SIGCHLD`, `SIGCONT`, `SIGWINCH`, ... не должны самоуничтожаться).
 pub fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> Result<u64, Errno> {
-    // ALL THREE arguments are C `int`s: truncate each to 32 bits and sign-extend
-    // before anything else. `sig` additionally indexes the disposition table by
-    // `sig - 1`, so a "negative" signal (0xFFFF_FFFF as `int`) would underflow that
-    // index and panic the kernel (`panic = "abort"` → the machine dies on an
-    // untrusted syscall argument) — the validation is the shared
-    // `kill::kill_sig_valid`, one implementation for the whole family.
+    // ВСЕ ТРИ аргумента — C `int`: усечь каждый до 32 бит и расширить знаково до
+    // любых действий. `sig` ещё и индексирует таблицу диспозиций по `sig - 1`,
+    // поэтому «отрицательный» сигнал (0xFFFF_FFFF как `int`) переполнил бы индекс
+    // вниз и паниковал ядро (`panic = "abort"` → машина умирает от недоверенного
+    // аргумента syscall) — проверка общая `kill::kill_sig_valid`, одна
+    // реализация на всё семейство.
     let sig = super::kill::decode_sig(sig);
     let tgid = super::kill::decode_pid(tgid);
     let tid = super::kill::decode_pid(tid);
     if !super::kill::kill_sig_valid(sig) {
         return Err(Errno::EINVAL);
     }
-    // ESRCH — the (tgid, tid) PAIR is what `tgkill` addresses, and Linux's
-    // `do_tkill` rejects it unless the thread exists AND belongs to that thread
-    // group (`task_tgid_vnr(p) != tgid` → ESRCH). Without this, `tgkill(self,
-    // 999999, 0)` "succeeded" against a thread id that does not exist. A
-    // nonexistent `tgid` cannot match either, so it lands here too; note that the
-    // group's id stays valid while ANY of its threads is alive, even after the
-    // leader has exited (the registry keeps `tgid` per thread).
+    // ESRCH: `tgkill` адресует ПАРУ (tgid, tid), и `do_tkill` в Linux отвергает
+    // её, если поток не существует ИЛИ не принадлежит этой группе
+    // (`task_tgid_vnr(p) != tgid` → ESRCH). Без этого `tgkill(self, 999999, 0)`
+    // «успешно» действовал на несуществующий thread id. Несуществующий `tgid`
+    // тоже не совпадёт и попадёт сюда; id группы остаётся валидным, пока жив
+    // ХОТЬ ОДИН её поток, даже после выхода лидера (реестр держит `tgid` на
+    // поток).
     if tid <= 0 {
         return Err(Errno::ESRCH);
     }
@@ -274,28 +277,28 @@ pub fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> Result<u64, Errno> {
     if tgid <= 0 || tgid as u64 != compat::tgid_of(tid) {
         return Err(Errno::ESRCH);
     }
-    // Same permission rule as kill(2), applied to the addressed thread (Linux's
-    // `do_tkill` runs `check_kill_permission` before delivering, including for
-    // the `sig == 0` existence probe).
+    // То же правило прав, что у kill(2), применённое к адресованному потоку
+    // (`do_tkill` в Linux вызывает `check_kill_permission` до доставки, включая
+    // пробу существования `sig == 0`).
     if let Some(target) = compat::creds_of(tid) {
         if !super::kill::kill_permits(compat::current_creds().euid, target.uid, target.euid) {
             return Err(Errno::EPERM);
         }
     }
     if sig == 0 {
-        // Existence probe: the pair is valid, nothing is sent.
+        // Проба существования: пара валидна, ничего не посылается.
         return Ok(0);
     }
     let sig = sig as u64;
-    // The disposition table is shared by the whole thread group (CLONE_THREAD
-    // shares it), so asking for the CALLER's action is the same as asking for the
-    // addressed thread's when they are in one group; for a foreign thread the
-    // lookup below simply finds no handler and the default action applies.
+    // Таблица диспозиций общая для всей группы потоков (CLONE_THREAD делит её),
+    // поэтому спросить действие ВЫЗЫВАЮЩЕГО — то же, что спросить адресованный
+    // поток, когда они в одной группе; для чужого потока поиск ниже просто не
+    // найдёт обработчика, и применяется действие по умолчанию.
     let has_handler = if tid == scheduler::current_pid() {
         super::signal::current_has_handler(sig)
     } else {
-        // A foreign target: its own table decides. `None` (no compat state) cannot
-        // happen here — the pair check above proved it exists.
+        // Чужая цель: решает её собственная таблица. `None` (нет compat-состояния)
+        // здесь невозможен — проверка пары выше доказала существование.
         Some(super::signal::has_handler_for(tid, sig))
     };
     match has_handler {
@@ -306,13 +309,13 @@ pub fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> Result<u64, Errno> {
         Some(false) => {
             if crate::arch::x86_64::linux::signal_frame::default_is_fatal(sig) {
                 if tid == scheduler::current_pid() {
-                    // Phase-0 behavior kept: a fatal self-signal (glibc `abort()`)
-                    // exits the caller's thread group from here.
+                    // Поведение сохранено: фатальный self-сигнал (`abort()` из
+                    // glibc) завершает группу потоков вызывающего отсюда.
                     crate::info!("[linux] tgkill: fatal signal {} to self - exiting", sig);
                     sys_exit_group(128 + sig)
                 } else {
-                    // A fatal signal aimed at another thread must kill THAT group,
-                    // not the caller's.
+                    // Фатальный сигнал, нацеленный на другой поток, обязан убить
+                    // ТУ группу, а не группу вызывающего.
                     crate::info!(
                         "[linux] tgkill: fatal signal {} to tid={} - terminating its group",
                         sig,
@@ -325,32 +328,32 @@ pub fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> Result<u64, Errno> {
                 Ok(0)
             }
         }
-        // Native task (no compat state): nothing to signal.
+        // Нативная задача (нет compat-состояния): сигнализировать некого.
         None => Ok(0),
     }
 }
 
-// ─────────────── identity / info / time / sleep / sched / signals ───────────────
-// (Feature: linux-binary-compat) Credentials live in `CompatState` and default
-// to root for every kernel-spawned process, so the shell and the existing
-// userland keep their old behaviour while the `setuid` family can produce a real
-// non-root process for the tests.
+// ─────────────── идентичность / информация / время / сон / планирование / сигналы ───────────────
+// Креденшелы живут в `CompatState` и по умолчанию root для каждого запущенного
+// ядром процесса, поэтому шелл и существующий userland сохраняют прежнее
+// поведение, а семейство `setuid` может создать настоящий не-root процесс для
+// тестов.
 
-/// Microseconds per second.
+/// Микросекунд в секунде.
 const USEC_PER_SEC: u64 = 1_000_000;
-/// One scheduler tick is `1/TICK_HZ` seconds (1 ms at 1000 Hz).
+/// Один тик планировщика — `1/TICK_HZ` секунд (1 мс при 1000 Гц).
 const NS_PER_TICK: u64 = 1_000_000_000 / TICK_HZ;
 
-/// Truncate a syscall register to a `uid_t`/`gid_t` (`u32`). The upper half of a
-/// 64-bit register carries whatever the caller's codegen left there; Linux
-/// truncates the C argument, and so must we.
+/// Усечь регистр syscall до `uid_t`/`gid_t` (`u32`). Старшая половина 64-битного
+/// регистра несёт то, что оставил кодогенератор вызывающего; Linux усекает
+/// C-аргумент, и мы обязаны так же.
 #[inline]
 fn id_arg(raw: u64) -> u32 {
     raw as u32
 }
 
-/// Decode a `uid_t`/`gid_t` argument where `(u32)-1` means "leave unchanged"
-/// (the `setreuid`/`setresuid` convention).
+/// Декодировать аргумент `uid_t`/`gid_t`, где `(u32)-1` означает «не менять»
+/// (соглашение `setreuid`/`setresuid`).
 #[inline]
 fn optional_id_arg(raw: u64) -> Option<u32> {
     let v = raw as u32;
@@ -361,19 +364,20 @@ fn optional_id_arg(raw: u64) -> Option<u32> {
     }
 }
 
-/// Write one `u32` to a validated user pointer.
+/// Записать один `u32` в проверенный пользовательский указатель.
 fn put_u32(ptr: u64, value: u32) -> Result<(), Errno> {
     check_user_ptr(ptr, 4)?;
-    // SAFETY: `ptr` was validated for four bytes above; `write_unaligned` has no
-    // alignment requirement and the page-presence walk already ran.
+    // SAFETY: `ptr` проверен на четыре байта выше; `write_unaligned` не требует
+    // выравнивания, а обход присутствия страниц уже выполнен.
     unsafe {
         core::ptr::write_unaligned(ptr as *mut u32, value);
     }
     Ok(())
 }
 
-/// Replace the current process's credentials, mapping "no compat state" to
-/// `EPERM` — a native task has no user-visible identity to change.
+/// Заменить креденшелы текущего процесса, отображая «нет compat-состояния» в
+/// `EPERM` — у нативной задачи нет видимой пользователю идентичности для
+/// смены.
 fn commit_creds(next: Creds) -> Result<u64, Errno> {
     if compat::set_current_creds(next) {
         Ok(0)
@@ -382,31 +386,31 @@ fn commit_creds(next: Creds) -> Result<u64, Errno> {
     }
 }
 
-/// `getuid` (102): the real user id.
+/// `getuid` (102): real user id.
 pub fn sys_getuid() -> Result<u64, Errno> {
     Ok(compat::current_creds().uid as u64)
 }
 
-/// `getgid` (104): the real group id.
+/// `getgid` (104): real group id.
 pub fn sys_getgid() -> Result<u64, Errno> {
     Ok(compat::current_creds().gid as u64)
 }
 
-/// `geteuid` (107): the effective user id (what permission checks use).
+/// `geteuid` (107): effective user id (то, что используют проверки прав).
 pub fn sys_geteuid() -> Result<u64, Errno> {
     Ok(compat::current_creds().euid as u64)
 }
 
-/// `getegid` (108): the effective group id.
+/// `getegid` (108): effective group id.
 pub fn sys_getegid() -> Result<u64, Errno> {
     Ok(compat::current_creds().egid as u64)
 }
 
-/// `getresuid` (118): write `(ruid, euid, suid)` to the three user pointers.
+/// `getresuid` (118): записать `(ruid, euid, suid)` в три пользовательских
+/// указателя.
 ///
-/// All three pointers are required (Linux returns `EFAULT` for a bad one), and
-/// they are all validated before the first write, so a partial result is not
-/// observable.
+/// Все три указателя обязательны (Linux даёт `EFAULT` на плохой), и все
+/// проверяются до первой записи, поэтому частичный результат ненаблюдаем.
 pub fn sys_getresuid(ruid: u64, euid: u64, suid: u64) -> Result<u64, Errno> {
     let c = compat::current_creds();
     check_user_ptr(ruid, 4)?;
@@ -418,7 +422,8 @@ pub fn sys_getresuid(ruid: u64, euid: u64, suid: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `getresgid` (120): write `(rgid, egid, sgid)` to the three user pointers.
+/// `getresgid` (120): записать `(rgid, egid, sgid)` в три пользовательских
+/// указателя.
 pub fn sys_getresgid(rgid: u64, egid: u64, sgid: u64) -> Result<u64, Errno> {
     let c = compat::current_creds();
     check_user_ptr(rgid, 4)?;
@@ -430,7 +435,7 @@ pub fn sys_getresgid(rgid: u64, egid: u64, sgid: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `setuid` (105): [`Creds::setuid`], `EPERM` when the transition is refused.
+/// `setuid` (105): [`Creds::setuid`], `EPERM`, когда переход отвергнут.
 pub fn sys_setuid(uid: u64) -> Result<u64, Errno> {
     let c = compat::current_creds();
     match c.setuid(id_arg(uid)) {
@@ -439,7 +444,7 @@ pub fn sys_setuid(uid: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `setgid` (106): the group analogue of [`sys_setuid`].
+/// `setgid` (106): групповой аналог [`sys_setuid`].
 pub fn sys_setgid(gid: u64) -> Result<u64, Errno> {
     let c = compat::current_creds();
     match c.setgid(id_arg(gid)) {
@@ -448,7 +453,7 @@ pub fn sys_setgid(gid: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `setreuid` (113): `(u32)-1` leaves an id unchanged.
+/// `setreuid` (113): `(u32)-1` оставляет id без изменений.
 pub fn sys_setreuid(uid: u64, euid: u64) -> Result<u64, Errno> {
     let c = compat::current_creds();
     match c.setreuid(optional_id_arg(uid), optional_id_arg(euid)) {
@@ -457,7 +462,7 @@ pub fn sys_setreuid(uid: u64, euid: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `setregid` (114): the group analogue of [`sys_setreuid`].
+/// `setregid` (114): групповой аналог [`sys_setreuid`].
 pub fn sys_setregid(gid: u64, egid: u64) -> Result<u64, Errno> {
     let c = compat::current_creds();
     match c.setregid(optional_id_arg(gid), optional_id_arg(egid)) {
@@ -466,7 +471,7 @@ pub fn sys_setregid(gid: u64, egid: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `setresuid` (117): set any subset of the three user ids.
+/// `setresuid` (117): задать любое подмножество трёх user id.
 pub fn sys_setresuid(uid: u64, euid: u64, suid: u64) -> Result<u64, Errno> {
     let c = compat::current_creds();
     match c.setresuid(
@@ -479,7 +484,7 @@ pub fn sys_setresuid(uid: u64, euid: u64, suid: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `setresgid` (119): set any subset of the three group ids.
+/// `setresgid` (119): задать любое подмножество трёх group id.
 pub fn sys_setresgid(gid: u64, egid: u64, sgid: u64) -> Result<u64, Errno> {
     let c = compat::current_creds();
     match c.setresgid(
@@ -492,21 +497,21 @@ pub fn sys_setresgid(gid: u64, egid: u64, sgid: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `getppid` (110): return the tracked parent pid.
+/// `getppid` (110): вернуть отслеживаемый pid родителя.
 pub fn sys_getppid() -> Result<u64, Errno> {
     Ok(compat::current_ppid())
 }
 
-/// `gettid` (186): return the calling thread's tid (R2.10), falling back to the
-/// pid for a context with no compat state.
+/// `gettid` (186): вернуть tid вызывающего потока (R2.10), откатываясь к pid для
+/// контекста без compat-состояния.
 pub fn sys_gettid() -> Result<u64, Errno> {
     let tid = compat::with_current_compat(|cs| cs.tid).unwrap_or_else(scheduler::current_pid);
     Ok(tid)
 }
 
-/// `gettimeofday` (96): fill the user `struct timeval` with the wall-clock time
-/// (whole seconds from the CMOS RTC, sub-second microseconds from the tick clock)
-/// and return 0. The timezone pointer is accepted but ignored.
+/// `gettimeofday` (96): заполнить пользовательский `struct timeval` стенным
+/// временем (целые секунды с CMOS RTC, дробные микросекунды с тиковых часов) и
+/// вернуть 0. Указатель таймзоны принимается и игнорируется.
 pub fn sys_gettimeofday(tvptr: u64, _tzptr: u64) -> Result<u64, Errno> {
     if tvptr == 0 {
         return Ok(0);
@@ -521,20 +526,20 @@ pub fn sys_gettimeofday(tvptr: u64, _tzptr: u64) -> Result<u64, Errno> {
             core::mem::size_of::<Timeval>(),
         )
     };
-    // SAFETY: `tvptr` validated for the timeval length above.
+    // SAFETY: `tvptr` проверен на длину timeval выше.
     unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), tvptr as *mut u8, bytes.len());
     }
     Ok(0)
 }
 
-/// `time` (201): return the wall-clock seconds, also writing them to the optional
-/// user `time_t` pointer when it is non-null.
+/// `time` (201): вернуть стенные секунды, заодно записав их в необязательный
+/// пользовательский указатель `time_t`, когда он не NULL.
 pub fn sys_time(tptr: u64) -> Result<u64, Errno> {
     let secs = rtc::now_unix();
     if tptr != 0 {
         check_user_ptr(tptr, 8)?;
-        // SAFETY: `tptr` validated for 8 bytes above.
+        // SAFETY: `tptr` проверен на 8 байт выше.
         unsafe {
             *(tptr as *mut i64) = secs as i64;
         }
@@ -542,8 +547,9 @@ pub fn sys_time(tptr: u64) -> Result<u64, Errno> {
     Ok(secs)
 }
 
-/// Convert a `(sec, nsec)` duration into a tick count at [`TICK_HZ`], rounding up
-/// so any non-zero duration sleeps at least one tick. Saturating throughout.
+/// Преобразовать длительность `(sec, nsec)` в число тиков при [`TICK_HZ`] с
+/// округлением вверх, чтобы любая ненулевая длительность спала хотя бы один тик.
+/// Везде saturating.
 pub(super) fn duration_to_ticks(sec: i64, nsec: i64) -> u64 {
     if sec <= 0 && nsec <= 0 {
         return 0;
@@ -562,10 +568,11 @@ pub(super) fn duration_to_ticks(sec: i64, nsec: i64) -> u64 {
     }
 }
 
-/// Read a `struct timespec` (two i64) from a validated user pointer.
+/// Прочитать `struct timespec` (два i64) из проверенного пользовательского
+/// указателя.
 fn read_timespec(ptr: u64) -> Result<(i64, i64), Errno> {
     check_user_ptr(ptr, 16)?;
-    // SAFETY: 16 bytes at `ptr` validated above.
+    // SAFETY: 16 байт по `ptr` проверены выше.
     let sec = unsafe { *(ptr as *const i64) };
     let nsec = unsafe { *((ptr + 8) as *const i64) };
     if !(0..1_000_000_000).contains(&nsec) || sec < 0 {
@@ -574,25 +581,25 @@ fn read_timespec(ptr: u64) -> Result<(i64, i64), Errno> {
     Ok((sec, nsec))
 }
 
-/// `nanosleep` (35): sleep for the requested `struct timespec` duration via the
-/// scheduler tick clock, returning 0. The remainder pointer is ignored (no signals
-/// interrupt the sleep in this model).
+/// `nanosleep` (35): спать запрошенную `struct timespec` длительность по счётчику
+/// тиков планировщика, вернуть 0. Указатель остатка игнорируется (в этой модели
+/// сон не прерывается сигналами).
 pub fn sys_nanosleep(req: u64, _rem: u64) -> Result<u64, Errno> {
     let (sec, nsec) = read_timespec(req)?;
     let ticks = duration_to_ticks(sec, nsec);
     if ticks > 0 && !sleep_interruptible(ticks) {
-        // A deliverable signal poked the sleep; the dispatch epilogue
-        // delivers it right after this handler returns. (`rem` stays
-        // unwritten — this minimal model never filled it.)
+        // Доставимый сигнал толкнул сон; эпилог диспетчеризации доставит его
+        // сразу после возврата из обработчика. (`rem` остаётся незаписанным —
+        // эта минимальная модель его никогда не заполняла.)
         return Err(Errno::EINTR);
     }
     Ok(0)
 }
 
-/// `clock_nanosleep` (230): relative sleep against the requested clock. Absolute
-/// (`TIMER_ABSTIME`) sleeps and the clock id are ignored in this minimal model; it
-/// sleeps the requested relative duration like `nanosleep` and returns 0.
-/// Interruptible by a deliverable signal (`-EINTR`), like `nanosleep`.
+/// `clock_nanosleep` (230): относительный сон относительно запрошенных часов.
+/// Абсолютный сон (`TIMER_ABSTIME`) и id часов в этой минимальной модели
+/// игнорируются; спит запрошенную относительную длительность, как `nanosleep`, и
+/// возвращает 0. Прерывается доставимым сигналом (`-EINTR`), как `nanosleep`.
 pub fn sys_clock_nanosleep(_clock_id: u64, _flags: u64, req: u64, _rem: u64) -> Result<u64, Errno> {
     let (sec, nsec) = read_timespec(req)?;
     let ticks = duration_to_ticks(sec, nsec);
@@ -602,9 +609,10 @@ pub fn sys_clock_nanosleep(_clock_id: u64, _flags: u64, req: u64, _rem: u64) -> 
     Ok(0)
 }
 
-/// Sleep `total` ticks in one-tick slices, aborting early when the current
-/// process has a deliverable signal (returns false). Checked before each
-/// slice, so worst-case wake-up latency is one tick (~1 ms at 1000 Hz).
+/// Проспать `total` тиков кусками по одному, прерываясь досрочно, когда у
+/// текущего процесса есть доставимый сигнал (возвращает false). Проверка идёт до
+/// каждого куска, поэтому задержка пробуждения в худшем случае — один тик (~1 мс
+/// при 1000 Гц).
 fn sleep_interruptible(total: u64) -> bool {
     let mut left = total;
     while left > 0 {
@@ -617,7 +625,7 @@ fn sleep_interruptible(total: u64) -> bool {
     true
 }
 
-/// The x86_64 Linux `struct sysinfo` (fields populated with plausible values).
+/// Linux x86_64 `struct sysinfo` (поля заполнены правдоподобными значениями).
 #[repr(C)]
 struct Sysinfo {
     uptime: i64,
@@ -633,22 +641,23 @@ struct Sysinfo {
     totalhigh: u64,
     freehigh: u64,
     mem_unit: u32,
-    // Trailing padding bytes (`_f`) so the struct matches the 64-bit layout; the
-    // C definition pads to a fixed size, which `#[repr(C)]` alignment reproduces.
+    // Хвостовые паддинг-байты (`_f`), чтобы структура совпадала с 64-битной
+    // раскладкой; C-определение дополняется до фиксированного размера, что
+    // воспроизводит выравнивание `#[repr(C)]`.
     _f: [u8; 0],
 }
 
-/// The 1/5/15-minute load averages in the 16.16 fixed-point form
-/// `struct sysinfo` uses (Linux ABI: `si_loads[i] = load * 65536`).
+/// Средние нагрузки за 1/5/15 минут в 16.16 fixed-point форме `struct sysinfo`
+/// (ABI Linux: `si_loads[i] = load * 65536`).
 ///
-/// WHY THIS EXISTS. `sysinfo(2)` used to fill `loads` with hard-coded zeros while
-/// `/proc/loadavg` printed the scheduler's real decayed averages: one kernel, two
-/// answers for the same question, so a userspace tool reading `sysinfo` showed
-/// `0.00 0.00 0.00` on a loaded machine. Both views now come from
-/// [`crate::task::scheduler::load_averages`]; this function only converts its
-/// hundredths (`123` = 1.23) to the kernel's fixed-point ABI. The conversion is
-/// pinned by an in-QEMU selftest, because "raw hundredths where the ABI says
-/// 16.16" is exactly the kind of unit mistake that reads as a plausible number.
+/// `sysinfo(2)` раньше заполнял `loads` жёстко зашитыми нулями, тогда как
+/// `/proc/loadavg` печатал настоящие затухающие средние планировщика: одно ядро,
+/// два ответа на один вопрос, поэтому userspace-инструмент, читающий `sysinfo`,
+/// показывал `0.00 0.00 0.00` на загруженной машине. Оба представления теперь
+/// берутся из [`crate::task::scheduler::load_averages`]; функция лишь переводит
+/// сотые (`123` = 1.23) в fixed-point ABI ядра. Перевод закреплён in-QEMU
+/// selftest'ом, потому что «сырые сотые там, где ABI требует 16.16» — ровно та
+/// ошибка единиц, которая читается как правдоподобное число.
 pub fn sysinfo_loads() -> [u64; 3] {
     let (one, five, fifteen) = scheduler::load_averages();
     let fixed = |hundredths: u32| -> u64 {
@@ -657,12 +666,13 @@ pub fn sysinfo_loads() -> [u64; 3] {
     [fixed(one), fixed(five), fixed(fifteen)]
 }
 
-/// One unit of load in the `struct sysinfo` 16.16 fixed-point representation.
+/// Одна единица нагрузки в 16.16 fixed-point `struct sysinfo`.
 pub const SYSTEM_LOAD_FIXED_ONE: u64 = 1 << 16;
 
-/// `sysinfo` (99): fill the user `struct sysinfo` with the uptime (from the tick
-/// clock), the load averages (16.16 fixed point, same source as
-/// `/proc/loadavg`) and total/free RAM (from the PMM frame counts), returning 0.
+/// `sysinfo` (99): заполнить пользовательский `struct sysinfo` аптаймом (из
+/// часов тиков), средними нагрузками (16.16 fixed point, тот же источник, что
+/// `/proc/loadavg`) и общим/свободным объёмом RAM (из счётчиков кадров PMM),
+/// вернув 0.
 pub fn sys_sysinfo(info: u64) -> Result<u64, Errno> {
     check_user_ptr(info, core::mem::size_of::<Sysinfo>() as u64)?;
     let uptime = (scheduler::ticks() / TICK_HZ) as i64;
@@ -690,30 +700,30 @@ pub fn sys_sysinfo(info: u64) -> Result<u64, Errno> {
             core::mem::size_of::<Sysinfo>(),
         )
     };
-    // SAFETY: `info` validated for the sysinfo length above.
+    // SAFETY: `info` проверен на длину sysinfo выше.
     unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), info as *mut u8, bytes.len());
     }
     Ok(0)
 }
 
-/// `sched_yield` (24): yield the CPU to the scheduler and return 0.
+/// `sched_yield` (24): уступить CPU планировщику и вернуть 0.
 pub fn sys_sched_yield() -> Result<u64, Errno> {
     scheduler::yield_current();
     Ok(0)
 }
 
-/// `rt_sigaction` (13): install or query the disposition for `sig`.
+/// `rt_sigaction` (13): установить или прочитать диспозицию для `sig`.
 ///
-/// The user ABI is `struct kernel_sigaction` (32 bytes at `sigsetsize == 8`):
-/// `{ handler, flags, restorer, mask }`. The handler address is stored
-/// verbatim — `SIG_DFL` (0) and `SIG_IGN` (1) are the special values — and
-/// delivery applies `sa_mask` for the handler's lifetime
+/// Пользовательский ABI — `struct kernel_sigaction` (32 байта при
+/// `sigsetsize == 8`): `{ handler, flags, restorer, mask }`. Адрес обработчика
+/// хранится дословно — `SIG_DFL` (0) и `SIG_IGN` (1) — специальные значения, — а
+/// доставка применяет `sa_mask` на время обработчика
 /// ([`super::signal::deliver_one_pending_syscall`]).
 ///
-/// `oldact`, when requested, receives the CURRENT disposition so
-/// save-and-restore users (bash, readline) round-trip exactly. `SIGKILL` and
-/// `SIGSTOP` dispositions cannot be changed (`EINVAL`, matching Linux).
+/// `oldact`, если запрошен, получает ТЕКУЩУЮ диспозицию, поэтому
+/// save-and-restore пользователи (bash, readline) делают точный круговой обход.
+/// Диспозиции `SIGKILL` и `SIGSTOP` менять нельзя (`EINVAL`, как в Linux).
 pub fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> Result<u64, Errno> {
     if sig == 0 || sig > super::signal_frame::SIGNAL_COUNT as u64 {
         return Err(Errno::EINVAL);
@@ -727,7 +737,7 @@ pub fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> Res
     if act != 0 {
         check_user_ptr(act, 32)?;
         let mut b = [0u8; 32];
-        // SAFETY: range validated above.
+        // SAFETY: диапазон проверен выше.
         unsafe {
             core::ptr::copy_nonoverlapping(act as *const u8, b.as_mut_ptr(), 32);
         }
@@ -736,8 +746,8 @@ pub fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> Res
         let restorer = u64::from_le_bytes(b[16..24].try_into().unwrap());
         let mask = u64::from_le_bytes(b[24..32].try_into().unwrap());
         if flags & crate::arch::x86_64::linux::signal_frame::SA_RESTORER == 0 {
-            // glibc always sets SA_RESTORER; a handler returning without it
-            // has no way back into the kernel (Linux would page-fault).
+            // glibc всегда ставит SA_RESTORER; обработчик, возвращающийся без
+            // него, не имеет пути назад в ядро (Linux дал бы page fault).
             crate::warn!(
                 "[linux] rt_sigaction: sig={} without SA_RESTORER (handler return will fault)",
                 sig
@@ -762,7 +772,7 @@ pub fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> Res
         b[8..16].copy_from_slice(&cur.flags.to_le_bytes());
         b[16..24].copy_from_slice(&cur.restorer.to_le_bytes());
         b[24..32].copy_from_slice(&cur.mask.to_le_bytes());
-        // SAFETY: range validated above.
+        // SAFETY: диапазон проверен выше.
         unsafe {
             core::ptr::copy_nonoverlapping(b.as_ptr(), oldact as *mut u8, 32);
         }
@@ -770,12 +780,12 @@ pub fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> Res
     Ok(0)
 }
 
-/// `rt_sigprocmask` (14): get/change the calling thread's blocked-signal
-/// mask. `how` is `SIG_BLOCK`/`SIG_UNBLOCK`/`SIG_SETMASK`; the `SIGKILL` and
-/// `SIGSTOP` bits can never end up blocked
-/// ([`apply_mask_op`](super::signal_frame::apply_mask_op) strips them). Only
-/// the low 64 bits of the sigset are implemented (signals 1..=64); a larger
-/// `sigsetsize` is accepted and the remaining bytes ignored.
+/// `rt_sigprocmask` (14): прочитать/сменить маску заблокированных сигналов
+/// вызывающего потока. `how` — `SIG_BLOCK`/`SIG_UNBLOCK`/`SIG_SETMASK`; биты
+/// `SIGKILL` и `SIGSTOP` никогда не могут оказаться заблокированными
+/// ([`apply_mask_op`](super::signal_frame::apply_mask_op) их вычищает).
+/// Реализованы только младшие 64 бита sigset (сигналы 1..=64); больший
+/// `sigsetsize` принимается, остальные байты игнорируются.
 pub fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> Result<u64, Errno> {
     let size = if sigsetsize != 0 { sigsetsize } else { 8 };
     if size < 8 {
@@ -787,7 +797,7 @@ pub fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> R
                 return Err(e);
             }
             let mut b = [0u8; 8];
-            // SAFETY: range validated above.
+            // SAFETY: диапазон проверен выше.
             unsafe {
                 core::ptr::copy_nonoverlapping(set as *const u8, b.as_mut_ptr(), 8);
             }
@@ -805,7 +815,7 @@ pub fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> R
                 return Err(e);
             }
             let le = cs.sig_blocked.to_le_bytes();
-            // SAFETY: range validated above.
+            // SAFETY: диапазон проверен выше.
             unsafe {
                 core::ptr::copy_nonoverlapping(le.as_ptr(), oldset as *mut u8, 8);
             }
@@ -815,13 +825,13 @@ pub fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> R
     outcome.ok_or(Errno::EINVAL)?
 }
 
-/// `sigaltstack` (131): register or query the alternate signal stack
-/// ([`SA_ONSTACK`](super::signal_frame::SA_ONSTACK) handlers run on it).
-/// The 24-byte `stack_t` ABI is `{ ss_sp, ss_flags(+pad), ss_size }`.
-/// Registering a stack while running ON the alternate stack is not detected
-/// in Phase 1 (the check needs the interrupted RSP, which this handler does
-/// not receive); glibc never switches altstacks from inside a handler, so the
-/// omission is benign.
+/// `sigaltstack` (131): зарегистрировать или прочитать альтернативный стек
+/// сигналов (на нём выполняются обработчики
+/// [`SA_ONSTACK`](super::signal_frame::SA_ONSTACK)). 24-байтный ABI `stack_t` —
+/// `{ ss_sp, ss_flags(+pad), ss_size }`. Регистрация стека, когда мы уже
+/// выполняемся НА альтернативном стеке, не детектируется (проверке нужен
+/// прерванный RSP, которого этот обработчик не получает); glibc никогда не
+/// переключает altstack изнутри обработчика, так что упущение безвредно.
 pub fn sys_sigaltstack(ss: u64, old_ss: u64) -> Result<u64, Errno> {
     let outcome: Option<Result<u64, Errno>> = compat::with_current_compat(|cs| {
         if old_ss != 0 {
@@ -832,7 +842,7 @@ pub fn sys_sigaltstack(ss: u64, old_ss: u64) -> Result<u64, Errno> {
             b[0..8].copy_from_slice(&cs.sig_altstack.sp.to_le_bytes());
             b[8..12].copy_from_slice(&cs.sig_altstack.flags.to_le_bytes());
             b[16..24].copy_from_slice(&cs.sig_altstack.size.to_le_bytes());
-            // SAFETY: range validated above.
+            // SAFETY: диапазон проверен выше.
             unsafe {
                 core::ptr::copy_nonoverlapping(b.as_ptr(), old_ss as *mut u8, 24);
             }
@@ -842,7 +852,7 @@ pub fn sys_sigaltstack(ss: u64, old_ss: u64) -> Result<u64, Errno> {
                 return Err(e);
             }
             let mut b = [0u8; 24];
-            // SAFETY: range validated above.
+            // SAFETY: диапазон проверен выше.
             unsafe {
                 core::ptr::copy_nonoverlapping(ss as *const u8, b.as_mut_ptr(), 24);
             }
@@ -862,7 +872,8 @@ pub fn sys_sigaltstack(ss: u64, old_ss: u64) -> Result<u64, Errno> {
     outcome.ok_or(Errno::EINVAL)?
 }
 
-/// `set_robust_list` (273): accept and return 0 (no futex/robust-list support).
+/// `set_robust_list` (273): принять и вернуть 0 (поддержки futex/robust-списков
+/// нет).
 pub fn sys_set_robust_list(head: u64, len: u64) -> Result<u64, Errno> {
     const ROBUST_HEAD_SIZE: u64 = 24;
     if len != ROBUST_HEAD_SIZE {
@@ -891,44 +902,44 @@ pub fn sys_get_robust_list(pid: u64, head_ptr: u64, len_ptr: u64) -> Result<u64,
     Ok(0)
 }
 
-/// `rseq` (334): restartable sequences are not supported. Returning 0 (rather than
-/// `-ENOSYS`) lets glibc-ish init continue without taking its fallback path; rseq
-/// is purely an optimization, so reporting success with no registration is benign.
+/// `rseq` (334): restartable sequences не поддерживаются. Возврат 0 (а не
+/// `-ENOSYS`) позволяет glibc-подобной инициализации не уходить в запасной путь;
+/// rseq — чистая оптимизация, поэтому успех без регистрации безвреден.
 pub fn sys_rseq() -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// The Linux `struct rlimit` / `rlimit64`: current and maximum (hard) limit.
+/// Linux `struct rlimit` / `rlimit64`: текущий и максимальный (жёсткий) лимит.
 #[repr(C)]
 struct Rlimit {
     rlim_cur: u64,
     rlim_max: u64,
 }
 
-/// `RLIM_INFINITY` — no limit.
+/// `RLIM_INFINITY` — без лимита.
 const RLIM_INFINITY: u64 = u64::MAX;
-/// `RLIMIT_STACK` resource id.
+/// Id ресурса `RLIMIT_STACK`.
 const RLIMIT_STACK: u64 = 3;
-/// `RLIMIT_NOFILE` resource id.
+/// Id ресурса `RLIMIT_NOFILE`.
 const RLIMIT_NOFILE: u64 = 7;
-/// Number of rlimit resources Linux defines (`RLIMIT_NLIMITS`); larger
-/// resource ids are rejected with `EINVAL`.
+/// Число ресурсов rlimit, определённых Linux (`RLIMIT_NLIMITS`); большие id
+/// отвергаются с `EINVAL`.
 pub(crate) const RLIMIT_NLIMITS: u64 = 16;
 
-/// Kernel-default `(cur, max)` rlimit pair for `resource` when the process has
-/// no `prlimit64`/`setrlimit` override. `RLIMIT_NOFILE`'s hard limit is the
-/// descriptor-table capacity (`io_sys::NOFILE_MAX`).
+/// Пара `(cur, max)` rlimit по умолчанию ядра для `resource`, когда у процесса нет
+/// переопределения `prlimit64`/`setrlimit`. Жёсткий лимит `RLIMIT_NOFILE` — это
+/// ёмкость таблицы дескрипторов (`io_sys::NOFILE_MAX`).
 pub(crate) fn default_rlimit(resource: u64) -> (u64, u64) {
     match resource {
-        RLIMIT_STACK => (8 * 1024 * 1024, RLIM_INFINITY), // 8 MiB soft stack
-        RLIMIT_NOFILE => (1024, super::io_sys::NOFILE_MAX), // open-file limits
+        RLIMIT_STACK => (8 * 1024 * 1024, RLIM_INFINITY), // мягкий лимит стека 8 МиБ
+        RLIMIT_NOFILE => (1024, super::io_sys::NOFILE_MAX), // лимиты открытых файлов
         _ => (RLIM_INFINITY, RLIM_INFINITY),
     }
 }
 
-/// The current process's effective `(cur, max)` rlimit for `resource`: the
-/// per-process override stored in its [`CompatState`](crate::task::compat::CompatState)
-/// when present, else the kernel default.
+/// Эффективный `(cur, max)` rlimit текущего процесса для `resource`:
+/// per-process переопределение из [`CompatState`](crate::task::compat::CompatState),
+/// если оно есть, иначе умолчание ядра.
 fn current_rlimit(resource: u64) -> (u64, u64) {
     compat::with_current_compat(|cs| match cs.rlimits.get(&resource) {
         Some(lim) => *lim,
@@ -937,8 +948,8 @@ fn current_rlimit(resource: u64) -> (u64, u64) {
     .unwrap_or_else(|| default_rlimit(resource))
 }
 
-/// Write the current process's effective `Rlimit` for `resource` to a validated
-/// user pointer. Unknown resource ids are rejected (`EINVAL`).
+/// Записать эффективный `Rlimit` текущего процесса для `resource` в проверенный
+/// пользовательский указатель. Неизвестные id ресурсов отвергаются (`EINVAL`).
 fn write_rlimit(ptr: u64, resource: u64) -> Result<(), Errno> {
     if resource >= RLIMIT_NLIMITS {
         return Err(Errno::EINVAL);
@@ -955,18 +966,18 @@ fn write_rlimit(ptr: u64, resource: u64) -> Result<(), Errno> {
             core::mem::size_of::<Rlimit>(),
         )
     };
-    // SAFETY: `ptr` validated for the rlimit length above.
+    // SAFETY: `ptr` проверен на длину rlimit выше.
     unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
     }
     Ok(())
 }
 
-/// `prlimit64` (302): report the current process's effective limit for
-/// `resource` via the `old_limit` pointer (if non-null); a non-null `new_limit`
-/// (user pointer to `struct rlimit64`) updates the per-process override for
-/// future queries. Limits are not enforced. Unknown resource ids and
-/// `rlim_cur > rlim_max` yield `EINVAL`.
+/// `prlimit64` (302): сообщить эффективный лимит текущего процесса для
+/// `resource` через `old_limit` (если не NULL); не NULL `new_limit`
+/// (пользовательский указатель на `struct rlimit64`) обновляет per-process
+/// переопределение для будущих запросов. Лимиты не принудительно
+/// применяются. Неизвестные id ресурсов и `rlim_cur > rlim_max` дают `EINVAL`.
 pub fn sys_prlimit64(
     _pid: u64,
     resource: u64,
@@ -978,7 +989,7 @@ pub fn sys_prlimit64(
     }
     if new_limit != 0 {
         check_user_ptr(new_limit, core::mem::size_of::<Rlimit>() as u64)?;
-        // SAFETY: `new_limit` validated for the rlimit length above.
+        // SAFETY: `new_limit` проверен на длину rlimit выше.
         let rl = unsafe { core::ptr::read_unaligned(new_limit as *const Rlimit) };
         if rl.rlim_cur > rl.rlim_max {
             return Err(Errno::EINVAL);
@@ -993,14 +1004,14 @@ pub fn sys_prlimit64(
     Ok(0)
 }
 
-/// `getrlimit` (97): report a sane limit for the resource and return 0.
+/// `getrlimit` (97): сообщить разумный лимит ресурса и вернуть 0.
 pub fn sys_getrlimit(resource: u64, rlim: u64) -> Result<u64, Errno> {
     write_rlimit(rlim, resource)?;
     Ok(0)
 }
 
-/// `setsid` (112): start a new session; the caller becomes session leader and
-/// the leader of a new process group (sessions themselves are not modelled).
+/// `setsid` (112): начать новую сессию; вызывающий становится лидером сессии и
+/// лидером новой группы процессов (сами сессии не моделируются).
 pub fn sys_setsid() -> Result<u64, Errno> {
     let pid = scheduler::current_pid();
     compat::with_current_compat(|cs| {
@@ -1009,10 +1020,10 @@ pub fn sys_setsid() -> Result<u64, Errno> {
     Ok(pid)
 }
 
-/// `setpgid` (109): move the caller or one of its children into `pgid`.
+/// `setpgid` (109): перевести вызывающего или одного из его детей в `pgid`.
 ///
-/// `pid == 0` means the caller, `pgid == 0` means the target's own pid. The
-/// target must be the caller or a direct child.
+/// `pid == 0` означает вызывающего, `pgid == 0` — собственный pid цели. Цель
+/// должна быть вызывающим или прямым ребёнком.
 pub fn sys_setpgid(pid: u64, pgid: u64) -> Result<u64, Errno> {
     let me = scheduler::current_pid();
     let target = if pid == 0 { me } else { pid };
@@ -1027,7 +1038,7 @@ pub fn sys_setpgid(pid: u64, pgid: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `getpgid` (132): the process group of `pid`, or the caller for `pid == 0`.
+/// `getpgid` (132): группа процессов `pid`, либо вызывающего при `pid == 0`.
 pub fn sys_getpgid(pid: u64) -> Result<u64, Errno> {
     let target = if pid == 0 {
         scheduler::current_pid()
@@ -1037,14 +1048,14 @@ pub fn sys_getpgid(pid: u64) -> Result<u64, Errno> {
     compat::pgid_of(target).ok_or(Errno::ESRCH)
 }
 
-/// `getpgrp` (111): the caller's process group.
+/// `getpgrp` (111): группа процессов вызывающего.
 pub fn sys_getpgrp() -> Result<u64, Errno> {
     sys_getpgid(0)
 }
 
-/// `umask` (95): set the process's file-mode creation mask to `mask & 0777`
-/// and return the previous mask. The mask is applied to the permission bits of
-/// freshly created files/directories (see the `open`/`mkdir` handlers).
+/// `umask` (95): задать маску создания режима файлов процесса `mask & 0777` и
+/// вернуть прежнюю маску. Маска применяется к битам прав свежесозданных
+/// файлов/каталогов (см. обработчики `open`/`mkdir`).
 pub fn sys_umask(mask: u64) -> Result<u64, Errno> {
     let old = compat::with_current_compat(|cs| {
         let old = cs.umask;
@@ -1055,20 +1066,21 @@ pub fn sys_umask(mask: u64) -> Result<u64, Errno> {
     Ok(old as u64)
 }
 
-/// `flock` (73): advisory locks are meaningless with one user and an
-/// in-process VFS; report success so nvim's swap-file locking proceeds.
+/// `flock` (73): рекомендательные блокировки бессмысленны при одном пользователе
+/// и внутрипроцессном VFS; сообщить успех, чтобы блокировка swap-файла nvim
+/// пошла дальше.
 pub fn sys_flock(_fd: u64, _op: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// Write one `u32` to a validated user pointer.
+/// Записать один `u32` в проверенный пользовательский указатель.
 fn write_user_u32(ptr: u64, value: u32) -> Result<(), Errno> {
     check_user_ptr(ptr, 4)?;
     super::io_sys::copy_out_pub(ptr, &value.to_le_bytes());
     Ok(())
 }
 
-/// `getcpu` (309): pagh is single-CPU, single-NUMA-node.
+/// `getcpu` (309): pagh — один CPU, один NUMA-узел.
 pub fn sys_getcpu(cpu: u64, node: u64, _tcache: u64) -> Result<u64, Errno> {
     if cpu != 0 {
         write_user_u32(cpu, 0)?;
@@ -1079,11 +1091,11 @@ pub fn sys_getcpu(cpu: u64, node: u64, _tcache: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `sched_getaffinity` (204): the affinity mask is always exactly CPU 0.
+/// `sched_getaffinity` (204): маска сродства — всегда ровно CPU 0.
 ///
-/// `pid` must name the caller (`0` or `getpid`); the mask is one 64-bit word, so
-/// `cpusetsize < 8` is `EINVAL`. Returns the bytes written (8), matching Linux's
-/// "bytes copied" convention.
+/// `pid` должен называть вызывающего (`0` или `getpid`); маска — одно 64-битное
+/// слово, поэтому `cpusetsize < 8` — `EINVAL`. Возвращает число записанных
+/// байт (8), как соглашение Linux «сколько байт скопировано».
 pub fn sys_sched_getaffinity(pid: u64, cpusetsize: u64, mask: u64) -> Result<u64, Errno> {
     let me = compat::with_current_compat(|cs| cs.tgid).unwrap_or(0);
     if pid != 0 && pid != me {
@@ -1097,7 +1109,7 @@ pub fn sys_sched_getaffinity(pid: u64, cpusetsize: u64, mask: u64) -> Result<u64
     Ok(8)
 }
 
-/// `sched_setaffinity` (203): accept only masks that include CPU 0.
+/// `sched_setaffinity` (203): принимать только маски, включающие CPU 0.
 pub fn sys_sched_setaffinity(pid: u64, cpusetsize: u64, mask: u64) -> Result<u64, Errno> {
     let me = compat::with_current_compat(|cs| cs.tgid).unwrap_or(0);
     if pid != 0 && pid != me {
@@ -1115,7 +1127,7 @@ pub fn sys_sched_setaffinity(pid: u64, cpusetsize: u64, mask: u64) -> Result<u64
     Ok(0)
 }
 
-/// `fadvise64` (221): advice is advisory; validate the descriptor and accept.
+/// `fadvise64` (221): совет рекомендателен; проверить дескриптор и принять.
 pub fn sys_fadvise64(fd: u64, _offset: u64, _len: u64, advice: u64) -> Result<u64, Errno> {
     if advice > 5 {
         return Err(Errno::EINVAL);
@@ -1127,15 +1139,16 @@ pub fn sys_fadvise64(fd: u64, _offset: u64, _len: u64, advice: u64) -> Result<u6
     Ok(0)
 }
 
-/// `setrlimit` (160): `prlimit64` for the calling process, old limit unused.
+/// `setrlimit` (160): `prlimit64` для вызывающего процесса, старый лимит не
+/// нужен.
 pub fn sys_setrlimit(resource: u64, new_limit: u64) -> Result<u64, Errno> {
     sys_prlimit64(0, resource, new_limit, 0)
 }
 
-/// `getrusage` (98): Linux's `struct rusage` is 144 bytes. pagh does not
-/// account per-process CPU time or faults yet, so the whole structure is
-/// zeroed — the same honest substitution as the zeroed fields in
-/// `/proc/<pid>/stat`, not invented numbers.
+/// `getrusage` (98): Linux `struct rusage` — 144 байта. pagh пока не учитывает
+/// per-process CPU-время и faults, поэтому вся структура обнуляется — та же
+/// честная подмена, что обнулённые поля в `/proc/<pid>/stat`, а не выдуманные
+/// числа.
 pub fn sys_getrusage(who: u64, usage: u64) -> Result<u64, Errno> {
     if who > 2 && who != u64::MAX {
         return Err(Errno::EINVAL);
@@ -1148,7 +1161,7 @@ pub fn sys_getrusage(who: u64, usage: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `times` (100): return the scheduler tick counter and zero `struct tms`.
+/// `times` (100): вернуть счётчик тиков планировщика и обнулённый `struct tms`.
 pub fn sys_times(tms: u64) -> Result<u64, Errno> {
     if tms != 0 {
         check_user_ptr(tms, 32)?;
@@ -1157,7 +1170,7 @@ pub fn sys_times(tms: u64) -> Result<u64, Errno> {
     Ok(scheduler::ticks())
 }
 
-/// `readahead` (187): advisory prefetch; validate the fd and accept.
+/// `readahead` (187): рекомендательная предвыборка; проверить fd и принять.
 pub fn sys_readahead(fd: u64, _offset: u64, _count: u64) -> Result<u64, Errno> {
     let open = compat::with_current_compat(|cs| cs.fds.get(fd as u32).is_some()).unwrap_or(false);
     if !open {
@@ -1166,8 +1179,8 @@ pub fn sys_readahead(fd: u64, _offset: u64, _count: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `syncfs` (306): the VFS/ext2 write path is synchronous, so there is nothing
-/// to flush; validate the fd as Linux does.
+/// `syncfs` (306): путь записи VFS/ext2 синхронный, сбрасывать нечего; проверить
+/// fd, как Linux.
 pub fn sys_syncfs(fd: u64) -> Result<u64, Errno> {
     let open = compat::with_current_compat(|cs| cs.fds.get(fd as u32).is_some()).unwrap_or(false);
     if !open {
@@ -1176,12 +1189,13 @@ pub fn sys_syncfs(fd: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `getpriority` (140): nice value 0 maps to the canonical 20.
+/// `getpriority` (140): nice 0 отображается в канонические 20.
 pub fn sys_getpriority(_which: u64, _who: u64) -> Result<u64, Errno> {
     Ok(20)
 }
 
-/// `setpriority` (141): one CPU, no scheduler priority classes; accepted.
+/// `setpriority` (141): один CPU, классов приоритета планировщика нет;
+/// принимается.
 pub fn sys_setpriority(_which: u64, _who: u64, priority: u64) -> Result<u64, Errno> {
     if priority < 40 {
         Ok(0)
@@ -1196,7 +1210,7 @@ pub fn sys_sched_getparam(_pid: u64, param: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `sched_setscheduler` (144): only SCHED_OTHER (0) exists.
+/// `sched_setscheduler` (144): существует только SCHED_OTHER (0).
 pub fn sys_sched_setscheduler(_pid: u64, policy: u64, _param: u64) -> Result<u64, Errno> {
     if policy == 0 {
         Ok(0)
@@ -1205,14 +1219,14 @@ pub fn sys_sched_setscheduler(_pid: u64, policy: u64, _param: u64) -> Result<u64
     }
 }
 
-/// `sched_rr_get_interval` (148): zero timespec; SCHED_RR is not implemented.
+/// `sched_rr_get_interval` (148): нулевой timespec; SCHED_RR не реализован.
 pub fn sys_sched_rr_get_interval(_pid: u64, interval: u64) -> Result<u64, Errno> {
     check_user_ptr(interval, 16)?;
     super::io_sys::copy_out_pub(interval, &[0u8; 16]);
     Ok(0)
 }
 
-/// `rt_sigpending` (127): no pending signals are ever reported.
+/// `rt_sigpending` (127): ожидающие сигналы никогда не сообщаются.
 pub fn sys_rt_sigpending(set: u64, sigsetsize: u64) -> Result<u64, Errno> {
     if sigsetsize != 8 {
         return Err(Errno::EINVAL);
@@ -1222,7 +1236,7 @@ pub fn sys_rt_sigpending(set: u64, sigsetsize: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `sync_file_range` (277): no dirty-page writeback exists; validate fd.
+/// `sync_file_range` (277): обратной записи грязных страниц нет; проверить fd.
 pub fn sys_sync_file_range(fd: u64, _offset: u64, _nbytes: u64, _flags: u64) -> Result<u64, Errno> {
     let open = compat::with_current_compat(|cs| cs.fds.get(fd as u32).is_some()).unwrap_or(false);
     if !open {
@@ -1231,8 +1245,8 @@ pub fn sys_sync_file_range(fd: u64, _offset: u64, _nbytes: u64, _flags: u64) -> 
     Ok(0)
 }
 
-/// `fallocate` (285): mode 0 extends the file to `offset + len`; other modes
-/// (punch-hole, collapse, zero-range) are not implemented.
+/// `fallocate` (285): режим 0 растягивает файл до `offset + len`; остальные режимы
+/// (punch-hole, collapse, zero-range) не реализованы.
 pub fn sys_fallocate(fd: u64, mode: u64, offset: u64, len: u64) -> Result<u64, Errno> {
     if mode != 0 {
         return Err(Errno::EINVAL);

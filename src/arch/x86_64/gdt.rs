@@ -1,5 +1,4 @@
-// arch/x86_64/gdt.rs — Global Descriptor Table, TSS, IST stacks
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// arch/x86_64/gdt.rs — Global Descriptor Table, TSS, стеки IST.
 
 use core::cell::SyncUnsafeCell;
 use core::sync::atomic::{AtomicU16, Ordering};
@@ -7,19 +6,18 @@ use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
 
-// ─── IST (Interrupt Stack Table) stack allocations ─────────────────────
+// ─── выделение стеков IST (Interrupt Stack Table) ─────────────────────────
 
-/// Double Fault IST stack (16KB, aligned to 16 bytes).
+/// Стек IST для Double Fault (16 КиБ, выравнивание 16 байт).
 #[repr(C, align(16))]
 struct IstStack([u8; 16384]);
 
-// The IST stacks, TSS and GDT live in `SyncUnsafeCell`s rather than `static mut`
-// items so that every access goes through the cell's `.get()` raw pointer and we
-// never create a `&`/`&mut` reference to a mutable static (which the
-// `static_mut_refs` lint forbids). None of these types are `Sync`, but
-// `SyncUnsafeCell` supplies the `Sync` impl a `static` requires; soundness rests
-// on the init-once, single-threaded, pre-interrupt invariant documented at each
-// access site.
+// Стеки IST, TSS и GDT живут в `SyncUnsafeCell`, а не в `static mut`, чтобы
+// каждый доступ шёл через сырой указатель `.get()` и мы никогда не создавали
+// `&`/`&mut` на изменяемый static (это запрещает lint `static_mut_refs`). Ни
+// один из типов не реализует `Sync`, но `SyncUnsafeCell` даёт реализацию,
+// нужную static; корректность держится на инварианте «инициализация один раз,
+// однопоточно, до прерываний», описанном в каждом месте доступа.
 static IST1_DOUBLE_FAULT: SyncUnsafeCell<IstStack> = SyncUnsafeCell::new(IstStack([0; 16384]));
 static IST2_PAGE_FAULT: SyncUnsafeCell<IstStack> = SyncUnsafeCell::new(IstStack([0; 16384]));
 
@@ -32,13 +30,13 @@ static TSS: SyncUnsafeCell<TaskStateSegment> = SyncUnsafeCell::new(TaskStateSegm
 static GDT: SyncUnsafeCell<GlobalDescriptorTable> =
     SyncUnsafeCell::new(GlobalDescriptorTable::new());
 
-/// Public segment selectors, set after `init()`.
+/// Публичные селекторы сегментов, выставляются после `init()`.
 pub struct Selectors;
 
-// Selector values are stored as raw `u16`s in `AtomicU16`s: `SegmentSelector` is
-// a `#[repr(transparent)]` wrapper around a `u16`, so storing `.0` in `init` and
-// rebuilding the wrapper on read is an exact, lock-free, reference-free
-// substitute for the previous `static mut SegmentSelector` items.
+// Значения селекторов хранятся сырыми `u16` в `AtomicU16`: `SegmentSelector` —
+// `#[repr(transparent)]`-обёртка над `u16`, поэтому сохранение `.0` в `init` и
+// пересборка обёртки при чтении точно, lock-free и без ссылок заменяют прежние
+// `static mut SegmentSelector`.
 static KERNEL_CODE_SEL: AtomicU16 = AtomicU16::new(0);
 static KERNEL_DATA_SEL: AtomicU16 = AtomicU16::new(0);
 static USER_CODE_SEL: AtomicU16 = AtomicU16::new(0);
@@ -47,55 +45,56 @@ static TSS_SEL: AtomicU16 = AtomicU16::new(0);
 
 impl Selectors {
     pub fn kernel_code() -> SegmentSelector {
-        // Set once during init, then read-only; rebuild the wrapper from the raw value.
+        // Ставится один раз в init, дальше только чтение; обёртка собирается из сырого значения.
         SegmentSelector(KERNEL_CODE_SEL.load(Ordering::Relaxed))
     }
     pub fn kernel_data() -> SegmentSelector {
-        // Set once during init, then read-only; rebuild the wrapper from the raw value.
+        // Ставится один раз в init, дальше только чтение; обёртка собирается из сырого значения.
         SegmentSelector(KERNEL_DATA_SEL.load(Ordering::Relaxed))
     }
     pub fn user_code() -> SegmentSelector {
-        // Set once during init, then read-only; rebuild the wrapper from the raw value.
+        // Ставится один раз в init, дальше только чтение; обёртка собирается из сырого значения.
         SegmentSelector(USER_CODE_SEL.load(Ordering::Relaxed))
     }
     pub fn user_data() -> SegmentSelector {
-        // Set once during init, then read-only; rebuild the wrapper from the raw value.
+        // Ставится один раз в init, дальше только чтение; обёртка собирается из сырого значения.
         SegmentSelector(USER_DATA_SEL.load(Ordering::Relaxed))
     }
 }
 
-// ─── IST indices (must match IDT entries) ───────────────────────────────
+// ─── индексы IST (должны совпадать с записями IDT) ──────────────────────
 
 pub const IST_DOUBLE_FAULT: u16 = 1;
 pub const IST_PAGE_FAULT: u16 = 2;
 
-// ─── TSS RSP0 (ring-3 → ring-0 stack) ───────────────────────────────────
+// ─── TSS RSP0 (стек перехода ring-3 → ring-0) ───────────────────────────
 
-/// Program the privileged stack pointer `TSS.privilege_stack_table[0]` (RSP0).
+/// Запрограммировать привилегированный указатель стека `TSS.privilege_stack_table[0]` (RSP0).
 ///
-/// When the CPU takes an interrupt (e.g. the preemptive timer tick) or executes
-/// `int 0x80` *while running in ring 3*, it performs a privilege-level switch
-/// and loads the kernel stack pointer from RSP0 in the TSS. If RSP0 is left
-/// unset (zero), that first ring-3 → ring-0 transition pushes onto address 0 and
-/// faults. A ring-3 task therefore cannot run until RSP0 points at a valid
-/// kernel stack.
+/// Когда CPU принимает прерывание (например, тик вытеснения) или исполняет
+/// `int 0x80` *в ring 3*, он переключает уровень привилегий и загружает
+/// указатель стека ядра из RSP0 в TSS. Если RSP0 не задан (ноль), первый
+/// переход ring-3 → ring-0 положит данные по адресу 0 и упадёт. Поэтому
+/// ring-3 задача не может выполняться, пока RSP0 не указывает на валидный стек
+/// ядра.
 ///
-/// `rsp0` must be the (exclusive) top of a mapped, 16-byte-aligned kernel stack.
-/// The CPU re-reads this field from TSS memory on every privilege switch, so
-/// updating it after `load_tss` (which we do per ring-3 task in
-/// `task::process::create_user_process`) takes effect immediately.
+/// `rsp0` должен быть (исключающей) вершиной отображённого стека ядра,
+/// выровненного на 16 байт. CPU перечитывает это поле из памяти TSS при каждом
+/// переключении привилегий, поэтому обновление после `load_tss` (мы делаем это
+/// для каждой ring-3 задачи в `task::process::create_user_process`) действует
+/// немедленно.
 ///
-/// LIMITATION (single-task): there is exactly one RSP0 slot, so this design
-/// supports only ONE ring-3 task at a time. With multiple user tasks RSP0 would
-/// have to be reprogrammed on every switch into a ring-3 task; that is out of
-/// scope for the current single embedded-test-process bring-up.
+/// ОГРАНИЧЕНИЕ (одна задача): слот RSP0 ровно один, поэтому дизайн поддерживает
+/// только ОДНУ ring-3 задачу одновременно. При нескольких пользовательских
+/// задачах RSP0 пришлось бы перенастраивать при каждом переключении в ring-3;
+/// это вне рамок текущего однопользовательского запуска.
 pub fn set_kernel_stack(rsp0: u64) {
-    // SAFETY: init-once, single-threaded, pre-interrupt invariant — the TSS is
-    // owned by this module's `SyncUnsafeCell` and is only mutated here and in
-    // `init`, with no concurrent access. RSP0 is written through the cell's raw
-    // pointer as a single aligned 64-bit store; the CPU re-reads it on the next
-    // privilege transition, so the write through `.get()` (never a `&mut` to a
-    // static) takes effect immediately.
+    // SAFETY: инвариант «инициализация один раз, однопоточно, до прерываний» —
+    // TSS принадлежит `SyncUnsafeCell` этого модуля и меняется только здесь и в
+    // `init`, без конкурентного доступа. RSP0 пишется через сырой указатель
+    // ячейки одной выровненной 64-битной записью; CPU перечитает его при
+    // следующем переключении привилегий, поэтому запись через `.get()` (никогда
+    // не `&mut` на static) действует сразу.
     unsafe {
         (*TSS.get()).privilege_stack_table[0] = VirtAddr::new(rsp0);
     }
@@ -103,37 +102,39 @@ pub fn set_kernel_stack(rsp0: u64) {
 
 // ─── init() ─────────────────────────────────────────────────────────────
 
-/// I/O-permission posture: the TSS carries no I/O bitmap (`iomap_base` points past
-/// the segment limit), so with `IOPL=0` every ring-3 `in`/`out`/PCI-config access
-/// is a #GP. That is intentional defense in depth: the `rt_sigreturn` fix masks
-/// IOPL out of restored RFLAGS (F-LEAD-2); the absent bitmap means even a future
-/// path that raises IOPL still has to change this TSS to get ports.
+/// Политика доступа к портам: в TSS нет I/O-битмапа (`iomap_base` указывает за
+/// предел сегмента), поэтому при `IOPL=0` любой `in`/`out`/PCI-config из ring 3 —
+/// это #GP. Так задумано как эшелонированная защита: исправление
+/// `rt_sigreturn` вычищает IOPL из восстановленных RFLAGS, а отсутствие битмапа
+/// означает, что даже будущий путь, поднявший IOPL, должен менять этот TSS,
+/// чтобы получить порты.
 ///
-/// Initialize GDT, TSS with IST stacks, and load them into the CPU.
+/// Инициализировать GDT, TSS со стеками IST и загрузить их в CPU.
 ///
-/// SAFETY: Must be called once during early boot, before interrupts are enabled.
+/// SAFETY: должен вызываться один раз при ранней загрузке, до включения
+/// прерываний.
 pub fn init() {
-    // IST stack tops. `.get()` yields the `*mut IstStack` backing each cell; the
-    // pointer-to-integer cast gives the stack base, and + 16384 gives its
-    // (exclusive) top. No reference to a static is created.
+    // Вершины стеков IST. `.get()` даёт `*mut IstStack` на ячейку; приведение
+    // указателя к числу даёт базу стека, а + 16384 — его (исключающую) вершину.
+    // Ссылка на static не создаётся.
     let df_stack_top = IST1_DOUBLE_FAULT.get() as u64 + 16384;
     let pf_stack_top = IST2_PAGE_FAULT.get() as u64 + 16384;
 
-    // SAFETY: init-once, single-threaded, pre-interrupt invariant — exclusive
-    // access to the TSS through its cell's raw pointer; no other code observes
-    // or mutates the TSS during early boot.
+    // SAFETY: инвариант «инициализация один раз, однопоточно, до прерываний» —
+    // эксклюзивный доступ к TSS через сырой указатель ячейки; никакой другой код
+    // не наблюдает и не меняет TSS во время ранней загрузки.
     unsafe {
         let tss = TSS.get();
         (*tss).interrupt_stack_table[IST_DOUBLE_FAULT as usize] = VirtAddr::new(df_stack_top);
         (*tss).interrupt_stack_table[IST_PAGE_FAULT as usize] = VirtAddr::new(pf_stack_top);
     }
 
-    // Build GDT descriptors.
-    // SAFETY: init-once, single-threaded, pre-interrupt invariant — exclusive
-    // access to the GDT through its cell's raw pointer. The `&'static TSS` fed to
-    // `Descriptor::tss_segment` is taken from the TSS cell, which is fully
-    // initialized above and never mutated concurrently; the reference only needs
-    // to remain valid for the descriptor, and the TSS lives for the whole program.
+    // Построить дескрипторы GDT.
+    // SAFETY: инвариант «инициализация один раз, однопоточно, до прерываний» —
+    // эксклюзивный доступ к GDT через сырой указатель ячейки. `&'static TSS`,
+    // передаваемый в `Descriptor::tss_segment`, берётся из ячейки TSS, которая
+    // полностью инициализирована выше и не меняется конкурентно; ссылка должна
+    // жить только для дескриптора, а TSS живёт всю программу.
     unsafe {
         let gdt = &mut *GDT.get();
         KERNEL_CODE_SEL.store(
@@ -144,13 +145,14 @@ pub fn init() {
             gdt.append(Descriptor::kernel_data_segment()).0,
             Ordering::Relaxed,
         );
-        // ORDER MATTERS (stage-13.7 fix): `sysretq` loads CS.sel = STAR[63:48]+16
-        // and SS.sel = STAR[63:48]+8 without consulting the GDT, so the user DATA
-        // descriptor must sit exactly 8 bytes BELOW the user CODE descriptor.
-        // With the previous [user_code, user_data] order no valid STAR value
-        // exists: sysret would hand ring 3 SS = kernel_data|3, and the first
-        // ring-3 interrupt would #GP on the iretq restore of that SS. Nothing
-        // depends on the raw selector values: all users go through `Selectors`.
+        // ПОРЯДОК ВАЖЕН: `sysretq` загружает CS.sel = STAR[63:48]+16 и
+        // SS.sel = STAR[63:48]+8, не обращаясь к GDT, поэтому дескриптор DATA
+        // пользователя обязан лежать ровно на 8 байт НИЖЕ дескриптора CODE
+        // пользователя. При прежнем порядке [user_code, user_data] валидного
+        // значения STAR не существует: sysret выдал бы ring 3 SS = kernel_data|3,
+        // и первое же ring-3 прерывание упало бы с #GP на восстановлении этого SS
+        // через iretq. От сырых значений селекторов ничего не зависит: все
+        // пользователи идут через `Selectors`.
         USER_DATA_SEL.store(
             gdt.append(Descriptor::user_data_segment()).0,
             Ordering::Relaxed,
@@ -166,16 +168,17 @@ pub fn init() {
         );
     }
 
-    // Load GDT and TSS.
-    // SAFETY: init-once, single-threaded, pre-interrupt invariant. The GDT holds
-    // valid descriptors built above and the TSS is initialized; access is through
-    // the GDT cell's raw pointer. The `&'static` borrow required by `load()` is
-    // satisfied because the GDT lives for the whole program and is not mutated
-    // after this point. The selector reloads use the just-stored atomic values.
+    // Загрузить GDT и TSS.
+    // SAFETY: инвариант «инициализация один раз, однопоточно, до прерываний».
+    // GDT содержит валидные дескрипторы, построенные выше, TSS инициализирован;
+    // доступ идёт через сырой указатель ячейки GDT. `&'static`, требуемый
+    // `load()`, обеспечен: GDT живёт всю программу и после этой точки не
+    // меняется. Перезагрузка селекторов использует только что сохранённые
+    // атомарные значения.
     unsafe {
         let gdt: &'static GlobalDescriptorTable = &*GDT.get();
         gdt.load();
-        // Reload code segment with a far jump
+        // Перезагрузить сегмент кода дальним переходом
         core::arch::asm!(
             "push {sel}",
             "lea {tmp}, [2f + rip]",
@@ -186,20 +189,21 @@ pub fn init() {
             tmp = lateout(reg) _,
             options(preserves_flags),
         );
-        // Reload data segments — INCLUDING SS.
+        // Перезагрузить сегменты данных — ВКЛЮЧАЯ SS.
         //
-        // SS must be reloaded here, not just DS/ES/FS/GS. On entry the CPU is
-        // still running with the stale stack selector the bootloader (Limine)
-        // loaded — its 64-bit data selector happens to be 0x30. After
-        // `GDT.load()` swaps in *our* GDT, selector 0x30 is the high half of
-        // the 16-byte TSS system descriptor (GDT index 6), i.e. NOT a valid
-        // data segment. If SS is left at 0x30, the first preemptive timer tick
-        // pushes SS=0x30 into the interrupt frame and the matching `iretq`
-        // (irq32_stub) reloads it against our GDT, faulting with #GP e=0x30.
-        // Loading SS = KERNEL_DATA_SEL (0x10) makes the running stack selector
-        // a valid present DPL0 data segment so the iret restore path is sound
-        // (Requirements 11.1, 11.2). `mov ss` also naturally inhibits IRQs for
-        // the following instruction, so RSP stays consistent across the load.
+        // SS нужно перезагрузить здесь, а не только DS/ES/FS/GS. На входе CPU
+        // работает с устаревшим селектором стека, загруженным загрузчиком
+        // (Limine) — его 64-битный селектор данных оказался 0x30. После того как
+        // `GDT.load()` подставит НАШУ GDT, селектор 0x30 — старшая половина
+        // 16-байтного системного дескриптора TSS (индекс 6 GDT), то есть НЕ
+        // валидный сегмент данных. Если оставить SS = 0x30, первый тик
+        // вытеснения положит SS=0x30 во фрейм прерывания, и соответствующий
+        // `iretq` (irq32_stub) перезагрузит его против нашей GDT, упав с
+        // #GP e=0x30. Загрузка SS = KERNEL_DATA_SEL (0x10) делает текущий
+        // селектор стека валидным present DPL0-сегментом данных, и путь
+        // восстановления iret корректен (Requirements 11.1, 11.2). `mov ss`
+        // естественно подавляет IRQ на следующей инструкции, поэтому RSP
+        // остаётся согласованным на время загрузки.
         core::arch::asm!(
             "mov ds, {sel:x}",
             "mov es, {sel:x}",
@@ -209,7 +213,7 @@ pub fn init() {
             sel = in(reg) KERNEL_DATA_SEL.load(Ordering::Relaxed),
             options(nomem, nostack),
         );
-        // Load TSS
+        // Загрузить TSS
         x86_64::instructions::tables::load_tss(SegmentSelector(TSS_SEL.load(Ordering::Relaxed)));
     }
 

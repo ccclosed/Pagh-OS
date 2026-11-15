@@ -1,22 +1,20 @@
-// task/stack_map.rs — Effectful initial-stack mapper (kernel-only)
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// task/stack_map.rs — эффектное отображение начального стека (только ядро).
 //
-// This module is the **effectful half** of the `Stack_Initializer` component
-// (design §5, task 13.2). It wraps the pure `task::stack::build_initial_stack`
-// encoder: it maps the ring-3 user-stack pages, asks the pure encoder for the
-// exact SysV byte image, copies that image into the mapped stack, and returns
-// the entry `rsp` for the process builder.
+// **Эффектная половина** компонента `Stack_Initializer` (design §5). Оборачивает
+// чистый кодировщик `task::stack::build_initial_stack`: отображает ring-3
+// страницы пользовательского стека, просит чистый кодировщик точный SysV-образ,
+// копирует его в отображённый стек и возвращает входной `rsp` строителю
+// процесса.
 //
-// It lives in its OWN file (not `task/stack.rs`) on purpose: `task/stack.rs` is
-// `#[path]`-included verbatim by the `host-tests` crate so its pure encoder can
-// be property-tested on the host (R11.6). This wrapper uses kernel-only
-// `memory::{pmm, vmm}` paging APIs that do not exist on the host, so keeping it
-// separate leaves `task/stack.rs` purely host-testable while this file is
-// compiled only as part of the kernel.
+// Модуль вынесен в отдельный файл намеренно: `task/stack.rs` включается в
+// `host-tests` через `#[path]`, чтобы его чистый кодировщик проверялся свойствами
+// на хосте (R11.6). Эта обёртка использует ядерные API paging
+// `memory::{pmm, vmm}`, которых на хосте нет, поэтому `task/stack.rs` остаётся
+// чисто host-тестируемым, а этот файл компилируется только в ядре.
 //
-// Requirements covered: R6.6 (AT_RANDOM bytes live in the mapped stack), R6.8
-// (insufficient space aborts without starting the process), R7.6 (stack pages
-// mapped USER_ACCESSIBLE so ring-3 can reach them).
+// Покрытые требования: R6.6 (байты AT_RANDOM живут в отображённом стеке), R6.8
+// (нехватка места обрывает запуск без старта процесса), R7.6 (страницы стека
+// отображены USER_ACCESSIBLE, чтобы ring-3 до них доставал).
 #![allow(dead_code)]
 
 use core::cmp::min;
@@ -28,20 +26,20 @@ use crate::memory::layout::{PAGE_SIZE, USER_STACK_PAGES, USER_STACK_TOP};
 use crate::memory::{pmm, vmm};
 use crate::task::stack::{build_initial_stack, AuxInputs, StackError, StackImage};
 
-/// Failure modes of [`map_initial_stack`].
+/// Режимы отказа [`map_initial_stack`].
 ///
-/// [`TooLarge`](StackMapError::TooLarge) forwards the pure encoder's
-/// [`StackError::TooLarge`] (R6.8). The other two cover the effectful mapping
-/// step (physical-frame exhaustion / page-table failure); in every error case
-/// the wrapper unwinds any pages it mapped and the process is NOT started
-/// (R6.8, R7.3).
+/// [`TooLarge`](StackMapError::TooLarge) пробрасывает
+/// [`StackError::TooLarge`] чистого кодировщика (R6.8). Остальные два покрывают
+/// эффектный шаг отображения (исчерпание физических кадров / отказ таблицы
+/// страниц); в любом случае обёртка снимает все отображённые страницы, и процесс
+/// НЕ запускается (R6.8, R7.3).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StackMapError {
-    /// The encoded SysV image does not fit in the user-stack region (R6.8).
+    /// Закодированный SysV-образ не помещается в регион пользовательского стека (R6.8).
     TooLarge,
-    /// A physical frame for a stack page could not be allocated.
+    /// Не удалось выделить физический кадр под страницу стека.
     OutOfMemory,
-    /// Mapping a stack page into the user PML4 failed.
+    /// Не удалось отобразить страницу стека в пользовательский PML4.
     MapFailed,
 }
 
@@ -53,36 +51,37 @@ impl From<StackError> for StackMapError {
     }
 }
 
-/// Map the initial user stack and populate it with the System V image (R6.6,
-/// R6.8, R7.6).
+/// Отобразить начальный пользовательский стек и заполнить его образом System V
+/// (R6.6, R6.8, R7.6).
 ///
-/// Mirrors the user-mapping approach in `task::process::create_user_process`:
-/// the user address space is `pml4_phys` (the fresh PML4 the loader produced as
-/// `ElfProcess::pml4_phys`), so this wrapper temporarily installs that CR3 while
-/// it maps and writes the stack, then restores the kernel CR3 on every return
-/// path. The kernel higher-half (this code, its stack, the heap that backs the
-/// pure encoder's `Vec`, and the HHDM used for the copy) stays mapped under the
-/// user PML4, so it is safe to run while that CR3 is active.
+/// Повторяет подход к пользовательским отображениям из
+/// `task::process::create_user_process`: пользовательское адресное пространство —
+/// `pml4_phys` (свежий PML4 от загрузчика как `ElfProcess::pml4_phys`), поэтому
+/// обёртка временно ставит этот CR3, пока отображает и пишет стек, и
+/// восстанавливает ядерный CR3 на каждом пути возврата. Ядерная верхняя половина
+/// (этот код, его стек, куча под `Vec` чистого кодировщика и HHDM для
+/// копирования) остаётся отображённой под пользовательским PML4, так что
+/// выполнение при этом CR3 безопасно.
 ///
-/// PRECONDITION: the caller must run this with interrupts disabled — it briefly
-/// installs the user CR3 while executing kernel code, exactly like
+/// ПРЕДУСЛОВИЕ: вызывающий выполняет это с выключенными прерываниями — на время
+/// исполнения кода ядра ставится пользовательский CR3, как в
 /// `create_user_process`/`ElfLoader::load`.
 ///
-/// Steps:
-///  1. Derive the stack region `[stack_low, USER_STACK_TOP)` from the layout
-///     constants (`USER_STACK_TOP`, `USER_STACK_PAGES`) — the same region
-///     `create_user_process` uses.
-///  2. Map every stack page `WRITABLE | NO_EXECUTE | USER_ACCESSIBLE` (R7.6),
-///     backing each with a PMM frame, tracking how many we mapped.
-///  3. Call the pure [`build_initial_stack`] encoder for that region.
-///  4. On `Ok`, copy `StackImage::bytes` into the mapped stack at `argc_addr`
-///     (page-by-page via the HHDM, so we never assume the freshly allocated
-///     frames are physically contiguous) and return `initial_rsp`.
-///  5. On any error (encoder `TooLarge`, PMM OOM, or VMM map failure), unwind
-///     every page mapped in step 2 and propagate the error so the process is
-///     not started (R6.8, R7.3).
+/// Шаги:
+///  1. Вывести регион `[stack_low, USER_STACK_TOP)` из констант
+///     (`USER_STACK_TOP`, `USER_STACK_PAGES`) — тот же, что у
+///     `create_user_process`.
+///  2. Отобразить каждую страницу стека `WRITABLE | NO_EXECUTE |
+///     USER_ACCESSIBLE` (R7.6), подложив кадр PMM, и считать число отображённых.
+///  3. Позвать чистый кодировщик [`build_initial_stack`] для этого региона.
+///  4. При `Ok` скопировать `StackImage::bytes` в отображённый стек по
+///     `argc_addr` (постранично через HHDM, не полагаясь на физическую
+///     непрерывность свежих кадров) и вернуть `initial_rsp`.
+///  5. При любой ошибке (кодировщик `TooLarge`, OOM PMM или отказ VMM)
+///     снять все отображённые на шаге 2 страницы и пробросить ошибку, чтобы
+///     процесс не стартовал (R6.8, R7.3).
 ///
-/// Returns the initial `rsp` (== the 16-byte-aligned `argc` address) on success.
+/// Возвращает начальный `rsp` (выровненный на 16 адрес `argc`) при успехе.
 pub fn map_initial_stack(
     pml4_phys: u64,
     argv: &[&[u8]],
@@ -93,22 +92,24 @@ pub fn map_initial_stack(
     let stack_top = USER_STACK_TOP;
     let stack_low = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
 
-    // Ring-3 stack pages: writable data, never executable, reachable from ring 3
-    // (R7.6). Identical flag set to `create_user_process`'s user stack.
+    // Ring-3 страницы стека: записываемые данные, никогда не исполняемые,
+    // достижимые из ring 3 (R7.6). Набор флагов идентичен стеку пользователя в
+    // `create_user_process`.
     let uflags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
         | PageTableFlags::USER_ACCESSIBLE
         | PageTableFlags::NO_EXECUTE;
 
     let kernel_cr3 = vmm::current_pml4_phys();
-    // SAFETY: `pml4_phys` is a valid PML4 with the kernel higher-half cloned in,
-    // so kernel code/stack/heap/HHDM remain mapped while it is installed. We
-    // restore `kernel_cr3` on every return path below before handing back.
+    // SAFETY: `pml4_phys` — валидный PML4 с клонированной ядерной верхней
+    // половиной, поэтому код/стек/куча/HHDM ядра остаются отображёнными, пока он
+    // установлен. `kernel_cr3` восстанавливается на каждом пути ниже перед
+    // возвратом.
     unsafe {
         vmm::load_cr3(pml4_phys);
     }
 
-    // ── Map the stack region, remembering how many pages we committed ────────
+    // ── Отобразить регион стека, запоминая, сколько страниц заняли ──────────
     let mut mapped_pages: u64 = 0;
     let mut map_err: Option<StackMapError> = None;
     for page in 0..USER_STACK_PAGES {
@@ -116,8 +117,9 @@ pub fn map_initial_stack(
         match pmm::alloc_frame() {
             Some(frame) => {
                 if vmm::map(frame, vaddr, uflags).is_err() {
-                    // Mapping failed: the frame is not referenced by any PTE, so
-                    // free it directly (the unwind loop only sees mapped pages).
+                    // Отображение не удалось: кадр не упомянут ни в одном PTE,
+                    // поэтому освобождаем его напрямую (цикл отката видит только
+                    // отображённые страницы).
                     pmm::free_frame(frame);
                     map_err = Some(StackMapError::MapFailed);
                     break;
@@ -131,7 +133,7 @@ pub fn map_initial_stack(
         }
     }
 
-    // ── Build the pure image and copy it in (only if mapping fully succeeded) ─
+    // ── Построить чистый образ и скопировать его (только если отображение удалось) ─
     let result: Result<u64, StackMapError> = match map_err {
         None => match build_initial_stack(stack_top, stack_low, argv, envp, aux, random16) {
             Ok(image) => {
@@ -143,11 +145,11 @@ pub fn map_initial_stack(
         Some(e) => Err(e),
     };
 
-    // ── On any error, unwind the pages we mapped (R6.8) ──────────────────────
+    // ── При любой ошибке снять отображённые страницы (R6.8) ────────────────
     if result.is_err() {
         for page in 0..mapped_pages {
             let vaddr = stack_low + page * PAGE_SIZE;
-            // Translate before unmapping so we can return the backing frame.
+            // Перевести адрес до снятия отображения, чтобы вернуть лежащий кадр.
             if let Some(phys) = vmm::virt_to_phys(vaddr) {
                 let _ = vmm::unmap(vaddr);
                 pmm::free_frame(phys);
@@ -155,8 +157,8 @@ pub fn map_initial_stack(
         }
     }
 
-    // SAFETY: restore the kernel PML4 before returning to the caller so we never
-    // hand control back with a foreign address space installed.
+    // SAFETY: восстановить ядерный PML4 до возврата вызывающему, чтобы никогда
+    // не отдавать управление с чужим адресным пространством.
     unsafe {
         vmm::load_cr3(kernel_cr3);
     }
@@ -164,16 +166,16 @@ pub fn map_initial_stack(
     result
 }
 
-/// Copy a built [`StackImage`] into the already-mapped user stack.
+/// Скопировать собранный [`StackImage`] в уже отображённый пользовательский
+/// стек.
 ///
-/// The image occupies `[argc_addr, stack_top)`; `bytes[0]` lives at `argc_addr`.
-/// The copy walks one page at a time and translates each page through the HHDM
-/// (`virt_to_phys` → `phys_to_virt`) — the same technique `ElfLoader` uses — so
-/// it is correct even though the freshly allocated stack frames are not
-/// guaranteed to be physically contiguous.
+/// Образ занимает `[argc_addr, stack_top)`; `bytes[0]` живёт по `argc_addr`.
+/// Копирование идёт постранично, переводя каждую страницу через HHDM
+/// (`virt_to_phys` → `phys_to_virt`) — тем же способом пользуется `ElfLoader`, —
+/// поэтому корректно даже при физической неоднородности свежих кадров стека.
 ///
-/// PRECONDITION: the user PML4 backing `argc_addr` is the active CR3 and every
-/// page the image spans is mapped writable (guaranteed by the caller).
+/// ПРЕДУСЛОВИЕ: пользовательский PML4, лежащий за `argc_addr`, — активный CR3, и
+/// каждая страница образа отображена на запись (гарантирует вызывающий).
 fn copy_image_to_user_stack(image: &StackImage) {
     let bytes = &image.bytes;
     let dst_base = image.argc_addr;
@@ -186,8 +188,9 @@ fn copy_image_to_user_stack(image: &StackImage) {
 
         if let Some(phys) = vmm::virt_to_phys(page_base) {
             let dst = (vmm::phys_to_virt(phys) + page_off as u64) as *mut u8;
-            // SAFETY: `dst` is the HHDM alias of a mapped, writable user stack
-            // page; `chunk` stays within that page and within `bytes`.
+            // SAFETY: `dst` — HHDM-алиас отображённой записываемой
+            // пользовательской страницы стека; `chunk` не выходит за эту страницу
+            // и за `bytes`.
             unsafe {
                 ptr::copy_nonoverlapping(bytes.as_ptr().add(written), dst, chunk);
             }

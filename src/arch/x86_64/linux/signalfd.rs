@@ -1,10 +1,10 @@
 //! `signalfd` (282) / `signalfd4` (289).
 //!
-//! A signalfd is a readable fd over the caller's pending-signal set: a matching
-//! pending signal is consumed from the pending bitmap (not delivered through the
-//! normal handler path) and returned as a 128-byte `signalfd_siginfo` whose first
-//! u32 is `ssi_signo`. pagh stores only the signal number per pending bit, so the
-//! remaining siginfo fields are zero — documented rather than invented.
+//! Signalfd — читаемый fd над pending-набором сигналов вызывающего: подходящий
+//! ожидающий сигнал потребляется из битмапа (не доставляется обычным путём
+//! обработчика) и возвращается как 128-байтный `signalfd_siginfo`, первые u32
+//! которого — `ssi_signo`. pagh хранит на ожидающий бит только номер сигнала,
+//! поэтому остальные поля siginfo нулевые — это документировано, а не выдумано.
 
 use alloc::sync::Arc;
 
@@ -47,7 +47,7 @@ fn create(mask: u64, flags: u64) -> Result<u64, Errno> {
     Ok(fd as u64)
 }
 
-/// `signalfd` (282) — the flags-less form.
+/// `signalfd` (282) — форма без флагов.
 pub fn sys_signalfd(fd: u64, mask: u64, sizemask: u64) -> Result<u64, Errno> {
     let mask = read_mask(mask, sizemask)?;
     if fd == u64::MAX {
@@ -81,8 +81,8 @@ fn update(fd: u64, mask: u64) -> Result<u64, Errno> {
     .ok_or(Errno::EBADF)
 }
 
-/// `read(2)` on a signalfd: block until a matching pending signal, then return
-/// one 128-byte `signalfd_siginfo` record.
+/// `read(2)` на signalfd: блокироваться до подходящего ожидающего сигнала, затем
+/// вернуть одну 128-байтную запись `signalfd_siginfo`.
 pub fn read_signalfd(mask: u64, buf: u64, count: u64) -> Result<u64, Errno> {
     if count < SIGNALFD_SIGINFO_SIZE as u64 {
         return Err(Errno::EINVAL);
@@ -92,9 +92,9 @@ pub fn read_signalfd(mask: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         if let Some(signal) = compat::take_signalfd_signal(mask) {
             let mut record = [0u8; SIGNALFD_SIGINFO_SIZE];
             record[..4].copy_from_slice(&(signal as u32).to_le_bytes());
-            // The wait above yields; re-validate the 128-byte record pointer
-            // before publishing. A CLONE_VM sibling may have unmapped it
-            // (F-x86a-4) — EFAULT, not a kernel-mode #PF that halts the machine.
+            // Ожидание выше уступает CPU; перепроверить указатель на 128-байтную
+            // запись перед публикацией. Поток-сосед по CLONE_VM мог снять её
+            // отображение — EFAULT, а не #PF режима ядра с остановкой машины.
             copy_out_checked(buf, &record)?;
             return Ok(SIGNALFD_SIGINFO_SIZE as u64);
         }

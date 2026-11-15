@@ -1,55 +1,52 @@
-// memory/layout.rs — Single source of truth for fixed kernel virtual regions.
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// memory/layout.rs — единственный источник правды о фиксированных виртуальных регионах ядра.
 //
-// This module is the canonical definition of the kernel's fixed virtual-memory
-// layout (Requirement 4.1). Historically the magic constants below were scattered
-// across `task::scheduler`, `task::process`, and `memory::allocator`. They are
-// collected here so the rest of the kernel can derive addresses from one place.
+// Здесь канонически определены фиксированные регионы (Requirement 4.1).
+// Раньше магические константы были разбросаны по `task::scheduler`,
+// `task::process` и `memory::allocator`; они собраны сюда, чтобы остальное ядро
+// выводило адреса из одного места.
 //
-// The call sites in scheduler.rs / process.rs / allocator.rs / heap.rs use these
-// constants (migration from task 5.1 is complete), so this module is the single
-// source of truth and none of the items below are dead code.
+// Вызывающие в scheduler.rs / process.rs / allocator.rs / heap.rs используют эти
+// константы, поэтому модуль — единственный источник правды и ни один элемент
+// ниже не является мёртвым кодом.
 
-/// Architectural page size (4 KiB).
+/// Архитектурный размер страницы (4 КиБ).
 pub const PAGE_SIZE: u64 = 4096;
 
-// ─── Kernel per-PID stack region ─────────────────────────────────────────────
+// ─── регион стеков ядра на PID ──────────────────────────────────────────────
 
-/// Base of the per-PID kernel-stack region.
+/// База региона стеков ядра на PID.
 ///
-/// Each PID is assigned a fixed slot starting at this base. Within a slot the
-/// lowest page is a guard page (left unmapped to catch stack overflow) followed
-/// by `KERNEL_STACK_PAGES` mapped stack pages.
+/// Каждому PID назначается фиксированный слот от этой базы. Внутри слота
+/// младшая страница — guard-страница (оставлена неотображённой, чтобы ловить
+/// переполнение стека), за ней `KERNEL_STACK_PAGES` отображённых страниц стека.
 ///
-/// Source: `task::scheduler::kernel_thread_spawn`.
+/// Источник: `task::scheduler::kernel_thread_spawn`.
 pub const KERNEL_STACK_REGION_BASE: u64 = 0xFFFF_FE00_0000_0000;
 
-/// Number of mapped stack pages per kernel stack.
+/// Число отображённых страниц стека на один стек ядра.
 ///
-/// Canonical value is 64 (256 KiB). It was originally 32 (the larger, safer of
-/// the two values that previously existed: `scheduler.rs` used 32, `process.rs`
-/// used 8). Bumped 32 → 64 as defense-in-depth for the deep `apt` streaming
-/// decompress → parse → log call chain (`deb::decompress_stream` →
-/// `stream_inflate`/`stream_xz`/`stream_zstd` → `StanzaParser`/builder →
-/// `info!` formatting), which nests many frames in a single activation. The
-/// guard page and `KERNEL_STACK_STRIDE` math derive from this constant, so no
-/// other change is needed. `process.rs` adopts this canonical constant in task 5.2.
+/// Каноническое значение — 64 (256 КиБ), увеличенное с 32 как запас прочности
+/// для глубокой цепочки apt «потоковая распаковка → разбор → лог»
+/// (`deb::decompress_stream` → `stream_inflate`/`stream_xz`/`stream_zstd` →
+/// `StanzaParser`/builder → форматирование `info!`), которая вкладывает много
+/// кадров в одной активации. Guard-страница и арифметика
+/// `KERNEL_STACK_STRIDE` выводятся из этой константы, других правок не нужно.
 pub const KERNEL_STACK_PAGES: u64 = 64;
 
-/// Number of guard pages preceding each kernel stack (unmapped overflow guard).
+/// Число guard-страниц перед каждым стеком ядра (неотображённая защита от переполнения).
 pub const KERNEL_STACK_GUARD_PAGES: u64 = 1;
 
-/// Bytes reserved per PID in the kernel-stack region (guard pages + stack pages).
+/// Байт на PID в регионе стеков ядра (guard-страницы + страницы стека).
 pub const KERNEL_STACK_STRIDE: u64 = (KERNEL_STACK_PAGES + KERNEL_STACK_GUARD_PAGES) * PAGE_SIZE;
 
-/// Compute the kernel-stack addresses for a given PID.
+/// Вычислить адреса стека ядра для заданного PID.
 ///
-/// Returns `(guard_base, stack_base, stack_top)` where:
-/// - `guard_base` is the start of the PID's slot (the guard page lives here),
-/// - `stack_base` is the lowest mapped stack address (guard_base + guard pages),
-/// - `stack_top`  is the exclusive top of the stack (initial RSP grows down from here).
+/// Возвращает `(guard_base, stack_base, stack_top)`:
+/// - `guard_base` — начало слота PID (здесь живёт guard-страница),
+/// - `stack_base` — младший отображённый адрес стека (guard_base + guard-страницы),
+/// - `stack_top`  — исключающая вершина стека (начальный RSP растёт вниз отсюда).
 ///
-/// This mirrors the layout `kernel_thread_spawn` builds today:
+/// Это зеркалит раскладку, которую строит `kernel_thread_spawn`:
 /// `guard_base = REGION_BASE + pid * STRIDE`, `stack_base = guard_base + PAGE_SIZE`,
 /// `stack_top = stack_base + KERNEL_STACK_PAGES * PAGE_SIZE`.
 pub fn kernel_stack_for_pid(
@@ -65,106 +62,99 @@ pub fn kernel_stack_for_pid(
     (guard_base, stack_base, stack_top)
 }
 
-// ─── User stack ──────────────────────────────────────────────────────────────
+// ─── пользовательский стек ───────────────────────────────────────────────────
 
-/// Exclusive top of the user-mode stack region.
+/// Исключающая вершина региона пользовательского стека.
 ///
-/// Source: `task::process` (`USER_STACK_TOP`).
+/// Источник: `task::process` (`USER_STACK_TOP`).
 pub const USER_STACK_TOP: u64 = 0x7000_8000_0000;
 
-/// Number of pages mapped for the user-mode stack.
+/// Число страниц, отображаемых под пользовательский стек.
 ///
-/// 8 pages (32 KiB) starved real Linux binaries — CPython blew
-/// through it during interpreter startup and page-faulted on a push just below
-/// RSP (`W=true U=true P=false` at `rsp-8`). Linux's default `RLIMIT_STACK` is
-/// 8 MiB, so map 2048 pages eagerly; the region still sits far above the
-/// `mmap` bump area (`USER_MMAP_BASE`) and the program break, so nothing can
-/// collide with it.
+/// 8 страниц (32 КиБ) морили настоящие Linux-бины: CPython исчерпывал их при
+/// старте интерпретатора и падал page fault'ом на push чуть ниже RSP
+/// (`W=true U=true P=false` по `rsp-8`). Дефолтный `RLIMIT_STACK` в Linux — 8
+/// МиБ, поэтому отображаем 2048 страниц заранее; регион по-прежнему далеко выше
+/// области `mmap` (`USER_MMAP_BASE`) и program break, так что столкнуться не с
+/// чем.
 ///
-/// Source: `task::process` (`USER_STACK_PAGES`).
+/// Источник: `task::process` (`USER_STACK_PAGES`).
 pub const USER_STACK_PAGES: u64 = 2048;
 
-/// Base virtual address from which anonymous `mmap` regions are bump-allocated
-/// for a `Compat_Process` (the lower-half `mmap` hint base seeded into its
+/// База, от которой bump-аллокацией выдаются анонимные `mmap`-регионы
+/// `Compat_Process` (нижнеполовинная mmap-подсказка, засеваемая в его
 /// `VmRegionSet`).
 ///
-/// Chosen at 32 TiB: comfortably above where any static binary's program break
-/// (`brk`) could plausibly grow (static `ET_EXEC` images load near `0x40_0000`
-/// and static-PIE near `PIE_BASE = 0x1_0000`) and well below both the user stack
-/// (`USER_STACK_TOP = 0x7000_8000_0000`) and the lower-half ceiling
-/// `User_Addr_Max = 0x0000_8000_0000_0000`, so anonymous mappings never collide
-/// with the heap or the stack.
+/// Выбрана на 32 ТиБ: уверенно выше того, куда может вырасти program break
+/// (`brk`) любого статического бина (статические `ET_EXEC` грузятся около
+/// `0x40_0000`, static-PIE — около `PIE_BASE = 0x1_0000`), и заметно ниже и
+/// пользовательского стека (`USER_STACK_TOP = 0x7000_8000_0000`), и потолка
+/// нижней половины `User_Addr_Max = 0x0000_8000_0000_0000`, поэтому анонимные
+/// отображения не сталкиваются ни с кучей, ни со стеком.
 pub const USER_MMAP_BASE: u64 = 0x2000_0000_0000;
 
-// ─── Kernel heap ─────────────────────────────────────────────────────────────
+// ─── куча ядра ───────────────────────────────────────────────────────────────
 
-/// Initial kernel heap size, in pages (65536 × 4 KiB = 256 MiB).
+/// Начальный размер кучи ядра в страницах (131072 × 4 КиБ = 512 МиБ).
 ///
-/// History: 64 pages (256 KiB) → 4096 (16 MiB, for the `paint` full-screen
-/// backing buffers) → 65536 (256 MiB). The big jump is for the `apt` package
-/// manager: the in-RAM Debian `Packages` index is large — the compressed
-/// download is ~10 MiB and a moderate decompressed index plus its parsed
-/// records run to tens of MiB, all held on this single fixed heap at once.
-/// With only 16 MiB the download/decompress overran the heap and the
-/// `linked_list_allocator` (which never grows) returned null → the `alloc`
-/// error handler aborted under `panic = "abort"`, which looked like a hang.
+/// Куча НЕ растёт по требованию (см. `memory::heap`), поэтому это жёсткий
+/// потолок. Объём нужен менеджеру пакетов `apt`: распакованный индекс Debian
+/// `Packages` большой — сжатая загрузка ~10 МиБ, а распакованный индекс с
+/// разобранными записями занимает десятки МиБ, и всё это одновременно лежит на
+/// одной фиксированной куче. galloc должен вмещать весь разобранный индекс
+/// (~60k стадий) плюс обычную жизнь ядра; 256 МиБ оказалось тесно, и
+/// `apt update` умирал посреди разбора с IndexTooLarge. Требуется VM с ≥ 1 ГиБ
+/// RAM (run.sh -m).
 ///
-/// The heap does NOT grow on demand (see `memory::heap`), so this is the hard
-/// ceiling. QEMU is launched with 512 MiB, leaving ~256 MiB for the kernel
-/// image, HHDM page tables, framebuffer, and PMM bookkeeping — comfortable.
-/// The full Debian `main` index (~150 MiB decompressed) is intentionally larger
-/// than the index decompression cap (`pkg::deb::MAX_INDEX_DECOMPRESSED`), so
-/// `apt update` against it fails with a clear error rather than exhausting the
-/// heap; use a smaller component / local mirror (or raise both limits + QEMU
-/// `-m`) for a full index.
-// 512 MiB (was 256 MiB). The fixed galloc arena must hold the
-// whole parsed apt package index (~60k stanzas) plus normal kernel churn;
-// 256 MiB proved too tight and `apt update` died mid-parse with
-// IndexTooLarge. Requires the VM to run with >= 1 GiB of RAM (run.sh -m).
+/// Полный индекс Debian `main` (~150 МиБ распакованными) намеренно больше
+/// предела распаковки (`pkg::deb::MAX_INDEX_DECOMPRESSED`), поэтому
+/// `apt update` по нему падает с внятной ошибкой, а не исчерпывает кучу;
+/// для полного индекса нужен меньший компонент / локальное зеркало (или поднять
+/// оба предела и `-m` QEMU).
 pub const HEAP_INITIAL_PAGES: u64 = 131072;
 
 extern "C" {
-    /// Start of the kernel image — provided by the linker script
-    /// (`__kernel_start = 0xffffffff80000000`). This is the VIRTUAL
-    /// higher-half base of the kernel image.
+    /// Начало образа ядра — задаётся линкер-скриптом
+    /// (`__kernel_start = 0xffffffff80000000`). Это ВИРТУАЛЬНАЯ
+    /// база образа ядра в верхней половине.
     static __kernel_start: u8;
-    /// End of kernel image (BSS) — provided by the linker script
-    /// (page-aligned). The heap begins at the next page boundary above this
-    /// symbol.
+    /// Конец образа ядра (BSS) — задаётся линкер-скриптом (выровнен по
+    /// странице). Куча начинается со следующей границы страницы выше этого
+    /// символа.
     static __kernel_end: u8;
 }
 
-/// Virtual base address of the kernel image (`__kernel_start` linker symbol).
+/// Виртуальный базовый адрес образа ядра (линкер-символ `__kernel_start`).
 pub fn kernel_start() -> u64 {
     &raw const __kernel_start as u64
 }
 
-/// Virtual end address of the kernel image (`__kernel_end` linker symbol,
-/// page-aligned by the linker script).
+/// Виртуальный конечный адрес образа ядра (линкер-символ `__kernel_end`,
+/// выровненный по странице линкер-скриптом).
 pub fn kernel_end() -> u64 {
     &raw const __kernel_end as u64
 }
 
-/// Size of the kernel image in bytes, computed from the linker symbols
-/// (`__kernel_end - __kernel_start`). Both symbols are virtual higher-half
-/// addresses laid out contiguously, so their difference is the image extent.
+/// Размер образа ядра в байтах из линкер-символов
+/// (`__kernel_end - __kernel_start`). Оба символа — виртуальные адреса верхней
+/// половины, уложенные подряд, поэтому их разность — размер образа.
 pub fn kernel_size() -> u64 {
     kernel_end() - kernel_start()
 }
 
-/// Canonical kernel heap base: the address of the linker symbol `__kernel_end`
-/// rounded up to the next page boundary.
+/// Каноническая база кучи ядра: адрес линкер-символа `__kernel_end`,
+/// округлённый вверх до следующей границы страницы.
 ///
-/// The heap base is dynamic (it depends on the linked image size), so it is
-/// exposed as a function rather than a `const`.
+/// База динамическая (зависит от размера слинкованного образа), поэтому
+/// экспонируется функцией, а не `const`.
 pub fn heap_base() -> u64 {
     (kernel_end() + (PAGE_SIZE - 1)) & !(PAGE_SIZE - 1)
 }
 
-// ─── MMIO window ─────────────────────────────────────────────────────────────
+// ─── окно MMIO ───────────────────────────────────────────────────────────────
 
-// The MMIO window is, under the current scheme, the HHDM (higher-half direct
-// map) region: device MMIO (LAPIC/IOAPIC/framebuffer) is reached at
-// `HHDM_OFFSET + phys`. There is therefore no separate fixed MMIO base; the
-// `virt = hhdm + phys` convention is centralized in `memory::vmm`
+// Окно MMIO по текущей схеме — это регион HHDM (higher-half direct map):
+// MMIO устройств (LAPIC/IOAPIC/framebuffer) доступно по `HHDM_OFFSET + phys`.
+// Отдельной фиксированной базы MMIO поэтому нет; соглашение
+// `virt = hhdm + phys` централизовано в `memory::vmm`
 // (`phys_to_virt` / `map_mmio`).

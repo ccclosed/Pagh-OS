@@ -1,102 +1,104 @@
-//! System V x86_64 initial process stack / auxiliary-vector encoder (pure).
+//! Чистый кодировщик начального стека процесса System V x86_64 и auxv.
 //!
-//! This module is the **pure layout half** of the `Stack_Initializer` component
-//! (design §5). It computes the exact byte image of a Linux-conformant initial
-//! user stack — `argc`, the `argv`/`envp` pointer arrays, the ELF auxiliary
-//! vector, the 16 `AT_RANDOM` bytes, and the NUL-terminated argument/environment
-//! strings — together with the entry `rsp`. It performs **no mapping**; the
-//! effectful page mapper is task 13.2 (`run_linux_binary` glue).
+//! **Чистая половина** компонента `Stack_Initializer` (design §5): вычисляет
+//! точный байтовый образ начального пользовательского стека, совместимого с
+//! Linux — `argc`, массивы указателей `argv`/`envp`, ELF auxiliary vector,
+//! 16 байт `AT_RANDOM` и NUL-терминированные строки аргументов/окружения, —
+//! вместе с входным `rsp`. Отображения страниц здесь **нет**; эффектное
+//! отображение — в `task::stack_map` (обвязка `run_linux_binary`).
 //!
-//! It is `core` + `alloc` only (uses [`alloc::vec::Vec`]) so it is exercised by
-//! the host `proptest` harness (R11.6). The kernel provides a global allocator,
-//! and the host-test crate links `std` (which provides `alloc`), so the same
-//! source compiles in both places.
+//! Только `core` + `alloc` (использует [`alloc::vec::Vec`]), поэтому
+//! проверяется host-харнессом `proptest` (R11.6). Ядро даёт глобальный
+//! аллокатор, host-test крейт линкует `std` (дающий `alloc`), так что один и
+//! тот же исходник компилируется в обоих местах.
 //!
-//! Requirements covered: R6.1–R6.8 (stack/auxv layout) and R7.5 (argument gate).
+//! Покрытые требования: R6.1–R6.8 (раскладка стека/auxv) и R7.5 (гейт аргументов).
 #![allow(dead_code)]
 
 use alloc::vec::Vec;
 
-/// ELF auxiliary-vector type tags used by the encoder.
+/// Теги типов ELF auxiliary vector, используемые кодировщиком.
 ///
-/// Values match the Linux x86_64 ABI exactly (design Data Models → `at`).
+/// Значения точно соответствуют ABI Linux x86_64 (design Data Models → `at`).
 pub mod at {
-    /// End-of-vector marker.
+    /// Маркер конца вектора.
     pub const NULL: u64 = 0;
-    /// Address of the program headers in the loaded image.
+    /// Адрес program headers в загруженном образе.
     pub const PHDR: u64 = 3;
-    /// Size in bytes of one program-header entry.
+    /// Размер одной записи program header в байтах.
     pub const PHENT: u64 = 4;
-    /// Number of program-header entries.
+    /// Число записей program header.
     pub const PHNUM: u64 = 5;
-    /// System page size.
+    /// Размер системной страницы.
     pub const PAGESZ: u64 = 6;
-    /// Base address of the interpreter (unused here, defined for completeness).
+    /// Базовый адрес интерпретатора (здесь не используется, определён для полноты).
     pub const BASE: u64 = 7;
-    /// Program entry-point address.
+    /// Адрес точки входа программы.
     pub const ENTRY: u64 = 9;
-    /// Address of 16 bytes of random data.
+    /// Адрес 16 байт случайных данных.
     pub const RANDOM: u64 = 25;
 }
 
-/// Inputs to the auxiliary vector supplied by the ELF loader.
+/// Входы auxiliary vector, передаваемые ELF-загрузчиком.
 ///
-/// `random_ptr` is an output, not an input: the encoder *computes* the in-stack
-/// address of the 16 random bytes itself (it owns their placement) and ignores
-/// whatever value is passed in this field. It is kept in the struct so callers
-/// can read the chosen address back if they construct the struct as scratch, but
-/// [`build_initial_stack`] never reads it.
+/// `random_ptr` — выход, а не вход: кодировщик сам *вычисляет* адрес 16
+/// случайных байт в стеке (он владеет их размещением) и игнорирует переданное
+/// значение. Поле оставлено, чтобы вызывающий мог прочитать выбранный адрес,
+/// если строит структуру как заготовку, но [`build_initial_stack`] его никогда
+/// не читает.
 pub struct AuxInputs {
-    /// `AT_PHDR`: address of the program headers in the user image.
+    /// `AT_PHDR`: адрес program headers в пользовательском образе.
     pub phdr: u64,
-    /// `AT_PHENT`: size of one program-header entry.
+    /// `AT_PHENT`: размер одной записи program header.
     pub phent: u64,
-    /// `AT_PHNUM`: number of program-header entries.
+    /// `AT_PHNUM`: число записей program header.
     pub phnum: u64,
-    /// `AT_ENTRY`: program entry-point address.
+    /// `AT_ENTRY`: адрес точки входа программы.
     pub entry: u64,
-    /// `AT_PAGESZ`: system page size.
+    /// `AT_PAGESZ`: размер системной страницы.
     pub pagesz: u64,
-    /// `AT_BASE`: load address of the ELF interpreter, zero for static images.
+    /// `AT_BASE`: адрес загрузки ELF-интерпретатора, ноль для статических образов.
     pub base: u64,
-    /// `AT_RANDOM`: ignored on input; the encoder fills the random block itself.
+    /// `AT_RANDOM`: игнорируется на входе; кодировщик сам заполняет случайный блок.
     pub random_ptr: u64,
 }
 
-/// The encoded initial stack: the bytes to copy plus the key user addresses.
+/// Закодированный начальный стек: байты для копирования и ключевые
+/// пользовательские адреса.
 ///
-/// `bytes` is the contiguous image occupying `[initial_rsp, stack_top)`; index 0
-/// of `bytes` corresponds to user address `argc_addr` (== `initial_rsp`). A caller
-/// (or property test) can locate any in-stack address `a` at `bytes[a - argc_addr]`.
+/// `bytes` — непрерывный образ, занимающий `[initial_rsp, stack_top)`; индекс 0
+/// в `bytes` соответствует пользовательскому адресу `argc_addr` (==
+/// `initial_rsp`). Вызывающий (или property-тест) находит любой адрес в стеке `a`
+/// по `bytes[a - argc_addr]`.
 pub struct StackImage {
-    /// The raw stack image, lowest address first. `bytes[0]` lives at `argc_addr`.
+    /// Сырой образ стека, от младшего адреса. `bytes[0]` живёт по `argc_addr`.
     pub bytes: Vec<u8>,
-    /// User virtual address of the `argc` word (16-byte aligned, R6.5).
+    /// Пользовательский виртуальный адрес слова `argc` (выровнен на 16, R6.5).
     pub argc_addr: u64,
-    /// Initial `rsp` for the process — equal to `argc_addr`.
+    /// Начальный `rsp` процесса — равен `argc_addr`.
     pub initial_rsp: u64,
 }
 
-/// Failure mode of [`build_initial_stack`].
+/// Режим отказа [`build_initial_stack`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StackError {
-    /// The encoded image does not fit within `[stack_low, stack_top)` (R6.8).
+    /// Закодированный образ не помещается в `[stack_low, stack_top)` (R6.8).
     TooLarge,
 }
 
-/// Number of bytes of random data referenced by `AT_RANDOM` (R6.6).
+/// Число байт случайных данных, на которые указывает `AT_RANDOM` (R6.6).
 const RANDOM_LEN: u64 = 16;
 
-/// Round `x` down to the nearest multiple of 16.
+/// Округлить `x` вниз до ближайшего кратного 16.
 #[inline]
 fn align_down_16(x: u64) -> u64 {
     x & !15
 }
 
-/// Build the System V x86_64 initial process stack image (pure; R6.1–R6.8).
+/// Построить образ начального стека процесса System V x86_64 (чисто; R6.1–R6.8).
 ///
-/// Layout, from the lowest address (`argc_addr`, where `rsp` points at entry)
-/// upward toward `stack_top`:
+/// Раскладка от младшего адреса (`argc_addr`, куда указывает `rsp` на входе)
+/// вверх к `stack_top`:
 ///
 /// ```text
 /// argc_addr -> [ argc (== argv.len()) ]
@@ -104,14 +106,14 @@ fn align_down_16(x: u64) -> u64 {
 ///              [ envp[0] .. envp[M-1] ][ NULL ]
 ///              [ (AT_PHDR,..)(AT_PHENT,..)(AT_PHNUM,..)
 ///                (AT_ENTRY,..)(AT_PAGESZ,..)(AT_RANDOM,&rand)(AT_NULL,0) ]
-///              [ ... zero padding ... ]
-///              [ 16 random bytes ]   <- AT_RANDOM points here
-///              [ argv/envp strings, each NUL-terminated ]   (ends at stack_top)
+///              [ ... нулевой паддинг ... ]
+///              [ 16 случайных байт ]   <- сюда указывает AT_RANDOM
+///              [ строки argv/envp, каждая с NUL ]   (кончается на stack_top)
 /// ```
 ///
-/// Every `argv`/`envp` pointer references the first byte of its NUL-terminated
-/// copy stored inside this image (R6.7), and `&argc` is 16-byte aligned (R6.5).
-/// Returns [`StackError::TooLarge`] if the image cannot fit in
+/// Каждый указатель `argv`/`envp` ссылается на первый байт своей
+/// NUL-терминированной копии в этом образе (R6.7), а `&argc` выровнен на 16
+/// (R6.5). Возвращает [`StackError::TooLarge`], если образ не помещается в
 /// `[stack_low, stack_top)` (R6.8).
 pub fn build_initial_stack(
     stack_top: u64,
@@ -121,23 +123,23 @@ pub fn build_initial_stack(
     aux: &AuxInputs,
     random16: [u8; 16],
 ) -> Result<StackImage, StackError> {
-    // ── Fixed pointer/auxv table size (in bytes), all 8-byte words ───────────
-    //   argc (1) + argv ptrs (N) + NULL (1) + envp ptrs (M) + NULL (1)
-    //   + auxv: 6 real entries + 1 AT_NULL = 7 pairs = 14 words.
+    // ── Фиксированный размер таблицы указателей/auxv (в байтах), всё 8-байтные
+    // слова: argc (1) + указатели argv (N) + NULL (1) + указатели envp (M) + NULL
+    // (1) + auxv: 6 реальных записей + 1 AT_NULL = 7 пар = 14 слов.
     let n = argv.len() as u64;
     let m = envp.len() as u64;
     let table_words = 1u64
         .checked_add(n)
-        .and_then(|w| w.checked_add(1)) // argv NULL
+        .and_then(|w| w.checked_add(1)) // NULL argv
         .and_then(|w| w.checked_add(m))
-        .and_then(|w| w.checked_add(1)) // envp NULL
-        .and_then(|w| w.checked_add(16)) // 8 auxv pairs
+        .and_then(|w| w.checked_add(1)) // NULL envp
+        .and_then(|w| w.checked_add(16)) // 8 пар auxv
         .ok_or(StackError::TooLarge)?;
     let table_size = table_words.checked_mul(8).ok_or(StackError::TooLarge)?;
 
-    // ── String blob: argv strings then envp strings, each NUL-terminated ─────
-    // Record each string's offset within the blob so we can compute its final
-    // absolute user address once `argc_addr` is fixed.
+    // ── Блоб строк: сначала строки argv, затем envp, каждая с NUL ────────
+    // Запоминаем смещение каждой строки в блобе, чтобы вычислить её итоговый
+    // абсолютный пользовательский адрес, когда `argc_addr` зафиксирован.
     let mut str_blob: Vec<u8> = Vec::new();
     let mut argv_str_off: Vec<u64> = Vec::with_capacity(argv.len());
     let mut envp_str_off: Vec<u64> = Vec::with_capacity(envp.len());
@@ -153,10 +155,10 @@ pub fn build_initial_stack(
     }
     let str_total = str_blob.len() as u64;
 
-    // ── Address computation (high → low) ─────────────────────────────────────
-    // Strings sit flush against stack_top; the 16 random bytes sit just below
-    // them; the fixed table sits below that with argc 16-byte aligned. Any slack
-    // becomes zero padding between the table and the random bytes.
+    // ── Вычисление адресов (сверху вниз) ─────────────────────────────────
+    // Строки прилегают к stack_top; 16 случайных байт — сразу под ними;
+    // фиксированная таблица — ниже, с argc, выровненным на 16. Любой зазор
+    // становится нулевым паддингом между таблицей и случайными байтами.
     let str_start = stack_top
         .checked_sub(str_total)
         .ok_or(StackError::TooLarge)?;
@@ -168,42 +170,42 @@ pub fn build_initial_stack(
         .ok_or(StackError::TooLarge)?;
     let argc_addr = align_down_16(table_floor);
 
-    // Fit check (R6.8): must stay within the mapped stack region.
+    // Проверка вписывания (R6.8): должны остаться внутри отображённого региона стека.
     if argc_addr < stack_low || stack_top < argc_addr {
         return Err(StackError::TooLarge);
     }
 
-    // ── Materialize the contiguous image [argc_addr, stack_top) ──────────────
+    // ── Материализовать непрерывный образ [argc_addr, stack_top) ──────────
     let image_len = (stack_top - argc_addr) as usize;
     let mut bytes = alloc::vec![0u8; image_len];
 
-    // Helper: write a u64 (LE) at the byte offset for absolute address `addr`.
+    // Хелпер: записать u64 (LE) по байтовому смещению абсолютного адреса `addr`.
     let put_u64 = |buf: &mut [u8], addr: u64, val: u64| {
         let off = (addr - argc_addr) as usize;
         buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
     };
 
-    // Walk the table writing words at successive 8-byte slots from argc_addr.
+    // Обойти таблицу, записывая слова в последовательные 8-байтные слоты от argc_addr.
     let mut cur = argc_addr;
     // argc (R6.2)
     put_u64(&mut bytes, cur, n);
     cur += 8;
-    // argv pointers, then a single NULL (R6.1)
+    // Указатели argv, затем один NULL (R6.1)
     for off in &argv_str_off {
         put_u64(&mut bytes, cur, str_start + off);
         cur += 8;
     }
     put_u64(&mut bytes, cur, 0);
     cur += 8;
-    // envp pointers, then a single NULL (R6.1)
+    // Указатели envp, затем один NULL (R6.1)
     for off in &envp_str_off {
         put_u64(&mut bytes, cur, str_start + off);
         cur += 8;
     }
     put_u64(&mut bytes, cur, 0);
     cur += 8;
-    // auxv: each tag once (R6.3), with PHENT/PHNUM/ENTRY from inputs (R6.4),
-    // AT_RANDOM pointing at the in-stack random block (R6.6), AT_NULL last (R6.1).
+    // auxv: каждый тег один раз (R6.3), PHENT/PHNUM/ENTRY из входов (R6.4),
+    // AT_RANDOM указывает на случайный блок в стеке (R6.6), AT_NULL последним (R6.1).
     let auxv: [(u64, u64); 8] = [
         (at::PHDR, aux.phdr),
         (at::PHENT, aux.phent),
@@ -220,13 +222,13 @@ pub fn build_initial_stack(
         put_u64(&mut bytes, cur, val);
         cur += 8;
     }
-    // `cur` now equals argc_addr + table_size; the gap up to rand_start stays zero.
+    // `cur` теперь равен argc_addr + table_size; зазор до rand_start остаётся нулевым.
 
-    // ── Random block (R6.6) ──────────────────────────────────────────────────
+    // ── Случайный блок (R6.6) ────────────────────────────────────────────────
     let rand_off = (rand_start - argc_addr) as usize;
     bytes[rand_off..rand_off + 16].copy_from_slice(&random16);
 
-    // ── String bytes (R6.7) ──────────────────────────────────────────────────
+    // ── Байты строк (R6.7) ──────────────────────────────────────────────────
     let str_off = (str_start - argc_addr) as usize;
     bytes[str_off..str_off + str_total as usize].copy_from_slice(&str_blob);
 
@@ -237,10 +239,10 @@ pub fn build_initial_stack(
     })
 }
 
-/// Run-request argument gate (R7.5).
+/// Гейт аргументов run-запроса (R7.5).
 ///
-/// Returns `true` iff `argv` has at most 256 entries **and** the combined byte
-/// length of all arguments is at most 4096 bytes.
+/// `true` тогда и только тогда, когда в `argv` не больше 256 записей **и**
+/// суммарная длина всех аргументов не больше 4096 байт.
 pub fn arg_gate(argv: &[&[u8]]) -> bool {
     if argv.len() > 256 {
         return false;

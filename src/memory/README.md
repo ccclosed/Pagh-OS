@@ -55,11 +55,11 @@
 - Транслируются и 1 GiB, и 2 MiB huge pages.
 - `map` при ремапе-перезаписи чужого кадра логирует утечку, но не падает; **живой COW-лист
   он не перезаписывает** — возвращает `VmError::CowShared` (иначе можно молча потерять
-  refcount и получить writable-алиас общего кадра, F-r2-arch-1).
+  refcount и получить writable-алиас общего кадра; см. `SECURITY.md`).
 - COW: `COW_BIT = BIT_9` (software-бит PTE). `fork_user_space_cow` двухпроходный:
   проход 1 отбрасывает huge pages до мутаций, проход 2 шарит листы, снимает WRITABLE,
   ставит COW_BIT обеим сторонам, `cow_ref` + полный TLB flush. Промежуточные таблицы НЕ шарятся.
-- **Единый release листа** (`release_user_leaf`, F-r2-arch-1/2): снимает PTE (и TLB) **до**
+- **Единый release листа** (`release_user_leaf`, см. `SECURITY.md`): снимает PTE (и TLB) **до**
   возможного free; для `COW_BIT`-листа делает ровно один `cow_unref` и освобождает кадр только
   при `true`. Через него идут `munmap`, `mprotect(PROT_NONE)`, замена `MAP_FIXED`, `mremap`
   (через `munmap_impl`), `unwind` и `drop_user_space`. `mprotect` не-PROT_NONE листа меняет
@@ -128,5 +128,4 @@
   проверяют это на реальных структурах.
 - `layout.rs` — единственный источник истины: `task::scheduler` и
   `task::process` уже вызывают `kernel_stack_for_pid`/`KERNEL_STACK_PAGES`/
-  `USER_STACK_TOP`/`USER_STACK_PAGES`/`USER_MMAP_BASE`/`heap_base`; пункт про
-  `dead_code` до миграции (task 5.1) устарел и удалён.
+  `USER_STACK_TOP`/`USER_STACK_PAGES`/`USER_MMAP_BASE`/`heap_base`.

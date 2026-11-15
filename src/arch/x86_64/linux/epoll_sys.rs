@@ -1,5 +1,5 @@
-//! Timer/clock, eventfd and epoll syscalls: clock_getres(229), eventfd2(290),
-//! epoll_create1(291), epoll_ctl(233), epoll_wait(232).
+//! Syscall'ы таймеров/часов, eventfd и epoll: clock_getres(229),
+//! eventfd2(290), epoll_create1(291), epoll_ctl(233), epoll_wait(232).
 #![allow(dead_code)]
 use super::check_user_ptr;
 use crate::arch::x86_64::linux::errno::Errno;
@@ -11,27 +11,27 @@ use alloc::vec::Vec;
 
 // ── clock_getres (229) ───────────────────────────────────────────────────────
 
-/// `clock_getres` (229): report the resolution of a clock as a `struct timespec`.
-/// We report 1 ms (= 10 000 000 ns) for all supported clocks, matching the
-/// LAPIC tick granularity. `EINVAL` for unknown ids, consistent with
+/// `clock_getres` (229): сообщить разрешение часов как `struct timespec`.
+/// Для всех поддерживаемых часов сообщаем 1 мс (= 10 000 000 нс), что совпадает
+/// с гранулярностью тика LAPIC. `EINVAL` для неизвестных id, согласованно с
 /// `clock_gettime`.
 pub fn sys_clock_getres(clock_id: u64, ts_ptr: u64) -> Result<u64, Errno> {
-    // Supported ids: CLOCK_REALTIME(0), CLOCK_MONOTONIC(1),
+    // Поддерживаемые id: CLOCK_REALTIME(0), CLOCK_MONOTONIC(1),
     // CLOCK_PROCESS_CPUTIME_ID(2), CLOCK_THREAD_CPUTIME_ID(3),
     // CLOCK_MONOTONIC_RAW(4), CLOCK_REALTIME_COARSE(5), CLOCK_MONOTONIC_COARSE(6),
-    // CLOCK_BOOTTIME(7). libuv probes
-    // CLOCK_MONOTONIC_COARSE(6) at loop init, so both must answer.
+    // CLOCK_BOOTTIME(7). libuv проверяет CLOCK_MONOTONIC_COARSE(6) при
+    // инициализации цикла, поэтому отвечать должны оба.
     if !matches!(clock_id, 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7) {
         return Err(Errno::EINVAL);
     }
     if ts_ptr == 0 {
         return Ok(0);
-    } // null buf is valid: just validate the id
+    } // null-буфер допустим: проверяем только id
     check_user_ptr(ts_ptr, 16)?;
-    // struct timespec { tv_sec: i64, tv_nsec: i64 } — 1 ms resolution
+    // struct timespec { tv_sec: i64, tv_nsec: i64 } — разрешение 1 мс
     let sec: i64 = 0;
-    let nsec: i64 = (1_000_000_000 / crate::arch::x86_64::apic::TICK_HZ) as i64; // one LAPIC tick
-                                                                                 // SAFETY: validated above
+    let nsec: i64 = (1_000_000_000 / crate::arch::x86_64::apic::TICK_HZ) as i64; // один тик LAPIC
+                                                                                 // SAFETY: проверено выше
     unsafe {
         core::ptr::write_unaligned(ts_ptr as *mut i64, sec);
         core::ptr::write_unaligned((ts_ptr + 8) as *mut i64, nsec);
@@ -41,8 +41,8 @@ pub fn sys_clock_getres(clock_id: u64, ts_ptr: u64) -> Result<u64, Errno> {
 
 // ── eventfd2 (290) ───────────────────────────────────────────────────────────
 
-/// `eventfd2` (290): create an event file descriptor with initial value `initval`.
-/// Flags: EFD_CLOEXEC(0x80000), EFD_NONBLOCK(0x800), EFD_SEMAPHORE(0x1).
+/// `eventfd2` (290): создать event-дескриптор с начальным значением `initval`.
+/// Флаги: EFD_CLOEXEC(0x80000), EFD_NONBLOCK(0x800), EFD_SEMAPHORE(0x1).
 pub fn sys_eventfd2(initval: u64, flags: u64) -> Result<u64, Errno> {
     let semaphore = flags & 1 != 0;
     let state = Arc::new(Spinlock::new(initval));
@@ -65,8 +65,8 @@ pub fn sys_eventfd2(initval: u64, flags: u64) -> Result<u64, Errno> {
 
 // ── epoll_create1 (291) ──────────────────────────────────────────────────────
 
-/// `epoll_create1` (291): create an epoll instance. `flags` may be
-/// EPOLL_CLOEXEC (0x80000); others are ignored.
+/// `epoll_create1` (291): создать экземпляр epoll. `flags` может быть
+/// EPOLL_CLOEXEC (0x80000); остальные игнорируются.
 pub fn sys_epoll_create1(flags: u64) -> Result<u64, Errno> {
     let interests: Arc<Spinlock<Vec<EpollEntry>>> = Arc::new(Spinlock::new(Vec::new()));
     let fd = compat::with_current_compat(|cs| {
@@ -88,7 +88,7 @@ const EPOLL_CTL_ADD: u64 = 1;
 const EPOLL_CTL_DEL: u64 = 2;
 const EPOLL_CTL_MOD: u64 = 3;
 
-/// One registered interest in an epoll instance.
+/// Один зарегистрированный интерес в экземпляре epoll.
 #[derive(Clone)]
 pub struct EpollEntry {
     pub fd: i32,
@@ -96,11 +96,11 @@ pub struct EpollEntry {
     pub data: u64,
 }
 
-/// `epoll_ctl` (233): add / modify / remove an interest in an epoll instance.
-/// `event_ptr` layout: { events: u32, _pad: u32, data: u64 } (epoll_event).
+/// `epoll_ctl` (233): добавить / изменить / удалить интерес в экземпляре epoll.
+/// Раскладка `event_ptr`: { events: u32, _pad: u32, data: u64 } (epoll_event).
 pub fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> Result<u64, Errno> {
-    // Clone the interest list Arc out of the fd table without holding the
-    // compat lock across the actual mutation.
+    // Клонировать Arc списка интересов из fd-таблицы, не держа compat-лок через
+    // саму мутацию.
     let interests = compat::with_current_compat(|cs| match cs.fds.get(epfd as u32) {
         Some(OpenObject::Epoll { interests }) => Some(Arc::clone(interests)),
         _ => None,
@@ -111,12 +111,12 @@ pub fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> Result<u64,
     match op {
         EPOLL_CTL_ADD => {
             check_user_ptr(event_ptr, 12)?;
-            // SAFETY: validated above; epoll_event is { u32 events, u8[8] data }
+            // SAFETY: проверено выше; epoll_event — это { u32 events, u8[8] data }
             let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
             let data = unsafe { core::ptr::read_unaligned((event_ptr + 4) as *const u64) };
             let mut list = interests.lock();
             if list.iter().any(|e| e.fd == fd as i32) {
-                // Linux semantics: ADD on an already-registered fd is EEXIST.
+                // Семантика Linux: ADD на уже зарегистрированный fd — EEXIST.
                 return Err(Errno::EEXIST);
             }
             list.push(EpollEntry {
@@ -127,7 +127,7 @@ pub fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> Result<u64,
         }
         EPOLL_CTL_MOD => {
             check_user_ptr(event_ptr, 12)?;
-            // SAFETY: validated above; epoll_event is { u32 events, u8[8] data }
+            // SAFETY: проверено выше; epoll_event — это { u32 events, u8[8] data }
             let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
             let data = unsafe { core::ptr::read_unaligned((event_ptr + 4) as *const u64) };
             let mut list = interests.lock();
@@ -136,7 +136,7 @@ pub fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> Result<u64,
                     e.events = events;
                     e.data = data;
                 }
-                // Linux semantics: MOD on an unregistered fd is ENOENT.
+                // Семантика Linux: MOD незарегистрированного fd — ENOENT.
                 None => return Err(Errno::ENOENT),
             }
         }
@@ -144,8 +144,8 @@ pub fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> Result<u64,
             let mut list = interests.lock();
             let present = list.iter().any(|e| e.fd == fd as i32);
             if !present {
-                // Linux semantics: DEL of an unregistered fd is ENOENT (and
-                // does not require a valid event_ptr — none is read here).
+                // Семантика Linux: DEL незарегистрированного fd — ENOENT (и не
+                // требует валидного event_ptr — здесь он не читается).
                 return Err(Errno::ENOENT);
             }
             list.retain(|e| e.fd != fd as i32);
@@ -163,9 +163,9 @@ const EPOLLERR: u32 = 0x0008;
 const EPOLLHUP: u32 = 0x0010;
 const EPOLLRDHUP: u64 = 0x2000;
 
-/// `epoll_wait` (232): wait for events on an epoll instance.
-/// `events_ptr` must point to `maxevents` * 12 bytes (struct epoll_event[]).
-/// `timeout_ms`: -1 = infinite, 0 = return immediately.
+/// `epoll_wait` (232): ждать событий на экземпляре epoll.
+/// `events_ptr` должен указывать на `maxevents` * 12 байт (struct epoll_event[]).
+/// `timeout_ms`: -1 = бесконечно, 0 = вернуться сразу.
 pub fn sys_epoll_wait(
     epfd: u64,
     events_ptr: u64,
@@ -194,18 +194,18 @@ pub fn sys_epoll_wait(
     };
 
     loop {
-        // Liveness check after every yield: the event records are built in
-        // kernel memory, so a sibling that unmapped the user array must turn
-        // into -EFAULT on the next iteration instead of an endless wait
-        // (F-x86a-4).
+        // Проверка живости после каждой уступки CPU: записи событий строятся в
+        // памяти ядра, поэтому сосед, снявший пользовательский массив, обязан
+        // превратиться в -EFAULT на следующей итерации, а не в бесконечное
+        // ожидание.
         check_user_ptr(events_ptr, maxevents * event_sz)?;
         let snapshot: Vec<EpollEntry> = interests.lock().clone();
-        // Collect the ready events in KERNEL memory, not straight into the user
-        // array: the array was validated once at entry, but this loop yields
-        // between iterations and a sibling CLONE_VM thread can munmap it in that
-        // window (F-x86a-4 — same class as poll/select). A stale ring-0 write
-        // takes a kernel-mode #PF, which halted the machine; the re-validated
-        // publish below reports -EFAULT instead.
+        // Собирать готовые события в памяти ЯДРА, а не прямо в массив
+        // пользователя: массив проверялся один раз на входе, а цикл уступает CPU
+        // между итерациями, и поток-сосед по CLONE_VM может снять его отображение
+        // в этом окне (тот же класс, что poll/select). Устаревшая запись из ring 0
+        // даёт #PF режима ядра с остановкой машины; перепроверенная публикация
+        // ниже сообщает -EFAULT.
         let mut out: Vec<u8> = Vec::with_capacity(maxevents as usize * event_sz as usize);
         for entry in &snapshot {
             if (out.len() as u64) / event_sz >= maxevents {
@@ -213,7 +213,7 @@ pub fn sys_epoll_wait(
             }
             let revents = poll_fd(entry.fd, entry.events);
             if revents != 0 {
-                // `struct epoll_event` is packed on x86_64: { u32 events, u64 data }.
+                // `struct epoll_event` упакован на x86_64: { u32 events, u64 data }.
                 out.extend_from_slice(&revents.to_ne_bytes());
                 out.extend_from_slice(&entry.data.to_ne_bytes());
             }
@@ -223,13 +223,13 @@ pub fn sys_epoll_wait(
             .unwrap_or(false);
         if !out.is_empty() || timed_out || timeout_i == 0 {
             if !out.is_empty() {
-                // Re-validate the destination after the wait before writing.
+                // Перепроверить приёмник после ожидания перед записью.
                 super::io_sys::copy_out_checked(events_ptr, &out)?;
             }
             return Ok((out.len() as u64) / event_sz);
         }
-        // Deliverable signal → -EINTR (libuv's `errno == EINTR` assertion
-        // already expects this shape); the dispatch epilogue delivers.
+        // Доставимый сигнал → -EINTR (проверка `errno == EINTR` в libuv уже
+        // ждёт эту форму); эпилог диспетчеризации доставит сигнал.
         if super::signal::has_deliverable_current() {
             return Err(Errno::EINTR);
         }
@@ -237,11 +237,10 @@ pub fn sys_epoll_wait(
     }
 }
 
-/// `epoll_pwait` (281): `epoll_wait` plus a sigmask. The atomic
-/// swap-to-sigmask-then-restore semantics are not implemented (the mask is
-/// accepted and ignored); the wait itself IS signal-interruptible — a
-/// deliverable signal returns `-EINTR`, which libuv's uv__io_poll already
-/// tolerates (its `errno == EINTR` assertion motivated this syscall).
+/// `epoll_pwait` (281): `epoll_wait` плюс sigmask. Атомарная семантика
+/// «подменить маску, потом восстановить» не реализована (маска принимается и
+/// игнорируется); само ожидание прерывается сигналом — доставимый сигнал даёт
+/// `-EINTR`, что uv__io_poll из libuv уже терпит.
 pub fn sys_epoll_pwait(
     epfd: u64,
     events_ptr: u64,
@@ -252,7 +251,7 @@ pub fn sys_epoll_pwait(
     sys_epoll_wait(epfd, events_ptr, maxevents, timeout_ms)
 }
 
-/// Compute revents for a single fd given requested events.
+/// Вычислить revents для одного fd при запрошенных событиях.
 fn poll_fd(fd: i32, events: u32) -> u32 {
     use crate::task::fd::OpenObject;
     if fd < 0 {
@@ -261,13 +260,13 @@ fn poll_fd(fd: i32, events: u32) -> u32 {
     let result = crate::task::compat::with_current_compat(|cs| {
         match cs.fds.get(fd as u32) {
             None => EPOLLERR,
-            // AF_INET sockets: report both directions; curl re-checks via send/recv.
+            // AF_INET-сокеты: сообщать оба направления; curl перепроверяет через send/recv.
             Some(OpenObject::InetTcp(_)) | Some(OpenObject::InetUdp(_)) => EPOLLIN | EPOLLOUT,
             Some(OpenObject::Stdin) => {
-                // Report readable only when a read can actually
-                // make progress. The old always-ready answer made libuv issue
-                // a read that blocked in-kernel and stalled nvim's TUI loop
-                // before the first frame was drawn.
+                // Сообщать читаемость, только когда чтение реально может
+                // продвинуться. Прежний ответ «всегда готов» заставлял libuv
+                // выдать read, который блокировался в ядре и вешал TUI-цикл
+                // nvim до отрисовки первого кадра.
                 if events & EPOLLIN != 0 && super::io_sys::stdin_input_available() {
                     EPOLLIN
                 } else {
@@ -314,7 +313,7 @@ fn poll_fd(fd: i32, events: u32) -> u32 {
                 }
                 r
             }
-            // A listener is "readable" when a connection is queued.
+            // Слушатель «читаем», когда в очереди есть подключение.
             Some(OpenObject::UnixListener(l)) => {
                 if events & EPOLLIN != 0 && !l.inner.lock().pending.is_empty() {
                     EPOLLIN
@@ -324,12 +323,13 @@ fn poll_fd(fd: i32, events: u32) -> u32 {
             }
             Some(OpenObject::UnixSocketUnbound { .. }) => 0,
             Some(OpenObject::Signalfd { mask }) => {
-                // F-r3-life-2: this arm runs INSIDE `with_current_compat`, so
-                // `COMPAT_STATES` is already held by this context. Calling
-                // `compat::signalfd_readable` here would take the non-reentrant
-                // spinlock a second time and deadlock the CPU with interrupts
-                // disabled (the round-3 audit's 4-syscall machine hang). Compute
-                // readiness from the state the closure already owns.
+                // Эта ветка выполняется ВНУТРИ `with_current_compat`, то есть
+                // `COMPAT_STATES` уже удерживается этим контекстом. Вызов
+                // `compat::signalfd_readable` здесь взял бы нереентерабельный
+                // спинлок второй раз и заблокировал CPU с выключенными
+                // прерываниями (зависание машины на 4 syscall'ах из аудита).
+                // Считаем готовность по состоянию, которым уже владеет
+                // замыкание.
                 let mask = *mask.lock();
                 if cs.sig_pending & mask & !cs.sig_blocked != 0 {
                     EPOLLIN
@@ -362,16 +362,16 @@ fn poll_fd(fd: i32, events: u32) -> u32 {
     result.unwrap_or(0)
 }
 
-/// Dump the CURRENT task's epoll interest list together with each
-/// fd's resolved object type and its readiness AS OF RIGHT NOW. Called by the
-/// stuck-syscall watchdog in the context of the stuck task itself. Answers
-/// the nvim question directly: is the RPC socket in the set at all, what does
-/// its fd resolve to, and does the poll see the queued bytes.
+/// Напечатать список интересов epoll ТЕКУЩЕЙ задачи вместе с разрешённым
+/// типом каждого fd и его готовностью ПРЯМО СЕЙЧАС. Вызывается watchdog'ом
+/// зависших syscall'ов в контексте самой зависшей задачи. Прямо отвечает на
+/// вопрос nvim: есть ли RPC-сокет в наборе, во что разрешается его fd и видит ли
+/// poll поставленные в очередь байты.
 pub(super) fn dump_epoll_self(epfd: u32) {
     use crate::task::fd::OpenObject;
     let pid = crate::task::scheduler::current_pid();
-    // Snapshot fds + types under the compat lock; readiness is computed after
-    // it is released (poll_fd takes the same lock internally).
+    // Снять снимок fd + типов под compat-локом; готовность считается после его
+    // отпускания (poll_fd внутри берёт тот же лок).
     let entries: alloc::vec::Vec<(i32, u32, &'static str)> =
         crate::task::compat::with_current_compat(|cs| {
             let interests = match cs.fds.get(epfd) {

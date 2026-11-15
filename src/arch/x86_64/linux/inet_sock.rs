@@ -1,9 +1,10 @@
-//! AF_INET socket syscalls over the kernel's own TCP/IP stack (`net::` primitives).
+//! Syscall'ы AF_INET-сокетов поверх собственного стека TCP/IP ядра (примитивы
+//! `net::`).
 //!
-//! TCP covers curl/git-remote-https; UDP covers glibc's resolver, which reads
-//! `/mnt/etc/resolv.conf` and speaks DNS over `sendto`/`recvfrom`. Blocking
-//! calls funnel through the scheduler yield so other tasks keep running while
-//! the network poll thread advances the stack.
+//! TCP покрывает curl/git-remote-https; UDP — резолвер glibc, который читает
+//! `/mnt/etc/resolv.conf` и говорит DNS через `sendto`/`recvfrom`. Блокирующие
+//! вызовы уступают CPU планировщику, чтобы другие задачи работали, пока поток
+//! опроса сети двигает стек.
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -26,9 +27,9 @@ const SOL_SOCKET: u64 = 1;
 const SO_ERROR: u64 = 4;
 const SO_TYPE: u64 = 3;
 
-const EINPROGRESS_ERR: u32 = 115; // used through Errno mapping below
+const EINPROGRESS_ERR: u32 = 115; // используется через отображение Errno ниже
 
-/// One AF_INET stream socket. `handle` is `None` until connect(2).
+/// Один AF_INET stream-сокет. `handle` равен `None` до connect(2).
 pub struct InetTcp {
     pub handle: crate::sync::spinlock::Spinlock<Option<net::SocketHandle>>,
     pub nonblocking: AtomicBool,
@@ -37,26 +38,26 @@ pub struct InetTcp {
     pub eof: AtomicBool,
 }
 
-/// One AF_INET datagram socket bound to an ephemeral local port.
+/// Один AF_INET datagram-сокет, привязанный к эфемерному локальному порту.
 pub struct InetUdp {
     pub handle: net::SocketHandle,
     pub nonblocking: AtomicBool,
-    /// Default destination remembered by connect(2): subsequent write(2)/send(2)
-    /// without an address go here (this is exactly how glibc's resolver sends
-    /// its queries over a connected UDP socket).
+    /// Назначение по умолчанию, запомненное connect(2): последующие
+    /// write(2)/send(2) без адреса идут сюда (именно так резолвер glibc шлёт
+    /// запросы через подключённый UDP-сокет).
     pub peer: crate::sync::spinlock::Spinlock<Option<IpEndpoint>>,
 }
 
-/// Parse a `sockaddr_in` OR `sockaddr_in6` into an [`IpEndpoint`].
-/// A v4-mapped IPv6 address (`::ffff:a.b.c.d`) collapses to its IPv4 form,
-/// matching Linux dual-stack socket semantics.
+/// Разобрать `sockaddr_in` ИЛИ `sockaddr_in6` в [`IpEndpoint`].
+/// v4-mapped IPv6-адрес (`::ffff:a.b.c.d`) схлопывается до IPv4-формы, как в
+/// dual-stack сокетах Linux.
 pub(super) fn parse_sockaddr_ep(addr: u64, len: u64) -> Result<IpEndpoint, Errno> {
     use super::check_user_ptr;
     if addr == 0 || len < 8 {
         return Err(Errno::EINVAL);
     }
     check_user_ptr(addr, 8)?;
-    // SAFETY: range validated above
+    // SAFETY: диапазон проверен выше
     let family = unsafe { core::ptr::read_unaligned(addr as *const u16) };
     match family as u64 {
         AF_INET => {
@@ -69,9 +70,9 @@ pub(super) fn parse_sockaddr_ep(addr: u64, len: u64) -> Result<IpEndpoint, Errno
                 return Err(Errno::EINVAL);
             }
             check_user_ptr(addr, 28)?;
-            // SAFETY: range validated above
+            // SAFETY: диапазон проверен выше
             let port = u16::from_be(unsafe { core::ptr::read_unaligned((addr + 2) as *const u16) });
-            // SAFETY: as above
+            // SAFETY: как выше
             let octets: [u8; 16] =
                 unsafe { core::ptr::read_unaligned((addr + 8) as *const [u8; 16]) };
             let v6 = net::Ipv6Addr(octets);
@@ -91,19 +92,19 @@ fn parse_sockaddr_in(addr: u64, len: u64) -> Result<(u16, [u8; 4]), Errno> {
         return Err(Errno::EINVAL);
     }
     check_user_ptr(addr, 8)?;
-    // SAFETY: range validated above
+    // SAFETY: диапазон проверен выше
     let family = unsafe { core::ptr::read_unaligned(addr as *const u16) };
     if family as u64 != AF_INET && family as u64 != AF_INET6 {
         return Err(Errno::EAFNOSUPPORT);
     }
-    // SAFETY: as above
+    // SAFETY: как выше
     let port = u16::from_be(unsafe { core::ptr::read_unaligned((addr + 2) as *const u16) });
-    // SAFETY: as above
+    // SAFETY: как выше
     let octets: [u8; 4] = unsafe { core::ptr::read_unaligned((addr + 4) as *const [u8; 4]) };
     Ok((port, octets))
 }
 
-/// `socket(AF_INET, ...)`: STREAM → lazy TCP slot, DGRAM → bound UDP socket.
+/// `socket(AF_INET, ...)`: STREAM → ленивый TCP-слот, DGRAM → привязанный UDP-сокет.
 pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
     if domain != AF_INET && domain != AF_INET6 {
         return Err(Errno::EAFNOSUPPORT);
@@ -153,7 +154,7 @@ pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
     .unwrap_or(Err(Errno::EBADF))
 }
 
-/// `connect` on an AF_INET TCP fd.
+/// `connect` на AF_INET TCP fd.
 pub fn sys_connect_tcp(fd: u64, addr: u64, len: u64) -> Result<u64, Errno> {
     let remote = parse_sockaddr_ep(addr, len)?;
     let (sock, nonblocking) = compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
@@ -177,20 +178,20 @@ pub fn sys_connect_tcp(fd: u64, addr: u64, len: u64) -> Result<u64, Errno> {
     drop(guard);
 
     if nonblocking {
-        // POSIX non-blocking connect: completion surfaces via SO_ERROR.
+        // POSIX неблокирующий connect: завершение всплывает через SO_ERROR.
         sock.so_error.store(EINPROGRESS_ERR, Ordering::Relaxed);
         return Err(Errno::EINPROGRESS);
     }
 
-    // Blocking: bounded wait, driven by the wall clock rather than a yield
-    // count. `ticks()` is LAPIC ticks at TICK_HZ (1000), so the deadline is
-    // real elapsed time: counting loop iterations measured scheduling pressure,
-    // not seconds, and a busy machine could fail a connect that was still
-    // progressing.
+    // Блокирующий режим: ограниченное ожидание по стенным часам, а не по
+    // числу уступок. `ticks()` — тики LAPIC при TICK_HZ (1000), поэтому дедлайн
+    // — реальное прошедшее время: подсчёт итераций цикла измерял давление
+    // планировщика, а не секунды, и загруженная машина могла провалить connect,
+    // который всё ещё продвигался.
     const CONNECT_TIMEOUT_MS: u64 = 5_000;
-    // How long a refused/unreachable peer may keep the caller waiting before
-    // the connect reports ECONNREFUSED (Linux reports it immediately, but the
-    // RST can arrive after several lost SYNs).
+    // Сколько отказавший/недостижимый партнёр может держать вызывающего до
+    // отчёта ECONNREFUSED (Linux сообщает сразу, но RST может прийти после
+    // нескольких потерянных SYN).
     const CONNECT_REFUSED_MS: u64 = 200;
     let deadline = crate::task::scheduler::ticks() + CONNECT_TIMEOUT_MS;
     let refused_at = crate::task::scheduler::ticks() + CONNECT_REFUSED_MS;
@@ -213,7 +214,7 @@ pub fn sys_connect_tcp(fd: u64, addr: u64, len: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `send`/`sendto`/`write` on an AF_INET TCP fd.
+/// `send`/`sendto`/`write` на AF_INET TCP fd.
 pub fn tcp_write(fd: u64, data: &[u8]) -> Result<usize, Errno> {
     let sock = tcp_sock(fd)?;
     if !sock.connected.load(Ordering::Relaxed) {
@@ -242,7 +243,7 @@ pub fn tcp_write(fd: u64, data: &[u8]) -> Result<usize, Errno> {
     }
 }
 
-/// `recv`/`read` on an AF_INET TCP fd.
+/// `recv`/`read` на AF_INET TCP fd.
 pub fn tcp_read(fd: u64, dst: &mut [u8]) -> Result<usize, Errno> {
     let sock = tcp_sock(fd)?;
     let handle = sock.handle.lock().ok_or(Errno::ENOTCONN)?;
@@ -266,7 +267,7 @@ pub fn tcp_read(fd: u64, dst: &mut [u8]) -> Result<usize, Errno> {
     }
 }
 
-/// `close` on an AF_INET TCP fd.
+/// `close` на AF_INET TCP fd.
 pub fn tcp_close_fd(fd: u64) {
     if let Ok(sock) = tcp_sock(fd) {
         if let Some(h) = sock.handle.lock().take() {
@@ -284,14 +285,14 @@ fn tcp_sock(fd: u64) -> Result<Arc<InetTcp>, Errno> {
     .ok_or(Errno::ENOTSOCK)
 }
 
-/// `connect` on an AF_INET UDP fd: remember the peer for write()/send().
+/// `connect` на AF_INET UDP fd: запомнить партнёра для write()/send().
 pub fn udp_connect_fd(fd: u64, addr: u64, len: u64) -> Result<u64, Errno> {
     let sock = udp_sock(fd)?;
     *sock.peer.lock() = Some(parse_sockaddr_ep(addr, len)?);
     Ok(0)
 }
 
-/// write(2)/send(2) on a connected AF_INET UDP fd.
+/// write(2)/send(2) на подключённом AF_INET UDP fd.
 pub fn udp_write_fd(fd: u64, data: &[u8]) -> Result<usize, Errno> {
     let sock = udp_sock(fd)?;
     let peer = sock.peer.lock().ok_or(Errno::ENOTCONN)?;
@@ -301,7 +302,7 @@ pub fn udp_write_fd(fd: u64, data: &[u8]) -> Result<usize, Errno> {
         .map_err(|_| Errno::EIO)
 }
 
-// ── UDP (glibc resolver path) ────────────────────────────────────────────────
+// ── UDP (путь резолвера glibc) ──────────────────────────────────────────────
 
 fn udp_sock(fd: u64) -> Result<Arc<InetUdp>, Errno> {
     compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
@@ -312,8 +313,8 @@ fn udp_sock(fd: u64) -> Result<Arc<InetUdp>, Errno> {
     .ok_or(Errno::ENOTSOCK)
 }
 
-/// `sendto` on an AF_INET UDP fd. A NULL address means "connected" semantics
-/// which we do not support (glibc's resolver always passes one).
+/// `sendto` на AF_INET UDP fd. NULL-адрес означает «подключённую» семантику,
+/// которую мы не поддерживаем (резолвер glibc всегда передаёт адрес).
 pub fn udp_sendto_fd(fd: u64, data: &[u8], addr: u64, len: u64) -> Result<usize, Errno> {
     let sock = udp_sock(fd)?;
     let ep = parse_sockaddr_ep(addr, len)?;
@@ -323,7 +324,7 @@ pub fn udp_sendto_fd(fd: u64, data: &[u8], addr: u64, len: u64) -> Result<usize,
         .map_err(|_| Errno::EIO)
 }
 
-/// `recvfrom` on an AF_INET/INET6 UDP fd; returns (bytes, source endpoint).
+/// `recvfrom` на AF_INET/INET6 UDP fd; возвращает (байты, эндпоинт-источник).
 pub fn udp_recvfrom_fd(fd: u64, dst: &mut [u8]) -> Result<(usize, IpEndpoint), Errno> {
     let sock = udp_sock(fd)?;
     static RECV_LOGGED: AtomicU32 = AtomicU32::new(0);
@@ -342,7 +343,7 @@ pub fn udp_recvfrom_fd(fd: u64, dst: &mut [u8]) -> Result<(usize, IpEndpoint), E
     }
 }
 
-/// `getsockopt` for AF_INET fds: real `SO_ERROR`, honest `SO_TYPE`.
+/// `getsockopt` для AF_INET fd: настоящий `SO_ERROR`, честный `SO_TYPE`.
 pub fn getsockopt_in(
     tcp: Option<&Arc<InetTcp>>,
     level: u64,
