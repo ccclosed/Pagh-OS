@@ -7,7 +7,7 @@ apk-tools, pacman/libalpm and xbps.
 
 The user-facing command is **`ppkg`** (renamed from `apt`; internal modules stay
 `pkg::apt*`). User-visible log lines therefore start with `ppkg:` — the phase
-timings below were captured before the rename in one live run (shown as `apt:`
+timings below were captured before the rename in one live run (shown as `ppkg:`
 in that raw evidence) and as `ppkg: timings` afterwards.
 
 ## What changed

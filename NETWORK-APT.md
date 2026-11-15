@@ -33,7 +33,7 @@ and never blocks on a console question: the base glibc + CPython userland (≈35
 `ppkg update` tries the `Packages.gz`, `Packages.xz`, and plain `Packages` variants in
 order — but only those the signed `Release` lists, with the digest and size it declares
 (the variant list in `src/pkg/apt.rs::update`). A decode failure in one variant (e.g. a corrupt gzip stream)
-logs an honest `deb:`/`apt:` diagnostic on serial and falls through to the next variant;
+logs an honest `deb:`/`ppkg:` diagnostic on serial and falls through to the next variant;
 a **digest or size mismatch** does not fall through — it aborts the update, because a
 mismatch means the mirror served bytes that differ from the signed metadata. Package
 payloads unpack with tar symlinks and hardlinks **created as real links**: symlink inodes
