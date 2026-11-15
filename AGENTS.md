@@ -289,58 +289,54 @@ the operational checklist in `RELEASING.md`.
   `freed=false` log line naming the registry that kept the space alive.
   The audit's raw-`clone` reproducer never created its second thread, so the
   finding's impact remains static (no UAF demonstrated); the fix is the
-  accounting invariant, not a PoC-driven crash. (4) the same `dev` version
-  carries the real-hardware USB HID fixes (field devices: R82HE keyboard
-  3151:502d, E-Signal LUOM G10 mouse 04d9:a09f): `SET_PROTOCOL` was sent with
-  `wValue=1`, i.e. *report* protocol, while the comment and docs claimed boot
-  (HID 1.11 §7.2.6 defines boot as 0); the interrupt-IN buffer was hard-coded
-  8/4 bytes, so the mouse's 7-byte report-protocol report made the controller
-  report a babble and the old code disabled the endpoint until reboot; a
-  transfer error now issues xHCI Reset Endpoint and re-arms the transfer (three
-  attempts) instead of disabling on the first error; and every HID interface of
-  a composite device is parsed and all boot keyboard/mouse ones are bound and
-  polled (`Slot.hid` is a `Vec`, SET_PROTOCOL/SET_IDLE per interface, one
-  Configure Endpoint adding every DCI) instead of only the first. Limitations
-  stay named: hubs are still unsupported, `protocol = 0`/vendor collections are
-  logged and not bound, report-protocol-only devices are best effort (boot-like
-  8-byte keyboard; mouse: 7-byte 16-bit E-Signal layout or 8-bit axes, deltas
-  clamped into the PS/2 packet range, wheel/pan decoded but not delivered), and
-  keyboard LED output reports are not driven. Evidence: host properties
-  `usb_hid_proto`/`usb_desc` (buffer sizing, layouts, composite/truncated
-  descriptors), new in-QEMU report-mode selftest cases, `tools/e2e.py usb` and
-  the PS/2 path are green; real hardware was not available, so this is QEMU
-  (5) the same field machine then exposed a deeper xHCI port bug below that
-  HID fix, in two iterations. The first (see the 2.22.7 notes) stopped a reset
-  every ~124 ms, but the next photo showed a PP power-cycle after 16 failures
-  with all ports at `pp=0 ccs=0`, PED+U0 only momentarily, and speed id 1 (FS)
-  where Linux reports 3 (HS). The root cause was the PORTSC write itself: the
-  driver wrote a masked copy of the register back and so carried `PED` (bit 1,
-  write-1-to-disable), `PR`/`WPR` and the change bits; acknowledging PRC/CSC on
-  the just-enabled port disabled it, which is exactly `post=0x6e1` (Polling,
-  PED=0) in the photo. Every PORTSC write now goes through the Linux neutral
-  mask (`port_state_to_neutral`: RO/RWS bits only), a reset is `neutral | PR`
-  (USB2) or `neutral | WPR` (USB3) with no change-bit clear in the same write,
-  and the policy follows `hub.c`/`xhci-hub.c`: `hub_port_debounce` (25 ms steps,
-  100 ms stable connection, 2 s budget) before the first reset, 100 ms power
-  settle after PP, `hub_port_wait_reset` (10 ms then 200 ms polls, 800 ms per
-  write, PED check, up to `PORT_RESET_TRIES`=5 writes), 200 ms of stable PED+U0
-  before addressing, change bits acknowledged after that enable, a ≥1 s pause
-  after a lost PED followed by a fresh debounce, and no PP power-cycle at all
-  (PP is only raised with readback/retry). One port is advanced per `poll()`,
-  so the boot menu keeps counting. Diagnostics gained `csc=`, `speed=`,
-  `try=K/5`, `pre/post` on the failure line and a ~200 ms `observe` trace for
-  attached ports during debounce. Evidence: QEMU `tools/e2e.py usb` (keyboard +
-  mouse through menu and shell; PS/2 unaffected), `selftest` and the
-  `xhci_port` host properties; real hardware was not available, so this needs a
-  user test — the serial lines to watch are named in
-  `src/drivers/README.md`. A third field round then showed input dying after a
-  minute of use: the HID transfer ring holds 63 usable TRBs and the wrap-around
-  Link TRB was written with the *next* producer cycle instead of the current one
-  (and without `TRB_TOGGLE`), so the controller never followed the link and the
-  endpoint went silent at the first wrap — the mouse after ~63 reports, the
-  keyboard shortly after. The Link TRB now carries the current cycle and the
-  toggle bit, and `tools/e2e.py usb` types across the wrap (241 reports) as the
-  regression. Version
+  accounting invariant, not a PoC-driven crash. (4) в той же версии `dev` — исправления USB HID по реальным устройствам
+  (R82HE keyboard 3151:502d, E-Signal LUOM G10 mouse 04d9:a09f): SET_PROTOCOL
+  отправлялся с `wValue=1`, то есть *report* protocol, хотя комментарий и доки
+  говорили boot (HID 1.11 §7.2.6: boot = 0); interrupt-IN буфер был жёстко
+  8/4 байта, поэтому 7-байтный report-protocol отчёт мыши вызывал babble и
+  эндпоинт отключался до перезагрузки. Теперь SET_PROTOCOL(0) уходит на каждый
+  boot-интерфейс с проверкой результата (`mode=boot|report`), буфер равен
+  `wMaxPacketSize` (clamp 8..=64), ошибка передачи восстанавливается xHCI Reset
+  Endpoint с переармированием (до трёх попыток), а композитное устройство
+  разбирается целиком: все HID-интерфейсы, привязка всех boot-клавиатур/мышей
+  (`Slot.hid` — `Vec`, SET_PROTOCOL/SET_IDLE на интерфейс, одна Configure
+  Endpoint со всеми DCI). Ограничения названы: хабы не поддерживаются,
+  `protocol = 0`/vendor-коллекции логируются и не привязываются, устройства
+  только-report-protocol — best effort (клавиатура — boot-подобные 8 байт;
+  мышь — 7-байтная 16-битная E-Signal или 8-битные оси, дельты клампятся в
+  диапазон PS/2-пакета, wheel/pan декодируются, но не доставляются), LED
+  output report не реализован. Evidence: host-свойства
+  `usb_hid_report`/`usb_desc` (размер буфера, раскладки, композитный/усечённый
+  дескриптор), новые in-QEMU selftest-кейсы report-режима, `tools/e2e.py usb`
+  и PS/2-путь зелёные; реального железа не было, так что это QEMU.
+  (5) затем тот же аппарат показал более глубокую ошибку порта xHCI ниже
+  HID-исправления, в двух итерациях. Первая убрала reset каждые ~124 мс, но
+  следующий дамп показал PP power-cycle после 16 неудач: все порты `pp=0 ccs=0`,
+  PED+U0 лишь на мгновение, speed id 1 (FS) там, где ожидается 3 (HS). Причина
+  была в самой записи PORTSC: драйвер возвращал маскированную копию регистра и
+  тем самым нёс `PED` (бит 1, write-1-to-disable), `PR`/`WPR` и change-биты;
+  подтверждение PRC/CSC на только что включённом порту отключало его, что и даёт
+  `post=0x6e1` (Polling, PED=0). Теперь каждая запись PORTSC идёт через
+  neutral-маску (`port_state_to_neutral`: только RO/RWS биты), reset —
+  `neutral | PR` (USB2) или `neutral | WPR` (USB3) без очистки change-битов в той
+  же записи, а политика следует `hub.c`/`xhci-hub.c`: `hub_port_debounce`
+  (шаг 25 мс, 100 мс стабильного подключения, бюджет 2 с) до первого reset,
+  100 мс power settle после PP, `hub_port_wait_reset` (10 мс, затем 200 мс,
+  800 мс на запись, проверка PED, до `PORT_RESET_TRIES`=5 записей), 200 мс
+  стабильного PED+U0 до адресации, подтверждение change-битов после этого
+  включения, пауза ≥1 с после потерянного PED и новый debounce, и никакого
+  PP power-cycle (PP только поднимается с readback/повтором). Один порт
+  продвигается за `poll()`, поэтому boot-меню продолжает считать. Диагностика:
+  короткий `warn` о реальных отказах, одна строка `xhci: HID device on port N:
+  ... mode=boot`, полное состояние — команда `usb`. Evidence: QEMU
+  `tools/e2e.py usb` (клавиатура и мышь через меню и shell; PS/2 не затронут),
+  `selftest` и host-свойства `xhci_hub`; реального железа не было — нужен тест
+  пользователя. Затем третий прогон показал отказ ввода после минуты работы:
+  HID-кольцо вмещает 63 TRB, а замыкающий Link TRB писался со *следующим*
+  циклом производителя и без `TRB_TOGGLE`, поэтому контроллер не шёл по ссылке
+  и эндпоинт замолкал на первом замыкании — мышь через ~63 отчёта, клавиатура
+  чуть позже. Теперь Link TRB несёт текущий цикл и toggle-бит, а
+  `tools/e2e.py usb` печатает через замыкание (241 отчёт) как регрессию. Version
   2.22.7 is the `dev` PATCH bump; `main` stays 2.22.6.
   **2.22.6** = the round-3 audit's four high x86 findings are closed
   (F-r3-arch-1, F-r3-life-1/2, F-r3-vfs-1; reports in the external

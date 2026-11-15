@@ -1,70 +1,67 @@
-//! Pure USB configuration-descriptor parsing for HID interfaces.
+//! Чистый разбор configuration descriptor USB для HID-интерфейсов.
 //!
-//! WHY THIS IS A SEPARATE, DEPENDENCY-FREE MODULE. `xhci.rs` used to stop at the
-//! *first* HID interface with an interrupt-IN endpoint and configure only that
-//! one. A real combo keyboard (e.g. the field R82HE) exposes several HID
-//! interfaces — a boot keyboard on interface 0 and consumer/system controls on
-//! later ones — and a driver that binds only the first still works for typing,
-//! but it is one parser mistake away from binding a report-protocol vendor
-//! collection as if it were a boot keyboard. This module walks the entire
-//! configuration descriptor and returns every HID interface, with the endpoint
-//! data the xHCI layer needs; the policy of which interfaces to bind lives in
-//! `usb_hid_proto`.
+//! Драйверу нужны ВСЕ HID-интерфейсы конфигурации, а не только первый: композитная
+//! клавиатура (например, R82HE) выставляет boot-клавиатуру на интерфейсе 0 и
+//! consumer/system-управление на следующих, и привязка только первого работает для
+//! печати, но в одном шаге от того, чтобы принять report-protocol vendor-коллекцию
+//! за boot-клавиатуру. Этот модуль обходит весь configuration descriptor и
+//! возвращает каждый HID-интерфейс с данными эндпоинтов, нужными слою xHCI;
+//! политика того, какие интерфейсы привязывать, живёт в `usb_hid_report`.
 //!
-//! It is `alloc`-only and self-contained, so the host property tests include the
-//! exact source the kernel compiles (`host-tests/src/lib.rs`) and can feed it
-//! malformed/truncated descriptors that no real device would send.
+//! Только `alloc`, без зависимостей, поэтому host property-тесты включают точный
+//! исходник, который компилирует ядро (`host-tests/src/lib.rs`), и могут подавать
+//! испорченные/усечённые дескрипторы, которых не пришлёт реальное устройство.
 
 use alloc::vec::Vec;
 
-/// One HID interface and its first interrupt-IN endpoint.
+/// Один HID-интерфейс и его первый interrupt-IN эндпоинт.
 ///
-/// Only the default alternate setting (`bAlternateSetting == 0`) is returned:
-/// the driver never selects an alternate setting, so collecting alt-1 endpoints
-/// would configure endpoints the device is not currently exposing.
+/// Возвращается только настройка по умолчанию (`bAlternateSetting == 0`): драйвер
+/// никогда не выбирает альтернативную настройку, поэтому сбор эндпоинтов alt-1
+/// конфигурировал бы то, что устройство сейчас не выставляет.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HidIface {
-    /// `bConfigurationValue` from the configuration descriptor (what
-    /// SET_CONFIGURATION takes).
+    /// `bConfigurationValue` из configuration descriptor (его принимает
+    /// SET_CONFIGURATION).
     pub config_value: u8,
     /// `bInterfaceNumber`.
     pub interface: u8,
-    /// `bInterfaceSubClass` (1 = boot interface).
+    /// `bInterfaceSubClass` (1 — boot-интерфейс).
     pub subclass: u8,
-    /// `bInterfaceProtocol` (0 = none, 1 = keyboard, 2 = mouse).
+    /// `bInterfaceProtocol` (0 — нет, 1 — клавиатура, 2 — мышь).
     pub protocol: u8,
-    /// Endpoint address; bit 7 set means IN.
+    /// Адрес эндпоинта; установленный бит 7 означает IN.
     pub ep_addr: u8,
-    /// `wMaxPacketSize` exactly as the endpoint descriptor carries it (bits
-    /// 11-12 of a high-speed value are the multiplier, not the byte size).
+    /// `wMaxPacketSize` ровно как в endpoint descriptor (биты 11-12 high-speed
+    /// значения — множитель, а не размер в байтах).
     pub max_packet: u16,
-    /// `bInterval` (polling interval; xHCI interprets it by speed).
+    /// `bInterval` (интервал опроса; xHCI интерпретирует его по скорости).
     pub interval: u8,
 }
 
-/// Descriptor type values used here (USB 2.0 §9.6).
+/// Значения типов дескрипторов, используемые здесь (USB 2.0 §9.6).
 const DESC_INTERFACE: u8 = 4;
 const DESC_ENDPOINT: u8 = 5;
 
-/// Walk the configuration descriptor and return every HID (class 3) interface
-/// that has an interrupt-IN endpoint.
+/// Обойти configuration descriptor и вернуть каждый HID-интерфейс (class 3) с
+/// interrupt-IN эндпоинтом.
 ///
-/// The parser is deliberately total: a truncated or lying descriptor can never
-/// panic or loop (every step is bounded by the slice), it only yields fewer
-/// interfaces. A HID interface whose endpoint is not interrupt-IN is skipped —
-/// a HID interrupt-OUT-only interface cannot produce input.
+/// Разбор намеренно тотальный: усечённый или лживый дескриптор не может вызвать
+/// panic или зациклиться (каждый шаг ограничен срезом), он лишь вернёт меньше
+/// интерфейсов. HID-интерфейс, чей эндпоинт не interrupt-IN, пропускается:
+/// interrupt-OUT-only интерфейс не может давать ввод.
 pub fn parse_hid_interfaces(conf: &[u8]) -> Vec<HidIface> {
     let mut out = Vec::new();
     let Some(&config_value) = conf.get(5) else {
         return out;
     };
     let mut i = 0usize;
-    // (bInterfaceNumber, bInterfaceSubClass, bInterfaceProtocol) of the HID
-    // interface the following endpoint descriptor belongs to, when it is a HID
-    // interface in its default alternate setting.
+    // (bInterfaceNumber, bInterfaceSubClass, bInterfaceProtocol) HID-интерфейса,
+    // которому принадлежит следующий endpoint descriptor, если это HID-интерфейс в
+    // настройке по умолчанию.
     let mut current: Option<(u8, u8, u8)> = None;
-    // Only the first interrupt-IN endpoint of an interface is used; a second
-    // one belongs to a layout this driver does not poll.
+    // Используется только первый interrupt-IN эндпоинт интерфейса; второй относится к
+    // раскладке, которую драйвер не опрашивает.
     let mut have_ep = false;
     while i + 2 <= conf.len() {
         let len = conf[i] as usize;
@@ -88,7 +85,7 @@ pub fn parse_hid_interfaces(conf: &[u8]) -> Vec<HidIface> {
             if let Some((number, subclass, protocol)) = current {
                 let addr = conf[i + 2];
                 let attrs = conf[i + 3];
-                // Transfer type bits 0-1: 3 = interrupt; bit 7 = IN direction.
+                // Биты 0-1 типа передачи: 3 — interrupt; бит 7 — направление IN.
                 if !have_ep && attrs & 0x03 == 3 && addr & 0x80 != 0 {
                     have_ep = true;
                     out.push(HidIface {
@@ -103,8 +100,8 @@ pub fn parse_hid_interfaces(conf: &[u8]) -> Vec<HidIface> {
                 }
             }
         }
-        // Unknown/HID class descriptors are skipped by their own bLength, which
-        // is what keeps the walk aligned.
+        // Неизвестные/HID class-дескрипторы пропускаются по своему bLength — так обход
+        // остаётся выровненным.
         i += len;
     }
     out

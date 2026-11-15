@@ -1,56 +1,53 @@
-//! USB HID boot protocol → the kernel's existing input path.
+//! USB HID boot protocol → существующий путь ввода ядра.
 //!
-//! WHY A TRANSLATOR AND NOT A SECOND INPUT STACK. The shell, the line editor,
-//! the `^C`/`^Z` latches, `lxrun`'s stdin and every compat process all consume
-//! **PS/2 set-1 scancodes** off one ring buffer (`drivers::ps2_kbd`). A USB
-//! keyboard reports HID usage codes in an 8-byte boot report. Rather than teach
-//! every consumer about a second source, this module translates the report into
-//! exactly the byte stream the 8042 would have produced — including the `0xE0`
-//! prefix for extended keys and the high-bit-set break codes — and pushes it into
-//! the same ring. Nothing downstream knows the difference, which is also why
-//! `^C` from a USB keyboard stops a `lxrun`ed program like it always did.
+//! Транслятор, а не второй стек ввода. Shell, редактор строки, защёлки ^C/^Z,
+//! stdin `lxrun` и все compat-процессы читают **PS/2 set-1 скан-коды** из одного
+//! ring buffer (`drivers::ps2_kbd`). USB-клавиатура присылает HID usage codes в
+//! 8-байтном boot-отчёте. Вместо обучения каждого потребителя второму источнику
+//! модуль переводит отчёт в ровно тот байтовый поток, который дал бы 8042, —
+//! включая префикс `0xE0` для extended-клавиш и break-коды со старшим битом — и
+//! кладёт его в то же кольцо. Ниже по потоку разницы не видно, поэтому ^C с
+//! USB-клавиатуры останавливает `lxrun`-программу, как и раньше.
 //!
-//! Boot protocol first, report protocol only as a documented fallback. A boot
-//! keyboard always sends the fixed 8-byte report `[modifiers, reserved,
-//! key0..key5]` and a boot mouse the 3-byte `[buttons, dx, dy]`, so no
-//! report-descriptor parser is needed for the normal path (and none is
-//! implemented). The xHCI driver now sends SET_PROTOCOL(0) — boot — to every
-//! boot-class interface, which is what the HID spec's value 0 actually means; the
-//! old code sent 1 (report protocol) while its comment said boot.
+//! Boot protocol в первую очередь, report protocol — только документированный
+//! fallback. Boot-клавиатура всегда шлёт фиксированный 8-байтный отчёт
+//! `[modifiers, reserved, key0..key5]`, boot-мышь — 3-байтный
+//! `[buttons, dx, dy]`, поэтому нормальному пути разбор report descriptor не
+//! нужен (и не реализован). xHCI-драйвер отправляет SET_PROTOCOL(0) — boot —
+//! каждому boot-интерфейсу.
 //!
-//! REPORT-PROTOCOL FALLBACK. A device may refuse SET_PROTOCOL(0) (a STALL). Then
-//! it keeps sending its own report descriptor's layout, which this driver cannot
-//! know without parsing that descriptor. It does not blind-parse boot format in
-//! that case: a keyboard's 8-byte boot-like layout is still assumed (most
-//! report-protocol keyboards use it, including the field R82HE), and a mouse is
-//! decoded by [`crate::drivers::usb_hid_proto::mouse_report`], which knows the
-//! 7-byte E-Signal/Holtek 16-bit layout seen on the field mouse and otherwise
-//! assumes 8-bit axes. Wheel/pan axes are decoded but not delivered (the PS/2
-//! path this feeds has no wheel byte); this is a documented limitation, not a
-//! silent one.
+//! FALLBACK REPORT-PROTOCOL. Устройство может отказать SET_PROTOCOL(0) (STALL) и
+//! слать раскладку своего report descriptor, которую драйвер без разбора не
+//! знает. В этом случае boot-формат слепо не парсится: для клавиатуры
+//! принимается 8-байтная boot-подобная раскладка (большинство report-клавиатур её
+//! и используют), а мышь разбирает
+//! [`crate::drivers::usb_hid_report::mouse_report`], который знает 7-байтную
+//! 16-битную раскладку E-Signal/Holtek и иначе считает оси 8-битными.
+//! Wheel/pan декодируются, но не доставляются (в PS/2-путь, который они кормят,
+//! нет wheel-байта); это документированное ограничение, а не молчаливое.
 //!
-//! The buffer/format decisions themselves live in `usb_hid_proto`, a pure module
-//! the host tests include, so the layout rules are tested without a USB device.
+//! Решения о буфере и формате живут в `usb_hid_report` — чистом модуле, который
+//! включают host-тесты, поэтому правила раскладки проверяются без USB-устройства.
 //!
-//! STATE. A boot report is a *snapshot* of the keys currently held, not a stream
-//! of events: the translator keeps the previously seen set to derive make/break
-//! codes, and the modifier byte is diffed the same way.
+//! СОСТОЯНИЕ. Boot-отчёт — снимок зажатых клавиш, а не поток событий: транслятор
+//! хранит предыдущее множество, чтобы вывести make/break-коды, и так же сравнивает
+//! байт модификаторов.
 
-use crate::drivers::usb_hid_proto::{self, HidClass, ReportMode};
+use crate::drivers::usb_hid_report::{self, HidClass, ReportMode};
 use crate::drivers::{ps2_kbd, ps2_mouse};
 use crate::sync::spinlock::Spinlock;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// USB HID usage ids → PS/2 set-1 scancodes (without the `0xE0` prefix).
+/// USB HID usage id → PS/2 set-1 скан-коды (без префикса `0xE0`).
 ///
-/// Sparse table by usage id; `0` means "no mapping" (media keys, power, and the
-/// vendor-defined ranges a boot keyboard should not be sending anyway).
+/// Разреженная таблица по usage id; `0` означает «нет отображения» (медиа-клавиши,
+/// питание и vendor-диапазоны, которые boot-клавиатура и не должна слать).
 struct KeyMap {
     usage: u8,
     code: u8,
 }
 
-/// Prefixed entries carry the `0xE0` extension byte the PS/2 stream uses.
+/// Записи с префиксом несут байт расширения `0xE0`, как в PS/2-потоке.
 const fn k(usage: u8, code: u8) -> KeyMap {
     KeyMap { usage, code }
 }
@@ -160,12 +157,11 @@ static MAP: [KeyMap; 102] = [
     k(0x6F, 0x58),
 ];
 
-/// Usages that must be sent with the `0xE0` prefix in a PS/2 stream.
+/// Usage, которые в PS/2-потоке обязаны идти с префиксом `0xE0`.
 ///
-/// A real 8042 emits the prefix for the "extended" half of the keyboard —
-/// arrows, navigation cluster, keypad Enter/slash, and the right-hand
-/// modifiers. Getting this wrong is visible: `^C` from the right Ctrl, or an
-/// arrow key, would arrive as an unrelated character.
+/// Настоящий 8042 выдаёт префикс для «расширенной» половины клавиатуры: стрелки,
+/// навигационный блок, Enter и слэш цифрового блока и правые модификаторы. Ошибка
+/// здесь видна: ^C с правого Ctrl или стрелка пришли бы посторонним символом.
 fn is_extended(usage: u8) -> bool {
     matches!(usage, 0x49..=0x52 | 0x54 | 0x55 | 0x57 | 0x58 | 0x5E..=0x63 | 0x64)
 }
@@ -174,14 +170,14 @@ fn lookup(usage: u8) -> Option<u8> {
     MAP.iter().find(|m| m.usage == usage).map(|m| m.code)
 }
 
-/// Keyboard state: the keys and modifiers held at the previous report.
+/// Состояние клавиатуры: клавиши и модификаторы, зажатые в предыдущем отчёте.
 struct KeyboardState {
-    /// Usage ids currently reported as held (0 = none).
+    /// Usage id, которые сейчас считаются зажатыми (0 — ни одной).
     keys: [u8; 6],
     modifiers: u8,
-    /// Reports translated, for diagnostics.
+    /// Отчётов переведено — для диагностики.
     reports: u64,
-    /// Keys that could not be mapped (so an operator can see why a key is dead).
+    /// Клавиши, которые не удалось отобразить (чтобы оператор видел, почему клавиша мертва).
     unmapped: u64,
 }
 
@@ -194,8 +190,8 @@ static KEYBOARD: Spinlock<KeyboardState> = Spinlock::new(KeyboardState {
     unmapped: 0,
 });
 
-/// Modifier bits in byte 0 of a boot keyboard report, with the scancode each
-/// one maps to. `ext` marks the right-hand variants (0xE0 prefix).
+/// Биты модификаторов в байте 0 boot-отчёта клавиатуры и скан-код каждого.
+/// `ext` отмечает правые варианты (префикс `0xE0`).
 const MODIFIERS: [(u8, u8, bool); 8] = [
     (1 << 0, 0x1D, false), // Left Ctrl
     (1 << 1, 0x2A, false), // Left Shift
@@ -218,17 +214,17 @@ fn emit(usage: u8, make: bool) {
     ps2_kbd::inject_scancode(if make { code } else { code | 0x80 });
 }
 
-/// Translate one keyboard report (8 bytes, boot or boot-like) into PS/2
-/// scancodes.
+/// Перевести один отчёт клавиатуры (8 байт, boot или boot-подобный) в PS/2
+/// скан-коды.
 fn feed_keyboard(report: &[u8]) {
-    let Some((mods, held)) = usb_hid_proto::keyboard_report(report) else {
+    let Some((mods, held)) = usb_hid_report::keyboard_report(report) else {
         return;
     };
 
     let mut state = KEYBOARD.lock();
     state.reports += 1;
 
-    // Modifiers first, so a chord like Ctrl+C is delivered in order.
+    // Сначала модификаторы, чтобы аккорд вроде Ctrl+C доставлялся по порядку.
     for (bit, code, ext) in MODIFIERS {
         let was = state.modifiers & bit != 0;
         let now = mods & bit != 0;
@@ -242,7 +238,7 @@ fn feed_keyboard(report: &[u8]) {
     }
     state.modifiers = mods;
 
-    // Break codes for keys that were held and are not any more.
+    // Break-коды для клавиш, которые были зажаты и больше нет.
     for i in 0..6 {
         let old = state.keys[i];
         if old == 0 || held.contains(&old) {
@@ -253,7 +249,7 @@ fn feed_keyboard(report: &[u8]) {
         }
         emit(old, false);
     }
-    // Make codes for keys that are newly held.
+    // Make-коды для только что зажатых клавиш.
     for i in 0..6 {
         let new = held[i];
         if new == 0 || state.keys.contains(&new) {
@@ -268,53 +264,52 @@ fn feed_keyboard(report: &[u8]) {
     state.keys = held;
 }
 
-/// Translate one mouse report into the PS/2 packet the mouse driver assembles,
-/// so the cursor moves through exactly the same path.
+/// Перевести один отчёт мыши в PS/2-пакет, который собирает драйвер мыши, чтобы
+/// курсор двигался тем же путём.
 ///
-/// Boot reports are the fixed 3-byte layout; report-protocol reports are decoded
-/// by the pure layout policy (7-byte 16-bit axes, or 8-bit axes), and the deltas
-/// are clamped to the PS/2 packet's range instead of wrapping.
+/// Boot-отчёты имеют фиксированную 3-байтную раскладку; report-protocol отчёты
+/// разбирает чистая политика раскладок (7 байт с 16-битными осями или 8-битные
+/// оси), а дельты зажимаются в диапазон PS/2-пакета вместо заворачивания.
 fn feed_mouse(report: &[u8], mode: ReportMode) {
-    let Some(decoded) = usb_hid_proto::mouse_report(report, mode) else {
+    let Some(decoded) = usb_hid_report::mouse_report(report, mode) else {
         return;
     };
     MOUSE_REPORTS.fetch_add(1, Ordering::Relaxed);
     let buttons = decoded.buttons;
-    let dx = usb_hid_proto::clamp_delta(decoded.dx);
-    // HID boot-mouse reports are Y-down (positive dy = towards the bottom of
-    // the screen), while the PS/2 convention the decoder below implements is
-    // Y-up (the driver computes `y - dy`). Flip the sign so a USB mouse moves
-    // the cursor the same way a PS/2 one does. `saturating_neg` keeps a
-    // report-protocol i16::MIN from overflowing.
-    let dy = usb_hid_proto::clamp_delta(decoded.dy.saturating_neg());
-    // PS/2 packet: flags (bit 3 always set, bits 0-2 buttons, bits 4/5 the sign
-    // of dx/dy), then the two deltas as 9-bit two's complement bytes.
+    let dx = usb_hid_report::clamp_delta(decoded.dx);
+    // HID boot-mouse отчёты имеют Y-вниз (положительный dy — к низу экрана), а
+    // PS/2-соглашение, которое реализует декодер ниже, — Y-вверх (драйвер считает
+    // `y - dy`). Перевернуть знак, чтобы USB-мышь двигала курсор как PS/2.
+    // `saturating_neg` не даёт i16::MIN из report-протокола переполниться.
+    let dy = usb_hid_report::clamp_delta(decoded.dy.saturating_neg());
+    // PS/2-пакет: flags (бит 3 всегда 1, биты 0-2 — кнопки, биты 4/5 — знак dx/dy),
+    // затем две дельты как 9-битные байты в дополнительном коде.
     let flags = 0x08 | buttons | if dx < 0 { 0x10 } else { 0 } | if dy < 0 { 0x20 } else { 0 };
     ps2_mouse::inject_packet([flags, dx as u8, dy as u8]);
 }
 
-/// Feed one HID report from an interface whose `subclass`/`protocol` identify it
-/// as a boot keyboard or mouse, in the report layout the interface is currently
-/// sending. Interfaces that are not a boot keyboard/mouse are ignored.
+/// Подать один HID-отчёт с интерфейса, чьи `subclass`/`protocol` определяют его
+/// как boot-клавиатуру или мышь, в той раскладке, которую интерфейс сейчас шлёт.
+/// Интерфейсы, не являющиеся boot-клавиатурой/мышью, игнорируются.
 pub fn feed_iface(report: &[u8], subclass: u8, protocol: u8, mode: ReportMode) {
-    match usb_hid_proto::class_of(subclass, protocol) {
+    match usb_hid_report::class_of(subclass, protocol) {
         HidClass::Keyboard => feed_keyboard(report),
         HidClass::Mouse => feed_mouse(report, mode),
         HidClass::Unsupported => {}
     }
 }
 
-/// Feed one boot-protocol report (the in-QEMU selftest entry point).
+/// Подать один boot-отчёт (точка входа selftest внутри QEMU).
 pub fn feed(report: &[u8], protocol: u8) {
     feed_iface(
         report,
-        usb_hid_proto::SUBCLASS_BOOT,
+        usb_hid_report::SUBCLASS_BOOT,
         protocol,
         ReportMode::Boot,
     );
 }
 
-/// `(keyboard reports, mouse reports, unmapped keys)` for diagnostics.
+/// `(отчёты клавиатуры, отчёты мыши, неотображённые клавиши)` для диагностики.
 pub fn stats() -> (u64, u64, u64) {
     let k = KEYBOARD.lock();
     (k.reports, MOUSE_REPORTS.load(Ordering::Relaxed), k.unmapped)

@@ -66,86 +66,79 @@ reports live in `attack/r3/{arch,vfs,lead}/REPORT.md` and the top-level
   kept). The audit's raw-`clone` reproducer never created its second thread, so
   the impact remains static; the fix is the accounting invariant.
 
-* **USB HID on real hardware: boot protocol, packet-sized buffers, endpoint
-  recovery, composite interfaces.** The field devices (R82HE keyboard
-  3151:502d, E-Signal LUOM G10 mouse 04d9:a09f) exposed four defects: the mouse
-  was dead and the keyboard only partly worked. (1) `SET_PROTOCOL` was sent with
-  `wValue=1` — *report* protocol — while the code and docs said boot; HID 1.11
-  §7.2.6 defines boot as 0. It is now 0 for every boot-class interface, the
-  result is checked and logged as `mode=boot|report`, and a device that refuses
-  boot stays in report protocol with best-effort parsing instead of losing input.
-  (2) The interrupt-IN buffer was the hard-coded 8/4 bytes; the 7-byte
-  report-protocol mouse report overflowed 4 bytes, the controller reported a
-  babble and the old code disabled the endpoint until reboot. The buffer is now
-  `wMaxPacketSize` clamped to 8..=64, i.e. never shorter than one packet. (3) A
-  transfer error now issues xHCI Reset Endpoint (TRB type 14) and re-arms the
-  transfer, up to three attempts, instead of disabling on the first error; the
-  `usb` command prints the reset/bad-report counters. (4) `Slot.hid` was a single
-  `Option<HidEndpoint>`, so a combo device's other HID interfaces were ignored;
-  it is now a `Vec`, every HID interface with an interrupt-IN endpoint is parsed,
-  only boot keyboard/mouse interfaces are bound (protocol 0/vendor collections
-  are logged and skipped), one Configure Endpoint adds every DCI, and all
-  endpoints are polled with per-slot/endpoint event routing. Report layouts:
-  boot reports as before; a report-mode mouse decodes the E-Signal/Holtek 7-byte
-  16-bit-X/Y layout (deltas clamped into the PS/2 packet range; wheel/pan decoded
-  but not delivered) and 3-6-byte 8-bit layouts best effort; a report-mode
-  keyboard uses the boot-like 8-byte layout. Host properties
-  `usb_hid_proto`/`usb_desc`, new in-QEMU report-mode selftest cases,
-  `tools/e2e.py usb` and the PS/2 path are green. Real hardware was not available
-  for this change (QEMU evidence only); the serial lines to watch on hardware are
-  named in `src/drivers/README.md`.
+* **USB HID: boot protocol, буферы по размеру пакета, восстановление
+  эндпоинта, композитные интерфейсы.** Устройства R82HE keyboard 3151:502d и
+  E-Signal LUOM G10 mouse 04d9:a09f выявили четыре дефекта: мышь не работала, а
+  клавиатура работала частично. (1) `SET_PROTOCOL` отправлялся с `wValue=1` —
+  *report* protocol — хотя код и доки говорили boot; HID 1.11 §7.2.6 определяет
+  boot как 0. Теперь для каждого boot-интерфейса уходит 0, результат проверяется
+  и логируется как `mode=boot|report`, а устройство, отказавшее boot, остаётся в
+  report protocol с best-effort разбором вместо потери ввода. (2) interrupt-IN
+  буфер был жёстко 8/4 байта; 7-байтный report-protocol отчёт мыши переполнял
+  4 байта, контроллер сообщал babble, и эндпоинт отключался до перезагрузки.
+  Теперь буфер равен `wMaxPacketSize` с clamp 8..=64, то есть не короче одного
+  пакета. (3) Ошибка передачи теперь выдаёт xHCI Reset Endpoint (TRB type 14) и
+  переармирует передачу, до трёх попыток, вместо отключения с первой ошибкой;
+  команда `usb` печатает счётчики reset/bad report. (4) `Slot.hid` был одним
+  `Option<HidEndpoint>`, поэтому остальные HID-интерфейсы композитного
+  устройства игнорировались; теперь это `Vec`, разбирается каждый HID-интерфейс
+  с interrupt-IN эндпоинтом, привязываются только boot-клавиатуры/мыши
+  (protocol 0 и vendor-коллекции логируются и пропускаются), одна Configure
+  Endpoint добавляет все DCI, а опрос идёт по всем эндпоинтам с маршрутизацией
+  событий по slot/endpoint. Раскладки: boot-отчёты как раньше; report-мышь
+  декодирует 7-байтную 16-битную X/Y E-Signal/Holtek (дельты клампятся в
+  диапазон PS/2-пакета; wheel/pan декодируются, но не доставляются) и
+  3-6-байтные 8-битные раскладки best effort; report-клавиатура использует
+  boot-подобные 8 байт. Host-свойства `usb_hid_report`/`usb_desc`, новые
+  in-QEMU selftest-кейсы report-режима, `tools/e2e.py usb` и PS/2-путь зелёные.
+  Реального железа для этого изменения не было (только QEMU); serial-строки для
+  проверки на железе названы в `src/drivers/README.md`.
 
-* **xHCI root-port bring-up: neutral PORTSC writes and Linux hub reset
-  sequencing (2.22.7 field fix, second iteration).** The same field machine
-  (Intel 8086:7a60, 26 ports, `attached=0x02000731`) reported every attached
-  USB2 port as `ccs=1 ped=0 pp=1 pls=7 stage=lost-after-reset code=0x6e1
-  try=19 ms=124 ... prc=1 ped_seen=1 ped_sc=0x00200e03` with 0 HID devices. The
-  first iteration replaced the 25 ms/20 ms/60 ms reset loop with a pure policy
-  (`src/drivers/xhci_port.rs`, properties `xhci_port`), but the next photo showed
-  the remaining failure: after 16 failed attempts a PP power-cycle left every
-  port at `pp=0 ccs=0` (`stage=power-cycle try=16 ms=159`), PED+U0 was visible
-  for a moment (`ped_seen=1 ped_u0=1 ped_sc=0x00200603`) and the port fell back
-  to Polling at speed id 1 (FS) where Linux reports 3 (HS). The cause was in the
-  PORTSC write: it masked the write-1-to-clear *change* bits but wrote the rest
-  of the read value back, including **PED (bit 1), which is write-1-to-disable**;
-  acknowledging PRC/CSC on the just-enabled port disabled it (the photo's
-  `post=0x6e1`). Every PORTSC write now goes through
-  `port_state_to_neutral()` — the Linux `xhci_port_state_to_neutral()` mask (RO
-  bits: CCS/bit 3/speed/bit 30; RWS bits: PLS/PP/bits 14-15/25-27; everything
-  else written 0) — and a reset is `neutral | PR` (USB2) or `neutral | WPR`
-  (USB3) with no change-bit clear in the same write. The policy now uses Linux's
-  numbers and ordering instead of invented ones: `hub_port_debounce` (25 ms
-  sample step, 100 ms unchanged CCS, 2 s budget) before the first reset; 100 ms
-  power settle after PP=1; `hub_port_wait_reset` (10 ms polls twice, then
-  200 ms, 800 ms timeout per write, success `!PR && CCS` then PED, no PED →
-  reset again, up to `PORT_RESET_TRIES`=5); PED+U0 must hold 200 ms before
-  addressing; PRC/WRC/CSC are acknowledged only after that enable
-  (`ClearPortFeature(C_PORT_RESET)`); a lost PED pauses ≥1 s, then debounces
-  again before any new reset. PP power-cycling is removed entirely (Linux does
-  not do it for root ports): PP is only raised, with readback and retries, and a
-  failed write is retried after the backoff, so a port cannot be left unpowered.
-  Diagnostics now print `stage=`/`try=`/`ms=`/`pre=`/`post=`/`prc=`/`csc=`/
-  `ped_seen=`/`ped_u0=`/`speed=`/`ped_sc=` on failures, `try=K/5` and the
-  debounce totals on reset lines, and a ~200 ms `observe` trace
-  (`ccs/ped/pp/pls/speed/csc/prc/pr/state/debounce_total/stable`) for attached
-  ports during debounce. Evidence: QEMU `tools/e2e.py usb` (keyboard + mouse
-  through the menu and shell, PS/2 unaffected), `selftest`, the `xhci_port` host
-  properties (including a property that pins the neutral mask) and all six
-  gates; real hardware was not available, so this is QEMU evidence only and
-  needs a user test. Serial lines to watch are named in
-  `src/drivers/README.md` (`port N: observe ... stable=100ms`, `port N: reset #K
-  issued (... try=1/5 ...)`, `reset-ok ... speed_before=... speed_after=...`,
-  `HID device on port N`, `usb: key reports`).
+* **Подъём корневого порта xHCI: neutral-записи PORTSC и последовательность
+  сброса по `hub.c` (2.22.7, вторая итерация).** Та же машина (Intel 8086:7a60,
+  26 портов, `attached=0x02000731`) сообщала о каждом подключённом USB2-порте
+  `ccs=1 ped=0 pp=1 pls=7 stage=lost-after-reset code=0x6e1 try=19 ms=124 ...
+  prc=1 ped_seen=1 ped_sc=0x00200e03` при 0 HID-устройств. Первая итерация
+  заменила цикл reset 25/20/60 мс чистой политикой (`src/drivers/xhci_hub.rs`,
+  свойства `xhci_hub`), но следующий дамп показал оставшийся отказ: после 16
+  неудачных попыток PP power-cycle оставил все порты в `pp=0 ccs=0`
+  (`stage=power-cycle try=16 ms=159`), PED+U0 был виден на мгновение
+  (`ped_seen=1 ped_u0=1 ped_sc=0x00200603`), а порт откатывался в Polling на
+  speed id 1 (FS) там, где ожидается 3 (HS). Причина — в записи PORTSC: она
+  маскировала write-1-to-clear *change*-биты, но возвращала остальное значение
+  обратно, включая **PED (бит 1), который является write-1-to-disable**;
+  подтверждение PRC/CSC на только что включённом порту отключало его (в дампе
+  `post=0x6e1`). Теперь каждая запись PORTSC идёт через
+  `port_state_to_neutral()` — маску `xhci_hub_state_to_neutral()` (RO-биты:
+  CCS/бит 3/speed/бит 30; RWS-биты: PLS/PP/биты 14-15/25-27; всё остальное
+  пишется нулём), — а reset это `neutral | PR` (USB2) или `neutral | WPR`
+  (USB3) без очистки change-битов в той же записи. Политика использует
+  последовательность и числа `hub.c`: `hub_port_debounce` (шаг 25 мс, 100 мс
+  неизменного CCS, бюджет 2 с) до первого reset; 100 мс power settle после
+  PP=1; `hub_port_wait_reset` (10 мс дважды, затем 200 мс, 800 мс на запись,
+  успех `!PR && CCS`, затем PED, нет PED — reset снова, до
+  `PORT_RESET_TRIES`=5); PED+U0 должен держаться 200 мс до адресации;
+  PRC/WRC/CSC подтверждаются только после этого включения
+  (`ClearPortFeature(C_PORT_RESET)`); потерянный PED даёт паузу ≥1 с, затем
+  debounce и только потом новый reset. PP power-cycle удалён полностью: PP
+  только поднимается, с readback и повторами, а неудачная запись повторяется
+  после backoff, поэтому порт не может остаться обесточенным. Диагностика:
+  короткий `warn` о реальных отказах, одна строка `xhci: HID device on port N:
+  ... mode=boot`, полный снимок портов — команда `usb`. Evidence: QEMU
+  `tools/e2e.py usb` (клавиатура и мышь через меню и shell, PS/2 не затронут),
+  `selftest`, host-свойства `xhci_hub` (включая свойство, закрепляющее
+  neutral-маску) и все шесть гейтов; реального железа не было, поэтому это
+  только QEMU-доказательство и нужен тест пользователя.
 
-* **HID transfer-ring wrap (field round 3):** input worked, then the mouse died
-  after about a minute and the keyboard about ten seconds later. The HID ring has
-  63 usable TRBs; the wrap-around Link TRB was written with the next producer
-  cycle (and `TRB_IOC` instead of `TRB_TOGGLE`), so the controller skipped the
-  link and the endpoint stopped consuming reports at the first wrap. The Link TRB
-  now carries the current cycle and the toggle bit; `tools/e2e.py usb` types
-  across the wrap and requires the keyboard counter to keep growing (241 reports
-  in the committed run). The failure scales with report count, which is why
-  short QEMU runs never saw it.
+* **Замыкание HID transfer-кольца:** ввод работал, затем мышь умирала примерно
+  через минуту, а клавиатура — на десять секунд позже. HID-кольцо вмещает 63
+  полезных TRB; замыкающий Link TRB писался со следующим циклом производителя
+  (и с `TRB_IOC` вместо `TRB_TOGGLE`), поэтому контроллер пропускал ссылку и
+  эндпоинт переставал потреблять отчёты на первом замыкании. Теперь Link TRB
+  несёт текущий цикл и toggle-бит; `tools/e2e.py usb` печатает через замыкание и
+  требует, чтобы счётчик клавиатуры продолжал расти (241 отчёт в закоммиченном
+  прогоне). Отказ масштабируется числом отчётов, поэтому короткие QEMU-прогоны
+  его не видели.
 
 ## 2.22.6
 

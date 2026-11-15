@@ -17,11 +17,11 @@ pub mod serial;
 pub mod tty;
 pub mod usb_desc;
 pub mod usb_hid;
-pub mod usb_hid_proto;
+pub mod usb_hid_report;
 pub mod virtio;
 pub mod vt;
 pub mod xhci;
-mod xhci_port;
+mod xhci_hub;
 
 use crate::sync::spinlock::Spinlock;
 use alloc::collections::BTreeMap;

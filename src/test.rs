@@ -7272,7 +7272,7 @@ mod security_tests {
 /// The routine drains the ring before and after itself, so a key pressed by
 /// whoever is at the keyboard during a `selftest` run cannot make it flaky.
 mod usb_hid_tests {
-    use crate::drivers::usb_hid_proto::ReportMode;
+    use crate::drivers::usb_hid_report::ReportMode;
     use crate::drivers::{ps2_kbd, usb_hid};
 
     /// Drain whatever is queued, so the routine starts from a known state.

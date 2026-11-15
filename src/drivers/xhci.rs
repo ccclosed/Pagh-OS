@@ -1,36 +1,31 @@
-//! xHCI (USB host controller) — polled, no interrupts, HID-oriented.
+//! xHCI-контроллер USB — опрос без прерываний, ориентирован на HID.
 //!
-//! WHY THIS EXISTS. Until now the kernel had no USB support at all: the only
-//! keyboard was PS/2 (ports 0x60/0x64 + IRQ1) and the only mouse PS/2 aux. A
-//! machine with a USB keyboard therefore worked only if its firmware translated
-//! USB HID into PS/2 scancodes in SMM ("USB Legacy Support") — which many boards
-//! do and many others do not, and on the ones that do not pagh booted to a shell
-//! nobody could type into. This driver removes that dependency: it drives the
-//! xHCI controller itself and feeds the same input path the PS/2 driver feeds.
+//! Драйвер работает с контроллером напрямую и подаёт отчёты в тот же путь
+//! ввода, что и PS/2: машина с USB-клавиатурой не зависит от того, транслирует
+//! ли прошивка USB HID в PS/2-сканкоды через SMM.
 //!
-//! DESIGN, and why it looks like `nvme.rs`. The controller is polled from one
-//! kernel thread (`usb`, spawned in `boot.rs`): no interrupt routing, no handler
-//! sharing the timer path, and the failure mode is "the poll thread stops"
-//! rather than "an IRQ corrupts a ring". That is the same shape as the NVMe
-//! driver, the only other driver here that owns a DMA protocol.
+//! Устройство опрашивается из одного потока ядра (`usb`, запускается в
+//! `boot.rs`): маршрутизации прерываний и общего с таймером обработчика нет,
+//! отказ выражается в остановке потока опроса, а не в порче кольца из IRQ.
+//! Форма та же, что у `nvme.rs` — единственного другого драйвера с DMA-протоколом.
 //!
-//! WHAT THE HARDWARE ASKS FOR. xHCI is a set of rings in RAM the controller
-//! walks by physical address: one command ring, one event ring per interrupter, a
-//! device context per slot, and transfer rings per endpoint. All of it must be
-//! physically contiguous and zeroed (the `DmaFrame`/`Ring` helpers), and every
-//! action is "write a TRB, ring the doorbell, wait for the matching event".
+//! xHCI — это набор колец в RAM, которые контроллер обходит по физическим
+//! адресам: командное кольцо, кольцо событий на каждый interrupter, контекст
+//! устройства на слот и transfer-кольца на эндпоинт. Всё это должно быть
+//! физически непрерывным и обнулённым (`DmaFrame`/`Ring`); любое действие —
+//! «записать TRB, позвонить в doorbell, дождаться события».
 //!
-//! SCOPE. Enumeration brings a device to the point of configured HID interfaces
-//! with interrupt-IN endpoints, which is exactly what boot-protocol keyboards
-//! and mice need; [`crate::drivers::usb_hid`] turns those reports into the
-//! scancode stream the shell already consumes. Every boot-class keyboard/mouse
-//! interface of a device is bound (a combo keyboard's consumer/system
-//! collections are skipped: they have no layout this driver parses), all of them
-//! are configured with one xHCI Configure Endpoint command and polled together.
-//! Root ports only — a device behind a hub is not reached (no hub class driver).
-//! Not implemented: isochronous transfers, suspend/resume, hot-unplug teardown,
-//! USB 3 link power management, HID report-descriptor parsing (report-protocol
-//! support is best effort; see `usb_hid`), keyboard LED output reports.
+//! Область: перечисление доводит устройство до сконфигурированных HID-
+//! интерфейсов с interrupt-IN эндпоинтами — это всё, что нужно boot-клавиатурам
+//! и мышам; [`crate::drivers::usb_hid`] превращает отчёты в поток сканкодов,
+//! который уже потребляет shell. Каждый boot-интерфейс клавиатуры/мыши
+//! привязывается (consumer/system-коллекции композитной клавиатуры пропускаются:
+//! раскладки для них нет), все они конфигурируются одной командой Configure
+//! Endpoint и опрашиваются вместе. Только корневые порты — устройство за хабом
+//! недоступно (hub-драйвера нет). Не реализовано: изохронные передачи,
+//! suspend/resume, teardown hot-unplug, USB 3 link power management, разбор
+//! HID report descriptor (report-протокол — best effort, см. `usb_hid`),
+//! output-отчёты для LED клавиатуры.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -40,8 +35,8 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::drivers::pci::PciDevice;
 use crate::drivers::usb_desc::{self, HidIface};
-use crate::drivers::usb_hid_proto::{self, RecoveryAction, ReportMode};
-use crate::drivers::xhci_port::{
+use crate::drivers::usb_hid_report::{self, RecoveryAction, ReportMode};
+use crate::drivers::xhci_hub::{
     self, port_state_to_neutral, FailReason, Phase, PortObservation, PortPolicy, Step,
 };
 use crate::memory::pmm;
@@ -50,10 +45,10 @@ use crate::sync::spinlock::Spinlock;
 const PAGE_SIZE: usize = 4096;
 const TRB_SIZE: usize = 16;
 
-// ─── DMA frames ──────────────────────────────────────────────────────────────
+// ─── DMA-кадры ───────────────────────────────────────────────────────────────
 
-/// One zeroed, page-aligned DMA frame, addressed both physically (for the
-/// controller) and through the HHDM (for the CPU).
+/// Один обнулённый DMA-кадр, выровненный на страницу; адресуется физически (для
+/// контроллера) и через HHDM (для CPU).
 struct DmaFrame {
     phys: u64,
     virt: usize,
@@ -69,8 +64,8 @@ impl DmaFrame {
     fn new_zeroed(what: &str) -> Option<Self> {
         let phys = pmm::alloc_frame()?;
         let virt = crate::memory::vmm::phys_to_virt(phys) as usize;
-        // SAFETY: the PMM just handed us this exclusive frame, mapped in the
-        // HHDM, so zeroing the whole page is valid.
+        // SAFETY: PMM только что выдал этот эксклюзивный кадр, отображённый в HHDM,
+        // поэтому обнуление всей страницы корректно.
         unsafe { core::ptr::write_bytes(virt as *mut u8, 0, PAGE_SIZE) };
         crate::debug!("xhci: dma frame {} phys={:#x} virt={:#x}", what, phys, virt);
         Some(Self { phys, virt })
@@ -85,44 +80,41 @@ impl DmaFrame {
     }
 }
 
-// ─── Clock ───────────────────────────────────────────────────────────────────
+// ─── Часы ────────────────────────────────────────────────────────────────────
 
-/// TSC ticks per microsecond, measured once at boot. 0 means "no usable clock".
+/// Тиков TSC на микросекунду, измеряется один раз при загрузке. 0 — часы непригодны.
 ///
-/// WHY A CLOCK AT ALL. Every wait in this driver used to be "N spins", which is a
-/// different wall-clock duration on every machine. The field machine is a 26-port
-/// PCH where a USB2 port needs tens of milliseconds to finish a reset, while a
-/// spin budget that looked generous under QEMU can expire in the middle of one —
-/// and the driver then reports the port as failed without ever having given the
-/// link the time it asked for. The boot menu polls this driver with interrupts
-/// disabled (so `scheduler::ticks` never advances), but `rdtsc` works in every
-/// context; calibrating it against the PIT at boot turns every USB wait into a
-/// real deadline.
+/// Все ожидания драйвера выражены в микросекундах: USB2-порт на реальном PCH
+/// тратит на reset десятки миллисекунд, а бюджет спин-циклов под QEMU может
+/// истечь посреди операции. Boot-меню опрашивает драйвер с выключенными
+/// прерываниями (поэтому `scheduler::ticks` не растёт), но `rdtsc` работает в
+/// любом контексте; калибровка по PIT при загрузке превращает каждое ожидание в
+/// реальный дедлайн.
 static TSC_PER_US: AtomicU64 = AtomicU64::new(0);
 
 fn rdtsc() -> u64 {
     let lo: u32;
     let hi: u32;
-    // SAFETY: `rdtsc` only reads the time-stamp counter. It has no memory side
-    // effects, so the compiler is told so (`nomem`) and nothing is pushed.
+    // SAFETY: `rdtsc` только читает счётчик меток времени, побочных эффектов памяти
+    // нет; компилятору это сообщают (`nomem`), стек не используется.
     unsafe {
         core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
     }
     ((hi as u64) << 32) | lo as u64
 }
 
-/// Measure the TSC against a 10 ms PIT channel-2 one-shot.
+/// Измерить TSC по 10-мс одноразовому таймеру PIT канала 2.
 ///
-/// Runs from `init_usb`, i.e. before the boot menu starts using PIT channel 2 for
-/// its own countdown, so the two users never overlap.
+/// Вызывается из `init_usb` до того, как boot-меню начнёт использовать канал 2
+/// для своего отсчёта, поэтому пользователи не пересекаются.
 fn calibrate_clock() -> bool {
     use x86_64::instructions::port::Port;
     const PIT_HZ: u64 = 1_193_182;
-    // 10 ms one-shot on channel 2.
+    // 10-мс одноразовый запуск канала 2.
     let count = (PIT_HZ / 100) as u16 - 1;
-    // SAFETY: port 0x61 gates PIT channel 2 and mirrors its output; 0x43/0x42 are
-    // the PIT command and channel-2 data ports. The gate value is restored on
-    // every return path, and the speaker is never enabled (bit 1 stays clear).
+    // SAFETY: порт 0x61 управляет каналом 2 PIT и отражает его выход; 0x43/0x42 —
+    // командный порт PIT и порт данных канала 2. Значение gate восстанавливается на
+    // каждом пути возврата, динамик не включается (бит 1 остаётся 0).
     unsafe {
         let mut gate: Port<u8> = Port::new(0x61);
         let mut cmd: Port<u8> = Port::new(0x43);
@@ -145,14 +137,14 @@ fn calibrate_clock() -> bool {
         }
         let end = rdtsc();
         gate.write(saved);
-        // The window is 10 ms, so ticks/second is the delta times 100.
+        // Окно 10 мс, поэтому тиков в секунду — дельта, умноженная на 100.
         let hz = end.wrapping_sub(start).saturating_mul(100);
         if !(1_000_000..=100_000_000_000).contains(&hz) {
             crate::warn!("xhci: no clock (implausible TSC rate {})", hz);
             return false;
         }
         TSC_PER_US.store((hz / 1_000_000).max(1), Ordering::Relaxed);
-        crate::info!("xhci: clock: TSC ~{} MHz", hz / 1_000_000);
+        crate::debug!("xhci: clock: TSC ~{} MHz", hz / 1_000_000);
     }
     true
 }
@@ -161,7 +153,7 @@ fn clock_ready() -> bool {
     TSC_PER_US.load(Ordering::Relaxed) != 0
 }
 
-/// Microseconds from an arbitrary epoch; only differences are meaningful.
+/// Микросекунды от произвольной эпохи; смысл имеют только разности.
 fn now_us() -> u64 {
     let per_us = TSC_PER_US.load(Ordering::Relaxed);
     if per_us == 0 {
@@ -170,8 +162,8 @@ fn now_us() -> u64 {
     rdtsc() / per_us
 }
 
-/// Busy-wait for at least `us` microseconds, where the spec mandates a delay
-/// (USB2 reset recovery, port power settle, firmware handoff timeout).
+/// Занять шину не менее `us` микросекунд там, где спецификация требует задержки
+/// (USB2 reset recovery, power settle порта, таймаут handoff прошивки).
 fn settle_us(us: u64) {
     if clock_ready() {
         let deadline = now_us() + us;
@@ -179,12 +171,12 @@ fn settle_us(us: u64) {
             core::hint::spin_loop();
         }
     } else {
-        // No calibrated clock: fall back to the old spin-count behaviour.
+        // Без калиброванных часов: запасной вариант — бюджет спин-циклов.
         spin_settle((us.saturating_mul(3)).min(u32::MAX as u64) as u32);
     }
 }
 
-// ─── TRBs ────────────────────────────────────────────────────────────────────
+// ─── TRB ─────────────────────────────────────────────────────────────────────
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -210,7 +202,7 @@ impl Trb {
         ((self.dw2 >> 24) & 0xFF) as u8
     }
 
-    /// Residual transfer length reported by a transfer event.
+    /// Остаточная длина передачи из transfer event.
     fn residual(&self) -> u32 {
         self.dw2 & 0x00FF_FFFF
     }
@@ -224,7 +216,7 @@ impl Trb {
     }
 }
 
-// TRB types (xHCI 1.2 table 6-91).
+// Типы TRB (xHCI 1.2, таблица 6-91).
 const TRB_NORMAL: u8 = 1;
 const TRB_SETUP: u8 = 2;
 const TRB_DATA: u8 = 3;
@@ -235,43 +227,43 @@ const TRB_DISABLE_SLOT: u8 = 10;
 const TRB_ADDRESS_DEVICE: u8 = 11;
 const TRB_CONFIGURE_ENDPOINT: u8 = 12;
 const TRB_EVALUATE_CONTEXT: u8 = 13;
-/// Reset Endpoint (xHCI 1.2 table 6-91): recovers a halted endpoint so its
-/// transfer ring can be re-armed after a babble/stall instead of disabling input
-/// until reboot.
+/// Reset Endpoint (xHCI 1.2, таблица 6-91): возвращает остановленный эндпоинт в
+/// работу, чтобы после babble/stall переармировать кольцо, а не отключать ввод до
+/// перезагрузки.
 const TRB_RESET_ENDPOINT: u8 = 14;
 const TRB_TRANSFER_EVENT: u8 = 32;
 const TRB_COMMAND_COMPLETION: u8 = 33;
 const TRB_PORT_STATUS_CHANGE: u8 = 34;
 
-// Completion codes (table 6-93).
+// Коды завершения (таблица 6-93).
 const CC_SUCCESS: u8 = 1;
 const CC_SHORT_PACKET: u8 = 13;
 
 const TRB_CYCLE: u32 = 1 << 0;
-/// Link TRB Toggle Cycle: the controller toggles its consumer cycle bit when it
-/// follows a Link TRB back to the start of the ring.
+/// Link TRB Toggle Cycle: контроллер переключает свой consumer cycle bit, когда
+/// следует по Link TRB в начало кольца.
 const TRB_TOGGLE: u32 = 1 << 1;
 const TRB_IOC: u32 = 1 << 5;
 const TRB_IDT: u32 = 1 << 6;
 const TRB_DIR_IN: u32 = 1 << 16;
-/// Transfer Type field of a Setup TRB: 0 = no data, 2 = IN, 3 = OUT.
+/// Поле Transfer Type в Setup TRB: 0 — без данных, 2 — IN, 3 — OUT.
 const TRT_NO_DATA: u32 = 0 << 16;
 const TRT_IN: u32 = 2 << 16;
 const TRT_OUT: u32 = 3 << 16;
 
-/// Ring capacity in TRBs (one page holds 256, so 64 leaves room for the link).
+/// Ёмкость кольца в TRB (в страницу помещается 256, поэтому 64 оставляет место для link).
 const RING_TRBS: usize = 64;
 const EVENT_TRBS: usize = 256;
 
-/// A ring of TRBs walked by the controller.
+/// Кольцо TRB, по которому ходит контроллер.
 struct Ring {
     frame: DmaFrame,
     enqueue: usize,
     dequeue: usize,
     cycle: u32,
-    /// Interrupt-IN only: a normal TRB is outstanding until its transfer event
-    /// arrives. Re-arming without waiting would queue a second read into the
-    /// same buffer and the reports would race each other.
+    /// Только interrupt-IN: Normal TRB считается незавершённым, пока не пришло
+    /// transfer event. Переармирование без ожидания поставило бы второе чтение в тот
+    /// же буфер, и отчёты гоняли бы друг друга.
     outstanding: bool,
 }
 
@@ -291,14 +283,14 @@ impl Ring {
     }
 
     fn write(&self, index: usize, trb: Trb) {
-        // SAFETY: `index < RING_TRBS` and one page holds 256 TRBs, so the write
-        // stays inside our own DMA frame; volatile because the controller reads
-        // these bytes without the CPU's knowledge.
+        // SAFETY: `index < RING_TRBS`, а в страницу помещается 256 TRB, поэтому запись
+        // остаётся внутри нашего DMA-кадра; volatile, потому что контроллер читает эти
+        // байты без участия CPU.
         unsafe { write_volatile(self.ptr(index), trb) }
     }
 
     fn read(&self, index: usize) -> Trb {
-        // SAFETY: as in `write`.
+        // SAFETY: как в `write`.
         unsafe { read_volatile(self.ptr(index)) }
     }
 
@@ -306,25 +298,21 @@ impl Ring {
         self.frame.phys()
     }
 
-    /// Append one TRB with the producer's cycle bit and advance the enqueue
-    /// pointer, installing the wrap-around Link TRB at the end of the ring.
+    /// Добавить один TRB с cycle bit производителя и сдвинуть enqueue, установив в
+    /// конце кольца замыкающий Link TRB.
     fn push(&mut self, dw0: u32, dw1: u32, dw2: u32, dw3: u32) {
         let index = self.enqueue;
         self.write(index, Trb::new(dw0, dw1, dw2, dw3 | self.cycle));
         self.enqueue += 1;
         if self.enqueue >= RING_TRBS - 1 {
-            // WRAP-AROUND. The Link TRB belongs to the *current* producer cycle
-            // (that is how the controller recognises it as ready); `TRB_TOGGLE`
-            // tells the controller to flip its consumer cycle bit when it follows
-            // the link, and only then does the producer flip its own bit for the
-            // TRBs written at the start of the ring.
+            // ЗАМЫКАНИЕ КОЛЬЦА. Link TRB принадлежит текущему циклу производителя — так
+            // контроллер распознаёт его готовым. `TRB_TOGGLE` велит контроллеру переключить
+            // consumer cycle bit при переходе по ссылке, и только после этого производитель
+            // переключает свой бит для TRB в начале кольца.
             //
-            // Writing `next_cycle` into the Link TRB itself (the old code) made
-            // the controller skip it — the ring is scanned for the current cycle
-            // bit — so after RING_TRBS-1 transfers the endpoint simply stopped:
-            // a HID device that works for a minute (or a few dozen keystrokes)
-            // and then goes silent. `TRB_IOC` is not a Link-TRB field; the toggle
-            // bit is what the wrap needs.
+            // Без `TRB_TOGGLE` (или с cycle bit следующего цикла) контроллер пропускает
+            // ссылку, и после RING_TRBS-1 передач эндпоинт замолкает. `TRB_IOC` не является
+            // полем Link TRB; для замыкания нужен toggle-бит.
             let next_cycle = if self.cycle == TRB_CYCLE {
                 0
             } else {
@@ -344,9 +332,8 @@ impl Ring {
         }
     }
 
-    /// Event-ring side: has the controller published an event the CPU has not
-    /// consumed? The cycle bit is what distinguishes a fresh TRB from the stale
-    /// contents of the ring.
+    /// Сторона кольца событий: опубликовал ли контроллер событие, которое CPU ещё не
+    /// забрал? Свежий TRB от устаревшего содержимого кольца отличает cycle bit.
     fn event_pending(&self) -> bool {
         let trb = self.read(self.dequeue);
         (trb.dw3 & TRB_CYCLE) == self.cycle && trb.trb_type() != 0
@@ -367,7 +354,7 @@ impl Ring {
     }
 }
 
-// ─── Registers ───────────────────────────────────────────────────────────────
+// ─── Регистры ────────────────────────────────────────────────────────────────
 
 const CAP_CAPLENGTH: usize = 0x00;
 const CAP_HCSPARAMS1: usize = 0x04;
@@ -383,25 +370,23 @@ const OP_DCBAAP: usize = 0x30;
 const OP_CONFIG: usize = 0x38;
 const OP_PORTS: usize = 0x400;
 
-/// Bytes between neighbouring port register sets.
+/// Байт между соседними наборами регистров порта.
 ///
-/// Each port has four 32-bit registers (PORTSC, PORTPMSC, PORTLI, PORTHLPMC), so
-/// the stride is 16 — this used to be 4, which made ports 2..=8 read and write
-/// their neighbours' registers (the "5th port" was really the 2nd port's PORTSC).
-/// The consequence was that a device on a USB2 port was never seen: QEMU puts its
-/// emulated keyboard on port 5 of 8, so the whole enumeration path never ran.
+/// У порта четыре 32-битных регистра (PORTSC, PORTPMSC, PORTLI, PORTHLPMC),
+/// поэтому шаг — 16. При шаге 4 порты 2..=8 читали и писали соседние регистры, и
+/// USB2-устройство не обнаруживалось.
 const OP_PORT_STRIDE: usize = 0x10;
 
-/// PORTSC register offset for a 1-based port number.
+/// Смещение PORTSC для номера порта с единицы.
 ///
-/// The arithmetic is pinned by a const assertion below, because this is exactly the
-/// kind of constant that is invisible until hardware shows up.
+/// Арифметика закреплена const-assert'ом ниже: такая константа незаметна, пока не
+/// появится железо.
 const fn portsc(port: u8) -> usize {
     OP_PORTS + (port as usize - 1) * OP_PORT_STRIDE
 }
 
-// Port 1 is at 0x400 and each port takes 16 bytes: port 5 (the first USB2 port on
-// a 4+4 controller) is at 0x440.
+// Порт 1 — 0x400, каждый порт занимает 16 байт: порт 5 (первый USB2 на
+// контроллере 4+4) — 0x440.
 const _: () = assert!(portsc(1) == 0x400);
 const _: () = assert!(portsc(5) == 0x440);
 
@@ -412,7 +397,7 @@ const USBSTS_HSE: u32 = 1 << 1;
 const USBSTS_HCE: u32 = 1 << 11;
 const USBSTS_CNR: u32 = 1 << 12;
 
-/// Port Link State values this driver acts on (xHCI 1.2 table 5-27).
+/// Значения Port Link State, с которыми работает драйвер (xHCI 1.2, таблица 5-27).
 const PLS_U0: u32 = 0;
 
 const PORTSC_CCS: u32 = 1 << 0;
@@ -421,8 +406,8 @@ const PORTSC_PR: u32 = 1 << 4;
 const PORTSC_PLS_MASK: u32 = 0xF << 5;
 const PORTSC_PLS_SHIFT: u32 = 5;
 const PORTSC_PP: u32 = 1 << 9;
-/// Port Link State is writable only in the same write that sets this bit; a
-/// write of the field alone is ignored by the controller.
+/// Port Link State записывается только вместе с этим битом; одна запись поля
+/// игнорируется контроллером.
 const PORTSC_LWS: u32 = 1 << 16;
 const PORTSC_SPEED_MASK: u32 = 0xF << 10;
 const PORTSC_SPEED_SHIFT: u32 = 10;
@@ -430,12 +415,11 @@ const PORTSC_CSC: u32 = 1 << 17;
 const PORTSC_WRC: u32 = 1 << 19;
 const PORTSC_PRC: u32 = 1 << 21;
 const PORTSC_WPR: u32 = 1 << 31;
-// Every PORTSC write goes through `xhci_port::port_state_to_neutral()` (Linux
-// `xhci_port_state_to_neutral`): writing a read value back verbatim carries the
-// write-1-to-clear `PED` bit, and writing PED=1 DISABLES the port — which is
-// exactly how the first 2.22.7 port fix lost the enable it had just waited for.
-// PR (bit 4), WPR (31), LWS (16) and the change bits (17-23) are likewise only
-// ever written as 0 unless the action is the point of the write.
+// Каждая запись PORTSC идёт через `xhci_hub::port_state_to_neutral()`
+// (`xhci_hub_state_to_neutral` из `xhci-hub.c`): запись прочитанного значения
+// возвращает write-1-to-clear бит `PED`, а PED=1 отключает порт. PR (бит 4),
+// WPR (31), LWS (16) и change-биты (17-23) тоже пишутся нулём, если действие не
+// является целью записи.
 
 const RTS_IR0: usize = 0x20;
 const IR_ERSTSZ: usize = 0x08;
@@ -450,7 +434,7 @@ struct ErstEntry {
     _reserved: u32,
 }
 
-// Context field positions (xHCI 1.2 §6.2.2).
+// Позиции полей контекста (xHCI 1.2 §6.2.2).
 const SLOT_CTX_ENTRIES_SHIFT: u32 = 27;
 const SLOT_CTX_SPEED_SHIFT: u32 = 20;
 const SLOT_CTX_PORT_SHIFT: u32 = 16;
@@ -461,45 +445,45 @@ const EP_CTX_INTERVAL_SHIFT: u32 = 16;
 const EP_TYPE_CONTROL: u32 = 4;
 const EP_TYPE_INTERRUPT_IN: u32 = 7;
 
-/// Speed ids from PORTSC (table 5-27).
+/// Speed id из PORTSC (таблица 5-27).
 const SPEED_LOW: u8 = 2;
 const SPEED_FULL: u8 = 1;
 const SPEED_HIGH: u8 = 3;
 const SPEED_SUPER: u8 = 4;
 
-// ─── Slots ───────────────────────────────────────────────────────────────────
+// ─── Слоты ───────────────────────────────────────────────────────────────────
 
-/// One HID interrupt-IN endpoint: its ring, its report buffer, its DCI and what
-/// SET_PROTOCOL left the interface in.
+/// Один HID interrupt-IN эндпоинт: кольцо, буфер отчёта, DCI и режим, который
+/// оставил SET_PROTOCOL.
 struct HidEndpoint {
-    /// Interface number, for the diagnostic lines.
+    /// Номер интерфейса — для диагностических строк.
     iface: u8,
-    /// `bInterfaceSubClass` (1 = boot) and `bInterfaceProtocol` (1 keyboard,
-    /// 2 mouse): what the report parser needs to know.
+    /// `bInterfaceSubClass` (1 = boot) и `bInterfaceProtocol` (1 — клавиатура,
+    /// 2 — мышь): это нужно разборщику отчётов.
     subclass: u8,
     protocol: u8,
-    /// Boot or report protocol as SET_PROTOCOL's result left it.
+    /// Boot или report protocol — как решил SET_PROTOCOL.
     mode: ReportMode,
-    /// Device endpoint context index (2 * endpoint number + direction).
+    /// Индекс эндпоинта в device context (2 * номер эндпоинта + направление).
     dci: u8,
     ring: Ring,
     buf: DmaFrame,
-    /// Transfer buffer size: at least the endpoint's wMaxPacketSize, so a report
-    /// longer than the old hard-coded 4 bytes cannot babble the endpoint.
+    /// Размер буфера передачи: не меньше `wMaxPacketSize` эндпоинта, иначе отчёт
+    /// длиннее 4 байт вызовет babble.
     len: usize,
-    /// Reset Endpoint attempts made since configuration (bounded by
-    /// `usb_hid_proto::MAX_RECOVERIES`).
+    /// Попытки Reset Endpoint после конфигурации (не больше
+    /// `usb_hid_report::MAX_RECOVERIES`).
     recoveries: u8,
-    /// Reports shorter than the layout's minimum, counted in diagnostics.
+    /// Отчёты короче минимального размера раскладки — для счётчика диагностики.
     bad_reports: u64,
-    /// Whether the wrong-size report was already logged (one line, not one per
-    /// poll: a broken device must not flood the serial log).
+    /// Признак, что отчёт неверного размера уже залогирован: одна строка, а не на
+    /// каждый опрос, чтобы сломанное устройство не заливало serial.
     bad_report_logged: bool,
-    /// Set once the recovery budget is spent; the endpoint is no longer polled.
+    /// Выставляется, когда бюджет восстановлений исчерпан; эндпоинт больше не опрашивается.
     disabled: bool,
 }
 
-/// One addressed device.
+/// Одно адресованное устройство.
 struct Slot {
     id: u8,
     port: u8,
@@ -507,61 +491,54 @@ struct Slot {
     ep0: Ring,
     input_ctx: DmaFrame,
     device_ctx: DmaFrame,
-    /// Data buffer for control transfers (one at a time, single-threaded poll).
+    /// Буфер данных для control-передач (по одной за раз, опрос однопоточный).
     ctrl_buf: DmaFrame,
-    /// Every bound HID interrupt-IN endpoint of this device. A combo device can
-    /// have several (keyboard + consumer/system collections); the old driver kept
-    /// only the first.
+    /// Все привязанные HID interrupt-IN эндпоинты устройства. У композитного
+    /// устройства их несколько (клавиатура + consumer/system-коллекции).
     hid: Vec<HidEndpoint>,
 }
 
-/// What the driver got out of one port. The boot menu prints this: on a machine
-/// with a dead keyboard and no serial port it is the entire bug report.
+/// Что драйвер узнал о порте. Boot-меню печатает это: на машине с мёртвой
+/// клавиатурой и без serial здесь весь отчёт о проблеме.
 ///
-/// The timing decisions live in [`PortPolicy`] (host-tested, see
-/// `src/drivers/xhci_port.rs`); this struct is the display copy plus the per-port
-/// link snapshot the policy cannot print by itself.
+/// Решения по таймингам живут в [`PortPolicy`] (host-тесты, см.
+/// `src/drivers/xhci_hub.rs`); эта структура — копия для вывода плюс снимок
+/// link-состояния порта, который политика сама напечатать не может.
 #[derive(Clone, Copy)]
 struct PortDiag {
-    /// Last stage the port reached (`""` before the first attempt).
+    /// Последняя достигнутая стадия порта (`""` до первой попытки).
     stage: &'static str,
-    /// Completion code (or PORTSC value) that ended it.
+    /// Код завершения (или значение PORTSC), которым она закончилась.
     code: u32,
-    /// Speed reported at the last successful adoption/reset.
+    /// Скорость, полученная при последнем успешном adopt/reset.
     speed: u8,
-    /// Reset attempts so far (`try=`; the policy retries forever with backoff).
+    /// Reset-попыток всего (`try=`; политика повторяет с backoff бесконечно).
     attempts: u8,
-    /// PORTSC just before the last reset and just after it. These two values are
-    /// the difference between "the port never enabled" and "the device did not
-    /// answer after it was enabled".
+    /// PORTSC непосредственно перед последним reset и сразу после него. Эти два
+    /// значения отделяют «порт не включился» от «устройство не ответило после
+    /// включения».
     pre: u32,
     post: u32,
-    /// Whether PRC / PED were observed during the last reset wait. `seen_prc`
-    /// false means the controller never even acknowledged the reset request.
+    /// Наблюдались ли PRC / PED за последнее ожидание reset. `seen_prc` = false
+    /// означает, что контроллер даже не подтвердил запрос сброса.
     seen_prc: bool,
     seen_ped: bool,
-    /// PED was seen together with PLS=U0 and a valid speed. `ped_sc` alone does
-    /// not say that: a reset-in-progress glimpse has PLS=Polling (or no speed),
-    /// so this bit distinguishes a U0 sample from a transient PED read.
+    /// PED виден вместе с PLS=U0 и валидной скоростью. Один `ped_sc` этого не
+    /// говорит: при reset-е PLS=Polling (или скорости нет), поэтому бит отличает
+    /// U0-сэмпл от кратковременного PED.
     seen_ped_u0: bool,
-    /// USB protocol generation of this port: 2, 3, or 0 when the controller did not
-    /// describe it (the Supported Protocol capabilities say which port ranges are
-    /// USB2 and which are USB3 — a keyboard is USB2 even when the port looks like a
-    /// USB3 one).
+    /// Поколение USB порта: 2, 3 или 0, если контроллер его не описал (Supported
+    /// Protocol capabilities задают диапазоны USB2 и USB3; клавиатура — USB2, даже
+    /// если порт выглядит как USB3).
     proto: u8,
-    /// PORTSC at the LAST PED+U0 sighting; while the port never reached U0, the
-    /// LAST transient PED sighting. Per-port by construction: each `PortDiag`
-    /// owns its `PortPolicy`, there is no shared value and no shared index.
+    /// PORTSC на последнем PED+U0; если порт так и не дошёл до U0 — на последнем
+    /// кратковременном PED. По построению на порт: у каждого `PortDiag` своя
+    /// `PortPolicy`, общих значений и индексов нет.
     ped_sc: u32,
-    /// Wall-clock duration of the last attempt in milliseconds. Zero when the
-    /// clock is unavailable. This is what separates "the port needs more time"
-    /// from "the controller refuses" in a photo.
+    /// Длительность последней попытки в миллисекундах. Ноль, если часов нет.
     ms: u16,
-    /// Next time the per-port "observe" line is due while debouncing (µs).
-    /// The attached-port trace the field photo needs runs every ~200 ms.
-    next_log_us: u64,
-    /// The host-tested state machine: phase, deadlines, Linux debounce/reset
-    /// sequencing, backoff, and the per-attempt PRC/CSC/PED snapshots.
+    /// Состояние-машина, проверенная host-тестами: фаза, дедлайны, последовательность
+    /// debounce/reset по `hub.c`, backoff и снимки PRC/CSC/PED на попытку.
     policy: PortPolicy,
 }
 
@@ -570,109 +547,106 @@ struct Controller {
     db: usize,
     rt: usize,
     ctx_size: usize,
-    /// xHCI controllers found on the PCI bus (this one is the chosen one).
+    /// Найденные на PCI xHCI-контроллеры (этот — выбранный).
     controllers: usize,
     ports: u8,
     cmdr: Ring,
     event: Ring,
     erst: DmaFrame,
-    /// Device Context Base Address Array. The controller writes a device-context
-    /// pointer into this frame on Enable Slot and fetches it again for every later
-    /// command on that slot, so the frame belongs to the controller, not to this
-    /// function's stack: `dcbaa` used to be a local whose page was returned to the
-    /// PMM as soon as `start_controller` returned. Under QEMU the page is rarely
-    /// reused and the driver "works"; on hardware the first allocation to reuse it
-    /// makes the controller fetch a garbage device context — a Host Controller
-    /// Error, which halts the controller mid-boot and freezes every port with it.
+    /// Массив базовых адресов device context (DCBAA). Контроллер записывает в этот
+    /// кадр указатель device context при Enable Slot и читает его в каждой следующей
+    /// команде слота, поэтому кадр принадлежит контроллеру, а не стеку функции:
+    /// локальная страница вернулась бы в PMM сразу после `start_controller`. На
+    /// реальном железе первая же аллокация, переиспользовавшая страницу, даёт
+    /// контроллеру мусорный device context — Host Controller Error и halt посреди
+    /// загрузки, замораживающий все порты.
     dcbaa: DmaFrame,
-    /// Device context array base address (DCBAAP), kept for the release path.
+    /// Базовый адрес массива device context (DCBAAP); хранится для release-пути.
     dcbaa_phys: u64,
-    /// Scratchpad buffer array (pointed at by DCBAA[0]) and the pages it points
-    /// to. Both must outlive the controller for the same reason as `dcbaa`.
+    /// Массив scratchpad-буферов (на него указывает DCBAA[0]) и его страницы. Оба
+    /// должны жить дольше контроллера по той же причине, что и `dcbaa`.
     #[allow(dead_code)] // kept alive: DMA state the controller reads
     scratchpad_array: Option<DmaFrame>,
     #[allow(dead_code)] // kept alive: DMA state the controller reads
     scratchpad_pages: Vec<DmaFrame>,
     slots: Vec<Slot>,
-    /// Reports delivered to `usb_hid` so far.
+    /// Отчётов, переданных в `usb_hid`, на текущий момент.
     reports: u64,
-    /// Devices enumerated so far (for logging).
+    /// Устройств перечислено на текущий момент.
     devices: u64,
-    /// Ports that have been powered and reset this boot. A port is brought up
-    /// exactly once: connect status is reported from then on.
+    /// Порты, поднятые и сброшенные за загрузку. Порт поднимается ровно один раз:
+    /// дальше о нём сообщает только состояние подключения.
     brought_up: Vec<u8>,
-    /// One-shot diagnostic: the port map after every port has been brought up.
-    logged_ports: bool,
-    /// Per-port enumeration state for the on-screen diagnostic.
+    /// Состояние перечисления каждого порта для экранной диагностики.
     diag: Vec<PortDiag>,
-    /// The last thing that went wrong anywhere, for the one-line status.
+    /// Последняя ошибка, для однострочного статуса.
     last_fail: Option<(u8, &'static str, u32)>,
-    /// Attached-port mask as the scan saw it BEFORE the controller reset. Ports
-    /// present then and absent now are the ones the reset cost us.
+    /// Маска подключённых портов до сброса контроллера. Порты, которые были тогда и
+    /// отсутствуют сейчас, потерял сброс.
     probe_mask: u32,
-    /// Round-robin cursor: at most ONE port is (re)initialised per poll so that a
-    /// slow reset attempt cannot stall the boot menu's countdown.
+    /// Курсор циклического обхода: за один poll инициализируется не больше одного
+    /// порта, чтобы медленный reset не останавливал отсчёт boot-меню.
     next_port: u8,
-    /// Monotonic fallback clock (1 ms per poll) for the port policy when the TSC
-    /// calibration failed. The policy's deadlines are microseconds; without a
-    /// real clock the poll count is the best available time base and is far
-    /// better than treating every deadline as already expired.
+    /// Монотонные микросекунды для политики порта, когда калибровка TSC не удалась
+    /// (1 мс на poll). Дедлайны политики в микросекундах; без реальных часов счётчик
+    /// опросов — лучшая доступная база времени, и он намного лучше, чем считать все
+    /// дедлайны уже истёкшими.
     fallback_us: u64,
-    /// Per-port USB protocol (2 or 3) derived from the Supported Protocol
-    /// capabilities, for the on-screen diagnostic. Mirrored into `PortDiag.proto`
-    /// (which is what the screens print); kept here for the shell `usb` command.
+    /// USB-поколение порта (2 или 3) из Supported Protocol capabilities — для
+    /// экранной диагностики. Дублируется в `PortDiag.proto` (это печатают экраны) и
+    /// хранится здесь для shell-команды `usb`.
     #[allow(dead_code)]
     protos: Vec<u8>,
-    /// Port masks ([usb2, usb3]) as the Supported Protocol capabilities described
-    /// them. Masks, not (first, count): the field machine's controller reports two
-    /// entries whose ranges overlap, and a mask shows that honestly instead of
-    /// hiding it behind a pretty range.
+    /// Маски портов ([usb2, usb3]) из Supported Protocol capabilities. Именно маски,
+    /// а не (first, count): контроллер может сообщить два диапазона с перекрытием, и
+    /// маска показывает это честно, не пряча за красивым диапазоном.
     proto_masks: [u32; 2],
-    /// Raw extended-capability entries, for the screen dump.
+    /// Сырые записи extended capabilities — для дампа на экран.
     xcaps: Vec<XCap>,
-    /// CAPLENGTH as read at init (the dump shows whether the operational base is
-    /// where the driver thinks it is).
+    /// CAPLENGTH, прочитанный при инициализации (дамп показывает, там ли
+    /// operational base, где думает драйвер).
     caplength: u32,
     hciversion: u32,
     hcsparams1: u32,
     hccparams1: u32,
-    /// What the BIOS/USB-legacy handoff found: `handoff`, `bios-owned`,
-    /// `absent`, or `bad-xecp`.
+    /// Результат BIOS/USB-legacy handoff: `handoff`, `bios-owned`, `absent` или
+    /// `bad-xecp`.
     legacy: &'static str,
-    /// A harmless register was written and read back at init: this separates "our
-    /// writes are ignored" from "the controller ignores this particular write".
+    /// Безвредный регистр записан и прочитан при инициализации: это отделяет «наши
+    /// записи игнорируются» от «контроллер игнорирует именно эту запись».
     writes_ok: bool,
-    /// PCI command register at init (bit 1 = memory space, bit 2 = bus mastering).
+    /// PCI command register при инициализации (бит 1 — memory space, бит 2 — bus
+    /// mastering).
     pci_cmd: u32,
-    /// Times the controller was found halted (USBSTS.HCH), and the values that
-    /// proved it. A halted controller ignores every port write, which looks
-    /// exactly like "the ports never enable": this counter is the difference.
+    /// Сколько раз контроллер найден остановленным (USBSTS.HCH) и значения, это
+    /// доказавшие. Остановленный контроллер игнорирует все записи портов, что
+    /// выглядит как «порты не включаются»; этот счётчик — разница.
     halts: u32,
     halt_cmd: u32,
     halt_sts: u32,
-    /// Transfer events that arrived while a command (Reset Endpoint,
-    /// Configure Endpoint, …) was waiting for its completion. `command()` cannot
-    /// drop them: the owning endpoint would stay "outstanding" forever and never
-    /// be re-armed. The poll loop drains this queue before the event ring.
+    /// Transfer events, пришедшие, пока команда (Reset Endpoint, Configure Endpoint,
+    /// …) ждала своего завершения. `command()` не может их выбросить: эндпоинт
+    /// навсегда остался бы «outstanding» и никогда не переармировался. Цикл опроса
+    /// осушает очередь перед кольцом событий.
     deferred_events: Vec<Trb>,
-    /// Successful Reset Endpoint recoveries since boot, for diagnostics.
+    /// Успешных восстановлений Reset Endpoint за загрузку — для диагностики.
     hid_recoveries: u64,
-    /// Reports that were shorter than their layout's minimum, for diagnostics.
+    /// Отчёты короче минимального размера раскладки — для диагностики.
     hid_bad_reports: u64,
 }
 
-/// One extended-capability entry, as the walk saw it: offset in the BAR, id,
-/// next-capability dword offset, and the two dwords a Supported Protocol entry
-/// keeps its port range in. Printed on screen when the ranges look wrong, which
-/// is exactly what the field machine did.
+/// Одна запись extended capability, как её увидел обход: смещение в BAR, id,
+/// смещение следующей capability и два dword'а, в которых Supported Protocol
+/// хранит диапазон портов. Печатается на экране, когда диапазоны выглядят
+/// неверно.
 #[derive(Clone, Copy)]
 pub struct XCap {
     pub offset: u32,
     pub id: u8,
     pub next: u8,
-    /// Major revision from DW0 bits 31:24 (2 = USB2 protocol, 3 = USB3).
+    /// Major revision из DW0, биты 31:24 (2 — USB2 protocol, 3 — USB3).
     pub major: u8,
-    /// Minor revision from DW0 bits 23:16.
+    /// Minor revision из DW0, биты 23:16.
     pub minor: u8,
     pub dw1: u32,
     pub dw2: u32,
@@ -680,14 +654,13 @@ pub struct XCap {
 
 static CONTROLLER: Spinlock<Option<Controller>> = Spinlock::new(None);
 
-/// How many xHCI controllers PCI enumeration saw, kept even when none started:
-/// the screen-only diagnostic needs to tell "no controller" from "controller but
-/// no device".
+/// Сколько xHCI-контроллеров увидело PCI-перечисление; хранится, даже если ни
+/// один не запустился: экранной диагностике нужно отличать «нет контроллера» от
+/// «контроллер есть, но устройств нет».
 static CONTROLLERS_SEEN: AtomicUsize = AtomicUsize::new(0);
 
-/// One PCI xHCI controller as the scan saw it, for the on-screen diagnostic. On a
-/// board with two controllers this is how the operator (and the developer reading
-/// a photo) sees which one has the keyboard.
+/// Один PCI xHCI-контроллер, как его увидел scan, для экранной диагностики. На
+/// плате с двумя контроллерами оператор видит, на каком из них клавиатура.
 #[derive(Clone, Copy)]
 pub struct ControllerInfo {
     pub vendor: u16,
@@ -699,15 +672,14 @@ pub struct ControllerInfo {
 
 static CONTROLLER_SCAN: Spinlock<Vec<ControllerInfo>> = Spinlock::new(Vec::new());
 
-/// What the controller scan found, in PCI order.
+/// Что нашёл scan контроллеров, в порядке PCI.
 pub fn scan() -> Vec<ControllerInfo> {
     CONTROLLER_SCAN.lock().clone()
 }
 
-/// Raw register dump for the on-screen diagnostic: (`caplength`, `usbcmd`,
-/// `usbsts`, `config`, `write-ok`, first four dwords of the selected port's
-/// register set). This exists because "the port does not reset" has no other
-/// explanation channel on a machine without serial.
+/// Сырой дамп регистров для экранной диагностики: (`caplength`, `usbcmd`,
+/// `usbsts`, `config`, `write-ok`, первые четыре dword'а набора регистров
+/// выбранного порта).
 pub struct RawDump {
     pub caplength: u32,
     pub hciversion: u32,
@@ -720,16 +692,16 @@ pub struct RawDump {
     pub legacy: &'static str,
     pub port: u8,
     pub port_regs: [u32; 4],
-    /// PCI command register (bit 2 = bus mastering; without it the controller's
-    /// ring DMA is aborted and it halts).
+    /// PCI command register (бит 2 — bus mastering; без него DMA-кольца контроллера
+    /// обрываются и он останавливается).
     pub pci_cmd: u32,
-    /// Halts seen since boot, and the register values at the first one.
+    /// Halts с момента загрузки и значения регистров при первом.
     pub halts: u32,
     pub halt_cmd: u32,
     pub halt_sts: u32,
 }
 
-/// Per-port protocol masks `[usb2, usb3]` (bit N = port N+1), for the diagnostic.
+/// Маски протоколов портов `[usb2, usb3]` (бит N = порт N+1) для диагностики.
 pub fn proto_masks() -> [u32; 2] {
     CONTROLLER
         .lock()
@@ -738,7 +710,7 @@ pub fn proto_masks() -> [u32; 2] {
         .unwrap_or([0, 0])
 }
 
-/// Raw extended-capability walk, for the diagnostic.
+/// Сырой обход extended capabilities для диагностики.
 pub fn xcaps() -> Vec<XCap> {
     CONTROLLER
         .lock()
@@ -775,43 +747,42 @@ pub fn raw_dump() -> Option<RawDump> {
     })
 }
 
-/// What the USB driver can say about itself, for the boot menu, the shell banner
-/// and the `usb` command. On a machine with no serial port this struct IS the
-/// field report.
+/// Что USB-драйвер может сказать о себе — для boot-меню, баннера shell и команды
+/// `usb`. На машине без serial эта структура и есть отчёт.
 pub struct Summary {
-    /// xHCI controllers found on the PCI bus.
+    /// xHCI-контроллеров найдено на PCI.
     pub controllers: usize,
-    /// Ports on the controller this driver runs (0 when none started).
+    /// Портов у контроллера, на котором работает драйвер (0, если ни один не запустился).
     pub ports: u8,
-    /// Bit N set = port N+1 reports a connected device right now.
+    /// Бит N = порт N+1 сообщает подключённое устройство прямо сейчас.
     pub ccs_mask: u32,
-    /// Devices that made it all the way to a configured HID interface.
+    /// Устройств, дошедших до сконфигурированного HID-интерфейса.
     pub devices: u64,
-    /// HID reports handed to the input translator.
+    /// HID-отчётов, переданных транслятору ввода.
     pub reports: u64,
-    /// Attached-port mask before the controller reset (what firmware left) versus
-    /// `ccs_mask` (what the driver sees now).
+    /// Маска подключённых портов до сброса контроллера (что оставила прошивка)
+    /// против `ccs_mask` (что видит драйвер сейчас).
     pub probe_mask: u32,
-    /// Last enumeration failure: port, stage, code. `None` when everything that
-    /// was attempted worked.
+    /// Последняя ошибка перечисления: порт, стадия, код. `None`, если всё, что
+    /// пробовалось, сработало.
     pub last_fail: Option<(u8, &'static str, u32)>,
-    /// HID endpoints reset after a transfer error (babble/stall/…) instead of
-    /// being disabled until reboot.
+    /// HID-эндпоинты, восстановленные после ошибки передачи (babble/stall/…), а не
+    /// отключённые до перезагрузки.
     pub hid_recoveries: u64,
-    /// Reports shorter than their layout's minimum (counted, logged once per
-    /// endpoint).
+    /// Отчёты короче минимальной раскладки (считаются, логируются один раз на
+    /// эндпоинт).
     pub hid_bad_reports: u64,
 }
 
 impl Summary {
-    /// True when some port reports a connected device — the first thing to look
-    /// at when a keyboard does not type.
+    /// Истина, когда хоть один порт сообщает подключённое устройство — первое, что
+    /// проверяют, если клавиатура не печатает.
     pub fn any_attached(&self) -> bool {
         self.ccs_mask != 0
     }
 }
 
-/// Snapshot of the driver's state, cheap enough to call from a redraw loop.
+/// Снимок состояния драйвера, достаточно дешёвый для цикла перерисовки.
 pub fn summary() -> Summary {
     let guard = CONTROLLER.lock();
     match guard.as_ref() {
@@ -848,14 +819,13 @@ pub fn summary() -> Summary {
     }
 }
 
-/// Monotonic microseconds for the port policy.
+/// Монотонные микросекунды для политики порта.
 ///
-/// The policy's deadlines are real time (USB2 debounce/training/reset are tens to
-/// hundreds of milliseconds by specification). `rdtsc` is calibrated at boot;
-/// when calibration failed, `fallback_us` advances one millisecond per poll — a
-/// poll thread sleeps one tick and the boot-menu loop is not slower than that,
-/// so the fallback is a conservative time base rather than "all deadlines have
-/// already expired" (which would restore the old reset-every-poll behaviour).
+/// Дедлайны политики — реальное время (USB2 debounce/training/reset — десятки и
+/// сотни миллисекунд по спецификации). `rdtsc` калибруется при загрузке; если
+/// калибровка не удалась, `fallback_us` растёт на 1 мс за poll — поток опроса
+/// спит один тик, а цикл boot-меню не медленнее, так что запасная база времени
+/// консервативна.
 fn fsm_now(ctrl: &mut Controller) -> u64 {
     if clock_ready() {
         now_us()
@@ -865,14 +835,13 @@ fn fsm_now(ctrl: &mut Controller) -> u64 {
     }
 }
 
-/// Copy the policy's per-attempt link snapshot into the display row.
+/// Скопировать снимок link-состояния попытки из политики в строку для вывода.
 ///
-/// Every field comes from `diag[port-1].policy`: the values are per port by
-/// construction. The field report's identical `ped_sc` on every USB2 port was
-/// not a shared/index bug — it is the same reset-time transient (CCS+PED+PP+
-/// speed=high+PRC) the controller reports on each port — so `seen_ped_u0` is
-/// printed next to it to say whether the snapshot was a PED+U0 sample or only a
-/// PED read during reset/Polling.
+/// Все значения берутся из `diag[port-1].policy`, то есть по построению на порт.
+/// Одинаковый `ped_sc` на всех USB2-портах — не общая переменная, а один и тот
+/// же переходный момент reset (CCS+PED+PP+speed=high+PRC), поэтому рядом
+/// печатается `seen_ped_u0`, показывающий, был ли снимок U0-сэмплом или только
+/// PED во время reset/Polling.
 fn sync_diag(ctrl: &mut Controller, port: u8) {
     let Some(d) = ctrl.diag.get_mut(port as usize - 1) else {
         return;
@@ -887,7 +856,7 @@ fn sync_diag(ctrl: &mut Controller, port: u8) {
     d.attempts = p.resets().min(u8::MAX as u16) as u8;
 }
 
-/// Record how long the last attempt took, in milliseconds (0 without a clock).
+/// Записать длительность последней попытки в миллисекундах (0 без часов).
 fn record_attempt_ms(ctrl: &mut Controller, port: u8) {
     if !clock_ready() {
         return;
@@ -906,8 +875,8 @@ fn record_attempt_ms(ctrl: &mut Controller, port: u8) {
     }
 }
 
-/// Stage string shown while the policy is waiting (the failure stages are set
-/// by [`port_failure`] and enumeration by `ctrl.fail`/`ctrl.stage`).
+/// Строка стадии, пока политика ждёт (стадии отказа выставляет [`port_failure`],
+/// перечисление — `ctrl.fail`/`ctrl.stage`).
 fn waiting_stage(phase: Phase) -> &'static str {
     match phase {
         Phase::Debounce => "debounce",
@@ -920,11 +889,12 @@ fn waiting_stage(phase: Phase) -> &'static str {
     }
 }
 
-/// Crude busy delay used only where a wrong-ordered reset costs a whole boot.
+/// Грубая занятая задержка только там, где неправильно упорядоченный reset стоит
+/// целой загрузки.
 ///
-/// No PIT here on purpose: the boot menu programs PIT channel 2 itself and calls
-/// into this driver while it counts, so a second user of that channel would break
-/// the countdown.
+/// PIT здесь намеренно не трогается: boot-меню само программирует канал 2 и
+/// вызывает драйвер во время отсчёта, второй пользователь канала сломал бы
+/// обратный отсчёт.
 fn spin_settle(iterations: u32) {
     let mut i = 0u32;
     while i < iterations {
@@ -934,7 +904,7 @@ fn spin_settle(iterations: u32) {
 }
 
 impl Controller {
-    /// Record what happened on a port for the on-screen diagnostic.
+    /// Записать, что произошло на порте, для экранной диагностики.
     fn stage(&mut self, port: u8, stage: &'static str, code: u32) {
         if port == 0 {
             return;
@@ -945,8 +915,8 @@ impl Controller {
         }
     }
 
-    /// Record a FAILURE stage (and remember it as the last failure, which is what
-    /// the one-line status shows when no HID device came up).
+    /// Записать стадию ОТКАЗА (и запомнить её как последнюю ошибку — её показывает
+    /// однострочный статус, когда HID-устройство не появилось).
     fn fail(&mut self, port: u8, stage: &'static str, code: u32) {
         self.stage(port, stage, code);
         self.last_fail = Some((port, stage, code));
@@ -956,14 +926,14 @@ impl Controller {
 // ─── MMIO ────────────────────────────────────────────────────────────────────
 
 fn rd32(base: usize, off: usize) -> u32 {
-    // SAFETY: `base + off` is inside the BAR0 window mapped by `map_bar0`
-    // (64 KiB covers capability + operational + runtime + doorbells), and the
-    // read is volatile so the register is re-read every time.
+    // SAFETY: `base + off` лежит внутри окна BAR0, отображённого `map_bar0`
+    // (64 КиБ покрывают capability + operational + runtime + doorbells), а чтение
+    // volatile, поэтому регистр перечитывается каждый раз.
     unsafe { read_volatile((base + off) as *const u32) }
 }
 
 fn wr32(base: usize, off: usize, v: u32) {
-    // SAFETY: as in `rd32`.
+    // SAFETY: как в `rd32`.
     unsafe { write_volatile((base + off) as *mut u32, v) }
 }
 
@@ -976,19 +946,17 @@ fn wr64(base: usize, off: usize, v: u64) {
     wr32(base, off + 4, (v >> 32) as u32);
 }
 
-// ─── Init ────────────────────────────────────────────────────────────────────
+// ─── Инициализация ───────────────────────────────────────────────────────────
 
-/// Find, choose and start an xHCI controller.
+/// Найти, выбрать и запустить xHCI-контроллер.
 ///
-/// A machine may expose MORE THAN ONE controller — desktop boards often pair the
-/// chipset xHCI with a discrete one for the front-panel ports — and the keyboard
-/// is on whichever one it was plugged into, so the driver probes every controller,
-/// counts the ports that already report a connected device, and starts the one
-/// with the most. Ties go to the first (stable PCI order).
+/// В машине может быть больше одного контроллера — чипсетный и отдельный на
+/// передние порты, — и клавиатура висит на том, куда её воткнули. Драйвер
+/// проверяет каждый контроллер, считает порты с подключённым устройством и
+/// запускает тот, где их больше; при равенстве — первый в стабильном порядке PCI.
 ///
-/// `false` means "no controller, or none could be started" — USB input is simply
-/// unavailable then, and PS/2 (plus any firmware translation) is all the machine
-/// has.
+/// `false` — «контроллера нет или ни один не запустился»: USB-ввод недоступен,
+/// остаются PS/2 и возможная трансляция прошивки.
 pub fn init(devices: &[PciDevice]) -> bool {
     let candidates: Vec<&PciDevice> = devices
         .iter()
@@ -999,13 +967,12 @@ pub fn init(devices: &[PciDevice]) -> bool {
         crate::warn!("xhci: no xHCI controller on the PCI bus");
         return false;
     }
-    // The clock first: every wait below is expressed in microseconds, and the PIT
-    // channel-2 window this calibration uses is free only until the boot menu
-    // takes that channel for its own countdown.
+    // Сначала часы: все ожидания ниже выражены в микросекундах, а окно PIT канала 2
+    // свободно только до того, как boot-меню заберёт канал для своего отсчёта.
     if !clock_ready() {
         calibrate_clock();
     }
-    crate::info!(
+    crate::debug!(
         "xhci: {} xHCI controller(s) on the PCI bus",
         candidates.len()
     );
@@ -1015,7 +982,7 @@ pub fn init(devices: &[PciDevice]) -> bool {
         match probe_controller(dev) {
             Some((ports, mask)) => {
                 let attached = mask.count_ones();
-                crate::info!(
+                crate::debug!(
                     "xhci: controller {}/{} {:04x}:{:04x} ports={} attached_mask={:#010x}",
                     index + 1,
                     candidates.len(),
@@ -1047,9 +1014,9 @@ pub fn init(devices: &[PciDevice]) -> bool {
         return false;
     };
     if candidates.len() > 1 {
-        crate::info!("xhci: using controller {}/{}", index + 1, candidates.len());
+        crate::debug!("xhci: using controller {}/{}", index + 1, candidates.len());
     }
-    // Remember which one was chosen for the on-screen scan list.
+    // Запомнить выбранный контроллер для экранного списка scan.
     let chosen_pair = (candidates[index].vendor_id, candidates[index].device_id);
     for info in scan_infos.iter_mut() {
         info.chosen = info.vendor == chosen_pair.0 && info.device == chosen_pair.1;
@@ -1058,7 +1025,7 @@ pub fn init(devices: &[PciDevice]) -> bool {
     start_controller(candidates[index], candidates.len())
 }
 
-/// Map BAR0 of a controller, or say why not.
+/// Отобразить BAR0 контроллера или сказать, почему нельзя.
 fn map_bar0(dev: &PciDevice) -> Option<(usize, u64)> {
     let lo = crate::drivers::pci::config_read_u32(dev.address, 0x10);
     let hi = crate::drivers::pci::config_read_u32(dev.address, 0x14);
@@ -1076,11 +1043,11 @@ fn map_bar0(dev: &PciDevice) -> Option<(usize, u64)> {
     }
 }
 
-/// Read the attached-device mask without disturbing the controller.
+/// Прочитать маску подключённых устройств, не тревожа контроллер.
 ///
-/// Runs before the BIOS handoff and the hardware reset, so on a real machine it
-/// shows what firmware left behind; ports that are still in RxDetect simply read
-/// as not attached and are retried after the reset by the port bring-up loop.
+/// Выполняется до BIOS handoff и аппаратного сброса, поэтому показывает, что
+/// оставила прошивка; порты в RxDetect просто читаются как неподключённые и
+/// будут перепроверены после сброса циклом подъёма.
 fn probe_controller(dev: &PciDevice) -> Option<(u8, u32)> {
     let (base, _bar) = map_bar0(dev)?;
     let caplength = (rd32(base, CAP_CAPLENGTH) & 0xFF) as usize;
@@ -1098,31 +1065,30 @@ fn probe_controller(dev: &PciDevice) -> Option<(u8, u32)> {
     Some((ports, mask))
 }
 
-/// Take ownership of the controller from the firmware's USB legacy support.
+/// Забрать контроллер у USB legacy support прошивки.
 ///
-/// WHY: xHCI carries a "USB Legacy Support" extended capability. While the BIOS
-/// owns the semaphore it may keep SMI handlers trapping port accesses, and some
-/// firmware leaves the controller in a state where the OS sees no port state at
-/// all. The standard handoff is: ask for ownership (OS-owned bit), wait for the
-/// BIOS-owned bit to clear, and if the firmware never answers, clear it yourself
-/// after a bounded wait so boot continues.
+/// xHCI имеет extended capability «USB Legacy Support». Пока BIOS владеет
+/// семафором, SMI-обработчики могут перехватывать доступ к портам, а прошивка
+/// может оставить контроллер в состоянии, где OS вообще не видит состояния
+/// портов. Стандартный handoff: запросить владение (OS-owned), ждать сброса
+/// BIOS-owned и, если прошивка не отвечает, снять BIOS-owned самому после
+/// ограниченного ожидания.
 fn bios_handoff(base: usize, hccparams1: u32) -> &'static str {
     const CAP_ID_USB_LEGACY: u32 = 1;
     const LEGSUP_BIOS_OWNED: u32 = 1 << 16;
     const LEGSUP_OS_OWNED: u32 = 1 << 24;
     let xecp = ((hccparams1 >> 16) & 0xFFFF) as usize;
-    // The spec says extended capabilities start at xECP*4; firmware that reports
-    // xECP=0 may still expose them where QEMU puts them (0x20), so that area is
-    // scanned as a fallback. Getting this wrong means skipping the handoff, and a
-    // BIOS-owned controller can keep the USB ports under SMM control — one of the
-    // ways a port can enable and then be yanked back to Polling.
+    // По спецификации extended capabilities начинаются с xECP*4; прошивка с xECP=0
+    // может всё же выставить их там, куда их кладёт QEMU (0x20), поэтому этот участок
+    // сканируется как fallback. Ошибка здесь означает пропущенный handoff, а
+    // контроллер во власти BIOS может держать USB-порты под SMM — один из способов,
+    // которым порт включается и снова уходит в Polling.
     let start = if xecp != 0 { xecp * 4 } else { 0x20 };
     let mut off = start;
     let mut guard = 0;
-    // xECP is a dword offset and real controllers do use the far end of the BAR
-    // (this Intel PCH reports 0x2000 dwords = 32 KiB). The BAR is mapped for
-    // 64 KiB, so the walk may go there; the old 0x1000 limit aborted before the
-    // capabilities and silently skipped the BIOS handoff.
+    // xECP — смещение в dword'ах, и реальные контроллеры используют дальний край BAR
+    // (этот Intel PCH сообщает 0x2000 dword'ов = 32 КиБ). BAR отображён на 64 КиБ,
+    // поэтому обход может туда дойти.
     while off + 4 <= 0x10000 && guard < 64 {
         guard += 1;
         let cap = rd32(base, off);
@@ -1131,18 +1097,16 @@ fn bios_handoff(base: usize, hccparams1: u32) -> &'static str {
             let mut value = cap;
             if value & LEGSUP_BIOS_OWNED != 0 {
                 wr32(base, off, value | LEGSUP_OS_OWNED);
-                // xHCI 1.2 §7.1.1: the OS gives the firmware up to one second, then
-                // takes ownership by force. The old two-million-spin budget was a
-                // guess; on a machine whose firmware really is slow it could expire
-                // in a few milliseconds and the "forced" path would run while the
-                // firmware was still in the middle of releasing the ports.
+                // xHCI 1.2 §7.1.1: OS даёт прошивке до одной секунды, затем забирает владение
+                // принудительно. Ограниченное ожидание гарантирует, что «принудительный» путь не
+                // сработает, пока прошивка ещё отпускает порты.
                 let clock = clock_ready();
                 let start_us = if clock { now_us() } else { 0 };
                 let mut spins = 0u32;
                 loop {
                     value = rd32(base, off);
                     if value & LEGSUP_BIOS_OWNED == 0 {
-                        crate::info!("xhci: BIOS handed the controller over");
+                        crate::debug!("xhci: BIOS handed the controller over");
                         return "handoff";
                     }
                     spins += 1;
@@ -1171,31 +1135,29 @@ fn bios_handoff(base: usize, hccparams1: u32) -> &'static str {
     "absent"
 }
 
-/// Bring one controller all the way up: reset, rings, DCBAA, running.
+/// Поднять контроллер целиком: сброс, кольца, DCBAA, запуск.
 fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
-    // Memory space AND bus mastering, before anything else: the controller's
-    // command/event rings, DCBAA and scratchpads are all DMA, and a device with
-    // bus mastering off cannot touch any of them. Every other DMA driver in this
-    // kernel calls this; this one relied on firmware having left the bit set,
-    // which is exactly the kind of state QEMU does not enforce and hardware does.
+    // Сначала memory space И bus mastering: командное/событийное кольца, DCBAA и
+    // scratchpad — это DMA, и устройство с выключенным bus mastering не может их
+    // читать.
     crate::drivers::pci::enable_bus_master(dev.address);
     let pci_cmd = crate::drivers::pci::config_read_u32(dev.address, 0x04) & 0xFFFF;
-    crate::info!(
+    crate::debug!(
         "xhci: PCI command={:#06x} (memory={} bus-master={})",
         pci_cmd,
         if pci_cmd & 0x2 != 0 { "on" } else { "OFF" },
         if pci_cmd & 0x4 != 0 { "on" } else { "OFF" }
     );
-    // A real-time base for the port waits: USB2 reset/recovery/settle are tens of
-    // milliseconds by specification, and a spin count is not a millisecond.
+    // Реальная база времени для ожиданий порта: USB2 reset/recovery/settle — десятки
+    // миллисекунд по спецификации, а спин-счётчик не миллисекунда.
     if !clock_ready() {
         calibrate_clock();
     }
     let Some((base, bar)) = map_bar0(dev) else {
         return false;
     };
-    // Attached ports before the reset, counted here so the diagnostic can show
-    // exactly which connections the reset lost (firmware had them, we do not).
+    // Подключённые порты до сброса: диагностика показывает, какие соединения сброс
+    // потерял.
     let mut ccs_mask_probe = 0u32;
 
     let caplength = (rd32(base, CAP_CAPLENGTH) & 0xFF) as usize;
@@ -1211,7 +1173,7 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
     let ports = ((hcsparams1 >> 24) & 0xFF) as u8;
     let ctx_size = if hccparams1 & (1 << 2) != 0 { 64 } else { 32 };
     let scratchpads = (((hcsparams2 >> 21) & 0x1F) << 5) | ((hcsparams2 >> 27) & 0x1F);
-    crate::info!(
+    crate::debug!(
         "xhci: {:04x}:{:04x} bar={:#x} slots={} ports={} ctx={}B scratchpad={}",
         dev.vendor_id,
         dev.device_id,
@@ -1226,9 +1188,8 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
         return false;
     }
 
-    // Port state BEFORE anything is touched: the firmware may already have
-    // brought devices up, and comparing this with the post-reset state is what
-    // told us whether a reset (rather than our port handling) was losing them.
+    // Состояние портов ДО любых действий: прошивка могла уже поднять устройства, и
+    // сравнение с состоянием после сброса показывает, не теряет ли их именно сброс.
     for port in 1..=ports {
         let sc = rd32(op, portsc(port));
         if sc & PORTSC_CCS != 0 {
@@ -1239,8 +1200,8 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
         }
     }
 
-    // Reset: the firmware may have left the controller running its own schedule,
-    // and we are about to replace every ring it knows about.
+    // Сброс: прошивка могла оставить контроллер со своим расписанием, а мы
+    // собираемся заменить все известные ему кольца.
     wr32(op, OP_USBCMD, rd32(op, OP_USBCMD) & !USBCMD_RS);
     spin_until(|| rd32(op, OP_USBSTS) & USBSTS_HCH != 0, 100_000);
     wr32(op, OP_USBCMD, USBCMD_HCRST);
@@ -1261,16 +1222,16 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
             let Some(page) = DmaFrame::new_zeroed("scratchpad page") else {
                 return false;
             };
-            // SAFETY: `array` is our own page and `i < scratchpads`, so the
-            // 8-byte slot is inside it.
+            // SAFETY: `array` — наша страница и `i < scratchpads`, поэтому 8-байтный слот
+            // лежит внутри неё.
             unsafe { write_volatile((array.virt() as *mut u64).add(i as usize), page.phys()) };
             scratchpad_pages.push(page);
         }
-        // SAFETY: DCBAA[0] is the first 8 bytes of our own zeroed frame.
+        // SAFETY: DCBAA[0] — первые 8 байт нашего обнулённого кадра.
         unsafe { write_volatile(dcbaa.virt() as *mut u64, array.phys()) };
-        // The array page is DMA state too: DCBAA[0] points at it and the
-        // controller reads it whenever it needs a scratchpad. It travels into the
-        // Controller with the frame above, for the same lifetime reason.
+        // Страница массива — тоже DMA-состояние: DCBAA[0] указывает на неё, и
+        // контроллер читает её, когда нужен scratchpad. Она живёт в `Controller` вместе с
+        // кадром по той же причине времени жизни.
         scratchpad_array = Some(array);
     }
 
@@ -1281,7 +1242,7 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
     ) else {
         return false;
     };
-    // SAFETY: `erst` is our own zeroed page and the entry is its first 16 bytes.
+    // SAFETY: `erst` — наша обнулённая страница, а запись — её первые 16 байт.
     unsafe {
         write_volatile(
             erst.virt() as *mut ErstEntry,
@@ -1309,8 +1270,8 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
         );
         return false;
     }
-    // Write-read-back on a harmless register: if this fails, every port write in
-    // this driver is being dropped and no amount of reset logic can help.
+    // Write-read-back безвредного регистра: если он не проходит, все записи портов в
+    // этом драйвере отбрасываются, и reset-логика уже не поможет.
     let before = rd32(op, OP_CONFIG);
     wr32(op, OP_CONFIG, before);
     let writes_ok = rd32(op, OP_CONFIG) == before;
@@ -1320,14 +1281,12 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
             before
         );
     }
-    crate::info!("xhci: running (ports={} cr={:#x})", ports, cmdr.base_phys());
-    // Give the PHYs a moment to settle before the first port reset: the firmware
-    // left these links in some state and USB2 wants ~100 ms after a controller
-    // reset (xHCI 1.2 §4.19.1). QEMU is instant, hardware is not.
+    crate::debug!("xhci: running (ports={} cr={:#x})", ports, cmdr.base_phys());
+    // Дать PHY устояться перед первым reset порта: USB2 хочет ~100 мс после сброса
+    // контроллера (xHCI 1.2 §4.19.1). QEMU работает мгновенно, железо — нет.
     settle_us(100_000);
-    // Port state at bring-up, at debug level: which ports have a device attached,
-    // whether they are powered and at what speed is the first thing to look at
-    // when enumeration does not happen.
+    // Состояние портов при подъёме, на уровне debug: какие порты подключены,
+    // питаются и на какой скорости — первое, что смотрят, если перечисление не идёт.
     for port in 1..=ports {
         let sc = rd32(op, portsc(port));
         crate::debug!(
@@ -1342,14 +1301,11 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
         );
     }
 
-    // Which ports are USB2 and which are USB3, from the Supported Protocol
-    // capabilities. This is DIAGNOSTIC, not policy: the reset path learns the
-    // protocol from the port's own reported speed, because the field machine
-    // shows how fragile this data can be (its controller reports two entries whose
-    // ranges overlap). The raw entries are kept for the screen so the next photo
-    // can be compared against the spec instead of against our parser — the old
-    // display printed `usb2=17-41 usb3=17-26`, which is what a parser that reads
-    // the wrong byte looks like.
+    // Какие порты USB2, а какие USB3 — из Supported Protocol capabilities. Это
+    // ДИАГНОСТИКА, а не политика: путь reset узнаёт протокол из скорости самого
+    // порта. Сырые записи хранятся для экрана, чтобы сверять их со спецификацией, а
+    // не с нашим парсером: неверно прочитанные поля дают невозможные диапазоны вроде
+    // `usb2=17-41 usb3=17-26`.
     let mut protos: Vec<u8> = vec![0u8; ports as usize];
     let mut proto_masks: [u32; 2] = [0, 0];
     let mut xcaps: Vec<XCap> = Vec::new();
@@ -1369,8 +1325,8 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
                     offset: off as u32,
                     id,
                     next,
-                    // DW0 is the capability header for every extended capability,
-                    // not only the protocol ones.
+                    // DW0 — заголовок capability для любой extended capability, не только
+                    // protocol.
                     major: ((dw0 >> 24) & 0xFF) as u8,
                     minor: ((dw0 >> 16) & 0xFF) as u8,
                     dw1,
@@ -1378,26 +1334,20 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
                 });
             }
             if id == 2 {
-                // Supported Protocol capability, xHCI 1.2 section 7.2 / table 7-4:
-                // DW0 is the header (major revision bits 31:24, minor 23:16), DW1
-                // is the name string, DW2 is the PORT INFO word:
-                //     bits 31:28 PSIC (speed-ID count), 15:8 port count, 7:0 port
-                //     offset — and the offset is 1-BASED (Linux: XHCI_EXT_PORT_OFF
-                //     / XHCI_EXT_PORT_COUNT, "port count includes the current port
-                //     offset").
-                // This is the bug the 2.18.12 field photo caught: the driver read
-                // the count from bits 31:16 and the offset from 15:8 plus one, so
-                // the machine's two clean entries (USB2 dw2=0x30191001 -> offset 1,
-                // count 16; USB3 dw2=0x40000a11 -> offset 17, count 10) printed as
-                // the impossible `usb2=17-41 usb3=17-26` and every real USB2 port
-                // came out as proto=usb0. QEMU writes the same field layout
-                // (`hcd-xhci.c` 0x28/0x38), so no emulator special case is needed.
+                // Supported Protocol capability, xHCI 1.2 §7.2 / таблица 7-4: DW0 — заголовок
+                // (major revision 31:24, minor 23:16), DW1 — строка имени, DW2 — слово PORT INFO:
+                // биты 31:28 PSIC (число speed id), 15:8 число портов, 7:0 смещение порта.
+                // Смещение 1-based (константы XHCI_EXT_PORT_OFF / XHCI_EXT_PORT_COUNT; «port count
+                // includes the current port offset»). Неверное чтение этих полей и даёт
+                // невозможные диапазоны и proto=usb0 для реальных USB2-портов. QEMU пишет ту же
+                // раскладку полей (`hcd-xhci.c` 0x28/0x38), поэтому особый случай эмулятора не
+                // нужен.
                 let major = ((dw0 >> 24) & 0xFF) as u8;
                 let minor = ((dw0 >> 16) & 0xFF) as u8;
                 let first = (dw2 & 0xFF) as usize;
                 let count = ((dw2 >> 8) & 0xFF) as usize;
                 let psic = (dw2 >> 28) & 0xF;
-                crate::info!(
+                crate::debug!(
                     "xhci: xcap {:#06x} id={} next={:#04x} major={} minor={} offset={} count={} psic={} dw1={:#010x} dw2={:#010x}",
                     off,
                     id,
@@ -1431,9 +1381,8 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
             off += next as usize * 4;
         }
     }
-    // A port belongs to one protocol at most. When the reported ranges overlap,
-    // USB3 wins: that is the port whose reset differs, so mislabelling it as USB2
-    // is the expensive direction to be wrong in.
+    // Порт принадлежит максимум одному протоколу. Если диапазоны перекрываются,
+    // побеждает USB3: у этого порта другой reset, и ошибиться в сторону USB2 дороже.
     let covered = proto_masks[0] | proto_masks[1];
     proto_masks[0] &= !proto_masks[1];
     for port in 1..=ports as usize {
@@ -1476,10 +1425,9 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
                 seen_ped_u0: false,
                 ped_sc: 0,
                 ms: 0,
-                next_log_us: 0,
                 proto,
-                // USB3 ports use WPR (warm reset), USB2 ports PR. An unknown
-                // protocol (0) is treated as USB2: PR is the safe request there.
+                // USB3-порты используют WPR (warm reset), USB2 — PR. Неизвестный протокол (0)
+                // считается USB2: PR — безопасный запрос.
                 policy: PortPolicy::new(proto == 3),
             }
         })
@@ -1502,7 +1450,6 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
         reports: 0,
         devices: 0,
         brought_up: Vec::new(),
-        logged_ports: false,
         probe_mask: ccs_mask_probe,
         next_port: 1,
         fallback_us: 0,
@@ -1528,7 +1475,8 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
     true
 }
 
-/// Spin until `cond` holds or the budget runs out. Returns whether it held.
+/// Крутиться, пока `cond` не станет истинным или не кончится бюджет. Возвращает
+/// результат проверки.
 fn spin_until(cond: impl Fn() -> bool, budget: u32) -> bool {
     let mut i = 0;
     while i < budget {
@@ -1541,19 +1489,19 @@ fn spin_until(cond: impl Fn() -> bool, budget: u32) -> bool {
     cond()
 }
 
-// ─── Commands and events ─────────────────────────────────────────────────────
+// ─── Команды и события ───────────────────────────────────────────────────────
 
 fn ring_doorbell(ctrl: &Controller, slot: u8, target: u8) {
     wr32(ctrl.db, slot as usize * 4, target as u32);
 }
 
-/// Consume one event, moving ERDP past it. `None` when nothing is pending within
-/// the budget.
+/// Забрать одно событие и сдвинуть ERDP. `None`, если за бюджет ничего не
+/// появилось.
 fn next_event(ctrl: &mut Controller, budget: u32) -> Option<Trb> {
     if !spin_until(
         || {
-            // The closure cannot borrow `ctrl` mutably, so the check is done on a
-            // raw read of the event ring through the shared reference.
+            // Замыкание не может заимствовать `ctrl` изменяемо, поэтому проверка идёт сырым
+            // чтением кольца событий через общую ссылку.
             ctrl.event.event_pending()
         },
         budget,
@@ -1566,21 +1514,20 @@ fn next_event(ctrl: &mut Controller, budget: u32) -> Option<Trb> {
     Some(ev)
 }
 
-/// Park a transfer event that arrived while a command was waiting, so the poll
-/// loop can still deliver it. Dropping it would leave its endpoint marked
-/// "outstanding" forever: it would never be re-armed and its input would die
-/// silently — the exact class of bug this driver exists to avoid.
+/// Отложить transfer event, пришедшее во время ожидания команды, чтобы цикл
+/// опроса всё равно его доставил. Потеря оставила бы эндпоинт «outstanding»
+/// навсегда: он бы не переармировался, и ввод молча умер бы.
 fn defer_event(ctrl: &mut Controller, ev: Trb) {
-    // Bounded: the queue is drained every poll, and a command waits for one
-    // completion. A full queue means something is very wrong; dropping a report
-    // is still better than growing kernel heap without a bound.
+    // Ограниченно: очередь осушается каждый poll, а команда ждёт одно завершение.
+    // Полная очередь означает серьёзную проблему, но потерять отчёт лучше, чем растить
+    // кучу ядра без границы.
     if ctrl.deferred_events.len() < 64 {
         ctrl.deferred_events.push(ev);
     }
 }
 
-/// Next event for the poll loop: deferred transfer events first (they are older
-/// than whatever is still on the event ring), then the ring itself.
+/// Следующее событие для цикла опроса: сначала отложенные transfer events (они
+/// старее того, что ещё в кольце), затем само кольцо.
 fn next_poll_event(ctrl: &mut Controller, budget: u32) -> Option<Trb> {
     if let Some(ev) = ctrl.deferred_events.pop() {
         return Some(ev);
@@ -1588,7 +1535,7 @@ fn next_poll_event(ctrl: &mut Controller, budget: u32) -> Option<Trb> {
     next_event(ctrl, budget)
 }
 
-/// Submit a command TRB and return its completion event.
+/// Отправить командный TRB и вернуть событие завершения.
 fn command(ctrl: &mut Controller, dw0: u32, dw1: u32, dw2: u32, dw3: u32) -> Option<Trb> {
     ctrl.cmdr.push(dw0, dw1, dw2, dw3);
     ring_doorbell(ctrl, 0, 0);
@@ -1600,7 +1547,7 @@ fn command(ctrl: &mut Controller, dw0: u32, dw1: u32, dw2: u32, dw3: u32) -> Opt
                 let port = (ev.dw0 >> 24) & 0xFF;
                 crate::debug!("xhci: port {} status change", port);
             }
-            // Not ours: a HID interrupt-IN completion for another endpoint.
+            // Не наше: завершение HID interrupt-IN другого эндпоинта.
             TRB_TRANSFER_EVENT => defer_event(ctrl, ev),
             _ => {}
         }
@@ -1608,23 +1555,22 @@ fn command(ctrl: &mut Controller, dw0: u32, dw1: u32, dw2: u32, dw3: u32) -> Opt
     None
 }
 
-/// Address of an input-context TRB argument: bits 4+ of dw0/dw1.
+/// Адрес аргумента input-context TRB: биты 4+ из dw0/dw1.
 fn ctx_addr(phys: u64) -> (u32, u32) {
     ((phys & 0xFFFF_FFF0) as u32, (phys >> 32) as u32)
 }
 
-// ─── Enumeration ─────────────────────────────────────────────────────────────
+// ─── Перечисление ────────────────────────────────────────────────────────────
 
-// ─── Port bring-up: executor for the pure policy ─────────────────────────────
+// ─── Подъём порта: исполнитель чистой политики ──────────────────────────────
 //
-// The decisions themselves live in `xhci_port.rs` and are host-tested against
-// simulated ports. This section only performs the one side effect the policy
-// asks for and keeps the display copy in sync. Nothing here waits out a USB2
-// debounce or reset window: those are `PortPolicy` deadlines checked once per
-// poll, so the boot menu's countdown keeps running and one stuck port costs a
-// register read, not a blocked second.
+// Решения принимаются в `xhci_hub.rs` и проверены host-тестами на симулированных
+// портах. Этот участок лишь выполняет один побочный эффект, который просит
+// политика, и синхронизирует копию для экрана. Ожидания USB2 debounce/reset здесь
+// не блокируют: это дедлайны `PortPolicy`, проверяемые раз за poll, поэтому
+// отсчёт boot-меню продолжается, а зависший порт стоит одного чтения регистра.
 
-/// Decode a raw PORTSC word into the policy's observation type.
+/// Декодировать сырое слово PORTSC в тип наблюдения политики.
 fn observe_portsc(raw: u32) -> PortObservation {
     PortObservation::new(
         raw & PORTSC_CCS != 0,
@@ -1639,12 +1585,12 @@ fn observe_portsc(raw: u32) -> PortObservation {
     )
 }
 
-/// Execute one step of the port policy for `port`.
+/// Выполнить один шаг политики порта для `port`.
 ///
-/// Called round-robin (one port per [`poll`]), so every port's state machine gets
-/// one bounded step per pass. This is the cooperative waiting the boot menu
-/// needs: a port that is debouncing or waiting for PRC is touched once, its
-/// deadline is compared, and the poll returns.
+/// Вызывается циклически (один порт за [`poll`]), поэтому каждая state machine
+/// получает один ограниченный шаг за проход. Это и есть кооперативное ожидание,
+/// нужное boot-меню: порт в debounce или в ожидании PRC трогается один раз, его
+/// дедлайн сравнивается, и poll возвращается.
 fn poll_port(ctrl: &mut Controller, port: u8) {
     if ctrl.slots.iter().any(|s| s.port == port) {
         return;
@@ -1668,12 +1614,11 @@ fn poll_port(ctrl: &mut Controller, port: u8) {
                 ctrl.stage(port, stage, raw);
             }
             sync_diag(ctrl, port);
-            log_port_observation(ctrl, port, raw, obs, now);
         }
         Step::PowerOn => {
-            // The write goes through the Linux neutral value (PED/PR/WPR/LWS
-            // must be 0) and PP is read back; a controller that drops the write
-            // must not leave the port dark and silent.
+            // Запись идёт через neutral-значение (PED/PR/WPR/LWS должны быть 0), PP читается
+            // обратно; контроллер, потерявший запись, не должен оставить порт обесточенным и
+            // молчащим.
             if !power_on_port(ctrl, port) {
                 policy_fail(ctrl, port, obs, now, FailReason::NoPower);
                 port_failure(ctrl, port, FailReason::NoPower, raw);
@@ -1687,8 +1632,8 @@ fn poll_port(ctrl: &mut Controller, port: u8) {
             ctrl.stage(port, "resume", raw);
             match resume_port(ctrl, port) {
                 Some(_speed) => {
-                    // The resume waited its 20 ms; the next policy step sees U0
-                    // and returns Enumerate. Do not write a reset here.
+                    // Resume подождал свои 20 мс; следующий шаг политики увидит U0 и вернёт
+                    // Enumerate. Reset здесь не пишется.
                     sync_diag(ctrl, port);
                 }
                 None => {
@@ -1702,26 +1647,21 @@ fn poll_port(ctrl: &mut Controller, port: u8) {
     }
 }
 
-/// Raise PP with a readback (and a bounded retry) — never leave the port off.
+/// Поднять PP с readback (и ограниченным повтором) — никогда не оставлять порт
+/// выключенным.
 ///
-/// Linux's `xhci_set_port_power()` writes `xhci_port_state_to_neutral()` | PP and
-/// reads the register back once. This driver has no hub workqueue to retry a
-/// dropped write, so it retries a few times and only then reports `no-power`;
-/// the policy then backs off and comes back to `PowerOn`, so a port is never
-/// abandoned unpowered.
+/// `xhci_set_port_power()` из `xhci-hub.c` пишет `xhci_hub_state_to_neutral()` | PP
+/// и читает регистр обратно один раз. У этого драйвера нет hub workqueue для
+/// повтора потерянной записи, поэтому он повторяет несколько раз и только затем
+/// сообщает `no-power`; политика отступает и возвращается к `PowerOn`, так что
+/// порт не остаётся без питания.
 fn power_on_port(ctrl: &mut Controller, port: u8) -> bool {
     let off = portsc(port);
-    for attempt in 0..3 {
+    for _ in 0..3 {
         let cur = rd32(ctrl.op, off);
         wr32(ctrl.op, off, port_state_to_neutral(cur) | PORTSC_PP);
         let sc = rd32(ctrl.op, off);
         if sc & PORTSC_PP != 0 {
-            crate::debug!(
-                "xhci: port {}: power on (PORTSC={:#010x}, attempt {})",
-                port,
-                sc,
-                attempt + 1
-            );
             return true;
         }
         settle_us(10_000);
@@ -1734,115 +1674,41 @@ fn power_on_port(ctrl: &mut Controller, port: u8) -> bool {
     false
 }
 
-/// One `observe` line every ~200 ms for a port that is attached and debouncing.
+/// Сбросить устаревшие change-биты и записать PR (USB2) или WPR (USB3).
 ///
-/// This is the trace the field photo needs: the second 2.22.7 report only had
-/// the failure line, so it was impossible to tell whether the port was stable
-/// in Polling, bouncing between CCS states, or already enabled and lost. Linux's
-/// `hub_port_debounce` logs `debounce total ... stable ... status`, and the same
-/// numbers are printed here (`debounce_total_us`/`debounce_stable_us`).
-fn log_port_observation(ctrl: &mut Controller, port: u8, raw: u32, obs: PortObservation, now: u64) {
-    let Some(d) = ctrl.diag.get(port as usize - 1) else {
-        return;
-    };
-    if d.policy.phase() != Phase::Debounce {
-        return;
-    }
-    if d.next_log_us != 0 && now < d.next_log_us {
-        return;
-    }
-    let total_ms = d.policy.debounce_total_us() / 1_000;
-    let stable_ms = d.policy.debounce_stable_us() / 1_000;
-    if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
-        d.next_log_us = now.saturating_add(200_000);
-    }
-    crate::info!(
-        "xhci: port {}: observe ccs={} ped={} pp={} pls={} speed={} csc={} prc={} pr={} state={:#010x} debounce_total={}ms stable={}ms",
-        port,
-        obs.ccs as u8,
-        obs.ped as u8,
-        obs.pp as u8,
-        obs.pls,
-        obs.speed,
-        obs.csc as u8,
-        obs.prc as u8,
-        obs.pr as u8,
-        raw,
-        total_ms,
-        stable_ms
-    );
-}
-
-/// Clear stale change bits and write PR (USB2) or WPR (USB3).
-///
-/// The policy has already moved to `ResetWait`; `pre` is the raw PORTSC the
-/// decision was made from, so a photo can separate "the port was in Polling
-/// before we touched it" from "our reset changed it".
+/// Политика уже перешла в `ResetWait`; `pre` — сырой PORTSC, из которого принято
+/// решение.
 fn start_port_reset(ctrl: &mut Controller, port: u8, warm: bool, raw: u32) {
     let off = portsc(port);
-    let attempt = ctrl.diag[port as usize - 1].policy.resets();
-    let tries = ctrl.diag[port as usize - 1].policy.reset_tries();
-    let debounce_total_ms = ctrl.diag[port as usize - 1].policy.debounce_total_us() / 1_000;
-    let debounce_stable_ms = ctrl.diag[port as usize - 1].policy.debounce_stable_us() / 1_000;
-    // Linux `xhci_hub_control`, case USB_PORT_FEAT_RESET:
-    //     portsc = xhci_port_state_to_neutral(portsc);
+    // `xhci_hub_control`, case USB_PORT_FEAT_RESET (`xhci-hub.c`):
+    //     portsc = xhci_hub_state_to_neutral(portsc);
     //     portsc |= PORT_RESET;
     //     writel(portsc);
-    // Change bits are NOT cleared here: the neutral value writes 0 to every
-    // W1C bit, and the change bits are acknowledged only after the port has
-    // enabled and held (driver `enumerate_port`).
+    // Change-биты здесь НЕ очищаются: neutral-значение пишет 0 во все W1C-биты, а
+    // change-биты подтверждаются только после того, как порт включился и удержался
+    // (см. `enumerate_port`).
     let sc = rd32(ctrl.op, off);
     let bit = if warm { PORTSC_WPR } else { PORTSC_PR };
     wr32(ctrl.op, off, port_state_to_neutral(sc) | bit);
     ctrl.stage(port, "reset", raw);
-    if attempt <= 2 || attempt % 8 == 0 || tries == 1 {
-        crate::info!(
-            "xhci: port {}: reset #{} issued (usb{} try={}/{} pre={:#010x} ccs={} ped={} pp={} speed={} pls={} prc={} csc={} debounce_total={}ms stable={}ms)",
-            port,
-            attempt,
-            if warm { 3 } else { 2 },
-            tries,
-            xhci_port::PORT_RESET_TRIES,
-            raw,
-            raw & PORTSC_CCS != 0,
-            raw & PORTSC_PED != 0,
-            raw & PORTSC_PP != 0,
-            (raw & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT,
-            (raw & PORTSC_PLS_MASK) >> PORTSC_PLS_SHIFT,
-            raw & PORTSC_PRC != 0,
-            raw & PORTSC_CSC != 0,
-            debounce_total_ms,
-            debounce_stable_ms
-        );
-    } else {
-        crate::debug!(
-            "xhci: port {}: reset #{} issued (try={}/{} pre={:#010x})",
-            port,
-            attempt,
-            tries,
-            xhci_port::PORT_RESET_TRIES,
-            raw
-        );
-    }
     sync_diag(ctrl, port);
 }
 
-/// The policy reported a stable PED+U0: acknowledge the change bits and hand the
-/// port to enumeration.
+/// Политика сообщила устойчивый PED+U0: подтвердить change-биты и передать порт
+/// перечислению.
 ///
-/// The post-reset re-read is the last chance for the field failure to show up:
-/// if PED disappeared between the policy's stability check and this read, the
-/// attempt is recorded as `lost-after-reset` and the driver backs off (it does
-/// NOT reset again immediately — the policy's next attempt observes first).
+/// Повторное чтение после reset — последний шанс увидеть потерю: если PED исчез
+/// между проверкой устойчивости и этим чтением, попытка записывается как
+/// `lost-after-reset`, и драйвер отступает (сразу не сбрасывает — следующий шаг
+/// политики сначала наблюдает).
 fn enumerate_port(ctrl: &mut Controller, port: u8, speed: u8, now: u64) {
     let off = portsc(port);
     let had_reset = ctrl.diag[port as usize - 1].policy.attempt_had_reset();
     let pre = rd32(ctrl.op, off);
-    // Linux clears C_PORT_RESET after the reset has completed and the port has
-    // enabled (hub_port_reset -> usb_clear_port_feature(C_RESET)). Keep the same
-    // ordering: the port has already held PED+U0 for STABLE_US here, and the
-    // write is neutral except for the W1C change bits — it can no longer write
-    // PED=1 (which would disable the port, the 2.22.7 field bug).
+    // `hub_port_reset` очищает C_PORT_RESET после завершения reset и включения
+    // порта (usb_clear_port_feature(C_RESET)). Порядок тот же: порт уже удержал
+    // PED+U0 в течение STABLE_US, а запись нейтральна, кроме W1C change-битов —
+    // PED=1 она записать не может и порт не отключит.
     wr32(
         ctrl.op,
         off,
@@ -1863,33 +1729,6 @@ fn enumerate_port(ctrl: &mut Controller, port: u8, speed: u8, now: u64) {
         d.code = cur;
     }
     record_attempt_ms(ctrl, port);
-    let attempts = ctrl.diag[port as usize - 1].policy.resets();
-    let ms = ctrl.diag[port as usize - 1].ms;
-    let speed_before_reset =
-        (ctrl.diag[port as usize - 1].pre & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT;
-    if had_reset {
-        crate::info!(
-            "xhci: port {}: reset-ok try={} ms={} speed_before={} speed_after={} pre={:#010x} post={:#010x} prc={} csc={} (enumerating)",
-            port,
-            attempts,
-            ms,
-            speed_before_reset,
-            speed,
-            ctrl.diag[port as usize - 1].pre,
-            cur,
-            (pre & PORTSC_PRC != 0) as u8,
-            (pre & PORTSC_CSC != 0) as u8
-        );
-    } else {
-        crate::info!(
-            "xhci: port {}: already enabled, adopting speed={} pre={:#010x} post={:#010x} prc={} (enumerating, no PR)",
-            port,
-            speed,
-            pre,
-            cur,
-            (pre & PORTSC_PRC != 0) as u8
-        );
-    }
     sync_diag(ctrl, port);
     if enumerate_with_speed(ctrl, port, speed) {
         ctrl.devices += 1;
@@ -1898,12 +1737,11 @@ fn enumerate_port(ctrl: &mut Controller, port: u8, speed: u8, now: u64) {
             d.policy.enumerated();
         }
     } else {
-        // The specific enumeration stage (`device-descriptor`, `no-hid-interface`,
-        // …) was already recorded by `enumerate_slot`; keep it and only update
-        // the retry bookkeeping so the next attempt starts with a reset after
-        // the backoff.
-        // Enumeration can block on descriptor timeouts; start the backoff from
-        // the moment it actually failed, not from the reset that preceded it.
+        // Конкретная стадия перечисления (`device-descriptor`, `no-hid-interface`, …)
+        // уже записана в `enumerate_slot`; сохраняем её и обновляем только retry-учёт,
+        // чтобы следующая попытка началась с reset после backoff.
+        // Перечисление может блокироваться на таймаутах дескрипторов, поэтому backoff
+        // стартует от момента реального отказа, а не от предшествовавшего reset.
         let failed_at = fsm_now(ctrl);
         let _ = ctrl
             .diag
@@ -1916,68 +1754,38 @@ fn enumerate_port(ctrl: &mut Controller, port: u8, speed: u8, now: u64) {
                 "xhci: port {}: enumeration failed (attempt {}); retrying with a reset in {} ms",
                 port,
                 failures,
-                xhci_port::backoff_us(failures) / 1_000
+                xhci_hub::backoff_us(failures) / 1_000
             );
         }
         sync_diag(ctrl, port);
     }
 }
 
-/// Record a failure from the policy/driver and log it with the evidence a photo
-/// can carry: attempt count, elapsed ms, PRC/PED/ped_sc/post, and the retry gap.
+/// Записать отказ политики/драйвера и залогировать его кратко: стадия, число
+/// попыток и пауза до повтора.
 fn port_failure(ctrl: &mut Controller, port: u8, reason: FailReason, raw: u32) {
     let stage = reason.stage();
     let was_last_fail = ctrl.last_fail.map_or(true, |(p, _, _)| p != port);
     ctrl.fail(port, stage, raw);
     record_attempt_ms(ctrl, port);
     sync_diag(ctrl, port);
-    let d = &ctrl.diag[port as usize - 1];
-    let failures = d.policy.failures();
-    let try_count = d.policy.resets();
-    let prc = d.policy.seen_prc();
-    let csc = d.policy.seen_csc();
-    let ped = d.policy.seen_ped();
-    let ped_u0 = d.policy.seen_ped_u0();
-    let ped_sc = d.policy.ped_sc();
-    let pre = d.policy.pre();
-    let post = d.policy.post();
-    let speed = port_speed(post);
-    let ms = d.ms;
-    let retry_ms = xhci_port::backoff_us(failures) / 1_000;
-    // First few attempts and every 8th afterwards: enough for a field photo,
-    // bounded so a permanently dead port cannot flood the serial log.
+    let failures = ctrl.diag[port as usize - 1].policy.failures();
+    let retry_ms = xhci_hub::backoff_us(failures) / 1_000;
+    // Первые попытки и каждая 8-я: ограниченно, чтобы навсегда мёртвый порт не
+    // заливал serial. Полный снимок порта печатает команда `usb`.
     if failures <= 3 || failures % 8 == 0 || was_last_fail {
         crate::warn!(
-            "xhci: port {}: stage={} try={} ms={} pre={:#010x} post={:#010x} prc={} csc={} ped_seen={} ped_u0={} speed={} ped_sc={:#010x} (attempt {}, retry in {} ms)",
+            "xhci: port {}: {} (attempt {}, retry in {} ms)",
             port,
             stage,
-            try_count,
-            ms,
-            pre,
-            post,
-            prc as u8,
-            csc as u8,
-            ped as u8,
-            ped_u0 as u8,
-            speed,
-            ped_sc,
             failures,
             retry_ms
-        );
-    } else {
-        crate::debug!(
-            "xhci: port {}: stage={} try={} ms={} speed={} (attempt {})",
-            port,
-            stage,
-            try_count,
-            ms,
-            speed,
-            failures
         );
     }
 }
 
-/// Apply a policy failure decided outside `step` (PP/resume/post-reset checks).
+/// Применить отказ политики, решение о котором принято вне `step` (проверки
+/// PP/resume/после reset).
 fn policy_fail(
     ctrl: &mut Controller,
     port: u8,
@@ -1991,24 +1799,24 @@ fn policy_fail(
         .map(|d| d.policy.fail(obs, now, reason));
 }
 
-/// Port link state from a PORTSC word.
+/// Port Link State из слова PORTSC.
 fn port_pls(sc: u32) -> u32 {
     (sc & PORTSC_PLS_MASK) >> PORTSC_PLS_SHIFT
 }
 
-/// Port speed id from a PORTSC word.
+/// Speed id порта из слова PORTSC.
 fn port_speed(sc: u32) -> u8 {
     ((sc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) as u8
 }
 
-/// Software-resume a port whose link is suspended with the device enabled.
+/// Программно разбудить порт, чей линк в suspended с включённым устройством.
 ///
-/// For a USB2 port, writing PLS=U0 with LWS=1 drives resume signalling (20 ms,
-/// USB2 §7.1.7.7); for USB3 it starts the link's resume. Both then report U0.
+/// Для USB2-порта запись PLS=U0 с LWS=1 запускает resume-сигнализацию (20 мс,
+/// USB2 §7.1.7.7); для USB3 — resume линка. Затем оба сообщают U0.
 fn resume_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
     let off = portsc(port);
     let cur = rd32(ctrl.op, off);
-    // Linux xhci_set_link_state(): neutral value, PLS=U0 and LWS=1.
+    // `xhci_set_link_state()`: neutral-значение, PLS=U0 и LWS=1.
     let neutral = port_state_to_neutral(cur) & !PORTSC_PLS_MASK;
     wr32(
         ctrl.op,
@@ -2023,7 +1831,7 @@ fn resume_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
         if port_pls(sc) == PLS_U0 && sc & PORTSC_PED != 0 {
             let speed = port_speed(sc);
             if speed != 0 {
-                // Resume signalling needs 20 ms to settle before traffic.
+                // Resume-сигнализации нужно 20 мс до трафика.
                 settle_us(20_000);
                 return Some(adopt(ctrl, port, speed, "resumed", sc));
             }
@@ -2042,8 +1850,8 @@ fn resume_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
     }
 }
 
-/// Take over an enabled port: acknowledge its change bits (neutral write, so
-/// PED=1 is never written back) and record the speed.
+/// Принять уже включённый порт: подтвердить change-биты (neutral-запись, PED=1 не
+/// возвращается) и запомнить скорость.
 fn adopt(ctrl: &mut Controller, port: u8, speed: u8, stage: &'static str, sc: u32) -> u8 {
     let off = portsc(port);
     let cur = rd32(ctrl.op, off);
@@ -2061,7 +1869,7 @@ fn adopt(ctrl: &mut Controller, port: u8, speed: u8, stage: &'static str, sc: u3
     speed
 }
 
-/// EP0 max packet size before the device descriptor is known, by speed.
+/// Максимальный размер пакета EP0 до чтения дескриптора устройства, по скорости.
 fn ep0_max_packet(speed: u8) -> u32 {
     match speed {
         SPEED_HIGH => 64,
@@ -2070,7 +1878,7 @@ fn ep0_max_packet(speed: u8) -> u32 {
     }
 }
 
-/// Run a control-IN transfer on the device's EP0 and return the bytes read.
+/// Выполнить control-IN передачу на EP0 устройства и вернуть прочитанные байты.
 fn control_in(
     ctrl: &mut Controller,
     slot_index: usize,
@@ -2085,12 +1893,12 @@ fn control_in(
     }
     let slot_id = {
         let slot = ctrl.slots.get_mut(slot_index)?;
-        // Setup stage: the 8-byte request packet goes in the TRB itself (IDT).
+        // Setup-стадия: 8-байтный пакет запроса идёт в самом TRB (IDT).
         let dw0 = request_type as u32 | ((request as u32) << 8) | ((value as u32) << 16);
         let dw1 = index as u32 | ((len as u32) << 16);
         let dw3 = ((TRB_SETUP as u32) << 10) | TRB_IDT | TRT_IN;
         slot.ep0.push(dw0, dw1, 8, dw3);
-        // Data stage: one IN TRB covering the whole buffer.
+        // Data-стадия: один IN TRB на весь буфер.
         let buf_phys = slot.ctrl_buf.phys();
         slot.ep0.push(
             buf_phys as u32,
@@ -2098,14 +1906,14 @@ fn control_in(
             len as u32,
             ((TRB_DATA as u32) << 10) | TRB_DIR_IN,
         );
-        // Status stage: OUT, with IOC so completion is signalled.
+        // Status-стадия: OUT, с IOC, чтобы пришло завершение.
         slot.ep0
             .push(0, 0, 0, ((TRB_STATUS as u32) << 10) | TRB_IOC);
         slot.id
     };
     ring_doorbell(ctrl, slot_id, 1);
-    // Two events can arrive: the data stage and the status stage. Wait for the
-    // one carrying the status TRB's completion (endpoint 1, IOC set).
+    // Могут прийти два события: data-стадия и status-стадия. Ждём то, что несёт
+    // завершение status TRB (эндпоинт 1, IOC установлен).
     let mut result = None;
     for _ in 0..8 {
         let ev = next_event(ctrl, 1_000_000)?;
@@ -2113,8 +1921,8 @@ fn control_in(
             continue;
         }
         if ev.endpoint_id() != 1 {
-            // A HID endpoint's transfer completed while we wait for EP0: keep it
-            // for the poll loop instead of swallowing the report.
+            // Transfer event HID-эндпоинта завершился, пока ждём EP0: сохраняем его для
+            // цикла опроса, а не проглатываем отчёт.
             defer_event(ctrl, ev);
             continue;
         }
@@ -2125,7 +1933,7 @@ fn control_in(
         }
         let got = len.saturating_sub(ev.residual() as usize);
         let slot = ctrl.slots.get(slot_index)?;
-        // SAFETY: `ctrl_buf` is our own page and `got <= len <= PAGE_SIZE`.
+        // SAFETY: `ctrl_buf` — наша страница и `got <= len <= PAGE_SIZE`.
         let bytes =
             unsafe { core::slice::from_raw_parts(slot.ctrl_buf.virt() as *const u8, got) }.to_vec();
         result = Some(bytes);
@@ -2134,13 +1942,11 @@ fn control_in(
     result
 }
 
-/// Run a control transfer with NO data stage (a standard OUT request).
+/// Выполнить control-передачу БЕЗ data-стадии (стандартный OUT-запрос).
 ///
-/// WHY THIS EXISTS: enumeration used to go straight from GET_DESCRIPTOR to the
-/// xHCI Configure Endpoint command, never sending USB SET_CONFIGURATION. The
-/// device therefore stayed unconfigured, its interrupt endpoint answered STALL,
-/// and the report path read `cc=6` (stall) forever — a keyboard that enumerates
-/// but never types.
+/// SET_CONFIGURATION обязателен: без него устройство остаётся
+/// неконфигурированным, interrupt-эндпоинт отвечает STALL, и путь отчётов вечно
+/// читает `cc=6` (stall) — клавиатура перечисляется, но не печатает.
 fn control_no_data(
     ctrl: &mut Controller,
     slot_index: usize,
@@ -2156,12 +1962,11 @@ fn control_no_data(
         let dw0 = request_type as u32 | ((request as u32) << 8) | ((value as u32) << 16);
         let dw1 = index as u32;
         let dw3 = ((TRB_SETUP as u32) << 10) | TRB_IDT | TRT_NO_DATA;
-        // The Setup TRB's status field is the transfer length of the SETUP PACKET,
-        // which is always 8 — even for a request with no data stage (the stage is
-        // signalled by TRT=0 instead). Writing 0 here made the controller reject
-        // the whole transfer before the device ever saw it.
+        // Поле status Setup TRB — длина SETUP PACKET, всегда 8, даже для запроса без
+        // data-стадии (стадия задаётся TRT=0). 0 здесь заставлял контроллер отклонить всю
+        // передачу до того, как её увидит устройство.
         slot.ep0.push(dw0, dw1, 8, dw3);
-        // Status stage: for a transfer without a data stage the status is IN.
+        // Status-стадия: для передачи без data-стадии status — IN.
         slot.ep0
             .push(0, 0, 0, ((TRB_STATUS as u32) << 10) | TRB_DIR_IN | TRB_IOC);
         slot.id
@@ -2175,8 +1980,8 @@ fn control_no_data(
             continue;
         }
         if ev.endpoint_id() != 1 {
-            // A HID endpoint's transfer completed while ENUMERATION was sending a
-            // control request; preserve it for the poll loop.
+            // Transfer event HID-эндпоинта пришёл, пока ПЕРЕЧИСЛЕНИЕ отправляло
+            // control-запрос; сохраняем его для цикла опроса.
             defer_event(ctrl, ev);
             continue;
         }
@@ -2190,7 +1995,7 @@ fn control_no_data(
     false
 }
 
-/// Read a descriptor: `kind` is the descriptor type, `index` its index.
+/// Прочитать дескриптор: `kind` — тип дескриптора, `index` — его индекс.
 fn get_descriptor(
     ctrl: &mut Controller,
     slot_index: usize,
@@ -2209,27 +2014,27 @@ fn get_descriptor(
     )
 }
 
-/// Enable a slot and return its index in `ctrl.slots`.
+/// Включить слот и вернуть его индекс в `ctrl.slots`.
 fn enable_slot(ctrl: &mut Controller) -> Option<usize> {
     let ev = command(ctrl, 0, 0, 0, (TRB_ENABLE_SLOT as u32) << 10)?;
     if ev.completion_code() != CC_SUCCESS {
         crate::warn!("xhci: enable slot failed: cc={}", ev.completion_code());
         return None;
     }
-    // A per-port stage is recorded by the caller, which knows the port; the slot
-    // command itself only says whether the controller had a free slot.
+    // Стадию порта записывает вызывающий, который знает порт; сама команда слота
+    // сообщает лишь, был ли у контроллера свободный слот.
     let id = ev.slot_id();
     if id == 0 {
         return None;
     }
-    // The device context array entry for this slot must point at the device
-    // context before ADDRESS_DEVICE is issued.
+    // Запись device context для этого слота должна указывать на device context до
+    // выдачи ADDRESS_DEVICE.
     let ep0 = Ring::new("ep0 ring")?;
     let input_ctx = DmaFrame::new_zeroed("input context")?;
     let device_ctx = DmaFrame::new_zeroed("device context")?;
     let ctrl_buf = DmaFrame::new_zeroed("control buffer")?;
-    // SAFETY: DCBAA is our own frame and `id` is a slot the controller just gave
-    // us, so the index is inside the array.
+    // SAFETY: DCBAA — наш кадр, а `id` — слот, который контроллер только что выдал,
+    // поэтому индекс лежит внутри массива.
     unsafe {
         let entry =
             (crate::memory::vmm::phys_to_virt(ctrl.dcbaa_phys) as *mut u64).add(id as usize);
@@ -2248,7 +2053,7 @@ fn enable_slot(ctrl: &mut Controller) -> Option<usize> {
     Some(ctrl.slots.len() - 1)
 }
 
-/// Build the input context for ADDRESS_DEVICE and issue the command.
+/// Собрать input context для ADDRESS_DEVICE и выдать команду.
 fn address_device(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8) -> bool {
     let ctx_size = ctrl.ctx_size;
     let Some(slot) = ctrl.slots.get(slot_index) else {
@@ -2261,28 +2066,26 @@ fn address_device(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
     let slot_id = slot.id;
     let max_packet = ep0_max_packet(speed);
 
-    // SAFETY: `input` is our own zeroed page; the Input Control Context (32 B),
-    // the slot context and the EP0 context all live inside it at the offsets the
-    // spec defines for a controller with this context size.
+    // SAFETY: `input` — наша обнулённая страница; Input Control Context (32 B),
+    // slot context и EP0 context лежат в ней по смещениям, которые спецификация
+    // задаёт для контроллера с таким размером контекста.
     unsafe {
         let p = input as *mut u32;
-        // ICC: add slot + EP0.
+        // ICC: добавить slot + EP0.
         write_volatile(p, 0); // drop flags
         write_volatile(p.add(1), 0b11); // add flags: A0 (slot) + A1 (EP0)
-                                        // Slot context: speed + port + one context entry.
+                                        // Slot context: скорость + порт + одна запись контекста.
         let slot_ctx = p.add(8) as *mut u32; // 32-byte ICC
         write_volatile(
             slot_ctx,
             (1 << SLOT_CTX_ENTRIES_SHIFT) | ((speed as u32) << SLOT_CTX_SPEED_SHIFT),
         );
         write_volatile(slot_ctx.add(1), (port as u32) << SLOT_CTX_PORT_SHIFT);
-        // EP0 context. DWORD 0 carries only the interval (0 for a control
-        // endpoint); CErr, the endpoint type and the max packet size live in
-        // DWORD 1. This layout matters: the first version put CErr and the max
-        // packet in DWORD 0, which put the packet size in the interval field and
-        // left EP info 2 empty — control transfers survived on the device's own
-        // EP0 defaults, which is exactly why the mistake stayed invisible until
-        // an interrupt endpoint had to be configured.
+        // EP0 context. DWORD 0 несёт только interval (0 для control-эндпоинта); CErr,
+        // тип эндпоинта и максимальный размер пакета живут в DWORD 1. Раскладка важна:
+        // CErr и max packet в DWORD 0 попадают в interval и оставляют EP info 2 пустым.
+        // Control-передачи могут выживать на дефолтах EP0 устройства, поэтому ошибка
+        // незаметна, пока не нужно сконфигурировать interrupt-эндпоинт.
         let ep_ctx = (input + ctx_size * 2) as *mut u32;
         write_volatile(ep_ctx, 0);
         write_volatile(
@@ -2296,10 +2099,9 @@ fn address_device(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
     }
     let _ = device_ctx_phys;
 
-    // The TRB parameter is a GUEST-PHYSICAL address; `input` is the HHDM virtual
-    // one. Handing the controller the virtual address made it read unrelated
-    // memory and reject the command with a TRB error (cc=5) — the second half of
-    // why enumeration had never worked.
+    // Параметр TRB — ГОСТЕВОЙ ФИЗИЧЕСКИЙ адрес; `input` — виртуальный адрес HHDM.
+    // Виртуальный адрес заставлял контроллер читать чужую память и отклонять команду
+    // с TRB error (cc=5).
     let (a0, a1) = ctx_addr(input_phys);
     let ev = command(
         ctrl,
@@ -2325,13 +2127,13 @@ fn address_device(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
     }
 }
 
-/// Update EP0's max packet size after the first descriptor read.
+/// Обновить максимальный размер пакета EP0 после чтения первого дескриптора.
 ///
-/// A full/low-speed device may start with an 8-byte EP0 and report its real
-/// `bMaxPacketSize0` only in the device descriptor; reading the 18-byte descriptor
-/// through an 8-byte EP0 then fails on real hardware (QEMU's keyboard is
-/// high-speed, so its 64-byte EP0 hid this). Evaluate Context is the specified way
-/// to change it: the input context carries the slot and EP0 contexts again.
+/// Full/low-speed устройство может начать с 8-байтного EP0 и сообщить настоящий
+/// `bMaxPacketSize0` только в дескрипторе устройства; чтение 18-байтного
+/// дескриптора через 8-байтный EP0 на реальном железе падает. Evaluate Context —
+/// штатный способ изменить размер: input context снова несёт slot и EP0
+/// контексты.
 fn evaluate_ep0_max_packet(ctrl: &mut Controller, slot_index: usize, max_packet: u32) -> bool {
     let ctx_size = ctrl.ctx_size;
     let (input, input_phys, ep0_phys, slot_id, port, speed) = {
@@ -2347,7 +2149,7 @@ fn evaluate_ep0_max_packet(ctrl: &mut Controller, slot_index: usize, max_packet:
             slot.speed,
         )
     };
-    // SAFETY: our own zeroed page; offsets are the spec's for this context size.
+    // SAFETY: наша обнулённая страница; смещения заданы спецификацией для такого размера контекста.
     unsafe {
         let p = input as *mut u32;
         core::ptr::write_bytes(input as *mut u8, 0, PAGE_SIZE);
@@ -2381,20 +2183,18 @@ fn evaluate_ep0_max_packet(ctrl: &mut Controller, slot_index: usize, max_packet:
     matches!(ev, Some(ev) if ev.completion_code() == CC_SUCCESS)
 }
 
-/// Configure every bindable HID interrupt-IN endpoint in ONE xHCI Configure
-/// Endpoint command.
+/// Сконфигурировать все привязываемые HID interrupt-IN эндпоинты ОДНОЙ командой
+/// Configure Endpoint.
 ///
-/// WHY ONE COMMAND: the slot context's "Context Entries" field must be the
-/// highest DCI the device context carries, so adding endpoints one at a time
-/// would re-write the slot context and issue N commands for N interfaces. The
-/// device may have several (a combo keyboard's boot keyboard plus
-/// consumer/system collections); configuring them together is also what makes
-/// the xHCI endpoint state consistent with the single SET_CONFIGURATION.
+/// Поле «Context Entries» slot context должно быть старшим DCI, который несёт
+/// device context; добавление эндпоинтов по одному переписывало бы slot context и
+/// слало N команд на N интерфейсов. Устройство может иметь несколько интерфейсов
+/// (boot-клавиатура плюс consumer/system-коллекции); совместная конфигурация ещё и
+/// согласует состояние эндпоинтов xHCI с единственным SET_CONFIGURATION.
 ///
-/// The endpoint's `wMaxPacketSize` is the transfer buffer's lower bound: an
-/// interrupt transfer may legitimately deliver a full packet, and a request
-/// shorter than that is a babble (completion code 3) — the field mouse's 7-byte
-/// report against the old 4-byte buffer.
+/// `wMaxPacketSize` эндпоинта — нижняя граница буфера передачи: interrupt-передача
+/// может законно доставить полный пакет, а запрос короче — это babble (код
+/// завершения 3).
 fn configure_hid_endpoints(
     ctrl: &mut Controller,
     slot_index: usize,
@@ -2414,9 +2214,9 @@ fn configure_hid_endpoints(
             slot.speed,
         )
     };
-    // Rings and buffers first: their physical addresses go into the endpoint
-    // contexts. Dropping this Vec on a failure returns the frames to the PMM, so
-    // a failed Configure Endpoint leaves nothing behind.
+    // Сначала кольца и буферы: их физические адреса идут в контексты эндпоинтов. При
+    // отказе Vec дропается и возвращает кадры в PMM, так что неудачный Configure
+    // Endpoint ничего не оставляет.
     let mut eps: Vec<HidEndpoint> = Vec::with_capacity(ifaces.len());
     for (i, iface) in ifaces.iter().enumerate() {
         let Some(ring) = Ring::new("hid ring") else {
@@ -2425,8 +2225,8 @@ fn configure_hid_endpoints(
         let Some(buf) = DmaFrame::new_zeroed("hid buffer") else {
             return false;
         };
-        let len = usb_hid_proto::transfer_len(iface.max_packet);
-        if (iface.max_packet & 0x07FF) as usize > usb_hid_proto::MAX_REPORT {
+        let len = usb_hid_report::transfer_len(iface.max_packet);
+        if (iface.max_packet & 0x07FF) as usize > usb_hid_report::MAX_REPORT {
             crate::warn!(
                 "xhci: iface {}: wMaxPacketSize {} exceeds the {}B transfer buffer; clamped (a longer report would babble)",
                 iface.interface,
@@ -2449,15 +2249,15 @@ fn configure_hid_endpoints(
             disabled: false,
         });
     }
-    // Highest DCI present decides the slot context's Context Entries field.
+    // Старший присутствующий DCI задаёт поле Context Entries slot context.
     let max_dci = eps.iter().map(|ep| ep.dci).max().unwrap_or(1);
-    // SAFETY: `input` is our own zeroed page; the contexts are written at the
-    // offsets the controller's context size dictates, and every DCI is <= 31
-    // (device endpoint numbers are 4 bits), so the writes stay in the page.
+    // SAFETY: `input` — наша обнулённая страница; контексты пишутся по смещениям,
+    // которые диктует размер контекста контроллера, и каждый DCI <= 31 (номер
+    // эндпоинта устройства — 4 бита), поэтому записи остаются в странице.
     unsafe {
         let p = input as *mut u32;
         core::ptr::write_bytes(input as *mut u8, 0, PAGE_SIZE);
-        // Input Control Context: A0 (slot context) plus one Add flag per DCI.
+        // Input Control Context: A0 (slot context) плюс Add-флаг на каждый DCI.
         let mut add = 1u32;
         for ep in &eps {
             add |= 1u32 << ep.dci;
@@ -2467,9 +2267,9 @@ fn configure_hid_endpoints(
         write_volatile(slot_ctx, (max_dci as u32) << SLOT_CTX_ENTRIES_SHIFT);
         for (ep, iface) in eps.iter().zip(ifaces.iter()) {
             let ep_ctx = (input + ctx_size * (1 + ep.dci as usize)) as *mut u32;
-            // xHCI stores the polling interval as log2(microframes) for high/super
-            // speed devices (so USB bInterval=1 is field 0) and as the frame count
-            // for full/low speed. Writing bInterval raw gave 2^bInterval.
+            // xHCI хранит polling interval как log2(микрокадров) для high/super-speed
+            // (поэтому USB bInterval=1 — поле 0) и как число кадров для full/low speed. Сырой
+            // bInterval давал 2^bInterval.
             let interval_field: u32 = if speed == SPEED_HIGH || speed == SPEED_SUPER {
                 (iface.interval.saturating_sub(1) & 0x0F) as u32
             } else {
@@ -2487,7 +2287,7 @@ fn configure_hid_endpoints(
             write_volatile(ep_ctx.add(3), (ring_phys >> 32) as u32);
         }
     }
-    // Physical address: see the same note in `address_device`.
+    // Физический адрес: см. тот же комментарий в `address_device`.
     let (a0, a1) = ctx_addr(input_phys);
     let ev = command(
         ctrl,
@@ -2511,8 +2311,7 @@ fn configure_hid_endpoints(
     true
 }
 
-/// Enumerate the device on `port`, returning true when a HID interface was
-/// configured. Logs what it found either way.
+/// Перечислить устройство на `port`; true, если HID-интерфейс сконфигурирован.
 fn enumerate_with_speed(ctrl: &mut Controller, port: u8, speed: u8) -> bool {
     let Some(slot_index) = enable_slot(ctrl) else {
         ctrl.fail(port, "enable-slot", 0);
@@ -2522,15 +2321,15 @@ fn enumerate_with_speed(ctrl: &mut Controller, port: u8, speed: u8) -> bool {
     ctrl.slots[slot_index].speed = speed;
     let ok = enumerate_slot(ctrl, slot_index, port, speed);
     if !ok {
-        // A failed enumeration must NOT leave the slot behind: the poll loop skips
-        // any port whose slot exists (so the retry would never run), and the
-        // controller only has 64 slots in total.
+        // Неудачное перечисление НЕ должно оставлять слот: цикл опроса пропускает порт,
+        // у которого слот существует, и повтор никогда бы не выполнился, а у контроллера
+        // всего 64 слота.
         release_slot(ctrl, slot_index);
     }
     ok
 }
 
-/// Disable a slot the controller gave us and drop its bookkeeping.
+/// Отключить выданный контроллером слот и убрать его учёт.
 fn release_slot(ctrl: &mut Controller, slot_index: usize) {
     let Some(slot) = ctrl.slots.get(slot_index) else {
         return;
@@ -2543,8 +2342,8 @@ fn release_slot(ctrl: &mut Controller, slot_index: usize) {
         0,
         ((TRB_DISABLE_SLOT as u32) << 10) | ((slot_id as u32) << 24),
     );
-    // Clear the DCBAA entry so a later slot id cannot alias the old context.
-    // SAFETY: DCBAA is our own frame and `slot_id` was handed out by the controller.
+    // Очистить запись DCBAA, чтобы будущий slot id не сослался на старый контекст.
+    // SAFETY: DCBAA — наш кадр, а `slot_id` выдал контроллер.
     unsafe {
         let entry =
             (crate::memory::vmm::phys_to_virt(ctrl.dcbaa_phys) as *mut u64).add(slot_id as usize);
@@ -2553,7 +2352,7 @@ fn release_slot(ctrl: &mut Controller, slot_index: usize) {
     ctrl.slots.remove(slot_index);
 }
 
-/// Everything after Enable Slot: address, descriptors, configuration, HID endpoint.
+/// Всё после Enable Slot: адресация, дескрипторы, конфигурация, HID-эндпоинт.
 fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8) -> bool {
     let speed_name = match speed {
         SPEED_LOW => "low",
@@ -2565,8 +2364,8 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
     if !address_device(ctrl, slot_index, port, speed) {
         return false;
     }
-    // Device descriptor: 8 bytes first (a full-speed device may only have an
-    // 8-byte EP0 at this point), then the whole 18.
+    // Дескриптор устройства: сначала 8 байт (у full-speed устройства на этом этапе
+    // может быть только 8-байтный EP0), затем все 18.
     let Some(head) = get_descriptor(ctrl, slot_index, 1, 0, 8) else {
         ctrl.fail(port, "device-descriptor", 0);
         crate::warn!("xhci: port {}: no device descriptor", port);
@@ -2578,9 +2377,9 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
     }
     let vendor = u16::from_le_bytes([head[0], head[1]]);
     let product = u16::from_le_bytes([head[2], head[3]]);
-    // The first 8 bytes carry bMaxPacketSize0 at offset 7. For full/low speed the
-    // controller was told 8; if the device says otherwise, update EP0 before
-    // asking for the 18-byte descriptor, or the long read fails on real hardware.
+    // Первые 8 байт несут bMaxPacketSize0 в смещении 7. Для full/low speed
+    // контроллеру сказано 8; если устройство говорит иначе, обновить EP0 до запроса
+    // 18-байтного дескриптора, иначе длинное чтение на реальном железе падает.
     let device_mps = head[7] as u32;
     let assumed_mps = ep0_max_packet(speed);
     if device_mps != assumed_mps && matches!(device_mps, 8 | 16 | 32 | 64) {
@@ -2608,7 +2407,7 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
         return false;
     }
     let max_packet0 = dev[7];
-    crate::info!(
+    crate::debug!(
         "xhci: port {} {:04x}:{:04x} speed={} ep0={}B",
         port,
         vendor,
@@ -2625,9 +2424,9 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
         )
         }
         0 => {}
-        class => crate::info!("xhci: port {} device class {:#04x}", port, class),
+        class => crate::debug!("xhci: port {} device class {:#04x}", port, class),
     }
-    // Configuration descriptor: 9 bytes for the total length, then the whole blob.
+    // Дескриптор конфигурации: 9 байт для общей длины, затем весь блок.
     let Some(head) = get_descriptor(ctrl, slot_index, 2, 0, 9) else {
         ctrl.fail(port, "config-descriptor", 0);
         return false;
@@ -2648,7 +2447,7 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
     let ifaces = usb_desc::parse_hid_interfaces(&conf);
     if ifaces.is_empty() {
         ctrl.fail(port, "no-hid-interface", dev[4] as u32);
-        crate::info!(
+        crate::debug!(
             "xhci: port {}: device {:04x}:{:04x} has no HID interrupt-IN interface",
             port,
             vendor,
@@ -2656,15 +2455,15 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
         );
         return false;
     }
-    // Bind only boot-class keyboard/mouse interfaces. A HID interface with
-    // protocol 0 (consumer/system/vendor collections, even on a keyboard that
-    // also exposes a boot keyboard) has no report layout this driver parses;
-    // binding it would burn a ring and a buffer to feed reports `usb_hid` must
-    // ignore. The skipped interfaces are logged so the decision is visible.
+    // Привязывать только boot-интерфейсы клавиатуры/мыши. HID-интерфейс с protocol 0
+    // (consumer/system/vendor-коллекции, даже у клавиатуры с boot-интерфейсом) не
+    // имеет раскладки, которую драйвер разбирает; привязка сожгла бы кольцо и буфер
+    // ради отчётов, которые `usb_hid` обязан игнорировать. Пропущенные интерфейсы
+    // логируются на debug.
     let mut chosen: Vec<HidIface> = Vec::new();
     for iface in ifaces {
-        if !usb_hid_proto::bindable(iface.subclass, iface.protocol) {
-            crate::info!(
+        if !usb_hid_report::bindable(iface.subclass, iface.protocol) {
+            crate::debug!(
                 "xhci: port {}: iface {} (subclass={} protocol={}) is not a boot keyboard/mouse; not bound",
                 port,
                 iface.interface,
@@ -2673,8 +2472,8 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
             );
             continue;
         }
-        // One device endpoint number must not be configured twice: two HID
-        // interfaces sharing an endpoint cannot both own the same DCI.
+        // Один номер эндпоинта устройства нельзя конфигурировать дважды: два
+        // HID-интерфейса с общим эндпоинтом не могут владеть одним DCI.
         if chosen
             .iter()
             .any(|c| c.ep_addr & 0x0F == iface.ep_addr & 0x0F)
@@ -2691,7 +2490,7 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
     }
     let Some(config_value) = chosen.first().map(|i| i.config_value) else {
         ctrl.fail(port, "no-boot-hid", dev[4] as u32);
-        crate::info!(
+        crate::debug!(
             "xhci: port {}: device {:04x}:{:04x} has HID interfaces but none is a boot keyboard/mouse",
             port,
             vendor,
@@ -2699,18 +2498,17 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
         );
         return false;
     };
-    // SET_CONFIGURATION activates the device (without it every endpoint stalls).
+    // SET_CONFIGURATION активирует устройство (без него все эндпоинты отвечают STALL).
     if !control_no_data(ctrl, slot_index, 0x00, 9, config_value as u16, 0) {
         ctrl.fail(port, "set-configuration", config_value as u32);
         crate::warn!("xhci: port {}: SET_CONFIGURATION failed", port);
         return false;
     }
-    // SET_PROTOCOL(0) = BOOT (HID 1.11 §7.2.6; the old code sent wValue=1, which
-    // is REPORT protocol, while its comment claimed boot). Boot pins the report
-    // layout to 8-byte keyboard / 3-byte mouse. A device may refuse (STALL): stay
-    // in report protocol, record that so the parser does not pretend it is boot,
-    // and keep the endpoint — `usb_hid`'s best-effort layouts are still better
-    // than a dead keyboard. SET_IDLE(0) = report on change only.
+    // SET_PROTOCOL(0) = BOOT (HID 1.11 §7.2.6): boot фиксирует раскладку 8 байт для
+    // клавиатуры и 3 для мыши. Устройство может отказать (STALL): остаёмся в report
+    // protocol, записываем это, чтобы парсер не выдавал его за boot, и сохраняем
+    // эндпоинт — best-effort раскладки `usb_hid` лучше мёртвой клавиатуры.
+    // SET_IDLE(0) = отчёт только при изменении.
     let mut modes: Vec<ReportMode> = Vec::with_capacity(chosen.len());
     for iface in &chosen {
         let mode = if control_no_data(ctrl, slot_index, 0x21, 0x0B, 0, iface.interface as u16) {
@@ -2738,9 +2536,9 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
     }
     ctrl.stage(port, "hid-ready", chosen.len() as u32);
     for (iface, ep) in chosen.iter().zip(ctrl.slots[slot_index].hid.iter()) {
-        // Boot class: 0 = none, 1 = keyboard, 2 = mouse. `mode` is what
-        // SET_PROTOCOL actually achieved; `report` is the transfer buffer size
-        // derived from wMaxPacketSize (>= a whole packet, so no babble).
+        // Boot class: 0 — нет, 1 — клавиатура, 2 — мышь. `mode` — чего достиг
+        // SET_PROTOCOL; `report` — размер буфера передачи из wMaxPacketSize (>= целого
+        // пакета, поэтому babble исключён).
         crate::info!(
             "xhci: HID device on port {}: iface={} subclass={} protocol={} ep={:#04x} report={}B mode={} maxpkt={}",
             port,
@@ -2756,19 +2554,18 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
     true
 }
 
-/// One poll pass: enumerate anything newly attached, then collect HID reports
-/// and hand them to [`crate::drivers::usb_hid`].
+/// Один проход опроса: перечислить новые подключения, затем собрать HID-отчёты и
+/// передать их в [`crate::drivers::usb_hid`].
 pub fn poll() {
     let mut guard = CONTROLLER.lock();
     let Some(ctrl) = guard.as_mut() else {
         return;
     };
-    // A halted controller is the worst failure mode this driver has: HCH=1 means
-    // it stopped walking the rings, and every port register keeps the value it
-    // had at the moment it died. The old driver never looked, so the diagnostic
-    // screen presented a dead controller's frozen state as live ("all ports stuck
-    // in Polling, tries exhausted") and kept retrying port writes the controller
-    // could not see. Detect it, record the registers that prove it, and restart.
+    // Остановленный контроллер — худший отказ драйвера: HCH=1 означает, что он
+    // перестал обходить кольца, и регистры портов хранят значения на момент смерти.
+    // Если этого не замечать, экран показывает замороженное состояние как живое и
+    // повторяет записи, которых контроллер не видит. Обнаружить, запомнить
+    // доказывающие регистры и перезапустить.
     if rd32(ctrl.op, OP_USBSTS) & USBSTS_HCH != 0 {
         ctrl.halts = ctrl.halts.saturating_add(1);
         let cmd = rd32(ctrl.op, OP_USBCMD);
@@ -2793,46 +2590,21 @@ pub fn poll() {
             );
             return;
         }
-        crate::info!("xhci: controller restarted (halt #{})", ctrl.halts);
+        crate::debug!("xhci: controller restarted (halt #{})", ctrl.halts);
     }
-    // 1. Advance ONE port's policy one step per poll, round-robin. The policy
-    //    itself never blocks (a debounce/reset/backoff is a deadline checked on
-    //    later polls), so a slow or dead port costs one PORTSC read per pass and
-    //    the boot menu's countdown keeps running. One port per poll also keeps
-    //    the enumeration work of a newly enabled device from delaying every
-    //    other port's deadline by more than one pass.
+    // 1. За poll продвигать политику ОДНОГО порта, циклически. Политика не
+    //    блокируется (debounce/reset/backoff — дедлайн, проверяемый на следующих
+    //    poll), поэтому медленный или мёртвый порт стоит одного чтения PORTSC за
+    //    проход, а отсчёт boot-меню продолжается. Один порт за poll ещё и не даёт
+    //    перечислению нового устройства задержать дедлайны остальных больше чем на
+    //    проход.
     let port = ctrl.next_port;
     ctrl.next_port = if port >= ctrl.ports { 1 } else { port + 1 };
     poll_port(ctrl, port);
 
-    // One-shot port map after one full round-robin pass: on a machine where
-    // nothing enumerates, this says whether the controller reports a device at
-    // all, which separates "our reset/enumeration is wrong" from "the device is
-    // not on this controller". The wrap is the trigger, not `brought_up`:
-    // ports with no device never enumerate by design, and the map is exactly
-    // what a photo of such a machine needs.
-    if !ctrl.logged_ports && ctrl.next_port == 1 {
-        ctrl.logged_ports = true;
-        for port in 1..=ctrl.ports {
-            let sc = rd32(ctrl.op, portsc(port));
-            if sc != 0 {
-                crate::info!(
-                    "xhci: port {} after bring-up PORTSC={:#010x} ccs={} ped={} pp={} speed={} pls={}",
-                    port,
-                    sc,
-                    sc & PORTSC_CCS != 0,
-                    sc & PORTSC_PED != 0,
-                    sc & PORTSC_PP != 0,
-                    (sc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT,
-                    (sc & PORTSC_PLS_MASK) >> 5
-                );
-            }
-        }
-    }
-
-    // 2. Arm every idle HID interrupt-IN endpoint. Completions are drained
-    //    afterwards, not per endpoint, so one device's completion cannot be
-    //    swallowed while another endpoint is being serviced.
+    // 2. Вооружить каждый простаивающий HID interrupt-IN эндпоинт. Завершения
+    //    собираются после, а не по эндпоинту, чтобы завершение одного устройства не
+    //    проглатывалось при обслуживании другого.
     for si in 0..ctrl.slots.len() {
         let slot_id = ctrl.slots[si].id;
         for hi in 0..ctrl.slots[si].hid.len() {
@@ -2857,9 +2629,8 @@ pub fn poll() {
             }
         }
     }
-    // 3. Drain completion events. Every transfer event names its slot and
-    //    endpoint; route it to that endpoint. (The old loop matched only the
-    //    single endpoint it was currently looking at and dropped the rest.)
+    // 3. Собрать события завершения. Каждое transfer event несёт slot и эндпоинт;
+    //    маршрутизировать по ним.
     let mut events = 0usize;
     while events < 64 {
         let Some(ev) = next_poll_event(ctrl, 0) else {
@@ -2881,8 +2652,8 @@ pub fn poll() {
         else {
             continue;
         };
-        // Snapshot what the completion needs; keep every borrow of the slot short
-        // because recovery issues a command through `ctrl`.
+        // Снять снимок нужного завершению; держать заимствования слота короткими,
+        // потому что восстановление шлёт команду через `ctrl`.
         let (len, mode, subclass, protocol, buf_virt) = {
             let hid = &ctrl.slots[si].hid[hi];
             (
@@ -2900,16 +2671,15 @@ pub fn poll() {
             if got == 0 {
                 continue;
             }
-            let mut report = [0u8; usb_hid_proto::MAX_REPORT];
+            let mut report = [0u8; usb_hid_report::MAX_REPORT];
             let n = got.min(report.len());
-            // SAFETY: the buffer is our own DMA page, `n <= len <= MAX_REPORT`,
-            // and the controller wrote at most `len` bytes into it before
-            // publishing this transfer event.
+            // SAFETY: буфер — наша DMA-страница, `n <= len <= MAX_REPORT`, и контроллер
+            // записал в неё не больше `len` байт до публикации этого transfer event.
             unsafe {
                 core::ptr::copy_nonoverlapping(buf_virt as *const u8, report.as_mut_ptr(), n);
             }
             let report = &report[..n];
-            let required = usb_hid_proto::minimum_report_len(subclass, protocol, mode);
+            let required = usb_hid_report::minimum_report_len(subclass, protocol, mode);
             if n < required {
                 ctrl.hid_bad_reports += 1;
                 let hid = &mut ctrl.slots[si].hid[hi];
@@ -2931,15 +2701,14 @@ pub fn poll() {
             }
             continue;
         }
-        // Transfer error (babble, data-buffer error, stall, USB transaction
-        // error, …): recover instead of disabling the endpoint on the first one.
-        // The old "input off until reboot" is now the LAST resort, after
-        // `MAX_RECOVERIES` failed resets.
+        // Ошибка передачи (babble, data-buffer error, stall, USB transaction error, …):
+        // восстановить, а не отключать эндпоинт с первой ошибкой. Отключение — последнее
+        // средство, после `MAX_RECOVERIES` неудачных reset.
         let (previous, iface) = {
             let hid = &ctrl.slots[si].hid[hi];
             (hid.recoveries, hid.iface)
         };
-        match usb_hid_proto::recovery_action(previous) {
+        match usb_hid_report::recovery_action(previous) {
             RecoveryAction::ResetEndpoint => {
                 ctrl.slots[si].hid[hi].recoveries += 1;
                 let attempt = ctrl.slots[si].hid[hi].recoveries;
@@ -2954,10 +2723,10 @@ pub fn poll() {
                     cc,
                     if ok { "ok, re-arming" } else { "failed" },
                     attempt,
-                    usb_hid_proto::MAX_RECOVERIES
+                    usb_hid_report::MAX_RECOVERIES
                 );
-                // The errored TRB produced this event, so the transfer ring has
-                // no outstanding TRB: the next poll pushes a fresh Normal TRB.
+                // Ошибка пришла от этого TRB, поэтому незавершённых TRB в кольце нет: следующий
+                // poll положит новый Normal TRB.
                 ctrl.slots[si].hid[hi].ring.outstanding = false;
             }
             RecoveryAction::Disable => {
@@ -2969,22 +2738,19 @@ pub fn poll() {
                     hid.iface,
                     dci,
                     cc,
-                    usb_hid_proto::MAX_RECOVERIES
+                    usb_hid_report::MAX_RECOVERIES
                 );
             }
         }
     }
 }
 
-/// Recover one halted HID endpoint with the xHCI Reset Endpoint command (TRB
-/// type 14: slot id in bits 24-31, DCI in bits 16-20).
+/// Восстановить остановленный HID-эндпоинт командой xHCI Reset Endpoint (TRB
+/// type 14: slot id в битах 24-31, DCI в 16-20).
 ///
-/// WHY NOT JUST RE-ARM: a transfer error moves the endpoint to the Halted state,
-/// and re-arming a halted endpoint only produces the same error event again. The
-/// old driver read that as "this device is broken" and disabled input until
-/// reboot — which is exactly what the field mouse looked like after its first
-/// 7-byte report hit the 4-byte buffer. Reset Endpoint returns the endpoint to
-/// Stopped/Running so the next poll's Normal TRB executes.
+/// Просто переармировать нельзя: ошибка передачи переводит эндпоинт в Halted, и
+/// повторная постановка TRB даёт ту же ошибку. Reset Endpoint возвращает эндпоинт
+/// в Stopped/Running, чтобы Normal TRB следующего poll выполнился.
 fn reset_hid_endpoint(ctrl: &mut Controller, slot_id: u8, dci: u8) -> bool {
     let ev = command(
         ctrl,
@@ -2996,14 +2762,15 @@ fn reset_hid_endpoint(ctrl: &mut Controller, slot_id: u8, dci: u8) -> bool {
     matches!(ev, Some(ev) if ev.completion_code() == CC_SUCCESS)
 }
 
-/// Bring a halted controller back: reset it, re-point it at our rings, run it.
+/// Вернуть остановленный контроллер: сбросить, снова указать на наши кольца,
+/// запустить.
 ///
-/// Everything this needs is owned by the `Controller` (rings, DCBAA, scratchpad
-/// array), which is the reason those frames became fields: a reset makes the
-/// controller re-read them, so they must still be ours.
+/// Всё нужное принадлежит `Controller` (кольца, DCBAA, массив scratchpad),
+/// поэтому эти кадры — поля: после сброса контроллер перечитывает их, и они
+/// должны оставаться нашими.
 fn restart_controller(ctrl: &mut Controller) -> bool {
-    // Stop, then reset. The halt may be an HCE; a port or command write will not
-    // clear it, a controller reset does.
+    // Сначала стоп, затем сброс. Halt может быть HCE; запись в порт или команда его
+    // не снимут, а сброс контроллера — снимет.
     wr32(ctrl.op, OP_USBCMD, 0);
     let _ = spin_until(|| rd32(ctrl.op, OP_USBSTS) & USBSTS_HCH != 0, 200_000);
     wr32(ctrl.op, OP_USBCMD, USBCMD_HCRST);
@@ -3024,8 +2791,8 @@ fn restart_controller(ctrl: &mut Controller) -> bool {
     if !spin_until(|| rd32(ctrl.op, OP_USBSTS) & USBSTS_HCH == 0, 2_000_000) {
         return false;
     }
-    // A controller reset forgets every slot and every port; the rings start from
-    // their first TRB with the cycle bit set again.
+    // Сброс контроллера забывает все слоты и порты; кольца начинаются с первого TRB
+    // снова с установленным cycle bit.
     ctrl.slots.clear();
     ctrl.deferred_events.clear();
     ctrl.brought_up.clear();
@@ -3047,37 +2814,31 @@ fn restart_controller(ctrl: &mut Controller) -> bool {
         d.seen_ped_u0 = false;
         d.ped_sc = 0;
         d.ms = 0;
-        d.next_log_us = 0;
         d.policy = PortPolicy::new(d.proto == 3);
     }
     true
 }
 
-/// Poll loop, run as the kernel's `usb` thread.
+/// Цикл опроса, работающий в потоке ядра `usb`.
 ///
-/// One pass: enumerate anything newly attached, then collect whatever reports the
-/// configured HID endpoints have produced. Sleeping a millisecond between passes
-/// costs nothing measurable (the transfers are re-armed, not restarted) and keeps
-/// the thread out of the way of the shell and the network pump.
+/// Один проход: перечислить новые подключения, затем собрать отчёты
+/// сконфигурированных HID-эндпоинтов. Сон в 1 мс между проходами ничего заметного
+/// не стоит (передачи переармируются, а не перезапускаются) и не мешает shell и
+/// сетевому насосу.
 pub fn usb_thread() {
-    if status().0 {
-        crate::info!("usb: poll thread started");
-    }
     loop {
         poll();
         crate::task::scheduler::sleep_ticks(1);
     }
 }
 
-/// One row per port that has (or had) a device on it, for the boot menu.
+/// Одна строка на порт, где есть (или было) устройство, для boot-меню.
 ///
-/// The stage is where enumeration stopped — `hid-ready` means the device types,
-/// anything else is the answer to "why does the keyboard not work". The two
-/// PORTSC snapshots separate "the port never enabled" from "the device did not
-/// answer after it was enabled", `ped_sc` is the per-port PORTSC snapshot at the
-/// last PED+U0 sighting (or the last transient PED sighting when `ped_u0=0`), and
-/// `proto` says whether this is a USB2 port (where a keyboard lives) or a USB3
-/// one.
+/// `stage` — где остановилось перечисление (`hid-ready` означает, что устройство
+/// печатает); два снимка PORTSC отделяют «порт не включился» от «устройство не
+/// ответило после включения»; `ped_sc` — снимок PORTSC на последнем PED+U0 (или
+/// на последнем кратковременном PED при `ped_u0=0`); `proto` — USB2 (где живёт
+/// клавиатура) или USB3.
 pub struct PortRow {
     pub port: u8,
     pub portsc: u32,
@@ -3089,12 +2850,12 @@ pub struct PortRow {
     pub attempts: u8,
     pub seen_prc: bool,
     pub seen_ped: bool,
-    /// Whether `ped_sc` is a real PED+U0 enable snapshot (true) or the last
-    /// transient PED sighting during reset/training (false).
+    /// `ped_sc` — настоящий снимок включения PED+U0 (true) или последний
+    /// кратковременный PED во время reset/training (false).
     pub seen_ped_u0: bool,
     pub ped_sc: u32,
     pub proto: u8,
-    /// Duration of the last attempt in milliseconds (0 when no clock).
+    /// Длительность последней попытки в миллисекундах (0 без часов).
     pub ms: u16,
 }
 
@@ -3109,8 +2870,8 @@ pub fn diagnostics() -> Vec<PortRow> {
         let Some(d) = c.diag.get(port as usize - 1) else {
             continue;
         };
-        // Only ports that are interesting: a device is attached, or an attempt was
-        // made (a device that vanished), or the stage is a real failure.
+        // Только интересные порты: подключено устройство, была попытка (устройство
+        // исчезло) или стадия — реальный отказ.
         if sc & PORTSC_CCS == 0 && d.stage.is_empty() {
             continue;
         }
@@ -3137,13 +2898,12 @@ pub fn diagnostics() -> Vec<PortRow> {
     rows
 }
 
-/// Every port's raw PORTSC, for the shell's `usb` command.
+/// Сырой PORTSC каждого порта для shell-команды `usb`.
 ///
-/// This is the diagnostic that matters on hardware: if a keyboard is plugged in
-/// and its port still reads `ccs=false`, the problem is below this driver (cable,
-/// port, or the device never reporting a speed); if a port reads `ccs=true` but
-/// no `HID device on port N` line followed, the failure is in the enumeration
-/// steps, and the log names the one that stopped.
+/// Главная диагностика на железе: если клавиатура подключена, а порт читается как
+/// `ccs=false`, проблема ниже драйвера (кабель, порт или устройство не сообщает
+/// скорость); если порт читается `ccs=true`, но строки `HID device on port N` не
+/// было, сбой в шагах перечисления, и лог называет остановившийся шаг.
 pub fn port_status() -> Vec<(u8, u32)> {
     let guard = CONTROLLER.lock();
     let Some(ctrl) = guard.as_ref() else {
@@ -3157,7 +2917,7 @@ pub fn port_status() -> Vec<(u8, u32)> {
         .collect()
 }
 
-/// Decode a PORTSC word for display: `(ccs, ped, pp, speed, pls)`.
+/// Декодировать PORTSC для вывода: `(ccs, ped, pp, speed, pls)`.
 pub fn decode_portsc(sc: u32) -> (bool, bool, bool, u8, u8) {
     (
         sc & PORTSC_CCS != 0,
@@ -3168,7 +2928,7 @@ pub fn decode_portsc(sc: u32) -> (bool, bool, bool, u8, u8) {
     )
 }
 
-/// `(present, ports, reports)` for the shell's diagnostics.
+/// `(present, ports, reports)` для диагностики shell.
 pub fn status() -> (bool, u8, u64) {
     match CONTROLLER.lock().as_ref() {
         Some(c) => (true, c.ports, c.reports),
