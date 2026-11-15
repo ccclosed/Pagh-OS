@@ -13,7 +13,7 @@
 `dns`, `deb`, `tar`, `install`, `apt_index`, `apt_resolve`, `mirror`, `diag`, `mem`, `dirent`,
 `timeconv`, `fd_alloc`, `x509`, `hostname`, `tls_verify`, `tls_chain`, `ca_bundle`, `tls_auth`,
 `seed`, `link_walk`, `format_policy`, `nvme_prp`, `ext2/symlink`, `openpgp{,_crypto,_packet,_keys}`,
-`release_file`, `procfs_format` — тесты исполняют точный исходник
+`release_file`, `procfs_format`, `usb_desc`, `usb_hid_proto` — тесты исполняют точный исходник
 ядра (нет копий и дрейфа). Плюс no-op `warn!`-шим и `extern crate alloc`.
 Эти модули обязаны быть только `core`+`alloc`.
 

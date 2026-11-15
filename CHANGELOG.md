@@ -66,6 +66,35 @@ reports live in `attack/r3/{arch,vfs,lead}/REPORT.md` and the top-level
   kept). The audit's raw-`clone` reproducer never created its second thread, so
   the impact remains static; the fix is the accounting invariant.
 
+* **USB HID on real hardware: boot protocol, packet-sized buffers, endpoint
+  recovery, composite interfaces.** The field devices (R82HE keyboard
+  3151:502d, E-Signal LUOM G10 mouse 04d9:a09f) exposed four defects: the mouse
+  was dead and the keyboard only partly worked. (1) `SET_PROTOCOL` was sent with
+  `wValue=1` — *report* protocol — while the code and docs said boot; HID 1.11
+  §7.2.6 defines boot as 0. It is now 0 for every boot-class interface, the
+  result is checked and logged as `mode=boot|report`, and a device that refuses
+  boot stays in report protocol with best-effort parsing instead of losing input.
+  (2) The interrupt-IN buffer was the hard-coded 8/4 bytes; the 7-byte
+  report-protocol mouse report overflowed 4 bytes, the controller reported a
+  babble and the old code disabled the endpoint until reboot. The buffer is now
+  `wMaxPacketSize` clamped to 8..=64, i.e. never shorter than one packet. (3) A
+  transfer error now issues xHCI Reset Endpoint (TRB type 14) and re-arms the
+  transfer, up to three attempts, instead of disabling on the first error; the
+  `usb` command prints the reset/bad-report counters. (4) `Slot.hid` was a single
+  `Option<HidEndpoint>`, so a combo device's other HID interfaces were ignored;
+  it is now a `Vec`, every HID interface with an interrupt-IN endpoint is parsed,
+  only boot keyboard/mouse interfaces are bound (protocol 0/vendor collections
+  are logged and skipped), one Configure Endpoint adds every DCI, and all
+  endpoints are polled with per-slot/endpoint event routing. Report layouts:
+  boot reports as before; a report-mode mouse decodes the E-Signal/Holtek 7-byte
+  16-bit-X/Y layout (deltas clamped into the PS/2 packet range; wheel/pan decoded
+  but not delivered) and 3-6-byte 8-bit layouts best effort; a report-mode
+  keyboard uses the boot-like 8-byte layout. Host properties
+  `usb_hid_proto`/`usb_desc`, new in-QEMU report-mode selftest cases,
+  `tools/e2e.py usb` and the PS/2 path are green. Real hardware was not available
+  for this change (QEMU evidence only); the serial lines to watch on hardware are
+  named in `src/drivers/README.md`.
+
 ## 2.22.6
 
 Round-3 audit hotfix: four high, verified findings (three x86 machine-kill /

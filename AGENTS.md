@@ -289,8 +289,28 @@ the operational checklist in `RELEASING.md`.
   `freed=false` log line naming the registry that kept the space alive.
   The audit's raw-`clone` reproducer never created its second thread, so the
   finding's impact remains static (no UAF demonstrated); the fix is the
-  accounting invariant, not a PoC-driven crash. Version 2.22.7 is the
-  `dev` PATCH bump; `main` stays 2.22.6.
+  accounting invariant, not a PoC-driven crash. (4) the same `dev` version
+  carries the real-hardware USB HID fixes (field devices: R82HE keyboard
+  3151:502d, E-Signal LUOM G10 mouse 04d9:a09f): `SET_PROTOCOL` was sent with
+  `wValue=1`, i.e. *report* protocol, while the comment and docs claimed boot
+  (HID 1.11 §7.2.6 defines boot as 0); the interrupt-IN buffer was hard-coded
+  8/4 bytes, so the mouse's 7-byte report-protocol report made the controller
+  report a babble and the old code disabled the endpoint until reboot; a
+  transfer error now issues xHCI Reset Endpoint and re-arms the transfer (three
+  attempts) instead of disabling on the first error; and every HID interface of
+  a composite device is parsed and all boot keyboard/mouse ones are bound and
+  polled (`Slot.hid` is a `Vec`, SET_PROTOCOL/SET_IDLE per interface, one
+  Configure Endpoint adding every DCI) instead of only the first. Limitations
+  stay named: hubs are still unsupported, `protocol = 0`/vendor collections are
+  logged and not bound, report-protocol-only devices are best effort (boot-like
+  8-byte keyboard; mouse: 7-byte 16-bit E-Signal layout or 8-bit axes, deltas
+  clamped into the PS/2 packet range, wheel/pan decoded but not delivered), and
+  keyboard LED output reports are not driven. Evidence: host properties
+  `usb_hid_proto`/`usb_desc` (buffer sizing, layouts, composite/truncated
+  descriptors), new in-QEMU report-mode selftest cases, `tools/e2e.py usb` and
+  the PS/2 path are green; real hardware was not available, so this is QEMU
+  evidence plus the serial lines named in `src/drivers/README.md`. Version
+  2.22.7 is the `dev` PATCH bump; `main` stays 2.22.6.
   **2.22.6** = the round-3 audit's four high x86 findings are closed
   (F-r3-arch-1, F-r3-life-1/2, F-r3-vfs-1; reports in the external
   `attack/r3/*/REPORT.md` tree). (1) `#DE`/`#DB`/`#UD` (and `#OF`/`#BR`/`#NM`/

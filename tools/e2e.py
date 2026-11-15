@@ -1813,6 +1813,35 @@ def mode_usb(h: Harness) -> tuple[str, int]:
     ok &= h.check("xHCI enumerated the USB mouse too (boot-protocol HID)",
                   bool(mouse_hid), mouse_hid or "not found")
 
+    # ── the 2.22.7 field fixes, pinned in the committed scenario ──
+    # SET_PROTOCOL(0) = boot: the old driver sent wValue=1 (report protocol)
+    # while claiming boot. QEMU's usb-kbd/usb-mouse accept boot, so `mode=boot`
+    # is the positive evidence that the request and its result check work.
+    ok &= h.check(
+        "both HID interfaces negotiated boot protocol (SET_PROTOCOL 0)",
+        bool(kbd_hid and "mode=boot" in kbd_hid)
+        and bool(mouse_hid and "mode=boot" in mouse_hid),
+        f"kbd: {kbd_hid or 'not found'}; mouse: {mouse_hid or 'not found'}")
+    # The transfer buffer is sized from wMaxPacketSize (floor 8B), not the old
+    # hard-coded 4B mouse buffer that turned the field mouse's 7-byte report into
+    # a babble. Both emulated endpoints declare <= 8B, so 8B is the expected size
+    # and anything below 7B would be the bug.
+    report_sizes = [int(n) for n in re.findall(
+        r"xhci: HID device on port \d+: .* report=(\d+)B", text)]
+    ok &= h.check(
+        "interrupt-IN buffers are packet-sized (>= 8B, not the old 4B mouse buffer)",
+        len(report_sizes) >= 2 and min(report_sizes) >= 8,
+        f"report buffer sizes: {report_sizes}")
+    # A transfer error must not end in the old permanent-disable line in this
+    # clean run: QEMU's devices are well-behaved, so any such line is a recovery
+    # regression (the recovery path itself is exercised by host properties and
+    # the in-QEMU report-mode selftests, not by a babble this emulation can make).
+    ok &= h.check(
+        "no HID endpoint was disabled after a transfer error",
+        "input from it is off until reboot" not in text,
+        "endpoint-disabled line present" if "input from it is off until reboot" in text
+        else "no endpoint-disabled line")
+
     # ── the menu decision: only the typed confirmation can format ──
     chose = regex_first(
         rf"fs: operator chose to format {re.escape(device)}p1[^\r\n]*", text)

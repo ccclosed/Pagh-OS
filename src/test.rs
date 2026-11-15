@@ -7272,6 +7272,7 @@ mod security_tests {
 /// The routine drains the ring before and after itself, so a key pressed by
 /// whoever is at the keyboard during a `selftest` run cannot make it flaky.
 mod usb_hid_tests {
+    use crate::drivers::usb_hid_proto::ReportMode;
     use crate::drivers::{ps2_kbd, usb_hid};
 
     /// Drain whatever is queued, so the routine starts from a known state.
@@ -7401,6 +7402,56 @@ mod usb_hid_tests {
             "a HID mouse report must go through the PS/2 packet assembler"
         );
         assert_kernel!(after.left, "the left button must be reported as held");
+    }
+
+    /// Report-protocol fallback: the 7-byte E-Signal/Holtek layout (buttons,
+    /// 16-bit X, 16-bit Y, wheel, pan) that the field mouse sent when the old
+    /// driver asked for report protocol. It must be decoded as 16-bit axes — not
+    /// as the boot `[buttons, dx, dy]` bytes, which would move the cursor by
+    /// 0x0100/0x0101 = nonsense — and still reach the PS/2 packet assembler.
+    pub fn report_protocol_mouse_16bit() {
+        let before = crate::drivers::ps2_mouse::poll();
+        // buttons = left, X = -4 (0xFFFC), Y = +3 (screen-down), wheel = 0, pan=0.
+        usb_hid::feed_iface(
+            &[0x01, 0xFC, 0xFF, 0x03, 0x00, 0x00, 0x00],
+            1,
+            2,
+            ReportMode::Report,
+        );
+        let after = crate::drivers::ps2_mouse::poll();
+        assert_kernel!(
+            after.seq == before.seq + 1,
+            "a 7-byte report-protocol mouse report must reach the PS/2 assembler"
+        );
+        assert_kernel!(
+            after.left,
+            "the 7-byte report's button byte must be decoded (left held)"
+        );
+    }
+
+    /// Report-protocol fallback with 8-bit axes and a wheel byte (the common
+    /// 4-byte HID mouse report): decoded best effort, never used to disable input.
+    pub fn report_protocol_mouse_8bit() {
+        let before = crate::drivers::ps2_mouse::poll();
+        usb_hid::feed_iface(&[0x00, 0x02, 0xFD, 0x01], 1, 2, ReportMode::Report);
+        let after = crate::drivers::ps2_mouse::poll();
+        assert_kernel!(
+            after.seq == before.seq + 1,
+            "a 4-byte report-protocol mouse report must reach the PS/2 assembler"
+        );
+    }
+
+    /// A HID interface that is not a boot keyboard/mouse (subclass 0, e.g. a
+    /// consumer-control collection) must be ignored by the translator, even if
+    /// its report happens to look like a boot keyboard report.
+    pub fn non_boot_interface_is_ignored() {
+        release_all();
+        usb_hid::feed_iface(&[0, 0, 0x04, 0, 0, 0, 0, 0], 0, 1, ReportMode::Report);
+        let codes = collect();
+        assert_kernel!(
+            codes.is_empty(),
+            "a non-boot HID interface must not inject keystrokes"
+        );
     }
 }
 
@@ -7745,6 +7796,18 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "usb: HID mouse report reaches the cursor",
             usb_hid_tests::mouse_report_moves_cursor
+        ),
+        (
+            "usb: HID report-protocol mouse (7-byte 16-bit)",
+            usb_hid_tests::report_protocol_mouse_16bit
+        ),
+        (
+            "usb: HID report-protocol mouse (8-bit axes)",
+            usb_hid_tests::report_protocol_mouse_8bit
+        ),
+        (
+            "usb: HID non-boot interface ignored",
+            usb_hid_tests::non_boot_interface_is_ignored
         ),
         (
             "sysinfo::loads match /proc/loadavg in 16.16 fixed point",

@@ -202,6 +202,20 @@ server certificate chain, hostname and validity checked before a byte of the ind
   offline into `assets/font8x18.bin` by `tools/gen_font.py` — the kernel blends
   8-bit coverage per pixel, so glyph edges are antialiased, and it ships no TrueType
   parser.
+- **USB input (xHCI + HID).** An in-kernel, interrupt-free xHCI driver
+  (`drivers/xhci.rs`) enumerates root-port devices, and `drivers/usb_hid.rs`
+  translates their reports into exactly the PS/2 scancode/packet stream the 8042
+  path produces, so the shell, the boot menu, `^C`/`^Z` and `lxrun` stdin work
+  unchanged. Each boot-class HID interface is put in **boot protocol**
+  (SET_PROTOCOL 0 — not report protocol), every boot keyboard/mouse interface of a
+  composite device is bound and polled, the interrupt-IN transfer buffer is sized
+  from `wMaxPacketSize` (so a longer report cannot babble the endpoint), and a
+  halted endpoint is recovered with xHCI **Reset Endpoint** (bounded retries)
+  instead of disabling input until reboot. Honest limitations: hubs are not
+  supported (a device behind one is invisible); report-protocol-only devices are
+  best effort (boot keyboard layout assumed, mouse supports the 7-byte 16-bit
+  E-Signal layout or 8-bit axes); wheel/pan are decoded but not delivered; keyboard
+  LED output reports (`SET_REPORT`) are not implemented.
 - **Storage:** PCI enumeration, virtio-blk and NVMe block devices, **GPT/MBR partition
   support** (each partition becomes its own block device, so pagh can own one partition
   instead of the whole disk), and a multi-block-group ext2-compatible read/write
@@ -415,7 +429,9 @@ scroll back:
   the IntelliMouse four-byte protocol at boot, and the serial log says
   `[PS2MOUSE] wheel: IntelliMouse ...`).
 - **PageUp / PageDown** — one screenful per press. This also covers a USB HID
-  mouse: its boot protocol has no wheel axis, so only the keyboard can page there.
+  mouse: its boot protocol has no wheel axis, and the report-protocol wheel/pan
+  bytes are decoded but not delivered to the PS/2 path, so only the keyboard can
+  page there.
 - **Any other key or a click** returns to the live bottom; the status strip shows
   `scroll N/M` while you are back in history. `clear` forgets the history.
 - With a wallpaper active the history view is painted opaque (a history row has to
