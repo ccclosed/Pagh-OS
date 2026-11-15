@@ -1,0 +1,139 @@
+name: Bug report
+description: Сообщить о проблеме в ядре, userspace или инструментах Pagh-OS
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Спасибо за отчёт. **Не публикуйте здесь уязвимости** — для них есть
+        [приватный канал](https://github.com/ccclosed/Pagh-OS/security/policy).
+
+        Чем точнее версия и лог, тем быстрее это починится.
+
+  - type: input
+    id: version
+    attributes:
+      label: Версия
+      description: Версия из `Cargo.toml` и ветка/тег, где воспроизводится.
+      placeholder: "2.24.0, ветка dev (commit abc1234)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: branch
+    attributes:
+      label: Ветка / канал
+      options:
+        - dev (экспериментальная)
+        - main (стабильный релиз)
+        - hotfix-тег
+        - локальная сборка / другое
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Компонент
+      options:
+        - ядро / память / прерывания
+        - VFS / ext2 / файловая система
+        - сеть / TCP / TLS / DNS
+        - USB / xHCI / HID / RNDIS
+        - пакеты / apt / установщик
+        - shell / VT / консоль
+        - desktop / userspace GUI
+        - boot / ACPI / PCI
+        - RISC-V (pagh-riscv)
+        - документация / инструменты / CI
+        - другое
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Где воспроизводится
+      options:
+        - QEMU + OVMF
+        - реальное железо (UEFI)
+        - Ventoy / загрузочная флешка
+        - другое
+    validations:
+      required: true
+
+  - type: textarea
+    id: host
+    attributes:
+      label: Окружение
+      description: Хост-ОС, CPU/GPU, версия QEMU/OVMF, nightly, режим сборки.
+      placeholder: |
+        Host: ...
+        CPU/GPU: ...
+        QEMU/OVMF: ...
+        rustc +nightly: ...
+        Сборка: debug / release
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Шаги воспроизведения
+      description: Минимальная последовательность; укажите e2e-режим, если он есть.
+      placeholder: |
+        1. python3 tools/e2e.py ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Ожидаемое поведение
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Фактическое поведение
+      description: Что произошло, код возврата, паника, зависание, скриншот.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Логи
+      description: |
+        Serial-вывод, `qemu_debug.log`, результат `selftest`/`e2e`, фрагмент
+        `apt: timings` или `usb-rndis:`. Оборачивайте в ```.
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: e2e
+    attributes:
+      label: E2E / selftest
+      description: Какой режим запускали и что вернул (если применимо).
+      placeholder: "tools/e2e.py usb — PASS; selftest — 106 routines, 0 failed"
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Перед отправкой
+      options:
+        - label: Я поискал существующие issues и не нашёл дубликат.
+          required: true
+        - label: Это не отчёт об уязвимости (иначе — приватный канал по ссылке выше).
+          required: true
+        - label: Проблема воспроизводится на указанной версии/сборке.
+          required: true
+        - label: Я приложил минимальный лог/репродуктор.
+          required: true

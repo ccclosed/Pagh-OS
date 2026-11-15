@@ -1,1 +1,8 @@
 blank_issues_enabled: false
+contact_links:
+  - name: Приватно сообщить об уязвимости
+    url: https://github.com/ccclosed/Pagh-OS/security/policy
+    about: Memory safety, привилегии, VFS/ext2, парсеры, цепочка поставки пакетов — только приватно.
+  - name: Вопросы и обсуждения
+    url: https://github.com/ccclosed/Pagh-OS/discussions
+    about: Свободные вопросы, идеи и обсуждения дизайна.
