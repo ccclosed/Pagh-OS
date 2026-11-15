@@ -1,182 +1,107 @@
-# Security model: process credentials and filesystem permissions
+# Модель безопасности: учётные данные процессов и права файловой системы
 
-**Status:** implemented in the `security-model` milestone. Defaults to root, so the
-existing userland (shell, apt, CPython) keeps running unchanged; the new behaviour is
-exercised by the in-QEMU selftest suite and host property P56.
+**Статус:** реализовано. По умолчанию всё работает от root, поэтому существующий userland (shell, apt, CPython) продолжает работать без изменений; новое поведение проверяется in-QEMU набором selftest и host-свойством P56.
 
-This page is the contract. It states what is enforced, where, and what is deliberately
-not modelled. Do not read it as a claim of sandboxing or multi-user security.
+Эта страница — контракт. Она говорит, что именно проверяется, где и что сознательно не моделируется. Не читайте её как заявление о sandboxing или многопользовательской безопасности.
 
-## 1. Credentials
+## 1. Учётные данные
 
-`src/arch/x86_64/linux/cred.rs` (pure, `core`-only, host property P56) defines:
+`src/arch/x86_64/linux/cred.rs` (чистый модуль, только `core`, host-свойство P56) определяет:
 
 ```rust
 pub struct Creds { uid, gid, euid, egid, suid, sgid: u32 }
 pub enum Access { Read, Write, Execute }
 ```
 
-* `Creds::ROOT` is the identity of every kernel-spawned process.
-* Credentials are stored in `CompatState::creds` (`src/task/compat.rs`), not in the VFS
-  or the scheduler. `fork`/`clone` inherit the value; `execve` preserves it (setuid
-  binaries are not modelled, so exec never elevates or drops ids). A pagh-native task
-  with no `CompatState` reports `Creds::ROOT` to the syscall layer.
-* Accessors used by syscalls: `compat::current_creds`, `set_current_creds`, `creds_of`.
+* `Creds::ROOT` — идентичность каждого процесса, порождённого ядром.
+* Учётные данные хранятся в `CompatState::creds` (`src/task/compat.rs`), а не в VFS или планировщике. `fork`/`clone` наследуют значение; `execve` его сохраняет (setuid-бинарники не моделируются, поэтому exec никогда не повышает и не сбрасывает ids). Нативная задача pagh без `CompatState` сообщает сисколл-слою `Creds::ROOT`.
+* Аксессоры для сисколлов: `compat::current_creds`, `set_current_creds`, `creds_of`.
 
-### `may`: the POSIX matrix
+### `may`: POSIX-матрица
 
 `Creds::may(mode, (owner_uid, owner_gid), access)`:
 
-1. effective ids select the class: `euid == owner_uid` → owner bits,
-   else `egid == owner_gid` → group bits, else other bits;
-2. a class grants the access iff its three bits contain the request;
-3. **root** (`euid == 0`) bypasses read and write, but not execute: execute is granted
-   iff at least one of the nine permission bits is an execute bit (`mode & 0o111 != 0`).
+1. эффективные ids выбирают класс: `euid == owner_uid` → биты владельца, иначе `egid == owner_gid` → биты группы, иначе биты остальных;
+2. класс разрешает доступ тогда и только тогда, когда его три бита содержат запрос;
+3. **root** (`euid == 0`) обходит чтение и запись, но не исполнение: execute разрешён тогда и только тогда, когда хотя бы один из девяти битов прав — бит исполнения (`mode & 0o111 != 0`).
 
-Only the low nine permission bits participate; type and setuid/setgid/sticky bits are
-masked out. There are no supplementary groups and no `fsuid`: `euid`/`egid` are the only
-identity a check sees.
+Участвуют только младшие девять битов прав; биты типа и setuid/setgid/sticky маскируются. Дополнительных групп и `fsuid` нет: `euid`/`egid` — единственная идентичность, которую видит проверка.
 
-### `set*id` transitions
+### Переходы `set*id`
 
-`setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid` are implemented in the
-same pure module and follow the Linux ownership rules:
+`setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid` реализованы в том же чистом модуле и следуют правилам владения Linux:
 
-| call | root (`euid == 0`) | otherwise |
+| вызов | root (`euid == 0`) | иначе |
 |---|---|---|
-| `setuid(x)` | all three UIDs := x | x must be real or saved; `euid := x`, `suid := x`, real unchanged |
-| `setgid(x)` | all three GIDs := x | x must be real or saved; same shape |
-| `setreuid(r, e)` | whichever is not `-1` | `r ∈ {uid, suid}`, `e ∈ {uid, euid, suid}`; saved follows the new effective id when a transition was requested |
-| `setresuid(r, e, s)` | whichever is not `-1` | every specified value ∈ `{uid, euid, suid}` |
+| `setuid(x)` | все три UID := x | x должен быть real или saved; `euid := x`, `suid := x`, real не меняется |
+| `setgid(x)` | все три GID := x | x должен быть real или saved; та же форма |
+| `setreuid(r, e)` | тот, что не `-1` | `r ∈ {uid, suid}`, `e ∈ {uid, euid, suid}`; saved следует за новым эффективным id, если переход был запрошен |
+| `setresuid(r, e, s)` | тот, что не `-1` | каждое указанное значение ∈ `{uid, euid, suid}` |
 | `setre[ug]id(-1, -1)` | no-op | no-op |
 
-`setres[ug]id` never invents an identity for an unprivileged caller; `setuid`/`setgid`
-never change the real id on the unprivileged path. A refused transition returns `EPERM`.
-`getresuid`/`getresgid` validate all three user pointers before writing any of them.
+`setres[ug]id` никогда не выдумывает идентичность для непривилегированного вызывающего; `setuid`/`setgid` на непривилегированном пути никогда не меняют real id. Отвергнутый переход возвращает `EPERM`. `getresuid`/`getresgid` проверяют все три пользовательских указателя, прежде чем писать хоть один.
 
-One deliberate deviation from Linux: on the unprivileged `setuid`/`setgid` path pagh
-also sets the saved id to the new effective id, so a process that drops root cannot
-re-acquire it through the saved id. That is stricter than Linux (which leaves the saved
-id alone) and is the rule this milestone asked for; it is not a compatibility promise
-for setuid-root programs, which pagh does not support anyway.
+Одно сознательное отклонение от Linux: на непривилегированном пути `setuid`/`setgid` pagh также выставляет saved id в новый эффективный id, поэтому процесс, сбросивший root, не может вернуть его через saved id. Это строже Linux (который saved id не трогает) и является правилом, которого требует эта модель; это не обещание совместимости для setuid-root программ, которые pagh всё равно не поддерживает.
 
-## 2. Filesystem metadata
+## 2. Метаданные файловой системы
 
-`VfsNode` (`src/vfs/mod.rs`) gained four **metadata-only** methods:
+`VfsNode` (`src/vfs/mod.rs`) получил четыре **только-метаданные** метода:
 
-| method | default | ext2 |
+| метод | по умолчанию | ext2 |
 |---|---|---|
-| `mode() -> u32` | `0o755` dir / `0o644` file | `i_mode & 0o7777` |
+| `mode() -> u32` | `0o755` каталог / `0o644` файл | `i_mode & 0o7777` |
 | `owner() -> (u32, u32)` | `(0, 0)` | `(i_uid, i_gid)` |
-| `set_mode(u32)` | `NotSupported` | journaled `i_mode` write, type bits preserved |
-| `set_owner(u32, u32)` | `NotSupported` | journaled `i_uid`/`i_gid` write; values > `u16::MAX` are `EINVAL` |
+| `set_mode(u32)` | `NotSupported` | журналируемая запись `i_mode`, биты типа сохраняются |
+| `set_owner(u32, u32)` | `NotSupported` | журналируемая запись `i_uid`/`i_gid`; значения > `u16::MAX` — `EINVAL` |
 
-The VFS never checks a credential. Boot provisioning, the package installer and the
-shell call these methods directly, exactly as before. A `MountNode` forwards all four.
-Creation through a syscall stamps the creator's `euid`/`egid` on the new node
-(`stamp_creation_owner`), because ext2's writer has no credential and always stores
-`(0, 0)`; root's own `(0, 0)` needs no extra transaction. Synthetic nodes cannot store
-an owner, so a non-root file created on ramfs remains root-owned for `chmod` purposes
-(documented gap).
+VFS никогда не проверяет учётные данные. Провижининг при загрузке, установщик пакетов и shell вызывают эти методы напрямую, ровно как раньше. `MountNode` пробрасывает все четыре. Создание через сисколл проставляет создателю `euid`/`egid` на новом узле (`stamp_creation_owner`), потому что писатель ext2 не имеет учётных данных и всегда хранит `(0, 0)`; собственные `(0, 0)` root не требуют лишней транзакции. Синтетические узлы не могут хранить владельца, поэтому файл, созданный не-root на ramfs, остаётся root-owned для целей `chmod` (задокументированный пробел).
 
-## 3. Enforcement points (syscall layer only)
+## 3. Точки проверки (только слой сисколлов)
 
-All checks live in `src/arch/x86_64/linux/`; the VFS remains credential-free.
+Все проверки живут в `src/arch/x86_64/linux/`; VFS остаётся свободен от учётных данных.
 
-| operation | rule | errno |
+| операция | правило | errno |
 |---|---|---|
-| path traversal (every handler that resolves a path) | search (`x`) on every intermediate directory, effective ids (`access(2)` uses its real ids); components spliced in from a followed symlink target are checked too | `EACCES` |
-| `open`/`openat` existing node | read for `O_RDONLY`; write for `O_WRONLY`/`O_RDWR`; both for `O_RDWR`; write additionally for `O_TRUNC` (checked before truncation) | `EACCES` |
-| `open`/`openat` `O_CREAT` | write **and** execute on the parent directory | `EACCES` |
-| `execve` | execute on the target; root still needs one x bit | `EACCES` |
-| `unlink`/`rmdir`/`mkdir` | write+execute on the parent directory | `EACCES` |
-| `rename`/`renameat`/`renameat2` | write+execute on the source **and** destination parents, both checked before any mutation | `EACCES` |
-| `chmod`/`fchmod` | root or inode owner | `EPERM` |
-| `chown`/`fchown` | root only; `(uid_t)-1` keeps the current id | `EPERM` |
-| `kill` | sender euid is root, or equals the target's real or effective uid; a group/broadcast send delivers to the permitted subset | `EPERM` if none permitted |
-| `tgkill` | same rule for the addressed thread | `EPERM` |
-| `access` | the real-id variant of the `may` matrix (`R_OK`/`W_OK`/`X_OK`; `F_OK` is existence); follows symlinks; the traversal check uses the same real ids | `EACCES` |
-| `chdir` | search (`x`) on the target directory itself as well as on every intermediate one | `EACCES` |
-| `stat`/`lstat`/`fstat` | reports the inode's real permission bits, type and `st_uid`/`st_gid` (the per-process override is only for nodes that cannot store metadata) | — |
+| обход пути (каждый обработчик, резолвящий путь) | search (`x`) на каждом промежуточном каталоге, эффективные ids (у `access(2)` — его real ids); компоненты, вставленные из цели разыменованной symlink, тоже проверяются | `EACCES` |
+| `open`/`openat` существующего узла | чтение для `O_RDONLY`; запись для `O_WRONLY`/`O_RDWR`; оба для `O_RDWR`; запись дополнительно для `O_TRUNC` (проверяется до усечения) | `EACCES` |
+| `open`/`openat` `O_CREAT` | запись **и** исполнение на родительском каталоге | `EACCES` |
+| `execve` | исполнение на цели; root всё равно нуждается в одном x-бите | `EACCES` |
+| `unlink`/`rmdir`/`mkdir` | запись+исполнение на родительском каталоге | `EACCES` |
+| `rename`/`renameat`/`renameat2` | запись+исполнение на исходном **и** целевом родителях, обе проверки до любой мутации | `EACCES` |
+| `chmod`/`fchmod` | root или владелец inode | `EPERM` |
+| `chown`/`fchown` | только root; `(uid_t)-1` сохраняет текущий id | `EPERM` |
+| `kill` | euid отправителя — root или совпадает с real/effective uid цели; групповой/широковещательный send доставляет разрешённому подмножеству | `EPERM`, если не разрешён никто |
+| `tgkill` | то же правило для адресованного потока | `EPERM` |
+| `access` | real-id-вариант матрицы `may` (`R_OK`/`W_OK`/`X_OK`; `F_OK` — существование); разыменовывает symlink; проверка обхода использует те же real ids | `EACCES` |
+| `chdir` | поиск (`x`) на самом целевом каталоге, а также на каждом промежуточном | `EACCES` |
+| `stat`/`lstat`/`fstat` | сообщает реальные биты прав inode, тип и `st_uid`/`st_gid` (per-process override — только для узлов, которые не могут хранить метаданные) | — |
 
-Directory-search permission is enforced inside the **pure link walker**
-(`vfs::link_walk`): before every name lookup the walker asks its `LinkTree`
-adapter `may_search`, and the syscall-layer adapter (`io_sys::walk_as`) answers
-with `Creds::may(node.mode(), node.owner(), Access::Execute)` for the effective
-ids. This covers every component a syscall path passes through — including the
-components a followed symbolic link splices into the walk, which a prefix check
-over the written path would miss — while the final component's own permissions
-stay the syscall's business (`open` needs read/write, `stat` needs none).
-`lstat`/`readlink` keep their no-follow semantics: search is required on the
-directories they pass through, but not on the link itself. The VFS still holds
-no credentials; `may_search` is a caller-supplied predicate over the metadata
-the VFS already exposes, exactly like the other boundary checks on this page.
+Разрешение на поиск в каталоге проверяется внутри **чистого обходчика ссылок** (`vfs::link_walk`): перед каждым поиском имени обходчик спрашивает у своего адаптера `LinkTree` `may_search`, а адаптер сисколл-слоя (`io_sys::walk_as`) отвечает `Creds::may(node.mode(), node.owner(), Access::Execute)` для эффективных ids. Это покрывает каждый компонент, через который проходит путь сисколла, — включая компоненты, которые вставляет в обход разыменованная символьная ссылка, а префиксная проверка по записанному пути их бы пропустила, — при этом права самого финального компонента остаются заботой сисколла (`open` нужны чтение/запись, `stat` — ничего). `lstat`/`readlink` сохраняют семантику без разыменования: search требуется на каталогах, через которые они проходят, но не на самой ссылке. VFS по-прежнему не держит учётных данных; `may_search` — это переданный вызывающим предикат над метаданными, которые VFS и так отдаёт, ровно как другие граничные проверки на этой странице.
 
-`chmod` writes the ext2 inode and also records the historical per-process stat override;
-`stat` prefers that override (it is what keeps synthetic nodes coherent) and otherwise
-reports the real `VfsNode::mode`/`owner`. Creation through `open(O_CREAT)` and `mkdir`
-applies the caller's mode argument masked by the umask to the inode and stamps the
-creator's effective ids, so a non-root process owns what it creates and can `chmod` it.
-Synthetic nodes cannot persist metadata: their `set_mode` returns `NotSupported` (the
-override still makes `stat` report the mode), and `chown` returns `EPERM` instead of
-pretending to have stored an owner.
+`chmod` пишет ext2-inode и дополнительно записывает исторический per-process override для `stat`; `stat` предпочитает этот override (именно он держит синтетические узлы согласованными), а иначе сообщает реальные `VfsNode::mode`/`owner`. Создание через `open(O_CREAT)` и `mkdir` применяет к inode аргумент mode вызывающего, замаскированный umask, и проставляет эффективные ids создателя, поэтому процесс не-root владеет тем, что создал, и может это `chmod`-ить. Синтетические узлы не могут сохранять метаданные: их `set_mode` возвращает `NotSupported` (override всё равно заставляет `stat` сообщать mode), а `chown` возвращает `EPERM` вместо вида, будто владелец сохранён.
 
-The package installer now applies each tar member's `mode` to the created ext2 inode.
-Without that, every apt-installed program would be `0644`, and the execute check would
-reject it even for root.
+Установщик пакетов теперь применяет `mode` каждого tar-члена к созданному ext2-inode. Без этого каждая установленная через apt программа была бы `0644`, и проверка исполнения отвергала бы её даже для root.
 
-## 4. Not implemented (honest gaps)
+## 4. Что не реализовано (честные пробелы)
 
-* **No login/accounts.** The shell and all kernel-spawned processes are root; the model
-  constrains only a process that calls the `set*id` family. There is no `/etc/passwd`
-  authentication, no session, no `su`/`sudo`.
-* **No setuid/setgid binaries or privilege elevation on exec.** `execve` preserves the
-  credential record; an executable's mode does not change ids.
-* **No supplementary groups, ACLs, `fsuid`/`fsgid`, capabilities, seccomp, LSM, audit or
-  namespaces.** Owner/group/other + root bypass is the whole model.
-* **No sticky-bit or directory-owner checks** on unlink/rename beyond the parent
-  write+execute rule.
-* **Synthetic nodes have no persistable owner/mode.** `/dev`, `/proc` and the RAM-backed
-  tree keep the historical per-process override for `stat`; a non-root file created there
-  remains root-owned for `chmod`/`chown` purposes.
-* **SMEP only.** `CR4.SMEP` is set when CPUID leaf 7 EBX bit 7 reports support. SMAP
-  (would require `stac`/`clac` around every user-memory access) and KPTI (would require a
-  separate kernel page-table hierarchy) are not implemented.
-* **`link(2)`/`symlink(2)` do not exist** in this syscall set, so the parent-directory
-  rule is documented for the VFS operations the installer uses, not enforced through a
-  missing syscall.
-* **Images populated before this change** (including a local `disk.img`) store
-  apt-installed programs as `0644`, because the old installer ignored the tar mode.
-  `execve` of such a file now returns `EACCES` until the package is reinstalled (the
-  installer now applies the archive mode) or the file is `chmod +x`. Kernel-internal
-  launchers (`run_linux_binary`, the shell's `lxrun`, the `lx_selftest` harnesses) are
-  not affected: they bypass the syscall check, exactly like the package installer
-  bypasses the VFS checks.
+* **Нет логина/аккаунтов.** Shell и все процессы, порождённые ядром, — root; модель ограничивает только процесс, который вызывает семейство `set*id`. Нет аутентификации через `/etc/passwd`, нет сессии, нет `su`/`sudo`.
+* **Нет setuid/setgid-бинарников и повышения привилегий на exec.** `execve` сохраняет запись учётных данных; режим исполняемого файла не меняет ids.
+* **Нет дополнительных групп, ACL, `fsuid`/`fsgid`, capabilities, seccomp, LSM, audit и namespaces.** Вся модель — owner/group/other плюс обход для root.
+* **Нет проверок sticky-бита и владельца каталога** на unlink/rename сверх правила записи+исполнения на родителе.
+* **У синтетических узлов нет сохраняемого owner/mode.** `/dev`, `/proc` и RAM-backed дерево держат исторический per-process override для `stat`; файл не-root, созданный там, остаётся root-owned для целей `chmod`/`chown`.
+* **Только SMEP.** `CR4.SMEP` выставляется, когда CPUID leaf 7 EBX bit 7 сообщает поддержку. SMAP (потребовал бы `stac`/`clac` вокруг каждого доступа к пользовательской памяти) и KPTI (потребовал бы отдельной иерархии таблиц страниц ядра) не реализованы.
+* **`link(2)`/`symlink(2)` отсутствуют** в этом наборе сисколлов, поэтому правило родительского каталога задокументировано для операций VFS, которые использует установщик, а не проверяется через отсутствующий сисколл.
+* **Образы, заполненные до этого изменения** (включая локальный `disk.img`), хранят установленные через apt программы как `0644`, потому что старый установщик игнорировал tar-mode. `execve` такого файла теперь возвращает `EACCES`, пока пакет не переустановят (установщик теперь применяет режим из архива) или файл не выполнят `chmod +x`. Внутренние лаунчеры ядра (`run_linux_binary`, shell-овый `lxrun`, harness'ы `lx_selftest`) не затронуты: они обходят проверку сисколлов, ровно как установщик пакетов обходит проверки VFS.
 
-## 5. Tests
+## 5. Тесты
 
-* **Host property P56** (`host-tests/src/properties/p56.rs`): `may` against an
-  independent oracle over arbitrary ids/modes, the exact root execute law, exhaustive
-  class selection on a small id universe, and every `set*id` transition's ownership
-  invariant. Runs via `python3 tools/host_tests.py`.
-* **In-QEMU `src/test.rs`** (`security_tests`, five routines): the permission matrix,
-  setuid transitions, chmod/chown rules plus ext2 mode/owner write-back, the kill
-  permission rule, and a get/set*id syscall round-trip against a synthetic
-  `CompatState` (root drops to 1000/100, then `setuid(0)`/`setgid(0)` are `EPERM`).
-  They allocate no PMM frames net of the suite and the ext2 test uses the
-  heap-backed mock and removes its file.
-* `python3 tools/e2e.py selftest` prints `SELFTEST SUMMARY: 80 routines, 0 failed
-  checks, 0 skipped` on this branch.
+* **Host-свойство P56** (`host-tests/src/properties/p56.rs`): `may` против независимого оракула на произвольных ids/modes, точный закон root-execute, исчерпывающий выбор класса на малом множестве ids и инвариант владения для каждого перехода `set*id`. Запуск через `python3 tools/host_tests.py`.
+* **In-QEMU `src/test.rs`** (`security_tests`, пять рутин): матрица прав, переходы setuid, правила chmod/chown плюс запись mode/owner в ext2, правило прав kill и круговой рейс get/set*id через сисколлы против синтетического `CompatState` (root сбрасывается в 1000/100, затем `setuid(0)`/`setgid(0)` дают `EPERM`). В сумме они не выделяют PMM-кадров, а ext2-тест использует heap-backed мок и удаляет свой файл.
+* `python3 tools/e2e.py selftest` печатает `SELFTEST SUMMARY: 80 routines, 0 failed checks, 0 skipped`.
 
-## 6. Review checklist for new syscalls
+## 6. Чек-лист ревью для новых сисколлов
 
-1. Add the number to `abi::nr`, the `dispatch_supported` arm and `SUPPORTED_SYSCALLS`
-   (and its independent `EXPECTED` literal). The maintenance contract is in
-   `src/arch/x86_64/linux/abi.rs`.
-2. If it touches a path, decide which access it needs and call the same helpers
-   (`check_node_access`, `check_dir_mutation`); do not add a credential check inside a
-   `VfsNode` implementation.
-3. If it changes credentials, go through a `Creds` transition method — never mutate the
-   six ids field by field in the handler.
-4. Add the pure decision to P56 (or a sibling property) and a deterministic in-QEMU
-   routine when kernel state is involved.
+1. Добавьте номер в `abi::nr`, ветку `dispatch_supported` и `SUPPORTED_SYSCALLS` (и независимый литерал `EXPECTED`). Контракт поддержки — в `src/arch/x86_64/linux/abi.rs`.
+2. Если сисколл трогает путь, решите, какой доступ нужен, и вызывайте те же хелперы (`check_node_access`, `check_dir_mutation`); не добавляйте проверку учётных данных внутрь реализации `VfsNode`.
+3. Если он меняет учётные данные, идите через метод перехода `Creds` — никогда не мутируйте шесть ids по полям в обработчике.
+4. Добавьте чистое решение в P56 (или соседнее свойство) и детерминированную in-QEMU рутину, когда замешано состояние ядра.
