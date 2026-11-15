@@ -1,0 +1,94 @@
+name: Feature request
+description: Предложить фичу или улучшение для Pagh-OS
+title: "[feat] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Сначала опишите **проблему**, а не только решение: это помогает выбрать
+        правильный дизайн. Для крупных изменений лучше сначала обсудить подход.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Проблема / мотивация
+      description: Что неудобно, чего не хватает, какой сценарий ломается.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Предлагаемое решение
+      description: Как это должно работать с точки зрения пользователя/API.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Основной компонент
+      options:
+        - ядро / память / прерывания
+        - VFS / ext2 / файловая система
+        - сеть / TCP / TLS / DNS
+        - USB / xHCI / HID / RNDIS
+        - пакеты / apt / установщик
+        - shell / VT / консоль
+        - desktop / userspace GUI
+        - boot / ACPI / PCI
+        - RISC-V (pagh-riscv)
+        - документация / инструменты / CI
+        - другое
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Затрагиваемые части
+      options:
+        - label: kernel (`src/**`)
+        - label: userspace (`rust-apps/**`, `pagh-programs`, libc)
+        - label: документация
+        - label: инструменты / CI
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Критерии приёмки
+      description: Что должно быть верно, чтобы фичу можно было считать сделанной. Проверяемые пункты.
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Влияние на build-invariants / безопасность
+      description: |
+        Затрагивает ли `#![no_std]`, `panic = abort`, custom target, higher-half,
+        frame pointers, host-tests isolation, unsafe-policy, security-модель?
+        Если да — как сохранить.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Альтернативы
+      description: Что ещё рассматривали и почему это лучше/хуже.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Перед отправкой
+      options:
+        - label: Я поискал существующие issues и не нашёл дубликат.
+          required: true
+        - label: Это не запрос на приватный security-фикс (для уязвимостей — SECURITY.md).
+          required: true
+        - label: Я готов(а) помочь с реализацией или тестированием (по возможности).
