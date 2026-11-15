@@ -1,31 +1,29 @@
-//! Effectful Linux file-I/O syscall handlers (task 12.1).
+//! Эффективные обработчики файловых I/O syscall'ов Linux.
 //!
-//! This is the **kernel-only** half of the `io` component. It wires the pure
-//! planners in [`super::io`] (`plan_read`/`plan_lseek`) and [`super::stat`]
-//! (`encode_stat`) to the running `Compat_Process`'s [`FdTable`], the kernel
-//! console, and the VFS/ext2 file tree.
+//! Это **ядерная** половина компонента `io`: она связывает чистые планировщики
+//! из [`super::io`] (`plan_read`/`plan_lseek`) и [`super::stat`] (`encode_stat`)
+//! с [`FdTable`] текущего `Compat_Process`, консолью ядра и деревом VFS/ext2.
 //!
-//! It lives in its OWN file (not `io.rs`) on purpose: `io.rs` is `#[path]`-included
-//! verbatim by the `host-tests` crate so its pure planners can be property-tested
-//! on the host (R11.6). These handlers use kernel-only `memory`/`vfs`/`task` APIs
-//! that do not exist on the host, so keeping them here leaves `io.rs` purely
-//! host-testable while this file is compiled only as part of the kernel.
+//! Модуль вынесен в отдельный файл намеренно: `io.rs` включается в `host-tests`
+//! через `#[path]`, чтобы его чистые планировщики проверялись на хосте (R11.6).
+//! Эти обработчики используют ядерные `memory`/`vfs`/`task`, которых на хосте
+//! нет, поэтому `io.rs` остаётся чисто host-тестируемым.
 //!
-//! ## User-pointer safety
+//! ## Безопасность пользовательских указателей
 //!
-//! Every handler that takes a user pointer routes it through the single
-//! [`super::check_user_ptr`] choke point (range check + page-presence walk) BEFORE
-//! dereferencing it. During a syscall the active CR3 is the calling process's user
-//! PML4, so a validated lower-half user pointer is directly accessible from ring 0.
+//! Каждый обработчик, принимающий пользовательский указатель, прогоняет его
+//! через единую точку [`super::check_user_ptr`] (проверка диапазона + обход
+//! страниц) ДО разыменования. Во время syscall активный CR3 — PML4 вызывающего
+//! процесса, поэтому проверенный указатель нижней половины доступен из ring 0.
 //!
-//! ## Locking discipline
+//! ## Дисциплина блокировок
 //!
-//! [`crate::task::compat::with_current_compat`] holds the `COMPAT_STATES` spinlock
-//! (interrupts disabled) for the duration of its closure. Disk-backed VFS reads
-//! can block waiting for a device interrupt, so these handlers never hold that lock
-//! across a VFS call: they resolve the descriptor (cloning the `Arc<dyn VfsNode>`
-//! and snapshotting the offset) under the lock, release it, perform the I/O, then
-//! re-acquire briefly to commit the new offset.
+//! [`crate::task::compat::with_current_compat`] держит спинлок `COMPAT_STATES`
+//! (с выключенными прерываниями) на всё время выполнения замыкания. Чтение VFS
+//! с диска может ждать прерывания устройства, поэтому обработчики никогда не
+//! держат этот лок во время вызова VFS: дескриптор резолвится (клонируется
+//! `Arc<dyn VfsNode>`, снимается смещение) под локом, лок отпускается,
+//! выполняется I/O, затем лок ненадолго берётся снова для фиксации смещения.
 #![allow(dead_code)]
 
 use alloc::string::String;
@@ -43,84 +41,83 @@ use super::cred::{Access, Creds};
 use super::dirent::{d_type_for, dirent_reclen, encode_dirent64};
 use super::errno::Errno;
 use super::io::{plan_lseek, plan_read};
-// The two foreground-group ioctls (`tcgetpgrp`/`tcsetpgrp`) and the `TOSTOP`
-// bit come from the pure model (`super::tty`) so the kernel and the host
-// properties cannot drift apart on the ABI numbers.
+// Два ioctl foreground-группы (`tcgetpgrp`/`tcsetpgrp`), как и бит `TOSTOP`,
+// берутся из чистой модели (`super::tty`), чтобы ядро и host-свойства не
+// разошлись в номерах ABI.
 use super::stat::{encode_stat, LinuxStat, S_IFDIR, S_IFLNK, S_IFREG};
 use super::tty::{TIOCGPGRP, TIOCSPGRP, TOSTOP};
 
-/// `st_mode` type bits for a character device (console/stdin), so `fstat` on a
-/// standard stream reports a plausible (non-regular) type.
+/// Биты типа `st_mode` для символьного устройства (консоль/stdin), чтобы
+/// `fstat` стандартного потока сообщал правдоподобный (не regular) тип.
 const S_IFCHR: u32 = 0o020000;
 
-/// `st_mode` type bits for a socket (socketpair ends).
+/// Биты типа `st_mode` для сокета (концы socketpair).
 const S_IFSOCK: u32 = 0o140000;
 
-/// Largest byte count `read`/`write` accept, matching the Linux `int` cap in
-/// R2.2 (0..=2_147_483_647). Larger requests are rejected with `EINVAL` rather
-/// than attempting a multi-gigabyte kernel allocation.
+/// Максимум байт, принимаемый `read`/`write`, как `int` в Linux (R2.2,
+/// 0..=2_147_483_647). Большие запросы отклоняются с `EINVAL`, а не пытаются
+/// выделить многогигабайтный буфер.
 const COUNT_MAX: u64 = 0x7FFF_FFFF;
 
-/// `openat` "current working directory" sentinel dir fd.
+/// Сентинел «текущий рабочий каталог» для dir fd в `openat`.
 const AT_FDCWD: u64 = (-100i64) as u64;
-/// `faccessat` flag: check against the effective ids instead of the real ids.
+/// Флаг `faccessat`: проверять по effective id, а не по real id.
 const AT_EACCESS: u64 = 0x200;
 
-/// `newfstatat` flag: do not follow a final symbolic link (`lstat`).
+/// Флаг `newfstatat`: не разыменовывать конечную символическую ссылку (`lstat`).
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
-/// `unlinkat` flag: remove a directory instead of a file.
+/// Флаг `unlinkat`: удалить каталог, а не файл.
 const AT_REMOVEDIR: u64 = 0x200;
 
-/// Default permission bits reported for an ext2-backed regular file.
-/// Reported permission bits for regular files. Everything here runs as root
-/// (single-user system), and apt-installed programs are executable — a plain
-/// 0644 made git refuse its remote helpers (`unable to find remote helper`)
-/// because the helper's statx mode carried no X bits.
+/// Права по умолчанию для regular-файла на ext2. Всё работает под root
+/// (однопользовательская система), программы из apt должны быть исполняемыми:
+/// с 0644 git отказывался от своих remote-хелперов («unable to find remote
+/// helper»), потому что в режиме statx не было X-битов.
 const DEFAULT_FILE_PERMS: u32 = 0o755;
 
-/// A descriptor resolved to an actionable target, decoupled from the
-/// `COMPAT_STATES` lock so subsequent (possibly blocking) VFS I/O runs unlocked.
+/// Дескриптор, сведённый к конкретной цели и отвязанный от лока
+/// `COMPAT_STATES`, чтобы последующий (возможно, блокирующий) I/O шёл без лока.
 enum Resolved {
-    /// fds 1/2 — the kernel console.
+    /// fd 1/2 — консоль ядра.
     Console,
-    /// fd 0 — standard input (not writable).
+    /// fd 0 — стандартный ввод (не для записи).
     Stdin,
-    /// An ext2-backed file: a cloned node handle and the offset at resolve time.
+    /// Regular-файл на ext2: клонированный узел и смещение на момент резолва.
     File {
         node: Arc<dyn VfsNode>,
         offset: u64,
     },
     PipeRead(Arc<PipeEndpoint>),
     PipeWrite(Arc<PipeEndpoint>),
-    /// One end of an AF_UNIX socketpair (rx = incoming, tx = outgoing).
+    /// Один конец AF_UNIX socketpair (rx — входящий, tx — исходящий).
     Socket {
         rx: Arc<PipeEndpoint>,
         tx: Arc<PipeEndpoint>,
     },
-    /// A timerfd instance.
+    /// Экземпляр timerfd.
     Timerfd(Arc<crate::sync::spinlock::Spinlock<crate::task::fd::TimerfdState>>),
-    /// A signalfd instance and its mask snapshot.
+    /// Экземпляр signalfd и снимок его маски.
     Signalfd(u64),
-    /// An eventfd counter.
+    /// Счётчик eventfd.
     Eventfd {
         val: Arc<crate::sync::spinlock::Spinlock<u64>>,
         semaphore: bool,
     },
-    /// An epoll instance (not directly readable/writable via read/write).
+    /// Экземпляр epoll (напрямую через read/write не читается и не пишется).
     Epoll,
-    /// AF_INET TCP over the own stack (data path via net:: primitives).
+    /// AF_INET TCP поверх собственного стека (данные — через примитивы net::).
     InetTcp(Arc<crate::arch::x86_64::linux::inet_sock::InetTcp>),
-    /// AF_INET UDP over the own stack.
+    /// AF_INET UDP поверх собственного стека.
     InetUdp(Arc<crate::arch::x86_64::linux::inet_sock::InetUdp>),
-    /// An open directory (not a byte stream): read/write/pread/pwrite are rejected.
+    /// Открытый каталог (не байтовый поток): read/write/pread/pwrite отклоняются.
     Dir,
 }
 
-/// Resolve `fd` for the current process, cloning the backing node so the caller
-/// can drop the `COMPAT_STATES` lock before doing VFS I/O. Returns `None` when the
-/// descriptor is absent/closed or the process has no compat state (→ `EBADF`).
-/// Public copy helpers for sibling modules (inet_sock dispatch glue).
-/// Populate a statx buffer describing an AF_INET socket.
+/// Резолвит `fd` текущего процесса, клонируя узел, чтобы вызывающий мог
+/// отпустить лок `COMPAT_STATES` до I/O VFS. `None` — дескриптор отсутствует
+/// или закрыт, либо у процесса нет compat-состояния (→ `EBADF`).
+/// Публичные копирующие хелперы для соседних модулей (диспетчеризация inet_sock).
+/// Заполнить буфер statx, описывающий AF_INET-сокет.
 fn write_statx_sock(buf: u64) -> Result<u64, Errno> {
     const S_IFSOCK: u32 = 0o_140000;
     write_statx(buf, 0, S_IFSOCK | 0o755, 0);
@@ -134,24 +131,23 @@ pub(crate) fn copy_out_pub(buf: u64, data: &[u8]) {
     copy_out(buf, data)
 }
 
-/// Re-validate `ptr` for `src.len()` bytes, then copy `src` out.
+/// Повторно проверить `ptr` на `src.len()` байт и скопировать `src` наружу.
 ///
-/// WHY: a handler that checks a buffer once at entry and then blocks in a
-/// `yield_current()` loop leaves a TOCTOU window — a sibling `CLONE_VM` thread
-/// can munmap/mprotect the page while the handler is descheduled (F-x86a-4).
-/// A stale ring-0 write takes a kernel-mode #PF, which halts the machine;
-/// re-checking immediately before the write turns it into `-EFAULT`.
+/// ПОЧЕМУ: если проверить буфер один раз на входе, а затем блокироваться в
+/// цикле `yield_current()`, остаётся окно TOCTOU — соседний поток `CLONE_VM`
+/// может munmap/mprotect страницу, пока обработчик вытеснен. Устаревшая запись
+/// из ring 0 даёт #PF режима ядра и останавливает машину; повторная проверка
+/// прямо перед записью превращает это в `-EFAULT`.
 pub(crate) fn copy_out_checked(ptr: u64, src: &[u8]) -> Result<(), Errno> {
     check_user_ptr(ptr, src.len() as u64)?;
     copy_out(ptr, src);
     Ok(())
 }
 
-/// Map a VFS write failure to errno.
+/// Свести ошибку записи в VFS к errno.
 ///
-/// A node that does not implement `write` is a read-only file — `/proc` files
-/// (issue #11) are exactly that, and Linux answers `EACCES` for them. Any other
-/// failure keeps the historical `EINVAL`.
+/// Узел без `write` — файл только для чтения; таковы файлы `/proc`, и Linux
+/// отвечает на них `EACCES`. Любая другая ошибка сохраняет прежний `EINVAL`.
 fn write_errno(e: crate::vfs::VfsError) -> Errno {
     match e {
         crate::vfs::VfsError::NotSupported => Errno::EACCES,
@@ -159,7 +155,7 @@ fn write_errno(e: crate::vfs::VfsError) -> Errno {
     }
 }
 
-/// Human-readable descriptor kind for watchdog/telemetry output.
+/// Человекочитаемый вид дескриптора для watchdog/телеметрии.
 pub(crate) fn fd_kind(fd: u64) -> &'static str {
     match resolve_fd(fd as u32) {
         None => "closed",
@@ -201,7 +197,7 @@ fn resolve_fd(fd: u32) -> Option<Resolved> {
                 val: Arc::clone(val),
                 semaphore: *semaphore,
             },
-            // Not byte streams — same read/write/seek rejections as epoll fds.
+            // Не байтовые потоки — те же отказы read/write/seek, что у epoll-fd.
             OpenObject::InetTcp(t) => Resolved::InetTcp(Arc::clone(&t)),
             OpenObject::InetUdp(u) => Resolved::InetUdp(Arc::clone(&u)),
             OpenObject::UnixListener(_) => Resolved::Epoll,
@@ -212,10 +208,10 @@ fn resolve_fd(fd: u32) -> Option<Resolved> {
     .flatten()
 }
 
-/// Clone the VFS node backing an open regular-file descriptor, for callers
-/// outside this module that need the file bytes without holding the compat
-/// lock (currently `mem_sys::sys_mmap`'s file-backed mappings). Returns `None`
-/// for absent descriptors and anything that is not an ext2-backed `File`.
+/// Клонировать узел VFS, стоящий за открытым regular-дескриптором, для
+/// вызывающих вне этого модуля, которым нужны байты файла без лока compat
+/// (сейчас — file-backed отображения в `mem_sys::sys_mmap`). `None` — для
+/// отсутствующих дескрипторов и всего, что не является ext2-`File`.
 pub fn file_node_for_fd(fd: u32) -> Option<Arc<dyn VfsNode>> {
     match resolve_fd(fd) {
         Some(Resolved::File { node, .. }) => Some(node),
@@ -223,9 +219,9 @@ pub fn file_node_for_fd(fd: u32) -> Option<Arc<dyn VfsNode>> {
     }
 }
 
-/// The backing node of an open file descriptor **and the VFS path it was opened
-/// with**. `mmap` needs both: the node to copy the file bytes in, and the path
-/// for the `/proc/<pid>/maps` pathname column (`docs/procfs.md` §14).
+/// Узел, стоящий за открытым дескриптором, **и путь VFS, с которым его
+/// открыли**. `mmap` нужны оба: узел — чтобы скопировать байты файла, путь —
+/// для колонки pathname в `/proc/<pid>/maps` (`docs/procfs.md` §14).
 pub fn file_backing_for_fd(fd: u32) -> Option<(Arc<dyn VfsNode>, String)> {
     compat::with_current_compat(|cs| match cs.fds.get(fd) {
         Some(OpenObject::File { node, path, .. }) => Some((Arc::clone(node), path.clone())),
@@ -234,8 +230,9 @@ pub fn file_backing_for_fd(fd: u32) -> Option<(Arc<dyn VfsNode>, String)> {
     .flatten()
 }
 
-/// Commit a new offset for an open file descriptor (no-op if it is not currently
-/// an open `File`). Used after a `read`/`write`/`lseek` advances the offset.
+/// Зафиксировать новое смещение открытого дескриптора (no-op, если это сейчас
+/// не открытый `File`). Вызывается после `read`/`write`/`lseek`, сдвинувших
+/// смещение.
 fn set_fd_offset(fd: u32, new_off: u64) {
     compat::with_current_compat(|cs| {
         if let Some(OpenObject::File { offset, .. }) = cs.fds.get_mut(fd) {
@@ -244,21 +241,20 @@ fn set_fd_offset(fd: u32, new_off: u64) {
     });
 }
 
-/// Write `slice` to the kernel console, reusing the exact serial-console path the
-/// legacy `SYS_WRITE` uses (valid-UTF-8 prefix written as `&str`, trailing
-/// invalid bytes emitted individually so output never panics).
+/// Записать `slice` в консоль ядра, используя тот же путь serial-консоли, что и
+/// legacy `SYS_WRITE`: валидный UTF-8-префикс пишется как `&str`, хвостовые
+/// невалидные байты — по одному, чтобы вывод не паниковал.
 fn console_write(slice: &[u8]) {
     use crate::drivers::Console;
     let console = crate::drivers::serial::console();
-    // Mirror every stdout/stderr byte (and the stdin echo) to the
-    // framebuffer console as well. Previously this wrote ONLY to serial, so a
-    // Compat_Process was invisible in the QEMU graphical window: the shell
-    // prints via kprintln!+fb_println!, but python's output bypassed the
-    // framebuffer entirely. The fb writer already handles \n scrolling and
-    // 0x08 backspace, so the line-editor echo renders correctly too.
-    // Route all compat stdout/stderr through the VT emulator.
-    // If this counter grows but the screen stays black, the
-    // VT renderer is the suspect; if it never grows, the UI client never draws.
+    // Дублировать каждый байт stdout/stderr (и эхо stdin) ещё и в
+    // framebuffer-консоль: раньше вывод шёл ТОЛЬКО в serial, и
+    // Compat_Process был невидим в графическом окне QEMU — шелл печатает
+    // через kprintln!+fb_println!, а вывод python обходил framebuffer.
+    // FB-писатель сам обрабатывает \n и 0x08, так что эхо line-редактора
+    // тоже рисуется правильно. Весь compat-вывод stdout/stderr идёт через
+    // VT-эмулятор. Если счётчик растёт, а экран чёрный — виноват VT-рендерер;
+    // если не растёт — UI-клиент не рисует.
     diag_count(
         &DIAG_CONSOLE_BYTES,
         "console bytes",
@@ -272,7 +268,7 @@ fn console_write(slice: &[u8]) {
         }
         Err(e) => {
             let valid_up_to = e.valid_up_to();
-            // SAFETY: `from_utf8` guarantees `slice[..valid_up_to]` is valid UTF-8.
+            // SAFETY: `from_utf8` гарантирует, что `slice[..valid_up_to]` — валидный UTF-8.
             let prefix = unsafe { core::str::from_utf8_unchecked(&slice[..valid_up_to]) };
             console.write_str(prefix);
             for &byte in &slice[valid_up_to..] {
@@ -284,14 +280,14 @@ fn console_write(slice: &[u8]) {
     }
 }
 
-/// Copy `len` validated user bytes at `ptr` into an owned buffer.
+/// Скопировать `len` проверенных пользовательских байт по `ptr` в свой буфер.
 ///
-/// PRECONDITION: `[ptr, ptr+len)` has already passed [`check_user_ptr`].
+/// ПРЕДУСЛОВИЕ: `[ptr, ptr+len)` уже прошёл [`check_user_ptr`].
 fn copy_in(ptr: u64, len: u64) -> Vec<u8> {
     let mut buf = vec![0u8; len as usize];
     if len > 0 {
-        // SAFETY: the range was validated (in-range + every page mapped) and the
-        // active CR3 is the calling process's user PML4, so the source is readable.
+        // SAFETY: диапазон проверен (в границах, все страницы отображены), а
+        // активный CR3 — user PML4 вызывающего процесса, поэтому источник читаем.
         unsafe {
             core::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len as usize);
         }
@@ -299,28 +295,28 @@ fn copy_in(ptr: u64, len: u64) -> Vec<u8> {
     buf
 }
 
-/// Copy `src` out to the validated user buffer at `ptr`.
+/// Скопировать `src` наружу в проверенный пользовательский буфер по `ptr`.
 ///
-/// PRECONDITION: `[ptr, ptr+src.len())` has already passed [`check_user_ptr`].
+/// ПРЕДУСЛОВИЕ: `[ptr, ptr+src.len())` уже прошёл [`check_user_ptr`].
 fn copy_out(ptr: u64, src: &[u8]) {
     if !src.is_empty() {
-        // SAFETY: validated range, active user CR3 — destination is writable.
+        // SAFETY: диапазон проверен, активный CR3 — user PML4, приёмник доступен на запись.
         unsafe {
             core::ptr::copy_nonoverlapping(src.as_ptr(), ptr as *mut u8, src.len());
         }
     }
 }
 
-/// Read a NUL-terminated path string from user memory, validating each byte's
-/// page before dereferencing it. Caps the path at 4096 bytes (`EINVAL` if longer
-/// or not valid UTF-8).
+/// Прочитать NUL-терминированную строку пути из памяти пользователя, проверяя
+/// страницу каждого байта перед разыменованием. Путь ограничен 4096 байтами
+/// (`EINVAL`, если длиннее или не валидный UTF-8).
 fn read_user_cstr(ptr: u64) -> Result<String, Errno> {
     const PATH_MAX: usize = 4096;
     let mut bytes: Vec<u8> = Vec::new();
     let mut addr = ptr;
     for _ in 0..PATH_MAX {
         check_user_ptr(addr, 1)?;
-        // SAFETY: the single byte at `addr` was just validated as mapped/in-range.
+        // SAFETY: одиночный байт по `addr` только что проверен как отображённый/в диапазоне.
         let b = unsafe { *(addr as *const u8) };
         if b == 0 {
             return String::from_utf8(bytes).map_err(|_| Errno::EINVAL);
@@ -352,9 +348,9 @@ fn write_pipe(e: &PipeEndpoint, src: &[u8]) -> Result<usize, Errno> {
     }
 }
 
-/// `read` (0): copy up to `count` bytes from the file at its current offset into
-/// the user buffer, advance the offset by the bytes copied, and return that count
-/// (R2.3). `EBADF` for an absent fd (R2.14); reads on the console/stdin return 0.
+/// `read` (0): скопировать до `count` байт файла с текущего смещения в буфер
+/// пользователя, сдвинуть смещение на скопированное и вернуть это число
+/// (R2.3). `EBADF` для отсутствующего fd (R2.14); чтение консоли/stdin даёт 0.
 pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
     if count > COUNT_MAX {
         return Err(Errno::EINVAL);
@@ -363,14 +359,14 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
 
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
-        // Stdin is interactive now — a blocking, line-buffered
-        // read from the PS/2 keyboard (echo, backspace, ^D = EOF). Previously
-        // this returned an instant EOF, so CPython silently exited with 0.
+        // Stdin теперь интерактивен — блокирующее построчное чтение с
+        // PS/2-клавиатуры (эхо, backspace, ^D = EOF). Раньше здесь был
+        // мгновенный EOF, и CPython молча завершался с кодом 0.
         Some(Resolved::Console) | Some(Resolved::Stdin) => {
-            // Terminal access control: a background JOB reading the terminal is
-            // stopped (SIGTTIN queued on its group, -EINTR here — the group
-            // parks at this syscall's return). Checked BEFORE the read so the
-            // process cannot consume a keystroke it does not own.
+            // Контроль доступа к терминалу: фоновый JOB, читающий терминал,
+            // останавливается (SIGTTIN ставится его группе, здесь -EINTR —
+            // группа паркуется на возврате из syscall). Проверка ДО чтения,
+            // чтобы процесс не съел чужое нажатие.
             crate::drivers::tty::check_access(super::tty::TtyAccess::Read)?;
             let raw = crate::task::compat::with_current_compat(|cs| cs.raw_mode).unwrap_or(false);
             if raw {
@@ -392,8 +388,8 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             loop {
                 let due = state.lock().take(crate::task::scheduler::ticks());
                 if due > 0 {
-                    // The loop above yields: re-validate before publishing
-                    // (F-x86a-4; a vanished buffer is EFAULT, not a ring-0 #PF).
+                    // Цикл выше уступает CPU: повторная проверка перед публикацией
+                    // (исчезнувший буфер — EFAULT, а не #PF в ring 0).
                     copy_out_checked(buf, &due.to_le_bytes())?;
                     return Ok(8);
                 }
@@ -407,7 +403,7 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             }
         }
         Some(Resolved::Eventfd { val, semaphore }) => {
-            // eventfd read: blocks until val > 0, then returns 8-byte u64 and resets.
+            // чтение eventfd: блокируется, пока val > 0, затем возвращает u64 и сбрасывает счётчик.
             if count < 8 {
                 return Err(Errno::EINVAL);
             }
@@ -424,8 +420,8 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
                         r
                     };
                     drop(v);
-                    // The wait loop yields: re-validate before publishing
-                    // (F-x86a-4; a vanished buffer is EFAULT, not a ring-0 #PF).
+                    // Цикл ожидания уступает CPU: повторная проверка перед публикацией
+                    // (исчезнувший буфер — EFAULT, а не #PF в ring 0).
                     copy_out_checked(buf, &out.to_ne_bytes())?;
                     return Ok(8);
                 }
@@ -440,7 +436,7 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             copy_out_checked(buf, &data[..n])?;
             return Ok(n as u64);
         }
-        Some(Resolved::InetUdp(_)) => Err(Errno::ENOTCONN), // recvfrom only
+        Some(Resolved::InetUdp(_)) => Err(Errno::ENOTCONN), // только recvfrom
         Some(Resolved::PipeRead(e)) => {
             let mut data = vec![0u8; count as usize];
             let n = read_pipe(&e, &mut data)?;
@@ -465,8 +461,8 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             }
             let mut kbuf = vec![0u8; copied as usize];
             let n = node.read(offset, &mut kbuf).map_err(|e| {
-                // A real VFS/ext2 read failure is not "invalid
-                // argument" — report EIO and log what actually broke.
+                // Настоящая ошибка чтения VFS/ext2 — не «неверный аргумент»:
+                // сообщаем EIO и логируем, что именно сломалось.
                 crate::error!(
                     "[linux] file read failed: {:?} ino={} off={} len={}",
                     e,
@@ -484,17 +480,18 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `write` (1): write `count` user bytes to the descriptor. fds 1/2 (console)
-/// emit to the kernel console and return `count` (R2.2); a file descriptor writes
-/// at its offset and advances it; stdin is not writable (`EBADF`); an absent fd is
-/// `EBADF` (R2.14).
+/// `write` (1): записать `count` пользовательских байт в дескриптор. fd 1/2
+/// (консоль) пишут в консоль ядра и возвращают `count` (R2.2); файловый
+/// дескриптор пишет по своему смещению и сдвигает его; stdin не пишется
+/// (`EBADF`); отсутствующий fd — `EBADF` (R2.14).
 
-/// `copy_file_range` (326): copy a byte range between two regular files.
+/// `copy_file_range` (326): скопировать диапазон байт между двумя regular-файлами.
 ///
-/// Both descriptors must be regular files; `flags` must be 0. Each optional
-/// offset pointer, when non-NULL, is read before and written after the copy
-/// (the fd's own offset stays put); a NULL pointer uses and advances the fd's
-/// offset. A short write ends the loop and returns the bytes copied.
+/// Оба дескриптора должны быть regular-файлами; `flags` должен быть 0. Каждый
+/// необязательный указатель смещения, если не NULL, читается до копирования и
+/// записывается после (собственное смещение fd не меняется); NULL означает
+/// использовать и сдвигать смещение fd. Короткая запись завершает цикл и
+/// возвращает число скопированных байт.
 pub fn sys_copy_file_range(
     fd_in: u64,
     off_in: u64,
@@ -554,13 +551,13 @@ pub fn sys_copy_file_range(
     Ok(total)
 }
 
-/// `sendfile` (40): copy bytes from a regular file to a file/socket/console.
+/// `sendfile` (40): скопировать байты из regular-файла в файл/сокет/консоль.
 ///
-/// Only a regular-file input is supported; the output may be a regular file,
-/// the console, a pipe, an AF_UNIX socketpair end or an AF_INET stream. The
-/// input offset comes from `*offset` when non-NULL (and is written back),
-/// otherwise from the fd's current offset, which advances. A short output write
-/// ends the copy and returns the bytes transferred, like Linux.
+/// Поддерживается только regular-файл на входе; выходом может быть regular-файл,
+/// консоль, pipe, конец AF_UNIX socketpair или AF_INET-поток. Входное смещение
+/// берётся из `*offset`, если он не NULL (и записывается обратно), иначе из
+/// текущего смещения fd, которое сдвигается. Короткая запись на выходе
+/// завершает копирование и возвращает перенесённое число байт, как в Linux.
 pub fn sys_sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<u64, Errno> {
     if count > COUNT_MAX {
         return Err(Errno::EINVAL);
@@ -573,8 +570,8 @@ pub fn sys_sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<
         Some(value) => value,
         None => return Err(Errno::EBADF),
     };
-    // A sendfile into the terminal is a write to it: same access control as
-    // `write(2)`, checked once before any byte reaches the console.
+    // sendfile в терминал — это запись в него: тот же контроль доступа, что у
+    // `write(2)`, проверяется один раз, прежде чем хоть один байт дойдёт до консоли.
     if matches!(output, Resolved::Console) {
         crate::drivers::tty::check_access(super::tty::TtyAccess::Write)?;
     }
@@ -627,9 +624,9 @@ pub fn sys_sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<
         }
     }
     if offset != 0 {
-        // The copy loop above can block on a pipe/socket and yield; the offset
-        // pointer was validated once before the loop, so re-validate it before
-        // publishing (F-x86a-4).
+        // Цикл копирования выше может блокироваться на pipe/сокете и уступать
+        // CPU; указатель смещения проверен один раз до цикла, поэтому перед
+        // публикацией проверяем его снова.
         copy_out_checked(offset, &in_offset.to_le_bytes())?;
     } else {
         set_fd_offset(in_fd as u32, in_offset);
@@ -656,7 +653,7 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
                 return Err(Errno::EINVAL);
             }
             check_user_ptr(buf, 8)?;
-            // SAFETY: validated above
+            // SAFETY: проверено выше
             let add = unsafe { core::ptr::read_unaligned(buf as *const u64) };
             let mut count = val.lock();
             *count = count.saturating_add(add);
@@ -688,9 +685,9 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             Ok(n as u64)
         }
         Some(Resolved::Console) => {
-            // Terminal access control: a background JOB writing the terminal is
-            // stopped when TOSTOP is set (SIGTTOU + -EINTR), exactly like
-            // Linux; with TOSTOP clear the write goes through.
+            // Контроль доступа к терминалу: фоновый JOB, пишущий в терминал,
+            // останавливается при TOSTOP (SIGTTOU + -EINTR), как в Linux; если
+            // TOSTOP снят, запись проходит.
             crate::drivers::tty::check_access(super::tty::TtyAccess::Write)?;
             let data = copy_in(buf, count);
             console_write(&data);
@@ -705,12 +702,12 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `writev` (20): gather-write up to `iovcnt` `iovec` entries. fds 1/2 emit each
-/// buffer to the console; a file descriptor writes them in order advancing its
-/// offset; returns the total bytes written (R2.2). Each `iov_base` is validated
-/// through the pointer choke point before being read.
+/// `writev` (20): gather-запись до `iovcnt` записей `iovec`. fd 1/2 выводят
+/// каждый буфер в консоль; файловый дескриптор пишет их по порядку, сдвигая
+/// смещение; возвращается суммарное число байт (R2.2). Каждый `iov_base`
+/// проверяется через точку контроля указателей до чтения.
 pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
-    // struct iovec { void *iov_base; size_t iov_len; } — 16 bytes on x86_64.
+    // struct iovec { void *iov_base; size_t iov_len; } — 16 байт на x86_64.
     const IOV_SIZE: u64 = 16;
     const IOV_MAX: u64 = 1024;
     if iovcnt == 0 {
@@ -719,7 +716,7 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
     if iovcnt > IOV_MAX {
         return Err(Errno::EINVAL);
     }
-    // Validate the iovec array itself before reading any entry.
+    // Проверить сам массив iovec, прежде чем читать из него записи.
     check_user_ptr(iov, iovcnt * IOV_SIZE)?;
 
     let target = resolve_fd(fd as u32).ok_or(Errno::EBADF)?;
@@ -727,12 +724,13 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
         return Err(Errno::EBADF);
     }
     if matches!(target, Resolved::InetTcp(_)) {
-        // gather-write straight into the TCP socket; report the total
+        // gather-запись сразу в TCP-сокет; считаем суммарный объём
         let mut total: u64 = 0;
         for i in 0..iovcnt {
             let entry = iov + i * 16;
-            // Same re-validation as the generic loop below: `tcp_write` can
-            // block and yield, and a sibling may unmap the array (F-x86a-4).
+            // Та же повторная проверка, что и в общем цикле ниже: `tcp_write`
+            // может блокироваться и уступать CPU, а соседний поток — снять
+            // отображение массива.
             check_user_ptr(entry, IOV_SIZE)?;
             let base = unsafe { *(entry as *const u64) };
             let len = unsafe { *((entry + 8) as *const u64) };
@@ -759,7 +757,7 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
         return Err(Errno::EBADF);
     }
 
-    // Track a running offset for the file case; commit it once at the end.
+    // Для файлового случая ведём текущее смещение и фиксируем его в конце.
     let mut file_off = match &target {
         Resolved::File { offset, .. } => *offset,
         _ => 0,
@@ -768,12 +766,12 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
 
     for i in 0..iovcnt {
         let entry = iov + i * IOV_SIZE;
-        // Re-validate the single entry every iteration: the scalar read/write
-        // for the previous entry can block and yield, letting a CLONE_VM
-        // sibling unmap the iovec array (F-x86a-4). Without this the ring-0
-        // read of `entry` faulted in kernel mode and halted the machine.
+        // Проверять запись на каждой итерации: scalar read/write предыдущей
+        // записи может блокироваться и уступать CPU, и поток-сосед по CLONE_VM
+        // снимет отображение массива iovec. Без этого чтение `entry` из ring 0
+        // падало в режиме ядра и останавливало машину.
         check_user_ptr(entry, IOV_SIZE)?;
-        // SAFETY: the 16-byte entry was just validated.
+        // SAFETY: 16-байтная запись только что проверена.
         let base = unsafe { *(entry as *const u64) };
         let len = unsafe { *((entry + 8) as *const u64) };
         if len == 0 {
@@ -786,8 +784,8 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
         let data = copy_in(base, len);
         match &target {
             Resolved::Console => {
-                // Same terminal access control as `write(2)`: a background job
-                // under TOSTOP is stopped before its first gathered write.
+                // Тот же контроль доступа к терминалу, что у `write(2)`:
+                // фоновый job под TOSTOP останавливается до первой записи.
                 crate::drivers::tty::check_access(super::tty::TtyAccess::Write)?;
                 console_write(&data);
                 total += len;
@@ -811,7 +809,7 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
                     break;
                 }
             }
-            // Stdin/PipeRead/Dir/Eventfd/Epoll are rejected by the guards above.
+            // Stdin/PipeRead/Dir/Eventfd/Epoll отсекаются проверками выше.
             _ => unreachable!(),
         }
     }
@@ -822,10 +820,10 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
     Ok(total)
 }
 
-/// `readv` (19) — vectored read. Fills iovecs in order, stopping on a short
-/// read or an error (a short count is a legal readv result); callers
-/// (glibc stdio, libuv) loop for the rest. The per-call scalar primitive
-/// inherits sys_read's blocking semantics.
+/// `readv` (19) — vectored-чтение. Заполняет iovec по порядку, останавливаясь
+/// на коротком чтении или ошибке (короткий счётчик — допустимый результат
+/// readv); вызывающие (glibc stdio, libuv) доделывают остаток циклом. Scalar-
+/// примитив наследует блокирующую семантику `sys_read`.
 pub fn sys_readv(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
     const IOV_SIZE: u64 = 16;
     const IOV_MAX: u64 = 1024;
@@ -839,12 +837,12 @@ pub fn sys_readv(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
     let mut total: u64 = 0;
     for i in 0..iovcnt {
         let entry = iov + i * IOV_SIZE;
-        // Re-validate the single entry every iteration: the scalar read/write
-        // for the previous entry can block and yield, letting a CLONE_VM
-        // sibling unmap the iovec array (F-x86a-4). Without this the ring-0
-        // read of `entry` faulted in kernel mode and halted the machine.
+        // Проверять запись на каждой итерации: scalar read/write предыдущей
+        // записи может блокироваться и уступать CPU, и поток-сосед по CLONE_VM
+        // снимет отображение массива iovec. Без этого чтение `entry` из ring 0
+        // падало в режиме ядра и останавливало машину.
         check_user_ptr(entry, IOV_SIZE)?;
-        // SAFETY: the 16-byte entry was just validated.
+        // SAFETY: 16-байтная запись только что проверена.
         let base = unsafe { *(entry as *const u64) };
         let len = unsafe { *((entry + 8) as *const u64) };
         if len == 0 {
@@ -859,8 +857,8 @@ pub fn sys_readv(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
     Ok(total)
 }
 
-/// `preadv` (295) — positional vectored read; first non-empty
-/// iovec via `sys_pread64` (the descriptor offset is not advanced).
+/// `preadv` (295) — позиционное vectored-чтение; первый непустой
+/// iovec через `sys_pread64` (смещение дескриптора не сдвигается).
 pub fn sys_preadv(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, Errno> {
     const IOV_SIZE: u64 = 16;
     const IOV_MAX: u64 = 1024;
@@ -874,12 +872,12 @@ pub fn sys_preadv(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, Er
     let mut total: u64 = 0;
     for i in 0..iovcnt {
         let entry = iov + i * IOV_SIZE;
-        // Re-validate the single entry every iteration: the scalar read/write
-        // for the previous entry can block and yield, letting a CLONE_VM
-        // sibling unmap the iovec array (F-x86a-4). Without this the ring-0
-        // read of `entry` faulted in kernel mode and halted the machine.
+        // Проверять запись на каждой итерации: scalar read/write предыдущей
+        // записи может блокироваться и уступать CPU, и поток-сосед по CLONE_VM
+        // снимет отображение массива iovec. Без этого чтение `entry` из ring 0
+        // падало в режиме ядра и останавливало машину.
         check_user_ptr(entry, IOV_SIZE)?;
-        // SAFETY: the 16-byte entry was just validated.
+        // SAFETY: 16-байтная запись только что проверена.
         let base = unsafe { *(entry as *const u64) };
         let len = unsafe { *((entry + 8) as *const u64) };
         if len == 0 {
@@ -894,8 +892,8 @@ pub fn sys_preadv(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, Er
     Ok(total)
 }
 
-/// `pwritev` (296) — positional vectored write; first non-empty
-/// iovec via `sys_pwrite64`.
+/// `pwritev` (296) — позиционная vectored-запись; первый непустой
+/// iovec через `sys_pwrite64`.
 pub fn sys_pwritev(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, Errno> {
     const IOV_SIZE: u64 = 16;
     const IOV_MAX: u64 = 1024;
@@ -909,12 +907,12 @@ pub fn sys_pwritev(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, E
     let mut total: u64 = 0;
     for i in 0..iovcnt {
         let entry = iov + i * IOV_SIZE;
-        // Re-validate the single entry every iteration: the scalar read/write
-        // for the previous entry can block and yield, letting a CLONE_VM
-        // sibling unmap the iovec array (F-x86a-4). Without this the ring-0
-        // read of `entry` faulted in kernel mode and halted the machine.
+        // Проверять запись на каждой итерации: scalar read/write предыдущей
+        // записи может блокироваться и уступать CPU, и поток-сосед по CLONE_VM
+        // снимет отображение массива iovec. Без этого чтение `entry` из ring 0
+        // падало в режиме ядра и останавливало машину.
         check_user_ptr(entry, IOV_SIZE)?;
-        // SAFETY: the 16-byte entry was just validated.
+        // SAFETY: 16-байтная запись только что проверена.
         let base = unsafe { *(entry as *const u64) };
         let len = unsafe { *((entry + 8) as *const u64) };
         if len == 0 {
@@ -929,9 +927,9 @@ pub fn sys_pwritev(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, E
     Ok(total)
 }
 
-/// `fsync`/`fdatasync` (74/75). nvim fsyncs the ShaDa file on
-/// write; the ext2 WAL already journals every write at syscall time (ordered
-/// mode), so there is no dirty cache to flush — success on any valid fd.
+/// `fsync`/`fdatasync` (74/75). nvim делает fsync ShaDa-файла при записи;
+/// WAL ext2 журналирует каждую запись уже во время syscall (ordered mode),
+/// поэтому грязного кеша для сброса нет — успех на любом валидном fd.
 pub fn sys_fsync(fd: u64) -> Result<u64, Errno> {
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
@@ -939,19 +937,20 @@ pub fn sys_fsync(fd: u64) -> Result<u64, Errno> {
     }
 }
 
-/// Read the current process's cwd (absolute), defaulting to `/` when there is no
-/// compat state (a native task driving these handlers in a test harness).
+/// Прочитать cwd текущего процесса (абсолютный), по умолчанию `/`, если
+/// compat-состояния нет (нативная задача, гоняющая эти обработчики в тестах).
 fn current_cwd() -> String {
     compat::with_current_compat(|cs| cs.cwd.clone()).unwrap_or_else(|| String::from("/"))
 }
 
-/// Normalize `path`, resolving it against the current working directory when it is
-/// relative, and collapsing `.`/`..`/empty components into a clean absolute path.
+/// Нормализовать `path`: разрешить её относительно текущего рабочего каталога,
+/// если она относительная, и схлопнуть `.`/`..`/пустые компоненты в чистый
+/// абсолютный путь.
 ///
-/// `..` at the root stays at the root; the result always begins with `/` and never
-/// has a trailing slash (except the bare root `/`). This is the single place
-/// relative `open`/`openat`/`access`/`chdir`/`statfs`/`readlink` paths become
-/// absolute before hitting [`vfs::lookup_path`] (Feature: linux-binary-compat).
+/// `..` в корне остаётся в корне; результат всегда начинается с `/` и не имеет
+/// завершающего слэша (кроме голого `/`). Это единственное место, где
+/// относительные пути `open`/`openat`/`access`/`chdir`/`statfs`/`readlink`
+/// становятся абсолютными до [`vfs::lookup_path`].
 fn resolve_path(path: &str) -> String {
     let combined = if path.starts_with('/') {
         String::from(path)
@@ -982,11 +981,11 @@ fn resolve_path(path: &str) -> String {
         out.push('/');
         out.push_str(comp);
     }
-    // Guest-chroot mapping: Linux programs see the ext2 tree as `/`. Kernel
-    // special trees stay put (/dev nodes, /tmp ramfs, /proc — issue #11 —, the
-    // explicit /mnt view), everything else resolves under /mnt — this is what
-    // makes /etc/resolv.conf visible to glibc's resolver. The predicate compares
-    // whole path components (`/process` is a guest path, not a `/proc` path).
+    // Гостевое отображение chroot: Linux-программы видят дерево ext2 как `/`.
+    // Специальные деревья ядра остаются на месте (/dev-узлы, ramfs /tmp, /proc,
+    // явное представление /mnt), всё остальное резолвится под /mnt — именно так
+    // /etc/resolv.conf виден резолверу glibc. Предикат сравнивает целые
+    // компоненты пути (`/process` — гостевой путь, а не путь `/proc`).
     if out != "/" && !super::io::guest_path_keeps_root(&out) {
         let mut mapped = String::with_capacity(out.len() + 4);
         mapped.push_str("/mnt");
@@ -996,28 +995,28 @@ fn resolve_path(path: &str) -> String {
     out
 }
 
-/// Resolve an already guest-mapped absolute path through the VFS link walker
-/// (issue #18, contract `EXT2-LINKS.md` §4).
+/// Разрешить уже отображённый в госте абсолютный путь через обход ссылок VFS
+/// (контракт `EXT2-LINKS.md` §4).
 ///
-/// `follow_final` selects the syscall's semantics: `true` for
-/// `stat`/`open`/`access`/`chdir`/`execve` (follow the last component too),
-/// `false` for `lstat`, `readlink`, `unlink` and `rmdir` (the link itself is the
-/// answer, while intermediates are still followed). The walk itself — component
-/// stack, `..` handling, relative/absolute targets, `SYMLOOP_MAX = 40` budget —
-/// lives in the host-property-tested `vfs::link_walk`; this is only the
-/// `WalkError` → `Errno` mapping.
+/// `follow_final` выбирает семантику syscall: `true` для
+/// `stat`/`open`/`access`/`chdir`/`execve` (разыменовывать и последний
+/// компонент), `false` для `lstat`, `readlink`, `unlink` и `rmdir` (ответ —
+/// сама ссылка, промежуточные компоненты всё равно разыменовываются). Сам обход
+/// (стек компонентов, обработка `..`, относительные/абсолютные цели, бюджет
+/// `SYMLOOP_MAX = 40`) живёт в host-property-тестируемом `vfs::link_walk`; здесь
+/// только отображение `WalkError` → `Errno`.
 fn walk(abs: &str, follow_final: bool) -> Result<Arc<dyn VfsNode>, Errno> {
     walk_as(abs, follow_final, current_creds())
 }
 
-/// [`walk`] with explicit credentials.
+/// [`walk`] с явными креденшелами.
 ///
-/// The linker walker asks a credential predicate before looking a name up in a
-/// directory, so this is where POSIX directory-search (`x`) permission is
-/// enforced on **every** intermediate component — not just on the final node
-/// (F-x86v-3: uid 1000 read a 0644 file inside a root-owned 0700 directory).
-/// `access(2)` passes its real-id credential set; every other syscall uses the
-/// effective ids.
+/// Обходчик ссылок спрашивает предикат креденшелов перед поиском имени в
+/// каталоге, поэтому здесь POSIX-право поиска в каталоге (`x`) проверяется на
+/// **каждом** промежуточном компоненте, а не только на конечном узле (иначе
+/// uid 1000 мог прочитать файл 0644 внутри каталога 0700, принадлежащего root).
+/// `access(2)` передаёт набор по real id, все остальные syscall'ы — по
+/// effective id.
 fn walk_as(abs: &str, follow_final: bool, creds: Creds) -> Result<Arc<dyn VfsNode>, Errno> {
     let may_search =
         |node: &Arc<dyn VfsNode>| creds.may(node.mode(), node.owner(), Access::Execute);
@@ -1038,14 +1037,15 @@ fn walk_as(abs: &str, follow_final: bool, creds: Creds) -> Result<Arc<dyn VfsNod
     }
 }
 
-/// Build the [`OpenObject`] for an already-resolved absolute path, allocating a
-/// fresh descriptor for it. A directory becomes an [`OpenObject::Dir`] carrying a
-/// snapshot of its children (for `getdents64`); a file becomes an
-/// [`OpenObject::File`] at offset 0. `flags` are the caller's real `open(2)`
-/// flags, recorded for `/proc/<pid>/fdinfo/<n>`.
+/// Построить [`OpenObject`] для уже разрешённого абсолютного пути, выделив для
+/// него новый дескриптор. Каталог становится [`OpenObject::Dir`] со снимком
+/// потомков (для `getdents64`); файл — [`OpenObject::File`] со смещением 0.
+/// `flags` — реальные флаги `open(2)` вызывающего, они сохраняются для
+/// `/proc/<pid>/fdinfo/<n>`.
 fn open_resolved(abs: &str, flags: u64) -> Result<u64, Errno> {
-    // `open(2)` follows a final symlink; `/proc/self/exe` is such a link, and
-    // opening it must hand back the real image, not the link node.
+    // `open(2)` разыменовывает конечную симлинк-ссылку; `/proc/self/exe` —
+    // как раз такая ссылка, и открытие должно вернуть реальный образ, а не узел
+    // ссылки.
     let node = walk(abs, true)?;
     let obj = if node.is_directory() {
         let children = node.readdir().unwrap_or_default();
@@ -1064,31 +1064,31 @@ fn open_resolved(abs: &str, flags: u64) -> Result<u64, Errno> {
     let fd = compat::with_current_compat(|cs| cs.fds.alloc_with_flags(obj, flags));
     match fd {
         Some(fd) => Ok(fd as u64),
-        // No compat state (native task) — nowhere to record the descriptor.
+        // Нет compat-состояния (нативная задача) — дескриптор некуда записать.
         None => Err(Errno::EBADF),
     }
 }
 
-// Creation flags for open/openat (octal values from fcntl.h).
+// Флаги создания для open/openat (восьмеричные значения из fcntl.h).
 const O_CREAT_FL: u64 = 0o100;
 const O_EXCL_FL: u64 = 0o200;
 const O_TRUNC_FL: u64 = 0o1000;
-/// `open(2)` must fail with `ELOOP` when the final component is a symlink.
+/// `open(2)` обязан вернуть `ELOOP`, если конечный компонент — символическая ссылка.
 const O_NOFOLLOW_FL: u64 = 0o400000;
 
-/// Resolve a user path (against the cwd if relative) and allocate a fresh
-/// descriptor for it (R2.4). Honors O_CREAT/O_EXCL (creates a
-/// regular file via the parent directory's `create_file` - i.e. works on the
-/// /tmp ramfs; read-only trees still refuse) and best-effort O_TRUNC.
-/// `ENOENT` if the path is absent and O_CREAT is unset (R2.5). Shared by
-/// `open`/`openat`.
+/// Разрешить пользовательский путь (относительно cwd, если относительный) и
+/// выделить новый дескриптор (R2.4). Учитывает O_CREAT/O_EXCL (создаёт
+/// regular-файл через `create_file` родительского каталога — то есть работает
+/// на ramfs /tmp; деревья только для чтения по-прежнему отказывают) и
+/// best-effort O_TRUNC. `ENOENT`, если пути нет и O_CREAT не задан (R2.5).
+/// Общий код для `open`/`openat`.
 fn open_path(path: &str, flags: u64, mode: u32) -> Result<u64, Errno> {
     let abs = resolve_path(path);
     let trimmed = abs.trim_end_matches('/');
     let lookup_target = if trimmed.is_empty() { "/" } else { trimmed };
 
-    // O_NOFOLLOW: the *final* component must not be a link (issue #18). Linux
-    // reports ELOOP here, not EINVAL.
+    // O_NOFOLLOW: *конечный* компонент не должен быть ссылкой. Linux сообщает
+    // здесь ELOOP, а не EINVAL.
     if flags & O_NOFOLLOW_FL != 0 {
         if let Ok(node) = walk(lookup_target, false) {
             if node.is_symlink() {
@@ -1096,9 +1096,9 @@ fn open_path(path: &str, flags: u64, mode: u32) -> Result<u64, Errno> {
             }
         }
     }
-    // O_CREAT|O_EXCL refuses any existing directory entry — including a dangling
-    // symlink, which the follow check below would otherwise miss (it answers
-    // "ENOENT" for a link whose target is gone).
+    // O_CREAT|O_EXCL отвергает любую существующую запись каталога — включая
+    // висячую символическую ссылку, которую проверка разыменования ниже иначе
+    // пропустила бы (она отвечает «ENOENT» для ссылки с исчезнувшей целью).
     if flags & O_CREAT_FL != 0 && flags & O_EXCL_FL != 0 && walk(lookup_target, false).is_ok() {
         return Err(Errno::EEXIST);
     }
@@ -1108,21 +1108,22 @@ fn open_path(path: &str, flags: u64, mode: u32) -> Result<u64, Errno> {
             if flags & O_CREAT_FL != 0 && flags & O_EXCL_FL != 0 {
                 return Err(Errno::EEXIST);
             }
-            // Permission check BEFORE the O_TRUNC side effect: a caller that may
-            // not write the file must not be able to empty it. Root bypasses
-            // read/write but still needs an execute bit for a directory walk
-            // through the VFS, which happened above.
+            // Проверка прав ДО побочного эффекта O_TRUNC: вызывающий, которому
+            // нельзя писать в файл, не должен иметь возможности его опустошить.
+            // Root обходит read/write, но для обхода каталогов через VFS ему всё
+            // равно нужен execute-бит, и этот обход уже произошёл выше.
             check_open_mode(&node, flags)?;
             if flags & O_TRUNC_FL != 0 && !node.is_directory() {
-                // Best effort: nodes without truncate support (plain ext2
-                // files in this minimal layer) keep their contents.
+                // Best effort: узлы без поддержки truncate (обычные файлы ext2
+                // в этом минимальном слое) сохраняют содержимое.
                 let _ = node.truncate(0);
             }
         }
         Err(e) => {
-            // Only "absent" may fall through to creation: a cycle (ELOOP), an
-            // intermediate non-directory (ENOTDIR) or an over-long expansion
-            // must be reported as such, never turned into a new file.
+            // Дальше к созданию может пройти только «отсутствует»: цикл
+            // (ELOOP), промежуточный не-каталог (ENOTDIR) или слишком длинное
+            // развёртывание должны сообщаться как есть и никогда не превращаться
+            // в новый файл.
             if flags & O_CREAT_FL == 0 || e != Errno::ENOENT {
                 return Err(e);
             }
@@ -1134,10 +1135,10 @@ fn open_path(path: &str, flags: u64, mode: u32) -> Result<u64, Errno> {
             if name.is_empty() {
                 return Err(Errno::EINVAL);
             }
-            // The parent is resolved through the link walker: `O_CREAT` under a
-            // symlinked directory (`/lib64/...`) must land in its target.
+            // Родитель разрешается через обходчик ссылок: `O_CREAT` под
+            // каталогом-симлинком (`/lib64/...`) должен попасть в его цель.
             let dir = walk(parent, true)?;
-            // Creating a directory entry needs write + execute on the parent.
+            // Создание записи каталога требует write + execute на родителе.
             check_dir_mutation(&dir)?;
             let created = dir.create_file(name).map_err(|e| {
                 crate::warn!(
@@ -1148,10 +1149,10 @@ fn open_path(path: &str, flags: u64, mode: u32) -> Result<u64, Errno> {
                 );
                 Errno::EIO
             })?;
-            // `open(2)`'s mode argument, masked by the process umask, is the
-            // file's real permission set; `0` means the caller passed no mode
-            // (some libc paths do), which Linux treats as `0666 & ~umask` for
-            // the read/write-without-exec case.
+            // Аргумент mode у `open(2)`, урезанный umask процесса, — это реальный
+            // набор прав файла; `0` означает, что вызывающий не передал mode
+            // (некоторые пути libc так делают), и Linux трактует это как
+            // `0666 & ~umask` для случая чтения/записи без exec.
             stamp_creation_owner(&created);
             let requested = if mode == 0 { 0o666 } else { mode & 0o7777 };
             let _ = apply_node_mode(&created, requested & !current_umask());
@@ -1160,35 +1161,36 @@ fn open_path(path: &str, flags: u64, mode: u32) -> Result<u64, Errno> {
     open_resolved(&abs, flags)
 }
 
-/// `open` (2): open an existing ext2 path (resolved against the cwd if relative),
-/// allocating the lowest fd ≥ 3 (R2.4); `ENOENT` if the path is absent (R2.5).
-/// Directories open as a directory descriptor usable with `getdents64`.
+/// `open` (2): открыть существующий путь ext2 (относительно cwd, если путь
+/// относительный), выделив наименьший fd ≥ 3 (R2.4); `ENOENT`, если пути нет
+/// (R2.5). Каталоги открываются дескриптором каталога, пригодным для `getdents64`.
 pub fn sys_open(path: u64, flags: u64, mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     let fd = open_path(&p, flags, mode as u32)?;
-    // Honor O_CLOEXEC now that execve sweeps flagged descriptors.
+    // Учитывать O_CLOEXEC: execve вычищает помеченные дескрипторы.
     if flags & O_CLOEXEC != 0 {
         compat::with_current_compat(|cs| cs.fds.set_cloexec(fd as u32, true));
     }
     Ok(fd)
 }
 
-/// `openat` (257): like `open`. `AT_FDCWD` (and any dirfd in this minimal layer)
-/// resolves the path against the process cwd; absolute paths ignore the dirfd.
+/// `openat` (257): как `open`. `AT_FDCWD` (и любой dirfd в этом минимальном
+/// слое) разрешает путь относительно cwd процесса; абсолютные пути игнорируют dirfd.
 pub fn sys_openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
-    // Absolute paths ignore dirfd; relative paths resolve against the cwd (the
-    // only directory base this minimal layer tracks), which covers AT_FDCWD.
+    // Абсолютные пути игнорируют dirfd; относительные разрешаются относительно
+    // cwd (единственной базы каталога, которую отслеживает этот слой), что
+    // покрывает AT_FDCWD.
     let _ = dirfd;
     let fd = open_path(&p, flags, mode as u32)?;
-    // Honor O_CLOEXEC now that execve sweeps flagged descriptors.
+    // Учитывать O_CLOEXEC: execve вычищает помеченные дескрипторы.
     if flags & O_CLOEXEC != 0 {
         compat::with_current_compat(|cs| cs.fds.set_cloexec(fd as u32, true));
     }
     Ok(fd)
 }
 
-/// `close` (3): release the descriptor, or `EBADF` if it is not open (R2.6, R2.14).
+/// `close` (3): освободить дескриптор или `EBADF`, если он не открыт (R2.6, R2.14).
 pub fn sys_close(fd: u64) -> Result<u64, Errno> {
     let kind = fd_kind(fd);
     if kind == "inet-udp" {}
@@ -1197,10 +1199,10 @@ pub fn sys_close(fd: u64) -> Result<u64, Errno> {
     }
     let kind = fd_kind(fd);
     if kind.starts_with("pipe") {}
-    // NOTE: we deliberately do NOT remove the UDP socket here. Any path
-    // that takes NET.lock from a syscall handler risks deadlock (spinlocks
-    // disable IF; the net thread can't run to release its side). The leaked
-    // SocketSet slot is reclaimed at reboot.
+    // ЗАМЕЧАНИЕ: UDP-сокет здесь намеренно НЕ удаляется. Любой путь, берущий
+    // NET.lock из обработчика syscall, рискует дедлоком: спинлоки выключают IF,
+    // и сетевой поток не может выполниться, чтобы отпустить свою сторону. Слот
+    // SocketSet освободится только при перезагрузке.
     let res = compat::with_current_compat(|cs| cs.fds.close(fd as u32));
     match res {
         Some(Ok(())) => Ok(0),
@@ -1209,16 +1211,17 @@ pub fn sys_close(fd: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `lseek` (8): reposition a file descriptor's offset per `whence`/`offset`,
-/// returning the new absolute offset (R2.7) or `EINVAL` for a bad whence/negative
-/// result (R2.15). Console/stdin are not seekable (`EINVAL`); absent fd is `EBADF`.
+/// `lseek` (8): переместить смещение дескриптора по `whence`/`offset`,
+/// вернув новое абсолютное смещение (R2.7), либо `EINVAL` при плохом whence или
+/// отрицательном результате (R2.15). Консоль/stdin не ищутся (`EINVAL`);
+/// отсутствующий fd — `EBADF`.
 pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> Result<u64, Errno> {
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
         Some(Resolved::InetTcp(_)) | Some(Resolved::InetUdp(_)) => Err(Errno::ESPIPE),
-        // The console is not seekable — ESPIPE, like a
-        // pipe. CPython probes lseek on fds 0/1/2 at startup to decide
-        // buffering; EINVAL spammed the diag log three times per start.
+        // Консоль не поддерживает позиционирование — ESPIPE, как pipe.
+        // CPython при старте пробует lseek на fd 0/1/2, чтобы выбрать
+        // буферизацию; EINVAL трижды засорял diag-лог на каждый старт.
         Some(Resolved::Console) | Some(Resolved::Stdin) => Err(Errno::ESPIPE),
         Some(Resolved::PipeRead(_)) | Some(Resolved::PipeWrite(_)) => Err(Errno::ESPIPE),
         Some(Resolved::Socket { .. }) => Err(Errno::ESPIPE),
@@ -1226,8 +1229,9 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> Result<u64, Errno> {
         | Some(Resolved::Epoll)
         | Some(Resolved::Timerfd(_))
         | Some(Resolved::Signalfd(_)) => Err(Errno::ESPIPE),
-        // A directory descriptor supports rewinding/positioning its dents cursor:
-        // SEEK_SET sets the cursor index, returning it. Other whences are EINVAL.
+        // Дескриптор каталога поддерживает перемотку/позиционирование курсора
+        // записей: SEEK_SET задаёт индекс курсора и возвращает его. Остальные
+        // whence — EINVAL.
         Some(Resolved::Dir) => {
             if whence != super::io::SEEK_SET as u64 {
                 return Err(Errno::EINVAL);
@@ -1248,12 +1252,12 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `st_dev` reported for all VFS-backed files (arbitrary but nonzero; 8:0).
+/// `st_dev`, сообщаемый для всех файлов VFS (произвольный, но ненулевой; 8:0).
 pub(crate) const STAT_DEV_VFS: u64 = 0x0800;
 
-/// Nonzero fallback inode for synthetic nodes without filesystem identity:
-/// FNV-1a of the node name with the top bit set, so it can never collide with
-/// a real ext2 inode number (those fit in 32 bits) and never reads as zero.
+/// Ненулевой запасной inode для синтетических узлов без идентичности ФС:
+/// FNV-1a от имени узла с установленным старшим битом, чтобы он никогда не
+/// совпал с настоящим inode ext2 (те влезают в 32 бита) и не читался как ноль.
 fn synth_ino(name: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in name.as_bytes() {
@@ -1262,10 +1266,11 @@ fn synth_ino(name: &str) -> u64 {
     h | (1 << 63)
 }
 
-/// The stat-identity inode of `node`: its filesystem ino when it has one, the
-/// synthetic FNV fallback otherwise. This is the key `mode_overrides` is
-/// indexed by, so it must match what `write_stat`/`write_statx` report.
-/// `/proc/<pid>/fdinfo/<n>` reuses it so an fd's `ino:` equals `stat`'s.
+/// stat-идентичность inode узла: его ino из ФС, если есть, иначе синтетический
+/// FNV-запасной. Это ключ индексации `mode_overrides`, поэтому он должен
+/// совпадать с тем, что сообщают `write_stat`/`write_statx`.
+/// `/proc/<pid>/fdinfo/<n>` использует его же, чтобы `ino:` дескриптора
+/// совпадал с `stat`.
 pub(crate) fn node_ino(node: &Arc<dyn VfsNode>) -> u64 {
     match node.fs_ino() {
         0 => synth_ino(node.name()),
@@ -1273,28 +1278,28 @@ pub(crate) fn node_ino(node: &Arc<dyn VfsNode>) -> u64 {
     }
 }
 
-/// The per-process permission-bit override recorded for `ino` (via `chmod` or
-/// at creation time), if any.
+/// Переопределение битов прав для `ino` в текущем процессе (после `chmod` или
+/// на момент создания), если оно есть.
 fn mode_override_perms(ino: u64) -> Option<u32> {
     compat::with_current_compat(|cs| cs.mode_overrides.get(&ino).copied()).flatten()
 }
 
-// ─── syscall-boundary permission checks ─────────────────────────────────────
+// ─── проверки прав на границе syscall ───────────────────────────────────────
 //
-// Credentials and permission checks live HERE, in the syscall layer. The VFS
-// only carries metadata (`VfsNode::mode`/`owner`); boot provisioning, the shell
-// and the package installer keep calling VFS methods directly with no credential
-// and are therefore unaffected — the same shape Linux has (the VFS does not know
-// the caller; `inode_permission()` runs in the syscall path).
+// Креденшелы и проверки прав живут ЗДЕСЬ, в слое syscall. VFS несёт только
+// метаданные (`VfsNode::mode`/`owner`); провижининг загрузки, шелл и
+// установщик пакетов по-прежнему зовут методы VFS напрямую, без креденшелов,
+// и потому не затронуты — та же форма, что в Linux (VFS не знает вызывающего;
+// `inode_permission()` выполняется в пути syscall).
 //
-// Everything below uses the process's EFFECTIVE ids (see `cred::Creds::may`).
+// Всё ниже использует EFFECTIVE id процесса (см. `cred::Creds::may`).
 
-/// Snapshot of the calling process's credentials (`ROOT` for a native task).
+/// Снимок креденшелов вызывающего процесса (`ROOT` для нативной задачи).
 fn current_creds() -> Creds {
     compat::current_creds()
 }
 
-/// May the caller access `node` for `access`? `EACCES` otherwise.
+/// Может ли вызывающий обратиться к `node` для `access`? Иначе `EACCES`.
 fn check_node_access(node: &Arc<dyn VfsNode>, access: Access) -> Result<(), Errno> {
     if current_creds().may(node.mode(), node.owner(), access) {
         Ok(())
@@ -1303,10 +1308,10 @@ fn check_node_access(node: &Arc<dyn VfsNode>, access: Access) -> Result<(), Errn
     }
 }
 
-/// Creating, removing or renaming an entry needs write AND execute on the
-/// parent directory (POSIX). Root bypasses write but, like every `may` call,
-/// still needs an execute bit — a mode-`0644` directory is not searchable even
-/// for root.
+/// Создание, удаление или переименование записи требуют write И execute на
+/// родительском каталоге (POSIX). Root обходит write, но, как и в любом вызове
+/// `may`, ему всё равно нужен execute-бит: каталог с правами `0644` не
+/// просматривается даже root.
 fn check_dir_mutation(dir: &Arc<dyn VfsNode>) -> Result<(), Errno> {
     let creds = current_creds();
     let mode = dir.mode();
@@ -1318,11 +1323,11 @@ fn check_dir_mutation(dir: &Arc<dyn VfsNode>) -> Result<(), Errno> {
     }
 }
 
-/// Access an already-open `open(2)` call needs on an existing node.
+/// Какой доступ к существующему узлу требует уже открытый вызов `open(2)`.
 ///
-/// `O_RDONLY` needs read; `O_WRONLY` write; `O_RDWR` both; `O_TRUNC` additionally
-/// needs write (Linux checks the truncation right separately, and a read-only
-/// descriptor that truncates is still a write).
+/// `O_RDONLY` требует read; `O_WRONLY` — write; `O_RDWR` — оба; `O_TRUNC`
+/// дополнительно требует write (Linux проверяет право на усечение отдельно:
+/// read-only дескриптор с усечением — всё равно запись).
 fn check_open_mode(node: &Arc<dyn VfsNode>, flags: u64) -> Result<(), Errno> {
     let acc = flags & 0o3;
     let creds = current_creds();
@@ -1363,12 +1368,12 @@ fn check_open_mode(node: &Arc<dyn VfsNode>, flags: u64) -> Result<(), Errno> {
     })
 }
 
-/// Persist `perms` on `node` and mirror it in the per-process stat override.
+/// Сохранить `perms` на `node` и отразить их в stat-переопределении процесса.
 ///
-/// ext2 writes the inode. Synthetic nodes (`/proc`, `/dev`, ramfs) have no
-/// metadata store and return `NotSupported`; for those the historical override
-/// remains the only record, which is why the caller keeps calling
-/// [`record_mode_override`] either way.
+/// ext2 пишет inode. Синтетические узлы (`/proc`, `/dev`, ramfs) не имеют хранилища
+/// метаданных и возвращают `NotSupported`; для них историческое переопределение
+/// остаётся единственной записью, поэтому вызывающий в любом случае продолжает
+/// звать [`record_mode_override`].
 fn apply_node_mode(node: &Arc<dyn VfsNode>, perms: u32) -> Result<(), Errno> {
     match node.set_mode(perms) {
         Ok(()) | Err(crate::vfs::VfsError::NotSupported) => {
@@ -1379,14 +1384,15 @@ fn apply_node_mode(node: &Arc<dyn VfsNode>, perms: u32) -> Result<(), Errno> {
     }
 }
 
-/// Stamp a newly created node with the creator's effective uid/egid.
+/// Проставить новому узлу effective uid/egid создателя.
 ///
-/// ext2's writer has no credential and stamps `(0, 0)`; the syscall boundary is
-/// where the caller's identity is known, so a non-root creator must become the
-/// owner here or it could never `chmod` the file it just made. Root's `(0, 0)`
-/// is already what the writer stores, so the extra journaled transaction is
-/// skipped for the default identity. Synthetic nodes cannot store an owner
-/// (`NotSupported`); that is the documented ramfs/procfs limitation.
+/// Писатель ext2 не имеет креденшелов и ставит `(0, 0)`; граница syscall — то
+/// место, где известна личность вызывающего, поэтому не-root создатель должен
+/// стать владельцем здесь, иначе он никогда не сможет сделать `chmod` только что
+/// созданного файла. `(0, 0)` root — это уже то, что пишет писатель, поэтому
+/// лишняя журналируемая транзакция для identity по умолчанию пропускается.
+/// Синтетические узлы не хранят владельца (`NotSupported`); это документированное
+/// ограничение ramfs/procfs.
 fn stamp_creation_owner(node: &Arc<dyn VfsNode>) {
     let creds = current_creds();
     if creds.euid != 0 || creds.egid != 0 {
@@ -1394,7 +1400,7 @@ fn stamp_creation_owner(node: &Arc<dyn VfsNode>) {
     }
 }
 
-/// Root-or-owner check shared by `chmod`/`fchmod`.
+/// Проверка root-или-владелец, общая для `chmod`/`fchmod`.
 fn check_chmod_allowed(node: &Arc<dyn VfsNode>) -> Result<(), Errno> {
     if current_creds().may_chmod(node.owner()) {
         Ok(())
@@ -1403,7 +1409,7 @@ fn check_chmod_allowed(node: &Arc<dyn VfsNode>) -> Result<(), Errno> {
     }
 }
 
-/// Root-only check shared by `chown`/`fchown`.
+/// Проверка только-root, общая для `chown`/`fchown`.
 fn check_chown_allowed() -> Result<(), Errno> {
     if current_creds().may_chown() {
         Ok(())
@@ -1412,9 +1418,9 @@ fn check_chown_allowed() -> Result<(), Errno> {
     }
 }
 
-/// Resolve a `(uid, gid)` pair for `chown(2)`: `(u32)-1` means "keep the current
-/// one". ext2 stores both as `u16`, so an out-of-range id is `EINVAL` rather than
-/// a silent truncation.
+/// Разрешить пару `(uid, gid)` для `chown(2)`: `(u32)-1` означает «оставить
+/// текущий». ext2 хранит оба как `u16`, поэтому id вне диапазона — `EINVAL`,
+/// а не молчаливое усечение.
 fn resolve_chown_ids(node: &Arc<dyn VfsNode>, uid: u64, gid: u64) -> Result<(u32, u32), Errno> {
     let (cur_uid, cur_gid) = node.owner();
     let new_uid = optional_owner_id(uid, cur_uid);
@@ -1433,39 +1439,39 @@ fn optional_owner_id(raw: u64, current: u32) -> u32 {
     }
 }
 
-/// Apply a `chown` to `node`, or `EPERM` when the node has no persistent owner.
+/// Применить `chown` к `node` или вернуть `EPERM`, если у узла нет постоянного владельца.
 fn apply_node_owner(node: &Arc<dyn VfsNode>, uid: u64, gid: u64) -> Result<(), Errno> {
     let (new_uid, new_gid) = resolve_chown_ids(node, uid, gid)?;
     match node.set_owner(new_uid, new_gid) {
         Ok(()) => Ok(()),
-        // Synthetic nodes cannot store an owner; reporting success would be a
-        // lie (a later `stat`/permission check would still see `(0, 0)`).
+        // Синтетические узлы не хранят владельца; сообщить успех было бы ложью
+        // (последующий `stat`/проверка прав всё равно увидели бы `(0, 0)`).
         Err(crate::vfs::VfsError::NotSupported) => Err(Errno::EPERM),
         Err(crate::vfs::VfsError::InvalidArgument) => Err(Errno::EINVAL),
         Err(_) => Err(Errno::EIO),
     }
 }
 
-/// The current process's umask (022 for native tasks without compat state).
+/// Текущий umask процесса (022 для нативных задач без compat-состояния).
 fn current_umask() -> u32 {
     compat::with_current_compat(|cs| cs.umask).unwrap_or(0o022)
 }
 
-/// Record `perms` (0o7777 bits) for `ino` in the current process's mode
-/// overrides.
+/// Записать `perms` (биты 0o7777) для `ino` в переопределения прав текущего процесса.
 fn record_mode_override(ino: u64, perms: u32) {
     compat::with_current_compat(|cs| {
         cs.mode_overrides.insert(ino, perms);
     });
 }
 
-/// `st_mode` permission bits for `node`: the per-process override when one was
-/// recorded, else the long-standing defaults (0755 files / 0700 dirs —
-/// everything runs as root, and apt-installed programs need the X bits).
+/// Биты прав `st_mode` для `node`: переопределение процесса, если оно записано,
+/// иначе давние значения по умолчанию (0755 файлы / 0700 каталоги — всё работает
+/// под root, а установленным из apt программам нужны X-биты).
 fn stat_mode_for(node: &Arc<dyn VfsNode>) -> u32 {
-    // The override is kept for synthetic nodes (`/proc`, `/dev`, ramfs) that
-    // cannot persist a mode; real files answer from their inode, which is what
-    // the permission checks use, so stat can no longer disagree with access.
+    // Переопределение хранится для синтетических узлов (`/proc`, `/dev`, ramfs),
+    // которые не могут сохранить режим; реальные файлы отвечают из своего inode,
+    // который используют и проверки прав, так что stat больше не может
+    // расходиться с access.
     let perms = match mode_override_perms(node_ino(node)) {
         Some(p) => p,
         None => node.mode() & 0o7777,
@@ -1479,34 +1485,35 @@ fn stat_mode_for(node: &Arc<dyn VfsNode>) -> u32 {
     }
 }
 
-/// Fill a [`LinuxStat`] for a node and copy it to the validated user buffer.
+/// Заполнить [`LinuxStat`] для узла и скопировать его в проверенный буфер пользователя.
 fn write_stat(node: &Arc<dyn VfsNode>, statbuf: u64) -> Result<u64, Errno> {
     let mode = stat_mode_for(node);
     let (uid, gid) = node.owner();
     let mut stat = encode_stat(node.size(), mode, uid, gid);
-    // File identity matters. glibc's ld.so deduplicates loaded
-    // shared objects by the (st_dev, st_ino) pair from `fstat`, and the main
-    // executable's link_map carries an all-zero file id. With st_dev/st_ino
-    // left zeroed for every file, each freshly opened library "matched" the
-    // main binary, the loader reused its link_map instead of mapping libc, and
-    // startup died with "no version information available" spam followed by
-    // undefined `__libc_start_main, version GLIBC_2.34` (exit 127).
+    // Идентичность файла важна. ld.so из glibc дедуплицирует загруженные
+    // разделяемые объекты по паре (st_dev, st_ino) из `fstat`, а link_map
+    // главного исполняемого файла несёт полностью нулевой file id. Пока
+    // st_dev/st_ino оставались нулевыми для всех файлов, каждая заново открытая
+    // библиотека «совпадала» с главным бинарём, загрузчик переиспользовал её
+    // link_map вместо отображения libc, и запуск умирал с потоком «no version
+    // information available», а затем undefined `__libc_start_main, version
+    // GLIBC_2.34` (exit 127).
     stat.st_dev = STAT_DEV_VFS;
     stat.st_ino = node_ino(node);
-    // Hard links: ext2 reports `i_links_count`, so two names for one inode are
-    // visibly the same file (issue #18). Synthetic nodes default to 1.
+    // Жёсткие ссылки: ext2 сообщает `i_links_count`, поэтому два имени одного
+    // inode выглядят одним файлом. Синтетические узлы по умолчанию 1.
     stat.st_nlink = node.nlink();
     stat.st_blocks = (stat.st_size + 511) / 512;
     write_stat_struct(&stat, statbuf);
     Ok(0)
 }
 
-/// Fill a [`LinuxStat`] describing a symbolic link itself (`lstat`).
+/// Заполнить [`LinuxStat`], описывающий саму символическую ссылку (`lstat`).
 ///
-/// `st_size` is the target length and `st_nlink` the inode's link count, exactly
-/// as Linux reports for a symlink; `st_blocks` is 0 because only a *slow* ext2
-/// link (target ≥ 60 bytes) owns a data block and `du`-grade accuracy is not
-/// needed here (documented in `src/vfs/README.md`).
+/// `st_size` — длина цели, `st_nlink` — счётчик ссылок inode, как Linux
+/// сообщает для симлинка; `st_blocks` равен 0, потому что только *медленная*
+/// ссылка ext2 (цель ≥ 60 байт) владеет блоком данных, а точность уровня `du`
+/// здесь не нужна (описано в `src/vfs/README.md`).
 fn write_link_stat(node: &Arc<dyn VfsNode>, statbuf: u64) {
     let len = node.read_link().map(|t| t.len() as u64).unwrap_or(0);
     let (uid, gid) = node.owner();
@@ -1518,7 +1525,7 @@ fn write_link_stat(node: &Arc<dyn VfsNode>, statbuf: u64) {
     write_stat_struct(&stat, statbuf);
 }
 
-/// Copy a fully-built [`LinuxStat`] to the validated user buffer.
+/// Скопировать полностью собранный [`LinuxStat`] в проверенный буфер пользователя.
 fn write_stat_struct(stat: &LinuxStat, statbuf: u64) {
     let bytes = unsafe {
         core::slice::from_raw_parts(
@@ -1529,19 +1536,20 @@ fn write_stat_struct(stat: &LinuxStat, statbuf: u64) {
     copy_out(statbuf, bytes);
 }
 
-/// `fstat` (5): populate the user `struct stat` for an open descriptor (R2.8).
-/// `EBADF` for an absent fd (R2.14). Console/stdin report a character device.
+/// `fstat` (5): заполнить пользовательский `struct stat` для открытого
+/// дескриптора (R2.8). `EBADF` для отсутствующего fd (R2.14). Консоль/stdin
+/// сообщают символьное устройство.
 pub fn sys_fstat(fd: u64, statbuf: u64) -> Result<u64, Errno> {
     check_user_ptr(statbuf, core::mem::size_of::<LinuxStat>() as u64)?;
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
         Some(Resolved::InetTcp(_)) | Some(Resolved::InetUdp(_)) => {
-            // S_IFSOCK with 0644-ish mode; libuv only asks for the type.
+            // S_IFSOCK с режимом вроде 0644; libuv спрашивает только тип.
             write_statx_sock(statbuf)
         }
         Some(Resolved::Socket { .. }) => {
-            // Socketpair ends report S_IFSOCK — libuv's
-            // uv_guess_handle checks the fd type of stdio descriptors.
+            // Концы socketpair сообщают S_IFSOCK — uv_guess_handle из libuv
+            // проверяет тип stdio-дескрипторов.
             let stat = encode_stat(0, S_IFSOCK | 0o666, 0, 0);
             write_stat_struct(&stat, statbuf);
             Ok(0)
@@ -1567,15 +1575,15 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `newfstatat` (262): stat a path (absolute, or `AT_FDCWD`-relative) into the
-/// user `struct stat` (R2.8); `ENOENT` if absent (R2.5).
+/// `newfstatat` (262): stat пути (абсолютного или относительного `AT_FDCWD`) в
+/// пользовательский `struct stat` (R2.8); `ENOENT`, если пути нет (R2.5).
 pub fn sys_newfstatat(_dirfd: u64, path: u64, statbuf: u64, flags: u64) -> Result<u64, Errno> {
     check_user_ptr(statbuf, core::mem::size_of::<LinuxStat>() as u64)?;
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
     if flags & AT_SYMLINK_NOFOLLOW != 0 {
-        // `lstat`: describe the link itself, never what it points at (the
-        // walker still follows intermediates).
+        // `lstat`: описать саму ссылку, а не то, куда она указывает
+        // (промежуточные компоненты обходчик всё равно разыменовывает).
         let node = walk(&abs, false)?;
         if node.is_symlink() {
             write_link_stat(&node, statbuf);
@@ -1583,24 +1591,23 @@ pub fn sys_newfstatat(_dirfd: u64, path: u64, statbuf: u64, flags: u64) -> Resul
         }
         return write_stat(&node, statbuf);
     }
-    // `stat`: follow the final link (a dangling one is ENOENT, a cycle ELOOP).
+    // `stat`: разыменовать конечную ссылку (висячая — ENOENT, цикл — ELOOP).
     let node = walk(&abs, true)?;
     write_stat(&node, statbuf)
 }
 
-/// `ioctl` (16): console/stdin answer the core tty queries (`TCGETS`,
-/// `TCSETS*`, `TIOCGWINSZ`) so `isatty()` reports a terminal. A
-/// blanket `EINVAL` made CPython treat stdin as a non-tty pipe, read an
-/// instant EOF and exit 0 without ever showing a prompt. Other descriptors
-/// still report `EINVAL`; an absent fd is `EBADF`.
+/// `ioctl` (16): консоль/stdin отвечают на базовые tty-запросы (`TCGETS`,
+/// `TCSETS*`, `TIOCGWINSZ`), чтобы `isatty()` видел терминал. Повальный
+/// `EINVAL` заставлял CPython считать stdin не-tty pipe, читать мгновенный EOF и
+/// завершаться с 0, так и не показав приглашение. Остальные дескрипторы
+/// по-прежнему получают `EINVAL`; отсутствующий fd — `EBADF`.
 pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
-    // FIOCLEX/FIONCLEX set/clear the close-on-exec
-    // flag on an fd. pagh has no execve yet, so the flag has no observable
-    // effect; report success on any valid fd instead of EINVAL. CPython's
-    // _Py_set_inheritable() issues ioctl(fd, FIOCLEX) for every module file
-    // importlib opens and treats any errno other than ENOTTY/EACCES as a
-    // fatal I/O error — this was the importlib get_data OSError (Errno 22)
-    // that aborted startup with "Failed to import encodings module".
+    // FIOCLEX/FIONCLEX ставят/снимают у fd флаг close-on-exec. Здесь ioctl
+    // принимается как успех на любом валидном fd, а не как EINVAL:
+    // `_Py_set_inheritable()` из CPython выдаёт ioctl(fd, FIOCLEX) для каждого
+    // файла модуля, который открывает importlib, и считает любую errno кроме
+    // ENOTTY/EACCES фатальной ошибкой I/O — это был OSError(Errno 22) из
+    // get_data, обрывавший запуск на «Failed to import encodings module».
     const FIONCLEX: u64 = 0x5450;
     const FIOCLEX: u64 = 0x5451;
     if request == FIOCLEX || request == FIONCLEX {
@@ -1609,11 +1616,11 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
             Some(_) => Ok(0),
         };
     }
-    // FIONBIO. libuv's uv__nonblock on Linux is ioctl(FIONBIO),
-    // NOT fcntl(F_SETFL). uv_pipe_open() calls it on the dup'd socketpair end
-    // of the embedded-nvim RPC channel; answering ENOTTY made pipe_open fail,
-    // so the channel never reached the event loop (the black-screen hang).
-    // Mirrors the F_SETFL O_NONBLOCK arm below.
+    // FIONBIO. В libuv на Linux uv__nonblock — это ioctl(FIONBIO), а НЕ
+    // fcntl(F_SETFL). uv_pipe_open() вызывает его на dup-конце socketpair
+    // RPC-канала встроенного nvim; ответ ENOTTY ломал pipe_open, канал не
+    // доходил до event loop (зависание с чёрным экраном). Зеркалит ветку
+    // F_SETFL O_NONBLOCK ниже.
     const FIONBIO: u64 = 0x5421;
     if request == FIONBIO {
         check_user_ptr(arg, 4)?;
@@ -1645,44 +1652,44 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
         Some(Resolved::Console) | Some(Resolved::Stdin) => tty_ioctl(request, arg),
-        // A tty request on a non-tty fd is "inappropriate
-        // ioctl for device", not "invalid argument". glibc isatty() expects
-        // ENOTTY; EINVAL also tripped the EINVAL diag on every isatty probe
-        // CPython makes (TCGETS on fd 3) and flooded the serial log.
+        // tty-запрос на не-tty дескриптор — «неподходящий ioctl для
+        // устройства», а не «неверный аргумент». isatty() из glibc ждёт ENOTTY;
+        // EINVAL ещё и зажигал diag на каждой пробе isatty у CPython (TCGETS на
+        // fd 3) и заливал serial-лог.
         Some(_) => {
-            // Tty probes (isatty and friends) on non-tty fds are
-            // routine noise; any OTHER unknown request is a compat-surface gap
-            // worth seeing on screen.
+            // Пробы tty (isatty и компании) на не-tty fd — рутинный шум;
+            // любой ДРУГОЙ неизвестный запрос — пробел compat-поверхности,
+            // который стоит видеть на экране.
             if !(0x5401..=0x5420).contains(&request) {}
             Err(Errno::ENOTTY)
         }
     }
 }
 
-// ─── tty surface ────────────────────────────────────────────────
+// ─── поверхность tty ────────────────────────────────────────────────────────
 
-/// `TCGETS`: read terminal attributes (`struct termios`).
+/// `TCGETS`: прочитать атрибуты терминала (`struct termios`).
 const TCGETS: u64 = 0x5401;
-/// `TCSETS` / `TCSETSW` / `TCSETSF`: set terminal attributes (accepted, ignored).
+/// `TCSETS` / `TCSETSW` / `TCSETSF`: задать атрибуты терминала (принимаются, игнорируются).
 const TCSETS: u64 = 0x5402;
 const TCSETSW: u64 = 0x5403;
 const TCSETSF: u64 = 0x5404;
-/// `TIOCGWINSZ`: read the window size (`struct winsize`).
+/// `TIOCGWINSZ`: прочитать размер окна (`struct winsize`).
 const TIOCGWINSZ: u64 = 0x5413;
 const TIOCSWINSZ: u64 = 0x5414;
 
-/// Byte size of the Linux `struct termios` (4×u32 + c_line + c_cc[19]).
+/// Размер Linux `struct termios` в байтах (4×u32 + c_line + c_cc[19]).
 const TERMIOS_SIZE: usize = 36;
 
-/// Build a plausible cooked-mode `struct termios` byte image: ICRNL|IXON,
-/// OPOST|ONLCR, B38400|CS8|CREAD, ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN plus the
-/// standard control characters (^C, ^\, DEL, ^U, ^D-as-VEOF, ...).
+/// Собрать правдоподобный образ `struct termios` в cooked-режиме: ICRNL|IXON,
+/// OPOST|ONLCR, B38400|CS8|CREAD, ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN плюс
+/// стандартные управляющие символы (^C, ^\, DEL, ^U, ^D как VEOF, ...).
 ///
-/// STAGE 16.16: the three bits the kernel actually implements — `ICANON` and
-/// `ECHO` (per-process, set by `TCSETS`) and `TOSTOP` (the terminal-wide
-/// background-write policy, see `drivers::tty`) — are reported from live state.
-/// A program that saves the attributes, changes them and restores them must get
-/// back what it set, not a hardcoded image.
+/// Три бита, которые ядро действительно реализует — `ICANON` и `ECHO`
+/// (на процесс, ставятся `TCSETS`) и `TOSTOP` (политика фоновой записи на весь
+/// терминал, см. `drivers::tty`) — сообщаются из живого состояния. Программа,
+/// которая сохраняет атрибуты, меняет их и восстанавливает, должна получить
+/// обратно то, что поставила, а не жёстко зашитый образ.
 fn build_termios() -> [u8; TERMIOS_SIZE] {
     let mut t = [0u8; TERMIOS_SIZE];
     let c_iflag: u32 = 0x0500; // ICRNL | IXON
@@ -1706,7 +1713,7 @@ fn build_termios() -> [u8; TERMIOS_SIZE] {
     t[12..16].copy_from_slice(&c_lflag.to_le_bytes());
     t[16] = 0; // c_line
                // c_cc: VINTR VQUIT VERASE VKILL VEOF VTIME VMIN VSWTC VSTART VSTOP VSUSP
-               //       VEOL VREPRINT VDISCARD VWERASE VLNEXT VEOL2 (rest zero)
+               //       VEOL VREPRINT VDISCARD VWERASE VLNEXT VEOL2 (остальное — нули)
     let c_cc: [u8; 19] = [
         3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0,
     ];
@@ -1714,8 +1721,8 @@ fn build_termios() -> [u8; TERMIOS_SIZE] {
     t
 }
 
-/// Console/stdin ioctls: just enough tty surface for `isatty()` to say yes
-/// (glibc issues `TCGETS`) and for programs to learn an 80×25 window.
+/// ioctl консоли/stdin: ровно столько tty-поверхности, чтобы `isatty()` сказал
+/// «да» (glibc выдаёт `TCGETS`), а программы узнали окно 80×25.
 fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
     match request {
         TCGETS => {
@@ -1723,28 +1730,28 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
             copy_out(arg, &build_termios());
             Ok(0)
         }
-        // If ICANON is cleared, switch to raw mode so reads
-        // return one byte at a time (nvim/less/vim need this).
+        // Если ICANON снят, переключаемся в raw-режим, чтобы чтения
+        // возвращали по одному байту (это нужно nvim/less/vim).
         TCSETS | TCSETSW | TCSETSF => {
             if arg != 0 {
-                // F-x86a-4 audit: the old code DISCARDED the validation result
-                // (`let _ = check_user_ptr(...)`) and read `c_lflag` anyway, so
-                // a bad pointer was dereferenced from ring 0 — the F-x86a-3
-                // class (kernel #GP/#PF -> halt) through an unchecked ioctl.
+                // Проверка указателя обязательна: если проигнорировать её
+                // результат и всё равно прочитать `c_lflag`, плохой указатель
+                // будет разыменован из ring 0 — класс kernel #GP/#PF с
+                // остановкой машины через непроверенный ioctl.
                 check_user_ptr(arg, TERMIOS_SIZE as u64)?;
-                // c_lflag is at offset 12; ICANON = 0x02
+                // c_lflag лежит по смещению 12; ICANON = 0x02
                 let c_lflag = unsafe { core::ptr::read_unaligned((arg + 12) as *const u32) };
-                let raw = c_lflag & 0x02 == 0; // ICANON cleared => raw mode
-                                               // STAGE 16.16: track ECHO (0x08) too, so raw-mode reads know
-                                               // whether the kernel must echo typed characters itself.
+                let raw = c_lflag & 0x02 == 0; // ICANON снят => raw-режим
+                                               // Отслеживать и ECHO (0x08), чтобы raw-чтения знали,
+                                               // должен ли сам kernel эхо-печатать введённые символы.
                 let echo = c_lflag & 0x08 != 0;
                 crate::task::compat::with_current_compat(|cs| {
                     if cs.raw_mode != raw || cs.echo != echo {}
                     cs.raw_mode = raw;
                     cs.echo = echo;
                 });
-                // TOSTOP (0x100) is TERMINAL state, not per-process: it decides
-                // whether a background job's write stops it (drivers::tty).
+                // TOSTOP (0x100) — состояние ТЕРМИНАЛА, а не процесса: он решает,
+                // останавливает ли запись фонового job (drivers::tty).
                 crate::drivers::tty::set_tostop(c_lflag & TOSTOP != 0);
             }
             Ok(0)
@@ -1759,14 +1766,14 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
             copy_out(arg, &ws);
             Ok(0)
         }
-        // Window-size writes are accepted and ignored (readline issues
-        // TIOCSWINSZ during startup to propagate its computed size).
+        // Запись размера окна принимается и игнорируется (readline шлёт
+        // TIOCSWINSZ при старте, распространяя вычисленный размер).
         TIOCSWINSZ => Ok(0),
-        // Terminal job control: report / change the terminal's foreground
-        // process group. Previously both answered in terms of the CALLER
-        // (report the caller, accept any change silently), so `tcgetpgrp` lied
-        // to every background job and bash printed "cannot set terminal process
-        // group (-1)" + "no job control in this shell" on every start.
+        // Управление заданиями терминала: сообщить/сменить foreground process
+        // group терминала. Раньше оба запроса отвечали про ВЫЗЫВАЮЩЕГО (сообщить
+        // вызывающего, принять любую смену молча), поэтому `tcgetpgrp` врал
+        // каждому фоновому job, а bash при каждом старте печатал «cannot set
+        // terminal process group (-1)» + «no job control in this shell».
         TIOCGPGRP => {
             check_user_ptr(arg, 4)?;
             let pg = crate::drivers::tty::foreground_pgid() as u32;
@@ -1774,15 +1781,15 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
             Ok(0)
         }
         TIOCSPGRP => {
-            // The argument is an `int *` (glibc's tcsetpgrp passes &pgrp): the
-            // 32-bit word is signed, so a negative pgid is EINVAL (Linux's
-            // tiocspgrp rejects `pgrp < 0` before any lookup). pagh has no
-            // sessions, so `tty::may_set_foreground` approximates Linux's
-            // session check with "the group must be live, or the terminal's
-            // current/shell group" and returns EPERM otherwise.
+            // Аргумент — `int *` (tcsetpgrp из glibc передаёт &pgrp): 32-битное
+            // слово знаковое, поэтому отрицательный pgid — EINVAL (tiocspgrp в
+            // Linux отвергает `pgrp < 0` до любого поиска). Сессий здесь нет,
+            // поэтому `tty::may_set_foreground` аппроксимирует проверку сессии
+            // Linux правилом «группа должна быть живой, либо текущей/шелловой
+            // группой терминала», иначе возвращает EPERM.
             check_user_ptr(arg, 4)?;
-            // SAFETY: validated above; the read is unaligned because the user
-            // pointer carries no alignment guarantee.
+            // SAFETY: проверено выше; чтение невыровненное, потому что
+            // пользовательский указатель не даёт гарантии выравнивания.
             let raw = unsafe { core::ptr::read_unaligned(arg as *const u32) };
             let target = super::tty::decode_pgrp_arg(raw)?;
             let live = !compat::group_pids(target).is_empty();
@@ -1799,27 +1806,27 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
     }
 }
 
-// Bytes of a cooked line the previous read(2) did not
-// consume — readline drains input one byte per read after select().
+// Байты cooked-строки, которые предыдущий read(2) не потребил —
+// readline вычерпывает ввод по одному байту за read после select().
 static STDIN_PENDING: crate::sync::spinlock::Spinlock<alloc::vec::Vec<u8>> =
     crate::sync::spinlock::Spinlock::new(alloc::vec::Vec::new());
 
-// Libuv puts the raw tty into O_NONBLOCK and multiplexes it with
-// epoll; a read that blocks in-kernel stalls nvim's whole TUI event loop.
+// Libuv переводит сырой tty в O_NONBLOCK и мультиплексирует его через epoll;
+// блокирующее чтение в ядре останавливает весь TUI event loop nvim.
 static STDIN_NONBLOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// True when a raw-mode stdin read can make progress right now:
-/// leftover bytes, queued VT query replies, or an unread keyboard scancode.
+/// Истина, когда raw-чтение stdin может продвинуться прямо сейчас: остались
+/// байты, в очереди есть ответы на VT-запросы или неразобранный сканкод клавиатуры.
 pub(crate) fn stdin_input_available() -> bool {
     !STDIN_PENDING.lock().is_empty()
         || crate::drivers::vt::has_input_responses()
         || crate::drivers::ps2_kbd::has_pending()
 }
 
-// Black-screen telemetry. Counts bytes through the three
-// pipeline segments (client stdout -> VT, RPC socketpair reads/writes) and
-// logs the first byte plus every `step` bytes after, so one glance at the
-// screen shows WHERE the nvim pipeline stalls.
+// Телеметрия чёрного экрана. Считает байты через три сегмента конвейера
+// (stdout клиента → VT, чтения/записи RPC socketpair) и логирует первый байт и
+// затем каждый `step`-й, чтобы один взгляд на экран показывал, ГДЕ встал
+// конвейер nvim.
 static DIAG_CONSOLE_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static DIAG_SOCK_R: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static DIAG_SOCK_W: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -1831,34 +1838,35 @@ fn diag_count(ctr: &core::sync::atomic::AtomicU64, label: &str, n: u64, step: u6
     let new = old + n;
     if old == 0 || old / step != new / step {}
 }
-/// Hard cap so a pathological paste cannot grow the cooked line unbounded.
+/// Жёсткий предел, чтобы патологический paste не растил cooked-строку безгранично.
 const STDIN_LINE_MAX: usize = 4096;
 
-/// Blocking, line-buffered stdin read from the PS/2 keyboard.
+/// Блокирующее построчное чтение stdin с PS/2-клавиатуры.
 ///
-/// Cooked-tty semantics: printable characters echo as they are typed, Backspace
-/// erases, Tab expands to four spaces (one byte per rendered column keeps the
-/// erase bookkeeping trivial), Enter terminates the line (returned including
-/// the trailing `\n`), and Ctrl+D on an empty line reports EOF (`Ok(0)`).
-/// Blocks by yielding to the scheduler between polls, so the shell's
-/// foreground wait and the timer keep running while a binary sits in `read`.
+/// Семантика cooked-tty: печатные символы эхом выводятся по мере ввода,
+/// Backspace стирает, Tab разворачивается в четыре пробела (один байт на
+/// отрисованную колонку упрощает учёт стирания), Enter завершает строку
+/// (возвращается вместе с завершающим `\n`), Ctrl+D на пустой строке даёт EOF
+/// (`Ok(0)`). Блокировка — через уступку планировщику между опросами, поэтому
+/// foreground-ожидание шелла и таймер работают, пока бинарь сидит в `read`.
 
-// In raw mode (ICANON cleared) return one byte immediately;
-// map special keys to ANSI escape sequences so nvim's terminal layer works.
+// В raw-режиме (ICANON снят) немедленно вернуть один байт;
+// спецклавиши отображаются в ANSI-последовательности, чтобы терминальный слой
+// nvim работал.
 fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
     use crate::shell::keys::{Decoder, KeyEvent};
     if count == 0 {
         return Ok(0);
     }
-    // Queue any pending VT query replies (DA1/DSR/DECRQM/OSC)
-    // so nvim's terminal interrogation gets its answers on stdin.
+    // Поставить в очередь накопившиеся ответы на VT-запросы (DA1/DSR/DECRQM/OSC),
+    // чтобы терминальный опрос nvim получил ответы через stdin.
     {
         let resp = crate::drivers::vt::take_input_responses();
         if !resp.is_empty() {
             STDIN_PENDING.lock().extend_from_slice(&resp);
         }
     }
-    // Drain pending bytes first (raw mode can also leave leftovers).
+    // Сначала вычерпать накопившиеся байты (raw-режим тоже может их оставлять).
     {
         let mut pending = STDIN_PENDING.lock();
         if !pending.is_empty() {
@@ -1869,9 +1877,10 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
         }
     }
     let mut decoder = Decoder::new();
-    // Once a scancode was consumed, wait a bounded number of
-    // polls so multi-byte sequences (E0-prefixed arrows) complete, but a
-    // lone key-release cannot park a nonblocking reader forever.
+    // После первого потреблённого сканкода подождать ограниченное число
+    // опросов, чтобы завершились многобайтные последовательности (стрелки с
+    // префиксом E0), но одиночное отпускание клавиши не парковало
+    // неблокирующего читателя навсегда.
     let mut consumed_any = false;
     let mut spins = 0u32;
     loop {
@@ -1879,14 +1888,15 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
         let sc = match sc {
             Some(b) => b,
             None => {
-                // A deliverable signal (pending ∧ ¬blocked) turns the blocked
-                // read into -EINTR; the dispatch epilogue delivers it right
-                // after this handler returns (handler, or default-terminate).
+                // Доставимый сигнал (pending ∧ ¬blocked) превращает блокирующее
+                // чтение в -EINTR; эпилог диспетчеризации доставит его сразу
+                // после возврата из обработчика (обработчик или завершение по
+                // умолчанию).
                 if super::signal::has_deliverable_current() {
                     return Err(Errno::EINTR);
                 }
-                // Honor O_NONBLOCK - blocking here stalled
-                // nvim's TUI loop before the first frame was drawn.
+                // Соблюдать O_NONBLOCK: блокировка здесь останавливала TUI-цикл
+                // nvim ещё до отрисовки первого кадра.
                 if STDIN_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed)
                     && (!consumed_any || spins > 200)
                 {
@@ -1903,7 +1913,7 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
             Some(ev) => ev,
             None => continue,
         };
-        // Encode KeyEvent as bytes (ANSI sequences for special keys)
+        // Кодировать KeyEvent в байты (ANSI-последовательности для спецклавиш)
         let bytes: alloc::vec::Vec<u8> = match ev {
             KeyEvent::Char(c) => {
                 let mut tmp = [0u8; 4];
@@ -1927,12 +1937,12 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
         if bytes.is_empty() {
             continue;
         }
-        // STAGE 16.16: a real tty keeps echoing in raw mode unless ECHO is
-        // cleared. bash's readline runs without a terminfo database here, so
-        // it does NOT redraw the input line itself and relied on that missing
-        // kernel echo - typed characters only showed up when Enter finally
-        // flushed the line. nvim and full readline clear ECHO, so they cannot
-        // double-echo. Escape sequences (0x1B...) are never echoed.
+        // Настоящий tty продолжает эхо и в raw-режиме, пока не снят ECHO.
+        // readline bash работает здесь без базы terminfo, поэтому сама НЕ
+        // перерисовывает строку ввода и полагалась на это эхо ядра — введённые
+        // символы появлялись только когда Enter наконец сбрасывал строку. nvim
+        // и полный readline снимают ECHO и потому не могут задвоить эхо.
+        // Escape-последовательности (0x1B...) не эхо-печатаются никогда.
         if crate::task::compat::with_current_compat(|cs| cs.echo).unwrap_or(false) {
             match bytes[0] {
                 b'\r' | b'\n' => console_write(b"\r\n"),
@@ -1971,12 +1981,12 @@ fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
         let sc = match sc {
             Some(b) => b,
             None => {
-                // Deliverable signal → -EINTR (see read_stdin_raw).
+                // Доставимый сигнал → -EINTR (см. read_stdin_raw).
                 if super::signal::has_deliverable_current() {
                     return Err(Errno::EINTR);
                 }
-                // No pending scancode: let other tasks (and the IRQ that feeds
-                // the ring buffer) run instead of burning the time slice.
+                // Нет готового сканкода: дать другим задачам (и IRQ, питающему
+                // кольцевой буфер) поработать вместо сжигания кванта.
                 crate::task::scheduler::yield_current();
                 continue;
             }
@@ -2018,36 +2028,36 @@ fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
             _ => {}
         }
         if line.len() >= STDIN_LINE_MAX {
-            break; // pathological line length: hand back what we have
+            break; // патологическая длина строки: отдать то, что есть
         }
     }
     let n = core::cmp::min(count as usize, line.len());
     copy_out_checked(buf, &line[..n])?;
     if n < line.len() {
-        // Stash the tail: readline asks for one byte per read(2).
+        // Сохранить хвост: readline просит по одному байту за read(2).
         STDIN_PENDING.lock().extend_from_slice(&line[n..]);
     }
     Ok(n as u64)
 }
 
-/// `access` (21): succeed (return 0) when the path exists on the VFS/ext2 tree,
-/// else `ENOENT` (R2.5). The requested access mode is not enforced in this layer.
+/// `access` (21): успех (0), когда путь существует в дереве VFS/ext2, иначе
+/// `ENOENT` (R2.5). Запрошенный режим доступа на этом слое не проверяется.
 pub fn sys_access(path: u64, mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
     if mode & !0o7 != 0 {
         return Err(Errno::EINVAL);
     }
-    // POSIX: access(2) checks the REAL ids (not the effective ones); the
-    // root bypass still applies, but a setuid-style elevation cannot be used
-    // to probe rights the process would not have after dropping back. That
-    // includes directory-search permission on the traversal, which is why the
-    // walk takes the real ids too, not just the final permission check.
+    // POSIX: access(2) проверяет REAL id (а не effective); обход для root всё
+    // равно действует, но setuid-подобное повышение нельзя использовать, чтобы
+    // прощупать права, которых у процесса не будет после сброса. Сюда входит и
+    // право поиска в каталоге при обходе, поэтому walk получает real id, а не
+    // только финальную проверку прав.
     let creds = current_creds();
     let real = Creds::new(
         creds.uid, creds.gid, creds.uid, creds.gid, creds.uid, creds.gid,
     );
-    // `access(2)` follows symlinks (a dangling link is ENOENT).
+    // `access(2)` разыменовывает симлинки (висячая ссылка — ENOENT).
     let node = walk_as(&abs, true, real)?;
     let owner = node.owner();
     let file_mode = node.mode();
@@ -2064,13 +2074,13 @@ pub fn sys_access(path: u64, mode: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `memfd_create` (319): an anonymous RAM-backed file descriptor.
+/// `memfd_create` (319): анонимный дескриптор файла в RAM.
 ///
-/// The name is only a label (`/memfd:<name>` for `/proc/.../fd` and debugging);
-/// it creates no VFS name, exactly like Linux. `MFD_CLOEXEC` sets FD_CLOEXEC;
-/// `MFD_ALLOW_SEALING` is accepted (no seals are implemented, so sealing calls
-/// are not exposed); other flags are `EINVAL`. Executing a memfd is not
-/// supported, because `execve` resolves a VFS path.
+/// Имя — только метка (`/memfd:<name>` для `/proc/.../fd` и отладки); имя в VFS
+/// не создаётся, как в Linux. `MFD_CLOEXEC` ставит FD_CLOEXEC;
+/// `MFD_ALLOW_SEALING` принимается (печати не реализованы, поэтому вызовы
+/// sealing не экспонируются); остальные флаги — `EINVAL`. Исполнение memfd не
+/// поддерживается, потому что `execve` разрешает путь VFS.
 pub fn sys_memfd_create(name: u64, flags: u64) -> Result<u64, Errno> {
     const MFD_CLOEXEC: u64 = 0x0001;
     const MFD_ALLOW_SEALING: u64 = 0x0002;
@@ -2095,14 +2105,14 @@ pub fn sys_memfd_create(name: u64, flags: u64) -> Result<u64, Errno> {
     Ok(fd as u64)
 }
 
-/// `mkdir` (83): create a directory on the mounted VFS/ext2 tree.
-/// CPython probes it for pyc cache directories; ENOSYS was tolerated but
-/// logged an "unsupported syscall" warning on every interpreter start.
-/// `rename` (82). The VFS trait has no native rename, so this is
-/// an emulation at the syscall layer: copy the file contents to the target
-/// path, then unlink the source. Not atomic (irrelevant for a single-user
-/// kernel) and files only: directory renames report EACCES with a WARN so a
-/// future stage can add real dirent renaming to ext2.
+/// `mkdir` (83): создать каталог в смонтированном дереве VFS/ext2.
+/// CPython пробует его для каталогов pyc-кеша; ENOSYS терпелся, но давал
+/// предупреждение «unsupported syscall» при каждом старте интерпретатора.
+/// `rename` (82). В трейте VFS нет нативного rename, поэтому это эмуляция на
+/// уровне syscall: скопировать содержимое файла в целевой путь, затем удалить
+/// источник. Не атомарно (неважно для однопользовательского ядра) и только для
+/// файлов: переименование каталогов возвращает EACCES с WARN, чтобы будущая
+/// версия могла добавить настоящее переименование dirent в ext2.
 fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
     const RENAME_NOREPLACE: u64 = 1;
     if flags & !RENAME_NOREPLACE != 0 {
@@ -2118,9 +2128,9 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
     if oldabs == newabs {
         return Ok(0);
     }
-    // The source is resolved by the credential-checked walker with the final
-    // component NOT followed (rename acts on the link itself): traversal needs
-    // `x` on every parent, exactly like the destination side below.
+    // Источник разрешается обходчиком с проверкой креденшелов, причём конечный
+    // компонент НЕ разыменовывается (rename действует на саму ссылку): обход
+    // требует `x` на каждом родителе, как и на стороне приёмника ниже.
     let node = walk(oldabs, false)?;
     if node.is_directory() {
         crate::warn!(
@@ -2133,9 +2143,9 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
     if flags & RENAME_NOREPLACE != 0 && walk(newabs, false).is_ok() {
         return Err(Errno::EEXIST);
     }
-    // Resolve and authorise BOTH parent directories before any side effect: a
-    // rename that is denied on the source side must not have already created or
-    // overwritten the target.
+    // Разрешить и авторизовать ОБА родительских каталога до любого побочного
+    // эффекта: rename, отклонённый на стороне источника, не должен успеть
+    // создать или перезаписать приёмник.
     let (nparent, nname) = match newabs.rfind('/') {
         Some(0) => ("/", &newabs[1..]),
         Some(i) => (&newabs[..i], &newabs[i + 1..]),
@@ -2152,20 +2162,21 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
     if oname.is_empty() {
         return Err(Errno::EINVAL);
     }
-    // Parents follow links (a rename into a symlinked directory must land in its
-    // target); the *source* stays unresolved on purpose — see the note above.
+    // Родители приёмника разыменовывают ссылки (rename в каталог-симлинк
+    // должен попасть в его цель); *источник* намеренно остаётся
+    // неразыменованным — см. замечание выше.
     let ndir = walk(nparent, true)?;
     check_dir_mutation(&ndir)?;
     let odir = walk(oparent, true)?;
     check_dir_mutation(&odir)?;
-    // Read the whole source file.
+    // Прочитать весь исходный файл.
     //
-    // `i_size` is image-controlled and may be a sparse ~4 GiB claim backed by a
-    // handful of blocks, so this copy is bounded and fallible (F-x86v-2):
-    // `data.resize(i_size, 0)` used to allocate the claimed size in one go and
-    // abort the kernel, then walk it block by block. A file above the cap is
-    // refused with ENOMEM (rename is a copy emulation; a real ext2 dirent
-    // rename — which is O(1) — is not implemented).
+    // `i_size` контролируется образом и может быть разреженным обещанием на
+    // ~4 ГиБ при горстке блоков, поэтому копия ограничена и может отказать:
+    // `data.resize(i_size, 0)` раньше выделял заявленный размер одним махом и
+    // ронял ядро, а затем обходил файл блок за блоком. Файл выше предела
+    // отклоняется с ENOMEM (rename — эмуляция копированием; настоящее О(1)
+    // переименование dirent в ext2 не реализовано).
     const RENAME_COPY_MAX: u64 = 64 * 1024 * 1024;
     let size = node.size();
     if size > RENAME_COPY_MAX {
@@ -2179,8 +2190,8 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
     }
     let size = size as usize;
     let mut data = ::alloc::vec::Vec::new();
-    // `try_reserve` refuses instead of aborting when the allocator cannot serve
-    // the request — the same rule `ramfs` already follows for writes.
+    // `try_reserve` отказывает вместо abort, когда аллокатор не может
+    // обслужить запрос — то же правило, которого ramfs уже держится для записи.
     data.try_reserve_exact(size).map_err(|_| Errno::ENOMEM)?;
     data.resize(size, 0u8);
     let mut off = 0usize;
@@ -2194,7 +2205,7 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
         off += n;
     }
     data.truncate(off);
-    // Create/replace the target and write the contents.
+    // Создать/заменить приёмник и записать содержимое.
     if ndir.lookup(nname).is_ok() {
         ndir.remove(nname).map_err(|e| {
             crate::warn!("[linux] rename: replace target failed: {:?} {}", e, newabs);
@@ -2216,7 +2227,7 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
         }
         woff += n;
     }
-    // Unlink the source (both parents were authorised before any mutation).
+    // Удалить источник (оба родителя авторизованы до любой мутации).
     odir.remove(oname).map_err(|e| {
         crate::warn!("[linux] rename: unlink source failed: {:?} {}", e, oldabs);
         Errno::EIO
@@ -2230,8 +2241,8 @@ pub fn sys_rename(oldpath: u64, newpath: u64) -> Result<u64, Errno> {
     rename_paths(&o, &n, 0)
 }
 
-/// `renameat` (264): dirfds are ignored (paths resolve against the cwd, which
-/// covers AT_FDCWD in this minimal layer, matching openat).
+/// `renameat` (264): dirfd игнорируются (пути разрешаются относительно cwd,
+/// что в этом минимальном слое покрывает AT_FDCWD, как в openat).
 pub fn sys_renameat(
     _olddirfd: u64,
     oldpath: u64,
@@ -2243,7 +2254,7 @@ pub fn sys_renameat(
     rename_paths(&o, &n, 0)
 }
 
-/// `renameat2` (316): like renameat; only RENAME_NOREPLACE is honored.
+/// `renameat2` (316): как renameat; учитывается только RENAME_NOREPLACE.
 pub fn sys_renameat2(
     _olddirfd: u64,
     oldpath: u64,
@@ -2261,10 +2272,10 @@ pub fn sys_mkdir(path: u64, mode: u64) -> Result<u64, Errno> {
     let abs = resolve_path(&p);
     let trimmed = abs.trim_end_matches('/');
     if trimmed.is_empty() {
-        return Err(Errno::EEXIST); // "/" always exists
+        return Err(Errno::EEXIST); // "/" существует всегда
     }
-    // Probe through the credential-checked walker (not the raw VFS lookup) so a
-    // missing `x` on an ancestor is EACCES rather than a create attempt.
+    // Проверять через обходчик с креденшелами (а не сырым lookup VFS), чтобы
+    // отсутствие `x` у предка давало EACCES, а не попытку создания.
     if walk(trimmed, false).is_ok() {
         return Err(Errno::EEXIST);
     }
@@ -2287,8 +2298,8 @@ pub fn sys_mkdir(path: u64, mode: u64) -> Result<u64, Errno> {
         );
         Errno::EIO
     })?;
-    // Apply `mkdir(2)`'s mode argument (masked by the umask) to the inode, so
-    // stat and permission checks agree from the first lookup.
+    // Применить аргумент mode из `mkdir(2)` (урезанный umask) к inode, чтобы
+    // stat и проверки прав совпадали с первого же lookup.
     stamp_creation_owner(&created);
     let requested = if mode == 0 {
         0o777
@@ -2299,15 +2310,15 @@ pub fn sys_mkdir(path: u64, mode: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `unlink` (87): remove a non-directory file (git deletes its `*.lock` files
-/// around every config write). Directories are refused with `EISDIR`, like
-/// unlink(2); empty-dir removal is rmdir's job.
+/// `unlink` (87): удалить файл, не являющийся каталогом (git удаляет свои
+/// `*.lock` вокруг каждой записи конфига). Каталоги отклоняются с `EISDIR`, как
+/// unlink(2); удаление пустого каталога — дело rmdir.
 pub fn sys_unlink(path: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
     let trimmed = abs.trim_end_matches('/');
     if trimmed.is_empty() {
-        return Err(Errno::EISDIR); // cannot unlink "/"
+        return Err(Errno::EISDIR); // нельзя удалить "/"
     }
     let node = walk(trimmed, false)?;
     if node.is_directory() {
@@ -2327,15 +2338,14 @@ pub fn sys_unlink(path: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `rmdir` (84): remove an empty directory. Non-directories are refused with
-/// `ENOTDIR`; a non-empty directory fails in the ext2 layer (`ENOTEMPTY`),
-/// like rmdir(2).
+/// `rmdir` (84): удалить пустой каталог. Не-каталоги отклоняются с `ENOTDIR`;
+/// непустой каталог падает в слое ext2 (`ENOTEMPTY`), как rmdir(2).
 pub fn sys_rmdir(path: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
     let trimmed = abs.trim_end_matches('/');
     if trimmed.is_empty() {
-        return Err(Errno::EINVAL); // cannot remove "/"
+        return Err(Errno::EINVAL); // нельзя удалить "/"
     }
     let node = walk(trimmed, false)?;
     if !node.is_directory() {
@@ -2355,29 +2365,30 @@ pub fn sys_rmdir(path: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `chmod` (90): change a file's permission bits.
+/// `chmod` (90): сменить биты прав файла.
 ///
-/// Enforcement: root or the file's owner only (`EPERM`). The bits are written to
-/// the ext2 inode through [`VfsNode::set_mode`]; nodes with no metadata store
-/// (`/dev`, `/proc`, ramfs) keep the historical per-process override so
-/// `stat`-family handlers still report the requested mode. The override is also
-/// recorded for ext2 because `stat_mode_for` consults it first (existing
-/// userland expects the old 0755 default for untouched files).
+/// Кто может: только root или владелец файла (`EPERM`). Биты пишутся в inode
+/// ext2 через [`VfsNode::set_mode`]; узлы без хранилища метаданных (`/dev`,
+/// `/proc`, ramfs) сохраняют прежнее переопределение на процесс, чтобы
+/// обработчики семейства `stat` всё равно сообщали запрошенный режим.
+/// Переопределение записывается и для ext2, потому что `stat_mode_for` смотрит
+/// в него первым (существующий userland ждёт старый дефолт 0755 для
+/// нетронутых файлов).
 pub fn sys_chmod(path: u64, mode: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
-    // `chmod(2)` follows symlinks: the bits belong to the target's inode.
+    // `chmod(2)` разыменовывает симлинки: биты принадлежат inode цели.
     let node = walk(&abs, true)?;
     check_chmod_allowed(&node)?;
     apply_node_mode(&node, (mode & 0o7777) as u32)?;
     Ok(0)
 }
 
-/// `fchmod` (91): `chmod` on an open descriptor.
+/// `fchmod` (91): `chmod` на открытом дескрипторе.
 ///
-/// The descriptor is resolved under the registry lock (cloning the node or the
-/// directory path), then the check/write runs outside it — the VFS write can
-/// block on the device.
+/// Дескриптор резолвится под локом реестра (с клонированием узла или пути
+/// каталога), а проверка/запись выполняются уже без него — запись в VFS может
+/// блокироваться на устройстве.
 pub fn sys_fchmod(fd: u64, mode: u64) -> Result<u64, Errno> {
     let node = fd_node(fd)?;
     check_chmod_allowed(&node)?;
@@ -2385,13 +2396,13 @@ pub fn sys_fchmod(fd: u64, mode: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `fchmodat` (268): `chmod` relative to an fd base, with flags.
+/// `fchmodat` (268): `chmod` относительно базы fd, с флагами.
 ///
-/// This minimal layer treats every `dirfd` as `AT_FDCWD` (absolute or
-/// cwd-relative), matching `openat`/`newfstatat`; `AT_SYMLINK_NOFOLLOW` keeps
-/// the link node itself instead of following it. Other flags are `EINVAL`.
+/// Этот минимальный слой трактует любой `dirfd` как `AT_FDCWD` (абсолютный путь
+/// или относительно cwd), как `openat`/`newfstatat`; `AT_SYMLINK_NOFOLLOW`
+/// оставляет сам узел ссылки вместо разыменования. Остальные флаги — `EINVAL`.
 pub fn sys_fchmodat(dirfd: u64, path: u64, mode: u64, flags: u64) -> Result<u64, Errno> {
-    let _ = dirfd; // AT_FDCWD-equivalent in this minimal compat layer.
+    let _ = dirfd; // эквивалент AT_FDCWD в этом минимальном compat-слое.
     if flags & !AT_SYMLINK_NOFOLLOW != 0 {
         return Err(Errno::EINVAL);
     }
@@ -2404,14 +2415,14 @@ pub fn sys_fchmodat(dirfd: u64, path: u64, mode: u64, flags: u64) -> Result<u64,
     Ok(0)
 }
 
-/// `faccessat` (269): `access` relative to an fd base, with `AT_EACCESS`.
+/// `faccessat` (269): `access` относительно базы fd, с `AT_EACCESS`.
 ///
-/// `dirfd` is treated as `AT_FDCWD` (see `sys_fchmodat`). Without `AT_EACCESS`
-/// the check uses the REAL ids, exactly like `access(2)`; with it, the
-/// effective ids. `AT_SYMLINK_NOFOLLOW` makes a final symlink the target of the
-/// check; other flags are `EINVAL`.
+/// `dirfd` трактуется как `AT_FDCWD` (см. `sys_fchmodat`). Без `AT_EACCESS`
+/// проверка идёт по REAL id, как `access(2)`; с ним — по effective. С
+/// `AT_SYMLINK_NOFOLLOW` целью проверки становится конечная симлинк-ссылка;
+/// остальные флаги — `EINVAL`.
 pub fn sys_faccessat(dirfd: u64, path: u64, mode: u64, flags: u64) -> Result<u64, Errno> {
-    let _ = dirfd; // AT_FDCWD-equivalent in this minimal compat layer.
+    let _ = dirfd; // эквивалент AT_FDCWD в этом минимальном compat-слое.
     if flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW) != 0 || mode & !0o7 != 0 {
         return Err(Errno::EINVAL);
     }
@@ -2441,17 +2452,17 @@ pub fn sys_faccessat(dirfd: u64, path: u64, mode: u64, flags: u64) -> Result<u64
     Ok(0)
 }
 
-/// `mkdirat` (258): `mkdir` with an AT_FDCWD/dirfd base.
+/// `mkdirat` (258): `mkdir` с базой AT_FDCWD/dirfd.
 ///
-/// `dirfd` is AT_FDCWD-equivalent in this minimal layer, matching
-/// `openat`/`newfstatat`; creation permissions come from `mode` & umask in the
-/// existing `sys_mkdir` path.
+/// `dirfd` в этом минимальном слое эквивалентен AT_FDCWD, как в
+/// `openat`/`newfstatat`; права на создание берутся из `mode` & umask в
+/// существующем пути `sys_mkdir`.
 pub fn sys_mkdirat(dirfd: u64, path: u64, mode: u64) -> Result<u64, Errno> {
     let _ = dirfd;
     sys_mkdir(path, mode)
 }
 
-/// `unlinkat` (263): unlink a file, or rmdir with `AT_REMOVEDIR`.
+/// `unlinkat` (263): удалить файл или каталог (rmdir) с `AT_REMOVEDIR`.
 pub fn sys_unlinkat(dirfd: u64, path: u64, flags: u64) -> Result<u64, Errno> {
     let _ = dirfd;
     if flags & !AT_REMOVEDIR != 0 {
@@ -2464,8 +2475,8 @@ pub fn sys_unlinkat(dirfd: u64, path: u64, flags: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `fchownat` (260): `chown` relative to AT_FDCWD/dirfd, honouring
-/// `AT_SYMLINK_NOFOLLOW` for the final component.
+/// `fchownat` (260): `chown` относительно AT_FDCWD/dirfd с учётом
+/// `AT_SYMLINK_NOFOLLOW` для конечного компонента.
 pub fn sys_fchownat(dirfd: u64, path: u64, uid: u64, gid: u64, flags: u64) -> Result<u64, Errno> {
     let _ = dirfd;
     if flags & !AT_SYMLINK_NOFOLLOW != 0 {
@@ -2479,20 +2490,20 @@ pub fn sys_fchownat(dirfd: u64, path: u64, uid: u64, gid: u64, flags: u64) -> Re
     Ok(0)
 }
 
-/// `chown` (92): change a file's owner. Root only (`EPERM`); a `(uid_t)-1`
-/// argument keeps the current id. Only ext2 inodes can store an owner, so a
-/// synthetic node reports `EPERM` instead of pretending the write happened.
+/// `chown` (92): сменить владельца файла. Только root (`EPERM`); аргумент
+/// `(uid_t)-1` оставляет текущий id. Только inode ext2 умеют хранить владельца,
+/// поэтому синтетический узел отвечает `EPERM`, а не изображает запись.
 pub fn sys_chown(path: u64, uid: u64, gid: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
-    // `chown(2)` follows symlinks: the owner belongs to the target's inode.
+    // `chown(2)` разыменовывает симлинки: владелец принадлежит inode цели.
     let node = walk(&abs, true)?;
     check_chown_allowed()?;
     apply_node_owner(&node, uid, gid)?;
     Ok(0)
 }
 
-/// `fchown` (93): `chown` on an open descriptor (root only).
+/// `fchown` (93): `chown` на открытом дескрипторе (только root).
 pub fn sys_fchown(fd: u64, uid: u64, gid: u64) -> Result<u64, Errno> {
     let node = fd_node(fd)?;
     check_chown_allowed()?;
@@ -2500,14 +2511,13 @@ pub fn sys_fchown(fd: u64, uid: u64, gid: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// Resolve an open descriptor to a VFS node for `fchmod`/`fchown`/`fstat`-style
-/// metadata operations.
+/// Свести открытый дескриптор к узлу VFS для метаданных-операций вроде
+/// `fchmod`/`fchown`/`fstat`.
 ///
-/// A regular file descriptor carries its node directly. A directory descriptor
-/// carries only the path it was opened under (the children snapshot is for
-/// `getdents64`), so it is re-resolved through the link walker after the
-/// registry lock is released. Any other descriptor kind is `EINVAL`; an absent
-/// one is `EBADF`.
+/// Дескриптор regular-файла несёт узел напрямую. Дескриптор каталога несёт
+/// только путь, под которым его открыли (снимок детей — для `getdents64`),
+/// поэтому он разрешается заново через обходчик ссылок после отпускания лока
+/// реестра. Любой другой вид дескриптора — `EINVAL`; отсутствующий — `EBADF`.
 fn fd_node(fd: u64) -> Result<Arc<dyn VfsNode>, Errno> {
     enum Found {
         File(Arc<dyn VfsNode>),
@@ -2529,22 +2539,22 @@ fn fd_node(fd: u64) -> Result<Arc<dyn VfsNode>, Errno> {
     }
 }
 
-// Keep AT_FDCWD referenced so the intent (dir-fd handling) is documented even
-// though absolute paths make it inert in this minimal layer.
+// AT_FDCWD остаётся упомянутым, чтобы намерение (работа с dir-fd) было
+// задокументировано, хотя абсолютные пути делают его инертным в этом слое.
 const _: u64 = AT_FDCWD;
 
-// ───────────────────── directory / path / fd (linux-binary-compat) ─────────────────────
+// ───────────────────── каталог / путь / fd (совместимость с Linux-бинами) ─────────────────────
 
-/// `getdents64` (217): serialize directory entries from an open directory fd into
-/// the user buffer as packed `struct linux_dirent64`, advancing a per-fd cursor.
-/// Returns the number of bytes written, `0` at end of directory. `EBADF` for an
-/// absent fd, `ENOTDIR` for a non-directory fd, `EINVAL` if the buffer is too small
-/// for even the first remaining entry.
+/// `getdents64` (217): сериализовать записи каталога из открытого fd каталога в
+/// буфер пользователя как упакованные `struct linux_dirent64`, сдвигая курсор
+/// дескриптора. Возвращает число записанных байт, `0` в конце каталога. `EBADF`
+/// для отсутствующего fd, `ENOTDIR` для не-каталога, `EINVAL`, если буфер меньше
+/// даже первой оставшейся записи.
 ///
-/// The directory's children were snapshotted at `open` time, so this runs entirely
-/// under the `COMPAT_STATES` lock (no blocking VFS call) using `get_mut` to advance
-/// the cursor. Each record's `d_ino`/`d_off` are synthesized (the VFS exposes no
-/// inode numbers): `d_ino` is the 1-based child position, `d_off` the next cursor.
+/// Дети каталога сняты снимком при `open`, поэтому всё выполняется под локом
+/// `COMPAT_STATES` (без блокирующего вызова VFS), а курсор двигается через
+/// `get_mut`. `d_ino`/`d_off` каждой записи синтезируются (VFS не даёт номеров
+/// inode): `d_ino` — позиция ребёнка с 1, `d_off` — следующий курсор.
 pub fn sys_getdents64(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
     check_user_ptr(buf, count)?;
 
@@ -2566,8 +2576,9 @@ pub fn sys_getdents64(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
                     break;
                 }
                 let d_type = d_type_for(child.is_directory(), child.is_symlink());
-                // The real identity, so `readdir` and `stat` agree (`ls -i`,
-                // `find`); the old `index + 1` was a cursor position, not an inode.
+                // Настоящая идентичность, чтобы `readdir` и `stat` сходились
+                // (`ls -i`, `find`); прежний `index + 1` был позицией курсора,
+                // а не inode.
                 let d_ino = node_ino(child);
                 let d_off = (*index as i64) + 1;
                 let rec = encode_dirent64(d_ino, d_off, d_type, name);
@@ -2593,47 +2604,47 @@ pub fn sys_getdents64(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `getcwd` (79): write the process's current working directory (NUL-terminated)
-/// into the user buffer, returning the number of bytes written including the NUL.
-/// `ERANGE` if the buffer is too small to hold the path plus its terminator.
+/// `getcwd` (79): записать текущий рабочий каталог процесса (с NUL на конце)
+/// в буфер пользователя, вернув число записанных байт вместе с NUL.
+/// `ERANGE`, если буфер мал для пути с терминатором.
 pub fn sys_getcwd(buf: u64, size: u64) -> Result<u64, Errno> {
     let cwd = current_cwd();
     let bytes = cwd.as_bytes();
-    let need = bytes.len() + 1; // include NUL terminator
+    let need = bytes.len() + 1; // включить NUL-терминатор
     if size < need as u64 {
         return Err(Errno::ERANGE);
     }
     check_user_ptr(buf, need as u64)?;
-    // Copy the path then the NUL terminator.
+    // Скопировать путь, затем NUL-терминатор.
     copy_out(buf, bytes);
-    // SAFETY: byte at buf+bytes.len() is within the validated `need` range.
+    // SAFETY: байт по buf+bytes.len() лежит внутри проверенного диапазона `need`.
     unsafe {
         *((buf + bytes.len() as u64) as *mut u8) = 0;
     }
     Ok(need as u64)
 }
 
-/// `chdir` (80): resolve `path` (against the cwd if relative), verify it is an
-/// existing directory, and set it as the process cwd. `ENOENT` if absent,
-/// `ENOTDIR` if it is not a directory.
+/// `chdir` (80): разрешить `path` (относительно cwd, если относительный),
+/// убедиться, что это существующий каталог, и сделать его cwd процесса.
+/// `ENOENT`, если пути нет, `ENOTDIR`, если это не каталог.
 pub fn sys_chdir(path: u64) -> Result<u64, Errno> {
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
-    // `chdir(2)` follows symlinks (`cd` into a link-to-directory works).
+    // `chdir(2)` разыменовывает симлинки (`cd` в ссылку на каталог работает).
     let node = walk(&abs, true)?;
     if !node.is_directory() {
         return Err(Errno::ENOTDIR);
     }
-    // The walk checks search permission on the parents; `chdir(2)` additionally
-    // needs `x` on the directory itself (POSIX), else a process could make a
-    // non-searchable directory its cwd and then read relative entries.
+    // Обход проверяет право поиска на родителях; `chdir(2)` дополнительно
+    // требует `x` на самом каталоге (POSIX), иначе процесс мог бы сделать
+    // непросматриваемый каталог своим cwd и читать относительные записи.
     check_node_access(&node, Access::Execute)?;
     compat::with_current_compat(|cs| cs.cwd = abs).ok_or(Errno::EBADF)?;
     Ok(0)
 }
 
-/// `fchdir` (81): set the process cwd to the path the directory fd was opened
-/// under. `EBADF` for an absent fd, `ENOTDIR` if the fd is not a directory.
+/// `fchdir` (81): сделать cwd процесса путь, под которым открыли дескриптор
+/// каталога. `EBADF` для отсутствующего fd, `ENOTDIR`, если fd — не каталог.
 pub fn sys_fchdir(fd: u64) -> Result<u64, Errno> {
     let resolved = compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
         None => Err(Errno::EBADF),
@@ -2651,44 +2662,45 @@ pub fn sys_fchdir(fd: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `dup` (32): duplicate `oldfd` into the lowest free descriptor, returning it.
-/// `EBADF` if `oldfd` is not open.
+/// `dup` (32): продублировать `oldfd` в наименьший свободный дескриптор и
+/// вернуть его. `EBADF`, если `oldfd` не открыт.
 pub fn sys_dup(oldfd: u64) -> Result<u64, Errno> {
     let r = compat::with_current_compat(|cs| cs.fds.dup(oldfd as u32))
         .unwrap_or(Err(Errno::EBADF))
         .map(|fd| fd as u64);
-    // Nvim dup()s its stdio before hiding it behind stderr;
-    // an EBADF here means fd 0/1 were already gone when the server started.
+    // Nvim делает dup() своего stdio, прежде чем спрятать его за stderr;
+    // EBADF здесь означает, что fd 0/1 уже пропали к старту сервера.
     let _ = &r;
     r
 }
 
-/// Upper bound for descriptor numbers (Linux's default RLIMIT_NOFILE soft limit).
-/// `dup2`/`dup3` must reject a `newfd` at or above this instead of growing the
-/// fd table to the (u32) requested index — a hostile or buggy `dup2(fd, 0x7FFFFFFF)`
-/// would otherwise attempt an ~8-billion-slot allocation and abort the kernel.
-/// `fcntl(F_DUPFD/F_DUPFD_CLOEXEC)` applies the same bound to its `arg` (the
-/// minimum descriptor): round-3 audit F-r3-life-1 showed that arm was missed,
-/// so `fcntl(fd, F_DUPFD, 0x2A000000)` grew the table to 704 MiB and the
-/// allocation panic halted the machine.
+/// Верхняя граница номеров дескрипторов (soft-лимит RLIMIT_NOFILE в Linux).
+/// `dup2`/`dup3` обязаны отвергать `newfd` на этой границе и выше, а не растить
+/// fd-таблицу до запрошенного индекса `(u32)`: враждебный или ошибочный
+/// `dup2(fd, 0x7FFFFFFF)` иначе попытался бы выделить ~8 миллиардов слотов и
+/// уронил ядро. `fcntl(F_DUPFD/F_DUPFD_CLOEXEC)` применяет ту же границу к
+/// своему `arg` (минимальному дескриптору): эта ветка когда-то была пропущена,
+/// и `fcntl(fd, F_DUPFD, 0x2A000000)` вырастил таблицу до 704 МиБ, а паника
+/// аллокации остановила машину.
 pub const NOFILE_MAX: u64 = 1024;
-// The table-level backstop (`FdSlots::try_alloc`) and this syscall-layer bound
-// must stay the same number, or one of the two layers would be dead code.
+// Запасной предел уровня таблицы (`FdSlots::try_alloc`) и эта граница слоя
+// syscall должны совпадать, иначе один из двух слоёв станет мёртвым кодом.
 const _: () = assert!(NOFILE_MAX as usize == crate::task::fd_alloc::FD_TABLE_LIMIT);
 
-/// `dup2` (33): duplicate `oldfd` into the explicit descriptor `newfd`, closing
-/// whatever occupies `newfd` first. If `oldfd == newfd` and `oldfd` is valid, it is
-/// returned unchanged (no close); `EBADF` if `oldfd` is invalid; `EINVAL` when
-/// `newfd` exceeds the descriptor cap (RLIMIT_NOFILE-style bound).
+/// `dup2` (33): продублировать `oldfd` в явный дескриптор `newfd`, сначала
+/// закрыв то, что занимает `newfd`. Если `oldfd == newfd` и `oldfd` валиден, он
+/// возвращается без изменений (без закрытия); `EBADF`, если `oldfd` невалиден;
+/// `EINVAL`, когда `newfd` превышает предел дескрипторов (граница в духе
+/// RLIMIT_NOFILE).
 pub fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, Errno> {
     if newfd >= NOFILE_MAX {
         return Err(Errno::EINVAL);
     }
-    // Stdio rewiring during spawn is exactly where a lost
-    // nvim RPC channel would hide; dup2/dup3 are rare enough to log each call.
+    // Перепайка stdio при spawn — именно там потеря RPC-канала nvim была бы
+    // незаметна; dup2/dup3 достаточно редки, чтобы логировать каждый вызов.
 
     compat::with_current_compat(|cs| {
-        // `oldfd` must be valid regardless.
+        // `oldfd` должен быть валиден в любом случае.
         if cs.fds.get(oldfd as u32).is_none() {
             return Err(Errno::EBADF);
         }
@@ -2702,8 +2714,9 @@ pub fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, Errno> {
     .unwrap_or(Err(Errno::EBADF))
 }
 
-/// `dup3` (292): like `dup2` but `oldfd == newfd` is an error (`EINVAL`) and the
-/// only accepted flag is `O_CLOEXEC` (ignored here). `EBADF` if `oldfd` is invalid.
+/// `dup3` (292): как `dup2`, но `oldfd == newfd` — ошибка (`EINVAL`), а
+/// единственный принимаемый флаг — `O_CLOEXEC` (здесь игнорируется). `EBADF`,
+/// если `oldfd` невалиден.
 pub fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> Result<u64, Errno> {
     if newfd >= NOFILE_MAX {
         return Err(Errno::EINVAL);
@@ -2716,7 +2729,7 @@ pub fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> Result<u64, Errno> {
     }
     compat::with_current_compat(|cs| {
         let fd = cs.fds.dup_to(oldfd as u32, newfd as u32)?;
-        // Dup3's only flag — mark the new descriptor close-on-exec.
+        // Единственный флаг dup3 — пометить новый дескриптор close-on-exec.
         if flags & O_CLOEXEC != 0 {
             cs.fds.set_cloexec(fd, true);
         }
@@ -2725,7 +2738,7 @@ pub fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> Result<u64, Errno> {
     .unwrap_or(Err(Errno::EBADF))
 }
 
-// fcntl commands.
+// Команды fcntl.
 const F_DUPFD: u64 = 0;
 const F_GETFD: u64 = 1;
 const F_SETFD: u64 = 2;
@@ -2733,26 +2746,27 @@ const F_GETFL: u64 = 3;
 const F_SETFL: u64 = 4;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 
-/// `fcntl` (72): the descriptor-management subset.
-///   * `F_DUPFD` → duplicate `fd` into the lowest free descriptor `>= arg`.
-///   * `F_DUPFD_CLOEXEC` → same, and mark the duplicate close-on-exec.
-///   * `F_GETFD`/`F_SETFD` → FD_CLOEXEC is tracked for real now
-///     (libuv marks its fork error pipe with it and execve must sweep it).
-///   * `F_GETFL` → O_RDWR plus O_NONBLOCK when the descriptor is nonblocking.
-///   * `F_SETFL` → O_NONBLOCK is applied for real to pipes, sockets
-///     and listeners (libuv reads until EAGAIN, so this must work); other
-///     flags are accepted and ignored.
-///   * anything else → `EINVAL`.
+/// `fcntl` (72): подмножество управления дескрипторами.
+///   * `F_DUPFD` → продублировать `fd` в наименьший свободный дескриптор `>= arg`.
+///   * `F_DUPFD_CLOEXEC` → то же плюс пометить дубликат close-on-exec.
+///   * `F_GETFD`/`F_SETFD` → FD_CLOEXEC отслеживается по-настоящему
+///     (libuv помечает им свой fork-error pipe, и execve обязан его вычищать).
+///   * `F_GETFL` → O_RDWR плюс O_NONBLOCK, если дескриптор неблокирующий.
+///   * `F_SETFL` → O_NONBLOCK реально применяется к pipe, сокетам и
+///     слушателям (libuv читает до EAGAIN, так что это обязано работать);
+///     остальные флаги принимаются и игнорируются.
+///   * всё остальное → `EINVAL`.
 pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
-    // Libuv's child-init shuffles stdio fds with F_DUPFD.
+    // Дочерняя инициализация libuv переставляет stdio-дескрипторы через F_DUPFD.
     if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC {}
     const FD_CLOEXEC: u64 = 1;
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            // F-r3-life-1: `arg` is a caller-chosen minimum descriptor number.
-            // Linux rejects a negative or `>= RLIMIT_NOFILE` argument with EINVAL;
-            // reject here — on the full u64, before truncating to u32 — so the fd
-            // table is never asked to grow to an attacker index at all.
+            // `arg` — выбранный вызывающим минимальный номер дескриптора.
+            // Linux отвергает отрицательный аргумент или `>= RLIMIT_NOFILE`
+            // с EINVAL; отвергаем здесь — по полному u64, до усечения к u32, —
+            // чтобы fd-таблицу вообще никогда не просили вырасти до индекса
+            // атакующего.
             if arg >= NOFILE_MAX {
                 return Err(Errno::EINVAL);
             }
@@ -2793,7 +2807,7 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
                         OpenObject::Socket { rx, .. } => rx.nonblocking(),
                         OpenObject::UnixListener(l) => l.inner.lock().nonblocking,
                         OpenObject::UnixSocketUnbound { nonblocking } => *nonblocking,
-                        // Stdin reports its real nonblocking state.
+                        // Stdin сообщает своё реальное состояние nonblocking.
                         OpenObject::Stdin => {
                             STDIN_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed)
                         }
@@ -2817,7 +2831,7 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
                         }
                         OpenObject::UnixListener(l) => l.inner.lock().nonblocking = on,
                         OpenObject::UnixSocketUnbound { nonblocking } => *nonblocking = on,
-                        // Libuv flips O_NONBLOCK on the raw tty.
+                        // Libuv переключает O_NONBLOCK на сыром tty.
                         OpenObject::Stdin => {
                             STDIN_NONBLOCK.store(on, core::sync::atomic::Ordering::Relaxed);
                         }
@@ -2833,16 +2847,16 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `readlink` (89): copy the target of the symbolic link at `path` into the user
-/// buffer (issue #18, contract `EXT2-LINKS.md` §4.2).
+/// `readlink` (89): скопировать цель символической ссылки по `path` в буфер
+/// пользователя (контракт `EXT2-LINKS.md` §4.2).
 ///
-/// No NUL terminator is written and the result is truncated to `bufsiz`; the
-/// final component is **not** followed (that is the point of the call), while
-/// intermediates are. `ENOENT` for an absent path, `EINVAL` for a node that is
-/// not a link *and* for `bufsiz == 0` (Linux checks the size first).
-/// `/proc/self/exe` is an ordinary link node now (contract `docs/procfs.md`
-/// §5.4), so libuv's `uv_exepath` — nvim's progpath — keeps working through the
-/// same path as any other link.
+/// NUL-терминатор не пишется, результат урезается до `bufsiz`; конечный
+/// компонент **не** разыменовывается (в этом смысл вызова), промежуточные —
+/// разыменовываются. `ENOENT` для отсутствующего пути, `EINVAL` для узла, не
+/// являющегося ссылкой, *и* для `bufsiz == 0` (Linux сначала проверяет размер).
+/// `/proc/self/exe` теперь обычный узел-ссылка (контракт `docs/procfs.md` §5.4),
+/// поэтому `uv_exepath` из libuv — progpath nvim — работает через тот же путь,
+/// что и любая другая ссылка.
 pub fn sys_readlink(path: u64, buf: u64, bufsiz: u64) -> Result<u64, Errno> {
     if bufsiz == 0 {
         return Err(Errno::EINVAL);
@@ -2861,15 +2875,15 @@ pub fn sys_readlink(path: u64, buf: u64, bufsiz: u64) -> Result<u64, Errno> {
     Ok(n)
 }
 
-/// `readlinkat` (267): like `readlink`; the dirfd is ignored (paths resolve
-/// absolute / against the cwd).
+/// `readlinkat` (267): как `readlink`; dirfd игнорируется (пути разрешаются
+/// абсолютно / относительно cwd).
 pub fn sys_readlinkat(_dirfd: u64, path: u64, buf: u64, bufsiz: u64) -> Result<u64, Errno> {
     sys_readlink(path, buf, bufsiz)
 }
 
-/// `pread64` (17): read up to `count` bytes from `fd` at the absolute `offset`
-/// WITHOUT advancing the descriptor's own offset. `EBADF` for an absent fd;
-/// `ESPIPE` for a non-seekable stream (console/stdin); `EISDIR` for a directory.
+/// `pread64` (17): прочитать до `count` байт из `fd` по абсолютному `offset`,
+/// НЕ сдвигая собственное смещение дескриптора. `EBADF` для отсутствующего fd;
+/// `ESPIPE` для неищущегося потока (консоль/stdin); `EISDIR` для каталога.
 pub fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Errno> {
     if count > COUNT_MAX {
         return Err(Errno::EINVAL);
@@ -2897,8 +2911,8 @@ pub fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Er
             }
             let mut kbuf = vec![0u8; copied as usize];
             let n = node.read(offset, &mut kbuf).map_err(|e| {
-                // A real VFS/ext2 read failure is not "invalid
-                // argument" — report EIO and log what actually broke.
+                // Настоящая ошибка чтения VFS/ext2 — не «неверный аргумент»:
+                // сообщаем EIO и логируем, что именно сломалось.
                 crate::error!(
                     "[linux] file read failed: {:?} ino={} off={} len={}",
                     e,
@@ -2909,16 +2923,16 @@ pub fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Er
                 Errno::EIO
             })?;
             copy_out(buf, &kbuf[..n]);
-            // NOTE: the descriptor offset is intentionally NOT updated.
+            // ЗАМЕЧАНИЕ: смещение дескриптора намеренно НЕ обновляется.
             Ok(n as u64)
         }
     }
 }
 
-/// `pwrite64` (18): write `count` bytes to `fd` at the absolute `offset` WITHOUT
-/// advancing the descriptor's own offset. Console writes ignore the offset and
-/// emit to the console; `ESPIPE` for stdin; `EISDIR` for a directory; `EBADF` for
-/// an absent fd.
+/// `pwrite64` (18): записать `count` байт в `fd` по абсолютному `offset`, НЕ
+/// сдвигая собственное смещение дескриптора. Запись в консоль игнорирует
+/// смещение и выводит в консоль; `ESPIPE` для stdin; `EISDIR` для каталога;
+/// `EBADF` для отсутствующего fd.
 pub fn sys_pwrite64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Errno> {
     if count > COUNT_MAX {
         return Err(Errno::EINVAL);
@@ -2936,7 +2950,7 @@ pub fn sys_pwrite64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, E
         | Some(Resolved::Signalfd(_)) => Err(Errno::ESPIPE),
         Some(Resolved::Dir) => Err(Errno::EISDIR),
         Some(Resolved::Console) => {
-            // Terminal access control, like `write(2)`/`writev(2)`.
+            // Контроль доступа к терминалу, как у `write(2)`/`writev(2)`.
             crate::drivers::tty::check_access(super::tty::TtyAccess::Write)?;
             let data = copy_in(buf, count);
             console_write(&data);
@@ -2945,13 +2959,13 @@ pub fn sys_pwrite64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, E
         Some(Resolved::File { node, .. }) => {
             let data = copy_in(buf, count);
             let n = node.write(offset, &data).map_err(write_errno)?;
-            // NOTE: the descriptor offset is intentionally NOT updated.
+            // ЗАМЕЧАНИЕ: смещение дескриптора намеренно НЕ обновляется.
             Ok(n as u64)
         }
     }
 }
 
-/// The x86_64 Linux `struct statfs` (subset populated with plausible values).
+/// Linux x86_64 `struct statfs` (подмножество, заполненное правдоподобными значениями).
 #[repr(C)]
 struct LinuxStatfs {
     f_type: i64,
@@ -2968,12 +2982,12 @@ struct LinuxStatfs {
     f_spare: [i64; 4],
 }
 
-/// ext2 superblock magic, reported in `f_type` so `df`-class probes recognize it.
+/// Магия суперблока ext2, сообщается в `f_type`, чтобы `df`-подобные пробы узнавали ФС.
 const EXT2_SUPER_MAGIC: i64 = 0xEF53;
 
-/// Build a `statfs` snapshot. When the node's filesystem reports capacity
-/// (`vfs::FsStat`, ext2), the real block/inode counts are used; otherwise the
-/// PMM frame counts stand in (ramfs, synthetic /dev nodes).
+/// Собрать снимок `statfs`. Если ФС узла сообщает ёмкость (`vfs::FsStat`, ext2),
+/// используются реальные счётчики блоков/inode; иначе подставляются счётчики
+/// кадров PMM (ramfs, синтетические узлы /dev).
 fn build_statfs_for(fs: Option<vfs::FsStat>) -> LinuxStatfs {
     match fs {
         Some(fs) => LinuxStatfs {
@@ -3011,7 +3025,7 @@ fn build_statfs_for(fs: Option<vfs::FsStat>) -> LinuxStatfs {
     }
 }
 
-/// Copy a built `statfs` to the validated user buffer.
+/// Скопировать собранный `statfs` в проверенный буфер пользователя.
 fn write_statfs(buf: u64, fs: Option<vfs::FsStat>) {
     let sf = build_statfs_for(fs);
     let bytes = unsafe {
@@ -3023,20 +3037,21 @@ fn write_statfs(buf: u64, fs: Option<vfs::FsStat>) {
     copy_out(buf, bytes);
 }
 
-/// `statfs` (137): fill the user `struct statfs` with the mounted filesystem's
-/// real capacity when available (which must exist, else `ENOENT`). Returns 0.
+/// `statfs` (137): заполнить пользовательский `struct statfs` реальной ёмкостью
+/// смонтированной ФС, когда она доступна (путь обязан существовать, иначе
+/// `ENOENT`). Возвращает 0.
 pub fn sys_statfs(path: u64, buf: u64) -> Result<u64, Errno> {
     check_user_ptr(buf, core::mem::size_of::<LinuxStatfs>() as u64)?;
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
-    // `statfs(2)` follows symlinks, like `stat`.
+    // `statfs(2)` разыменовывает симлинки, как `stat`.
     let node = walk(&abs, true)?;
     write_statfs(buf, node.fs_stat());
     Ok(0)
 }
 
-/// `fstatfs` (138): fill the user `struct statfs` for an open descriptor (which
-/// must be valid, else `EBADF`). Returns 0.
+/// `fstatfs` (138): заполнить пользовательский `struct statfs` для открытого
+/// дескриптора (он обязан быть валидным, иначе `EBADF`). Возвращает 0.
 pub fn sys_fstatfs(fd: u64, buf: u64) -> Result<u64, Errno> {
     check_user_ptr(buf, core::mem::size_of::<LinuxStatfs>() as u64)?;
     let fs = match resolve_fd(fd as u32) {
@@ -3085,8 +3100,9 @@ fn poll_revents(fd: i32, events: i16) -> i16 {
     match resolve_fd(fd as u32) {
         None => POLLNVAL,
         Some(Resolved::InetTcp(_)) => {
-            // Conservative: a connected socket is always reported writable and
-            // readable-if-data; curl's event loop re-checks via recv/send anyway.
+            // Консервативно: подключённый сокет всегда считается доступным для
+            // записи и для чтения-при-наличии-данных; event loop curl всё равно
+            // перепроверяет через recv/send.
             events & (POLLIN | POLLOUT)
         }
         Some(Resolved::InetUdp(_)) => events & (POLLIN | POLLOUT),
@@ -3151,14 +3167,14 @@ fn poll_revents(fd: i32, events: i16) -> i16 {
         Some(Resolved::File { .. }) | Some(Resolved::Dir) => events & (POLLIN | POLLOUT),
     }
 }
-/// Publish the kernel copy of a pollfd array to the user pointer, re-validating
-/// the range first.
+/// Опубликовать ядерную копию массива pollfd в пользовательский указатель,
+/// предварительно проверив диапазон заново.
 ///
-/// WHY: `poll`/`ppoll` may block for an unbounded time; the array was validated
-/// only once, at entry (F-x86a-4). A sibling `CLONE_VM` thread can munmap or
-/// mprotect that page while this call is descheduled, and a stale ring-0 write
-/// took a kernel-mode #PF, which the fault handler turned into a machine halt.
-/// Re-checking immediately before the write turns that class into `-EFAULT`.
+/// ПОЧЕМУ: `poll`/`ppoll` могут блокироваться на неограниченное время; массив
+/// проверялся один раз на входе. Поток-сосед по `CLONE_VM` может munmap или
+/// mprotect эту страницу, пока вызов вытеснен, а устаревшая запись из ring 0
+/// даёт #PF режима ядра, который обработчик превращает в остановку машины.
+/// Повторная проверка прямо перед записью превращает этот класс в `-EFAULT`.
 fn publish_pollfds(fds: u64, bytes: u64, kfds: &[u8]) -> Result<(), Errno> {
     check_user_ptr(fds, bytes)?;
     copy_out(fds, kfds);
@@ -3172,12 +3188,13 @@ pub fn sys_poll(fds: u64, nfds: u64, timeout: u64) -> Result<u64, Errno> {
     }
     let bytes = nfds.checked_mul(SZ).ok_or(Errno::EINVAL)?;
     check_user_ptr(fds, bytes)?;
-    // F-x86a-4: the pollfd array is user memory and every wait iteration used to
-    // re-dereference it after `yield_current()`. Take a private kernel copy once
-    // (validated immediately above, no yield in between), drive the whole wait
-    // on the copy, and publish it only through `publish_pollfds`, which
-    // re-validates the destination. A buffer unmapped during the wait now
-    // reports `-EFAULT` instead of faulting in ring 0 and halting the machine.
+    // Массив pollfd — память пользователя, и каждая итерация ожидания раньше
+    // заново разыменовывала его после `yield_current()`. Брать приватную
+    // ядерную копию один раз (проверенную непосредственно выше, без уступки
+    // CPU между проверкой и копией), вести всё ожидание по копии и публиковать
+    // её только через `publish_pollfds`, который заново проверяет приёмник.
+    // Буфер, размонтированный во время ожидания, теперь даёт `-EFAULT`, а не
+    // падение в ring 0 с остановкой машины.
     let mut kfds = copy_in(fds, bytes);
     let ms = timeout as i64;
     let deadline = if ms < 0 {
@@ -3186,16 +3203,16 @@ pub fn sys_poll(fds: u64, nfds: u64, timeout: u64) -> Result<u64, Errno> {
         Some(crate::task::scheduler::ticks().saturating_add((ms as u64).saturating_add(9) / 10))
     };
     loop {
-        // Liveness check after every yield (and before the first scan): the
-        // kernel copy above keeps the wait itself fault-free, but the syscall
-        // must not keep blocking for a buffer the caller no longer owns. A
-        // range unmapped by a sibling thread is -EFAULT, exactly like the
-        // entry-time check — not an eternal wait (F-x86a-4).
+        // Проверка живости после каждой уступки CPU (и до первого сканирования):
+        // ядерная копия выше делает само ожидание безопасным от падений, но
+        // syscall не должен блокироваться на буфере, которым вызывающий уже не
+        // владеет. Диапазон, снятый соседним потоком, — это -EFAULT, точно как
+        // проверка на входе, а не вечное ожидание.
         check_user_ptr(fds, bytes)?;
         let mut ready = 0;
         for i in 0..nfds {
             let off = (i * SZ) as usize;
-            // `off + 8 <= kfds.len()` by construction (`nfds * 8` bytes).
+            // `off + 8 <= kfds.len()` по построению (`nfds * 8` байт).
             let fd = i32::from_ne_bytes([kfds[off], kfds[off + 1], kfds[off + 2], kfds[off + 3]]);
             let ev = i16::from_ne_bytes([kfds[off + 4], kfds[off + 5]]);
             let rev = poll_revents(fd, ev);
@@ -3210,8 +3227,8 @@ pub fn sys_poll(fds: u64, nfds: u64, timeout: u64) -> Result<u64, Errno> {
         }
         if let Some(end) = deadline {
             if crate::task::scheduler::ticks() >= end {
-                // Timeout: Linux leaves every revents field zeroed, which is
-                // exactly what the scan above wrote into the kernel copy.
+                // Таймаут: Linux оставляет все поля revents нулевыми — именно это
+                // и записало в ядерную копию сканирование выше.
                 publish_pollfds(fds, bytes, &kfds)?;
                 return Ok(0);
             }
@@ -3224,18 +3241,18 @@ pub fn sys_poll(fds: u64, nfds: u64, timeout: u64) -> Result<u64, Errno> {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal select/pselect6/ppoll (nr 23/270/271). GNU
-// readline (loaded by the CPython REPL now that libreadline is installed)
-// waits for stdin with pselect6 before every byte; ENOSYS left it spinning
-// right after the first `>>>` prompt. The cooked-tty stdin always reports
-// readable — the following read(2) blocks line-buffered anyway, and leftover
-// bytes are served from STDIN_PENDING one read at a time.
+// Минимальные select/pselect6/ppoll (nr 23/270/271). GNU readline (его грузит
+// REPL CPython, раз установлен libreadline) ждёт stdin через pselect6 перед
+// каждым байтом; ENOSYS оставлял её крутиться сразу после первого приглашения
+// `>>>`. stdin cooked-tty всегда сообщается читаемым — следующий read(2) всё
+// равно блокируется построчно, а остаток отдаётся из STDIN_PENDING по байту за
+// чтение.
 // ---------------------------------------------------------------------------
-const FDSET_WORDS: usize = 16; // 1024 fds, matching FD_SETSIZE
+const FDSET_WORDS: usize = 16; // 1024 fd, как FD_SETSIZE
 
 fn select_ready(fd: u64, want_write: bool) -> bool {
     match resolve_fd(fd as u32) {
-        None => true, // report ready; the following operation returns EBADF
+        None => true, // сообщить готовность; следующая операция вернёт EBADF
         Some(Resolved::InetTcp(_)) | Some(Resolved::InetUdp(_)) => true,
         Some(Resolved::Stdin) => !want_write,
         Some(Resolved::Console) => true,
@@ -3278,8 +3295,8 @@ fn load_fdset(ptr: u64, nfds: u64) -> Result<[u64; FDSET_WORDS], Errno> {
     Ok(set)
 }
 
-/// Write one result fdset at a pointer that has ALREADY been validated by
-/// [`store_fdsets`] (the caller validates all three before writing any of them).
+/// Записать один результирующий fdset по указателю, который УЖЕ проверен
+/// [`store_fdsets`] (вызывающий проверяет все три до записи любого из них).
 fn store_fdset(ptr: u64, nfds: u64, set: &[u64; FDSET_WORDS]) {
     if ptr == 0 {
         return;
@@ -3290,15 +3307,15 @@ fn store_fdset(ptr: u64, nfds: u64, set: &[u64; FDSET_WORDS]) {
     }
 }
 
-/// Publish the three `select(2)` result fdsets, re-validating every non-null
-/// destination BEFORE writing any of them.
+/// Опубликовать три результирующих fdset `select(2)`, заново проверив каждый
+/// ненулевой приёмник ДО записи любого из них.
 ///
-/// WHY: `select`/`pselect6` block for an unbounded time across
-/// `yield_current()`. The fdsets were validated once at entry, and a sibling
-/// `CLONE_VM` thread can munmap one of them while this call is descheduled
-/// (F-x86a-4) — the stale ring-0 write would take a kernel-mode #PF and halt
-/// the machine. Validating all three first means a vanished buffer reports
-/// `-EFAULT` and no partial result reaches the surviving sets.
+/// ПОЧЕМУ: `select`/`pselect6` блокируются на неограниченное время, уступая
+/// CPU через `yield_current()`. Fdsets проверялись один раз на входе, а соседний
+/// поток по `CLONE_VM` может munmap один из них, пока вызов вытеснен — такая
+/// устаревшая запись из ring 0 даёт #PF режима ядра и останавливает машину.
+/// Проверка всех трёх заранее означает, что исчезнувший буфер даёт `-EFAULT`, и
+/// ни один частичный результат не попадёт в уцелевшие наборы.
 fn check_fdsets_out(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64) -> Result<(), Errno> {
     let bytes = ((nfds + 63) / 64) * 8;
     for ptr in [readfds, writefds, exceptfds] {
@@ -3320,7 +3337,7 @@ fn store_fdsets(
     check_fdsets_out(nfds, readfds, writefds, exceptfds)?;
     store_fdset(readfds, nfds, got_r);
     store_fdset(writefds, nfds, got_w);
-    // Exceptional conditions never fire in this layer; report an empty set.
+    // Исключительных условий на этом слое не бывает; сообщаем пустой набор.
     store_fdset(exceptfds, nfds, &[0u64; FDSET_WORDS]);
     Ok(())
 }
@@ -3335,19 +3352,19 @@ fn do_select(
     let nfds = nfds.min(1024);
     let want_r = load_fdset(readfds, nfds)?;
     let want_w = load_fdset(writefds, nfds)?;
-    let _ = load_fdset(exceptfds, nfds)?; // exceptional conditions never fire here
+    let _ = load_fdset(exceptfds, nfds)?; // исключительные условия здесь не срабатывают
     let deadline = match timeout_ms {
         None => None,
-        Some(ms) if ms <= 0 => Some(0), // scan once, then time out
+        Some(ms) if ms <= 0 => Some(0), // просканировать раз, затем таймаут
         Some(ms) => Some(
             crate::task::scheduler::ticks().saturating_add(((ms as u64).saturating_add(9)) / 10),
         ),
     };
     loop {
-        // Liveness check after every yield: the loop works on the kernel copies
-        // loaded above, so a sibling that unmapped an output fdset must turn
-        // into -EFAULT on the next iteration instead of an endless wait
-        // (F-x86a-4).
+        // Проверка живости после каждой уступки CPU: цикл работает с ядерными
+        // копиями, загруженными выше, поэтому сосед, размонтировавший выходной
+        // fdset, обязан превратиться в -EFAULT на следующей итерации, а не в
+        // бесконечное ожидание.
         check_fdsets_out(nfds, readfds, writefds, exceptfds)?;
         let mut got_r = [0u64; FDSET_WORDS];
         let mut got_w = [0u64; FDSET_WORDS];
@@ -3368,8 +3385,8 @@ fn do_select(
             None => false,
         };
         if ready != 0 || timed_out {
-            // Re-validate the outputs after the (possibly long) wait above —
-            // see `store_fdsets` (F-x86a-4).
+            // Перепроверить выходы после (возможно, долгого) ожидания выше —
+            // см. `store_fdsets`.
             store_fdsets(nfds, readfds, writefds, exceptfds, &got_r, &got_w)?;
             return Ok(ready);
         }
@@ -3380,8 +3397,8 @@ fn do_select(
     }
 }
 
-/// `pselect6` (270): the timeout is a `struct timespec`; the sigmask is
-/// ignored (no signal delivery yet).
+/// `pselect6` (270): таймаут — `struct timespec`; sigmask игнорируется
+/// (маска на время ожидания не применяется).
 pub fn sys_pselect6(
     nfds: u64,
     readfds: u64,
@@ -3401,7 +3418,7 @@ pub fn sys_pselect6(
     do_select(nfds, readfds, writefds, exceptfds, ms)
 }
 
-/// `select` (23): the timeout is a `struct timeval`.
+/// `select` (23): таймаут — `struct timeval`.
 pub fn sys_select(
     nfds: u64,
     readfds: u64,
@@ -3420,7 +3437,7 @@ pub fn sys_select(
     do_select(nfds, readfds, writefds, exceptfds, ms)
 }
 
-/// `ppoll` (271): `poll` with a `struct timespec` timeout; sigmask ignored.
+/// `ppoll` (271): `poll` с таймаутом `struct timespec`; sigmask игнорируется.
 pub fn sys_ppoll(fds: u64, nfds: u64, ts: u64, _sigmask: u64) -> Result<u64, Errno> {
     let ms: i64 = if ts == 0 {
         -1
@@ -3441,10 +3458,10 @@ const SOCK_TYPE_MASK: u64 = 0xf;
 const SOCK_NONBLOCK: u64 = 0x800;
 const SOCK_CLOEXEC: u64 = 0x80000;
 
-/// `socketpair` (53): AF_UNIX/SOCK_STREAM only — the channel libuv builds for
-/// the `nvim --embed` msgpack-rpc server, dup2'd onto the child's stdio.
-/// Backed by two cross-connected in-kernel byte queues (FdTable::socketpair),
-/// so both descriptors are readable and writable.
+/// `socketpair` (53): только AF_UNIX/SOCK_STREAM — канал, который libuv строит
+/// для msgpack-rpc-сервера `nvim --embed`, dup2'нутый на stdio ребёнка. Опирается
+/// на две перекрёстно связанные ядерные байтовые очереди (FdTable::socketpair),
+/// поэтому оба дескриптора читаемы и записываемы.
 pub fn sys_socketpair(domain: u64, sock_type: u64, protocol: u64, sv: u64) -> Result<u64, Errno> {
     if domain != AF_UNIX || protocol != 0 {
         return Err(Errno::EINVAL);
@@ -3465,7 +3482,7 @@ pub fn sys_socketpair(domain: u64, sock_type: u64, protocol: u64, sv: u64) -> Re
     })
     .ok_or(Errno::EBADF)?;
     let words = [pair.0, pair.1];
-    // SAFETY: two u32 fds → exactly the 8 bytes socketpair writes to sv.
+    // SAFETY: два u32-дескриптора — ровно те 8 байт, которые socketpair пишет в sv.
     let bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, 8) };
     copy_out(sv, bytes);
     Ok(0)
@@ -3475,10 +3492,11 @@ const STATX_BASIC_STATS: u32 = 0x7ff;
 const AT_EMPTY_PATH: u64 = 0x1000;
 const STATX_SIZE_BYTES: u64 = 256;
 
-/// Fill a zeroed `struct statx` (256 bytes) with the basic fields pagh tracks.
-/// Timestamps stay zero — the legacy `stat` path reports the same.
+/// Заполнить обнулённый `struct statx` (256 байт) базовыми полями, которые
+/// отслеживает pagh. Метки времени остаются нулевыми — старый путь `stat`
+/// сообщает те же.
 fn write_statx(buf: u64, size: u64, mode: u32, ino: u64) {
-    // SAFETY: the caller validated `buf` for STATX_SIZE_BYTES.
+    // SAFETY: вызывающий проверил `buf` на STATX_SIZE_BYTES.
     unsafe {
         core::ptr::write_bytes(buf as *mut u8, 0, STATX_SIZE_BYTES as usize);
         core::ptr::write_unaligned(buf as *mut u32, STATX_BASIC_STATS); // stx_mask
@@ -3492,11 +3510,12 @@ fn write_statx(buf: u64, size: u64, mode: u32, ino: u64) {
     }
 }
 
-/// `statx` (332): translated onto the existing stat plumbing. Supports plain
-/// path lookups (absolute or cwd-relative; any dirfd is treated as AT_FDCWD,
-/// like `openat`) and the `AT_EMPTY_PATH` fd form glibc uses for fstat-style
-/// queries. libuv's uv_fs_fstat probes statx first and only falls back on a
-/// clean ENOSYS from the dispatcher — which it no longer needs to.
+/// `statx` (332): переводится на существующую обвязку stat. Поддерживает
+/// обычный поиск по пути (абсолютному или относительно cwd; любой dirfd
+/// трактуется как AT_FDCWD, как в `openat`) и fd-форму `AT_EMPTY_PATH`, которую
+/// glibc использует для запросов в стиле fstat. `uv_fs_fstat` из libuv сначала
+/// пробует statx и откатывается только при чистом ENOSYS от диспетчера —
+/// которого ему больше не нужно.
 pub fn sys_statx(dirfd: u64, path: u64, flags: u64, _mask: u64, buf: u64) -> Result<u64, Errno> {
     check_user_ptr(buf, STATX_SIZE_BYTES)?;
     let p = read_user_cstr(path)?;

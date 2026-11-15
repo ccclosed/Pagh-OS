@@ -1,33 +1,33 @@
-//! Effectful Linux memory-management syscall handlers (task 12.3).
+//! Эффектные обработчики memory-management syscall'ов Linux.
 //!
-//! This is the **kernel-only** half of the `mem` component. It wires the pure
-//! planners in [`super::mem`] (`plan_brk`/`plan_mmap`/`plan_munmap`/`prot_to_flags`)
-//! to the running `Compat_Process`'s [`VmRegionSet`] and to the page tables via
+//! **Ядерная** половина компонента `mem`: связывает чистые планировщики
+//! [`super::mem`] (`plan_brk`/`plan_mmap`/`plan_munmap`/`prot_to_flags`) с
+//! [`VmRegionSet`] работающего `Compat_Process` и с таблицами страниц через
 //! `memory::vmm`/`memory::pmm`.
 //!
-//! It lives in its OWN file (not `mem.rs`) on purpose: `mem.rs` is `#[path]`-included
-//! verbatim by the `host-tests` crate so its pure planners can be property-tested on
-//! the host (R11.6). These handlers use kernel-only paging APIs that do not exist on
-//! the host, so keeping them here leaves `mem.rs` purely host-testable while this file
-//! is compiled only as part of the kernel.
+//! Модуль вынесен в отдельный файл намеренно: `mem.rs` включается в `host-tests`
+//! через `#[path]`, чтобы его чистые планировщики проверялись свойствами на хосте
+//! (R11.6). Эти обработчики используют ядерные API paging, которых на хосте нет,
+//! поэтому `mem.rs` остаётся чисто host-тестируемым, а этот файл компилируется
+//! только в ядре.
 //!
-//! ## Address space
+//! ## Адресное пространство
 //!
-//! During a syscall the active CR3 is the calling process's user PML4, so
-//! `vmm::map`/`vmm::release_user_leaf`/`vmm::virt_to_phys` operate directly on
-//! that process's address space — no CR3 switch is needed here. PMM/VMM use their own brief
-//! spinlocks and never wait on a device interrupt, so it is safe to run this work
-//! inside the [`crate::task::compat::with_current_compat`] closure (which holds the
-//! `COMPAT_STATES` lock).
+//! Во время syscall активный CR3 — пользовательский PML4 вызывающего, поэтому
+//! `vmm::map`/`vmm::release_user_leaf`/`vmm::virt_to_phys` работают напрямую с его
+//! адресным пространством — переключать CR3 здесь не нужно. PMM/VMM используют
+//! свои краткие спинлоки и никогда не ждут прерывания устройства, поэтому такую
+//! работу безопасно выполнять внутри замыкания
+//! [`crate::task::compat::with_current_compat`] (держащего лок `COMPAT_STATES`).
 //!
-//! ## OOM rollback (R3.4, R4.4)
+//! ## Откат при OOM (R3.4, R4.4)
 //!
-//! `brk`-grow and `mmap` allocate frames page-by-page; on the first
-//! `pmm::alloc_frame` failure (or a `vmm::map` failure) every page mapped so far in
-//! that call is unwound through the single leaf-release path
-//! (`vmm::release_user_leaf`, which honours COW ownership) and the operation
-//! returns with the process's memory state unchanged: `brk` reports the unchanged
-//! break, `mmap` returns `-ENOMEM`.
+//! Рост `brk` и `mmap` аллоцируют кадры постранично; при первом отказе
+//! `pmm::alloc_frame` (или `vmm::map`) каждая уже отображённая в этом вызове
+//! страница снимается через единый путь освобождения листа
+//! (`vmm::release_user_leaf`, уважающий владение COW), и операция возвращается с
+//! неизменённым состоянием памяти процесса: `brk` сообщает прежний break,
+//! `mmap` возвращает `-ENOMEM`.
 #![allow(dead_code)]
 
 use alloc::vec::Vec;
@@ -45,23 +45,23 @@ use super::mem::{
 };
 use super::validate::USER_ADDR_MAX;
 
-/// Architectural page size (4 KiB).
+/// Архитектурный размер страницы (4 КиБ).
 const PAGE_SIZE: u64 = 4096;
 
-/// Validate that a memory-syscall range lies in the user half and return its page
-/// count.
+/// Проверить, что диапазон memory-syscall'а лежит в пользовательской половине, и
+/// вернуть число страниц.
 ///
-/// This is the range gate for `mprotect`/`munmap`/`mremap`. Those syscalls used
-/// to trust `addr`/`len`: `mprotect` on a *kernel* virtual address walked the
-/// kernel's own page tables, remapped kernel pages with `USER_ACCESSIBLE` (via
-/// `leaf_flags`) and, for `PROT_NONE`, returned kernel frames to the PMM — a
-/// ring-3 → ring-0 memory primitive. The pure [`check_user_range`] helper already
-/// existed for copy-in/copy-out; this wraps it with the page-count arithmetic the
-/// memory syscalls need.
+/// Это гейт диапазона для `mprotect`/`munmap`/`mremap`. Эти syscall'ы раньше
+/// доверяли `addr`/`len`: `mprotect` на *ядерном* виртуальном адресе обходил
+/// таблицы страниц самого ядра, переотображал ядерные страницы с
+/// `USER_ACCESSIBLE` (через `leaf_flags`) и для `PROT_NONE` возвращал ядерные
+/// кадры в PMM — примитив памяти ring 3 → ring 0. Чистый хелпер
+/// [`check_user_range`] уже существовал для copy-in/copy-out; эта обёртка
+/// добавляет арифметику страниц, нужную memory-syscall'ам.
 ///
-/// Returns `EINVAL` for an unaligned base or a non-user/overflowing range (the
-/// page-table operations below assume 4 KiB-aligned user VAs), and the page count
-/// otherwise (`len == 0` → 0 pages, a no-op).
+/// `EINVAL` для невыровненной базы или не-пользовательского/переполняющегося
+/// диапазона (операции с таблицами ниже предполагают выровненные на 4 КиБ
+/// пользовательские VA), иначе число страниц (`len == 0` → 0 страниц, no-op).
 fn user_pages(addr: u64, len: u64) -> Result<u64, Errno> {
     if addr & (PAGE_SIZE - 1) != 0 {
         return Err(Errno::EINVAL);
@@ -77,17 +77,18 @@ fn user_pages(addr: u64, len: u64) -> Result<u64, Errno> {
         .ok_or(Errno::EINVAL)
 }
 
-/// Zero the 4 KiB physical frame at `frame` through the HHDM alias.
+/// Обнулить физический кадр 4 КиБ по `frame` через HHDM-алиас.
 fn zero_frame(frame: u64) {
-    // SAFETY: `frame` was just allocated from the PMM and is mapped into the HHDM
-    // window, so `phys_to_virt(frame)` is a valid, writable, page-aligned pointer.
+    // SAFETY: `frame` только что выделен из PMM и отображён в окно HHDM,
+    // поэтому `phys_to_virt(frame)` — валидный, записываемый, выровненный на
+    // страницу указатель.
     unsafe {
         core::ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, PAGE_SIZE as usize);
     }
 }
 
-/// Build the leaf PTE flags for a user data page from `(writable, nx)` (always
-/// `PRESENT | USER_ACCESSIBLE`).
+/// Построить флаги листового PTE пользовательской страницы данных из
+/// `(writable, nx)` (всегда `PRESENT | USER_ACCESSIBLE`).
 fn leaf_flags(writable: bool, nx: bool) -> PageTableFlags {
     let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
     if writable {
@@ -99,9 +100,10 @@ fn leaf_flags(writable: bool, nx: bool) -> PageTableFlags {
     flags
 }
 
-/// Map zero-filled pages over `[from, to)` (page-aligned), skipping pages already
-/// present. On the first allocation/mapping failure, unwind every page mapped by
-/// this call and return `false` (caller leaves state unchanged).
+/// Отобразить заполненные нулями страницы на `[from, to)` (выровнено по
+/// страницам), пропуская уже присутствующие. При первом отказе
+/// аллокации/отображения снять все страницы, отображённые этим вызовом, и вернуть
+/// `false` (вызывающий оставляет состояние неизменным).
 fn map_zeroed_range(from: u64, to: u64, flags: PageTableFlags) -> bool {
     let mut mapped: Vec<u64> = Vec::new();
     let mut page = from;
@@ -112,7 +114,7 @@ fn map_zeroed_range(from: u64, to: u64, flags: PageTableFlags) -> bool {
                 Some(frame) => {
                     zero_frame(frame);
                     if vmm::map(frame, page, flags).is_err() {
-                        // Frame not referenced by any PTE; free it directly.
+                        // Кадр не упомянут ни в одном PTE; освободить его напрямую.
                         pmm::free_frame(frame);
                         ok = false;
                         break;
@@ -133,28 +135,30 @@ fn map_zeroed_range(from: u64, to: u64, flags: PageTableFlags) -> bool {
     ok
 }
 
-/// Unmap a set of pages this call mapped, returning their frames to the PMM.
+/// Снять отображение набора страниц, отображённых этим вызовом, вернув их кадры
+/// в PMM.
 fn unwind(pages: &[u64]) {
     for &p in pages {
-        // The single leaf-release path: unwinds frames this call mapped itself
-        // (never COW-shared, so they are freed), but a COW leaf at the same VA
-        // is accounted for instead of being freed behind another address
-        // space's back.
+        // Единый путь освобождения листа: снимает кадры, отображённые этим
+        // вызовом (они никогда не COW-разделены, поэтому освобождаются), но
+        // COW-лист по тому же VA учитывается, а не освобождается за спиной
+        // другого адресного пространства.
         let _ = vmm::release_user_leaf(p);
     }
 }
 
-/// `brk` (12): query/move the program break (R3.1–R3.6). On a grow that cannot be
-/// backed by physical memory, the break is left unchanged (R3.4).
+/// `brk` (12): запросить/сдвинуть program break (R3.1–R3.6). При росте, который
+/// не удаётся подпереть физической памятью, break остаётся неизменным (R3.4).
 pub fn sys_brk(addr: u64) -> Result<u64, Errno> {
     compat::with_current_compat(|cs| brk_impl(&mut *cs.vm.lock(), addr)).ok_or(Errno::EINVAL)
 }
 
 fn brk_impl(vm: &mut VmRegionSet, requested: u64) -> u64 {
-    // The brk heap grows upward in the same lower-half range the mmap bump
-    // allocator uses, so a grow must not run into a tracked mmap region: clamp
-    // the ceiling at the lowest region base above the current break (Linux
-    // keeps the two areas apart; failing the grow is the POSIX-visible result).
+    // Куча brk растёт вверх в том же диапазоне нижней половины, что использует
+    // bump-аллокатор mmap, поэтому рост не должен наткнуться на отслеживаемый
+    // mmap-регион: потолок урезается до младшей базы региона выше текущего break
+    // (Linux держит эти области раздельно; провал роста — видимый для POSIX
+    // результат).
     let ceiling = vm
         .mmaps
         .iter()
@@ -174,9 +178,10 @@ fn brk_impl(vm: &mut VmRegionSet, requested: u64) -> u64 {
         BrkOutcome::Grow {
             new_brk, map_from, ..
         } => {
-            // Lazy: no eager mapping. Pages in [brk_lazy_from, page_up(new_brk))
-            // are backed by the page-fault handler on first touch; the recorded
-            // floor only ever moves down.
+            // Лениво: без жадного отображения. Страницы в
+            // [brk_lazy_from, page_up(new_brk)) подпираются обработчиком page
+            // fault по первому касанию; записанная нижняя граница только
+            // опускается.
             vm.brk_lazy_from = vm.brk_lazy_from.min(map_from);
             vm.current_brk = new_brk;
             new_brk
@@ -184,34 +189,34 @@ fn brk_impl(vm: &mut VmRegionSet, requested: u64) -> u64 {
     }
 }
 
-/// Additional Linux `mmap` flag bits handled here (beyond `MAP_PRIVATE` /
-/// `MAP_ANONYMOUS` from the pure planner module).
+/// Дополнительные биты флагов `mmap` Linux, обрабатываемые здесь (сверх
+/// `MAP_PRIVATE`/`MAP_ANONYMOUS` из модуля чистых планировщиков).
 const MAP_SHARED: u32 = 0x1;
 const MAP_FIXED: u32 = 0x10;
-/// Hint / bookkeeping-only bits, accepted and ignored:
+/// Биты-подсказки/только-учёт, принимаются и игнорируются:
 /// `MAP_DENYWRITE | MAP_EXECUTABLE | MAP_NORESERVE | MAP_POPULATE | MAP_STACK`.
 const MAP_IGNORED: u32 = 0x800 | 0x1000 | 0x4000 | 0x8000 | 0x2_0000;
 
-/// `mmap` (9): map a private region (R4.1, R4.2) in the three shapes a dynamic loader
-/// (`ld.so` mapping shared libraries) actually issues:
+/// `mmap` (9): отобразить приватный регион (R4.1, R4.2) в трёх формах, которые
+/// реально выдаёт динамический загрузчик (`ld.so`, отображающий разделяемые
+/// библиотеки):
 ///
-///   * anonymous `MAP_PRIVATE|MAP_ANONYMOUS` — zero-filled bump-pointer region
-///     (the original behavior, R4.2);
-///   * file-backed `MAP_PRIVATE` with `fd`/`off` — the region is backed by
-///     fresh zeroed frames and the file bytes `[off, off + len)` are copied in
-///     eagerly. There are no shared file mappings in this kernel to stay
-///     coherent with, so an eager private copy is *exact* `MAP_PRIVATE`
-///     semantics, and pages past EOF stay zero (the bss tail the loader
-///     expects);
-///   * `MAP_FIXED` at a page-aligned address — replaces any existing pages in
-///     the range, exactly like Linux (the loader maps each ELF segment with
-///     `MAP_FIXED` over the span reserved by its first mapping).
+///   * анонимный `MAP_PRIVATE|MAP_ANONYMOUS` — заполненный нулями bump-регион
+///     (исходное поведение, R4.2);
+///   * file-backed `MAP_PRIVATE` с `fd`/`off` — регион подпирается свежими
+///     обнулёнными кадрами, а байты файла `[off, off + len)` копируются жадно.
+///     Разделяемых файловых отображений в этом ядре нет, так что жадная приватная
+///     копия — *точная* семантика `MAP_PRIVATE`, а страницы за EOF остаются
+///     нулевыми (bss-хвост, которого ждёт загрузчик);
+///   * `MAP_FIXED` по выровненному адресу — заменяет любые существующие страницы
+///     диапазона, точно как Linux (загрузчик отображает каждый ELF-сегмент
+///     `MAP_FIXED` поверх диапазона, зарезервированного первым отображением).
 ///
-/// Returns the mapped base; `-EINVAL` for malformed requests and genuinely
-/// unsupported shapes (`MAP_SHARED`, unknown flag bits — refuse loudly rather
-/// than mis-map); `-EBADF` when a file-backed request names a descriptor that
-/// is not an open regular file; `-ENOMEM` when the region cannot be placed
-/// below the user ceiling or backed by frames (R4.4).
+/// Возвращает базу отображения; `-EINVAL` для неверных запросов и действительно
+/// неподдерживаемых форм (`MAP_SHARED`, неизвестные биты — отказать громко, а не
+/// отобразить неверно); `-EBADF`, когда file-backed запрос называет дескриптор,
+/// не являющийся открытым regular-файлом; `-ENOMEM`, когда регион нельзя
+/// разместить ниже пользовательского потолка или подпереть кадрами (R4.4).
 pub fn sys_mmap(
     addr: u64,
     len: u64,
@@ -230,9 +235,9 @@ pub fn sys_mmap(
     let anon = flags & MAP_ANONYMOUS != 0;
     let fixed = flags & MAP_FIXED != 0;
 
-    // File-backed: resolve and clone the backing node (and its VFS path, for
-    // `/proc/<pid>/maps`) BEFORE taking the compat lock, mirroring
-    // `read`/`pread64` (VFS I/O must run with the lock dropped).
+    // File-backed: разрешить и клонировать узел (и его путь VFS, для
+    // `/proc/<pid>/maps`) ДО взятия compat-лока, как в `read`/`pread64` (I/O VFS
+    // должен идти с отпущенным локом).
     let mut backing: Option<MmapBacking> = None;
     let node = if anon {
         None
@@ -247,7 +252,8 @@ pub fn sys_mmap(
             Some((n, path)) => {
                 backing = Some(MmapBacking {
                     path,
-                    // Same identity `stat(2)`/`fdinfo` report for this file.
+                    // Та же идентичность, что `stat(2)`/`fdinfo` сообщают для
+                    // этого файла.
                     ino: super::io_sys::node_ino(&n),
                     file_offset: off,
                 });
@@ -265,8 +271,8 @@ pub fn sys_mmap(
     let (writable, nx) = prot_to_flags(prot as u32);
     let prot_none = prot == 0;
 
-    // Phase 1 (under the compat lock): place the region, back it with zeroed
-    // frames when eager, record it in the tracked set.
+    // Фаза 1 (под compat-локом): разместить регион, подпереть обнулёнными
+    // кадрами, если жадно, записать в отслеживаемый набор.
     let base = compat::with_current_compat(|cs| -> Result<u64, Errno> {
         let vm = &mut cs.vm.lock();
         let base = if fixed {
@@ -275,10 +281,10 @@ pub fn sys_mmap(
             }
             addr
         } else {
-            // First-fit placement: reuse freed holes before extending past the
-            // high-water mark (Linux reuses VA space; a bump-only allocator
-            // makes long-lived processes walk into USER_ADDR_MAX and die of
-            // ENOMEM with plenty of memory free).
+            // Размещение first-fit: переиспользовать освобождённые дыры прежде
+            // чем расширяться за отметку максимума (Linux переиспользует VA;
+            // bump-only аллокатор заставляет долгоживущие процессы упереться в
+            // USER_ADDR_MAX и умереть от ENOMEM при свободной памяти).
             plan_mmap_base(&vm.mmaps, vm.mmap_floor, pages, USER_ADDR_MAX).ok_or(Errno::ENOMEM)?
         };
         let end = base.checked_add(span).ok_or(Errno::ENOMEM)?;
@@ -286,24 +292,26 @@ pub fn sys_mmap(
             return Err(Errno::ENOMEM);
         }
         if fixed {
-            // MAP_FIXED replaces whatever was there: release the old leaves so
-            // `map_zeroed_range` backs the whole span with fresh zeroed pages,
-            // and cut the replaced span out of the tracked regions.
+            // MAP_FIXED заменяет то, что было: освободить старые листья, чтобы
+            // `map_zeroed_range` подпёр весь диапазон свежими обнулёнными
+            // страницами, и вырезать заменённый диапазон из отслеживаемых
+            // регионов.
             for i in 0..pages {
                 let page = base + i * PAGE_SIZE;
-                // The replaced pages may be COW-shared with another address
-                // space (the loader re-maps over a forked image): unref instead
-                // of freeing a frame the other side still maps.
+                // Заменённые страницы могут быть COW-разделены с другим
+                // адресным пространством (загрузчик переотображает поверх
+                // форкнутого образа): unref, а не освобождение кадра, который
+                // другая сторона ещё отображает.
                 let _ = vmm::release_user_leaf(page);
             }
             cut_regions(&mut vm.mmaps, base, pages);
         }
-        // Anonymous regions (and PROT_NONE reserves of either kind) are lazy:
-        // only the region is recorded here; the page-fault handler backs pages
-        // on first touch. File-backed regions with access rights keep the
-        // eager copy — there is no page cache to fault them in from.
+        // Анонимные регионы (и PROT_NONE-резервы любого вида) ленивы: здесь
+        // записывается только регион; обработчик page fault подпирает страницы по
+        // первому касанию. File-backed регионы с правами доступа сохраняют жадную
+        // копию — кеша страниц, из которого их можно было бы подгружать, нет.
         if !anon && !prot_none && !map_zeroed_range(base, end, leaf_flags(writable, nx)) {
-            // OOM: existing mappings are untouched (R4.4).
+            // OOM: существующие отображения не тронуты (R4.4).
             return Err(Errno::ENOMEM);
         }
         vm.mmaps.push(MmapRegion {
@@ -322,11 +330,11 @@ pub fn sys_mmap(
     })
     .unwrap_or(Err(Errno::EINVAL))?;
 
-    // Phase 2 (lock dropped): copy the file bytes in through the HHDM alias.
-    // The just-installed PTEs may be read-only and/or NX under the final
-    // protections, and CR0.WP makes supervisor writes honor read-only user
-    // PTEs, so the copy goes through the always-writable HHDM alias instead of
-    // the user virtual address.
+    // Фаза 2 (лок отпущен): скопировать байты файла через HHDM-алиас.
+    // Только что установленные PTE могут быть read-only и/или NX под финальными
+    // защитами, а CR0.WP заставляет supervisor-записи уважать read-only
+    // пользовательские PTE, поэтому копирование идёт через всегда записываемый
+    // HHDM-алиас, а не через пользовательский виртуальный адрес.
     if let Some(node) = node {
         let size = node.size();
         let mut buf = [0u8; PAGE_SIZE as usize];
@@ -336,7 +344,7 @@ pub fn sys_mmap(
                 None => break,
             };
             if file_off >= size {
-                break; // Rest of the region stays zero (bss tail).
+                break; // Остаток региона остаётся нулевым (bss-хвост).
             }
             let want = core::cmp::min(PAGE_SIZE, size - file_off) as usize;
             let n = node
@@ -347,9 +355,9 @@ pub fn sys_mmap(
             }
             let page = base + i * PAGE_SIZE;
             if let Some(phys) = vmm::virt_to_phys(page) {
-                // SAFETY: `page` was mapped by this very call to a fresh 4 KiB
-                // frame; the HHDM alias of that frame is valid and writable,
-                // and `n <= PAGE_SIZE`.
+                // SAFETY: `page` отображена именно этим вызовом в свежий кадр
+                // 4 КиБ; HHDM-алиас этого кадра валиден и записываем, а
+                // `n <= PAGE_SIZE`.
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         buf.as_ptr(),
@@ -363,13 +371,13 @@ pub fn sys_mmap(
     Ok(base)
 }
 
-/// `munmap` (11): unmap a previously-`mmap`ped range (R4.3) or reject an
-/// unaligned/uncovered request with `-EINVAL` (R4.7).
+/// `munmap` (11): снять отображение ранее `mmap`-нутого диапазона (R4.3) или
+/// отвергнуть невыровненный/непокрытый запрос с `-EINVAL` (R4.7).
 pub fn sys_munmap(addr: u64, len: u64) -> Result<u64, Errno> {
-    // `munmap` only unmaps tracked regions, so a kernel address was rejected
-    // indirectly; validate the range up front all the same, so the three
-    // memory-length syscalls share one gate instead of relying on three
-    // different code paths to reject a kernel VA.
+    // `munmap` снимает только отслеживаемые регионы, поэтому ядерный адрес
+    // отвергался косвенно; всё равно проверяем диапазон заранее, чтобы три
+    // memory-syscall'а с длиной делили один гейт, а не полагались на три разных
+    // пути кода для отказа ядерному VA.
     let pages = user_pages(addr, len)?;
     if pages == 0 {
         return Ok(0);
@@ -378,14 +386,14 @@ pub fn sys_munmap(addr: u64, len: u64) -> Result<u64, Errno> {
         .unwrap_or(Err(Errno::EINVAL))
 }
 
-/// `mremap` (25): resize an anonymous private mapping. glibc's
-/// realloc() tries mremap first for large blocks and falls back to
-/// malloc+memcpy+free on ENOSYS, which logged an unsupported-syscall warning
-/// on every CPython start. Shrinks drop the tail pages in place; growth
-/// requires `MREMAP_MAYMOVE` (in-place growth is never attempted, matching
-/// Linux when the next pages are taken): a fresh zeroed span is mapped, the
-/// old frames are copied through the HHDM alias (immune to read-only/NX user
-/// PTEs under CR0.WP) and the old range is unmapped.
+/// `mremap` (25): изменить размер анонимного приватного отображения. `realloc`
+/// из glibc сначала пробует mremap для больших блоков и откатывается к
+/// malloc+memcpy+free на ENOSYS, что логировало предупреждение о
+/// неподдерживаемом syscall'е при каждом старте CPython. Сжатие отбрасывает
+/// хвостовые страницы на месте; рост требует `MREMAP_MAYMOVE` (рост на месте не
+/// пробуется, как в Linux, когда следующие страницы заняты): отображается свежий
+/// обнулённый диапазон, старые кадры копируются через HHDM-алиас (невосприимчив к
+/// read-only/NX пользовательским PTE при CR0.WP), а старый диапазон снимается.
 pub fn sys_mremap(
     old_addr: u64,
     old_size: u64,
@@ -397,11 +405,11 @@ pub fn sys_mremap(
     if old_size == 0 || new_size == 0 {
         return Err(Errno::EINVAL);
     }
-    // Same user-half gate as mprotect/munmap: `old_addr` feeds page-table and
-    // frame arithmetic, and `new_size` decides how many pages are allocated and
-    // mapped. A length cannot be "in the user half" (it is not an address), so
-    // it is bounded by the user half size instead: no single mremap may ask for
-    // more VA than that half can hold.
+    // Тот же гейт пользовательской половины, что у mprotect/munmap: `old_addr`
+    // участвует в арифметике таблиц/кадров, а `new_size` решает, сколько страниц
+    // выделить и отобразить. Длина не может быть «в пользовательской половине»
+    // (это не адрес), поэтому она ограничена размером половины: ни один mremap не
+    // может запросить VA больше, чем половина вмещает.
     if user_pages(old_addr, old_size)? == 0 {
         return Err(Errno::EINVAL);
     }
@@ -409,8 +417,8 @@ pub fn sys_mremap(
         return Err(Errno::EINVAL);
     }
     if flags & !MREMAP_MAYMOVE != 0 {
-        // MREMAP_FIXED / MREMAP_DONTUNMAP are unsupported shapes — refuse
-        // loudly rather than mis-map.
+        // MREMAP_FIXED / MREMAP_DONTUNMAP — неподдерживаемые формы: отказать
+        // громко, а не отобразить неверно.
         return Err(Errno::EINVAL);
     }
     let old_pages = old_size
@@ -426,8 +434,8 @@ pub fn sys_mremap(
     }
     compat::with_current_compat(|cs| -> Result<u64, Errno> {
         let vm = &mut cs.vm.lock();
-        // The whole old range must lie inside one tracked mmap region; its
-        // protections carry over to the new placement.
+        // Весь старый диапазон обязан лежать внутри одного отслеживаемого
+        // mmap-региона; его защита переносится на новое размещение.
         let old_span = old_pages.checked_mul(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
         let idx = vm
             .mmaps
@@ -439,7 +447,7 @@ pub fn sys_mremap(
 
         if new_pages <= old_pages {
             if new_pages < old_pages {
-                // Shrink in place: drop the tail pages.
+                // Сжатие на месте: отбросить хвостовые страницы.
                 let _ = munmap_impl(
                     vm,
                     old_addr + new_pages * PAGE_SIZE,
@@ -450,11 +458,11 @@ pub fn sys_mremap(
         }
         let delta = new_pages - old_pages;
 
-        // In-place growth: when the span right after the region is free, just
-        // widen the tracked region — no copy, no move. Anonymous tails stay
-        // lazy; eager (file-backed) tails are zero-mapped here (mremap never
-        // faults in more file data, matching Linux where the new pages simply
-        // belong to the same VMA).
+        // Рост на месте: когда диапазон сразу за регионом свободен, просто
+        // расширить отслеживаемый регион — без копирования и перемещения.
+        // Анонимные хвосты остаются ленивыми; жадные (file-backed) хвосты здесь
+        // отображаются нулями (mremap никогда не подгружает больше данных файла,
+        // как в Linux, где новые страницы просто принадлежат той же VMA).
         if range_is_free(&vm.mmaps, old_addr + old_span, delta, USER_ADDR_MAX) {
             let tail = old_addr + old_span;
             if !old.anon && !map_zeroed_range(tail, tail + delta * PAGE_SIZE, flags_of) {
@@ -478,23 +486,24 @@ pub fn sys_mremap(
         if end > USER_ADDR_MAX {
             return Err(Errno::ENOMEM);
         }
-        // Anonymous target: lazy — copy touches only pages that carry data.
-        // Eager (file-backed) target: pre-map the whole span, then copy.
+        // Анонимная цель: ленивая — копирование трогает только страницы с
+        // данными. Жадная (file-backed) цель: отобразить весь диапазон, затем
+        // копировать.
         if !old.anon && !map_zeroed_range(base, end, flags_of) {
-            // OOM: the old mapping is untouched.
+            // OOM: старое отображение не тронуто.
             return Err(Errno::ENOMEM);
         }
         let mut copied: Vec<u64> = Vec::new();
         for i in 0..old_pages {
             let src = vmm::virt_to_phys(old_addr + i * PAGE_SIZE);
             let Some(src) = src else {
-                continue; // never-touched source page: target stays zero/lazy
+                continue; // нетронутая исходная страница: цель остаётся нулевой/ленивой
             };
             let dst_page = base + i * PAGE_SIZE;
             if old.anon {
-                // Ensure the destination page is backed before copying into it
-                // (its frame cannot be written through a missing PTE; the HHDM
-                // alias needs the frame to exist first).
+                // Убедиться, что страница-приёмник подпёрта, прежде чем копировать
+                // в неё (её кадр нельзя записать через отсутствующий PTE; HHDM-
+                // алиасу нужно, чтобы кадр сначала существовал).
                 match pmm::alloc_frame() {
                     Some(frame) => {
                         zero_frame(frame);
@@ -511,8 +520,8 @@ pub fn sys_mremap(
                     }
                 }
             }
-            // SAFETY: both frames are 4 KiB, mapped by this process /
-            // this very call; the HHDM aliases are valid and writable.
+            // SAFETY: оба кадра по 4 КиБ, отображены этим процессом / этим
+            // вызовом; HHDM-алиасы валидны и записываемы.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     vmm::phys_to_virt(src & !(PAGE_SIZE - 1)) as *const u8,
@@ -530,9 +539,10 @@ pub fn sys_mremap(
                 nx: old.nx,
                 prot: old.prot,
                 anon: old.anon,
-                // A moved mapping keeps its file identity; the tail pages past
-                // the old end are zero-filled by the copy above, exactly like
-                // the eager file copy leaves a short file's tail zeroed.
+                // Перемещённое отображение сохраняет идентичность файла; хвостовые
+                // страницы за старым концом заполняются нулями копированием выше,
+                // точно как жадное копирование файла оставляет хвост короткого
+                // файла нулевым.
                 backing: old.backing.clone(),
             },
         );
@@ -551,9 +561,10 @@ fn munmap_impl(vm: &mut VmRegionSet, base: u64, len: u64) -> Result<u64, Errno> 
         MunmapPlan::Unmap { base, pages } => {
             for i in 0..pages {
                 let page = base + i * PAGE_SIZE;
-                // One release path for every detached leaf: private frames are
-                // freed, COW-shared frames only lose this address space's
-                // reference and stay mapped in the other one.
+                // Один путь освобождения для каждого отцепленного листа:
+                // приватные кадры освобождаются, COW-разделённые теряют только
+                // ссылку этого адресного пространства и остаются отображёнными в
+                // другом.
                 let _ = vmm::release_user_leaf(page);
             }
             cut_regions(&mut vm.mmaps, base, pages);
@@ -562,8 +573,9 @@ fn munmap_impl(vm: &mut VmRegionSet, base: u64, len: u64) -> Result<u64, Errno> 
     }
 }
 
-/// Remove the page span `[base, base + pages*4096)` from the tracked region set,
-/// splitting any region it partially overlaps into its surviving sub-ranges.
+/// Удалить диапазон страниц `[base, base + pages*4096)` из набора
+/// отслеживаемых регионов, разрезая любой частично перекрытый регион на выжившие
+/// поддиапазоны.
 fn cut_regions(regions: &mut Vec<MmapRegion>, base: u64, pages: u64) {
     let ustart = base;
     let uend = base + pages * PAGE_SIZE;
@@ -572,11 +584,11 @@ fn cut_regions(regions: &mut Vec<MmapRegion>, base: u64, pages: u64) {
         let rstart = r.base;
         let rend = r.base + r.pages * PAGE_SIZE;
         if rend <= ustart || rstart >= uend {
-            // No overlap: keep intact.
+            // Перекрытия нет: оставить целиком.
             out.push(r.clone());
             continue;
         }
-        // Surviving left sub-range.
+        // Выживший левый поддиапазон.
         if rstart < ustart {
             out.push(MmapRegion {
                 base: rstart,
@@ -588,8 +600,9 @@ fn cut_regions(regions: &mut Vec<MmapRegion>, base: u64, pages: u64) {
                 backing: r.backing.clone(),
             });
         }
-        // Surviving right sub-range: its first page maps a later file offset,
-        // so the backing's `file_offset` shifts by the bytes cut away.
+        // Выживший правый поддиапазон: его первая страница отображает более
+        // позднее смещение файла, поэтому `file_offset` backing'а сдвигается на
+        // отрезанные байты.
         if rend > uend {
             let shift = uend - rstart;
             out.push(MmapRegion {
@@ -609,9 +622,9 @@ fn cut_regions(regions: &mut Vec<MmapRegion>, base: u64, pages: u64) {
     *regions = out;
 }
 
-/// `mprotect` (10): change protection on a range of mapped user pages (R4.5), or
-/// `-ENOMEM` if any page in the range is not currently mapped (R4.8). An unaligned
-/// base is `-EINVAL`.
+/// `mprotect` (10): сменить защиту диапазона отображённых пользовательских
+/// страниц (R4.5) или `-ENOMEM`, если хоть одна страница диапазона сейчас не
+/// отображена (R4.8). Невыровненная база — `-EINVAL`.
 pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> Result<u64, Errno> {
     compat::with_current_compat(|cs| mprotect_impl(&mut cs.vm.lock(), addr, len, prot as u32))
         .unwrap_or(Err(Errno::EINVAL))
@@ -623,13 +636,14 @@ fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result
         return Ok(0);
     }
 
-    // Coverage check: every page in the range must be mapped in the caller's
-    // address space. Most pages are tracked as mmap regions or the brk heap,
-    // but the ELF loader maps PT_LOAD segments (and glibc's ld.so reprotects
-    // its RELRO segment) without a VmRegionSet entry; a resident PTE is just as
-    // real a mapping, so fall back to the page tables instead of answering
-    // ENOMEM. glibc reports that failure as "cannot apply additional memory
-    // protection after relocation", which is how fastfetch failed to start.
+    // Проверка покрытия: каждая страница диапазона должна быть отображена в
+    // адресном пространстве вызывающего. Большинство страниц отслеживаются как
+    // mmap-регионы или куча brk, но ELF-загрузчик отображает PT_LOAD-сегменты (а
+    // ld.so из glibc перезащищает свой RELRO-сегмент) без записи в VmRegionSet;
+    // резидентный PTE — такое же реальное отображение, поэтому откатываемся к
+    // таблицам страниц вместо ответа ENOMEM. glibc сообщает этот отказ как
+    // "cannot apply additional memory protection after relocation", и fastfetch
+    // не стартовал именно так.
     {
         let mut covered = vm.mmaps.clone();
         if vm.current_brk > vm.brk_lazy_from {
@@ -644,9 +658,9 @@ fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result
             });
         }
         let region_rejected = matches!(plan_munmap(addr, len, &covered), MunmapPlan::Reject(_));
-        // A page is acceptable when the region planner covers it OR when it is
-        // actually mapped (loader/stack/other PTEs). ENOMEM means at least one
-        // page is genuinely absent.
+        // Страница приемлема, когда её покрывает планировщик регионов ИЛИ она
+        // реально отображена (PTE загрузчика/стека/иные). ENOMEM означает, что
+        // хотя бы одна страница действительно отсутствует.
         let unmapped = (0..pages)
             .filter(|i| vmm::virt_to_phys(addr + i * PAGE_SIZE).is_none())
             .count();
@@ -657,54 +671,55 @@ fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result
 
     let (writable, nx) = prot_to_flags(prot);
     let prot_none = prot == 0;
-    // Second pass: only resident pages change hardware state. PROT_NONE drops
-    // the PTE entirely (a later touch must SIGSEGV, not re-back the page);
-    // everything else is re-mapped in place with the new bits.
+    // Второй проход: аппаратное состояние меняют только резидентные страницы.
+    // PROT_NONE полностью убирает PTE (последующее касание обязано дать SIGSEGV,
+    // а не заново подпереть страницу); всё остальное переотображается на месте с
+    // новыми битами.
     for i in 0..pages {
         let page = addr + i * PAGE_SIZE;
-        // `user_pages` already proved the whole span is below `USER_ADDR_MAX`;
-        // the check is repeated so the invariant lives next to the page-table
-        // calls that depend on it. A kernel frame must never be unmapped, freed
-        // (PROT_NONE path: PMM UAF) or re-mapped with user flags here.
+        // `user_pages` уже доказал, что весь диапазон ниже `USER_ADDR_MAX`;
+        // проверка повторяется, чтобы инвариант жил рядом с вызовами таблиц
+        // страниц, которые на него опираются. Ядерный кадр здесь нельзя снять с
+        // отображения, освободить (путь PROT_NONE: UAF PMM) или переотобразить с
+        // пользовательскими флагами.
         if page >= USER_ADDR_MAX {
             return Err(Errno::EINVAL);
         }
         if vmm::virt_to_phys(page).is_some() {
             if prot_none {
-                // PROT_NONE drops the translation; a COW-shared frame is
-                // unref'd (freed only when this was the last sharer), never
-                // freed unconditionally.
+                // PROT_NONE убирает трансляцию; COW-разделённый кадр делает unref
+                // (освобождается, только когда это был последний шарящий), никогда
+                // не освобождается безусловно.
                 let _ = vmm::release_user_leaf(page);
             } else {
-                // Raw leaf flags (`page_flags` intersects the whole walk and
-                // therefore masks software leaf-only bits like COW_BIT; the
-                // ownership marker must be read from the leaf PTE itself).
+                // Сырые флаги листа (`page_flags` пересекает весь обход и потому
+                // маскирует программные листовые биты вроде COW_BIT; маркер
+                // владения нужно читать из самого листового PTE).
                 let Some(old_flags) = vmm::walk_pte(page).map(|pte| pte.flags()) else {
                     continue;
                 };
-                // A COW leaf stays shared: keep its marker and never install
-                // hardware write access to a frame another address space still
-                // maps. Write permission is granted by the next write fault,
-                // which copies the page private (cow_copy_page) and restores
-                // WRITABLE on the private copy only.
+                // COW-лист остаётся разделяемым: сохранить его маркер и никогда не
+                // ставить аппаратную запись в кадр, который всё ещё отображает
+                // другое адресное пространство. Право записи выдаёт следующий write
+                // fault, копирующий страницу приватно (cow_copy_page) и
+                // восстанавливающий WRITABLE только на приватной копии.
                 let mut new_flags = leaf_flags(writable, nx);
                 if old_flags.contains(vmm::COW_BIT) {
                     new_flags |= vmm::COW_BIT;
                     new_flags = new_flags - PageTableFlags::WRITABLE;
-                    // Record the MAPPING's write permission on the shared
-                    // leaf: `RO_BIT` is what tells the next write fault
-                    // "the mapping denies write -> SIGSEGV" instead of
-                    // "COW write pending -> copy the page private"
-                    // (F-r3-arch-3(a): mprotect(PROT_READ) used to be
-                    // advisory on every fork-shared page).
+                    // Записать право записи ОТОБРАЖЕНИЯ на разделяемом листе:
+                    // `RO_BIT` — это то, что говорит следующему write fault «карта
+                    // запрещает запись -> SIGSEGV» вместо «COW-запись отложена ->
+                    // скопировать страницу приватно» (mprotect(PROT_READ) раньше был
+                    // совещательным для каждой fork-разделённой страницы).
                     if writable {
                         new_flags = new_flags - vmm::RO_BIT;
                     } else {
                         new_flags |= vmm::RO_BIT;
                     }
                 }
-                // Re-flag in place: same frame, no PMM allocation, so an OOM
-                // cannot leave half the range detached.
+                // Переставить флаги на месте: тот же кадр, без аллокации PMM,
+                // поэтому OOM не может оставить половину диапазона отцепленной.
                 let _ = vmm::set_user_leaf_flags(page, new_flags);
             }
         }
@@ -714,23 +729,23 @@ fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result
     Ok(0)
 }
 
-/// Refresh the tracked protection of the region bytes `mprotect` covers,
-/// splitting any region the span only partially overlaps into its
-/// before/covered/after sub-ranges.
+/// Обновить отслеживаемую защиту байтов региона, покрытых `mprotect`, разрезая
+/// регион, который диапазон перекрывает лишь частично, на поддиапазоны
+/// до/покрытый/после.
 ///
-/// The page tables are always updated above, but the bookkeeping matters for
-/// pages that are NOT resident yet: the page-fault handler backs an anonymous
-/// page with `leaf_flags(r.writable, r.nx)` and treats `r.prot == 0` as a true
-/// `PROT_NONE` fault. The previous "only fully-covered regions" rule left a
-/// partially covered region entirely stale, so `mprotect(page, PAGE,
-/// PROT_NONE)` on the first page of an 8-page mapping dropped the PTE (correct)
-/// and then the next touch re-mapped that page **writable** from the old
-/// region record (round-3 F-r3-arch-3(b)). Splitting makes the record match the
-/// bytes the syscall actually reprotected.
+/// Таблицы страниц всегда обновляются выше, но учёт важен для ещё НЕ резидентных
+/// страниц: обработчик page fault подпирает анонимную страницу
+/// `leaf_flags(r.writable, r.nx)` и трактует `r.prot == 0` как настоящий
+/// `PROT_NONE`-отказ. Прежнее правило «только полностью покрытые регионы»
+/// оставляло частично покрытый регион полностью устаревшим, поэтому
+/// `mprotect(page, PAGE, PROT_NONE)` на первой странице 8-страничного отображения
+/// снимал PTE (верно), а следующее касание переотображало эту страницу
+/// **записываемой** из старой записи региона. Разрезание приводит запись в
+/// соответствие байтам, которые syscall реально перезащитил.
 ///
-/// The right-hand sub-range of a file-backed region keeps mapping the same file
-/// bytes, so its `backing.file_offset` shifts by the bytes spliced in front of
-/// it — the same rule [`cut_regions`] uses for `munmap`.
+/// Правый поддиапазон file-backed региона продолжает отображать те же байты
+/// файла, поэтому его `backing.file_offset` сдвигается на вставленные перед ним
+/// байты — то же правило, что использует [`cut_regions`] для `munmap`.
 fn update_region_flags(
     regions: &mut Vec<MmapRegion>,
     base: u64,
@@ -749,11 +764,11 @@ fn update_region_flags(
         let rstart = r.base;
         let rend = r.base.saturating_add(r.pages.saturating_mul(PAGE_SIZE));
         if rend <= ustart || rstart >= uend {
-            // No overlap: unchanged.
+            // Перекрытия нет: без изменений.
             out.push(r.clone());
             continue;
         }
-        // Surviving left sub-range keeps the old protection.
+        // Выживший левый поддиапазон сохраняет старую защиту.
         if rstart < ustart {
             out.push(MmapRegion {
                 base: rstart,
@@ -765,9 +780,9 @@ fn update_region_flags(
                 backing: r.backing.clone(),
             });
         }
-        // The covered middle gets the new protection. For a file-backed region
-        // its first page maps a later file offset, so `backing` shifts by the
-        // bytes now in front of it.
+        // Покрытая середина получает новую защиту. У file-backed региона её первая
+        // страница отображает более позднее смещение файла, поэтому `backing`
+        // сдвигается на байты, оказавшиеся теперь перед ней.
         let mstart = core::cmp::max(rstart, ustart);
         let mend = core::cmp::min(rend, uend);
         out.push(MmapRegion {
@@ -782,8 +797,8 @@ fn update_region_flags(
                 b
             }),
         });
-        // Surviving right sub-range keeps the old protection and its shifted
-        // file offset.
+        // Выживший правый поддиапазон сохраняет старую защиту и свой сдвинутый
+        // offset файла.
         if rend > uend {
             out.push(MmapRegion {
                 base: uend,
@@ -802,51 +817,51 @@ fn update_region_flags(
     *regions = out;
 }
 
-/// Write-fault on a present page: copy-on-write service. The leaf must be
-/// COW-shared (`COW_BIT`, left by [`crate::memory::vmm::fork_user_space_cow`])
-/// AND its mapping must allow writing: `mprotect(PROT_READ)` on a shared page
-/// marks the leaf read-only (`RO_BIT`), so a write there still SIGSEGVs
-/// instead of becoming a private writable copy. Works for ring-3 faults and
-/// kernel-mode faults on user addresses (`copy_out` over a fork-shared
-/// buffer).
+/// Write-fault на присутствующей странице: обслуживание copy-on-write. Лист
+/// обязан быть COW-разделённым (`COW_BIT`, оставленный
+/// [`crate::memory::vmm::fork_user_space_cow`]) И его отображение обязано разрешать
+/// запись: `mprotect(PROT_READ)` на разделяемой странице помечает лист read-only
+/// (`RO_BIT`), поэтому запись туда всё равно даёт SIGSEGV, а не приватную
+/// записываемую копию. Работает и для отказов ring 3, и для отказов режима ядра на
+/// пользовательских адресах (`copy_out` по fork-разделённому буферу).
 fn handle_cow_fault(addr: u64, caused_by_write: bool) -> bool {
     if !caused_by_write || compat::compat_lock_held() {
         return false;
     }
-    // `cow_copy_page` itself validates both markers: a present read-only page
-    // without `COW_BIT` (ELF text/rodata, PROT_READ mmap) and a COW leaf
-    // whose mapping denies write (`RO_BIT`) both return false and keep the
-    // SIGSEGV path. Gating on VMA bookkeeping here was wrong: the user stack,
-    // thread stacks and fork-shared heap pages are real writable mappings
-    // that `fork_user_space_cow` turns read-only, and a bookkeeping miss
-    // killed fastfetch in both the child and the parent immediately after
-    // fork. The per-leaf marker is the authoritative answer.
+    // `cow_copy_page` сам проверяет оба маркера: присутствующая read-only
+    // страница без `COW_BIT` (текст/rodata ELF, PROT_READ mmap) и COW-лист, чьё
+    // отображение запрещает запись (`RO_BIT`), — обе дают false и сохраняют путь
+    // SIGSEGV. Гейт по учёту VMA здесь был ошибкой: пользовательский стек, стеки
+    // потоков и fork-разделённые страницы кучи — настоящие записываемые
+    // отображения, которые `fork_user_space_cow` делает read-only, и промах учёта
+    // убивал fastfetch и в ребёнке, и в родителе сразу после fork. Авторитетный
+    // ответ — маркер на листе.
     let page = addr & !(PAGE_SIZE - 1);
     crate::memory::vmm::cow_copy_page(page)
 }
 
-/// Back the page at `addr` on demand (anonymous `mmap` regions and the `brk`
-/// heap). Called from the #PF handler for every page fault, before any
-/// diagnostic/SIGSEGV path.
+/// Подпереть страницу по `addr` по требованию (анонимные `mmap`-регионы и куча
+/// `brk`). Вызывается обработчиком #PF на каждом page fault, до любого
+/// диагностического/SIGSEGV-пути.
 ///
-/// Returns `true` when the fault was serviced: a zero frame was mapped with
-/// the region's protection bits and the faulting instruction may simply retry.
-/// Returns `false` when the address is not lazily servable — the caller's
-/// existing SIGSEGV/diagnostic path applies:
+/// Возвращает `true`, когда отказ обслужен: отображён нулевой кадр с битами защиты
+/// региона, и инструкция с отказом может просто повториться. `false`, когда адрес
+/// необслуживаем лениво — применяется существующий путь SIGSEGV/диагностики
+/// вызывающего:
 ///
-///   * a PROTECTION_VIOLATION fault (page present, access type bad — NX/RO
-///     violations must SIGSEGV; COW will hook here later);
-///   * an address at or above `USER_ADDR_MAX` (kernel-side wild pointer);
-///   * a page inside a `PROT_NONE` region (stack guard semantics);
-///   * a page inside an eager (file-backed) region — those are always fully
-///     mapped, so a missing PTE is a kernel bug;
-///   * an address covered by no region and outside the brk heap.
+///   * отказ PROTECTION_VIOLATION (страница присутствует, тип доступа плохой —
+///     нарушения NX/RO обязаны дать SIGSEGV; COW подключится здесь позже);
+///   * адрес на `USER_ADDR_MAX` или выше (дикий указатель ядра);
+///   * страница внутри `PROT_NONE`-региона (семантика stack guard);
+///   * страница внутри жадного (file-backed) региона — они всегда отображены
+///     полностью, поэтому отсутствующий PTE — ошибка ядра;
+///   * адрес не покрыт ни одним регионом и вне кучи brk.
 ///
-/// Contract with the syscall layer (see the module docs): kernel code never
-/// touches user memory while holding the compat registry lock, so this handler
-/// can always take that lock. `compat::compat_lock_held()` is the tripwire for
-/// violations of that rule — such a fault is reported as a segfault instead of
-/// deadlocking the CPU on a non-reentrant spinlock.
+/// Контракт со слоем syscall (см. doc модуля): код ядра никогда не трогает память
+/// пользователя под compat-локом реестра, поэтому этот обработчик всегда может
+/// взять лок. `compat::compat_lock_held()` — растяжка нарушений этого правила:
+/// такой отказ сообщается как segfault, а не блокирует CPU на нереентерабельном
+/// спинлоке.
 pub fn handle_user_page_fault(
     addr: u64,
     protection_violation: bool,
@@ -868,16 +883,16 @@ pub fn handle_user_page_fault(
     let page = addr & !(PAGE_SIZE - 1);
     compat::with_current_compat(|cs| {
         let vm = &mut cs.vm.lock();
-        // brk heap: pages in [brk_lazy_from, page_up(current_brk)) are backed
-        // on first touch, always writable + NX.
+        // Куча brk: страницы в [brk_lazy_from, page_up(current_brk)) подпираются
+        // по первому касанию, всегда writable + NX.
         let brk_end = vm.current_brk.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         if page >= vm.brk_lazy_from && page < brk_end {
             if vmm::virt_to_phys(page).is_some() {
-                return true; // resident again (shrink/grow race); retry
+                return true; // снова резидентна (гонка сжатия/роста); повтор
             }
             return map_zeroed_range(page, page + PAGE_SIZE, leaf_flags(true, true));
         }
-        // Tracked mmap regions.
+        // Отслеживаемые mmap-регионы.
         let Some(r) = vm
             .mmaps
             .iter()
@@ -886,16 +901,16 @@ pub fn handle_user_page_fault(
             return false;
         };
         if r.prot == 0 {
-            // PROT_NONE (e.g. a thread-stack guard page): a touch is a
-            // genuine SIGSEGV, never a mapping opportunity.
+            // PROT_NONE (например, guard-страница стека потока): касание — это
+            // настоящий SIGSEGV, а не повод для отображения.
             return false;
         }
         if vmm::virt_to_phys(page).is_some() {
-            return true; // already resident; retry
+            return true; // уже резидентна; повтор
         }
         if !r.anon {
-            // File-backed regions are eagerly mapped; a missing PTE here is a
-            // kernel bug, not a lazy-mapping case.
+            // File-backed регионы отображены жадно; отсутствующий PTE здесь —
+            // ошибка ядра, а не ленивое отображение.
             crate::error!(
                 "[PF] missing PTE in eager file-backed region base=0x{:x} addr=0x{:x}",
                 r.base,

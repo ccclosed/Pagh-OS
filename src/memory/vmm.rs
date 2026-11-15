@@ -1,5 +1,4 @@
-// memory/vmm.rs — 4-level paging (Virtual Memory Manager)
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// memory/vmm.rs — 4-уровневый paging (Virtual Memory Manager).
 
 use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -8,23 +7,23 @@ use x86_64::structures::paging::page_table::{PageTableEntry, PageTableIndex};
 use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
 use x86_64::{PhysAddr, VirtAddr};
 
-/// Typed errors returned by the virtual memory manager.
+/// Типизированные ошибки менеджера виртуальной памяти.
 ///
-/// Replaces the previous ad-hoc `&'static str` errors so callers can match on
-/// the failure mode instead of comparing strings.
+/// Заменяют прежние ad-hoc `&'static str`, чтобы вызывающие могли
+/// сопоставлять вид отказа вместо сравнения строк.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmError {
-    /// The PMM had no free frame to back an intermediate page table.
+    /// У PMM не нашлось свободного кадра под промежуточную таблицу страниц.
     OutOfMemory,
-    /// An entry along the page-table walk was not present.
+    /// Одна из записей на пути обхода таблиц страниц отсутствует.
     NotMapped,
-    /// The requested physical range is not addressable (implausible base, or a
-    /// virtual address the HHDM window cannot reach).
+    /// Запрошенный физический диапазон недостижим (неправдоподобная база или
+    /// виртуальный адрес, до которого окно HHDM не достаёт).
     InvalidAddress,
-    /// A leaf PTE is COW-shared and the operation would overwrite it or grant
-    /// hardware write access to the shared frame. Detaching it must go through
-    /// [`release_user_leaf`]/[`cow_copy_page`], which keep the PMM reference
-    /// count correct.
+    /// Листовой PTE разделён по COW, а операция перезаписала бы его или дала
+    /// аппаратную запись в разделяемый кадр. Отцеплять его нужно через
+    /// [`release_user_leaf`]/[`cow_copy_page`], которые сохраняют счётчик ссылок
+    /// PMM корректным.
     CowShared,
 }
 
@@ -40,13 +39,14 @@ impl core::fmt::Display for VmError {
     }
 }
 
-/// Physical address of the kernel/boot PML4, captured at `init` (before any
-/// user address space exists, CR3 still holds the boot table). Exit cleanup
-/// uses this to tell the shared kernel PML4 — which must NEVER be torn down —
-/// apart from the per-process user PML4s created by the loader and `fork`.
+/// Физический адрес PML4 ядра/загрузки, снятый в `init` (до появления любого
+/// пользовательского адресного пространства, когда CR3 ещё содержит загрузочную
+/// таблицу). Очистка при выходе использует его, чтобы отличить общий PML4 ядра —
+/// который сносить НЕЛЬЗЯ НИКОГДА — от per-process пользовательских PML4,
+/// созданных загрузчиком и `fork`.
 static KERNEL_PML4: AtomicU64 = AtomicU64::new(0);
 
-/// Initialize the VMM. Stores the Limine HHDM offset.
+/// Инициализировать VMM. Сохраняет HHDM-смещение Limine.
 pub fn init(hhdm_offset: u64) {
     crate::HHDM_OFFSET.store(hhdm_offset, Ordering::Relaxed);
     KERNEL_PML4.store(current_pml4_phys(), Ordering::Relaxed);
@@ -58,44 +58,44 @@ pub fn init(hhdm_offset: u64) {
     );
 }
 
-/// Physical address of the shared kernel PML4 (captured at boot).
+/// Физический адрес общего PML4 ядра (снят при загрузке).
 pub fn kernel_pml4_phys() -> u64 {
     KERNEL_PML4.load(Ordering::Relaxed)
 }
 
-/// Convert a physical address to a virtual address via HHDM.
+/// Перевести физический адрес в виртуальный через HHDM.
 pub fn phys_to_virt(phys: u64) -> u64 {
     phys + crate::HHDM_OFFSET.load(Ordering::Relaxed)
 }
 
-/// Get the *active* PML4 physical address by reading CR3.
+/// Получить физический адрес *активного* PML4, прочитав CR3.
 ///
-/// This reads the live CR3 rather than a cached static, so page-table walks
-/// (`map`/`unmap`/`virt_to_phys`) always target the address space that is
-/// actually installed. This matters for user processes: while a ring-3 task is
-/// current, CR3 holds its user PML4, and mapping/translation must operate on
-/// that PML4 (not the kernel PML4). At boot — and whenever a kernel thread is
-/// current — CR3 holds the kernel PML4, so the result is unchanged from the
-/// previous cached-static behaviour.
+/// Читается живой CR3, а не кэш из static, поэтому обходы таблиц
+/// (`map`/`unmap`/`virt_to_phys`) всегда целятся в реально установленное
+/// адресное пространство. Это важно для пользовательских процессов: пока
+/// текущая ring-3 задача, CR3 содержит её пользовательский PML4, и
+/// отображение/трансляция должны работать с ним (а не с PML4 ядра). При
+/// загрузке — и всегда, когда текущий поток ядерный — CR3 содержит PML4 ядра,
+/// так что результат совпадает с прежним поведением кэша-static.
 pub fn current_pml4_phys() -> u64 {
-    // SAFETY: Reading CR3 is a side-effect-free privileged read; always valid.
+    // SAFETY: чтение CR3 — привилегированное чтение без побочных эффектов; валидно всегда.
     let (cr3_frame, _): (PhysFrame, _) = x86_64::registers::control::Cr3::read();
     cr3_frame.start_address().as_u64()
 }
 
-/// Reload CR3 with the page table at physical address `phys`.
+/// Перезагрузить CR3 таблицей страниц по физическому адресу `phys`.
 ///
-/// This is the SINGLE place in the kernel that writes CR3 on a context switch
-/// (Requirement 11.5). Both the preemptive tick path (`scheduler_tick_irq`) and
-/// the cooperative `yield_current` path call through here, so there is exactly
-/// one CR3 reload site. The write is unconditional: rewriting CR3 with the same
-/// or a new PML4 also flushes the non-global TLB, ensuring the next task's stack
-/// and address-space mappings are reloaded.
+/// Единственное место в ядре, которое пишет CR3 при переключении контекста
+/// (Requirement 11.5). И путь вытесняющего тика (`scheduler_tick_irq`), и
+/// кооперативный `yield_current` идут через него, поэтому точка перезагрузки
+/// CR3 ровно одна. Запись безусловная: перезапись CR3 тем же или новым PML4
+/// также сбрасывает неглобальный TLB, гарантируя перезагрузку отображений
+/// стека и адресного пространства следующей задачи.
 ///
 /// # Safety
-/// `phys` must be the physical base address of a valid, fully-initialized PML4
-/// containing the kernel higher-half mappings. Loading a malformed table will
-/// fault on the next memory access.
+/// `phys` обязан быть физической базой валидного, полностью инициализированного
+/// PML4 с ядерными отображениями верхней половины. Загрузка испорченной таблицы
+/// упадёт на следующем обращении к памяти.
 #[inline]
 pub unsafe fn load_cr3(phys: u64) {
     x86_64::registers::control::Cr3::write(
@@ -104,50 +104,52 @@ pub unsafe fn load_cr3(phys: u64) {
     );
 }
 
-/// A safe abstraction over the recursive page-table walk.
+/// Безопасная абстракция над рекурсивным обходом таблиц страниц.
 ///
-/// All of the raw `unsafe` needed to turn an HHDM-mapped physical address into a
-/// `&PageTable`/`&mut PageTable` is confined to this type's `table`/`table_mut`
-/// helpers. Callers in `map`/`unmap`/`virt_to_phys` therefore read as safe code.
+/// Весь сырой `unsafe`, нужный, чтобы превратить HHDM-отображённый физический
+/// адрес в `&PageTable`/`&mut PageTable`, заперт в хелперах `table`/`table_mut`
+/// этого типа. Вызывающие в `map`/`unmap`/`virt_to_phys` поэтому выглядят как
+/// безопасный код.
 struct PageTableWalker {
     hhdm: u64,
 }
 
 impl PageTableWalker {
-    /// Construct a walker bound to the active HHDM offset.
+    /// Создать обходчик, привязанный к активному HHDM-смещению.
     fn new() -> Self {
         Self {
             hhdm: crate::HHDM_OFFSET.load(Ordering::Relaxed),
         }
     }
 
-    /// Borrow the page table located at physical address `phys`.
+    /// Позаимствовать таблицу страниц по физическому адресу `phys`.
     fn table(&self, phys: u64) -> &'static PageTable {
-        // SAFETY: Every page-table frame is mapped into the HHDM window by
-        // Limine, so `phys + hhdm` is a valid, aligned, readable pointer to a
-        // `PageTable` for the lifetime of the kernel's address space.
+        // SAFETY: каждый кадр таблицы страниц отображён Limine в окно HHDM,
+        // поэтому `phys + hhdm` — валидный, выровненный, читаемый указатель на
+        // `PageTable` на всё время жизни адресного пространства ядра.
         unsafe { &*((phys + self.hhdm) as *const PageTable) }
     }
 
-    /// Mutably borrow the page table located at physical address `phys`.
+    /// Изменяемо позаимствовать таблицу страниц по физическому адресу `phys`.
     fn table_mut(&self, phys: u64) -> &'static mut PageTable {
-        // SAFETY: Same HHDM-validity invariant as `table`. Each level of the
-        // walk points at a distinct frame, so the `'static mut` references handed
-        // out for successive levels never alias the same memory.
+        // SAFETY: тот же инвариант валидности HHDM, что у `table`. Каждый
+        // уровень обхода указывает на отдельный кадр, поэтому `'static mut`,
+        // выданные для последовательных уровней, никогда не алиасят одну память.
         unsafe { &mut *((phys + self.hhdm) as *mut PageTable) }
     }
 
-    /// The active PML4 (read-only).
+    /// Активный PML4 (только чтение).
     fn root(&self) -> &'static PageTable {
         self.table(current_pml4_phys())
     }
 
-    /// The active PML4 (mutable).
+    /// Активный PML4 (изменяемо).
     fn root_mut(&self) -> &'static mut PageTable {
         self.table_mut(current_pml4_phys())
     }
 
-    /// Follow a present entry to the next-level table, or `None` if absent.
+    /// Проследовать по присутствующей записи к таблице следующего уровня или
+    /// `None`, если её нет.
     fn next_mut(&self, entry: &PageTableEntry) -> Option<&'static mut PageTable> {
         if !entry.flags().contains(PageTableFlags::PRESENT) {
             return None;
@@ -155,34 +157,34 @@ impl PageTableWalker {
         Some(self.table_mut(entry.addr().as_u64()))
     }
 
-    /// Ensure an intermediate table exists at `table[idx]`, allocating and
-    /// zeroing a fresh frame from the PMM when the entry is absent, then return
-    /// the next-level table.
+    /// Убедиться, что промежуточная таблица существует по `table[idx]`,
+    /// выделив и обнулив свежий кадр из PMM при отсутствии записи, затем вернуть
+    /// таблицу следующего уровня.
     ///
-    /// # Intermediate-entry flag policy
+    /// # Политика флагов промежуточных записей
     ///
-    /// An intermediate PML4/PDPT/PD entry is *not* a leaf mapping — it only
-    /// points at the next-level table — so it must carry the minimal flags that
-    /// keep the whole sub-tree usable rather than the leaf's flags:
+    /// Промежуточная запись PML4/PDPT/PD — *не* листовое отображение, она лишь
+    /// указывает на таблицу следующего уровня, поэтому должна нести минимальные
+    /// флаги, сохраняющие работоспособность всего поддерева, а не флаги листа:
     ///
-    /// - It is always `PRESENT | WRITABLE`. Writability on an intermediate does
-    ///   not by itself make any leaf writable (the leaf PTE governs that), and
-    ///   forcing it writable keeps later writable leaf mappings under the same
-    ///   intermediate working.
-    /// - `USER_ACCESSIBLE` is propagated *iff* the leaf mapping requested it
-    ///   (`leaf_flags & USER_ACCESSIBLE`). This satisfies Property 4: every
-    ///   intermediate on a `USER_ACCESSIBLE` page's walk must also carry
-    ///   `USER_ACCESSIBLE`, or the CPU denies ring-3 access to the leaf.
-    /// - Leaf-only flags (`NO_EXECUTE`, `NO_CACHE`, `HUGE_PAGE`, `GLOBAL`) and
-    ///   the leaf's physical address are deliberately *not* propagated. An NX
-    ///   bit on a higher-level entry disables execution for the entire sub-tree,
-    ///   and `NO_CACHE` on an intermediate would needlessly mark sibling
-    ///   mappings uncacheable — both would poison unrelated mappings.
+    /// - Всегда `PRESENT | WRITABLE`. Записываемость промежуточной записи сама
+    ///   по себе не делает лист записываемым (этим управляет листовой PTE), а её
+    ///   принудительная установка сохраняет работу будущих записываемых листьев
+    ///   под тем же узлом.
+    /// - `USER_ACCESSIBLE` распространяется *только если* его запросил лист
+    ///   (`leaf_flags & USER_ACCESSIBLE`). Это выполняет Property 4: каждая
+    ///   промежуточная запись на пути к `USER_ACCESSIBLE`-странице тоже должна
+    ///   нести `USER_ACCESSIBLE`, иначе CPU откажет ring 3 в доступе к листу.
+    /// - Листовые флаги (`NO_EXECUTE`, `NO_CACHE`, `HUGE_PAGE`, `GLOBAL`) и
+    ///   физический адрес листа намеренно *не* распространяются. NX на записи
+    ///   верхнего уровня отключает исполнение для всего поддерева, а `NO_CACHE`
+    ///   на промежуточной сделал бы соседние отображения некешируемыми — оба
+    ///   отравили бы посторонние отображения.
     ///
-    /// When the intermediate already exists, it is *upgraded* to
-    /// `USER_ACCESSIBLE` if the new leaf mapping needs it but the existing entry
-    /// (e.g. first created for a kernel mapping) lacks it, preserving the entry's
-    /// existing address and other flags.
+    /// Если промежуточная запись уже есть, она *повышается* до
+    /// `USER_ACCESSIBLE`, когда это нужно новому листу, а существующая запись
+    /// (например, созданная сначала под ядерное отображение) его не имеет;
+    /// адрес и прочие флаги записи сохраняются.
     fn ensure_next(
         &self,
         table: &mut PageTable,
@@ -190,33 +192,34 @@ impl PageTableWalker {
         flags: PageTableFlags,
         level: EntryLevel,
     ) -> Result<&'static mut PageTable, VmError> {
-        // Flags an intermediate entry should carry: present + writable, plus
-        // user-accessibility only when the leaf mapping requested it.
+        // Флаги, которые должна нести промежуточная запись: present + writable
+        // плюс доступность пользователю, только если её запросил лист.
         let user = flags & PageTableFlags::USER_ACCESSIBLE;
         let intermediate_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | user;
 
-        // A HUGE PAGE here is not a page table.
+        // HUGE PAGE здесь — не таблица страниц.
         //
-        // Limine maps the HHDM with 2 MiB — and on some machines 1 GiB — pages,
-        // so a walk that reaches this level finds a present entry whose HUGE_PAGE
-        // bit is set and whose "frame address" is the start of a large region of
-        // RAM, not a table of 512 entries. Treating it as a table (the previous
-        // behaviour) walked into whatever bytes lived there and produced a
-        // non-canonical pointer — a GENERAL PROTECTION fault, not a page fault.
-        // That is what killed `map_mmio` on real hardware while QEMU, whose HHDM
-        // happened not to be covered by a huge page at that address, booted fine.
+        // Limine отображает HHDM страницами 2 МиБ (а на некоторых машинах
+        // 1 ГиБ), поэтому обход, дошедший до этого уровня, встречает
+        // присутствующую запись с битом HUGE_PAGE, чей «адрес кадра» — начало
+        // большого региона RAM, а не таблица из 512 записей. Отношение к ней как
+        // к таблице (прежнее поведение) заводило обход в произвольные байты и
+        // давало неканонический указатель — GENERAL PROTECTION fault, а не page
+        // fault. Именно это убивало `map_mmio` на реальном железе, тогда как
+        // QEMU, чей HHDM в этом месте не покрыт огромной страницей, грузился
+        // нормально.
         //
-        // The level decides what replaces it: a 2 MiB page becomes a full table
-        // of 4 KiB entries, a 1 GiB page becomes a table of 2 MiB huge entries
-        // (the next level down splits those again, on demand).
+        // Уровень решает, чем заменить: страница 2 МиБ становится полной
+        // таблицей записей 4 КиБ, страница 1 ГиБ — таблицей огромных записей
+        // 2 МиБ (следующий уровень при необходимости расщепит и их).
         if table[idx].flags().contains(PageTableFlags::HUGE_PAGE) {
             self.split_huge(table, idx, level)?;
         }
 
         if !table[idx].flags().contains(PageTableFlags::PRESENT) {
             let frame = crate::memory::pmm::alloc_frame().ok_or(VmError::OutOfMemory)?;
-            // SAFETY: `frame` was just allocated and is mapped via the HHDM, so
-            // this writes zeroes over exactly one owned, page-aligned frame.
+            // SAFETY: `frame` только что выделен и отображён через HHDM, поэтому
+            // эта запись обнуляет ровно один принадлежащий нам выровненный кадр.
             unsafe {
                 ptr::write_bytes((frame + self.hhdm) as *mut u8, 0, 4096);
             }
@@ -224,10 +227,11 @@ impl PageTableWalker {
         } else if user.contains(PageTableFlags::USER_ACCESSIBLE)
             && !table[idx].flags().contains(PageTableFlags::USER_ACCESSIBLE)
         {
-            // Upgrade case (Property 4): an intermediate first created for a
-            // kernel mapping must gain USER_ACCESSIBLE so a later user mapping
-            // beneath it is actually reachable from ring 3. Preserve the
-            // existing address and any other flags it already carries.
+            // Случай повышения (Property 4): промежуточная запись, созданная
+            // сначала под ядерное отображение, должна получить USER_ACCESSIBLE,
+            // чтобы более позднее пользовательское отображение под ней было
+            // реально достижимо из ring 3. Сохранить существующий адрес и все
+            // прочие уже установленные флаги.
             let addr = table[idx].addr();
             let upgraded = table[idx].flags() | PageTableFlags::USER_ACCESSIBLE;
             table[idx].set_addr(addr, upgraded);
@@ -235,14 +239,15 @@ impl PageTableWalker {
         Ok(self.table_mut(table[idx].addr().as_u64()))
     }
 
-    /// Replace a huge-page entry with a real page table covering the same memory.
+    /// Заменить запись огромной страницы настоящей таблицей страниц,
+    /// покрывающей ту же память.
     ///
-    /// `level` is the level of the entry being split: an entry in a PD (level
-    /// `Pd`) describes 2 MiB and is replaced by a PT of 4 KiB mappings; an entry
-    /// in a PDPT (`Pdpt`) describes 1 GiB and is replaced by a PD of 2 MiB huge
-    /// mappings. The huge page's own flags are copied into every leaf, so a
-    /// read-only or non-executable HHDM region keeps those properties — dropping
-    /// them would silently widen permissions on memory the kernel does not own.
+    /// `level` — уровень расщепляемой записи: запись в PD (`level` `Pd`)
+    /// описывает 2 МиБ и заменяется PT из отображений 4 КиБ; запись в PDPT
+    /// (`Pdpt`) описывает 1 ГиБ и заменяется PD из огромных отображений 2 МиБ.
+    /// Флаги самой огромной страницы копируются в каждый лист, поэтому
+    /// read-only или non-executable регион HHDM сохраняет свои свойства — их
+    /// потеря молча расширила бы права на память, которая ядру не принадлежит.
     fn split_huge(
         &self,
         table: &mut PageTable,
@@ -254,31 +259,31 @@ impl PageTableWalker {
         let leaf_flags = huge_flags & !PageTableFlags::HUGE_PAGE;
 
         let frame = crate::memory::pmm::alloc_frame().ok_or(VmError::OutOfMemory)?;
-        // SAFETY: `frame` is a freshly allocated, HHDM-mapped page owned by us.
+        // SAFETY: `frame` — свежевыделенная, отображённая через HHDM страница, принадлежащая нам.
         unsafe { ptr::write_bytes((frame + self.hhdm) as *mut u8, 0, 4096) };
 
-        // SAFETY: `frame` is our own HHDM-mapped page; the entries written to it
-        // reproduce exactly the region the huge entry described, so nothing that
-        // was mapped stops being mapped.
+        // SAFETY: `frame` — наша HHDM-отображённая страница; записываемые в неё
+        // записи точно воспроизводят регион, который описывала огромная
+        // запись, поэтому ничто отображённое не перестаёт быть отображённым.
         unsafe {
             let new_table = &mut *((frame + self.hhdm) as *mut PageTable);
             match level {
-                // 1 GiB entry -> 512 × 2 MiB entries (still huge, split later).
+                // Запись 1 ГиБ -> 512 записей 2 МиБ (всё ещё огромные, расщепятся позже).
                 EntryLevel::Pdpt => {
                     let sub = leaf_flags | PageTableFlags::HUGE_PAGE;
                     for i in 0..512usize {
                         new_table[i].set_addr(PhysAddr::new(base + (i as u64) * 0x20_0000), sub);
                     }
                 }
-                // 2 MiB entry -> 512 × 4 KiB entries.
+                // Запись 2 МиБ -> 512 записей 4 КиБ.
                 EntryLevel::Pd => {
                     for i in 0..512usize {
                         new_table[i]
                             .set_addr(PhysAddr::new(base + (i as u64) * 0x1000), leaf_flags);
                     }
                 }
-                // A huge page cannot legitimately appear at these levels; leaving
-                // the entry alone is safer than splitting something unknown.
+                // Огромная страница не может законно появиться на этих уровнях;
+                // оставить запись как есть безопаснее, чем расщеплять неизвестное.
                 EntryLevel::Pml4 | EntryLevel::Pt => {
                     crate::warn!("[VMM] unexpected huge page at {:?}; not splitting", level);
                     return Ok(());
@@ -291,10 +296,10 @@ impl PageTableWalker {
     }
 }
 
-/// Which level of the page-table hierarchy an entry belongs to.
+/// Уровень иерархии таблиц страниц, к которому принадлежит запись.
 ///
-/// Needed because the meaning of `HUGE_PAGE` depends on it: the bit is reserved
-/// in a PML4 and a PT entry, means 1 GiB in a PDPT entry and 2 MiB in a PD entry.
+/// Нужен потому, что смысл `HUGE_PAGE` зависит от него: бит зарезервирован в
+/// записи PML4 и PT, означает 1 ГиБ в записи PDPT и 2 МиБ в записи PD.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EntryLevel {
     Pml4,
@@ -303,7 +308,7 @@ enum EntryLevel {
     Pt,
 }
 
-/// Walk page tables to translate a virtual address to a physical address.
+/// Пройти таблицы страниц и перевести виртуальный адрес в физический.
 pub fn virt_to_phys(virt: u64) -> Option<u64> {
     let virt_addr = VirtAddr::new(virt);
     let p4_idx = virt_addr.p4_index();
@@ -325,9 +330,9 @@ pub fn virt_to_phys(virt: u64) -> Option<u64> {
         return None;
     }
 
-    // Check for 1GiB huge page
+    // Проверить огромную страницу 1 ГиБ
     if pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-        let offset = virt_addr.as_u64() & 0x3FFF_FFFF; // 1GiB - 1
+        let offset = virt_addr.as_u64() & 0x3FFF_FFFF; // 1 ГиБ - 1
         return Some(pdpt_entry.addr().as_u64() + offset);
     }
 
@@ -337,9 +342,9 @@ pub fn virt_to_phys(virt: u64) -> Option<u64> {
         return None;
     }
 
-    // Check for 2MiB huge page
+    // Проверить огромную страницу 2 МиБ
     if pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-        let offset = virt_addr.as_u64() & 0x1F_FFFF; // 2MiB - 1
+        let offset = virt_addr.as_u64() & 0x1F_FFFF; // 2 МиБ - 1
         return Some(pd_entry.addr().as_u64() + offset);
     }
 
@@ -349,13 +354,14 @@ pub fn virt_to_phys(virt: u64) -> Option<u64> {
         return None;
     }
 
-    let offset = virt_addr.as_u64() & 0xFFF; // 4KiB - 1
+    let offset = virt_addr.as_u64() & 0xFFF; // 4 КиБ - 1
     Some(pt_entry.addr().as_u64() + offset)
 }
 
-/// Return the effective leaf flags for a mapped virtual address.
-/// Every level must be present; user accessibility is intersected across the
-/// complete walk so a kernel-only ancestor cannot be mistaken for a user page.
+/// Вернуть эффективные флаги листа для отображённого виртуального адреса.
+/// Каждый уровень должен присутствовать; доступность пользователю пересекается
+/// по всему обходу, чтобы ядерный предок не был принят за пользовательскую
+/// страницу.
 pub fn page_flags(virt: u64) -> Option<PageTableFlags> {
     let va = VirtAddr::new(virt);
     let walker = PageTableWalker::new();
@@ -389,24 +395,24 @@ pub fn page_flags(virt: u64) -> Option<PageTableFlags> {
     Some(effective & p1e.flags())
 }
 
-/// Map a physical frame to a virtual page.
+/// Отобразить физический кадр в виртуальную страницу.
 ///
-/// Allocates intermediate page tables as needed via PMM.
-/// Exclusive upper bound of the lower-half user address range.
+/// При необходимости выделяет промежуточные таблицы через PMM.
+/// Исключающая верхняя граница пользовательского диапазона нижней половины.
 ///
-/// Mirrors `linux::validate::USER_ADDR_MAX` (which is `core`-only and
-/// host-testable, while this module is kernel-only). Keeping the value here lets
-/// [`map`] enforce the invariant "a kernel virtual address is never mapped
-/// `USER_ACCESSIBLE`" at the one place every mapping goes through, instead of
-/// trusting each caller's flags.
+/// Зеркалит `linux::validate::USER_ADDR_MAX` (тот модуль только `core` и
+/// host-тестируемый, а этот — ядерный). Держа значение здесь, [`map`] может
+/// обеспечить инвариант «ядерный виртуальный адрес никогда не отображается
+/// `USER_ACCESSIBLE`» в единственном месте, через которое проходят все
+/// отображения, вместо доверия флагам каждого вызывающего.
 const USER_ADDR_MAX: u64 = 0x0000_8000_0000_0000;
 
 pub fn map(phys_addr: u64, virt_addr: u64, flags: PageTableFlags) -> Result<(), VmError> {
-    // A `USER_ACCESSIBLE` leaf in the kernel half is always a bug: ring 3 could
-    // then read/write that kernel page (the F-LEAD-1 mprotect chain got exactly
-    // this by running its user-page flag builder over a kernel VA). Refuse it at
-    // the choke point; `mem_sys` also validates its ranges, so this is the
-    // defense-in-depth copy of the same rule.
+    // `USER_ACCESSIBLE`-лист в ядерной половине — всегда ошибка: ring 3 смог бы
+    // читать/писать эту ядерную страницу (так и произошло, когда построитель
+    // флагов пользовательской страницы прогнали по ядерному VA; см.
+    // `SECURITY.md`). Отказываем в узком месте; `mem_sys` тоже валидирует свои
+    // диапазоны, так что это эшелонированная копия того же правила.
     if virt_addr >= USER_ADDR_MAX && flags.contains(PageTableFlags::USER_ACCESSIBLE) {
         crate::error!(
             "[VMM] refusing USER_ACCESSIBLE mapping of kernel VA {:#x} (phys {:#x})",
@@ -420,37 +426,39 @@ pub fn map(phys_addr: u64, virt_addr: u64, flags: PageTableFlags) -> Result<(), 
 
     let walker = PageTableWalker::new();
 
-    // Walk (allocating intermediates) down to the PT. The walker confines all
-    // page-table-deref `unsafe`, so this reads as safe code.
+    // Обход (с выделением промежуточных таблиц) вниз до PT. Все сырые
+    // разыменования таблиц страниц заперты в обходчике, поэтому код выглядит
+    // безопасным.
     let pml4 = walker.root_mut();
     let pdpt = walker.ensure_next(pml4, virt.p4_index(), flags, EntryLevel::Pml4)?;
     let pd = walker.ensure_next(pdpt, virt.p3_index(), flags, EntryLevel::Pdpt)?;
     let pt = walker.ensure_next(pd, virt.p2_index(), flags, EntryLevel::Pd)?;
 
-    // Never silently overwrite a live translation.
+    // Никогда не перезаписывать живую трансляцию молча.
     //
-    // A present COW leaf is REFUSED: its frame is refcounted and another
-    // address space may still map it, so overwriting the PTE here either leaks
-    // that frame or (worse) installs a writable alias of memory this side no
-    // longer owns. Callers that replace a mapping must release it first
-    // (`release_user_leaf`) or copy it private (`cow_copy_page`).
+    // Присутствующий COW-лист ОТВЕРГАЕТСЯ: его кадр подсчитан, и другое
+    // адресное пространство может всё ещё отображать его, поэтому перезапись PTE
+    // либо утечёт кадр, либо (хуже) установит записываемый алиас памяти, которой
+    // эта сторона уже не владеет. Заменяющие отображение вызывающие обязаны
+    // сначала освободить его (`release_user_leaf`) или скопировать приватно
+    // (`cow_copy_page`).
     //
-    // A present non-COW PTE pointing at a *different* frame means two owners
-    // believe they own this virtual page: the old frame leaks and whoever still
-    // uses the old mapping is one re-allocation away from reading someone
-    // else's memory. Keep the historical overwrite but log it.
+    // Присутствующий не-COW PTE, указывающий на *другой* кадр, означает, что два
+    // владельца считают эту виртуальную страницу своей: старый кадр утекает, а
+    // тот, кто ещё использует старое отображение, в одной переаллокации от
+    // чтения чужой памяти. Сохраняем историческую перезапись, но логируем.
     {
         let entry = &pt[virt.p1_index()];
         if entry.flags().contains(PageTableFlags::PRESENT) {
             let old_flags = entry.flags();
             let old_phys = entry.addr().as_u64();
             if old_flags.contains(COW_BIT) {
-                // A COW leaf is shared with at least one other address space and
-                // its frame is refcounted in the PMM. Overwriting it here would
-                // either leak the old frame while another side keeps mapping it,
-                // or install write access to memory that is still shared — the
-                // F-r2-arch-1 UAF. Detach it through `release_user_leaf`, or
-                // copy it private first (`cow_copy_page`).
+                // COW-лист разделён хотя бы с одним другим адресным
+                // пространством, и его кадр подсчитан в PMM. Перезапись здесь
+                // либо утекла бы старый кадр, пока другая сторона продолжает его
+                // отображать, либо дала бы запись в ещё разделяемую память —
+                // use-after-free. Отцеплять через `release_user_leaf` или
+                // сначала скопировать приватно (`cow_copy_page`).
                 if old_phys != phys.as_u64()
                     || !flags.contains(COW_BIT)
                     || flags.contains(PageTableFlags::WRITABLE)
@@ -469,30 +477,30 @@ pub fn map(phys_addr: u64, virt_addr: u64, flags: PageTableFlags) -> Result<(), 
             }
         }
     }
-    // Set the PTE (Page Table Entry)
+    // Установить PTE (Page Table Entry)
     pt[virt.p1_index()].set_addr(phys, flags | PageTableFlags::PRESENT);
 
-    // Flush TLB for this virtual address
+    // Сбросить TLB для этого виртуального адреса
     tlb::flush(virt);
 
     Ok(())
 }
 
-/// Log the raw 4-level page-table walk for `virt_addr` in the
-/// *currently active* address space, one line per level, stopping at the first
-/// non-present entry. Post-mortem this distinguishes "a single PTE vanished"
-/// from "a whole intermediate table vanished" (e.g. its frame was
-/// double-allocated and zero-filled by another owner) - the two failure shapes
-/// point at different culprits.
-/// Return a copy of the leaf PTE for `virt_addr` in the CURRENT address
-/// space, if the whole walk is present. Used by the page-fault handler for
-/// copy-on-write diagnosis.
+/// Напечатать сырой 4-уровневый обход таблиц страниц для `virt_addr` в
+/// *текущем активном* адресном пространстве, по строке на уровень, до первой
+/// отсутствующей записи. В постмортеме это отличает «исчез один PTE» от
+/// «исчезла целая промежуточная таблица» (например, её кадр был дважды выделен и
+/// обнулён другим владельцем) — две картины отказа указывают на разных
+/// виновников.
+/// Вернуть копию листового PTE для `virt_addr` в ТЕКУЩЕМ адресном пространстве,
+/// если весь обход присутствует. Используется обработчиком page fault для
+/// диагностики copy-on-write.
 pub fn walk_pte(virt_addr: u64) -> Option<PageTableEntry> {
     const SHIFTS: [u64; 3] = [39, 30, 21];
     let mut table_phys = current_pml4_phys();
     for shift in SHIFTS {
         let idx = ((virt_addr >> shift) & 0x1ff) as usize;
-        // SAFETY: page-table frames are always readable through the HHDM.
+        // SAFETY: кадры таблиц страниц всегда читаемы через HHDM.
         let entry =
             unsafe { core::ptr::read_volatile((phys_to_virt(table_phys) as *const u64).add(idx)) };
         if entry & 1 == 0 {
@@ -501,7 +509,7 @@ pub fn walk_pte(virt_addr: u64) -> Option<PageTableEntry> {
         table_phys = entry & 0x000f_ffff_ffff_f000;
     }
     let idx = (virt_addr >> 12) & 0x1ff;
-    // SAFETY: as above.
+    // SAFETY: как выше.
     let pte = unsafe {
         core::ptr::read_volatile(
             (phys_to_virt(table_phys) as *const PageTableEntry).add(idx as usize),
@@ -519,7 +527,7 @@ pub fn dump_translation(virt_addr: u64) {
     let mut table_phys = current_pml4_phys();
     for level in 0..4 {
         let idx = ((virt_addr >> SHIFTS[level]) & 0x1ff) as usize;
-        // SAFETY: page-table frames are always readable through the HHDM.
+        // SAFETY: кадры таблиц страниц всегда читаемы через HHDM.
         let entry =
             unsafe { core::ptr::read_volatile((phys_to_virt(table_phys) as *const u64).add(idx)) };
         if entry & 1 == 0 {
@@ -542,13 +550,13 @@ pub fn dump_translation(virt_addr: u64) {
             table_phys
         );
         if level > 0 && level < 3 && entry & (1 << 7) != 0 {
-            return; // huge page - the walk legitimately ends here
+            return; // огромная страница — обход законно заканчивается здесь
         }
         table_phys = entry & 0x000f_ffff_ffff_f000;
     }
 }
 
-/// Unmap a virtual page.
+/// Снять отображение виртуальной страницы.
 pub fn unmap(virt_addr: u64) -> Result<(), VmError> {
     let virt = VirtAddr::new(virt_addr);
 
@@ -565,21 +573,21 @@ pub fn unmap(virt_addr: u64) -> Result<(), VmError> {
         .next_mut(&pd[virt.p2_index()])
         .ok_or(VmError::NotMapped)?;
 
-    // Clear the PTE
+    // Очистить PTE
     pt[virt.p1_index()].set_unused();
     tlb::flush(virt);
 
     Ok(())
 }
 
-/// Create a new PML4 table for a user process.
-/// Copies kernel higher-half mappings from the current PML4.
+/// Создать новый PML4 для пользовательского процесса.
+/// Копирует ядерные отображения верхней половины из текущего PML4.
 pub fn new_user_pml4() -> Result<u64, VmError> {
     let walker = PageTableWalker::new();
 
     let new_pml4_frame = crate::memory::pmm::alloc_frame().ok_or(VmError::OutOfMemory)?;
 
-    // Zero the new PML4, then copy the kernel higher-half entries (256..512).
+    // Обнулить новый PML4, затем скопировать ядерные записи верхней половины (256..512).
     let new_pml4 = walker.table_mut(new_pml4_frame);
     new_pml4.zero();
 
@@ -593,23 +601,23 @@ pub fn new_user_pml4() -> Result<u64, VmError> {
     Ok(new_pml4_frame)
 }
 
-/// Map a region of physical MMIO into the kernel address space as
-/// non-cacheable and return its virtual base address.
+/// Отобразить регион физического MMIO в адресное пространство ядра как
+/// некешируемый и вернуть его виртуальную базу.
 ///
-/// `len` bytes starting at `phys` are mapped page-by-page (rounded up to whole
-/// 4 KiB pages) with `PRESENT | WRITABLE | NO_CACHE | NO_EXECUTE`. MMIO is
-/// reached through the HHDM window (`virt = phys_to_virt(phys)`, the same
-/// convention as `crate::memory::layout::mmio_virt_for`), so the returned base
-/// matches how the LAPIC/IOAPIC MMIO is mapped today.
+/// `len` байт от `phys` отображаются постранично (с округлением до целых страниц
+/// 4 КиБ) с `PRESENT | WRITABLE | NO_CACHE | NO_EXECUTE`. MMIO достигается через
+/// окно HHDM (`virt = phys_to_virt(phys)`, то же соглашение, что у
+/// `crate::memory::layout::mmio_virt_for`), поэтому возвращённая база совпадает
+/// с тем, как сейчас отображено MMIO LAPIC/IOAPIC.
 ///
-/// MMIO is device memory: it is mapped `NO_CACHE` so writes/reads hit the
-/// device, `NO_EXECUTE` since it is never code, and is *never* `USER_ACCESSIBLE`
-/// — these regions belong to the kernel alone.
+/// MMIO — память устройства: отображается `NO_CACHE`, чтобы чтения/записи
+/// доходили до устройства, `NO_EXECUTE`, так как это никогда не код, и *никогда*
+/// не `USER_ACCESSIBLE` — эти регионы принадлежат только ядру.
 pub fn map_mmio(phys: u64, len: u64) -> Result<u64, VmError> {
     let page_size = 4096u64;
 
-    // Page-align the base down and the end up so the whole requested region is
-    // covered even when `phys`/`len` are not page-aligned.
+    // Выровнять базу вниз, конец вверх, чтобы весь запрошенный регион был
+    // покрыт, даже если `phys`/`len` не выровнены по странице.
     let start = phys & !(page_size - 1);
     let end = (phys + len + (page_size - 1)) & !(page_size - 1);
 
@@ -618,16 +626,16 @@ pub fn map_mmio(phys: u64, len: u64) -> Result<u64, VmError> {
         | PageTableFlags::NO_CACHE
         | PageTableFlags::NO_EXECUTE;
 
-    // Reject an address that cannot be mapped before walking the page tables.
+    // Отвергнуть адрес, который нельзя отобразить, до обхода таблиц страниц.
     //
-    // WHY: on a real machine `apic::init` took the LAPIC address from the MADT
-    // and called this, and the boot died with a GENERAL PROTECTION fault inside
-    // `map` — not a page fault. A #GP there means the computed virtual address
-    // was non-canonical, which can only happen if the physical base is garbage:
-    // a bogus BAR/MADT value such as all-ones makes `phys + hhdm` overflow into
-    // the non-canonical hole. Reporting the value beats faulting inside the page
-    // walker, where the address is long gone.
-    const MAX_PHYS: u64 = 0x0000_FFFF_FFFF_FFFF; // 52-bit physical address space
+    // ПОЧЕМУ: на реальной машине `apic::init` брал адрес LAPIC из MADT и звал
+    // это, и загрузка умирала с GENERAL PROTECTION fault внутри `map` — не с
+    // page fault. #GP там означает, что вычисленный виртуальный адрес
+    // неканонический, а это возможно только при мусорной физической базе:
+    // ошибочное значение BAR/MADT вроде всех единиц даёт переполнение
+    // `phys + hhdm` в неканоническую дыру. Сообщить значение лучше, чем упасть
+    // внутри обходчика, где адрес уже потерян.
+    const MAX_PHYS: u64 = 0x0000_FFFF_FFFF_FFFF; // 52-битное физическое адресное пространство
     if phys > MAX_PHYS || start > MAX_PHYS {
         crate::error!(
             "[VMM] map_mmio: refusing implausible physical base 0x{:x}",
@@ -642,8 +650,8 @@ pub fn map_mmio(phys: u64, len: u64) -> Result<u64, VmError> {
 
     let mut p = start;
     while p < end {
-        // `map` returns Err rather than faulting for the same reason: a bad
-        // physical range must surface as a boot error, not as a #GP.
+        // `map` возвращает Err, а не падает, по той же причине: плохой
+        // физический диапазон должен всплыть как ошибка загрузки, а не #GP.
         map(p, phys_to_virt(p), flags)?;
         p += page_size;
     }
@@ -651,17 +659,18 @@ pub fn map_mmio(phys: u64, len: u64) -> Result<u64, VmError> {
     Ok(phys_to_virt(phys))
 }
 
-// ─── fork support ────────────────────────────────────────────────────
+// ─── поддержка fork ──────────────────────────────────────────────────
 
-/// Deep-copy the user lower half (PML4 entries 0..256) of
-/// `src_pml4` into `dst_pml4`, eagerly duplicating every mapped 4 KiB frame
-/// (no copy-on-write). All access goes through the HHDM window, so neither
-/// address space needs to be active in CR3 and no TLB shootdown is needed
-/// (the destination has never been loaded). Leaf flags are preserved;
-/// intermediate tables are rebuilt with the standard user policy. Huge pages
-/// never appear in the user lower half here (the loader and mmap only map
-/// 4 KiB pages), so a huge leaf is reported as `NotMapped` instead of being
-/// silently shared between two address spaces.
+/// Глубоко скопировать пользовательскую нижнюю половину (записи PML4 0..256)
+/// из `src_pml4` в `dst_pml4`, жадно дублируя каждый отображённый кадр 4 КиБ
+/// (без copy-on-write). Весь доступ идёт через окно HHDM, поэтому ни одно
+/// адресное пространство не обязано быть активным в CR3 и TLB-shootdown не
+/// нужен (приёмник никогда не загружался). Флаги листьев сохраняются;
+/// промежуточные таблицы перестраиваются по стандартной пользовательской
+/// политике. Огромные страницы в пользовательской нижней половине здесь не
+/// появляются (загрузчик и mmap отображают только 4 КиБ), поэтому огромный лист
+/// сообщается как `NotMapped`, а не молча делится между двумя адресными
+/// пространствами.
 pub fn clone_user_space(src_pml4: u64, dst_pml4: u64) -> Result<(), VmError> {
     let walker = PageTableWalker::new();
     let user = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
@@ -690,8 +699,8 @@ pub fn clone_user_space(src_pml4: u64, dst_pml4: u64) -> Result<(), VmError> {
                     return Err(VmError::NotMapped);
                 }
                 let src1 = walker.table(e2.addr().as_u64());
-                // Build the destination chain lazily — only once this P1 proves
-                // to hold at least one present leaf.
+                // Лениво строить цепочку приёмника — только когда у этого P1
+                // реально есть хотя бы один присутствующий лист.
                 let mut dst1: Option<&mut PageTable> = None;
                 for i1 in 0..512usize {
                     let e1 = &src1[i1];
@@ -700,8 +709,8 @@ pub fn clone_user_space(src_pml4: u64, dst_pml4: u64) -> Result<(), VmError> {
                     }
                     if dst1.is_none() {
                         let p4 = walker.table_mut(dst_pml4);
-                        // Levels are named for the ENTRY being walked through,
-                        // which is what decides the meaning of HUGE_PAGE there.
+                        // Уровни названы по ЗАПИСИ, через которую идёт обход:
+                        // именно она решает смысл HUGE_PAGE на этом уровне.
                         let p3 = walker.ensure_next(
                             p4,
                             x86_64::structures::paging::PageTableIndex::new(i4 as u16),
@@ -723,8 +732,8 @@ pub fn clone_user_space(src_pml4: u64, dst_pml4: u64) -> Result<(), VmError> {
                         dst1 = Some(p1);
                     }
                     let frame = crate::memory::pmm::alloc_frame().ok_or(VmError::OutOfMemory)?;
-                    // SAFETY: both frames are ordinary RAM reachable through
-                    // the HHDM window; copy one whole page.
+                    // SAFETY: оба кадра — обычная RAM, достижимая через окно
+                    // HHDM; копируем целую страницу.
                     unsafe {
                         ptr::copy_nonoverlapping(
                             phys_to_virt(e1.addr().as_u64()) as *const u8,
@@ -742,9 +751,10 @@ pub fn clone_user_space(src_pml4: u64, dst_pml4: u64) -> Result<(), VmError> {
     Ok(())
 }
 
-/// Translate a user virtual address in the (inactive)
-/// address space rooted at `pml4` — used to write CLONE_CHILD_SETTID into the
-/// child's copied memory. 4 KiB walks only; None on any non-present entry.
+/// Перевести пользовательский виртуальный адрес в (неактивном) адресном
+/// пространстве с корнем `pml4` — используется для записи CLONE_CHILD_SETTID в
+/// скопированную память ребёнка. Только обход 4 КиБ; None на любой
+/// отсутствующей записи.
 pub fn virt_to_phys_in(pml4: u64, virt: u64) -> Option<u64> {
     let walker = PageTableWalker::new();
     let idx4 = ((virt >> 39) & 0x1ff) as usize;
@@ -774,52 +784,54 @@ pub fn virt_to_phys_in(pml4: u64, virt: u64) -> Option<u64> {
     Some(e1.addr().as_u64() + (virt & 0xfff))
 }
 
-/// Software PTE bit (available bit 9) marking a COW-shared leaf: the frame is
-/// shared with another address space and its ownership is refcounted in the
-/// PMM (`pmm::cow_ref`/`cow_unref`). Set on BOTH sides by
-/// [`fork_user_space_cow`]; cleared when a side copies the page private
-/// ([`cow_copy_page`]) or when it exits (`drop_user_space` unrefs instead of
-/// freeing).
+/// Программный бит PTE (свободный бит 9), помечающий COW-разделённый лист:
+/// кадр разделён с другим адресным пространством, и его владение подсчитано в
+/// PMM (`pmm::cow_ref`/`cow_unref`). Ставится на ОБЕИХ сторонах
+/// [`fork_user_space_cow`]; снимается, когда сторона копирует страницу приватно
+/// ([`cow_copy_page`]) или выходит (`drop_user_space` делает unref вместо
+/// освобождения).
 pub(crate) const COW_BIT: PageTableFlags = PageTableFlags::BIT_9;
 
-/// Software PTE bit (available bit 10) meaning "this leaf's MAPPING denies
-/// write": the hardware `WRITABLE` bit is cleared because the protection is
-/// read-only (or execute-only), not because the frame is COW-shared.
+/// Программный бит PTE (свободный бит 10), означающий «ОТОБРАЖЕНИЕ этого листа
+/// запрещает запись»: аппаратный бит `WRITABLE` снят потому, что защита —
+/// read-only (или execute-only), а не потому, что кадр COW-разделён.
 ///
-/// It exists because those two reasons are otherwise indistinguishable on a
-/// COW leaf — both leave a present, read-only PTE — and the write-fault
-/// service ([`cow_copy_page`]) must only copy the page private when the
-/// mapping actually allows writing. Without this bit `mprotect(PROT_READ)` on
-/// a fork-shared page was advisory: the next write fault copied the page and
-/// installed `WRITABLE` on the private copy (round-3 audit F-r3-arch-3(a)).
+/// Бит нужен, потому что иначе эти две причины на COW-листе неразличимы — обе
+/// оставляют присутствующий read-only PTE, — а обработчик write-fault
+/// ([`cow_copy_page`]) должен копировать страницу приватно, только когда
+/// отображение реально разрешает запись. Без этого бита `mprotect(PROT_READ)` на
+/// fork-разделённой странице был совещательным: следующий write fault копировал
+/// страницу и ставил `WRITABLE` на приватную копию.
 ///
-/// Maintained on COW leaves only (a private read-only leaf needs no marker:
-/// [`cow_copy_page`] refuses it for lack of `COW_BIT`):
-///   * [`fork_user_space_cow`] sets it on leaves whose mapping was read-only
-///     and keeps it on already-COW leaves (a deferred COW write has no bit);
-///   * `mprotect` sets/clears it together with the tracked protection;
-///   * [`cow_copy_page`] clears it when it makes the page privately writable.
+/// Поддерживается только на COW-листах (приватному read-only листу маркер не
+/// нужен: [`cow_copy_page`] отвергает его из-за отсутствия `COW_BIT`):
+///   * [`fork_user_space_cow`] ставит его на листьях, чьё отображение было
+///     read-only, и сохраняет на уже-COW листьях (отложенный COW-запись бита не
+///     имеет);
+///   * `mprotect` ставит/снимает его вместе с отслеживаемой защитой;
+///   * [`cow_copy_page`] снимает его, когда делает страницу приватно
+///     записываемой.
 pub(crate) const RO_BIT: PageTableFlags = PageTableFlags::BIT_10;
 
-/// Result of detaching one user leaf through [`release_user_leaf`].
+/// Результат отцепления одного пользовательского листа через [`release_user_leaf`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeafRelease {
-    /// The frame was returned to the PMM: privately owned, or the last COW sharer.
+    /// Кадр возвращён в PMM: приватный или последний COW-шарящий.
     Freed,
-    /// The leaf was COW-shared and another address space still maps it; only
-    /// this side's PMM reference was dropped. The PTE is gone, the frame stays.
+    /// Лист был COW-разделён, и другое адресное пространство всё ещё отображает
+    /// его; отпущена только ссылка PMM этой стороны. PTE убран, кадр остаётся.
     Shared,
 }
 
-/// Release one leaf frame according to its COW ownership marker.
+/// Освободить один листовой кадр сообразно его COW-маркеру владения.
 ///
-/// The SINGLE place where a user leaf frame goes back to the PMM (or stays
-/// owned by other sharers): `munmap`, `mprotect(PROT_NONE)`, `MAP_FIXED`
-/// replacement, `mremap` and address-space teardown all funnel their leaf
-/// frees here. A `COW_BIT` leaf consumes one `pmm::cow_unref` reference and is
-/// freed only when that call reports the last one; an ordinary private leaf is
-/// freed directly. No caller may call `pmm::free_frame` on a user leaf it
-/// detached itself.
+/// ЕДИНСТВЕННОЕ место, где листовой кадр пользователя возвращается в PMM (или
+/// остаётся у других шарящих): `munmap`, `mprotect(PROT_NONE)`, замена
+/// `MAP_FIXED`, `mremap` и снос адресного пространства сводят освобождение
+/// листьев сюда. Лист с `COW_BIT` потребляет одну ссылку `pmm::cow_unref` и
+/// освобождается, только когда вызов сообщил о последней; обычный приватный
+/// лист освобождается напрямую. Ни один вызывающий не должен звать
+/// `pmm::free_frame` на отцеплённом им листе пользователя.
 fn release_leaf_frame(frame: u64, flags: PageTableFlags) -> bool {
     if flags.contains(COW_BIT) {
         if crate::memory::pmm::cow_unref(frame) {
@@ -834,18 +846,19 @@ fn release_leaf_frame(frame: u64, flags: PageTableFlags) -> bool {
     }
 }
 
-/// Detach the 4 KiB leaf at `virt_addr` from the ACTIVE user address space and
-/// release its frame exactly once according to COW ownership.
+/// Отцепить лист 4 КиБ по `virt_addr` от АКТИВНОГО пользовательского
+/// адресного пространства и освободить его кадр ровно один раз сообразно
+/// COW-владению.
 ///
-/// This is the release half of the ownership invariant: the PTE is cleared
-/// before the frame is (possibly) returned to the PMM, so no live translation
-/// ever points at a free frame, and a COW-shared frame is not freed while the
-/// other address space still maps it.
+/// Это половина освобождения в инварианте владения: PTE очищается до того, как
+/// кадр (возможно) вернётся в PMM, поэтому ни одна живая трансляция не указывает
+/// на свободный кадр, а COW-разделённый кадр не освобождается, пока другое
+/// адресное пространство его отображает.
 ///
-/// Returns [`VmError::NotMapped`] when no 4 KiB leaf is present (huge pages in
-/// the user half are a kernel bug and are refused rather than mis-walked), and
-/// [`VmError::InvalidAddress`] for a non-user address — this helper exists for
-/// user leaves only.
+/// Возвращает [`VmError::NotMapped`], если листа 4 КиБ нет (огромные страницы в
+/// пользовательской половине — ошибка ядра, и они отвергаются, а не
+/// обходятся неверно), и [`VmError::InvalidAddress`] для не-пользовательского
+/// адреса — хелпер существует только для листьев пользователя.
 pub fn release_user_leaf(virt_addr: u64) -> Result<LeafRelease, VmError> {
     if virt_addr >= USER_ADDR_MAX {
         return Err(VmError::InvalidAddress);
@@ -886,8 +899,9 @@ pub fn release_user_leaf(virt_addr: u64) -> Result<LeafRelease, VmError> {
     }
     let frame = entry.addr().as_u64();
     let flags = entry.flags();
-    // Clear the translation BEFORE the frame can become free: a TLB miss must
-    // never resurrect a stale translation to a frame the PMM can hand out.
+    // Очистить трансляцию ДО того, как кадр сможет стать свободным: промах TLB
+    // не должен воскресить устаревшую трансляцию на кадр, который PMM уже может
+    // выдать.
     entry.set_unused();
     tlb::flush(virt);
     Ok(if release_leaf_frame(frame, flags) {
@@ -897,20 +911,21 @@ pub fn release_user_leaf(virt_addr: u64) -> Result<LeafRelease, VmError> {
     })
 }
 
-/// Re-flag an existing 4 KiB leaf of the ACTIVE user address space WITHOUT
-/// changing its frame. Used by `mprotect(2)`: it needs no PMM allocation and
-/// therefore cannot fail with `ENOMEM` half-way through the range.
+/// Переставить флаги существующего листа 4 КиБ АКТИВНОГО пользовательского
+/// адресного пространства, НЕ меняя его кадр. Используется `mprotect(2)`: не
+/// требует аллокации PMM и потому не может упасть с `ENOMEM` на середине
+/// диапазона.
 ///
-/// A COW leaf keeps its `COW_BIT` and is never made hardware-writable: write
-/// permission is delivered lazily by the next write fault ([`cow_copy_page`]),
-/// exactly like Linux's `can_change_pte_writable` keeps a write-protected PTE
-/// when the page is still shared. Clearing the marker or setting `WRITABLE`
-/// here would silently create a writable alias of a frame another address
-/// space still owns.
+/// COW-лист сохраняет `COW_BIT` и никогда не становится аппаратно записываемым:
+/// право записи выдаётся лениво следующим write fault ([`cow_copy_page`]) — как
+/// Linux `can_change_pte_writable` оставляет write-protected PTE, пока страница
+/// разделена. Снять маркер или поставить `WRITABLE` здесь значило бы молча
+/// создать записываемый алиас кадра, которым всё ещё владеет другое адресное
+/// пространство.
 ///
-/// The caller decides the MAPPING protection: `mprotect` sets [`RO_BIT`] when
-/// it makes a COW leaf read-only and clears it when it grants write access, so
-/// the fault service can tell "protected read-only" from "COW write pending".
+/// Защиту ОТОБРАЖЕНИЯ решает вызывающий: `mprotect` ставит [`RO_BIT`], когда
+/// делает COW-лист read-only, и снимает его, когда даёт запись, чтобы обработчик
+/// fault отличал «защищён read-only» от «COW-запись отложена».
 pub fn set_user_leaf_flags(virt_addr: u64, flags: PageTableFlags) -> Result<(), VmError> {
     if virt_addr >= USER_ADDR_MAX {
         return Err(VmError::InvalidAddress);
@@ -974,15 +989,16 @@ pub fn set_user_leaf_flags(virt_addr: u64, flags: PageTableFlags) -> Result<(), 
     Ok(())
 }
 
-/// Release every frame owned by a *private* user address space: all mapped
-/// 4 KiB leaf frames in the lower half (PML4 entries 0..256), the intermediate
-/// page-table frames beneath them, and the PML4 frame itself.
+/// Освободить каждый кадр, принадлежащий *приватному* пользовательскому
+/// адресному пространству: все отображённые листовые кадры 4 КиБ нижней половины
+/// (записи PML4 0..256), промежуточные кадры таблиц страниц под ними и сам кадр
+/// PML4.
 ///
-/// The caller MUST ensure the address space is exclusively owned (no other
-/// task shares this PML4) and that it is not the kernel PML4 — this function
-/// frees unconditionally and would otherwise tear down live mappings. The
-/// address space does not need to be active in CR3: all access goes through
-/// the HHDM window (same convention as `clone_user_space`).
+/// Вызывающий ОБЯЗАН обеспечить, что адресное пространство принадлежит
+/// эксклюзивно (PML4 не делится с другой задачей) и что это не PML4 ядра —
+/// функция освобождает безусловно и иначе снесла бы живые отображения.
+/// Адресному пространству не нужно быть активным в CR3: весь доступ идёт через
+/// окно HHDM (как в `clone_user_space`).
 pub fn drop_user_space(pml4: u64) {
     let walker = PageTableWalker::new();
     let p4 = walker.table(pml4);
@@ -999,11 +1015,11 @@ pub fn drop_user_space(pml4: u64) {
                 continue;
             }
             if e3.flags().contains(PageTableFlags::HUGE_PAGE) {
-                // 1 GiB leaf: the entry's frame IS the mapped page (there is
-                // no PD table behind it). Nothing else is freed at this level.
-                // COW cannot currently produce huge leaves (fork falls back to
-                // the eager copier), but the shared release helper keeps the
-                // accounting correct if that ever changes.
+                // Лист 1 ГиБ: кадр записи И ЕСТЬ отображённая страница (PD-
+                // таблицы за ней нет). На этом уровне больше ничего не
+                // освобождается. COW пока не создаёт огромных листьев (fork
+                // откатывается к жадному копированию), но общий хелпер
+                // освобождения сохранит учёт корректным, если это изменится.
                 release_leaf_frame(e3.addr().as_u64(), e3.flags());
                 continue;
             }
@@ -1015,7 +1031,7 @@ pub fn drop_user_space(pml4: u64) {
                     continue;
                 }
                 if e2.flags().contains(PageTableFlags::HUGE_PAGE) {
-                    // 2 MiB leaf: the entry's frame IS the mapped page.
+                    // Лист 2 МиБ: кадр записи И ЕСТЬ отображённая страница.
                     release_leaf_frame(e2.addr().as_u64(), e2.flags());
                     continue;
                 }
@@ -1026,51 +1042,53 @@ pub fn drop_user_space(pml4: u64) {
                     if !e1.flags().contains(PageTableFlags::PRESENT) {
                         continue;
                     }
-                    // Shared with another address space: only drop this
-                    // side's reference. The last departing side frees —
-                    // `release_leaf_frame`'s cow_unref reports that via its
-                    // return value. Private leaves are freed directly.
+                    // Разделён с другим адресным пространством: отпускаем
+                    // только ссылку этой стороны. Освобождает последняя уходящая
+                    // сторона — `release_leaf_frame` сообщает это возвратом
+                    // cow_unref. Приватные листья освобождаются напрямую.
                     release_leaf_frame(e1.addr().as_u64(), e1.flags());
                 }
-                // The PT frame itself: free even when every leaf was
-                // unmapped earlier (munmap clears leaf PTEs but leaves the
-                // table) — the table is unreachable once this tree dies.
+                // Сам кадр PT: освобождается, даже если все листья были сняты
+                // раньше (munmap чистит листовые PTE, но оставляет таблицу) —
+                // после смерти этого дерева таблица недостижима.
                 crate::memory::pmm::free_frame(p1_phys);
             }
-            // ONE PD frame per PDPT entry — freed once, AFTER the PT loop
-            // (freed inside the loop, a populated PD was released once per
-            // present PT entry, tripping the PMM double-free detector).
+            // ОДИН кадр PD на запись PDPT — освобождается один раз, ПОСЛЕ
+            // цикла PT (если освобождать внутри цикла, заполненный PD
+            // освобождался бы по разу на каждую присутствующую запись PT,
+            // срабатывая на детекторе double-free PMM).
             crate::memory::pmm::free_frame(p2_phys);
         }
-        // ONE PDPT frame per PML4 entry — freed once, after the PD loop.
+        // ОДИН кадр PDPT на запись PML4 — освобождается один раз, после цикла PD.
         crate::memory::pmm::free_frame(p3_phys);
     }
     crate::memory::pmm::free_frame(pml4);
 }
 
-/// Fork the active lower-half address space into `child_pml4` copy-on-write:
-/// every present leaf frame is SHARED (refcounted in the PMM via
-/// `pmm::cow_ref`), both PTEs are marked with the `COW_BIT` software bit, and
-/// formerly-writable entries lose the WRITABLE bit on both sides so the next
-/// write traps into the page-fault handler, which copies the page private
-/// ([`cow_copy_page`]). Read-only leaves (ELF text/rodata, `PROT_READ` mmaps)
-/// keep their flags AND carry [`RO_BIT`], so a write there still segfaults
-/// instead of turning into a private writable copy; only their ownership is
-/// refcounted.
+/// Форкнуть активное адресное пространство нижней половины в `child_pml4`
+/// copy-on-write: каждый присутствующий листовой кадр РАЗДЕЛЯЕТСЯ (учтён в PMM
+/// через `pmm::cow_ref`), оба PTE помечаются программным битом `COW_BIT`, а
+/// прежде записываемые записи теряют WRITABLE на обеих сторонах, чтобы
+/// следующая запись попала в обработчик page fault, который копирует страницу
+/// приватно ([`cow_copy_page`]). Read-only листья (текст/rodata ELF,
+/// `PROT_READ`-mmap) сохраняют флаги И несут [`RO_BIT`], поэтому запись туда
+/// по-прежнему даёт SIGSEGV, а не приватную записываемую копию; подсчитывается
+/// только владение.
 ///
-/// Intermediate page-table frames are NOT shared: the child gets fresh zeroed
-/// tables, so each side's table mutations stay independent.
+/// Промежуточные кадры таблиц страниц НЕ разделяются: ребёнок получает свежие
+/// обнулённые таблицы, поэтому мутации таблиц каждой стороны независимы.
 ///
-/// Returns `Err` (with the parent untouched) when the parent uses huge pages
-/// in the lower half — the caller falls back to the eager copier. The parent
-/// address space must be ACTIVE (fork runs on the parent's CR3): the RO-flip
-/// needs a TLB invalidate, done here as a full flush on return.
+/// Возвращает `Err` (родитель не тронут), если родитель использует огромные
+/// страницы в нижней половине — вызывающий откатывается к жадному копированию.
+/// Родительское адресное пространство должно быть АКТИВНЫМ (fork идёт на CR3
+/// родителя): RO-flip требует сброса TLB, выполняемого здесь полным сбросом на
+/// возврате.
 pub fn fork_user_space_cow(parent_pml4: u64, child_pml4: u64) -> Result<(), VmError> {
-    // Caller contract: the parent's address space is the active CR3, because
-    // the RO-flip below must invalidate the parent's TLB entries; the full
-    // flush at the end is only correct for the active space. `fork_linux_process`
-    // calls this from the parent's syscall context. Debug builds enforce the
-    // contract here instead of letting a future caller silently skip the flush.
+    // Контракт вызывающего: адресное пространство родителя — активный CR3,
+    // потому что RO-flip ниже должен сбросить его записи TLB; полный сброс в
+    // конце корректен только для активного пространства. `fork_linux_process`
+    // зовёт это из контекста syscall родителя. Debug-сборки проверяют контракт
+    // здесь, а не позволяют будущему вызывающему молча пропустить сброс.
     debug_assert_eq!(
         parent_pml4,
         crate::memory::vmm::current_pml4_phys(),
@@ -1079,8 +1097,8 @@ pub fn fork_user_space_cow(parent_pml4: u64, child_pml4: u64) -> Result<(), VmEr
     let walker = PageTableWalker::new();
     let p4p = walker.table(parent_pml4);
 
-    // Pass 1: reject huge pages before any mutation so the caller's fallback
-    // starts from a clean parent.
+    // Проход 1: отвергнуть огромные страницы до любой мутации, чтобы откат
+    // вызывающего начинался с чистого родителя.
     for i4 in 0..256usize {
         let e4 = &p4p[i4];
         if !e4.flags().contains(PageTableFlags::PRESENT) {
@@ -1110,7 +1128,7 @@ pub fn fork_user_space_cow(parent_pml4: u64, child_pml4: u64) -> Result<(), VmEr
         }
     }
 
-    // Pass 2: mirror the tree into the child, share leaves, flip writables.
+    // Проход 2: отразить дерево в ребёнке, разделить листья, переставить записываемые.
     for i4 in 0..256usize {
         let e4 = &p4p[i4];
         if !e4.flags().contains(PageTableFlags::PRESENT) {
@@ -1142,34 +1160,34 @@ pub fn fork_user_space_cow(parent_pml4: u64, child_pml4: u64) -> Result<(), VmEr
                     }
                     let frame = e1.addr();
                     let flags = e1.flags();
-                    // Two distinct reasons for a non-writable leaf must stay
-                    // distinct across the fork:
-                    //   * writable mapping  -> COW with a deferred write: a
-                    //     write fault copies the page private (no RO_BIT);
-                    //   * read-only mapping -> COW without write permission:
-                    //     a write fault must SIGSEGV (RO_BIT set).
-                    // An already-COW leaf keeps its RO_BIT as-is: its mapping
-                    // protection was already recorded by the first fork or by
-                    // mprotect, and "no WRITABLE bit" alone cannot tell a
-                    // deferred COW write from a read-only mapping.
+                    // Две разные причины не-записываемого листа должны
+                    // оставаться различимыми после fork:
+                    //   * записываемое отображение -> COW с отложенной записью:
+                    //     write fault копирует страницу приватно (без RO_BIT);
+                    //   * read-only отображение -> COW без права записи: write
+                    //     fault обязан дать SIGSEGV (RO_BIT установлен).
+                    // Уже-COW лист сохраняет свой RO_BIT: защита его отображения
+                    // уже записана первым fork или mprotect, а «нет бита
+                    // WRITABLE» само по себе не отличает отложенную COW-запись
+                    // от read-only отображения.
                     let shared = if flags.contains(PageTableFlags::WRITABLE) {
                         ((flags - PageTableFlags::WRITABLE) | COW_BIT) - RO_BIT
                     } else if flags.contains(COW_BIT) {
-                        // Already a COW leaf: `RO_BIT` records whether its
-                        // mapping denies write; preserve it.
+                        // Уже COW-лист: `RO_BIT` фиксирует, запрещает ли его
+                        // отображение запись; сохраняем.
                         flags | COW_BIT
                     } else {
-                        // Private read-only leaf (ELF text/rodata, a PROT_READ
-                        // mapping): the child/this side must not gain write
-                        // access through the COW fault service.
+                        // Приватный read-only лист (текст/rodata ELF,
+                        // PROT_READ-отображение): ребёнок/эта сторона не должны
+                        // получить запись через обработчик COW-fault.
                         (flags | COW_BIT) | RO_BIT
                     };
                     p1p[i1].set_addr(frame, shared);
                     p1c[i1].set_addr(frame, shared);
-                    // Two sharers enter the map when the leaf was privately
-                    // owned (parent + child). When the parent's leaf is
-                    // ALREADY COW (fork of a fork) the parent side is counted
-                    // since its first fork — only the new child registers.
+                    // В карту входят два шарящих, когда лист был приватным
+                    // (родитель + ребёнок). Если лист родителя УЖЕ COW (fork от
+                    // fork), сторона родителя учтена с первого fork —
+                    // регистрируется только новый ребёнок.
                     if !flags.contains(COW_BIT) {
                         crate::memory::pmm::cow_ref(frame.as_u64());
                     }
@@ -1178,22 +1196,22 @@ pub fn fork_user_space_cow(parent_pml4: u64, child_pml4: u64) -> Result<(), VmEr
             }
         }
     }
-    // The parent's flipped PTEs may still sit in the TLB with stale RW
-    // translations; a full reload flushes them.
+    // Переставленные PTE родителя могут ещё сидеть в TLB с устаревшими RW-
+    // трансляциями; полная перезагрузка их сбрасывает.
     tlb::flush_all();
     Ok(())
 }
 
-/// Physical address of the intermediate table at `idx` of the table at
-/// physical address `parent`, created (freshly zeroed, USER-accessible
-/// intermediate flags) if absent — a lower-half user tree.
+/// Физический адрес промежуточной таблицы по `idx` таблицы по физическому
+/// адресу `parent`, созданной (свежеобнулённой, с промежуточными флагами
+/// USER-accessible), если её нет — дерево пользователя нижней половины.
 fn fork_child_table_phys(parent: u64, idx: PageTableIndex) -> Result<u64, VmError> {
     let walker = PageTableWalker::new();
     let table = walker.table_mut(parent);
     if !table[idx].flags().contains(PageTableFlags::PRESENT) {
         let frame = crate::memory::pmm::alloc_frame().ok_or(VmError::OutOfMemory)?;
-        // SAFETY: `frame` was just allocated and is mapped via the HHDM, so
-        // this zeroes exactly one owned, page-aligned frame.
+        // SAFETY: `frame` только что выделен и отображён через HHDM, поэтому
+        // обнуляется ровно один принадлежащий нам выровненный кадр.
         unsafe {
             ptr::write_bytes(phys_to_virt(frame) as *mut u8, 0, 4096);
         }
@@ -1205,14 +1223,14 @@ fn fork_child_table_phys(parent: u64, idx: PageTableIndex) -> Result<u64, VmErro
     Ok(table[idx].addr().as_u64())
 }
 
-/// Copy-on-write fault service: the page at `virt_addr` (ACTIVE address space)
-/// is a COW-shared leaf (present + `COW_BIT`). Allocate a fresh frame, copy
-/// the shared contents, re-point the PTE at the private copy with WRITABLE
-/// restored, drop this side's share of the old frame (freeing it when this was
-/// the last sharer) and flush the TLB. Returns `false` when the PTE is not a
-/// COW leaf (caller's SIGSEGV path applies), when the mapping explicitly
-/// denies write ([`RO_BIT`]: `mprotect(PROT_READ)` after fork) or the PMM is
-/// exhausted.
+/// Обработчик copy-on-write fault: страница по `virt_addr` (АКТИВНОЕ адресное
+/// пространство) — COW-разделённый лист (present + `COW_BIT`). Выделить свежий
+/// кадр, скопировать разделяемое содержимое, перецелить PTE на приватную копию
+/// с восстановленным WRITABLE, отпустить долю этой стороны в старом кадре
+/// (освобождая его, если это был последний шарящий) и сбросить TLB. Возвращает
+/// `false`, если PTE не COW-лист (применяется путь SIGSEGV вызывающего), если
+/// отображение явно запрещает запись ([`RO_BIT`]: `mprotect(PROT_READ)` после
+/// fork) или PMM исчерпан.
 pub fn cow_copy_page(virt_addr: u64) -> bool {
     let walker = PageTableWalker::new();
     let virt = VirtAddr::new(virt_addr);
@@ -1232,9 +1250,9 @@ pub fn cow_copy_page(virt_addr: u64) -> bool {
     if !flags.contains(PageTableFlags::PRESENT) || !flags.contains(COW_BIT) {
         return false;
     }
-    // The mapping itself forbids writing (it was read-only before the fork, or
-    // `mprotect` made it so): a write fault must become a SIGSEGV, never a
-    // private writable copy. This is the round-3 F-r3-arch-3(a) gate.
+    // Само отображение запрещает запись (было read-only до fork, или так его
+    // сделал `mprotect`): write fault обязан стать SIGSEGV, никогда — приватной
+    // записываемой копией. Это и есть заслон для read-only COW-листьев.
     if flags.contains(RO_BIT) {
         crate::debug!(
             "[VMM] write fault on read-only COW leaf virt=0x{:x} flags={:?} -> SIGSEGV",
@@ -1247,8 +1265,8 @@ pub fn cow_copy_page(virt_addr: u64) -> bool {
     let Some(new) = crate::memory::pmm::alloc_frame() else {
         return false;
     };
-    // SAFETY: both addresses are HHDM aliases of owned 4 KiB frames; the copy
-    // stays inside them.
+    // SAFETY: оба адреса — HHDM-алиасы принадлежащих нам кадров 4 КиБ;
+    // копирование не выходит за них.
     unsafe {
         core::ptr::copy_nonoverlapping(
             phys_to_virt(old) as *const u8,

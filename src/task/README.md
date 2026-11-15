@@ -71,8 +71,8 @@
 [+128] RIP  [+136] CS  [+144] RFLAGS  [+152] RSP  [+160] SS   (iretq-фрейм)
 ```
 - Кооперативный: `yield_current` → `switch::yield_switch` (asm) → `scheduler_yield_switch`.
-  Задача ре-эн queue'ится **между** сохранением фрейма и переключением стека
-  («stage-13.6 fix» — иначе clone-треды вечно висели в FUTEX_WAIT).
+  Задача возвращается в очередь **между** сохранением фрейма и переключением стека
+  (иначе clone-треды вечно висели в FUTEX_WAIT).
 - Вытесняющий: `irq32_stub` (CPU уже пушнул iret-фрейм; стаб пушит 15 GPR + pushfq) →
   `scheduler_tick_irq`: реап минимум одной exit-задачи за тик, EOI, выбор следующего,
   `activate_task` (TSS RSP0 + зеркало syscall-стека + FS base), `vmm::load_cr3` (заодно TLB flush),
@@ -142,11 +142,11 @@ sched_yield, tgkill и др.).
 
 - `COMPAT_STATES` спинлок **нереентерабелен**: замыкания `with_current_compat` не должны
   блокироваться на device I/O и не должны реэнтерить реестр; page-fault-обработчик
-  проверяет `compat_lock_held()` (`COMPAT_DEPTH`), чтобы не дедлокнуться. F-r3-life-2
-  (2.22.6): `epoll_wait`→`poll_fd` уже держит реестр, поэтому signalfd-ветка читает
+  проверяет `compat_lock_held()` (`COMPAT_DEPTH`), чтобы не дедлокнуться:
+  `epoll_wait`→`poll_fd` уже держит реестр, поэтому signalfd-ветка читает
   `sig_pending`/`sig_blocked` из уже захваченного `CompatState`, а не зовёт
   `signalfd_readable()` (тот теперь debug-assert'ит, что реестр не удерживается).
-- **fd-таблица ограничена `NOFILE_MAX`/`FD_TABLE_LIMIT` = 1024** (F-r3-life-1, 2.22.6):
+- **fd-таблица ограничена `NOFILE_MAX`/`FD_TABLE_LIMIT` = 1024** (см. `SECURITY.md`):
   `dup2`/`dup3`/`fcntl(F_DUPFD/F_DUPFD_CLOEXEC)` отвергают номер ≥ предела до аллокации
   (`EINVAL`), а `FdSlots::try_alloc` независимо не даёт вектору вырасти за предел (`EMFILE`);
   `FdSlots::alloc` остаётся только для внутренних вызовов с `FIRST_DYNAMIC_FD`.

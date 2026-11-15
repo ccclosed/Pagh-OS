@@ -1,89 +1,92 @@
-//! Linux errno model for the x86_64 binary-compatibility layer.
+//! Модель errno Linux для слоя совместимости с x86_64-бинарями.
 //!
-//! Pure, allocation-free, `core`-only logic shared with the `host-tests` crate
-//! (R11.6). The kernel folds a handler's `Err(e)` into `rax` as the negated errno
-//! value Linux expects, i.e. a value in the range `-4095..=-1` (R1.3).
+//! Чистая логика без аллокаций, только `core`, общая с крейтом `host-tests`
+//! (R11.6). Ядро складывает `Err(e)` обработчика в `rax` как отрицательное
+//! значение errno, которого ждёт Linux, то есть значение в диапазоне
+//! `-4095..=-1` (R1.3).
 #![allow(dead_code)]
 
-/// The subset of Linux `errno` values the compatibility layer can report.
+/// Подмножество значений Linux `errno`, которое может сообщить слой
+/// совместимости.
 ///
-/// Discriminants match the Linux x86_64 ABI exactly so the encoded `rax` value is
-/// the negated number a Linux binary expects.
+/// Дискриминанты точно соответствуют ABI Linux x86_64, поэтому кодируемое
+/// значение `rax` — отрицательное число, которого ждёт Linux-бинарь.
 #[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Errno {
-    /// Operation not permitted.
+    /// Операция не разрешена.
     EPERM = 1,
-    /// No such file or directory.
+    /// Нет такого файла или каталога.
     ENOENT = 2,
     ESRCH = 3,
-    /// Interrupted system call (a deliverable signal poked a blocking wait).
+    /// Системный вызов прерван (доставимый сигнал разбудил блокирующее ожидание).
     EINTR = 4,
-    /// Input/output error (a real VFS/device read or write failure).
+    /// Ошибка ввода/вывода (реальный отказ чтения/записи VFS/устройства).
     EIO = 5,
-    /// Argument list too long.
+    /// Слишком длинный список аргументов.
     E2BIG = 7,
-    /// Exec format error.
+    /// Ошибка формата exec.
     ENOEXEC = 8,
-    /// No child processes.
+    /// Нет дочерних процессов.
     ECHILD = 10,
-    /// Resource temporarily unavailable (including unavailable secure entropy).
+    /// Ресурс временно недоступен (включая недоступную защищённую энтропию).
     EAGAIN = 11,
-    /// Socket operation on non-socket.
+    /// Операция сокета над не-сокетом.
     ENOTSOCK = 88,
-    /// Message too long (a datagram payload above the socket I/O cap).
+    /// Сообщение слишком длинное (полезная нагрузка датаграммы выше предела I/O сокета).
     EMSGSIZE = 90,
-    /// Address family not supported by protocol (AF_INET6 etc.).
+    /// Семейство адресов не поддерживается протоколом (AF_INET6 и т. п.).
     EAFNOSUPPORT = 97,
-    /// Network is unreachable.
+    /// Сеть недостижима.
     ENETUNREACH = 101,
-    /// Connection already in progress (non-blocking connect).
+    /// Соединение уже устанавливается (неблокирующий connect).
     EINPROGRESS = 115,
-    /// Transport endpoint is not connected.
+    /// Транспортный конец не подключён.
     ENOTCONN = 107,
-    /// Connection refused.
+    /// В соединении отказано.
     ECONNREFUSED = 111,
-    /// Socket is already connected.
+    /// Сокет уже подключён.
     EISCONN = 106,
-    /// Bad file descriptor.
+    /// Плохой файловый дескриптор.
     EBADF = 9,
-    /// Cannot allocate memory.
+    /// Невозможно выделить память.
     ENOMEM = 12,
-    /// Permission denied (directory rename refusal).
+    /// В доступе отказано (отказ в переименовании каталога).
     EACCES = 13,
-    /// Bad address.
+    /// Плохой адрес.
     EFAULT = 14,
-    /// File exists.
+    /// Файл существует.
     EEXIST = 17,
-    /// Not a directory.
+    /// Не каталог.
     ENOTDIR = 20,
-    /// Is a directory.
+    /// Это каталог.
     EISDIR = 21,
-    /// Invalid argument.
+    /// Неверный аргумент.
     EINVAL = 22,
-    /// Too many open files (the descriptor table's hard slot bound).
+    /// Слишком много открытых файлов (жёсткий предел слотов таблицы дескрипторов).
     EMFILE = 24,
-    /// Inappropriate ioctl for device (not a tty).
+    /// Неподходящий ioctl для устройства (не tty).
     ENOTTY = 25,
-    /// Illegal seek (pipe/non-seekable).
+    /// Недопустимый seek (pipe/неищущийся поток).
     ESPIPE = 29,
-    /// Broken pipe.
+    /// Разорванный pipe.
     EPIPE = 32,
-    /// Result too large / buffer too small.
+    /// Результат слишком велик / буфер слишком мал.
     ERANGE = 34,
-    /// File name too long (a resolution expanded past `link_walk::MAX_EXPANDED_BYTES`).
+    /// Имя файла слишком длинное (разрешение разрослось за `link_walk::MAX_EXPANDED_BYTES`).
     ENAMETOOLONG = 36,
-    /// Function not implemented.
+    /// Функция не реализована.
     ENOSYS = 38,
-    /// Too many levels of symbolic links (`link_walk::SYMLOOP_MAX` crossed).
+    /// Слишком много уровней символических ссылок (превышен `link_walk::SYMLOOP_MAX`).
     ELOOP = 40,
-    /// Operation timed out.
+    /// Время операции истекло.
     ETIMEDOUT = 110,
 }
 
-/// Encode an [`Errno`] for return in `rax` as Linux's negated-errno convention.
+/// Закодировать [`Errno`] для возврата в `rax` по соглашению Linux об
+/// отрицательном errno.
 ///
-/// The result reinterpreted as an `i64` lies in `[-4095, -1]` (R1.3).
+/// Результат, переинтерпретированный как `i64`, лежит в `[-4095, -1]` (R1.3).
 pub fn encode_errno(e: Errno) -> u64 {
     (-(e as i64)) as u64
 }

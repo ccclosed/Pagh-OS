@@ -1,5 +1,4 @@
-// arch/x86_64/syscall.rs — System call interface (SYSCALL/SYSRET)
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// arch/x86_64/syscall.rs — интерфейс системных вызовов (SYSCALL/SYSRET).
 
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
@@ -19,26 +18,27 @@ pub fn init() {
         let user_ds = crate::arch::x86_64::gdt::Selectors::user_data();
         let kernel_cs = crate::arch::x86_64::gdt::Selectors::kernel_code();
         let kernel_ds = crate::arch::x86_64::gdt::Selectors::kernel_data();
-        // STAR programs the selectors `syscall`/`sysretq` load WITHOUT any GDT
-        // lookup: syscall sets CS.sel = STAR[47:32] and SS.sel = STAR[47:32]+8;
-        // sysretq sets CS.sel = STAR[63:48]+16 and SS.sel = STAR[63:48]+8.
+        // STAR программирует селекторы, которые `syscall`/`sysretq` загружают
+        // БЕЗ обращения к GDT: syscall ставит CS.sel = STAR[47:32] и
+        // SS.sel = STAR[47:32]+8; sysretq — CS.sel = STAR[63:48]+16 и
+        // SS.sel = STAR[63:48]+8.
         //
-        // Regression guard: this call used to pass a NULL selector as the
-        // syscall CS and swallow the validation error with `.ok()`, so STAR was
-        // never written and stayed 0 from reset. Every `syscall` window then ran
-        // with CS.sel = 0 / SS.sel = 8, and ring 3 ran after `sysretq` with
-        // CS.sel = 0x13 / SS.sel = 0x0b — invisible while nothing interrupted
-        // those stretches (segment attributes are force-loaded, the GDT is never
-        // consulted), but the first timer tick that sampled them saved the bad
-        // selectors into its interrupt frame and the `iretq` restore raised #GP.
-        // Fail loudly: a kernel with a broken STAR must not boot.
+        // Защита от регрессии: раньше сюда передавался NULL-селектор как syscall
+        // CS, а ошибка проверки глушилась `.ok()`, поэтому STAR не писался и
+        // оставался нулём с момента сброса. Каждое окно `syscall` тогда шло с
+        // CS.sel = 0 / SS.sel = 8, а ring 3 после `sysretq` — с
+        // CS.sel = 0x13 / SS.sel = 0x0b; это незаметно, пока ничто не прерывает
+        // такие участки (атрибуты сегментов загружаются принудительно, GDT не
+        // читается), но первый тик таймера сохранял плохие селекторы во фрейм
+        // прерывания, и восстановление через `iretq` давало #GP. Отказывать
+        // громко: ядро со сломанным STAR не должно загружаться.
         Star::write(user_cs, user_ds, kernel_cs, kernel_ds)
             .expect("STAR: GDT selector layout incompatible with syscall/sysret");
-        // Boot-time proof in the log that STAR really holds what we wrote. The
-        // proof is informational: the loud failure is the `.expect()` above, so
-        // the good-path readback must not use `error!` — a healthy boot that
-        // prints `[ERROR]` makes every log filter treating that tag as "this
-        // boot failed" raise a false alarm.
+        // Доказательство в логе при загрузке, что STAR действительно содержит
+        // записанное. Доказательство информационное: громкий отказ — это
+        // `.expect()` выше, поэтому успешное чтение назад не должно звать
+        // `error!` — здоровая загрузка с `[ERROR]` поднимает ложную тревогу у
+        // любого фильтра, трактующего этот тег как «загрузка провалена».
         let (sysret_base, syscall_base) = Star::read_raw();
         crate::info!(
             "[syscall] STAR readback: sysret_base=0x{:x} syscall_base=0x{:x} (uc=0x{:x} ud=0x{:x})",
@@ -48,41 +48,42 @@ pub fn init() {
             user_ds.0,
         );
 
-        // LStar points at the naked `syscall_entry` stub (global_asm below) so the
-        // `syscall` instruction and `int 0x80` both funnel into `linux_dispatch`.
-        // SFMASK clears IF on `syscall`, so the entry stub runs with interrupts
-        // masked; `linux_dispatch` re-enables them once the user RSP has been
-        // parked in the per-task slot on the kernel stack, and the
-        // exit tail runs `cli` before unwinding, so preemption never straddles
-        // the frame pops.
+        // LStar указывает на naked-стаб `syscall_entry` (global_asm ниже), так
+        // что и инструкция `syscall`, и `int 0x80` попадают в `linux_dispatch`.
+        // SFMASK сбрасывает IF на `syscall`, поэтому входной стаб идёт с
+        // замаскированными прерываниями; `linux_dispatch` снова включает их,
+        // когда user RSP припаркован в per-task слоте на стеке ядра, а хвост
+        // выхода выполняет `cli` до снятия фрейма, чтобы вытеснение никогда не
+        // попало между pop'ами.
         LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
-        // F-r3-arch-1: clear TF as well as IF on `syscall` entry. A user can set
-        // RFLAGS.TF with a plain `popfq`; without this bit the first kernel
-        // instruction after `syscall` would raise #DB with a *kernel* CS/RIP and
-        // the exception handler would (correctly) treat it as a kernel fault and
-        // halt the machine. SYSCALL still saves the user RFLAGS (including TF)
-        // in r11 and `sysretq` restores it, so the user's single-step state is
-        // not lost — it simply cannot leak into the kernel.
+        // Сбрасывать TF вместе с IF на входе `syscall`. Пользователь может
+        // поставить RFLAGS.TF обычным `popfq`; без этого бита первая инструкция
+        // ядра после `syscall` дала бы #DB с *ядерными* CS/RIP, и обработчик
+        // исключения (справедливо) счёл бы это отказом ядра и остановил машину.
+        // SYSCALL по-прежнему сохраняет user RFLAGS (включая TF) в r11, а
+        // `sysretq` восстанавливает его, поэтому состояние пошагового
+        // выполнения пользователя не теряется — оно просто не протекает в ядро.
         SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG);
     }
-    // NOTE: the boot orchestrator's `init_syscalls` step emits the single
-    // concise `info!("syscalls")` line; we deliberately avoid double-logging here.
+    // ЗАМЕЧАНИЕ: шаг `init_syscalls` оркестратора загрузки печатает одну
+    // краткую строку `info!("syscalls")`; здесь намеренно не дублируем лог.
 }
 
-// ─── `syscall`-instruction kernel-stack mirror ───────────────────────────────
+// ─── зеркало стека ядра для инструкции `syscall` ─────────────────────────────
 //
-// Unlike `int 0x80`, the `syscall` instruction performs NO stack switch: on entry
-// the kernel is still running on the user's `rsp`. We must switch to a kernel
-// stack manually before pushing the saved-register frame. The kernel uses the
-// same per-task kernel stack the CPU loads from TSS `RSP0` for the `int 0x80`
-// path; since there is no per-CPU `GS` base set up (no `swapgs`), the `syscall`
-// stub cannot read `RSP0` out of the TSS cheaply, so we mirror the current RSP0
-// into this global whenever it is (re)programmed (`set_syscall_kernel_stack`,
-// called alongside `gdt::set_kernel_stack` in `task::process`).
+// В отличие от `int 0x80`, инструкция `syscall` НЕ переключает стек: на входе
+// ядро всё ещё работает на пользовательском `rsp`. Переключиться на стек ядра
+// нужно вручную, прежде чем класть фрейм сохранённых регистров. Ядро использует
+// тот же per-task стек, который CPU загружает из TSS `RSP0` для пути
+// `int 0x80`; per-CPU базы `GS` (и `swapgs`) нет, поэтому стаб `syscall` не
+// может дёшево прочитать `RSP0` из TSS, и мы зеркалируем текущий RSP0 в этот
+// глобал при каждом (пере)программировании (`set_syscall_kernel_stack`,
+// вызывается рядом с `gdt::set_kernel_stack` в `task::process`).
 //
-// Single-task model: there is exactly one RSP0 slot today (see
-// `gdt::set_kernel_stack`), so a single global mirror is exact. The `syscall`
-// window runs with IF masked (SFMASK), so this slot is not re-entered.
+// Модель одной задачи: слот RSP0 сейчас ровно один (см.
+// `gdt::set_kernel_stack`), поэтому одного глобального зеркала достаточно.
+// Окно `syscall` идёт с замаскированным IF (SFMASK), поэтому повторного входа в
+// этот слот нет.
 #[no_mangle]
 static mut SYSCALL_KERNEL_RSP: u64 = 0;
 #[no_mangle]
@@ -97,48 +98,50 @@ pub fn syscall_user_stack() -> u64 {
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RSP)) }
 }
 
-/// Mirror the current ring-3 → ring-0 kernel stack top (TSS `RSP0`) into the
-/// location the `syscall_entry` stub loads. Call this with the same value passed
-/// to `gdt::set_kernel_stack`.
+/// Отразить текущую вершину стека ядра для перехода ring-3 → ring-0 (TSS `RSP0`)
+/// туда, откуда её загружает стаб `syscall_entry`. Вызывать с тем же значением,
+/// что передаётся в `gdt::set_kernel_stack`.
 ///
-/// # Safety / invariants
-/// Single-task, init-time/per-task-spawn use only; written with interrupts
-/// effectively quiescent for the spawning window. The `syscall` stub reads it with
-/// IF masked, so there is no concurrent reader.
+/// # Safety / инварианты
+/// Только модель одной задачи, время инициализации или spawn'а задачи; запись
+/// происходит, когда прерывания для окна spawn'а фактически затихли. Стаб
+/// `syscall` читает значение с замаскированным IF, поэтому конкурентного
+/// читателя нет.
 pub fn set_syscall_kernel_stack(rsp0: u64) {
-    // SAFETY: single-writer, single-task bring-up; the only reader is the
-    // `syscall_entry` stub which runs with interrupts masked (SFMASK clears IF).
+    // SAFETY: один писатель, bring-up одной задачи; единственный читатель —
+    // стаб `syscall_entry`, исполняющийся с замаскированными прерываниями
+    // (SFMASK сбрасывает IF).
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!(SYSCALL_KERNEL_RSP), rsp0);
     }
 }
 
-// ─── int 0x80 system-call trampoline ─────────────────────────────────────────
+// ─── трамплин системных вызовов int 0x80 ─────────────────────────────────────
 //
-// The legacy pagh-native test program invokes syscalls via `int 0x80`. `int 0x80`
-// is the simpler of the two entries: the CPU automatically switches to the kernel
-// stack (TSS RSP0) on the ring-3 → ring-0 transition and `iretq` cleanly returns
-// to ring 3, so we avoid the manual stack switch the `syscall` path needs. The IDT
-// entry for vector 0x80 is installed with DPL=3 so ring-3 code may raise it (see
-// `idt::init`); that wiring is unchanged (R11.2).
+// Legacy-тестовая программа pagh зовёт syscall'ы через `int 0x80`. Это более
+// простой из двух входов: CPU сам переключается на стек ядра (TSS RSP0) при
+// переходе ring-3 → ring-0, а `iretq` чисто возвращает в ring 3, поэтому
+// ручное переключение стека, нужное пути `syscall`, здесь не требуется. Запись
+// IDT для вектора 0x80 ставится с DPL=3, чтобы код ring 3 мог её вызвать (см.
+// `idt::init`); эта проводка не менялась (R11.2).
 //
-// Widened entry (task 10.1): the stub now saves ALL 15 general-purpose registers
-// into a `SavedRegs` frame (see `linux::regs::SavedRegs`) and passes a single
-// pointer to that frame to `linux_dispatch`. Funnelling through one
-// `*mut SavedRegs` lets the dispatcher read the full Linux argument set
-// (number=rax, args=rdi,rsi,rdx,r10,r8,r9) and modify saved registers, while
-// sidestepping the SysV six-register argument limit. After the call the result is
-// written into the saved `rax` slot; every other GPR is restored unchanged so the
-// caller observes them preserved (R1.7), then `iretq` returns to ring 3.
+// Расширенный вход: стаб сохраняет ВСЕ 15 регистров общего назначения во фрейм
+// `SavedRegs` (см. `linux::regs::SavedRegs`) и передаёт диспетчеру один указатель
+// на этот фрейм. Единый `*mut SavedRegs` позволяет читать полный набор
+// аргументов Linux (номер=rax, аргументы=rdi,rsi,rdx,r10,r8,r9) и менять
+// сохранённые регистры, обходя предел SysV в шесть регистров-аргументов. После
+// вызова результат пишется в сохранённый слот `rax`; остальные GPR
+// восстанавливаются без изменений, так что вызывающий видит их сохранёнными
+// (R1.7), затем `iretq` возвращает в ring 3.
 //
-// On `int 0x80` the CPU pushes [SS, RSP, RFLAGS, CS, RIP] (5 qwords = 40 bytes,
-// no error code) onto RSP0. RSP0 is 16-byte aligned, so after those 40 bytes plus
-// our 15×8 = 120 bytes the stack is 160 bytes below RSP0 → 16-byte aligned exactly
-// at the `call` (the SysV requirement; no extra padding needed on this path).
+// На `int 0x80` CPU толкает [SS, RSP, RFLAGS, CS, RIP] (5 qword = 40 байт, без
+// кода ошибки) на RSP0. RSP0 выровнен на 16, поэтому после этих 40 байт плюс
+// наших 15×8 = 120 байт стек на 160 байт ниже RSP0 → ровно выровнен на 16 в
+// точке `call` (требование SysV; лишний паддинг на этом пути не нужен).
 //
-// SavedRegs layout contract: pushed first = rax = highest address = offset 112;
-// pushed last = r15 = lowest address = offset 0 = where rsp/the pointer points.
-// The `mov [rsp + 112], rax` therefore targets the saved `rax` slot.
+// Контракт раскладки SavedRegs: первым толкается rax = старший адрес =
+// смещение 112; последним — r15 = младший адрес = смещение 0 = куда указывает
+// rsp. Поэтому `mov [rsp + 112], rax` попадает в сохранённый слот `rax`.
 core::arch::global_asm!(
     ".global int80_stub",
     "int80_stub:",
@@ -157,23 +160,24 @@ core::arch::global_asm!(
     "    push r13",
     "    push r14",
     "    push r15",
-    // rsp now points at the SavedRegs frame (r15 at offset 0). Pass it as the
-    // sole (rdi) argument to linux_dispatch. rsp is 16-byte aligned here (see
-    // header). rsi carries the second argument: REENTRY_ALLOWED | INT80_ENTRY
-    // (1 | 2). Bit 0 says this is a real syscall on a schedulable task, so the
-    // dispatcher may unmask interrupts (blocking handlers need the timer tick).
-    // Bit 1 records the entry path as `int 0x80`: AGENTS.md invariant 2 forbids
-    // that for a Compat_Process, because the CPU-pushed frame makes the word at
-    // SavedRegs+120 the user RIP, not the per-task user-RSP slot signal delivery
-    // reads. `linux_dispatch` marks the process so the signal path refuses frame
-    // delivery instead of corrupting the user's code. The legacy native ring-3
-    // test process is unaffected (no compat state; its 1/2/3 numbers keep the
-    // legacy routing). rsi is free to clobber — the caller's value was pushed
-    // into the frame above.
+    // rsp теперь указывает на фрейм SavedRegs (r15 по смещению 0). Передаём
+    // его единственным (rdi) аргументом в linux_dispatch. rsp здесь выровнен на
+    // 16 (см. заголовок). rsi несёт второй аргумент:
+    // REENTRY_ALLOWED | INT80_ENTRY (1 | 2). Бит 0 говорит, что это настоящий
+    // syscall на планируемой задаче, поэтому диспетчер может размаскировать
+    // прерывания (блокирующим обработчикам нужен тик таймера). Бит 1 помечает
+    // входной путь как `int 0x80`: инвариант 2 из AGENTS.md запрещает это для
+    // Compat_Process, потому что CPU-положенный фрейм делает слово по
+    // SavedRegs+120 user RIP, а не слотом user-RSP задачи, который читает
+    // доставка сигнала. `linux_dispatch` помечает процесс, чтобы сигнальный путь
+    // отказался от доставки фрейма, а не портил код пользователя. Legacy-нативная
+    // ring-3 тест-программа не затронута (нет compat-состояния; её номера 1/2/3
+    // сохраняют legacy-маршрутизацию). rsi можно портить — значение вызывающего
+    // уже положено во фрейм выше.
     "    mov rdi, rsp",
     "    mov esi, 3",
     "    call linux_dispatch",
-    // Write the dispatcher's return value into the saved rax slot (offset 112).
+    // Записать возвращаемое значение диспетчера в сохранённый слот rax (смещение 112).
     "    mov [rsp + 112], rax",
     "    pop r15",
     "    pop r14",
@@ -193,51 +197,51 @@ core::arch::global_asm!(
     "    iretq",
 );
 
-// ─── `syscall`-instruction fast-path entry (LStar target) ────────────────────
+// ─── быстрый вход по инструкции `syscall` (цель LStar) ──────────────────────
 //
-// x86_64 static Linux binaries normally use the `syscall` instruction rather than
-// `int 0x80`. This stub is the `LStar` target programmed in `init()`. It funnels
-// into the SAME `linux_dispatch` as `int80_stub`, building an identical
-// `SavedRegs` frame, so the supported-set/validation/errno logic exists once.
+// Статические Linux-бины x86_64 обычно используют инструкцию `syscall`, а не
+// `int 0x80`. Этот стаб — цель `LStar`, записанная в `init()`. Он попадает в
+// ТОТ ЖЕ `linux_dispatch`, что и `int80_stub`, строя идентичный фрейм
+// `SavedRegs`, поэтому логика supported-set/валидации/errno существует один раз.
 //
-// `syscall` semantics the stub must honor:
-//   * The CPU saves user RIP into rcx and user RFLAGS into r11 (so we must keep
-//     rcx/r11 intact through to `sysretq`, which reloads RIP from rcx and RFLAGS
-//     from r11). They are saved in the frame and restored by the symmetric pops.
-//   * SFMASK clears IF, so the syscall window ENTERS with interrupts masked;
-//     `linux_dispatch` re-enables them once the frame is complete (blocking
-//     handlers need the timer tick to keep firing), and the exit path below
-//     re-masks IF (`cli`) before unwinding the frame.
-//   * The CPU performs NO stack switch: on entry rsp is still the USER stack. We
-//     must switch to the kernel stack before touching it. The user rsp passes
-//     through a global scratch only for the two masked-IF entry instructions,
-//     then lives in a PER-TASK slot pushed onto our own kernel stack (offset
-//     +120, just above the SavedRegs frame). A lone global is not thread-safe
-//     once clone threads exist: a sibling thread entering a syscall while we
-//     are blocked mid-window would overwrite it, and sysretq would then
-//     restore OUR ring-3 execution onto the SIBLING's user stack.
-//   * CS/SS are loaded from STAR on both `syscall` (kernel selectors) and
-//     `sysretq` (user selectors), consistent with the GDT layout in `gdt.rs`.
+// Семантика `syscall`, которую обязан соблюсти стаб:
+//   * CPU сохраняет user RIP в rcx и user RFLAGS в r11 (значит, rcx/r11 должны
+//     дожить до `sysretq`, который перезагружает RIP из rcx, а RFLAGS из r11).
+//     Они сохраняются во фрейм и восстанавливаются симметричными pop'ами.
+//   * SFMASK сбрасывает IF, поэтому окно syscall ВХОДИТ с замаскированными
+//     прерываниями; `linux_dispatch` включает их, когда фрейм собран
+//     (блокирующим обработчикам нужен тик таймера), а путь выхода ниже снова
+//     маскирует IF (`cli`) до снятия фрейма.
+//   * CPU НЕ переключает стек: на входе rsp всё ещё пользовательский. До любого
+//     обращения к нему надо переключиться на стек ядра. Пользовательский rsp
+//     проходит через глобальную царапину лишь на двух входных инструкциях с
+//     замаскированным IF, затем живёт в PER-TASK слоте, положенном на НАШ стек
+//     ядра (смещение +120, сразу над фреймом SavedRegs). Один глобал не
+//     потокобезопасен при наличии clone-потоков: соседний поток, входящий в
+//     syscall, пока мы заблокированы посреди окна, перезаписал бы его, и
+//     sysretq восстановил бы НАШ ring-3 на стеке СОСЕДА.
+//   * CS/SS загружаются из STAR и на `syscall` (селекторы ядра), и на
+//     `sysretq` (селекторы пользователя), согласованно с раскладкой GDT в `gdt.rs`.
 //
-// Stack alignment: after switching to the (16-byte aligned) kernel stack top,
-// the user-RSP slot push plus the 15 GPR pushes leave rsp at kernel_top-128 ≡ 0
-// (mod 16), so rsp is already 16-byte aligned at the `call` site and no extra
-// adjustment is needed around it.
+// Выравнивание стека: после переключения на (выровненную на 16) вершину стека
+// ядра push слота user-RSP плюс 15 push'ей GPR оставляют rsp на kernel_top-128
+// ≡ 0 (mod 16), поэтому rsp уже выровнен на 16 в точке `call` и лишняя
+// коррекция не нужна.
 core::arch::global_asm!(
     ".global syscall_entry",
     "syscall_entry:",
-    // Switch from the user stack to the kernel stack. rip-relative access to the
-    // module-global scratch/mirror; no GS/swapgs is required.
+    // Переключиться с пользовательского стека на стек ядра. rip-relative
+    // доступ к глобальной царапине/зеркалу модуля; GS/swapgs не нужен.
     "    mov [rip + SYSCALL_USER_RSP], rsp",
     "    mov rsp, [rip + SYSCALL_KERNEL_RSP]",
-    // Per-task user-RSP slot: park the user stack pointer on OUR OWN kernel
-    // stack (offset +120, just above the SavedRegs frame about to be pushed).
-    // The global above is only masked-IF entry scratch; the exit path must
-    // NOT read it back (another thread may have overwritten it while this
-    // one was blocked inside the window).
+    // Per-task слот user-RSP: припарковать указатель пользовательского стека на
+    // НАШЕМ стеке ядра (смещение +120, сразу над фреймом SavedRegs, который
+    // сейчас будет положен). Глобал выше — только царапина входа с
+    // замаскированным IF; путь выхода НЕ должен читать его обратно (другой поток
+    // мог перезаписать его, пока этот был заблокирован в окне).
     "    push qword ptr [rip + SYSCALL_USER_RSP]",
-    // Build the SavedRegs frame in the SAME order as int80_stub (rcx=user RIP and
-    // r11=user RFLAGS are captured here and restored before sysretq).
+    // Собрать фрейм SavedRegs в ТОМ ЖЕ порядке, что int80_stub (rcx=user RIP и
+    // r11=user RFLAGS захватываются здесь и восстанавливаются до sysretq).
     "    push rax",
     "    push rbx",
     "    push rcx",
@@ -253,21 +257,21 @@ core::arch::global_asm!(
     "    push r13",
     "    push r14",
     "    push r15",
-    "    mov rdi, rsp", // &SavedRegs (sole arg; rsp is 16-byte aligned here)
-    "    mov esi, 1",   // REENTRY_ALLOWED: real syscall on a schedulable task
+    "    mov rdi, rsp", // &SavedRegs (единственный аргумент; rsp здесь выровнен на 16)
+    "    mov esi, 1",   // REENTRY_ALLOWED: настоящий syscall на планируемой задаче
     "    call linux_dispatch",
-    // linux_dispatch re-enables interrupts for blocking handlers; re-mask IF
-    // so the frame unwind and the `pop rsp`/`sysretq` tail are atomic — an
-    // IRQ arriving after `pop rsp` would be delivered on the USER stack
-    // (same-privilege delivery performs no RSP0 switch). sysretq itself
-    // restores the user IF from r11.
+    // linux_dispatch включает прерывания для блокирующих обработчиков; снова
+    // маскируем IF, чтобы снятие фрейма и хвост `pop rsp`/`sysretq` были
+    // атомарны — IRQ, пришедший после `pop rsp`, был бы доставлен на
+    // ПОЛЬЗОВАТЕЛЬСКИЙ стек (доставка на том же уровне привилегий не
+    // переключает RSP0). Сам sysretq восстанавливает user IF из r11.
     "    cli",
     "    mov [rsp + 112], rax",
     "    pop r15",
     "    pop r14",
     "    pop r13",
     "    pop r12",
-    "    pop r11", // user RFLAGS -> r11 (consumed by sysretq)
+    "    pop r11", // user RFLAGS -> r11 (потребляется sysretq)
     "    pop r10",
     "    pop r9",
     "    pop r8",
@@ -275,31 +279,32 @@ core::arch::global_asm!(
     "    pop rdi",
     "    pop rsi",
     "    pop rdx",
-    "    pop rcx", // user RIP -> rcx (consumed by sysretq)
+    "    pop rcx", // user RIP -> rcx (потребляется sysretq)
     "    pop rbx",
     "    pop rax",
-    "    pop rsp", // per-task user RSP (slot pushed at entry; execve rewrites it)
+    "    pop rsp", // per-task user RSP (слот кладётся на входе; execve его переписывает)
     "    sysretq",
-    // SYSCALL_USER_RSP is a Rust-defined no_mangle static used ONLY as entry
-    // scratch under masked IF; execve rewrites the per-task +120 slot instead.
+    // SYSCALL_USER_RSP — определённый в Rust no_mangle static, используемый
+    // ТОЛЬКО как царапина входа при замаскированном IF; execve перезаписывает
+    // per-task слот +120.
 );
 
 extern "C" {
-    /// Naked `int 0x80` entry stub (see the `global_asm!` above). Installed as
-    /// the IDT vector-0x80 handler with DPL=3 by `idt::init`.
+    /// Naked-стаб входа `int 0x80` (см. `global_asm!` выше). Устанавливается
+    /// обработчиком IDT вектора 0x80 с DPL=3 в `idt::init`.
     pub fn int80_stub();
 
-    /// Naked `syscall`-instruction entry stub (see the `global_asm!` above).
-    /// Installed as the `LStar` MSR target by `init`.
+    /// Naked-стаб входа по инструкции `syscall` (см. `global_asm!` выше).
+    /// Устанавливается целью MSR `LStar` в `init`.
     pub fn syscall_entry();
 }
 
-/// Legacy pagh-native syscall dispatcher (`SYS_WRITE`/`SYS_EXIT`/`SYS_YIELD`).
+/// Legacy-диспетчер нативных syscall'ов pagh (`SYS_WRITE`/`SYS_EXIT`/`SYS_YIELD`).
 ///
-/// Retained as the boot-path compatibility target: `linux_dispatch` delegates the
-/// three native numbers here so the existing ring-3 test process keeps working
-/// until task 12.7 installs real Linux routing. `num` is the syscall number and
-/// `a1`..`a3` are the user arguments (originally in rdi/rsi/rdx).
+/// Сохранён как цель совместимости пути загрузки: `linux_dispatch` делегирует
+/// эти три нативных номера сюда, чтобы существующая ring-3 тест-программа
+/// работала, пока не появится настоящая Linux-маршрутизация. `num` — номер
+/// syscall, `a1`..`a3` — пользовательские аргументы (изначально в rdi/rsi/rdx).
 pub(crate) fn legacy_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     match num {
         SYS_WRITE => sys_write(a1, a2, a3),
@@ -315,50 +320,53 @@ pub(crate) fn legacy_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     }
 }
 
-/// Exclusive upper bound of the lower-half canonical address range.
+/// Исключающая верхняя граница канонического диапазона нижней половины.
 ///
-/// A canonical user pointer on x86_64 has bits 47..63 all zero, i.e. it must be
-/// strictly below `0x0000_8000_0000_0000`. Both the START and the END of a user
-/// buffer must satisfy this so the kernel never reads across into non-canonical
-/// or kernel space (Requirement 12.3).
+/// Канонический пользовательский указатель x86_64 имеет биты 47..63
+/// нулевыми, то есть обязан быть строго ниже `0x0000_8000_0000_0000`. И НАЧАЛО,
+/// И КОНЕЦ пользовательского буфера должны удовлетворять этому, чтобы ядро
+/// никогда не читало через границу в неканоническое или ядерное пространство
+/// (Requirement 12.3).
 const USER_CANONICAL_LIMIT: u64 = 0x0000_8000_0000_0000;
 
 fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
-    // ── Validation (Requirement 12.3): reject null / oversized / non-canonical
-    // / unmapped user pointers WITHOUT ever dereferencing them. ──────────────
+    // ── Валидация (Requirement 12.3): отвергать null / слишком длинные /
+    // неканонические / неотображённые пользовательские указатели, НИКОГДА их не
+    // разыменовывая. ─────────────────────────────────────────────────────────
     //
-    // Only stdout (fd 1) is writable.
+    // Записывать можно только в stdout (fd 1).
     if fd != 1 {
         return u64::MAX;
     }
-    // Non-null buffer and a bounded, non-zero length. `len <= 4096` bounds the
-    // buffer to at most two pages, keeping the page-presence walk below cheap.
+    // Ненулевой буфер и ограниченная ненулевая длина. `len <= 4096` ограничивает
+    // буфер максимум двумя страницами, сохраняя дешёвым обход присутствия страниц.
     if buf_ptr == 0 || len == 0 || len > 4096 {
         return u64::MAX;
     }
-    // Start must be a lower-half canonical pointer (bits 47..63 zero).
+    // Начало должно быть каноническим указателем нижней половины (биты 47..63 нулевые).
     if buf_ptr >= USER_CANONICAL_LIMIT {
         return u64::MAX;
     }
-    // The END of the buffer must also stay below the canonical boundary: reject
-    // on arithmetic overflow (wrap) or if the last byte would land in
-    // non-canonical / kernel space. `checked_add` catches the wrap case.
+    // КОНЕЦ буфера тоже должен остаться ниже канонической границы: отвергаем при
+    // арифметическом переполнении (wrap) или если последний байт попадёт в
+    // неканоническое/ядерное пространство. `checked_add` ловит wrap.
     match buf_ptr.checked_add(len) {
         Some(end) if end <= USER_CANONICAL_LIMIT => {}
         _ => return u64::MAX,
     }
 
-    // Page-presence check: confirm every page the buffer spans is actually
-    // mapped before reading, so the kernel never faults on an unmapped user
-    // pointer ("never dereference an unvalidated user pointer", design §Safety).
-    // The buffer spans at most two pages (len <= 4096); walk each page's base
-    // from `buf_ptr` to the page containing the last byte (`buf_ptr+len-1`).
+    // Проверка присутствия страниц: убедиться, что каждая страница буфера
+    // действительно отображена, прежде чем читать, чтобы ядро никогда не падало
+    // на неотображённом пользовательском указателе («никогда не разыменовывать
+    // непроверенный пользовательский указатель», design §Safety). Буфер
+    // занимает максимум две страницы (len <= 4096); обходим базы страниц от
+    // `buf_ptr` до страницы последнего байта (`buf_ptr+len-1`).
     let first_page = buf_ptr & !0xFFF;
     let last_page = (buf_ptr + len - 1) & !0xFFF;
     let mut page = first_page;
     loop {
         if crate::memory::vmm::virt_to_phys(page).is_none() {
-            // Unmapped page in the buffer's span: refuse without dereferencing.
+            // Неотображённая страница в диапазоне буфера: отказать, не разыменовывая.
             return u64::MAX;
         }
         if page == last_page {
@@ -367,25 +375,26 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
         page += 0x1000;
     }
 
-    // Route the write through the serial `Console` abstraction rather than the
-    // old per-byte `format_args!` hack (Requirement 12.2).
+    // Провести запись через абстракцию serial `Console`, а не через старый
+    // побайтовый хак `format_args!` (Requirement 12.2).
     use crate::drivers::Console;
     let console = crate::drivers::serial::console();
 
-    // SAFETY: `buf_ptr`/`len` were fully validated above: non-null, len <= 4096,
-    // start AND end within the lower-half canonical range, and every page the
-    // buffer spans confirmed mapped via `virt_to_phys`. The read therefore
-    // cannot fault on an unmapped page or cross into kernel space.
+    // SAFETY: `buf_ptr`/`len` полностью проверены выше: не null, len <= 4096,
+    // начало И конец в каноническом диапазоне нижней половины, и каждая страница
+    // диапазона подтверждена как отображённая через `virt_to_phys`. Поэтому
+    // чтение не может упасть на неотображённой странице или зайти в пространство
+    // ядра.
     let slice = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len as usize) };
 
     match core::str::from_utf8(slice) {
-        // Valid UTF-8: write the whole string in one shot.
+        // Валидный UTF-8: записать всю строку за один раз.
         Ok(s) => console.write_str(s),
-        // Invalid UTF-8: never panic. Write the valid prefix as a `&str`, then
-        // emit the remaining bytes individually as chars so output is robust.
+        // Невалидный UTF-8: не паниковать. Записать валидный префикс как `&str`,
+        // затем вывести оставшиеся байты по одному, чтобы вывод был устойчив.
         Err(e) => {
             let valid_up_to = e.valid_up_to();
-            // SAFETY: `from_utf8` guarantees `slice[..valid_up_to]` is valid UTF-8.
+            // SAFETY: `from_utf8` гарантирует, что `slice[..valid_up_to]` — валидный UTF-8.
             let prefix = unsafe { core::str::from_utf8_unchecked(&slice[..valid_up_to]) };
             console.write_str(prefix);
             for &byte in &slice[valid_up_to..] {
@@ -396,16 +405,16 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
         }
     }
 
-    // Report the number of bytes consumed from the user buffer.
+    // Сообщить число байт, потреблённых из буфера пользователя.
     len
 }
 
 fn sys_exit(code: u64) -> u64 {
     crate::debug!("sys_exit({})", code);
-    // Requirement 12.4: terminate ONLY the calling task and let the scheduler
-    // keep running other tasks. `exit_current` removes this task from the
-    // rotation and never returns (the next timer tick switches away and never
-    // schedules it again); it falls back to a full halt only if invoked on the
-    // idle task. This replaces the old `halt_loop()` which froze the whole CPU.
+    // Requirement 12.4: завершить ТОЛЬКО вызывающую задачу и дать планировщику
+    // продолжать другие. `exit_current` убирает задачу из ротации и никогда не
+    // возвращается (следующий тик уводит с неё и больше её не планирует);
+    // полный halt — только на idle-задаче. Это заменяет старый `halt_loop()`,
+    // замораживавший весь CPU.
     crate::task::scheduler::exit_current()
 }

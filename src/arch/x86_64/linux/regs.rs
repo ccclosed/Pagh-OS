@@ -1,20 +1,20 @@
-//! Saved general-purpose register frame shared by the two Linux syscall entry
-//! stubs (`int80_stub` and `syscall_entry`) and `linux_dispatch`.
+//! Сохранённый фрейм регистров общего назначения, общий для двух входных
+//! стабов syscall Linux (`int80_stub` и `syscall_entry`) и `linux_dispatch`.
 //!
-//! Both entry stubs push all 15 general-purpose registers in the **same order**
-//! and then pass a single pointer to the resulting frame to `linux_dispatch`.
-//! Funnelling through one `*mut SavedRegs` (rather than spreading six register
-//! arguments across the SysV C ABI, which only passes six in registers) keeps the
-//! dispatcher signature trivial and lets it both *read* the Linux argument
-//! registers and *modify* them (e.g. `arch_prctl(ARCH_SET_FS)` writing `FS.base`,
-//! or writing the result back into the saved `rax` slot).
+//! Оба входных стаба кладут все 15 регистров общего назначения в **одном
+//! порядке** и затем передают `linux_dispatch` один указатель на получившийся
+//! фрейм. Единый `*mut SavedRegs` (вместо размазывания шести регистров-аргументов
+//! по SysV C ABI, который передаёт в регистрах только шесть) делает подпись
+//! диспетчера тривиальной и позволяет ему и *читать* регистры-аргументы Linux, и
+//! *менять* их (например, `arch_prctl(ARCH_SET_FS)`, пишущий `FS.base`, или
+//! запись результата обратно в сохранённый слот `rax`).
 //!
-//! ## Layout contract (DO NOT REORDER)
+//! ## Контракт раскладки (НЕ ПЕРЕСТАВЛЯТЬ)
 //!
-//! The stubs push, from first to last:
+//! Стабы кладут, от первого к последнему:
 //!
 //! ```text
-//!   push rax   ; pushed first  -> HIGHEST address  (offset 112)
+//!   push rax   ; положен первым -> СТАРШИЙ адрес (смещение 112)
 //!   push rbx
 //!   push rcx
 //!   push rdx
@@ -28,28 +28,28 @@
 //!   push r12
 //!   push r13
 //!   push r14
-//!   push r15   ; pushed last   -> LOWEST address   (offset 0, == rsp)
+//!   push r15   ; положен последним -> МЛАДШИЙ адрес (смещение 0, == rsp)
 //! ```
 //!
-//! On x86 the stack grows down, so the register pushed *last* (`r15`) sits at the
-//! lowest address, which is where `rsp` points and therefore where the
-//! `*mut SavedRegs` pointer is taken. A `#[repr(C)]` struct lays its fields out
-//! from low to high address, so the field order below is the *reverse* of the push
-//! order. This makes each field's offset equal to the byte distance from `rsp`,
-//! and in particular places `rax` at offset `14 * 8 = 112` — exactly the slot the
-//! stubs target with `mov [rsp + 112], rax` when writing the syscall result back.
+//! На x86 стек растёт вниз, поэтому регистр, положенный *последним* (`r15`),
+//! стоит по младшему адресу — туда указывает `rsp` и оттуда берётся указатель
+//! `*mut SavedRegs`. `#[repr(C)]` раскладывает поля от младшего адреса к
+//! старшему, поэтому порядок полей ниже — *обратный* порядку push. Так смещение
+//! каждого поля равно байтовому расстоянию от `rsp`, и в частности `rax` попадает
+//! на смещение `14 * 8 = 112` — ровно тот слот, куда стабы пишут через
+//! `mov [rsp + 112], rax`, возвращая результат syscall.
 #![allow(dead_code)]
 
-/// The saved general-purpose register frame built by the syscall entry stubs.
+/// Сохранённый фрейм регистров общего назначения, построенный входными стабами
+/// syscall.
 ///
-/// Field order is the reverse of the stub push order so that the in-memory layout
-/// (offset 0 = `r15`, offset 112 = `rax`) matches the bytes on the kernel stack.
-/// `#[repr(C)]` is mandatory: the offsets are an ABI contract with hand-written
-/// assembly.
+/// Порядок полей обратен порядку push стабов, чтобы раскладка в памяти
+/// (смещение 0 = `r15`, смещение 112 = `rax`) совпадала с байтами на стеке ядра.
+/// `#[repr(C)]` обязателен: смещения — ABI-контракт с рукописным ассемблером.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SavedRegs {
-    /// `r15` — pushed last, lowest address (offset 0, where `rsp`/the pointer points).
+    /// `r15` — положен последним, младший адрес (смещение 0, куда указывает `rsp`/указатель).
     pub r15: u64,
     /// `r14`.
     pub r14: u64,
@@ -57,35 +57,36 @@ pub struct SavedRegs {
     pub r13: u64,
     /// `r12`.
     pub r12: u64,
-    /// `r11` — on the `syscall` path this holds the user `RFLAGS` the CPU saved.
+    /// `r11` — на пути `syscall` здесь лежит пользовательский `RFLAGS`, сохранённый CPU.
     pub r11: u64,
-    /// `r10` — Linux syscall argument 4 (`a4`).
+    /// `r10` — 4-й аргумент syscall Linux (`a4`).
     pub r10: u64,
-    /// `r9` — Linux syscall argument 6 (`a6`).
+    /// `r9` — 6-й аргумент syscall Linux (`a6`).
     pub r9: u64,
-    /// `r8` — Linux syscall argument 5 (`a5`).
+    /// `r8` — 5-й аргумент syscall Linux (`a5`).
     pub r8: u64,
     /// `rbp`.
     pub rbp: u64,
-    /// `rdi` — Linux syscall argument 1 (`a1`).
+    /// `rdi` — 1-й аргумент syscall Linux (`a1`).
     pub rdi: u64,
-    /// `rsi` — Linux syscall argument 2 (`a2`).
+    /// `rsi` — 2-й аргумент syscall Linux (`a2`).
     pub rsi: u64,
-    /// `rdx` — Linux syscall argument 3 (`a3`).
+    /// `rdx` — 3-й аргумент syscall Linux (`a3`).
     pub rdx: u64,
-    /// `rcx` — on the `syscall` path this holds the user `RIP` the CPU saved.
+    /// `rcx` — на пути `syscall` здесь лежит пользовательский `RIP`, сохранённый CPU.
     pub rcx: u64,
     /// `rbx`.
     pub rbx: u64,
-    /// `rax` — Linux syscall number on entry; the dispatcher's return value is
-    /// written back here (offset 112) before the stub restores and returns.
+    /// `rax` — номер syscall Linux на входе; сюда пишется возвращаемое значение
+    /// диспетчера (смещение 112) перед восстановлением и возвратом стаба.
     pub rax: u64,
 }
 
-// Compile-time guarantee that the layout matches the assembly contract: the frame
-// is exactly 15 registers (120 bytes) and `rax` is at offset 112.
+// Compile-time гарантия, что раскладка соответствует asm-контракту: фрейм —
+// ровно 15 регистров (120 байт), а `rax` на смещении 112.
 const _: () = {
     assert!(core::mem::size_of::<SavedRegs>() == 15 * 8);
-    // offset_of would be ideal but is not const-stable on all toolchains; the
-    // size check plus the documented field order pins the `rax` slot at 112.
+    // offset_of был бы идеален, но он не const-stable на всех toolchain'ах;
+    // проверка размера плюс документированный порядок полей закрепляют слот `rax`
+    // на 112.
 };

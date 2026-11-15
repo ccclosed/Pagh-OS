@@ -1,5 +1,4 @@
-// arch/x86_64/apic.rs — APIC subsystem: LAPIC timer, I/O APIC, IRQ dispatch
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// arch/x86_64/apic.rs — подсистема APIC: таймер LAPIC, I/O APIC, диспетчеризация IRQ.
 
 use crate::arch::x86_64::acpi::DEFAULT_LAPIC_PHYS;
 use crate::sync::spinlock::Spinlock;
@@ -32,7 +31,7 @@ fn disable_pic() {
     let mut cmd_slave: Port<u8> = Port::new(0xA0);
     let mut data_slave: Port<u8> = Port::new(0xA1);
 
-    // SAFETY: Port I/O to standard PIC addresses.
+    // SAFETY: port I/O к стандартным адресам PIC.
     unsafe {
         cmd_master.write(0x11);
         cmd_slave.write(0x11);
@@ -49,61 +48,65 @@ fn disable_pic() {
 }
 
 unsafe fn lapic_write(reg: u32, value: u32) {
-    // LAPIC_BASE holds an already-HHDM-mapped virtual base: `init_apic` stores
-    // what `vmm::map_mmio` returned, so HHDM must NOT be added again here.
+    // LAPIC_BASE хранит уже HHDM-отображённую виртуальную базу: `init_apic`
+    // сохраняет то, что вернул `vmm::map_mmio`, поэтому HHDM здесь добавлять НЕЛЬЗЯ.
     let addr = (LAPIC_BASE.load(Ordering::Relaxed) + reg as u64) as *mut u32;
-    // SAFETY: LAPIC_BASE holds the HHDM-mapped LAPIC MMIO virtual base, set once
-    // in `init` before any register access; `addr` is therefore a valid mapped
-    // device-memory location and the volatile write targets a real LAPIC register.
+    // SAFETY: LAPIC_BASE хранит HHDM-отображённую виртуальную базу MMIO LAPIC,
+    // установленную один раз в `init` до любого доступа к регистрам; `addr` —
+    // валидный отображённый адрес памяти устройства, и volatile-запись попадает
+    // в реальный регистр LAPIC.
     ptr::write_volatile(addr, value);
 }
 
 unsafe fn lapic_read(reg: u32) -> u32 {
-    // LAPIC_BASE holds an already-HHDM-mapped virtual base (see `lapic_write`).
+    // LAPIC_BASE хранит уже HHDM-отображённую виртуальную базу (см. `lapic_write`).
     let addr = (LAPIC_BASE.load(Ordering::Relaxed) + reg as u64) as *const u32;
-    // SAFETY: LAPIC_BASE holds the HHDM-mapped LAPIC MMIO virtual base, set once
-    // in `init` before any register access; `addr` is therefore a valid mapped
-    // device-memory location and the volatile read targets a real LAPIC register.
+    // SAFETY: LAPIC_BASE хранит HHDM-отображённую виртуальную базу MMIO LAPIC,
+    // установленную один раз в `init` до любого доступа к регистрам; `addr` —
+    // валидный отображённый адрес памяти устройства, и volatile-чтение идёт из
+    // реального регистра LAPIC.
     ptr::read_volatile(addr)
 }
 
 unsafe fn ioapic_write(reg: u32, value: u32) {
-    // IOAPIC_BASE should be virtual (HHDM-mapped) if non-zero
+    // IOAPIC_BASE должен быть виртуальным (HHDM-отображённым), если ненулевой
     let base = IOAPIC_BASE.load(Ordering::Relaxed);
     let sel = (base + IOAPIC_REG_SEL as u64) as *mut u32;
     let win = (base + IOAPIC_REG_WIN as u64) as *mut u32;
-    // SAFETY: callers only invoke this once IOAPIC_BASE is set to the non-zero
-    // HHDM-mapped I/O APIC MMIO base; `sel`/`win` therefore point at the valid
-    // mapped index/data register pair and the volatile writes target real registers.
+    // SAFETY: вызывающие приходят сюда только когда IOAPIC_BASE установлена в
+    // ненулевую HHDM-отображённую базу MMIO I/O APIC; поэтому `sel`/`win`
+    // указывают на валидную пару регистров index/data, и volatile-записи идут в
+    // реальные регистры.
     ptr::write_volatile(sel, reg);
     ptr::write_volatile(win, value);
 }
 
 unsafe fn ioapic_read(reg: u32) -> u32 {
-    // IOAPIC_BASE should be virtual (HHDM-mapped) if non-zero
+    // IOAPIC_BASE должен быть виртуальным (HHDM-отображённым), если ненулевой
     let base = IOAPIC_BASE.load(Ordering::Relaxed);
     let sel = (base + IOAPIC_REG_SEL as u64) as *mut u32;
     let win = (base + IOAPIC_REG_WIN as u64) as *mut u32;
-    // SAFETY: callers only invoke this once IOAPIC_BASE is set to the non-zero
-    // HHDM-mapped I/O APIC MMIO base; `sel`/`win` therefore point at the valid
-    // mapped index/data register pair and the volatile accesses target real registers.
+    // SAFETY: вызывающие приходят сюда только когда IOAPIC_BASE установлена в
+    // ненулевую HHDM-отображённую базу MMIO I/O APIC; поэтому `sel`/`win`
+    // указывают на валидную пару регистров index/data, и volatile-доступы идут в
+    // реальные регистры.
     ptr::write_volatile(sel, reg);
     ptr::read_volatile(win)
 }
 
 fn init_lapic() {
-    // Enable LAPIC via MSR if needed (IA32_APIC_BASE, MSR 0x1B).
-    // read_msr is safe (no memory effect); the write stays unsafe below.
+    // При необходимости включить LAPIC через MSR (IA32_APIC_BASE, MSR 0x1B).
+    // read_msr безопасен (нет эффектов на память); запись ниже остаётся unsafe.
     let mut apic_base_msr = crate::arch::cpu::read_msr(0x1B);
     crate::debug!("LAPIC MSR before: 0x{:016x}", apic_base_msr);
 
-    // x2APIC (bit 10) puts the LAPIC behind MSRs and takes the memory-mapped
-    // register window away. Firmware on modern machines may hand over with it
-    // already enabled, and this driver is a memory-mapped one: every later
-    // `lapic_write` would go to a window the CPU no longer answers at, which is
-    // exactly a boot that stops right here with no output on a machine whose
-    // firmware enabled x2APIC. Disable it (the architectural way back to xAPIC)
-    // and say so, rather than reading registers that are no longer there.
+    // x2APIC (бит 10) уводит LAPIC за MSR и отбирает окно регистров,
+    // отображённое в память. Прошивка современных машин может передать
+    // управление уже с ним, а этот драйвер — memory-mapped: каждая последующая
+    // `lapic_write` шла бы в окно, которое CPU больше не обслуживает, то есть
+    // загрузка вставала бы здесь без вывода на машине с включённым прошивкой
+    // x2APIC. Выключаем его (архитектурный путь назад к xAPIC) и сообщаем об
+    // этом, вместо чтения регистров, которых больше нет.
     if apic_base_msr & (1 << 10) != 0 {
         crate::warn!("LAPIC: x2APIC was enabled by firmware; switching to xAPIC (MMIO)");
         apic_base_msr &= !(1 << 10);
@@ -112,23 +115,25 @@ fn init_lapic() {
         ));
     }
 
-    // Set bit 11 (global enable)
+    // Установить бит 11 (глобальное включение)
     apic_base_msr |= 1 << 11;
 
-    // SAFETY: Setting the IA32_APIC_BASE global-enable bit (bit 11) while
-    // preserving the existing base address is the intended, sound LAPIC
-    // reconfiguration; we read-modify-write the same MSR and program no new
-    // address, so the LAPIC stays at its current (already-mapped) location.
+    // SAFETY: установка бита глобального включения IA32_APIC_BASE (бит 11) с
+    // сохранением существующего базового адреса — намеренная корректная
+    // реконфигурация LAPIC; мы делаем read-modify-write того же MSR и не
+    // программируем новый адрес, поэтому LAPIC остаётся на текущем (уже
+    // отображённом) месте.
     unsafe {
         crate::arch::cpu::write_msr(0x1B, apic_base_msr);
     }
 
     crate::debug!("LAPIC MSR after: 0x{:016x} (enabled)", apic_base_msr);
 
-    // SAFETY: LAPIC_BASE points at the HHDM-mapped LAPIC MMIO region; the
-    // volatile register reads/writes below target valid mapped device memory.
+    // SAFETY: LAPIC_BASE указывает на HHDM-отображённый регион MMIO LAPIC;
+    // volatile-доступы к регистрам ниже идут в валидную отображённую память
+    // устройства.
     unsafe {
-        // Configure LAPIC registers
+        // Настроить регистры LAPIC
         let spurious = SPURIOUS_VECTOR | SPURIOUS_ENABLE;
         lapic_write(LAPIC_SPURIOUS, spurious);
         let spurious_read = lapic_read(LAPIC_SPURIOUS);
@@ -138,21 +143,20 @@ fn init_lapic() {
             spurious_read
         );
 
-        lapic_write(LAPIC_TIMER_DIV, 3); // Divide by 16
+        lapic_write(LAPIC_TIMER_DIV, 3); // Деление на 16
 
-        // MEASURE the timer instead of trusting a constant.
+        // ИЗМЕРИТЬ таймер, а не доверять константе.
         //
-        // The LAPIC timer counts at the platform's bus clock divided by the
-        // configured divider — 1 GHz / 16 under QEMU, tens of MHz on real
-        // hardware. Programming it from the QEMU constant made every tick worth
-        // ~1/60th of a millisecond on a real machine: the shell's clock advanced
-        // one second per minute and every timeout was 60x too long. The PIT is
-        // the only clock here that does not depend on the CPU, so it is the
-        // reference: count LAPIC ticks across a known PIT interval.
+        // Таймер LAPIC считает на частоте шины платформы, делённой на
+        // настроенный делитель — 1 ГГц / 16 под QEMU, десятки МГц на реальном
+        // железе. Программирование по константе QEMU делало тик на реальной
+        // машине ~1/60 мс: часы шелла уходили на секунду за минуту, а все
+        // таймауты были в 60 раз длиннее. PIT — единственные часы, не зависящие
+        // от CPU, поэтому он эталон: считаем тики LAPIC за известный интервал PIT.
         //
-        // The measurement is taken WITH the divider programmed, so it is the
-        // rate the counter itself runs at. Dividing by the divider again (the
-        // first version of this code) made each tick 16x too long.
+        // Измерение делается С запрограммированным делителем, то есть это
+        // скорость самого счётчика. Повторное деление на делитель (первая
+        // версия кода) делало каждый тик в 16 раз длиннее.
         let measured = calibrate_timer_hz();
         let effective_hz = measured.unwrap_or(APIC_TIMER_BASE_HZ / APIC_TIMER_DIVIDER);
         let init_count = (effective_hz / TICK_HZ).clamp(1, u32::MAX as u64);
@@ -180,12 +184,12 @@ fn init_lapic() {
         );
         lapic_write(LAPIC_TIMER_INIT, init_count as u32);
 
-        let timer_cfg = 32 | (1 << 17); // Vector 32, periodic mode
+        let timer_cfg = 32 | (1 << 17); // Вектор 32, периодический режим
         lapic_write(LAPIC_LVT_TIMER, timer_cfg);
         let timer_read = lapic_read(LAPIC_LVT_TIMER);
         crate::debug!("Timer LVT: wrote=0x{:x} read=0x{:x}", timer_cfg, timer_read);
 
-        // Check if timer is masked
+        // Проверить, не замаскирован ли таймер
         if (timer_read & (1 << 16)) != 0 {
             crate::warn!("Timer is MASKED! Unmasking...");
             lapic_write(LAPIC_LVT_TIMER, timer_cfg & !(1 << 16));
@@ -196,58 +200,56 @@ fn init_lapic() {
     crate::debug!("LAPIC fully configured (vector 32, {} Hz)", TICK_HZ);
 }
 
-/// Measure the LAPIC timer's counting frequency in Hz using the PIT as the
-/// reference clock.
+/// Измерить частоту счёта таймера LAPIC в Гц, используя PIT как эталонные часы.
 ///
-/// HOW. PIT channel 2 is put in mode 0 (interrupt on terminal count) with a count
-/// that expires after ~10 ms; the LAPIC timer is then started from its maximum
-/// count, and the two are compared when the PIT output goes high. The LAPIC value
-/// that elapsed in that window is the number of LAPIC ticks per 10 ms, i.e. the
-/// frequency with the configured divider.
+/// КАК. Канал 2 PIT ставится в режим 0 (interrupt on terminal count) со счётом
+/// на ~10 мс; таймер LAPIC запускается с максимума, и при переходе выхода PIT
+/// в высокий уровень значения сравниваются. Прошедшее значение LAPIC — число
+/// тиков LAPIC за 10 мс, то есть частота с настроенным делителем.
 ///
-/// WHY THE PIT. It runs at a fixed 1.193182 MHz from its own crystal and does not
-/// depend on the CPU, the bus clock or any ACPI table, which is exactly what is
-/// needed to measure a clock whose rate is the unknown. Reading the TSC instead
-/// would just measure one unknown against another.
+/// ПОЧЕМУ PIT. Он идёт от собственного кварца на фиксированных 1.193182 МГц и
+/// не зависит от CPU, частоты шины или таблиц ACPI — именно это нужно, чтобы
+/// измерить часы с неизвестной частотой. Чтение TSC просто сравнивало бы одну
+/// неизвестную с другой.
 ///
-/// Returns `None` if the PIT never reports completion (no PIT, or a firmware that
-/// traps port 0x42/0x43) — the caller then keeps its default constant.
+/// `None`, если PIT так и не сообщил о завершении (нет PIT или прошивка
+/// перехватывает порты 0x42/0x43) — тогда вызывающий оставляет свою константу.
 unsafe fn calibrate_timer_hz() -> Option<u64> {
     use x86_64::instructions::port::Port;
 
     const PIT_CHANNEL2: u16 = 0x42;
     const PIT_COMMAND: u16 = 0x43;
     const PIT_FREQ: u64 = 1_193_182;
-    /// ~10 ms.
+    /// ~10 мс.
     const PIT_COUNT: u16 = 11_932;
 
     let mut cmd: Port<u8> = Port::new(PIT_COMMAND);
     let mut ch2: Port<u8> = Port::new(PIT_CHANNEL2);
     let mut gate: Port<u8> = Port::new(0x61);
 
-    // SAFETY: ports 0x42/0x43/0x61 are the standard PIT/speaker ports; the writes
-    // program channel 2 as a one-shot counter with the speaker left off.
+    // SAFETY: порты 0x42/0x43/0x61 — стандартные порты PIT/динамика; записи
+    // программируют канал 2 как одноразовый счётчик с выключенным динамиком.
     unsafe {
-        // Speaker off, channel-2 gate on (bit 0), so counting is enabled.
+        // Динамик выключен, gate канала 2 включён (бит 0), счёт разрешён.
         let p61 = gate.read();
         gate.write((p61 & !0x02) | 0x01);
-        // Channel 2, lobyte/hibyte, mode 0 (terminal count), binary.
+        // Канал 2, lobyte/hibyte, режим 0 (terminal count), двоичный.
         cmd.write(0b1011_0000);
         ch2.write((PIT_COUNT & 0xFF) as u8);
         ch2.write((PIT_COUNT >> 8) as u8);
 
-        // Start the LAPIC timer from its maximum so the elapsed value is the
-        // count that fits in the window.
-        lapic_write(LAPIC_TIMER_DIV, 3); // divide by 16, same as the real config
+        // Запустить таймер LAPIC с максимума, чтобы прошедшее значение было
+        // счётом, помещающимся в окно.
+        lapic_write(LAPIC_TIMER_DIV, 3); // деление на 16, как в реальной конфигурации
         lapic_write(LAPIC_TIMER_INIT, 0xFFFF_FFFF);
 
-        // Wait for the PIT output to go high: bit 5 of port 0x61 is the channel-2
-        // output state, set when the count reaches zero.
+        // Ждать перехода выхода PIT в высокий уровень: бит 5 порта 0x61 —
+        // состояние выхода канала 2, ставится при достижении нуля счёта.
         let mut spins: u32 = 0;
         while gate.read() & 0x20 == 0 {
             spins += 1;
             if spins > 50_000_000 {
-                // Restore the gate and give up rather than hanging the boot.
+                // Восстановить gate и сдаться, а не вешать загрузку.
                 gate.write(p61);
                 return None;
             }
@@ -256,16 +258,16 @@ unsafe fn calibrate_timer_hz() -> Option<u64> {
 
         let elapsed = 0xFFFF_FFFFu32.wrapping_sub(lapic_read(LAPIC_TIMER_CUR));
         gate.write(p61);
-        // Stop the timer until the real configuration is programmed.
+        // Остановить таймер до программирования реальной конфигурации.
         lapic_write(LAPIC_TIMER_INIT, 0);
 
         if elapsed == 0 || elapsed == 0xFFFF_FFFF {
             return None;
         }
-        // elapsed counts per (PIT_COUNT / PIT_FREQ) seconds.
+        // прошедшие счёты за (PIT_COUNT / PIT_FREQ) секунд.
         let hz = (elapsed as u64 * PIT_FREQ) / PIT_COUNT as u64;
-        // A plausible LAPIC frequency is between 1 MHz and 4 GHz; anything else
-        // means the measurement is bogus and the caller should keep its default.
+        // Правдоподобная частота LAPIC — от 1 МГц до 4 ГГц; всё прочее означает
+        // ошибочное измерение, и вызывающий должен оставить значение по умолчанию.
         if (1_000_000..=4_000_000_000).contains(&hz) {
             Some(hz)
         } else {
@@ -274,24 +276,24 @@ unsafe fn calibrate_timer_hz() -> Option<u64> {
     }
 }
 
-/// Scheduler timer tick rate (the LAPIC periodic timer). Every conversion
-/// between ticks and real time in the kernel derives from this constant:
-/// `clock_gettime`/`times` granularity, the network stack's monotonic clock, and the
-/// tick-denominated network timeouts.
+/// Частота тика планировщика (периодический таймер LAPIC). От этой константы
+/// выводится каждое преобразование тиков в реальное время в ядре:
+/// гранулярность `clock_gettime`/`times`, монотонные часы сетевого стека и
+/// сетевые таймауты в тиках.
 ///
-/// Practical ceiling: each tick costs one IRQ delivery (~thousands of cycles),
-/// so rates beyond a few kHz starve everything else; 1000 Hz matches the
-/// classic Linux `CONFIG_HZ=1000` desktop setting. Going higher requires a
-/// one-shot/TSC-deadline (tickless) timer instead of periodic mode.
+/// Практический потолок: каждый тик стоит одну доставку IRQ (~тысячи циклов),
+/// поэтому частоты выше нескольких кГц морят всё остальное; 1000 Гц совпадает с
+/// классической настройкой Linux `CONFIG_HZ=1000`. Выше — только
+/// one-shot/TSC-deadline (tickless) таймер вместо периодического режима.
 pub const TICK_HZ: u64 = 1000;
 
-/// Platform bus clock driving the LAPIC timer under QEMU (`-cpu max`: 1 GHz).
+/// Частота шины платформы, тактирующей таймер LAPIC под QEMU (`-cpu max`: 1 ГГц).
 const APIC_TIMER_BASE_HZ: u64 = 1_000_000_000;
 
-/// LAPIC timer divider configured in `init_apic` (write value 3 = divide by 16).
+/// Делитель таймера LAPIC, настроенный в `init_apic` (значение записи 3 = деление на 16).
 const APIC_TIMER_DIVIDER: u64 = 16;
 
-/// Convert milliseconds to scheduler ticks, rounding up.
+/// Перевести миллисекунды в тики планировщика с округлением вверх.
 pub const fn ms_to_ticks(ms: u64) -> u64 {
     (ms * TICK_HZ + 999) / 1000
 }
@@ -300,8 +302,9 @@ fn init_ioapic() {
     if IOAPIC_BASE.load(Ordering::Relaxed) == 0 {
         return;
     }
-    // SAFETY: IOAPIC_BASE is non-zero here, so it holds the HHDM-mapped I/O APIC
-    // MMIO base; the ioapic_read/write helpers access only valid mapped registers.
+    // SAFETY: здесь IOAPIC_BASE ненулевая, то есть хранит HHDM-отображённую базу
+    // MMIO I/O APIC; хелперы ioapic_read/write трогают только валидные
+    // отображённые регистры.
     unsafe {
         let ver = ioapic_read(0x01);
         let max_redir = ((ver >> 16) & 0xFF) + 1;
@@ -319,23 +322,23 @@ pub fn init() {
     let lapic_phys = addrs.lapic_phys;
     let ioapic_phys = addrs.ioapic_phys;
 
-    // The APIC owns its own MMIO mapping (Requirement 7.4): establish the
-    // LAPIC/IOAPIC mappings here via the VMM's `map_mmio` helper before any
-    // register access. `map_mmio` maps NO_CACHE|NO_EXECUTE|PRESENT|WRITABLE
-    // through the HHDM window and returns the virtual base, which equals
-    // `phys + hhdm` — the same value previously computed by hand — so
-    // LAPIC_BASE/IOAPIC_BASE are unchanged.
-    // Say what the firmware reported BEFORE touching it: on a real machine the
-    // only evidence of a bad MADT entry is the address itself, and the boot dies
-    // before anything else can print it.
+    // APIC владеет собственным MMIO-отображением (Requirement 7.4): создать
+    // отображения LAPIC/IOAPIC здесь через `map_mmio` из VMM до любого доступа к
+    // регистрам. `map_mmio` отображает NO_CACHE|NO_EXECUTE|PRESENT|WRITABLE через
+    // окно HHDM и возвращает виртуальную базу, равную `phys + hhdm` — тому же
+    // значению, которое раньше считалось вручную, — поэтому LAPIC_BASE/
+    // IOAPIC_BASE не меняются.
+    // Сказать, что сообщила прошивка, ДО обращения к ней: на реальной машине
+    // единственное свидетельство плохой записи MADT — сам адрес, а загрузка
+    // умирает раньше, чем что-то ещё успеет его напечатать.
     crate::drivers::earlyfb::println(format_args!(
         "acpi: lapic_phys={:#x} ioapic_phys={:#x}",
         lapic_phys, ioapic_phys
     ));
 
-    // A mapping failure is reported, not fatal, and falls back to the
-    // architectural LAPIC base: firmware that reports a bogus address should cost
-    // us one warning line, not the whole boot.
+    // Ошибка отображения сообщается, но не фатальна: откат к архитектурной базе
+    // LAPIC. Прошивка с неверным адресом должна стоить одной строки
+    // предупреждения, а не всей загрузки.
     let lapic_virt = match crate::memory::vmm::map_mmio(lapic_phys, 0x1000) {
         Ok(v) => v,
         Err(e) => {
@@ -407,8 +410,9 @@ pub fn route_irq(isa_irq: u8, vector: u8) {
     if IOAPIC_BASE.load(Ordering::Relaxed) == 0 {
         return;
     }
-    // SAFETY: IOAPIC_BASE is non-zero here, so it holds the HHDM-mapped I/O APIC
-    // MMIO base; ioapic_write only touches the valid mapped redirection registers.
+    // SAFETY: здесь IOAPIC_BASE ненулевая, то есть хранит HHDM-отображённую базу
+    // MMIO I/O APIC; ioapic_write трогает только валидные отображённые регистры
+    // перенаправления.
     unsafe {
         let reg = IOAPIC_REDTBL_BASE + (isa_irq as u32) * 2;
         ioapic_write(reg, vector as u32);

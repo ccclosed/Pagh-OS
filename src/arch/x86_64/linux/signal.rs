@@ -1,72 +1,73 @@
-//! Signal delivery machinery — the kernel-only glue between the pure frame ABI
-//! ([`super::signal_frame`]), the pure `kill(2)` argument/errno model
-//! ([`super::kill`]), the per-process signal state in [`crate::task::compat`],
-//! and the syscall entry path.
+//! Механизм доставки сигналов — ядерный клей между чистым ABI фрейма
+//! ([`super::signal_frame`]), чистой моделью аргументов/errno `kill(2)`
+//! ([`super::kill`]), per-process сигнальным состоянием в
+//! [`crate::task::compat`] и путём входа syscall.
 //!
-//! ## Where signals are delivered
+//! ## Где доставляются сигналы
 //!
-//! Phase 1 delivers at exactly ONE point: the tail of
-//! [`super::linux_dispatch`], after the syscall's `Result` has been folded
-//! but before the entry stub writes the return value and unwinds the
-//! `SavedRegs` frame. A pending, unblocked signal with a user handler gets an
-//! `rt_sigframe` built on the user stack and the saved registers rewritten so
-//! `sysretq` lands in the handler; a default-terminate signal kills the
-//! process right there. Blocking kernel waits are interrupted through the
-//! `EINTR` checks the wait loops perform with [`has_deliverable_current`].
+//! Доставка происходит ровно в ОДНОЙ точке: в хвосте
+//! [`super::linux_dispatch`], после того как `Result` syscall'а сложен, но до
+//! того как входной стаб запишет возвращаемое значение и снимет фрейм
+//! `SavedRegs`. Ожидающий незаблокированный сигнал с пользовательским
+//! обработчиком получает `rt_sigframe` на пользовательском стеке, а сохранённые
+//! регистры переписываются так, что `sysretq` попадает в обработчик; сигнал с
+//! завершением по умолчанию убивает процесс прямо здесь. Блокирующие ожидания в
+//! ядре прерываются проверками `EINTR`, которые циклы ожидания выполняют через
+//! [`has_deliverable_current`].
 //!
-//! Delivery also happens at the timer-tick return path (`tick_action`, for a
-//! CPU-bound task that never enters a syscall) and stop/continue are real
-//! scheduler state (a stopped task keeps its frame and leaves rotation), so the
-//! only remaining delivery limit is that a signal is observed at a syscall or
-//! tick boundary — never in the middle of a kernel computation.
+//! Доставка также бывает на пути возврата тика (`tick_action`, для CPU-bound
+//! задачи, никогда не входящей в syscall), а stop/continue — настоящее состояние
+//! планировщика (остановленная задача сохраняет фрейм и уходит из ротации),
+//! поэтому единственное оставшееся ограничение — сигнал наблюдается на границе
+//! syscall или тика, никогда посреди вычисления в ядре.
 //!
-//! ## Sending: `kill(2)`, `tgkill` and the group broadcast
+//! ## Отправка: `kill(2)`, `tgkill` и групповая рассылка
 //!
-//! [`send_signal`] queues onto ONE thread. [`sys_kill`] (`kill`, nr 62) decodes
-//! the `pid_t`/`int` arguments, classifies the target (`pid > 0`, `0`, `-1`,
-//! `-pgid`) via [`super::kill`], resolves it to a SNAPSHOT of pids and queues the
-//! signal once per addressed process group (`kill::pick_group_target`), which is
-//! what Linux's shared group-pending list achieves. [`send_signal_to_pgid_all`]
-//! is the per-THREAD-GROUP variant the terminal and shell stop/continue paths
-//! need (a group stop parks one thread group at a time). Errno decisions (EINVAL
-//! before any lookup, `ESRCH` for `INT_MIN` and empty groups, `EPERM` when no
-//! target is signalable by the caller's effective uid) are documented on
-//! `kill::kill_args`.
+//! [`send_signal`] ставит сигнал ОДНОМУ потоку. [`sys_kill`] (`kill`, nr 62)
+//! декодирует аргументы `pid_t`/`int`, классифицирует цель (`pid > 0`, `0`, `-1`,
+//! `-pgid`) через [`super::kill`], сводит её к СНИМКУ pid и ставит сигнал один раз
+//! на адресованную группу процессов (`kill::pick_group_target`) — это то, чего
+//! Linux достигает общим group-pending списком. [`send_signal_to_pgid_all`] —
+//! вариант на каждую ГРУППУ ПОТОКОВ, нужный путям stop/continue терминала и
+//! шелла (групповой stop паркует одну группу потоков за раз). Решения errno
+//! (EINVAL до любого поиска, `ESRCH` для `INT_MIN` и пустых групп, `EPERM`,
+//! когда ни одну цель нельзя сигнализировать по effective uid вызывающего)
+//! документированы в `kill::kill_args`.
 //!
-//! ## Path assumption: compat ⇒ `syscall_entry`
+//! ## Предположение о пути: compat ⇒ `syscall_entry`
 //!
-//! Signal delivery only ever runs for Compat_Processes (native tasks have no
-//! signal state), and a Compat_Process enters syscalls exclusively through
-//! the `syscall`-instruction stub. On that path the per-task user-RSP slot at
-//! `SavedRegs + 120` holds the live user RSP (the same slot `execve` and
-//! `clone` already read/write), the saved `rcx` is the user RIP and the saved
-//! `r11` is the user RFLAGS. An `int 0x80`-entering compat process would find
-//! a different meaning in those slots — the CPU-pushed user RIP at `+120` — so
-//! the frame is never interpreted blind. Two guards enforce this, in order:
+//! Доставка сигналов идёт только для Compat_Process (у нативных задач нет
+//! сигнального состояния), а Compat_Process входит в syscall исключительно через
+//! стаб инструкции `syscall`. На этом пути per-task слот user-RSP по
+//! `SavedRegs + 120` хранит живой user RSP (тот же слот, который уже читают/пишут
+//! `execve` и `clone`), сохранённый `rcx` — user RIP, а сохранённый `r11` — user
+//! RFLAGS. У compat-процесса, вошедшего через `int 0x80`, эти слоты значат
+//! другое — положенный CPU user RIP по `+120` — поэтому фрейм никогда не
+//! интерпретируется вслепую. Это обеспечивают две проверки по порядку:
 //!
-//!   1. **Exact**: `linux_dispatch` records every `int 0x80` entry on the
-//!      process (`linux::INT80_ENTRY`, `compat::current_int80_entry`). A
-//!      process observed on that path never gets a frame: the signal is
-//!      consumed, one `[signal] ... refused: int 0x80 entry` diagnostic is
-//!      printed, and a default-fatal signal is executed through
-//!      [`force_terminate_group`] instead of being written into user memory.
-//!   2. **Last resort**: [`frame_carries_syscall_view`] rejects any frame whose
-//!      saved `r11` lacks RFLAGS bit 1 (architecturally always set) — a `syscall`
-//!      entry cannot produce such a frame, so an entry path nobody has thought
-//!      of yet degrades to "signal consumed, nothing written" rather than to a
-//!      corrupted user address space.
+//!   1. **Точная**: `linux_dispatch` записывает каждый вход `int 0x80` на
+//!      процесс (`linux::INT80_ENTRY`, `compat::current_int80_entry`). Процесс,
+//!      замеченный на этом пути, фрейма не получает: сигнал потребляется,
+//!      печатается одна диагностика `[signal] ... refused: int 0x80 entry`, а
+//!      фатальный по умолчанию сигнал исполняется через
+//!      [`force_terminate_group`] вместо записи в память пользователя.
+//!   2. **Последняя линия**: [`frame_carries_syscall_view`] отвергает фрейм, чей
+//!      сохранённый `r11` не имеет бита 1 RFLAGS (архитектурно всегда
+//!      установленного) — вход `syscall` не может дать такой фрейм, поэтому
+//!      неизвестный путь входа деградирует в «сигнал потреблён, ничего не
+//!      записано», а не в испорченное адресное пространство пользователя.
 //!
-//! ## Register contract recap
+//! ## Кратко о контракте регистров
 //!
-//! * Delivery: `RSP=frame`, `RIP=sa_handler`, `RDI=signo`, `RSI=&siginfo`,
-//!   `RDX=&ucontext`, `RAX=syscall result`, clean user RFLAGS. `sigcontext`
-//!   stores `cx = ip` and `r11 = flags` (the `syscall` clobber — identical to
-//!   Linux's syscall-return delivery view).
-//! * `rt_sigreturn`: mcontext GPRs are restored into the `SavedRegs` frame;
-//!   `rcx ← sigcontext.ip` (sysret RIP), `r11 ← sigcontext.flags`, the slot
-//!   `+120 ← sigcontext.sp`, and the function's return value becomes the
-//!   restored `rax` (the stub writes the dispatcher's return into the `rax`
-//!   slot after we return).
+//! * Доставка: `RSP=frame`, `RIP=sa_handler`, `RDI=signo`, `RSI=&siginfo`,
+//!   `RDX=&ucontext`, `RAX=результат syscall`, чистый пользовательский RFLAGS.
+//!   `sigcontext` хранит `cx = ip` и `r11 = flags` (clobber инструкции `syscall`
+//!   — идентично представлению доставки на возврате из syscall в Linux).
+//! * `rt_sigreturn`: GPR mcontext восстанавливаются во фрейм `SavedRegs`;
+//!   `rcx ← sigcontext.ip` (RIP sysret), `r11 ← sigcontext.flags`, слот
+//!   `+120 ← sigcontext.sp`, а возвращаемое функцией значение становится
+//!   восстановленным `rax` (стаб пишет возврат диспетчера в слот `rax` после
+//!   нашего возврата).
 #![allow(dead_code)]
 
 use core::ptr;
@@ -85,49 +86,49 @@ use super::trap_frame::{plan_irq_delivery, IrqFrame};
 use crate::task::compat;
 use crate::task::scheduler;
 
-/// Conservative count of enqueued pending signals across all processes. The
-/// delivery check on EVERY syscall return is `load(==0) → skip` — a pure
-/// atomic read; the value may overcount (cleared pendings, exited processes)
-/// but never undercount an actually-deliverable signal, so the optimistic
-/// skip is always safe.
+/// Консервативный счётчик поставленных в очередь сигналов по всем процессам.
+/// Проверка доставки на КАЖДОМ возврате из syscall — `load(==0) → пропуск`, чистое
+/// атомарное чтение; значение может завышать (снятые pending, вышедшие процессы),
+/// но никогда не занижает реально доставимый сигнал, поэтому оптимистичный пропуск
+/// всегда безопасен.
 static PENDING_APPROX: AtomicU64 = AtomicU64::new(0);
 
-// ─── Sending ─────────────────────────────────────────────────────────────────
+// ─── Отправка ────────────────────────────────────────────────────────────────
 
-/// Queue signal `sig` for process `pid` (single-thread primitive):
+/// Поставить сигнал `sig` процессу `pid` (примитив на один поток):
 ///
-/// * `sig == 0`: existence probe (`kill(pid, 0)` semantics).
-/// * `SIGKILL`: immediate outside-kill — the target's compat state is torn
-///   down with exit code `128 + 9` recorded for `wait4`, and the task is
-///   marked exiting (it notices at its next tick/yield). A PARKED (stopped)
-///   task is removed from `STOPPED_TASKS` and reaped with its own cr3 (see
+/// * `sig == 0`: проба существования (семантика `kill(pid, 0)`).
+/// * `SIGKILL`: немедленное внешнее убийство — compat-состояние цели сносится с
+///   кодом выхода `128 + 9` для `wait4`, а задача помечается exiting (она заметит
+///   на следующем тике/уступке). ПРИПАРКОВАННАЯ (остановленная) задача снимается
+///   из `STOPPED_TASKS` и собирается со своим cr3 (см.
 ///   `scheduler::request_exit`).
-/// * everything else: appended to the target's pending bitset and delivered
-///   at its next syscall return (or by the `EINTR` checks of its blocking
-///   waits).
+/// * всё остальное: добавляется в pending-битсет цели и доставляется на её
+///   следующем возврате из syscall (или проверками `EINTR` её блокирующих
+///   ожиданий).
 ///
-/// ## Stop/continue magic happens HERE, at generation time
+/// ## Магия stop/continue происходит ЗДЕСЬ, на времени генерации
 ///
-/// Linux splits the two halves of job control (`prepare_signal`): the *stop* is
-/// done as a signal action at delivery, but the *continue* is done immediately
-/// when `SIGCONT` is generated — "regardless of blocking, ignoring, or
-/// handling" — because a stopped task has no execution context that could
-/// observe a pending bit. This function therefore performs, for the target's
-/// THREAD GROUP:
+/// Linux делит job control на две половины (`prepare_signal`): *stop* выполняется
+/// как действие сигнала при доставке, а *continue* — сразу при генерации
+/// `SIGCONT`, «независимо от блокировки, игнорирования или обработки», потому что
+/// у остановленной задачи нет контекста исполнения, который мог бы увидеть
+/// pending-бит. Поэтому функция для ГРУППЫ ПОТОКОВ цели выполняет:
 ///
-/// * `SIGCONT`: resume every parked member ([`scheduler::resume_stopped`]) and
-///   discard all pending stop-class bits (POSIX 2.4.1). Unconditional — a
-///   blocked or `SIG_IGN`ed `SIGCONT` still resumes; only the signal's own
-///   delivery follows the normal mask/disposition rules afterwards.
-/// * a stop-class signal (`SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU`): discard a
-///   pending `SIGCONT` (POSIX: generating a stop signal discards it), and if the
-///   group is ALREADY stopped, consume the signal without queueing it — otherwise
-///   the resume would immediately re-stop the group.
+/// * `SIGCONT`: возобновляет каждого припаркованного члена
+///   ([`scheduler::resume_stopped`]) и отбрасывает все ожидающие биты класса
+///   остановки (POSIX 2.4.1). Безусловно — заблокированный или `SIG_IGN`-нутый
+///   `SIGCONT` всё равно возобновляет; уже потом доставка самого сигнала идёт по
+///   обычным правилам маски/диспозиции.
+/// * stop-сигнал (`SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU`): отбрасывает ожидающий
+///   `SIGCONT` (POSIX: генерация stop-сигнала его отбрасывает), а если группа
+///   УЖЕ остановлена, потребляет сигнал, не ставя его в очередь — иначе
+///   возобновление тут же снова остановило бы группу.
 ///
-/// Pending signals are per-thread: `pid` is addressed exactly. Group-addressed
-/// calls (`kill(0|-1|-pgid)`) go through [`sys_kill`], which resolves the group
-/// to a single thread per group before calling this (Linux queues a group signal
-/// on the group's shared pending list, so the handler runs once per group).
+/// Pending-сигналы per-thread: `pid` адресуется точно. Групповые вызовы
+/// (`kill(0|-1|-pgid)`) идут через [`sys_kill`], который сводит группу к одному
+/// потоку на группу перед вызовом (Linux ставит групповой сигнал в общий
+/// pending-список группы, поэтому обработчик выполняется раз на группу).
 pub fn send_signal(pid: u64, sig: u64) -> Result<(), Errno> {
     if sig == 0 {
         return if compat::compat_exists(pid) {
@@ -146,7 +147,7 @@ pub fn send_signal(pid: u64, sig: u64) -> Result<(), Errno> {
         force_terminate_group(pid, SIGKILL);
         return Ok(());
     }
-    // ── generation-time stop/continue effects (see the doc above) ───────────
+    // ── эффекты stop/continue на времени генерации (см. doc выше) ──────────
     let tgid = compat::tgid_of(pid);
     if sig == super::signal_frame::SIGCONT {
         resume_group(tgid);
@@ -171,43 +172,44 @@ pub fn send_signal(pid: u64, sig: u64) -> Result<(), Errno> {
     Ok(())
 }
 
-/// Is any member of thread group `tgid` parked in the stopped state?
+/// Есть ли среди членов группы потоков `tgid` припаркованные в состоянии
+/// остановки?
 fn group_is_stopped(tgid: u64) -> bool {
     compat::group_pids(tgid)
         .into_iter()
         .any(scheduler::is_stopped)
 }
 
-/// `SIGCONT` generation for thread group `tgid`: discard every pending
-/// stop-class bit and put every parked member back into rotation.
+/// Генерация `SIGCONT` для группы потоков `tgid`: отбросить каждый ожидающий бит
+/// класса остановки и вернуть каждого припаркованного члена в ротацию.
 ///
-/// One registry snapshot, then per-member scheduler calls — `COMPAT_STATES` is
-/// never held across them (AGENTS.md invariant 4).
+/// Один снимок реестра, затем вызовы планировщика по членам — `COMPAT_STATES`
+/// никогда не держится между ними (AGENTS.md, инвариант 4).
 fn resume_group(tgid: u64) {
     for member in compat::group_pids(tgid) {
         compat::clear_stop_pending(member);
-        // Snapshot the parked state BEFORE resuming: only a member that really was
-        // parked produces a WCONTINUED report (a SIGCONT to a running process just
-        // discards stop bits).
+        // Снять снимок состояния парковки ДО возобновления: только член,
+        // который действительно был припаркован, даёт отчёт WCONTINUED (SIGCONT
+        // работающему процессу просто отбрасывает stop-биты).
         let was_parked = scheduler::is_stopped(member);
         if scheduler::resume_stopped(member) && was_parked {
             compat::note_child_continued(member);
-            // The stuck-syscall clock restarts: the paused interval must not count
-            // as "stuck in syscall" for the watchdog (see `watchdog_tick`).
+            // Часы зависшего syscall перезапускаются: пауза не должна считаться
+            // «застреванием в syscall» для watchdog'а (см. `watchdog_tick`).
             super::inflight_refresh(member);
             crate::info!("[signal] pid={} resumed by SIGCONT", member);
         }
     }
 }
 
-/// Apply a DELIVERED stop-class signal whose disposition is `SIG_DFL`: the whole
-/// thread group stops (Linux group stop).
+/// Применить ДОСТАВЛЕННЫЙ stop-сигнал с диспозицией `SIG_DFL`: останавливается вся
+/// группа потоков (групповой stop Linux).
 ///
-/// The receiver parks at THIS delivery point — the pending bit has already been
-/// consumed by the caller — while members whose frames are already saved are
-/// moved out of rotation immediately. `mark_stop_requested` makes the next
-/// requeue decision (this yield, or a tick that fires first) move the frame into
-/// `STOPPED_TASKS`; we never return to ring 3 with a stop pending.
+/// Получатель паркуется в ЭТОЙ точке доставки — pending-бит уже потреблён
+/// вызывающим, — а члены, чьи фреймы уже сохранены, немедленно уводятся из
+/// ротации. `mark_stop_requested` заставляет следующее решение о requeue (эта
+/// уступка или тик, сработавший первым) перевести фрейм в `STOPPED_TASKS`; в ring 3
+/// с ожидающим stop мы не возвращаемся никогда.
 fn begin_group_stop(sig: u64) {
     let pid = scheduler::current_pid();
     let tgid = compat::tgid_of(pid);
@@ -227,26 +229,26 @@ fn begin_group_stop(sig: u64) {
     scheduler::mark_stop_requested(pid);
 }
 
-/// Stop-signal delivery at a syscall return: mark the group stopped, then park the
-/// receiver by yielding — the requeue decision inside `yield_switch` sees the stop
-/// request and parks this frame instead of rotating it.
+/// Доставка stop-сигнала на возврате из syscall: пометить группу остановленной,
+/// затем припарковать получателя уступкой CPU — решение о requeue внутри
+/// `yield_switch` видит запрос остановки и паркует этот фрейм вместо ротации.
 fn stop_current_group(sig: u64) {
     begin_group_stop(sig);
     scheduler::yield_current();
 }
 
-/// Outside-kill of the thread group `pid` belongs to, recording exit status
-/// `128 + sig` for `wait4` (a plain `request_exit` would drop the compat
-/// state without ever inserting the zombie entry).
+/// Внешнее убийство группы потоков, которой принадлежит `pid`, с записью статуса
+/// выхода `128 + sig` для `wait4` (обычный `request_exit` снёс бы compat-состояние,
+/// так и не вставив запись зомби).
 ///
-/// Public twin of the SIGKILL sender path for `tgkill`-style callers that address
-/// a thread other than themselves.
+/// Публичный двойник пути отправителя SIGKILL для вызывающих в стиле `tgkill`,
+/// адресующих не себя.
 pub fn terminate_group(pid: u64, sig: u64) {
     force_terminate_group(pid, sig);
 }
 
-/// Is a user handler installed for `sig` in the thread group of `pid` (as opposed
-/// to the caller's)? `true`/`false` when `pid` has compat state.
+/// Установлен ли пользовательский обработчик для `sig` в группе потоков `pid` (а
+/// не вызывающего)? `true`/`false`, когда у `pid` есть compat-состояние.
 pub fn has_handler_for(pid: u64, sig: u64) -> bool {
     compat::with_pid_compat(pid, |cs| {
         is_user_handler(&cs.sig.lock().handlers[(sig - 1) as usize])
@@ -254,9 +256,9 @@ pub fn has_handler_for(pid: u64, sig: u64) -> bool {
     .unwrap_or(false)
 }
 
-/// Outside-kill of the thread group `pid` belongs to, recording exit status
-/// `128 + sig` for `wait4` (a plain `request_exit` would drop the compat
-/// state without ever inserting the zombie entry).
+/// Внешнее убийство группы потоков, которой принадлежит `pid`, с записью статуса
+/// выхода `128 + sig` для `wait4` (обычный `request_exit` снёс бы compat-состояние,
+/// так и не вставив запись зомби).
 fn force_terminate_group(pid: u64, sig: u64) {
     let tgid = compat::tgid_of(pid);
     for member in compat::group_member_pids(tgid, pid) {
@@ -264,30 +266,29 @@ fn force_terminate_group(pid: u64, sig: u64) {
     }
     let code = (128u64 + sig) as u8;
     compat::set_exit_code_of(pid, code);
-    // Removes the compat state and inserts the wait4 zombie with the code
-    // recorded above.
+    // Удаляет compat-состояние и вставляет зомби wait4 с записанным выше кодом.
     compat::finish_compat_exit(pid);
-    // Now a no-op removal + the actual mark-exiting.
+    // Теперь no-op-удаление + фактическая пометка exiting.
     scheduler::request_exit(pid);
 }
 
 // ─── kill(2) ─────────────────────────────────────────────────────────────────
 
-/// `kill(2)` (62): send `sig` to a process, a process group, or every process
-/// the caller may signal.
+/// `kill(2)` (62): послать `sig` процессу, группе процессов или каждому процессу,
+/// которому вызывающий имеет право сигнализировать.
 ///
-/// The pure half lives in [`super::kill`]: argument decoding (both parameters
-/// are C `int`s, so they are truncated to 32 bits and sign-extended — `kill(-pgid)`
-/// depends on it), target classification, and the errno matrix. See
-/// `kill::kill_args` for why each error is returned where it is: `EINVAL` for an
-/// invalid signal BEFORE any target lookup, `ESRCH` for `INT_MIN` and for a
-/// group with no live member, `EPERM` when the caller's effective uid may signal
-/// none of the resolved targets.
+/// Чистая половина живёт в [`super::kill`]: декодирование аргументов (оба
+/// параметра — C `int`, поэтому усекаются до 32 бит и знаково расширяются — от
+/// этого зависит `kill(-pgid)`), классификация цели и матрица errno. См.
+/// `kill::kill_args`, почему каждая ошибка возвращается там, где возвращается:
+/// `EINVAL` для неверного сигнала ДО любого поиска цели, `ESRCH` для `INT_MIN` и
+/// группы без живых членов, `EPERM`, когда effective uid вызывающего не может
+/// сигнализировать ни одной из найденных целей.
 ///
-/// Locking (AGENTS.md invariant 4): [`resolve_kill_targets`] takes one short
-/// registry snapshot and releases it; the sends happen afterwards, never while
-/// `COMPAT_STATES` is held (each `send_signal` re-enters the registry itself).
-/// Send `sig` to the process group `pgid`, queued once on its leader.
+/// Локи (AGENTS.md, инвариант 4): [`resolve_kill_targets`] берёт один короткий
+/// снимок реестра и отпускает его; отправки идут после, никогда под
+/// `COMPAT_STATES` (каждый `send_signal` сам входит в реестр).
+/// Послать `sig` группе процессов `pgid`, поставив его один раз на её лидера.
 pub fn send_signal_to_pgid(pgid: u64, sig: u64) -> Result<(), Errno> {
     let targets = super::kill::pick_group_target(&compat::group_pids(pgid), pgid);
     match targets {
@@ -296,25 +297,26 @@ pub fn send_signal_to_pgid(pgid: u64, sig: u64) -> Result<(), Errno> {
     }
 }
 
-/// Send `sig` to EVERY thread group in process group `pgid`.
+/// Послать `sig` КАЖДОЙ группе потоков в группе процессов `pgid`.
 ///
-/// [`send_signal_to_pgid`] queues one copy on the group's leader, which is what
-/// `kill(-pgid)`/`kill(0)` want (Linux's shared group-pending list runs a handler
-/// once per process). Terminal access control is different: `SIGTTIN`,
-/// `SIGTTOU` and `SIGTSTP` stop the whole foreground group, and a pagh process
-/// group can hold SEVERAL thread groups (a job whose process forked), so each
-/// of them must receive its own copy — a group stop is per thread group in the
-/// scheduler ([`begin_group_stop`]), and signalling only the leader would leave
-/// its siblings running (the exact "stops only the last pid" failure this
-/// replaces). One representative per thread group preserves the "one handler
-/// run per process" property.
+/// [`send_signal_to_pgid`] ставит одну копию на лидера группы, что и нужно
+/// `kill(-pgid)`/`kill(0)` (общий group-pending список Linux выполняет обработчик
+/// раз на процесс). Контроль доступа к терминалу иной: `SIGTTIN`, `SIGTTOU` и
+/// `SIGTSTP` останавливают всю foreground-группу, а группа процессов pagh может
+/// содержать НЕСКОЛЬКО групп потоков (job, чей процесс форкнулся), поэтому каждая
+/// должна получить свою копию — групповой stop в планировщике per thread group
+/// ([`begin_group_stop`]), и сигнал только лидеру оставил бы его соседей
+/// работающими (ровно отказ «останавливает только последний pid», который это
+/// заменяет). Один представитель на группу потоков сохраняет свойство «один запуск
+/// обработчика на процесс».
 pub fn send_signal_to_pgid_all(pgid: u64, sig: u64) -> Result<(), Errno> {
     let members = compat::group_pids(pgid);
     if members.is_empty() {
         return Err(Errno::ESRCH);
     }
-    // One registry snapshot, then group it in memory: `tgid_of` would re-lock
-    // per member, and AGENTS.md invariant 4 keeps delivery out of the lock.
+    // Один снимок реестра, затем группировка в памяти: `tgid_of` брал бы лок
+    // заново на каждого члена, а инвариант 4 из AGENTS.md не пускает доставку под
+    // локом.
     let mut groups: alloc::collections::BTreeMap<u64, alloc::vec::Vec<u64>> =
         alloc::collections::BTreeMap::new();
     for pid in members {
@@ -344,42 +346,44 @@ pub fn sys_kill(pid_raw: u64, sig_raw: u64) -> Result<u64, Errno> {
     deliver_to_targets(&targets, sig)
 }
 
-/// Resolve a classified `kill(2)` target into the exact pids a signal is queued
-/// on: ONE thread per addressed process group (`kill::pick_group_target`), not
-/// every member — the equivalent of Linux queueing on the group's shared pending
-/// list, so a handler installed by a multi-threaded process runs once.
+/// Свести классифицированную цель `kill(2)` к точным pid, на которые ставится
+/// сигнал: ОДИН поток на адресованную группу процессов
+/// (`kill::pick_group_target`), а не каждый член — эквивалент постановки в общий
+/// pending-список группы Linux, поэтому обработчик, установленный многопоточным
+/// процессом, выполняется один раз.
 ///
-/// KNOWN GAP (named in `AGENTS.md` → Known open gaps): since `pgid` became
-/// independent of the thread group (2.16.0), a signal sent to a process group
-/// that holds SEVERAL thread groups reaches only the one this picks, so
-/// `kill(-pgid, SIGCONT)` resumes just that thread group. The terminal and shell
-/// stop/continue paths do not use this function — they use
-/// [`send_signal_to_pgid_all`], which queues one copy per thread group.
+/// ИЗВЕСТНЫЙ ПРОБЕЛ (назван в `AGENTS.md` → Known open gaps): с тех пор как `pgid`
+/// стал независим от группы потоков (2.16.0), сигнал группе процессов, содержащей
+/// НЕСКОЛЬКО групп потоков, доходит только до выбранной, поэтому
+/// `kill(-pgid, SIGCONT)` возобновляет лишь её. Пути stop/continue терминала и
+/// шелла эту функцию не используют — они берут [`send_signal_to_pgid_all`], который
+/// ставит копию на каждую группу потоков.
 ///
-/// An empty result means "no such process/group" and becomes `ESRCH` in
-/// [`deliver_to_targets`]. All registry iteration happens inside the snapshot
-/// helpers here; nothing is delivered while their lock is held.
+/// Пустой результат означает «нет такого процесса/группы» и превращается в
+/// `ESRCH` в [`deliver_to_targets`]. Весь обход реестра идёт внутри хелперов
+/// снимка здесь; ничего не доставляется, пока их лок удерживается.
 pub fn resolve_kill_targets(target: super::kill::KillTarget) -> alloc::vec::Vec<u64> {
     use super::kill::KillTarget;
     match target {
-        // Positive pid: addressed exactly (Phase-1 per-thread semantics — the
-        // module doc records this deviation from Linux's group delivery). No
-        // registry walk: existence is checked by `send_signal` itself.
+        // Положительный pid: адресуется точно (per-thread семантика — doc модуля
+        // фиксирует это отклонение от групповой доставки Linux). Обхода реестра
+        // нет: существование проверяет сам `send_signal`.
         KillTarget::Pid(pid) => alloc::vec![pid],
-        // pid == 0: the caller's own process group.
+        // pid == 0: собственная группа процессов вызывающего.
         KillTarget::OwnGroup => {
             let pgid = compat::current_pgid();
             super::kill::pick_group_target(&compat::group_pids(pgid), pgid)
                 .into_iter()
                 .collect()
         }
-        // pid < -1: the process group `-pid`.
+        // pid < -1: группа процессов `-pid`.
         KillTarget::Group(pgid) => super::kill::pick_group_target(&compat::group_pids(pgid), pgid)
             .into_iter()
             .collect(),
-        // pid == -1: every signalable process except the caller's whole thread
-        // group and pid 1 (`kill::INIT_PID`; man7 kill(2) NOTES). One snapshot,
-        // then grouped by tgid so each process still receives exactly one copy.
+        // pid == -1: каждый сигнализируемый процесс, кроме всей группы потоков
+        // вызывающего и pid 1 (`kill::INIT_PID`; man7 kill(2) NOTES). Один
+        // снимок, затем группировка по tgid, чтобы каждый процесс всё равно
+        // получил ровно одну копию.
         KillTarget::All => {
             let own = compat::current_tgid();
             let mut groups: alloc::collections::BTreeMap<u64, alloc::vec::Vec<u64>> =
@@ -398,19 +402,18 @@ pub fn resolve_kill_targets(target: super::kill::KillTarget) -> alloc::vec::Vec<
     }
 }
 
-/// Permission policy: the sender is the CURRENT process's effective uid and each
-/// target's credentials are looked up in the compat registry. A target that is
-/// no longer registered (it exited between the snapshot and this call) is not
-/// filtered here — `send_signal` reports `ESRCH` for it, which is what Linux
-/// does. If every resolved target is un-signalable the result is `EPERM`;
-/// otherwise the permitted subset is delivered to and the usual errno folding
-/// applies.
+/// Политика прав: отправитель — effective uid ТЕКУЩЕГО процесса, а креденшелы
+/// каждой цели ищутся в compat-реестре. Цель, уже не зарегистрированная (вышла
+/// между снимком и этим вызовом), здесь не фильтруется — `send_signal` сообщает
+/// для неё `ESRCH`, как Linux. Если все найденные цели несигнализируемы,
+/// результат — `EPERM`; иначе доставка идёт разрешённому подмножеству и
+/// применяется обычное складывание errno.
 ///
-/// Errno folding (Linux: a group send succeeds when at least one target was
-/// reached — `__kill_pgrp_info`): `Ok(0)` as soon as one delivery succeeded,
-/// otherwise the last per-target error. For a target that existed when the
-/// snapshot was taken, `ESRCH` is the only failure `send_signal` can produce (the
-/// target exited in between).
+/// Складывание errno (Linux: групповой send успешен, когда достигнута хотя бы одна
+/// цель — `__kill_pgrp_info`): `Ok(0)`, как только одна доставка удалась, иначе
+/// последняя ошибка по цели. Для цели, существовавшей на момент снимка, `ESRCH` —
+/// единственная ошибка, которую может дать `send_signal` (цель вышла между
+/// вызовами).
 fn deliver_to_targets(targets: &[u64], sig: u64) -> Result<u64, Errno> {
     if targets.is_empty() {
         return Err(Errno::ESRCH);
@@ -421,9 +424,8 @@ fn deliver_to_targets(targets: &[u64], sig: u64) -> Result<u64, Errno> {
         .copied()
         .filter(|pid| match compat::creds_of(*pid) {
             Some(target) => super::kill::kill_permits(sender_euid, target.uid, target.euid),
-            // Gone already: let `send_signal` answer ESRCH rather than
-            // misreporting a permission failure for a process that no longer
-            // exists.
+            // Уже нет: пусть `send_signal` ответит ESRCH, а не переврал отказ прав
+            // для процесса, которого больше нет.
             None => true,
         })
         .collect();
@@ -445,48 +447,46 @@ fn deliver_to_targets(targets: &[u64], sig: u64) -> Result<u64, Errno> {
     }
 }
 
-// ─── Delivery ────────────────────────────────────────────────────────────────
+// ─── Доставка ────────────────────────────────────────────────────────────────
 
-/// Does the saved-register frame carry the `syscall`-entry meaning the delivery
-/// contract requires?
+/// Несёт ли фрейм сохранённых регистров смысл входа `syscall`, которого требует
+/// контракт доставки?
 ///
-/// On the `syscall` path the CPU stores the user RFLAGS in `r11`, and RFLAGS bit
-/// 1 is architecturally always set; on any other entry the slot holds an ordinary
-/// user GPR. A frame failing this check therefore cannot have come from
-/// `syscall`, and the `+120` word in it is NOT the user RSP — writing an
-/// `rt_sigframe` "below it" would land in whatever that value points at (for
-/// `int 0x80`: the user's own code page).
+/// На пути `syscall` CPU кладёт пользовательский RFLAGS в `r11`, а бит 1 RFLAGS
+/// архитектурно всегда установлен; на любом другом входе в слоте лежит обычный
+/// пользовательский GPR. Фрейм, проваливающий проверку, не мог прийти из
+/// `syscall`, и слово `+120` в нём — НЕ user RSP: запись `rt_sigframe` «под ним»
+/// попала бы туда, куда указывает это значение (для `int 0x80` — в собственную
+/// кодовую страницу пользователя).
 ///
-/// This is the last-resort half of the invariant-2 guard: the exact half is the
-/// per-process `int 0x80` observation (`compat::current_int80_entry`), checked
-/// first. Cheap, no lock, and cannot reject a genuine `syscall` frame.
+/// Это последняя линия защиты инварианта 2: точная половина — наблюдение
+/// `int 0x80` на процесс (`compat::current_int80_entry`), проверяемое первым.
+/// Дёшево, без лока и не может отвергнуть настоящий фрейм `syscall`.
 fn frame_carries_syscall_view(regs: &SavedRegs) -> bool {
     regs.r11 & 0x2 != 0
 }
 
-/// Deliver ONE pending signal for the current process, if any is deliverable
-/// (pending ∧ ¬blocked), at the syscall-return point. Called from the
-/// [`super::linux_dispatch`] epilogue with `result` = the syscall's folded
-/// return value (stored into the frame's saved `rax`, so a handler that later
-/// returns via `rt_sigreturn` resumes with the correct syscall result).
+/// Доставить ОДИН ожидающий сигнал текущего процесса, если какой-то доставим
+/// (pending ∧ ¬blocked), в точке возврата из syscall. Вызывается из эпилога
+/// [`super::linux_dispatch`] с `result` = сложенное возвращаемое значение syscall
+/// (записывается в сохранённый `rax` фрейма, поэтому обработчик, вернувшийся позже
+/// через `rt_sigreturn`, возобновляется с правильным результатом syscall).
 ///
-/// Default actions without a user handler:
-///   * `Term` → the process exits with status `128 + sig` (diverges, never
-///     returns — mirrors `tgkill`'s Phase-0 fatal semantics);
-///   * `Ignore`/`Stop`/`Cont` → dropped (the scheduler has no stop/continue yet
-///     — see issue #12 tasks t8/t9; this is the only delivery point until the
-///     timer-tick path lands, so a CPU-bound loop with no syscalls still never
-///     sees a signal).
+/// Действия по умолчанию без пользовательского обработчика:
+///   * `Term` → процесс выходит со статусом `128 + sig` (расходится, никогда не
+///     возвращается — зеркалит фатальную семантику `tgkill`);
+///   * `Ignore`/`Stop`/`Cont` → отбрасывается (у планировщика пока нет
+///     stop/continue — у планировщика пока нет пути тика, это единственная точка
+///     доставки, поэтому CPU-bound цикл без syscall'ов сигнала всё ещё не видит).
 ///
-/// Frame placement failure (region below RSP not mapped — a guard page or a
-/// nearly-exhausted stack) is treated as `SIGSEGV`: the process exits with
-/// `128 + 11` (139). Linux would grow the stack; our stack-growth fault path
-/// is not reachable from here yet.
+/// Ошибка размещения фрейма (регион ниже RSP не отображён — guard-страница или
+/// почти исчерпанный стек) трактуется как `SIGSEGV`: процесс выходит с `128 + 11`
+/// (139). Linux вырастил бы стек; наш путь роста стека отсюда пока недостижим.
 ///
-/// The signal is ALWAYS consumed before any of the refusal paths below (the
-/// pending bit is cleared and `PENDING_APPROX` decremented), so a refused
-/// delivery can never spin: it is either converted into the signal's default
-/// action or dropped with a diagnostic.
+/// Сигнал ВСЕГДА потребляется до любого из путей отказа ниже (pending-бит
+/// очищается, `PENDING_APPROX` уменьшается), поэтому отвергнутая доставка не может
+/// зациклиться: она либо превращается в действие сигнала по умолчанию, либо
+/// отбрасывается с диагностикой.
 pub fn deliver_one_pending_syscall(regs: &mut SavedRegs, result: u64) {
     if PENDING_APPROX.load(Ordering::Relaxed) == 0 {
         return;
@@ -499,10 +499,10 @@ pub fn deliver_one_pending_syscall(regs: &mut SavedRegs, result: u64) {
     if action.handler == SIG_IGN {
         return;
     }
-    // Invariant-2 guard, exact half: this process entered a syscall through
-    // `int 0x80` at least once, so its saved registers do not mean what the
-    // frame contract above requires. Never write an `rt_sigframe` for it; run the
-    // default action instead and say so once per process.
+    // Точная половина защиты инварианта 2: этот процесс хотя бы раз вошёл в
+    // syscall через `int 0x80`, поэтому его сохранённые регистры значат не то,
+    // что требует контракт фрейма выше. Никогда не писать для него `rt_sigframe`;
+    // выполнить действие по умолчанию и сказать об этом один раз на процесс.
     if compat::current_int80_entry() {
         if compat::note_int80_refused() {
             crate::warn!(
@@ -525,14 +525,15 @@ pub fn deliver_one_pending_syscall(regs: &mut SavedRegs, result: u64) {
                     scheduler::current_pid(),
                     sig
                 );
-                // Diverges: exits the thread group with 128 + sig.
+                // Расходится: завершает группу потоков с 128 + sig.
                 super::misc::sys_exit_group(128 + sig);
             }
             DefaultAction::Stop => {
-                // Stop is an ACTION (Linux: "the actual stopping ... is done as a
-                // signal action for SIG_DFL"): park this task and its siblings. Does
-                // not return until SIGCONT resumes us; the pending bit was already
-                // consumed above, so the stop is not re-observed.
+                // Stop — это ДЕЙСТВИЕ (Linux: «сама остановка ... выполняется как
+                // действие сигнала для SIG_DFL»): припарковать эту задачу и её
+                // соседей. Не возвращается, пока SIGCONT не возобновит нас;
+                // pending-бит уже потреблён выше, поэтому stop не наблюдается
+                // повторно.
                 stop_current_group(sig);
                 return;
             }
@@ -540,8 +541,8 @@ pub fn deliver_one_pending_syscall(regs: &mut SavedRegs, result: u64) {
         }
     }
 
-    // Invariant-2 guard, last resort (see the module doc): a frame that cannot
-    // have come from `syscall` must not be interpreted as one.
+    // Последняя линия защиты инварианта 2 (см. doc модуля): фрейм, который не мог
+    // прийти из `syscall`, нельзя интерпретировать как таковой.
     if !frame_carries_syscall_view(regs) {
         crate::warn!(
             "[signal] pid={} sig={} refused: saved RFLAGS={:#x} lacks bit 1 - \
@@ -553,7 +554,7 @@ pub fn deliver_one_pending_syscall(regs: &mut SavedRegs, result: u64) {
         return;
     }
 
-    // User handler: build the frame below the interrupted RSP.
+    // Пользовательский обработчик: построить фрейм ниже прерванного RSP.
     let user_rsp = unsafe { ((regs as *mut SavedRegs as *const u64).add(15)).read() };
     let frame = frame_location(user_rsp, &action, &altstack);
     if check_user_ptr(frame, RT_SIGFRAME_SIZE).is_err() {
@@ -589,18 +590,18 @@ pub fn deliver_one_pending_syscall(regs: &mut SavedRegs, result: u64) {
     let newmask = (old_blocked | action.mask) & !UNBLOCKABLE_MASK;
     let mut buf = [0u8; RT_SIGFRAME_SIZE as usize];
     encode_rt_sigframe(&mut buf, action.restorer, sig, &saved, newmask, &altstack);
-    // SAFETY: the whole frame range was validated mapped+user-accessible by
-    // `check_user_ptr` above, and this task exclusively owns its user stack
-    // region while running.
+    // SAFETY: весь диапазон фрейма проверен как отображённый и доступный
+    // пользователю через `check_user_ptr` выше, а задача эксклюзивно владеет своим
+    // пользовательским стеком, пока выполняется.
     unsafe {
         ptr::copy_nonoverlapping(buf.as_ptr(), frame as *mut u8, buf.len());
-        // New user RSP for the syscall-exit stub: the frame base.
+        // Новый user RSP для стаба выхода syscall: база фрейма.
         ((regs as *mut SavedRegs as *mut u64).add(15)).write(frame);
     }
     regs.rdi = sig;
     regs.rsi = frame + SIGINFO_OFFSET;
     regs.rdx = frame + UC_OFFSET;
-    regs.rcx = action.handler; // sysretq RIP target
+    regs.rcx = action.handler; // цель RIP для sysretq
     regs.r11 = USER_RFLAGS;
     regs.rax = result;
     compat::block_during_handler(action.mask);
@@ -614,58 +615,58 @@ pub fn deliver_one_pending_syscall(regs: &mut SavedRegs, result: u64) {
     );
 }
 
-// ─── Timer-tick delivery ─────────────────────────────────────────────────────
+// ─── Доставка с тика таймера ─────────────────────────────────────────────────
 
-/// What the timer-tick return path did with the interrupted task.
+/// Что путь возврата тика сделал с прерванной задачей.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TickAction {
-    /// Nothing to do: no deliverable signal, or the interrupted frame is a kernel
-    /// frame whose user context is not here (the syscall return epilogue, or the
-    /// `EINTR` checks of the blocking wait loops, will deliver it).
+    /// Делать нечего: нет доставимого сигнала либо прерванный фрейм — ядерный,
+    /// чей пользовательский контекст не здесь (вернёт эпилог возврата syscall или
+    /// проверки `EINTR` блокирующих циклов ожидания).
     None,
-    /// An `rt_sigframe` was written and the iret frame rewritten in place; the
-    /// caller must requeue the task with this frame.
+    /// Записан `rt_sigframe` и iret-фрейм переписан на месте; вызывающий обязан
+    /// вернуть задачу в очередь с этим фреймом.
     Delivered,
-    /// The signal's default action stopped the task: the caller's requeue decision
-    /// must park it (the stop request is already marked).
+    /// Действие сигнала по умолчанию остановило задачу: решение о requeue должно
+    /// припарковать её (запрос остановки уже помечен).
     Park,
-    /// The task was terminated (a fatal default action, or an `rt_sigframe` that
-    /// could not be placed): the caller must drop it — never requeue it — and reap
-    /// it with its own address space.
+    /// Задача завершена (фатальное действие по умолчанию или `rt_sigframe`,
+    /// который не удалось разместить): вызывающий обязан снять её — никогда не
+    /// возвращать в очередь — и собрать с её собственным адресным пространством.
     Kill,
 }
 
-/// Handle one pending signal for the CURRENT task at the timer-tick return point,
-/// where `cur_rsp` is the frame `irq32_stub` just saved (see
+/// Обработать один ожидающий сигнал ТЕКУЩЕЙ задачи в точке возврата тика
+/// таймера, где `cur_rsp` — фрейм, только что сохранённый `irq32_stub` (см.
 /// [`super::trap_frame`]).
 ///
-/// ## Why this is a separate path from [`deliver_one_pending_syscall`]
+/// ## Почему это отдельный путь от [`deliver_one_pending_syscall`]
 ///
-/// The two frames are different: at `cur_rsp` the word at `+120` is the
-/// interrupted `rax` and the interrupted user context lives in the CPU-pushed
-/// iret words, so the syscall-path code (which rewrites `rcx`/`r11` for `sysretq`
-/// and the per-task user-RSP slot) would corrupt the task. Here the delivery
-/// rewrites the iret frame: `RIP` = handler, `RSP` = frame base, `RFLAGS` =
-/// [`USER_RFLAGS`], `RDI/RSI/RDX` = signo/`&siginfo`/`&ucontext`; `CS`, `SS`,
-/// `rax` and the `popfq` word stay untouched.
+/// Фреймы разные: по `cur_rsp` слово `+120` — прерванный `rax`, а прерванный
+/// пользовательский контекст живёт в положенных CPU iret-словах, поэтому код
+/// syscall-пути (переписывающий `rcx`/`r11` для `sysretq` и per-task слот
+/// user-RSP) испортил бы задачу. Здесь доставка переписывает iret-фрейм:
+/// `RIP` = обработчик, `RSP` = база фрейма, `RFLAGS` = [`USER_RFLAGS`],
+/// `RDI/RSI/RDX` = signo/`&siginfo`/`&ucontext`; `CS`, `SS`, `rax` и слово для
+/// `popfq` не трогаются.
 ///
-/// ## Order of the checks (all of them load-bearing)
+/// ## Порядок проверок (все несущие)
 ///
-///   1. **Fatal action first** (any frame): a `SIG_DFL` default-terminate signal
-///      needs no user frame, and the task must die whether it was in ring 3 or
-///      inside a syscall. Terminates WITHOUT diverging — `sys_exit_group` must
-///      never be called from IRQ context.
-///   2. **Stop action next** (any frame): a stop parks the task at this tick's
-///      requeue decision; unlike the syscall path it must NOT yield from IRQ
-///      context.
-///   3. **Ring-3 check BEFORE the pick**: a kernel frame has no user context here,
-///      and consuming the bit would lose the signal forever (nothing re-queues a
-///      signal). This is the one ordering rule the whole path depends on.
-///   4. Then (and only then) consume the bit and build the frame. The picked
-///      signal is checked against the peeked one and the frame is built from the
-///      value that was actually taken, so the delivered signal can never be a
-///      neighbour of the pending bit (the off-by-one class this code was written
-///      next to).
+///   1. **Сначала фатальное действие** (любой фрейм): сигналу `SIG_DFL` с
+///      завершением не нужен пользовательский фрейм, и задача должна умереть, была
+///      ли она в ring 3 или внутри syscall. Завершает БЕЗ расхождения —
+///      `sys_exit_group` нельзя звать из контекста IRQ.
+///   2. **Затем stop** (любой фрейм): остановка паркует задачу на решении о
+///      requeue этого тика; в отличие от syscall-пути, уступать CPU из контекста
+///      IRQ нельзя.
+///   3. **Проверка ring 3 ДО выбора**: у ядерного фрейма нет пользовательского
+///      контекста, и потребление бита потеряло бы сигнал навсегда (никто не
+///      переставит сигнал в очередь). Это единственное правило порядка, от
+///      которого зависит весь путь.
+///   4. Затем (и только затем) потребить бит и построить фрейм. Выбранный сигнал
+///      сверяется с подсмотренным, и фрейм строится из реально взятого значения,
+///      поэтому доставленный сигнал никогда не может быть соседом pending-бита
+///      (класс off-by-one).
 pub fn tick_action(cur_rsp: u64) -> TickAction {
     if cur_rsp == 0 || PENDING_APPROX.load(Ordering::Relaxed) == 0 {
         return TickAction::None;
@@ -674,14 +675,14 @@ pub fn tick_action(cur_rsp: u64) -> TickAction {
     if !compat::compat_exists(pid) {
         return TickAction::None;
     }
-    // SAFETY: the only caller is `scheduler_tick_irq`, which passes its own
-    // `current_rsp` — the frame `irq32_stub` pushed on the CURRENT task's kernel
-    // stack. That frame is 168 bytes, mapped and unaliased for the duration of
-    // this call (each task owns a private kernel stack, and the tick runs with
-    // interrupts masked, so nothing can preempt or alias it).
+    // SAFETY: единственный вызывающий — `scheduler_tick_irq`, передающий свой
+    // `current_rsp` — фрейм, который `irq32_stub` положил на стек ядра ТЕКУЩЕЙ
+    // задачи. Фрейм занимает 168 байт, отображён и не алиасится на время вызова
+    // (у каждой задачи свой стек ядра, а тик идёт с замаскированными прерываниями,
+    // так что ничто не может вытеснить или алиасить его).
     let frame = unsafe { &mut *(cur_rsp as *mut IrqFrame) };
 
-    // (1) What would the pending signal do? Peek WITHOUT consuming.
+    // (1) Что сделал бы ожидающий сигнал? Подсмотреть БЕЗ потребления.
     let Some((sig, action, _blocked, _alt)) = compat::peek_deliverable_signal() else {
         return TickAction::None;
     };
@@ -694,8 +695,9 @@ pub fn tick_action(cur_rsp: u64) -> TickAction {
             pid,
             sig
         );
-        // Records 128 + sig for wait4 and marks the task exiting; the caller drops
-        // it. Diverging here (exit_group) would be a halt loop inside the IRQ.
+        // Записывает 128 + sig для wait4 и помечает задачу exiting; вызывающий
+        // снимает её. Расхождение здесь (exit_group) было бы циклом halt внутри
+        // IRQ.
         force_terminate_group(pid, sig);
         return TickAction::Kill;
     }
@@ -705,7 +707,8 @@ pub fn tick_action(cur_rsp: u64) -> TickAction {
         begin_group_stop(sig);
         return TickAction::Park;
     }
-    // (3) A kernel frame: no user context here, so consume NOTHING.
+    // (3) Ядерный фрейм: пользовательского контекста здесь нет, поэтому НИЧЕГО
+    // не потребляем.
     if !frame.is_user_frame() {
         return TickAction::None;
     }
@@ -715,15 +718,15 @@ pub fn tick_action(cur_rsp: u64) -> TickAction {
         return TickAction::None;
     }
 
-    // (4) Consume the bit and deliver to the user handler.
+    // (4) Потребить бит и доставить пользовательскому обработчику.
     let Some((taken, action, old_blocked, altstack)) = compat::pick_pending_signal() else {
         return TickAction::None;
     };
     PENDING_APPROX.fetch_sub(1, Ordering::Relaxed);
     if taken != sig {
-        // Impossible while interrupts are masked (nothing else may touch this
-        // process's pending set), but if it ever happens the frame must be built
-        // from the signal that was ACTUALLY taken — never from a neighbour.
+        // Невозможно при замаскированных прерываниях (ничто другое не может
+        // тронуть pending-набор процесса), но если случится, фрейм обязан строиться
+        // из сигнала, который РЕАЛЬНО взят, — никогда из соседа.
         crate::error!(
             "[signal] pid={} tick delivery: peeked sig={} but picked sig={} - delivering the picked one",
             pid,
@@ -747,9 +750,9 @@ pub fn tick_action(cur_rsp: u64) -> TickAction {
     let newmask = (old_blocked | action.mask) & !UNBLOCKABLE_MASK;
     let mut buf = [0u8; RT_SIGFRAME_SIZE as usize];
     encode_rt_sigframe(&mut buf, action.restorer, taken, &saved, newmask, &altstack);
-    // SAFETY: `check_user_ptr` above proved the whole RT_SIGFRAME_SIZE region is
-    // mapped and user-accessible, and this task exclusively owns its user stack
-    // while it is the running task (the tick runs on its kernel stack).
+    // SAFETY: `check_user_ptr` выше доказал, что весь регион RT_SIGFRAME_SIZE
+    // отображён и доступен пользователю, а задача эксклюзивно владеет своим
+    // пользовательским стеком, пока она текущая (тик идёт на её стеке ядра).
     unsafe {
         ptr::copy_nonoverlapping(buf.as_ptr(), frame_addr as *mut u8, buf.len());
     }
@@ -773,22 +776,22 @@ pub fn tick_action(cur_rsp: u64) -> TickAction {
 
 // ─── rt_sigreturn ────────────────────────────────────────────────────────────
 
-/// `rt_sigreturn` (15): restore the interrupted context from the
-/// `rt_sigframe` the restorer is standing on.
+/// `rt_sigreturn` (15): восстановить прерванный контекст из `rt_sigframe`, на
+/// котором стоит restorer.
 ///
-/// The glibc restorer runs with `RSP = frame + 8` (`pretcode` was popped by
-/// the handler's `ret`), which is exactly where `ucontext` starts — so the
-/// entry user RSP (the `+120` slot) IS the ucontext address.
+/// Restorer glibc работает с `RSP = frame + 8` (`pretcode` снят `ret` обработчика),
+/// а это ровно начало `ucontext` — значит входной user RSP (слот `+120`) И ЕСТЬ
+/// адрес ucontext.
 ///
-/// Returns the saved `rax`; [`super::linux_dispatch`]'s caller (the entry
-/// stub) writes this into the saved `rax` slot, which is how the restored
-/// `rax` reaches ring 3 despite the normal return-value plumbing.
+/// Возвращает сохранённый `rax`; вызывающий [`super::linux_dispatch`] (входной
+/// стаб) пишет его в сохранённый слот `rax`, и так восстановленный `rax` доходит до
+/// ring 3 вопреки обычной обвязке возвращаемого значения.
 pub fn sys_rt_sigreturn(regs: &mut SavedRegs) -> Result<u64, Errno> {
     let user_rsp = unsafe { ((regs as *mut SavedRegs as *const u64).add(15)).read() };
     check_user_ptr(user_rsp, 304)?;
     let mut uc = [0u8; 304];
-    // SAFETY: range validated above; the frame was written by us (or the user
-    // forged it — Linux trusts it likewise; a null-IP frame is rejected below).
+    // SAFETY: диапазон проверен выше; фрейм записан нами (или подделан
+    // пользователем — Linux тоже доверяет; фрейм с нулевым IP отвергается ниже).
     unsafe {
         ptr::copy_nonoverlapping(user_rsp as *const u8, uc.as_mut_ptr(), uc.len());
     }
@@ -808,13 +811,14 @@ pub fn sys_rt_sigreturn(regs: &mut SavedRegs) -> Result<u64, Errno> {
     regs.rbp = fr.bp;
     regs.rbx = fr.bx;
     regs.rdx = fr.dx;
-    regs.rcx = fr.ip; // sysretq RIP
-                      // `decode_rt_sigframe` has already validated ip/sp and masked the flags down
-                      // to user-settable bits: `sysretq` restores RFLAGS verbatim, so IOPL/NT/VM/
-                      // RF/AC must never reach it from a user-forged frame (F-LEAD-2).
-    regs.r11 = fr.flags; // sysretq RFLAGS
-                         // SAFETY: the per-task user-RSP slot is this task's own kernel-stack
-                         // storage (same slot execve/clone rewrite).
+    regs.rcx = fr.ip; // RIP для sysretq
+                      // `decode_rt_sigframe` уже проверил ip/sp и вымаскировал флаги до
+                      // пользовательски устанавливаемых битов: `sysretq` восстанавливает RFLAGS
+                      // дословно, поэтому IOPL/NT/VM/RF/AC никогда не должны дойти до него из
+                      // подделанного пользователем фрейма.
+    regs.r11 = fr.flags; // RFLAGS для sysretq
+                         // SAFETY: per-task слот user-RSP — собственное хранилище этой задачи на
+                         // стеке ядра (тот же слот, который переписывают execve/clone).
     unsafe {
         ((regs as *mut SavedRegs as *mut u64).add(15)).write(fr.sp);
     }
@@ -822,11 +826,11 @@ pub fn sys_rt_sigreturn(regs: &mut SavedRegs) -> Result<u64, Errno> {
     Ok(fr.ax)
 }
 
-// ─── Wait-loop introspection (Phase 2 consumes these) ────────────────────────
+// ─── Интроспекция циклов ожидания ────────────────────────────────────────────
 
-/// Whether the CURRENT process has a signal that would be delivered at the
-/// next syscall return. Blocking syscall wait loops call this to convert a
-/// delivered signal into an `-EINTR` return instead of sleeping through it.
+/// Есть ли у ТЕКУЩЕГО процесса сигнал, который был бы доставлен на следующем
+/// возврате из syscall. Блокирующие циклы ожидания syscall'ов зовут это, чтобы
+/// превратить доставленный сигнал в возврат `-EINTR`, а не проспать его.
 pub fn has_deliverable_current() -> bool {
     if PENDING_APPROX.load(Ordering::Relaxed) == 0 {
         return false;
@@ -834,14 +838,14 @@ pub fn has_deliverable_current() -> bool {
     compat::with_current_compat(|cs| cs.sig_pending & !cs.sig_blocked != 0).unwrap_or(false)
 }
 
-/// Does the CURRENT process have a USER handler installed for `sig`?
-/// `None` when there is no compat state (native task).
+/// Установлен ли у ТЕКУЩЕГО процесса ПОЛЬЗОВАТЕЛЬСКИЙ обработчик для `sig`?
+/// `None`, когда compat-состояния нет (нативная задача).
 pub fn current_has_handler(sig: u64) -> Option<bool> {
     compat::current_action(sig).map(|a| is_user_handler(&a))
 }
 
-/// Disposition snapshot for `sig` in the CURRENT process (used by
-/// `rt_sigaction`'s oldact read-back).
+/// Снимок диспозиции для `sig` в ТЕКУЩЕМ процессе (используется чтением oldact в
+/// `rt_sigaction`).
 pub fn current_action_clone(
     sig: u64,
 ) -> Option<crate::arch::x86_64::linux::signal_frame::SignalAction> {

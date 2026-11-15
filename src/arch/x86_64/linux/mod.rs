@@ -1,17 +1,17 @@
-//! Linux x86_64 binary-compatibility layer.
+//! Слой совместимости с x86_64-бинарями Linux.
 //!
-//! This module tree houses the pure, host-testable core (errno encoding, ABI
-//! marshalling, pointer-range validation, syscall planning, diagnostics) and the
-//! effectful kernel shells that drive it. Pure modules are shared into the
-//! `host-tests` crate via `#[path]` includes (R11.6); the effectful handlers and
-//! the `linux_dispatch` entry land in later tasks.
+//! Дерево модулей содержит чистое, host-тестируемое ядро (кодирование errno,
+//! маршаллинг ABI, валидацию диапазонов указателей, планирование syscall'ов,
+//! диагностику) и эффектные ядерные оболочки, которые его приводят в действие.
+//! Чистые модули разделяются в крейт `host-tests` через `#[path]` (R11.6);
+//! эффектные обработчики и вход `linux_dispatch` — здесь.
 
 pub mod errno;
 pub mod regs;
 
-// The following submodules are populated by later tasks. They are declared here so
-// the module tree exists up front; each starts as a placeholder that compiles
-// cleanly and gains its real content in its own task.
+// Следующие подмодули объявлены, чтобы дерево модулей существовало сразу;
+// каждый вначале компилируется как чистая заготовка и наполняется в своём
+// обработчике.
 pub mod abi;
 pub mod cred;
 pub mod diag;
@@ -26,11 +26,11 @@ pub mod timeconv;
 pub mod tty;
 pub mod validate;
 
-// Kernel-only effectful handler shells. These are NOT `#[path]`-included by the
-// `host-tests` crate (only the pure modules above are), so they may freely use the
-// VMM/PMM, VFS, scheduler, and per-process compat state. Keeping the effectful
-// handlers here — rather than in the host-included `io.rs`/`mem.rs` — is what lets
-// those pure planners stay host-testable (R11.6).
+// Ядерные эффектные оболочки обработчиков. Они НЕ включаются в `host-tests`
+// через `#[path]` (так включаются только чистые модули выше), поэтому свободно
+// используют VMM/PMM, VFS, планировщик и per-process compat-состояние. Хранение
+// эффектных обработчиков здесь — а не в включаемых в host `io.rs`/`mem.rs` —
+// и позволяет тем чистым планировщикам оставаться host-тестируемыми (R11.6).
 pub mod epoll_sys;
 pub mod inet_sock;
 pub mod io_sys;
@@ -48,21 +48,23 @@ use abi::nr as sysno;
 use errno::{encode_errno, Errno};
 use regs::SavedRegs;
 
-/// Single user-pointer validation choke point (R1.5, R1.6).
+/// Единая точка контроля пользовательских указателей (R1.5, R1.6).
 ///
-/// Every handler that takes a user pointer calls this before dereferencing it. It
-/// runs the pure range check [`validate::check_user_range`] (rejecting buffers that
-/// start at/above `User_Addr_Max`, overflow, or end above it — R1.5) and then walks
-/// every 4 KiB page the buffer spans, confirming each is mapped in the CURRENT
-/// address space via [`crate::memory::vmm::virt_to_phys`] (R1.6). Any failure yields
-/// `EFAULT` without the buffer ever being read or written. A zero-length buffer is
-/// Rate limit for the `EINVAL` syscall diagnostic (defense against log flooding).
+/// Каждый обработчик, принимающий пользовательский указатель, зовёт это до
+/// разыменования. Сначала идёт чистая проверка диапазона
+/// [`validate::check_user_range`] (отвергает буферы на/выше `User_Addr_Max`,
+/// переполнение или конец выше границы — R1.5), затем обход каждой страницы 4 КиБ
+/// диапазона с подтверждением, что она отображена в ТЕКУЩЕМ адресном пространстве
+/// через [`crate::memory::vmm::virt_to_phys`] (R1.6). Любой отказ даёт `EFAULT` без
+/// чтения или записи буфера.
+/// Ограничитель частоты диагностики `EINVAL` для syscall'а (защита от заливки
+/// лога).
 ///
-/// The diagnostic exists to name a misbehaving syscall on the next run, but it is
-/// attacker-triggerable: a ring-3 loop over `mprotect()` on kernel addresses (the
-/// F-LEAD-1 exploit) produced >1000 `[linux] EINVAL diag` lines per second, and
-/// every `warn!` reaches both the serial log and the framebuffer — a cheap DoS of
-/// the console/log. At most one line per second is enough to identify the culprit.
+/// Диагностика нужна, чтобы назвать сбойный syscall на следующем запуске, но её
+/// может вызвать атакующий: ring-3 цикл по `mprotect()` на адресах ядра давал
+/// >1000 строк `[linux] EINVAL diag` в секунду, а каждый `warn!` доходит и в
+/// serial, и в framebuffer — дешёвый DoS консоли/лога. Одной строки в секунду
+/// достаточно, чтобы найти виновника.
 fn einval_diag_allowed() -> bool {
     use core::sync::atomic::{AtomicU64, Ordering};
     static LAST: AtomicU64 = AtomicU64::new(0);
@@ -76,7 +78,7 @@ fn einval_diag_allowed() -> bool {
     }
 }
 
-/// always accepted (it dereferences nothing).
+/// Буфер нулевой длины всегда принимается (он ничего не разыменовывает).
 pub(crate) fn check_user_ptr(start: u64, len: u64) -> Result<(), Errno> {
     use validate::PtrCheck;
     if validate::check_user_range(start, len) == PtrCheck::Efault {
@@ -92,12 +94,13 @@ pub(crate) fn check_user_ptr(start: u64, len: u64) -> Result<(), Errno> {
     Ok(())
 }
 
-/// Emit the at-most-once-per-number `-ENOSYS` diagnostic for `nr` (R12.2).
+/// Выдать диагностику `-ENOSYS` для `nr` не чаще раза на номер (R12.2).
 ///
-/// For a Compat_Process the per-process `nosys_logged` set de-duplicates the entry
-/// so each distinct unsupported number is logged once. For a native task (no compat
-/// state) there is no per-process set, so the entry is logged each time — native
-/// tasks never legitimately reach the unsupported path.
+/// Для Compat_Process per-process множество `nosys_logged` дедуплицирует запись,
+/// поэтому каждый отдельный неподдерживаемый номер логируется один раз. У
+/// нативной задачи (нет compat-состояния) per-process множества нет, поэтому
+/// запись логируется каждый раз — нативные задачи законно не доходят до
+/// неподдерживаемого пути.
 fn log_nosys(nr: u64) {
     match compat_log_nosys(nr) {
         Some(true) | None => {
@@ -107,19 +110,20 @@ fn log_nosys(nr: u64) {
     }
 }
 
-/// Record `nr` in the running process's `nosys_logged` set, returning whether this
-/// was its first occurrence (`Some(true)`), a repeat (`Some(false)`), or there is no
-/// compat state (`None`).
+/// Записать `nr` в множество `nosys_logged` работающего процесса, вернув, было ли
+/// это первое появление (`Some(true)`), повтором (`Some(false)`) или
+/// compat-состояния нет (`None`).
 fn compat_log_nosys(nr: u64) -> Option<bool> {
     crate::task::compat::with_current_compat(|cs| diag::should_log_nosys(&mut cs.nosys_logged, nr))
 }
 
-/// Route a supported Linux syscall to its effectful handler, returning the
-/// handler's `Result<u64, Errno>` (the caller folds it into `rax`). The supported
-/// gate has already been checked, so the final arm is unreachable in practice.
+/// Маршрутизировать поддерживаемый syscall Linux в его эффективный обработчик,
+/// вернув `Result<u64, Errno>` обработчика (вызывающий складывает его в `rax`).
+/// Гейт поддерживаемости уже проверен, поэтому последняя ветка на практике
+/// недостижима.
 fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
     match nr {
-        // ── I/O (task 12.1) ──
+        // ── I/O ──
         sysno::READ => io_sys::sys_read(a[0], a[1], a[2]),
         sysno::WRITE => io_sys::sys_write(a[0], a[1], a[2]),
         sysno::WRITEV => io_sys::sys_writev(a[0], a[1], a[2]),
@@ -159,7 +163,8 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::PSELECT6 => io_sys::sys_pselect6(a[0], a[1], a[2], a[3], a[4], a[5]),
         sysno::PPOLL => io_sys::sys_ppoll(a[0], a[1], a[2], a[3]),
         sysno::CLOCK_GETRES => epoll_sys::sys_clock_getres(a[0], a[1]),
-        // The wall clock is read-only here (ticks-derived); setting it is EPERM.
+        // Стенное время здесь только читается (производное от тиков); его
+        // установка — EPERM.
         sysno::CLOCK_SETTIME => Err(crate::arch::x86_64::linux::errno::Errno::EPERM),
         sysno::EVENTFD2 => epoll_sys::sys_eventfd2(a[0], a[1]),
         sysno::EVENTFD => epoll_sys::sys_eventfd2(a[0], 0),
@@ -178,7 +183,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::EPOLL_WAIT => epoll_sys::sys_epoll_wait(a[0], a[1], a[2], a[3]),
         sysno::PIPE => io_sys::sys_pipe(a[0]),
         sysno::PIPE2 => io_sys::sys_pipe2(a[0], a[1]),
-        // ── nvim uv_spawn support ──
+        // ── поддержка uv_spawn в nvim ──
         sysno::SOCKETPAIR => io_sys::sys_socketpair(a[0], a[1], a[2], a[3]),
         sysno::STATX => io_sys::sys_statx(a[0], a[1], a[2], a[3], a[4]),
         sysno::EPOLL_PWAIT => epoll_sys::sys_epoll_pwait(a[0], a[1], a[2], a[3], a[4]),
@@ -190,16 +195,19 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             }
         }
         sysno::CONNECT => {
-            // Peek the sockaddr family to pick the stack (AF_UNIX registry vs AF_INET own stack).
+            // Подсмотреть семейство sockaddr, чтобы выбрать стек (реестр AF_UNIX
+            // vs собственный стек AF_INET).
             let fam = if a[1] != 0 && a[2] >= 2 {
-                // The old comment claimed a "check_user_ptr-style bounds guard",
-                // but only `a[2]` (the length) was checked: `a[1] = 0x8000...`
-                // made the ring-0 read take a #GP and the fault handler halted
-                // the machine (F-x86a-3). Validate the address, then read.
+                // Прежний комментарий обещал «проверку границ в стиле
+                // check_user_ptr», но проверялся только `a[2]` (длина):
+                // `a[1] = 0x8000...` заставлял чтение из ring 0 получить #GP, и
+                // обработчик отказа останавливал машину. Проверить адрес, затем
+                // читать.
                 check_user_ptr(a[1], 2)?;
-                // SAFETY: 2-byte user read after `check_user_ptr` proved
-                // `[a[1], a[1]+2)` is inside the user half; unaligned read of the
-                // sa_family field only, never dereferenced past 2 bytes.
+                // SAFETY: 2-байтное пользовательское чтение после того, как
+                // `check_user_ptr` доказал, что `[a[1], a[1]+2)` в пользовательской
+                // половине; невыровненное чтение только поля sa_family, никогда за
+                // пределами 2 байт.
                 (unsafe { core::ptr::read_unaligned(a[1] as *const u16) }) as u64
             } else {
                 1
@@ -222,8 +230,8 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             }
         }
         sysno::SENDTO => {
-            // Route by fd type. For a connected UDP socket glibc passes
-            // dest_addr=NULL (write-style); an explicit address wins.
+            // Маршрутизировать по типу fd. Для подключённого UDP-сокета glibc
+            // передаёт dest_addr=NULL (стиль write); явный адрес побеждает.
             let is_inet_udp = crate::task::compat::with_current_compat(|cs| {
                 matches!(
                     cs.fds.get(a[0] as u32),
@@ -234,10 +242,11 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             if !is_inet_udp {
                 return Err(Errno::EINVAL);
             }
-            // F-x86v-1 class: the pointer walk below is capped but the COPY
-            // must use the same bound, or a caller with only 1 MiB mapped can
-            // make the kernel allocate/copy the raw (attacker-chosen) count.
-            // Oversized datagrams are EMSGSIZE before any allocation.
+            // Класс аллокационного переполнения: обход указателя ниже ограничен,
+            // но КОПИРОВАНИЕ обязано использовать ту же границу, иначе вызывающий
+            // всего с 1 МиБ отображённых страниц заставит ядро выделить/скопировать
+            // сырой (выбранный атакующим) счётчик. Слишком большие датаграммы —
+            // EMSGSIZE до любой аллокации.
             let len = crate::arch::x86_64::linux::abi::socket_payload_len(a[2], true)?;
             check_user_ptr(a[1], len)?;
             let data = crate::arch::x86_64::linux::io_sys::copy_in_pub(a[1], len);
@@ -249,7 +258,8 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             Ok(n as u64)
         }
         sysno::RECVFROM => {
-            // Route by fd type: AF_INET UDP sockets come here (glibc resolver).
+            // Маршрутизировать по типу fd: сюда приходят AF_INET UDP-сокеты
+            // (резолвер glibc).
             let is_inet_udp = crate::task::compat::with_current_compat(|cs| {
                 matches!(
                     cs.fds.get(a[0] as u32),
@@ -260,24 +270,26 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             if !is_inet_udp {
                 return Err(Errno::EINVAL);
             }
-            // Same allocation-bound bug as sendto: the count is only the
-            // caller's buffer capacity, so cap it to MAX_SOCKET_IO, validate
-            // exactly the range the kernel will allocate/copy, and never ask
-            // for the raw u64 count.
+            // Та же ошибка границы аллокации, что в sendto: счётчик — это только
+            // ёмкость буфера вызывающего, поэтому ограничиваем его MAX_SOCKET_IO,
+            // валидируем ровно диапазон, который ядро выделит/скопирует, и никогда
+            // не просим сырой u64-счётчик.
             let len = crate::arch::x86_64::linux::abi::socket_payload_len(a[2], false)?;
             check_user_ptr(a[1], len)?;
-            // The payload buffer was checked, but this arm is the one socket
-            // path that writes a sockaddr back to user memory. Both outputs are
-            // plain user pointers (F-x86a-1: 16 bytes reached a kernel address
-            // and rewrote TICK_COUNT). Validate them before the receive so no
-            // peer-controlled data can reach an unchecked address.
+            // Буфер полезной нагрузки проверен, но эта ветка — единственный
+            // сокетный путь, пишущий sockaddr обратно в память пользователя. Оба
+            // выхода — простые пользовательские указатели (16 байт достигали
+            // адреса ядра и перезаписывали TICK_COUNT). Проверить их до приёма,
+            // чтобы управляемые партнёром данные не попали по непроверенному
+            // адресу.
             if a[4] != 0 && a[5] != 0 {
-                // `addrlen` is a socklen_t (4 bytes); the sockaddr is 16 bytes
-                // (sockaddr_in) or 28 (sockaddr_in6), validated per family below.
+                // `addrlen` — socklen_t (4 байта); sockaddr — 16 байт
+                // (sockaddr_in) или 28 (sockaddr_in6), проверяется по семейству
+                // ниже.
                 check_user_ptr(a[5], 4)?;
             } else {
-                // One pointer without the other is a nonsense request; Linux
-                // ignores the output in that case, and so do we.
+                // Один указатель без другого — бессмысленный запрос; Linux в этом
+                // случае игнорирует выход, и мы тоже.
             }
             let mut buf = alloc::vec![0u8; len as usize];
             let (n, src) = crate::arch::x86_64::linux::inet_sock::udp_recvfrom_fd(a[0], &mut buf)?;
@@ -291,9 +303,10 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
                         sa[0..2].copy_from_slice(&2u16.to_ne_bytes());
                         sa[2..4].copy_from_slice(&src.port.to_be_bytes());
                         sa[4..8].copy_from_slice(&v4.octets());
-                        // SAFETY: addrlen (a[5]) != 0 checked above; fixed 16-byte
-                        // struct write + 4-byte socklen_t write into user memory
-                        // at syscall-supplied pointers, both unaligned-tolerant.
+                        // SAFETY: addrlen (a[5]) != 0 проверен выше; фиксированная
+                        // 16-байтная структура + 4-байтный socklen_t пишутся в память
+                        // пользователя по указателям из syscall, оба допускают
+                        // невыровненность.
                         unsafe {
                             core::ptr::write_unaligned(a[4] as *mut [u8; 16], sa);
                             core::ptr::write_unaligned(a[5] as *mut u32, 16);
@@ -307,9 +320,10 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
                         sa[0..2].copy_from_slice(&10u16.to_ne_bytes());
                         sa[2..4].copy_from_slice(&src.port.to_be_bytes());
                         sa[8..24].copy_from_slice(&v6.octets());
-                        // SAFETY: addrlen (a[5]) != 0 checked above; fixed 28-byte
-                        // struct write + 4-byte socklen_t write into user memory
-                        // at syscall-supplied pointers, both unaligned-tolerant.
+                        // SAFETY: addrlen (a[5]) != 0 проверен выше; фиксированная
+                        // 28-байтная структура + 4-байтный socklen_t пишутся в память
+                        // пользователя по указателям из syscall, оба допускают
+                        // невыровненность.
                         unsafe {
                             core::ptr::write_unaligned(a[4] as *mut [u8; 28], sa);
                             core::ptr::write_unaligned(a[5] as *mut u32, 28);
@@ -345,7 +359,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::GETPGID => misc::sys_getpgid(a[0]),
         sysno::UMASK => misc::sys_umask(a[0]),
         sysno::FLOCK => misc::sys_flock(a[0], a[1]),
-        // ── Directory / path / fd (linux-binary-compat) ──
+        // ── каталог / путь / fd ──
         sysno::GETDENTS64 => io_sys::sys_getdents64(a[0], a[1], a[2]),
         sysno::GETCWD => io_sys::sys_getcwd(a[0], a[1]),
         sysno::CHDIR => io_sys::sys_chdir(a[0]),
@@ -358,17 +372,18 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::READLINKAT => io_sys::sys_readlinkat(a[0], a[1], a[2], a[3]),
         sysno::STATFS => io_sys::sys_statfs(a[0], a[1]),
         sysno::FSTATFS => io_sys::sys_fstatfs(a[0], a[1]),
-        // ── Memory (task 12.3) ──
+        // ── память ──
         sysno::BRK => mem_sys::sys_brk(a[0]),
         sysno::MMAP => mem_sys::sys_mmap(a[0], a[1], a[2], a[3], a[4], a[5]),
         sysno::MUNMAP => mem_sys::sys_munmap(a[0], a[1]),
         sysno::MREMAP => mem_sys::sys_mremap(a[0], a[1], a[2], a[3], a[4]),
         sysno::MPROTECT => mem_sys::sys_mprotect(a[0], a[1], a[2]),
-        // `madvise` is purely advisory: accept every hint and do nothing.
+        // `madvise` чисто рекомендателен: принять любую подсказку и ничего не
+        // делать.
         sysno::TGKILL => misc::sys_tgkill(a[0], a[1], a[2]),
         sysno::KILL => signal::sys_kill(a[0], a[1]),
         sysno::MADVISE => Ok(0),
-        // ── Misc + process (task 12.5) ──
+        // ── прочее + процессы ──
         sysno::GETPID => misc::sys_getpid(),
         sysno::WAIT4 => process_sys::sys_wait4(a[0], a[1], a[2], a[3]),
         sysno::UNAME => misc::sys_uname(a[0]),
@@ -377,7 +392,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::CLOCK_GETTIME => misc::sys_clock_gettime(a[0], a[1]),
         sysno::GETRANDOM => misc::sys_getrandom(a[0], a[1], a[2]),
         sysno::FUTEX => process_sys::sys_futex(a[0], a[1], a[2], a[3], a[4], a[5]),
-        // ── Identity / info / time / sleep / sched / signals (linux-binary-compat) ──
+        // ── идентичность / информация / время / сон / планирование / сигналы ──
         sysno::GETUID => misc::sys_getuid(),
         sysno::GETGID => misc::sys_getgid(),
         sysno::GETEUID => misc::sys_geteuid(),
@@ -425,15 +440,15 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::MEMFD_CREATE => io_sys::sys_memfd_create(a[0], a[1]),
         sysno::GETRUSAGE => misc::sys_getrusage(a[0], a[1]),
         sysno::TIMES => misc::sys_times(a[0]),
-        // `exit`/`exit_group` diverge (never return); the `!` coerces to the
-        // `Result` arm type.
+        // `exit`/`exit_group` расходятся (никогда не возвращаются); `!`
+        // приводится к типу ветки `Result`.
         sysno::EXIT => misc::sys_exit(a[0]),
         sysno::EXIT_GROUP => misc::sys_exit_group(a[0]),
-        // Tripwire for `abi::SUPPORTED_SYSCALLS` drift: a number the gate
-        // accepted must have a real arm above. Reaching this line means the
-        // enumerated coverage list and this match disagree, so say which number
-        // it is instead of returning a silent, permanent ENOSYS (the test in
-        // `abi.rs` locks the numbers; this locks the arms).
+        // Растяжка дрейфа `abi::SUPPORTED_SYSCALLS`: у числа, принятого гейтом,
+        // обязана быть реальная ветка выше. Дойти сюда — значит перечисленный
+        // список покрытия и этот match разошлись, поэтому назвать номер, а не
+        // вернуть молчаливый вечный ENOSYS (тест в `abi.rs` закрепляет числа, эта
+        // ветка — арм'ы).
         _ => {
             crate::error!(
                 "[linux] nr={} is gated as supported but has NO dispatch arm (SUPPORTED_SYSCALLS drift)",
@@ -444,148 +459,145 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
     }
 }
 
-/// Single funnel point for both Linux syscall entry stubs (`int80_stub` and the
-/// `syscall`-instruction `syscall_entry`).
+/// Единая воронка для обоих входных стабов syscall Linux (`int80_stub` и
+/// `syscall_entry` инструкции `syscall`).
 ///
-/// ## Calling convention
+/// ## Соглашение вызова
 ///
-/// Both stubs save all 15 general-purpose registers into an identical
-/// [`SavedRegs`] frame on the kernel stack and pass a single pointer to that frame
-/// (`rdi = &SavedRegs`). Routing everything through one `*mut SavedRegs` — instead
-/// of spreading the six Linux argument registers across the SysV C ABI — sidesteps
-/// the six-register argument limit cleanly and lets the dispatcher both read the
-/// Linux number/arguments out of the frame and (in later tasks) modify saved
-/// registers such as `FS.base`. The value returned here is written by the stub
-/// into the saved `rax` slot, so it becomes the syscall's `rax` result on return
-/// to ring 3 (R1.2, R1.3); every other GPR is restored unchanged (R1.7).
+/// Оба стаба сохраняют все 15 GPR в идентичный фрейм [`SavedRegs`] на стеке ядра
+/// и передают один указатель на этот фрейм (`rdi = &SavedRegs`). Единый
+/// `*mut SavedRegs` — вместо размазывания шести регистров-аргументов Linux по
+/// SysV C ABI — чисто обходит предел в шесть регистров и позволяет диспетчеру и
+/// читать номер/аргументы из фрейма, и менять сохранённые регистры (например,
+/// `FS.base`). Возвращаемое значение стаб пишет в сохранённый слот `rax`, так что
+/// оно становится результатом syscall в `rax` при возврате в ring 3 (R1.2, R1.3);
+/// все остальные GPR восстанавливаются без изменений (R1.7).
 ///
-/// ## Status: full Linux routing (task 12.7)
+/// ## Статус: полная Linux-маршрутизация
 ///
-/// Reads the Linux number and arguments via [`abi::marshal_args`] (R1.1, R1.8),
-/// then:
+/// Читает номер и аргументы через [`abi::marshal_args`] (R1.1, R1.8), затем:
 ///
-///   1. **Precedence shim.** If the running process has NO registered
-///      [`CompatState`](crate::task::compat::CompatState) (a pagh-native task) and
-///      the number is one of the three legacy pagh-native calls, it is delegated to
-///      the legacy dispatcher so the existing boot/test path keeps working. A
-///      Compat_Process (compat state present) instead gets full Linux semantics —
-///      so the numeric overlap with Linux `open`(2)/`close`(3) is resolved by
-///      "native ⇒ legacy, Linux ⇒ Linux".
-///   2. **Supported-set gate (R1.4, R11.4, R11.5).** Unsupported numbers (incl.
-///      `clone`/`fork`/`vfork`/`futex` and graphical syscalls) log one nosys
-///      diagnostic and return `-ENOSYS` **before any argument pointer is
-///      inspected**.
-///   3. **Routing.** Supported numbers go to the io/mem/misc handlers, each of
-///      which runs the single [`check_user_ptr`] choke point on its pointer
-///      arguments. The handler's `Result<u64, Errno>` is folded `Ok(v) -> v` /
-///      `Err(e) -> -errno` (R1.3) into the value written back to `rax`; every other
-///      GPR is preserved by the entry stub (R1.7).
+///   1. **Шим приоритета.** Если у процесса НЕТ зарегистрированного
+///      [`CompatState`](crate::task::compat::CompatState) (нативная задача pagh) и
+///      номер — один из трёх legacy-вызовов pagh, он делегируется legacy-
+///      диспетчеру, чтобы существующий путь загрузки/тестов работал.
+///      Compat_Process (есть compat-состояние) вместо этого получает полную
+///      семантику Linux — поэтому числовое пересечение с Linux `open`(2)/
+///      `close`(3) решается правилом «нативное ⇒ legacy, Linux ⇒ Linux».
+///   2. **Гейт supported-set (R1.4, R11.4, R11.5).** Неподдерживаемые номера
+///      (включая `clone`/`fork`/`vfork`/`futex` и графические syscall'ы) логируют
+///      одну диагностику nosys и возвращают `-ENOSYS` **до инспекции любого
+///      указателя-аргумента**.
+///   3. **Маршрутизация.** Поддерживаемые номера идут в обработчики io/mem/misc,
+///      каждый из которых прогоняет свои указатели через единую точку
+///      [`check_user_ptr`]. `Result<u64, Errno>` обработчика складывается
+///      `Ok(v) -> v` / `Err(e) -> -errno` (R1.3) в значение, записываемое в `rax`;
+///      все прочие GPR сохраняет входной стаб (R1.7).
 ///
-/// Second argument of [`linux_dispatch`] for a REAL syscall: the caller is a
-/// schedulable task whose frame is safely parked, so the dispatcher may unmask
-/// interrupts for the duration of the handler.
+/// Второй аргумент [`linux_dispatch`] для НАСТОЯЩЕГО syscall: вызывающий —
+/// планируемая задача, чей фрейм безопасно припаркован, поэтому диспетчер может
+/// размаскировать прерывания на время обработчика.
 ///
-/// The boot-time selftest calls the dispatcher DIRECTLY and passes `0` instead:
-/// it runs on the boot thread, which is not a schedulable task (see
-/// `linux_dispatch`).
-/// Bit 0 of [`linux_dispatch`]'s `reentry_allowed` argument: the caller is a real
-/// syscall on a schedulable task (both entry stubs pass it), so the dispatcher
-/// may unmask interrupts for the handler's duration.
+/// Boot-selftest вызывает диспетчер НАПРЯМУЮ и передаёт `0`: он работает на потоке
+/// загрузки, который не планируемая задача (см. `linux_dispatch`).
+/// Бит 0 аргумента `reentry_allowed` у [`linux_dispatch`]: вызывающий — настоящий
+/// syscall на планируемой задаче (оба входных стаба передают его), поэтому
+/// диспетчер может размаскировать прерывания на время обработчика.
 pub const REENTRY_ALLOWED: u64 = 1;
 
-/// Bit 1 of `reentry_allowed`: the syscall arrived through `int 0x80` (only
-/// `syscall::int80_stub` sets it, i.e. the legacy pagh-native entry).
+/// Бит 1 `reentry_allowed`: syscall пришёл через `int 0x80` (его ставит только
+/// `syscall::int80_stub`, то есть legacy-вход pagh).
 ///
-/// AGENTS.md invariant 2 forbids that path for a Compat_Process: on it the saved
-/// `rcx`/`r11` are ordinary user GPRs and the word at `SavedRegs + 120` is the
-/// CPU-pushed user RIP — not the per-task user-RSP slot `execve`, `clone` and
-/// signal delivery depend on. `linux_dispatch` records the observation on the
-/// process so the signal path can refuse frame delivery
-/// (`signal::deliver_one_pending_syscall`) instead of writing an `rt_sigframe`
-/// over the user's code. Native tasks have no compat state (the flag is then
-/// recorded nowhere) and keep working unchanged.
+/// Инвариант 2 из AGENTS.md запрещает этот путь для Compat_Process: на нём
+/// сохранённые `rcx`/`r11` — обычные пользовательские GPR, а слово по
+/// `SavedRegs + 120` — положенный CPU user RIP, а не per-task слот user-RSP, на
+/// который опираются `execve`, `clone` и доставка сигналов. `linux_dispatch`
+/// записывает наблюдение на процесс, чтобы сигнальный путь мог отказаться от
+/// доставки фрейма (`signal::deliver_one_pending_syscall`) вместо записи
+/// `rt_sigframe` поверх кода пользователя. У нативных задач compat-состояния нет
+/// (флаг тогда нигде не записывается), и они работают как раньше.
 pub const INT80_ENTRY: u64 = 2;
 
 /// # Safety
 ///
-/// `regs` must point at a fully-initialized [`SavedRegs`] frame on the current
-/// kernel stack, exactly as built by the entry stubs. The stubs guarantee this.
+/// `regs` обязан указывать на полностью инициализированный фрейм [`SavedRegs`]
+/// на текущем стеке ядра, точно как его строят входные стабы. Стабы это
+/// гарантируют.
 ///
-/// `reentry_allowed` must be [`REENTRY_ALLOWED`] only when the caller really is
-/// a syscall on a schedulable task (both entry stubs pass it); the boot-time
-/// selftest passes 0.
+/// `reentry_allowed` должен быть [`REENTRY_ALLOWED`], только когда вызывающий
+/// действительно syscall на планируемой задаче (оба входных стаба передают его);
+/// boot-selftest передаёт 0.
 #[no_mangle]
 pub extern "C" fn linux_dispatch(regs: *mut SavedRegs, reentry_allowed: u64) -> u64 {
-    // SAFETY: the entry stubs always pass a pointer to the 15-register frame they
-    // just pushed on the current task's own kernel stack; it outlives this call
-    // and is uniquely owned for the duration (each task owns a private kernel
-    // stack, so preemption cannot alias the frame).
+    // SAFETY: входные стабы всегда передают указатель на 15-регистровый фрейм,
+    // который только что положили на собственный стек ядра текущей задачи; он
+    // живёт дольше вызова и уникально принадлежит на время (у каждой задачи свой
+    // стек ядра, поэтому вытеснение не может алиасить фрейм).
     let r = unsafe { &mut *regs };
 
-    // The stubs enter with IF masked (SFMASK / interrupt gate). The frame and
-    // the per-task user-RSP slot are now safely parked on this task's kernel
-    // stack, so the window is preemption-safe: re-enable interrupts so the
-    // timer keeps ticking while handlers block (futex/poll/pipe waits,
-    // nanosleep). With IF masked, `ticks()` never advances — timeouts can
-    // never fire — and `hlt` inside `sleep_ticks` would sleep forever. The
-    // syscall exit stub re-masks IF (`cli`) before unwinding the frame.
+    // Стабы входят с замаскированным IF (SFMASK / шлюз прерывания). Фрейм и
+    // per-task слот user-RSP теперь безопасно припаркованы на стеке ядра этой
+    // задачи, поэтому окно безопасно для вытеснения: включаем прерывания, чтобы
+    // таймер тикал, пока обработчики блокируются (futex/poll/pipe, nanosleep).
+    // С замаскированным IF `ticks()` не растёт — таймауты не срабатывают, — а
+    // `hlt` в `sleep_ticks` спал бы вечно. Хвост выхода syscall снова маскирует
+    // IF (`cli`) до снятия фрейма.
     //
-    // Gated on the CALLER, never on the current IF: every caller arrives with
-    // IF masked (SFMASK on `syscall`, the interrupt gate for `int 0x80`), so a
-    // check of the live flag could never unmask anything. What differs is who
-    // is calling — see REENTRY_ALLOWED.
+    // Зависит от ВЫЗЫВАЮЩЕГО, а не от текущего IF: каждый вызывающий приходит с
+    // замаскированным IF (SFMASK на `syscall`, шлюз прерывания для `int 0x80`),
+    // поэтому проверка живого флага никогда ничего не размаскировала бы. Разница —
+    // кто зовёт, см. REENTRY_ALLOWED.
     //
-    // The boot-time selftest calls this dispatcher DIRECTLY, from the boot
-    // thread, with interrupts still masked (the whole boot path runs that way
-    // until `boot::kernel_main` enables them just before the idle loop).
-    // Unmasking there is a silent machine hang, not a speedup: the boot thread
-    // has `current_pid() == IDLE_PID`, so the first timer tick files its stack
-    // under the idle task and switches to the always-ready shell/net threads —
-    // and because those two are permanently in the ready queue, the tick never
-    // restores the boot thread, which stays parked mid-`sti` forever (the
-    // harness then dies before its post-network checks are ever spawned, with
-    // no diagnostics). That caller therefore passes a zero `reentry_allowed`
-    // and leaves interrupts exactly as it found them; the boot thread reaches
-    // the idle loop still masked and `boot::kernel_main` enables them there,
-    // as designed.
+    // Boot-selftest вызывает диспетчер НАПРЯМУЮ, с потока загрузки, всё ещё с
+    // замаскированными прерываниями (весь путь загрузки идёт так, пока
+    // `boot::kernel_main` не включит их перед idle-циклом). Размаскировка там —
+    // тихое зависание машины, а не ускорение: у потока загрузки
+    // `current_pid() == IDLE_PID`, поэтому первый тик таймера складывает его стек
+    // под idle-задачу и переключается на всегда готовые потоки шелла/net, а
+    // поскольку те двое постоянно в ready-очереди, тик никогда не восстановит
+    // поток загрузки — он навсегда останется припаркованным посреди `sti`. Этот
+    // вызывающий передаёт нулевой `reentry_allowed` и оставляет прерывания как
+    // были; поток загрузки доходит до idle-цикла всё ещё с маской, и
+    // `boot::kernel_main` включает их там, как и задумано.
     if reentry_allowed & REENTRY_ALLOWED != 0 {
         crate::arch::cpu::enable_interrupts();
     }
 
-    // The `int 0x80` observation (bit 1) is recorded per process, never acted on
-    // here: the dispatcher itself can serve such a caller (the legacy native
-    // process and the pre-migration compat test binary both did), but the
-    // signal-frame path cannot trust its saved-register meaning (see INT80_ENTRY).
+    // Наблюдение `int 0x80` (бит 1) записывается на процесс и здесь никогда не
+    // используется: диспетчер сам может обслужить такого вызывающего (legacy-
+    // нативный процесс и до-миграционный compat-тест оба так делали), но
+    // сигнальный путь не может доверять смыслу его сохранённых регистров (см.
+    // INT80_ENTRY).
     if reentry_allowed & INT80_ENTRY != 0 {
         crate::task::compat::note_int80_entry();
     }
 
     let (nr, args) = abi::marshal_args(r.rax, r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9);
 
-    // #GP post-mortem context (last dispatched syscall) bookkeeping.
+    // Учёт контекста постмортема #GP (последний диспетчеризованный syscall).
     let cur_pid = crate::task::scheduler::current_pid();
     crate::arch::x86_64::idt::note_syscall(cur_pid, nr);
 
-    // ── 1. Precedence shim: native tasks keep the legacy pagh-native routing ──
-    // A process WITH compat state is a Linux Compat_Process and bypasses this,
-    // taking full Linux semantics for every number (including 1/2/3).
+    // ── 1. Шим приоритета: нативные задачи сохраняют legacy-маршрутизацию pagh ──
+    // Процесс С compat-состоянием — это Linux Compat_Process, он обходит шим и
+    // получает полную семантику Linux для каждого номера (включая 1/2/3).
     if !crate::task::compat::current_has_compat() {
         use crate::arch::x86_64::syscall::{legacy_dispatch, SYS_EXIT, SYS_WRITE, SYS_YIELD};
         if matches!(nr, SYS_WRITE | SYS_EXIT | SYS_YIELD) {
-            // a1/a2/a3 == rdi/rsi/rdx, matching the legacy 3-argument convention.
+            // a1/a2/a3 == rdi/rsi/rdx, как в legacy-соглашении о трёх аргументах.
             return legacy_dispatch(nr, args[0], args[1], args[2]);
         }
     }
 
-    // ── 2. Supported-set gate BEFORE any pointer inspection (R1.4) ──
+    // ── 2. Гейт supported-set ДО инспекции указателей (R1.4) ──
     if !abi::is_supported(nr) {
         log_nosys(nr);
         return encode_errno(Errno::ENOSYS);
     }
 
-    // ── 3. Route to the handler and fold the result into rax (R1.3) ──
-    // Bracket the routed handler with the stuck-syscall watchdog
-    // table, so a silent in-kernel block names its pid + syscall in the log.
+    // ── 3. Маршрутизация в обработчик и складывание результата в rax (R1.3) ──
+    // Обернуть маршрутизированный обработчик таблицей watchdog'а зависших
+    // syscall'ов, чтобы тихий блок в ядре назвал свой pid + syscall в логе.
     let wd_pid = crate::task::scheduler::current_pid();
     inflight_enter(wd_pid, nr, args[0]);
     let result = if nr == sysno::EXECVE {
@@ -593,7 +605,8 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs, reentry_allowed: u64) -> 
     } else if nr == sysno::CLONE {
         process_sys::sys_clone(r, args[0], args[1], args[2], args[3], args[4])
     } else if nr == sysno::RT_SIGRETURN {
-        // Needs the saved frame (the user RSP slot +120), not the six args.
+        // Нужен сохранённый фрейм (per-task слот user-RSP +120), а не шесть
+        // аргументов.
         signal::sys_rt_sigreturn(r)
     } else {
         dispatch_supported(nr, &args)
@@ -602,12 +615,11 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs, reentry_allowed: u64) -> 
     let out = match result {
         Ok(v) => v,
         Err(e) => {
-            // EINVAL returns are logged with their syscall
-            // number and raw args. Userspace surfaces a bare OSError(EINVAL)
-            // (python importlib get_data) with no way to tell which syscall
-            // produced it; this pinpoints the culprit on the next run.
-            // readlink's EINVAL means "not a symlink" — a legitimate answer
-            // for a regular file, not a misbehaving syscall.
+            // Возвраты EINVAL логируются с номером syscall и сырыми аргументами.
+            // Userspace показывает голый OSError(EINVAL) (python importlib
+            // get_data) без способа понять, какой syscall его дал; это указывает
+            // виновника на следующем запуске. EINVAL у readlink означает «не
+            // симлинк» — законный ответ для regular-файла, а не сбойный syscall.
             if matches!(e, Errno::EINVAL) && nr != sysno::READLINK && einval_diag_allowed() {
                 crate::warn!(
                     "[linux] EINVAL diag: nr={} args=[{:#x}, {:#x}, {:#x}, {:#x}]",
@@ -621,28 +633,30 @@ pub extern "C" fn linux_dispatch(regs: *mut SavedRegs, reentry_allowed: u64) -> 
             encode_errno(e)
         }
     };
-    // ── 4. Signal delivery at the syscall-return point (Phase 1) ──
-    // After the result was folded but BEFORE the entry stub writes it into
-    // the saved `rax` slot and unwinds: a pending, unblocked signal with a
-    // user handler gets an `rt_sigframe` on the user stack and the saved
-    // registers rewritten so `sysretq` lands in the handler; a
-    // default-terminate signal exits the process right here. The interrupted
-    // syscall's result travels inside the frame's saved `rax`, so a handler
-    // that returns via `rt_sigreturn` resumes with the correct value.
-    // Native tasks (no compat state) pass through with one atomic load.
+    // ── 4. Доставка сигнала в точке возврата из syscall ──
+    // После складывания результата, но ДО того как входной стаб запишет его в
+    // сохранённый слот `rax` и снимет фрейм: ожидающий незаблокированный сигнал
+    // с пользовательским обработчиком получает `rt_sigframe` на пользовательском
+    // стеке, а сохранённые регистры переписываются так, что `sysretq` попадает в
+    // обработчик; сигнал с завершением по умолчанию завершает процесс прямо
+    // здесь. Результат прерванного syscall едет внутри сохранённого `rax` фрейма,
+    // поэтому обработчик, вернувшийся через `rt_sigreturn`, возобновляется с
+    // правильным значением. Нативные задачи (нет compat-состояния) проходят мимо
+    // за одну атомарную загрузку.
     signal::deliver_one_pending_syscall(r, out);
     out
 }
 
-// ─── stuck-syscall watchdog ────────────────────────────────────────
-// A silent hang (nvim's black screen) means some Compat_Process is parked
-// inside one blocking syscall forever, with nothing in the log to say WHICH
-// pid in WHICH syscall. linux_dispatch brackets every routed syscall with
-// inflight_enter/inflight_exit; watchdog_tick (driven by yield_current, i.e.
-// by the very tasks spinning in blocking loops) scans the in-flight table
-// about once a second and reports anyone stuck longer than 5 seconds,
-// re-reporting every 30 seconds. Entries of exited pids are swept lazily.
-// Values: pid -> (nr, arg0, start_tick, last_warn_tick, last_dump_tick).
+// ─── watchdog зависших syscall'ов ──────────────────────────────────
+// Тихое зависание (чёрный экран nvim) означает, что какой-то Compat_Process
+// навсегда припаркован внутри одного блокирующего syscall, и в логе нет ничего,
+// что сказало бы, КАКОЙ pid в КАКОМ syscall. linux_dispatch оборачивает каждый
+// маршрутизированный syscall в inflight_enter/inflight_exit; watchdog_tick
+// (двигаемый yield_current, то есть самими задачами, крутящимися в блокирующих
+// циклах) сканирует таблицу in-flight примерно раз в секунду и сообщает о любом,
+// застрявшем дольше 5 секунд, повторяя каждые 30 секунд. Записи вышедших pid
+// вычищаются лениво. Значения: pid -> (nr, arg0, start_tick, last_warn_tick,
+// last_dump_tick).
 static SYSCALL_INFLIGHT: crate::sync::spinlock::Spinlock<
     alloc::collections::BTreeMap<u64, (u64, u64, u64, u64, u64)>,
 > = crate::sync::spinlock::Spinlock::new(alloc::collections::BTreeMap::new());
@@ -657,10 +671,10 @@ fn inflight_exit(pid: u64) {
     SYSCALL_INFLIGHT.lock().remove(&pid);
 }
 
-/// Restart the stuck-syscall clock of `pid`'s in-flight entry (called when a task
-/// that was parked by SIGSTOP is resumed). Without it the paused interval would
-/// count towards the watchdog age and a resumed task could be reported as "stuck"
-/// the moment it continues.
+/// Перезапустить часы застрявшего syscall для in-flight записи `pid`
+/// (вызывается при возобновлении задачи, припаркованной SIGSTOP). Без этого
+/// пауза засчиталась бы в возраст watchdog'а, и возобновлённая задача была бы
+/// объявлена «застрявшей» сразу после продолжения.
 pub fn inflight_refresh(pid: u64) {
     let now = crate::task::scheduler::ticks();
     if let Some(e) = SYSCALL_INFLIGHT.lock().get_mut(&pid) {
@@ -669,7 +683,7 @@ pub fn inflight_refresh(pid: u64) {
     }
 }
 
-/// Human name for the syscalls a task can realistically block in.
+/// Человеческое имя syscall'ов, в которых задача реально может блокироваться.
 fn wd_sys_name(nr: u64) -> &'static str {
     match nr {
         0 => "read",
@@ -689,19 +703,19 @@ fn wd_sys_name(nr: u64) -> &'static str {
     }
 }
 
-/// Called from `yield_current` (thread context, no scheduler locks held).
-/// COMPAT_STATES is only taken AFTER the in-flight lock is released, so the
-/// two locks never nest and no ordering hazard is introduced.
+/// Вызывается из `yield_current` (контекст потока, локов планировщика не
+/// держим). `COMPAT_STATES` берётся только ПОСЛЕ отпускания in-flight лока,
+/// поэтому два лока никогда не вкладываются и порядок не страдает.
 pub fn watchdog_tick() {
-    // The stuck task itself spins through yield_current, so this
-    // is the one place where its OWN fd table is the current one — dump its
-    // epoll interest list from here.
+    // Застрявшая задача сама крутится через yield_current, поэтому это
+    // единственное место, где ЕЁ fd-таблица — текущая: печатаем её список
+    // интересов epoll отсюда.
     maybe_dump_self();
     let now = crate::task::scheduler::ticks();
     let last = WD_LAST_SCAN.load(core::sync::atomic::Ordering::Relaxed);
     if now.saturating_sub(last) < 100 {
         return;
-    } // scan at most once a second
+    } // скан не чаще раза в секунду
     if WD_LAST_SCAN
         .compare_exchange(
             last,
@@ -723,12 +737,13 @@ pub fn watchdog_tick() {
             SYSCALL_INFLIGHT.lock().remove(&pid);
             continue;
         }
-        // A task parked by SIGSTOP is not stuck: it is STOPPED, and its in-flight
-        // entry simply freezes with it (a task blocked in a wait loop can be parked
-        // from another context by a group stop). Reporting it would make
-        // `[WATCHDOG]` — an E2E problem marker — fire for a process that is doing
-        // exactly what it was told to do. The entry's clock is restarted on resume
-        // (`inflight_refresh`), so the paused time never counts as "stuck".
+        // Задача, припаркованная SIGSTOP, не застряла: она ОСТАНОВЛЕНА, и её
+        // in-flight запись просто замирает вместе с ней (заблокированную в цикле
+        // ожидания задачу может припарковать групповой stop из другого контекста).
+        // Сообщение о ней заставило бы `[WATCHDOG]` — маркер проблемы E2E —
+        // срабатывать для процесса, делающего ровно то, что ему велели. Часы
+        // записи перезапускаются при возобновлении (`inflight_refresh`), поэтому
+        // пауза никогда не считается «застреванием».
         if crate::task::scheduler::is_stopped(pid) {
             continue;
         }
@@ -736,7 +751,8 @@ pub fn watchdog_tick() {
         if age >= 500 && (warned == 0 || now.saturating_sub(warned) >= 3000) {
             let mut still_stuck = false;
             if let Some(e) = SYSCALL_INFLIGHT.lock().get_mut(&pid) {
-                // Same syscall instance only: a fresh entry means it moved on.
+                // Только тот же экземпляр syscall: свежая запись означает, что
+                // задача двинулась дальше.
                 if e.2 == start {
                     e.3 = now;
                     still_stuck = true;
@@ -757,10 +773,11 @@ pub fn watchdog_tick() {
     }
 }
 
-/// When the CURRENT task is the one stuck in epoll_wait (232) or
-/// epoll_pwait (281), dump its interest list with live readiness every ~10 s.
-/// Runs in the stuck task's own context (it spins through yield_current), so
-/// the ordinary current-task fd helpers resolve against the right table.
+/// Когда ТЕКУЩАЯ задача — та, что застряла в epoll_wait (232) или epoll_pwait
+/// (281), печатать её список интересов с живой готовностью примерно раз в 10 с.
+/// Выполняется в контексте самой застрявшей задачи (она крутится через
+/// yield_current), поэтому обычные хелперы fd текущей задачи разрешаются по
+/// правильной таблице.
 fn maybe_dump_self() {
     let pid = crate::task::scheduler::current_pid();
     let now = crate::task::scheduler::ticks();
@@ -780,10 +797,10 @@ fn maybe_dump_self() {
         }
     };
     if let Some(epfd) = epfd {
-        // The spawn-time [DIAG] lines are wiped when the TUI
-        // clears the screen, and the QEMU display cannot scroll back. Re-print
-        // the decisive evidence with every dump: what stdio is NOW and what it
-        // was AT execve time (after the close-on-exec sweep).
+        // Строки [DIAG] времени spawn стираются, когда TUI очищает экран, а
+        // дисплей QEMU не умеет прокручиваться назад. Заново печатать решающие
+        // улики при каждом дампе: что stdio сейчас и что было НА МОМЕНТ execve
+        // (после вычистки close-on-exec).
         let _ = crate::task::compat::with_current_compat(|cs| {
             crate::warn!(
                 "[WATCHDOG] pid={} stdio now: fd0={} fd1={} fd2={} | at exec: fd0={} fd1={} fd2={}",

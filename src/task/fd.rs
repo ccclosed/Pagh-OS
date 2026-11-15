@@ -1,11 +1,11 @@
-//! Per-`Compat_Process` file-descriptor table (R2.4, R2.6, R2.14).
+//! Таблица файловых дескрипторов на `Compat_Process` (R2.4, R2.6, R2.14).
 //!
-//! Maps small integer fds to open objects, with 0/1/2 pre-bound to the standard
-//! streams (R2.2) and fresh descriptors allocated as the lowest free index `>= 3`
-//! (R2.4). The pure index-allocation and close bookkeeping lives in the
-//! dependency-free [`super::fd_alloc`] module so it is host-testable for Property
-//! 7; this module layers the kernel-only [`OpenObject`] (which embeds
-//! `Arc<dyn VfsNode>`) and the shared [`Errno`] mapping on top of it.
+//! Сопоставляет небольшие целые fd открытым объектам: 0/1/2 заранее привязаны к
+//! стандартным потокам (R2.2), новые дескрипторы выделяются как наименьший
+//! свободный индекс `>= 3` (R2.4). Чистое выделение индексов и учёт закрытия
+//! живут в [`super::fd_alloc`] без зависимостей, поэтому host-тестируются для
+//! Property 7; этот модуль надстраивает ядерный [`OpenObject`] (со встроенным
+//! `Arc<dyn VfsNode>`) и общее отображение [`Errno`].
 #![allow(dead_code)]
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -88,9 +88,10 @@ impl PipeEndpoint {
             s.readers == 0
         }
     }
-    /// Clone this endpoint with a different O_NONBLOCK flag (fcntl
-    /// F_SETFL). The clone registers as an extra reader/writer on the shared
-    /// queue; the original's count drops when its last Arc is released.
+    /// Клонировать этот конец pipe с другим флагом O_NONBLOCK (fcntl
+    /// F_SETFL). Клон регистрируется как дополнительный читатель/писатель на
+    /// общей очереди; счётчик оригинала падает, когда отпускается последний
+    /// Arc.
     pub fn with_nonblocking(self: &Arc<Self>, on: bool) -> Arc<PipeEndpoint> {
         if self.nonblocking == on {
             return Arc::clone(self);
@@ -111,12 +112,12 @@ impl PipeEndpoint {
     }
 }
 
-/// Dropping the last endpoint Arc of a side decrements that side's count so
-/// the opposite end observes EOF (`writers == 0`) / EPIPE (`readers == 0`).
-/// Without this, counts only ever grew: a forked child's inherited write ends
-/// (run-command's CLOEXEC notify pipe in particular) never released them and
-/// the parent blocked in `read()` forever — git clone hung right after
-/// spawning its remote helper.
+/// Удаление последнего Arc-конца стороны уменьшает счётчик этой стороны, чтобы
+/// противоположный конец увидел EOF (`writers == 0`) / EPIPE (`readers == 0`).
+/// Без этого счётчики только росли: унаследованные форкнутым ребёнком концы
+/// записи (особенно notify-pipe у run-command с CLOEXEC) никогда не
+/// освобождались, и родитель навсегда зависал в `read()` — git clone вставал
+/// сразу после запуска remote-хелпера.
 impl Drop for PipeEndpoint {
     fn drop(&mut self) {
         let mut s = self.state.lock();
@@ -128,23 +129,23 @@ impl Drop for PipeEndpoint {
     }
 }
 
-/// State of one `timerfd` instance.
+/// Состояние одного экземпляра `timerfd`.
 ///
-/// Times are in scheduler ticks (the only clock available to the kernel), and
-/// expiration is computed lazily on read/poll: no timer IRQ walks the fd table.
+/// Времена — в тиках планировщика (единственные часы ядра), истечение считается
+/// лениво на read/poll: ни один IRQ таймера не обходит таблицу fd.
 pub struct TimerfdState {
-    /// Absolute tick at which the next expiration is due; `None` = disarmed.
+    /// Абсолютный тик следующего истечения; `None` = разряжен.
     pub deadline: Option<u64>,
-    /// Repetition interval in ticks; `0` = one-shot.
+    /// Интервал повторения в тиках; `0` = одноразовый.
     pub interval: u64,
-    /// Expirations already accumulated (returned by the next read).
+    /// Накопленные истечения (их вернёт следующий read).
     pub expirations: u64,
-    /// Whether the descriptor was created with TFD_NONBLOCK.
+    /// Создан ли дескриптор с TFD_NONBLOCK.
     pub nonblocking: bool,
 }
 
 impl TimerfdState {
-    /// Expirations due at `now`, without mutating (used by poll/epoll).
+    /// Истечения, наступившие к `now`, без мутации (используется poll/epoll).
     pub fn pending(&self, now: u64) -> u64 {
         if self.expirations > 0 {
             return self.expirations;
@@ -161,7 +162,7 @@ impl TimerfdState {
         }
     }
 
-    /// Consume all due expirations, advancing the deadline.
+    /// Потребить все наступившие истечения, сдвинув deadline.
     pub fn take(&mut self, now: u64) -> u64 {
         let due = self.pending(now);
         if due > 0 {
@@ -177,73 +178,67 @@ impl TimerfdState {
     }
 }
 
-/// An object a file descriptor can refer to.
+/// Объект, на который может ссылаться файловый дескриптор.
 ///
-/// Standard streams resolve to the kernel console / stdin; everything else is an
-/// ext2-backed file reached through the VFS, carrying its own read/write offset.
+/// Стандартные потоки сводятся к консоли ядра / stdin; всё остальное — файл на
+/// ext2, достижимый через VFS и несущий собственное смещение чтения/записи.
 pub enum OpenObject {
-    /// The kernel console (pre-bound to fds 1 and 2 for stdout/stderr).
+    /// Консоль ядра (заранее привязана к fd 1 и 2 для stdout/stderr).
     Console,
-    /// An AF_INET TCP socket over the kernel's own TCP stack.
+    /// AF_INET TCP-сокет поверх собственного стека TCP ядра.
     InetTcp(Arc<crate::arch::x86_64::linux::inet_sock::InetTcp>),
-    /// An AF_INET UDP socket over the kernel's own UDP stack.
+    /// AF_INET UDP-сокет поверх собственного стека UDP ядра.
     InetUdp(Arc<crate::arch::x86_64::linux::inet_sock::InetUdp>),
-    /// Standard input (pre-bound to fd 0).
+    /// Стандартный ввод (заранее привязан к fd 0).
     Stdin,
-    /// An open ext2-backed file and its current byte offset.
+    /// Открытый файл на ext2 и его текущее байтовое смещение.
     File {
-        /// The VFS node backing this descriptor.
+        /// Узел VFS, лежащий за этим дескриптором.
         node: Arc<dyn VfsNode>,
-        /// Absolute path the descriptor was opened under (for `/proc/.../fd`).
+        /// Абсолютный путь, под которым открыт дескриптор (для `/proc/.../fd`).
         path: String,
-        /// Current read/write offset within the file.
+        /// Текущее смещение чтения/записи внутри файла.
         offset: u64,
     },
-    /// An open directory: the absolute path it was opened under, the snapshot of
-    /// its child nodes taken at open time, and the `getdents64` cursor index into
-    /// that snapshot (Feature: linux-binary-compat). Snapshotting the children at
-    /// open avoids re-reading the VFS (a potentially blocking operation) while the
-    /// `COMPAT_STATES` lock is held during `getdents64`.
+    /// Читающий конец pipe (байты приходят от писателя).
     PipeRead(Arc<PipeEndpoint>),
+    /// Писательский конец pipe (байты уходят читателю).
     PipeWrite(Arc<PipeEndpoint>),
-    /// A `timerfd` instance; state is shared with poll/epoll readers.
+    /// Экземпляр `timerfd`; состояние разделено с читателями poll/epoll.
     Timerfd(Arc<Spinlock<TimerfdState>>),
-    /// A `signalfd` instance: the mask of signals it consumes.
-    Signalfd {
-        mask: Arc<Spinlock<u64>>,
-    },
-    /// An eventfd counter (EFD_SEMAPHORE if semaphore=true).
+    /// Экземпляр `signalfd`: маска сигналов, которые он потребляет.
+    Signalfd { mask: Arc<Spinlock<u64>> },
+    /// Счётчик eventfd (EFD_SEMAPHORE при semaphore=true).
     Eventfd {
         val: Arc<Spinlock<u64>>,
         semaphore: bool,
     },
-    /// One end of an AF_UNIX stream socketpair — a cross-connected
-    /// pair of pipe endpoints (rx = this end's incoming bytes, tx = outgoing).
+    /// Один конец AF_UNIX stream-socketpair — перекрёстно связанная пара
+    /// концов pipe (rx — входящие байты этого конца, tx — исходящие).
     Socket {
         rx: Arc<PipeEndpoint>,
         tx: Arc<PipeEndpoint>,
     },
-    /// A bound/listening AF_UNIX server socket.
+    /// Привязанный/слушающий серверный AF_UNIX-сокет.
     UnixListener(Arc<UnixListenerState>),
-    /// Socket(2) created but not yet bound or connected.
-    UnixSocketUnbound {
-        nonblocking: bool,
-    },
-    /// An epoll instance with its interest list.
+    /// Socket(2), созданный, но ещё не привязанный и не подключённый.
+    UnixSocketUnbound { nonblocking: bool },
+    /// Экземпляр epoll со списком интересов.
     Epoll {
         interests: Arc<Spinlock<Vec<EpollEntry>>>,
     },
+    /// Открытый каталог со снимком детей и курсором `getdents64`.
     Dir {
-        /// Absolute path the directory was opened under (used by `fchdir`).
+        /// Абсолютный путь, под которым открыт каталог (для `fchdir`).
         path: String,
-        /// Child nodes captured at open time.
+        /// Дочерние узлы, снятые снимком при открытии.
         children: Vec<Arc<dyn VfsNode>>,
-        /// Index of the next child `getdents64` will emit.
+        /// Индекс следующего ребёнка, который выдаст `getdents64`.
         index: usize,
     },
 }
 
-/// Linux `O_RDONLY` (access mode 0).
+/// Linux `O_RDONLY` (режим доступа 0).
 pub const O_RDONLY: u64 = 0;
 /// Linux `O_WRONLY`.
 pub const O_WRONLY: u64 = 1;
@@ -251,24 +246,25 @@ pub const O_WRONLY: u64 = 1;
 pub const O_RDWR: u64 = 2;
 /// Linux `O_NONBLOCK` (x86_64).
 pub const O_NONBLOCK: u64 = 0o4000;
-/// Linux `O_CLOEXEC` (x86_64). Tracked separately in [`FdTable::cloexec`] so
-/// `FD_CLOEXEC` can be toggled without rewriting the open flags.
+/// Linux `O_CLOEXEC` (x86_64). Отслеживается отдельно в [`FdTable::cloexec`],
+/// чтобы FD_CLOEXEC можно было переключать, не переписывая флаги открытия.
 pub const O_CLOEXEC: u64 = 0o2000000;
 
-/// Open-time flags Linux strips from `file->f_flags` after `open(2)` returns
-/// (`fs/open.c::do_dentry_open`: `f->f_flags &= ~(O_CREAT | O_EXCL | O_NOCTTY |
-/// O_TRUNC | …)`). `/proc/<pid>/fdinfo/<n>` reports `f_flags`, so these must not
-/// leak into `flags:` even though the caller passed them to `open`.
+/// Флаги открытия, которые Linux вычищает из `file->f_flags` после возврата
+/// `open(2)` (`fs/open.c::do_dentry_open`: `f->f_flags &= ~(O_CREAT | O_EXCL |
+/// O_NOCTTY | O_TRUNC | …)`). `/proc/<pid>/fdinfo/<n>` сообщает `f_flags`,
+/// поэтому они не должны протекать в `flags:`, хоть вызывающий и передал их в
+/// `open`.
 const O_CREAT_FLAG: u64 = 0o100;
 const O_EXCL_FLAG: u64 = 0o200;
 const O_NOCTTY_FLAG: u64 = 0o400;
 const O_TRUNC_FLAG: u64 = 0o1000;
 const FDINFO_OPEN_TIME_FLAGS: u64 = O_CREAT_FLAG | O_EXCL_FLAG | O_NOCTTY_FLAG | O_TRUNC_FLAG;
 
-/// Default open/status flags for an object created without an explicit open
-/// flag set. These are the access modes the object actually has: stdio is
-/// one-directional, pipes are one-directional, every socket/event object is
-/// read-write. The open path overrides this with the caller's real flags via
+/// Флаги открытия/статуса по умолчанию для объекта, созданного без явного
+/// набора флагов. Это реальные режимы доступа объекта: stdio односторонний,
+/// pipe односторонний, каждый сокет/объект событий читаемо-записываемый. Путь
+/// открытия переопределяет это настоящими флагами вызывающего через
 /// [`FdTable::alloc_with_flags`].
 fn default_object_flags(obj: &OpenObject) -> u64 {
     match obj {
@@ -294,13 +290,12 @@ impl Clone for OpenObject {
 }
 
 impl OpenObject {
-    /// Produce an independent duplicate of this descriptor for `dup`/`dup2`/`dup3`.
+    /// Создать независимый дубликат дескриптора для `dup`/`dup2`/`dup3`.
     ///
-    /// Standard streams clone trivially; a file clones the `Arc` node handle and
-    /// copies the current offset (Linux `dup` shares the open-file description, so
-    /// the offset is the same at duplication time); a directory clones its captured
-    /// child list and cursor so the duplicate continues iterating from the same
-    /// position.
+    /// Стандартные потоки клонируются тривиально; файл клонирует Arc-дескриптор
+    /// узла и копирует текущее смещение (Linux `dup` делит open-file description,
+    /// так что на момент дублирования смещение одно); каталог клонирует снятый
+    /// список детей и курсор, чтобы дубликат продолжал обход с той же позиции.
     pub fn dup_clone(&self) -> OpenObject {
         match self {
             OpenObject::Console => OpenObject::Console,
@@ -346,31 +341,31 @@ impl OpenObject {
     }
 }
 
-/// A process's file-descriptor table.
+/// Таблица файловых дескрипторов процесса.
 ///
-/// Thin kernel-facing wrapper over the pure [`FdSlots`] bookkeeping: it fixes the
-/// stored type to [`OpenObject`], pins the minimum allocatable descriptor at 3,
-/// and maps the pure absent-fd error to [`Errno::EBADF`].
+/// Тонкая ядерная обёртка над чистым учётом [`FdSlots`]: фиксирует хранимый тип
+/// [`OpenObject`], закрепляет минимальный выделяемый дескриптор на 3 и
+/// отображает чистую ошибку отсутствия fd в [`Errno::EBADF`].
 #[derive(Clone)]
 pub struct FdTable {
     slots: FdSlots<OpenObject>,
-    /// Descriptors flagged close-on-exec (O_CLOEXEC / FD_CLOEXEC).
-    /// Swept by execve; libuv's fork+exec error-pipe protocol depends on it.
+    /// Дескрипторы с флагом close-on-exec (O_CLOEXEC / FD_CLOEXEC).
+    /// Вычищаются execve; на этом держится протокол error-pipe у fork+exec libuv.
     cloexec: BTreeSet<u32>,
-    /// The `f_flags` each descriptor was opened with (without `O_CLOEXEC`,
-    /// which lives in `cloexec`). This is the real source for `/proc/.../fdinfo`
-    /// `flags:`; `dup`/`dup2` copy it, `close` drops it, and the
-    /// `F_SETFL`/`FIONBIO` paths update `O_NONBLOCK` when they change it.
+    /// `f_flags`, с которыми открыт каждый дескриптор (без `O_CLOEXEC` — он в
+    /// `cloexec`). Это настоящий источник `flags:` для `/proc/.../fdinfo`;
+    /// `dup`/`dup2` его копируют, `close` удаляет, а пути `F_SETFL`/`FIONBIO`
+    /// обновляют `O_NONBLOCK` при изменении.
     flags: BTreeMap<u32, u64>,
 }
 
 impl FdTable {
-    /// Lowest descriptor a fresh `alloc` may return; 0/1/2 are reserved for the
-    /// standard streams (R2.4).
+    /// Наименьший дескриптор, который может вернуть свежий `alloc`; 0/1/2
+    /// зарезервированы под стандартные потоки (R2.4).
     const FIRST_DYNAMIC_FD: usize = 3;
 
-    /// Create a table with the standard streams pre-bound: fd 0 = stdin,
-    /// fd 1 = console (stdout), fd 2 = console (stderr) (R2.2).
+    /// Создать таблицу с заранее привязанными стандартными потоками: fd 0 =
+    /// stdin, fd 1 = консоль (stdout), fd 2 = консоль (stderr) (R2.2).
     pub fn with_standard_streams() -> Self {
         let mut initial: Vec<Option<OpenObject>> = Vec::with_capacity(Self::FIRST_DYNAMIC_FD);
         initial.push(Some(OpenObject::Stdin)); // fd 0
@@ -387,36 +382,37 @@ impl FdTable {
         }
     }
 
-    /// Allocate the lowest free descriptor `>= 3`, store `obj` there, and return
-    /// the descriptor, growing the table as needed (R2.4). The recorded open
-    /// flags are the object's real access mode ([`default_object_flags`]); paths
-    /// that know the caller's `open(2)` flags use [`Self::alloc_with_flags`].
+    /// Выделить наименьший свободный дескриптор `>= 3`, положить туда `obj` и
+    /// вернуть дескриптор, вырастив таблицу при необходимости (R2.4).
+    /// Записанные флаги открытия — реальный режим доступа объекта
+    /// ([`default_object_flags`]); пути, знающие флаги `open(2)` вызывающего,
+    /// используют [`Self::alloc_with_flags`].
     pub fn alloc(&mut self, obj: OpenObject) -> u32 {
         let flags = default_object_flags(&obj);
         self.alloc_with_flags(obj, flags)
     }
 
-    /// Allocate a descriptor and record the exact open/status flags the
-    /// descriptor carries. `O_CLOEXEC` is stripped here because it is tracked
-    /// in `cloexec` ([`Self::fdinfo_flags`] recombines the two), and the
-    /// creation-only flags Linux clears from `f_flags` are removed for the
-    /// same reason.
+    /// Выделить дескриптор и записать точные флаги открытия/статуса, которые он
+    /// несёт. `O_CLOEXEC` здесь вычищается, потому что отслеживается в `cloexec`
+    /// ([`Self::fdinfo_flags`] собирает их обратно), а флаги только создания,
+    /// которые Linux убирает из `f_flags`, удаляются по той же причине.
     pub fn alloc_with_flags(&mut self, obj: OpenObject, flags: u64) -> u32 {
         let fd = self.slots.alloc(Self::FIRST_DYNAMIC_FD, obj);
-        self.cloexec.remove(&fd); // a recycled slot must not inherit the flag
+        self.cloexec.remove(&fd); // переиспользованный слот не должен наследовать флаг
         self.flags
             .insert(fd, flags & !(O_CLOEXEC | FDINFO_OPEN_TIME_FLAGS));
         fd
     }
 
-    /// Recorded open/status flags for `fd` (without `O_CLOEXEC`), or `None`
-    /// when the descriptor is absent.
+    /// Записанные флаги открытия/статуса `fd` (без `O_CLOEXEC`) или `None`,
+    /// когда дескриптор отсутствует.
     pub fn open_flags(&self, fd: u32) -> Option<u64> {
         self.flags.get(&fd).copied()
     }
 
-    /// The `f_flags` value `/proc/<pid>/fdinfo/<fd>` reports: recorded open
-    /// flags plus `O_CLOEXEC` when `FD_CLOEXEC` is set on this descriptor.
+    /// Значение `f_flags`, которое сообщает `/proc/<pid>/fdinfo/<fd>`:
+    /// записанные флаги открытия плюс `O_CLOEXEC`, если на дескрипторе стоит
+    /// `FD_CLOEXEC`.
     pub fn fdinfo_flags(&self, fd: u32) -> Option<u64> {
         let mut flags = self.open_flags(fd)?;
         if self.cloexec.contains(&fd) {
@@ -425,8 +421,9 @@ impl FdTable {
         Some(flags)
     }
 
-    /// Set or clear `O_NONBLOCK` in the recorded descriptor flags after an
-    /// `fcntl(F_SETFL)`/`ioctl(FIONBIO)` actually changed the object's state.
+    /// Поставить или снять `O_NONBLOCK` в записанных флагах дескриптора после
+    /// того, как `fcntl(F_SETFL)`/`ioctl(FIONBIO)` реально изменили состояние
+    /// объекта.
     pub fn set_nonblocking_flag(&mut self, fd: u32, on: bool) {
         if let Some(flags) = self.flags.get_mut(&fd) {
             if on {
@@ -437,14 +434,14 @@ impl FdTable {
         }
     }
 
-    /// Borrow the object referenced by `fd`, or `None` for an out-of-range/empty
-    /// descriptor (caller maps `None` -> `EBADF`, R2.14).
+    /// Позаимствовать объект по `fd` или `None` для дескриптора вне
+    /// диапазона/пустого (вызывающий отображает `None` -> `EBADF`, R2.14).
     pub fn get(&self, fd: u32) -> Option<&OpenObject> {
         self.slots.get(fd)
     }
 
-    /// Mutably borrow the object referenced by `fd`, or `None` for an
-    /// out-of-range/empty descriptor (caller maps `None` -> `EBADF`, R2.14).
+    /// Изменяемо позаимствовать объект по `fd` или `None` для дескриптора вне
+    /// диапазона/пустого (вызывающий отображает `None` -> `EBADF`, R2.14).
     pub fn get_mut(&mut self, fd: u32) -> Option<&mut OpenObject> {
         self.slots.get_mut(fd)
     }
@@ -471,16 +468,16 @@ impl FdTable {
         (rfd, wfd)
     }
 
-    /// The descriptor table's current slot capacity, reported as `FDSize:` in
-    /// `/proc/self/status` (Linux reports the allocated table size, not the
-    /// number of open descriptors).
+    /// Текущая ёмкость слотов таблицы, сообщаемая как `FDSize:` в
+    /// `/proc/self/status` (Linux сообщает размер выделенной таблицы, а не число
+    /// открытых дескрипторов).
     pub fn capacity(&self) -> usize {
         self.slots.len()
     }
 
-    /// Close `fd`. Returns `Err(Errno::EBADF)` when the descriptor is absent or
-    /// already closed, leaving the table unchanged; otherwise releases it and
-    /// returns `Ok` (R2.6, R2.14).
+    /// Закрыть `fd`. Возвращает `Err(Errno::EBADF)`, если дескриптор отсутствует
+    /// или уже закрыт, оставляя таблицу неизменной; иначе освобождает его и
+    /// возвращает `Ok` (R2.6, R2.14).
     pub fn close(&mut self, fd: u32) -> Result<(), Errno> {
         let res = self.slots.close(fd).map_err(|_| Errno::EBADF);
         if res.is_ok() {
@@ -490,14 +487,14 @@ impl FdTable {
         res
     }
 
-    /// `dup` (32): duplicate `oldfd` into the lowest free descriptor `>= 3`,
-    /// returning the new descriptor. `EBADF` if `oldfd` is not open.
+    /// `dup` (32): продублировать `oldfd` в наименьший свободный дескриптор
+    /// `>= 3` и вернуть новый дескриптор. `EBADF`, если `oldfd` не открыт.
     pub fn dup(&mut self, oldfd: u32) -> Result<u32, Errno> {
         self.dup_min(oldfd, Self::FIRST_DYNAMIC_FD as u32)
     }
 
-    /// `fcntl(F_DUPFD)`: duplicate `oldfd` into the lowest free descriptor that is
-    /// `>= min`, returning the new descriptor. `EBADF` if `oldfd` is not open.
+    /// `fcntl(F_DUPFD)`: продублировать `oldfd` в наименьший свободный
+    /// дескриптор `>= min` и вернуть его. `EBADF`, если `oldfd` не открыт.
     pub fn dup_min(&mut self, oldfd: u32, min: u32) -> Result<u32, Errno> {
         let dup = self.slots.get(oldfd).ok_or(Errno::EBADF)?.dup_clone();
         let flags = self
@@ -505,26 +502,26 @@ impl FdTable {
             .get(&oldfd)
             .copied()
             .unwrap_or_else(|| default_object_flags(&dup));
-        // F-r3-life-1: `min` is caller-controlled (`fcntl(F_DUPFD, arg)`). The
-        // syscall layer rejects `arg >= NOFILE_MAX` with EINVAL, but the table
-        // itself refuses to grow past `FD_TABLE_LIMIT` so no path can turn a
-        // huge minimum into a multi-hundred-MiB allocation (EMFILE).
+        // `min` контролируется вызывающим (`fcntl(F_DUPFD, arg)`). Слой
+        // syscall отвергает `arg >= NOFILE_MAX` с EINVAL, но сама таблица не даёт
+        // вырасти за `FD_TABLE_LIMIT`, чтобы никакой путь не превратил огромный
+        // минимум в аллокацию на сотни МиБ (EMFILE).
         let fd = self
             .slots
             .try_alloc(min as usize, super::fd_alloc::FD_TABLE_LIMIT, dup)
             .map_err(|_| Errno::EMFILE)?;
-        self.cloexec.remove(&fd); // the duplicate starts without FD_CLOEXEC
+        self.cloexec.remove(&fd); // дубликат начинается без FD_CLOEXEC
         self.flags.insert(fd, flags);
         Ok(fd)
     }
 
-    /// `dup2`/`dup3`: duplicate `oldfd` into the explicit descriptor `newfd`,
-    /// closing whatever currently occupies `newfd` first. Returns `newfd`.
-    /// `EBADF` if `oldfd` is not open.
+    /// `dup2`/`dup3`: продублировать `oldfd` в явный дескриптор `newfd`, сначала
+    /// закрыв то, что занимает `newfd`. Возвращает `newfd`. `EBADF`, если `oldfd`
+    /// не открыт.
     ///
-    /// When `oldfd == newfd` the caller must enforce the `dup2`/`dup3` distinction
-    /// (`dup2` returns `newfd` unchanged; `dup3` is `EINVAL`); this method assumes
-    /// they differ.
+    /// При `oldfd == newfd` различие `dup2`/`dup3` обеспечивает вызывающий
+    /// (`dup2` возвращает `newfd` без изменений; `dup3` — `EINVAL`); этот метод
+    /// предполагает, что они различаются.
     pub fn dup_to(&mut self, oldfd: u32, newfd: u32) -> Result<u32, Errno> {
         let dup = self.slots.get(oldfd).ok_or(Errno::EBADF)?.dup_clone();
         let flags = self
@@ -533,14 +530,14 @@ impl FdTable {
             .copied()
             .unwrap_or_else(|| default_object_flags(&dup));
         self.slots.set(newfd, dup);
-        self.cloexec.remove(&newfd); // dup2/dup3 clear FD_CLOEXEC on the target
+        self.cloexec.remove(&newfd); // dup2/dup3 снимают FD_CLOEXEC с цели
         self.flags.insert(newfd, flags);
         Ok(newfd)
     }
 
-    // ── close-on-exec bookkeeping ──
+    // ── учёт close-on-exec ──
 
-    /// Set or clear the FD_CLOEXEC flag for `fd`.
+    /// Поставить или снять флаг FD_CLOEXEC у `fd`.
     pub fn set_cloexec(&mut self, fd: u32, on: bool) {
         if on {
             self.cloexec.insert(fd);
@@ -549,12 +546,12 @@ impl FdTable {
         }
     }
 
-    /// Whether `fd` carries the FD_CLOEXEC flag.
+    /// Несёт ли `fd` флаг FD_CLOEXEC.
     pub fn is_cloexec(&self, fd: u32) -> bool {
         self.cloexec.contains(&fd)
     }
 
-    /// Short human name for whatever occupies `fd`.
+    /// Короткое человеческое имя того, что занимает `fd`.
     pub fn describe_fd(&self, fd: u32) -> &'static str {
         match self.slots.get(fd) {
             None => "closed",
@@ -576,7 +573,7 @@ impl FdTable {
         }
     }
 
-    /// Close every descriptor flagged close-on-exec (the execve sweep).
+    /// Закрыть все дескрипторы с флагом close-on-exec (вычистка при execve).
     pub fn close_cloexec(&mut self) {
         let fds = core::mem::take(&mut self.cloexec);
         for fd in fds {
@@ -585,10 +582,10 @@ impl FdTable {
         }
     }
 
-    /// `socketpair(AF_UNIX, SOCK_STREAM)`: two cross-connected
-    /// in-kernel byte queues. Each end reads from one queue and writes to the
-    /// other, so BOTH fds are readable and writable (unlike a pipe). Closing
-    /// one end makes the peer observe EOF on read and EPIPE on write.
+    /// `socketpair(AF_UNIX, SOCK_STREAM)`: две перекрёстно связанные ядерные
+    /// байтовые очереди. Каждый конец читает из одной очереди и пишет в другую,
+    /// поэтому ОБА fd читаемы и записываемы (в отличие от pipe). Закрытие одного
+    /// конца даёт партнёру EOF на чтении и EPIPE на записи.
     pub fn socketpair(&mut self, nonblocking: bool) -> (u32, u32) {
         let q_ab = Arc::new(Spinlock::new(PipeState {
             bytes: VecDeque::new(),
@@ -627,28 +624,28 @@ impl FdTable {
         let extra = if nonblocking { O_NONBLOCK } else { 0 };
         let fa = self.alloc_with_flags(a, O_RDWR | extra);
         let fb = self.alloc_with_flags(b, O_RDWR | extra);
-        // Which descriptor numbers the RPC channel ends get.
+        // Какие номера дескрипторов получают концы RPC-канала.
 
         (fa, fb)
     }
 }
 
-// --- AF_UNIX listener plumbing -----------------------------------
+// --- обвязка AF_UNIX listener'а -----------------------------------
 
-/// Mutable half of a listening AF_UNIX socket.
+/// Изменяемая половина слушающего AF_UNIX-сокета.
 pub struct UnixListenerInner {
-    /// listen(2) has been called; connect(2) refuses otherwise.
+    /// listen(2) был вызван; иначе connect(2) отказывает.
     pub listening: bool,
-    /// O_NONBLOCK: accept returns EAGAIN instead of blocking.
+    /// O_NONBLOCK: accept возвращает EAGAIN вместо блокировки.
     pub nonblocking: bool,
-    /// Fully connected server-side endpoint pairs queued by connect(2),
-    /// waiting for accept(2).
+    /// Полностью подключённые серверные пары концов, поставленные connect(2) в
+    /// очередь и ждущие accept(2).
     pub pending: VecDeque<(Arc<PipeEndpoint>, Arc<PipeEndpoint>)>,
 }
 
-/// A bound AF_UNIX stream server socket (uv_pipe server in nvim).
+/// Привязанный слушающий AF_UNIX stream-сокет (сервер uv_pipe в nvim).
 pub struct UnixListenerState {
-    /// The sockaddr_un path this socket was bound to.
+    /// Путь sockaddr_un, к которому привязан сокет.
     pub path: String,
     pub inner: Spinlock<UnixListenerInner>,
 }
@@ -666,10 +663,10 @@ impl UnixListenerState {
     }
 }
 
-/// Build the two endpoint pairs of a connected AF_UNIX stream —
-/// (client side, server side) — without allocating fds. connect(2) pushes the
-/// server pair into the listener queue and installs the client pair locally;
-/// accept(2) later turns the server pair into a fresh fd.
+/// Построить две пары концов подключённого AF_UNIX stream — (сторона клиента,
+/// сторона сервера) — не выделяя fd. connect(2) кладёт серверную пару в очередь
+/// listener'а и устанавливает клиентскую пару локально; позже accept(2)
+/// превращает серверную пару в свежий fd.
 pub fn socket_pair_endpoints(
     nonblocking_client: bool,
     nonblocking_server: bool,

@@ -1,180 +1,188 @@
-//! Memory-management syscall planning and effectful handlers.
+//! Планирование memory-management syscall'ов и эффективные обработчики.
 //!
-//! This task (3.1) implements only the **pure** planning logic for `brk`, `mmap`,
-//! `munmap`, and the shared protection-flag mapping: allocation-free, `core`-only
-//! functions that compute outcomes without touching the VMM/PMM, the per-process
-//! `VmRegionSet`, hardware, or global mutable state (R11.6). The effectful handlers
-//! that wire these plans to real page tables land in task 12.3.
+//! Здесь только **чистая** логика планирования `brk`, `mmap`, `munmap` и общее
+//! отображение флагов защиты: функции без аллокаций, только `core`, вычисляющие
+//! результат без обращения к VMM/PMM, per-process `VmRegionSet`, железу или
+//! глобальному изменяемому состоянию (R11.6). Эффектные обработчики, связывающие
+//! эти планы с реальными таблицами страниц, живут в `mem_sys`.
 //!
-//! The `Errno` type is shared from the sibling `errno` module via `super::errno`,
-//! and `USER_ADDR_MAX` from `super::validate`, so the same source compiles both in
-//! the kernel (`crate::arch::x86_64::linux::{errno, validate}`) and when included
-//! into the `host-tests` crate as crate-root sibling modules (R11.6).
+//! Тип `Errno` берётся из соседнего `errno` через `super::errno`, а
+//! `USER_ADDR_MAX` — из `super::validate`, чтобы один и тот же исходник
+//! компилировался и в ядре (`crate::arch::x86_64::linux::{errno, validate}`), и
+//! будучи включённым в крейт `host-tests` как соседние модули корня (R11.6).
 #![allow(dead_code)]
 
 use super::errno::Errno;
 use super::validate::USER_ADDR_MAX;
 
-/// Page size used for all rounding and page-count arithmetic (x86_64 4 KiB pages).
+/// Размер страницы для всего округления и арифметики страниц (x86_64, 4 КиБ).
 const PAGE_SIZE: u64 = 4096;
 
-/// `mmap`/`mprotect` protection bit: the region may be read.
+/// Бит защиты `mmap`/`mprotect`: регион можно читать.
 pub const PROT_READ: u32 = 1;
-/// `mmap`/`mprotect` protection bit: the region may be written.
+/// Бит защиты `mmap`/`mprotect`: регион можно писать.
 pub const PROT_WRITE: u32 = 2;
-/// `mmap`/`mprotect` protection bit: the region may be executed.
+/// Бит защиты `mmap`/`mprotect`: регион можно исполнять.
 pub const PROT_EXEC: u32 = 4;
 
-/// `mmap` flag: the mapping is private (copy-on-write, not shared).
+/// Флаг `mmap`: отображение приватное (copy-on-write, не разделяемое).
 pub const MAP_PRIVATE: u32 = 0x2;
-/// `mmap` flag: the mapping is not backed by any file (zero-filled).
+/// Флаг `mmap`: отображение не опирается на файл (заполняется нулями).
 pub const MAP_ANONYMOUS: u32 = 0x20;
 
-/// A file-backed mapping's backing file identity, for `/proc/<pid>/maps`.
+/// Идентичность файла, лежащего за file-backed отображением, для
+/// `/proc/<pid>/maps`.
 ///
-/// The pure planners ([`plan_mmap_base`], [`plan_munmap`], …) have no business
-/// knowing about the VFS, but the maps file must print what the mapping is
-/// actually backed by: without this table every file-backed line would have to
-/// claim `00:00 0` and no pathname (`docs/procfs.md` DEVIATION-7).
+/// Чистым планировщикам ([`plan_mmap_base`], [`plan_munmap`], …) незачем знать
+/// про VFS, но файл maps должен печатать, чем отображение реально подпёрто: без
+/// этой таблицы каждая file-backed строка заявляла бы `00:00 0` и отсутствие
+/// pathname (`docs/procfs.md` DEVIATION-7).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MmapBacking {
-    /// VFS path the descriptor mapping the region was opened with; the same
-    /// pathname Linux prints for the mapping.
+    /// Путь VFS, с которым открывали дескриптор, отображающий регион; тот же
+    /// pathname, что печатает Linux для отображения.
     pub path: alloc::string::String,
-    /// `st_ino` the VFS reports for that path (`io_sys::node_ino`), so the maps
-    /// line agrees with `stat(2)`/`fdinfo` on the same file.
+    /// `st_ino`, который VFS сообщает для этого пути (`io_sys::node_ino`), чтобы
+    /// строка maps сходилась с `stat(2)`/`fdinfo` по тому же файлу.
     pub ino: u64,
-    /// File offset (bytes) this region's first page maps from. Kept
-    /// page-aligned at map time; partial `munmap`/`mprotect` splits shift it so
-    /// each surviving sub-range reports its own true offset.
+    /// Смещение в файле (байты), с которого отображается первая страница
+    /// региона. Хранится выровненным по странице на момент map; частичные
+    /// `munmap`/`mprotect` сдвигают его, чтобы каждый выживший поддиапазон
+    /// сообщал своё истинное смещение.
     pub file_offset: u64,
 }
 
-/// A previously-mapped region, as tracked by the per-process `VmRegionSet`.
-/// Used by [`plan_munmap`] to confirm a requested range is covered.
+/// Ранее отображённый регион в том виде, как его отслеживает per-process
+/// `VmRegionSet`. Используется [`plan_munmap`] для подтверждения покрытия
+/// запрошенного диапазона.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MmapRegion {
-    /// 4 KiB-aligned base virtual address of the region.
+    /// База региона, выровненная на 4 КиБ.
     pub base: u64,
-    /// Number of 4 KiB pages in the region.
+    /// Число страниц 4 КиБ в регионе.
     pub pages: u64,
-    /// Whether the region's pages carry the writable bit (`PROT_WRITE`).
+    /// Несут ли страницы региона бит записи (`PROT_WRITE`).
     pub writable: bool,
-    /// Whether the region's pages carry the no-execute bit (`!PROT_EXEC`).
+    /// Несут ли страницы региона бит no-execute (`!PROT_EXEC`).
     pub nx: bool,
-    /// Raw `prot` bitmask the region was created with. `0` (`PROT_NONE`) pages
-    /// must NEVER be backed: the page-fault handler treats a fault inside a
-    /// `PROT_NONE` region as a genuine SIGSEGV (stack-guard semantics), not as
-    /// a lazy-mapping opportunity.
+    /// Сырая битовая маска `prot`, с которой создан регион. Страницы `0`
+    /// (`PROT_NONE`) НИКОГДА не должны подпираться кадрами: обработчик page fault
+    /// трактует отказ внутри `PROT_NONE`-региона как настоящий SIGSEGV (семантика
+    /// guard-страницы), а не как повод для ленивого отображения.
     pub prot: u32,
-    /// Whether the region is anonymous (zero-filled, lazy — pages are backed
-    /// on first touch by the page-fault handler) as opposed to file-backed
-    /// (eagerly copied at `mmap` time by the kernel handler).
+    /// Анонимный ли регион (нулевой, ленивый — страницы подпираются по первому
+    /// касанию обработчиком page fault) в отличие от file-backed (жадно
+    /// копируется ядром при `mmap`).
     pub anon: bool,
-    /// File identity of a file-backed region; `None` for anonymous ones (and
-    /// for the synthetic heap coverage region). `/proc/<pid>/maps` prints it
-    /// as `maj:min ino pathname`.
+    /// Идентичность файла file-backed региона; `None` для анонимных (и для
+    /// синтетического региона покрытия кучи). `/proc/<pid>/maps` печатает её как
+    /// `maj:min ino pathname`.
     pub backing: Option<MmapBacking>,
 }
 
-/// Outcome of a pure `brk` planning step (R3.1–R3.6).
+/// Итог чистого шага планирования `brk` (R3.1–R3.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrkOutcome {
-    /// The break is unchanged; the syscall reports this value in `rax`.
+    /// Break не изменился; syscall сообщает это значение в `rax`.
     Unchanged(u64),
-    /// The break grows to `new_brk`; pages over `[map_from, map_to)` must be mapped.
+    /// Break растёт до `new_brk`; страницы `[map_from, map_to)` нужно отобразить.
     Grow {
-        /// The new program break, also the value reported in `rax`.
+        /// Новый program break, он же значение в `rax`.
         new_brk: u64,
-        /// Page-aligned (down) start of the range that must be backed by pages.
+        /// Выровненное (вниз) начало диапазона, который нужно подпереть страницами.
         map_from: u64,
-        /// Page-aligned (up) end of the range that must be backed by pages.
+        /// Выровненный (вверх) конец диапазона, который нужно подпереть страницами.
         map_to: u64,
     },
-    /// The break shrinks to this value, which is also reported in `rax`.
+    /// Break сжимается до этого значения, оно же сообщается в `rax`.
     Shrink(u64),
 }
 
-/// Outcome of a pure `mmap` planning step (R4.1, R4.2, R4.6).
+/// Итог чистого шага планирования `mmap` (R4.1, R4.2, R4.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MmapPlan {
-    /// The request is invalid; the syscall returns this negated errno.
+    /// Запрос неверен; syscall возвращает это отрицательное errno.
     Reject(Errno),
-    /// Map `pages` zero-filled pages at `base` with the given protection bits.
+    /// Отобразить `pages` заполненных нулями страниц по `base` с заданными
+    /// битами защиты.
     Map {
-        /// 4 KiB-aligned base virtual address of the new mapping.
+        /// База нового отображения, выровненная на 4 КиБ.
         base: u64,
-        /// Number of 4 KiB pages to map (length rounded up).
+        /// Число страниц 4 КиБ для отображения (длина округлена вверх).
         pages: u64,
-        /// Whether the pages carry the writable bit (`PROT_WRITE` requested).
+        /// Несут ли страницы бит записи (запрошен `PROT_WRITE`).
         writable: bool,
-        /// Whether the pages carry the no-execute bit (`PROT_EXEC` not requested).
+        /// Несут ли страницы бит no-execute (`PROT_EXEC` не запрошен).
         nx: bool,
     },
 }
 
-/// Outcome of a pure `munmap` planning step (R4.3, R4.7).
+/// Итог чистого шага планирования `munmap` (R4.3, R4.7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MunmapPlan {
-    /// The request is invalid; the syscall returns this negated errno.
+    /// Запрос неверен; syscall возвращает это отрицательное errno.
     Reject(Errno),
-    /// Unmap `pages` pages starting at `base`.
+    /// Снять отображение `pages` страниц начиная с `base`.
     Unmap {
-        /// 4 KiB-aligned base virtual address to unmap.
+        /// База для снятия отображения, выровненная на 4 КиБ.
         base: u64,
-        /// Number of 4 KiB pages to unmap (length rounded up).
+        /// Число страниц 4 КиБ для снятия (длина округлена вверх).
         pages: u64,
     },
 }
 
-/// Round `addr` down to its containing page base.
+/// Округлить `addr` вниз до базы содержащей его страницы.
 #[inline]
 fn page_down(addr: u64) -> u64 {
     addr & !(PAGE_SIZE - 1)
 }
 
-/// Round `addr` up to the next page boundary, saturating at `u64::MAX`.
+/// Округлить `addr` вверх до следующей границы страницы с насыщением на
+/// `u64::MAX`.
 ///
-/// Callers only pass values already known to be below `USER_ADDR_MAX`, so the
-/// saturating add never actually saturates in practice; it keeps the helper total.
+/// Вызывающие передают только значения, уже известные как меньшие
+/// `USER_ADDR_MAX`, поэтому saturating-сложение на практике никогда не
+/// насыщается; оно делает хелпер тотальным.
 #[inline]
 fn page_up(addr: u64) -> u64 {
     page_down(addr.saturating_add(PAGE_SIZE - 1))
 }
 
-/// Compute `ceil(len / PAGE_SIZE)` without overflowing.
+/// Вычислить `ceil(len / PAGE_SIZE)` без переполнения.
 ///
-/// Returns `None` only if `len + (PAGE_SIZE - 1)` would overflow `u64`, which a
-/// caller treats as an invalid request.
+/// `None` только если `len + (PAGE_SIZE - 1)` переполнит `u64`; вызывающий
+/// трактует это как неверный запрос.
 #[inline]
 fn pages_for_len(len: u64) -> Option<u64> {
     len.checked_add(PAGE_SIZE - 1).map(|n| n / PAGE_SIZE)
 }
 
-/// Map a protection bitmask to the `(writable, nx)` page-attribute pair (R4.2,
-/// R4.5, and — via `PF_W`/`PF_X` — R5.4).
+/// Отобразить маску битов защиты в пару атрибутов страницы `(writable, nx)`
+/// (R4.2, R4.5 и — через `PF_W`/`PF_X` — R5.4).
 ///
-/// * `writable` is set iff `PROT_WRITE` is present.
-/// * `nx` (no-execute) is set iff `PROT_EXEC` is **absent**.
+/// * `writable` установлен тогда и только тогда, когда есть `PROT_WRITE`.
+/// * `nx` (no-execute) установлен тогда и только тогда, когда `PROT_EXEC`
+///   **отсутствует**.
 ///
-/// This single mapping is reused by `mmap`, `mprotect`, and the ELF loader, so the
-/// writable/no-execute policy stays identical across all three (Property 14).
+/// Это единственное отображение переиспользуют `mmap`, `mprotect` и ELF-загрузчик,
+/// поэтому политика writable/no-execute остаётся одинаковой во всех трёх
+/// (Property 14).
 pub fn prot_to_flags(prot: u32) -> (bool, bool) {
     let writable = prot & PROT_WRITE != 0;
     let nx = prot & PROT_EXEC == 0;
     (writable, nx)
 }
 
-/// Plan a `brk` transition from `current` toward `requested`, given the process's
-/// `initial` break, without mapping anything (R3.1–R3.6, Property 11).
+/// Спланировать переход `brk` от `current` к `requested` при `initial` break
+/// процесса, ничего не отображая (R3.1–R3.6, Property 11).
 ///
-/// The branches, in order:
-///   * `requested == 0` → [`BrkOutcome::Unchanged`] (query the current break, R3.1).
+/// Ветки по порядку:
+///   * `requested == 0` → [`BrkOutcome::Unchanged`] (запрос текущего break, R3.1).
 ///   * `requested >= USER_ADDR_MAX` → [`BrkOutcome::Unchanged`] (R3.5).
-///   * `requested < initial` → [`BrkOutcome::Unchanged`] (below the floor, R3.6).
+///   * `requested < initial` → [`BrkOutcome::Unchanged`] (ниже нижней границы, R3.6).
 ///   * `initial <= requested <= current` → [`BrkOutcome::Shrink`] (R3.3).
-///   * `current < requested < USER_ADDR_MAX` → [`BrkOutcome::Grow`] mapping the page
-///     span `[page_down(current), page_up(requested))` (R3.2).
+///   * `current < requested < USER_ADDR_MAX` → [`BrkOutcome::Grow`] с отображением
+///     диапазона страниц `[page_down(current), page_up(requested))` (R3.2).
 pub fn plan_brk(initial: u64, current: u64, requested: u64) -> BrkOutcome {
     if requested == 0 || requested >= USER_ADDR_MAX || requested < initial {
         return BrkOutcome::Unchanged(current);
@@ -192,14 +200,15 @@ pub fn plan_brk(initial: u64, current: u64, requested: u64) -> BrkOutcome {
     }
 }
 
-/// Plan the placement of a non-fixed `mmap` of `pages` pages: the first free
-/// gap at or above `floor` that fits `[base, base + pages*4096)` below
-/// `ceiling`, reusing holes left by `munmap`/`mremap`-moves instead of bumping
-/// the high-water mark forever.
+/// Спланировать размещение нефиксированного `mmap` из `pages` страниц: первый
+/// свободный промежуток на `floor` или выше, вмещающий `[base, base + pages*4096)`
+/// ниже `ceiling`, переиспользуя дыры от `munmap`/перемещений `mremap` вместо
+/// вечного роста отметки максимума.
 ///
-/// Returns `None` when no gap fits below `ceiling` (caller reports `ENOMEM`).
-/// The scan walks the regions in arbitrary order, restarting after each hit;
-/// each hit strictly advances `candidate`, so the loop terminates.
+/// `None`, когда ниже `ceiling` не помещается ни один промежуток (вызывающий
+/// сообщает `ENOMEM`). Скан идёт по регионам в произвольном порядке и
+/// перезапускается после каждого попадания; каждое попадание строго двигает
+/// `candidate`, поэтому цикл завершается.
 pub fn plan_mmap_base(regions: &[MmapRegion], floor: u64, pages: u64, ceiling: u64) -> Option<u64> {
     let span = pages.checked_mul(PAGE_SIZE)?;
     let mut candidate = page_up(floor);
@@ -221,10 +230,10 @@ pub fn plan_mmap_base(regions: &[MmapRegion], floor: u64, pages: u64, ceiling: u
     }
 }
 
-/// Whether `[start, start + pages*4096)` is page-aligned, below `ceiling`, and
-/// overlaps no tracked region. Used by `mremap` to decide an in-place growth is
-/// possible (the growing region itself never overlaps: the range starts at its
-/// end).
+/// Выровнен ли `[start, start + pages*4096)` по страницам, лежит ли ниже
+/// `ceiling` и не пересекает ли ни один отслеживаемый регион. Используется
+/// `mremap`, чтобы решить, возможно ли расширение на месте (растущий регион сам
+/// не пересекается: диапазон начинается у его конца).
 pub fn range_is_free(regions: &[MmapRegion], start: u64, pages: u64, ceiling: u64) -> bool {
     if start & (PAGE_SIZE - 1) != 0 {
         return false;
@@ -244,17 +253,19 @@ pub fn range_is_free(regions: &[MmapRegion], start: u64, pages: u64, ceiling: u6
     })
 }
 
-/// Plan an anonymous `mmap` of `len` bytes with protection `prot` and `flags` at the
-/// pre-aligned `hint_base`, without mapping anything (R4.1, R4.2, R4.6, Property 12).
+/// Спланировать анонимный `mmap` длины `len` с защитой `prot` и флагами `flags`
+/// по заранее выровненной `hint_base`, ничего не отображая (R4.1, R4.2, R4.6,
+/// Property 12).
 ///
-/// Returns [`MmapPlan::Reject`] with `EINVAL` when:
-///   * `len == 0`, or
-///   * `flags` are not exactly `MAP_ANONYMOUS | MAP_PRIVATE`, or
-///   * `fd != -1`, or
-///   * the page count for `len` would overflow.
+/// Возвращает [`MmapPlan::Reject`] с `EINVAL`, когда:
+///   * `len == 0`, или
+///   * `flags` не равны ровно `MAP_ANONYMOUS | MAP_PRIVATE`, или
+///   * `fd != -1`, или
+///   * число страниц для `len` переполняется.
 ///
-/// Otherwise returns [`MmapPlan::Map`] with `pages = ceil(len / 4096)`, the supplied
-/// (assumed 4 KiB-aligned) `hint_base`, and `(writable, nx)` from [`prot_to_flags`].
+/// Иначе возвращает [`MmapPlan::Map`] с `pages = ceil(len / 4096)`, переданной
+/// (предположительно выровненной на 4 КиБ) `hint_base` и `(writable, nx)` из
+/// [`prot_to_flags`].
 pub fn plan_mmap(len: u64, prot: u32, flags: u32, fd: i64, hint_base: u64) -> MmapPlan {
     if len == 0 || flags != (MAP_ANONYMOUS | MAP_PRIVATE) || fd != -1 {
         return MmapPlan::Reject(Errno::EINVAL);
@@ -272,16 +283,16 @@ pub fn plan_mmap(len: u64, prot: u32, flags: u32, fd: i64, hint_base: u64) -> Mm
     }
 }
 
-/// Plan a `munmap` of `[base, base + len)` against the set of previously-mapped
-/// `regions`, without unmapping anything (R4.3, R4.7, Property 13).
+/// Спланировать `munmap` `[base, base + len)` относительно набора ранее
+/// отображённых `regions`, ничего не снимая (R4.3, R4.7, Property 13).
 ///
-/// Returns [`MunmapPlan::Reject`] with `EINVAL` when:
-///   * `base` is not 4 KiB-aligned, or
-///   * `len == 0`, or
-///   * the page count / range arithmetic would overflow, or
-///   * any 4 KiB page in the range is not covered by some region in `regions`.
+/// Возвращает [`MunmapPlan::Reject`] с `EINVAL`, когда:
+///   * `base` не выровнен на 4 КиБ, или
+///   * `len == 0`, или
+///   * арифметика числа страниц/диапазона переполняется, или
+///   * какая-либо страница 4 КиБ диапазона не покрыта регионом из `regions`.
 ///
-/// Otherwise returns [`MunmapPlan::Unmap`] with `pages = ceil(len / 4096)`.
+/// Иначе возвращает [`MunmapPlan::Unmap`] с `pages = ceil(len / 4096)`.
 pub fn plan_munmap(base: u64, len: u64, regions: &[MmapRegion]) -> MunmapPlan {
     if base & (PAGE_SIZE - 1) != 0 || len == 0 {
         return MunmapPlan::Reject(Errno::EINVAL);
@@ -290,7 +301,8 @@ pub fn plan_munmap(base: u64, len: u64, regions: &[MmapRegion]) -> MunmapPlan {
         Some(p) => p,
         None => return MunmapPlan::Reject(Errno::EINVAL),
     };
-    // Every page in [base, base + pages*4096) must be covered by some region.
+    // Каждая страница в [base, base + pages*4096) должна быть покрыта каким-то
+    // регионом.
     for i in 0..pages {
         let page = match i
             .checked_mul(PAGE_SIZE)
@@ -306,7 +318,7 @@ pub fn plan_munmap(base: u64, len: u64, regions: &[MmapRegion]) -> MunmapPlan {
     MunmapPlan::Unmap { base, pages }
 }
 
-/// Whether the 4 KiB page at `page` lies within `region`'s `[base, base + pages*4096)`.
+/// Лежит ли страница 4 КиБ по `page` внутри `[base, base + pages*4096)` региона.
 #[inline]
 fn region_contains_page(region: &MmapRegion, page: u64) -> bool {
     let span = match region.pages.checked_mul(PAGE_SIZE) {
@@ -320,40 +332,43 @@ fn region_contains_page(region: &MmapRegion, page: u64) -> bool {
     page >= region.base && page < end
 }
 
-/// Per-`Compat_Process` virtual-memory bookkeeping: the program break plus the
-/// set of anonymous `mmap` regions (design "MmapRegion / VM tracking").
+/// Per-`Compat_Process` учёт виртуальной памяти: program break плюс набор
+/// анонимных `mmap`-регионов (design "MmapRegion / VM tracking").
 ///
-/// This is the state the effectful `brk`/`mmap`/`munmap`/`mprotect` handlers
-/// (task 12.3) mutate after consulting the pure `plan_*` planners above; it holds
-/// no hardware state and stays `core` + `alloc` only so this module remains
-/// host-testable (R11.6). A populated instance is seeded by `run_linux_binary`
-/// (task 13.3) from the loader's `initial_brk` and the lower-half mmap hint base.
+/// Это состояние изменяют эффективные обработчики
+/// `brk`/`mmap`/`munmap`/`mprotect` после обращения к чистым планировщикам
+/// `plan_*` выше; аппаратного состояния оно не держит и остаётся `core` + `alloc`,
+/// чтобы модуль оставался host-тестируемым (R11.6). Заполненный экземпляр
+/// засевает `run_linux_binary` из `initial_brk` загрузчика и mmap-подсказки
+/// нижней половины.
 #[derive(Clone, Debug)]
 pub struct VmRegionSet {
-    /// The program break at process start (the floor `brk` may not drop below).
+    /// Program break на старте процесса (нижняя граница, ниже которой `brk` не
+    /// может опуститься).
     pub initial_brk: u64,
-    /// The current program break (top of the heap region).
+    /// Текущий program break (верх региона кучи).
     pub current_brk: u64,
-    /// Anonymous `mmap` regions currently mapped for the process.
+    /// Анонимные `mmap`-регионы, отображённые сейчас для процесса.
     pub mmaps: alloc::vec::Vec<MmapRegion>,
-    /// Bump-pointer hint for the next anonymous `mmap` base in the user range.
+    /// Bump-подсказка для базы следующего анонимного `mmap` в пользовательском
+    /// диапазоне.
     pub mmap_next_hint: u64,
-    /// Fixed low-water mark for non-fixed `mmap` placement: `plan_mmap_base`
-    /// scans for free gaps starting here (so holes below the high-water mark
-    /// are reused).
+    /// Фиксированная нижняя отметка для размещения нефиксированного `mmap`:
+    /// `plan_mmap_base` ищет свободные промежутки начиная здесь (так дыры ниже
+    /// отметки максимума переиспользуются).
     pub mmap_floor: u64,
-    /// Lowest page that belongs to the demand-paged `brk` heap: pages in
-    /// `[brk_lazy_from, page_up(current_brk))` are backed on first touch, not
-    /// eagerly. Starts at the (page-rounded-down) initial break and only ever
-    /// moves down — a `brk` grow from `current` records
-    /// `page_down(current)` as a candidate floor.
+    /// Младшая страница demand-paged кучи `brk`: страницы в
+    /// `[brk_lazy_from, page_up(current_brk))` подпираются по первому касанию, а
+    /// не жадно. Стартует с (округлённого вниз) начального break и только
+    /// опускается — рост `brk` от `current` записывает `page_down(current)` как
+    /// кандидатную нижнюю границу.
     pub brk_lazy_from: u64,
 }
 
 impl VmRegionSet {
-    /// Create an empty region set for a process whose initial (and current)
-    /// program break is `initial_brk` and whose anonymous `mmap` allocations
-    /// start bumping from `mmap_hint_base`.
+    /// Создать пустой набор регионов для процесса, чей начальный (и текущий)
+    /// program break — `initial_brk`, а анонимные `mmap`-аллокации начинают
+    /// bump-рост от `mmap_hint_base`.
     pub fn new(initial_brk: u64, mmap_hint_base: u64) -> Self {
         Self {
             initial_brk,

@@ -1,10 +1,10 @@
-//! Minimal AF_UNIX stream sockets — socket(41)/connect(42)/
-//! accept(43)/bind(49)/listen(50)/getsockname(51)/accept4(288).
+//! Минимальные AF_UNIX stream-сокеты —
+//! socket(41)/connect(42)/accept(43)/bind(49)/listen(50)/getsockname(51)/accept4(288).
 //!
-//! Listeners live in a global path-keyed registry; a connection is a pair of
-//! cross-connected in-kernel byte queues (the same primitive as
-//! socketpair(53)). This is exactly the surface nvim/libuv needs for
-//! `server_start` (uv_pipe bind/listen/accept) and `nvim --remote` (connect).
+//! Слушатели живут в глобальном реестре по пути; соединение — пара
+//! перекрёстно связанных ядерных байтовых очередей (тот же примитив, что
+//! socketpair(53)). Это ровно та поверхность, которая нужна nvim/libuv для
+//! `server_start` (uv_pipe bind/listen/accept) и `nvim --remote` (connect).
 #![allow(dead_code)]
 
 use alloc::collections::BTreeMap;
@@ -29,14 +29,16 @@ const SO_TYPE: u64 = 3;
 const SO_ERROR: u64 = 4;
 const SO_ACCEPTCONN: u64 = 30;
 
-/// Global listener registry: bound sockaddr_un path -> shared listener state.
-/// The newest bind for a path wins; entries from long-closed listeners are
-/// overwritten on rebind (socket paths are per-run unique in practice).
+/// Глобальный реестр слушателей: привязанный путь sockaddr_un -> общее
+/// состояние слушателя. Побеждает самый новый bind для пути; записи давно
+/// закрытых слушателей перезаписываются при повторном bind (пути сокетов на
+/// практике уникальны для запуска).
 static LISTENERS: Spinlock<BTreeMap<String, Arc<UnixListenerState>>> =
     Spinlock::new(BTreeMap::new());
 
-/// Parse a `struct sockaddr_un` from user memory into its path.
-/// Abstract-namespace (leading NUL) and autobind (empty) names are rejected.
+/// Разобрать `struct sockaddr_un` из памяти пользователя в его путь.
+/// Абстрактное пространство имён (ведущий NUL) и autobind (пустое имя)
+/// отвергаются.
 fn read_sockaddr_un(addr: u64, addrlen: u64) -> Result<String, Errno> {
     if addrlen < 2 || addrlen as usize > 2 + SUN_PATH_MAX + 8 {
         return Err(Errno::EINVAL);
@@ -61,9 +63,9 @@ fn read_sockaddr_un(addr: u64, addrlen: u64) -> Result<String, Errno> {
     String::from_utf8(path).map_err(|_| Errno::EINVAL)
 }
 
-/// `socket` (41): AF_UNIX + SOCK_STREAM only (there is no network stack on the
-/// Linux side). SOCK_NONBLOCK is remembered and applied when the socket turns
-/// into a listener or a connection; SOCK_CLOEXEC marks the fd immediately.
+/// `socket` (41): только AF_UNIX + SOCK_STREAM (на стороне Linux нет сетевого
+/// стека). SOCK_NONBLOCK запоминается и применяется, когда сокет становится
+/// слушателем или соединением; SOCK_CLOEXEC сразу помечает fd.
 pub fn sys_socket(domain: u64, ty: u64, _protocol: u64) -> Result<u64, Errno> {
     if domain != AF_UNIX {
         return Err(Errno::EINVAL);
@@ -89,7 +91,7 @@ pub fn sys_socket(domain: u64, ty: u64, _protocol: u64) -> Result<u64, Errno> {
     .unwrap_or(Err(Errno::EBADF))
 }
 
-/// `bind` (49): name the socket and register it in the listener registry.
+/// `bind` (49): назвать сокет и зарегистрировать его в реестре слушателей.
 pub fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> Result<u64, Errno> {
     let path = read_sockaddr_un(addr, addrlen)?;
     let state = compat::with_current_compat(|cs| match cs.fds.get_mut(fd as u32) {
@@ -109,7 +111,7 @@ pub fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `listen` (50): open the gate for connect(2). The backlog is unbounded.
+/// `listen` (50): открыть ворота для connect(2). Backlog неограничен.
 pub fn sys_listen(fd: u64, _backlog: u64) -> Result<u64, Errno> {
     compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
         Some(OpenObject::UnixListener(l)) => {
@@ -122,10 +124,10 @@ pub fn sys_listen(fd: u64, _backlog: u64) -> Result<u64, Errno> {
     .unwrap_or(Err(Errno::EBADF))
 }
 
-/// `connect` (42): look the path up in the registry, queue the server-side
-/// endpoint pair on the listener and become a connected socket immediately
-/// (in-kernel streams have no handshake latency). ENOENT stands in for
-/// ECONNREFUSED when nothing is listening.
+/// `connect` (42): найти путь в реестре, поставить серверную пару концов в
+/// очередь слушателя и сразу стать подключённым сокетом (у ядерных потоков нет
+/// задержки рукопожатия). ENOENT заменяет ECONNREFUSED, когда никто не
+/// слушает.
 pub fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> Result<u64, Errno> {
     let path = read_sockaddr_un(addr, addrlen)?;
     let listener = LISTENERS.lock().get(&path).cloned().ok_or(Errno::ENOENT)?;
@@ -150,9 +152,9 @@ pub fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> Result<u64, Errno> {
     .unwrap_or(Err(Errno::EBADF))
 }
 
-/// `accept4` (288): pop a queued connection into a fresh fd. Honors the
-/// listener O_NONBLOCK (EAGAIN) and the SOCK_NONBLOCK/SOCK_CLOEXEC flags on
-/// the accepted descriptor; blocks by yielding otherwise.
+/// `accept4` (288): вынуть подключение из очереди в свежий fd. Соблюдает
+/// O_NONBLOCK слушателя (EAGAIN) и флаги SOCK_NONBLOCK/SOCK_CLOEXEC принятого
+/// дескриптора; иначе блокируется, уступая CPU.
 pub fn sys_accept4(fd: u64, addr: u64, addrlen_ptr: u64, flags: u64) -> Result<u64, Errno> {
     if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
         return Err(Errno::EINVAL);
@@ -187,8 +189,8 @@ pub fn sys_accept4(fd: u64, addr: u64, addrlen_ptr: u64, flags: u64) -> Result<u
         .unwrap_or(Err(Errno::EBADF))?;
         match attempt {
             Some(newfd) => {
-                // The peer of an accepted AF_UNIX connection is unnamed:
-                // report just the family, as Linux does.
+                // Партнёр принятого AF_UNIX-соединения безымянный: сообщаем
+                // только семейство, как Linux.
                 if addr != 0 && addrlen_ptr != 0 && check_user_ptr(addrlen_ptr, 4).is_ok() {
                     let want = unsafe { core::ptr::read_unaligned(addrlen_ptr as *const u32) };
                     if want >= 2 && check_user_ptr(addr, 2).is_ok() {
@@ -203,13 +205,14 @@ pub fn sys_accept4(fd: u64, addr: u64, addrlen_ptr: u64, flags: u64) -> Result<u
     }
 }
 
-/// `accept` (43): accept4 without flags.
+/// `accept` (43): accept4 без флагов.
 pub fn sys_accept(fd: u64, addr: u64, addrlen_ptr: u64) -> Result<u64, Errno> {
     sys_accept4(fd, addr, addrlen_ptr, 0)
 }
 
-/// `getsockname` (51): report the bound path for listeners and an unnamed
-/// address for connected/unbound sockets (uv uses this to print the pipe name).
+/// `getsockname` (51): сообщить привязанный путь для слушателей и безымянный
+/// адрес для подключённых/непривязанных сокетов (uv использует это, чтобы
+/// напечатать имя pipe).
 pub fn sys_getsockname(fd: u64, addr: u64, addrlen_ptr: u64) -> Result<u64, Errno> {
     check_user_ptr(addrlen_ptr, 4)?;
     let path: Option<String> = compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
@@ -236,10 +239,10 @@ pub fn sys_getsockname(fd: u64, addr: u64, addrlen_ptr: u64) -> Result<u64, Errn
     Ok(0)
 }
 
-/// `setsockopt` (54): accepted and ignored. The in-kernel AF_UNIX pair has no
-/// tunable knobs (no buffer sizes, no credential passing), and libuv only sets
-/// cosmetic options on its pipes; reporting success is the Linux-visible
-/// behaviour callers expect.
+/// `setsockopt` (54): принимается и игнорируется. У ядерной пары AF_UNIX нет
+/// настраиваемых ручек (ни размеров буферов, ни передачи креденшелов), а libuv
+/// ставит на свои pipe только косметические опции; сообщить успех — то
+/// Linux-видимое поведение, которого ждут вызывающие.
 pub fn sys_setsockopt(
     _fd: u64,
     _level: u64,
@@ -250,10 +253,10 @@ pub fn sys_setsockopt(
     Ok(0)
 }
 
-/// `getsockopt` (55): only `SOL_SOCKET`/`SO_ERROR` is answered - it reports
-/// "no pending async error" (0), which is what libuv polls after a
-/// non-blocking connect. Everything else is EINVAL so callers fall back to
-/// defaults instead of parsing uninitialised memory.
+/// `getsockopt` (55): отвечаем только `SOL_SOCKET`/`SO_ERROR` — «нет
+/// ожидающей асинхронной ошибки» (0), что libuv опрашивает после неблокирующего
+/// connect. Всё остальное — EINVAL, чтобы вызывающие откатывались к умолчаниям,
+/// а не разбирали неинициализированную память.
 pub fn sys_getsockopt(
     _fd: u64,
     level: u64,
@@ -264,14 +267,14 @@ pub fn sys_getsockopt(
     if level != SOL_SOCKET {
         return Err(Errno::EINVAL);
     }
-    // SO_TYPE is what libuv's uv_guess_handle asks right after
-    // fstat reports S_IFSOCK on the stdio fds of the embedded-nvim channel.
-    // Failing it made the whole channel UV_UNKNOWN_HANDLE and hung the
-    // msgpack-RPC handshake (TUI waited forever on a dead pipe).
+    // SO_TYPE — то, что uv_guess_handle из libuv спрашивает сразу после того,
+    // как fstat сообщил S_IFSOCK для stdio-дескрипторов канала встроенного nvim.
+    // Отказ на нём делал весь канал UV_UNKNOWN_HANDLE и вешал рукопожатие
+    // msgpack-RPC (TUI вечно ждал на мёртвом pipe).
     let value: u32 = match optname {
-        SO_ERROR => 0,      // no pending async error
+        SO_ERROR => 0,      // нет ожидающей асинхронной ошибки
         SO_TYPE => 1,       // SOCK_STREAM
-        SO_ACCEPTCONN => 0, // "not a listening socket" is fine for probes
+        SO_ACCEPTCONN => 0, // «не слушающий сокет» нормально для проб
         _ => return Err(Errno::EINVAL),
     };
     check_user_ptr(optlen, 4)?;

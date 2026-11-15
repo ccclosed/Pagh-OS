@@ -1,4 +1,4 @@
-//! Linux process/thread synchronization syscalls.
+//! Syscall'ы синхронизации процессов/потоков Linux.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -19,10 +19,11 @@ const FUTEX_WAIT_BITSET: u64 = 9;
 const FUTEX_WAKE_BITSET: u64 = 10;
 const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
 
-/// Cooperative waiter registry. Tickets make FUTEX_WAKE return and release an
-/// exact number of waiters even though the current scheduler has no blocked TCB
-/// state yet. The key includes pid so identical virtual addresses in unrelated
-/// address spaces never share a queue.
+/// Реестр кооперативных ожидающих. Билеты позволяют FUTEX_WAKE вернуть и
+/// отпустить ровно нужное число ожидающих, хотя у текущего планировщика ещё нет
+/// заблокированного состояния TCB. Ключ включает pid, чтобы одинаковые
+/// виртуальные адреса в несвязанных адресных пространствах никогда не делили
+/// очередь.
 #[derive(Default)]
 struct WaitQueue {
     next_ticket: u64,
@@ -43,7 +44,7 @@ fn load_word(addr: u64) -> Result<u32, Errno> {
         return Err(Errno::EINVAL);
     }
     check_user_ptr(addr, 4)?;
-    // SAFETY: the address is aligned and the mapped user range was validated.
+    // SAFETY: адрес выровнен, отображённый пользовательский диапазон проверен.
     Ok(unsafe { ptr::read_volatile(addr as *const u32) })
 }
 
@@ -52,7 +53,7 @@ fn timeout_deadline(timeout: u64) -> Result<Option<u64>, Errno> {
         return Ok(None);
     }
     check_user_ptr(timeout, 16)?;
-    // SAFETY: the complete timespec was validated above.
+    // SAFETY: полный timespec проверен выше.
     let sec = unsafe { ptr::read_unaligned(timeout as *const i64) };
     let nsec = unsafe { ptr::read_unaligned((timeout + 8) as *const i64) };
     if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
@@ -72,8 +73,8 @@ fn register_waiter(queue_key: (u64, u64), bitset: u32) -> u64 {
     ticket
 }
 
-/// Remove a waiter or consume its wake token. Returns true only when it was
-/// selected by FUTEX_WAKE.
+/// Убрать ожидающего или потребить его токен пробуждения. Возвращает true,
+/// только когда его выбрал FUTEX_WAKE.
 fn finish_wait(queue_key: (u64, u64), ticket: u64) -> bool {
     let mut queues = FUTEX_QUEUES.lock();
     let mut was_woken = false;
@@ -119,9 +120,10 @@ fn wake_waiters(queue_key: (u64, u64), maximum: u64, bitset: u32) -> u64 {
     selected.len() as u64
 }
 
-/// Cooperative futex implementation with an exact ticketed waiter registry.
-/// WAIT still yields cooperatively, but WAKE now selects at most `val` matching
-/// waiters, reports the exact count, and honors WAIT/WAKE_BITSET masks.
+/// Кооперативная реализация futex с точным реестром ожидающих на билетах.
+/// WAIT по-прежнему уступает CPU кооперативно, но WAKE теперь выбирает не более
+/// `val` подходящих ожидающих, сообщает точное число и соблюдает маски
+/// WAIT/WAKE_BITSET.
 pub fn sys_futex(
     uaddr: u64,
     op: u64,
@@ -155,21 +157,21 @@ pub fn sys_futex(
                     finish_wait(queue_key, ticket);
                     return Ok(0);
                 }
-                // A changed word permits a spurious successful return; callers
-                // must always re-check the userspace condition, as on Linux.
+                // Изменённое слово допускает ложный успешный возврат; вызывающие
+                // обязаны всегда перепроверять условие в userspace, как в Linux.
                 if load_word(uaddr)? != val as u32 {
                     finish_wait(queue_key, ticket);
                     return Ok(0);
                 }
                 if deadline.is_some_and(|end| crate::task::scheduler::ticks() >= end) {
-                    // A concurrent wake wins over timeout if it selected us first.
+                    // Конкурентное пробуждение побеждает таймаут, если выбрало нас первым.
                     if finish_wait(queue_key, ticket) {
                         return Ok(0);
                     }
                     return Err(Errno::ETIMEDOUT);
                 }
-                // Deliverable signal → -EINTR. Deregister first (same
-                // wake-wins-over-anything race window as the timeout path).
+                // Доставимый сигнал → -EINTR. Сначала сняться с учёта (то же окно
+                // гонки «пробуждение побеждает всё», что и на пути таймаута).
                 if crate::arch::x86_64::linux::signal::has_deliverable_current()
                     && !finish_wait(queue_key, ticket)
                 {
@@ -197,25 +199,26 @@ pub fn sys_futex(
     }
 }
 
-// bash with job control calls wait4 with WUNTRACED (and WCONTINUED since Linux
-// 2.6.10). Both are real now: a stopped child is parked by the signal path
-// (`signal::stop_current_group`) and reports `(stopsig << 8) | 0x7f`, a child
-// resumed by SIGCONT reports `0xffff`. Each event is reported ONCE — the report
-// consumes the registry entry (`compat::reap_child_stop` /
-// `reap_child_continued`), so a wait loop advances instead of re-reporting.
+// bash с job control зовёт wait4 с WUNTRACED (и WCONTINUED с Linux 2.6.10).
+// Оба теперь настоящие: остановленного ребёнка паркует сигнальный путь
+// (`signal::stop_current_group`) и сообщает `(stopsig << 8) | 0x7f`, а ребёнок,
+// возобновлённый SIGCONT, сообщает `0xffff`. Каждое событие сообщается ОДИН раз —
+// отчёт потребляет запись реестра (`compat::reap_child_stop` /
+// `reap_child_continued`), поэтому цикл ожидания продвигается, а не повторяет
+// отчёт.
 pub const WNOHANG: u64 = 1;
 pub const WUNTRACED: u64 = 2;
 pub const WCONTINUED: u64 = 8;
 const RUSAGE_SIZE: u64 = 18 * 8;
 
-/// Publish a `wait4(2)` result to the caller's status/rusage pointers.
+/// Опубликовать результат `wait4(2)` в указатели status/rusage вызывающего.
 ///
-/// The two output pointers were validated once at syscall entry, but the wait
-/// loop below yields for an unbounded time and a sibling CLONE_VM thread can
-/// munmap them in that window (F-x86a-4). Re-validating both immediately before
-/// writing keeps a vanished buffer at `-EFAULT` instead of a ring-0 write that
-/// faults in kernel mode and halts the machine; validating both before writing
-/// either means no partial result is published.
+/// Оба выходных указателя проверялись один раз на входе в syscall, но цикл
+/// ожидания ниже уступает CPU неограниченно долго, и поток-сосед по CLONE_VM
+/// может снять их отображение в этом окне. Повторная проверка обоих прямо перед
+/// записью оставляет исчезнувший буфер при `-EFAULT` вместо записи из ring 0,
+/// падающей в режиме ядра с остановкой машины; проверка обоих до записи любого
+/// означает, что частичный результат не публикуется.
 fn publish_wait_result(status: u64, rusage: u64, code: u32) -> Result<(), Errno> {
     if status != 0 {
         check_user_ptr(status, 4)?;
@@ -224,12 +227,12 @@ fn publish_wait_result(status: u64, rusage: u64, code: u32) -> Result<(), Errno>
         check_user_ptr(rusage, RUSAGE_SIZE)?;
     }
     if status != 0 {
-        // SAFETY: `status` was just validated for 4 bytes; the active CR3 is
-        // the calling process's, and no yield separates check from write.
+        // SAFETY: `status` только что проверен на 4 байта; активный CR3 —
+        // вызывающего процесса, и между проверкой и записью нет уступки CPU.
         unsafe { ptr::write_unaligned(status as *mut u32, code) }
     }
     if rusage != 0 {
-        // SAFETY: `rusage` was just validated for RUSAGE_SIZE bytes.
+        // SAFETY: `rusage` только что проверен на RUSAGE_SIZE байт.
         unsafe { ptr::write_bytes(rusage as *mut u8, 0, RUSAGE_SIZE as usize) }
     }
     Ok(())
@@ -254,9 +257,10 @@ pub fn sys_wait4(pid: u64, status: u64, options: u64, rusage: u64) -> Result<u64
     }
     let parent = crate::task::scheduler::current_pid();
     loop {
-        // Report order: a real exit wins over a state change (the exit path drops
-        // the child's pending stop/continue reports), then the stop (WUNTRACED),
-        // then the continue (WCONTINUED). Each arm consumes its event.
+        // Порядок отчёта: реальный выход перекрывает смену состояния (путь
+        // выхода удаляет ожидающие отчёты stop/continue ребёнка), затем stop
+        // (WUNTRACED), затем continue (WCONTINUED). Каждая ветка потребляет своё
+        // событие.
         if let Some((child, code)) = crate::task::compat::reap_child(parent, wanted) {
             publish_wait_result(status, rusage, wait_status_exited(code))?;
             return Ok(child);
@@ -279,8 +283,9 @@ pub fn sys_wait4(pid: u64, status: u64, options: u64, rusage: u64) -> Result<u64
         if options & WNOHANG != 0 {
             return Ok(0);
         }
-        // Deliverable signal → -EINTR (SIGCHLD is not delivered yet — wait4
-        // stays poll-based — but a `^C`-style signal must wake the waiter).
+        // Доставимый сигнал → -EINTR (SIGCHLD пока не доставляется — wait4
+        // остаётся на опросе, — но сигнал в стиле `^C` обязан разбудить
+        // ожидающего).
         if crate::arch::x86_64::linux::signal::has_deliverable_current() {
             return Err(Errno::EINTR);
         }
@@ -332,15 +337,16 @@ fn runerr(e: crate::task::process::RunError) -> Errno {
         crate::task::process::RunError::AccessDenied => Errno::EACCES,
     }
 }
-/// execve(59), syscall-instruction path: replace CR3/image and return through
-/// sysretq directly to the new ELF entry with a new System-V initial stack.
+/// execve(59), путь инструкции `syscall`: заменить CR3/образ и вернуться через
+/// sysretq прямо на точку входа нового ELF с новым начальным стеком System V.
 pub fn sys_execve(regs: &mut SavedRegs, path: u64, argv: u64, envp: u64) -> Result<u64, Errno> {
     let mut budget = 0usize;
     let pathb = exec_cstr(path, &mut budget)?;
     let path = String::from_utf8(pathb).map_err(|_| Errno::EINVAL)?;
-    // Execute permission is checked HERE, at the syscall boundary, before any
-    // image/memory work. Root still needs at least one x bit (`Creds::may`);
-    // a missing path is left to `exec_linux_image`, which reports ENOENT.
+    // Право на исполнение проверяется ЗДЕСЬ, на границе syscall, до любой работы
+    // с образом/памятью. Root всё равно нуждается хотя бы в одном x-бите
+    // (`Creds::may`); отсутствующий путь оставляется `exec_linux_image`, который
+    // сообщает ENOENT.
     if let Some(node) = crate::task::process::exec_target_node(&path) {
         let creds = crate::task::compat::current_creds();
         if !creds.may(
@@ -360,9 +366,9 @@ pub fn sys_execve(regs: &mut SavedRegs, path: u64, argv: u64, envp: u64) -> Resu
     *regs = SavedRegs::default();
     regs.r11 = flags | 2;
     regs.rcx = image.entry;
-    // `syscall`-instruction path (musl): the exit stub restores the user RSP
-    // from the per-task slot at +120 right above the SavedRegs frame, so
-    // execve must rewrite THAT slot; the old global is never read on exit.
+    // Путь инструкции `syscall` (musl): хвост выхода восстанавливает user RSP из
+    // per-task слота по +120 прямо над фреймом SavedRegs, поэтому execve обязан
+    // переписать ИМЕННО этот слот; старый глобал на выходе не читается.
     unsafe { ((regs as *mut SavedRegs as *mut u64).add(15)).write(image.initial_rsp) };
     Ok(0)
 }
@@ -390,12 +396,13 @@ const CLONE_SUPPORTED: u64 = 0xff
     | CLONE_CHILD_SETTID;
 const CLONE_VFORK: u64 = 0x4000;
 const FORK_SUPPORTED: u64 = 0xff | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID;
-/// `clone` supports both forms nvim's libuv needs.
-///   * thread clone (CLONE_VM|CLONE_THREAD) — shared address space;
-///   * fork (no CLONE_VM; glibc fork() = SIGCHLD|CHILD_SETTID|CHILD_CLEARTID)
-///     — deep-copied address space, child gets rax=0, parent gets the pid.
-/// CLONE_VM WITHOUT CLONE_THREAD (vfork / glibc posix_spawn) stays ENOSYS on
-/// purpose: libuv then falls back to its plain fork+exec spawn path.
+/// `clone` поддерживает обе формы, нужные libuv в nvim:
+///   * thread clone (CLONE_VM|CLONE_THREAD) — общее адресное пространство;
+///   * fork (без CLONE_VM; glibc fork() = SIGCHLD|CHILD_SETTID|CHILD_CLEARTID)
+///     — глубоко скопированное адресное пространство, ребёнок получает rax=0,
+///     родитель — pid.
+/// CLONE_VM БЕЗ CLONE_THREAD (vfork / glibc posix_spawn) намеренно остаётся
+/// ENOSYS: тогда libuv откатывается к обычному пути fork+exec.
 pub fn sys_clone(
     regs: &SavedRegs,
     flags: u64,
@@ -409,28 +416,28 @@ pub fn sys_clone(
             crate::debug!("[clone] unsupported thread flags {:#x} -> ENOSYS", flags);
             return Err(Errno::ENOSYS);
         }
-        // Default stack = the caller's user RSP from the per-task slot at +120
-        // above the SavedRegs frame (the global scratch may already belong to a
-        // sibling thread by the time we run).
+        // Стек по умолчанию = user RSP вызывающего из per-task слота по +120
+        // над фреймом SavedRegs (глобальная царапина к моменту нашего выполнения
+        // может уже принадлежать потоку-соседу).
         let stack = if child_stack == 0 {
             unsafe { ((regs as *const SavedRegs as *const u64).add(15)).read() }
         } else {
             child_stack
         };
         check_user_ptr(stack.saturating_sub(8), 8)?;
-        // Register the child's CompatState BEFORE it can ever run: spawn
-        // enqueues the child, so both the enqueue and the compat registration
-        // happen with interrupts disabled (same pattern as
-        // `fork_linux_process`). Otherwise the tick could schedule the child
-        // between the two steps and route its first syscalls as native.
+        // Зарегистрировать CompatState ребёнка ДО того, как он сможет
+        // выполниться: spawn ставит ребёнка в очередь, поэтому и постановка, и
+        // регистрация compat идут с выключенными прерываниями (та же схема, что в
+        // `fork_linux_process`). Иначе тик мог бы запланировать ребёнка между
+        // двумя шагами и маршрутизировать его первые syscall'ы как нативные.
         //
-        // F-x86a-4 (clone residue): the TID output pointers are validated and
-        // written INSIDE that same interrupt-disabled window. Validating before
-        // the spawn and writing after it left a preemption window in which a
-        // sibling thread sharing this address space (CLONE_VM) could munmap the
-        // page, so the ring-0 write faulted and halted the machine. With
-        // interrupts masked no other task can run between the check and the
-        // write, and a bad pointer fails before the child exists.
+        // Выходные указатели TID проверяются и пишутся ВНУТРИ того же окна с
+        // выключенными прерываниями. Проверка до spawn и запись после него
+        // оставляли окно вытеснения, в котором поток-сосед, разделяющий это
+        // адресное пространство (CLONE_VM), мог снять страницу, и запись из ring 0
+        // падала с остановкой машины. С замаскированными прерываниями между
+        // проверкой и записью не может выполниться другая задача, а плохой
+        // указатель отказывает до появления ребёнка.
         let tls_value = if flags & CLONE_SETTLS != 0 {
             Some(tls)
         } else {
@@ -451,13 +458,13 @@ pub fn sys_clone(
             let child =
                 crate::task::process::spawn_linux_thread(regs, stack).map_err(|_| Errno::ENOMEM)?;
             if !crate::task::compat::clone_current_compat(child, tls_value, clear) {
-                // Parent has no compat state: never leave the half-spawned
-                // child in rotation.
+                // У родителя нет compat-состояния: никогда не оставлять
+                // полузапущенного ребёнка в ротации.
                 crate::task::scheduler::remove_ready_pids(&[child]);
                 return Err(Errno::EINVAL);
             }
-            // SAFETY: both pointers were just validated in this same
-            // non-preemptible window, so the mappings cannot have changed.
+            // SAFETY: оба указателя только что проверены в том же
+            // непрерываемом окне, поэтому отображения не могли измениться.
             if flags & CLONE_PARENT_SETTID != 0 {
                 unsafe { ptr::write_unaligned(parent_tid as *mut u32, child as u32) }
             }
@@ -468,27 +475,26 @@ pub fn sys_clone(
         })?;
         return Ok(child);
     }
-    // ── fork path ──
+    // ── путь fork ──
     if flags & (CLONE_VM | CLONE_VFORK) != 0 || flags & !FORK_SUPPORTED != 0 {
         crate::debug!("[clone] unsupported fork flags {:#x} -> ENOSYS", flags);
         return Err(Errno::ENOSYS);
     }
     if child_stack != 0 {
         return Err(Errno::EINVAL);
-    } // fork(2) never passes a stack
+    } // fork(2) никогда не передаёт стек
     let clear = if flags & CLONE_CHILD_CLEARTID != 0 {
         child_tid
     } else {
         0
     };
-    // F-x86a-4 (clone residue): both TID outputs are handed to
-    // `fork_linux_process`, which validates and publishes them inside its
-    // interrupt-disabled window, right after the child is enqueued. Doing the
-    // pre-check here and the write after the fork left two windows in which a
-    // sibling thread sharing the parent's address space (CLONE_VM) could
-    // munmap the buffer — the ring-0 write then halted the machine — and the
-    // child itself could run and unmap its `child_tid` page before a post-fork
-    // translation wrote through it.
+    // Оба выходных указателя TID передаются `fork_linux_process`, который
+    // проверяет и публикует их в своём окне с выключенными прерываниями сразу
+    // после постановки ребёнка в очередь. Предварительная проверка здесь и запись
+    // после fork оставляли два окна, в которых поток-сосед, разделяющий
+    // адресное пространство родителя (CLONE_VM), мог снять буфер — запись из
+    // ring 0 останавливала машину, — а сам ребёнок мог выполниться и снять
+    // страницу `child_tid` до того, как пост-fork трансляция запишет через неё.
     let parent_tid_out = if flags & CLONE_PARENT_SETTID != 0 {
         parent_tid
     } else {

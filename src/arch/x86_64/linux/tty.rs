@@ -1,71 +1,70 @@
-//! Pure controlling-terminal job-control model (Linux tty semantics).
+//! Чистая модель управления заданиями управляющего терминала (семантика tty Linux).
 //!
-//! WHY THIS EXISTS. The kernel console is pagh's controlling terminal: every
-//! `Compat_Process` starts with stdin/stdout/stderr pre-bound to it
-//! (`FdTable::with_standard_streams`). A terminal has exactly ONE foreground
-//! process group. The group that owns the terminal reads and writes freely; a
-//! process in any OTHER group that tries to read gets `SIGTTIN`, and — when the
-//! terminal's `TOSTOP` flag is set — one that tries to write gets `SIGTTOU`
-//! (POSIX 11.1.4 "Terminal Access Control", `termios(3)`). `tcgetpgrp`/
-//! `tcsetpgrp` are `TIOCGPGRP`/`TIOCSPGRP` on that same terminal.
+//! Консоль ядра — управляющий терминал pagh: каждый `Compat_Process` стартует с
+//! stdin/stdout/stderr, заранее привязанными к ней
+//! (`FdTable::with_standard_streams`). У терминала ровно ОДНА foreground-группа
+//! процессов. Группа-владелец читает и пишет свободно; процесс из ЛЮБОЙ другой
+//! группы при чтении получает `SIGTTIN`, а при записи — `SIGTTOU`, если у
+//! терминала стоит `TOSTOP` (POSIX 11.1.4 "Terminal Access Control",
+//! `termios(3)`). `tcgetpgrp`/`tcsetpgrp` — это `TIOCGPGRP`/`TIOCSPGRP` на том же
+//! терминале.
 //!
-//! This module is the pure decision: [`TtyJobControl`] holds the foreground
-//! pgid + the `TOSTOP` bit, [`TtyJobControl::access`] classifies an access, and
-//! [`decode_pgrp_arg`]/[`may_set_foreground`] are the `TIOCSPGRP` input rules.
-//! It owns no kernel state and no lock, so `host-tests` includes this exact
-//! source via `#[path]` (properties in `properties/tty_job.rs`). The kernel-side
-//! state lives in `src/drivers/tty.rs` (the `Spinlock`, the shell's own group,
-//! and the call into the signal path); `io_sys` applies the verdict to the two
-//! ioctls and to the stdin/console read/write paths.
+//! Модуль — чистое решение: [`TtyJobControl`] хранит foreground pgid + бит
+//! `TOSTOP`, [`TtyJobControl::access`] классифицирует доступ, а
+//! [`decode_pgrp_arg`]/[`may_set_foreground`] — правила входа `TIOCSPGRP`.
+//! Ядерного состояния и локов здесь нет, поэтому `host-tests` включает этот же
+//! исходник через `#[path]` (свойства в `properties/tty_job.rs`). Ядерное
+//! состояние живёт в `src/drivers/tty.rs` (спинлок, группа шелла и вызов
+//! сигнального пути); `io_sys` применяет вердикт к двум ioctl и к путям
+//! read/write stdin/консоли.
 //!
-//! DEVIATIONS, stated rather than implied:
+//! ОТКЛОНЕНИЯ, заявленные явно:
 //!
-//! * pagh has no sessions. `tcsetpgrp`'s "the group must be in the caller's
-//!   session" rule is approximated by [`may_set_foreground`] as "the target
-//!   group must be live, or be the terminal's current group, or the kernel
-//!   shell's own" — anything else is `EPERM`, the errno Linux returns for a
-//!   group outside the session.
-//! * A background access does not restart the interrupted syscall after
-//!   `SIGCONT`: the caller returns `EINTR`, and the stop itself is performed by
-//!   the ordinary signal-delivery path at syscall return. Linux restarts the
-//!   read/write when the signal's disposition is `SIG_DFL` and returns `EINTR`
-//!   only when a handler ran.
-//! * `TOSTOP` is tracked and honoured, but pagh defaults it ON (Linux defaults
-//!   it off), so a background job's first console write stops it without the
-//!   program having asked. `tcsetattr` clears/sets it like any other flag, and
-//!   `tcgetattr` reports the real state.
+//! * В pagh нет сессий. Правило `tcsetpgrp` «группа должна быть в сессии
+//!   вызывающего» аппроксимируется [`may_set_foreground`] как «целевая группа
+//!   жива, либо это текущая группа терминала, либо группа шелла ядра» — иначе
+//!   `EPERM`, как errno Linux для группы вне сессии.
+//! * Фоновый доступ не перезапускает прерванный syscall после `SIGCONT`:
+//!   вызывающий получает `EINTR`, а остановку выполняет обычный путь доставки
+//!   сигнала при возврате из syscall. Linux перезапускает read/write, когда
+//!   диспозиция сигнала `SIG_DFL`, и возвращает `EINTR`, только если сработал
+//!   обработчик.
+//! * `TOSTOP` отслеживается и соблюдается, но по умолчанию ВКЛЮЧЁН (в Linux —
+//!   выключен), поэтому первая запись в консоль фонового job останавливает его
+//!   без запроса программы. `tcsetattr` снимает/ставит его как любой другой флаг,
+//!   а `tcgetattr` сообщает реальное состояние.
 
 use super::errno::Errno;
 use super::signal_frame::{SIGTTIN, SIGTTOU};
 
-/// `TIOCGPGRP`: read the terminal's foreground process group (`tcgetpgrp`).
+/// `TIOCGPGRP`: прочитать foreground-группу процессов терминала (`tcgetpgrp`).
 pub const TIOCGPGRP: u64 = 0x540F;
-/// `TIOCSPGRP`: set the terminal's foreground process group (`tcsetpgrp`).
+/// `TIOCSPGRP`: задать foreground-группу процессов терминала (`tcsetpgrp`).
 pub const TIOCSPGRP: u64 = 0x5410;
-/// `TOSTOP`, the `c_lflag` bit that makes background writes generate `SIGTTOU`
-/// (`termios(3)`; Linux value, same bit position as every other `c_lflag`).
+/// `TOSTOP`, бит `c_lflag`, заставляющий фоновую запись генерировать `SIGTTOU`
+/// (`termios(3)`; значение Linux, та же позиция бита, что у любого `c_lflag`).
 pub const TOSTOP: u32 = 0x0000_0100;
 
-/// Which terminal operation is being attempted by a compat process.
+/// Какую операцию с терминалом пытается выполнить compat-процесс.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TtyAccess {
-    /// A read from the controlling terminal (stdin / console).
+    /// Чтение из управляющего терминала (stdin / консоль).
     Read,
-    /// A write to the controlling terminal (stdout / stderr).
+    /// Запись в управляющий терминал (stdout / stderr).
     Write,
 }
 
-/// What the terminal says about an access by a process in group `caller`.
+/// Что терминал говорит о доступе процесса из группы `caller`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TtyVerdict {
-    /// The caller owns the terminal: the operation proceeds.
+    /// Вызывающий владеет терминалом: операция проходит.
     Allow,
-    /// The caller is in a background process group: queue this stop-class
-    /// signal on that group and fail the call (`EINTR`).
+    /// Вызывающий в фоновой группе процессов: поставить этот стоп-сигнал
+    /// группе и провалить вызов (`EINTR`).
     Background(u64),
 }
 
-/// The terminal's foreground process group + the `TOSTOP` write policy.
+/// Foreground-группа процессов терминала + политика записи `TOSTOP`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TtyJobControl {
     fg_pgid: u64,
@@ -73,42 +72,42 @@ pub struct TtyJobControl {
 }
 
 impl TtyJobControl {
-    /// A terminal owned by `fg_pgid`, stopping background writes iff `tostop`.
+    /// Терминал, принадлежащий `fg_pgid`, останавливающий фоновые записи при `tostop`.
     pub const fn new(fg_pgid: u64, tostop: bool) -> Self {
         Self { fg_pgid, tostop }
     }
 
-    /// The process group that currently owns the terminal (`tcgetpgrp`).
+    /// Группа процессов, владеющая терминалом сейчас (`tcgetpgrp`).
     pub const fn foreground(&self) -> u64 {
         self.fg_pgid
     }
 
-    /// Hand the terminal to `pgid` (`tcsetpgrp`). Input validation is the
-    /// caller's job — see [`decode_pgrp_arg`] and [`may_set_foreground`].
+    /// Передать терминал `pgid` (`tcsetpgrp`). Проверка входа — дело вызывающего:
+    /// см. [`decode_pgrp_arg`] и [`may_set_foreground`].
     pub fn set_foreground(&mut self, pgid: u64) {
         self.fg_pgid = pgid;
     }
 
-    /// Whether background writes generate `SIGTTOU` (`TOSTOP`).
+    /// Генерирует ли фоновая запись `SIGTTOU` (`TOSTOP`).
     pub const fn tostop(&self) -> bool {
         self.tostop
     }
 
-    /// Apply a `TCSETS` `c_lflag` image's `TOSTOP` bit.
+    /// Применить бит `TOSTOP` из образа `c_lflag` для `TCSETS`.
     pub fn set_tostop(&mut self, on: bool) {
         self.tostop = on;
     }
 
-    /// `true` when `pgid` owns the terminal.
+    /// `true`, когда `pgid` владеет терминалом.
     pub const fn is_foreground(&self, pgid: u64) -> bool {
         self.fg_pgid == pgid
     }
 
-    /// Classify an access from process group `caller`.
+    /// Классифицировать доступ группы `caller`.
     ///
-    /// A read from a background group always stops it (`SIGTTIN`, any terminal
-    /// configuration). A write stops it (`SIGTTOU`) only under `TOSTOP`;
-    /// otherwise background output is delivered normally.
+    /// Чтение из фоновой группы останавливает её всегда (`SIGTTIN`, при любой
+    /// конфигурации терминала). Запись останавливает (`SIGTTOU`) только при
+    /// `TOSTOP`; иначе фоновый вывод доставляется нормально.
     pub const fn access(&self, caller: u64, kind: TtyAccess) -> TtyVerdict {
         if self.fg_pgid == caller {
             return TtyVerdict::Allow;
@@ -126,17 +125,18 @@ impl TtyJobControl {
     }
 }
 
-/// The two ioctl requests that address the foreground group.
+/// Два запроса ioctl, адресующие foreground-группу.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PgrpRequest {
-    /// `TIOCGPGRP` — read it (`tcgetpgrp`).
+    /// `TIOCGPGRP` — прочитать (`tcgetpgrp`).
     Get,
-    /// `TIOCSPGRP` — set it (`tcsetpgrp`).
+    /// `TIOCSPGRP` — задать (`tcsetpgrp`).
     Set,
 }
 
-/// Classify `request`: `Some(Get)`/`Some(Set)` for the two foreground-group
-/// ioctls, `None` for anything else (the caller's `ENOTTY` case).
+/// Классифицировать `request`: `Some(Get)`/`Some(Set)` для двух ioctl
+/// foreground-группы, `None` для всего остального (случай `ENOTTY` у
+/// вызывающего).
 pub const fn pgrp_request(request: u64) -> Option<PgrpRequest> {
     if request == TIOCGPGRP {
         Some(PgrpRequest::Get)
@@ -147,11 +147,12 @@ pub const fn pgrp_request(request: u64) -> Option<PgrpRequest> {
     }
 }
 
-/// Decode the `int` name read from the `TIOCSPGRP` user argument.
+/// Декодировать `int`, прочитанный из пользовательского аргумента `TIOCSPGRP`.
 ///
-/// The word is a C `int`, so the high bit is a sign bit: a negative pgid is
-/// `EINVAL` (Linux's `tiocspgrp` rejects `pgrp < 0` before any lookup). Zero
-/// decodes fine but can never name a group; [`may_set_foreground`] refuses it.
+/// Слово — C `int`, поэтому старший бит знаковый: отрицательный pgid — `EINVAL`
+/// (`tiocspgrp` в Linux отвергает `pgrp < 0` до любого поиска). Ноль
+/// декодируется, но никогда не называет группу; [`may_set_foreground`] его
+/// отвергает.
 pub const fn decode_pgrp_arg(raw: u32) -> Result<u64, Errno> {
     if (raw as i32) < 0 {
         Err(Errno::EINVAL)
@@ -160,15 +161,14 @@ pub const fn decode_pgrp_arg(raw: u32) -> Result<u64, Errno> {
     }
 }
 
-/// May `target` become the terminal's foreground group?
+/// Может ли `target` стать foreground-группой терминала?
 ///
-/// * `live` — at least one registered process has `target` as its pgid.
-/// * `shell_pgid` — the kernel shell's own group, the terminal's default owner.
-/// * `current_fg` — the group the terminal is on right now (idempotent set).
+/// * `live` — хотя бы один зарегистрированный процесс имеет `target` своим pgid.
+/// * `shell_pgid` — собственная группа шелла ядра, владелец терминала по умолчанию.
+/// * `current_fg` — группа, на которой терминал сейчас (идемпотентная установка).
 ///
-/// `Ok(())` for a live group, the shell's group, or the current group; `EPERM`
-/// otherwise (pagh's approximation of Linux's session check) and for the
-/// meaningless group 0.
+/// `Ok(())` для живой группы, группы шелла или текущей группы; иначе `EPERM`
+/// (аппроксимация проверки сессии в pagh) и для бессмысленной группы 0.
 pub fn may_set_foreground(
     target: u64,
     live: bool,
