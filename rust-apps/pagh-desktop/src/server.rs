@@ -1,0 +1,770 @@
+//! AF_UNIX desktop-сервер: приём клиентов, маршрутизация протокола, цикл композитора.
+//!
+//! Один серверный поток владеет [`Compositor`]; на каждое соединение создаётся
+//! читающий поток, который складывает разобранные сообщения в общий канал. Сервер
+//! обрабатывает канал, рассылает `configure`/`input`/`focus`/`close` и после каждого
+//! пакета событий перерисовывает только повреждённые области.
+
+use crate::backend::{Backend, HeadlessBackend};
+use crate::client::Welcome;
+use crate::compositor::{AppKind, Compositor, HostEvent, MouseButton};
+use crate::geometry::Point;
+use crate::protocol::{
+    self, Decoder, Message, ERR_BAD_MESSAGE, ERR_INVALID_SURFACE, ERR_NOT_HELLO, ERR_NOT_OWNER,
+    ERR_UNSUPPORTED, VERSION, WELCOME_FORMAT_RGB565, WELCOME_FORMAT_XRGB8888,
+};
+use crate::surface::{PixelFormat, Surface};
+use std::io::{self, ErrorKind, Read};
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+/// Настройки сервера.
+#[derive(Clone, Debug)]
+pub struct ServerOptions {
+    pub socket: PathBuf,
+    pub width: u32,
+    pub height: u32,
+    /// Если задано — каждый presented-кадр пишется в `frame_NNNNN.png` этого каталога.
+    pub screenshot_dir: Option<PathBuf>,
+    /// Остановиться после N presented-кадров (headless smoke-тест).
+    pub max_frames: Option<u64>,
+    /// Не печатать диагностику подключений.
+    pub quiet: bool,
+    /// Запускать `pagh-desktop-demo` по запросам панели/меню.
+    pub spawn_demo: bool,
+    /// Явный путь к демо-клиенту (иначе ищется рядом с сервером).
+    pub demo_binary: Option<PathBuf>,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            socket: PathBuf::from("/tmp/pagh-desktop.sock"),
+            width: 1280,
+            height: 720,
+            screenshot_dir: None,
+            max_frames: None,
+            quiet: false,
+            spawn_demo: false,
+            demo_binary: None,
+        }
+    }
+}
+
+/// Команды управления запущенным сервером (используются тестами и CLI-хуками).
+#[derive(Clone, Debug)]
+pub enum ServerCommand {
+    PointerMove {
+        x: i32,
+        y: i32,
+    },
+    PointerRelative {
+        dx: i32,
+        dy: i32,
+    },
+    PointerButton {
+        button: u32,
+        pressed: bool,
+    },
+    Key {
+        code: u32,
+        pressed: bool,
+        modifiers: u32,
+    },
+    Axis {
+        horizontal: i32,
+        vertical: i32,
+    },
+    Screenshot(PathBuf),
+    Shutdown,
+}
+
+enum Incoming {
+    Client { conn: u64, message: Message },
+    Disconnected(u64),
+    ProtocolError { conn: u64, detail: String },
+    Command(ServerCommand),
+}
+
+struct ClientConn {
+    id: u64,
+    client_id: Option<u64>,
+    name: String,
+    writer: Arc<Mutex<UnixStream>>,
+}
+
+/// Управляющий handle к серверу.
+pub struct ServerControl {
+    tx: Sender<Incoming>,
+    running: Arc<AtomicBool>,
+    pub socket: PathBuf,
+}
+
+impl ServerControl {
+    pub fn send(&self, command: ServerCommand) {
+        let _ = self.tx.send(Incoming::Command(command));
+    }
+
+    pub fn mouse_move(&self, x: i32, y: i32) {
+        self.send(ServerCommand::PointerMove { x, y });
+    }
+
+    pub fn mouse_relative(&self, dx: i32, dy: i32) {
+        self.send(ServerCommand::PointerRelative { dx, dy });
+    }
+
+    pub fn mouse_button(&self, button: u32, pressed: bool) {
+        self.send(ServerCommand::PointerButton { button, pressed });
+    }
+
+    pub fn key(&self, code: u32, pressed: bool, modifiers: u32) {
+        self.send(ServerCommand::Key {
+            code,
+            pressed,
+            modifiers,
+        });
+    }
+
+    pub fn axis(&self, horizontal: i32, vertical: i32) {
+        self.send(ServerCommand::Axis {
+            horizontal,
+            vertical,
+        });
+    }
+
+    pub fn screenshot(&self, path: impl Into<PathBuf>) {
+        self.send(ServerCommand::Screenshot(path.into()));
+    }
+
+    pub fn shutdown(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        self.send(ServerCommand::Shutdown);
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+}
+
+/// Handle запущенного в отдельном потоке сервера.
+pub struct ServerHandle {
+    pub control: ServerControl,
+    join: JoinHandle<io::Result<()>>,
+}
+
+impl ServerHandle {
+    pub fn join(self) -> io::Result<()> {
+        self.join
+            .join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "поток сервера запаниковал"))?
+    }
+}
+
+/// Сам сервер. `run` захватывает `self` и работает до shutdown/лимита кадров.
+pub struct Server {
+    options: ServerOptions,
+    listener: UnixListener,
+    compositor: Compositor,
+    backend: HeadlessBackend,
+    clients: Vec<ClientConn>,
+    incoming_tx: Sender<Incoming>,
+    incoming_rx: Receiver<Incoming>,
+    running: Arc<AtomicBool>,
+    next_conn: u64,
+    next_client: u64,
+    children: Vec<Child>,
+    demo_started: bool,
+}
+
+impl Server {
+    pub fn bind(options: ServerOptions) -> io::Result<Self> {
+        if options.width == 0
+            || options.height == 0
+            || options.width > 8192
+            || options.height > 8192
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "недопустимый размер экрана",
+            ));
+        }
+        if let Some(parent) = options.socket.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        if options.socket.exists() {
+            let metadata = std::fs::symlink_metadata(&options.socket)?;
+            if metadata.file_type().is_socket() {
+                std::fs::remove_file(&options.socket)?;
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "{} существует и не является сокетом",
+                        options.socket.display()
+                    ),
+                ));
+            }
+        }
+        let listener = UnixListener::bind(&options.socket)?;
+        listener.set_nonblocking(true)?;
+        let (tx, rx) = channel();
+        let compositor = Compositor::new(options.width, options.height);
+        let mut backend = HeadlessBackend::new(options.width, options.height);
+        if let Some(dir) = &options.screenshot_dir {
+            backend.set_screenshot_dir(dir);
+        }
+        Ok(Self {
+            options,
+            listener,
+            compositor,
+            backend,
+            clients: Vec::new(),
+            incoming_tx: tx,
+            incoming_rx: rx,
+            running: Arc::new(AtomicBool::new(true)),
+            next_conn: 1,
+            next_client: 1,
+            children: Vec::new(),
+            demo_started: false,
+        })
+    }
+
+    /// Поднять сервер в фоновом потоке и вернуть handle.
+    pub fn spawn(options: ServerOptions) -> io::Result<ServerHandle> {
+        let server = Self::bind(options)?;
+        let control = server.control();
+        let join = thread::spawn(move || server.run());
+        Ok(ServerHandle { control, join })
+    }
+
+    pub fn control(&self) -> ServerControl {
+        ServerControl {
+            tx: self.incoming_tx.clone(),
+            running: self.running.clone(),
+            socket: self.options.socket.clone(),
+        }
+    }
+
+    pub fn compositor(&self) -> &Compositor {
+        &self.compositor
+    }
+
+    pub fn compositor_mut(&mut self) -> &mut Compositor {
+        &mut self.compositor
+    }
+
+    pub fn take_screenshot(&mut self, path: impl AsRef<std::path::Path>) -> io::Result<()> {
+        self.compositor.render_full();
+        self.backend.screenshot(path, self.compositor.frame())
+    }
+
+    /// Основной цикл. Завершается по shutdown, лимиту кадров или ошибке сокета.
+    pub fn run(mut self) -> io::Result<()> {
+        if !self.options.quiet {
+            println!(
+                "pagh-desktop: слушаю {} ({}x{}, backend=headless)",
+                self.options.socket.display(),
+                self.options.width,
+                self.options.height
+            );
+        }
+        loop {
+            if !self.running.load(Ordering::SeqCst) {
+                break;
+            }
+            self.accept_pending();
+            let mut shutdown = false;
+            match self.incoming_rx.recv_timeout(Duration::from_millis(4)) {
+                Ok(incoming) => {
+                    if !self.handle_incoming(incoming) {
+                        shutdown = true;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+            while let Ok(incoming) = self.incoming_rx.try_recv() {
+                if !self.handle_incoming(incoming) {
+                    shutdown = true;
+                    break;
+                }
+            }
+            if shutdown {
+                break;
+            }
+            self.render_if_needed()?;
+            self.reap_children();
+            if !self.demo_started && self.options.spawn_demo {
+                self.demo_started = true;
+                self.launch(AppKind::Terminal);
+            }
+            if let Some(max) = self.options.max_frames {
+                if self.backend.frames >= max {
+                    break;
+                }
+            }
+        }
+        self.cleanup();
+        Ok(())
+    }
+
+    fn accept_pending(&mut self) {
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => self.attach(stream),
+                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                Err(err) => {
+                    if !self.options.quiet {
+                        eprintln!("pagh-desktop: accept: {err}");
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn attach(&mut self, stream: UnixStream) {
+        let conn = self.next_conn;
+        self.next_conn += 1;
+        let writer = match stream.try_clone() {
+            Ok(writer) => writer,
+            Err(err) => {
+                eprintln!("pagh-desktop: не удалось клонировать сокет: {err}");
+                return;
+            }
+        };
+        let _ = writer.set_write_timeout(Some(Duration::from_secs(2)));
+        let tx = self.incoming_tx.clone();
+        let running = self.running.clone();
+        let reader = stream;
+        let _ = reader.set_read_timeout(Some(Duration::from_millis(200)));
+        thread::spawn(move || read_loop(conn, reader, tx, running));
+        self.clients.push(ClientConn {
+            id: conn,
+            client_id: None,
+            name: String::new(),
+            writer: Arc::new(Mutex::new(writer)),
+        });
+        if !self.options.quiet {
+            eprintln!("pagh-desktop: клиент #{conn} подключён");
+        }
+    }
+
+    fn handle_incoming(&mut self, incoming: Incoming) -> bool {
+        match incoming {
+            Incoming::Client { conn, message } => {
+                self.handle_client_message(conn, message);
+                true
+            }
+            Incoming::Disconnected(conn) => {
+                self.drop_client(conn);
+                true
+            }
+            Incoming::ProtocolError { conn, detail } => {
+                self.reply_error(conn, ERR_BAD_MESSAGE, detail);
+                if let Some(index) = self.clients.iter().position(|c| c.id == conn) {
+                    shutdown_stream(&self.clients[index].writer);
+                }
+                self.drop_client(conn);
+                true
+            }
+            Incoming::Command(command) => self.handle_command(command),
+        }
+    }
+
+    fn handle_command(&mut self, command: ServerCommand) -> bool {
+        match command {
+            ServerCommand::PointerMove { x, y } => {
+                let events = self.compositor.pointer_motion(Point::new(x, y));
+                self.dispatch(events);
+            }
+            ServerCommand::PointerRelative { dx, dy } => {
+                let events = self.compositor.pointer_motion_relative(dx, dy);
+                self.dispatch(events);
+            }
+            ServerCommand::PointerButton { button, pressed } => {
+                let events = self
+                    .compositor
+                    .pointer_button(MouseButton::from_wire(button), pressed);
+                self.dispatch(events);
+            }
+            ServerCommand::Key {
+                code,
+                pressed,
+                modifiers,
+            } => {
+                let events = self.compositor.key_event(code, pressed, modifiers);
+                self.dispatch(events);
+            }
+            ServerCommand::Axis {
+                horizontal,
+                vertical,
+            } => {
+                let events = self.compositor.axis(horizontal, vertical);
+                self.dispatch(events);
+            }
+            ServerCommand::Screenshot(path) => {
+                if let Err(err) = self.take_screenshot(&path) {
+                    eprintln!("pagh-desktop: screenshot {}: {err}", path.display());
+                }
+            }
+            ServerCommand::Shutdown => return false,
+        }
+        true
+    }
+
+    fn handle_client_message(&mut self, conn: u64, message: Message) {
+        let Some(index) = self.clients.iter().position(|c| c.id == conn) else {
+            return;
+        };
+        let client_id = self.clients[index].client_id;
+        match message {
+            Message::Hello { version, pid, app } => {
+                if client_id.is_some() {
+                    self.reply_error(conn, ERR_BAD_MESSAGE, "повторный hello");
+                    return;
+                }
+                if version != VERSION {
+                    self.reply_error(
+                        conn,
+                        ERR_UNSUPPORTED,
+                        format!("поддерживается только протокол версии {VERSION}"),
+                    );
+                    return;
+                }
+                let id = self.next_client;
+                self.next_client += 1;
+                self.clients[index].client_id = Some(id);
+                self.clients[index].name = app.chars().take(64).collect();
+                if !self.options.quiet {
+                    eprintln!(
+                        "pagh-desktop: hello client_id={id} pid={pid} app={:?}",
+                        self.clients[index].name
+                    );
+                }
+                self.send_message(
+                    index,
+                    &Message::Welcome {
+                        version: VERSION,
+                        client_id: id,
+                        width: self.options.width,
+                        height: self.options.height,
+                        flags: WELCOME_FORMAT_XRGB8888 | WELCOME_FORMAT_RGB565,
+                    },
+                );
+            }
+            Message::Create {
+                window_id,
+                width,
+                height,
+                format,
+                title,
+            } => {
+                let Some(client_id) = client_id else {
+                    self.reply_error(conn, ERR_NOT_HELLO, "сначала hello");
+                    return;
+                };
+                let Some(format) = PixelFormat::from_wire(format) else {
+                    self.reply_error(conn, ERR_INVALID_SURFACE, "неизвестный формат пикселей");
+                    return;
+                };
+                match self
+                    .compositor
+                    .add_window(client_id, window_id, title, width, height, format)
+                {
+                    Ok(events) => self.dispatch(events),
+                    Err(err) => self.reply_error(conn, err.code(), err.to_string()),
+                }
+            }
+            Message::Commit {
+                window_id,
+                width,
+                height,
+                format,
+                stride,
+                pixels,
+            } => {
+                let Some(client_id) = client_id else {
+                    self.reply_error(conn, ERR_NOT_HELLO, "сначала hello");
+                    return;
+                };
+                match Surface::from_wire(width, height, stride, format, &pixels) {
+                    Ok(surface) => match self
+                        .compositor
+                        .commit_surface(client_id, window_id, surface)
+                    {
+                        Ok(events) => self.dispatch(events),
+                        Err(err) => self.reply_error(conn, err.code(), err.to_string()),
+                    },
+                    Err(err) => self.reply_error(conn, ERR_INVALID_SURFACE, err.to_string()),
+                }
+            }
+            Message::Damage { window_id, rects } => {
+                let Some(client_id) = client_id else {
+                    self.reply_error(conn, ERR_NOT_HELLO, "сначала hello");
+                    return;
+                };
+                if let Err(err) = self.compositor.note_damage(client_id, window_id, &rects) {
+                    self.reply_error(conn, err.code(), err.to_string());
+                }
+            }
+            Message::Close { window_id, .. } => {
+                let Some(client_id) = client_id else {
+                    self.reply_error(conn, ERR_NOT_HELLO, "сначала hello");
+                    return;
+                };
+                let owned = self
+                    .compositor
+                    .window(window_id)
+                    .map(|window| window.client_id == client_id)
+                    .unwrap_or(false);
+                if !owned {
+                    self.reply_error(conn, ERR_NOT_OWNER, "нельзя закрыть чужое окно");
+                    return;
+                }
+                let events = self.compositor.remove_window(window_id, false);
+                self.dispatch(events);
+            }
+            Message::Ping { nonce } => {
+                self.send_message(index, &Message::Pong { nonce });
+            }
+            other => {
+                self.reply_error(
+                    conn,
+                    ERR_UNSUPPORTED,
+                    format!("клиент не должен присылать {}", other.name()),
+                );
+            }
+        }
+    }
+
+    fn reply_error(&mut self, conn: u64, code: u32, message: impl Into<String>) {
+        if let Some(index) = self.clients.iter().position(|c| c.id == conn) {
+            self.send_message(
+                index,
+                &Message::Error {
+                    code,
+                    message: message.into(),
+                },
+            );
+        }
+    }
+
+    fn send_message(&mut self, index: usize, message: &Message) {
+        let Some(conn) = self.clients.get(index) else {
+            return;
+        };
+        let Ok(mut writer) = conn.writer.lock() else {
+            return;
+        };
+        if let Err(err) = protocol::write_message(&mut *writer, message) {
+            if !self.options.quiet {
+                eprintln!("pagh-desktop: отправка клиенту #{}: {err}", conn.id);
+            }
+        }
+    }
+
+    fn send_to_client(&mut self, client_id: u64, message: Message) {
+        if let Some(index) = self
+            .clients
+            .iter()
+            .position(|conn| conn.client_id == Some(client_id))
+        {
+            self.send_message(index, &message);
+        }
+    }
+
+    fn dispatch(&mut self, events: Vec<HostEvent>) {
+        for event in events {
+            match event {
+                HostEvent::Send { client_id, message } => {
+                    self.send_to_client(client_id, message);
+                }
+                HostEvent::Launch(app) => self.launch(app),
+            }
+        }
+    }
+
+    fn launch(&mut self, app: AppKind) {
+        if !self.options.spawn_demo {
+            if !self.options.quiet {
+                eprintln!("pagh-desktop: launch {:?} (spawn_demo выключен)", app);
+            }
+            return;
+        }
+        let app_arg = match app {
+            AppKind::Terminal => "terminal",
+            AppKind::Files => "files",
+            AppKind::Paint => "paint",
+        };
+        let binary = self.options.demo_binary.clone().or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|dir| dir.join("pagh-desktop-demo")))
+        });
+        let Some(binary) = binary else {
+            eprintln!("pagh-desktop: не найден демо-клиент для запуска");
+            return;
+        };
+        match Command::new(&binary)
+            .arg("--connect")
+            .arg(&self.options.socket)
+            .arg("--app")
+            .arg(app_arg)
+            .spawn()
+        {
+            Ok(child) => {
+                if !self.options.quiet {
+                    eprintln!(
+                        "pagh-desktop: запущен {} (pid {})",
+                        binary.display(),
+                        child.id()
+                    );
+                }
+                self.children.push(child);
+            }
+            Err(err) => eprintln!("pagh-desktop: запуск {}: {err}", binary.display()),
+        }
+    }
+
+    fn reap_children(&mut self) {
+        self.children.retain_mut(|child| match child.try_wait() {
+            Ok(Some(_)) => false,
+            Ok(None) => true,
+            Err(_) => false,
+        });
+    }
+
+    fn drop_client(&mut self, conn: u64) {
+        let Some(index) = self.clients.iter().position(|c| c.id == conn) else {
+            return;
+        };
+        let client = self.clients.remove(index);
+        if let Some(client_id) = client.client_id {
+            let events = self.compositor.remove_client(client_id);
+            self.dispatch(events);
+        }
+        if !self.options.quiet {
+            eprintln!("pagh-desktop: клиент #{conn} отключён");
+        }
+        self.compositor.render_full();
+    }
+
+    fn render_if_needed(&mut self) -> io::Result<()> {
+        let damage = self.compositor.render();
+        if damage.is_empty() {
+            return Ok(());
+        }
+        self.backend.present(self.compositor.frame(), &damage)
+    }
+
+    fn cleanup(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        for client in &self.clients {
+            shutdown_stream(&client.writer);
+        }
+        self.clients.clear();
+        for mut child in self.children.drain(..) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if self.options.socket.exists() {
+            let _ = std::fs::remove_file(&self.options.socket);
+        }
+        if !self.options.quiet {
+            println!(
+                "pagh-desktop: остановлен, кадров отрисовано {}",
+                self.backend.frames
+            );
+        }
+    }
+
+    /// Отправить приветствие клиенту без сервера (для unit-тестов протокола).
+    pub fn welcome_for(&self, client_id: u64) -> Welcome {
+        Welcome {
+            client_id,
+            screen: crate::geometry::Size::new(self.options.width, self.options.height),
+            flags: WELCOME_FORMAT_XRGB8888 | WELCOME_FORMAT_RGB565,
+        }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        if self.options.socket.exists() {
+            let _ = std::fs::remove_file(&self.options.socket);
+        }
+    }
+}
+
+fn shutdown_stream(writer: &Arc<Mutex<UnixStream>>) {
+    if let Ok(guard) = writer.lock() {
+        let _ = guard.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+fn read_loop(conn: u64, mut stream: UnixStream, tx: Sender<Incoming>, running: Arc<AtomicBool>) {
+    let mut decoder = Decoder::new();
+    let mut buffer = [0u8; 64 * 1024];
+    'read: loop {
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Err(err) = decoder.push(&buffer[..n]) {
+                    let _ = tx.send(Incoming::ProtocolError {
+                        conn,
+                        detail: err.to_string(),
+                    });
+                    return;
+                }
+                loop {
+                    match decoder.next_message() {
+                        Ok(Some(message)) => {
+                            if tx.send(Incoming::Client { conn, message }).is_err() {
+                                break 'read;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            let _ = tx.send(Incoming::ProtocolError {
+                                conn,
+                                detail: err.to_string(),
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(err)
+                if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut => {}
+            Err(_) => break,
+        }
+    }
+    let _ = tx.send(Incoming::Disconnected(conn));
+}
+
+/// Утилита для тестов: уникальный путь сокета.
+pub fn unique_socket_path(tag: &str) -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "pagh-desktop-{tag}-{}-{nanos}.sock",
+        std::process::id()
+    ))
+}

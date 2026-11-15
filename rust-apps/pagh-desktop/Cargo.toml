@@ -1,0 +1,15 @@
+[package]
+name = "pagh-desktop"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Userspace desktop compositor/server for Pagh-OS (PDP/1 protocol, headless backend)"
+
+[workspace]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+strip = true
