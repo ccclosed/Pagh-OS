@@ -415,6 +415,8 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::DUP2 => io_sys::sys_dup2(a[0], a[1]),
         sysno::DUP3 => io_sys::sys_dup3(a[0], a[1], a[2]),
         sysno::FCNTL => io_sys::sys_fcntl(a[0], a[1], a[2]),
+        sysno::TRUNCATE => io_sys::sys_truncate(a[0], a[1]),
+        sysno::FTRUNCATE => io_sys::sys_ftruncate(a[0], a[1]),
         sysno::READLINK => io_sys::sys_readlink(a[0], a[1], a[2]),
         sysno::READLINKAT => io_sys::sys_readlinkat(a[0], a[1], a[2], a[3]),
         sysno::STATFS => io_sys::sys_statfs(a[0], a[1]),

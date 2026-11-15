@@ -2,6 +2,45 @@
 
 Новое сверху, один раздел на версию `Cargo.toml`.
 
+## 2.24.0
+
+Desktop-вариант B: kernel-примитивы под userspace-композитор (`pagh-desktop`).
+ABI и ограничения — `docs/desktop-b.md`.
+
+* **`memfd` + `MAP_SHARED`.** Новый тип VFS-узла `vfs::memfd::MemFd`: страницы —
+  кадры PMM в карте `page_index -> phys`, файл держит pin-ссылку кэша, каждое
+  отображение — свою (`SHARED_BIT` листа). Повторные `mmap` одного fd и
+  fork-ребёнок видят одни байты, `read`/`write`/`pread64` согласованы с
+  отображением, `munmap`/exit/`mprotect(PROT_NONE)` отпускают только ссылку, а
+  кадр возвращается в PMM после последней. `ftruncate`/`truncate` (76/77)
+  добавлены в ABI (пустой memfd → размер SHM-буфера); `MAP_SHARED` обычного
+  файла — `EINVAL`, `PROT_NONE`/`mremap` shared — `EINVAL`.
+* **`/dev/fb0`.** Символьное устройство над Limine-фреймбуфером:
+  `FBIOGET_VSCREENINFO` (0x4600)/`FBIOGET_FSCREENINFO` (0x4602) отдают
+  минимальные `fb_var_screeninfo` (160 байт) и `fb_fix_screeninfo` (80 байт) с
+  реальными xres/yres/bpp/masks/stride/smem_start/smem_len/type/visual;
+  `mmap(MAP_SHARED)` отображает физический scanout как MMIO. Первый
+  `open`/`mmap` останавливает kernel-консольный flush (takeover; serial-логи
+  продолжают), без desktop консоль работает как раньше. fb-листья несут
+  MMIO-бит: `munmap`/exit/fork не возвращают экран в PMM. Нет фреймбуфера —
+  `open` даёт `ENODEV`.
+* **`/dev/input/event0`.** evdev-подобная очередь: `read` отдаёт 24-байтный
+  `struct input_event` (timeval, type, code, value); `EV_KEY` из PS/2 и USB HID
+  (set-1 → Linux keycodes, extended-таблица), `EV_REL` REL_X/REL_Y/REL_WHEEL из
+  PS/2 и USB HID мыши, `EV_SYN`/`SYN_REPORT` на пакет. Blocking read,
+  `O_NONBLOCK` → `EAGAIN`, `poll`/`select`/`epoll` → `POLLIN`; кольцо на 256
+  событий с вытеснением старого. Ввод дублируется из того же PS/2-потока,
+  поэтому shell-stdin и `/dev/stdin` не ломаются, если устройство не открыто.
+* **Проверка.** Host-тесты `fb_abi`/`input_event` сверяют размеры и смещения с
+  `linux/fb.h`/`linux/input.h`; in-QEMU `selftest` получил четыре routine
+  `desktop-b::*`: fb ioctl/mmap/пиксель (через mapping и физический scanout),
+  event0 read/poll (клавиатура + мышь), memfd coherence и `MAP_SHARED` после
+  `fork` (общий кадр, не COW). Все routine выполняются в свежем пользовательском
+  PML4 и возвращают кадры в PMM. `tools/e2e.py selftest` зелёный.
+* **Остаток.** SCM_RIGHTS/fd passing (клиент не может передать memfd композитору
+  через AF_UNIX), DMA-BUF/GPU/EGL, Wayland/xdg-shell, EV_ABS/touch, fb modeset,
+  аппаратный курсор и vt-switch — отдельные будущие PR.
+
 **Как читать этот файл.** Заголовок — это bump версии, не обязательно выпущенная сборка. Git-теги / GitHub-релизы существуют для `2.17.0` (2026-11-10), `2.18.6` (2026-11-10) и бандла `2.18.12-demo` (2026-11-11, демо-медиа снято с 2.18.12); `2.17.1`, `2.17.2` и серия исправлений по реальному железу `2.18.0`–`2.18.12` — это bump'ы версии, чьи заметки записаны здесь и в `AGENTS.md` и входят в следующий тегированный релиз (`2.18.13`, влит как PR #56). Полная техническая история каждого релиза — в release-note блоке `AGENTS.md`; разделы здесь называют видимое пользователю изменение и указывают туда, а не дублируют. Единственная статусная страница по находкам безопасности — `SECURITY.md`.
 
 ## 2.23.0

@@ -57,6 +57,8 @@ pub enum Errno {
     EFAULT = 14,
     /// Файл существует.
     EEXIST = 17,
+    /// Устройство не существует (`open(/dev/fb0)` на serial-only boot).
+    ENODEV = 19,
     /// Не каталог.
     ENOTDIR = 20,
     /// Это каталог.

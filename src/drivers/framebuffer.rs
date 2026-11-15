@@ -24,6 +24,60 @@ const MAX_LINES: usize = 37;
 /// выровнены.
 pub const STATUS_BAR_HEIGHT: usize = CHAR_HEIGHT;
 
+/// Геометрия Limine-фреймбуфера для `/dev/fb0` (fbdev UAPI) и `mmap`.
+///
+/// `phys` — **физический** адрес: Limine отдаёт уже замапленный HHDM-адрес,
+/// поэтому драйвер вычитает HHDM-смещение один раз здесь, а не в syscall-слое.
+/// `smem_len` — `pitch * height`, то есть весь scanout ровно так, как его
+/// ожидает `mmap(/dev/fb0)`: пользователь получает линейные страницы экрана.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FbInfo {
+    pub phys: u64,
+    pub smem_len: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub bpp: u32,
+    pub red_offset: u32,
+    pub red_length: u32,
+    pub green_offset: u32,
+    pub green_length: u32,
+    pub blue_offset: u32,
+    pub blue_length: u32,
+    pub transp_offset: u32,
+    pub transp_length: u32,
+}
+
+/// Один раз установленный загрузчиком scanout: `open(/dev/fb0)`/`mmap`
+/// переключает консоль в режим «экран принадлежит userspace».
+///
+/// Флаг намеренно **односторонний**: точно как DRM/fbcon handover, после того
+/// как композитор забрал экран, kernel-консоль не должна тайком перерисовывать
+/// кадр под ним. Serial-логи (`kprintln!`) продолжают идти — на машине без
+/// serial это единственная диагностика, и она не зависит от экрана. Вернуть
+/// консоль может только [`release_takeover`] (in-QEMU selftest); userspace-
+/// композитор этого не делает.
+static CONSOLE_TAKEOVER: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Забрал ли userspace экран (`/dev/fb0` открыт/отображён).
+pub fn takeover_active() -> bool {
+    CONSOLE_TAKEOVER.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Остановить kernel-консольный flush: экран теперь рисует композитор.
+pub fn takeover_acquire() {
+    CONSOLE_TAKEOVER.store(true, core::sync::atomic::Ordering::Relaxed);
+    crate::info!("[FB] /dev/fb0 opened: kernel console flush suspended (takeover)");
+}
+
+/// Вернуть экран kernel-консоли. Вызывается только in-QEMU selftest'ом, чтобы
+/// проверка `/dev/fb0` не оставляла за собой мёртвый экран; рабочий композитор
+/// handover не отменяет.
+pub fn release_takeover() {
+    CONSOLE_TAKEOVER.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Сколько ушедших за экран строк консоли держит scrollback. Одна строка —
 /// `CHARS_PER_LINE` символов плюс их `u32`-цвета (~500 байт), так что это
 /// ограничивает историю ~256 KiB — память аллоцируется лениво по мере прокрутки,
@@ -198,6 +252,9 @@ pub struct FramebufferWriter {
     /// a full-surface copy on the next frame flush — an idle shell would spend the
     /// CPU of a busy one just to redraw a 12x19 arrow nobody asked to move.
     quiet: bool,
+    /// Снимок геометрии/формата для `/dev/fb0`; `phys` — HHDM-адрес минус
+    /// смещение, то есть физическая база scanout.
+    info: FbInfo,
 }
 
 impl FramebufferWriter {
@@ -238,6 +295,33 @@ impl FramebufferWriter {
             bpp
         );
 
+        // Limine отдаёт уже замапленный HHDM-адрес (см. boot.rs, шаг
+        // `init_drivers`); `/dev/fb0` обязан сообщать ФИЗИЧЕСКУЮ базу, потому
+        // что mmap пользователя мапит кадры, а не kernel-VA.
+        let hhdm = crate::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+        let phys = if hhdm != 0 && address >= hhdm {
+            address - hhdm
+        } else {
+            address
+        };
+        let info = FbInfo {
+            phys,
+            smem_len: pitch.saturating_mul(height),
+            width: width as u32,
+            height: height as u32,
+            pitch: pitch as u32,
+            bpp: bpp as u32,
+            red_offset: fb.red_mask_shift as u32,
+            red_length: fb.red_mask_size as u32,
+            green_offset: fb.green_mask_shift as u32,
+            green_length: fb.green_mask_size as u32,
+            blue_offset: fb.blue_mask_shift as u32,
+            blue_length: fb.blue_mask_size as u32,
+            // Limine не сообщает alpha-маску: XRGB, прозрачности нет.
+            transp_offset: 0,
+            transp_length: 0,
+        };
+
         Some(FramebufferWriter {
             fb_addr: address,
             width: width as usize,
@@ -265,7 +349,13 @@ impl FramebufferWriter {
             back: alloc::vec![0u8; (pitch as usize) * (height as usize)],
             dirty: None,
             quiet: false,
+            info,
         })
+    }
+
+    /// Геометрия/формат scanout для `/dev/fb0`.
+    pub fn info(&self) -> FbInfo {
+        self.info
     }
 
     pub fn clear(&mut self) {
@@ -469,6 +559,13 @@ impl FramebufferWriter {
     /// [`Self::flush_rect`]. A bug that bypasses `put_pixel` would show as a stale
     /// rectangle, so keep new drawing primitives going through it.
     pub fn flush(&mut self) -> bool {
+        if takeover_active() {
+            // Экран у userspace-композитора: погасить накопленный dirty-box,
+            // чтобы после явного `release_takeover` (selftest) не выстрелить
+            // устаревшим кадром поверх чужой отрисовки.
+            self.dirty = None;
+            return false;
+        }
         let Some((x0, y0, x1, y1)) = self.dirty.take() else {
             return false;
         };
@@ -503,7 +600,13 @@ impl FramebufferWriter {
     /// on the device (the software cursor) does not force a frame flush later.
     /// Rectangles are clipped to the surface; an empty intersection is a no-op.
     pub fn flush_rect(&mut self, x: usize, y: usize, w: usize, h: usize) {
-        if self.bpp < 3 || w == 0 || h == 0 || x >= self.width || y >= self.height {
+        if takeover_active()
+            || self.bpp < 3
+            || w == 0
+            || h == 0
+            || x >= self.width
+            || y >= self.height
+        {
             return;
         }
         let x1 = (x + w).min(self.width);
@@ -1500,6 +1603,11 @@ pub fn repaint_grid() {
 /// framebuffer never initialized.
 pub fn dimensions() -> (usize, usize) {
     FB_WRITER.dimensions()
+}
+
+/// Геометрия Limine-фреймбуфера для `/dev/fb0`; `None` на serial-only boot.
+pub fn fb_info() -> Option<FbInfo> {
+    FB_WRITER.with(|w| w.info())
 }
 
 /// The console's current foreground and background colours (see
