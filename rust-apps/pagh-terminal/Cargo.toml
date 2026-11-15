@@ -1,0 +1,26 @@
+[package]
+name = "pagh-terminal"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Pagh desktop terminal: VT100/ANSI parser, RGBA renderer, PDP/1 protocol client"
+
+# Standalone crate: rust-apps/** are built separately from the bare-metal kernel
+# workspace (see rust-apps/README.md). Without this table cargo would try to make
+# this package a member of the kernel workspace at the repository root.
+[workspace]
+
+[lib]
+name = "pagh_terminal"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pagh-terminal"
+path = "src/bin/pagh-terminal.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+strip = true

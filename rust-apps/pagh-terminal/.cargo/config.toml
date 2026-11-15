@@ -1,0 +1,11 @@
+# Host-target default: `cargo test` and `cargo run` inside this crate build for
+# the host. The static pagh binary is built explicitly with
+# `--target x86_64-unknown-linux-musl` (see README.md).
+[build]
+target = "x86_64-unknown-linux-gnu"
+# The repository root enables `build-std` for the bare-metal kernel target.  For
+# a host-target app cargo would then pair a build-std `core` with the toolchain's
+# precompiled `std`, whose `core` is a second copy: primitive inherent methods
+# become ambiguous.  Rebuilding std from source too keeps exactly one core.
+[unstable]
+build-std = ["std", "core", "compiler_builtins", "alloc"]
