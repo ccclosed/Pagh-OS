@@ -309,27 +309,30 @@ the operational checklist in `RELEASING.md`.
   `usb_hid_proto`/`usb_desc` (buffer sizing, layouts, composite/truncated
   descriptors), new in-QEMU report-mode selftest cases, `tools/e2e.py usb` and
   the PS/2 path are green; real hardware was not available, so this is QEMU
-  evidence plus the serial lines named in `src/drivers/README.md`. (5) the same
-  field machine exposed an xHCI *timing* failure below that HID fix: every
-  attached USB2 port reported `ccs=1 ped=0 pp=1 pls=7 stage=lost-after-reset
-  try=19 ms=124` with 0 HID devices. The old port loop waited only 60 ms for
-  PED+U0, reset the port anyway while its PHY was still debouncing/training
-  (25 ms first-reset budget, 20 ms stability check, PP cycled every 4 attempts),
-  and therefore restarted the attach sequence every ~124 ms. Port bring-up is
-  now a pure, host-tested policy (`src/drivers/xhci_port.rs`, properties
-  `xhci_port`): Polling/RxDetect gets 400 ms of undisturbed detect/training and
-  is adopted without a reset if it enables on its own; after PR (USB2) or WPR
-  (USB3) PRC and PED+U0 are awaited for 500 ms with no second reset inside that
-  window; the enable must hold for 80 ms; a lost enable backs off 250 ms →
-  500 ms → 1 s and is re-observed before any new reset; PP is power-cycled only
-  after 16 failed attempts (500 ms off, then a fresh debounce). One port is
-  advanced per `poll()` and waiting is deadline-based, so the boot menu keeps
-  counting. The diagnostics gained `ped_u0=`: the field's identical `ped_sc` was
-  a per-port reset-time transient, not a shared diagnostic value, and `ped_sc`
-  now records the last PED+U0 sighting per port. Evidence: QEMU `tools/e2e.py
-  usb` (keyboard + mouse through menu and shell; PS/2 unaffected), `selftest`
-  and the new host properties; real hardware was not available, so this also
-  needs a user test — the serial lines to watch are named in
+  (5) the same field machine then exposed a deeper xHCI port bug below that
+  HID fix, in two iterations. The first (see the 2.22.7 notes) stopped a reset
+  every ~124 ms, but the next photo showed a PP power-cycle after 16 failures
+  with all ports at `pp=0 ccs=0`, PED+U0 only momentarily, and speed id 1 (FS)
+  where Linux reports 3 (HS). The root cause was the PORTSC write itself: the
+  driver wrote a masked copy of the register back and so carried `PED` (bit 1,
+  write-1-to-disable), `PR`/`WPR` and the change bits; acknowledging PRC/CSC on
+  the just-enabled port disabled it, which is exactly `post=0x6e1` (Polling,
+  PED=0) in the photo. Every PORTSC write now goes through the Linux neutral
+  mask (`port_state_to_neutral`: RO/RWS bits only), a reset is `neutral | PR`
+  (USB2) or `neutral | WPR` (USB3) with no change-bit clear in the same write,
+  and the policy follows `hub.c`/`xhci-hub.c`: `hub_port_debounce` (25 ms steps,
+  100 ms stable connection, 2 s budget) before the first reset, 100 ms power
+  settle after PP, `hub_port_wait_reset` (10 ms then 200 ms polls, 800 ms per
+  write, PED check, up to `PORT_RESET_TRIES`=5 writes), 200 ms of stable PED+U0
+  before addressing, change bits acknowledged after that enable, a ≥1 s pause
+  after a lost PED followed by a fresh debounce, and no PP power-cycle at all
+  (PP is only raised with readback/retry). One port is advanced per `poll()`,
+  so the boot menu keeps counting. Diagnostics gained `csc=`, `speed=`,
+  `try=K/5`, `pre/post` on the failure line and a ~200 ms `observe` trace for
+  attached ports during debounce. Evidence: QEMU `tools/e2e.py usb` (keyboard +
+  mouse through menu and shell; PS/2 unaffected), `selftest` and the
+  `xhci_port` host properties; real hardware was not available, so this needs a
+  user test — the serial lines to watch are named in
   `src/drivers/README.md`. Version
   2.22.7 is the `dev` PATCH bump; `main` stays 2.22.6.
   **2.22.6** = the round-3 audit's four high x86 findings are closed

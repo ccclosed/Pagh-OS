@@ -41,7 +41,9 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::drivers::pci::PciDevice;
 use crate::drivers::usb_desc::{self, HidIface};
 use crate::drivers::usb_hid_proto::{self, RecoveryAction, ReportMode};
-use crate::drivers::xhci_port::{self, FailReason, Phase, PortObservation, PortPolicy, Step};
+use crate::drivers::xhci_port::{
+    self, port_state_to_neutral, FailReason, Phase, PortObservation, PortPolicy, Step,
+};
 use crate::memory::pmm;
 use crate::sync::spinlock::Spinlock;
 
@@ -415,11 +417,12 @@ const PORTSC_CSC: u32 = 1 << 17;
 const PORTSC_WRC: u32 = 1 << 19;
 const PORTSC_PRC: u32 = 1 << 21;
 const PORTSC_WPR: u32 = 1 << 31;
-/// Write-1-to-clear bits: every PORTSC write must preserve the rest of the
-/// register and set only the bits being acknowledged, or the controller keeps
-/// re-reporting the same change (and, worse, can drop a real one).
-const PORTSC_RW1C: u32 =
-    PORTSC_CSC | (1 << 18) | PORTSC_WRC | (1 << 20) | PORTSC_PRC | (1 << 22) | (1 << 23);
+// Every PORTSC write goes through `xhci_port::port_state_to_neutral()` (Linux
+// `xhci_port_state_to_neutral`): writing a read value back verbatim carries the
+// write-1-to-clear `PED` bit, and writing PED=1 DISABLES the port — which is
+// exactly how the first 2.22.7 port fix lost the enable it had just waited for.
+// PR (bit 4), WPR (31), LWS (16) and the change bits (17-23) are likewise only
+// ever written as 0 unless the action is the point of the write.
 
 const RTS_IR0: usize = 0x20;
 const IR_ERSTSZ: usize = 0x08;
@@ -541,8 +544,11 @@ struct PortDiag {
     /// clock is unavailable. This is what separates "the port needs more time"
     /// from "the controller refuses" in a photo.
     ms: u16,
-    /// The host-tested state machine: phase, deadlines, backoff, power-cycle
-    /// gate, and the per-attempt PRC/PED snapshots.
+    /// Next time the per-port "observe" line is due while debouncing (µs).
+    /// The attached-port trace the field photo needs runs every ~200 ms.
+    next_log_us: u64,
+    /// The host-tested state machine: phase, deadlines, Linux debounce/reset
+    /// sequencing, backoff, and the per-attempt PRC/CSC/PED snapshots.
     policy: PortPolicy,
 }
 
@@ -895,7 +901,6 @@ fn waiting_stage(phase: Phase) -> &'static str {
         Phase::ResetWait => "reset",
         Phase::Stabilize => "stabilize",
         Phase::PowerSettle => "power-settle",
-        Phase::PowerCycle => "power-cycle",
         Phase::ResumeWait => "resume",
         Phase::Empty => "no-device",
         Phase::Backoff | Phase::Idle | Phase::Enumerating => "",
@@ -1458,6 +1463,7 @@ fn start_controller(dev: &PciDevice, controllers: usize) -> bool {
                 seen_ped_u0: false,
                 ped_sc: 0,
                 ms: 0,
+                next_log_us: 0,
                 proto,
                 // USB3 ports use WPR (warm reset), USB2 ports PR. An unknown
                 // protocol (0) is treated as USB2: PR is the safe request there.
@@ -1614,6 +1620,8 @@ fn observe_portsc(raw: u32) -> PortObservation {
         ((raw & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) as u8,
         ((raw & PORTSC_PLS_MASK) >> PORTSC_PLS_SHIFT) as u8,
         raw & PORTSC_PRC != 0,
+        raw & PORTSC_CSC != 0,
+        raw & PORTSC_PR != 0,
         raw,
     )
 }
@@ -1647,33 +1655,18 @@ fn poll_port(ctrl: &mut Controller, port: u8) {
                 ctrl.stage(port, stage, raw);
             }
             sync_diag(ctrl, port);
+            log_port_observation(ctrl, port, raw, obs, now);
         }
         Step::PowerOn => {
-            wr32(ctrl.op, off, (raw & !PORTSC_RW1C) | PORTSC_PP);
-            if !spin_until(|| rd32(ctrl.op, off) & PORTSC_PP != 0, 100_000) {
+            // The write goes through the Linux neutral value (PED/PR/WPR/LWS
+            // must be 0) and PP is read back; a controller that drops the write
+            // must not leave the port dark and silent.
+            if !power_on_port(ctrl, port) {
                 policy_fail(ctrl, port, obs, now, FailReason::NoPower);
                 port_failure(ctrl, port, FailReason::NoPower, raw);
                 return;
             }
-            crate::debug!("xhci: port {}: power on", port);
             ctrl.stage(port, "power-settle", raw);
-            sync_diag(ctrl, port);
-        }
-        Step::PowerOff => {
-            wr32(ctrl.op, off, raw & !PORTSC_RW1C & !PORTSC_PP);
-            if !spin_until(|| rd32(ctrl.op, off) & PORTSC_PP == 0, 100_000) {
-                policy_fail(ctrl, port, obs, now, FailReason::NoPower);
-                port_failure(ctrl, port, FailReason::NoPower, raw);
-                return;
-            }
-            let failures = ctrl.diag[port as usize - 1].policy.failures();
-            crate::info!(
-                "xhci: port {}: power cycle after {} failed attempt(s): PP off for {} ms, then a fresh debounce",
-                port,
-                failures,
-                xhci_port::POWER_CYCLE_OFF_US / 1_000
-            );
-            ctrl.stage(port, "power-cycle", raw);
             sync_diag(ctrl, port);
         }
         Step::Reset { warm } => start_port_reset(ctrl, port, warm, raw),
@@ -1696,6 +1689,77 @@ fn poll_port(ctrl: &mut Controller, port: u8) {
     }
 }
 
+/// Raise PP with a readback (and a bounded retry) — never leave the port off.
+///
+/// Linux's `xhci_set_port_power()` writes `xhci_port_state_to_neutral()` | PP and
+/// reads the register back once. This driver has no hub workqueue to retry a
+/// dropped write, so it retries a few times and only then reports `no-power`;
+/// the policy then backs off and comes back to `PowerOn`, so a port is never
+/// abandoned unpowered.
+fn power_on_port(ctrl: &mut Controller, port: u8) -> bool {
+    let off = portsc(port);
+    for attempt in 0..3 {
+        let cur = rd32(ctrl.op, off);
+        wr32(ctrl.op, off, port_state_to_neutral(cur) | PORTSC_PP);
+        let sc = rd32(ctrl.op, off);
+        if sc & PORTSC_PP != 0 {
+            crate::debug!(
+                "xhci: port {}: power on (PORTSC={:#010x}, attempt {})",
+                port,
+                sc,
+                attempt + 1
+            );
+            return true;
+        }
+        settle_us(10_000);
+    }
+    crate::warn!(
+        "xhci: port {}: PP did not come up after 3 writes (PORTSC={:#010x})",
+        port,
+        rd32(ctrl.op, off)
+    );
+    false
+}
+
+/// One `observe` line every ~200 ms for a port that is attached and debouncing.
+///
+/// This is the trace the field photo needs: the second 2.22.7 report only had
+/// the failure line, so it was impossible to tell whether the port was stable
+/// in Polling, bouncing between CCS states, or already enabled and lost. Linux's
+/// `hub_port_debounce` logs `debounce total ... stable ... status`, and the same
+/// numbers are printed here (`debounce_total_us`/`debounce_stable_us`).
+fn log_port_observation(ctrl: &mut Controller, port: u8, raw: u32, obs: PortObservation, now: u64) {
+    let Some(d) = ctrl.diag.get(port as usize - 1) else {
+        return;
+    };
+    if d.policy.phase() != Phase::Debounce {
+        return;
+    }
+    if d.next_log_us != 0 && now < d.next_log_us {
+        return;
+    }
+    let total_ms = d.policy.debounce_total_us() / 1_000;
+    let stable_ms = d.policy.debounce_stable_us() / 1_000;
+    if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+        d.next_log_us = now.saturating_add(200_000);
+    }
+    crate::info!(
+        "xhci: port {}: observe ccs={} ped={} pp={} pls={} speed={} csc={} prc={} pr={} state={:#010x} debounce_total={}ms stable={}ms",
+        port,
+        obs.ccs as u8,
+        obs.ped as u8,
+        obs.pp as u8,
+        obs.pls,
+        obs.speed,
+        obs.csc as u8,
+        obs.prc as u8,
+        obs.pr as u8,
+        raw,
+        total_ms,
+        stable_ms
+    );
+}
+
 /// Clear stale change bits and write PR (USB2) or WPR (USB3).
 ///
 /// The policy has already moved to `ResetWait`; `pre` is the raw PORTSC the
@@ -1704,35 +1768,46 @@ fn poll_port(ctrl: &mut Controller, port: u8) {
 fn start_port_reset(ctrl: &mut Controller, port: u8, warm: bool, raw: u32) {
     let off = portsc(port);
     let attempt = ctrl.diag[port as usize - 1].policy.resets();
-    // The PRC seen later must belong to THIS reset: acknowledge old ones first.
-    wr32(
-        ctrl.op,
-        off,
-        (raw & !PORTSC_RW1C) | PORTSC_CSC | PORTSC_PRC | PORTSC_WRC,
-    );
+    let tries = ctrl.diag[port as usize - 1].policy.reset_tries();
+    let debounce_total_ms = ctrl.diag[port as usize - 1].policy.debounce_total_us() / 1_000;
+    let debounce_stable_ms = ctrl.diag[port as usize - 1].policy.debounce_stable_us() / 1_000;
+    // Linux `xhci_hub_control`, case USB_PORT_FEAT_RESET:
+    //     portsc = xhci_port_state_to_neutral(portsc);
+    //     portsc |= PORT_RESET;
+    //     writel(portsc);
+    // Change bits are NOT cleared here: the neutral value writes 0 to every
+    // W1C bit, and the change bits are acknowledged only after the port has
+    // enabled and held (driver `enumerate_port`).
     let sc = rd32(ctrl.op, off);
     let bit = if warm { PORTSC_WPR } else { PORTSC_PR };
-    wr32(ctrl.op, off, (sc & !PORTSC_RW1C) | bit);
+    wr32(ctrl.op, off, port_state_to_neutral(sc) | bit);
     ctrl.stage(port, "reset", raw);
-    if attempt <= 2 || attempt % 8 == 0 {
+    if attempt <= 2 || attempt % 8 == 0 || tries == 1 {
         crate::info!(
-            "xhci: port {}: reset #{} issued (usb{} pre={:#010x} ccs={} ped={} pp={} speed={} pls={} prc={})",
+            "xhci: port {}: reset #{} issued (usb{} try={}/{} pre={:#010x} ccs={} ped={} pp={} speed={} pls={} prc={} csc={} debounce_total={}ms stable={}ms)",
             port,
             attempt,
             if warm { 3 } else { 2 },
+            tries,
+            xhci_port::PORT_RESET_TRIES,
             raw,
             raw & PORTSC_CCS != 0,
             raw & PORTSC_PED != 0,
             raw & PORTSC_PP != 0,
             (raw & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT,
             (raw & PORTSC_PLS_MASK) >> PORTSC_PLS_SHIFT,
-            raw & PORTSC_PRC != 0
+            raw & PORTSC_PRC != 0,
+            raw & PORTSC_CSC != 0,
+            debounce_total_ms,
+            debounce_stable_ms
         );
     } else {
         crate::debug!(
-            "xhci: port {}: reset #{} issued (pre={:#010x})",
+            "xhci: port {}: reset #{} issued (try={}/{} pre={:#010x})",
             port,
             attempt,
+            tries,
+            xhci_port::PORT_RESET_TRIES,
             raw
         );
     }
@@ -1749,11 +1824,16 @@ fn start_port_reset(ctrl: &mut Controller, port: u8, warm: bool, raw: u32) {
 fn enumerate_port(ctrl: &mut Controller, port: u8, speed: u8, now: u64) {
     let off = portsc(port);
     let had_reset = ctrl.diag[port as usize - 1].policy.attempt_had_reset();
-    let cur = rd32(ctrl.op, off);
+    let pre = rd32(ctrl.op, off);
+    // Linux clears C_PORT_RESET after the reset has completed and the port has
+    // enabled (hub_port_reset -> usb_clear_port_feature(C_RESET)). Keep the same
+    // ordering: the port has already held PED+U0 for STABLE_US here, and the
+    // write is neutral except for the W1C change bits — it can no longer write
+    // PED=1 (which would disable the port, the 2.22.7 field bug).
     wr32(
         ctrl.op,
         off,
-        (cur & !PORTSC_RW1C) | PORTSC_PRC | PORTSC_WRC | PORTSC_CSC,
+        port_state_to_neutral(pre) | PORTSC_PRC | PORTSC_WRC | PORTSC_CSC,
     );
     let cur = rd32(ctrl.op, off);
     let still = observe_portsc(cur);
@@ -1772,21 +1852,29 @@ fn enumerate_port(ctrl: &mut Controller, port: u8, speed: u8, now: u64) {
     record_attempt_ms(ctrl, port);
     let attempts = ctrl.diag[port as usize - 1].policy.resets();
     let ms = ctrl.diag[port as usize - 1].ms;
+    let speed_before_reset =
+        (ctrl.diag[port as usize - 1].pre & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT;
     if had_reset {
         crate::info!(
-            "xhci: port {}: reset-ok attempt={} ms={} speed={} post={:#010x} (enumerating)",
+            "xhci: port {}: reset-ok try={} ms={} speed_before={} speed_after={} pre={:#010x} post={:#010x} prc={} csc={} (enumerating)",
             port,
             attempts,
             ms,
+            speed_before_reset,
             speed,
-            cur
+            ctrl.diag[port as usize - 1].pre,
+            cur,
+            (pre & PORTSC_PRC != 0) as u8,
+            (pre & PORTSC_CSC != 0) as u8
         );
     } else {
         crate::info!(
-            "xhci: port {}: already enabled, adopting speed={} post={:#010x}",
+            "xhci: port {}: already enabled, adopting speed={} pre={:#010x} post={:#010x} prc={} (enumerating, no PR)",
             port,
             speed,
-            cur
+            pre,
+            cur,
+            (pre & PORTSC_PRC != 0) as u8
         );
     }
     sync_diag(ctrl, port);
@@ -1832,35 +1920,45 @@ fn port_failure(ctrl: &mut Controller, port: u8, reason: FailReason, raw: u32) {
     sync_diag(ctrl, port);
     let d = &ctrl.diag[port as usize - 1];
     let failures = d.policy.failures();
+    let try_count = d.policy.resets();
     let prc = d.policy.seen_prc();
+    let csc = d.policy.seen_csc();
     let ped = d.policy.seen_ped();
     let ped_u0 = d.policy.seen_ped_u0();
     let ped_sc = d.policy.ped_sc();
+    let pre = d.policy.pre();
     let post = d.policy.post();
+    let speed = port_speed(post);
     let ms = d.ms;
     let retry_ms = xhci_port::backoff_us(failures) / 1_000;
     // First few attempts and every 8th afterwards: enough for a field photo,
     // bounded so a permanently dead port cannot flood the serial log.
     if failures <= 3 || failures % 8 == 0 || was_last_fail {
         crate::warn!(
-            "xhci: port {}: {} ms={} prc={} ped={} ped_u0={} ped_sc={:#010x} post={:#010x} (attempt {}, retry in {} ms)",
+            "xhci: port {}: stage={} try={} ms={} pre={:#010x} post={:#010x} prc={} csc={} ped_seen={} ped_u0={} speed={} ped_sc={:#010x} (attempt {}, retry in {} ms)",
             port,
             stage,
+            try_count,
             ms,
+            pre,
+            post,
             prc as u8,
+            csc as u8,
             ped as u8,
             ped_u0 as u8,
+            speed,
             ped_sc,
-            post,
             failures,
             retry_ms
         );
     } else {
         crate::debug!(
-            "xhci: port {}: {} ms={} (attempt {})",
+            "xhci: port {}: stage={} try={} ms={} speed={} (attempt {})",
             port,
             stage,
+            try_count,
             ms,
+            speed,
             failures
         );
     }
@@ -1897,10 +1995,12 @@ fn port_speed(sc: u32) -> u8 {
 fn resume_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
     let off = portsc(port);
     let cur = rd32(ctrl.op, off);
+    // Linux xhci_set_link_state(): neutral value, PLS=U0 and LWS=1.
+    let neutral = port_state_to_neutral(cur) & !PORTSC_PLS_MASK;
     wr32(
         ctrl.op,
         off,
-        (cur & !PORTSC_RW1C & !PORTSC_PLS_MASK) | PORTSC_LWS | (PLS_U0 << PORTSC_PLS_SHIFT),
+        neutral | PORTSC_LWS | (PLS_U0 << PORTSC_PLS_SHIFT),
     );
     let clock = clock_ready();
     let start = if clock { now_us() } else { 0 };
@@ -1929,14 +2029,15 @@ fn resume_port(ctrl: &mut Controller, port: u8) -> Option<u8> {
     }
 }
 
-/// Take over an enabled port: acknowledge its change bits and record the speed.
+/// Take over an enabled port: acknowledge its change bits (neutral write, so
+/// PED=1 is never written back) and record the speed.
 fn adopt(ctrl: &mut Controller, port: u8, speed: u8, stage: &'static str, sc: u32) -> u8 {
     let off = portsc(port);
     let cur = rd32(ctrl.op, off);
     wr32(
         ctrl.op,
         off,
-        (cur & !PORTSC_RW1C) | PORTSC_PRC | PORTSC_WRC | PORTSC_CSC,
+        port_state_to_neutral(cur) | PORTSC_PRC | PORTSC_WRC | PORTSC_CSC,
     );
     let cur = rd32(ctrl.op, off);
     if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
@@ -2933,6 +3034,7 @@ fn restart_controller(ctrl: &mut Controller) -> bool {
         d.seen_ped_u0 = false;
         d.ped_sc = 0;
         d.ms = 0;
+        d.next_log_us = 0;
         d.policy = PortPolicy::new(d.proto == 3);
     }
     true

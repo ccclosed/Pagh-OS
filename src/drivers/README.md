@@ -19,7 +19,7 @@ framebuffer-консоль, VT-эмулятор, курсор, serial. Коор�
 | `tty.rs` | Управляющий терминал консоли: foreground process group (kernel-side, по умолчанию — группа shell) + `TOSTOP`, `TIOCGPGRP`/`TIOCSPGRP` через чистую модель `linux::tty`, `check_access(kind)` — фоновое чтение/запись JOB-процесса получает `SIGTTIN`/`SIGTTOU` на всю группу и `EINTR` (не-JOB'ы, т.е. служебные spawn'ы ядра, не останавливаются) |
 | `ps2_mouse.rs` | PS/2 мышь (IRQ12) через 8042 aux: IntelliMouse-негоциация (3 magic sample rate + id 3), 4-байтовые пакеты с колесом (Z в младшем ниббле 4-го байта), зажатые координаты + кнопки + `wheel` + `seq`; без колеса — 3-байтовый режим |
 | `scrollback.rs` | Чистое ядро скроллбека консоли: ring прокрученных строк (символы + цвет) и view-offset; `push`/`scroll`/`reset`/`view_row`, тесты в host-tests |
-| `xhci_port.rs` | Чистая (`core` только) политика корневого порта xHCI: «ждать или сбрасывать», debounce/training, окно PRC+PED/U0, стабильность, backoff, редкий PP power-cycle; включается в host-tests как есть |
+| `xhci_port.rs` | Чистая (`core` только) политика корневого порта xHCI по Linux `hub.c`/`xhci-hub.c`: neutral-запись PORTSC (PED/PR/WPR/change bits не пишутся обратно), `hub_port_debounce` (25 мс шаг, 100 мс стабильного CCS, 2 с бюджет), `hub_port_wait_reset` (10/200 мс, 800 мс на запись, 5 попыток), 100 мс power settle, стабильность PED+U0 200 мс, backoff ≥1 с, без PP power-cycle; включается в host-tests как есть |
 | `framebuffer.rs` | Limine framebuffer текстовая консоль + 2D-графика: шрифт Fira Code 8×18 (`assets/font8x18.bin` — 8-битное **покрытие** на пиксель, генерируется `tools/gen_font.py`), `FbWriter`, скролл + скроллбек (см. `scrollback.rs`), status bar, макросы `fb_print!` |
 | `vt.rs` | ANSI/VT-100 эмулятор поверх framebuffer (`Vt`: CSI/OSC/DCS, 256 цветов, scroll regions, ответы на запросы) — stdout compat-программ |
 | `cursor.rs` | Программный курсор мыши 12×19 (save/restore фона); `text_begin`/`text_end` для курсор-безопасного текста |
@@ -224,17 +224,19 @@ PRP-list страница. `rw_common` режет запрос на LBA-выро
     печатается `ms=` — сколько последняя попытка реально заняла.
 
   Логика порта — чистая политика `xhci_port.rs` (host-tests гоняют её против
-  симулированных портов, потому что QEMU порты включает мгновенно): порт в процессе
-  детекта (PLS=Polling/RxDetect) **не сбрасывается**, а получает 400 мс на
-  debounce/training; если он включает сам — adopt без единого PR. После PR/WPR
-  драйвер ждёт PRC и PED+U0 до 500 мс и **внутри этого окна не пишет второй reset**
-  (это и был цикл «PED появился и снова Polling»); PED+U0 должен продержаться 80 мс,
-  иначе потеря PED ведёт в backoff 250 мс → 1 с и повторное наблюдение, а не в новый
-  reset. PP power-cycle — только после 16 неудачных попыток и с 500 мс выключенного
-  питания. USB2 сбрасывается PR, USB3 — WPR; порт с PED=1 и PLS=U3 (состояние с фото
-  2.18.10 сразу после сброса) **возобновляется** записью PLS=U0|LWS, а не сбрасывается
-  ещё раз. Все ожидания — дедлайны, проверяемые по одному порту за `poll()`, поэтому
-  boot-меню не блокируется на секунды. `poll()` замечает halted
+  симулированных портов, потому что QEMU порты включает мгновенно), повторяющая
+  Linux `hub_port_debounce`/`hub_port_wait_reset`: подключение должно быть
+  неизменным 100 мс (шаг 25 мс, общий бюджет 2 с), после PP=1 — 100 мс power
+  settle; только затем первый reset. Reset (PR для USB2, WPR для USB3) пишется
+  на **neutral**-значении PORTSC и ждётся как у Linux: опрос 10 мс два раза,
+  затем 200 мс, 800 мс на запись, успех `!PR && CCS`, затем PED; нет PED —
+  повторная запись, всего до 5. PED+U0 должен продержаться 200 мс, после чего
+  change bits очищаются (`ClearPortFeature(C_PORT_RESET)`) и порт адресуется.
+  Потеря PED ведёт в паузу ≥1 с, свежий debounce и только потом новый reset.
+  PP power-cycle **удалён** (Linux его не делает); PP только поднимается с
+  readback и повтором, поэтому порт не остаётся обесточенным. Все ожидания —
+  дедлайны, проверяемые по одному порту за `poll()`, поэтому boot-меню не
+  блокируется на секунды. `poll()` замечает halted
   контроллер, запоминает `usbcmd/usbsts` и перезапускает его (HCRST + переустановка
   колец), так что halt больше не маскируется под «нет USB-устройства». Диагностика
   печатает **маски** портов и сырые записи extended capabilities. Строка
@@ -309,42 +311,62 @@ PRP-list страница. `rw_common` режет запрос на LBA-выро
   `SET_PROTOCOL(boot)` без warn, `HID device on port N: iface=... mode=boot`,
   `usb: key reports ..., mouse reports ...` и рост `mouse reports` при движении.
 
-  **2.22.7 — xHCI: порт в Polling больше не сбрасывается.** Следующее с той же
-  машины (Intel 8086:7a60, 26 портов, `attached=0x02000731` → порты 1, 5, 6, 9, 10,
-  11) показало, что HID-фикс пути не достигает: устройства детектируются
-  (`ccs=1`), но после reset порт не остаётся enabled:
-  `ped=0 pls=7 stage=lost-after-reset code=0x6e1 try=19 ms=124 ... prc=1
-  ped_seen=1 ped_sc=0x00200e03`, 0 HID. QEMU это не воспроизводит — его порты
-  включаются мгновенно. Причина была в таймингах (подтверждено кодом):
-  * `adopt_or_wake` ждал PED+U0 только 60 мс, а затем `reset_port` всё равно
-    писал PR — посреди USB2 debounce/training, обрывая attach-последовательность,
-    которую сам же и прервал; первая попытка имела бюджет reset 25 мс (потом
-    150 мс), а `port_enabled_stable` принимал U0 всего за 20 мс. Итог — сброс
-    каждые ~124 мс (`try=19 ms=124`), PED то появлялся, то терялся;
-  * PP дёргался каждые 4 попытки, добавляя порту возмущение вместо тишины;
-  * `ped_sc` во всех строках был одинаковым (`0x00200e03` = CCS+PED+PP+speed=3+
-    PRC). Это **не** shared/индексная ошибка диагностики: `PortDiag` всегда
-    был per-port (`diag[port-1]`), и значение — одинаковый для всех USB2-портов
-    reset-time transient. Теперь рядом печатается `ped_u0=`: 1 только если PED
-    наблюдался вместе с PLS=U0 и валидной скоростью; `ped_sc` — последний такой
-    снимок, а если настоящего enable не было — последний transient (per-port).
+  **2.22.7 — xHCI: порт больше не теряет enable, reset идёт по Linux hub.**
+  Две итерации по одной машине (Intel 8086:7a60, 26 портов,
+  `attached=0x02000731` → порты 1, 5, 6, 9, 10, 11, 0 HID). Первая убрала
+  reset-шторм каждые ~124 мс (`try=19 ms=124`) политикой «не сбрасывать
+  детектящийся порт», но следующее фото показало power-cycle после 16 неудач,
+  все порты с `pp=0 ccs=0` и PED+U0 лишь на мгновение:
+  `stage=power-cycle try=16 ms=159 pre=0x6e1 post=0x6e1 prc=1 ped_seen=1
+  ped_u0=1 ped_sc=0x00200603`, speed=1 (FS) вместо Linux 3 (HS). Причин две,
+  и обе — в записи PORTSC:
+  * запись «сохранить регистр, погасить change bits» сохраняла **PED** (бит 1),
+    а это write-1-to-**disable**: очистка PRC/CSC на только что включённом
+    порту выключала его сама, и следующий read давал ровно `post=0x6e1`
+    (Polling, PED=0). Так же сохранялись PR/WPR — reset мог писаться повторно;
+  * PP power-cycle при неудачах мог оставить порт обесточенным (`pp=0`), а
+    20 мс settle меньше USB2-бюджета power/debounce.
 
-  Исправление — state machine как у Linux hub, вынесенная в чистый
-  `xhci_port.rs` и покрытая host-свойствами `xhci_port`: порт в Polling/RxDetect
-  получает 400 мс на детект/training и **не сбрасывается в этом окне**; reset
-  (PR для USB2, WPR для USB3) ожидается до 500 мс по PRC+PED+U0 без повторных
-  reset'ов внутри окна; enable должен продержаться 80 мс; потеря PED ведёт в
-  backoff 250 мс → 500 мс → 1 с и затем в повторное наблюдение (свежие 400 мс)
-  до нового reset; PP power-cycle — только после 16 неудач (PP off 500 мс, затем
-  свежий debounce). Один порт за `poll()`, никаких блокирующих секунд: дедлайны
-  проверяются между опросами, boot-меню продолжает считать. Serial-строки для
-  проверки на железе: `xhci: port N: reset #K issued (...)`, `port N: reset-ok
-  attempt=... ms=... post=...`, `lost-after-reset`/`reset-no-prc`/`no-power`
-  с `prc=/ped=/ped_u0=/ped_sc=/post=`, затем `HID device on port N: ...` и
-  `usb: key reports ...`. В строчке boot-меню смотреть `stage=hid-ready`,
-  `ped=1`, `ped_u0=1` и `try=` (не должен расти каждые 100 мс). Проверено
+  Теперь все записи PORTSC идут через `port_state_to_neutral()` — копию Linux
+  `xhci_port_state_to_neutral()`: сохраняются только RO-биты (CCS, speed) и
+  RWS-биты (PLS, PP), а PED/PR/WPR/LWS/change-bits всегда пишутся нулём, нужное
+  действие добавляется одним битом. Reset — `neutral | PR` (USB2) или
+  `neutral | WPR` (USB3), **без** очистки change bits в той же записи. Тайминги
+  взяты у Linux, а не придуманы (`hub.c`/`xhci-hub.c`):
+  * debounce подключения — `hub_port_debounce`: шаг 25 мс, 100 мс неизменного
+    CCS, бюджет 2 с; только после этого первый reset (не «прошло N мс»);
+  * после PP=1 — 100 мс power settle + те же 100 мс debounce (USB 2.0
+    §7.1.7.1; у Linux root hub `bPwrOn2PwrGood=10` = 20 мс, а 100 мс — нижняя
+    граница power settling для не-root hub'ов; здесь консервативная сумма);
+  * reset ждётся как `hub_port_wait_reset`: опрос через 10 мс два раза, затем
+    200 мс, таймаут 800 мс на запись; успех — `!PR && CCS`, затем PED; нет
+    PED — `-EBUSY` и повторная запись, всего до 5 (`PORT_RESET_TRIES`);
+  * PED+U0 должен продержаться 200 мс, только потом адресация; change bits
+    (PRC/WRC/CSC) очищаются после устойчивого enable, перед адресацией
+    (Linux `ClearPortFeature(C_PORT_RESET)`);
+  * после потери PED — пауза ≥1 с, затем свежий debounce и только потом новый
+    reset; USB2 — PR, USB3 — WPR; порт с PED=1 и PLS=U3 **возобновляется**
+    записью PLS=U0|LWS;
+  * PP power-cycle **удалён**: Linux для корневого порта его не делает; PP
+    только поднимается (readback + 3 попытки), а если не поднялся — повторяется
+    после backoff, так что порт не остаётся обесточенным.
+
+  Диагностика: строка отказа теперь `stage=... try=... ms=... pre=... post=...
+  prc=... csc=... ped_seen=... ped_u0=... speed=... ped_sc=...`;
+  attached-порт во время debounce печатает `observe ccs=... ped=... pp=...
+  pls=... speed=... csc=... prc=... pr=... state=... debounce_total=...ms
+  stable=...ms` раз в ~200 мс (аналог Linux `debounce total ... stable ...
+  status`); reset-строка несёт `try=K/5` и `debounce_total/stable`. Serial-строки
+  для железа: `xhci: port N: reset #K issued (... try=1/5 ...)`, `port N:
+  observe ... stable=100ms`, `port N: reset-ok try=... ms=... speed_before=...
+  speed_after=...`, `stage=...` с `ped_u0=1`, затем `HID device on port N: ...`
+  и `usb: key reports ...`. На что смотреть: если `speed_after=1`, но
+  `ped_u0=1` и HID появился — FS допустим (HID работает и на FS); если PED
+  теряется сразу после `observe ... stable=100ms` — смотреть `pre/post`
+  (PRC/CSC) и не растёт ли `try=` чаще, чем раз в несколько секунд. Проверено
   QEMU: `tools/e2e.py usb` (клавиатура + мышь, меню, shell, PS/2), `selftest`,
-  host-свойства; **на реальном железе не проверено — нужен тест пользователя.**
+  host-свойства `xhci_port`; **на реальном железе не проверено — нужен тест
+  пользователя.**
 
 - **Разделы.** `partition.rs` разбирает GPT (заголовок LBA 1, массив записей) и,
   как запасной вариант, MBR, и публикует каждый раздел отдельным блочным
