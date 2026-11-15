@@ -21,11 +21,60 @@ use crate::vfs::VfsNode;
 use super::fd_alloc::FdSlots;
 
 const PIPE_CAPACITY: usize = 64 * 1024;
+
+/// Переданный через `SCM_RIGHTS` дескриптор: dup объекта и его `f_flags`.
+///
+/// Linux `dup`/`SCM_RIGHTS` сохраняют режим доступа (`f_flags`): принятый
+/// memfd должен остаться writable, если отправитель открыл его на запись, —
+/// иначе `mmap(MAP_SHARED, PROT_WRITE)` получателя отвечал бы `EACCES`.
+/// `FD_CLOEXEC` сюда не входит: он появляется только по `MSG_CMSG_CLOEXEC`.
+pub struct PassedFd {
+    pub object: OpenObject,
+    pub flags: u64,
+}
+
+/// `SCM_RIGHTS`, привязанный к позиции байтового потока AF_UNIX.
+///
+/// `pos`/`end` — абсолютные (с начала потока) позиции первого байта и конца
+/// чанка `sendmsg`, вместе с которым пришли `objects`. Linux доставляет
+/// ancillary data с первым байтом записи и не даёт одному `recvmsg` перейти
+/// границу этой записи, поэтому приём останавливается на `end`: дескрипторы
+/// приходят ровно один раз и не «уезжают» в середину следующего сообщения.
+pub struct StreamCmsg {
+    /// Абсолютная позиция первого байта sendmsg.
+    pub pos: u64,
+    /// Абсолютная позиция сразу за чанком sendmsg (граница чтения).
+    pub end: u64,
+    /// dup'ы переданных дескрипторов; закрываются, когда cmsg отброшен,
+    /// доставлен получателю или сокет уничтожен.
+    pub objects: Vec<PassedFd>,
+}
+
 struct PipeState {
     bytes: VecDeque<u8>,
     readers: usize,
     writers: usize,
+    /// Сколько байт всего записано в очередь (абсолютная позиция конца).
+    written_total: u64,
+    /// Сколько байт всего прочитано (абсолютная позиция начала доступного).
+    read_total: u64,
+    /// Ждущие `SCM_RIGHTS`; строго возрастают по `pos`, все `pos >= read_total`.
+    cmsgs: VecDeque<StreamCmsg>,
 }
+
+impl PipeState {
+    fn new() -> Self {
+        Self {
+            bytes: VecDeque::new(),
+            readers: 1,
+            writers: 1,
+            written_total: 0,
+            read_total: 0,
+            cmsgs: VecDeque::new(),
+        }
+    }
+}
+
 pub struct PipeEndpoint {
     state: Arc<Spinlock<PipeState>>,
     read_end: bool,
@@ -41,6 +90,19 @@ pub enum PipeWriteResult {
     WouldBlock,
     Broken,
 }
+
+/// Результат `recvmsg`-чтения: байты и забранный cmsg (если он пришёлся на
+/// это чтение). `objects` непусто, только когда поток достиг позиции cmsg.
+pub struct ScmRead {
+    pub n: usize,
+    pub objects: Vec<PassedFd>,
+}
+
+pub enum ScmReadResult {
+    Data(ScmRead),
+    WouldBlock,
+    Eof,
+}
 impl PipeEndpoint {
     pub fn nonblocking(&self) -> bool {
         self.nonblocking
@@ -52,12 +114,111 @@ impl PipeEndpoint {
             for b in dst.iter_mut().take(n) {
                 *b = s.bytes.pop_front().unwrap();
             }
+            s.read_total += n as u64;
+            // `read(2)`/`readv(2)` не принимают ancillary data: Linux при
+            // проходе мимо позиции SCM_RIGHTS отбрасывает (закрывает) fd.
+            // Забираем записи из-под лока и отпускаем после него: Drop объекта
+            // может отпускать Arc-сокеты и брать лок их очереди.
+            let mut skipped: Vec<StreamCmsg> = Vec::new();
+            while let Some(front) = s.cmsgs.front() {
+                if front.pos < s.read_total {
+                    skipped.push(s.cmsgs.pop_front().unwrap());
+                } else {
+                    break;
+                }
+            }
+            drop(s);
+            drop(skipped);
             PipeReadResult::Data(n)
         } else if s.writers == 0 {
             PipeReadResult::Eof
         } else {
             PipeReadResult::WouldBlock
         }
+    }
+
+    /// Записать первые байты `sendmsg` и атомарно привязать к их позиции
+    /// дескрипторы `objects` (одна блокировка: позиция и cmsg не разъедутся).
+    ///
+    /// `objects` снимаются только при успешной записи: на `WouldBlock`/`Broken`
+    /// они остаются у вызывающего, который обязан либо повторить, либо закрыть
+    /// их сам (не переданный fd не должен исчезать у отправителя). Пустой
+    /// `objects` (`Some(empty)`) — обычная запись без cmsg.
+    pub fn write_scm(&self, src: &[u8], objects: &mut Option<Vec<PassedFd>>) -> PipeWriteResult {
+        let mut s = self.state.lock();
+        if s.readers == 0 {
+            return PipeWriteResult::Broken;
+        }
+        if src.is_empty() {
+            return PipeWriteResult::Data(0);
+        }
+        let room = PIPE_CAPACITY.saturating_sub(s.bytes.len());
+        if room == 0 {
+            return PipeWriteResult::WouldBlock;
+        }
+        let n = core::cmp::min(room, src.len());
+        let pos = s.written_total;
+        s.bytes.extend(src[..n].iter().copied());
+        s.written_total += n as u64;
+        if let Some(objs) = objects.take() {
+            if !objs.is_empty() {
+                s.cmsgs.push_back(StreamCmsg {
+                    pos,
+                    end: pos + n as u64,
+                    objects: objs,
+                });
+            }
+        }
+        PipeWriteResult::Data(n)
+    }
+
+    /// `recvmsg`-чтение: те же байты, что `read`, но с доставкой стоящего на
+    /// текущей позиции SCM_RIGHTS и остановкой на границе его чанка.
+    ///
+    /// Границы (повторяют Linux): данные перед cmsg читаются обычным
+    /// `recvmsg`-вызовом; как только чтение входит в чанк с cmsg, cmsg
+    /// забирается, а вызов не идёт дальше `end` этого чанка; cmsg, позицию
+    /// которого прошёл обычный `read(2)`, уже отброшен [`Self::read`].
+    pub fn read_scm(&self, dst: &mut [u8]) -> ScmReadResult {
+        let mut s = self.state.lock();
+        if s.bytes.is_empty() {
+            return if s.writers == 0 {
+                ScmReadResult::Eof
+            } else {
+                ScmReadResult::WouldBlock
+            };
+        }
+        // Инвариант: read() отбрасывает пройденные cmsg. Защитно повторяем,
+        // забирая записи из-под лока.
+        let mut skipped: Vec<StreamCmsg> = Vec::new();
+        while let Some(front) = s.cmsgs.front() {
+            if front.pos < s.read_total {
+                skipped.push(s.cmsgs.pop_front().unwrap());
+            } else {
+                break;
+            }
+        }
+        let avail = s.bytes.len() as u64;
+        let mut take = core::cmp::min(dst.len() as u64, avail);
+        let mut objects: Vec<PassedFd> = Vec::new();
+        if let Some(front) = s.cmsgs.front() {
+            let rel = front.pos - s.read_total;
+            if take > rel {
+                // Чтение вошло в чанк с cmsg: доставить его и остановиться на
+                // границе чанка (или на конце буфера вызывающего).
+                let end_rel = front.end.saturating_sub(s.read_total);
+                take = core::cmp::min(take, end_rel.max(rel + 1));
+                objects = s.cmsgs.pop_front().map(|c| c.objects).unwrap_or_default();
+            }
+        }
+        let n = take as usize;
+        for b in dst.iter_mut().take(n) {
+            *b = s.bytes.pop_front().unwrap();
+        }
+        s.read_total += n as u64;
+        drop(s);
+        drop(skipped);
+        ScmReadResult::Data(ScmRead { n, objects })
     }
     pub fn write(&self, src: &[u8]) -> PipeWriteResult {
         let mut s = self.state.lock();
@@ -453,11 +614,7 @@ impl FdTable {
     }
 
     pub fn pipe(&mut self, nonblocking: bool) -> Result<(u32, u32), Errno> {
-        let state = Arc::new(Spinlock::new(PipeState {
-            bytes: VecDeque::new(),
-            readers: 1,
-            writers: 1,
-        }));
+        let state = Arc::new(Spinlock::new(PipeState::new()));
         let r = Arc::new(PipeEndpoint {
             state: Arc::clone(&state),
             read_end: true,
@@ -608,16 +765,8 @@ impl FdTable {
     /// поэтому ОБА fd читаемы и записываемы (в отличие от pipe). Закрытие одного
     /// конца даёт партнёру EOF на чтении и EPIPE на записи.
     pub fn socketpair(&mut self, nonblocking: bool) -> Result<(u32, u32), Errno> {
-        let q_ab = Arc::new(Spinlock::new(PipeState {
-            bytes: VecDeque::new(),
-            readers: 1,
-            writers: 1,
-        }));
-        let q_ba = Arc::new(Spinlock::new(PipeState {
-            bytes: VecDeque::new(),
-            readers: 1,
-            writers: 1,
-        }));
+        let q_ab = Arc::new(Spinlock::new(PipeState::new()));
+        let q_ba = Arc::new(Spinlock::new(PipeState::new()));
         let a = OpenObject::Socket {
             rx: Arc::new(PipeEndpoint {
                 state: Arc::clone(&q_ba),
@@ -702,16 +851,8 @@ pub fn socket_pair_endpoints(
     (Arc<PipeEndpoint>, Arc<PipeEndpoint>),
     (Arc<PipeEndpoint>, Arc<PipeEndpoint>),
 ) {
-    let q_cs = Arc::new(Spinlock::new(PipeState {
-        bytes: VecDeque::new(),
-        readers: 1,
-        writers: 1,
-    }));
-    let q_sc = Arc::new(Spinlock::new(PipeState {
-        bytes: VecDeque::new(),
-        readers: 1,
-        writers: 1,
-    }));
+    let q_cs = Arc::new(Spinlock::new(PipeState::new()));
+    let q_sc = Arc::new(Spinlock::new(PipeState::new()));
     let client = (
         Arc::new(PipeEndpoint {
             state: Arc::clone(&q_sc),

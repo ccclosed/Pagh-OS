@@ -1,34 +1,39 @@
 <!--
-Thanks for contributing to pagh! Please fill out the sections below.
-See CONTRIBUTING.en.md (or CONTRIBUTING.md for Russian) for the full guidelines.
+Спасибо за PR! Заполните разделы ниже; для крупных изменений сначала issue.
+См. CONTRIBUTING.md — процесс, ветки и релизы.
 -->
 
-## Summary
+## Что меняется и зачем
 
-<!-- What does this PR change, and why? -->
+<!-- Кратко: проблема, решение, затронутые компоненты. -->
 
-## Related issue
+## Связанный issue
 
-<!-- e.g. Closes #123 -->
+<!-- Closes #123 / Refs #123 -->
 
-## How it was tested
+## Как проверено
 
-<!-- Pick what applies and add details -->
-- [ ] `host-tests` (`cd host-tests && cargo test`)
-- [ ] In-QEMU `selftest` (P1–P27, no `FAIL`)
-- [ ] Manual QEMU run
+- [ ] `cargo fmt --all -- --check`
+- [ ] `python3 tools/build.py build` (debug + link)
+- [ ] `python3 tools/build.py build --release` (release + link)
+- [ ] `python3 tools/host_tests.py`
+- [ ] `python3 tools/check_safety.py`
+- [ ] `python3 tools/check_agents_md.py`
+- [ ] in-QEMU `selftest` без `FAIL` (если менялось ядро)
+- [ ] `tools/e2e.py <mode>` для затронутого сценария (если применимо)
+- [ ] ручной прогон / реальное железо (если применимо)
 
-<!-- For behavior changes, paste before/after: serial output, framebuffer screenshot, etc. -->
+<!-- Для изменений поведения: before/after serial, скриншот framebuffer, e2e-вывод. -->
 
-## Checklist
+## Риски и совместимость
 
-- [ ] `run.cmd build` (debug) passes with no errors and no warnings
-- [ ] `cargo fmt --all` and `cargo clippy` are clean
-- [ ] `cd host-tests && cargo test` is green (if portable logic was touched)
-- [ ] `selftest` in QEMU passes with no `FAIL` (if kernel code was touched)
-- [ ] Build invariants are preserved (`#![no_std]`, `panic = abort`, custom target,
-      `.requests` section, higher-half address, forced frame pointers)
-- [ ] New `unsafe` is annotated with `// SAFETY:`
-- [ ] Docs (`README.md`, comments) updated if behavior changed
-- [ ] No stray/generated files in the diff (`target/`, `iso_root/`, `PAGH.elf`,
-      `disk.img`, `OVMF.fd`, `limine-12.3.1/`, logs, IDE folders)
+<!-- Ломает ли API/ABI/формат данных? Нужна ли миграция? Влияние на security-модель? -->
+
+## Чек-лист
+
+- [ ] PR направлен в `dev` (hotfix в `main` — только critical/high verified security или release-blocking regression).
+- [ ] Build invariants сохранены (`#![no_std]`, `panic = abort`, custom target, higher-half, frame pointers, host-tests isolation).
+- [ ] Новый `unsafe` имеет `// SAFETY:` и проходит `check_safety`.
+- [ ] Документация/комментарии обновлены, если изменилось поведение.
+- [ ] Нет случайных файлов (`target/`, `iso_root/`, `disk.img`, `PAGH.elf`, логи, IDE).
+- [ ] Нет секретов/токенов/приватных ключей в диффе.

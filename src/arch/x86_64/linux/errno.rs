@@ -39,6 +39,10 @@ pub enum Errno {
     EAFNOSUPPORT = 97,
     /// Сеть недостижима.
     ENETUNREACH = 101,
+    /// Нет буфера под буферы сокета/ancillary data (Linux `ENOBUFS`).
+    /// В этом ядре — отказ `sendmsg`/`recvmsg` на `msg_controllen` больше
+    /// поддерживаемого предела (Linux отвечает так же при `> INT_MAX`).
+    ENOBUFS = 105,
     /// Соединение уже устанавливается (неблокирующий connect).
     EINPROGRESS = 115,
     /// Транспортный конец не подключён.
