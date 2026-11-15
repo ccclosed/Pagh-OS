@@ -97,6 +97,7 @@ pub enum Key {
     PageUp,
     PageDown,
     F4,
+    F5,
     /// Печатный символ (приходит из раскладки композитора).
     Char(char),
 }
@@ -119,7 +120,10 @@ impl Key {
             Key::PageUp => 104,
             Key::PageDown => 109,
             Key::F4 => 62,
-            Key::Char(ch) => 0x1000_0000 | ch as u32,
+            Key::F5 => 63,
+            // Печатные символы не ходят по проводу: PDP/1 передаёт только
+            // evdev-код, текст восстанавливает клиент.
+            Key::Char(_) => 0,
         }
     }
 
@@ -139,7 +143,7 @@ impl Key {
             104 => Some(Key::PageUp),
             109 => Some(Key::PageDown),
             62 => Some(Key::F4),
-            code if code & 0x1000_0000 != 0 => char::from_u32(code & 0x0FFF_FFFF).map(Key::Char),
+            63 => Some(Key::F5),
             _ => None,
         }
     }
@@ -220,10 +224,12 @@ mod tests {
             Key::PageUp,
             Key::PageDown,
             Key::F4,
-            Key::Char('ё'),
+            Key::F5,
         ] {
             assert_eq!(Key::from_protocol(key.protocol_code()), Some(key));
         }
+        // Печатные символы по проводу не передаются.
+        assert_eq!(Key::from_protocol(Key::Char('ё').protocol_code()), None);
     }
 
     #[test]

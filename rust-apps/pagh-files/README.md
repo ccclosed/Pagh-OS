@@ -1,12 +1,21 @@
 # Files — файловый менеджер Pagh
 
 Приложение рабочего стола Pagh (вариант B: userspace-композитор, клиент —
-статически собранный musl-бинарник). Окно рисуется целиком внутри приложения:
-заголовок с кнопками `v`/`^`/`x`, панель инструментов, боковая панель, сетка
-значков или подробный список, строка состояния. Композитору остаётся только
-скомпоновать готовый кадр.
+статически собранный musl-бинарник). Files рисует **только клиентскую область**:
+панель инструментов, боковую панель, сетку значков/подробный список и строку
+состояния. Заголовок окна, кнопки `v`/`^`/`x`, рамку, панель, размещение, фокус
+и drag/resize рисует композитор `pagh-desktop`; связь — по протоколу **PDP/1**
+(см. [`../pagh-desktop/PROTOCOL.md`](../pagh-desktop/PROTOCOL.md) и клиентскую
+часть в [`../pagh-ui/PROTOCOL.md`](../pagh-ui/PROTOCOL.md)).
 
-![Главное окно](screenshots/files-main.png)
+![Главное окно в настоящем композиторе](screenshots/files-under-pagh-desktop.png)
+
+Кадр выше снят **самим композитором** (`pagh-desktop`, headless): окно Files
+подключилось по PDP/1, а окно `PaghTerm` слева открыто через `launch (type 13)` —
+пункт «Открыть терминал в этой папке» (Alt+Shift+F4). Оформление окон — работа
+композитора, не приложения.
+
+![Главное окно (демо-рендер клиентской области)](screenshots/files-main.png)
 
 ## Что умеет
 
@@ -28,8 +37,10 @@
 - **«Свойства»** (Alt+Return) — модальный диалог с именем, типом, размером,
   датой, правами и путём.
 - **«Открыть терминал в этой папке»** (Alt+Shift+F4) возвращает
-  `Command::OpenTerminal { path }` — запуском терминала занимается композитор/
-  лаунчер, приложение не форкает процессы само.
+  `Command::LaunchTerminal { path }`; главный цикл отправляет композитору PDP/1
+  `launch (type 13)` с `app="terminal"` и `cwd`. Запуском занимается композитор
+  (`ServerOptions.launch_targets` / `--launch-target`), приложение не форкает
+  процессы само.
 - Копирование/вставка (Ctrl+C / Ctrl+V), удаление (Delete), создание копий
   с именами `имя (копия).расширение`, навигация стрелками, F5 — обновить.
 
@@ -42,16 +53,19 @@
 
 | Сцена | Файл |
 |-------|------|
-| Главное окно, домашняя папка | `screenshots/files-main.png` |
+| Files в настоящем `pagh-desktop` (PDP/1 + launch терминала) | `screenshots/files-under-pagh-desktop.png` |
+| Главное окно, домашняя папка (демо-рендер клиентской области с заголовком композитора) | `screenshots/files-main.png` |
 | Контекстное меню и подменю «Создать» | `screenshots/files-context-menu.png` |
 | Свойства файла | `screenshots/files-properties.png` |
 | Подробный список | `screenshots/files-list-view.png` |
 | Поиск по папке | `screenshots/files-search.png` |
 | Пустая папка | `screenshots/files-empty.png` |
 
-Все сцены детерминированы: фейковая ФС, встроенный шрифт, целочисленный
+Демо-сцены детерминированы: фейковая ФС, встроенный шрифт, целочисленный
 рендер. Их проверяют screenshot-тесты (хеш FNV-1a), а PNG пишутся тем же
-кодом, что и в демо.
+кодом, что и в демо. В демо-кадрах заголовок окна дорисовывает демо-обвязка
+(`pagh_ui::chrome`) как это сделал бы композитор — сам Files его не рисует;
+кадр `files-under-pagh-desktop.png` снят настоящим композитором.
 
 ## Архитектура
 
@@ -66,23 +80,25 @@
 | `screenshots` | демо-сцены для PNG и golden-тестов |
 
 События приходят из `pagh_ui::event` (от композитора или из тестов), команды
-возвращаются наружу:
+возвращаются наружу. Главный цикл `pagh-files` подключается к `pagh-desktop`
+по PDP/1, создаёт окно (`create`), шлёт кадры (`commit`), обрабатывает
+`configure` (resize/maximize/restore), `input`, `focus` и `close` (завершение),
+а `Command::LaunchTerminal` переводит в `launch (type 13)`:
 
 ```rust
 use pagh_files::{Command, FilesApp, FakeVfs};
 use pagh_ui::event::{Event, MouseButton};
 use pagh_ui::geom::Size;
 
-let mut app = FilesApp::new(Box::new(FakeVfs::concept()), Size::new(1060, 640));
+let mut app = FilesApp::new(Box::new(FakeVfs::concept()), Size::new(1000, 600));
 for command in app.handle_event(&Event::MouseDown {
     pos: pagh_ui::Point::new(400, 300),
     button: MouseButton::Right,
 }) {
     match command {
-        Command::OpenTerminal { path } => println!("терминал: {path}"),
+        Command::LaunchTerminal { path } => println!("launch terminal в {path}"),
         Command::OpenPath { path } => println!("открыть: {path}"),
         Command::Quit => break,
-        Command::Minimize | Command::Maximize => {}
     }
 }
 let mut canvas = pagh_ui::Canvas::filled(1060, 640, app.theme.palette.desktop);
@@ -100,27 +116,38 @@ cargo run -- --shot files-main     # только одна сцена
 cargo build --release --target x86_64-unknown-linux-musl   # статический бинарник
 ```
 
-Окно в живом композиторе (когда композитор из `rust-apps/pagh-desktop` готов):
+Окно в живом композиторе:
 
-```text
-pagh-files --connect /run/pagh-desktop.sock --path /home/user
+```bash
+# терминал 1: композитор (headless, кадры в PNG)
+cargo run --manifest-path ../pagh-desktop/Cargo.toml --bin pagh-desktop -- \
+    --socket /tmp/pagh-desktop.sock --screenshot-dir /tmp/frames
+
+# терминал 2: Files, клиентская область 1000x600
+cargo run -- --connect /tmp/pagh-desktop.sock --path /home/user --size 1000x600
 ```
 
-Кадр отправляется по протоколу PGUI v1 (`pagh_ui::protocol`, описание —
-[`../pagh-ui/PROTOCOL.md`](../pagh-ui/PROTOCOL.md)): `hello` → `welcome`,
-`create_window`, `commit_frame`, `input`. Приложение перерисовывает окно
-только после событий.
+Протокол — PDP/1: `hello` → `welcome`, `create`, `commit` (полный кадр
+XRGB8888/RGB565), `configure`/`input`/`focus`, `close`, `launch`. Приложение
+перерисовывает кадр только после событий.
+
+Сквозной тест `tests/pdp_e2e.rs` поднимает настоящий `pagh-desktop` (как
+библиотеку), запускает настоящий бинарник `pagh-files`, шлёт клавиатурный ввод,
+проверяет `launch` (заглушка или настоящий `pagh-terminal` через
+`PAGH_TERMINAL_BIN`), закрывает окно композитором и проверяет завершение
+клиента. С `PAGH_E2E_SHOTS=DIR` он сохраняет кадры композитора для отчёта/PR.
 
 ## Ограничения
 
-- Композитора ещё нет в дереве: headless-демо и тесты полные, канал
-  `--connect` компилируется и покрыт unit-тестом транспорта в `pagh-ui`, но
-  против настоящего сервера не проверялся.
-- «Открыть терминал» и двойной клик по файлу — только команды наружу; запуск
-  приложений появится вместе с протоколом запуска у композитора.
+- «Открыть терминал» работает через `launch` композитора; двойной клик по файлу
+  пока только печатает `OpenPath` — протокола запуска конкретного файла нет.
 - Буфер обмена локальный (путь элемента внутри Files), системного буфера нет.
 - Нет drag-and-drop, переименования на месте, вкладок, предпросмотра.
 - Сетка и список прокручиваются колесом/клавишами; полосу прокрутки можно
   тянуть только программно (виджета scrollbar пока нет).
+- Ввод текста — US-раскладка (PDP/1 передаёт evdev-коды без текста); кириллицу
+  в поля ввода набрать нельзя.
 - `HostVfs` не делает chroot и не различает точки монтирования — список
   «УСТРОЙСТВА» статический.
+- Оформление окна полностью на композиторе: собственного заголовка у Files нет,
+  поэтому в headless-демо он дорисовывается демо-обвязкой.

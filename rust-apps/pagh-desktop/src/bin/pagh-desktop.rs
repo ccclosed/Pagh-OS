@@ -6,7 +6,7 @@
 //! ```
 
 use pagh_desktop::demo;
-use pagh_desktop::server::{Server, ServerOptions};
+use pagh_desktop::server::{LaunchTarget, Server, ServerOptions};
 use std::env;
 use std::io;
 use std::path::PathBuf;
@@ -39,6 +39,10 @@ fn run() -> io::Result<()> {
             "--spawn-demo" => options.spawn_demo = true,
             "--demo-binary" => {
                 options.demo_binary = Some(PathBuf::from(value(&mut args, "--demo-binary")?))
+            }
+            "--launch-target" => {
+                let spec = value(&mut args, "--launch-target")?;
+                options.launch_targets.push(parse_launch_target(&spec)?);
             }
             "--clock" => {
                 let value = value(&mut args, "--clock")?;
@@ -84,6 +88,33 @@ fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> io::Result<Stri
     })
 }
 
+fn parse_launch_target(spec: &str) -> io::Result<LaunchTarget> {
+    let (app, command) = spec.split_once('=').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--launch-target ожидает APP=PROGRAM[|ARG…]",
+        )
+    })?;
+    if app.is_empty() || app.len() > 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--launch-target: пустой или слишком длинный app id",
+        ));
+    }
+    let tokens: Vec<String> = command
+        .split('|')
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_string())
+        .collect();
+    if tokens.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--launch-target: пустая команда",
+        ));
+    }
+    Ok(LaunchTarget::new(app, tokens))
+}
+
 fn parse_u32(value: String, flag: &str) -> io::Result<u32> {
     value.parse().map_err(|_| {
         io::Error::new(
@@ -110,10 +141,15 @@ fn print_help() {
            pagh-desktop [--socket PATH] [--width N] [--height N]\n\
                         [--screenshot-dir DIR] [--max-frames N]\n\
                         [--spawn-demo] [--demo-binary PATH]\n\
+                        [--launch-target APP=PROGRAM[|ARG…]]\n\
                         [--clock now|fixed] [--quiet]\n\
          \n\
          По умолчанию: /tmp/pagh-desktop.sock, 1280x720, часы 23:38 / 15.11.2026,\n\
          headless-backend (PNG только при --screenshot-dir).\n\
+         \n\
+         --launch-target задаёт приложение для PDP/1 launch (type 13):\n\
+           --launch-target 'terminal=/usr/bin/pagh-terminal|--socket|{{socket}}'\n\
+         Токен {{socket}} заменяется путём сокета; без него добавится --connect.\n\
          Протокол: PROTOCOL.md; демо-клиент: pagh-desktop-demo."
     );
 }

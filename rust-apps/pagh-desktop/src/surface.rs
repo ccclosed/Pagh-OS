@@ -312,7 +312,7 @@ mod tests {
             })
         );
         assert_eq!(
-            Surface::from_wire(10, 10, 10, 1, &vec![0; 100]),
+            Surface::from_wire(10, 10, 10, 1, &[0; 100]),
             Err(SurfaceError::StrideTooSmall {
                 stride: 10,
                 minimum: 40

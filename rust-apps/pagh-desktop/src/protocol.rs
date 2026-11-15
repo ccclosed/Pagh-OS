@@ -37,6 +37,8 @@ pub const TYPE_DAMAGE: u16 = 9;
 pub const TYPE_ERROR: u16 = 10;
 pub const TYPE_PING: u16 = 11;
 pub const TYPE_PONG: u16 = 12;
+/// Расширение PDP/1: просьба клиента запустить приложение (launch).
+pub const TYPE_LAUNCH: u16 = 13;
 
 /// Флаги `configure`.
 pub const CONFIGURE_FOCUSED: u32 = 1 << 0;
@@ -92,7 +94,14 @@ pub mod key {
     pub const LEFT_CTRL: u32 = 29;
     pub const LEFT_SHIFT: u32 = 42;
     pub const LEFT_ALT: u32 = 56;
+    pub const F4: u32 = 62;
+    pub const F5: u32 = 63;
     pub const F10: u32 = 68;
+    pub const HOME: u32 = 102;
+    pub const PAGEUP: u32 = 104;
+    pub const END: u32 = 107;
+    pub const PAGEDOWN: u32 = 109;
+    pub const SPACE: u32 = 57;
     pub const UP: u32 = 103;
     pub const LEFT: u32 = 105;
     pub const RIGHT: u32 = 106;
@@ -206,6 +215,13 @@ pub enum Message {
     Ping { nonce: u32 },
     /// Ответ на ping.
     Pong { nonce: u32 },
+    /// c→s: открыть известное композитору приложение `app` в каталоге `cwd`.
+    ///
+    /// Идентификаторы задаёт сервер через `ServerOptions.launch_targets`
+    /// (`"terminal"`, `"files"`, …); `cwd` — подсказка приложениям с рабочим
+    /// каталогом (может быть пустой). Успех не подтверждается отдельным
+    /// сообщением, ошибка приходит как [`Message::Error`].
+    Launch { app: String, cwd: String },
 }
 
 impl Message {
@@ -223,6 +239,7 @@ impl Message {
             Self::Error { .. } => TYPE_ERROR,
             Self::Ping { .. } => TYPE_PING,
             Self::Pong { .. } => TYPE_PONG,
+            Self::Launch { .. } => TYPE_LAUNCH,
         }
     }
 
@@ -240,6 +257,7 @@ impl Message {
             Self::Error { .. } => "error",
             Self::Ping { .. } => "ping",
             Self::Pong { .. } => "pong",
+            Self::Launch { .. } => "launch",
         }
     }
 
@@ -412,6 +430,10 @@ impl Message {
                 e.string(message);
             }
             Self::Ping { nonce } | Self::Pong { nonce } => e.u32(*nonce),
+            Self::Launch { app, cwd } => {
+                e.string(app);
+                e.string(cwd);
+            }
         }
         e.into_inner()
     }
@@ -540,6 +562,10 @@ impl Message {
             },
             TYPE_PING => Self::Ping { nonce: d.u32()? },
             TYPE_PONG => Self::Pong { nonce: d.u32()? },
+            TYPE_LAUNCH => Self::Launch {
+                app: d.string()?,
+                cwd: d.string()?,
+            },
             other => return Err(ProtocolError::UnknownType(other)),
         };
         d.finish()?;

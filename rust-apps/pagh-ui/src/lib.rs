@@ -3,9 +3,11 @@
 //! Клиентский UI-тулкит рабочего стола Pagh (вариант B: userspace-композитор).
 //!
 //! Библиотека без внешних зависимостей: собственный растр, встроенный шрифт,
-//! PNG-энкодер и клиент протокола PGUI v1. Всё, что нужно приложению, — это
-//! [`Canvas`], [`Theme`], набор виджетов и [`client::DesktopClient`] для связи
-//! с композитором.
+//! PNG-энкодер и клиент протокола **PDP/1** (его серверная половина —
+//! `rust-apps/pagh-desktop`). Всё, что нужно приложению, — это [`Canvas`],
+//! [`Theme`], набор виджетов и [`client::DesktopClient`] для связи с
+//! композитором. Клиент рисует только клиентскую область: заголовок окна,
+//! кнопки `v`/`^`/`x`, панель, размещение и фокус принадлежат композитору.
 //!
 //! ## Из чего состоит
 //!
@@ -19,7 +21,8 @@
 //! - [`menu`] — контекстные меню и подменю с раскладкой и hit-тестами.
 //! - [`chrome`] — заголовок окна (`v`/`^`/`x`), строка состояния.
 //! - [`icon`] — векторные иконки, включая синюю папку с листом бумаги.
-//! - [`protocol`], [`client`] — клиентская часть протокола PGUI v1.
+//! - [`protocol`], [`client`] — клиентская часть протокола PDP/1 (включая
+//!   расширение `launch`, type 13).
 //! - [`image`], [`testkit`] — PNG/PPM и screenshot-тесты.
 //! - [`demo`] — готовые демо-сцены (витрина, меню, палитра).
 //!
@@ -65,6 +68,7 @@ pub mod widgets;
 
 pub use canvas::Canvas;
 pub use chrome::WindowStyle;
+pub use client::DesktopClient;
 pub use color::Color;
 pub use geom::{Insets, Point, Rect, Size};
 pub use theme::Theme;
@@ -73,7 +77,7 @@ pub use theme::Theme;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Имя протокола, который реализует тулкит.
-pub const PROTOCOL_NAME: &str = "PGUI v1";
+pub const PROTOCOL_NAME: &str = "PDP/1";
 
 #[cfg(test)]
 mod tests {
