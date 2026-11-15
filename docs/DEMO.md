@@ -1,23 +1,18 @@
-# Demo media and the one-command bundle
+# Демо-медиа и однокомандный бандл
 
-`docs/demo.gif` / `docs/demo.mp4` are **real framebuffer captures** of this kernel
-running under QEMU/OVMF — every frame is a `screendump` of the guest's 1280×800
-framebuffer, with input injected through the QEMU monitor (`sendkey`,
-`mouse_move`/`mouse_button`). Nothing is composited or staged on the host: the
-kernel draws the console, the windows, the paint canvas and the cursor itself.
+`docs/demo.gif` / `docs/demo.mp4` — **настоящие снимки framebuffer** этого ядра под QEMU/OVMF: каждый кадр — это `screendump` гостевого framebuffer 1280×800, а ввод инжектится через QEMU monitor (`sendkey`, `mouse_move`/`mouse_button`). Ничего не композитится и не постановочно готовится на хосте: консоль, окна, canvas `paint` и курсор рисует само ядро.
 
-The capture is 24 s long, 15 fps, from the boot sequence to the `settings` panel
-with the `synth` theme and a live wallpaper.
+Запись длится 24 с, 15 fps, от загрузки до панели `settings` с темой `synth` и живыми обоями.
 
-## How it was recorded
+## Как это записывалось
 
-1. Build and stage the kernel exactly as usual:
+1. Собрать и застейджить ядро как обычно:
 
    ```sh
    python3 tools/build.py stage --release
    ```
 
-2. Boot it headless with a QEMU monitor socket and inject input while dumping frames:
+2. Загрузить его headless с сокетом QEMU monitor и инжектить ввод, сбрасывая кадры:
 
    ```sh
    qemu-system-x86_64 -machine pc -cpu max -m 1024M \
@@ -32,13 +27,9 @@ with the `synth` theme and a live wallpaper.
      -monitor unix:/tmp/pagh_mon.sock,server,nowait -no-reboot
    ```
 
-   Frames come from monitor `screendump … -f png`; the sequence drives `clear`,
-   `ls /mnt`, `paint` (mouse strokes), `ifconfig` (by then the DHCP lease is live),
-   `nano /mnt/pagh-log.txt`, then `settings` (theme + wallpaper cycling). Frames captured while the kernel was
-   mid-repaint (the shadow-buffer→VGA copy takes a few milliseconds) are dropped,
-   so the video only shows fully rendered frames.
+   Кадры берутся из monitor-команды `screendump … -f png`; последовательность прогоняет `clear`, `ls /mnt`, `paint` (штрихи мышью), `ifconfig` (к этому моменту DHCP-lease уже живой), `nano /mnt/pagh-log.txt`, затем `settings` (перебор темы и обоев). Кадры, снятые в момент перерисовки ядра (копирование shadow-buffer→VGA занимает несколько миллисекунд), отбрасываются, поэтому видео показывает только полностью отрисованные кадры.
 
-3. Encode:
+3. Закодировать:
 
    ```sh
    ffmpeg -framerate 15 -i o%05d.png -c:v libopenh264 -b:v 6M -pix_fmt yuv420p docs/demo.mp4
@@ -47,25 +38,19 @@ with the `synth` theme and a live wallpaper.
      -loop 0 docs/demo.gif
    ```
 
-`paint` is driven by a **USB HID mouse** in the capture (`-device qemu-xhci
--device usb-mouse`) because synthetic PS/2 deltas are lossy at scripted rates. The
-capture runs on a kernel with the USB-HID Y-sign fix (`1a54396`), so no host-side
-compensation is needed; the default PS/2 mouse under QEMU is unaffected either way.
+`paint` в записи управляется **USB HID-мышью** (`-device qemu-xhci
+-device usb-mouse`), потому что синтетические PS/2-дельты теряются на скриптовых скоростях. Запись сделана на ядре с исправлением Y-знака USB-HID (`1a54396`), поэтому хостовой компенсации не нужно; штатная PS/2-мышь под QEMU в любом случае не затронута.
 
-## The `pagh-demo-x86_64.tar.gz` bundle
+## Бандл `pagh-demo-x86_64.tar.gz`
 
-The release bundle is just the staged kernel plus the bootloader on a FAT image,
-and a launcher:
+Релизный бандл — это просто staged-ядро с загрузчиком на FAT-образе и лаунчер:
 
 ```sh
-# from the repository root, after `python3 tools/build.py stage --release`
+# из корня репозитория, после `python3 tools/build.py stage --release`
 dd if=/dev/zero of=pagh-boot.img bs=1M count=64
 mkfs.vfat -F 32 -n PAGH pagh-boot.img
 mcopy -i pagh-boot.img -s iso_root/* ::
 tar czf pagh-demo-x86_64.tar.gz pagh-boot.img run.sh TRY-IT.md README.txt
 ```
 
-The launcher resolves a combined `OVMF.fd` or a split `OVMF_CODE.fd`/`OVMF_VARS.fd`
-pair, creates a 256 MiB `disk.img` on first run, and boots QEMU with the image as
-the UEFI boot disk plus a virtio-blk data disk. `PAGH_HEADLESS=1 ./run.sh` boots
-without a window and writes `pagh-serial.log`.
+Лаунчер находит объединённый `OVMF.fd` или сплит-пару `OVMF_CODE.fd`/`OVMF_VARS.fd`, создаёт при первом запуске `disk.img` на 256 MiB и грузит QEMU с образом как UEFI boot-диском и virtio-blk data-диском. `PAGH_HEADLESS=1 ./run.sh` грузится без окна и пишет `pagh-serial.log`.

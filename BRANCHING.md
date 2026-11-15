@@ -1,54 +1,33 @@
-# Branching and releases
+# Ветвление и релизы
 
-## Branches
+## Ветки
 
-| Branch | Role | Rules |
+| Ветка | Роль | Правила |
 |---|---|---|
-| `main` | **Stable.** What users build, package and release. | Only release merges from `dev` (or a hotfix PR) land here. CI must be green. |
-| `dev` | **Experimental integration.** The next release lives here and may be broken between commits. | Feature/fix PRs target `dev`. CI must be green before merge. |
-| `feat/*`, `fix/*`, `security/*` | Short-lived work branches. | Branch from `dev`, PR back to `dev`, delete after merge. |
-| `hotfix/*` | Emergency fix for a released version. | Branch from `main`, PR to `main`; only critical/high verified security or a release-blocking regression. |
+| `main` | **Стабильная.** То, что пользователи собирают, упаковывают и релизят. | Сюда попадают только релизные слияния из `dev` (или hotfix-PR). CI обязан быть зелёным. |
+| `dev` | **Экспериментальная интеграция.** Здесь живёт следующий релиз; между коммитами она может быть сломана. | Feature/fix-PR целятся в `dev`. Перед слиянием CI обязан быть зелёным. |
+| `feat/*`, `fix/*`, `security/*` | Короткоживущие рабочие ветки. | Ответвляются от `dev`, PR обратно в `dev`, удаляются после слияния. |
+| `hotfix/*` | Аварийное исправление выпущенной версии. | Ответвляется от `main`, PR в `main`; только critical/high verified security или регрессия, блокирующая релиз. |
 
-`main` and `dev` are both protected in spirit: no direct pushes of code, no
-force-pushes, CI green before merge. Tagging and release publication are
-maintainer actions.
+`main` и `dev` защищены по духу: никаких прямых пушей кода, никаких force-push, CI зелёный до слияния. Тегирование и публикация релизов — действия мейнтейнера.
 
-## Release flow
+## Поток релиза
 
-1. **Feature / fix PR** → `dev`. CI runs the same gates as for `main`.
-2. **Pre-release**: freeze `dev` and tag a validated `dev` commit
-   `vX.Y.Z-rc.N` (release candidates only; there is no `-pre.N` channel) and
-   push the tag. After `-rc.1` only stabilisation fixes land in `dev`.
-   `.github/workflows/release.yml` publishes it as a **GitHub pre-release**
-   (GitHub marks it "Pre-release"; package tooling must ignore it unless the
-   user opts in).
-3. **Stabilisation**: once `dev` is release-ready, merge `dev` → `main` (merge
-   commit or fast-forward, no code changes beyond release metadata).
-4. **Stable release**: tag the merge commit `vX.Y.Z` on `main`; the release
-   workflow publishes a full GitHub release with generated notes and the
-   release kernel (`pagh.elf`).
-5. **Hotfix**: branch from `main`, PR to `main` with full CI plus a targeted
-   regression test, tag a PATCH version **straight to stable** (no RC), then
-   merge `main` back into `dev` with `--no-ff`; `dev` keeps the higher version
-   and CHANGELOG/AGENTS merge additively.
+1. **Feature/fix-PR** → `dev`. CI прогоняет те же гейты, что и для `main`.
+2. **Pre-release**: заморозить `dev` и поставить тег `vX.Y.Z-rc.N` на проверенный коммит `dev` (только release candidates; канала `-pre.N` нет), затем запушить тег. После `-rc.1` в `dev` попадают только стабилизирующие исправления. `.github/workflows/release.yml` публикует это как **GitHub pre-release** (GitHub помечает его «Pre-release»; пакетный инструментарий обязан его игнорировать, если пользователь не включил его явно).
+3. **Стабилизация**: когда `dev` готов к релизу, слить `dev` → `main` (merge commit или fast-forward, без изменений кода помимо релизных метаданных).
+4. **Стабильный релиз**: поставить тег `vX.Y.Z` на merge-коммит в `main`; release workflow публикует полный GitHub release со сгенерированными заметками и релизным ядром (`pagh.elf`).
+5. **Hotfix**: ответвиться от `main`, сделать PR в `main` с полным CI и целевым регрессионным тестом, поставить PATCH-тег **сразу в stable** (без RC), затем слить `main` обратно в `dev` через `--no-ff`; в `dev` остаётся старшая версия, а `CHANGELOG.md`/`AGENTS.md` сливаются аддитивно.
 
-## Tag conventions
+## Соглашения о тегах
 
-| Tag | Cut from | GitHub release type |
+| Тег | Откуда | Тип GitHub release |
 |---|---|---|
-| `vX.Y.Z` (or bare `X.Y.Z`, the historical style here) | `main` | Release |
-| `vX.Y.Z-rc.N` | `dev` (must not already be on `main`) | Pre-release |
+| `vX.Y.Z` (или голый `X.Y.Z`, исторический стиль этого репозитория) | `main` | Release |
+| `vX.Y.Z-rc.N` | `dev` (не должен уже быть на `main`) | Pre-release |
 
-New tags always carry the `v` prefix (`vX.Y.Z`, `vX.Y.Z-rc.N`); old bare-numeric
-tags stay as history. The version source of truth is the repository's version
-file (`Cargo.toml [package].version`, `VERSION`, …); `dev` carries the next
-release version, `main` the last released one. The release workflow checks both
-the tag's branch (stable: main; RC: dev-only) and that the tag base equals the
-version source. The operational checklist is in `RELEASING.md`.
+Новые теги всегда несут префикс `v` (`vX.Y.Z`, `vX.Y.Z-rc.N`); старые голые числовые теги остаются как история. Источник истины версии — версионный файл репозитория (`Cargo.toml [package].version`, `VERSION`, …); `dev` несёт версию следующего релиза, `main` — последнюю выпущенную. Release workflow проверяет и ветку тега (stable: main; RC: только dev), и совпадение базы тега с версионным источником. Операционный чек-лист — в `RELEASING.md`.
 
-## Why two branches
+## Зачем две ветки
 
-`main` stays reproducible for users and downstream repositories (whose packaged
-kernels point at releases). `dev` lets integration work — multi-repo changes,
-experimental features, unfinished migrations — land and be tested continuously
-without making `main` unstable.
+`main` остаётся воспроизводимой для пользователей и нижестоящих репозиториев (их упакованные ядра указывают на релизы). `dev` позволяет интеграционной работе — изменениям сразу в нескольких репозиториях, экспериментальным фичам, незаконченным миграциям — попадать в дерево и непрерывно тестироваться, не делая `main` нестабильной.

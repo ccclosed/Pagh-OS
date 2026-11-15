@@ -1,30 +1,29 @@
-//! Device-level helpers shared by the boot path and the shell's `disk` menu.
+//! Помощники уровня устройства, общие для boot-пути и shell-меню `disk`.
 //!
-//! The *decision* "may this device be formatted?" is pure and lives in
-//! [`crate::fs::format_policy`], which host-tests include directly. Reading the
-//! device to feed that decision is I/O, so it lives here — one implementation
-//! used by both callers, because a menu that classified a device differently
-//! from the boot path would offer to erase exactly the disks the boot path
-//! refuses to touch.
+//! Само *решение* «можно ли форматировать устройство?» — чистое и живёт в
+//! [`crate::fs::format_policy`], который host-тесты включают напрямую. Чтение
+//! устройства для этого решения — уже I/O, поэтому оно здесь: одна реализация на
+//! оба вызывающих, иначе меню классифицировало бы диск иначе, чем boot-путь, и
+//! предлагало стереть ровно те диски, которые boot-путь трогать отказывается.
 
-/// Highest byte offset the probe inspects.
+/// Наибольшее смещение в байтах, которое осматривает зонд.
 ///
-/// One MiB is the smallest window that contains everything the classifier has to
-/// recognise: the ext2 superblock at 1024, an MBR at the end of sector 0 and a
-/// GPT header with its partition entry array at LBA 1..33.
+/// Один MiB — минимальное окно, вмещающее всё, что должен распознать
+/// классификатор: суперблок ext2 по смещению 1024, MBR в конце сектора 0 и
+/// заголовок GPT с массивом записей разделов в LBA 1..33.
 const PROBE_LIMIT: u64 = 1024 * 1024;
 
-/// Probe granularity, in bytes: one filesystem block (8 device sectors).
+/// Шаг зонда в байтах: один блок ФС (8 секторов устройства).
 const PROBE_CHUNK: u64 = 4096;
 
-/// Classify the first MiB of `dev` for [`crate::fs::format_policy`].
+/// Классифицирует первый MiB `dev` для [`crate::fs::format_policy`].
 ///
-/// Reads in [`PROBE_CHUNK`] steps and stops as soon as the layout is decided — a
-/// partitioned or populated device costs a single read; only a device claiming to
-/// be blank is scanned to the end of [`PROBE_LIMIT`]. A read error keeps the
-/// `Foreign` (refused) classification, so an unreadable device is never formatted
-/// either — including a device with a single bad sector inside the window, which
-/// therefore cannot be formatted at all until it is zeroed.
+/// Читает шагами по [`PROBE_CHUNK`] и останавливается, как только разметка
+/// определена: размеченное или непустое устройство стоит одного чтения; до конца
+/// [`PROBE_LIMIT`] сканируется только устройство, притворяющееся пустым. Ошибка
+/// чтения оставляет классификацию `Foreign` (отказ), поэтому нечитаемое
+/// устройство тоже никогда не форматируется — в том числе устройство с одним
+/// битым сектором в окне: его нельзя отформатировать, пока оно не обнулено.
 pub fn probe_boot_area(dev: &dyn crate::drivers::BlockDevice) -> crate::fs::format_policy::Probe {
     use crate::fs::format_policy::Probe;
 

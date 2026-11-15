@@ -1,15 +1,15 @@
-//! Minimal in-memory filesystem backing `/tmp`.
+//! Минимальная in-memory ФС для `/tmp`.
 //!
-//! Nothing else in the tree implements `create_dir` (the ext2 root is
-//! read-mostly and directory creation there means real on-disk allocation),
-//! but Linux userspace assumes a writable `/tmp`: nvim's `vim_mktempdir`
-//! (mkdir /tmp/nvim.XXXXXX), mkstemp, unix-socket paths. A tiny ramfs gives
-//! all of that POSIX surface without touching the ext2 driver.
+//! Кроме неё `create_dir` в дереве никто не реализует (корень ext2 в основном
+//! read-only, а создание каталога там — настоящая on-disk аллокация), но
+//! Linux-userspace рассчитывает на записываемый `/tmp`: `vim_mktempdir` в nvim
+//! (mkdir /tmp/nvim.XXXXXX), mkstemp, пути unix-сокетов. Крошечная ramfs даёт
+//! всю эту POSIX-поверхность, не трогая драйвер ext2.
 //!
-//! Design: directories hold `BTreeMap<name, Arc<dyn VfsNode>>` under a
-//! spinlock; files hold `Spinlock<Vec<u8>>`. Every node gets a unique
-//! `fs_ino` from a global counter so `(st_dev, st_ino)` identity stays sound
-//! (glibc dedups by that pair).
+//! Устройство: каталоги держат `BTreeMap<name, Arc<dyn VfsNode>>` под спинлоком;
+//! файлы — `Spinlock<Vec<u8>>`. Каждый узел получает уникальный `fs_ino` из
+//! глобального счётчика, чтобы идентичность `(st_dev, st_ino)` оставалась
+//! корректной (glibc дедуплицирует по этой паре).
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -20,15 +20,15 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::{VfsError, VfsNode, VfsResult};
 use crate::sync::spinlock::Spinlock;
 
-/// Ram-node inode numbers start high above the ext2 range so the pairs never
-/// collide with real on-disk inodes.
+/// Номера inode ram-узлов начинаются высоко над диапазоном ext2, чтобы пары
+/// никогда не совпали с настоящими on-disk inode.
 static NEXT_INO: AtomicU64 = AtomicU64::new(0x0054_0000);
 
 fn next_ino() -> u64 {
     NEXT_INO.fetch_add(1, Ordering::Relaxed)
 }
 
-// ─── directory ───
+// ─── каталог ───
 
 pub struct RamDir {
     name: String,
@@ -103,8 +103,8 @@ impl VfsNode for RamDir {
                 if node.is_directory() {
                     if let Ok(list) = node.readdir() {
                         if !list.is_empty() {
-                            // Linux would say ENOTEMPTY; NotSupported keeps the
-                            // caller-visible errno mapping unchanged.
+                            // Linux сказал бы ENOTEMPTY; NotSupported сохраняет
+                            // прежнее отображение errno для вызывающего.
                             return Err(VfsError::NotSupported);
                         }
                     }
@@ -116,7 +116,7 @@ impl VfsNode for RamDir {
     }
 }
 
-// ─── regular file ───
+// ─── обычный файл ───
 
 pub struct RamFile {
     name: String,
@@ -167,10 +167,10 @@ impl VfsNode for RamFile {
             .ok_or(VfsError::InvalidArgument)?;
         let old_len = data.len();
         if old_len < end {
-            // Sparse-write gap (off > len) is zero-filled by resize, matching
-            // POSIX semantics for writes past EOF. try_reserve first so a huge
-            // user-driven offset cannot exhaust the fixed kernel heap
-            // (allocation failure is a kernel abort, not an error return).
+            // Дыра sparse-записи (off > len) заливается нулями через resize, как
+            // требует POSIX для записи за EOF. Сначала try_reserve, чтобы
+            // огромный пользовательский offset не исчерпал фиксированную кучу
+            // ядра (ошибка аллокации — аборт ядра, а не возврат ошибки).
             data.try_reserve(end - old_len)
                 .map_err(|_| VfsError::IoError)?;
             data.resize(end, 0);

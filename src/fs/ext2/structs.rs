@@ -1,33 +1,34 @@
-//! ext2 + WAL journal on-disk `#[repr(C)]` structures, byte<->struct helpers,
-//! and an inline CRC32.
+//! On-disk `#[repr(C)]`-структуры ext2 и журнала WAL, помощники байты↔структура
+//! и встроенный CRC32.
 //!
-//! All structures use the canonical ext2 field names/offsets so a freshly
-//! formatted image is host-mountable as plain ext2. The kernel target is
-//! x86_64 (little-endian) and ext2 is a little-endian format, so the in-memory
-//! `#[repr(C)]` byte layout equals the on-disk layout: we read/write whole
-//! structs to byte buffers with unaligned copies (`read_struct`/`write_struct`),
-//! which avoids creating misaligned references while preserving exact bytes.
+//! Все структуры используют канонические имена/смещения полей ext2, поэтому
+//! свежеотформатированный образ маунтится на хосте как обычный ext2. Цель ядра —
+//! x86_64 (little-endian), ext2 тоже little-endian, так что байтовая раскладка
+//! `#[repr(C)]` в памяти совпадает с on-disk: целые структуры читаются и
+//! пишутся в байтовые буферы невыровненными копиями (`read_struct`/
+//! `write_struct`) — без создания невыровненных ссылок и с сохранением байтов.
 //!
-//! `const _: () = assert!(...)` size checks lock the struct sizes (e.g. the
-//! 128-byte inode, 8-byte dir-entry header, 32-byte group descriptor).
+//! Проверки `const _: () = assert!(...)` фиксируют размеры структур (inode
+//! 128 байт, заголовок dirent 8 байт, групповой дескриптор 32 байта).
 
 #![allow(dead_code)]
 
-/// Filesystem block size in bytes. `s_log_block_size = 2` -> `1024 << 2 = 4096`.
+/// Размер блока ФС в байтах. `s_log_block_size = 2` -> `1024 << 2 = 4096`.
 pub const BS: usize = 4096;
 
-/// 512-byte device sectors per 4096-byte FS block.
+/// 512-байтных секторов устройства в 4096-байтном блоке ФС.
 pub const SECTORS_PER_BLOCK: u64 = (BS / 512) as u64;
 
-/// Classic ext2 inode size for `s_rev_level == 1` (bytes).
+/// Классический размер inode ext2 для `s_rev_level == 1` (байт).
 pub const INODE_SIZE: usize = 128;
 
-/// Effective on-disk inode size for a mounted superblock.
+/// Действующий on-disk размер inode для смонтированного суперблока.
 ///
-/// `s_rev_level >= 1` images may declare a larger (power-of-two) inode size in
-/// `s_inode_size` (e.g. 256); address math must honor it or every inode-table
-/// access lands on the wrong slot. Rev-0 images always carry 128-byte inodes,
-/// and a corrupt `s_inode_size` must never be trusted — fall back to 128.
+/// Образы с `s_rev_level >= 1` могут объявлять в `s_inode_size` больший
+/// (степень двойки) размер — например, 256; арифметика адресов обязана его
+/// учитывать, иначе любой доступ к таблице inode попадает не в тот слот. У
+/// образов rev-0 всегда inode по 128 байт, а испорченному `s_inode_size` нельзя
+/// доверять — откат к 128.
 pub fn inode_size(sb: &Ext2SuperBlock) -> usize {
     let v = sb.s_inode_size as usize;
     if sb.s_rev_level == 0 || v < INODE_SIZE || v > BS || !v.is_power_of_two() {
@@ -36,31 +37,31 @@ pub fn inode_size(sb: &Ext2SuperBlock) -> usize {
     v
 }
 
-/// ext2 magic, stored at superblock offset 0x38.
+/// Магия ext2 по смещению 0x38 в суперблоке.
 pub const EXT2_MAGIC: u16 = 0xEF53;
 
-/// Root directory inode number.
+/// Номер inode корневого каталога.
 pub const EXT2_ROOT_INO: u32 = 2;
 
-/// First non-reserved inode.
+/// Первый нерезервированный inode.
 pub const EXT2_FIRST_INO: u32 = 11;
 
-/// Number of `u32` pointers in one indirect block (`BS / 4 == 1024`).
+/// Число `u32`-указателей в одном indirect-блоке (`BS / 4 == 1024`).
 pub const PTRS_PER_BLOCK: u32 = (BS / 4) as u32;
 
-/// Inode mode bits.
+/// Биты режима inode.
 pub const S_IFREG: u16 = 0x8000;
 pub const S_IFDIR: u16 = 0x4000;
 pub const S_IFLNK: u16 = 0xA000;
 
-/// Journal superblock magic ("PAGHJNL\1") — OUR format, not jbd2.
+/// Магия суперблока журнала ("PAGHJNL\1") — **свой** формат, не jbd2.
 pub const JNL_MAGIC: u64 = 0x5041_4748_4A4E_4C01;
-/// Journal descriptor magic ("JDES").
+/// Магия дескриптора журнала ("JDES").
 pub const JDES_MAGIC: u32 = 0x4A44_4553;
-/// Journal commit magic ("JCMT").
+/// Магия коммита журнала ("JCMT").
 pub const JCMT_MAGIC: u32 = 0x4A43_4D54;
 
-// ─── ext2 superblock (lives at byte offset 1024) ────────────────────────────
+// ─── суперблок ext2 (по смещению 1024 байт) ─────────────────────────────────
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -101,13 +102,13 @@ pub struct Ext2SuperBlock {
 }
 
 const _: () = assert!(core::mem::size_of::<Ext2SuperBlock>() == 0x88);
-// Field-offset locks for the host-critical fields.
+// Фиксация смещений полей, критичных для host-тестов.
 const _: () = assert!(core::mem::offset_of!(Ext2SuperBlock, s_log_block_size) == 0x18);
 const _: () = assert!(core::mem::offset_of!(Ext2SuperBlock, s_magic) == 0x38);
 const _: () = assert!(core::mem::offset_of!(Ext2SuperBlock, s_inode_size) == 0x58);
 const _: () = assert!(core::mem::offset_of!(Ext2SuperBlock, s_feature_incompat) == 0x60);
 
-// ─── ext2 block group descriptor (32 bytes) ─────────────────────────────────
+// ─── групповой дескриптор блоков ext2 (32 байта) ────────────────────────────
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -124,7 +125,7 @@ pub struct Ext2GroupDesc {
 
 const _: () = assert!(core::mem::size_of::<Ext2GroupDesc>() == 32);
 
-// ─── ext2 inode (128 bytes) ──────────────────────────────────────────────────
+// ─── inode ext2 (128 байт) ──────────────────────────────────────────────────
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -138,7 +139,7 @@ pub struct Ext2Inode {
     pub i_dtime: u32,
     pub i_gid: u16,
     pub i_links_count: u16,
-    pub i_blocks: u32, // count of 512-byte sectors
+    pub i_blocks: u32, // число 512-байтных секторов
     pub i_flags: u32,
     pub i_osd1: u32,
     pub i_block: [u32; 15], // 0..=11 direct, 12 single, 13 double, 14 triple
@@ -181,15 +182,14 @@ impl Ext2Inode {
     pub fn is_reg(&self) -> bool {
         (self.i_mode & 0xF000) == S_IFREG
     }
-    /// A symbolic link: the target lives inline in `i_block` (fast,
-    /// `i_blocks == 0`) or in one data block (slow). Layout math lives in
-    /// `super::symlink`.
+    /// Симлинк: цель лежит inline в `i_block` (fast, `i_blocks == 0`) либо в
+    /// одном блоке данных (slow). Расчёт формы — в `super::symlink`.
     pub fn is_symlink(&self) -> bool {
         (self.i_mode & 0xF000) == S_IFLNK
     }
 }
 
-// ─── ext2 directory entry header (8 bytes; name follows) ─────────────────────
+// ─── заголовок записи каталога ext2 (8 байт; далее имя) ──────────────────────
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -202,7 +202,7 @@ pub struct Ext2DirEntryHeader {
 
 const _: () = assert!(core::mem::size_of::<Ext2DirEntryHeader>() == 8);
 
-// ─── journal structures ──────────────────────────────────────────────────────
+// ─── структуры журнала ──────────────────────────────────────────────────────
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -218,7 +218,7 @@ pub struct JournalSuper {
 
 const _: () = assert!(core::mem::size_of::<JournalSuper>() == 56);
 
-/// Maximum data blocks a single descriptor can describe.
+/// Максимум data-блоков, которые описывает один дескриптор.
 pub const JDESC_MAX_TARGETS: usize = 254;
 
 #[repr(C)]
@@ -243,49 +243,49 @@ pub struct JournalCommit {
 
 const _: () = assert!(core::mem::size_of::<JournalCommit>() == 24);
 
-// ─── byte <-> struct helpers ──────────────────────────────────────────────────
+// ─── помощники байты <-> структура ──────────────────────────────────────────
 
-/// Read a `Copy` POD struct out of a byte buffer with an unaligned load.
+/// Читает `Copy`-POD-структуру из байтового буфера невыровненной загрузкой.
 ///
 /// # Safety
-/// `bytes.len()` must be at least `size_of::<T>()`, and the bytes must be a
-/// valid bit-pattern for `T` (always true for our integer/array POD structs).
+/// `bytes.len()` не меньше `size_of::<T>()`, а байты — валидный битовый образ
+/// `T` (для наших целочисленных/массивных POD-структур это всегда так).
 pub unsafe fn read_struct<T: Copy>(bytes: &[u8]) -> T {
     debug_assert!(bytes.len() >= core::mem::size_of::<T>());
     core::ptr::read_unaligned(bytes.as_ptr() as *const T)
 }
 
-/// Write a `Copy` POD struct into a byte buffer with an unaligned store.
+/// Пишет `Copy`-POD-структуру в байтовый буфер невыровненным сохранением.
 ///
 /// # Safety
-/// `bytes.len()` must be at least `size_of::<T>()`.
+/// `bytes.len()` не меньше `size_of::<T>()`.
 pub unsafe fn write_struct<T: Copy>(bytes: &mut [u8], value: &T) {
     debug_assert!(bytes.len() >= core::mem::size_of::<T>());
     core::ptr::write_unaligned(bytes.as_mut_ptr() as *mut T, *value);
 }
 
-/// Read a little-endian `u32` at `off`.
+/// Читает little-endian `u32` по смещению `off`.
 pub fn read_u32(bytes: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
 }
 
-/// Write a little-endian `u32` at `off`.
+/// Пишет little-endian `u32` по смещению `off`.
 pub fn write_u32(bytes: &mut [u8], off: usize, v: u32) {
     bytes[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 
-// ─── inline CRC32 (IEEE 802.3, reflected poly 0xEDB88320) ────────────────────
+// ─── встроенный CRC32 (IEEE 802.3, отражённый полином 0xEDB88320) ───────────
 
-/// Compute the standard CRC32 (poly 0xEDB88320) of `data`.
+/// Считает стандартный CRC32 (полином 0xEDB88320) от `data`.
 ///
-/// Known answer: `crc32(b"123456789") == 0xCBF4_3926`.
+/// Известный ответ: `crc32(b"123456789") == 0xCBF4_3926`.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &b in data {
         crc ^= b as u32;
         let mut k = 0;
         while k < 8 {
-            // Branchless: subtract 1-bit mask, AND with the polynomial.
+            // Без ветвлений: маска из младшего бита, AND с полиномом.
             let mask = (crc & 1).wrapping_neg();
             crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
             k += 1;
@@ -294,7 +294,7 @@ pub fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// CRC32 over a sequence of byte slices (used for multi-block journal data).
+/// CRC32 по последовательности байтовых срезов (для многоблочных данных журнала).
 pub fn crc32_slices(slices: &[&[u8]]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for s in slices {
@@ -311,7 +311,7 @@ pub fn crc32_slices(slices: &[&[u8]]) -> u32 {
     !crc
 }
 
-/// `align4(n)` rounds `n` up to a multiple of 4.
+/// `align4(n)` округляет `n` вверх до кратного 4.
 #[inline]
 pub fn align4(n: usize) -> usize {
     (n + 3) & !3

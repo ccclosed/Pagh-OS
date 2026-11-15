@@ -1,19 +1,6 @@
 # Контракт procfs для issue #11 — срезы 1–7
 
-**Статус:** требования (задача `t3`, kind=work). Документ — приёмка: реализация issue #11
-обязана соответствовать ему по путям, содержимому и поведению syscall-поверхности.
-**Реализовано** в задаче `t4` (ветка `vfs/procfs`), срез 2 — в 2.9.0 (`/proc/stat`),
-срез 3 — в 2.10.0 (`/proc/version`, `/proc/filesystems`, `/proc/loadavg`,
-read-only `/proc/sys/kernel/*`), срез 4 — в 2.11.0 (per-pid `cmdline/stat/status/maps`,
-`/proc/self/{stat,statm}`, mountinfo/mounts/cgroup — в 2.12–2.15), срез 5 — в 2.16.0
-(`/proc/<pid>/fdinfo/<n>`, `/proc/self/fdinfo/<n>`, `/proc/<pid>/limits`,
-`/proc/self/limits`; §12), срез 6 — в 2.19.0 (`/proc/<pid>/task/`,
-`/proc/self/task/` — per-thread view; §13), срез 7 — в 2.20.0 (достоверные
-`maj:min`/`ino`/`pathname` в `/proc/<pid>/maps` для file-backed строк; §14). Отступления от текста ниже, если они есть,
-перечислены в коде и в `src/vfs/README.md`; DEVIATION-2 уточнён: рендер ленивый и живёт
-один проход чтения (`read(offset == 0)` перерисовывает), а не снимок на `open()`.
-Ссылки на код и номера строк — исторические (контракт писался на `cd542bb`), сверяйтесь
-с текущим деревом: имена файлов и функций стабильнее номеров строк.
+**Статус:** контракт приёмки issue #11. Реализовано по срезам: срез 1 — вместе с `/proc` в `vfs::init()`; срез 2 — 2.9.0 (`/proc/stat`); срез 3 — 2.10.0 (`/proc/version`, `/proc/filesystems`, `/proc/loadavg`, read-only `/proc/sys/kernel/*`); срез 4 — 2.11.0 (per-pid `cmdline/stat/status/maps`, `/proc/self/{stat,statm}`, mountinfo/mounts/cgroup — в 2.12–2.15); срез 5 — 2.16.0 (`/proc/<pid>/fdinfo/<n>`, `/proc/self/fdinfo/<n>`, `/proc/<pid>/limits`, `/proc/self/limits`; §12); срез 6 — 2.19.0 (`/proc/<pid>/task/`, `/proc/self/task/` — per-thread view; §13); срез 7 — 2.20.0 (достоверные `maj:min`/`ino`/`pathname` в `/proc/<pid>/maps` для file-backed строк; §14). Отступления от текста ниже перечислены в коде и в `src/vfs/README.md`; DEVIATION-2 уточнён: рендер ленивый и живёт один проход чтения (`read(offset == 0)` перерисовывает), а не снимок на `open()`. Номера строк в ссылках исторические; имена файлов и функций стабильнее.
 
 Источники решения: issue #11; `src/vfs/mod.rs` (трейт `VfsNode`); `src/vfs/ramfs.rs`;
 `src/arch/x86_64/linux/io_sys.rs` (резолв путей, `open`/`stat`/`readlink`/`getdents64`);
@@ -733,10 +720,10 @@ nodev\tramfs\n
   `st_mode = S_IFLNK | 0o777`, `st_size = target.len()`, `st_nlink = 1`,
   `st_dev/st_ino` — как обычно (`STAT_DEV_VFS`, `node_ino(node)`);
 - флаг не задан и узел — ссылка: **следование** тем же резолвером, что и у `open`
-  (§5.4; `ENOENT` при висячей цели, `ELOOP` при цикле — из t15);
+  (§5.4; `ENOENT` при висячей цели, `ELOOP` при цикле);
 - остальные узлы: без изменений (`write_stat`, `io_sys.rs:968-984`).
 - Точные значения полей для ссылок (`st_nlink` из `i_links_count`, `st_blocks` из
-  `i_blocks` и т.п.) — зона t15 (`EXT2-LINKS.md` §4.3); для `/proc/self/exe`
+  `i_blocks` и т.п.) — по `EXT2-LINKS.md` §4.3; для `/proc/self/exe`
   действует строка таблицы ниже: `st_nlink = 1`, `st_blocks = 0`.
 
 Итоговые значения для procfs:
@@ -785,27 +772,10 @@ DEVIATION-1 (size ≠ 0), DEVIATION-11 (права: `stat_mode_for` даёт д�
 
 ### 5.4 `open` и следование по ссылкам
 
-`open_path` (`io_sys.rs:773-816`) сейчас не различает ссылки. Нужна follow-семантика, и её
-владелец — поток t15 из контракта по issue #18 (`EXT2-LINKS.md` §4.1/§4.6): общий резолвер
-с бюджетом `SYMLOOP_MAX = 40` переходов, `Errno::ELOOP`, `lookup_path_no_follow` для
-`lstat`/`readlink` и таблица «что следует за конечным компонентом, а что нет».
+`open_path` различает ссылки через общий follow-резолвер из контракта по issue #18 (`EXT2-LINKS.md` §4.1/§4.6): бюджет `SYMLOOP_MAX = 40` переходов, `Errno::ELOOP`, `lookup_path_no_follow` для `lstat`/`readlink` и таблица «что следует за конечным компонентом, а что нет». Первым его добавил тот, кто смержил общий резолвер; procfs его переиспользует:
 
-Контракт procfs для этого среза:
-
-1. **Если t15 уже лендирован** — `open`/`openat` (без `O_NOFOLLOW`), `stat` без
-   `AT_SYMLINK_NOFOLLOW`, `access`, `chdir` используют общий follow-резолвер t15;
-   `readlink`/`lstat` — резолвер без следования. `/proc/self/exe` — это просто узел
-   с `is_symlink() == true` и `read_link() == Some(exe_path)`, и он получает всю эту
-   семантику бесплатно (у t15 это записано как ожидаемый случай: «синтетический узел с
-   `is_symlink()`/`read_link()`»). Отдельного хардкода `/proc/self/exe` в `sys_readlink`
-   не остаётся.
-2. **Если t15 ещё не лендирован, а procfs садится первым** — минимальный собственный шов
-   (его потом заменяет общий резолвер): один уровень следования в `open_path` по
-   `read_link()`, `lookup_path` для остального, исчерпание бюджета (8) → `ENOENT` +
-   `crate::warn!` вместо `ELOOP`. Тогда DEVIATION-13 действует только до мержа t15.
-3. `O_CREAT|O_EXCL` при существующем имени → `EEXIST` (в т.ч. если это висячая ссылка —
-   как в `EXT2-LINKS.md` §4.5); `O_CREAT`/`O_TRUNC` по ссылке действуют на цель;
-   `readlink(2)` резолвит **без** следования (иначе нельзя прочитать саму ссылку).
+1. `open`/`openat` (без `O_NOFOLLOW`), `stat` без `AT_SYMLINK_NOFOLLOW`, `access`, `chdir` используют общий follow-резолвер; `readlink`/`lstat` — резолвер без следования. `/proc/self/exe` — это просто узел с `is_symlink() == true` и `read_link() == Some(exe_path)`, и он получает всю эту семантику бесплатно («синтетический узел с `is_symlink()`/`read_link()`»). Отдельного хардкода `/proc/self/exe` в `sys_readlink` не остаётся.
+2. `O_CREAT|O_EXCL` при существующем имени → `EEXIST` (в т.ч. если это висячая ссылка — как в `EXT2-LINKS.md` §4.5); `O_CREAT`/`O_TRUNC` по ссылке действуют на цель; `readlink(2)` резолвит **без** следования (иначе нельзя прочитать саму ссылку).
 
 ### 5.5 Отсутствие процесса
 
@@ -869,7 +839,7 @@ fn read_link(&self) -> Option<String> { None }
   новых метода обязаны быть провардены, иначе `/mnt/<ссылка>`-корень и любой будущий
   procfs-подобный mount потеряют тип ссылки;
 - резолверы путей: `lookup_path` (без следования, семантика не меняется) и общий
-  follow-резолвер из t15 (§5.4).
+  общий follow-резолвер (§5.4).
 
 ### 6.2 `src/vfs/procfs.rs` (новый)
 - Узлы `ProcDir`/`ProcFile`, `root()`; `DirKind::{Root,SelfDir,SysDir,SysKernelDir}`;
@@ -884,8 +854,7 @@ fn read_link(&self) -> Option<String> { None }
   `lookup_path` и брать `node.is_symlink()`/`node.read_link()`; пустая цель/нет узла → `ENOENT`;
   не-ссылка → `EINVAL`;
 - `sys_newfstatat` (`:1035-1041`): обработать `AT_SYMLINK_NOFOLLOW` (§5.2);
-- `open_path` (`:773-816`): следование по ссылке через общий follow-резолвер t15 (§5.4),
-  либо (если t15 ещё не лендирован) — минимальный одноуровневый шов §5.4(2);
+- `open_path` (`:773-816`): следование по ссылке через общий follow-резолвер (§5.4);
 - `sys_getdents64` (`:1726-1729`): `d_ino = node_ino(child)`, `d_type` → `DT_LNK` для ссылок;
 - `sys_write` (File-ветка, `:456-459`): маппинг `VfsError::NotSupported` → `EACCES`
   (сейчас всё превращается в `EINVAL`); `writev`/`pwrite64` (`:549`, `:2071`) — та же
@@ -1139,7 +1108,7 @@ python3 tools/host_tests.py          # + 6 новых property-наборов
 | 10 | `open("/proc/cpuinfo/x")` → `ENOENT`, а не `ENOTDIR` | Дефолтный `lookup` трейта; `ENOTDIR` потребует отдельной проверки в `lookup_path` |
 | 11 | Права procfs = дефолты слоя (0700/0755), а не 0555/0444 | `stat_mode_for` не имеет per-node режима; `access(2)` режим не проверяет |
 | 12 | Нет записей `.`/`..` в `getdents64` | Общее свойство VFS этого ядра, не специфика procfs |
-| 13 | До мержа t15: цикл/лишние ссылки → `ENOENT` (нет `ELOOP` в `errno.rs`), вместо Linux-овского `ELOOP` | Бюджет 8 + `warn!` как временный шов; t15 (`EXT2-LINKS.md` §4.6) добавляет `Errno::ELOOP = 40` и `SYMLOOP_MAX = 40`, после чего procfs переиспользует общий резолвер |
+| 13 | Цикл/лишние ссылки → `ELOOP` | Общий follow-резолвер: `Errno::ELOOP = 40` и `SYMLOOP_MAX = 40`; procfs его переиспользует |
 | 14 | `/proc/1` для живого pid → файл; `/proc/999999` → `ENOENT` | Срез 4: pid-keyed дерево есть |
 | 15 | `/proc/loadavg` первые три поля всегда `0.00` | Учёта загрузки нет; libuv `uv_loadavg` падает обратно на `sysinfo(2)` (`loads = [0;3]`), выдумывать средние запрещено. `runnable/total` и `last_pid` — реальные (§4.11) |
 | 16 | `/proc/version` — `pagh <version> (x86_64) #1 SMP`, а не Linux-строка | Ядро не Linux: реальная версия крейта вместо поддельного релиза. `#1 SMP` — фиксированный build-тег формы, не заявление о SMP (машина однопроцессорная) |
@@ -1151,10 +1120,10 @@ python3 tools/host_tests.py          # + 6 новых property-наборов
 
 1. **Общий трейт.** `VfsNode::is_symlink()`/`read_link()` (§6.1) — тот же примитив, который
    нужен #18 для симлинков ext2; имена взяты из `EXT2-LINKS.md` (§1.2), чтобы не появилось
-   двух названий одного механизма. Кто первым мержит — тот добавляет методы и их форвард
-   в `MountNode`; вторая задача использует их без изменений. Follow-семантика, бюджет
-   переходов и `ELOOP` — зона t15 (`EXT2-LINKS.md` §4.1/§4.6); procfs их только
-   переиспользует (§5.4).
+   двух названий одного механизма. Методы добавлены с форвардом
+   в `MountNode`; потребители используют их без изменений. Follow-семантика, бюджет
+   переходов и `ELOOP` — по `EXT2-LINKS.md` §4.1/§4.6; procfs их только переиспользует
+   (§5.4).
 2. **`readlink`-тип возврата.** `Option<String>` (не `Vec<u8>`) выбран потому, что все
    пути в этом ядре уже `String` (`read_user_cstr`, `resolve_path`); ext2-тайргеты
    читаются из inode-байтов, но и там путь нормализуется в `String`.
@@ -1171,8 +1140,8 @@ python3 tools/host_tests.py          # + 6 новых property-наборов
 ## 11. Definition of Done для реализации
 
 1. Все узлы §2.1 (срезы 1–5) существуют и ведут себя по §3–§5/§12; неизвестные пути → `ENOENT` (§5.6).
-2. `VfsNode::{is_symlink, read_link}` (+ форвард в `MountNode`), follow-резолвер (t15 или
-   минимальный §5.4(2)), `FdTable::capacity`, `LoadSegment`,
+2. `VfsNode::{is_symlink, read_link}` (+ форвард в `MountNode`), follow-резолвер
+   (§5.4), `FdTable::capacity`, `LoadSegment`,
    `CompatState::{cmdline,image_segments,interp_path}`, `cpuid::read`,
    `procfs_format::*` — на месте.
 3. 6 новых property-наборов (p51–p55 + `procfs_misc`) + расширение p32 зелёные в

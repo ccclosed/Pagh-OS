@@ -1,137 +1,100 @@
-# Releasing Pagh-OS
+# Выпуск Pagh-OS
 
-This is the operational runbook for `Pagh-OS`. The branch model is in
-`BRANCHING.md`; the version/feature rules are in `AGENTS.md` / `README.md`.
-Nothing here releases automatically except the tag-driven `release` workflow.
+Это операционный runbook для `Pagh-OS`. Модель веток — в `BRANCHING.md`; правила версий и фич — в `AGENTS.md` / `README.md`. Ничего не выпускается автоматически, кроме tag-driven workflow `release`.
 
-## Version source
+## Источник версии
 
-`Cargo.toml` (`[package].version`). It is what the running system reports via
-`env!("CARGO_PKG_VERSION")` (`src/provision.rs` writes `/mnt/etc/pagh-release`
-and the motd), so a stale version is user-visible at boot — and the workflow
-refuses a tag whose base version disagrees with it.
+`Cargo.toml` (`[package].version`). Именно её работающая система сообщает через `env!("CARGO_PKG_VERSION")` (`src/provision.rs` пишет `/mnt/etc/pagh-release` и motd), поэтому устаревшая версия видна пользователю при загрузке — и workflow отвергает тег, базовая версия которого с ней не совпадает.
 
-`dev` carries the **next release** version; `main` keeps the last **released**
-version. The first feature after a release bumps MINOR, the first fix bumps
-PATCH. The `AGENTS.md` `main` version line describes the latest
-**stable** release only: an in-flight bump on `dev` does not rewrite it, and it
-is updated together with the stable release.
+`dev` несёт версию **следующего релиза**; `main` держит последнюю **выпущенную** версию. Первая фича после релиза поднимает MINOR, первое исправление — PATCH. Строка версии `main` в `AGENTS.md` описывает только последний **stable**-релиз: незавершённый bump в `dev` её не переписывает, обновляется она вместе со stable-релизом.
 
-## Required checks and live evidence
+## Обязательные проверки и live-доказательства
 
-A release is cut only from a commit where **all four required CI jobs** are
-green (`.github/workflows/ci.yml`):
+Релиз режется только с коммита, где зелёные **все четыре обязательных CI-job** (`.github/workflows/ci.yml`):
 
-| Job | What it proves |
+| Job | Что доказывает |
 |---|---|
-| `kernel` | `cargo fmt --check` and the debug + release kernel builds |
-| `host-tests` | the `host-tests/` property/regression suite |
-| `static-policy` | no unreviewed `unsafe` blocks (`tools/check_safety.py`) |
-| `docs-claims` | the verifiable claims in `AGENTS.md` match the tree |
+| `kernel` | `cargo fmt --check` и debug + release сборки ядра |
+| `host-tests` | property/regression-набор `host-tests/` |
+| `static-policy` | нет непроверенных `unsafe`-блоков (`tools/check_safety.py`) |
+| `docs-claims` | проверяемые утверждения в `AGENTS.md` совпадают с деревом |
 
-On top of CI, collect the live evidence on the exact commit that will be
-tagged:
+Поверх CI соберите live-доказательства ровно на том коммите, который будет тегирован:
 
-- `python3 tools/e2e.py selftest` — boots the staged release kernel in QEMU and
-  runs the in-guest `selftest`; the run is only valid with its `[BOOTID]` boot
-  identity proof and `SELFTEST SUMMARY` (see `tools/e2e_boot_integrity.md`).
-- The committed security-regression PoCs still behave as documented:
-  `tools/security/poc/poc_poll_toctou.c` (user-buffer TOCTOU class),
-  `tools/security/poc/poc_sock_large_count.c`, the round-1 PoCs, and
-  `tests/pkg/e2e_pkg_escape.py` (crafted `.deb` packages refused, no
-  `/mnt/etc/autorun`). A released kernel must not regress a closed finding.
+- `python3 tools/e2e.py selftest` — загружает staged release-ядро в QEMU и запускает гостевой `selftest`; прогон валиден только вместе с доказательством boot identity `[BOOTID]` и `SELFTEST SUMMARY` (см. `tools/e2e_boot_integrity.md`).
+- Закоммиченные security-regression PoC ведут себя как задокументировано: `tools/security/poc/poc_poll_toctou.c` (класс TOCTOU пользовательского буфера), `tools/security/poc/poc_sock_large_count.c`, PoC раунда 1 и `tests/pkg/e2e_pkg_escape.py` (crafted `.deb` отвергаются, `/mnt/etc/autorun` не появляется). Выпущенное ядро не должно регрессировать закрытую находку.
 
-## Pre-release (release candidate) — from `dev` only
+## Pre-release (release candidate) — только из `dev`
 
-1. Freeze `dev`: after `vX.Y.Z-rc.1`, only fixes for this release are merged
-   until the release lands. Everything else waits.
-2. Pre-flight on the exact `dev` commit:
-   - the four required checks green;
-   - the live evidence above collected;
-   - `CHANGELOG.md` section written (and the release-note block in `AGENTS.md`
-     updated);
-   - version source equals `X.Y.Z` (no `-rc` in the source file);
-   - no open blocker, no known regression in the release scope.
-3. Tag and push `vX.Y.Z-rc.N`:
+1. Заморозить `dev`: после `vX.Y.Z-rc.1` до релиза вливаются только исправления этого релиза. Всё остальное ждёт.
+2. Pre-flight на точном коммите `dev`:
+   - четыре обязательных проверки зелёные;
+   - live-доказательства выше собраны;
+   - секция `CHANGELOG.md` написана (и обновлён release-note блок в `AGENTS.md`);
+   - источник версии равен `X.Y.Z` (в версионном файле нет `-rc`);
+   - нет открытых блокеров и известных регрессий в объёме релиза.
+3. Поставить и запушить тег `vX.Y.Z-rc.N`:
    ```sh
    git checkout dev && git pull --ff-only
    git tag -a vX.Y.Z-rc.1 -m "pagh X.Y.Z-rc.1"
    git push origin vX.Y.Z-rc.1
    ```
-4. Watch the `release` workflow: it refuses the tag unless it is reachable
-   from `dev` **and not** from `main`, checks the base version, builds the
-   release kernel, writes `.sha256` files, and publishes a GitHub
-   **Pre-release**.
-   A rejected tag stays in the repository but produces **no** release entry:
-   delete it (`git push origin :refs/tags/<tag>`) before retrying.
-5. Test the pre-release artifact. Bugs: fix on `dev`, tag `-rc.2` (never move
-   the `-rc.1` tag).
+4. Следить за workflow `release`: он отвергает тег, если тот недостижим из `dev` **и не** достижим из `main`, проверяет базовую версию, собирает релизное ядро, пишет `.sha256`-файлы и публикует GitHub **Pre-release**.
+   Отвергнутый тег остаётся в репозитории, но **не** создаёт запись релиза: удалите его (`git push origin :refs/tags/<tag>`) перед новой попыткой.
+5. Проверить pre-release артефакт. Баги: исправлять в `dev`, тегировать `-rc.2` (никогда не перемещать тег `-rc.1`).
 
-## Stable release — from `main`
+## Стабильный релиз — из `main`
 
-1. Merge `dev` into `main` (merge commit; no code changes at this step):
+1. Слить `dev` в `main` (merge commit; на этом шаге код не меняется):
    ```sh
    git checkout main && git pull --ff-only
    git merge --no-ff dev
    git push origin main
    ```
-2. Wait for CI on `main` to be green.
-3. Tag and push `vX.Y.Z` on the merge commit; the workflow checks that the
-   commit is reachable from `main` and that the version source matches.
-4. Verify in **Releases**: the new entry is a full release with the versioned
-   kernel artifact and matching `.sha256` (see *Artifacts* below). GitHub marks
-   the newest stable as **Latest**.
-5. `dev` continues with the next version (first change bumps it).
+2. Дождаться зелёного CI на `main`.
+3. Поставить и запушить `vX.Y.Z` на merge-коммит; workflow проверяет, что коммит достижим из `main` и что источник версии совпадает.
+4. Проверить в **Releases**: новая запись — полный релиз с версионным артефактом ядра и соответствующим `.sha256` (см. *Артефакты* ниже). GitHub помечает новейший stable как **Latest**.
+5. `dev` продолжает со следующей версией (первое изменение её поднимает).
 
-## Hotfix — straight to `main`, no RC
+## Hotfix — сразу в `main`, без RC
 
-Hotfixes are limited to **critical/high verified security findings** or a
-release-blocking regression in a released version. Everything else rides `dev`.
+Hotfix'ы ограничены **critical/high verified security findings** или регрессией, блокирующей релиз, в выпущенной версии. Всё остальное едет через `dev`.
 
-1. Branch from `main`: `hotfix/<short-name>`.
-2. PR to `main` (never to `dev`), full CI plus a targeted regression test/PoC
-   for the bug. Get it reviewed.
-3. Merge to `main`, then tag the PATCH release `vX.Y.Z+1` directly (no RC) and
-   verify the release entry.
-4. Merge `main` back into `dev` with `--no-ff`:
+1. Ответвиться от `main`: `hotfix/<short-name>`.
+2. PR в `main` (никогда в `dev`), полный CI плюс целевой регрессионный тест/PoC на баг. Пройти ревью.
+3. Слить в `main`, затем поставить PATCH-релиз `vX.Y.Z+1` напрямую (без RC) и проверить запись релиза.
+4. Слить `main` обратно в `dev` через `--no-ff`:
    ```sh
    git checkout dev && git pull --ff-only
    git merge --no-ff main
    ```
-   Resolve version conflicts in favour of the larger version (dev stays ahead).
-   `CHANGELOG.md` and `AGENTS.md` merge additively: keep both release sections.
-5. CI on `dev` must be green after the merge-back.
+   Конфликты версий разрешать в пользу старшей версии (dev остаётся впереди). `CHANGELOG.md` и `AGENTS.md` сливаются аддитивно: сохраняйте обе релизные секции.
+5. После merge-back CI на `dev` должен быть зелёным.
 
-## Artifacts
+## Артефакты
 
-Every release entry carries (built by `.github/workflows/release.yml`):
+Каждая запись релиза несёт (собирается `.github/workflows/release.yml`):
 
-| File | Contents |
+| Файл | Содержимое |
 |---|---|
-| `pagh-vX.Y.Z.elf` (or `pagh-vX.Y.Z-rc.N.elf`) | the release kernel ELF |
-| `pagh-vX.Y.Z.elf.sha256` | its SHA-256 checkout |
-| `Pagh-OS-vX.Y.Z.tar.gz` | source archive (`git archive`, tag-prefixed) |
-| `Pagh-OS-vX.Y.Z.tar.gz.sha256` | its SHA-256 checksum |
+| `pagh-vX.Y.Z.elf` (или `pagh-vX.Y.Z-rc.N.elf`) | релизное ядро ELF |
+| `pagh-vX.Y.Z.elf.sha256` | его SHA-256-контрольная сумма |
+| `Pagh-OS-vX.Y.Z.tar.gz` | архив исходников (`git archive`, с префиксом тега) |
+| `Pagh-OS-vX.Y.Z.tar.gz.sha256` | его SHA-256-контрольная сумма |
 
-Verify before using an artifact:
+Проверьте перед использованием артефакта:
 
 ```sh
 sha256sum -c pagh-vX.Y.Z.elf.sha256
 ```
 
-## Cross-repository ABI change order
+## Порядок изменения ABI между репозиториями
 
-When a change touches the C/ABI boundary, release in dependency order and only
-then update dependants:
+Когда изменение касается границы C/ABI, релизьте в порядке зависимостей и только потом обновляйте зависимых:
 
-1. `pagh-api` / `pagh-libc` (whichever changed; if both, `pagh-api` first when
-   the SDK pins the libc header).
-2. `pagh-rust` / `pagh-python` (they consume `pagh-api`/`pagh-libc`).
-3. `pagh-programs` (apps built against the new SDK), `pagh-repo` (published
-   packages), and finally Pagh-OS / pagh-riscv images that ship the new
-   runtime/ABI.
-4. Update the pinned sibling versions (`Cargo.toml` path/registry deps,
-   `Cargo.lock`) in the same release train, not later.
+1. `pagh-api` / `pagh-libc` (что изменилось; если оба, сначала `pagh-api`, когда SDK пинит заголовок libc).
+2. `pagh-rust` / `pagh-python` (они потребляют `pagh-api`/`pagh-libc`).
+3. `pagh-programs` (приложения, собранные против нового SDK), `pagh-repo` (опубликованные пакеты) и наконец образы Pagh-OS / pagh-riscv, которые несут новый runtime/ABI.
+4. Обновляйте запиненные версии соседей (`Cargo.toml` path/registry deps, `Cargo.lock`) в том же релизном поезде, а не позже.
 
-Never tag a dependant before its dependency is tagged; the release workflow
-only checks branch/version, not cross-repo compatibility.
+Никогда не тегируйте зависимого раньше зависимости; release workflow проверяет только ветку/версию, но не кросс-репозиторную совместимость.
