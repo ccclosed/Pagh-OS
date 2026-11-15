@@ -19,6 +19,12 @@ pagh-desktop server ──► Compositor ──► damage-регионы ──�
 * Протокол PDP/1: `hello`/`welcome`, `create`, `configure`, `commit` (полный кадр
   `XRGB8888`/`RGB565` по сокету), `input`, `focus`, `close`, `damage`, `error`,
   `ping`/`pong`; аккуратная проверка размеров/stride и повреждённых кадров.
+* Расширение **`launch` (type 13)**: клиент просит композитор открыть приложение
+  (`app` + подсказка `cwd`) — так работают «Открыть терминал…» в Files и меню
+  лаунчера. Цели запуска задаются `ServerOptions.launch_targets`/`--launch-target`
+  (`{socket}` подставляется), иначе используется демо-клиент (`--spawn-demo`).
+* Шрифт интерфейса — 8×16 ASCII + **кириллица** и типографские знаки
+  (`tools/gen_cyrillic_font.py`), поэтому заголовки русских приложений читаемы.
 * Окна: z-order, фокус, заголовок с кнопками `v/^/x`, перетаскивание за заголовок,
   resize за правый нижний угол, maximize/restore, minimize и восстановление с чипа
   панели; клиентские поверхности масштабируются до `configure`, если ещё не прислали
@@ -62,8 +68,16 @@ cargo run --bin pagh-desktop-demo -- --connect /tmp/pagh-desktop.sock --app file
 ```
 
 Сервер сам запускает `pagh-desktop-demo` по запросам панели/меню, если рядом лежит
-бинарник (`--demo-binary PATH` задаёт явно). Headless-кадры: `--screenshot-dir DIR`
-(каждый presented-кадр → `frame_NNNNN.png`), `--max-frames N` — выйти после N кадров.
+бинарник (`--demo-binary PATH` задаёт явно), и приложения по `launch`:
+
+```bash
+# настоящий терминал: {socket} подставится путём сокета сервера
+cargo run --bin pagh-desktop -- --socket /tmp/pagh-desktop.sock \
+    --launch-target 'terminal=pagh-terminal|--socket|{socket}'
+```
+
+Headless-кадры: `--screenshot-dir DIR` (каждый presented-кадр →
+`frame_NNNNN.png`), `--max-frames N` — выйти после N кадров.
 
 Скриншоты без сокета (детерминированный сценарий):
 
@@ -113,7 +127,7 @@ file target/x86_64-unknown-linux-musl/release/pagh-desktop
 | `panel.rs` | 44-пиксельная панель, часы/дата, Wi-Fi, чипы окон |
 | `context_menu.rs` | контекстные меню, hover, clamp к экрану |
 | `backend.rs` | trait `Backend`, headless-вывод PNG |
-| `canvas.rs` / `png.rs` / `deflate.rs` / `font.rs` | программный холст, примитивы, PNG-энкодер со встроенным deflate (fixed Huffman + LZ77, без зависимостей), шрифт 8×16 |
+| `canvas.rs` / `png.rs` / `deflate.rs` / `font.rs` | программный холст, примитивы, PNG-энкодер со встроенным deflate (fixed Huffman + LZ77, без зависимостей), шрифт 8×16 (ASCII + кириллица, генератор `tools/gen_cyrillic_font.py`) |
 | `surface.rs` | клиентские поверхности, `XRGB8888`/`RGB565`, stride |
 | `demo.rs` / `scenario.rs` | демо-контент Terminal/Files/Paint, сценарий скриншотов |
 | `src/bin/pagh-desktop.rs` | CLI сервера |

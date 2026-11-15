@@ -25,6 +25,27 @@ pub enum AppKind {
     Paint,
 }
 
+impl AppKind {
+    /// Стабильный идентификатор приложения для LAUNCH/CLI.
+    pub fn id(self) -> &'static str {
+        match self {
+            AppKind::Terminal => "terminal",
+            AppKind::Files => "files",
+            AppKind::Paint => "paint",
+        }
+    }
+
+    /// Разобрать идентификатор приложения.
+    pub fn from_id(id: &str) -> Option<AppKind> {
+        match id {
+            "terminal" => Some(AppKind::Terminal),
+            "files" => Some(AppKind::Files),
+            "paint" => Some(AppKind::Paint),
+            _ => None,
+        }
+    }
+}
+
 /// Действие, которое сервер должен выполнить после обработки события.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostEvent {
@@ -1236,12 +1257,10 @@ impl Compositor {
     /// Клавиатурное событие. Комбинации композитора обрабатываются здесь.
     pub fn key_event(&mut self, code: u32, pressed: bool, modifiers: u32) -> Vec<HostEvent> {
         if pressed {
-            if code == key::ESC {
-                if self.context_menu.is_some() || self.flyout.is_some() {
-                    self.close_context_menu();
-                    self.close_flyout();
-                    return Vec::new();
-                }
+            if code == key::ESC && (self.context_menu.is_some() || self.flyout.is_some()) {
+                self.close_context_menu();
+                self.close_flyout();
+                return Vec::new();
             }
             if code == key::F10 {
                 self.open_desktop_menu(self.pointer);
@@ -2027,7 +2046,7 @@ mod tests {
     #[test]
     fn render_full_draws_wallpaper_panel_and_windows() {
         let mut compositor = compositor();
-        let surface = Surface::filled(640, 400, PixelFormat::Xrgb8888, 0x0020_80_70);
+        let surface = Surface::filled(640, 400, PixelFormat::Xrgb8888, 0x0020_8070);
         compositor.commit_surface(1, 2, surface).unwrap();
         let rects = compositor.render_full();
         assert_eq!(rects, vec![compositor.screen()]);

@@ -20,6 +20,14 @@ Wayland в Pagh-OS пока отсутствует (нет `wl_display`, xdg-she
 
 Полное описание ABI — [`rust-apps/pagh-desktop/PROTOCOL.md`](../rust-apps/pagh-desktop/PROTOCOL.md).
 
+Запуск приложений из клиентов — расширение **`launch` (type 13)**: клиент присылает
+`app` (например `terminal`) и подсказку `cwd`, а композитор запускает настроенную
+команду (`ServerOptions.launch_targets`, CLI `--launch-target`) или демо-клиент при
+`--spawn-demo`. Оформление окна, кнопки `v/^/x`, панель и фокус принадлежат
+композитору: клиенты (`pagh-files`, `pagh-terminal`) рисуют только клиентскую
+область. Шрифт интерфейса композитора покрывает ASCII и кириллицу, поэтому
+русские заголовки читаемы.
+
 ## Архитектура
 
 ```text
@@ -158,8 +166,8 @@ value }` (24 байта) → EV_KEY/EV_REL/EV_SYN → те же `Compositor::poi
 1. `FbdevBackend`: mmap `/dev/fb0`, ioctl, damage-present; ждёт kernel-ABI.
 2. `EvdevInput`: `/dev/input/event0` + EV_KEY/EV_REL/EV_SYN, absolute mouse, hotplug.
 3. `ShmSurface` (`SCM_RIGHTS`, memfd) и частичный commit; frame upload остаётся fallback.
-4. Запуск настоящих приложений (реестр, `.desktop`-подобные записи) вместо
-   `--spawn-demo`; управление дочерними процессами и перезапуск.
+4. Реестр приложений и `.desktop`-подобные записи для `launch` (сейчас — явные
+   `launch_targets`/`--spawn-demo`); управление дочерними процессами и перезапуск.
 5. Клиентские popup/меню, курсоры, DnD, outputs/scale/rotation, анимации.
 6. Kernel-console/VT bridge: общий текстовый surface, чтобы shell стал окном Terminal.
 7. Ввод с реального железа (PS/2/USB HID через event0) и проверка в QEMU с

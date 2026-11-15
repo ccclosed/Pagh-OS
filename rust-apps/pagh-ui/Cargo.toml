@@ -19,6 +19,11 @@ path = "src/lib.rs"
 name = "pagh-ui-gallery"
 path = "src/bin/gallery.rs"
 
+[dev-dependencies]
+# Только для тестов: сверяем клиентский кодек PDP/1 с серверным кодеком
+# композитора (общий провод, независимые реализации).
+pagh-desktop = { path = "../pagh-desktop" }
+
 [profile.release]
 panic = "abort"
 opt-level = "s"
