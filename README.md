@@ -211,17 +211,22 @@ server certificate chain, hostname and validity checked before a byte of the ind
   composite device is bound and polled, the interrupt-IN transfer buffer is sized
   from `wMaxPacketSize` (so a longer report cannot babble the endpoint), and a
   halted endpoint is recovered with xHCI **Reset Endpoint** (bounded retries)
-  instead of disabling input until reboot. Root-port bring-up is a Linux-hub-like
-  state machine (`drivers/xhci_port.rs`, host-tested): a port still in USB2
-  Polling/RxDetect is never reset out of its debounce/training window, a reset is
-  awaited for PRC and PED+U0 up to 500 ms without a second reset, an enable must
-  stay stable before the device is addressed, a lost enable backs off (250 ms–1 s)
-  and is re-observed instead of reset every ~100 ms, and PP is power-cycled only
-  after many failures. The field machine that motivated this (Intel 8086:7a60, 26
-  ports) detected devices but reset them every ~124 ms; real hardware was not
-  available for this change, so it is QEMU evidence and the serial lines to look
-  for are named in `src/drivers/README.md`. Honest limitations: hubs are not
-  supported (a device behind one is invisible); report-protocol-only devices are
+  instead of disabling input until reboot. Root-port bring-up follows Linux
+  `hub.c`/`xhci-hub.c` in a pure, host-tested policy (`drivers/xhci_port.rs`):
+  every PORTSC write goes through the Linux
+  neutral mask (so acknowledging a reset can no longer write `PED=1` and disable
+  the port), the connection must be unchanged for 100 ms before a reset (25 ms
+  debounce steps, 2 s budget), a reset is awaited as `hub_port_wait_reset`
+  (10 ms then 200 ms polls, 800 ms per write, up to five writes, then `PED`), the
+  enable must hold for 200 ms before the device is addressed, a lost enable
+  pauses ≥1 s and is re-debounced instead of reset every ~100 ms, and there is no
+  PP power-cycle at all (PP is only raised, read back and retried). The field
+  machine that motivated this (Intel 8086:7a60, 26 ports) went through two field
+  reports: a reset every ~124 ms and then a port that enabled for a moment and
+  fell back to Polling, with every port left unpowered by the power-cycle.
+  Real hardware was not available for this change, so it is QEMU evidence and
+  the serial lines to look for are named in `src/drivers/README.md`. Honest
+  limitations: hubs are not supported (a device behind one is invisible); report-protocol-only devices are
   best effort (boot keyboard layout assumed, mouse supports the 7-byte 16-bit
   E-Signal layout or 8-bit axes); wheel/pan are decoded but not delivered; keyboard
   LED output reports (`SET_REPORT`) are not implemented.

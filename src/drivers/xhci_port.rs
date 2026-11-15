@@ -1,37 +1,49 @@
-//! Root-port reset policy for the xHCI driver.
+//! Root-port bring-up/reset policy for the xHCI driver, shaped like Linux's
+//! `hub.c`/`xhci-hub.c`.
 //!
-//! WHY A SEPARATE, PURE MODULE: the field bug is a timing decision, not an MMIO
-//! one — "reset this port now" versus "leave the PHY alone and look again" —
-//! and that decision cannot be observed on QEMU (its ports enable instantly).
-//! Keeping it here means the exact policy the kernel runs is driven on the host
-//! against simulated ports: a port that stays in Polling, a port that enables
-//! for 50 ms and falls back, a port that needs 700 ms of debounce, many failed
-//! attempts (backoff/power-cycle escalation). The driver in `xhci.rs` is then a
-//! thin executor: read PORTSC, call [`PortPolicy::step`], perform the returned
-//! [`Step`] side effect.
+//! WHY A SEPARATE, PURE MODULE: the field bug is a timing and write-ordering
+//! decision, not an MMIO one, and QEMU enables its ports instantly, so no boot
+//! test can observe it. Keeping the decision here lets the host tests drive the
+//! exact state machine the kernel runs against simulated PCH ports (a link that
+//! keeps dropping to Polling, a connect that bounces, a reset the controller
+//! never completes, five failed resets in a row).
 //!
-//! THE RULE THE OLD DRIVER BROKE. xHCI reports a USB2 port in Polling (7) or
-//! RxDetect (5) while the controller is still detecting/debouncing/training a
-//! device. Writing PR in that window restarts the attach sequence: PED appears
-//! for a moment, the link returns to Polling, and the old loop reset again
-//! 124 ms later (the field photo: `try=19 ms=124`). Linux's hub waits out the
-//! connect debounce and only then resets; after a reset it gives the port up to
-//! 500 ms for PRC and PED+U0, requires the enable to stay stable, and backs off
-//! between attempts. This module encodes exactly those decisions:
+//! LESSONS FROM THE TWO FIELD ROUNDS (Intel 8086:7a60, 26 ports):
 //!
-//! * Polling/RxDetect is a WAIT state, not a reset request: a port gets
-//!   [`DETECT_WAIT_US`] of uninterrupted training before a reset is considered,
-//!   and an enable that happens during the wait is adopted without any reset;
-//! * after a reset, PRC followed by PED+U0 is awaited for [`RESET_WAIT_US`]
-//!   without issuing another reset, whatever the link does in between;
-//! * the enable must hold for [`STABLE_US`] before the device is addressed;
-//! * a lost PED does not trigger a reset: the port goes into [`Phase::Backoff`]
-//!   (250 ms → 1 s) and is then observed again first;
-//! * a PP power-cycle is a last resort: only after [`POWER_CYCLE_AFTER`] failed
-//!   attempts, with a 500 ms power-off and a fresh debounce afterwards;
-//! * the state machine never blocks: `step` does one bounded decision and
-//!   returns, so the boot menu (which calls the driver synchronously from its
-//!   countdown) keeps working between steps.
+//! 1. The first iteration stopped the ~124 ms reset storm but still lost the
+//!    enable. Its PORTSC writes took the raw read value, masked only the
+//!    write-1-to-clear *change* bits and wrote the result back. That write still
+//!    carried `PED` (bit 1), which is itself write-1-to-clear ("write 1 to
+//!    disable the port"): clearing PRC/CSC on the just-enabled port therefore
+//!    DISABLED it, and the following read reported the field's `post=0x6e1`
+//!    (Polling, PED=0). It also carried `PR`/`WPR`, so a reset write could
+//!    re-trigger a reset. Linux never does this: every PORTSC write goes through
+//!    `xhci_port_state_to_neutral()`, which keeps only read-only bits (CCS,
+//!    speed) and read/write bits whose 0 means "leave alone" (PLS, PP), and then
+//!    ORs in the one bit it wants. [`port_state_to_neutral`] is that function.
+//! 2. The reset/change-bit order must be Linux's: write PR (USB2) or WPR (USB3)
+//!    on a neutral value, wait for the port to leave reset with a connection,
+//!    check PED, and only then clear C_PORT_RESET (PRC). Never clear PRC/CSC in
+//!    the same write that issues a reset.
+//! 3. The timing numbers are Linux's, not invented: `HUB_DEBOUNCE_STEP` 25 ms,
+//!    `HUB_DEBOUNCE_STABLE` 100 ms of uninterrupted connection before the first
+//!    reset, `HUB_DEBOUNCE_TIMEOUT` 2000 ms total, `PORT_RESET_TRIES` 5,
+//!    `HUB_SHORT_RESET_TIME` 10 ms then `HUB_LONG_RESET_TIME` 200 ms per wait,
+//!    `HUB_RESET_TIMEOUT` 800 ms per reset, and a 100 ms power settle after PP.
+//!    The 2 s is a *maximum* debounce budget, not a quiet period: Linux resets a
+//!    connected port after 100 ms of a stable connect, and so does this policy.
+//! 4. Linux never power-cycles a root port for an enable failure. The old
+//!    `PowerOff`/`PowerCycle` escalation is gone: a port is only ever powered
+//!    ON here, and a port that cannot be powered on is retried after the
+//!    backoff rather than left unpowered.
+//! 5. After a failed enable there is a ≥1 s pause, then a fresh debounce, so a
+//!    broken port produces a deliberate retry every few seconds, not the field's
+//!    reset every 124 ms.
+//!
+//! The driver in `xhci.rs` is a thin executor: read PORTSC, decode it into
+//! [`PortObservation`], call [`PortPolicy::step`], perform the returned
+//! [`Step`]. All waiting is a deadline compared on later polls, so the boot
+//! menu's countdown never blocks on a USB2 PHY.
 
 // ─── Link-state constants the policy talks about ─────────────────────────────
 //
@@ -44,9 +56,7 @@
 pub const PLS_U0: u8 = 0;
 /// Link state U3: suspended with the device still enabled.
 pub const PLS_U3: u8 = 3;
-/// Link state RxDetect: USB3 receiver detection. Part of the module's public
-/// vocabulary (decoders and host tests); the kernel's step function matches it
-/// through `PortObservation`.
+/// Link state RxDetect: USB3 receiver detection.
 #[allow(dead_code)]
 pub const PLS_RXDETECT: u8 = 5;
 /// Link state Polling: USB2 detection/training; PED is not valid yet.
@@ -54,62 +64,86 @@ pub const PLS_RXDETECT: u8 = 5;
 pub const PLS_POLLING: u8 = 7;
 
 // ─── Timing policy (microseconds unless named) ───────────────────────────────
+//
+// Every constant below is Linux's, with the file/constant it comes from named,
+// because "the field port does not enable" is not a reason to invent a number.
 
-/// Time a detecting port gets before a reset is allowed. Linux debounces a
-/// connect for ~100 ms and then resets; a PCH USB2 PHY can still be training
-/// well after that, and the field loop proved 60 ms is far too little. 400 ms
-/// is inside the 100–500 ms band the task asks for: long enough for the slow
-/// case, short enough that a dead port does not postpone boot for a second.
-pub const DETECT_WAIT_US: u64 = 400_000;
+/// `hub.c` HUB_DEBOUNCE_STEP: debounce samples are 25 ms apart.
+pub const HUB_DEBOUNCE_STEP_US: u64 = 25_000;
+/// `hub.c` HUB_DEBOUNCE_STABLE: the connection must be unchanged for this long
+/// before the port counts as connected. USB 2.0 §7.1.7.1 asks for ≥100 ms.
+pub const HUB_DEBOUNCE_STABLE_US: u64 = 100_000;
+/// `hub.c` HUB_DEBOUNCE_TIMEOUT: if the connection never stays stable this long,
+/// the debounce gives up (a bouncing/flapping port, not a device).
+pub const HUB_DEBOUNCE_TIMEOUT_US: u64 = 2_000_000;
+/// `hub.c` HUB_SHORT_RESET_TIME: first two reset-status polls are 10 ms apart.
+pub const HUB_SHORT_RESET_TIME_US: u64 = 10_000;
+/// `hub.c` HUB_LONG_RESET_TIME: after two short polls, poll every 200 ms.
+pub const HUB_LONG_RESET_TIME_US: u64 = 200_000;
+/// `hub.c` HUB_RESET_TIMEOUT: one reset attempt is abandoned after this long.
+pub const HUB_RESET_TIMEOUT_US: u64 = 800_000;
+/// `hub.c` PORT_RESET_TRIES: resets written for one bring-up before giving up.
+pub const PORT_RESET_TRIES: u8 = 5;
 
-/// Time after PR/WPR to wait for PRC and a PED+U0 enable. xHCI 1.2 §4.19.1
-/// gives USB2 a 50 ms reset + 10 ms recovery; slower PCH PHYs need more. During
-/// this window the policy NEVER issues another reset: PRC/PED are allowed to
-/// come and go, and a lost PED is handled after the window, not inside it.
-pub const RESET_WAIT_US: u64 = 500_000;
+/// Power settle after PP is raised. USB 2.0 §7.1.7.1 requires 100 ms between
+/// power-on and the first reset; Linux's root hub additionally debounces the
+/// connection for `HUB_DEBOUNCE_STABLE` before resetting. This policy keeps the
+/// 100 ms power settle and then the 100 ms stable-connect debounce, i.e. the
+/// conservative sum of both requirements (the old 20 ms was only the xHCI
+/// descriptor's `bPwrOn2PwrGood` value and skipped debounce entirely).
+pub const POWER_SETTLE_US: u64 = 100_000;
 
 /// Uninterrupted PED+U0 interval required before enumeration. A single PED read
-/// is not an enable: the field log shows PED was seen and then lost, and the
-/// old code accepted a 20 ms U0 glimpse. 80 ms is inside the 50–100 ms band.
-pub const STABLE_US: u64 = 80_000;
-
-/// Port power settle after raising PP (xHCI 1.2 §4.19.1: 20 ms before CCS is
-/// valid). The old driver slept here too; the policy makes the wait visible.
-pub const POWER_SETTLE_US: u64 = 20_000;
-
-/// How long PP stays off during a last-resort power cycle.
-pub const POWER_CYCLE_OFF_US: u64 = 500_000;
+/// is not an enable: the field log shows PED+U0 was seen and then lost. Linux
+/// only checks PED once; this driver additionally proves the enable held so a
+/// reset-time glimpse cannot be enumerated (and, with the neutral-write fix, is
+/// not disabled by our own change-bit clear either).
+pub const STABLE_US: u64 = 200_000;
 
 /// How often an empty port is re-examined. A port with nothing attached costs
-/// one PORTSC read per interval; no resets, no power cycling.
+/// one PORTSC read per interval; no resets, no power writes.
 pub const EMPTY_RETRY_US: u64 = 1_000_000;
 
 /// How long the policy waits for a software resume to reach U0.
 pub const RESUME_WAIT_US: u64 = 60_000;
 
-/// Failed attempts before a PP power-cycle is allowed. The old driver toggled
-/// PP every 4 attempts, which is exactly the kind of extra disturbance the
-/// field link did not need; 16 failures at 250 ms–1 s backoff means the port has
-/// had >10 s of quiet retries first.
-pub const POWER_CYCLE_AFTER: u16 = 16;
+/// Pause after a failed attempt (lost PED, reset timeout, enumeration failure).
+/// Linux relies on the hub workqueue's retry pacing; a cooperative polled driver
+/// needs an explicit quiet period so a dead port cannot become a reset loop.
+/// ≥1 s is also what the second field round asked for after a lost PED.
+pub const RETRY_BACKOFF_US: u64 = 1_000_000;
 
-/// Retry delay after a failed attempt: 250 ms, 500 ms, then 1 s (capped).
-/// The field driver retried every ~124 ms; that is faster than the link can
-/// recover and turns one slow device into a permanent reset loop.
-pub const fn backoff_us(failures: u16) -> u64 {
-    let ms = match failures {
-        0 | 1 => 250,
-        2 => 500,
-        _ => 1_000,
-    };
-    ms * 1_000
+/// Retry delay after a failed attempt. Kept as a function because callers log it
+/// and the host tests pin the floor; it is deliberately flat, not "faster at
+/// first": every retry now costs a full debounce plus up to five resets anyway.
+pub const fn backoff_us(_failures: u16) -> u64 {
+    RETRY_BACKOFF_US
+}
+
+// ─── PORTSC write helper (the bug from the second field round) ───────────────
+
+/// PORTSC bits that are read-only status or read/write-with-0-meaning-neutral
+/// (Linux `XHCI_PORT_RO` / `XHCI_PORT_RWS` in `xhci-hub.c`):
+///
+/// * RO: CCS (0), bit 3, speed id (10-13), bit 30;
+/// * RWS: PLS (5-8), PP (9), bits 14-15, bits 25-27.
+///
+/// Everything else is write-1-to-set / write-1-to-clear / reserved-zero and
+/// must be written as 0. In particular **PED (bit 1) is write-1-to-disable**:
+/// preserving a read PED value in a PORTSC write disabled the port that the
+/// field log showed enabled for a moment. PR (bit 4), WPR (31), LWS (16) and the
+/// change bits (17-23) are also cleared by this mask.
+pub fn port_state_to_neutral(raw: u32) -> u32 {
+    const RO: u32 = (1 << 0) | (1 << 3) | (0xf << 10) | (1 << 30);
+    const RWS: u32 = (0xf << 5) | (1 << 9) | (0x3 << 14) | (0x7 << 25);
+    (raw & RO) | (raw & RWS)
 }
 
 /// One PORTSC read, decoded by the driver.
 ///
 /// `raw` is kept because the diagnostics show the full register value: the
 /// field report is a photograph, and `pre`/`post`/`ped_sc` only mean something
-/// with all bits (CCS, PED, PLS, speed, PRC) intact.
+/// with all bits (CCS, PED, PLS, speed, PR, PRC, CSC) intact.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortObservation {
     pub ccs: bool,
@@ -117,8 +151,12 @@ pub struct PortObservation {
     pub pp: bool,
     pub speed: u8,
     pub pls: u8,
-    /// Port Reset Change was set in this read.
+    /// Port Reset Change was set in this read (sticky, write-1-to-clear).
     pub prc: bool,
+    /// Connect Status Change was set in this read (sticky, write-1-to-clear).
+    pub csc: bool,
+    /// Port Reset (bit 4): the controller is still performing a reset.
+    pub pr: bool,
     pub raw: u32,
 }
 
@@ -130,6 +168,8 @@ impl PortObservation {
         speed: u8,
         pls: u8,
         prc: bool,
+        csc: bool,
+        pr: bool,
         raw: u32,
     ) -> Self {
         Self {
@@ -139,18 +179,21 @@ impl PortObservation {
             speed,
             pls,
             prc,
+            csc,
+            pr,
             raw,
         }
     }
 
-    /// A port that is enabled and active: PED, U0 and a valid speed id.
+    /// A port that is enabled and active: PED, U0, a valid speed id, and not
+    /// still inside a reset.
     pub const fn enabled(&self) -> bool {
-        self.ccs && self.ped && self.speed != 0 && self.pls == PLS_U0
+        self.ccs && self.ped && self.speed != 0 && self.pls == PLS_U0 && !self.pr
     }
 
     /// Suspended but still enabled: resume is required, not a reset.
     pub const fn suspended(&self) -> bool {
-        self.ccs && self.ped && self.speed != 0 && self.pls == PLS_U3
+        self.ccs && self.ped && self.speed != 0 && self.pls == PLS_U3 && !self.pr
     }
 
     /// Still detecting/debouncing/training the device.
@@ -165,11 +208,12 @@ impl PortObservation {
 pub enum Step {
     /// Nothing to do this poll. The policy waits for time or the next PORTSC.
     Idle,
-    /// Raise PP (port power). The policy then waits [`POWER_SETTLE_US`].
+    /// Raise PP (port power) and read it back. The policy then waits
+    /// [`POWER_SETTLE_US`] before debouncing the connection.
     PowerOn,
-    /// Drop PP for a last-resort power cycle (waits [`POWER_CYCLE_OFF_US`]).
-    PowerOff,
-    /// Clear stale change bits and write PR (USB2) or WPR (USB3).
+    /// Write PR (USB2) or WPR (USB3) on a neutral PORTSC value. The policy then
+    /// waits for the reset to complete (PR clear + CCS) and PED, up to
+    /// [`HUB_RESET_TIMEOUT_US`] per write and [`PORT_RESET_TRIES`] writes.
     Reset { warm: bool },
     /// Port is enabled but suspended: perform a software resume.
     Resume,
@@ -184,12 +228,14 @@ pub enum Step {
 /// menu and the shell print, and the serial log names the same value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FailReason {
-    /// The controller never raised PRC for the reset we asked for.
-    NoPrc,
-    /// PRC/PED were seen (or the reset completed) but PED+U0 did not hold.
+    /// The reset never left the port enabled within its 800 ms window(s).
+    ResetTimeout,
+    /// Reset completed, but PED+U0 did not hold for [`STABLE_US`].
     LostAfterReset,
     /// The device disappeared during the attempt.
     Disconnected,
+    /// The connection never stayed stable for [`HUB_DEBOUNCE_STABLE_US`].
+    DebounceTimeout,
     /// A software resume did not reach U0.
     ResumeLost,
     /// The port enabled but enumeration (descriptors/configuration) failed.
@@ -201,9 +247,10 @@ pub enum FailReason {
 impl FailReason {
     pub const fn stage(self) -> &'static str {
         match self {
-            FailReason::NoPrc => "reset-no-prc",
+            FailReason::ResetTimeout => "reset-timeout",
             FailReason::LostAfterReset => "lost-after-reset",
             FailReason::Disconnected => "no-device",
+            FailReason::DebounceTimeout => "debounce-timeout",
             FailReason::ResumeLost => "resume-lost",
             FailReason::EnumFailed => "enum-failed",
             FailReason::NoPower => "no-power",
@@ -213,8 +260,8 @@ impl FailReason {
     const fn needs_reset_before_retry(self) -> bool {
         // Enumeration failure happens on an ENABLED port: the link is fine but
         // the device/endpoint state is not, so the next attempt starts with a
-        // reset. A lost enable is the opposite: observe first, reset only if
-        // the link does not come back by itself (see `Phase::Backoff`).
+        // reset. A lost enable is the opposite: debounce and reset again from
+        // scratch (Linux's hub workqueue does the same after a failed reset).
         matches!(self, FailReason::EnumFailed)
     }
 }
@@ -229,16 +276,16 @@ pub enum Phase {
     PowerSettle,
     /// Nothing attached; re-read once per [`EMPTY_RETRY_US`].
     Empty,
-    /// Port is detecting/training: wait, do not reset before the deadline.
+    /// Sampling CCS every [`HUB_DEBOUNCE_STEP_US`] until the connection has
+    /// been unchanged for [`HUB_DEBOUNCE_STABLE_US`] (Linux hub_port_debounce).
     Debounce,
-    /// PR/WPR issued: wait for PRC and PED+U0 until the deadline.
+    /// PR/WPR issued: wait for PR clear + CCS, then PED, up to
+    /// [`HUB_RESET_TIMEOUT_US`] per write (Linux hub_port_wait_reset).
     ResetWait,
     /// PED+U0 seen: require [`STABLE_US`] of uninterrupted enable.
     Stabilize,
     /// Failed attempt: quiet until the backoff deadline.
     Backoff,
-    /// PP is off for a last-resort power cycle.
-    PowerCycle,
     /// Software resume in progress.
     ResumeWait,
     /// Port is enabled and the driver is enumerating it (the driver reports
@@ -246,7 +293,7 @@ pub enum Phase {
     Enumerating,
 }
 
-/// The complete reset policy of one root port. `Copy`, no allocation.
+/// The complete bring-up policy of one root port. `Copy`, no allocation.
 #[derive(Clone, Copy)]
 pub struct PortPolicy {
     phase: Phase,
@@ -254,11 +301,11 @@ pub struct PortPolicy {
     deadline_us: u64,
     /// Start of the current stability window / observation.
     since_us: u64,
-    /// Start of the current attempt (reset or adoption), for `ms=`.
+    /// Start of the current attempt (reset sequence or adoption), for `ms=`.
     attempt_started_us: u64,
     /// PR/WPR commands issued since boot (the menu's `try=`).
     resets: u16,
-    /// Failed attempts since boot (drives backoff and the power-cycle gate).
+    /// Failed attempts since boot (drives the backoff / diagnostics).
     failures: u16,
     /// Whether the enable being enumerated came from OUR reset (the driver
     /// prints `reset-ok`) or was adopted/resumed (`adopted`).
@@ -267,8 +314,37 @@ pub struct PortPolicy {
     need_reset: bool,
     /// USB3 port (Supported Protocol major revision 3): reset is WPR.
     usb3: bool,
+    // ── hub_port_debounce state ─────────────────────────────────────────────
+    /// Start of the current debounce window (real-time timeout base).
+    debounce_started_us: u64,
+    /// When the next 25 ms debounce sample is due.
+    debounce_next_us: u64,
+    /// Total debounce time elapsed (Linux `total_time`), for the log.
+    debounce_total_us: u64,
+    /// Unchanged-connection time accumulated in 25 ms steps (Linux
+    /// `stable_time`), for the log and the decision.
+    debounce_stable_us: u64,
+    /// Whether a previous sample has established the sampled connection state.
+    debounce_have_conn: bool,
+    /// The connection state the stable timer is counting.
+    debounce_conn: bool,
+    /// CSC as it was at the previous sample, so a *new* connect change resets
+    /// the stable timer even though the sticky bit is not cleared before reset.
+    debounce_last_csc: bool,
+    // ── hub_port_wait_reset state ───────────────────────────────────────────
+    /// Reset writes in the current attempt (1..=[`PORT_RESET_TRIES`]).
+    reset_tries: u8,
+    /// When the current reset write happened (poll schedule base).
+    reset_wait_started_us: u64,
+    /// When the next reset-status poll is due.
+    reset_wait_next_us: u64,
+    /// Current poll spacing: 10 ms for the first two, then 200 ms.
+    reset_wait_delay_us: u64,
+    /// Reset-status polls taken for the current write (Linux `delay_time`).
+    reset_wait_samples: u8,
     // ── last-attempt diagnostics (per port, never shared) ───────────────────
     seen_prc: bool,
+    seen_csc: bool,
     seen_ped: bool,
     /// PED was seen with PLS=U0 and a valid speed (a real enable glimpse).
     seen_ped_u0: bool,
@@ -291,7 +367,20 @@ impl PortPolicy {
             attempt_had_reset: false,
             need_reset: false,
             usb3,
+            debounce_started_us: 0,
+            debounce_next_us: 0,
+            debounce_total_us: 0,
+            debounce_stable_us: 0,
+            debounce_have_conn: false,
+            debounce_conn: false,
+            debounce_last_csc: false,
+            reset_tries: 0,
+            reset_wait_started_us: 0,
+            reset_wait_next_us: 0,
+            reset_wait_delay_us: HUB_SHORT_RESET_TIME_US,
+            reset_wait_samples: 0,
             seen_prc: false,
+            seen_csc: false,
             seen_ped: false,
             seen_ped_u0: false,
             ped_sc: 0,
@@ -309,7 +398,12 @@ impl PortPolicy {
         self.resets
     }
 
-    /// Failed attempts since boot (backoff/power-cycle escalation).
+    /// Reset writes in the CURRENT attempt (Linux `PORT_RESET_TRIES` walk).
+    pub const fn reset_tries(&self) -> u8 {
+        self.reset_tries
+    }
+
+    /// Failed attempts since boot.
     pub const fn failures(&self) -> u16 {
         self.failures
     }
@@ -324,6 +418,10 @@ impl PortPolicy {
 
     pub const fn seen_prc(&self) -> bool {
         self.seen_prc
+    }
+
+    pub const fn seen_csc(&self) -> bool {
+        self.seen_csc
     }
 
     pub const fn seen_ped(&self) -> bool {
@@ -346,6 +444,16 @@ impl PortPolicy {
         self.post
     }
 
+    /// Debounce progress (`total_time` in Linux's log line), microseconds.
+    pub const fn debounce_total_us(&self) -> u64 {
+        self.debounce_total_us
+    }
+
+    /// Debounce progress (`stable_time` in Linux's log line), microseconds.
+    pub const fn debounce_stable_us(&self) -> u64 {
+        self.debounce_stable_us
+    }
+
     /// Advance the machine with one PORTSC observation taken at `now_us` (any
     /// monotonic microsecond clock; the driver uses calibrated TSC). Returns the
     /// one side effect the driver must perform; all waiting is done by calling
@@ -362,7 +470,10 @@ impl PortPolicy {
                 }
             }
             Phase::Empty => {
-                if !obs.ccs {
+                if !obs.pp {
+                    // Never leave a port unpowered: PP is only ever raised here.
+                    self.begin(obs, now_us)
+                } else if !obs.ccs {
                     if now_us >= self.deadline_us {
                         self.deadline_us = now_us.saturating_add(EMPTY_RETRY_US);
                     }
@@ -373,65 +484,8 @@ impl PortPolicy {
                     self.begin(obs, now_us)
                 }
             }
-            Phase::Debounce => {
-                if !obs.ccs {
-                    self.phase = Phase::Empty;
-                    self.deadline_us = now_us.saturating_add(EMPTY_RETRY_US);
-                    return Step::Idle;
-                }
-                if obs.enabled() {
-                    // Self-enable during detect/training: still require the
-                    // stability window. The field port produced exactly this
-                    // PED+U0 glimpse before falling back, and the old 20 ms
-                    // check accepted it as an enable.
-                    return self.stabilize(obs, now_us);
-                }
-                if obs.suspended() {
-                    return self.resume(now_us);
-                }
-                // Polling/RxDetect (or any other not-yet-enabled state): the
-                // whole point of this phase is that the timer — not a reset —
-                // decides when the wait is over.
-                if now_us >= self.deadline_us {
-                    if obs.pp {
-                        self.start_reset(obs, now_us)
-                    } else {
-                        self.phase = Phase::PowerSettle;
-                        self.deadline_us = now_us.saturating_add(POWER_SETTLE_US);
-                        Step::PowerOn
-                    }
-                } else {
-                    Step::Idle
-                }
-            }
-            Phase::ResetWait => {
-                if !obs.ccs {
-                    return self.fail(obs, now_us, FailReason::Disconnected);
-                }
-                if obs.enabled() {
-                    // Do not address the device yet: a PED glimpse is not an
-                    // enable (the field port raises it and loses it again).
-                    self.phase = Phase::Stabilize;
-                    self.since_us = now_us;
-                    self.deadline_us = now_us.saturating_add(STABLE_US);
-                    self.post = obs.raw;
-                    return Step::Idle;
-                }
-                if obs.suspended() {
-                    return self.resume(now_us);
-                }
-                if now_us >= self.deadline_us {
-                    let reason = if self.seen_prc {
-                        FailReason::LostAfterReset
-                    } else {
-                        FailReason::NoPrc
-                    };
-                    return self.fail(obs, now_us, reason);
-                }
-                // Whatever PED/PLS do inside this window: keep waiting. PRC and
-                // PED+U0 may legally appear late; resetting here is the bug.
-                Step::Idle
-            }
+            Phase::Debounce => self.debounce_step(obs, now_us),
+            Phase::ResetWait => self.reset_wait_step(obs, now_us),
             Phase::Stabilize => {
                 if obs.enabled() {
                     if now_us.saturating_sub(self.since_us) >= STABLE_US {
@@ -441,8 +495,9 @@ impl PortPolicy {
                 } else if obs.suspended() {
                     self.resume(now_us)
                 } else {
-                    // The enable did not hold. Do NOT reset: back off, then
-                    // observe again (the port is probably back in Polling).
+                    // The enable did not hold. Do NOT reset here: back off for
+                    // ≥1 s, then debounce and (only if still not enabled) reset
+                    // again. This is the field's lost-PED path.
                     self.fail(obs, now_us, FailReason::LostAfterReset)
                 }
             }
@@ -450,28 +505,9 @@ impl PortPolicy {
                 if now_us < self.deadline_us {
                     return Step::Idle;
                 }
-                if !obs.ccs {
-                    self.begin(obs, now_us)
-                } else if self.should_power_cycle() {
-                    // Last resort, after many quiet failures: cold-start the
-                    // port. The following steps power it back on and wait a
-                    // fresh debounce — no reset is written while PP is down.
-                    self.phase = Phase::PowerCycle;
-                    self.deadline_us = now_us.saturating_add(POWER_CYCLE_OFF_US);
-                    self.attempt_had_reset = false;
-                    Step::PowerOff
-                } else {
-                    self.begin(obs, now_us)
-                }
-            }
-            Phase::PowerCycle => {
-                if now_us < self.deadline_us {
-                    Step::Idle
-                } else {
-                    self.phase = Phase::PowerSettle;
-                    self.deadline_us = now_us.saturating_add(POWER_SETTLE_US);
-                    Step::PowerOn
-                }
+                // Never power-cycle: re-observe and let the normal path raise
+                // PP again only if it was actually lost.
+                self.begin(obs, now_us)
             }
             Phase::ResumeWait => {
                 if obs.enabled() {
@@ -513,6 +549,7 @@ impl PortPolicy {
         self.failures = self.failures.saturating_add(1);
         self.need_reset = reason.needs_reset_before_retry();
         self.attempt_had_reset = false;
+        self.reset_tries = 0;
         self.deadline_us = now_us.saturating_add(backoff_us(self.failures));
         Step::Failed(reason)
     }
@@ -523,6 +560,9 @@ impl PortPolicy {
     fn observe(&mut self, obs: PortObservation) {
         if obs.prc {
             self.seen_prc = true;
+        }
+        if obs.csc {
+            self.seen_csc = true;
         }
         if obs.ped {
             self.seen_ped = true;
@@ -540,27 +580,31 @@ impl PortPolicy {
         }
     }
 
-    /// First decision after Idle/Empty/Backoff/PowerSettle: adopt, resume, or
-    /// start observing a still-detecting port. NEVER resets a detecting port.
+    /// First decision after Idle/Empty/Backoff/PowerSettle: power on if needed,
+    /// adopt, resume, or start debouncing a detecting port. NEVER resets a
+    /// port before its connect has been stable for [`HUB_DEBOUNCE_STABLE_US`].
     fn begin(&mut self, obs: PortObservation, now_us: u64) -> Step {
-        if !obs.ccs {
-            self.phase = Phase::Empty;
-            self.deadline_us = now_us.saturating_add(EMPTY_RETRY_US);
-            self.attempt_had_reset = false;
-            return Step::Idle;
-        }
-        self.attempt_started_us = now_us;
+        // Power the port first, even with nothing attached: Linux powers every
+        // root-hub port at init, and an unpowered port reports no connection at
+        // all, so a keyboard on a port that HCRST left unpowered would otherwise
+        // stay invisible forever.
         if !obs.pp {
             self.phase = Phase::PowerSettle;
             self.deadline_us = now_us.saturating_add(POWER_SETTLE_US);
             self.attempt_had_reset = false;
             return Step::PowerOn;
         }
+        if !obs.ccs {
+            self.phase = Phase::Empty;
+            self.deadline_us = now_us.saturating_add(EMPTY_RETRY_US);
+            self.attempt_had_reset = false;
+            return Step::Idle;
+        }
         if obs.enabled() {
             if self.need_reset {
                 return self.start_reset(obs, now_us);
             }
-            // Already enabled (firmware left it up, or it recovered during
+            // Already enabled (firmware left it up, or it recovered during the
             // backoff): adopt it only after the same uninterrupted U0 window.
             return self.stabilize(obs, now_us);
         }
@@ -570,29 +614,157 @@ impl PortPolicy {
             self.attempt_had_reset = false;
             return Step::Resume;
         }
-        // Polling/RxDetect (or an unusable link state): give the controller its
-        // detect/debounce/train window. The deadline is the only thing that can
-        // turn this into a reset.
+        // Attached but not enabled: Linux hub_port_debounce first (25 ms steps,
+        // 100 ms stable, 2 s budget), and only then a reset.
+        self.start_debounce(obs, now_us);
+        Step::Idle
+    }
+
+    fn start_debounce(&mut self, obs: PortObservation, now_us: u64) {
         self.phase = Phase::Debounce;
-        self.deadline_us = now_us.saturating_add(DETECT_WAIT_US);
-        self.attempt_had_reset = false;
+        self.debounce_started_us = now_us;
+        self.debounce_next_us = now_us.saturating_add(HUB_DEBOUNCE_STEP_US);
+        self.debounce_total_us = 0;
+        self.debounce_stable_us = 0;
+        // The observation that started the debounce is Linux's first
+        // `usb_hub_port_status()` read: it establishes `connection`, so a steady
+        // port completes HUB_DEBOUNCE_STABLE 100 ms after this point, not 125.
+        self.debounce_have_conn = true;
+        self.debounce_conn = obs.ccs;
+        self.debounce_last_csc = obs.csc;
+        self.since_us = now_us;
+    }
+
+    /// Linux `hub_port_debounce`: sample every 25 ms; the connection must be
+    /// unchanged for 100 ms. A newly-set CSC or a CCS change restarts the timer.
+    /// When the connection is stable, decide: adopt an enable, resume a suspend,
+    /// or (only now) reset the still-disabled port.
+    fn debounce_step(&mut self, obs: PortObservation, now_us: u64) -> Step {
+        if now_us < self.debounce_next_us {
+            return Step::Idle;
+        }
+        self.debounce_next_us = now_us.saturating_add(HUB_DEBOUNCE_STEP_US);
+        self.debounce_total_us = now_us.saturating_sub(self.debounce_started_us);
+
+        let csc_edge = obs.csc && !self.debounce_last_csc;
+        self.debounce_last_csc = obs.csc;
+        let conn = obs.ccs;
+        if !self.debounce_have_conn {
+            self.debounce_have_conn = true;
+            self.debounce_conn = conn;
+            self.debounce_stable_us = 0;
+        } else if !csc_edge && conn == self.debounce_conn {
+            self.debounce_stable_us = self
+                .debounce_stable_us
+                .saturating_add(HUB_DEBOUNCE_STEP_US)
+                .min(HUB_DEBOUNCE_STABLE_US);
+        } else {
+            self.debounce_stable_us = 0;
+            self.debounce_conn = conn;
+        }
+
+        if self.debounce_stable_us >= HUB_DEBOUNCE_STABLE_US {
+            if !conn {
+                // A stable *disconnection* (Linux debounces both directions).
+                self.phase = Phase::Empty;
+                self.deadline_us = now_us.saturating_add(EMPTY_RETRY_US);
+                self.attempt_had_reset = false;
+                return Step::Idle;
+            }
+            if obs.enabled() {
+                // Self-enabled during detect/training: adopt without any PR,
+                // but still require the stability window (the field port
+                // produced exactly this PED+U0 glimpse before falling back).
+                return self.stabilize(obs, now_us);
+            }
+            if obs.suspended() {
+                return self.resume(now_us);
+            }
+            return self.start_reset(obs, now_us);
+        }
+
+        if now_us.saturating_sub(self.debounce_started_us) >= HUB_DEBOUNCE_TIMEOUT_US {
+            return self.fail(obs, now_us, FailReason::DebounceTimeout);
+        }
         Step::Idle
     }
 
     fn start_reset(&mut self, obs: PortObservation, now_us: u64) -> Step {
+        // A retry inside one attempt (Linux's outer PORT_RESET_TRIES loop) keeps
+        // the attempt clock and the pre-reset snapshot from the first write.
+        if self.phase != Phase::ResetWait || self.reset_tries == 0 {
+            self.attempt_started_us = now_us;
+            self.reset_tries = 0;
+            self.pre = obs.raw;
+            self.seen_prc = false;
+            self.seen_csc = false;
+            self.seen_ped = false;
+            self.seen_ped_u0 = false;
+            self.ped_sc = 0;
+        }
+        self.reset_tries = self.reset_tries.saturating_add(1);
         self.phase = Phase::ResetWait;
-        self.deadline_us = now_us.saturating_add(RESET_WAIT_US);
-        self.since_us = now_us;
-        self.attempt_started_us = now_us;
-        self.pre = obs.raw;
-        self.seen_prc = false;
-        self.seen_ped = false;
-        self.seen_ped_u0 = false;
-        self.ped_sc = 0;
         self.attempt_had_reset = true;
         self.need_reset = false;
         self.resets = self.resets.saturating_add(1);
+        self.reset_wait_started_us = now_us;
+        self.reset_wait_next_us = now_us.saturating_add(HUB_SHORT_RESET_TIME_US);
+        self.reset_wait_delay_us = HUB_SHORT_RESET_TIME_US;
+        self.reset_wait_samples = 0;
         Step::Reset { warm: self.usb3 }
+    }
+
+    /// Linux `hub_port_wait_reset`: poll every 10 ms twice, then every 200 ms,
+    /// for up to 800 ms. Success is PR clear AND connection; then PED must be
+    /// set, otherwise the reset is retried (up to five writes per attempt).
+    fn reset_wait_step(&mut self, obs: PortObservation, now_us: u64) -> Step {
+        if now_us < self.reset_wait_next_us {
+            return Step::Idle;
+        }
+        self.reset_wait_samples = self.reset_wait_samples.saturating_add(1);
+        let elapsed = now_us.saturating_sub(self.reset_wait_started_us);
+
+        if !obs.pr && obs.ccs {
+            if obs.enabled() {
+                // Reset completed and the port is enabled at U0 with a speed.
+                self.phase = Phase::Stabilize;
+                self.since_us = now_us;
+                self.deadline_us = now_us.saturating_add(STABLE_US);
+                self.post = obs.raw;
+                return Step::Idle;
+            }
+            // PR clear + connected but no usable enable: Linux returns -EBUSY
+            // and writes the reset again.
+            return self.reset_retry_or_fail(obs, now_us, FailReason::ResetTimeout);
+        }
+
+        if elapsed >= HUB_RESET_TIMEOUT_US {
+            let reason = if obs.ccs {
+                FailReason::ResetTimeout
+            } else {
+                FailReason::Disconnected
+            };
+            return self.reset_retry_or_fail(obs, now_us, reason);
+        }
+
+        // Two short polls, then the long spacing (hub.c HUB_LONG_RESET_TIME).
+        if self.reset_wait_samples >= 2 {
+            self.reset_wait_delay_us = HUB_LONG_RESET_TIME_US;
+        }
+        self.reset_wait_next_us = now_us.saturating_add(self.reset_wait_delay_us);
+        Step::Idle
+    }
+
+    fn reset_retry_or_fail(
+        &mut self,
+        obs: PortObservation,
+        now_us: u64,
+        reason: FailReason,
+    ) -> Step {
+        if self.reset_tries < PORT_RESET_TRIES {
+            return self.start_reset(obs, now_us);
+        }
+        self.fail(obs, now_us, reason)
     }
 
     /// Start the uninterrupted PED+U0 window that must precede enumeration.
@@ -604,6 +776,9 @@ impl PortPolicy {
         self.since_us = now_us;
         self.deadline_us = now_us.saturating_add(STABLE_US);
         self.post = obs.raw;
+        // `stabilize` is the adopt/resume path, so `attempt_had_reset` is
+        // already false here; the reset path enters Stabilize directly and keeps
+        // the attempt's "reset-ok" provenance.
         Step::Idle
     }
 
@@ -621,23 +796,28 @@ impl PortPolicy {
         self.deadline_us = now_us.saturating_add(RESUME_WAIT_US);
         Step::Resume
     }
-
-    fn should_power_cycle(&self) -> bool {
-        self.failures >= POWER_CYCLE_AFTER && self.failures % POWER_CYCLE_AFTER == 0
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn obs(ccs: bool, ped: bool, pp: bool, speed: u8, pls: u8, prc: bool) -> PortObservation {
+    fn obs(
+        ccs: bool,
+        ped: bool,
+        pp: bool,
+        speed: u8,
+        pls: u8,
+        prc: bool,
+        csc: bool,
+        pr: bool,
+    ) -> PortObservation {
         let mut raw = 0u32;
         if ccs {
-            raw |= 1;
+            raw |= 1 << 0;
         }
         if ped {
-            raw |= 2;
+            raw |= 1 << 1;
         }
         if pp {
             raw |= 1 << 9;
@@ -647,160 +827,413 @@ mod tests {
         if prc {
             raw |= 1 << 21;
         }
-        PortObservation::new(ccs, ped, pp, speed, pls, prc, raw)
+        if csc {
+            raw |= 1 << 17;
+        }
+        if pr {
+            raw |= 1 << 4;
+        }
+        PortObservation::new(ccs, ped, pp, speed, pls, prc, csc, pr, raw)
     }
 
     fn normal(pls: u8) -> PortObservation {
-        obs(true, false, true, 0, pls, false)
+        obs(true, false, true, 0, pls, false, false, false)
+    }
+
+    fn enabled(speed: u8) -> PortObservation {
+        obs(true, true, true, speed, PLS_U0, false, false, false)
+    }
+
+    /// Drive a detecting port through a full, stable debounce (four counted
+    /// samples at 25 ms after the first establishing sample).
+    fn stable_debounce(p: &mut PortPolicy, now: &mut u64, pls: u8) {
+        assert_eq!(p.step(normal(pls), *now), Step::Idle);
+        for _ in 0..5 {
+            *now += HUB_DEBOUNCE_STEP_US;
+            let step = p.step(normal(pls), *now);
+            if !matches!(step, Step::Idle) {
+                return;
+            }
+        }
     }
 
     #[test]
-    fn polling_is_wait_not_reset() {
+    fn neutral_write_never_carries_ped_pr_or_change_bits() {
+        // A raw PORTSC from the field: CCS+PED+PP+speed=3+U0+PRC+CSC+PR+WPR.
+        let mut raw = 0u32;
+        raw |= 1 << 0; // CCS
+        raw |= 1 << 1; // PED (write 1 disables!)
+        raw |= 1 << 3;
+        raw |= 0xF << 5; // PLS
+        raw |= 1 << 9; // PP
+        raw |= 3 << 10; // speed
+        raw |= 1 << 16; // LWS
+        raw |= 1 << 17; // CSC
+        raw |= 1 << 21; // PRC
+        raw |= 1 << 31; // WPR
+        raw |= 1 << 4; // PR
+        let neutral = port_state_to_neutral(raw);
+        assert_eq!(neutral & (1 << 1), 0, "PED must never be written back");
+        assert_eq!(neutral & (1 << 4), 0, "PR must not be re-issued");
+        assert_eq!(neutral & (1 << 31), 0, "WPR must not be re-issued");
+        assert_eq!(neutral & (1 << 16), 0, "LWS must not be set implicitly");
+        assert_eq!(neutral & (1 << 17), 0, "CSC is write-1-to-clear");
+        assert_eq!(neutral & (1 << 21), 0, "PRC is write-1-to-clear");
+        // Read-only status / neutral write bits survive.
+        assert_eq!(neutral & 1, 1, "CCS is read-only");
+        assert_eq!(neutral & (0xF << 10), 3 << 10, "speed is read-only");
+        assert_eq!(neutral & (0xF << 5), 0xF << 5, "PLS is neutral with LWS=0");
+        assert_eq!(neutral & (1 << 9), 1 << 9, "PP survives");
+        // The reset write is neutral | PR: a reset must not disable the port.
+        let reset = neutral | (1 << 4);
+        assert_eq!(reset & (1 << 1), 0);
+    }
+
+    #[test]
+    fn debounce_needs_100ms_of_unchanged_connection() {
+        let mut p = PortPolicy::new(false);
+        let poll = normal(PLS_POLLING);
+        let mut now = 0u64;
+        assert_eq!(p.step(poll, now), Step::Idle);
+        assert_eq!(p.phase(), Phase::Debounce);
+        // Samples at 25/50/75 ms: still inside the 100 ms stable window.
+        for _ in 0..3 {
+            now += HUB_DEBOUNCE_STEP_US;
+            assert_eq!(p.step(poll, now), Step::Idle);
+            assert_eq!(p.resets(), 0);
+        }
+        // Fourth counted sample completes 100 ms of stable connection, and only
+        // then is PR written (Linux hub_port_debounce → hub_port_reset).
+        now += HUB_DEBOUNCE_STEP_US;
+        assert_eq!(p.step(poll, now), Step::Reset { warm: false });
+        assert_eq!(p.resets(), 1);
+        assert_eq!(p.reset_tries(), 1);
+    }
+
+    #[test]
+    fn a_new_csc_edge_restarts_the_debounce_timer() {
+        let mut p = PortPolicy::new(false);
+        let poll = normal(PLS_POLLING);
+        let mut now = 0u64;
+        assert_eq!(p.step(poll, now), Step::Idle);
+        for _ in 0..3 {
+            now += HUB_DEBOUNCE_STEP_US;
+            assert_eq!(p.step(poll, now), Step::Idle);
+        }
+        // Connect change at 100 ms: the stable timer restarts, so the reset that
+        // was due now does not happen.
+        now += HUB_DEBOUNCE_STEP_US;
+        let with_csc = obs(true, false, true, 0, PLS_POLLING, false, true, false);
+        assert_eq!(p.step(with_csc, now), Step::Idle);
+        assert_eq!(p.resets(), 0);
+        for _ in 0..3 {
+            now += HUB_DEBOUNCE_STEP_US;
+            assert_eq!(p.step(poll, now), Step::Idle);
+            assert_eq!(p.resets(), 0);
+        }
+        now += HUB_DEBOUNCE_STEP_US;
+        assert_eq!(p.step(poll, now), Step::Reset { warm: false });
+    }
+
+    #[test]
+    fn connection_that_never_settles_times_out_after_2s() {
         let mut p = PortPolicy::new(false);
         let mut now = 0u64;
-        // Attached port in Polling: the first step starts the debounce window
-        // and must not write a reset.
-        assert_eq!(p.step(normal(PLS_POLLING), now), Step::Idle);
-        assert_eq!(p.phase(), Phase::Debounce);
-        // Every poll inside the window is still a wait — no reset at 60 ms, no
-        // reset at 100/124 ms (the field loop's cadence).
-        for ms in [60, 100, 124, 250, 399] {
-            now = ms * 1_000;
-            assert_eq!(p.step(normal(PLS_POLLING), now), Step::Idle, "ms={ms}");
+        // CCS toggles on every sample: stable_time never reaches 100 ms.
+        let mut ccs = true;
+        // 80 samples cover exactly the 2 s debounce budget.
+        for _ in 0..80 {
+            assert_eq!(
+                p.step(
+                    obs(ccs, false, true, 0, PLS_POLLING, false, false, false),
+                    now
+                ),
+                Step::Idle,
+                "a bouncing port is never reset"
+            );
+            ccs = !ccs;
+            now += HUB_DEBOUNCE_STEP_US;
         }
-        // At the end of the debounce window the port still has not enabled, so
-        // a reset is now the correct escalation.
-        now = DETECT_WAIT_US;
-        assert_eq!(
-            p.step(normal(PLS_POLLING), now),
-            Step::Reset { warm: false }
+        assert_eq!(now, HUB_DEBOUNCE_TIMEOUT_US);
+        let step = p.step(
+            obs(ccs, false, true, 0, PLS_POLLING, false, false, false),
+            now,
         );
-        assert_eq!(p.resets(), 1);
-        assert_eq!(p.phase(), Phase::ResetWait);
+        assert_eq!(step, Step::Failed(FailReason::DebounceTimeout));
+        assert_eq!(p.resets(), 0);
     }
 
     #[test]
-    fn enable_during_debounce_is_adopted_without_reset() {
+    fn self_enabled_port_is_adopted_without_any_reset() {
         let mut p = PortPolicy::new(false);
-        assert_eq!(p.step(normal(PLS_POLLING), 0), Step::Idle);
-        // The PHY finishes training on its own 120 ms later: adopt it after the
-        // same stability window every enable needs.
-        let enabled = obs(true, true, true, 3, PLS_U0, false);
-        assert_eq!(p.step(enabled, 120_000), Step::Idle);
+        let mut now = 0u64;
+        assert_eq!(p.step(normal(PLS_POLLING), now), Step::Idle);
+        for _ in 0..3 {
+            now += HUB_DEBOUNCE_STEP_US;
+            assert_eq!(p.step(normal(PLS_POLLING), now), Step::Idle);
+        }
+        // The PHY finishes training on its own before the debounce completes.
+        now += HUB_DEBOUNCE_STEP_US;
+        let en = enabled(3);
+        assert_eq!(p.step(en, now), Step::Idle); // starts the 200 ms stability window
         assert_eq!(p.phase(), Phase::Stabilize);
-        assert_eq!(
-            p.step(enabled, 120_000 + STABLE_US),
-            Step::Enumerate { speed: 3 }
-        );
+        assert_eq!(p.step(en, now + STABLE_US - 1), Step::Idle);
+        assert_eq!(p.step(en, now + STABLE_US), Step::Enumerate { speed: 3 });
         assert_eq!(p.resets(), 0, "a self-enabled port must not be reset");
     }
 
     #[test]
-    fn reset_wait_tolerates_a_transient_ped_without_re_resetting() {
+    fn reset_wait_follows_linux_polling_and_never_re_resets_inside_one_wait() {
         let mut p = PortPolicy::new(false);
         let mut now = 0u64;
-        assert_eq!(p.step(normal(PLS_POLLING), now), Step::Idle);
-        now = DETECT_WAIT_US;
+        stable_debounce(&mut p, &mut now, PLS_POLLING);
+        // `stable_debounce` stopped as soon as a Reset step appeared.
+        assert_eq!(p.resets(), 1);
+        // First status poll is 10 ms later and still sees PR set.
+        let in_reset = obs(true, false, true, 0, PLS_POLLING, true, false, true);
+        assert_eq!(p.step(in_reset, now + 5_000), Step::Idle);
+        assert_eq!(p.step(in_reset, now + HUB_SHORT_RESET_TIME_US), Step::Idle);
+        // Second poll 20 ms after the write: PR clear, connection, PED+U0 at FS.
+        let done = obs(true, true, true, 1, PLS_U0, true, false, false);
+        assert_eq!(p.step(done, now + 2 * HUB_SHORT_RESET_TIME_US), Step::Idle);
+        assert_eq!(p.phase(), Phase::Stabilize);
+        assert_eq!(p.resets(), 1, "no second reset inside the wait");
+        // The enable must hold for the full 200 ms before enumeration.
+        let t = now + 2 * HUB_SHORT_RESET_TIME_US;
+        assert_eq!(p.step(done, t + STABLE_US - 1), Step::Idle);
+        assert_eq!(p.step(done, t + STABLE_US), Step::Enumerate { speed: 1 });
+        assert_eq!(p.resets(), 1);
+    }
+
+    #[test]
+    fn reset_without_enable_is_written_again_up_to_five_times() {
+        let mut p = PortPolicy::new(false);
+        let mut now = 0u64;
+        stable_debounce(&mut p, &mut now, PLS_POLLING);
+        assert_eq!(p.resets(), 1);
+        // PR clears and CCS stays, but PED never comes: Linux returns -EBUSY and
+        // writes the reset again, until PORT_RESET_TRIES is exhausted.
+        let no_enable = obs(true, false, true, 0, PLS_POLLING, true, false, false);
+        for expected in 2..=PORT_RESET_TRIES {
+            now += HUB_SHORT_RESET_TIME_US;
+            assert_eq!(
+                p.step(no_enable, now),
+                Step::Reset { warm: false },
+                "reset write #{expected}"
+            );
+            assert_eq!(p.resets(), expected as u16);
+            assert_eq!(p.reset_tries(), expected);
+        }
+        // The fifth wait also ends without an enable: the attempt fails.
+        now += HUB_SHORT_RESET_TIME_US;
         assert_eq!(
-            p.step(normal(PLS_POLLING), now),
-            Step::Reset { warm: false }
+            p.step(no_enable, now),
+            Step::Failed(FailReason::ResetTimeout)
         );
-        // The field sequence: PED+U0+PRC appears immediately, then the link
-        // falls back to Polling. The policy must wait out the full window and
-        // must never issue a second reset inside it.
-        let glimpse = obs(true, true, true, 3, PLS_U0, true);
-        assert_eq!(p.step(glimpse, now + 1_000), Step::Idle);
-        // The PED glimpse starts the stability window; when the next read shows
-        // Polling again the attempt fails — but it never becomes a second reset.
-        let mut failed = false;
-        for ms in [10, 50, 100, 200] {
-            now += ms * 1_000;
-            match p.step(normal(PLS_POLLING), now) {
-                Step::Idle => {}
-                Step::Failed(FailReason::LostAfterReset) => {
-                    failed = true;
+        assert_eq!(p.phase(), Phase::Backoff);
+        assert_eq!(p.failures(), 1);
+    }
+
+    #[test]
+    fn a_reset_that_never_completes_waits_800ms_per_try() {
+        let mut p = PortPolicy::new(false);
+        let mut now = 0u64;
+        stable_debounce(&mut p, &mut now, PLS_POLLING);
+        let in_reset = obs(true, false, true, 0, PLS_POLLING, true, false, true);
+        let reset_at = now;
+        // 10 ms, 20 ms, then 200 ms spacing; at 820 ms the wait times out and
+        // the reset is written again.
+        let mut retries = 0;
+        for _ in 0..120 {
+            now += 10_000;
+            match p.step(in_reset, now) {
+                Step::Reset { .. } => {
+                    retries += 1;
                     break;
                 }
-                other => panic!("unexpected step {other:?} inside reset wait"),
+                Step::Idle => {}
+                other => panic!("unexpected {other:?}"),
             }
-            assert_eq!(p.resets(), 1, "no reset inside the reset wait window");
         }
-        // If the failure was not recorded inside the loop, the end of the
-        // 500 ms window records it instead.
-        if !failed {
-            now = DETECT_WAIT_US + RESET_WAIT_US;
-            assert_eq!(
-                p.step(normal(PLS_POLLING), now),
-                Step::Failed(FailReason::LostAfterReset)
-            );
-        }
-        assert_eq!(p.phase(), Phase::Backoff);
-        assert_eq!(p.resets(), 1);
-        assert!(p.seen_prc && p.seen_ped && p.seen_ped_u0);
-        assert_ne!(p.ped_sc(), 0, "the PED+U0 snapshot is kept for the log");
+        assert_eq!(retries, 1);
+        assert!(
+            now - reset_at >= HUB_RESET_TIMEOUT_US,
+            "first wait lasted only {} us",
+            now - reset_at
+        );
     }
 
     #[test]
-    fn lost_ped_waits_the_backoff_then_observes_before_resetting() {
+    fn lost_ped_backs_off_one_second_then_debounces_before_reset() {
         let mut p = PortPolicy::new(false);
         let mut now = 0u64;
-        p.step(normal(PLS_POLLING), now);
-        now = DETECT_WAIT_US;
-        p.step(normal(PLS_POLLING), now);
-        // Fail that attempt at the end of its window.
-        now += RESET_WAIT_US;
+        stable_debounce(&mut p, &mut now, PLS_POLLING);
+        let t = now;
+        let en = enabled(1);
+        assert_eq!(p.step(en, t + 20_000), Step::Idle);
+        // The field's glimpse: PED+U0 for less than 200 ms, then Polling.
         assert_eq!(
-            p.step(normal(PLS_POLLING), now),
-            Step::Failed(FailReason::NoPrc)
-        );
-        // Backoff is 250 ms for the first failure; inside it nothing happens.
-        for delta in [1, 50, 100, 249] {
-            assert_eq!(p.step(normal(PLS_POLLING), now + delta * 1_000), Step::Idle);
-        }
-        // At the backoff deadline the policy observes the still-Polling port and
-        // gives it a fresh debounce window — it does NOT reset right away.
-        now += 250_000;
-        assert_eq!(p.step(normal(PLS_POLLING), now), Step::Idle);
-        assert_eq!(p.phase(), Phase::Debounce);
-        for delta in [100, 250, 399] {
-            assert_eq!(p.step(normal(PLS_POLLING), now + delta * 1_000), Step::Idle);
-            assert_eq!(p.resets(), 1);
-        }
-        // Only after the fresh window does the second reset happen: this is the
-        // ≥650 ms spacing that stops the 124 ms reset loop.
-        assert_eq!(
-            p.step(normal(PLS_POLLING), now + DETECT_WAIT_US),
-            Step::Reset { warm: false }
-        );
-        assert_eq!(p.resets(), 2);
-    }
-
-    #[test]
-    fn enable_must_stay_stable_before_enumeration() {
-        let mut p = PortPolicy::new(false);
-        let mut now = 0u64;
-        p.step(normal(PLS_POLLING), now);
-        now = DETECT_WAIT_US;
-        p.step(normal(PLS_POLLING), now);
-        let enabled = obs(true, true, true, 1, PLS_U0, true);
-        // Reset completes: only a stability window starts.
-        assert_eq!(p.step(enabled, now + 60_000), Step::Idle);
-        assert_eq!(p.phase(), Phase::Stabilize);
-        // A 50 ms glimpse is not enough (the old driver accepted 20 ms).
-        assert_eq!(p.step(enabled, now + 60_000 + 50_000), Step::Idle);
-        // PED lost before the window ends: backoff, no enumeration.
-        assert_eq!(
-            p.step(normal(PLS_POLLING), now + 60_000 + 60_000),
+            p.step(normal(PLS_POLLING), t + 20_000 + 100_000),
             Step::Failed(FailReason::LostAfterReset)
         );
-        // And it never enumerated.
-        let mut q = PortPolicy::new(false);
-        q.step(normal(PLS_POLLING), 0);
-        q.step(normal(PLS_POLLING), DETECT_WAIT_US);
-        q.step(enabled, DETECT_WAIT_US + 60_000);
+        assert_eq!(p.phase(), Phase::Backoff);
+        // No reset for a full second.
+        for delta in [1u64, 250, 500, 999] {
+            assert_eq!(
+                p.step(normal(PLS_POLLING), t + 20_000 + 100_000 + delta * 1_000),
+                Step::Idle
+            );
+        }
+        let after = t + 20_000 + 100_000 + RETRY_BACKOFF_US;
+        // At the backoff deadline the port is observed again (debounce), not
+        // reset immediately.
+        assert_eq!(p.step(normal(PLS_POLLING), after), Step::Idle);
+        assert_eq!(p.phase(), Phase::Debounce);
+        let resets_before = p.resets();
+        let mut t2 = after;
+        for _ in 0..3 {
+            t2 += HUB_DEBOUNCE_STEP_US;
+            assert_eq!(p.step(normal(PLS_POLLING), t2), Step::Idle);
+            assert_eq!(p.resets(), resets_before);
+        }
+        t2 += HUB_DEBOUNCE_STEP_US;
+        assert_eq!(p.step(normal(PLS_POLLING), t2), Step::Reset { warm: false });
+        assert_eq!(p.resets(), resets_before + 1);
+    }
+
+    #[test]
+    fn power_on_is_retried_and_never_powered_off() {
+        let mut p = PortPolicy::new(false);
+        let mut now = 0u64;
+        let unpowered = obs(true, false, false, 0, PLS_POLLING, false, false, false);
+        assert_eq!(p.step(unpowered, now), Step::PowerOn);
+        assert_eq!(p.phase(), Phase::PowerSettle);
+        // Nothing happens during the 100 ms power settle.
+        for delta in [1u64, 50, 99] {
+            assert_eq!(p.step(unpowered, now + delta * 1_000), Step::Idle);
+        }
+        // Still unpowered at the deadline: ask again (the driver read it back).
+        assert_eq!(p.step(unpowered, now + POWER_SETTLE_US), Step::PowerOn);
+        // Powered but empty: an empty port is just observed, never reset.
+        now += POWER_SETTLE_US;
+        let powered_empty = obs(false, false, true, 0, PLS_POLLING, false, false, false);
+        assert_eq!(p.step(powered_empty, now + POWER_SETTLE_US), Step::Idle);
+        assert_eq!(p.phase(), Phase::Empty);
+        assert_eq!(p.resets(), 0);
+        assert_eq!(p.failures(), 0);
+        // Powering on a port is idempotent: PP=1 never yields another PowerOn.
+        for _ in 0..10 {
+            now += 1_000_000;
+            assert_eq!(p.step(powered_empty, now), Step::Idle);
+        }
+    }
+
+    #[test]
+    fn no_power_cycle_ever_after_many_failures() {
+        // Drive a permanently failing attached port through many attempts and
+        // assert the only power-related step is PowerOn (never off), and that
+        // no attempt is ever made with PP missing. (The enum has no PowerOff
+        // step any more; this pins the behaviour the field bug asked for.)
+        let mut p = PortPolicy::new(false);
+        let mut now = 0u64;
+        let poll = normal(PLS_POLLING);
+        let mut power_ons = 0;
+        let mut resets_in_attempt = 0u16;
+        let mut attempts = 0u16;
+        let mut last_fail: Option<u64> = None;
+        for _ in 0..400_000 {
+            match p.step(poll, now) {
+                Step::PowerOn => power_ons += 1,
+                Step::Reset { .. } => {
+                    if let Some(failed_at) = last_fail.take() {
+                        assert!(
+                            now - failed_at >= RETRY_BACKOFF_US,
+                            "attempt restarted only {} us after failure",
+                            now - failed_at
+                        );
+                    }
+                    resets_in_attempt += 1;
+                    assert!(
+                        resets_in_attempt <= PORT_RESET_TRIES as u16,
+                        "more than PORT_RESET_TRIES resets in one attempt"
+                    );
+                }
+                Step::Failed(_) => {
+                    attempts += 1;
+                    resets_in_attempt = 0;
+                    last_fail = Some(now);
+                }
+                Step::Idle => {}
+                other => panic!("unexpected {other:?}"),
+            }
+            now += 1_000;
+        }
+        assert!(attempts >= 5, "the port keeps retrying (slowly)");
+        assert_eq!(power_ons, 0, "PP=1 must never be toggled off/on");
+    }
+
+    #[test]
+    fn empty_port_is_never_reset_or_power_cycled() {
+        let mut p = PortPolicy::new(false);
+        let mut now = 0u64;
+        let empty = obs(false, false, true, 0, PLS_RXDETECT, false, false, false);
+        for _ in 0..100 {
+            assert_eq!(p.step(empty, now), Step::Idle);
+            now += 100_000;
+        }
+        assert_eq!(p.resets(), 0);
+        assert_eq!(p.failures(), 0);
+        assert_eq!(p.phase(), Phase::Empty);
+    }
+
+    #[test]
+    fn usb3_ports_use_warm_reset() {
+        let mut p = PortPolicy::new(true);
+        let mut now = 0u64;
+        stable_debounce(&mut p, &mut now, PLS_POLLING);
+        // `stable_debounce` returns on the Reset step; re-drive cleanly.
+        let mut q = PortPolicy::new(true);
+        let mut t = 0u64;
+        assert_eq!(q.step(normal(PLS_POLLING), t), Step::Idle);
+        let mut last = Step::Idle;
+        for _ in 0..5 {
+            t += HUB_DEBOUNCE_STEP_US;
+            last = q.step(normal(PLS_POLLING), t);
+            if matches!(last, Step::Reset { .. }) {
+                break;
+            }
+        }
+        assert_eq!(last, Step::Reset { warm: true });
+    }
+
+    #[test]
+    fn resume_is_requested_for_suspended_enabled_ports() {
+        let mut p = PortPolicy::new(false);
+        let suspended = obs(true, true, true, 3, PLS_U3, false, false, false);
+        assert_eq!(p.step(suspended, 0), Step::Resume);
+        assert_eq!(p.phase(), Phase::ResumeWait);
+        let en = enabled(3);
+        assert_eq!(p.step(en, 20_000), Step::Idle);
+        assert_eq!(p.step(en, 20_000 + STABLE_US), Step::Enumerate { speed: 3 });
+        assert_eq!(p.resets(), 0);
+    }
+
+    #[test]
+    fn enumeration_failure_resets_after_backoff_not_immediately() {
+        let mut p = PortPolicy::new(false);
+        let en = enabled(3);
+        assert_eq!(p.step(en, 0), Step::Idle);
+        assert_eq!(p.step(en, STABLE_US), Step::Enumerate { speed: 3 });
         assert_eq!(
-            q.step(enabled, DETECT_WAIT_US + 60_000 + STABLE_US),
-            Step::Enumerate { speed: 1 }
+            p.enumeration_failed(en, 5_000),
+            Step::Failed(FailReason::EnumFailed)
+        );
+        // During the 1 s backoff the still-enabled port must not be touched.
+        assert_eq!(p.step(en, 100_000), Step::Idle);
+        // At the deadline the policy resets before enumerating again.
+        assert_eq!(
+            p.step(en, 5_000 + RETRY_BACKOFF_US),
+            Step::Reset { warm: false }
         );
     }
 
@@ -808,11 +1241,9 @@ mod tests {
     fn ped_snapshot_is_per_policy_and_records_the_last_real_enable() {
         let mut hs = PortPolicy::new(false);
         let mut fs = PortPolicy::new(false);
-        // Both ports see the same reset-time transient (this is what the field
-        // photo shows on every port), then enable at their own speed.
-        let transient = obs(true, true, true, 3, PLS_U0, true);
-        let hs_enabled = obs(true, true, true, 3, PLS_U0, true);
-        let fs_enabled = obs(true, true, true, 1, PLS_U0, true);
+        let transient = obs(true, true, true, 3, PLS_POLLING, true, false, false);
+        let hs_enabled = enabled(3);
+        let fs_enabled = enabled(1);
         hs.observe(transient);
         fs.observe(transient);
         hs.observe(hs_enabled);
@@ -826,209 +1257,17 @@ mod tests {
     #[test]
     fn transient_only_ped_is_flagged_as_not_u0() {
         let mut p = PortPolicy::new(false);
-        p.observe(obs(true, true, true, 3, PLS_POLLING, false));
+        p.observe(obs(true, true, true, 3, PLS_POLLING, false, false, false));
         assert!(p.seen_ped());
         assert!(!p.seen_ped_u0(), "PED without U0 is not an enable");
-        // The last transient snapshot is kept, so a photo shows the latest
-        // state rather than the first one.
-        p.observe(obs(true, true, true, 1, PLS_POLLING, false));
+        p.observe(obs(true, true, true, 1, PLS_POLLING, false, false, false));
         assert_eq!(p.ped_sc() & 0xF << 10, 1 << 10);
     }
 
     #[test]
-    fn backoff_grows_to_one_second_and_power_cycles_only_late() {
-        assert_eq!(backoff_us(0), 250_000);
-        assert_eq!(backoff_us(1), 250_000);
-        assert_eq!(backoff_us(2), 500_000);
-        assert_eq!(backoff_us(3), 1_000_000);
-        assert_eq!(backoff_us(u16::MAX), 1_000_000);
-
-        // Drive a permanent-loss port through enough attempts: no PP toggling
-        // before POWER_CYCLE_AFTER failures, and a PowerOff at exactly 16.
-        let mut p = PortPolicy::new(false);
-        let mut now = 0u64;
-        let mut resets = 0u16;
-        let mut power_offs = 0u16;
-        let mut resets_at_first_power_off: Option<u16> = None;
-        for _ in 0..60 {
-            // Fast-forward until the policy wants to do something.
-            let mut guard = 0u32;
-            loop {
-                let step = p.step(normal(PLS_POLLING), now);
-                match step {
-                    Step::Idle => {
-                        now += 10_000;
-                        guard += 1;
-                        assert!(guard < 10_000, "policy stuck in Idle");
-                    }
-                    Step::Reset { .. } => {
-                        resets += 1;
-                        break;
-                    }
-                    Step::PowerOff => {
-                        if resets_at_first_power_off.is_none() {
-                            resets_at_first_power_off = Some(resets);
-                        }
-                        power_offs += 1;
-                        break;
-                    }
-                    // The driver performs these side effects; the policy only
-                    // needs the observation sequence, so keep time moving.
-                    Step::PowerOn | Step::Resume => break,
-                    Step::Enumerate { .. } => break,
-                    Step::Failed(_) => break,
-                }
-            }
-        }
-        assert!(
-            power_offs >= 1,
-            "a long-dead port must be power-cycled once"
-        );
-        assert!(
-            power_offs <= 4,
-            "power cycling is a last resort, not a loop"
-        );
-        // The first power cycle happens only after the 16th failed attempt.
-        let at = resets_at_first_power_off.expect("first power-off recorded");
-        assert!(
-            at >= POWER_CYCLE_AFTER,
-            "power-cycled after only {at} reset(s)"
-        );
-    }
-
-    #[test]
-    fn empty_port_is_never_reset_or_power_cycled() {
-        let mut p = PortPolicy::new(false);
-        let mut now = 0u64;
-        let empty = obs(false, false, true, 0, PLS_RXDETECT, false);
-        for _ in 0..100 {
-            assert_eq!(p.step(empty, now), Step::Idle);
-            now += 100_000;
-        }
-        assert_eq!(p.resets(), 0);
-        assert_eq!(p.failures(), 0);
-        assert_eq!(p.phase(), Phase::Empty);
-    }
-
-    #[test]
-    fn usb3_ports_use_warm_reset() {
-        let mut p = PortPolicy::new(true);
-        p.step(normal(PLS_POLLING), 0);
-        assert_eq!(
-            p.step(normal(PLS_POLLING), DETECT_WAIT_US),
-            Step::Reset { warm: true }
-        );
-    }
-
-    #[test]
-    fn resume_is_requested_for_suspended_enabled_ports() {
-        let mut p = PortPolicy::new(false);
-        let suspended = obs(true, true, true, 3, PLS_U3, false);
-        assert_eq!(p.step(suspended, 0), Step::Resume);
-        assert_eq!(p.phase(), Phase::ResumeWait);
-        // The driver's resume brings the link to U0: stability, then enumerate.
-        let enabled = obs(true, true, true, 3, PLS_U0, false);
-        assert_eq!(p.step(enabled, 20_000), Step::Idle);
-        assert_eq!(
-            p.step(enabled, 20_000 + STABLE_US),
-            Step::Enumerate { speed: 3 }
-        );
-        assert_eq!(p.resets(), 0);
-    }
-
-    #[test]
-    fn enumeration_failure_resets_after_backoff_not_immediately() {
-        let mut p = PortPolicy::new(false);
-        let enabled = obs(true, true, true, 3, PLS_U0, false);
-        assert_eq!(p.step(enabled, 0), Step::Idle);
-        assert_eq!(p.step(enabled, STABLE_US), Step::Enumerate { speed: 3 });
-        assert_eq!(
-            p.enumeration_failed(enabled, 5_000),
-            Step::Failed(FailReason::EnumFailed)
-        );
-        // During the 250 ms backoff the still-enabled port must not be touched.
-        assert_eq!(p.step(enabled, 100_000), Step::Idle);
-        // At the deadline the policy resets before enumerating again.
-        assert_eq!(
-            p.step(enabled, 5_000 + 250_000),
-            Step::Reset { warm: false }
-        );
-    }
-
-    #[test]
-    fn simulation_enable_after_700ms_debounce_is_adopted_without_reset() {
-        // The user's field symptom: a USB2 port that needs a long debounce.
-        // Model a port that is in Polling for `enable_after` and then enables on
-        // its own. Drive the policy at 10 ms steps and record resets.
-        for enable_after in [50_000u64, 200_000, 350_000] {
-            let mut p = PortPolicy::new(false);
-            let mut now = 0u64;
-            let mut resets = 0;
-            let mut enumerated = false;
-            for _ in 0..2_000 {
-                let enabled = now >= enable_after;
-                let o = if enabled {
-                    obs(true, true, true, 3, PLS_U0, true)
-                } else {
-                    normal(PLS_POLLING)
-                };
-                match p.step(o, now) {
-                    Step::Reset { .. } => resets += 1,
-                    Step::Enumerate { .. } => {
-                        enumerated = true;
-                        break;
-                    }
-                    Step::Failed(_) => {}
-                    _ => {}
-                }
-                now += 10_000;
-            }
-            assert!(enumerated, "enable_after={enable_after}");
-            assert_eq!(resets, 0, "a self-enabling port must never be reset");
-        }
-    }
-
-    #[test]
-    fn simulation_lost_after_reset_never_resets_faster_than_backoff() {
-        // A port that always shows PED for one read after a reset and then
-        // falls back to Polling. Count reset timestamps and assert the spacing
-        // is at least backoff + debounce (≥650 ms), not the field's 124 ms.
-        let mut p = PortPolicy::new(false);
-        let mut now = 0u64;
-        let mut reset_times: Vec<u64> = Vec::new();
-        let mut ped_glimpse_until = 0u64;
-        for _ in 0..20_000 {
-            // 2 s of simulated time is enough for the first few attempts.
-            let o = if now < ped_glimpse_until {
-                obs(true, true, true, 3, PLS_U0, true)
-            } else {
-                normal(PLS_POLLING)
-            };
-            match p.step(o, now) {
-                Step::Reset { .. } => {
-                    reset_times.push(now);
-                    ped_glimpse_until = now + 10_000;
-                }
-                _ => {}
-            }
-            now += 1_000;
-            if now > 4_000_000 {
-                break;
-            }
-        }
-        assert!(
-            reset_times.len() >= 2,
-            "the port keeps failing, retries happen"
-        );
-        for pair in reset_times.windows(2) {
-            let spacing = pair[1] - pair[0];
-            // Minimum: 250 ms backoff + 400 ms fresh debounce. A PED glimpse
-            // fails before the 500 ms reset window ends, so 650 ms is the true
-            // floor — still 5x the field driver's 124 ms.
-            assert!(
-                spacing >= 650_000,
-                "resets {pair:?} only {spacing} us apart"
-            );
-        }
+    fn backoff_is_flat_one_second() {
+        assert_eq!(backoff_us(0), RETRY_BACKOFF_US);
+        assert_eq!(backoff_us(1), RETRY_BACKOFF_US);
+        assert_eq!(backoff_us(u16::MAX), RETRY_BACKOFF_US);
     }
 }
