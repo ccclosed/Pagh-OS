@@ -20,6 +20,11 @@ path = "src/main.rs"
 [dependencies]
 pagh-ui = { path = "../pagh-ui" }
 
+[dev-dependencies]
+# Только для e2e: поднимаем реальный композитор в процессе и подключаем к нему
+# собранный бинарник pagh-files по настоящему AF_UNIX-сокету (PDP/1).
+pagh-desktop = { path = "../pagh-desktop" }
+
 [profile.release]
 panic = "abort"
 opt-level = "s"

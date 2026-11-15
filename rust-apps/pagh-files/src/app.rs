@@ -11,7 +11,7 @@
 //! файловых вызовов, в тестах и демо — [`crate::fake::FakeVfs`].
 
 use pagh_ui::canvas::Canvas;
-use pagh_ui::chrome::{self, ChromeButton, ChromeLayout, WindowStyle};
+use pagh_ui::chrome;
 use pagh_ui::color::Color;
 use pagh_ui::event::{Event, Key, Modifiers, MouseButton};
 use pagh_ui::font::{self, TextAlign};
@@ -38,16 +38,17 @@ const LIST_HEADER: i32 = 24;
 const WHEEL_STEP: i32 = 48;
 
 /// Действие, которое приложение просит выполнить снаружи.
+///
+/// Оформление окна (заголовок, `v`/`^`/`x`, панель) принадлежит композитору,
+/// поэтому свернуть/развернуть/закрыть окно клиент не может — он лишь
+/// завершается по `close` от сервера. [`Command::LaunchTerminal`] отправляется
+/// композитору сообщением PDP/1 `launch` (type 13).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Command {
-    /// Закрыть приложение.
+    /// Завершить приложение (окно закрыто композитором).
     Quit,
-    /// Свернуть окно.
-    Minimize,
-    /// Развернуть/восстановить окно.
-    Maximize,
-    /// Открыть терминал в каталоге.
-    OpenTerminal { path: String },
+    /// Открыть терминал в каталоге (PDP/1 `launch` с app = "terminal").
+    LaunchTerminal { path: String },
     /// Открыть файл/каталог внешним приложением.
     OpenPath { path: String },
 }
@@ -118,11 +119,10 @@ struct Clipboard {
     path: String,
 }
 
-/// Геометрия экрана Files: заголовок, панель инструментов, боковая панель,
-/// содержимое и строка состояния.
+/// Геометрия клиентской области Files: панель инструментов, боковая панель,
+/// содержимое и строка состояния (заголовок окна рисует композитор).
 #[derive(Clone, Debug)]
 pub struct AppLayout {
-    pub window: ChromeLayout,
     pub toolbar: Rect,
     pub back: Rect,
     pub forward: Rect,
@@ -152,7 +152,6 @@ pub struct FilesApp {
     sidebar_selected: Option<u32>,
     sidebar_hover: Option<u32>,
     toolbar_hover: Option<ToolbarButton>,
-    chrome_hover: Option<ChromeButton>,
     path: TextField,
     search: TextField,
     search_visible: bool,
@@ -193,7 +192,6 @@ impl FilesApp {
             sidebar_selected: Some(1),
             sidebar_hover: None,
             toolbar_hover: None,
-            chrome_hover: None,
             path,
             search,
             search_visible: false,
@@ -653,7 +651,7 @@ impl FilesApp {
             action::VIEW_GRID => self.set_view(ViewMode::Grid),
             action::VIEW_LIST => self.set_view(ViewMode::List),
             action::OPEN_TERMINAL => {
-                return vec![Command::OpenTerminal {
+                return vec![Command::LaunchTerminal {
                     path: self.cwd.clone(),
                 }]
             }
@@ -678,10 +676,10 @@ impl FilesApp {
         Rect::new(0, 0, self.size.w, self.size.h)
     }
 
-    /// Рассчитать раскладку экрана.
+    /// Рассчитать раскладку клиентской области.
     pub fn layout(&self) -> AppLayout {
-        let window = chrome::layout_window(&self.theme, self.window_rect());
-        let (toolbar, rest) = window.content.split_top(self.theme.metrics.toolbar_height);
+        let client = self.window_rect();
+        let (toolbar, rest) = client.split_top(self.theme.metrics.toolbar_height);
         let (rest, status) = rest.split_bottom(self.theme.metrics.status_height);
         let (sidebar, content) = rest.split_left(self.theme.metrics.sidebar_width);
 
@@ -726,7 +724,6 @@ impl FilesApp {
 
         let content_area = content.inset_by(Insets::new(14, 12, 12, 10));
         AppLayout {
-            window,
             toolbar,
             back,
             forward,
@@ -881,19 +878,13 @@ impl FilesApp {
 
     // ───────────────────────── отрисовка ─────────────────────────
 
-    /// Нарисовать окно Files целиком.
+    /// Нарисовать клиентскую область Files.
+    ///
+    /// Композитор рисует вокруг неё заголовок окна, рамку и панель; клиент не
+    /// знает про `v`/`^`/`x` и не рисует их.
     pub fn draw(&self, canvas: &mut Canvas) {
         let layout = self.layout();
-        chrome::draw_window(
-            canvas,
-            &self.theme,
-            self.window_rect(),
-            WindowStyle {
-                title: &self.title(),
-                focused: true,
-                hovered: self.chrome_hover,
-            },
-        );
+        canvas.fill(self.window_rect(), self.theme.palette.window);
         self.draw_toolbar(canvas, &layout);
         self.draw_sidebar(canvas, &layout);
         self.draw_content(canvas, &layout);
@@ -1451,7 +1442,6 @@ impl FilesApp {
         if self.dialog.is_some() {
             return;
         }
-        self.chrome_hover = layout.window.button_at(pos);
         self.toolbar_hover = [
             (ToolbarButton::Back, layout.back),
             (ToolbarButton::Forward, layout.forward),
@@ -1563,13 +1553,6 @@ impl FilesApp {
         }
 
         let layout = self.layout();
-        if let Some(chrome_button) = layout.window.button_at(pos) {
-            return match chrome_button {
-                ChromeButton::Close => vec![Command::Quit],
-                ChromeButton::Minimize => vec![Command::Minimize],
-                ChromeButton::Maximize => vec![Command::Maximize],
-            };
-        }
         if layout.kebab.contains(pos) {
             self.open_toolbar_menu();
             return Vec::new();
@@ -1883,7 +1866,7 @@ impl FilesApp {
 
         // Глобальные сочетания.
         if modifiers.alt && modifiers.shift && key == Key::F4 {
-            return vec![Command::OpenTerminal {
+            return vec![Command::LaunchTerminal {
                 path: self.cwd.clone(),
             }];
         }

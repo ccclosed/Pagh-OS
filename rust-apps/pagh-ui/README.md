@@ -3,7 +3,11 @@
 Клиентский тулкит для userspace-композитора Pagh desktop B (вариант «композитор
 в user space, приложения — обычные статически собранные musl-бинарники»).
 Библиотека **без внешних зависимостей**: свой растр, встроенный шрифт, PNG-энкодер
-и клиент протокола.
+и клиент протокола **PDP/1** (сервер — `rust-apps/pagh-desktop`).
+
+Композитор владеет заголовком окна (`v`/`^`/`x`), рамкой, панелью, размещением,
+фокусом и drag/resize; клиент рисует **только клиентскую область** и получает
+координаты ввода относительно неё.
 
 Демо-сцены (рендер в PNG без экрана, см. `src/demo.rs`):
 
@@ -32,12 +36,13 @@ screenshot-тесты.
 | `menu` | `Menu`/`MenuEntry`, подменю, раскладка по содержимому, hit-тесты |
 | `chrome` | заголовок окна `v`/`^`/`x`, строка состояния, панель рабочего стола |
 | `icon` | векторные иконки, включая синюю папку с листом бумаги |
-| `protocol` | клиентские типы PGUI v1 и кадрирование |
-| `client` | `DesktopClient` поверх `AF_UNIX`: `hello`/`welcome`, `create_window`, `commit`, `poll` |
+| `protocol` | клиентский кодек PDP/1: заголовок `PDS1`, сообщения 1..12, `launch(13)`, `MessageReader` |
+| `client` | `DesktopClient` поверх `AF_UNIX`: `hello`/`welcome`, `open_window`, `commit`, `poll` (configure/input/focus/close/error), `launch`, `damage_hint` |
 | `image`/`testkit` | PNG/PPM, детерминированный хеш сцены, golden-тесты |
 | `demo` | готовые сцены витрины/меню/палитры |
 
-Протокол описан в [`PROTOCOL.md`](PROTOCOL.md).
+Клиентская сторона протокола описана в [`PROTOCOL.md`](PROTOCOL.md); нормативный
+ABI и обязанности сервера — [`../pagh-desktop/PROTOCOL.md`](../pagh-desktop/PROTOCOL.md).
 
 ## Сборка и тесты
 
@@ -60,7 +65,7 @@ cargo build --release --target x86_64-unknown-linux-musl   # статическ�
 file target/x86_64-unknown-linux-musl/release/pagh-ui-gallery
 ```
 
-## Пример: окно и содержимое
+## Пример: окно и содержимое (CSD — приложение рисует заголовок само)
 
 ```rust
 use pagh_ui::canvas::Canvas;
@@ -89,19 +94,33 @@ button.draw(
 ## Пример: подключение к композитору
 
 ```rust
-use pagh_ui::client::DesktopClient;
+use pagh_ui::client::{DesktopClient, Incoming};
 use pagh_ui::canvas::Canvas;
 use pagh_ui::geom::Size;
+use std::time::Duration;
 
 let mut client = DesktopClient::connect("/run/pagh-desktop.sock", "pagh-files")?;
-let window = client.create_window(Size::new(1060, 640), "Домашняя папка — Files")?;
-let frame = Canvas::filled(1060, 640, pagh_ui::Color::hex(0x081216));
+let window = client.open_window(Size::new(1000, 600), "Домашняя папка — Files")?;
+let mut frame = Canvas::filled(1000, 600, pagh_ui::Color::hex(0x081216));
 client.commit(window, &frame)?;
-for incoming in client.poll()? {
-    // Обработать события ввода/configure/closed.
-    let _ = incoming;
+loop {
+    for message in client.poll(Duration::from_millis(16))? {
+        match message {
+            Incoming::Configure { size, .. } => {
+                frame = Canvas::filled(size.w, size.h, pagh_ui::Color::hex(0x081216));
+                client.commit(window, &frame)?;
+            }
+            Incoming::Event { event, .. } => { /* передать в приложение */ let _ = event; }
+            Incoming::Close { .. } => return Ok(()),
+            _ => {}
+        }
+    }
 }
+# Ok::<(), std::io::Error>(())
 ```
+
+`launch("terminal", cwd)` отправляет композитору PDP/1 `launch (type 13)` —
+запуск известного приложения (см. [`PROTOCOL.md`](PROTOCOL.md)).
 
 ## Детерминизм и screenshot-тесты
 
@@ -117,6 +136,10 @@ for incoming in client.poll()? {
   поддерживаются — для них нужен отдельный шрифт/масштабирование.
 - Нет прокрутки как виджета: `Grid`/`List` отдают раскладку, полосу прокрутки и
   смещение рисует приложение (Files делает это само).
-- Протокол v1 передаёт полную поверхность без damage — ок.
-  для локального сокета, но избыточно для больших окон; см. `PROTOCOL.md`.
-- Курсор мыши, drag-and-drop и буфер обмена — зона композитора, не тулкита.
+- PDP/1 v1 передаёт полную поверхность без частичного аплоада (`damage` —
+  подсказка) — ок для локального сокета, но избыточно для больших окон.
+- Текст вводится по US-раскладке (PDP/1 передаёт только evdev-код); другие
+  раскладки требуют input method/расширения протокола.
+- Курсор мыши, drag-and-drop, буфер обмена, заголовок и панель — зона
+  композитора, не тулкита. Модуль `chrome` оставлен для приложений с
+  собственным заголовком (CSD), Files его не использует.

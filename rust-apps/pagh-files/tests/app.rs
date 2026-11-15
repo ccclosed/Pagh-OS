@@ -418,21 +418,17 @@ fn terminal_shortcut_returns_command() {
     let commands = alt_shift_f4(&mut app);
     assert_eq!(
         commands,
-        vec![Command::OpenTerminal {
+        vec![Command::LaunchTerminal {
             path: "/home/user".to_string()
         }]
     );
 }
 
 #[test]
-fn close_button_returns_quit() {
+fn close_request_from_compositor_quits() {
     let mut app = demo_app();
-    let close = app
-        .layout()
-        .window
-        .button_rect(pagh_ui::chrome::ChromeButton::Close)
-        .expect("кнопка закрытия");
-    let commands = click(&mut app, close.center(), MouseButton::Left);
+    // Кнопку x рисует композитор: он присылает close, приложение завершается.
+    let commands = app.handle_event(&Event::CloseRequest);
     assert_eq!(commands, vec![Command::Quit]);
 }
 
@@ -494,7 +490,7 @@ fn resize_recomputes_layout() {
     });
     assert_eq!(app.size(), Size::new(900, 560));
     let layout = app.layout();
-    assert_eq!(layout.window.window.w, 900);
+    assert_eq!(layout.toolbar.w, 900);
     assert!(app.item_rect(0).is_some());
 }
 

@@ -5,7 +5,7 @@
 //! повторная отрисовка сцены обновляет лишь повреждённые пиксели.
 
 use crate::color::{self, Color, TRANSPARENT};
-use crate::font::{FIRST_CHAR, FONT_8X16, GLYPH_HEIGHT, GLYPH_WIDTH};
+use crate::font::{self, GLYPH_HEIGHT, GLYPH_WIDTH};
 use crate::geometry::{Point, Rect, Size};
 use crate::surface::Surface;
 
@@ -382,15 +382,21 @@ impl Canvas {
                 // Переводы строк обрабатывает draw_text; здесь символ игнорируется.
                 continue;
             }
-            let code = (ch as u32).clamp(32, 126) as u8;
-            let glyph = &FONT_8X16[(code - FIRST_CHAR) as usize];
+            // ASCII + кириллица; неизвестный символ показываем как `?`.
+            let glyph = match font::glyph(ch) {
+                Some(glyph) => glyph,
+                None => match font::glyph('?') {
+                    Some(glyph) => glyph,
+                    None => continue,
+                },
+            };
             for (row, bits) in glyph.iter().enumerate() {
                 for col in 0..8 {
                     if bits & (0x80 >> col) != 0 {
                         for sy in 0..scale {
                             for sx in 0..scale {
                                 self.blend(
-                                    cursor + col as i32 * scale + sx,
+                                    cursor + col * scale + sx,
                                     y + row as i32 * scale + sy,
                                     color,
                                     opacity,
@@ -408,10 +414,8 @@ impl Canvas {
     /// Многострочный текст; `\n` начинает новую строку с тем же отступом.
     pub fn draw_text(&mut self, x: i32, y: i32, scale: i32, color: Color, text: &str) {
         let line_height = GLYPH_HEIGHT * scale.max(1);
-        let mut line = 0;
-        for part in text.split('\n') {
-            self.text(x, y + line * line_height, scale, color, part);
-            line += 1;
+        for (line, part) in text.split('\n').enumerate() {
+            self.text(x, y + line as i32 * line_height, scale, color, part);
         }
     }
 

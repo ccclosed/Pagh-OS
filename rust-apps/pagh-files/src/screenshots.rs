@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use pagh_ui::canvas::Canvas;
+use pagh_ui::chrome::{self, WindowStyle};
 use pagh_ui::color::Color;
 use pagh_ui::event::{Event, Key, Modifiers, MouseButton};
 use pagh_ui::geom::{Point, Rect, Size};
@@ -56,17 +57,39 @@ pub fn wallpaper(size: Size, theme: &pagh_ui::theme::Theme) -> Canvas {
     canvas
 }
 
+/// Изобразить окно так, как его нарисует композитор: заголовок с `v`/`^`/`x`
+/// плюс клиентская область от Files.
+///
+/// Это **только демо/скриншот**: в реальной связке оформление рисует
+/// `pagh-desktop`, а клиент отдаёт поверхность без заголовка (см.
+/// `files-under-pagh-desktop.png` — кадр настоящего композитора).
+pub fn compose_window(app: &FilesApp) -> Canvas {
+    let theme = &app.theme;
+    let title_height = theme.metrics.title_height;
+    let total = Size::new(app.size().w, app.size().h + title_height);
+    let mut frame = Canvas::filled(total.w, total.h, theme.palette.window);
+    let layout = chrome::draw_window(
+        &mut frame,
+        theme,
+        Rect::new(0, 0, total.w, total.h),
+        WindowStyle::new(&app.title()),
+    );
+    let client = render_window(app);
+    frame.blit(&client, layout.content.origin());
+    frame
+}
+
 /// Поставить окно приложения на обои рабочего стола.
 pub fn compose(app: &FilesApp, desktop: Size) -> Canvas {
     let theme = &app.theme;
     let mut canvas = wallpaper(desktop, theme);
-    let window = render_window(app);
+    let window = compose_window(app);
     let at = Point::new(
-        (desktop.w - app.size().w) / 2,
-        (desktop.h - app.size().h) / 2,
+        (desktop.w - window.width()) / 2,
+        (desktop.h - window.height()) / 2,
     );
     canvas.soft_shadow(
-        Rect::new(at.x, at.y, app.size().w, app.size().h),
+        Rect::new(at.x, at.y, window.width(), window.height()),
         theme.metrics.radius_window,
         26,
         theme.palette.shadow,

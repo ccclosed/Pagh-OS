@@ -10,8 +10,8 @@ use crate::client::Welcome;
 use crate::compositor::{AppKind, Compositor, HostEvent, MouseButton};
 use crate::geometry::Point;
 use crate::protocol::{
-    self, Decoder, Message, ERR_BAD_MESSAGE, ERR_INVALID_SURFACE, ERR_NOT_HELLO, ERR_NOT_OWNER,
-    ERR_UNSUPPORTED, VERSION, WELCOME_FORMAT_RGB565, WELCOME_FORMAT_XRGB8888,
+    self, Decoder, Message, ERR_BAD_MESSAGE, ERR_INTERNAL, ERR_INVALID_SURFACE, ERR_NOT_HELLO,
+    ERR_NOT_OWNER, ERR_UNSUPPORTED, VERSION, WELCOME_FORMAT_RGB565, WELCOME_FORMAT_XRGB8888,
 };
 use crate::surface::{PixelFormat, Surface};
 use std::io::{self, ErrorKind, Read};
@@ -24,6 +24,57 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+/// Команда запуска приложения по запросу `LAUNCH` (расширение PDP/1, type 13).
+///
+/// `command` — argv без имени сокета; токен `{socket}` заменяется путём сокета
+/// сервера. Пример для терминала, который подключается флагом `--socket`:
+///
+/// ```text
+/// LaunchTarget { app: "terminal".into(), command: vec![
+///     "pagh-terminal".into(), "--socket".into(), "{socket}".into(),
+/// ] }
+/// ```
+///
+/// Если токена `{socket}` нет, сервер добавит `--connect <socket>` в конец.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchTarget {
+    /// Идентификатор, который клиент присылает в `launch.app`.
+    pub app: String,
+    /// argv запуска (см. описание выше).
+    pub command: Vec<String>,
+}
+
+impl LaunchTarget {
+    pub fn new(app: impl Into<String>, command: Vec<String>) -> LaunchTarget {
+        LaunchTarget {
+            app: app.into(),
+            command,
+        }
+    }
+
+    /// Готовая argv с подставленным сокетом.
+    fn command_for(&self, socket: &std::path::Path) -> Vec<std::ffi::OsString> {
+        let socket = socket.as_os_str().to_os_string();
+        let has_placeholder = self.command.iter().any(|token| token.contains("{socket}"));
+        let mut argv: Vec<std::ffi::OsString> = self
+            .command
+            .iter()
+            .map(|token| {
+                if token.contains("{socket}") {
+                    token.replace("{socket}", &socket.to_string_lossy()).into()
+                } else {
+                    token.into()
+                }
+            })
+            .collect();
+        if !has_placeholder {
+            argv.push("--connect".into());
+            argv.push(socket);
+        }
+        argv
+    }
+}
 
 /// Настройки сервера.
 #[derive(Clone, Debug)]
@@ -41,6 +92,11 @@ pub struct ServerOptions {
     pub spawn_demo: bool,
     /// Явный путь к демо-клиенту (иначе ищется рядом с сервером).
     pub demo_binary: Option<PathBuf>,
+    /// Приложения, которые сервер умеет запускать по `launch` (type 13).
+    ///
+    /// Если цели нет, но `spawn_demo` включён и `app` — известный
+    /// `AppKind::id()`, сервер запускает демо-клиент.
+    pub launch_targets: Vec<LaunchTarget>,
 }
 
 impl Default for ServerOptions {
@@ -54,6 +110,7 @@ impl Default for ServerOptions {
             quiet: false,
             spawn_demo: false,
             demo_binary: None,
+            launch_targets: Vec::new(),
         }
     }
 }
@@ -83,6 +140,11 @@ pub enum ServerCommand {
         vertical: i32,
     },
     Screenshot(PathBuf),
+    /// Закрыть окно от имени сервера (тестовый/служебный хук; клиент получает
+    /// `close(reason=SERVER)`).
+    CloseWindow {
+        window_id: u32,
+    },
     Shutdown,
 }
 
@@ -143,6 +205,10 @@ impl ServerControl {
         self.send(ServerCommand::Screenshot(path.into()));
     }
 
+    pub fn close_window(&self, window_id: u32) {
+        self.send(ServerCommand::CloseWindow { window_id });
+    }
+
     pub fn shutdown(&self) {
         self.running.store(false, Ordering::SeqCst);
         self.send(ServerCommand::Shutdown);
@@ -163,7 +229,7 @@ impl ServerHandle {
     pub fn join(self) -> io::Result<()> {
         self.join
             .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "поток сервера запаниковал"))?
+            .map_err(|_| io::Error::other("поток сервера запаниковал"))?
     }
 }
 
@@ -417,6 +483,12 @@ impl Server {
                     eprintln!("pagh-desktop: screenshot {}: {err}", path.display());
                 }
             }
+            ServerCommand::CloseWindow { window_id } => {
+                // notify=true: клиент получает close(reason=SERVER) и сам
+                // завершается — это имитация нажатия `x` в заголовке.
+                let events = self.compositor.remove_window(window_id, true);
+                self.dispatch(events);
+            }
             ServerCommand::Shutdown => return false,
         }
         true
@@ -537,6 +609,13 @@ impl Server {
             Message::Ping { nonce } => {
                 self.send_message(index, &Message::Pong { nonce });
             }
+            Message::Launch { app, cwd } => {
+                if client_id.is_none() {
+                    self.reply_error(conn, ERR_NOT_HELLO, "сначала hello");
+                    return;
+                }
+                self.launch_app(&app, &cwd, conn);
+            }
             other => {
                 self.reply_error(
                     conn,
@@ -595,31 +674,31 @@ impl Server {
     }
 
     fn launch(&mut self, app: AppKind) {
-        if !self.options.spawn_demo {
+        if let Err(error) = self.spawn_demo(app) {
             if !self.options.quiet {
-                eprintln!("pagh-desktop: launch {:?} (spawn_demo выключен)", app);
+                eprintln!("pagh-desktop: launch {}: {error}", app.id());
             }
-            return;
         }
-        let app_arg = match app {
-            AppKind::Terminal => "terminal",
-            AppKind::Files => "files",
-            AppKind::Paint => "paint",
-        };
+    }
+
+    /// Запустить демо-клиент для известного приложения.
+    fn spawn_demo(&mut self, app: AppKind) -> Result<(), String> {
+        if !self.options.spawn_demo {
+            return Err("spawn_demo выключен".to_string());
+        }
         let binary = self.options.demo_binary.clone().or_else(|| {
             std::env::current_exe()
                 .ok()
                 .and_then(|exe| exe.parent().map(|dir| dir.join("pagh-desktop-demo")))
         });
         let Some(binary) = binary else {
-            eprintln!("pagh-desktop: не найден демо-клиент для запуска");
-            return;
+            return Err("не найден демо-клиент для запуска".to_string());
         };
         match Command::new(&binary)
             .arg("--connect")
             .arg(&self.options.socket)
             .arg("--app")
-            .arg(app_arg)
+            .arg(app.id())
             .spawn()
         {
             Ok(child) => {
@@ -631,8 +710,68 @@ impl Server {
                     );
                 }
                 self.children.push(child);
+                Ok(())
             }
-            Err(err) => eprintln!("pagh-desktop: запуск {}: {err}", binary.display()),
+            Err(err) => Err(format!("запуск {}: {err}", binary.display())),
+        }
+    }
+
+    /// Обработать `launch` (type 13): запустить приложение по идентификатору.
+    ///
+    /// Сначала ищется явная цель `ServerOptions.launch_targets`; иначе, если
+    /// включён `spawn_demo`, известный `AppKind` запускается демо-клиентом.
+    fn launch_app(&mut self, app: &str, cwd: &str, conn: u64) {
+        if app.is_empty() || app.len() > 64 {
+            self.reply_error(conn, ERR_UNSUPPORTED, "пустой или слишком длинный app id");
+            return;
+        }
+        if let Some(target) = self
+            .options
+            .launch_targets
+            .iter()
+            .find(|target| target.app == app)
+            .cloned()
+        {
+            let argv = target.command_for(&self.options.socket);
+            let Some(program) = argv.first() else {
+                self.reply_error(conn, ERR_UNSUPPORTED, format!("пустая команда для {app}"));
+                return;
+            };
+            match Command::new(program).args(&argv[1..]).spawn() {
+                Ok(child) => {
+                    if !self.options.quiet {
+                        eprintln!(
+                            "pagh-desktop: launch {} -> {} (pid {})",
+                            app,
+                            program.to_string_lossy(),
+                            child.id()
+                        );
+                        if !cwd.is_empty() {
+                            eprintln!("pagh-desktop: launch {app}: cwd {cwd} (подсказка)");
+                        }
+                    }
+                    self.children.push(child);
+                }
+                Err(err) => {
+                    self.reply_error(conn, ERR_INTERNAL, format!("запуск {app}: {err}"));
+                }
+            }
+            return;
+        }
+        match AppKind::from_id(app) {
+            Some(kind) => match self.spawn_demo(kind) {
+                Ok(()) => {}
+                Err(error) => {
+                    self.reply_error(conn, ERR_UNSUPPORTED, format!("{app}: {error}"));
+                }
+            },
+            None => {
+                self.reply_error(
+                    conn,
+                    ERR_UNSUPPORTED,
+                    format!("приложение {app:?} не настроено на сервере"),
+                );
+            }
         }
     }
 

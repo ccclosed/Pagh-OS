@@ -3,9 +3,14 @@
 version = 4
 
 [[package]]
+name = "pagh-desktop"
+version = "0.1.0"
+
+[[package]]
 name = "pagh-files"
 version = "0.1.0"
 dependencies = [
+ "pagh-desktop",
  "pagh-ui",
 ]
 

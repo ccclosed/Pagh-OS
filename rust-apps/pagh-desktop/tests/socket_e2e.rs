@@ -2,8 +2,8 @@
 //! устойчивость к мусору в сокете.
 
 use pagh_desktop::client::Client;
-use pagh_desktop::protocol::{key, Message, ERR_BAD_MESSAGE};
-use pagh_desktop::server::{unique_socket_path, Server, ServerHandle, ServerOptions};
+use pagh_desktop::protocol::{key, Message, ERR_BAD_MESSAGE, ERR_UNSUPPORTED};
+use pagh_desktop::server::{unique_socket_path, LaunchTarget, Server, ServerHandle, ServerOptions};
 use pagh_desktop::surface::{PixelFormat, Surface};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -255,4 +255,95 @@ fn stale_socket_is_replaced_on_bind() {
         .is_running()));
     server.join().expect("сервер с max_frames завершился");
     assert!(!socket.exists());
+}
+
+/// Проверка расширения `launch` (type 13): сервер запускает команду из
+/// `launch_targets`, подставляет путь сокета и отвечает ошибкой на неизвестное
+/// приложение.
+#[test]
+fn launch_message_spawns_configured_app() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!(
+        "pagh-launch-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let marker = dir.join("launched.txt");
+    let script = dir.join("stub.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nprintf '%s' \"$*\" > '{}'\n", marker.display()),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    let socket = unique_socket_path("launch");
+    let options = ServerOptions {
+        socket: socket.clone(),
+        width: 640,
+        height: 480,
+        quiet: true,
+        launch_targets: vec![LaunchTarget::new(
+            "terminal",
+            vec![
+                script.to_string_lossy().into_owned(),
+                "--socket".to_string(),
+                "{socket}".to_string(),
+            ],
+        )],
+        ..ServerOptions::default()
+    };
+    let server = Server::spawn(options).expect("сервер стартует");
+    let mut client = Client::connect_retry(&socket, 200).expect("клиент подключается");
+    client.hello("launch-test").expect("hello");
+
+    client
+        .send(&Message::Launch {
+            app: "terminal".into(),
+            cwd: "/home/user".into(),
+        })
+        .expect("launch");
+    assert!(
+        wait_for(Duration::from_secs(5), || marker.exists()),
+        "команда запуска не выполнилась"
+    );
+    let argv = std::fs::read_to_string(&marker).unwrap();
+    assert!(argv.contains("--socket"), "argv без --socket: {argv:?}");
+    assert!(
+        argv.contains(&socket.to_string_lossy().into_owned()),
+        "в argv нет пути сокета: {argv:?}"
+    );
+
+    // Неизвестное приложение: spawn_demo выключен → ошибка UNSUPPORTED.
+    client
+        .send(&Message::Launch {
+            app: "paint".into(),
+            cwd: String::new(),
+        })
+        .expect("launch unknown");
+    let mut error = None;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let Some(Message::Error { code, message }) = client
+            .next_message(Duration::from_millis(200))
+            .expect("чтение")
+        {
+            error = Some((code, message));
+            break;
+        }
+    }
+    let (code, message) = error.expect("ошибка на неизвестное приложение");
+    assert_eq!(code, ERR_UNSUPPORTED, "message = {message:?}");
+    assert!(message.contains("paint"), "message = {message:?}");
+
+    server.control.shutdown();
+    server.join().expect("сервер завершился");
+    let _ = std::fs::remove_dir_all(&dir);
 }

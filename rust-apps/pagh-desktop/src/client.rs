@@ -50,7 +50,7 @@ impl Client {
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "нет попыток")))
+        Err(last_error.unwrap_or_else(|| io::Error::other("нет попыток")))
     }
 
     pub fn welcome(&self) -> Option<&Welcome> {
@@ -99,10 +99,9 @@ impl Client {
                     return Ok(welcome);
                 }
                 Some(Message::Error { code, message }) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("сервер вернул ошибку {code}: {message}"),
-                    ));
+                    return Err(io::Error::other(format!(
+                        "сервер вернул ошибку {code}: {message}"
+                    )));
                 }
                 Some(_) => continue,
                 None => std::thread::sleep(Duration::from_millis(2)),
@@ -172,7 +171,7 @@ impl Client {
                 }
                 Ok(n) => {
                     self.decoder.push(&buffer[..n]).map_err(protocol_error)?;
-                    while let Some(message) = self.decoder.next_message().map_err(protocol_error)? {
+                    if let Some(message) = self.decoder.next_message().map_err(protocol_error)? {
                         return Ok(Some(message));
                     }
                 }

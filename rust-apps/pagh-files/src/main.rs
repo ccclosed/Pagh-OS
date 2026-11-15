@@ -1,10 +1,11 @@
-//! Files: демо-снимки без экрана или окно в живом композиторе.
+//! Files: демо-снимки без экрана или окно в живом композиторе Pagh desktop.
 //!
 //! ```text
-//! pagh-files [--out DIR] [--shot NAME|all]     # headless: PNG-скриншоты
-//! pagh-files --connect /run/pagh-desktop.sock [--path DIR] [--size WxH]
+//! pagh-files [--out DIR] [--shot NAME|all]       # headless: PNG-скриншоты
+//! pagh-files --connect /run/pagh-desktop.sock    # окно по PDP/1
 //! ```
 
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -12,8 +13,9 @@ use std::time::Duration;
 use pagh_files::screenshots;
 use pagh_files::{Command, FilesApp, HostVfs, APP_NAME};
 use pagh_ui::canvas::Canvas;
-use pagh_ui::client::{DesktopClient, Incoming};
+use pagh_ui::client::{close_name, error_name, DesktopClient, Incoming};
 use pagh_ui::geom::Size;
+use pagh_ui::protocol::close_reason;
 
 fn main() -> ExitCode {
     match run() {
@@ -38,7 +40,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--out" | "-o" => {
                 out = PathBuf::from(args.next().ok_or("--out требует каталог")?);
             }
-            "--connect" => {
+            "--connect" | "--socket" => {
                 connect = Some(args.next().ok_or("--connect требует путь к сокету")?);
             }
             "--path" | "-p" => {
@@ -90,39 +92,86 @@ fn run_headless(out: &PathBuf, filter: Option<&str>) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// Окно Files в живом композиторе (`pagh-desktop`, PDP/1).
+///
+/// Клиент рисует только клиентскую область: заголовок окна, рамку, кнопки
+/// `v`/`^`/`x` и панель рисует композитор. Кадр уходит после каждого события,
+/// меняющего вид; `configure` меняет размер клиентской области (включая
+/// maximize/restore), `close` от сервера завершает приложение.
 fn run_compositor(
     socket: &str,
     path: Option<String>,
     size: Size,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = DesktopClient::connect(socket, APP_NAME)?;
+    let mut client = DesktopClient::connect_retry(socket, APP_NAME, 200)?;
     let mut app = FilesApp::new(Box::new(HostVfs::new()), size);
     if let Some(path) = path {
         app.navigate_to(&path);
     }
-    let window = client.create_window(app.size(), &app.title())?;
-    let mut canvas = Canvas::filled(app.size().w, app.size().h, app.theme.palette.desktop);
+    let window = client.open_window(app.size(), &app.title())?;
+    println!(
+        "pagh-files: окно {window} {}x{} (сокет {socket}, экран {}x{})",
+        app.size().w,
+        app.size().h,
+        client.screen().w,
+        client.screen().h
+    );
+    let _ = std::io::stdout().flush();
+
+    let mut canvas = Canvas::filled(app.size().w, app.size().h, app.theme.palette.window);
     let mut dirty = true;
     loop {
-        for incoming in client.poll()? {
+        for incoming in client.poll(Duration::from_millis(16))? {
             match incoming {
-                Incoming::Event { event, .. } => {
+                Incoming::Event {
+                    window_id, event, ..
+                } if window_id == window => {
                     for command in app.handle_event(&event) {
-                        if handle_command(command) {
-                            return Ok(());
+                        match command {
+                            Command::Quit => {
+                                let _ = client.close_window(window);
+                                return Ok(());
+                            }
+                            Command::LaunchTerminal { path } => {
+                                // PDP/1 launch (type 13): композитор запускает
+                                // терминал. Успех отдельно не подтверждается;
+                                // ошибка придёт как Incoming::Error.
+                                client.launch("terminal", &path)?;
+                            }
+                            Command::OpenPath { path } => {
+                                println!("pagh-files: открыть {path}");
+                                let _ = std::io::stdout().flush();
+                            }
                         }
                     }
                     dirty = true;
                 }
-                Incoming::Configure { size, .. } => {
+                Incoming::Configure {
+                    window_id, size, ..
+                } if window_id == window => {
                     app.resize(size);
-                    canvas = Canvas::filled(size.w, size.h, app.theme.palette.desktop);
+                    canvas = Canvas::filled(size.w, size.h, app.theme.palette.window);
                     dirty = true;
                 }
-                Incoming::Closed { .. } => return Ok(()),
-                Incoming::Error { code, message } => {
-                    eprintln!("композитор: ошибка {code}: {message}");
+                Incoming::Close { reason, .. } => {
+                    let _ = client.close_window(window);
+                    if reason != close_reason::CLIENT {
+                        println!(
+                            "pagh-files: композитор закрыл окно ({})",
+                            close_name(reason)
+                        );
+                        let _ = std::io::stdout().flush();
+                    }
+                    return Ok(());
                 }
+                Incoming::Error { code, message } => {
+                    eprintln!(
+                        "pagh-files: композитор: {} ({code}): {message}",
+                        error_name(code)
+                    );
+                }
+                Incoming::Focus { .. } | Incoming::Ping { .. } => {}
+                Incoming::Configure { .. } | Incoming::Event { .. } => {}
             }
         }
         if dirty {
@@ -130,27 +179,7 @@ fn run_compositor(
             client.commit(window, &canvas)?;
             dirty = false;
         }
-        std::thread::sleep(Duration::from_millis(16));
     }
-}
-
-/// Выполнить команду приложения; `true` — пора выходить.
-fn handle_command(command: Command) -> bool {
-    match command {
-        Command::Quit => return true,
-        Command::OpenTerminal { path } => {
-            // Терминал — отдельное приложение; запуск по протоколу появится
-            // вместе с лаунчером композитора.
-            println!("открыть терминал в: {path}");
-        }
-        Command::OpenPath { path } => {
-            println!("открыть: {path}");
-        }
-        Command::Minimize | Command::Maximize => {
-            println!("окно: свернуть/развернуть");
-        }
-    }
-    false
 }
 
 fn parse_size(value: &str) -> Result<Size, Box<dyn std::error::Error>> {
@@ -176,9 +205,13 @@ fn print_help() {
          \x20 --shot NAME|all     какая сцена: files-main, files-context-menu,\n\
          \x20                     files-properties, files-list-view, files-search,\n\
          \x20                     files-empty (по умолчанию all)\n\
-         \x20 --connect SOCKET    подключиться к композитору Pagh desktop\n\
+         \x20 --connect SOCKET    окно в композиторе Pagh desktop (PDP/1)\n\
+         \x20 --socket SOCKET     то же, что --connect\n\
          \x20 --path DIR          начальный каталог для окна\n\
-         \x20 --size WxH          размер окна (по умолчанию 1060x640)",
+         \x20 --size WxH          размер клиентской области (по умолчанию 1060x640)\n\
+         \n\
+         Оформление окна (заголовок, v/^/x, панель) принадлежит композитору;\n\
+         Files рисует только клиентскую область и шлёт кадры по PDP/1.",
         pagh_files::VERSION
     );
 }
