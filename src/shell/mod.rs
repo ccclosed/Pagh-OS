@@ -21,6 +21,10 @@ pub(crate) mod nano;
 pub(crate) mod nano_config;
 pub(crate) mod paint;
 pub(crate) mod path;
+// Pure `ppkg install` progress model/renderers (host-tested in
+// `host-tests/src/properties/ppkg_progress_ui.rs`) + its effectful console driver.
+pub(crate) mod ppkg_progress;
+mod progress;
 pub(crate) mod registry;
 pub(crate) mod render;
 pub(crate) mod selection;

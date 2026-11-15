@@ -28,7 +28,7 @@
 | `build-rust-app.sh` | Сборка userland-приложений (`rust-apps/`) под `x86_64-unknown-linux-musl` |
 | `e2e_shell_tools.script` | Сценарий `e2e.py shell` для shell-команд 2.19.0 (`free`, `date`, `head`/`tail`/`wc`/`grep`, `ls -l`, `chmod`/`chown`): 36 шагов, 18 serial-ассертов, без сети |
 | `e2e_local_mirror.ps1` | Детерминированный apt E2E: release-сборка c `--features lx_selftest`, stage, serve mini_repo, QEMU, assert serial-маркеров |
-| `e2e_live_update.ps1` | Live `apt update` против `deb.debian.org` (`--features lx_livetest`) **по HTTPS** (issue #19 закрыт: живой путь идёт аутентифицированным транспортом, харнесс отказывается стартовать на cleartext-конфиге); assert `LIVE_APT_UPDATE: count=N`, N ≥ 50000; тайминги soft |
+| `e2e_live_update.ps1` | Live `ppkg update` против `deb.debian.org` (`--features lx_livetest`) **по HTTPS** (issue #19 закрыт: живой путь идёт аутентифицированным транспортом, харнесс отказывается стартовать на cleartext-конфиге); assert `LIVE_APT_UPDATE: count=N`, N ≥ 50000; тайминги soft |
 | `e2e_bigindex.ps1` | Репро parse-краша #14 (`--features lx_bigindex`, `-InRam` добавляет `lx_bigindex_inram`); скан serial на `[EXC #14]` |
 | `smoke_assertions.ps1` | Проверка smoke-критериев R4.1/R4.2/R7.4 по захваченным serial-логам (промпт достигнут, debug-link работает, аутентификация HTTPS-сервера подтверждена: `LXSELFTEST https_get PASS` либо отказ верификатора `Package_Fetcher(tls): stage=verify cause=…`) |
 | `mini_repo/` | Сгенерированное дерево зеркала (**закоммичено**, чтобы e2e не требовал сборки) |
@@ -116,7 +116,7 @@ Legacy- и UEFI-режимы, а ISO с одним EFI-записью в Legacy 
 В загрузочный образ ядро положить нельзя: запись El Torito описывает максимум
 32 МиБ, а ядро занимает ~21 МиБ.
 
-**Для ISO нужен `xorriso`** (`dnf install xorriso` / `apt install xorriso`) —
+**Для ISO нужен `xorriso`** (`dnf install xorriso` / `ppkg install xorriso`) —
 сборщик вызывает его с `-b limine-bios-cd.bin -no-emul-boot -boot-load-size 4
 -boot-info-table --efi-boot limine-uefi-cd.bin -efi-boot-part --efi-boot-image
 --protective-msdos-label -V PAGH_OS`. Ручной ISO9660+El Torito (или UEFI-only

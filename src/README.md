@@ -107,7 +107,7 @@ Sinks: serial всегда, framebuffer условно. Гейты fb-зерка
   `etc/`, `home/user/`, `usr/share/pagh/`, `examples/hello/`; `resolv.conf` (10.0.2.3),
   `hosts`, `motd`, README, LICENSE-NOTICE, hello-пример. `write_once` — не перезаписывает.
   Зависит только от `vfs` (`VfsNode`/`VfsError`): никакого apt/python в этой функции уже
-  нет — юзерленд ставится из shell по явной команде (`apt update` + `apt install python3`).
+  нет — юзерленд ставится из shell по явной команде (`ppkg update` + `ppkg install python3`).
 
 ### `selftest_lx.rs` — Linux-совместимость selftests (feature-gated)
 Компилируется только под `lx_selftest`/`lx_livetest`/`lx_bigindex`/`lx_tlsbig`.
@@ -118,7 +118,7 @@ Sinks: serial всегда, framebuffer условно. Гейты fb-зерка
   getcwd/chdir/dup/gettimeofday/getdents.
 - `run_post_net_checks()` — apt E2E через локальное мини-зеркало (`tools/mini_repo.py`) +
   HTTPS smoke (реальный TLS 1.3 GET на deb.debian.org).
-- `run_live_update_check()` (`lx_livetest`) — полный live `apt update` **по HTTPS** (TLS 1.3;
+- `run_live_update_check()` (`lx_livetest`) — полный live `ppkg update` **по HTTPS** (TLS 1.3;
   зеркало из `apt::DEFAULT_MIRROR_HOST/BASE`; на cleartext-конфиге харнесс не стартует и
   печатает FAIL, так что «случайный PASS по HTTP» невозможен), assert count ≥ 50 000.
   Стойки на больших стримах нет — issue #19 опровергнут байт-трейсом (13 332 733 B одним

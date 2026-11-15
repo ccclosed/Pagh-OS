@@ -121,7 +121,7 @@ def render_module(signing: dict, untrusted: dict, expired: dict, future: dict) -
         "//! script, so the anchor and every `tools/mini_repo/` digest can be reproduced).\n"
         "//!\n"
         "//! TEST ANCHOR ONLY. This module is compiled only for the harness builds that run\n"
-        "//! `apt update` against the LOCAL test mirror — `lx_selftest` and `lx_bigindex`\n"
+        "//! `ppkg update` against the LOCAL test mirror — `lx_selftest` and `lx_bigindex`\n"
         "//! (see `src/pkg/mod.rs`) — and `pkg::apt::trusted_keyring` selects it only there,\n"
         "//! so a normal, release or live-test build cannot trust the key below. It exists so\n"
         "//! the local-mirror harness can run against a repository that is *signed*: the\n"

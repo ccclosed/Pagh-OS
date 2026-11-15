@@ -133,7 +133,7 @@ MODE_DEFAULTS = {
     "bigindex": {"timeout": 300.0, "serial": "serial_bigindex.log"},
     # apt performance benchmark (apt-fast): build a signed local benchmark repo
     # (5k/50k stanzas + a multi-package 24 MiB install), boot `lx_apt_bench`, and
-    # read the `apt: timings` phase lines. Generous timeout: the 50k index parse
+    # read the `ppkg: timings` phase lines. Generous timeout: the 50k index parse
     # and the ext2 writes both run under TCG.
     "bench": {"timeout": 900.0, "serial": "serial_bench.log"},
     "shell": {"timeout": 180.0, "serial": "serial_shell.log"},
@@ -164,20 +164,20 @@ MODE_EVIDENCE = {
         r"Self-test complete", r"Running kernel self-test", r"pagh:/>",
     ),
     "local-mirror": (
-        r"apt:|LXSELFTEST apt_e2e|hello from apt|LXSELFTEST https_get|Package_Fetcher\(tls\)",
+        r"ppkg:|LXSELFTEST apt_e2e|hello from apt|LXSELFTEST https_get|Package_Fetcher\(tls\)",
     ),
     "live-update": (
-        r"apt:|LIVE_APT_UPDATE|LXSELFTEST live_update|Resident_Index_Footprint|net::tls|busybox",
+        r"ppkg:|LIVE_APT_UPDATE|LXSELFTEST live_update|Resident_Index_Footprint|net::tls|busybox",
     ),
     "bigindex": (
-        r"apt:|BIGINDEX|LXSELFTEST bigindex|EXC #\d+|PAGE FAULT|RIP=",
+        r"ppkg:|BIGINDEX|LXSELFTEST bigindex|EXC #\d+|PAGE FAULT|RIP=",
     ),
     "bench": (
-        r"apt: timings|LXSELFTEST apt_bench|apt: \[\d+/\d+\] Unpacked|EXC #\d+|"
+        r"ppkg: timings|LXSELFTEST apt_bench|ppkg: \[\d+/\d+\] Unpacked|EXC #\d+|"
         r"PAGE FAULT|RIP=",
     ),
     "shell": (
-        r"SELFTEST|LXSELFTEST|EXC #|FAIL|PASS|hello|apt:|pagh:/>",
+        r"SELFTEST|LXSELFTEST|EXC #|FAIL|PASS|hello|ppkg:|pagh:/>",
     ),
     "usb": (
         r"input: usb:|xhci: HID device on port|usb: \d+ controller|usb: key reports|"
@@ -1610,9 +1610,9 @@ def mode_local_mirror(h: Harness) -> tuple[str, int]:
     ok = h.check("apt_e2e verdict marker reached", bool(found),
                  regex_first(r"LXSELFTEST apt_e2e (?:PASS|FAIL)[^\r\n]*", text) or "timeout")
     ok &= h.check("index loaded (>0 packages)", bool(idx))
-    get = regex_first(r"apt: Get http://10\.0\.2\.2(?::\d+)?/\S*Packages\S*", text)
+    get = regex_first(r"ppkg: Get http://10\.0\.2\.2(?::\d+)?/\S*Packages\S*", text)
     ok &= h.check("index fetch from the local mirror (R5.2)", bool(get), get or "")
-    unpacked = regex_first(r"apt: \[\d+/\d+\] Unpacked \S+ \(\d+ files,", text)
+    unpacked = regex_first(r"ppkg: \[\d+/\d+\] Unpacked \S+ \(\d+ files,", text)
     ok &= h.check("install wrote files onto ext2 /mnt", bool(unpacked), unpacked or "")
     ok &= h.check("apt_e2e PASS", bool(re.search(r"LXSELFTEST apt_e2e PASS[^\r\n]*", text)),
                   regex_first(r"LXSELFTEST apt_e2e PASS[^\r\n]*", text) or "no PASS line")
@@ -1633,7 +1633,7 @@ def mode_bench(h: Harness) -> tuple[str, int]:
     The mode itself is the **after** regression gate: it requires the streaming
     install to keep `heap_peak_kib` for the large package below
     `--max-heap-kib` (0 disables the bound, for baseline measurements), and it
-    asserts the exact `apt: timings` phase-line surface exists. The before/after
+    asserts the exact `ppkg: timings` phase-line surface exists. The before/after
     numeric comparison lives in the task report; the harness preserves every
     timings line in the serial log this mode prints.
     """
@@ -1660,7 +1660,7 @@ def mode_bench(h: Harness) -> tuple[str, int]:
                    ready_path="/dists/bench/main/binary-amd64/Packages.gz")
 
     def on_tick(text: str) -> None:
-        last = re.findall(r"apt: (?:reading package lists[^\r\n]*|index ready[^\r\n]*)", text)
+        last = re.findall(r"ppkg: (?:reading package lists[^\r\n]*|index ready[^\r\n]*)", text)
         if last:
             log(f"... {last[-1]}")
 
@@ -1668,8 +1668,8 @@ def mode_bench(h: Harness) -> tuple[str, int]:
                      on_tick=on_tick, label="apt_bench verdict")
     text = h.guest.serial()
 
-    timings = re.findall(r"apt: timings cmd=(\w+)[^\r\n]*", text)
-    full_lines = re.findall(r"apt: timings cmd=\w+[^\r\n]*", text)
+    timings = re.findall(r"ppkg: timings cmd=(\w+)[^\r\n]*", text)
+    full_lines = re.findall(r"ppkg: timings cmd=\w+[^\r\n]*", text)
     for line in full_lines:
         log(f"timing: {line}")
     update_lines = [l for l in full_lines if "cmd=update" in l]
@@ -1706,9 +1706,9 @@ def mode_bench(h: Harness) -> tuple[str, int]:
                  or "timeout")
     ok &= h.check("apt_bench PASS", bool(re.search(r"LXSELFTEST apt_bench PASS", text)),
                   regex_first(r"LXSELFTEST apt_bench PASS[^\r\n]*", text) or "no PASS line")
-    ok &= h.check("two apt: timings update phase lines", len(update_lines) >= 2,
+    ok &= h.check("two ppkg: timings update phase lines", len(update_lines) >= 2,
                   f"{len(update_lines)} update timing line(s)")
-    ok &= h.check("one apt: timings install phase line", bool(install_lines), install_line)
+    ok &= h.check("one ppkg: timings install phase line", bool(install_lines), install_line)
     ok &= h.check("install timing carries phase fields & heap_peak_kib",
                   heap_kib >= 0 and files > 0, install_line)
     ok &= h.check("install payload verified in guest", bool(payload), payload or "")
@@ -1742,17 +1742,17 @@ def mode_live_update(h: Harness) -> tuple[str, int]:
     assert h.guest is not None
 
     def on_tick(text: str) -> None:
-        last = re.findall(r"apt: reading package lists\.\.\. [^\r\n]*", text)
+        last = re.findall(r"ppkg: reading package lists\.\.\. [^\r\n]*", text)
         if last:
             log(f"... {last[-1]}")
 
     found = wait_for(h.guest, [r"LXSELFTEST live_update (?:PASS|FAIL)"], h.timeout,
                      on_tick=on_tick, label="live_update verdict")
     text = h.guest.serial()
-    progress = re.findall(r"apt: reading package lists\.\.\. \S+ / (\d+) pkgs", text)
+    progress = re.findall(r"ppkg: reading package lists\.\.\. \S+ / (\d+) pkgs", text)
     seq = [int(p) for p in progress]
     mono = all(seq[i] >= seq[i - 1] for i in range(1, len(seq)))
-    terminal = re.search(r"apt: index ready - (\d+) packages", text)
+    terminal = re.search(r"ppkg: index ready - (\d+) packages", text)
     count = re.search(r"LIVE_APT_UPDATE: count=(\d+)", text)
     footprint = re.search(r"Resident_Index_Footprint = (\d+) bytes", text)
     live_pass = bool(re.search(r"LXSELFTEST live_update PASS", text))
@@ -2559,7 +2559,7 @@ def mode_smoke(h: Harness) -> tuple[str, int]:
                       if proc.stdout.strip() else f"exit {proc.returncode}")
         if not linked:
             print(proc.stdout[-2000:], proc.stderr[-2000:], file=sys.stderr)
-    idx = re.search(r"(?:apt: index ready - (\d+) packages"
+    idx = re.search(r"(?:ppkg: index ready - (\d+) packages"
                     r"|LXSELFTEST apt_e2e: index loaded \((\d+) packages\))", local_text)
     h.check("R4.2 functional index-pipeline evidence in the local log", bool(idx),
             idx.group(0).strip() if idx else "none (run `local-mirror` first)")

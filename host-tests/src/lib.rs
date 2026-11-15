@@ -113,6 +113,13 @@ pub mod deb;
 #[path = "../../src/pkg/tar.rs"]
 pub mod tar;
 
+// `ppkg_progress` is the pure `ppkg install` progress model/renderer (bar
+// geometry, unknown-total `<=>` animation, percent/speed/size/ETA widgets, the
+// 10 FPS gate, ANSI/carriage-return/plain emitters). It is `core` + `alloc` only,
+// so the host tests pin the exact strings the console driver writes.
+#[path = "../../src/shell/ppkg_progress.rs"]
+pub mod ppkg_progress;
+
 // `install` is the pure install-path normalization + install model (component 10).
 // It references `TarEntry`/`TarType` via `super::tar`, which here resolves to the
 // crate-root `tar` module declared just above (in the kernel it resolves to
@@ -585,6 +592,11 @@ mod properties {
     // streaming builder, strict structural validation (magic/version/lengths/
     // StrRef ranges/no trailing bytes) and byte-level panic-freedom.
     mod apt_index_cache;
+    // `ppkg install` progress UI: deterministic snapshots of the known bar,
+    // the unknown-total `<=>` animation at t=0/250/500/750/1000 ms, the
+    // percent/speed/size/ETA widgets, the 10 FPS redraw gate, the ANSI repaint
+    // sequence and the carriage-return/plain fallbacks.
+    mod ppkg_progress_ui;
     // OpenPGP repository-metadata verification (issue #32), contract
     // OPENPGP-VERIFY-CONTRACT.md §2/§3/§7.
     //   P51 — armor/packet framing: bounded, panic-free parsing of hostile bytes.

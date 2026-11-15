@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Live full-`apt update` smoke against the real deb.debian.org mirror
+  Live full-`ppkg update` smoke against the real deb.debian.org mirror
   (spec full-debian-apt-update task 11.1).
 
 .DESCRIPTION
@@ -150,7 +150,7 @@ while ((Get-Date) -lt $deadline) {
             break
         }
         # Heartbeat: surface the most recent progress line as we wait.
-        $last = ($txt -split "`r?`n" | Select-String -Pattern 'apt: reading package lists' | Select-Object -Last 1)
+        $last = ($txt -split "`r?`n" | Select-String -Pattern 'ppkg: reading package lists' | Select-Object -Last 1)
         if ($last) { Write-Host ("  ... {0}" -f $last.Line.Trim()) -ForegroundColor DarkGray }
     }
 }
@@ -167,15 +167,15 @@ $serial = if (Test-Path $serialLog) { Get-Content $serialLog -Raw } else { '' }
 
 Write-Host "`n================ LIVE SERIAL EVIDENCE ================" -ForegroundColor Yellow
 $serial -split "`r?`n" |
-    Select-String -Pattern 'apt:|LIVE_APT_UPDATE|LXSELFTEST live_update|Resident_Index_Footprint|net::tls|busybox' |
+    Select-String -Pattern 'ppkg:|LIVE_APT_UPDATE|LXSELFTEST live_update|Resident_Index_Footprint|net::tls|busybox' |
     ForEach-Object { $_.Line }
 
 # Progress lines. The kernel's periodic marker is
-#   src/pkg/apt.rs:450 -> "apt: reading package lists... <human bytes> / <N> pkgs"
-# (the older "apt: decompressed K KiB, parsed P packages" format was never
+#   src/pkg/apt.rs:450 -> "ppkg: reading package lists... <human bytes> / <N> pkgs"
+# (the older "ppkg: decompressed K KiB, parsed P packages" format was never
 # emitted by this kernel, so this scan used to match nothing and the
 # monotonicity check below passed vacuously on an empty sequence).
-$progress = [regex]::Matches($serial, 'apt: reading package lists\.\.\. \S+ / (\d+) pkgs')
+$progress = [regex]::Matches($serial, 'ppkg: reading package lists\.\.\. \S+ / (\d+) pkgs')
 $pkgSeq = @()
 foreach ($m in $progress) { $pkgSeq += [int64]$m.Groups[1].Value }
 
@@ -186,9 +186,9 @@ function Test-NonDecreasing($seq) {
 
 $pkgMono = Test-NonDecreasing $pkgSeq
 
-# Terminal marker: the kernel logs "apt: index ready - N packages"
+# Terminal marker: the kernel logs "ppkg: index ready - N packages"
 # (src/pkg/apt.rs:374).
-$terminal     = [regex]::Match($serial, 'apt: index ready - (\d+) packages')
+$terminal     = [regex]::Match($serial, 'ppkg: index ready - (\d+) packages')
 $liveCount    = [regex]::Match($serial, 'LIVE_APT_UPDATE: count=(\d+)')
 $footprint    = [regex]::Match($serial, 'Resident_Index_Footprint = (\d+) bytes')
 $livePass     = $serial -match 'LXSELFTEST live_update PASS'
@@ -205,9 +205,9 @@ if ($progress.Count -gt 0) {
     Write-Host ("Parsed packages monotonic non-decreasing  : {0}" -f $pkgMono)
 }
 if ($terminal.Success) {
-    Write-Host ("Terminal `apt: index ready` reached       : YES ({0} packages)" -f $terminal.Groups[1].Value) -ForegroundColor Green
+    Write-Host ("Terminal `ppkg: index ready` reached       : YES ({0} packages)" -f $terminal.Groups[1].Value) -ForegroundColor Green
 } else {
-    Write-Host  "Terminal `apt: index ready` reached       : NO (still progressing or blocked)" -ForegroundColor DarkYellow
+    Write-Host  "Terminal `ppkg: index ready` reached       : NO (still progressing or blocked)" -ForegroundColor DarkYellow
 }
 if ($liveCount.Success) {
     $n = [int64]$liveCount.Groups[1].Value

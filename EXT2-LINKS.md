@@ -787,7 +787,7 @@ python3 tools/e2e.py local-mirror  # in-guest
 4. Два hardlink'а: равные `st_ino`, `st_nlink == 2`; данные не дублируются (свободное место
    не уменьшилось вдвое); `unlink` одного имени не ломает второе; `unlink` последнего
    освобождает inode и блоки (счётчики `s_free_inodes_count`/`s_free_blocks_count` вернулись).
-5. `apt install` пакета с symlink+hardlink (mini_repo, in-guest): ссылки реальные, копий нет,
+5. `ppkg install` пакета с symlink+hardlink (mini_repo, in-guest): ссылки реальные, копий нет,
    `materialize_symlinks` отсутствует в коде, README больше не заявляет «links materialized
    as copies».
 6. Tar: `'1'` и `'2'` различимы; `'L'`/`'K'` и ustar `prefix` дают корректные длинные пути;

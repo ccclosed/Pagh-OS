@@ -5,7 +5,7 @@ issue #32's trust chain.
 
 Suites under `tools/mini_repo/dists/` (one served root, switched with `apt setsuite`):
 
-    stable/          correct AND signed          -> `apt update` + `install` succeed
+    stable/          correct AND signed          -> `ppkg update` + `install` succeed
     tampered-index/  signature VALID, but the served `Packages` is a same-length
                      version-swapped copy of the one the signed `Release` describes
                                                   -> update refused, no index published
@@ -364,7 +364,7 @@ def write_suite(suite: str, signer, deb: bytes, tamper_deb: bool, links: bytes =
     if tamper_deb:
         # Flip one bit inside the (compressed) data member: the file keeps its
         # exact length, so the signed `Size:` matches and the SHA-256 is the only
-        # check that can refuse it. `apt install` verifies the digest BEFORE it
+        # check that can refuse it. `ppkg install` verifies the digest BEFORE it
         # parses the archive, which is the behaviour under test.
         served_deb[-1] ^= 0x01
     served_deb = bytes(served_deb)
@@ -484,7 +484,7 @@ def build_repo() -> None:
 def build_big_index(n: int) -> None:
     """DIAGNOSTIC (Pagh-OS apt parse-stage crash repro): generate a LARGE synthetic
     `Packages` index of `n` stanzas and write both `Packages` and `Packages.gz`
-    under dists/stable/main/binary-amd64, so the kernel `apt update` streaming
+    under dists/stable/main/binary-amd64, so the kernel `ppkg update` streaming
     parse path is exercised at real-`main` scale over local HTTP (no live CDN).
 
     Mirrors the host-tests `bigindex` generator field-for-field (Package, Version,
@@ -598,7 +598,7 @@ def build_bench_repo(out_dir: str, stanzas: int, size_mib: int) -> None:
       * `bench-dep-0`/`bench-dep-1` — `size_mib/4` MiB each,
 
     followed by synthetic filler stanzas (`bench-filler-NNNNNN`) that only make
-    the index big enough to measure the parse stage. `apt install bench-large`
+    the index big enough to measure the parse stage. `ppkg install bench-large`
     therefore fetches four signed `.deb`s and writes ~`size_mib` MiB in one
     transaction — exactly the multi-package shape the once-per-transaction `sync`
     change targets.
@@ -657,11 +657,23 @@ def build_bench_repo(out_dir: str, stanzas: int, size_mib: int) -> None:
         with open(os.path.join(deb_dir, f"{pkg}_1.0_amd64.deb"), "wb") as f:
             f.write(deb)
 
-    rel_dir = os.path.join(out_dir, "dists", BENCH_SUITE)
-    release = suite_release(BENCH_SUITE, index, gz)
-    with open(os.path.join(rel_dir, "Release"), "wb") as f:
-        f.write(release)
-    sign_release(rel_dir, release, "test")
+    # Two signed suites with the same content: `bench` is what `lx_apt_bench`
+    # selects programmatically, and `stable` is the default suite so a
+    # shell-level `ppkg update/install` test can point at this repo with only
+    # `ppkg setmirror` (no suite-selection command exists).
+    for suite in (BENCH_SUITE, "stable"):
+        rel_dir = os.path.join(out_dir, "dists", suite)
+        os.makedirs(rel_dir, exist_ok=True)
+        idx_dir = os.path.join(out_dir, "dists", suite, "main", "binary-amd64")
+        os.makedirs(idx_dir, exist_ok=True)
+        with open(os.path.join(idx_dir, "Packages"), "wb") as f:
+            f.write(index)
+        with open(os.path.join(idx_dir, "Packages.gz"), "wb") as f:
+            f.write(gz)
+        release = suite_release(suite, index, gz)
+        with open(os.path.join(rel_dir, "Release"), "wb") as f:
+            f.write(release)
+        sign_release(rel_dir, release, "test")
 
     print(f"built BENCH repo at {out_dir}")
     print(f"  suite       : {BENCH_SUITE} (signed by the deterministic TEST key)")

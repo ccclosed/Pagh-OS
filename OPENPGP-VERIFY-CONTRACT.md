@@ -499,7 +499,7 @@ The local-mirror integration tests need a key the kernel trusts. Design:
      (mismatch => hard refusal, no fallback to another variant)
 7. decompress + stream-parse (existing pipeline, unchanged limits)
 8. publish INDEX atomically (5.6)
-9. `apt install`: per record -> Filename + SHA256 + Size from the SAME signed record ->
+9. `ppkg install`: per record -> Filename + SHA256 + Size from the SAME signed record ->
    GET -> check SHA-256 **and** Size -> only then parse_ar/decompress/tar/install (5.4)
 ```
 
@@ -544,7 +544,7 @@ byte-identical to the standalone `Release` **[verified]**. Rules:
   code already keeps them together; keep it that way);
   * empty `Filename` → refuse (today an ad-hoc `Download` error; make it a named cause);
   * missing/unparsable `SHA256` → refuse to install **that package** (`DigestUnavailable`);
-    `apt show`/`list` may still display the record, but it must be visible in the output
+    `ppkg show`/`list` may still display the record, but it must be visible in the output
     that the package cannot be verified (implementer's choice of wording; no silent install);
   * after `cfg.fetch(&url)` and **before** `deb::parse_ar` → compare SHA-256 and size;
     mismatch → `DigestMismatch`/`SizeMismatch` and **no unpacking, no file written**.
@@ -578,7 +578,7 @@ byte-identical to the standalone `Release` **[verified]**. Rules:
   parse have all succeeded (`Ok(count)`).
 * On **any** verification failure the INDEX is **cleared** (not left holding the previous
   boot's or previous run's index). Rationale: the index is RAM-only and rebuilt by
-  `apt update` every boot, so clearing costs nothing while "keep the last verified index
+  `ppkg update` every boot, so clearing costs nothing while "keep the last verified index
   after a failed update" would let an attacker freeze the mirror view. Record this deviation
   from apt's "keep old lists" behaviour in the subsystem README.
 * `install()` requires a published, verified index; with none it returns `NoIndex` (existing).
@@ -734,7 +734,7 @@ one boot (or five boots; implementer's choice, but all five must be asserted by 
 
 | # | Mirror state | Required kernel behaviour | Evidence |
 |---|---|---|---|
-| 1 | signed, correct (positive control) | `apt update` + `apt install hello-pagh` succeed, the ELF runs | `LXSELFTEST apt_sig control PASS`, existing `apt: [1/1] Unpacked hello-pagh`, `hello from apt` |
+| 1 | signed, correct (positive control) | `ppkg update` + `ppkg install hello-pagh` succeed, the ELF runs | `LXSELFTEST apt_sig control PASS`, existing `apt: [1/1] Unpacked hello-pagh`, `hello from apt` |
 | 2 | `Packages.gz` does not match the signed `Release` | update refused, index NOT published | `apt: verify FAIL stage=index cause=HashMismatch`, `LXSELFTEST apt_sig tampered_index PASS` |
 | 3 | `.deb` does not match the signed `Packages` | install refused **before unpacking**; `/mnt/usr/bin/hello-pagh` must not exist afterwards | `apt: verify FAIL stage=deb cause=HashMismatch`, `LXSELFTEST apt_sig tampered_deb PASS` |
 | 4 | no `InRelease`, no `Release.gpg` | update refused, explicit user-visible message | `apt: verify FAIL stage=metadata cause=Unsigned`, `LXSELFTEST apt_sig unsigned PASS` |
@@ -807,7 +807,7 @@ An implementation satisfies this contract only if **all** of the following hold:
    order, deterministic regeneration).
 3. The update path implements §5.1 exactly, including "verify before publish" (§5.6) and
    "no variant fallback after a digest failure".
-4. `apt install` verifies SHA-256 **and** size of every `.deb` before `deb::parse_ar`.
+4. `ppkg install` verifies SHA-256 **and** size of every `.deb` before `deb::parse_ar`.
 5. §6 holds: every refusal is terminal, greppable, and no override exists; the unsigned
    mirror refusal is visible to the user.
 6. §8.1 properties pass, §8.3's five cases pass in QEMU under `tools/e2e.py`, and the
