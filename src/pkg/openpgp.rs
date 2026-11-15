@@ -1,38 +1,37 @@
-//! Pure OpenPGP *verification policy* for Debian repository metadata (issue
-//! #32): trusted-key selection, subkey binding, expiry/revocation/key-flag
-//! handling, and the two entry points `apt` will call — a detached signature
-//! over `Release` (`Release.gpg`) and a clear-signed `InRelease`.
+//! Чистая *политика верификации* OpenPGP для метаданных Debian-репозитория
+//! (issue #32): выбор доверенного ключа, subkey binding, обработка
+//! expiry/revocation/key-flag и две точки входа, которые вызовет `apt` — detached
+//! подпись над `Release` (`Release.gpg`) и clear-signed `InRelease`.
 //!
-//! `core` + `alloc` only, no globals: the trusted keyring is always an explicit
-//! argument ([`PinnedKey`]), so this module can never consult a mutable trust
-//! store, and the host tests exercise the same code with synthetic keyrings.
-//! The contract this implements is `OPENPGP-VERIFY-CONTRACT.md` (§2, §3, §7);
-//! the empirical facts behind every rule (the v4 digest trailer, clearsign
-//! canonicalization, "EdDSA signs the digest", the legacy Ed25519 OID, subkey
-//! issuers) are recorded there and re-verified against live Debian artifacts in
-//! P52/P53.
+//! Только `core` + `alloc`, без глобалов: доверенный keyring всегда явный аргумент
+//! ([`PinnedKey`]), так что модуль не может обратиться к изменяемому trust store, а
+//! host-тесты гоняют тот же код с синтетическими keyring'ами. Реализуемый контракт —
+//! `OPENPGP-VERIFY-CONTRACT.md` (§2, §3, §7); эмпирические факты за каждым правилом
+//! (v4 digest trailer, канонизация clearsign, «EdDSA подписывает дайджест»,
+//! legacy Ed25519 OID, subkey issuers) записаны там и перепроверены на живых
+//! артефактах Debian в P52/P53.
 //!
-//! ## Acceptance over multiple signatures
+//! ## Приём при нескольких подписях
 //!
-//! Real `stable` metadata carries three signatures (today: two RSA-4096
-//! subkeys and one Ed25519 primary) and a mirror may add signers Debian rotation
-//! introduces. The rule is therefore:
+//! Реальные метаданные `stable` несут три подписи (сегодня: два RSA-4096 subkey и
+//! один Ed25519 primary), и зеркало может добавить подписантов из ротации Debian.
+//! Правило поэтому такое:
 //!
-//! * a signature whose issuer fingerprint is **not** in the pinned keyring is
-//!   ignored (it cannot be checked, and refusing it would break the mirror the
-//!   day Debian adds a signer);
-//! * a signature whose issuer fingerprint **is** pinned must verify fully — a
-//!   single bad signature from a pinned key is fatal even when others are good
-//!   (this is `gpgv`'s own behaviour: one bad signature makes it exit 1);
-//! * at least one fully verified signature is required.
+//! * подпись, чей issuer fingerprint **не** в закреплённом keyring'е, игнорируется
+//!   (её нельзя проверить, а отказ сломал бы зеркало в день, когда Debian добавит
+//!   подписанта);
+//! * подпись, чей issuer fingerprint **закреплён**, должна проверяться полностью —
+//!   одна плохая подпись закреплённого ключа фатальна, даже когда другие хороши
+//!   (это собственное поведение `gpgv`: одна плохая подпись даёт exit 1);
+//! * требуется хотя бы одна полностью проверенная подпись.
 //!
-//! ## Deliberate strengthening over `gpgv`
+//! ## Намеренное усиление против `gpgv`
 //!
-//! `gpgv` verifies, and exits 0 for, a signature made by an **expired** key.
-//! pagh refuses: a key whose validity window has closed is not usable, and the
-//! operator must regenerate the pinned keyring (`tools/gen_debian_keyring.py`)
-//! deliberately. `SECURITY.md` names this as a strengthening, not as
-//! compatibility.
+//! `gpgv` проверяет и выходит с 0 для подписи **просроченным** ключом. pagh
+//! отказывает: ключ, чьё окно валидности закрылось, не используется, и оператор
+//! должен намеренно перегенерировать закреплённый keyring
+//! (`tools/gen_debian_keyring.py`). `SECURITY.md` называет это усилением, а не
+//! совместимостью.
 
 #![allow(dead_code)]
 

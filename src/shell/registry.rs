@@ -1,35 +1,33 @@
-//! Command registry: the single static `CommandSpec` table driving dispatch
-//! and `help`.
+//! Реестр команд: единственная статическая таблица `CommandSpec`, ведущая
+//! диспетчеризацию и `help`.
 //!
-//! This module is the scaffolding for the registry-driven dispatch model
-//! described in the design (R6). It defines the [`CommandSpec`] shape, the
-//! [`ShellCtx`] handlers receive, the [`COMMANDS`] table, and the [`lookup`] /
-//! [`command_names`] helpers used by dispatch, `help`, and Tab completion.
+//! Модуль — каркас registry-driven модели диспетчеризации (R6). Он определяет
+//! форму [`CommandSpec`], [`ShellCtx`], который получают обработчики, таблицу
+//! [`COMMANDS`] и хелперы [`lookup`] / [`command_names`], используемые
+//! диспетчеризацией, `help` и Tab-дополнением.
 //!
-//! The [`COMMANDS`] table starts empty; migrating the existing command bodies
-//! out of `mod.rs::execute_command` into registry handlers (and rewiring
-//! dispatch through [`lookup`]) is a later task. Likewise the completion code
-//! consumes [`command_names`] in a later task. Until then these items are not
-//! referenced internally, hence the `#[allow(dead_code)]` annotations that keep
-//! the `#![no_std]` build warning-free.
+//! Таблица [`COMMANDS`] заполнена; сами тела команд по-прежнему в
+//! `mod.rs::execute_command`, а диспетчеризация идёт через [`lookup`].
+//! Дополнение потребляет [`command_names`]. Эти элементы не упоминаются внутри
+//! иначе, отсюда `#[allow(dead_code)]`, чтобы сборка `#![no_std]` оставалась без
+//! предупреждений.
 
-/// Shared, mutable state a command handler operates on for a single
-/// invocation.
+/// Общее изменяемое состояние, с которым обработчик команды работает за один
+/// вызов.
+
+/// По замыслу здесь собраны сервисы, нужные обработчикам, чтобы они оставались
+/// развязаны с глобальными. В этой версии каркаса полей нет; он будет наполняться
+/// по мере миграции команд.
 ///
-/// Per the design this bundles the services handlers need so they stay
-/// decoupled from globals. In this scaffolding version it carries no fields;
-/// it will be fleshed out as commands migrate.
-///
-/// Handlers access the current working directory through
-/// [`crate::shell::path::cwd`] / [`crate::shell::path::set_cwd`], and (once it
-/// exists) render output through the `crate::shell::render` helpers. Nothing in
-/// this struct should be used to call into `render` yet — that module is
-/// landed by a later task.
+/// Обработчики получают текущий рабочий каталог через
+/// [`crate::shell::path::cwd`] / [`crate::shell::path::set_cwd`] и рендерят вывод
+/// через хелперы `crate::shell::render`. Ничего в этой структуре не должно
+/// вызывать `render` — этот модуль подключается отдельно.
 #[allow(dead_code)]
 pub struct ShellCtx;
 
 impl ShellCtx {
-    /// Construct a fresh per-invocation context.
+    /// Создать свежий контекст на один вызов.
     #[allow(dead_code)]
     pub fn new() -> Self {
         ShellCtx
@@ -42,29 +40,29 @@ impl Default for ShellCtx {
     }
 }
 
-/// A single command's metadata and handler, the unit of the registry.
+/// Метаданные и обработчик одной команды, единица реестра.
 ///
-/// One `CommandSpec` row drives both dispatch (via `handler`) and `help` (via
-/// `name` / `description` / `usage`), so adding a command is a single-row edit
-/// with no other changes (R6.5, R9.5).
+/// Одна строка `CommandSpec` ведёт и диспетчеризацию (через `handler`), и `help`
+/// (через `name` / `description` / `usage`), так что добавление команды — правка
+/// одной строки без других изменений (R6.5, R9.5).
 #[allow(dead_code)]
 pub struct CommandSpec {
-    /// The command word typed at the prompt (e.g. `"ls"`).
+    /// Слово команды, набираемое в промпте (например `"ls"`).
     pub name: &'static str,
-    /// One-line summary shown by `help`.
+    /// Однострочная сводка, показываемая `help`.
     pub description: &'static str,
-    /// Usage string shown by `help <cmd>` and on argument errors.
+    /// Строка usage для `help <cmd>` и ошибок аргументов.
     pub usage: &'static str,
-    /// Handler invoked with the per-invocation context and the parsed
-    /// arguments (the tokens following the command name).
+    /// Обработчик, вызываемый с контекстом вызова и разобранными аргументами
+    /// (токены после имени команды).
     pub handler: fn(ctx: &mut ShellCtx, args: &[&str]),
 }
 
-/// The single source of truth for shell commands.
+/// Единственный источник истины для команд shell.
 ///
-/// Dispatch, `help`, and completion all read from this slice, so adding a row
-/// is the only edit needed to expose a command (R6.5, R9.5). Order here is the
-/// order `help` lists the commands in.
+/// Диспетчеризация, `help` и дополнение читают этот срез, так что добавление
+/// строки — единственная правка, нужная чтобы выставить команду (R6.5, R9.5).
+/// Порядок здесь — порядок, в котором `help` перечисляет команды.
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "help",
@@ -410,18 +408,18 @@ pub static COMMANDS: &[CommandSpec] = &[
     },
 ];
 
-/// Look up a command by its exact name via a linear scan of [`COMMANDS`].
+/// Найти команду по точному имени линейным сканом [`COMMANDS`].
 ///
-/// Returns `None` when no command matches.
+/// Возвращает `None`, когда ни одна команда не совпала.
 #[allow(dead_code)]
 pub fn lookup(name: &str) -> Option<&'static CommandSpec> {
     COMMANDS.iter().find(|spec| spec.name == name)
 }
 
-/// Iterate the registered command names, in table order.
+/// Итерировать зарегистрированные имена команд в порядке таблицы.
 ///
-/// Used by Tab completion (command-name completion) and `help` to enumerate the
-/// available commands without exposing the table layout.
+/// Используется Tab-дополнением (имена команд) и `help`, чтобы перечислять
+/// доступные команды, не выставляя раскладку таблицы.
 #[allow(dead_code)]
 pub fn command_names() -> impl Iterator<Item = &'static str> {
     COMMANDS.iter().map(|spec| spec.name)

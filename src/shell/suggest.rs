@@ -1,17 +1,17 @@
-//! Typo suggestion: bounded edit distance and nearest-command lookup against
-//! the registry (R7.2).
+//! Подсказка опечаток: ограниченное edit distance и поиск ближайшей команды по
+//! реестру (R7.2).
 //!
-//! Pure logic, `no_std`-friendly: distances are computed over Unicode
-//! scalar values (UTF-8 safe) and the dynamic-programming row lives in a
-//! heap `Vec` sized to the second string. Both functions are bounded by
-//! `max` so large/very-different inputs stay cheap and never panic.
+//! Чистая логика, `no_std`-friendly: расстояния считаются по Unicode scalar
+//! values (UTF-8-safe), а строка dynamic programming живёт в heap-`Vec` размером
+//! со вторую строку. Обе функции ограничены `max`, так что большие/очень разные
+//! входы остаются дешёвыми и никогда не паникуют.
 //!
-//! Consumed by the shell dispatcher (later task) to offer "did you mean
-//! '<name>'?" hints for unknown commands.
+//! Потребляется диспетчером shell, чтобы предлагать подсказки «did you mean
+//! '<name>'?» для неизвестных команд.
 
 use alloc::vec::Vec;
 
-/// Smallest of three values.
+/// Наименьшее из трёх значений.
 #[inline]
 fn min3(a: usize, b: usize, c: usize) -> usize {
     let m = if a < b { a } else { b };
@@ -22,17 +22,16 @@ fn min3(a: usize, b: usize, c: usize) -> usize {
     }
 }
 
-/// Bounded Levenshtein edit distance between `a` and `b`, computed over
-/// characters (Unicode scalar values, so multi-byte UTF-8 is handled
-/// correctly).
+/// Ограниченное Levenshtein-расстояние между `a` и `b`, посчитанное по
+/// символам (Unicode scalar values, так что многобайтовый UTF-8 обрабатывается
+/// корректно).
 ///
-/// Insertion, deletion, and substitution each cost 1. The result is the
-/// exact distance when it is `<= max`; if the true distance would exceed
-/// `max`, the function returns `max + 1` (it does not compute the precise
-/// over-threshold value). This early-exit keeps both time and memory bounded
-/// for large or very dissimilar inputs.
+/// Вставка, удаление и замена стоят по 1. Результат — точное расстояние, когда
+/// оно `<= max`; если истинное расстояние превышает `max`, функция возвращает
+/// `max + 1` (точное значение за порогом не вычисляется). Этот early-exit
+/// держит время и память ограниченными для больших или очень разных входов.
 ///
-/// Never panics for any input.
+/// Никогда не паникует ни на каком входе.
 #[allow(dead_code)]
 pub fn edit_distance(a: &str, b: &str, max: usize) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
@@ -40,21 +39,21 @@ pub fn edit_distance(a: &str, b: &str, max: usize) -> usize {
     let n = a_chars.len();
     let m = b_chars.len();
 
-    // The minimum possible distance is the difference in lengths (it takes at
-    // least that many insertions/deletions). If that already exceeds `max`,
-    // skip all allocation and DP work.
+    // Минимально возможное расстояние — разность длин (нужно как минимум
+    // столько вставок/удалений). Если она уже превышает `max`, пропустить всю
+    // аллокацию и DP.
     let len_diff = if n > m { n - m } else { m - n };
     if len_diff > max {
         return max + 1;
     }
 
-    // One-row dynamic programming over `b`. `prev[j]` holds the distance
-    // between `a[..i]` and `b[..j]`. Row width is bounded by `b`'s char count.
+    // Однострочное dynamic programming по `b`. `prev[j]` хранит расстояние между
+    // `a[..i]` и `b[..j]`. Ширина строки ограничена числом символов `b`.
     let mut prev: Vec<usize> = (0..=m).collect();
 
     for i in 1..=n {
         let mut cur: Vec<usize> = Vec::with_capacity(m + 1);
-        // Distance between `a[..i]` and the empty prefix of `b` is `i`.
+        // Расстояние между `a[..i]` и пустым префиксом `b` равно `i`.
         cur.push(i);
         let mut row_min = i;
 
@@ -74,9 +73,9 @@ pub fn edit_distance(a: &str, b: &str, max: usize) -> usize {
             }
         }
 
-        // Early exit: any optimal alignment path must cross this row, so the
-        // final distance is >= the minimum value in the row. Once that
-        // minimum exceeds `max`, the true distance can only exceed `max`.
+        // Early exit: любой оптимальный путь выравнивания пересекает эту строку,
+        // так что итоговое расстояние >= минимума в строке. Как только минимум
+        // превышает `max`, истинное расстояние может только превышать `max`.
         if row_min > max {
             return max + 1;
         }
@@ -92,12 +91,12 @@ pub fn edit_distance(a: &str, b: &str, max: usize) -> usize {
     }
 }
 
-/// Return the command name with the minimum bounded edit distance to `input`
-/// that is within `max`, or `None` if no name is within `max`.
+/// Вернуть имя команды с минимальным ограниченным edit distance до `input` в
+/// пределах `max` или `None`, если ни одно имя не укладывается в `max`.
 ///
-/// Ties are broken by iteration order: the first name achieving the minimum
-/// distance wins. This is the inverse guarantee asserted by Property 26 (the
-/// returned suggestion's distance is the minimum over all names).
+/// Ничьи разрешаются порядком итерации: побеждает первое имя с минимальным
+/// расстоянием. Это обратная гарантия свойства 26 (расстояние возвращённой
+/// подсказки минимально среди всех имён).
 #[allow(dead_code)]
 pub fn nearest_command<'a>(input: &str, names: &[&'a str], max: usize) -> Option<&'a str> {
     let mut best: Option<(&'a str, usize)> = None;
@@ -106,7 +105,7 @@ pub fn nearest_command<'a>(input: &str, names: &[&'a str], max: usize) -> Option
         let d = edit_distance(input, name, max);
         if d <= max {
             match best {
-                // Keep the earlier name on ties (strictly-closer replaces).
+                // При ничьей оставить более раннее имя (строго ближе — заменяет).
                 Some((_, best_d)) if best_d <= d => {}
                 _ => best = Some((name, d)),
             }

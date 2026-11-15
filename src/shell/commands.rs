@@ -1,32 +1,30 @@
-//! Command handlers (`help`, `clear`, `echo`, ...) built on the registry.
+//! Обработчики команд (`help`, `clear`, `echo`, ...), построенные на реестре.
 //!
-//! Each handler has the signature `fn(ctx: &mut ShellCtx, args: &[&str])`,
-//! where `args` are the tokens that follow the command name (so for the line
-//! `write /mnt/f hi`, the `write` handler receives `["/mnt/f", "hi"]`). The
-//! handlers are registered in [`super::registry::COMMANDS`] and invoked by the
-//! dispatcher in `mod.rs` via [`super::registry::lookup`].
+//! У каждого обработчика сигнатура `fn(ctx: &mut ShellCtx, args: &[&str])`,
+//! где `args` — токены после имени команды (для строки `write /mnt/f hi`
+//! обработчик `write` получает `["/mnt/f", "hi"]`). Обработчики регистрируются
+//! в [`super::registry::COMMANDS`] и вызываются диспетчером из `mod.rs` через
+//! [`super::registry::lookup`].
 //!
-//! Behavior is migrated verbatim from the previous hand-maintained
-//! `execute_command` match: identical output text, error messages, and logic.
-//! Paths are still used as absolute, exactly as before (CWD-relative
-//! resolution lands in a later task). The dual-output helpers
-//! ([`shell_println`] / [`shell_print_bytes`]) and the path/networking helpers
-//! live here so handlers can share them.
+//! Пути по-прежнему абсолютные; разрешение относительно CWD идёт отдельно.
+//! Двойные хелперы вывода ([`shell_println`] / [`shell_print_bytes`]) и
+//! path/сетевые хелперы живут здесь, чтобы обработчики их делили.
 
 use alloc::format;
 use alloc::string::String;
 
 use super::registry::ShellCtx;
 
-/// Print a line to both serial and framebuffer, matching the shell's
-/// dual-output convention.
+/// Напечатать строку в serial и framebuffer, соблюдая двойное соглашение shell
+/// о выводе.
 pub(super) fn shell_println(text: &str) {
     crate::kprintln!("{}", text);
     crate::fb_println!("{}", text);
 }
 
-/// Print raw bytes as text to both serial and framebuffer. Valid UTF-8 is
-/// printed as-is; invalid bytes are replaced so the routine stays panic-free.
+/// Напечатать сырые байты как текст в serial и framebuffer. Валидный UTF-8
+/// печатается как есть; невалидные байты заменяются, чтобы процедура оставалась
+/// panic-free.
 pub(super) fn shell_print_bytes(bytes: &[u8]) {
     let mut start = 0;
     while start < bytes.len() {
@@ -44,7 +42,7 @@ pub(super) fn shell_print_bytes(bytes: &[u8]) {
                     crate::kprint!("{}", s);
                     crate::fb_print!("{}", s);
                 }
-                // Emit a replacement char for the invalid byte and skip it.
+                // На невалидный байт вывести replacement-символ и пропустить его.
                 crate::kprint!("\u{FFFD}");
                 crate::fb_print!("\u{FFFD}");
                 start += valid + 1;
@@ -53,22 +51,22 @@ pub(super) fn shell_print_bytes(bytes: &[u8]) {
     }
 }
 
-/// Resolve a user-supplied path argument against the shell's current working
-/// directory, returning an absolute, normalized path.
+/// Разрешить путь пользователя относительно текущего рабочего каталога shell,
+/// вернув абсолютный нормализованный путь.
 ///
-/// Absolute inputs (those starting with `/`) ignore the CWD, so users typing
-/// `/mnt/...` behave exactly as before; relative inputs and `.`/`..` are folded
-/// against the CWD (R4.6, R9.5). All path-taking handlers route their user
-/// argument through this so relative paths work everywhere.
+/// Абсолютный вход (начинается с `/`) игнорирует CWD, так что `/mnt/...` работает
+/// как раньше; относительные пути и `.`/`..` сворачиваются относительно CWD
+/// (R4.6, R9.5). Все обработчики, принимающие путь, пропускают аргумент через
+/// это, чтобы относительные пути работали везде.
 pub(super) fn resolve_arg(arg: &str) -> String {
     super::path::resolve(&super::path::cwd(), arg)
 }
 
-/// Split an absolute path into `(parent_path, leaf_name)`.
+/// Разбить абсолютный путь на `(parent_path, leaf_name)`.
 ///
 /// `"/mnt/foo"` -> `("/mnt", "foo")`, `"/mnt/a/b"` -> `("/mnt/a", "b")`,
-/// `"/foo"` -> `("/", "foo")`. Returns `None` for paths with no leaf
-/// (`"/"`, `""`, or a trailing-slash-only path).
+/// `"/foo"` -> `("/", "foo")`. Возвращает `None` для путей без листа
+/// (`"/"`, `""` или путь только с завершающим слэшем).
 fn split_path(path: &str) -> Option<(&str, &str)> {
     let trimmed = path.trim_end_matches('/');
     let idx = trimmed.rfind('/')?;
@@ -80,10 +78,10 @@ fn split_path(path: &str) -> Option<(&str, &str)> {
     Some((parent, leaf))
 }
 
-/// `help` (R6.2/6.3/6.4): with no argument, list every registered command and
-/// its one-line description; with an argument, print that command's usage and
-/// description, or a clear "no such command" message when unknown. Generated
-/// entirely from the registry so the list never drifts from the table.
+/// `help` (R6.2/6.3/6.4): без аргумента перечислить все зарегистрированные
+/// команды и их однострочные описания; с аргументом напечатать usage и описание
+/// команды либо внятное «no such command». Генерируется целиком из реестра, чтобы
+/// список не расходился с таблицей.
 pub(super) fn cmd_help(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
         shell_println("Available commands:");
@@ -104,7 +102,7 @@ pub(super) fn cmd_help(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `clear` (R9.3): clear both the serial scrollback and the framebuffer view.
+/// `clear` (R9.3): очистить и serial-scrollback, и framebuffer-вид.
 pub(super) fn cmd_clear(_ctx: &mut ShellCtx, _args: &[&str]) {
     for _ in 0..50 {
         crate::kprintln!();
@@ -112,7 +110,7 @@ pub(super) fn cmd_clear(_ctx: &mut ShellCtx, _args: &[&str]) {
     crate::drivers::framebuffer::clear_screen();
 }
 
-/// `echo` (R9.4): join the arguments with single spaces and print the result.
+/// `echo` (R9.4): соединить аргументы одинарными пробелами и напечатать результат.
 pub(super) fn cmd_echo(_ctx: &mut ShellCtx, args: &[&str]) {
     if !args.is_empty() {
         let text = args.join(" ");
@@ -121,7 +119,7 @@ pub(super) fn cmd_echo(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `uptime`: print the scheduler tick count and an approximate seconds value.
+/// `uptime`: напечатать счётчик тиков планировщика и примерное значение секунд.
 pub(super) fn cmd_uptime(_ctx: &mut ShellCtx, _args: &[&str]) {
     let ticks = crate::task::scheduler::ticks();
     crate::kprintln!(
@@ -136,27 +134,27 @@ pub(super) fn cmd_uptime(_ctx: &mut ShellCtx, _args: &[&str]) {
     );
 }
 
-/// `date`: print the CMOS RTC wall clock in UTC.
+/// `date`: напечатать wall-clock CMOS RTC в UTC.
 ///
-/// `uptime` reports monotonic ticks since boot; the shell had no way to see the
-/// actual time even though the same RTC reader already feeds
-/// `clock_gettime(2)` and TLS certificate validation. `date` prints that clock
-/// in ISO form plus the Unix seconds and the weekday, so a log line or a
-/// transcript can be timestamped without a userspace program.
+/// `uptime` сообщает монотонные тики с загрузки; у shell не было способа увидеть
+/// реальное время, хотя тот же читатель RTC уже питает `clock_gettime(2)` и
+/// проверку TLS-сертификатов. `date` печатает эти часы в ISO-форме плюс
+/// Unix-секунды и день недели, чтобы строку лога или транскрипт можно было
+/// пометить временем без userspace-программы.
 ///
-/// The fields come from [`crate::arch::x86_64::linux::rtc::read_date`], i.e. the
-/// same read-twice guarded snapshot the kernel uses, so they belong to one
-/// consistent second. The kernel assumes the RTC keeps UTC everywhere (NTP is
-/// not implemented yet); a machine whose RTC is on local time will therefore
-/// show its local time labelled `UTC` — the command cannot guess which, and a
-/// wrong timezone is preferable to a made-up correction.
+/// Поля приходят из [`crate::arch::x86_64::linux::rtc::read_date`], то есть из
+/// того же защищённого двойным чтением снимка, что использует ядро, так что они
+/// относятся к одной согласованной секунде. Ядро считает, что RTC везде хранит
+/// UTC (NTP ещё не реализован); машина с локальным временем в RTC покажет его
+/// как `UTC` — команда не может угадать, и неверный часовой пояс лучше выдуманной
+/// поправки.
 pub(super) fn cmd_date(_ctx: &mut ShellCtx, _args: &[&str]) {
     let d = crate::arch::x86_64::linux::rtc::read_date();
     let secs = crate::arch::x86_64::linux::timeconv::civil_to_unix(
         d.year, d.month, d.day, d.hour, d.minute, d.second,
     );
     let unix = if secs < 0 { 0 } else { secs as u64 };
-    // 1970-01-01 was a Thursday, so epoch day 0 is index 4.
+    // 1970-01-01 был четвергом, поэтому день эпохи 0 — индекс 4.
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     let weekday = WEEKDAYS[((unix / 86_400 + 4) % 7) as usize];
     shell_println(&format!(
@@ -165,20 +163,20 @@ pub(super) fn cmd_date(_ctx: &mut ShellCtx, _args: &[&str]) {
     ));
 }
 
-/// `pwd` (R4.2): print the absolute current working directory.
+/// `pwd` (R4.2): напечатать абсолютный текущий рабочий каталог.
 pub(super) fn cmd_pwd(_ctx: &mut ShellCtx, _args: &[&str]) {
     shell_println(&super::path::cwd());
 }
 
-/// `cd [path]`: change the shell's current working directory.
+/// `cd [path]`: сменить текущий рабочий каталог shell.
 ///
-/// With no argument, reset the CWD to the home default `/` (R4.4). With a path,
-/// resolve it against the current CWD, verify it names an existing directory,
-/// and on success store it (R4.3). A missing path or a non-directory target
-/// prints a clear error and leaves the CWD unchanged (R4.5).
+/// Без аргумента сбросить CWD в домашний дефолт `/` (R4.4). С путём — разрешить
+/// его относительно текущего CWD, проверить, что это существующий каталог, и
+/// сохранить (R4.3). Отсутствующий путь или не-каталог печатает внятную ошибку и
+/// оставляет CWD неизменным (R4.5).
 pub(super) fn cmd_cd(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
-        // No argument: reset to the home default `/` (R4.4).
+        // Нет аргумента: сбросить в домашний дефолт `/` (R4.4).
         super::path::set_cwd("/");
         return;
     }
@@ -198,12 +196,12 @@ pub(super) fn cmd_cd(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `ls [path]`: list a directory's entries (directories shown with a trailing
-/// `/`), or print a file's own name. Defaults to `/` when no path is given.
+/// `ls [path]`: перечислить записи каталога (каталоги с завершающим `/`) или
+/// напечатать имя самого файла. По умолчанию `/`, если путь не задан.
 pub(super) fn cmd_ls(_ctx: &mut ShellCtx, args: &[&str]) {
-    // `-l`: long form — mode, links, owner/group, size, name. Anything else is a
-    // path. No path: the CWD (R9.2); a relative path resolves against the CWD so
-    // `.`/`..` work (R4.6).
+    // `-l`: длинная форма — режим, ссылки, владелец/группа, размер, имя.
+    // Остальное — путь. Нет пути: CWD (R9.2); относительный путь разрешается
+    // относительно CWD, чтобы работали `.`/`..` (R4.6).
     let mut long = false;
     let mut path_arg: Option<&str> = None;
     for a in args {
@@ -243,10 +241,10 @@ pub(super) fn cmd_ls(_ctx: &mut ShellCtx, args: &[&str]) {
                     }
                 }
             } else if long {
-                // `ls -l file`: the same line the directory listing would show.
+                // `ls -l file`: та же строка, что показал бы листинг каталога.
                 shell_println(&ls_long_line(&*node));
             } else {
-                // Non-directory: print just its name, like `ls file`.
+                // Не каталог: напечатать только имя, как `ls file`.
                 shell_println(node.name());
             }
         }
@@ -256,13 +254,13 @@ pub(super) fn cmd_ls(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// The `-rw-r--r--`-style mode word for `ls -l`: type letter, the nine
-/// permission bits, and the setuid/setgid/sticky markers in the execute slot
-/// (`s`/`S`/`t`/`T`), exactly like coreutils.
+/// Слово режима в стиле `-rw-r--r--` для `ls -l`: буква типа, девять бит прав и
+/// маркеры setuid/setgid/sticky в слоте execute (`s`/`S`/`t`/`T`), как в coreutils.
 ///
-/// The kernel has no `mtime`/`ctime` accessor on `VfsNode`, so the long listing
-/// deliberately stops at mode/links/owner/size instead of printing a timestamp
-/// the VFS cannot supply (a fake `Jan 1 1970` column would read as real data).
+/// У ядра нет доступа к `mtime`/`ctime` на `VfsNode`, поэтому длинный листинг
+/// намеренно ограничивается mode/links/owner/size, а не печатает время, которое
+/// VFS не может дать (фальшивая колонка `Jan 1 1970` читалась бы как реальные
+/// данные).
 fn ls_mode_string(node: &dyn crate::vfs::VfsNode) -> alloc::string::String {
     let mode = node.mode();
     let type_char = if node.is_directory() {
@@ -274,7 +272,7 @@ fn ls_mode_string(node: &dyn crate::vfs::VfsNode) -> alloc::string::String {
     };
     let mut out = alloc::string::String::with_capacity(10);
     out.push(type_char);
-    // (read bit, write bit, execute bit, special bit, special-if-exec, special-if-not)
+    // (бит чтения, бит записи, бит execute, спецбит, спецбит-если-execute, спецбит-если-не)
     let triplets = [
         (0o400u32, 0o200, 0o100, 0o4000u32, 's', 'S'), // user + setuid
         (0o040, 0o020, 0o010, 0o2000u32, 's', 'S'),    // group + setgid
@@ -297,8 +295,8 @@ fn ls_mode_string(node: &dyn crate::vfs::VfsNode) -> alloc::string::String {
     out
 }
 
-/// One `ls -l` row: mode, link count, owner, group, size, name (plus `-> target`
-/// for symlinks).
+/// Одна строка `ls -l`: режим, число ссылок, владелец, группа, размер, имя (плюс
+/// `-> target` для симлинков).
 fn ls_long_line(node: &dyn crate::vfs::VfsNode) -> alloc::string::String {
     let (uid, gid) = node.owner();
     let mut line = alloc::format!(
@@ -319,18 +317,19 @@ fn ls_long_line(node: &dyn crate::vfs::VfsNode) -> alloc::string::String {
     line
 }
 
-/// `tree [-L N] [path]`: recursive directory listing.
+/// `tree [-L N] [path]`: рекурсивный листинг каталога.
 ///
-/// `ls` shows one level; the editor's sidebar shows a tree only while editing. This
-/// prints the whole tree below `path` (sorted, two spaces of indent per depth), which
-/// is what a human wants when looking around `/mnt` or a freshly unpacked package.
+/// `ls` показывает один уровень; сайдбар редактора показывает дерево только при
+/// редактировании. Эта команда печатает всё дерево ниже `path` (отсортировано,
+/// два пробела отступа на уровень) — то, что нужно человеку, осматривающему
+/// `/mnt` или свежераспакованный пакет.
 ///
-/// The rendering is ASCII on purpose: the console font covers ASCII 0x20..0x7E and
-/// has no box-drawing glyphs, so `|--`/backtick art would print as blanks.
+/// Рендеринг намеренно ASCII: шрифт консоли покрывает ASCII 0x20..0x7E и не имеет
+/// glyph'ов рисования рамок, так что `|--`/backtick-арт печатался бы пустотой.
 ///
-/// Depth is capped by `-L` (default 4) and every directory is read through `readdir`,
-/// so a symlink loop cannot recurse without end. The counts in the trailer cover
-/// everything below the printed root, not the root itself.
+/// Глубина ограничена `-L` (по умолчанию 4), и каждый каталог читается через
+/// `readdir`, так что цикл симлинков не может рекурсировать бесконечно. Счётчики
+/// в трейлере покрывают всё ниже напечатанного корня, не сам корень.
 pub(super) fn cmd_tree(_ctx: &mut ShellCtx, args: &[&str]) {
     let mut limit = 4usize;
     let mut path_arg: Option<&str> = None;
@@ -374,9 +373,9 @@ pub(super) fn cmd_tree(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// Depth-first half of [`cmd_tree`]: print `node`'s children sorted by name, then
-/// recurse into the directories. A child whose `readdir` fails is printed but not
-/// descended into (the diagnostic clutter is not worth it for a listing command).
+/// Depth-first половина [`cmd_tree`]: напечатать детей `node` по имени, затем
+/// рекурсивно войти в каталоги. Ребёнок, чей `readdir` упал, печатается, но не
+/// обходится (ради листинга диагностический шум не стоит того).
 fn tree_walk(
     node: &dyn crate::vfs::VfsNode,
     prefix: &str,
@@ -410,9 +409,9 @@ fn tree_walk(
     }
 }
 
-/// `cat <path>`: print a file's contents/// `cat <path>`: print a file's contents, capping the total bytes read so an
-/// endless device cannot spin forever, and end the transcript on a fresh line
-/// so the next prompt cannot be glued onto the file's last line.
+/// `cat <path>`: напечатать содержимое файла, ограничив суммарно прочитанные
+/// байты, чтобы бесконечное устройство не крутилось вечно, и завершить вывод на
+/// свежей строке, чтобы следующий промпт не приклеился к последней строке файла.
 pub(super) fn cmd_cat(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
         shell_println("cat: missing operand");
@@ -424,9 +423,9 @@ pub(super) fn cmd_cat(_ctx: &mut ShellCtx, args: &[&str]) {
             if node.is_directory() {
                 shell_println(&alloc::format!("cat: {}: is a directory", path));
             } else {
-                // The streaming/newline rules live in `shell::cat` so the
-                // in-kernel property suite exercises the same bytes a user
-                // gets; this handler is only the VFS read + console sink.
+                // Правила streaming/переводов строк живут в `shell::cat`, чтобы
+                // in-kernel набор свойств проверял те же байты, что получает
+                // пользователь; этот обработчик — только VFS-чтение + приёмник консоли.
                 let out = super::cat::stream(
                     |offset, buf| node.read(offset, buf).map_err(|_| ()),
                     shell_print_bytes,
@@ -442,7 +441,7 @@ pub(super) fn cmd_cat(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `mkdir <path>`: create a directory under an existing parent.
+/// `mkdir <path>`: создать каталог под существующим родителем.
 pub(super) fn cmd_mkdir(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
         shell_println("mkdir: missing operand");
@@ -461,7 +460,7 @@ pub(super) fn cmd_mkdir(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `touch <path>`: create an empty file (a no-op when it already exists).
+/// `touch <path>`: создать пустой файл (no-op, если он уже есть).
 pub(super) fn cmd_touch(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
         shell_println("touch: missing operand");
@@ -481,7 +480,7 @@ pub(super) fn cmd_touch(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `write <path> <text>`: write text to a file, creating it if needed.
+/// `write <path> <text>`: записать текст в файл, создав его при необходимости.
 pub(super) fn cmd_write(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.len() < 2 {
         shell_println("write: usage: write <path> <text>");
@@ -489,7 +488,7 @@ pub(super) fn cmd_write(_ctx: &mut ShellCtx, args: &[&str]) {
     }
     let path = resolve_arg(args[0]);
     let text = args[1..].join(" ");
-    // Open the file if it exists, otherwise create it (in its parent).
+    // Открыть файл, если он есть, иначе создать (в его родителе).
     let file = match crate::vfs::lookup_path(&path) {
         Ok(node) => Ok(node),
         Err(_) => match split_path(&path) {
@@ -505,8 +504,8 @@ pub(super) fn cmd_write(_ctx: &mut ShellCtx, args: &[&str]) {
             if node.is_directory() {
                 shell_println(&alloc::format!("write: {}: is a directory", path));
             } else {
-                // Replace, not overwrite-in-place: a shorter text must not leave
-                // the previous file's tail behind (see `vfs::replace_contents`).
+                // Заменять, а не перезаписывать на месте: более короткий текст не
+                // должен оставлять хвост прошлого файла (см. `vfs::replace_contents`).
                 match crate::vfs::replace_contents(&node, text.as_bytes()) {
                     Ok(n) => {
                         node.sync();
@@ -520,7 +519,7 @@ pub(super) fn cmd_write(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `rm <path>`: remove a file or empty directory.
+/// `rm <path>`: удалить файл или пустой каталог.
 pub(super) fn cmd_rm(_ctx: &mut ShellCtx, args: &[&str]) {
     let mut recursive = false;
     let mut targets: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
@@ -543,9 +542,9 @@ pub(super) fn cmd_rm(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// Remove one operand. Directories require `-r`; removal is post-order
-/// (children first) with a depth cap so a malformed tree cannot recurse
-/// without bound.
+/// Удалить один операнд. Каталоги требуют `-r`; удаление post-order (сначала
+/// дети) с ограничением глубины, чтобы некорректное дерево не рекурсировало
+/// бесконечно.
 fn rm_path(path: &str, recursive: bool, depth: u8) -> Result<(), &'static str> {
     if depth > 24 {
         return Err("tree too deep");
@@ -576,10 +575,10 @@ fn rm_path(path: &str, recursive: bool, depth: u8) -> Result<(), &'static str> {
     })
 }
 
-/// `sync`: flush the mounted filesystem.
+/// `sync`: сбросить смонтированную файловую систему.
 pub(super) fn cmd_sync(_ctx: &mut ShellCtx, _args: &[&str]) {
-    // Flush the mounted filesystem. Every mutation is already journaled at
-    // commit time, so this is a no-op confirmation in v1.
+    // Сбросить смонтированную ФС. Каждая мутация уже журналируется на коммите,
+    // так что в v1 это no-op-подтверждение.
     match crate::vfs::lookup_path("/mnt") {
         Ok(node) => {
             node.sync();
@@ -589,12 +588,12 @@ pub(super) fn cmd_sync(_ctx: &mut ShellCtx, _args: &[&str]) {
     }
 }
 
-/// `fscrash`: demonstrate journal replay + persistence on the real disk.
+/// `fscrash`: показать replay журнала + персистентность на реальном диске.
 pub(super) fn cmd_fscrash(_ctx: &mut ShellCtx, _args: &[&str]) {
     fscrash_demo();
 }
 
-/// `pci`: enumerate and list PCI devices.
+/// `pci`: перечислить и показать PCI-устройства.
 pub(super) fn cmd_pci(_ctx: &mut ShellCtx, _args: &[&str]) {
     let devices = crate::drivers::pci::enumerate();
     if devices.is_empty() {
@@ -618,11 +617,11 @@ pub(super) fn cmd_pci(_ctx: &mut ShellCtx, _args: &[&str]) {
     }
 }
 
-/// `exec`: run the embedded test user process.
+/// `exec`: запустить встроенный тестовый пользовательский процесс.
 pub(super) fn cmd_exec(_ctx: &mut ShellCtx, _args: &[&str]) {
-    // create_user_process programs the TSS RSP0 and briefly switches CR3; run
-    // it with interrupts disabled so the CR3 window isn't preempted on this
-    // interruptible shell thread.
+    // create_user_process программирует TSS RSP0 и ненадолго переключает CR3;
+    // запускать с выключенными прерываниями, чтобы окно CR3 не вытеснилось
+    // на этом прерываемом потоке shell.
     let result =
         crate::arch::cpu::without_interrupts(crate::task::process::spawn_test_user_process);
     match result {
@@ -635,7 +634,7 @@ pub(super) fn cmd_exec(_ctx: &mut ShellCtx, _args: &[&str]) {
     }
 }
 
-/// `ifconfig`: show the network interface configuration.
+/// `ifconfig`: показать конфигурацию сетевого интерфейса.
 pub(super) fn cmd_ifconfig(_ctx: &mut ShellCtx, _args: &[&str]) {
     match crate::net::ip_config() {
         Some(cfg) => {
@@ -662,7 +661,7 @@ pub(super) fn cmd_ifconfig(_ctx: &mut ShellCtx, _args: &[&str]) {
     }
 }
 
-/// `ping <ip>`: send one ICMP echo request (v4 or v6) and print the RTT.
+/// `ping <ip>`: послать один ICMP echo-запрос (v4 или v6) и напечатать RTT.
 pub(super) fn cmd_ping(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
         shell_println("usage: ping <ip|ipv6>");
@@ -685,14 +684,14 @@ pub(super) fn cmd_ping(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `nc <ip> <port> [text]` (R15.2, R15.3): open a TCP connection to the given
-/// endpoint and echo data over it.
+/// `nc <ip> <port> [text]` (R15.2, R15.3): открыть TCP-соединение с endpoint и
+/// отзеркалить данные.
 ///
-/// v1 simplification (documented): the shell is line-based, so rather than a
-/// fully interactive session this connects, sends a single line (the trailing
-/// `text` args, or a default test string when none are given), collects the
-/// bytes echoed back within a short bounded poll window, prints them, and
-/// closes. This exercises the guest TCP client path against an echo server.
+/// Упрощение v1 (задокументировано): shell построчный, поэтому вместо полностью
+/// интерактивной сессии команда соединяется, посылает одну строку (хвостовые
+/// `text`-аргументы или тестовую строку по умолчанию), собирает отзеркаленные
+/// байты в коротком ограниченном окне poll, печатает их и закрывается. Это
+/// проверяет гостевой TCP-клиент против echo-сервера.
 pub(super) fn cmd_nc(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.len() < 2 {
         shell_println("usage: nc <ip> <port> [text]");
@@ -714,7 +713,7 @@ pub(super) fn cmd_nc(_ctx: &mut ShellCtx, args: &[&str]) {
         }
     };
 
-    // Payload: the remaining args joined, or a default test line.
+    // Payload: остальные аргументы, соединённые, или тестовая строка по умолчанию.
     let payload: String = if args.len() > 2 {
         args[2..].join(" ")
     } else {
@@ -746,15 +745,15 @@ pub(super) fn cmd_nc(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `selftest [passes]`: run the kernel self-test suite (output on serial).
+/// `selftest [passes]`: запустить набор self-test ядра (вывод в serial).
 ///
-/// Every registered routine is supposed to be non-destructive (it restores PMM
-/// free counts, heap, interrupt state, VFS, …). `passes >= 2` turns that claim
-/// into a measurable one: the SECOND pass of the same boot must report the same
-/// routine count, zero failed checks, and the same `[selftest] PMM hygiene`
-/// delta as the first — a routine that retains frames, VFS nodes or heap makes
-/// the passes diverge, which is exactly how the harness was found to be
-/// non-idempotent (one ELF fuzz routine used to eat the whole PMM pool).
+/// Каждая зарегистрированная процедура должна быть неразрушающей
+/// (восстанавливает свободные счётчики PMM, heap, состояние прерываний, VFS, …).
+/// `passes >= 2` превращает это утверждение в измеримое: ВТОРОЙ проход той же
+/// загрузки должен сообщить то же число процедур, ноль упавших проверок и ту же
+/// дельту `[selftest] PMM hygiene`, что и первый — процедура, удерживающая
+/// кадры, VFS-узлы или heap, заставит проходы разойтись, и именно так стенд был
+/// найден неидемпотентным (одна ELF-fuzz процедура когда-то съедала весь пул PMM).
 pub(super) fn cmd_selftest(_ctx: &mut ShellCtx, args: &[&str]) {
     let passes = args
         .first()
@@ -774,17 +773,18 @@ pub(super) fn cmd_selftest(_ctx: &mut ShellCtx, args: &[&str]) {
         results.push(crate::test::run_all());
     }
     if passes > 1 {
-        // The idempotency verdict in ONE line: a later pass must not report more
-        // failures than the first (nor a different routine count). A routine that
-        // retains state — frames above all — makes the passes diverge here, while
-        // the `[selftest] PMM hygiene` lines above show which direction the pool
-        // moved. E2E greps this marker.
+        // Вердикт идемпотентности в ОДНОЙ строке: поздний проход не должен
+        // сообщить больше падений, чем первый (и другое число процедур).
+        // Процедура, удерживающая состояние — прежде всего кадры, — заставит
+        // проходы разойтись здесь, а строки `[selftest] PMM hygiene` выше
+        // показывают, в какую сторону двинулся пул. E2E ищет этот маркер.
         let (n0, f0, s0, d0) = results[0];
         let (nl, fl, sl, dl) = *results.last().expect("at least one pass");
-        // Divergence = any pass reports more failures or more skips than the first,
-        // a different routine count, or a LARGER frame delta than the first. A
-        // constant per-pass residual (a fixed warm-up allocation that stabilizes) is
-        // not divergence; a growing one is exactly the retention this checks for.
+        // Расхождение = любой проход сообщает больше падений или пропусков, чем
+        // первый, другое число процедур или БОЛЬШУЮ дельту кадров, чем первый.
+        // Постоянный остаток на проход (фиксированная warm-up аллокация, которая
+        // стабилизируется) — не расхождение; растущий — ровно то удержание,
+        // которое проверяется.
         let diverged = results
             .iter()
             .any(|(n, f, sk, d)| *n != n0 || *f > f0 || *sk > s0 || *d > d0);
@@ -805,17 +805,17 @@ pub(super) fn cmd_selftest(_ctx: &mut ShellCtx, args: &[&str]) {
     shell_println("Self-test complete (see serial log).");
 }
 
-/// `fscrash` demo (Task 5.3): demonstrate journal replay + persistence on the
-/// real disk end-to-end.
+/// `fscrash` demo: показать replay журнала + персистентность на реальном диске
+/// end-to-end.
 ///
-/// Writes `/mnt/crashtest.txt` with known content through the journaled write
-/// path, then re-mounts the ext2 filesystem from the same block device — which
-/// runs `journal.recover()` — and reads the file back, asserting the committed
-/// write survived. Prints PASS/FAIL.
+/// Пишет `/mnt/crashtest.txt` известным содержимым через журналируемый путь
+/// записи, затем перемонтирует ext2 с того же блочного устройства — это
+/// запускает `journal.recover()` — и читает файл обратно, утверждая, что
+/// закоммиченная запись выжила. Печатает PASS/FAIL.
 ///
-/// A true mid-write power-cut cannot be injected on live hardware; the RAM-mock
-/// property tests P10/P11 cover crash atomicity. This command demonstrates the
-/// mount + recover + persist path end-to-end on the real device.
+/// Настоящий power-cut посреди записи нельзя внедрить на живом железе;
+/// RAM-mock property-тесты P10/P11 покрывают атомарность краша. Эта команда
+/// показывает путь mount + recover + persist end-to-end на реальном устройстве.
 fn fscrash_demo() {
     use crate::fs::ext2::Ext2Fs;
 
@@ -829,7 +829,7 @@ fn fscrash_demo() {
         }
     };
 
-    // 1. Mount and write the test file through the journaled path.
+    // 1. Смонтировать и записать тестовый файл через журналируемый путь.
     let root = match Ext2Fs::mount(blk.clone()) {
         Ok(r) => r,
         Err(e) => {
@@ -857,8 +857,8 @@ fn fscrash_demo() {
     }
     shell_println("fscrash: wrote /mnt/crashtest.txt (committed via journal)");
 
-    // 2. Force a fresh remount; this runs journal recover() before building the
-    //    root, simulating the post-crash mount path.
+    // 2. Принудительно перемонтировать заново; это запускает journal recover()
+    //    до построения корня, имитируя путь монтирования после краша.
     shell_println("fscrash: remounting (triggers journal recover)...");
     let root2 = match Ext2Fs::mount(blk) {
         Ok(r) => r,
@@ -868,7 +868,7 @@ fn fscrash_demo() {
         }
     };
 
-    // 3. Read the file back and verify the content persisted.
+    // 3. Прочитать файл обратно и проверить, что содержимое сохранилось.
     let node = match root2.lookup("crashtest.txt") {
         Ok(n) => n,
         Err(e) => {
@@ -897,15 +897,15 @@ fn fscrash_demo() {
     }
 }
 
-/// Copy all bytes from `src` to `dst` in chunks, capping total bytes so an
-/// endless device cannot spin forever. Returns the number of bytes copied.
+/// Скопировать все байты из `src` в `dst` чанками, ограничив суммарный объём,
+/// чтобы бесконечное устройство не крутилось вечно. Возвращает число скопированных байт.
 fn copy_bytes(
     src: &alloc::sync::Arc<dyn crate::vfs::VfsNode>,
     dst: &alloc::sync::Arc<dyn crate::vfs::VfsNode>,
 ) -> Result<u64, crate::vfs::VfsError> {
     const MAX_BYTES: u64 = 16 * 1024 * 1024;
-    // `cp` replaces the destination: copying a shorter file over a longer one
-    // used to leave the old tail in place. Truncate first, like `O_TRUNC`.
+    // `cp` заменяет назначение: копирование более короткого файла поверх длинного
+    // раньше оставляло старый хвост. Сначала truncate, как `O_TRUNC`.
     dst.truncate(0)?;
     let mut buf = [0u8; 512];
     let mut offset: u64 = 0;
@@ -924,8 +924,8 @@ fn copy_bytes(
     Ok(offset)
 }
 
-/// `cp <src> <dst>`: copy a file. If `dst` is an existing directory, the source
-/// file is copied into it under its original name.
+/// `cp <src> <dst>`: скопировать файл. Если `dst` — существующий каталог,
+/// исходный файл копируется в него под своим именем.
 pub(super) fn cmd_cp(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.len() < 2 {
         shell_println("cp: usage: cp <src> <dst>");
@@ -946,8 +946,8 @@ pub(super) fn cmd_cp(_ctx: &mut ShellCtx, args: &[&str]) {
         return;
     }
 
-    // Resolve the destination: into a directory (keep the source leaf name) or
-    // to an explicit file path (create in its parent if needed).
+    // Разрешить назначение: в каталог (сохранить leaf-имя источника) или в явный
+    // путь файла (создать в родителе при необходимости).
     let dst_node = match crate::vfs::lookup_path(&dst) {
         Ok(node) if node.is_directory() => {
             let leaf = match split_path(&src) {
@@ -1000,7 +1000,7 @@ pub(super) fn cmd_cp(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `mv <src> <dst>`: move/rename a file (copy then remove the source).
+/// `mv <src> <dst>`: переместить/переименовать файл (копировать, затем удалить источник).
 pub(super) fn cmd_mv(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.len() < 2 {
         shell_println("mv: usage: mv <src> <dst>");
@@ -1020,7 +1020,7 @@ pub(super) fn cmd_mv(_ctx: &mut ShellCtx, args: &[&str]) {
         return;
     }
 
-    // Reuse cp for the copy half, then unlink the source.
+    // Переиспользовать cp для копирования, затем unlink источника.
     cmd_cp(_ctx, args);
 
     match split_path(&src) {
@@ -1036,7 +1036,7 @@ pub(super) fn cmd_mv(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `stat <path>`: print a file/directory's name, type, and size.
+/// `stat <path>`: напечатать имя, тип и размер файла/каталога.
 pub(super) fn cmd_stat(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
         shell_println("stat: missing operand");
@@ -1064,15 +1064,15 @@ pub(super) fn cmd_stat(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `chmod <octal-mode> <path>…`: change permission bits.
+/// `chmod <octal-mode> <path>…`: сменить биты прав.
 ///
-/// The bits are the same nine permission bits plus setuid/setgid/sticky that
-/// `chmod(2)` accepts (the VFS `set_mode` contract), so an octal argument is
-/// validated against `0o7777` and nothing else: a mode with higher bits set is a
-/// typo, not a request to stamp file-type bits from userspace. Filesystems
-/// without on-disk metadata (ramfs, `/dev`, `/proc`) answer `NotSupported`; the
-/// command reports that per path instead of failing the whole invocation, so
-/// `chmod 600 /mnt/etc/hosts /tmp/x` still fixes the ext2 file.
+/// Это те же девять бит прав плюс setuid/setgid/sticky, которые принимает
+/// `chmod(2)` (контракт `set_mode` VFS), поэтому восьмеричный аргумент
+/// проверяется против `0o7777` и ничего больше: режим с выставленными старшими
+/// битами — опечатка, а не просьба проставить file-type биты из userspace.
+/// ФС без on-disk метаданных (ramfs, `/dev`, `/proc`) отвечают `NotSupported`;
+/// команда сообщает это по пути, а не валит весь вызов, так что
+/// `chmod 600 /mnt/etc/hosts /tmp/x` всё равно исправит ext2-файл.
 pub(super) fn cmd_chmod(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.len() < 2 {
         shell_println("chmod: usage: chmod OCTAL-MODE PATH...");
@@ -1107,14 +1107,13 @@ pub(super) fn cmd_chmod(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `chown <uid>[:<gid>] <path>…`: change a node's owner and/or group.
+/// `chown <uid>[:<gid>] <path>…`: сменить владельца и/или группу узла.
 ///
-/// The spec is Linux-shaped: `1000:1000` sets both, `1000` keeps the group and
-/// `:1000` keeps the owner. Only numeric ids are accepted — this kernel has no
-/// user database to resolve names against, and a bogus name should fail rather
-/// than silently become uid 0. Like [`cmd_chmod`], paths without on-disk
-/// metadata answer `NotSupported` per path and the remaining paths are still
-/// tried.
+/// Спецификация в форме Linux: `1000:1000` ставит обоих, `1000` сохраняет
+/// группу, `:1000` сохраняет владельца. Принимаются только числовые id — в ядре
+/// нет базы пользователей для резолва имён, и ненастоящее имя должно падать, а не
+/// молча становиться uid 0. Как и [`cmd_chmod`], пути без on-disk метаданных
+/// отвечают `NotSupported` по пути, остальные пути всё равно пробуются.
 pub(super) fn cmd_chown(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.len() < 2 {
         shell_println("chown: usage: chown UID[:GID] PATH...");
@@ -1180,8 +1179,8 @@ pub(super) fn cmd_chown(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `sleep <seconds>`: block the shell for the given whole number of seconds,
-/// halting between timer ticks instead of busy-spinning.
+/// `sleep <seconds>`: заблокировать shell на заданное целое число секунд,
+/// засыпая между тиками таймера вместо busy-spin.
 pub(super) fn cmd_sleep(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
         shell_println("sleep: usage: sleep <seconds>");
@@ -1193,7 +1192,7 @@ pub(super) fn cmd_sleep(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `nano <path>`: launch the full-screen nano+ editor.
+/// `nano <path>`: запустить полноэкранный редактор nano+.
 pub(super) fn cmd_nano(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.first() == Some(&"--settings") {
         super::nano_config::command(&args[1..]);
@@ -1206,9 +1205,9 @@ pub(super) fn cmd_nano(_ctx: &mut ShellCtx, args: &[&str]) {
     super::nano::run(args[0]);
 }
 
-/// `rust <path> [args...]`: run a mini-Rust source/package, or a Linux ELF.
-/// A `.rs`/`.pbc` path goes to the embedded mini-Rust toolchain; anything else
-/// is handed to the Linux compatibility loader (`cmd_lxrun`).
+/// `rust <path> [args...]`: запустить мини-Rust исходник/пакет или Linux ELF.
+/// Путь `.rs`/`.pbc` идёт во встроенный мини-Rust toolchain; всё остальное
+/// передаётся загрузчику Linux-совместимости (`cmd_lxrun`).
 pub(super) fn cmd_rust(ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
         shell_println("usage: rust <file.rs|file.pbc|static-elf> [args...]");
@@ -1223,7 +1222,7 @@ pub(super) fn cmd_rust(ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// Embedded offline mini-Rust package manager.
+/// Встроенный офлайн мини-Rust пакетный менеджер.
 pub(super) fn cmd_cargo(ctx: &mut ShellCtx, args: &[&str]) {
     if crate::vfs::lookup_path("/mnt/usr/bin/cargo").is_ok() {
         runtime_command(ctx, "/mnt/usr/bin/cargo", &[], args);
@@ -1232,7 +1231,7 @@ pub(super) fn cmd_cargo(ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// Compile mini-Rust source into a portable `.pbc` source package.
+/// Скомпилировать мини-Rust исходник в переносимый `.pbc`-пакет исходников.
 pub(super) fn cmd_rustc(ctx: &mut ShellCtx, args: &[&str]) {
     if crate::vfs::lookup_path("/mnt/usr/bin/rustc").is_ok() {
         runtime_command(ctx, "/mnt/usr/bin/rustc", &[], args);
@@ -1241,7 +1240,7 @@ pub(super) fn cmd_rustc(ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// Inspect the embedded mini-Rust toolchain.
+/// Показать встроенный мини-Rust toolchain.
 pub(super) fn cmd_rustup(_ctx: &mut ShellCtx, args: &[&str]) {
     super::toolchain::rustup(args);
 }
@@ -1259,9 +1258,9 @@ pub(super) fn cmd_lua(ctx: &mut ShellCtx, args: &[&str]) {
     runtime_command(ctx, "/mnt/usr/bin/lua", &[], args);
 }
 
-/// Locate an installed glibc CPython under /mnt/usr/bin (any
-/// python3* name), preferring the most specific/versioned entry, so the alias
-/// works with whatever apt/provisioning installed (python3.13, 3.16, ...).
+/// Найти установленный glibc CPython в /mnt/usr/bin (любое имя python3*),
+/// предпочитая самый конкретный/версионированный вход, чтобы алиас работал с
+/// тем, что поставил apt/provisioning (python3.13, 3.16, ...).
 fn find_python() -> Option<alloc::string::String> {
     let dir = crate::vfs::lookup_path("/mnt/usr/bin").ok()?;
     let entries = dir.readdir().ok()?;
@@ -1289,18 +1288,18 @@ pub(super) fn cmd_python(ctx: &mut ShellCtx, args: &[&str]) {
     cmd_lxrun(ctx, &argv);
 }
 
-/// `settings`: the interactive terminal-customization panel.
+/// `settings`: интерактивная панель настройки терминала.
 ///
-/// Modal on purpose — it owns the keyboard until the user leaves, because each
-/// keystroke there means "change it and show me", which the shell's line editor
-/// would otherwise swallow. `paint` takes the same approach.
+/// Намеренно модальная — владеет клавиатурой, пока пользователь не выйдет,
+/// потому что каждое нажатие там означает «поменяй и покажи», которое
+/// построчный редактор shell иначе проглотил бы. `paint` придерживается того же подхода.
 pub(super) fn cmd_settings(_ctx: &mut ShellCtx, _args: &[&str]) {
     crate::kprintln!("settings: theme/wallpaper/status/caret");
     crate::kprintln!("settings keys: arrows or hjkl, t=theme w=wallpaper r=reset q=quit");
     super::theme::run_panel();
 }
 
-/// `theme`: show the schemes, or switch to one by name / by cycling with no argument.
+/// `theme`: показать схемы или переключиться на схему по имени / циклически без аргумента.
 pub(super) fn cmd_theme(_ctx: &mut ShellCtx, args: &[&str]) {
     use super::theme::{self, THEMES};
     match args.first().copied() {
@@ -1337,7 +1336,7 @@ pub(super) fn cmd_theme(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `wallpaper`: set (or list) the background layer behind the text.
+/// `wallpaper`: задать (или перечислить) фоновый слой за текстом.
 pub(super) fn cmd_wallpaper(_ctx: &mut ShellCtx, args: &[&str]) {
     use super::theme::{self, Wallpaper};
     match args.first().copied() {
@@ -1352,10 +1351,10 @@ pub(super) fn cmd_wallpaper(_ctx: &mut ShellCtx, args: &[&str]) {
         Some(name) => match Wallpaper::from_name(name) {
             Some(w) => {
                 theme::with(|s| s.wallpaper = w);
-                // `repaint` re-emits the grid, and the console's opaque/transparent
-                // knob is what decides whether that re-emit stamps its background
-                // over the picture. Without `apply` the knob still says "opaque"
-                // and every wallpaper was invisible inside the text grid.
+                // `repaint` заново выдаёт сетку, а ручка opaque/transparent
+                // консоли решает, штампует ли эта выдача её фон поверх картинки.
+                // Без `apply` ручка всё ещё говорит "opaque", и каждые обои были
+                // невидимы внутри текстовой сетки.
                 theme::apply();
                 theme::repaint();
                 shell_println(&format!("wallpaper: {}", w.name()));
@@ -1382,7 +1381,7 @@ pub(super) fn cmd_pythonc(ctx: &mut ShellCtx, args: &[&str]) {
     cmd_lxrun(ctx, &argv);
 }
 
-/// `paint`: launch the framebuffer drawing application (mouse + keyboard).
+/// `paint`: запустить framebuffer-приложение рисования (мышь + клавиатура).
 pub(super) fn cmd_paint(_ctx: &mut ShellCtx, _args: &[&str]) {
     crate::kprintln!("paint: launching... (Esc or 'q' to quit)");
     crate::kprintln!(
@@ -1397,16 +1396,16 @@ pub(super) fn cmd_paint(_ctx: &mut ShellCtx, _args: &[&str]) {
     super::paint::run();
 }
 
-/// `pkg <host> <path> [port]`: download a `.deb` over HTTP and install its files
-/// onto the mounted ext2 filesystem under `/mnt`.
+/// `pkg <host> <path> [port]`: скачать `.deb` по HTTP и установить его файлы на
+/// смонтированную ext2 в `/mnt`.
 ///
-/// Runs the full Package_Fetcher -> Deb_Parser -> Tar_Reader -> Package_Installer
-/// pipeline: open a TCP connection to `host:port` (port defaults to 80), `GET` the
-/// `.deb`, parse the `ar` container, decompress the `data.tar` (gzip only — `xz`/
-/// `zstd` Debian packages are rejected with a clear message), and write every safe
-/// regular file onto ext2. Networking must be up (see `ifconfig`).
+/// Прогоняет полный конвейер Package_Fetcher -> Deb_Parser -> Tar_Reader ->
+/// Package_Installer: открыть TCP-соединение с `host:port` (порт по умолчанию 80),
+/// `GET` `.deb`, разобрать контейнер `ar`, распаковать `data.tar` (только gzip —
+/// `xz`/`zstd` Debian-пакеты отвергаются с внятным сообщением) и записать каждый
+/// безопасный regular file на ext2. Сеть должна быть поднята (см. `ifconfig`).
 ///
-/// Example:
+/// Пример:
 ///   pkg 10.0.2.2 /pool/main/h/hello/hello-static_2.10.gz.deb
 pub(super) fn cmd_pkg(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.len() < 2 {
@@ -1445,7 +1444,7 @@ pub(super) fn cmd_pkg(_ctx: &mut ShellCtx, args: &[&str]) {
     };
     shell_println(&alloc::format!("pkg: downloaded {} bytes", bytes.len()));
 
-    // Parse the .deb ar container and locate its members.
+    // Разобрать `ar`-контейнер .deb и найти его члены.
     let members = match crate::pkg::deb::parse_ar(&bytes) {
         Ok(m) => m,
         Err(e) => {
@@ -1461,7 +1460,7 @@ pub(super) fn cmd_pkg(_ctx: &mut ShellCtx, args: &[&str]) {
         }
     };
 
-    // Decompress the data.tar member (gzip, xz, or zstd).
+    // Распаковать член data.tar (gzip, xz или zstd).
     let comp = match crate::pkg::deb::compression_of(deb.data.name) {
         Ok(c) => c,
         Err(e) => {
@@ -1481,7 +1480,7 @@ pub(super) fn cmd_pkg(_ctx: &mut ShellCtx, args: &[&str]) {
         }
     };
 
-    // Enumerate and install the regular files onto ext2 under /mnt.
+    // Перечислить и установить regular files на ext2 под /mnt.
     let entries = match crate::pkg::tar::read_tar(&tar) {
         Ok(e) => e,
         Err(e) => {
@@ -1497,23 +1496,24 @@ pub(super) fn cmd_pkg(_ctx: &mut ShellCtx, args: &[&str]) {
             }
             shell_println("pkg: done. Run an installed binary with: lxrun /mnt/<path>");
         }
-        // `Display` names the refused path and reason (F-x86n-1); the installer has
-        // already emitted the structured diagnostic.
+        // `Display` называет отвергнутый путь и причину; installer уже выдал
+        // структурированную диагностику.
         Err(e) => shell_println(&alloc::format!("pkg: install failed: {}", e)),
     }
 }
 
-/// `lxrun <path> [args...]`: run an installed statically-linked Linux binary as a
-/// ring-3 `Compat_Process`.
+/// `lxrun <path> [args...]`: запустить установленный статически слинкованный
+/// Linux-бинарник как ring-3 `Compat_Process`.
 ///
-/// Reads the ELF at `path` from ext2, loads it through the Linux ELF loader, builds
-/// a System V initial stack with the supplied arguments, and enqueues it on the
-/// scheduler. Only static `ET_EXEC` / static-PIE `ET_DYN` binaries are supported
-/// (dynamically-linked binaries are rejected). Like `exec`, this runs with
-/// interrupts disabled across the brief CR3 switch the loader/stack mapper perform.
-/// `warn` toggles mirroring of `[WARN]` kernel log lines onto
-/// the framebuffer console. Serial always receives every line regardless;
-/// this only controls the on-screen spam that wrecked full-screen TUIs.
+/// Читает ELF по `path` из ext2, загружает через Linux ELF loader, строит
+/// начальный стек System V с переданными аргументами и ставит в очередь
+/// планировщика. Поддерживаются только статические `ET_EXEC` / static-PIE
+/// `ET_DYN` (динамически слинкованные отвергаются). Как и `exec`, запускается с
+/// выключенными прерываниями на время короткого переключения CR3, которое
+/// делают загрузчик/маппер стека.
+/// `warn` включает зеркалирование строк лога ядра `[WARN]` на
+/// framebuffer-консоль. Serial всегда получает каждую строку; это управляет
+/// только экранным спамом, который ломал полноэкранные TUI.
 pub(super) fn cmd_warn(_ctx: &mut ShellCtx, args: &[&str]) {
     match args.first().copied() {
         Some("on") => {
@@ -1538,16 +1538,17 @@ pub(super) fn cmd_warn(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// Wait for a foreground job, translating ^C/^Z into SIGINT/SIGTSTP.
+/// Дождаться foreground-задания, превращая ^C/^Z в SIGINT/SIGTSTP.
 ///
-/// Returns when the program exits or stops. A stopped program is recorded in
-/// the shell job table; `fg`/`bg` resume it later.
+/// Возвращается, когда программа выходит или останавливается. Остановленная
+/// программа записывается в таблицу заданий shell; `fg`/`bg` возобновляют её
+/// позже.
 ///
-/// The terminal belongs to the job for the duration: `pgid` is a terminal
-/// foreground process group (`drivers::tty`), so ^C/^Z are delivered to THAT
-/// group — not merely to the pid the shell happens to be waiting for — and the
-/// shell takes the terminal back on every exit path (exit, stop). This is what
-/// makes a multi-process foreground job (a process that forked) stop as a unit.
+/// Терминал принадлежит заданию на всё время: `pgid` — foreground process group
+/// терминала (`drivers::tty`), так что ^C/^Z доставляются ИМЕННО этой группе, а
+/// не только pid, которого ждёт shell, и shell забирает терминал обратно на
+/// каждом пути выхода (exit, stop). Это и делает остановку много-процессного
+/// foreground-задания (процесс, сделавший fork) единой.
 fn foreground_wait(pid: u64, pgid: u64, command: &str) {
     use crate::arch::x86_64::linux::signal::send_signal_to_pgid_all;
     use crate::arch::x86_64::linux::signal_frame::{SIGINT, SIGTSTP};
@@ -1558,17 +1559,17 @@ fn foreground_wait(pid: u64, pgid: u64, command: &str) {
     crate::drivers::ps2_kbd::CTRL_C.store(false, Ordering::Relaxed);
     crate::drivers::ps2_kbd::CTRL_Z.store(false, Ordering::Relaxed);
     crate::drivers::ps2_kbd::FG_PID.store(pid, Ordering::Relaxed);
-    // The job owns the terminal while it runs (also set by `lxrun` inside the
-    // spawn's critical section; `fg` sets it here before resuming).
+    // Задание владеет терминалом, пока выполняется (также ставится `lxrun`
+    // внутри критической секции spawn; `fg` ставит его здесь перед возобновлением).
     crate::drivers::tty::set_foreground_pgid(pgid);
     let mut parked = false;
     while crate::task::compat::compat_exists(pid) && !parked {
         let stopped = crate::shell::keys::CTRL_Z_LATCH.swap(false, Ordering::Relaxed)
             | crate::drivers::ps2_kbd::CTRL_Z.swap(false, Ordering::Relaxed);
         if stopped {
-            // Stop the TERMINAL's foreground group. The recorded pid is only
-            // the shell's own waiter: a job that forked has several thread
-            // groups, and all of them must park, not just the leader.
+            // Остановить foreground-группу ТЕРМИНАЛА. Записанный pid — лишь
+            // собственный waiter shell: задание, сделавшее fork, имеет несколько
+            // thread groups, и все они должны встать, а не только лидер.
             let target = crate::drivers::tty::foreground_pgid();
             match send_signal_to_pgid_all(target, SIGTSTP) {
                 Ok(()) => {
@@ -1582,7 +1583,7 @@ fn foreground_wait(pid: u64, pgid: u64, command: &str) {
         let pressed = crate::shell::keys::CTRL_C_LATCH.swap(false, Ordering::Relaxed)
             | crate::drivers::ps2_kbd::CTRL_C.swap(false, Ordering::Relaxed);
         if pressed {
-            // ^C is a terminal signal too: SIGINT goes to the foreground group.
+            // ^C — тоже сигнал терминала: SIGINT идёт foreground-группе.
             shell_println("^C");
             if send_signal_to_pgid_all(crate::drivers::tty::foreground_pgid(), SIGINT).is_err() {
                 let _ = crate::arch::x86_64::linux::signal::send_signal(pid, SIGINT);
@@ -1591,21 +1592,20 @@ fn foreground_wait(pid: u64, pgid: u64, command: &str) {
         crate::task::scheduler::yield_current();
     }
     crate::drivers::ps2_kbd::FG_PID.store(0, Ordering::Relaxed);
-    // The job is done with the screen: continue the shell below its last line
-    // instead of overwriting it (the VT knows where its cursor ended up, the
-    // console does not).
+    // Задание закончило с экраном: продолжить shell ниже его последней строки,
+    // а не затирать её (VT знает, где кончился его курсор, консоль — нет).
     crate::drivers::vt::cursor_to_console();
     if !parked {
-        // The job exited: forget it. A parked job stays in the table for
-        // `jobs`/`fg`/`bg`.
+        // Задание вышло: забыть его. Припаркованное задание остаётся в таблице
+        // для `jobs`/`fg`/`bg`.
         crate::shell::jobs::remove(pid);
     }
-    // Give the terminal back to the shell. A stopped job is resumed by `fg`,
-    // which re-arms its group before the SIGCONT.
+    // Вернуть терминал shell. Остановленное задание возобновляет `fg`,
+    // который заново вооружает его группу перед SIGCONT.
     crate::drivers::tty::restore_shell_foreground();
 }
 
-/// `jobs`: list remembered jobs.
+/// `jobs`: перечислить запомненные задания.
 pub(super) fn cmd_jobs(_ctx: &mut ShellCtx, _args: &[&str]) {
     let jobs = crate::shell::jobs::snapshot();
     if jobs.is_empty() {
@@ -1624,15 +1624,15 @@ pub(super) fn cmd_jobs(_ctx: &mut ShellCtx, _args: &[&str]) {
     }
 }
 
-/// `bg`: resume the most recent stopped job in the background.
+/// `bg`: возобновить самое свежее остановленное задание в фоне.
 pub(super) fn cmd_bg(_ctx: &mut ShellCtx, _args: &[&str]) {
     let Some((pid, pgid, command)) = crate::shell::jobs::last() else {
         shell_println("bg: no jobs");
         return;
     };
-    // Every thread group in the job resumes (a group stop is per thread group),
-    // and the terminal stays with the shell — that is what "background" means:
-    // the job's next terminal read stops it again with SIGTTIN.
+    // Возобновляются все thread groups задания (групповая остановка — на thread
+    // group), а терминал остаётся у shell — это и значит «фон»: следующее чтение
+    // терминала заданием снова остановит его через SIGTTIN.
     let _ = crate::arch::x86_64::linux::signal::send_signal_to_pgid_all(
         pgid,
         crate::arch::x86_64::linux::signal_frame::SIGCONT,
@@ -1641,15 +1641,15 @@ pub(super) fn cmd_bg(_ctx: &mut ShellCtx, _args: &[&str]) {
     shell_println(&format!("bg: [{}] {}", pid, command));
 }
 
-/// `fg`: resume the most recent stopped job and wait for it.
+/// `fg`: возобновить самое свежее остановленное задание и дождаться его.
 pub(super) fn cmd_fg(_ctx: &mut ShellCtx, _args: &[&str]) {
     let Some((pid, pgid, command)) = crate::shell::jobs::last() else {
         shell_println("fg: no jobs");
         return;
     };
-    // Hand the terminal to the job BEFORE resuming it: a job that writes
-    // immediately after SIGCONT must not be stopped as "background" (it is the
-    // foreground job again) — the ordering is what makes `fg` reliable.
+    // Отдать терминал заданию ДО его возобновления: задание, пишущее сразу после
+    // SIGCONT, не должно быть остановлено как «фоновое» (оно снова foreground) —
+    // порядок и делает `fg` надёжным.
     crate::drivers::tty::set_foreground_pgid(pgid);
     let _ = crate::arch::x86_64::linux::signal::send_signal_to_pgid_all(
         pgid,
@@ -1666,13 +1666,13 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
         return;
     }
     let path = resolve_arg(args[0]);
-    // argv[0] is the program name as typed; remaining tokens follow.
+    // argv[0] — имя программы как набрано; остальные токены следуют.
     let argv: alloc::vec::Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
 
-    // Make sure the VT emulator exists so nvim's ANSI output renders correctly.
-    // It is created once and then kept: the console and the VT share the same
-    // framebuffer, and re-initialising per run wiped the screen and left the
-    // shell's cursor behind (the prompt marched down the display on every run).
+    // Убедиться, что VT-эмулятор существует, чтобы ANSI-вывод nvim рендерился
+    // правильно. Он создаётся один раз и затем живёт: консоль и VT делят один
+    // framebuffer, а переинициализация на каждый запуск стирала экран и оставляла
+    // курсор shell позади (промпт уезжал вниз на каждом запуске).
     crate::drivers::vt::ensure();
     let env: [&[u8]; 12] = [
         b"TERM=xterm",
@@ -1683,40 +1683,40 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
         b"PYTHONPATH=/mnt/usr/lib/python3.13:/mnt/usr/lib/python3.16",
         b"RUSTUP_HOME=/mnt/usr/lib/rustlib",
         b"HOME=/mnt/home/user",
-        // Git discovers remote helpers (git-remote-https) via GIT_EXEC_PATH;
-        // without it the compiled-in /usr/lib/git-core prefix still resolves
-        // through the /mnt mapping, but naming it explicitly keeps the lookup
-        // on the ext2 tree even when cwd differs.
+        // Git находит remote-хелперы (git-remote-https) через GIT_EXEC_PATH;
+        // без этого вкомпилированный префикс /usr/lib/git-core всё равно
+        // разрешался бы через маппинг /mnt, но явное значение держит поиск на
+        // ext2-дереве, даже когда cwd другой.
         b"GIT_EXEC_PATH=/mnt/usr/lib/git-core",
         b"GIT_TEMPLATE_DIR=/mnt/usr/share/git-core/templates",
         b"GIT_TRACE=1",
-        // Nvim cannot create ~/.local/state/nvim/log; silence the
-        // \"failed to open $NVIM_LOG_FILE\" stderr spam by pointing it at /dev/null.
+        // Nvim не может создать ~/.local/state/nvim/log; заглушить спам
+        // "failed to open $NVIM_LOG_FILE" в stderr, направив его в /dev/null.
         b"NVIM_LOG_FILE=/dev/null",
     ];
-    // Spawn AND publish the child's terminal state inside ONE
-    // `without_interrupts` section. The child becomes runnable the instant
-    // interrupts come back, so anything the shell does afterwards races it:
-    //   * marking it as a job / setting the foreground pgid late would leave a
-    //     window in which the new process is "background" relative to the shell
-    //     — a read it issues there would be refused and a write stopped;
-    //   * printing the banner and aligning the VT cursor late let a quick
-    //     program write its first line at the PREVIOUS job's cursor position,
-    //     so its output landed on the shell's own prompt line.
-    // Both are fixed by doing the whole hand-over before the child can execute.
-    // Console output here is safe with interrupts masked: it takes the
-    // framebuffer/serial locks, neither of which is taken twice, and neither
-    // blocks.
+    // Спавнить И опубликовать терминальное состояние ребёнка внутри ОДНОЙ
+    // секции `without_interrupts`. Ребёнок становится runnable сразу, как
+    // возвращаются прерывания, так что всё, что shell делает после, гонится с ним:
+    //   * поздняя пометка задания / установка foreground pgid оставила бы окно,
+    //     в котором новый процесс «фоновый» относительно shell — его read там
+    //     был бы отвергнут, а write остановлен;
+    //   * поздняя печать баннера и выравнивание курсора VT позволили бы быстрой
+    //     программе написать первую строку на позиции курсора ПРОШЛОГО задания,
+    //     так что её вывод лёг бы на строку промпта shell.
+    // Оба лечатся выполнением всей передачи до того, как ребёнок сможет
+    // исполниться. Вывод консоли здесь безопасен при замаскированных
+    // прерываниях: он берёт локи framebuffer/serial, ни один не берётся дважды и
+    // ни один не блокирует.
     let result = crate::arch::cpu::without_interrupts(|| {
         let r = crate::task::process::run_linux_binary(&path, &argv, &env);
         if let Ok(pid) = r {
             let child_pgid = crate::task::compat::pgid_of(pid).unwrap_or(pid);
             crate::task::compat::mark_tty_job(pid);
             crate::drivers::tty::set_foreground_pgid(child_pgid);
-            // The job's output goes through the VT, the shell's through the text
-            // console: both draw into the same framebuffer, so hand the VT the
-            // cell the console has reached. Without this the program's first
-            // line lands on top of the "lxrun: started" line above it.
+            // Вывод задания идёт через VT, shell — через текстовую консоль: оба
+            // рисуют в один framebuffer, поэтому передать VT клетку, до которой
+            // дошла консоль. Без этого первая строка программы легла бы поверх
+            // строки "lxrun: started" выше.
             shell_println(&alloc::format!("lxrun: started Compat_Process pid {}", pid));
             crate::drivers::vt::cursor_from_console();
         }
@@ -1724,19 +1724,18 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
     });
     match result {
         Ok(pid) => {
-            // Foreground wait: the process owns the keyboard now
-            // (its stdin reads the PS/2 stream directly), so resuming the
-            // prompt immediately would make the shell steal every keystroke.
-            //
-            // Ctrl+C delivers a real SIGINT to the child (Phase-2 signals):
-            // the latch reflects real user intent at the keyboard even when a
-            // program never decodes modifiers itself, and the EINTR checks in
-            // the blocking waits wake the child so the signal is delivered at
-            // its next syscall return. A handler-installing program can keep
-            // running (each further ^C re-sends); without a handler the
-            // default-terminate action kills it, ending this wait loop.
-            // Ctrl+Z stops the terminal's foreground group (see
-            // `foreground_wait`); the shell takes the terminal back on exit.
+            // Ожидание foreground: процесс теперь владеет клавиатурой (его stdin
+            // читает поток PS/2 напрямую), поэтому немедленное возобновление
+            // промпта заставило бы shell красть каждое нажатие.
+            // Ctrl+C доставляет реальный SIGINT ребёнку (Phase-2 signals): защёлка
+            // отражает реальное намерение пользователя у клавиатуры, даже когда
+            // программа сама не декодирует модификаторы, а проверки EINTR в
+            // блокирующих ожиданиях будят ребёнка, чтобы сигнал доставился на
+            // следующем возврате из syscall. Программа, ставящая обработчик,
+            // может продолжать работу (каждый следующий ^C пересылает заново); без
+            // обработчика действие по умолчанию убивает её, завершая этот цикл.
+            // Ctrl+Z останавливает foreground-группу терминала (см.
+            // `foreground_wait`); shell забирает терминал обратно на выходе.
             let command = args.first().copied().unwrap_or("?").into();
             let child_pgid = crate::task::compat::pgid_of(pid).unwrap_or(pid);
             crate::shell::jobs::record(pid, child_pgid, command, false);
@@ -1758,25 +1757,25 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `apt <subcommand> ...`: the name-driven package manager.
+/// `apt <subcommand> ...`: пакетный менеджер по именам.
 ///
-/// Unlike `pkg` (which takes a raw host/path/port), `apt` works by *package
-/// name* against a downloaded repository index, resolving dependencies
-/// automatically:
+/// В отличие от `pkg` (сырые host/path/port), `apt` работает по *имени пакета*
+/// против скачанного индекса репозитория, автоматически разрешая зависимости:
 ///
-///   * `apt update`                  — download + parse the `Packages` index.
-///   * `apt install <name> [name2…]` — resolve deps and install each package.
-///   * `apt show <name>`             — print a package's index metadata.
-///   * `apt list [substr]`           — list (matching) available package names.
-///   * `apt setmirror <host> [base]` — point apt at a different mirror.
+///   * `apt update`                  — скачать + разобрать индекс `Packages`.
+///   * `apt install <name> [name2…]` — разрешить зависимости и поставить каждый пакет.
+///   * `apt show <name>`             — напечатать метаданные пакета из индекса.
+///   * `apt list [substr]`           — перечислить (подходящие) имена доступных пакетов.
+///   * `apt setmirror <host> [base]` — направить apt на другое зеркало.
 ///
-/// Transport: the normal pagh development build enables outbound package access
-/// through the `network_packages` default feature. HTTPS is encrypted but still
-/// unauthenticated, so every update prints a trust warning. A fail-closed kernel
-/// can be built with `--no-default-features`. `setmirror` accepts a scheme prefix.
+/// Транспорт: обычная dev-сборка pagh включает исходящий доступ к пакетам через
+/// дефолтную фичу `network_packages`. HTTPS шифруется, но остаётся
+/// неаутентифицированным, поэтому каждое обновление печатает предупреждение о
+/// доверии. Fail-closed ядро можно собрать с `--no-default-features`. `setmirror`
+/// принимает префикс схемы.
 ///
-/// The index lives only in RAM (the 64 MiB disk is too small to cache it), so
-/// `apt update` must be re-run each boot before `install`/`show`/`list`.
+/// Индекс живёт только в RAM (64 MiB диска слишком мало для кэша), поэтому
+/// `apt update` надо повторять каждую загрузку до `install`/`show`/`list`.
 pub(super) fn cmd_apt(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
         apt_usage();
@@ -1795,7 +1794,7 @@ pub(super) fn cmd_apt(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// Print the `apt` usage summary.
+/// Напечатать сводку usage `apt`.
 fn apt_usage() {
     shell_println("usage: apt <command> [args]");
     shell_println("  update                  download & parse the package index");
@@ -1820,7 +1819,7 @@ fn apt_usage() {
     shell_println("             an unsigned mirror is REFUSED; there is no 'continue anyway' flag");
 }
 
-/// `apt update`: refresh the in-RAM package index.
+/// `apt update`: обновить in-RAM индекс пакетов.
 fn cmd_apt_update() {
     let cfg = crate::pkg::apt::config();
     if cfg.tls {
@@ -1851,7 +1850,7 @@ fn cmd_apt_update() {
     }
 }
 
-/// `apt install <name> [name2 …]`: resolve and install each named package.
+/// `apt install <name> [name2 …]`: разрешить и установить каждый названный пакет.
 fn cmd_apt_install(names: &[&str]) {
     if names.is_empty() {
         shell_println("usage: apt install <name> [name2 ...]");
@@ -1884,7 +1883,7 @@ fn cmd_apt_install(names: &[&str]) {
     }
 }
 
-/// `apt show <name>`: print a package's index metadata.
+/// `apt show <name>`: напечатать метаданные пакета из индекса.
 fn cmd_apt_show(args: &[&str]) {
     if args.is_empty() {
         shell_println("usage: apt show <name>");
@@ -1915,7 +1914,7 @@ fn cmd_apt_show(args: &[&str]) {
     }
 }
 
-/// `apt list [substr]`: list (matching) available package names, capped.
+/// `apt list [substr]`: перечислить (подходящие) имена доступных пакетов с ограничением.
 fn cmd_apt_list(args: &[&str]) {
     let filter = args.first().copied();
     if !crate::pkg::apt::has_index() {
@@ -1927,7 +1926,7 @@ fn cmd_apt_list(args: &[&str]) {
         shell_println("apt: no matching packages");
         return;
     }
-    // Cap output so a full index does not flood the console.
+    // Ограничить вывод, чтобы полный индекс не залил консоль.
     const MAX_LINES: usize = 100;
     for name in names.iter().take(MAX_LINES) {
         shell_println(name);
@@ -1940,7 +1939,7 @@ fn cmd_apt_list(args: &[&str]) {
     }
 }
 
-/// `apt setmirror <host> [basepath]`: change the active mirror.
+/// `apt setmirror <host> [basepath]`: сменить активное зеркало.
 fn cmd_apt_setmirror(args: &[&str]) {
     if args.is_empty() {
         shell_println("usage: apt setmirror <host> [basepath]");
@@ -1969,20 +1968,19 @@ fn cmd_apt_setmirror(args: &[&str]) {
     }
 }
 
-/// `df`: filesystem capacity from the VFS mount registry.
+/// `df`: ёмкость файловых систем из реестра монтирований VFS.
 ///
-/// The header and column layout follow `df -k`; `1K-blocks` is
-/// `blocks_total * block_size / 1024`. Synthetic filesystems (`rootfs`,
-/// `devtmpfs`, `proc`) have no capacity accounting, so their numeric columns
-/// are `-` rather than a made-up zero. `ext2` reports real counts through
-/// `VfsNode::fs_stat`.
-/// `usb`: the xHCI controller's live state, and what is on each port.
+/// Заголовок и раскладка колонок следуют `df -k`; `1K-blocks` — это
+/// `blocks_total * block_size / 1024`. Синтетические ФС (`rootfs`, `devtmpfs`,
+/// `proc`) не имеют учёта ёмкости, поэтому их числовые колонки — `-`, а не
+/// выдуманный ноль. `ext2` сообщает реальные счётчики через `VfsNode::fs_stat`.
+/// `usb`: живое состояние xHCI-контроллера и что на каждом порту.
 ///
-/// On a real machine this is the first thing to look at when a USB keyboard does
-/// nothing: a port reading `ccs=false` with a device plugged in means the
-/// controller never saw it (cable, port, or the device), while `ccs=true` with no
-/// `HID device on port N` line in the log means enumeration (the steps in
-/// `drivers::xhci`) did not get through.
+/// На реальной машине это первое, на что смотрят, когда USB-клавиатура не
+/// работает: порт с `ccs=false` при вставленном устройстве означает, что
+/// контроллер его не увидел (кабель, порт или устройство), а `ccs=true` без
+/// строки `HID device on port N` в логе означает, что перечисление (шаги в
+/// `drivers::xhci`) не прошло.
 pub(super) fn cmd_usb(_ctx: &mut ShellCtx, _args: &[&str]) {
     let summary = crate::drivers::xhci::summary();
     let (kb_reports, mouse_reports, unmapped) = crate::drivers::usb_hid::stats();
@@ -2011,10 +2009,10 @@ pub(super) fn cmd_usb(_ctx: &mut ShellCtx, _args: &[&str]) {
         mouse_reports,
         unmapped
     ));
-    // Endpoint recovery: a non-zero reset count is the proof that a device sent a
-    // report the buffer could not hold and the driver recovered instead of
-    // disabling input (the 2.22.7 HID fix). `bad reports` counts reports shorter
-    // than their layout needs (dropped, logged once per endpoint).
+    // Восстановление endpoint: ненулевой счётчик сбросов — доказательство, что
+    // устройство прислало отчёт, не влезший в буфер, и драйвер восстановился,
+    // вместо того чтобы отключить ввод. `bad reports` считает отчёты короче, чем
+    // требует их layout (отброшены, логируются один раз на endpoint).
     shell_println(&alloc::format!(
         "usb: HID endpoint reset(s) {}, bad report(s) {}",
         summary.hid_recoveries,
@@ -2049,10 +2047,10 @@ pub(super) fn cmd_usb(_ctx: &mut ShellCtx, _args: &[&str]) {
     shell_println("usb: a keyboard shows as `ccs=true` on its port, then `HID device on port N`");
 }
 
-/// `disk`: block devices, and the deliberate path to a formatted `/mnt`.
+/// `disk`: блочные устройства и осознанный путь к отформатированному `/mnt`.
 ///
-/// The interactive wizard lives in [`crate::shell::disk`]; this is the thin
-/// command shim, so the REPL and the wizard stay independent.
+/// Интерактивный мастер живёт в [`crate::shell::disk`]; это тонкий шим команды,
+/// так что REPL и мастер остаются независимыми.
 pub(super) fn cmd_disk(_ctx: &mut ShellCtx, args: &[&str]) {
     crate::shell::disk::cmd(args);
 }
@@ -2114,12 +2112,12 @@ pub(super) fn cmd_df(_ctx: &mut ShellCtx, args: &[&str]) {
                     ));
                 }
             }
-            // No capacity to report (VFS contract: `fs_stat() == None`). A
-            // ramfs still knows how many bytes it is HOLDING, and that is worth
-            // showing: the total/available columns stay `-` (it is bounded only
-            // by physical memory), but `Used` stops being a shrug. Pure
-            // synthetic trees (/dev, /proc) have no bytes of their own and stay
-            // all-dashes, which is what Linux prints for the same reason.
+            // Ёмкости для отчёта нет (контракт VFS: `fs_stat() == None`). Ramfs
+            // всё равно знает, сколько байт он ДЕРЖИТ, и это стоит показать:
+            // колонки total/available остаются `-` (он ограничен только физической
+            // памятью), но `Used` перестаёт быть пожатием плеч. Чисто синтетические
+            // деревья (/dev, /proc) не имеют собственных байт и остаются целиком
+            // из прочерков, как и печатает Linux по той же причине.
             _ => {
                 let used = crate::vfs::lookup_path(point)
                     .ok()
@@ -2163,13 +2161,13 @@ pub(super) fn cmd_df(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// Bytes held by `node` and everything under it, in a ramfs tree.
+/// Байты, удерживаемые `node` и всем под ним, в ramfs-дереве.
 ///
-/// Used by `df` for filesystems without capacity accounting (see the VFS
-/// `fs_stat` contract): they cannot say how much room is left, but they can say
-/// how much they are holding. Depth-capped and cycle-free by construction —
-/// mounts are looked up by path, and a directory's children are walked only
-/// through `readdir`, which cannot loop back to an ancestor in these trees.
+/// Используется `df` для ФС без учёта ёмкости (см. контракт VFS `fs_stat`): они
+/// не могут сказать, сколько места осталось, но могут сказать, сколько держат.
+/// Ограничено глубиной и циклобезопасно по построению — монтирования ищутся по
+/// пути, а дети каталога обходятся только через `readdir`, который в этих
+/// деревьях не может вернуться к предку.
 fn tree_bytes(node: &alloc::sync::Arc<dyn crate::vfs::VfsNode>, depth: usize) -> u64 {
     const MAX_DEPTH: usize = 8;
     if depth > MAX_DEPTH {
@@ -2187,9 +2185,9 @@ fn tree_bytes(node: &alloc::sync::Arc<dyn crate::vfs::VfsNode>, depth: usize) ->
         .fold(0u64, |acc, n| acc.saturating_add(n))
 }
 
-/// Format a byte count the way `-h` does: binary units, one decimal for KiB and
-/// above, integer `B` below 1 KiB — coreutils' convention, computed with integer
-/// arithmetic so the output is exact and no float formatting is involved.
+/// Форматировать число байт как `-h`: двоичные единицы, один знак после точки
+/// для KiB и выше, целое `B` ниже 1 KiB — соглашение coreutils, посчитанное
+/// целочисленной арифметикой, так что вывод точен и без float-форматирования.
 pub(crate) fn human_size(bytes: u64) -> alloc::string::String {
     const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
     if bytes < 1024 {
@@ -2203,7 +2201,7 @@ pub(crate) fn human_size(bytes: u64) -> alloc::string::String {
     }
     let whole = bytes / scale;
     let remainder = bytes % scale;
-    // Round to the nearest tenth so 1023.96 MiB prints as 1024.0 MiB, not 1023.9.
+    // Округлить до десятых, чтобы 1023.96 MiB печаталось как 1024.0 MiB, а не 1023.9.
     let tenths = (remainder * 10 + scale / 2) / scale;
     if tenths >= 10 {
         alloc::format!("{}.0 {}", whole + 1, UNITS[unit])
@@ -2212,23 +2210,22 @@ pub(crate) fn human_size(bytes: u64) -> alloc::string::String {
     }
 }
 
-/// `free`: physical-memory and kernel-heap usage.
+/// `free`: использование физической памяти и кучи ядра.
 ///
-/// The layout is busybox `free` (one header row, KiB columns), but the numbers
-/// are Pagh's own: `Mem` comes straight from the PMM frame counters
-/// (`total_frames` / `free_frames` × 4096), so `total` is the RAM the allocator
-/// was handed at boot, `free` is what is still available to any later PMM user,
-/// and `used` is everything else (kernel image, page tables, the backing frames
-/// of the kernel heap and the pages of live user programs). There is no swap
-/// device, so that row is a constant zero, and no block cache, so `buffers` is
-/// zero as well.
+/// Раскладка — busybox `free` (одна строка заголовка, колонки KiB), но числа
+/// свои у Pagh: `Mem` берётся прямо из счётчиков кадров PMM (`total_frames` /
+/// `free_frames` × 4096), так что `total` — RAM, которую аллокатор получил при
+/// загрузке, `free` — что ещё доступно любому позднему пользователю PMM, а
+/// `used` — всё остальное (образ ядра, таблицы страниц, кадры кучи ядра и
+/// страницы живых пользовательских программ). Swap-устройства нет, поэтому эта
+/// строка — константный ноль, и block cache нет, поэтому `buffers` тоже ноль.
 ///
-/// The `Heap` row reports the fixed kernel heap region, not a Linux memory
-/// class: `used` is what the global allocator has handed out, `free` is the rest
-/// of the region. It is worth its own row because the region is mapped at boot
-/// and therefore always counts into `Mem used`, while only a fraction of it is
-/// actually occupied — an oversized or leaking heap shows up here long before
-/// physical memory runs out.
+/// Строка `Heap` показывает фиксированный регион кучи ядра, а не класс памяти
+/// Linux: `used` — что выдал глобальный аллокатор, `free` — остаток региона. Она
+/// заслуживает своей строки, потому что регион мапится при загрузке и поэтому
+/// всегда входит в `Mem used`, а занята на самом деле лишь его часть —
+/// разросшаяся или текущая куча видна здесь задолго до исчерпания физической
+/// памяти.
 pub(super) fn cmd_free(_ctx: &mut ShellCtx, args: &[&str]) {
     let mut human = false;
     for a in args {
@@ -2247,8 +2244,8 @@ pub(super) fn cmd_free(_ctx: &mut ShellCtx, args: &[&str]) {
     let (heap_size, heap_used, heap_free) = crate::memory::heap::stats();
     let (heap_size, heap_used, heap_free) = (heap_size as u64, heap_used as u64, heap_free as u64);
 
-    // The header is formatted through the same widths as the rows so the
-    // columns cannot drift apart when a row gains a field.
+    // Заголовок форматируется теми же ширинами, что строки, чтобы колонки не
+    // разъезжались, когда в строке появляется поле.
     shell_println(&format!(
         "{:<6} {:>13} {:>12} {:>12} {:>12} {:>12}",
         "", "total", "used", "free", "shared", "buffers"
@@ -2285,21 +2282,21 @@ pub(super) fn cmd_free(_ctx: &mut ShellCtx, args: &[&str]) {
     ));
 }
 
-/// `ps`: the live compat-process table, rendered from `/proc/<pid>/*`.
+/// `ps`: живая таблица compat-процессов, отрисованная из `/proc/<pid>/*`.
 ///
-/// Header and columns mimic `ps` (`PID PPID STAT COMMAND`), but the state
-/// letter and command name come from the same per-pid procfs nodes a Linux
-/// program would read, so this is also a smoke test of that tree. Threads are
-/// listed individually; `COMMAND` is the basename of argv[0], or `[comm]` when
-/// cmdline is empty.
+/// Заголовок и колонки имитируют `ps` (`PID PPID STAT COMMAND`), но буква
+/// состояния и имя команды берутся из тех же per-pid procfs-узлов, которые
+/// прочитала бы Linux-программа, так что это ещё и smoke-тест того дерева.
+/// Потоки перечисляются отдельно; `COMMAND` — basename argv[0] или `[comm]`,
+/// когда cmdline пуст.
 pub(super) fn cmd_ps(_ctx: &mut ShellCtx, _args: &[&str]) {
     shell_println("  PID  PPID STAT COMMAND");
-    // Kernel threads (the shell itself, the network pump, a gated selftest
-    // harness) are NOT Linux compat processes and have no /proc entry, so the
-    // table used to consist of a bare header whenever no `lxrun`ed program was
-    // alive — which reads as "this machine has no processes at all", the exact
-    // opposite of what `ps` is for. They are listed from the scheduler's name
-    // table, in brackets like a Linux kernel thread.
+    // Потоки ядра (сам shell, сетевой насос, gated selftest harness) — НЕ
+    // Linux compat-процессы и не имеют записи в /proc, поэтому таблица состояла
+    // из голого заголовка всякий раз, когда не было живого `lxrun`-процесса —
+    // что читается как «на машине вообще нет процессов», ровно наоборот от того,
+    // зачем нужен `ps`. Они перечисляются из таблицы имён планировщика, в
+    // скобках, как поток ядра Linux.
     let kernel_tasks = crate::task::scheduler::task_names_snapshot();
     let mut pids = crate::task::compat::compat_pid_tgid_snapshot();
     pids.sort_by_key(|(pid, _tgid)| *pid);
@@ -2341,8 +2338,8 @@ pub(super) fn cmd_ps(_ctx: &mut ShellCtx, _args: &[&str]) {
         if compat_pids.contains(&pid) {
             continue; // a thread with compat state was already rendered from /proc
         }
-        // `T` is the stopped state, exactly as in /proc/<pid>/stat; everything
-        // else the scheduler can run is `R` (running or runnable).
+        // `T` — остановленное состояние, точно как в /proc/<pid>/stat; всё
+        // остальное, что планировщик может исполнять, — `R` (running или runnable).
         let state = if crate::task::scheduler::is_stopped(pid) {
             "T"
         } else {

@@ -1,82 +1,82 @@
-//! Debian package handling (design components 8–10).
+//! Обработка Debian-пакетов (компоненты дизайна 8–10).
 //!
-//! This subsystem turns a downloaded `.deb` byte buffer into files installed on
-//! the ext2 filesystem. It is split along the R11.6 pure-function boundary:
+//! Этот subsystem превращает скачанный байтовый буфер `.deb` в файлы,
+//! установленные на ext2. Разделение идёт по границе чистых функций R11.6:
 //!
-//!   * [`deb`] — pure `ar` container enumeration, `.deb` member location,
-//!     compression-suffix classification (design component 8, R9) and the
-//!     effectful decompression shell (whole-buffer and streaming).
+//!   * [`deb`] — чистое перечисление `ar`-контейнера, поиск членов `.deb`,
+//!     классификация сжатия по суффиксу (компонент 8, R9) и эффектная оболочка
+//!     декомпрессии (весь буфер и streaming).
 //!
-//! Sibling modules [`tar`] (the ustar reader/writer, component 9), [`install`]
-//! (the pure path-normalization/install model) and [`install_fs`] (the effectful
-//! ext2 installer, component 10) are already in place.
+//! Соседние модули [`tar`] (reader/writer ustar, компонент 9), [`install`]
+//! (чистая нормализация путей/модель установки) и [`install_fs`] (эффектный
+//! ext2-инсталлятор, компонент 10) уже на месте.
 //!
-//! Everything in [`deb`] is `core` + `alloc` only — no hardware, no globals — so
-//! the `host-tests` crate `#[path]`-includes the same source and property-tests
-//! it on the host (P23).
+//! Всё в [`deb`] — только `core` + `alloc`, без железа и глобалов, поэтому
+//! `host-tests` `#[path]`-включает тот же исходник и property-тестирует его на
+//! хосте (P23).
 
-/// Effectful `apt` package-manager front end: by-name `update`/`install`/`show`/
-/// `list`/`setmirror` over the pure index ([`apt_index`]), resolver
-/// ([`apt_resolve`]), `.deb` parser ([`deb`]), tar reader ([`tar`]), and ext2
-/// installer ([`install_fs`]). Kernel-only (drives networking + VFS), so it lives
-/// apart from the pure, host-includable modules.
+/// Эффектный фронтенд пакетного менеджера `apt`: по имени `update`/`install`/
+/// `show`/`list`/`setmirror` поверх чистого индекса ([`apt_index`]), резолвера
+/// ([`apt_resolve`]), парсера `.deb` ([`deb`]), tar reader'а ([`tar`]) и
+/// ext2-инсталлятора ([`install_fs`]). Kernel-only (ведёт сеть + VFS), поэтому
+/// живёт отдельно от чистых host-includable модулей.
 pub mod apt;
-/// Pure `Packages` index parser + lookup index (the read side of `apt install`).
-/// `core` + `alloc` only — `#[path]`-included by `host-tests` and exercised by P30.
+/// Чистый парсер индекса `Packages` + lookup-индекс (сторона чтения `apt install`).
+/// Только `core` + `alloc` — `#[path]`-включается `host-tests`, проверяется P30.
 pub mod apt_index;
-/// Pure dependency resolver layered over [`apt_index`] (the planning side of
-/// `apt install`). `core` + `alloc` only; references [`apt_index`] via `super::`
-/// so one source resolves in both the kernel and the host crate. Tested by P30.
+/// Чистый резолвер зависимостей поверх [`apt_index`] (сторона планирования
+/// `apt install`). Только `core` + `alloc`; ссылается на [`apt_index`] через
+/// `super::`, чтобы один исходник разрешался и в ядре, и в host-крейте. Тестируется P30.
 pub mod apt_resolve;
 pub mod deb;
 pub mod install;
-/// Effectful ext2 installer (`Package_Installer`, component 10). Kernel-only: it
-/// drives the `VfsNode` trait, so — like `net::http_fetch` beside the pure
-/// `net::http` — it lives apart from the pure, host-includable `install` module.
+/// Эффектный ext2-инсталлятор (`Package_Installer`, компонент 10). Kernel-only:
+/// ведёт трейт `VfsNode`, поэтому — как `net::http_fetch` рядом с чистым
+/// `net::http` — живёт отдельно от чистого host-includable модуля `install`.
 pub mod install_fs;
-/// Pure `apt setmirror` host-argument parsing (URL-scheme prefix handling).
-/// `core`-only and self-contained — `#[path]`-included by `host-tests`.
+/// Чистый разбор host-аргумента `apt setmirror` (обработка префикса URL-схемы).
+/// Только `core`, самодостаточный — `#[path]`-включается `host-tests`.
 pub mod mirror;
 pub mod tar;
 
-/// Pure OpenPGP verification policy for repository metadata (issue #32):
-/// trusted-key selection, subkey binding, expiry/revocation/key-flag handling and
-/// the `Release.gpg`/`InRelease` entry points. `core` + `alloc` only —
-/// `#[path]`-included by `host-tests` (P51–P53).
+/// Чистая политика OpenPGP-верификации метаданных репозитория (issue #32):
+/// выбор доверенного ключа, subkey binding, обработка expiry/revocation/key-flag и
+/// точки входа `Release.gpg`/`InRelease`. Только `core` + `alloc` —
+/// `#[path]`-включается `host-tests` (P51–P53).
 pub mod openpgp;
-/// Pure OpenPGP cryptography used by [`openpgp`]: the v4 signature digest rule,
-/// RSA PKCS#1 v1.5 / EdDSA / ECDSA verification over that digest, and the local
-/// SHA-1 used for v4 fingerprints only (no `sha1` crate is vendored).
-/// `core` + `alloc` only — `#[path]`-included by `host-tests`.
+/// Чистая OpenPGP-криптография, используемая [`openpgp`]: правило дайджеста
+/// v4-подписи, проверка RSA PKCS#1 v1.5 / EdDSA / ECDSA над этим дайджестом и
+/// локальный SHA-1 только для v4-фингерпринтов (`sha1`-крейт не вендорится).
+/// Только `core` + `alloc` — `#[path]`-включается `host-tests`.
 pub mod openpgp_crypto;
-/// Pure OpenPGP packet layer: ASCII armor (CRC24), packet framing, public keys,
-/// signature packets, keyring blocks and the `InRelease` clearsign framing.
-/// `core` + `alloc` only, panic-free and bounded — `#[path]`-included by
+/// Чистый слой OpenPGP-пакетов: ASCII armor (CRC24), framing пакетов, публичные
+/// ключи, signature-пакеты, keyring-блоки и clearsign-framing `InRelease`.
+/// Только `core` + `alloc`, panic-free и bounded — `#[path]`-включается
 /// `host-tests`.
 pub mod openpgp_packet;
 
-/// The GENERATED Debian keyring (`tools/gen_debian_keyring.py`): the trusted
-/// keys as exact keyring byte ranges, each pinned by its v4 fingerprint,
-/// algorithm, size, validity window and subkey fingerprints. Committed and
-/// reviewed deliberately; the kernel never fetches or updates keys at runtime.
-/// The apt trust chain consumes this table in the next PR of the series.
+/// СГЕНЕРИРОВАННЫЙ Debian-keyring (`tools/gen_debian_keyring.py`): доверенные
+/// ключи как точные байтовые диапазоны keyring'а, каждый закреплён своим
+/// v4-фингерпринтом, алгоритмом, размером, окном валидности и фингерпринтами
+/// подключей. Закоммичен и просмотрен намеренно; ядро никогда не скачивает и не
+/// обновляет ключи в runtime. Цепочка доверия apt потребляет эту таблицу.
 pub mod openpgp_keys;
 
-/// Pure parser for a Debian `Release`/`InRelease` body (issue #32): the fields
-/// the apt trust chain policy-checks (`Suite`/`Codename`/`Date`/`Valid-Until`)
-/// and — the part that matters — the `SHA256:` section, so the `Packages` body
-/// can be bound to the signed metadata before it is parsed. `core` + `alloc`
-/// only — `#[path]`-included by `host-tests` (P54).
+/// Чистый парсер тела Debian `Release`/`InRelease` (issue #32): поля, которые
+/// policy-проверяет цепочка доверия apt (`Suite`/`Codename`/`Date`/`Valid-Until`),
+/// и — важнейшее — секция `SHA256:`, чтобы тело `Packages` можно было связать с
+/// подписанными метаданными до разбора. Только `core` + `alloc` —
+/// `#[path]`-включается `host-tests` (P54).
 pub mod release_file;
 
-/// The GENERATED E2E *test* trust anchor (`tools/gen_openpgp_testkey.py`): a
-/// deterministic Ed25519 test key plus the three pinned Debian keys, used ONLY by
-/// the harness builds that drive `apt update` against the local test mirror —
-/// `lx_selftest` (the apt E2E checks) and `lx_bigindex` (whose synthetic index is
-/// signed with the same test key, so a real `apt update` can reach the parse
-/// stage). Compiled out of every other build, so a normal kernel — and the
-/// `lx_livetest` live-mirror harness, which must keep trusting only Debian — has
-/// no test key in its trust store at all.
+/// СГЕНЕРИРОВАННЫЙ E2E *test* trust anchor (`tools/gen_openpgp_testkey.py`):
+/// детерминированный Ed25519 тестовый ключ плюс три закреплённых Debian-ключа,
+/// используемые ТОЛЬКО harness-сборками, которые гоняют `apt update` против
+/// локального тестового зеркала — `lx_selftest` (apt E2E-проверки) и `lx_bigindex`
+/// (чей синтетический индекс подписан тем же тестовым ключом, чтобы реальный
+/// `apt update` дошёл до стадии разбора). Компилируется вне всех прочих сборок,
+/// так что обычное ядро — и live-mirror harness `lx_livetest`, который должен
+/// доверять только Debian, — вообще не имеет тестового ключа в trust store.
 #[cfg(any(
     feature = "lx_selftest",
     feature = "lx_bigindex",

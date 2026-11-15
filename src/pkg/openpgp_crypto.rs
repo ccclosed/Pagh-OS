@@ -1,50 +1,49 @@
-//! Cryptographic primitives for the pure OpenPGP verifier (issue #32).
+//! Криптографические примитивы для чистого OpenPGP-верификатора (issue #32).
 //!
-//! This is the only place in the OpenPGP stack that touches a crypto crate, and
-//! it is `core` + `alloc` only: the kernel compiles this exact source for the
-//! bare-metal target, while `host-tests` `#[path]`-includes it and exercises it
-//! on the host (P51–P53). No new dependency is introduced — the verifier reuses
-//! the `sha2`/`rsa`/`ed25519-dalek`/`p256`/`p384` crates the tree already pins
-//! for the TLS certificate verifier (`net::tls_verify`).
+//! Это единственное место в OpenPGP-стеке, трогающее crypto-крейт, и оно только
+//! `core` + `alloc`: ядро компилирует ровно этот исходник для bare-metal, а
+//! `host-tests` `#[path]`-включает его и проверяет на хосте (P51–P53). Новая
+//! зависимость не добавляется — верификатор переиспользует крейты
+//! `sha2`/`rsa`/`ed25519-dalek`/`p256`/`p384`, которые дерево уже пинует для
+//! верификатора TLS-сертификатов (`net::tls_verify`).
 //!
-//! ## What is signed
+//! ## Что подписывается
 //!
-//! An OpenPGP v4 signature is computed over
+//! OpenPGP v4-подпись считается по
 //!
 //! ```text
 //! H = HASH( signed_data || hashed_portion || 0x04 0xFF || be32(len(hashed_portion)) )
 //! ```
 //!
-//! where `hashed_portion` is the signature packet body from the version octet
-//! through the end of the hashed subpackets (RFC 4880 §5.2.4 / RFC 9580 §5.2.4;
-//! the trailer length is the length of that whole portion, *not* the length of
-//! the subpacket area alone — getting this wrong makes every real signature
-//! fail, and it is verified against live Debian metadata in P52).
+//! где `hashed_portion` — тело signature-пакета от октета версии до конца hashed
+//! subpackets (RFC 4880 §5.2.4 / RFC 9580 §5.2.4; длина trailer — длина всей этой
+//! части, *не* только области subpacket'ов — ошибка здесь валит каждую реальную
+//! подпись, и она проверяется на живых метаданных Debian в P52).
 //!
-//! `H` — never the raw document — is what each algorithm consumes:
+//! `H` — никогда не сырой документ — и потребляется каждым алгоритмом:
 //!
-//! * **RSA** (public-key algo 1/3): PKCS#1 v1.5 with the DigestInfo prefix, via
-//!   the pre-hashed `RsaPublicKey::verify(Pkcs1v15Sign::new::<D>(), &H, &sig)`
-//!   entry point. Two traps: the signature MPI must be **left-padded to the
-//!   modulus byte length** (`rsa` rejects `sig_len != modulus size`), and the
-//!   `pkcs1v15::VerifyingKey::verify` helper must NOT be used — it would hash the
-//!   digest a second time.
-//! * **EdDSA** (algo 22, Ed25519): OpenPGP EdDSA signs the *digest*, so this is
-//!   `VerifyingKey::verify_strict(&H, &sig)` — not a signature over the document.
-//!   R and S arrive as MPIs and are left-padded to the 32-octet RFC 8032 form.
-//! * **ECDSA** (algo 19): ECDSA over `H` with the curve named by the key's OID;
-//!   the r/s MPIs are left-padded to the field size (32/48/66 octets).
+//! * **RSA** (public-key algo 1/3): PKCS#1 v1.5 с DigestInfo-префиксом, через
+//!   pre-hashed точку входа `RsaPublicKey::verify(Pkcs1v15Sign::new::<D>(), &H, &sig)`.
+//!   Две ловушки: MPI подписи должен быть **дополнен слева до байтовой длины
+//!   модуля** (`rsa` отвергает `sig_len != размер модуля`), и helper
+//!   `pkcs1v15::VerifyingKey::verify` использовать НЕЛЬЗЯ — он захэширует дайджест
+//!   второй раз.
+//! * **EdDSA** (algo 22, Ed25519): OpenPGP EdDSA подписывает *дайджест*, так что
+//!   это `VerifyingKey::verify_strict(&H, &sig)` — не подпись над документом. R и S
+//!   приходят как MPI и дополняются слева до 32-октетной формы RFC 8032.
+//! * **ECDSA** (algo 19): ECDSA над `H` с кривой из OID ключа; MPI r/s дополняются
+//!   слева до размера поля (32/48/66 октетов).
 //!
-//! ## SHA-1 is for fingerprints only
+//! ## SHA-1 только для фингерпринтов
 //!
-//! No `sha1` crate is vendored, and OpenPGP v4 **fingerprints** are
-//! `SHA1(0x99 || be16(len(body)) || body)`, needed to tie a key packet to a
-//! *pinned* 20-octet fingerprint and to match a signature's issuer fingerprint.
-//! [`sha1`] therefore implements RFC 3174 locally. It is never a signature or
-//! MAC hash and no trust decision depends on its collision resistance: a wrong
-//! implementation can only make a valid key look absent (a refusal), never make a
-//! foreign key acceptable, because acceptance compares the **pinned constant**
-//! against the bytes carried in the signature.
+//! Крейт `sha1` не вендорится, а OpenPGP v4 **фингерпринты** — это
+//! `SHA1(0x99 || be16(len(body)) || body)`, нужные, чтобы связать key-пакет с
+//! *закреплённым* 20-октетным фингерпринтом и сопоставить issuer fingerprint
+//! подписи. [`sha1`] поэтому реализует RFC 3174 локально. Это никогда не хеш
+//! подписи или MAC, и ни одно решение о доверии не зависит от его
+//! collision-resistance: неверная реализация может лишь сделать валидный ключ
+//! отсутствующим (отказ), но никогда не сделает чужой ключ приемлемым, потому что
+//! приём сравнивает **закреплённую константу** с байтами в подписи.
 
 #![allow(dead_code)]
 

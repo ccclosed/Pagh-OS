@@ -1,27 +1,26 @@
-// drivers/virtio/hal.rs — `virtio_drivers::Hal` implementation for pagh
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// drivers/virtio/hal.rs — реализация `virtio_drivers::Hal` для pagh
+// 64-битное ядро ОС x86_64 на Rust (#![no_std])
 //
-// `PaghHal` bridges the `virtio-drivers` crate's hardware-abstraction layer to
-// pagh's physical memory manager (`pmm`) and virtual memory manager (`vmm`).
-// The crate uses this trait for every DMA allocation, MMIO BAR mapping, and
-// buffer share/unshare during virtqueue operation. `PhysAddr` in
-// virtio-drivers 0.11 is `usize`.
+// `PaghHal` мостит hardware-abstraction layer крейта `virtio-drivers` к менеджеру
+// физической памяти pagh (`pmm`) и менеджеру виртуальной памяти (`vmm`). Крейт
+// использует этот трейт для каждой DMA-аллокации, маппинга MMIO BAR и
+// share/unshare буфера во время работы virtqueue. `PhysAddr` в virtio-drivers
+// 0.11 — `usize`.
 //
-// DMA physical-contiguity (R4): all of physical RAM is identity-mapped into the
-// higher-half via the HHDM, but the kernel heap (`memory::heap`) maps *one
-// independently-allocated physical frame per virtual page*. A buffer handed to
-// `share` is therefore *virtually* contiguous but may be *physically*
-// fragmented when it crosses a page boundary. Returning `virt_to_phys` of only
-// the first byte would make the device DMA into unrelated physical frames past
-// the first page. To stay correct, `share` checks whether the buffer's spanned
-// pages are physically contiguous; if not, it allocates a physically-contiguous
-// bounce buffer, copies the bytes per `BufferDirection`, and hands the device
-// the bounce physical base (whose first byte is the buffer's first byte).
-// `unshare` reconciles the bytes back to the kernel buffer for device-written
-// directions and frees the bounce frames. Physically-contiguous buffers (the
-// single-page / already-contiguous case, including `dma_alloc` regions) take
-// the unchanged direct path with no bounce allocation.
-
+// Физическая непрерывность DMA (R4): вся физическая RAM identity-mapped в верхнюю
+// половину через HHDM, но куча ядра (`memory::heap`) мапит *один независимо
+// аллоцированный физический кадр на виртуальную страницу*. Буфер, отданный в
+// `share`, поэтому *виртуально* непрерывен, но может быть *физически*
+// фрагментирован при пересечении границы страницы. Вернуть `virt_to_phys` только
+// первого байта значило бы заставить устройство DMA'ить в чужие физические кадры
+// за первой страницей. Чтобы оставаться корректным, `share` проверяет, физически
+// непрерывны ли страницы буфера; если нет — аллоцирует физически непрерывный
+// bounce-буфер, копирует байты согласно `BufferDirection` и отдаёт устройству
+// физическую базу bounce (чей первый байт — первый байт буфера). `unshare`
+// переносит байты обратно в буфер ядра для направлений, куда пишет устройство, и
+// освобождает bounce-кадры. Физически непрерывные буферы (single-page / уже
+// непрерывный случай, включая области `dma_alloc`) идут неизменным прямым путём
+// без bounce-аллокации.
 use core::ptr::NonNull;
 
 use alloc::collections::BTreeMap;
@@ -31,11 +30,11 @@ use virtio_drivers::{BufferDirection, Hal, PhysAddr};
 use crate::memory::{pmm, vmm};
 use crate::sync::spinlock::Spinlock;
 
-/// Page size used for physical-contiguity reasoning and bounce sizing.
+/// Размер страницы для рассуждений о физической непрерывности и размера bounce.
 const PAGE_SIZE: u64 = 4096;
 
-/// Bookkeeping for one in-flight bounce buffer, keyed in [`BOUNCE`] by the
-/// device-visible physical base returned from [`PaghHal::share`].
+/// Учёт одного in-flight bounce-буфера, ключ в [`BOUNCE`] — device-visible
+/// физическая база, возвращённая из [`PaghHal::share`].
 struct BounceRecord {
     /// Kernel virtual base of the original (fragmented) buffer.
     orig_ptr: *mut u8,

@@ -1,38 +1,37 @@
-//! Mouse text selection over the console.
+//! Выделение текста мышью на консоли.
 //!
-//! The console keeps a cell model of what it has printed (`FramebufferWriter`'s
-//! grid) and can repaint a single cell with a background, which between them make
-//! selection possible without touching the pixel-level drawing code: a selection
-//! is a range of cells, drawn by repainting those cells inverted.
+//! Консоль держит клеточную модель напечатанного (сетка `FramebufferWriter`) и
+//! умеет перекрасить одну клетку фоном — вместе это делает выделение возможным
+//! без правки пиксельного кода рисования: выделение — диапазон клеток,
+//! рисуемый перекраской этих клеток инверсией.
 //!
-//! Two coordinate systems meet here and the whole module is about not confusing
-//! them:
+//! Здесь встречаются две системы координат, и весь модуль о том, чтобы их не
+//! путать:
 //!
-//! * **Console cells** — `(col, row)` on the screen. What the mouse reports, after
-//!   dividing by the glyph size.
-//! * **Line indices** — positions in the editable line, where index 0 is the first
-//!   character *after the prompt*. What the editor understands.
+//! * **Клетки консоли** — `(col, row)` на экране. То, что сообщает мышь после
+//!   деления на размер глифа.
+//! * **Индексы строки** — позиции в редактируемой строке, где индекс 0 — первый
+//!   символ *после промпта*. То, что понимает редактор.
 //!
-//! The prompt is what relates them: the prompt occupies `prompt_cols` cells at the
-//! start of the line, so cell `prompt_cols + k` on the line's first row is line
-//! index `k`. Anything selected to the left of the prompt's end is not line text
-//! and is clipped away, because a selection that included the prompt could not be
-//! deleted from the buffer.
+//! Их связывает промпт: он занимает `prompt_cols` клеток в начале строки, так
+//! что клетка `prompt_cols + k` первой строки — это индекс строки `k`. Всё,
+//! выделенное левее конца промпта, не является текстом строки и отсекается,
+//! потому что выделение, включающее промпт, нельзя было бы удалить из буфера.
 //!
-//! Text for the clipboard is read back from the grid rather than from the buffer,
-//! so a selection spanning output the user scrolled past still copies what they
-//! can see.
+//! Текст для буфера обмена читается обратно из сетки, а не из буфера, поэтому
+//! выделение, охватывающее вывод, который пользователь прокрутил, всё равно
+//! копирует то, что он видит.
 
 use crate::drivers::framebuffer;
 use crate::shell::caret::Cell;
 
-/// Colors for a selected cell: dark text on a light background, the inverse of
-/// the console's ordinary light-on-dark. Inverting is what makes the selection
-/// visible over text of any color.
+/// Цвета выделенной клетки: тёмный текст на светлом фоне, инверсия обычного
+/// светлого-на-тёмном консоли. Инверсия и делает выделение видимым поверх текста
+/// любого цвета.
 pub const SELECT_FG: u32 = 0x000000;
 pub const SELECT_BG: u32 = 0xCCCCCC;
 
-/// A range of cells on the console, from `a` to `b` inclusive, in reading order.
+/// Диапазон клеток консоли от `a` до `b` включительно, в порядке чтения.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CellRange {
     pub a: Cell,
@@ -40,8 +39,8 @@ pub struct CellRange {
 }
 
 impl CellRange {
-    /// Order two points into reading order (top-to-bottom, then left-to-right), so
-    /// a drag in any direction describes the same range.
+    /// Упорядочить две точки в порядок чтения (сверху вниз, затем слева
+    /// направо), чтобы перетаскивание в любом направлении описывало один диапазон.
     pub fn new(from: Cell, to: Cell) -> Self {
         let ordered = (from.row, from.col) <= (to.row, to.col);
         if ordered {
@@ -51,7 +50,7 @@ impl CellRange {
         }
     }
 
-    /// Iterate the cells of the range, row by row.
+    /// Итерировать клетки диапазона построчно.
     pub fn cells(&self, cols: usize) -> alloc::vec::Vec<Cell> {
         let mut out = alloc::vec::Vec::new();
         if cols == 0 || (self.a.row, self.a.col) > (self.b.row, self.b.col) {
@@ -71,12 +70,12 @@ impl CellRange {
         out
     }
 
-    /// The selected text, read back from the console's model.
-    ///
-    /// Rows are joined with `\n`, and each row is trimmed of trailing blanks: the
-    /// console pads every row to the full width, so copying a selection that ends
-    /// mid-line would otherwise drag a screenful of spaces into the clipboard.
-    /// Leading spaces are kept — they are real content (indentation).
+    /// Выделенный текст, прочитанный обратно из модели консоли.
+
+    /// Строки соединяются `\n`, и у каждой строки обрезаются хвостовые пробелы:
+    /// консоль дополняет каждую строку до полной ширины, так что копирование
+    /// выделения, кончающегося посреди строки, иначе притащило бы в буфер экран
+    /// пробелов. Ведущие пробелы сохраняются — это реальное содержимое (отступы).
     pub fn text(&self, cols: usize) -> alloc::string::String {
         use alloc::string::String;
         let mut out = String::new();
@@ -102,12 +101,12 @@ impl CellRange {
         out
     }
 
-    /// The same range expressed as indices into the editable line.
+    /// Тот же диапазон как индексы редактируемой строки.
     ///
-    /// `prompt_cols` is the prompt's width on the first row of the line, `cols` the
-    /// console width. Returns `None` when the range does not overlap the line's text
-    /// at all (a selection entirely inside the prompt, or on an output row), because
-    /// there is then nothing to delete or replace.
+    /// `prompt_cols` — ширина промпта в первой строке, `cols` — ширина консоли.
+    /// Возвращает `None`, когда диапазон вообще не пересекает текст строки
+    /// (выделение целиком внутри промпта или на строке вывода), потому что тогда
+    /// нечего удалять или заменять.
     pub fn line_indices(
         &self,
         prompt_cols: usize,
@@ -119,7 +118,7 @@ impl CellRange {
         }
         let first = self.a.row * cols + self.a.col;
         let last = self.b.row * cols + self.b.col;
-        // The line's text starts right after the prompt and is `line_len` long.
+        // Текст строки начинается сразу после промпта и имеет длину `line_len`.
         let start_of_line = prompt_cols; // prompt is printed at the line's first cell
         let end_of_line = start_of_line + line_len;
         let from = first.max(start_of_line);
@@ -131,7 +130,7 @@ impl CellRange {
     }
 }
 
-/// The `[from, to]` columns a range covers on `row`, clipped to the grid.
+/// Колонки `[from, to]`, которые диапазон покрывает на `row`, обрезанные по сетке.
 fn row_interval(range: CellRange, row: usize, cols: usize) -> Option<(usize, usize)> {
     if cols == 0 || row < range.a.row || row > range.b.row {
         return None;
@@ -148,7 +147,7 @@ fn row_interval(range: CellRange, row: usize, cols: usize) -> Option<(usize, usi
     Some((from, to.min(cols - 1)))
 }
 
-/// `a \ b` for two inclusive column intervals, as up to two segments.
+/// `a \ b` для двух включительных интервалов колонок, как до двух сегментов.
 fn subtract(a: (usize, usize), b: (usize, usize)) -> [Option<(usize, usize)>; 2] {
     let (af, at) = a;
     let (bf, bt) = b;
@@ -160,13 +159,14 @@ fn subtract(a: (usize, usize), b: (usize, usize)) -> [Option<(usize, usize)>; 2]
     [left, right]
 }
 
-/// Cells to restore and cells to highlight when moving from `old` to `new`.
+/// Клетки для восстановления и клетки для подсветки при переходе от `old` к `new`.
 ///
-/// A drag extends by one cell at a time; the old implementation repainted the
-/// whole range (restore all, then paint all) on every mouse event, which made a
-/// large selection O(cells) per pixel of mouse movement and dropped the frame
-/// rate. Computing the row-interval difference keeps each move proportional to
-/// the changed cells — usually one cell, and at most two short row segments.
+/// Перетаскивание расширяется по одной клетке; старая реализация
+/// перерисовывала весь диапазон (восстановить всё, затем покрасить всё) на каждом
+/// событии мыши, что делало большое выделение O(клеток) на пиксель движения мыши
+/// и роняло частоту кадров. Вычисление разности построчных интервалов держит
+/// каждое движение пропорциональным изменившимся клеткам — обычно одной клетке и
+/// максимум двум коротким сегментам строки.
 fn paint_diff(
     old: Option<CellRange>,
     new: Option<CellRange>,
@@ -215,23 +215,23 @@ fn paint_diff(
     (restore, paint)
 }
 
-/// An in-progress or finished mouse selection.
+/// Выделение мышью в процессе или завершённое.
 pub struct Selection {
     anchor: Option<Cell>,
     range: Option<CellRange>,
-    /// Exact line indices this selection corresponds to, when they are known
-    /// without inference. Keyboard selection knows them by construction (`Ctrl+A`
-    /// selects the buffer), so it does not have to re-derive them from cells —
-    /// which is the arithmetic that turned out to be unreliable.
+    /// Точные индексы строки, соответствующие выделению, когда они известны без
+    /// вывода. Клавиатурное выделение знает их по построению (`Ctrl+A` выделяет
+    /// буфер), так что ему не надо выводить их из клеток — а именно эта
+    /// арифметика оказалась ненадёжной.
     line_range: Option<(usize, usize)>,
     painted: bool,
-    /// The range that is currently highlighted on screen.
+    /// Диапазон, который сейчас подсвечен на экране.
     ///
-    /// Repainting is incremental: a drag extends the range cell by cell, so a
-    /// repaint must first restore the cells the *previous* range covered. Without
-    /// this record a shrinking drag (or a click after a drag) left the cells that
-    /// fell out of the range still highlighted — the "holes" and stuck bright
-    /// patches after releasing the mouse.
+    /// Перерисовка инкрементальна: перетаскивание расширяет диапазон по клетке,
+    /// поэтому перерисовка должна сначала восстановить клетки *предыдущего*
+    /// диапазона. Без этой записи сокращающееся перетаскивание (или клик после
+    /// него) оставляло выпавшие из диапазона клетки подсвеченными — те самые
+    /// «дыры» и залипшие яркие пятна после отпускания мыши.
     painted_range: Option<CellRange>,
 }
 
@@ -246,20 +246,20 @@ impl Selection {
         }
     }
 
-    /// Set the range directly (no drag), for keyboard-driven selection, together
-    /// with the line indices it covers.
+    /// Задать диапазон напрямую (без перетаскивания) для клавиатурного
+    /// выделения вместе с покрываемыми индексами строки.
     pub fn set_range(&mut self, range: CellRange, line_range: Option<(usize, usize)>) {
         self.anchor = None;
         self.range = Some(range);
         self.line_range = line_range;
     }
 
-    /// The line indices this selection covers, when they are known exactly.
+    /// Индексы строки, которые покрывает выделение, когда они известны точно.
     pub fn known_line_range(&self) -> Option<(usize, usize)> {
         self.line_range
     }
 
-    /// Begin a drag at `cell`.
+    /// Начать перетаскивание в `cell`.
     pub fn begin(&mut self, cell: Cell) {
         self.clear();
         self.anchor = Some(cell);
@@ -267,7 +267,7 @@ impl Selection {
         self.line_range = None;
     }
 
-    /// Extend the drag to `cell` and report whether anything is selected.
+    /// Расширить перетаскивание до `cell` и сообщить, выделено ли что-то.
     pub fn extend(&mut self, cell: Cell) -> bool {
         let Some(anchor) = self.anchor else {
             return false;
@@ -276,8 +276,9 @@ impl Selection {
         self.range.is_some()
     }
 
-    /// Finish the drag. Returns the finished range, if the drag covered more than
-    /// one cell — a plain click is not a selection and must not leave a highlight.
+    /// Завершить перетаскивание. Возвращает готовый диапазон, если перетаскивание
+    /// покрыло больше одной клетки — простой клик не выделение и не должен
+    /// оставлять подсветку.
     pub fn finish(&mut self) -> Option<CellRange> {
         self.anchor = None;
         match self.range {
@@ -293,14 +294,14 @@ impl Selection {
         self.range
     }
 
-    /// Whether a drag is in progress.
+    /// Идёт ли перетаскивание.
     pub fn is_active(&self) -> bool {
         self.anchor.is_some()
     }
 
-    /// Repaint the range as selected, restoring whatever the previous range
-    /// covered first. Repeated calls are cheap: a drag moves the highlight by a
-    /// cell or two, and only the cells that left the range are repainted back.
+    /// Перекрасить диапазон как выделенный, сначала восстановив то, что покрывал
+    /// предыдущий диапазон. Повторные вызовы дёшевы: перетаскивание двигает
+    /// подсветку на клетку-две, и обратно перекрашиваются только покинутые клетки.
     pub fn paint(&mut self, cols: usize) {
         if self.painted_range == self.range {
             return;
@@ -317,27 +318,28 @@ impl Selection {
         self.painted = self.painted_range.is_some();
     }
 
-    /// Repaint the highlighted range back to ordinary console colors.
+    /// Вернуть подсвеченный диапазон к обычным цветам консоли.
     pub fn unpaint(&mut self) {
         let cols = framebuffer::console().text_grid().0;
         self.unpaint_painted(cols);
         self.painted = false;
     }
 
-    /// Restore exactly the cells that are highlighted right now.
+    /// Восстановить ровно те клетки, что подсвечены прямо сейчас.
     fn unpaint_painted(&mut self, cols: usize) {
         let Some(range) = self.painted_range.take() else {
             return;
         };
         for cell in range.cells(cols) {
-            // `restore = true`: each cell goes back to the color it was drawn in,
-            // so releasing a selection over the green prompt leaves it green.
+            // `restore = true`: каждая клетка возвращается к цвету, которым была
+            // нарисована, так что отпускание выделения поверх зелёного промпта
+            // оставляет его зелёным.
             framebuffer::console().paint_cell_selected(cell.col, cell.row, 0, 0x000000, true);
         }
         self.painted = false;
     }
 
-    /// Drop the selection, restoring the cells it covered.
+    /// Сбросить выделение, восстановив покрытые клетки.
     pub fn clear(&mut self) {
         self.unpaint();
         self.anchor = None;

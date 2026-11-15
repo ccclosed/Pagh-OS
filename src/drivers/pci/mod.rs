@@ -1,32 +1,34 @@
-// drivers/pci/mod.rs — Legacy PCI configuration-space access and bus enumeration
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// drivers/pci/mod.rs — доступ к legacy PCI configuration space и перечисление шины
+// 64-битное ядро ОС x86_64 на Rust (#![no_std])
 //
-// Implements Component 1 of the networking-and-storage design: it walks the PCI
-// configuration space via the legacy I/O ports 0xCF8 (CONFIG_ADDRESS) and 0xCFC
-// (CONFIG_DATA), discovers present devices, and exposes helpers used by
-// `virtio-drivers` to attach (config read/write, bus-master enable). Virtio
-// devices are identified by PCI vendor id 0x1AF4; callers filter on `vendor_id`.
+// Реализует Component 1 дизайна networking-and-storage: обходит configuration
+// space через legacy I/O-порты 0xCF8 (CONFIG_ADDRESS) и 0xCFC (CONFIG_DATA),
+// находит присутствующие устройства и выставляет хелперы, используемые
+// `virtio-drivers` для attach (чтение/запись конфигурации, включение bus-master).
+// Virtio-устройства опознаются по PCI vendor id 0x1AF4; вызывающие фильтруют по
+// `vendor_id`.
 //
-// Enumeration performs only pure configuration-space reads (vendor/device id,
-// class/subclass, header type). BAR size-probing is intentionally NOT performed:
-// `virtio-drivers` discovers and maps device BARs through its own PCI transport,
-// so decoding them here produced unused, side-effecting config-space writes.
+// Перечисление выполняет только чистые чтения configuration space (vendor/device
+// id, class/subclass, header type). BAR size-probing намеренно НЕ выполняется:
+// `virtio-drivers` находит и мапит BAR устройства через свой PCI transport, так
+// что декодирование здесь давало неиспользуемые записи config space с побочными
+// эффектами.
 
 use alloc::vec::Vec;
 use x86_64::instructions::port::Port;
 
-/// Legacy PCI CONFIG_ADDRESS I/O port.
+/// Legacy PCI-порт CONFIG_ADDRESS.
 const CONFIG_ADDRESS: u16 = 0xCF8;
-/// Legacy PCI CONFIG_DATA I/O port.
+/// Legacy PCI-порт CONFIG_DATA.
 const CONFIG_DATA: u16 = 0xCFC;
 
-/// PCI vendor id used by all QEMU virtio devices.
+/// PCI vendor id всех virtio-устройств QEMU.
 pub const VIRTIO_VENDOR_ID: u16 = 0x1AF4;
 
-/// PCI vendor id of Intel (e1000 NICs).
+/// PCI vendor id Intel (NIC e1000).
 pub const VENDOR_INTEL: u16 = 0x8086;
 
-/// A bus/device/function coordinate in PCI configuration space.
+/// Координата bus/device/function в PCI configuration space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PciAddress {
     pub bus: u8,
@@ -34,7 +36,7 @@ pub struct PciAddress {
     pub function: u8,
 }
 
-/// A present PCI device (one function).
+/// Присутствующее PCI-устройство (одна функция).
 #[derive(Debug, Clone)]
 pub struct PciDevice {
     pub address: PciAddress,

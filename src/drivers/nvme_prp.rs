@@ -1,26 +1,27 @@
-//! Pure transfer planning for the NVMe driver.
+//! Чистое планирование передач для драйвера NVMe.
 //!
-//! Nothing here touches MMIO, the PMM or the allocator. The module is included
-//! verbatim by `host-tests` (`#[path]`, see `host-tests/src/properties/nvme_io.rs`),
-//! so the arithmetic the kernel executes is also fuzzed on the host. Three pieces
-//! are easy to get subtly wrong and are therefore isolated here:
+//! Ничто здесь не трогает MMIO, PMM или аллокатор. Модуль включается дословно в
+//! `host-tests` (`#[path]`, см. `host-tests/src/properties/nvme_io.rs`), так что
+//! арифметика, которую исполняет ядро, фаззится и на хосте. Три части легко
+//! ошибить на единицу и потому изолированы здесь:
 //!
-//! * **PRP construction** (NVMe Base Spec §3.3.3): PRP1 is the first data page
-//!   (with an in-page byte offset in its low bits), PRP2 is the *second page
-//!   address* for exactly two pages, and a *PRP-list page address* for three or
-//!   more. In the list case the list's entry 0 is the **second** page (PRP1
-//!   already covers the first), entry 1 the third, and so on. Off-by-one here
-//!   makes the controller read or write unrelated physical memory.
-//! * **Command chunking**: mapping a byte range of the caller's buffer to an
-//!   LBA-aligned Read/Write command that fits one DMA slot. The command covers
-//!   whole logical blocks, so the bytes before/after the caller's range inside
-//!   the first/last LBA must be padded (reads) or preserved (writes).
-//! * **Ring state**: the SQ tail and the polled CQ head/phase-tag. The phase tag
-//!   inverts exactly on a wrap; a stale slot must never be consumed as a fresh
-//!   completion.
+//! * **Построение PRP** (NVMe Base Spec §3.3.3): PRP1 — первая data-страница (с
+//!   внутристраничным байтовым смещением в младших битах), PRP2 — *адрес второй
+//!   страницы* ровно для двух страниц и *адрес PRP-list-страницы* для трёх и более.
+//!   В list-случае запись 0 списка — **вторая** страница (PRP1 уже покрывает первую),
+//!   запись 1 — третья и т.д. Ошибка на единицу здесь заставляет контроллер читать
+//!   или писать несвязанную физическую память.
+//! * **Чанкинг команд**: отображение байтового диапазона буфера вызывающего в
+//!   LBA-выровненную Read/Write-команду, влезающую в один DMA-слот. Команда
+//!   покрывает целые логические блоки, так что байты до/после диапазона внутри
+//!   первого/последнего LBA надо добить (чтения) или сохранить (записи).
+//! * **Состояние ring'а**: SQ tail и polled CQ head/phase-tag. Phase tag
+//!   инвертируется ровно на wrap; устаревший слот никогда не должен быть
+//!   потреблён как свежее завершение.
 //!
-//! All address arithmetic is `core`-only and panic-free on hostile inputs: the
-//! functions return `None`/`Err` rather than relying on callers to pre-validate.
+//! Вся адресная арифметика `core`-only и panic-free на враждебном вводе: функции
+//! возвращают `None`/`Err`, а не полагаются на предварительную валидацию
+//! вызывающим.
 
 /// The driver programs CC.MPS = 4 KiB and addresses every DMA buffer with 4 KiB
 /// pages, so PRP entries are 4 KiB pages.

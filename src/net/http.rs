@@ -1,61 +1,60 @@
-//! Pure HTTP/1.1 request building and response-head parsing.
+//! Чистое построение HTTP/1.1-запроса и разбор головы ответа.
 //!
-//! This task (7.1) implements only the **pure** core of the `Package_Fetcher`
-//! (design component 7): allocation-aware but socket-free logic that builds a
-//! `GET` request and parses an HTTP response head. It is `core` + `alloc` only —
-//! no socket types, no globals, no hardware — so it compiles into both the
-//! kernel (`crate::net::http`) and the `host-tests` crate via `#[path]` include,
-//! letting properties P20/P21 exercise the same source (R11.6).
+//! Здесь реализовано только **чистое** ядро `Package_Fetcher` (компонент
+//! дизайна 7): allocation-aware, но без сокетов — логика, строящая `GET`-запрос и
+//! разбирающая голову HTTP-ответа. Только `core` + `alloc` — без типов сокетов,
+//! глобалов и железа — так что собирается и в ядро (`crate::net::http`), и в
+//! `host-tests` через `#[path]`-include, позволяя свойствам P20/P21 проверять тот
+//! же исходник (R11.6).
 //!
-//! The effectful `fetch_deb` shell that pumps a real TCP socket and calls
-//! [`parse_http_head`] lands in task 14.1.
+//! Эффектный `fetch_deb`, качающий реальный TCP-сокет и вызывающий
+//! [`parse_http_head`], подключается отдельно.
 //!
-//! All parsing is hardened against adversarial input: every index is bounds
-//! checked, slicing uses half-open ranges derived from found positions, and no
-//! path can panic or read past `buf`.
+//! Весь разбор закалён против враждебного ввода: каждый индекс проверен на
+//! границы, срезы используют полуоткрытые диапазоны из найденных позиций, и ни
+//! один путь не паникует и не читает за `buf`.
 #![allow(dead_code)]
 
 use alloc::vec::Vec;
 
-/// Outcome of parsing the head (status line + headers) of an HTTP response.
+/// Результат разбора головы (строка статуса + заголовки) HTTP-ответа.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HeadParse {
-    /// The buffer does not yet contain a complete head (no `CRLFCRLF`
-    /// terminator). The caller should read more bytes and retry.
+    /// Буфер ещё не содержит полной головы (нет терминатора `CRLFCRLF`).
+    /// Вызывающему следует прочитать ещё байты и повторить.
     Need,
-    /// A complete, well-formed head was parsed.
+    /// Разобрана полная, корректная голова.
     Done {
-        /// The numeric HTTP status code from the status line.
+        /// Числовой HTTP-код статуса из строки статуса.
         status: u16,
-        /// The parsed `Content-Length`, if a well-formed header was present.
+        /// Разобранный `Content-Length`, если был корректный заголовок.
         ///
-        /// `Some(n)` only when a `Content-Length` header exists and its value
-        /// parses as a non-negative integer; `None` when the header is absent or
-        /// present but unparseable (R8.3 decides what to do with `None`).
+        /// `Some(n)` только когда заголовок `Content-Length` есть и его значение
+        /// парсится как неотрицательное целое; `None`, когда заголовок отсутствует
+        /// или не парсится (R8.3 решает, что делать с `None`).
         content_length: Option<u64>,
-        /// Byte index just past the `CRLFCRLF` terminator — where the body
-        /// begins within the buffer.
+        /// Байтовый индекс сразу за терминатором `CRLFCRLF` — где начинается тело
+        /// внутри буфера.
         body_off: usize,
     },
-    /// A head terminator was present but the status line was not well-formed.
+    /// Терминатор головы был, но строка статуса некорректна.
     Malformed,
 }
 
-/// The CRLFCRLF sequence that terminates an HTTP message head.
+/// Последовательность CRLFCRLF, завершающая голову HTTP-сообщения.
 const CRLFCRLF: &[u8] = b"\r\n\r\n";
 
-/// Parse the head of an HTTP/1.x response from `buf` (R8.2, R8.3, R8.5).
+/// Разобрать голову HTTP/1.x-ответа из `buf` (R8.2, R8.3, R8.5).
 ///
-/// Scans for the `CRLFCRLF` head terminator. If it is absent the head is
-/// incomplete and [`HeadParse::Need`] is returned. Otherwise the status line is
-/// parsed (`HTTP/1.x <3-digit code> ...`); a status line that does not begin with
-/// `HTTP/` or whose code is not exactly three ASCII digits yields
-/// [`HeadParse::Malformed`]. Header lines are parsed case-insensitively; a
-/// `Content-Length` whose value parses as a non-negative integer sets
-/// `content_length = Some(n)`, otherwise it stays `None`. `body_off` is the index
-/// immediately following the terminator.
+/// Ищет терминатор `CRLFCRLF`. Если его нет, голова неполна и возвращается
+/// [`HeadParse::Need`]. Иначе разбирается строка статуса (`HTTP/1.x <3-значный
+/// код> ...`); строка, не начинающаяся с `HTTP/`, или с кодом не ровно из трёх
+/// ASCII-цифр даёт [`HeadParse::Malformed`]. Строки заголовков разбираются
+/// регистронезависимо; `Content-Length`, чьё значение парсится как неотрицательное
+/// целое, ставит `content_length = Some(n)`, иначе остаётся `None`. `body_off` —
+/// индекс сразу за терминатором.
 ///
-/// The function never indexes past `buf` and never panics on any input.
+/// Функция никогда не индексирует за `buf` и не паникует ни на каком входе.
 pub fn parse_http_head(buf: &[u8]) -> HeadParse {
     let term = match find_subslice(buf, CRLFCRLF) {
         Some(i) => i,
@@ -63,8 +62,8 @@ pub fn parse_http_head(buf: &[u8]) -> HeadParse {
     };
     let body_off = term + CRLFCRLF.len();
 
-    // The head is everything before the terminating CRLFCRLF. Individual lines
-    // are separated by CRLF; the head itself contains no trailing blank line.
+    // Голова — всё до терминатора CRLFCRLF. Отдельные строки разделены CRLF;
+    // сама голова не содержит завершающей пустой строки.
     let head = &buf[..term];
     let mut lines = SplitCrlf::new(head);
 
@@ -81,7 +80,7 @@ pub fn parse_http_head(buf: &[u8]) -> HeadParse {
     for line in lines {
         if let Some((name, value)) = split_header(line) {
             if eq_ascii_ci(trim_ascii(name), b"content-length") {
-                // Present-but-unparseable leaves content_length as None.
+                // Присутствующий, но непарсящийся оставляет content_length = None.
                 content_length = parse_u64(trim_ascii(value));
             }
         }
@@ -94,19 +93,18 @@ pub fn parse_http_head(buf: &[u8]) -> HeadParse {
     }
 }
 
-/// Build an HTTP/1.1 `GET` request for `path` on `host` (R8.1, Property 21).
+/// Построить HTTP/1.1 `GET`-запрос для `path` на `host` (R8.1, Property 21).
 ///
-/// Produces exactly:
+/// Даёт ровно:
 ///
 /// ```text
 /// GET <path> HTTP/1.1\r\n
 /// Host: <host>\r\n
 /// Connection: close\r\n
-/// \r\n
 /// ```
 ///
-/// The result always begins with `GET <path> HTTP/1.1\r\n`, contains
-/// `Host: <host>\r\n`, and ends with a blank line.
+/// Результат всегда начинается с `GET <path> HTTP/1.1\r\n`, содержит
+/// `Host: <host>\r\n` и кончается пустой строкой.
 pub fn build_get_request(host: &str, path: &str) -> Vec<u8> {
     let mut req = Vec::new();
     req.extend_from_slice(b"GET ");
@@ -121,11 +119,11 @@ pub fn build_get_request(host: &str, path: &str) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Pure parsing helpers (bounds-checked, panic-free)
+// Чистые хелперы разбора (bounds-checked, panic-free)
 // ---------------------------------------------------------------------------
 
-/// Return the index of the first occurrence of `needle` within `haystack`, or
-/// `None`. Empty `needle` is treated as not found.
+/// Вернуть индекс первого вхождения `needle` в `haystack` или `None`. Пустой
+/// `needle` считается ненайденным.
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     let n = needle.len();
     if n == 0 || haystack.len() < n {
@@ -141,9 +139,9 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     None
 }
 
-/// Iterator over CRLF-separated lines of a head slice. A bare trailing CRLF (no
-/// following bytes) yields no extra empty line; intermediate empty lines are
-/// preserved but never occur in a well-formed head before the terminator.
+/// Итератор по CRLF-разделённым строкам среза головы. Голый завершающий CRLF
+/// (без следующих байтов) не даёт лишней пустой строки; промежуточные пустые
+/// строки сохраняются, но в корректной голове до терминатора не встречаются.
 struct SplitCrlf<'a> {
     rest: &'a [u8],
     done: bool,
@@ -182,17 +180,17 @@ impl<'a> Iterator for SplitCrlf<'a> {
     }
 }
 
-/// Parse the numeric status code from a status line of the form
-/// `HTTP/1.x <code> [reason]`. Returns `None` unless the line begins with
-/// `HTTP/` and the code is exactly three ASCII digits.
+/// Разобрать числовой код статуса из строки вида `HTTP/1.x <code> [reason]`.
+/// Возвращает `None`, если строка не начинается с `HTTP/`, а код — не ровно три
+/// ASCII-цифры.
 fn parse_status_code(line: &[u8]) -> Option<u16> {
     if !line.starts_with(b"HTTP/") {
         return None;
     }
-    // The status code follows the first space.
+    // Код статуса идёт после первого пробела.
     let sp = line.iter().position(|&b| b == b' ')?;
     let rest = &line[sp + 1..];
-    // The code token ends at the next space or end of line.
+    // Токен кода кончается на следующем пробеле или конце строки.
     let code_end = rest.iter().position(|&b| b == b' ').unwrap_or(rest.len());
     let code = &rest[..code_end];
     if code.len() != 3 || !code.iter().all(|b| b.is_ascii_digit()) {
@@ -203,8 +201,8 @@ fn parse_status_code(line: &[u8]) -> Option<u16> {
     Some(value)
 }
 
-/// Split a header line into `(name, value)` at the first colon, or `None` if the
-/// line has no colon.
+/// Разбить строку заголовка на `(name, value)` по первому двоеточию или `None`,
+/// если двоеточия нет.
 fn split_header(line: &[u8]) -> Option<(&[u8], &[u8])> {
     let colon = line.iter().position(|&b| b == b':')?;
     let name = &line[..colon];
@@ -212,7 +210,7 @@ fn split_header(line: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((name, value))
 }
 
-/// Trim leading and trailing ASCII spaces and tabs from a byte slice.
+/// Обрезать ведущие и завершающие ASCII-пробелы и табы из байтового среза.
 fn trim_ascii(mut s: &[u8]) -> &[u8] {
     while let [first, rest @ ..] = s {
         if *first == b' ' || *first == b'\t' {
@@ -231,13 +229,13 @@ fn trim_ascii(mut s: &[u8]) -> &[u8] {
     s
 }
 
-/// Case-insensitive ASCII byte-slice equality.
+/// Регистронезависимое ASCII-равенство байтовых срезов.
 fn eq_ascii_ci(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
-/// Parse a non-negative decimal integer. Returns `None` for an empty slice, any
-/// non-digit byte (including sign characters), or on `u64` overflow.
+/// Разобрать неотрицательное десятичное целое. `None` для пустого среза, любого
+/// не-цифрового байта (включая знаки) или переполнения `u64`.
 fn parse_u64(s: &[u8]) -> Option<u64> {
     if s.is_empty() {
         return None;

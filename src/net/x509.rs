@@ -1,31 +1,30 @@
-//! Minimal DER (ASN.1) reader + X.509 time decoding for the TLS certificate
-//! verifier (issue #14 — TLS server authentication).
+//! Минимальный DER (ASN.1) reader + декодирование X.509-времени для
+//! верификатора TLS-сертификатов (issue #14 — TLS server authentication).
 //!
-//! This is the foundation the certificate verifier (later PRs in the issue #14
-//! series) is built on: a deliberately tiny, fail-closed DER subset covering
-//! exactly the shapes a TLS 1.3 server certificate chain actually carries —
-//! SEQUENCE/SET containers, INTEGER/OID/strings, context tags, and the two
-//! time types X.509 `Validity` uses.
+//! Это фундамент, на котором строится верификатор сертификатов: намеренно
+//! крошечное fail-closed подмножество DER, покрывающее ровно те формы, что реально
+//! несёт цепочка TLS 1.3-сервера — SEQUENCE/SET-контейнеры, INTEGER/OID/строки,
+//! context-теги и два типа времени, которые использует X.509 `Validity`.
 //!
-//! Design constraints (match the repo's pure-module convention, R11.6):
+//! Ограничения дизайна (следуют конвенции чистого модуля репозитория, R11.6):
 //!
-//!   * **Pure `core`-only, self-contained** — no `alloc`, no sibling deps, no
-//!     kernel/arch references, so this exact source is `#[path]`-included in
-//!     `host-tests` and exercised by property P43 against adversarial input.
-//!     The calendar math is a re-implementation of Howard Hinnant's
-//!     `days_from_civil` (see also `arch/x86_64/linux/timeconv.rs`, which
-//!     cannot be referenced across the subtree without breaking the standalone
-//!     host include; the host property cross-checks the two).
-//!   * **Fail-closed and panic-free**: every malformed input returns
-//!     [`Err(DerError)`]; there is no indexing without bounds checks, no
-//!     `unwrap`, no panic path. A parser that runs on untrusted network bytes
-//!     inside a `panic = "abort"` kernel must never panic.
-//!   * **DER, not BER**: indefinite lengths and non-minimal length encodings
-//!     are rejected. Certificates are DER per RFC 5280 §4.1, and strictness
-//!     here is free attack surface removal.
-//!   * **No high-tag-number form** (tags ≥ 31) and no multi-byte tag parsing:
-//!     nothing in an X.509 certificate path uses them; encountering one is a
-//!     hard error rather than a half-supported code path.
+//!   * **Чистый `core`-only, самодостаточный** — без `alloc`, соседних зависимостей
+//!     и ссылок на ядро/арх, так что ровно этот исходник `#[path]`-включается в
+//!     `host-tests` и проверяется свойством P43 на враждебном вводе. Календарная
+//!     математика — ре-реализация `days_from_civil` Howard'а Hinnant (см. также
+//!     `arch/x86_64/linux/timeconv.rs`, на который нельзя ссылаться через
+//!     поддерево, не ломая standalone host-include; host-property перекрёстно
+//!     сверяет обе).
+//!   * **Fail-closed и panic-free**: каждый некорректный вход возвращает
+//!     [`Err(DerError)`]; нет индексации без проверки границ, нет `unwrap`, нет
+//!     пути с паникой. Парсер, работающий на недоверенных сетевых байтах внутри
+//!     ядра с `panic = "abort"`, не должен паниковать никогда.
+//!   * **DER, не BER**: indefinite-длины и не-минимальные кодировки длины
+//!     отвергаются. Сертификаты — DER по RFC 5280 §4.1, и строгость здесь —
+//!     бесплатное удаление поверхности атаки.
+//!   * **Без high-tag-number формы** (теги ≥ 31) и без разбора многобайтовых
+//!     тегов: в пути X.509-сертификата они не используются; встретить такой —
+//!     жёсткая ошибка, а не половинчато поддерживаемый путь.
 
 #![allow(dead_code)] // the DER tag vocabulary is deliberately complete.
 

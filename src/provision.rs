@@ -1,10 +1,9 @@
-//! Idempotent first-boot filesystem provisioning for pagh.
+//! Идемпотентное первичное заполнение файловой системы при первой загрузке pagh.
 
 use crate::vfs::{VfsError, VfsNode};
 use alloc::sync::Arc;
 
-// OS version is derived from the crate version (Cargo.toml) so the two
-// cannot drift apart.
+// Версия ОС берётся из версии крейта (Cargo.toml), чтобы они не расходились.
 const RELEASE: &[u8] = concat!(
     "NAME=pagh OS\nID=pagh\nVERSION=",
     env!("CARGO_PKG_VERSION"),
@@ -49,8 +48,8 @@ fn write_once(path: &str, data: &[u8]) -> Result<(), VfsError> {
     Ok(())
 }
 
-/// Install release metadata, a home skeleton and examples on the first boot.
-/// Existing files are never overwritten.
+/// Установить release-метаданные, скелет домашнего каталога и примеры при первой
+/// загрузке. Существующие файлы никогда не перезаписываются.
 pub fn seed() {
     if crate::vfs::lookup_path("/mnt/etc/pagh-release").is_ok() {
         return;
@@ -61,8 +60,8 @@ pub fn seed() {
         ensure_dir("/mnt/usr/share/pagh")?;
         ensure_dir("/mnt/examples/hello/src")?;
         write_once("/mnt/etc/pagh-release", RELEASE)?;
-        // glibc's resolver reads these before any getaddrinfo call works;
-        // 10.0.2.3 is QEMU slirp's built-in DNS forwarder.
+        // Резолвер glibc читает их до того, как заработает любой getaddrinfo;
+        // 10.0.2.3 — встроенный DNS-форвардер QEMU slirp.
         write_once(
             "/mnt/etc/resolv.conf",
             b"nameserver 10.0.2.3\noptions timeout:1 attempts:2\n",

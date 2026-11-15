@@ -1,27 +1,25 @@
-//! Pure `.deb` (`ar` archive) enumeration and member location (design
-//! component 8, R9.1/R9.2/R9.4/R9.6).
+//! Чистое перечисление `.deb` (`ar`-архив) и поиск членов (компонент дизайна 8,
+//! R9.1/R9.2/R9.4/R9.6).
 //!
-//! A `.deb` is an `ar` archive (`!<arch>\n` global magic) whose members are, in
-//! order, `debian-binary`, `control.tar[.gz|.xz]`, and `data.tar[.gz|.xz]`. This
-//! module implements only the **pure** core of the `Deb_Parser`:
+//! `.deb` — это `ar`-архив (глобальная магия `!<arch>\n`), чьи члены по порядку:
+//! `debian-binary`, `control.tar[.gz|.xz]` и `data.tar[.gz|.xz]`. Модуль реализует
+//! только **чистое** ядро `Deb_Parser`:
 //!
-//!   * [`parse_ar`] — walk the `ar` member headers and return each member's
-//!     trimmed name and bounds-checked content slice (R9.1, R9.6).
-//!   * [`locate_members`] — pick out the three `.deb` members (R9.2).
-//!   * [`compression_of`] — classify a member name's compression by suffix
-//!     (R9.4).
+//!   * [`parse_ar`] — пройти заголовки членов `ar` и вернуть усечённое имя и
+//!     проверенный на границы срез содержимого каждого члена (R9.1, R9.6).
+//!   * [`locate_members`] — выбрать три члена `.deb` (R9.2).
+//!   * [`compression_of`] — классифицировать сжатие по суффиксу имени (R9.4).
 //!
-//! It is `core` + `alloc` only — no hardware, no globals — so it compiles into
-//! both the kernel (`crate::pkg::deb`) and the `host-tests` crate via a
-//! `#[path]` include, letting properties P22/P23 exercise the same source
-//! (R11.6). Its external dependencies are all pure-Rust, `no_std`+`alloc`
-//! decoders used by [`decompress_data`]: [`miniz_oxide`] for the gzip/DEFLATE
-//! path, [`xz4rust`] for `.tar.xz` (LZMA2), and [`ruzstd`] for `.tar.zst`
-//! (Zstandard). All three build on both the bare-metal target and the host.
+//! Только `core` + `alloc` — без железа и глобалов, так что собирается и в ядро
+//! (`crate::pkg::deb`), и в `host-tests` через `#[path]`-include, позволяя
+//! свойствам P22/P23 проверять тот же исходник (R11.6). Внешние зависимости —
+//! pure-Rust `no_std`+`alloc` декодеры, используемые [`decompress_data`]:
+//! [`miniz_oxide`] для gzip/DEFLATE, [`xz4rust`] для `.tar.xz` (LZMA2) и [`ruzstd`]
+//! для `.tar.zst` (Zstandard). Все три собираются и на bare-metal, и на хосте.
 //!
-//! All parsing is hardened against adversarial input: every offset is computed
-//! with checked arithmetic, every slice is bounds-checked against `buf`, and no
-//! path can panic or read past the end of the buffer (R9.6).
+//! Весь разбор закалён против враждебного ввода: каждое смещение считается
+//! checked-арифметикой, каждый срез проверен на границы относительно `buf`, и ни
+//! один путь не паникует и не читает за конец буфера (R9.6).
 #![allow(dead_code)]
 
 use alloc::vec::Vec;

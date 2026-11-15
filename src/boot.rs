@@ -1,23 +1,23 @@
-// boot.rs — Kernel boot orchestrator
-// 64-bit x86_64 Limine kernel in Rust (#![no_std])
+// boot.rs — оркестратор загрузки ядра
+// 64-битное ядро x86_64 под Limine на Rust (#![no_std])
 //
-// This module owns the ordered, fallible kernel initialization sequence that
-// previously lived inline in `lib.rs::_start` (Requirement 1). `_start` now
-// simply delegates to `boot::start()`.
+// Этот модуль владеет упорядоченной последовательностью инициализации ядра,
+// которая раньше жила прямо в `lib.rs::_start` (Requirement 1). Теперь `_start`
+// просто делегирует в `boot::start()`.
 //
-// Structure (Requirement 1):
-//  * 1.1 — initialization runs as an explicit ordered sequence of init steps,
-//          modeled as one private `fn` per phase invoked in order by `start()`.
-//  * 1.3 — each completed step emits a single concise `info!` line; verbose
-//          detail stays at `debug!`.
-//  * 1.4 — a missing required Limine response or a failed step funnels through
-//          the centralized `fatal()` helper, which logs one `error!` line
-//          naming the failed step and enters `arch::cpu::halt_loop()`.
+// Структура (Requirement 1):
+//  * 1.1 — инициализация идёт явной упорядоченной последовательностью шагов:
+//          одна приватная `fn` на фазу, вызываемая по порядку из `start()`.
+//  * 1.3 — каждый завершённый шаг печатает одну короткую строку `info!`;
+//          подробности остаются на `debug!`.
+//  * 1.4 — отсутствующий обязательный ответ Limine или упавший шаг проходят
+//          через централизованный `fatal()`, который пишет одну строку `error!`
+//          с именем шага и уходит в `arch::cpu::halt_loop()`.
 //
-// NOTE: behavior is intentionally kept identical to the previous inline
-// `_start` for now. The inline LAPIC/IOAPIC MMIO mapping stays here (it moves
-// to the APIC/memory owners in task 7). `KERNEL_SIZE` is computed precisely
-// from the kernel image extent (linker symbols) in `read_limine_responses`.
+// Поведение намеренно совпадает с прежним inline-`_start`. Inline-маппинг
+// MMIO LAPIC/IOAPIC пока остаётся здесь (переедет к владельцам APIC/памяти).
+// `KERNEL_SIZE` точно вычисляется из границ образа ядра (символы линкера)
+// в `read_limine_responses`.
 
 use core::sync::atomic::Ordering;
 
@@ -26,55 +26,55 @@ use crate::{debug, error, info, warn};
 use crate::{BASE_REVISION, HHDM_REQUEST, KERNEL_ADDR_REQUEST, MEMMAP_REQUEST, MODULES_REQUEST};
 use crate::{HHDM_OFFSET, KERNEL_BASE, KERNEL_SIZE};
 
-/// Centralized fatal-boot handler (Requirement 1.4).
+/// Централизованный обработчик фатальной ошибки загрузки (Requirement 1.4).
 ///
-/// Logs exactly one `error!` line naming the failed step, then parks the CPU
-/// forever via the safe `arch::cpu` halt primitive. Never returns.
+/// Пишет ровно одну строку `error!` с именем упавшего шага, затем навсегда
+/// паркует CPU через безопасный halt-примитив `arch::cpu`. Не возвращается.
 fn fatal(step: &str) -> ! {
     error!("boot: {} failed", step);
     crate::drivers::earlyfb::errorln(format_args!("BOOT FAILED at step: {}", step));
     arch::cpu::halt_loop();
 }
 
-/// Announce that a boot step is about to run, on the emergency console.
+/// Объявить, что шаг загрузки вот-вот начнётся, на аварийной консоли.
 ///
-/// Printed BEFORE the step: a step that hangs never prints its `ok`, so the row
-/// naming it in progress is exactly the one to look at. (This is how the "stops
-/// after heap" report is read: heap finished, so the hang is in the step named
-/// `> apic` below it.)
+/// Печатается ДО шага: зависший шаг никогда не напечатает свой `ok`, поэтому
+/// строка с его именем в состоянии «выполняется» — именно та, на которую надо
+/// смотреть (так читается отчёт «встаёт после heap»: heap завершён, значит
+/// висит шаг `> apic` под ним).
 fn step_begin(visible: bool, name: &str) {
     if visible {
         crate::drivers::earlyfb::println(format_args!("  >  {}", name));
     }
 }
 
-/// Report a completed boot step on the emergency console (when there is one).
+/// Отметить завершённый шаг загрузки на аварийной консоли (если она есть).
 fn step(visible: bool, name: &str) {
     if visible {
         crate::drivers::earlyfb::println(format_args!("  ok  {}", name));
     }
 }
 
-/// Run the ordered kernel initialization sequence, then enter the idle loop.
+/// Выполнить упорядоченную инициализацию ядра и уйти в idle-цикл.
 ///
-/// Each call below is one init step (Requirement 1.1). Steps that depend on a
-/// Limine response read it from the request statics in `lib.rs`; missing
-/// responses route through [`fatal`] (Requirement 1.4).
+/// Каждый вызов ниже — один шаг инициализации (Requirement 1.1). Шаги, которым
+/// нужен ответ Limine, читают его из статиков запросов в `lib.rs`; отсутствующий
+/// ответ ведёт к [`fatal`] (Requirement 1.4).
 pub fn start() -> ! {
-    // Step 0: enable SSE before anything else. The kernel and Rust's
-    // `extern "x86-interrupt"` handlers emit SSE (`movaps`) instructions, but
-    // Limine hands off with SSE not OS-enabled, so this must happen before any
-    // FP/SSE use and before interrupts are enabled. See `arch::cpu::enable_sse`.
+    // Шаг 0: включить SSE прежде всего остального. Ядро и обработчики
+    // `extern "x86-interrupt"` в Rust генерируют SSE-инструкции (`movaps`), но
+    // Limine передаёт управление без OS-enable SSE, поэтому это должно
+    // произойти до любого FP/SSE-использования и до включения прерываний.
+    // См. `arch::cpu::enable_sse`.
     arch::cpu::enable_sse();
 
-    // The emergency console goes up before anything that can fail, and it does
-    // not need the heap: on a real PC there is no serial port, so without this a
-    // failure in any later step leaves a black screen and nothing else. From here
-    // on every step prints its name, so a machine that stops shows exactly where.
-    // Capture log lines into the file-mirror ring from the very first message:
-    // the boot log is what an operator needs after a failure, and it happens
-    // before any filesystem exists to write it to (the flusher thread drains the
-    // ring once /mnt is mounted).
+    // Аварийная консоль поднимается до всего, что может упасть, и не требует
+    // heap: на реальном ПК нет serial-порта, поэтому без неё сбой любого
+    // позднего шага оставил бы чёрный экран. С этого момента каждый шаг
+    // печатает своё имя, так что остановившаяся машина показывает, где встала.
+    // Строки лога захватываются в file-mirror ring с самого первого сообщения:
+    // boot-лог нужен оператору после сбоя, а пишется он до появления файловой
+    // системы (поток-flusher сливает ring после монтирования /mnt).
     crate::logfile::enable_buffering();
 
     let visible = crate::drivers::earlyfb::init();
@@ -138,23 +138,24 @@ pub fn start() -> ! {
     init_net();
     step(visible, "net");
 
-    // Boot is done: erase the emergency trace so the shell starts on a blank
-    // screen. The console stays usable — a panic later still prints here.
+    // Загрузка окончена: стереть аварийный трассировочный вывод, чтобы shell
+    // начался с чистого экрана. Консоль остаётся рабочей — поздняя паника
+    // всё равно печатается здесь.
     if visible {
         crate::drivers::earlyfb::clear();
     }
 
-    // Hand off to the run phase (spawns the shell, enables interrupts, idles).
+    // Передача в run-фазу (спавнит shell, включает прерывания, уходит в idle).
     kernel_main();
 }
 
-/// Step 1: bring up the COM1 serial port (the primary log sink).
+/// Шаг 1: поднять COM1 (основной приёмник логов).
 fn init_serial() {
     drivers::serial::init();
     info!("serial");
 }
 
-/// Step 2: verify Limine handed us a base revision we support.
+/// Шаг 2: проверить, что Limine дал поддерживаемую базовую ревизию.
 fn check_base_revision() {
     if !BASE_REVISION.is_supported() {
         fatal("base revision");
@@ -162,8 +163,8 @@ fn check_base_revision() {
     info!("base revision");
 }
 
-/// Step 3: read the required Limine responses (HHDM offset + kernel address)
-/// and store them into the global address cells in `lib.rs`.
+/// Шаг 3: прочитать обязательные ответы Limine (смещение HHDM + адрес ядра)
+/// и сохранить их в глобальные ячейки адресов в `lib.rs`.
 fn read_limine_responses() {
     match HHDM_REQUEST.response() {
         Some(hhdm) => HHDM_OFFSET.store(hhdm.offset, Ordering::Relaxed),
@@ -173,9 +174,9 @@ fn read_limine_responses() {
     match KERNEL_ADDR_REQUEST.response() {
         Some(kaddr) => {
             KERNEL_BASE.store(kaddr.virtual_base, Ordering::Relaxed);
-            // KERNEL_SIZE is the kernel image extent, computed precisely from
-            // the linker symbols (`__kernel_end - __kernel_start`) rather than
-            // a hardcoded guess. KERNEL_BASE stays the Limine virtual base.
+            // KERNEL_SIZE — размер образа ядра, точно вычисленный из символов
+            // линкера (`__kernel_end - __kernel_start`), а не угаданный.
+            // KERNEL_BASE остаётся виртуальной базой Limine.
             KERNEL_SIZE.store(memory::layout::kernel_size(), Ordering::Relaxed);
         }
         None => fatal("kernel address"),
@@ -184,23 +185,24 @@ fn read_limine_responses() {
     info!("limine responses");
 }
 
-/// Step 4: load the GDT (with TSS/IST) and install the IDT.
+/// Шаг 4: загрузить GDT (с TSS/IST) и установить IDT.
 fn init_descriptor_tables() {
     arch::x86_64::gdt::init();
     arch::x86_64::idt::init();
     info!("gdt + idt");
 }
 
-/// Step 4.5: enable the SYSCALL/SYSRET fast system-call interface.
+/// Шаг 4.5: включить быстрый интерфейс системных вызовов SYSCALL/SYSRET.
 ///
-/// Must run after `init_descriptor_tables` because `syscall::init` reads the
-/// GDT selectors (`Selectors::user_code()` / `kernel_code()`) to program STAR.
+/// Должен идти после `init_descriptor_tables`, потому что `syscall::init` читает
+/// селекторы GDT (`Selectors::user_code()` / `kernel_code()`) для программирования
+/// STAR.
 fn init_syscalls() {
     arch::x86_64::syscall::init();
     info!("syscalls");
 }
 
-/// Step 5: initialize the physical frame allocator from the Limine memmap.
+/// Шаг 5: инициализировать аллокатор физических кадров по memmap Limine.
 fn init_pmm() {
     match MEMMAP_REQUEST.response() {
         Some(memmap) => memory::pmm::init(memmap),
@@ -209,80 +211,80 @@ fn init_pmm() {
     info!("pmm");
 }
 
-/// Step 6: initialize the virtual memory manager over the HHDM.
+/// Шаг 6: инициализировать менеджер виртуальной памяти поверх HHDM.
 fn init_vmm() {
     let hhdm_offset = HHDM_OFFSET.load(Ordering::Relaxed);
     memory::vmm::init(hhdm_offset);
     info!("vmm");
 }
 
-/// Step 7: initialize the kernel heap / global allocator.
+/// Шаг 7: инициализировать кучу ядра / глобальный аллокатор.
 fn init_heap() {
     memory::heap::init();
     info!("heap");
 }
 
-/// Step 8: initialize the APIC and route the keyboard IRQ.
+/// Шаг 8: инициализировать APIC и направить IRQ клавиатуры.
 ///
-/// The APIC owns its own LAPIC/IOAPIC MMIO mapping (Requirement 7.4):
-/// `apic::init()` establishes those mappings internally via `vmm::map_mmio`
-/// before touching any registers, so no MMIO mapping happens inline here.
+/// APIC сам владеет маппингом MMIO LAPIC/IOAPIC (Requirement 7.4): `apic::init()`
+/// создаёт эти маппинги внутри себя через `vmm::map_mmio` до работы с регистрами,
+/// так что inline-маппинга MMIO здесь нет.
 fn init_apic() {
     arch::x86_64::apic::init();
 
-    // Route IRQ1 (keyboard) -> vector 33 and register its handler.
+    // Направить IRQ1 (клавиатура) -> вектор 33 и зарегистрировать обработчик.
     arch::x86_64::apic::route_irq(1, 33);
     arch::x86_64::apic::register_irq(33, drivers::ps2_kbd::irq_handler);
 
-    // Route IRQ12 (PS/2 mouse) -> vector 44 and register its handler. The
-    // mouse device itself is enabled later in `init_drivers` (after the
-    // framebuffer is up, so it knows the screen bounds); routing the IOAPIC
-    // redirection entry early is harmless because no packets stream until the
-    // device's data reporting is turned on.
+    // Направить IRQ12 (PS/2 мышь) -> вектор 44 и зарегистрировать обработчик.
+    // Само устройство включается позже в `init_drivers` (когда framebuffer уже
+    // поднят, чтобы знать границы экрана); ранняя настройка записи
+    // перенаправления IOAPIC безвредна, потому что пакеты не идут, пока
+    // устройство не начнёт сообщать данные.
     arch::x86_64::apic::route_irq(12, 44);
     arch::x86_64::apic::register_irq(44, drivers::ps2_mouse::irq_handler);
 
     info!("apic");
 }
 
-/// Step 9: initialize the device manager (PS/2 keyboard + framebuffer).
+/// Шаг 9: инициализировать device manager (PS/2 клавиатура + framebuffer).
 ///
-/// The framebuffer needs no MMIO mapping of its own: Limine maps the
-/// framebuffer into the higher half and hands us the already-mapped virtual
-/// address (`fb.address()`), so the driver uses that mapping directly.
+/// Framebuffer не нуждается в собственном маппинге MMIO: Limine отображает его
+/// в верхнюю половину и отдаёт уже замапленный виртуальный адрес
+/// (`fb.address()`), так что драйвер работает с этим маппингом напрямую.
 fn init_drivers() {
     drivers::init();
     info!("drivers");
 }
 
-/// Step 9.5: discover and attach virtio devices (PCI enumeration + drivers).
+/// Шаг 9.5: найти и подключить virtio-устройства (перечисление PCI + драйверы).
 ///
-/// Runs after `init_drivers` so the heap is up (PCI `enumerate()` allocates a
-/// `Vec`). Attaches the virtio-blk disk as a `BlockDevice` ("virtio-blk0"). If
-/// no virtio device of a given kind is present, the corresponding attach logs a
-/// warning and no-ops so boot is always preserved (R17.4).
+/// Идёт после `init_drivers`, чтобы heap был поднят (PCI `enumerate()`
+/// аллоцирует `Vec`). Подключает virtio-blk диск как `BlockDevice`
+/// ("virtio-blk0"). Если virtio-устройства нужного типа нет, соответствующий
+/// attach пишет предупреждение и ничего не делает, сохраняя загрузку (R17.4).
 ///
-/// Networking bring-up attaches the e1000 NIC here (`net::init`).
+/// Здесь же `net::init` подключает сетевую карту e1000.
 fn init_virtio() {
     let devs = drivers::pci::enumerate();
     drivers::virtio::blk::init_blk(&devs);
     info!("virtio");
 }
 
-/// Step 10: initialize the preemptive scheduler.
+/// Шаг 10: инициализировать вытесняющий планировщик.
 ///
-/// Also captures the wall-clock boot time for `/proc/stat`'s `btime` line: the
-/// CMOS RTC is readable before interrupts are enabled, and reading it here
-/// (rather than lazily in the renderer) makes `btime` the boot instant, as in
-/// Linux. A dead/pre-epoch RTC yields `0`, which the file prints verbatim and
-/// the contract documents as the honest gap (`docs/procfs.md` §4.8).
+/// Заодно фиксируется wall-clock время загрузки для строки `btime` в
+/// `/proc/stat`: CMOS RTC читается до включения прерываний, и чтение здесь
+/// (а не лениво в рендерере) делает `btime` моментом загрузки, как в Linux.
+/// Мёртвый/до-эпоховый RTC даёт `0`; файл печатает его дословно, а контракт
+/// документирует это как честный пробел (`docs/procfs.md` §4.8).
 fn init_scheduler() {
     task::scheduler::init();
     task::stat::set_boot_unix(arch::x86_64::linux::rtc::now_unix());
     info!("scheduler");
 }
 
-/// Step 11: initialize the virtual filesystem.
+/// Шаг 11: инициализировать виртуальную файловую систему.
 fn init_vfs() {
     debug!("About to call vfs::init()...");
     vfs::init();
@@ -290,13 +292,13 @@ fn init_vfs() {
     info!("vfs");
 }
 
-/// Step 11.35: bring up a USB host controller, if the machine has one.
+/// Шаг 11.35: поднять хост-контроллер USB, если он есть в машине.
 ///
-/// Runs after the PCI walk (which the virtio step already did) and before the
-/// filesystem, because a USB keyboard is an INPUT device: the sooner it is
-/// alive, the sooner a machine without PS/2 can be typed into. Failure is not
-/// fatal — no controller, or one that will not start, leaves the PS/2 path (and
-/// whatever the firmware translates into it) as the only input.
+/// Идёт после обхода PCI (его уже сделал virtio-шаг) и до файловой системы,
+/// потому что USB-клавиатура — INPUT-устройство: чем раньше она жива, тем
+/// раньше можно печатать на машине без PS/2. Сбой не фатален — нет контроллера
+/// или он не стартует — остаётся путь PS/2 (и то, что прошивка в него
+/// транслирует).
 fn init_usb() {
     let devices = crate::drivers::pci::enumerate();
     if crate::drivers::xhci::init(&devices) {
@@ -306,19 +308,19 @@ fn init_usb() {
     }
 }
 
-/// Step 11.4: register a boot-loaded disk image as a RAM disk.
+/// Шаг 11.4: зарегистрировать загруженный с загрузчика образ диска как RAM-диск.
 ///
-/// WHY: on real hardware the kernel can only mount a device it has a driver for
-/// (virtio-blk, NVMe), so a machine with only SATA — or one whose disk the
-/// operator does not want to hand over — came up with no `/mnt` at all. Limine
-/// can load files next to the kernel, so the system's disk image travels on the
-/// boot medium and is mounted from memory. The device is registered under the
-/// module's own file name (`disk.img` -> `ram0`), so `disk list` shows where the
-/// filesystem came from.
+/// Зачем: на реальном железе ядро может смонтировать только устройство, для
+/// которого есть драйвер (virtio-blk, NVMe), поэтому машина только с SATA — или
+/// та, чей диск оператор не хочет отдавать, — оставалась без `/mnt`. Limine
+/// умеет загружать файлы рядом с ядром, так что образ диска системы едет на
+/// загрузочном носителе и монтируется из памяти. Устройство регистрируется под
+/// именем самого модуля (`disk.img` -> `ram0`), чтобы `disk list` показывал,
+/// откуда взялась файловая система.
 ///
-/// Selection rule: the FIRST module whose name ends in `.img`. Deliberate and
-/// narrow — a module named `pagh.elf` or `notes.txt` is not a disk, and the boot
-/// configuration is the only writer of this list.
+/// Правило выбора: ПЕРВЫЙ модуль, имя которого оканчивается на `.img`.
+/// Намеренно и узко — модуль `pagh.elf` или `notes.txt` не диск, а список
+/// пишет только загрузочная конфигурация.
 fn init_ramdisk() {
     let Some(response) = MODULES_REQUEST.response() else {
         return;
@@ -356,36 +358,36 @@ fn init_ramdisk() {
     }
 }
 
-/// Step 11.5: bring the ext2 filesystem up on the real virtio-blk/NVMe disk and
-/// mount it at `/mnt` (Task 5.1, R5.6/R9.1/R9.2).
+/// Шаг 11.5: поднять ext2 на реальном диске virtio-blk/NVMe и смонтировать
+/// его в `/mnt` (R5.6/R9.1/R9.2).
 ///
-/// Ordering note: this runs *after* `init_vfs` (not inside `init_virtio`)
-/// because `vfs::mount_at` needs the VFS root to already exist. The block
-/// device itself was registered earlier in `init_virtio`; heap/pmm/vmm are all
-/// up, and interrupts are still disabled during boot init, so the format/mount
-/// disk I/O and allocations run on a single, non-preempted path.
+/// Порядок: идёт *после* `init_vfs` (а не внутри `init_virtio`), потому что
+/// `vfs::mount_at` требует уже существующий корень VFS. Само блочное
+/// устройство зарегистрировано раньше в `init_virtio`; heap/pmm/vmm подняты,
+/// прерывания во время boot-init ещё выключены, поэтому форматирование и
+/// монтирование, диск I/O и аллокации идут по одному непрерываемому пути.
 ///
-/// If no virtio-blk or NVMe device is present this logs a warning and continues
-/// booting (R17.4). On first boot the device is formatted, but **only when it is
-/// genuinely blank or carries the explicit opt-in marker**: the decision lives in
-/// [`crate::fs::format_policy`] and every other layout — a valid ext2 superblock,
-/// a partition table, or any other non-zero data — is refused by name (issue #33;
-/// on real hardware the machine's own SSD is exactly such a device, and the NVMe
-/// path takes the whole namespace, not a partition). After a successful mount a
-/// one-shot self-demo writes a file under `/mnt` and reads it back, proving the
-/// real-disk journaled write+read path end-to-end on a headless boot.
+/// Если нет ни virtio-blk, ни NVMe — предупреждение и загрузка продолжается
+/// (R17.4). При первой загрузке устройство форматируется, но **только если оно
+/// действительно пустое или несёт явный opt-in маркер**: решение живёт в
+/// [`crate::fs::format_policy`], а любой другой расклад — валидный ext2
+/// superblock, таблица разделов или любые ненулевые данные — отвергается по
+/// имени (issue #33; на реальном железе SSD самой машины — как раз такое
+/// устройство, а NVMe-путь берёт всё пространство имён, не раздел). После
+/// успешного монтирования одноразовый self-demo пишет файл в `/mnt` и читает
+/// его обратно, доказывая журналируемый путь записи+чтения на реальном диске
+/// при headless-загрузке.
 fn init_fs() {
     use crate::fs::ext2::Ext2Fs;
     use crate::fs::format_policy::{format_allowed, Refusal};
 
-    // Attach NVMe before the partition walk: on a real machine that disk is the
-    // one with a partition table, and a partition holding an ext2 filesystem has
-    // to be visible before the RAM-disk fallback is chosen.
-    //
-    // This path used to run only when there was no RAM disk, which under BIOS
-    // meant it never ran at all — and it turned out to be broken there (see
-    // `nvme::bar0_mmio`: a BAR reading back all ones was mapped as if it were a
-    // device). It is exercised now, so it is validated now.
+    // Подключить NVMe до обхода разделов: на реальной машине это тот диск,
+    // что несёт таблицу разделов, и раздел с ext2 должен быть виден до выбора
+    // fallback на RAM-диск.
+    // Раньше этот путь выполнялся только при отсутствии RAM-диска, что под BIOS
+    // означало, что он не выполнялся вообще — и оказалось, что там он сломан
+    // (см. `nvme::bar0_mmio`: BAR, читающийся как все единицы, мапился как
+    // устройство). Теперь он используется, поэтому и проверяется.
     {
         let devices = crate::drivers::pci::enumerate();
         if let Ok(true) = crate::drivers::nvme::attach(&devices) {
@@ -394,12 +396,12 @@ fn init_fs() {
         }
     }
 
-    // Partitions, for every whole device registered so far: on a real machine the
-    // disk carries a partition table and pagh must be able to use ONE partition
-    // without touching the rest (see `drivers::partition`).
+    // Разделы для каждого зарегистрированного целого устройства: на реальной
+    // машине диск несёт таблицу разделов, и pagh должен уметь использовать ОДИН
+    // раздел, не трогая остальные (см. `drivers::partition`).
     for (name, _sectors) in drivers::list_blocks() {
         if let Some(dev) = drivers::get_block(&name) {
-            // Whole devices only: partitions themselves are never re-parsed.
+            // Только целые устройства: сами разделы никогда не разбираются повторно.
             let is_partition = match name.rfind('p') {
                 Some(pos) => {
                     !name[pos + 1..].is_empty()
@@ -413,24 +415,24 @@ fn init_fs() {
         }
     }
 
-    // The operator looks at the list before the kernel decides anything. This is
-    // the ONLY place a partition may be formatted or a foreign filesystem taken
-    // over: the kernel cannot tell a partition meant for pagh from one that
-    // merely looks empty, and guessing wrong costs data. The menu times out into
-    // the non-destructive default, so an unattended boot is unchanged.
-    //
-    // Classify once and hand the same list to the menu: what the operator sees
-    // must be exactly what the boot path acts on. A skipped menu then reuses it,
-    // so no partition is probed twice on the same boot.
+    // Оператор смотрит список до того, как ядро что-то решит. Это ЕДИНСТВЕННОЕ
+    // место, где раздел может быть отформатирован или чужая файловая система
+    // занята: ядро не отличит раздел, предназначенный pagh, от просто пустого,
+    // а ошибка стоит данных. Меню истекает в неразрушающий вариант по
+    // умолчанию, так что загрузка без оператора не меняется.
+    // Классифицировать один раз и передать тот же список меню: то, что видит
+    // оператор, должно быть ровно тем, с чем работает boot-путь. Пропущенное
+    // меню затем переиспользует его, и ни один раздел не проверяется дважды за
+    // загрузку.
     let partitions = drivers::partition::candidates();
     let menu = crate::boot_menu::run(&partitions);
 
-    // SAFETY-CRITICAL, and the reason nothing below formats on its own: absent a
-    // menu choice, the boot path only ever MOUNTS a volume that already carries
-    // pagh's own journal marker. A structurally valid ext2/ext4 filesystem
-    // belonging to somebody else is somebody's Linux system — mounting it rewrites
-    // group descriptors and reserves WAL blocks inside it, and formatting it would
-    // be worse. Those partitions are listed in the menu and left alone here.
+    // SAFETY-CRITICAL, и поэтому ниже ничего не форматирует само по себе: без
+    // выбора в меню boot-путь только МОНТИРУЕТ том, который уже несёт
+    // собственный журнальный маркер pagh. Структурно валидная ext2/ext4 чужая
+    // файловая система — это чья-то Linux-система: её монтирование перепишет
+    // group descriptors и зарезервирует WAL-блоки внутри, а форматирование
+    // будет ещё хуже. Такие разделы перечислены в меню и не трогаются здесь.
     for (dev, content) in &partitions {
         if matches!(content, drivers::partition::PartitionContent::ForeignExt2) {
             warn!(
@@ -440,10 +442,10 @@ fn init_fs() {
         }
     }
 
-    // Storage priority: what the operator picked, else the volume pagh itself
-    // formatted on the attached disk, else a disk image from the boot medium
-    // (the system carried along on the stick), else virtio-blk (QEMU/dev images),
-    // else NVMe.
+    // Приоритет носителей: выбор оператора, иначе том, который pagh сам
+    // отформатировал на подключённом диске, иначе образ диска с загрузочного
+    // носителя (система, приехавшая на флешке), иначе virtio-blk (QEMU/dev
+    // образы), иначе NVMe.
     let mut blk = match &menu {
         crate::boot_menu::Choice::Mount(dev) => {
             info!("fs: operator chose to mount {}", dev.name());
@@ -487,13 +489,13 @@ fn init_fs() {
         }
     };
 
-    // Format only what a human explicitly asked to format, in the menu, after
-    // typing the device name. Everything else here mounts or refuses.
-    //
-    // This used to key on `fs::format_policy` alone, which meant a blank partition
-    // the boot path happened to select was formatted without asking. It is not
-    // selected any more unless the operator chose it (menu) or it is the RAM disk
-    // (a scratch volume that disappears at power-off) — see below.
+    // Форматировать только то, что человек явно попросил отформатировать в
+    // меню, набрав имя устройства. Всё остальное здесь монтируется или
+    // отвергается.
+    // Раньше это опиралось только на `fs::format_policy`, и пустой раздел,
+    // выбранный boot-путём, форматировался без вопроса. Теперь он не
+    // выбирается, если оператор не выбрал его (меню) или это RAM-диск
+    // (черновой том, исчезающий при выключении) — см. ниже.
     let root = match menu {
         crate::boot_menu::Choice::Format(_) => {
             warn!(
@@ -512,9 +514,10 @@ fn init_fs() {
                 }
             }
         }
-        // An explicit "mount this" is NEVER silently upgraded to "format this":
-        // erasing a volume is not a recovery step, and the operator who picked the
-        // row did not ask for it. The message says how to get there on purpose.
+        // Явное «смонтировать это» НИКОГДА молча не превращается в
+        // «отформатировать это»: стирание тома не шаг восстановления, и
+        // оператор, выбравший строку, не просил об этом. Сообщение намеренно
+        // говорит, как этого добиться.
         crate::boot_menu::Choice::Mount(_) => match Ext2Fs::mount(blk.clone()) {
             Ok(root) => root,
             Err(e) => {
@@ -531,14 +534,15 @@ fn init_fs() {
             Ok(root) => root,
             Err(first_error) => {
                 let has_superblock = Ext2Fs::has_valid_superblock(&*blk);
-                // The probe runs only here: a failed mount is the sole situation in
-                // which erasing the device is even on the table, so the happy path
-                // pays nothing for it.
+                // Проверка выполняется только здесь: неудачное монтирование —
+                // единственная ситуация, когда стирание устройства вообще
+                // рассматривается, так что счастливый путь за неё не платит.
                 let probe = crate::fs::device::probe_boot_area(&*blk);
-                // The one way to authorise formatting a device that is not blank: an
-                // operator deliberately wrote `format_policy::OPT_IN_MARKER` into
-                // sector 0. Nothing else — no bootloader flag, no config file — can
-                // turn this on, and the marker cannot appear by accident.
+                // Единственный способ разрешить форматирование непустого
+                // устройства: оператор намеренно записал
+                // `format_policy::OPT_IN_MARKER` в сектор 0. Ничто другое — ни
+                // флаг загрузчика, ни конфиг — не включает это, и маркер не
+                // может появиться случайно.
                 let allow_destructive = probe.is_marked();
                 if allow_destructive {
                     warn!(
@@ -567,8 +571,8 @@ fn init_fs() {
                     }
                     Err(refusal) => {
                         match refusal {
-                            // Wording kept byte-identical: it is the historical
-                            // refusal line and the docs quote it.
+                            // Формулировка сохранена байт-в-байт: это историческая
+                            // строка отказа, и документация её цитирует.
                             Refusal::ExistingFilesystem => error!(
                                 "fs: existing ext2 mount failed: {:?}; refusing destructive reformat",
                                 first_error
@@ -580,9 +584,9 @@ fn init_fs() {
                                 first_error
                             ),
                         }
-                        // No in-guest route forward exists (there is no `mkfs` in the
-                        // shell), so name the operator's options instead of leaving
-                        // the refusal as the last word on the serial line.
+                        // Пути вперёд внутри гостя нет (в shell нет `mkfs`),
+                        // поэтому назовите варианты оператора вместо того,
+                        // чтобы оставлять отказ последним словом в serial-строке.
                         error!(
                             "fs: {} left untouched; reboot and use the disk menu (F + the typed \
                              device name), or run `disk setup` at the shell to format it \
@@ -609,29 +613,29 @@ fn init_fs() {
     info!("fs");
 }
 
-/// How far into a device [`probe_boot_area`] looks: 1 MiB.
+/// Насколько глубоко [`probe_boot_area`] смотрит в устройство: 1 MiB.
 ///
-/// Enough for a GPT/MBR partition table, an ext2 superblock, and the boot-sector
-/// or superblock-at-offset-0 layouts of every filesystem a user is likely to have
-/// (NTFS, XFS, LUKS, ZFS, ext4-in-a-partition). btrfs keeps its superblock at
-/// 64 KiB — inside the window as well.
+/// Достаточно для таблицы разделов GPT/MBR, ext2 superblock и layouts
+/// boot-сектора или superblock-по-смещению-0 любой ФС, которая может быть у
+/// пользователя (NTFS, XFS, LUKS, ZFS, ext4-в-разделе). btrfs держит superblock
+/// на 64 KiB — тоже внутри окна.
 ///
-/// **The window is a real limitation, not a formality**: a layout that keeps
-/// everything outside the first MiB — a `mkswap` signature at the tail of the
-/// device, mdadm 1.0 superblocks, IMSM/DDF external RAID metadata, or a device
-/// whose start was zeroed by an interrupted `wipefs`/`dd` — probes as `Blank`
-/// and is formatted. Bounding the probe is what keeps boot from reading a whole
-/// SSD; the cost is that "blank" means "blank in the first MiB".
+/// **Окно — реальное ограничение, а не формальность**: расклад, у которого всё
+/// лежит за первым MiB (сигнатура `mkswap` в хвосте устройства, superblock
+/// mdadm 1.0, внешние RAID-метаданные IMSM/DDF или устройство, начало которого
+/// занулили прерванные `wipefs`/`dd`), проверяется как `Blank` и
+/// форматируется. Ограничение проверки — то, что не даёт загрузке читать весь
+/// SSD; цена — «пустой» означает «пустой в первом MiB».
 const PROBE_LIMIT: u64 = 1024 * 1024;
 
-/// Step 11.6: bring up networking (Task 6). Enumerates PCI, attaches the
-/// e1000 NIC, builds the own TCP/IP stack state, and enables the UDP echo
-/// service on port 7. Address acquisition (DHCP, static fallback) and packet
-/// servicing run in the net thread spawned from `kernel_main` once interrupts
-/// are enabled and the LAPIC tick is advancing the network clock.
+/// Шаг 11.6: поднять сеть. Перечисляет PCI, подключает NIC e1000, строит
+/// состояние собственного TCP/IP-стека и включает UDP echo-сервис на порту 7.
+/// Получение адреса (DHCP, статический fallback) и обслуживание пакетов идут в
+/// net-потоке, который спавнится из `kernel_main` после включения прерываний и
+/// запуска тика LAPIC, двигающего сетевые часы.
 ///
-/// If no virtio-net device is present this logs a warning and continues booting
-/// (R17.3). Networking is fully optional — boot is always preserved.
+/// Если virtio-net нет — предупреждение в лог и загрузка продолжается (R17.3).
+/// Сеть полностью опциональна — загрузка всегда сохраняется.
 fn init_net() {
     match net::init() {
         Ok(()) => {
@@ -646,10 +650,11 @@ fn init_net() {
     }
 }
 
-/// One-shot boot self-demo (Task 5.5): exercise the real-disk journaled write
-/// and read-back path so a headless boot proves it works end-to-end. Writes a
-/// known string to `/mnt/bootdemo.txt`, then re-reads it through a fresh VFS
-/// lookup and logs PASS/FAIL. Non-fatal: any error is logged and boot proceeds.
+/// Одноразовый boot self-demo: прогнать журналируемую запись и чтение с
+/// реального диска, чтобы headless-загрузка доказала, что путь работает
+/// end-to-end. Пишет известную строку в `/mnt/bootdemo.txt`, затем перечитывает
+/// её через свежий VFS-lookup и логирует PASS/FAIL. Не фатально: любая ошибка
+/// логируется, загрузка продолжается.
 fn fs_boot_demo() {
     use crate::vfs::{self, VfsError};
 
@@ -663,15 +668,15 @@ fn fs_boot_demo() {
         }
     };
 
-    // Create or open the demo file (tolerate it already existing from a prior
-    // boot, since the disk image persists across runs).
+    // Создать или открыть demo-файл (терпеть его существование с прошлой
+    // загрузки, так как образ диска переживает запуски).
     let file = match dir.create_file("bootdemo.txt") {
         Ok(f) => f,
         Err(VfsError::AlreadyExists) => match dir.lookup("bootdemo.txt") {
             Ok(f) => {
-                // The disk persists across boots; a shorter demo string must not
-                // leave the previous run's tail in place (write(2) does not
-                // truncate, exactly like POSIX).
+                // Диск переживает загрузки; более короткая demo-строка не должна
+                // оставлять хвост прошлого запуска (write(2) не обрезает файл,
+                // совсем как POSIX).
                 let _ = f.truncate(0);
                 f
             }
@@ -699,7 +704,7 @@ fn fs_boot_demo() {
     }
     dir.sync();
 
-    // Read back through a fresh lookup to avoid any cached node state.
+    // Перечитать через свежий lookup, чтобы не зависеть от кэшированного состояния узла.
     let rfile = match vfs::lookup_path("/mnt/bootdemo.txt") {
         Ok(f) => f,
         Err(e) => {
@@ -722,58 +727,57 @@ fn fs_boot_demo() {
     }
 }
 
-/// Run phase: spawn the shell thread, enable interrupts, and become the idle
-/// loop.
+/// Run-фаза: запустить поток shell, включить прерывания и стать idle-циклом.
 ///
-/// The old ~5M-cycle busy-spin debug block (used only to observe timer IRQs
-/// during bringup) is removed per Requirement 1.5.
+/// Старый отладочный блок busy-spin на ~5M циклов (наблюдение IRQ таймера при
+/// bringup) удалён согласно Requirement 1.5.
 fn kernel_main() -> ! {
-    // Entropy capability probe (issue #16). `AT_RANDOM` cannot fail closed —
-    // glibc reads it unconditionally at process start — so without RDSEED/RDRAND
-    // it derives from the mixed boot seed instead of the old predictable
-    // xorshift; this line is what tells the operator the fallback is in use
-    // BEFORE the first process starts. No-op (no log line) with hardware entropy.
+    // Проба энтропии (issue #16). `AT_RANDOM` не может fail closed — glibc
+    // читает его безусловно при старте процесса, — поэтому без RDSEED/RDRAND
+    // значение выводится из смешанного boot-seed, а не из старого
+    // предсказуемого xorshift; эта строка сообщает оператору об использовании
+    // fallback ДО старта первого процесса. С аппаратной энтропией — no-op (без
+    // строки лога).
     crate::security::entropy::report_capabilities();
 
     debug!("Spawning shell thread...");
     task::scheduler::kernel_thread_spawn_named(shell_thread, "shell");
     debug!("Shell thread spawned (PID should be 1)");
 
-    // Spawn the networking poll thread (Task 6, R13.4). It must start once
-    // scheduling is running and interrupts are enabled (below), because the
-    // The stack clock advances off the LAPIC timer tick and DHCP/echo servicing
-    // relies on the periodic poll. If no NIC was attached, `net::poll` is a
-    // cheap no-op, so spawning unconditionally is harmless.
+    // Спавнить поток опроса сети (R13.4). Он должен стартовать, когда
+    // планировщик уже работает, а прерывания включены (ниже), потому что часы
+    // стека двигаются от тика LAPIC и обслуживание DHCP/echo опирается на
+    // периодический poll. Если NIC не подключён, `net::poll` — дешёвый no-op,
+    // так что безусловный spawn безвреден.
     task::scheduler::kernel_thread_spawn_named(net::net_thread, "net");
 
-    // USB poll thread: enumerates newly attached devices and collects HID
-    // reports. Spawned unconditionally — with no controller `xhci::poll` is a
-    // no-op, and gating it would need a second source of truth about the
-    // hardware that the controller itself already provides.
+    // Поток опроса USB: перечисляет новые устройства и собирает HID-отчёты.
+    // Спавнится безусловно — без контроллера `xhci::poll` это no-op, а условие
+    // потребовало бы второго источника истины об оборудовании, которое уже
+    // предоставляет сам контроллер.
     task::scheduler::kernel_thread_spawn_named(crate::drivers::xhci::usb_thread, "usb");
 
-    // Log mirror: drains the in-memory ring into /mnt/pagh-log.txt. A kernel
-    // thread rather than an inline write, because the logger also runs in
-    // interrupt and panic contexts, where touching the filesystem would deadlock.
+    // Зеркало логов: сливает in-memory ring в /mnt/pagh-log.txt. Отдельный поток
+    // ядра, а не inline-запись, потому что logger также работает в контексте
+    // прерываний и паники, где обращение к файловой системе приведёт к дедлоку.
     task::scheduler::kernel_thread_spawn_named(crate::logfile::flush_thread, "logd");
     debug!("Net thread spawned");
 
-    // Spawn the embedded ring-3 test user process (Requirements 13.1 / 13.4).
-    //
-    // This MUST happen while interrupts are still disabled: `create_user_process`
-    // briefly installs the user CR3 to populate the user address space, and a
-    // timer tick in that window would let the scheduler observe the foreign CR3.
-    // It also programs TSS RSP0 for the ring-3 → ring-0 transition.
-    //
-    // The process performs a `SYS_WRITE` (observable on serial) then `SYS_EXIT`,
-    // dropping itself from the scheduler rotation; the shell thread continues to
-    // run and the prompt stays interactive.
-    //
-    // Skipped when the `lx_selftest` feature is on: that harness launches its own
-    // ring-3 `Compat_Process`, and the kernel's TSS `RSP0` is single-task (see
-    // `gdt::set_kernel_stack`), so running two ring-3 processes at once would share
-    // one kernel stack. Under the feature the compat process is the sole ring-3
-    // task, so it can run its `write`/`exit_group` cleanly and be observed.
+    // Спавнить встроенный ring-3 тестовый пользовательский процесс
+    // (Requirements 13.1 / 13.4).
+    // Это ДОЛЖНО происходить, пока прерывания ещё выключены:
+    // `create_user_process` ненадолго ставит пользовательский CR3, чтобы
+    // заполнить адресное пространство, и тик таймера в этом окне дал бы
+    // планировщику увидеть чужой CR3. Здесь же программируется TSS RSP0 для
+    // перехода ring-3 → ring-0.
+    // Процесс делает `SYS_WRITE` (видно на serial), затем `SYS_EXIT`, убирая
+    // себя из ротации планировщика; поток shell продолжает работать, и промпт
+    // остаётся интерактивным.
+    // Пропускается при включённой фиче `lx_selftest`: этот стенд запускает
+    // собственный ring-3 `Compat_Process`, а TSS `RSP0` ядра — одно-задачный
+    // (см. `gdt::set_kernel_stack`), поэтому два ring-3 процесса делили бы
+    // один стек ядра. Под фичей compat-процесс — единственная ring-3 задача,
+    // и его `write`/`exit_group` чисто наблюдаются.
     #[cfg(not(any(
         feature = "lx_selftest",
         feature = "lx_livetest",
@@ -785,84 +789,85 @@ fn kernel_main() -> ! {
         Err(e) => error!("user test process failed: {}", e),
     }
 
-    // Linux-compat boot-time self-test (cargo feature `lx_selftest`). Runs here —
-    // after ext2 mount and networking init, while interrupts are still disabled —
-    // so it can enqueue a Compat_Process like the native test process above and so
-    // the `fetch_no_network` check observes the no-interface-address state before
-    // DHCP runs. Compiled out entirely when the feature is off (default).
+    // Boot-time self-test Linux-совместимости (cargo feature `lx_selftest`).
+    // Идёт здесь — после монтирования ext2 и init сети, пока прерывания ещё
+    // выключены, — чтобы поставить в очередь Compat_Process, как нативный
+    // тестовый процесс выше, и чтобы проверка `fetch_no_network` увидела
+    // состояние «нет адреса интерфейса» до DHCP. Полностью компилируется вне
+    // сборки при выключенной фиче (по умолчанию).
     #[cfg(feature = "lx_selftest")]
     crate::selftest_lx::run();
 
-    // Post-network checks on a single thread so they run *sequentially* and do
-    // not contend for the network pump. The local-mirror `apt` end-to-end test
-    // runs FIRST (fast, against the QEMU host gateway), then the external HTTPS
-    // smoke test (which may be slow/unreachable depending on the environment and
-    // would otherwise monopolize the pump). Compiled out when the feature is off.
+    // Пост-сетевые проверки в одном потоке, чтобы идти *последовательно* и не
+    // конкурировать за сетевой насос. Локальный end-to-end `apt`-тест
+    // запускается ПЕРВЫМ (быстро, против gateway хоста QEMU), затем внешний
+    // HTTPS smoke (может быть медленным/недоступным и иначе монополизировал бы
+    // насос). Компилируется вне сборки при выключенной фиче.
     #[cfg(feature = "lx_selftest")]
     task::scheduler::kernel_thread_spawn_named(
         crate::selftest_lx::run_post_net_checks,
         "lx-selftest",
     );
 
-    // Live full-update integration check (cargo feature `lx_livetest`, spec task
-    // 11.1). Spawned on its own thread so it runs after interrupts/DHCP are up.
-    // Separate from `lx_selftest`: it talks to the live `deb.debian.org` mirror
-    // (default HTTPS config, NOT the local mini-repo). Mutually exclusive in
-    // practice — if both features are set, the local selftest harness wins and
-    // the live check is skipped to avoid two ring-3 processes contending for the
-    // single-task kernel stack. Compiled out when the feature is off (default).
+    // Живая проверка полного обновления (cargo feature `lx_livetest`).
+    // Спавнится отдельным потоком, чтобы идти после поднятия прерываний/DHCP.
+    // Отделён от `lx_selftest`: он ходит на живое зеркало `deb.debian.org`
+    // (конфиг HTTPS по умолчанию, НЕ локальный mini-repo). На практике
+    // взаимоисключающи: если включены обе фичи, побеждает локальный selftest,
+    // а live-проверка пропускается, чтобы два ring-3 процесса не делили
+    // одно-задачный стек ядра. Компилируется вне сборки при выключенной фиче.
     #[cfg(all(feature = "lx_livetest", not(feature = "lx_selftest")))]
     task::scheduler::kernel_thread_spawn_named(
         crate::selftest_lx::run_live_update_check,
         "lx-live",
     );
 
-    // DIAGNOSTIC (Part B): apt-update parse-stage crash repro over the LOCAL big
-    // index (cargo feature `lx_bigindex`). Spawned on its own thread so it runs
-    // after interrupts/DHCP are up. Points apt at `http://10.0.2.2:8000` (the
-    // `tools/mini_repo.py bigindex` mirror) and drives `apt::update()` (or, with
-    // `lx_bigindex_inram`, the in-RAM Test-A variant). Compiled out when the
-    // feature is off (default).
+    // ДИАГНОСТИКА (Part B): воспроизведение краша на стадии разбора apt-update
+    // на ЛОКАЛЬНОМ большом индексе (cargo feature `lx_bigindex`). Спавнится
+    // отдельным потоком после включения прерываний/DHCP. Направляет apt на
+    // `http://10.0.2.2:8000` (`tools/mini_repo.py bigindex`) и гоняет
+    // `apt::update()` (или, с `lx_bigindex_inram`, in-RAM вариант Test-A).
+    // Компилируется вне сборки при выключенной фиче.
     #[cfg(feature = "lx_bigindex")]
     task::scheduler::kernel_thread_spawn_named(
         crate::selftest_lx::run_bigindex_check,
         "lx-bigindex",
     );
 
-    // Large-stream HTTPS regression (cargo feature `lx_tlsbig`, issue #19).
-    // One multi-MB authenticated `https_get` against the live mirror's full
-    // `Packages.gz`, isolating the TLS transport from the index pipeline.
-    // Skipped when a broader harness is also enabled, so exactly one live
-    // external download runs per boot (and no two ring-3 processes share the
-    // single-task kernel stack).
+    // Регрессия большого HTTPS-потока (cargo feature `lx_tlsbig`, issue #19).
+    // Один многомегабайтный аутентифицированный `https_get` к полному
+    // `Packages.gz` живого зеркала, изолирующий TLS-транспорт от конвейера
+    // индексов. Пропускается, когда включён более широкий стенд, чтобы за
+    // загрузку шла ровно одна живая внешняя загрузка (и никакие два ring-3
+    // процесса не делили одно-задачный стек ядра).
     #[cfg(all(
         feature = "lx_tlsbig",
         not(any(feature = "lx_selftest", feature = "lx_livetest"))
     ))]
     task::scheduler::kernel_thread_spawn_named(crate::selftest_lx::run_tls_big_check, "lx-tlsbig");
 
-    // The first-boot base userland (glibc + python3)
-    // download is opt-in now. shell_thread asks Y/n on the console first and
-    // spawns crate::provision::ensure_base_packages_thread only on consent.
+    // Первая загрузка базового userland (glibc + python3) теперь opt-in.
+    // shell_thread спрашивает Y/n в консоли и запускает
+    // crate::provision::ensure_base_packages_thread только с согласия.
 
     arch::cpu::enable_interrupts();
     info!("interrupts enabled");
 
-    // Main thread becomes the idle loop.
+    // Главный поток становится idle-циклом.
     arch::cpu::halt_loop()
 }
 
-/// The shell kernel thread: let the scheduler stabilize, then run the shell.
+/// Поток ядра shell: дать планировщику стабилизироваться, затем запустить shell.
 fn shell_thread() {
-    // Give scheduler time to stabilize.
+    // Дать планировщику время стабилизироваться.
     for _ in 0..1_000_000 {
         core::hint::spin_loop();
     }
 
-    // The first boot no longer stops to ask about downloading python3: a fresh
-    // disk gets the file skeleton from `provision::seed()`, and the glibc/python
-    // userland is installed on demand from the shell (`apt update` +
-    // `apt install python3`). A boot-time question blocked the shell on a console
-    // prompt with no default timeout, which is not something boot may do.
+    // Первая загрузка больше не останавливается на вопросе о загрузке python3:
+    // свежий диск получает файловый скелет из `provision::seed()`, а userland
+    // glibc/python ставится по требованию из shell (`apt update` +
+    // `apt install python3`). Вопрос на загрузке блокировал shell в консольном
+    // промпте без таймаута — загрузка так делать не должна.
     shell::shell_main();
 }

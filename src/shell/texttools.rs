@@ -1,34 +1,34 @@
-// shell/texttools.rs — the pure streaming core of `head`, `tail`, `wc`, `grep`
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// shell/texttools.rs — чистое потоковое ядро `head`, `tail`, `wc`, `grep`
+// 64-битное ядро ОС x86_64 на Rust (#![no_std])
 //
-// `commands::cmd_cat` dumps a whole file; these four commands answer the
-// questions a reader actually has about a file that does not fit on the screen:
-// what is at the top, what is at the bottom, how big is it, and which lines
-// contain this text. All four are the same walk over the file's bytes, so the
-// walk lives here once and the handlers below are thin VFS + console glue,
-// exactly like `cat` (`shell/cat.rs`).
+// `commands::cmd_cat` вываливает файл целиком; эти четыре команды отвечают на
+// вопросы, которые у читателя действительно есть о файле, не влезающем на экран:
+// что в начале, что в конце, насколько он велик и какие строки содержат этот
+// текст. Все четыре — один и тот же обход байтов файла, поэтому обход живёт
+// здесь один раз, а обработчики ниже — тонкий клей VFS + консоли, совсем как
+// `cat` (`shell/cat.rs`).
 //
-// The walk is streaming on purpose: a file is read in 256-byte chunks, so
-// `head -n 1` on a 3 GiB log costs one chunk, not 3 GiB of kernel heap. `tail`
-// keeps only the last N lines in a ring, `wc` keeps counters, and `grep` keeps
-// nothing. Every path is capped at [`MAX_BYTES`] so a synthetic endless device
-// (`/dev/serial`) cannot spin a shell command forever.
+// Обход намеренно потоковый: файл читается чанками по 256 байт, так что
+// `head -n 1` на логе в 3 GiB стоит одного чанка, а не 3 GiB кучи ядра. `tail`
+// держит только последние N строк в ring, `wc` — счётчики, `grep` — ничего.
+// Каждый путь ограничен [`MAX_BYTES`], чтобы синтетическое бесконечное устройство
+// (`/dev/serial`) не могло крутить команду shell вечно.
 //
-// Line model (the same one POSIX text tools assume):
-//   * a line ends at `\n`;
-//   * a final run of bytes that is not newline-terminated is the last line;
-//   * a file that ends with `\n` has no extra empty line after it;
-//   * an empty file has no lines at all.
-// `wc -l` counts newline characters (like Linux), so it agrees with this model
-// for newline-terminated files and reports one less for a final partial line —
-// which is exactly what `wc` means by "lines".
+// Модель строк (та же, что предполагают POSIX text tools):
+//   * строка кончается на `\n`;
+//   * финальный хвост байтов без newline — последняя строка;
+//   * файл, кончающийся `\n`, не имеет лишней пустой строки после;
+//   * пустой файл не имеет строк вообще.
+// `wc -l` считает символы newline (как Linux), поэтому сходится с этой моделью
+// для newline-терминированных файлов и сообщает на один меньше для финальной
+// неполной строки — ровно то, что `wc` понимает под «строками».
 //
-// `head`/`tail` terminate every printed line with `\n`, including a final line
-// the file left unterminated. That is one deliberate difference from GNU
-// coreutils (which copies the last line raw): the shell prints the next prompt
-// immediately after the command, so an unterminated last line would glue
-// `pagh:/>` onto the file's text and corrupt any transcript an E2E script or a
-// human reads — the same reasoning as `cat`'s transcript terminator.
+// `head`/`tail` завершают каждую напечатанную строку `\n`, включая финальную
+// строку, оставленную файлом без терминатора. Это осознанное отличие от GNU
+// coreutils (который копирует последнюю строку сырой): shell печатает следующий
+// промпт сразу после команды, так что незавершённая последняя строка приклеила
+// бы `pagh:/>` к тексту файла и испортила бы транскрипт, который читает
+// E2E-скрипт или человек — та же логика, что у терминатора вывода `cat`.
 
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -38,34 +38,34 @@ use alloc::vec::Vec;
 use super::commands::{resolve_arg, shell_print_bytes, shell_println};
 use super::registry::ShellCtx;
 
-/// Byte cap for one command: enough for any real text file on this system,
-/// small enough that an endless device cannot wedge the shell.
+/// Кап байт на одну команду: достаточно для любого реального текстового файла
+/// в этой системе и мало настолько, чтобы бесконечное устройство не заклинило shell.
 pub(crate) const MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Read request size. Small on purpose: the streaming tools should not need a
-/// 4 KiB stack buffer for what `head -n 3` usually needs 20 bytes of.
+/// Размер запроса на чтение. Мал намеренно: потоковым инструментам не нужен
+/// 4-KiB стек-буфер для того, чему `head -n 3` обычно требует 20 байт.
 const CHUNK: usize = 256;
 
-/// What one walk did. `bytes` is how much of the file was consumed (the whole
-/// file unless a caller stopped early or hit [`MAX_BYTES`]).
+/// Что сделал один обход. `bytes` — сколько файла потреблено (весь файл, если
+/// вызывающий не остановил раньше или не упёрся в [`MAX_BYTES`]).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Walked {
     pub bytes: u64,
-    /// Lines seen, where `newline_terminated` counts only lines that ended in
-    /// `\n` (the `wc -l` meaning).
+    /// Виденные строки, где `newline_terminated` считает только строки,
+    /// окончившиеся `\n` (смысл `wc -l`).
     pub lines: u64,
     pub newline_terminated: u64,
     pub read_failed: bool,
-    /// The walk stopped because `on_line` asked it to, not at EOF/cap.
+    /// Обход остановился, потому что `on_line` попросил, а не на EOF/капе.
     pub stopped_early: bool,
 }
 
-/// Walk a file line by line.
+/// Обойти файл построчно.
 ///
-/// `read(offset, buf)` places at most `buf.len()` bytes at `buf` and returns
-/// the count (`Ok(0)` is EOF) or `Err(())`. `on_line` receives the 1-based line
-/// number, whether the line was newline-terminated, and the line's bytes (the
-/// terminator is not part of the slice); it returns `false` to stop the walk.
+/// `read(offset, buf)` кладёт не более `buf.len()` байт в `buf` и возвращает
+/// количество (`Ok(0)` — EOF) или `Err(())`. `on_line` получает номер строки с 1,
+/// была ли она newline-терминирована, и байты строки (терминатор не входит в
+/// срез); возврат `false` останавливает обход.
 pub(crate) fn walk<R, F>(mut read: R, mut on_line: F) -> Walked
 where
     R: FnMut(u64, &mut [u8]) -> Result<usize, ()>,
@@ -104,7 +104,7 @@ where
             }
         }
     }
-    // The unterminated tail is still a line (unless it is empty).
+    // Не–терминированный хвост всё равно строка (если он не пустой).
     if !line.is_empty() {
         out.lines += 1;
         let _ = on_line(out.lines, false, &line);
@@ -112,14 +112,14 @@ where
     out
 }
 
-/// Write one line, always newline-terminated, so a file whose last line has no
-/// terminator still leaves the next prompt on its own row.
+/// Написать одну строку, всегда с завершающим newline, чтобы файл, чья последняя
+/// строка без терминатора, всё равно оставил следующий промпт на своей строке.
 fn emit<W: FnMut(&[u8])>(write: &mut W, line: &[u8]) {
     write(line);
     write(b"\n");
 }
 
-/// First `limit` lines of a file.
+/// Первые `limit` строк файла.
 pub(crate) fn head<R, W>(limit: usize, read: R, mut write: W) -> Walked
 where
     R: FnMut(u64, &mut [u8]) -> Result<usize, ()>,
@@ -134,11 +134,11 @@ where
     })
 }
 
-/// Last `limit` lines of a file.
+/// Последние `limit` строк файла.
 ///
-/// The ring holds `limit` lines; a line longer than the whole file is still
-/// copied once, so memory is bounded by the file's size and the line count, not
-/// by the file's length in lines.
+/// Ring держит `limit` строк; строка длиннее всего файла всё равно копируется
+/// один раз, так что память ограничена размером файла и числом строк, а не
+/// длиной файла в строках.
 pub(crate) fn tail<R, W>(limit: usize, read: R, mut write: W) -> Walked
 where
     R: FnMut(u64, &mut [u8]) -> Result<usize, ()>,
@@ -160,7 +160,7 @@ where
     walked
 }
 
-/// `wc` counters, in the order Linux prints them.
+/// Счётчики `wc` в порядке, в котором их печатает Linux.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Counts {
     pub lines: u64,
@@ -169,10 +169,10 @@ pub(crate) struct Counts {
     pub read_failed: bool,
 }
 
-/// Count lines, whitespace-separated words and bytes.
+/// Считать строки, слова через пробелы и байты.
 ///
-/// Words are the same runs Linux `wc` counts: maximal runs of non-whitespace,
-/// where whitespace is the C `isspace` set (`space, \t, \n, \v, \f, \r`).
+/// Слова — те же пробеги, что считает Linux `wc`: максимальные пробеги
+/// непробельных символов, где пробел — набор C `isspace` (`space, \t, \n, \v, \f, \r`).
 pub(crate) fn word_count<R>(read: R) -> Counts
 where
     R: FnMut(u64, &mut [u8]) -> Result<usize, ()>,
@@ -197,32 +197,32 @@ where
     counts
 }
 
-/// `grep` switches.
+/// Переключатели `grep`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GrepOpts {
-    /// `-i`: ASCII case-insensitive match.
+    /// `-i`: ASCII case-insensitive сопоставление.
     pub ignore_case: bool,
-    /// `-n`: prefix each match with its 1-based line number.
+    /// `-n`: префикс каждой совпавшей строки её номером с 1.
     pub line_numbers: bool,
-    /// `-c`: print only the count of matching lines.
+    /// `-c`: печатать только число совпавших строк.
     pub count_only: bool,
-    /// `-v`: print lines that do NOT match.
+    /// `-v`: печатать строки, которые НЕ совпадают.
     pub invert: bool,
 }
 
-/// What one `grep` call found.
+/// Что нашёл один вызов `grep`.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Grepped {
     pub matched: u64,
     pub walked: Walked,
 }
 
-/// Case-fold one ASCII byte (`-i` is ASCII-only, like `grep` without a locale).
+/// Свернуть регистр одного ASCII-байта (`-i` только ASCII, как `grep` без локали).
 fn fold(b: u8) -> u8 {
     b.to_ascii_lowercase()
 }
 
-/// Does `haystack` contain `needle`?
+/// Содержит ли `haystack` подстроку `needle`?
 fn contains(haystack: &[u8], needle: &[u8], ignore_case: bool) -> bool {
     if needle.is_empty() {
         return true;
@@ -240,7 +240,7 @@ fn contains(haystack: &[u8], needle: &[u8], ignore_case: bool) -> bool {
     haystack.windows(needle.len()).any(|w| eq(w, needle))
 }
 
-/// Print every line that matches (or, with `invert`, does not match) `pattern`.
+/// Напечатать каждую строку, совпадающую с `pattern` (или, с `invert`, не совпадающую).
 pub(crate) fn grep<R, W>(pattern: &[u8], opts: GrepOpts, read: R, mut write: W) -> Grepped
 where
     R: FnMut(u64, &mut [u8]) -> Result<usize, ()>,
@@ -265,10 +265,10 @@ where
     out
 }
 
-// ─── thin VFS + console glue ────────────────────────────────────────────────
+// ─── тонкий клей VFS + консоли ────────────────────────────────────────────────
 
-/// Read `path` through `body`, translating "not found"/"is a directory"/read
-/// errors into the shell's one-line-diagnostic style.
+/// Прочитать `path` через `body`, переводя «not found»/«is a directory»/ошибки
+/// чтения в стиль однострочной диагностики shell.
 fn with_file<F>(cmd: &str, path_arg: &str, mut body: F)
 where
     F: FnMut(&dyn crate::vfs::VfsNode),
@@ -286,8 +286,8 @@ where
     }
 }
 
-/// Parse `head`/`tail` arguments: optional `-n N` / `-nN`, then exactly one
-/// path. Returns `(line limit, path)`.
+/// Разобрать аргументы `head`/`tail`: опциональный `-n N` / `-nN`, затем ровно
+/// один путь. Возвращает `(лимит строк, путь)`.
 fn parse_line_args(args: &[&str], default: usize) -> Option<(usize, String)> {
     let mut limit = default;
     let mut path: Option<String> = None;
@@ -317,7 +317,7 @@ fn parse_line_args(args: &[&str], default: usize) -> Option<(usize, String)> {
     path.map(|p| (limit, p))
 }
 
-/// `head [-n LINES] FILE`: print the first LINES lines (default 10).
+/// `head [-n LINES] FILE`: напечатать первые LINES строк (по умолчанию 10).
 pub(super) fn cmd_head(_ctx: &mut ShellCtx, args: &[&str]) {
     let Some((limit, path)) = parse_line_args(args, 10) else {
         shell_println("head: usage: head [-n LINES] FILE");
@@ -335,7 +335,7 @@ pub(super) fn cmd_head(_ctx: &mut ShellCtx, args: &[&str]) {
     });
 }
 
-/// `tail [-n LINES] FILE`: print the last LINES lines (default 10).
+/// `tail [-n LINES] FILE`: напечатать последние LINES строк (по умолчанию 10).
 pub(super) fn cmd_tail(_ctx: &mut ShellCtx, args: &[&str]) {
     let Some((limit, path)) = parse_line_args(args, 10) else {
         shell_println("tail: usage: tail [-n LINES] FILE");
@@ -353,7 +353,7 @@ pub(super) fn cmd_tail(_ctx: &mut ShellCtx, args: &[&str]) {
     });
 }
 
-/// `wc [-l] [-w] [-c] FILE`: count lines, words, bytes (all three by default).
+/// `wc [-l] [-w] [-c] FILE`: считать строки, слова, байты (все три по умолчанию).
 pub(super) fn cmd_wc(_ctx: &mut ShellCtx, args: &[&str]) {
     let (mut want_lines, mut want_words, mut want_bytes) = (false, false, false);
     let mut path: Option<String> = None;
@@ -403,7 +403,7 @@ pub(super) fn cmd_wc(_ctx: &mut ShellCtx, args: &[&str]) {
     });
 }
 
-/// `grep [-i] [-n] [-c] [-v] PATTERN FILE`: print lines containing PATTERN.
+/// `grep [-i] [-n] [-c] [-v] PATTERN FILE`: напечатать строки, содержащие PATTERN.
 pub(super) fn cmd_grep(_ctx: &mut ShellCtx, args: &[&str]) {
     let mut opts = GrepOpts::default();
     let mut pattern: Option<String> = None;

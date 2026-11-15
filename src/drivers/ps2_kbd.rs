@@ -1,5 +1,5 @@
-// drivers/ps2_kbd.rs — PS/2 keyboard driver stub
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// drivers/ps2_kbd.rs — драйвер PS/2 клавиатуры
+// 64-битное ядро ОС x86_64 на Rust (#![no_std])
 
 use crate::drivers::CharacterDevice;
 use crate::sync::spinlock::Spinlock;

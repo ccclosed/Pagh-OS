@@ -1,21 +1,21 @@
-//! Pinned Debian archive keys for the OpenPGP verifier (issue #32).
+//! Закреплённые ключи Debian-архива для OpenPGP-верификатора (issue #32).
 //!
-//! GENERATED FILE — do not edit by hand; regenerate with
-//! `python3 tools/gen_debian_keyring.py` (add `--deb FILE` to use a local copy of
-//! the pinned `debian-archive-keyring` package, which is what offline runs do)
-//! and commit the result. The generator selects every key BY ITS v4
-//! FINGERPRINT, cross-checks label/algorithm/size/creation/expiry/subkeys
-//! against its `SELECTION` table and fails closed on any deviation.
+//! СГЕНЕРИРОВАННЫЙ ФАЙЛ — не редактировать вручную; перегенерировать через
+//! `python3 tools/gen_debian_keyring.py` (добавьте `--deb FILE`, чтобы использовать
+//! локальную копию закреплённого пакета `debian-archive-keyring` — так делают
+//! офлайн-прогоны) и закоммитить результат. Генератор выбирает каждый ключ ПО ЕГО v4
+//! ФИНГЕРПРИНТУ, сверяет label/алгоритм/размер/создание/expiry/subkeys со своей
+//! таблицей `SELECTION` и падает fail-closed при любом отклонении.
 //!
-//! Source: https://deb.debian.org/debian/pool/main/d/debian-archive-keyring/debian-archive-keyring_2025.1_all.deb
+//! Источник: https://deb.debian.org/debian/pool/main/d/debian-archive-keyring/debian-archive-keyring_2025.1_all.deb
 //! sha256: 9ea7778e443144ca490668737a8ab22dd3e748bb99e805e22ec055abeb3c7fac
 //!
-//! Each `block` is the exact keyring byte range for one primary key
-//! (primary + user IDs + certifications + subkeys + binding signatures), so
-//! it can be inspected with `gpg --list-packets`. The runtime re-derives the
-//! fingerprints and the validity window from these bytes and refuses on any
-//! disagreement (host property P53); trust never rests on a value parsed out
-//! of the block alone.
+//! Каждый `block` — точный байтовый диапазон keyring'а для одного первичного ключа
+//! (primary + user IDs + certifications + subkeys + binding signatures), так что его
+//! можно посмотреть через `gpg --list-packets`. Runtime заново выводит фингерпринты
+//! и окно валидности из этих байтов и отказывает при любом расхождении (host-
+//! property P53); доверие никогда не опирается на значение, разобранное только из
+//! блока.
 
 #![allow(dead_code)] // consumed by the apt trust chain in the next PR of the series.
 

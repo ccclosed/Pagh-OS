@@ -1,32 +1,32 @@
-//! Networking subsystem — the kernel's OWN TCP/IP stack.
+//! Сетевой subsystem — СОБСТВЕННЫЙ TCP/IP-стек ядра.
 //!
-//! This is a from-scratch replacement for the previous smoltcp + virtio-net
-//! pairing. The layering, bottom-up:
+//! Это написанная с нуля замена прежней связки smoltcp + virtio-net. Слои,
+//! снизу вверх:
 //!
-//!   * [`crate::drivers::e1000`] — the NIC driver (polled, no IRQs).
-//!   * [`arp`] — Ethernet framing decisions + ARP cache/resolution.
-//!   * [`ip`] — IPv4 routing/fragmentation/reassembly + ICMP echo.
-//!   * [`udp`] — UDP sockets + the DHCP client.
-//!   * [`tcp`] — the TCP state machine, windows, timers, congestion control.
-//!   * [`wire`] — pure wire-format types and checksums (host-testable).
+//!   * [`crate::drivers::e1000`] — драйвер NIC (поллинг, без IRQ).
+//!   * [`arp`] — решения по Ethernet-фреймингу + ARP-кэш/разрешение.
+//!   * [`ip`] — IPv4-маршрутизация/фрагментация/сборка + ICMP echo.
+//!   * [`udp`] — UDP-сокеты + DHCP-клиент.
+//!   * [`tcp`] — TCP state machine, окна, таймеры, congestion control.
+//!   * [`wire`] — чистые wire-форматы и checksum (host-тестируемо).
 //!
-//! All mutable network state lives in [`Stack`] behind one spinlock ([`NET`]).
-//! The locking discipline carried over from the previous design: every entry
-//! point runs in THREAD context (the dedicated net thread, or shell/syscall
-//! threads driving bounded locked-step pumps). Nothing ever touches these
-//! structures from interrupt context, so lock nesting cannot deadlock.
+//! Всё изменяемое сетевое состояние живёт в [`Stack`] под одним спинлоком
+//! ([`NET`]). Дисциплина локинга: каждая точка входа выполняется в THREAD-
+//! контексте (выделенный net-поток или потоки shell/сисколлов, ведущие bounded
+//! locked-step насосы). Ничто никогда не трогает эти структуры из контекста
+//! прерываний, так что вложенность локов не может дедлокнуться.
 //!
-//! Bring-up sequence:
-//!   1. [`init`] enumerates PCI, attaches the e1000 (`drivers::e1000::attach`)
-//!      and builds an unconfigured [`Stack`].
-//!   2. [`net_thread`] repeatedly calls [`poll`]: RX frames are drained and
-//!      dispatched, the DHCP client runs (falling back to the static QEMU
-//!      user-net address `10.0.2.15/24` gw `10.0.2.2` after a timeout), TCP
-//!      output/retransmission steps run, and the demo echo services are fed.
-//!   3. ICMP echo is answered natively by [`ip`]; `ping` uses it end-to-end.
+//! Порядок поднятия:
+//!   1. [`init`] перечисляет PCI, подключает e1000 (`drivers::e1000::attach`) и
+//!      строит ненастроенный [`Stack`].
+//!   2. [`net_thread`] многократно вызывает [`poll`]: RX-кадры вычерпываются и
+//!      диспетчеризуются, работает DHCP-клиент (с откатом на статический адрес
+//!      QEMU user-net `10.0.2.15/24` gw `10.0.2.2` после таймаута), выполняются
+//!      шаги TCP-вывода/ретрансмиссии и кормятся demo echo-сервисы.
+//!   3. ICMP echo отвечает нативно [`ip`]; `ping` использует его end-to-end.
 //!
-//! If no NIC is present, [`init`] returns `Err(NetError::NoDevice)`; the caller
-//! logs a warning and boot continues (R17.3).
+//! Если NIC отсутствует, [`init`] возвращает `Err(NetError::NoDevice)`;
+//! вызывающий пишет предупреждение, и загрузка продолжается (R17.3).
 
 pub mod arp;
 pub mod ca_bundle;
@@ -54,74 +54,74 @@ use crate::sync::spinlock::Spinlock;
 use crate::task::scheduler;
 use crate::{info, warn};
 
-/// A transport-layer socket handle (TCP or UDP — both tables index from 0).
+/// Хэндл транспортного сокета (TCP или UDP — обе таблицы индексируются с 0).
 pub type SocketHandle = usize;
 
 pub use wire::Mac;
 
-/// Errors produced by the networking subsystem.
+/// Ошибки сетевого subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetError {
-    /// No usable NIC was discovered, so networking is unavailable.
+    /// Пригодный NIC не найден, сеть недоступна.
     NoDevice,
-    /// A NIC was found but initialisation failed, or a socket operation could
-    /// not complete.
+    /// NIC найден, но инициализация упала, или сокетная операция не может
+    /// завершиться.
     DeviceInit,
 }
 
-/// Static fallback address used when DHCP does not complete (R13.3). These are
-/// the well-known QEMU user-mode networking values.
+/// Статический fallback-адрес, когда DHCP не завершился (R13.3). Это
+/// общеизвестные значения QEMU user-mode networking.
 const FALLBACK_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 const FALLBACK_PREFIX: u8 = 24;
 const FALLBACK_GW: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
 
-/// QEMU user-mode networking always answers DNS at this address, so it is the
-/// resolver of last resort (R13.3).
+/// QEMU user-mode networking всегда отвечает DNS на этом адресе, так что это
+/// резолвер последней надежды (R13.3).
 const QEMU_DNS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
 
-/// Per-step `spin_loop` hint count between DNS pump steps (mirrors `nc_echo`).
+/// Число подсказок `spin_loop` на шаг между шагами насоса DNS (как у `nc_echo`).
 const DNS_STEP_SPIN: u32 = 20_000;
-/// DNS resolve timeout (~700 ms).
+/// Таймаут DNS-разрешения (~700 мс).
 const DNS_TIMEOUT_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(700);
-/// DNS query retransmit interval: if no answer has arrived after this many
-/// ticks, the same query (same id) is sent again until the deadline.
+/// Интервал ретрансмиссии DNS-запроса: если ответ не пришёл за столько тиков,
+/// тот же запрос (тот же id) посылается снова до дедлайна.
 const DNS_RESEND_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(100);
-/// Hard upper bound on DNS pump iterations, independent of the clock.
+/// Жёсткий верхний предел итераций насоса DNS, независимый от часов.
 const DNS_MAX_STEPS: u32 = 20_000;
-/// DHCP timeout (~5 s) before the static fallback applies (R13.3).
+/// Таймаут DHCP (~5 с) до применения статического fallback (R13.3).
 const DHCP_TIMEOUT_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(5_000);
 
-/// Current IP configuration, reported by `ifconfig` (see [`ip_config`]).
+/// Текущая IP-конфигурация, показываемая `ifconfig` (см. [`ip_config`]).
 #[derive(Debug, Clone, Copy)]
 pub struct IpConfig {
-    /// Assigned address + prefix (e.g. `10.0.2.15/24`).
+    /// Назначенный адрес + префикс (например `10.0.2.15/24`).
     pub addr: Ipv4Cidr,
-    /// Default gateway.
+    /// Шлюз по умолчанию.
     pub gateway: Ipv4Addr,
-    /// The NIC's hardware (MAC) address.
+    /// Аппаратный (MAC) адрес NIC.
     pub mac: Mac,
 }
 
-/// Result of a one-shot [`nc_echo`] client exchange.
+/// Результат одноразового клиентского обмена [`nc_echo`].
 #[derive(Debug, Clone)]
 pub enum NcResult {
-    /// The connection could not be established (refused / unreachable / timed
-    /// out before reaching the `Established` state).
+    /// Соединение не установлено (refused / unreachable / таймаут до состояния
+    /// `Established`).
     Failed,
-    /// The connection was established; `bytes` holds whatever was received back
-    /// (for an echo server this mirrors the payload that was sent).
+    /// Соединение установлено; `bytes` содержит всё, что пришло в ответ
+    /// (для echo-сервера это отражённый отправленный payload).
     Echoed(Vec<u8>),
 }
 
-/// All mutable networking state, owned behind a single lock.
+/// Всё изменяемое сетевое состояние под одним локом.
 ///
-/// Submodules reach into these fields directly (`pub(crate)`), which keeps the
-/// layering flat: each layer is a plain function over `&mut Stack`.
+/// Подмодули обращаются к этим полям напрямую (`pub(crate)`), что держит слои
+/// плоскими: каждый слой — простая функция над `&mut Stack`.
 pub struct Stack {
-    // Interface
+    // Интерфейс
     pub(crate) mac: Mac,
 
-    // Address configuration — IPv4 (DHCP or static fallback)
+    // Конфигурация адреса — IPv4 (DHCP или статический fallback)
     pub(crate) cidr: Option<Ipv4Cidr>,
     pub(crate) gateway: Option<Ipv4Addr>,
     pub(crate) dns_servers: Vec<Ipv4Addr>,
@@ -129,17 +129,17 @@ pub struct Stack {
     pub(crate) deadline_tick: Option<u64>,
     pub(crate) dhcp_fallback_used: bool,
 
-    // Address configuration — IPv6 (link-local always; global via SLAAC)
+    // Конфигурация адреса — IPv6 (link-local всегда; глобальный через SLAAC)
     pub(crate) ll_addr6: Ipv6Addr,
     pub(crate) cidr6: Option<wire::Ipv6Cidr>,
     pub(crate) v6_gateway: Option<Ipv6Addr>,
-    /// Set once a Router Solicitation has gone out this boot.
+    /// Ставится, когда Router Solicitation уже ушёл в этой загрузке.
     pub(crate) rs_sent: bool,
 
-    // Ephemeral port allocation
+    // Выделение эфемерных портов
     pub(crate) next_eph: u16,
 
-    // Layers
+    // Слои
     pub(crate) arp: arp::ArpTable,
     pub(crate) nd: arp::NdpTable,
     pub(crate) reasm: ip::Reassembler,
@@ -149,19 +149,19 @@ pub struct Stack {
     pub(crate) dhcp: udp::DhcpClient,
     pub(crate) pings: Vec<ip::PingWaiter>,
 
-    // Demo services
+    // Demo-сервисы
     pub(crate) udp_echo_handle: Option<SocketHandle>,
     pub(crate) udp_echo_port: u16,
     pub(crate) tcp_echo_port: Option<u16>,
 
-    // IP identification counter for fragmentation
+    // Счётчик IP identification для фрагментации
     pub(crate) next_ip_ident: u16,
 }
 
 static NET: Spinlock<Option<Stack>> = Spinlock::new(None);
 
-/// A fresh pseudo-random u32 for ISS/xid purposes. Hardware entropy when
-/// available, otherwise tick-mixed xorshift (never security-critical here).
+/// Свежий псевдослучайный u32 для ISS/xid. Аппаратная энтропия, когда есть,
+/// иначе tick-mixed xorshift (здесь никогда не security-critical).
 pub(crate) fn random_u32() -> u32 {
     static STATE: Spinlock<u32> = Spinlock::new(0x9E37_79B9);
     let mut g = STATE.lock();
@@ -173,19 +173,19 @@ pub(crate) fn random_u32() -> u32 {
     x
 }
 
-/// Allocate an ephemeral local port not currently bound by any TCP or UDP
-/// socket. MUST be called with `NET` already locked (see
-/// [`ephemeral_port_locked`]); kept as documentation of the discipline.
+/// Выделить эфемерный локальный порт, не занятый сейчас ни одним TCP- или
+/// UDP-сокетом. ДОЛЖНО вызываться с уже взятым `NET` (см.
+/// [`ephemeral_port_locked`]); оставлено как документация дисциплины.
 fn _ephemeral_port_requires_held_lock() {}
 
 // ─── Init ────────────────────────────────────────────────────────────────────
 
-/// Initialize the networking subsystem (R13.1): attach the e1000 and build the
-/// (still unconfigured) stack. Address acquisition happens in [`poll`] once the
-/// net thread runs.
+/// Инициализировать сетевой subsystem (R13.1): подключить e1000 и построить
+/// (пока ненастроенный) стек. Получение адреса происходит в [`poll`], когда
+/// заработает net-поток.
 ///
-/// Returns `Err(NetError::NoDevice)` if no usable NIC is present; the caller
-/// logs and continues booting (R17.3).
+/// Возвращает `Err(NetError::NoDevice)`, если пригодного NIC нет; вызывающий
+/// логирует и продолжает загрузку (R17.3).
 pub fn init() -> Result<(), NetError> {
     let devices = crate::drivers::pci::enumerate();
     let mac_bytes = crate::drivers::e1000::attach(&devices).map_err(|_| NetError::NoDevice)?;
@@ -223,21 +223,21 @@ pub fn init() -> Result<(), NetError> {
     Ok(())
 }
 
-// ─── Poll loop ───────────────────────────────────────────────────────────────
+// ─── Цикл poll ───────────────────────────────────────────────────────────────
 
 impl Stack {
-    /// Advance the whole stack once. Called by [`poll`] and (crate-internally)
-    /// by the bounded locked-step pumps in `http_fetch`/`tls`.
+    /// Продвинуть весь стек на один шаг. Вызывается [`poll`] и (внутри крейта)
+    /// bounded locked-step насосами в `http_fetch`/`tls`.
     pub(crate) fn step(&mut self) {
         let now = scheduler::ticks();
 
-        // 1. RX: drain every completed frame off the NIC.
+        // 1. RX: вычерпать каждый завершённый кадр из NIC.
         let mut frame = [0u8; 2048];
         while let Some(n) = crate::drivers::e1000::recv(&mut frame) {
             self.input_frame(&frame[..n], now);
         }
 
-        // 2. Neighbor/fragment bookkeeping for both families + RS once.
+        // 2. Учёт соседей/фрагментов для обоих семейств + RS один раз.
         self.arp.on_tick(now);
         self.nd.on_tick(now);
         self.reasm.on_tick(now);
@@ -261,8 +261,8 @@ impl Stack {
             crate::drivers::e1000::send(&frame);
         }
 
-        // 3. DHCP: run discovery until configured; renew once bound.
-        //     (moved out temporarily so it can borrow the rest of the stack)
+        // 3. DHCP: discovery, пока не настроено; renew после привязки.
+        //     (временно вынесено, чтобы занять остальной стек)
         {
             let mut client = core::mem::take(&mut self.dhcp);
             let lease = client.drive(self, now);
@@ -283,7 +283,7 @@ impl Stack {
             }
         }
 
-        // 4. DHCP timeout -> static fallback, applied exactly once (R13.3).
+        // 4. Таймаут DHCP -> статический fallback, применяется ровно один раз (R13.3).
         if !self.configured && !self.dhcp_fallback_used {
             if self.deadline_tick.is_none() {
                 self.deadline_tick = Some(scheduler::ticks() + DHCP_TIMEOUT_TICKS);
@@ -302,23 +302,23 @@ impl Stack {
             }
         }
 
-        // 5. TCP transmit/retransmit pass.
+        // 5. Проход TCP-передачи/ретрансмиссии.
         tcp::TcpTable::poll_all(self, now);
 
-        // 6. Demo services.
+        // 6. Demo-сервисы.
         self.service_udp_echo();
         self.service_tcp_echo();
 
-        // 7. Ping waiters are removed by `net::ping` itself once resolved.
+        // 7. Ожидающие ping удаляет сам `net::ping` после разрешения.
     }
 
-    /// Dispatch one received Ethernet frame up the layers.
+    /// Диспетчеризовать один принятый Ethernet-кадр вверх по слоям.
     fn input_frame(&mut self, frame: &[u8], now: u64) {
         let Some((dst, _src, ethertype, payload)) = wire::eth_parse(frame) else {
             return;
         };
-        // Accept: our unicast, broadcast, and IPv6 multicast (33:33:*).
-        // The e1000 runs promiscuous; everything else is dropped here.
+        // Принимаем: наш unicast, broadcast и IPv6 multicast (33:33:*).
+        // e1000 работает в promiscuous; всё остальное дропается здесь.
         let ipv6_mcast = dst.0[0] == 0x33 && dst.0[1] == 0x33;
         if dst != self.mac && dst != wire::Mac::BROADCAST && !ipv6_mcast {
             return;
@@ -328,8 +328,8 @@ impl Stack {
                 self.arp
                     .input(self.mac, self.cidr.map(|c| c.addr), payload, now)
             }
-            // ip::input dispatches on the version nibble (v4 and v6); NDP needs
-            // the real Ethernet-level sender MAC.
+            // ip::input диспетчеризует по нибблу версии (v4 и v6); NDP нужен
+            // настоящий MAC отправителя на Ethernet-уровне.
             wire::ETHERTYPE_IPV4 | wire::ETHERTYPE_IPV6 => ip::input(self, payload, _src, now),
             _ => {}
         }
@@ -361,7 +361,7 @@ impl Stack {
             let state = self.tcp.get(h).map(|s| s.state()).unwrap();
             match state {
                 tcp::State::Established | tcp::State::CloseWait => {
-                    // Echo buffered bytes back.
+                    // Отразить буферизованные байты.
                     let mut buf = [0u8; 1024];
                     loop {
                         let n = self
@@ -375,7 +375,7 @@ impl Stack {
                         let data = buf[..n].to_vec();
                         let _ = self.tcp.get_mut(h).map(|s| s.send_slice(&data));
                     }
-                    // Peer closed and we've echoed everything: close our half.
+                    // Peer закрыл и мы всё отразили: закрыть нашу половину.
                     if state == tcp::State::CloseWait {
                         let empty = self.tcp.get(h).map(|s| !s.can_recv()).unwrap_or(true);
                         if empty {
@@ -391,8 +391,8 @@ impl Stack {
     }
 }
 
-/// Advance the network stack once (called by [`net_thread`] and by the bounded
-/// locked-step pumps). Never runs in IRQ context.
+/// Продвинуть сетевой стек на один шаг (вызывается [`net_thread`] и bounded
+/// locked-step насосами). Никогда не выполняется в IRQ-контексте.
 pub fn poll() {
     let mut guard = NET.lock();
     if let Some(s) = guard.as_mut() {
@@ -400,30 +400,30 @@ pub fn poll() {
     }
 }
 
-/// The networking kernel thread entry point (R13.4). Loops forever: advance
-/// the stack, then sleep cooperatively until the next timer tick.
+/// Точка входа сетевого потока ядра (R13.4). Бесконечный цикл: продвинуть
+/// стек, затем кооперативно поспать до следующего тика таймера.
 pub fn net_thread() {
     info!("net: poll thread started");
     let mut polls: u64 = 0;
     loop {
         poll();
         polls += 1;
-        // Heartbeat: if this line stops appearing while the system hangs,
-        // the net thread (or the scheduler feeding it ticks) is dead.
+        // Heartbeat: если эта строка перестала появляться при зависании системы,
+        // net-поток (или планировщик, кормящий его тиками) мёртв.
         if polls.is_multiple_of(crate::arch::x86_64::apic::TICK_HZ * 5) {}
         scheduler::sleep_ticks(1);
     }
 }
 
-// ─── TCP public API (unchanged surface from the smoltcp era) ────────────────
+// ─── Публичный TCP API (неизменная поверхность со времён smoltcp) ───────────
 
-/// Open an outbound TCP connection to `remote` and return its socket handle.
+/// Открыть исходящее TCP-соединение к `remote` и вернуть хэндл сокета.
 pub fn tcp_connect(remote: IpEndpoint) -> Result<SocketHandle, NetError> {
     tcp_connect_buffered(remote, 4096, 4096)
 }
 
-/// Open an outbound TCP connection like [`tcp_connect`], with explicitly sized
-/// rx/tx buffers (TLS needs multi-KiB records; fetches want large windows).
+/// Открыть исходящее TCP-соединение как [`tcp_connect`], с явно заданными
+/// размерами rx/tx-буферов (TLS нужны записи в multi-KiB; fetch'ам — большие окна).
 pub fn tcp_connect_buffered(
     remote: IpEndpoint,
     rx_bytes: usize,
@@ -446,17 +446,16 @@ pub fn tcp_connect_buffered(
     r
 }
 
-/// Has the TCP handshake completed?
+/// Завершилось ли TCP-рукопожатие?
 ///
-/// This deliberately asks "did the connection ever reach ESTABLISHED", not "is
-/// it in ESTABLISHED right now". A peer that sends its data and its FIN in the
-/// same burst (a one-shot server replying and closing — exactly what the
-/// clipboard bridge and any `curl`-style request/response peer does) drives the
-/// socket from SYN-SENT straight through ESTABLISHED into CLOSE-WAIT inside a
-/// single poll pass. Comparing `state == Established` missed that window
-/// entirely: `connect(2)` then spun out its whole timeout and failed with
-/// ETIMEDOUT even though the peer had already answered — the data sitting in
-/// the receive buffer was thrown away with the socket.
+/// Здесь намеренно спрашивается «доходило ли соединение когда-либо до
+/// ESTABLISHED», а не «в ESTABLISHED ли оно сейчас». Peer, посылающий свои данные
+/// и FIN одним burst'ом (одноразовый сервер, отвечающий и закрывающийся — ровно
+/// то, что делают clipboard bridge и любой peer в стиле `curl` request/response),
+/// проводит сокет из SYN-SENT через ESTABLISHED в CLOSE-WAIT за один проход poll.
+/// Сравнение `state == Established` полностью упускало это окно: `connect(2)`
+/// затем выкручивал весь таймаут и падал с ETIMEDOUT, хотя peer уже ответил —
+/// данные в приёмном буфере выбрасывались вместе с сокетом.
 pub fn tcp_established(handle: SocketHandle) -> bool {
     let mut g = NET.lock();
     let Some(s) = g.as_mut() else { return false };
@@ -467,7 +466,7 @@ pub fn tcp_established(handle: SocketHandle) -> bool {
         .unwrap_or(false)
 }
 
-/// Did the connection fail before ever establishing (refused/unreachable)?
+/// Соединение упало до установки (refused/unreachable)?
 pub fn tcp_dead_before_established(handle: SocketHandle) -> bool {
     let g = NET.lock();
     match g.as_ref().and_then(|s| s.tcp.get(handle)) {
@@ -476,8 +475,8 @@ pub fn tcp_dead_before_established(handle: SocketHandle) -> bool {
     }
 }
 
-/// Poll once and enqueue as much of `data` as fits the peer window. Returns
-/// the number of bytes accepted into the transmit buffer.
+/// Один раз опросить и поставить в очередь столько `data`, сколько влезает в
+/// окно peer. Возвращает число байт, принятых в передающий буфер.
 pub fn tcp_send_chunk(handle: SocketHandle, data: &[u8]) -> usize {
     let mut g = NET.lock();
     let Some(s) = g.as_mut() else { return 0 };
@@ -488,7 +487,7 @@ pub fn tcp_send_chunk(handle: SocketHandle, data: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
-/// Poll once and drain received bytes into `dst`. Returns bytes copied.
+/// Один раз опросить и слить принятые байты в `dst`. Возвращает число скопированных байт.
 pub fn tcp_recv_chunk(handle: SocketHandle, dst: &mut [u8]) -> usize {
     let mut g = NET.lock();
     let Some(s) = g.as_mut() else { return 0 };
@@ -499,7 +498,7 @@ pub fn tcp_recv_chunk(handle: SocketHandle, dst: &mut [u8]) -> usize {
         .unwrap_or(0)
 }
 
-/// Remote half closed and nothing left to read: read(2) should return 0.
+/// Удалённая половина закрыта и читать нечего: read(2) должен вернуть 0.
 pub fn tcp_rx_at_eof(handle: SocketHandle) -> bool {
     let mut g = NET.lock();
     let Some(s) = g.as_mut() else { return true };
@@ -507,8 +506,8 @@ pub fn tcp_rx_at_eof(handle: SocketHandle) -> bool {
     s.tcp.get(handle).map(|k| k.eof_visible()).unwrap_or(true)
 }
 
-/// Half-close our TX then give the close handshake a few polls and reclaim
-/// the socket slot.
+/// Полузакрыть наш TX, дать close-рукопожатию несколько poll'ов и вернуть слот
+/// сокета.
 pub fn tcp_close(handle: SocketHandle) {
     let mut g = NET.lock();
     let Some(s) = g.as_mut() else { return };
@@ -521,9 +520,9 @@ pub fn tcp_close(handle: SocketHandle) {
     s.tcp.remove(handle);
 }
 
-// ─── UDP public API ──────────────────────────────────────────────────────────
+// ─── Публичный UDP API ──────────────────────────────────────────────────────
 
-/// Open an UDP socket bound to an ephemeral local port on 0.0.0.0.
+/// Открыть UDP-сокет, привязанный к эфемерному локальному порту на 0.0.0.0.
 pub fn udp_open() -> Result<SocketHandle, NetError> {
     let mut guard = NET.lock();
     let state = guard.as_mut().ok_or(NetError::NoDevice)?;
@@ -531,8 +530,8 @@ pub fn udp_open() -> Result<SocketHandle, NetError> {
     Ok(state.udp.open(port))
 }
 
-/// Allocate an ephemeral local port (49152..=65535) not currently bound by any
-/// TCP or UDP socket. Caller MUST hold `NET`.
+/// Выделить эфемерный локальный порт (49152..=65535), не занятый сейчас ни одним
+/// TCP- или UDP-сокетом. Вызывающий ДОЛЖЕН держать `NET`.
 fn ephemeral_port_locked(s: &mut Stack) -> u16 {
     loop {
         let p = s.next_eph;
@@ -547,7 +546,7 @@ fn ephemeral_port_locked(s: &mut Stack) -> u16 {
     }
 }
 
-/// Send one datagram to `remote`.
+/// Послать одну датаграмму на `remote`.
 pub fn udp_sendto(handle: SocketHandle, data: &[u8], remote: IpEndpoint) -> Result<(), NetError> {
     let mut guard = NET.lock();
     let state = guard.as_mut().ok_or(NetError::NoDevice)?;
@@ -555,7 +554,7 @@ pub fn udp_sendto(handle: SocketHandle, data: &[u8], remote: IpEndpoint) -> Resu
     udp::send_from(state, port, data, remote).map_err(|_| NetError::DeviceInit)
 }
 
-/// Remove a UDP socket from the set (reclaim buffers). Idempotent.
+/// Убрать UDP-сокет из набора (вернуть буферы). Идемпотентно.
 #[allow(dead_code)]
 pub fn udp_remove(handle: SocketHandle) {
     let mut g = NET.lock();
@@ -564,7 +563,7 @@ pub fn udp_remove(handle: SocketHandle) {
     }
 }
 
-/// Receive one datagram if available (caller drives polling between calls).
+/// Принять одну датаграмму, если есть (вызывающий гоняет polling между вызовами).
 pub fn udp_recvfrom(handle: SocketHandle, dst: &mut [u8]) -> Option<(usize, IpEndpoint)> {
     let mut g = NET.lock();
     let s = g.as_mut()?;
@@ -572,9 +571,9 @@ pub fn udp_recvfrom(handle: SocketHandle, dst: &mut [u8]) -> Option<(usize, IpEn
     s.udp.recv(handle, dst)
 }
 
-// ─── Services / diagnostics ──────────────────────────────────────────────────
+// ─── Сервисы / диагностика ──────────────────────────────────────────────────
 
-/// Enable a UDP echo service bound to `port` (R14.2).
+/// Включить UDP echo-сервис на `port` (R14.2).
 pub fn udp_echo_enable(port: u16) {
     let mut guard = NET.lock();
     let Some(state) = guard.as_mut() else {
@@ -587,8 +586,8 @@ pub fn udp_echo_enable(port: u16) {
     info!("net: UDP echo enabled on port {}", port);
 }
 
-/// Start a TCP echo listener bound to `port` (R14.3). Each accepted connection
-/// becomes its own socket; the listener accepts further clients immediately.
+/// Запустить TCP echo-листенер на `port` (R14.3). Каждое принятое соединение
+/// становится отдельным сокетом; листенер сразу принимает следующих клиентов.
 pub fn tcp_echo_listen(port: u16) {
     let mut guard = NET.lock();
     let Some(state) = guard.as_mut() else {
@@ -604,8 +603,8 @@ pub fn tcp_echo_listen(port: u16) {
     }
 }
 
-/// Current IP configuration for `ifconfig`, or `None` if no NIC is present or
-/// no address has been assigned yet.
+/// Текущая IP-конфигурация для `ifconfig` или `None`, если NIC нет или адрес ещё
+/// не назначен.
 pub fn ip_config() -> Option<IpConfig> {
     let guard = NET.lock();
     let state = guard.as_ref()?;
@@ -617,27 +616,27 @@ pub fn ip_config() -> Option<IpConfig> {
     })
 }
 
-/// Current IPv6 configuration for `ifconfig`, or `None` before SLAAC.
+/// Текущая IPv6-конфигурация для `ifconfig` или `None` до SLAAC.
 #[derive(Debug, Clone, Copy)]
 pub struct Ip6Config {
     pub addr: wire::Ipv6Cidr,
 }
 
-/// The SLAAC-configured global address, if any.
+/// Глобальный адрес, настроенный SLAAC, если есть.
 pub fn ip6_config() -> Option<Ip6Config> {
     let guard = NET.lock();
     let state = guard.as_ref()?;
     Some(Ip6Config { addr: state.cidr6? })
 }
 
-/// The RA-learned default router (always link-local), if any.
+/// Изученный из RA маршрутизатор по умолчанию (всегда link-local), если есть.
 #[allow(dead_code)]
 pub fn ip6_gateway() -> Option<Ipv6Addr> {
     let guard = NET.lock();
     guard.as_ref()?.v6_gateway
 }
 
-/// The first usable DNS server, or `None` when no address is configured yet.
+/// Первый пригодный DNS-сервер или `None`, пока адрес не настроен.
 pub fn dns_server() -> Option<Ipv4Addr> {
     let guard = NET.lock();
     let state = guard.as_ref()?;
@@ -647,17 +646,16 @@ pub fn dns_server() -> Option<Ipv4Addr> {
     Some(state.dns_servers.first().copied().unwrap_or(QEMU_DNS))
 }
 
-// ─── DNS resolve (A + AAAA; family preference follows configuration) ───────
+// ─── DNS resolve (A + AAAA; предпочтение семейства следует конфигурации) ───
 
-/// Resolve `hostname` to an [`IpAddr`] via a DNS query.
+/// Разрешить `hostname` в [`IpAddr`] через DNS-запрос.
 ///
-/// IPv4/IPv6 literals return directly. Otherwise queries are sent as single
-/// UDP datagrams to [`dns_server`]`:53` over temporary sockets, pumped in
-/// bounded locked steps: AAAA first when the interface has an IPv6 address,
-/// then A; the other family is used as fallback when the preferred one has no
-/// answer.
+/// IPv4/IPv6-литералы возвращаются сразу. Иначе запросы шлются одиночными
+/// UDP-датаграммами на [`dns_server`]:53 через временные сокеты, ведомые bounded
+/// locked steps: AAAA первым, когда у интерфейса есть IPv6-адрес, затем A;
+/// другое семейство — fallback, когда у предпочтительного нет ответа.
 pub fn resolve(hostname: &str) -> Option<IpAddr> {
-    // Literals first (v4 dotted-quad or any v6 text form).
+    // Сначала литералы (v4 dotted-quad или любая текстовая форма v6).
     if hostname.contains(':') {
         return wire::parse_ipv6_literal(hostname).map(IpAddr::V6);
     }
@@ -667,11 +665,11 @@ pub fn resolve(hostname: &str) -> Option<IpAddr> {
 
     let server = dns_server()?;
 
-    // IPv4 FIRST. QEMU user-mode networking (slirp) advertises RAs and answers
-    // AAAA queries but does NOT route outbound IPv6, so AAAA-first resolution
-    // sent apt/TLS into a black hole (regression introduced with dual-stack).
-    // AAAA remains the fallback when a name has no A record, and explicit
-    // IPv6 endpoints connect fine.
+    // IPv4 ПЕРВЫМ. QEMU user-mode networking (slirp) анонсирует RA и отвечает
+    // на AAAA-запросы, но НЕ маршрутизирует исходящий IPv6, так что AAAA-first
+    // отправлял apt/TLS в чёрную дыру (регрессия, привнесённая dual-stack).
+    // AAAA остаётся fallback, когда у имени нет A-записи, а явные IPv6-endpoint'ы
+    // подключаются нормально.
     let order: [(u16, bool); 2] = [(dns::QTYPE_A, false), (dns::QTYPE_AAAA, true)];
 
     for (qtype, _) in order {
@@ -682,12 +680,11 @@ pub fn resolve(hostname: &str) -> Option<IpAddr> {
     None
 }
 
-/// One DNS exchange of `qtype` on a temporary socket; returns the first
-/// matching address.
+/// Один DNS-обмен `qtype` на временном сокете; возвращает первый подходящий адрес.
 fn dns_query_once(server: Ipv4Addr, hostname: &str, qtype: u16) -> Option<IpAddr> {
-    // Random transaction id: a tick-derived id is predictable and collides
-    // between back-to-back lookups, letting an off-path reply be mistaken for
-    // the answer.
+    // Случайный transaction id: id, выведенный из тика, предсказуем и
+    // сталкивается между подряд идущими lookup'ами, позволяя off-path ответу
+    // сойти за ответ.
     let id: u16 = random_u32() as u16;
     let mut query: Vec<u8> = Vec::new();
     if !dns::build_dns_query_typed(id, hostname, qtype, &mut query) {
@@ -714,9 +711,9 @@ fn dns_query_once(server: Ipv4Addr, hostname: &str, qtype: u16) -> Option<IpAddr
                 Some(s) => s,
                 None => break,
             };
-            // (Re-)send the query every DNS_RESEND_TICKS until an answer
-            // arrives or the deadline passes; a single lost datagram no longer
-            // burns the whole budget spinning.
+            // (Пере)посылать запрос каждые DNS_RESEND_TICKS, пока не придёт ответ
+            // или не истечёт дедлайн; одна потерянная датаграмма больше не сжигает
+            // весь бюджет на spin.
             if scheduler::ticks() >= next_send {
                 let port = state.udp.port_of(handle).unwrap_or(0);
                 if udp::send_from(state, port, &query, server_ep).is_ok() {
@@ -754,9 +751,9 @@ fn dns_query_once(server: Ipv4Addr, hostname: &str, qtype: u16) -> Option<IpAddr
     result
 }
 
-/// Drive a brief, self-contained TCP client exchange for the shell `nc`
-/// command (R15.2, R15.3): connect, send once established, collect echoed
-/// bytes within a bounded poll window, close, tear down.
+/// Провести короткий самодостаточный TCP-клиентский обмен для команды shell
+/// `nc` (R15.2, R15.3): connect, отправить после установки, собрать отражённые
+/// байты в bounded окне poll, close, teardown.
 pub fn nc_echo(remote: IpEndpoint, payload: &[u8]) -> NcResult {
     let handle = match tcp_connect(remote) {
         Ok(h) => h,
@@ -784,12 +781,12 @@ pub fn nc_echo(remote: IpEndpoint, payload: &[u8]) -> NcResult {
                     }
                 }
                 Some(sock) => {
-                    // `ever_established`, not `state == Established`: a peer that
-                    // answers and closes in one burst moves the socket through
-                    // ESTABLISHED into CLOSE-WAIT inside a single poll pass, and
-                    // the equality test then never fires — the payload was never
-                    // sent and `nc` reported a failure against a server that had
-                    // already replied. Same trap as `tcp_established`.
+                    // `ever_established`, а не `state == Established`: peer, который
+                    // отвечает и закрывается одним burst'ом, проводит сокет через
+                    // ESTABLISHED в CLOSE-WAIT за один проход poll, и проверка на
+                    // равенство тогда не срабатывает никогда — payload не отправлен,
+                    // а `nc` сообщает о сбое серверу, который уже ответил. Та же
+                    // ловушка, что в `tcp_established`.
                     if sock.ever_established() {
                         established = true;
                     }
@@ -807,7 +804,7 @@ pub fn nc_echo(remote: IpEndpoint, payload: &[u8]) -> NcResult {
                 }
             }
 
-            // Drain any echoed bytes.
+            // Вычерпать любые отражённые байты.
             loop {
                 let mut buf = [0u8; 1024];
                 let n = s
@@ -837,7 +834,7 @@ pub fn nc_echo(remote: IpEndpoint, payload: &[u8]) -> NcResult {
         }
     }
 
-    // Give the close handshake a few polls, then reclaim the slot.
+    // Дать close-рукопожатию несколько poll'ов, затем вернуть слот.
     {
         let mut guard = NET.lock();
         if let Some(s) = guard.as_mut() {
@@ -857,8 +854,8 @@ pub fn nc_echo(remote: IpEndpoint, payload: &[u8]) -> NcResult {
 
 // ─── ICMP ping ───────────────────────────────────────────────────────────────
 
-/// Send one ICMP echo request to `addr` (v4 or v6) and wait up to ~1 s for the
-/// reply. Returns the measured round-trip time in ticks (ms at TICK_HZ).
+/// Послать один ICMP echo-запрос на `addr` (v4 или v6) и ждать до ~1 с ответа.
+/// Возвращает измеренное round-trip время в тиках (мс при TICK_HZ).
 pub fn ping(addr: IpAddr) -> Option<u64> {
     const PING_TIMEOUT_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(1000);
 
@@ -867,7 +864,7 @@ pub fn ping(addr: IpAddr) -> Option<u64> {
     let started = scheduler::ticks();
     let payload = b"pagh-ping";
 
-    // Register the waiter BEFORE sending so a fast reply cannot be missed.
+    // Зарегистрировать ожидающего ДО отправки, чтобы быстрый ответ не потерялся.
     {
         let mut guard = NET.lock();
         let state = guard.as_mut()?;
@@ -917,7 +914,7 @@ pub fn ping(addr: IpAddr) -> Option<u64> {
             }
         }
         if scheduler::ticks() >= started + PING_TIMEOUT_TICKS {
-            // Unregister.
+            // Разрегистрировать.
             let mut guard = NET.lock();
             if let Some(state) = guard.as_mut() {
                 state.pings.retain(|p| p.ident != ident);
