@@ -35,7 +35,8 @@ full-screen TUIs such as `nvim`.
   child with a copied address space (`fork_linux_process`). Threads via
   `CLONE_VM|CLONE_THREAD` share the address space; glibc `pthread_create` works.
 - `epoll` (create1/ctl/wait/pwait) and `eventfd2` are implemented over the compat fd
-  table, plus unix sockets (`socketpair`/AF_UNIX stream), so libuv event loops run —
+  table, plus unix sockets (`socketpair`/AF_UNIX stream, including `sendmsg`/`recvmsg`
+  with `SOL_SOCKET`/`SCM_RIGHTS` fd passing — `docs/desktop-b.md` §6), so libuv event loops run —
   `nvim` starts, renders through the VT emulator, and saves its ShaDa
   (`rename`/`renameat`/`renameat2`, `fsync`/`fdatasync`, `readv`/`preadv`/`pwritev`).
 - Terminal: the console is a real tty. Honest `tcgetattr` reports actual

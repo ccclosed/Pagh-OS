@@ -257,10 +257,14 @@ console flush останавливается, serial-логи идут), `FBIOGE
 `/dev/input/event0` — evdev-подобный поток 24-байтных `input_event` (timeval,
 EV_KEY/EV_REL/EV_SYN) из PS/2 и USB HID, blocking/`O_NONBLOCK`/`poll`/`select`,
 кольцо 256 событий; ввод дублируется, поэтому shell-stdin и `/dev/stdin` не
-ломаются. ABI и ограничения — `docs/desktop-b.md`. Проверка: host-тесты ABI
-(`fb_abi`, `input_event`) + четыре in-QEMU routine `desktop-b::*` (fb ioctl/mmap/
-пиксель, event0 read/poll, memfd coherence, MAP_SHARED после fork).
-Пробелы: SCM_RIGHTS/fd passing, DMA-BUF/GPU, Wayland, EV_ABS/touch, fb modeset.
+ломаются. `sendmsg`/`recvmsg` (46/47) несут `SOL_SOCKET`/`SCM_RIGHTS`: клиент
+передаёт композитору memfd (массив fd, `MSG_CMSG_CLOEXEC`, `MSG_CTRUNC`,
+`EINVAL`/`ENOBUFS`/`EBADF`); получатель получает dup в свою таблицу, отправитель
+свой дескриптор сохраняет. ABI и ограничения — `docs/desktop-b.md`. Проверка:
+host-тесты ABI (`fb_abi`, `input_event`, `cmsg`) + шесть in-QEMU routine
+`desktop-b::*` (fb ioctl/mmap/пиксель, event0 read/poll, memfd coherence,
+MAP_SHARED после fork, SCM_RIGHTS fd passing, SCM_RIGHTS truncation/errors).
+Пробелы: DMA-BUF/GPU, Wayland, EV_ABS/touch, fb modeset.
 Предыдущая версия `dev`:
 
 **`dev` до 2.24.0** (2.23.0) — USB-тетеринг телефона: нативный RNDIS поверх xHCI.

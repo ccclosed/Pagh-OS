@@ -7482,7 +7482,7 @@ mod usb_hid_tests {
 mod desktop_b_tests {
     use crate::arch::x86_64::linux::errno::Errno;
     use crate::arch::x86_64::linux::mem::{VmRegionSet, MAP_SHARED, PROT_READ, PROT_WRITE};
-    use crate::arch::x86_64::linux::{io_sys, mem_sys};
+    use crate::arch::x86_64::linux::{io_sys, mem_sys, unix_sock};
     use crate::drivers::fb_abi::{
         FBIOGET_FSCREENINFO, FBIOGET_VSCREENINFO, FB_FIX_SIZE, FB_VAR_SIZE,
     };
@@ -7613,6 +7613,99 @@ mod desktop_b_tests {
     fn put_cstr(offset: u64, s: &[u8]) {
         put(offset, s);
         put(offset + s.len() as u64, &[0]);
+    }
+
+    fn put_u8(offset: u64, v: u8) {
+        // SAFETY: scratch-страница отображена writable в `with_user_space`.
+        unsafe { core::ptr::write_unaligned((SCRATCH_VA + offset) as *mut u8, v) }
+    }
+
+    fn put_u32(offset: u64, v: u32) {
+        // SAFETY: как выше.
+        unsafe { core::ptr::write_unaligned((SCRATCH_VA + offset) as *mut u32, v) }
+    }
+
+    fn put_i32(offset: u64, v: i32) {
+        // SAFETY: как выше.
+        unsafe { core::ptr::write_unaligned((SCRATCH_VA + offset) as *mut i32, v) }
+    }
+
+    fn put_u64(offset: u64, v: u64) {
+        // SAFETY: как выше.
+        unsafe { core::ptr::write_unaligned((SCRATCH_VA + offset) as *mut u64, v) }
+    }
+
+    fn get_u8(offset: u64) -> u8 {
+        // SAFETY: scratch-страница отображена; смещение внутри 4 КиБ.
+        unsafe { core::ptr::read_unaligned((SCRATCH_VA + offset) as *const u8) }
+    }
+
+    fn get_u64(offset: u64) -> u64 {
+        // SAFETY: как выше.
+        unsafe { core::ptr::read_unaligned((SCRATCH_VA + offset) as *const u64) }
+    }
+
+    fn get_i32(offset: u64) -> i32 {
+        // SAFETY: как выше.
+        unsafe { core::ptr::read_unaligned((SCRATCH_VA + offset) as *const i32) }
+    }
+
+    /// Разложить `struct iovec` (16 байт: base + len) в scratch.
+    fn put_iovec(offset: u64, base: u64, len: u64) {
+        put_u64(offset, base);
+        put_u64(offset + 8, len);
+    }
+
+    /// Разложить `struct msghdr` (56 байт) в scratch. `msg_name`/`namelen` и
+    /// входной `msg_flags` нулевые: подключённому AF_UNIX stream адрес не нужен.
+    fn put_msghdr(offset: u64, iov: u64, iovlen: u64, control: u64, controllen: u64) {
+        put(offset, &[0u8; 56]);
+        put_u64(offset, 0); // msg_name
+        put_u64(offset + 16, iov);
+        put_u64(offset + 24, iovlen);
+        put_u64(offset + 32, control);
+        put_u64(offset + 40, controllen);
+    }
+
+    /// Записать в scratch один `SCM_RIGHTS` cmsg с массивом `fds`.
+    /// Возвращает `CMSG_SPACE(4*len)` — длину control-буфера.
+    fn put_cmsg_rights(offset: u64, fds: &[i32]) -> u64 {
+        let payload = 4 * fds.len() as u64;
+        let len = 16 + payload;
+        let space = (len + 7) & !7;
+        put_u64(offset, len); // cmsg_len (CMSG_LEN)
+        put_u32(offset + 8, 1); // cmsg_level = SOL_SOCKET
+        put_u32(offset + 12, 1); // cmsg_type = SCM_RIGHTS
+        for (i, fd) in fds.iter().enumerate() {
+            put_i32(offset + 16 + 4 * i as u64, *fd);
+        }
+        space
+    }
+
+    /// Записать `memfd` с именем `name` и одним 8-байтным словом `magic` по
+    /// смещению 0; возвращает (fd, его VFS-узел для проверок владения).
+    fn make_shm(name: &[u8], magic: u64) -> (u64, Arc<dyn crate::vfs::VfsNode>) {
+        put_cstr(0x220, name);
+        let fd = io_sys::sys_memfd_create(SCRATCH_VA + 0x220, 0).expect("scm: memfd_create");
+        io_sys::sys_ftruncate(fd, 4096).expect("scm: ftruncate");
+        put_u64(0x300, magic);
+        assert_eq_kernel!(
+            io_sys::sys_pwrite64(fd, SCRATCH_VA + 0x300, 8, 0),
+            Ok(8),
+            "scm: seed memfd page"
+        );
+        let node = io_sys::file_node_for_fd(fd as u32).expect("scm: memfd node");
+        (fd, node)
+    }
+
+    /// Прочитать 8-байтное слово из `fd` (0 смещение) в scratch+0x300.
+    fn read_shm_word(fd: u64) -> u64 {
+        assert_eq_kernel!(
+            io_sys::sys_pread64(fd, SCRATCH_VA + 0x300, 8, 0),
+            Ok(8),
+            "scm: pread memfd word"
+        );
+        get_u64(0x300)
     }
 
     /// `/dev/fb0`: open → ioctl var/fix → mmap физического scanout → пиксель
@@ -8178,6 +8271,610 @@ mod desktop_b_tests {
             "fork-shm: routine returned every PMM frame"
         );
     }
+
+    /// SCM_RIGHTS по AF_UNIX socketpair: данные и memfd в одном `sendmsg`,
+    /// получатель принимает dup fd и через `mmap(MAP_SHARED)` видит те же
+    /// страницы; отправитель свой fd не теряет. Плюс несколько fd в одном cmsg
+    /// и `MSG_CMSG_CLOEXEC`, переживающий exec-вычистку (`close_cloexec` —
+    /// ровно тот путь, которым `execve` вычищает fd в `task/process.rs`).
+    pub fn scm_rights_memfd_passing() {
+        let frames_before = pmm::free_frames();
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            assert_eq_kernel!(
+                io_sys::sys_socketpair(1, 1, 0, SCRATCH_VA + 0x40),
+                Ok(0),
+                "scm: socketpair(AF_UNIX, SOCK_STREAM)"
+            );
+            let a = get_u32(0x40) as u64;
+            let b = get_u32(0x44) as u64;
+            assert_kernel!(a != b, "scm: socketpair gives two distinct ends");
+
+            // ── данные + memfd в одном sendmsg ──
+            const MAGIC: u64 = 0x5343_4D52_4947_4854; // "SCMRIGHT"
+            let (memfd, node) = make_shm(b"scm-one", MAGIC);
+            put(0x100, b"HELLO");
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 5);
+            let space = put_cmsg_rights(0x180, &[memfd as i32]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x180, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Ok(5),
+                "scm: sendmsg carries payload + fd in one call"
+            );
+            // Отправитель не теряет дескриптор.
+            assert_eq_kernel!(read_shm_word(memfd), MAGIC, "scm: sender keeps its fd");
+
+            // ── recvmsg отдаёт данные, cmsg и новый fd ──
+            put(0x140, &[0u8; 32]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 32);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, SCRATCH_VA + 0x1c0, 64);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0),
+                Ok(5),
+                "scm: recvmsg returns the payload"
+            );
+            // SAFETY: scratch writable, данные лежат по 0x140.
+            let data = unsafe { core::slice::from_raw_parts((SCRATCH_VA + 0x140) as *const u8, 5) };
+            assert_eq_kernel!(data, b"HELLO", "scm: payload arrives with the fd");
+            assert_eq_kernel!(get_u64(0x1c0), 20, "scm: cmsg_len = CMSG_LEN(4)");
+            assert_eq_kernel!(get_u32(0x1c0 + 8), 1, "scm: cmsg_level = SOL_SOCKET");
+            assert_eq_kernel!(get_u32(0x1c0 + 12), 1, "scm: cmsg_type = SCM_RIGHTS");
+            let got = get_i32(0x1c0 + 16);
+            assert_kernel!(got >= 3, "scm: received fd is a dynamic descriptor");
+            assert_kernel!(
+                got as u64 != memfd,
+                "scm: receiver gets a dup, not the sender's number"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_fcntl(got as u64, 3 /*F_GETFL*/, 0),
+                Ok(2 /*O_RDWR*/),
+                "scm: received fd inherits the sender's access mode"
+            );
+            assert_eq_kernel!(
+                get_u64(0x080 + 40),
+                24,
+                "scm: msg_controllen = CMSG_SPACE(sizeof(int))"
+            );
+            assert_eq_kernel!(get_u32(0x080 + 8), 0, "scm: msg_namelen = 0");
+            assert_eq_kernel!(get_u32(0x080 + 48), 0, "scm: no MSG_CTRUNC");
+
+            // ── dup ссылается на тот же открытый файл ──
+            let node2 = io_sys::file_node_for_fd(got as u32).expect("scm: received fd node");
+            assert_kernel!(
+                Arc::ptr_eq(&node, &node2),
+                "scm: received fd refers to the same open file"
+            );
+
+            // ── MAP_SHARED полученного fd: те же физические страницы ──
+            let base = mem_sys::sys_mmap(
+                0,
+                4096,
+                (PROT_READ | PROT_WRITE) as u64,
+                MAP_SHARED as u64,
+                memfd,
+                0,
+            )
+            .expect("scm: mmap sender memfd");
+            assert_eq_kernel!(get_u64(0x300), MAGIC, "scm: scratch seed intact");
+            // SAFETY: отображение MAP_SHARED writable на 4096 байт.
+            assert_eq_kernel!(
+                unsafe { core::ptr::read_unaligned(base as *const u64) },
+                MAGIC,
+                "scm: sender mapping sees the seed"
+            );
+            let base2 = mem_sys::sys_mmap(
+                0,
+                4096,
+                (PROT_READ | PROT_WRITE) as u64,
+                MAP_SHARED as u64,
+                got as u64,
+                0,
+            )
+            .expect("scm: mmap received fd");
+            // SAFETY: оба отображения валидны и MAP_SHARED.
+            assert_eq_kernel!(
+                unsafe { core::ptr::read_unaligned(base2 as *const u64) },
+                MAGIC,
+                "scm: mmap of the received fd aliases the sender's page"
+            );
+            // SAFETY: как выше.
+            unsafe {
+                core::ptr::write_unaligned((base2 + 8) as *mut u64, !MAGIC);
+            }
+            // SAFETY: как выше.
+            assert_eq_kernel!(
+                unsafe { core::ptr::read_unaligned((base + 8) as *const u64) },
+                !MAGIC,
+                "scm: write through the received mapping is visible to the sender"
+            );
+
+            // Закрытие отправного fd не вырывает страницы из-под отображения и
+            // не ломает принятый fd.
+            assert_eq_kernel!(io_sys::sys_close(memfd), Ok(0), "scm: close sender fd");
+            // SAFETY: отображение живо (держит кадр).
+            assert_eq_kernel!(
+                unsafe { core::ptr::read_unaligned(base2 as *const u64) },
+                MAGIC,
+                "scm: page survives the sender's close"
+            );
+            assert_eq_kernel!(
+                read_shm_word(got as u64),
+                MAGIC,
+                "scm: received fd still reads"
+            );
+            assert_eq_kernel!(
+                mem_sys::sys_munmap(base2, 4096),
+                Ok(0),
+                "scm: munmap received"
+            );
+            assert_eq_kernel!(mem_sys::sys_munmap(base, 4096), Ok(0), "scm: munmap sender");
+            assert_eq_kernel!(
+                io_sys::sys_close(got as u64),
+                Ok(0),
+                "scm: close received fd"
+            );
+
+            // ── два fd в одном cmsg + MSG_CMSG_CLOEXEC ──
+            let (m1, n1) = make_shm(b"scm-two-a", 0x1111_2222_3333_4444);
+            let (m2, n2) = make_shm(b"scm-two-b", 0x5555_6666_7777_8888);
+            put(0x100, b"XY");
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 2);
+            let space = put_cmsg_rights(0x180, &[m1 as i32, m2 as i32]);
+            assert_eq_kernel!(space, 24, "scm: CMSG_SPACE(2*sizeof(int)) = 24");
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x180, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Ok(2),
+                "scm: sendmsg with two fds"
+            );
+            put(0x140, &[0u8; 16]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 16);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, SCRATCH_VA + 0x1c0, 64);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(
+                    b,
+                    SCRATCH_VA + 0x080,
+                    0x4000_0000 /*MSG_CMSG_CLOEXEC*/
+                ),
+                Ok(2),
+                "scm: recvmsg with MSG_CMSG_CLOEXEC"
+            );
+            assert_eq_kernel!(get_u64(0x1c0), 24, "scm: one cmsg with two fd");
+            let f1 = get_i32(0x1c0 + 16);
+            let f2 = get_i32(0x1c0 + 20);
+            assert_kernel!(
+                f1 != f2 && f1 >= 3 && f2 >= 3,
+                "scm: two distinct installed fds"
+            );
+            // SAFETY: scratch readable; узлы установленных fd.
+            assert_kernel!(
+                io_sys::file_node_for_fd(f1 as u32)
+                    .map(|n| Arc::ptr_eq(&n, &n1))
+                    .unwrap_or(false),
+                "scm: first fd is the dup of the first passed fd"
+            );
+            assert_kernel!(
+                io_sys::file_node_for_fd(f2 as u32)
+                    .map(|n| Arc::ptr_eq(&n, &n2))
+                    .unwrap_or(false),
+                "scm: second fd is the dup of the second passed fd"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_fcntl(f1 as u64, 1 /*F_GETFD*/, 0),
+                Ok(1),
+                "scm: MSG_CMSG_CLOEXEC sets FD_CLOEXEC on the received fd"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_fcntl(f2 as u64, 1, 0),
+                Ok(1),
+                "scm: every received fd is close-on-exec"
+            );
+            // execve вычищает ровно close_cloexec-множество (task/process.rs).
+            assert_kernel!(
+                compat::with_current_compat(|cs| {
+                    cs.fds.close_cloexec();
+                })
+                .is_some(),
+                "scm: simulates exec close-on-exec sweep"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_fcntl(f1 as u64, 1, 0),
+                Err(Errno::EBADF),
+                "scm: cloexec fd is gone after exec"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_fcntl(f2 as u64, 1, 0),
+                Err(Errno::EBADF),
+                "scm: second cloexec fd is gone after exec"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_fcntl(a as u64, 1, 0),
+                Ok(0),
+                "scm: inherited sockets survive the exec sweep"
+            );
+            assert_eq_kernel!(io_sys::sys_close(m1), Ok(0), "scm: close m1");
+            assert_eq_kernel!(io_sys::sys_close(m2), Ok(0), "scm: close m2");
+            assert_eq_kernel!(io_sys::sys_close(a as u64), Ok(0), "scm: close end a");
+            assert_eq_kernel!(io_sys::sys_close(b as u64), Ok(0), "scm: close end b");
+        })
+        .is_some();
+        restore_synth(me, saved);
+        assert_kernel!(ran, "scm: fd passing test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "scm: fd passing routine returned every PMM frame"
+        );
+    }
+
+    /// SCM_RIGHTS: грницы/ошибки, `MSG_CTRUNC`, закрытие недоставленных fd,
+    /// отбрасывание cmsg обычным `read(2)` и то, что обычный AF_UNIX-поток
+    /// (nvim/libuv) не изменился.
+    pub fn scm_rights_truncation_and_errors() {
+        let frames_before = pmm::free_frames();
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            assert_eq_kernel!(
+                io_sys::sys_socketpair(1, 1, 0, SCRATCH_VA + 0x40),
+                Ok(0),
+                "scm-err: socketpair"
+            );
+            let a = get_u32(0x40) as u64;
+            let b = get_u32(0x44) as u64;
+
+            // ── MSG_CTRUNC: два fd, ёмкость — ровно один fd ──
+            let (t1, _tn1) = make_shm(b"scm-trunc-a", 0x1111_1111_1111_1111);
+            let (t2, tn2) = make_shm(b"scm-trunc-b", 0x2222_2222_2222_2222);
+            put(0x100, b"T");
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 1);
+            let space = put_cmsg_rights(0x180, &[t1 as i32, t2 as i32]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x180, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Ok(1),
+                "scm-err: send two fds with one byte"
+            );
+            // Отправительские fd закрыты: очередь держит dup'ы.
+            assert_eq_kernel!(io_sys::sys_close(t1), Ok(0), "scm-err: close t1");
+            assert_eq_kernel!(io_sys::sys_close(t2), Ok(0), "scm-err: close t2");
+            assert_eq_kernel!(
+                Arc::strong_count(&tn2),
+                2,
+                "scm-err: queue holds a dup of the second fd"
+            );
+            put(0x140, &[0u8; 16]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 16);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, SCRATCH_VA + 0x1c0, 20);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0),
+                Ok(1),
+                "scm-err: truncated receive still returns the data"
+            );
+            assert_kernel!(
+                get_u32(0x080 + 48) & 0x8 != 0,
+                "scm-err: MSG_CTRUNC is reported"
+            );
+            assert_eq_kernel!(
+                get_u64(0x080 + 40),
+                20,
+                "scm-err: msg_controllen = capacity"
+            );
+            assert_eq_kernel!(get_u64(0x1c0), 20, "scm-err: partial cmsg = CMSG_LEN(4)");
+            let first = get_i32(0x1c0 + 16);
+            assert_eq_kernel!(
+                read_shm_word(first as u64),
+                0x1111_1111_1111_1111,
+                "scm-err: the fd that fit is the first one"
+            );
+            assert_eq_kernel!(
+                Arc::strong_count(&tn2),
+                1,
+                "scm-err: the fd that did not fit was closed, not installed"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_close(first as u64),
+                Ok(0),
+                "scm-err: close truncated fd"
+            );
+
+            // ── без control-буфера fd закрываются, MSG_CTRUNC выставлен ──
+            let (nc, ncn) = make_shm(b"scm-nocontrol", 0x3333_3333_3333_3333);
+            put(0x100, b"N");
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 1);
+            let space = put_cmsg_rights(0x180, &[nc as i32]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x180, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Ok(1),
+                "scm-err: send N + fd"
+            );
+            assert_eq_kernel!(io_sys::sys_close(nc), Ok(0), "scm-err: close nc");
+            put(0x140, &[0u8; 16]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 16);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, 0, 0);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0),
+                Ok(1),
+                "scm-err: receive without control buffer"
+            );
+            assert_kernel!(
+                get_u32(0x080 + 48) & 0x8 != 0,
+                "scm-err: MSG_CTRUNC without a control buffer"
+            );
+            assert_eq_kernel!(get_u64(0x080 + 40), 0, "scm-err: msg_controllen = 0");
+            assert_eq_kernel!(
+                Arc::strong_count(&ncn),
+                1,
+                "scm-err: undeliverable fd is closed"
+            );
+
+            // ── read(2) отбрасывает ancillary data, как Linux ──
+            let (rd, rdn) = make_shm(b"scm-read", 0x4444_4444_4444_4444);
+            put(0x100, b"PQQQ");
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 4);
+            let space = put_cmsg_rights(0x180, &[rd as i32]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x180, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Ok(4),
+                "scm-err: send PQQQ + fd"
+            );
+            assert_eq_kernel!(io_sys::sys_close(rd), Ok(0), "scm-err: close rd");
+            assert_eq_kernel!(
+                Arc::strong_count(&rdn),
+                2,
+                "scm-err: queue holds the read-test dup"
+            );
+            put(0x140, &[0u8; 16]);
+            assert_eq_kernel!(
+                io_sys::sys_read(b, SCRATCH_VA + 0x140, 4),
+                Ok(4),
+                "scm-err: plain read(2) consumes the bytes"
+            );
+            // SAFETY: scratch writable/readable.
+            let read_data =
+                unsafe { core::slice::from_raw_parts((SCRATCH_VA + 0x140) as *const u8, 4) };
+            assert_eq_kernel!(read_data, b"PQQQ", "scm-err: plain read payload");
+            assert_eq_kernel!(
+                Arc::strong_count(&rdn),
+                1,
+                "scm-err: read(2) discards (closes) the passed fd"
+            );
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 8);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, SCRATCH_VA + 0x1c0, 64);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0x40 /*MSG_DONTWAIT*/),
+                Err(Errno::EAGAIN),
+                "scm-err: nothing left after read(2) discarded the cmsg"
+            );
+
+            // ── обычный AF_UNIX-поток не изменился ──
+            put(0x100, b"abcdef");
+            assert_eq_kernel!(
+                io_sys::sys_write(a, SCRATCH_VA + 0x100, 6),
+                Ok(6),
+                "scm-err: plain write"
+            );
+            put(0x140, &[0u8; 8]);
+            assert_eq_kernel!(
+                io_sys::sys_read(b, SCRATCH_VA + 0x140, 6),
+                Ok(6),
+                "scm-err: plain read back"
+            );
+            // SAFETY: scratch readable.
+            let echoed =
+                unsafe { core::slice::from_raw_parts((SCRATCH_VA + 0x140) as *const u8, 6) };
+            assert_eq_kernel!(echoed, b"abcdef", "scm-err: stream bytes are unchanged");
+            // data-only sendmsg/recvmsg (control = NULL) — обычный путь libuv.
+            put(0x100, b"zz");
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 2);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, 0, 0);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Ok(2),
+                "scm-err: sendmsg without control behaves like write"
+            );
+            put(0x140, &[0u8; 8]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 8);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, 0, 0);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0),
+                Ok(2),
+                "scm-err: recvmsg without control behaves like read"
+            );
+            // SAFETY: scratch readable.
+            let plain =
+                unsafe { core::slice::from_raw_parts((SCRATCH_VA + 0x140) as *const u8, 2) };
+            assert_eq_kernel!(plain, b"zz", "scm-err: data-only recvmsg payload");
+
+            // ── EINVAL: битые и неподдержанные cmsg ──
+            put(0x100, b"E");
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 1);
+            put(0x1c0, &[0u8; 32]);
+            put_u64(0x1c0, 8); // cmsg_len < sizeof(cmsghdr)
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x1c0, 24);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::EINVAL),
+                "scm-err: malformed cmsg_len is EINVAL"
+            );
+            put_u64(0x1c0, 200); // cmsg_len за пределами control-буфера
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::EINVAL),
+                "scm-err: cmsg_len past the control buffer is EINVAL"
+            );
+            put_u64(0x1c0, 32); // SOL_SOCKET/SCM_CREDENTIALS(2) не поддержан
+            put_u32(0x1c0 + 8, 1);
+            put_u32(0x1c0 + 12, 2);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x1c0, 32);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::EINVAL),
+                "scm-err: SCM_CREDENTIALS is EINVAL"
+            );
+
+            // ── EBADF: несуществующие fd в массиве и сам syscall-fd ──
+            let space = put_cmsg_rights(0x1c0, &[-1]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x1c0, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::EBADF),
+                "scm-err: negative passed fd is EBADF"
+            );
+            let space = put_cmsg_rights(0x1c0, &[4242]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x1c0, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::EBADF),
+                "scm-err: unopened passed fd is EBADF"
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(4242, SCRATCH_VA + 0x080, 0),
+                Err(Errno::EBADF),
+                "scm-err: sendmsg on a closed fd is EBADF"
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(4242, SCRATCH_VA + 0x080, 0x40),
+                Err(Errno::EBADF),
+                "scm-err: recvmsg on a closed fd is EBADF"
+            );
+
+            // ── нулевая длина sendmsg: fd валидируются, но не передаются ──
+            let (zf, zfn) = make_shm(b"scm-zero", 0x5555_5555_5555_5555);
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 0);
+            let space = put_cmsg_rights(0x1c0, &[zf as i32]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x1c0, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Ok(0),
+                "scm-err: zero-length sendmsg returns 0"
+            );
+            assert_eq_kernel!(io_sys::sys_close(zf), Ok(0), "scm-err: close zf");
+            assert_eq_kernel!(
+                Arc::strong_count(&zfn),
+                1,
+                "scm-err: zero-length sendmsg does not queue the fd"
+            );
+            // Пустой iovec с неоткрытым fd: Linux всё равно отвечает EBADF.
+            let space = put_cmsg_rights(0x1c0, &[999]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x1c0, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::EBADF),
+                "scm-err: zero-length sendmsg still validates the passed fd"
+            );
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 8);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, 0, 0);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0x40),
+                Err(Errno::EAGAIN),
+                "scm-err: zero-length sendmsg queues nothing"
+            );
+
+            // ── ENOBUFS: control-буфер сверх INT_MAX / сверх предела копии ──
+            put_msghdr(
+                0x080,
+                SCRATCH_VA + 0x0c0,
+                1,
+                SCRATCH_VA + 0x1c0,
+                0x8000_0001,
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::ENOBUFS),
+                "scm-err: msg_controllen > INT_MAX is ENOBUFS"
+            );
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x1c0, 65537);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::ENOBUFS),
+                "scm-err: control buffer above the 64 KiB copy cap is ENOBUFS"
+            );
+            put_msghdr(
+                0x080,
+                SCRATCH_VA + 0x0e0,
+                1,
+                SCRATCH_VA + 0x1c0,
+                0x8000_0001,
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0x40),
+                Err(Errno::ENOBUFS),
+                "scm-err: recvmsg msg_controllen > INT_MAX is ENOBUFS"
+            );
+
+            // ── ENOTSOCK: sendmsg/recvmsg на pipe ──
+            assert_eq_kernel!(
+                io_sys::sys_pipe2(SCRATCH_VA + 0x40, 0),
+                Ok(0),
+                "scm-err: pipe2"
+            );
+            let rfd = get_u32(0x40);
+            let wfd = get_u32(0x44);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, 0, 0);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(wfd as u64, SCRATCH_VA + 0x080, 0),
+                Err(Errno::ENOTSOCK),
+                "scm-err: sendmsg on a pipe is ENOTSOCK"
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(rfd as u64, SCRATCH_VA + 0x080, 0),
+                Err(Errno::ENOTSOCK),
+                "scm-err: recvmsg on a pipe is ENOTSOCK"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_close(rfd as u64),
+                Ok(0),
+                "scm-err: close pipe r"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_close(wfd as u64),
+                Ok(0),
+                "scm-err: close pipe w"
+            );
+
+            // ── EINVAL флагов: MSG_OOB у send, MSG_PEEK у recv ──
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, 0, 0);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 1 /*MSG_OOB*/),
+                Err(Errno::EINVAL),
+                "scm-err: MSG_OOB on AF_UNIX SOCK_STREAM is EINVAL"
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 2 /*MSG_PEEK*/),
+                Err(Errno::EINVAL),
+                "scm-err: MSG_PEEK is EINVAL (not supported, not silently wrong)"
+            );
+
+            // ── > SCM_MAX_FD(253) дескрипторов в одном cmsg — EINVAL ──
+            put(0x400, &[0u8; 1032]);
+            put_u64(0x400, 1032); // CMSG_LEN(254 * 4)
+            put_u32(0x400 + 8, 1);
+            put_u32(0x400 + 12, 1);
+            for i in 0..254u64 {
+                put_i32(0x400 + 16 + 4 * i, 3);
+            }
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x400, 1032);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::EINVAL),
+                "scm-err: more than SCM_MAX_FD descriptors is EINVAL"
+            );
+
+            assert_eq_kernel!(io_sys::sys_close(a as u64), Ok(0), "scm-err: close end a");
+            assert_eq_kernel!(io_sys::sys_close(b as u64), Ok(0), "scm-err: close end b");
+        })
+        .is_some();
+        restore_synth(me, saved);
+        assert_kernel!(ran, "scm-err: truncation/errors test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "scm-err: routine returned every PMM frame"
+        );
+    }
 }
 
 pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
@@ -8554,6 +9251,14 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "desktop-b::MAP_SHARED memfd survives fork",
             desktop_b_tests::memfd_mmap_shared_survives_fork
+        ),
+        (
+            "desktop-b::SCM_RIGHTS memfd fd passing + shared pages",
+            desktop_b_tests::scm_rights_memfd_passing
+        ),
+        (
+            "desktop-b::SCM_RIGHTS truncation, errors, plain-stream regression",
+            desktop_b_tests::scm_rights_truncation_and_errors
         ),
     ]
 }
