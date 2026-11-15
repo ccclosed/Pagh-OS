@@ -72,16 +72,17 @@ impl<T> FdSlots<T> {
         Self { slots }
     }
 
-    /// Выделить наименьший свободный индекс `>= min`, при необходимости вырастив
-    /// вектор пустыми слотами, положить туда `obj` и вернуть индекс (R2.4).
+    /// Выделить наименьший свободный индекс `>= min` в пределах
+    /// [`FD_TABLE_LIMIT`], при необходимости вырастив вектор пустыми слотами,
+    /// положить туда `obj` и вернуть индекс (R2.4).
     ///
-    /// Непогрешимо по устройству: каждый ядерный вызывающий, кроме
-    /// `fcntl(F_DUPFD)`, передаёт [`super::fd::FdTable::FIRST_DYNAMIC_FD`],
-    /// поэтому индекс ограничен числом открытых дескрипторов. Переданный
-    /// вызывающим минимум должен идти через [`FdSlots::try_alloc`].
-    pub fn alloc(&mut self, min: usize, obj: T) -> u32 {
-        let idx = lowest_free_index(&self.slots, min);
-        self.store(idx, obj)
+    /// F-r4-life-3: раньше это была непогрешимая версия, которой пользовались
+    /// `open`/`pipe`/`socket`/`accept`/`dup2`, поэтому `pipe()` после 1024 fd
+    /// выдавал индекс 1024+ и таблица росла без предела. Теперь и этот вход
+    /// ограничен тем же [`FD_TABLE_LIMIT`]; вызывающий отображает
+    /// [`TableFull`] в `EMFILE`.
+    pub fn alloc(&mut self, min: usize, obj: T) -> Result<u32, TableFull> {
+        self.try_alloc(min, FD_TABLE_LIMIT, obj)
     }
 
     /// [`FdSlots::alloc`] с жёстким пределом индекса: если наименьший свободный
@@ -119,12 +120,20 @@ impl<T> FdSlots<T> {
     /// при необходимости и заменив (освободив) уже лежащий там объект. Вернуть
     /// ранее занимавший слот объект, если он был. Используется `dup2`/`dup3`,
     /// которые называют явный целевой дескриптор.
-    pub fn set(&mut self, idx: u32, obj: T) -> Option<T> {
+    ///
+    /// F-r4-life-3: явный индекс тоже ограничен [`FD_TABLE_LIMIT`] — иначе
+    /// `dup2(old, 0x7fff_ffff)` вырастил бы `Vec` до выбранного вызывающим
+    /// индекса. `dup2`/`dup3` отображают отказ в `EBADF` (Linux: `newfd` вне
+    /// `RLIMIT_NOFILE`).
+    pub fn try_set(&mut self, idx: u32, limit: usize, obj: T) -> Result<Option<T>, TableFull> {
         let idx = idx as usize;
+        if idx >= limit {
+            return Err(TableFull);
+        }
         while self.slots.len() <= idx {
             self.slots.push(None);
         }
-        self.slots[idx].replace(obj)
+        Ok(self.slots[idx].replace(obj))
     }
 
     /// Позаимствовать объект по `fd` или `None` для слота вне диапазона/пустого

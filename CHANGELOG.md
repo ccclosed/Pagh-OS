@@ -4,6 +4,46 @@
 
 **Как читать этот файл.** Заголовок — это bump версии, не обязательно выпущенная сборка. Git-теги / GitHub-релизы существуют для `2.17.0` (2026-11-10), `2.18.6` (2026-11-10) и бандла `2.18.12-demo` (2026-11-11, демо-медиа снято с 2.18.12); `2.17.1`, `2.17.2` и серия исправлений по реальному железу `2.18.0`–`2.18.12` — это bump'ы версии, чьи заметки записаны здесь и в `AGENTS.md` и входят в следующий тегированный релиз (`2.18.13`, влит как PR #56). Полная техническая история каждого релиза — в release-note блоке `AGENTS.md`; разделы здесь называют видимое пользователю изменение и указывают туда, а не дублируют. Единственная статусная страница по находкам безопасности — `SECURITY.md`.
 
+## 2.22.9
+
+Hotfix раунда 4 (main, PR-only): пять x86-находок, каждая воспроизведена на 2.22.6.
+
+* **Read-only user-out → остановка машины навсегда (high).** `check_user_ptr` не требовал
+  `WRITABLE`, а `rt_sigprocmask`/`sigaltstack` писали `oldset`/`old_ss` в user-память
+  **внутри** `with_current_compat`. Store в present read-only страницу давал ring-0 #PF,
+  обработчик отказывал (`compat_lock_held`), а kill-путь делал повторный
+  `COMPAT_STATES.lock()` с уже выключенным IF → вечный спин. Добавлен
+  `check_user_ptr_writable` (эффективные флаги + листовой `WRITABLE`/fork-COW), все
+  `copy_out`/`copy_out_pub`/явные out-write проверяются на запись, значение вычисляется под
+  локом, а копируется после выхода. Kill-пути (#PF, #GP, синхронные исключения) отвечают
+  `compat_exists_for_exit` без лока и `abandon_held_registry` аварийно отпускают
+  удерживаемый реестр перед завершением задачи. PoC `lockpf`/`ro_sigmask`/`ro_altstack`:
+  `EFAULT`/SIGSEGV, shell жив.
+* **FPU/SSE не изолированы (high).** Инвертированное условие `(rsp as i64) < 0` делало
+  `frame_uses_fp` всегда false: FXSAVE/FXRSTOR не исполнялись, XMM0-15/x87 и FCW/MXCSR
+  перетекали между процессами. Условие исправлено (канонический верхний half + ring-3 CS
+  либо compat-фрейм), сохранение/восстановление реально идут на switch, новый pid
+  получает образ сброса (FINIT/`MXCSR=0x1f80`), а `fpu::free` затирает область мёртвого
+  pid. PoC `fpu_leak`: канарейки не текут, control mxcsr/cw сброшены.
+* **Межпакетный symlink-split установщика (high).** `own_links` строились заново на пакет,
+  а резолвер разворачивал pre-existing относительную in-root ссылку: пакет A ставил
+  `x/evil -> ../etc`, пакет B писал `x/evil/autorun` → `/mnt/etc/autorun` → root при
+  загрузке. Теперь разворачивается только точная документированная провижиненная пара
+  `lib64 -> usr/lib64`; любая другая pre-existing ссылка даёт `UnsafePath` до записи, а
+  preflight всего пакета (`refuse_preexisting_redirectors`) сохраняет атомарность. PoC
+  `craft_r4_deb.py` (r4-plant+r4-write): второй пакет отвергнут, `/mnt/etc/autorun` нет,
+  payload не исполняется; normal `.deb` и конструкции r2/r3 по-прежнему отвергаются.
+* **`SFMASK` не маскировал AC/DF/NT/IOPL (medium, spec).** Теперь `SFMask` = TF|DF|IF|IOPL|
+  AC|NT, как Linux; битсет закреплён в host-тестируемом `abi::SYSCALL_SFMASK` (QEMU #AC не
+  моделирует).
+* **fd-«cap» обходился `pipe()`/`dup2` (low).** `FD_TABLE_LIMIT` проверялся только в
+  `try_alloc` (fcntl): `pipe()` выдавал fd 1024+, а `set` рос до индекса вызывающего.
+  `alloc`/`alloc_with_flags`/`pipe`/`socketpair` теперь fallible (`EMFILE`), `dup2`/`dup3`
+  на `newfd >= 1024` отвечают `EBADF`, `FdSlots::try_set` ограничен. Host-тесты обновлены.
+
+Гейты: шесть команд, host-tests 561/0, in-QEMU selftest, PoC раунда 4 и регрессия
+r1-r3.
+
 ## 2.22.8
 
 Перевод комментариев и документации на русский по всему дереву (docs/comments-only,

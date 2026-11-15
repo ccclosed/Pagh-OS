@@ -186,6 +186,33 @@ pub enum InstallOp<'a> {
     Hardlink { path: String, target: String },
 }
 
+/// Провижиненные ссылки установочного корня, которые эффектный резолвер имеет
+/// право разворачивать, даже когда они созданы НЕ этим пакетом.
+///
+/// F-r4-vfs-1: `resolve_confined` раньше следовал любой существующей
+/// относительной in-root ссылке. Пакет A оставлял `x/evil -> ../etc`, пакет B
+/// писал `x/evil/autorun` — preflight пакета B видел только его собственные
+/// ссылки (их не было), резолвер шёл по «pre-existing» ссылке и материализовал
+/// `/etc/autorun`, который shell исполняет root'ом при следующей загрузке.
+/// Поэтому теперь разворачиваются ТОЛЬКО перечисленные здесь пары.
+///
+/// Пара точная: проверять один путь мало — `lib64 -> etc` материализовал бы
+/// член `lib64/autorun` в `/etc/autorun` при том же spelling. Документированный
+/// случай — Debian usr-merge, который pagh поддерживает для поиска ELF-
+/// интерпретатора (`/lib64/ld-linux-x86-64.so.2`).
+pub const PROVISIONED_INSTALL_LINKS: &[(&str, &str)] = &[("lib64", "usr/lib64")];
+
+/// Можно ли развернуть pre-existing ссылку `path` с целью `target`?
+///
+/// `path` — нормализованный root-relative путь самой ссылки (без ведущего `/`),
+/// `target` — её сохранённая цель дословно. Разрешены только точные пары из
+/// [`PROVISIONED_INSTALL_LINKS`]; всё остальное — `UnsafePath` до записи.
+pub fn is_provisioned_in_root_link(path: &str, target: &str) -> bool {
+    PROVISIONED_INSTALL_LINKS
+        .iter()
+        .any(|(link, link_target)| *link == path && *link_target == target)
+}
+
 /// What an archive's members mean for the installer, computed purely so the
 /// ordering rules can be property-tested on the host (issue #18, `EXT2-LINKS.md`
 /// §5).

@@ -283,7 +283,7 @@ extern "x86-interrupt" fn gp_fault_handler(stack: InterruptStackFrame, error_cod
     // Compat_Process (код выхода 139 = 128+SIGSEGV), оставив ядро и шелл
     // работать; раньше это останавливало всю машину.
     if stack.instruction_pointer.as_u64() < 0x8000_0000_0000
-        && crate::task::compat::compat_exists(pid)
+        && crate::task::compat::compat_exists_for_exit(pid)
     {
         crate::task::compat::with_current_compat(|cs| cs.exit_code = Some(139));
         crate::error!(
@@ -350,11 +350,18 @@ extern "x86-interrupt" fn page_fault_handler(
         // адресе ЯДРА по-прежнему идёт фатальным путём ниже, поэтому настоящая
         // ошибка ядра не спрячется за этим заслоном.
         let pid = crate::task::scheduler::current_pid();
+        // F-r4-arch-1: kill-путь не имеет права повторно входить в реестр.
+        // `compat_exists_for_exit` отвечает без лока, если текущее замыкание
+        // `with_current_compat` удерживает COMPAT_STATES; `abandon_held_registry`
+        // аварийно отпускает лок, чтобы exit-путь снял состояние процесса и
+        // машина осталась жива (вечный спин на нереентерабельном спинлоке с
+        // выключенными прерываниями — это отказ всей машины, а не процесса).
+        let compat_here = crate::task::compat::compat_exists_for_exit(pid);
         let action = crate::arch::x86_64::linux::trap_frame::page_fault_action(
             false,
             fault_addr.as_u64(),
             crate::arch::x86_64::linux::validate::USER_ADDR_MAX,
-            crate::task::compat::compat_exists(pid),
+            compat_here,
         );
         if action == crate::arch::x86_64::linux::trap_frame::PageFaultAction::KillProcess {
             crate::error!(
@@ -363,6 +370,7 @@ extern "x86-interrupt" fn page_fault_handler(
                 stack.instruction_pointer.as_u64(),
                 pid
             );
+            crate::task::compat::abandon_held_registry();
             crate::task::compat::with_current_compat(|cs| cs.exit_code = Some(139));
             crate::task::scheduler::exit_current();
         }
@@ -378,7 +386,8 @@ extern "x86-interrupt" fn page_fault_handler(
         fault_addr.as_u64(),
         stack.instruction_pointer.as_u64()
     );
-    if crate::task::compat::compat_exists(pid) {
+    if crate::task::compat::compat_exists_for_exit(pid) {
+        crate::task::compat::abandon_held_registry();
         crate::task::compat::with_current_compat(|cs| cs.exit_code = Some(139));
         crate::error!(
             "[EXC #14] killing Compat_Process pid={} (SIGSEGV) - kernel keeps running",
@@ -514,13 +523,19 @@ fn user_exception_or_halt_inner(
     let rip = stack.instruction_pointer.as_u64();
     let user_mode = force_user || (stack.code_segment.0 & 3) == 3;
     let pid = crate::task::scheduler::current_pid();
+    // F-r4-arch-1: тот же нереентерабельный реестр, что и в #PF. Отказ внутри
+    // `with_current_compat` (kernel store в RO user-страницу — например
+    // sigreturn-путь) раньше звал `compat_exists` и вешал CPU вторичным
+    // `lock()`; теперь решение принимается без лока, а удерживаемый лок
+    // аварийно отпускается перед завершением задачи.
     let action = exception_action(
         user_mode,
         rip,
         crate::arch::x86_64::linux::validate::USER_ADDR_MAX,
-        crate::task::compat::compat_exists(pid),
+        crate::task::compat::compat_exists_for_exit(pid),
     );
     if action == TrapAction::KillProcess {
+        crate::task::compat::abandon_held_registry();
         crate::task::compat::with_current_compat(|cs| cs.exit_code = Some(128 + signal));
         crate::error!(
             "[EXC #{}] killing Compat_Process pid={} ({}) - kernel keeps running",

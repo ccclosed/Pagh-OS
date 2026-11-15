@@ -37,14 +37,14 @@ fn create(mask: u64, flags: u64) -> Result<u64, Errno> {
     let fd = compat::with_current_compat(|cs| {
         let fd = cs
             .fds
-            .alloc_with_flags(OpenObject::Signalfd { mask }, O_RDWR | (flags & O_NONBLOCK));
+            .alloc_with_flags(OpenObject::Signalfd { mask }, O_RDWR | (flags & O_NONBLOCK))?;
         if flags & SFD_CLOEXEC != 0 {
             cs.fds.set_cloexec(fd, true);
         }
-        fd
+        Ok::<u64, Errno>(fd as u64)
     })
-    .ok_or(Errno::EBADF)?;
-    Ok(fd as u64)
+    .ok_or(Errno::EBADF)??;
+    Ok(fd)
 }
 
 /// `signalfd` (282) — форма без флагов.

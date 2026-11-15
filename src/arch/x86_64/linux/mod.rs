@@ -94,6 +94,53 @@ pub(crate) fn check_user_ptr(start: u64, len: u64) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Проверить пользовательский диапазон, в который ядро будет **писать**:
+/// [`check_user_ptr`] плюс право записи на каждой странице.
+///
+/// ПОЧЕМУ отдельная проверка: `check_user_ptr` доказывает только отображение и
+/// доступность из ring 3. Store в present read-only страницу (например `.text`
+/// ELF или `mprotect(PROT_READ)`) даёт #PF в ring 0, и раньше это могло
+/// остановить машину: под `with_current_compat` обработчик отказа не имеет права
+/// повторно брать реестр, а kill-путь брал его второй раз (F-r4-arch-1). Каждый
+/// путь, который копирует данные НАРУЖУ, должен отвергнуть такой буфер с
+/// `EFAULT` до записи.
+///
+/// fork-COW лист намеренно read-only: пользовательская запись в него законна и
+/// обслуживается обработчиком #PF приватной копией, поэтому COW-лист без
+/// `RO_BIT` (явный `mprotect(PROT_READ)`) считается записываемым. `RO_BIT` —
+/// маркер «отображение запрещает запись», и запись в него обязана стать
+/// SIGSEGV, а не EFAULT, но обработчик syscall до неё не доходит.
+pub(crate) fn check_user_ptr_writable(start: u64, len: u64) -> Result<(), Errno> {
+    use validate::PtrCheck;
+    if validate::check_user_range(start, len) == PtrCheck::Efault {
+        return Err(Errno::EFAULT);
+    }
+    use x86_64::structures::paging::PageTableFlags;
+    for page in validate::spanned_pages(start, len) {
+        // Эффективные права всего обхода: `USER_ACCESSIBLE` обязан стоять на
+        // каждом уровне, иначе ring 3 не смог бы писать сам.
+        let flags = crate::memory::vmm::page_flags(page).ok_or(Errno::EFAULT)?;
+        if !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+            return Err(Errno::EFAULT);
+        }
+        // `page_flags` пересекает флаги уровней и потому теряет программные
+        // листовые биты (`COW_BIT`, `RO_BIT`); владение листом читается из
+        // самого PTE. Пользовательские страницы ядро не мапит huge-страницами,
+        // поэтому листовой PTE — 4 КиБ-страница, которую и увидит запись.
+        let leaf = crate::memory::vmm::walk_pte(page)
+            .map(|pte| pte.flags())
+            .ok_or(Errno::EFAULT)?;
+        let writable =
+            flags.contains(PageTableFlags::WRITABLE) && leaf.contains(PageTableFlags::WRITABLE);
+        let cow_writable = leaf.contains(crate::memory::vmm::COW_BIT)
+            && !leaf.contains(crate::memory::vmm::RO_BIT);
+        if !writable && !cow_writable {
+            return Err(Errno::EFAULT);
+        }
+    }
+    Ok(())
+}
+
 /// Выдать диагностику `-ENOSYS` для `nr` не чаще раза на номер (R12.2).
 ///
 /// Для Compat_Process per-process множество `nosys_logged` дедуплицирует запись,
@@ -275,7 +322,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             // валидируем ровно диапазон, который ядро выделит/скопирует, и никогда
             // не просим сырой u64-счётчик.
             let len = crate::arch::x86_64::linux::abi::socket_payload_len(a[2], false)?;
-            check_user_ptr(a[1], len)?;
+            check_user_ptr_writable(a[1], len)?;
             // Буфер полезной нагрузки проверен, но эта ветка — единственный
             // сокетный путь, пишущий sockaddr обратно в память пользователя. Оба
             // выхода — простые пользовательские указатели (16 байт достигали
@@ -286,18 +333,18 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
                 // `addrlen` — socklen_t (4 байта); sockaddr — 16 байт
                 // (sockaddr_in) или 28 (sockaddr_in6), проверяется по семейству
                 // ниже.
-                check_user_ptr(a[5], 4)?;
+                check_user_ptr_writable(a[5], 4)?;
             } else {
                 // Один указатель без другого — бессмысленный запрос; Linux в этом
                 // случае игнорирует выход, и мы тоже.
             }
             let mut buf = alloc::vec![0u8; len as usize];
             let (n, src) = crate::arch::x86_64::linux::inet_sock::udp_recvfrom_fd(a[0], &mut buf)?;
-            crate::arch::x86_64::linux::io_sys::copy_out_pub(a[1], &buf[..n]);
+            crate::arch::x86_64::linux::io_sys::copy_out_pub(a[1], &buf[..n])?;
             if a[4] != 0 && a[5] != 0 {
                 match src.addr {
                     crate::net::IpAddr::V4(v4) => {
-                        check_user_ptr(a[4], 16)?;
+                        check_user_ptr_writable(a[4], 16)?;
                         // struct sockaddr_in { family=2, port(be16), addr, zero }
                         let mut sa = [0u8; 16];
                         sa[0..2].copy_from_slice(&2u16.to_ne_bytes());
@@ -313,7 +360,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
                         }
                     }
                     crate::net::IpAddr::V6(v6) => {
-                        check_user_ptr(a[4], 28)?;
+                        check_user_ptr_writable(a[4], 28)?;
                         // struct sockaddr_in6 { family=10, port(be16), flowinfo,
                         // addr(16), scope_id }
                         let mut sa = [0u8; 28];

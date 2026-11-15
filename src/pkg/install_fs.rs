@@ -47,6 +47,19 @@
 //!     Абсолютные цели отвергаются сразу — их ремап в гостевой namespace и есть
 //!     то, что делало их relative-to-install-root.
 //!
+//! ## Кросс-пакетная политика ссылок (F-r4-vfs-1)
+//!
+//! `own_links`/`own_link_inos` описывают только ссылки ТЕКУЩЕГО пакета, а
+//! ссылка, установленная предыдущим пакетом, для следующего — обычная
+//! pre-existing. Round-4 PoC: A ставит `x/evil -> ../etc`, B пишет
+//! `x/evil/autorun` без своих ссылок → preflight B пуст, резолвер разворачивает
+//! чужую ссылку и пишет `/mnt/etc/autorun`. Поэтому разворот pre-existing
+//! ссылки разрешён ТОЛЬКО для точных документированных пар
+//! [`PROVISIONED_INSTALL_LINKS`] (`lib64 -> usr/lib64`); любая другая —
+//! [`InstallError::UnsafePath`] **до записи члена**, а
+//! [`refuse_preexisting_redirectors`] проверяет весь пакет до первого inode,
+//! чтобы отказ остался атомарным.
+//!
 //! Цели hard-link разрешаются тем же confined walker'ом (финальный компонент не
 //! разворачивается, как требует `link(2)`), так что враждебный архив не может
 //! захардлинковать узел снаружи корня.
@@ -181,6 +194,11 @@ pub fn install_data_tar(entries: &[TarEntry<'_>], root: &str) -> Result<usize, I
     // the materialized path it would be written through the archive's own link.
     // Refuse that package here, before the first inode, so the refusal stays atomic.
     refuse_spelling_split(root, &plan)?;
+    // F-r4-vfs-1: the same split across packages. A pre-existing link created by
+    // an earlier package cannot be told apart from a provisioned one, so the only
+    // links the resolver may follow are the exact documented pairs. Refuse the
+    // whole package before the first inode.
+    refuse_preexisting_redirectors(root, &plan)?;
 
     let mut installed = 0usize;
     // Symlink paths this same install creates. Layer 2 (the effectful resolver)
@@ -310,13 +328,20 @@ fn refuse_spelling_split(root: &str, plan: &InstallPlan<'_>) -> Result<(), Insta
         let (parents, filename) = comps.split_at(comps.len() - 1);
         let dir_rel = parents.join("/");
         let dir_abs = join_abs(root, &dir_rel);
-        let Ok((_dir, walked)) =
-            resolve_confined(root, &dir_rel, &dir_abs, true, false, &no_links, &no_inos)
-        else {
-            // The parent does not exist yet (the archive creates it) or is not a
-            // traversable in-root directory: no pre-existing spelling split.
-            continue;
-        };
+        let (_dir, walked) =
+            match resolve_confined(root, &dir_rel, &dir_abs, true, false, &no_links, &no_inos) {
+                Ok(v) => v,
+                // A pre-existing link outside the documented allowlist in the link's
+                // own parent chain is a cross-package redirector (F-r4-vfs-1): refuse
+                // the package now, before any inode is created, instead of letting
+                // `install_symlink` hit the refusal after the earlier members landed.
+                Err(ResolveFailure::Unsafe(reason)) => {
+                    return Err(unsafe_path(&dir_abs, reason));
+                }
+                // The parent does not exist yet (the archive creates it) or is not a
+                // traversable in-root directory: no pre-existing spelling split.
+                Err(_) => continue,
+            };
         let resolved_rel = join_rel(&walked, filename[0]);
         if resolved_rel == *path {
             continue;
@@ -330,6 +355,48 @@ fn refuse_spelling_split(root: &str, plan: &InstallPlan<'_>) -> Result<(), Insta
                     path,
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Проверить весь план против дерева, каким оно существует ДО установки, и
+/// отказать пакету, если хоть один член материализовался бы через pre-existing
+/// ссылку вне [`super::install::PROVISIONED_INSTALL_LINKS`] (F-r4-vfs-1).
+///
+/// Проверяются родительские цепочки обычных членов и hard-link'ов (цели
+/// hard-link'ов резолвятся lstat-стилем, без разворота финального компонента).
+/// Отсутствующий компонент — нормально: его создаст этот же пакет, а ссылки под
+/// ещё не существующим каталогом быть не может. `Unsafe` возвращается сразу,
+/// поэтому отказ атомарный; прочие ошибки игнорируются — их сообщит настоящая
+/// установка с точным путём.
+fn refuse_preexisting_redirectors(root: &str, plan: &InstallPlan<'_>) -> Result<(), InstallError> {
+    let no_links: BTreeSet<String> = BTreeSet::new();
+    let no_inos: BTreeSet<u64> = BTreeSet::new();
+    let mut paths: Vec<&str> = Vec::with_capacity(plan.ops.len());
+    for op in plan.ops.iter() {
+        match op {
+            InstallOp::File { path, .. } | InstallOp::Symlink { path, .. } => paths.push(path),
+            InstallOp::Hardlink { path, target } => {
+                paths.push(path);
+                paths.push(target);
+            }
+        }
+    }
+    for path in paths {
+        let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        if comps.len() < 2 {
+            continue;
+        }
+        let (parents, _) = comps.split_at(comps.len() - 1);
+        let dir_rel = parents.join("/");
+        let dir_abs = join_abs(root, &dir_rel);
+        match resolve_confined(root, &dir_rel, &dir_abs, true, false, &no_links, &no_inos) {
+            Ok(_) => {}
+            Err(ResolveFailure::Unsafe(reason)) => {
+                return Err(unsafe_path(&dir_abs, reason));
+            }
+            Err(_) => {}
         }
     }
     Ok(())
@@ -552,7 +619,9 @@ const INSTALL_MAX_EXPANDED_BYTES: usize = 4096;
 /// install-root-relative paths — that mapping is exactly what the attack relied on.
 /// A link this same install created (`own_links`) is never followed at all, and
 /// neither is a symlink that has more than one hard link: it may be reached through
-/// an unmarked hard-link alias (F-r2-vfs-1).
+/// an unmarked hard-link alias (F-r2-vfs-1). A pre-existing link is followed only
+/// when it is one of the exact [`super::install::PROVISIONED_INSTALL_LINKS`]
+/// pairs (F-r4-vfs-1); anything else is refused before the member is created.
 ///
 /// `follow_final` selects `true` for a parent directory (a member is placed
 /// inside it) and `false` for a hard-link target (`link(2)` does not follow the
@@ -668,6 +737,16 @@ fn resolve_confined(
             if target.starts_with('/') {
                 return Err(ResolveFailure::Unsafe(
                     "absolute symlink target (only relative in-root links are followed)",
+                ));
+            }
+            // F-r4-vfs-1: a link that is not ours and is not one of the exact
+            // documented provisioning pairs is a pre-existing redirector. Following
+            // it is the cross-package split (package A plants `x/evil -> ../etc`,
+            // package B writes `x/evil/autorun`). Refuse before splicing/creating
+            // anything; the allowed pair is pinned to its exact target too.
+            if !super::install::is_provisioned_in_root_link(&link_rel, &target) {
+                return Err(ResolveFailure::Unsafe(
+                    "pre-existing symlink outside the documented installer allowlist",
                 ));
             }
             links = links.saturating_add(1);
