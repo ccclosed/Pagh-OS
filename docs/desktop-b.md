@@ -1,8 +1,10 @@
-# Desktop B: kernel UAPI для userspace-композитора (2.24.0)
+# Desktop B: kernel UAPI для userspace-композитора (2.24.0 + SCM_RIGHTS)
 
-**Статус:** реализовано в ядре Pagh-OS 2.24.0. Композитор (`pagh-desktop`) —
-отдельный userspace-процесс; этот документ описывает **только** примитивы,
-которые ему нужны от ядра. Самого композитора здесь нет.
+**Статус:** базовые примитивы реализованы в ядре Pagh-OS 2.24.0; `SCM_RIGHTS`
+(fd passing, §6) добавлен отдельным изменением поверх 2.24.0 — `Cargo.toml`
+в нём не менялся, `dev` по-прежнему несёт 2.24.0. Композитор
+(`pagh-desktop`) — отдельный userspace-процесс; этот документ описывает
+**только** примитивы, которые ему нужны от ядра. Самого композитора здесь нет.
 
 Вариант B: userspace-сервер рисует кадр в разделяемую память и отдаёт его
 `/dev/fb0`; ввод читает из `/dev/input/event0`. Kernel-консоль после handover
@@ -31,7 +33,8 @@ ABI ниже проверен host-тестами против `linux/fb.h` и `
 | 3 | `close` | отпустить fd (страницы живут, пока живы отображения) |
 | 56 | `clone` | fork-ребёнок (`SIGCHLD`, glibc `fork()`); `CLONE_VM|CLONE_THREAD` — потоки |
 | 59 | `execve` | запуск клиентов; маппинги старого AS снимаются, fd (без `CLOEXEC`) наследуются |
-| 1 / 0 | `write` / `read` | AF_UNIX (`socketpair`/`connect`) уже есть; SCM_RIGHTS — см. §6 |
+| 1 / 0 | `write` / `read` | AF_UNIX (`socketpair`/`connect`) уже есть; контроль ancillary data не несут |
+| 46 / 47 | `sendmsg` / `recvmsg` | AF_UNIX `SCM_RIGHTS`: клиент передаёт композитору memfd (см. §6) |
 
 `fork` (57) и `vfork` (58) **не** поддерживаются как отдельные номера:
 glibc `fork()` идёт через `clone(SIGCHLD)`, и этот путь работает.
@@ -435,15 +438,187 @@ for (;;) {
 
 ---
 
-## 7. Ограничения и остаток
+## 7. `SCM_RIGHTS`: передача memfd между клиентом и композитором
 
-Этот PR даёт **kernel-примитивы**, а не готовый композитор. Чего ещё нет:
+`sendmsg`/`recvmsg` для AF_UNIX `SOCK_STREAM` (`socketpair`, `connect`/
+`accept`) поддерживают ancillary data `SOL_SOCKET`/`SCM_RIGHTS` с массивом
+`int fd`. Это Linux-совместимое подмножество: раскладка структур и наблюдаемое
+поведение сверены с Linux x86_64 (см. §7.7), а неподдержанные части названы
+ниже явно.
 
-* **SCM_RIGHTS / fd passing**: `sendmsg`/`recvmsg` с cmsg не реализованы.
-  Клиент не может передать memfd композитору через AF_UNIX. Пока рабочие
-  варианты — запускать клиента через `fork`/`execve` от композитора (fd
-  наследуется) или добавить SCM_RIGHTS отдельным PR. Это главный оставшийся
-  ABI-пробел варианта B.
+### 6.1. Syscall'ы и флаги
+
+| nr | syscall | args | Флаги, которые принимаются |
+|---|---|---|---|
+| 46 | `sendmsg` | `fd`, `struct msghdr *`, `flags` | `MSG_DONTWAIT` 0x40, `MSG_EOR` 0x80, `MSG_NOSIGNAL` 0x4000 |
+| 47 | `recvmsg` | `fd`, `struct msghdr *`, `flags` | `MSG_DONTWAIT` 0x40, `MSG_CMSG_CLOEXEC` 0x40000000 |
+
+Прочие биты `flags` — `EINVAL` (в частности `MSG_OOB` у `sendmsg` и
+`MSG_PEEK`/`MSG_WAITALL` у `recvmsg`: молча вернуть не то было бы хуже отказа).
+`fd` — только AF_UNIX socket; AF_INET TCP/UDP поддержаны в data-only виде
+(`SCM_RIGHTS` через них — `EINVAL`). Не-сокет — `ENOTSOCK`, непривязанный/
+неподключённый AF_UNIX — `ENOTCONN`.
+
+### 6.2. Раскладка (x86_64 Linux)
+
+`struct msghdr` — 56 байт:
+
+| offset | size | поле |
+|---|---|---|
+| 0 | 8 | `msg_name` (игнорируется: у подключённого stream адреса нет) |
+| 8 | 4 | `msg_namelen` (на выходе 0) |
+| 16 | 8 | `msg_iov` — `struct iovec[]` |
+| 24 | 8 | `msg_iovlen` (≤ `IOV_MAX` 1024) |
+| 32 | 8 | `msg_control` |
+| 40 | 8 | `msg_controllen` |
+| 48 | 4 | `msg_flags` (на выходе — входные флаги \| `MSG_CTRUNC`) |
+
+`struct iovec` — 16 байт (`void *iov_base`, `size_t iov_len`);
+`struct cmsghdr` — 16 байт: `size_t cmsg_len`, `int cmsg_level`,
+`int cmsg_type`, дальше полезная нагрузка. Следующий cmsg начинается с
+`CMSG_ALIGN(cmsg_len) = (cmsg_len + 7) & ~7`; `CMSG_LEN(n) = 16 + n`,
+`CMSG_SPACE(n) = CMSG_ALIGN(16 + n)`. Для `SCM_RIGHTS`
+(`cmsg_level = SOL_SOCKET = 1`, `cmsg_type = SCM_RIGHTS = 1`) нагрузка —
+массив `int fd` (`n = 4 * число fd`), до `SCM_MAX_FD = 253` дескрипторов в
+одном cmsg. Несколько `SCM_RIGHTS` cmsg в одном `sendmsg` накапливаются в
+порядке появления (как Linux); cmsg чужих уровней (например `IPPROTO_TCP`)
+игнорируются, неизвестный тип `SOL_SOCKET` — `EINVAL`.
+
+Пределы этого ядра: данные одного `sendmsg`/`recvmsg` — ≤ 1 МиБ
+(`EMSGSIZE`), control-буфер отправки — ≤ 64 КиБ и ≤ `INT_MAX` (`ENOBUFS`).
+Первый предел — тот же `MAX_SOCKET_IO`, что у `sendto`/`recvfrom`; второй
+ограничивает копию control-буфера в ядро (законный `SCM_RIGHTS` ≤
+`CMSG_SPACE(1012) = 1028` байт).
+
+### 6.3. Семантика доставки
+
+* **fd дублируются, отправитель не теряет свой.** Получатель получает новый
+  номер (наименьший свободный ≥ 3) в **своей** таблице; режим доступа
+  (`O_RDONLY`/`O_RDWR`) наследуется. Два fd в одном cmsg приходят двумя
+  разными номерами.
+* **`FD_CLOEXEC`** ставится только при `MSG_CMSG_CLOEXEC`; `execve` вычищает
+  такие дескрипторы (как обычно, по `FdTable::close_cloexec`).
+* **Границы потока.** Ancillary data привязаны к первому байту своей записи
+  `sendmsg`: `recvmsg` может вернуть данные, отправленные раньше, и данные
+  этой записи, но не идёт дальше её конца; следующая запись читается следующим
+  вызовом. Два `recvmsg` подряд не могут получить cmsg из чужой записи.
+* **Данные + control в одном вызове** — штатный путь: `sendmsg` пишет payload
+  и привязывает fd к его первому байту; `recvmsg` возвращает payload и cmsg.
+* **`sendmsg` с нулевой длиной данных** возвращает 0 и fd не передаёт (Linux
+  для SOCK_STREAM тоже не создаёт запись в потоке).
+* **`read`/`readv`** не принимают ancillary data: проход мимо позиции cmsg
+  отбрасывает (закрывает) её fd. Если control-буфера нет или он мал,
+  `recvmsg` закрывает не поместившиеся fd и выставляет `MSG_CTRUNC`; в
+  `msg_controllen` возвращается использованная ёмкость (Linux-правило:
+  при частичном размещении — вся ёмкость, при полном — `CMSG_SPACE(cmsg_len)`,
+  но не больше ёмкости).
+* **Без cmsg поведение не изменилось**: data-only `sendmsg`/`recvmsg` идут по
+  тем же очередям, что `write`/`read`; nvim/libuv (msgpack-rpc через
+  socketpair) не затронуты.
+* **Дубликат — это `dup`**: общий VFS-узел/страницы memfd, но собственное
+  смещение чтения/записи (в ядре нет разделяемого open-file-description; для
+  memfd это не наблюдаемо — данные ходят через `mmap(MAP_SHARED)`/`pread`).
+
+### 6.4. Ошибки
+
+| errno | Когда |
+|---|---|
+| `EBADF` | нет самого fd; передан неоткрытый/отрицательный fd в массиве |
+| `ENOTSOCK` | `sendmsg`/`recvmsg` на не-сокете (pipe, файл, консоль) |
+| `ENOTCONN` | AF_UNIX ещё не подключён (unbound/listener) |
+| `EINVAL` | битый cmsg (`cmsg_len < 16` или за буфером), неизвестный `SOL_SOCKET`-тип, > 253 fd, неподдержанные флаги |
+| `ENOBUFS` | `msg_controllen > INT_MAX`; у `sendmsg` ещё и control > 64 КиБ |
+| `EMSGSIZE` | сумма iovec > 1 МиБ; `msg_iovlen > 1024` |
+| `EAGAIN` | неблокирующий вызов (`O_NONBLOCK`/`MSG_DONTWAIT`) без данных/места |
+| `EPIPE` | приёмный конец закрыт до отправки |
+| `EMFILE` | в fd-таблице получателя нет места (частичной доставки нет) |
+| `EFAULT` | недоступный пользовательский указатель (проверяется и перед записью) |
+
+### 6.5. Ограничения
+
+* `SCM_CREDENTIALS`/`SO_PASSCRED` не поддержаны: такой cmsg — `EINVAL`.
+* `MSG_PEEK`/`MSG_WAITALL`/`MSG_TRUNC` не поддержаны (`EINVAL`).
+* `sendmsg` с `SCM_RIGHTS` по AF_INET TCP/UDP — `EINVAL` (Linux тоже не
+  передаёт fd, но здесь отказ явный, а не тихая потеря).
+* Ядро не имеет `unix_gc`: если процесс передаёт конец socketpair самому себе
+  и закрывает все обычные ссылки, очередь с cmsg образует цикл Arc и остаётся
+  в куче ядра. Это утечка kernel-heap при враждебном сценарии, не PMM-кадров
+  и не данных других процессов; для протокола композитора не встречается.
+
+### 6.6. Пример для композитора (C)
+
+Клиент передаёт memfd вместе с заголовком запроса:
+
+```c
+struct create_surface { uint32_t w, h, stride, format; };
+
+int shm = memfd_create("surface-7", 0);            /* 319 */
+ftruncate(shm, w * h * 4);                          /* 77  */
+uint32_t *px = mmap(NULL, w * h * 4, PROT_READ | PROT_WRITE,
+                    MAP_SHARED, shm, 0);            /* 9   */
+
+struct create_surface req = { w, h, w * 4, FORMAT_ARGB8888 };
+struct msghdr msg = {0};
+struct iovec iov = { .iov_base = &req, .iov_len = sizeof req };
+char cbuf[CMSG_SPACE(sizeof(int))];
+msg.msg_iov = &iov;         msg.msg_iovlen = 1;
+msg.msg_control = cbuf;     msg.msg_controllen = sizeof cbuf;
+struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+c->cmsg_level = SOL_SOCKET;
+c->cmsg_type  = SCM_RIGHTS;
+c->cmsg_len   = CMSG_LEN(sizeof(int));
+memcpy(CMSG_DATA(c), &shm, sizeof shm);
+if (sendmsg(ctl, &msg, 0) != (ssize_t)sizeof req)
+        fatal("sendmsg: surface fd not passed");
+```
+
+Композитор принимает fd в свою таблицу (он живёт и после закрытия сокета
+клиентом):
+
+```c
+struct create_surface req;
+struct msghdr msg = {0};
+struct iovec iov = { .iov_base = &req, .iov_len = sizeof req };
+char cbuf[CMSG_SPACE(sizeof(int) * 4)];
+msg.msg_iov = &iov;         msg.msg_iovlen = 1;
+msg.msg_control = cbuf;     msg.msg_controllen = sizeof cbuf;
+ssize_t n = recvmsg(ctl, &msg, MSG_CMSG_CLOEXEC);   /* 47 */
+if (n != (ssize_t)sizeof req) fatal("recvmsg");
+if (msg.msg_flags & MSG_CTRUNC) fatal("control truncated");
+
+int shm = -1;
+for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
+                memcpy(&shm, CMSG_DATA(c), sizeof shm);
+        }
+}
+if (shm < 0) fatal("no SCM_RIGHTS");
+void *px = mmap(NULL, req.stride * req.h, PROT_READ, MAP_SHARED, shm, 0);
+/* ... composite ... */
+close(shm);
+```
+
+`MSG_CMSG_CLOEXEC` здесь обязателен, если композитор потом запускает клиентов:
+иначе принятый fd унаследуется `execve`-ребёнком.
+
+### 6.7. Проверка
+
+Linux-поведение снято одноразовым пробником на хосте (socketpair + memfd):
+`sizeof(struct msghdr) = 56`, `CMSG_SPACE(sizeof(int)) = 24`, `recvmsg`
+останавливается на записи с cmsg, `msg_controllen` возвращается как
+использованная ёмкость, при ёмкости `< 20` байт cmsg не пишется и
+выставляется `MSG_CTRUNC`, частичная ёмкость доставляет столько fd, сколько
+влезло, остальные закрываются, `read(2)` отбрасывает fd, `sendmsg` нулевой
+длины fd не передаёт. Эти числа закреплены host-тестами
+`src/arch/x86_64/linux/cmsg.rs` (+ свойства `scm_cmsg`) и in-QEMU routine
+`desktop-b::SCM_RIGHTS …`; полный список — §8.
+
+---
+
+## 8. Ограничения и остаток
+
+Этот слой даёт **kernel-примитивы**, а не готовый композитор. Чего ещё нет:
+
 * **Wayland/xdg-shell**: первый протокол — собственный AF_UNIX + memfd, не
   Wayland.
 * **DMA-BUF / GPU / EGL / GBM**: нет; только программный blit в scanout.
@@ -452,12 +627,10 @@ for (;;) {
 * **fbdev modeset** (`FBIOPUT_VSCREENINFO`) и панорамирование: нет.
 * **PTY/терминал в окне**: kernel-shell остаётся особым случаем; userspace PTY
   появится отдельно.
-* **SCM_RIGHTS-путь** также нужен для `pagh-desktop`-клиентов, не являющихся
-  потомками композитора.
 
 ---
 
-## 8. Проверка (evidence)
+## 9. Проверка (evidence)
 
 Host-тесты (`python3 tools/host_tests.py`) исполняют точный исходник ядра:
 
@@ -469,7 +642,12 @@ Host-тесты (`python3 tools/host_tests.py`) исполняют точный 
   cursor/margins/cells/total), клетка 16 байт, `PGVT_IOC_INFO`, валидатор
   границ и seqlock-паритет;
 * `src/drivers/vt_keys.rs` — VT-байты → set-1: printable/Shift/Ctrl, стрелки и
-  CSI-split между write'ами, backspace/tab, отброс UTF-8.
+  CSI-split между write'ами, backspace/tab, отброс UTF-8;
+* `src/arch/x86_64/linux/cmsg.rs` — 56/16/24 байта `msghdr`/`cmsghdr`/
+  `CMSG_SPACE(int)`, разбор control-буфера (`__scm_send`-семантика: битые
+  `cmsg_len`, чужие уровни, `SCM_MAX_FD`, слияние нескольких cmsg) и таблица
+  доставки/усечения `recvmsg`; host-свойства `properties/scm_cmsg.rs` гоняют
+  encode/decode round-trip и инварианты плана доставки на произвольных входах.
 
 In-QEMU (`python3 tools/e2e.py selftest`) гоняет routines:
 
@@ -481,12 +659,23 @@ In-QEMU (`python3 tools/e2e.py selftest`) гоняет routines:
 * `desktop-b::memfd ftruncate + MAP_SHARED coherence` — fd↔mapping
   согласованность, два отображения, `mprotect`, отказ `MAP_SHARED` не-memfd;
 * `desktop-b::MAP_SHARED memfd survives fork` — общий кадр после
-  `fork_user_space_cow`, запись родителя видна ребёнку, `SHARED_BIT` не COW.
+  `fork_user_space_cow`, запись родителя видна ребёнку, `SHARED_BIT` не COW;
 * `desktop-b::/dev/vtconsole0 shared VT surface + vtinput` — open → ioctl
   `PGVT_IOC_INFO` → read-only `mmap` → в снимке найден напечатанный маркер shell
   → `mprotect(PROT_WRITE)` = `EACCES`; запись команды в `/dev/vtinput`; после
   `selftest` shell выполняет её (`vtinput-ok` в serial — это проверяет
   `tools/e2e.py selftest`).
+* `desktop-b::SCM_RIGHTS memfd fd passing + shared pages` — data+fd одним
+  `sendmsg` → `recvmsg` с cmsg → `mmap(MAP_SHARED)` принятого fd видит байты
+  отправителя и наоборот, отправитель сохраняет fd, дубликат ссылается на тот
+  же узел и наследует режим доступа, два fd в одном cmsg,
+  `MSG_CMSG_CLOEXEC` + exec-вычистка (`close_cloexec`), закрытие отправного fd
+  не вырывает страницы;
+* `desktop-b::SCM_RIGHTS truncation, errors, plain-stream regression` —
+  `MSG_CTRUNC` при ёмкости control на один fd (второй закрывается, а не
+  устанавливается), приём без control-буфера, `read(2)` отбрасывает fd,
+  `EINVAL`/`EBADF`/`ENOBUFS`/`ENOTSOCK`, data-only `sendmsg`/`recvmsg` и
+  обычные `write`/`read` на том же socketpair не изменились.
 
 Все проверки выполняются в свежем пользовательском PML4 и возвращают кадры в
-PMM (`SELFTEST SUMMARY: … 0 failed checks`).
+PMM (`SELFTEST SUMMARY: 106 routines, 0 failed checks`).

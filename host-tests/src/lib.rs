@@ -53,6 +53,13 @@ pub mod io;
 #[path = "../../src/arch/x86_64/linux/abi.rs"]
 pub mod abi;
 
+// Ancillary data (`cmsg`) AF_UNIX SCM_RIGHTS: разметка msghdr/cmsghdr,
+// разбор control-буфера отправки и план доставки fd на приёме. Модуль
+// `core`+`alloc`-only, поэтому host-свойства исполняют ровно тот исходник,
+// который компилирует ядро (`src/arch/x86_64/linux/cmsg.rs`).
+#[path = "../../src/arch/x86_64/linux/cmsg.rs"]
+pub mod cmsg;
+
 // Process credentials + POSIX permission/setuid decisions (security model).
 // `core`-only and self-contained, so the same source the kernel compiles is
 // exercised by property P56 and its inline unit tests.
@@ -653,6 +660,13 @@ mod properties {
     // frame is freed exactly once and only when no PTE maps it anymore;
     // descriptive name, same policy as `page_fault`/`irq_frame`.
     mod cow_ownership;
+
+    // AF_UNIX SCM_RIGHTS fd passing (desktop B): `sendmsg` control-buffer
+    // decoding (`__scm_send`), Linux-observed `recvmsg` delivery/truncation
+    // plan, and the encode/decode round trip. Pure `cmsg` layout only — the
+    // effectful fd-table half is covered by the in-QEMU `desktop-b::SCM_RIGHTS`
+    // routines.
+    mod scm_cmsg;
 
 }
 
