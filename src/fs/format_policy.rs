@@ -1,98 +1,75 @@
-//! When may pagh format a block device?
+//! Когда pagh вправе форматировать блочное устройство.
 //!
-//! `boot::init_fs` used to format whenever `Ext2Fs::mount` failed *and* the ext2
-//! superblock magic was absent. On a real machine that is the normal case for the
-//! machine's **own** disk: the check reads byte 1024 of the raw namespace, which on
-//! a GPT/MBR disk is the partition entry array, so a partitioned non-ext2 disk was
-//! classified "blank" and erased — partition table, per-group metadata across the
-//! whole device and the backup GPT at the tail (issue #33).
+//! Политика намеренно **чистая** (`core`-only, без I/O): устройство зондирует
+//! вызывающий и передаёт байты сюда, поэтому host-tests проверяют само решение
+//! (свойство P50) на реальных boot-областях GPT/MBR/ext2, не полагаясь на QEMU.
 //!
-//! The policy below is the fix. It is deliberately **pure** (`core`-only, no I/O):
-//! the caller probes the device and feeds the bytes in, so `host-tests` can assert
-//! the decision itself against real GPT/MBR/ext2 boot areas (property P50) instead
-//! of hoping a QEMU run happens to cover it — no test in CI ever boots the kernel.
+//! Правила по порядку:
 //!
-//! Rule, in order:
-//!
-//! 1. a *mountable* ext2 superblock means "this is a filesystem" — never format,
-//!    whatever else the device looks like (`Refusal::ExistingFilesystem`);
-//! 2. a device whose probed boot area is entirely zero is genuinely blank and is
-//!    the only thing pagh formats on its own;
-//! 3. `allow_destructive` (an explicit opt-in, not wired to a caller yet) is the
-//!    only way past a foreign layout;
-//! 4. everything else is refused, naming what was found.
+//! 1. *монтируемый* суперблок ext2 — это ФС, не форматировать никогда, что бы
+//!    ещё ни лежало на устройстве (`Refusal::ExistingFilesystem`);
+//! 2. целиком нулевая зондируемая boot-область действительно пуста, и только
+//!    её pagh форматирует сам;
+//! 3. `allow_destructive` (явный opt-in) — единственный путь мимо чужой
+//!    разметки;
+//! 4. всё остальное отвергается с указанием, что найдено.
 
-/// Byte offset of the ext2 superblock inside the first filesystem block.
+/// Смещение суперблока ext2 в байтах внутри первого блока ФС.
 pub const SUPERBLOCK_OFFSET: usize = 1024;
 
-/// Offset of `s_magic` INSIDE the superblock (`0x38`, matching
-/// `Ext2SuperBlock::s_magic`, whose offset is asserted in `ext2::structs`).
+/// Смещение `s_magic` **внутри** суперблока (`0x38`, как у
+/// `Ext2SuperBlock::s_magic`; смещение проверяется в `ext2::structs`).
 ///
-/// This constant exists because its absence was a real bug: the detector compared
-/// the magic against `buf[SUPERBLOCK_OFFSET..SUPERBLOCK_OFFSET + 2]`, i.e. at byte
-/// 1024, while the magic actually lives at 1080. Every ext2/ext4 volume therefore
-/// probed as `Foreign`, and the `Ext2Like` refusal — "the magic is there but the
-/// superblock does not validate" — could never fire. The `has_valid_superblock`
-/// check in front of it masked the mistake for the format decision, and nothing
-/// displayed the layout, so it stayed invisible until a boot menu started printing
-/// what each partition holds.
+/// Магия ext-семейства лежит по `SUPERBLOCK_OFFSET + SB_MAGIC_OFFSET`
+/// (1024 + 0x38), а не по 1024; константу экспортируют и детектор, и host-тест
+/// P50.
 pub const SB_MAGIC_OFFSET: usize = 0x38;
 
-/// ext2/ext4 `s_magic` as it appears on disk (little-endian `0xEF53`).
+/// `s_magic` ext2/ext4 в том виде, в каком лежит на диске (little-endian `0xEF53`).
 pub const EXT2_MAGIC_LE: [u8; 2] = [0x53, 0xEF];
 
-/// GPT header signature, at LBA 1 (byte 512).
+/// Сигнатура заголовка GPT в LBA 1 (байт 512).
 pub const GPT_SIGNATURE: &[u8; 8] = b"EFI PART";
 
-/// MBR boot signature, at the end of LBA 0 (byte 510).
+/// Boot-сигнатура MBR в конце LBA 0 (байт 510).
 pub const MBR_SIGNATURE: [u8; 2] = [0x55, 0xAA];
 
-/// Minimum probe length that can recognise every layout above (the ext2 magic).
+/// Минимальная длина зонда, при которой распознаётся любая разметка выше
+/// (магия ext2).
 pub const MIN_PROBE: usize = SUPERBLOCK_OFFSET + SB_MAGIC_OFFSET + 2;
 
-/// Explicit opt-in marker an operator writes into sector 0 to authorise pagh to
-/// take over a device that already carries data.
+/// Явный opt-in: оператор пишет этот маркер в сектор 0, разрешая pagh забрать
+/// устройство, на котором уже есть данные.
 ///
 /// ```text
 /// printf 'PAGH-FORMAT' | sudo dd of=/dev/nvme0n1 bs=1 conv=notrunc
 /// ```
 ///
-/// Deliberate and unmistakable: nothing else writes these bytes, and the write
-/// itself *is* the operator saying "this device may be destroyed" — unlike a
-/// bootloader command line, which is easy to add once and forget.
-///
-/// It is the only way to authorise formatting a device that holds data, and it
-/// is **destructive in itself**: the marker lands in the first 11 bytes of
-/// sector 0, which is the bootstrap area of a partitioned disk (and would
-/// overwrite the jump instruction of a partition's boot sector). Recovery from
-/// a disk whose data the operator wants to keep is `dd`/`wipefs`/`sgdisk -Z`
-/// — those zero the start and make the device `Blank`, which is formatted
-/// without any marker. The marker exists for the case where the operator wants
-/// the *data* gone but cannot first make the device look blank (e.g. a
-/// whole-disk foreign filesystem at LBA 0 with metadata beyond the probe
-/// window). Without it, a device is formatted only when the probed region is
-/// entirely zero.
+/// Единственный способ разрешить форматирование устройства с данными, и сам по
+/// себе он **разрушителен**: маркер ложится в первые 11 байт сектора 0 —
+/// bootstrap-область размеченного диска. Без маркера устройство форматируется,
+/// только когда зондируемая область целиком нулевая.
 pub const OPT_IN_MARKER_NAME: &str = "PAGH-FORMAT";
 
-/// The same marker as bytes, for the probe. Derived from the name so the two can
-/// never drift apart.
+/// Тот же маркер байтами — для зонда. Выводится из имени, поэтому разойтись
+/// они не могут.
 pub const OPT_IN_MARKER: &[u8] = OPT_IN_MARKER_NAME.as_bytes();
 
-/// What the probed boot area of a device looks like.
+/// Как выглядит зондируемая boot-область устройства.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layout {
-    /// The ext2/ext4 superblock magic is present.
+    /// Присутствует магия суперблока ext2/ext4.
     Ext2,
-    /// An MBR or GPT partition table is present.
+    /// Присутствует таблица разделов MBR или GPT.
     PartitionTable,
-    /// Every probed byte is zero.
+    /// Все зондируемые байты нулевые.
     Blank,
-    /// Non-zero data that is neither of the above.
+    /// Ненулевые данные, не подходящие под варианты выше.
     Foreign,
 }
 
 impl Layout {
-    /// Short name for the boot log line.
+    /// Короткое имя для строки boot-лога.
     pub fn name(self) -> &'static str {
         match self {
             Layout::Ext2 => "ext2-like",
@@ -103,21 +80,21 @@ impl Layout {
     }
 }
 
-/// Why a device must not be formatted.
+/// Причина, по которой устройство нельзя форматировать.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// A valid ext2 superblock is present: a real filesystem that failed to mount.
+    /// Есть валидный суперблок ext2: настоящая ФС, которая не смонтировалась.
     ExistingFilesystem,
-    /// The device carries a partition table (MBR or GPT).
+    /// На устройстве есть таблица разделов (MBR или GPT).
     PartitionTable,
-    /// The ext2 magic is present but the superblock does not validate.
+    /// Магия ext2 есть, но суперблок не проходит валидацию.
     Ext2Like,
-    /// Non-zero bytes that are neither a partition table nor an ext2 superblock.
+    /// Ненулевые байты — ни таблица разделов, ни суперблок ext2.
     ForeignData,
 }
 
 impl Refusal {
-    /// One-line explanation for the serial log.
+    /// Однострочное объяснение для serial-лога.
     pub fn reason(self) -> &'static str {
         match self {
             Refusal::ExistingFilesystem => {
@@ -130,26 +107,26 @@ impl Refusal {
     }
 }
 
-/// Incremental boot-area classifier.
+/// Инкрементальный классификатор boot-области.
 ///
-/// Construct with the first filesystem block (≥ [`MIN_PROBE`] bytes, 4 KiB in
-/// practice) and `feed` further chunks while [`Probe::is_decided`] is false. The
-/// caller owns the I/O and may stop as soon as the layout is decided; a device
-/// only has to be scanned to the end when it is claiming to be blank.
+/// Создаётся по первому блоку ФС (≥ [`MIN_PROBE`] байт, на практике 4 KiB),
+/// затем `feed` до тех пор, пока [`Probe::is_decided`] ложно. I/O — на
+/// вызывающем: он может остановиться сразу после определения разметки; до конца
+/// устройство сканируется, только если притворяется пустым.
 ///
-/// Fail-closed by construction: a probe shorter than [`MIN_PROBE`] is
-/// [`Layout::Foreign`] (refused), never `Blank`.
+/// Fail-closed по построению: зонд короче [`MIN_PROBE`] — это
+/// [`Layout::Foreign`] (отказ), а не `Blank`.
 #[derive(Clone, Copy, Debug)]
 pub struct Probe {
     layout: Layout,
-    /// Still `Blank`-so-far: a later non-zero byte turns it into `Foreign`.
+    /// Пока `Blank`: первый же ненулевой байт дальше делает его `Foreign`.
     provisional_blank: bool,
-    /// The operator's [`OPT_IN_MARKER`] was found in sector 0.
+    /// В секторе 0 найден [`OPT_IN_MARKER`] оператора.
     marked: bool,
 }
 
 impl Probe {
-    /// Classify the first filesystem block.
+    /// Классифицирует первый блок ФС.
     pub fn new(first_block: &[u8]) -> Self {
         let marked = first_block.len() >= OPT_IN_MARKER.len()
             && &first_block[..OPT_IN_MARKER.len()] == OPT_IN_MARKER;
@@ -176,7 +153,7 @@ impl Probe {
         }
     }
 
-    /// A probe that could not be taken (I/O error). Refused, never formatted.
+    /// Зонд не удался (ошибка I/O). Отказ, форматирования не будет.
     pub fn unreadable() -> Self {
         Self {
             layout: Layout::Foreign,
@@ -185,7 +162,7 @@ impl Probe {
         }
     }
 
-    /// Feed the next chunk of the boot area.
+    /// Передаёт следующий фрагмент boot-области.
     pub fn feed(&mut self, chunk: &[u8]) {
         if self.provisional_blank && !is_zero(chunk) {
             self.layout = Layout::Foreign;
@@ -193,82 +170,80 @@ impl Probe {
         }
     }
 
-    /// The layout decided so far.
+    /// Разметка, определённая на текущий момент.
     pub fn layout(&self) -> Layout {
         self.layout
     }
 
-    /// Was the explicit [`OPT_IN_MARKER`] found? This is the value to pass as
+    /// Найден ли явный [`OPT_IN_MARKER`]? Это значение передаётся как
     /// `allow_destructive`.
     pub fn is_marked(&self) -> bool {
         self.marked
     }
 
-    /// `true` once the layout can no longer change (no further probe is needed).
+    /// `true`, когда разметка уже не изменится (дальнейший зонд не нужен).
     pub fn is_decided(&self) -> bool {
         !self.provisional_blank
     }
 }
 
-/// The one decision `boot::init_fs` makes: may this device be formatted?
+/// Единственное решение `boot::init_fs`: можно ли форматировать устройство?
 ///
-/// `has_valid_superblock` must be the result of `Ext2Fs::has_valid_superblock`
-/// (a *parsable* superblock, not merely the magic), and `layout` the result of
-/// probing the device's boot area.
+/// `has_valid_superblock` — результат `Ext2Fs::has_valid_superblock`
+/// (*разбираемый* суперблок, не просто магия), `layout` — результат зонда
+/// boot-области.
 ///
-/// Precedence, in order: a parsable ext2 superblock refuses unconditionally; a
-/// blank device is formatted without any opt-in; the [`OPT_IN_MARKER`] lifts
-/// every *layout* refusal; otherwise the layout's own refusal is returned.
+/// Приоритет: разбираемый суперблок ext2 отказывает безусловно; пустое
+/// устройство форматируется без opt-in; [`OPT_IN_MARKER`] снимает любой отказ
+/// *по разметке*; иначе возвращается отказ самой разметки.
 pub fn format_allowed(
     layout: Layout,
     has_valid_superblock: bool,
     allow_destructive: bool,
 ) -> Result<(), Refusal> {
     if has_valid_superblock {
-        // A real filesystem that failed to mount is an error, never permission
-        // to erase user data. This is the pre-existing guard, kept first: it is
-        // the one refusal the opt-in marker cannot lift, because the volume is
-        // intact enough to be recognised. An operator who really wants such a
-        // device back zeroes its superblock first — that makes the probe report
-        // `Blank`, which needs no marker at all.
+        // Настоящая ФС, не прошедшая mount, — это ошибка, а не разрешение
+        // стирать пользовательские данные. Маркер этот отказ не снимает: том
+        // достаточно цел, чтобы его опознали. Кто действительно хочет вернуть
+        // такое устройство, сначала обнуляет суперблок — тогда зонд видит
+        // `Blank`, и маркер не нужен.
         return Err(Refusal::ExistingFilesystem);
     }
     if layout == Layout::Blank {
         return Ok(());
     }
-    // The marker is the operator's written consent, so it lifts the layout
-    // refusals — a partition table, an ext2 magic whose superblock does not
-    // validate, any other foreign data. Checked here, before the layout is
-    // turned into a refusal, so the precedence is visible in one place instead
-    // of being implied by the match arms below.
+    // Маркер — письменное согласие оператора, поэтому снимает отказы по
+    // разметке: таблицу разделов, магию ext2 с невалидным суперблоком, любые
+    // чужие данные. Проверка здесь, до превращения разметки в отказ, чтобы
+    // приоритет был виден в одном месте, а не следовал из веток match.
     if allow_destructive {
         return Ok(());
     }
     Err(match layout {
         Layout::PartitionTable => Refusal::PartitionTable,
         Layout::Ext2 => Refusal::Ext2Like,
-        // `Blank` returned above; listed for exhaustiveness.
+        // `Blank` вернулся выше; ветка нужна для полноты.
         Layout::Blank | Layout::Foreign => Refusal::ForeignData,
     })
 }
 
-/// ext2/ext4 superblock magic at [`SUPERBLOCK_OFFSET`].
+/// Магия суперблока ext2/ext4 по [`SUPERBLOCK_OFFSET`].
 fn is_ext2_superblock(buf: &[u8]) -> bool {
-    // The magic sits at 1024 + 0x38, not at 1024: see `SB_MAGIC_OFFSET`.
+    // Магия лежит по 1024 + 0x38, а не по 1024: см. `SB_MAGIC_OFFSET`.
     buf.len() >= MIN_PROBE && buf[SUPERBLOCK_OFFSET + SB_MAGIC_OFFSET..MIN_PROBE] == EXT2_MAGIC_LE
 }
 
-/// GPT header at LBA 1 or the MBR boot signature at the end of LBA 0.
+/// Заголовок GPT в LBA 1 или boot-сигнатура MBR в конце LBA 0.
 ///
-/// A protective MBR (GPT) carries both, so checking either alone is enough to
-/// refuse; both are checked so a hybrid or MBR-only layout is caught too.
+/// Защитный MBR (GPT) несёт обе, поэтому для отказа хватило бы одной; проверяются
+/// обе, чтобы поймать и hybrid-, и чисто MBR-разметку.
 fn is_partition_table(buf: &[u8]) -> bool {
     let gpt = buf.len() >= 520 && &buf[512..520] == GPT_SIGNATURE;
     let mbr = buf.len() >= 512 && buf[510..512] == MBR_SIGNATURE;
     gpt || mbr
 }
 
-/// No non-zero byte anywhere in the slice (empty slices are trivially zero).
+/// Ни одного ненулевого байта во всём срезе (пустой срез тривиально нулевой).
 fn is_zero(buf: &[u8]) -> bool {
     buf.iter().all(|&b| b == 0)
 }
@@ -279,10 +254,10 @@ mod tests {
 
     fn gpt_boot_block() -> [u8; 4096] {
         let mut b = [0u8; 4096];
-        // Protective MBR: one 0xEE partition entry, then the boot signature.
-        b[446] = 0x00; // not bootable
-        b[450] = 0xEE; // type: GPT protective
-        b[454] = 0x01; // first LBA 1 (little-endian u32)
+        // Защитный MBR: одна запись раздела 0xEE, затем boot-сигнатура.
+        b[446] = 0x00; // не загрузочный
+        b[450] = 0xEE; // тип: GPT protective
+        b[454] = 0x01; // первый LBA 1 (little-endian u32)
         b[510] = 0x55;
         b[511] = 0xAA;
         b[512..520].copy_from_slice(GPT_SIGNATURE);
@@ -291,10 +266,8 @@ mod tests {
 
     fn ext2_boot_block() -> [u8; 4096] {
         let mut b = [0u8; 4096];
-        // At `SUPERBLOCK_OFFSET + SB_MAGIC_OFFSET`, the offset a real volume has.
-        // These tests previously wrote it at `SUPERBLOCK_OFFSET`, matching the
-        // detector's own mistake — which is why both stayed green while every
-        // ext2/ext4 volume probed as `Foreign`.
+        // По `SUPERBLOCK_OFFSET + SB_MAGIC_OFFSET` — там, где магия у настоящего
+        // тома. Тест и детектор обязаны использовать одну и ту же константу.
         b[SUPERBLOCK_OFFSET + SB_MAGIC_OFFSET..MIN_PROBE].copy_from_slice(&EXT2_MAGIC_LE);
         b
     }
@@ -331,7 +304,7 @@ mod tests {
         assert_eq!(Probe::new(&ext2_boot_block()).layout(), Layout::Ext2);
         assert_eq!(Probe::new(&[0u8; 4096]).layout(), Layout::Blank);
         let mut junk = [0u8; 4096];
-        junk[0] = 0xEB; // x86 boot sector jump, e.g. NTFS/XFS/LUKS
+        junk[0] = 0xEB; // jump x86-загрузчика, например NTFS/XFS/LUKS
         assert_eq!(Probe::new(&junk).layout(), Layout::Foreign);
     }
 
@@ -389,8 +362,8 @@ mod tests {
         marked[..OPT_IN_MARKER.len()].copy_from_slice(OPT_IN_MARKER);
         let p = Probe::new(&marked);
         assert!(p.is_marked());
-        // The marker authorises exactly one layout class, and the partition
-        // table underneath is still reported.
+        // Маркер разрешает ровно один класс разметки, а таблица разделов под
+        // ним всё равно распознаётся.
         assert_eq!(p.layout(), Layout::PartitionTable);
         assert_eq!(format_allowed(p.layout(), false, p.is_marked()), Ok(()));
 
@@ -398,7 +371,7 @@ mod tests {
         assert!(!Probe::new(&[0u8; 4096]).is_marked());
         assert!(!Probe::unreadable().is_marked());
 
-        // A marker later in the window is not a marker: it must be in sector 0.
+        // Маркер дальше в окне — не маркер: он обязан быть в секторе 0.
         let mut late = [0u8; 4096];
         late[2048..2048 + OPT_IN_MARKER.len()].copy_from_slice(OPT_IN_MARKER);
         assert!(!Probe::new(&late).is_marked());
@@ -419,9 +392,9 @@ mod tests {
 
     #[test]
     fn the_marker_lifts_every_layout_refusal() {
-        // The marker is consent for *this device's contents*, whatever the probe
-        // called them: a partition table, an ext2 magic that does not validate,
-        // or unrecognised data. Only a parsable superblock outranks it.
+        // Маркер — согласие на *содержимое этого устройства*, как бы зонд его ни
+        // назвал: таблица разделов, невалидная магия ext2, нераспознанные данные.
+        // Выше него только разбираемый суперблок.
         for layout in [
             Layout::PartitionTable,
             Layout::Ext2,
@@ -434,7 +407,7 @@ mod tests {
                 "the opt-in marker must lift {layout:?}"
             );
         }
-        // ...and without it, each layout refuses by name.
+        // ...а без него каждая разметка отвергается по имени.
         assert_eq!(
             format_allowed(Layout::PartitionTable, false, false),
             Err(Refusal::PartitionTable)

@@ -1,16 +1,17 @@
-//! E2E *test* trust anchor for the OpenPGP verifier (issue #32).
+//! E2E *test* trust anchor для OpenPGP-верификатора (issue #32).
 //!
-//! GENERATED FILE — do not edit by hand; regenerate with
-//! `python3 tools/gen_openpgp_testkey.py` (the deterministic seeds live in that
-//! script, so the anchor and every `tools/mini_repo/` digest can be reproduced).
+//! СГЕНЕРИРОВАННЫЙ ФАЙЛ — не редактировать вручную; перегенерировать через
+//! `python3 tools/gen_openpgp_testkey.py` (детерминированные seed'ы живут в этом
+//! скрипте, так что anchor и каждый дайджест `tools/mini_repo/` воспроизводимы).
 //!
-//! TEST ANCHOR ONLY. This module is compiled only for the harness builds that run
-//! `apt update` against the LOCAL test mirror — `lx_selftest` and `lx_bigindex`
-//! (see `src/pkg/mod.rs`) — and `pkg::apt::trusted_keyring` selects it only there,
-//! so a normal, release or live-test build cannot trust the key below. It exists so
-//! the local-mirror harness can run against a repository that is *signed*: the
-//! positive half of the E2E proof, plus the negative half (tampered Packages,
-//! tampered .deb, unsigned mirror, unpinned signer) driven by `tools/mini_repo.py`.
+//! ТОЛЬКО TEST ANCHOR. Модуль компилируется только для harness-сборок, гоняющих
+//! `apt update` против ЛОКАЛЬНОГО тестового зеркала — `lx_selftest` и `lx_bigindex`
+//! (см. `src/pkg/mod.rs`), — и `pkg::apt::trusted_keyring` выбирает его только там,
+//! так что обычная, release или live-test сборка не может доверять ключу ниже. Он
+//! существует, чтобы локальный harness мог работать против *подписанного*
+//! репозитория: положительная половина E2E-доказательства плюс отрицательная
+//! (tampered Packages, tampered .deb, unsigned mirror, unpinned signer), ведомая
+//! `tools/mini_repo.py`.
 
 #![allow(dead_code)]
 

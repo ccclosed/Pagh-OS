@@ -1,46 +1,45 @@
-//! Pure dependency resolver for an `apt install <name>` feature (the planning
-//! side, layered over [`super::apt_index::PackageIndex`]).
+//! Чистый резолвер зависимостей для `apt install <name>` (сторона планирования,
+//! поверх [`super::apt_index::PackageIndex`]).
 //!
-//! Given a parsed repository [`PackageIndex`], a target package name, and the set
-//! of already-installed package names, [`resolve_install`] returns the list of
-//! package names to install in **dependency-first (topological) order** — every
-//! dependency appears before the package that needs it, and the original
-//! `target` appears last among its own subtree. Callers install in the returned
-//! order.
+//! По разобранному [`PackageIndex`], имени целевого пакета и множеству уже
+//! установленных имён [`resolve_install`] возвращает список имён для установки в
+//! **dependency-first (топологическом) порядке** — каждая зависимость идёт перед
+//! пакетом, которому нужна, а исходный `target` — последним в своём поддереве.
+//! Вызывающие ставят в возвращённом порядке.
 //!
-//! ## Cross-crate module path
+//! ## Межкрейтовый путь модуля
 //!
-//! The index types are imported via `super::apt_index`, which resolves in BOTH
-//! crates: in the kernel this module is `crate::pkg::apt_resolve`, so `super` is
-//! `crate::pkg` (which declares `pub mod apt_index;`); in `host-tests` it is
-//! included at the crate root, so `super` is the crate root (which also declares
-//! `pub mod apt_index;`). One source, two crates, no shim — the same convention
-//! `install.rs` uses for `super::tar`.
+//! Типы индекса импортируются через `super::apt_index`, который разрешается в ОБОИХ
+//! крейтах: в ядре модуль — `crate::pkg::apt_resolve`, так что `super` — `crate::pkg`
+//! (объявляющий `pub mod apt_index;`); в `host-tests` он включён в корень крейта,
+//! так что `super` — корень крейта (тоже объявляющий `pub mod apt_index;`). Один
+//! исходник, два крейта, без шима — та же конвенция, что `install.rs` использует
+//! для `super::tar`.
 //!
-//! ## Documented simplifications
+//! ## Задокументированные упрощения
 //!
-//! This resolver is intentionally a pragmatic, real-world-usable approximation,
-//! not a full SAT-based apt solver:
+//! Резолвер намеренно прагматичная, пригодная в реальном мире аппроксимация, а не
+//! полный SAT-солвер apt:
 //!
-//!   * **Version constraints are ignored.** A `Depends: libc6 (>= 2.34)` is
-//!     treated as a plain dependency on `libc6`; the only (newest/sole) record in
-//!     the index for that name is used. The parser already stripped `(...)`.
-//!   * **Pre-Depends are merged into Depends** at parse time (see
-//!     [`super::apt_index::PkgRecord::depends`]); the resolver does not enforce
-//!     the stricter pre-dependency *unpack* ordering beyond ordinary topological
-//!     order.
-//!   * **Missing dependencies are treated as already-satisfied essentials.** If a
-//!     dependency group has no alternative that is installed *or* present in the
-//!     index, the group is silently skipped rather than failing the install. In a
-//!     real repo such a name is almost always an Essential/base package assumed
-//!     present (e.g. `libc6`, `dpkg`); failing the whole transaction on it would
-//!     make ordinary installs unusable.
-//!   * **Alternatives pick the first satisfiable option.** For `a | b` the first
-//!     alternative that is already installed, or failing that the first that
-//!     exists in the index (real or via `Provides`), is chosen; if one is already
-//!     installed the group needs nothing further.
-//!   * **Virtual packages** are resolved through the index `Provides` map; the
-//!     *providing real package* is what gets scheduled for install.
+//!   * **Версионные ограничения игнорируются.** `Depends: libc6 (>= 2.34)`
+//!     трактуется как простая зависимость от `libc6`; используется единственная
+//!     (новейшая) запись индекса для этого имени. Парсер уже срезал `(...)`.
+//!   * **Pre-Depends сливаются в Depends** при разборе (см.
+//!     [`super::apt_index::PkgRecord::depends`]); резолвер не требует более
+//!     строгого порядка *распаковки* pre-dependency сверх обычного
+//!     топологического порядка.
+//!   * **Отсутствующие зависимости считаются уже удовлетворёнными essential.**
+//!     Если у группы зависимостей нет варианта, установленного *или* присутствующего
+//!     в индексе, группа молча пропускается, а не валит установку. В реальном
+//!     репозитории такое имя почти всегда Essential/base-пакет, предполагаемо
+//!     присутствующий (например `libc6`, `dpkg`); срыв всей транзакции из-за него
+//!     сделал бы обычные установки непригодными.
+//!   * **Альтернативы берут первый удовлетворимый вариант.** Для `a | b` выбирается
+//!     первый уже установленный вариант, а иначе первый, существующий в индексе
+//!     (реальный или через `Provides`); если один уже установлен, группе больше
+//!     ничего не нужно.
+//!   * **Виртуальные пакеты** разрешаются через карту `Provides` индекса;
+//!     устанавливается *предоставляющий реальный пакет*.
 
 #![allow(dead_code)]
 

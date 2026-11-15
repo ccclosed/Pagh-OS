@@ -1,16 +1,17 @@
-//! Pure POSIX/ustar reader and writer for the Debian package layer.
+//! Чистый POSIX/ustar reader и writer для слоя Debian-пакетов.
 //!
-//! Pure, `core` + `alloc` only, allocation-bounded, and **panic-free** logic shared
-//! with the `host-tests` crate (R11.6). [`read_tar`] enumerates a (decompressed)
-//! `data.tar` byte stream into borrowed [`TarEntry`] records — exposing each regular
-//! file's content as a zero-copy slice of the input — while validating every 512-byte
-//! ustar header's checksum and length consistency without ever reading past the
-//! buffer (R9.5, R9.6). [`write_tar`] is the inverse: it emits a valid ustar stream so
-//! the round-trip property (R9.7) holds for any set of named entries.
+//! Чистая, только `core` + `alloc`, allocation-bounded и **panic-free** логика,
+//! разделяемая с `host-tests` (R11.6). [`read_tar`] перечисляет (распакованный)
+//! поток `data.tar` в заимствованные записи [`TarEntry`], выставляя содержимое каждого
+//! regular file как zero-copy срез входа, при этом проверяя checksum и
+//! согласованность длины каждого 512-байтового ustar-заголовка, никогда не читая за
+//! буфер (R9.5, R9.6). [`write_tar`] — обратная операция: выдаёт валидный ustar-поток,
+//! так что round-trip свойство (R9.7) выполняется для любого набора именованных
+//! записей.
 //!
-//! This module is intentionally self-contained: it depends on nothing from `deb.rs`
-//! (or any other kernel module) so it can be `#[path]`-included by the host test
-//! crate and compiled identically by the `#![no_std]` kernel.
+//! Модуль намеренно самодостаточен: он не зависит ни от чего из `deb.rs` (или любого
+//! другого модуля ядра), так что может `#[path]`-включаться host-крейтом и
+//! компилироваться тем же `#![no_std]`-ядром.
 #![allow(dead_code)]
 
 use alloc::string::String;

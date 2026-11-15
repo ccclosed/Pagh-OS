@@ -1,38 +1,40 @@
-// drivers/scrollback.rs — the console's scrollback ring and scroll view model
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// drivers/scrollback.rs — ring скроллбека консоли и модель прокручиваемого вида
+// 64-битное ядро ОС x86_64 на Rust (#![no_std])
 //
-// The framebuffer console keeps one text grid in RAM (see `framebuffer.rs`): it
-// is the model the shell edits, the caret sits on, and a selection copies from.
-// That model has exactly as many rows as fit on screen, so text scrolled off the
-// top was gone. This module is the missing history: a bounded ring of *rows* —
-// the same `(chars, fg)` pair the framebuffer keeps per cell — plus a view offset
-// that says "show the last N history rows above the live grid".
+// Framebuffer-консоль держит одну текстовую сетку в RAM (см. `framebuffer.rs`):
+// это модель, которую правит shell, на которой стоит каретка и из которой
+// копирует выделение. В этой модели ровно столько строк, сколько влезает на
+// экран, так что ушедший вверх текст пропадал. Модуль — недостающая история:
+// ограниченный ring *строк* — та же пара `(chars, fg)`, что framebuffer держит на
+// клетку, — плюс view-смещение, говорящее «показать последние N строк истории над
+// живой сеткой».
 //
-// Pure on purpose: no pixel, no lock, no device. The framebuffer owns one of
-// these, feeds it a row every time its `scroll()` runs, and asks it which row a
-// screen position maps to when the user scrolls back. That split lets the host
-// tests drive the exact source the kernel compiles (property `scrollback`), and
-// keeps the ring's wrap/offset rules out of the pixel path.
+// Чистый намеренно: ни пикселя, ни лока, ни устройства. Framebuffer владеет одним
+// таким, кормит его строкой каждый раз при `scroll()` и спрашивает, в какую
+// строку отображается экранная позиция при прокрутке назад. Такое разделение
+// позволяет host-тестам гонять точный исходник, который компилирует ядро
+// (property `scrollback`), и держит правила wrap/offset в стороне от пиксельного
+// пути.
 //
-// Terminology:
-//   * row        — one line of console cells, `W` characters wide;
-//   * history    — the ring of rows that have already left the top of the screen;
-//   * view       — how many of the newest history rows are shown *above* the live
-//                  grid; `0` means "live view, nothing scrolled back".
+// Терминология:
+//   * row        — одна строка клеток консоли шириной `W` символов;
+//   * history    — ring строк, уже ушедших с верха экрана;
+//   * view       — сколько новейших строк истории показано *над* живой сеткой;
+//                  `0` означает «живой вид, ничего не прокручено назад».
 //
-// While the user is scrolled back, new console output must not move what they are
-// reading: `push` keeps the same absolute rows in view by incrementing `view`,
-// and the oldest row is dropped only when the ring is full — a terminal's standard
-// behaviour, and the one the wheel path relies on to stay stable under the
-// network pump printing INFO lines in the background.
+// Пока пользователь прокручен назад, новый вывод консоли не должен двигать то,
+// что он читает: `push` сохраняет те же абсолютные строки в виде, увеличивая
+// `view`, а старейшая строка отбрасывается, только когда ring полон — стандартное
+// поведение терминала, и именно на него опирается путь колеса, чтобы оставаться
+// стабильным, пока сетевой насос печатает INFO-строки в фоне.
 
 use alloc::collections::VecDeque;
 
-/// One console row: the characters and the foreground colour each was drawn in.
+/// Одна строка консоли: символы и foreground-цвет, которым был нарисован каждый.
 ///
-/// `fg` is part of the row for the same reason the framebuffer keeps `grid_fg`:
-/// the pixels do not remember how a cell was painted, so a re-render (a scroll, a
-/// theme repaint) has to be able to put coloured text back.
+/// `fg` — часть строки по той же причине, по которой framebuffer держит `grid_fg`:
+/// пиксели не помнят, как клетка была покрашена, так что re-render (прокрутка,
+/// перерисовка темы) должен уметь вернуть цветной текст.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row<const W: usize> {
     pub chars: [u8; W],

@@ -1,18 +1,18 @@
-//! Scancode decoding: `KeyEvent` and the `0xE0`-prefixed extended-scancode
-//! state machine.
+//! Декодирование сканкодов: `KeyEvent` и state machine расширенных сканкодов
+//! с префиксом `0xE0`.
 //!
-//! This module owns PS/2 Set 1 scancode decoding for the shell. The base
-//! make-code → ASCII table (`scancode_to_ascii`) lives here, and the stateful
-//! [`Decoder`] layers shift tracking and the `0xE0` extended-prefix navigation
-//! keys on top of it. The decoder is consumed by the interactive read loop in
-//! a later task; until then it is allowed to be dead code.
+//! Модуль владеет декодированием PS/2 Set 1 для shell. Базовая таблица
+//! make-code → ASCII (`scancode_to_ascii`) живёт здесь, а stateful [`Decoder`]
+//! добавляет поверх неё отслеживание Shift и навигационные клавиши с префиксом
+//! `0xE0`. Decoder потребляет интерактивный цикл чтения; до подключения он
+//! считается мёртвым кодом.
 
-/// A decoded keyboard event.
+/// Декодированное событие клавиатуры.
 ///
-/// Closed enum of the keys the line editor understands. Printable input is
-/// carried by [`KeyEvent::Char`]; everything else is an editing/navigation
-/// action. Extended (`0xE0`-prefixed) scancodes only ever decode to the
-/// navigation variants — never to `Char` (R1.7).
+/// Закрытый enum клавиш, которые понимает построчный редактор. Печатный ввод
+/// несёт [`KeyEvent::Char`]; остальное — действия редактирования/навигации.
+/// Расширенные (с префиксом `0xE0`) сканкоды декодируются только в
+/// навигационные варианты — никогда в `Char` (R1.7).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyEvent {
@@ -33,26 +33,26 @@ pub enum KeyEvent {
     Enter,
 }
 
-/// Stateful PS/2 Set 1 scancode decoder.
+/// Stateful-декодер сканкодов PS/2 Set 1.
 ///
-/// Holds the minimal state needed to interpret the raw scancode byte stream:
-/// `extended` is set for the one byte following a standalone `0xE0` prefix, and
-/// `shift` tracks the current Shift modifier across make/break codes. The
-/// decoder never panics on any input byte (Properties 25 & 27).
+/// Держит минимальное состояние для интерпретации сырого потока байт:
+/// `extended` ставится на один байт после одиночного префикса `0xE0`, а `shift`
+/// отслеживает текущий модификатор Shift через make/break-коды. Decoder никогда
+/// не паникует ни на каком входном байте (свойства 25 и 27).
 #[allow(dead_code)]
-/// Set by any decoder that sees Ctrl+C (the shell line editor AND the
-/// kernel-side raw-mode stdin decoder). The `lxrun` foreground wait polls and
-/// takes this latch to terminate the child — classic ^C semantics for a
-/// kernel that has no signal delivery.
+/// Ставится любым декодером, увидевшим Ctrl+C (и построчным редактором shell,
+/// и kernel-side raw-mode декодером stdin). Foreground-ожидание `lxrun`
+/// опрашивает и забирает эту защёлку, чтобы завершить ребёнка — классическая
+/// семантика ^C для ядра без доставки сигналов.
 pub static CTRL_C_LATCH: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Ctrl+Z latch for the `lxrun` foreground wait (same path as Ctrl+C).
+/// Защёлка Ctrl+Z для foreground-ожидания `lxrun` (тот же путь, что Ctrl+C).
 pub static CTRL_Z_LATCH: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Persistent CapsLock state. Decoders are created per read call on the
-/// stdin path, so the toggle must outlive any single instance.
+/// Постоянное состояние CapsLock. Декодеры создаются на каждый вызов чтения на
+/// пути stdin, так что переключатель должен жить дольше любого экземпляра.
 static CAPS_LOCK_STATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub struct Decoder {
@@ -64,7 +64,7 @@ pub struct Decoder {
 
 #[allow(dead_code)]
 impl Decoder {
-    /// Create a fresh decoder with no pending prefix and Shift released.
+    /// Создать свежий decoder без ожидающего префикса и с отпущенным Shift.
     pub fn new() -> Self {
         Decoder {
             extended: false,
@@ -74,15 +74,15 @@ impl Decoder {
         }
     }
 
-    /// Feed one raw scancode byte.
+    /// Подать один сырой байт сканкода.
     ///
-    /// Returns `Some(event)` for a complete key, or `None` while mid-prefix or
-    /// for a consumed modifier/break code. This is total over all `u8` inputs
-    /// and never panics.
+    /// Возвращает `Some(event)` для полной клавиши или `None` посреди префикса
+    /// либо для поглощённого модификатора/break-кода. Функция тотальна по всем
+    /// `u8` и никогда не паникует.
     pub fn feed(&mut self, scancode: u8) -> Option<KeyEvent> {
-        // Ctrl make/break is tracked so modal applications can receive
-        // shortcuts without interpreting raw scancodes. Right Ctrl is E0-prefixed;
-        // consume that prefix here so it cannot leak into the next key.
+        // Ctrl make/break отслеживается, чтобы модальные приложения могли
+        // получать сокращения, не разбирая сырые сканкоды. Правый Ctrl идёт с
+        // префиксом E0; поглотить его здесь, чтобы он не утёк в следующую клавишу.
         if self.extended && matches!(scancode, 0x1D | 0x9D) {
             self.extended = false;
             self.ctrl = scancode == 0x1D;
@@ -100,16 +100,16 @@ impl Decoder {
             _ => {}
         }
 
-        // CapsLock make: toggle the persistent state, emit no event. Break
-        // (0xBA) is ignored, like a real keyboard's LED-only response.
+        // CapsLock make: переключить постоянное состояние, событие не выдавать.
+        // Break (0xBA) игнорируется, как LED-only ответ реальной клавиатуры.
         if scancode == 0x3A {
             self.caps = !self.caps;
             CAPS_LOCK_STATE.store(self.caps, core::sync::atomic::Ordering::Relaxed);
             return None;
         }
 
-        // Shift make/break: track the modifier, emit no event. Handled before
-        // the extended path because Shift codes are never E0-prefixed here.
+        // Shift make/break: отслеживать модификатор, событие не выдавать. Обработан
+        // до расширенного пути, потому что коды Shift здесь никогда не с E0.
         match scancode {
             0x2A | 0x36 => {
                 self.shift = true;
@@ -122,24 +122,24 @@ impl Decoder {
             _ => {}
         }
 
-        // A standalone 0xE0 prefix: arm the extended flag, yield nothing yet.
+        // Одиночный префикс 0xE0: взвести флаг extended, пока ничего не выдавать.
         if scancode == 0xE0 {
             self.extended = true;
             return None;
         }
 
         if self.extended {
-            // Always clear the prefix flag after the byte following 0xE0 so a
-            // stray prefix can never wedge the decoder (R11.2).
+            // Всегда сбрасывать флаг префикса после байта за 0xE0, чтобы
+            // случайный префикс не мог заклинить decoder (R11.2).
             self.extended = false;
 
-            // Extended break code (key release): consume and ignore.
+            // Расширенный break-код (отпускание клавиши): поглотить и игнорировать.
             if scancode >= 0x80 {
                 return None;
             }
 
-            // Extended make-codes decode to navigation keys only. Unknown
-            // extended codes produce no event. GUARANTEE: never a Char (R1.7).
+            // Расширенные make-коды декодируются только в навигационные клавиши.
+            // Неизвестные расширенные коды события не дают. ГАРАНТИЯ: никогда Char (R1.7).
             return match scancode {
                 0x4B => Some(KeyEvent::Left),
                 0x4D => Some(KeyEvent::Right),
@@ -154,9 +154,9 @@ impl Decoder {
             };
         }
 
-        // Base (non-extended) make-codes.
+        // Базовые (не расширенные) make-коды.
 
-        // Base break codes (key release): ignore.
+        // Базовые break-коды (отпускание клавиши): игнорировать.
         if scancode >= 0x80 {
             return None;
         }
@@ -167,9 +167,9 @@ impl Decoder {
             0x0E => Some(KeyEvent::Backspace),
             0x0F => Some(KeyEvent::Tab),
             _ => {
-                // Map the remaining base make-codes via the Set 1 ASCII table.
-                // Enter ('\n') and Tab ('\t') are handled above as their own
-                // events, so guard against the table also producing them.
+                // Отобразить оставшиеся базовые make-коды через таблицу ASCII Set 1.
+                // Enter ('\n') и Tab ('\t') обработаны выше как отдельные события,
+                // поэтому защититься от того, что таблица тоже их выдаст.
                 match scancode_to_ascii(scancode, self.shift) {
                     Some(ch) if ch != '\n' && ch != '\t' && self.ctrl => {
                         if ch.to_ascii_lowercase() == 'c' {
@@ -181,13 +181,13 @@ impl Decoder {
                         Some(KeyEvent::Ctrl(ch.to_ascii_lowercase()))
                     }
                     Some(mut ch) if ch != '\n' && ch != '\t' => {
-                        // `scancode_to_ascii` has already applied Shift, so the
-                        // only case flip left is CapsLock: it turns the letter
-                        // around *relative to whatever Shift produced*, which is
-                        // the standard caps-XOR-shift rule. Comparing the two
-                        // modifiers here (`caps != shift`) double-counted Shift
-                        // and made Shift+letter type lowercase whenever CapsLock
-                        // was off — the inverse of what a keyboard does.
+                        // `scancode_to_ascii` уже применил Shift, поэтому
+                        // единший оставшийся флип регистра — CapsLock: он
+                        // переворачивает букву *относительно того, что выдал
+                        // Shift*, — стандартное правило caps-XOR-shift. Сравнение
+                        // двух модификаторов здесь (`caps != shift`) дважды
+                        // учитывало Shift и делало Shift+букву строчной при
+                        // выключенном CapsLock — противоположность клавиатуре.
                         if ch.is_ascii_alphabetic() && self.caps {
                             ch = if ch.is_ascii_lowercase() {
                                 ch.to_ascii_uppercase()
@@ -210,9 +210,9 @@ impl Default for Decoder {
     }
 }
 
-/// Simple scancode to ASCII mapping (US keyboard layout, PS/2 Set 1 base
-/// make-codes). Owned here since `keys.rs` owns scancode decoding; the shell
-/// read loop calls it via `keys::scancode_to_ascii`.
+/// Простое отображение сканкод → ASCII (раскладка US, базовые make-коды PS/2
+/// Set 1). Живёт здесь, так как `keys.rs` владеет декодированием сканкодов;
+/// цикл чтения shell вызывает его через `keys::scancode_to_ascii`.
 pub(super) fn scancode_to_ascii(scancode: u8, shift: bool) -> Option<char> {
     match scancode {
         0x02 => Some(if shift { '!' } else { '1' }),

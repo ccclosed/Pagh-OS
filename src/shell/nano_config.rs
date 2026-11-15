@@ -1,4 +1,4 @@
-//! Persistent nano+ configuration stored in `/mnt/.nanorc`.
+//! Персистентная конфигурация nano+ в `/mnt/.nanorc`.
 
 use crate::vfs::{VfsError, VfsNode};
 use alloc::format;

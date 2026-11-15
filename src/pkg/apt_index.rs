@@ -1,22 +1,21 @@
-//! Pure Debian binary-repository `Packages` index parser and lookup index
-//! (the read side of an `apt install <name>` feature).
+//! Чистый парсер индекса `Packages` бинарного Debian-репозитория и lookup-индекс
+//! (сторона чтения фичи `apt install <name>`).
 //!
-//! A Debian binary repository serves a `Packages` text file: one *stanza* per
-//! package in an RFC822-ish format — lines are `Key: value`, a *continuation*
-//! line begins with a space (or tab) and extends the previous field's value, and
-//! a blank line separates stanzas. This module turns that byte buffer into a
-//! queryable [`PackageIndex`].
+//! Бинарный Debian-репозиторий отдаёт текстовый файл `Packages`: одна *станза* на
+//! пакет в RFC822-подобном формате — строки `Key: value`, *continuation*-строка
+//! начинается с пробела (или таба) и продолжает значение предыдущего поля, а
+//! пустая строка разделяет станзы. Модуль превращает этот байтовый буфер в
+//! запрашиваемый [`PackageIndex`].
 //!
-//! Everything here is `core` + `alloc` only — no hardware, no globals, no
-//! networking — so the same source compiles into both the kernel
-//! (`crate::pkg::apt_index`) and the `host-tests` crate via a `#[path]` include,
-//! letting the unit/property tests in P30 exercise it on the host (R11.6).
+//! Всё здесь — только `core` + `alloc`, без железа, глобалов и сети, так что один
+//! и тот же исходник собирается и в ядро (`crate::pkg::apt_index`), и в `host-tests`
+//! через `#[path]`-include, позволяя unit/property-тестам P30 гонять его на хосте
+//! (R11.6).
 //!
-//! The parser is deliberately **robust and panic-free**: it tolerates CRLF or LF
-//! line endings, continuation lines, missing optional fields (`Depends`/
-//! `Provides` empty, `Size` 0), and unknown keys (ignored). Input is decoded
-//! UTF-8-lossily so malformed bytes never panic. A stanza that carries no
-//! `Package` key is skipped.
+//! Парсер намеренно **устойчив и panic-free**: терпит CRLF или LF, continuation-
+//! строки, отсутствующие необязательные поля (`Depends`/`Provides` пусты, `Size` 0)
+//! и неизвестные ключи (игнорируются). Вход декодируется UTF-8-lossy, так что
+//! битые байты никогда не паникуют. Станза без ключа `Package` пропускается.
 #![allow(dead_code)]
 
 use alloc::string::{String, ToString};

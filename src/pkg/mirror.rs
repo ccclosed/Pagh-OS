@@ -1,17 +1,17 @@
-//! Pure parsing of an `apt setmirror` host argument.
+//! Чистый разбор host-аргумента `apt setmirror`.
 //!
-//! `setmirror` accepts an optional URL scheme prefix on the host so the user can
-//! pick the transport inline, e.g.:
+//! `setmirror` принимает необязательный префикс URL-схемы у хоста, чтобы
+//! пользователь выбирал транспорт на месте, например:
 //!
 //! ```text
-//! apt setmirror https://deb.debian.org /debian   # TLS (HTTPS, port 443)
-//! apt setmirror http://deb.debian.org  /debian   # cleartext (HTTP, port 80)
-//! apt setmirror deb.debian.org         /debian   # leave transport unchanged
+//! apt setmirror https://deb.debian.org /debian   # TLS (HTTPS, порт 443)
+//! apt setmirror http://deb.debian.org  /debian   # cleartext (HTTP, порт 80)
+//! apt setmirror deb.debian.org         /debian   # оставить транспорт как есть
 //! ```
 //!
-//! This module is `core`-only and self-contained (no kernel deps, no globals), so
-//! the same source is exercised by the host property tests (`#[path]`-included)
-//! and compiled into the kernel — matching how `http`/`dns`/`deb` are shared.
+//! Модуль только `core` и самодостаточен (без зависимостей ядра и глобалов), так
+//! что тот же исходник проверяется host property-тестами (`#[path]`-include) и
+//! компилируется в ядро — как `http`/`dns`/`deb`.
 
 /// The parsed result of a mirror host argument.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,43 +1,44 @@
-// drivers/framebuffer.rs — Simple framebuffer text output using Limine
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// drivers/framebuffer.rs — простой текстовый вывод во framebuffer через Limine
+// 64-битное ядро ОС x86_64 на Rust (#![no_std])
 
 use crate::sync::spinlock::Spinlock;
 use core::fmt;
 
-/// Glyph cell width in pixels. **Public on purpose**: the VT emulator, the shell's
-/// mouse-to-cell mapping and the `paint` toolbar all lay out in cells, so they must
-/// take the cell from here instead of re-declaring it. A second copy of these two
-/// numbers is a silent layout bug the moment the font changes (`tools/gen_font.py`
-/// decides the cell; the asset and these constants move together).
+/// Ширина глиф-клетки в пикселях. **Публична намеренно**: VT-эмулятор, маппинг
+/// мыши в клетку в shell и toolbar `paint` раскладываются по клеткам, так что
+/// должны брать клетку отсюда, а не объявлять своё. Вторая копия этих двух чисел —
+/// молчаливый баг раскладки при смене шрифта (`tools/gen_font.py` решает размер
+/// клетки; ассет и эти константы двигаются вместе).
 pub const CHAR_WIDTH: usize = 8;
-/// Glyph cell height in pixels (see [`CHAR_WIDTH`]).
+/// Высота глиф-клетки в пикселях (см. [`CHAR_WIDTH`]).
 pub const CHAR_HEIGHT: usize = 18;
 const CHARS_PER_LINE: usize = 100;
 const MAX_LINES: usize = 37;
 
-/// Height in pixels of the reserved status-bar strip at the bottom of the
-/// screen. The text console never scrolls into this region (see `scroll`).
+/// Высота в пикселях зарезервированной полосы status bar внизу экрана. Текстовая
+/// консоль никогда не прокручивается в эту область (см. `scroll`).
 ///
-/// Sized to hold one glyph row with a little padding: the strip's own labels go
-/// through `draw_text_px`, so a bar shorter than a glyph would clip them in half.
-/// `paint`'s taskbar uses this same constant, so the two bars stay aligned.
+/// Рассчитана на одну строку глифов с небольшим отступом: собственные метки
+/// полосы идут через `draw_text_px`, так что полоса ниже глифа обрезала бы их
+/// пополам. Taskbar `paint` использует ту же константу, чтобы полосы были
+/// выровнены.
 pub const STATUS_BAR_HEIGHT: usize = CHAR_HEIGHT;
 
-/// How many scrolled-off console rows the scrollback keeps. One row is
-/// `CHARS_PER_LINE` characters plus their `u32` colours (~500 bytes), so this
-/// caps the history at ~256 KiB — memory is allocated lazily as output scrolls,
-/// and a wheel-scrolled session never reaches the cap on a normal boot.
+/// Сколько ушедших за экран строк консоли держит scrollback. Одна строка —
+/// `CHARS_PER_LINE` символов плюс их `u32`-цвета (~500 байт), так что это
+/// ограничивает историю ~256 KiB — память аллоцируется лениво по мере прокрутки,
+/// и сессия с прокруткой колесом на нормальной загрузке не достигает капа.
 const SCROLLBACK_ROWS: usize = 512;
 
-/// The console typeface: Fira Code (the host's terminal font), rasterised offline
-/// by `tools/gen_font.py` into one **8-bit coverage** glyph per printable ASCII
-/// codepoint.
+/// Шрифт консоли: Fira Code (шрифт терминала хоста), растеризованный офлайн
+/// `tools/gen_font.py` в один глиф **8-битного покрытия** на печатную ASCII-кодовую
+/// точку.
 ///
-/// The kernel deliberately does not parse TrueType: the asset holds 95 glyphs, each
-/// `CHAR_HEIGHT` rows of `CHAR_WIDTH` coverage bytes (0 = background, 255 = full
-/// ink), covering 0x20 (space) through 0x7E ('~'), so the glyph for codepoint `ch`
-/// lives at index `ch - 0x20`. Coverage — not a bitmap — is what lets the console
-/// antialias its glyphs ([`blend_px`]); a 1-bit asset at an 8 px advance is the
+/// Ядро намеренно не парсит TrueType: ассет держит 95 глифов, каждый —
+/// `CHAR_HEIGHT` строк по `CHAR_WIDTH` байт покрытия (0 = фон, 255 = полная
+/// заливка), покрывая 0x20 (пробел)..0x7E ('~'), так что глиф кодовой точки `ch`
+/// живёт по индексу `ch - 0x20`. Покрытие — а не bitmap — и позволяет консоли
+/// сглаживать глифы ([`blend_px`]); 1-битный ассет при 8 px advance — это
 /// "rough" text this replaced. Regenerate (never hand-edit) with::
 ///
 ///     python3 tools/gen_font.py \

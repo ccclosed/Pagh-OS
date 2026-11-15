@@ -1,5 +1,5 @@
-// pagh OS kernel — 64-bit hybrid kernel in Rust
-// lib.rs: entry point, panic handler, test infrastructure
+// ядро pagh OS — 64-битное гибридное ядро на Rust
+// lib.rs: точка входа, panic-handler, тестовая инфраструктура
 
 #![no_std]
 #![no_main]
@@ -27,9 +27,9 @@ mod net;
 mod pkg;
 mod provision;
 mod security;
-/// Boot-time Linux-compat self-test harness, compiled only under the
-/// `lx_selftest`, `lx_livetest`, `lx_bigindex`, or `lx_tlsbig` cargo features so
-/// the default build/boot is unchanged.
+/// Boot-time стенд self-test Linux-совместимости, компилируется только с cargo-фичами
+/// `lx_selftest`, `lx_livetest`, `lx_bigindex` или `lx_tlsbig`, так что
+/// обычная сборка/загрузка не меняется.
 #[cfg(any(
     feature = "lx_selftest",
     feature = "lx_livetest",
@@ -79,13 +79,13 @@ pub static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 #[link_section = ".requests"]
 pub static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
-/// Boot-loaded files (`module_path:` entries in `limine.conf`).
+/// Загруженные загрузчиком файлы (записи `module_path:` в `limine.conf`).
 ///
-/// The storage path uses this to find a disk image travelling next to the
-/// kernel — the boot medium itself becomes the system's disk, which is what
-/// makes a machine with no supported drive usable at all (see
-/// `drivers::memdisk`). The request is unconditional and costs one response
-/// lookup; with no modules configured the response is simply empty.
+/// Путь хранения использует это, чтобы найти образ диска, едущий рядом с
+/// ядром — сам загрузочный носитель становится диском системы, что и делает
+/// машину без поддерживаемого накопителя вообще пригодной (см.
+/// `drivers::memdisk`). Запрос безусловный и стоит одного поиска ответа; без
+/// настроенных модулей ответ просто пустой.
 #[used]
 #[no_mangle]
 #[link_section = ".requests"]
@@ -95,25 +95,24 @@ pub(crate) static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KERNEL_BASE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KERNEL_SIZE: AtomicU64 = AtomicU64::new(0);
 
-/// The kernel's own boot stack.
+/// Собственный boot-стек ядра.
 ///
-/// WHY THE KERNEL DOES NOT USE THE BOOTLOADER'S STACK. Limine hands over with a
-/// stack it sized for its own purposes, and every call the kernel makes before
-/// the scheduler installs a per-task stack runs on it. That works until it does
-/// not: on a BIOS boot, adding one call to the boot path pushed a legitimate
-/// depth over the limit, the overflow landed on memory Limine had put below the
-/// stack, and the kernel died fetching an instruction from a page that was no
-/// longer mapped — a crash that appears and disappears with unrelated code
-/// changes, which is the signature of a stack overflow rather than a logic bug.
-/// Owning the stack makes the boot path independent of the loader's sizing.
+/// ПОЧЕМУ ЯДРО НЕ ИСПОЛЬЗУЕТ СТЕК ЗАГРУЗЧИКА. Limine передаёт управление со
+/// стеком, размер которого выбрал под свои нужды, и каждый вызов ядра до
+/// установки стеков задач планировщиком идёт по нему. Это работает, пока не
+/// перестаёт: при BIOS-загрузке добавление одного вызова в boot-путь увело
+/// легитимную глубину за лимит, переполнение легло на память, которую Limine
+/// положил под стек, и ядро умерло, выбирая инструкцию из уже не замапленной
+/// страницы — краш, который появляется и исчезает от несвязанных изменений
+/// кода, характерный признак переполнения стека, а не логической ошибки.
+/// Собственный стек делает boot-путь независимым от размеров загрузчика.
 ///
-/// 128 KiB matches half of a kernel task stack (`KERNEL_STACK_PAGES`), which is
-/// far more than the boot path has ever used, and it is `.bss`: it costs no
-/// space in the image.
+/// 128 KiB — половина стека задачи ядра (`KERNEL_STACK_PAGES`), намного больше,
+/// чем boot-путь когда-либо использовал, и это `.bss`: места в образе не стоит.
 #[repr(align(16))]
 struct BootStack([u8; BOOT_STACK_BYTES]);
 
-/// Size of the kernel's boot stack.
+/// Размер boot-стека ядра.
 const BOOT_STACK_BYTES: usize = 128 * 1024;
 
 static mut BOOT_STACK: BootStack = BootStack([0; BOOT_STACK_BYTES]);
@@ -143,8 +142,8 @@ fn panic(info: &PanicInfo) -> ! {
     arch::cpu::disable_interrupts();
     if let Some(loc) = info.location() {
         kprint!("[PANIC] {}:{} — ", loc.file(), loc.line());
-        // A panic is fatal (`panic = "abort"`): on a machine with no serial port
-        // the screen is the only witness, so say it there too.
+        // Паника фатальна (`panic = "abort"`): на машине без serial-порта экран —
+        // единственный свидетель, так что скажите и там.
         drivers::earlyfb::errorln(format_args!("PANIC at {}:{}", loc.file(), loc.line()));
     } else {
         kprint!("[PANIC] ");

@@ -1,23 +1,23 @@
-// drivers/cursor.rs — Software mouse cursor (framebuffer overlay)
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// drivers/cursor.rs — программный курсор мыши (оверлей framebuffer)
+// 64-битное ядро ОС x86_64 на Rust (#![no_std])
 //
-// A classic arrow cursor drawn directly into the framebuffer. Because there is
-// no hardware cursor plane, the pixels underneath the arrow are saved before
-// drawing and restored before the next move, so the cursor leaves no trail.
+// Классическая стрелка-курсор, рисуемая прямо во framebuffer. Аппаратной
+// cursor-plane нет, поэтому пиксели под стрелкой сохраняются до рисования и
+// восстанавливаются перед следующим движением — курсор не оставляет следа.
 //
-// Ordering contract (important when something else draws under the cursor, e.g.
-// `paint`'s shape preview): callers must `hide()` (restore background) before
-// redrawing the area beneath the cursor, then `move_to()` afterwards to
-// re-capture the fresh background and redraw the arrow on top.
+// Контракт порядка (важен, когда под курсором рисует кто-то ещё, например
+// preview фигур `paint`): вызывающие должны вызвать `hide()` (восстановить фон)
+// перед перерисовкой области под курсором, затем `move_to()`, чтобы заново
+// захватить свежий фон и нарисовать стрелку сверху.
 //
-// Flushing contract: the framebuffer console draws into a RAM shadow buffer, so
-// the arrow is only on the screen if its pixels are pushed to the device. The
-// cursor owns that push: writes are "quiet" (they do not mark the frame dirty)
-// and `hide`/`move_to` flush just the 12x19 rectangle they touched. This keeps
-// the frame flush for actual frame changes — before that split, every mouse move
-// made the shell copy the whole surface, and drawing the arrow *after* the frame
-// flush without a rect flush meant the arrow never reached the device at all
-// (the next `hide` restored the background before the next frame flush).
+// Контракт flush: консоль framebuffer рисует в RAM shadow-буфер, так что стрелка
+// на экране, только если её пиксели отправлены на устройство. Курсор владеет
+// этим push: записи «тихие» (не помечают кадр dirty), а `hide`/`move_to` флашат
+// только затронутый прямоугольник 12x19. Это оставляет flush кадра для реальных
+// изменений кадра — до такого разделения каждое движение мыши заставляло shell
+// копировать всю поверхность, а рисование стрелки *после* flush кадра без
+// прямоугольного flush означало, что стрелка вообще не доходила до устройства
+// (следующий `hide` восстанавливал фон до следующего flush кадра).
 
 use crate::drivers::framebuffer;
 use crate::sync::spinlock::Spinlock;
@@ -28,7 +28,7 @@ const CURSOR_H: usize = 19;
 const BORDER: u32 = 0x000000;
 const FILL: u32 = 0xFFFFFF;
 
-/// Arrow shape: `#` = black border, `o` = white fill, space = transparent.
+/// Форма стрелки: `#` = чёрная граница, `o` = белая заливка, пробел = прозрачно.
 static ARROW: [&str; CURSOR_H] = [
     "#",
     "##",

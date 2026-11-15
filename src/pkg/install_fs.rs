@@ -1,79 +1,79 @@
-//! Effectful ext2 package installer (design component 10, `Package_Installer`).
+//! Эффектный ext2-инсталлятор пакетов (компонент дизайна 10, `Package_Installer`).
 //!
-//! This is the *kernel-only* half of the installer. The pure selection/normalization
-//! logic lives in [`super::install`] (`install.rs`), which is `#[path]`-included by
-//! the `host-tests` crate and therefore MUST stay free of kernel/VFS dependencies
-//! (R11.6). [`install_data_tar`] is the effectful shell: it reuses
-//! [`normalize_entry_path`](super::install::normalize_entry_path) and writes the
-//! selected regular files onto the real ext2 filesystem through the [`VfsNode`]
-//! trait. It is split into this sibling module — exactly like `net::http` (pure) vs
-//! `net::http_fetch` (effectful) — so `install.rs` remains host-includable.
+//! Это *kernel-only* половина инсталлятора. Чистая логика выбора/нормализации живёт
+//! в [`super::install`] (`install.rs`), который `#[path]`-включается `host-tests` и
+//! потому ОБЯЗАН оставаться без зависимостей от ядра/VFS (R11.6). [`install_data_tar`]
+//! — эффектная оболочка: переиспользует
+//! [`normalize_entry_path`](super::install::normalize_entry_path) и пишет выбранные
+//! regular files на реальную ext2 через трейт [`VfsNode`]. Вынесено в соседний
+//! модуль — ровно как `net::http` (чистый) vs `net::http_fetch` (эффектный) — чтобы
+//! `install.rs` оставался host-includable.
 //!
-//! Responsibilities (R10.1–R10.4, R10.6, R10.7, R10.8, R12.4, R12.5):
-//!   * Skip non-regular entries (R10.6) and `..`-escaping / empty paths (R10.8).
-//!   * Resolve each safe path relative to `root`, creating any missing parent
-//!     directories (R10.2) — but **never outside `root`**, and never through a
-//!     symlink the same package creates (F-x86n-1, see below).
-//!   * Create/overwrite the target file and write exactly the entry content so the
-//!     stored size equals the content length (R10.3, R10.7).
-//!   * On a no-space failure from ext2, remove any partial file and return
+//! Обязанности (R10.1–R10.4, R10.6, R10.7, R10.8, R12.4, R12.5):
+//!   * Пропускать не-regular записи (R10.6) и `..`-escapes/пустые пути (R10.8).
+//!   * Разрешать каждый безопасный путь относительно `root`, создавая недостающие
+//!     родительские каталоги (R10.2) — но **никогда вне `root`** и никогда через
+//!     симлинк, созданный тем же пакетом.
+//!   * Создавать/перезаписывать целевой файл и писать ровно содержимое записи, чтобы
+//!     сохранённый размер равнялся длине содержимого (R10.3, R10.7).
+//!   * При нехватке места от ext2 удалить частичный файл и вернуть
 //!     [`InstallError::NoSpace`] (R10.4).
-//!   * Emit exactly one structured diagnostic per failure naming
-//!     `component=Package_Installer`, the stage, and the file path (R12.4, R12.5).
+//!   * Выдавать ровно одну структурированную диагностику на сбой с
+//!     `component=Package_Installer`, стадией и путём файла (R12.4, R12.5).
 //!
-//! ## Install-root confinement (F-x86n-1)
+//! ## Confinement установочного корня
 //!
-//! The archive is untrusted even when it arrived over an authenticated channel: a
-//! `.deb` member may be a symlink, and older code resolved later members' parent
-//! directories through **any** symlink in the tree (`lookup_path_walk(_, true)`).
-//! Because the walker interprets link targets in the *guest* namespace, an
-//! absolute target like `/etc` maps to `/mnt/etc` — so `./y -> /etc` followed by
-//! `./y/autorun` wrote `/mnt/etc/autorun`, which the shell executes as root at
-//! boot (also `./x -> /` + `./x/pwned_root` → `/mnt/pwned_root`). Neither path
-//! contains `..`, so the archive-path normalization could not catch it.
+//! Архив недоверенный, даже когда пришёл по аутентифицированному каналу: член `.deb`
+//! может быть симлинком, и старый код резолвил родительские каталоги поздних членов
+//! через **любой** симлинк дерева (`lookup_path_walk(_, true)`). Поскольку walker
+//! интерпретирует цели ссылок в *гостевом* namespace, абсолютная цель вроде `/etc`
+//! отображается в `/mnt/etc` — так что `./y -> /etc`, затем `./y/autorun` писали
+//! `/mnt/etc/autorun`, который shell исполняет как root при загрузке (и
+//! `./x -> /` + `./x/pwned_root` → `/mnt/pwned_root`). Ни один путь не содержит
+//! `..`, так что нормализация путей архива это не ловила.
 //!
-//! The fix is two independent layers:
+//! Фикс — два независимых слоя:
 //!
-//!   * the pure [`plan_install`] collects every symlink the archive creates and
-//!     refuses any member (or hard-link target) whose ancestor component is one of
-//!     them; [`install_data_tar`] turns that into a whole-package refusal
-//!     ([`InstallError::UnsafePath`]) **before writing anything**;
-//!   * the effectful resolver below walks parents component by component starting
-//!     at the install-root node and never leaves it: a component must be a real
-//!     directory or a missing name (created when asked), a symbolic link is only
-//!     followed when its target is **relative** and the spliced components stay
-//!     under the root, and a link this same install created is never followed at
-//!     all (lstat-style resolutution). Absolute targets are refused outright —
-//!     remapping them into the guest namespace is exactly what made them
-//!     install-root-relative.
+//!   * чистый [`plan_install`] собирает каждый создаваемый архивом симлинк и
+//!     отвергает любого члена (или цель hard-link), чей компонент-предок — один из
+//!     них; [`install_data_tar`] превращает это в отказ всего пакета
+//!     ([`InstallError::UnsafePath`]) **до записи чего-либо**;
+//!   * эффектный резолвер ниже идёт по родителям покомпонентно, начиная с узла
+//!     установочного корня, и никогда его не покидает: компонент должен быть
+//!     настоящим каталогом или отсутствующим именем (создаётся по запросу),
+//!     симлинк разворачивается, только когда его цель **относительная** и
+//!     склеенные компоненты остаются под корнем, а ссылка, созданная этой же
+//!     установкой, не разворачивается вообще (резолвинг в стиле lstat).
+//!     Абсолютные цели отвергаются сразу — их ремап в гостевой namespace и есть
+//!     то, что делало их relative-to-install-root.
 //!
-//! Hard-link targets are resolved by the same confined walker (final component
-//! unfollowed, as `link(2)` requires), so a hostile archive cannot hard-link a
-//! node from outside the root either.
+//! Цели hard-link разрешаются тем же confined walker'ом (финальный компонент не
+//! разворачивается, как требует `link(2)`), так что враждебный архив не может
+//! захардлинковать узел снаружи корня.
 //!
-//! ## Hard-link aliases of symlinks (F-r2-vfs-1)
+//! ## Hard-link-алиасы симлинков
 //!
-//! `link(2)` does not follow the final component, so a hard link whose target is a
-//! symlink is a **second name for the link inode**. The round-2 audit used that to
-//! bypass both layers above (`./d/y -> ../etc`, `./d/h -> ./d/y`, then
-//! `./d/h/autorun -> ./d/pwn`): the planner knew only `d/y`, `d/h` looked like an
-//! ordinary hard link, and the member named `d/h/autorun` landed at
-//! `/mnt/etc/autorun`. The fix has two independent halves, matching the layers
-//! above: the pure planner treats every hard-link alias as a link (equivalence
-//! closure, so aliases of aliases and `..`-normalized targets are covered) and
-//! rejects the whole package before any write; the effectful layer never creates a
-//! second name for an archive symlink and never traverses a symlink that has more
-//! than one name — an alias that no path-based `own_links` entry marks, e.g. one
-//! left by an earlier install or a planner regression.
+//! `link(2)` не разворачивает финальный компонент, поэтому hard link, чья цель —
+//! симлинк, есть **второе имя inode ссылки**. Аудит round-2 использовал это, чтобы
+//! обойти оба слоя выше (`./d/y -> ../etc`, `./d/h -> ./d/y`, затем
+//! `./d/h/autorun -> ./d/pwn`): планировщик знал только `d/y`, `d/h` выглядел
+//! обычным hard link, и член `d/h/autorun` попадал в `/mnt/etc/autorun`. Фикс — две
+//! независимые половины, соответствующие слоям выше: чистый планировщик трактует
+//! каждый hard-link-алиас как ссылку (замыкание эквивалентности, так что покрыты
+//! алиасы алиасов и `..`-нормализованные цели) и отвергает весь пакет до любой
+//! записи; эффектный слой никогда не создаёт второе имя для симлинка архива и
+//! никогда не обходит симлинк, у которого больше одного имени — алиас, который не
+//! помечен ни одной path-based записью `own_links`, например оставленный прошлой
+//! установкой или регрессией планировщика.
 //!
-//! ## No-space detection through the VFS boundary
+//! ## Обнаружение нехватки места через границу VFS
 //!
-//! ext2 reports an exhausted block/inode bitmap as `FsError::OutOfSpace`, which the
-//! ext2 `VfsNode` adapter (`fs/ext2/mod.rs::fs_to_vfs`) collapses to
-//! [`VfsError::IoError`]. The VFS trait surface exposes no dedicated out-of-space
-//! variant, so a write/create that fails with [`VfsError::IoError`] is the only
-//! observable no-space signal and is mapped to [`InstallError::NoSpace`] here (R10.4).
-//! Every other [`VfsError`] is reported verbatim via [`InstallError::Vfs`].
+//! ext2 сообщает исчерпанную bitmap блоков/inode как `FsError::OutOfSpace`, которую
+//! адаптер ext2 `VfsNode` (`fs/ext2/mod.rs::fs_to_vfs`) сводит к
+//! [`VfsError::IoError`]. Поверхность трейта VFS не выставляет отдельного варианта
+//! out-of-space, поэтому write/create, падающий с [`VfsError::IoError`], — единственный
+//! наблюдаемый сигнал нехватки места и здесь отображается в [`InstallError::NoSpace`]
+//! (R10.4). Любая другая [`VfsError`] сообщается дословно через [`InstallError::Vfs`].
 #![allow(dead_code)]
 
 use alloc::collections::BTreeSet;

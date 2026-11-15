@@ -1,26 +1,25 @@
-//! Emergency console: text straight into the Limine framebuffer, no heap.
+//! Аварийная консоль: текст прямо в Limine framebuffer, без heap.
 //!
-//! WHY THIS EXISTS. On a real PC there is no serial port, so the only thing an
-//! operator can see is the screen — and every failure before the normal console
-//! is up (heap allocation, APIC bring-up, a Limine response missing, a panic) was
-//! invisible: `fatal()` and the panic handler wrote to COM1 and halted, leaving a
-//! black display with no clue what happened. That is exactly the bug report this
-//! module answers: "no image at all".
+//! Зачем: на реальном ПК нет serial-порта, так что единственное, что оператор
+//! видит, — экран; и каждый сбой до поднятия нормальной консоли (аллокация heap,
+//! APIC bring-up, отсутствующий ответ Limine, паника) был невидим: `fatal()` и
+//! panic handler писали в COM1 и останавливались, оставляя чёрный экран без
+//! подсказки, что произошло.
 //!
-//! CONSTRAINTS, and why the implementation looks primitive:
+//! ОГРАНИЧЕНИЯ и почему реализация выглядит примитивно:
 //!
-//! * **No allocator.** The normal `FramebufferWriter` allocates a shadow buffer
-//!   (`back`) and two grids, so it cannot exist until the heap does — and the
-//!   steps that fail are precisely the ones before that.
-//! * **No locks.** A panic may hold a lock already, so anything taking a spinlock
-//!   could deadlock while reporting the very failure that stopped the machine.
-//! * **No formatting machinery that allocates.** `core::fmt::Write` into a fixed
-//!   buffer is fine; `format!` is not.
+//! * **Без аллокатора.** Нормальный `FramebufferWriter` аллоцирует shadow-буфер
+//!   (`back`) и две сетки, поэтому не может существовать до появления heap — а
+//!   падают как раз шаги до этого.
+//! * **Без локов.** Паника может уже держать лок, так что всё, берущее спинлок,
+//!   могло бы дедлокнуться, сообщая ровно о сбое, остановившем машину.
+//! * **Без форматирования, которое аллоцирует.** `core::fmt::Write` в фиксированный
+//!   буфер годится; `format!` — нет.
 //!
-//! So this is a plain "draw one glyph into the linear framebuffer" loop over the
-//! same embedded font asset the real console uses. It is used by [`fatal`] and by
-//! the panic handler, and by boot steps as a progress trace — so a machine that
-//! dies at step N shows steps 1..N-1 and the name of the step that failed.
+//! Так что это простой цикл «нарисовать один глиф в линейный framebuffer» поверх
+//! того же встроенного ассета шрифта, что у настоящей консоли. Используется
+//! [`fatal`] и panic handler'ом, а boot-шаги — как трасса прогресса: машина, умершая
+//! на шаге N, показывает шаги 1..N-1 и имя шага, который упал.
 
 use core::fmt::{self, Write};
 use core::ptr::write_volatile;

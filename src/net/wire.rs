@@ -1,17 +1,17 @@
-//! Own network wire types + pure encode/decode helpers.
+//! Свои сетевые wire-типы + чистые хелперы encode/decode.
 //!
-//! This replaces every `smoltcp::wire` type the kernel used. Everything here is
-//! pure: byte slices in, values out, no globals, no hardware, no allocation —
-//! so the module is host-includable (same discipline as `net/http.rs`) and the
-//! property tests can exercise it directly.
+//! Заменяет каждый тип `smoltcp::wire`, который использовало ядро. Всё здесь
+//! чистое: байтовые срезы на входе, значения на выходе, без глобалов, железа и
+//! аллокаций — так что модуль host-includable (та же дисциплина, что
+//! `net/http.rs`), и property-тесты могут проверять его напрямую.
 //!
-//! Layers covered:
-//!   * Ethernet II framing (14-byte header)
-//!   * ARP (RFC 826) packet build/parse
-//!   * IPv4 header build/parse (+ fragmentation fields), internet checksum
+//! Покрытые слои:
+//!   * Ethernet II framing (14-байтовый заголовок)
+//!   * ARP (RFC 826) сборка/разбор пакета
+//!   * IPv4-заголовок сборка/разбор (+ поля фрагментации), internet checksum
 //!   * ICMP echo request/reply
-//!   * UDP datagram build/parse
-//!   * TCP segment header build/parse (options: MSS, window scaling)
+//!   * UDP датаграмма сборка/разбор
+//!   * TCP-заголовок сегмента сборка/разбор (опции: MSS, window scaling)
 
 use alloc::string::String;
 use core::fmt;

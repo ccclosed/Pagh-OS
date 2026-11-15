@@ -1,462 +1,141 @@
-# Security policy
+# Политика безопасности
 
-pagh is an educational kernel, not a production operating system.
+pagh — учебное ядро, а не production-операционная система.
 
-## Threat model in one paragraph
+## Модель угроз в одном абзаце
 
-pagh aims at **kernel integrity** (ring 3 cannot read or write kernel memory,
-execute writable memory, or touch device MMIO — paging is supposed to enforce it).
-That boundary was **violated in 2.21.0**: the three demonstrated ring3-to-ring0
-paths were closed in 2.22.0 and the filesystem findings in 2.22.2 (see "Attack
-audit" below); the remaining audit findings are listed there and are not claimed
-fixed. pagh gives you **package
-authenticity** (the TLS/OpenPGP/digest chain above refuses a mirror that cannot prove
-what it served), and a **filesystem permission model between processes** (per-process
-`uid`/`gid`/`euid`/`egid`/`suid`/`sgid`, POSIX owner/group/other checks on `open`,
-`execve`, directory mutation and `kill`, and owner/root-only `chmod`, root-only
-`chown`, all against real ext2 inode metadata). It does **not** give you a secure
-multi-user system: there is no login or account database, so the boot shell and every
-kernel-spawned process run as root and the model constrains only a process that
-deliberately drops privileges (`setuid` family). There are no supplementary groups,
-ACLs, `fsuid`, capabilities, seccomp, LSM or audit trail, no setuid-binary elevation on
-`execve`, no ASLR/KASLR, no KPTI, no SMAP (SMEP is enabled only when CPUID reports it)
-and no address-space or mount namespaces. A hostile process that starts as root stays
-root; a process that has dropped privileges can still exhaust memory/CPU and has the
-whole remaining syscall surface. Side channels, network availability and firmware are
-out of scope. Treat it as a teaching kernel that a careful operator runs only with code
-they trust. The enforcement points and the exact gaps are listed in
-`docs/security-model.md`.
+pagh нацелен на **целостность ядра** (ring 3 не может читать или писать память ядра, исполнять записываемую память или трогать MMIO устройств — это должна обеспечивать пейджинговая защита). Эта граница была **нарушена в 2.21.0**: три продемонстрированных пути ring3-to-ring0 закрыты в 2.22.0, находки файловой системы — в 2.22.2 (см. «Аудиты атак» ниже); остальные находки аудита перечислены там же и не объявляются исправленными. pagh даёт **подлинность пакетов** (цепочка TLS/OpenPGP/digest выше отвергает зеркало, которое не может доказать, что оно отдало), и **модель прав файловой системы между процессами** (per-process `uid`/`gid`/`euid`/`egid`/`suid`/`sgid`, POSIX-проверки owner/group/other на `open`, `execve`, мутациях каталогов и `kill`, а также owner/root-only `chmod`, root-only `chown` — всё по реальным метаданным ext2-inode). Он **не** даёт безопасной многопользовательской системы: нет логина и базы аккаунтов, поэтому загрузочный shell и каждый процесс, порождённый ядром, работают от root, а модель ограничивает только процесс, который намеренно сбрасывает привилегии (семейство `setuid`). Нет дополнительных групп, ACL, `fsuid`, capabilities, seccomp, LSM и audit trail; нет повышения прав через setuid-бинарники на `execve`; нет ASLR/KASLR, KPTI, SMAP (SMEP включается только при поддержке по CPUID) и namespaces адресного пространства/монтирования. Враждебный процесс, стартовавший root'ом, остаётся root'ом; процесс, сбросивший привилегии, всё ещё может исчерпать память/CPU, и ему доступна вся остальная поверхность сисколлов. Side channels, доступность сети и прошивка вне области. Относитесь к нему как к учебному ядру, которое аккуратный оператор запускает только на доверенном коде. Точки принуждения и точные пробелы перечислены в `docs/security-model.md`.
 
-### Credentials and filesystem permissions
+### Учётные данные и права файловой системы
 
-Credentials live in `CompatState` (`src/task/compat.rs`) and start as `Creds::ROOT` for
-every process the kernel spawns; `fork`/`clone` inherit them unchanged and `execve`
-preserves them (setuid *binaries* are not modelled). The pure decisions live in
-`src/arch/x86_64/linux/cred.rs` (host property P56), and the syscall layer — not the
-VFS — consults them:
+Учётные данные живут в `CompatState` (`src/task/compat.rs`) и стартуют как `Creds::ROOT` для каждого процесса, порождённого ядром; `fork`/`clone` наследуют их без изменений, `execve` сохраняет (setuid-*бинарники* не моделируются). Чистые решения — в `src/arch/x86_64/linux/cred.rs` (host-свойство P56), и их спрашивает слой сисколлов, а не VFS:
 
-* `open`/`openat`: read for `O_RDONLY`, write for `O_WRONLY`/`O_RDWR`, plus write for
-  `O_TRUNC`; `O_CREAT` additionally needs write+execute on the parent directory.
-* `execve`: at least one execute bit, even for root (Linux's rule).
-* `unlink`/`rmdir`/`mkdir`/`rename`: write+execute on every parent directory involved;
-  `rename` authorises both parents before it mutates either.
-* `chmod`/`fchmod`: root or the inode owner; `chown`/`fchown`: root only. ext2 writes
-  `i_mode`/`i_uid`/`i_gid` back through the journal; synthetic nodes (`/dev`, `/proc`,
-  ramfs) keep the historical per-process stat override and cannot persist an owner.
-* `kill`/`tgkill`: caller's effective uid must be root or equal the target's real or
-  effective uid.
+* `open`/`openat`: чтение для `O_RDONLY`, запись для `O_WRONLY`/`O_RDWR`, плюс запись для `O_TRUNC`; `O_CREAT` дополнительно требует запись+исполнение на родительском каталоге.
+* `execve`: хотя бы один бит исполнения, даже для root (правило Linux).
+* `unlink`/`rmdir`/`mkdir`/`rename`: запись+исполнение на каждом задействованном родительском каталоге; `rename` авторизует оба родителя до мутации любого.
+* `chmod`/`fchmod`: root или владелец inode; `chown`/`fchown`: только root. ext2 пишет `i_mode`/`i_uid`/`i_gid` обратно через журнал; синтетические узлы (`/dev`, `/proc`, ramfs) держат исторический per-process stat override и не могут сохранить владельца.
+* `kill`/`tgkill`: эффективный uid вызывающего должен быть root или совпадать с real/effective uid цели.
 
-Root bypasses read and write, but **not** execute: a `0644` file cannot be execed by
-anyone. That rule is what makes the model meaningful even though the default identity
-is root.
+Root обходит чтение и запись, но **не** исполнение: файл `0644` не может исполнить никто. Именно это правило делает модель осмысленной, несмотря на то что идентичность по умолчанию — root.
 
-## Attack audits (2026-11-13 and round 2): fixed
+## Аудиты атак: исправленное
 
-An external red-team pass ran stock ring-3 Linux ELFs on a private QEMU range
-(attachments: PoC sources, serial logs and per-area reports). It found three
-independent ring3-to-ring0 paths and a one-syscall machine kill on the 2.21.0
-image, and a second, independent round on the 2.22.3 tree found seven more
-(a fork-COW ownership UAF that also reached uid 0, a package-installer hard-link
-alias bypass, and RISC-V kernel/runtime issues). A third round against 2.22.5
-found four more x86 highs, all fixed in 2.22.6, plus three lower-severity x86
-findings fixed in the next release (2.22.7 on `dev`). **Fixed in 2.22.0** for
-the round-1 ring3-to-ring0 paths, **2.22.3** for the round-1 user-buffer TOCTOU
-class, **2.22.4/2.22.5** for the round-2 x86 items, **2.22.6** for the four high
-round-3 x86 items, **2.22.7 (dev)** for the remaining round-3 x86 items, with
-the RISC-V items fixed in the sibling repositories. Each finding was reproduced before and after; the
-same PoCs still succeed on the stock images:
+Внешний red-team прогон запускал стоковые ring-3 Linux ELF на приватном QEMU-стенде (PoC-исходники, serial-логи и отчёты по областям). На образе 2.21.0 он нашёл три независимых пути ring3-to-ring0 и убийство машины одним сисколлом; второй, независимый раунд на дереве 2.22.3 нашёл ещё семь (UAF владения fork-COW, доросший до uid 0; обход hard-link-алиасом установщика пакетов; проблемы RISC-V kernel/runtime). Третий раунд против 2.22.5 нашёл ещё четыре x86-high, все исправлены в 2.22.6, плюс три менее серьёзные x86-находки, исправленные в следующем релизе (2.22.7 на `dev`). Каждая находка воспроизводилась до и после; те же PoC на стоковых образах по-прежнему срабатывают. Ниже — компактный перечень; полные истории — в release notes `AGENTS.md` и `CHANGELOG.md`.
 
-* **F-LEAD-1 (critical, verified).** `mprotect(2)` accepted kernel virtual
-  addresses: no `USER_ADDR_MAX` gate, a coverage guard that inverted to "allowed"
-  for a fully mapped kernel range, and `leaf_flags()` (a user-page flag builder
-  that always sets `USER_ACCESSIBLE`) re-mapping the found kernel frames. The
-  kernel's leaf page tables are shared between the user PML4 and the kernel, so
-  this produced a ring-3 W+X alias of kernel memory; scanning the heap for the
-  process's credentials and zeroing them gave uid 0. `mprotect`/`munmap`/`mremap`
-  now share a user-range gate, the `PROT_NONE` path can free only user frames, and
-  `vmm::map` refuses `USER_ACCESSIBLE` kernel mappings.
-* **F-LEAD-2 (critical, verified).** A forged `rt_sigreturn(2)` frame restored
-  user-controlled `eflags` into `r11`; `sysretq` loaded them as RFLAGS, so
-  `IOPL=3` gave ring 3 I/O ports and PCI config space (virtio-blk BAR observed).
-  Frame decode now rejects `ip`/`sp` outside the user half and masks restored
-  flags to `USER_RFLAGS_MASK` (IOPL/NT/VM/RF/AC cleared); the TSS carries no I/O
-  bitmap, so ports need both this mask changed and a new TSS to become reachable.
-* **F-x86a-1 (critical, verified).** `recvfrom(2)` wrote the source `sockaddr`
-  and `socklen_t` through unvalidated user pointers: 16 bytes plus a constant 4
-  at two arbitrary addresses, proven against the kernel tick counter (a one-shot
-  arbitrary kernel write, and with a known `Creds` address a direct privesc).
-  Both outputs are now `check_user_ptr`-validated before the write.
-* **F-x86a-3 (medium, verified).** `connect(2)` read `sa_family` through the
-  caller's pointer after checking only the *length*, so a non-canonical pointer
-  caused a ring-0 #GP and the fault handler halted the machine. The pointer is
-  now validated before the read.
-* Also in 2.22.0: the EINVAL syscall diagnostic (attacker-triggerable, flooded
-  serial and framebuffer from the exploit loop) is rate-limited to one line per
-  second.
-* **F-x86a-4 (medium, fixed in 2.22.3).** `poll`/`ppoll`, `select`/`pselect6`
-  and `epoll_wait` validated their user-visible array once and then kept
-  publishing into it after a `yield`; a sibling `CLONE_VM` thread could munmap
-  (or `mprotect PROT_NONE`) that page in the window, so the next ring-0 access
-  faulted in kernel mode and halted the machine. The wait loops now work on
-  private kernel copies, re-validate the user range after every yield and
-  return `EFAULT` when it vanished — and the same "validate, block, publish"
-  pattern is closed in the read family, the `readv`/`writev` iovec entries,
-  `wait4` and `sendfile`. `clone`'s `parent_tid`/`child_tid` writes are
-  validated and written inside the interrupt-disabled spawn/fork window (a bad
-  pointer is `EFAULT` before the child exists), `ioctl(TCSETS*)` honours its
-  validation result (it used to read anyway), and a kernel-mode page fault on a
-  user address now kills only the faulting compat process instead of the
-  machine (kernel-address and NULL faults stay fatal). PoC:
-  `tools/security/poc/poc_poll_toctou.c` (`poll`/`ppoll`/`select`/`epoll`/
-  `futex` modes).
-* **F-x86a-6 (medium, found in review, fixed in 2.22.3).** `sendto(2)` and
-  `recvfrom(2)` validated the caller's payload with a capped length
-  (`count.min(1 MiB)`) but then allocated/copied the RAW `u64` count: 1 MiB of
-  mapped pages was enough to make the kernel request a ~4 GiB allocation, which
-  aborts the kernel on a 1 GiB guest (the crafted-ext2 `i_size` class, F-x86v-1,
-  through one socket syscall). `abi::socket_payload_len` now refuses an
-  oversized `sendto` with `EMSGSIZE` before allocating and truncates
-  `recvfrom`'s capacity to the 1 MiB cap (the buffer is validated, allocated and
-  copied at exactly that length). `sendmsg`/`recvmsg` are not implemented in
-  this layer, so the pattern has no second copy. PoC:
-  `tools/security/poc/poc_sock_large_count.c`.
+**Раунд 1 — исправлено в 2.22.0/2.22.3:**
 
-**Fixed in 2.22.7 (round-3 audit, dev — next release, not yet stable):**
+* **F-LEAD-1 (critical, verified).** `mprotect(2)` принимал адреса виртуальной памяти ядра: не было гейта `USER_ADDR_MAX`, guard покрытия инвертировался в «разрешено» для полностью замапленного диапазона ядра, а `leaf_flags()` (сборщик флагов пользовательской страницы, всегда ставящий `USER_ACCESSIBLE`) перемапливал найденные кадры ядра. Таблицы листовых страниц ядра общие между пользовательским PML4 и ядром, поэтому получался ring-3 W+X алиас памяти ядра; сканирование кучи в поисках учётных данных процесса и их обнуление давало uid 0. Теперь `mprotect`/`munmap`/`mremap` делят пользовательский гейт диапазона, путь `PROT_NONE` освобождает только пользовательские кадры, а `vmm::map` отказывается маппить ядро с `USER_ACCESSIBLE`.
+* **F-LEAD-2 (critical, verified).** Поддельный кадр `rt_sigreturn(2)` восстанавливал управляемый пользователем `eflags` в `r11`; `sysretq` загружал их как RFLAGS, и `IOPL=3` давал ring 3 доступ к I/O-портам и PCI config space (наблюдался BAR virtio-blk). Декодер кадра теперь отвергает `ip`/`sp` вне пользовательской половины и маскирует восстановленные флаги в `USER_RFLAGS_MASK` (IOPL/NT/VM/RF/AC очищены); в TSS нет I/O-bitmap, поэтому для доступа к портам нужно изменить и эту маску, и создать новый TSS.
+* **F-x86a-1 (critical, verified).** `recvfrom(2)` писал исходный `sockaddr` и `socklen_t` через непроверенные пользовательские указатели: 16 байт плюс константа 4 по двум произвольным адресам, доказано против тикового счётчика ядра (одноразовая произвольная запись в ядро, а при известном адресе `Creds` — прямая эскалация). Оба выхода теперь проверяются `check_user_ptr` до записи.
+* **F-x86a-3 (medium, verified).** `connect(2)` читал `sa_family` через указатель вызывающего, проверив только *длину*, поэтому неканонический указатель вызывал ring-0 #GP, и обработчик fault останавливал машину. Теперь указатель валидируется до чтения.
+* Также в 2.22.0: диагностика сисколлов на EINVAL (триггерилась атакующим, флудила serial и framebuffer) ограничена одной строкой в секунду.
+* **F-x86a-4 (medium, исправлено в 2.22.3).** `poll`/`ppoll`, `select`/`pselect6` и `epoll_wait` валидировали свой пользовательский массив один раз, затем продолжали публиковать в него после `yield`; sibling-поток `CLONE_VM` мог сделать munmap (или `mprotect PROT_NONE`) этой страницы в окне, и следующее обращение ring 0 падало в режиме ядра, останавливая машину. Циклы ожидания теперь работают с приватными копиями в ядре, перепроверяют диапазон после каждого `yield` и возвращают `EFAULT`, если он исчез. Тот же паттерн «проверить, заблокироваться, опубликовать» закрыт в семействе read, записях iovec `readv`/`writev`, `wait4` и `sendfile`; записи `clone` в `parent_tid`/`child_tid` валидируются и выполняются внутри окна spawn/fork с выключенными прерываниями (плохой указатель — `EFAULT` до появления ребёнка); `ioctl(TCSETS*)` уважает результат валидации (раньше читал всё равно); page fault режима ядра на пользовательском адресе теперь убивает только виновный compat-процесс, а не машину (fault на адресе ядра и NULL остаются фатальными). PoC: `tools/security/poc/poc_poll_toctou.c` (режимы `poll`/`ppoll`/`select`/`epoll`/`futex`).
+* **F-x86a-6 (medium, найдено на ревью, исправлено в 2.22.3).** `sendto(2)` и `recvfrom(2)` валидировали полезную нагрузку вызывающего с урезанной длиной (`count.min(1 MiB)`), но затем выделяли/копировали СЫРОЙ `u64` count: 1 MiB замапленных страниц хватало, чтобы ядро запросило аллокацию ~4 GiB, что аварийно завершает ядро на 1-GiB госте (класс crafted-ext2 `i_size`, F-x86v-1, через один сокетный сисколл). `abi::socket_payload_len` теперь отвергает слишком большой `sendto` с `EMSGSIZE` до аллокации и урезает ёмкость `recvfrom` до лимита 1 MiB. `sendmsg`/`recvmsg` в этом слое не реализованы, поэтому второй копии паттерна нет. PoC: `tools/security/poc/poc_sock_large_count.c`.
 
-* **F-r3-arch-3 (low, verified).** `mprotect` protections were advisory in two
-  cases. (a) A write to a `PROT_READ` page that was fork-shared (COW) went
-  through `cow_copy_page`, which unconditionally installed `WRITABLE` on the
-  private copy, so the read-only mapping accepted writes and an executable
-  page could become W+X. A software leaf bit (`RO_BIT`, available bit 10) now
-  records that the mapping denies write; `cow_copy_page` refuses the copy when
-  it is set and the write fault keeps its SIGSEGV path, `fork` preserves the
-  deferred-write/read-only distinction across generations, and `mprotect`
-  maintains the bit with the tracked protection. (b) `mprotect(PROT_NONE)` over
-  a range that only partially covered a `VmRegion` refreshed only fully covered
-  regions, so the next touch found the stale region and lazily re-mapped the
-  page writable (a stack/guard page did not guard). `update_region_flags` now
-  splits the region into before/covered/after sub-ranges (file-backed offsets
-  shift like `munmap`), so `PROT_NONE` bytes stay a genuine fault. Evidence:
-  the audit's `attack/r3/arch/prot_bypass.c` dies with SIGSEGV on both edges
-  and the shell stays alive; ordinary COW fork/write (the round-3 `sweep`
-  matrix) and a dynamically linked glibc binary (`fastfetch`) are unchanged. Residual (documented, out of this finding): `mprotect(PROT_NONE)`
-  on a `brk` heap page is still re-backed by the brk fast path in
-  `handle_user_page_fault` — same self-protection class, not exploitable
-  cross-process, left for a follow-up.
-* **F-r3-vfs-2 (low-medium, verified).** A crafted ext2 image with
-  `s_inodes_count = s_inodes_per_group = 0xFFFFFFFF` (blocks/WAL untouched, so
-  `is_pagh_volume` accepts it) made `reconcile_free_counts` scan a 2^32-bit
-  bitmap span at every mount (~28 s of boot CPU) and write a bogus
-  `s_free_inodes_count` (≈2^32) back to block 0. `ext2::bounds::validate_group_counts`
-  now rejects an impossible superblock before any bitmap read: a per-group
-  count above the bitmap capacity (`BS * 8`), a zero count, or an inode count
-  above `s_inodes_per_group * groups` fails the mount with `FsError::Corrupt`.
-  The scan span is also clamped to one bitmap block and the free totals
-  saturate, so a superblock that changes after validation cannot reintroduce
-  the loop. Evidence: `attack/r3/vfs/img/ext2-bad-inodes.img` is refused
-  quickly and the bogus count is never written; host properties
-  (`ext2_group_counts`) pin the acceptance rule and the clamp.
-* **F-r3-lead-1 (high, static; no UAF demonstrated).** `exec_linux_image` frees
-  the replaced address space through `scheduler::drop_exclusive_user_space`,
-  which only looked at `READY_QUEUE` and `PENDING_REAPS`. A `CLONE_VM` sibling
-  parked by SIGSTOP/SIGTSTP lives in `STOPPED_TASKS`, so its shared page tables
-  could be freed under it (the audit log shows `old_cr3=… freed=true`; its raw
-  `clone` reproducer failed before creating the thread, so the UAF effect was
-  never demonstrated). The teardown policy is now pure and host-tested
-  (`src/task/as_refs.rs`): a space is freed only when no live Tcb in the ready
-  queue, the stopped set or the pending-reap set references it, and the same
-  rule now guards the exit reaper (which had the same hole). The execve log
-  names the registry that kept the space alive. This kernel keeps the sibling
-  alive in the old image instead of killing the thread group on execve;
-  Linux would kill it, and the deviation is documented in the release notes.
+**Раунд 3 — исправлено в 2.22.7 (dev, следующий релиз, ещё не stable):**
 
-**Fixed in 2.22.6 (round-3 audit):**
+* **F-r3-arch-3 (low, verified).** `mprotect`-защиты были совещательными в двух случаях. (a) Запись в страницу `PROT_READ`, разделённую после fork (COW), шла через `cow_copy_page`, который безусловно ставил `WRITABLE` на приватную копию: read-only-маппинг принимал записи, а исполняемая страница могла стать W+X. Новый программный бит листа (`RO_BIT`, available bit 10) фиксирует, что маппинг запрещает запись; `cow_copy_page` отказывается копировать при нём, write-fault сохраняет путь SIGSEGV, `fork` сохраняет различие deferred-write/read-only между поколениями, а `mprotect` поддерживает бит вместе с отслеживаемой защитой. (b) `mprotect(PROT_NONE)` по диапазону, частично покрывающему `VmRegion`, обновлял только полностью покрытые регионы, поэтому следующее касание находило устаревший регион и лениво перемапливало страницу записываемой (stack/guard-страница не защищала). `update_region_flags` теперь делит регион на поддиапазоны before/covered/after (file-backed смещения сдвигаются как в `munmap`), поэтому байты `PROT_NONE` остаются настоящим fault. Доказательство: `attack/r3/arch/prot_bypass.c` умирает с SIGSEGV на обоих краях, shell жив; обычный COW fork/write (матрица `sweep`) и динамически слинкованный glibc-бинарник (`fastfetch`) не затронуты. Остаток (задокументирован, вне этой находки): `mprotect(PROT_NONE)` на странице `brk`-кучи всё ещё переподкрепляется brk-fast-path в `handle_user_page_fault` — тот же класс самозащиты, не эксплуатируется кросс-процессно, оставлен на follow-up.
+* **F-r3-vfs-2 (low-medium, verified).** Crafted ext2-образ с `s_inodes_count = s_inodes_per_group = 0xFFFFFFFF` (блоки/WAL не тронуты, поэтому `is_pagh_volume` его принимает) заставлял `reconcile_free_counts` сканировать 2^32-битный span bitmap при каждом mount (~28 с boot CPU) и записывать фиктивный `s_free_inodes_count` (≈2^32) обратно в блок 0. `ext2::bounds::validate_group_counts` теперь отвергает невозможный superblock до любого чтения bitmap: счётчик на группу выше ёмкости bitmap (`BS * 8`), нулевой счётчик или число inode выше `s_inodes_per_group * groups` дают `FsError::Corrupt` при mount. Span сканирования также клампится до одного блока bitmap, а свободные итоги сатурируются. Доказательство: `attack/r3/vfs/img/ext2-bad-inodes.img` отвергается быстро, фиктивный счётчик не пишется; host-свойства (`ext2_group_counts`) закрепляют правило и clamp.
+* **F-r3-lead-1 (high, static; UAF не продемонстрирован).** `exec_linux_image` освобождает заменяемое адресное пространство через `scheduler::drop_exclusive_user_space`, который смотрел только на `READY_QUEUE` и `PENDING_REAPS`. Sibling `CLONE_VM`, припаркованный SIGSTOP/SIGTSTP, живёт в `STOPPED_TASKS`, поэтому его общие таблицы страниц могли освободиться под ним (в логе аудита `old_cr3=… freed=true`; сырой `clone`-репро не создал поток, поэтому UAF-эффект не продемонстрирован). Политика teardown теперь чистая и host-тестируемая (`src/task/as_refs.rs`): пространство освобождается только когда на него не ссылается ни один живой Tcb в ready queue, stopped set или pending-reap set; то же правило теперь охраняет exit reaper (у него была та же дыра). Лог execve называет реестр, удержавший пространство. Ядро сохраняет sibling живым в старом образе вместо убийства thread group на execve; Linux убил бы, отклонение задокументировано в release notes.
 
-* **F-r3-arch-1 (high, verified).** User-reachable CPU exceptions other than
-  `#GP`/`#PF` ended in `halt()`: a ring-3 `1/0` (#DE), `ud2` (#UD) or
-  `pushfq/orq $0x100/popfq` (#DB, TF is not IOPL-protected) parked the whole
-  machine from an unprivileged ELF. `#DE`/`#DB`/`#UD`/`#OF`/`#BR`/`#NM`/`#AC`
-  (and the user-reachable `#MF`/`#XM`) now share the pure, host-tested
-  `trap_frame::exception_action` policy: a ring-3 fault (or a user RIP) in a
-  `Compat_Process` is killed with `exit_code = 128 + signal`, a ring-0 fault
-  on a kernel address stays fatal. `SYSCALL` masks TF out of the kernel RFLAGS
-  so a user-set single-step flag cannot become a kernel-mode `#DB`. Evidence:
-  the audit's `mk_de`/`mk_ud`/`mk_db` PoCs return to the prompt on the fixed
-  kernel; `mk_bp` (`int3` from ring 3 → `#GP`) still kills only the process.
-* **F-r3-life-1 (high, verified).** `fcntl(F_DUPFD/F_DUPFD_CLOEXEC, arg)` had
-  no `NOFILE_MAX`/`RLIMIT_NOFILE` clamp (unlike `dup2`/`dup3`), so
-  `fcntl(fd, F_DUPFD, 0x2A000000)` grew the fd-slot vector toward a 704 MiB
-  allocation, the allocator aborted and the machine halted. The syscall now
-  rejects `arg >= NOFILE_MAX` with `EINVAL` before allocation and
-  `FdSlots::try_alloc` independently refuses a slot index at or above the same
-  bound with `EMFILE`; both rules are host-property-tested.
-* **F-r3-life-2 (high, verified).** `epoll_wait` over a registered signalfd
-  called `signalfd_readable()` from inside `poll_fd`'s `with_current_compat`
-  closure, re-entering the non-reentrant `COMPAT_STATES` spinlock with
-  interrupts disabled: a four-syscall, uid-1000 hard hang. The arm now
-  computes readiness from the `CompatState` the closure already owns, and
-  `signalfd_readable` debug-asserts that the registry is not held. Evidence:
-  the PoC returns (`EAGAIN`/`EINTR`) and the prompt stays alive; ordinary
-  epoll/signalfd use works.
-* **F-r3-vfs-1 (high, verified).** The installer's `own_links` recorded the
-  *archive* spelling of a created symlink while the effectful resolver
-  compared the *walked* spelling. With a pre-existing relative in-root
-  redirector (`/usr/share/doc/libgcc-s1 -> gcc-14-base` on the shipped tree),
-  `./usr/share/doc/libgcc-s1/evil -> ../../../../etc` was materialized at
-  `gcc-14-base/evil`; a later member spelled
-  `gcc-14-base/evil/autorun` then traversed the archive's own link and wrote
-  `/mnt/etc/autorun`, which the shell executes as root at the next boot. The
-  effectful layer now preflights every planned symlink against the pre-existing
-  tree and refuses the package as a whole (`UnsafePath`) before the first
-  inode when a member descends through the materialized spelling; it also
-  registers both spellings and the created link inode, and the resolver never
-  traverses a symlink inode the install created. Evidence: the audit's
-  `attack-final.deb` refused atomically with `/mnt/etc/autorun` absent and a
-  clean second boot, the self-contained two-package variant refused, round-1/2
-  constructs still refused, a normal `.deb` still installs; new
-  `tar_links`/`exception_trap`/fd host properties and the in-QEMU
-  `install_spelling_split_confinement` selftest.
+**Раунд 3 — исправлено в 2.22.6:**
 
-**Fixed in 2.22.5 (round-2 audit):**
+* **F-r3-arch-1 (high, verified).** Достижимые из userland CPU-исключения, кроме `#GP`/`#PF`, заканчивались `halt()`: ring-3 `1/0` (#DE), `ud2` (#UD) или `pushfq/orq $0x100/popfq` (#DB, TF не защищён IOPL) парковали всю машину из непривилегированного ELF. `#DE`/`#DB`/`#UD`/`#OF`/`#BR`/`#NM`/`#AC` (и достижимые из userland `#MF`/`#XM`) теперь делят чистую host-тестируемую политику `trap_frame::exception_action`: fault ring 3 (или user RIP) в `Compat_Process` убивает процесс с `exit_code = 128 + signal`, fault ring 0 на адресе ядра остаётся фатальным. `SYSCALL` маскирует TF из RFLAGS ядра, чтобы выставленный пользователем single-step не стал kernel-mode `#DB`. Доказательство: PoC `mk_de`/`mk_ud`/`mk_db` на исправленном ядре возвращаются к prompt; `mk_bp` (`int3` из ring 3 → `#GP`) по-прежнему убивает только процесс.
+* **F-r3-life-1 (high, verified).** У `fcntl(F_DUPFD/F_DUPFD_CLOEXEC, arg)` не было клампа `NOFILE_MAX`/`RLIMIT_NOFILE` (в отличие от `dup2`/`dup3`), поэтому `fcntl(fd, F_DUPFD, 0x2A000000)` растил вектор fd-слотов к аллокации 704 MiB, аллокатор аварийно завершался, машина вставала. Сисколл теперь отвергает `arg >= NOFILE_MAX` с `EINVAL` до аллокации, а `FdSlots::try_alloc` независимо отказывает индексу слота на границе и выше с `EMFILE`; оба правила покрыты host-свойствами.
+* **F-r3-life-2 (high, verified).** `epoll_wait` по зарегистрированному signalfd вызывал `signalfd_readable()` изнутри замыкания `with_current_compat` в `poll_fd`, повторно входя в нереентерабельный spinlock `COMPAT_STATES` с выключенными прерываниями: жёсткий hang для uid 1000 на четырёх сисколлах. Теперь ветка вычисляет готовность из `CompatState`, которым уже владеет замыкание, а `signalfd_readable` debug-assert'ит, что реестр не удерживается. Доказательство: PoC возвращается (`EAGAIN`/`EINTR`), prompt жив; обычный epoll/signalfd работает.
+* **F-r3-vfs-1 (high, verified).** `own_links` установщика записывал *архивное* написание созданной symlink, а эффектный резолвер сравнивал *пройденное* написание. При существующем относительном in-root редиректоре (`/usr/share/doc/libgcc-s1 -> gcc-14-base` в поставляемом дереве) `./usr/share/doc/libgcc-s1/evil -> ../../../../etc` материализовался в `gcc-14-base/evil`; более поздний член `gcc-14-base/evil/autorun` шёл через собственную ссылку архива и писал `/mnt/etc/autorun`, который shell исполняет как root при следующей загрузке. Эффектный слой теперь предпроверяет каждую планируемую symlink против существующего дерева и отвергает пакет целиком (`UnsafePath`) до первого inode, если член спускается через материализованное написание; он также регистрирует оба написания и inode созданной ссылки, а резолвер никогда не проходит через symlink-inode, созданный установкой. Доказательство: `attack-final.deb` отвергнут атомарно, `/mnt/etc/autorun` отсутствует, чистая вторая загрузка; самодостаточный двухпакетный вариант отвергнут; конструкции раундов 1/2 по-прежнему отвергаются; нормальный `.deb` ставится; новые host-свойства `tar_links`/`exception_trap`/fd и in-QEMU selftest `install_spelling_split_confinement`.
 
-* **F-r2-vfs-1 (high, verified).** A hard-link alias of an archive symlink
-  bypassed both F-x86n-1 layers. `link(2)` does not follow the final component,
-  so `./d/y -> ../etc` + `./d/h` HARDLINK to `./d/y` created a second name for
-  the *symlink inode*; the planner only knew `d/y` as a link and the effectful
-  resolver followed the alias, so `./d/h/autorun` (HARDLINK to `./d/pwn`) was
-  written to `/mnt/etc/autorun` and executed as root at the next boot. The pure
-  planner now computes the hard-link/symlink equivalence closure up front
-  (aliases of aliases and `..`-normalized targets included, archive order
-  irrelevant), reports the alias with `UnsafeKind::HardlinkAliasesSymlink` and
-  every member below it, and the installer refuses the whole package
-  (`InstallError::UnsafePath`) before writing anything. The effectful layer
-  never creates a second name for an archive symlink and never traverses a
-  symlink with `nlink > 1`, which also covers an unmarked alias left by an
-  earlier install or a planner regression. Evidence: the audit's
-  `attack/r2/vfs/attack-alias.deb` refused as a whole with `/mnt/etc/autorun`
-  absent and a clean next boot, the new `tar_links` host properties, the
-  in-QEMU `install_hardlink_alias_confinement` selftest, and the extended
-  `tests/pkg/e2e_pkg_escape.py` (round-1 packages still refused, a normal `.deb`
-  with a regular-file hard link still installs).
+**Раунд 2 — исправлено в 2.22.4/2.22.5:**
 
-**Fixed in 2.22.4 (round-2 audit):**
+* **F-r2-arch-1 (critical, verified).** `fork_user_space_cow` разделял листовые кадры с `COW_BIT` и `pmm::cow_ref` = 2, но только `cow_copy_page` и `drop_user_space` уважали счётчик ссылок. `munmap`, `mprotect(PROT_NONE)`, замена `mmap(MAP_FIXED)`, `mremap` и `vmm::unmap` освобождали или перефлагировали разделяемый кадр безусловно; `mprotect(RW)` даже снимал `COW_BIT` и делал разделяемый кадр аппаратно записываемым. Эксплойт: родитель делает `mprotect(RW)` на форкнутом диапазоне, ребёнок через `munmap` возвращает кадры в PMM, более поздний `mmap` выдаёт их как таблицы страниц, а устаревший writable PTE родителя перезаписывает их — primitive чтения/записи физической памяти, который сканирует `Creds` вызывающего и обнуляет их до uid 0. Фикс — один инвариант с одной точкой принуждения: `vmm::release_user_leaf` сначала очищает PTE/TLB, потребляет ровно один `cow_unref` для COW-листа и освобождает только на последней ссылке; он используется `munmap`, `PROT_NONE`, MAP_FIXED, `mremap`, OOM-unwind и `drop_user_space`. `mprotect` перефлагирует лист на месте и сохраняет `COW_BIT`; `vmm::map` отказывается перезаписывать живой COW-лист; `pmm::free_frame` отказывает и логирует кадр с живыми COW-ссылками. Учёт чистый и host-тестируемый (`memory/cow.rs`, свойство `cow_ownership`). Доказательство на стенде аудита: `cow_root` на исправленном сообщает `hijacked PT count=0` и `no page-table reuse observed`, uid остаётся 1000, ноль строк `DOUBLE FREE`, shell возвращается; сток 2.22.3 даёт uid 0 + чтение root-файла + 1017 строк `[PMM] DOUBLE FREE`. `cow_min` не показывает ни переиспользования кадров, ни double free; in-QEMU selftest проходит 96 рутин с двумя новыми COW-рутинами.
+* **F-r2-arch-2 (high, verified).** Тот же баг владения заставлял `drop_user_space` освобождать PTE-кадры, уже возвращённые и переиспользованные как живые таблицы страниц (1017 кадров `DOUBLE FREE` в прогоне аудита). Инвариант `release_user_leaf` убирает класс: exit, munmap и замена теперь согласны, кто владеет кадром; двухпроходная проверка selftest подтверждает, что кадры не удерживаются и не освобождаются дважды.
+* **F-r2-vfs-1 (high, verified).** Hard-link-алиас архивной symlink обходил оба слоя F-x86n-1. `link(2)` не разыменовывает финальный компонент, поэтому `./d/y -> ../etc` + `./d/h` HARDLINK на `./d/y` создавал второе имя *symlink-inode*; планировщик знал `d/y` только как ссылку, а эффектный резолвер шёл сквозь алиас, поэтому `./d/h/autorun` (HARDLINK на `./d/pwn`) записывался в `/mnt/etc/autorun` и исполнялся как root при следующей загрузке. Чистый планировщик теперь заранее вычисляет замыкание эквивалентности hardlink/symlink (алиасы алиасов и нормализованные по `..` цели включены, порядок архива не важен), сообщает алиас через `UnsafeKind::HardlinkAliasesSymlink` и каждый член под ним, а установщик отвергает пакет целиком (`InstallError::UnsafePath`) до записи. Эффектный слой никогда не создаёт второе имя архивной symlink и не проходит через symlink с `nlink > 1`, что покрывает и непомеченный алиас, оставшийся от прошлой установки или регрессии планировщика. Доказательство: `attack/r2/vfs/attack-alias.deb` отвергнут целиком, `/mnt/etc/autorun` отсутствует, чистая следующая загрузка; новые host-свойства `tar_links`; in-QEMU selftest `install_hardlink_alias_confinement`; расширенный `tests/pkg/e2e_pkg_escape.py` (пакеты раунда 1 по-прежнему отвергаются, нормальный `.deb` с hardlink на regular file ставится).
 
-* **F-r2-arch-1 (critical, verified).** `fork_user_space_cow` shares leaf
-  frames with `COW_BIT` and `pmm::cow_ref` = 2, but only `cow_copy_page` and
-  `drop_user_space` honoured the reference count. `munmap`, `mprotect(PROT_NONE)`,
-  `mmap(MAP_FIXED)` replacement, `mremap` and `vmm::unmap` freed or re-flagged
-  the shared frame unconditionally; `mprotect(RW)` even dropped `COW_BIT` and
-  made the shared frame hardware-writable. The exploit: parent `mprotect(RW)` on
-  a forked range, child `munmap` returns the frames to the PMM, a later `mmap`
-  hands them out as page tables, and the parent's stale writable PTE rewrites
-  them (512 present user PTEs for a chosen physical frame) — a physical-memory
-  read/write primitive that scans for the caller's `Creds` and zeroes them to
-  reach uid 0. The fix is one invariant with one enforcement point:
-  `vmm::release_user_leaf` clears the PTE/TLB first, consumes exactly one
-  `cow_unref` for a COW leaf and frees only on the last reference; it is used by
-  `munmap`, `PROT_NONE`, MAP_FIXED, `mremap`, OOM unwind and `drop_user_space`.
-  `mprotect` now re-flags the leaf in place and keeps `COW_BIT` (first write
-  goes through `cow_copy_page`); `vmm::map` refuses to overwrite a live COW
-  leaf; `pmm::free_frame` refuses and logs a frame with live COW references.
-  The accounting itself is pure and host-tested (`memory/cow.rs`,
-  property `cow_ownership`: model PMM rejects double-free and free-of-mapped
-  under random fork/write/unmap/MAP_FIXED/mprotect/exit). Evidence on the
-  audit's rig: `cow_root` on fixed reports `hijacked PT count=0` and
-  `no page-table reuse observed`, uid stays 1000, zero `DOUBLE FREE` lines and
-  the shell returns; stock 2.22.3 reports uid 0 + root-file read + 1017
-  `[PMM] DOUBLE FREE` lines. `cow_min` reports no frame reuse and no double
-  free; in-QEMU selftest 96 routines pass with two new COW routines.
-* **F-r2-arch-2 (high, verified).** The same ownership bug made
-  `drop_user_space` free PTE frames that had already been returned and reused as
-  live page tables (1017 `DOUBLE FREE` frames in the audit run). The
-  `release_user_leaf` invariant above removes the class: exit, munmap and
-  replacement now agree on who owns a frame, and the selftest's two-pass check
-  confirms frames are not retained or double-freed.
+**Раунд 2 — исправлено в 2.22.1:**
 
-**Fixed in 2.22.1 (this branch):**
+* **F-x86n-1 (high, verified).** `.deb` нёс symlink-член, указывающий вне корня установки (`./y -> /etc`), и более поздние члены архива резолвили через него родителей: `./y/autorun` проходил проверку `..` и писался в `/mnt/etc/autorun`, исполняемый как root при следующей загрузке (`./x -> /` + `./x/pwned_root` писали `/mnt/pwned_root` так же). Теперь отказывают два независимых слоя: чистый планировщик отбрасывает любой член или hard-link-цель, у которой компонент-предок — symlink, создаваемая тем же архивом, а `install_data_tar` отвергает пакет целиком (`InstallError::UnsafePath`) до создания inode; эффектный резолвер родителей стартует с узла корня установки, никогда не идёт через ссылку, созданную пакетом или с абсолютной целью (гостевое namespace мапит `/etc` в `/mnt/etc` — ровно это и есть escape), удерживает каждый `..` и склеенную относительную цель под корнем и резолвит hard-link-цели тем же обходчиком. Существующая *относительная* in-root ссылка (`lib64 -> usr/lib64`) по-прежнему разыменовывается. Доказательство: host-свойства F-x86n-1, in-QEMU selftest `install_symlink_confinement` и закоммиченный live-harness `tests/pkg/e2e_pkg_escape.py` (crafted `.deb` отвергнут с именем виновного пути, `/mnt/etc/autorun` отсутствует, нормальный `.deb` ставится).
 
-* **F-x86n-1 (high, verified).** A `.deb` carried a symlink member pointing
-  outside the installation root (`./y -> /etc`), and later archive members
-  resolved their parents through it: `./y/autorun` passed the `..` check and was
-  written to `/mnt/etc/autorun`, executed as root at the next boot
-  (`./x -> /` + `./x/pwned_root` wrote `/mnt/pwned_root` the same way). Two
-  independent layers now refuse it: the pure planner drops any member or
-  hard-link target whose ancestor component is a symlink the same archive
-  creates, and `install_data_tar` refuses the whole package
-  (`InstallError::UnsafePath`) before creating an inode; the effectful parent
-  resolver starts at the install-root node, never follows a package-created or
-  absolute-target link (the guest namespace maps `/etc` to `/mnt/etc`, which is
-  exactly the escape), keeps every `..` and spliced relative target under the
-  root, and resolves hard-link targets through the same walker. A pre-existing
-  *relative* in-root link (`lib64 -> usr/lib64`) is still followed. Evidence:
-  F-x86n-1 host properties, the in-QEMU `install_symlink_confinement` selftest,
-  and the committed live harness `tests/pkg/e2e_pkg_escape.py` (the audit's
-  crafted `.deb` refused with the offending path named, `/mnt/etc/autorun`
-  absent, a normal `.deb` still installs).
+**Исправлено в 2.22.2** (пакет x86 VFS/ext2; каждая находка воспроизведена на стоковом стенде 2.21.0 и перепроверена на исправленном ядре):
 
-**Fixed in 2.22.2** (the x86 VFS/ext2 batch; each reproduced on
-the stock 2.21.0 range and re-run against the fixed kernel):
+* **F-x86v-1 (medium, verified).** Crafted ext2 symlink-inode с огромным `i_size` заставлял `read_symlink()` выделять `vec![0; i_size]` (4 GiB) → panic аллокации, машина мертва. Форма цели теперь классифицируется по полям inode до аллокации: fast только для действительно inline-цели (`i_blocks == 0`, ≤ 60 байт), slow только для data-ссылки на один блок (≤ 4096 байт), всё остальное — `FsError::Corrupt`.
+* **F-x86v-3 (medium, verified).** Обходчик путей не требовал search (`x`) на промежуточных каталогах, поэтому uid 1000 мог прочитать файл `0644` внутри root-owned каталога `0700`. Чистый обходчик ссылок теперь спрашивает `may_search` перед каждым поиском; слой сисколлов отвечает `Creds::may(..., Access::Execute)` для эффективных ids (`access(2)` — для real ids), включая компоненты, вставленные из цели разыменованной ссылки, и мапит отказ в `EACCES`. `chdir(2)` также требует search на самом целевом каталоге, а чтение образа в `execve` использует проверенный обход.
+* **F-x86v-2 (static).** Эмуляция копирования в `rename` выделяла `i_size` источника одним `Vec`; разреженный файл ~4 GiB аварийно завершал ядро. Копирование ограничено 64 MiB (`ENOMEM` выше) и резервируется fallible.
+* **F-x86v-4 (static).** Путаница fast/slow symlink на `unlink`: inode `i_blocks == 0, i_size > 60` шёл в slow-ветку и освобождал байты текста цели как номер блока. Удаление теперь решает по одному `i_blocks`; путь чтения сообщает такую форму как corrupt.
+* **F-x86v-5 (static).** Crafted `i_size` каталога заставлял один lookup/readdir сканировать до ~1M блоков (залипание ядра). Размеры каталогов валидируются (выровнены по блоку, не больше файловой системы) до цикла.
+* **F-x86v-6 (найдено при исправлении пакета).** Читатель образов `execve`/`PT_INTERP` имел ту же неограниченную аллокацию `i_size` и непроверенный exec-обход. Размер образа ограничен 256 MiB с fallible-резервом, а exec-путь проверяет учётные данные.
 
-* **F-x86v-1 (medium, verified).** Crafted ext2 symlink inodes with a huge
-  `i_size` made `read_symlink()` allocate `vec![0; i_size]` (4 GiB) →
-  allocation panic, machine dead. The target shape is now classified from the
-  inode fields before allocation: fast only for a genuinely inline target
-  (`i_blocks == 0`, ≤ 60 bytes), slow only for a one-block data link
-  (≤ 4096 bytes), everything else `FsError::Corrupt`.
-* **F-x86v-3 (medium, verified).** The path walker required no search (`x`)
-  permission on intermediate directories, so uid 1000 could read a 0644 file
-  inside a root-owned 0700 directory. The pure link walker now asks
-  `may_search` before every lookup; the syscall layer answers with
-  `Creds::may(..., Access::Execute)` of the effective ids (`access(2)` with its
-  real ids), including components spliced in from a followed link target, and
-  maps a denial to `EACCES`. `chdir(2)` also needs search on the target
-  directory itself, and `execve`'s image read uses the checked walk.
-* **F-x86v-2 (static).** `rename`'s copy emulation allocated the source
-  `i_size` in one `Vec`; a sparse ~4 GiB file aborted the kernel. The copy is
-  capped at 64 MiB (`ENOMEM` above) and reserved fallibly.
-* **F-x86v-4 (static).** Fast/slow symlink confusion on `unlink`: an
-  `i_blocks == 0, i_size > 60` inode took the slow branch and freed its target
-  text bytes as a block number. Deletion now decides from `i_blocks` alone;
-  the read path reports that shape as corrupt.
-* **F-x86v-5 (static).** Crafted directory `i_size` made one lookup/readdir
-  scan up to ~1M blocks (kernel stall). Directory sizes are validated
-  (block-aligned, not larger than the filesystem) before the loop.
-* **F-x86v-6 (found while fixing the batch).** The `execve`/`PT_INTERP` image
-  reader had the same unbounded `i_size` allocation and an unchecked exec
-  walk. Image size is capped at 256 MiB with a fallible reserve, and the exec
-  path is credential-checked.
+**Соседние репозитории (второй раунд):**
 
-**Fixed in the sibling repositories (round 2 as well):**
+* **F-r2-rv-1 (high, verified; pagh-riscv 0.24.2, PR #14).** Неканонический пользовательский указатель проходил `user_range_valid`, потому что Sv39-обход игнорирует биты 63..39 (`mmu::vpn`): `openat(0xdead_0000_0000_0000|path)` давал supervisor-mode load page fault и `park_forever()` — убийство машины одним ecall. Валидатор теперь требует `mmu::is_canonical` на обоих концах диапазона плюс нижнюю границу `USER_TOP` до постраничного обхода U/R/W; обход страниц и `protect_in`/`unmap_in` отвергают неканонические/верхнеполовинные VA; матрица ABI из 34 кейсов в госте и закоммиченный harness `noncanon.elf` покрывают класс. Исправлено: сисколл возвращает `-EFAULT`, shell выживает; сток: `[EXC] load page fault … [EXC] halting`.
+* **F-r2-libc-1 (high, verified; pagh-libc 0.15.2, PR #11).** `ld-pagh` валидировал *адреса* динамических таблиц, но вызывал указатели, прочитанные из них: каждая цель `DT_INIT`/`DT_INIT_ARRAY` (и `DT_FINI*`) теперь должна быть внутри исполняемого file-backed `PT_LOAD` того же объекта, сама таблица — внутри writable non-executable file-backed данных, а значения `SHN_ABS`-релокаций — внутри определяющего образа; таблицы и entry валидируются до первого конструктора, а `dlopen()` валидирует всю группу заранее. Исправлено: crafted ELF завершается с кодом 1 и «malformed ELF: unsafe DT_INIT_ARRAY» вместо прыжка на `0x4141414141414140`; нормальные конструкторы DSO работают.
+* **F-r2-py-1/2 (medium, verified; pagh-python 0.9.2, PR #8).** Фикс глубины парсера обходился лево-ассоциативной цепочкой `1+1+…` (парсер сворачивает её циклом, счётчик вложенности не растёт), и `eval_expr` рекурсировал без лимита; то же выражение на 64-КиБ heap-fiber-стеке генератора давало wild-pointer fault. `eval_expr` теперь имеет лимит глубины выражения (256, выше парсерных 200, чтобы легитимная вложенность вычислялась), проверяет запас стека процесса/файбера на каждом узле и отслеживает глубину на текущем стеке через переключения файберов; цепочки сверх лимита дают перехватываемый `RecursionError`, путь генератора сообщает «generator stack exhausted» вместо fault, а бомбы аудита на 720/740/800 термов — чистые ошибки.
 
-* **F-r2-rv-1 (high, verified; pagh-riscv 0.24.2, PR #14).** A non-canonical
-  user pointer passed `user_range_valid` because the Sv39 walk ignores bits
-  63..39 (`mmu::vpn`), so `openat(0xdead_0000_0000_0000|path)` produced a
-  supervisor-mode load page fault and `park_forever()` — a one-ecall machine
-  kill. The validator now requires `mmu::is_canonical` at both range ends plus
-  the lower-half `USER_TOP` bound before the per-page U/R/W walk (the canonical
-  *supervisor* half was a second aliasing variant found while fixing); the page
-  walk and `protect_in`/`unmap_in` reject non-canonical/upper-half VAs; a
-  34-case in-guest ABI matrix and a committed `noncanon.elf` harness cover the
-  class. Fixed: syscall returns `-EFAULT`, shell survives; stock: `[EXC] load
-  page fault … [EXC] halting`.
-* **F-r2-libc-1 (high, verified; pagh-libc 0.15.2, PR #11).** `ld-pagh`
-  validated the *addresses* of dynamic tables but called the pointers read from
-  them: every `DT_INIT`/`DT_INIT_ARRAY` (and `DT_FINI*`) target must now be
-  inside an executable file-backed `PT_LOAD` of the same object, the table
-  itself inside writable non-executable file-backed data, and `SHN_ABS`
-  relocation values inside the defining image; tables and entry are validated
-  before the first constructor, and `dlopen()` validates the whole group first.
-  Fixed: crafted ELFs exit 1 with "malformed ELF: unsafe DT_INIT_ARRAY" instead
-  of jumping to `0x4141414141414140`; normal DSO constructors still run.
-* **F-r2-py-1/2 (medium, verified; pagh-python 0.9.2, PR #8).** The parser-depth
-  fix was bypassed by a left-associative `1+1+…` chain (the parser folds it in a
-  loop, so the nesting counter never grew) and `eval_expr` recursed without a
-  limit; the same expression on a generator's 64 KiB heap-fiber stack produced
-  wild-pointer faults. `eval_expr` now has an expression-depth limit (256, above
-  the parser's 200 so legitimate nesting still evaluates), checks process/fiber
-  stack headroom at every node, and tracks depth per current stack across fiber
-  switches; chains beyond the limit raise a catchable `RecursionError`, the
-  generator path reports "generator stack exhausted" instead of faulting, and
-  the audit's 720/740/800-term bombs are clean errors.
+**Соседние репозитории (первый раунд):**
 
-**Fixed in the sibling repositories** (not this kernel; each has its own
-release notes, PoC and live transcript):
+* **F-rv-1/2/3 (RISC-V kernel, pagh-riscv 0.24.1, PR #12).** Crafted-ext2 symlink `i_size` ограничен до аллокации (fast ≤ inline-ёмкость, slow ≤ один блок, иначе `FsError::Corrupt`); перекрывающиеся сегменты `PT_LOAD`, сливающиеся в W+X, отвергаются с `ElfError::WxOverlap`; `mprotect` валидирует, что пишет собственный page-table root процесса (`protect_in`), а не активный. Доказательство: crafted ext2/W^X ELF отвергаются в живом QEMU/OpenSBI, `cat` crafted-ссылки печатает «filesystem is corrupt», машина жива; регрессия `sv39-map-roundtrip`/reject-матрица.
+* **F-rt-1/2/3 (pagh-libc 0.15.1, PR #9).** `ld-pagh` больше не публикует `__pagh_dl_state` через недоверенный self-scope символ `SHN_ABS` и отвергает внеобразные значения символов/`PT_DYNAMIC` как malformed; `vsnprintf` клампит целочисленную точность и пишет zero-extension прямо в выходное поле (без `memmove` в 32-байтный стековый scratch), с host-дифференциальным тестом против glibc (1.3M проверок) и ASAN-регрессией.
+* **F-rt-4 (pagh-python 0.9.1, PR #6).** Лексер и парсер вводят лимит вложенности (CPython-овские 200) на скобках и на нескобочной рекурсии; pagh-riscv дополнительно охраняет запас стека. PoC аудита на 200 скобок (506 байт) теперь падает с `SyntaxError: maximum recursion depth exceeded` вместо исчерпания стека.
 
-* **F-rv-1/2/3 (RISC-V kernel, pagh-riscv 0.24.1, PR #12).** Crafted-ext2
-  symlink `i_size` is bounded before allocation (fast ≤ inline capacity, slow ≤
-  one block, else `FsError::Corrupt`); overlapping `PT_LOAD` segments that would
-  merge to W+X are rejected with `ElfError::WxOverlap`; `mprotect` validates
-  that it writes the process's own page-table root (`protect_in`), not whichever
-  root is active. Evidence: crafted ext2/W^X ELFs refused in live QEMU/OpenSBI,
-  `cat` of the crafted link prints "filesystem is corrupt" and the machine
-  stays up, regression `sv39-map-roundtrip`/reject matrix.
-* **F-rt-1/2/3 (pagh-libc 0.15.1, PR #9).** `ld-pagh` no longer publishes
-  `__pagh_dl_state` through an untrusted self-scope `SHN_ABS` symbol and rejects
-  out-of-image symbol/`PT_DYNAMIC` values as malformed; `vsnprintf` clamps
-  integer precision and writes zero-extension directly into the output field
-  (no `memmove` into the 32-byte stack scratch), with a host-differential test
-  against glibc (1.3M checks) and an ASAN regression.
-* **F-rt-4 (pagh-python 0.9.1, PR #6).** Lexer and parser enforce a nesting
-  limit (CPython's 200) on brackets and on non-bracket recursion; pagh-riscv
-  additionally guards stack headroom. The audit's 506-byte 200-paren PoC now
-  fails with `SyntaxError: maximum recursion depth exceeded` instead of
-  exhausting the stack.
+Ни одна находка аудита 2026-11-13 не осталась неразобранной. Две новые находки сделаны при исправлении этого пакета и исправлены в тех же релизах: F-x86v-6 (неограниченная аллокация образа в `execve`, 2.22.2) и F-x86a-6 (обход валидированного лимита длины через count в `sendto`/`recvfrom`, 2.22.3).
 
-No finding from the 2026-11-13 audit remains unaddressed. Two new findings were
-made while fixing this batch and are fixed in the same releases: F-x86v-6
-(unbounded `execve` image allocation, 2.22.2) and F-x86a-6 (`sendto`/`recvfrom`
-payload count bypassing the validated length cap, 2.22.3).
+**Непроверенные зацепки раунда 2** (не объявлены исправленными; следующий триаж): F-r2-vfs-2/F-r2-vfs-3 (span сверки свободных счётчиков crafted-ext2 superblock и границы `fs_blocks`/`log_blocks` журнала при mount, обе `verified: no`), F-r2-net-1 (TOCTOU `socklen_t` в `recvfrom` после yield; пользовательский адрес, kernel-mode fault backstop убил бы только процесс) и RISC-V-кандидаты с `verified: no` (перекрывающиеся-PT_LOAD W^X, кросс-корневой `mprotect`, retirement sibling'ов на execve, границы mount/block ext2, неограниченный `read_dir_entries`). Они записаны здесь, чтобы их не считали молчаливо закрытыми.
 
-**Unverified leads from round 2** (not claimed fixed; next triage):
-F-r2-vfs-2/F-r2-vfs-3 (crafted ext2 superblock free-count reconciliation span
-and journal `fs_blocks`/`log_blocks` bounds at mount, both `verified: no`),
-F-r2-net-1 (recvfrom `socklen_t` TOCTOU after a yield; user address, the
-kernel-mode fault backstop would kill only the process), and the RISC-V
-`verified: no` candidates (overlapping-PT_LOAD W^X, `mprotect` cross-root,
-execve sibling retirement, ext2 mount/block bounds, unbounded
-`read_dir_entries`). They are recorded here so they are not silently considered
-closed.
+Известные структурные ограничения, которые аудит подтвердил: **нет KASLR** (база кучи и символы ядра фиксированы — поэтому PoC хардкодят/сканируют адреса), **нет SMAP**, SMEP только при поддержке по CPUID, общие листовые таблицы страниц ядра между адресными пространствами, **нет аутентифицированной загрузки**. Запланированная в `AUTH.md` фича логина/аккаунтов этого не меняет: она защищает от случайного использования, а не от процесса, который всё ещё может дотянуться до ring 0.
 
-Known structural limitations the audit reconfirmed: **no KASLR** (heap base and
-kernel symbols are fixed, which is why the PoCs hardcode/scan addresses), **no
-SMAP**, SMEP only when CPUID reports it, shared kernel leaf page tables between
-address spaces, and **no authenticated boot**. The login/accounts feature planned
-in `AUTH.md` does not change this: it protects against casual use, not against a
-process that can still reach ring 0.
+## Безопасные значения по умолчанию
 
-## Safe defaults
+Development-сборка включает исходящие загрузки пакетов через Cargo-фичу по умолчанию `network_packages`, которая активирует сетевой транспорт; `cargo build --no-default-features` даёт fail-closed сборку без исходящего пакетного транспорта.
 
-The development build enables outbound package downloads through the default `network_packages` Cargo feature, which activates the network transport; `cargo build --no-default-features` produces a fail-closed build with no outbound package transport.
+**TLS-аутентификация пира реализована (issue #14, PR #22–#29 серии):** HTTPS-загрузка валидирует цепочку сертификата сервера до закоммиченного CA-бандла (`src/net/ca_bundle.rs`, корни запинены по sha256 во время генерации), авторизует хост соединения против SAN-записей листа (RFC 6125, без fallback на CommonName), применяет окна валидности, отказывается валидировать вообще, когда системные часы не выставлены (ниже 2025-01-01), и проверяет подпись `CertificateVerify` рукопожатия против проверенного ключа листа. Провал проверки прерывает рукопожатие — нет fallback, сохраняющего соединение, а диагностика верификатора (`Package_Fetcher(tls): stage=verify cause=…`) называет отвергнутую проверку.
 
-**TLS peer authentication is implemented (issue #14, PRs #22–#29 of the series):** an HTTPS fetch validates the server certificate chain down to the committed CA bundle (`src/net/ca_bundle.rs`, roots pinned by sha256 at generation time), authorizes the connection host against the leaf's SAN entries (RFC 6125, no CommonName fallback), enforces the validity windows, refuses to validate at all when the system clock is unset (below 2025-01-01), and checks the handshake `CertificateVerify` signature against the verified leaf key. A failed check aborts the handshake — there is no fallback that keeps the connection, and the verifier's `error!` diagnostics (`Package_Fetcher(tls): stage=verify cause=…`) name the refused check.
+**Рукопожатие, пропускающее сертификат, тоже отвергается.** RFC 8446 §4.4.2.4 требует, чтобы клиент отвергал серверный `Finished`, которому не предшествовали `Certificate` и `CertificateVerify`. Upstream `embedded-tls` этого не обеспечивал, поэтому пир мог опустить оба сообщения, вычислить валидный `Finished` (активный MITM, который сам завершает обмен ключами, может) и дойти до данных приложения, ни разу не вызвав верификатор — fail-open путь, который никакая логика верификатора не закрыла бы. Поэтому это дерево несёт локальный патч в `vendor/embedded-tls/src/connection.rs`, который обеспечивает порядок (PSK-рукопожатия, легитимно не посылающие сертификат, освобождены), а `src/net/tls.rs` независимо требует, чтобы его счётчик аутентификации продвинулся за рукопожатие, прежде чем сдвинется хоть один байт приложения. Оба шага намеренны: патч — протокольно корректный фикс, счётчик сохраняет гарантию при обновлении vendored-крейта.
 
-**A handshake that skips the certificate is refused too.** RFC 8446 §4.4.2.4 requires a client to reject a server `Finished` that was not preceded by `Certificate` and `CertificateVerify`. Upstream `embedded-tls` did not enforce that, so a peer could omit both messages, compute a valid `Finished` (an active MITM that terminates the key exchange itself can), and reach application data with the verifier never invoked — a fail-open path that no amount of verifier logic could close. This tree therefore carries a local patch to `vendor/embedded-tls/src/connection.rs` that enforces the ordering (PSK handshakes, which legitimately send no certificate, are exempt), and `src/net/tls.rs` independently requires its authentication counter to advance across the handshake before a single application byte moves. Both are deliberate: the patch is the protocol-correct fix, the counter keeps the guarantee if the vendored crate is ever refreshed.
+**`AT_RANDOM` — best-effort при отсутствии аппаратной энтропии (issue #16).** glibc читает блок ELF `AT_RANDOM` безусловно при старте процесса, поэтому — в отличие от `getrandom`, возвращающего `EAGAIN`, — он не может fail closed: отказ означал бы отказ запускать процесс. Он предпочитает RDSEED/RDRAND; когда CPU не даёт ни одного, блок выводится из смешанного boot-seed (SHA-256 по джиттеру TSC-дельт, латентности/гонкам чтения порта CMOS RTC, счётчикам ядра и раскладке адресного пространства) плюс per-process счётчик. **Непредсказуемость несут только тайминговые источники**: тиковый счётчик, pid, счётчики PMM/кучи, CR3 и адреса объектов наблюдаемы или фиксированы конфигурацией — замер по пяти загрузкам показал их постоянными (0 бит), а всю вариацию — в латентностях чтения RTC и свёртке TSC-дельт. Поэтому seed не является функцией публичных входов (чем был прежний xorshift-fallback), но его сила держится только на тайминговом джиттере, и это заявлено, а не доказано. Это **best-effort, не CSPRNG**: при полностью детерминированном повторе собранный тайминг воспроизводим, а значит и канарейки. Деградация поэтому объявляется один раз при загрузке (`entropy: stage=degraded cause=NoHardwareEntropy cpu=…`), а не молчит; загрузка QEMU с `-cpu max` (RDSEED/RDRAND присутствуют) остаётся рекомендуемой конфигурацией. Host-свойства P51 доказывают лавинность микшера и разделение секретов и отвергают удалённый xorshift и вырожденные микшеры как негативные контроли; гостевой `selftest` сэмплирует 64 блока и печатает digest — это делает прогон с `-cpu qemu64` сравним между загрузками.
 
-**`AT_RANDOM` is best-effort when hardware entropy is missing (issue #16).** glibc reads the ELF `AT_RANDOM` block unconditionally at process start, so — unlike `getrandom`, which returns `EAGAIN` — it cannot fail closed: refusing would mean refusing to start the process. It prefers RDSEED/RDRAND; when the CPU exposes neither, the block is derived from a mixed boot seed (SHA-256 over TSC-delta jitter, CMOS RTC port-read latency/races, kernel counters and address-space layout) plus a per-process counter. **Only the timing sources carry unpredictability**: the tick clock, the pid, the PMM/heap counts, CR3 and object addresses are observable or fixed by the configuration — a five-boot measurement found them constant (0 bits) and all the variation in the RTC read latencies and the TSC-delta fold. The seed is therefore not a function of the public inputs (that is what the previous xorshift fallback was), but its strength rests on timing jitter alone, and that is claimed rather than proven. This is **best-effort, not a CSPRNG**: on a fully deterministic replay the collected timing is reproducible and so are the canaries. The degradation is therefore announced once at boot (`entropy: stage=degraded cause=NoHardwareEntropy cpu=…`) instead of being silent, and booting QEMU with `-cpu max` (RDSEED/RDRAND present) stays the recommended configuration. Host properties P51 prove the mixer's avalanche and secret separation and reject the removed xorshift plus degenerate mixers as negative controls; the in-guest `selftest` samples 64 blocks and prints a digest, which is what makes a `-cpu qemu64` run comparable across boots.
+### Доверие ограничено запиненными корнями
 
-### Trust is limited to the pinned roots
+Бандл доверяет ровно четырём самоподписанным корням: **ISRG Root X1**, **ISRG Root X2**, **GTS Root R1** и **GTS Root R4** (каждый выбирается по sha256-пину в `tools/gen_ca_bundle.py`). Следствия:
 
-The bundle trusts exactly four self-signed roots: **ISRG Root X1**, **ISRG Root X2**, **GTS Root R1**, and **GTS Root R4** (each selected by a sha256 pin in `tools/gen_ca_bundle.py`). Consequences:
+* HTTPS-зеркало, цепочка которого не доходит до одного из этих четырёх корней, **отвергается** (`ChainError::NoAnchor`), даже если сертификат в остальном совершенно валиден и выдан широко доверенным CA. Добавление корня означает намеренный перезапуск генератора с проверенным пином и коммит перегенерированного `src/net/ca_bundle.rs`.
 
-* An HTTPS mirror whose chain does not reach one of those four roots is **refused** (`ChainError::NoAnchor`), even if the certificate is otherwise perfectly valid and issued by a widely trusted CA. Adding a root means deliberately re-running the generator with a reviewed pin and committing the regenerated `src/net/ca_bundle.rs`.
+* Plain-HTTP-зеркала (`apt setmirror http://…`) **не аутентифицированы на транспортном уровне**: cleartext, проверять сертификат нечего. Этот путь вместо этого несёт цепочка метаданных OpenPGP ниже — подпись над `InRelease`/`Release.gpg`, SHA-256 `Packages` и SHA-256 каждого `.deb`, — поэтому cleartext-зеркало больше не может подменить метаданные или payload'ы, хотя всё ещё может наблюдать и отказывать в обслуживании. Оно также больше не живой default: `deb.debian.org` достигается по HTTPS, включая большие индексы, а harness `lx_livetest` отказывается работать на cleartext-конфигурации (issue #19).
 
-* Plain-HTTP mirrors (`apt setmirror http://…`) are **unauthenticated at the transport layer**: cleartext, no certificate to check. What carries that path instead is the OpenPGP metadata chain below — the signature over `InRelease`/`Release.gpg`, the SHA-256 of `Packages`, and the SHA-256 of every `.deb` — so a cleartext mirror can no longer substitute metadata or payloads, although it can still observe and deny service. It is no longer the live default either: `deb.debian.org` is reached over HTTPS, large indexes included, and the `lx_livetest` harness refuses to run on a cleartext config (issue #19).
+* **Отзыв сертификатов не проверяется** (нет CRL, OCSP, stapling): сертификат, отозванный издателем, но всё ещё внутри окна валидности, принимается.
 
-* Certificate **revocation is not checked** (no CRL, no OCSP, no stapling): a certificate that its issuer has revoked but that is still inside its validity window is accepted.
+### Метаданные репозитория проверяются против запиненных ключей Debian
 
-### Repository metadata is verified against pinned Debian keys
+`apt update` отказывается использовать то, что не покрыто цепочкой подписей (issue #32):
 
-`apt update` refuses to use anything the signature chain does not cover (issue #32):
+* `dists/<suite>/InRelease` проверяется как clear-signed сообщение OpenPGP или — только когда его нет — `Release.gpg` против `Release`, против keyring'а, закоммиченного в `src/pkg/openpgp_keys.rs`: Ed25519 *Debian Stable Release Key (13/trixie)* и RSA-4096 архивные ключи *13/trixie* и *12/bookworm*, каждый запинен по v4-отпечатку, его подписывающие подключи связаны проверенными key binding signatures, с принудительными expiry, revocation и key flags и применённым clock gate 2025.
+* Запись `SHA256:` проверенного `Release` — авторитет для варианта `Packages`, который за ним следует: загруженное тело должно совпасть и по дайджесту, **и** по размеру до распаковки или парсинга.
+* Каждый загруженный `.deb` должен совпасть с `SHA256:`/`Size:` станзы, назвавшей его `Filename:` — проверяется после загрузки и **до** парсинга, распаковки или записи payload'а.
+* Зеркало, не отдающее подписей, **отвергается с видимой ошибкой**, и нет флага, фичи или переменной окружения, отключающей проверку. Единственная непроверяемая сборка — `cargo build --no-default-features`, где `apt update`/`install` возвращают `NetworkDisabled`.
 
-* `dists/<suite>/InRelease` is verified as a clear-signed OpenPGP message, or — only when it is absent — `Release.gpg` against `Release`, against the keyring committed in `src/pkg/openpgp_keys.rs`: the Ed25519 *Debian Stable Release Key (13/trixie)* and the RSA-4096 archive keys *13/trixie* and *12/bookworm*, each pinned by its v4 fingerprint, its signing subkeys bound by verified key binding signatures, with expiry, revocation and key flags enforced and the 2025 clock gate applied.
-* The `SHA256:` entry of the verified `Release` is the authority for the `Packages` variant that follows: the downloaded body must match both digest **and** size before it is decompressed or parsed.
-* Every downloaded `.deb` must match the `SHA256:`/`Size:` of the stanza that named its `Filename:` — checked after the download and **before** the payload is parsed, decompressed or written.
-* A mirror that serves no signatures is **refused with a visible error**, and there is no flag, feature or environment variable that turns verification off. The only unverified build is `cargo build --no-default-features`, where `apt update`/`install` return `NetworkDisabled`.
+Намеренное ужесточение относительно `gpgv`: подпись, сделанная **истёкшим** ключом, отвергается (`gpgv` её проверяет и выходит с 0), а пакеты частичной длины отвергаются, а не дособираются.
 
-Deliberate strengthening over `gpgv`: a signature made by an **expired** key is refused (`gpgv` verifies it and exits 0), and partial-length packets are refused rather than reassembled.
+### Что всё ещё не проверяется
 
-### What is still not verified
+* **Распространение отзыва:** отзыв учитывается, только если подпись отзыва находится внутри закоммиченного блока keyring. Нет обновления, эквивалентного CRL/OCSP, поэтому об отозванном upstream ключе узнают только по перегенерированному keyring'у.
+* **Replay полной старой тройки** (`Release` + `Packages` + `.deb`) **не детектируется** на suite'ах без `Valid-Until` — включая `stable`; этой проверкой покрыты только suite'ы с `Valid-Until` (например `security`) плюс проверки датированных в будущем подписей. E2E-harness *демонстрирует* это, а не оставляет подразумеваемым: `stale`-suite локального зеркала — полная корректно подписанная старая ревизия (старее `Date`, старее версия пакета), `apt update` её принимает, и прогон печатает `LXSELFTEST apt_verify stale-rollback NOTE (accepted: 1.0 -> 0.9 …)`. Для закрытия нужен `Valid-Until` на каждом suite, постоянное состояние «наибольший виденный release» (его нет: индекс только в RAM) или аутентифицированный канал свежести — ничего из этого не входит в объём.
+* **Какие пути отказа где доказаны.** QEMU E2E-harness доказывает против реального пайплайна `apt`: корректно подписанное зеркало загружается и ставится (позитивный контроль), и четыре отказа — тело `Packages`, не совпадающее с подписанным `Release` **при валидной подписи**, `.deb`, не совпадающий с подписанным индексом (в `/mnt` ничего не пишется), зеркало без подписей и зеркало, подписанное незапиненным ключом; каждый отказ также не публикует индекс. Отказы, которым нужны гостевые часы или ключ подписи Debian, покрыты **только host-свойствами, не end-to-end**, и не заявлены как E2E: `ClockUnset` (P52), expiry/revocation/not-yet-valid ключа (P52/P53), датированные в будущем подписи и парсинг `Date`/`Valid-Until` (P52/P54), `NoIndexEntry` (P54) и ECDSA-путь (P52, синтетические ключи — ни один архивный ключ Debian сегодня не использует ECDSA). Эти свойства запускают **тот же верификатор**, который компилирует ядро; чего они не упражняют — обвязку apt вокруг него.
 
-* **Revocation distribution:** a revocation is honoured only if the revocation signature is inside the committed keyring block. There is no CRL/OCSP-equivalent refresh, so a key revoked upstream is learned only by shipping a regenerated keyring.
-* **Replay of a complete older triplet** (`Release` + `Packages` + `.deb`) is **not detected** on suites without `Valid-Until` — which includes `stable`; only suites that carry `Valid-Until` (e.g. `security`) are covered by that check, plus the future-dated-signature checks. The E2E harness *demonstrates* this rather than leaving it implied: the local mirror's `stale` suite is a complete, correctly signed older revision (older `Date`, older package version), `apt update` accepts it, and the run prints `LXSELFTEST apt_verify stale-rollback NOTE (accepted: 1.0 -> 0.9 …)`. Closing it needs either `Valid-Until` on every suite, persistent "highest release seen" state (none exists: the index is RAM-only), or an authenticated freshness channel — none of which is in scope here.
-* **Which refusal paths are proven where.** The QEMU E2E harness proves, against the real `apt` pipeline: a correctly signed mirror loads and installs (positive control), and four refusals — a `Packages` body that does not match the signed `Release` **while its signature verifies**, a `.deb` that does not match the signed index (nothing written to `/mnt`), a mirror with no signatures, and a mirror signed by an unpinned key; each refusal also leaves no index published. Refusals that need a guest clock or a Debian signing key are covered by **host properties only, not end-to-end**, and are not claimed as E2E: `ClockUnset` (P52), key expiry/revocation/not-yet-valid (P52/P53), future-dated signatures and `Date`/`Valid-Until` parsing (P52/P54), `NoIndexEntry` (P54), and the ECDSA path (P52, synthetic keys — no Debian archive key uses ECDSA today). These properties run **the same verifier** the kernel compiles; what they do not exercise is the apt plumbing around it.
+E2E-*инструмент* для веток жизненного цикла уже существует и валидирован: `tools/gen_openpgp_testkey.py` выдаёт два детерминированных lifecycle-ключа (один, чьё окно закрылось через час после создания, другой — созданный на десять лет в будущем), и host-свойство P53 доказывает, что верификатор отвергает их как `Expired` / `NotYetValid`. Они намеренно **не** внесены в якорь harness'а (`TEST_TRUST_ANCHORS`) и не подключены к E2E-сценарию — ветки уже покрыты свойствами выше, а добавление их в E2E расширило бы поверхность, на которой верификатор должен сойтись, без добавления доказательств.
 
-The E2E *tool* for the lifecycle branches already exists and is validated: `tools/gen_openpgp_testkey.py` emits two deterministic lifecycle keys (one whose window closed an hour after creation, one created ten years in the future) and host property P53 proves the verifier refuses them as `Expired` / `NotYetValid`. They are deliberately **not** listed in the harness anchor (`TEST_TRUST_ANCHORS`) and not wired into an E2E scenario — the branches are already covered by the properties above, and adding them to the E2E run would widen the surface the verifier has to converge on without adding evidence.
-* **TLS revocation** is still unchecked (no CRL/OCSP/stapling) and trust is limited to the four pinned roots.
-* **`pkg <host> <path>`** (the manual, index-free `.deb` downloader) remains unauthenticated by construction; `apt` is the verified path.
-* **`Acquire-By-Hash`** is not used: pagh fetches the plain index path, which is checked against the same signed entry.
-* The ECDSA verification path exists but no real Debian key exercises it yet (all current archive keys are RSA or Ed25519), so it is covered only by synthetic host tests.
+* **Отзыв TLS** по-прежнему не проверяется (нет CRL/OCSP/stapling), а доверие ограничено четырьмя запиненными корнями.
+* **`pkg <host> <path>`** (ручной загрузчик `.deb` без индекса) остаётся неаутентифицированным по построению; `apt` — проверенный путь.
+* **`Acquire-By-Hash`** не используется: pagh забирает обычный путь индекса, который проверяется против той же подписанной записи.
+* ECDSA-путь проверки существует, но ни один реальный ключ Debian его пока не упражняет (все текущие архивные ключи — RSA или Ed25519), поэтому он покрыт только синтетическими host-тестами.
 
-## Reporting
+## Сообщения об уязвимостях
 
-Report memory-safety, privilege-boundary, filesystem-integrity, parser, or package-supply-chain issues privately to the repository maintainers. Include a minimal reproducer, build profile, QEMU version, and serial log.
+Сообщайте о проблемах memory-safety, границ привилегий, целостности файловой системы, парсеров или цепочки поставки пакетов приватно мейнтейнерам репозитория. Приложите минимальный репродуктор, профиль сборки, версию QEMU и serial-лог.
 
-## Release requirements
+## Требования к релизу
 
-A security-capable package manager requires all of the following before the demo feature can become a default:
+Security-capable пакетный менеджер требует всего перечисленного, прежде чем демо-фича может стать значением по умолчанию:
 
-1. ~~CSPRNG-backed TLS randomness.~~ **Done for TLS and `getrandom`** — RDSEED/RDRAND, fail-closed when unavailable. The one documented exception is ELF `AT_RANDOM` (issue #16): glibc reads it unconditionally, so it cannot fail closed; it uses the mixed boot seed, warns once at boot when hardware entropy is missing, and is best-effort by construction.
-2. ~~Certificate-chain, hostname, and expiry validation.~~ **Done, with two named gaps** — `net::tls_auth` / `net::tls_chain` / `net::ca_bundle`, driven by the handshake verifier in `net::tls`, fail-closed, and the "no certificate at all" bypass is closed in `vendor/embedded-tls` + the `VERIFIED_HANDSHAKES` gate. Not covered: **revocation** (no CRL/OCSP/stapling) and **root agility** (trust is the four pinned roots above; any other issuer is refused). Both are documented in "Safe defaults" rather than implied by "Done".
-3. ~~Signed repository metadata verification.~~ **Done** — the OpenPGP chain above, pinned by fingerprint. Not covered: revocation distribution and replay of a whole old triplet (both named in "What is still not verified").
-4. ~~Digest verification of `Packages` and every `.deb` before parsing or installation.~~ **Done** — digest **and size**, checked before decompression/parsing and before any unpacking.
-5. Negative integration tests for MITM, corrupted metadata, digest mismatch, path traversal, malformed archives, and malformed ELF files. **Partly done.** The apt side is now proven in-QEMU by one reproducible command (`python3 tools/e2e.py local-mirror`, whose `LXSELFTEST apt_e2e PASS` is gated on it): a correctly signed local mirror loads and installs, while a **valid signature over a `Packages` file that was replaced afterwards** (equal size, different SHA-256), a **tampered `.deb`** (equal size, different SHA-256, nothing written), a mirror with **no signatures at all**, and a mirror signed by an **unpinned key** are each refused with a named diagnostic (`apt: verify FAIL stage=… cause=…`). The signed test mirror uses a deterministic test key whose anchor is compiled only into the `lx_selftest`/`lx_bigindex` harness builds (`src/pkg/openpgp_test_keys.rs`); a production build cannot trust it. Still missing from this item: the certificate-omission MITM regression test (needs a TLS server that deliberately skips `Certificate`, which rustls will not do) and the path-traversal/malformed-archive cases, which remain covered by host properties and code review.
+1. ~~CSPRNG-случайность для TLS.~~ **Сделано для TLS и `getrandom`** — RDSEED/RDRAND, fail-closed при недоступности. Единственное задокументированное исключение — ELF `AT_RANDOM` (issue #16): glibc читает его безусловно, поэтому fail closed невозможен; используется смешанный boot-seed, один раз предупреждаем при загрузке без аппаратной энтропии, по построению best-effort.
+2. ~~Проверка цепочки сертификатов, hostname и срока действия.~~ **Сделано, с двумя названными пробелами** — `net::tls_auth` / `net::tls_chain` / `net::ca_bundle`, управляемые верификатором рукопожатия в `net::tls`, fail-closed; обход «сертификата нет вовсе» закрыт в `vendor/embedded-tls` + гейте `VERIFIED_HANDSHAKES`. Не покрыто: **revocation** (нет CRL/OCSP/stapling) и **root agility** (доверие — четыре запиненных корня выше; любой другой издатель отвергается). Оба задокументированы в «Безопасных значениях по умолчанию», а не подразумеваются словом «Done».
+3. ~~Проверка подписанных метаданных репозитория.~~ **Сделано** — цепочка OpenPGP выше, запинена по отпечатку. Не покрыто: распространение отзыва и replay целой старой тройки (оба названы в «Что всё ещё не проверяется»).
+4. ~~Проверка дайджестов `Packages` и каждого `.deb` до парсинга или установки.~~ **Сделано** — дайджест **и размер**, проверяются до распаковки/парсинга и до любого разбора.
+5. Негативные интеграционные тесты для MITM, повреждённых метаданных, несовпадения дайджестов, path traversal, malformed-архивов и malformed ELF. **Частично сделано.** Сторона apt теперь доказана in-QEMU одной воспроизводимой командой (`python3 tools/e2e.py local-mirror`, чей `LXSELFTEST apt_e2e PASS` является гейтом): корректно подписанное локальное зеркало загружается и ставится, а **валидная подпись над `Packages`, заменённым после подписи** (тот же размер, другой SHA-256), **подменённый `.deb`** (тот же размер, другой SHA-256, ничего не записано), зеркало **без подписей вовсе** и зеркало, подписанное **незапиненным ключом**, — каждый отвергается с именованной диагностикой (`apt: verify FAIL stage=… cause=…`). Подписанное тестовое зеркало использует детерминированный тестовый ключ, чей якорь компилируется только в сборки harness'ов `lx_selftest`/`lx_bigindex` (`src/pkg/openpgp_test_keys.rs`); production-сборка доверять ему не может. В этом пункте всё ещё не хватает: регрессионного теста MITM с опущенным сертификатом (нужен TLS-сервер, намеренно пропускающий `Certificate`, чего rustls не делает) и кейсов path traversal/malformed-архивов — они остаются покрыты host-свойствами и ревью кода.

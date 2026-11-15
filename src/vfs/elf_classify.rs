@@ -1,45 +1,47 @@
-//! Pure ELF classification and static-PIE load-bias selection.
+//! Чистая классификация ELF и выбор load-bias для static-PIE.
 //!
-//! Pure, allocation-free, `core`-only logic shared with the `host-tests` crate
-//! (R11.6). This module decides — *without mapping anything, allocating page
-//! tables, or touching global state* — whether a byte buffer is a Linux static
-//! `ET_EXEC` or static-PIE `ET_DYN` x86_64 ELF this kernel can load, and (for
-//! `ET_DYN`) picks a page-aligned load bias that keeps every segment inside the
-//! lower-half user address space.
+//! Чистая, без аллокаций, `core`-only логика, общая с крейтом `host-tests`
+//! (R11.6). Модуль решает — *не отображая ничего, не аллоцируя таблицы страниц и
+//! не трогая глобальное состояние* — является ли буфер байт Linux static
+//! `ET_EXEC` или static-PIE `ET_DYN` x86_64 ELF, который это ядро умеет
+//! загружать, и (для `ET_DYN`) выбирает выровненный по странице load-bias,
+//! держащий все сегменты в нижней половине пользовательского адресного
+//! пространства.
 //!
-//! The effectful loader (`ElfLoader::load`, task 13.1) consumes [`classify_elf`]
-//! and [`choose_bias`] before it allocates a user PML4 or maps any segment, so a
-//! malformed/ineligible binary is rejected with a descriptive `&'static str`
-//! before any memory is touched (R5.5, R5.6, R5.9, R11.3, R12.1).
+//! Эффектный загрузчик (`ElfLoader::load`) использует [`classify_elf`] и
+//! [`choose_bias`] до аллокации пользовательского PML4 или маппинга сегментов,
+//! поэтому битый/непригодный бинарь отвергается описательным `&'static str` до
+//! касания памяти (R5.5, R5.6, R5.9, R11.3, R12.1).
 //!
-//! Parsing is done with explicit little-endian byte reads off the slice (rather
-//! than reinterpreting the buffer as a `#[repr(C)]` struct) so the logic is fully
-//! portable, alignment-safe, and identical on the host and the target.
+//! Разбор идёт явными little-endian чтениями байт из среза (а не
+//! переинтерпретацией буфера как `#[repr(C)]`-структуры), поэтому логика
+//! полностью переносима, безопасна по выравниванию и одинакова на хосте и на
+//! цели.
 #![allow(dead_code)]
 
 /// x86_64 page size (4 KiB).
 const PAGE_SIZE: u64 = 4096;
 
-/// Exclusive upper bound of the lower-half canonical user address range
-/// (`User_Addr_Max`). A segment is acceptable only when its page-rounded range
-/// lies strictly below this.
+/// Исключающая верхняя граница нижней половины канонического
+/// пользовательского диапазона (`User_Addr_Max`). Сегмент допустим, только если
+/// его диапазон, округлённый по страницам, строго ниже неё.
 ///
-/// NOTE: this is intentionally a standalone copy of the same constant in
-/// `src/vfs/elf.rs`. That module pulls in kernel-only dependencies (the VMM/PMM
-/// and the `x86_64` paging crate), so importing it would make this pure module —
-/// and the `host-tests` crate that `#[path]`-includes it — impossible to build on
-/// the host. The value is fixed by the architecture.
+/// Копия той же константы из `src/vfs/elf.rs` сделана намеренно: тот модуль
+/// тянет зависимости только для ядра (VMM/PMM и крейт пейджинга `x86_64`),
+/// поэтому импорт сделал бы этот чистый модуль — и включающий его через `#[path]`
+/// крейт `host-tests` — несостоявшимся на хосте. Значение задано архитектурой.
 pub const USER_ADDR_MAX: u64 = 0x0000_8000_0000_0000;
 
-/// Default page-aligned base used for static-PIE (`ET_DYN`) load bias.
+/// База по умолчанию, выровненная по странице, для load-bias static-PIE
+/// (`ET_DYN`).
 ///
-/// Deterministic so two runs of the same binary load identically. Any
-/// page-aligned value below `USER_ADDR_MAX` works for a self-relocating
-/// static-PIE; `0x1_0000` (64 KiB) keeps the NULL page unmapped while leaving the
-/// whole user half available above it.
+/// Детерминирована, чтобы два запуска одного бинаря загружались одинаково.
+/// Подойдёт любое выровненное по странице значение ниже `USER_ADDR_MAX`;
+/// `0x1_0000` (64 KiB) оставляет NULL-страницу незамапленной и всю
+/// пользовательскую половину доступной выше.
 pub const PIE_BASE: u64 = 0x1_0000;
 
-// ── ELF64 identification ────────────────────────────────────────────────────
+// ── идентификация ELF64 ─────────────────────────────────────────────────────
 const EI_CLASS: usize = 4;
 const EI_DATA: usize = 5;
 const ELFCLASS64: u8 = 2;
@@ -54,52 +56,52 @@ const EM_X86_64: u16 = 0x3E;
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
 
-// ── ELF64 structure sizes ───────────────────────────────────────────────────
+// ── размеры структур ELF64 ──────────────────────────────────────────────────
 const EHDR_SIZE: usize = 64;
 const PHDR_SIZE: usize = 56;
 
-// ── ELF64 header field offsets ──────────────────────────────────────────────
+// ── смещения полей заголовка ELF64 ──────────────────────────────────────────
 const E_TYPE_OFF: usize = 16;
 const E_MACHINE_OFF: usize = 18;
 const E_PHOFF_OFF: usize = 32;
 const E_PHENTSIZE_OFF: usize = 54;
 const E_PHNUM_OFF: usize = 56;
 
-// ── ELF64 program-header field offsets (relative to the phdr) ───────────────
+// ── смещения полей program header ELF64 (относительно phdr) ─────────────────
 const P_TYPE_OFF: usize = 0;
 const P_OFFSET_OFF: usize = 8;
 const P_VADDR_OFF: usize = 16;
 const P_FILESZ_OFF: usize = 32;
 const P_MEMSZ_OFF: usize = 40;
 
-/// The kind of ELF image accepted by the loader.
+/// Вид ELF-образа, который принимает загрузчик.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ElfKind {
-    /// A classic static executable (`ET_EXEC`); loaded at its absolute `p_vaddr`
-    /// (bias 0). (R5.1)
+    /// Классический статический исполняемый файл (`ET_EXEC`); грузится по
+    /// абсолютному `p_vaddr` (bias 0). (R5.1)
     Exec,
-    /// A position-independent executable or dynamic interpreter (`ET_DYN`);
-    /// loaded at `p_vaddr + bias` for a kernel-chosen bias. (R5.2)
+    /// Позиционно-независимый исполняемый файл или динамический интерпретатор
+    /// (`ET_DYN`); грузится по `p_vaddr + bias` с bias, выбранным ядром. (R5.2)
     Dyn,
 }
 
-/// Result of classifying a candidate ELF buffer.
+/// Результат классификации буфера-кандидата ELF.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ElfVerdict {
-    /// The buffer is ineligible; the contained `&'static str` names the cause
-    /// (used for the loader's single rejection diagnostic — R12.1).
+    /// Буфер непригоден; `&'static str` внутри называет причину (служить
+    /// единственной диагностикой отказа загрузчика — R12.1).
     Reject(&'static str),
-    /// The buffer is a loadable static binary.
+    /// Буфер — загружаемый статический бинарь.
     Load {
-        /// Whether this is an `ET_EXEC` or a static-PIE `ET_DYN`.
+        /// Это `ET_EXEC` или static-PIE `ET_DYN`.
         kind: ElfKind,
-        /// `true` for `ET_DYN` (a load bias must be chosen via [`choose_bias`]),
-        /// `false` for `ET_EXEC` (bias is always 0).
+        /// `true` для `ET_DYN` (load bias выбирается через [`choose_bias`]),
+        /// `false` для `ET_EXEC` (bias всегда 0).
         bias_required: bool,
     },
 }
 
-// ── little-endian field readers (bounds-checked, total) ─────────────────────
+// ── little-endian читатели полей (с проверкой границ, тотальные) ────────────
 
 #[inline]
 fn rd_u16(data: &[u8], off: usize) -> Option<u16> {
@@ -121,26 +123,27 @@ fn rd_u64(data: &[u8], off: usize) -> Option<u64> {
     ]))
 }
 
-/// Round `x` up to the next page boundary, returning `None` on overflow.
+/// Округляет `x` вверх до границы страницы; `None` при переполнении.
 #[inline]
 fn page_up(x: u64) -> Option<u64> {
     x.checked_add(PAGE_SIZE - 1).map(|v| v & !(PAGE_SIZE - 1))
 }
 
-/// Pure classification of a candidate ELF buffer (no mapping, no allocation).
+/// Чистая классификация буфера-кандидата ELF (без маппинга и аллокаций).
 ///
-/// Returns [`ElfVerdict::Load`] **iff** the buffer is a 64-bit little-endian
-/// `EM_X86_64` ELF of type `ET_EXEC` or `ET_DYN` whose optional `PT_INTERP` is resolved by the process loader, and every `PT_LOAD` segment satisfies all of:
-///   * `p_filesz <= p_memsz` (R5.9),
-///   * `p_offset + p_filesz <= data.len()` (R5.9), and
-///   * the page-rounded range `[p_vaddr, p_vaddr + p_memsz)` lies strictly below
-///     [`USER_ADDR_MAX`] (R5.5). For `ET_DYN` this is evaluated at a zero bias as
-///     a lower bound; the actual bias is chosen later by [`choose_bias`].
+/// Возвращает [`ElfVerdict::Load`] **тогда и только тогда**, когда буфер —
+/// 64-битный little-endian `EM_X86_64` ELF типа `ET_EXEC` или `ET_DYN`, чей
+/// необязательный `PT_INTERP` резолвит загрузчик процесса, и каждый `PT_LOAD`:
+///   * `p_filesz <= p_memsz` (R5.9);
+///   * `p_offset + p_filesz <= data.len()` (R5.9);
+///   * диапазон `[p_vaddr, p_vaddr + p_memsz)`, округлённый по страницам, строго
+///     ниже [`USER_ADDR_MAX`] (R5.5). Для `ET_DYN` это нижняя граница при нулевом
+///     bias; реальный bias выбирает позже [`choose_bias`].
 ///
-/// Any other buffer yields [`ElfVerdict::Reject`] with a descriptive cause and
-/// nothing is mapped (R5.3, R5.6, R11.3). All arithmetic is overflow-safe.
+/// Любой другой буфер даёт [`ElfVerdict::Reject`] с описательной причиной, и
+/// ничего не мапится (R5.3, R5.6, R11.3). Вся арифметика overflow-safe.
 pub fn classify_elf(data: &[u8]) -> ElfVerdict {
-    // ── header presence & identity (R5.6) ──
+    // ── наличие и идентичность заголовка (R5.6) ──
     if data.len() < EHDR_SIZE {
         return ElfVerdict::Reject("ELF: data too small for header");
     }
@@ -172,14 +175,14 @@ pub fn classify_elf(data: &[u8]) -> ElfVerdict {
         _ => return ElfVerdict::Reject("ELF: not ET_EXEC or ET_DYN"),
     };
 
-    // ── program-header table bounds ──
+    // ── границы таблицы program headers ──
     let phnum = match rd_u16(data, E_PHNUM_OFF) {
         Some(v) => v as usize,
         None => return ElfVerdict::Reject("ELF: truncated header"),
     };
     if phnum == 0 {
-        // No segments to load. Nothing can violate the segment invariants; the
-        // image is classified purely by its type.
+        // Сегментов нет. Инварианты сегментов нарушить нечем; образ
+        // классифицируется только по типу.
         return ElfVerdict::Load {
             kind,
             bias_required: kind == ElfKind::Dyn,
@@ -210,9 +213,9 @@ pub fn classify_elf(data: &[u8]) -> ElfVerdict {
         return ElfVerdict::Reject("ELF: program header table beyond data");
     }
 
-    // ── per-segment validation ──
+    // ── проверка каждого сегмента ──
     for i in 0..phnum {
-        // In range: i < phnum and phnum*phentsize did not overflow.
+        // В границах: i < phnum и phnum*phentsize не переполнилось.
         let ph = phoff + i * phentsize;
 
         let p_type = match rd_u32(data, ph + P_TYPE_OFF) {
@@ -220,8 +223,8 @@ pub fn classify_elf(data: &[u8]) -> ElfVerdict {
             None => return ElfVerdict::Reject("ELF: truncated program header"),
         };
 
-        // PT_INTERP is validated and resolved by the effectful process loader.
-        // It is not itself a loadable segment in this pass.
+        // PT_INTERP проверяет и резолвит эффектный загрузчик процесса; в этом
+        // проходе это не загружаемый сегмент.
 
         if p_type != PT_LOAD {
             continue;
@@ -244,12 +247,12 @@ pub fn classify_elf(data: &[u8]) -> ElfVerdict {
             None => return ElfVerdict::Reject("ELF: truncated program header"),
         };
 
-        // filesz must not exceed memsz (a negative bss tail is impossible). (R5.9)
+        // filesz не больше memsz (отрицательный bss-хвост невозможен). (R5.9)
         if p_filesz > p_memsz {
             return ElfVerdict::Reject("ELF: p_filesz exceeds p_memsz");
         }
 
-        // File data range must lie within the supplied buffer. (R5.9)
+        // Диапазон данных файла обязан лежать в переданном буфере. (R5.9)
         let file_end = match p_offset.checked_add(p_filesz) {
             Some(v) => v,
             None => return ElfVerdict::Reject("ELF: segment file range overflow"),
@@ -258,9 +261,9 @@ pub fn classify_elf(data: &[u8]) -> ElfVerdict {
             return ElfVerdict::Reject("ELF: file data beyond input");
         }
 
-        // Virtual range must be canonical lower-half and not overflow. For
-        // ET_DYN this is the zero-bias lower bound; choose_bias re-checks the
-        // biased range. (R5.5)
+        // Виртуальный диапазон обязан быть каноническим нижней половиной и не
+        // переполняться. Для ET_DYN это нижняя граница при нулевом bias;
+        // choose_bias перепроверяет диапазон с bias. (R5.5)
         let vaddr_end = match p_vaddr.checked_add(p_memsz) {
             Some(v) => v,
             None => return ElfVerdict::Reject("ELF: vaddr range overflow"),
@@ -280,17 +283,16 @@ pub fn classify_elf(data: &[u8]) -> ElfVerdict {
     }
 }
 
-/// Choose a page-aligned load bias for a static-PIE (`ET_DYN`) image.
+/// Выбирает выровненный по странице load-bias для static-PIE (`ET_DYN`) образа.
 ///
-/// `max_vaddr_end` is the maximum `p_vaddr + p_memsz` across all `PT_LOAD`
-/// segments (the highest un-biased virtual address the image touches). Returns
-/// a 4096-aligned `bias` such that
-/// `bias + page_up(max_vaddr_end) < USER_ADDR_MAX`, so every biased segment stays
-/// strictly inside the lower-half user range (R5.2 / Property 16). Returns `None`
-/// when no such bias at the deterministic [`PIE_BASE`] fits. All arithmetic is
-/// overflow-safe.
+/// `max_vaddr_end` — максимум `p_vaddr + p_memsz` по всем `PT_LOAD` (наивысший
+/// несмещённый виртуальный адрес образа). Возвращает выровненный по 4096 `bias`,
+/// при котором `bias + page_up(max_vaddr_end) < USER_ADDR_MAX`, поэтому каждый
+/// смещённый сегмент строго внутри нижней половины пользовательского диапазона
+/// (R5.2 / Property 16). `None`, если такой bias при детерминированной
+/// [`PIE_BASE`] не помещается. Вся арифметика overflow-safe.
 pub fn choose_bias(max_vaddr_end: u64) -> Option<u64> {
-    let bias = PIE_BASE; // already 4096-aligned
+    let bias = PIE_BASE; // уже выровнен по 4096
     let end = page_up(max_vaddr_end)?;
     let top = bias.checked_add(end)?;
     if top < USER_ADDR_MAX {

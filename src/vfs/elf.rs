@@ -1,5 +1,5 @@
-// vfs/elf.rs — ELF64 binary loader
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// vfs/elf.rs — загрузчик бинарей ELF64
+// 64-битное ядро ОС x86_64 на Rust (#![no_std])
 
 use alloc::vec::Vec;
 
@@ -7,10 +7,10 @@ use crate::memory::vmm;
 use core::ptr;
 use x86_64::structures::paging::PageTableFlags;
 
-// Re-export the pure, host-testable ELF classifier and static-PIE bias selector
-// (task 5.1). These live in the sibling `elf_classify` module so they carry no
-// kernel/paging dependencies and can be `#[path]`-included by `host-tests`
-// (R11.6). The effectful `ElfLoader::load` extension (task 13.1) consumes them.
+// Реэкспорт чистого host-тестируемого классификатора ELF и выбора bias для
+// static-PIE (R11.6). Они живут в соседнем модуле `elf_classify`, поэтому не
+// тянут зависимости ядра/пейджинга и включаются в `host-tests` через `#[path]`.
+// Эффектный `ElfLoader::load` их использует.
 #[allow(unused_imports)]
 pub use crate::vfs::elf_classify::{choose_bias, classify_elf, ElfKind, ElfVerdict};
 
@@ -44,34 +44,33 @@ pub struct Elf64ProgramHeader {
     pub p_align: u64,
 }
 
-/// Read the ELF file header out of the first bytes of `data`.
+/// Читает заголовок ELF-файла из первых байт `data`.
 ///
-/// A `&[u8]` starts at an arbitrary byte alignment, so forming a `&Elf64Header`
-/// over it is undefined behaviour even when the length is in bounds — and the
-/// debug build's alignment check turns that UB into a kernel panic. Copying the
-/// struct out by value (`ptr::read_unaligned`) has no alignment requirement.
+/// `&[u8]` начинается с произвольного выравнивания, поэтому `&Elf64Header`
+/// поверх него — UB даже при корректной длине, а проверка выравнивания в debug-
+/// сборке превращает это UB в панику ядра. Копирование структуры по значению
+/// (`ptr::read_unaligned`) выравнивания не требует.
 ///
 /// # Safety
-/// The caller must have checked `data.len() >= size_of::<Elf64Header>()`.
+/// Вызывающий проверил `data.len() >= size_of::<Elf64Header>()`.
 unsafe fn read_elf_header(data: &[u8]) -> Elf64Header {
-    // SAFETY: the caller guarantees the header is in bounds; `read_unaligned`
-    // accepts any alignment.
+    // SAFETY: вызывающий гарантировал, что заголовок в границах;
+    // `read_unaligned` принимает любое выравнивание.
     unsafe { core::ptr::read_unaligned(data.as_ptr() as *const Elf64Header) }
 }
 
-/// Read one program header out of the file bytes.
+/// Читает один program header из байтов файла.
 ///
-/// `ph_offset` is attacker-controlled (`e_phoff` came from the file), so it is
-/// not necessarily aligned for `Elf64ProgramHeader`. The ELF fuzz routine found
-/// exactly that: a single flipped bit in `e_phoff` made the old reference cast
-/// panic the kernel with "misaligned pointer dereference", which is the debug
-/// build's version of UB. The copy below needs no alignment.
+/// `ph_offset` управляется атакующим (`e_phoff` из файла), поэтому не
+/// обязательно выровнен под `Elf64ProgramHeader`. Копирование ниже выравнивания
+/// не требует.
 ///
 /// # Safety
-/// The caller must have checked `ph_offset + size_of::<Elf64ProgramHeader>() <= data.len()`.
+/// Вызывающий проверил
+/// `ph_offset + size_of::<Elf64ProgramHeader>() <= data.len()`.
 unsafe fn read_program_header(data: &[u8], ph_offset: usize) -> Elf64ProgramHeader {
-    // SAFETY: in bounds per the caller's contract; `read_unaligned` accepts any
-    // alignment.
+    // SAFETY: в границах по контракту вызывающего; `read_unaligned` принимает
+    // любое выравнивание.
     unsafe { core::ptr::read_unaligned(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) }
 }
 
@@ -89,20 +88,22 @@ const EI_DATA: usize = 5;
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 
-/// Exclusive upper bound of the lower-half canonical address space on x86_64
-/// (48-bit VA): valid user addresses are `0 .. 0x0000_8000_0000_0000`. Anything
-/// at or above this is either the non-canonical hole or the kernel higher-half;
-/// mapping such an address would either alias kernel space or panic inside
-/// `VirtAddr::new` (which rejects non-canonical addresses). We reject these in
-/// validation so a malformed program header can never reach the mapping loop.
+/// Исключающая верхняя граница нижней половины канонического адресного
+/// пространства x86_64 (48-битный VA): валидные пользовательские адреса —
+/// `0 .. 0x0000_8000_0000_0000`. Всё выше — либо неканоническая дыра, либо
+/// верхняя половина ядра; маппинг такого адреса заалиасил бы пространство ядра
+/// или запаниковал бы в `VirtAddr::new` (она отвергает неканонические адреса).
+/// Отвергаем их на валидации, чтобы битый program header не дошёл до цикла
+/// маппинга.
 const USER_ADDR_MAX: u64 = 0x0000_8000_0000_0000;
 
-/// One mapped `PT_LOAD` segment, page-rounded, as `/proc/self/maps` needs it.
+/// Один замапленный `PT_LOAD`-сегмент, округлённый по страницам, — как нужно
+/// `/proc/self/maps`.
 ///
-/// `prot` holds the raw ELF `p_flags` (`PF_R`/`PF_W`/`PF_X`); the procfs layer
-/// converts them to Linux `PROT_*` bits when it renders the line. `file_offset`
-/// is the segment's `p_offset` rounded down to the page boundary (Linux reports
-/// the page-aligned file offset of a mapping).
+/// `prot` хранит сырые ELF `p_flags` (`PF_R`/`PF_W`/`PF_X`); procfs-слой
+/// переводит их в Linux `PROT_*` при рендере строки. `file_offset` — `p_offset`
+/// сегмента, округлённый вниз до границы страницы (Linux показывает
+/// выровненный по странице file offset маппинга).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoadSegment {
     pub start: u64,
@@ -111,50 +112,48 @@ pub struct LoadSegment {
     pub file_offset: u64,
 }
 
-/// Loader outputs for a successfully mapped Linux ELF image.
+/// Выход загрузчика для успешно замапленного Linux ELF-образа.
 ///
-/// Beyond the entry point and the user PML4 that the existing pagh-native path
-/// consumes, this carries the extra values the `Stack_Initializer` needs to
-/// build a Linux-conformant auxiliary vector (`AT_PHDR`/`AT_PHENT`/`AT_PHNUM`/
-/// `AT_ENTRY`) and to seed the per-process `VmRegionSet` program break
-/// (design "Data Models" / component 4 Linux_ELF_Loader, R6.4).
+/// Кроме точки входа и пользовательского PML4, которые использует нативный путь
+/// pagh, здесь лежат данные, нужные `Stack_Initializer` для Linux-совместимого
+/// auxiliary vector (`AT_PHDR`/`AT_PHENT`/`AT_PHNUM`/`AT_ENTRY`) и для начального
+/// program break процесса (R6.4).
 pub struct ElfProcess {
-    /// Program entry point, already adjusted by `load_bias` for `ET_DYN` (R5.2).
+    /// Точка входа, уже скорректированная `load_bias` для `ET_DYN` (R5.2).
     pub entry: u64,
-    /// Physical address of the freshly-created user PML4.
+    /// Физический адрес свежесозданного пользовательского PML4.
     pub pml4_phys: u64,
-    /// Page-aligned load bias applied to every segment: `0` for `ET_EXEC`,
-    /// a kernel-chosen value for static-PIE `ET_DYN` (R5.1, R5.2).
+    /// Выровненный по странице load bias, применённый ко всем сегментам: `0`
+    /// для `ET_EXEC`, выбранное ядром значение для static-PIE `ET_DYN` (R5.1,
+    /// R5.2).
     pub load_bias: u64,
-    /// `AT_PHDR`: the in-memory (biased) virtual address of the program-header
-    /// table (R6.4).
+    /// `AT_PHDR`: виртуальный адрес таблицы program headers в памяти (с bias,
+    /// R6.4).
     pub phdr_vaddr: u64,
-    /// `AT_PHENT`: ELF program-header entry size (`e_phentsize`).
+    /// `AT_PHENT`: размер записи program header (`e_phentsize`).
     pub phent: u16,
-    /// `AT_PHNUM`: ELF program-header count (`e_phnum`).
+    /// `AT_PHNUM`: число program headers (`e_phnum`).
     pub phnum: u16,
-    /// Page-aligned top of the highest `PT_LOAD` (+bias); seeds the heap break.
+    /// Выровненный по странице верх наивысшего `PT_LOAD` (+bias); начальный
+    /// heap break.
     pub initial_brk: u64,
-    /// The mapped `PT_LOAD` segments, in program-header order. Consumed by
-    /// `/proc/self/maps`; empty for images with no `PT_LOAD`.
+    /// Замапленные `PT_LOAD`-сегменты в порядке program headers. Потребляются
+    /// `/proc/self/maps`; пусто у образов без `PT_LOAD`.
     pub segments: Vec<LoadSegment>,
 }
 
 pub struct ElfLoader;
 
-/// Frames one loader pass has mapped, in mapping order, for rollback on failure.
+/// Кадры, замапленные одним проходом загрузчика, в порядке маппинга — для
+/// отката при ошибке.
 ///
-/// The loader maps an image page by page with `vmm::map`; until this guard existed
-/// every early return **kept** the frames mapped so far — a forged `p_memsz` that
-/// passed the canonical-address checks drained the entire PMM (443 MiB in one
-/// failed load) and the guest could no longer start a process. The guard makes the
-/// rollback unconditional: it runs on *any* return, including ones added later.
-///
-/// Order matters: unmap the virtual page first, then return the frame to the PMM,
-/// so no live PTE ever points at memory the allocator can hand out again. The user
-/// PML4 and the intermediate page tables `vmm::map` creates are **not** freed —
-/// the VMM exposes no teardown API (the process-exit path has the same property) —
-/// so this guard owns the *data* frames; that limit is deliberate, not forgotten.
+/// Загрузчик мапит образ постранично через `vmm::map`; guard делает откат
+/// безусловным при *любом* возврате, включая добавленные позже. Порядок важен:
+/// сначала unmap виртуальной страницы, затем возврат кадра в PMM, чтобы живая PTE
+/// никогда не указывала на память, которую аллокатор может выдать снова.
+/// Пользовательский PML4 и промежуточные таблицы страниц `vmm::map` **не**
+/// освобождаются — teardown-API у VMM нет (то же на выходе процесса), — поэтому
+/// guard владеет *data*-кадрами; это осознанное ограничение.
 pub(crate) struct MappedFrames {
     entries: Vec<(u64, u64)>,
 }
@@ -166,12 +165,12 @@ impl MappedFrames {
         }
     }
 
-    /// Map `frame` at `addr`. On failure the frame is returned immediately (it was
-    /// never mapped) and everything mapped before it is released by [`Drop`].
+    /// Мапит `frame` по `addr`. При ошибке кадр возвращается сразу (он не был
+    /// замаплен), а всё замапленное до него освобождает [`Drop`].
     ///
-    /// `pub(crate)` together with the type itself: the in-QEMU regression test
-    /// (`elf::failed map rolls back …`) drives the guard with real frames, which
-    /// is the only way to exercise the late-failure path deterministically.
+    /// `pub(crate)` вместе с самим типом: in-QEMU регрессия
+    /// (`elf::failed map rolls back …`) гоняет guard на настоящих кадрах — только
+    /// так поздний отказ проверяется детерминированно.
     pub(crate) fn map(
         &mut self,
         frame: u64,
@@ -186,7 +185,7 @@ impl MappedFrames {
         Ok(())
     }
 
-    /// The mapping succeeded: the frames now belong to the loaded image.
+    /// Маппинг удался: кадры теперь принадлежат загруженному образу.
     fn commit(&mut self) {
         self.entries.clear();
     }
@@ -207,8 +206,8 @@ impl ElfLoader {
             return Err("ELF: data too small for header");
         }
 
-        // SAFETY: the slice is longer than a header (checked above); the bytes
-        // are only byte-aligned, so the header is copied, not referenced.
+        // SAFETY: срез длиннее заголовка (проверено выше); байты выровнены
+        // только побайтно, поэтому заголовок копируется, а не берётся по ссылке.
         let header_owned = unsafe { read_elf_header(data) };
         let header: &Elf64Header = &header_owned;
 
@@ -231,12 +230,12 @@ impl ElfLoader {
             return Err("ELF: unsupported version");
         }
 
-        // Validate the program-header table and every PT_LOAD segment with
-        // overflow-safe arithmetic *before* allocating the user PML4 or mapping
-        // anything. This guarantees every malformed-binary rejection returns an
-        // Err without touching memory and — critically — that the later mapping
-        // loop can never index out of bounds, copy past the input, or feed a
-        // non-canonical address to `VirtAddr::new` (which would panic).
+        // Валидируем таблицу program headers и каждый PT_LOAD overflow-safe
+        // арифметикой *до* аллокации пользовательского PML4 и любого маппинга.
+        // Так любой отказ битому бинарю возвращает Err, не трогая память, и —
+        // что важно — цикл маппинга позже не выйдет за границы, не скопирует за
+        // вход и не подсунет неканонический адрес в `VirtAddr::new` (это была бы
+        // паника).
         Self::validate_program_headers(data, header)?;
 
         crate::debug!(
@@ -247,24 +246,25 @@ impl ElfLoader {
 
         let pml4_phys = vmm::new_user_pml4().map_err(|_| "ELF: failed to create PML4")?;
 
-        // Map the PT_LOAD segments INTO the freshly created user PML4. Because
-        // `vmm::map`/`virt_to_phys` operate on the *active* CR3, we temporarily
-        // install the user PML4 around the segment loop, then restore the
-        // kernel CR3. The kernel higher-half (which holds this code, its stack,
-        // the heap, the PMM bitmap and the HHDM used for the data copies) was
-        // cloned into the user PML4 by `new_user_pml4`, so the kernel keeps
-        // running normally while CR3 is switched.
+        // Мапим PT_LOAD В свежий пользовательский PML4. `vmm::map`/
+        // `virt_to_phys` работают с *активным* CR3, поэтому на время цикла
+        // сегментов ставим пользовательский PML4, затем восстанавливаем CR3
+        // ядра. Верхняя половина ядра (код, стек, куча, битмап PMM и HHDM,
+        // используемый для копирования данных) была клонирована в
+        // пользовательский PML4 внутри `new_user_pml4`, так что ядро продолжает
+        // работать при переключённом CR3.
         //
-        // The caller (`create_user_process`) runs this with interrupts disabled,
-        // so no timer tick can observe the temporarily-installed user CR3.
+        // Вызывающий (`create_user_process`) запускает это с выключенными
+        // прерываниями, поэтому тик таймера не увидит временно установленный
+        // пользовательский CR3.
         let kernel_cr3 = vmm::current_pml4_phys();
-        // SAFETY: `pml4_phys` is a valid PML4 containing the kernel higher-half.
+        // SAFETY: `pml4_phys` — валидный PML4, содержащий верхнюю половину ядра.
         unsafe {
             vmm::load_cr3(pml4_phys);
         }
         let load_result = Self::map_segments(data, header);
-        // SAFETY: restore the kernel PML4 regardless of success/failure so we
-        // never return to the caller with a foreign address space installed.
+        // SAFETY: восстанавливаем PML4 ядра независимо от успеха/отказа, чтобы
+        // не вернуться к вызывающему с чужим адресным пространством.
         unsafe {
             vmm::load_cr3(kernel_cr3);
         }
@@ -275,49 +275,48 @@ impl ElfLoader {
         Ok(ElfProcess {
             entry: header.e_entry,
             pml4_phys,
-            // The legacy pagh-native path only loads absolute ET_EXEC images, so
-            // there is never a load bias and the entry/phdr addresses are absolute.
+            // Нативный путь pagh грузит только абсолютные ET_EXEC, поэтому bias
+            // здесь всегда 0, а адреса entry/phdr абсолютные.
             load_bias: 0,
             phdr_vaddr: Self::compute_phdr_vaddr(data, header, 0),
             phent: header.e_phentsize,
             phnum: header.e_phnum,
             initial_brk: brk,
-            // The legacy native path has no maps consumer; the segments are only
-            // collected for Linux images (`load_linux`).
+            // У нативного пути нет потребителя maps; сегменты собираются только
+            // для Linux-образов (`load_linux`).
             segments: Vec::new(),
         })
     }
 
-    /// Load a statically-linked Linux `ET_EXEC` or static-PIE `ET_DYN` image and
-    /// expose the loader outputs the `Stack_Initializer` needs for the auxv
-    /// (task 13.1, R5.1/R5.2/R5.3/R5.4/R5.7/R5.8/R7.6/R11.3/R12.1).
+    /// Грузит статически слинкованный Linux `ET_EXEC` или static-PIE `ET_DYN` и
+    /// отдаёт выход загрузчика, нужный `Stack_Initializer` для auxv
+    /// (R5.1/R5.2/R5.3/R5.4/R5.7/R5.8/R7.6/R11.3/R12.1).
     ///
-    /// This is an *additive* sibling of [`ElfLoader::load`]: the legacy path
-    /// stays restricted to absolute `ET_EXEC` (and is what `create_user_process`
-    /// / `spawn_test_user_process` still use), while this path additionally
-    /// accepts static-PIE `ET_DYN` via the pure [`classify_elf`]/[`choose_bias`]
-    /// classifier and returns the full [`ElfProcess`] with `load_bias`,
-    /// `phdr_vaddr`, `phent`, `phnum`, and `initial_brk` populated.
+    /// Это *аддитивный* сосед [`ElfLoader::load`]: нативный путь остаётся
+    /// ограничен абсолютными `ET_EXEC` (его используют `create_user_process` /
+    /// `spawn_test_user_process`), а этот дополнительно принимает static-PIE
+    /// `ET_DYN` через чистый классификатор [`classify_elf`]/[`choose_bias`] и
+    /// возвращает полный [`ElfProcess`] с заполненными `load_bias`,
+    /// `phdr_vaddr`, `phent`, `phnum` и `initial_brk`.
     ///
-    /// Steps:
-    ///   1. [`classify_elf`] — on [`ElfVerdict::Reject`] emit exactly one
-    ///      diagnostic naming the cause + a binary identifier and return `Err`
-    ///      **without** allocating a PML4 or mapping anything (R5.3/R5.5/R5.6/
-    ///      R5.9/R11.3/R12.1).
-    ///   2. `ET_DYN` → [`choose_bias`] over `max(p_vaddr + p_memsz)`; `ET_EXEC`
-    ///      → bias `0` (R5.1/R5.2).
-    ///   3. Fresh user PML4; map every `PT_LOAD` at `p_vaddr + bias` with
-    ///      `PF_W`→WRITABLE, `!PF_X`→NO_EXECUTE, always `USER_ACCESSIBLE`; copy
-    ///      exactly `p_filesz` bytes and zero `[p_filesz, p_memsz)` (R5.4/R5.7/
-    ///      R5.8/R7.6).
-    ///   4. Compute `phdr_vaddr`, `phent`, `phnum`, `initial_brk`.
+    /// Шаги:
+    ///   1. [`classify_elf`] — при [`ElfVerdict::Reject`] одна диагностика с
+    ///      причиной + идентификатором бинаря и `Err` **без** аллокации PML4 и
+    ///      маппинга (R5.3/R5.5/R5.6/R5.9/R11.3/R12.1).
+    ///   2. `ET_DYN` → [`choose_bias`] по `max(p_vaddr + p_memsz)`; `ET_EXEC` →
+    ///      bias `0` (R5.1/R5.2).
+    ///   3. Свежий пользовательский PML4; каждый `PT_LOAD` мапится по
+    ///      `p_vaddr + bias` с `PF_W`→WRITABLE, `!PF_X`→NO_EXECUTE, всегда
+    ///      `USER_ACCESSIBLE`; копируется ровно `p_filesz` байт, а
+    ///      `[p_filesz, p_memsz)` обнуляется (R5.4/R5.7/R5.8/R7.6).
+    ///   4. Вычисляются `phdr_vaddr`, `phent`, `phnum`, `initial_brk`.
     pub fn load_linux(data: &[u8]) -> Result<ElfProcess, &'static str> {
-        // 1. Pure classification — reject *before* touching any memory (R12.1).
+        // 1. Чистая классификация — отказ *до* касания памяти (R12.1).
         let kind = match classify_elf(data) {
             ElfVerdict::Reject(msg) => {
-                // One diagnostic naming the rejection cause + a binary identifier
-                // (we only have the byte buffer here, so the identifier is its
-                // length). Severity is Error per R12.5.
+                // Одна диагностика с причиной отказа + идентификатором бинаря
+                // (здесь есть только байтовый буфер, так что идентификатор —
+                // его длина). Severity — Error, R12.5.
                 crate::error!(
                     "Linux ELF loader: rejecting binary (id=<{}-byte image>): {}",
                     data.len(),
@@ -328,16 +327,16 @@ impl ElfLoader {
             ElfVerdict::Load { kind, .. } => kind,
         };
 
-        // `classify_elf` guarantees the buffer is at least an ELF64 header, has
-        // valid magic / ELFCLASS64 / ELFDATA2LSB / EM_X86_64, and that every
-        // PT_LOAD is in bounds with a (zero-bias) page-rounded range below
-        // USER_ADDR_MAX. Reading the header struct is therefore in-bounds.
-        // SAFETY: length validated by `classify_elf`; byte alignment means the
-        // header must be copied rather than referenced.
+        // `classify_elf` гарантирует, что буфер не меньше заголовка ELF64, имеет
+        // валидные magic / ELFCLASS64 / ELFDATA2LSB / EM_X86_64 и что каждый
+        // PT_LOAD в границах с округлённым по страницам (при нулевом bias)
+        // диапазоном ниже USER_ADDR_MAX. Значит, чтение заголовка в границах.
+        // SAFETY: длину проверил `classify_elf`; из-за побайтного выравнивания
+        // заголовок копируется, а не берётся по ссылке.
         let header_owned = unsafe { read_elf_header(data) };
         let header: &Elf64Header = &header_owned;
 
-        // 2. Choose the load bias.
+        // 2. Выбираем load bias.
         let bias = match kind {
             ElfKind::Exec => 0u64,
             ElfKind::Dyn => {
@@ -346,7 +345,7 @@ impl ElfLoader {
             }
         };
 
-        // Entry point adjusted by the bias (0 for ET_EXEC). Overflow-safe.
+        // Точка входа с поправкой на bias (0 для ET_EXEC). Overflow-safe.
         let entry = header
             .e_entry
             .checked_add(bias)
@@ -360,26 +359,26 @@ impl ElfLoader {
             header.e_phnum
         );
 
-        // 3. Fresh user PML4, then map the biased PT_LOAD segments into it. As in
-        // the legacy path we install the user CR3 around the mapping loop (so
-        // `vmm::map`/`virt_to_phys` operate on it) and restore the kernel CR3
-        // afterwards regardless of outcome. The caller runs with interrupts off.
+        // 3. Свежий пользовательский PML4, затем маппинг смещённых PT_LOAD. Как
+        // и в нативном пути, на время цикла ставим пользовательский CR3 (чтобы
+        // `vmm::map`/`virt_to_phys` работали с ним) и восстанавливаем CR3 ядра
+        // независимо от результата. Вызывающий идёт с выключенными прерываниями.
         let pml4_phys = vmm::new_user_pml4().map_err(|_| "ELF: failed to create PML4")?;
 
         let kernel_cr3 = vmm::current_pml4_phys();
-        // SAFETY: `pml4_phys` is a valid PML4 containing the kernel higher-half.
+        // SAFETY: `pml4_phys` — валидный PML4, содержащий верхнюю половину ядра.
         unsafe {
             vmm::load_cr3(pml4_phys);
         }
         let mut segments: Vec<LoadSegment> = Vec::new();
         let map_result = Self::map_segments_biased(data, header, bias, &mut segments);
-        // SAFETY: always restore the kernel PML4 before returning to the caller.
+        // SAFETY: PML4 ядра восстанавливается до любого возврата вызывающему.
         unsafe {
             vmm::load_cr3(kernel_cr3);
         }
         let initial_brk = map_result?;
 
-        // 4. Loader outputs for the auxv.
+        // 4. Выход загрузчика для auxv.
         let phdr_vaddr = Self::compute_phdr_vaddr(data, header, bias);
 
         crate::debug!(
@@ -404,7 +403,8 @@ impl ElfLoader {
         })
     }
 
-    /// Map an ET_DYN PT_INTERP image into an existing user address space.
+    /// Мапит образ ET_DYN PT_INTERP в существующее пользовательское адресное
+    /// пространство.
     pub fn map_interpreter(
         pml4_phys: u64,
         data: &[u8],
@@ -418,8 +418,8 @@ impl ElfLoader {
             ElfVerdict::Load { .. } => return Err("ELF: interpreter is not ET_DYN"),
             ElfVerdict::Reject(msg) => return Err(msg),
         }
-        // SAFETY: `classify_elf` validated the length; the buffer is only
-        // byte-aligned, so the header is copied out of it.
+        // SAFETY: `classify_elf` проверил длину; буфер выровнен только побайтно,
+        // поэтому заголовок копируется из него.
         let header_owned = unsafe { read_elf_header(data) };
         let header: &Elf64Header = &header_owned;
         let max_end = Self::max_load_vaddr_end(data, header)?;
@@ -445,14 +445,13 @@ impl ElfLoader {
         Ok(entry)
     }
 
-    /// Maximum `p_vaddr + p_memsz` across all `PT_LOAD` segments (the highest
-    /// un-biased virtual address the image touches), used to feed [`choose_bias`]
-    /// for static-PIE `ET_DYN`. Overflow-safe; returns `0` when there are no
-    /// loadable segments.
+    /// Максимум `p_vaddr + p_memsz` по всем `PT_LOAD` (наивысший несмещённый
+    /// виртуальный адрес образа) — вход [`choose_bias`] для static-PIE `ET_DYN`.
+    /// Overflow-safe; `0`, если загружаемых сегментов нет.
     ///
-    /// PRECONDITION: `classify_elf(data)` has already succeeded, so the phdr
-    /// table is fully in bounds and each program header struct read below lies
-    /// within `data`.
+    /// PRECONDITION: `classify_elf(data)` уже успешно отработал, поэтому таблица
+    /// phdr целиком в границах и каждая читаемая ниже структура program header
+    /// лежит внутри `data`.
     fn max_load_vaddr_end(data: &[u8], header: &Elf64Header) -> Result<u64, &'static str> {
         let phoff = header.e_phoff as usize;
         let phentsize = header.e_phentsize as usize;
@@ -460,11 +459,12 @@ impl ElfLoader {
         let mut max_end: u64 = 0;
 
         for i in 0..phnum {
-            // In bounds: classify_elf validated phoff + phnum*phentsize <= len.
+            // В границах: classify_elf проверил phoff + phnum*phentsize <= len.
             let ph_offset = phoff + i * phentsize;
             // SAFETY: `ph_offset + phentsize <= table_end <= data.len()`.
-            // `ph_offset` is attacker-controlled, so it need not be aligned for
-            // `Elf64ProgramHeader`: copy the header instead of referencing it.
+            // `ph_offset` управляется атакующим, поэтому может быть не выровнен
+            // под `Elf64ProgramHeader`: копируем заголовок, а не ссылаемся на
+            // него.
             let ph = unsafe { read_program_header(data, ph_offset) };
             if ph.p_type != PT_LOAD {
                 continue;
@@ -480,18 +480,18 @@ impl ElfLoader {
         Ok(max_end)
     }
 
-    /// Compute `AT_PHDR`: the in-memory virtual address of the program-header
-    /// table once the image is loaded at `bias`.
+    /// Вычисляет `AT_PHDR`: виртуальный адрес таблицы program headers в памяти
+    /// после загрузки образа с `bias`.
     ///
-    /// Standard SysV convention: the headers are mapped as part of whichever
-    /// `PT_LOAD` segment's file range `[p_offset, p_offset + p_filesz)` covers
-    /// `e_phoff`; for that segment the table sits at
-    /// `p_vaddr + bias + (e_phoff - p_offset)`. When no segment explicitly covers
-    /// `e_phoff` (rare), fall back to "headers live at the start of the first
-    /// `PT_LOAD`", i.e. `first_load.p_vaddr + bias + e_phoff`, and finally to
-    /// `bias + e_phoff` if there are no loadable segments at all.
+    /// Стандартное соглашение SysV: заголовки замаплены в составе того
+    /// `PT_LOAD`, чей файловый диапазон `[p_offset, p_offset + p_filesz)`
+    /// покрывает `e_phoff`; для него таблица лежит по
+    /// `p_vaddr + bias + (e_phoff - p_offset)`. Если ни один сегмент явно не
+    /// покрывает `e_phoff` (редкость), откат к «заголовки в начале первого
+    /// `PT_LOAD`», то есть `first_load.p_vaddr + bias + e_phoff`, и наконец к
+    /// `bias + e_phoff`, если загружаемых сегментов нет вовсе.
     ///
-    /// PRECONDITION: `classify_elf(data)` has already succeeded.
+    /// PRECONDITION: `classify_elf(data)` уже успешно отработал.
     fn compute_phdr_vaddr(data: &[u8], header: &Elf64Header, bias: u64) -> u64 {
         let phoff = header.e_phoff;
         let phentsize = header.e_phentsize as usize;
@@ -500,11 +500,12 @@ impl ElfLoader {
         let mut first_load_vaddr: Option<u64> = None;
 
         for i in 0..phnum {
-            // In bounds: classify_elf validated the phdr table fits in `data`.
+            // В границах: classify_elf проверил, что таблица phdr помещается в
+            // `data`.
             let ph_offset = table_off + i * phentsize;
-            // SAFETY: bounds guaranteed by classify_elf.
-            // `ph_offset` is attacker-controlled, so it need not be aligned for
-            // `Elf64ProgramHeader`: copy the header instead of referencing it.
+            // SAFETY: границы гарантированы classify_elf. `ph_offset`
+            // управляется атакующим, поэтому может быть не выровнен под
+            // `Elf64ProgramHeader`: копируем заголовок, а не ссылаемся на него.
             let ph = unsafe { read_program_header(data, ph_offset) };
             if ph.p_type != PT_LOAD {
                 continue;
@@ -512,7 +513,8 @@ impl ElfLoader {
             if first_load_vaddr.is_none() {
                 first_load_vaddr = Some(ph.p_vaddr);
             }
-            // Does this segment's file range cover the phdr table offset?
+            // Покрывает ли файловый диапазон этого сегмента смещение таблицы
+            // phdr?
             let seg_file_end = ph.p_offset.saturating_add(ph.p_filesz);
             if ph.p_offset <= phoff && phoff < seg_file_end {
                 return ph
@@ -528,37 +530,38 @@ impl ElfLoader {
         bias.wrapping_add(phoff)
     }
 
-    /// Map all `PT_LOAD` segments at `p_vaddr + bias` into the **currently
-    /// active** PML4 (the caller installs the user PML4 first) and return the
-    /// page-aligned program break (the page-rounded top of the highest segment).
+    /// Мапит все `PT_LOAD` по `p_vaddr + bias` в **текущий активный** PML4
+    /// (вызывающий сначала ставит пользовательский PML4) и возвращает выровненный
+    /// по странице program break (округлённый верх наивысшего сегмента).
     ///
-    /// Identical in structure to [`ElfLoader::map_segments`] but applies a load
-    /// bias (for static-PIE) to every segment's virtual address. Per-segment
-    /// flags: `PF_W`→WRITABLE, `!PF_X`→NO_EXECUTE, always `USER_ACCESSIBLE`
-    /// (R5.4/R7.6). Copies exactly `p_filesz` bytes from `p_offset` and zeroes
-    /// `[p_filesz, p_memsz)` (R5.7/R5.8). All arithmetic is overflow-safe and the
-    /// biased range is re-checked against `USER_ADDR_MAX` defensively.
+    /// Структурно совпадает с [`ElfLoader::map_segments`], но применяет load bias
+    /// (для static-PIE) к виртуальному адресу каждого сегмента. Флаги на
+    /// сегмент: `PF_W`→WRITABLE, `!PF_X`→NO_EXECUTE, всегда `USER_ACCESSIBLE`
+    /// (R5.4/R7.6). Копируется ровно `p_filesz` байт с `p_offset`, а
+    /// `[p_filesz, p_memsz)` обнуляется (R5.7/R5.8). Вся арифметика
+    /// overflow-safe, смещённый диапазон защитно перепроверяется по
+    /// `USER_ADDR_MAX`.
     ///
-    /// PRECONDITION: `classify_elf(data)` has already succeeded for this image.
+    /// PRECONDITION: `classify_elf(data)` уже успешно отработал для этого образа.
     fn map_segments_biased(
         data: &[u8],
         header: &Elf64Header,
         bias: u64,
         segments: &mut Vec<LoadSegment>,
     ) -> Result<u64, &'static str> {
-        // Unlike the legacy path this one does not go through
-        // `validate_program_headers` (a biased vaddr range is only checkable with
-        // the bias in hand), so the eager-mapping bound is applied here — before
-        // the first allocation.
+        // В отличие от нативного пути этот не проходит через
+        // `validate_program_headers` (смещённый vaddr-диапазон проверяется только
+        // при известном bias), поэтому граница eager-маппинга применяется здесь —
+        // до первой аллокации.
         if data.len() as u64 > Self::MAX_IMAGE_BYTES {
             return Err("ELF: image file too large for the loader");
         }
         let mut total_memsz: u64 = 0;
 
         let mut brk: u64 = 0;
-        // Frames mapped by this pass; committed only on full success (see
-        // `MappedFrames`). One guard for the whole image: a failure in a later
-        // segment must also release the earlier ones.
+        // Кадры, замапленные этим проходом; фиксируются только при полном
+        // успехе (см. `MappedFrames`). Один guard на весь образ: отказ в позднем
+        // сегменте обязан освободить и ранние.
         let mut mapped = MappedFrames::new();
         let phoff = header.e_phoff as usize;
         let phentsize = header.e_phentsize as usize;
@@ -582,9 +585,9 @@ impl ElfLoader {
                 return Err("ELF: program header beyond data");
             }
 
-            // SAFETY: Bounds checked above.
-            // `ph_offset` is attacker-controlled, so it need not be aligned for
-            // `Elf64ProgramHeader`: copy the header instead of referencing it.
+            // SAFETY: границы проверены выше. `ph_offset` управляется
+            // атакующим, поэтому может быть не выровнен под
+            // `Elf64ProgramHeader`: копируем заголовок, а не ссылаемся на него.
             let ph = unsafe { read_program_header(data, ph_offset) };
 
             if ph.p_type != PT_LOAD {
@@ -599,7 +602,7 @@ impl ElfLoader {
                 flags |= PageTableFlags::NO_EXECUTE;
             }
 
-            // Apply the load bias to the segment's virtual address (R5.2).
+            // Применяем load bias к виртуальному адресу сегмента (R5.2).
             let vaddr_start = ph
                 .p_vaddr
                 .checked_add(bias)
@@ -642,14 +645,14 @@ impl ElfLoader {
             let mut addr = page_start;
             while addr < page_end {
                 let frame = crate::memory::pmm::alloc_frame().ok_or("ELF: PMM OOM for LOAD")?;
-                // PT_LOAD pages are independent PMM frames, not a physically
-                // contiguous allocation. Zero each frame through its HHDM alias.
+                // Страницы PT_LOAD — независимые кадры PMM, не физически
+                // непрерывная аллокация. Обнуляем каждый кадр через его HHDM-алиас.
                 unsafe {
                     ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, 4096);
                 }
-                // Every frame is registered as soon as it is mapped: any later
-                // failure (OOM, a bad translation, a copy error) releases the
-                // whole lot instead of keeping the pages alive.
+                // Каждый кадр регистрируется сразу после маппинга: любой поздний
+                // отказ (OOM, плохой перевод адреса, ошибка копирования)
+                // освобождает всё, а не оставляет страницы живыми.
                 mapped.map(frame, addr, flags)?;
                 addr += 4096;
             }
@@ -663,9 +666,9 @@ impl ElfLoader {
                 if file_end > data.len() {
                     return Err("ELF: file data beyond input");
                 }
-                // Copy page-by-page. PMM frames backing adjacent virtual pages
-                // are not guaranteed to be physically contiguous. A single HHDM
-                // memcpy across `file_sz` corrupts unrelated physical memory.
+                // Копируем постранично: кадры PMM под соседними виртуальными
+                // страницами не гарантированно физически непрерывны. Один HHDM
+                // memcpy на `file_sz` испортил бы постороннюю физическую память.
                 let mut copied: usize = 0;
                 while copied < file_sz {
                     let dst_vaddr = vaddr_start + copied as u64;
@@ -707,43 +710,38 @@ impl ElfLoader {
         Ok(brk)
     }
 
-    /// Validate the program-header table and all `PT_LOAD` segments using only
-    /// overflow-safe arithmetic. Returns `Ok(())` if every segment is in bounds
-    /// and addressable, otherwise an `Err` describing the first problem found.
+    /// Наибольший суммарный `PT_LOAD p_memsz`, который может запросить один
+    /// образ (64 MiB).
     ///
-    /// This performs NO allocation and NO mapping — it exists so the loader can
-    /// reject malformed binaries before creating the user PML4, and so the
-    /// mapping loop in `map_segments` is guaranteed never to panic or run past
-    /// the input buffer.
-    ///
-    /// A zero-`e_phnum` image is accepted (there is simply nothing to map); the
-    /// caller still gets a valid entry and handles any run failure itself.
-    /// Largest total `PT_LOAD` `p_memsz` a single image may request (64 MiB).
-    ///
-    /// Every segment page is mapped **eagerly**, so this is a hard bound on how
-    /// much of the PMM one image can consume before anything else rejects it.
-    /// Measured against the userland this kernel runs — a static test ELF,
-    /// `hello-pagh`, glibc's `ld.so`/`libc`, `python3`, `nvim` — the largest
-    /// `PT_LOAD` total is a few MiB, and the largest ELF on the development host
-    /// (`lto-dump`) is 40 MiB. 64 MiB keeps headroom over that while staying 1/16
-    /// of the 1 GiB guest the E2E harness boots: a forged header can no longer
-    /// drain the pool (the previous behaviour: one failed load leaked the whole
-    /// PMM through a bogus `p_memsz`).
+    /// Каждая страница сегмента мапится **eagerly**, поэтому это жёсткая граница
+    /// того, сколько PMM может съесть один образ до любого другого отказа.
+    /// Реальный юзерленд этого ядра (`hello-pagh`, `ld.so`/`libc`, `python3`,
+    /// `nvim`) требует единицы MiB; 64 MiB дают запас и остаются 1/16 гостя
+    /// 1 GiB, которого бутит E2E-стенд.
     pub const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 
+    /// Валидирует таблицу program headers и все `PT_LOAD` только overflow-safe
+    /// арифметикой. `Ok(())`, если каждый сегмент в границах и адресуем, иначе
+    /// `Err` с первой найденной проблемой.
+    ///
+    /// Не делает ни аллокаций, ни маппинга: загрузчик отвергает битые бинари до
+    /// создания пользовательского PML4, а цикл маппинга в `map_segments` не может
+    /// паниковать или выйти за входной буфер.
+    ///
+    /// Образ с нулевым `e_phnum` принимается (мапить нечего); вызывающий всё
+    /// равно получает валидную точку входа и сам обрабатывает отказ запуска.
     fn validate_program_headers(data: &[u8], header: &Elf64Header) -> Result<(), &'static str> {
-        // The file alone cannot be bigger than the image it describes: refuse
-        // before walking anything.
+        // Сам файл не может быть больше описываемого образа: отказ до обхода.
         if data.len() as u64 > Self::MAX_IMAGE_BYTES {
             return Err("ELF: image file too large for the loader");
         }
-        // Sum of the loaded sizes, bounded by `MAX_IMAGE_BYTES` below. This is the
-        // check that keeps a forged `p_memsz` from reaching the mapping loop.
+        // Сумма загружаемых размеров с границей `MAX_IMAGE_BYTES` ниже — именно
+        // эта проверка не пускает подделанный `p_memsz` в цикл маппинга.
         let mut total_memsz: u64 = 0;
 
         let phnum = header.e_phnum as usize;
         if phnum == 0 {
-            // No program headers: nothing to load. Accept gracefully.
+            // Program headers нет: грузить нечего. Принимаем.
             return Ok(());
         }
 
@@ -754,7 +752,8 @@ impl ElfLoader {
 
         let phoff = header.e_phoff as usize;
 
-        // Bound the whole phdr table: phoff + phnum*phentsize must fit in `data`.
+        // Ограничиваем всю таблицу phdr: phoff + phnum*phentsize должен
+        // помещаться в `data`.
         let table_bytes = phnum
             .checked_mul(phentsize)
             .ok_or("ELF: program header table size overflow")?;
@@ -766,22 +765,22 @@ impl ElfLoader {
         }
 
         for i in 0..phnum {
-            // Safe: i < phnum and phnum*phentsize did not overflow, so this is
-            // <= table_bytes which is within usize range.
+            // Безопасно: i < phnum, phnum*phentsize не переполнилось, значит
+            // значение <= table_bytes и в диапазоне usize.
             let ph_offset = phoff + i * phentsize;
 
-            // SAFETY: `ph_offset + phentsize <= table_end <= data.len()` and
-            // `phentsize >= size_of::<Elf64ProgramHeader>()`, so the full
-            // program-header struct lies within `data`.
-            // `ph_offset` is attacker-controlled, so it need not be aligned for
-            // `Elf64ProgramHeader`: copy the header instead of referencing it.
+            // SAFETY: `ph_offset + phentsize <= table_end <= data.len()` и
+            // `phentsize >= size_of::<Elf64ProgramHeader>()`, поэтому вся
+            // структура program header лежит внутри `data`. `ph_offset`
+            // управляется атакующим, поэтому может быть не выровнен под
+            // `Elf64ProgramHeader`: копируем заголовок, а не ссылаемся на него.
             let ph = unsafe { read_program_header(data, ph_offset) };
 
             if ph.p_type != PT_LOAD {
                 continue;
             }
 
-            // File data range must lie within the input buffer.
+            // Диапазон данных файла обязан лежать во входном буфере.
             if ph.p_filesz > 0 {
                 let file_off = ph.p_offset as usize;
                 let file_sz = ph.p_filesz as usize;
@@ -793,12 +792,13 @@ impl ElfLoader {
                 }
             }
 
-            // filesz must not exceed memsz (the bss tail would be negative).
+            // filesz не больше memsz (иначе bss-хвост был бы отрицательным).
             if ph.p_filesz > ph.p_memsz {
                 return Err("ELF: p_filesz exceeds p_memsz");
             }
 
-            // Virtual range must be canonical lower-half (user) and not overflow.
+            // Виртуальный диапазон обязан быть канонической нижней половиной
+            // (user) и не переполняться.
             let vaddr_end = ph
                 .p_vaddr
                 .checked_add(ph.p_memsz)
@@ -807,8 +807,8 @@ impl ElfLoader {
                 return Err("ELF: segment outside user address space");
             }
 
-            // Eager mapping: bound the total, so a legal-looking but huge
-            // `p_memsz` is refused here instead of inside the mapping loop.
+            // Eager-маппинг: ограничиваем сумму, чтобы правдоподобный, но
+            // огромный `p_memsz` отвергался здесь, а не в цикле маппинга.
             total_memsz = total_memsz
                 .checked_add(ph.p_memsz)
                 .ok_or("ELF: segment sizes overflow")?;
@@ -816,7 +816,8 @@ impl ElfLoader {
                 return Err("ELF: image too large for the loader");
             }
 
-            // Page-rounded end must also not overflow (used by the map loop).
+            // Округлённый по странице конец тоже не должен переполняться (его
+            // использует цикл маппинга).
             vaddr_end
                 .checked_add(4095)
                 .ok_or("ELF: vaddr page-round overflow")?;
@@ -825,20 +826,20 @@ impl ElfLoader {
         Ok(())
     }
 
-    /// Map all `PT_LOAD` segments described by `header` from `data` into the
-    /// **currently active** PML4 (the caller installs the user PML4 first), and
-    /// return the computed program break (`brk`).
+    /// Мапит все `PT_LOAD` из `header`/`data` в **текущий активный** PML4
+    /// (вызывающий сначала ставит пользовательский PML4) и возвращает
+    /// вычисленный program break (`brk`).
     ///
-    /// PRECONDITION: `validate_program_headers` has already succeeded for this
-    /// `data`/`header`, so all offsets/sizes are in bounds and all virtual
-    /// addresses are canonical lower-half. Bounds checks are nonetheless
-    /// repeated defensively with checked arithmetic so this function can never
-    /// panic or index out of bounds even if called independently.
+    /// PRECONDITION: `validate_program_headers` уже успешно отработал для этих
+    /// `data`/`header`, поэтому все смещения/размеры в границах, а виртуальные
+    /// адреса — каноническая нижняя половина. Тем не менее проверки границ
+    /// защитно повторяются checked-арифметикой, чтобы функция не паниковала и не
+    /// выходила за границы даже при независимом вызове.
     fn map_segments(data: &[u8], header: &Elf64Header) -> Result<u64, &'static str> {
         let mut brk: u64 = 0;
-        // Frames mapped by this pass; committed only on full success (see
-        // `MappedFrames`). One guard for the whole image: a failure in a later
-        // segment must also release the earlier ones.
+        // Кадры, замапленные этим проходом; фиксируются только при полном
+        // успехе (см. `MappedFrames`). Один guard на весь образ: отказ в позднем
+        // сегменте обязан освободить и ранние.
         let mut mapped = MappedFrames::new();
         let phoff = header.e_phoff as usize;
         let phentsize = header.e_phentsize as usize;
@@ -863,9 +864,9 @@ impl ElfLoader {
                 return Err("ELF: program header beyond data");
             }
 
-            // SAFETY: Bounds checked above.
-            // `ph_offset` is attacker-controlled, so it need not be aligned for
-            // `Elf64ProgramHeader`: copy the header instead of referencing it.
+            // SAFETY: границы проверены выше. `ph_offset` управляется
+            // атакующим, поэтому может быть не выровнен под
+            // `Elf64ProgramHeader`: копируем заголовок, а не ссылаемся на него.
             let ph = unsafe { read_program_header(data, ph_offset) };
 
             if ph.p_type != PT_LOAD {
@@ -906,14 +907,14 @@ impl ElfLoader {
             let mut addr = page_start;
             while addr < page_end {
                 let frame = crate::memory::pmm::alloc_frame().ok_or("ELF: PMM OOM for LOAD")?;
-                // PT_LOAD pages are independent PMM frames, not a physically
-                // contiguous allocation. Zero each frame through its HHDM alias.
+                // Страницы PT_LOAD — независимые кадры PMM, не физически
+                // непрерывная аллокация. Обнуляем каждый кадр через его HHDM-алиас.
                 unsafe {
                     ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, 4096);
                 }
-                // Every frame is registered as soon as it is mapped: any later
-                // failure (OOM, a bad translation, a copy error) releases the
-                // whole lot instead of keeping the pages alive.
+                // Каждый кадр регистрируется сразу после маппинга: любой поздний
+                // отказ (OOM, плохой перевод адреса, ошибка копирования)
+                // освобождает всё, а не оставляет страницы живыми.
                 mapped.map(frame, addr, flags)?;
                 addr += 4096;
             }
@@ -927,9 +928,9 @@ impl ElfLoader {
                 if file_end > data.len() {
                     return Err("ELF: file data beyond input");
                 }
-                // Copy page-by-page. PMM frames backing adjacent virtual pages
-                // are not guaranteed to be physically contiguous. A single HHDM
-                // memcpy across `file_sz` corrupts unrelated physical memory.
+                // Копируем постранично: кадры PMM под соседними виртуальными
+                // страницами не гарантированно физически непрерывны. Один HHDM
+                // memcpy на `file_sz` испортил бы постороннюю физическую память.
                 let mut copied: usize = 0;
                 while copied < file_sz {
                     let dst_vaddr = vaddr_start + copied as u64;

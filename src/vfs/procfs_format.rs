@@ -1,20 +1,21 @@
-//! Pure, `core`+`alloc`-only rendering of the synthetic `/proc` texts (issue #11).
+//! Чистый (`core`+`alloc`) рендеринг текстов синтетического `/proc`.
 //!
-//! Everything a `/proc` file needs to *say* lives here as plain data in, bytes out:
-//! no VFS, no kernel state, no allocation-visible side effects. The kernel-facing
-//! node layer ([`super::procfs`]) only collects the inputs (PMM counters, tick
-//! clock, `CompatState`, CPUID) and hands them to these formatters; the exact
-//! byte formats and the path/inode table are here so `host-tests` can
-//! `#[path]`-include this file verbatim and property-test it (contract
-//! `docs/procfs.md` §7).
+//! Всё, что файлу `/proc` нужно *сказать*, живёт здесь как данные на входе и
+//! байты на выходе: без VFS, без состояния ядра, без побочных эффектов,
+//! видимых аллокатору. Ядро-ориентированный слой узлов ([`super::procfs`])
+//! только собирает входы (счётчики PMM, тик-клок, `CompatState`, CPUID) и
+//! отдаёт их форматтерам; точные байтовые форматы и таблица путей/inode — здесь,
+//! чтобы `host-tests` включали файл дословно через `#[path]` и проверяли
+//! свойства (контракт `docs/procfs.md` §7).
 //!
-//! Formats are Linux-compatible on purpose, and the load-bearing details were
-//! taken from the consumers' own parsers (see `docs/procfs.md` §4):
+//! Форматы намеренно Linux-совместимы, а несущие детали взяты из парсеров самих
+//! потребителей (см. `docs/procfs.md` §4):
 //!   * `meminfo` — libuv `strstr("MemTotal:")` + `sscanf("%llu kB")`;
-//!   * `cpuinfo` — libuv `fscanf("processor\t: %u\n")` + literal `"model name\t: "`;
+//!   * `cpuinfo` — libuv `fscanf("processor\t: %u\n")` + литерал
+//!     `"model name\t: "`;
 //!   * `uptime`  — libuv/vmstat `sscanf("%lf")`;
-//!   * `maps`    — readelf/sanitizers address-range + perms parsing;
-//!   * `status`  — key/tab/value lines as in Linux `fs/proc/array.c`.
+//!   * `maps`    — разбор диапазонов адресов и прав в readelf/санитайзерах;
+//!   * `status`  — строки key/tab/value, как в Linux `fs/proc/array.c`.
 
 #![allow(dead_code)]
 
@@ -22,29 +23,29 @@ use alloc::fmt;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// Append a formatted line to `out`.
+/// Дописывает форматированную строку в `out`.
 ///
-/// `Vec<u8>` does not implement `core::fmt::Write` in this configuration, so the
-/// formatted text is produced by `alloc::fmt::format` and copied in — one small
-/// allocation per line, which keeps the byte layout obvious and identical in the
-/// kernel and under `host-tests`.
+/// `Vec<u8>` в этой конфигурации не реализует `core::fmt::Write`, поэтому текст
+/// готовится через `alloc::fmt::format` и копируется — одна небольшая аллокация
+/// на строку, зато байтовая раскладка очевидна и одинакова в ядре и в
+/// `host-tests`.
 fn push(out: &mut Vec<u8>, args: fmt::Arguments<'_>) {
     let s = fmt::format(args);
     out.extend_from_slice(s.as_bytes());
 }
 
-// ─── Path / inode table ─────────────────────────────────────────────────────
+// ─── таблица путей / inode ──────────────────────────────────────────────────
 //
-// Inode numbers are constants so a path keeps one identity across every
-// `lookup()`: `d_ino` from `getdents64`, `st_ino` from `stat`, and re-opens all
-// agree. The base sits above the ext2 range (the ramfs counter starts at
-// 0x0054_0000 for exactly that reason, `src/vfs/ramfs.rs`) and below bit 63,
-// which `synth_ino` reserves for the FNV identity of nodes with no real inode.
+// Номера inode — константы, чтобы путь сохранял одну идентичность во всех
+// `lookup()`: `d_ino` из `getdents64`, `st_ino` из `stat` и повторные open
+// согласованы. База лежит выше диапазона ext2 (счётчик ramfs стартует с
+// 0x0054_0000 именно поэтому, `src/vfs/ramfs.rs`) и ниже бита 63, который
+// `synth_ino` резервирует под FNV-идентичность узлов без настоящего inode.
 
-/// Base inode number for every procfs node.
+/// Базовый номер inode для всех узлов procfs.
 pub const PROC_INO_BASE: u64 = 0x00F0_0000_0000;
-/// `/proc` itself (the inner node; `MountNode` reports the FNV identity of the
-/// `proc` mount name, see `docs/procfs.md` §2.3).
+/// Сам `/proc` (внутренний узел; `MountNode` сообщает FNV-идентичность имени
+/// монтирования `proc`, см. `docs/procfs.md` §2.3).
 pub const PROC_ROOT_DIR_INO: u64 = PROC_INO_BASE;
 /// `/proc/self`.
 pub const PROC_SELF_DIR_INO: u64 = PROC_INO_BASE + 1;
@@ -53,10 +54,10 @@ pub const PROC_SYS_DIR_INO: u64 = PROC_INO_BASE + 10;
 /// `/proc/sys/kernel`.
 pub const PROC_SYS_KERNEL_DIR_INO: u64 = PROC_INO_BASE + 11;
 
-/// Which `/proc` file a node presents.
+/// Какой файл `/proc` представляет узел.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcKind {
-    /// `/proc/self/exe` — a symlink to the running image.
+    /// `/proc/self/exe` — симлинк на запущенный образ.
     SelfExe,
     /// `/proc/self/cmdline`.
     SelfCmdline,
@@ -64,9 +65,9 @@ pub enum ProcKind {
     SelfStatus,
     /// `/proc/self/maps`.
     SelfMaps,
-    /// `/proc/self/stat` — the Linux per-task `stat` line of the reader.
+    /// `/proc/self/stat` — Linux-строка `stat` читателя.
     SelfStat,
-    /// `/proc/self/statm` — the reader's memory summary in pages.
+    /// `/proc/self/statm` — сводка памяти читателя в страницах.
     SelfStatm,
     /// `/proc/cpuinfo`.
     CpuInfo,
@@ -74,19 +75,19 @@ pub enum ProcKind {
     MemInfo,
     /// `/proc/uptime`.
     Uptime,
-    /// `/proc/stat` — the kernel tick/event counters.
+    /// `/proc/stat` — тиковые/событийные счётчики ядра.
     Stat,
-    /// `/proc/version` — this kernel's identity string.
+    /// `/proc/version` — строка идентичности этого ядра.
     Version,
-    /// `/proc/filesystems` — the filesystem drivers this build implements.
+    /// `/proc/filesystems` — драйверы ФС, которые реализует эта сборка.
     FileSystems,
-    /// `/proc/loadavg` — load averages plus live task counts.
+    /// `/proc/loadavg` — средние нагрузки плюс живые счётчики задач.
     LoadAvg,
-    /// `/proc/mounts` — the VFS mount table (Linux field order).
+    /// `/proc/mounts` — таблица монтирования VFS (порядок полей Linux).
     Mounts,
-    /// `/proc/self/mounts` — same table, per-process path.
+    /// `/proc/self/mounts` — та же таблица, per-process путь.
     SelfMounts,
-    /// `/proc/self/cgroup` — root cgroup (no controllers).
+    /// `/proc/self/cgroup` — корневая cgroup (без контроллеров).
     SelfCgroup,
     /// `/proc/<pid>/cgroup`.
     PidCgroup,
@@ -108,15 +109,16 @@ pub enum ProcKind {
     PidStatus,
     /// `/proc/<pid>/maps`.
     PidMaps,
-    /// `/proc/<pid>/limits` and `/proc/self/limits`.
+    /// `/proc/<pid>/limits` и `/proc/self/limits`.
     PidLimits,
     /// `/proc/self/limits`.
     SelfLimits,
-    /// `/proc/<pid>/fdinfo/<n>` (the target pid and fd are carried by the node).
+    /// `/proc/<pid>/fdinfo/<n>` (pid цели и fd несёт узел).
     FdInfo,
 }
 
-/// One named entry: its `readdir` name, stable inode, and content kind.
+/// Одна именованная запись: имя для `readdir`, стабильный inode и вид
+/// содержимого.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcEntry {
     pub name: &'static str,
@@ -124,7 +126,7 @@ pub struct ProcEntry {
     pub kind: ProcKind,
 }
 
-/// The regular files directly under `/proc` (in `readdir` order).
+/// Обычные файлы непосредственно под `/proc` (в порядке `readdir`).
 pub const PROC_FILES: [ProcEntry; 8] = [
     ProcEntry {
         name: "cpuinfo",
@@ -168,7 +170,7 @@ pub const PROC_FILES: [ProcEntry; 8] = [
     },
 ];
 
-/// The regular files under `/proc/sys/kernel` (in `readdir` order).
+/// Обычные файлы под `/proc/sys/kernel` (в порядке `readdir`).
 pub const PROC_SYS_FILES: [ProcEntry; 3] = [
     ProcEntry {
         name: "ostype",
@@ -187,13 +189,12 @@ pub const PROC_SYS_FILES: [ProcEntry; 3] = [
     },
 ];
 
-/// The regular files under `/proc/self` (in `readdir` order).
+/// Обычные файлы под `/proc/self` (в порядке `readdir`).
 ///
-/// `stat` and `statm` (slice 3) describe the *calling* process, so their inodes
-/// are fixed here like the older `self` entries. `/proc/<pid>/stat` uses the
-/// pid-derived identity below instead; the two paths describe the same state but
-/// are distinct VFS nodes (this `self` is a directory, not a symlink to the pid
-/// directory).
+/// `stat` и `statm` описывают *вызывающий* процесс, поэтому их inode, как и у
+/// остальных записей `self`, фиксированы здесь. `/proc/<pid>/stat` использует
+/// ниже идентичность от pid; пути описывают одно состояние, но являются разными
+/// VFS-узлами (`self` здесь — каталог, а не симлинк на pid-каталог).
 pub const PROC_SELF_FILES: [ProcEntry; 10] = [
     ProcEntry {
         name: "exe",
@@ -247,10 +248,10 @@ pub const PROC_SELF_FILES: [ProcEntry; 10] = [
     },
 ];
 
-/// `readdir` order of `/proc`'s **static** entries: `self`/`sys` first, then the
-/// regular files. Live numeric pid directories are inserted between `self` and
-/// `cpuinfo` by the kernel-facing `ProcDir::readdir` (ascending pid, snapshot of
-/// the compat registry); they are dynamic and therefore not listed here.
+/// Порядок `readdir` **статических** записей `/proc`: сначала `self`/`sys`, затем
+/// обычные файлы. Живые числовые pid-каталоги вставляет между `self` и `cpuinfo`
+/// ядро-ориентированный `ProcDir::readdir` (pid по возрастанию, снимок реестра
+/// compat); они динамические и здесь не перечисляются.
 pub const PROC_ROOT_ORDER: [&str; 10] = [
     "self",
     "sys",
@@ -264,69 +265,69 @@ pub const PROC_ROOT_ORDER: [&str; 10] = [
     "mounts",
 ];
 
-// ─── /proc/<pid> path / inode identity ──────────────────────────────────────
+// ─── идентичность пути / inode для /proc/<pid> ──────────────────────────────
 //
-// A pid directory has no fixed table row: its identity is derived from the pid,
-// so `getdents64` (`d_ino`), `stat` and repeated `lookup`s agree for the whole
-// life of the directory. The base sits above the static range (`PROC_INO_BASE +
-// 11`) and the stride leaves room for the four files. The pid is masked to its
-// low 32 bits: pagh's scheduler hands out small sequential pids, and a 32-bit
-// mask keeps the result below bit 63 for any input.
+// У pid-каталога нет фиксированной строки таблицы: его идентичность выводится из
+// pid, поэтому `getdents64` (`d_ino`), `stat` и повторные `lookup` согласованы на
+// всё время жизни каталога. База выше статического диапазона (`PROC_INO_BASE +
+// 11`), а шаг оставляет место файлам каталога. pid маскируется до младших 32
+// бит: планировщик pagh выдаёт небольшие последовательные pid, а 32-битная
+// маска держит результат ниже бита 63 при любом входе.
 
-/// First inode of the `/proc/<pid>` directory range.
+/// Первый inode диапазона каталогов `/proc/<pid>`.
 pub const PROC_PID_DIR_INO_BASE: u64 = PROC_INO_BASE + 0x0000_0000_0010_0000;
-/// Inodes reserved per pid directory. The stride also leaves room for the
-/// dynamic `/proc/<pid>/fd/<n>` (`+0x100`) and `/proc/<pid>/fdinfo/<n>`
-/// (`+0x1000`) identities, whose fd component is bounded by `NOFILE_MAX`
-/// (1024), well below `0x10000`.
+/// Inode, резервируемые на один pid-каталог. Шаг оставляет место и для
+/// динамических идентичностей `/proc/<pid>/fd/<n>` (`+0x100`) и
+/// `/proc/<pid>/fdinfo/<n>` (`+0x1000`), чей fd ограничен `NOFILE_MAX` (1024) —
+/// заметно ниже `0x10000`.
 pub const PROC_PID_INO_STRIDE: u64 = 0x1_0000;
-/// Pids are masked to this many bits before deriving an inode.
+/// pid маскируются до стольких бит перед выводом inode.
 pub const PROC_PID_INO_MASK: u64 = 0xFFFF_FFFF;
 
-/// Stable inode of the `/proc/<pid>` directory.
+/// Стабильный inode каталога `/proc/<pid>`.
 pub fn pid_dir_ino(pid: u64) -> u64 {
     PROC_PID_DIR_INO_BASE + (pid & PROC_PID_INO_MASK) * PROC_PID_INO_STRIDE
 }
 
-/// Stable inode of one file under `/proc/<pid>` (`slot` is its table entry).
+/// Стабильный inode файла под `/proc/<pid>` (`slot` — его запись таблицы).
 pub fn pid_file_ino(pid: u64, slot: u64) -> u64 {
     pid_dir_ino(pid) + slot
 }
 
-/// Stable inode of the `/proc/<pid>/fd/<fd>` symlink (also used for
+/// Стабильный inode симлинка `/proc/<pid>/fd/<fd>` (используется и для
 /// `/proc/self/fd/<fd>`).
 pub fn pid_fd_ino(pid: u64, fd: u32) -> u64 {
     pid_dir_ino(pid) + 0x100 + fd as u64
 }
 
-/// Stable inode of the `/proc/<pid>/fdinfo/<fd>` regular file.
+/// Стабильный inode обычного файла `/proc/<pid>/fdinfo/<fd>`.
 ///
-/// Kept in a separate range from [`pid_fd_ino`]: the fd symlink and the fdinfo
-/// file are distinct directory entries with distinct inodes, as in Linux.
+/// Отдельный диапазон от [`pid_fd_ino`]: симлинк fd и файл fdinfo — разные записи
+/// каталога с разными inode, как в Linux.
 pub fn pid_fdinfo_ino(pid: u64, fd: u32) -> u64 {
     pid_dir_ino(pid) + 0x1000 + fd as u64
 }
 
-/// Offset of the `/proc/<pid>/task` directory within the pid's inode stride.
+/// Смещение каталога `/proc/<pid>/task` внутри inode-шага pid.
 ///
-/// Chosen below the fd symlink range (`+0x100`) and disjoint from the static
-/// file slots (`+1..=7`) and the fd/fdinfo directory offsets (`+0x10`, `+0x11`),
-/// so every entry below one pid directory keeps a unique, path-stable identity.
+/// Выбрано ниже диапазона симлинков fd (`+0x100`) и не пересекается ни со слотами
+/// статических файлов (`+1..=7`), ни со смещениями каталогов fd/fdinfo (`+0x10`,
+/// `+0x11`), поэтому каждая запись под одним pid-каталогом сохраняет уникальную,
+/// стабильную по пути идентичность.
 pub const PROC_PID_TASK_DIR_OFFSET: u64 = 0x30;
 
-/// Stable inode of the `/proc/<pid>/task` directory.
+/// Стабильный inode каталога `/proc/<pid>/task`.
 ///
-/// A thread's own directory `/proc/<tgid>/task/<tid>` is deliberately **not**
-/// given a new inode: it is the same VFS object as `/proc/<tid>`, exactly as in
-/// Linux, where one task has one inode reachable through both paths. That is why
-/// this module has no `pid_task_tid_ino` — the kernel-facing node layer resolves
-/// `<tid>` to the existing pid directory ([`pid_dir_ino`]), and the two paths
-/// stat identically.
+/// Собственный каталог треда `/proc/<tgid>/task/<tid>` намеренно **не** получает
+/// новый inode: это тот же VFS-объект, что `/proc/<tid>`, как в Linux, где у
+/// задачи один inode, достижимый обоими путями. Поэтому в модуле нет
+/// `pid_task_tid_ino` — ядро-ориентированный слой узлов резолвит `<tid>` в
+/// существующий pid-каталог ([`pid_dir_ino`]), и оба пути `stat` одинаково.
 pub fn pid_task_dir_ino(pid: u64) -> u64 {
     pid_dir_ino(pid) + PROC_PID_TASK_DIR_OFFSET
 }
 
-/// One file under `/proc/<pid>`: a static name, its inode slot, and its kind.
+/// Один файл под `/proc/<pid>`: статическое имя, слот inode и вид.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcPidEntry {
     pub name: &'static str,
@@ -334,7 +335,7 @@ pub struct ProcPidEntry {
     pub kind: ProcKind,
 }
 
-/// The files under every `/proc/<pid>` directory, in `readdir` order.
+/// Файлы каждого каталога `/proc/<pid>` в порядке `readdir`.
 pub const PROC_PID_FILES: [ProcPidEntry; 7] = [
     ProcPidEntry {
         name: "cmdline",
@@ -373,7 +374,7 @@ pub const PROC_PID_FILES: [ProcPidEntry; 7] = [
     },
 ];
 
-/// `readdir` order of `/proc/<pid>`.
+/// Порядок `readdir` для `/proc/<pid>`.
 pub const PROC_PID_ORDER: [&str; 7] = [
     "cmdline",
     "stat",
@@ -384,12 +385,12 @@ pub const PROC_PID_ORDER: [&str; 7] = [
     "limits",
 ];
 
-/// Look up a `/proc/<pid>` file by name.
+/// Ищет файл `/proc/<pid>` по имени.
 pub fn proc_pid_file(name: &str) -> Option<ProcPidEntry> {
     PROC_PID_FILES.iter().copied().find(|e| e.name == name)
 }
 
-/// Parse a `/proc` path component as a Linux pid.
+/// Разбирает компонент пути `/proc` как Linux pid.
 pub fn parse_pid_component(name: &str) -> Option<u64> {
     let bytes = name.as_bytes();
     if bytes.is_empty() || !bytes.iter().all(|b| b.is_ascii_digit()) {
@@ -402,35 +403,35 @@ pub fn parse_pid_component(name: &str) -> Option<u64> {
     Some(pid)
 }
 
-/// Look up a regular `/proc` file by name (`self`/`sys` are directories).
+/// Ищет обычный файл `/proc` по имени (`self`/`sys` — каталоги).
 pub fn proc_file(name: &str) -> Option<ProcEntry> {
     PROC_FILES.iter().copied().find(|e| e.name == name)
 }
 
-/// Look up a `/proc/self` file by name.
+/// Ищет файл `/proc/self` по имени.
 pub fn proc_self_file(name: &str) -> Option<ProcEntry> {
     PROC_SELF_FILES.iter().copied().find(|e| e.name == name)
 }
 
-/// Look up a `/proc/sys/kernel` file by name.
+/// Ищет файл `/proc/sys/kernel` по имени.
 pub fn proc_sys_file(name: &str) -> Option<ProcEntry> {
     PROC_SYS_FILES.iter().copied().find(|e| e.name == name)
 }
 
 // ─── /proc/meminfo ──────────────────────────────────────────────────────────
 
-/// Kernel-memory counters for `/proc/meminfo`, already in KiB.
+/// Счётчики памяти ядра для `/proc/meminfo`, уже в КиБ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemInfoKb {
     pub total_kb: u64,
     pub free_kb: u64,
 }
 
-/// Required `meminfo` keys, in order: `(label, value)`.
+/// Обязательные ключи `meminfo` по порядку: `(метка, значение)`.
 ///
-/// `MemAvailable` equals `MemFree` because this kernel has no page cache and no
-/// reclaimable slab: that is the honest number, not a placeholder
-/// (`docs/procfs.md` DEVIATION-3). Every other counter is a real zero.
+/// `MemAvailable` равно `MemFree`, потому что в этом ядре нет page cache и
+/// reclaimable slab: это честное число, а не заглушка (`docs/procfs.md`
+/// DEVIATION-3). Остальные счётчики — настоящие нули.
 fn meminfo_rows(m: &MemInfoKb) -> [(&'static str, u64); 18] {
     [
         ("MemTotal:", m.total_kb),
@@ -454,8 +455,9 @@ fn meminfo_rows(m: &MemInfoKb) -> [(&'static str, u64); 18] {
     ]
 }
 
-/// Render `/proc/meminfo`: `label` padded to 16 columns, value right-aligned in
-/// 8, then `" kB\n"` — byte-identical in shape to Linux `show_val_kb`.
+/// Рендерит `/proc/meminfo`: `label` дополняется до 16 колонок, значение
+/// выровнено вправо в 8, затем `" kB\n"` — байт-в-байт по форме как Linux
+/// `show_val_kb`.
 pub fn format_meminfo(m: &MemInfoKb) -> Vec<u8> {
     let mut out = Vec::with_capacity(1024);
     for (label, kb) in meminfo_rows(m) {
@@ -466,12 +468,11 @@ pub fn format_meminfo(m: &MemInfoKb) -> Vec<u8> {
 
 // ─── /proc/uptime ───────────────────────────────────────────────────────────
 
-/// Render `/proc/uptime`: `"<sec>.<centi> <idle_sec>.<idle_centi>\n"`.
+/// Рендерит `/proc/uptime`: `"<сек>.<сотые> <idle_сек>.<idle_сотые>\n"`.
 ///
-/// The idle field is `0.00`: this kernel does not account for idle time
-/// (`docs/procfs.md` DEVIATION-4) and printing a fabricated non-zero idle would
-/// be worse than printing the truth. Consumers (`libuv`, `uptime(1)`, `htop`)
-/// read the first field only.
+/// Поле idle — `0.00`: это ядро не учитывает простой (`docs/procfs.md`
+/// DEVIATION-4), и выдуманный ненулевой idle был бы хуже правды. Потребители
+/// (`libuv`, `uptime(1)`, `htop`) читают только первое поле.
 pub fn format_uptime(ticks: u64, tick_hz: u64) -> Vec<u8> {
     let hz = if tick_hz == 0 { 1 } else { tick_hz };
     let secs = ticks / hz;
@@ -481,31 +482,14 @@ pub fn format_uptime(ticks: u64, tick_hz: u64) -> Vec<u8> {
     out
 }
 
-// ─── /proc/version ──────────────────────────────────────────────────────────
+// ─── таблица монтирования ───────────────────────────────────────────────────
 
-/// Render `/proc/version`.
+/// Рендерит `/proc/*/mountinfo` (Linux-подмножество 36 полей mountinfo).
 ///
-/// pagh is not Linux, so this is **not** a fake Linux release string: the first
-/// word is the kernel name, the second is the real crate version
-/// (`env!("CARGO_PKG_VERSION")`, the same source as `/mnt/etc/pagh-release`),
-/// then the machine and the fixed build tag.
-///
-/// The trailing `#1 SMP` is the shape consumer scripts grep for; `#1` is this
-/// kernel's constant build number and `SMP` is part of the requested fixed tag —
-/// pagh is a **single-CPU** kernel and this line is not a claim of SMP support.
-/// The version is passed in rather than read here so the formatter stays pure and
-/// host-testable; the kernel-side node supplies the crate version.
-/// Format `/proc/mounts` / `/proc/self/mounts`.
-///
-/// Linux field order: `device mount_point fstype options dump pass`. pagh has no
-/// per-mount options and no separate block devices, so the device field is the
-/// mount point itself, options are `rw`, and dump/pass are `0 0`.
-/// Format `/proc/*/mountinfo` (Linux's 36-field mountinfo subset).
-///
-/// pagh has no separate block devices and no per-mount option strings, so the
-/// optional-fields section is empty (`-`), major:minor is `0:0`, root is `/`,
-/// and both options and super-options are `rw`. IDs are assigned in sorted
-/// mount-point order; the root is its own parent, everything else has parent 1.
+/// В pagh нет отдельных блочных устройств и строк опций на монтирование, поэтому
+/// секция необязательных полей пуста (`-`), major:minor — `0:0`, root — `/`, а
+/// опции и super-options — `rw`. ID назначаются в порядке сортировки точек
+/// монтирования; корень — родитель самому себе, у остальных родитель 1.
 pub fn format_mountinfo(mounts: &[(&str, &str)]) -> Vec<u8> {
     let mut out = Vec::new();
     for (index, (point, fs)) in mounts.iter().enumerate() {
@@ -519,6 +503,11 @@ pub fn format_mountinfo(mounts: &[(&str, &str)]) -> Vec<u8> {
     out
 }
 
+/// Рендерит `/proc/mounts` / `/proc/self/mounts`.
+///
+/// Порядок полей Linux: `device mount_point fstype options dump pass`. В pagh нет
+/// опций на монтирование и отдельных блочных устройств, поэтому device — сама
+/// точка монтирования, options — `rw`, dump/pass — `0 0`.
 pub fn format_mounts(mounts: &[(&str, &str)]) -> Vec<u8> {
     let mut out = Vec::new();
     for (point, fs) in mounts {
@@ -530,35 +519,37 @@ pub fn format_mounts(mounts: &[(&str, &str)]) -> Vec<u8> {
     out
 }
 
-/// `/proc/*/cgroup` — pagh runs every process in one root cgroup and implements
-/// no controllers. Linux's v2 format has one line per hierarchy: `0::/`.
+/// `/proc/*/cgroup` — pagh держит каждый процесс в одной корневой cgroup и не
+/// реализует контроллеров. В Linux v2 одна строка на иерархию: `0::/`.
 pub fn format_cgroup() -> Vec<u8> {
     Vec::from(&b"0::/\n"[..])
 }
 
 // ─── /proc/<pid>/fdinfo/<fd> ────────────────────────────────────────────────
 
-/// The real, kernel-owned fields of one open descriptor, as `/proc/.../fdinfo`
-/// reports them. `mnt_id`/`ino` are `0` for objects that have no VFS mount or
-/// VFS inode (pipes, sockets, event objects, stdio): this kernel's VFS defines
-/// `fs_ino() == 0` as "no real inode identity" and there is no mount behind
-/// those objects, so `0` is the honest sentinel rather than a fabricated id.
+/// Настоящие, принадлежащие ядру поля одного открытого дескриптора — как их
+/// показывает `/proc/.../fdinfo`. `mnt_id`/`ino` равны `0` у объектов без VFS-
+/// монтирования или VFS-inode (пайпы, сокеты, event-объекты, stdio): VFS этого
+/// ядра определяет `fs_ino() == 0` как «нет настоящей идентичности inode», а за
+/// такими объектами нет монтирования, поэтому `0` — честный сентинел, а не
+/// выдуманный id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FdInfo {
-    /// Current file position (`f_pos`); 0 for objects without one.
+    /// Текущая позиция файла (`f_pos`); 0 для объектов без неё.
     pub pos: u64,
-    /// Linux `f_flags`, including `O_CLOEXEC` when the descriptor carries it.
+    /// Linux `f_flags`, включая `O_CLOEXEC`, если дескриптор его несёт.
     pub flags: u64,
-    /// Mount id from the VFS mount table, or 0 when no mount backs the object.
+    /// Mount id из таблицы монтирования VFS, либо 0, если за объектом нет
+    /// монтирования.
     pub mnt_id: u64,
-    /// VFS inode number, or 0 when the object has no VFS inode.
+    /// Номер VFS-inode, либо 0, если у объекта нет VFS-inode.
     pub ino: u64,
 }
 
-/// Render `/proc/<pid>/fdinfo/<fd>` in Linux `fs/proc/fd.c` order.
+/// Рендерит `/proc/<pid>/fdinfo/<fd>` в порядке Linux `fs/proc/fd.c`.
 ///
-/// The leading `0` in `flags` is Linux's `0%o` format: the field is C-style
-/// octal, so `O_RDONLY` renders as `00` and `O_RDWR` as `02`.
+/// Ведущий `0` у `flags` — это Linux-формат `0%o`: поле в C-стиле восьмеричное,
+/// поэтому `O_RDONLY` рендерится как `00`, а `O_RDWR` — как `02`.
 pub fn format_fdinfo(i: &FdInfo) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
     push(
@@ -573,23 +564,23 @@ pub fn format_fdinfo(i: &FdInfo) -> Vec<u8> {
 
 // ─── /proc/<pid>/limits ─────────────────────────────────────────────────────
 
-/// Number of resource ids Linux defines (`RLIMIT_NLIMITS`); the rlimit table
-/// this kernel models is exactly this wide (`misc::RLIMIT_NLIMITS`).
+/// Число resource id, определённых в Linux (`RLIMIT_NLIMITS`); таблица rlimit
+/// этого ядра ровно такой ширины (`misc::RLIMIT_NLIMITS`).
 pub const RLIMIT_COUNT: usize = 16;
-/// Linux `RLIM_INFINITY`: the "no limit" value.
+/// Linux `RLIM_INFINITY`: значение «без предела».
 pub const RLIM_INFINITY: u64 = u64::MAX;
 
-/// One row of `/proc/<pid>/limits`: Linux's name and unit. `units: None` means
-/// the row has no unit column (Linux prints a trailing space instead).
+/// Одна строка `/proc/<pid>/limits`: имя и единица из Linux. `units: None`
+/// означает, что у строки нет колонки единицы (Linux печатает хвостовой пробел).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LimitRow {
     pub name: &'static str,
     pub units: Option<&'static str>,
 }
 
-/// Linux `RLIMIT_*` rows in resource-id order 0..15
-/// (`fs/proc/base.c::lnames`). The order is the ABI: `limits` is positional for
-/// scripts that compare it with `ulimit -a`.
+/// Строки Linux `RLIMIT_*` в порядке resource id 0..15
+/// (`fs/proc/base.c::lnames`). Порядок — это ABI: `limits` позиционен для
+/// скриптов, сравнивающих его с `ulimit -a`.
 pub const LIMIT_ROWS: [LimitRow; RLIMIT_COUNT] = [
     LimitRow {
         name: "Max cpu time",
@@ -657,7 +648,7 @@ pub const LIMIT_ROWS: [LimitRow; RLIMIT_COUNT] = [
     },
 ];
 
-/// `unlimited` or the decimal value, exactly as Linux prints it.
+/// `unlimited` или десятичное значение — ровно как печатает Linux.
 fn limit_value(value: u64) -> String {
     if value == RLIM_INFINITY {
         String::from("unlimited")
@@ -666,13 +657,13 @@ fn limit_value(value: u64) -> String {
     }
 }
 
-/// Render `/proc/<pid>/limits`.
+/// Рендерит `/proc/<pid>/limits`.
 ///
-/// Header and row widths are Linux's byte-for-byte
-/// (`fs/proc/base.c::proc_pid_limits`): name 25 + space, soft 20 + space, hard
-/// 20 + space, then a 10-wide unit. The header is 78 bytes including the five
-/// trailing spaces after `Units`; a unitless row ("Max nice priority") ends
-/// with the single separator space after the hard column, as in Linux.
+/// Ширины заголовка и строк — Linux байт-в-байт
+/// (`fs/proc/base.c::proc_pid_limits`): имя 25 + пробел, soft 20 + пробел, hard
+/// 20 + пробел, затем единица шириной 10. Заголовок — 78 байт, включая пять
+/// хвостовых пробелов после `Units`; строка без единицы ("Max nice priority")
+/// заканчивается одним разделяющим пробелом после колонки hard, как в Linux.
 pub fn format_limits(limits: &[(u64, u64); RLIMIT_COUNT]) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 * 80);
     out.extend_from_slice(
@@ -696,6 +687,21 @@ pub fn format_limits(limits: &[(u64, u64); RLIMIT_COUNT]) -> Vec<u8> {
     out
 }
 
+// ─── /proc/version ──────────────────────────────────────────────────────────
+
+/// Рендерит `/proc/version`.
+///
+/// pagh — не Linux, поэтому это **не** поддельная строка Linux-релиза: первое
+/// слово — имя ядра, второе — настоящая версия крейта
+/// (`env!("CARGO_PKG_VERSION")`, тот же источник, что `/mnt/etc/pagh-release`),
+/// затем машина и фиксированный build-тег.
+///
+/// Хвостовой `#1 SMP` — форма, которую grep-ят скрипты-потребители; `#1` —
+/// постоянный номер сборки этого ядра, а `SMP` — часть запрошенного
+/// фиксированного тега: pagh — **однопроцессорное** ядро, и эта строка не
+/// заявляет поддержку SMP. Версия передаётся аргументом, а не читается здесь,
+/// чтобы форматтер оставался чистым и host-тестируемым; ядро-сторона узла
+/// подставляет версию крейта.
 pub fn format_version(version: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 + version.len());
     push(&mut out, format_args!("pagh {} (x86_64) #1 SMP\n", version));
@@ -704,25 +710,26 @@ pub fn format_version(version: &str) -> Vec<u8> {
 
 // ─── /proc/filesystems ──────────────────────────────────────────────────────
 
-/// One `/proc/filesystems` row: a filesystem this build actually implements.
+/// Строка `/proc/filesystems`: ФС, которую эта сборка действительно реализует.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileSystemEntry {
-    /// Linux's `nodev` marker: the filesystem needs no block device.
+    /// Linux-маркер `nodev`: ФС не нужен блочный диск.
     pub nodev: bool,
-    /// The name Linux uses for the filesystem (not the Rust module name).
+    /// Имя ФС из Linux (не имя Rust-модуля).
     pub name: &'static str,
 }
 
-/// The filesystem drivers present in this build, in the documented order.
+/// Драйверы ФС, присутствующие в этой сборке, в задокументированном порядке.
 ///
-/// "Present" means **implemented and registered in the VFS**, not "mounted": Linux
-/// lists drivers here regardless of whether an instance is mounted. There is no
-/// runtime filesystem registry in pagh, so this table *is* the registry — adding or
-/// removing a driver must update it in the same commit (`docs/procfs.md` §4.10).
+/// «Присутствует» означает **реализован и зарегистрирован в VFS**, а не
+/// «смонтирован»: Linux листает драйверы здесь независимо от наличия
+/// смонтированного экземпляра. В pagh нет рантайм-реестра ФС, поэтому эта
+/// таблица *и есть* реестр — добавление или удаление драйвера обязано обновлять
+/// её в том же коммите (`docs/procfs.md` §4.10).
 ///
-/// * `proc` — `src/vfs/procfs.rs`, synthetic, no block device;
-/// * `ramfs` — `src/vfs/ramfs.rs`, in-memory `/tmp`, no block device;
-/// * `ext2` — `src/fs/ext2/`, the on-disk root mounted at `/mnt` when present.
+/// * `proc` — `src/vfs/procfs.rs`, синтетическая, без блочного устройства;
+/// * `ramfs` — `src/vfs/ramfs.rs`, in-memory `/tmp`, без блочного устройства;
+/// * `ext2` — `src/fs/ext2/`, on-disk корень, монтируемый в `/mnt` при наличии.
 pub const FILESYSTEMS: [FileSystemEntry; 3] = [
     FileSystemEntry {
         nodev: true,
@@ -738,13 +745,13 @@ pub const FILESYSTEMS: [FileSystemEntry; 3] = [
     },
 ];
 
-/// Render `/proc/filesystems`: `nodev\t<name>\n` for a device-less filesystem,
-/// `\t<name>\n` for one backed by a block device.
+/// Рендерит `/proc/filesystems`: `nodev\t<имя>\n` для ФС без устройства,
+/// `\t<имя>\n` для ФС с блочным устройством.
 ///
-/// The leading tab on a block-device row is Linux's exact layout (`seq_puts(m,
-/// "\text4\n")` without a `nodev` word); the parser everyone uses splits on
-/// whitespace, but the byte shape is fixed here so a future `mount -t` reader can
-/// rely on it.
+/// Ведущий таб в строке блочной ФС — точная раскладка Linux (`seq_puts(m,
+/// "\text4\n")` без слова `nodev`); все парсеры делят по пробельным символам,
+/// но байтовая форма зафиксирована здесь, чтобы будущий читатель `mount -t` мог
+/// на неё положиться.
 pub fn format_filesystems(entries: &[FileSystemEntry]) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 * entries.len());
     for e in entries {
@@ -761,39 +768,39 @@ pub fn format_filesystems(entries: &[FileSystemEntry]) -> Vec<u8> {
 
 // ─── /proc/loadavg ──────────────────────────────────────────────────────────
 
-/// `/proc/loadavg` inputs.
+/// Входы `/proc/loadavg`.
 ///
-/// The three load averages are not inputs because pagh has no load accounting:
-/// the formatter always emits `0.00 0.00 0.00`, the honest value. libuv's
-/// `uv_loadavg` falls back to `sysinfo(2)`, which is already implemented with
-/// `loads = [0; 3]` (`docs/procfs.md` §4.11), so nothing downstream is misled.
-/// The remaining fields are real: runnable and total are live scheduler counts,
-/// `last_pid` is the most recently allocated pid (`0` before the first
-/// allocation).
+/// Три средние нагрузки не входят во входы, потому что pagh не ведёт их учёт:
+/// форматтер всегда печатает `0.00 0.00 0.00` — честное значение. `uv_loadavg`
+/// из libuv откатывается к `sysinfo(2)`, который уже реализован с
+/// `loads = [0; 3]` (`docs/procfs.md` §4.11), так что ниже по потоку никто не
+/// обманут. Остальные поля настоящие: runnable и total — живые счётчики
+/// планировщика, `last_pid` — последний выданный pid (`0` до первой выдачи).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoadAvg {
-    /// 1-minute average in hundredths (`123` = `1.23`).
+    /// Средняя за 1 минуту в сотых (`123` = `1.23`).
     pub one: u32,
-    /// 5-minute average in hundredths.
+    /// Средняя за 5 минут в сотых.
     pub five: u32,
-    /// 15-minute average in hundredths.
+    /// Средняя за 15 минут в сотых.
     pub fifteen: u32,
-    /// Ready queue + the running task (idle excluded).
+    /// Очередь ready + выполняющаяся задача (idle исключён).
     pub runnable: u64,
-    /// Live tasks: runnable + parked/stopped (blocking waits stay runnable).
+    /// Живые задачи: runnable + parked/stopped (блокирующие ожидания остаются
+    /// runnable).
     pub total: u64,
-    /// Last pid handed out by the scheduler, or `0` if none was ever allocated.
+    /// Последний выданный планировщиком pid, либо `0`, если не выдавался.
     pub last_pid: u64,
 }
 
-/// Render `/proc/loadavg`:
-/// `"<1m> <5m> <15m> <runnable>/<total> <last_pid>\n"`, averages in hundredths.
+/// Рендерит `/proc/loadavg`:
+/// `"<1m> <5m> <15m> <runnable>/<total> <last_pid>\n"`, средние в сотых.
 ///
-/// Linux's fourth field is `runnable/total` where `total` is the number of
-/// threads. pagh has no blocked (uninterruptible) state and no sleeping-task
-/// list, so `total` is every live task in the scheduler's rotation states —
-/// runnable plus stopped. Task creation counters are deliberately not used: that
-/// would grow forever and is not a live count.
+/// Четвёртое поле Linux — `runnable/total`, где `total` — число тредов. В pagh
+/// нет состояния blocked (uninterruptible) и списка спящих задач, поэтому
+/// `total` — все живые задачи в состояниях ротации планировщика: runnable плюс
+/// stopped. Счётчики создания задач намеренно не используются: они росли бы
+/// вечно и не являются живым счётом.
 pub fn format_loadavg(l: &LoadAvg) -> Vec<u8> {
     let mut out = Vec::with_capacity(48);
     push(
@@ -816,31 +823,32 @@ pub fn format_loadavg(l: &LoadAvg) -> Vec<u8> {
 
 // ─── /proc/stat ─────────────────────────────────────────────────────────────
 
-/// Kernel tick and event counters behind `/proc/stat`, already in `USER_HZ`
-/// units (one tick = one unit; `USER_HZ == TICK_HZ == 1000`).
+/// Тиковые и событийные счётчики ядра за `/proc/stat`, уже в единицах `USER_HZ`
+/// (один тик = одна единица; `USER_HZ == TICK_HZ == 1000`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StatInputs {
-    /// Ring-3 ticks.
+    /// Тики ring 3.
     pub user: u64,
-    /// Ring-0 non-idle ticks.
+    /// Тики ring 0, не idle.
     pub system: u64,
-    /// Idle-task / `hlt` ticks.
+    /// Тики idle-задачи / `hlt`.
     pub idle: u64,
-    /// Context switches since boot.
+    /// Переключения контекста с момента загрузки.
     pub ctxt: u64,
-    /// Boot wall-clock time in Unix seconds, `0` when the RTC had no valid time.
+    /// Wall-clock время загрузки в Unix-секундах, `0`, если RTC не дал валидного
+    /// времени.
     pub btime: u64,
-    /// Tasks created since boot (Linux `total_forks` analogue).
+    /// Задачи, созданные с загрузки (аналог Linux `total_forks`).
     pub processes: u64,
-    /// Ready + running tasks (idle excluded).
+    /// Задачи ready + running (idle исключён).
     pub procs_running: u64,
-    /// Blocked tasks (this kernel has no blocked state: always `0`).
+    /// Заблокированные задачи (в этом ядре состояния blocked нет: всегда `0`).
     pub procs_blocked: u64,
 }
 
-/// Render `/proc/stat` for the single-CPU machine.
+/// Рендерит `/proc/stat` для однопроцессорной машины.
 ///
-/// Linux field order, exactly 10 numeric columns per CPU line:
+/// Порядок полей Linux, ровно 10 числовых колонок на строку CPU:
 ///
 /// ```text
 /// cpu  user nice system idle iowait irq softirq steal guest guest_nice
@@ -852,17 +860,17 @@ pub struct StatInputs {
 /// procs_blocked …
 /// ```
 ///
-/// `nice`, `iowait`, `irq`, `softirq`, `steal`, `guest` and `guest_nice` are
-/// real zeros: this kernel does not account for them, and inventing values
-/// would be worse than saying nothing. For the same reason the `intr` and
-/// `softirq` lines are omitted — there is no per-IRQ counter to fill them
-/// truthfully (`docs/procfs.md` §4.8, DEVIATION-15).
+/// `nice`, `iowait`, `irq`, `softirq`, `steal`, `guest` и `guest_nice` — настоящие
+/// нули: ядро их не учитывает, а выдуманные значения были бы хуже молчания. По
+/// той же причине опущены строки `intr` и `softirq`: нет per-IRQ счётчика, чтобы
+/// заполнить их правдиво (`docs/procfs.md` §4.8, DEVIATION-15).
 ///
-/// The aggregate `cpu` line has **two** spaces after the label: Linux writes
-/// `"cpu "` and then each value prefixed by one space (`show_val`), while the
-/// per-CPU `cpu0` line writes the label without a trailing space. libuv's
-/// `uv_cpu_info` discards the first line, then parses `cpu%u` + six numbers,
-/// so the `cpu0` line is what makes Node's `os.cpus()` work on a one-CPU box.
+/// У агрегатной строки `cpu` **два** пробела после метки: Linux пишет `"cpu "`, а
+/// затем каждое значение с одним пробелом перед ним (`show_val`), тогда как
+/// per-CPU строка `cpu0` пишет метку без хвостового пробела. `uv_cpu_info` из
+/// libuv отбрасывает первую строку и разбирает `cpu%u` + шесть чисел, поэтому
+/// именно строка `cpu0` заставляет `os.cpus()` в Node работать на однопроцессорной
+/// машине.
 pub fn format_stat(s: &StatInputs) -> Vec<u8> {
     let mut out = Vec::with_capacity(256);
     push(
@@ -889,23 +897,23 @@ pub fn format_stat(s: &StatInputs) -> Vec<u8> {
 
 // ─── /proc/sys/kernel ───────────────────────────────────────────────────────
 
-/// `/proc/sys/kernel/ostype`: the kernel's own name, not Linux's.
+/// `/proc/sys/kernel/ostype`: собственное имя ядра, не Linux.
 ///
-/// Linux answers `Linux\n` here because it reads `init_uts_ns.name.sysname`.
-/// pagh's `uname(2)` reports `Linux` for compatibility, but the procfs contract
-/// asks for this kernel's identity, so the value is `Pagh` — the same name the
-/// project uses (`docs/procfs.md` §4.12).
+/// Linux отвечает здесь `Linux\n`, потому что читает `init_uts_ns.name.sysname`.
+/// `uname(2)` в pagh ради совместимости сообщает `Linux`, но контракт procfs
+/// требует идентичность этого ядра, поэтому значение — `Pagh`, то же имя, что
+/// использует проект (`docs/procfs.md` §4.12).
 pub const KERNEL_OSTYPE: &str = "Pagh";
 
-/// `/proc/sys/kernel/hostname`: the nodename `uname(2)` reports.
+/// `/proc/sys/kernel/hostname`: nodename, который сообщает `uname(2)`.
 ///
-/// There is no hostname variable and no `sethostname(2)` in pagh;
-/// `sys_uname` hard-codes `pagh`, so this file mirrors that constant and is
-/// therefore always writable-looking but static. A future hostname facility must
-/// update both call sites (`src/arch/x86_64/linux/misc.rs` and here).
+/// В pagh нет переменной hostname и нет `sethostname(2)`; `sys_uname` жёстко
+/// возвращает `pagh`, поэтому файл зеркалит эту константу и всегда выглядит
+/// записываемым, оставаясь статическим. Будущая поддержка hostname обязана
+/// обновить оба места (`src/arch/x86_64/linux/misc.rs` и здесь).
 pub const KERNEL_HOSTNAME: &str = "pagh";
 
-/// Render `/proc/sys/kernel/ostype`: `"Pagh\n"`.
+/// Рендерит `/proc/sys/kernel/ostype`: `"Pagh\n"`.
 pub fn format_sys_ostype() -> Vec<u8> {
     let mut out = Vec::with_capacity(KERNEL_OSTYPE.len() + 1);
     out.extend_from_slice(KERNEL_OSTYPE.as_bytes());
@@ -913,11 +921,12 @@ pub fn format_sys_ostype() -> Vec<u8> {
     out
 }
 
-/// Render `/proc/sys/kernel/osrelease`: the real crate version plus a newline.
+/// Рендерит `/proc/sys/kernel/osrelease`: настоящая версия крейта плюс перевод
+/// строки.
 ///
-/// This is the same `env!("CARGO_PKG_VERSION")` that `/proc/version` embeds and
-/// that `provision.rs` writes to `/mnt/etc/pagh-release`; it is passed in so the
-/// formatter stays host-testable.
+/// Это тот же `env!("CARGO_PKG_VERSION")`, который встраивает `/proc/version` и
+/// который `provision.rs` пишет в `/mnt/etc/pagh-release`; версия передаётся
+/// сюда, чтобы форматтер оставался host-тестируемым.
 pub fn format_sys_osrelease(version: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(version.len() + 1);
     out.extend_from_slice(version.as_bytes());
@@ -925,7 +934,7 @@ pub fn format_sys_osrelease(version: &str) -> Vec<u8> {
     out
 }
 
-/// Render `/proc/sys/kernel/hostname`: `KERNEL_HOSTNAME` plus a newline.
+/// Рендерит `/proc/sys/kernel/hostname`: `KERNEL_HOSTNAME` плюс перевод строки.
 pub fn format_sys_hostname() -> Vec<u8> {
     let mut out = Vec::with_capacity(KERNEL_HOSTNAME.len() + 1);
     out.extend_from_slice(KERNEL_HOSTNAME.as_bytes());
@@ -935,7 +944,7 @@ pub fn format_sys_hostname() -> Vec<u8> {
 
 // ─── /proc/cpuinfo ──────────────────────────────────────────────────────────
 
-/// Which CPUID word a feature flag lives in.
+/// В каком CPUID-слове живёт флаг возможности.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlagWord {
     /// `CPUID.01h:EDX`.
@@ -952,12 +961,12 @@ pub enum FlagWord {
     Leaf81Ecx,
 }
 
-/// `(name, word, bit)` for every flag this kernel is willing to advertise.
+/// `(имя, слово, бит)` для каждого флага, который ядро готово рекламировать.
 ///
-/// The names are the Linux `flags` vocabulary; a name is emitted **iff** its
-/// CPUID bit is set, so the file can never claim a feature the CPU lacks
-/// (property P52). `rdrand`/`rdseed` are included deliberately: they are the
-/// userland-visible basis of the entropy source (issue #16).
+/// Имена — словарь Linux `flags`; имя выдаётся **тогда и только тогда**, когда
+/// выставлен его CPUID-бит, поэтому файл не может заявить отсутствующую у CPU
+/// возможность (свойство P52). `rdrand`/`rdseed` включены намеренно: это видимая
+/// юзерленду основа источника энтропии.
 pub const CPU_FLAG_TABLE: &[(&str, FlagWord, u8)] = &[
     ("fpu", FlagWord::Leaf1Edx, 0),
     ("vme", FlagWord::Leaf1Edx, 1),
@@ -1022,7 +1031,7 @@ pub const CPU_FLAG_TABLE: &[(&str, FlagWord, u8)] = &[
     ("ospke", FlagWord::Leaf7Ecx, 4),
 ];
 
-/// Flags for a decoded CPUID word set, in table order.
+/// Флаги для набора расшифрованных CPUID-слов в порядке таблицы.
 pub fn cpu_flags(c: &CpuInfoData) -> Vec<&'static str> {
     let mut out = Vec::new();
     for (name, word, bit) in CPU_FLAG_TABLE.iter().copied() {
@@ -1041,26 +1050,25 @@ pub fn cpu_flags(c: &CpuInfoData) -> Vec<&'static str> {
     out
 }
 
-/// One CPU's decoded CPUID data (the input side of `/proc/cpuinfo`).
+/// Расшифрованные CPUID-данные одного CPU (вход `/proc/cpuinfo`).
 ///
-/// `Option` fields are the ones that only exist on some CPUs: the frequency leaf
-/// (`CPUID.16h`) and the cache descriptor (`CPUID.80000006h`). Absent means the
-/// line is omitted rather than filled with an invented number
-/// (`docs/procfs.md` §4.2).
+/// `Option`-поля есть только у части CPU: лист частоты (`CPUID.16h`) и дескриптор
+/// кэша (`CPUID.80000006h`). Отсутствие означает, что строка опускается, а не
+/// заполняется выдуманным числом (`docs/procfs.md` §4.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CpuInfoData {
-    /// `CPUID.00h` EBX/EDX/ECX, 12 ASCII bytes.
+    /// `CPUID.00h` EBX/EDX/ECX, 12 ASCII-байт.
     pub vendor: [u8; 12],
-    /// `CPUID.80000002h..80000004h`, 48 ASCII bytes (may be all-NUL).
+    /// `CPUID.80000002h..80000004h`, 48 ASCII-байт (могут быть все NUL).
     pub brand: [u8; 48],
     pub family: u32,
     pub model: u32,
     pub stepping: u32,
-    /// `CPUID.00h` EAX — the highest basic leaf.
+    /// `CPUID.00h` EAX — старший базовый лист.
     pub max_basic: u32,
-    /// `CPUID.80000006h` ECX[31:16], KiB.
+    /// `CPUID.80000006h` ECX[31:16], КиБ.
     pub cache_kb: Option<u32>,
-    /// `CPUID.16h` EAX, MHz.
+    /// `CPUID.16h` EAX, МГц.
     pub mhz: Option<u32>,
     pub phys_bits: u8,
     pub virt_bits: u8,
@@ -1095,11 +1103,12 @@ impl Default for CpuInfoData {
     }
 }
 
-/// The literal emitted when the brand string is empty or all-NUL: never invent a
-/// model name, but keep the key present (`docs/procfs.md` §4.2).
+/// Литерал, выдаваемый при пустой или полностью NUL-строке brand: не выдумывать
+/// имя модели, но сохранить ключ (`docs/procfs.md` §4.2).
 pub const UNKNOWN_MODEL: &str = "Unknown x86_64 CPU";
 
-/// Trim a NUL-padded ASCII field, collapsing inner whitespace runs to one space.
+/// Обрезает ASCII-поле с NUL-добивкой, схлопывая внутренние пробельные серии в
+/// один пробел.
 fn clean_ascii(raw: &[u8]) -> alloc::string::String {
     let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
     let mut out = String::new();
@@ -1123,8 +1132,8 @@ fn clean_ascii(raw: &[u8]) -> alloc::string::String {
     out
 }
 
-/// Render `/proc/cpuinfo`: one block per entry in `cpus`, each terminated by a
-/// blank line, with the exact `\t: ` separators libuv's parser expects.
+/// Рендерит `/proc/cpuinfo`: по блоку на запись `cpus`, каждый завершается пустой
+/// строкой, с ровно теми разделителями `\t: `, которых ждёт парсер libuv.
 pub fn format_cpuinfo(cpus: &[CpuInfoData]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1024);
     for (i, c) in cpus.iter().enumerate() {
@@ -1194,18 +1203,19 @@ pub fn format_cpuinfo(cpus: &[CpuInfoData]) -> Vec<u8> {
 
 // ─── /proc/self/cmdline ─────────────────────────────────────────────────────
 
-/// Upper bound for the `/proc/self/cmdline` **payload** (the summed argument
-/// bytes), matching the initial-stack argument gate
-/// (`src/task/stack.rs::arg_gate`, 4096 combined argv bytes). The NUL
-/// terminators are not charged against it, so the largest argv the gate admits is
-/// still fully representable; the rendered file is at most `cap + argc` bytes.
+/// Верхняя граница **payload** `/proc/self/cmdline` (суммарные байты аргументов),
+/// совпадающая с гейтом аргументов начального стека
+/// (`src/task/stack.rs::arg_gate`, 4096 суммарных байт argv). NUL-терминаторы в
+/// неё не входят, поэтому максимальный argv, который пропускает гейт, всё ещё
+/// представим целиком; рендер занимает не больше `cap + argc` байт.
 pub const CMDLINE_CAP: usize = 4096;
 
-/// Render `/proc/self/cmdline`: every argument followed by NUL, nothing else.
+/// Рендерит `/proc/self/cmdline`: каждый аргумент с NUL после него, больше
+/// ничего.
 ///
-/// An argument is never cut in half: once `cap` would be exceeded, that argument
-/// and all following ones are dropped (`docs/procfs.md` §4.4). An empty `argv`
-/// therefore renders an empty file, exactly like Linux.
+/// Аргумент никогда не режется пополам: как только `cap` был бы превышен, этот
+/// аргумент и все следующие отбрасываются (`docs/procfs.md` §4.4). Пустой
+/// `argv` поэтому рендерит пустой файл, как в Linux.
 pub fn format_cmdline(argv: &[&[u8]], cap: usize) -> Vec<u8> {
     let mut out = Vec::new();
     let mut payload = 0usize;
@@ -1222,14 +1232,14 @@ pub fn format_cmdline(argv: &[&[u8]], cap: usize) -> Vec<u8> {
 
 // ─── /proc/self/status ──────────────────────────────────────────────────────
 
-/// `TASK_COMM_LEN - 1`, the Linux limit for the `Name:` field.
+/// `TASK_COMM_LEN - 1` — Linux-предел для поля `Name:`.
 pub const TASK_NAME_MAX: usize = 15;
 
-/// Linux task name: the basename of the loaded image (not `argv[0]`).
+/// Linux-имя задачи: basename загруженного образа (не `argv[0]`).
 ///
-/// Falls back to the basename of `argv0` when no image path is known, then to
-/// `pagh`. Truncation is by bytes (as in Linux), so a non-UTF-8 argument passes
-/// through unchanged.
+/// Откат к basename `argv0`, когда путь образа неизвестен, затем к `pagh`.
+/// Усечение побайтное (как в Linux), поэтому не-UTF-8 аргумент проходит без
+/// изменений.
 pub fn task_name(exe_path: &str, argv0: &[u8]) -> Vec<u8> {
     fn basename(bytes: &[u8]) -> &[u8] {
         match bytes.iter().rposition(|b| *b == b'/') {
@@ -1250,7 +1260,7 @@ pub fn task_name(exe_path: &str, argv0: &[u8]) -> Vec<u8> {
     base[..core::cmp::min(base.len(), TASK_NAME_MAX)].to_vec()
 }
 
-/// `/proc/self/status` inputs, all plain scalars.
+/// Входы `/proc/self/status`, всё простые скаляры.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VmKb {
     pub size: u64,
@@ -1261,13 +1271,13 @@ pub struct VmKb {
     pub lib: u64,
 }
 
-/// `/proc/self/status` inputs.
+/// Входы `/proc/self/status`.
 #[derive(Clone, Copy, Debug)]
 pub struct StatusInputs<'a> {
-    /// Task name (≤ 15 bytes, raw bytes on purpose).
+    /// Имя задачи (≤ 15 байт, намеренно сырые байты).
     pub name: &'a [u8],
-    /// Linux state letter: `R` running, `T` stopped (the two this kernel can
-    /// truthfully distinguish).
+    /// Буква состояния Linux: `R` running, `T` stopped (две, которые это ядро
+    /// может честно различить).
     pub state: u8,
     pub umask: u32,
     pub pid: u64,
@@ -1277,24 +1287,23 @@ pub struct StatusInputs<'a> {
     pub fd_size: u64,
     pub sig_pending: u64,
     pub sig_blocked: u64,
-    /// Signals with `SIG_IGN` disposition.
+    /// Сигналы с диспозицией `SIG_IGN`.
     pub sig_ign: u64,
-    /// Signals with a user handler installed.
+    /// Сигналы с установленным пользовательским обработчиком.
     pub sig_cgt: u64,
-    /// `[real, effective, saved, filesystem]` user ids. pagh has no separate
-    /// fsuid, so the fourth entry is the effective id.
+    /// Пользовательские id `[real, effective, saved, filesystem]`. В pagh нет
+    /// отдельного fsuid, поэтому четвёртая запись — effective id.
     pub uids: [u32; 4],
-    /// `[real, effective, saved, filesystem]` group ids.
+    /// Групповые id `[real, effective, saved, filesystem]`.
     pub gids: [u32; 4],
     pub vm: VmKb,
 }
 
-/// Long-form description of a Linux task-state letter for the `State:` line.
+/// Длинное описание Linux-буквы состояния для строки `State:`.
 ///
-/// Only `R` and `T` are ever produced by this kernel (task 4 of the procfs
-/// slice: there is no sleeping/blocked task bookkeeping and zombies are removed
-/// from the compat registry at exit). The remaining Linux letters are mapped
-/// too so a future producer cannot silently emit "unknown".
+/// Это ядро выдаёт только `R` и `T` (учёта спящих/блокированных задач нет,
+/// зомби удаляются из реестра compat при выходе). Остальные Linux-буквы тоже
+/// отображены, чтобы будущий источник не выдал молча «unknown».
 pub fn state_word(state: u8) -> &'static str {
     match state {
         b'R' => "running",
@@ -1309,11 +1318,11 @@ pub fn state_word(state: u8) -> &'static str {
     }
 }
 
-/// Render `/proc/self/status`.
+/// Рендерит `/proc/self/status`.
 ///
-/// Field order and separators follow Linux `fs/proc/array.c`. Capabilities are
-/// reported as zero: this kernel has no capability model and claiming the root
-/// set for a model that is not enforced would be a lie (`docs/procfs.md` §4.5).
+/// Порядок полей и разделители — как в Linux `fs/proc/array.c`. Capabilities
+/// нулевые: в этом ядре нет модели capability, и заявлять root-набор для
+/// необеспечиваемой модели было бы ложью (`docs/procfs.md` §4.5).
 pub fn format_status(s: &StatusInputs<'_>) -> Vec<u8> {
     let vm = s.vm;
     let mut out = Vec::with_capacity(1024);
@@ -1376,48 +1385,50 @@ pub fn format_status(s: &StatusInputs<'_>) -> Vec<u8> {
     out
 }
 
-// ─── /proc/<pid>/stat and /proc/self/statm ──────────────────────────────────
+// ─── /proc/<pid>/stat и /proc/self/statm ────────────────────────────────────
 
-/// `/proc/<pid>/stat` inputs.
+/// Входы `/proc/<pid>/stat`.
 ///
-/// The line has 52 Linux fields; the ones this kernel can answer truthfully come
-/// from the target's `CompatState` snapshot, and the rest are the documented
-/// "not tracked" zeros (see the renderer). Keeping the full Linux width means
-/// `ps`/`procps` can index the fields it cares about (18 priority, 20 threads,
-/// 22 starttime, 23 vsize, 24 rss, 39 processor, …) without falling off the end.
+/// В строке 52 поля Linux; те, на которые это ядро может ответить правдиво,
+/// берутся из снимка `CompatState` цели, остальные — задокументированные нули
+/// «не учитывается» (см. рендерер). Полная Linux-ширина нужна, чтобы
+/// `ps`/`procps` индексировали нужные поля (18 priority, 20 threads, 22
+/// starttime, 23 vsize, 24 rss, 39 processor, …) и не выпадали за конец.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PidStatInputs<'a> {
-    /// Task name (raw bytes; capped and sanitized by [`stat_comm`]).
+    /// Имя задачи (сырые байты; обрезается и санитизируется [`stat_comm`]).
     pub name: &'a [u8],
     pub pid: u64,
-    /// Linux state letter (`R` or `T` here).
+    /// Буква состояния Linux (здесь `R` или `T`).
     pub state: u8,
     pub ppid: u64,
-    /// Process group id. pagh has one group per thread group, so this is `tgid`.
+    /// Id группы процессов. В pagh одна группа на группу тредов, поэтому это
+    /// `tgid`.
     pub pgrp: u64,
-    /// Session id; pagh has no sessions, so this is `tgid` too.
+    /// Id сессии; сессий в pagh нет, поэтому это тоже `tgid`.
     pub session: u64,
     pub threads: u64,
     pub sig_blocked: u64,
     pub sig_ign: u64,
     pub sig_cgt: u64,
     pub vm: VmKb,
-    /// Current program break (field 47, `start_brk`).
+    /// Текущий program break (поле 47, `start_brk`).
     pub start_brk: u64,
-    /// Lowest address of the mapped user stack (field 28, `startstack`).
+    /// Младший адрес замапленного пользовательского стека (поле 28,
+    /// `startstack`).
     pub startstack: u64,
-    /// Field 52, `exit_code`: 0 until the process exits (a zombie is already gone
-    /// from the compat registry in this kernel, so it is always 0 in practice).
+    /// Поле 52, `exit_code`: 0 до выхода процесса (зомби в этом ядре уже удалён
+    /// из реестра compat, поэтому на практике всегда 0).
     pub exit_code: i64,
 }
 
-/// Sanitize a task name for the parenthesised `comm` field of `/proc/<pid>/stat`.
+/// Санитизирует имя задачи для поля `comm` в скобках `/proc/<pid>/stat`.
 ///
-/// Linux emits the raw 15-byte `comm`; this renderer additionally folds NUL,
-/// CR/LF and `)` to visible ASCII (`)` becomes `]`) so a filename that a user
-/// happened to create can neither split the line nor confuse the conventional
-/// "find the LAST `)`" parse used by `ps`/`procps`. Truncation is by bytes at
-/// Linux's `TASK_COMM_LEN - 1`.
+/// Linux выдаёт сырые 15 байт `comm`; этот рендерер дополнительно сводит NUL,
+/// CR/LF и `)` к видимому ASCII (`)` становится `]`), чтобы имя файла,
+/// случайно созданное пользователем, не разорвало строку и не сбило
+/// традиционный разбор «найти ПОСЛЕДНЮЮ `)`» в `ps`/`procps`. Усечение побайтное
+/// по Linux-пределу `TASK_COMM_LEN - 1`.
 pub fn stat_comm(name: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = name
         .iter()
@@ -1434,19 +1445,19 @@ pub fn stat_comm(name: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Render `/proc/<pid>/stat` (and `/proc/self/stat`): Linux's 52-field line.
+/// Рендерит `/proc/<pid>/stat` (и `/proc/self/stat`): Linux-строка из 52 полей.
 ///
-/// Fields the kernel does not account for are emitted as 0 rather than invented
-/// (`utime`/`stime`/`cutime`/`cstime`, page-fault counters, `starttime`, the
-/// signal bitmap, code/data segment addresses and `arg/env` bounds). `vsize` is
-/// KiB → bytes and `rss` is KiB → 4 KiB pages, both derived from the same
-/// [`VmKb`] snapshot as `/proc/<pid>/status`, so the two files agree.
-/// `rsslim` is Linux's `RLIM_INFINITY` (all ones), `exit_signal` is `SIGCHLD`.
+/// Поля, которые ядро не учитывает, выдаются нулями, а не выдумываются
+/// (`utime`/`stime`/`cutime`/`cstime`, счётчики page fault, `starttime`, битмап
+/// сигналов, адреса code/data-сегментов и границы `arg/env`). `vsize` — КиБ →
+/// байты, `rss` — КиБ → страницы 4 КиБ, оба из того же снимка [`VmKb`], что и
+/// `/proc/<pid>/status`, поэтому файлы согласованы. `rsslim` — Linux
+/// `RLIM_INFINITY` (все единицы), `exit_signal` — `SIGCHLD`.
 pub fn format_pid_stat(s: &PidStatInputs<'_>) -> Vec<u8> {
     let comm = stat_comm(s.name);
     let mut out = Vec::with_capacity(384);
 
-    // Fields 1–9: pid, comm, state, ppid, pgrp, session, tty_nr, tpgid, flags.
+    // Поля 1–9: pid, comm, state, ppid, pgrp, session, tty_nr, tpgid, flags.
     push(&mut out, format_args!("{} (", s.pid));
     out.extend_from_slice(&comm);
     push(
@@ -1457,11 +1468,11 @@ pub fn format_pid_stat(s: &PidStatInputs<'_>) -> Vec<u8> {
         ),
     );
 
-    // Fields 10–17: minflt, cminflt, majflt, cmajflt, utime, stime, cutime,
-    // cstime — no per-process CPU/fault accounting exists.
+    // Поля 10–17: minflt, cminflt, majflt, cmajflt, utime, stime, cutime,
+    // cstime — per-process учёта CPU/fault не существует.
     out.extend_from_slice(b" 0 0 0 0 0 0 0 0");
 
-    // Fields 18–52: priority, nice, threads, itrealvalue, starttime, vsize,
+    // Поля 18–52: priority, nice, threads, itrealvalue, starttime, vsize,
     // rss, rsslim, startcode, endcode, startstack, kstkesp, kstkeip, signal,
     // blocked, sigignore, sigcatch, wchan, nswap, cnswap, exit_signal,
     // processor, rt_priority, policy, delayacct_blkio_ticks, guest_time,
@@ -1486,12 +1497,13 @@ pub fn format_pid_stat(s: &PidStatInputs<'_>) -> Vec<u8> {
     out
 }
 
-/// Render `/proc/self/statm`: `size resident shared text lib data dt` in pages.
+/// Рендерит `/proc/self/statm`: `size resident shared text lib data dt` в
+/// страницах.
 ///
-/// `shared` and `dt` are real zeros (no shared-memory accounting). `lib` is 0 in
-/// practice because `VmKb::lib` is 0 (interpreter segments are folded into
-/// `exe`). `size`/`resident`/`text`/`data` are the same KiB values as
-/// `/proc/<pid>/status`, divided by the 4 KiB page size.
+/// `shared` и `dt` — настоящие нули (учёта разделяемой памяти нет). `lib` на
+/// практике 0, потому что `VmKb::lib` равен 0 (сегменты интерпретатора сложены в
+/// `exe`). `size`/`resident`/`text`/`data` — те же КиБ, что в
+/// `/proc/<pid>/status`, делённые на размер страницы 4 КиБ.
 pub fn format_statm(vm: &VmKb) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
     push(
@@ -1510,41 +1522,41 @@ pub fn format_statm(vm: &VmKb) -> Vec<u8> {
 
 // ─── /proc/self/maps ────────────────────────────────────────────────────────
 
-/// `mmap`/`mprotect` protection bit: readable (same value as `linux::mem`).
+/// Бит защиты `mmap`/`mprotect`: чтение (то же значение, что в `linux::mem`).
 pub const PROT_READ: u32 = 1;
-/// `mmap`/`mprotect` protection bit: writable.
+/// Бит защиты `mmap`/`mprotect`: запись.
 pub const PROT_WRITE: u32 = 2;
-/// `mmap`/`mprotect` protection bit: executable.
+/// Бит защиты `mmap`/`mprotect`: исполнение.
 pub const PROT_EXEC: u32 = 4;
 
-/// One `/proc/self/maps` line's worth of region data.
+/// Данные региона на одну строку `/proc/self/maps`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MapsRegion<'a> {
     pub start: u64,
     pub end: u64,
-    /// Linux `PROT_*` bits.
+    /// Биты Linux `PROT_*`.
     pub prot: u32,
     pub file_offset: u64,
     pub dev_major: u8,
     pub dev_minor: u8,
     pub ino: u64,
-    /// Pathname column: an absolute path, or a bracketed label like `[stack]`.
+    /// Колонка pathname: абсолютный путь или метка в скобках вроде `[stack]`.
     pub path: Option<&'a str>,
 }
 
-/// Render `/proc/self/maps`.
+/// Рендерит `/proc/self/maps`.
 ///
-/// Lines are sorted by start address and overlapping inputs are coalesced, so the
-/// output is always parseable by tools that binary-search the range list
-/// (sanitizers, `addr2line`). A region without a pathname gets **no** trailing
-/// space, matching Linux's anonymous mappings.
+/// Строки сортируются по начальному адресу, перекрывающиеся входы объединяются,
+/// поэтому вывод всегда разбираем инструментами, бинарно ищущими по списку
+/// диапазонов (санитайзеры, `addr2line`). Регион без pathname получает **без**
+/// хвостового пробела — как анонимные маппинги Linux.
 pub fn format_maps(regions: &[MapsRegion<'_>]) -> Vec<u8> {
     let mut sorted: Vec<MapsRegion<'_>> = regions.to_vec();
     sorted.sort_by_key(|r| (r.start, r.end));
 
-    // Coalesce overlapping ranges: keep the first (lowest-start) name and take
-    // the union of protections. Addresses are non-overlapping in a real address
-    // space, so this only guards malformed input.
+    // Объединяем перекрывающиеся диапазоны: сохраняем первое (с младшим стартом)
+    // имя и берём объединение защит. В настоящем адресном пространстве адреса не
+    // перекрываются, так что это страховка от испорченного входа.
     let mut merged: Vec<MapsRegion<'_>> = Vec::with_capacity(sorted.len());
     for r in sorted {
         if let Some(last) = merged.last_mut() {
@@ -1577,7 +1589,7 @@ pub fn format_maps(regions: &[MapsRegion<'_>]) -> Vec<u8> {
     out
 }
 
-/// Format `dev_t`-style `major:minor` bytes for a maps line (hex, 2 digits each).
+/// Формирует `dev_t`-байты `major:minor` для строки maps (hex, по 2 цифры).
 pub fn dev_bytes(dev: u64) -> (u8, u8) {
     let major = ((dev >> 8) & 0xfff) as u8;
     let minor = ((dev & 0xff) | ((dev >> 12) & 0xfff00)) as u8;

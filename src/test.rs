@@ -1,13 +1,13 @@
-// test.rs — Kernel test suite (runs inside QEMU)
-// 64-bit x86_64 OS kernel in Rust (#![no_std])
+// test.rs — набор тестов ядра (работает внутри QEMU)
+// 64-битное ядро ОС x86_64 на Rust (#![no_std])
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// Failed checks since the last [`reset_failures`].
+/// Число упавших проверок с последнего [`reset_failures`].
 ///
-/// `assert_kernel!` cannot unwind, so this counter is the only way `run_all`
-/// learns whether a routine was clean. Printing `ok` unconditionally is how P21
-/// stayed red while looking green.
+/// `assert_kernel!` не умеет unwind, так что этот счётчик — единственный способ,
+/// которым `run_all` узнаёт, была ли процедура чистой. Безусловная печать `ok` —
+/// это то, из-за чего P21 оставался красным, выглядя зелёным.
 static FAILED_CHECKS: AtomicU32 = AtomicU32::new(0);
 
 pub fn reset_failures() {
@@ -20,15 +20,15 @@ pub fn failed_checks() -> u32 {
     FAILED_CHECKS.load(Ordering::Relaxed)
 }
 
-/// Checks the current routine did NOT execute because the environment could not
-/// support them (no block device, a starved frame pool, …).
+/// Проверки текущей процедуры, которые НЕ выполнились, потому что среда их не
+/// поддержала (нет блочного устройства, голодный пул кадров, …).
 ///
-/// A skip is **never** a success: before this counter existed a routine that
-/// could not run printed `ok`, so `SELFTEST SUMMARY: … 0 failed checks` looked
-/// green while part of the suite had not happened at all.
+/// Пропуск **никогда** не успех: до появления этого счётчика процедура, которая
+/// не могла выполниться, печатала `ok`, так что `SELFTEST SUMMARY: … 0 failed
+/// checks` выглядел зелёным, хотя часть набора вообще не произошла.
 static SKIPPED_CHECKS: AtomicU32 = AtomicU32::new(0);
 
-/// Per-reason skip counts of the routine currently running (`reason -> count`).
+/// Счётчики пропусков по причинам для текущей работающей процедуры (`reason -> count`).
 static SKIP_REASONS: crate::sync::spinlock::Spinlock<
     alloc::collections::BTreeMap<&'static str, u32>,
 > = crate::sync::spinlock::Spinlock::new(alloc::collections::BTreeMap::new());
@@ -1838,10 +1838,13 @@ mod vfs_tests {
 }
 
 // ============================================================================
-// procfs: the synthetic /proc (issue #11, contract docs/procfs.md)
+// ============================================================================
+// procfs: синтетический /proc (issue #11, контракт docs/procfs.md)
 // ============================================================================
 //
-// Read-only by construction: `lookup_path` / `readdir` / `read` / `size` only.
+// Read-only по построению: только `lookup_path` / `readdir` / `read` / `size`.
+// Ничто здесь не открывает дескриптор, не ставит `CompatState`, не трогает PMM или
+// IF и не мутирует VFS, так что процедура неразрушающая (AGENTS.md инвариант 8)
 // Nothing here opens a descriptor, installs `CompatState`, touches the PMM or IF,
 // or mutates the VFS, so the routine is non-destructive (AGENTS.md invariant 8)
 // and safe to run from the shell thread — which has no `CompatState`, which is
@@ -3408,7 +3411,7 @@ mod virtio_blk_tests {
     }
 }
 
-// ─── NVMe PRP-list / queue-depth data path ───────────────────────────────────
+// ─── NVMe PRP-list / data path глубины очереди ───────────────────────────────
 //
 // These routines run only when an NVMe namespace was registered at boot (the
 // normal QEMU/e2e path uses virtio-blk and skips them). They are deliberately
@@ -3504,7 +3507,7 @@ mod nvme_tests {
     }
 }
 
-// ─── RAM-mock BlockDevice for ext2 + journal property tests (Task 4.1) ───────
+// ─── RAM-mock BlockDevice для property-тестов ext2 + журнала ─────────────────
 //
 // A `Spinlock`-guarded byte buffer addressed at the 512-byte sector granularity
 // the `BlockDevice` trait uses (the ext2/journal layers issue 4096-byte FS-block
@@ -3742,7 +3745,7 @@ pub mod mock_block {
     }
 }
 
-// ─── ext2 + WAL journal property routines (Task 4.8–4.14) ────────────────────
+// ─── property-процедуры ext2 + WAL journal ──────────────────────────────────
 //
 // All routines run against the RAM-mock `BlockDevice` (no real disk). They use
 // a deterministic xorshift PRNG and are non-destructive (each builds its own
@@ -5645,7 +5648,7 @@ mod net_phy_prop_tests {
     }
 }
 
-// ─── linux::kill(2) in-guest checks (issue #12, task t7) ─────────────────────
+// ─── linux::kill(2), гостевые проверки (issue #12) ──────────────────────────
 //
 // The pure half of `kill(2)` (argument decoding, target classification, errno
 // matrix) is proven on the host by `host-tests` P51 and `abi::supported_set_is_exact`.
@@ -5875,7 +5878,7 @@ mod linux_signal_tests {
     }
 }
 
-// ─── Controlling-terminal job control, in-guest (2.16.0) ─────────────────────
+// ─── Controlling-terminal job control, в госте (2.16.0) ─────────────────────
 //
 // Proves on the real machine what the host property `tty_job` cannot: the
 // KERNEL-side terminal state and its two ioctls actually move the foreground
@@ -6205,7 +6208,7 @@ mod linux_tty_tests {
     }
 }
 
-// ─── SIGSTOP/SIGCONT scheduler state, in-guest (issue #12, task t8) ──────────
+// ─── Состояние планировщика SIGSTOP/SIGCONT, в госте (issue #12) ────────────
 //
 // Proves on the real machine what the host properties (`signal_stop`,
 // `signal_frame`) cannot: a parked (stopped) task stops rotating while keeping
@@ -6519,7 +6522,7 @@ mod linux_stop_tests {
     }
 }
 
-// ─── execve / exit address-space teardown accounting (round 3, F-r3-lead-1) ──
+// ─── execve / учёт teardown адресного пространства при exit ─────────────────
 //
 // `execve` swaps to a fresh CRT3 and may free the old PML4 tree. That free is
 // only safe when NO live task still runs on the old space. The buggy rule
@@ -6665,7 +6668,7 @@ mod exec_as_tests {
         resume(entry_if, saved);
     }
 }
-// ─── Timer-tick signal delivery, in-guest (issue #12, task t9) ───────────────
+// ─── Доставка сигналов по тику таймера, в госте (issue #12) ─────────────────
 //
 // The tick path is the LAST chance for a CPU-bound task that never enters a
 // syscall to see a signal, and it is the highest-risk code in the signal work: it
@@ -7010,11 +7013,12 @@ mod linux_tick_tests {
 }
 
 // ============================================================================
-// Security model: credentials, permission matrix, set*id transitions, chmod /
-// chown rules and kill permission. The pure half is host property P56; these
-// routines are the in-QEMU counterpart and also prove the ext2 metadata
-// write-back (mode/owner) end to end. Non-destructive: the mock filesystem is
-// heap-backed and its single test file is removed again.
+// ============================================================================
+// Модель безопасности: credentials, матрица прав, переходы set*id, правила
+// chmod/chown и право на kill. Чистая половина — host property P56; эти процедуры —
+// in-QEMU аналог, а также доказывают write-back метаданных ext2 (mode/owner)
+// end-to-end. Неразрушающе: mock-файловая система в heap, и её единственный тестовый
+// файл снова удаляется.
 // ============================================================================
 mod security_tests {
     use super::mock_block::MockBlockDevice;
@@ -7900,10 +7904,10 @@ pub fn run_all() -> (usize, u32, u32, i64) {
 }
 
 // ============================================================================
-// user-friendly-shell: in-kernel property + unit tests (P21–P27, unit checks)
+// ============================================================================
+// user-friendly-shell: in-kernel property + unit-тесты (P21–P27, unit-проверки)
 // ============================================================================
 //
-// These routines target the PURE LOGIC of the interactive shell — path
 // normalization, the line-editor model, the history ring buffer, completion /
 // longest-common-prefix, the scancode decoder, and edit distance. They contain
 // no console/keyboard/VFS I/O, so they are deterministic and non-destructive,
@@ -9101,10 +9105,10 @@ mod shell_prop_tests {
 }
 
 // ============================================================================
-// entropy::AT_RANDOM (issue #16) — in-kernel liveness/regression check
+// ============================================================================
+// entropy::AT_RANDOM (issue #16) — in-kernel проверка живости/регрессии
 // ============================================================================
 //
-// The *statistical* proof that the fallback block is not a function of the
 // observable inputs (tick clock, pid, RTC) lives in the host property tests
 // (`host-tests/src/properties/at_random.rs`), which drive `security::seed` directly.
 // This routine is the in-QEMU counterpart: it exercises the REAL effectful path
@@ -9237,17 +9241,21 @@ mod sysinfo_tests {
 }
 
 // ============================================================================
-// text inspection tools: the `head`/`tail`/`wc`/`grep` line model
+// ============================================================================
+// text inspection tools: модель строк `head`/`tail`/`wc`/`grep`
 // ============================================================================
 
 /// The four text tools share one streaming walk (`shell::texttools::walk`), so
-/// they must agree on what a line is, where the file ends, and where a partial
-/// last line goes. These checks pin that model without a VFS or a console:
-/// synthetic readers feed exact byte sequences through the same functions the
-/// commands call, so a regression in the walk shows up as a wrong transcript
-/// here instead of as a confusing shell output.
+/// Все четыре текстовых инструмента делят один потоковый обход
+/// (`shell::texttools::walk`), так что должны сходиться в том, что такое строка,
+/// где кончается файл и куда идёт частичная последняя строка. Эти проверки
+/// фиксируют модель без VFS и консоли: синтетические reader'ы подают точные
+/// байтовые последовательности через те же функции, которые зовут команды, так что
+/// регрессия в обходе видна как неверный транскрипт здесь, а не как запутанный
+/// вывод shell.
 ///
-/// Non-destructive: no VFS, no console, no task; it allocates only the small
+/// Неразрушающе: без VFS, консоли и задач; аллоцируются только небольшие векторы
+/// этих проверок, и они дропаются.
 /// vectors these checks build and drops them.
 mod texttools_tests {
     use alloc::vec::Vec;

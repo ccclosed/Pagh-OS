@@ -1,47 +1,47 @@
-//! Pure DNS query construction and A-record response parsing.
+//! Чистое построение DNS-запроса и разбор A-записи ответа.
 //!
-//! This is the **pure** core of the resolver (the effectful socket pump lives in
-//! [`crate::net::resolve`]). Like [`crate::net::http`] it is `core` + `alloc`
-//! only — no sockets, no globals, no hardware — and deliberately speaks
-//! in plain byte slices and `[u8; 4]` octets rather than any stack wire type,
-//! so it compiles unchanged into the `host-tests` crate via a `#[path]` include
-//! and the parser can be property-tested on the host.
+//! Это **чистое** ядро резолвера (эффектный сокетный насос живёт в
+//! [`crate::net::resolve`]). Как и [`crate::net::http`], только `core` + `alloc` —
+//! без сокетов, глобалов и железа — и намеренно говорит простыми байтовыми
+//! срезами и октетами `[u8; 4]`, а не каким-либо wire-типом стека, так что
+//! собирается без изменений в `host-tests` через `#[path]`-include, и парсер можно
+//! property-тестировать на хосте.
 //!
-//! Both functions are hardened against adversarial input: every index is bounds
-//! checked, compression pointers in answers are handled defensively, and no path
-//! can panic or read past the input buffer.
+//! Обе функции закалены против враждебного ввода: каждый индекс проверен на
+//! границы, указатели сжатия в ответах обрабатываются защитно, и ни один путь не
+//! паникует и не читает за входным буфером.
 #![allow(dead_code)]
 
 use alloc::vec::Vec;
 
-/// DNS QTYPE for an IPv4 address (A) record.
+/// DNS QTYPE для записи IPv4-адреса (A).
 pub const QTYPE_A: u16 = 1;
-/// DNS QTYPE for an IPv6 address (AAAA) record.
+/// DNS QTYPE для записи IPv6-адреса (AAAA).
 pub const QTYPE_AAAA: u16 = 28;
-/// DNS QCLASS for the Internet (IN).
+/// DNS QCLASS для интернета (IN).
 pub const QCLASS_IN: u16 = 1;
 
-/// Maximum number of name "hops" we will follow while skipping a (possibly
-/// compressed) DNS name. A bound prevents runaway loops on malformed pointers.
+/// Максимальное число «прыжков» имени при пропуске (возможно сжатого) DNS-имени.
+/// Граница предотвращает зацикливание на некорректных указателях.
 const MAX_NAME_STEPS: usize = 128;
 
-/// Build a DNS standard query for `hostname` into `out` (cleared first).
+/// Построить стандартный DNS-запрос для `hostname` в `out` (сначала очищенный).
 ///
-/// Produces a single-Question message with `QTYPE=A`, `QCLASS=IN`, the
-/// recursion-desired (RD) flag set, and transaction id `id`. The QNAME is the
-/// dot-separated labels of `hostname`, each length-prefixed, terminated by the
-/// root (zero) label.
+/// Даёт одно-Question сообщение с `QTYPE=A`, `QCLASS=IN`, выставленным флагом
+/// recursion-desired (RD) и transaction id `id`. QNAME — разделённые точками
+/// лейблы `hostname`, каждый с длиной-префиксом, завершённые корневым (нулевым)
+/// лейблом.
 ///
-/// Returns `false` (leaving `out` safe but unspecified) if `hostname` cannot be
-/// encoded: an empty hostname, an empty label (e.g. a leading/trailing/`..` dot),
-/// a label longer than 63 bytes, or a total encoded name longer than 255 bytes.
-/// Pure and panic-free.
+/// Возвращает `false` (оставляя `out` безопасным, но неопределённым), если
+/// `hostname` нельзя закодировать: пустой hostname, пустой лейбл (`..` или
+/// ведущая/завершающая точка), лейбл длиннее 63 байт или закодированное имя
+/// длиннее 255 байт. Чисто и panic-free.
 pub fn build_dns_query(id: u16, hostname: &str, out: &mut Vec<u8>) -> bool {
     build_dns_query_typed(id, hostname, QTYPE_A, out)
 }
 
-/// Same as [`build_dns_query`] but with an explicit question type
-/// ([`QTYPE_A`] or [`QTYPE_AAAA`]).
+/// То же, что [`build_dns_query`], но с явным типом вопроса
+/// ([`QTYPE_A`] или [`QTYPE_AAAA`]).
 pub fn build_dns_query_typed(id: u16, hostname: &str, qtype: u16, out: &mut Vec<u8>) -> bool {
     out.clear();
 
@@ -49,8 +49,8 @@ pub fn build_dns_query_typed(id: u16, hostname: &str, qtype: u16, out: &mut Vec<
         return false;
     }
 
-    // Validate + measure the encoded QNAME length before emitting anything past
-    // the header, so a reject leaves no partial garbage to misinterpret.
+    // Провалидировать + измерить длину закодированного QNAME до вывода чего-либо
+    // за заголовок, чтобы отказ не оставил частичного мусора для неверной трактовки.
     let mut name_len = 1usize; // the terminating root label
     for label in hostname.split('.') {
         if label.is_empty() || label.len() > 63 {
@@ -62,7 +62,7 @@ pub fn build_dns_query_typed(id: u16, hostname: &str, qtype: u16, out: &mut Vec<
         return false;
     }
 
-    // Header (12 bytes): ID, flags, QDCOUNT=1, ANCOUNT=NSCOUNT=ARCOUNT=0.
+    // Заголовок (12 байт): ID, флаги, QDCOUNT=1, ANCOUNT=NSCOUNT=ARCOUNT=0.
     out.extend_from_slice(&id.to_be_bytes());
     out.extend_from_slice(&0x0100u16.to_be_bytes()); // QR=0, Opcode=0, RD=1
     out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
@@ -70,7 +70,7 @@ pub fn build_dns_query_typed(id: u16, hostname: &str, qtype: u16, out: &mut Vec<
     out.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
     out.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
 
-    // QNAME: length-prefixed labels + root label.
+    // QNAME: лейблы с префиксом длины + корневой лейбл.
     for label in hostname.split('.') {
         out.push(label.len() as u8);
         out.extend_from_slice(label.as_bytes());
@@ -83,15 +83,15 @@ pub fn build_dns_query_typed(id: u16, hostname: &str, qtype: u16, out: &mut Vec<
     true
 }
 
-/// Verify that the Question record starting at `pos` carries exactly the
-/// QNAME labels of `hostname` (byte-for-byte, as the query encoded them) plus
-/// QTYPE `qtype` / QCLASS IN. Returns the position just past the question.
+/// Проверить, что Question-запись с `pos` несёт ровно QNAME-лейблы `hostname`
+/// (байт-в-байт, как их закодировал запрос) плюс QTYPE `qtype` / QCLASS IN.
+/// Возвращает позицию сразу за вопросом.
 ///
-/// A response whose question does not match the one we sent is not an answer
-/// to our query (off-path spoof or a stale/foreign reply) and must be
-/// rejected. A compression pointer inside the *question* of a response to a
-/// single-question query never occurs legitimately (the question starts at
-/// offset 12, nothing before it to point at) — treat it as a mismatch.
+/// Ответ, чей вопрос не совпадает с отправленным, — не ответ на наш запрос
+/// (off-path spoof или устаревший/чужой reply) и должен быть отвергнут. Указатель
+/// сжатия внутри *вопроса* ответа на одно-вопросный запрос законно не
+/// встречается (вопрос начинается со смещения 12, до него нечего указывать) —
+/// считаем это несовпадением.
 fn verify_question(buf: &[u8], mut pos: usize, hostname: &str, qtype: u16) -> Option<usize> {
     for label in hostname.split('.') {
         let bytes = label.as_bytes();
@@ -108,7 +108,7 @@ fn verify_question(buf: &[u8], mut pos: usize, hostname: &str, qtype: u16) -> Op
         }
         pos += bytes.len();
     }
-    // Terminating root label, then QTYPE + QCLASS.
+    // Завершающий корневой лейбл, затем QTYPE + QCLASS.
     if *buf.get(pos)? != 0 {
         return None;
     }
@@ -124,15 +124,14 @@ fn verify_question(buf: &[u8], mut pos: usize, hostname: &str, qtype: u16) -> Op
     Some(pos + 4)
 }
 
-/// Parse the first A-record (IPv4) answer out of a DNS response in `buf`.
+/// Разобрать первый A-record (IPv4) ответ из DNS-ответа в `buf`.
 ///
-/// Returns `Some([a, b, c, d])` for the first answer RR whose TYPE is A and whose
-/// RDATA is exactly four bytes. Returns `None` on any of: a buffer shorter than
-/// the 12-byte header, a transaction-id mismatch with `expected_id`, a message
-/// that is not a response (QR clear), a non-zero RCODE (e.g. NXDOMAIN), a
-/// question section that does not exactly echo the `expected_name`/A question
-/// that was sent, no A answer present, or any malformed/truncated record. Never
-/// indexes past `buf` and never panics.
+/// Возвращает `Some([a, b, c, d])` для первой answer RR с TYPE A и RDATA ровно в
+/// четыре байта. Возвращает `None` при любом из: буфер короче 12-байтового
+/// заголовка, несовпадение transaction-id с `expected_id`, сообщение не является
+/// ответом (QR снят), ненулевой RCODE (например NXDOMAIN), секция вопроса не
+/// повторяет ровно отправленный `expected_name`/A-вопрос, A-ответа нет или любая
+/// некорректная/усечённая запись. Никогда не индексирует за `buf` и не паникует.
 pub fn parse_dns_a_response(buf: &[u8], expected_id: u16, expected_name: &str) -> Option<[u8; 4]> {
     if buf.len() < 12 {
         return None;
@@ -144,11 +143,11 @@ pub fn parse_dns_a_response(buf: &[u8], expected_id: u16, expected_name: &str) -
     }
 
     let flags = u16::from_be_bytes([buf[2], buf[3]]);
-    // QR (bit 15) must be set for a response.
+    // Для ответа QR (бит 15) должен быть выставлен.
     if flags & 0x8000 == 0 {
         return None;
     }
-    // RCODE (low 4 bits) must be 0 (NoError); NXDOMAIN(3) and friends -> None.
+    // RCODE (младшие 4 бита) должен быть 0 (NoError); NXDOMAIN(3) и прочие -> None.
     if flags & 0x000F != 0 {
         return None;
     }
@@ -156,16 +155,16 @@ pub fn parse_dns_a_response(buf: &[u8], expected_id: u16, expected_name: &str) -
     let qdcount = u16::from_be_bytes([buf[4], buf[5]]);
     let ancount = u16::from_be_bytes([buf[6], buf[7]]);
 
-    // We only ever send a single question; the response must echo exactly it.
+    // Мы всегда шлём один вопрос; ответ должен повторить ровно его.
     if qdcount != 1 {
         return None;
     }
     let mut pos = verify_question(buf, 12, expected_name, QTYPE_A)?;
 
-    // Walk the answer RRs looking for the first A record.
+    // Идти по answer RR в поисках первой A-записи.
     for _ in 0..ancount {
         pos = skip_name(buf, pos)?;
-        // Fixed RR fields: TYPE(2) CLASS(2) TTL(4) RDLENGTH(2) = 10 bytes.
+        // Фиксированные поля RR: TYPE(2) CLASS(2) TTL(4) RDLENGTH(2) = 10 байт.
         let fields_end = pos.checked_add(10)?;
         if fields_end > buf.len() {
             return None;
@@ -186,10 +185,10 @@ pub fn parse_dns_a_response(buf: &[u8], expected_id: u16, expected_name: &str) -
     None
 }
 
-/// Parse the first AAAA-record (IPv6) answer out of a DNS response in `buf`.
+/// Разобрать первый AAAA-record (IPv6) ответ из DNS-ответа в `buf`.
 ///
-/// Same validation rules as [`parse_dns_a_response`]; the answer's RDATA must
-/// be exactly 16 bytes.
+/// Те же правила валидации, что у [`parse_dns_a_response`]; RDATA ответа должно
+/// быть ровно 16 байт.
 pub fn parse_dns_aaaa_response(
     buf: &[u8],
     expected_id: u16,
@@ -241,14 +240,14 @@ pub fn parse_dns_aaaa_response(
     None
 }
 
-/// Advance past a (possibly compressed) DNS name beginning at `pos`, returning
-/// the index of the first byte after the name *in the record stream*.
+/// Пройти за (возможно сжатым) DNS-именем, начинающимся с `pos`, вернув индекс
+/// первого байта после имени *в потоке записей*.
 ///
-/// For a name terminated by a compression pointer, that is the index just after
-/// the two pointer bytes (the pointer is not followed — callers only need to skip
-/// the name, never decode it). Returns `None` on any malformed input: an index
-/// out of range, reserved length bits, or more than [`MAX_NAME_STEPS`] labels
-/// (runaway). Never indexes past `buf`.
+/// Для имени, завершённого указателем сжатия, это индекс сразу за двумя байтами
+/// указателя (по нему не идём — вызывающим нужно только пропустить имя, никогда
+/// его не декодируя). Возвращает `None` на любом некорректном вводе: индекс вне
+/// диапазона, зарезервированные биты длины или более [`MAX_NAME_STEPS`] лейблов
+/// (зацикливание). Никогда не индексирует за `buf`.
 fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
     let mut steps = 0usize;
     loop {
@@ -260,31 +259,32 @@ fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
         match len & 0xC0 {
             0x00 => {
                 if len == 0 {
-                    // Root label: the name ends here.
+                    // Корневой лейбл: имя кончается здесь.
                     return Some(pos + 1);
                 }
-                // Ordinary label: skip the length byte + the label bytes.
+                // Обычный лейбл: пропустить байт длины + байты лейбла.
                 pos = pos.checked_add(1 + len as usize)?;
                 if pos > buf.len() {
                     return None;
                 }
             }
             0xC0 => {
-                // Compression pointer (two bytes); ensure the second byte exists,
-                // then the name ends here in the stream.
+                // Указатель сжатия (два байта); убедиться, что второй байт
+                // существует, затем имя кончается здесь в потоке.
                 buf.get(pos + 1)?;
                 return Some(pos + 2);
             }
-            // 0x40 / 0x80: reserved label types -> malformed.
+            // 0x40 / 0x80: зарезервированные типы лейблов -> некорректно.
             _ => return None,
         }
     }
 }
 
-/// Parse a dotted-quad IPv4 literal (e.g. `"10.0.2.3"`) into four octets, or
-/// `None` for any malformed input (wrong octet count, empty/oversized octet,
-/// non-digit byte, or an octet outside `0..=255`). Pure and panic-free; lets
-/// [`crate::net::resolve`] short-circuit a literal without issuing a query.
+/// Разобрать IPv4-литерал dotted-quad (например `"10.0.2.3"`) в четыре октета
+/// или `None` для любого некорректного ввода (неверное число октетов,
+/// пустой/слишком длинный октет, не-цифровой байт или октет вне `0..=255`).
+/// Чисто и panic-free; позволяет [`crate::net::resolve`] короткозамкнуть литерал
+/// без выдачи запроса.
 pub fn parse_ipv4_literal(s: &str) -> Option<[u8; 4]> {
     let mut octets = [0u8; 4];
     let mut idx = 0usize;

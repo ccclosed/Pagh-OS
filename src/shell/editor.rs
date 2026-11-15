@@ -1,31 +1,31 @@
-//! `LineEditor`: a buffer + cursor model with pure insert/delete/move
-//! operations.
+//! `LineEditor`: модель буфер + курсор с чистыми операциями
+//! вставки/удаления/перемещения.
 //!
-//! The cursor is tracked in **character** units (not bytes) so the editor
-//! stays correct around multi-byte UTF-8 (R11.6). Every operation preserves
-//! two invariants:
+//! Курсор хранится в **символьных** единицах (не байтах), чтобы редактор
+//! оставался корректным вокруг многобайтового UTF-8 (R11.6). Каждая операция
+//! сохраняет два инварианта:
 //!   * `cursor <= buf.chars().count()`
-//!   * `buf.len() <= MAX_CMD_LEN` (byte length is bounded, R11.1)
-//! and never splits a multi-byte UTF-8 character — all indexing maps a
-//! character index to a byte index via `char_indices`.
+//!   * `buf.len() <= MAX_CMD_LEN` (длина в байтах ограничена, R11.1)
+//! и никогда не разрезает многобайтовый символ UTF-8 — любая индексация
+//! отображает символьный индекс в байтовый через `char_indices`.
 
 use alloc::string::String;
 
-/// Maximum command line length in bytes. Matches the shell constant in
-/// `shell/mod.rs` so the editor and the legacy read loop agree on the cap.
+/// Максимальная длина командной строки в байтах. Совпадает с константой
+/// shell в `shell/mod.rs`, чтобы редактор и старый цикл чтения сходились на капе.
 const MAX_CMD_LEN: usize = 256;
 
-/// An editable line of text with a cursor positioned between characters.
+/// Редактируемая строка текста с курсором между символами.
 #[allow(dead_code)]
 pub struct LineEditor {
     buf: String,
-    /// Cursor position in character units, in `0..=buf.chars().count()`.
+    /// Позиция курсора в символьных единицах, в `0..=buf.chars().count()`.
     cursor: usize,
 }
 
 #[allow(dead_code)]
 impl LineEditor {
-    /// Create an empty editor with the cursor at the start.
+    /// Создать пустой редактор с курсором в начале.
     pub fn new() -> Self {
         LineEditor {
             buf: String::new(),
@@ -33,15 +33,15 @@ impl LineEditor {
         }
     }
 
-    /// Create an editor seeded with `line`, cursor positioned at the end.
+    /// Создать редактор с `line`, курсор в конце.
     pub fn from_line(line: &str) -> Self {
         let mut buf = String::new();
         let cursor = Self::push_bounded(&mut buf, line);
         LineEditor { buf, cursor }
     }
 
-    /// Map a character index into the corresponding byte index in `buf`.
-    /// `char_idx == char count` maps to `buf.len()` (one past the end).
+    /// Отобразить символьный индекс в соответствующий байтовый в `buf`.
+    /// `char_idx == число символов` отображается в `buf.len()` (на один за концом).
     fn byte_index(&self, char_idx: usize) -> usize {
         match self.buf.char_indices().nth(char_idx) {
             Some((byte_idx, _)) => byte_idx,
@@ -49,9 +49,9 @@ impl LineEditor {
         }
     }
 
-    /// Append as much of `line` as fits within `MAX_CMD_LEN` bytes onto `buf`,
-    /// never splitting a character, and return the number of characters added.
-    /// Used by constructors/`set_line` so seeded lines respect the byte cap.
+    /// Дописать столько `line`, сколько влезает в `MAX_CMD_LEN` байт в `buf`,
+    /// никогда не разрезая символ, и вернуть число добавленных символов.
+    /// Используется конструкторами/`set_line`, чтобы заданные строки уважали байтовый кап.
     fn push_bounded(buf: &mut String, line: &str) -> usize {
         let mut count = 0;
         for ch in line.chars() {
@@ -64,9 +64,9 @@ impl LineEditor {
         count
     }
 
-    /// Insert `ch` at the cursor, shifting the suffix right, and advance the
-    /// cursor by one (R1.3). The insert is dropped if it would push the buffer
-    /// past `MAX_CMD_LEN` bytes (R11.1).
+    /// Вставить `ch` в курсор, сдвинув суффикс вправо, и продвинуть курсор на
+    /// один (R1.3). Вставка отбрасывается, если она вывела бы буфер за
+    /// `MAX_CMD_LEN` байт (R11.1).
     pub fn insert(&mut self, ch: char) {
         if self.buf.len() + ch.len_utf8() > MAX_CMD_LEN {
             return;
@@ -76,8 +76,8 @@ impl LineEditor {
         self.cursor += 1;
     }
 
-    /// Backspace: remove the character before the cursor and move left
-    /// (R1.4). Returns `true` if the buffer changed.
+    /// Backspace: удалить символ перед курсором и сдвинуться влево
+    /// (R1.4). Возвращает `true`, если буфер изменился.
     pub fn delete_back(&mut self) -> bool {
         if self.cursor == 0 {
             return false;
@@ -88,8 +88,8 @@ impl LineEditor {
         true
     }
 
-    /// Delete: remove the character at the cursor, leaving the cursor in place
-    /// (R1.5). Returns `true` if the buffer changed.
+    /// Delete: удалить символ в курсоре, оставив курсор на месте
+    /// (R1.5). Возвращает `true`, если буфер изменился.
     pub fn delete_fwd(&mut self) -> bool {
         if self.cursor >= self.char_count() {
             return false;
@@ -99,13 +99,12 @@ impl LineEditor {
         true
     }
 
-    /// Replace the character range `[from, to)` with nothing, placing the cursor
-    /// at `from`.
+    /// Заменить диапазон символов `[from, to)` ничем, поставив курсор в `from`.
     ///
-    /// Indices are character units, matching the rest of this type. An out-of-range
-    /// or inverted range is clamped rather than refused, so a selection that runs
-    /// past either end of the line still deletes the part that exists. Returns
-    /// whether anything was removed.
+    /// Индексы в символьных единицах, как и везде в типе. Вне диапазона или
+    /// инвертированный диапазон клампится, а не отвергается, так что выделение,
+    /// выходящее за любой конец строки, всё равно удаляет существующую часть.
+    /// Возвращает, было ли что удалено.
     pub fn replace_range(&mut self, from: usize, to: usize) -> bool {
         let count = self.char_count();
         let from = from.min(count);
@@ -121,8 +120,8 @@ impl LineEditor {
         true
     }
 
-    /// Move the cursor one character left, clamping at the start (R1.1).
-    /// Returns `true` if the cursor moved.
+    /// Сдвинуть курсор на символ влево, клампя в начале (R1.1).
+    /// Возвращает `true`, если курсор сдвинулся.
     pub fn move_left(&mut self) -> bool {
         if self.cursor == 0 {
             return false;
@@ -131,8 +130,8 @@ impl LineEditor {
         true
     }
 
-    /// Move the cursor one character right, clamping at the end (R1.1).
-    /// Returns `true` if the cursor moved.
+    /// Сдвинуть курсор на символ вправо, клампя в конце (R1.1).
+    /// Возвращает `true`, если курсор сдвинулся.
     pub fn move_right(&mut self) -> bool {
         if self.cursor >= self.char_count() {
             return false;
@@ -141,40 +140,40 @@ impl LineEditor {
         true
     }
 
-    /// Move the cursor to the start of the line (R1.2).
+    /// Переместить курсор в начало строки (R1.2).
     pub fn move_home(&mut self) {
         self.cursor = 0;
     }
 
-    /// Move the cursor to the end of the line (R1.2).
+    /// Переместить курсор в конец строки (R1.2).
     pub fn move_end(&mut self) {
         self.cursor = self.char_count();
     }
 
-    /// Replace the buffer with `line` and place the cursor at the end. Used for
-    /// history recall and completion. The new line is bounded to `MAX_CMD_LEN`
-    /// bytes, never splitting a character.
+    /// Заменить буфер на `line` и поставить курсор в конец. Используется для
+    /// recall истории и дополнения. Новая строка ограничена `MAX_CMD_LEN` байт и
+    /// никогда не разрезает символ.
     pub fn set_line(&mut self, line: &str) {
         self.buf.clear();
         self.cursor = Self::push_bounded(&mut self.buf, line);
     }
 
-    /// The current buffer contents.
+    /// Текущее содержимое буфера.
     pub fn buffer(&self) -> &str {
         &self.buf
     }
 
-    /// The cursor position in character units.
+    /// Позиция курсора в символьных единицах.
     pub fn cursor(&self) -> usize {
         self.cursor
     }
 
-    /// Whether the buffer is empty.
+    /// Пуст ли буфер.
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
 
-    /// Number of characters in the buffer (cursor upper bound).
+    /// Число символов в буфере (верхняя граница курсора).
     fn char_count(&self) -> usize {
         self.buf.chars().count()
     }

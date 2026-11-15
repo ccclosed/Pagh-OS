@@ -1,21 +1,21 @@
-//! Own IPv4 layer: routing, fragmentation (send), datagram reassembly
-//! (receive), and ICMP echo.
+//! Свой IPv4-слой: маршрутизация, фрагментация (отправка), сборка датаграмм
+//! (приём) и ICMP echo.
 //!
-//! Design notes:
-//!   * Routing: destination inside the configured subnet -> ARP-resolve the
-//!     destination itself; otherwise via the default gateway; limited
-//!     broadcast always goes to the broadcast MAC without ARP (this is what
-//!     DHCP needs before any address is configured).
-//!   * Sending: payloads larger than the MTU are fragmented into chunks whose
-//!     byte length is a multiple of 8 (except the final one), as RFC 791
-//!     requires; every fragment carries the same identification.
-//!   * Receiving: fragmented datagrams are reassembled in bounded buffers
-//!     (max 4 concurrent, 10 s lifetime); complete datagrams are dispatched to
-//!     ICMP/UDP/TCP exactly once.
-//!   * ICMP: echo requests are answered natively; echo replies resolve
-//!     registered ping waiters (`net::ping`).
+//! Заметки по устройству:
+//!   * Маршрутизация: назначение внутри настроенной подсети -> ARP-разрешение
+//!     самого назначения; иначе через шлюз по умолчанию; limited broadcast
+//!     всегда идёт на broadcast MAC без ARP (это нужно DHCP до появления любого
+//!     адреса).
+//!   * Отправка: payload'ы больше MTU фрагментируются на чанки, чья байтовая
+//!     длина кратна 8 (кроме последнего), как требует RFC 791; каждый фрагмент
+//!     несёт один и тот же identification.
+//!   * Приём: фрагментированные датаграммы собираются в ограниченных буферах
+//!     (макс. 4 одновременно, время жизни 10 с); полные датаграммы диспетчеризуются
+//!     в ICMP/UDP/TCP ровно один раз.
+//!   * ICMP: echo-запросы отвечаются нативно; echo-ответы разрешают
+//!     зарегистрированных ping-waiter'ов (`net::ping`).
 //!
-//! All functions run under the stack lock from thread context.
+//! Все функции выполняются под локом стека из thread-контекста.
 
 use alloc::vec::Vec;
 
@@ -26,27 +26,27 @@ use super::wire::{
 };
 use super::Stack;
 
-/// Ethernet MTU advertised everywhere (R13).
+/// Ethernet MTU, анонсируемый везде (R13).
 pub const MTU: usize = 1500;
-/// Maximum IP payload per non-final fragment must be a multiple of 8 bytes.
+/// Максимальный IP-payload на нефинальный фрагмент должен быть кратен 8 байтам.
 const FRAG_UNIT: usize = 8;
-/// Concurrent reassembly buffers.
+/// Одновременные буферы сборки.
 const REASM_CAP: usize = 4;
-/// Reassembly buffer lifetime (ticks).
+/// Время жизни буфера сборки (тики).
 const REASM_TTL_TICKS: u64 = 10 * 1000;
-/// Total bytes we will ever hold across all partial datagrams.
+/// Всего байт, которые мы когда-либо держим по всем частичным датаграммам.
 const REASM_TOTAL_CAP: usize = 128 * 1024;
 
-// ─── Fragment reassembly ─────────────────────────────────────────────────────
+// ─── Сборка фрагментов ───────────────────────────────────────────────────────
 
 struct FragBuf {
     src: IpAddr,
     dst: IpAddr,
     id: u32,
     proto: u8,
-    /// Byte offset -> fragment bytes (sorted by offset at completion time).
+    /// Байтовое смещение -> байты фрагмента (отсортированы по смещению к завершению).
     frags: Vec<(usize, Vec<u8>)>,
-    /// Set when the final fragment (MF=0) has arrived.
+    /// Ставится, когда пришёл финальный фрагмент (MF=0).
     total: Option<usize>,
     seen: u64,
 }
@@ -58,7 +58,7 @@ impl FragBuf {
 
     fn try_complete(&self) -> Option<Vec<u8>> {
         let total = self.total?;
-        // Contiguity check: sorted fragments must cover [0, total).
+        // Проверка непрерывности: отсортированные фрагменты должны покрывать [0, total).
         let mut frags = self.frags.clone();
         frags.sort_by_key(|(off, _)| *off);
         let mut expect = 0usize;
@@ -97,7 +97,7 @@ impl Reassembler {
         self.bufs.iter().map(FragBuf::bytes_held).sum()
     }
 
-    /// Feed one non-initial fragment (or initial fragment of an incomplete set).
+    /// Принять один не-начальный фрагмент (или начальный фрагмент неполного набора).
     #[allow(clippy::too_many_arguments)]
     fn feed(
         &mut self,
@@ -120,11 +120,11 @@ impl Reassembler {
         {
             Some(b) => b,
             None => {
-                // CAP exceeded -> drop silently (deliberate). Note the buffer
-                // is created even when THIS fragment is the last one (MF=0):
-                // fragments arrive in any order, and refusing to open the
-                // buffer here would lose the recorded total — the datagram
-                // could then never complete as later fragments arrive.
+                // CAP превышен -> тихо дропнуть (намеренно). Заметьте: буфер
+                // создаётся, даже когда ЭТОТ фрагмент последний (MF=0): фрагменты
+                // приходят в любом порядке, и отказ создать буфер здесь потерял бы
+                // записанный total — датаграмма тогда никогда не завершится с
+                // приходом более поздних фрагментов.
                 if self.bufs.len() >= REASM_CAP {
                     return None;
                 }
@@ -159,9 +159,9 @@ impl Reassembler {
 
 // ─── Ingress ─────────────────────────────────────────────────────────────────
 
-/// Handle one IP packet received off the wire (`pkt` starts at the IP header).
-/// Dispatches on the version nibble; both families validate, reassemble when
-/// needed, and dispatch by protocol.
+/// Обработать один IP-пакет, принятый с провода (`pkt` начинается с IP-заголовка).
+/// Диспетчеризует по нибблу версии; оба семейства валидируют, собирают при
+/// необходимости и диспетчеризуют по протоколу.
 pub(crate) fn input(st: &mut Stack, pkt: &[u8], eth_src: Mac, now: u64) {
     match pkt.first().map(|b| b >> 4) {
         Some(4) => input_v4(st, pkt, now),
@@ -170,16 +170,16 @@ pub(crate) fn input(st: &mut Stack, pkt: &[u8], eth_src: Mac, now: u64) {
     }
 }
 
-/// Handle one IPv6 packet. Also serves NDP (NS/NA) and Router Advertisements
-/// (SLAAC): an RA with an autonomous on-link prefix configures our global
-/// address and default router (RFC 4862).
+/// Обработать один IPv6-пакет. Также обслуживает NDP (NS/NA) и Router
+/// Advertisements (SLAAC): RA с autonomous on-link префиксом настраивает наш
+/// глобальный адрес и маршрутизатор по умолчанию (RFC 4862).
 fn input_v6(st: &mut Stack, pkt: &[u8], eth_src: Mac, now: u64) {
     let Some((h, payload)) = ipv6_parse(pkt) else {
         return;
     };
 
-    // Accept packets addressed to us (global SLAAC address or link-local),
-    // plus the node-local/link-local multicasts NDP relies on.
+    // Принимать пакеты, адресованные нам (глобальный SLAAC-адрес или link-local),
+    // плюс node-local/link-local multicast'ы, на которые опирается NDP.
     let ll = st.ll_addr6;
     let global = st.cidr6.map(|c| c.addr);
     let dst = h.dst;
@@ -192,22 +192,22 @@ fn input_v6(st: &mut Stack, pkt: &[u8], eth_src: Mac, now: u64) {
     }
 
     if h.proto == wire::PROTO_ICMPV6 {
-        // NDP first (its own message space), then RA, then echo.
+        // Сначала NDP (своё пространство сообщений), затем RA, затем echo.
         let is_ndp = matches!(
             payload.first().copied(),
             Some(wire::ICMPV6_NEIGHBOR_SOLICIT) | Some(wire::ICMPV6_NEIGHBOR_ADVERT)
         );
         let is_ra = payload.first() == Some(&wire::ICMPV6_ROUTER_ADVERT);
         if is_ndp || is_ra {
-            // RFC 4861 anti-off-link-spoof checks: ND/RA messages are valid
-            // only with hop limit 255 (an forwarded packet has been decremented)
-            // and an on-link (link-local, or unspecified for DAD solicitation)
-            // source. An off-link attacker cannot forge either.
+            // Anti-off-link-spoof проверки RFC 4861: ND/RA-сообщения валидны
+            // только с hop limit 255 (у forward'нутого пакета он уменьшен) и
+            // on-link (link-local или unspecified для DAD solicitation)
+            // источником. Off-link атакующий не может подделать ни то, ни другое.
             if h.hop_limit != 255 {
                 return;
             }
             if is_ra {
-                // RA sources are always routers' link-local addresses.
+                // Источники RA — всегда link-local адреса маршрутизаторов.
                 if !h.src.is_link_local() {
                     return;
                 }
@@ -217,10 +217,10 @@ fn input_v6(st: &mut Stack, pkt: &[u8], eth_src: Mac, now: u64) {
         }
         if is_ndp {
             if let Some(p) = wire::ndp_parse(h.src, h.dst, payload) {
-                // The link-layer sender is the Ethernet source, not bytes from
-                // inside the IPv6 header (those were next-header/hop-limit/src).
+                // Link-layer отправитель — Ethernet-источник, а не байты из
+                // IPv6-заголовка (там были next-header/hop-limit/src).
                 let mac = Mac(eth_src.0);
-                // (moved out temporarily so it can use the rest of the stack)
+                // (временно вынесено, чтобы занять остальной стек)
                 let mut nd = core::mem::take(&mut st.nd);
                 nd.input(st, p, h.src, mac, now);
                 st.nd = nd;
@@ -235,7 +235,7 @@ fn input_v6(st: &mut Stack, pkt: &[u8], eth_src: Mac, now: u64) {
         }
     }
 
-    // Fragment reassembly (fragment header carries the real upper proto).
+    // Сборка фрагментов (fragment-заголовок несёт реальный upper proto).
     let dispatch: Option<(u8, alloc::vec::Vec<u8>)> = if h.proto == wire::IPV6_EXT_FRAGMENT {
         let Some((ident, frag_off, more, rest)) = ipv6_fragment_parse(payload) else {
             return;
@@ -270,14 +270,14 @@ fn input_v6(st: &mut Stack, pkt: &[u8], eth_src: Mac, now: u64) {
     }
 }
 
-/// The fragment header's first byte is the NEXT HEADER of the enclosed data.
+/// Первый байт fragment-заголовка — NEXT HEADER вложенных данных.
 fn rest_first(rest: &[u8]) -> u8 {
     rest.first().copied().unwrap_or(wire::IPV6_NO_NEXT)
 }
 
-/// Apply a Router Advertisement prefix (SLAAC). The interface identifier comes
-/// from our EUI-64-derived link-local address, so the configured address is
-/// stable across boots.
+/// Применить префикс Router Advertisement (SLAAC). Идентификатор интерфейса
+/// берётся из нашего EUI-64 link-local адреса, так что настроенный адрес стабилен
+/// между загрузками.
 fn ra_apply(st: &mut Stack, router: Ipv6Addr, pi: wire::PrefixInfo) {
     if !pi.on_link || !pi.autonomous || pi.valid_lifetime_secs == 0 || pi.prefix_len == 0 {
         return;
@@ -299,8 +299,8 @@ fn ra_apply(st: &mut Stack, router: Ipv6Addr, pi: wire::PrefixInfo) {
     st.v6_gateway = Some(router);
     if changed {
         crate::info!("net: SLAAC address {} via router {}", addr, router);
-        // Unsolicited NA so neighbors learn us promptly (RX is promiscuous, so
-        // the solicited-node multicast group needs no explicit join).
+        // Непрошеный NA, чтобы соседи быстро нас узнали (RX в promiscuous, так что
+        // solicited-node multicast-группе явный join не нужен).
         let adv = wire::neighbor_advert(
             addr,
             Ipv6Addr::ALL_NODES,
@@ -315,7 +315,7 @@ fn ra_apply(st: &mut Stack, router: Ipv6Addr, pi: wire::PrefixInfo) {
     }
 }
 
-/// Handle one ICMPv6 echo exchange (requests answered; replies resolve pings).
+/// Обработать один ICMPv6 echo-обмен (запросы отвечаются; ответы разрешают ping).
 fn icmpv6_input(st: &mut Stack, src: Ipv6Addr, dst: Ipv6Addr, msg: &[u8]) {
     match icmpv6_echo_parse(src, dst, msg) {
         Some((wire::ICMPV6_ECHO_REQUEST, ident, seq, data)) => {
@@ -347,15 +347,15 @@ fn icmpv6_input(st: &mut Stack, src: Ipv6Addr, dst: Ipv6Addr, msg: &[u8]) {
     }
 }
 
-/// Handle one IPv4 packet received off the wire (`pkt` starts at the IP
-/// header). Validates, reassembles when needed, dispatches by protocol.
+/// Обработать один IPv4-пакет, принятый с провода (`pkt` начинается с IP-
+/// заголовка). Валидирует, собирает при необходимости, диспетчеризует по протоколу.
 fn input_v4(st: &mut Stack, pkt: &[u8], now: u64) {
     let Some((h, payload)) = ipv4_parse(pkt) else {
         return;
     };
 
-    // Accept only packets addressed to us (or limited broadcast — needed while
-    // unconfigured during DHCP).
+    // Принимать только пакеты, адресованные нам (или limited broadcast — нужен,
+    // пока не настроены, во время DHCP).
     let ours = match st.cidr {
         Some(c) => h.dst == c.addr || h.dst.is_broadcast(),
         None => h.dst.is_broadcast(),
@@ -401,8 +401,8 @@ fn input_v4(st: &mut Stack, pkt: &[u8], now: u64) {
 fn icmp_input(st: &mut Stack, src: Ipv4Addr, dst: Ipv4Addr, msg: &[u8]) {
     match icmp_echo_parse(msg) {
         Some((wire::ICMP_ECHO_REQUEST, ident, seq, data)) => {
-            // Answer echo requests natively (swap type 8 -> 0); reply to the
-            // requester from the address it addressed us at.
+            // Отвечать на echo-запросы нативно (поменять тип 8 -> 0); отвечать
+            // запрашивающему с адреса, на который он к нам обратился.
             let reply = icmp_echo_build(wire::ICMP_ECHO_REPLY, ident, seq, data);
             let now = crate::task::scheduler::ticks();
             output(
@@ -415,7 +415,7 @@ fn icmp_input(st: &mut Stack, src: Ipv4Addr, dst: Ipv4Addr, msg: &[u8]) {
             );
         }
         Some((wire::ICMP_ECHO_REPLY, rid, rseq, _data)) => {
-            // Resolve a matching pending ping.
+            // Разрешить подходящий ожидающий ping.
             if let Some(p) = st
                 .pings
                 .iter_mut()
@@ -431,12 +431,12 @@ fn icmp_input(st: &mut Stack, src: Ipv4Addr, dst: Ipv4Addr, msg: &[u8]) {
 
 // ─── Egress ──────────────────────────────────────────────────────────────────
 
-/// Send one L3 payload toward `dst_ip` over `proto`. Handles next-hop
-/// selection, neighbor resolution via ARP/NDP (queueing when unresolved), and
-/// IPv4 fragmentation (IPv6 is never fragmented on TX per RFC 2460 §4.5).
+/// Послать один L3-payload к `dst_ip` по `proto`. Обрабатывает выбор next-hop,
+/// разрешение соседа через ARP/NDP (с очередью, пока не разрешено) и IPv4-
+/// фрагментацию (IPv6 никогда не фрагментируется на TX по RFC 2460 §4.5).
 ///
-/// `src_override` lets DHCP send from 0.0.0.0 before configuration; pass
-/// `None` to use the configured address of the matching family.
+/// `src_override` позволяет DHCP отправлять с 0.0.0.0 до конфигурации; передайте
+/// `None`, чтобы использовать настроенный адрес соответствующего семейства.
 pub(crate) fn output(
     st: &mut Stack,
     src_override: Option<IpAddr>,
@@ -477,7 +477,7 @@ fn output_v4(
         .or_else(|| st.cidr.map(|c| c.addr))
         .unwrap_or(Ipv4Addr::UNSPECIFIED);
 
-    // Next-hop selection.
+    // Выбор next-hop.
     let next_hop: Ipv4Addr = if dst_ip.is_broadcast() {
         dst_ip
     } else if let Some(c) = st.cidr {
@@ -492,7 +492,7 @@ fn output_v4(
         return; // nothing routable while unconfigured (except broadcast above)
     };
 
-    // Fragment as needed.
+    // Фрагментировать при необходимости.
     let max_payload = MTU - wire::IPV4_HDR_MIN;
     let fragments = fragment_chunks(payload, max_payload);
     let count = fragments.len();
@@ -522,8 +522,8 @@ fn output_v6(
         return; // packet too big and IPv6 never fragments locally (RFC 2460)
     }
 
-    // Source selection: link-local destination -> link-local source; otherwise
-    // the SLAAC global address when present.
+    // Выбор источника: link-local назначение -> link-local источник; иначе
+    // глобальный SLAAC-адрес, когда он есть.
     let ll = st.ll_addr6;
     let global = st.cidr6.map(|c| c.addr);
     let src: Ipv6Addr = src_override.unwrap_or(if dst_ip.is_link_local() {
@@ -532,8 +532,8 @@ fn output_v6(
         global.unwrap_or(ll)
     });
 
-    // Next hop: multicast maps straight to its MAC; on-link/link-local targets
-    // resolve themselves; everything else goes via the RA-provided router.
+    // Next hop: multicast отображается прямо в его MAC; on-link/link-local цели
+    // разрешаются сами; всё остальное идёт через router из RA.
     let on_link = dst_ip.is_link_local() || st.cidr6.is_some_and(|c| dst_ip.in_subnet(c));
     let next_hop: Option<Ipv6Addr> = if dst_is_multicast(dst_ip.octets()) || on_link {
         Some(dst_ip)
@@ -555,8 +555,8 @@ struct Chunk<'a> {
     data: &'a [u8],
 }
 
-/// Split `payload` into MTU-sized chunks whose lengths are multiples of 8
-/// except the final one. A payload that fits yields a single zero-offset chunk.
+/// Разбить `payload` на чанки размера MTU, длины которых кратны 8, кроме
+/// последнего. Влезающий payload даёт один чанк с нулевым смещением.
 fn fragment_chunks(payload: &[u8], max_payload: usize) -> Vec<Chunk<'_>> {
     let mut out = Vec::new();
     if payload.len() <= max_payload {
@@ -566,7 +566,7 @@ fn fragment_chunks(payload: &[u8], max_payload: usize) -> Vec<Chunk<'_>> {
         });
         return out;
     }
-    // Round the per-fragment size down to a multiple of 8.
+    // Округлить размер на фрагмент вниз до кратного 8.
     let unit = max_payload - max_payload % FRAG_UNIT;
     let mut off = 0usize;
     while off < payload.len() {
@@ -580,8 +580,8 @@ fn fragment_chunks(payload: &[u8], max_payload: usize) -> Vec<Chunk<'_>> {
     out
 }
 
-/// Hand an IPv4 packet to the link layer, resolving the next hop's MAC through
-/// ARP (broadcast destinations bypass resolution entirely).
+/// Отдать IPv4-пакет link-слою, разрешив MAC next-hop через ARP (broadcast-
+/// назначения обходят разрешение полностью).
 fn send_v4(st: &mut Stack, next_hop: Ipv4Addr, packet: &[u8], now: u64) {
     if next_hop.is_broadcast() {
         let frame = eth_frame(Mac::BROADCAST, st.mac, ETHERTYPE_IPV4, packet);
@@ -591,7 +591,7 @@ fn send_v4(st: &mut Stack, next_hop: Ipv4Addr, packet: &[u8], now: u64) {
     let mac = match st.arp.lookup(next_hop) {
         Some(m) => m,
         None => {
-            // Park the frame and ask.
+            // Припарковать кадр и спросить.
             st.arp
                 .enqueue_pending(next_hop, ETHERTYPE_IPV4, packet.to_vec(), now);
             st.arp.request(
@@ -607,8 +607,8 @@ fn send_v4(st: &mut Stack, next_hop: Ipv4Addr, packet: &[u8], now: u64) {
     crate::drivers::e1000::send(&frame);
 }
 
-/// Hand an IPv6 packet to the link layer, resolving the next hop's MAC through
-/// NDP (multicast destinations map directly to 33:33:* MACs).
+/// Отдать IPv6-пакет link-слою, разрешив MAC next-hop через NDP (multicast-
+/// назначения отображаются прямо в MAC 33:33:*).
 fn send_v6(st: &mut Stack, next_hop: Ipv6Addr, packet: &[u8]) {
     let dst_mac = if dst_is_multicast(next_hop.octets()) {
         wire::ipv6_multicast_mac(next_hop)
@@ -632,14 +632,14 @@ fn send_v6(st: &mut Stack, next_hop: Ipv6Addr, packet: &[u8]) {
     crate::drivers::e1000::send(&frame);
 }
 
-// ─── Ping waiters ────────────────────────────────────────────────────────────
+// ─── Ожидающие ping ──────────────────────────────────────────────────────────
 
-/// One outstanding `net::ping`.
+/// Один ожидающий `net::ping`.
 pub struct PingWaiter {
     pub ident: u16,
     pub seq: u16,
     pub started: u64,
-    /// Match any sequence number (we send exactly one probe).
+    /// Совпасть с любым sequence number (мы шлём ровно один probe).
     pub seq_any: bool,
     pub done: bool,
     pub rtt: Option<u64>,

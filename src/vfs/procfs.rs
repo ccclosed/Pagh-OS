@@ -1,48 +1,39 @@
-//! Synthetic `/proc` (issue #11; contract: `docs/procfs.md`).
+//! Синтетический `/proc` (контракт: `docs/procfs.md`).
 //!
-//! `/proc` is a VFS subtree whose files have no backing store: their text is
-//! rendered from kernel state when a program reads them. The design decisions
-//! that matter are all in `docs/procfs.md`; the short version:
+//! `/proc` — поддерево VFS, у файлов которого нет хранилища: их текст
+//! рендерится из состояния ядра при чтении. Существенные решения:
 //!
-//!   * **Lazy, per-instance content.** Nothing is rendered at mount time. A node
-//!     instance is created by `lookup()`/`open()` and renders its text on the
-//!     first `size()`/`read()`. A read from offset 0 re-renders, so a program that
-//!     samples `/proc/uptime` or `/proc/meminfo` sees current values, while a
-//!     multi-chunk reader of one file keeps a single render and therefore never
-//!     splices two different renders together (`docs/procfs.md` §3.2).
-//!   * **`size()` is the rendered length**, not Linux's zero: this kernel's read
-//!     path derives EOF from `size()` (`plan_read`), so a zero-sized procfs file
-//!     would read as instantly empty (DEVIATION-1).
-//!   * **Lock order is state-then-node.** Rendering (`COMPAT_STATES`, PMM,
-//!     scheduler) happens before the node's own spinlock is taken; the node lock
-//!     is never held across a `with_pid_compat` call.
-//!   * **`/proc/self` is invisible to a task without `CompatState`** (a kernel
-//!     thread, the boot selftest): `lookup` returns `NotFound` → `ENOENT` rather
-//!     than inventing a process (`docs/procfs.md` §5.5).
-//!   * **Unknown paths are `NotFound`** — there is no wildcard. A numeric
-//!     component is resolved *only* when that pid is currently registered in
-//!     `COMPAT_STATES`, so `/proc/<dead-pid>` is `ENOENT`; `/proc/self/fd`,
-//!     `/proc/loadavg`, `/proc/version` and friends stay `ENOENT` too.
+//!   * **Ленивое содержимое на экземпляр.** При монтировании ничего не
+//!     рендерится. Узел создаётся `lookup()`/`open()` и рендерит текст на первом
+//!     `size()`/`read()`. Чтение со смещения 0 перерисовывает, поэтому
+//!     программа, опрашивающая `/proc/uptime` или `/proc/meminfo`, видит
+//!     актуальные значения, а многоблочный читатель одного файла держит один
+//!     рендер и не склеивает два разных (`docs/procfs.md` §3.2).
+//!   * **`size()` — длина рендера**, а не ноль, как в Linux: путь чтения этого
+//!     ядра выводит EOF из `size()` (`plan_read`), поэтому procfs-файл нулевого
+//!     размера читался бы как мгновенно пустой (DEVIATION-1).
+//!   * **Порядок локов — сначала состояние, потом узел.** Рендеринг
+//!     (`COMPAT_STATES`, PMM, планировщик) идёт до взятия спинлока узла; спинлок
+//!     узла никогда не держится через вызов `with_pid_compat`.
+//!   * **`/proc/self` невидим задаче без `CompatState`** (ядро-поток, boot
+//!     selftest): `lookup` возвращает `NotFound` → `ENOENT`, а не выдумывает
+//!     процесс (`docs/procfs.md` §5.5).
+//!   * **Неизвестные пути — `NotFound`**, wildcard'а нет. Числовой компонент
+//!     резолвится *только* когда pid зарегистрирован в `COMPAT_STATES`, поэтому
+//!     `/proc/<dead-pid>` — `ENOENT`; `/proc/self/fd`, `/proc/loadavg`,
+//!     `/proc/version` и т. п. ведут себя так же.
 //!
-//! Slices:
-//!   * 1 (2.5.0): `/proc/{cpuinfo,meminfo,uptime}` and
-//!     `/proc/self/{exe,cmdline,status,maps}`;
-//!   * 2 (2.9.0): `/proc/stat` from real tick accounting;
-//!   * 3 (2.10.0): `/proc/version`, `/proc/filesystems`, `/proc/loadavg`,
-//!     `/proc/sys/kernel/{ostype,osrelease,hostname}` and the per-pid tree
-//!     `/proc/<pid>/{status,stat,cmdline,maps}`, plus
-//!     `/proc/self/{stat,statm}`;
-//!   * 6 (2.19.0): the per-thread view — `/proc/<pid>/task/` and
-//!     `/proc/self/task/` list one directory per live task of the thread group,
-//!     and `/proc/<tgid>/task/<tid>/` resolves to that task's pid directory
-//!     (Linux identity: one task, one inode, one set of files).
+//! Реализовано: `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,
+//! mounts,cgroup,mountinfo,limits}`; `/proc/sys/kernel/{ostype,osrelease,
+//! hostname}`; per-pid `/proc/<pid>/{status,stat,statm,cmdline,maps,limits,
+//! cgroup,mountinfo,fd/*,fdinfo/*,task/*}`; `/proc/self/*`; per-thread view
+//! `/proc/<pid>/task/` — по каталогу на каждый живой тред группы.
 //!
-//! The per-pid files snapshot the TARGET's state (not the reader's) under
-//! `COMPAT_STATES`, release the registry lock, and only then format the text.
-//! That is the whole point of the `*Snap` structs below: `COMPAT_STATES` is a
-//! non-reentrant spinlock and must never be held across a render (AGENTS.md
-//! invariant 4), while a cpu-bound target may be concurrently changing its
-//! `VmRegionSet`.
+//! Per-pid-файлы снимают состояние ЦЕЛИ (не читателя) под `COMPAT_STATES`,
+//! отпускают лок реестра и только потом форматируют текст. В этом смысл структур
+//! `*Snap` ниже: `COMPAT_STATES` — нереентерабельный спинлок, его нельзя держать
+//! через рендер (AGENTS.md, инвариант 4), а cpu-bound цель может параллельно
+//! менять свой `VmRegionSet`.
 
 use alloc::borrow::Cow;
 use alloc::format;
@@ -65,20 +56,20 @@ use super::elf::LoadSegment;
 use super::procfs_format::{self as fmt, ProcKind};
 use super::{VfsError, VfsNode, VfsResult};
 
-// `/proc/stat` reports USER_HZ units; the counters are raw ticks, so the two
-// rates must be the same constant or every number would silently be wrong.
+// `/proc/stat` отдаёт единицы USER_HZ; счётчики — сырые тики, поэтому обе
+// частоты обязаны быть одной константой, иначе каждое число тихо разойдётся.
 const _: () = assert!(TICK_HZ == stat::USER_HZ);
 
-/// The real crate version (`Cargo.toml` is the single source), the same value
-/// `provision.rs` writes to `/mnt/etc/pagh-release`.
+/// Настоящая версия крейта (единственный источник — `Cargo.toml`), то же
+/// значение `provision.rs` пишет в `/mnt/etc/pagh-release`.
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// `/proc/.../limits` renders one row per Linux resource id; the rlimit table and
-// the syscall layer must agree on that width or `limits` would silently omit or
-// invent a row.
+// `/proc/.../limits` рендерит строку на каждый Linux resource id; таблица
+// rlimit и syscall-слой обязаны совпадать по ширине, иначе `limits` тихо
+// потеряет или выдумает строку.
 const _: () = assert!(fmt::RLIMIT_COUNT == misc::RLIMIT_NLIMITS as usize);
 
-/// The `/proc` subtree root, ready for `vfs::mount_at("/proc", …)`.
+/// Корень поддерева `/proc`, готовый для `vfs::mount_at("/proc", …)`.
 pub fn root() -> Arc<dyn VfsNode> {
     Arc::new(ProcDir {
         name: String::from("proc"),
@@ -87,7 +78,7 @@ pub fn root() -> Arc<dyn VfsNode> {
     })
 }
 
-// ─── directories ────────────────────────────────────────────────────────────
+// ─── каталоги ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DirKind {
@@ -99,29 +90,28 @@ enum DirKind {
     SysDir,
     /// `/proc/sys/kernel`.
     SysKernelDir,
-    /// `/proc/<pid>`, carrying the target pid.
+    /// `/proc/<pid>` с pid цели.
     Pid(u64),
-    /// `/proc/self/fd` or `/proc/<pid>/fd`, carrying the target pid.
+    /// `/proc/self/fd` или `/proc/<pid>/fd` с pid цели.
     FdDir(u64),
-    /// `/proc/self/fdinfo` or `/proc/<pid>/fdinfo`, carrying the target pid.
+    /// `/proc/self/fdinfo` или `/proc/<pid>/fdinfo` с pid цели.
     FdInfoDir(u64),
-    /// `/proc/self/task` or `/proc/<pid>/task`, carrying the **thread-group**
-    /// id (the process whose threads are listed), not the path component it was
-    /// reached through: a non-leader thread's `/proc/<tid>/task` is the same
-    /// thread group as its leader's.
+    /// `/proc/self/task` или `/proc/<pid>/task` с id **группы тредов** (процесса,
+    /// чьи треды листаются), а не компонента пути, через который пришли: у
+    /// не-лидера `/proc/<tid>/task` — та же группа, что у лидера.
     TaskDir(u64),
 }
 
 struct ProcDir {
-    /// `"proc"`, `"self"`, or the decimal pid. Owned because a pid directory's
-    /// name is dynamic (`VfsNode::name` returns `&str`).
+    /// `"proc"`, `"self"` или десятичный pid. Owned, потому что имя pid-каталога
+    /// динамическое (`VfsNode::name` возвращает `&str`).
     name: String,
     ino: u64,
     kind: DirKind,
 }
 
-/// A fresh `/proc/self` node (the children are re-created per lookup so each one
-/// renders for the process that is asking).
+/// Свежий узел `/proc/self` (дети пересоздаются на каждый lookup, чтобы каждый
+/// рендерился для спрашивающего процесса).
 fn self_dir() -> Arc<dyn VfsNode> {
     Arc::new(ProcDir {
         name: String::from("self"),
@@ -130,7 +120,7 @@ fn self_dir() -> Arc<dyn VfsNode> {
     })
 }
 
-/// `/proc/sys` — the read-only sysctl namespace (slice 3).
+/// `/proc/sys` — read-only пространство sysctl.
 fn sys_dir() -> Arc<dyn VfsNode> {
     Arc::new(ProcDir {
         name: String::from("sys"),
@@ -148,9 +138,9 @@ fn sys_kernel_dir() -> Arc<dyn VfsNode> {
     })
 }
 
-/// A fresh `/proc/<pid>` node. Only created after the pid was observed live;
-/// `lookup` re-checks that on every child access, so a cached directory cannot
-/// outlive its process.
+/// Свежий узел `/proc/<pid>`. Создаётся, только когда pid наблюдён живым;
+/// `lookup` перепроверяет это при каждом доступе к ребёнку, поэтому кэшированный
+/// каталог не переживёт свой процесс.
 fn pid_dir(pid: u64) -> Arc<dyn VfsNode> {
     Arc::new(ProcDir {
         name: format!("{}", pid),
@@ -159,13 +149,13 @@ fn pid_dir(pid: u64) -> Arc<dyn VfsNode> {
     })
 }
 
-/// A fresh `/proc/<pid>/task` node.
+/// Свежий узел `/proc/<pid>/task`.
 ///
-/// `tgid` is the thread group whose tasks the directory lists. It is resolved
-/// once, from the path component the caller used (`pid_dir(pid)` stores its own
-/// pid; the node asks the registry for that pid's `tgid`), so
-/// `/proc/<tid>/task` lists the group of a non-leader thread rather than an
-/// empty directory named after its tid.
+/// `tgid` — группа тредов, чьи задачи листает каталог. Она резолвится один раз из
+/// компонента пути, который использовал вызывающий (`pid_dir(pid)` хранит свой
+/// pid, а узел спрашивает у реестра `tgid` этого pid), поэтому
+/// `/proc/<tid>/task` у не-лидера листает его группу, а не пустой каталог с
+/// именем его tid.
 fn task_dir(tgid: u64) -> Arc<dyn VfsNode> {
     Arc::new(ProcDir {
         name: String::from("task"),
@@ -174,7 +164,7 @@ fn task_dir(tgid: u64) -> Arc<dyn VfsNode> {
     })
 }
 
-/// A `/proc/<pid>/fd/<n>` symlink.
+/// Симлинк `/proc/<pid>/fd/<n>`.
 struct ProcFdLink {
     name: String,
     target: String,
@@ -205,7 +195,7 @@ impl VfsNode for ProcFdLink {
     }
 }
 
-/// Human/Linux-shaped target for one open descriptor.
+/// Цель в человеко-/Linux-виде для одного открытого дескриптора.
 fn fd_target(fd: u32, object: &OpenObject) -> String {
     match object {
         OpenObject::Stdin | OpenObject::Console => String::from("/dev/serial"),
@@ -243,7 +233,8 @@ fn fd_dir(pid: u64) -> Arc<dyn VfsNode> {
     })
 }
 
-/// `/proc/self/fdinfo` or `/proc/<pid>/fdinfo`: one regular file per open fd.
+/// `/proc/self/fdinfo` или `/proc/<pid>/fdinfo`: обычный файл на каждый
+/// открытый fd.
 fn fdinfo_dir(pid: u64) -> Arc<dyn VfsNode> {
     Arc::new(ProcDir {
         name: String::from("fdinfo"),
@@ -252,8 +243,8 @@ fn fdinfo_dir(pid: u64) -> Arc<dyn VfsNode> {
     })
 }
 
-/// The target's open descriptors, as numbers only (the fdinfo renderer reads
-/// the object itself later, outside the registry lock).
+/// Открытые дескрипторы цели только номерами (рендерер fdinfo прочитает сам
+/// объект позже, вне лока реестра).
 fn open_fds(pid: u64) -> Vec<u32> {
     compat::with_pid_compat(pid, |cs| {
         (0..cs.fds.capacity() as u32)
@@ -283,10 +274,11 @@ impl VfsNode for ProcDir {
     fn readdir(&self) -> VfsResult<Vec<Arc<dyn VfsNode>>> {
         let mut out: Vec<Arc<dyn VfsNode>> = Vec::new();
         match self.kind {
-            // `readdir` lists the namespace, not the visible-at-this-instant
-            // subset: `self` is listed even for a caller that cannot resolve it
-            // (Linux behaves the same way for a pid directory that disappeared).
-            // The numeric pids ARE a live snapshot: one short registry lock.
+            // `readdir` листает пространство имён, а не видимое в этот момент
+            // подмножество: `self` показывается даже вызывающему, который не
+            // может его резолвить (Linux так же поступает с исчезнувшим
+            // pid-каталогом). Числовые pid — живой снимок: один короткий лок
+            // реестра.
             DirKind::Root => {
                 out.push(self_dir());
                 out.push(sys_dir());
@@ -322,18 +314,17 @@ impl VfsNode for ProcDir {
                 }
                 out.push(fd_dir(pid));
                 out.push(fdinfo_dir(pid));
-                // Every live task has a `task` directory (Linux): for a
-                // non-leader thread it lists the whole thread group, not just
-                // the thread itself.
+                // У каждой живой задачи есть каталог `task` (Linux): у
+                // не-лидера он листает всю группу тредов, а не только его самого.
                 if let Some(tgid) = compat::with_pid_compat(pid, |cs| cs.tgid) {
                     out.push(task_dir(tgid));
                 }
             }
             DirKind::TaskDir(tgid) => {
-                // One numeric directory per live task of the group, ascending
-                // (the registry is a `BTreeMap`). Each entry IS the task's pid
-                // directory, so `/proc/<tgid>/task/<tid>` and `/proc/<tid>` are
-                // the same VFS object.
+                // По числовому каталогу на каждую живую задачу группы по
+                // возрастанию (реестр — `BTreeMap`). Каждая запись ЕСТЬ
+                // pid-каталог задачи, поэтому `/proc/<tgid>/task/<tid>` и
+                // `/proc/<tid>` — один VFS-объект.
                 for tid in compat::thread_group_pids(tgid) {
                     out.push(pid_dir(tid));
                 }
@@ -363,15 +354,15 @@ impl VfsNode for ProcDir {
                     if compat::current_has_compat() {
                         return Ok(self_dir());
                     }
-                    // No process of our own: nothing to describe.
+                    // Своего процесса нет: описывать нечего.
                     return Err(VfsError::NotFound);
                 }
                 if name == "sys" {
                     return Ok(sys_dir());
                 }
-                // Numeric components are the per-pid tree. The liveness check is
-                // what makes this a namespace rather than a wildcard: a dead (or
-                // never-used) pid is ENOENT, never an empty file.
+                // Числовые компоненты — per-pid дерево. Именно проверка живости
+                // делает это пространством имён, а не wildcard'ом: мёртвый (или
+                // никогда не использованный) pid — ENOENT, не пустой файл.
                 if let Some(pid) = fmt::parse_pid_component(name) {
                     return if compat::compat_exists(pid) {
                         Ok(pid_dir(pid))
@@ -397,8 +388,8 @@ impl VfsNode for ProcDir {
                     };
                 }
                 if name == "task" {
-                    // The reader's own thread group; a caller without
-                    // `CompatState` has no threads to describe (§5.5).
+                    // Собственная группа тредов читателя; у вызывающего без
+                    // `CompatState` нет тредов для описания (§5.5).
                     return if compat::current_has_compat() {
                         Ok(task_dir(compat::current_tgid()))
                     } else {
@@ -407,8 +398,8 @@ impl VfsNode for ProcDir {
                 }
                 let e = fmt::proc_self_file(name).ok_or(VfsError::NotFound)?;
                 if e.kind == ProcKind::SelfExe && current_exe().is_none() {
-                    // No image to point at (`readlink` used to answer ENOENT in
-                    // exactly this case).
+                    // Указывать не на что: образа нет (`readlink` в этом случае
+                    // отвечает ENOENT).
                     return Err(VfsError::NotFound);
                 }
                 Ok(file_for(e))
@@ -434,10 +425,10 @@ impl VfsNode for ProcDir {
                     return Ok(fdinfo_dir(pid));
                 }
                 if name == "task" {
-                    // Resolved through the target's `tgid`, so a non-leader
-                    // thread gets its whole thread group here (Linux does the
-                    // same) and the directory name stays a property of the
-                    // group, not of the path component that reached it.
+                    // Резолвится через `tgid` цели, поэтому не-лидер получает
+                    // здесь всю свою группу тредов (Linux делает так же), а имя
+                    // каталога остаётся свойством группы, а не компонента пути,
+                    // через который пришли.
                     return match compat::with_pid_compat(pid, |cs| cs.tgid) {
                         Some(tgid) => Ok(task_dir(tgid)),
                         None => Err(VfsError::NotFound),
@@ -448,18 +439,18 @@ impl VfsNode for ProcDir {
                     .ok_or(VfsError::NotFound)
             }
             DirKind::TaskDir(tgid) => {
-                // A numeric component resolves only when that pid is a LIVE
-                // task of THIS thread group; a registered task from another
-                // process, a dead pid and a non-numeric name are all ENOENT.
-                // That liveness + membership check is what keeps the directory
-                // a namespace instead of a wildcard (`docs/procfs.md` §5.6).
+                // Числовой компонент резолвится, только когда pid — ЖИВАЯ задача
+                // ЭТОЙ группы тредов; зарегистрированная задача другого процесса,
+                // мёртвый pid и нечисловое имя — ENOENT. Проверка живости и
+                // членства держит каталог пространством имён, а не wildcard'ом
+                // (`docs/procfs.md` §5.6).
                 let tid = fmt::parse_pid_component(name).ok_or(VfsError::NotFound)?;
                 let actual = compat::with_pid_compat(tid, |cs| cs.tgid);
                 if actual != Some(tgid) {
                     return Err(VfsError::NotFound);
                 }
-                // Same VFS object as `/proc/<tid>`: one task, one inode, one
-                // set of files (`docs/procfs.md` §13).
+                // Тот же VFS-объект, что `/proc/<tid>`: одна задача, один inode,
+                // один набор файлов (`docs/procfs.md` §13).
                 Ok(pid_dir(tid))
             }
             DirKind::FdDir(pid) => {
@@ -489,7 +480,7 @@ impl VfsNode for ProcDir {
     }
 }
 
-// ─── files ──────────────────────────────────────────────────────────────────
+// ─── файлы ──────────────────────────────────────────────────────────────────
 
 fn file_for(e: fmt::ProcEntry) -> Arc<dyn VfsNode> {
     Arc::new(ProcFile {
@@ -513,8 +504,8 @@ fn pid_file(pid: u64, e: fmt::ProcPidEntry) -> Arc<dyn VfsNode> {
     })
 }
 
-/// `/proc/<pid>/fdinfo/<fd>`: the text node is created only for a live pid and
-/// an open descriptor (the caller has already checked both).
+/// `/proc/<pid>/fdinfo/<fd>`: текстовый узел создаётся только для живого pid и
+/// открытого дескриптора (вызывающий уже проверил оба).
 fn fdinfo_file(pid: u64, fd: u32) -> Arc<dyn VfsNode> {
     Arc::new(ProcFile {
         name: Cow::Owned(alloc::format!("{fd}")),
@@ -526,29 +517,29 @@ fn fdinfo_file(pid: u64, fd: u32) -> Arc<dyn VfsNode> {
     })
 }
 
-/// The current process's image path, when it has one.
+/// Путь образа текущего процесса, если он есть.
 fn current_exe() -> Option<String> {
     compat::with_current_compat(|cs| cs.exe_path.clone()).filter(|p| !p.is_empty())
 }
 
 struct ProcFile {
-    /// Static table name, or the decimal fd for a `fdinfo` node.
+    /// Имя из статической таблицы или десятичный fd для узла `fdinfo`.
     name: Cow<'static, str>,
     ino: u64,
     kind: ProcKind,
-    /// Target of a `ProcKind::Pid*`/`FdInfo` node; ignored by the
-    /// `Self*`/static kinds.
+    /// Цель узла `ProcKind::Pid*`/`FdInfo`; у `Self*`/статических видов не
+    /// используется.
     pid: u64,
-    /// Descriptor of a `ProcKind::FdInfo` node (0 for every other kind).
+    /// Дескриптор узла `ProcKind::FdInfo` (0 для остальных видов).
     fd: u32,
-    /// The render in use for the current reading pass. Filled on demand; a
-    /// zero-offset read refreshes it (see the module docs).
+    /// Рендер текущего прохода чтения. Заполняется по требованию; чтение со
+    /// смещения 0 его обновляет (см. документацию модуля).
     buf: Spinlock<Option<Vec<u8>>>,
 }
 
 impl ProcFile {
-    /// Render the file's current text. Called with **no** node lock held, and it
-    /// takes no node lock itself, so it may freely reach into kernel state.
+    /// Рендерит текущий текст файла. Вызывается **без** спинлока узла и сам его
+    /// не берёт, поэтому может свободно обращаться к состоянию ядра.
     fn render(&self) -> Vec<u8> {
         match self.kind {
             ProcKind::CpuInfo => fmt::format_cpuinfo(&[cpuid::read()]),
@@ -557,10 +548,10 @@ impl ProcFile {
                 free_kb: pmm::free_frames() as u64 * PAGE_SIZE / 1024,
             }),
             ProcKind::Uptime => fmt::format_uptime(scheduler::ticks(), TICK_HZ),
-            // Counters only: no wall-clock read and no arithmetic in the
-            // renderer (`docs/procfs.md` §4.8). `procs_blocked` is a real zero:
-            // this scheduler has no blocked state (blocking waits yield and stay
-            // runnable), so there is nothing to count.
+            // Только счётчики: ни чтения wall-clock, ни арифметики в рендерере
+            // (`docs/procfs.md` §4.8). `procs_blocked` — честный ноль: у этого
+            // планировщика нет состояния blocked (блокирующие ожидания уступают
+            // и остаются runnable), считать нечего.
             ProcKind::Stat => {
                 let cpu = stat::cpu_ticks();
                 fmt::format_stat(&fmt::StatInputs {
@@ -583,7 +574,7 @@ impl ProcFile {
             ProcKind::PidStatus => self.render_status(self.pid),
             ProcKind::PidMaps => self.render_maps(self.pid),
             ProcKind::PidStat => self.render_stat(self.pid),
-            // The real crate version, never a fabricated Linux release string.
+            // Настоящая версия крейта, а не выдуманная строка Linux-релиза.
             ProcKind::Version => fmt::format_version(KERNEL_VERSION),
             ProcKind::FileSystems => fmt::format_filesystems(&fmt::FILESYSTEMS),
             ProcKind::LoadAvg => {
@@ -629,32 +620,32 @@ impl ProcFile {
                     .collect();
                 fmt::format_mounts(&refs)
             }
-            // The `exe` node is a symlink, not a readable file.
+            // Узел `exe` — симлинк, а не читаемый файл.
             ProcKind::SelfExe => Vec::new(),
         }
     }
 
-    /// Render into the session buffer (idempotent).
+    /// Рендерит в буфер сессии (идемпотентно).
     fn refresh(&self) {
         let fresh = self.render();
         *self.buf.lock() = Some(fresh);
     }
 
-    /// `/proc/<pid>/cmdline` is the argv snapshot `CompatState` already holds in
-    /// Linux's NUL-separated form (`format_cmdline`). Copy it out under the
-    /// registry lock, format nothing.
+    /// `/proc/<pid>/cmdline` — снимок argv, который `CompatState` уже держит в
+    /// Linux-форме с разделителями NUL (`format_cmdline`). Копируем под локом
+    /// реестра, ничего не форматируя.
     fn render_cmdline(&self, pid: u64) -> Vec<u8> {
         compat::with_pid_compat(pid, |cs| cs.cmdline.clone()).unwrap_or_default()
     }
 
     fn render_status(&self, pid: u64) -> Vec<u8> {
         let Some(s) = compat::with_pid_compat(pid, |cs| StatusSnap::from(cs)) else {
-            // The target exited between lookup and render: an empty file is the
-            // only truthful answer a VFS node can give (the path itself is gone).
+            // Цель завершилась между lookup и рендером: пустой файл — единственный
+            // честный ответ VFS-узла (сам путь уже исчез).
             return Vec::new();
         };
-        // Threads = the target thread plus every other thread of its group.
-        // Queried outside the registry lock (`group_member_pids` takes it).
+        // Threads = целевой тред плюс все другие треды его группы. Запрашивается
+        // вне лока реестра (`group_member_pids` берёт его сам).
         let threads = compat::group_member_pids(s.tgid, pid).len() as u64 + 1;
 
         fmt::format_status(&fmt::StatusInputs {
@@ -688,7 +679,7 @@ impl ProcFile {
             pid,
             state: pid_state(pid),
             ppid: s.ppid,
-            // One process group per thread group (pagh does not model sessions).
+            // Одна группа процессов на группу тредов (сессии pagh не моделирует).
             pgrp: s.tgid,
             session: s.tgid,
             threads,
@@ -716,12 +707,12 @@ impl ProcFile {
         maps_text(&s)
     }
 
-    /// `/proc/<pid>/limits`: the target's effective `(soft, hard)` pair for
-    /// every Linux resource id. A per-process `prlimit64`/`setrlimit` override
-    /// wins; otherwise the kernel default (`misc::default_rlimit`) is reported,
-    /// which is exactly what `getrlimit(2)` returns for that target. Resources
-    /// the kernel does not model default to `RLIM_INFINITY` and render as
-    /// `unlimited` — never as an invented number.
+    /// `/proc/<pid>/limits`: эффективная пара `(soft, hard)` цели для каждого
+    /// Linux resource id. Побеждает per-process override из `prlimit64`/
+    /// `setrlimit`; иначе отдаётся дефолт ядра (`misc::default_rlimit`) — ровно
+    /// то, что `getrlimit(2)` вернёт для этой цели. Ресурсы, которые ядро не
+    /// моделирует, дают `RLIM_INFINITY` и рендерятся как `unlimited`, а не
+    /// выдуманным числом.
     fn render_limits(&self, pid: u64) -> Vec<u8> {
         let Some(values) = compat::with_pid_compat(pid, |cs| {
             let mut values = [(fmt::RLIM_INFINITY, fmt::RLIM_INFINITY); fmt::RLIMIT_COUNT];
@@ -739,9 +730,10 @@ impl ProcFile {
         fmt::format_limits(&values)
     }
 
-    /// `/proc/<pid>/fdinfo/<fd>`: snapshot the descriptor's real position,
-    /// flags, mount and inode under the registry lock, then format after it is
-    /// released. `mnt_id`/`ino` stay 0 for objects with no VFS mount/inode.
+    /// `/proc/<pid>/fdinfo/<fd>`: снимает реальные position, flags, mount и
+    /// inode дескриптора под локом реестра, затем форматирует после его
+    /// освобождения. `mnt_id`/`ino` остаются 0 у объектов без VFS-монтирования/
+    /// inode.
     fn render_fdinfo(&self, pid: u64, fd: u32) -> Vec<u8> {
         let Some(s) = compat::with_pid_compat(pid, |cs| FdInfoSnap::from(cs, fd)).flatten() else {
             return Vec::new();
@@ -749,8 +741,8 @@ impl ProcFile {
         let mnt_id = s.path.as_deref().map(mount_id_for_path).unwrap_or(0);
         let ino = match &s.node {
             Some(node) => crate::arch::x86_64::linux::io_sys::node_ino(node),
-            // A directory descriptor keeps only its path; resolve it outside
-            // the registry lock to report the directory's real inode.
+            // Дескриптор каталога хранит только путь; резолвим его вне лока
+            // реестра, чтобы показать настоящий inode каталога.
             None => s
                 .path
                 .as_deref()
@@ -767,15 +759,15 @@ impl ProcFile {
     }
 }
 
-/// Real descriptor fields copied out from under `COMPAT_STATES`.
+/// Настоящие поля дескриптора, скопированные из-под `COMPAT_STATES`.
 struct FdInfoSnap {
     pos: u64,
     flags: u64,
-    /// Absolute VFS path for a `File`/`Dir` descriptor; `None` for stdio,
-    /// pipes, sockets and the other anonymous objects.
+    /// Абсолютный VFS-путь для дескриптора `File`/`Dir`; `None` для stdio,
+    /// пайпов, сокетов и прочих анонимных объектов.
     path: Option<String>,
-    /// Backing VFS node for a `File` descriptor (cloned so `fs_ino()` runs
-    /// after the registry lock is released).
+    /// VFS-узел за дескриптором `File` (клонируется, чтобы `fs_ino()`
+    /// выполнился после освобождения лока реестра).
     node: Option<Arc<dyn VfsNode>>,
 }
 
@@ -789,10 +781,10 @@ impl FdInfoSnap {
                 path: Some(path.clone()),
                 node: Some(Arc::clone(node)),
             }),
-            // The only position a directory descriptor has in this kernel is
-            // the `getdents64` child cursor (`lseek(SEEK_SET)` sets exactly
-            // this index), so report it as `pos` rather than inventing a byte
-            // offset Linux would report.
+            // Единственная позиция дескриптора каталога в этом ядре — курсор
+            // детей `getdents64` (`lseek(SEEK_SET)` ставит ровно этот индекс),
+            // поэтому отдаём его как `pos`, не выдумывая байтовое смещение, как
+            // в Linux.
             OpenObject::Dir { path, index, .. } => Some(FdInfoSnap {
                 pos: *index as u64,
                 flags,
@@ -809,11 +801,11 @@ impl FdInfoSnap {
     }
 }
 
-/// Map a kernel VFS path to the id `/proc/*/mountinfo` assigns it: the
-/// 1-based index of the longest matching mount point in the sorted
-/// [`super::mount_snapshot`]. This is the same table and the same order, so a
-/// file's `mnt_id` and the corresponding mountinfo row agree. `memfd` paths are
-/// not mounted anywhere and report 0.
+/// Отображает путь VFS ядра в id, который назначает `/proc/*/mountinfo`:
+/// 1-based индекс самой длинной подходящей точки монтирования в отсортированном
+/// [`super::mount_snapshot`]. Таблица и порядок те же, поэтому `mnt_id` файла и
+/// соответствующая строка mountinfo согласованы. Пути `memfd` нигде не
+/// смонтированы и дают 0.
 fn mount_id_for_path(path: &str) -> u64 {
     if path.starts_with("/memfd:") {
         return 0;
@@ -833,9 +825,9 @@ fn mount_id_for_path(path: &str) -> u64 {
     best.map(|(_, id)| id).unwrap_or(0)
 }
 
-/// Is the target task currently parked by a stop signal? This kernel tracks
-/// exactly two observable states for `/proc` purposes: `R` (running/ready) and
-/// `T` (stopped; `scheduler::STOPPED_TASKS`). Sleeping tasks are not modelled.
+/// Запаркована ли целевая задача stop-сигналом? Для `/proc` это ядро различает
+/// ровно два наблюдаемых состояния: `R` (running/ready) и `T` (stopped;
+/// `scheduler::STOPPED_TASKS`). Спящие задачи не моделируются.
 fn pid_state(pid: u64) -> u8 {
     if scheduler::is_stopped(pid) {
         b'T'
@@ -844,8 +836,8 @@ fn pid_state(pid: u64) -> u8 {
     }
 }
 
-/// Everything `/proc/<pid>/{status,stat,statm}` needs, copied out from under the
-/// registry lock so formatting never holds it (AGENTS.md invariant 4).
+/// Всё, что нужно `/proc/<pid>/{status,stat,statm}`, скопированное из-под лока
+/// реестра, чтобы форматирование его никогда не держало (AGENTS.md, инвариант 4).
 struct StatusSnap {
     name: Vec<u8>,
     umask: u32,
@@ -859,9 +851,9 @@ struct StatusSnap {
     uids: [u32; 4],
     gids: [u32; 4],
     vm: fmt::VmKb,
-    /// Current program break (`/proc/<pid>/stat` field 47).
+    /// Текущий program break (поле 47 `/proc/<pid>/stat`).
     current_brk: u64,
-    /// Recorded exit code (`/proc/<pid>/stat` field 52), 0 while alive.
+    /// Записанный код выхода (поле 52 `/proc/<pid>/stat`), 0 пока жива.
     exit_code: i64,
 }
 
@@ -873,8 +865,8 @@ impl StatusSnap {
         };
         let name = fmt::task_name(&cs.exe_path, argv0);
 
-        // Disposition masks: `SIG_IGN` for ignored signals, "handler installed"
-        // for everything that is neither default nor ignore.
+        // Маски диспозиций: `SIG_IGN` для игнорируемых сигналов, «установлен
+        // обработчик» для всего, что не default и не ignore.
         let mut sig_ign = 0u64;
         let mut sig_cgt = 0u64;
         for (i, action) in cs.sig.lock().handlers.iter().enumerate() {
@@ -897,9 +889,9 @@ impl StatusSnap {
             sig_blocked: cs.sig_blocked,
             sig_ign,
             sig_cgt,
-            // Linux's four Uid/Gid columns are real, effective, saved and
-            // filesystem. pagh has no separate fsuid/fsgid, so the last column
-            // repeats the effective id.
+            // Четыре колонки Uid/Gid в Linux — real, effective, saved и
+            // filesystem. В pagh нет отдельных fsuid/fsgid, поэтому последняя
+            // колонка повторяет effective id.
             uids: [cs.creds.uid, cs.creds.euid, cs.creds.suid, cs.creds.euid],
             gids: [cs.creds.gid, cs.creds.egid, cs.creds.sgid, cs.creds.egid],
             vm,
@@ -909,13 +901,13 @@ impl StatusSnap {
     }
 }
 
-/// `/proc/<pid>/maps` inputs, snapshotted under the registry lock.
+/// Входы `/proc/<pid>/maps`, снятые под локом реестра.
 struct MapsSnap {
     exe_path: String,
-    /// `st_ino` of the image's VFS node (`stat(2)` identity), 0 when unknown.
+    /// `st_ino` VFS-узла образа (идентичность `stat(2)`), 0 если неизвестен.
     image_ino: u64,
     interp_path: String,
-    /// `st_ino` of the interpreter's VFS node, 0 for static images.
+    /// `st_ino` VFS-узла интерпретатора, 0 для статических образов.
     interp_ino: u64,
     image_segments: Vec<LoadSegment>,
     interp_segments: Vec<LoadSegment>,
@@ -941,12 +933,12 @@ impl MapsSnap {
     }
 }
 
-/// Render a `/proc/<pid>/maps` snapshot (shared by `self` and pid nodes).
+/// Рендерит снимок `/proc/<pid>/maps` (общий для `self` и pid-узлов).
 fn maps_text(s: &MapsSnap) -> Vec<u8> {
-    // File-backed lines carry the real `st_dev`/`st_ino` that `stat(2)` reports
-    // for the same VFS node, and file-backed `mmap`s also carry their pathname
-    // and file offset (`docs/procfs.md` §14). A node without a VFS identity
-    // keeps the honest `00:00 0`.
+    // Строки file-backed несут настоящие `st_dev`/`st_ino`, которые `stat(2)`
+    // отдаёт для того же VFS-узла, а file-backed `mmap` ещё и pathname и file
+    // offset (`docs/procfs.md` §14). Узел без VFS-идентичности сохраняет честный
+    // `00:00 0`.
     let mut regions: Vec<fmt::MapsRegion> = Vec::new();
     let (image_dev, image_ino) = file_identity(s.image_ino);
     for seg in &s.image_segments {
@@ -988,7 +980,7 @@ fn maps_text(s: &MapsSnap) -> Vec<u8> {
                 let (maj, min) = fmt::dev_bytes(vfs_dev());
                 (maj, min, b.ino, b.file_offset, Some(b.path.as_str()))
             }
-            // Anonymous mapping: no backing file, so no file identity to print.
+            // Анонимный маппинг: файла за ним нет, печатать идентичность нечего.
             None => (0, 0, 0, 0, None),
         };
         regions.push(fmt::MapsRegion {
@@ -1018,14 +1010,14 @@ fn maps_text(s: &MapsSnap) -> Vec<u8> {
     fmt::format_maps(&regions)
 }
 
-/// The `st_dev` every VFS node reports through `stat(2)` (`08:00`); a maps line
-/// for a file-backed mapping must print the same device `stat` would.
+/// `st_dev`, который каждый VFS-узел отдаёт через `stat(2)` (`08:00`); строка
+/// maps для file-backed-маппинга обязана печатать то же устройство, что `stat`.
 fn vfs_dev() -> u64 {
     crate::arch::x86_64::linux::io_sys::STAT_DEV_VFS
 }
 
-/// `(dev, ino)` for a file-backed region: the real `stat(2)` identity when the
-/// node has one, otherwise the honest `00:00 0` sentinel.
+/// `(dev, ino)` для file-backed-региона: настоящая идентичность `stat(2)`, если
+/// у узла она есть, иначе честный сентинел `00:00 0`.
 fn file_identity(ino: u64) -> (u64, u64) {
     if ino == 0 {
         (0, 0)
@@ -1034,7 +1026,7 @@ fn file_identity(ino: u64) -> (u64, u64) {
     }
 }
 
-/// One `/proc/<pid>/maps` line for a loaded `PT_LOAD` segment.
+/// Одна строка `/proc/<pid>/maps` для загруженного `PT_LOAD`-сегмента.
 fn seg_region<'a>(
     seg: &LoadSegment,
     path: Option<&'a str>,
@@ -1054,7 +1046,7 @@ fn seg_region<'a>(
     }
 }
 
-/// ELF `p_flags` (`PF_R`/`PF_W`/`PF_X`) → Linux `PROT_*` bits.
+/// ELF `p_flags` (`PF_R`/`PF_W`/`PF_X`) → биты Linux `PROT_*`.
 fn prot_bits(p_flags: u32) -> u32 {
     let mut prot = 0;
     if p_flags & 4 != 0 {
@@ -1069,7 +1061,7 @@ fn prot_bits(p_flags: u32) -> u32 {
     prot
 }
 
-/// Page-rounded Vm* accounting for the loaded images, in KiB.
+/// Округлённый по страницам учёт Vm* загруженных образов, в КиБ.
 fn image_kb(image: &[LoadSegment], interp: &[LoadSegment]) -> (u64, u64) {
     let mut total = 0u64;
     for seg in image.iter().chain(interp.iter()) {
@@ -1078,11 +1070,11 @@ fn image_kb(image: &[LoadSegment], interp: &[LoadSegment]) -> (u64, u64) {
     (total / 1024, total / 1024)
 }
 
-/// Snapshot the target's Vm* accounting and current break under one `vm` lock.
+/// Снимает учёт Vm* цели и текущий break под одним локом `vm`.
 ///
-/// `size` is image + heap + stack + anonymous mappings; `rss` counts only the
-/// eagerly backed parts (image + stack), exactly as `/proc/self/status` has
-/// reported since slice 1 (`docs/procfs.md` §4.5.1, DEVIATION-5).
+/// `size` = образ + heap + stack + анонимные маппинги; `rss` считает только
+/// заранее выделенные части (образ + stack) — ровно как сообщает
+/// `/proc/self/status` (`docs/procfs.md` §4.5.1, DEVIATION-5).
 fn vm_kb(cs: &CompatState) -> (fmt::VmKb, u64) {
     let guard = cs.vm.lock();
     let heap_lo = page_down(guard.initial_brk);
@@ -1142,8 +1134,9 @@ impl VfsNode for ProcFile {
     }
 
     fn size(&self) -> u64 {
-        // Rendered on first touch; afterwards the session buffer is reused so
-        // `size()` and `read()` inside one syscall agree.
+        // Рендерится при первом обращении; дальше буфер сессии
+        // переиспользуется, чтобы `size()` и `read()` в одном syscall были
+        // согласованы.
         if self.buf.lock().is_none() {
             self.refresh();
         }
@@ -1156,11 +1149,12 @@ impl VfsNode for ProcFile {
 
     fn read(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         if self.kind == ProcKind::SelfExe {
-            // A symlink has no readable content; `open` follows it instead.
+            // У симлинка нет читаемого содержимого; `open` вместо этого
+            // следует по нему.
             return Err(VfsError::NotSupported);
         }
         if offset == 0 {
-            // Start of a reading pass: show current state.
+            // Начало прохода чтения: показываем текущее состояние.
             self.refresh();
         } else if self.buf.lock().is_none() {
             self.refresh();
@@ -1180,8 +1174,8 @@ impl VfsNode for ProcFile {
         Ok(n)
     }
 
-    // write/truncate/create/remove keep the trait defaults (`NotSupported`): the
-    // syscall layer maps that to `EACCES` for a read-only synthetic file.
+    // write/truncate/create/remove остаются дефолтами трейта (`NotSupported`):
+    // syscall-слой отображает это в `EACCES` для read-only синтетического файла.
     fn readdir(&self) -> VfsResult<Vec<Arc<dyn VfsNode>>> {
         Err(VfsError::NotSupported)
     }

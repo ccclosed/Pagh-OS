@@ -1,14 +1,14 @@
-//! Own UDP layer: socket table, datagram demux, and the DHCP client.
+//! Свой UDP-слой: таблица сокетов, демультиплексирование датаграмм и DHCP-клиент.
 //!
-//! UDP sockets are identified by a table index (the `SocketHandle` consumers
-//! hold). Demux matches on the local port only — every socket binds a distinct
-//! ephemeral or well-known port, which is all this stack needs (DNS queries on
-//! ephemeral ports, DHCP on 68, the UDP echo service).
+//! UDP-сокеты идентифицируются индексом таблицы (`SocketHandle`, который держат
+//! потребители). Demux сопоставляет только локальный порт — каждый сокет
+//! привязан к отдельному эфемерному или well-known порту, чего этому стеку
+//! достаточно (DNS-запросы на эфемерных портах, DHCP на 68, UDP echo-сервис).
 //!
-//! The DHCP client (RFC 2131) is a small state machine driven from
-//! [`DhcpClient::drive`], called once per poll. It speaks broadcast DISCOVER →
-//! OFFER → REQUEST → ACK, applies the lease (address/prefix/router/DNS/lease
-//! time), renews at T1, and restarts discovery when a phase stalls.
+//! DHCP-клиент (RFC 2131) — небольшая state machine, ведомая
+//! [`DhcpClient::drive`], вызываемой раз за poll. Она говорит broadcast DISCOVER →
+//! OFFER → REQUEST → ACK, применяет lease (address/prefix/router/DNS/lease time),
+//! продлевает на T1 и перезапускает discovery, когда фаза застревает.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -16,12 +16,12 @@ use alloc::vec::Vec;
 use super::wire::{self, udp_build, udp_parse, IpAddr, IpEndpoint, Ipv4Addr};
 use super::Stack;
 
-/// Per-socket queued-datagram cap.
+/// Кап датаграмм в очереди на сокет.
 const RX_QUEUE_CAP: usize = 16;
-/// Largest datagram buffered per queue entry.
+/// Максимальная датаграмма, буферизуемая на запись очереди.
 const MAX_DGRAM: usize = 2048;
 
-// ─── Socket table ────────────────────────────────────────────────────────────
+// ─── Таблица сокетов ────────────────────────────────────────────────────────
 
 pub struct UdpSock {
     pub(crate) port: u16,
@@ -38,7 +38,7 @@ impl UdpTable {
         UdpTable { socks: Vec::new() }
     }
 
-    /// Open a socket bound to `port`. Returns its handle.
+    /// Открыть сокет, привязанный к `port`. Возвращает его хэндл.
     pub fn open(&mut self, port: u16) -> usize {
         for (i, s) in self.socks.iter().enumerate() {
             if s.is_none() {
@@ -66,13 +66,13 @@ impl UdpTable {
         self.socks.get(h)?.as_ref().map(|s| s.port)
     }
 
-    /// Is `port` bound by any live socket?
+    /// Занят ли `port` каким-либо живым сокетом?
     pub(crate) fn port_in_use(&self, port: u16) -> bool {
         self.socks.iter().flatten().any(|s| s.port == port)
     }
 
-    /// Queue an incoming datagram for the socket bound to `dst_port`.
-    /// Returns false when no listener exists or the queue is full.
+    /// Поставить входящую датаграмму в очередь сокета, привязанного к `dst_port`.
+    /// Возвращает false, когда листенера нет или очередь полна.
     pub(crate) fn demux(&mut self, src: IpEndpoint, dst_port: u16, payload: &[u8]) -> bool {
         for slot in self.socks.iter_mut().flatten() {
             if slot.port == dst_port {
@@ -88,7 +88,7 @@ impl UdpTable {
         false // no listener (an ICMP port-unreachable would go here)
     }
 
-    /// Receive one datagram if available. Returns `(len, sender_endpoint)`.
+    /// Принять одну датаграмму, если есть. Возвращает `(len, sender_endpoint)`.
     pub fn recv(&mut self, h: usize, dst: &mut [u8]) -> Option<(usize, IpEndpoint)> {
         let sock = self.socks.get_mut(h)?.as_mut()?;
         let (data, ep) = sock.rx.pop_front()?;
@@ -112,7 +112,7 @@ impl UdpTable {
     }
 }
 
-/// Send one UDP datagram from `local_port` to `remote` through the stack.
+/// Послать одну UDP-датаграмму с `local_port` на `remote` через стек.
 pub(crate) fn send_from(
     st: &mut Stack,
     local_port: u16,
@@ -132,13 +132,13 @@ pub(crate) fn send_from(
     Ok(())
 }
 
-/// Handle one incoming UDP datagram (checksum already verified by `udp_parse`).
+/// Обработать одну входящую UDP-датаграмму (checksum уже проверен `udp_parse`).
 pub(crate) fn input(st: &mut Stack, src_ip: IpAddr, dst_ip: IpAddr, dgram: &[u8]) {
     let Some((src_ep, dst_ep, payload)) = udp_parse(src_ip, dst_ip, dgram) else {
         return;
     };
-    // The DHCP socket gets first refusal so boot-phase packets land even when
-    // other sockets exist.
+    // DHCP-сокет получает первый отказ, чтобы boot-фазовые пакеты доходили, даже
+    // когда есть другие сокеты.
     if dst_ep.port == DhcpClient::local_port() {
         st.dhcp.on_datagram(src_ep, payload);
         return;
@@ -146,18 +146,18 @@ pub(crate) fn input(st: &mut Stack, src_ip: IpAddr, dst_ip: IpAddr, dgram: &[u8]
     st.udp.demux(src_ep, dst_ep.port, payload);
 }
 
-// ─── DHCP client ─────────────────────────────────────────────────────────────
+// ─── DHCP-клиент ─────────────────────────────────────────────────────────────
 
 const DHCP_CLIENT_PORT: u16 = 68;
 const DHCP_SERVER_PORT: u16 = 67;
 
-// DHCP message types (option 53).
+// Типы DHCP-сообщений (option 53).
 const DHCPDISCOVER: u8 = 1;
 const DHCPOFFER: u8 = 2;
 const DHCPREQUEST: u8 = 3;
 const DHCPACK: u8 = 5;
 
-/// Retry cadence for Discover/Request phases.
+/// Ритм повторов фаз Discover/Request.
 const RETRY_TICKS: u64 = 2000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -168,13 +168,13 @@ enum Phase {
     Bound,
 }
 
-/// Lease state applied by `net::poll` once an ACK arrives.
+/// Lease-состояние, применяемое `net::poll` по приходу ACK.
 pub struct DhcpLease {
     pub addr: Ipv4Addr,
     pub prefix: u8,
     pub router: Option<Ipv4Addr>,
     pub dns_servers: Vec<Ipv4Addr>,
-    /// Lease lifetime in seconds (kept for future renewal tuning).
+    /// Время жизни lease в секундах (оставлено для будущей настройки renewal).
     #[allow(dead_code)]
     pub lease_secs: u32,
 }
@@ -224,8 +224,8 @@ impl DhcpClient {
         }
     }
 
-    /// Advance the state machine one step. Returns `Some(lease)` exactly once
-    /// per newly-acquired lease.
+    /// Продвинуть state machine на шаг. Возвращает `Some(lease)` ровно один раз
+    /// на каждый только что полученный lease.
     pub fn drive(&mut self, st: &mut Stack, now: u64) -> Option<DhcpLease> {
         match self.phase {
             Phase::Init => {
@@ -233,9 +233,9 @@ impl DhcpClient {
                     st.udp.open(DHCP_CLIENT_PORT);
                     self.socket_opened = true;
                 }
-                // Fresh random xid for each discovery attempt (the constant
-                // default is predictable and survives across retries, letting
-                // a spoofed OFFER/ACK match a stale exchange).
+                // Свежий случайный xid на каждую попытку discovery (константный
+                // дефолт предсказуем и переживает повторы, позволяя spoofed
+                // OFFER/ACK совпасть с устаревшим обменом).
                 self.xid = super::random_u32();
                 let mac = st.mac;
                 let pkt = dhcp_packet(
@@ -309,9 +309,9 @@ impl DhcpClient {
                 None
             }
             Phase::Bound => {
-                // Renewal at T1: unicast REQUEST to the leasing server with
-                // ciaddr filled. If the network vanished entirely, the poll
-                // loop's fallback logic handles deconfiguration.
+                // Renewal на T1: unicast REQUEST лизингодателю с заполненным
+                // ciaddr. Если сеть пропала совсем, fallback-логика poll-цикла
+                // занимается деконфигурацией.
                 if let Some(t1) = self.t1_deadline {
                     if now >= t1 {
                         let addr = st.cidr.map(|c| c.addr).unwrap_or(Ipv4Addr::UNSPECIFIED);
@@ -323,7 +323,7 @@ impl DhcpClient {
                         self.t1_deadline = Some(now + self.lease_ticks_total / 2);
                     }
                 }
-                // Consume any late replies quietly (configuration unchanged).
+                // Тихо поглотить поздние ответы (конфигурация не меняется).
                 while let Some((_ep, _pkt)) = self.rx.pop_front() {}
                 None
             }
@@ -331,13 +331,13 @@ impl DhcpClient {
     }
 }
 
-// ─── DHCP wire format ────────────────────────────────────────────────────────
+// ─── Wire-формат DHCP ────────────────────────────────────────────────────────
 
 const DHCP_COOKIE: [u8; 4] = [0x63, 0x82, 0x53, 0x63];
 const OPT_MSG_TYPE: u8 = 53;
 const OPT_END: u8 = 255;
 
-/// Build a minimal BOOTREQUEST/DHCP packet (fixed header + cookie + options).
+/// Построить минимальный BOOTREQUEST/DHCP-пакет (фиксированный заголовок + cookie + опции).
 fn dhcp_packet(
     xid: u32,
     msg_type: u8,
@@ -354,8 +354,8 @@ fn dhcp_packet(
     p.push(0); // hops
     p.extend_from_slice(&xid.to_be_bytes());
     p.extend_from_slice(&[0, 0]); // secs
-                                  // Broadcast flag set: QEMU's DHCP server answers broadcasts fine even
-                                  // before we have an address.
+                                  // Broadcast-флаг выставлен: DHCP-сервер QEMU отвечает
+                                  // на broadcast нормально даже до появления адреса.
     p.extend_from_slice(&[0x80, 0x00]);
     p.extend_from_slice(&ciaddr.0); // ciaddr
     p.extend_from_slice(&[0; 4]); // yiaddr
@@ -367,9 +367,9 @@ fn dhcp_packet(
     p.extend_from_slice(&[0u8; 64]); // sname
     p.extend_from_slice(&[0u8; 128]); // file
     p.extend_from_slice(&DHCP_COOKIE);
-    // Options.
+    // Опции.
     p.extend_from_slice(&[OPT_MSG_TYPE, 1, msg_type]);
-    // Parameter request list: subnet(1), router(3), dns(6), lease(51), server(54)
+    // Список запрашиваемых параметров: subnet(1), router(3), dns(6), lease(51), server(54)
     p.extend_from_slice(&[55, 5, 1, 3, 6, 51, 54]);
     p.extend_from_slice(extra_options);
     p.push(OPT_END);
@@ -385,10 +385,10 @@ struct ParsedReply {
     lease_secs: u32,
 }
 
-/// Parse a DHCP reply (BOOTREPLY), requiring `want_type` in option 53 and a
-/// matching xid.
+/// Разобрать DHCP-ответ (BOOTREPLY), требуя `want_type` в option 53 и
+/// совпадающий xid.
 fn parse_reply(pkt: &[u8], xid: u32, want_type: u8) -> Option<ParsedReply> {
-    // Fixed header is 236 bytes + 4-byte cookie.
+    // Фиксированный заголовок — 236 байт + 4-байтовый cookie.
     if pkt.len() < 240 || pkt[0] != 2 {
         return None;
     }
@@ -430,9 +430,9 @@ fn parse_reply(pkt: &[u8], xid: u32, want_type: u8) -> Option<ParsedReply> {
                 match kind {
                     OPT_MSG_TYPE if len >= 1 => msg_type = Some(v[0]),
                     1 if len == 4 => {
-                        // Subnet mask -> prefix length.
+                        // Маска подсети -> длина префикса.
                         out.prefix = v.iter().filter(|&&b| b == 0xFF).count() as u8 * 8;
-                        // Handle non-contiguous masks defensively: count leading FFs only.
+                        // Защитно обработать несмежные маски: считать только ведущие FF.
                         let mut prefix = 0u8;
                         for &b in v {
                             if b == 0xFF {
@@ -442,7 +442,7 @@ fn parse_reply(pkt: &[u8], xid: u32, want_type: u8) -> Option<ParsedReply> {
                             }
                         }
                         if prefix == 0 && v[0] != 0 {
-                            // Non-byte-aligned mask: derive from leading ones of the partial octet.
+                            // Не выровненная по байту маска: вывести из ведущих единиц частичного октета.
                             let mut b = v[0];
                             while b & 0x80 != 0 {
                                 prefix += 1;
@@ -480,7 +480,7 @@ fn parse_reply(pkt: &[u8], xid: u32, want_type: u8) -> Option<ParsedReply> {
     Some(out)
 }
 
-// Silence unused import when built without tests exercising `vec!`.
+// Заглушить неиспользуемый импорт, когда сборка без тестов, использующих `vec!`.
 #[cfg(test)]
 use alloc::vec as _vec_macro_alias;
 
@@ -542,7 +542,7 @@ mod tests {
         p[0] = 2; // BOOTREPLY
         p[4..8].copy_from_slice(&42u32.to_be_bytes());
         p[16..20].copy_from_slice(&[10, 0, 2, 15]); // yiaddr
-                                                    // Append options: 53/1=OFFER, 54/4=server, 51/4=lease, 1/4=mask, 3/4=router
+                                                    // Дописать опции: 53/1=OFFER, 54/4=server, 51/4=lease, 1/4=mask, 3/4=router
         let mut opts: Vec<u8> = vec![53, 1, DHCPOFFER];
         opts.extend_from_slice(&[54, 4, 10, 0, 2, 2]);
         opts.extend_from_slice(&[51, 4, 0, 0, 14, 16]); // 3600s
@@ -561,7 +561,7 @@ mod tests {
     }
 }
 
-/// Best source address for an outgoing datagram of the same family as `remote`.
+/// Лучший source-адрес для исходящей датаграммы того же семейства, что `remote`.
 pub(crate) fn source_addr(st: &Stack) -> IpAddr {
     match st.cidr.map(|c| c.addr) {
         Some(v4) => IpAddr::V4(v4),
