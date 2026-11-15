@@ -270,16 +270,21 @@ fn decode_packet(m: &mut MouseInner) {
     // IntelliMouse wheel: the fourth byte carries the vertical delta as a signed
     // 4-bit value in its low nibble (the high nibble is button/sign state that
     // this driver does not use). Sign-extend before accumulating.
+    let mut dz = 0i32;
     if m.packet_len >= 4 {
         let nibble = m.packet[3] & 0x0F;
-        let dz = if nibble & 0x08 != 0 {
+        dz = if nibble & 0x08 != 0 {
             nibble as i8 - 16
         } else {
             nibble as i8
-        };
-        m.wheel = m.wheel.wrapping_add(dz as i32);
+        } as i32;
+        m.wheel = m.wheel.wrapping_add(dz);
     }
     m.seq = m.seq.wrapping_add(1);
+    // Тот же пакет — в evdev (`/dev/input/event0`): кнопки как BTN_*, движение
+    // как REL_X/REL_Y в screen-координатах (PS/2 dy положителен вверх, а Linux
+    // REL_Y — вниз, поэтому знак переворачивается), колесо как REL_WHEEL.
+    crate::drivers::evdev::feed_mouse(dx, -dy, dz, flags & 0x07);
 }
 
 /// Feed one byte of the PS/2 aux stream through the assembler.
