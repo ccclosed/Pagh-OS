@@ -61,7 +61,9 @@ evidence lines printed to stdout, and a machine-readable summary JSON
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
+import http.server
 import json
 import os
 import pathlib
@@ -134,6 +136,9 @@ MODE_DEFAULTS = {
     # The waits are generous on purpose: this runs under TCG, and a timeout is a
     # verdict, not a retry knob.
     "usb": {"timeout": 180.0, "serial": "serial_usb.log"},
+    # USB RNDIS tethering: boot with no e1000, one emulated usb-net device on
+    # xHCI, then prove enumeration/MAC/DHCP/ping/HTTP over the driver's bulk pair.
+    "rndis": {"timeout": 240.0, "serial": "serial_rndis.log"},
     # Console scroll: boot + help screenful + wheel/PageUp/PageDown + screenshots.
     "scroll": {"timeout": 180.0, "serial": "serial_scroll.log"},
 }
@@ -167,6 +172,9 @@ MODE_EVIDENCE = {
     "usb": (
         r"input: usb:|xhci: HID device on port|usb: \d+ controller|usb: key reports|"
         r"fs: operator chose to format|ext2 mounted at /mnt|pagh:/>",
+    ),
+    "rndis": (
+        r"usb-rndis:|net: usb-rndis|net: DHCP lease|eth0  inet|ping: reply|pkg:|pagh:/>",
     ),
 }
 
@@ -1354,7 +1362,8 @@ class Harness:
                    "apply tools/e2e_bootid_kernel.patch and re-run")
 
     def boot(self, *, net: bool = True, need_keyboard: bool = False,
-             usb_hid: bool = False, disk: pathlib.Path | None = None) -> None:
+             usb_hid: bool = False, rndis: bool = False,
+             disk: pathlib.Path | None = None) -> None:
         """Start one headless QEMU instance.
 
         `usb_hid=True` attaches the device set the USB-input scenario needs — an
@@ -1393,7 +1402,14 @@ class Harness:
             argv += ["-device", "qemu-xhci,id=xhci",
                      "-device", "usb-kbd,bus=xhci.0",
                      "-device", "usb-mouse,bus=xhci.0"]
-        if net:
+        if rndis:
+            # Only the USB path: no e1000, so a green run cannot be explained by
+            # the Intel NIC. `msos-desc=on` is QEMU's default and selects the
+            # RNDIS configuration (bConfigurationValue 2) rather than CDC ECM.
+            argv += ["-device", "qemu-xhci,id=xhci",
+                     "-netdev", "user,id=net0",
+                     "-device", "usb-net,netdev=net0,bus=xhci.0,msos-desc=on"]
+        elif net:
             # QEMU user-net: the guest reaches a host-side mirror on 10.0.2.2:8000
             # and, for the live mode, the outside world.
             argv += ["-netdev", "user,id=net0", "-device", "e1000,netdev=net0"]
@@ -1671,6 +1687,83 @@ def mode_bigindex(h: Harness) -> tuple[str, int]:
             + ("" if parsed is None else
                " - a below-scale index cannot prove the #14 parse path at size"),
         )
+    return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
+
+
+def mode_rndis(h: Harness) -> tuple[str, int]:
+    """USB RNDIS acceptance: phone-style tethering over one emulated usb-net.
+
+    The claim: with NO e1000 attached, the kernel enumerates QEMU's RNDIS device
+    on xHCI, performs INITIALIZE/QUERY(MAC)/SET(packet filter), brings up the
+    net stack over the bulk pair, leases 10.0.2.15 from slirp, answers ping to
+    10.0.2.2 and completes an HTTP GET. Each step is asserted from serial, so a
+    driver that only stores the MAC (the classic false positive) fails at DHCP.
+    """
+    a = h.a
+    h.boot(net=False, rndis=True, need_keyboard=True)
+    assert h.guest is not None and h.kb is not None
+    if not wait_for_shell(h.guest, h.kb, a, a.boot_timeout):
+        raise HarnessError(f"the shell prompt never appeared within {a.boot_timeout:.0f}s; "
+                           f"serial tail:\n{tail(h.guest.serial())}")
+    if wait_for(h.guest, [r"usb-rndis: iface=\d+ data=\d+ mac=(?:[0-9a-f]{2}:){5}[0-9a-f]{2} link=up"],
+                h.timeout, label="RNDIS link-up") is None:
+        raise HarnessError("no usb-rndis link-up line with a MAC; serial tail:\n"
+                           + tail(h.guest.serial()))
+
+    # DHCP starts as soon as the link attaches; wait for the lease before
+    # asking ifconfig (the one-shot command prints "no interface" until then).
+    if wait_for(h.guest, [r"net: DHCP lease acquired: 10\.0\.2\.15/24"],
+                h.timeout, label="DHCP lease") is None:
+        raise HarnessError("no 10.0.2.15 lease over RNDIS; serial tail:\n"
+                           + tail(h.guest.serial()))
+    log("lease acquired; asking ifconfig")
+    h.kb.text("ifconfig")
+    h.kb.key("ret")
+    if wait_for(h.guest, [r"eth0  inet 10\.0\.2\.15/24"], h.timeout,
+                label="ifconfig") is None:
+        raise HarnessError("ifconfig did not show the lease; serial tail:\n"
+                           + tail(h.guest.serial()))
+
+    log("lease acquired; pinging the slirp gateway")
+    h.kb.text("ping 10.0.2.2")
+    h.kb.key("ret")
+    if wait_for(h.guest, [r"ping: reply from 10\.0\.2\.2"], h.timeout,
+                label="ICMP reply") is None:
+        raise HarnessError("no ping reply over RNDIS; serial tail:\n"
+                           + tail(h.guest.serial()))
+
+    log("ping works; fetching README.md over HTTP via `pkg`")
+    httpd = None
+    try:
+        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(ROOT))
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", a.port), handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        h.kb.text(f"pkg 10.0.2.2 /README.md {a.port}")
+        h.kb.key("ret")
+        if wait_for(h.guest, [r"pkg: downloaded \d+ bytes"], h.timeout,
+                    label="HTTP body") is None:
+            raise HarnessError("HTTP GET over RNDIS did not complete; serial tail:\n"
+                               + tail(h.guest.serial()))
+    finally:
+        if httpd is not None:
+            httpd.shutdown()
+
+    time.sleep(a.settle)
+    text = h.guest.serial()
+    link = regex_first(r"usb-rndis:[^\r\n]*", text)
+    lease = regex_first(r"eth0  inet [^\r\n]*", text)
+    ping = regex_first(r"ping: reply from [^\r\n]*", text)
+    http_get = regex_first(r"pkg: downloaded \d+ bytes", text)
+    h.metrics.update({
+        "usb-rndis link": link or "missing",
+        "DHCP lease": lease or "missing",
+        "ping": ping or "missing",
+        "HTTP": http_get or "missing",
+    })
+    ok = h.check("usb-rndis link up with MAC", bool(link), link or "missing")
+    ok &= h.check("DHCP lease 10.0.2.15", bool(lease), lease or "missing")
+    ok &= h.check("ICMP reply from 10.0.2.2", bool(ping), ping or "missing")
+    ok &= h.check("HTTP GET completed", bool(http_get), http_get or "missing")
     return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
 
 
@@ -2374,6 +2467,7 @@ MODES = {
     "shell": mode_shell,
     "tcp-shot": mode_tcp_shot,
     "usb": mode_usb,
+    "rndis": mode_rndis,
     "scroll": mode_scroll,
     "smoke": mode_smoke,
     "boot-check": mode_boot_check,
@@ -2511,6 +2605,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "emulated xHCI controller + USB keyboard + USB mouse, drive "
                         "the boot disk menu and the shell through them, and assert "
                         "the driver's HID evidence on serial")
+
+    rn = sub.add_parser("rndis", parents=[common],
+                        help="USB RNDIS tethering acceptance: boot with no e1000, one "
+                             "emulated usb-net, require link/MAC, DHCP, ping and HTTP")
+    rn.add_argument("--port", type=int, default=8099,
+                    help="host TCP port the guest reaches as 10.0.2.2:<port> (default 8099)")
 
     sm = sub.add_parser("smoke", parents=[common],
                         help="log-based smoke criteria R4.1/R4.2/R7.4 (replaces "

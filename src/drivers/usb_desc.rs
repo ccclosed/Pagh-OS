@@ -1,4 +1,4 @@
-//! Чистый разбор configuration descriptor USB для HID-интерфейсов.
+//! Чистый разбор configuration descriptor USB: HID-интерфейсы и RNDIS-пара.
 //!
 //! Драйверу нужны ВСЕ HID-интерфейсы конфигурации, а не только первый: композитная
 //! клавиатура (например, R82HE) выставляет boot-клавиатуру на интерфейсе 0 и
@@ -7,6 +7,12 @@
 //! за boot-клавиатуру. Этот модуль обходит весь configuration descriptor и
 //! возвращает каждый HID-интерфейс с данными эндпоинтов, нужными слою xHCI;
 //! политика того, какие интерфейсы привязывать, живёт в `usb_hid_report`.
+//!
+//! Тот же обход находит пару интерфейсов RNDIS: communication-интерфейс с
+//! interrupt-IN статусом и CDC Data с bulk-IN/bulk-OUT. Устройство выбирает
+//! class/subclass/protocol по-разному (RNDIS, wireless controller, CDC ACM
+//! vendor), поэтому распознавание идёт по набору известных троек, а не по
+//! VID:PID.
 //!
 //! Только `alloc`, без зависимостей, поэтому host property-тесты включают точный
 //! исходник, который компилирует ядро (`host-tests/src/lib.rs`), и могут подавать
@@ -40,6 +46,7 @@ pub struct HidIface {
 }
 
 /// Значения типов дескрипторов, используемые здесь (USB 2.0 §9.6).
+const DESC_CONFIG: u8 = 2;
 const DESC_INTERFACE: u8 = 4;
 const DESC_ENDPOINT: u8 = 5;
 
@@ -105,4 +112,221 @@ pub fn parse_hid_interfaces(conf: &[u8]) -> Vec<HidIface> {
         i += len;
     }
     out
+}
+
+// ─── RNDIS: communication + CDC Data ────────────────────────────────────────
+
+/// Пара интерфейсов RNDIS и все эндпоинты, нужные драйверу.
+///
+/// `config_value` принимает SET_CONFIGURATION. `comm_interface` — интерфейс,
+/// которому адресуются class-запросы SEND/GET_ENCAPSULATED_COMMAND; он же несёт
+/// interrupt-IN уведомления. `data_interface` — CDC Data с bulk-парой.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RndisIface {
+    /// `bConfigurationValue` конфигурации, в которой нашлась пара.
+    pub config_value: u8,
+    /// Номер communication-интерфейса (class 0xEF/0xE0/0x02).
+    pub comm_interface: u8,
+    /// Номер CDC Data интерфейса (class 0x0A).
+    pub data_interface: u8,
+    /// Адрес interrupt-IN эндпоинта уведомлений (установлен бит 7).
+    pub status_ep_addr: u8,
+    /// `wMaxPacketSize` эндпоинта уведомлений.
+    pub status_max_packet: u16,
+    /// `bInterval` эндпоинта уведомлений.
+    pub status_interval: u8,
+    /// Адрес bulk-IN эндпоинта (кадры от устройства).
+    pub bulk_in_addr: u8,
+    /// `wMaxPacketSize` bulk-IN.
+    pub bulk_in_max_packet: u16,
+    /// Адрес bulk-OUT эндпоинта (кадры к устройству).
+    pub bulk_out_addr: u8,
+    /// `wMaxPacketSize` bulk-OUT.
+    pub bulk_out_max_packet: u16,
+}
+
+#[derive(Clone, Copy, Default)]
+struct EpInfo {
+    addr: u8,
+    max_packet: u16,
+    interval: u8,
+}
+
+#[derive(Clone, Copy)]
+struct CommCandidate {
+    iface: u8,
+    status: EpInfo,
+}
+
+#[derive(Clone, Copy)]
+struct DataCandidate {
+    iface: u8,
+    bulk_in: EpInfo,
+    bulk_out: EpInfo,
+}
+
+/// Распознать communication-интерфейс RNDIS по тройке class/subclass/protocol.
+///
+/// Известные варианты одной и той же структуры: RNDIS (EF/04/01), wireless
+/// controller (E0/01/03) и «ACM flavour» (02/02/FF), которым пользуются и
+/// телефоны, и QEMU. CDC ECM (02/06/..) сюда намеренно не входит: у него другая
+/// семантика управления, а драйвера для неё нет.
+fn is_rndis_comm(class: u8, subclass: u8, protocol: u8) -> bool {
+    (class == 0xEF && subclass == 0x04 && protocol == 0x01)
+        || (class == 0xE0 && subclass == 0x01 && protocol == 0x03)
+        || (class == 0x02 && subclass == 0x02 && protocol == 0xFF)
+}
+
+fn endpoint_info(conf: &[u8], i: usize) -> EpInfo {
+    EpInfo {
+        addr: conf[i + 2],
+        max_packet: u16::from_le_bytes([conf[i + 4], conf[i + 5]]),
+        interval: conf[i + 6],
+    }
+}
+
+fn is_interrupt_in(ep: EpInfo) -> bool {
+    ep.addr & 0x80 != 0 && (ep.addr & 0x0F) != 0
+}
+
+/// Обойти configuration descriptor и вернуть первую полную пару RNDIS.
+///
+/// Разбор тотальный, как у [`parse_hid_interfaces`]: испорченный bLength не
+/// паникует и не зацикливает обход. Пара собирается только из настройки по
+/// умолчанию (alt 0) и только когда у communication-интерфейса есть interrupt-IN,
+/// а у data-интерфейса — обе bulk-стороны: половина пары бесполезна, и выдавать
+/// её за устройство было бы хуже, чем не найти ничего.
+///
+/// Data-интерфейс ищется сначала как соседний по номеру (`comm + 1`, обычная
+/// раскладка IAD), затем — как первый свободный. Это покрывает устройства,
+/// которые нумеруют интерфейсы не подряд, не привязывая к конкретному VID:PID.
+pub fn parse_rndis_interfaces(conf: &[u8]) -> Option<RndisIface> {
+    if conf.len() < 9 || conf[0] < 9 || conf[1] != DESC_CONFIG {
+        return None;
+    }
+    let config_value = conf[5];
+
+    let mut comms: Vec<CommCandidate> = Vec::new();
+    let mut datas: Vec<DataCandidate> = Vec::new();
+    let mut comm: Option<CommCandidate> = None;
+    let mut data: Option<DataCandidate> = None;
+    let mut kind = 0u8; // 0 — не наша, 1 — communication, 2 — CDC Data
+
+    let mut i = 0usize;
+    while i + 2 <= conf.len() {
+        let len = conf[i] as usize;
+        if len < 2 || i + len > conf.len() {
+            break;
+        }
+        let desc = conf[i + 1];
+        if desc == DESC_INTERFACE && len >= 9 {
+            // Закрыть предыдущий интерфейс, если он был нашей роли.
+            if let Some(c) = comm.take() {
+                if c.status.addr != 0 {
+                    comms.push(c);
+                }
+            }
+            if let Some(d) = data.take() {
+                if d.bulk_in.addr != 0 && d.bulk_out.addr != 0 {
+                    datas.push(d);
+                }
+            }
+            let number = conf[i + 2];
+            let alt = conf[i + 3];
+            let class = conf[i + 5];
+            let subclass = conf[i + 6];
+            let protocol = conf[i + 7];
+            kind = if alt == 0 && is_rndis_comm(class, subclass, protocol) {
+                1
+            } else if alt == 0 && class == 0x0A {
+                2
+            } else {
+                0
+            };
+            if kind == 1 {
+                comm = Some(CommCandidate {
+                    iface: number,
+                    status: EpInfo::default(),
+                });
+            } else if kind == 2 {
+                data = Some(DataCandidate {
+                    iface: number,
+                    bulk_in: EpInfo::default(),
+                    bulk_out: EpInfo::default(),
+                });
+            }
+        } else if desc == DESC_ENDPOINT && len >= 7 {
+            let ep = endpoint_info(conf, i);
+            if kind == 1 {
+                if let Some(c) = comm.as_mut() {
+                    if c.status.addr == 0 && is_interrupt_in(ep) && ep.max_packet & 0x07FF != 0 {
+                        c.status = ep;
+                    }
+                }
+            } else if kind == 2 {
+                if let Some(d) = data.as_mut() {
+                    // bmAttributes, биты 0-1: 2 — bulk. Проверка направления
+                    // разделяет пару, даже если устройство перепутало порядок.
+                    let bulk = conf[i + 3] & 0x03 == 2;
+                    if bulk && ep.addr & 0x80 != 0 && d.bulk_in.addr == 0 {
+                        d.bulk_in = ep;
+                    } else if bulk && ep.addr & 0x80 == 0 && d.bulk_out.addr == 0 {
+                        d.bulk_out = ep;
+                    }
+                }
+            }
+        }
+        // Неизвестные class-дескрипторы (CDC functional, IAD) пропускаются по
+        // bLength, поэтому обход остаётся выровненным.
+        i += len;
+    }
+    if let Some(c) = comm.take() {
+        if c.status.addr != 0 {
+            comms.push(c);
+        }
+    }
+    if let Some(d) = data.take() {
+        if d.bulk_in.addr != 0 && d.bulk_out.addr != 0 {
+            datas.push(d);
+        }
+    }
+
+    // Сначала соседняя пара (comm+1), затем первый свободный data-интерфейс.
+    let mut used: Vec<bool> = Vec::new();
+    used.resize(datas.len(), false);
+    let mut pair: Option<(CommCandidate, usize)> = None;
+    for c in comms.iter() {
+        let found = datas
+            .iter()
+            .enumerate()
+            .position(|(di, d)| !used[di] && d.iface == c.iface.wrapping_add(1));
+        if let Some(di) = found {
+            used[di] = true;
+            pair = Some((*c, di));
+            break;
+        }
+    }
+    if pair.is_none() {
+        for c in comms.iter() {
+            if let Some(di) = datas.iter().enumerate().position(|(di, _)| !used[di]) {
+                used[di] = true;
+                pair = Some((*c, di));
+                break;
+            }
+        }
+    }
+    let (c, di) = pair?;
+    let d = datas.get(di)?;
+    Some(RndisIface {
+        config_value,
+        comm_interface: c.iface,
+        data_interface: d.iface,
+        status_ep_addr: c.status.addr,
+        status_max_packet: c.status.max_packet,
+        status_interval: c.status.interval,
+        bulk_in_addr: d.bulk_in.addr,
+        bulk_in_max_packet: d.bulk_in.max_packet,
+        bulk_out_addr: d.bulk_out.addr,
+        bulk_out_max_packet: d.bulk_out.max_packet,
+    })
 }

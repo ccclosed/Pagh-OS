@@ -341,6 +341,12 @@ pub mod usb_desc;
 #[path = "../../src/drivers/usb_hid_report.rs"]
 pub mod usb_hid_report;
 
+// Протокол RNDIS: сообщения управления и data-конверты. Модуль `core`+`alloc`
+// и самодостаточен, поэтому host-тесты разбирают точный исходник ядра и подают
+// ему усечённые/лживые ответы устройства.
+#[path = "../../src/drivers/usb_rndis_proto.rs"]
+pub mod usb_rndis_proto;
+
 // Политика сброса корневого порта xHCI. Только `core`, самодостаточна: state
 // machine порта для USB2 debounce/training, ожиданий PRC/PED+U0, стабильности и
 // backoff, без PP power-cycle. Host-тесты симулируют порты (Polling сотни
@@ -531,6 +537,9 @@ mod properties {
     // вызывает babble на 4-байтном буфере), boot/report-раскладки мыши и каждый
     // boot-интерфейс клавиатуры/мыши композитного устройства.
     mod usb_hid_report;
+    // RNDIS: разбор пары интерфейсов (RNDIS/wireless/ACM) и конвертов данных —
+    // батчи, смещения от 8-байтного префикса, границы полей длины.
+    mod usb_rndis;
     // Symbolic-link path resolution (issue #18, contract `EXT2-LINKS.md` §4.6,
     // §7.4): Linux-verified cases plus a randomized comparison against an
     // independent restart-based oracle.
