@@ -18,6 +18,8 @@ pub mod tty;
 pub mod usb_desc;
 pub mod usb_hid;
 pub mod usb_hid_report;
+pub mod usb_rndis;
+pub mod usb_rndis_proto;
 pub mod virtio;
 pub mod vt;
 pub mod xhci;

@@ -3,7 +3,7 @@
 //! Это написанная с нуля замена прежней связки smoltcp + virtio-net. Слои,
 //! снизу вверх:
 //!
-//!   * [`crate::drivers::e1000`] — драйвер NIC (поллинг, без IRQ).
+//!   * [`link`] — канальный уровень: e1000 или USB RNDIS (поллинг, без IRQ).
 //!   * [`arp`] — решения по Ethernet-фреймингу + ARP-кэш/разрешение.
 //!   * [`ip`] — IPv4-маршрутизация/фрагментация/сборка + ICMP echo.
 //!   * [`udp`] — UDP-сокеты + DHCP-клиент.
@@ -17,15 +17,16 @@
 //! прерываний, так что вложенность локов не может дедлокнуться.
 //!
 //! Порядок поднятия:
-//!   1. [`init`] перечисляет PCI, подключает e1000 (`drivers::e1000::attach`) и
-//!      строит ненастроенный [`Stack`].
+//!   1. [`init`] перечисляет PCI и выбирает канал: e1000, иначе USB RNDIS.
+//!      Если xHCI-контроллер есть, а телефон ещё не перечислен, стек строится
+//!      ненастроенным и ждёт появления канала в шаге [`Stack::step`].
 //!   2. [`net_thread`] многократно вызывает [`poll`]: RX-кадры вычерпываются и
 //!      диспетчеризуются, работает DHCP-клиент (с откатом на статический адрес
 //!      QEMU user-net `10.0.2.15/24` gw `10.0.2.2` после таймаута), выполняются
 //!      шаги TCP-вывода/ретрансмиссии и кормятся demo echo-сервисы.
 //!   3. ICMP echo отвечает нативно [`ip`]; `ping` использует его end-to-end.
 //!
-//! Если NIC отсутствует, [`init`] возвращает `Err(NetError::NoDevice)`;
+//! Если ни e1000, ни xHCI нет, [`init`] возвращает `Err(NetError::NoDevice)`;
 //! вызывающий пишет предупреждение, и загрузка продолжается (R17.3).
 
 pub mod arp;
@@ -35,6 +36,7 @@ pub mod hostname;
 pub mod http;
 pub mod http_fetch;
 pub mod ip;
+pub mod link;
 pub mod progress;
 pub mod tcp;
 pub mod tls;
@@ -50,6 +52,7 @@ use alloc::vec::Vec;
 
 pub use wire::{IpAddr, IpEndpoint, Ipv4Addr, Ipv4Cidr, Ipv6Addr};
 
+use crate::net::link::Link;
 use crate::sync::spinlock::Spinlock;
 use crate::task::scheduler;
 use crate::{info, warn};
@@ -69,11 +72,17 @@ pub enum NetError {
     DeviceInit,
 }
 
-/// Статический fallback-адрес, когда DHCP не завершился (R13.3). Это
+/// Статический fallback-адрес, когда DHCP не завершился (R13.3). Для e1000 это
 /// общеизвестные значения QEMU user-mode networking.
 const FALLBACK_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 const FALLBACK_PREFIX: u8 = 24;
 const FALLBACK_GW: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
+
+/// Fallback для USB-тетеринга телефона: подсеть, которую раздаёт Android по
+/// умолчанию. Используется, только если DHCP не ответил; обычно телефон выдаёт
+/// адрес по DHCP и эти значения не нужны.
+const RNDIS_FALLBACK_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 42, 21);
+const RNDIS_FALLBACK_GW: Ipv4Addr = Ipv4Addr::new(192, 168, 42, 129);
 
 /// QEMU user-mode networking всегда отвечает DNS на этом адресе, так что это
 /// резолвер последней надежды (R13.3).
@@ -90,6 +99,10 @@ const DNS_RESEND_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(100);
 const DNS_MAX_STEPS: u32 = 20_000;
 /// Таймаут DHCP (~5 с) до применения статического fallback (R13.3).
 const DHCP_TIMEOUT_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(5_000);
+/// RNDIS-телефону даётся больше времени: первый bulk-обмен идёт через
+/// USB-транзакции, а DHCP-клиент стартует сразу после перечисления. 5 секунд
+/// на медленном контроллере/TCG — это ещё не «DHCP не отвечает».
+const RNDIS_DHCP_TIMEOUT_TICKS: u64 = crate::arch::x86_64::apic::ms_to_ticks(15_000);
 
 /// Текущая IP-конфигурация, показываемая `ifconfig` (см. [`ip_config`]).
 #[derive(Debug, Clone, Copy)]
@@ -120,6 +133,8 @@ pub enum NcResult {
 pub struct Stack {
     // Интерфейс
     pub(crate) mac: Mac,
+    /// Активный канал; `None` — стек построен, но RNDIS ещё не перечислен.
+    pub(crate) link: Option<Link>,
 
     // Конфигурация адреса — IPv4 (DHCP или статический fallback)
     pub(crate) cidr: Option<Ipv4Cidr>,
@@ -180,19 +195,15 @@ fn _ephemeral_port_requires_held_lock() {}
 
 // ─── Init ────────────────────────────────────────────────────────────────────
 
-/// Инициализировать сетевой subsystem (R13.1): подключить e1000 и построить
-/// (пока ненастроенный) стек. Получение адреса происходит в [`poll`], когда
-/// заработает net-поток.
+/// Построить ненастроенный стек над выбранным каналом (или без него).
 ///
-/// Возвращает `Err(NetError::NoDevice)`, если пригодного NIC нет; вызывающий
-/// логирует и продолжает загрузку (R17.3).
-pub fn init() -> Result<(), NetError> {
-    let devices = crate::drivers::pci::enumerate();
-    let mac_bytes = crate::drivers::e1000::attach(&devices).map_err(|_| NetError::NoDevice)?;
+/// `mac_bytes` — нули, пока RNDIS не перечислился: адрес интерфейса появится в
+/// [`Stack::step`] вместе с каналом, и до этого ни один кадр не уйдёт.
+fn build_stack(link: Option<Link>, mac_bytes: [u8; 6]) -> Stack {
     let mac = Mac(mac_bytes);
-
-    let stack = Stack {
+    Stack {
         mac,
+        link,
         cidr: None,
         gateway: None,
         dns_servers: Vec::new(),
@@ -216,11 +227,55 @@ pub fn init() -> Result<(), NetError> {
         udp_echo_port: 0,
         tcp_echo_port: None,
         next_ip_ident: 1,
-    };
+    }
+}
 
-    *NET.lock() = Some(stack);
-    info!("net: stack built over e1000 (awaiting DHCP, static fallback after timeout)");
-    Ok(())
+/// Инициализировать сетевой subsystem (R13.1): выбрать канал и построить
+/// (пока ненастроенный) стек. Получение адреса происходит в [`poll`], когда
+/// заработает net-поток.
+///
+/// Порядок выбора: e1000, иначе USB RNDIS, иначе — если есть xHCI-контроллер —
+/// стек без канала: телефон может быть подключён уже после этой точки (поток
+/// `usb` перечисляет его позже), и `Stack::step` подхватит канал, как только он
+/// появится. `Err(NetError::NoDevice)` остаётся для машины без обоих драйверов;
+/// вызывающий логирует и продолжает загрузку (R17.3).
+pub fn init() -> Result<(), NetError> {
+    let devices = crate::drivers::pci::enumerate();
+    let attached = match crate::drivers::e1000::attach(&devices) {
+        Ok(mac_bytes) => Some((Link::E1000, mac_bytes)),
+        Err(_) => link::attach(),
+    };
+    if let Some((kind, mac_bytes)) = attached {
+        link::set(kind);
+        *NET.lock() = Some(build_stack(Some(kind), mac_bytes));
+        info!(
+            "net: stack built over {} (awaiting DHCP, static fallback after timeout)",
+            kind.name()
+        );
+        return Ok(());
+    }
+    if crate::drivers::xhci::present() {
+        *NET.lock() = Some(build_stack(None, [0u8; 6]));
+        info!("net: no link yet; awaiting usb-rndis enumeration");
+        return Ok(());
+    }
+    Err(NetError::NoDevice)
+}
+
+/// Поздняя попытка построить стек, если при загрузке канала не было вовсе.
+///
+/// Нужна драйверу, который появился после `net::init` (RNDIS на уже
+/// перечисленном xHCI): поток сети крутится всегда и обязан подхватить канал,
+/// а не остаться навсегда с пустым `NET`.
+fn ensure_stack() {
+    if NET.lock().is_some() {
+        return;
+    }
+    if let Some((kind, mac_bytes)) = link::attach() {
+        link::set(kind);
+        *NET.lock() = Some(build_stack(Some(kind), mac_bytes));
+        info!("net: late stack built over {}", kind.name());
+    }
 }
 
 // ─── Цикл poll ───────────────────────────────────────────────────────────────
@@ -229,11 +284,39 @@ impl Stack {
     /// Продвинуть весь стек на один шаг. Вызывается [`poll`] и (внутри крейта)
     /// bounded locked-step насосами в `http_fetch`/`tls`.
     pub(crate) fn step(&mut self) {
+        // 0. Канал мог появиться после init: RNDIS перечисляется потоком `usb`
+        //    уже после первого шага сети. До появления канала шаг не делает
+        //    ничего: DHCP без MAC и без передачи бессмыслен.
+        if self.link.is_none() {
+            let Some((kind, mac_bytes)) = link::attach() else {
+                return;
+            };
+            link::set(kind);
+            self.link = Some(kind);
+            self.mac = Mac(mac_bytes);
+            self.ll_addr6 = wire::Ipv6Addr::link_local_from_mac(self.mac);
+            self.cidr = None;
+            self.gateway = None;
+            self.configured = false;
+            self.deadline_tick = None;
+            self.dhcp_fallback_used = false;
+            self.dhcp = udp::DhcpClient::new();
+            info!(
+                "net: {} attached, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}; starting DHCP",
+                kind.name(),
+                self.mac.0[0],
+                self.mac.0[1],
+                self.mac.0[2],
+                self.mac.0[3],
+                self.mac.0[4],
+                self.mac.0[5]
+            );
+        }
         let now = scheduler::ticks();
 
-        // 1. RX: вычерпать каждый завершённый кадр из NIC.
+        // 1. RX: вычерпать каждый завершённый кадр из активного канала.
         let mut frame = [0u8; 2048];
-        while let Some(n) = crate::drivers::e1000::recv(&mut frame) {
+        while let Some(n) = link::recv(&mut frame) {
             self.input_frame(&frame[..n], now);
         }
 
@@ -258,7 +341,7 @@ impl Stack {
                 wire::ETHERTYPE_IPV6,
                 &pkt,
             );
-            crate::drivers::e1000::send(&frame);
+            link::send(&frame);
         }
 
         // 3. DHCP: discovery, пока не настроено; renew после привязки.
@@ -286,17 +369,30 @@ impl Stack {
         // 4. Таймаут DHCP -> статический fallback, применяется ровно один раз (R13.3).
         if !self.configured && !self.dhcp_fallback_used {
             if self.deadline_tick.is_none() {
-                self.deadline_tick = Some(scheduler::ticks() + DHCP_TIMEOUT_TICKS);
+                let timeout = if self.link == Some(Link::UsbRndis) {
+                    RNDIS_DHCP_TIMEOUT_TICKS
+                } else {
+                    DHCP_TIMEOUT_TICKS
+                };
+                self.deadline_tick = Some(scheduler::ticks() + timeout);
             }
             if let Some(deadline) = self.deadline_tick {
                 if scheduler::ticks() >= deadline {
-                    self.cidr = Some(Ipv4Cidr::new(FALLBACK_IP, FALLBACK_PREFIX));
-                    self.gateway = Some(FALLBACK_GW);
+                    // У телефона своя подсеть: QEMU-адреса здесь не пригодны ни
+                    // для ping, ни для HTTP. Обычно до fallback не доходит — DHCP
+                    // телефона отвечает за доли секунды.
+                    let (fallback_ip, fallback_gw) = if self.link == Some(Link::UsbRndis) {
+                        (RNDIS_FALLBACK_IP, RNDIS_FALLBACK_GW)
+                    } else {
+                        (FALLBACK_IP, FALLBACK_GW)
+                    };
+                    self.cidr = Some(Ipv4Cidr::new(fallback_ip, FALLBACK_PREFIX));
+                    self.gateway = Some(fallback_gw);
                     self.configured = true;
                     self.dhcp_fallback_used = true;
                     info!(
                         "net: DHCP timed out, static fallback {} gw {}",
-                        FALLBACK_IP, FALLBACK_GW
+                        fallback_ip, fallback_gw
                     );
                 }
             }
@@ -394,6 +490,7 @@ impl Stack {
 /// Продвинуть сетевой стек на один шаг (вызывается [`net_thread`] и bounded
 /// locked-step насосами). Никогда не выполняется в IRQ-контексте.
 pub fn poll() {
+    ensure_stack();
     let mut guard = NET.lock();
     if let Some(s) = guard.as_mut() {
         s.step();
@@ -643,7 +740,16 @@ pub fn dns_server() -> Option<Ipv4Addr> {
     if !state.configured {
         return None;
     }
-    Some(state.dns_servers.first().copied().unwrap_or(QEMU_DNS))
+    if let Some(server) = state.dns_servers.first() {
+        return Some(*server);
+    }
+    // QEMU-резолвер существует только в user-mode networking. На USB-тетеринге
+    // без DHCP-lease честнее не иметь DNS, чем ходить на чужой адрес: HTTP по
+    // IP-литералу продолжает работать.
+    match state.link {
+        Some(Link::UsbRndis) => None,
+        _ => Some(QEMU_DNS),
+    }
 }
 
 // ─── DNS resolve (A + AAAA; предпочтение семейства следует конфигурации) ───
