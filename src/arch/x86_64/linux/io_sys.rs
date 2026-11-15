@@ -33,7 +33,7 @@ use alloc::vec::Vec;
 
 use crate::task::compat;
 use crate::task::fd::{OpenObject, PipeEndpoint, PipeReadResult, PipeWriteResult};
-use crate::vfs::ramfs::RamFile;
+use crate::vfs::memfd::MemFd;
 use crate::vfs::{self, VfsNode};
 
 use super::cred::{Access, Creds};
@@ -229,6 +229,12 @@ pub fn file_backing_for_fd(fd: u32) -> Option<(Arc<dyn VfsNode>, String)> {
     .flatten()
 }
 
+/// `f_flags` открытого дескриптора (или `None`, если fd закрыт): нужен
+/// `mmap(MAP_SHARED)` для проверки «открыт на запись» и `fcntl` для `F_GETFL`.
+pub fn fd_open_flags(fd: u32) -> Option<u64> {
+    compat::with_current_compat(|cs| cs.fds.open_flags(fd)).flatten()
+}
+
 /// Зафиксировать новое смещение открытого дескриптора (no-op, если это сейчас
 /// не открытый `File`). Вызывается после `read`/`write`/`lseek`, сдвинувших
 /// смещение.
@@ -356,12 +362,54 @@ fn write_pipe(e: &PipeEndpoint, src: &[u8]) -> Result<usize, Errno> {
     }
 }
 
+/// `read(2)` на `/dev/input/event0`: одно 24-байтное `struct input_event` за
+/// вызов.
+///
+/// Linux evdev требует `count >= sizeof(struct input_event)` (иначе `EINVAL`) и
+/// возвращает ровно одно событие. Пустая очередь блокирует вызов до события;
+/// `O_NONBLOCK` даёт `EAGAIN`, доставимый сигнал — `EINTR`. Nonblock-флаг
+/// читается ДО цикла ожидания: compat-лок нельзя держать, пока уступаем CPU.
+fn read_evdev_event(fd: u32, buf: u64, count: u64) -> Result<u64, Errno> {
+    const EV_SIZE: u64 = crate::drivers::evdev::EVENT_SIZE as u64;
+    if count < EV_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    check_user_ptr_writable(buf, EV_SIZE)?;
+    let nonblock = fd_open_flags(fd)
+        .map(|f| f & crate::task::fd::O_NONBLOCK != 0)
+        .unwrap_or(false);
+    let mut event = [0u8; crate::drivers::evdev::EVENT_SIZE];
+    loop {
+        if crate::drivers::evdev::read_event(&mut event) {
+            // Повторная проверка приёмника: буфер мог исчезнуть, пока вызов
+            // уступал CPU (тот же TOCTOU-контракт, что у pipe/read).
+            copy_out_checked(buf, &event)?;
+            return Ok(EV_SIZE);
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if super::signal::has_deliverable_current() {
+            return Err(Errno::EINTR);
+        }
+        crate::task::scheduler::yield_current();
+    }
+}
+
 /// `read` (0): скопировать до `count` байт файла с текущего смещения в буфер
 /// пользователя, сдвинуть смещение на скопированное и вернуть это число
 /// (R2.3). `EBADF` для отсутствующего fd (R2.14); чтение консоли/stdin даёт 0.
 pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
     if count > COUNT_MAX {
         return Err(Errno::EINVAL);
+    }
+    // evdev читает одно событие (24 байта), поэтому полный `count` ему не
+    // обязан быть отображён: Linux проверяет только `sizeof(input_event)`.
+    // Остальные файловые/pipe-пути сохраняют прежнюю проверку всего буфера.
+    if let Some(Resolved::File { node, .. }) = resolve_fd(fd as u32) {
+        if node.is_evdev() {
+            return read_evdev_event(fd as u32, buf, count);
+        }
     }
     check_user_ptr(buf, count)?;
 
@@ -1118,6 +1166,14 @@ fn open_path(path: &str, flags: u64, mode: u32) -> Result<u64, Errno> {
             // Root обходит read/write, но для обхода каталогов через VFS ему всё
             // равно нужен execute-бит, и этот обход уже произошёл выше.
             check_open_mode(&node, flags)?;
+            // `/dev/fb0`: экран забирает первый открывший (композитор), а на
+            // serial-only boot устройства нет — ENODEV, не «пустой файл».
+            if node.is_fbdev() {
+                if node.fb_info().is_none() {
+                    return Err(Errno::ENODEV);
+                }
+                crate::drivers::framebuffer::takeover_acquire();
+            }
             if flags & O_TRUNC_FL != 0 && !node.is_directory() {
                 // Best effort: узлы без поддержки truncate (обычные файлы ext2
                 // в этом минимальном слое) сохраняют содержимое.
@@ -1254,6 +1310,49 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> Result<u64, Errno> {
             set_fd_offset(fd as u32, new_off);
             Ok(new_off)
         }
+    }
+}
+
+/// `ftruncate` (77): изменить размер открытого regular-файла.
+///
+/// Нужен композитору для memfd: `memfd_create` даёт пустой файл, `ftruncate`
+/// задаёт размер SHM-буфера, дальше `mmap(MAP_SHARED)` отображает страницы.
+/// Дескриптор обязан быть открыт на запись; символьные устройства (`fb0`,
+/// `event0`) не усекаются. Смещение fd Linux не меняет — так же и здесь.
+pub fn sys_ftruncate(fd: u64, length: u64) -> Result<u64, Errno> {
+    let acc = fd_open_flags(fd as u32).ok_or(Errno::EBADF)? & 0o3;
+    if acc == 0 {
+        return Err(Errno::EINVAL);
+    }
+    match resolve_fd(fd as u32) {
+        Some(Resolved::File { node, .. }) => {
+            if node.is_fbdev() || node.is_evdev() {
+                return Err(Errno::EINVAL);
+            }
+            node.truncate(length).map_err(truncate_errno)?;
+            Ok(0)
+        }
+        Some(_) => Err(Errno::EINVAL),
+        None => Err(Errno::EBADF),
+    }
+}
+
+/// `truncate` (76): то же по пути (путь разыменовывается, как в `open`).
+pub fn sys_truncate(path: u64, length: u64) -> Result<u64, Errno> {
+    let p = read_user_cstr(path)?;
+    let abs = resolve_path(&p);
+    let node = walk(&abs, true)?;
+    if node.is_directory() {
+        return Err(Errno::EISDIR);
+    }
+    node.truncate(length).map_err(truncate_errno)?;
+    Ok(0)
+}
+
+fn truncate_errno(e: crate::vfs::VfsError) -> Errno {
+    match e {
+        crate::vfs::VfsError::NotSupported | crate::vfs::VfsError::InvalidArgument => Errno::EINVAL,
+        _ => Errno::EIO,
     }
 }
 
@@ -1485,6 +1584,11 @@ fn stat_mode_for(node: &Arc<dyn VfsNode>) -> u32 {
         S_IFDIR | perms
     } else if node.is_symlink() {
         S_IFLNK | perms
+    } else if node.is_fbdev() || node.is_evdev() {
+        // Символьные устройства варианта B: композитор видит S_IFCHR, как
+        // `/dev/fb0`/`/dev/input/event0` в Linux, и может отличить их от
+        // regular-файла до open.
+        S_IFCHR | perms
     } else {
         S_IFREG | perms
     }
@@ -1656,6 +1760,7 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
     }
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
+        Some(Resolved::File { node, .. }) if node.is_fbdev() => fb_ioctl(&node, request, arg),
         Some(Resolved::Console) | Some(Resolved::Stdin) => tty_ioctl(request, arg),
         // tty-запрос на не-tty дескриптор — «неподходящий ioctl для
         // устройства», а не «неверный аргумент». isatty() из glibc ждёт ENOTTY;
@@ -1672,6 +1777,70 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
 }
 
 // ─── поверхность tty ────────────────────────────────────────────────────────
+
+/// `ioctl(/dev/fb0)`: `FBIOGET_VSCREENINFO`/`FBIOGET_FSCREENINFO`.
+///
+/// Это единственная часть fbdev UAPI, которая нужна композитору: геометрия,
+/// stride, биты на пиксель и физическая база scanout. `FBIOPUT_*`/`FBIOBLANK`
+/// не реализованы и честно отвечают `ENOTTY` — притворяться, что режим
+/// переключён, значило бы отдать композитору неверный stride.
+fn fb_ioctl(node: &Arc<dyn VfsNode>, request: u64, arg: u64) -> Result<u64, Errno> {
+    use crate::drivers::fb_abi::{
+        encode_fix, encode_var, FbBitfield, FixScreenInfo, VarScreenInfo, FBIOGET_FSCREENINFO,
+        FBIOGET_VSCREENINFO, FB_FIX_SIZE, FB_VAR_SIZE, FB_VISUAL_TRUECOLOR,
+    };
+    let info = node.fb_info().ok_or(Errno::ENODEV)?;
+    match request {
+        FBIOGET_VSCREENINFO => {
+            let var = VarScreenInfo {
+                xres: info.width,
+                yres: info.height,
+                xres_virtual: info.width,
+                yres_virtual: info.height,
+                xoffset: 0,
+                yoffset: 0,
+                bits_per_pixel: info.bpp,
+                grayscale: 0,
+                red: FbBitfield {
+                    offset: info.red_offset,
+                    length: info.red_length,
+                },
+                green: FbBitfield {
+                    offset: info.green_offset,
+                    length: info.green_length,
+                },
+                blue: FbBitfield {
+                    offset: info.blue_offset,
+                    length: info.blue_length,
+                },
+                transp: FbBitfield {
+                    offset: info.transp_offset,
+                    length: info.transp_length,
+                },
+                ..Default::default()
+            };
+            check_user_ptr_writable(arg, FB_VAR_SIZE as u64)?;
+            copy_out(arg, &encode_var(&var))?;
+            Ok(0)
+        }
+        FBIOGET_FSCREENINFO => {
+            let fix = FixScreenInfo {
+                id: crate::drivers::fb_abi::padded_id(b"paghfb"),
+                smem_start: info.phys,
+                smem_len: core::cmp::min(info.smem_len, u32::MAX as u64) as u32,
+                // FB_TYPE_PACKED_PIXELS
+                type_: 0,
+                type_aux: 0,
+                visual: FB_VISUAL_TRUECOLOR,
+                line_length: info.pitch,
+            };
+            check_user_ptr_writable(arg, FB_FIX_SIZE as u64)?;
+            copy_out(arg, &encode_fix(&fix))?;
+            Ok(0)
+        }
+        _ => Err(Errno::ENOTTY),
+    }
+}
 
 /// `TCGETS`: прочитать атрибуты терминала (`struct termios`).
 const TCGETS: u64 = 0x5401;
@@ -2093,7 +2262,7 @@ pub fn sys_memfd_create(name: u64, flags: u64) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     let requested = read_user_cstr(name)?;
-    let node = Arc::new(RamFile::new(&alloc::format!("memfd:{requested}"))) as Arc<dyn VfsNode>;
+    let node = Arc::new(MemFd::new(&alloc::format!("memfd:{requested}"))) as Arc<dyn VfsNode>;
     let obj = OpenObject::File {
         node,
         path: alloc::format!("/memfd:{requested}"),
@@ -3170,7 +3339,22 @@ fn poll_revents(fd: i32, events: i16) -> i16 {
             }
         }
         Some(Resolved::Epoll) => 0,
-        Some(Resolved::File { .. }) | Some(Resolved::Dir) => events & (POLLIN | POLLOUT),
+        Some(Resolved::File { node, .. }) => {
+            if node.is_evdev() {
+                // evdev: POLLIN ровно когда в очереди есть событие.
+                if crate::drivers::evdev::has_events() {
+                    events & POLLIN
+                } else {
+                    0
+                }
+            } else if node.is_fbdev() {
+                // Фреймбуфер всегда готов к записи (mmap — отдельный путь).
+                events & POLLOUT
+            } else {
+                events & (POLLIN | POLLOUT)
+            }
+        }
+        Some(Resolved::Dir) => events & (POLLIN | POLLOUT),
     }
 }
 /// Опубликовать ядерную копию массива pollfd в пользовательский указатель,
@@ -3283,7 +3467,14 @@ fn select_ready(fd: u64, want_write: bool) -> bool {
             }
         }
         Some(Resolved::Epoll) => false,
-        Some(Resolved::File { .. }) | Some(Resolved::Dir) => true,
+        Some(Resolved::File { node, .. }) => {
+            if node.is_evdev() {
+                !want_write && crate::drivers::evdev::has_events()
+            } else {
+                true
+            }
+        }
+        Some(Resolved::Dir) => true,
     }
 }
 

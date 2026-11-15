@@ -469,6 +469,16 @@ pub fn map(phys_addr: u64, virt_addr: u64, flags: PageTableFlags) -> Result<(), 
                     );
                     return Err(VmError::CowShared);
                 }
+            } else if old_flags.contains(SHARED_BIT) || old_flags.contains(MMIO_BIT) {
+                // MAP_SHARED/MMIO-лист нельзя молча перезаписать другой
+                // трансляцией: у первого есть посчитанная ссылка владения, у
+                // второго кадр вообще не из PMM. Заменяющие пути обязаны сперва
+                // снять лист (`release_user_leaf`).
+                crate::error!(
+                    "[VMM] refusing to overwrite SHARED/MMIO leaf virt=0x{:016x} old_phys=0x{:x} new_phys=0x{:x}",
+                    virt_addr, old_phys, phys.as_u64()
+                );
+                return Err(VmError::CowShared);
             } else if old_phys != phys.as_u64() {
                 crate::warn!(
                     "[VMM] remap virt=0x{:016x}: old_phys=0x{:x} -> new_phys=0x{:x} (old frame leaked/aliased)",
@@ -731,9 +741,28 @@ pub fn clone_user_space(src_pml4: u64, dst_pml4: u64) -> Result<(), VmError> {
                         )?;
                         dst1 = Some(p1);
                     }
+                    if e1.flags().contains(MMIO_BIT) {
+                        // Framebuffer: новое адресное пространство получает ту
+                        // же трансляцию на кадр устройства, без аллокации.
+                        if let Some(pt) = dst1.as_deref_mut() {
+                            pt[i1].set_addr(e1.addr(), e1.flags());
+                        }
+                        continue;
+                    }
+                    if e1.flags().contains(SHARED_BIT) {
+                        // MAP_SHARED: копия адресного пространства разделяет
+                        // кадр, а не дублирует его; ссылка учитывается так же,
+                        // как в fork-COW.
+                        crate::memory::pmm::cow_ref(e1.addr().as_u64());
+                        if let Some(pt) = dst1.as_deref_mut() {
+                            pt[i1].set_addr(e1.addr(), e1.flags());
+                        }
+                        continue;
+                    }
                     let frame = crate::memory::pmm::alloc_frame().ok_or(VmError::OutOfMemory)?;
                     // SAFETY: оба кадра — обычная RAM, достижимая через окно
-                    // HHDM; копируем целую страницу.
+                    // HHDM; копируем целую страницу. MMIO/SHARED-листья сюда не
+                    // доходят (обработаны выше): они алиасятся, а не копируются.
                     unsafe {
                         ptr::copy_nonoverlapping(
                             phys_to_virt(e1.addr().as_u64()) as *const u8,
@@ -813,6 +842,20 @@ pub(crate) const COW_BIT: PageTableFlags = PageTableFlags::BIT_9;
 ///     записываемой.
 pub(crate) const RO_BIT: PageTableFlags = PageTableFlags::BIT_10;
 
+/// Программный бит PTE (свободный бит 11), помечающий лист `MAP_SHARED`:
+/// кадр принадлежит файлу (memfd) и подсчитан в PMM как общая ссылка. Такой
+/// лист НЕ становится COW при `fork` — обе стороны должны видеть одни байты, —
+/// а освобождается через `cow_unref`, как COW-лист. Ссылку отображения ставит
+/// `mem_sys` при `mmap`, кэш-ссылку — сам memfd-узел.
+pub(crate) const SHARED_BIT: PageTableFlags = PageTableFlags::BIT_11;
+
+/// Программный бит PTE (свободный бит 52), помечающий MMIO-лист: физический
+/// кадр устройства (framebuffer), который НИКОГДА не принадлежит PMM. `munmap`,
+/// exit и `fork` обязаны не освобождать и не копировать его — только снять/
+/// продублировать трансляцию. Бит 52 взят из диапазона 52..=58: младшие
+/// программные биты уже заняты `COW_BIT`/`RO_BIT`/`SHARED_BIT`.
+pub(crate) const MMIO_BIT: PageTableFlags = PageTableFlags::BIT_52;
+
 /// Результат отцепления одного пользовательского листа через [`release_user_leaf`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeafRelease {
@@ -833,7 +876,19 @@ pub enum LeafRelease {
 /// лист освобождается напрямую. Ни один вызывающий не должен звать
 /// `pmm::free_frame` на отцеплённом им листе пользователя.
 fn release_leaf_frame(frame: u64, flags: PageTableFlags) -> bool {
-    if flags.contains(COW_BIT) {
+    if flags.contains(MMIO_BIT) {
+        // Физический кадр устройства: PMM им не владеет, возвращать нечего.
+        false
+    } else if flags.contains(SHARED_BIT) {
+        // MAP_SHARED: ушла наша ссылка отображения; кадр живёт, пока его держит
+        // файл-кэш или другое адресное пространство.
+        if crate::memory::pmm::cow_unref(frame) {
+            crate::memory::pmm::free_frame(frame);
+            true
+        } else {
+            false
+        }
+    } else if flags.contains(COW_BIT) {
         if crate::memory::pmm::cow_unref(frame) {
             crate::memory::pmm::free_frame(frame);
             true
@@ -1160,6 +1215,21 @@ pub fn fork_user_space_cow(parent_pml4: u64, child_pml4: u64) -> Result<(), VmEr
                     }
                     let frame = e1.addr();
                     let flags = e1.flags();
+                    // MAP_SHARED и MMIO НЕ становятся COW: запись обязана идти
+                    // в тот же кадр у обеих сторон. Трансляция копируется как
+                    // есть; для shared добавляется ссылка нового адресного
+                    // пространства, для MMIO ссылок нет вовсе (кадр не из PMM).
+                    if flags.contains(MMIO_BIT) {
+                        p1p[i1].set_addr(frame, flags);
+                        p1c[i1].set_addr(frame, flags);
+                        continue;
+                    }
+                    if flags.contains(SHARED_BIT) {
+                        p1p[i1].set_addr(frame, flags);
+                        p1c[i1].set_addr(frame, flags);
+                        crate::memory::pmm::cow_ref(frame.as_u64());
+                        continue;
+                    }
                     // Две разные причины не-записываемого листа должны
                     // оставаться различимыми после fork:
                     //   * записываемое отображение -> COW с отложенной записью:

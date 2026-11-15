@@ -341,6 +341,16 @@ pub mod usb_desc;
 #[path = "../../src/drivers/usb_hid_report.rs"]
 pub mod usb_hid_report;
 
+// Desktop-вариант B: ABI `fbdev` (`fb_var/fix_screeninfo`) и evdev
+// (`input_event` + set-1 → Linux keycodes). Оба модуля только `core`, поэтому
+// host-тесты проверяют разметку байтов и декодер ровно того исходника, который
+// компилирует ядро; смещения/размеры сверены с `linux/fb.h`/`linux/input.h`.
+#[path = "../../src/drivers/fb_abi.rs"]
+pub mod fb_abi;
+
+#[path = "../../src/drivers/input_event.rs"]
+pub mod input_event;
+
 // Протокол RNDIS: сообщения управления и data-конверты. Модуль `core`+`alloc`
 // и самодостаточен, поэтому host-тесты разбирают точный исходник ядра и подают
 // ему усечённые/лживые ответы устройства.

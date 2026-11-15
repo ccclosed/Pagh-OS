@@ -20,3 +20,23 @@ rust /mnt/pagh-rust-hello one two
 ```
 
 Programs should remain single-threaded and use ordinary file/stdio/time/allocator APIs. Unsupported Linux syscalls return `ENOSYS` and are logged once per process.
+
+## Desktop B: `pagh-ui`, `pagh-files` and `pagh-desktop`
+
+`rust-apps/pagh-ui` is the client UI toolkit for the userspace desktop (variant B):
+software RGBA canvas, embedded bitmap font, theme, widgets, context menus, window
+chrome, a PNG encoder, and the PGUI v1 protocol client. `rust-apps/pagh-files` is
+the Files application built on top of it (sidebar, grid/list views, context menu
+with the Dolphin-style "Создать" submenu, properties dialog, VFS trait plus a
+fake and a host backend). Both are dependency-free crates with their own
+`[workspace]` and `.cargo/config.toml` (the root config targets bare metal), so
+they build for the host or for static musl:
+
+```bash
+cd rust-apps/pagh-ui && cargo test && cargo run --bin pagh-ui-gallery -- --out screenshots
+cd rust-apps/pagh-files && cargo test && cargo run -- --out screenshots
+cargo build --release --target x86_64-unknown-linux-musl   # in either crate
+```
+
+Demos and screenshot tests render the same deterministic scenes; see
+`pagh-ui/README.md`, `pagh-files/README.md` and `pagh-ui/PROTOCOL.md`.

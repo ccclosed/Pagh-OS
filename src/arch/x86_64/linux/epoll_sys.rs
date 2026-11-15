@@ -352,9 +352,26 @@ fn poll_fd(fd: i32, events: u32) -> u32 {
                     0
                 }
             }
-            Some(OpenObject::File { .. }) | Some(OpenObject::Dir { .. }) => {
-                events & (EPOLLIN | EPOLLOUT)
+            Some(OpenObject::File { node, .. }) => {
+                // evdev: IN только при непустой очереди; fbdev: OUT всегда;
+                // regular-файл: прежняя семантика «оба направления».
+                if node.is_evdev() {
+                    if events & EPOLLIN != 0 && crate::drivers::evdev::has_events() {
+                        EPOLLIN
+                    } else {
+                        0
+                    }
+                } else if node.is_fbdev() {
+                    if events & EPOLLOUT != 0 {
+                        EPOLLOUT
+                    } else {
+                        0
+                    }
+                } else {
+                    events & (EPOLLIN | EPOLLOUT)
+                }
             }
+            Some(OpenObject::Dir { .. }) => events & (EPOLLIN | EPOLLOUT),
             Some(OpenObject::Epoll { .. }) => 0,
         }
     });
