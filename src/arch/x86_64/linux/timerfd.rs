@@ -12,10 +12,10 @@ use crate::sync::spinlock::Spinlock;
 use crate::task::compat;
 use crate::task::fd::{OpenObject, TimerfdState, O_NONBLOCK, O_RDWR};
 
-use super::check_user_ptr;
 use super::errno::Errno;
 use super::io_sys::copy_in_pub;
 use super::io_sys::copy_out_pub;
+use super::{check_user_ptr, check_user_ptr_writable};
 
 const CLOCK_REALTIME: u64 = 0;
 const CLOCK_MONOTONIC: u64 = 1;
@@ -51,7 +51,7 @@ fn write_itimerspec(ptr: u64, interval_ticks: u64, remaining_ticks: u64) -> Resu
     if ptr == 0 {
         return Ok(());
     }
-    check_user_ptr(ptr, 32)?;
+    check_user_ptr_writable(ptr, 32)?;
     let hz = crate::arch::x86_64::apic::TICK_HZ.max(1);
     let sec = |ticks: u64| ticks / hz;
     let nsec = |ticks: u64| (ticks % hz).saturating_mul(NS_PER_SEC / hz);
@@ -67,8 +67,7 @@ fn write_itimerspec(ptr: u64, interval_ticks: u64, remaining_ticks: u64) -> Resu
     {
         out[index * 8..index * 8 + 8].copy_from_slice(&value.to_le_bytes());
     }
-    copy_out_pub(ptr, &out);
-    Ok(())
+    copy_out_pub(ptr, &out)
 }
 
 /// `timerfd_create` (283).
@@ -88,14 +87,14 @@ pub fn sys_timerfd_create(clockid: u64, flags: u64) -> Result<u64, Errno> {
     let fd = compat::with_current_compat(|cs| {
         let fd = cs
             .fds
-            .alloc_with_flags(OpenObject::Timerfd(state), O_RDWR | (flags & O_NONBLOCK));
+            .alloc_with_flags(OpenObject::Timerfd(state), O_RDWR | (flags & O_NONBLOCK))?;
         if flags & TFD_CLOEXEC != 0 {
             cs.fds.set_cloexec(fd, true);
         }
-        fd
+        Ok::<u64, Errno>(fd as u64)
     })
-    .ok_or(Errno::EBADF)?;
-    Ok(fd as u64)
+    .ok_or(Errno::EBADF)??;
+    Ok(fd)
 }
 
 /// `timerfd_settime` (286).

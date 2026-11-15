@@ -7,10 +7,10 @@ use core::ptr;
 
 use crate::sync::spinlock::Spinlock;
 
-use super::check_user_ptr;
 use super::errno::Errno;
 use super::misc::duration_to_ticks;
 use super::regs::SavedRegs;
+use super::{check_user_ptr, check_user_ptr_writable};
 
 const FUTEX_CMD_MASK: u64 = 0x7f;
 const FUTEX_WAIT: u64 = 0;
@@ -221,10 +221,10 @@ const RUSAGE_SIZE: u64 = 18 * 8;
 /// означает, что частичный результат не публикуется.
 fn publish_wait_result(status: u64, rusage: u64, code: u32) -> Result<(), Errno> {
     if status != 0 {
-        check_user_ptr(status, 4)?;
+        check_user_ptr_writable(status, 4)?;
     }
     if rusage != 0 {
-        check_user_ptr(rusage, RUSAGE_SIZE)?;
+        check_user_ptr_writable(rusage, RUSAGE_SIZE)?;
     }
     if status != 0 {
         // SAFETY: `status` только что проверен на 4 байта; активный CR3 —
@@ -250,10 +250,10 @@ pub fn sys_wait4(pid: u64, status: u64, options: u64, rusage: u64) -> Result<u64
         return Err(Errno::ECHILD);
     }
     if status != 0 {
-        check_user_ptr(status, 4)?
+        check_user_ptr_writable(status, 4)?
     }
     if rusage != 0 {
-        check_user_ptr(rusage, RUSAGE_SIZE)?
+        check_user_ptr_writable(rusage, RUSAGE_SIZE)?
     }
     let parent = crate::task::scheduler::current_pid();
     loop {
@@ -450,10 +450,10 @@ pub fn sys_clone(
         };
         let child = crate::arch::cpu::without_interrupts(|| {
             if flags & CLONE_PARENT_SETTID != 0 {
-                check_user_ptr(parent_tid, 4)?;
+                check_user_ptr_writable(parent_tid, 4)?;
             }
             if flags & CLONE_CHILD_SETTID != 0 {
-                check_user_ptr(child_tid, 4)?;
+                check_user_ptr_writable(child_tid, 4)?;
             }
             let child =
                 crate::task::process::spawn_linux_thread(regs, stack).map_err(|_| Errno::ENOMEM)?;
@@ -517,7 +517,7 @@ const FUTEX_WAITERS: u32 = 0x8000_0000;
 const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
 const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 fn cleanup_robust(head: u64, len: u64, tid: u64) {
-    if head == 0 || len != 24 || check_user_ptr(head, 24).is_err() {
+    if head == 0 || len != 24 || check_user_ptr_writable(head, 24).is_err() {
         return;
     }
     let next = unsafe { ptr::read_unaligned(head as *const u64) };
@@ -543,7 +543,7 @@ fn mark_owner_died(node: u64, offset: i64, tid: u64) {
     let Some(addr) = node.checked_add_signed(offset) else {
         return;
     };
-    if check_user_ptr(addr, 4).is_err() {
+    if check_user_ptr_writable(addr, 4).is_err() {
         return;
     }
     unsafe {
@@ -559,7 +559,7 @@ pub fn cleanup_thread_exit(pid: u64) {
     let clear = crate::task::compat::clear_tid_for(pid);
     let (head, len) = crate::task::compat::robust_for(pid);
     cleanup_robust(head, len, pid);
-    if clear != 0 && check_user_ptr(clear, 4).is_ok() {
+    if clear != 0 && check_user_ptr_writable(clear, 4).is_ok() {
         unsafe { ptr::write_volatile(clear as *mut u32, 0) };
         let _ = wake_waiters(key(clear), 1, FUTEX_BITSET_MATCH_ANY);
     }

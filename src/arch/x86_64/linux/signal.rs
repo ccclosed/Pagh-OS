@@ -73,7 +73,6 @@
 use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::check_user_ptr;
 use super::errno::Errno;
 use super::regs::SavedRegs;
 use super::signal_frame::{
@@ -82,6 +81,7 @@ use super::signal_frame::{
     UC_OFFSET, UNBLOCKABLE_MASK, USER_RFLAGS,
 };
 use super::trap_frame::{plan_irq_delivery, IrqFrame};
+use super::{check_user_ptr, check_user_ptr_writable};
 
 use crate::task::compat;
 use crate::task::scheduler;
@@ -557,7 +557,7 @@ pub fn deliver_one_pending_syscall(regs: &mut SavedRegs, result: u64) {
     // Пользовательский обработчик: построить фрейм ниже прерванного RSP.
     let user_rsp = unsafe { ((regs as *mut SavedRegs as *const u64).add(15)).read() };
     let frame = frame_location(user_rsp, &action, &altstack);
-    if check_user_ptr(frame, RT_SIGFRAME_SIZE).is_err() {
+    if check_user_ptr_writable(frame, RT_SIGFRAME_SIZE).is_err() {
         crate::warn!(
             "[signal] pid={} sig={} frame {:#x} unmapped -> SIGSEGV exit",
             scheduler::current_pid(),
@@ -736,7 +736,7 @@ pub fn tick_action(cur_rsp: u64) -> TickAction {
     }
     let user_rsp = frame.rsp;
     let frame_addr = frame_location(user_rsp, &action, &altstack);
-    if check_user_ptr(frame_addr, RT_SIGFRAME_SIZE).is_err() {
+    if check_user_ptr_writable(frame_addr, RT_SIGFRAME_SIZE).is_err() {
         crate::warn!(
             "[signal] pid={} sig={} tick delivery: frame {:#x} unmapped -> SIGSEGV exit",
             pid,
@@ -788,7 +788,7 @@ pub fn tick_action(cur_rsp: u64) -> TickAction {
 /// ring 3 вопреки обычной обвязке возвращаемого значения.
 pub fn sys_rt_sigreturn(regs: &mut SavedRegs) -> Result<u64, Errno> {
     let user_rsp = unsafe { ((regs as *mut SavedRegs as *const u64).add(15)).read() };
-    check_user_ptr(user_rsp, 304)?;
+    check_user_ptr_writable(user_rsp, 304)?;
     let mut uc = [0u8; 304];
     // SAFETY: диапазон проверен выше; фрейм записан нами (или подделан
     // пользователем — Linux тоже доверяет; фрейм с нулевым IP отвергается ниже).

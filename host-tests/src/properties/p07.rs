@@ -44,7 +44,9 @@ proptest! {
                     while occupied.contains(&expected) {
                         expected += 1;
                     }
-                    let got = table.alloc(3, value);
+                    let got = table
+                        .alloc(3, value)
+                        .expect("a table below FD_TABLE_LIMIT always has a free slot");
                     prop_assert_eq!(got, expected);
                     prop_assert!(table.get(got).is_some());
                     occupied.insert(got);
@@ -85,7 +87,7 @@ fn fd_table_refuses_an_index_above_the_limit() {
     assert!(table.get(1023).is_some());
     // Fill the holes below it; now the lowest free index is the bound itself.
     for _ in 3..1023 {
-        table.alloc(3, 0);
+        table.alloc(3, 0).expect("index 1023 was reserved for the last alloc");
     }
     // The next free index (1024) is at the bound: EMFILE, no growth.
     assert_eq!(table.try_alloc(0, FD_TABLE_LIMIT, 8), Err(TableFull));
@@ -114,7 +116,7 @@ fn full_fd_table_reports_emfile() {
     let mut table: FdSlots<u32> =
         FdSlots::from_slots(vec![Some(0u32), Some(1u32), Some(2u32)]);
     for _ in 3..FD_TABLE_LIMIT {
-        table.alloc(3, 0);
+        table.alloc(3, 0).expect("allocations below the limit are admitted");
     }
     assert_eq!(table.len(), FD_TABLE_LIMIT);
     assert_eq!(table.try_alloc(0, FD_TABLE_LIMIT, 1), Err(TableFull));
@@ -151,4 +153,45 @@ proptest! {
             }
         }
     }
+}
+
+/// F-r4-life-3 (round-4 audit): the 1024 "cap" was enforced only in `try_alloc`
+/// (fcntl's `F_DUPFD`). `alloc` — used by `open`/`pipe`/`socket`/`accept` — and
+/// `set` — used by `dup2`/`dup3` — grew the table past `FD_TABLE_LIMIT`, so
+/// `pipe()` returned fd 1024+ and `dup2` accepted any caller index. Both entry
+/// points are now bounded: this test pins the allocator half (a full table reports
+/// EMFILE / TableFull and leaves the vector at the limit).
+#[test]
+fn alloc_and_set_are_bounded_by_fd_table_limit() {
+    let mut table: FdSlots<u32> =
+        FdSlots::from_slots(vec![Some(0u32), Some(1u32), Some(2u32)]);
+    for _ in 3..FD_TABLE_LIMIT {
+        assert!(table.alloc(3, 0).is_ok());
+    }
+    assert_eq!(table.len(), FD_TABLE_LIMIT);
+    // `pipe()`'s second end and any `open()` at a full table: EMFILE, no growth.
+    assert_eq!(table.alloc(3, 1), Err(TableFull));
+    assert_eq!(table.len(), FD_TABLE_LIMIT);
+    // A reused slot below the limit is fine again.
+    assert_eq!(table.close(1023), Ok(()));
+    assert_eq!(table.alloc(3, 2), Ok(1023));
+}
+
+#[test]
+fn try_set_refuses_indices_at_or_above_the_limit() {
+    let mut table: FdSlots<u32> =
+        FdSlots::from_slots(vec![Some(0u32), Some(1u32), Some(2u32)]);
+    // `dup2(old, newfd)` with newfd at/above RLIMIT_NOFILE: the pre-fix `set`
+    // grew the Vector to the caller index (dup2(fd, 0x7fffffff) was the crash).
+    for idx in [FD_TABLE_LIMIT as u32, 1 << 20, u32::MAX] {
+        assert_eq!(table.try_set(idx, FD_TABLE_LIMIT, 1), Err(TableFull));
+        assert_eq!(table.len(), 3, "a refused index must not grow the table");
+    }
+    // The last admissible index is accepted exactly.
+    assert_eq!(
+        table.try_set((FD_TABLE_LIMIT - 1) as u32, FD_TABLE_LIMIT, 9),
+        Ok(None)
+    );
+    assert_eq!(table.len(), FD_TABLE_LIMIT);
+    assert_eq!(table.get((FD_TABLE_LIMIT - 1) as u32), Some(&9));
 }

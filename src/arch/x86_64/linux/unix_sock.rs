@@ -12,8 +12,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use super::check_user_ptr;
 use super::errno::Errno;
+use super::{check_user_ptr, check_user_ptr_writable};
 use crate::sync::spinlock::Spinlock;
 use crate::task::compat;
 use crate::task::fd::{socket_pair_endpoints, OpenObject, UnixListenerState};
@@ -82,7 +82,7 @@ pub fn sys_socket(domain: u64, ty: u64, _protocol: u64) -> Result<u64, Errno> {
                 nonblocking: ty & SOCK_NONBLOCK != 0,
             },
             crate::task::fd::O_RDWR | (ty & SOCK_NONBLOCK),
-        );
+        )?;
         if ty & SOCK_CLOEXEC != 0 {
             cs.fds.set_cloexec(fd, true);
         }
@@ -175,7 +175,7 @@ pub fn sys_accept4(fd: u64, addr: u64, addrlen_ptr: u64, flags: u64) -> Result<u
                 let newfd = cs.fds.alloc_with_flags(
                     OpenObject::Socket { rx, tx },
                     crate::task::fd::O_RDWR | (flags & SOCK_NONBLOCK),
-                );
+                )?;
                 if flags & SOCK_CLOEXEC != 0 {
                     cs.fds.set_cloexec(newfd, true);
                 }
@@ -191,9 +191,10 @@ pub fn sys_accept4(fd: u64, addr: u64, addrlen_ptr: u64, flags: u64) -> Result<u
             Some(newfd) => {
                 // Партнёр принятого AF_UNIX-соединения безымянный: сообщаем
                 // только семейство, как Linux.
-                if addr != 0 && addrlen_ptr != 0 && check_user_ptr(addrlen_ptr, 4).is_ok() {
+                if addr != 0 && addrlen_ptr != 0 && check_user_ptr_writable(addrlen_ptr, 4).is_ok()
+                {
                     let want = unsafe { core::ptr::read_unaligned(addrlen_ptr as *const u32) };
-                    if want >= 2 && check_user_ptr(addr, 2).is_ok() {
+                    if want >= 2 && check_user_ptr_writable(addr, 2).is_ok() {
                         unsafe { core::ptr::write_unaligned(addr as *mut u16, AF_UNIX as u16) };
                     }
                     unsafe { core::ptr::write_unaligned(addrlen_ptr as *mut u32, 2) };
@@ -214,7 +215,7 @@ pub fn sys_accept(fd: u64, addr: u64, addrlen_ptr: u64) -> Result<u64, Errno> {
 /// адрес для подключённых/непривязанных сокетов (uv использует это, чтобы
 /// напечатать имя pipe).
 pub fn sys_getsockname(fd: u64, addr: u64, addrlen_ptr: u64) -> Result<u64, Errno> {
-    check_user_ptr(addrlen_ptr, 4)?;
+    check_user_ptr_writable(addrlen_ptr, 4)?;
     let path: Option<String> = compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
         Some(OpenObject::UnixListener(l)) => Ok(Some(l.path.clone())),
         Some(OpenObject::Socket { .. }) | Some(OpenObject::UnixSocketUnbound { .. }) => Ok(None),
@@ -232,7 +233,7 @@ pub fn sys_getsockname(fd: u64, addr: u64, addrlen_ptr: u64) -> Result<u64, Errn
     let want = unsafe { core::ptr::read_unaligned(addrlen_ptr as *const u32) } as usize;
     let n = core::cmp::min(want, out.len());
     if n > 0 {
-        check_user_ptr(addr, n as u64)?;
+        check_user_ptr_writable(addr, n as u64)?;
         unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), addr as *mut u8, n) };
     }
     unsafe { core::ptr::write_unaligned(addrlen_ptr as *mut u32, full) };
@@ -277,12 +278,12 @@ pub fn sys_getsockopt(
         SO_ACCEPTCONN => 0, // «не слушающий сокет» нормально для проб
         _ => return Err(Errno::EINVAL),
     };
-    check_user_ptr(optlen, 4)?;
+    check_user_ptr_writable(optlen, 4)?;
     let want = unsafe { core::ptr::read_unaligned(optlen as *const u32) };
     if want < 4 {
         return Err(Errno::EINVAL);
     }
-    check_user_ptr(optval, 4)?;
+    check_user_ptr_writable(optval, 4)?;
     unsafe {
         core::ptr::write_unaligned(optval as *mut u32, value);
         core::ptr::write_unaligned(optlen as *mut u32, 4u32);

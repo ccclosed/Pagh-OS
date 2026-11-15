@@ -36,11 +36,11 @@ use crate::task::fd::{OpenObject, PipeEndpoint, PipeReadResult, PipeWriteResult}
 use crate::vfs::ramfs::RamFile;
 use crate::vfs::{self, VfsNode};
 
-use super::check_user_ptr;
 use super::cred::{Access, Creds};
 use super::dirent::{d_type_for, dirent_reclen, encode_dirent64};
 use super::errno::Errno;
 use super::io::{plan_lseek, plan_read};
+use super::{check_user_ptr, check_user_ptr_writable};
 // Два ioctl foreground-группы (`tcgetpgrp`/`tcsetpgrp`), как и бит `TOSTOP`,
 // берутся из чистой модели (`super::tty`), чтобы ядро и host-свойства не
 // разошлись в номерах ABI.
@@ -127,7 +127,7 @@ fn write_statx_sock(buf: u64) -> Result<u64, Errno> {
 pub(crate) fn copy_in_pub(buf: u64, count: u64) -> alloc::vec::Vec<u8> {
     copy_in(buf, count)
 }
-pub(crate) fn copy_out_pub(buf: u64, data: &[u8]) {
+pub(crate) fn copy_out_pub(buf: u64, data: &[u8]) -> Result<(), Errno> {
     copy_out(buf, data)
 }
 
@@ -139,9 +139,8 @@ pub(crate) fn copy_out_pub(buf: u64, data: &[u8]) {
 /// из ring 0 даёт #PF режима ядра и останавливает машину; повторная проверка
 /// прямо перед записью превращает это в `-EFAULT`.
 pub(crate) fn copy_out_checked(ptr: u64, src: &[u8]) -> Result<(), Errno> {
-    check_user_ptr(ptr, src.len() as u64)?;
-    copy_out(ptr, src);
-    Ok(())
+    check_user_ptr_writable(ptr, src.len() as u64)?;
+    copy_out(ptr, src)
 }
 
 /// Свести ошибку записи в VFS к errno.
@@ -295,16 +294,25 @@ fn copy_in(ptr: u64, len: u64) -> Vec<u8> {
     buf
 }
 
-/// Скопировать `src` наружу в проверенный пользовательский буфер по `ptr`.
+/// Скопировать `src` наружу в пользовательский буфер по `ptr`.
 ///
-/// ПРЕДУСЛОВИЕ: `[ptr, ptr+src.len())` уже прошёл [`check_user_ptr`].
-fn copy_out(ptr: u64, src: &[u8]) {
-    if !src.is_empty() {
-        // SAFETY: диапазон проверен, активный CR3 — user PML4, приёмник доступен на запись.
-        unsafe {
-            core::ptr::copy_nonoverlapping(src.as_ptr(), ptr as *mut u8, src.len());
-        }
+/// Право записи проверяется ЗДЕСЬ, на единственном низкоуровневом choke point'е
+/// всех копирований в user-память этого модуля (F-r4-arch-1): буфер, который
+/// прошёл старый `check_user_ptr` (только `USER_ACCESSIBLE`), мог оказаться
+/// present read-only — store в него давал #PF в ring 0. Возврат `EFAULT` вместо
+/// записи сохраняет контракт syscall-слоя: отказ валидации никогда не трогает
+/// страницу.
+fn copy_out(ptr: u64, src: &[u8]) -> Result<(), Errno> {
+    if src.is_empty() {
+        return Ok(());
     }
+    check_user_ptr_writable(ptr, src.len() as u64)?;
+    // SAFETY: диапазон проверен выше (включая право записи/COW); активный CR3 —
+    // user PML4 вызывающего, поэтому приёмник доступен на запись.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), ptr as *mut u8, src.len());
+    }
+    Ok(())
 }
 
 /// Прочитать NUL-терминированную строку пути из памяти пользователя, проверяя
@@ -1061,12 +1069,9 @@ fn open_resolved(abs: &str, flags: u64) -> Result<u64, Errno> {
             offset: 0,
         }
     };
-    let fd = compat::with_current_compat(|cs| cs.fds.alloc_with_flags(obj, flags));
-    match fd {
-        Some(fd) => Ok(fd as u64),
-        // Нет compat-состояния (нативная задача) — дескриптор некуда записать.
-        None => Err(Errno::EBADF),
-    }
+    let fd = compat::with_current_compat(|cs| cs.fds.alloc_with_flags(obj, flags))
+        .ok_or(Errno::EBADF)??;
+    Ok(fd as u64)
 }
 
 // Флаги создания для open/openat (восьмеричные значения из fcntl.h).
@@ -1504,7 +1509,7 @@ fn write_stat(node: &Arc<dyn VfsNode>, statbuf: u64) -> Result<u64, Errno> {
     // inode выглядят одним файлом. Синтетические узлы по умолчанию 1.
     stat.st_nlink = node.nlink();
     stat.st_blocks = (stat.st_size + 511) / 512;
-    write_stat_struct(&stat, statbuf);
+    write_stat_struct(&stat, statbuf)?;
     Ok(0)
 }
 
@@ -1514,7 +1519,7 @@ fn write_stat(node: &Arc<dyn VfsNode>, statbuf: u64) -> Result<u64, Errno> {
 /// сообщает для симлинка; `st_blocks` равен 0, потому что только *медленная*
 /// ссылка ext2 (цель ≥ 60 байт) владеет блоком данных, а точность уровня `du`
 /// здесь не нужна (описано в `src/vfs/README.md`).
-fn write_link_stat(node: &Arc<dyn VfsNode>, statbuf: u64) {
+fn write_link_stat(node: &Arc<dyn VfsNode>, statbuf: u64) -> Result<(), Errno> {
     let len = node.read_link().map(|t| t.len() as u64).unwrap_or(0);
     let (uid, gid) = node.owner();
     let mut stat = encode_stat(len, S_IFLNK | 0o777, uid, gid);
@@ -1522,25 +1527,25 @@ fn write_link_stat(node: &Arc<dyn VfsNode>, statbuf: u64) {
     stat.st_ino = node_ino(node);
     stat.st_nlink = node.nlink();
     stat.st_blocks = 0;
-    write_stat_struct(&stat, statbuf);
+    write_stat_struct(&stat, statbuf)
 }
 
 /// Скопировать полностью собранный [`LinuxStat`] в проверенный буфер пользователя.
-fn write_stat_struct(stat: &LinuxStat, statbuf: u64) {
+fn write_stat_struct(stat: &LinuxStat, statbuf: u64) -> Result<(), Errno> {
     let bytes = unsafe {
         core::slice::from_raw_parts(
             stat as *const LinuxStat as *const u8,
             core::mem::size_of::<LinuxStat>(),
         )
     };
-    copy_out(statbuf, bytes);
+    copy_out(statbuf, bytes)
 }
 
 /// `fstat` (5): заполнить пользовательский `struct stat` для открытого
 /// дескриптора (R2.8). `EBADF` для отсутствующего fd (R2.14). Консоль/stdin
 /// сообщают символьное устройство.
 pub fn sys_fstat(fd: u64, statbuf: u64) -> Result<u64, Errno> {
-    check_user_ptr(statbuf, core::mem::size_of::<LinuxStat>() as u64)?;
+    check_user_ptr_writable(statbuf, core::mem::size_of::<LinuxStat>() as u64)?;
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
         Some(Resolved::InetTcp(_)) | Some(Resolved::InetUdp(_)) => {
@@ -1551,7 +1556,7 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> Result<u64, Errno> {
             // Концы socketpair сообщают S_IFSOCK — uv_guess_handle из libuv
             // проверяет тип stdio-дескрипторов.
             let stat = encode_stat(0, S_IFSOCK | 0o666, 0, 0);
-            write_stat_struct(&stat, statbuf);
+            write_stat_struct(&stat, statbuf)?;
             Ok(0)
         }
         Some(Resolved::Console)
@@ -1563,12 +1568,12 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> Result<u64, Errno> {
         | Some(Resolved::Signalfd(_))
         | Some(Resolved::Epoll) => {
             let stat = encode_stat(0, S_IFCHR | 0o620, 0, 0);
-            write_stat_struct(&stat, statbuf);
+            write_stat_struct(&stat, statbuf)?;
             Ok(0)
         }
         Some(Resolved::Dir) => {
             let stat = encode_stat(0, S_IFDIR | 0o700, 0, 0);
-            write_stat_struct(&stat, statbuf);
+            write_stat_struct(&stat, statbuf)?;
             Ok(0)
         }
         Some(Resolved::File { node, .. }) => write_stat(&node, statbuf),
@@ -1578,7 +1583,7 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> Result<u64, Errno> {
 /// `newfstatat` (262): stat пути (абсолютного или относительного `AT_FDCWD`) в
 /// пользовательский `struct stat` (R2.8); `ENOENT`, если пути нет (R2.5).
 pub fn sys_newfstatat(_dirfd: u64, path: u64, statbuf: u64, flags: u64) -> Result<u64, Errno> {
-    check_user_ptr(statbuf, core::mem::size_of::<LinuxStat>() as u64)?;
+    check_user_ptr_writable(statbuf, core::mem::size_of::<LinuxStat>() as u64)?;
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
     if flags & AT_SYMLINK_NOFOLLOW != 0 {
@@ -1586,7 +1591,7 @@ pub fn sys_newfstatat(_dirfd: u64, path: u64, statbuf: u64, flags: u64) -> Resul
         // (промежуточные компоненты обходчик всё равно разыменовывает).
         let node = walk(&abs, false)?;
         if node.is_symlink() {
-            write_link_stat(&node, statbuf);
+            write_link_stat(&node, statbuf)?;
             return Ok(0);
         }
         return write_stat(&node, statbuf);
@@ -1726,8 +1731,8 @@ fn build_termios() -> [u8; TERMIOS_SIZE] {
 fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
     match request {
         TCGETS => {
-            check_user_ptr(arg, TERMIOS_SIZE as u64)?;
-            copy_out(arg, &build_termios());
+            check_user_ptr_writable(arg, TERMIOS_SIZE as u64)?;
+            copy_out(arg, &build_termios())?;
             Ok(0)
         }
         // Если ICANON снят, переключаемся в raw-режим, чтобы чтения
@@ -1757,13 +1762,13 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
             Ok(0)
         }
         TIOCGWINSZ => {
-            check_user_ptr(arg, 8)?;
+            check_user_ptr_writable(arg, 8)?;
             let (cols, rows) = crate::drivers::vt::dimensions();
             // struct winsize { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 }
             let mut ws = [0u8; 8];
             ws[0..2].copy_from_slice(&rows.to_le_bytes());
             ws[2..4].copy_from_slice(&cols.to_le_bytes());
-            copy_out(arg, &ws);
+            copy_out(arg, &ws)?;
             Ok(0)
         }
         // Запись размера окна принимается и игнорируется (readline шлёт
@@ -1775,9 +1780,9 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
         // каждому фоновому job, а bash при каждом старте печатал «cannot set
         // terminal process group (-1)» + «no job control in this shell».
         TIOCGPGRP => {
-            check_user_ptr(arg, 4)?;
+            check_user_ptr_writable(arg, 4)?;
             let pg = crate::drivers::tty::foreground_pgid() as u32;
-            copy_out(arg, &pg.to_le_bytes());
+            copy_out(arg, &pg.to_le_bytes())?;
             Ok(0)
         }
         TIOCSPGRP => {
@@ -2095,14 +2100,14 @@ pub fn sys_memfd_create(name: u64, flags: u64) -> Result<u64, Errno> {
         offset: 0,
     };
     let fd = compat::with_current_compat(|cs| {
-        let fd = cs.fds.alloc_with_flags(obj, crate::task::fd::O_RDWR);
+        let fd = cs.fds.alloc_with_flags(obj, crate::task::fd::O_RDWR)?;
         if flags & MFD_CLOEXEC != 0 {
             cs.fds.set_cloexec(fd, true);
         }
-        fd
+        Ok::<u64, Errno>(fd as u64)
     })
-    .ok_or(Errno::EBADF)?;
-    Ok(fd as u64)
+    .ok_or(Errno::EBADF)??;
+    Ok(fd)
 }
 
 /// `mkdir` (83): создать каталог в смонтированном дереве VFS/ext2.
@@ -2598,7 +2603,7 @@ pub fn sys_getdents64(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         None => Err(Errno::EBADF),
         Some(Err(e)) => Err(e),
         Some(Ok(out)) => {
-            copy_out(buf, &out);
+            copy_out(buf, &out)?;
             Ok(out.len() as u64)
         }
     }
@@ -2614,9 +2619,9 @@ pub fn sys_getcwd(buf: u64, size: u64) -> Result<u64, Errno> {
     if size < need as u64 {
         return Err(Errno::ERANGE);
     }
-    check_user_ptr(buf, need as u64)?;
+    check_user_ptr_writable(buf, need as u64)?;
     // Скопировать путь, затем NUL-терминатор.
-    copy_out(buf, bytes);
+    copy_out(buf, bytes)?;
     // SAFETY: байт по buf+bytes.len() лежит внутри проверенного диапазона `need`.
     unsafe {
         *((buf + bytes.len() as u64) as *mut u8) = 0;
@@ -2690,11 +2695,11 @@ const _: () = assert!(NOFILE_MAX as usize == crate::task::fd_alloc::FD_TABLE_LIM
 /// `dup2` (33): продублировать `oldfd` в явный дескриптор `newfd`, сначала
 /// закрыв то, что занимает `newfd`. Если `oldfd == newfd` и `oldfd` валиден, он
 /// возвращается без изменений (без закрытия); `EBADF`, если `oldfd` невалиден;
-/// `EINVAL`, когда `newfd` превышает предел дескрипторов (граница в духе
-/// RLIMIT_NOFILE).
+/// `EBADF`, когда `newfd` не меньше `RLIMIT_NOFILE` (Linux проверяет границу
+/// как невалидный дескриптор; прежний `EINVAL` расходился с ABI).
 pub fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, Errno> {
     if newfd >= NOFILE_MAX {
-        return Err(Errno::EINVAL);
+        return Err(Errno::EBADF);
     }
     // Перепайка stdio при spawn — именно там потеря RPC-канала nvim была бы
     // незаметна; dup2/dup3 достаточно редки, чтобы логировать каждый вызов.
@@ -2719,7 +2724,7 @@ pub fn sys_dup2(oldfd: u64, newfd: u64) -> Result<u64, Errno> {
 /// если `oldfd` невалиден.
 pub fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> Result<u64, Errno> {
     if newfd >= NOFILE_MAX {
-        return Err(Errno::EINVAL);
+        return Err(Errno::EBADF);
     }
     if oldfd == newfd {
         return Err(Errno::EINVAL);
@@ -2870,8 +2875,8 @@ pub fn sys_readlink(path: u64, buf: u64, bufsiz: u64) -> Result<u64, Errno> {
     let target = node.read_link().ok_or(Errno::ENOENT)?;
     let bytes = target.as_bytes();
     let n = core::cmp::min(bytes.len() as u64, bufsiz);
-    check_user_ptr(buf, n)?;
-    copy_out(buf, &bytes[..n as usize]);
+    check_user_ptr_writable(buf, n)?;
+    copy_out(buf, &bytes[..n as usize])?;
     Ok(n)
 }
 
@@ -2888,7 +2893,7 @@ pub fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Er
     if count > COUNT_MAX {
         return Err(Errno::EINVAL);
     }
-    check_user_ptr(buf, count)?;
+    check_user_ptr_writable(buf, count)?;
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
         Some(Resolved::Console)
@@ -2922,7 +2927,7 @@ pub fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Er
                 );
                 Errno::EIO
             })?;
-            copy_out(buf, &kbuf[..n]);
+            copy_out(buf, &kbuf[..n])?;
             // ЗАМЕЧАНИЕ: смещение дескриптора намеренно НЕ обновляется.
             Ok(n as u64)
         }
@@ -3026,7 +3031,7 @@ fn build_statfs_for(fs: Option<vfs::FsStat>) -> LinuxStatfs {
 }
 
 /// Скопировать собранный `statfs` в проверенный буфер пользователя.
-fn write_statfs(buf: u64, fs: Option<vfs::FsStat>) {
+fn write_statfs(buf: u64, fs: Option<vfs::FsStat>) -> Result<(), Errno> {
     let sf = build_statfs_for(fs);
     let bytes = unsafe {
         core::slice::from_raw_parts(
@@ -3034,32 +3039,32 @@ fn write_statfs(buf: u64, fs: Option<vfs::FsStat>) {
             core::mem::size_of::<LinuxStatfs>(),
         )
     };
-    copy_out(buf, bytes);
+    copy_out(buf, bytes)
 }
 
 /// `statfs` (137): заполнить пользовательский `struct statfs` реальной ёмкостью
 /// смонтированной ФС, когда она доступна (путь обязан существовать, иначе
 /// `ENOENT`). Возвращает 0.
 pub fn sys_statfs(path: u64, buf: u64) -> Result<u64, Errno> {
-    check_user_ptr(buf, core::mem::size_of::<LinuxStatfs>() as u64)?;
+    check_user_ptr_writable(buf, core::mem::size_of::<LinuxStatfs>() as u64)?;
     let p = read_user_cstr(path)?;
     let abs = resolve_path(&p);
     // `statfs(2)` разыменовывает симлинки, как `stat`.
     let node = walk(&abs, true)?;
-    write_statfs(buf, node.fs_stat());
+    write_statfs(buf, node.fs_stat())?;
     Ok(0)
 }
 
 /// `fstatfs` (138): заполнить пользовательский `struct statfs` для открытого
 /// дескриптора (он обязан быть валидным, иначе `EBADF`). Возвращает 0.
 pub fn sys_fstatfs(fd: u64, buf: u64) -> Result<u64, Errno> {
-    check_user_ptr(buf, core::mem::size_of::<LinuxStatfs>() as u64)?;
+    check_user_ptr_writable(buf, core::mem::size_of::<LinuxStatfs>() as u64)?;
     let fs = match resolve_fd(fd as u32) {
         None => return Err(Errno::EBADF),
         Some(Resolved::File { node, .. }) => node.fs_stat(),
         _ => None,
     };
-    write_statfs(buf, fs);
+    write_statfs(buf, fs)?;
     Ok(0)
 }
 
@@ -3077,20 +3082,21 @@ pub fn sys_pipe2(pipefd: u64, flags: u64) -> Result<u64, Errno> {
     if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
         return Err(Errno::EINVAL);
     }
-    check_user_ptr(pipefd, 8)?;
+    check_user_ptr_writable(pipefd, 8)?;
     let pair = compat::with_current_compat(|cs| {
-        let p = cs.fds.pipe(flags & O_NONBLOCK != 0);
+        // F-r4-life-3: table full → EMFILE, а не рост за FD_TABLE_LIMIT.
+        let p = cs.fds.pipe(flags & O_NONBLOCK != 0)?;
         if flags & O_CLOEXEC != 0 {
             cs.fds.set_cloexec(p.0, true);
             cs.fds.set_cloexec(p.1, true);
         }
-        p
+        Ok::<(u32, u32), Errno>(p)
     })
-    .ok_or(Errno::EBADF)?;
+    .ok_or(Errno::EBADF)??;
 
     let words = [pair.0, pair.1];
     let bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, 8) };
-    copy_out(pipefd, bytes);
+    copy_out(pipefd, bytes)?;
     Ok(0)
 }
 fn poll_revents(fd: i32, events: i16) -> i16 {
@@ -3176,9 +3182,8 @@ fn poll_revents(fd: i32, events: i16) -> i16 {
 /// даёт #PF режима ядра, который обработчик превращает в остановку машины.
 /// Повторная проверка прямо перед записью превращает этот класс в `-EFAULT`.
 fn publish_pollfds(fds: u64, bytes: u64, kfds: &[u8]) -> Result<(), Errno> {
-    check_user_ptr(fds, bytes)?;
-    copy_out(fds, kfds);
-    Ok(())
+    check_user_ptr_writable(fds, bytes)?;
+    copy_out(fds, kfds)
 }
 
 pub fn sys_poll(fds: u64, nfds: u64, timeout: u64) -> Result<u64, Errno> {
@@ -3471,20 +3476,20 @@ pub fn sys_socketpair(domain: u64, sock_type: u64, protocol: u64, sv: u64) -> Re
     {
         return Err(Errno::EINVAL);
     }
-    check_user_ptr(sv, 8)?;
+    check_user_ptr_writable(sv, 8)?;
     let pair = compat::with_current_compat(|cs| {
-        let p = cs.fds.socketpair(sock_type & SOCK_NONBLOCK != 0);
+        let p = cs.fds.socketpair(sock_type & SOCK_NONBLOCK != 0)?;
         if sock_type & SOCK_CLOEXEC != 0 {
             cs.fds.set_cloexec(p.0, true);
             cs.fds.set_cloexec(p.1, true);
         }
-        p
+        Ok::<(u32, u32), Errno>(p)
     })
-    .ok_or(Errno::EBADF)?;
+    .ok_or(Errno::EBADF)??;
     let words = [pair.0, pair.1];
     // SAFETY: два u32-дескриптора — ровно те 8 байт, которые socketpair пишет в sv.
     let bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, 8) };
-    copy_out(sv, bytes);
+    copy_out(sv, bytes)?;
     Ok(0)
 }
 
@@ -3517,7 +3522,7 @@ fn write_statx(buf: u64, size: u64, mode: u32, ino: u64) {
 /// пробует statx и откатывается только при чистом ENOSYS от диспетчера —
 /// которого ему больше не нужно.
 pub fn sys_statx(dirfd: u64, path: u64, flags: u64, _mask: u64, buf: u64) -> Result<u64, Errno> {
-    check_user_ptr(buf, STATX_SIZE_BYTES)?;
+    check_user_ptr_writable(buf, STATX_SIZE_BYTES)?;
     let p = read_user_cstr(path)?;
     if p.is_empty() && flags & AT_EMPTY_PATH != 0 {
         return match resolve_fd(dirfd as u32) {

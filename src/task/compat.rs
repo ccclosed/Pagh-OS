@@ -297,6 +297,55 @@ pub fn remove_compat(pid: u64) -> Option<CompatState> {
 pub fn compat_exists(pid: u64) -> bool {
     COMPAT_STATES.lock().contains_key(&pid)
 }
+
+/// [`compat_exists`] для kill-путей обработчиков исключений: не входит в реестр,
+/// если его лок уже удерживает ЭТО ядро.
+///
+/// Контракт `with_current_compat`: замыкание исполняется только когда у текущего
+/// pid есть compat-состояние, поэтому `compat_lock_held()` здесь — достаточное
+/// доказательство существования. Без этого отказ внутри замыкания (исторически:
+/// store в read-only user-страницу) звал `compat_exists` → повторный
+/// `COMPAT_STATES.lock()` с уже снятым IF → вечный спин (F-r4-arch-1).
+pub fn compat_exists_for_exit(pid: u64) -> bool {
+    if compat_lock_held() {
+        true
+    } else {
+        compat_exists(pid)
+    }
+}
+
+/// Аварийно отпустить [`COMPAT_STATES`], удержанный прерванным замыканием
+/// [`with_current_compat`], которое уже никогда не вернётся (задачу убивает
+/// обработчик исключения).
+///
+/// Вызывающий обязан затем завершить текущую задачу через
+/// [`crate::task::scheduler::exit_current`], который снимет её состояние из
+/// реестра. Возвращает `false`, когда лок не удерживался (обычный kill-путь).
+///
+/// # Safety
+/// Покинутое замыкание не должно продолжать мутировать защищаемую карту: путь
+/// существует для отказов на пользовательской памяти (store в RO-страницу),
+/// которые случаются после изменения compat-состояния. Это последний рубеж
+/// «машина живёт», а не общий механизм отмены.
+pub fn abandon_held_registry() -> bool {
+    if !compat_lock_held() {
+        return false;
+    }
+    // SAFETY: прерванный кадр задачи (владелец guard'а) не будет возобновлён:
+    // обработчик исключения немедленно завершает задачу через exit_current, а
+    // её стек ядра освобождает reaper. Глубже вложенных удержаний
+    // COMPAT_STATES не бывает (лок нереентерабелен и берётся только здесь).
+    unsafe {
+        COMPAT_STATES.force_unlock();
+    }
+    // Счётчик глубины принадлежал тому же прерванному кадру. Обнуляем, чтобы
+    // exit-путь (with_current_compat для кода выхода) снова работал штатно.
+    COMPAT_DEPTH.store(0, Ordering::Relaxed);
+    crate::error!(
+        "[COMPAT] abandoned COMPAT_STATES held by interrupted with_current_compat (exit recovery)"
+    );
+    true
+}
 /// Уведомить `parent`, что `child` сменил состояние, как SIGCHLD в Linux.
 ///
 /// Очередь best-effort: ушедший (или не-compat) родитель просто не получает

@@ -86,6 +86,8 @@ pub fn run() {
     check_end_to_end_run();
     check_exit_isolation();
     check_open_absent();
+    check_out_writable();
+    check_fd_table_limit();
     check_arch_prctl_uname_tid();
     check_register_preservation();
     check_oom_rollback();
@@ -2466,6 +2468,123 @@ fn check_open_absent() {
     }
 }
 
+/// F-r4-arch-1 — an output buffer that the user mapped read-only must be rejected
+/// with `EFAULT` by the writability-aware choke point, and the process/kernel must
+/// stay alive. This is the in-guest half of the `lockpf`/`ro_sigmask` PoC: the
+/// exact `rt_sigprocmask`/`sigaltstack` paths that used to store into the page
+/// under `with_current_compat` and spin the CPU on the non-reentrant registry
+/// lock now fail before touching the page. `sys_uname` covers the `copy_out`
+/// choke point (all io_sys copies) rather than the two hand-written closures.
+fn check_out_writable() {
+    let name = "out_writable";
+    if !map_scratch() {
+        fail(name, "scratch map failed");
+        return;
+    }
+    // Write the input mask while the page is still writable (the kernel stores
+    // through the same PTE, so this must happen before the RO switch).
+    scratch_write_at(0, &(1u64 << (10 - 1)).to_le_bytes());
+    // Drop WRITABLE but keep the page present and USER_ACCESSIBLE.
+    let ro = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE;
+    if vmm::set_user_leaf_flags(SCRATCH_VA, ro).is_err() {
+        unmap_scratch();
+        fail(name, "cannot make the scratch page read-only");
+        return;
+    }
+    let result: Result<(), &'static str> =
+        with_synth_compat(0x40_0000, scheduler::current_pid(), || {
+            // SIG_BLOCK with no input set: only the oldset store is exercised.
+            match misc::sys_rt_sigprocmask(0, 0, SCRATCH_VA, 8) {
+                Err(Errno::EFAULT) => {}
+                _ => return Err("rt_sigprocmask(RO oldset) did not return EFAULT"),
+            }
+            match misc::sys_sigaltstack(0, SCRATCH_VA) {
+                Err(Errno::EFAULT) => {}
+                _ => return Err("sigaltstack(RO old_ss) did not return EFAULT"),
+            }
+            match misc::sys_uname(SCRATCH_VA) {
+                Err(Errno::EFAULT) => {}
+                _ => return Err("uname(RO buffer) did not return EFAULT"),
+            }
+            // A readable RO page is still a valid INPUT: SIG_BLOCK with one bit
+            // set (SIGUSR1 = bit 10) must succeed and actually update the mask.
+            match misc::sys_rt_sigprocmask(0, SCRATCH_VA, 0, 8) {
+                Ok(0) => {}
+                _ => return Err("rt_sigprocmask(RO input set) failed"),
+            }
+            let blocked = compat::with_current_compat(|cs| cs.sig_blocked).unwrap_or(0);
+            if blocked & (1u64 << (10 - 1)) == 0 {
+                return Err("RO input set was not applied");
+            }
+            Ok(())
+        });
+    unmap_scratch();
+    match result {
+        Ok(()) => pass(name),
+        Err(d) => fail(name, d),
+    }
+}
+
+/// F-r4-life-3 — `FD_TABLE_LIMIT` is enforced on every allocation path, not just
+/// `fcntl(F_DUPFD)`: a full table reports `EMFILE` for `eventfd`/`pipe`, `dup2`
+/// with `newfd >= 1024` reports `EBADF`, and `pipe()` frees its first end when
+/// the second does not fit. Runs against the real handlers with a synthesized
+/// compat state.
+fn check_fd_table_limit() {
+    let name = "fd_table_limit";
+    const LIMIT: u64 = 1024;
+    if !map_scratch() {
+        fail(name, "scratch map failed");
+        return;
+    }
+    let result: Result<(), &'static str> =
+        with_synth_compat(0x40_0000, scheduler::current_pid(), || {
+            let mut last = 0u64;
+            // stdio occupies 0..=2; fill everything below the limit.
+            for _ in 3..LIMIT {
+                match crate::arch::x86_64::linux::epoll_sys::sys_eventfd2(0, 0) {
+                    Ok(fd) => last = fd,
+                    Err(Errno::EMFILE) => return Err("EMFILE before the table was full"),
+                    Err(_) => return Err("eventfd failed below the table limit"),
+                }
+            }
+            if last != LIMIT - 1 {
+                return Err("the last descriptor is not FD_TABLE_LIMIT-1");
+            }
+            match crate::arch::x86_64::linux::epoll_sys::sys_eventfd2(0, 0) {
+                Err(Errno::EMFILE) => {}
+                _ => return Err("eventfd on a full table did not return EMFILE"),
+            }
+            match io_sys::sys_pipe2(SCRATCH_VA, 0) {
+                Err(Errno::EMFILE) => {}
+                _ => return Err("pipe on a full table did not return EMFILE"),
+            }
+            match io_sys::sys_dup2(3, LIMIT) {
+                Err(Errno::EBADF) => {}
+                _ => return Err("dup2(newfd >= LIMIT) did not return EBADF"),
+            }
+            // One slot free: pipe cannot place both ends, so it must fail with
+            // EMFILE and release the end it did allocate.
+            if io_sys::sys_close(last) != Ok(0) {
+                return Err("close of the last descriptor failed");
+            }
+            match io_sys::sys_pipe2(SCRATCH_VA, 0) {
+                Err(Errno::EMFILE) => {}
+                _ => return Err("half-fitting pipe did not return EMFILE"),
+            }
+            match crate::arch::x86_64::linux::epoll_sys::sys_eventfd2(0, 0) {
+                Ok(fd) if fd == last => {}
+                _ => return Err("pipe leaked its first descriptor after EMFILE"),
+            }
+            Ok(())
+        });
+    unmap_scratch();
+    match result {
+        Ok(()) => pass(name),
+        Err(d) => fail(name, d),
+    }
+}
+
 /// 12.6 — `arch_prctl(ARCH_SET_FS)` records `FS.base`; `set_tid_address` returns the
 /// tid; `uname` fills the fixed identifying strings. Driven through the real
 /// handlers with a synthesized compat state; the live `FS.base` MSR is saved and
@@ -2716,9 +2835,9 @@ fn check_ext2_install_roundtrip() {
 /// partial tree) and its confined resolver must not follow absolute link targets.
 ///
 /// Controls in the same routine:
-///   * a pre-existing relative in-root link is still followed (a member under
-///     `/mnt/pkgpre/link -> real` lands in `real/`, the `/lib64 -> usr/lib64`
-///     behaviour the installer documents);
+///   * an arbitrary pre-existing relative in-root link is refused atomically
+///     (F-r4-vfs-1 cross-package policy); only the documented
+///     `/lib64 -> usr/lib64` provisioning pair is still followed;
 ///   * a pre-existing absolute link target is refused (`UnsafePath`);
 ///   * a pre-existing link whose relative target escapes the root is refused;
 ///   * a normal archive still installs and reads back byte-for-byte.
@@ -2787,8 +2906,10 @@ fn check_install_symlink_confinement() {
         }
     }
 
-    // 2) A pre-existing *relative* in-root link is still followed: this is the
-    //    documented `lib64 -> usr/lib64` placement rule.
+    // 2) F-r4-vfs-1: an arbitrary pre-existing relative in-root link is a
+    //    cross-package redirector and must be REFUSED as a whole package (it is
+    //    not one of the documented provisioned pairs); nothing may be written
+    //    through it either.
     let mnt = match vfs::lookup_path("/mnt") {
         Ok(n) => n,
         Err(_) => {
@@ -2815,12 +2936,15 @@ fn check_install_symlink_confinement() {
         path: "pkgpre/link/leaf",
         content: PAYLOAD,
     }];
-    if let Err(d) = install_archive("/mnt", &under_rel, 1) {
+    if let Err(d) = install_archive("/mnt", &under_rel, 0) {
         fail(name, d);
         return;
     }
-    if let Err(d) = verify_file("/mnt/pkgpre/real/leaf", PAYLOAD) {
-        fail(name, d);
+    if vfs::lookup_path("/mnt/pkgpre/real/leaf").is_ok() {
+        fail(
+            name,
+            "a member was written through a foreign pre-existing link",
+        );
         return;
     }
     match vfs::lookup_path("/mnt/pkgpre/link") {
@@ -2829,6 +2953,12 @@ fn check_install_symlink_confinement() {
             fail(name, "the pre-existing link was replaced");
             return;
         }
+    }
+    // 2b) The documented `/lib64 -> usr/lib64` provisioning pair IS followed:
+    //     this is the only pre-existing link the installer may traverse.
+    if let Err(d) = check_provisioned_lib64_install("r4-c1") {
+        fail(name, d);
+        return;
     }
 
     // 3) A pre-existing *absolute* link target must be refused: the guest
@@ -2893,8 +3023,9 @@ fn check_install_symlink_confinement() {
 ///     below `h2`;
 ///   * a **normal** hard link to a regular file still installs (both names, one
 ///     inode, `nlink == 2`);
-///   * a pre-existing *relative in-root* symlink with a single name is still
-///     followed (the documented `lib64 -> usr/lib64` placement rule);
+///   * an arbitrary pre-existing relative in-root symlink with a single name is
+///     refused atomically (F-r4-vfs-1); only the documented provisioning pair
+///     (`lib64 -> usr/lib64`) is followed;
 ///   * a pre-existing hard-link alias of a symlink is not traversed even though
 ///     the alias path was created by an earlier install and is absent from this
 ///     install's `own_links` (the `nlink > 1` backstop).
@@ -3037,8 +3168,9 @@ fn check_install_hardlink_alias_confinement() {
         }
     }
 
-    // 4) Round-1 behaviour stays: a pre-existing *relative, single-name* in-root
-    //    link is followed (the `/lib64 -> usr/lib64` placement rule).
+    // 4) F-r4-vfs-1: a pre-existing relative, single-name in-root link that is
+    //    NOT the documented `/lib64 -> usr/lib64` pair is refused atomically (a
+    //    later package could have planted it as a cross-package redirector).
     let mnt = match vfs::lookup_path("/mnt") {
         Ok(n) => n,
         Err(_) => {
@@ -3064,11 +3196,19 @@ fn check_install_hardlink_alias_confinement() {
         path: "pkgpc/link/leaf-ok",
         content: PAYLOAD,
     }];
-    if let Err(d) = install_archive("/mnt", &under_rel, 1) {
+    if let Err(d) = install_archive("/mnt", &under_rel, 0) {
         fail(name, d);
         return;
     }
-    if let Err(d) = verify_file("/mnt/pkgpc/real/leaf-ok", PAYLOAD) {
+    if vfs::lookup_path("/mnt/pkgpc/real/leaf-ok").is_ok() {
+        fail(
+            name,
+            "a member was written through a foreign pre-existing link",
+        );
+        return;
+    }
+    // 4b) The documented provisioning pair is still followed.
+    if let Err(d) = check_provisioned_lib64_install("r4-c2") {
         fail(name, d);
         return;
     }
@@ -3265,17 +3405,26 @@ fn check_install_spelling_split_confinement() {
         return;
     }
 
-    // 3) Documented placement rule intact: a *regular* member under a
-    //    pre-existing relative in-root link still follows the link.
+    // 3) F-r4-vfs-1: a regular member under an arbitrary pre-existing
+    //    relative in-root link is now REFUSED atomically — such a link is a
+    //    cross-package redirector unless it is the documented provisioning pair.
     let under_rel = [TarMember::File {
         path: "pkgsd/redirect/plain",
         content: PAYLOAD,
     }];
-    if let Err(d) = install_archive("/mnt", &under_rel, 1) {
+    if let Err(d) = install_archive("/mnt", &under_rel, 0) {
         fail(name, d);
         return;
     }
-    if let Err(d) = verify_file("/mnt/pkgsd/gcc-14-base/plain", PAYLOAD) {
+    if vfs::lookup_path("/mnt/pkgsd/gcc-14-base/plain").is_ok() {
+        fail(
+            name,
+            "a member was written through a foreign pre-existing link",
+        );
+        return;
+    }
+    // 3b) The documented `/lib64 -> usr/lib64` pair is still followed.
+    if let Err(d) = check_provisioned_lib64_install("r4-sd3") {
         fail(name, d);
         return;
     }
@@ -3350,6 +3499,56 @@ fn install_archive(
         Err(InstallError::UnsafePath { .. }) if expected == 0 => Ok(()),
         Err(_) => Err("install_data_tar returned the wrong error"),
     }
+}
+
+/// F-r4-vfs-1 positive control: make the documented `/lib64 -> usr/lib64`
+/// provisioned link available. Returns:
+///
+///   * `Ok(Some(true))`  — this call created the link; remove it afterwards;
+///   * `Ok(Some(false))` — the documented link already exists;
+///   * `Ok(None)`        — `/lib64` exists but is not that link (skip the control).
+fn documented_lib64_ready() -> Result<Option<bool>, &'static str> {
+    let mnt = match vfs::lookup_path("/mnt") {
+        Ok(n) => n,
+        Err(_) => return Err("/mnt is not mounted"),
+    };
+    match vfs::lookup_path("/mnt/lib64") {
+        Ok(n) => {
+            if n.is_symlink() && n.read_link().as_deref() == Some("usr/lib64") {
+                Ok(Some(false))
+            } else {
+                Ok(None)
+            }
+        }
+        Err(_) => {
+            mnt.create_symlink("lib64", b"usr/lib64")
+                .map_err(|_| "cannot create the provisioned /lib64 link")?;
+            Ok(Some(true))
+        }
+    }
+}
+
+/// Install one member under the documented `/lib64 -> usr/lib64` pair and verify
+/// it materialized inside the *target* directory, then clean up. This is the
+/// positive half of the F-r4-vfs-1 cross-package policy.
+fn check_provisioned_lib64_install(member_leaf: &'static str) -> Result<(), &'static str> {
+    let created_link = match documented_lib64_ready()? {
+        Some(v) => v,
+        None => return Ok(()), // /lib64 occupied by something else: control skipped
+    };
+    let member = [TarMember::File {
+        path: alloc::format!("lib64/{member_leaf}").leak(),
+        content: b"r4-lib64-positive\n",
+    }];
+    let result = install_archive("/mnt", &member, 1);
+    let target = alloc::format!("/mnt/usr/lib64/{member_leaf}");
+    let verified = verify_file(&target, b"r4-lib64-positive\n");
+    remove_leaf(&target);
+    if created_link {
+        remove_leaf("/mnt/lib64");
+    }
+    result?;
+    verified
 }
 
 /// Remove `path`'s final component through its parent directory (test cleanup;

@@ -387,7 +387,7 @@ impl FdTable {
     /// Записанные флаги открытия — реальный режим доступа объекта
     /// ([`default_object_flags`]); пути, знающие флаги `open(2)` вызывающего,
     /// используют [`Self::alloc_with_flags`].
-    pub fn alloc(&mut self, obj: OpenObject) -> u32 {
+    pub fn alloc(&mut self, obj: OpenObject) -> Result<u32, Errno> {
         let flags = default_object_flags(&obj);
         self.alloc_with_flags(obj, flags)
     }
@@ -396,12 +396,18 @@ impl FdTable {
     /// несёт. `O_CLOEXEC` здесь вычищается, потому что отслеживается в `cloexec`
     /// ([`Self::fdinfo_flags`] собирает их обратно), а флаги только создания,
     /// которые Linux убирает из `f_flags`, удаляются по той же причине.
-    pub fn alloc_with_flags(&mut self, obj: OpenObject, flags: u64) -> u32 {
-        let fd = self.slots.alloc(Self::FIRST_DYNAMIC_FD, obj);
+    ///
+    /// F-r4-life-3: падает с `EMFILE`, когда свободного слота ниже
+    /// [`FD_TABLE_LIMIT`] нет (раньше таблица росла за предел).
+    pub fn alloc_with_flags(&mut self, obj: OpenObject, flags: u64) -> Result<u32, Errno> {
+        let fd = self
+            .slots
+            .try_alloc(Self::FIRST_DYNAMIC_FD, super::fd_alloc::FD_TABLE_LIMIT, obj)
+            .map_err(|_| Errno::EMFILE)?;
         self.cloexec.remove(&fd); // переиспользованный слот не должен наследовать флаг
         self.flags
             .insert(fd, flags & !(O_CLOEXEC | FDINFO_OPEN_TIME_FLAGS));
-        fd
+        Ok(fd)
     }
 
     /// Записанные флаги открытия/статуса `fd` (без `O_CLOEXEC`) или `None`,
@@ -446,7 +452,7 @@ impl FdTable {
         self.slots.get_mut(fd)
     }
 
-    pub fn pipe(&mut self, nonblocking: bool) -> (u32, u32) {
+    pub fn pipe(&mut self, nonblocking: bool) -> Result<(u32, u32), Errno> {
         let state = Arc::new(Spinlock::new(PipeState {
             bytes: VecDeque::new(),
             readers: 1,
@@ -463,9 +469,17 @@ impl FdTable {
             nonblocking,
         });
         let extra = if nonblocking { O_NONBLOCK } else { 0 };
-        let rfd = self.alloc_with_flags(OpenObject::PipeRead(r), O_RDONLY | extra);
-        let wfd = self.alloc_with_flags(OpenObject::PipeWrite(w), O_WRONLY | extra);
-        (rfd, wfd)
+        let rfd = self.alloc_with_flags(OpenObject::PipeRead(r), O_RDONLY | extra)?;
+        // F-r4-life-3: если второй конец не влез в предел, первый обязан быть
+        // освобождён — иначе неудачный `pipe()` навсегда съедал бы один fd.
+        let wfd = match self.alloc_with_flags(OpenObject::PipeWrite(w), O_WRONLY | extra) {
+            Ok(fd) => fd,
+            Err(e) => {
+                let _ = self.close(rfd);
+                return Err(e);
+            }
+        };
+        Ok((rfd, wfd))
     }
 
     /// Текущая ёмкость слотов таблицы, сообщаемая как `FDSize:` в
@@ -523,13 +537,20 @@ impl FdTable {
     /// (`dup2` возвращает `newfd` без изменений; `dup3` — `EINVAL`); этот метод
     /// предполагает, что они различаются.
     pub fn dup_to(&mut self, oldfd: u32, newfd: u32) -> Result<u32, Errno> {
+        // F-r4-life-3: Linux отвечает EBADF на `newfd >= RLIMIT_NOFILE`; прежний
+        // путь растил `Vec` до выбранного вызывающим индекса и отвечал EINVAL.
+        if newfd as usize >= super::fd_alloc::FD_TABLE_LIMIT {
+            return Err(Errno::EBADF);
+        }
         let dup = self.slots.get(oldfd).ok_or(Errno::EBADF)?.dup_clone();
         let flags = self
             .flags
             .get(&oldfd)
             .copied()
             .unwrap_or_else(|| default_object_flags(&dup));
-        self.slots.set(newfd, dup);
+        self.slots
+            .try_set(newfd, super::fd_alloc::FD_TABLE_LIMIT, dup)
+            .map_err(|_| Errno::EBADF)?;
         self.cloexec.remove(&newfd); // dup2/dup3 снимают FD_CLOEXEC с цели
         self.flags.insert(newfd, flags);
         Ok(newfd)
@@ -586,7 +607,7 @@ impl FdTable {
     /// байтовые очереди. Каждый конец читает из одной очереди и пишет в другую,
     /// поэтому ОБА fd читаемы и записываемы (в отличие от pipe). Закрытие одного
     /// конца даёт партнёру EOF на чтении и EPIPE на записи.
-    pub fn socketpair(&mut self, nonblocking: bool) -> (u32, u32) {
+    pub fn socketpair(&mut self, nonblocking: bool) -> Result<(u32, u32), Errno> {
         let q_ab = Arc::new(Spinlock::new(PipeState {
             bytes: VecDeque::new(),
             readers: 1,
@@ -622,11 +643,18 @@ impl FdTable {
             }),
         };
         let extra = if nonblocking { O_NONBLOCK } else { 0 };
-        let fa = self.alloc_with_flags(a, O_RDWR | extra);
-        let fb = self.alloc_with_flags(b, O_RDWR | extra);
+        let fa = self.alloc_with_flags(a, O_RDWR | extra)?;
+        let fb = match self.alloc_with_flags(b, O_RDWR | extra) {
+            Ok(fd) => fd,
+            Err(e) => {
+                // Симметрично `pipe`: не оставлять первый конец при EMFILE.
+                let _ = self.close(fa);
+                return Err(e);
+            }
+        };
         // Какие номера дескрипторов получают концы RPC-канала.
 
-        (fa, fb)
+        Ok((fa, fb))
     }
 }
 
