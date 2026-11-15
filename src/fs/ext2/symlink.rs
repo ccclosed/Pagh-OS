@@ -1,75 +1,67 @@
-//! Pure ext2 symbolic-link layout and hard-link accounting rules.
+//! Чистые правила раскладки симлинков ext2 и учёта хардлинков.
 //!
-//! ext2 stores a symlink's target in one of two shapes:
+//! Цель симлинка хранится в одной из двух форм: **fast** («inline») — цель с
+//! завершающим NUL помещается в 60-байтный `i_block` inode (`[u32; 15]`), блока
+//! данных нет (`i_blocks == 0`); **slow** — цель лежит в одном блоке данных
+//! (`i_blocks == BS/512`), в начале блока цель, хвост нулевой.
 //!
-//!   * **fast** ("inline") — the target and its terminating NUL fit in the
-//!     inode's 60-byte `i_block` array (`[u32; 15]`), so the link occupies no
-//!     data block at all (`i_blocks == 0`);
-//!   * **slow** — the target needs a real data block (`i_blocks == BS/512`),
-//!     whose first bytes are the target (the block is zero-filled, so a NUL
-//!     always follows it).
+//! Граница как у `e2fsprogs` 1.47.3 и Linux: 59-байтная цель ещё fast,
+//! 60-байтная уже slow (`strlen(target) + 1` против `sizeof(i_block) == 60`);
+//! ошибка на единицу теряет последний символ цели на Linux-маунте.
 //!
-//! `e2fsprogs` 1.47.3 and Linux agree on the boundary: a 59-byte target is
-//! still fast, a 60-byte one is already slow (`ext2_symlink` compares
-//! `strlen(target) + 1` against `sizeof(i_block) == 60`). Getting this wrong
-//! loses the last character of a 60-byte target on Linux, so the boundary is
-//! pinned here once and property-tested on the host.
-//!
-//! The file is `core`-only and self-contained (it never names a sibling
-//! module), so `host-tests` includes it verbatim via `#[path]` and the same
-//! source is compiled by the `#![no_std]` kernel (R11.6).
+//! Файл `core`-only и самодостаточен, поэтому `host-tests` включают его дословно
+//! через `#[path]`, и тот же исходник собирает `#![no_std]`-ядро (R11.6).
 #![allow(dead_code)]
 
-/// Bytes of inline target storage: `i_block` is `[u32; 15]`.
+/// Байт inline-хранилища цели: `i_block` — это `[u32; 15]`.
 pub const INLINE_CAPACITY: usize = 60;
 
-/// `u32` words in `i_block`.
+/// `u32`-слов в `i_block`.
 pub const INLINE_WORDS: usize = 15;
 
-/// Longest target that still fits inline *with* its terminating NUL.
+/// Самая длинная цель, которая ещё помещается inline *вместе* с NUL.
 pub const FAST_MAX_TARGET: usize = INLINE_CAPACITY - 1;
 
-/// Largest target a **slow** symlink may have: one ext2 filesystem block.
+/// Наибольшая цель **slow**-симлинка: один блок ФС ext2.
 ///
-/// ext2 stores a slow target in a single data block (e2fsprogs refuses to
-/// create a longer link), so a larger `i_size` on an `S_IFLNK` inode is a
-/// corrupt/crafted image, never a legitimate target. The reader uses this as a
-/// hard allocation bound: a crafted `i_size = 0xFFFFFFF0` used to reach
-/// `vec![0u8; 0xFFFFFFF0]` in `Ext2Fs::read_symlink` and abort the kernel
-/// (F-x86v-1). Keep it in sync with `structs::BS` — the value is duplicated so
-/// this module stays self-contained for the host `#[path]` include.
+/// ext2 хранит slow-цель в одном блоке данных (e2fsprogs отказывается создавать
+/// более длинную ссылку), поэтому больший `i_size` у inode `S_IFLNK` —
+/// испорченный или подделанный образ, а не легитимная цель. Читатель использует
+/// это как жёсткую границу аллокации: подделанный `i_size = 0xFFFFFFF0`
+/// приводил к `vec![0u8; 0xFFFFFFF0]` в `Ext2Fs::read_symlink` и аборту ядра.
+/// Значение дублирует `structs::BS`, чтобы модуль остался самодостаточным для
+/// host-`#[path]`-включения.
 pub const SLOW_MAX_TARGET: usize = 4096;
 
-/// What an attacker-controlled `(i_blocks, i_size)` pair means for a symlink.
+/// Что означает управляемая атакующим пара `(i_blocks, i_size)` для симлинка.
 ///
-/// One decision for every consumer (read and delete), so a corrupt inode cannot
-/// be "fast" for one and "slow" for the other (F-x86v-4: `unlink` used to take
-/// the slow branch for an `i_blocks == 0, i_size > 60` inode and free
-/// `i_block[0]` — the first four bytes of the *target text* — as a block
-/// number).
+/// Одно решение для всех потребителей (чтение и удаление), чтобы испорченный
+/// inode не оказался «fast» для одного и «slow» для другого: иначе `unlink`
+/// брал бы slow-ветку для `i_blocks == 0, i_size > 60` и освобождал `i_block[0]`
+/// — первые четыре байта *текста цели* — как номер блока.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum TargetShape {
-    /// Inline target of this many bytes (`i_blocks == 0`, `i_size <= 60`).
+    /// Inline-цель из стольких байт (`i_blocks == 0`, `i_size <= 60`).
     Fast(usize),
-    /// Target in one data block, this many bytes (`i_blocks != 0`).
+    /// Цель в одном блоке данных, столько байт (`i_blocks != 0`).
     Slow(usize),
-    /// Inconsistent shape: report [`FsError::Corrupt`], allocate nothing.
+    /// Несогласованная форма: [`FsError::Corrupt`], ничего не аллоцировать.
     Corrupt,
 }
 
-/// Classify an on-disk symlink target strictly from its inode fields.
+/// Классифицирует on-disk цель симлинка строго по полям inode.
 ///
-/// Fast requires `i_blocks == 0` *and* the inline capacity (`is_fast`); a
-/// `i_blocks == 0` inode claiming a longer target is inconsistent — its
-/// `i_block` bytes are text, not a block map — and must never be read through
-/// the slow path. Slow requires a plausible one-block target; anything longer
-/// than [`SLOW_MAX_TARGET`] is corrupt *before* any allocation.
+/// Fast требует `i_blocks == 0` *и* вписывания в inline-ёмкость (`is_fast`);
+/// inode с `i_blocks == 0`, заявляющий более длинную цель, несогласован — его
+/// байты `i_block` это текст, а не карта блоков, — и никогда не должен читаться
+/// через slow-путь. Slow требует правдоподобной цели в один блок; всё длиннее
+/// [`SLOW_MAX_TARGET`] — порча *до* любой аллокации.
 pub fn target_shape(i_blocks: u32, i_size: u32) -> TargetShape {
     let size = i_size as usize;
     if is_fast(i_blocks, i_size) {
         TargetShape::Fast(size)
     } else if i_blocks == 0 {
-        // Text in `i_block`, but `i_size` > inline capacity: neither layout.
+        // Текст в `i_block`, но `i_size` > inline-ёмкости: ни та, ни другая форма.
         TargetShape::Corrupt
     } else if size <= SLOW_MAX_TARGET {
         TargetShape::Slow(size)
@@ -78,47 +70,47 @@ pub fn target_shape(i_blocks: u32, i_size: u32) -> TargetShape {
     }
 }
 
-/// Does a symlink inode own a data block?
+/// Владеет ли inode симлинка блоком данных?
 ///
-/// Deletion decides **only** from `i_blocks`, exactly like Linux's
-/// `ext2_inode_is_fast_symlink` (`i_blocks - ea_blocks == 0`): an inline target
-/// is text in `i_block` whatever `i_size` claims, so no block may be freed for
-/// it and no `i_size` may be used to pick the slow branch.
+/// Удаление решает **только** по `i_blocks`, как `ext2_inode_is_fast_symlink` в
+/// Linux (`i_blocks - ea_blocks == 0`): inline-цель — это текст в `i_block` при
+/// любом `i_size`, поэтому ни один блок нельзя освобождать и нельзя выбирать
+/// slow-ветку по `i_size`.
 pub fn owns_data_block(i_blocks: u32) -> bool {
     i_blocks != 0
 }
 
-/// Which on-disk shape a symlink target must use.
+/// Какую on-disk форму обязана использовать цель симлинка.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SymlinkLayout {
-    /// Target (plus NUL) lives in `i_block`; no data block, `i_blocks == 0`.
+    /// Цель (с NUL) в `i_block`; блока данных нет, `i_blocks == 0`.
     Fast,
-    /// Target lives in a freshly allocated data block; `i_blocks == BS/512`.
+    /// Цель в свежевыделенном блоке данных; `i_blocks == BS/512`.
     Slow,
 }
 
-/// Why a target cannot become a symlink at all.
+/// Почему цель вообще не может стать симлинком.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SymlinkError {
-    /// A zero-length target: never created (a dangling-but-empty link is not
-    /// something any archive or `ln -s ''` should produce silently).
+    /// Цель нулевой длины: не создаётся (пустая висячая ссылка не должна
+    /// появляться молча ни из архива, ни из `ln -s ''`).
     Empty,
-    /// The target does not fit `i_size` (a 32-bit field).
+    /// Цель не помещается в `i_size` (32-битное поле).
     TooBig,
 }
 
-/// The on-disk plan for one symlink target.
+/// On-disk-план для одной цели симлинка.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct SymlinkPlan {
-    /// Fast or slow layout.
+    /// Fast- или slow-раскладка.
     pub layout: SymlinkLayout,
-    /// Value for `i_size` (the target length, without any NUL).
+    /// Значение для `i_size` (длина цели, без NUL).
     pub size: usize,
-    /// The 60 inline bytes for [`SymlinkLayout::Fast`] (target + NUL padding).
+    /// 60 inline-байт для [`SymlinkLayout::Fast`] (цель + NUL-добивка).
     pub inline: Option<[u8; INLINE_CAPACITY]>,
 }
 
-/// Decide the layout for `target` and render the inline image when it is fast.
+/// Выбирает раскладку для `target` и готовит inline-образ, если она fast.
 pub fn plan(target: &[u8]) -> Result<SymlinkPlan, SymlinkError> {
     let len = target.len();
     if len == 0 {
@@ -144,17 +136,17 @@ pub fn plan(target: &[u8]) -> Result<SymlinkPlan, SymlinkError> {
     }
 }
 
-/// True when the inode is a *fast* symlink on disk.
+/// True, когда inode на диске — *fast*-симлинк.
 ///
-/// Mirrors Linux's `ext2_inode_is_fast_symlink` (`i_blocks - ea_blocks == 0`);
-/// this filesystem never writes xattr blocks (`i_file_acl == 0`), so the test
-/// reduces to `i_blocks == 0`. The `i_size <= 60` half keeps a corrupt image
-/// from making the reader copy inode fields that are not part of the target.
+/// Повторяет `ext2_inode_is_fast_symlink` из Linux (`i_blocks - ea_blocks == 0`);
+/// эта ФС никогда не пишет xattr-блоки (`i_file_acl == 0`), поэтому проверка
+/// сводится к `i_blocks == 0`. Половина `i_size <= 60` не даёт испорченному
+/// образу заставить читателя скопировать поля inode, не являющиеся целью.
 pub fn is_fast(i_blocks: u32, i_size: u32) -> bool {
     i_blocks == 0 && i_size as usize <= INLINE_CAPACITY
 }
 
-/// The `i_size` leading bytes of an inline image — the target exactly as stored.
+/// Первые `i_size` байт inline-образа — цель ровно в том виде, как хранится.
 pub fn fast_target(inline: &[u8; INLINE_CAPACITY], i_size: u32) -> Option<&[u8]> {
     let n = i_size as usize;
     if n > INLINE_CAPACITY {
@@ -163,10 +155,10 @@ pub fn fast_target(inline: &[u8; INLINE_CAPACITY], i_size: u32) -> Option<&[u8]>
     Some(&inline[..n])
 }
 
-/// Reinterpret the 60 inline bytes as `i_block`'s 15 little-endian `u32` words.
+/// Переинтерпретирует 60 inline-байт как 15 little-endian `u32`-слов `i_block`.
 ///
-/// The on-disk inode is written as raw bytes, so this is a pure byte/word
-/// reshape — no pointer interpretation is ever applied to a symlink inode.
+/// On-disk inode пишется сырыми байтами, поэтому это чистая перекладка
+/// байты↔слова: к inode симлинка никогда не применяется интерпретация указателей.
 pub fn inline_words(inline: &[u8; INLINE_CAPACITY]) -> [u32; INLINE_WORDS] {
     let mut words = [0u32; INLINE_WORDS];
     for (i, w) in words.iter_mut().enumerate() {
@@ -177,7 +169,7 @@ pub fn inline_words(inline: &[u8; INLINE_CAPACITY]) -> [u32; INLINE_WORDS] {
     words
 }
 
-/// Inverse of [`inline_words`]: the raw 60 bytes of an inode's `i_block`.
+/// Обратное к [`inline_words`]: сырые 60 байт `i_block` inode.
 pub fn inline_bytes(words: &[u32; INLINE_WORDS]) -> [u8; INLINE_CAPACITY] {
     let mut inline = [0u8; INLINE_CAPACITY];
     for (i, w) in words.iter().enumerate() {
@@ -186,22 +178,22 @@ pub fn inline_bytes(words: &[u32; INLINE_WORDS]) -> [u8; INLINE_CAPACITY] {
     inline
 }
 
-/// What `unlink` must do with the child inode after removing its directory
-/// entry.
+/// Что `unlink` обязан сделать с дочерним inode после удаления его записи
+/// каталога.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum UnlinkAction {
-    /// Other names still point at the inode: only decrement `i_links_count`.
+    /// На inode ещё указывают другие имена: только уменьшить `i_links_count`.
     DropLink,
-    /// Last name: free the data/indirect blocks and the inode.
+    /// Последнее имя: освободить data/indirect-блоки и inode.
     FreeInode,
 }
 
-/// Decide the unlink action for a **non-directory** inode with `links_count`
-/// links. `None` means the on-disk state is already broken (free inode with a
-/// live directory entry) and must be reported as corruption.
+/// Выбирает действие `unlink` для **не-каталога** с `links_count` ссылками.
+/// `None` означает, что on-disk состояние уже сломано (свободный inode с живой
+/// записью каталога), и это надо сообщить как порчу.
 ///
-/// Directories never take this path: `i_links_count` on a directory counts
-/// `.`/`..` links, not names, and hard links to directories are forbidden.
+/// Каталоги сюда не попадают: `i_links_count` каталога считает ссылки `.`/`..`,
+/// а не имена, и хардлинки на каталоги запрещены.
 pub fn unlink_action(links_count: u16) -> Option<UnlinkAction> {
     match links_count {
         0 => None,
@@ -210,8 +202,8 @@ pub fn unlink_action(links_count: u16) -> Option<UnlinkAction> {
     }
 }
 
-/// `i_links_count` after adding one hard link, or `None` when that would
-/// overflow the 16-bit field or the inode is already free.
+/// `i_links_count` после добавления одного хардлинка, либо `None`, если это
+/// переполнит 16-битное поле или inode уже свободен.
 pub fn link_bump(links_count: u16) -> Option<u16> {
     if links_count == 0 {
         None
