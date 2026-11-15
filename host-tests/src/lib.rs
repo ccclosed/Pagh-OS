@@ -330,25 +330,24 @@ pub mod ext2_bounds;
 #[path = "../../src/task/as_refs.rs"]
 pub mod as_refs;
 
-// USB HID boot/report policy and configuration-descriptor parsing (2.22.7 field
-// fix). Both modules are `core`+`alloc` only and self-contained, so the host
-// tests exercise the exact source the kernel compiles: buffer sizing from
-// `wMaxPacketSize` (the 4-byte buffer vs the field mouse's 7-byte report), boot
-// vs report-protocol mouse layouts, and the composite-device descriptor walk
-// that binds every boot keyboard/mouse interface.
+// Политика boot/report USB HID и разбор configuration descriptor. Оба модуля
+// только `core`+`alloc` и самодостаточны, поэтому host-тесты исполняют точный
+// исходник ядра: размер буфера из `wMaxPacketSize` (4-байтный буфер против
+// 7-байтного отчёта), boot/report-раскладки мыши и обход дескриптора
+// композитного устройства, привязывающий каждый boot-интерфейс клавиатуры/мыши.
 #[path = "../../src/drivers/usb_desc.rs"]
 pub mod usb_desc;
 
-#[path = "../../src/drivers/usb_hid_proto.rs"]
-pub mod usb_hid_proto;
+#[path = "../../src/drivers/usb_hid_report.rs"]
+pub mod usb_hid_report;
 
-// xHCI root-port reset policy (2.22.7 field fix). `core`-only and self-contained:
-// the port state machine the driver runs for USB2 debounce/training, PRC/PED+U0
-// waits, stability and backoff, with no PP power-cycle. Host tests simulate the
-// field machine's ports (Polling for hundreds of ms, PED glimpses that are lost,
-// permanent failure) because QEMU ports enable instantly and cannot reproduce it.
-#[path = "../../src/drivers/xhci_port.rs"]
-pub mod xhci_port;
+// Политика сброса корневого порта xHCI. Только `core`, самодостаточна: state
+// machine порта для USB2 debounce/training, ожиданий PRC/PED+U0, стабильности и
+// backoff, без PP power-cycle. Host-тесты симулируют порты (Polling сотни
+// миллисекунд, потерянные PED, постоянный отказ), потому что QEMU включает порты
+// мгновенно и этого не воспроизводит.
+#[path = "../../src/drivers/xhci_hub.rs"]
+pub mod xhci_hub;
 
 
 // ── OpenPGP repository-metadata verification (issue #32) ─────────────────────
@@ -521,17 +520,17 @@ mod properties {
     // execve/exit teardown — every live-task registry (ready, SIGSTOP-parked,
     // pending reap) must block freeing a PML4 another task still runs on.
     mod as_refs;
-    // xHCI port bring-up policy (2.22.7, two field iterations): the reset storm
-    // was a timing bug and the lost enable was a PORTSC-write bug (PED is
-    // write-1-to-disable). The properties pin the Linux neutral mask, the
-    // hub_port_debounce/hub_port_wait_reset sequencing, the 200 ms stability
-    // window and the ≥1 s backoff. Simulated ports cover what QEMU cannot.
-    mod xhci_port;
-    // USB HID boot/report policy + configuration-descriptor walk (2.22.7):
-    // transfer length from wMaxPacketSize (never shorter than a packet, so a
-    // 7-byte report cannot babble a 4-byte buffer), boot vs report mouse
-    // layouts, and every boot keyboard/mouse interface of a composite device.
-    mod usb_hid_proto;
+    // Политика подъёма порта xHCI: шторм reset был ошибкой таймингов, а
+    // потерянное включение — ошибкой записи PORTSC (PED — write-1-to-disable).
+    // Свойства закрепляют neutral-маску, последовательность
+    // hub_port_debounce/hub_port_wait_reset, 200-мс окно стабильности и backoff
+    // ≥1 с. Симулированные порты покрывают то, чего не может QEMU.
+    mod xhci_hub;
+    // Политика boot/report USB HID + обход configuration descriptor: длина
+    // передачи из wMaxPacketSize (не короче пакета, поэтому 7-байтный отчёт не
+    // вызывает babble на 4-байтном буфере), boot/report-раскладки мыши и каждый
+    // boot-интерфейс клавиатуры/мыши композитного устройства.
+    mod usb_hid_report;
     // Symbolic-link path resolution (issue #18, contract `EXT2-LINKS.md` §4.6,
     // §7.4): Linux-verified cases plus a randomized comparison against an
     // independent restart-based oracle.

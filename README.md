@@ -202,34 +202,31 @@ server certificate chain, hostname and validity checked before a byte of the ind
   offline into `assets/font8x18.bin` by `tools/gen_font.py` — the kernel blends
   8-bit coverage per pixel, so glyph edges are antialiased, and it ships no TrueType
   parser.
-- **USB input (xHCI + HID).** An in-kernel, interrupt-free xHCI driver
-  (`drivers/xhci.rs`) enumerates root-port devices, and `drivers/usb_hid.rs`
-  translates their reports into exactly the PS/2 scancode/packet stream the 8042
-  path produces, so the shell, the boot menu, `^C`/`^Z` and `lxrun` stdin work
-  unchanged. Each boot-class HID interface is put in **boot protocol**
-  (SET_PROTOCOL 0 — not report protocol), every boot keyboard/mouse interface of a
-  composite device is bound and polled, the interrupt-IN transfer buffer is sized
-  from `wMaxPacketSize` (so a longer report cannot babble the endpoint), and a
-  halted endpoint is recovered with xHCI **Reset Endpoint** (bounded retries)
-  instead of disabling input until reboot. Root-port bring-up follows Linux
-  `hub.c`/`xhci-hub.c` in a pure, host-tested policy (`drivers/xhci_port.rs`):
-  every PORTSC write goes through the Linux
-  neutral mask (so acknowledging a reset can no longer write `PED=1` and disable
-  the port), the connection must be unchanged for 100 ms before a reset (25 ms
-  debounce steps, 2 s budget), a reset is awaited as `hub_port_wait_reset`
-  (10 ms then 200 ms polls, 800 ms per write, up to five writes, then `PED`), the
-  enable must hold for 200 ms before the device is addressed, a lost enable
-  pauses ≥1 s and is re-debounced instead of reset every ~100 ms, and there is no
-  PP power-cycle at all (PP is only raised, read back and retried). The field
-  machine that motivated this (Intel 8086:7a60, 26 ports) went through two field
-  reports: a reset every ~124 ms and then a port that enabled for a moment and
-  fell back to Polling, with every port left unpowered by the power-cycle.
-  Real hardware was not available for this change, so it is QEMU evidence and
-  the serial lines to look for are named in `src/drivers/README.md`. Honest
-  limitations: hubs are not supported (a device behind one is invisible); report-protocol-only devices are
-  best effort (boot keyboard layout assumed, mouse supports the 7-byte 16-bit
-  E-Signal layout or 8-bit axes); wheel/pan are decoded but not delivered; keyboard
-  LED output reports (`SET_REPORT`) are not implemented.
+- **USB-ввод (xHCI + HID).** Встроенный драйвер xHCI без прерываний
+  (`drivers/xhci.rs`) перечисляет устройства на корневых портах, а
+  `drivers/usb_hid.rs` переводит их отчёты ровно в тот поток PS/2-сканкодов и
+  пакетов, который даёт путь 8042, поэтому shell, boot-меню, `^C`/`^Z` и stdin
+  `lxrun` работают без изменений. Каждый boot-интерфейс HID переводится в
+  **boot protocol** (SET_PROTOCOL 0, не report protocol), все boot-клавиатуры и
+  мыши композитного устройства привязываются и опрашиваются, interrupt-IN буфер
+  имеет размер `wMaxPacketSize` (поэтому длинный отчёт не вызывает babble), а
+  остановленный эндпоинт восстанавливается xHCI **Reset Endpoint** (ограниченное
+  число попыток), а не отключением ввода до перезагрузки. Подъём корневых портов
+  следует `hub.c`/`xhci-hub.c` в чистой политике с host-тестами
+  (`drivers/xhci_hub.rs`): каждая запись PORTSC идёт через neutral-маску (так
+  подтверждение reset больше не пишет `PED=1` и не отключает порт), подключение
+  должно быть неизменным 100 мс до reset (шаг 25 мс, бюджет 2 с), reset ждётся
+  как `hub_port_wait_reset` (опрос 10 мс, затем 200 мс, 800 мс на запись, до
+  пяти записей, затем `PED`), включение должно продержаться 200 мс до адресации,
+  потеря включения даёт паузу ≥1 с и новый debounce вместо reset каждые ~100 мс,
+  а PP power-cycle отсутствует вовсе (PP только поднимается, читается обратно и
+  повторяется). Ограничения честно названы: хабы не поддерживаются (устройство
+  за хабом невидимо); устройства только-report-protocol — best effort
+  (предполагается boot-раскладка клавиатуры, мышь поддерживает 7-байтную
+  16-битную E-Signal или 8-битные оси); wheel/pan декодируются, но не
+  доставляются; LED output report (`SET_REPORT`) не реализован. Проверено в
+  QEMU (`tools/e2e.py usb`, host-свойства, `selftest`); на реальном железе не
+  проверялось.
 - **Storage:** PCI enumeration, virtio-blk and NVMe block devices, **GPT/MBR partition
   support** (each partition becomes its own block device, so pagh can own one partition
   instead of the whole disk), and a multi-block-group ext2-compatible read/write
