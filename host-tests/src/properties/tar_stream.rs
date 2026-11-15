@@ -107,10 +107,7 @@ fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
         "files",
         write_tar(&[("a/one", b"1".as_slice()), ("a/two", b"22".as_slice())]),
     ));
-    out.push((
-        "empty",
-        write_tar_members(&[], TarFormat::UstarPrefix),
-    ));
+    out.push(("empty", write_tar_members(&[], TarFormat::UstarPrefix)));
 
     let links = [
         TarMember::File {
@@ -129,10 +126,7 @@ fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
             path: "usr/share/doc",
         },
     ];
-    out.push((
-        "links",
-        write_tar_members(&links, TarFormat::UstarPrefix),
-    ));
+    out.push(("links", write_tar_members(&links, TarFormat::UstarPrefix)));
 
     let ln = long_name(140);
     let lt = long_target(150);
@@ -188,11 +182,7 @@ fn stream_scan_agrees_with_read_tar_on_every_fixture() {
             assert_eq!(got.kind, want.kind, "{}: kind", name);
             assert_eq!(got.mode, want.mode, "{}: mode", name);
             assert_eq!(got.size, want.size, "{}: size", name);
-            assert_eq!(
-                got.link_target, want.link_target,
-                "{}: link target",
-                name
-            );
+            assert_eq!(got.link_target, want.link_target, "{}: link target", name);
         }
         // Member ordinals are dense and match the entry positions: the metadata
         // plan and pass 2 use them as the acceptance key.
@@ -209,7 +199,11 @@ fn stream_scan_accepts_every_chunk_boundary() {
         for chunk in [1usize, 2, 7, 511, 512, 513, 1024, buf.len()] {
             let got = scan_chunked(&buf, chunk)
                 .unwrap_or_else(|e| panic!("{} @ {} bytes: {:?}", name, chunk, e));
-            assert_eq!(got, whole, "{}: chunk size {} changed the scan", name, chunk);
+            assert_eq!(
+                got, whole,
+                "{}: chunk size {} changed the scan",
+                name, chunk
+            );
         }
     }
 }
@@ -257,11 +251,7 @@ fn truncated_content_is_refused() {
 #[test]
 fn oversized_extension_is_refused_before_buffering() {
     let mut buf = Vec::new();
-    buf.extend_from_slice(&plain_header(
-        LONG_LINK,
-        STREAM_MAX_EXTENSION + 1,
-        b'L',
-    ));
+    buf.extend_from_slice(&plain_header(LONG_LINK, STREAM_MAX_EXTENSION + 1, b'L'));
     // The size check fires at the header, so no payload needs to exist.
     assert_eq!(scan_whole(&buf), Err(TarError::ExtensionTooLarge));
 }
@@ -293,7 +283,13 @@ fn eager_ops(entries: &[crate::tar::TarEntry<'_>]) -> Vec<(u8, String, String, u
                 path,
                 content,
                 mode,
-            } => (b'F', path.clone(), String::new(), *mode, content.len() as u64),
+            } => (
+                b'F',
+                path.clone(),
+                String::new(),
+                *mode,
+                content.len() as u64,
+            ),
             crate::install::InstallOp::Symlink { path, target } => {
                 (b'S', path.clone(), target.clone(), 0, 0)
             }
@@ -304,7 +300,16 @@ fn eager_ops(entries: &[crate::tar::TarEntry<'_>]) -> Vec<(u8, String, String, u
         .collect()
 }
 
-fn eager_checks<'a>(entries: &'a [crate::tar::TarEntry<'a>]) -> (usize, usize, usize, Vec<String>, Vec<String>, Vec<(String, String, u8)>) {
+fn eager_checks<'a>(
+    entries: &'a [crate::tar::TarEntry<'a>],
+) -> (
+    usize,
+    usize,
+    usize,
+    Vec<String>,
+    Vec<String>,
+    Vec<(String, String, u8)>,
+) {
     let plan = plan_install(entries);
     (
         plan.skipped_unsafe,
@@ -379,7 +384,10 @@ fn metadata_plan_matches_eager_plan_on_every_fixture() {
                     assert_eq!(metas[*member].size, *size, "{}", name);
                 }
                 MetaOp::Symlink {
-                    member, path, target, ..
+                    member,
+                    path,
+                    target,
+                    ..
                 } => {
                     assert_eq!(&metas[*member].path, path, "{}: symlink ordinal", name);
                     assert_eq!(metas[*member].kind, TarType::Symlink, "{}", name);
