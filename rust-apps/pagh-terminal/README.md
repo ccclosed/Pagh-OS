@@ -6,6 +6,11 @@ headless PNG-скриншоты и клиент PDP/1 (Pagh Desktop Protocol).  
 
 ![PaghTerm](screenshots/01-welcome.png)
 
+E2E с реальным композитором: `pagh-desktop` из dev (PR #101) рисует окно
+терминала, полученное по PDP/1 (headless backend, 1280×800).
+
+![Live PDP/1](screenshots/05-live-pdp1.png)
+
 ## Что уже работает
 
 * VT100/ANSI: CSI/OSC/ESC/DCS, курсор, scroll region, alt screen, tabs,

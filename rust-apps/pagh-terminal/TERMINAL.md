@@ -208,7 +208,8 @@ wide wrap, selection, resize, DECRQM, malformed sequences.  Плюс unit-тес
   подмножество (для golden-тестов).  Размер файла ~1–1.7 MB на кадр — цена
   отсутствия компрессора; для desktop-протокола кадры идут XRGB8888.
 
-Скриншоты (детерминированные, сравниваются тестом):
+Скриншоты (01–04 детерминированные, сравниваются тестом; 05 — артефакт
+ручного e2e, не участвует в byte-for-byte проверке):
 
 | файл | содержание |
 |---|---|
@@ -216,9 +217,16 @@ wide wrap, selection, resize, DECRQM, malformed sequences.  Плюс unit-тес
 | `screenshots/02-colors.png` | 16/256/truecolor, атрибуты |
 | `screenshots/03-scrollback.png` | 90 строк лога, scroll offset, selection, scrollbar |
 | `screenshots/04-unicode.png` | box drawing, кириллица/греческий/CJK/kana, block elements |
+| `screenshots/05-live-pdp1.png` | e2e: `pagh-desktop` (dev #101) рисует наше окно через PDP/1 |
 
 ![Colors](screenshots/02-colors.png)
 ![Unicode](screenshots/04-unicode.png)
+
+E2E с реальным композитором (headless backend, `pagh-desktop` из `origin/dev`
+после merge PR #101): окно создано, PDP/1-кадры приняты, сервер отрисовал
+терминал и панель.
+
+![Live PDP/1](screenshots/05-live-pdp1.png)
 
 ## Клиентский протокол PDP/1
 
@@ -492,11 +500,13 @@ Kernel-side проверка (после реализации): boot-тест п
 
 ## Ограничения и остаток
 
-* **Реальный compositor ещё не подключён.** Клиент реализует опубликованный
-  server-task `PROTOCOL.md` (PDP/1) и протестирован против фейкового
-  Unix-socket сервера, повторяющего этот обмен; e2e-прогон с реальным
-  `pagh-desktop` — следующий шаг.  Дефолтный сокет —
-  `/tmp/pagh-desktop.sock`, переопределяется `--socket`/`PAGH_DESKTOP_SOCKET`.
+* **Compositor-интеграция проверена вручную.** Клиент реализует опубликованный
+  server-task `PROTOCOL.md` (PDP/1), проходит тест против fake-сервера и был
+  прогнан e2e с `pagh-desktop` из `origin/dev` после merge PR #101
+  (headless backend, окно 720×460, скриншот `05-live-pdp1.png`).  Этот прогон
+  не входит в CI (compositor появился в dev после base этого PR).  Дефолтный
+  сокет — `/tmp/pagh-desktop.sock`, переопределяется
+  `--socket`/`PAGH_DESKTOP_SOCKET`.
 * **Kernel shared surface не реализован** — только ABI + host-парсер; нужен
   отдельный PR (desktop-kernel/lead) в `src/drivers/vt.rs`/devfs и согласие на
   ABI.  `kernel/src/**` этим PR не тронут.
