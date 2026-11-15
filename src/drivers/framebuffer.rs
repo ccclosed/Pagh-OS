@@ -48,6 +48,19 @@ pub struct FbInfo {
     pub transp_length: u32,
 }
 
+/// Снимок текстовой сетки консоли для `/dev/vtconsole0` (ABI v1).
+///
+/// `cols`/`rows` — размер *консольной* сетки (100×text_rows), а не всей
+/// поверхности ABI: при открытии устройства снимок кладётся в левый верхний
+/// угол shared surface, остальные колонки/строки остаются под kernel-VT.
+pub struct TextSnapshot {
+    pub cols: usize,
+    pub rows: usize,
+    /// `(символ, fg, bg)` в row-major порядке.
+    pub cells: alloc::vec::Vec<(u8, u32, u32)>,
+    pub cursor: (usize, usize),
+}
+
 /// Один раз установленный загрузчиком scanout: `open(/dev/fb0)`/`mmap`
 /// переключает консоль в режим «экран принадлежит userspace».
 ///
@@ -358,6 +371,44 @@ impl FramebufferWriter {
         self.info
     }
 
+    /// Снять текущую текстовую сетку для shared VT surface.
+    pub fn text_snapshot(&self) -> TextSnapshot {
+        let rows = self.text_rows();
+        let mut cells = alloc::vec::Vec::with_capacity(rows * CHARS_PER_LINE);
+        for row in 0..rows {
+            let base = row * CHARS_PER_LINE;
+            for col in 0..CHARS_PER_LINE {
+                cells.push((
+                    self.grid[base + col],
+                    self.grid_fg[base + col],
+                    self.bg_color,
+                ));
+            }
+        }
+        TextSnapshot {
+            cols: CHARS_PER_LINE,
+            rows,
+            cells,
+            cursor: (self.col, self.row),
+        }
+    }
+
+    /// Опубликовать всю живую текстовую сетку в `/dev/vtconsole0`.
+    ///
+    /// Вызывается после scroll/clear/repaint: инкрементально публикуются только
+    /// одиночные клетки, а сдвиг строк меняет всю матрицу.
+    fn publish_all(&self) {
+        let snap = self.text_snapshot();
+        crate::drivers::vtsurface::publish_shell_full(
+            &snap.cells,
+            snap.cols as u16,
+            snap.rows as u16,
+            snap.cursor.0 as u16,
+            snap.cursor.1 as u16,
+            true,
+        );
+    }
+
     pub fn clear(&mut self) {
         self.col = 0;
         self.row = 0;
@@ -390,6 +441,8 @@ impl FramebufferWriter {
             self.width.saturating_sub(1),
             self.height.saturating_sub(1),
         ));
+        crate::drivers::vtsurface::publish_shell_clear(self.fg_color, self.bg_color);
+        crate::drivers::vtsurface::publish_shell_cursor(0, 0, true);
     }
 
     /// Record `ch` at grid cell `(col, row)`; out-of-range writes are dropped.
@@ -398,6 +451,15 @@ impl FramebufferWriter {
             let idx = row * CHARS_PER_LINE + col;
             self.grid[idx] = ch;
             self.grid_fg[idx] = self.fg_color;
+            // Инкрементальная публикация в /dev/vtconsole0. Пока поверхности
+            // никто не открыл, `publish_shell_cell` — один atomic load.
+            crate::drivers::vtsurface::publish_shell_cell(
+                col,
+                row,
+                ch,
+                self.fg_color,
+                self.bg_color,
+            );
         }
     }
 
@@ -477,6 +539,7 @@ impl FramebufferWriter {
             }
             _ => {}
         }
+        crate::drivers::vtsurface::publish_shell_cursor(self.col, self.row, true);
     }
 
     /// Number of text rows the console may use, leaving room for the bottom
@@ -680,6 +743,7 @@ impl FramebufferWriter {
         if self.scroll.view() > 0 {
             self.render_view();
         }
+        self.publish_all();
     }
 
     /// Copy grid row `row` into an owned history row.
@@ -826,6 +890,7 @@ impl FramebufferWriter {
                 self.paint_cell_with_bg(col, row, ch, fg, self.bg_color, false);
             }
         }
+        self.publish_all();
     }
 
     // ─── Text-cursor support (the blinking caret) ───
@@ -846,6 +911,7 @@ impl FramebufferWriter {
         let (cols, rows) = self.text_grid();
         self.col = col.min(cols.saturating_sub(1));
         self.row = row.min(rows.saturating_sub(1));
+        crate::drivers::vtsurface::publish_shell_cursor(self.col, self.row, true);
     }
 
     /// Number of character columns on one text row, and the number of text rows
@@ -1608,6 +1674,12 @@ pub fn dimensions() -> (usize, usize) {
 /// Геометрия Limine-фреймбуфера для `/dev/fb0`; `None` на serial-only boot.
 pub fn fb_info() -> Option<FbInfo> {
     FB_WRITER.with(|w| w.info())
+}
+
+/// Снимок живой текстовой сетки для `/dev/vtconsole0`; `None` на serial-only
+/// boot (тогда поверхность живёт сеткой 80×25 и остаётся пустой).
+pub fn text_snapshot() -> Option<TextSnapshot> {
+    FB_WRITER.with(|w| w.text_snapshot())
 }
 
 /// The console's current foreground and background colours (see

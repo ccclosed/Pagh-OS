@@ -407,6 +407,9 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
     // обязан быть отображён: Linux проверяет только `sizeof(input_event)`.
     // Остальные файловые/pipe-пути сохраняют прежнюю проверку всего буфера.
     if let Some(Resolved::File { node, .. }) = resolve_fd(fd as u32) {
+        if node.is_vtinput() {
+            return Err(Errno::EBADF);
+        }
         if node.is_evdev() {
             return read_evdev_event(fd as u32, buf, count);
         }
@@ -748,6 +751,10 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             let data = copy_in(buf, count);
             console_write(&data);
             Ok(count)
+        }
+        Some(Resolved::File { node, .. }) if node.is_vtconsole() => {
+            // Shared surface — read-only: экран публикует только ядро.
+            Err(Errno::EBADF)
         }
         Some(Resolved::File { node, offset }) => {
             let data = copy_in(buf, count);
@@ -1119,6 +1126,11 @@ fn open_resolved(abs: &str, flags: u64) -> Result<u64, Errno> {
     };
     let fd = compat::with_current_compat(|cs| cs.fds.alloc_with_flags(obj, flags))
         .ok_or(Errno::EBADF)??;
+    if node.is_vtconsole() {
+        // Публикация включается после успешной аллокации fd: клиент сразу
+        // получает снимок уже нарисованного shell-текста.
+        crate::drivers::vtsurface::activate();
+    }
     Ok(fd as u64)
 }
 
@@ -1173,6 +1185,19 @@ fn open_path(path: &str, flags: u64, mode: u32) -> Result<u64, Errno> {
                     return Err(Errno::ENODEV);
                 }
                 crate::drivers::framebuffer::takeover_acquire();
+            }
+            // `/dev/vtconsole0` — read-only снимок консоли; запись/чтение
+            // vtinput — строго по назначению (ABI: 0600, read-only/write-only).
+            if node.is_vtconsole() {
+                if node.vtconsole_info().is_none() {
+                    return Err(Errno::ENODEV);
+                }
+                if flags & 0o3 != 0 {
+                    return Err(Errno::EACCES);
+                }
+            }
+            if node.is_vtinput() && flags & 0o3 == 0 {
+                return Err(Errno::EACCES);
             }
             if flags & O_TRUNC_FL != 0 && !node.is_directory() {
                 // Best effort: узлы без поддержки truncate (обычные файлы ext2
@@ -1264,9 +1289,20 @@ pub fn sys_close(fd: u64) -> Result<u64, Errno> {
     // NET.lock из обработчика syscall, рискует дедлоком: спинлоки выключают IF,
     // и сетевой поток не может выполниться, чтобы отпустить свою сторону. Слот
     // SocketSet освободится только при перезагрузке.
+    // `/dev/vtconsole0`: закрытие последнего fd выключает публикацию shared
+    // surface (уже взятые mmap-снимки остаются валидны до munmap).
+    let closing_vtconsole = matches!(
+        resolve_fd(fd as u32),
+        Some(Resolved::File { ref node, .. }) if node.is_vtconsole()
+    );
     let res = compat::with_current_compat(|cs| cs.fds.close(fd as u32));
     match res {
-        Some(Ok(())) => Ok(0),
+        Some(Ok(())) => {
+            if closing_vtconsole {
+                crate::drivers::vtsurface::deactivate();
+            }
+            Ok(0)
+        }
         Some(Err(e)) => Err(e),
         None => Err(Errno::EBADF),
     }
@@ -1304,6 +1340,9 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> Result<u64, Errno> {
             });
             Ok(offset)
         }
+        Some(Resolved::File { node, .. }) if node.is_vtconsole() || node.is_vtinput() => {
+            Err(Errno::ESPIPE)
+        }
         Some(Resolved::File { node, offset: cur }) => {
             let size = node.size();
             let new_off = plan_lseek(whence as u32, cur, size, offset as i64)?;
@@ -1326,7 +1365,7 @@ pub fn sys_ftruncate(fd: u64, length: u64) -> Result<u64, Errno> {
     }
     match resolve_fd(fd as u32) {
         Some(Resolved::File { node, .. }) => {
-            if node.is_fbdev() || node.is_evdev() {
+            if node.is_fbdev() || node.is_evdev() || node.is_vtconsole() || node.is_vtinput() {
                 return Err(Errno::EINVAL);
             }
             node.truncate(length).map_err(truncate_errno)?;
@@ -1584,7 +1623,7 @@ fn stat_mode_for(node: &Arc<dyn VfsNode>) -> u32 {
         S_IFDIR | perms
     } else if node.is_symlink() {
         S_IFLNK | perms
-    } else if node.is_fbdev() || node.is_evdev() {
+    } else if node.is_fbdev() || node.is_evdev() || node.is_vtconsole() || node.is_vtinput() {
         // Символьные устройства варианта B: композитор видит S_IFCHR, как
         // `/dev/fb0`/`/dev/input/event0` в Linux, и может отличить их от
         // regular-файла до open.
@@ -1761,6 +1800,9 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
         Some(Resolved::File { node, .. }) if node.is_fbdev() => fb_ioctl(&node, request, arg),
+        Some(Resolved::File { node, .. }) if node.is_vtconsole() => {
+            vtconsole_ioctl(&node, request, arg)
+        }
         Some(Resolved::Console) | Some(Resolved::Stdin) => tty_ioctl(request, arg),
         // tty-запрос на не-tty дескриптор — «неподходящий ioctl для
         // устройства», а не «неверный аргумент». isatty() из glibc ждёт ENOTTY;
@@ -1840,6 +1882,31 @@ fn fb_ioctl(node: &Arc<dyn VfsNode>, request: u64, arg: u64) -> Result<u64, Errn
         }
         _ => Err(Errno::ENOTTY),
     }
+}
+
+/// `ioctl(/dev/vtconsole0)`: `PGVT_IOC_INFO` (ABI v1).
+///
+/// Отдаёт геометрию и `total_bytes`, чтобы клиент мог отобразить/промапить
+/// поверхность, не угадывая размер. Прочие запросы — `ENOTTY`; режим/размер
+/// меняет только ядро.
+fn vtconsole_ioctl(node: &Arc<dyn VfsNode>, request: u64, arg: u64) -> Result<u64, Errno> {
+    use crate::drivers::vt_abi::{encode_info, PgvtInfo, PGVT_IOC_INFO};
+    let info = node.vtconsole_info().ok_or(Errno::ENODEV)?;
+    if request != PGVT_IOC_INFO {
+        return Err(Errno::ENOTTY);
+    }
+    let out = PgvtInfo {
+        abi_version: 1,
+        total_bytes: info.total_bytes,
+        cols: info.cols as u32,
+        rows: info.rows as u32,
+        cell_size: 16,
+        header_len: 128,
+        reserved: [0, 0],
+    };
+    check_user_ptr_writable(arg, 32)?;
+    copy_out(arg, &encode_info(&out))?;
+    Ok(0)
 }
 
 /// `TCGETS`: прочитать атрибуты терминала (`struct termios`).
@@ -1984,6 +2051,18 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
 // readline вычерпывает ввод по одному байту за read после select().
 static STDIN_PENDING: crate::sync::spinlock::Spinlock<alloc::vec::Vec<u8>> =
     crate::sync::spinlock::Spinlock::new(alloc::vec::Vec::new());
+
+/// Положить байты в stdin текущего foreground-процесса (`/dev/vtinput` →
+/// Linux-программа). Ограничение 4 КиБ: медленный читатель не должен дать
+/// userspace бесконечно растить kernel-heap.
+pub fn push_stdin_bytes(bytes: &[u8]) {
+    const MAX_PENDING: usize = 4096;
+    let mut q = STDIN_PENDING.lock();
+    let room = MAX_PENDING.saturating_sub(q.len());
+    if room != 0 {
+        q.extend_from_slice(&bytes[..core::cmp::min(bytes.len(), room)]);
+    }
+}
 
 // Libuv переводит сырой tty в O_NONBLOCK и мультиплексирует его через epoll;
 // блокирующее чтение в ядре останавливает весь TUI event loop nvim.

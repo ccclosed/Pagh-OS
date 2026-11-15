@@ -240,6 +240,27 @@ pub trait VfsNode: Send + Sync {
     fn is_memfd(&self) -> bool {
         false
     }
+
+    /// Является ли узел `/dev/vtconsole0` (read-only shared VT surface).
+    fn is_vtconsole(&self) -> bool {
+        false
+    }
+
+    /// Геометрия shared VT surface; `None` — поверхность не поднялась
+    /// (open вернёт `ENODEV`).
+    fn vtconsole_info(&self) -> Option<crate::drivers::vtsurface::VtConsoleInfo> {
+        None
+    }
+
+    /// Физический кадр страницы shared VT surface для read-only `mmap`.
+    fn vtconsole_page(&self, _index: u64) -> Option<u64> {
+        None
+    }
+
+    /// Является ли узел `/dev/vtinput` (write-only приём VT-байтов).
+    fn is_vtinput(&self) -> bool {
+        false
+    }
 }
 
 // ─── /dev/null ────────────────────────────────────────────────────────────
@@ -425,6 +446,18 @@ impl VfsNode for MountNode {
     fn is_memfd(&self) -> bool {
         self.inner.is_memfd()
     }
+    fn is_vtconsole(&self) -> bool {
+        self.inner.is_vtconsole()
+    }
+    fn vtconsole_info(&self) -> Option<crate::drivers::vtsurface::VtConsoleInfo> {
+        self.inner.vtconsole_info()
+    }
+    fn vtconsole_page(&self, index: u64) -> Option<u64> {
+        self.inner.vtconsole_page(index)
+    }
+    fn is_vtinput(&self) -> bool {
+        self.inner.is_vtinput()
+    }
 }
 
 // ─── корневой каталог ───────────────────────────────────────────────────────
@@ -508,12 +541,18 @@ pub fn init() {
     crate::debug!("/dev/fb0 — ready");
     let input = desktop_dev::input_dir();
     crate::debug!("/dev/input/event0 — ready");
+    let vtconsole = desktop_dev::vtconsole0();
+    crate::debug!("/dev/vtconsole0 — ready");
+    let vtinput = desktop_dev::vtinput();
+    crate::debug!("/dev/vtinput — ready");
     let dev = Arc::new(DevDirectory {
         children: vec![
             Arc::clone(&null),
             Arc::clone(&serial),
             Arc::clone(&fb0),
             Arc::clone(&input),
+            Arc::clone(&vtconsole),
+            Arc::clone(&vtinput),
         ],
     }) as Arc<dyn VfsNode>;
     // Записываемый in-memory /tmp: Linux-userspace считает, что он есть, —

@@ -25,7 +25,7 @@ ABI ниже проверен host-тестами против `linux/fb.h` и `
 | 11 | `munmap` | вернуть VA и ссылку на страницы |
 | 10 | `mprotect` | защита региона (в т.ч. read-only поверх) |
 | 2 / 257 | `open` / `openat` | `/dev/fb0`, `/dev/input/event0`, файлы |
-| 16 | `ioctl` | `FBIOGET_VSCREENINFO` / `FBIOGET_FSCREENINFO` |
+| 16 | `ioctl` | `FBIOGET_VSCREENINFO` / `FBIOGET_FSCREENINFO`; `PGVT_IOC_INFO` |
 | 0 | `read` | события `/dev/input/event0` |
 | 7 | `poll`, 271 `ppoll`, 270 `pselect6`, 23 `select` | ожидание событий |
 | 3 | `close` | отпустить fd (страницы живут, пока живы отображения) |
@@ -283,7 +283,122 @@ fb[y * (fix.line_length / 4) + x] = argb;
 
 ---
 
-## 5. Минимальный цикл композитора (C)
+## 5. `/dev/vtconsole0` + `/dev/vtinput` — shared VT surface
+
+Терминальное окно desktop B не переписывает shell на userspace PTY: kernel-VT
+остаётся владельцем сетки/курсора/scrollback, а терминал получает **read-only
+снимок видимой текстовой матрицы** и рисует его своим шрифтом. Ввод идёт обратно
+байтами через `/dev/vtinput`. Полный ABI — в
+`rust-apps/pagh-terminal/TERMINAL.md` (§«Kernel console shared surface ABI v1»);
+ниже — контракт, который реализует ядро.
+
+| путь | open | назначение |
+|---|---|---|
+| `/dev/vtconsole0` | `O_RDONLY`, режим 0600 | `mmap`/`read` shared-снимка видимой сетки |
+| `/dev/vtinput` | `O_WRONLY`, режим 0600 | VT-байты (UTF-8/escape) → вход shell/VT |
+
+`O_WRONLY` на `vtconsole0` и `O_RDONLY` на `vtinput` — `EACCES`; `write` в
+`vtconsole0` и `read` из `vtinput` — `EBADF`. Без фреймбуфера поверхность живёт
+сеткой 80×25, а `vtconsole0` при этом остаётся доступной (снимок пуст).
+
+### 5.1. Формат
+
+Заголовок — **128 байт**, клетка — **16 байт**, little-endian; всё в одном
+непрерывном буфере `128 + cols*rows*16`. Ключевые смещения заголовка:
+
+| offset | size | поле |
+|---|---|---|
+| 0 | 4 | magic `0x54564750` (`"PGVT"`) |
+| 4 | 2 | version = 1 |
+| 6 | 2 | header_len = 128 |
+| 8 | 4 | `seq` — seqlock (нечётный = идёт запись) |
+| 12 | 4 | flags: bit0 Unicode, bit1 truecolor, bit2 cursor valid |
+| 16, 18 | 2+2 | cols, rows (1…1000) |
+| 20, 22 | 2+2 | cursor_x, cursor_y |
+| 24, 25 | 1+1 | cursor_visible, cursor_style (0 block) |
+| 26, 28 | 2+2 | scroll_top, scroll_bot |
+| 30, 32, 34 | 2+2+2 | cell_width=8, cell_height=18, cell_size=16 |
+| 40 | 4 | cells_offset = 128 |
+| 44 | 4 | cells_bytes = cols*rows*16 |
+| 56 | 4 | total_bytes |
+| 60 | 4 | write_seq — счётчик завершённых публикаций |
+| 64..128 | 64 | reserved, нули |
+
+Клетка: `codepoint u32` (0 = пробел), `fg u32` `0x00RRGGBB`, `bg u32`,
+`attrs u16` (bold 1, dim 2, italic 4, underline 8, blink 16, reverse 32,
+hidden 64, strike 128, overline 256), `width u8` (1/2), `flags u8`
+(bit0 = wide continuation). В v1 kernel публикует `attrs=0`, `width=1`:
+kernel-VT хранит `u8`, а не Unicode-атрибуты; цвета уже RGB.
+
+### 5.2. mmap и read
+
+```c
+int fd = open("/dev/vtconsole0", O_RDONLY);
+struct pgvt_info info;
+ioctl(fd, PGVT_IOC_INFO, &info);                 /* 0x8020_5601, 32 B */
+const uint8_t *surf = mmap(NULL, info.total_bytes, PROT_READ,
+                           MAP_SHARED, fd, 0);
+```
+
+* `mmap` принимает только `MAP_SHARED` + ровно `PROT_READ`, `offset == 0`,
+  `len <= info.total_bytes`. PTE read-only и несёт `VT_RO_BIT`: `mprotect(
+  PROT_WRITE)` возвращает `EACCES`, поэтому userspace не может подменить экран.
+* Писатель — только ядро. Публикация идёт в живые кадры PMM; отображение
+  когерентно, читатель обязан использовать seqlock: взять `seq`, если он
+  нечётный — повторить, скопировать заголовок/клетки, проверить, что `seq` не
+  изменился и чётен. `write_seq` увеличивается на каждой завершённой
+  публикации — по нему удобно замечать «экран изменился».
+* `read(fd, buf, total_bytes)` — fallback: ядро копирует целостный снимок под
+  тем же локом, что и писатель (проверять seqlock вручную не нужно). `lseek` на
+  устройствах — `ESPIPE`.
+* `PGVT_IOC_INFO`: `{abi_version=1, total_bytes, cols, rows, cell_size=16,
+  header_len=128, reserved[2]}`; прочие ioctl — `ENOTTY`.
+
+### 5.3. Жизненный цикл и стоимость
+
+* Первый `open` включает публикацию и сразу отдаёт снимок текущей консоли:
+  терминал видит уже нарисованный shell-текст, а не пустую сетку.
+* `close` последнего fd выключает публикацию. Пока поверхность не открыта,
+  каждый `write_char` платит только один atomic load; boot/shell без desktop
+  не деградируют.
+* Это **не** takeover экрана: kernel-консоль продолжает рисовать во
+  framebuffer/serial как раньше, shared surface — просто снимок. `/dev/fb0`
+  takeover (§3) и `/dev/vtconsole0` независимы.
+* `fork`/`exec`/`munmap` учитывают кадры поверхности через `VT_RO_BIT`: кадры
+  запинены ядром и не освобождаются читателем.
+
+### 5.4. `/dev/vtinput`
+
+`write(2)` принимает VT-байты и переводит их в PS/2 set-1 скан-коды, которые
+кладутся в то же кольцо, что и физическая клавиатура; shell обрабатывает их
+своим line editor'ом/хоткеями:
+
+* printable ASCII — make+break (Shift make/break вокруг заглавных и символов
+  верхнего регистра, US-раскладка);
+* `\r`/`\n` — Enter, `\x7f`/`\x08` — Backspace, `\t` — Tab, `Ctrl+A..Z`
+  (0x01..0x1A) — Ctrl-аккорд;
+* `ESC [ A/B/C/D`, `ESC O A..D`, `ESC [ H/F`, `ESC [ 1~..8~` — стрелки/
+  Home/End/Insert/Delete/PageUp/PageDown;
+* разорванная CSI-последовательность между `write`'ами сохраняется; одиночный
+  `ESC` в конце write — Esc;
+* UTF-8 > ASCII в v1 отбрасывается (kernel-VT хранит `u8`, shell-editor
+  принимает ASCII) — это задокументированное сужение, а не молчаливая порча.
+
+Если foreground-процесс — Linux-программа (`lxrun`), её stdin читается из
+собственной очереди ядра (`STDIN_PENDING`): `/dev/vtinput` отдаёт байты туда
+дословно (UTF-8/escape сохраняются, лимит 4 КиБ), а не в shell-редактор. Иначе
+(shell prompt) работает set-1-мост выше. Синтетические скан-коды намеренно не
+дублируются в `/dev/input/event0`: терминал получает ввод из event0 desktop'а, и
+эхо `vtinput → event0` дало бы цикл.
+
+### 5.5. Ограничения VT-поверхности
+
+Одна консоль (`vtconsole0`); scrollback/selection остаются в kernel и не
+экспортируются; нет частичных damage-обновлений (клиент сравнивает `seq` и
+перерисовывает весь видимый экран); `attrs`/широкие символы в v1 всегда 0/1;
+UTF-8-сетка — v2; палитра-override и hyperlinks не публикуются.
+
+## 6. Минимальный цикл композитора (C)
 
 ```c
 /* Ввод */
@@ -320,7 +435,7 @@ for (;;) {
 
 ---
 
-## 6. Ограничения и остаток
+## 7. Ограничения и остаток
 
 Этот PR даёт **kernel-примитивы**, а не готовый композитор. Чего ещё нет:
 
@@ -342,14 +457,19 @@ for (;;) {
 
 ---
 
-## 7. Проверка (evidence)
+## 8. Проверка (evidence)
 
 Host-тесты (`python3 tools/host_tests.py`) исполняют точный исходник ядра:
 
 * `src/drivers/fb_abi.rs` — размеры 160/80 и смещения полей против
   `linux/fb.h` (сверено `gcc -offsetof`), маски/`id`/stride;
 * `src/drivers/input_event.rs` — 24-байтный `input_event`, set-1 → Linux
-  keycodes, extended-таблица, fake shift/ACK/Pause, `E0` не прилипает.
+  keycodes, extended-таблица, fake shift/ACK/Pause, `E0` не прилипает;
+* `src/drivers/vt_abi.rs` — заголовок 128 байт (смещения magic/version/seq/
+  cursor/margins/cells/total), клетка 16 байт, `PGVT_IOC_INFO`, валидатор
+  границ и seqlock-паритет;
+* `src/drivers/vt_keys.rs` — VT-байты → set-1: printable/Shift/Ctrl, стрелки и
+  CSI-split между write'ами, backspace/tab, отброс UTF-8.
 
 In-QEMU (`python3 tools/e2e.py selftest`) гоняет routines:
 
@@ -362,6 +482,11 @@ In-QEMU (`python3 tools/e2e.py selftest`) гоняет routines:
   согласованность, два отображения, `mprotect`, отказ `MAP_SHARED` не-memfd;
 * `desktop-b::MAP_SHARED memfd survives fork` — общий кадр после
   `fork_user_space_cow`, запись родителя видна ребёнку, `SHARED_BIT` не COW.
+* `desktop-b::/dev/vtconsole0 shared VT surface + vtinput` — open → ioctl
+  `PGVT_IOC_INFO` → read-only `mmap` → в снимке найден напечатанный маркер shell
+  → `mprotect(PROT_WRITE)` = `EACCES`; запись команды в `/dev/vtinput`; после
+  `selftest` shell выполняет её (`vtinput-ok` в serial — это проверяет
+  `tools/e2e.py selftest`).
 
 Все проверки выполняются в свежем пользовательском PML4 и возвращают кадры в
 PMM (`SELFTEST SUMMARY: … 0 failed checks`).

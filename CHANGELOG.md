@@ -31,11 +31,24 @@ ABI и ограничения — `docs/desktop-b.md`.
   `O_NONBLOCK` → `EAGAIN`, `poll`/`select`/`epoll` → `POLLIN`; кольцо на 256
   событий с вытеснением старого. Ввод дублируется из того же PS/2-потока,
   поэтому shell-stdin и `/dev/stdin` не ломаются, если устройство не открыто.
-* **Проверка.** Host-тесты `fb_abi`/`input_event` сверяют размеры и смещения с
-  `linux/fb.h`/`linux/input.h`; in-QEMU `selftest` получил четыре routine
-  `desktop-b::*`: fb ioctl/mmap/пиксель (через mapping и физический scanout),
-  event0 read/poll (клавиатура + мышь), memfd coherence и `MAP_SHARED` после
-  `fork` (общий кадр, не COW). Все routine выполняются в свежем пользовательском
+* **Shared VT surface (`/dev/vtconsole0` + `/dev/vtinput`).** Терминальное окно
+  desktop B получает read-only снимок видимой текстовой матрицы kernel-VT/shell:
+  128-байтный заголовок (`PGVT`, `seq`-seqlock, cursor/margins/cols/rows,
+  `write_seq`) + 16-байтные клетки, `mmap(MAP_SHARED, PROT_READ)` через
+  кадры PMM (`VT_RO_BIT`: `mprotect(PROT_WRITE)` = `EACCES`) и `read()`
+  fallback; `PGVT_IOC_INFO` (0x80205601). Первый open публикует снимок уже
+  нарисованного shell-текста, close выключает публикацию; без клиента консоль
+  работает как раньше. `/dev/vtinput` принимает VT-байты и переводит их в PS/2
+  set-1 (`printable`/Shift/Ctrl/стрелки/CSI, split между write'ами), чтобы ввод
+  терминала дошёл до shell его же line editor'ом; UTF-8 > ASCII в v1
+  отбрасывается. ABI — `docs/desktop-b.md` §5 и `TERMINAL.md`.
+* **Проверка.** Host-тесты `fb_abi`/`input_event`/`vt_abi`/`vt_keys` сверяют
+  размеры/смещения/seqlock/таблицу ввода с ABI; in-QEMU `selftest` получил
+  пять routine `desktop-b::*`: fb ioctl/mmap/пиксель (через mapping и
+  физический scanout), event0 read/poll (клавиатура + мышь), memfd coherence,
+  `MAP_SHARED` после `fork` (общий кадр, не COW) и vtconsole surface + vtinput
+  (маркер shell в снимке, read-only mmap, команда через vtinput выполняется
+  shell после selftest). Все routine выполняются в свежем пользовательском
   PML4 и возвращают кадры в PMM. `tools/e2e.py selftest` зелёный.
 * **Остаток.** SCM_RIGHTS/fd passing (клиент не может передать memfd композитору
   через AF_UNIX), DMA-BUF/GPU/EGL, Wayland/xdg-shell, EV_ABS/touch, fb modeset,

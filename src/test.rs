@@ -7483,13 +7483,11 @@ mod desktop_b_tests {
     use crate::arch::x86_64::linux::errno::Errno;
     use crate::arch::x86_64::linux::mem::{VmRegionSet, MAP_SHARED, PROT_READ, PROT_WRITE};
     use crate::arch::x86_64::linux::{io_sys, mem_sys};
-    use crate::drivers::fb_abi::{
-        FBIOGET_FSCREENINFO, FBIOGET_VSCREENINFO, FB_FIX_SIZE, FB_VAR_SIZE,
-    };
+    use crate::drivers::fb_abi::{FBIOGET_FSCREENINFO, FBIOGET_VSCREENINFO};
     use crate::drivers::input_event::{
         BTN_LEFT, EV_KEY, EV_REL, EV_SYN, INPUT_EVENT_SIZE, REL_X, REL_Y,
     };
-    use crate::drivers::{evdev, usb_hid};
+    use crate::drivers::{evdev, ps2_kbd, usb_hid, vt_abi, vtsurface};
     use crate::memory::layout::USER_MMAP_BASE;
     use crate::memory::{pmm, vmm};
     use crate::sync::spinlock::Spinlock;
@@ -7507,6 +7505,7 @@ mod desktop_b_tests {
     const FORK_VA: u64 = 0x0000_5000_0000_0000;
 
     const O_RDONLY: u64 = 0;
+    const O_WRONLY: u64 = 1;
     const O_RDWR: u64 = 2;
     const F_SETFL: u64 = 4;
     const O_NONBLOCK: u64 = 0o4000;
@@ -8178,6 +8177,200 @@ mod desktop_b_tests {
             "fork-shm: routine returned every PMM frame"
         );
     }
+
+    /// `/dev/vtconsole0` + `/dev/vtinput`: shared surface видит текст shell,
+    /// mmap read-only/seqlock валиден, ioctl отдаёт геометрию, а записанная в
+    /// vtinput команда доходит до shell (после возврата из selftest он выполнит
+    /// `echo vtinput-ok`; e2e проверяет строку вывода).
+    pub fn vtconsole_shared_surface_and_input() {
+        let frames_before = pmm::free_frames();
+        // Маркер печатается в framebuffer (не в serial) — его должен увидеть
+        // shared surface через снимок, который делает activate().
+        crate::fb_println!("vt-surface-marker");
+        crate::kprintln!("[VT] selftest: opening /dev/vtconsole0");
+
+        fn rd_u16(base: u64, off: u64) -> u16 {
+            // SAFETY: base — валидное пользовательское отображение поверхности,
+            // off внутри заголовка.
+            unsafe { core::ptr::read_unaligned((base + off) as *const u16) }
+        }
+        fn rd_u32(base: u64, off: u64) -> u32 {
+            // SAFETY: как выше.
+            unsafe { core::ptr::read_unaligned((base + off) as *const u32) }
+        }
+
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            put_cstr(0, b"/dev/vtconsole0");
+            let fd = match io_sys::sys_open(SCRATCH_VA, O_RDONLY, 0) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    assert_eq_kernel!(0, 1, "vtconsole: open failed");
+                    return;
+                }
+            };
+            assert_kernel!(
+                vtsurface::is_active(),
+                "vtconsole: open activates publishing"
+            );
+
+            // PGVT_IOC_INFO (32 байта) по адресу scratch+0x100.
+            assert_eq_kernel!(
+                io_sys::sys_ioctl(fd, vt_abi::PGVT_IOC_INFO, SCRATCH_VA + 0x100),
+                Ok(0),
+                "vtconsole: PGVT_IOC_INFO succeeds"
+            );
+            let info = vtsurface::info().expect("vtconsole: surface info");
+            assert_eq_kernel!(get_u32(0x100), 1, "vtconsole: abi_version=1");
+            assert_eq_kernel!(
+                get_u32(0x104),
+                info.total_bytes,
+                "vtconsole: ioctl total_bytes"
+            );
+            assert_eq_kernel!(get_u32(0x108) as u16, info.cols, "vtconsole: ioctl cols");
+            assert_eq_kernel!(get_u32(0x10c) as u16, info.rows, "vtconsole: ioctl rows");
+            assert_eq_kernel!(get_u32(0x110), 16, "vtconsole: cell_size=16");
+            assert_eq_kernel!(get_u32(0x114), 128, "vtconsole: header_len=128");
+
+            let base = match mem_sys::sys_mmap(
+                0,
+                info.total_bytes as u64,
+                PROT_READ as u64,
+                MAP_SHARED as u64,
+                fd,
+                0,
+            ) {
+                Ok(base) => base,
+                Err(_) => {
+                    assert_eq_kernel!(0, 1, "vtconsole: MAP_SHARED mmap failed");
+                    return;
+                }
+            };
+
+            // Заголовок ABI v1: magic/version/header_len/чётный seq/размеры.
+            assert_eq_kernel!(rd_u32(base, 0), vt_abi::MAGIC, "vtconsole: magic PGVT");
+            assert_eq_kernel!(rd_u16(base, 4), vt_abi::VERSION, "vtconsole: version=1");
+            assert_eq_kernel!(rd_u16(base, 6), 128, "vtconsole: header_len=128");
+            let seq = rd_u32(base, 8);
+            assert_eq_kernel!(seq & 1, 0, "vtconsole: mmap snapshot has an even seqlock");
+            assert_eq_kernel!(rd_u16(base, 16) as u32, info.cols as u32, "vtconsole: cols");
+            assert_eq_kernel!(rd_u16(base, 18) as u32, info.rows as u32, "vtconsole: rows");
+            assert_eq_kernel!(rd_u32(base, 40), 128, "vtconsole: cells_offset=128");
+            let cells_bytes = info.cols as u32 * info.rows as u32 * 16;
+            assert_eq_kernel!(rd_u32(base, 44), cells_bytes, "vtconsole: cells_bytes");
+            assert_eq_kernel!(rd_u32(base, 56), info.total_bytes, "vtconsole: total_bytes");
+            let cx = rd_u16(base, 20);
+            let cy = rd_u16(base, 22);
+            assert_kernel!(
+                cx < info.cols && cy < info.rows,
+                "vtconsole: cursor inside grid"
+            );
+
+            // Найти маркер в видимой матрице: shell-текст опубликован снимком
+            // activate() ещё до первого нового символа.
+            let mut marker_found = false;
+            let mut marker_row = 0u16;
+            for row in 0..info.rows as u32 {
+                let mut line = alloc::string::String::new();
+                for col in 0..info.cols as u32 {
+                    let off = 128 + (row * info.cols as u32 + col) * 16;
+                    let cp = rd_u32(base, off as u64);
+                    let ch = if cp == 0 {
+                        ' '
+                    } else {
+                        core::char::from_u32(cp).unwrap_or('?')
+                    };
+                    line.push(ch);
+                }
+                if line.contains("vt-surface-marker") {
+                    marker_found = true;
+                    marker_row = row as u16;
+                }
+            }
+            assert_kernel!(
+                marker_found,
+                "vtconsole: shared surface contains the shell marker text"
+            );
+            assert_kernel!(
+                marker_row < info.rows,
+                "vtconsole: marker row inside the visible matrix"
+            );
+
+            // Отображение read-only на уровне PTE и с маркером VT_RO_BIT.
+            let pte = vmm::walk_pte(base).expect("vtconsole: PTE exists");
+            assert_kernel!(
+                !pte.flags().contains(PageTableFlags::WRITABLE),
+                "vtconsole: mmap is not writable"
+            );
+            assert_kernel!(
+                pte.flags().contains(vmm::VT_RO_BIT),
+                "vtconsole: mmap carries VT_RO_BIT"
+            );
+            assert_eq_kernel!(
+                mem_sys::sys_mprotect(base, 4096, (PROT_READ | PROT_WRITE) as u64),
+                Err(Errno::EACCES),
+                "vtconsole: mprotect(PROT_WRITE) is refused"
+            );
+
+            // read(2) fallback: один целостный снимок с начала.
+            assert_eq_kernel!(
+                io_sys::sys_read(fd, SCRATCH_VA + 0x800, 128),
+                Ok(128),
+                "vtconsole: read() returns the header snapshot"
+            );
+            assert_eq_kernel!(
+                unsafe { core::ptr::read_unaligned((SCRATCH_VA + 0x800) as *const u32) },
+                vt_abi::MAGIC,
+                "vtconsole: read() snapshot starts with PGVT"
+            );
+
+            assert_eq_kernel!(
+                mem_sys::sys_munmap(base, info.total_bytes as u64),
+                Ok(0),
+                "vtconsole: munmap"
+            );
+            assert_eq_kernel!(io_sys::sys_close(fd), Ok(0), "vtconsole: close");
+            assert_kernel!(
+                !vtsurface::is_active(),
+                "vtconsole: close deactivates publishing"
+            );
+
+            // vtinput: команда уходит в shell как set-1-скан-коды.
+            put_cstr(0, b"/dev/vtinput");
+            let ifd = match io_sys::sys_open(SCRATCH_VA, O_WRONLY, 0) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    assert_eq_kernel!(0, 1, "vtinput: open failed");
+                    return;
+                }
+            };
+            let cmd = b"echo vtinput-ok\r";
+            put(0x300, cmd);
+            assert_eq_kernel!(
+                io_sys::sys_write(ifd, SCRATCH_VA + 0x300, cmd.len() as u64),
+                Ok(cmd.len() as u64),
+                "vtinput: write accepts the whole buffer"
+            );
+            assert_kernel!(
+                ps2_kbd::has_scancode(),
+                "vtinput: bytes were translated into the shell scancode ring"
+            );
+            assert_eq_kernel!(io_sys::sys_close(ifd), Ok(0), "vtinput: close");
+            // Сбросить только ESC-парсер; кольцо scancode'ов намеренно НЕ
+            // трогаем — shell должен выполнить команду после selftest.
+            crate::drivers::vtinput::reset();
+        })
+        .is_some();
+        restore_synth(me, saved);
+        vtsurface::reset_for_tests();
+        assert_kernel!(ran, "vtconsole: syscall test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "vtconsole: routine returned every PMM frame (surface is preallocated)"
+        );
+        crate::kprintln!("[VT] selftest: vtinput injected; expecting shell echo after return");
+    }
 }
 
 pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
@@ -8554,6 +8747,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "desktop-b::MAP_SHARED memfd survives fork",
             desktop_b_tests::memfd_mmap_shared_survives_fork
+        ),
+        (
+            "desktop-b::/dev/vtconsole0 shared VT surface + vtinput",
+            desktop_b_tests::vtconsole_shared_surface_and_input
         ),
     ]
 }

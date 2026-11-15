@@ -2,10 +2,9 @@
 
 `rust-apps/pagh-terminal` — самодостаточный Rust-крейт (без внешних зависимостей):
 эмулятор терминала VT100/ANSI, программный RGBA-рендерер, PNG-выгрузка для
-headless-тестов и клиент PDP/1 (Pagh Desktop Protocol).  Отдельно описан предлагаемый ABI
+headless-тестов и клиент PDP/1 (Pagh Desktop Protocol).  Отдельно описан ABI
 разделяемой текстовой поверхности для kernel console (`/dev/vtconsole0`),
-который должен реализовать kernel-side PR; в этом PR `kernel/src/**` не
-изменяется.
+реализованный в kernel-side PR; сам этот крейт `kernel/src/**` не меняет.
 
 Статус: вертикальный срез для desktop B.  Парсер, рендерер, PNG, протокол
 клиента, ABI-парсер shared surface и host-тесты работают; реальный compositor,
@@ -313,11 +312,11 @@ Resize — только серверный: клиент не просит ра�
 
 ## Kernel console shared surface ABI v1
 
-Предложение, **не реализованное в kernel/src** этим PR.  Цель — не
-переписывать shell на userspace PTY сразу: kernel VT продолжает владеть
-сеткой, курсором и scrollback, а desktop-композитор получает read-only снимок
-видимой текстовой матрицы и рисует его своим шрифтом.  Ввод идёт обратно в VT
-байтами.
+Реализовано в kernel (`/dev/vtconsole0`, `/dev/vtinput`; см.
+`docs/desktop-b.md` §5).  Цель — не переписывать shell на userspace PTY сразу:
+kernel VT продолжает владеть сеткой, курсором и scrollback, а
+desktop-композитор получает read-only снимок видимой текстовой матрицы и рисует
+его своим шрифтом.  Ввод идёт обратно в VT байтами.
 
 ### Устройства
 
@@ -507,9 +506,11 @@ Kernel-side проверка (после реализации): boot-тест п
   не входит в CI (compositor появился в dev после base этого PR).  Дефолтный
   сокет — `/tmp/pagh-desktop.sock`, переопределяется
   `--socket`/`PAGH_DESKTOP_SOCKET`.
-* **Kernel shared surface не реализован** — только ABI + host-парсер; нужен
-  отдельный PR (desktop-kernel/lead) в `src/drivers/vt.rs`/devfs и согласие на
-  ABI.  `kernel/src/**` этим PR не тронут.
+* **Kernel shared surface реализован** (`/dev/vtconsole0` + `/dev/vtinput`),
+  но v1 публикует ASCII/Latin-1 `u8`-клетки без attrs/wide, без scrollback и
+  без частичных damage; `/dev/vtinput` переводит байты в PS/2-скан-коды shell
+  (см. `docs/desktop-b.md` §5.4 — UTF-8 > ASCII пока отбрасывается).
+  `kernel/src/**` этим крейтом не тронут.
 * **Нет PTY.** Live-режим без `/dev/vtconsole0` использует встроенный demo shell
   с line editing; произвольные программы запускать нельзя.
 * **Нет real framebuffer/evdev backend.** Клиент рисует в RGBA и отправляет

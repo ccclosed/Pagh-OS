@@ -28,6 +28,10 @@ PS/2 клавиатура и мышь, framebuffer-консоль, VT-эмуля
 | `fb_abi.rs` | Чистый (`core`) ABI fbdev: `struct fb_var_screeninfo` (160 байт) и `fb_fix_screeninfo` (80 байт), `FBIOGET_VSCREENINFO` 0x4600 / `FBIOGET_FSCREENINFO` 0x4602; host-тесты сверяют размеры/смещения с Linux UAPI |
 | `evdev.rs` | evdev-подобная очередь `/dev/input/event0`: кольцо 256 событий, `feed_scancode` из PS/2 IRQ1 и USB HID, `feed_mouse` (BTN_*/REL_X/REL_Y/REL_WHEEL) из PS/2 IRQ12 и USB HID, `read_event`/`has_events`; ввод дублируется, shell-stdin не затрагивается |
 | `input_event.rs` | Чистый (`core`) кодек `struct input_event` (24 байта), set-1 → Linux keycodes (extended-таблица, fake shift/ACK/Pause отбрасываются); включается в host-tests |
+| `vt_abi.rs` | Чистый (`core`) ABI `/dev/vtconsole0`: 128-байтный заголовок (magic/version/seqlock/курсор/margins/offsets), 16-байтные клетки, `PGVT_IOC_INFO`; host-тесты сверяют смещения/валидацию/seqlock с `TERMINAL.md` |
+| `vtsurface.rs` | Разделяемая VT-поверхность: кадры PMM + seqlock, публикация клеток/курсора из shell (`framebuffer`) и kernel-VT (`vt.rs`), `read_at` fallback, `page()` для read-only `mmap`; публикация включается первым open `vtconsole0` |
+| `vt_keys.rs` | Чистый (`core`) перевод VT-байтов в PS/2 set-1: printable/Shift/Ctrl, стрелки/CSI split, lone Esc; host-тесты |
+| `vtinput.rs` | `/dev/vtinput`: VT-байты → scancode-кольцо shell (без эха в evdev) |
 | `vt.rs` | ANSI/VT-100 эмулятор поверх framebuffer (`Vt`: CSI/OSC/DCS, 256 цветов, scroll regions, ответы на запросы) — stdout compat-программ |
 | `cursor.rs` | Программный курсор мыши 12×19 (save/restore фона); `text_begin`/`text_end` для курсор-безопасного текста |
 | `serial.rs` | COM1 UART консоль (`init`, `write_bytes`, `console()`, макросы `kprint!`/`kprintln!`) |
@@ -58,7 +62,12 @@ PS/2 клавиатура и мышь, framebuffer-консоль, VT-эмуля
   `STATUS_BAR_HEIGHT=18`. Размер глифа экспортируется **намеренно**: VT, маппинг мыши в
   клетку и тулбар `paint` берут его отсюда, а не заводят свою копию (вторая копия —
   молчаливый баг раскладки при смене шрифта).
-- `vt`: `init()`, `write(bytes)`, `dimensions()`, `take_input_responses()`.
+- `vt`: `init()`, `write(bytes)`, `dimensions()`, `take_input_responses()`;
+  публикует клетки/курсор в `vtsurface` (когда `/dev/vtconsole0` открыт).
+- `vtsurface`: `init()`, `activate()`/`deactivate()`, `info()`, `page()`,
+  `read_at()`, `publish_shell_cell/cursor/full/clear`, `publish_vt_cell/full/
+  cursor`; `vt_abi::{Header, Cell, encode_header, encode_cell, parse_header,
+  PGVT_IOC_INFO}`; `vtinput::write/reset`.
 - `cursor`: `hide()`, `move_to()`, `text_begin()`, `text_end()`.
 - `serial`: `init()`, `write_bytes()`, `console()`.
 
