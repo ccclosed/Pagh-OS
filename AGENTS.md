@@ -309,7 +309,28 @@ the operational checklist in `RELEASING.md`.
   `usb_hid_proto`/`usb_desc` (buffer sizing, layouts, composite/truncated
   descriptors), new in-QEMU report-mode selftest cases, `tools/e2e.py usb` and
   the PS/2 path are green; real hardware was not available, so this is QEMU
-  evidence plus the serial lines named in `src/drivers/README.md`. Version
+  evidence plus the serial lines named in `src/drivers/README.md`. (5) the same
+  field machine exposed an xHCI *timing* failure below that HID fix: every
+  attached USB2 port reported `ccs=1 ped=0 pp=1 pls=7 stage=lost-after-reset
+  try=19 ms=124` with 0 HID devices. The old port loop waited only 60 ms for
+  PED+U0, reset the port anyway while its PHY was still debouncing/training
+  (25 ms first-reset budget, 20 ms stability check, PP cycled every 4 attempts),
+  and therefore restarted the attach sequence every ~124 ms. Port bring-up is
+  now a pure, host-tested policy (`src/drivers/xhci_port.rs`, properties
+  `xhci_port`): Polling/RxDetect gets 400 ms of undisturbed detect/training and
+  is adopted without a reset if it enables on its own; after PR (USB2) or WPR
+  (USB3) PRC and PED+U0 are awaited for 500 ms with no second reset inside that
+  window; the enable must hold for 80 ms; a lost enable backs off 250 ms →
+  500 ms → 1 s and is re-observed before any new reset; PP is power-cycled only
+  after 16 failed attempts (500 ms off, then a fresh debounce). One port is
+  advanced per `poll()` and waiting is deadline-based, so the boot menu keeps
+  counting. The diagnostics gained `ped_u0=`: the field's identical `ped_sc` was
+  a per-port reset-time transient, not a shared diagnostic value, and `ped_sc`
+  now records the last PED+U0 sighting per port. Evidence: QEMU `tools/e2e.py
+  usb` (keyboard + mouse through menu and shell; PS/2 unaffected), `selftest`
+  and the new host properties; real hardware was not available, so this also
+  needs a user test — the serial lines to watch are named in
+  `src/drivers/README.md`. Version
   2.22.7 is the `dev` PATCH bump; `main` stays 2.22.6.
   **2.22.6** = the round-3 audit's four high x86 findings are closed
   (F-r3-arch-1, F-r3-life-1/2, F-r3-vfs-1; reports in the external
