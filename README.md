@@ -1,8 +1,8 @@
 <h1 align="center">pagh</h1>
 
 <p align="center">
-  A small 64-bit OS kernel in Rust — ext2 + WAL journaling, a TCP/IP stack,
-  a framebuffer GUI, and a mouse-driven paint app, booting on real UEFI via Limine.
+  Небольшое 64-битное ядро ОС на Rust — ext2 + WAL-журналирование, стек TCP/IP,
+  framebuffer-GUI и управляемый мышью paint-редактор, загружается на реальном UEFI через Limine.
 </p>
 
 <p align="center">
@@ -17,191 +17,190 @@
 <p align="center">
   <a href="docs/demo.mp4"><img src="docs/demo.gif" width="960" alt="pagh booting in QEMU: the shell, the paint app drawing a house, the nano+ editor and the settings panel with live themes"></a>
   <br>
-  <sub><i>24 s of a real QEMU/OVMF boot, recorded from the framebuffer — boot, shell, paint, nano+, themes. <a href="docs/demo.mp4">MP4</a></i></sub>
+  <sub><i>24 с реальной загрузки QEMU/OVMF, записанные с framebuffer — boot, shell, paint, nano+, темы. <a href="docs/demo.mp4">MP4</a></i></sub>
 </p>
 
 <p align="center">
-  <b>Try it in one command — no Rust toolchain needed:</b><br>
+  <b>Попробовать одной командой — тулчейн Rust не нужен:</b><br>
   <code>tar xzf pagh-demo-x86_64.tar.gz &amp;&amp; cd pagh-demo-x86_64 &amp;&amp; ./run.sh</code><br>
-  <sub>download the bootable image from the <a href="https://github.com/ccclosed/Pagh-OS/releases/tag/2.18.12-demo">demo bundle release</a> · needs <code>qemu-system-x86_64</code> + OVMF · <code>Ctrl+Alt+G</code> releases the mouse, then <code>quit</code></sub>
+  <sub>скачайте загрузочный образ из <a href="https://github.com/ccclosed/Pagh-OS/releases/tag/2.18.12-demo">релиза demo bundle</a> · нужны <code>qemu-system-x86_64</code> + OVMF · <code>Ctrl+Alt+G</code> отпускает мышь, затем <code>quit</code></sub>
 </p>
 
-### What works today
+### Что уже работает
 
-- **Boot:** Limine/UEFI → 1280×800 framebuffer console with a coloured prompt and status bar.
-- **Shell:** line editing, history, tab completion, console scrollback (mouse wheel / PageUp / PageDown), `ls`/`ls -l`/`tree`/`chmod`/`chown`/`df`/`free`/`date`/`head`/`tail`/`wc`/`grep`/`ifconfig`/`ps`, ext2 file ops, `selftest`.
-- **GUI apps:** the mouse-driven `paint` (shape tools, 16-colour palette, brush sizes, undo, save to ext2), the full-screen `nano+` editor, and `settings` with live colour themes + wallpapers.
-- **Storage:** ext2-compatible read/write filesystem with a write-ahead-log journal, on a real virtio-blk or NVMe disk (or a RAM disk carried on the boot medium).
-- **Networking:** the kernel's own e1000 + TCP/IP stack (DHCP/ARP/TCP/UDP; `ifconfig` shows the live lease).
-- **Processes:** preemptive ~1 kHz scheduler, ring-3 user processes, `SYSCALL`/`int 0x80`.
+- **Загрузка:** Limine/UEFI → консоль framebuffer 1280×800 с цветным prompt'ом и статус-строкой.
+- **Shell:** редактирование строки, история, tab completion, прокрутка консоли (колесо мыши / PageUp / PageDown), `ls`/`ls -l`/`tree`/`chmod`/`chown`/`df`/`free`/`date`/`head`/`tail`/`wc`/`grep`/`ifconfig`/`ps`, файловые операции ext2, `selftest`.
+- **GUI-приложения:** управляемый мышью `paint` (инструменты фигур, 16-цветная палитра, размеры кисти, undo, сохранение в ext2), полноэкранный редактор `nano+` и `settings` с живыми цветовыми темами и обоями.
+- **Хранилище:** ext2-совместимая read/write файловая система с журналом write-ahead-log, на реальном virtio-blk или NVMe-диске (или RAM-диске с загрузочного носителя).
+- **Сеть:** собственный драйвер e1000 + стек TCP/IP (DHCP/ARP/TCP/UDP; `ifconfig` показывает живой lease).
+- **Процессы:** вытесняющий планировщик ~1 кГц, ring-3 пользовательские процессы, `SYSCALL`/`int 0x80`.
 
-*Not shown in the demo above (implemented, but not exercised in this capture):* the
-`apt`-style Debian package manager over HTTPS/TLS with OpenPGP-verified metadata, the
-Linux-x86_64 binary compatibility layer with CPython 3.16, and ext2 WAL crash/replay
-recovery (`fscrash`). See the deep docs below.
+*Не показано в демо выше (реализовано, но не задействовано в этой записи):* `apt`-подобный
+менеджер пакетов Debian по HTTPS/TLS с проверенными через OpenPGP метаданными, слой
+совместимости с Linux-x86_64-бинарниками и CPython 3.16, а также восстановление после
+краша ext2 WAL (`fscrash`). См. глубокие доки ниже.
 
-**Build and run from source** (Rust nightly with `rust-src`, QEMU + OVMF; Limine is
-fetched automatically):
+**Сборка и запуск из исходников** (Rust nightly с `rust-src`, QEMU + OVMF; Limine
+скачивается автоматически):
 
 ```sh
 git clone https://github.com/ccclosed/Pagh-OS && cd Pagh-OS
 ./run.sh --release
 ```
 
-**Deep docs:** [Quick start](#quick-start) · [Boot output](#boot-output) ·
-[Shell commands](#shell-commands) · [Graphics & paint](#graphics--the-paint-app) ·
-[Architecture](#architecture) · [Correctness & testing](#correctness-properties--testing) ·
-[Linux binaries & packages](#linux-binaries--debian-packages) · [Security model](SECURITY.md) ·
-[Contributing](CONTRIBUTING.md)
+**Глубокие доки:** [Быстрый старт](#быстрый-старт) · [Вывод загрузки](#вывод-загрузки) ·
+[Команды shell](#команды-shell) · [Графика и paint](#графика-и-приложение-paint) ·
+[Архитектура](#архитектура) · [Корректность и тесты](#свойства-корректности-и-тестирование) ·
+[Linux-бинарники и пакеты](#linux-бинарники-и-пакеты-debian) · [Модель безопасности](SECURITY.md) ·
+[Участие в проекте](CONTRIBUTING.md)
 
 ---
 
-A small 64-bit operating system kernel written in Rust (`#![no_std]`), booted via the
-[Limine](https://github.com/limine-bootloader/limine) boot protocol on x86_64 and run
-under QEMU/OVMF.
+Небольшое 64-битное ядро операционной системы на Rust (`#![no_std]`), загружаемое по
+протоколу [Limine](https://github.com/limine-bootloader/limine) на x86_64 и работающее
+под QEMU/OVMF.
 
-`pagh` brings up serial, the GDT/IDT, a bitmap physical memory manager, 4-level paging,
-a heap, the APIC (LAPIC timer + I/O APIC), a PS/2 keyboard and mouse, a framebuffer
-console with 2D graphics primitives and a software cursor, a virtual filesystem, an ELF64
-loader, a preemptive round-robin scheduler, a `SYSCALL`/`int 0x80` interface, PCI
-enumeration with virtio drivers, a TCP/IP network stack, a journaled ext2 filesystem on a
-real disk, and a friendly interactive shell with line editing, history, tab completion,
-and colored output. It can load and run an embedded test program in ring 3, and ships a
-windowed, mouse-driven `paint` application (a movable window with minimize/maximize/close
-and a taskbar entry). It also runs **Linux x86_64 ELF
-binaries — statically linked or dynamically linked against glibc (up to CPython 3.16) —**
-in ring 3 through a Linux syscall-compatibility layer (`fork`/`clone` + threads,
-`epoll`/`eventfd`, unix sockets, and a VT100-style terminal with raw-mode `termios`
-included), includes an **`apt`-style package manager** that fetches and installs Debian
-`.deb` packages by name over HTTP/HTTPS, and can **install a base glibc + Python
-userland** onto its ext2 disk, on demand from the shell (`apt update` +
-`apt install python3`) — boot itself never stops to ask.
+`pagh` поднимает serial, GDT/IDT, битмапный менеджер физической памяти, 4-уровневый
+пейджинг, кучу, APIC (LAPIC-таймер + I/O APIC), PS/2-клавиатуру и мышь, framebuffer-консоль
+с 2D-примитивами и программным курсором, виртуальную файловую систему, загрузчик ELF64,
+вытесняющий round-robin планировщик, интерфейс `SYSCALL`/`int 0x80`, перечисление PCI с
+драйверами virtio, сетевой стек TCP/IP, журналируемую ext2-файловую систему на реальном
+диске и дружественный интерактивный shell с редактированием строки, историей, tab
+completion и цветным выводом. Он умеет загружать и исполнять встроенную тестовую программу
+в ring 3 и поставляет оконное, управляемое мышью приложение `paint` (перемещаемое окно с
+minimize/maximize/close и кнопкой на панели задач). Он также исполняет **Linux x86_64
+ELF-бинарники — статически слинкованные или динамически слинкованные против glibc (вплоть
+до CPython 3.16) —** в ring 3 через слой совместимости с Linux-сисколлами (`fork`/`clone` +
+потоки, `epoll`/`eventfd`, unix-сокеты и VT100-совместимый терминал с raw-mode `termios`),
+включает **`apt`-подобный менеджер пакетов**, который скачивает и ставит Debian-пакеты
+`.deb` по имени через HTTP/HTTPS, и умеет **устанавливать базовый glibc + Python userland**
+на свой ext2-диск по запросу из shell (`apt update` + `apt install python3`) — сама
+загрузка никогда не останавливается, чтобы что-то спросить.
 
-> Hobby/educational kernel — **not a security boundary.** Ring 3 is isolated from the
-> kernel by paging (the U/S bit, W^X/NX leaves, and device MMIO never user-accessible)
-> and syscall buffers are range-checked against user mappings. A **process credential
-> model** now exists: `CompatState` carries real `uid`/`gid`/`euid`/`egid`/`suid`/`sgid`
-> values, the `set*id` family changes them under the Linux rules, and the syscall layer
-> enforces POSIX owner/group/other bits (with the standard root read/write bypass and
-> the "execute still needs an x bit" rule) on `open`, `execve`, directory mutation,
-> `chmod`/`chown`, `kill` and `access`, backed by ext2 `i_mode`/`i_uid`/`i_gid`
-> (creation stamps the caller's ids and mode; `stat` reports them). SMEP is enabled
-> when CPUID reports it. What is **still missing**: there are no user accounts or login
-> (the shell and every kernel-spawned process default to root, so the model only
-> constrains processes that deliberately drop privileges), no setuid-binary elevation on
-> `execve`, no supplementary groups, ACLs or `fsuid`, no capability sets, seccomp or LSM,
-> no audit trail, no ASLR/KASLR, no KPTI, no SMAP and no address-space or mount
-> namespaces. The TLS + OpenPGP + digest chain below authenticates **packages** against a
-> hostile mirror; it does not contain hostile local code. Do not run untrusted binaries or
-> expose this kernel to a network you do not control. Details in `SECURITY.md` and
-> `docs/security-model.md`.
+> Хобби/учебное ядро — **не граница безопасности.** Ring 3 изолирован от ядра
+> пейджингом (бит U/S, W^X/NX-листы, MMIO устройств никогда не доступен пользователю), а
+> буферы сисколлов проверяются на диапазон против пользовательских маппингов. **Модель
+> учётных данных процессов** теперь существует: `CompatState` несёт реальные
+> `uid`/`gid`/`euid`/`egid`/`suid`/`sgid`, семейство `set*id` меняет их по правилам Linux,
+> а слой сисколлов применяет POSIX-биты owner/group/other (со стандартным обходом
+> чтения/записи для root и правилом «для исполнения всё равно нужен x-бит») на `open`,
+> `execve`, мутациях каталогов, `chmod`/`chown`, `kill` и `access`, опираясь на ext2
+> `i_mode`/`i_uid`/`i_gid` (создание проставляет ids и mode вызывающего; `stat` их
+> сообщает). SMEP включается, когда CPUID о нём сообщает. Чего **всё ещё нет**: учётных
+> записей и логина (shell и каждый порождённый ядром процесс по умолчанию root, поэтому
+> модель ограничивает только процессы, которые намеренно сбрасывают привилегии), повышения
+> через setuid-бинарники на `execve`, дополнительных групп, ACL или `fsuid`, наборов
+> capabilities, seccomp или LSM, audit trail, ASLR/KASLR, KPTI, SMAP и namespaces
+> адресного пространства/монтирования. Цепочка TLS + OpenPGP + digest ниже аутентифицирует
+> **пакеты** против враждебного зеркала; она не сдерживает враждебный локальный код. Не
+> запускайте недоверенные бинарники и не выставляйте это ядро в сеть, которую не
+> контролируете. Подробности — в `SECURITY.md` и `docs/security-model.md`.
 
-> **Network default:** outbound package operations are **enabled** in normal builds
-> (`default = ["network_packages"]` in `Cargo.toml`). Two independent halves now
-> authenticate a repository: HTTPS verifies the server certificate fail-closed against
-> four pinned roots, and the package pipeline verifies the signed metadata end to end —
-> `InRelease`/`Release.gpg` against a fingerprint-pinned Debian keyring, then the
-> SHA-256 **and** size of `Packages` and of every `.deb` (issue #32). A mirror that
-> serves no signature is refused; there is no override flag. Plain-HTTP mirrors are
-> integrity-checked by that chain even though their transport is unauthenticated.
-> Remaining gaps (revocation distribution, replay of a whole old triplet on suites
-> without `Valid-Until`, the index-free `pkg` command) are listed in `SECURITY.md`.
-> Use `cargo build --no-default-features` for a fail-closed build. See `HARDENING.md`.
-
+> **Сетевое поведение по умолчанию:** исходящие операции с пакетами **включены** в обычных
+> сборках (`default = ["network_packages"]` в `Cargo.toml`). Две независимые половины
+> аутентифицируют репозиторий: HTTPS проверяет сертификат сервера fail-closed против четырёх
+> запиненных корней, а пакетный конвейер проверяет подписанные метаданные end-to-end —
+> `InRelease`/`Release.gpg` против keyring'а Debian, запиненного по отпечатку, затем SHA-256
+> **и** размер `Packages` и каждого `.deb` (issue #32). Зеркало, не отдающее подпись,
+> отвергается; флага-обхода нет. Plain-HTTP-зеркала проходят проверку целостности по этой
+> цепочке, хотя их транспорт не аутентифицирован. Оставшиеся пробелы (распространение
+> отзыва, replay целой старой тройки на suite'ах без `Valid-Until`, команда `pkg` без
+> индекса) перечислены в `SECURITY.md`. Для fail-closed сборки используйте
+> `cargo build --no-default-features`. См. `HARDENING.md`.
 
 ---
 
-## Screenshots
+## Скриншоты
 
-Every image below is a raw QEMU capture of the 1280×800 framebuffer — the kernel draws
-these pixels itself (the console blits the Fira Code bitmap asset, the cursor is a
-software overlay, `paint` is a canvas in a window), so there is no host-side font
-rendering or screenshot compositing in play.
+Каждое изображение ниже — сырой QEMU-снимок framebuffer 1280×800: эти пиксели рисует само
+ядро (консоль блитит битмап-ассет Fira Code, курсор — программный оверлей, `paint` — canvas
+в окне), поэтому здесь нет ни хостового рендеринга шрифтов, ни композитинга скриншотов.
 
-### Interactive shell
+### Интерактивный shell
 
-The framebuffer console with the colour-coded `pagh:/>` prompt, the blinking caret at
-the logical cursor, the live status bar (OS name, current directory, uptime, mouse
-position) and the software mouse cursor. Line editing, history, tab completion,
-`Shift`/`CapsLock`, mouse selection and `Ctrl+A`/`Ctrl+X`/`Ctrl+Y` all work on this
-screen; an idle shell sleeps instead of redrawing the surface on every timer tick.
+Framebuffer-консоль с цветным prompt'ом `pagh:/>`, мигающей кареткой на логическом
+курсоре, живой статус-строкой (имя ОС, текущий каталог, uptime, позиция мыши) и
+программным курсором. Редактирование строки, история, tab completion, `Shift`/`CapsLock`,
+выделение мышью и `Ctrl+A`/`Ctrl+X`/`Ctrl+Y` работают на этом экране; простаивающий shell
+спит, а не перерисовывает поверхность на каждом тике таймера.
 
 ![pagh shell](docs/shell.png)
 
-### Selecting console text with the mouse
+### Выделение текста консоли мышью
 
-Dragging the left button selects console cells (the highlight is the console *model*
-inverted, not a bitmap copy); releasing copies the text into the session clipboard,
-and `Ctrl+X`, `Ctrl+Y`/`Ctrl+V` cut and paste it into the editable line.
+Перетаскивание левой кнопкой выделяет ячейки консоли (подсветка — инвертированная *модель*
+консоли, а не копия битмапа); отпускание копирует текст в клипборд сессии, а `Ctrl+X`,
+`Ctrl+Y`/`Ctrl+V` вырезают и вставляют его в редактируемую строку.
 
 ![pagh mouse selection](docs/selection.png)
 
-### `nano+` editor
+### Редактор `nano+`
 
-Full-screen editor with a file-tree sidebar (`^B`), undo/redo, search/replace, a line
-clipboard, per-file backups and a two-press quit guard. Saving truncates the file, so a
-shorter document really replaces the old one instead of leaving its tail behind.
+Полноэкранный редактор с боковой панелью файлового дерева (`^B`), undo/redo, поиском и
+заменой, построчным клипбордом, per-file бэкапами и защитой от выхода двойным нажатием.
+Сохранение усекает файл, поэтому более короткий документ действительно заменяет старый, а
+не оставляет его хвост.
 
 ![pagh nano editor](docs/nano.png)
 
-### The `paint` app
+### Приложение `paint`
 
-Windowed, mouse-driven drawing app: title bar with minimize/maximize/close, a 16-colour
-palette, pencil/eraser/line/rect/filled-rect/circle/disc/bucket/picker tools, brush
-sizes 1–64, undo, and a "Paint" entry in the taskbar. The canvas is a `Vec<u32>` that
-is blitted through the same shadow buffer as the console.
+Оконное, управляемое мышью приложение для рисования: title bar с minimize/maximize/close,
+16-цветная палитра, инструменты pencil/eraser/line/rect/filled-rect/circle/disc/bucket/picker,
+размеры кисти 1–64, undo и пункт «Paint» на панели задач. Canvas — это `Vec<u32>`, который
+блитится через тот же shadow-buffer, что и консоль.
 
 ![pagh paint app](docs/paint.png)
 
-### `settings`: themes, wallpapers, status bar, caret
+### `settings`: темы, обои, статус-строка, каретка
 
-`settings` opens a modal panel that switches colour schemes (classic, amber, green,
-paper, synth) and wallpapers (plain, gradient, scanlines, stars, grid) live — every
-change repaints the real framebuffer, so the panel is the preview.
+`settings` открывает модальную панель, которая вживую переключает цветовые схемы (classic,
+amber, green, paper, synth) и обои (plain, gradient, scanlines, stars, grid) — каждое
+изменение перерисовывает реальный framebuffer, поэтому панель и есть превью.
 
 ![pagh settings panel](docs/settings.png)
 
-A theme + wallpaper applied to the running console; the palette also recolours the
-status strip and the prompt.
+Тема и обои, применённые к работающей консоли; палитра также перекрашивает статус-строку и
+prompt.
 
 ![pagh theme and wallpaper](docs/themes.png)
 
 ### In-QEMU self-test
 
-`selftest` runs the kernel's own property/regression suite against live kernel state
-(PMM, VMM, ext2, the VFS, the scheduler, signals, TLS/apt parsers, the shell's pure
-logic …) and prints a machine-checkable verdict on serial (`SELFTEST SUMMARY`, plus the
-`SELFTEST IDEMPOTENCY` line when it runs more than one pass); the screen reports that
-the run started and finished.
+`selftest` прогоняет собственный property/regression набор ядра против живого состояния
+ядра (PMM, VMM, ext2, VFS, планировщик, сигналы, парсеры TLS/apt, чистая логика shell …) и
+печатает машинно-проверяемый вердикт на serial (`SELFTEST SUMMARY`, плюс строку `SELFTEST
+IDEMPOTENCY`, когда прогонов больше одного); экран сообщает, что прогон начался и
+закончился.
 
 ![pagh self-test](docs/selftest.png)
 
-### `apt update` over HTTPS
+### `apt update` по HTTPS
 
-The by-name package manager fetching the Debian `Packages` index over TLS 1.3, with the
-server certificate chain, hostname and validity checked before a byte of the index is read.
+Менеджер пакетов по имени скачивает индекс Debian `Packages` по TLS 1.3, проверив цепочку
+сертификата сервера, hostname и срок действия до того, как прочитан хоть байт индекса.
 
 ![pagh apt update](docs/apt.png)
 
 ---
 
-## Features at a glance
+## Возможности вкратце
 
-- **Core:** safe privileged-instruction layer (SSE enabled for ring 3; the kernel itself is compiled soft-float), GDT/IDT/TSS/IST,
-  bitmap PMM, 4-level paging VMM with `map_mmio`, a `good_memory_allocator` (galloc) heap, ACPI (MADT),
-  LAPIC + I/O APIC.
-- **Tasking:** preemptive ~1 kHz round-robin scheduler, kernel threads, ring-3 user
-  processes, `int 0x80` syscalls (`SYS_WRITE`/`EXIT`/`YIELD`).
-- **Input & graphics:** PS/2 keyboard (IRQ1) and mouse (IRQ12), a framebuffer console
-  that draws through a RAM shadow buffer and pushes it to the device once per changed
-  frame (so an idle shell is actually idle), 2D primitives (lines, rectangles, circles,
-  fills, blit), a bottom status bar, and a trail-free software mouse cursor drawn as
-  part of that frame. The `nano+` editor takes the mouse too (click to place the
-  caret, drag to select, click a sidebar row to switch files) and marks a file
-  modified only while its text actually differs from what was saved. The console typeface is Fira Code in an 8×18 cell, rasterised
-  offline into `assets/font8x18.bin` by `tools/gen_font.py` — the kernel blends
-  8-bit coverage per pixel, so glyph edges are antialiased, and it ships no TrueType
-  parser.
+- **Ядро:** безопасный слой привилегированных инструкций (SSE включён для ring 3; само ядро
+  собрано soft-float), GDT/IDT/TSS/IST, битмапный PMM, 4-уровневый VMM с `map_mmio`, куча
+  `good_memory_allocator` (galloc), ACPI (MADT), LAPIC + I/O APIC.
+- **Задачи:** вытесняющий ~1 кГц round-robin планировщик, потоки ядра, ring-3
+  пользовательские процессы, `int 0x80`-сисколлы (`SYS_WRITE`/`EXIT`/`YIELD`).
+- **Ввод и графика:** PS/2-клавиатура (IRQ1) и мышь (IRQ12), framebuffer-консоль, которая
+  рисует через RAM shadow buffer и выталкивает его в устройство один раз на изменённый
+  кадр (поэтому простаивающий shell действительно спит), 2D-примитивы (линии,
+  прямоугольники, окружности, заливки, blit), нижняя статус-строка и программный курсор
+  без шлейфа, рисуемый в составе того же кадра. Редактор `nano+` тоже принимает мышь (клик
+  ставит каретку, drag выделяет, клик по строке сайдбара переключает файл) и помечает файл
+  изменённым, только пока его текст действительно отличается от сохранённого. Гарнитура
+  консоли — Fira Code в ячейке 8×18, растеризованная офлайн в `assets/font8x18.bin`
+  генератором `tools/gen_font.py` — ядро смешивает 8-битное покрытие на пиксель, поэтому
+  края глифов антиалиасятся, а парсера TrueType оно не несёт.
 - **USB-ввод (xHCI + HID).** Встроенный драйвер xHCI без прерываний
   (`drivers/xhci.rs`) перечисляет устройства на корневых портах, а
   `drivers/usb_hid.rs` переводит их отчёты ровно в тот поток PS/2-сканкодов и
@@ -227,134 +226,134 @@ server certificate chain, hostname and validity checked before a byte of the ind
   доставляются; LED output report (`SET_REPORT`) не реализован. Проверено в
   QEMU (`tools/e2e.py usb`, host-свойства, `selftest`); на реальном железе не
   проверялось.
-- **Storage:** PCI enumeration, virtio-blk and NVMe block devices, **GPT/MBR partition
-  support** (each partition becomes its own block device, so pagh can own one partition
-  instead of the whole disk), and a multi-block-group ext2-compatible read/write
-  filesystem mounted at `/mnt` (GiB-scale volumes), protected by a write-ahead-log (WAL)
-  journal for crash consistency — large writes are committed in bounded per-transaction
-  chunks. At boot a **disk menu** lists what every partition holds (pagh's own volume, an
-  empty region, somebody else's filesystem) and is the only place a partition can be
-  formatted: `Enter` mounts, `F` formats once the device name is typed back, a stray key
-  cannot erase anything, and a 20 s timeout takes the non-destructive path. A volume is
-  pagh's own iff it carries pagh's WAL superblock; ext3/ext4 are recognised as foreign and
-  refused. The on-disk image is host-mountable (`mount -t ext2 -o loop disk.img`).
-- **Networking:** the kernel's OWN dual-stack TCP/IP implementation (no external
-  networking crate) over an own Intel e1000 NIC driver:
-  IPv4 (ARP, fragmentation/reassembly, ICMP echo + `ping`, DHCPv4) and
+- **Хранилище:** перечисление PCI, блочные устройства virtio-blk и NVMe, **поддержка
+  разделов GPT/MBR** (каждый раздел становится отдельным блочным устройством, поэтому pagh
+  может владеть одним разделом, а не всем диском) и ext2-совместимая read/write файловая
+  система с несколькими группами блоков, монтируемая в `/mnt` (тома масштаба GiB),
+  защищённая журналом write-ahead-log (WAL) для консистентности после краша — большие
+  записи коммитятся ограниченными порциями на транзакцию. При загрузке **disk-меню** листит,
+  что хранит каждый раздел (собственный том pagh, пустая область, чужая файловая система), и
+  это единственное место, где раздел можно форматировать: `Enter` монтирует, `F`
+  форматирует после ввода имени устройства обратно, случайная клавиша ничего не стирает, а
+  20-секундный таймаут выбирает неразрушающий путь. Том считается своим для pagh тогда и
+  только тогда, когда несёт WAL-superblock pagh; ext3/ext4 распознаются как чужие и
+  отвергаются. Образ на диске можно смонтировать на хосте (`mount -t ext2 -o loop disk.img`).
+- **Сеть:** собственная dual-stack реализация TCP/IP (без внешнего сетевого крейта) поверх
+  собственного драйвера Intel e1000:
+  IPv4 (ARP, фрагментация/сборка, ICMP echo + `ping`, DHCPv4) и
   IPv6 (NDP neighbor discovery, Router Solicitation/Advertisement SLAAC,
-  ICMPv6 echo + `ping <ipv6>`, link-local + global addresses); TCP with window
-  scaling (RFC 7323), SACK (RFC 2013/2883 — both sending blocks and a
-  retransmission scoreboard), MSS negotiation, Jacobson/Karels RTO estimation,
-  Reno congestion control; UDP sockets, DNS A+AAAA resolution, and UDP/TCP echo
-  services. AF_INET6 Linux sockets (with v4-mapped addresses) are exposed to
-  Linux binaries.
-- **Shell:** line editing (arrows/Home/End/Delete/insert), command history, tab
-  completion, `cd`/`pwd` with relative paths, file ops (`cp`/`mv`/`stat`), coloured
-  prompt/errors, typo suggestions, a registry-driven `help`, mouse text selection with
-  a session clipboard, a full-screen `nano+` editor, the `paint` app, and a `settings`
-  panel with live colour themes and wallpapers.
-- **Linux binaries:** a Linux x86_64 syscall layer (`int 0x80` + `syscall`) and an ELF
-  loader for static `ET_EXEC`, static-PIE, and glibc-dynamic (`PT_INTERP`) images run
-  Linux programs in ring 3 (`lxrun`) — including the CPython 3.16 REPL (GNU readline
-  works via `select`/`pselect6`). `fork`/`clone` + threads, `epoll`/`eventfd`, unix
-  sockets, and raw-mode `termios` (with kernel-side echo) are implemented; POSIX signal
-  delivery works at the syscall-return point (real `rt_sigaction`/`rt_sigprocmask`/
-  `sigaltstack`/`rt_sigreturn`, `^C` → SIGINT with `EINTR` wake-ups in the blocking
-  waits); a synthetic `procfs` serves
-  `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}`, the
-  read-only `/proc/sys/kernel/{ostype,osrelease,hostname}` stubs, `/proc/self/*`
-  and the per-pid tree `/proc/<pid>/{cmdline,stat,status,maps,cgroup,mountinfo,limits}`
-  plus `/proc/<pid>/{fd,fdinfo}/<n>` and the per-thread view `/proc/<pid>/task/<tid>/`
-  (with `/proc/self/task`); `/proc/<pid>/fdinfo/<n>` reports the real
-  `pos`/`flags`/`mnt_id`/`ino` of the descriptor.
-- **Packages:** a by-name `apt` (`update`/`install`/`show`/`list`/`setmirror`) that fetches
-  a Debian `Packages` index over HTTP/HTTPS, streams gzip/xz/zstd decompression into a
-  compact in-RAM arena index, resolves dependencies, and installs `.deb`s onto ext2 `/mnt`
-  (tar symlinks/hardlinks are created as real links on ext2).
-- **Provisioning:** an idempotent first-boot flow seeds `/mnt`; the glibc + CPython
-  userland is installed through `apt` (gz→xz index-decode fallback, honest decode
-  diagnostics, progress on serial) on demand from the shell (`apt update` +
-  `apt install python3`). Boot no longer stops to ask: a console prompt without a
-  timeout is not something boot may do.
+  ICMPv6 echo + `ping <ipv6>`, link-local + глобальные адреса); TCP с window
+  scaling (RFC 7323), SACK (RFC 2013/2883 — и отправляемые блоки, и scoreboard
+  ретрансмиссий), согласование MSS, оценка RTO Jacobson/Karels, Reno congestion
+  control; UDP-сокеты, DNS-резолвинг A+AAAA и UDP/TCP echo-сервисы. Linux-сокеты
+  AF_INET6 (с v4-mapped адресами) доступны Linux-бинарникам.
+- **Shell:** редактирование строки (стрелки/Home/End/Delete/insert), история команд, tab
+  completion, `cd`/`pwd` с относительными путями, файловые операции (`cp`/`mv`/`stat`),
+  цветные prompt/ошибки, подсказки опечаток, реестровый `help`, выделение текста мышью с
+  клипбордом сессии, полноэкранный редактор `nano+`, приложение `paint` и панель `settings`
+  с живыми цветовыми темами и обоями.
+- **Linux-бинарники:** слой Linux x86_64-сисколлов (`int 0x80` + `syscall`) и ELF-загрузчик
+  для статических `ET_EXEC`, static-PIE и glibc-dynamic (`PT_INTERP`) образов запускают
+  Linux-программы в ring 3 (`lxrun`) — включая REPL CPython 3.16 (GNU readline работает
+  через `select`/`pselect6`). `fork`/`clone` + потоки, `epoll`/`eventfd`, unix-сокеты и
+  raw-mode `termios` (с kernel-side echo) реализованы; доставка POSIX-сигналов работает в
+  точке возврата из сисколла (настоящие `rt_sigaction`/`rt_sigprocmask`/`sigaltstack`/
+  `rt_sigreturn`, `^C` → SIGINT с пробуждениями `EINTR` в блокирующих ожиданиях);
+  синтетический `procfs` отдаёт
+  `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}`, read-only
+  заглушки `/proc/sys/kernel/{ostype,osrelease,hostname}`, `/proc/self/*` и per-pid дерево
+  `/proc/<pid>/{cmdline,stat,status,maps,cgroup,mountinfo,limits}`, плюс
+  `/proc/<pid>/{fd,fdinfo}/<n>` и per-thread представление `/proc/<pid>/task/<tid>/` (с
+  `/proc/self/task`); `/proc/<pid>/fdinfo/<n>` сообщает реальные `pos`/`flags`/`mnt_id`/`ino`
+  дескриптора.
+- **Пакеты:** `apt` по имени (`update`/`install`/`show`/`list`/`setmirror`), который
+  скачивает Debian-индекс `Packages` по HTTP/HTTPS, потоково разжимает gzip/xz/zstd в
+  компактный in-RAM arena-индекс, разрешает зависимости и ставит `.deb` на ext2 `/mnt`
+  (tar-симлинки/hardlink'и создаются настоящими ссылками на ext2).
+- **Провижининг:** идемпотентный first-boot flow засеивает `/mnt`; userland glibc + CPython
+  ставится через `apt` (fallback декодирования индекса gz→xz, честная диагностика
+  декодирования, прогресс на serial) по запросу из shell (`apt update` + `apt install
+  python3`). Загрузка больше не останавливается, чтобы спросить: консольный вопрос без
+  таймаута — не то, что загрузка может себе позволить.
 
 ---
 
-## Quick start
+## Быстрый старт
 
-### Prerequisites
+### Предварительные требования
 
-- **Rust nightly** with the `rust-src` component (for `build-std`):
+- **Rust nightly** с компонентом `rust-src` (для `build-std`):
   ```sh
   rustup toolchain install nightly
   rustup component add rust-src --toolchain nightly
   ```
-  `rust-lld` ships with the toolchain and is used as the linker.
-- **QEMU** (`qemu-system-x86_64`) on your `PATH`. `qemu-img` is used to create the disk
-  image on first run.
-- Two developer-provided blobs in the project root (they are git-ignored — see below):
-  - `OVMF.fd` — UEFI firmware for QEMU.
-  - A Limine bootloader loader (`BOOTX64.EFI`). No version is pinned: the scripts
-    accept any local `limine*/` tree (or `LIMINE_EFI`/`LIMINE_DIR`), and
-    `tools/limine.py` downloads the latest Limine binary release into `limine/`
-    automatically when none is found.
+  `rust-lld` поставляется с тулчейном и используется как линкер.
+- **QEMU** (`qemu-system-x86_64`) в вашем `PATH`. `qemu-img` используется для создания
+  образа диска при первом запуске.
+- Два предоставляемых разработчиком блоба в корне проекта (они git-ignored — см. ниже):
+  - `OVMF.fd` — прошивка UEFI для QEMU.
+  - Загрузчик Limine (`BOOTX64.EFI`). Версия не запинена: скрипты принимают любое локальное
+    дерево `limine*/` (или `LIMINE_EFI`/`LIMINE_DIR`), а `tools/limine.py` автоматически
+    скачивает последний бинарный релиз Limine в `limine/`, когда ничего не найдено.
 
-### Build and run
+### Сборка и запуск
 
 #### Linux / Bash
 
-Install QEMU/OVMF and the pinned Rust toolchain. A Limine `BOOTX64.EFI` is
-located automatically (any `limine*/` tree, `LIMINE_EFI`, system paths) or
-downloaded on first build:
+Установите QEMU/OVMF и запиненный тулчейн Rust. `BOOTX64.EFI` Limine находится
+автоматически (любое дерево `limine*/`, `LIMINE_EFI`, системные пути) или скачивается
+при первой сборке:
 
 ```bash
 chmod +x setup-linux.sh build.sh run.sh
-./setup-linux.sh                 # Ubuntu/Debian, Fedora, or Arch host packages
-./build.sh                       # debug build + link
-./build.sh --release --stage     # release build + Limine ESP staging
-./run.sh --release               # build, stage, and boot in QEMU
-./run.sh --headless              # serial-only QEMU
+./setup-linux.sh                 # пакеты хоста Ubuntu/Debian, Fedora или Arch
+./build.sh                       # debug-сборка + линковка
+./build.sh --release --stage     # release-сборка + staging ESP Limine
+./run.sh --release               # собрать, застейджить и загрузить в QEMU
+./run.sh --headless              # QEMU только с serial
 ```
 
-The scripts automatically detect common system OVMF locations. Override with
-`OVMF=/path/to/OVMF.fd` or `OVMF_CODE` + `OVMF_VARS`. Other supported variables
-are `LIMINE_DIR`, `LIMINE_EFI`, and `PAGH_DISK`. QEMU exits with `Ctrl-A`, then `X`.
+Скрипты автоматически находят типовые системные расположения OVMF. Переопределяйте через
+`OVMF=/path/to/OVMF.fd` или `OVMF_CODE` + `OVMF_VARS`. Другие поддерживаемые переменные —
+`LIMINE_DIR`, `LIMINE_EFI` и `PAGH_DISK`. QEMU выходит по `Ctrl-A`, затем `X`.
 
-`run.sh` creates a 1 GiB raw `disk.img` on first run and boots QEMU with 1 GiB of RAM.
-The first boot only seeds the filesystem skeleton; the base `python3` userland is not
-installed from a boot prompt (a console question without a timeout is not something boot
-may do). Install it from the shell when you want it: `apt update` then `apt install
-python3` (≈50 MB of downloads, progress on serial). Delete `disk.img` to get a clean,
-re-seeded system on the next boot.
+`run.sh` создаёт при первом запуске raw-диск `disk.img` на 1 GiB и загружает QEMU с 1 GiB
+RAM. Первая загрузка только засеивает скелет файловой системы; базовый userland `python3`
+не ставится из boot-prompt'а (консольный вопрос без таймаута — не то, что загрузка может
+себе позволить). Ставьте его из shell, когда захотите: `apt update`, затем `apt install
+python3` (≈50 MB загрузки, прогресс на serial). Удалите `disk.img`, чтобы получить чистую,
+заново засеянную систему при следующей загрузке.
 
-> **Data safety when booting real hardware.** pagh does not format a disk on its own at
-> boot. It lists the partitions it can see and waits; formatting a partition happens only
-> when a human presses `F` in that menu and then types the partition's name back — a stray
-> Enter mounts or explains, it never erases — and the menu's timeout chooses the
-> non-destructive path (mount pagh's own volume when there is one, otherwise the RAM disk).
-> A volume counts as pagh's own only when it carries pagh's WAL superblock
-> (`PAGHJNL\1`), which `Ext2Fs::format` and nothing else writes; an ext2/ext3/ext4
-> filesystem is shown as `FOREIGN` and left untouched (ext3/ext4 are additionally refused
-> at mount time by their feature words). The one device the automatic path may format is
-> the **RAM disk from the boot medium** (`disk.img` next to the kernel), which is scratch
-> by definition and disappears at power-off. The shell's `disk setup` stays the
-> deliberate, whole-device route: the explicit opt-in marker (write `PAGH-FORMAT` into
-> sector 0 of that device: `printf 'PAGH-FORMAT' | sudo dd of=/dev/nvme0n1 bs=1
-> conv=notrunc`) still authorises it, and the marker is itself destructive — it overwrites
-> the first 11 bytes of sector 0, which on a partitioned disk is the bootstrap area. Two
-> caveats matter: the probe **stops at 1 MiB**, so a layout that keeps all of its metadata
-> past that point (a `mkswap` signature at the end of a device, an mdadm 1.0 superblock,
-> external RAID metadata) looks like free space — the menu labels it `empty`, and
-> formatting it is then a human decision, not an accident; and a device refused because
-> its ext2 superblock parses but its mount fails cannot be rescued by the marker — zero
-> its start (`wipefs -a`) and it becomes blank. Attach pagh to a dedicated blank partition
-> or disk — never to one that holds data you care about.
+> **Безопасность данных при загрузке на реальном железе.** pagh не форматирует диск сам
+> при загрузке. Он листит видимые разделы и ждёт; форматирование раздела происходит, только
+> когда человек нажимает `F` в этом меню и затем вводит имя раздела обратно — случайный
+> Enter монтирует или объясняет, но никогда не стирает — а таймаут меню выбирает
+> неразрушающий путь (монтировать собственный том pagh, если он есть, иначе RAM-диск). Том
+> считается собственным для pagh, только когда несёт его WAL-superblock (`PAGHJNL\1`),
+> который пишет `Ext2Fs::format` и больше никто; файловая система ext2/ext3/ext4
+> показывается как `FOREIGN` и остаётся нетронутой (ext3/ext4 дополнительно отвергаются
+> при mount по их feature-словам). Единственное устройство, которое автоматический путь
+> может форматировать, — **RAM-диск с загрузочного носителя** (`disk.img` рядом с ядром),
+> который по определению черновой и исчезает при выключении питания. Shell-овая `disk
+> setup` остаётся намеренным маршрутом на всё устройство: явный маркер opt-in (запишите
+> `PAGH-FORMAT` в сектор 0 этого устройства: `printf 'PAGH-FORMAT' | sudo dd
+> of=/dev/nvme0n1 bs=1 conv=notrunc`) всё ещё авторизует её, и сам маркер разрушителен — он
+> перезаписывает первые 11 байт сектора 0, что на разбитом на разделы диске является
+> загрузочной областью. Важны две оговорки: проба **останавливается на 1 MiB**, поэтому
+> раскладка, держащая все свои метаданные за этой точкой (сигнатура `mkswap` в конце
+> устройства, superblock mdadm 1.0, внешние RAID-метаданные), выглядит как свободное
+> место — меню помечает её `empty`, и форматирование тогда становится решением человека, а
+> не случайностью; а устройство, отвергнутое потому, что его ext2-superblock парсится, но
+> mount падает, нельзя спасти маркером — обнулите его начало (`wipefs -a`), и оно станет
+> пустым. Подключайте pagh к выделенному пустому разделу или диску — никогда к тому, что
+> хранит важные вам данные.
 
-The cross-platform Python equivalents remain available through `tools/build.py`
-and the `Makefile`.
+Кроссплатформенные Python-эквиваленты по-прежнему доступны через `tools/build.py` и
+`Makefile`.
 
 #### Windows
 
-The `run.cmd` script drives the whole pipeline:
+Скрипт `run.cmd` проводит весь конвейер:
 
 ```bat
 run.cmd build           :: cargo build + link PAGH.elf only
@@ -363,21 +362,20 @@ run.cmd run release     :: release build
 ```
 
 `run.cmd`:
-1. runs `cargo build` to produce the static library `libpagh.a`,
-2. links it into `PAGH.elf` with `rust-lld` using `linker.ld`,
-3. stages `iso_root/` (kernel + `BOOTX64.EFI` + a generated `limine.conf`),
-4. creates a 64 MiB raw `disk.img` (via `qemu-img`) if it does not already exist,
-5. launches QEMU with OVMF, a `virtio-blk-pci` drive, an `e1000` NIC (user
-   networking with host port-forwards), serial on stdio, and interrupt logging to
-   `qemu_debug.log`.
+1. запускает `cargo build`, получая статическую библиотеку `libpagh.a`,
+2. линкует её в `PAGH.elf` через `rust-lld` по `linker.ld`,
+3. застейдживает `iso_root/` (ядро + `BOOTX64.EFI` + сгенерированный `limine.conf`),
+4. создаёт raw-диск `disk.img` на 64 MiB (через `qemu-img`), если его ещё нет,
+5. запускает QEMU с OVMF, приводом `virtio-blk-pci`, NIC `e1000` (user networking с
+   host-пробросом портов), serial на stdio и логированием прерываний в `qemu_debug.log`.
 
-The NIC is configured with host→guest forwards on TCP/UDP `localhost:5555 → guest :7`,
-so you can reach the guest's echo services from the host.
+NIC настроен с host→guest пробросом по TCP/UDP `localhost:5555 → guest :7`, поэтому вы
+можете достучаться до эхо-сервисов гостя с хоста.
 
-Serial output (including the shell) appears on the console. Press `Ctrl-A` then `X` to
-exit QEMU.
+Вывод serial (включая shell) появляется на консоли. Нажмите `Ctrl-A`, затем `X`, чтобы
+выйти из QEMU.
 
-Just building the static library:
+Только сборка статической библиотеки:
 
 ```sh
 cargo build            # debug
@@ -386,9 +384,9 @@ cargo build --release  # release
 
 ---
 
-## Boot output
+## Вывод загрузки
 
-On a clean boot you will see a concise, leveled log followed by the shell:
+На чистой загрузке вы увидите сжатый уровневый лог, за которым следует shell:
 
 ```
 [INFO] serial
@@ -418,132 +416,132 @@ Type 'help' for available commands
 pagh:/>
 ```
 
-The default log level is `INFO`; `debug!`/`trace!` output is filtered out. Boot runs as an
-ordered sequence of fallible init steps (`boot::start`); hardware SSE is enabled first
-(ring-3 programs use XMM freely — the kernel itself is compiled soft-float and never
-touches vector registers), then each step logs one concise `info!` line. The `ext2 mounted at /mnt` step also runs a one-shot
-journaled write/read self-demo. The `Hello from ring3 user process!` line is printed by an
-embedded ELF executing in ring 3 via a `SYS_WRITE` system call. The DHCP lease is acquired
-asynchronously by the network poll thread once interrupts are enabled, so it appears after
-the prompt. On a fresh disk the boot only seeds the file skeleton (release metadata,
-`/etc`, an example); the glibc + `python3` userland is installed on demand from the shell
-with `apt update` + `apt install python3` (progress on serial; the framebuffer log mirror
-is paused while it runs). The prompt shows the current working directory and is rendered in color on the
-framebuffer (serial stays plain text).
+Уровень лога по умолчанию — `INFO`; вывод `debug!`/`trace!` отфильтрован. Загрузка идёт
+упорядоченной последовательностью fallible-шагов инициализации (`boot::start`); сначала
+включается аппаратный SSE (ring-3-программы свободно используют XMM — само ядро собрано
+soft-float и никогда не трогает векторные регистры), затем каждый шаг пишет одну сжатую
+строку `info!`. Шаг `ext2 mounted at /mnt` также прогоняет одноразовую журналируемую
+запись/чтение self-demo. Строку `Hello from ring3 user process!` печатает встроенный ELF,
+исполняемый в ring 3 через сисколл `SYS_WRITE`. DHCP-lease асинхронно получает поток
+сетевого poll'а после включения прерываний, поэтому он появляется после prompt'а. На
+свежем диске загрузка только засеивает скелет файлов (release-метаданные, `/etc`, пример);
+userland glibc + `python3` ставится по запросу из shell командами `apt update` + `apt
+install python3` (прогресс на serial; зеркало лога во framebuffer приостанавливается).
+Prompt показывает текущий рабочий каталог и рендерится в цвете на framebuffer (serial
+остаётся простым текстом).
 
-### Console scrollback
+### Прокрутка консоли
 
-The console keeps the rows that scroll off the top and shows them again when you
-scroll back:
+Консоль держит строки, ушедшие вверх, и показывает их снова при прокрутке:
 
-- **Mouse wheel** — three text lines per notch (PS/2 mouse; the driver negotiates
-  the IntelliMouse four-byte protocol at boot, and the serial log says
+- **Колесо мыши** — три текстовые строки за щелчок (PS/2-мышь; драйвер согласует
+  четырёхбайтный протокол IntelliMouse при загрузке, а serial-лог говорит
   `[PS2MOUSE] wheel: IntelliMouse ...`).
-- **PageUp / PageDown** — one screenful per press. This also covers a USB HID
-  mouse: its boot protocol has no wheel axis, and the report-protocol wheel/pan
-  bytes are decoded but not delivered to the PS/2 path, so only the keyboard can
-  page there.
-- **Any other key or a click** returns to the live bottom; the status strip shows
-  `scroll N/M` while you are back in history. `clear` forgets the history.
-- With a wallpaper active the history view is painted opaque (a history row has to
-  replace what was on screen); returning to the bottom repaints the wallpaper.
+- **PageUp / PageDown** — один экран за нажатие. Это же покрывает USB HID-мышь: в её boot
+  protocol нет оси wheel, а байты wheel/pan report-протокола декодируются, но не
+  доставляются в PS/2-путь, поэтому там постранично может только клавиатура.
+- **Любая другая клавиша или клик** возвращает к живому низу; статус-строка показывает
+  `scroll N/M`, пока вы в истории. `clear` забывает историю.
+- При активных обоях вид истории рисуется непрозрачным (строка истории должна заменить то,
+  что было на экране); возврат к низу перерисовывает обои.
 
-The history is bounded (512 rows, ~256 KiB) and allocated as output scrolls.
+История ограничена (512 строк, ~256 KiB) и выделяется по мере прокрутки вывода.
 
-### Shell commands
+### Команды shell
 
-| Command              | Description                                                     |
+| Команда              | Описание                                                        |
 |----------------------|-----------------------------------------------------------------|
-| `help [cmd]`         | List commands, or show usage/description for one command        |
-| `clear`              | Clear the framebuffer screen                                    |
-| `echo …`             | Echo the arguments                                              |
-| `uptime`             | Show scheduler ticks (~1000 Hz)                                 |
-| `date`               | Show the RTC wall clock in UTC (ISO date, time, Unix seconds)   |
-| `pwd`                | Print the current working directory                             |
-| `cd [path]`          | Change directory (relative or absolute; no arg → `/`)           |
-| `ls [-l] [path]`     | List a directory; `-l` adds mode, links, owner/group and size  |
-| `tree [-L N] [path]` | Recursive listing, depth-limited (default 4), counts at the end |
-| `cat path`           | Print the contents of a file                                    |
-| `head [-n N] path`   | Print the first N lines of a file (default 10)                  |
-| `tail [-n N] path`   | Print the last N lines of a file (default 10)                   |
-| `wc [-l\|-w\|-c] path` | Count lines, words and bytes in a file                       |
-| `grep [-i] [-n] [-c] [-v] pattern path` | Print the lines of a file that contain pattern |
-| `cp src dst`         | Copy a file                                                     |
-| `mv src dst`         | Move/rename a file                                              |
-| `stat path`          | Show file/directory info                                        |
-| `chmod MODE path…`   | Change permission bits (octal, e.g. `chmod 644 file`)           |
-| `chown UID[:GID] path…` | Change owner/group (numeric; `chown 1000:1000 file`)         |
-| `mkdir path`         | Create a directory                                              |
-| `touch path`         | Create an empty file                                            |
-| `write path text`    | Write text to a file (journaled)                                |
-| `rm [-r] path…`      | Remove files; `-r` removes directories recursively              |
-| `sync`               | Flush the mounted filesystem                                    |
-| `fscrash`            | Demo journal replay + persistence (write → remount → verify)    |
-| `sleep <seconds>`    | Sleep for N seconds                                             |
-| `nano <path>`        | Full-screen editor: undo/redo, search/replace, goto, clipboard  |
-| `rust <path> [...]`  | Run `.rs`/`.pbc` with mini-Rust, or any ELF via the Linux layer |
-| `rustc <file.rs>`    | Compile Rust source to a `.pbc` (real `/mnt/usr/bin/rustc` if installed, else embedded mini-Rust) |
-| `cargo …`            | Real `/mnt/usr/bin/cargo` if installed, else embedded mini-Rust |
-| `rustup …`           | Inspect the built-in offline mini-Rust toolchain                |
-| `lua [file\|-e code]` | Run Lua 5.5 (installed via apt)                                |
-| `python [file\|-c code]` | Run the installed CPython 3.16 (glibc) via the Linux layer  |
-| `python3 [file\|-c code]` | Alias of `python`                                          |
-| `pythonc <file.py>`  | Compile Python source to bytecode                               |
-| `paint`              | Launch the windowed, mouse-driven framebuffer paint app         |
-| `pci`                | List enumerated PCI devices (virtio tagged)                     |
-| `usb`                | xHCI controller state and per-port status (diagnostics)         |
-| `disk [list\|setup\|mount <n>\|format <n> [--force]\|cancel]` | List block devices; format one as ext2 and mount it at `/mnt` |
-| `ifconfig`           | Show the network interface (IP, gateway, MAC)                   |
-| `ping <ip>`          | Send one ICMP echo request and print the RTT                    |
-| `df [-h]`            | Mounted filesystems: blocks/size, used, available, use%, mount point |
-| `free [-h]`          | RAM and kernel heap: total/used/free in KiB, `-h` for human units |
-| `ps`                 | Processes: PID, PPID, STAT, COMMAND — compat processes from `/proc/<pid>/*`, kernel threads as `[shell]`/`[net]`/`[usb]` |
-| `nc <ip> <port> [text]` | Open a TCP connection and echo a line over it                |
-| `jobs` / `fg` / `bg` | Shell job table; resume the most recent stopped job in the foreground / background |
-| `lxrun <path> […]`   | Load and run a Linux x86_64 ELF (static or glibc) in ring 3    |
-| `pkg <host> <path> [port]` | Download a `.deb` over HTTP(S) and install it under /mnt  |
-| `apt <subcmd> …`     | Package manager: `update`/`install`/`show`/`list`/`setmirror`   |
-| `warn <on\|off>`     | Show/hide kernel `[WARN]` lines on screen (serial always logs)  |
-| `settings` / `theme` / `wallpaper` | Customize the terminal: themes, wallpaper, status bar, caret |
-| `exec`               | Run the embedded ring-3 test process                            |
-| `selftest [passes]`  | Run the in-kernel correctness self-test suite (serial; N passes add an idempotency check) |
+| `help [cmd]`         | Список команд или usage/описание одной команды                  |
+| `clear`              | Очистить экран framebuffer                                      |
+| `echo …`             | Эхо аргументов                                                  |
+| `uptime`             | Показать тики планировщика (~1000 Hz)                           |
+| `date`               | Показать настенные часы RTC в UTC (ISO-дата, время, Unix-секунды) |
+| `pwd`                | Напечатать текущий рабочий каталог                              |
+| `cd [path]`          | Сменить каталог (относительный или абсолютный; без аргумента → `/`) |
+| `ls [-l] [path]`     | Листинг каталога; `-l` добавляет mode, links, owner/group и размер |
+| `tree [-L N] [path]` | Рекурсивный листинг с ограничением глубины (по умолчанию 4) и счётчиками в конце |
+| `cat path`           | Напечатать содержимое файла                                     |
+| `head [-n N] path`   | Напечатать первые N строк файла (по умолчанию 10)               |
+| `tail [-n N] path`   | Напечатать последние N строк файла (по умолчанию 10)            |
+| `wc [-l\|-w\|-c] path` | Посчитать строки, слова и байты в файле                       |
+| `grep [-i] [-n] [-c] [-v] pattern path` | Напечатать строки файла, содержащие pattern |
+| `cp src dst`         | Скопировать файл                                                |
+| `mv src dst`         | Переместить/переименовать файл                                  |
+| `stat path`          | Показать информацию о файле/каталоге                            |
+| `chmod MODE path…`   | Сменить биты прав (восьмерично, например `chmod 644 file`)      |
+| `chown UID[:GID] path…` | Сменить owner/group (числовые ids; `chown 1000:1000 file`)   |
+| `mkdir path`         | Создать каталог                                                 |
+| `touch path`         | Создать пустой файл                                             |
+| `write path text`    | Записать текст в файл (журналируемо)                            |
+| `rm [-r] path…`      | Удалить файлы; `-r` рекурсивно удаляет каталоги                 |
+| `sync`               | Сбросить смонтированную файловую систему                        |
+| `fscrash`            | Демо replay журнала + персистентность (запись → remount → проверка) |
+| `sleep <seconds>`    | Спать N секунд                                                  |
+| `nano <path>`        | Полноэкранный редактор: undo/redo, поиск/замена, goto, клипборд  |
+| `rust <path> [...]`  | Запустить `.rs`/`.pbc` через mini-Rust или любой ELF через Linux-слой |
+| `rustc <file.rs>`    | Скомпилировать Rust-исходник в `.pbc` (реальный `/mnt/usr/bin/rustc`, если установлен, иначе встроенный mini-Rust) |
+| `cargo …`            | Реальный `/mnt/usr/bin/cargo`, если установлен, иначе встроенный mini-Rust |
+| `rustup …`           | Посмотреть встроенный офлайн-тулчейн mini-Rust                  |
+| `lua [file\|-e code]` | Запустить Lua 5.5 (ставится через apt)                        |
+| `python [file\|-c code]` | Запустить установленный CPython 3.16 (glibc) через Linux-слой |
+| `python3 [file\|-c code]` | Алиас `python`                                             |
+| `pythonc <file.py>`  | Скомпилировать Python-исходник в байткод                        |
+| `paint`              | Запустить оконное управляемое мышью framebuffer-приложение paint |
+| `pci`                | Список перечисленных PCI-устройств (virtio помечены)            |
+| `usb`                | Состояние xHCI-контроллера и статус каждого порта (диагностика) |
+| `disk [list\|setup\|mount <n>\|format <n> [--force]\|cancel]` | Список блочных устройств; форматировать одно как ext2 и смонтировать в `/mnt` |
+| `ifconfig`           | Показать сетевой интерфейс (IP, gateway, MAC)                   |
+| `ping <ip>`          | Отправить один ICMP echo и напечатать RTT                       |
+| `df [-h]`            | Смонтированные файловые системы: blocks/size, used, available, use%, mount point |
+| `free [-h]`          | RAM и куча ядра: total/used/free в KiB, `-h` — человеческие единицы |
+| `ps`                 | Процессы: PID, PPID, STAT, COMMAND — compat-процессы из `/proc/<pid>/*`, потоки ядра как `[shell]`/`[net]`/`[usb]` |
+| `nc <ip> <port> [text]` | Открыть TCP-соединение и отправить строку                    |
+| `jobs` / `fg` / `bg` | Таблица jobs shell; возобновить последнюю остановленную job на переднем/фоновом плане |
+| `lxrun <path> […]`   | Загрузить и запустить Linux x86_64 ELF (статический или glibc) в ring 3 |
+| `pkg <host> <path> [port]` | Скачать `.deb` по HTTP(S) и установить в /mnt            |
+| `apt <subcmd> …`     | Менеджер пакетов: `update`/`install`/`show`/`list`/`setmirror`  |
+| `warn <on\|off>`     | Показывать/скрывать строки `[WARN]` ядра на экране (serial логирует всегда) |
+| `settings` / `theme` / `wallpaper` | Настроить терминал: темы, обои, статус-строка, каретка |
+| `exec`               | Запустить встроенный ring-3 тестовый процесс                    |
+| `selftest [passes]`  | Прогнать in-kernel набор self-test (serial; N проходов добавляют проверку идемпотентности) |
 
-**Line editing & UX.** The shell supports a movable cursor (Left/Right/Home/End),
-mid-line insert/Backspace/Delete, command history (Up/Down), and Tab completion for
-command names and VFS paths. Unknown commands get a nearest-match "did you mean …?"
-suggestion. Paths are resolved against the current working directory (`.`/`..`
-supported), and prompt/errors/success are color-coded on the framebuffer.
+**Редактирование строки и UX.** Shell поддерживает перемещаемую каретку (Left/Right/Home/End),
+вставку/Backspace/Delete в середине строки, историю команд (Up/Down) и Tab completion для имён
+команд и VFS-путей. Неизвестные команды получают подсказку ближайшего совпадения «did you
+mean …?». Пути резолвятся относительно текущего рабочего каталога (поддерживаются `.`/`..`),
+а prompt/ошибки/успех кодируются цветом на framebuffer.
 
-> Console note: the framebuffer console only supports destructive backspace and has no
-> non-destructive cursor positioning, so during mid-line edits the visible caret rests at
-> end-of-line while the logical cursor is placed correctly — the buffer content always
-> renders accurately.
+> Замечание о консоли: framebuffer-консоль поддерживает только деструктивный backspace и
+> не имеет недеструктивного позиционирования курсора, поэтому при редактировании в
+> середине строки видимая каретка стоит в конце строки, а логический курсор расположен
+> правильно — содержимое буфера всегда рендерится точно.
 
-### Graphics & the `paint` app
+### Графика и приложение `paint`
 
-The framebuffer driver is not just a text console: it exposes 2D primitives (pixels,
-filled/outline rectangles, lines and thick lines, circles and discs, and `blit`) plus a
-bottom status bar. A PS/2 mouse (IRQ12) feeds an absolute, screen-clamped cursor position
-and button state, drawn as a trailing-free software arrow cursor (`drivers::cursor`) that
-saves and restores the pixels beneath it.
+Драйвер framebuffer — не просто текстовая консоль: он предоставляет 2D-примитивы (пиксели,
+заполненные/контурные прямоугольники, линии и толстые линии, окружности и диски, а также
+`blit`) плюс нижнюю статус-строку. PS/2-мышь (IRQ12) подаёт абсолютную, прижатую к экрану
+позицию курсора и состояние кнопок, рисуемую программным стрелочным курсором без шлейфа
+(`drivers::cursor`), который сохраняет и восстанавливает пиксели под собой.
 
-`paint` ties these together into a windowed drawing application launched from the shell:
+`paint` связывает это в оконное приложение для рисования, запускаемое из shell:
 
-- **Window:** draws itself as a desktop window with a title bar (drag to move) and
-  minimize / maximize / close buttons, plus a "Paint" taskbar button that toggles
-  minimize; maximize stretches it to full screen.
-- **Tools:** Pencil, Eraser, Line, Rectangle, Filled Rectangle, Circle, Disc, Bucket fill,
-  and color Picker — shape tools show a live rubber-band preview while dragging.
-- **Color:** a 16-entry palette (toolbar swatches, or number keys `1`–`0`); left button
-  paints, right button quick-erases to white.
-- **Editing:** keyboard shortcuts for tools, brush size (`[`/`]`), undo/redo (`u`),
-  clear (`x`), maximize (`m`), and save/load the canvas to `/mnt/paint.img` (`s`/`g`) via
-  the ext2 FS.
-- **Exit:** the close button, `Esc`, or `q` returns to the shell.
+- **Окно:** рисуется как desktop-окно с title bar (drag для перемещения) и кнопками
+  minimize / maximize / close, плюс кнопка «Paint» на панели задач, переключающая minimize;
+  maximize растягивает его на весь экран.
+- **Инструменты:** Pencil, Eraser, Line, Rectangle, Filled Rectangle, Circle, Disc, Bucket
+  fill и Color Picker — инструменты фигур показывают живое резиновое превью при
+  перетаскивании.
+- **Цвет:** палитра из 16 элементов (свотчи на панели или цифровые клавиши `1`–`0`); левая
+  кнопка рисует, правая быстро стирает в белый.
+- **Редактирование:** горячие клавиши инструментов, размер кисти (`[`/`]`), undo/redo (`u`),
+  clear (`x`), maximize (`m`) и сохранение/загрузка canvas в `/mnt/paint.img` (`s`/`g`)
+  через ext2 FS.
+- **Выход:** кнопка close, `Esc` или `q` возвращает в shell.
 
-### Trying the network from the host
+### Проверка сети с хоста
 
-With the guest booted (DHCP lease `10.0.2.15`):
+При загруженном госте (DHCP-lease `10.0.2.15`):
 
 ```sh
 # TCP echo (host forward 5555 → guest 7)
@@ -553,17 +551,17 @@ printf 'hello pagh' | nc 127.0.0.1 5555
 printf 'hello pagh' | nc -u 127.0.0.1 5555
 ```
 
-From inside the guest shell you can also drive the TCP client: `nc 10.0.2.2 <port> text`.
+Изнутри гостевого shell также можно управлять TCP-клиентом: `nc 10.0.2.2 <port> text`.
 
 ---
 
-## Rust applications and nano+
+## Rust-приложения и nano+
 
-### Embedded mini-Rust
+### Встроенный mini-Rust
 
-pagh includes an offline Rust-like toolchain designed for source written directly
-in `nano+`. It is deliberately smaller than upstream rustc, Cargo and rustup, but
-uses familiar commands and requires no network or host compiler.
+pagh включает офлайн-тулчейн в стиле Rust, рассчитанный на исходники, написанные прямо в
+`nano+`. Он намеренно меньше upstream rustc, Cargo и rustup, но использует привычные
+команды и не требует сети или хостового компилятора.
 
 ```text
 cargo new /mnt/hello
@@ -579,48 +577,50 @@ rustup show
 rustup target list
 ```
 
-Supported mini-Rust syntax includes `fn main()`, integer variables and arithmetic,
-integer arrays, `.iter().sum()`, `println!`/`print!`, assignments and integer
-`for` ranges. Cargo supports `new`, `check`, `build`, and `run`. `.pbc` files are
-portable source packages interpreted by the built-in runtime, not native ELF.
+Поддерживаемый синтаксис mini-Rust включает `fn main()`, целочисленные переменные и
+арифметику, целочисленные массивы, `.iter().sum()`, `println!`/`print!`, присваивания и
+целочисленные диапазоны `for`. Cargo поддерживает `new`, `check`, `build` и `run`. Файлы
+`.pbc` — портативные пакеты исходников, интерпретируемые встроенным runtime, а не
+нативные ELF.
 
-### Native Rust userspace
+### Нативный Rust-userland
 
-pagh can also run single-threaded, statically linked Rust programs compiled for
-`x86_64-unknown-linux-musl`. Build the included example on the host:
+pagh также может запускать однопоточные статически слинкованные Rust-программы, собранные
+под `x86_64-unknown-linux-musl`. Соберите включённый пример на хосте:
 
 ```bash
 tools/build-rust-app.sh rust-apps/hello
 ```
 
-Copy `rust-apps/out/pagh-rust-hello` into the ext2 disk and run it in pagh:
+Скопируйте `rust-apps/out/pagh-rust-hello` на ext2-диск и запустите в pagh:
 
 ```text
 rust /mnt/pagh-rust-hello one two
 ```
 
-For `.rs` and `.pbc`, the `rust` command selects the embedded interpreter. For
-other files it selects the ring-3 Linux ELF loader — static or glibc-dynamic,
-single- or multi-threaded. GUI libraries remain unsupported for native binaries.
+Для `.rs` и `.pbc` команда `rust` выбирает встроенный интерпретатор. Для остальных файлов
+она выбирает ring-3 Linux ELF-загрузчик — статический или glibc-dynamic, однопоточный или
+многопоточный. GUI-библиотеки для нативных бинарников по-прежнему не поддерживаются.
 
-### nano+ editor
+### Редактор nano+
 
-Open or create a file with `nano /mnt/file.rs`. The editor provides:
+Откройте или создайте файл через `nano /mnt/file.rs`. Редактор предоставляет:
 
-- line numbers and horizontal/vertical scrolling;
-- `Ctrl-S` save and a double-`Ctrl-Q` unsaved-change guard;
-- `Ctrl-Z` undo and `Ctrl-Y` redo (32 snapshots);
-- `Ctrl-F` search, `Ctrl-R` replace-all and `Ctrl-G` go to line;
-- Home/End, Page Up/Page Down, Delete, configurable Tab and auto-indent;
-- `Ctrl-C` copy line, `Ctrl-K` cut line, `Ctrl-U`/`Ctrl-V` paste;
-- persistent `nano --settings`, themes, line-number/whitespace toggles, wrapping, trimming and `.bak` backups;
-- journaled truncate-before-rewrite with explicit save errors.
+- номера строк и горизонтальную/вертикальную прокрутку;
+- `Ctrl-S` — сохранение и защита от выхода при несохранённых изменениях двойным `Ctrl-Q`;
+- `Ctrl-Z` — undo и `Ctrl-Y` — redo (32 снимка);
+- `Ctrl-F` — поиск, `Ctrl-R` — replace-all и `Ctrl-G` — переход к строке;
+- Home/End, Page Up/Page Down, Delete, настраиваемый Tab и auto-indent;
+- `Ctrl-C` — копировать строку, `Ctrl-K` — вырезать строку, `Ctrl-U`/`Ctrl-V` — вставить;
+- персистентные `nano --settings`, темы, переключатели номеров строк/пробелов, wrapping,
+  trimming и `.bak`-бэкапы;
+- журналируемое усечение перед перезаписью с явными ошибками сохранения.
 
-## Linux binaries & Debian packages
+## Linux-бинарники и пакеты Debian
 
-`pagh` can run Linux x86_64 programs — statically linked or glibc-dynamic — and install
-Debian packages by name. The base userland is not installed by the boot: install it on
-demand from the shell, so `python` works once you ask for it.
+`pagh` умеет запускать Linux x86_64-программы — статически слинкованные или glibc-dynamic —
+и ставить Debian-пакеты по имени. Базовый userland не ставится при загрузке: установите его
+по запросу из shell, и `python` заработает, когда вы об этом попросите.
 
 ```text
 # run a Linux ELF already on the filesystem
@@ -636,98 +636,96 @@ lxrun /mnt/bin/busybox
 python
 ```
 
-- **Static and dynamic.** Statically-linked binaries and glibc-dynamic binaries both run:
-  the loader maps the ELF interpreter (`ld-linux-x86-64.so.2`) from `/mnt` (with
-  merged-`/usr` fallback paths), and CPython 3.16 works end to end.
-  `fork`/`clone` + threads, `epoll`/`eventfd`, unix sockets, vectored I/O
-  (`readv`/`writev`/…), `rename*`, and real process groups (`pgid` in `CompatState`,
-  `setpgid`/`getpgid`/`getpgrp`/`setsid`; `kill(0)`/`kill(-pgid)` address the group)
-  are implemented.
-  POSIX signal delivery works at the syscall-return point and at the timer-tick return:
-  `rt_sigaction` installs real handlers, delivered signals build an x86_64 `rt_sigframe`
-  on the user stack and `rt_sigreturn` restores the context, `kill(2)` (nr 62) addresses
-  a process, the caller's process group, a `-pgid` group or every process (`kill(-1)`),
-  `SIGSTOP`/`SIGCONT` are real scheduler state (a stopped task keeps its saved frame,
-  leaves rotation and is resumed by `SIGCONT`; `wait4` reports `WUNTRACED` and
-  `WCONTINUED`, and `SIGCHLD` is queued on child exit/stop/continue), and a fatal
-  `tgkill`/`kill` without a handler still ends the process cleanly (glibc `abort()` →
-  exit 134).
-  The console is a real controlling terminal: a kernel-side foreground process group
-  (`tcgetpgrp`/`tcsetpgrp` through `TIOCGPGRP`/`TIOCSPGRP`) that `lxrun` hands to its
-  child and restores to the shell on exit, `SIGTTIN` when a background job reads the
-  terminal and `SIGTTOU` when it writes with `TOSTOP` set (pagh defaults `TOSTOP` on;
-  `tcsetattr` clears it), and `^Z` stopping the terminal's whole foreground group
-  instead of only the last pid. The shell keeps a job table (`jobs`/`fg`/`bg`).
-  Not yet: no sessions/`getsid`, `tcsetattr` from a background group does not generate
-  `SIGTTOU`, and `kill(-pgid)` queues one copy on the group leader rather than one per
-  thread group (the terminal and shell stop/continue paths use a per-thread-group
-  broadcast).
+- **Статические и динамические.** Работают и статически слинкованные бинарники, и
+  glibc-dynamic: загрузчик мапит ELF-интерпретатор (`ld-linux-x86-64.so.2`) из `/mnt` (с
+  fallback-путями merged-`/usr`), и CPython 3.16 работает end-to-end. Реализованы
+  `fork`/`clone` + потоки, `epoll`/`eventfd`, unix-сокеты, vectored I/O
+  (`readv`/`writev`/…), `rename*` и настоящие process groups (`pgid` в `CompatState`,
+  `setpgid`/`getpgid`/`getpgrp`/`setsid`; `kill(0)`/`kill(-pgid)` адресуют группу).
+  Доставка POSIX-сигналов работает в точке возврата из сисколла и в точке возврата по
+  тику таймера: `rt_sigaction` ставит настоящие обработчики, доставленные сигналы строят
+  x86_64 `rt_sigframe` на пользовательском стеке, а `rt_sigreturn` восстанавливает
+  контекст; `kill(2)` (nr 62) адресует процесс, группу процессов вызывающего, группу
+  `-pgid` или каждый процесс (`kill(-1)`); `SIGSTOP`/`SIGCONT` — реальное состояние
+  планировщика (остановленная задача сохраняет свой кадр, покидает ротацию и
+  возобновляется по `SIGCONT`; `wait4` сообщает `WUNTRACED` и `WCONTINUED`, а `SIGCHLD`
+  ставится в очередь на exit/stop/continue ребёнка), и фатальный `tgkill`/`kill` без
+  обработчика всё равно чисто завершает процесс (glibc `abort()` → exit 134).
+  Консоль — настоящий управляющий терминал: kernel-side foreground process group
+  (`tcgetpgrp`/`tcsetpgrp` через `TIOCGPGRP`/`TIOCSPGRP`), который `lxrun` передаёт
+  ребёнку и восстанавливает для shell на выходе; `SIGTTIN`, когда фоновая job читает
+  терминал, и `SIGTTOU`, когда она пишет при выставленном `TOSTOP` (pagh по умолчанию
+  включает `TOSTOP`; `tcsetattr` его снимает); `^Z` останавливает всю foreground-группу
+  терминала, а не только последний pid. Shell держит таблицу jobs (`jobs`/`fg`/`bg`).
+  Пока нет: сессий/`getsid`, `tcsetattr` из фоновой группы не генерирует `SIGTTOU`, а
+  `kill(-pgid)` ставит одну копию лидеру группы, а не по одной на thread group (пути
+  stop/continue терминала и shell используют broadcast на thread group).
 
-- **Install ≠ run.** `apt install <pkg>` resolves the dependency closure, downloads each
-  `.deb`, unpacks its files onto `/mnt`, and creates tar symlinks/hardlinks as real links
-  (symlink inodes, shared inodes for hard links — issue #18). Console programs like `python3`
-  genuinely run, and full-screen TUIs do too: the VT driver emulates CSI/ECMA-48
-  sequences with `ONLCR`, `TCSETS*` applies real raw-mode (`ICANON`/`ECHO`) with
-  kernel-side echo in raw mode, honest `tcgetattr` reports terminal state, and
-  `ioctl(FIONBIO)` covers libuv's non-blocking path — `nvim` runs and saves its ShaDa.
-  A synthetic `/proc` (issue #11) serves `/proc/cpuinfo`, `/proc/meminfo`,
-  `/proc/uptime`, `/proc/stat`, `/proc/version`, `/proc/filesystems`,
-  `/proc/loadavg`, `/proc/mounts`, the read-only
-  `/proc/sys/kernel/{ostype,osrelease,hostname}` stubs, `/proc/self/*` and the
-  per-pid tree `/proc/<pid>/{cmdline,stat,status,maps,cgroup,mountinfo,limits}`
-  from live kernel state (CPUID, PMM counters, the tick clock, the scheduler's
-  task counts, the target process's `CompatState`), with
-  `readlink`/`lstat`/`getdents64` handling `/proc/self/exe` as a real symlink.
-  `/proc/<pid>/fd` exposes the fd table as numeric symlinks, and
-  `/proc/<pid>/fdinfo/<n>` reports the descriptor's real offset, open flags,
-  mount id (the same sorted mount table as mountinfo) and VFS inode — no
-  placeholder numbers; stdio/pipes/sockets, which have no VFS mount/inode,
-  report the documented 0 sentinel. `/proc/<pid>/limits` renders the 16 Linux
-  rlimit rows from the target's override table and the kernel defaults (stack
-  8 MiB, nofile 1024/1024, everything else `unlimited`). The per-thread view is
-  `/proc/<pid>/task/` (and `/proc/self/task/`): one numeric directory per live
-  scheduler task of the process's thread group, ascending tid — a thread's
-  directory is the same VFS object as `/proc/<tid>`, so `stat`, `status`,
-  `cmdline` (and the rest of the pid files) are per-thread there. Still deferred:
-  mountinfo optional fields/statfs metadata and the Linux per-thread files this
-  kernel does not model (`sched`, `syscall`, per-thread `comm`). See
-  `docs/procfs.md` for the exact contract. `/proc/loadavg` reports
-  real exponentially decayed 1/5/15-minute load averages (fixed point 16.16,
-  displayed with two decimals) plus live runnable/total counts and the last allocated
-  pid. `/proc/<pid>/maps` names the file behind each file-backed region (image
-  segments, interpreter, `mmap`s) with the same `08:00` device and inode `stat`
-  reports, and the real `mmap` file offset; `[heap]`/`[stack]`/anonymous
-  mappings keep the honest `00:00 0`. Signal
-  delivery is real both at the syscall-return point and on the timer-tick return
-  (`signal::tick_action`, so a task that never enters a syscall is still signalled).
-  See `LINUX-USERLAND.md` for the exact status.
-- **Transport.** Downloads use HTTP or HTTPS. HTTPS authenticates the peer fail-closed: the
-  server certificate chain is validated against the committed CA bundle, the hostname against
-  the leaf SAN entries, validity windows are enforced (with a hard clock gate — an unset RTC
-  refuses the handshake), and the `CertificateVerify` signature is checked against the leaf
-  key. The verifier cannot be skipped by omission either: the vendored `embedded-tls` refuses a
-  server `Finished` that was not preceded by `Certificate`/`CertificateVerify` (RFC 8446
-  §4.4.2.4), and `net::tls` independently requires its authentication counter to advance before
-  any application byte moves. Trust is limited to the bundle's four pinned roots (ISRG Root
-  X1/X2, GTS R1/R4), and revocation (CRL/OCSP) is not checked, so an HTTPS mirror outside that
-  issuance is refused rather than trusted. Repository-side trust is implemented on top of
-  that: `apt update` verifies `InRelease`/`Release.gpg` against the committed, fingerprint-pinned
-  Debian keyring (subkey bindings, expiry, revocation, 2025 clock gate) and refuses an unsigned
-  mirror outright, the `Packages` body must match the signed `SHA-256` **and** size before it is
-  decoded, and every `.deb` must match the digest from the signed index before it is unpacked.
-  Plain-HTTP mirrors (`apt setmirror http://…`) are integrity-checked by that chain although
-  their transport is unauthenticated, and live `apt update` runs over HTTPS (issue #19 closed).
-  What remains open: revocation distribution, replay of a whole old triplet on suites without
-  `Valid-Until`, and the negative MITM/digest E2E harnesses — see `SECURITY.md`.
+- **Установка ≠ запуск.** `apt install <pkg>` разрешает замыкание зависимостей, скачивает
+  каждый `.deb`, распаковывает его файлы в `/mnt` и создаёт tar-симлинки/hardlink'и
+  настоящими ссылками (symlink-inode, общие inode для hardlink'ов — issue #18). Консольные
+  программы вроде `python3` действительно работают, и полноэкранные TUI тоже: драйвер VT
+  эмулирует последовательности CSI/ECMA-48 с `ONLCR`, `TCSETS*` применяет настоящий
+  raw-mode (`ICANON`/`ECHO`) с kernel-side echo в raw-режиме, честный `tcgetattr` сообщает
+  состояние терминала, а `ioctl(FIONBIO)` покрывает non-blocking путь libuv — `nvim`
+  работает и сохраняет свой ShaDa. Синтетический `/proc` (issue #11) отдаёт
+  `/proc/cpuinfo`, `/proc/meminfo`, `/proc/uptime`, `/proc/stat`, `/proc/version`,
+  `/proc/filesystems`, `/proc/loadavg`, `/proc/mounts`, read-only заглушки
+  `/proc/sys/kernel/{ostype,osrelease,hostname}`, `/proc/self/*` и per-pid дерево
+  `/proc/<pid>/{cmdline,stat,status,maps,cgroup,mountinfo,limits}` из живого состояния
+  ядра (CPUID, счётчики PMM, тиковые часы, счётчики задач планировщика, `CompatState`
+  целевого процесса), причём `readlink`/`lstat`/`getdents64` обрабатывают `/proc/self/exe`
+  как настоящую symlink. `/proc/<pid>/fd` выставляет таблицу fd как числовые symlink'и, а
+  `/proc/<pid>/fdinfo/<n>` сообщает реальное смещение дескриптора, open flags, mount id
+  (та же отсортированная таблица mount'ов, что mountinfo) и VFS-inode — без
+  placeholder-чисел; stdio/pipes/sockets, у которых нет VFS mount/inode, сообщают
+  задокументированный сентинел 0. `/proc/<pid>/limits` рендерит 16 строк Linux rlimit из
+  таблицы override цели и значений по умолчанию ядра (стек 8 MiB, nofile 1024/1024,
+  остальное `unlimited`). Per-thread представление — `/proc/<pid>/task/` (и
+  `/proc/self/task/`): один числовой каталог на живую задачу планировщика thread group
+  процесса, по возрастанию tid — каталог потока это тот же VFS-объект, что `/proc/<tid>`,
+  поэтому `stat`, `status`, `cmdline` (и остальные pid-файлы) там per-thread. Пока
+  отложены: необязательные поля mountinfo/метаданные statfs и per-thread файлы Linux,
+  которые это ядро не моделирует (`sched`, `syscall`, per-thread `comm`). Точный контракт —
+  `docs/procfs.md`. `/proc/loadavg` сообщает реальные экспоненциально затухающие
+  1/5/15-минутные load averages (fixed point 16.16, отображаются с двумя знаками) плюс
+  живые счётчики runnable/total и последний выданный pid. `/proc/<pid>/maps` называет файл
+  за каждым file-backed регионом (сегменты образа, интерпретатор, `mmap`'ы) с тем же
+  устройством `08:00` и inode, что сообщает `stat`, и реальным смещением файла `mmap`;
+  `[heap]`/`[stack]`/анонимные маппинги сохраняют честные `00:00 0`. Доставка сигналов
+  реальна и в точке возврата из сисколла, и в точке возврата по тику таймера
+  (`signal::tick_action`, поэтому задача, вообще не входящая в сисколл, всё равно получает
+  сигнал). Точный статус — в `LINUX-USERLAND.md`.
+- **Транспорт.** Загрузки идут по HTTP или HTTPS. HTTPS аутентифицирует пира fail-closed:
+  цепочка сертификата сервера проверяется против закоммиченного CA-бандла, hostname —
+  против SAN-записей листа, применяются окна валидности (с жёстким clock gate — не
+  выставленные RTC отказывают в рукопожатии), а подпись `CertificateVerify` проверяется
+  против ключа листа. Верификатор нельзя пропустить и опущением: vendored `embedded-tls`
+  отвергает серверный `Finished`, которому не предшествовали
+  `Certificate`/`CertificateVerify` (RFC 8446 §4.4.2.4), а `net::tls` независимо требует,
+  чтобы его счётчик аутентификации продвинулся до того, как сдвинется хоть один байт
+  приложения. Доверие ограничено четырьмя запиненными корнями бандла (ISRG Root X1/X2, GTS
+  R1/R4), а revocation (CRL/OCSP) не проверяется, поэтому HTTPS-зеркало вне этой выдачи
+  отвергается, а не принимается на веру. Поверх этого реализовано доверие к репозиторию:
+  `apt update` проверяет `InRelease`/`Release.gpg` против закоммиченного, запиненного по
+  отпечатку keyring'а Debian (binding подключей, expiry, revocation, clock gate 2025) и
+  отвергает неподписанное зеркало сразу; тело `Packages` должно совпасть с подписанным
+  `SHA-256` **и** размером до декодирования, а каждый `.deb` — с дайджестом из подписанного
+  индекса до распаковки. Plain-HTTP-зеркала (`apt setmirror http://…`) проверяются этой
+  цепочкой на целостность, хотя их транспорт не аутентифицирован, а живой `apt update`
+  идёт по HTTPS (issue #19 закрыт). Что осталось открытым: распространение отзыва, replay
+  целой старой тройки на suite'ах без `Valid-Until` и негативные MITM/digest E2E-harness'ы
+  — см. `SECURITY.md`.
 
-- **Scale.** The full Debian `main` index (~60k packages, ~150 MiB decompressed) is streamed
-  and parsed into a compact in-RAM byte-arena index (kept in RAM only, rebuilt per boot).
-  End-to-end install is proven against a local mirror; a live full `apt update` from
-  `deb.debian.org` works but is slow under QEMU user-mode networking (slirp) + TCG emulation.
+- **Масштаб.** Полный Debian-индекс `main` (~60k пакетов, ~150 MiB в разжатом виде)
+  потоково парсится в компактный in-RAM byte-arena индекс (держится только в RAM,
+  пересобирается каждую загрузку). End-to-end установка доказана на локальном зеркале;
+  живой полный `apt update` с `deb.debian.org` работает, но медленный под QEMU user-mode
+  networking (slirp) + TCG-эмуляцией.
 
 ---
 
-## Architecture
+## Архитектура
 
 ```
 Limine ──hands off──▶ _start (lib.rs) ──▶ boot::start()  (ordered init steps)
@@ -742,10 +740,10 @@ arch::cpu       gdt/idt         memory      apic      drivers      fs / net    v
                                                       pci, virtio)
 ```
 
-The kernel is built as a `staticlib` (`libpagh.a`) and linked into a higher-half ELF
-(load address `0xffffffff80000000`, set by `linker.ld`).
+Ядро собирается как `staticlib` (`libpagh.a`) и линкуется в higher-half ELF (адрес
+загрузки `0xffffffff80000000`, задаётся `linker.ld`).
 
-### Source layout
+### Раскладка исходников
 
 ```
 src/
@@ -852,223 +850,226 @@ src/
     └── unwind.rs       # heap-free RBP-chain stack trace for panics
 ```
 
-### Design notes
+### Заметки о дизайне
 
-- **Safe abstraction layer.** Privileged instructions are funneled through `arch::cpu`;
-  no module outside `arch` contains inline `asm!` except the unavoidable `task::switch`
-  stubs and the GDT segment reload. Global mutable state (GDT/TSS/IDT, APIC MMIO bases,
-the serial port) is reached through `SyncUnsafeCell` raw pointers or atomics rather than
-references to `static mut`, so the tree avoids `static_mut_refs`
-hazards. The `unsafe` that remains is documented with `// SAFETY:`
-comments.
-- **Memory.** `memory::layout` centralizes fixed virtual regions. The PMM reserves the
-  kernel image, the bitmap's own frames, and everything below 1 MB, and offers
-  contiguous-frame allocation for DMA. `free_frame`/`free_frames_contiguous` refuse to
-  return any reserved frame (below 1 MB, kernel image, or the bitmap itself) to the
-  allocatable pool, so a stray free cannot corrupt the pool. The VMM propagates
-  `USER_ACCESSIBLE` through intermediate page tables and exposes `map`/`map_mmio`/
-  `unmap` plus the COW fork helpers (`fork_user_space_cow`/`cow_copy_page`). The global
-  heap allocator is an IRQ-safe wrapper over
-  galloc (interrupts are disabled while the allocator lock is held), so allocation from
-  interrupt context can never deadlock the kernel.
-- **Storage.** virtio-blk presents a `BlockDevice` that reports its real capacity via
-  `sector_count`. The ext2 layer sizes the filesystem from that capacity across multiple
-  32768-block groups (with backup superblocks/group descriptors and free-count
-  reconciliation on mount), and routes every mutating write (data, inode, bitmap, dirent)
-  through the WAL journal; large file writes are split into bounded per-transaction chunks
-  so any file size fits the fixed journal area. `recover()` replays committed transactions
-  on mount and discards torn ones, giving crash consistency. The image is plain ext2, so it can be inspected on the host.
-- **DMA.** The kernel heap maps one independently-allocated physical frame per virtual
-  page, so a multi-page buffer is virtually contiguous but physically fragmented. The
-  `virtio` HAL detects this and, for fragmented buffers, hands the device a
-  physically-contiguous bounce buffer, copying bytes in on `share` and back out on
-  `unshare` per the transfer direction; already-contiguous buffers take the direct path.
-- **Networking.** The stack is written from scratch: an e1000 NIC driver (polled, no
-  IRQs) feeds Ethernet/ARP, IPv4 (fragment reassembly on RX, fragmentation on TX),
-  ICMP, UDP+DHCP, and a full TCP implementation (state machine, sliding window with
-  RFC 7323 scaling, MSS negotiation, Jacobson/Karels RTO with Karn retransmission,
-  Reno congestion control with fast retransmit). A dedicated kernel thread runs the
-  poll loop; addressing is DHCPv4 with a static fallback. Outbound package
-  fetches add a pure DNS resolver, a pure HTTP/1.1 client, and an HTTPS path over TLS 1.3
-  (`embedded-tls`) — the TLS path verifies the server certificate chain against the
-  committed CA bundle, matches the hostname against SAN entries, enforces validity with a
-  clock gate, and checks the handshake `CertificateVerify` signature; a failure aborts the
-  handshake. The development build enables the transport through the default `network_packages` feature; use `--no-default-features` for a build with no outbound package transport at all.
-- **Shell.** The interactive loop is the only place that touches the keyboard, console,
-  and VFS; all the interesting logic (path normalization, the line-editor model, history,
-  completion, the scancode decoder, edit distance) is pure and property-tested. A single
-  `CommandSpec` registry drives both dispatch and `help`.
-- **Scheduling.** A ~1 kHz LAPIC timer preempts via `irq32_stub`. The preemptive tick,
-  the cooperative `SYS_YIELD` path, and a freshly spawned kernel thread all use one
-  identical saved-frame layout, so a task suspended by any path resumes correctly through
-  any other. Kernel threads and ring-3 tasks share this frame; the idle task (pid 0) is
-  explicit. The cooperative switch saves its frame with interrupts disabled (matching the
-  timer stub's IF=0 restore window), so a context is always restored interrupt-atomically
-  and a timer tick can never corrupt a partially-restored frame. Exiting kernel threads
-  park in an interrupt-enabled `sti; hlt` loop until the scheduler reaps them, so thread
-  exit can never freeze the machine.
-- **User mode.** `task::process` loads an ELF into a fresh user PML4, programs `TSS.RSP0`,
-  and builds an `iret` frame that drops to ring 3. System calls use `int 0x80`
-  (`rax`=number, `rdi/rsi/rdx`=args).
-- **Linux binaries.** A Linux x86_64 syscall layer (`int 0x80` + `syscall` → a single
-  dispatcher) plus an ELF loader for static `ET_EXEC`, static-PIE, and `PT_INTERP` dynamic images, a
-  SysV initial stack/auxv builder, and per-process compat state (fd table, VM regions) let
-  Linux programs — including glibc-dynamic ones such as CPython 3.16 — run in ring 3
-  (`lxrun`). `clone` covers both thread and fork paths (real address-space fork via
-  `fork_linux_process`), `epoll`/`eventfd` and unix sockets are backed by real
-  implementations, and the VT driver gives TUIs a terminal. POSIX signal delivery is
-  implemented (`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`, `kill(2)` with process
-  groups, `SIGSTOP`/`SIGCONT`, `SIGCHLD`, delivery at both the syscall return and the
-  timer-tick return), and `futex` supports glibc locking.
-- **Packages (apt).** `apt` fetches a Debian `Packages` index and parses it incrementally
-  from a streaming gzip/xz/zstd decompressor into a **compact byte-arena index** — one
-  growable byte arena plus `(offset,len)` references and integer-keyed sorted lookup tables,
-  instead of hundreds of thousands of per-field `String`s — so the full `main` index fits in
-  bounded RAM. The streaming stanza parser itself reuses one fixed `String` slot per field
-  and `clear()`s them between stanzas, so it does **no** per-stanza heap alloc/free; combined
-  with a size-binned global allocator (`good_memory_allocator`/galloc, replacing
-  `linked_list_allocator`), index parsing stays ~O(n) instead of degrading to O(n²) on the
-  allocator free-list — the earlier symptom that looked like a hang and corrupted the heap.
-  A pure resolver produces a dependency-first plan, then each `.deb` is fetched, its
-  `data.tar` unpacked, and files written onto ext2 `/mnt`.
-- **Input & graphics.** The PS/2 keyboard (IRQ1) and mouse (IRQ12) are routed through the
-  I/O APIC. The mouse driver assembles 3-byte packets and maintains an absolute,
-  screen-clamped position. The framebuffer driver offers 2D primitives over the
-  Limine-provided linear framebuffer; the software cursor saves/restores the pixels under
-  the arrow so it leaves no trail, and `paint` composites onto an in-heap canvas it can
-  read back (preview, flood fill, undo, save/load).
+- **Слой безопасных абстракций.** Привилегированные инструкции проходят через `arch::cpu`;
+  ни один модуль вне `arch` не содержит inline `asm!`, кроме неизбежных заглушек
+  `task::switch` и перезагрузки сегментов GDT. Глобальное изменяемое состояние
+  (GDT/TSS/IDT, MMIO-базы APIC, serial-порт) достигается через raw-указатели
+  `SyncUnsafeCell` или атомики, а не через ссылки на `static mut`, поэтому дерево избегает
+  опасностей `static_mut_refs`. Оставшийся `unsafe` документирован комментариями
+  `// SAFETY:`.
+- **Память.** `memory::layout` централизует фиксированные виртуальные регионы. PMM
+  резервирует образ ядра, собственные кадры битмапа и всё ниже 1 MB, а также предлагает
+  выделение смежных кадров для DMA. `free_frame`/`free_frames_contiguous` отказываются
+  возвращать в аллоцируемый пул любой зарезервированный кадр (ниже 1 MB, образ ядра или сам
+  битмап), поэтому случайное освобождение не может испортить пул. VMM распространяет
+  `USER_ACCESSIBLE` через промежуточные таблицы страниц и предоставляет
+  `map`/`map_mmio`/`unmap` плюс COW-хелперы fork (`fork_user_space_cow`/`cow_copy_page`).
+  Глобальный аллокатор кучи — IRQ-safe обёртка над galloc (прерывания выключены, пока
+  удерживается лок аллокатора), поэтому выделение из контекста прерывания никогда не может
+  задеадлочить ядро.
+- **Хранилище.** virtio-blk предоставляет `BlockDevice`, который сообщает реальную ёмкость
+  через `sector_count`. Слой ext2 выводит размер файловой системы из этой ёмкости на
+  нескольких группах по 32768 блоков (с резервными superblock'ами/group descriptor'ами и
+  сверкой свободных счётчиков при mount) и проводит каждую мутирующую запись (данные,
+  inode, bitmap, dirent) через журнал WAL; большие записи файлов делятся на ограниченные
+  порции на транзакцию, чтобы любой размер файла помещался в фиксированную область журнала.
+  `recover()` проигрывает закоммиченные транзакции при mount и отбрасывает порванные, давая
+  консистентность после краша. Образ — обычный ext2, поэтому его можно inspect'ить на
+  хосте.
+- **DMA.** Куча ядра мапит один независимо выделенный физический кадр на виртуальную
+  страницу, поэтому многостраничный буфер виртуально непрерывен, но физически
+  фрагментирован. HAL `virtio` это детектирует и для фрагментированных буферов отдаёт
+  устройству физически непрерывный bounce buffer, копируя байты внутрь на `share` и обратно
+  на `unshare` в соответствии с направлением передачи; уже непрерывные буферы идут прямым
+  путём.
+- **Сеть.** Стек написан с нуля: драйвер NIC e1000 (опрашиваемый, без IRQ) подаёт
+  Ethernet/ARP, IPv4 (сборка фрагментов на RX, фрагментация на TX), ICMP, UDP+DHCP и полную
+  реализацию TCP (state machine, sliding window с RFC 7323 scaling, согласование MSS,
+  Jacobson/Karels RTO с ретрансмиссией Karn, Reno congestion control с fast retransmit).
+  Выделенный поток ядра крутит poll-цикл; адресация — DHCPv4 со статическим fallback.
+  Исходящие загрузки пакетов добавляют чистый DNS-резолвер, чистый HTTP/1.1-клиент и
+  HTTPS-путь по TLS 1.3 (`embedded-tls`) — TLS-путь проверяет цепочку сертификата сервера
+  против закоммиченного CA-бандла, сопоставляет hostname с SAN-записями, применяет
+  валидность с clock gate и проверяет подпись `CertificateVerify` рукопожатия; ошибка
+  прерывает рукопожатие. Development-сборка включает транспорт через фичу по умолчанию
+  `network_packages`; используйте `--no-default-features` для сборки вообще без исходящего
+  пакетного транспорта.
+- **Shell.** Интерактивный цикл — единственное место, которое трогает клавиатуру, консоль и
+  VFS; вся интересная логика (нормализация путей, модель редактора строки, история,
+  completion, декодер сканкодов, edit distance) чистая и покрыта property-тестами. Единый
+  реестр `CommandSpec` управляет и диспетчеризацией, и `help`.
+- **Планирование.** LAPIC-таймер ~1 кГц вытесняет через `irq32_stub`. Вытесняющий тик,
+  кооперативный путь `SYS_YIELD` и только что порождённый поток ядра используют одну
+  одинаковую раскладку сохранённого кадра, поэтому задача, приостановленная любым путём,
+  корректно возобновляется через любой другой. Потоки ядра и ring-3-задачи делят этот кадр;
+  idle-задача (pid 0) явная. Кооперативное переключение сохраняет кадр с выключенными
+  прерываниями (совпадая с окном восстановления IF=0 у тиковой заглушки), поэтому контекст
+  всегда восстанавливается атомарно по прерываниям и тик таймера никогда не может испортить
+  частично восстановленный кадр. Завершающиеся потоки ядра паркуются в цикле `sti; hlt` с
+  включёнными прерываниями, пока планировщик их не соберёт, поэтому выход потока никогда не
+  может заморозить машину.
+- **User mode.** `task::process` загружает ELF в свежий пользовательский PML4, программирует
+  `TSS.RSP0` и строит кадр `iret`, который сбрасывает в ring 3. Сисколлы используют
+  `int 0x80` (`rax`=номер, `rdi/rsi/rdx`=аргументы).
+- **Linux-бинарники.** Слой Linux x86_64-сисколлов (`int 0x80` + `syscall` → единый
+  диспетчер) плюс ELF-загрузчик для статических `ET_EXEC`, static-PIE и `PT_INTERP`
+  динамических образов, сборщик начального стека/auxv SysV и per-process compat state
+  (таблица fd, VM-регионы) позволяют Linux-программам — включая glibc-dynamic, такие как
+  CPython 3.16, — работать в ring 3 (`lxrun`). `clone` покрывает и потоки, и fork-пути
+  (реальный fork адресного пространства через `fork_linux_process`), `epoll`/`eventfd` и
+  unix-сокеты опираются на реальные реализации, а драйвер VT даёт TUI терминал. Доставка
+  POSIX-сигналов реализована (`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`, `kill(2)` с
+  process groups, `SIGSTOP`/`SIGCONT`, `SIGCHLD`, доставка и в возврате из сисколла, и в
+  возврате по тику), а `futex` поддерживает блокировки glibc.
+- **Пакеты (apt).** `apt` скачивает Debian-индекс `Packages` и парсит его инкрементально из
+  потокового gzip/xz/zstd-декомпрессора в **компактный byte-arena индекс** — одна
+  растущая байтовая арена плюс ссылки `(offset,len)` и отсортированные таблицы поиска по
+  целочисленным ключам вместо сотен тысяч per-field `String` — поэтому полный индекс `main`
+  помещается в ограниченную RAM. Сам потоковый парсер станс переиспользует один
+  фиксированный слот `String` на поле и `clear()`-ит их между стансами, поэтому **не**
+  делает heap alloc/free на каждую стансу; вместе с size-binned глобальным аллокатором
+  (`good_memory_allocator`/galloc вместо `linked_list_allocator`) разбор индекса остаётся
+  ~O(n), а не деградирует до O(n²) на free-list аллокатора — прежний симптом выглядел как
+  зависание и портил кучу. Чистый резолвер строит план «сначала зависимости», затем каждый
+  `.deb` скачивается, его `data.tar` распаковывается, а файлы пишутся на ext2 `/mnt`.
+- **Ввод и графика.** PS/2-клавиатура (IRQ1) и мышь (IRQ12) маршрутизируются через I/O
+  APIC. Драйвер мыши собирает 3-байтные пакеты и поддерживает абсолютную, прижатую к экрану
+  позицию. Драйвер framebuffer предлагает 2D-примитивы поверх линейного framebuffer'а
+  Limine; программный курсор сохраняет/восстанавливает пиксели под стрелкой, поэтому не
+  оставляет шлейфа, а `paint` компонует в in-heap canvas, который умеет читать обратно
+  (превью, flood fill, undo, save/load).
 
 ---
 
-## Correctness properties & testing
+## Свойства корректности и тестирование
 
-The kernel ships an in-QEMU harness (`src/test.rs`): `all_tests()` lists dozens of
-routines, of which the 29 numbered correctness properties (P1–P29) are the core — the
-rest are issue-regression routines (signals, job control, USB HID, NVMe PRP lists,
-procfs, and so on). Each property routine runs ≥100 randomized iterations against pure
-logic or a RAM-mock device (no hardware dependency). Run them from the shell with
-`selftest`; results print over serial as `ok`/`FAIL` lines.
+Ядро поставляет in-QEMU harness (`src/test.rs`): `all_tests()` перечисляет десятки рутин,
+из которых 29 нумерованных свойств корректности (P1–P29) — ядро; остальные — рутины
+регрессии issue (сигналы, job control, USB HID, PRP-списки NVMe, procfs и так далее).
+Каждая рутина свойства прогоняет ≥100 рандомизированных итераций против чистой логики или
+RAM-mock-устройства (без зависимости от железа). Запускайте их из shell командой
+`selftest`; результаты печатаются по serial строками `ok`/`FAIL`.
 
-For logic that is cleanly extractable to the host, a separate, workspace-excluded
-`host-tests/` crate runs [`proptest`](https://crates.io/crates/proptest)-based property
-tests with `cargo test` (it builds for the host triple, not the bare-metal target). Run
-it from that directory:
+Для логики, чисто извлекаемой на хост, отдельный, исключённый из workspace крейт
+`host-tests/` прогоняет property-тесты на [`proptest`](https://crates.io/crates/proptest)
+через `cargo test` (собирается под хост-трипл, а не под bare-metal target). Запуск из этого
+каталога:
 
 ```sh
 cd host-tests && cargo test
 ```
 
-The host suite carries the numbered property modules `p01`–`p56` plus named modules for
-the areas added since (`tty_job`, `kill_target`, `ext2_links`, `link_walk_paths`,
-`nvme_io`, `at_random`, `signal_stop`, the `procfs_*` family, …). Beyond the kernel-core
-properties listed below it covers the Linux-compat and package logic added since: the ELF
-classifier and static-PIE bias, the SysV stack/auxv encoder, fd-number bookkeeping, DNS
-query/response and HTTP head parsing, `.deb`/`ar`/`tar` handling, gzip/xz/zstd decode
-round-trips, and the `apt` index/resolver — including the compact arena index checked for
-query-equivalence against a reference `String`-backed model.
+Host-набор несёт нумерованные модули свойств `p01`–`p56` плюс именованные модули для
+областей, добавленных позже (`tty_job`, `kill_target`, `ext2_links`, `link_walk_paths`,
+`nvme_io`, `at_random`, `signal_stop`, семейство `procfs_*`, …). Сверх перечисленных ниже
+свойств ядра он покрывает добавленную позже логику Linux-compat и пакетов: классификатор
+ELF и static-PIE bias, сборщик стека/auxv SysV, учёт fd-номеров, парсинг DNS-запросов/
+ответов и HTTP-head, обработку `.deb`/`ar`/`tar`, round-trip'ы декодирования gzip/xz/zstd
+и индекс/резолвер `apt` — включая компактный arena-индекс, проверенный на эквивалентность
+запросов против reference-модели на `String`.
 
-| #     | Property                                                            |
+| #     | Свойство                                                            |
 |-------|---------------------------------------------------------------------|
-| P1    | PMM allocate/free round-trip conserves the free count               |
-| P2    | PMM never allocates reserved memory (< 1 MB, kernel, bitmap)        |
-| P3    | VMM map → translate → unmap consistency                             |
-| P4    | `USER_ACCESSIBLE` propagates to intermediate page tables            |
-| P5    | Heap allocations are non-overlapping and aligned                    |
-| P6    | Spinlock restores the interrupt flag on release                     |
-| P7    | Context-switch frame layout matches the restore order               |
-| P8    | ELF loader rejects malformed binaries (no panic / no map)           |
-| P9    | Logging level filter monotonicity                                   |
-| P10   | Journal replay reaches the committed post-state (atomic commit)     |
-| P11   | Uncommitted transactions leave the pre-state (atomicity)            |
-| P12   | Journal replay idempotence                                          |
-| P13   | Journal record integrity detects corruption                        |
-| P14   | Block read/write round-trip                                         |
-| P15   | Contiguous frame allocation is non-overlapping and contiguous       |
-| P16   | Virtqueue buffers are never aliased (no double-use)                 |
-| P17   | NIC poll preserves frames (no loss under bounded buffering)         |
-| P18   | Filesystem operation round-trip through the VFS                     |
-| P19   | ext2 directory entry `rec_len`/`name_len` round-trip + tiling       |
-| P20   | Freshly formatted ext2 superblock is valid and self-consistent      |
-| P21   | Path normalization is canonical, idempotent, and never escapes root |
-| P22   | Line-editor buffer/cursor invariants hold under arbitrary edits     |
-| P23   | History recall round-trips and stays bounded and deduplicated       |
-| P24   | Tab completion uses the true longest common prefix                  |
-| P25   | Extended scancodes decode to navigation keys, never to characters   |
-| P26   | Typo suggestion picks a true nearest command                        |
-| P27   | The decoder and editor never panic on arbitrary input               |
-| P28   | The blinking caret cell tracks the logical cursor                   |
-| P29   | A mouse selection range maps to the console's line indices          |
+| P1    | Round-trip allocate/free PMM сохраняет число свободных кадров        |
+| P2    | PMM никогда не выделяет зарезервированную память (< 1 MB, ядро, bitmap) |
+| P3    | Согласованность VMM map → translate → unmap                         |
+| P4    | `USER_ACCESSIBLE` распространяется на промежуточные таблицы страниц  |
+| P5    | Выделения кучи не перекрываются и выровнены                          |
+| P6    | Spinlock восстанавливает флаг прерываний при освобождении           |
+| P7    | Раскладка кадра переключения контекста совпадает с порядком восстановления |
+| P8    | Загрузчик ELF отвергает malformed-бинарники (без panic/без маппинга) |
+| P9    | Монотонность фильтра уровня логирования                             |
+| P10   | Replay журнала достигает закоммиченного post-state (атомарный коммит) |
+| P11   | Незакоммиченные транзакции оставляют pre-state (атомарность)          |
+| P12   | Идемпотентность replay журнала                                      |
+| P13   | Целостность записи журнала обнаруживает повреждение                  |
+| P14   | Round-trip чтения/записи блока                                      |
+| P15   | Выделение смежных кадров не перекрывается и смежно                  |
+| P16   | Буферы virtqueue никогда не алиасятся (нет двойного использования)   |
+| P17   | Poll NIC сохраняет кадры (нет потерь при ограниченной буферизации)   |
+| P18   | Round-trip файловой операции через VFS                              |
+| P19   | Round-trip `rec_len`/`name_len` dirent ext2 + тайлинг                |
+| P20   | Свежеотформатированный superblock ext2 валиден и самосогласован       |
+| P21   | Нормализация путей канонична, идемпотентна и не выходит за root       |
+| P22   | Инварианты буфера/курсора редактора строки при произвольных правках  |
+| P23   | Round-trip recall истории, ограниченность и дедупликация              |
+| P24   | Tab completion использует истинный longest common prefix             |
+| P25   | Расширенные сканкоды декодируются в навигационные клавиши, не в символы |
+| P26   | Подсказка опечатки выбирает истинно ближайшую команду                |
+| P27   | Декодер и редактор никогда не паникуют на произвольном вводе         |
+| P28   | Ячейка мигающей каретки отслеживает логический курсор                |
+| P29   | Диапазон выделения мышью мапится в индексы строк консоли             |
 
 ---
 
-## Build constraints
+## Ограничения сборки
 
-These are required and preserved across the codebase:
+Они обязательны и сохраняются по всей кодовой базе:
 
-- `#![no_std]`, `panic = "abort"` (dev and release).
-- Custom target `x86_64-unknown-none.json` with `build-std = [core, compiler_builtins, alloc]`.
-- Limine request statics live in the `.requests` section.
-- Higher-half load address `0xffffffff80000000` (`linker.ld`).
-- Frame pointers forced on (`-Cforce-frame-pointers=yes`) for the panic stack trace.
-- The kernel is compiled **soft-float** (`"rustc-abi": "softfloat"`; SSE/AVX disabled in
-  the target spec): syscalls, interrupts, and context switches never touch user
-  XMM/MXCSR state, which the Linux syscall ABI requires to be preserved.
+- `#![no_std]`, `panic = "abort"` (dev и release).
+- Кастомный target `x86_64-unknown-none.json` с `build-std = [core, compiler_builtins, alloc]`.
+- Статики Limine request живут в секции `.requests`.
+- Higher-half адрес загрузки `0xffffffff80000000` (`linker.ld`).
+- Frame pointers включены принудительно (`-Cforce-frame-pointers=yes`) для panic-стектрейса.
+- Ядро собрано **soft-float** (`"rustc-abi": "softfloat"`; SSE/AVX отключены в спецификации
+  target): сисколлы, прерывания и переключения контекста никогда не трогают пользовательское
+  состояние XMM/MXCSR, которое ABI Linux-сисколлов требует сохранять.
 
-### Key dependencies
+### Ключевые зависимости
 
-- [`acpi`](https://crates.io/crates/acpi) — MADT parsing.
-- [`good_memory_allocator`](https://crates.io/crates/good_memory_allocator) — kernel heap (galloc; size-binned, ~O(1) alloc/free).
-- [`virtio-drivers`](https://crates.io/crates/virtio-drivers) — virtio-blk storage.
-- The TCP/IP stack and the e1000 driver are the kernel's own code (`src/net`, `src/drivers/e1000.rs`).
-- [`embedded-tls`](https://crates.io/crates/embedded-tls) — TLS 1.3 client for HTTPS (driven through the kernel's own fail-closed verifier).
-- [`miniz_oxide`](https://crates.io/crates/miniz_oxide) / [`xz4rust`](https://crates.io/crates/xz4rust) / [`ruzstd`](https://crates.io/crates/ruzstd) — gzip / xz / zstd decompression for `.deb`s and the package index.
-- [`proptest`](https://crates.io/crates/proptest) — host-side property tests (dev-dependency; `host-tests/`).
+- [`acpi`](https://crates.io/crates/acpi) — разбор MADT.
+- [`good_memory_allocator`](https://crates.io/crates/good_memory_allocator) — куча ядра (galloc; size-binned, ~O(1) alloc/free).
+- [`virtio-drivers`](https://crates.io/crates/virtio-drivers) — хранилище virtio-blk.
+- Стек TCP/IP и драйвер e1000 — собственный код ядра (`src/net`, `src/drivers/e1000.rs`).
+- [`embedded-tls`](https://crates.io/crates/embedded-tls) — TLS 1.3-клиент для HTTPS (управляется собственным fail-closed верификатором ядра).
+- [`miniz_oxide`](https://crates.io/crates/miniz_oxide) / [`xz4rust`](https://crates.io/crates/xz4rust) / [`ruzstd`](https://crates.io/crates/ruzstd) — gzip / xz / zstd-декомпрессия для `.deb` и индекса пакетов.
+- [`proptest`](https://crates.io/crates/proptest) — host-side property-тесты (dev-dependency; `host-tests/`).
 
 ---
 
-## Repository hygiene
+## Гигиена репозитория
 
-Generated, large, or environment-specific files are git-ignored (see `.gitignore`):
+Сгенерированные, крупные или специфичные для окружения файлы git-ignored (см. `.gitignore`):
 `target/`, `host-tests/target/`, `iso_root/`, `PAGH.elf`, `disk.img`, `OVMF.fd`,
-any `limine*/` loader tree, QEMU runtime logs, and editor/IDE folders (`.vscode/`, `.kiro/`,
-`.idea/`).
+любое дерево загрузчика `limine*/`, runtime-логи QEMU и папки редакторов/IDE (`.vscode/`,
+`.kiro/`, `.idea/`).
 
-`OVMF.fd` is kept on disk but ignored — it is downloaded locally and required by
-`run.cmd`. The Limine loader is fetched automatically into `limine/` by
-`tools/limine.py` when no local tree is present. `disk.img` is created automatically
-on first run.
-
----
-
-## Branching and releases
-
-`main` is the stable branch; `dev` is the experimental integration branch and
-carries the next release. Feature and fix PRs target `dev`. Release candidates are
-tagged from `dev` and only as `vX.Y.Z-rc.N` (there is no `-pre.N` channel); stable
-releases are tagged `vX.Y.Z` from `main`. A hotfix — limited to a critical/high
-verified security finding or a release-blocking regression — branches from `main`,
-ships straight to stable without an RC, and is merged back into `dev`. The release
-workflow refuses a tag cut from the wrong branch or one whose base version
-disagrees with `Cargo.toml`, and publishes the kernel (`pagh-vX.Y.Z.elf`) plus a
-checksummed source archive. See [BRANCHING.md](BRANCHING.md) for the model and
-[RELEASING.md](RELEASING.md) for the release checklist.
+`OVMF.fd` хранится на диске, но игнорируется — он скачивается локально и требуется
+`run.cmd`. Загрузчик Limine автоматически скачивается в `limine/` через `tools/limine.py`,
+когда локального дерева нет. `disk.img` создаётся автоматически при первом запуске.
 
 ---
 
-## Contributing
+## Ветвление и релизы
 
-Contributions are welcome. Please read the contributing guide before opening a PR — it
-covers the toolchain setup, the build/run pipeline, the two-tier test story (in-QEMU
-`selftest` + host `proptest`), and the build invariants that must be preserved:
+`main` — стабильная ветка; `dev` — экспериментальная интеграционная ветка и несёт
+следующий релиз. Feature- и fix-PR целятся в `dev`. Release candidates тегируются из `dev`
+и только как `vX.Y.Z-rc.N` (канала `-pre.N` нет); стабильные релизы тегируются `vX.Y.Z` из
+`main`. Hotfix — ограниченный critical/high verified security finding или регрессией,
+блокирующей релиз, — ответвляется от `main`, выходит сразу в stable без RC и сливается
+обратно в `dev`. Release workflow отвергает тег, срезанный не с той ветки, или тег, чья
+базовая версия не совпадает с `Cargo.toml`, и публикует ядро (`pagh-vX.Y.Z.elf`) плюс
+архив исходников с контрольной суммой. Модель — в [BRANCHING.md](BRANCHING.md), чек-лист
+релиза — в [RELEASING.md](RELEASING.md).
+
+---
+
+## Участие в проекте
+
+Вклад приветствуется. Пожалуйста, прочитайте руководство для контрибьюторов перед
+открытием PR — оно покрывает настройку тулчейна, конвейер сборки/запуска, двухуровневую
+историю тестов (in-QEMU `selftest` + host `proptest`) и инварианты сборки, которые нужно
+сохранять:
 
 - [`CONTRIBUTING.en.md`](CONTRIBUTING.en.md) (English)
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) (Русский)
 
-Bug reports and feature requests use the issue templates under
-[`.github/ISSUE_TEMPLATE`](.github/ISSUE_TEMPLATE); pull requests get a checklist from
+Баг-репорты и запросы фич используют шаблоны issue в
+[`.github/ISSUE_TEMPLATE`](.github/ISSUE_TEMPLATE); pull request'ы получают чек-лист из
 [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md).
 
 ## License
 
 Licensed under the [MIT License](LICENSE).
-
