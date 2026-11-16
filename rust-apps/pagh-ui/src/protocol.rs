@@ -1436,4 +1436,106 @@ mod tests {
         );
         assert_eq!(FrameFormat::from_welcome_flags(0), FrameFormat::Xrgb8888);
     }
+
+    #[test]
+    fn shm_messages_roundtrip_with_header_flags() {
+        let offer = Message::ShmOffer {
+            window_id: 7,
+            width: 320,
+            height: 200,
+            format: FrameFormat::Xrgb8888.to_wire(),
+            stride: 1280,
+            flags: 0,
+        };
+        let encoded = offer.encode();
+        assert_eq!(u16::from_le_bytes(encoded[6..8].try_into().unwrap()), 0);
+        let mut reader = MessageReader::new();
+        reader.push(&encoded);
+        assert_eq!(reader.next().unwrap(), Some(offer));
+
+        let ready = Message::ShmReady {
+            window_id: 7,
+            generation: 3,
+        };
+        let mut reader = MessageReader::new();
+        reader.push(&ready.encode());
+        assert_eq!(reader.next().unwrap(), Some(ready));
+
+        let release = Message::ShmRelease {
+            window_id: 7,
+            generation: 2,
+        };
+        let mut reader = MessageReader::new();
+        reader.push(&release.encode());
+        assert_eq!(reader.next().unwrap(), Some(release));
+
+        let commit = Message::CommitShm {
+            window_id: 7,
+            generation: 3,
+            rects: vec![(1, 2, 3, 4), (10, 20, 30, 40)],
+        };
+        let encoded = commit.encode();
+        assert_eq!(
+            u16::from_le_bytes(encoded[6..8].try_into().unwrap()),
+            header_flags::SHM
+        );
+        let mut reader = MessageReader::new();
+        reader.push(&encoded);
+        assert_eq!(reader.next().unwrap(), Some(commit));
+
+        let damage = Message::DamageShm {
+            window_id: 7,
+            generation: 3,
+            rects: vec![(0, 0, 5, 6)],
+        };
+        let mut reader = MessageReader::new();
+        reader.push(&damage.encode());
+        assert_eq!(reader.next().unwrap(), Some(damage));
+    }
+
+    #[test]
+    fn shm_header_flag_is_only_valid_for_commit_and_damage() {
+        for kind in [
+            types::HELLO,
+            types::SHM_OFFER,
+            types::SHM_READY,
+            types::SHM_RELEASE,
+        ] {
+            let mut header = [0u8; HEADER_LEN];
+            header[..4].copy_from_slice(&MAGIC);
+            header[4..6].copy_from_slice(&kind.to_le_bytes());
+            header[6..8].copy_from_slice(&header_flags::SHM.to_le_bytes());
+            header[8..12].copy_from_slice(&0u32.to_le_bytes());
+            assert!(
+                matches!(Header::parse(&header), Err(ProtocolError::ReservedFlags(_))),
+                "kind {kind} must reject the SHM header flag"
+            );
+        }
+        let unknown = header_flags::SHM | (1 << 1);
+        let mut header = [0u8; HEADER_LEN];
+        header[..4].copy_from_slice(&MAGIC);
+        header[4..6].copy_from_slice(&types::COMMIT.to_le_bytes());
+        header[6..8].copy_from_slice(&unknown.to_le_bytes());
+        header[8..12].copy_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            Header::parse(&header),
+            Err(ProtocolError::ReservedFlags(flags)) if flags == unknown
+        ));
+    }
+
+    #[test]
+    fn shm_commit_rejects_too_many_rects() {
+        let payload_len = 12 + (MAX_DAMAGE_RECTS + 1) * 12;
+        let mut payload = Vec::with_capacity(payload_len);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&((MAX_DAMAGE_RECTS + 1) as u32).to_le_bytes());
+        for _ in 0..=MAX_DAMAGE_RECTS {
+            payload.extend_from_slice(&[0u8; 12]);
+        }
+        assert!(matches!(
+            Message::decode_with_flags(types::COMMIT, header_flags::SHM, &payload),
+            Err(ProtocolError::BadPayload(_))
+        ));
+    }
 }

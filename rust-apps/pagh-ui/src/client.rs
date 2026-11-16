@@ -355,7 +355,17 @@ impl DesktopClient {
     }
 
     /// Отправить полный кадр поверхности окна.
+    ///
+    /// `canvas` обязан быть обычным RGBA-холстом; для `ShmSurface` используйте
+    /// [`DesktopClient::commit_shm`] — у неё другой порядок пикселей и не нужен
+    /// аплоад.
     pub fn commit(&mut self, window_id: u32, canvas: &Canvas) -> io::Result<()> {
+        if canvas.is_shared() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "shared surface must be committed with commit_shm",
+            ));
+        }
         self.commit_rgba(
             window_id,
             canvas.width() as u32,
@@ -491,6 +501,8 @@ impl DesktopClient {
             generation: old_generation,
         });
         self.generation = generation;
+        self.width = size.w as u32;
+        self.height = size.h as u32;
         *frame = new_frame;
         Ok(true)
     }

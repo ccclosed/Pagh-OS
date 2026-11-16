@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn tracker_resize_requests_full_frame() {
-        let mut canvas = Canvas::filled(32, 32, crate::color::Color::BLACK);
+        let canvas = Canvas::filled(32, 32, crate::color::Color::BLACK);
         let mut tracker = DamageTracker::for_canvas(&canvas);
         let _ = tracker.update(&canvas);
         let bigger = Canvas::filled(48, 32, crate::color::Color::BLACK);

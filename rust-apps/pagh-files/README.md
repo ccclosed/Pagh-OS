@@ -127,15 +127,22 @@ cargo run --manifest-path ../pagh-desktop/Cargo.toml --bin pagh-desktop -- \
 cargo run -- --connect /tmp/pagh-desktop.sock --path /home/user --size 1000x600
 ```
 
-Протокол — PDP/1: `hello` → `welcome`, `create`, `commit` (полный кадр
-XRGB8888/RGB565), `configure`/`input`/`focus`, `close`, `launch`. Приложение
-перерисовывает кадр только после событий.
+Протокол — PDP/1: `hello` → `welcome`, `create`, затем либо `commit` (полный
+кадр XRGB8888/RGB565) для legacy-сервера, либо `shm_offer`/`shm_ready` и
+`commit` с `flags=SHM`, где по сокету едут только damage-прямоугольники
+(пиксели — в memfd). `configure` пересоздаёт shm-поколение (старое уходит
+`shm_release`) или меняет RGBA-холст; `input`/`focus`/`close`/`launch` — как в
+v1. Приложение перерисовывает кадр только после событий, а
+`damage::DamageTracker` сравнивает тайлы и отправляет лишь изменившиеся
+области.
 
-Сквозной тест `tests/pdp_e2e.rs` поднимает настоящий `pagh-desktop` (как
-библиотеку), запускает настоящий бинарник `pagh-files`, шлёт клавиатурный ввод,
-проверяет `launch` (заглушка или настоящий `pagh-terminal` через
-`PAGH_TERMINAL_BIN`), закрывает окно композитором и проверяет завершение
-клиента. С `PAGH_E2E_SHOTS=DIR` он сохраняет кадры композитора для отчёта/PR.
+Сквозные тесты: `tests/pdp_e2e.rs` поднимает настоящий `pagh-desktop` (как
+библиотеку), запускает настоящий бинарник `pagh-files`, шлёт ввод, проверяет
+`launch` (заглушка или настоящий `pagh-terminal` через `PAGH_TERMINAL_BIN`),
+закрывает окно композитором и проверяет завершение клиента;
+`tests/shm_e2e.rs` проверяет shm-путь против сервера с `SCM_RIGHTS` (offer,
+damage-only commit, resize поколения, отсутствие пикселей в сокете).
+С `PAGH_E2E_SHOTS=DIR` кадры композитора сохраняются для отчёта/PR.
 
 ## Ограничения
 
