@@ -285,7 +285,7 @@ impl Message {
     /// Флаги заголовка сообщения.
     pub fn header_flags(&self) -> u16 {
         match self {
-            Self::ShmCommit { .. } => HEADER_FLAG_SHM,
+            Self::ShmCommit { .. } | Self::ShmDamage { .. } => HEADER_FLAG_SHM,
             _ => 0,
         }
     }
@@ -526,10 +526,12 @@ impl Message {
                 e.u32(*generation);
                 e.u32(rects.len() as u32);
                 for (x, y, w, h) in rects {
+                    // Клиентский ABI ShmSurface: ширина/высота — u16, как в
+                    // legacy `damage`; большие значения зажимаются.
                     e.i32(*x);
                     e.i32(*y);
-                    e.u32(*w);
-                    e.u32(*h);
+                    e.u16((*w).min(u16::MAX as u32) as u16);
+                    e.u16((*h).min(u16::MAX as u32) as u16);
                 }
             }
         }
@@ -572,7 +574,7 @@ impl Message {
                     let window_id = d.u32()?;
                     let generation = d.u32()?;
                     let count = d.u32()? as usize;
-                    let rects = decode_rects_u32(&mut d, count)?;
+                    let rects = decode_rects_u16(&mut d, count)?;
                     d.finish()?;
                     Self::ShmCommit {
                         window_id,
@@ -655,15 +657,17 @@ impl Message {
                 reason: d.u32()?,
             },
             TYPE_DAMAGE => {
-                // Две формы: legacy (u16 count; payload = 6 + 12*n, т.е.
-                // 6 mod 12) и ShmSurface (generation + u32 count;
-                // payload = 12 + 16*n, т.е. 0/4/8 mod 12). Формы однозначны.
-                let shm_form = payload.len() >= 12 && payload.len() % 12 != 6;
+                // Формы: legacy (u16 count; payload = 6 + 12*n) и ShmSurface
+                // (generation + u32 count; payload = 12 + 12*n). Клиенты
+                // помечают shm-форму flags bit 0; без флага она всё ещё
+                // однозначно отличается по длине (0 mod 12 vs 6 mod 12).
+                let shm_form = flags & HEADER_FLAG_SHM != 0
+                    || (payload.len() >= 12 && payload.len() % 12 != 6);
                 let window_id = d.u32()?;
                 if shm_form {
                     let generation = d.u32()?;
                     let count = d.u32()? as usize;
-                    let rects = decode_rects_u32(&mut d, count)?;
+                    let rects = decode_rects_u16(&mut d, count)?;
                     Self::ShmDamage {
                         window_id,
                         generation,
@@ -715,16 +719,16 @@ impl Message {
     }
 }
 
-fn decode_rects_u32(
+fn decode_rects_u16(
     d: &mut PayloadDecoder<'_>,
     count: usize,
 ) -> Result<Vec<(i32, i32, u32, u32)>, ProtocolError> {
-    // Каждый прямоугольник — 12 байт; count ограничен длиной payload, но
-    // защищаемся от гигантского Vec::with_capacity.
-    let count = count.min(d.remaining() / 16);
+    // Каждый прямоугольник — 12 байт (x/y i32, w/h u16); count ограничен
+    // длиной payload, чтобы клиент не заказал гигантский Vec.
+    let count = count.min(d.remaining() / 12);
     let mut rects = Vec::with_capacity(count);
     for _ in 0..count {
-        rects.push((d.i32()?, d.i32()?, d.u32()?, d.u32()?));
+        rects.push((d.i32()?, d.i32()?, d.u16()? as u32, d.u16()? as u32));
     }
     Ok(rects)
 }
@@ -766,7 +770,7 @@ fn validate_header_flags(kind: u16, flags: u16) -> Result<(), ProtocolError> {
             "неизвестные флаги заголовка: {flags:#x}"
         )));
     }
-    if flags != 0 && kind != TYPE_COMMIT {
+    if flags != 0 && kind != TYPE_COMMIT && kind != TYPE_DAMAGE {
         return Err(ProtocolError::BadPayload(format!(
             "флаги {flags:#x} допустимы только для commit (type {kind})"
         )));
@@ -1247,7 +1251,7 @@ mod tests {
     }
 
     #[test]
-    fn header_flag_is_only_allowed_on_commit() {
+    fn header_flag_is_rejected_on_non_shm_messages() {
         let mut bytes = Message::Ping { nonce: 1 }.encode();
         bytes[6] = HEADER_FLAG_SHM as u8;
         let mut decoder = Decoder::new();
