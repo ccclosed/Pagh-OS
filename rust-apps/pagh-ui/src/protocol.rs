@@ -465,7 +465,7 @@ pub enum Message {
     CommitShm {
         window_id: u32,
         generation: u32,
-        rects: Vec<(i32, i32, u16, u16)>,
+        rects: Vec<(i32, i32, u32, u32)>,
     },
     /// Устаревшая shm-подсказка damage с поколением (header flags bit 0 = SHM).
     /// Клиент этой волны шлёт damage внутри [`Message::CommitShm`], но тип
@@ -473,7 +473,7 @@ pub enum Message {
     DamageShm {
         window_id: u32,
         generation: u32,
-        rects: Vec<(i32, i32, u16, u16)>,
+        rects: Vec<(i32, i32, u32, u32)>,
     },
 }
 
@@ -749,8 +749,8 @@ impl Message {
                 for (x, y, width, height) in rects.iter().take(MAX_DAMAGE_RECTS) {
                     w.i32(*x);
                     w.i32(*y);
-                    w.u16(*width);
-                    w.u16(*height);
+                    w.u32(*width);
+                    w.u32(*height);
                 }
             }
         }
@@ -818,7 +818,7 @@ impl Message {
                 }
                 let mut rects = Vec::with_capacity(count);
                 for _ in 0..count {
-                    rects.push((r.i32()?, r.i32()?, r.u16()?, r.u16()?));
+                    rects.push((r.i32()?, r.i32()?, r.u32()?, r.u32()?));
                 }
                 Message::CommitShm {
                     window_id,
@@ -911,7 +911,7 @@ impl Message {
                 }
                 let mut rects = Vec::with_capacity(count);
                 for _ in 0..count {
-                    rects.push((r.i32()?, r.i32()?, r.u16()?, r.u16()?));
+                    rects.push((r.i32()?, r.i32()?, r.u32()?, r.u32()?));
                 }
                 Message::DamageShm {
                     window_id,
@@ -1525,13 +1525,13 @@ mod tests {
 
     #[test]
     fn shm_commit_rejects_too_many_rects() {
-        let payload_len = 12 + (MAX_DAMAGE_RECTS + 1) * 12;
+        let payload_len = 12 + (MAX_DAMAGE_RECTS + 1) * 16;
         let mut payload = Vec::with_capacity(payload_len);
         payload.extend_from_slice(&1u32.to_le_bytes());
         payload.extend_from_slice(&1u32.to_le_bytes());
         payload.extend_from_slice(&((MAX_DAMAGE_RECTS + 1) as u32).to_le_bytes());
         for _ in 0..=MAX_DAMAGE_RECTS {
-            payload.extend_from_slice(&[0u8; 12]);
+            payload.extend_from_slice(&[0u8; 16]);
         }
         assert!(matches!(
             Message::decode_with_flags(types::COMMIT, header_flags::SHM, &payload),

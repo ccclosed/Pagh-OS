@@ -130,7 +130,7 @@ server → close(1, reason=2)
    рвётся.
 4. Кадр: `commit` с `flags=SHM` и payload
    `{ u32 window_id, u32 generation, u32 damage_count, rect[count] }`, где
-   `rect = { i32 x, i32 y, u16 w, u16 h }`. Пикселей в сокете нет; сервер
+   `rect = { i32 x, i32 y, u32 w, u32 h }`. Пикселей в сокете нет; сервер
    читает их из memfd по damage-прямоугольникам. Пустой damage не шлётся.
    Повреждения копятся в `damage::Damage` (clip/merge/схлопывание), а
    `damage::DamageTracker` сравнивает тайлы кадра и отдаёт только изменившиеся

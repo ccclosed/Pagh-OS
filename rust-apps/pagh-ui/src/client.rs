@@ -529,7 +529,8 @@ impl DesktopClient {
             return Ok(());
         }
         let rects = damage.rects();
-        let payload_len = 12 + rects.len() * 12;
+        // Серверный ABI B5: rect = i32 x, i32 y, u32 w, u32 h (16 байт).
+        let payload_len = 12 + rects.len() * 16;
         let total = HEADER_LEN + payload_len;
         self.tx_buffer.clear();
         self.tx_buffer.reserve(total);
@@ -550,9 +551,9 @@ impl DesktopClient {
             self.tx_buffer.extend_from_slice(&rect.x.to_le_bytes());
             self.tx_buffer.extend_from_slice(&rect.y.to_le_bytes());
             self.tx_buffer
-                .extend_from_slice(&(rect.w.clamp(0, u16::MAX as i32) as u16).to_le_bytes());
+                .extend_from_slice(&rect.w.max(0).to_le_bytes());
             self.tx_buffer
-                .extend_from_slice(&(rect.h.clamp(0, u16::MAX as i32) as u16).to_le_bytes());
+                .extend_from_slice(&rect.h.max(0).to_le_bytes());
         }
         self.stream.write_all(&self.tx_buffer)?;
         self.stream.flush()?;

@@ -16,7 +16,7 @@ use pagh_terminal::keys::evdev::KEY_A;
 use pagh_ui::protocol::{self, close_reason, FrameFormat, Header, Message};
 use pagh_ui::shm::{recv_fd_payload, MappedBuffer};
 
-type DamageRect = (i32, i32, u16, u16);
+type DamageRect = (i32, i32, u32, u32);
 
 const W: u32 = 640;
 const H: u32 = 400;
@@ -72,7 +72,7 @@ fn read_commit(stream: &mut UnixStream) -> (Header, u32, Vec<DamageRect>) {
         panic!("expected shm commit, got {message:?}");
     };
     assert!(
-        header.length <= 12 + 12 * protocol::MAX_DAMAGE_RECTS,
+        header.length <= 12 + 16 * protocol::MAX_DAMAGE_RECTS,
         "pixels leaked into the socket: {} bytes",
         header.length
     );
@@ -159,7 +159,7 @@ fn terminal_shm_damage_blink_and_resize() {
         // Первый кадр — полный damage.
         let (_, generation, rects) = read_commit(&mut stream);
         assert_eq!(generation, 1);
-        assert_eq!(rects, vec![(0, 0, W as u16, H as u16)]);
+        assert_eq!(rects, vec![(0, 0, W, H)]);
         assert!(
             mapping
                 .as_slice()
@@ -287,7 +287,7 @@ fn terminal_shm_damage_blink_and_resize() {
                     generation, rects, ..
                 } => {
                     assert_eq!(generation, 2);
-                    assert_eq!(rects, vec![(0, 0, W2 as u16, H2 as u16)]);
+                    assert_eq!(rects, vec![(0, 0, W2, H2)]);
                     assert!(
                         mapping2
                             .as_slice()

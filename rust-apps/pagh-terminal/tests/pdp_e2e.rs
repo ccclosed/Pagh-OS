@@ -101,8 +101,10 @@ fn pagh_terminal_runs_under_real_pagh_desktop() {
     .expect("композитор стартует");
 
     let empty = capture(&server.control, &shots, "00-empty.png");
+    let trace = shots.join("terminal.trace");
     let mut child = Command::new(env!("CARGO_BIN_EXE_pagh-terminal"))
         .args(["--socket", socket.to_str().unwrap(), "--size", "700x460"])
+        .env("PAGH_TERMINAL_PDP_TRACE", &trace)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -163,6 +165,19 @@ fn pagh_terminal_runs_under_real_pagh_desktop() {
     let status = wait_child_exit(&mut child, Duration::from_secs(10))
         .expect("pagh-terminal не завершился после close");
     assert!(status.success(), "pagh-terminal завершился с {status:?}");
+
+    // dev-сервер объявляет ShmSurface: терминал обязан идти shm-путём.
+    let trace = std::fs::read_to_string(&trace).expect("PDP trace");
+    assert!(
+        trace.lines().any(|line| line.starts_with("> shm_offer")),
+        "терминал не сделал shm_offer:\n{trace}"
+    );
+    assert!(trace.lines().any(|line| line.starts_with("< shm_ready")));
+    assert!(trace.lines().any(|line| line.starts_with("> commit_shm")));
+    assert!(
+        !trace.contains("pixels="),
+        "shm-путь не должен слать пиксели:\n{trace}"
+    );
 
     server.control.shutdown();
     server.join().expect("композитор завершился");

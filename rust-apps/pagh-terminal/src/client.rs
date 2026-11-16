@@ -8,7 +8,8 @@
 //! v1 full-frame upload path is used.
 
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
+use std::fs::File;
+use std::io::{self, BufWriter, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -28,6 +29,8 @@ use crate::render::Canvas;
 pub const DEFAULT_SOCKET: &str = "/tmp/pagh-desktop.sock";
 /// Framing + commit prefix overhead (diagnostics).
 pub const COMMIT_OVERHEAD: usize = HEADER_LEN + 24;
+/// Optional PDP/1 trace file (one line per message, no pixel bytes).
+pub const TRACE_ENV: &str = "PAGH_TERMINAL_PDP_TRACE";
 
 /// Welcome information returned by the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +108,8 @@ pub struct SurfaceClient {
     pending: VecDeque<Event>,
     /// Reused shm-commit buffer (no allocation in the frame loop).
     tx: Vec<u8>,
+    /// Optional compact PDP/1 trace (e2e/debug).
+    trace: Option<BufWriter<File>>,
 }
 
 impl SurfaceClient {
@@ -128,6 +133,10 @@ impl SurfaceClient {
             generation: 0,
             pending: VecDeque::new(),
             tx: Vec::with_capacity(64 * 1024),
+            trace: std::env::var_os(TRACE_ENV)
+                .filter(|value| !value.is_empty())
+                .and_then(|path| File::create(std::path::Path::new(&path)).ok())
+                .map(BufWriter::new),
         })
     }
 
@@ -371,7 +380,8 @@ impl SurfaceClient {
             return Ok(());
         }
         let rects = damage.rects();
-        let payload = 12 + rects.len() * 12;
+        // PDP/1 B5: rect = i32 x, i32 y, u32 w, u32 h (16 байт).
+        let payload = 12 + rects.len() * 16;
         self.tx.clear();
         self.tx.reserve(HEADER_LEN + payload);
         self.tx.extend_from_slice(&MAGIC);
@@ -386,13 +396,21 @@ impl SurfaceClient {
         for rect in rects {
             self.tx.extend_from_slice(&rect.x.to_le_bytes());
             self.tx.extend_from_slice(&rect.y.to_le_bytes());
-            self.tx
-                .extend_from_slice(&(rect.w.clamp(0, u16::MAX as i32) as u16).to_le_bytes());
-            self.tx
-                .extend_from_slice(&(rect.h.clamp(0, u16::MAX as i32) as u16).to_le_bytes());
+            self.tx.extend_from_slice(&rect.w.max(0).to_le_bytes());
+            self.tx.extend_from_slice(&rect.h.max(0).to_le_bytes());
         }
         self.stream.write_all(&self.tx)?;
-        self.stream.flush()
+        self.stream.flush()?;
+        if self.trace.is_some() {
+            let detail = format!(
+                "window={} gen={} damage={}",
+                frame.window_id,
+                frame.generation,
+                rects.len()
+            );
+            self.trace('>', "commit_shm", header_flags::SHM, payload, &detail);
+        }
+        Ok(())
     }
 
     /// Release the current generation and stop using shared memory.
@@ -444,6 +462,16 @@ impl SurfaceClient {
             self.shm_capable = false;
             return Ok(None);
         }
+        if self.trace.is_some() {
+            let detail = format!(
+                "window={} {}x{} stride={} fd",
+                self.window_id,
+                width,
+                height,
+                surface.stride()
+            );
+            self.trace('>', "shm_offer", 0, encoded.len() - HEADER_LEN, &detail);
+        }
         let Some(generation) = self.wait_for_shm_ready()? else {
             return Ok(None);
         };
@@ -471,7 +499,10 @@ impl SurfaceClient {
                 Message::ShmReady {
                     window_id,
                     generation,
-                } if window_id == self.window_id => return Ok(Some(generation)),
+                } if window_id == self.window_id => {
+                    self.trace('<', "shm_ready", 0, 8, "");
+                    return Ok(Some(generation));
+                }
                 Message::Error { .. } => return Ok(None),
                 other => {
                     if let Some(event) = self.handle_message(other)? {
@@ -480,6 +511,21 @@ impl SurfaceClient {
                 }
             }
         }
+    }
+
+    fn trace(&mut self, direction: char, kind: &str, flags: u16, length: usize, detail: &str) {
+        let Some(trace) = self.trace.as_mut() else {
+            return;
+        };
+        if detail.is_empty() {
+            let _ = writeln!(trace, "{direction} {kind} flags={flags:#x} len={length}");
+        } else {
+            let _ = writeln!(
+                trace,
+                "{direction} {kind} flags={flags:#x} len={length} {detail}"
+            );
+        }
+        let _ = trace.flush();
     }
 
     fn send(&mut self, message: &Message) -> io::Result<()> {
@@ -491,7 +537,41 @@ impl SurfaceClient {
             ));
         }
         self.stream.write_all(&encoded)?;
-        self.stream.flush()
+        self.stream.flush()?;
+        if self.trace.is_some() {
+            let detail = match message {
+                Message::Commit {
+                    window_id,
+                    width,
+                    height,
+                    pixels,
+                    ..
+                } => format!(
+                    "window={window_id} {width}x{height} pixels={}",
+                    pixels.len()
+                ),
+                Message::ShmOffer {
+                    window_id,
+                    width,
+                    height,
+                    stride,
+                    ..
+                } => format!("window={window_id} {width}x{height} stride={stride} fd"),
+                Message::ShmRelease {
+                    window_id,
+                    generation,
+                } => format!("window={window_id} gen={generation}"),
+                _ => String::new(),
+            };
+            self.trace(
+                '>',
+                message.name(),
+                message.header_flags(),
+                encoded.len() - HEADER_LEN,
+                &detail,
+            );
+        }
+        Ok(())
     }
 
     /// Poll for events, waiting at most `timeout` for the first byte.

@@ -166,9 +166,9 @@ fn files_renders_into_memfd_and_sends_only_damage() {
             panic!("expected shm commit, got {commit:?}");
         };
         assert_eq!((commit_window, generation), (window_id, 1));
-        assert_eq!(rects, vec![(0, 0, W as u16, H as u16)]);
+        assert_eq!(rects, vec![(0, 0, W, H)]);
         assert!(
-            header.length <= 12 + 12 * 4,
+            header.length <= 12 + 16 * 4,
             "pixels leaked into the control socket: {} bytes",
             header.length
         );
@@ -241,9 +241,9 @@ fn files_renders_into_memfd_and_sends_only_damage() {
                     rects,
                 } => {
                     assert_eq!((id, generation), (window_id, 2));
-                    assert_eq!(rects, vec![(0, 0, W2 as u16, H2 as u16)]);
+                    assert_eq!(rects, vec![(0, 0, W2, H2)]);
                     assert_eq!(header.flags, protocol::header_flags::SHM);
-                    assert!(header.length <= 12 + 12 * 4);
+                    assert!(header.length <= 12 + 16 * 4);
                     assert!(
                         mapping2
                             .as_slice()
@@ -323,6 +323,6 @@ fn files_renders_into_memfd_and_sends_only_damage() {
             .unwrap()
             .parse()
             .unwrap();
-        assert!(len <= 12 + 12 * 64, "commit metadata too large: {line}");
+        assert!(len <= 12 + 16 * 64, "commit metadata too large: {line}");
     }
 }
