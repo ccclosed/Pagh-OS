@@ -366,14 +366,14 @@ pub static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "pkg",
-        description: "Download & install a .deb by URL (use `apt` for by-name)",
+        description: "Download & install a .deb by URL (use `ppkg` for by-name)",
         usage: "pkg <host> <path> [port]",
         handler: super::commands::cmd_pkg,
     },
     CommandSpec {
-        name: "apt",
-        description: "Name-based package manager (update/install/show/list/setmirror)",
-        usage: "apt <update|install|show|list|setmirror> [args]",
+        name: "ppkg",
+        description: "Pagh package manager (update/install/show/list/setmirror)",
+        usage: "ppkg <update|install|show|list|setmirror> [args]",
         handler: super::commands::cmd_apt,
     },
     CommandSpec {

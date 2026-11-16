@@ -5,7 +5,7 @@
 **Стойка не воспроизводится.** Заявленный в #19 «детерминированный hang embedded-tls на
 ~12 MiB» на текущем стеке отсутствует: полный `Packages.gz` (`stable/main/amd64`,
 **13 332 733 B** — ровно тот класс размера, где заявлена стойка) расшифровывается до конца
-одним fetch'ем за считанные секунды, а живой `apt update` проходит по HTTPS целиком и
+одним fetch'ем за считанные секунды, а живой `ppkg update` проходит по HTTPS целиком и
 заканчивается `PASS`.
 
 Исторический контекст: утверждение записано против ещё smoltcp-транспорта, тогда как
@@ -21,12 +21,12 @@
 
 | # | Что | Команда | Результат | Время |
 |---|---|---|---|---|
-| 1 | живой `apt update` по HTTPS | `python3 tools/e2e.py live-update --allow-partial --timeout 1200 --serial-log serial_live.log` | `stage=done … body=13332733 raw_in=13356522 read_polls=1737 pending_polls=74 bytes_per_s=1837983` → `LIVE_APT_UPDATE: count=68825` → `.deb` по HTTPS (955 316 B) → `/mnt/usr/bin/busybox` запущен → `LXSELFTEST live_update PASS`, **exit 0** | 79.9 s |
+| 1 | живой `ppkg update` по HTTPS | `python3 tools/e2e.py live-update --allow-partial --timeout 1200 --serial-log serial_live.log` | `stage=done … body=13332733 raw_in=13356522 read_polls=1737 pending_polls=74 bytes_per_s=1837983` → `LIVE_APT_UPDATE: count=68825` → `.deb` по HTTPS (955 316 B) → `/mnt/usr/bin/busybox` запущен → `LXSELFTEST live_update PASS`, **exit 0** | 79.9 s |
 | 2 | регресс `lx_tlsbig` | `python3 tools/e2e.py shell --features lx_tlsbig --script tools/e2e_tlsbig.script --timeout 1000 --settle 30` | `LXSELFTEST tls_big PASS (TLS 1.3; 13332733 bytes decrypted end to end)`, **exit 0** | 65.3 s |
 | 3 | `lx_tlsbig` под CPU-голоданием (8 `yes`, гость TCG замедлен) | (8 × `yes` на хосте; гость TCG замедлен) | `stage=done … body=13332733 raw_in=13357293 read_polls=1821 pending_polls=91 bytes_per_s=1255436` → `PASS`, **exit 0** | 54.0 s |
 | 4 | `lx_tlsbig` #2 (детерминизм) | то же, `--serial-log serial_tlsbig_2.log` | `body=13332733 raw_in=13356809 read_polls=2464 pending_polls=757 bytes_per_s=1277816` → **PASS**, **exit 0** | ~65 s |
 | 5 | регресс `https_get` | `python3 tools/e2e.py local-mirror --serial-log serial_httpsget.log` | `stage=done host=deb.debian.org path=/debian/dists/stable/Release body=138612` → `LXSELFTEST https_get PASS`, `apt_e2e PASS`, **exit 0** | ~40 s |
-| 6 | НЕГАТИВ (недоверенная цепочка) | локальный self-signed HTTPS на 10.0.2.2:8443 (SAN `deb.debian.org`, `10.0.2.2`), в госте `apt setmirror https://10.0.2.2:8443 /` + `apt update` | `Package_Fetcher(tls): stage=verify cause=InvalidCertificate (chain: NoAnchor)` → `stage=tls:handshake … cause=Tls (handshake/record failure; no application data was exchanged)`; `stage=done host=10.0.2.2` — **0 вхождений** | ~50 s |
+| 6 | НЕГАТИВ (недоверенная цепочка) | локальный self-signed HTTPS на 10.0.2.2:8443 (SAN `deb.debian.org`, `10.0.2.2`), в госте `ppkg setmirror https://10.0.2.2:8443 /` + `ppkg update` | `Package_Fetcher(tls): stage=verify cause=InvalidCertificate (chain: NoAnchor)` → `stage=tls:handshake … cause=Tls (handshake/record failure; no application data was exchanged)`; `stage=done host=10.0.2.2` — **0 вхождений** | ~50 s |
 
 Геометрия: заявленная точка стойки ~12 MiB (12 582 912 B) **меньше** фактически скачанных
 13 332 733 B, т.е. трансфер прошёл её и дошёл до конца; во всех прогонах
@@ -42,8 +42,8 @@
 `https_get`. `.deb` busybox: 955 316 B по HTTPS.
 
 Итог: `LXSELFTEST tls_big PASS` дважды с N = 13 332 733 ≥ `TLS_BIG_MIN_BYTES`
-(4 194 304); живой путь идёт по HTTPS (1 × `apt: Get https://…Packages.gz`, 0 ×
-`apt: Get http://…`), `TLS verifier refusals` = 0; негативный кейс с недоверенной цепочкой
+(4 194 304); живой путь идёт по HTTPS (1 × `ppkg: Get https://…Packages.gz`, 0 ×
+`ppkg: Get http://…`), `TLS verifier refusals` = 0; негативный кейс с недоверенной цепочкой
 отклонён на `stage=verify` без обмена прикладными данными; `https_get` не деградировал.
 
 ## Что сделано кодом

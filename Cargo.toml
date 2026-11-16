@@ -64,6 +64,18 @@ lx_bigindex = []
 # parse/heap path from the net/scheduler interaction. OFF by default.
 lx_bigindex_inram = []
 
+# In-guest apt performance benchmark (apt-fast task: streaming .deb, once-per-
+# transaction sync, phase timings). OFF by default and SEPARATE from the other
+# harnesses: when set, `boot::kernel_main` spawns `selftest_lx::run_apt_bench`,
+# which points apt at the LOCAL signed benchmark repo on the QEMU host gateway
+# (`tools/mini_repo.py bench OUT --serve 8000`) and drives two `apt update`
+# rounds plus one multi-package `apt install`, printing the `apt: timings …`
+# phase lines and an `LXSELFTEST apt_bench PASS` verdict. It is also the only
+# added anchor for the deterministic TEST-ONLY signing key (like the other local
+# harnesses), never for a production build. Build with
+# `cargo build --release --features lx_apt_bench`.
+lx_apt_bench = []
+
 # Large-stream HTTPS regression (issue #19). OFF by default and SEPARATE from the
 # other harnesses: when set, `boot::kernel_main` spawns
 # `selftest_lx::run_tls_big_check`, which performs ONE multi-MB authenticated

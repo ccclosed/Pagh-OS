@@ -12,6 +12,7 @@
 
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use super::registry::ShellCtx;
 
@@ -1279,7 +1280,7 @@ fn find_python() -> Option<alloc::string::String> {
 
 pub(super) fn cmd_python(ctx: &mut ShellCtx, args: &[&str]) {
     let Some(py) = find_python() else {
-        shell_println("python: no python3 in /mnt/usr/bin yet; run 'apt install python3' or wait for first-boot provisioning");
+        shell_println("python: no python3 in /mnt/usr/bin yet; run 'ppkg install python3' or wait for first-boot provisioning");
         return;
     };
     let mut argv: alloc::vec::Vec<&str> = alloc::vec::Vec::with_capacity(1 + args.len());
@@ -1370,7 +1371,7 @@ pub(super) fn cmd_pythonc(ctx: &mut ShellCtx, args: &[&str]) {
         return;
     }
     let Some(py) = find_python() else {
-        shell_println("pythonc: no python3 in /mnt/usr/bin yet; run 'apt install python3' first");
+        shell_println("pythonc: no python3 in /mnt/usr/bin yet; run 'ppkg install python3' first");
         return;
     };
     let mut argv: alloc::vec::Vec<&str> = alloc::vec::Vec::with_capacity(3 + args.len());
@@ -1412,7 +1413,7 @@ pub(super) fn cmd_pkg(_ctx: &mut ShellCtx, args: &[&str]) {
         shell_println("usage: pkg <host> <path> [port]");
         shell_println("  downloads a .deb over HTTP and installs it under /mnt");
         shell_println("  note: only gzip-compressed .deb data is supported (not xz/zstd)");
-        shell_println("  tip: for name-based installs with dependency resolution, use `apt`");
+        shell_println("  tip: for name-based installs with dependency resolution, use `ppkg`");
         return;
     }
     let host = args[0];
@@ -1757,16 +1758,16 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `apt <subcommand> ...`: пакетный менеджер по именам.
+/// `ppkg <subcommand> ...`: пакетный менеджер по именам.
 ///
-/// В отличие от `pkg` (сырые host/path/port), `apt` работает по *имени пакета*
+/// В отличие от `pkg` (сырые host/path/port), `ppkg` работает по *имени пакета*
 /// против скачанного индекса репозитория, автоматически разрешая зависимости:
 ///
-///   * `apt update`                  — скачать + разобрать индекс `Packages`.
-///   * `apt install <name> [name2…]` — разрешить зависимости и поставить каждый пакет.
-///   * `apt show <name>`             — напечатать метаданные пакета из индекса.
-///   * `apt list [substr]`           — перечислить (подходящие) имена доступных пакетов.
-///   * `apt setmirror <host> [base]` — направить apt на другое зеркало.
+///   * `ppkg update`                  — скачать + разобрать индекс `Packages`.
+///   * `ppkg install <name> [name2…]` — разрешить зависимости и поставить каждый пакет.
+///   * `ppkg show <name>`             — напечатать метаданные пакета из индекса.
+///   * `ppkg list [substr]`           — перечислить (подходящие) имена доступных пакетов.
+///   * `ppkg setmirror <host> [base]` — направить apt на другое зеркало.
 ///
 /// Транспорт: обычная dev-сборка pagh включает исходящий доступ к пакетам через
 /// дефолтную фичу `network_packages`. HTTPS шифруется, но остаётся
@@ -1775,7 +1776,7 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
 /// принимает префикс схемы.
 ///
 /// Индекс живёт только в RAM (64 MiB диска слишком мало для кэша), поэтому
-/// `apt update` надо повторять каждую загрузку до `install`/`show`/`list`.
+/// `ppkg update` надо повторять каждую загрузку до `install`/`show`/`list`.
 pub(super) fn cmd_apt(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
         apt_usage();
@@ -1788,17 +1789,18 @@ pub(super) fn cmd_apt(_ctx: &mut ShellCtx, args: &[&str]) {
         "list" => cmd_apt_list(&args[1..]),
         "setmirror" => cmd_apt_setmirror(&args[1..]),
         other => {
-            shell_println(&alloc::format!("apt: unknown subcommand '{}'", other));
+            shell_println(&alloc::format!("ppkg: unknown subcommand '{}'", other));
             apt_usage();
         }
     }
 }
 
-/// Напечатать сводку usage `apt`.
+/// Напечатать сводку usage `ppkg`.
 fn apt_usage() {
-    shell_println("usage: apt <command> [args]");
+    shell_println("usage: ppkg <command> [args]");
     shell_println("  update                  download & parse the package index");
-    shell_println("  install <name> [name...]  install package(s) by name + deps");
+    shell_println("  install [--quiet] [--progress=ansi|cr|plain] <name> [name...]");
+    shell_println("                          install package(s) by name + deps, with progress");
     shell_println("  show <name>             show a package's metadata");
     shell_println("  list [substr]           list available package names");
     shell_println("  setmirror [scheme://]<host> [base]  set the mirror");
@@ -1819,21 +1821,21 @@ fn apt_usage() {
     shell_println("             an unsigned mirror is REFUSED; there is no 'continue anyway' flag");
 }
 
-/// `apt update`: обновить in-RAM индекс пакетов.
+/// `ppkg update`: обновить in-RAM индекс пакетов.
 fn cmd_apt_update() {
     let cfg = crate::pkg::apt::config();
     if cfg.tls {
         shell_println(
-            "apt: HTTPS transport: server certificate verified against the committed CA bundle",
+            "ppkg: HTTPS transport: server certificate verified against the committed CA bundle",
         );
     } else {
-        shell_println("apt: HTTP transport: the mirror is NOT authenticated (cleartext)");
+        shell_println("ppkg: HTTP transport: the mirror is NOT authenticated (cleartext)");
     }
     shell_println(
-        "apt: metadata will be verified against the pinned Debian archive keys (InRelease/Release.gpg)",
+        "ppkg: metadata will be verified against the pinned Debian archive keys (InRelease/Release.gpg)",
     );
     shell_println(&alloc::format!(
-        "apt: updating from {}://{}:{}{} ({}/{}/{})",
+        "ppkg: updating from {}://{}:{}{} ({}/{}/{})",
         cfg.scheme(),
         cfg.host,
         cfg.port,
@@ -1844,49 +1846,102 @@ fn cmd_apt_update() {
     ));
     match crate::pkg::apt::update() {
         Ok(n) => {
-            super::render::success_line(&alloc::format!("apt: done - {} packages available", n))
+            super::render::success_line(&alloc::format!("ppkg: done - {} packages available", n))
         }
-        Err(e) => super::render::error_line(&alloc::format!("apt: update failed: {}", e.message())),
+        Err(e) => {
+            super::render::error_line(&alloc::format!("ppkg: update failed: {}", e.message()))
+        }
     }
 }
 
-/// `apt install <name> [name2 …]`: разрешить и установить каждый названный пакет.
-fn cmd_apt_install(names: &[&str]) {
+/// Parse the `ppkg install` progress flags.
+///
+/// `--quiet`/`-q` forces [`ProgressMode::Plain`] (no live UI at all);
+/// `--progress=ansi|cr|plain` picks a renderer explicitly; otherwise the mode is
+/// auto-detected from console capability ([`super::progress::auto_mode`]).
+/// Returns the names to install or `None` on a malformed flag.
+fn parse_install_args<'a>(
+    args: &'a [&'a str],
+) -> Option<(super::ppkg_progress::ProgressMode, Vec<&'a str>)> {
+    use super::ppkg_progress::ProgressMode;
+    let mut mode: Option<ProgressMode> = None;
+    let mut quiet = false;
+    let mut names: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if arg == "--quiet" || arg == "-q" {
+            quiet = true;
+        } else if arg == "--progress" {
+            i += 1;
+            let value = args.get(i)?;
+            mode = Some(ProgressMode::parse(value)?);
+        } else if let Some(value) = arg.strip_prefix("--progress=") {
+            mode = Some(ProgressMode::parse(value)?);
+        } else if arg.starts_with("--") {
+            return None;
+        } else {
+            names.push(arg);
+        }
+        i += 1;
+    }
+    let mode = if quiet {
+        ProgressMode::Plain
+    } else {
+        mode.unwrap_or_else(super::progress::auto_mode)
+    };
+    Some((mode, names))
+}
+
+/// `ppkg install [--quiet] [--progress=ansi|cr|plain] <name> [name2 …]`: разрешить
+/// и установить каждый названный пакет, рисуя ход установки (DNF-style).
+fn cmd_apt_install(args: &[&str]) {
+    let Some((mode, names)) = parse_install_args(args) else {
+        shell_println(
+            "usage: ppkg install [--quiet] [--progress=ansi|cr|plain] <name> [name2 ...]",
+        );
+        return;
+    };
     if names.is_empty() {
-        shell_println("usage: apt install <name> [name2 ...]");
+        shell_println(
+            "usage: ppkg install [--quiet] [--progress=ansi|cr|plain] <name> [name2 ...]",
+        );
         return;
     }
     let mut any_installed = false;
     for name in names {
-        shell_println(&alloc::format!("apt: resolving {} ...", name));
-        match crate::pkg::apt::install(name) {
+        shell_println(&alloc::format!("ppkg: resolving {} ...", name));
+        let mut progress = super::progress::ProgressDriver::new(mode);
+        let result = crate::pkg::apt::install_observed(name, &mut progress);
+        progress.finish();
+        match result {
             Ok(installed) => {
                 if installed.is_empty() {
                     shell_println(&alloc::format!(
-                        "apt: {} is already installed (nothing to do)",
+                        "ppkg: {} is already installed (nothing to do)",
                         name
                     ));
                 } else {
                     any_installed = true;
                     super::render::success_line(&alloc::format!(
-                        "apt: installed {} package(s): {}",
+                        "ppkg: installed {} package(s): {}",
                         installed.len(),
                         installed.join(" ")
                     ));
                 }
             }
-            Err(e) => super::render::error_line(&alloc::format!("apt: {}: {}", name, e.message())),
+            Err(e) => super::render::error_line(&alloc::format!("ppkg: {}: {}", name, e.message())),
         }
     }
     if any_installed {
-        shell_println("apt: run an installed static binary with: lxrun /mnt/<path>");
+        shell_println("ppkg: run an installed static binary with: lxrun /mnt/<path>");
     }
 }
 
-/// `apt show <name>`: напечатать метаданные пакета из индекса.
+/// `ppkg show <name>`: напечатать метаданные пакета из индекса.
 fn cmd_apt_show(args: &[&str]) {
     if args.is_empty() {
-        shell_println("usage: apt show <name>");
+        shell_println("usage: ppkg show <name>");
         return;
     }
     let name = args[0];
@@ -1906,24 +1961,24 @@ fn cmd_apt_show(args: &[&str]) {
         }
         None => {
             if crate::pkg::apt::has_index() {
-                shell_println(&alloc::format!("apt: no such package '{}'", name));
+                shell_println(&alloc::format!("ppkg: no such package '{}'", name));
             } else {
-                shell_println("apt: no package index - run `apt update` first");
+                shell_println("ppkg: no package index - run `ppkg update` first");
             }
         }
     }
 }
 
-/// `apt list [substr]`: перечислить (подходящие) имена доступных пакетов с ограничением.
+/// `ppkg list [substr]`: перечислить (подходящие) имена доступных пакетов с ограничением.
 fn cmd_apt_list(args: &[&str]) {
     let filter = args.first().copied();
     if !crate::pkg::apt::has_index() {
-        shell_println("apt: no package index - run `apt update` first");
+        shell_println("ppkg: no package index - run `ppkg update` first");
         return;
     }
     let names = crate::pkg::apt::list(filter);
     if names.is_empty() {
-        shell_println("apt: no matching packages");
+        shell_println("ppkg: no matching packages");
         return;
     }
     // Ограничить вывод, чтобы полный индекс не залил консоль.
@@ -1933,16 +1988,16 @@ fn cmd_apt_list(args: &[&str]) {
     }
     if names.len() > MAX_LINES {
         shell_println(&alloc::format!(
-            "... ({} more; narrow with `apt list <substr>`)",
+            "... ({} more; narrow with `ppkg list <substr>`)",
             names.len() - MAX_LINES
         ));
     }
 }
 
-/// `apt setmirror <host> [basepath]`: сменить активное зеркало.
+/// `ppkg setmirror <host> [basepath]`: сменить активное зеркало.
 fn cmd_apt_setmirror(args: &[&str]) {
     if args.is_empty() {
-        shell_println("usage: apt setmirror <host> [basepath]");
+        shell_println("usage: ppkg setmirror <host> [basepath]");
         return;
     }
     let host = args[0];
@@ -1950,7 +2005,7 @@ fn cmd_apt_setmirror(args: &[&str]) {
     crate::pkg::apt::set_mirror(host, base);
     let cfg = crate::pkg::apt::config();
     shell_println(&alloc::format!(
-        "apt: mirror set to {}://{}:{}{}",
+        "ppkg: mirror set to {}://{}:{}{}",
         cfg.scheme(),
         cfg.host,
         cfg.port,
@@ -1958,12 +2013,12 @@ fn cmd_apt_setmirror(args: &[&str]) {
     ));
     if cfg.tls {
         shell_println(
-            "apt: transport is HTTPS (TLS 1.3) with fail-closed certificate verification",
+            "ppkg: transport is HTTPS (TLS 1.3) with fail-closed certificate verification",
         );
-        shell_println("apt: NOTE: only hosts chaining to the committed CA bundle are accepted (ISRG X1/X2, GTS R1/R4)");
+        shell_println("ppkg: NOTE: only hosts chaining to the committed CA bundle are accepted (ISRG X1/X2, GTS R1/R4)");
     } else {
         shell_println(
-            "apt: transport is HTTP (cleartext) -- the mirror and the index are NOT authenticated",
+            "ppkg: transport is HTTP (cleartext) -- the mirror and the index are NOT authenticated",
         );
     }
 }

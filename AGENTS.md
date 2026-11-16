@@ -168,7 +168,7 @@ kernel-e2e-legacy -> tools/e2e_*.ps1         # Windows-only legacy harnesses (ne
   вычерпывавшую весь пул.
 - **Linux-compat end-to-end → `selftest_lx`** (фича-гейтед harness'ы) плюс гостевой драйвер
   `tools/e2e.py` (режимы `selftest`, `local-mirror`, `live-update`, `bigindex`, `shell`):
-  локальный mini-repo, живой apt update, bigindex-репро, многомегабайтный TLS-поток через
+  локальный mini-repo, живой `ppkg update`, bigindex-репро, многомегабайтный TLS-поток через
   `lx_tlsbig`. Harness'ы `tools/e2e_*.ps1` — Windows-only legacy-эквиваленты тех же
   сценариев, см. *Canonical entry points*; новая работа идёт в `tools/e2e.py` (Linux и CI
   могут его запускать).
@@ -441,7 +441,7 @@ slice 4; 2.10.0 — procfs slice 3; 2.9.x — правда о памяти и `/
   перезагрузки), нет SMART/self-test и shutdown notification, а невыровненные записи —
   read-modify-write на LBA, а не батчем.
   (Бывший пробел «embedded-tls встаёт на больших потоках» закрыт: многомегабайтная
-  TLS-загрузка проходит end to end — `lx_tlsbig`, issue #19, — а живой `apt update` идёт
+  TLS-загрузка проходит end to end — `lx_tlsbig`, issue #19, — а живой `ppkg update` идёт
   по HTTPS.)
 - Учётные данные процессов и права файловой системы реализованы (контракт
   `docs/security-model.md`): per-process real/effective/saved uid+gid в `CompatState`,

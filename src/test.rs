@@ -10417,6 +10417,27 @@ mod shell_prop_tests {
                 "registry: required command present"
             );
         }
+
+        // The user-facing package manager is `ppkg`. The old `apt` spelling is
+        // NOT a command and has no alias (renamed for Pagh's own naming scheme);
+        // every `help`-visible string names `ppkg`.
+        match registry::lookup("ppkg") {
+            Some(spec) => {
+                assert_kernel!(
+                    spec.usage.starts_with("ppkg "),
+                    "registry: ppkg usage names ppkg"
+                );
+                assert_kernel!(
+                    spec.usage.contains("install"),
+                    "registry: ppkg usage lists install"
+                );
+            }
+            None => assert_kernel!(false, "registry: ppkg command present"),
+        }
+        assert_kernel!(
+            registry::lookup("apt").is_none(),
+            "registry: apt is no longer a command"
+        );
     }
 
     /// Regression: Shift+letter must uppercase while CapsLock is off, and

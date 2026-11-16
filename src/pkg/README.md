@@ -12,14 +12,14 @@ list/setmirror), парсер индекса `Packages`, резолвер зав
 | Файл | Роль |
 |---|---|
 | `mod.rs` | Корень; документирует split pure/kernel |
-| `apt.rs` | Kernel-only apt-фронтенд: `update`/`install`/`show`/`list`/`setmirror` |
+| `apt.rs` | Kernel-only фронтенд `ppkg` (модуль исторически `apt`): `update`/`install`/`show`/`list`/`setmirror`, фазовые `ppkg: timings`, two-pass streaming-установка, персистентный кэш индекса |
 | `apt_index.rs` | Чистый парсер Debian-индекса (RFC822-станзы) + компактный arena-backed `PackageIndex` |
 | `apt_resolve.rs` | Чистый резолвер зависимостей → план установки dependency-first |
 | `deb.rs` | Чистый парсер `ar`/`.deb`, классификация сжатия, gzip/xz/zstd декомпрессоры (буферные и streaming) |
 | `tar.rs` | Чистый POSIX/ustar/GNU/pax tar reader/writer, zero-copy, валидация checksum: `TarType::{Regular,Directory,Symlink,Hardlink,Other}`, GNU `'L'`/`'K'`, ustar `prefix`, pax `path=`/`linkpath=` |
 | `install.rs` | Чистая нормализация путей и модель инсталлятора |
 | `install_fs.rs` | Kernel-only ext2-инсталлятор (`install_data_tar`) через `VfsNode`: реальные симлинки и хардлинки (issue #18), создание недостающих родителей |
-| `mirror.rs` | Чистый парсер аргумента `apt setmirror` |
+| `mirror.rs` | Чистый парсер аргумента `ppkg setmirror` |
 | `openpgp.rs` | Чистая политика OpenPGP-верификации (issue #32): выбор доверенного ключа, subkey binding, expiry/revocation/key-flags, точки входа `verify_detached` (`Release.gpg`) и `verify_clearsigned` (`InRelease`), `check_pinned_key` |
 | `openpgp_packet.rs` | Чистый слой пакетов: armor (CRC24), framing (old/new, definite lengths), public key/subkey, signature packet, keyring-блок, clearsign-разбор и канонизация |
 | `openpgp_crypto.rs` | Чистая криптография верификатора: правило v4-хеша, RSA PKCS#1 v1.5 / EdDSA / ECDSA по дайджесту, локальная SHA-1 (только для v4-фингерпринтов) |
@@ -30,6 +30,8 @@ list/setmirror), парсер индекса `Packages`, резолвер зав
 ## Ключевые символы
 
 - `apt`: `AptConfig { host, base, suite, component, arch, port, tls }` (дефолт: `deb.debian.org`,
+  команда — `ppkg`), `install_observed(name, &mut dyn InstallObserver)` — установка с
+  progress-колбэками (фазы download/verify/unpack, unpack-байты), `install(name)` — без них,
   `/debian`, `stable`, `main`, `amd64`, порт 443, tls), `set_mirror()`, `update() -> usize`,
   `install(name) -> Vec<String>`, `show()`, `list()`, `has_index()`, `index_footprint()`;
   `AptOpError::{NetworkDisabled, NoNetwork, NoIndex, NotFound, Download, Parse, IndexTooLarge, Install}`.
@@ -51,11 +53,13 @@ list/setmirror), парсер индекса `Packages`, резолвер зав
 
 ### Состояние apt (`apt.rs`)
 Три глобала под спинлоками: `CONFIG` (зеркало), `INDEX` (распарсенный `PackageIndex`,
-**RAM-only, не персистится** — диск мал; пересобирается каждым `apt update`),
+**RAM-only (плюс компактный W3-кэш на ext2 под `/mnt/var/cache/pagh/apt/`,
+ключ = SHA-256 проверенного signed Release + suite/component/arch + версия формата;
+любая несостыковка — fallback на сетевой путь) — пересобирается каждым `ppkg update`),
 `INSTALLED` (`BTreeSet<String>` — сессионный список, не настоящий dpkg db).
 Сетевой I/O никогда не держит лок индекса.
 
-### apt update (цепочка доверия, issue #32)
+### ppkg update (цепочка доверия, issue #32)
 Сначала подписанные метаданные: `dists/{suite}/InRelease` (clearsigned) проверяется по
 пиннутому keyring'у; фоллбэк на `Release.gpg`+`Release` — **только** при 404 на `InRelease`
 (битая подпись фатальна, фоллбэка нет). Затем поля Release (suite/codename, architectures,
@@ -69,8 +73,8 @@ list/setmirror), парсер индекса `Packages`, резолвер зав
 OOM-аборта. Публикация индекса — только после полной проверки; любой отказ **очищает**
 `INDEX` (никакого «оставить прошлый индекс»).
 
-### apt install
-`apt setsuite <suite>` переключает release/suite (по умолчанию `stable`); `apt setmirror`
+### ppkg install
+`ppkg setmirror` выбирает зеркало; release/suite задаётся программно (по умолчанию `stable`) (по умолчанию `stable`); `ppkg setmirror`
 по-прежнему меняет только хост и базовый путь.
 `resolve_install` → на каждый пакет: из **той же** записи индекса берутся `Filename`,
 `SHA256` и `Size`; запись без пригодного `SHA256` отвергается (`DigestUnavailable`), затем
@@ -161,10 +165,10 @@ gzip — RFC 1952 вручную + `miniz_oxide`; xz — `xz4rust` (словар
   этой выдачи отвергается (`ChainError::NoAnchor`) — лечится только осознанной перегенерацией
   бандла `tools/gen_ca_bundle.py`. На этом слое не проверяется только отзыв (CRL/OCSP);
   подписи метаданных Debian (OpenPGP) и digest'ы пакетов проверяет сам `apt` — см. «Цепочка
-  доверия» ниже. HTTP-зеркала (`apt setmirror http://…`) неаутентифицированы по построению,
+  доверия» ниже. HTTP-зеркала (`ppkg setmirror http://…`) неаутентифицированы по построению,
   но целостность их метаданных даёт та же подписанная цепочка. Fail-closed сборка:
-  `cargo build --no-default-features` — тогда `apt update/install` возвращают `NetworkDisabled`.
-- Живой `apt update` идёт по HTTPS ЦЕЛИКОМ, включая ~13 МБ `Packages.gz` (issue #19: сообщённой
+  `cargo build --no-default-features` — тогда `ppkg update/install` возвращают `NetworkDisabled`.
+- Живой `ppkg update` идёт по HTTPS ЦЕЛИКОМ, включая ~13 МБ `Packages.gz` (issue #19: сообщённой
   стойки TLS-транспорта на много-МБ потоках на текущем TCP-стеке нет; пин — харнесс `lx_tlsbig`,
   диагностика — строки `Package_Fetcher(tls): stage=done|stall …`). Живой харнесс `lx_livetest`
   отказывается стартовать на cleartext-конфиге, поэтому PASS не может быть «случайно по HTTP».
@@ -187,7 +191,7 @@ gzip — RFC 1952 вручную + `miniz_oxide`; xz — `xz4rust` (словар
   пиннутому keyring'у → SHA-256 **и** размер `Packages` из подписанного Release (до
   декомпрессии) → SHA-256 **и** размер каждого `.deb` из подписанного индекса (до
   распаковки). Любое несовпадение — жёсткий отказ с одной строкой
-  `apt: verify FAIL stage=… cause=…` и без обходных путей; зеркало без подписей отвергается
+  `ppkg: verify FAIL stage=… cause=…` и без обходных путей; зеркало без подписей отвергается
   явно (`AptOpError::Unsigned`). Отличия от `gpgv`: подпись просроченного ключа отвергается,
   частичные длины пакетов не собираются. Остаточные пробелы (нет распространения отзывов,
   replay старого триплета на suite без `Valid-Until`, ручной `pkg`-путь) — в `SECURITY.md`.
@@ -201,6 +205,6 @@ gzip — RFC 1952 вручную + `miniz_oxide`; xz — `xz4rust` (словар
   SHA-512 self-sig + subkey binding, Ed25519 SHA-256 с легаси OID 1.3.6.1.4.1.11591.15.1).
   Два осознанных отличия от `gpgv`: подпись просроченного ключа отвергается (gpgv её принимает),
   и частичные длины пакетов не собираются, а отвергаются. К `apt.rs` это подключено:
-  `apt update` проверяет `InRelease`/`Release.gpg` до разбора индекса, сверяет SHA-256 **и
+  `ppkg update` проверяет `InRelease`/`Release.gpg` до разбора индекса, сверяет SHA-256 **и
   размер** `Packages` из подписанного Release и каждого `.deb` из подписанного индекса, а
   негативные кейсы прогоняет `run_apt_verify_checks` (см. выше).

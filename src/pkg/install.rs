@@ -186,6 +186,162 @@ pub enum InstallOp<'a> {
     Hardlink { path: String, target: String },
 }
 
+/// One operation of the **metadata-only** plan used by the streaming installer
+/// (W1, apt-fast): everything [`InstallPlan`] carries except the file bytes.
+///
+/// The two-pass `.deb` install first decompresses `data.tar` once and collects
+/// [`TarMeta`](super::tar::TarMeta) per member — with no content — plans over
+/// those, and only then decompresses a second time, writing each regular file
+/// as its bytes stream past. Resident memory is therefore bounded by the
+/// metadata (paths, modes, link targets), not by the decompressed archive.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum MetaOp {
+    /// Create (or replace) a regular file; its content arrives in pass 2.
+    ///
+    /// `member` is the source member's ordinal in the archive stream: pass 2
+    /// matches the arriving [`TarMeta`](super::tar::TarMeta) by it, so only the
+    /// members this plan accepted can ever be written.
+    File {
+        member: usize,
+        path: String,
+        mode: u32,
+        size: u64,
+    },
+    /// Create a symbolic link; `target` is verbatim, as in [`InstallOp::Symlink`].
+    Symlink {
+        member: usize,
+        path: String,
+        target: String,
+    },
+    /// Create a hard link, as in [`InstallOp::Hardlink`]. Hard links carry no
+    /// content, so they need no member ordinal; they run after the content pass.
+    Hardlink { path: String, target: String },
+}
+
+impl MetaOp {
+    /// The root-relative path this operation materializes.
+    pub fn path(&self) -> &str {
+        match self {
+            MetaOp::File { path, .. }
+            | MetaOp::Symlink { path, .. }
+            | MetaOp::Hardlink { path, .. } => path,
+        }
+    }
+}
+
+/// [`InstallPlan`] without file contents: the pure planner's verdict over a
+/// metadata stream, consumed by the effectful streaming installer.
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+pub struct MetaPlan {
+    /// Operations in execution order (files/symlinks in archive order, then hard
+    /// links in dependency order).
+    pub ops: Vec<MetaOp>,
+    /// Hard links whose target the archive does not create (see
+    /// [`InstallPlan::deferred`]).
+    pub deferred: Vec<String>,
+    /// Hard links in an unbreakable cycle (see [`InstallPlan::unresolved`]).
+    pub unresolved: Vec<String>,
+    /// Members refused for the F-x86n-1/F-r2-vfs-1 constructs; a non-empty list
+    /// makes the effectful installer refuse the whole package before any write.
+    pub unsafe_members: Vec<UnsafeMember>,
+    /// Members whose path escapes the install root (R10.8).
+    pub skipped_unsafe: usize,
+    /// Link members with an empty target.
+    pub skipped_empty_target: usize,
+    /// Members of a kind the installer does not create.
+    pub skipped_other: usize,
+}
+
+/// The member view the planner needs, implemented by both the eager
+/// [`TarEntry`](super::tar::TarEntry) (tests, in-memory callers) and the owned
+/// [`TarMeta`](super::tar::TarMeta) (the streaming two-pass installer).
+///
+/// Sharing this trait keeps ONE implementation of the security-relevant planning
+/// rules (F-x86n-1/F-r2-vfs-1/F-r3-vfs-1) behind both entry points, so the
+/// metadata plan cannot drift from the plan the property tests exercise.
+pub trait PlanMember {
+    /// The member's effective root-relative path (`prefix` already joined).
+    fn plan_path(&self) -> String;
+    /// The member kind.
+    fn plan_kind(&self) -> TarType;
+    /// The permission bits.
+    fn plan_mode(&self) -> u32;
+    /// The declared content size.
+    fn plan_size(&self) -> u64;
+    /// The verbatim link target (empty for non-link members).
+    fn plan_link_target(&self) -> &str;
+}
+
+impl PlanMember for TarEntry<'_> {
+    fn plan_path(&self) -> String {
+        effective_path(self)
+    }
+    fn plan_kind(&self) -> TarType {
+        self.kind
+    }
+    fn plan_mode(&self) -> u32 {
+        self.mode
+    }
+    fn plan_size(&self) -> u64 {
+        self.size
+    }
+    fn plan_link_target(&self) -> &str {
+        self.link_target
+    }
+}
+
+impl PlanMember for super::tar::TarMeta {
+    fn plan_path(&self) -> String {
+        String::from(&self.path)
+    }
+    fn plan_kind(&self) -> TarType {
+        self.kind
+    }
+    fn plan_mode(&self) -> u32 {
+        self.mode
+    }
+    fn plan_size(&self) -> u64 {
+        self.size
+    }
+    fn plan_link_target(&self) -> &str {
+        &self.link_target
+    }
+}
+
+/// One planner operation before its content type is attached.
+#[derive(Debug, PartialEq, Eq, Clone)]
+enum CoreOp<C> {
+    File {
+        member: usize,
+        path: String,
+        mode: u32,
+        size: u64,
+        content: C,
+    },
+    Symlink {
+        member: usize,
+        path: String,
+        target: String,
+    },
+    Hardlink {
+        path: String,
+        target: String,
+    },
+}
+
+/// The planner's output over a generic member list, before it is mapped onto
+/// [`InstallPlan`] (content borrowed from the archive) or [`MetaPlan`]
+/// (no content).
+struct CorePlan<C> {
+    ops: Vec<CoreOp<C>>,
+    deferred: Vec<String>,
+    unresolved: Vec<String>,
+    unsafe_members: Vec<UnsafeMember>,
+    skipped_unsafe: usize,
+    skipped_empty_target: usize,
+    skipped_other: usize,
+}
+
 /// Провижиненные ссылки установочного корня, которые эффектный резолвер имеет
 /// право разворачивать, даже когда они созданы НЕ этим пакетом.
 ///
@@ -243,6 +399,11 @@ pub struct InstallPlan<'a> {
 
 /// Turn tar members into the ordered operations a faithful install performs.
 ///
+/// This is the eager flavour ([`InstallPlan`] keeps a borrowed content slice per
+/// file); it is the API the host property tests and the in-memory installer use.
+/// [`plan_install_meta`] applies the exact same rules to a content-free metadata
+/// list for the streaming two-pass install.
+///
 /// The rules (`EXT2-LINKS.md` §5.6):
 ///
 ///   * only `Regular`, `Symlink` and `Hardlink` members produce operations;
@@ -276,8 +437,98 @@ pub struct InstallPlan<'a> {
 /// relying on install order. Refusing a hard link to an archive symlink is
 /// likewise deliberate: Debian package builders do not emit hard links for symlink
 /// members, while the alias is exactly the primitive F-r2-vfs-1 needs.
-pub fn plan_install<'a>(entries: &[TarEntry<'a>]) -> InstallPlan<'a> {
-    let mut plan = InstallPlan::default();
+pub fn plan_install<'a>(entries: &'a [TarEntry<'a>]) -> InstallPlan<'a> {
+    let core = plan_core(entries, |entry| entry.content);
+    InstallPlan {
+        ops: core
+            .ops
+            .into_iter()
+            .map(|op| match op {
+                CoreOp::File {
+                    path,
+                    mode,
+                    content,
+                    ..
+                } => InstallOp::File {
+                    path,
+                    content,
+                    mode,
+                },
+                CoreOp::Symlink { path, target, .. } => InstallOp::Symlink { path, target },
+                CoreOp::Hardlink { path, target } => InstallOp::Hardlink { path, target },
+            })
+            .collect(),
+        deferred: core.deferred,
+        unresolved: core.unresolved,
+        unsafe_members: core.unsafe_members,
+        skipped_unsafe: core.skipped_unsafe,
+        skipped_empty_target: core.skipped_empty_target,
+        skipped_other: core.skipped_other,
+    }
+}
+
+/// Plan a **metadata-only** member list for the streaming two-pass installer.
+///
+/// Same rules and same result shape as [`plan_install`] minus the file bytes:
+/// each `MetaOp::File` keeps the declared size instead of a content slice, so the
+/// plan's resident size is the metadata (paths/modes/targets), not the archive.
+/// Pass 2 feeds the actual bytes as they decompress; see
+/// [`crate::pkg::install_fs::StreamingInstall`].
+pub fn plan_install_meta(entries: &[super::tar::TarMeta]) -> MetaPlan {
+    let core = plan_core(entries, |_| ());
+    MetaPlan {
+        ops: core
+            .ops
+            .into_iter()
+            .map(|op| match op {
+                CoreOp::File {
+                    member,
+                    path,
+                    mode,
+                    size,
+                    ..
+                } => MetaOp::File {
+                    member,
+                    path,
+                    mode,
+                    size,
+                },
+                CoreOp::Symlink {
+                    member,
+                    path,
+                    target,
+                } => MetaOp::Symlink {
+                    member,
+                    path,
+                    target,
+                },
+                CoreOp::Hardlink { path, target } => MetaOp::Hardlink { path, target },
+            })
+            .collect(),
+        deferred: core.deferred,
+        unresolved: core.unresolved,
+        unsafe_members: core.unsafe_members,
+        skipped_unsafe: core.skipped_unsafe,
+        skipped_empty_target: core.skipped_empty_target,
+        skipped_other: core.skipped_other,
+    }
+}
+
+/// The one implementation of the planning rules, shared by [`plan_install`] and
+/// [`plan_install_meta`] (and therefore by every security test).
+fn plan_core<'a, M, C>(entries: &'a [M], content_of: impl Fn(&'a M) -> C) -> CorePlan<C>
+where
+    M: PlanMember,
+{
+    let mut plan: CorePlan<C> = CorePlan {
+        ops: Vec::new(),
+        deferred: Vec::new(),
+        unresolved: Vec::new(),
+        unsafe_members: Vec::new(),
+        skipped_unsafe: 0,
+        skipped_empty_target: 0,
+        skipped_other: 0,
+    };
     // Paths this archive creates, used to order hard links.
     let mut created: Vec<String> = Vec::new();
     // Hard links still to be ordered: (member path, normalized target).
@@ -288,10 +539,10 @@ pub fn plan_install<'a>(entries: &[TarEntry<'a>]) -> InstallPlan<'a> {
     // after all links, so archive order alone would miss `file x/y` + `link x`).
     let mut own_links: BTreeSet<String> = BTreeSet::new();
     for entry in entries {
-        if entry.kind != TarType::Symlink || entry.link_target.is_empty() {
+        if entry.plan_kind() != TarType::Symlink || entry.plan_link_target().is_empty() {
             continue;
         }
-        if let NormPath::Keep(p) = normalize_entry_path(&effective_path(entry)) {
+        if let NormPath::Keep(p) = normalize_entry_path(&entry.plan_path()) {
             own_links.insert(p);
         }
     }
@@ -310,13 +561,13 @@ pub fn plan_install<'a>(entries: &[TarEntry<'a>]) -> InstallPlan<'a> {
     // ever adds paths.
     let mut hardlink_pairs: Vec<(String, String)> = Vec::new();
     for entry in entries {
-        if entry.kind != TarType::Hardlink || entry.link_target.is_empty() {
+        if entry.plan_kind() != TarType::Hardlink || entry.plan_link_target().is_empty() {
             continue;
         }
-        let NormPath::Keep(path) = normalize_entry_path(&effective_path(entry)) else {
+        let NormPath::Keep(path) = normalize_entry_path(&entry.plan_path()) else {
             continue;
         };
-        let NormPath::Keep(target) = normalize_entry_path(entry.link_target) else {
+        let NormPath::Keep(target) = normalize_entry_path(entry.plan_link_target()) else {
             continue;
         };
         hardlink_pairs.push((path, target));
@@ -333,10 +584,10 @@ pub fn plan_install<'a>(entries: &[TarEntry<'a>]) -> InstallPlan<'a> {
         }
     }
 
-    for entry in entries {
+    for (member, entry) in entries.iter().enumerate() {
         // Long paths arrive through the GNU `'L'` header or the ustar `prefix`
-        // field; `effective_path` joins the latter.
-        let raw = effective_path(entry);
+        // field; the member view exposes the joined effective path.
+        let raw = entry.plan_path();
         let path = match normalize_entry_path(&raw) {
             NormPath::Keep(p) => p,
             NormPath::SkipUnsafe => {
@@ -355,37 +606,40 @@ pub fn plan_install<'a>(entries: &[TarEntry<'a>]) -> InstallPlan<'a> {
             });
             continue;
         }
-        match entry.kind {
+        match entry.plan_kind() {
             TarType::Regular => {
-                plan.ops.push(InstallOp::File {
+                plan.ops.push(CoreOp::File {
+                    member,
                     path: path.clone(),
-                    content: entry.content,
-                    mode: entry.mode,
+                    mode: entry.plan_mode(),
+                    size: entry.plan_size(),
+                    content: content_of(entry),
                 });
                 created.push(path);
             }
             TarType::Symlink => {
-                if entry.link_target.is_empty() {
+                if entry.plan_link_target().is_empty() {
                     plan.skipped_empty_target += 1;
                     continue;
                 }
                 // Verbatim: no normalization, no existence check, no deferral.
-                plan.ops.push(InstallOp::Symlink {
+                plan.ops.push(CoreOp::Symlink {
+                    member,
                     path: path.clone(),
-                    target: String::from(entry.link_target),
+                    target: String::from(entry.plan_link_target()),
                 });
                 // A symlink is a directory entry too, so a hard link may reference
                 // it (Linux `link(2)` does not follow the final component).
                 created.push(path);
             }
             TarType::Hardlink => {
-                if entry.link_target.is_empty() {
+                if entry.plan_link_target().is_empty() {
                     plan.skipped_empty_target += 1;
                     continue;
                 }
                 // Tar stores the target as the *archive* path of the first
                 // occurrence, so it is normalized like any other member path.
-                match normalize_entry_path(entry.link_target) {
+                match normalize_entry_path(entry.plan_link_target()) {
                     NormPath::Keep(t) => {
                         // The hard-link target is resolved on the installed tree;
                         // if it descends through a link this archive creates, the
@@ -435,7 +689,7 @@ pub fn plan_install<'a>(entries: &[TarEntry<'a>]) -> InstallPlan<'a> {
         for (path, target) in pending {
             if created.iter().any(|c| *c == target) {
                 created.push(path.clone());
-                plan.ops.push(InstallOp::Hardlink { path, target });
+                plan.ops.push(CoreOp::Hardlink { path, target });
                 progressed = true;
             } else {
                 remaining.push((path, target));
@@ -465,7 +719,7 @@ pub fn plan_install<'a>(entries: &[TarEntry<'a>]) -> InstallPlan<'a> {
         }
     }
     for (path, target) in pending {
-        plan.ops.push(InstallOp::Hardlink { path, target });
+        plan.ops.push(CoreOp::Hardlink { path, target });
     }
     plan
 }

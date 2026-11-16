@@ -10,11 +10,11 @@ Inside pagh:
 
 ```text
 ifconfig
-apt setmirror https://deb.debian.org /debian
-apt update
-apt install busybox-static
+ppkg setmirror https://deb.debian.org /debian
+ppkg update
+ppkg install busybox-static
 lxrun /mnt/bin/busybox
-apt install python3   # the base userland is installed from the shell, not by boot
+ppkg install python3   # the base userland is installed from the shell, not by boot
 python
 ```
 
@@ -24,16 +24,16 @@ On the first boot with a fresh `disk.img`, the kernel seeds `/mnt` (release meta
 skeleton, mini-Rust example) from `src/provision.rs::seed()`, guarded by
 `/mnt/etc/pagh-release`, so later boots are no-ops. Boot installs nothing over the network
 and never blocks on a console question: the base glibc + CPython userland (≈35 packages,
-≈50 MB of downloads) is installed **on demand from the shell** with `apt update` +
-`apt install python3`. Progress appears on serial through the normal apt logging. Delete
+≈50 MB of downloads) is installed **on demand from the shell** with `ppkg update` +
+`ppkg install python3`. Progress appears on serial through the normal apt logging. Delete
 `disk.img` to re-seed from scratch.
 
 ## Index decode robustness
 
-`apt update` tries the `Packages.gz`, `Packages.xz`, and plain `Packages` variants in
+`ppkg update` tries the `Packages.gz`, `Packages.xz`, and plain `Packages` variants in
 order — but only those the signed `Release` lists, with the digest and size it declares
 (the variant list in `src/pkg/apt.rs::update`). A decode failure in one variant (e.g. a corrupt gzip stream)
-logs an honest `deb:`/`apt:` diagnostic on serial and falls through to the next variant;
+logs an honest `deb:`/`ppkg:` diagnostic on serial and falls through to the next variant;
 a **digest or size mismatch** does not fall through — it aborts the update, because a
 mismatch means the mirror served bytes that differ from the signed metadata. Package
 payloads unpack with tar symlinks and hardlinks **created as real links**: symlink inodes
@@ -44,7 +44,7 @@ and shared inodes through the ext2 writer (issue #18), with the `tar`
 
 ## Trust status
 
-DNS, HTTP/HTTPS, package-index parsing, dependency resolution, `.deb` decompression and ext2 installation are implemented. HTTPS authenticates the mirror fail-closed: the server chain must reach the committed CA bundle (four pinned roots — ISRG Root X1/X2, GTS Root R1/R4), the leaf SAN must authorize the host, the 2025 clock gate must pass, and the TLS 1.3 `CertificateVerify` signature must check out; a handshake that omits the certificate is refused outright. Plain HTTP is unauthenticated as a transport, but it no longer decides what pagh trusts: `apt update` verifies `InRelease`/`Release.gpg` against the pinned Debian keys, checks the `Packages` digest **and** size from the signed `Release` before parsing it, and `apt install` checks each `.deb` digest **and** size from the signed index before unpacking it. A mirror that serves no signatures is refused outright (no override flag exists). Deployment consequences: the local mini-repo used by the E2E harnesses must be signed with the test anchor, and a mirror that is not signed by one of the pinned Debian keys is unusable by design; what remains unverified (revocation distribution, replay of a whole old triplet on suites without `Valid-Until`, the index-free `pkg` command) is stated in `SECURITY.md`.
+DNS, HTTP/HTTPS, package-index parsing, dependency resolution, `.deb` decompression and ext2 installation are implemented. HTTPS authenticates the mirror fail-closed: the server chain must reach the committed CA bundle (four pinned roots — ISRG Root X1/X2, GTS Root R1/R4), the leaf SAN must authorize the host, the 2025 clock gate must pass, and the TLS 1.3 `CertificateVerify` signature must check out; a handshake that omits the certificate is refused outright. Plain HTTP is unauthenticated as a transport, but it no longer decides what pagh trusts: `ppkg update` verifies `InRelease`/`Release.gpg` against the pinned Debian keys, checks the `Packages` digest **and** size from the signed `Release` before parsing it, and `ppkg install` checks each `.deb` digest **and** size from the signed index before unpacking it. A mirror that serves no signatures is refused outright (no override flag exists). Deployment consequences: the local mini-repo used by the E2E harnesses must be signed with the test anchor, and a mirror that is not signed by one of the pinned Debian keys is unusable by design; what remains unverified (revocation distribution, replay of a whole old triplet on suites without `Valid-Until`, the index-free `pkg` command) is stated in `SECURITY.md`.
 
 For a fail-closed build:
 

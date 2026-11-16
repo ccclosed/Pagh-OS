@@ -5,7 +5,7 @@ issue #32's trust chain.
 
 Suites under `tools/mini_repo/dists/` (one served root, switched with `apt setsuite`):
 
-    stable/          correct AND signed          -> `apt update` + `install` succeed
+    stable/          correct AND signed          -> `ppkg update` + `install` succeed
     tampered-index/  signature VALID, but the served `Packages` is a same-length
                      version-swapped copy of the one the signed `Release` describes
                                                   -> update refused, no index published
@@ -364,7 +364,7 @@ def write_suite(suite: str, signer, deb: bytes, tamper_deb: bool, links: bytes =
     if tamper_deb:
         # Flip one bit inside the (compressed) data member: the file keeps its
         # exact length, so the signed `Size:` matches and the SHA-256 is the only
-        # check that can refuse it. `apt install` verifies the digest BEFORE it
+        # check that can refuse it. `ppkg install` verifies the digest BEFORE it
         # parses the archive, which is the behaviour under test.
         served_deb[-1] ^= 0x01
     served_deb = bytes(served_deb)
@@ -484,7 +484,7 @@ def build_repo() -> None:
 def build_big_index(n: int) -> None:
     """DIAGNOSTIC (Pagh-OS apt parse-stage crash repro): generate a LARGE synthetic
     `Packages` index of `n` stanzas and write both `Packages` and `Packages.gz`
-    under dists/stable/main/binary-amd64, so the kernel `apt update` streaming
+    under dists/stable/main/binary-amd64, so the kernel `ppkg update` streaming
     parse path is exercised at real-`main` scale over local HTTP (no live CDN).
 
     Mirrors the host-tests `bigindex` generator field-for-field (Package, Version,
@@ -538,6 +538,170 @@ def build_big_index(n: int) -> None:
     print(f"  Packages.gz : {len(gz_bytes)} bytes ({len(gz_bytes)//1024} KiB)")
 
 
+# ───────────────────────── apt performance benchmark repo ─────────────────────────
+
+# Suite name the in-guest benchmark (`lx_apt_bench`) points apt at. Kept apart
+# from the `stable`/tampered suites so a benchmark run can never be mistaken for,
+# or accidentally serve, the trust-chain fixtures.
+BENCH_SUITE = "bench"
+
+# Installed file name prefix; the in-guest driver checks one of these exists.
+BENCH_FILE_PREFIX = "usr/share/bench"
+
+
+def _bench_payload(total_bytes: int, n_files: int) -> list:
+    """`n_files` regular files whose contents together are `total_bytes`.
+
+    The bytes are a repeating pattern on purpose: the *compressed* `.deb` stays
+    tiny (so the benchmark isolates CPU/decompress/install work from the
+    QEMU user-net transfer limit), while the decompressed `data.tar` is the full
+    size and therefore the allocation the streaming change targets.
+    """
+    n_files = max(1, n_files)
+    per = max(1, total_bytes // n_files)
+    pat = b"pagh-apt-benchmark-payload-0123456789abcdef\n"
+    chunk = (pat * ((per + len(pat) - 1) // len(pat)))[:per]
+    return [
+        {
+            "name": f"{BENCH_FILE_PREFIX}/file-{i:04d}",
+            "mode": 0o644,
+            "data": chunk,
+        }
+        for i in range(n_files)
+    ]
+
+
+def bench_deb(pkg: str, version: str, payload_mib: int, n_files: int,
+              depends: str = "") -> bytes:
+    """A real `.deb` whose `data.tar.gz` installs `n_files` files (payload_mib MiB)."""
+    data_tar_gz = make_tar_gz(_bench_payload(payload_mib * 1024 * 1024, n_files))
+    control = (
+        f"Package: {pkg}\n"
+        f"Version: {version}\n"
+        "Architecture: amd64\n"
+        "Maintainer: Pagh-OS <root@pagh>\n"
+        f"{('Depends: ' + depends + chr(10)) if depends else ''}"
+        f"Description: apt performance benchmark payload ({payload_mib} MiB)\n"
+    ).encode()
+    control_tar_gz = make_tar_gz([{"name": "control", "mode": 0o644, "data": control}])
+    return build_deb(control_tar_gz, data_tar_gz)
+
+
+def build_bench_repo(out_dir: str, stanzas: int, size_mib: int) -> None:
+    """Generate a signed benchmark repository under `out_dir` (never the committed
+    `tools/mini_repo` tree).
+
+    Layout: one suite `bench`, whose index holds `stanzas` records in total. The
+    first records are the install transaction the benchmark drives:
+
+      * `bench-large` — `size_mib` MiB of files, depends on the two deps below;
+      * `bench-dep-0`/`bench-dep-1` — `size_mib/4` MiB each,
+
+    followed by synthetic filler stanzas (`bench-filler-NNNNNN`) that only make
+    the index big enough to measure the parse stage. `ppkg install bench-large`
+    therefore fetches four signed `.deb`s and writes ~`size_mib` MiB in one
+    transaction — exactly the multi-package shape the once-per-transaction `sync`
+    change targets.
+    """
+    pgp.self_test()  # deterministic TEST-ONLY key; never a real signing secret
+    out_dir = os.path.abspath(out_dir)
+    large_mib = max(1, size_mib // 2)
+    dep_mib = max(1, size_mib // 4)
+    large = bench_deb("bench-large", "1.0", large_mib, 128,
+                      depends="bench-dep-0, bench-dep-1")
+    dep0 = bench_deb("bench-dep-0", "1.0", dep_mib, 32)
+    dep1 = bench_deb("bench-dep-1", "1.0", dep_mib, 32)
+    debs = [("bench-large", large), ("bench-dep-0", dep0), ("bench-dep-1", dep1)]
+
+    index = b""
+    for pkg, deb in debs:
+        rel = f"pool/main/b/{pkg}/{pkg}_1.0_amd64.deb"
+        index += (
+            f"Package: {pkg}\n"
+            "Version: 1.0\n"
+            "Architecture: amd64\n"
+            "Maintainer: Pagh-OS <root@pagh>\n"
+            + ("Depends: bench-dep-0, bench-dep-1\n" if pkg == "bench-large" else "")
+            + f"Filename: {rel}\n"
+            f"Size: {len(deb)}\n"
+            f"MD5sum: {hashlib.md5(deb).hexdigest()}\n"
+            f"SHA256: {hashlib.sha256(deb).hexdigest()}\n"
+            f"Description: apt performance benchmark package {pkg}\n\n"
+        ).encode()
+
+    filler_count = max(0, stanzas - len(debs))
+    for i in range(filler_count):
+        pkg = f"bench-filler-{i:06d}"
+        index += (
+            f"Package: {pkg}\n"
+            f"Version: {i % 10}.{i % 100}\n"
+            "Architecture: amd64\n"
+            "Maintainer: Pagh-OS <root@pagh>\n"
+            f"Filename: pool/main/b/{pkg}/{pkg}_{i % 10}.{i % 100}_amd64.deb\n"
+            f"Size: {512 + (i % 4000)}\n"
+            f"SHA256: {hashlib.sha256(pkg.encode()).hexdigest()}\n"
+            f"Description: synthetic filler stanza {pkg}\n\n"
+        ).encode()
+
+    gz = gzip_bytes(index)
+    idx_dir = os.path.join(out_dir, "dists", BENCH_SUITE, "main", "binary-amd64")
+    os.makedirs(idx_dir, exist_ok=True)
+    with open(os.path.join(idx_dir, "Packages"), "wb") as f:
+        f.write(index)
+    with open(os.path.join(idx_dir, "Packages.gz"), "wb") as f:
+        f.write(gz)
+
+    for pkg, deb in debs:
+        deb_dir = os.path.join(out_dir, "pool", "main", "b", pkg)
+        os.makedirs(deb_dir, exist_ok=True)
+        with open(os.path.join(deb_dir, f"{pkg}_1.0_amd64.deb"), "wb") as f:
+            f.write(deb)
+
+    # Two signed suites with the same content: `bench` is what `lx_apt_bench`
+    # selects programmatically, and `stable` is the default suite so a
+    # shell-level `ppkg update/install` test can point at this repo with only
+    # `ppkg setmirror` (no suite-selection command exists).
+    for suite in (BENCH_SUITE, "stable"):
+        rel_dir = os.path.join(out_dir, "dists", suite)
+        os.makedirs(rel_dir, exist_ok=True)
+        idx_dir = os.path.join(out_dir, "dists", suite, "main", "binary-amd64")
+        os.makedirs(idx_dir, exist_ok=True)
+        with open(os.path.join(idx_dir, "Packages"), "wb") as f:
+            f.write(index)
+        with open(os.path.join(idx_dir, "Packages.gz"), "wb") as f:
+            f.write(gz)
+        release = suite_release(suite, index, gz)
+        with open(os.path.join(rel_dir, "Release"), "wb") as f:
+            f.write(release)
+        sign_release(rel_dir, release, "test")
+
+    print(f"built BENCH repo at {out_dir}")
+    print(f"  suite       : {BENCH_SUITE} (signed by the deterministic TEST key)")
+    print(f"  stanzas     : {len(debs) + filler_count}")
+    print(f"  Packages    : {len(index)} bytes ({len(index)//1024} KiB)")
+    print(f"  Packages.gz : {len(gz)} bytes ({len(gz)//1024} KiB)")
+    for pkg, deb in debs:
+        print(f"  {pkg:12s}: {len(deb)} bytes, "
+              f"{sum(len(m['data']) for m in _bench_payload((size_mib//2 if pkg=='bench-large' else size_mib//4)*1024*1024, 128 if pkg=='bench-large' else 32))//(1024*1024)} MiB decompressed")
+
+
+def serve_dir(directory: str, port: int) -> None:
+    """Serve an arbitrary directory over HTTP (the benchmark repo lives outside
+    the committed `tools/mini_repo` tree and is never snapshotted/restored)."""
+    import http.server
+    import socketserver
+
+    os.chdir(os.path.abspath(directory))
+    handler = http.server.SimpleHTTPRequestHandler
+
+    class Server(socketserver.TCPServer):
+        allow_reuse_address = True
+
+    with Server(("0.0.0.0", port), handler) as httpd:
+        print(f"serving {os.getcwd()} at http://0.0.0.0:{port} (guest reaches host at 10.0.2.2)")
+        httpd.serve_forever()
+
+
 def serve(port: int) -> None:
     import http.server
     import socketserver
@@ -564,6 +728,27 @@ def main() -> None:
         build_big_index(n)
         port = int(sys.argv[3]) if len(sys.argv) > 3 else 8000
         serve(port)
+        return
+
+    # BENCHMARK mode: `mini_repo.py bench OUT [--stanzas N] [--size-mib M] [--serve PORT]`
+    # generates a signed benchmark repo OUTSIDE the committed tree (so the
+    # snapshot/restore fixtures never see it) and optionally serves it.
+    if mode == "bench":
+        import argparse
+
+        bp = argparse.ArgumentParser(prog="mini_repo.py bench")
+        bp.add_argument("out")
+        bp.add_argument("--stanzas", type=int, default=5000)
+        bp.add_argument("--size-mib", type=int, default=24)
+        bp.add_argument("--serve", type=int, default=0)
+        args = bp.parse_args(sys.argv[2:])
+        build_bench_repo(args.out, args.stanzas, args.size_mib)
+        if args.serve:
+            serve_dir(args.out, args.serve)
+        return
+
+    if mode == "serve-dir":
+        serve_dir(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 8000)
         return
 
     build_repo()

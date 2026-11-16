@@ -308,7 +308,7 @@ fn parse_decimal(field: &[u8]) -> Result<usize, DebError> {
 /// moment the running output would exceed this cap, so a hostile member can
 /// never drive unbounded allocation. 64 MiB comfortably covers a real
 /// `data.tar` while staying within kernel memory bounds.
-const MAX_DECOMPRESSED: usize = 64 * 1024 * 1024;
+pub const MAX_DECOMPRESSED: usize = 64 * 1024 * 1024;
 
 /// A higher decompression cap for whole-buffer (non-streaming) decompression.
 ///
@@ -520,7 +520,7 @@ const STREAM_CHUNK: usize = 8 * 1024;
 /// `sink` in fixed-size chunks (at most [`STREAM_CHUNK`] bytes each) **without**
 /// ever materializing the whole decompressed stream in memory.
 ///
-/// This is the bounded-memory core behind `apt update`: the compressed body
+/// This is the bounded-memory core behind `ppkg update`: the compressed body
 /// (~10 MiB for a real `Packages.xz`) stays resident, but its decompressed form
 /// (which can be ~150 MiB) is produced incrementally — each chunk is handed to
 /// `sink` (which feeds it to the streaming [`crate::pkg::apt_index::StanzaParser`]

@@ -80,6 +80,7 @@ pub mod release_file;
 #[cfg(any(
     feature = "lx_selftest",
     feature = "lx_bigindex",
-    feature = "lx_bigindex_inram"
+    feature = "lx_bigindex_inram",
+    feature = "lx_apt_bench"
 ))]
 pub mod openpgp_test_keys;

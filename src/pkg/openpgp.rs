@@ -135,7 +135,7 @@ pub enum OpenPgpError {
 }
 
 impl OpenPgpError {
-    /// The `(stage, cause)` pair for the `apt: verify FAIL stage=… cause=…`
+    /// The `(stage, cause)` pair for the `ppkg: verify FAIL stage=… cause=…`
     /// diagnostic and for `AptOpError::BadSignature`.
     ///
     /// Stages name the layer that refused (`armor`, `clearsign`, `packet`,

@@ -34,7 +34,8 @@ mod security;
     feature = "lx_selftest",
     feature = "lx_livetest",
     feature = "lx_bigindex",
-    feature = "lx_tlsbig"
+    feature = "lx_tlsbig",
+    feature = "lx_apt_bench"
 ))]
 mod selftest_lx;
 mod shell;

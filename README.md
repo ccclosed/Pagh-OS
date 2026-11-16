@@ -74,7 +74,7 @@ ELF-бинарники — статически слинкованные или 
 потоки, `epoll`/`eventfd`, unix-сокеты и VT100-совместимый терминал с raw-mode `termios`),
 включает **`apt`-подобный менеджер пакетов**, который скачивает и ставит Debian-пакеты
 `.deb` по имени через HTTP/HTTPS, и умеет **устанавливать базовый glibc + Python userland**
-на свой ext2-диск по запросу из shell (`apt update` + `apt install python3`) — сама
+на свой ext2-диск по запросу из shell (`ppkg update` + `ppkg install python3`) — сама
 загрузка никогда не останавливается, чтобы что-то спросить.
 
 > Хобби/учебное ядро — **не граница безопасности.** Ring 3 изолирован от ядра
@@ -175,12 +175,12 @@ IDEMPOTENCY`, когда прогонов больше одного); экран
 
 ![pagh self-test](docs/selftest.png)
 
-### `apt update` по HTTPS
+### `ppkg update` по HTTPS
 
 Менеджер пакетов по имени скачивает индекс Debian `Packages` по TLS 1.3, проверив цепочку
 сертификата сервера, hostname и срок действия до того, как прочитан хоть байт индекса.
 
-![pagh apt update](docs/apt.png)
+![pagh ppkg update](docs/apt.png)
 
 ---
 
@@ -287,7 +287,7 @@ IDEMPOTENCY`, когда прогонов больше одного); экран
   (tar-симлинки/hardlink'и создаются настоящими ссылками на ext2).
 - **Провижининг:** идемпотентный first-boot flow засеивает `/mnt`; userland glibc + CPython
   ставится через `apt` (fallback декодирования индекса gz→xz, честная диагностика
-  декодирования, прогресс на serial) по запросу из shell (`apt update` + `apt install
+  декодирования, прогресс на serial) по запросу из shell (`ppkg update` + `ppkg install
   python3`). Загрузка больше не останавливается, чтобы спросить: консольный вопрос без
   таймаута — не то, что загрузка может себе позволить.
 
@@ -335,7 +335,7 @@ chmod +x setup-linux.sh build.sh run.sh
 `run.sh` создаёт при первом запуске raw-диск `disk.img` на 1 GiB и загружает QEMU с 1 GiB
 RAM. Первая загрузка только засеивает скелет файловой системы; базовый userland `python3`
 не ставится из boot-prompt'а (консольный вопрос без таймаута — не то, что загрузка может
-себе позволить). Ставьте его из shell, когда захотите: `apt update`, затем `apt install
+себе позволить). Ставьте его из shell, когда захотите: `ppkg update`, затем `ppkg install
 python3` (≈50 MB загрузки, прогресс на serial). Удалите `disk.img`, чтобы получить чистую,
 заново засеянную систему при следующей загрузке.
 
@@ -440,7 +440,7 @@ soft-float и никогда не трогает векторные регист
 исполняемый в ring 3 через сисколл `SYS_WRITE`. DHCP-lease асинхронно получает поток
 сетевого poll'а после включения прерываний, поэтому он появляется после prompt'а. На
 свежем диске загрузка только засеивает скелет файлов (release-метаданные, `/etc`, пример);
-userland glibc + `python3` ставится по запросу из shell командами `apt update` + `apt
+userland glibc + `python3` ставится по запросу из shell командами `ppkg update` + `apt
 install python3` (прогресс на serial; зеркало лога во framebuffer приостанавливается).
 Prompt показывает текущий рабочий каталог и рендерится в цвете на framebuffer (serial
 остаётся простым текстом).
@@ -514,7 +514,7 @@ Prompt показывает текущий рабочий каталог и ре
 | `jobs` / `fg` / `bg` | Таблица jobs shell; возобновить последнюю остановленную job на переднем/фоновом плане |
 | `lxrun <path> […]`   | Загрузить и запустить Linux x86_64 ELF (статический или glibc) в ring 3 |
 | `pkg <host> <path> [port]` | Скачать `.deb` по HTTP(S) и установить в /mnt            |
-| `apt <subcmd> …`     | Менеджер пакетов: `update`/`install`/`show`/`list`/`setmirror`  |
+| `ppkg <subcmd> …`     | Менеджер пакетов: `update`/`install`/`show`/`list`/`setmirror`  |
 | `warn <on\|off>`     | Показывать/скрывать строки `[WARN]` ядра на экране (serial логирует всегда) |
 | `settings` / `theme` / `wallpaper` | Настроить терминал: темы, обои, статус-строка, каретка |
 | `exec`               | Запустить встроенный ring-3 тестовый процесс                    |
@@ -642,12 +642,12 @@ rust /mnt/pagh-rust-hello one two
 lxrun /mnt/bin/busybox
 
 # point apt at a mirror, refresh the index, then install + run a package
-apt setmirror http://deb.debian.org /debian
-apt update
-apt install busybox-static
+ppkg setmirror http://deb.debian.org /debian
+ppkg update
+ppkg install busybox-static
 lxrun /mnt/bin/busybox
 
-# CPython 3.16 (installed from the shell with `apt install python3`)
+# CPython 3.16 (installed from the shell with `ppkg install python3`)
 python
 ```
 
@@ -676,7 +676,7 @@ python
   `kill(-pgid)` ставит одну копию лидеру группы, а не по одной на thread group (пути
   stop/continue терминала и shell используют broadcast на thread group).
 
-- **Установка ≠ запуск.** `apt install <pkg>` разрешает замыкание зависимостей, скачивает
+- **Установка ≠ запуск.** `ppkg install <pkg>` разрешает замыкание зависимостей, скачивает
   каждый `.deb`, распаковывает его файлы в `/mnt` и создаёт tar-симлинки/hardlink'и
   настоящими ссылками (symlink-inode, общие inode для hardlink'ов — issue #18). Консольные
   программы вроде `python3` действительно работают, и полноэкранные TUI тоже: драйвер VT
@@ -722,12 +722,12 @@ python
   приложения. Доверие ограничено четырьмя запиненными корнями бандла (ISRG Root X1/X2, GTS
   R1/R4), а revocation (CRL/OCSP) не проверяется, поэтому HTTPS-зеркало вне этой выдачи
   отвергается, а не принимается на веру. Поверх этого реализовано доверие к репозиторию:
-  `apt update` проверяет `InRelease`/`Release.gpg` против закоммиченного, запиненного по
+  `ppkg update` проверяет `InRelease`/`Release.gpg` против закоммиченного, запиненного по
   отпечатку keyring'а Debian (binding подключей, expiry, revocation, clock gate 2025) и
   отвергает неподписанное зеркало сразу; тело `Packages` должно совпасть с подписанным
   `SHA-256` **и** размером до декодирования, а каждый `.deb` — с дайджестом из подписанного
-  индекса до распаковки. Plain-HTTP-зеркала (`apt setmirror http://…`) проверяются этой
-  цепочкой на целостность, хотя их транспорт не аутентифицирован, а живой `apt update`
+  индекса до распаковки. Plain-HTTP-зеркала (`ppkg setmirror http://…`) проверяются этой
+  цепочкой на целостность, хотя их транспорт не аутентифицирован, а живой `ppkg update`
   идёт по HTTPS (issue #19 закрыт). Что осталось открытым: распространение отзыва, replay
   целой старой тройки на suite'ах без `Valid-Until` и негативные MITM/digest E2E-harness'ы
   — см. `SECURITY.md`.
@@ -735,7 +735,7 @@ python
 - **Масштаб.** Полный Debian-индекс `main` (~60k пакетов, ~150 MiB в разжатом виде)
   потоково парсится в компактный in-RAM byte-arena индекс (держится только в RAM,
   пересобирается каждую загрузку). End-to-end установка доказана на локальном зеркале;
-  живой полный `apt update` с `deb.debian.org` работает, но медленный под QEMU user-mode
+  живой полный `ppkg update` с `deb.debian.org` работает, но медленный под QEMU user-mode
   networking (slirp) + TCG-эмуляцией.
 
 ---
@@ -840,7 +840,7 @@ src/
 │   ├── tar.rs          # pure ustar reader/writer
 │   ├── install.rs      # pure install-path normalization + model
 │   ├── install_fs.rs   # effectful data.tar → ext2 /mnt installer
-│   └── mirror.rs       # `apt setmirror` host/scheme/port argument parser
+│   └── mirror.rs       # `ppkg setmirror` host/scheme/port argument parser
 ├── sync/
 │   └── spinlock.rs     # IRQ-safe spinlock (built on arch::cpu)
 ├── task/

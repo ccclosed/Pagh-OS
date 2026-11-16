@@ -65,8 +65,8 @@ path after `/mnt` is mounted, and is idempotent (its guard is `/mnt/etc/pagh-rel
    boot may do.
 
 The glibc + CPython userland is installed on demand from the shell instead:
-`apt update` streams the Debian `Packages` index (gz/xz/zstd decode, honest `deb:`/`apt:`
-diagnostics on failure), then `apt install python3` pulls its dependency closure
+`ppkg update` streams the Debian `Packages` index (gz/xz/zstd decode, honest `deb:`/`ppkg:`
+diagnostics on failure), then `ppkg install python3` pulls its dependency closure
 (≈35 packages, ≈50 MB). Delete `disk.img` to re-seed from scratch.
 
 ## Installer details
@@ -119,5 +119,5 @@ gaps left are the ones named above, plus the deliberately unverified manual `pkg
   the **interpreter or a library** was missing, not the binary — check serial for
   `[linux] interpreter … fallback` lines.
 - `Package_Installer: … cause=NoSpace` names the file that failed to write.
-- Decode problems during `apt update` appear as `deb: inflate …` / `apt: index decode
+- Decode problems during `ppkg update` appear as `deb: inflate …` / `ppkg: index decode
   failed …` lines before any fallback is tried.

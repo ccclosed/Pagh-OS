@@ -10,6 +10,8 @@ Framebuffer-shell с редактированием строки, историе
 |---|---|
 | `mod.rs` | I/O-слой REPL: REPL-цикл (`shell_main`), диспетч через реестр, Tab, autorun, dual serial+framebuffer печать, status bar |
 | `commands.rs` | Тела всех команд (`cmd_help`, `cmd_ls`, `cmd_apt`, …) + хелперы `shell_println`, `resolve_arg`, `rm_path` и др. |
+| `ppkg_progress.rs` | Чистая (core+alloc) модель/рендереры прогресса `ppkg install`: known `[====    ]`, unknown `<=>` (`(elapsed_ms/500)%(width-4)`, `???%`), percent/speed/size/ETA, гейт 10 FPS, ANSI/CR/plain-эмиттеры. Host-тесты: `host-tests/src/properties/ppkg_progress_ui.rs` |
+| `progress.rs` | Effectful-драйвер: `InstallObserver` → serial+framebuffer, выбор режима (framebuffer → CR, serial/`--quiet` → plain, `--progress=ansi` → VT100) |
 | `cat.rs` | Чистое ядро `cat`: потоковое чтение чанками 256 Б с капом 64 KiB, дословный вывод и завершающий `\n`, если файл не заканчивается переводом строки (иначе следующий промпт приклеивался к последней строке файла — QA F-04) |
 | `texttools.rs` | Чистое ядро `head`/`tail`/`wc`/`grep`: один потоковый обход строк (чанки 256 Б, кап 4 MiB), ring на N строк для `tail`, счётчики для `wc`, ASCII case-fold подмножество для `grep -i`; сюда же тонкий VFS-слой этих четырёх команд |
 | `registry.rs` | Статическая таблица `COMMANDS: &[CommandSpec]`; `lookup()`, `command_names()` |
@@ -117,7 +119,8 @@ Shift+букву строчной при выключенном CapsLock.
 `chown` (числовой `uid[:gid]`), `sleep`, `nano`, `lua`,
 `python`/`python3`, `pythonc`, `cargo`, `rustc`, `rustup`, `rust`, `paint`,
 `pkg <host> <path> [port]` (HTTP GET .deb → ar → decompress → tar → install в /mnt),
-`apt <update|install|show|list|setmirror>`, `lxrun <path> [args]` (Linux ELF в ring 3,
+`ppkg <update|install|show|list|setmirror>` (`install` принимает `--quiet` и
+`--progress=ansi|cr|plain`, рисуя DNF-style прогресс), `lxrun <path> [args]` (Linux ELF в ring 3,
 fixed env `TERM=xterm`, `PATH=/mnt/usr/bin`; забирает терминал у shell'а на время
 работы — см. «Job control»), `jobs`, `fg`, `bg`, `warn <on|off>` (тумблер fb-зеркала
 warn-логов), `usb` (состояние xHCI и PORTSC каждого порта), `disk`
