@@ -32,8 +32,9 @@ offset  size  field
 | максимальный stride | `width * bpp + 4096` |
 | screen (по умолчанию) | 1280×720 |
 
-`length` проверяется до выделения памяти. Неверная сигнатура, ненулевые `flags`,
-неизвестный `type`, лишние/недостающие байты payload считаются ошибкой кадра.
+`length` проверяется до выделения памяти. Неверная сигнатура, неизвестные
+`flags` (кроме бита 0 у `commit`), неизвестный `type`, лишние/недостающие байты
+payload считаются ошибкой кадра.
 
 ## 2. Типы сообщений
 
@@ -52,6 +53,9 @@ offset  size  field
 | 11 | `ping` | обе стороны |
 | 12 | `pong` | обе стороны |
 | 13 | `launch` | c→s (расширение, см. §8) |
+| 14 | `shm_offer` | c→s (ShmSurface, см. §8.1) |
+| 15 | `shm_ready` | s→c |
+| 16 | `shm_release` | обе стороны |
 
 Строки (`string`) кодируются как `u16 length` (байты UTF-8) + байты. Невалидный UTF-8 —
 ошибка кадра.
@@ -97,7 +101,7 @@ u32 flags
 |---:|---|
 | 0 | поддерживается `XRGB8888` |
 | 1 | поддерживается `RGB565` |
-| 2 | `ShmSurface`/`SCM_RIGHTS` (в v1 всегда 0) |
+| 2 | `ShmSurface`: memfd через `SCM_RIGHTS` + damage-only commit (см. §8.1) |
 
 ## 4. Окна
 
@@ -163,7 +167,7 @@ bytes pixels[data_len]
 совпадает с текущим `configure`, композитор масштабирует его. Ошибки:
 `ERR_UNKNOWN_WINDOW`, `ERR_NOT_OWNER`, `ERR_INVALID_SURFACE`.
 
-### damage (9) — подсказка для будущего частичного аплоада
+### damage (9) — damage-прямоугольники поверхности
 
 ```text
 u32 window_id
@@ -172,8 +176,9 @@ repeat count:
     i32 x, i32 y, u16 w, u16 h     // координаты внутри клиентской поверхности
 ```
 
-В v1 `damage` не уменьшает объём `commit` (кадр всё равно полный), но композитор
-использует подсказку для своей damage-области. Сообщение опционально.
+Legacy-форма не уменьшает объём `commit` (кадр всё равно полный), но композитор
+использует подсказку для своей damage-области. Сообщение опционально. Для окна с
+`shm_offer` используется форма с `generation` и `u32 count` (см. §8.1).
 
 ### close (8)
 
@@ -306,6 +311,91 @@ string cwd        // подсказка рабочего каталога; мо�
 * `cwd` — только подсказка: приложения без понятия рабочего каталога её
   игнорируют (демо-клиент `pagh-desktop-demo` пока не принимает).
 
+## 8.1 ShmSurface (types 14–16)
+
+Расширение PDP/1: клиент отдаёт серверу memfd и шлёт только метаданные + damage.
+Клиентские пиксели не ходят по сокету и никогда не сканируются напрямую. Тип
+поддерживается, если в `welcome.flags` установлен бит 2; иначе клиент обязан
+использовать legacy `commit` с полным кадром.
+
+### shm_offer (14) — c→s
+
+```text
+u32 window_id
+u32 width
+u32 height
+u32 format        // 1 = XRGB8888, 2 = RGB565
+u32 stride        // байт на строку
+u32 flags         // зарезервировано, 0
+```
+
+Ровно один `SCM_RIGHTS` fd приходит ancillary-данными вместе с кадром. Это должен
+быть memfd размером **не меньше** `stride*height`; несколько fd или fd без
+`shm_offer` — ошибка `ERR_BAD_MESSAGE`. `width/height` — 1..=4096,
+`stride ∈ [width*bpp, width*bpp+4096]`. Сервер отображает fd `MAP_SHARED|PROT_READ`
+и создаёт серверную тень поверхности; memfd остаётся собственностью клиента.
+
+### shm_ready (15) — s→c
+
+```text
+u32 window_id
+u32 generation    // сервер назначает; использовать в commit/damage
+```
+
+Приходит после успешного `shm_offer`. `generation` монотонно растёт; commit с
+другим generation отбрасывается без ошибки.
+
+### shm_release (16) — обе стороны
+
+```text
+u32 window_id
+u32 generation
+```
+
+Сервер шлёт `release` старого generation после повторного `shm_offer` (reoffer при
+resize/новом формате). Клиент может прислать `release`, чтобы освободить
+generation; после этого нужен новый `shm_offer`. Старый memfd не переиспользуется
+для нового размера.
+
+### commit (5, flags bit 0 = SHM) — c→s
+
+```text
+u32 window_id
+u32 generation
+u32 damage_count
+repeat damage_count:
+    i32 x, i32 y, u32 w, u32 h    // внутри клиентской поверхности
+```
+
+Пиксельного payload нет: сервер копирует только перечисленные прямоугольники из
+memfd в свою тень и перерисовывает их damage. Форма отличается от legacy `commit`
+битом 0 в `flags` заголовка.
+
+### damage (9) в ShmSurface-форме — c→s
+
+```text
+u32 window_id
+u32 generation
+u32 count
+repeat count:
+    i32 x, i32 y, u32 w, u32 h
+```
+
+Формы `damage` различаются по длине payload: legacy = `6 + 12*n` (6 mod 12),
+ShmSurface = `12 + 16*n` (0/4/8 mod 12). Legacy-клиенты не затронуты.
+
+### Безопасность и ограничения
+
+* fd принимается только через `SCM_RIGHTS`; сервер валидирует `format`, `stride`,
+  размер memfd и все прямоугольники, а также владельца окна.
+* Сервер читает клиентскую память `PROT_READ`; запись в memfd невозможна.
+* В scanout попадают только копии повреждённых прямоугольников из серверной тени,
+  не клиентские страницы.
+* Ошибки: `ERR_NOT_HELLO`, `ERR_UNKNOWN_WINDOW`, `ERR_NOT_OWNER`,
+  `ERR_INVALID_SURFACE`, `ERR_BAD_MESSAGE`.
+* Старый frame-upload (`commit` без флага) работает параллельно; при возврате на
+  него сервер освобождает SHM generation.
+
 ## 9. Пример сессии (два окна)
 
 ```text
@@ -329,9 +419,8 @@ S: close(101, reason=1)      // при нажатии «x» сервер сам 
 
 ## 10. Ограничения v1
 
-* Нет `SCM_RIGHTS`/shared memory: каждый кадр копируется через сокет.
-* Нет частичного аплоада: `commit` всегда передаёт полный кадр; `damage` — только
-  подсказка.
+* Legacy-`commit` передаёт полный кадр через сокет; частичный аплоад доступен
+  только через ShmSurface (`shm_offer` + damage-only commit).
 * Нет pointer enter/leave, grab-ов, DnD, курсоров клиента, popup-ов.
 * Один глобальный экран; нет outputs/scale/rotation.
 * Окна клиента не имеют собственных sub-surface/декораций; рамка и заголовок —
@@ -340,10 +429,9 @@ S: close(101, reason=1)      // при нажатии «x» сервер сам 
 
 ## 11. Будущее (не в v1)
 
-* `ShmSurface`: `welcome.flags[2]=1`; `create` передаёт memfd через `SCM_RIGHTS` +
-  offset/stride/format, `commit` — только dirty-регионы и id буфера. Frame upload по
-  сокету остаётся fallback-путём.
-* Частичный `commit` (rect list вместо полного кадра) и явный fence/ack кадра.
+* Явный fence/ack кадра ShmSurface; несколько buffers на окно (double buffering на
+  клиенте).
+* Частичный `commit` для legacy-клиентов (rect list вместо полного кадра).
 * fb0/event0 backend ядра: `/dev/fb0` (mmap + `FBIOGET_VSCREENINFO`/`FBIOGET_FSCREENINFO`)
   и `/dev/input/event0` (`struct input_event`), см. `docs/desktop-b.md` kernel-ветки.
 * Клиентские popup/меню и мульти-экран.

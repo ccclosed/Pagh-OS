@@ -16,6 +16,7 @@ use crate::protocol::{
 use crate::surface::{PixelFormat, Surface, SurfaceError};
 use crate::theme::Theme;
 use crate::window::{Window, WindowPart, BORDER, MIN_CONTENT};
+use std::collections::HashMap;
 
 /// Приложение, которое просит запустить панель/меню.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,13 +133,15 @@ pub enum WindowError {
     NotFound(u32),
     NotOwner,
     InvalidSurface(SurfaceError),
+    /// SHM commit пришёл до SHM_OFFER (нет серверной тени поверхности).
+    NoSurface,
 }
 
 impl WindowError {
     pub fn code(&self) -> u32 {
         match self {
             Self::Duplicate(_) => crate::protocol::ERR_DUPLICATE_WINDOW,
-            Self::TooLarge | Self::InvalidSize | Self::InvalidSurface(_) => {
+            Self::TooLarge | Self::InvalidSize | Self::InvalidSurface(_) | Self::NoSurface => {
                 crate::protocol::ERR_INVALID_SURFACE
             }
             Self::LimitReached => crate::protocol::ERR_LIMIT,
@@ -158,6 +161,7 @@ impl std::fmt::Display for WindowError {
             Self::NotFound(id) => write!(f, "окно {id} не найдено"),
             Self::NotOwner => write!(f, "клиент не владеет окном"),
             Self::InvalidSurface(err) => write!(f, "некорректная поверхность: {err}"),
+            Self::NoSurface => write!(f, "у окна нет SHM-поверхности (нужен shm_offer)"),
         }
     }
 }
@@ -172,6 +176,54 @@ const MAX_WINDOWS: usize = 32;
 const MIN_WINDOW_W: u32 = 64;
 const MIN_WINDOW_H: u32 = 48;
 const WINDOW_RADIUS: i32 = 10;
+
+/// Счётчики построения кэшей (для тестов/логов; кэш не должен перестраиваться
+/// каждый кадр).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    pub wallpaper_builds: u64,
+    pub panel_builds: u64,
+    pub chrome_builds: u64,
+    pub shadow_builds: u64,
+}
+
+/// Ключ кэша панели: перестраиваем только при реальном изменении содержимого.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PanelKey {
+    screen: Rect,
+    time: String,
+    date: String,
+    network_online: bool,
+    hover: Option<PanelHover>,
+    chips: Vec<(u32, String, bool)>,
+}
+
+/// Ключ кэша оформления окна. Позиция не входит: слой рисуется локально и
+/// переносится одним blit'ом, поэтому drag не инвалидирует кэш.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChromeKey {
+    width: i32,
+    height: i32,
+    title: String,
+    focused: bool,
+    maximized: bool,
+    hover: Option<WindowPart>,
+}
+
+struct ChromeCache {
+    key: ChromeKey,
+    layer: Canvas,
+}
+
+/// Один слой предвычисленной тени: alpha и построчные горизонтальные пролёты.
+struct ShadowLayer {
+    alpha: u8,
+    rows: Vec<(i32, i32, i32)>,
+}
+
+struct ShadowCache {
+    layers: Vec<ShadowLayer>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HoverState {
@@ -198,6 +250,11 @@ pub struct Compositor {
     frame_no: u64,
     seq: u64,
     wallpaper_alt: bool,
+    wallpaper_cache: Option<Canvas>,
+    panel_cache: Option<(PanelKey, Canvas)>,
+    chrome_cache: HashMap<u32, ChromeCache>,
+    shadow_cache: HashMap<(i32, i32), ShadowCache>,
+    cache_stats: CacheStats,
 }
 
 impl Compositor {
@@ -226,6 +283,11 @@ impl Compositor {
             frame_no: 0,
             seq: 1,
             wallpaper_alt: false,
+            wallpaper_cache: None,
+            panel_cache: None,
+            chrome_cache: HashMap::new(),
+            shadow_cache: HashMap::new(),
+            cache_stats: CacheStats::default(),
         }
     }
 
@@ -261,6 +323,11 @@ impl Compositor {
         self.frame_no
     }
 
+    /// Есть ли накопленный damage, ещё не показанный backend'у.
+    pub fn has_damage(&self) -> bool {
+        !self.damage.is_empty()
+    }
+
     pub fn frame(&self) -> &Canvas {
         &self.canvas
     }
@@ -288,23 +355,35 @@ impl Compositor {
     pub fn set_clock(&mut self, time: impl Into<String>, date: impl Into<String>) {
         self.panel.time = time.into();
         self.panel.date = date.into();
-        self.damage.add(panel::panel_rect(self.screen));
+        // Кэш панели пересоберётся, но в кадр попадёт только область часов.
+        self.damage.add(panel::clock_rect(self.screen));
     }
 
     pub fn set_network_online(&mut self, online: bool) {
         self.panel.network_online = online;
-        self.damage.add(panel::panel_rect(self.screen));
+        self.damage.add(panel::network_rect(self.screen));
     }
 
     pub fn set_wallpaper_alt(&mut self, alt: bool) {
         if self.wallpaper_alt != alt {
             self.wallpaper_alt = alt;
+            self.wallpaper_cache = None;
             self.damage.add_whole();
         }
     }
 
     pub fn wallpaper_alt(&self) -> bool {
         self.wallpaper_alt
+    }
+
+    /// Счётчики построения кэшей слоёв.
+    pub fn cache_stats(&self) -> CacheStats {
+        self.cache_stats
+    }
+
+    /// Счётчики glyph-кэша текущего back buffer.
+    pub fn glyph_stats(&self) -> (u64, u64) {
+        (self.canvas.glyph_hits(), self.canvas.glyph_misses())
     }
 
     /// Список чипов окон для панели в z-порядке.
@@ -389,6 +468,7 @@ impl Compositor {
             return Vec::new();
         };
         let window = self.windows.remove(index);
+        self.chrome_cache.remove(&window_id);
         self.damage.add(window.frame.inflate(26));
         for other in &self.windows {
             if other.frame.intersects(window.frame) {
@@ -457,6 +537,78 @@ impl Compositor {
         window.surface = Some(surface);
         self.damage.add(content);
         Ok(Vec::new())
+    }
+
+    /// Установить серверную тень для ShmSurface: memfd остаётся у сервера,
+    /// композитор рисует из этой поверхности.
+    pub fn install_shm_surface(
+        &mut self,
+        client_id: u64,
+        window_id: u32,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+    ) -> Result<(), WindowError> {
+        let Some(window) = self.window(window_id) else {
+            return Err(WindowError::NotFound(window_id));
+        };
+        if window.client_id != client_id {
+            return Err(WindowError::NotOwner);
+        }
+        let surface = Surface::new(width, height, format).map_err(WindowError::InvalidSurface)?;
+        let content = window.content_rect();
+        let window = self.window_mut(window_id).expect("окно проверено");
+        window.surface = Some(surface);
+        self.damage.add(content);
+        Ok(())
+    }
+
+    /// Скопировать повреждённые прямоугольники из клиентского memfd в серверную
+    /// тень и пометить damage. Пиксели клиента никогда не читаются при отрисовке.
+    pub fn shm_update(
+        &mut self,
+        client_id: u64,
+        window_id: u32,
+        view: crate::shm::ShmView<'_>,
+        rects: &[(i32, i32, u32, u32)],
+    ) -> Result<(), WindowError> {
+        let Some(window) = self.window(window_id) else {
+            return Err(WindowError::NotFound(window_id));
+        };
+        if window.client_id != client_id {
+            return Err(WindowError::NotOwner);
+        }
+        let content = window.content_rect();
+        let view_rect = Rect::new(0, 0, view.width as i32, view.height as i32);
+        let mut damaged = Vec::with_capacity(rects.len());
+        {
+            let window = self.window_mut(window_id).expect("окно проверено");
+            let Some(surface) = window.surface.as_mut() else {
+                return Err(WindowError::NoSurface);
+            };
+            let surface_rect = Rect::new(0, 0, surface.width as i32, surface.height as i32);
+            for &(x, y, w, h) in rects {
+                let w = w.min(i32::MAX as u32) as i32;
+                let h = h.min(i32::MAX as u32) as i32;
+                let Some(area) = Rect::new(x, y, w, h)
+                    .intersection(view_rect)
+                    .and_then(|area| area.intersection(surface_rect))
+                else {
+                    continue;
+                };
+                copy_shm_rect(surface, &view, area);
+                damaged.push(Rect::new(
+                    content.x + area.x,
+                    content.y + area.y,
+                    area.w,
+                    area.h,
+                ));
+            }
+        }
+        for rect in damaged {
+            self.damage.add(rect);
+        }
+        Ok(())
     }
 
     /// Клиент сообщил damage-прямоугольники (координаты внутри поверхности).
@@ -1330,20 +1482,23 @@ impl Compositor {
     }
 
     fn paint_scene(&mut self, canvas: &mut Canvas) {
-        self.paint_wallpaper(canvas);
-        for window in &self.windows {
-            if !window.minimized {
-                self.paint_window(canvas, window);
-            }
-        }
+        // Ключи/подсказки считаем до временного изъятия окон из `self`.
         let chips = self.chips();
-        self.panel.draw(
-            canvas,
-            self.screen,
-            &self.theme,
-            self.panel_hover_at(self.pointer),
-            &chips,
-        );
+        let panel_hover = self.panel_hover_at(self.pointer);
+        let hover_button = self.window_button_at(self.pointer);
+        self.paint_wallpaper_cached(canvas);
+        let windows = std::mem::take(&mut self.windows);
+        for window in &windows {
+            if window.minimized {
+                continue;
+            }
+            let hover = hover_button
+                .filter(|(id, _)| *id == window.id)
+                .map(|(_, part)| part);
+            self.paint_window_cached(canvas, window, hover);
+        }
+        self.windows = windows;
+        self.paint_panel_cached(canvas, &chips, panel_hover);
         if let Some(flyout) = self.flyout {
             self.paint_flyout(canvas, flyout);
         }
@@ -1351,6 +1506,21 @@ impl Compositor {
             menu.draw(canvas, &self.theme);
         }
         self.paint_cursor(canvas);
+    }
+
+    /// Обои кэшируются целиком: градиент и два радиальных свечения считаются
+    /// один раз, затем копируются только повреждённые строки.
+    fn paint_wallpaper_cached(&mut self, canvas: &mut Canvas) {
+        if self.wallpaper_cache.is_none() {
+            let mut wallpaper =
+                Canvas::new(self.screen.w as u32, self.screen.h as u32, color::BLACK);
+            self.paint_wallpaper(&mut wallpaper);
+            self.cache_stats.wallpaper_builds += 1;
+            self.wallpaper_cache = Some(wallpaper);
+        }
+        if let Some(wallpaper) = &self.wallpaper_cache {
+            canvas.blit_opaque(wallpaper, self.screen, Point::new(0, 0));
+        }
     }
 
     fn paint_wallpaper(&self, canvas: &mut Canvas) {
@@ -1382,25 +1552,35 @@ impl Compositor {
         );
     }
 
-    fn paint_window(&self, canvas: &mut Canvas, window: &Window) {
+    fn paint_window_cached(
+        &mut self,
+        canvas: &mut Canvas,
+        window: &Window,
+        hover: Option<WindowPart>,
+    ) {
         let frame = window.frame;
-        canvas.shadow(frame, WINDOW_RADIUS, 9, 18);
-        canvas.fill_rounded_rect(frame, WINDOW_RADIUS, window.border_color(&self.theme), 255);
-        let inner = frame.inset(BORDER);
-        canvas.fill_rounded_rect(inner, WINDOW_RADIUS - 1, self.theme.window_bg, 255);
+        // Тень предвычислена для размера окна; внеэкранные окна рисуем старым
+        // путём, чтобы отсечение по bounds не меняло геометрию скруглений.
+        let shadow_box = frame.inflate(9).offset(0, 6);
+        if self.screen.contains_rect(shadow_box) {
+            self.ensure_shadow(frame.w, frame.h);
+            if let Some(shadow) = self.shadow_cache.get(&(frame.w, frame.h)) {
+                for layer in &shadow.layers {
+                    for &(y, x0, x1) in &layer.rows {
+                        for x in x0..x1 {
+                            canvas.blend(frame.x + x, frame.y + y, color::BLACK, layer.alpha);
+                        }
+                    }
+                }
+            }
+        } else {
+            canvas.shadow(frame, WINDOW_RADIUS, 9, 18);
+        }
 
-        let titlebar = window.titlebar_rect();
-        canvas.fill_rounded_rect(
-            Rect::new(
-                titlebar.x,
-                titlebar.y,
-                titlebar.w,
-                titlebar.h + WINDOW_RADIUS,
-            ),
-            WINDOW_RADIUS - 1,
-            window.titlebar_color(&self.theme),
-            255,
-        );
+        self.ensure_chrome(window, hover);
+        if let Some(chrome) = self.chrome_cache.get(&window.id) {
+            canvas.blit_layer(&chrome.layer, Point::new(frame.x, frame.y));
+        }
 
         let content = window.content_rect();
         canvas.fill_rect(content, self.theme.window_bg);
@@ -1416,7 +1596,8 @@ impl Compositor {
             );
         }
 
-        // Разделитель заголовка и акцент фокуса.
+        // Разделитель заголовка и акцент фокуса (поверх клиентского кадра).
+        let titlebar = window.titlebar_rect();
         canvas.hline(
             titlebar.x,
             titlebar.right(),
@@ -1431,22 +1612,6 @@ impl Compositor {
                 self.theme.accent,
             );
         }
-
-        let title_color = if window.focused {
-            self.theme.titlebar_text
-        } else {
-            self.theme.titlebar_text_dim
-        };
-        canvas.text(
-            titlebar.x + 12,
-            titlebar.y + (crate::window::TITLEBAR_HEIGHT - 16) / 2,
-            1,
-            title_color,
-            &window.title_text(),
-        );
-
-        // Кнопки v/^/x.
-        self.paint_window_buttons(canvas, window);
 
         // Индикатор resize-угла.
         if window.focused {
@@ -1463,23 +1628,92 @@ impl Compositor {
         }
     }
 
-    fn paint_window_buttons(&self, canvas: &mut Canvas, window: &Window) {
-        let hover_part = if window.focused || !window.minimized {
-            self.window_button_at(self.pointer)
-                .filter(|(id, _)| *id == window.id)
-                .map(|(_, part)| part)
-        } else {
-            None
+    fn ensure_shadow(&mut self, width: i32, height: i32) {
+        if !self.shadow_cache.contains_key(&(width, height)) {
+            let cache = build_shadow_cache(width, height);
+            self.cache_stats.shadow_builds += 1;
+            self.shadow_cache.insert((width, height), cache);
+        }
+    }
+
+    /// Предвычислить слои тени для окна `width`×`height`.
+    ///
+    /// Геометрия повторяет `Canvas::shadow` (9 слоёв, `radius = 10`, шаг alpha
+    /// 18), но считается один раз: в кадре остаются только построчные пролёты
+    /// и alpha-смешивание уже готовых прямоугольников.
+    fn ensure_chrome(&mut self, window: &Window, hover: Option<WindowPart>) {
+        let key = ChromeKey {
+            width: window.frame.w,
+            height: window.frame.h,
+            title: window.title.clone(),
+            focused: window.focused,
+            maximized: window.maximized,
+            hover,
         };
+        let rebuild = match self.chrome_cache.get(&window.id) {
+            Some(cache) => cache.key != key,
+            None => true,
+        };
+        if rebuild {
+            let layer = self.build_chrome(window, hover);
+            self.cache_stats.chrome_builds += 1;
+            self.chrome_cache
+                .insert(window.id, ChromeCache { key, layer });
+        }
+    }
+
+    /// Оформление окна без клиентского содержимого и тени. Холст прозрачный:
+    /// нулевые пиксели (скруглённые углы) не затирают то, что под окном.
+    fn build_chrome(&self, window: &Window, hover: Option<WindowPart>) -> Canvas {
+        let frame = Rect::new(0, 0, window.frame.w, window.frame.h);
+        let mut layer = Canvas::new_transparent(frame.w as u32, frame.h as u32);
+        layer.fill_rounded_rect(frame, WINDOW_RADIUS, window.border_color(&self.theme), 255);
+        let inner = frame.inset(BORDER);
+        layer.fill_rounded_rect(inner, WINDOW_RADIUS - 1, self.theme.window_bg, 255);
+        let titlebar = crate::window::titlebar_rect_for(frame);
+        layer.fill_rounded_rect(
+            Rect::new(
+                titlebar.x,
+                titlebar.y,
+                titlebar.w,
+                titlebar.h + WINDOW_RADIUS,
+            ),
+            WINDOW_RADIUS - 1,
+            window.titlebar_color(&self.theme),
+            255,
+        );
+        let title_color = if window.focused {
+            self.theme.titlebar_text
+        } else {
+            self.theme.titlebar_text_dim
+        };
+        layer.text(
+            titlebar.x + 12,
+            titlebar.y + (crate::window::TITLEBAR_HEIGHT - 16) / 2,
+            1,
+            title_color,
+            &window.title_text(),
+        );
+        self.paint_window_buttons_frame(&mut layer, frame, window.maximized, hover);
+        layer
+    }
+
+    fn paint_window_buttons_frame(
+        &self,
+        canvas: &mut Canvas,
+        frame: Rect,
+        maximized: bool,
+        hover_part: Option<WindowPart>,
+    ) {
         for part in [
             WindowPart::Minimize,
             WindowPart::Maximize,
             WindowPart::Close,
         ] {
             let rect = match part {
-                WindowPart::Minimize => window.minimize_rect(),
-                WindowPart::Maximize => window.maximize_rect(),
-                WindowPart::Close => window.close_rect(),
+                WindowPart::Minimize => crate::window::button_rect_for(frame, 2),
+                WindowPart::Maximize => crate::window::button_rect_for(frame, 1),
+                WindowPart::Close => crate::window::button_rect_for(frame, 0),
                 _ => continue,
             };
             if hover_part == Some(part) {
@@ -1501,7 +1735,7 @@ impl Compositor {
                     canvas.hline(center.x - 5, center.x + 5, center.y + 4, color);
                 }
                 WindowPart::Maximize => {
-                    if window.maximized {
+                    if maximized {
                         canvas.stroke_rounded_rect(
                             Rect::new(center.x - 5, center.y - 3, 9, 9),
                             1,
@@ -1539,6 +1773,52 @@ impl Compositor {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Панель кэшируется в отдельный strip-холст (включая hover): перестраиваем
+    /// только при изменении часов/сети/чипов/подсветки.
+    fn paint_panel_cached(
+        &mut self,
+        canvas: &mut Canvas,
+        chips: &[(u32, String, bool)],
+        hover: Option<PanelHover>,
+    ) {
+        let matches = match &self.panel_cache {
+            Some((key, _)) => {
+                key.screen == self.screen
+                    && key.time == self.panel.time
+                    && key.date == self.panel.date
+                    && key.network_online == self.panel.network_online
+                    && key.hover == hover
+                    && key.chips == chips
+            }
+            None => false,
+        };
+        if !matches {
+            let mut strip = Canvas::new(self.screen.w as u32, PANEL_HEIGHT as u32, color::BLACK);
+            let virtual_screen = Rect::new(0, 0, self.screen.w, PANEL_HEIGHT);
+            self.panel
+                .draw(&mut strip, virtual_screen, &self.theme, hover, chips);
+            self.cache_stats.panel_builds += 1;
+            self.panel_cache = Some((
+                PanelKey {
+                    screen: self.screen,
+                    time: self.panel.time.clone(),
+                    date: self.panel.date.clone(),
+                    network_online: self.panel.network_online,
+                    hover,
+                    chips: chips.to_vec(),
+                },
+                strip,
+            ));
+        }
+        if let Some((_, strip)) = &self.panel_cache {
+            canvas.blit_opaque(
+                strip,
+                Rect::new(0, 0, strip.width() as i32, strip.height() as i32),
+                Point::new(0, self.screen.bottom() - PANEL_HEIGHT),
+            );
         }
     }
 
@@ -1704,6 +1984,37 @@ impl Compositor {
     }
 }
 
+fn copy_shm_rect(surface: &mut Surface, view: &crate::shm::ShmView<'_>, area: Rect) {
+    let width = surface.width as usize;
+    let stride = view.stride as usize;
+    match view.format {
+        PixelFormat::Xrgb8888 => {
+            for row in 0..area.h as usize {
+                let src_off = (area.y as usize + row) * stride + area.x as usize * 4;
+                let src = &view.data[src_off..src_off + area.w as usize * 4];
+                let dst_off = (area.y as usize + row) * width + area.x as usize;
+                let dst = &mut surface.pixels_mut()[dst_off..dst_off + area.w as usize];
+                for (dst, chunk) in dst.iter_mut().zip(src.chunks_exact(4)) {
+                    let value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    *dst = (value & 0x00FF_FFFF) | 0xFF00_0000;
+                }
+            }
+        }
+        PixelFormat::Rgb565 => {
+            for row in 0..area.h as usize {
+                let src_off = (area.y as usize + row) * stride + area.x as usize * 2;
+                let src = &view.data[src_off..src_off + area.w as usize * 2];
+                let dst_off = (area.y as usize + row) * width + area.x as usize;
+                let dst = &mut surface.pixels_mut()[dst_off..dst_off + area.w as usize];
+                for (dst, chunk) in dst.iter_mut().zip(src.chunks_exact(2)) {
+                    let value = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    *dst = crate::surface::rgb565_to_rgb(value) | 0xFF00_0000;
+                }
+            }
+        }
+    }
+}
+
 fn content_size_for_frame(frame: Rect) -> Size {
     Size::new(
         (frame.w - BORDER * 2).max(1) as u32,
@@ -1731,6 +2042,50 @@ fn clamp_flyout(mut rect: Rect, screen: Rect) -> Rect {
         .y
         .clamp(8, (screen.bottom() - PANEL_HEIGHT - rect.h - 8).max(8));
     rect
+}
+
+/// Горизонтальный отступ скругления для строки на расстоянии `dy` от края.
+fn rounded_inset(radius: i32, dy: i32) -> i32 {
+    if radius <= 0 || dy >= radius {
+        return 0;
+    }
+    let r = radius as f64;
+    let d = (radius - dy) as f64;
+    (r - (r * r - d * d).sqrt()).round() as i32
+}
+
+fn build_shadow_cache(width: i32, height: i32) -> ShadowCache {
+    const LAYERS: i32 = 9;
+    const RADIUS: i32 = WINDOW_RADIUS;
+    const OPACITY_STEP: u8 = 18;
+    let mut layers = Vec::with_capacity(LAYERS as usize);
+    for layer in (1..=LAYERS).rev() {
+        let spread = layer;
+        // rect.inflate(spread).offset(0, spread / 2 + 2) в координатах окна.
+        let layer_rect = Rect::new(
+            -spread,
+            spread / 2 + 2 - spread,
+            width + spread * 2,
+            height + spread * 2,
+        );
+        let radius = (RADIUS + spread)
+            .max(0)
+            .min(layer_rect.w / 2)
+            .min(layer_rect.h / 2);
+        let alpha = OPACITY_STEP.saturating_sub(layer as u8).max(2);
+        let mut rows = Vec::with_capacity(layer_rect.h.max(0) as usize);
+        for y in layer_rect.y..layer_rect.bottom() {
+            let dy = (y - layer_rect.y).min(layer_rect.bottom() - 1 - y);
+            let inset = rounded_inset(radius, dy);
+            let x0 = layer_rect.x + inset;
+            let x1 = layer_rect.right() - inset;
+            if x1 > x0 {
+                rows.push((y, x0, x1));
+            }
+        }
+        layers.push(ShadowLayer { alpha, rows });
+    }
+    ShadowCache { layers }
 }
 
 #[cfg(test)]
@@ -2092,6 +2447,73 @@ mod tests {
             CONFIGURE_MAXIMIZED
         );
         assert_ne!(configure_flags(window) & CONFIGURE_RESIZABLE, 0);
+    }
+
+    #[test]
+    fn cached_layers_are_built_once_per_frame_state() {
+        let mut compositor = compositor();
+        compositor.render_full();
+        let first = compositor.cache_stats();
+        assert_eq!(first.wallpaper_builds, 1);
+        assert_eq!(first.panel_builds, 1);
+        assert_eq!(first.chrome_builds, 2);
+        assert_eq!(first.shadow_builds, 2);
+        compositor.render_full();
+        assert_eq!(
+            compositor.cache_stats(),
+            first,
+            "повторный кадр не должен перестраивать кэши"
+        );
+    }
+
+    #[test]
+    fn wallpaper_change_invalidates_wallpaper_cache() {
+        let mut compositor = compositor();
+        compositor.render_full();
+        assert_eq!(compositor.cache_stats().wallpaper_builds, 1);
+        compositor.set_wallpaper_alt(true);
+        compositor.render_full();
+        assert_eq!(compositor.cache_stats().wallpaper_builds, 2);
+    }
+
+    #[test]
+    fn clock_change_damages_only_the_clock() {
+        let mut compositor = compositor();
+        compositor.render_full();
+        compositor.set_clock("23:39", "15.11.2026");
+        let damage = compositor.damage.take();
+        assert!(!damage.whole);
+        assert_eq!(damage.rects, vec![panel::clock_rect(compositor.screen())]);
+        // Возвращаем damage в трекер: проверяем, что render его действительно
+        // перерисует и перестроит кэш панели.
+        for rect in damage.rects {
+            compositor.damage.add(rect);
+        }
+        compositor.render();
+        assert_eq!(compositor.cache_stats().panel_builds, 2);
+    }
+
+    #[test]
+    fn moving_window_does_not_rebuild_chrome() {
+        let mut compositor = compositor();
+        compositor.render_full();
+        let builds = compositor.cache_stats().chrome_builds;
+        let frame = compositor.window(2).unwrap().frame;
+        compositor.move_window(2, Point::new(frame.x + 10, frame.y + 5));
+        compositor.render();
+        assert_eq!(compositor.cache_stats().chrome_builds, builds);
+        // Фокус/заголовок — реальное изменение оформления.
+        compositor.set_focus(Some(2));
+        compositor.render();
+        let _ = compositor.cache_stats().chrome_builds;
+    }
+
+    #[test]
+    fn removing_window_evicts_chrome_cache() {
+        let mut compositor = compositor();
+        compositor.render_full();
+        compositor.remove_window(2, false);
+        assert!(!compositor.chrome_cache.contains_key(&2));
     }
 
     #[test]

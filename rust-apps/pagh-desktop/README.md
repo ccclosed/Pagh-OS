@@ -35,9 +35,18 @@ pagh-desktop server ──► Compositor ──► damage-регионы ──�
 * Рабочий стол: градиентные обои с радиальным свечением, программные тени и
   alpha-смешивание, скруглённые окна, акцент фокуса, контекстное меню рабочего стола и
   окна, курсор.
-* Damage/repaint: композитор копит прямоугольники и перерисовывает только их; headless
-  backend пишет PNG, тесты проверяют, что курсор/локальная подсветка не вызывают
-  полнокадровый damage.
+* Damage/repaint и 60 Hz: один back buffer, damage-merge/clip, present только
+  повреждённых прямоугольников (для 32 bpp — построчный `copy_from_slice`), без
+  полного кадра в idle. Кэшируются обои, панель, заголовки/тени окон и глифы;
+  текст не перебирает битмап на каждом кадре (`src/glyph.rs`).
+* **ShmSurface (PDP/1 types 14–16)**: клиент отдаёт memfd через `SCM_RIGHTS`,
+  сервер копирует только damage-прямоугольники в свою тень и не сканирует
+  клиентскую память. `welcome.flags` бит 2; legacy frame-upload остаётся
+  fallback-путём. Счётчики `presents/bytes_presented/compose_ms/present_ms/
+  shm_*` печатаются в логе завершения.
+* Тесты: damage-merge/clamp/collapse, каширование слоёв, opacity/alpha equality,
+  e2e idle (0 presents), drag (bytes < полэкрана), cursor (маленький rect) и
+  ShmSurface (pattern из memfd, reoffer/stale generation, damage-only).
 * Демо-клиенты: Terminal, Files, Paint (рисуются тем же холстом, что и композитор),
   `pagh-desktop-demo --scenario` генерирует 9 скриншотов сценария.
 * Тесты: 89 unit + 5 integration (AF_UNIX e2e с реальными сокетами, два клиента,

@@ -15,14 +15,16 @@ use crate::geometry::Point;
 use crate::protocol::{
     self, Decoder, Message, ERR_BAD_MESSAGE, ERR_INTERNAL, ERR_INVALID_SURFACE, ERR_NOT_HELLO,
     ERR_NOT_OWNER, ERR_UNSUPPORTED, VERSION, WELCOME_FORMAT_RGB565, WELCOME_FORMAT_XRGB8888,
+    WELCOME_SHM_SURFACE,
 };
 use crate::surface::{PixelFormat, Surface};
-use std::io::{self, ErrorKind, Read};
+use std::io::{self, ErrorKind};
 use std::os::unix::fs::FileTypeExt;
+use std::os::unix::io::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -193,13 +195,27 @@ pub enum ServerCommand {
     CloseWindow {
         window_id: u32,
     },
+    /// Прочитать пиксель текущего back buffer (диагностика/e2e без PNG-декодера).
+    SamplePixel {
+        x: i32,
+        y: i32,
+        tx: Sender<Option<u32>>,
+    },
     Shutdown,
 }
 
 enum Incoming {
-    Client { conn: u64, message: Message },
+    Client {
+        conn: u64,
+        message: Message,
+        /// Ровно один fd, пришедший вместе с `shm_offer`.
+        fd: Option<OwnedFd>,
+    },
     Disconnected(u64),
-    ProtocolError { conn: u64, detail: String },
+    ProtocolError {
+        conn: u64,
+        detail: String,
+    },
     Command(ServerCommand),
 }
 
@@ -208,6 +224,87 @@ struct ClientConn {
     client_id: Option<u64>,
     name: String,
     writer: Arc<Mutex<UnixStream>>,
+}
+
+/// Счётчики кадра: present-ы, байты scanout, время compose/present и ShmSurface.
+#[derive(Debug, Default)]
+pub struct RenderCounters {
+    presents: AtomicU64,
+    bytes_presented: AtomicU64,
+    damage_rects: AtomicU64,
+    compose_ns: AtomicU64,
+    present_ns: AtomicU64,
+    shm_offers: AtomicU64,
+    shm_commits: AtomicU64,
+    shm_bytes: AtomicU64,
+}
+
+/// Снимок [`RenderCounters`] для логов/тестов.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderStats {
+    pub presents: u64,
+    pub bytes_presented: u64,
+    pub damage_rects: u64,
+    pub compose_ns: u64,
+    pub present_ns: u64,
+    pub shm_offers: u64,
+    pub shm_commits: u64,
+    pub shm_bytes: u64,
+}
+
+impl RenderCounters {
+    pub fn snapshot(&self) -> RenderStats {
+        RenderStats {
+            presents: self.presents.load(Ordering::Relaxed),
+            bytes_presented: self.bytes_presented.load(Ordering::Relaxed),
+            damage_rects: self.damage_rects.load(Ordering::Relaxed),
+            compose_ns: self.compose_ns.load(Ordering::Relaxed),
+            present_ns: self.present_ns.load(Ordering::Relaxed),
+            shm_offers: self.shm_offers.load(Ordering::Relaxed),
+            shm_commits: self.shm_commits.load(Ordering::Relaxed),
+            shm_bytes: self.shm_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn reset(&self) {
+        for counter in [
+            &self.presents,
+            &self.bytes_presented,
+            &self.damage_rects,
+            &self.compose_ns,
+            &self.present_ns,
+            &self.shm_offers,
+            &self.shm_commits,
+            &self.shm_bytes,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+impl RenderStats {
+    pub fn compose_ms(&self) -> f64 {
+        self.compose_ns as f64 / 1_000_000.0
+    }
+
+    pub fn present_ms(&self) -> f64 {
+        self.present_ns as f64 / 1_000_000.0
+    }
+
+    /// Строка для логов/selftest.
+    pub fn log_line(&self) -> String {
+        format!(
+            "presents={} bytes_presented={} damage_rects={} compose_ms={:.3} present_ms={:.3} shm_offers={} shm_commits={} shm_bytes={}",
+            self.presents,
+            self.bytes_presented,
+            self.damage_rects,
+            self.compose_ms(),
+            self.present_ms(),
+            self.shm_offers,
+            self.shm_commits,
+            self.shm_bytes
+        )
+    }
 }
 
 /// Управляющий handle к серверу.
@@ -257,6 +354,13 @@ impl ServerControl {
         self.send(ServerCommand::CloseWindow { window_id });
     }
 
+    /// Пиксель текущего back buffer (диагностика/e2e).
+    pub fn sample_pixel(&self, x: i32, y: i32) -> Option<u32> {
+        let (tx, rx) = channel();
+        self.send(ServerCommand::SamplePixel { x, y, tx });
+        rx.recv_timeout(Duration::from_secs(2)).ok().flatten()
+    }
+
     pub fn shutdown(&self) {
         self.running.store(false, Ordering::SeqCst);
         self.send(ServerCommand::Shutdown);
@@ -270,6 +374,8 @@ impl ServerControl {
 /// Handle запущенного в отдельном потоке сервера.
 pub struct ServerHandle {
     pub control: ServerControl,
+    /// Счётчики текущего сервера (presents/bytes/compose/SHM).
+    pub counters: Arc<RenderCounters>,
     join: JoinHandle<io::Result<()>>,
 }
 
@@ -301,6 +407,9 @@ pub struct Server {
     selfcheck_due: Option<Instant>,
     selfcheck_done: bool,
     selfcheck_failed: bool,
+    counters: Arc<RenderCounters>,
+    shm: std::collections::HashMap<u32, crate::shm::ShmBinding>,
+    next_shm_generation: u32,
 }
 
 fn open_backend(options: &ServerOptions) -> io::Result<OutputBackend> {
@@ -478,6 +587,9 @@ impl Server {
             selfcheck_due,
             selfcheck_done: false,
             selfcheck_failed: false,
+            counters: Arc::new(RenderCounters::default()),
+            shm: std::collections::HashMap::new(),
+            next_shm_generation: 1,
         })
     }
 
@@ -485,8 +597,17 @@ impl Server {
     pub fn spawn(options: ServerOptions) -> io::Result<ServerHandle> {
         let server = Self::bind(options)?;
         let control = server.control();
+        let counters = server.counters.clone();
         let join = thread::spawn(move || server.run());
-        Ok(ServerHandle { control, join })
+        Ok(ServerHandle {
+            control,
+            counters,
+            join,
+        })
+    }
+
+    pub fn counters(&self) -> Arc<RenderCounters> {
+        self.counters.clone()
     }
 
     pub fn control(&self) -> ServerControl {
@@ -524,6 +645,10 @@ impl Server {
             );
         }
         self.ensure_demo_window();
+        // 60 Hz: один present на интервал, несколько commit'ов в одной итерации
+        // цикла сливаются в один damage-набор.
+        const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+        let mut next_frame = Instant::now();
         loop {
             if !self.running.load(Ordering::SeqCst) {
                 break;
@@ -531,10 +656,9 @@ impl Server {
             self.poll_input();
             self.accept_pending();
             let mut shutdown = false;
-            // Неблокирующий дренаж: `recv_timeout` опирается на futex-таймаут,
-            // который в compat-слое просыпается с большой задержкой, из-за чего
-            // evdev не опрашивался секундами. Композитор и так должен тикать
-            // коротко (input + damage), поэтому спим явно в конце итерации.
+            // Неблокирующий дренаж: `recv_timeout` в compat-слое Pagh опирается
+            // на futex-таймаут, который может просыпаться с большой задержкой,
+            // поэтому канал дренируем без блокировки, а паузу делаем `sleep`.
             while let Ok(incoming) = self.incoming_rx.try_recv() {
                 if !self.handle_incoming(incoming) {
                     shutdown = true;
@@ -544,7 +668,17 @@ impl Server {
             if shutdown {
                 break;
             }
-            self.render_if_needed()?;
+            let now = Instant::now();
+            if now >= next_frame {
+                let before = self.backend.frames();
+                self.render_if_needed()?;
+                next_frame = if self.backend.frames() != before {
+                    Instant::now() + FRAME_INTERVAL
+                } else {
+                    // Damage нет: следующий commit может быть показан сразу.
+                    now
+                };
+            }
             self.reap_children();
             if !self.demo_started && self.options.spawn_demo {
                 self.demo_started = true;
@@ -562,7 +696,8 @@ impl Server {
                     break;
                 }
             }
-            thread::sleep(Duration::from_millis(2));
+            // Пауза до ближайшего дедлайна: нет damage — не крутим кадры.
+            thread::sleep(self.next_wakeup(next_frame));
         }
         let failed = self.selfcheck_failed;
         self.cleanup();
@@ -789,8 +924,8 @@ impl Server {
 
     fn handle_incoming(&mut self, incoming: Incoming) -> bool {
         match incoming {
-            Incoming::Client { conn, message } => {
-                self.handle_client_message(conn, message);
+            Incoming::Client { conn, message, fd } => {
+                self.handle_client_message(conn, message, fd);
                 true
             }
             Incoming::Disconnected(conn) => {
@@ -845,10 +980,15 @@ impl Server {
                     eprintln!("pagh-desktop: screenshot {}: {err}", path.display());
                 }
             }
+            ServerCommand::SamplePixel { x, y, tx } => {
+                let pixel = self.compositor.frame().get(x, y) & 0x00FF_FFFF;
+                let _ = tx.send(Some(pixel));
+            }
             ServerCommand::CloseWindow { window_id } => {
                 // notify=true: клиент получает close(reason=SERVER) и сам
                 // завершается — это имитация нажатия `x` в заголовке.
                 let events = self.compositor.remove_window(window_id, true);
+                self.shm.remove(&window_id);
                 self.dispatch(events);
             }
             ServerCommand::Shutdown => return false,
@@ -856,7 +996,7 @@ impl Server {
         true
     }
 
-    fn handle_client_message(&mut self, conn: u64, message: Message) {
+    fn handle_client_message(&mut self, conn: u64, message: Message, fd: Option<OwnedFd>) {
         let Some(index) = self.clients.iter().position(|c| c.id == conn) else {
             return;
         };
@@ -892,7 +1032,9 @@ impl Server {
                         client_id: id,
                         width: self.compositor.screen().w as u32,
                         height: self.compositor.screen().h as u32,
-                        flags: WELCOME_FORMAT_XRGB8888 | WELCOME_FORMAT_RGB565,
+                        flags: WELCOME_FORMAT_XRGB8888
+                            | WELCOME_FORMAT_RGB565
+                            | WELCOME_SHM_SURFACE,
                     },
                 );
             }
@@ -931,6 +1073,19 @@ impl Server {
                     self.reply_error(conn, ERR_NOT_HELLO, "сначала hello");
                     return;
                 };
+                // Клиент вернулся на legacy frame upload: SHM generation больше
+                // не нужна, освобождаем её и принимаем полный кадр.
+                if let Some(old) = self.shm.remove(&window_id) {
+                    if old.client_id == client_id {
+                        self.send_to_client(
+                            client_id,
+                            Message::ShmRelease {
+                                window_id,
+                                generation: old.generation,
+                            },
+                        );
+                    }
+                }
                 match Surface::from_wire(width, height, stride, format, &pixels) {
                     Ok(surface) => match self
                         .compositor
@@ -940,6 +1095,57 @@ impl Server {
                         Err(err) => self.reply_error(conn, err.code(), err.to_string()),
                     },
                     Err(err) => self.reply_error(conn, ERR_INVALID_SURFACE, err.to_string()),
+                }
+            }
+            Message::ShmOffer {
+                window_id,
+                width,
+                height,
+                format,
+                stride,
+                flags,
+            } => {
+                let Some(client_id) = client_id else {
+                    self.reply_error(conn, ERR_NOT_HELLO, "сначала hello");
+                    return;
+                };
+                self.handle_shm_offer(
+                    conn, client_id, window_id, width, height, format, stride, flags, fd,
+                );
+            }
+            Message::ShmCommit {
+                window_id,
+                generation,
+                rects,
+            }
+            | Message::ShmDamage {
+                window_id,
+                generation,
+                rects,
+            } => {
+                let Some(client_id) = client_id else {
+                    self.reply_error(conn, ERR_NOT_HELLO, "сначала hello");
+                    return;
+                };
+                self.handle_shm_update(conn, client_id, window_id, generation, &rects);
+            }
+            Message::ShmRelease {
+                window_id,
+                generation,
+            } => {
+                let Some(client_id) = client_id else {
+                    self.reply_error(conn, ERR_NOT_HELLO, "сначала hello");
+                    return;
+                };
+                let owned = self
+                    .shm
+                    .get(&window_id)
+                    .map(|binding| {
+                        binding.client_id == client_id && binding.generation == generation
+                    })
+                    .unwrap_or(false);
+                if owned {
+                    self.shm.remove(&window_id);
                 }
             }
             Message::Damage { window_id, rects } => {
@@ -966,6 +1172,7 @@ impl Server {
                     return;
                 }
                 let events = self.compositor.remove_window(window_id, false);
+                self.shm.remove(&window_id);
                 self.dispatch(events);
             }
             Message::Ping { nonce } => {
@@ -986,6 +1193,172 @@ impl Server {
                 );
             }
         }
+    }
+
+    fn handle_shm_offer(
+        &mut self,
+        conn: u64,
+        client_id: u64,
+        window_id: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+        stride: u32,
+        flags: u32,
+        fd: Option<OwnedFd>,
+    ) {
+        if flags != 0 {
+            self.reply_error(conn, ERR_INVALID_SURFACE, "shm_offer: flags должны быть 0");
+            return;
+        }
+        let Some(format) = PixelFormat::from_wire(format) else {
+            self.reply_error(conn, ERR_INVALID_SURFACE, "shm_offer: неизвестный формат");
+            return;
+        };
+        let owned = self
+            .compositor
+            .window(window_id)
+            .map(|window| window.client_id == client_id)
+            .unwrap_or(false);
+        if !owned {
+            let exists = self.compositor.window(window_id).is_some();
+            self.reply_error(
+                conn,
+                if exists {
+                    ERR_NOT_OWNER
+                } else {
+                    ERR_INVALID_SURFACE
+                },
+                "shm_offer: окно не найдено или чужое",
+            );
+            return;
+        }
+        if width == 0 || height == 0 || width > 4096 || height > 4096 {
+            self.reply_error(conn, ERR_INVALID_SURFACE, "shm_offer: недопустимый размер");
+            return;
+        }
+        let minimum = width.saturating_mul(format.bytes_per_pixel());
+        if stride < minimum || stride > minimum.saturating_add(4096) {
+            self.reply_error(
+                conn,
+                ERR_INVALID_SURFACE,
+                format!("shm_offer: stride {stride} вне [{minimum}, {minimum}+4096]"),
+            );
+            return;
+        }
+        let Some(needed) = (stride as usize).checked_mul(height as usize) else {
+            self.reply_error(conn, ERR_INVALID_SURFACE, "shm_offer: overflow");
+            return;
+        };
+        let Some(fd) = fd else {
+            self.reply_error(conn, ERR_BAD_MESSAGE, "shm_offer без SCM_RIGHTS fd");
+            return;
+        };
+        let mapping = match crate::shm::map_readonly(fd, needed) {
+            Ok(mapping) => mapping,
+            Err(err) => {
+                self.reply_error(conn, ERR_INVALID_SURFACE, format!("shm_offer: {err}"));
+                return;
+            }
+        };
+        if let Err(err) = self
+            .compositor
+            .install_shm_surface(client_id, window_id, width, height, format)
+        {
+            self.reply_error(conn, err.code(), err.to_string());
+            return;
+        }
+        let generation = self.next_shm_generation.max(1);
+        self.next_shm_generation = generation.wrapping_add(1).max(1);
+        let old = self.shm.insert(
+            window_id,
+            crate::shm::ShmBinding {
+                client_id,
+                window_id,
+                generation,
+                width,
+                height,
+                format,
+                stride,
+                mapping,
+            },
+        );
+        self.counters.shm_offers.fetch_add(1, Ordering::Relaxed);
+        self.send_to_client(
+            client_id,
+            Message::ShmReady {
+                window_id,
+                generation,
+            },
+        );
+        if let Some(old) = old {
+            // Старый generation освобождается сразу после reoffer; клиент
+            // обязан прислать новый memfd/fd, старые commit'ы будут отброшены.
+            self.send_to_client(
+                client_id,
+                Message::ShmRelease {
+                    window_id,
+                    generation: old.generation,
+                },
+            );
+        }
+    }
+
+    fn handle_shm_update(
+        &mut self,
+        conn: u64,
+        client_id: u64,
+        window_id: u32,
+        generation: u32,
+        rects: &[(i32, i32, u32, u32)],
+    ) {
+        let Some(binding) = self.shm.get(&window_id) else {
+            self.reply_error(conn, ERR_INVALID_SURFACE, "shm commit без shm_offer");
+            return;
+        };
+        if binding.client_id != client_id {
+            self.reply_error(conn, ERR_NOT_OWNER, "shm commit чужого окна");
+            return;
+        }
+        if binding.generation != generation {
+            // Устаревший кадр: молча отбрасываем (клиент уже получил RELEASE).
+            return;
+        }
+        let Some(view) = binding.view() else {
+            self.reply_error(
+                conn,
+                ERR_INVALID_SURFACE,
+                "shm mapping короче stride*height",
+            );
+            return;
+        };
+        let bpp = binding.format.bytes_per_pixel() as u64;
+        let view_rect =
+            crate::geometry::Rect::new(0, 0, binding.width as i32, binding.height as i32);
+        let mut area = 0u64;
+        for &(x, y, w, h) in rects {
+            let w = w.min(i32::MAX as u32) as i32;
+            let h = h.min(i32::MAX as u32) as i32;
+            if let Some(rect) = crate::geometry::Rect::new(x, y, w, h).intersection(view_rect) {
+                area += (rect.area().max(0)) as u64;
+            }
+        }
+        match self
+            .compositor
+            .shm_update(client_id, window_id, view, rects)
+        {
+            Ok(()) => {
+                self.counters.shm_commits.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .shm_bytes
+                    .fetch_add(area * bpp, Ordering::Relaxed);
+            }
+            Err(err) => self.reply_error(conn, err.code(), err.to_string()),
+        }
+    }
+
+    fn drop_shm_for_client(&mut self, client_id: u64) {
+        self.shm.retain(|_, binding| binding.client_id != client_id);
     }
 
     fn reply_error(&mut self, conn: u64, code: u32, message: impl Into<String>) {
@@ -1152,6 +1525,7 @@ impl Server {
         let client = self.clients.remove(index);
         if let Some(client_id) = client.client_id {
             let events = self.compositor.remove_client(client_id);
+            self.drop_shm_for_client(client_id);
             self.dispatch(events);
         }
         if !self.options.quiet {
@@ -1161,15 +1535,37 @@ impl Server {
     }
 
     fn render_if_needed(&mut self) -> io::Result<()> {
+        let compose_start = Instant::now();
         let damage = if self.options.full_render {
             self.compositor.render_full()
         } else {
             self.compositor.render()
         };
+        self.counters
+            .compose_ns
+            .fetch_add(compose_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if damage.is_empty() {
+            // Idle: не трогаем scanout и не считаем present.
             return Ok(());
         }
+        let bytes_per_pixel = self
+            .backend
+            .as_fbdev()
+            .map(|fb| (fb.layout().bpp / 8) as u64)
+            .unwrap_or(4);
+        let area: i64 = damage.iter().map(|rect| rect.area().max(0)).sum();
+        let present_start = Instant::now();
         self.backend.present(self.compositor.frame(), &damage)?;
+        self.counters
+            .present_ns
+            .fetch_add(present_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.counters.presents.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .bytes_presented
+            .fetch_add(area as u64 * bytes_per_pixel, Ordering::Relaxed);
+        self.counters
+            .damage_rects
+            .fetch_add(damage.len() as u64, Ordering::Relaxed);
         if let Some(dir) = &self.options.screenshot_dir {
             let path = dir.join(format!("frame_{:05}.png", self.backend.frames()));
             if let Err(err) = crate::png::write_png(&path, self.compositor.frame()) {
@@ -1177,6 +1573,34 @@ impl Server {
             }
         }
         Ok(())
+    }
+
+    /// Сколько ждать до следующего пробуждения: событие в сокете, ввод,
+    /// 60 Hz-дедлайн кадра или служебный таймер.
+    fn next_wakeup(&self, next_frame: Instant) -> Duration {
+        let now = Instant::now();
+        let mut timeout = if self.compositor.has_damage() {
+            next_frame.saturating_duration_since(now)
+        } else if self.clients.is_empty() {
+            // Idle-рабочий стол без клиентов: редкий poll, 0 presents.
+            Duration::from_millis(50)
+        } else {
+            // Живой клиент: просыпаемся на каждом кадре, чтобы commit не ждал.
+            Duration::from_millis(16)
+        };
+        if self.input.is_some() {
+            // evdev — неблокирующий fd; опрашиваем его чаще, чем кадр.
+            timeout = timeout.min(Duration::from_millis(4));
+        }
+        if let Some(due) = self.exit_due {
+            timeout = timeout.min(due.saturating_duration_since(now));
+        }
+        if let Some(due) = self.selfcheck_due {
+            if !self.selfcheck_done {
+                timeout = timeout.min(due.saturating_duration_since(now));
+            }
+        }
+        timeout.max(Duration::from_millis(1))
     }
 
     fn cleanup(&mut self) {
@@ -1200,6 +1624,10 @@ impl Server {
             if self.backend.as_fbdev().is_some() {
                 println!("pagh-desktop: fbdev closed; screen takeover remains armed (ABI one-way)");
             }
+            println!(
+                "pagh-desktop: stats {}",
+                self.counters.snapshot().log_line()
+            );
         }
     }
 
@@ -1211,7 +1639,7 @@ impl Server {
                 self.compositor.screen().w as u32,
                 self.compositor.screen().h as u32,
             ),
-            flags: WELCOME_FORMAT_XRGB8888 | WELCOME_FORMAT_RGB565,
+            flags: WELCOME_FORMAT_XRGB8888 | WELCOME_FORMAT_RGB565 | WELCOME_SHM_SURFACE,
         }
     }
 }
@@ -1240,16 +1668,27 @@ fn shutdown_stream(writer: &Arc<Mutex<UnixStream>>) {
     }
 }
 
-fn read_loop(conn: u64, mut stream: UnixStream, tx: Sender<Incoming>, running: Arc<AtomicBool>) {
+fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<AtomicBool>) {
     let mut decoder = Decoder::new();
     let mut buffer = [0u8; 64 * 1024];
+    // memfd'ы приходят ancillary-данными; SHM_OFFER забирает по одному fd.
+    let mut pending_fds: std::collections::VecDeque<OwnedFd> = std::collections::VecDeque::new();
     'read: loop {
         if !running.load(Ordering::SeqCst) {
             break;
         }
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(n) => {
+        match crate::shm::recv_with_fds(&stream, &mut buffer) {
+            Ok((0, _)) => break,
+            Ok((n, fds)) => {
+                pending_fds.extend(fds);
+                // Защита от клиента, засыпающего сервер fd'ами без offer'ов.
+                if pending_fds.len() > 8 {
+                    let _ = tx.send(Incoming::ProtocolError {
+                        conn,
+                        detail: "слишком много SCM_RIGHTS fd без shm_offer".to_string(),
+                    });
+                    return;
+                }
                 if let Err(err) = decoder.push(&buffer[..n]) {
                     let _ = tx.send(Incoming::ProtocolError {
                         conn,
@@ -1260,7 +1699,21 @@ fn read_loop(conn: u64, mut stream: UnixStream, tx: Sender<Incoming>, running: A
                 loop {
                     match decoder.next_message() {
                         Ok(Some(message)) => {
-                            if tx.send(Incoming::Client { conn, message }).is_err() {
+                            let fd = if matches!(message, Message::ShmOffer { .. }) {
+                                match pending_fds.pop_front() {
+                                    Some(fd) => Some(fd),
+                                    None => {
+                                        let _ = tx.send(Incoming::ProtocolError {
+                                            conn,
+                                            detail: "shm_offer без SCM_RIGHTS fd".to_string(),
+                                        });
+                                        return;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            if tx.send(Incoming::Client { conn, message, fd }).is_err() {
                                 break 'read;
                             }
                         }

@@ -196,6 +196,11 @@ impl Damage {
         !self.whole && self.rects.is_empty()
     }
 
+    /// Суммарная площадь прямоугольников (для счётчиков present/байт).
+    pub fn area(&self) -> i64 {
+        self.rects.iter().map(|rect| rect.area()).sum()
+    }
+
     pub fn merged(rects: Vec<Rect>) -> Vec<Rect> {
         merge_rects(rects)
     }
@@ -212,6 +217,12 @@ pub struct DamageTracker {
     pending: Vec<Rect>,
     whole: bool,
 }
+
+/// Верхняя граница количества damage-прямоугольников за кадр.
+pub const DAMAGE_MAX_RECTS: usize = 64;
+/// Если суммарная площадь damage превышает этот процент экрана, кадр
+/// сворачивается в один полноэкранный прямоугольник.
+pub const DAMAGE_COLLAPSE_PERCENT: i64 = 70;
 
 impl DamageTracker {
     pub fn new(width: u32, height: u32) -> Self {
@@ -232,7 +243,7 @@ impl DamageTracker {
         }
         if let Some(visible) = rect.intersection(self.screen) {
             self.pending.push(visible);
-            if self.pending.len() > 24 {
+            if self.pending.len() > DAMAGE_MAX_RECTS {
                 self.pending = merge_rects(std::mem::take(&mut self.pending));
             }
         }
@@ -262,6 +273,12 @@ impl DamageTracker {
             };
         }
         let rects = merge_rects(std::mem::take(&mut self.pending));
+        if covers_most_of_screen(&rects, self.screen) {
+            return Damage {
+                rects: vec![self.screen],
+                whole: true,
+            };
+        }
         Damage {
             rects,
             whole: false,
@@ -269,8 +286,15 @@ impl DamageTracker {
     }
 }
 
+fn covers_most_of_screen(rects: &[Rect], screen: Rect) -> bool {
+    let total: i64 = rects.iter().map(|rect| rect.area()).sum();
+    total > 0 && total * 100 >= screen.area() * DAMAGE_COLLAPSE_PERCENT
+}
+
 fn merge_rects(mut rects: Vec<Rect>) -> Vec<Rect> {
     rects.retain(|r| !r.is_empty());
+    // Пересекающиеся и соприкасающиеся прямоугольники объединяем: лишняя
+    // площадь безопасна (перерисуем больше), зато список остаётся коротким.
     let mut merged = true;
     while merged {
         merged = false;
@@ -278,7 +302,7 @@ fn merge_rects(mut rects: Vec<Rect>) -> Vec<Rect> {
         while i < rects.len() {
             let mut j = i + 1;
             while j < rects.len() {
-                if rects[i].intersects(rects[j]) {
+                if overlap_or_touch(rects[i], rects[j]) {
                     rects[i] = rects[i].union(rects[j]);
                     rects.swap_remove(j);
                     merged = true;
@@ -289,8 +313,33 @@ fn merge_rects(mut rects: Vec<Rect>) -> Vec<Rect> {
             i += 1;
         }
     }
+    // Ограничиваем количество: сливаем пару с минимальным приростом площади.
+    while rects.len() > DAMAGE_MAX_RECTS {
+        let mut best = (0usize, 1usize, i64::MAX);
+        for i in 0..rects.len() {
+            for j in (i + 1)..rects.len() {
+                let union = rects[i].union(rects[j]).area();
+                let cost = union - rects[i].area() - rects[j].area();
+                if cost < best.2 {
+                    best = (i, j, cost);
+                }
+            }
+        }
+        let (i, j, _) = best;
+        rects[i] = rects[i].union(rects[j]);
+        rects.swap_remove(j);
+    }
     rects.sort_by_key(|r| (r.y, r.x, r.w, r.h));
     rects
+}
+
+fn overlap_or_touch(a: Rect, b: Rect) -> bool {
+    !a.is_empty()
+        && !b.is_empty()
+        && a.x <= b.right()
+        && b.x <= a.right()
+        && a.y <= b.bottom()
+        && b.y <= a.bottom()
 }
 
 #[cfg(test)]
@@ -351,5 +400,58 @@ mod tests {
         let d = tracker.take();
         assert!(d.whole);
         assert_eq!(d.rects, vec![Rect::new(0, 0, 10, 10)]);
+    }
+
+    #[test]
+    fn touching_rects_are_merged() {
+        let mut tracker = DamageTracker::new(100, 100);
+        tracker.add(Rect::new(10, 10, 20, 20));
+        // Касается правой гранью (x=30) — должен слиться, хотя пересечения нет.
+        tracker.add(Rect::new(30, 10, 20, 20));
+        let damage = tracker.take();
+        assert!(!damage.whole);
+        assert_eq!(damage.rects, vec![Rect::new(10, 10, 40, 20)]);
+        assert_eq!(damage.area(), 800);
+    }
+
+    #[test]
+    fn damage_rect_count_is_capped() {
+        let mut tracker = DamageTracker::new(1000, 1000);
+        for i in 0..300 {
+            let x = (i % 25) * 39;
+            let y = (i / 25) * 39;
+            tracker.add(Rect::new(x, y, 20, 20));
+        }
+        let damage = tracker.take();
+        assert!(!damage.whole, "площадь мала для collapse");
+        assert!(
+            damage.rects.len() <= DAMAGE_MAX_RECTS,
+            "прямоугольников {}, ожидался предел {DAMAGE_MAX_RECTS}",
+            damage.rects.len()
+        );
+        assert!(!damage.rects.is_empty());
+    }
+
+    #[test]
+    fn large_damage_collapses_to_screen() {
+        let mut tracker = DamageTracker::new(100, 100);
+        tracker.add(Rect::new(0, 0, 100, 50));
+        tracker.add(Rect::new(0, 50, 100, 25));
+        tracker.add(Rect::new(0, 0, 100, 100));
+        let damage = tracker.take();
+        assert!(damage.whole);
+        assert_eq!(damage.rects, vec![Rect::new(0, 0, 100, 100)]);
+        assert_eq!(damage.area(), 10_000);
+    }
+
+    #[test]
+    fn small_scattered_damage_stays_partial() {
+        let mut tracker = DamageTracker::new(100, 100);
+        tracker.add(Rect::new(0, 0, 10, 10));
+        tracker.add(Rect::new(80, 80, 10, 10));
+        let damage = tracker.take();
+        assert!(!damage.whole);
+        assert_eq!(damage.rects.len(), 2);
+        assert_eq!(damage.area(), 200);
     }
 }
