@@ -275,18 +275,6 @@ impl FbLayout {
         x >= 0 && y >= 0 && (x as u32) < self.width && (y as u32) < self.height
     }
 
-    /// Записать пиксель в буфер с учётом stride и bpp (без проверки границ).
-    fn write_pixel(&self, dst: &mut [u8], x: i32, y: i32, color: u32) {
-        let bytes = self.bytes_per_pixel();
-        let off = y as usize * self.stride_usize() + x as usize * bytes;
-        if off + bytes > dst.len() {
-            return;
-        }
-        let packed = self.pack(color);
-        let raw = packed.to_le_bytes();
-        dst[off..off + bytes].copy_from_slice(&raw[..bytes]);
-    }
-
     /// Прочитать пиксель scanout (для `--fbdev-selfcheck`).
     pub fn read_pixel(&self, src: &[u8], x: i32, y: i32) -> Option<u32> {
         if !self.bounds(x, y) {
@@ -303,21 +291,80 @@ impl FbLayout {
     }
 
     /// Скопировать только повреждённые прямоугольники холста в scanout.
+    ///
+    /// Горячий путь — построчный: для 32 bpp без преобразования каналов
+    /// (`red=16:8`, `green=8:8`, `blue=0:8`) строка копируется словами; для
+    /// 16/24 bpp и нестандартных масок упаковка выполняется по строке, без
+    /// `set_pixel`/`write_pixel` на каждый пиксель.
     pub fn blit_damage(&self, dst: &mut [u8], canvas: &Canvas, damage: &[Rect]) -> usize {
         let screen = Rect::new(0, 0, self.width as i32, self.height as i32);
+        let canvas_rect = canvas.bounds();
+        let bytes = self.bytes_per_pixel();
         let mut pixels = 0usize;
         for rect in damage {
-            let Some(rect) = rect.intersection(screen) else {
+            let Some(rect) = rect
+                .intersection(screen)
+                .and_then(|rect| rect.intersection(canvas_rect))
+            else {
                 continue;
             };
             for y in rect.y..rect.bottom() {
-                for x in rect.x..rect.right() {
-                    self.write_pixel(dst, x, y, canvas.get(x, y));
-                    pixels += 1;
+                let dst_off = y as usize * self.stride_usize() + rect.x as usize * bytes;
+                let dst_end = dst_off + rect.w as usize * bytes;
+                if dst_end > dst.len() {
+                    continue;
                 }
+                let src_off = y as usize * canvas.width() as usize + rect.x as usize;
+                let src = &canvas.pixels()[src_off..src_off + rect.w as usize];
+                self.copy_row(&mut dst[dst_off..dst_end], src);
+                pixels += rect.w as usize;
             }
         }
         pixels
+    }
+
+    /// Признак «scanout уже в XRGB8888 с теми же масками» — можно копировать
+    /// слова без `pack`.
+    fn is_xrgb8888(&self) -> bool {
+        self.bpp == 32
+            && self.red.offset == 16
+            && self.red.length == 8
+            && self.green.offset == 8
+            && self.green.length == 8
+            && self.blue.offset == 0
+            && self.blue.length == 8
+    }
+
+    fn copy_row(&self, dst: &mut [u8], src: &[u32]) {
+        match self.bpp {
+            32 => {
+                if self.is_xrgb8888() {
+                    // Внутренний холст хранит 0xAARRGGBB; в scanout XRGB
+                    // альфа-байт нулевой, как у `pack`.
+                    for (d, s) in dst.chunks_exact_mut(4).zip(src.iter()) {
+                        d.copy_from_slice(&(*s & 0x00FF_FFFF).to_le_bytes());
+                    }
+                } else {
+                    for (d, s) in dst.chunks_exact_mut(4).zip(src.iter()) {
+                        d.copy_from_slice(&self.pack(*s).to_le_bytes());
+                    }
+                }
+            }
+            24 => {
+                for (d, s) in dst.chunks_exact_mut(3).zip(src.iter()) {
+                    d.copy_from_slice(&self.pack(*s).to_le_bytes()[..3]);
+                }
+            }
+            16 => {
+                for (d, s) in dst.chunks_exact_mut(2).zip(src.iter()) {
+                    d.copy_from_slice(&self.pack(*s).to_le_bytes()[..2]);
+                }
+            }
+            _ => {
+                // FbLayout::from_info отбрасывает остальные bpp; ветка нужна
+                // только для исчерпывающести match.
+            }
+        }
     }
 }
 

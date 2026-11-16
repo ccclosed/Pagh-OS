@@ -39,6 +39,15 @@ pub const TYPE_PING: u16 = 11;
 pub const TYPE_PONG: u16 = 12;
 /// Расширение PDP/1: просьба клиента запустить приложение (launch).
 pub const TYPE_LAUNCH: u16 = 13;
+/// c→s: клиент предлагает memfd как поверхность окна (ровно один SCM_RIGHTS fd).
+pub const TYPE_SHM_OFFER: u16 = 14;
+/// s→c: сервер принял memfd и назначил generation.
+pub const TYPE_SHM_READY: u16 = 15;
+/// обе стороны: освободить generation (s→c после reoffer, c→s при закрытии).
+pub const TYPE_SHM_RELEASE: u16 = 16;
+
+/// Бит 0 флагов заголовка: `commit` в SHM-форме (без пикселей).
+pub const HEADER_FLAG_SHM: u16 = 1 << 0;
 
 /// Флаги `configure`.
 pub const CONFIGURE_FOCUSED: u32 = 1 << 0;
@@ -49,7 +58,7 @@ pub const CONFIGURE_RESIZABLE: u32 = 1 << 3;
 /// Флаги `welcome`.
 pub const WELCOME_FORMAT_XRGB8888: u32 = 1 << 0;
 pub const WELCOME_FORMAT_RGB565: u32 = 1 << 1;
-/// SCM_RIGHTS/ShmSurface ещё не поддерживаются.
+/// Поддерживаются ShmSurface/SCM_RIGHTS (memfd + damage-only commit).
 pub const WELCOME_SHM_SURFACE: u32 = 1 << 2;
 
 /// Причины `close`.
@@ -222,6 +231,31 @@ pub enum Message {
     /// каталогом (может быть пустой). Успех не подтверждается отдельным
     /// сообщением, ошибка приходит как [`Message::Error`].
     Launch { app: String, cwd: String },
+    /// c→s: memfd поверхности окна; fd приходит отдельным ancillary SCM_RIGHTS.
+    ShmOffer {
+        window_id: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+        stride: u32,
+        flags: u32,
+    },
+    /// s→c: memfd принят, generation можно использовать в commit/damage.
+    ShmReady { window_id: u32, generation: u32 },
+    /// обе стороны: generation больше не нужен.
+    ShmRelease { window_id: u32, generation: u32 },
+    /// c→s: commit без пикселей (header flags bit 0).
+    ShmCommit {
+        window_id: u32,
+        generation: u32,
+        rects: Vec<(i32, i32, u32, u32)>,
+    },
+    /// c→s: damage-форма ShmSurface (type 9 с generation).
+    ShmDamage {
+        window_id: u32,
+        generation: u32,
+        rects: Vec<(i32, i32, u32, u32)>,
+    },
 }
 
 impl Message {
@@ -240,6 +274,19 @@ impl Message {
             Self::Ping { .. } => TYPE_PING,
             Self::Pong { .. } => TYPE_PONG,
             Self::Launch { .. } => TYPE_LAUNCH,
+            Self::ShmOffer { .. } => TYPE_SHM_OFFER,
+            Self::ShmReady { .. } => TYPE_SHM_READY,
+            Self::ShmRelease { .. } => TYPE_SHM_RELEASE,
+            Self::ShmCommit { .. } => TYPE_COMMIT,
+            Self::ShmDamage { .. } => TYPE_DAMAGE,
+        }
+    }
+
+    /// Флаги заголовка сообщения.
+    pub fn header_flags(&self) -> u16 {
+        match self {
+            Self::ShmCommit { .. } => HEADER_FLAG_SHM,
+            _ => 0,
         }
     }
 
@@ -258,6 +305,11 @@ impl Message {
             Self::Ping { .. } => "ping",
             Self::Pong { .. } => "pong",
             Self::Launch { .. } => "launch",
+            Self::ShmOffer { .. } => "shm_offer",
+            Self::ShmReady { .. } => "shm_ready",
+            Self::ShmRelease { .. } => "shm_release",
+            Self::ShmCommit { .. } => "shm_commit",
+            Self::ShmDamage { .. } => "shm_damage",
         }
     }
 
@@ -267,7 +319,7 @@ impl Message {
         let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&self.kind().to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&self.header_flags().to_le_bytes());
         out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         out.extend_from_slice(&payload);
         out
@@ -434,12 +486,58 @@ impl Message {
                 e.string(app);
                 e.string(cwd);
             }
+            Self::ShmOffer {
+                window_id,
+                width,
+                height,
+                format,
+                stride,
+                flags,
+            } => {
+                e.u32(*window_id);
+                e.u32(*width);
+                e.u32(*height);
+                e.u32(*format);
+                e.u32(*stride);
+                e.u32(*flags);
+            }
+            Self::ShmReady {
+                window_id,
+                generation,
+            }
+            | Self::ShmRelease {
+                window_id,
+                generation,
+            } => {
+                e.u32(*window_id);
+                e.u32(*generation);
+            }
+            Self::ShmCommit {
+                window_id,
+                generation,
+                rects,
+            }
+            | Self::ShmDamage {
+                window_id,
+                generation,
+                rects,
+            } => {
+                e.u32(*window_id);
+                e.u32(*generation);
+                e.u32(rects.len() as u32);
+                for (x, y, w, h) in rects {
+                    e.i32(*x);
+                    e.i32(*y);
+                    e.u32(*w);
+                    e.u32(*h);
+                }
+            }
         }
         e.into_inner()
     }
 
-    /// Разобрать payload по известному типу.
-    fn decode(kind: u16, payload: &[u8]) -> Result<Self, ProtocolError> {
+    /// Разобрать payload по известному типу и флагам заголовка.
+    fn decode(kind: u16, flags: u16, payload: &[u8]) -> Result<Self, ProtocolError> {
         let mut d = PayloadDecoder::payload(payload);
         let message = match kind {
             TYPE_HELLO => Self::Hello {
@@ -470,21 +568,34 @@ impl Message {
                 flags: d.u32()?,
             },
             TYPE_COMMIT => {
-                let window_id = d.u32()?;
-                let width = d.u32()?;
-                let height = d.u32()?;
-                let format = d.u32()?;
-                let stride = d.u32()?;
-                let data_len = d.u32()? as usize;
-                let pixels = d.bytes(data_len)?.to_vec();
-                d.finish()?;
-                Self::Commit {
-                    window_id,
-                    width,
-                    height,
-                    format,
-                    stride,
-                    pixels,
+                if flags & HEADER_FLAG_SHM != 0 {
+                    let window_id = d.u32()?;
+                    let generation = d.u32()?;
+                    let count = d.u32()? as usize;
+                    let rects = decode_rects_u32(&mut d, count)?;
+                    d.finish()?;
+                    Self::ShmCommit {
+                        window_id,
+                        generation,
+                        rects,
+                    }
+                } else {
+                    let window_id = d.u32()?;
+                    let width = d.u32()?;
+                    let height = d.u32()?;
+                    let format = d.u32()?;
+                    let stride = d.u32()?;
+                    let data_len = d.u32()? as usize;
+                    let pixels = d.bytes(data_len)?.to_vec();
+                    d.finish()?;
+                    Self::Commit {
+                        window_id,
+                        width,
+                        height,
+                        format,
+                        stride,
+                        pixels,
+                    }
                 }
             }
             TYPE_INPUT => {
@@ -544,17 +655,31 @@ impl Message {
                 reason: d.u32()?,
             },
             TYPE_DAMAGE => {
+                // Две формы: legacy (u16 count; длина 6 mod 12) и ShmSurface
+                // (generation + u32 count; длина кратна 12).
+                let shm_form = payload.len() >= 12 && payload.len() % 12 == 0;
                 let window_id = d.u32()?;
-                let count = d.u16()? as usize;
-                let mut rects = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let x = d.i32()?;
-                    let y = d.i32()?;
-                    let w = d.u16()?;
-                    let h = d.u16()?;
-                    rects.push((x, y, w, h));
+                if shm_form {
+                    let generation = d.u32()?;
+                    let count = d.u32()? as usize;
+                    let rects = decode_rects_u32(&mut d, count)?;
+                    Self::ShmDamage {
+                        window_id,
+                        generation,
+                        rects,
+                    }
+                } else {
+                    let count = d.u16()? as usize;
+                    let mut rects = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let x = d.i32()?;
+                        let y = d.i32()?;
+                        let w = d.u16()?;
+                        let h = d.u16()?;
+                        rects.push((x, y, w, h));
+                    }
+                    Self::Damage { window_id, rects }
                 }
-                Self::Damage { window_id, rects }
             }
             TYPE_ERROR => Self::Error {
                 code: d.u32()?,
@@ -566,11 +691,41 @@ impl Message {
                 app: d.string()?,
                 cwd: d.string()?,
             },
+            TYPE_SHM_OFFER => Self::ShmOffer {
+                window_id: d.u32()?,
+                width: d.u32()?,
+                height: d.u32()?,
+                format: d.u32()?,
+                stride: d.u32()?,
+                flags: d.u32()?,
+            },
+            TYPE_SHM_READY => Self::ShmReady {
+                window_id: d.u32()?,
+                generation: d.u32()?,
+            },
+            TYPE_SHM_RELEASE => Self::ShmRelease {
+                window_id: d.u32()?,
+                generation: d.u32()?,
+            },
             other => return Err(ProtocolError::UnknownType(other)),
         };
         d.finish()?;
         Ok(message)
     }
+}
+
+fn decode_rects_u32(
+    d: &mut PayloadDecoder<'_>,
+    count: usize,
+) -> Result<Vec<(i32, i32, u32, u32)>, ProtocolError> {
+    // Каждый прямоугольник — 12 байт; count ограничен длиной payload, но
+    // защищаемся от гигантского Vec::with_capacity.
+    let count = count.min(d.remaining() / 12);
+    let mut rects = Vec::with_capacity(count);
+    for _ in 0..count {
+        rects.push((d.i32()?, d.i32()?, d.u32()?, d.u32()?));
+    }
+    Ok(rects)
 }
 
 /// Ошибка разбора/валидации протокола.
@@ -601,6 +756,21 @@ impl From<io::Error> for ProtocolError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
     }
+}
+
+/// Флаги заголовка: bit 0 разрешён только для `commit` (SHM-форма).
+fn validate_header_flags(kind: u16, flags: u16) -> Result<(), ProtocolError> {
+    if flags & !HEADER_FLAG_SHM != 0 {
+        return Err(ProtocolError::BadPayload(format!(
+            "неизвестные флаги заголовка: {flags:#x}"
+        )));
+    }
+    if flags != 0 && kind != TYPE_COMMIT {
+        return Err(ProtocolError::BadPayload(format!(
+            "флаги {flags:#x} допустимы только для commit (type {kind})"
+        )));
+    }
+    Ok(())
 }
 
 /// Инкрементальный разбор потока кадров.
@@ -648,11 +818,7 @@ impl Decoder {
         }
         let kind = u16::from_le_bytes([self.buffer[4], self.buffer[5]]);
         let flags = u16::from_le_bytes([self.buffer[6], self.buffer[7]]);
-        if flags != 0 {
-            return Err(ProtocolError::BadPayload(format!(
-                "зарезервированные флаги заголовка не нулевые: {flags:#x}"
-            )));
-        }
+        validate_header_flags(kind, flags)?;
         let length = u32::from_le_bytes([
             self.buffer[8],
             self.buffer[9],
@@ -668,7 +834,7 @@ impl Decoder {
         }
         let payload: Vec<u8> = self.buffer[HEADER_LEN..total].to_vec();
         self.buffer.drain(..total);
-        Message::decode(kind, &payload).map(Some)
+        Message::decode(kind, flags, &payload).map(Some)
     }
 }
 
@@ -689,12 +855,8 @@ pub fn read_message<R: Read>(reader: &mut R) -> io::Result<Message> {
     }
     let kind = u16::from_le_bytes([header[4], header[5]]);
     let flags = u16::from_le_bytes([header[6], header[7]]);
-    if flags != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "зарезервированные флаги заголовка не нулевые",
-        ));
-    }
+    validate_header_flags(kind, flags)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     let length = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
     if length > MAX_PAYLOAD {
         return Err(io::Error::new(
@@ -704,7 +866,7 @@ pub fn read_message<R: Read>(reader: &mut R) -> io::Result<Message> {
     }
     let mut payload = vec![0u8; length];
     reader.read_exact(&mut payload)?;
-    Message::decode(kind, &payload)
+    Message::decode(kind, flags, &payload)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
 }
 
@@ -761,6 +923,10 @@ struct PayloadDecoder<'a> {
 impl<'a> PayloadDecoder<'a> {
     fn payload(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.pos)
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8], ProtocolError> {

@@ -133,13 +133,15 @@ pub enum WindowError {
     NotFound(u32),
     NotOwner,
     InvalidSurface(SurfaceError),
+    /// SHM commit пришёл до SHM_OFFER (нет серверной тени поверхности).
+    NoSurface,
 }
 
 impl WindowError {
     pub fn code(&self) -> u32 {
         match self {
             Self::Duplicate(_) => crate::protocol::ERR_DUPLICATE_WINDOW,
-            Self::TooLarge | Self::InvalidSize | Self::InvalidSurface(_) => {
+            Self::TooLarge | Self::InvalidSize | Self::InvalidSurface(_) | Self::NoSurface => {
                 crate::protocol::ERR_INVALID_SURFACE
             }
             Self::LimitReached => crate::protocol::ERR_LIMIT,
@@ -159,6 +161,7 @@ impl std::fmt::Display for WindowError {
             Self::NotFound(id) => write!(f, "окно {id} не найдено"),
             Self::NotOwner => write!(f, "клиент не владеет окном"),
             Self::InvalidSurface(err) => write!(f, "некорректная поверхность: {err}"),
+            Self::NoSurface => write!(f, "у окна нет SHM-поверхности (нужен shm_offer)"),
         }
     }
 }
@@ -318,6 +321,11 @@ impl Compositor {
 
     pub fn frame_number(&self) -> u64 {
         self.frame_no
+    }
+
+    /// Есть ли накопленный damage, ещё не показанный backend'у.
+    pub fn has_damage(&self) -> bool {
+        !self.damage.is_empty()
     }
 
     pub fn frame(&self) -> &Canvas {
@@ -527,6 +535,79 @@ impl Compositor {
         window.surface = Some(surface);
         self.damage.add(content);
         Ok(Vec::new())
+    }
+
+    /// Установить серверную тень для ShmSurface: memfd остаётся у сервера,
+    /// композитор рисует из этой поверхности.
+    pub fn install_shm_surface(
+        &mut self,
+        client_id: u64,
+        window_id: u32,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+    ) -> Result<(), WindowError> {
+        let Some(window) = self.window(window_id) else {
+            return Err(WindowError::NotFound(window_id));
+        };
+        if window.client_id != client_id {
+            return Err(WindowError::NotOwner);
+        }
+        let surface =
+            Surface::new(width, height, format).map_err(WindowError::InvalidSurface)?;
+        let content = window.content_rect();
+        let window = self.window_mut(window_id).expect("окно проверено");
+        window.surface = Some(surface);
+        self.damage.add(content);
+        Ok(())
+    }
+
+    /// Скопировать повреждённые прямоугольники из клиентского memfd в серверную
+    /// тень и пометить damage. Пиксели клиента никогда не читаются при отрисовке.
+    pub fn shm_update(
+        &mut self,
+        client_id: u64,
+        window_id: u32,
+        view: crate::shm::ShmView<'_>,
+        rects: &[(i32, i32, u32, u32)],
+    ) -> Result<(), WindowError> {
+        let Some(window) = self.window(window_id) else {
+            return Err(WindowError::NotFound(window_id));
+        };
+        if window.client_id != client_id {
+            return Err(WindowError::NotOwner);
+        }
+        let content = window.content_rect();
+        let view_rect = Rect::new(0, 0, view.width as i32, view.height as i32);
+        let mut damaged = Vec::with_capacity(rects.len());
+        {
+            let window = self.window_mut(window_id).expect("окно проверено");
+            let Some(surface) = window.surface.as_mut() else {
+                return Err(WindowError::NoSurface);
+            };
+            let surface_rect = Rect::new(0, 0, surface.width as i32, surface.height as i32);
+            for &(x, y, w, h) in rects {
+                let w = w.min(i32::MAX as u32) as i32;
+                let h = h.min(i32::MAX as u32) as i32;
+                let Some(area) = Rect::new(x, y, w, h)
+                    .intersection(view_rect)
+                    .and_then(|area| area.intersection(surface_rect))
+                else {
+                    continue;
+                };
+                copy_shm_rect(surface, &view, area);
+                damaged.push(Rect::new(
+                    content.x + area.x,
+                    content.y + area.y,
+                    area.w,
+                    area.h,
+                ));
+            }
+        }
+        for rect in damaged {
+            self.damage.add(rect);
+        }
+        Ok(())
     }
 
     /// Клиент сообщил damage-прямоугольники (координаты внутри поверхности).
@@ -1907,6 +1988,38 @@ impl Compositor {
             self.theme.menu_text_dim,
             "Sunday, 15 November 2026",
         );
+    }
+}
+
+fn copy_shm_rect(surface: &mut Surface, view: &crate::shm::ShmView<'_>, area: Rect) {
+    let width = surface.width as usize;
+    let stride = view.stride as usize;
+    match view.format {
+        PixelFormat::Xrgb8888 => {
+            for row in 0..area.h as usize {
+                let src_off = (area.y as usize + row) * stride + area.x as usize * 4;
+                let src = &view.data[src_off..src_off + area.w as usize * 4];
+                let dst_off = (area.y as usize + row) * width + area.x as usize;
+                let dst = &mut surface.pixels_mut()[dst_off..dst_off + area.w as usize];
+                for (dst, chunk) in dst.iter_mut().zip(src.chunks_exact(4)) {
+                    let value =
+                        u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    *dst = (value & 0x00FF_FFFF) | 0xFF00_0000;
+                }
+            }
+        }
+        PixelFormat::Rgb565 => {
+            for row in 0..area.h as usize {
+                let src_off = (area.y as usize + row) * stride + area.x as usize * 2;
+                let src = &view.data[src_off..src_off + area.w as usize * 2];
+                let dst_off = (area.y as usize + row) * width + area.x as usize;
+                let dst = &mut surface.pixels_mut()[dst_off..dst_off + area.w as usize];
+                for (dst, chunk) in dst.iter_mut().zip(src.chunks_exact(2)) {
+                    let value = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    *dst = crate::surface::rgb565_to_rgb(value) | 0xFF00_0000;
+                }
+            }
+        }
     }
 }
 

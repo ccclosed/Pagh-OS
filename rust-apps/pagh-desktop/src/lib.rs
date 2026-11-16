@@ -31,6 +31,7 @@ pub mod fbdev;
 pub mod font;
 pub mod scenario;
 pub mod server;
+pub mod shm;
 pub mod surface;
 
 pub use backend::{Backend, BackendKind, HeadlessBackend, OutputBackend};

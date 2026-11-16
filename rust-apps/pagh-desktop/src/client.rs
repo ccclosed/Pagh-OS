@@ -7,6 +7,7 @@ use crate::geometry::Size;
 use crate::protocol::{self, Decoder, Message, VERSION};
 use crate::surface::Surface;
 use std::io::{self, Read};
+use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -134,6 +135,62 @@ impl Client {
             format: surface.format.to_wire(),
             stride: surface.stride(),
             pixels: surface.to_wire(),
+        })
+    }
+
+    /// Отправить сообщение с ровно одним SCM_RIGHTS fd (ShmSurface).
+    pub fn send_with_fd(&mut self, message: &Message, fd: RawFd) -> io::Result<()> {
+        crate::shm::send_message_with_fd(&self.stream, message, fd)
+    }
+
+    /// Предложить memfd как поверхность окна.
+    pub fn shm_offer(
+        &mut self,
+        window_id: u32,
+        width: u32,
+        height: u32,
+        format: crate::surface::PixelFormat,
+        stride: u32,
+        fd: RawFd,
+    ) -> io::Result<()> {
+        self.send_with_fd(
+            &Message::ShmOffer {
+                window_id,
+                width,
+                height,
+                format: format.to_wire(),
+                stride,
+                flags: 0,
+            },
+            fd,
+        )
+    }
+
+    /// Commit ShmSurface: только метаданные и damage-прямоугольники.
+    pub fn shm_commit(
+        &mut self,
+        window_id: u32,
+        generation: u32,
+        rects: &[(i32, i32, u32, u32)],
+    ) -> io::Result<()> {
+        self.send(&Message::ShmCommit {
+            window_id,
+            generation,
+            rects: rects.to_vec(),
+        })
+    }
+
+    /// DAMAGE в форме ShmSurface (type 9 + generation).
+    pub fn shm_damage(
+        &mut self,
+        window_id: u32,
+        generation: u32,
+        rects: &[(i32, i32, u32, u32)],
+    ) -> io::Result<()> {
+        self.send(&Message::ShmDamage {
+            window_id,
+            generation,
+            rects: rects.to_vec(),
         })
     }
 
