@@ -2,10 +2,11 @@
 //! устойчивость к мусору в сокете.
 
 use pagh_desktop::client::Client;
-use pagh_desktop::protocol::{key, Message, ERR_BAD_MESSAGE, ERR_UNSUPPORTED};
+use pagh_desktop::protocol::{key, Message, ERR_BAD_MESSAGE, ERR_UNSUPPORTED, WELCOME_SHM_SURFACE};
 use pagh_desktop::server::{unique_socket_path, LaunchTarget, Server, ServerHandle, ServerOptions};
 use pagh_desktop::surface::{PixelFormat, Surface};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -346,4 +347,279 @@ fn launch_message_spawns_configured_app() {
     server.control.shutdown();
     server.join().expect("сервер завершился");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn xrgb_data(width: u32, height: u32, color: u32) -> Vec<u8> {
+    let mut data = vec![0u8; width as usize * height as usize * 4];
+    for px in data.chunks_exact_mut(4) {
+        px.copy_from_slice(&(color & 0x00FF_FFFF).to_le_bytes());
+    }
+    data
+}
+
+fn set_xrgb(data: &mut [u8], width: u32, x: u32, y: u32, color: u32) {
+    let off = (y as usize * width as usize + x as usize) * 4;
+    data[off..off + 4].copy_from_slice(&(color & 0x00FF_FFFF).to_le_bytes());
+}
+
+fn write_memfd(fd: &std::os::unix::io::OwnedFd, data: &[u8]) {
+    let mut file = std::fs::File::from(fd.try_clone().expect("clone memfd"));
+    file.seek(SeekFrom::Start(0)).expect("seek memfd");
+    file.write_all(data).expect("write memfd");
+}
+
+fn wait_ready(client: &mut Client, window_id: u32) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let Some(Message::ShmReady {
+            window_id: id,
+            generation,
+        }) = client
+            .next_message(Duration::from_millis(200))
+            .expect("ready")
+        {
+            if id == window_id {
+                return generation;
+            }
+        }
+    }
+    panic!("shm_ready для окна {window_id} не пришёл");
+}
+
+#[test]
+fn idle_has_zero_presents_and_cursor_damage_is_small() {
+    let (server, socket) = spawn_server("idle");
+    let mut client = Client::connect_retry(&socket, 200).expect("клиент");
+    client.hello("idle").expect("hello");
+    client
+        .create_window(21, 320, 200, PixelFormat::Xrgb8888, "Idle")
+        .expect("create");
+    let (x, y, _, _) = expect_configure(&mut client, 21);
+    client
+        .commit(
+            21,
+            &Surface::filled(320, 200, PixelFormat::Xrgb8888, 0x0022_3344),
+        )
+        .expect("commit");
+    assert!(
+        wait_for(Duration::from_secs(3), || server
+            .counters
+            .snapshot()
+            .presents
+            >= 1),
+        "первый present не случился"
+    );
+
+    // Дать серверу дообработать focus/configure damage и обнулить счётчики.
+    std::thread::sleep(Duration::from_millis(150));
+    server.counters.reset();
+    std::thread::sleep(Duration::from_millis(150));
+    server.counters.reset();
+    std::thread::sleep(Duration::from_secs(2));
+    let idle = server.counters.snapshot();
+    assert_eq!(idle.presents, 0, "idle не должен презентовать: {idle:?}");
+    assert_eq!(idle.bytes_presented, 0, "idle не должен писать байты");
+    assert_eq!(idle.damage_rects, 0);
+
+    // Курсор: маленький damage, не полный экран.
+    server.control.mouse_move(x + 40, y + 40);
+    assert!(
+        wait_for(Duration::from_secs(3), || server
+            .counters
+            .snapshot()
+            .presents
+            >= 1),
+        "present после движения курсора"
+    );
+    let cursor = server.counters.snapshot();
+    eprintln!("e2e idle: {idle:?}; e2e cursor: {cursor:?}");
+    assert!(
+        cursor.bytes_presented > 0 && cursor.bytes_presented < 20_000,
+        "курсор должен дать маленький damage: {cursor:?}"
+    );
+
+    server.control.shutdown();
+    server.join().expect("сервер завершился");
+}
+
+#[test]
+fn drag_damage_is_bounded_by_window_not_screen() {
+    let (server, socket) = spawn_server("drag");
+    let mut client = Client::connect_retry(&socket, 200).expect("клиент");
+    client.hello("drag").expect("hello");
+    client
+        .create_window(31, 320, 200, PixelFormat::Xrgb8888, "Drag")
+        .expect("create");
+    let (x, y, _, _) = expect_configure(&mut client, 31);
+    client
+        .commit(
+            31,
+            &Surface::filled(320, 200, PixelFormat::Xrgb8888, 0x0044_5566),
+        )
+        .expect("commit");
+    assert!(wait_for(Duration::from_secs(3), || server
+        .counters
+        .snapshot()
+        .presents
+        >= 1));
+    std::thread::sleep(Duration::from_millis(150));
+    server.counters.reset();
+
+    let title_y = y - 20;
+    server.control.mouse_move(x + 50, title_y);
+    server.control.mouse_button(1, true);
+    server.control.mouse_move(x + 80, title_y + 30);
+    assert!(
+        wait_for(Duration::from_secs(3), || server
+            .counters
+            .snapshot()
+            .presents
+            >= 1),
+        "present во время drag"
+    );
+    server.control.mouse_button(1, false);
+    std::thread::sleep(Duration::from_millis(100));
+    let stats = server.counters.snapshot();
+    eprintln!("e2e drag: {stats:?}");
+    let screen_bytes = 800u64 * 600 * 4;
+    assert!(
+        stats.bytes_presented > 0 && stats.bytes_presented < screen_bytes / 2,
+        "drag не должен презентовать полэкрана: {stats:?}"
+    );
+
+    server.control.shutdown();
+    server.join().expect("сервер завершился");
+}
+
+#[test]
+fn shm_surface_commit_reoffer_and_stale_generation() {
+    let (server, socket) = spawn_server("shm");
+    let mut client = Client::connect_retry(&socket, 200).expect("клиент");
+    let welcome = client.hello("shm").expect("hello");
+    assert_ne!(
+        welcome.flags & WELCOME_SHM_SURFACE,
+        0,
+        "welcome должен объявить ShmSurface"
+    );
+    client
+        .create_window(41, 320, 200, PixelFormat::Xrgb8888, "SHM")
+        .expect("create");
+    let (x, y, width, height) = expect_configure(&mut client, 41);
+    assert_eq!((width, height), (320, 200));
+
+    let stride = width * 4;
+    let size = stride as usize * height as usize;
+    let fd = pagh_desktop::shm::create_memfd("pagh-e2e-shm", size).expect("memfd");
+    let mut data = xrgb_data(width, height, 0x0011_2233);
+    set_xrgb(&mut data, width, 10, 10, 0x00FF_0000);
+    write_memfd(&fd, &data);
+    client
+        .shm_offer(
+            41,
+            width,
+            height,
+            PixelFormat::Xrgb8888,
+            stride,
+            fd.as_raw_fd(),
+        )
+        .expect("shm_offer");
+    let generation = wait_ready(&mut client, 41);
+    client
+        .shm_commit(41, generation, &[(0, 0, width, height)])
+        .expect("shm commit");
+
+    assert!(
+        wait_for(Duration::from_secs(3), || server
+            .control
+            .sample_pixel(x + 10, y + 10)
+            == Some(0x00FF_0000)),
+        "pattern из memfd не попал в back buffer"
+    );
+    assert_eq!(
+        server.control.sample_pixel(x + 20, y + 20),
+        Some(0x0011_2233)
+    );
+    let stats = server.counters.snapshot();
+    assert_eq!(stats.shm_offers, 1);
+    assert!(stats.shm_commits >= 1);
+    assert!(stats.shm_bytes >= size as u64);
+    eprintln!("e2e shm initial: {stats:?}");
+
+    // Reoffer: новый memfd и generation; старый commit должен быть отброшен.
+    let fd2 = pagh_desktop::shm::create_memfd("pagh-e2e-shm-2", size).expect("memfd 2");
+    let mut data2 = xrgb_data(width, height, 0x0000_FF00);
+    set_xrgb(&mut data2, width, 40, 40, 0x0000_00FF);
+    write_memfd(&fd2, &data2);
+    client
+        .shm_offer(
+            41,
+            width,
+            height,
+            PixelFormat::Xrgb8888,
+            stride,
+            fd2.as_raw_fd(),
+        )
+        .expect("shm_offer 2");
+    let generation2 = wait_ready(&mut client, 41);
+    assert_ne!(generation2, generation, "generation должен смениться");
+    // RELEASE старого generation приходит после READY.
+    let mut released = false;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && !released {
+        if let Some(Message::ShmRelease {
+            window_id,
+            generation: old,
+        }) = client
+            .next_message(Duration::from_millis(200))
+            .expect("release")
+        {
+            released = window_id == 41 && old == generation;
+        }
+    }
+    assert!(released, "сервер не освободил старый generation");
+
+    // Старый generation: молча отбрасывается, новый цвет не появляется.
+    client
+        .shm_commit(41, generation, &[(0, 0, width, height)])
+        .expect("stale commit");
+    std::thread::sleep(Duration::from_millis(150));
+    assert_ne!(
+        server.control.sample_pixel(x + 40, y + 40),
+        Some(0x0000_00FF),
+        "stale generation не должен применяться"
+    );
+
+    client
+        .shm_commit(41, generation2, &[(0, 0, width, height)])
+        .expect("shm commit 2");
+    assert!(
+        wait_for(Duration::from_secs(3), || server
+            .control
+            .sample_pixel(x + 40, y + 40)
+            == Some(0x0000_00FF)),
+        "новый generation не применился"
+    );
+
+    // Damage-only: меняем один пиксель и коммитим только его прямоугольник.
+    let mut data3 = data2.clone();
+    set_xrgb(&mut data3, width, 50, 50, 0x00FF_FF00);
+    write_memfd(&fd2, &data3);
+    client
+        .shm_commit(41, generation2, &[(50, 50, 1, 1)])
+        .expect("partial commit");
+    assert!(
+        wait_for(Duration::from_secs(3), || server
+            .control
+            .sample_pixel(x + 50, y + 50)
+            == Some(0x00FF_FF00)),
+        "частичный damage не применился"
+    );
+    assert_eq!(
+        server.control.sample_pixel(x + 20, y + 20),
+        Some(0x0000_FF00),
+        "остальная поверхность не должна меняться"
+    );
+
+    server.control.shutdown();
+    server.join().expect("сервер завершился");
 }

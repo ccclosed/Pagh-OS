@@ -80,49 +80,27 @@ impl Window {
     }
 
     pub fn content_rect(&self) -> Rect {
-        Rect::new(
-            self.frame.x + BORDER,
-            self.frame.y + BORDER + TITLEBAR_HEIGHT,
-            self.frame.w - BORDER * 2,
-            self.frame.h - BORDER * 2 - TITLEBAR_HEIGHT,
-        )
+        content_rect_for(self.frame)
     }
 
     pub fn titlebar_rect(&self) -> Rect {
-        Rect::new(
-            self.frame.x + BORDER,
-            self.frame.y + BORDER,
-            self.frame.w - BORDER * 2,
-            TITLEBAR_HEIGHT,
-        )
+        titlebar_rect_for(self.frame)
     }
 
     pub fn close_rect(&self) -> Rect {
-        self.button_rect(0)
+        button_rect_for(self.frame, 0)
     }
 
     pub fn maximize_rect(&self) -> Rect {
-        self.button_rect(1)
+        button_rect_for(self.frame, 1)
     }
 
     pub fn minimize_rect(&self) -> Rect {
-        self.button_rect(2)
-    }
-
-    fn button_rect(&self, index: i32) -> Rect {
-        let bar = self.titlebar_rect();
-        let y = bar.y + (bar.h - BUTTON_SIZE) / 2;
-        let x = bar.right() - RIGHT_PADDING - BUTTON_SIZE - index * (BUTTON_SIZE + BUTTON_GAP);
-        Rect::new(x, y, BUTTON_SIZE, BUTTON_SIZE)
+        button_rect_for(self.frame, 2)
     }
 
     pub fn resize_corner_rect(&self) -> Rect {
-        Rect::new(
-            self.frame.right() - RESIZE_HANDLE,
-            self.frame.bottom() - RESIZE_HANDLE,
-            RESIZE_HANDLE,
-            RESIZE_HANDLE,
-        )
+        resize_corner_rect_for(self.frame)
     }
 
     /// Где находится точка внутри окна; `None` — снаружи или окно свёрнуто.
@@ -176,10 +154,7 @@ impl Window {
     }
 
     pub fn title_text(&self) -> String {
-        let max_chars = ((self.frame.w - 3 * (BUTTON_SIZE + BUTTON_GAP) - RIGHT_PADDING * 2 - 16)
-            / 8)
-        .max(4) as usize;
-        truncate_text(&self.title, max_chars)
+        title_text_for(&self.title, self.frame)
     }
 
     pub fn titlebar_color(&self, theme: &crate::theme::Theme) -> crate::color::Color {
@@ -197,6 +172,51 @@ impl Window {
             theme.window_border_inactive
         }
     }
+}
+
+/// Клиентская область для заданной внешней рамки (без `Window`).
+pub fn content_rect_for(frame: Rect) -> Rect {
+    Rect::new(
+        frame.x + BORDER,
+        frame.y + BORDER + TITLEBAR_HEIGHT,
+        frame.w - BORDER * 2,
+        frame.h - BORDER * 2 - TITLEBAR_HEIGHT,
+    )
+}
+
+/// Полоса заголовка для заданной внешней рамки.
+pub fn titlebar_rect_for(frame: Rect) -> Rect {
+    Rect::new(
+        frame.x + BORDER,
+        frame.y + BORDER,
+        frame.w - BORDER * 2,
+        TITLEBAR_HEIGHT,
+    )
+}
+
+/// Кнопка заголовка (0 — close, 1 — maximize, 2 — minimize) для рамки.
+pub fn button_rect_for(frame: Rect, index: i32) -> Rect {
+    let bar = titlebar_rect_for(frame);
+    let y = bar.y + (bar.h - BUTTON_SIZE) / 2;
+    let x = bar.right() - RIGHT_PADDING - BUTTON_SIZE - index * (BUTTON_SIZE + BUTTON_GAP);
+    Rect::new(x, y, BUTTON_SIZE, BUTTON_SIZE)
+}
+
+/// Угол resize для заданной рамки.
+pub fn resize_corner_rect_for(frame: Rect) -> Rect {
+    Rect::new(
+        frame.right() - RESIZE_HANDLE,
+        frame.bottom() - RESIZE_HANDLE,
+        RESIZE_HANDLE,
+        RESIZE_HANDLE,
+    )
+}
+
+/// Обрезанный заголовок окна для рамки заданной ширины.
+pub fn title_text_for(title: &str, frame: Rect) -> String {
+    let max_chars =
+        ((frame.w - 3 * (BUTTON_SIZE + BUTTON_GAP) - RIGHT_PADDING * 2 - 16) / 8).max(4) as usize;
+    truncate_text(title, max_chars)
 }
 
 /// Обрезать строку по количеству символов, добавляя многоточие из трёх точек.

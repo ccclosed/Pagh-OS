@@ -137,6 +137,11 @@ impl Surface {
         &self.pixels
     }
 
+    /// Прямой доступ к пикселям для damage-копирования (server-side shadow).
+    pub fn pixels_mut(&mut self) -> &mut [u32] {
+        &mut self.pixels
+    }
+
     pub fn get(&self, x: u32, y: u32) -> u32 {
         if x >= self.width || y >= self.height {
             return 0;

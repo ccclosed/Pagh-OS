@@ -13,6 +13,7 @@
 pub mod color;
 pub mod context_menu;
 pub mod geometry;
+pub mod glyph;
 pub mod panel;
 pub mod png;
 pub mod protocol;
@@ -30,6 +31,7 @@ pub mod fbdev;
 pub mod font;
 pub mod scenario;
 pub mod server;
+pub mod shm;
 pub mod surface;
 
 pub use backend::{Backend, BackendKind, HeadlessBackend, OutputBackend};
