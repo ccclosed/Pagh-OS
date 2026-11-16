@@ -21,9 +21,13 @@ E2E с реальным композитором: `pagh-desktop` из dev (PR #1
 * PNG-выгрузка (RGBA8) без зависимостей.
 * Клиент PDP/1: AF_UNIX, hello/welcome/create/commit/input/configure/focus/
   ping/pong/close, XRGB8888/RGB565, кодирование клавиш и SGR-мыши.
+* `ShmSurface`: memfd/`SCM_RIGHTS` (`shm_offer`/`shm_ready`/`shm_release`),
+  рендер прямо в mmap, по сокету — только damage-прямоугольники; мигание
+  курсора и ввод дают damage порядка клетки, а не полный кадр. Legacy-сервер
+  без bit 2 обслуживается прежним полным кадром.
 * ABI v1 kernel console shared surface: валидатор, reader, конвертация в
   экран (`/dev/vtconsole0`, `/dev/vtinput`), см. [TERMINAL.md](TERMINAL.md).
-* 118 host-тестов, включая эталонные escape-последовательности и скриншоты.
+* 120 host-тестов, включая эталонные escape-последовательности и скриншоты.
 
 ## Сборка и проверки
 
@@ -67,9 +71,11 @@ Headless-демо: `01-welcome`, `02-colors`, `03-scrollback`, `04-unicode`.
 
 ## Ограничения
 
-Пока нет реального PTY, `/dev/fb0`/evdev и kernel-side shared surface.
-Live-режим подключается к `pagh-desktop` по PDP/1; без VT-устройства
-используется demo shell.  Нет reflow при resize,
+Пока нет реального PTY и kernel-side shared surface (ABI v1 описан в
+[TERMINAL.md](TERMINAL.md)). Live-режим подключается к `pagh-desktop` по PDP/1;
+без VT-устройства используется demo shell. ShmSurface включается только если
+сервер объявил `welcome.flags` bit 2 (иначе — полный кадр). Нет reflow при
+resize,
 комбинирующие метки не компонуются, OSC 4/8/52 игнорируются.  Подробно —
 [TERMINAL.md](TERMINAL.md).
 

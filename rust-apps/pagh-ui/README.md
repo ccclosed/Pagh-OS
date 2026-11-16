@@ -36,8 +36,10 @@ screenshot-тесты.
 | `menu` | `Menu`/`MenuEntry`, подменю, раскладка по содержимому, hit-тесты |
 | `chrome` | заголовок окна `v`/`^`/`x`, строка состояния, панель рабочего стола |
 | `icon` | векторные иконки, включая синюю папку с листом бумаги |
-| `protocol` | клиентский кодек PDP/1: заголовок `PDS1`, сообщения 1..12, `launch(13)`, `MessageReader` |
-| `client` | `DesktopClient` поверх `AF_UNIX`: `hello`/`welcome`, `open_window`, `commit`, `poll` (configure/input/focus/close/error), `launch`, `damage_hint` |
+| `protocol` | клиентский кодек PDP/1: заголовок `PDS1`, сообщения 1..12, `launch(13)`, shm `14..16`, `MessageReader` с учётом header flags |
+| `client` | `DesktopClient` поверх `AF_UNIX`: `hello`/`welcome`, `open_window`, `commit`, `enable_shm`/`commit_shm`/`resize_shm`, `poll`, `launch`, `damage_hint` |
+| `shm` | `memfd_create` + `ftruncate` + `mmap`, `SCM_RIGHTS` send/recv, `MappedBuffer`/`ShmSurface` |
+| `damage` | `Damage` (clip/merge/collapse) и `DamageTracker` (сравнение тайлов кадра, без аллокаций в кадре) |
 | `image`/`testkit` | PNG/PPM, детерминированный хеш сцены, golden-тесты |
 | `demo` | готовые сцены витрины/меню/палитры |
 
@@ -136,8 +138,10 @@ loop {
   поддерживаются — для них нужен отдельный шрифт/масштабирование.
 - Нет прокрутки как виджета: `Grid`/`List` отдают раскладку, полосу прокрутки и
   смещение рисует приложение (Files делает это само).
-- PDP/1 v1 передаёт полную поверхность без частичного аплоада (`damage` —
-  подсказка) — ок для локального сокета, но избыточно для больших окон.
+- Если сервер не объявил `ShmSurface` (`welcome.flags` bit 2), клиент шлёт
+  полную поверхность: `damage` остаётся подсказкой. На shm-сервере рендер идёт
+  прямо в memfd, а по сокету уходят только прямоугольники (`commit` с
+  `flags=SHM`); fallback обязан оставаться рабочим и покрыт тестами.
 - Текст вводится по US-раскладке (PDP/1 передаёт только evdev-код); другие
   раскладки требуют input method/расширения протокола.
 - Курсор мыши, drag-and-drop, буфер обмена, заголовок и панель — зона

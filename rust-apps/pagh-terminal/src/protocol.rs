@@ -9,13 +9,15 @@
 //!   offset  size  field
 //!   0       4     magic  = b"PDS1"
 //!   4       2     type   (u16 LE)
-//!   6       2     flags  (u16 LE, must be 0)
+//!   6       2     flags  (u16 LE; 0, либо bit0 SHM для commit/damage)
 //!   8       4     length (u32 LE, payload bytes)
 //!   12      N     payload
 //! ```
 //!
 //! All integers are little-endian.  Strings are `u16 length` + UTF-8 bytes.
-//! `commit` uploads a full frame in-band; `damage` is only a hint in v1.
+//! `commit` uploads a full frame in-band, unless the server advertises
+//! `ShmSurface`: then `commit` carries damage metadata only (flags bit 0) and
+//! pixels live in the memfd sent with `shm_offer`. `damage` is only a hint.
 //! Unknown message types and trailing payload bytes are rejected, matching the
 //! server's decoder.
 
@@ -31,6 +33,8 @@ pub const MAX_PAYLOAD: usize = 4096 * 4096 * 4 + 4096;
 pub const MAX_SURFACE_DIM: u32 = 4096;
 /// Maximum extra stride padding accepted by the compositor.
 pub const MAX_STRIDE_PADDING: u32 = 4096;
+/// Maximum damage rects in one shm `COMMIT`/`DAMAGE` message.
+pub const MAX_DAMAGE_RECTS: usize = 1024;
 
 pub mod types {
     pub const HELLO: u16 = 1;
@@ -45,6 +49,18 @@ pub mod types {
     pub const ERROR: u16 = 10;
     pub const PING: u16 = 11;
     pub const PONG: u16 = 12;
+    /// c→s: shared surface offer (memfd via SCM_RIGHTS).
+    pub const SHM_OFFER: u16 = 14;
+    /// s→c: server accepted the offer and assigned a generation.
+    pub const SHM_READY: u16 = 15;
+    /// either direction: generation released.
+    pub const SHM_RELEASE: u16 = 16;
+}
+
+/// PDP/1 header flag bits.
+pub mod header_flags {
+    /// Bit 0: payload is the shm form of `COMMIT`/`DAMAGE` (no pixel bytes).
+    pub const SHM: u16 = 1 << 0;
 }
 
 pub mod welcome_flags {
@@ -78,6 +94,8 @@ pub mod error_codes {
     pub const LIMIT: u32 = 7;
     pub const UNSUPPORTED: u32 = 8;
     pub const INTERNAL: u32 = 9;
+    /// shm commit with a generation the server already evicted.
+    pub const STALE_GENERATION: u32 = 10;
 }
 
 pub mod buttons {
@@ -256,7 +274,10 @@ impl Header {
         }
         let kind = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
         let flags = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
-        if flags != 0 {
+        if flags & !header_flags::SHM != 0 {
+            return Err(ProtocolError::ReservedFlags(flags));
+        }
+        if flags != 0 && kind != self::types::COMMIT && kind != self::types::DAMAGE {
             return Err(ProtocolError::ReservedFlags(flags));
         }
         let length = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
@@ -344,6 +365,31 @@ pub enum Message {
     Pong {
         nonce: u32,
     },
+    /// c→s: shared surface geometry; the memfd rides in `SCM_RIGHTS`.
+    ShmOffer {
+        window_id: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+        stride: u32,
+        flags: u32,
+    },
+    /// s→c: server accepted the surface and assigned `generation`.
+    ShmReady {
+        window_id: u32,
+        generation: u32,
+    },
+    /// either direction: generation can be released.
+    ShmRelease {
+        window_id: u32,
+        generation: u32,
+    },
+    /// c→s: shm commit — damage rects only, pixels live in the memfd.
+    CommitShm {
+        window_id: u32,
+        generation: u32,
+        rects: Vec<(i32, i32, u32, u32)>,
+    },
 }
 
 impl Message {
@@ -361,6 +407,18 @@ impl Message {
             Message::Error { .. } => types::ERROR,
             Message::Ping { .. } => types::PING,
             Message::Pong { .. } => types::PONG,
+            Message::ShmOffer { .. } => types::SHM_OFFER,
+            Message::ShmReady { .. } => types::SHM_READY,
+            Message::ShmRelease { .. } => types::SHM_RELEASE,
+            Message::CommitShm { .. } => types::COMMIT,
+        }
+    }
+
+    /// Header flag bits this message requires.
+    pub fn header_flags(&self) -> u16 {
+        match self {
+            Message::CommitShm { .. } => header_flags::SHM,
+            _ => 0,
         }
     }
 
@@ -378,6 +436,10 @@ impl Message {
             Message::Error { .. } => "error",
             Message::Ping { .. } => "ping",
             Message::Pong { .. } => "pong",
+            Message::ShmOffer { .. } => "shm_offer",
+            Message::ShmReady { .. } => "shm_ready",
+            Message::ShmRelease { .. } => "shm_release",
+            Message::CommitShm { .. } => "commit_shm",
         }
     }
 
@@ -386,7 +448,7 @@ impl Message {
         let payload = self.encode_payload();
         let header = Header {
             kind: self.kind(),
-            flags: 0,
+            flags: self.header_flags(),
             length: payload.len(),
         };
         let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
@@ -552,12 +614,71 @@ impl Message {
                 w.string(message);
             }
             Message::Ping { nonce } | Message::Pong { nonce } => w.u32(*nonce),
+            Message::ShmOffer {
+                window_id,
+                width,
+                height,
+                format,
+                stride,
+                flags,
+            } => {
+                w.u32(*window_id);
+                w.u32(*width);
+                w.u32(*height);
+                w.u32(*format);
+                w.u32(*stride);
+                w.u32(*flags);
+            }
+            Message::ShmReady {
+                window_id,
+                generation,
+            }
+            | Message::ShmRelease {
+                window_id,
+                generation,
+            } => {
+                w.u32(*window_id);
+                w.u32(*generation);
+            }
+            Message::CommitShm {
+                window_id,
+                generation,
+                rects,
+            } => {
+                w.u32(*window_id);
+                w.u32(*generation);
+                w.u32(rects.len().min(MAX_DAMAGE_RECTS) as u32);
+                for (x, y, width, height) in rects.iter().take(MAX_DAMAGE_RECTS) {
+                    w.i32(*x);
+                    w.i32(*y);
+                    w.u32(*width);
+                    w.u32(*height);
+                }
+            }
         }
         w.buf
     }
 
     /// Decode a payload for `kind`; the payload must be consumed exactly.
+    /// Header flags are assumed to be zero (v1); shm forms need
+    /// [`Message::decode_with_flags`].
     pub fn decode(kind: u16, payload: &[u8]) -> Result<Message, ProtocolError> {
+        Message::decode_with_flags(kind, 0, payload)
+    }
+
+    /// Decode a payload taking the header flags (`header_flags::SHM`) into account.
+    pub fn decode_with_flags(
+        kind: u16,
+        flags: u16,
+        payload: &[u8],
+    ) -> Result<Message, ProtocolError> {
+        if flags & !header_flags::SHM != 0 {
+            return Err(ProtocolError::ReservedFlags(flags));
+        }
+        let shm = flags & header_flags::SHM != 0;
+        if shm && kind != types::COMMIT && kind != types::DAMAGE {
+            return Err(ProtocolError::ReservedFlags(flags));
+        }
         let mut r = Reader::new(payload);
         let message = match kind {
             types::HELLO => Message::Hello {
@@ -587,6 +708,25 @@ impl Message {
                 height: r.u32()?,
                 flags: r.u32()?,
             },
+            types::COMMIT if shm => {
+                let window_id = r.u32()?;
+                let generation = r.u32()?;
+                let count = r.u32()? as usize;
+                if count > MAX_DAMAGE_RECTS {
+                    return Err(ProtocolError::BadPayload(format!(
+                        "too many shm damage rects: {count}"
+                    )));
+                }
+                let mut rects = Vec::with_capacity(count);
+                for _ in 0..count {
+                    rects.push((r.i32()?, r.i32()?, r.u32()?, r.u32()?));
+                }
+                Message::CommitShm {
+                    window_id,
+                    generation,
+                    rects,
+                }
+            }
             types::COMMIT => {
                 let window_id = r.u32()?;
                 let width = r.u32()?;
@@ -661,6 +801,22 @@ impl Message {
                 window_id: r.u32()?,
                 reason: r.u32()?,
             },
+            types::DAMAGE if shm => {
+                let window_id = r.u32()?;
+                let generation = r.u32()?;
+                let count = r.u32()? as usize;
+                if count > MAX_DAMAGE_RECTS {
+                    return Err(ProtocolError::BadPayload(format!(
+                        "too many shm damage rects: {count}"
+                    )));
+                }
+                let mut rects = Vec::with_capacity(count);
+                for _ in 0..count {
+                    rects.push((r.i32()?, r.i32()?, r.u16()?, r.u16()?));
+                }
+                let _ = generation;
+                Message::Damage { window_id, rects }
+            }
             types::DAMAGE => {
                 let window_id = r.u32()?;
                 let count = r.u16()? as usize;
@@ -676,6 +832,22 @@ impl Message {
             },
             types::PING => Message::Ping { nonce: r.u32()? },
             types::PONG => Message::Pong { nonce: r.u32()? },
+            types::SHM_OFFER => Message::ShmOffer {
+                window_id: r.u32()?,
+                width: r.u32()?,
+                height: r.u32()?,
+                format: r.u32()?,
+                stride: r.u32()?,
+                flags: r.u32()?,
+            },
+            types::SHM_READY => Message::ShmReady {
+                window_id: r.u32()?,
+                generation: r.u32()?,
+            },
+            types::SHM_RELEASE => Message::ShmRelease {
+                window_id: r.u32()?,
+                generation: r.u32()?,
+            },
             other => return Err(ProtocolError::UnknownType(other)),
         };
         r.finish()?;
@@ -730,7 +902,11 @@ pub fn read_message<R: Read>(reader: &mut R) -> io::Result<Message> {
     let header = Header::parse(&header)?;
     let mut payload = vec![0u8; header.length];
     reader.read_exact(&mut payload)?;
-    Ok(Message::decode(header.kind, &payload)?)
+    Ok(Message::decode_with_flags(
+        header.kind,
+        header.flags,
+        &payload,
+    )?)
 }
 
 /// Incremental frame decoder.  Feed it arbitrary socket chunks; it returns

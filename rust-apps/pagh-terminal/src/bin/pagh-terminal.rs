@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pagh_terminal::client::{close_name, error_name, Event, SurfaceClient};
 use pagh_terminal::demo::{self, DemoShell};
@@ -217,17 +217,86 @@ fn run_client(args: &Args, socket: &str) -> Result<(), String> {
         shell.write(&bytes);
     }
     let theme = Theme::default();
+    let mut render_opts = RenderOptions::default();
+    // ShmSurface: рендер прямо в mmap, по сокету — только damage. На legacy-
+    // сервере `enable_shm` вернёт None, и ниже работает полный кадр v1.
+    let mut shm = client
+        .enable_shm(width, height)
+        .map_err(|e| format!("shm offer: {e}"))?;
+    let mut fallback: Option<Canvas> = if shm.is_none() {
+        Some(Canvas::new(width as usize, height as usize, theme.bg))
+    } else {
+        None
+    };
+    let mut tracker = pagh_ui::damage::DamageTracker::new(
+        pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32),
+        pagh_ui::damage::DEFAULT_TILE,
+    );
     let mut dirty = true;
     let mut dragging = false;
+    let mut blink_on = true;
+    let mut next_blink = Instant::now() + Duration::from_millis(500);
 
     loop {
+        // Cursor blink: damage только клетки курсора (трекер сравнит тайлы).
+        if shell.terminal.screen.cursor_blink && Instant::now() >= next_blink {
+            blink_on = !blink_on;
+            next_blink = Instant::now() + Duration::from_millis(500);
+            dirty = true;
+        }
         if dirty {
-            let canvas = render_frame(&shell.terminal, &theme, width, height);
-            client.commit(&canvas).map_err(|e| format!("commit: {e}"))?;
+            render_opts.blink_on = blink_on;
+            let mut needs_full_frame = false;
+            if let Some(frame) = shm.as_mut() {
+                frame.canvas.fill(theme.bg);
+                render_screen_into(
+                    &mut frame.canvas,
+                    VIEWPORT_PADDING,
+                    VIEWPORT_PADDING,
+                    &shell.terminal.screen,
+                    &theme,
+                    &render_opts,
+                );
+                let damage = tracker.update(&frame.canvas);
+                match client.commit_shm(frame, damage) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        needs_full_frame = true;
+                    }
+                    Err(error) => return Err(format!("commit_shm: {error}")),
+                }
+            } else {
+                needs_full_frame = true;
+            }
+            if needs_full_frame {
+                if let Some(stale) = shm.take() {
+                    let _ = client.release_shm(&stale);
+                }
+                let canvas = fallback
+                    .get_or_insert_with(|| Canvas::new(width as usize, height as usize, theme.bg));
+                canvas.fill(theme.bg);
+                render_screen_into(
+                    canvas,
+                    VIEWPORT_PADDING,
+                    VIEWPORT_PADDING,
+                    &shell.terminal.screen,
+                    &theme,
+                    &render_opts,
+                );
+                client.commit(canvas).map_err(|e| format!("commit: {e}"))?;
+                tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
+            }
             dirty = false;
         }
+
+        // Не спим дольше, чем до следующего мигания курсора.
+        let mut timeout = Duration::from_millis(16);
+        if shell.terminal.screen.cursor_blink {
+            let until_blink = next_blink.saturating_duration_since(Instant::now());
+            timeout = timeout.min(until_blink.max(Duration::from_millis(1)));
+        }
         for event in client
-            .poll_events(Duration::from_millis(16))
+            .poll_events(timeout)
             .map_err(|e| format!("poll: {e}"))?
         {
             match event {
@@ -236,8 +305,47 @@ fn run_client(args: &Args, socket: &str) -> Result<(), String> {
                     height = configure.height.max(32);
                     let (cols, rows) = layout(width, height);
                     shell.terminal.resize(cols, rows);
+                    let same_size = shm.as_ref().is_some_and(|frame| {
+                        frame.canvas.width == width as usize
+                            && frame.canvas.height == height as usize
+                    });
+                    if same_size {
+                        dirty = true;
+                        continue;
+                    }
+                    let resized = match shm.as_mut() {
+                        Some(frame) => client.resize_shm(frame, width, height).unwrap_or(false),
+                        None => false,
+                    };
+                    if resized {
+                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
+                    } else {
+                        if let Some(stale) = shm.take() {
+                            let _ = client.release_shm(&stale);
+                        }
+                        fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
+                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
+                    }
                     dirty = true;
                 }
+                Event::ShmRelease {
+                    window_id,
+                    generation,
+                } => {
+                    if window_id == args.window_id
+                        && shm
+                            .as_ref()
+                            .is_some_and(|frame| frame.generation == generation)
+                    {
+                        if let Some(stale) = shm.take() {
+                            let _ = client.release_shm(&stale);
+                        }
+                        fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
+                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
+                        dirty = true;
+                    }
+                }
+                Event::ShmReady { .. } => {}
                 Event::Input(InputEvent::Key {
                     code,
                     pressed,
@@ -247,6 +355,9 @@ fn run_client(args: &Args, socket: &str) -> Result<(), String> {
                         dirty = true;
                     }
                     if shell.quit {
+                        if let Some(stale) = shm.take() {
+                            let _ = client.release_shm(&stale);
+                        }
                         let _ = client.close();
                         return Ok(());
                     }
@@ -309,6 +420,7 @@ fn run_client(args: &Args, socket: &str) -> Result<(), String> {
                 }
                 Event::Focus { focused, .. } => {
                     shell.terminal.screen.cursor.visible = focused;
+                    render_opts.focused = focused;
                     dirty = true;
                 }
                 Event::Close { reason, .. } => {

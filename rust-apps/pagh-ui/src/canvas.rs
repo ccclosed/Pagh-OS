@@ -11,12 +11,57 @@
 
 use crate::color::Color;
 use crate::geom::{Point, Rect, Size};
+use crate::protocol::FrameFormat;
+use crate::shm::{self, MappedBuffer};
 
-/// Пиксельная поверхность RGBA8888.
+/// Порядок байтов пикселя во внутреннем буфере [`Canvas`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PixelOrder {
+    /// Собственный буфер: straight-alpha RGBA (скриншоты, PNG, старый commit).
+    Rgba8888,
+    /// Разделяемая поверхность XRGB8888: мало-endian `B,G,R,0`.
+    Xrgb8888,
+    /// Разделяемая поверхность RGB565: 2 байта на пиксель.
+    Rgb565,
+}
+
+impl PixelOrder {
+    pub fn from_frame_format(format: FrameFormat) -> PixelOrder {
+        match format {
+            FrameFormat::Xrgb8888 => PixelOrder::Xrgb8888,
+            FrameFormat::Rgb565 => PixelOrder::Rgb565,
+        }
+    }
+
+    pub fn bytes_per_pixel(self) -> usize {
+        match self {
+            PixelOrder::Rgba8888 | PixelOrder::Xrgb8888 => 4,
+            PixelOrder::Rgb565 => 2,
+        }
+    }
+}
+
+/// Владелец пиксельного буфера.
+enum Storage {
+    /// Обычный `Vec<u8>` (RGBA) — скриншоты, headless-рендер, frame upload.
+    Owned(Vec<u8>),
+    /// Mapping клиентской `ShmSurface` (рендер прямо в разделяемую память).
+    Mapped(MappedBuffer),
+}
+
+/// Пиксельная поверхность RGBA8888 или mapping XRGB8888/RGB565.
+///
+/// По умолчанию ( [`Canvas::new`] / [`Canvas::filled`] ) пиксели хранятся как
+/// straight-alpha RGBA; это путь скриншотов и full-frame commit. Для
+/// `ShmSurface` клиент создаёт поверхность через [`Canvas::from_mapped`]: тогда
+/// примитивы пишут **прямо в mmap** в проводном формате (XRGB8888/RGB565),
+/// без промежуточного `Vec<u8>`-кадра.
 pub struct Canvas {
     width: i32,
     height: i32,
-    pixels: Vec<u8>,
+    stride: usize,
+    order: PixelOrder,
+    storage: Storage,
     clip_stack: Vec<Rect>,
 }
 
@@ -28,9 +73,76 @@ impl Canvas {
         Canvas {
             width,
             height,
-            pixels: vec![0u8; (width * height * 4) as usize],
+            stride: (width as usize) * 4,
+            order: PixelOrder::Rgba8888,
+            storage: Storage::Owned(vec![0u8; (width * height * 4) as usize]),
             clip_stack: Vec::new(),
         }
+    }
+
+    /// Поверхность, отображающая `ShmSurface` напрямую (mmap).
+    ///
+    /// `buffer` должен быть получен из [`crate::shm::ShmSurface::map`] для той
+    /// же геометрии/формата. Canvas владеет mapping и размонтирует его в `Drop`.
+    pub fn from_mapped(
+        buffer: MappedBuffer,
+        width: i32,
+        height: i32,
+        stride: usize,
+        format: FrameFormat,
+    ) -> Canvas {
+        assert!(width >= 0 && height >= 0, "negative canvas size");
+        assert!(
+            stride >= width as usize * format.bytes_per_pixel(),
+            "stride smaller than width"
+        );
+        assert!(
+            buffer.len() >= stride * height.max(0) as usize,
+            "mapped buffer shorter than stride*height"
+        );
+        Canvas {
+            width,
+            height,
+            stride,
+            order: PixelOrder::from_frame_format(format),
+            storage: Storage::Mapped(buffer),
+            clip_stack: Vec::new(),
+        }
+    }
+
+    /// Удобная обёртка: `mmap` клиентской `ShmSurface` + Canvas.
+    pub fn map_surface(surface: &crate::shm::ShmSurface) -> std::io::Result<Canvas> {
+        let buffer = surface.map()?;
+        Ok(Canvas::from_mapped(
+            buffer,
+            surface.width() as i32,
+            surface.height() as i32,
+            surface.stride() as usize,
+            surface.format(),
+        ))
+    }
+
+    /// Проводной формат, если поверхность разделяемая (для shm-commit).
+    pub fn frame_format(&self) -> Option<FrameFormat> {
+        match self.order {
+            PixelOrder::Rgba8888 => None,
+            PixelOrder::Xrgb8888 => Some(FrameFormat::Xrgb8888),
+            PixelOrder::Rgb565 => Some(FrameFormat::Rgb565),
+        }
+    }
+
+    /// Байт на строку (у разделяемой поверхности бывает padding).
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    pub fn pixel_order(&self) -> PixelOrder {
+        self.order
+    }
+
+    /// Разделяемая поверхность (mmap).
+    pub fn is_shared(&self) -> bool {
+        matches!(self.storage, Storage::Mapped(_))
     }
 
     /// Поверхность, целиком заполненная цветом.
@@ -57,14 +169,26 @@ impl Canvas {
         Rect::new(0, 0, self.width, self.height)
     }
 
-    /// Сырые пиксели RGBA.
+    /// Сырые байты поверхности в её внутреннем порядке
+    /// (RGBA для [`Canvas::new`], проводной формат для mapping).
     pub fn pixels(&self) -> &[u8] {
-        &self.pixels
+        match &self.storage {
+            Storage::Owned(pixels) => pixels,
+            Storage::Mapped(buffer) => buffer.as_slice(),
+        }
     }
 
-    /// Изменяемые сырые пиксели RGBA (для отдачи в протокол).
+    /// Изменяемые сырые байты поверхности.
     pub fn pixels_mut(&mut self) -> &mut [u8] {
-        &mut self.pixels
+        match &mut self.storage {
+            Storage::Owned(pixels) => pixels,
+            Storage::Mapped(buffer) => buffer.as_mut_slice(),
+        }
+    }
+
+    #[inline]
+    fn offset(&self, x: i32, y: i32) -> usize {
+        y as usize * self.stride + x as usize * self.order.bytes_per_pixel()
     }
 
     /// Текущая область отсечения (без учёта содержимого).
@@ -80,13 +204,26 @@ impl Canvas {
         if p.x < 0 || p.y < 0 || p.x >= self.width || p.y >= self.height {
             return Color::TRANSPARENT;
         }
-        let idx = ((p.y * self.width + p.x) * 4) as usize;
-        Color::rgba(
-            self.pixels[idx],
-            self.pixels[idx + 1],
-            self.pixels[idx + 2],
-            self.pixels[idx + 3],
-        )
+        let idx = self.offset(p.x, p.y);
+        let pixels = self.pixels();
+        match self.order {
+            PixelOrder::Rgba8888 => Color::rgba(
+                pixels[idx],
+                pixels[idx + 1],
+                pixels[idx + 2],
+                pixels[idx + 3],
+            ),
+            _ => {
+                let [r, g, b, a] = shm::load_pixel(
+                    match self.order {
+                        PixelOrder::Xrgb8888 => FrameFormat::Xrgb8888,
+                        _ => FrameFormat::Rgb565,
+                    },
+                    &pixels[idx..],
+                );
+                Color::rgba(r, g, b, a)
+            }
+        }
     }
 
     /// Записать пиксель без смешивания (игнорирует отсечение).
@@ -94,9 +231,22 @@ impl Canvas {
         if p.x < 0 || p.y < 0 || p.x >= self.width || p.y >= self.height {
             return;
         }
-        let idx = ((p.y * self.width + p.x) * 4) as usize;
-        let bytes = color.to_rgba_bytes();
-        self.pixels[idx..idx + 4].copy_from_slice(&bytes);
+        let idx = self.offset(p.x, p.y);
+        let order = self.order;
+        let pixels = self.pixels_mut();
+        match order {
+            PixelOrder::Rgba8888 => pixels[idx..idx + 4].copy_from_slice(&color.to_rgba_bytes()),
+            PixelOrder::Xrgb8888 => shm::store_pixel(
+                FrameFormat::Xrgb8888,
+                &mut pixels[idx..],
+                color.to_rgba_bytes(),
+            ),
+            PixelOrder::Rgb565 => shm::store_pixel(
+                FrameFormat::Rgb565,
+                &mut pixels[idx..],
+                color.to_rgba_bytes(),
+            ),
+        }
     }
 
     /// Смешать цвет с пикселем поверхности (учитывает отсечение).
@@ -128,9 +278,27 @@ impl Canvas {
 
     /// Залить всю поверхность цветом (без учёта отсечения).
     pub fn clear(&mut self, color: Color) {
-        let bytes = color.to_rgba_bytes();
-        for pixel in self.pixels.as_mut_slice().as_chunks_mut::<4>().0 {
-            *pixel = bytes;
+        match self.order {
+            PixelOrder::Rgba8888 => {
+                let bytes = color.to_rgba_bytes();
+                for pixel in self.pixels_mut().as_chunks_mut::<4>().0 {
+                    *pixel = bytes;
+                }
+            }
+            PixelOrder::Xrgb8888 => {
+                let mut bytes = [0u8; 4];
+                shm::store_pixel(FrameFormat::Xrgb8888, &mut bytes, color.to_rgba_bytes());
+                for pixel in self.pixels_mut().as_chunks_mut::<4>().0 {
+                    *pixel = bytes;
+                }
+            }
+            PixelOrder::Rgb565 => {
+                let mut bytes = [0u8; 2];
+                shm::store_pixel(FrameFormat::Rgb565, &mut bytes, color.to_rgba_bytes());
+                for pixel in self.pixels_mut().as_chunks_mut::<2>().0 {
+                    *pixel = bytes;
+                }
+            }
         }
     }
 
