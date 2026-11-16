@@ -19,6 +19,15 @@ path = "src/lib.rs"
 name = "pagh-terminal"
 path = "src/bin/pagh-terminal.rs"
 
+[dependencies]
+# Клиентская половина ShmSurface (memfd/SCM_RIGHTS) и DamageTracker живут в
+# pagh-ui; терминал использует их, чтобы тоже слать damage вместо полного кадра.
+pagh-ui = { path = "../pagh-ui" }
+
+[dev-dependencies]
+# E2E с настоящим композитором (host build) по AF_UNIX/PDP/1.
+pagh-desktop = { path = "../pagh-desktop" }
+
 [profile.release]
 panic = "abort"
 opt-level = "s"

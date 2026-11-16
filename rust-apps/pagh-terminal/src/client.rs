@@ -2,18 +2,25 @@
 //! window, upload RGBA frames and decode server input events.
 //!
 //! The compositor owns decorations, focus, placement and resize.  This client
-//! reacts to `configure`/`focus`/`close` and sends full frames through the
-//! socket (no shared memory in v1).
+//! reacts to `configure`/`focus`/`close`.  When the server advertises
+//! `welcome.flags` bit 2, frames go through a `ShmSurface` (memfd mapped
+//! directly by the renderer, only damage metadata on the socket); otherwise the
+//! v1 full-frame upload path is used.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use pagh_ui::damage::Damage;
+use pagh_ui::protocol::FrameFormat as UiFrameFormat;
+use pagh_ui::shm as ui_shm;
+
 use crate::protocol::{
-    self, buttons, close_reason, mods, pack_rgb565, pack_xrgb8888, welcome_flags, Configure,
-    FrameFormat, InputEvent, Message, MessageReader, ProtocolError, HEADER_LEN, MAX_PAYLOAD,
-    MAX_SURFACE_DIM, VERSION,
+    self, buttons, close_reason, header_flags, mods, pack_rgb565, pack_xrgb8888, welcome_flags,
+    Configure, FrameFormat, InputEvent, Message, MessageReader, ProtocolError, HEADER_LEN, MAGIC,
+    MAX_PAYLOAD, MAX_SURFACE_DIM, VERSION,
 };
 use crate::render::Canvas;
 
@@ -37,11 +44,43 @@ pub struct Welcome {
 pub enum Event {
     Configure(Configure),
     Input(InputEvent),
-    Focus { window_id: u32, focused: bool },
-    Close { window_id: u32, reason: u32 },
-    Error { code: u32, message: String },
+    Focus {
+        window_id: u32,
+        focused: bool,
+    },
+    Close {
+        window_id: u32,
+        reason: u32,
+    },
+    Error {
+        code: u32,
+        message: String,
+    },
     Ping(u32),
     Pong(u32),
+    /// Server accepted the shared surface and assigned a generation.
+    ShmReady {
+        window_id: u32,
+        generation: u32,
+    },
+    /// Server released a generation; fall back to full-frame upload.
+    ShmRelease {
+        window_id: u32,
+        generation: u32,
+    },
+}
+
+/// Client shared surface: mmap canvas + generation for shm commits.
+pub struct ShmFrame {
+    pub canvas: Canvas,
+    pub window_id: u32,
+    pub generation: u32,
+}
+
+impl ShmFrame {
+    pub fn size(&self) -> (u32, u32) {
+        (self.canvas.width as u32, self.canvas.height as u32)
+    }
 }
 
 /// Connected PDP/1 client.
@@ -58,6 +97,14 @@ pub struct SurfaceClient {
     flags: u32,
     format: FrameFormat,
     peer_closed: bool,
+    /// Welcome advertises ShmSurface and the environment supports it.
+    shm_capable: bool,
+    /// Current accepted generation (0 = none).
+    generation: u32,
+    /// Events received while synchronously waiting for SHM_READY.
+    pending: VecDeque<Event>,
+    /// Reused shm-commit buffer (no allocation in the frame loop).
+    tx: Vec<u8>,
 }
 
 impl SurfaceClient {
@@ -77,6 +124,10 @@ impl SurfaceClient {
             flags: 0,
             format: FrameFormat::Xrgb8888,
             peer_closed: false,
+            shm_capable: false,
+            generation: 0,
+            pending: VecDeque::new(),
+            tx: Vec::with_capacity(64 * 1024),
         })
     }
 
@@ -150,6 +201,9 @@ impl SurfaceClient {
                     self.screen_height = height;
                     self.flags = flags;
                     self.format = FrameFormat::from_welcome_flags(flags);
+                    self.shm_capable = flags & welcome_flags::SHM_SURFACE != 0
+                        && self.format == FrameFormat::Xrgb8888
+                        && ui_shm::shm_supported();
                     return Ok(Welcome {
                         version,
                         client_id,
@@ -255,6 +309,179 @@ impl SurfaceClient {
         self.send(&Message::Ping { nonce })
     }
 
+    // ───────────────────────── ShmSurface (PDP/1 B5) ────────────────────────
+
+    /// Server + environment support shared-memory frames.
+    pub fn shm_supported(&self) -> bool {
+        self.shm_capable
+    }
+
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// Create a memfd surface, send `SHM_OFFER` with its fd and wait for
+    /// `SHM_READY`.  `Ok(None)` means "use the full-frame path".
+    pub fn enable_shm(&mut self, width: u32, height: u32) -> io::Result<Option<ShmFrame>> {
+        if !self.shm_capable || width == 0 || height == 0 {
+            return Ok(None);
+        }
+        let Some((mut frame, generation)) = self.offer_shm(width, height)? else {
+            return Ok(None);
+        };
+        frame.generation = generation;
+        self.generation = generation;
+        Ok(Some(frame))
+    }
+
+    /// Recreate memfd/mapping for a new size and release the old generation.
+    /// `Ok(false)` means the caller must fall back to full-frame upload.
+    pub fn resize_shm(
+        &mut self,
+        frame: &mut ShmFrame,
+        width: u32,
+        height: u32,
+    ) -> io::Result<bool> {
+        if !self.shm_capable || width == 0 || height == 0 {
+            return Ok(false);
+        }
+        let Some((mut new_frame, generation)) = self.offer_shm(width, height)? else {
+            return Ok(false);
+        };
+        new_frame.generation = generation;
+        let old = frame.generation;
+        let _ = self.send(&Message::ShmRelease {
+            window_id: frame.window_id,
+            generation: old,
+        });
+        self.generation = generation;
+        *frame = new_frame;
+        Ok(true)
+    }
+
+    /// Send only damage metadata for the shared surface (no pixel payload).
+    pub fn commit_shm(&mut self, frame: &ShmFrame, damage: &Damage) -> io::Result<()> {
+        if !self.shm_capable {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "ShmSurface is not enabled",
+            ));
+        }
+        if damage.is_empty() {
+            return Ok(());
+        }
+        let rects = damage.rects();
+        let payload = 12 + rects.len() * 12;
+        self.tx.clear();
+        self.tx.reserve(HEADER_LEN + payload);
+        self.tx.extend_from_slice(&MAGIC);
+        self.tx
+            .extend_from_slice(&protocol::types::COMMIT.to_le_bytes());
+        self.tx.extend_from_slice(&header_flags::SHM.to_le_bytes());
+        self.tx.extend_from_slice(&(payload as u32).to_le_bytes());
+        self.tx.extend_from_slice(&frame.window_id.to_le_bytes());
+        self.tx.extend_from_slice(&frame.generation.to_le_bytes());
+        self.tx
+            .extend_from_slice(&(rects.len() as u32).to_le_bytes());
+        for rect in rects {
+            self.tx.extend_from_slice(&rect.x.to_le_bytes());
+            self.tx.extend_from_slice(&rect.y.to_le_bytes());
+            self.tx
+                .extend_from_slice(&(rect.w.clamp(0, u16::MAX as i32) as u16).to_le_bytes());
+            self.tx
+                .extend_from_slice(&(rect.h.clamp(0, u16::MAX as i32) as u16).to_le_bytes());
+        }
+        self.stream.write_all(&self.tx)?;
+        self.stream.flush()
+    }
+
+    /// Release the current generation and stop using shared memory.
+    pub fn release_shm(&mut self, frame: &ShmFrame) -> io::Result<()> {
+        self.shm_capable = false;
+        self.generation = 0;
+        self.send(&Message::ShmRelease {
+            window_id: frame.window_id,
+            generation: frame.generation,
+        })
+    }
+
+    fn offer_shm(&mut self, width: u32, height: u32) -> io::Result<Option<(ShmFrame, u32)>> {
+        let name = format!("pagh-terminal-{}-{}", std::process::id(), self.window_id);
+        let surface =
+            match ui_shm::ShmSurface::create(&name, width, height, UiFrameFormat::Xrgb8888) {
+                Ok(surface) => surface,
+                Err(_) => {
+                    self.shm_capable = false;
+                    return Ok(None);
+                }
+            };
+        let mapping = match surface.map() {
+            Ok(mapping) => mapping,
+            Err(_) => {
+                self.shm_capable = false;
+                return Ok(None);
+            }
+        };
+        let Some(canvas) = Canvas::from_mapped(
+            mapping,
+            width as usize,
+            height as usize,
+            surface.stride() as usize,
+        ) else {
+            self.shm_capable = false;
+            return Ok(None);
+        };
+        let offer = Message::ShmOffer {
+            window_id: self.window_id,
+            width,
+            height,
+            format: self.format.to_wire(),
+            stride: surface.stride(),
+            flags: 0,
+        };
+        let encoded = offer.encode();
+        if ui_shm::send_fd_payload(&self.stream, &encoded, surface.fd()).is_err() {
+            self.shm_capable = false;
+            return Ok(None);
+        }
+        let Some(generation) = self.wait_for_shm_ready()? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            ShmFrame {
+                canvas,
+                window_id: self.window_id,
+                generation,
+            },
+            generation,
+        )))
+    }
+
+    fn wait_for_shm_ready(&mut self) -> io::Result<Option<u32>> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let Some(message) = self.next_message(remaining)? else {
+                return Ok(None);
+            };
+            match message {
+                Message::ShmReady {
+                    window_id,
+                    generation,
+                } if window_id == self.window_id => return Ok(Some(generation)),
+                Message::Error { .. } => return Ok(None),
+                other => {
+                    if let Some(event) = self.handle_message(other)? {
+                        self.pending.push_back(event);
+                    }
+                }
+            }
+        }
+    }
+
     fn send(&mut self, message: &Message) -> io::Result<()> {
         let encoded = message.encode();
         if encoded.len() > HEADER_LEN + MAX_PAYLOAD {
@@ -269,8 +496,14 @@ impl SurfaceClient {
 
     /// Poll for events, waiting at most `timeout` for the first byte.
     pub fn poll_events(&mut self, timeout: Duration) -> io::Result<Vec<Event>> {
-        let deadline = Instant::now() + timeout;
         let mut events = Vec::new();
+        while let Some(event) = self.pending.pop_front() {
+            events.push(event);
+        }
+        if !events.is_empty() {
+            return Ok(events);
+        }
+        let deadline = Instant::now() + timeout;
         loop {
             if let Some(message) = self.reader.next().map_err(io::Error::from)? {
                 if let Some(event) = self.handle_message(message)? {
@@ -358,6 +591,30 @@ impl SurfaceClient {
                 Ok(Some(Event::Ping(nonce)))
             }
             Message::Pong { nonce } => Ok(Some(Event::Pong(nonce))),
+            Message::ShmReady {
+                window_id,
+                generation,
+            } => {
+                if window_id == self.window_id {
+                    self.generation = generation;
+                }
+                Ok(Some(Event::ShmReady {
+                    window_id,
+                    generation,
+                }))
+            }
+            Message::ShmRelease {
+                window_id,
+                generation,
+            } => {
+                if window_id == self.window_id && generation == self.generation {
+                    self.generation = 0;
+                }
+                Ok(Some(Event::ShmRelease {
+                    window_id,
+                    generation,
+                }))
+            }
             _ => Ok(None),
         }
     }
@@ -415,6 +672,7 @@ pub fn error_name(code: u32) -> &'static str {
         protocol::error_codes::LIMIT => "window limit",
         protocol::error_codes::UNSUPPORTED => "unsupported",
         protocol::error_codes::INTERNAL => "internal",
+        protocol::error_codes::STALE_GENERATION => "stale shm generation",
         _ => "unknown",
     }
 }

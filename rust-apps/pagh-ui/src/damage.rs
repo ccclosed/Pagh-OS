@@ -218,6 +218,35 @@ impl Damage {
     }
 }
 
+/// Пиксельная поверхность, для которой [`DamageTracker`] считает damage.
+///
+/// Реализуется [`Canvas`] и (для собственного рендерера терминала) его
+/// `Canvas`: трекеру нужны только размеры, stride, bpp и байты.
+pub trait DamageSurface {
+    fn dims(&self) -> (i32, i32);
+    fn stride(&self) -> usize;
+    fn bytes_per_pixel(&self) -> usize;
+    fn bytes(&self) -> &[u8];
+}
+
+impl DamageSurface for Canvas {
+    fn dims(&self) -> (i32, i32) {
+        (self.width(), self.height())
+    }
+
+    fn stride(&self) -> usize {
+        Canvas::stride(self)
+    }
+
+    fn bytes_per_pixel(&self) -> usize {
+        self.pixel_order().bytes_per_pixel()
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.pixels()
+    }
+}
+
 /// Автоматический damage между двумя кадрами поверхности.
 ///
 /// Приложение рисует кадр целиком в `Canvas` (в том числе прямо в mmap
@@ -286,8 +315,9 @@ impl DamageTracker {
     /// Возвращает ссылку на внутренний буфер, чтобы не аллоцировать список на
     /// каждом кадре; вызывающий обязан использовать его до следующего
     /// `update`.
-    pub fn update(&mut self, canvas: &Canvas) -> &Damage {
-        let rect = canvas.rect();
+    pub fn update<S: DamageSurface + ?Sized>(&mut self, canvas: &S) -> &Damage {
+        let (width, height) = canvas.dims();
+        let rect = Rect::new(0, 0, width, height);
         if rect != self.bounds {
             self.resize(rect);
         }
@@ -295,9 +325,9 @@ impl DamageTracker {
         if rect.is_empty() {
             return &self.damage;
         }
-        let bytes = canvas.pixels();
+        let bytes = canvas.bytes();
         let stride = canvas.stride();
-        let bpp = canvas.pixel_order().bytes_per_pixel();
+        let bpp = canvas.bytes_per_pixel();
         let mut index = 0usize;
         for row in 0..self.rows {
             let y0 = (row * self.tile).max(0) as usize;
