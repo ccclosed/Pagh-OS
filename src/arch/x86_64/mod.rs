@@ -4,4 +4,5 @@ pub mod cpuid;
 pub mod gdt;
 pub mod idt;
 pub mod linux;
+pub mod pat;
 pub mod syscall;
