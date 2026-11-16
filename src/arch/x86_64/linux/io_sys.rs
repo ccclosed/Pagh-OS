@@ -150,6 +150,9 @@ pub(crate) fn copy_out_checked(ptr: u64, src: &[u8]) -> Result<(), Errno> {
 fn write_errno(e: crate::vfs::VfsError) -> Errno {
     match e {
         crate::vfs::VfsError::NotSupported => Errno::EACCES,
+        // `/dev/full`: Linux отвечает ENOSPC, и POSIX-программы полагаются на
+        // эту ошибку в тестах записи.
+        crate::vfs::VfsError::NoSpace => Errno::ENOSPC,
         _ => Errno::EINVAL,
     }
 }
@@ -2326,9 +2329,10 @@ pub fn sys_access(path: u64, mode: u64) -> Result<u64, Errno> {
     // право поиска в каталоге при обходе, поэтому walk получает real id, а не
     // только финальную проверку прав.
     let creds = current_creds();
-    let real = Creds::new(
-        creds.uid, creds.gid, creds.uid, creds.gid, creds.uid, creds.gid,
-    );
+    // REAL-проекция, но с сохранением дополнительных групп: `setgroups(2)`
+    // меняет общий набор, поэтому `access(2)` обязан видеть group-класс так же,
+    // как обычный путь прав.
+    let real = creds.with_real_ids();
     // `access(2)` разыменовывает симлинки (висячая ссылка — ENOENT).
     let node = walk_as(&abs, true, real)?;
     let owner = node.owner();
@@ -2705,9 +2709,8 @@ pub fn sys_faccessat(dirfd: u64, path: u64, mode: u64, flags: u64) -> Result<u64
     let check = if flags & AT_EACCESS != 0 {
         creds
     } else {
-        Creds::new(
-            creds.uid, creds.gid, creds.uid, creds.gid, creds.uid, creds.gid,
-        )
+        // REAL-проекция с сохранением дополнительных групп (см. `sys_access`).
+        creds.with_real_ids()
     };
     let node = walk_as(&abs, follow, check)?;
     let owner = node.owner();
