@@ -59,7 +59,7 @@ fn blit_damage(
     mapping: &MappedBuffer,
     stride: usize,
     format: pagh_ui::protocol::FrameFormat,
-    rects: &[(i32, i32, u16, u16)],
+    rects: &[(i32, i32, u32, u32)],
     framebuffer: &mut [u8],
     width: i32,
 ) {
@@ -160,7 +160,7 @@ fn shm_surface_e2e_without_pixels_on_the_wire() {
             panic!("expected shm commit, got {message:?}");
         };
         assert_eq!((id, generation), (window_id, 1));
-        assert_eq!(rects, vec![(0i32, 0i32, W as u16, H as u16)]);
+        assert_eq!(rects, vec![(0i32, 0i32, W as u32, H as u32)]);
         assert!(
             header.length < 64,
             "shm commit payload must be metadata only, got {} bytes",
@@ -186,8 +186,8 @@ fn shm_surface_e2e_without_pixels_on_the_wire() {
             panic!("expected shm commit, got {message:?}");
         };
         assert_eq!(generation, 1);
-        assert_eq!(rects, vec![(5i32, 5i32, 1u16, 1u16)]);
-        assert!(header.length <= 12 + 12, "pixels leaked into the socket");
+        assert_eq!(rects, vec![(5i32, 5i32, 1u32, 1u32)]);
+        assert!(header.length <= 12 + 16, "pixels leaked into the socket");
         blit_damage(
             &mapping,
             stride as usize,
@@ -254,7 +254,7 @@ fn shm_surface_e2e_without_pixels_on_the_wire() {
                     generation, rects, ..
                 } => {
                     assert_eq!(generation, 2, "commit must use new generation");
-                    assert_eq!(rects, vec![(0i32, 0i32, W2 as u16, H2 as u16)]);
+                    assert_eq!(rects, vec![(0i32, 0i32, W2 as u32, H2 as u32)]);
                     blit_damage(
                         &mapping2,
                         stride2 as usize,
@@ -357,7 +357,7 @@ fn shm_surface_e2e_without_pixels_on_the_wire() {
             .unwrap()
             .parse()
             .unwrap();
-        assert!(len <= 12 + 12 * 64, "commit metadata too large: {line}");
+        assert!(len <= 12 + 16 * 64, "commit metadata too large: {line}");
     }
     let offers = trace
         .lines()

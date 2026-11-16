@@ -305,6 +305,14 @@ fn run_client(args: &Args, socket: &str) -> Result<(), String> {
                     height = configure.height.max(32);
                     let (cols, rows) = layout(width, height);
                     shell.terminal.resize(cols, rows);
+                    let same_size = shm.as_ref().is_some_and(|frame| {
+                        frame.canvas.width == width as usize
+                            && frame.canvas.height == height as usize
+                    });
+                    if same_size {
+                        dirty = true;
+                        continue;
+                    }
                     let resized = match shm.as_mut() {
                         Some(frame) => client.resize_shm(frame, width, height).unwrap_or(false),
                         None => false,

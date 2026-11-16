@@ -388,7 +388,7 @@ pub enum Message {
     CommitShm {
         window_id: u32,
         generation: u32,
-        rects: Vec<(i32, i32, u16, u16)>,
+        rects: Vec<(i32, i32, u32, u32)>,
     },
 }
 
@@ -651,8 +651,8 @@ impl Message {
                 for (x, y, width, height) in rects.iter().take(MAX_DAMAGE_RECTS) {
                     w.i32(*x);
                     w.i32(*y);
-                    w.u16(*width);
-                    w.u16(*height);
+                    w.u32(*width);
+                    w.u32(*height);
                 }
             }
         }
@@ -719,7 +719,7 @@ impl Message {
                 }
                 let mut rects = Vec::with_capacity(count);
                 for _ in 0..count {
-                    rects.push((r.i32()?, r.i32()?, r.u16()?, r.u16()?));
+                    rects.push((r.i32()?, r.i32()?, r.u32()?, r.u32()?));
                 }
                 Message::CommitShm {
                     window_id,

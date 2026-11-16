@@ -151,11 +151,13 @@ fn pagh_files_runs_under_real_pagh_desktop() {
 
     // 2. Запускаем реальный бинарник Files, он подключается по PDP/1.
     let binary = env!("CARGO_BIN_EXE_pagh-files");
+    let trace = shots.join("files.trace");
     let mut child = Command::new(binary)
         .arg("--connect")
         .arg(&socket)
         .arg("--size")
         .arg("1000x600")
+        .env("PAGH_UI_PDP_TRACE", &trace)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -268,7 +270,74 @@ fn pagh_files_runs_under_real_pagh_desktop() {
         .expect("pagh-files не завершился после close");
     assert!(status.success(), "pagh-files завершился с {status:?}");
 
+    // Сервер в dev умеет ShmSurface: клиент обязан идти shm-путём, без
+    // пиксельного payload в управляющем сокете.
+    let trace = std::fs::read_to_string(&trace).expect("PDP trace");
+    assert!(
+        trace.lines().any(|line| line.starts_with("> shm_offer")),
+        "Files не сделал shm_offer:\n{trace}"
+    );
+    assert!(trace.lines().any(|line| line.starts_with("< shm_ready")));
+    assert!(trace.lines().any(|line| line.starts_with("> commit_shm")));
+    assert!(
+        !trace.contains("pixels="),
+        "shm-путь не должен слать пиксели:\n{trace}"
+    );
+
     server.control.shutdown();
     server.join().expect("композитор завершился");
+    let _ = std::fs::remove_dir_all(&shots);
+}
+
+#[test]
+fn pagh_files_falls_back_when_shm_disabled() {
+    let socket = unique_socket_path("files-fallback");
+    let shots = temp_dir("fallback-shots");
+    let trace = shots.join("files-fallback.trace");
+    let server = Server::spawn(ServerOptions {
+        socket: socket.clone(),
+        width: 1280,
+        height: 800,
+        quiet: std::env::var("PAGH_E2E_VERBOSE").is_err(),
+        screenshot_dir: Some(shots.clone()),
+        ..ServerOptions::default()
+    })
+    .expect("композитор стартует");
+    let empty = capture(&server.control, &shots, "00-empty.png");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pagh-files"))
+        .arg("--connect")
+        .arg(&socket)
+        .arg("--size")
+        .arg("800x500")
+        .env("PAGH_UI_DISABLE_SHM", "1")
+        .env("PAGH_UI_PDP_TRACE", &trace)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("pagh-files стартует");
+    assert!(
+        wait_for(Duration::from_secs(15), || {
+            capture(&server.control, &shots, "01-fallback.png") != empty
+        }),
+        "окно Files не появилось на экране композитора (fallback)"
+    );
+    server.control.close_window(1);
+    let status = wait_child_exit(&mut child, Duration::from_secs(10))
+        .expect("pagh-files не завершился после close");
+    assert!(status.success(), "pagh-files завершился с {status:?}");
+    server.control.shutdown();
+    server.join().expect("композитор завершился");
+
+    let trace = std::fs::read_to_string(&trace).expect("PDP trace");
+    assert!(
+        !trace.contains("shm_offer"),
+        "PAGH_UI_DISABLE_SHM не должен делать shm_offer:\n{trace}"
+    );
+    assert!(
+        trace
+            .lines()
+            .any(|line| line.starts_with("> commit") && line.contains("pixels=")),
+        "fallback обязан слать полный кадр:\n{trace}"
+    );
     let _ = std::fs::remove_dir_all(&shots);
 }

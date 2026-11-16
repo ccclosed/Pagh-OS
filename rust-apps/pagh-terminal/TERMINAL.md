@@ -271,7 +271,7 @@ E2E с реальным композитором (headless backend, `pagh-deskto
 | 16 | `shm_release` | обе | `window_id u32, generation u32` |
 
 `commit` с `flags=SHM` (bit 0) — без пикселей: `window_id u32, generation u32,
-count u32, rects[(x i32,y i32,w u16,h u16)]`; сервер читает повреждённые
+count u32, rects[(x i32,y i32,w u32,h u32)]`; сервер читает повреждённые
 области из memfd. Терминал пересоздаёт memfd при `configure`, шлёт новое
 поколение и `shm_release` старого; на legacy-сервере (bit 2 = 0) остаётся
 полный кадр. `damage` (type 9) — по-прежнему подсказка.

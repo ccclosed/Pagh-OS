@@ -189,6 +189,13 @@ fn run_compositor(
                 } if window_id == window => {
                     app.resize(size);
                     window_size = size;
+                    // Повторный configure с тем же размером не повод
+                    // пересоздавать memfd/поколение.
+                    let same_size = shm.as_ref().is_some_and(|frame| frame.size() == size);
+                    if same_size {
+                        dirty = true;
+                        continue;
+                    }
                     let resized = match shm.as_mut() {
                         Some(frame) => client.resize_shm(frame, size).unwrap_or(false),
                         None => false,
