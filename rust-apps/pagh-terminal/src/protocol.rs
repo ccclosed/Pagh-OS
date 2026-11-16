@@ -9,13 +9,15 @@
 //!   offset  size  field
 //!   0       4     magic  = b"PDS1"
 //!   4       2     type   (u16 LE)
-//!   6       2     flags  (u16 LE, must be 0)
+//!   6       2     flags  (u16 LE; 0, либо bit0 SHM для commit/damage)
 //!   8       4     length (u32 LE, payload bytes)
 //!   12      N     payload
 //! ```
 //!
 //! All integers are little-endian.  Strings are `u16 length` + UTF-8 bytes.
-//! `commit` uploads a full frame in-band; `damage` is only a hint in v1.
+//! `commit` uploads a full frame in-band, unless the server advertises
+//! `ShmSurface`: then `commit` carries damage metadata only (flags bit 0) and
+//! pixels live in the memfd sent with `shm_offer`. `damage` is only a hint.
 //! Unknown message types and trailing payload bytes are rejected, matching the
 //! server's decoder.
 
