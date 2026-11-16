@@ -32,13 +32,13 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 | `trap_frame.rs` | Чистое зеркало фрейма `irq32_stub` (21 слово: popfq, 15 GPR в порядке `SavedRegs`, iret-слова) и план доставки сигнала с тика: ring-3 классификация, точный набор мутаций входа в обработчик, проверка «доставлен тот же сигнал» (хост-тестируемый, свойство `irq_frame`; const-asserts против индексов из `src/test.rs`) |
 | `kill.rs` | Чистая модель `kill(2)`: 32-битное декодирование `pid_t`/`int`, классификация цели (`pid>0`, `0`, `-1`, `-pgid`, `INT_MIN → ESRCH`), политика прав `kill_permits` (root / real uid / effective uid цели; EPERM реально достижим), выбор одного потока на группу (хост-тестируемая, свойство `kill_target`) |
 | `tty.rs` | Чистая модель управления терминалом (job control): foreground-pgid + `TOSTOP`, вердикт доступа (`SIGTTIN` на фоновое чтение, `SIGTTOU` на фоновую запись при `TOSTOP`), декодирование `int`-аргумента `TIOCSPGRP` (отрицательный → `EINVAL`) и `may_set_foreground` (живая группа / текущая / группа shell; иначе `EPERM`), константы `TIOCGPGRP` 0x540F / `TIOCSPGRP` 0x5410 и `TOSTOP` (хост-тестируемая, свойство `tty_job`; состояние — в `drivers/tty.rs`) |
-| `cred.rs` | Чистая модель креденшелов: `Creds` (6 id), `Access`, POSIX `may` (owner/group/other по effective id, root bypass r/w, execute требует x), переходы setuid/setgid/setreuid/setregid/setresuid/setresgid, `may_chmod`/`may_chown` (хост-тестируемая, свойство P56) |
+| `cred.rs` | Чистая модель креденшелов: `Creds` (6 id + до 32 дополнительных групп, `GROUPS_CAP`), `Access`, POSIX `may` (owner/group/other; group-класс по `egid` **или любому** supplementary gid; root bypass r/w, execute требует x), `in_group`/`with_groups`/`setgroups` (root-only), `with_real_ids` для `access(2)`, переходы setuid/setgid/setreuid/setregid/setresuid/setresgid, `may_chmod`/`may_chown`, константы gid (tty/disk/wheel/video/input/net) (хост-тестируемая, свойство P56) |
 | `errno.rs` | Модель errno; ядро складывает `Err(e)` в rax как `-errno` (`-4095..=-1`) |
 | `io.rs` | Чистое планирование `read`/`lseek` |
 | `io_sys.rs` | Эффектные обработчики файлового I/O (FdTable, консоль, VFS/ext2) |
 | `mem.rs` | Чистое планирование `brk`/`mmap`/`munmap`, `prot_to_flags` |
 | `mem_sys.rs` | Эффектные memory-syscall'ы: `handle_user_page_fault` (demand paging для anon mmap/brk), VmRegionSet + VMM/PMM |
-| `misc.rs` | `getpid`/`uname`/`arch_prctl`/`set_tid_address`/`clock_gettime`/`getrandom`/`exit`/`exit_group`, а также `get[res]{u,g}id`/`set[res]{u,g}id` (читают и меняют `CompatState::creds`) |
+| `misc.rs` | `getpid`/`uname`/`arch_prctl`/`set_tid_address`/`clock_gettime`/`getrandom`/`exit`/`exit_group`, а также `get[res]{u,g}id`/`set[res]{u,g}id` и `getgroups`/`setgroups` (nr 115/116; читают и меняют `CompatState::creds`, `setgroups` — только `euid == 0`) |
 | `stat.rs` | Кодирование `struct stat` (`LinuxStat`) для `stat`/`fstat`/`newfstatat` |
 | `dirent.rs` | Чистая упаковка `linux_dirent64` для `getdents64` |
 | `epoll_sys.rs` | `clock_getres`, `eventfd2`, `epoll_create1/ctl/wait` |
