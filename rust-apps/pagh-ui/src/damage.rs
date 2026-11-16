@@ -390,12 +390,11 @@ fn hash_region(
         if start >= end {
             continue;
         }
-        let mut chunks = bytes[start..end].chunks_exact(8);
-        for chunk in &mut chunks {
-            let word = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+        let (chunks, tail) = bytes[start..end].as_chunks::<8>();
+        for chunk in chunks {
+            let word = u64::from_le_bytes(*chunk);
             hash = (hash ^ word).wrapping_mul(PRIME);
         }
-        let tail = chunks.remainder();
         if !tail.is_empty() {
             let mut word = [0u8; 8];
             word[..tail.len()].copy_from_slice(tail);

@@ -158,14 +158,14 @@ impl Canvas {
             let bytes = mapping.as_mut_slice();
             for y in 0..self.height {
                 let row = &mut bytes[y * self.stride..y * self.stride + self.width * 4];
-                for px in row.chunks_exact_mut(4) {
-                    px.copy_from_slice(&[bg.2, bg.1, bg.0, 0]);
+                for px in row.as_chunks_mut::<4>().0 {
+                    *px = [bg.2, bg.1, bg.0, 0];
                 }
             }
             return;
         }
-        for chunk in self.pixels.chunks_exact_mut(4) {
-            chunk.copy_from_slice(&[bg.0, bg.1, bg.2, 255]);
+        for chunk in self.pixels.as_chunks_mut::<4>().0 {
+            *chunk = [bg.0, bg.1, bg.2, 255];
         }
     }
 

@@ -16,6 +16,8 @@ use pagh_terminal::keys::evdev::KEY_A;
 use pagh_ui::protocol::{self, close_reason, FrameFormat, Header, Message};
 use pagh_ui::shm::{recv_fd_payload, MappedBuffer};
 
+type DamageRect = (i32, i32, u16, u16);
+
 const W: u32 = 640;
 const H: u32 = 400;
 const W2: u32 = 720;
@@ -60,7 +62,7 @@ fn read_offer(stream: &UnixStream) -> (Message, OwnedFd) {
     (offer, fds.remove(0))
 }
 
-fn read_commit(stream: &mut UnixStream) -> (Header, u32, Vec<(i32, i32, u16, u16)>) {
+fn read_commit(stream: &mut UnixStream) -> (Header, u32, Vec<DamageRect>) {
     let (header, message) = read_plain(stream);
     assert_eq!(header.flags, protocol::header_flags::SHM);
     let Message::CommitShm {
@@ -161,7 +163,9 @@ fn terminal_shm_damage_blink_and_resize() {
         assert!(
             mapping
                 .as_slice()
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|px| px[..3] != [0, 0, 0]),
             "terminal did not render into memfd"
         );
@@ -287,7 +291,9 @@ fn terminal_shm_damage_blink_and_resize() {
                     assert!(
                         mapping2
                             .as_slice()
-                            .chunks_exact(4)
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
                             .any(|px| px[..3] != [0, 0, 0]),
                         "resized terminal surface stayed blank"
                     );

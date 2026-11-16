@@ -587,7 +587,7 @@ impl DesktopClient {
     /// Создать memfd+canvas и провести offer/ready; на неудаче — `Ok(None)`
     /// (fallback), без разрыва соединения.
     fn offer_shm(&mut self, window_id: u32, size: Size) -> io::Result<Option<(ShmFrame, u32)>> {
-        let name = format!("pagh-ui-{}-{}", std::process::id(), window_id.min(u32::MAX));
+        let name = format!("pagh-ui-{}-{}", std::process::id(), window_id);
         let surface = match ShmSurface::create(&name, size.w as u32, size.h as u32, self.format) {
             Ok(surface) => surface,
             Err(_) => {

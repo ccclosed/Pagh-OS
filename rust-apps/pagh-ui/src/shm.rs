@@ -638,7 +638,9 @@ mod tests {
         let surface = ShmSurface::create("pagh-ui-len", 7, 5, FrameFormat::Xrgb8888).unwrap();
         let mut mapping = surface.map().unwrap();
         assert_eq!(mapping.len(), surface.byte_len());
-        mapping.as_mut_slice().last_mut().map(|b| *b = 7);
+        if let Some(last) = mapping.as_mut_slice().last_mut() {
+            *last = 7;
+        }
         let mut buf = Vec::new();
         // memfd виден через /proc/self/fd; небольшой sanity check, что fd живой.
         let path = format!("/proc/self/fd/{}", surface.fd());

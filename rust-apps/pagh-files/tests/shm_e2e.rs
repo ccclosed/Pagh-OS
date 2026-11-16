@@ -176,7 +176,11 @@ fn files_renders_into_memfd_and_sends_only_damage() {
         // непрозрачные (не нулевые) пиксели.
         let pixels = mapping.as_slice();
         assert!(
-            pixels.chunks_exact(4).any(|px| px[..3] != [0, 0, 0]),
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[..3] != [0, 0, 0]),
             "shm surface stayed blank"
         );
 
@@ -243,7 +247,9 @@ fn files_renders_into_memfd_and_sends_only_damage() {
                     assert!(
                         mapping2
                             .as_slice()
-                            .chunks_exact(4)
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
                             .any(|px| px[..3] != [0, 0, 0]),
                         "resized shm surface stayed blank"
                     );
