@@ -432,6 +432,7 @@ fn idle_has_zero_presents_and_cursor_damage_is_small() {
         "present после движения курсора"
     );
     let cursor = server.counters.snapshot();
+    eprintln!("e2e idle: {idle:?}; e2e cursor: {cursor:?}");
     assert!(
         cursor.bytes_presented > 0 && cursor.bytes_presented < 20_000,
         "курсор должен дать маленький damage: {cursor:?}"
@@ -479,6 +480,7 @@ fn drag_damage_is_bounded_by_window_not_screen() {
     server.control.mouse_button(1, false);
     std::thread::sleep(Duration::from_millis(100));
     let stats = server.counters.snapshot();
+    eprintln!("e2e drag: {stats:?}");
     let screen_bytes = 800u64 * 600 * 4;
     assert!(
         stats.bytes_presented > 0 && stats.bytes_presented < screen_bytes / 2,
@@ -541,6 +543,7 @@ fn shm_surface_commit_reoffer_and_stale_generation() {
     assert_eq!(stats.shm_offers, 1);
     assert!(stats.shm_commits >= 1);
     assert!(stats.shm_bytes >= size as u64);
+    eprintln!("e2e shm initial: {stats:?}");
 
     // Reoffer: новый memfd и generation; старый commit должен быть отброшен.
     let fd2 = pagh_desktop::shm::create_memfd("pagh-e2e-shm-2", size).expect("memfd 2");
