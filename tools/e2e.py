@@ -146,6 +146,10 @@ MODE_DEFAULTS = {
     "rndis": {"timeout": 240.0, "serial": "serial_rndis.log"},
     # Console scroll: boot + help screenful + wheel/PageUp/PageDown + screenshots.
     "scroll": {"timeout": 180.0, "serial": "serial_scroll.log"},
+    # Phase-1 group model: two boots (format disk, then inject the probe), then
+    # real getgroups/setgroups/access/open decisions from ring 3 as root and as
+    # uid 1000 (both with and without supplementary groups).
+    "groups": {"timeout": 300.0, "serial": "serial_groups.log"},
 }
 
 # Features a mode cannot work without; `--features` only ADDS to this list.
@@ -2901,6 +2905,192 @@ def mode_desktop(h: "Harness") -> tuple[str, int]:
         kb.close()
 
 
+# ── phase 1 groups: real getgroups/setgroups/VFS decisions from ring 3 ───────
+
+
+def _groups_probe_binary() -> pathlib.Path:
+    """Assemble `tools/group_probe.c` into a freestanding static ELF.
+
+    No libc and no package dependencies: the probe is raw syscalls, so a green
+    run cannot be explained by glibc falling back to something else. `gcc` is
+    only a build tool here, exactly as the desktop mode needs a cargo target.
+    """
+    gcc = shutil.which("gcc")
+    if not gcc:
+        raise SetupError("groups: gcc is required to build tools/group_probe.c")
+    src = ROOT / "tools" / "group_probe.c"
+    if not src.is_file():
+        raise SetupError(f"groups: probe source missing: {src}")
+    out = CACHE / "grpprobe"
+    CACHE.mkdir(parents=True, exist_ok=True)
+    run_checked(
+        [gcc, "-static", "-nostdlib", "-ffreestanding", "-fno-stack-protector",
+         "-fno-pie", "-no-pie", "-Os", "-o", out, src,
+         "-Wl,-e,_start", "-Wl,--build-id=none"],
+        "groups probe build", timeout=120,
+    )
+    if not out.is_file():
+        raise SetupError("groups: probe build produced no ELF")
+    return out
+
+
+def _debugfs_inject_exec(image: pathlib.Path, src: pathlib.Path, name: str) -> None:
+    """Write `src` as `/{name}` mode 0100755 into an ext2 image, then verify it."""
+    for argv in (
+        ["debugfs", "-w", "-R", f"write {src} /{name}", str(image)],
+        ["debugfs", "-w", "-R", f"sif /{name} mode 0100755", str(image)],
+    ):
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise SetupError(f"debugfs {argv[3]} failed: {proc.stderr.strip()}")
+    stat = _debugfs_stat(image, name)
+    if stat is None or "Mode:  0755" not in stat:
+        raise SetupError(f"debugfs: /{name} is not executable after injection")
+
+
+def _groups_prepare_disk(h: "Harness", image: pathlib.Path,
+                         probe: pathlib.Path) -> None:
+    """Let the kernel format a blank disk, then inject the probe with debugfs.
+
+    The kernel only mounts a volume carrying its WAL superblock, so the first
+    boot must be the kernel's own format path (a host mkfs.ext2 image would be
+    refused). After QEMU stops, the probe is written into the already-provisioned
+    ext2 and the second boot mounts it without prompting.
+    """
+    if not shutil.which("qemu-img") or not shutil.which("debugfs"):
+        raise SetupError("groups: qemu-img and debugfs are required")
+    image.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        image.unlink()
+    except FileNotFoundError:
+        pass
+    run_checked([shutil.which("qemu-img"), "create", "-f", "raw", str(image), "64M"],
+                "qemu-img create (groups format)", timeout=60)
+    log("groups: first boot on a blank disk to let the kernel format ext2+WAL")
+    h.boot(need_keyboard=True, disk=image, net=False)
+    assert h.guest is not None and h.kb is not None
+    if not wait_for_shell(h.guest, h.kb, h.a, h.a.boot_timeout):
+        raise HarnessError("groups: shell never appeared on the blank disk; "
+                           f"serial tail:\n{tail(h.guest.serial())}")
+    if wait_for(h.guest, [r"ext2 mounted at /mnt"], 60.0, label="ext2 mount") is None:
+        raise HarnessError("groups: kernel did not mount the freshly formatted volume")
+    time.sleep(2.0)
+    h.guest.stop()
+    h.guest = None
+    h.kb.close()
+    h.kb = None
+    if not image.is_file():
+        raise SetupError("groups: formatted disk image disappeared")
+    _debugfs_inject_exec(image, probe, "grpprobe")
+    log(f"groups: injected {rel(probe)} into {rel(image)} as /grpprobe")
+
+
+def mode_groups(h: "Harness") -> tuple[str, int]:
+    """Phase 1 acceptance for supplementary groups, group VFS checks and devices.
+
+    Two boots: the first formats a blank disk (the only writable ext2 the kernel
+    will mount), the probe is injected with debugfs, and the second boot drives
+    the shell. The probe is the part selftest cannot do from ring 0: it passes a
+    real user `gid_t*` through getgroups/setgroups and asks access/open for
+    group-owned files and /dev nodes as root, as uid 1000 with no groups, as
+    uid 1000 with only supplementary video(44), and as the `su oleg` session.
+    """
+    a = h.a
+    probe = _groups_probe_binary()
+    disk = CACHE / "e2e_groups_disk.img"
+    if not (getattr(a, "reuse_groups_disk", False)
+            and _debugfs_stat(disk, "grpprobe") is not None):
+        _groups_prepare_disk(h, disk, probe)
+    else:
+        log(f"groups: reusing {rel(disk)}")
+
+    h.boot(need_keyboard=True, disk=disk, net=False)
+    assert h.guest is not None and h.kb is not None
+    kb = h.kb
+    if not wait_for_shell(h.guest, kb, a, a.boot_timeout):
+        raise HarnessError(f"groups: shell never appeared; serial tail:\n"
+                           f"{tail(h.guest.serial())}")
+
+    def sh(cmd: str) -> None:
+        log(f"type: {cmd}")
+        kb.text(cmd)
+        kb.key("ret")
+
+    # `root:video 0640` data file: the group-class probe target, created as root
+    # by the native shell (which bypasses VFS checks by design).
+    sh("write /mnt/groupfile topsecret")
+    sh("chmod 0640 /mnt/groupfile")
+    sh("chown 0:44 /mnt/groupfile")
+    sh("id")
+    sh("ls -l /dev/fb0")
+    sh("ls -l /dev/null")
+
+    ok = True
+    for mode in ("root", "drop", "dropvideo"):
+        sh(f"lxrun /mnt/grpprobe {mode}")
+        if wait_for(h.guest, [rf"GPROBE mode={mode} "], h.timeout,
+                    label=f"grpprobe {mode}") is None:
+            ok &= h.check(f"grpprobe {mode} produced a result line", False,
+                          "timeout; serial tail: " + tail(h.guest.serial(), 10))
+            return ("FAIL", EXIT_FAIL)
+        time.sleep(1.0)
+
+    sh("su oleg")
+    if wait_for(h.guest, [r"su: no password authentication in phase 1"], 30.0,
+                label="su oleg") is None:
+        ok &= h.check("su oleg switches the session", False, "no su marker")
+        return ("FAIL", EXIT_FAIL)
+    sh("id")
+    sh("groups")
+    sh("lxrun /mnt/grpprobe file")
+    if wait_for(h.guest, [r"GPROBE mode=file "], h.timeout,
+                label="grpprobe file") is None:
+        ok &= h.check("grpprobe file produced a result line", False,
+                      "timeout; serial tail: " + tail(h.guest.serial(), 10))
+        return ("FAIL", EXIT_FAIL)
+    time.sleep(a.settle)
+    text = h.guest.serial()
+
+    expected = [
+        ("root: getgroups count/size/EFAULT and setgroups cap+clear",
+         r"GPROBE mode=root uid=0 euid=0 gid=0 egid=0 ngroups=0 groups=- "
+         r"initial=0 invalid33=22 set=0 count=3 listed=3 vals=0,44,105 "
+         r"small=22 badptr=14 cleared=0 after=0"),
+        ("uid 1000 with no groups: group file/devices denied, null allowed",
+         r"GPROBE mode=drop uid=1000 euid=1000 gid=1000 egid=1000 ngroups=0 groups=- "
+         r"rootfile=0 setgroups=0 setgid=0 setuid=0 file=13 read=13 fb0=13 "
+         r"event0=13 vtconsole=13 null=0 setgroups_again=1"),
+        ("supplementary video(44), egid 1000: group file and fb0 allowed, tty denied",
+         r"GPROBE mode=dropvideo uid=1000 euid=1000 gid=1000 egid=1000 ngroups=1 "
+         r"groups=44 rootfile=0 setgroups=0 setgid=0 setuid=0 file=0 read=9 "
+         r"fb0=0 event0=13 vtconsole=13 null=0 setgroups_again=1"),
+        ("su oleg + lxrun: session tty/video/input groups reach the child",
+         r"GPROBE mode=file uid=1000 euid=1000 gid=1000 egid=1000 ngroups=3 "
+         r"groups=5,44,105 file=0 read=9 fb0=0 event0=0 vtconsole=0 vtinput=0 "
+         r"null=0 setgroups=1"),
+        ("id after su oleg reports the same groups",
+         r"uid=1000\(oleg\) gid=1000\(oleg\) "
+         r"groups=1000\(oleg\),5\(tty\),44\(video\),105\(input\)"),
+        ("groups after su oleg lists tty/video/input",
+         r"(?m)^oleg tty video input\r?$"),
+        ("/dev/fb0 is root:video 0660",
+         r"-rw-rw----\s+1\s+0\s+44\s+\d+\s+fb0"),
+        ("/dev/null is 0666",
+         r"-rw-rw-rw-\s+1\s+0\s+0\s+\d+\s+null"),
+        ("su prints the loaded supplementary set",
+         r"su: groups=1000\(oleg\),5\(tty\),44\(video\),105\(input\)"),
+    ]
+    for label, pattern in expected:
+        m = re.search(pattern, text)
+        ok &= h.check(label, bool(m), m.group(0).strip() if m else "not found")
+
+    crashes = re.findall(r"PANIC|\[EXC [^\]]+\]|DOUBLE FREE", text)
+    ok &= h.check("no panic/exception in guest", not crashes,
+                  crashes[0] if crashes else "none")
+    h.metrics["probe modes"] = "root, drop, dropvideo, file"
+    return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
+
+
 MODES = {
     "selftest": mode_selftest,
     "local-mirror": mode_local_mirror,
@@ -2913,6 +3103,7 @@ MODES = {
     "rndis": mode_rndis,
     "scroll": mode_scroll,
     "desktop": mode_desktop,
+    "groups": mode_groups,
     "smoke": mode_smoke,
     "boot-check": mode_boot_check,
     "restore": mode_restore,
@@ -3048,6 +3239,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="shell command to type + Enter (repeatable)")
     sh.add_argument("--script", default=None,
                     help="interaction script (see the module docstring for the DSL)")
+
+    gp = sub.add_parser(
+        "groups", parents=[common],
+        help="Phase-1 group model: getgroups/setgroups and VFS group checks from "
+             "ring 3 via a static probe (root, dropped uid, su oleg)")
+    gp.add_argument("--reuse-groups-disk", action="store_true",
+                    help="reuse .cache/e2e_groups_disk.img (already formatted/injected)")
 
     ts = sub.add_parser("tcp-shot", parents=[common],
                         help="regression: a peer that replies and closes in one burst "

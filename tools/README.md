@@ -11,7 +11,7 @@
 | `host_tests.py` | Обёртка: определяет host triple через `rustc -vV`, запускает `cargo test --locked --target <host>` в `host-tests/` |
 | `toolchain.sh` | Guard для `build.sh`/`run.sh`: отказывается собирать ненайтовым (stable/дистрибутивным) `cargo` — тот падает с `-Zjson-target-spec` и не называет настоящую причину. `tools/build.py` его не требует |
 | `check_agents_md.py` | Гейт утверждений `AGENTS.md` против дерева (шесть гейтов, канонические entry points, версия/теги, release-notes) в обе стороны; `--probe` ломает каждый класс утверждений в scratch-копии и требует находку на каждую поломку; `--quiet` — только вердикт |
-| `e2e.py` | Кроссплатформенный (Linux/CI, без pwsh) in-guest E2E-драйвер: режимы `selftest`, `local-mirror`, `live-update`, `bigindex`, `shell`, `tcp-shot`, `smoke`, `usb`, `scroll`; общие флаги `--features`/`--debug`/`--cpu`/`--disk`/`--nvme`/`--timeout`/`--settle`/`--expect`/`--keep-artifacts` |
+| `e2e.py` | Кроссплатформенный (Linux/CI, без pwsh) in-guest E2E-драйвер: режимы `selftest`, `local-mirror`, `live-update`, `bigindex`, `shell`, `tcp-shot`, `smoke`, `usb`, `rndis`, `scroll`, `desktop`, `groups`; общие флаги `--features`/`--debug`/`--cpu`/`--disk`/`--nvme`/`--timeout`/`--settle`/`--expect`/`--keep-artifacts` |
 | `check_safety.py` | CI-гейт unsafe-политики: сканирует `src/security/`, `src/arch/x86_64/linux/mod.rs`, `src/memory/vmm.rs`, `src/net/tls.rs`, `src/pkg/apt.rs` — каждый `unsafe {` обязан иметь `SAFETY:`-коммент в предыдущих 6 строках, иначе exit 1 |
 | `worktrees.py` | Гигиена worktree по правилу AGENTS.md «после мержа PR ветку удаляют»: таблица всех worktree (state `merged`/`unique`/`dirty`/`detached`, ahead/unique по `git cherry`, число грязных путей), `--prune` (dry-run без `--yes`; не трогает грязные/уникальные/detached и «активные» — тронутые меньше `--min-idle-minutes`, по умолчанию 30), `--self-test` собирает временный репозиторий и проверяет классификатор и правила prune на нём) |
 | `gen_ca_bundle.py` | Генератор trust-anchor бандла TLS-верификатора: скачивает curl/Mozilla CA extract, выбирает корни по subject CN (ISRG Root X1/X2, GTS R1/R4), пишет детерминированный `src/net/ca_bundle.rs` (DER-массивы + метки); сгенерированный файл коммитится, перегенерация — только осознанно |
@@ -19,6 +19,7 @@
 | `gen_debian_keyring.py` | Генератор пиннутого Debian-keyring'а OpenPGP-верификатора (issue #32): качает зафиксированный по sha256 `debian-archive-keyring_*.deb` (или берёт `--deb FILE`), выбирает ключи **по v4-фингерпринту**, сверяет UID/алгоритм/размер/создание/истечение/подключи, пишет детерминированный `src/pkg/openpgp_keys.rs` (блоки байт + таблица пинов); `--check` — diff без записи, `--print-keyring` — тот же набор как бинарный keyring для `gpg --list-packets`. Перегенерация — только осознанно |
 | `gen_openpgp_fixtures.py` | Генератор OpenPGP-фикстур для host-свойств P51–P53: настоящие подписи GnuPG 2.4 (`--faked-system-time`, Ed25519 + RSA-2048 c signing-подключом, просроченный и непроверенный ключи), пишет `host-tests/src/properties/openpgp_fixtures.rs` (закоммичены; генерация ключей случайна, поэтому перегенерация — осознанный акт) |
 | `pgp_packets.py` | Мини-читалка OpenPGP-пакетов (реестр блоков, MPI, subpacket'ы, v4-фингерпринты) для обоих генераторов выше; только стандартная библиотека |
+| `group_probe.c` | Freestanding x86_64 Linux-проба для режима `e2e.py groups`: raw-сисколлы `getgroups`/`setgroups`/`access`/`open` (без libc), режимы `root`/`drop`/`dropvideo`/`file`. Собирается `gcc -static -nostdlib` в `.cache/grpprobe` и инжектится в ext2 через `debugfs`; вывод — строки `GPROBE …`, которые грепает харнесс |
 | `mini_repo.py` | Мини Debian-зеркало в `tools/mini_repo/` для apt-E2E: **шесть suite'ов** — `stable` (корректный и **подписанный**), `tampered-index` (подпись валидна, но отдаваемый `Packages` не тот, что описан в подписанном `Release`; длина совпадает — ловится только SHA-256), `tampered-deb` (метаданные корректны, а `.deb` не тот; тоже равной длины), `unsigned` (подписей нет), `untrusted` (подписан непроверенным ключом) и `stale` (корректный, но более старый triplet — `apt` его принимает, харнесс печатает NOTE). `stable` дополнительно несёт фикстуру `links-pagh` (symlink/hardlink/длинное имя, issue #18). Подпись — `tools/openpgp_sign.py` по детерминированному тестовому seed'у, без секретов в репозитории |
 | `openpgp_sign.py` | Детерминированная OpenPGP-подпись для фикстур (issue #32): RFC 8032 Ed25519 от фиксированного seed + v4-пакеты (public key с легаси-OID, UID, сертификация 0x13, detached/clearsign) + armor с CRC24. Только stdlib, векторы RFC 8032 проверяются перед каждой генерацией; применим только для тестовых фикстур |
 | `gen_openpgp_testkey.py` | Генератор E2E-**тестового** trust-anchor'а `src/pkg/openpgp_test_keys.rs` (компилируется только под `lx_selftest`/`lx_bigindex`): детерминированный Ed25519-ключ + три пиннутых ключа Debian в одной таблице. `--print-keyring DIR` выкладывает бинарные блоки для `gpg --list-packets` |
@@ -54,6 +55,20 @@
   образе проверяются формат/монтирование ext2 на NVMe, а routine
   `nvme::PRP-list multi-page read + batch depth` реально исполняется (без `--nvme`
   она печатает `skip`, потому что `nvme0` не зарегистрирован).
+- `python3 tools/e2e.py groups` — приёмка фазы 1 «группы отдельно от root» **реальными
+  сисколлами из ring 3** (in-QEMU `selftest` исполняется в ring 0 и массив `gid_t*` туда
+  передать не может). Два boot'а: первый форматирует чистый 64-МиБ диск (хост-`mkfs` ядро не
+  монтирует), затем `tools/group_probe.c` инжектится в ext2 через `debugfs`, второй boot
+  монтирует его и гоняет probe: `root` (контракт `getgroups`/`setgroups`: count, `EINVAL` на
+  `size < n` и `size > 32`, `EFAULT` на плохом списке, очистка), `drop` (root сбрасывает
+  uid до 1000 без групп: `root:video 0640`-файл и `/dev/fb0`/`event0`/`vtconsole0` —
+  `EACCES`, `/dev/null` — 0), `dropvideo` (root ставит **дополнительную** video(44) и
+  сбрасывает uid: файл и fb0 открываются, tty-устройство — нет — доказывает, что group-класс
+  использует любой supplementary gid, а не `egid`), `file` (после `su oleg`: uid 1000,
+  groups 5/44/105 открывают всё разрешённое, `setgroups` — `EPERM`; uid/groups печатает сам
+  probe, т.е. наследование сессии в `lxrun` видно с другой стороны). Утверждения — точные
+  строки `GPROBE …`, `ls -l /dev/fb0`, `id`/`groups` после `su` и `su: groups=…`; отдельно
+  проверяется отсутствие `PANIC`/`[EXC`. Требуется `gcc`, `qemu-img`, `debugfs`.
 - `python3 tools/e2e.py tcp-shot [--port 8099]` — регрессия на «пир ответил и закрылся
   одним залпом»: хост поднимает одноразовый TCP-сервер (`OneShotServer`), который
   отправляет полезную нагрузку и сразу закрывает соединение, а гость делает
