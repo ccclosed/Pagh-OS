@@ -1,7 +1,7 @@
 // task/process.rs — создание пользовательских процессов.
 
 use crate::arch::x86_64::gdt;
-use crate::arch::x86_64::linux::cred::Access;
+use crate::arch::x86_64::linux::cred::{Access, Creds};
 use crate::arch::x86_64::linux::mem::VmRegionSet;
 use crate::memory::{pmm, vmm};
 use crate::task::compat::{self, CompatState};
@@ -536,6 +536,48 @@ fn map_linux_images(data: &[u8], interpreter: Option<&[u8]>) -> Result<LoadedLin
 /// чужое адресное пространство. Чтение ext2 на шаге 2 выполняется *до* заслона,
 /// поэтому может блокироваться на дисковом I/O.
 pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u64, RunError> {
+    run_linux_binary_as(Creds::ROOT, path, argv, envp)
+}
+
+/// [`run_linux_binary`] с явной идентичностью запускаемого процесса.
+///
+/// Используется shell-командой `lxrun`, когда сессия сменилась через `su`:
+/// ребёнок стартует с этими креденшелами (включая дополнительные группы), и все
+/// проверки прав слоя syscall дальше применяются к нему обычным путём.
+///
+/// Для **не-root** сессии образ проверяется на execute+read по тем же битам,
+/// что и `execve` (root-сессия сохраняет историческое поведение лаунчера,
+/// документированное в `SECURITY.md`: kernel-лаунчеры обходят проверку
+/// сисколлов). Проверка промежуточных каталогов путём пока не выполняется —
+/// это ограничение фазы 1, вынесенное в `docs/security/groups.md`.
+pub fn run_linux_binary_as(
+    creds: Creds,
+    path: &str,
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+) -> Result<u64, RunError> {
+    if !creds.is_root() {
+        let resolved = resolve_exec_path(path);
+        let may_search = |node: &Arc<dyn crate::vfs::VfsNode>| {
+            creds.may(node.mode(), node.owner(), Access::Execute)
+        };
+        let node = crate::vfs::lookup_path_walk_checked(&resolved, true, &may_search)
+            .map_err(|_| RunError::AccessDenied)?;
+        if !creds.may(node.mode(), node.owner(), Access::Read)
+            || !creds.may(node.mode(), node.owner(), Access::Execute)
+        {
+            return Err(RunError::AccessDenied);
+        }
+    }
+    run_linux_binary_inner(creds, path, argv, envp)
+}
+
+fn run_linux_binary_inner(
+    creds: Creds,
+    path: &str,
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+) -> Result<u64, RunError> {
     // ── 1. Гейт аргументов (R7.5) ────────────────────────────────────────────
     if !arg_gate(argv) {
         return Err(RunError::ArgsTooLarge);
@@ -598,6 +640,10 @@ pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u6
         );
         // Запомнить путь образа для readlink("/proc/self/exe").
         state.exe_path = path.to_string();
+        // Идентичность запускающего: ROOT для kernel-лаунчеров и обычной
+        // сессии shell, креденшелы `su` для `lxrun` из непривилегированной
+        // сессии. Всё остальное (fork/clone/execve) наследует их.
+        state.creds = creds;
         // Состояние procfs: argv, склеенные NUL для /proc/self/cmdline
         // (начальный стек хранит копию, но она живёт в памяти пользователя),
         // загруженные PT_LOAD сегменты для /proc/self/maps и путь интерпретатора.
