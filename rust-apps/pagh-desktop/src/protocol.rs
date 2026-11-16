@@ -655,9 +655,10 @@ impl Message {
                 reason: d.u32()?,
             },
             TYPE_DAMAGE => {
-                // Две формы: legacy (u16 count; длина 6 mod 12) и ShmSurface
-                // (generation + u32 count; длина кратна 12).
-                let shm_form = payload.len() >= 12 && payload.len() % 12 == 0;
+                // Две формы: legacy (u16 count; payload = 6 + 12*n, т.е.
+                // 6 mod 12) и ShmSurface (generation + u32 count;
+                // payload = 12 + 16*n, т.е. 0/4/8 mod 12). Формы однозначны.
+                let shm_form = payload.len() >= 12 && payload.len() % 12 != 6;
                 let window_id = d.u32()?;
                 if shm_form {
                     let generation = d.u32()?;
@@ -720,7 +721,7 @@ fn decode_rects_u32(
 ) -> Result<Vec<(i32, i32, u32, u32)>, ProtocolError> {
     // Каждый прямоугольник — 12 байт; count ограничен длиной payload, но
     // защищаемся от гигантского Vec::with_capacity.
-    let count = count.min(d.remaining() / 12);
+    let count = count.min(d.remaining() / 16);
     let mut rects = Vec::with_capacity(count);
     for _ in 0..count {
         rects.push((d.i32()?, d.i32()?, d.u32()?, d.u32()?));
@@ -1175,6 +1176,82 @@ mod tests {
         ping_header.push(0xAA);
         let mut decoder = Decoder::new();
         decoder.push(&ping_header).unwrap();
+        assert!(matches!(
+            decoder.next_message(),
+            Err(ProtocolError::BadPayload(_))
+        ));
+    }
+
+    #[test]
+    fn shm_messages_roundtrip_without_pixels() {
+        let messages = [
+            Message::ShmOffer {
+                window_id: 7,
+                width: 640,
+                height: 400,
+                format: 1,
+                stride: 2560,
+                flags: 0,
+            },
+            Message::ShmReady {
+                window_id: 7,
+                generation: 3,
+            },
+            Message::ShmRelease {
+                window_id: 7,
+                generation: 3,
+            },
+            Message::ShmCommit {
+                window_id: 7,
+                generation: 3,
+                rects: vec![(10, 20, 100, 50), (0, 0, 640, 400)],
+            },
+            Message::ShmDamage {
+                window_id: 7,
+                generation: 3,
+                rects: vec![(1, 2, 3, 4)],
+            },
+        ];
+        for message in messages {
+            let encoded = message.encode();
+            if matches!(message, Message::ShmCommit { .. }) {
+                // SHM commit — только метаданные, без пиксельного payload.
+                assert_eq!(
+                    u16::from_le_bytes([encoded[6], encoded[7]]),
+                    HEADER_FLAG_SHM
+                );
+                assert!(encoded.len() < 128, "commit слишком длинный");
+            }
+            let mut decoder = Decoder::new();
+            decoder.push(&encoded).unwrap();
+            assert_eq!(decoder.next_message().unwrap(), Some(message));
+        }
+    }
+
+    #[test]
+    fn shm_damage_and_legacy_damage_are_distinguishable() {
+        let legacy = Message::Damage {
+            window_id: 1,
+            rects: vec![(1, 2, 3, 4)],
+        };
+        let shm = Message::ShmDamage {
+            window_id: 1,
+            generation: 9,
+            rects: vec![(1, 2, 3, 4)],
+        };
+        for message in [legacy, shm] {
+            let mut decoder = Decoder::new();
+            decoder.push(&message.encode()).unwrap();
+            assert_eq!(decoder.next_message().unwrap(), Some(message));
+        }
+    }
+
+    #[test]
+    fn header_flag_is_only_allowed_on_commit() {
+        let mut bytes = Message::Ping { nonce: 1 }.encode();
+        bytes[6] = HEADER_FLAG_SHM as u8;
+        let mut decoder = Decoder::new();
+        decoder.push(&bytes).unwrap();
         assert!(matches!(
             decoder.next_message(),
             Err(ProtocolError::BadPayload(_))

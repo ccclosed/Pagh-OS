@@ -592,9 +592,9 @@ impl Canvas {
                         x += 1;
                     }
                     let d = drow + area.x as usize + start;
-                    target.pixels[d..d + (x - start)]
-                        .copy_from_slice(&layer.pixels[srow + layer_x as usize + start
-                            ..srow + layer_x as usize + x]);
+                    target.pixels[d..d + (x - start)].copy_from_slice(
+                        &layer.pixels[srow + layer_x as usize + start..srow + layer_x as usize + x],
+                    );
                 }
             }
         };
@@ -651,6 +651,43 @@ mod tests {
         assert_eq!(w, 8);
         let lit = c.pixels().iter().filter(|p| **p != 0).count();
         assert!(lit > 5, "буква A должна оставить пиксели, получено {lit}");
+    }
+
+    #[test]
+    fn opaque_blit_matches_per_pixel_blend() {
+        let source = Canvas::new(8, 6, rgb(10, 20, 30));
+        let mut fast = Canvas::new(8, 6, rgb(1, 2, 3));
+        let mut slow = Canvas::new(8, 6, rgb(1, 2, 3));
+        fast.blit_opaque(&source, source.bounds(), Point::new(0, 0));
+        for y in 0..6 {
+            for x in 0..8 {
+                slow.blend(x, y, rgb(10, 20, 30), 255);
+            }
+        }
+        assert_eq!(fast.pixels(), slow.pixels());
+    }
+
+    #[test]
+    fn cached_layer_blit_skips_transparent_pixels() {
+        let mut layer = Canvas::new_transparent(4, 4);
+        layer.put(1, 2, rgb(200, 100, 50));
+        let mut canvas = Canvas::new(4, 4, rgb(1, 2, 3));
+        canvas.blit_layer(&layer, Point::new(0, 0));
+        assert_eq!(canvas.get(1, 2), rgb(200, 100, 50));
+        assert_eq!(canvas.get(0, 0), rgb(1, 2, 3));
+        assert_eq!(canvas.get(2, 2), rgb(1, 2, 3));
+    }
+
+    #[test]
+    fn clipped_blit_only_touches_damage() {
+        let source = Canvas::new(8, 8, rgb(9, 9, 9));
+        let mut canvas = Canvas::new(8, 8, rgb(1, 2, 3));
+        canvas.set_clip(&[Rect::new(2, 2, 2, 2)]);
+        canvas.blit_opaque(&source, source.bounds(), Point::new(0, 0));
+        canvas.clear_clip();
+        assert_eq!(canvas.get(3, 3), rgb(9, 9, 9));
+        assert_eq!(canvas.get(0, 0), rgb(1, 2, 3));
+        assert_eq!(canvas.get(5, 5), rgb(1, 2, 3));
     }
 
     #[test]

@@ -212,7 +212,10 @@ enum Incoming {
         fd: Option<OwnedFd>,
     },
     Disconnected(u64),
-    ProtocolError { conn: u64, detail: String },
+    ProtocolError {
+        conn: u64,
+        detail: String,
+    },
     Command(ServerCommand),
 }
 
@@ -349,6 +352,13 @@ impl ServerControl {
 
     pub fn close_window(&self, window_id: u32) {
         self.send(ServerCommand::CloseWindow { window_id });
+    }
+
+    /// Пиксель текущего back buffer (диагностика/e2e).
+    pub fn sample_pixel(&self, x: i32, y: i32) -> Option<u32> {
+        let (tx, rx) = channel();
+        self.send(ServerCommand::SamplePixel { x, y, tx });
+        rx.recv_timeout(Duration::from_secs(2)).ok().flatten()
     }
 
     pub fn shutdown(&self) {
@@ -971,7 +981,7 @@ impl Server {
                 }
             }
             ServerCommand::SamplePixel { x, y, tx } => {
-                let pixel = self.compositor.frame().get(x, y);
+                let pixel = self.compositor.frame().get(x, y) & 0x00FF_FFFF;
                 let _ = tx.send(Some(pixel));
             }
             ServerCommand::CloseWindow { window_id } => {
@@ -1214,7 +1224,11 @@ impl Server {
             let exists = self.compositor.window(window_id).is_some();
             self.reply_error(
                 conn,
-                if exists { ERR_NOT_OWNER } else { ERR_INVALID_SURFACE },
+                if exists {
+                    ERR_NOT_OWNER
+                } else {
+                    ERR_INVALID_SURFACE
+                },
                 "shm_offer: окно не найдено или чужое",
             );
             return;
@@ -1311,23 +1325,21 @@ impl Server {
             return;
         }
         let Some(view) = binding.view() else {
-            self.reply_error(conn, ERR_INVALID_SURFACE, "shm mapping короче stride*height");
+            self.reply_error(
+                conn,
+                ERR_INVALID_SURFACE,
+                "shm mapping короче stride*height",
+            );
             return;
         };
         let bpp = binding.format.bytes_per_pixel() as u64;
-        let view_rect = crate::geometry::Rect::new(
-            0,
-            0,
-            binding.width as i32,
-            binding.height as i32,
-        );
+        let view_rect =
+            crate::geometry::Rect::new(0, 0, binding.width as i32, binding.height as i32);
         let mut area = 0u64;
         for &(x, y, w, h) in rects {
             let w = w.min(i32::MAX as u32) as i32;
             let h = h.min(i32::MAX as u32) as i32;
-            if let Some(rect) =
-                crate::geometry::Rect::new(x, y, w, h).intersection(view_rect)
-            {
+            if let Some(rect) = crate::geometry::Rect::new(x, y, w, h).intersection(view_rect) {
                 area += (rect.area().max(0)) as u64;
             }
         }
@@ -1612,7 +1624,10 @@ impl Server {
             if self.backend.as_fbdev().is_some() {
                 println!("pagh-desktop: fbdev closed; screen takeover remains armed (ABI one-way)");
             }
-            println!("pagh-desktop: stats {}", self.counters.snapshot().log_line());
+            println!(
+                "pagh-desktop: stats {}",
+                self.counters.snapshot().log_line()
+            );
         }
     }
 

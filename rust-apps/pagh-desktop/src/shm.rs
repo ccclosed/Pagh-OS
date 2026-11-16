@@ -26,7 +26,6 @@ const SOL_SOCKET: c_int = 1;
 const SCM_RIGHTS: c_int = 1;
 const MSG_NOSIGNAL: c_int = 0x4000;
 
-
 #[repr(C)]
 struct IoVec {
     base: *mut c_void,
@@ -279,8 +278,7 @@ pub fn recv_with_fds(stream: &UnixStream, buffer: &mut [u8]) -> io::Result<(usiz
     let mut offset = 0usize;
     while offset + size_of::<CMsgHdr>() <= msg.controllen {
         // SAFETY: заголовок лежит в control-буфере; читаем unaligned.
-        let header =
-            unsafe { ptr::read_unaligned(control.as_ptr().add(offset) as *const CMsgHdr) };
+        let header = unsafe { ptr::read_unaligned(control.as_ptr().add(offset) as *const CMsgHdr) };
         if header.len < size_of::<CMsgHdr>() || offset + header.len > msg.controllen {
             break;
         }
@@ -304,7 +302,8 @@ pub fn recv_with_fds(stream: &UnixStream, buffer: &mut [u8]) -> io::Result<(usiz
                 ptr::read_unaligned(
                     control
                         .as_ptr()
-                        .add(offset + cmsg_align(size_of::<CMsgHdr>())) as *const c_int,
+                        .add(offset + cmsg_align(size_of::<CMsgHdr>()))
+                        as *const c_int,
                 )
             };
             // SAFETY: SCM_RIGHTS передал нам владение новым fd.

@@ -355,12 +355,13 @@ impl Compositor {
     pub fn set_clock(&mut self, time: impl Into<String>, date: impl Into<String>) {
         self.panel.time = time.into();
         self.panel.date = date.into();
-        self.damage.add(panel::panel_rect(self.screen));
+        // Кэш панели пересоберётся, но в кадр попадёт только область часов.
+        self.damage.add(panel::clock_rect(self.screen));
     }
 
     pub fn set_network_online(&mut self, online: bool) {
         self.panel.network_online = online;
-        self.damage.add(panel::panel_rect(self.screen));
+        self.damage.add(panel::network_rect(self.screen));
     }
 
     pub fn set_wallpaper_alt(&mut self, alt: bool) {
@@ -467,6 +468,7 @@ impl Compositor {
             return Vec::new();
         };
         let window = self.windows.remove(index);
+        self.chrome_cache.remove(&window_id);
         self.damage.add(window.frame.inflate(26));
         for other in &self.windows {
             if other.frame.intersects(window.frame) {
@@ -553,8 +555,7 @@ impl Compositor {
         if window.client_id != client_id {
             return Err(WindowError::NotOwner);
         }
-        let surface =
-            Surface::new(width, height, format).map_err(WindowError::InvalidSurface)?;
+        let surface = Surface::new(width, height, format).map_err(WindowError::InvalidSurface)?;
         let content = window.content_rect();
         let window = self.window_mut(window_id).expect("окно проверено");
         window.surface = Some(surface);
@@ -1511,11 +1512,8 @@ impl Compositor {
     /// один раз, затем копируются только повреждённые строки.
     fn paint_wallpaper_cached(&mut self, canvas: &mut Canvas) {
         if self.wallpaper_cache.is_none() {
-            let mut wallpaper = Canvas::new(
-                self.screen.w as u32,
-                self.screen.h as u32,
-                color::BLACK,
-            );
+            let mut wallpaper =
+                Canvas::new(self.screen.w as u32, self.screen.h as u32, color::BLACK);
             self.paint_wallpaper(&mut wallpaper);
             self.cache_stats.wallpaper_builds += 1;
             self.wallpaper_cache = Some(wallpaper);
@@ -1669,12 +1667,7 @@ impl Compositor {
     fn build_chrome(&self, window: &Window, hover: Option<WindowPart>) -> Canvas {
         let frame = Rect::new(0, 0, window.frame.w, window.frame.h);
         let mut layer = Canvas::new_transparent(frame.w as u32, frame.h as u32);
-        layer.fill_rounded_rect(
-            frame,
-            WINDOW_RADIUS,
-            window.border_color(&self.theme),
-            255,
-        );
+        layer.fill_rounded_rect(frame, WINDOW_RADIUS, window.border_color(&self.theme), 255);
         let inner = frame.inset(BORDER);
         layer.fill_rounded_rect(inner, WINDOW_RADIUS - 1, self.theme.window_bg, 255);
         let titlebar = crate::window::titlebar_rect_for(frame);
@@ -2002,8 +1995,7 @@ fn copy_shm_rect(surface: &mut Surface, view: &crate::shm::ShmView<'_>, area: Re
                 let dst_off = (area.y as usize + row) * width + area.x as usize;
                 let dst = &mut surface.pixels_mut()[dst_off..dst_off + area.w as usize];
                 for (dst, chunk) in dst.iter_mut().zip(src.chunks_exact(4)) {
-                    let value =
-                        u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    let value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                     *dst = (value & 0x00FF_FFFF) | 0xFF00_0000;
                 }
             }
@@ -2455,6 +2447,73 @@ mod tests {
             CONFIGURE_MAXIMIZED
         );
         assert_ne!(configure_flags(window) & CONFIGURE_RESIZABLE, 0);
+    }
+
+    #[test]
+    fn cached_layers_are_built_once_per_frame_state() {
+        let mut compositor = compositor();
+        compositor.render_full();
+        let first = compositor.cache_stats();
+        assert_eq!(first.wallpaper_builds, 1);
+        assert_eq!(first.panel_builds, 1);
+        assert_eq!(first.chrome_builds, 2);
+        assert_eq!(first.shadow_builds, 2);
+        compositor.render_full();
+        assert_eq!(
+            compositor.cache_stats(),
+            first,
+            "повторный кадр не должен перестраивать кэши"
+        );
+    }
+
+    #[test]
+    fn wallpaper_change_invalidates_wallpaper_cache() {
+        let mut compositor = compositor();
+        compositor.render_full();
+        assert_eq!(compositor.cache_stats().wallpaper_builds, 1);
+        compositor.set_wallpaper_alt(true);
+        compositor.render_full();
+        assert_eq!(compositor.cache_stats().wallpaper_builds, 2);
+    }
+
+    #[test]
+    fn clock_change_damages_only_the_clock() {
+        let mut compositor = compositor();
+        compositor.render_full();
+        compositor.set_clock("23:39", "15.11.2026");
+        let damage = compositor.damage.take();
+        assert!(!damage.whole);
+        assert_eq!(damage.rects, vec![panel::clock_rect(compositor.screen())]);
+        // Возвращаем damage в трекер: проверяем, что render его действительно
+        // перерисует и перестроит кэш панели.
+        for rect in damage.rects {
+            compositor.damage.add(rect);
+        }
+        compositor.render();
+        assert_eq!(compositor.cache_stats().panel_builds, 2);
+    }
+
+    #[test]
+    fn moving_window_does_not_rebuild_chrome() {
+        let mut compositor = compositor();
+        compositor.render_full();
+        let builds = compositor.cache_stats().chrome_builds;
+        let frame = compositor.window(2).unwrap().frame;
+        compositor.move_window(2, Point::new(frame.x + 10, frame.y + 5));
+        compositor.render();
+        assert_eq!(compositor.cache_stats().chrome_builds, builds);
+        // Фокус/заголовок — реальное изменение оформления.
+        compositor.set_focus(Some(2));
+        compositor.render();
+        let _ = compositor.cache_stats().chrome_builds;
+    }
+
+    #[test]
+    fn removing_window_evicts_chrome_cache() {
+        let mut compositor = compositor();
+        compositor.render_full();
+        compositor.remove_window(2, false);
+        assert!(!compositor.chrome_cache.contains_key(&2));
     }
 
     #[test]

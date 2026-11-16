@@ -123,8 +123,18 @@ mod tests {
         assert_eq!(small.height, 16);
         assert_eq!(large.width, 16);
         assert_eq!(large.height, 32);
-        let runs: i32 = large.rows().iter().flat_map(|row| row.iter()).map(|(_, w)| w).sum();
-        let small_runs: i32 = small.rows().iter().flat_map(|row| row.iter()).map(|(_, w)| w).sum();
+        let runs: i32 = large
+            .rows()
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|(_, w)| w)
+            .sum();
+        let small_runs: i32 = small
+            .rows()
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|(_, w)| w)
+            .sum();
         assert_eq!(runs, small_runs * 4);
     }
 }
