@@ -2710,9 +2710,11 @@ fn check_out_writable() {
         fail(name, "scratch map failed");
         return;
     }
-    // Write the input mask while the page is still writable (the kernel stores
-    // through the same PTE, so this must happen before the RO switch).
+    // Write the input mask and a guest path while the page is still writable
+    // (the kernel stores through the same PTE, so this must happen before the
+    // RO switch).
     scratch_write_at(0, &(1u64 << (10 - 1)).to_le_bytes());
+    scratch_write_at(64, b"/mnt\0");
     // Drop WRITABLE but keep the page present and USER_ACCESSIBLE.
     let ro = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE;
     if vmm::set_user_leaf_flags(SCRATCH_VA, ro).is_err() {
@@ -2734,6 +2736,12 @@ fn check_out_writable() {
             match misc::sys_uname(SCRATCH_VA) {
                 Err(Errno::EFAULT) => {}
                 _ => return Err("uname(RO buffer) did not return EFAULT"),
+            }
+            // `stat` (4) copies a 144-byte record out; the writability-aware
+            // choke point must reject the RO page, not fault in ring 0.
+            match io_sys::sys_stat(SCRATCH_VA + 64, SCRATCH_VA) {
+                Err(Errno::EFAULT) => {}
+                _ => return Err("stat(RO statbuf) did not return EFAULT"),
             }
             // A readable RO page is still a valid INPUT: SIG_BLOCK with one bit
             // set (SIGUSR1 = bit 10) must succeed and actually update the mask.
@@ -4500,6 +4508,60 @@ fn check_links() {
                 if u64_at(STAT_OFF + 16) != 2 {
                     return Err("a hard-linked file must report st_nlink 2");
                 }
+            }
+
+            // ── stat(2) nr 4: the old number musl std still calls ───────
+            // Runtime `Command::spawn` and `Path::exists()` in static musl
+            // binaries reach this handler, not `newfstatat`; pin file/dir/
+            // symlink-follow semantics and the error set here.
+            scratch_write_at(PATH_OFF, b"/mnt/lx_target\0");
+            io_sys::sys_stat(SCRATCH_VA + PATH_OFF as u64, SCRATCH_VA + STAT_OFF as u64)
+                .map_err(|_| "stat(file) failed")?;
+            if u32_at(STAT_OFF + 24) & S_IFMT != S_IFREG {
+                return Err("stat(file) must report S_IFREG");
+            }
+            if u64_at(STAT_OFF + 48) as usize != target_payload.len() {
+                return Err("stat(file).st_size must be the file size");
+            }
+            if u64_at(STAT_OFF + 8) != target_ino {
+                return Err("stat(file) must report the target inode");
+            }
+            scratch_write_at(PATH_OFF, b"/mnt\0");
+            io_sys::sys_stat(SCRATCH_VA + PATH_OFF as u64, SCRATCH_VA + STAT_OFF as u64)
+                .map_err(|_| "stat(dir) failed")?;
+            if u32_at(STAT_OFF + 24) & S_IFMT != S_IFDIR {
+                return Err("stat(dir) must report S_IFDIR");
+            }
+            // `stat` (unlike `lstat`/`newfstatat(NOFOLLOW)`) follows the link.
+            scratch_write_at(PATH_OFF, b"/mnt/lx_abs\0");
+            io_sys::sys_stat(SCRATCH_VA + PATH_OFF as u64, SCRATCH_VA + STAT_OFF as u64)
+                .map_err(|_| "stat(symlink) failed")?;
+            if u32_at(STAT_OFF + 24) & S_IFMT != S_IFREG {
+                return Err("stat(symlink) must follow to S_IFREG");
+            }
+            if u64_at(STAT_OFF + 48) as usize != target_payload.len() {
+                return Err("stat(symlink).st_size must be the target size");
+            }
+            // Absent path, non-directory component and both pointer forms are
+            // rejected before any VFS lookup / store.
+            scratch_write_at(PATH_OFF, b"/mnt/lx_absent\0");
+            if io_sys::sys_stat(SCRATCH_VA + PATH_OFF as u64, SCRATCH_VA + STAT_OFF as u64)
+                != Err(Errno::ENOENT)
+            {
+                return Err("stat(absent) must be ENOENT");
+            }
+            scratch_write_at(PATH_OFF, b"/mnt/lx_target/child\0");
+            if io_sys::sys_stat(SCRATCH_VA + PATH_OFF as u64, SCRATCH_VA + STAT_OFF as u64)
+                != Err(Errno::ENOTDIR)
+            {
+                return Err("stat(file/child) must be ENOTDIR");
+            }
+            scratch_write_at(PATH_OFF, b"/mnt/lx_target\0");
+            if io_sys::sys_stat(SCRATCH_VA + PATH_OFF as u64, 0) != Err(Errno::EFAULT) {
+                return Err("stat(NULL statbuf) must be EFAULT");
+            }
+            if io_sys::sys_stat(0, SCRATCH_VA + STAT_OFF as u64) != Err(Errno::EFAULT) {
+                return Err("stat(NULL path) must be EFAULT");
             }
 
             // ── dangling link ────────────────────────────────────────────

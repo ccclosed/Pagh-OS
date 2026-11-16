@@ -39,7 +39,7 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 | `mem.rs` | Чистое планирование `brk`/`mmap`/`munmap`, `prot_to_flags` |
 | `mem_sys.rs` | Эффектные memory-syscall'ы: `handle_user_page_fault` (demand paging для anon mmap/brk), VmRegionSet + VMM/PMM |
 | `misc.rs` | `getpid`/`uname`/`arch_prctl`/`set_tid_address`/`clock_gettime`/`getrandom`/`exit`/`exit_group`, а также `get[res]{u,g}id`/`set[res]{u,g}id` (читают и меняют `CompatState::creds`) |
-| `stat.rs` | Кодирование `struct stat` (`LinuxStat`) для `fstat`/`newfstatat` |
+| `stat.rs` | Кодирование `struct stat` (`LinuxStat`) для `stat`/`fstat`/`newfstatat` |
 | `dirent.rs` | Чистая упаковка `linux_dirent64` для `getdents64` |
 | `epoll_sys.rs` | `clock_getres`, `eventfd2`, `epoll_create1/ctl/wait` |
 | `process_sys.rs` | Процессные syscall'ы: `execve`, `clone`, семейство futex |

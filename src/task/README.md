@@ -113,7 +113,7 @@
 ## Реализованные Linux syscall'ы (кратко)
 
 Полный список — в `dispatch_supported` (`arch/x86_64/linux/mod.rs`):
-I/O (read/write/writev, open/openat, lseek, rename, fstat/statx, ioctl, poll/select, pipe,
+I/O (read/write/writev, open/openat, lseek, rename, stat/fstat/newfstatat/statx, ioctl, poll/select, pipe,
 getdents64, getcwd/chdir, dup/fcntl, socketpair), память (brk, mmap, munmap, mremap, mprotect),
 сокеты AF_UNIX и AF_INET/6 (TCP/UDP), epoll/eventfd, время (clock_gettime, nanosleep,
 gettimeofday), процессы (getpid/getppid/gettid, wait4, clone, execve, exit/exit_group,
