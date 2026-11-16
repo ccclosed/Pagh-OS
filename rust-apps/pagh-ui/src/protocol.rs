@@ -25,6 +25,8 @@ pub const MAX_PAYLOAD: usize = 4096 * 4096 * 4 + 4096;
 pub const MAX_SURFACE_DIM: u32 = 4096;
 /// Maximum extra stride padding accepted by the compositor.
 pub const MAX_STRIDE_PADDING: u32 = 4096;
+/// Максимум damage-прямоугольников в одном shm `COMMIT`/`DAMAGE`.
+pub const MAX_DAMAGE_RECTS: usize = 1024;
 
 pub mod types {
     pub const HELLO: u16 = 1;
@@ -41,6 +43,19 @@ pub mod types {
     pub const PONG: u16 = 12;
     /// Расширение PDP/1: просьба клиента запустить приложение (LAUNCH).
     pub const LAUNCH: u16 = 13;
+    /// c→s: предложение разделяемой поверхности (memfd + `SCM_RIGHTS`).
+    pub const SHM_OFFER: u16 = 14;
+    /// s→c: сервер принял поверхность; назначил поколение для коммитов.
+    pub const SHM_READY: u16 = 15;
+    /// обе стороны: поколение поверхности освобождено.
+    pub const SHM_RELEASE: u16 = 16;
+}
+
+/// Флаги 16-битного заголовка PDP/1.
+pub mod header_flags {
+    /// Бит 0: сообщение относится к `ShmSurface` (type 5/9 в shm-форме).
+    /// Для остальных типов флаги обязаны быть нулевыми.
+    pub const SHM: u16 = 1 << 0;
 }
 
 pub mod welcome_flags {
@@ -74,6 +89,8 @@ pub mod error_codes {
     pub const LIMIT: u32 = 7;
     pub const UNSUPPORTED: u32 = 8;
     pub const INTERNAL: u32 = 9;
+    /// shm-коммит с поколением, которое сервер уже вытеснил.
+    pub const STALE_GENERATION: u32 = 10;
 }
 
 pub mod buttons {
@@ -322,7 +339,10 @@ impl Header {
         }
         let kind = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
         let flags = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
-        if flags != 0 {
+        if flags & !header_flags::SHM != 0 {
+            return Err(ProtocolError::ReservedFlags(flags));
+        }
+        if flags != 0 && kind != self::types::COMMIT && kind != self::types::DAMAGE {
             return Err(ProtocolError::ReservedFlags(flags));
         }
         let length = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
@@ -420,6 +440,41 @@ pub enum Message {
         app: String,
         cwd: String,
     },
+    /// c→s: предложение разделяемой поверхности. Сам memfd едет отдельным
+    /// `sendmsg` с `SCM_RIGHTS`; в payload — только геометрия/формат.
+    ShmOffer {
+        window_id: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+        stride: u32,
+        flags: u32,
+    },
+    /// s→c: сервер назначил поколение поверхности (`generation`).
+    ShmReady {
+        window_id: u32,
+        generation: u32,
+    },
+    /// обе стороны: поколение поверхности можно освободить.
+    ShmRelease {
+        window_id: u32,
+        generation: u32,
+    },
+    /// c→s: коммит разделяемой поверхности: только метаданные и damage,
+    /// без пикселей (header flags bit 0 = SHM).
+    CommitShm {
+        window_id: u32,
+        generation: u32,
+        rects: Vec<(i32, i32, u16, u16)>,
+    },
+    /// Устаревшая shm-подсказка damage с поколением (header flags bit 0 = SHM).
+    /// Клиент этой волны шлёт damage внутри [`Message::CommitShm`], но тип
+    /// поддержан для совместимости со спекой §3 B5.
+    DamageShm {
+        window_id: u32,
+        generation: u32,
+        rects: Vec<(i32, i32, u16, u16)>,
+    },
 }
 
 impl Message {
@@ -438,6 +493,19 @@ impl Message {
             Message::Ping { .. } => types::PING,
             Message::Pong { .. } => types::PONG,
             Message::Launch { .. } => types::LAUNCH,
+            Message::ShmOffer { .. } => types::SHM_OFFER,
+            Message::ShmReady { .. } => types::SHM_READY,
+            Message::ShmRelease { .. } => types::SHM_RELEASE,
+            Message::CommitShm { .. } => types::COMMIT,
+            Message::DamageShm { .. } => types::DAMAGE,
+        }
+    }
+
+    /// Флаги заголовка, которые требует этот вариант сообщения.
+    pub fn header_flags(&self) -> u16 {
+        match self {
+            Message::CommitShm { .. } | Message::DamageShm { .. } => header_flags::SHM,
+            _ => 0,
         }
     }
 
@@ -456,6 +524,11 @@ impl Message {
             Message::Ping { .. } => "ping",
             Message::Pong { .. } => "pong",
             Message::Launch { .. } => "launch",
+            Message::ShmOffer { .. } => "shm_offer",
+            Message::ShmReady { .. } => "shm_ready",
+            Message::ShmRelease { .. } => "shm_release",
+            Message::CommitShm { .. } => "commit_shm",
+            Message::DamageShm { .. } => "damage_shm",
         }
     }
 
@@ -464,7 +537,7 @@ impl Message {
         let payload = self.encode_payload();
         let header = Header {
             kind: self.kind(),
-            flags: 0,
+            flags: self.header_flags(),
             length: payload.len(),
         };
         let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
@@ -634,12 +707,77 @@ impl Message {
                 w.string(app);
                 w.string(cwd);
             }
+            Message::ShmOffer {
+                window_id,
+                width,
+                height,
+                format,
+                stride,
+                flags,
+            } => {
+                w.u32(*window_id);
+                w.u32(*width);
+                w.u32(*height);
+                w.u32(*format);
+                w.u32(*stride);
+                w.u32(*flags);
+            }
+            Message::ShmReady {
+                window_id,
+                generation,
+            }
+            | Message::ShmRelease {
+                window_id,
+                generation,
+            } => {
+                w.u32(*window_id);
+                w.u32(*generation);
+            }
+            Message::CommitShm {
+                window_id,
+                generation,
+                rects,
+            }
+            | Message::DamageShm {
+                window_id,
+                generation,
+                rects,
+            } => {
+                w.u32(*window_id);
+                w.u32(*generation);
+                w.u32(rects.len().min(MAX_DAMAGE_RECTS) as u32);
+                for (x, y, width, height) in rects.iter().take(MAX_DAMAGE_RECTS) {
+                    w.i32(*x);
+                    w.i32(*y);
+                    w.u16(*width);
+                    w.u16(*height);
+                }
+            }
         }
         w.buf
     }
 
     /// Decode a payload for `kind`; the payload must be consumed exactly.
+    ///
+    /// Заголовок считается без флагов (совместимость с v1); shm-формы требуют
+    /// [`Message::decode_with_flags`].
     pub fn decode(kind: u16, payload: &[u8]) -> Result<Message, ProtocolError> {
+        Message::decode_with_flags(kind, 0, payload)
+    }
+
+    /// Decode a payload, учитывая флаги заголовка (`header_flags::SHM`).
+    pub fn decode_with_flags(
+        kind: u16,
+        flags: u16,
+        payload: &[u8],
+    ) -> Result<Message, ProtocolError> {
+        if flags & !header_flags::SHM != 0 {
+            return Err(ProtocolError::ReservedFlags(flags));
+        }
+        let shm = flags & header_flags::SHM != 0;
+        if shm && kind != types::COMMIT && kind != types::DAMAGE {
+            return Err(ProtocolError::ReservedFlags(flags));
+        }
         let mut r = Reader::new(payload);
         let message = match kind {
             types::HELLO => Message::Hello {
@@ -669,6 +807,25 @@ impl Message {
                 height: r.u32()?,
                 flags: r.u32()?,
             },
+            types::COMMIT if shm => {
+                let window_id = r.u32()?;
+                let generation = r.u32()?;
+                let count = r.u32()? as usize;
+                if count > MAX_DAMAGE_RECTS {
+                    return Err(ProtocolError::BadPayload(format!(
+                        "too many shm damage rects: {count}"
+                    )));
+                }
+                let mut rects = Vec::with_capacity(count);
+                for _ in 0..count {
+                    rects.push((r.i32()?, r.i32()?, r.u16()?, r.u16()?));
+                }
+                Message::CommitShm {
+                    window_id,
+                    generation,
+                    rects,
+                }
+            }
             types::COMMIT => {
                 let window_id = r.u32()?;
                 let width = r.u32()?;
@@ -743,6 +900,25 @@ impl Message {
                 window_id: r.u32()?,
                 reason: r.u32()?,
             },
+            types::DAMAGE if shm => {
+                let window_id = r.u32()?;
+                let generation = r.u32()?;
+                let count = r.u32()? as usize;
+                if count > MAX_DAMAGE_RECTS {
+                    return Err(ProtocolError::BadPayload(format!(
+                        "too many shm damage rects: {count}"
+                    )));
+                }
+                let mut rects = Vec::with_capacity(count);
+                for _ in 0..count {
+                    rects.push((r.i32()?, r.i32()?, r.u16()?, r.u16()?));
+                }
+                Message::DamageShm {
+                    window_id,
+                    generation,
+                    rects,
+                }
+            }
             types::DAMAGE => {
                 let window_id = r.u32()?;
                 let count = r.u16()? as usize;
@@ -761,6 +937,22 @@ impl Message {
             types::LAUNCH => Message::Launch {
                 app: r.string()?,
                 cwd: r.string()?,
+            },
+            types::SHM_OFFER => Message::ShmOffer {
+                window_id: r.u32()?,
+                width: r.u32()?,
+                height: r.u32()?,
+                format: r.u32()?,
+                stride: r.u32()?,
+                flags: r.u32()?,
+            },
+            types::SHM_READY => Message::ShmReady {
+                window_id: r.u32()?,
+                generation: r.u32()?,
+            },
+            types::SHM_RELEASE => Message::ShmRelease {
+                window_id: r.u32()?,
+                generation: r.u32()?,
             },
             other => return Err(ProtocolError::UnknownType(other)),
         };
@@ -867,8 +1059,10 @@ impl MessageReader {
             return Ok(None);
         }
         let payload = self.buffer[HEADER_LEN..total].to_vec();
+        let kind = header.kind;
+        let flags = header.flags;
         self.buffer.drain(..total);
-        Message::decode(header.kind, &payload).map(Some)
+        Message::decode_with_flags(kind, flags, &payload).map(Some)
     }
 }
 
@@ -1241,5 +1435,107 @@ mod tests {
             FrameFormat::Xrgb8888
         );
         assert_eq!(FrameFormat::from_welcome_flags(0), FrameFormat::Xrgb8888);
+    }
+
+    #[test]
+    fn shm_messages_roundtrip_with_header_flags() {
+        let offer = Message::ShmOffer {
+            window_id: 7,
+            width: 320,
+            height: 200,
+            format: FrameFormat::Xrgb8888.to_wire(),
+            stride: 1280,
+            flags: 0,
+        };
+        let encoded = offer.encode();
+        assert_eq!(u16::from_le_bytes(encoded[6..8].try_into().unwrap()), 0);
+        let mut reader = MessageReader::new();
+        reader.push(&encoded);
+        assert_eq!(reader.next().unwrap(), Some(offer));
+
+        let ready = Message::ShmReady {
+            window_id: 7,
+            generation: 3,
+        };
+        let mut reader = MessageReader::new();
+        reader.push(&ready.encode());
+        assert_eq!(reader.next().unwrap(), Some(ready));
+
+        let release = Message::ShmRelease {
+            window_id: 7,
+            generation: 2,
+        };
+        let mut reader = MessageReader::new();
+        reader.push(&release.encode());
+        assert_eq!(reader.next().unwrap(), Some(release));
+
+        let commit = Message::CommitShm {
+            window_id: 7,
+            generation: 3,
+            rects: vec![(1, 2, 3, 4), (10, 20, 30, 40)],
+        };
+        let encoded = commit.encode();
+        assert_eq!(
+            u16::from_le_bytes(encoded[6..8].try_into().unwrap()),
+            header_flags::SHM
+        );
+        let mut reader = MessageReader::new();
+        reader.push(&encoded);
+        assert_eq!(reader.next().unwrap(), Some(commit));
+
+        let damage = Message::DamageShm {
+            window_id: 7,
+            generation: 3,
+            rects: vec![(0, 0, 5, 6)],
+        };
+        let mut reader = MessageReader::new();
+        reader.push(&damage.encode());
+        assert_eq!(reader.next().unwrap(), Some(damage));
+    }
+
+    #[test]
+    fn shm_header_flag_is_only_valid_for_commit_and_damage() {
+        for kind in [
+            types::HELLO,
+            types::SHM_OFFER,
+            types::SHM_READY,
+            types::SHM_RELEASE,
+        ] {
+            let mut header = [0u8; HEADER_LEN];
+            header[..4].copy_from_slice(&MAGIC);
+            header[4..6].copy_from_slice(&kind.to_le_bytes());
+            header[6..8].copy_from_slice(&header_flags::SHM.to_le_bytes());
+            header[8..12].copy_from_slice(&0u32.to_le_bytes());
+            assert!(
+                matches!(Header::parse(&header), Err(ProtocolError::ReservedFlags(_))),
+                "kind {kind} must reject the SHM header flag"
+            );
+        }
+        let unknown = header_flags::SHM | (1 << 1);
+        let mut header = [0u8; HEADER_LEN];
+        header[..4].copy_from_slice(&MAGIC);
+        header[4..6].copy_from_slice(&types::COMMIT.to_le_bytes());
+        header[6..8].copy_from_slice(&unknown.to_le_bytes());
+        header[8..12].copy_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            Header::parse(&header),
+            Err(ProtocolError::ReservedFlags(flags)) if flags == unknown
+        ));
+    }
+
+    #[test]
+    fn shm_commit_rejects_too_many_rects() {
+        let payload_len = 12 + (MAX_DAMAGE_RECTS + 1) * 12;
+        let mut payload = Vec::with_capacity(payload_len);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&((MAX_DAMAGE_RECTS + 1) as u32).to_le_bytes());
+        for _ in 0..=MAX_DAMAGE_RECTS {
+            payload.extend_from_slice(&[0u8; 12]);
+        }
+        assert!(matches!(
+            Message::decode_with_flags(types::COMMIT, header_flags::SHM, &payload),
+            Err(ProtocolError::BadPayload(_))
+        ));
     }
 }

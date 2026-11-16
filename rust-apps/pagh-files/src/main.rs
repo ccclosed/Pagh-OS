@@ -13,9 +13,11 @@ use std::time::Duration;
 use pagh_files::screenshots;
 use pagh_files::{Command, FilesApp, HostVfs, APP_NAME};
 use pagh_ui::canvas::Canvas;
-use pagh_ui::client::{close_name, error_name, DesktopClient, Incoming};
-use pagh_ui::geom::Size;
+use pagh_ui::client::{close_name, error_name, DesktopClient, Incoming, ShmFrame};
+use pagh_ui::damage::{DamageTracker, DEFAULT_TILE};
+use pagh_ui::geom::{Rect, Size};
 use pagh_ui::protocol::close_reason;
+use pagh_ui::Color;
 
 fn main() -> ExitCode {
     match run() {
@@ -118,8 +120,41 @@ fn run_compositor(
     );
     let _ = std::io::stdout().flush();
 
-    let mut canvas = Canvas::filled(app.size().w, app.size().h, app.theme.palette.window);
+    let mut window_size = app.size();
+    // ShmSurface — приоритетный путь: рендер прямо в mmap memfd, по сокету
+    // едут только damage-прямоугольники. На legacy-сервере (нет welcome bit 2)
+    // `enable_shm` сразу возвращает `None`, и работает полный кадр v1.
+    let mut shm = client.enable_shm(window, window_size)?;
+    let mut fallback: Option<Canvas> = if shm.is_none() {
+        Some(Canvas::filled(
+            window_size.w,
+            window_size.h,
+            app.theme.palette.window,
+        ))
+    } else {
+        None
+    };
+    let mut tracker =
+        DamageTracker::new(Rect::new(0, 0, window_size.w, window_size.h), DEFAULT_TILE);
     let mut dirty = true;
+
+    // Переключиться на полный кадр: отпустить shm-поколение (если было) и
+    // выделить обычный RGBA-холст.
+    fn use_fallback(
+        client: &mut DesktopClient,
+        shm: &mut Option<ShmFrame>,
+        fallback: &mut Option<Canvas>,
+        tracker: &mut DamageTracker,
+        size: Size,
+        background: Color,
+    ) {
+        if let Some(frame) = shm.take() {
+            let _ = client.release_shm(&frame);
+        }
+        *fallback = Some(Canvas::filled(size.w, size.h, background));
+        tracker.resize(Rect::new(0, 0, size.w, size.h));
+    }
+
     loop {
         for incoming in client.poll(Duration::from_millis(16))? {
             match incoming {
@@ -130,6 +165,9 @@ fn run_compositor(
                         match command {
                             Command::Quit => {
                                 let _ = client.close_window(window);
+                                if let Some(frame) = shm.take() {
+                                    let _ = client.release_shm(&frame);
+                                }
                                 return Ok(());
                             }
                             Command::LaunchTerminal { path } => {
@@ -150,9 +188,48 @@ fn run_compositor(
                     window_id, size, ..
                 } if window_id == window => {
                     app.resize(size);
-                    canvas = Canvas::filled(size.w, size.h, app.theme.palette.window);
+                    window_size = size;
+                    let resized = match shm.as_mut() {
+                        Some(frame) => client.resize_shm(frame, size).unwrap_or(false),
+                        None => false,
+                    };
+                    if resized {
+                        tracker.resize(Rect::new(0, 0, size.w, size.h));
+                    } else {
+                        use_fallback(
+                            &mut client,
+                            &mut shm,
+                            &mut fallback,
+                            &mut tracker,
+                            size,
+                            app.theme.palette.window,
+                        );
+                    }
                     dirty = true;
                 }
+                Incoming::ShmRelease {
+                    window_id,
+                    generation,
+                } => {
+                    // Сервер вытеснил поверхность: до нового offer рисуем и
+                    // шлём полный кадр. Новый offer сделает configure.
+                    if window_id == window
+                        && shm
+                            .as_ref()
+                            .is_some_and(|frame| frame.generation == generation)
+                    {
+                        use_fallback(
+                            &mut client,
+                            &mut shm,
+                            &mut fallback,
+                            &mut tracker,
+                            window_size,
+                            app.theme.palette.window,
+                        );
+                        dirty = true;
+                    }
+                }
+                Incoming::ShmReady { .. } => {}
                 Incoming::Close { reason, .. } => {
                     let _ = client.close_window(window);
                     if reason != close_reason::CLIENT {
@@ -174,10 +251,40 @@ fn run_compositor(
                 Incoming::Configure { .. } | Incoming::Event { .. } => {}
             }
         }
-        if dirty {
-            app.draw(&mut canvas);
-            client.commit(window, &canvas)?;
-            dirty = false;
+        if !dirty {
+            continue;
+        }
+        dirty = false;
+        let needs_full_frame;
+        if let Some(frame) = shm.as_mut() {
+            app.draw(&mut frame.canvas);
+            let damage = tracker.update(&frame.canvas);
+            match client.commit_shm(frame, damage) {
+                Ok(()) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    // Поколение устарело (сервер прислал release, но мы его
+                    // ещё не прочитали): переходим на полный кадр.
+                    use_fallback(
+                        &mut client,
+                        &mut shm,
+                        &mut fallback,
+                        &mut tracker,
+                        window_size,
+                        app.theme.palette.window,
+                    );
+                    needs_full_frame = true;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            needs_full_frame = true;
+        }
+        if needs_full_frame {
+            let canvas = fallback.get_or_insert_with(|| {
+                Canvas::filled(window_size.w, window_size.h, app.theme.palette.window)
+            });
+            app.draw(canvas);
+            client.commit(window, canvas)?;
         }
     }
 }

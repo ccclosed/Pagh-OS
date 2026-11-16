@@ -18,14 +18,74 @@ pub const STATUS_H: usize = 22;
 /// Window border thickness.
 pub const BORDER: usize = 1;
 
-/// A straight-alpha RGBA image.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A straight-alpha RGBA image or a client `ShmSurface` mapping.
+///
+/// By default pixels live in [`Canvas::pixels`] as RGBA (screenshots, PNG,
+/// headless).  [`Canvas::from_mapped`] instead renders directly into the memfd
+/// mapping in PDP/1 wire order (XRGB8888 little-endian `B,G,R,0`), so terminal
+/// frames reach the compositor without a socket upload.
 pub struct Canvas {
     pub width: usize,
     pub height: usize,
-    /// RGBA, 4 bytes per pixel, row-major, alpha is 255 everywhere this crate
-    /// draws (the protocol commits opaque XRGB frames).
+    /// RGBA, 4 bytes per pixel, row-major.  Empty for a mapped surface.
     pub pixels: Vec<u8>,
+    mapping: Option<pagh_ui::shm::MappedBuffer>,
+    /// Bytes per row (`width * 4` for both RGBA and XRGB8888).
+    stride: usize,
+}
+
+impl PartialEq for Canvas {
+    fn eq(&self, other: &Canvas) -> bool {
+        self.width == other.width
+            && self.height == other.height
+            && self.pixels == other.pixels
+            && self.surface_bytes() == other.surface_bytes()
+    }
+}
+
+impl Eq for Canvas {}
+
+impl std::fmt::Debug for Canvas {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Canvas")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("mapped", &self.mapping.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for Canvas {
+    fn clone(&self) -> Canvas {
+        if let Some(mapping) = &self.mapping {
+            let mut pixels = Vec::with_capacity(self.width * self.height * 4);
+            for y in 0..self.height {
+                for x in 0..self.width {
+                    pixels.extend_from_slice(&mapped_rgba(mapping.as_slice(), self.stride, x, y));
+                }
+            }
+            return Canvas {
+                width: self.width,
+                height: self.height,
+                pixels,
+                mapping: None,
+                stride: self.width * 4,
+            };
+        }
+        Canvas {
+            width: self.width,
+            height: self.height,
+            pixels: self.pixels.clone(),
+            mapping: None,
+            stride: self.stride,
+        }
+    }
+}
+
+#[inline]
+fn mapped_rgba(bytes: &[u8], stride: usize, x: usize, y: usize) -> [u8; 4] {
+    let offset = y * stride + x * 4;
+    [bytes[offset + 2], bytes[offset + 1], bytes[offset], 255]
 }
 
 impl Canvas {
@@ -38,6 +98,8 @@ impl Canvas {
             width,
             height,
             pixels,
+            mapping: None,
+            stride: width * 4,
         }
     }
 
@@ -49,18 +111,75 @@ impl Canvas {
             width,
             height,
             pixels,
+            mapping: None,
+            stride: width * 4,
         })
     }
 
+    /// Поверхность, пишущая прямо в `mmap` клиентской `ShmSurface` (XRGB8888).
+    ///
+    /// `buffer` должен покрывать `stride * height`; `pixels` остаётся пустым.
+    pub fn from_mapped(
+        buffer: pagh_ui::shm::MappedBuffer,
+        width: usize,
+        height: usize,
+        stride: usize,
+    ) -> Option<Canvas> {
+        if stride < width.checked_mul(4)? || buffer.len() < stride.checked_mul(height)? {
+            return None;
+        }
+        Some(Canvas {
+            width,
+            height,
+            pixels: Vec::new(),
+            mapping: Some(buffer),
+            stride,
+        })
+    }
+
+    pub fn is_mapped(&self) -> bool {
+        self.mapping.is_some()
+    }
+
+    /// Байты видимой поверхности (RGBA или сырой XRGB mapping).
+    pub fn surface_bytes(&self) -> &[u8] {
+        match &self.mapping {
+            Some(mapping) => mapping.as_slice(),
+            None => &self.pixels,
+        }
+    }
+
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
     pub fn fill(&mut self, bg: Rgb) {
-        for chunk in self.pixels.chunks_exact_mut(4) {
-            chunk.copy_from_slice(&[bg.0, bg.1, bg.2, 255]);
+        if let Some(mapping) = &mut self.mapping {
+            let bytes = mapping.as_mut_slice();
+            for y in 0..self.height {
+                let row = &mut bytes[y * self.stride..y * self.stride + self.width * 4];
+                for px in row.as_chunks_mut::<4>().0 {
+                    *px = [bg.2, bg.1, bg.0, 0];
+                }
+            }
+            return;
+        }
+        for chunk in self.pixels.as_chunks_mut::<4>().0 {
+            *chunk = [bg.0, bg.1, bg.2, 255];
         }
     }
 
     #[inline]
     fn put(&mut self, x: usize, y: usize, color: Rgb) {
         if x >= self.width || y >= self.height {
+            return;
+        }
+        if let Some(mapping) = &mut self.mapping {
+            let i = y * self.stride + x * 4;
+            mapping.as_mut_slice()[i] = color.2;
+            mapping.as_mut_slice()[i + 1] = color.1;
+            mapping.as_mut_slice()[i + 2] = color.0;
+            mapping.as_mut_slice()[i + 3] = 0;
             return;
         }
         let i = (y * self.width + x) * 4;
@@ -79,16 +198,21 @@ impl Canvas {
             self.put(x, y, color);
             return;
         }
-        let i = (y * self.width + x) * 4;
+        let dst = self.pixel(x, y);
         let a = u32::from(alpha);
         let inv = 255 - a;
-        for (dst, src) in self.pixels[i..i + 3]
-            .iter_mut()
-            .zip([color.0, color.1, color.2])
-        {
-            *dst = ((u32::from(*dst) * inv + u32::from(src) * a + 127) / 255) as u8;
-        }
-        self.pixels[i + 3] = 255;
+        let blend = |dst: u8, src: u8| -> u8 {
+            ((u32::from(dst) * inv + u32::from(src) * a + 127) / 255) as u8
+        };
+        self.put(
+            x,
+            y,
+            Rgb(
+                blend(dst[0], color.0),
+                blend(dst[1], color.1),
+                blend(dst[2], color.2),
+            ),
+        );
     }
 
     pub fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: Rgb) {
@@ -132,19 +256,28 @@ impl Canvas {
     pub fn blit(&mut self, src: &Canvas, x: usize, y: usize) {
         for sy in 0..src.height {
             for sx in 0..src.width {
-                let si = (sy * src.width + sx) * 4;
                 let sx_dst = x + sx;
                 let sy_dst = y + sy;
                 if sx_dst >= self.width || sy_dst >= self.height {
                     continue;
                 }
-                let di = (sy_dst * self.width + sx_dst) * 4;
-                self.pixels[di..di + 4].copy_from_slice(&src.pixels[si..si + 4]);
+                self.put(
+                    sx_dst,
+                    sy_dst,
+                    Rgb(
+                        src.pixel(sx, sy)[0],
+                        src.pixel(sx, sy)[1],
+                        src.pixel(sx, sy)[2],
+                    ),
+                );
             }
         }
     }
 
     pub fn pixel(&self, x: usize, y: usize) -> [u8; 4] {
+        if let Some(mapping) = &self.mapping {
+            return mapped_rgba(mapping.as_slice(), self.stride, x, y);
+        }
         let i = (y * self.width + x) * 4;
         [
             self.pixels[i],
@@ -156,6 +289,24 @@ impl Canvas {
 
     pub fn save_png(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
         crate::png::save(self, path)
+    }
+}
+
+impl pagh_ui::damage::DamageSurface for Canvas {
+    fn dims(&self) -> (i32, i32) {
+        (self.width as i32, self.height as i32)
+    }
+
+    fn stride(&self) -> usize {
+        self.stride
+    }
+
+    fn bytes_per_pixel(&self) -> usize {
+        4
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.surface_bytes()
     }
 }
 

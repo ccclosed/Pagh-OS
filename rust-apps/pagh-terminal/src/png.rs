@@ -67,6 +67,12 @@ pub fn encode(canvas: &Canvas) -> Vec<u8> {
 
 /// Save a canvas as a PNG file.
 pub fn save(canvas: &Canvas, path: impl AsRef<Path>) -> io::Result<()> {
+    if canvas.is_mapped() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "PNG save needs an RGBA canvas (shared mapping is XRGB8888)",
+        ));
+    }
     std::fs::write(path, encode(canvas))
 }
 
@@ -145,11 +151,7 @@ pub fn decode(bytes: &[u8]) -> Result<Canvas, PngError> {
         }
         pixels.extend_from_slice(&row[1..]);
     }
-    Ok(Canvas {
-        width,
-        height,
-        pixels,
-    })
+    Canvas::from_rgba(width, height, pixels).ok_or(PngError::TooLarge)
 }
 
 fn write_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {

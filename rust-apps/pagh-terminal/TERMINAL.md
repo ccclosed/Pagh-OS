@@ -233,7 +233,9 @@ E2E с реальным композитором (headless backend, `pagh-deskto
 `rust-apps/pagh-desktop/PROTOCOL.md` (server-task, ветка `feat/desktop-server`).
 Итоговый документ принадлежит серверу; при расхождении приоритет у него.
 Транспорт: `AF_UNIX SOCK_STREAM`, все числа little-endian, строки —
-`u16 length` + UTF-8.  Кадры передаются in-band, без `SCM_RIGHTS`/SHM в v1.
+`u16 length` + UTF-8.  По умолчанию кадры передаются in-band; если сервер
+объявил `welcome.flags` bit 2, терминал использует `ShmSurface` (memfd через
+`SCM_RIGHTS`), а по сокету шлёт только damage-прямоугольники.
 
 ### Заголовок (12 байт)
 
@@ -241,12 +243,12 @@ E2E с реальным композитором (headless backend, `pagh-deskto
 |---|---|---|
 | 0 | 4 | magic `"PDS1"` |
 | 4 | 2 | type |
-| 6 | 2 | flags (зарезервировано, должно быть 0) |
+| 6 | 2 | flags (0; bit0 `SHM` допустим только у `commit`/`damage`) |
 | 8 | 4 | length payload |
 
-`MAX_PAYLOAD = 4096*4096*4 + 4096`.  Неизвестный type, ненулевые flags,
-лишние/недостающие байты payload и неверный magic считаются ошибкой кадра
-(как в серверном декодере).
+`MAX_PAYLOAD = 4096*4096*4 + 4096`.  Неизвестный type, flags с битами кроме
+`SHM`, `SHM` не у `commit`/`damage`, лишние/недостающие байты payload и
+неверный magic считаются ошибкой кадра (как в серверном декодере).
 
 ### Сообщения
 
@@ -264,10 +266,19 @@ E2E с реальным композитором (headless backend, `pagh-deskto
 | 10 | `error` | s→c | `code u32, string message` |
 | 11 | `ping` | обе | `nonce u32` |
 | 12 | `pong` | обе | `nonce u32` |
+| 14 | `shm_offer` | c→s | `window_id u32, width u32, height u32, format u32, stride u32, flags u32` + ровно один `SCM_RIGHTS` memfd |
+| 15 | `shm_ready` | s→c | `window_id u32, generation u32` |
+| 16 | `shm_release` | обе | `window_id u32, generation u32` |
+
+`commit` с `flags=SHM` (bit 0) — без пикселей: `window_id u32, generation u32,
+count u32, rects[(x i32,y i32,w u16,h u16)]`; сервер читает повреждённые
+области из memfd. Терминал пересоздаёт memfd при `configure`, шлёт новое
+поколение и `shm_release` старого; на legacy-сервере (bit 2 = 0) остаётся
+полный кадр. `damage` (type 9) — по-прежнему подсказка.
 
 Форматы кадра: `format 1` — XRGB8888 (`0x00RRGGBB`, память `B,G,R,X`),
 `format 2` — RGB565 LE.  `welcome.flags`: bit0 XRGB8888, bit1 RGB565, bit2
-ShmSurface (в v1 = 0).  `configure.flags`: focus 1, maximized 2, minimized 4,
+ShmSurface (0 — fallback на полный кадр).  `configure.flags`: focus 1, maximized 2, minimized 4,
 resizable 8.  `input.kind`: 1 motion, 2 button, 3 key, 4 axis.  Кнопки:
 `button` 1 left / 2 middle / 3 right, `buttons` — маска 1/2/4.  Модификаторы:
 shift 1, ctrl 2, alt 4, super 8.  `close.reason`: client 0, server 1,
@@ -537,7 +548,7 @@ Kernel-side проверка (после реализации): boot-тест п
 ```sh
 cd rust-apps/pagh-terminal
 cargo fmt --all -- --check
-cargo test                 # 118 host tests (60 unit + 58 integration)
+cargo test                 # 120 host tests (60 unit + 60 integration)
 python3 tools/gen_font.py --check --allow-clip
 tools/build-static.sh      # ELF static-pie x86_64-musl, no INTERP
 ```

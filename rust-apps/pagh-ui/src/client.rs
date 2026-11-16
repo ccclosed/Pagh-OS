@@ -2,8 +2,16 @@
 //!
 //! Композитор владеет размещением, заголовком окна (`v`/`^`/`x`), фокусом и
 //! панелью; клиент рисует **только клиентскую область** и получает координаты
-//! ввода относительно неё. Кадры в v1 идут полной поверхностью внутри сокета
-//! (`XRGB8888` или `RGB565`), `damage` — только подсказка.
+//! ввода относительно неё. Есть два пути доставки пикселей:
+//!
+//! * **ShmSurface** (приоритет): клиент создаёт memfd, отображает его
+//!   `MAP_SHARED`, отправляет fd через `SCM_RIGHTS` (`SHM_OFFER`), ждёт
+//!   `SHM_READY`, рендерит прямо в mapping и шлёт только damage-прямоугольники
+//!   (`COMMIT` с header flags bit 0) — пиксели по сокету не идут;
+//! * **frame upload** (fallback): полный кадр `XRGB8888`/`RGB565` внутри
+//!   сокета, как в v1. Используется, если `welcome.flags` не содержит bit 2,
+//!   `SCM_RIGHTS`/`memfd` недоступны, сервер не прислал `SHM_READY` за
+//!   [`SHM_READY_TIMEOUT`] или ответил ошибкой на `SHM_OFFER`.
 //!
 //! Поверх [`protocol`] клиент даёт удобный [`DesktopClient`]:
 //!
@@ -17,21 +25,32 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-use std::io::{self, Read, Write};
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{self, BufWriter, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::canvas::Canvas;
+use crate::damage::Damage;
 use crate::event::{Event, Key, Modifiers, MouseButton};
 use crate::geom::{Point, Size};
 use crate::protocol::{
-    self, buttons, close_reason, mods, pack_rgb565, pack_xrgb8888, FrameFormat, InputEvent,
-    Message, MessageReader, HEADER_LEN, MAX_PAYLOAD, MAX_SURFACE_DIM, VERSION,
+    self, buttons, close_reason, header_flags, mods, pack_rgb565, pack_xrgb8888, FrameFormat,
+    InputEvent, Message, MessageReader, HEADER_LEN, MAGIC, MAX_PAYLOAD, MAX_SURFACE_DIM, VERSION,
 };
+use crate::shm::{self, ShmSurface};
 
 /// Сокет композитора по умолчанию (совпадает с `pagh-desktop`).
 pub const DEFAULT_SOCKET: &str = "/tmp/pagh-desktop.sock";
+
+/// Сколько ждать `SHM_READY` после `SHM_OFFER`, прежде чем откатиться на
+/// полный кадр (legacy-сервер не отвечает на type 14).
+pub const SHM_READY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Переменная окружения для трассировки PDP/1 (одна строка на сообщение,
+/// без пикселей — длина payload вместо байтов).
+pub const TRACE_ENV: &str = "PAGH_UI_PDP_TRACE";
 
 /// Информация из `welcome`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +82,60 @@ pub enum Incoming {
     Error { code: u32, message: String },
     /// `ping` (клиент уже ответил `pong`).
     Ping { nonce: u32 },
+    /// Сервер принял `SHM_OFFER` и назначил поколение.
+    ShmReady { window_id: u32, generation: u32 },
+    /// Сервер освободил поколение разделяемой поверхности.
+    ShmRelease { window_id: u32, generation: u32 },
+}
+
+/// Клиентская разделяемая поверхность: mapping + поколение для `COMMIT`.
+///
+/// Пока `frame` жив, приложение рисует прямо в [`ShmFrame::canvas`] (это mmap
+/// memfd) и отправляет только damage через [`DesktopClient::commit_shm`].
+pub struct ShmFrame {
+    pub canvas: Canvas,
+    pub window_id: u32,
+    pub generation: u32,
+    pub format: FrameFormat,
+}
+
+impl ShmFrame {
+    pub fn size(&self) -> Size {
+        self.canvas.size()
+    }
+
+    pub fn stride(&self) -> u32 {
+        self.canvas.stride() as u32
+    }
+
+    pub fn rect(&self) -> crate::geom::Rect {
+        self.canvas.rect()
+    }
+}
+
+/// Куда писать компактную трассировку PDP/1 (для e2e/отладки).
+struct Trace {
+    writer: BufWriter<File>,
+}
+
+impl DesktopClient {
+    fn trace(&mut self, direction: char, kind: &str, flags: u16, length: usize, detail: &str) {
+        let Some(trace) = self.trace.as_mut() else {
+            return;
+        };
+        if detail.is_empty() {
+            let _ = writeln!(
+                trace.writer,
+                "{direction} {kind} flags={flags:#x} len={length}"
+            );
+        } else {
+            let _ = writeln!(
+                trace.writer,
+                "{direction} {kind} flags={flags:#x} len={length} {detail}"
+            );
+        }
+        let _ = trace.writer.flush();
+    }
 }
 
 /// Подключение к композитору Pagh desktop.
@@ -78,6 +151,16 @@ pub struct DesktopClient {
     flags: u32,
     peer_closed: bool,
     next_window: u32,
+    /// Сервер объявил ShmSurface и окружение его поддерживает.
+    shm_capable: bool,
+    /// Текущее поколение shm-поверхности (0 = ещё не готово).
+    generation: u32,
+    /// События, полученные во время синхронного ожидания `SHM_READY`.
+    pending: VecDeque<Incoming>,
+    /// Переиспользуемый буфер заголовка+payload (без аллокаций в кадре).
+    tx_buffer: Vec<u8>,
+    /// Необязательная трассировка отправленных/принятых сообщений.
+    trace: Option<Trace>,
 }
 
 impl DesktopClient {
@@ -86,6 +169,12 @@ impl DesktopClient {
         let stream = UnixStream::connect(path.as_ref())?;
         stream.set_read_timeout(Some(Duration::from_millis(100)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let trace = std::env::var_os(TRACE_ENV)
+            .filter(|value| !value.is_empty())
+            .and_then(|path| File::create(std::path::Path::new(&path)).ok())
+            .map(|file| Trace {
+                writer: BufWriter::new(file),
+            });
         Ok(DesktopClient {
             stream,
             reader: MessageReader::new(),
@@ -98,6 +187,11 @@ impl DesktopClient {
             flags: 0,
             peer_closed: false,
             next_window: 1,
+            shm_capable: false,
+            generation: 0,
+            pending: VecDeque::new(),
+            tx_buffer: Vec::with_capacity(64 * 1024),
+            trace,
         })
     }
 
@@ -201,6 +295,8 @@ impl DesktopClient {
                     }
                     self.format = FrameFormat::from_welcome_flags(flags);
                     self.screen = Size::new(width as i32, height as i32);
+                    self.shm_capable =
+                        flags & protocol::welcome_flags::SHM_SURFACE != 0 && shm::shm_supported();
                     let welcome = Welcome {
                         version,
                         client_id,
@@ -259,7 +355,17 @@ impl DesktopClient {
     }
 
     /// Отправить полный кадр поверхности окна.
+    ///
+    /// `canvas` обязан быть обычным RGBA-холстом; для `ShmSurface` используйте
+    /// [`DesktopClient::commit_shm`] — у неё другой порядок пикселей и не нужен
+    /// аплоад.
     pub fn commit(&mut self, window_id: u32, canvas: &Canvas) -> io::Result<()> {
+        if canvas.is_shared() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "shared surface must be committed with commit_shm",
+            ));
+        }
         self.commit_rgba(
             window_id,
             canvas.width() as u32,
@@ -343,6 +449,232 @@ impl DesktopClient {
         self.send(&Message::Ping { nonce })
     }
 
+    // ───────────────────────── ShmSurface (PDP/1 B5) ────────────────────────
+
+    /// Умеет ли соединение разделяемые поверхности: `welcome.flags` bit 2 **и**
+    /// окружение (memfd/mmap/SCM_RIGHTS); тестовый выключатель —
+    /// [`shm::DISABLE_ENV`].
+    pub fn shm_supported(&self) -> bool {
+        self.shm_capable
+    }
+
+    /// Текущее поколение разделяемой поверхности (0 = ещё не готово).
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// Создать memfd-поверхность, отправить `SHM_OFFER` и дождаться `SHM_READY`.
+    ///
+    /// Возвращает `Ok(None)`, если сервер/окружение не поддерживают ShmSurface
+    /// или сервер не ответил за [`SHM_READY_TIMEOUT`]: вызывающий продолжает
+    /// работать через full-frame [`DesktopClient::commit`].
+    pub fn enable_shm(&mut self, window_id: u32, size: Size) -> io::Result<Option<ShmFrame>> {
+        if !self.shm_capable || window_id == 0 || size.w <= 0 || size.h <= 0 {
+            return Ok(None);
+        }
+        let Some((mut frame, generation)) = self.offer_shm(window_id, size)? else {
+            return Ok(None);
+        };
+        frame.generation = generation;
+        self.generation = generation;
+        Ok(Some(frame))
+    }
+
+    /// Пересоздать разделяемую поверхность под новый размер (`configure`).
+    ///
+    /// Новый memfd + `SHM_OFFER` + ожидание `SHM_READY`; старый mapping
+    /// освобождается после подтверждения (и клиент шлёт `SHM_RELEASE(old)`).
+    /// `Ok(false)` — сервер не подтвердил, `frame` остаётся прежним; вызывающий
+    /// продолжает full-frame commit.
+    pub fn resize_shm(&mut self, frame: &mut ShmFrame, size: Size) -> io::Result<bool> {
+        if !self.shm_capable || size.w <= 0 || size.h <= 0 {
+            return Ok(false);
+        }
+        let window_id = frame.window_id;
+        let old_generation = frame.generation;
+        let Some((mut new_frame, generation)) = self.offer_shm(window_id, size)? else {
+            return Ok(false);
+        };
+        new_frame.generation = generation;
+        let _ = self.send(&Message::ShmRelease {
+            window_id,
+            generation: old_generation,
+        });
+        self.generation = generation;
+        self.width = size.w as u32;
+        self.height = size.h as u32;
+        *frame = new_frame;
+        Ok(true)
+    }
+
+    /// Отправить только damage-прямоугольники (shm-форма `COMMIT`, без пикселей).
+    ///
+    /// Пустой damage ничего не отправляет (idle → ноль сообщений). Ошибка
+    /// `InvalidData` означает, что поколение устарело: нужно откатиться на
+    /// full-frame commit или пересоздать поверхность.
+    pub fn commit_shm(&mut self, frame: &ShmFrame, damage: &Damage) -> io::Result<()> {
+        if !self.shm_capable {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "ShmSurface is not enabled",
+            ));
+        }
+        if frame.generation != self.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stale shm generation",
+            ));
+        }
+        if damage.is_empty() {
+            return Ok(());
+        }
+        let rects = damage.rects();
+        let payload_len = 12 + rects.len() * 12;
+        let total = HEADER_LEN + payload_len;
+        self.tx_buffer.clear();
+        self.tx_buffer.reserve(total);
+        self.tx_buffer.extend_from_slice(&MAGIC);
+        self.tx_buffer
+            .extend_from_slice(&protocol::types::COMMIT.to_le_bytes());
+        self.tx_buffer
+            .extend_from_slice(&header_flags::SHM.to_le_bytes());
+        let payload_len = payload_len as u32;
+        self.tx_buffer.extend_from_slice(&payload_len.to_le_bytes());
+        self.tx_buffer
+            .extend_from_slice(&frame.window_id.to_le_bytes());
+        self.tx_buffer
+            .extend_from_slice(&frame.generation.to_le_bytes());
+        self.tx_buffer
+            .extend_from_slice(&(rects.len() as u32).to_le_bytes());
+        for rect in rects {
+            self.tx_buffer.extend_from_slice(&rect.x.to_le_bytes());
+            self.tx_buffer.extend_from_slice(&rect.y.to_le_bytes());
+            self.tx_buffer
+                .extend_from_slice(&(rect.w.clamp(0, u16::MAX as i32) as u16).to_le_bytes());
+            self.tx_buffer
+                .extend_from_slice(&(rect.h.clamp(0, u16::MAX as i32) as u16).to_le_bytes());
+        }
+        self.stream.write_all(&self.tx_buffer)?;
+        self.stream.flush()?;
+        if self.trace.is_some() {
+            let detail = format!(
+                "window={} gen={} damage={}",
+                frame.window_id,
+                frame.generation,
+                rects.len()
+            );
+            self.trace(
+                '>',
+                "commit_shm",
+                header_flags::SHM,
+                payload_len as usize,
+                &detail,
+            );
+        }
+        Ok(())
+    }
+
+    /// Сообщить серверу, что поколение больше не нужно, и отключить shm-путь.
+    pub fn release_shm(&mut self, frame: &ShmFrame) -> io::Result<()> {
+        self.shm_capable = false;
+        self.generation = 0;
+        self.send(&Message::ShmRelease {
+            window_id: frame.window_id,
+            generation: frame.generation,
+        })
+    }
+
+    /// Создать memfd+canvas и провести offer/ready; на неудаче — `Ok(None)`
+    /// (fallback), без разрыва соединения.
+    fn offer_shm(&mut self, window_id: u32, size: Size) -> io::Result<Option<(ShmFrame, u32)>> {
+        let name = format!("pagh-ui-{}-{}", std::process::id(), window_id);
+        let surface = match ShmSurface::create(&name, size.w as u32, size.h as u32, self.format) {
+            Ok(surface) => surface,
+            Err(_) => {
+                self.shm_capable = false;
+                return Ok(None);
+            }
+        };
+        let canvas = match Canvas::map_surface(&surface) {
+            Ok(canvas) => canvas,
+            Err(_) => {
+                self.shm_capable = false;
+                return Ok(None);
+            }
+        };
+        let offer = Message::ShmOffer {
+            window_id,
+            width: size.w as u32,
+            height: size.h as u32,
+            format: self.format.to_wire(),
+            stride: surface.stride(),
+            flags: 0,
+        };
+        let encoded = offer.encode();
+        if shm::send_fd_payload(&self.stream, &encoded, surface.fd()).is_err() {
+            self.shm_capable = false;
+            return Ok(None);
+        }
+        if self.trace.is_some() {
+            let detail = format!(
+                "window={} {}x{} stride={} format={}",
+                window_id,
+                size.w,
+                size.h,
+                surface.stride(),
+                self.format.to_wire()
+            );
+            self.trace('>', "shm_offer", 0, encoded.len() - HEADER_LEN, &detail);
+        }
+        let Some(generation) = self.wait_for_shm_ready(window_id)? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            ShmFrame {
+                canvas,
+                window_id,
+                generation,
+                format: self.format,
+            },
+            generation,
+        )))
+    }
+
+    /// Ждать `SHM_READY`/ошибку с дедлайном, не теряя прочие события.
+    fn wait_for_shm_ready(&mut self, window_id: u32) -> io::Result<Option<u32>> {
+        let deadline = Instant::now() + SHM_READY_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let Some(message) = self.next_message(remaining)? else {
+                return Ok(None);
+            };
+            match message {
+                Message::ShmReady {
+                    window_id: id,
+                    generation,
+                } if id == window_id => {
+                    self.trace('<', "shm_ready", 0, 8, "");
+                    return Ok(Some(generation));
+                }
+                Message::Error { code, message } => {
+                    self.trace('<', "error", 0, message.len(), &format!("code={code}"));
+                    if code == protocol::error_codes::STALE_GENERATION {
+                        self.generation = 0;
+                    }
+                    return Ok(None);
+                }
+                other => {
+                    let mut incoming = Vec::new();
+                    self.handle_message(other, &mut incoming)?;
+                    self.pending.extend(incoming);
+                }
+            }
+        }
+    }
+
     fn send(&mut self, message: &Message) -> io::Result<()> {
         let encoded = message.encode();
         if encoded.len() > HEADER_LEN + MAX_PAYLOAD {
@@ -352,13 +684,66 @@ impl DesktopClient {
             ));
         }
         self.stream.write_all(&encoded)?;
-        self.stream.flush()
+        self.stream.flush()?;
+        if self.trace.is_some() {
+            let detail = match message {
+                Message::Commit {
+                    window_id,
+                    width,
+                    height,
+                    stride,
+                    pixels,
+                    ..
+                } => format!(
+                    "window={window_id} {}x{} stride={stride} pixels={}",
+                    width,
+                    height,
+                    pixels.len()
+                ),
+                Message::CommitShm {
+                    window_id,
+                    generation,
+                    rects,
+                } => format!("window={window_id} gen={generation} damage={}", rects.len()),
+                Message::Damage { window_id, rects } => {
+                    format!("window={window_id} hint={}", rects.len())
+                }
+                Message::ShmOffer {
+                    window_id,
+                    width,
+                    height,
+                    stride,
+                    ..
+                } => format!("window={window_id} {width}x{height} stride={stride} fd"),
+                Message::ShmRelease {
+                    window_id,
+                    generation,
+                } => format!("window={window_id} gen={generation}"),
+                _ => String::new(),
+            };
+            self.trace(
+                '>',
+                message.name(),
+                message.header_flags(),
+                encoded.len() - HEADER_LEN,
+                &detail,
+            );
+        }
+        Ok(())
     }
 
     /// Прочитать все события, ожидая первое не дольше `timeout`.
     pub fn poll(&mut self, timeout: Duration) -> io::Result<Vec<Incoming>> {
         let deadline = Instant::now() + timeout;
         let mut incoming = Vec::new();
+        // События, пришедшие во время синхронного ожидания SHM_READY,
+        // отдаём до чтения сокета и не блокируемся повторно.
+        while let Some(event) = self.pending.pop_front() {
+            incoming.push(event);
+        }
+        if !incoming.is_empty() {
+            return Ok(incoming);
+        }
         loop {
             if let Some(message) = self.reader.next().map_err(io::Error::from)? {
                 self.handle_message(message, &mut incoming)?;
@@ -404,6 +789,8 @@ impl DesktopClient {
             } => {
                 self.format = FrameFormat::from_welcome_flags(flags);
                 self.screen = Size::new(width as i32, height as i32);
+                self.shm_capable =
+                    flags & protocol::welcome_flags::SHM_SURFACE != 0 && shm::shm_supported();
                 self.welcome = Some(Welcome {
                     version,
                     client_id,
@@ -450,10 +837,38 @@ impl DesktopClient {
                 self.send(&Message::Pong { nonce })?;
                 incoming.push(Incoming::Ping { nonce });
             }
-            Message::Pong { .. } | Message::Damage { .. } => {}
+            Message::ShmReady {
+                window_id,
+                generation,
+            } => {
+                if window_id == self.window_id {
+                    self.generation = generation;
+                }
+                incoming.push(Incoming::ShmReady {
+                    window_id,
+                    generation,
+                });
+            }
+            Message::ShmRelease {
+                window_id,
+                generation,
+            } => {
+                if window_id == self.window_id && generation == self.generation {
+                    // Сервер освободил текущую поверхность: до нового offer
+                    // рендерим/шлём полный кадр.
+                    self.generation = 0;
+                }
+                incoming.push(Incoming::ShmRelease {
+                    window_id,
+                    generation,
+                });
+            }
+            Message::Pong { .. } | Message::Damage { .. } | Message::DamageShm { .. } => {}
             Message::Hello { .. }
             | Message::Create { .. }
             | Message::Commit { .. }
+            | Message::CommitShm { .. }
+            | Message::ShmOffer { .. }
             | Message::Launch { .. } => {}
         }
         Ok(())
