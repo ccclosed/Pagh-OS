@@ -37,7 +37,7 @@ use x86_64::structures::paging::PageTableFlags;
 
 use crate::drivers::framebuffer::FbInfo;
 use crate::memory::layout::{USER_STACK_PAGES, USER_STACK_TOP};
-use crate::memory::{pmm, vmm};
+use crate::memory::{pat, pmm, vmm};
 use crate::task::compat;
 use crate::vfs::VfsNode;
 
@@ -595,10 +595,15 @@ fn mmap_fb(
             }
             cut_regions(&mut vm.mmaps, base, pages);
         }
-        let pte_flags = leaf_flags(writable, nx)
-            | vmm::MMIO_BIT
-            | PageTableFlags::NO_CACHE
-            | PageTableFlags::WRITE_THROUGH;
+        // Write-combining, если boot запрограммировал IA32_PAT entry 4.
+        // WC-лист несёт PAT (bit 7) и не несёт NO_CACHE/WRITE_THROUGH;
+        // без PAT остаётся точная прежняя некешируемая пара (см.
+        // `memory::pat::fb0_pte_flags`, host-тесты проверяют обе композиции).
+        let pte_flags = PageTableFlags::from_bits_truncate(pat::fb0_pte_flags(
+            writable,
+            nx,
+            pat::wc_supported(),
+        ));
         let mut mapped: Vec<u64> = Vec::new();
         for i in 0..pages {
             let page = base + i * PAGE_SIZE;
@@ -1066,11 +1071,16 @@ fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result
                 // восстанавливающий WRITABLE только на приватной копии.
                 let mut new_flags = leaf_flags(writable, nx);
                 if old_flags.contains(vmm::MMIO_BIT) {
-                    // Framebuffer: сохранить MMIO-маркер и некешируемость,
-                    // иначе следующий munmap/exit попытается вернуть кадр
-                    // устройства в PMM.
-                    new_flags |=
-                        vmm::MMIO_BIT | PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH;
+                    // Framebuffer: сохранить MMIO-маркер (иначе следующий
+                    // munmap/exit попытается вернуть кадр устройства в PMM) и
+                    // ТУ ЖЕ политику кэша, что уже стоит на листе. Раньше здесь
+                    // безусловно возвращались NO_CACHE|WRITE_THROUGH, и первый
+                    // же mprotect на fb-регионе молча отменял write-combining.
+                    let cache = PageTableFlags::from_bits_truncate(pat::mmio_cache_bits_from(
+                        old_flags.bits(),
+                        pat::wc_supported(),
+                    ));
+                    new_flags |= vmm::MMIO_BIT | cache;
                 } else if old_flags.contains(vmm::VT_RO_BIT) {
                     // Read-only VT-поверхность: маркер владения сохраняется,
                     // WRITABLE сюда не приходит (см. pre-scan выше).

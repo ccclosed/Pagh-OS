@@ -205,12 +205,18 @@ fb[y * (fix.line_length / 4) + x] = argb;
 * Только `MAP_SHARED`: `MAP_PRIVATE` на `/dev/fb0` — `EINVAL` (приватная копия
   экрана не имеет смысла).
 * `offset` выровнен на 4096; `offset + len <= smem_len`.
-* Физические страницы Limine-фреймбуфера отображаются как MMIO
-  (`NO_CACHE|WRITE_THROUGH`); `munmap`/exit/`fork` **никогда** не возвращают их
-  в PMM — лист помечен `MMIO_BIT`.
+* Физические страницы Limine-фреймбуфера отображаются как MMIO; `munmap`/exit/
+  `fork` **никогда** не возвращают их в PMM — лист помечен `MMIO_BIT`.
+* Тип памяти: при поддержке PAT (`CPUID.1:EDX[16]`) boot программирует
+  `IA32_PAT` entry 4/5 = WC, а лист fb0 получает `PAT` (bit 7) **без**
+  `NO_CACHE|WRITE_THROUGH` — потоковая запись композитора сливается в
+  write-combining-буферы (desktop-render §2 A). Без PAT — ровно прежняя пара
+  `NO_CACHE|WRITE_THROUGH` и однократный serial-лог `fb0: PAT missing, uncached`.
 * `fork` дублирует трансляцию на тот же scanout (ребёнок рисует в тот же экран,
-  как и в Linux с наследованием fd).
-* `mprotect` на fb-листе сохраняет MMIO-маркер.
+  как и в Linux с наследованием fd), PTE копируется как есть — WC/MMIO
+  сохраняются, COW для scanout не ставится.
+* `mprotect` на fb-листе сохраняет MMIO-маркер **и** текущую политику кэша:
+  WC не откатывается в uncached сменой прав `PROT_*`.
 
 ---
 
