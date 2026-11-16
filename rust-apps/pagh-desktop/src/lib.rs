@@ -13,6 +13,7 @@
 pub mod color;
 pub mod context_menu;
 pub mod geometry;
+pub mod glyph;
 pub mod panel;
 pub mod png;
 pub mod protocol;

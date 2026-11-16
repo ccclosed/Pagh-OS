@@ -5,29 +5,80 @@
 //! повторная отрисовка сцены обновляет лишь повреждённые пиксели.
 
 use crate::color::{self, Color, TRANSPARENT};
-use crate::font::{self, GLYPH_HEIGHT, GLYPH_WIDTH};
+use crate::font::{GLYPH_HEIGHT, GLYPH_WIDTH};
 use crate::geometry::{Point, Rect, Size};
+use crate::glyph::GlyphAtlas;
 use crate::surface::Surface;
 
 /// Программный холст кадра.
-#[derive(Clone)]
 pub struct Canvas {
     width: u32,
     height: u32,
     pixels: Vec<Color>,
     clip: Vec<Rect>,
     clip_active: bool,
+    glyphs: GlyphAtlas,
+}
+
+impl Clone for Canvas {
+    fn clone(&self) -> Self {
+        // Кэш глифов не клонируем: он нужен только для рисования и быстро
+        // восстановится; копия холста используется тестами/снапшотами.
+        Self {
+            width: self.width,
+            height: self.height,
+            pixels: self.pixels.clone(),
+            clip: self.clip.clone(),
+            clip_active: self.clip_active,
+            glyphs: GlyphAtlas::default(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Canvas {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Canvas")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("clip_active", &self.clip_active)
+            .field("clip", &self.clip)
+            .field("glyph_misses", &self.glyphs.misses())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Canvas {
     pub fn new(width: u32, height: u32, fill: Color) -> Self {
+        Self::with_backing(width, height, fill | 0xFF00_0000)
+    }
+
+    /// Прозрачный холст для кэшируемых слоёв: незаписанные пиксели остаются 0.
+    pub fn new_transparent(width: u32, height: u32) -> Self {
+        Self::with_backing(width, height, 0)
+    }
+
+    fn with_backing(width: u32, height: u32, fill: Color) -> Self {
         Self {
             width,
             height,
-            pixels: vec![fill | 0xFF00_0000; (width as usize) * (height as usize)],
+            pixels: vec![fill; (width as usize) * (height as usize)],
             clip: Vec::new(),
             clip_active: false,
+            glyphs: GlyphAtlas::default(),
         }
+    }
+
+    /// Статистика glyph-кэша (для тестов и счётчиков).
+    pub fn glyph_hits(&self) -> u64 {
+        self.glyphs.hits()
+    }
+
+    pub fn glyph_misses(&self) -> u64 {
+        self.glyphs.misses()
+    }
+
+    pub fn glyph_cache_len(&self) -> usize {
+        self.glyphs.len()
     }
 
     pub fn width(&self) -> u32 {
@@ -383,25 +434,22 @@ impl Canvas {
                 continue;
             }
             // ASCII + кириллица; неизвестный символ показываем как `?`.
-            let glyph = match font::glyph(ch) {
-                Some(glyph) => glyph,
-                None => match font::glyph('?') {
-                    Some(glyph) => glyph,
-                    None => continue,
-                },
+            // Маска глифа кэшируется («glyph atlas»), runs — готовые горизонтальные
+            // отрезки пикселей, без перебора 16×8 бит на каждом кадре.
+            let Some(mask) = self.glyphs.mask(ch, scale) else {
+                continue;
             };
-            for (row, bits) in glyph.iter().enumerate() {
-                for col in 0..8 {
-                    if bits & (0x80 >> col) != 0 {
-                        for sy in 0..scale {
-                            for sx in 0..scale {
-                                self.blend(
-                                    cursor + col * scale + sx,
-                                    y + row as i32 * scale + sy,
-                                    color,
-                                    opacity,
-                                );
-                            }
+            for (row, runs) in mask.rows().iter().enumerate() {
+                let py = y + row as i32;
+                for &(dx, len) in runs {
+                    let px = cursor + dx;
+                    if opacity == 255 {
+                        for i in 0..len {
+                            self.put(px + i, py, color);
+                        }
+                    } else {
+                        for i in 0..len {
+                            self.blend(px + i, py, color, opacity);
                         }
                     }
                 }
@@ -422,7 +470,9 @@ impl Canvas {
     /// Блит поверхности клиента в прямоугольник назначения (nearest-neighbour).
     ///
     /// Если размеры не совпадают (клиент ещё не прислал кадр под новый configure),
-    /// изображение масштабируется; так живой resize выглядит корректно.
+    /// изображение масштабируется; так живой resize выглядит корректно. Для
+    /// совпадающих размеров и `opacity=255` (непрозрачный XRGB/RGB565-путь)
+    /// строки копируются `copy_from_slice`, без per-pixel blend.
     pub fn blit_surface(&mut self, surface: &Surface, dst: Rect, opacity: u8) {
         let Some(dst) = dst.intersection(self.bounds()) else {
             return;
@@ -430,16 +480,133 @@ impl Canvas {
         if surface.width == 0 || surface.height == 0 {
             return;
         }
-        for y in dst.y..dst.bottom() {
-            let sy = ((y - dst.y) as u64 * surface.height as u64 / dst.h as u64)
-                .min(surface.height as u64 - 1) as u32;
-            for x in dst.x..dst.right() {
-                let sx = ((x - dst.x) as u64 * surface.width as u64 / dst.w as u64)
-                    .min(surface.width as u64 - 1) as u32;
-                // Форматы поверхностей непрозрачные; альфа приходит только из opacity.
-                let src = surface.get(sx, sy) | 0xFF00_0000;
-                self.blend(x, y, src, opacity);
+        let direct = surface.width == dst.w as u32 && surface.height == dst.h as u32;
+        let one_to_one = direct && opacity == 255;
+        let src_pixels = surface.pixels();
+        let paint = |target: &mut Canvas, area: Rect| {
+            if area.is_empty() {
+                return;
             }
+            if one_to_one {
+                let src_x = area.x - dst.x;
+                let src_y = area.y - dst.y;
+                for row in 0..area.h as usize {
+                    let s = (src_y as usize + row) * surface.width as usize + src_x as usize;
+                    let d = (area.y as usize + row) * target.width as usize + area.x as usize;
+                    target.pixels[d..d + area.w as usize]
+                        .copy_from_slice(&src_pixels[s..s + area.w as usize]);
+                }
+                return;
+            }
+            for y in area.y..area.bottom() {
+                let sy = if direct {
+                    (y - dst.y) as u32
+                } else {
+                    (((y - dst.y) as u64 * surface.height as u64 / dst.h as u64)
+                        .min(surface.height as u64 - 1)) as u32
+                };
+                for x in area.x..area.right() {
+                    let sx = if direct {
+                        (x - dst.x) as u32
+                    } else {
+                        (((x - dst.x) as u64 * surface.width as u64 / dst.w as u64)
+                            .min(surface.width as u64 - 1)) as u32
+                    };
+                    // Форматы поверхностей непрозрачные; альфа приходит только из opacity.
+                    let src = surface.get(sx, sy) | 0xFF00_0000;
+                    if opacity == 255 {
+                        target.pixels[(y as usize) * target.width as usize + x as usize] = src;
+                    } else {
+                        target.blend(x, y, src, opacity);
+                    }
+                }
+            }
+        };
+        if self.clip_active {
+            for index in 0..self.clip.len() {
+                let clip = self.clip[index];
+                if let Some(area) = dst.intersection(clip) {
+                    paint(self, area);
+                }
+            }
+        } else {
+            paint(self, dst);
+        }
+    }
+
+    /// Скопировать непрозрачную область из другого холста (кэш обоев/панели).
+    ///
+    /// Копирование идёт построчно через `copy_from_slice` и только в пределах
+    /// текущего damage-отсечения.
+    pub fn blit_opaque(&mut self, src: &Canvas, src_rect: Rect, dst: Point) {
+        let Some(src_rect) = src_rect.intersection(src.bounds()) else {
+            return;
+        };
+        let dst_rect = Rect::new(dst.x, dst.y, src_rect.w, src_rect.h);
+        let Some(dst_rect) = dst_rect.intersection(self.bounds()) else {
+            return;
+        };
+        let copy = |target: &mut Canvas, area: Rect| {
+            let src_x = src_rect.x + (area.x - dst.x);
+            let src_y = src_rect.y + (area.y - dst.y);
+            for row in 0..area.h as usize {
+                let s = (src_y as usize + row) * src.width as usize + src_x as usize;
+                let d = (area.y as usize + row) * target.width as usize + area.x as usize;
+                target.pixels[d..d + area.w as usize]
+                    .copy_from_slice(&src.pixels[s..s + area.w as usize]);
+            }
+        };
+        if self.clip_active {
+            for index in 0..self.clip.len() {
+                let clip = self.clip[index];
+                if let Some(area) = dst_rect.intersection(clip) {
+                    copy(self, area);
+                }
+            }
+        } else {
+            copy(self, dst_rect);
+        }
+    }
+
+    /// Наложить кэшированный слой с прозрачными пикселями (`0` = не рисовать).
+    pub fn blit_layer(&mut self, layer: &Canvas, dst: Point) {
+        let dst_rect = Rect::new(dst.x, dst.y, layer.width as i32, layer.height as i32);
+        let Some(dst_rect) = dst_rect.intersection(self.bounds()) else {
+            return;
+        };
+        let copy = |target: &mut Canvas, area: Rect| {
+            let layer_x = area.x - dst.x;
+            let layer_y = area.y - dst.y;
+            for row in 0..area.h as usize {
+                let srow = (layer_y as usize + row) * layer.width as usize;
+                let drow = (area.y as usize + row) * target.width as usize;
+                let mut x = 0usize;
+                while x < area.w as usize {
+                    let sx = layer_x as usize + x;
+                    if layer.pixels[srow + sx] == 0 {
+                        x += 1;
+                        continue;
+                    }
+                    let start = x;
+                    while x < area.w as usize && layer.pixels[srow + layer_x as usize + x] != 0 {
+                        x += 1;
+                    }
+                    let d = drow + area.x as usize + start;
+                    target.pixels[d..d + (x - start)]
+                        .copy_from_slice(&layer.pixels[srow + layer_x as usize + start
+                            ..srow + layer_x as usize + x]);
+                }
+            }
+        };
+        if self.clip_active {
+            for index in 0..self.clip.len() {
+                let clip = self.clip[index];
+                if let Some(area) = dst_rect.intersection(clip) {
+                    copy(self, area);
+                }
+            }
+        } else {
+            copy(self, dst_rect);
         }
     }
 
