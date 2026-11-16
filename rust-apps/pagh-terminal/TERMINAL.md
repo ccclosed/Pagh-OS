@@ -537,7 +537,7 @@ Kernel-side проверка (после реализации): boot-тест п
 ```sh
 cd rust-apps/pagh-terminal
 cargo fmt --all -- --check
-cargo test                 # 118 host tests (60 unit + 58 integration)
+cargo test                 # 120 host tests (60 unit + 60 integration)
 python3 tools/gen_font.py --check --allow-clip
 tools/build-static.sh      # ELF static-pie x86_64-musl, no INTERP
 ```

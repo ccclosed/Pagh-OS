@@ -27,7 +27,7 @@ E2E с реальным композитором: `pagh-desktop` из dev (PR #1
   без bit 2 обслуживается прежним полным кадром.
 * ABI v1 kernel console shared surface: валидатор, reader, конвертация в
   экран (`/dev/vtconsole0`, `/dev/vtinput`), см. [TERMINAL.md](TERMINAL.md).
-* 118 host-тестов, включая эталонные escape-последовательности и скриншоты.
+* 120 host-тестов, включая эталонные escape-последовательности и скриншоты.
 
 ## Сборка и проверки
 
