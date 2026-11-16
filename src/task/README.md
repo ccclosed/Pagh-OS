@@ -95,10 +95,16 @@
 - `run_linux_binary` → `exec_linux_image`: чтение файла, ELF-загрузка (`vfs::elf::ElfLoader::load_linux`,
   ET_EXEC и ET_DYN/static-PIE с bias), поиск интерпретатора (`/lib64/ld-linux-x86-64.so.2`
   с фоллбэком в merged-usr пути), маппинг стека через `stack_map::map_initial_stack`.
-- `sys_clone` (в `arch/.../linux/process_sys.rs`) различает тред (`CLONE_VM|CLONE_THREAD` →
-  общий CR3, `spawn_linux_thread`) и fork (→ `fork_linux_process`, COW через
-  `vmm::fork_user_space_cow`, с eager-фоллбэком при huge pages). `CLONE_VM` без
-  `CLONE_THREAD` (vfork/posix_spawn) — сознательно ENOSYS, чтобы libuv шла через fork+exec.
+- `sys_clone` (в `arch/.../linux/process_sys.rs`) различает три формы: тред
+  (`CLONE_VM|CLONE_THREAD` → общий CR3, `spawn_linux_thread`), fork (→
+  `fork_linux_process`, COW через `vmm::fork_user_space_cow`, с eager-фоллбэком при
+  huge pages) и vfork/`posix_spawn` (`CLONE_VM|CLONE_VFORK` без `CLONE_THREAD` → тот же
+  COW-fork с явным `child_stack`, `process::vfork_linux_process`; родитель ждёт
+  `execve`/выхода ребёнка через `scheduler::vfork_wait`, ребёнок будит его из
+  `sys_execve` и reap-пути). Совместная память vfork намеренно заменена копией:
+  `posix_spawn` передаёт статус через pipe, а не через общую память, поэтому копия
+  ненаблюдаема и безопаснее. `CLONE_VM` без обоих `CLONE_THREAD`/`CLONE_VFORK` —
+  по-прежнему ENOSYS.
 - Зомби: `finish_compat_exit` кладёт детей в `EXITED_CHILDREN`; `sys_wait4` опрашивает
   `reap_child`, уступая между проверками.
 - Треды: `clone_current_compat` регистрирует тред под его pid с общим `tgid` и общим

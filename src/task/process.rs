@@ -863,6 +863,55 @@ pub fn fork_linux_process(
     parent_tid: u64,
     child_tid: u64,
 ) -> Result<(u64, u64), crate::arch::x86_64::linux::errno::Errno> {
+    fork_linux_process_inner(regs, clear_child_tid, parent_tid, child_tid, None, false)
+}
+
+/// `clone(CLONE_VM | CLONE_VFORK)` — форма, которой musl и glibc реализуют
+/// `posix_spawn` (Rust-std `Command::spawn` на static-musl идёт именно сюда).
+///
+/// Ребёнку нужен только пользовательский RSP из `child_stack` и остановка
+/// родителя до его `execve`/выхода; фактическое совместное адресное
+/// пространство vfork (ребёнок исполняется на стеке родителя) здесь заменено
+/// обычным COW-fork:
+///
+///   * это безопасно: ребёнок не может переписать стек родителя, а родитель не
+///     может снять страницы у ребёнка;
+///   * единственное наблюдаемое отличие от Linux — прямой пользователь
+///     `clone(CLONE_VM|CLONE_VFORK)`, пишущий в память до `execve`, не увидит
+///     записей в родителе. `posix_spawn` (единственный реальный потребитель в
+///     этом compat-слое) так не делает: он передаёт результат через pipe, а не
+///     через общую память, и после `execve` адресные пространства всё равно
+///     расходятся.
+///
+/// Родитель ждёт ребёнка в [`crate::task::scheduler::vfork_wait`]; ребёнок
+/// будит его из `execve` (успех) или из reap-пути (выход/убийство), так что
+/// зависания на неудачном exec нет.
+pub fn vfork_linux_process(
+    regs: &crate::arch::x86_64::linux::regs::SavedRegs,
+    child_stack: u64,
+    clear_child_tid: u64,
+    parent_tid: u64,
+    child_tid: u64,
+) -> Result<u64, crate::arch::x86_64::linux::errno::Errno> {
+    let (child, _child_pml4) = fork_linux_process_inner(
+        regs,
+        clear_child_tid,
+        parent_tid,
+        child_tid,
+        Some(child_stack),
+        true,
+    )?;
+    Ok(child)
+}
+
+fn fork_linux_process_inner(
+    regs: &crate::arch::x86_64::linux::regs::SavedRegs,
+    clear_child_tid: u64,
+    parent_tid: u64,
+    child_tid: u64,
+    user_rsp_override: Option<u64>,
+    vfork: bool,
+) -> Result<(u64, u64), crate::arch::x86_64::linux::errno::Errno> {
     use crate::arch::x86_64::linux::errno::Errno;
     crate::arch::cpu::without_interrupts(|| {
         // Проверить выходы TID ДО появления ребёнка, чтобы плохой указатель дал
@@ -892,17 +941,28 @@ pub fn fork_linux_process(
         let parent_top = crate::memory::layout::kernel_stack_for_pid(parent).2;
         gdt::set_kernel_stack(parent_top);
         crate::arch::x86_64::syscall::set_syscall_kernel_stack(parent_top);
-        // Ребёнок возобновляется на return RIP родителя с user RSP родителя из
-        // per-task слота по +120 над фреймом SavedRegs.
-        let user_rsp = unsafe {
-            ((regs as *const crate::arch::x86_64::linux::regs::SavedRegs as *const u64).add(15))
-                .read()
+        // Ребёнок возобновляется на return RIP родителя. Обычный fork берёт
+        // user RSP родителя из per-task слота по +120 над фреймом SavedRegs;
+        // vfork/posix_spawn передаёт собственный `child_stack` (мусловая
+        // `__clone` строит на нём кадр ребёнка).
+        let user_rsp = match user_rsp_override {
+            Some(rsp) => rsp,
+            None => unsafe {
+                ((regs as *const crate::arch::x86_64::linux::regs::SavedRegs as *const u64).add(15))
+                    .read()
+            },
         };
         let krsp = unsafe { build_clone_frame(child_top, regs, regs.rcx, user_rsp) };
         // Зарегистрировать CompatState ребёнка ДО постановки в очередь, чтобы его
         // первый же syscall уже шёл с полной семантикой Linux.
         if !compat::fork_current_compat(child, clear_child_tid) {
             return Err(Errno::EINVAL);
+        }
+        if vfork {
+            // Зарегистрировать ожидание ДО постановки ребёнка в очередь: иначе
+            // он мог бы exec'нуть/выйти раньше, чем родитель начнёт ждать, и
+            // уведомление потерялось бы (вечный yield-цикл).
+            scheduler::vfork_register(child, parent);
         }
         scheduler::spawn(Tcb::new(child, krsp, child_pml4));
         // SAFETY: оба указателя проверены выше, всё ещё внутри окна с
@@ -919,7 +979,8 @@ pub fn fork_linux_process(
             }
         }
         crate::info!(
-            "[linux] fork: parent pid={} pml4=0x{:x} -> child pid={} pml4=0x{:x}",
+            "[linux] {}: parent pid={} pml4=0x{:x} -> child pid={} pml4=0x{:x}",
+            if vfork { "vfork" } else { "fork" },
             parent,
             parent_pml4,
             child,
