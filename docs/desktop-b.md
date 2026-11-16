@@ -31,13 +31,19 @@ ABI ниже проверен host-тестами против `linux/fb.h` и `
 | 0 | `read` | события `/dev/input/event0` |
 | 7 | `poll`, 271 `ppoll`, 270 `pselect6`, 23 `select` | ожидание событий |
 | 3 | `close` | отпустить fd (страницы живут, пока живы отображения) |
-| 56 | `clone` | fork-ребёнок (`SIGCHLD`, glibc `fork()`); `CLONE_VM|CLONE_THREAD` — потоки |
+| 56 | `clone` | fork-ребёнок (`SIGCHLD`, glibc `fork()`); `CLONE_VM|CLONE_THREAD` — потоки; `CLONE_VM|CLONE_VFORK` — `posix_spawn` |
 | 59 | `execve` | запуск клиентов; маппинги старого AS снимаются, fd (без `CLOEXEC`) наследуются |
 | 1 / 0 | `write` / `read` | AF_UNIX (`socketpair`/`connect`) уже есть; контроль ancillary data не несут |
 | 46 / 47 | `sendmsg` / `recvmsg` | AF_UNIX `SCM_RIGHTS`: клиент передаёт композитору memfd (см. §6) |
 
 `fork` (57) и `vfork` (58) **не** поддерживаются как отдельные номера:
-glibc `fork()` идёт через `clone(SIGCHLD)`, и этот путь работает.
+glibc `fork()` идёт через `clone(SIGCHLD)`, и этот путь работает. Форма
+`clone(CLONE_VM|CLONE_VFORK)` (её зовут musl/glibc `posix_spawn`, а за ними
+Rust-std `Command::spawn`) поддержана как COW-fork с явным `child_stack` и
+остановкой родителя до `execve`/выхода ребёнка: совместный стек vfork не
+нужен `posix_spawn` (статус идёт через pipe), а копия безопаснее. Поэтому
+`pagh-desktop --spawn-demo` и кнопки панели Files/Terminal запускают
+дочерний демо-клиент, а не падают с `Function not implemented (os error 38)`.
 
 ---
 

@@ -177,8 +177,12 @@ value }` (24 байта) → EV_KEY/EV_REL/EV_SYN → те же `Compositor::poi
   kernel-format + инъекция статических бинарников через debugfs), запускает
   `rust /mnt/pd --e2e`, проверяет serial/скриншоты: fbdev ioctl+mmap, takeover,
   selfcheck пикселей scanout, F10-меню, REL/BTN_LEFT через QMP, выход и отсутствие
-  перерисовки консоли. Скриншоты: `screenshots/11-fbdev-qemu.png` (desktop на
-  реальном scanout) и `screenshots/12-fbdev-context-menu.png` (меню).
+  перерисовки консоли. Затем тот же сценарий запускает
+  `rust /mnt/pd --spawn-demo` и проверяет дочерний запуск: serial-маркер
+  `pagh-desktop: launch terminal ok`, `pagh-desktop-demo: window ... подключён`,
+  отсутствие `Function not implemented (os error 38)` и живой shell после выхода
+  сервера. Скриншоты: `screenshots/11-fbdev-qemu.png` (desktop на реальном scanout)
+  и `screenshots/12-fbdev-context-menu.png` (меню).
 * `cargo fmt --all -- --check` — чисто.
 * `./build-static.sh`: `x86_64-unknown-linux-musl`, оба бинарника `static-pie`,
   ~585 KiB сервер и ~497 KiB демо-клиент.

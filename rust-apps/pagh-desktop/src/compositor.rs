@@ -1904,6 +1904,28 @@ mod tests {
     }
 
     #[test]
+    fn panel_terminal_and_files_icons_request_launch() {
+        // Панель — один из двух пользовательских входов в `launch` (второй —
+        // контекстное меню); оба обязаны отдавать `HostEvent::Launch(kind)`,
+        // который сервер превращает в `Command::spawn` демо-клиента.
+        for (icon, expected) in [
+            (PanelIcon::Terminal, AppKind::Terminal),
+            (PanelIcon::Files, AppKind::Files),
+            (PanelIcon::Paint, AppKind::Paint),
+        ] {
+            let mut compositor = compositor();
+            let point = panel::icon_rect(compositor.screen(), icon.index()).center();
+            compositor.pointer_motion(point);
+            let events = compositor.pointer_button(MouseButton::Left, true);
+            compositor.pointer_button(MouseButton::Left, false);
+            assert!(
+                events.contains(&HostEvent::Launch(expected)),
+                "{icon:?}: панель должна запросить launch {expected:?}, получено {events:?}"
+            );
+        }
+    }
+
+    #[test]
     fn panel_network_click_opens_and_closes_flyout() {
         let mut compositor = compositor();
         let network = panel::network_rect(compositor.screen()).center();

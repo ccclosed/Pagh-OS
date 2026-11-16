@@ -1065,8 +1065,11 @@ impl Server {
         {
             Ok(child) => {
                 if !self.options.quiet {
+                    // Стабильный English-маркер для e2e (панель/меню Files/
+                    // Terminal идут тем же путём, что и --spawn-demo).
                     eprintln!(
-                        "pagh-desktop: запущен {} (pid {})",
+                        "pagh-desktop: launch {} ok -> {} (pid {})",
+                        app.id(),
                         binary.display(),
                         child.id()
                     );
@@ -1103,7 +1106,7 @@ impl Server {
                 Ok(child) => {
                     if !self.options.quiet {
                         eprintln!(
-                            "pagh-desktop: launch {} -> {} (pid {})",
+                            "pagh-desktop: launch {} ok -> {} (pid {})",
                             app,
                             program.to_string_lossy(),
                             child.id()
