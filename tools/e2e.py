@@ -2840,6 +2840,56 @@ def mode_desktop(h: "Harness") -> tuple[str, int]:
         ok &= h.check("fbdev close reports one-way takeover",
                       "takeover remains armed" in text,
                       regex_first(r"pagh-desktop: fbdev closed[^\r\n]*", text) or "")
+
+        # Child launch: the same `launch()` path the panel Files/Terminal icons
+        # take (`Command::spawn` -> static-musl posix_spawn -> clone
+        # CLONE_VM|CLONE_VFORK). The kernel used to answer that clone with
+        # ENOSYS, so the panel printed "Function not implemented (os error 38)".
+        child_cmd = ("rust /mnt/pd --backend headless --input none "
+                     "--spawn-demo --exit-after-ms 6000")
+        log(f"type: {child_cmd}")
+        kb.text(child_cmd)
+        kb.key("ret")
+        launched = wait_for(guest, [r"pagh-desktop: launch terminal ok"], 30.0,
+                            label="child launch")
+        ok &= h.check("pagh-desktop spawned its child (posix_spawn/vfork)",
+                      launched is not None,
+                      launched or "no 'launch terminal ok' marker")
+        child_win = wait_for(guest, [r"pagh-desktop-demo: window \d+"], 30.0,
+                             label="child demo client")
+        ok &= h.check("spawned demo client connected over PDP/1",
+                      child_win is not None,
+                      child_win or "no child window line")
+        text = guest.serial()
+        enosys = re.search(
+            r"pagh-desktop: launch[^\r\n]*(Function not implemented|os error 38)",
+            text,
+        )
+        ok &= h.check("child launch returned no ENOSYS", enosys is None,
+                      enosys.group(0) if enosys else "none")
+        # The launched client keeps the shell job tree busy only until its
+        # server exits; prove the serial shell survived the child. Match the
+        # *headless* run's own exit marker: "exit-after-ms reached" already
+        # occurred once in the fbdev run above, so a bare pattern would return
+        # before this shell command even starts.
+        exited_child = wait_for(
+            guest,
+            [r"pagh-desktop: backend=headless 1280x720[\s\S]*?"
+             r"pagh-desktop: exit-after-ms reached"],
+            40.0,
+            label="child server exit",
+        )
+        ok &= h.check("child server exited via --exit-after-ms",
+                      exited_child is not None,
+                      "second exit marker" if exited_child else "no second exit marker")
+        kb.text("echo E2E_ALIVE_AFTER_CHILD")
+        kb.key("ret")
+        alive_child = wait_for(guest, [r"E2E_ALIVE_AFTER_CHILD"], 20.0,
+                               label="shell after child launch")
+        ok &= h.check("serial shell alive after child launch", alive_child is not None,
+                      alive_child or "no echo")
+
+        text = guest.serial()
         crashes = re.findall(r"PANIC|\[EXC [^\]]+\]|DOUBLE FREE", text)
         ok &= h.check("no panic/exception in guest", not crashes,
                       crashes[0] if crashes else "none")

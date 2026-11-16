@@ -31,9 +31,13 @@ full-screen TUIs such as `nvim`.
 - The `python`/`python3` shell commands find the installed CPython (any `python3*`
   under `/mnt/usr/bin`, preferring the most specific version) and run it with a proper
   `PYTHONHOME`/`PYTHONPATH` environment (`PYTHON_BASIC_REPL=1`).
-- `fork`/`clone`: `clone` handles both the thread and fork paths; a fork creates a real
-  child with a copied address space (`fork_linux_process`). Threads via
-  `CLONE_VM|CLONE_THREAD` share the address space; glibc `pthread_create` works.
+- `fork`/`clone`: `clone` handles the thread, fork and vfork/`posix_spawn` paths; a fork
+  creates a real child with a copied address space (`fork_linux_process`). Threads via
+  `CLONE_VM|CLONE_THREAD` share the address space (musl's `CLONE_DETACHED` is accepted);
+  glibc/musl `pthread_create` works. `clone(CLONE_VM|CLONE_VFORK)` is implemented as a
+  COW fork with the caller-provided `child_stack` plus a parent wait until the child
+  `execve`s or exits, which is what static-musl Rust-std `Command::spawn` uses; the
+  shared-memory part of vfork is deliberately replaced by the copy (documented deviation).
 - `epoll` (create1/ctl/wait/pwait) and `eventfd2` are implemented over the compat fd
   table, plus unix sockets (`socketpair`/AF_UNIX stream, including `sendmsg`/`recvmsg`
   with `SOL_SOCKET`/`SCM_RIGHTS` fd passing — `docs/desktop-b.md` §6), so libuv event loops run —

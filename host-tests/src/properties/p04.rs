@@ -4,11 +4,12 @@ use crate::abi::{is_supported, nr};
 use proptest::prelude::*;
 
 /// The complete enumerated `Supported_Syscall_Set`.
-const SUPPORTED: [u64; 23] = [
+const SUPPORTED: [u64; 24] = [
     nr::READ,
     nr::WRITE,
     nr::OPEN,
     nr::CLOSE,
+    nr::STAT,
     nr::FSTAT,
     nr::LSEEK,
     nr::MMAP,
@@ -51,6 +52,7 @@ proptest! {
 fn out_of_scope_syscalls_are_unsupported() {
     assert!(is_supported(56), "clone must be supported");
     assert!(is_supported(202), "futex must be supported");
+    assert!(is_supported(4), "stat must be supported (musl std calls it)");
     assert!(!is_supported(57), "fork must be unsupported");
     assert!(!is_supported(58), "vfork must be unsupported");
 

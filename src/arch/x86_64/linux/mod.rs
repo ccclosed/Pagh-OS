@@ -188,6 +188,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::RENAME => io_sys::sys_rename(a[0], a[1]),
         sysno::RENAMEAT => io_sys::sys_renameat(a[0], a[1], a[2], a[3]),
         sysno::RENAMEAT2 => io_sys::sys_renameat2(a[0], a[1], a[2], a[3], a[4]),
+        sysno::STAT => io_sys::sys_stat(a[0], a[1]),
         sysno::FSTAT => io_sys::sys_fstat(a[0], a[1]),
         sysno::NEWFSTATAT => io_sys::sys_newfstatat(a[0], a[1], a[2], a[3]),
         sysno::IOCTL => io_sys::sys_ioctl(a[0], a[1], a[2]),
@@ -278,17 +279,47 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             }
         }
         sysno::SENDTO => {
-            // Маршрутизировать по типу fd. Для подключённого UDP-сокета glibc
-            // передаёт dest_addr=NULL (стиль write); явный адрес побеждает.
-            let is_inet_udp = crate::task::compat::with_current_compat(|cs| {
-                matches!(
-                    cs.fds.get(a[0] as u32),
-                    Some(crate::task::fd::OpenObject::InetUdp(_))
-                )
-            })
-            .unwrap_or(false);
-            if !is_inet_udp {
-                return Err(Errno::EINVAL);
+            // Маршрутизировать по типу fd. Rust-std зовёт `send()` (== `sendto`)
+            // для AF_UNIX и TCP, а не `write()`, поэтому одной UDP-ветки мало:
+            // без неё `UnixStream::write` из дочернего демо-клиента получал
+            // EINVAL. Для подключённого UDP-сокета glibc передаёт
+            // dest_addr=NULL (стиль write); явный адрес побеждает.
+            enum SendTarget {
+                Udp,
+                Tcp,
+                Unix,
+            }
+            let target =
+                crate::task::compat::with_current_compat(|cs| match cs.fds.get(a[0] as u32) {
+                    None => Err(Errno::EBADF),
+                    Some(crate::task::fd::OpenObject::InetUdp(_)) => Ok(SendTarget::Udp),
+                    Some(crate::task::fd::OpenObject::InetTcp(_)) => Ok(SendTarget::Tcp),
+                    Some(crate::task::fd::OpenObject::Socket { .. }) => Ok(SendTarget::Unix),
+                    Some(crate::task::fd::OpenObject::UnixListener(_))
+                    | Some(crate::task::fd::OpenObject::UnixSocketUnbound { .. }) => {
+                        Err(Errno::ENOTCONN)
+                    }
+                    Some(_) => Err(Errno::ENOTSOCK),
+                })
+                .unwrap_or(Err(Errno::EBADF))?;
+            if matches!(target, SendTarget::Unix) {
+                return crate::arch::x86_64::linux::unix_sock::sys_sendto_unix(
+                    a[0], a[1], a[2], a[3], a[4], a[5],
+                );
+            }
+            if matches!(target, SendTarget::Tcp) {
+                const STREAM_SEND_FLAGS: u64 = (crate::arch::x86_64::linux::cmsg::MSG_DONTWAIT
+                    | crate::arch::x86_64::linux::cmsg::MSG_EOR
+                    | crate::arch::x86_64::linux::cmsg::MSG_NOSIGNAL)
+                    as u64;
+                if a[3] & !STREAM_SEND_FLAGS != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let len = crate::arch::x86_64::linux::abi::socket_payload_len(a[2], true)?;
+                check_user_ptr(a[1], len)?;
+                let data = crate::arch::x86_64::linux::io_sys::copy_in_pub(a[1], len);
+                let n = crate::arch::x86_64::linux::inet_sock::tcp_write(a[0], &data)?;
+                return Ok(n as u64);
             }
             // Класс аллокационного переполнения: обход указателя ниже ограничен,
             // но КОПИРОВАНИЕ обязано использовать ту же границу, иначе вызывающий
@@ -306,17 +337,49 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             Ok(n as u64)
         }
         sysno::RECVFROM => {
-            // Маршрутизировать по типу fd: сюда приходят AF_INET UDP-сокеты
-            // (резолвер glibc).
-            let is_inet_udp = crate::task::compat::with_current_compat(|cs| {
-                matches!(
-                    cs.fds.get(a[0] as u32),
-                    Some(crate::task::fd::OpenObject::InetUdp(_))
-                )
-            })
-            .unwrap_or(false);
-            if !is_inet_udp {
-                return Err(Errno::EINVAL);
+            // Маршрутизировать по типу fd: UDP-сокеты резолвера glibc,
+            // TCP/AF_UNIX — `recv()` из Rust-std (== `recvfrom` с NULL-адресом).
+            enum RecvTarget {
+                Udp,
+                Tcp,
+                Unix,
+            }
+            let target =
+                crate::task::compat::with_current_compat(|cs| match cs.fds.get(a[0] as u32) {
+                    None => Err(Errno::EBADF),
+                    Some(crate::task::fd::OpenObject::InetUdp(_)) => Ok(RecvTarget::Udp),
+                    Some(crate::task::fd::OpenObject::InetTcp(_)) => Ok(RecvTarget::Tcp),
+                    Some(crate::task::fd::OpenObject::Socket { .. }) => Ok(RecvTarget::Unix),
+                    Some(crate::task::fd::OpenObject::UnixListener(_))
+                    | Some(crate::task::fd::OpenObject::UnixSocketUnbound { .. }) => {
+                        Err(Errno::ENOTCONN)
+                    }
+                    Some(_) => Err(Errno::ENOTSOCK),
+                })
+                .unwrap_or(Err(Errno::EBADF))?;
+            if matches!(target, RecvTarget::Unix) {
+                return crate::arch::x86_64::linux::unix_sock::sys_recvfrom_unix(
+                    a[0], a[1], a[2], a[3], a[4], a[5],
+                );
+            }
+            if matches!(target, RecvTarget::Tcp) {
+                const STREAM_RECV_FLAGS: u64 =
+                    crate::arch::x86_64::linux::cmsg::MSG_DONTWAIT as u64;
+                if a[3] & !STREAM_RECV_FLAGS != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let cap = crate::arch::x86_64::linux::abi::socket_payload_len(a[2], false)?;
+                check_user_ptr_writable(a[1], cap)?;
+                let mut data = alloc::vec![0u8; cap as usize];
+                let n = crate::arch::x86_64::linux::inet_sock::tcp_read(a[0], &mut data)?;
+                crate::arch::x86_64::linux::io_sys::copy_out_pub(a[1], &data[..n])?;
+                if a[4] != 0 && a[5] != 0 {
+                    check_user_ptr_writable(a[5], 4)?;
+                    // SAFETY: 4-байтный socklen_t проверен выше; подключённый
+                    // stream-сокет адреса отправителя не имеет.
+                    unsafe { core::ptr::write_unaligned(a[5] as *mut u32, 0) };
+                }
+                return Ok(n as u64);
             }
             // Та же ошибка границы аллокации, что в sendto: счётчик — это только
             // ёмкость буфера вызывающего, поэтому ограничиваем его MAX_SOCKET_IO,

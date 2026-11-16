@@ -19,8 +19,8 @@ use super::{check_user_ptr, check_user_ptr_writable};
 use crate::sync::spinlock::Spinlock;
 use crate::task::compat;
 use crate::task::fd::{
-    socket_pair_endpoints, OpenObject, PassedFd, PipeEndpoint, PipeWriteResult, ScmReadResult,
-    UnixListenerState,
+    socket_pair_endpoints, OpenObject, PassedFd, PipeEndpoint, PipeReadResult, PipeWriteResult,
+    ScmReadResult, UnixListenerState,
 };
 
 const AF_UNIX: u64 = 1;
@@ -307,6 +307,8 @@ const SENDMSG_FLAGS: u64 = (cmsg::MSG_DONTWAIT | cmsg::MSG_EOR | cmsg::MSG_NOSIG
 /// Флаги `recvmsg`: разовая неблокирующая операция и close-on-exec для
 /// принятых дескрипторов.
 const RECVMSG_FLAGS: u64 = (cmsg::MSG_DONTWAIT | cmsg::MSG_CMSG_CLOEXEC) as u64;
+/// Флаги `recvfrom` на подключённый stream: только разовая неблокируемость.
+const RECVFROM_FLAGS: u64 = cmsg::MSG_DONTWAIT as u64;
 
 /// `struct msghdr` x86_64 (56 байт), прочитанный из пользовательской памяти.
 struct Msghdr {
@@ -651,6 +653,140 @@ pub fn sys_sendmsg(fd: u64, msg_addr: u64, flags: u64) -> Result<u64, Errno> {
             Ok(written as u64)
         }
     }
+}
+
+/// `sendto` (44) на подключённый AF_UNIX `SOCK_STREAM`.
+///
+/// Rust-std на static-musl реализует `UnixStream::write` через `send(...,
+/// MSG_NOSIGNAL)` — это syscall `sendto`, а не `write`, поэтому без этой ветки
+/// дочерний `pagh-desktop-demo` получал `EINVAL` на первом же `hello` и умирал
+/// с `os error 22` (а сервер — без клиента). Поток-семантика та же, что у
+/// `write`/`sendmsg` на `OpenObject::Socket`: пишем в очередь получателя, при
+/// `WouldBlock` блокируемся, если не `MSG_DONTWAIT`/`O_NONBLOCK`; на закрытом
+/// конце — `EPIPE`.
+///
+/// `dest_addr` подключённого stream-сокета не нужен: NULL/нулевая длина —
+/// норма (так зовут `send`), ненулевой адрес принимается как no-op? Нет:
+/// этот слой поддерживает только подключённые пары, поэтому ненулевой адрес —
+/// `EINVAL` (честный отказ, а не тихое игнорирование).
+pub fn sys_sendto_unix(
+    fd: u64,
+    buf: u64,
+    len: u64,
+    flags: u64,
+    dest_addr: u64,
+    dest_len: u64,
+) -> Result<u64, Errno> {
+    if flags & !SENDMSG_FLAGS != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if dest_addr != 0 && dest_len != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // Предел ровно как у sendmsg: len — длина полезной нагрузки, а не ёмкость.
+    let len = super::abi::socket_payload_len(len, true)?;
+    let tx = compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
+        None => Err(Errno::EBADF),
+        Some(OpenObject::Socket { tx, .. }) => Ok(Arc::clone(tx)),
+        Some(OpenObject::UnixListener(_)) | Some(OpenObject::UnixSocketUnbound { .. }) => {
+            Err(Errno::ENOTCONN)
+        }
+        Some(_) => Err(Errno::ENOTSOCK),
+    })
+    .unwrap_or(Err(Errno::EBADF))?;
+    if len == 0 {
+        return Ok(0);
+    }
+    check_user_ptr(buf, len)?;
+    let data = super::io_sys::copy_in_pub(buf, len);
+    let nonblock = tx.nonblocking() || flags & cmsg::MSG_DONTWAIT as u64 != 0;
+    let mut written = 0usize;
+    loop {
+        match tx.write(&data[written..]) {
+            PipeWriteResult::Data(n) => {
+                written += n;
+                if written == data.len() {
+                    return Ok(written as u64);
+                }
+            }
+            PipeWriteResult::Broken => {
+                return if written == 0 {
+                    Err(Errno::EPIPE)
+                } else {
+                    Ok(written as u64)
+                };
+            }
+            PipeWriteResult::WouldBlock => {
+                if nonblock {
+                    return if written == 0 {
+                        Err(Errno::EAGAIN)
+                    } else {
+                        Ok(written as u64)
+                    };
+                }
+                crate::task::scheduler::yield_current();
+            }
+        }
+    }
+}
+
+/// `recvfrom` (45) на подключённый AF_UNIX `SOCK_STREAM`.
+///
+/// Зеркало [`sys_sendto_unix`]: Rust-std `UnixStream::read` зовёт `recv(...)`,
+/// то есть `recvfrom`. У подключённой stream-пары адреса отправителя нет:
+/// если вызывающий передал непустые `src_addr`/`addr_len`, ядро пишет длину 0
+/// (Linux `recv` сам передаёт NULL, а libuv — NULL/0). `MSG_DONTWAIT`
+/// действует на один вызов, `EPIPE`/`EAGAIN` — как у `read`.
+pub fn sys_recvfrom_unix(
+    fd: u64,
+    buf: u64,
+    len: u64,
+    flags: u64,
+    src_addr: u64,
+    addr_len: u64,
+) -> Result<u64, Errno> {
+    if flags & !RECVFROM_FLAGS != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // Ёмкость буфера вызывающего; ядро вправе урезать её до предела, но не
+    // должно выделять по сырому u64 (та же защита, что в UDP-пути).
+    let cap = super::abi::socket_payload_len(len, false)?;
+    check_user_ptr_writable(buf, cap)?;
+    let rx = compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
+        None => Err(Errno::EBADF),
+        Some(OpenObject::Socket { rx, .. }) => Ok(Arc::clone(rx)),
+        Some(OpenObject::UnixListener(_)) | Some(OpenObject::UnixSocketUnbound { .. }) => {
+            Err(Errno::ENOTCONN)
+        }
+        Some(_) => Err(Errno::ENOTSOCK),
+    })
+    .unwrap_or(Err(Errno::EBADF))?;
+    if cap == 0 {
+        return Ok(0);
+    }
+    let mut data: Vec<u8> = vec![0u8; cap as usize];
+    let nonblock = rx.nonblocking() || flags & cmsg::MSG_DONTWAIT as u64 != 0;
+    let n = loop {
+        match rx.read(&mut data) {
+            PipeReadResult::Data(n) => break n,
+            PipeReadResult::Eof => break 0,
+            PipeReadResult::WouldBlock => {
+                if nonblock {
+                    return Err(Errno::EAGAIN);
+                }
+                crate::task::scheduler::yield_current();
+            }
+        }
+    };
+    super::io_sys::copy_out_pub(buf, &data[..n])?;
+    if src_addr != 0 && addr_len != 0 {
+        // Подключённый stream-сокет не имеет адреса отправителя.
+        check_user_ptr_writable(addr_len, 4)?;
+        // SAFETY: addr_len — 4-байтный socklen_t, проверен выше; запись
+        // допускает невыровненность.
+        unsafe { core::ptr::write_unaligned(addr_len as *mut u32, 0) };
+    }
+    Ok(n as u64)
 }
 
 /// `recvmsg` (47): данные и `SCM_RIGHTS` из AF_UNIX SOCK_STREAM.

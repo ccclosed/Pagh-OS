@@ -1684,6 +1684,25 @@ fn write_stat_struct(stat: &LinuxStat, statbuf: u64) -> Result<(), Errno> {
     copy_out(statbuf, bytes)
 }
 
+/// `stat` (4): статус файла по пути в пользовательский `struct stat`.
+///
+/// Старый (до `newfstatat`) номер x86_64, который всё ещё зовут статические
+/// musl-бинари: Rust-std `Command::spawn`/`Path::exists` внутри
+/// `pagh-desktop` упирались в него и получали `ENOSYS`, из-за чего запуск
+/// дочернего процесса (`--spawn-demo`, панель Files/Terminal) падал с
+/// `Function not implemented (os error 38)`.
+///
+/// Семантика — как у Linux `stat`: конечная символическая ссылка
+/// разыменовывается (в отличие от `lstat`, то есть `newfstatat` с
+/// `AT_SYMLINK_NOFOLLOW`), относительный путь разрешается от cwd, а разметка
+/// результата — тот же 144-байтный [`LinuxStat`], что у `fstat`/`newfstatat`
+/// (x86_64 `struct stat`). Поэтому обработчик — тонкая обёртка над проверенной
+/// обвязкой `newfstatat`: одна реализация поиска в VFS, одна проверка буфера
+/// (`EFAULT` до записи) и один набор `ENOENT`/`ENOTDIR`/`ELOOP`.
+pub fn sys_stat(path: u64, statbuf: u64) -> Result<u64, Errno> {
+    sys_newfstatat(AT_FDCWD, path, statbuf, 0)
+}
+
 /// `fstat` (5): заполнить пользовательский `struct stat` для открытого
 /// дескриптора (R2.8). `EBADF` для отсутствующего fd (R2.14). Консоль/stdin
 /// сообщают символьное устройство.

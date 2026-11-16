@@ -279,6 +279,69 @@ struct ExitReap {
 /// выключенными прерываниями.
 static PENDING_REAPS: Spinlock<BTreeMap<u64, ExitReap>> = Spinlock::new(BTreeMap::new());
 
+/// Ожидание `clone(CLONE_VM|CLONE_VFORK)` (vfork / `posix_spawn`).
+///
+/// Родитель не должен вернуться в userspace, пока ребёнок не `execve`-нётся
+/// или не завершится: `posix_spawn` кладёт ошибку exec в pipe, а разделяемый
+/// (в Linux) стек/аргументы остаются валидными только до этого момента. Здесь
+/// вместо опасного совместного адресного пространства используется COW-fork
+/// (см. `process::vfork_linux_process`), поэтому родитель физически не может
+/// испортить память ребёнка, но обязан дождаться события как в Linux.
+///
+/// Одна карта `child -> (parent, done)` под одним локом: уведомление и
+/// ожидание не могут разминуться (отдельные `waiters`/`done` множества дали бы
+/// lost-wakeup окно). `yield_current()` в ожидании — тот же кооперативный
+/// приём, что у futex/pipe-циклов; watchdog syscall'ов двигается каждым yield.
+struct VforkWait {
+    parent: u64,
+    done: bool,
+}
+
+static VFORK_WAITS: Spinlock<BTreeMap<u64, VforkWait>> = Spinlock::new(BTreeMap::new());
+
+/// Зарегистрировать ожидание родителя за vfork-ребёнка (до `spawn`).
+pub fn vfork_register(child: u64, parent: u64) {
+    VFORK_WAITS.lock().insert(
+        child,
+        VforkWait {
+            parent,
+            done: false,
+        },
+    );
+}
+
+/// vfork-ребёнок сделал `execve` или снят с ротации: разбудить родителя.
+///
+/// Идемпотентно и дёшево для обычных (не-vfork) задач: карта пуста, лок
+/// берётся один раз на событие.
+pub fn vfork_child_done(child: u64) {
+    if let Some(entry) = VFORK_WAITS.lock().get_mut(&child) {
+        entry.done = true;
+        crate::debug!("[SCHED] vfork child {} woke parent {}", child, entry.parent);
+    }
+}
+
+/// Дождаться, пока vfork-ребёнок `execve`-нётся или завершится, и снять запись.
+/// Вызывается родителем из `clone`, поэтому блокировка кооперативная.
+pub fn vfork_wait(child: u64) {
+    loop {
+        {
+            let mut waits = VFORK_WAITS.lock();
+            match waits.get_mut(&child) {
+                Some(entry) if entry.done => {
+                    waits.remove(&child);
+                    return;
+                }
+                // Нет записи — значит ребёнок уже уведомил и запись сняли
+                // (защита от зависания при будущих переделках регистрации).
+                None => return,
+                Some(_) => {}
+            }
+        }
+        yield_current();
+    }
+}
+
 /// Поставить память снятой задачи в очередь на возврат и отпустить её штамп
 /// реестра фреймов (её сохранённый фрейм больше не восстановится). Вызывается из
 /// тика, снимающего задачу.
@@ -297,6 +360,9 @@ fn pend_reap(pid: u64) {
 /// собственный пользовательский PML4 припаркованной задачи утёк бы. Штамп фрейма
 /// снимается здесь по той же причине, что и в [`pend_reap`].
 fn pend_reap_with(pid: u64, cr3: u64) {
+    // vfork-родитель ждёт `execve`/выход ребёнка; выход в любом виде
+    // (нормальный, сигнал, убийство припаркованной задачи) проходит здесь же.
+    vfork_child_done(pid);
     PENDING_REAPS.lock().insert(pid, ExitReap { cr3 });
     FRAME_LEDGER.lock().remove(&pid);
     // Задача вне ротации: удалить и её отображаемое имя, иначе `ps` продолжал бы
