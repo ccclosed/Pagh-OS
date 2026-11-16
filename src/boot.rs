@@ -89,6 +89,13 @@ pub fn start() -> ! {
     step_begin(visible, "init_serial");
     init_serial();
     step(visible, "serial");
+    // PAT программируется сразу после serial: это ещё до PMM/VMM и до любого
+    // отображения `/dev/fb0`, поэтому WC-лист не может сослаться на entry 4,
+    // пока там write-back. Лог fallback'а (`fb0: PAT missing, uncached`) тоже
+    // попадает в serial.
+    step_begin(visible, "init_pat");
+    init_pat();
+    step(visible, "pat");
     step_begin(visible, "check_base_revision");
     check_base_revision();
     step(visible, "base revision");
@@ -153,6 +160,16 @@ pub fn start() -> ! {
 fn init_serial() {
     drivers::serial::init();
     info!("serial");
+}
+
+/// Шаг 1.5: включить write-combining в `IA32_PAT` (MSR 0x277).
+///
+/// До первого `mmap(/dev/fb0)`: лист выбирает кэш-политику битом PAT (bit 7
+/// 4 КиБ PTE) и записью 4 `IA32_PAT`. Если PAT нет, фиксируется fallback —
+/// `mmap` останется на прежней паре `NO_CACHE|WRITE_THROUGH` и залогирует это
+/// один раз (`arch::x86_64::pat::init`).
+fn init_pat() {
+    arch::x86_64::pat::init();
 }
 
 /// Шаг 2: проверить, что Limine дал поддерживаемую базовую ревизию.

@@ -859,6 +859,11 @@ pub(crate) const SHARED_BIT: PageTableFlags = PageTableFlags::BIT_11;
 /// программные биты уже заняты `COW_BIT`/`RO_BIT`/`SHARED_BIT`.
 pub(crate) const MMIO_BIT: PageTableFlags = PageTableFlags::BIT_52;
 
+// Маркер MMIO обязан совпадать с чистым `pat::PTE_MMIO`: иначе host-тест
+// композиции fb0-флагов доказывал бы не тот бит, а `release_user_leaf`
+// проверял бы не тот маркер.
+const _: () = assert!(MMIO_BIT.bits() == crate::memory::pat::PTE_MMIO);
+
 /// Программный бит PTE (свободный бит 53), помечающий лист read-only
 /// shared-поверхности ядра (`/dev/vtconsole0`): кадр запинен поверхностью,
 /// отображение пользователя не должно становиться записываемым через

@@ -7491,7 +7491,7 @@ mod desktop_b_tests {
     };
     use crate::drivers::{evdev, ps2_kbd, usb_hid, vt_abi, vtsurface};
     use crate::memory::layout::USER_MMAP_BASE;
-    use crate::memory::{pmm, vmm};
+    use crate::memory::{pat, pmm, vmm};
     use crate::sync::spinlock::Spinlock;
     use crate::task::compat::{self, CompatState};
     use crate::task::fd::FdTable;
@@ -7808,6 +7808,150 @@ mod desktop_b_tests {
             };
             assert_kernel!(base != 0, "fb0: mmap returned an address");
 
+            // A2: лист fb0 обязан быть write-combined (PAT entry 4), если
+            // boot запрограммировал IA32_PAT; без PAT — точная прежняя
+            // некешируемая пара. Проверяем сам листовой PTE, а не только
+            // наблюдаемый пиксель: QEMU не моделирует кэш, поэтому потеря
+            // атрибута иначе осталась бы незамеченной.
+            let wc = pat::wc_supported();
+            let cache_mask = pat::PTE_PAT | pat::PTE_NO_CACHE | pat::PTE_WRITE_THROUGH;
+            let leaf_bits = vmm::walk_pte(base)
+                .expect("fb0: leaf PTE")
+                .flags()
+                .bits();
+            assert_kernel!(
+                leaf_bits & pat::PTE_MMIO != 0,
+                "fb0: leaf keeps the MMIO ownership marker"
+            );
+            assert_eq_kernel!(
+                leaf_bits & (pat::PTE_PRESENT | pat::PTE_WRITABLE | pat::PTE_USER),
+                pat::PTE_PRESENT | pat::PTE_WRITABLE | pat::PTE_USER,
+                "fb0: leaf is PRESENT|WRITABLE|USER"
+            );
+            assert_kernel!(
+                leaf_bits & pat::PTE_NX != 0,
+                "fb0: leaf is NX (scanout is not code)"
+            );
+            if wc {
+                assert_kernel!(
+                    leaf_bits & pat::PTE_PAT != 0,
+                    "fb0: leaf selects PAT entry 4 (write-combining)"
+                );
+                assert_eq_kernel!(
+                    leaf_bits & (pat::PTE_NO_CACHE | pat::PTE_WRITE_THROUGH),
+                    0,
+                    "fb0: WC leaf has no NO_CACHE/WRITE_THROUGH"
+                );
+            } else {
+                assert_kernel!(
+                    leaf_bits & pat::PTE_PAT == 0,
+                    "fb0: fallback leaf does not depend on PAT"
+                );
+                assert_eq_kernel!(
+                    leaf_bits & (pat::PTE_NO_CACHE | pat::PTE_WRITE_THROUGH),
+                    pat::PTE_NO_CACHE | pat::PTE_WRITE_THROUGH,
+                    "fb0: fallback keeps NO_CACHE|WRITE_THROUGH"
+                );
+            }
+            crate::kprintln!(
+                "[selftest] fb0: leaf flags 0x{:016x} cache={}",
+                leaf_bits,
+                if wc { "wc" } else { "uncached" }
+            );
+
+            // mprotect меняет права, но не тип памяти: WC/MMIO обязаны
+            // пережить RW → RO → RW. Регрессия: безусловный
+            // NO_CACHE|WRITE_THROUGH в mprotect молча отменял WC.
+            assert_eq_kernel!(
+                mem_sys::sys_mprotect(base, map_len, (PROT_READ | PROT_WRITE) as u64),
+                Ok(0),
+                "fb0: mprotect(RW) succeeds"
+            );
+            let rw = vmm::walk_pte(base)
+                .expect("fb0: leaf after mprotect(RW)")
+                .flags();
+            assert_eq_kernel!(
+                rw.bits() & cache_mask,
+                leaf_bits & cache_mask,
+                "fb0: mprotect(RW) preserves the cache policy"
+            );
+            assert_kernel!(
+                rw.contains(vmm::MMIO_BIT),
+                "fb0: mprotect(RW) preserves MMIO_BIT"
+            );
+            assert_eq_kernel!(
+                mem_sys::sys_mprotect(base, map_len, PROT_READ as u64),
+                Ok(0),
+                "fb0: mprotect(RO) succeeds"
+            );
+            let ro = vmm::walk_pte(base)
+                .expect("fb0: leaf after mprotect(RO)")
+                .flags();
+            assert_kernel!(
+                !ro.contains(PageTableFlags::WRITABLE),
+                "fb0: mprotect(RO) removes WRITABLE"
+            );
+            assert_eq_kernel!(
+                ro.bits() & cache_mask,
+                leaf_bits & cache_mask,
+                "fb0: mprotect(RO) preserves the cache policy"
+            );
+            assert_kernel!(
+                ro.contains(vmm::MMIO_BIT),
+                "fb0: mprotect(RO) preserves MMIO_BIT"
+            );
+            assert_eq_kernel!(
+                mem_sys::sys_mprotect(base, map_len, (PROT_READ | PROT_WRITE) as u64),
+                Ok(0),
+                "fb0: mprotect(RW) restores write access"
+            );
+
+            // fork копирует PTE как есть: ребёнок получает ту же WC/MMIO
+            // трансляцию на тот же физический scanout, без COW и без второго
+            // «владельца» кадра устройства (PMM его не знает).
+            let parent = vmm::current_pml4_phys();
+            let child = vmm::new_user_pml4().expect("fb0: child PML4");
+            vmm::fork_user_space_cow(parent, child).expect("fb0: fork_user_space_cow");
+            // SAFETY: child полностью построен; переключаем CR3 на него и
+            // возвращаемся на parent до сноса.
+            unsafe {
+                vmm::load_cr3(child);
+            }
+            let child_bits = vmm::walk_pte(base)
+                .expect("fb0: child leaf")
+                .flags()
+                .bits();
+            let child_phys = vmm::virt_to_phys_in(child, base);
+            // SAFETY: возврат на parent AS.
+            unsafe {
+                vmm::load_cr3(parent);
+            }
+            assert_eq_kernel!(
+                child_bits & cache_mask,
+                leaf_bits & cache_mask,
+                "fb0: fork preserves the cache policy"
+            );
+            assert_kernel!(
+                child_bits & pat::PTE_MMIO != 0,
+                "fb0: fork preserves MMIO_BIT"
+            );
+            assert_eq_kernel!(
+                child_bits & vmm::COW_BIT.bits(),
+                0,
+                "fb0: fork does not make the scanout COW"
+            );
+            assert_eq_kernel!(
+                child_phys,
+                Some(info.phys),
+                "fb0: child maps the same physical scanout"
+            );
+            // SAFETY: ребёнок не активен (CR3=parent), снос идёт через HHDM.
+            vmm::drop_user_space(child);
+            assert_kernel!(
+                vmm::virt_to_phys(base).is_some(),
+                "fb0: child teardown leaves the parent mapping alive"
+            );
+
             // Пиксель в правом нижнем углу: он не занят текстовой сеткой, но
             // сохраняется/восстанавливается независимо от этого.
             let off = ((info.height as u64 - 2) * info.pitch as u64 + (info.width as u64 - 2) * 4)
@@ -7851,6 +7995,101 @@ mod desktop_b_tests {
             // SAFETY: как выше.
             let seen2 = unsafe { core::ptr::read_unaligned((base2 + off as u64) as *const u32) };
             assert_eq_kernel!(seen2, MAGIC, "fb0: second mmap aliases the same scanout");
+
+            // A3: 4 MiB класс fill/copy через WC-отображение + scanout.
+            // QEMU не моделирует кэш CPU, поэтому тики здесь — наблюдаемое
+            // значение (real-hardware evidence), а проверяется корректность:
+            // запись доходит до физического scanout, а sfence сбрасывает
+            // WC-буферы перед чтением через HHDM-алиас.
+            const TIMED_BYTES: usize = 4 << 20;
+            let span = info.smem_len as usize & !3;
+            assert_kernel!(span >= 4096, "fb0: scanout span is at least one page");
+
+            let fill_t0 = scheduler::ticks();
+            let mut written = 0usize;
+            while written < TIMED_BYTES {
+                // Проход пишет не больше целого scanout, поэтому 1280×800×4
+                // (3.9 MiB) не переполняется: остаток 4 MiB дописывается
+                // вторым проходом с начала кадра.
+                let n = core::cmp::min(span, TIMED_BYTES - written);
+                // SAFETY: base..base+span — writable-отображение scanout,
+                // n <= span, запись не выходит за smem_len.
+                unsafe {
+                    core::ptr::write_bytes(base as *mut u8, 0xA5, n);
+                }
+                written += n;
+            }
+            // SAFETY: sfence — архитектурный барьер WC-буферов.
+            unsafe {
+                core::arch::x86_64::_mm_sfence();
+            }
+            let fill_ticks = scheduler::ticks().wrapping_sub(fill_t0);
+
+            static COPY_SRC: [u8; 64 * 1024] = [0x5A; 64 * 1024];
+            let copy_t0 = scheduler::ticks();
+            let mut copied = 0usize;
+            while copied < TIMED_BYTES {
+                let n = core::cmp::min(
+                    core::cmp::min(COPY_SRC.len(), TIMED_BYTES - copied),
+                    span,
+                );
+                // SAFETY: COPY_SRC — статический буфер, приёмник — fb-маппинг;
+                // n <= span, области не пересекаются.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(COPY_SRC.as_ptr(), base as *mut u8, n);
+                }
+                copied += n;
+            }
+            // SAFETY: как выше.
+            unsafe {
+                core::arch::x86_64::_mm_sfence();
+            }
+            let copy_ticks = scheduler::ticks().wrapping_sub(copy_t0);
+
+            // Scanout correctness: три точки в разных страницах кадра,
+            // прочитанные и через отображение, и через физический алиас.
+            let probes = [0usize, (span / 2) & !3, span - 4];
+            for (i, &probe) in probes.iter().enumerate() {
+                let value = 0xC0DE_0000u32 | i as u32;
+                // SAFETY: probe + 4 <= span, отображение writable.
+                unsafe {
+                    core::ptr::write_unaligned((base + probe as u64) as *mut u32, value);
+                }
+            }
+            // SAFETY: барьер перед чтением scanout.
+            unsafe {
+                core::arch::x86_64::_mm_sfence();
+            }
+            for (i, &probe) in probes.iter().enumerate() {
+                let value = 0xC0DE_0000u32 | i as u32;
+                // SAFETY: отображение и HHDM-алиас валидны для probe+4.
+                let via_map =
+                    unsafe { core::ptr::read_unaligned((base + probe as u64) as *const u32) };
+                let via_scanout = unsafe {
+                    core::ptr::read_volatile(
+                        vmm::phys_to_virt(info.phys + probe as u64) as *const u32
+                    )
+                };
+                assert_eq_kernel!(
+                    via_map,
+                    value,
+                    "fb0: WC write readable through the mapping"
+                );
+                assert_eq_kernel!(
+                    via_scanout,
+                    value,
+                    "fb0: WC write reached the physical scanout"
+                );
+            }
+            crate::kprintln!(
+                "[selftest] fb0: {} B fill in {} tick(s), {} B copy in {} tick(s), span {} B, cache={}",
+                TIMED_BYTES,
+                fill_ticks,
+                TIMED_BYTES,
+                copy_ticks,
+                span,
+                if wc { "wc" } else { "uncached" }
+            );
 
             // Восстановить пиксель и снять отображения.
             // SAFETY: оба отображения живут до munmap ниже.

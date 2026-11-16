@@ -42,7 +42,9 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
 Точный порядок:
 1. `enable_sse()` — первым (Limine отдаёт управление с CR4.OSFXSR=0, а прологи
    `x86-interrupt` эмитят `movaps` — иначе `#UD`-хендлер рекурсирует в triple fault).
-2. `serial::init` (COM1).
+2. `serial::init` (COM1); `pat::init` — `IA32_PAT` entry 4/5 = WC, чтобы
+   `/dev/fb0` можно было отобразить write-combined (до первого fb0 mmap;
+   без PAT — fallback `NO_CACHE|WRITE_THROUGH` и лог `fb0: PAT missing, uncached`).
 3. Проверка Limine base revision; чтение HHDM/KERNEL_ADDR ответов.
 4. `gdt::init` + `idt::init`.
 5. `syscall::init` (после GDT — STAR читает селекторы).

@@ -171,6 +171,14 @@ pub mod mem;
 #[path = "../../src/memory/cow.rs"]
 pub mod cow;
 
+// `pat` is the pure PAT/write-combining policy behind `/dev/fb0` (desktop-render
+// §2 A1/A2): the `IA32_PAT` entry-4 encoding, CPUID PAT detection, the fb0 PTE
+// flag composition (PAT entry 4, no NO_CACHE/WRITE_THROUGH) and the exact
+// uncached fallback. `core`-only, so the same source the kernel compiles is
+// property-tested here (`pat_wc_flags`) and unit-tested inline.
+#[path = "../../src/memory/pat.rs"]
+pub mod pat;
+
 // `dirent` is the pure `getdents64` record packer (Feature: linux-binary-compat).
 // `core` + `alloc` only and self-contained, so the standalone `#[path]` include
 // resolves with no extra wiring (P32).
@@ -683,6 +691,12 @@ mod properties {
     // frame is freed exactly once and only when no PTE maps it anymore;
     // descriptive name, same policy as `page_fault`/`irq_frame`.
     mod cow_ownership;
+
+    // `/dev/fb0` write-combining policy (desktop-render §2 A1/A2): random
+    // `IA32_PAT` values prove entries 4/5 are set to WC while every other entry
+    // survives, and random PTE bit patterns prove the fb0 leaf selects PAT entry
+    // 4 (never NO_CACHE/WRITE_THROUGH) or keeps the exact uncached fallback.
+    mod pat_wc_flags;
 
     // AF_UNIX SCM_RIGHTS fd passing (desktop B): `sendmsg` control-buffer
     // decoding (`__scm_send`), Linux-observed `recvmsg` delivery/truncation
