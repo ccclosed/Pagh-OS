@@ -127,3 +127,50 @@ fn plan_rights_matches_linux_probe_vectors() {
         assert_eq!(plan.cmsg_len, if deliver == 0 { 0 } else { 16 + 4 * deliver });
     }
 }
+/// The `SHM_OFFER` handshake, both halves, in the exact buffer shape the
+/// `pagh-ui` client uses (`rust-apps/pagh-ui/src/shm.rs`):
+///
+/// * send: `msghdr.msg_iov` = one 40-byte `SHM_OFFER` frame,
+///   `msghdr.msg_control` = 24 bytes (`CMSG_SPACE(4)`), `msg_controllen = 24`,
+///   one `SCM_RIGHTS` cmsg of `CMSG_LEN(4) = 20` bytes carrying one memfd;
+/// * receive: the compositor offers a 24-byte control buffer, so
+///   `plan_rights(1, 24)` must deliver the fd exactly once and write the
+///   `msg_controllen` Linux reports back (`CMSG_SPACE(4)`).
+///
+/// This pins the layout that the kernel's `read_msghdr`/`decode_send_control`
+/// and the client's `repr(C)` `MsgHdr` must agree on. It is a pure test: the
+/// effectful fd-table half (dup, `MSG_CMSG_CLOEXEC`, truncation) is covered by
+/// the in-QEMU `desktop-b::*SCM_RIGHTS*` routines.
+#[test]
+fn shm_offer_handshake_round_trips_one_fd() {
+    const CONTROL: usize = 24; // CMSG_SPACE(sizeof(int))
+    let memfd = 5; // any int the sender's table holds
+
+    // Send side: the client fills only `cmsg_len` bytes, the 4 bytes of
+    // CMSG_ALIGN padding stay zero (the kernel ignores them).
+    let mut control = [0u8; CONTROL];
+    let written = cmsg::encode_rights(&mut control, &[memfd]);
+    assert_eq!(written, Some(cmsg::cmsg_len(4)));
+    assert_eq!(written, Some(20));
+
+    // `msg_controllen` is the CAPACITY the client passes, not `cmsg_len`;
+    // the kernel must still find exactly one fd and ignore the padding.
+    assert_eq!(cmsg::decode_send_control(&control), Ok(vec![memfd]));
+
+    // Receive side: 24 bytes of capacity, one fd -> full delivery, and the
+    // `msg_controllen` written back equals `CMSG_SPACE(4)` (24).
+    let plan = cmsg::plan_rights(1, CONTROL);
+    assert_eq!((plan.deliver, plan.cmsg_len, plan.used, plan.truncated),
+               (1, 20, 24, false));
+
+    // A buffer of exactly `cmsg_len` (no padding) is also a legal receive
+    // buffer, as on Linux.
+    let tight = cmsg::plan_rights(1, plan.cmsg_len);
+    assert_eq!((tight.deliver, tight.used, tight.truncated), (1, 20, false));
+
+    // Mirrored delivery: the compositor encodes `plan.deliver` fds into a
+    // buffer of `plan.used` bytes; the client's cmsg(3) loop must see one fd.
+    let mut delivered = [0u8; CONTROL];
+    assert_eq!(cmsg::encode_rights(&mut delivered, &[9]), Some(20));
+    assert_eq!(cmsg::decode_send_control(&delivered[..plan.used]), Ok(vec![9]));
+}
