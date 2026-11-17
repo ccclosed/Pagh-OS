@@ -683,8 +683,11 @@ pub fn sys_sendto_unix(
     if dest_addr != 0 && dest_len != 0 {
         return Err(Errno::EINVAL);
     }
-    // Предел ровно как у sendmsg: len — длина полезной нагрузки, а не ёмкость.
-    let len = super::abi::socket_payload_len(len, true)?;
+    // Поток байтов не имеет границ записи: длиннее [MAX_SOCKET_IO] — это не
+    // ошибка, а короткая запись (Linux копирует сколько помещается и возвращает
+    // счётчик; `write_all` вызывающего доносит остаток). Тот же предел остаётся
+    // границей одной аллокации/копии.
+    let len = super::abi::stream_send_len(len);
     let tx = compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
         None => Err(Errno::EBADF),
         Some(OpenObject::Socket { tx, .. }) => Ok(Arc::clone(tx)),
