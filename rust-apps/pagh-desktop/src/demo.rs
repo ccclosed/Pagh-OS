@@ -30,122 +30,60 @@ impl Default for DemoState {
     }
 }
 
-const TERM_BG: Color = color::rgb(10, 16, 20);
-const TERM_PANEL: Color = color::rgb(17, 27, 33);
-const TERM_TEXT: Color = color::rgb(216, 231, 236);
-const TERM_DIM: Color = color::rgb(116, 137, 147);
-const TERM_ACCENT: Color = color::rgb(50, 179, 163);
-const TERM_GREEN: Color = color::rgb(124, 202, 154);
-const TERM_YELLOW: Color = color::rgb(222, 192, 120);
-
 fn text_width(text: &str) -> i32 {
     text.chars().count() as i32 * 8
 }
 
-/// Терминальное окно: шапка, строки сессии и панель ввода.
-pub fn terminal_surface(width: u32, height: u32, state: &DemoState) -> Surface {
+/// Терминальное окно: только сетка текста на тёмном фоне.
+///
+/// Визуальный референс — KDE Konsole (Breeze dark): почти чёрный контент
+/// `#232627`, светлый моноширинный текст `#eff0f1`, блочный курсор, никакой
+/// шапки, кнопок, градиентов, панелей ввода и статус-строки.  Заголовок,
+/// кнопки окна и панель задач принадлежат композитору (см.
+/// `rust-apps/pagh-desktop/PROTOCOL.md`), поэтому клиентская поверхность их
+/// не дублирует.  Вкладок нет: терминал зеркалит один kernel-VT
+/// (`/dev/vtconsole0`), то есть одну сессию.
+pub fn terminal_surface(width: u32, height: u32, _state: &DemoState) -> Surface {
+    const TERM_BG: Color = color::rgb(35, 38, 39);
+    const TERM_TEXT: Color = color::rgb(239, 240, 241);
+    const TERM_DIM: Color = color::rgb(127, 140, 141);
+
     let mut canvas = Canvas::new(width, height, TERM_BG);
-    let w = width as i32;
     let h = height as i32;
-
-    canvas.fill_gradient(Rect::new(0, 0, w, 46), color::rgb(22, 42, 45), TERM_BG);
-    canvas.fill_rect(Rect::new(0, 46, w, 1), color::rgb(41, 68, 72));
-
-    // Метка приложения.
-    canvas.fill_rounded_rect(Rect::new(14, 12, 118, 22), 6, TERM_ACCENT, 230);
-    canvas.text(24, 15, 1, color::rgb(7, 24, 22), "PAGH DESKTOP");
-    canvas.text(146, 15, 1, TERM_TEXT, "pagh-desktop 0.1.0");
-    // Кнопка RUN в шапке.
-    let button = Rect::new(w - 96, 11, 72, 24);
-    let right = "utf-8";
-    canvas.text(button.x - 16 - text_width(right), 15, 1, TERM_DIM, right);
-    let inside = state
-        .mouse
-        .map(|mouse| button.contains(mouse))
-        .unwrap_or(false);
-    let button_color = if state.clicked {
-        TERM_GREEN
-    } else if inside {
-        color::rgb(70, 140, 132)
-    } else {
-        TERM_PANEL
-    };
-    canvas.fill_rounded_rect(button, 7, button_color, 255);
-    canvas.stroke_rounded_rect(button, 7, TERM_ACCENT, 255);
-    let label = if state.clicked { "OK" } else { "RUN" };
-    canvas.text(
-        button.center().x - text_width(label) / 2,
-        button.center().y - 8,
-        1,
-        TERM_TEXT,
-        label,
-    );
-
-    // Строки сессии.
+    // Отступ — 4 px, как поля консольной сетки; всё остальное — рабочий текст.
+    let x = 4;
+    let line_h = 16;
     let lines: [(&str, Color); 9] = [
-        ("pagh 2.23.0 | userspace compositor", TERM_ACCENT),
+        ("pagh 2.24.0 | userspace compositor", TERM_DIM),
         ("", TERM_TEXT),
         ("pagh:/mnt$ uname -a", TERM_TEXT),
-        ("Pagh-OS 2.23.0 x86_64", TERM_GREEN),
+        ("Pagh-OS 2.24.0 x86_64", TERM_TEXT),
         ("pagh:/mnt$ pagh-desktop --headless", TERM_TEXT),
         ("PDP/1: hello -> welcome (1280x720)", TERM_DIM),
         ("pagh:/mnt$ ./demo-client --app terminal", TERM_TEXT),
         ("commit 640x400 xrgb8888 -> frame delivered", TERM_DIM),
-        ("pagh:/mnt$ ", TERM_TEXT),
+        ("", TERM_TEXT),
     ];
-    let mut y = 62;
+    let mut y = 4;
     for (line, line_color) in lines {
-        if y + 16 > h - 96 {
+        if y + line_h > h {
             break;
         }
-        canvas.text(16, y, 1, line_color, line);
-        y += 20;
+        if !line.is_empty() {
+            canvas.text(x, y, 1, line_color, line);
+        }
+        y += line_h;
     }
-    // Курсор в конце последней строки-приглашения (только один).
+    // Приглашение и единственный блочный курсор — как в терминале, а не
+    // «жирная кнопка»: подсветка 8x16 сразу после пробела.
     let prompt = "pagh:/mnt$ ";
-    canvas.fill_rect(
-        Rect::new(16 + text_width(prompt), y - 20, 8, 16),
-        TERM_ACCENT,
-    );
-
-    // Панель ввода.
-    let input_top = h - 88;
-    canvas.fill_rect(Rect::new(0, input_top, w, 88), TERM_PANEL);
-    canvas.fill_rect(Rect::new(0, input_top, w, 1), color::rgb(38, 60, 65));
-    canvas.text(16, input_top + 10, 1, TERM_DIM, "INPUT");
-    let input = format!("{}   scroll={}", state.last_input, state.scroll);
-    canvas.text(16, input_top + 28, 1, TERM_TEXT, &input);
-    let hint = "move/click inside the window; titlebar drag/resize is compositor-side";
-    canvas.text(16, input_top + 52, 1, TERM_DIM, hint);
-
-    // Кроссхэйр указателя, если он внутри поверхности.
-    if let Some(mouse) = state.mouse {
-        let inside = mouse.x >= 0 && mouse.y >= 0 && mouse.x < w && mouse.y < h;
-        if inside {
-            canvas.circle_outline(mouse, 6, TERM_YELLOW, 1);
-            canvas.fill_circle(mouse, 1, TERM_YELLOW, 255);
-        }
+    if y + line_h <= h {
+        canvas.text(x, y, 1, TERM_TEXT, prompt);
+        canvas.fill_rect(
+            Rect::new(x + text_width(prompt), y, 8, line_h),
+            TERM_TEXT,
+        );
     }
-
-    // Нижний статус-бар.
-    canvas.fill_rect(Rect::new(0, h - 22, w, 22), color::rgb(7, 12, 15));
-    let status = format!(
-        "UTF-8 | 80x24 | {} | {}",
-        if state.focused {
-            "focused"
-        } else {
-            "unfocused"
-        },
-        if state.clicked {
-            "button: down"
-        } else {
-            "button: up"
-        }
-    );
-    canvas.text(16, h - 19, 1, TERM_DIM, &status);
-    let clock = "23:38";
-    canvas.text(w - 16 - text_width(clock), h - 19, 1, TERM_TEXT, clock);
-
     Surface::from_canvas(&canvas, PixelFormat::Xrgb8888)
 }
 

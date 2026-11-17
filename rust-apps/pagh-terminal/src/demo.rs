@@ -50,7 +50,7 @@ impl DemoShell {
     }
 
     pub fn prompt(&mut self) {
-        self.write_str("\x1b[1;36mpagh@pagh\x1b[0m:\x1b[1;34m~\x1b[0m$ ");
+        self.write_str("\x1b[1;32mpagh@pagh\x1b[0m:\x1b[1;34m~\x1b[0m$ ");
     }
 
     /// Echo a command, execute it and print a new prompt.
@@ -256,12 +256,12 @@ impl DemoShell {
 
     fn neofetch(&mut self) {
         let art = [
-            "\x1b[1;36m   ██████╗  █████╗  ██████╗ ██╗  ██╗\x1b[0m",
-            "\x1b[1;36m   ██╔══██╗██╔══██╗██╔════╝ ██║  ██║\x1b[0m",
-            "\x1b[1;36m   ██████╔╝███████║██║  ███╗███████║\x1b[0m",
-            "\x1b[1;36m   ██╔═══╝ ██╔══██║██║   ██║██╔══██║\x1b[0m",
-            "\x1b[1;36m   ██║     ██║  ██║╚██████╔╝██║  ██║\x1b[0m",
-            "\x1b[1;36m   ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝\x1b[0m",
+            "\x1b[1;37m   ██████╗  █████╗  ██████╗ ██╗  ██╗\x1b[0m",
+            "\x1b[1;37m   ██╔══██╗██╔══██╗██╔════╝ ██║  ██║\x1b[0m",
+            "\x1b[1;37m   ██████╔╝███████║██║  ███╗███████║\x1b[0m",
+            "\x1b[1;37m   ██╔═══╝ ██╔══██║██║   ██║██╔══██║\x1b[0m",
+            "\x1b[1;37m   ██║     ██║  ██║╚██████╔╝██║  ██║\x1b[0m",
+            "\x1b[1;37m   ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝\x1b[0m",
         ];
         let info = [
             "",
@@ -271,7 +271,7 @@ impl DemoShell {
             "  \x1b[1;37mTerminal\x1b[0m  PaghTerm 0.1 · VT100/ANSI",
             "  \x1b[1;37mFont\x1b[0m      Fira Code 8x18 + Noto CJK",
             "  \x1b[1;37mColors\x1b[0m    16 / 256 / truecolor",
-            "  \x1b[1;37mTheme\x1b[0m     teal-dark",
+            "  \x1b[1;37mTheme\x1b[0m     breeze-dark",
         ];
         for i in 0..art.len().max(info.len()) {
             if let Some(a) = art.get(i) {
@@ -288,8 +288,8 @@ impl DemoShell {
 }
 
 fn welcome_banner() -> &'static str {
-    "\x1b]0;pagh@pagh: ~\x07\
-      \x1b[1;36mPagh OS 2.24\x1b[0m  \x1b[90mdesktop terminal — variant B\x1b[0m\r\n\
+    "\x1b]0;vt0 — Pagh Terminal\x07\
+      Pagh OS 2.24  \x1b[90mdesktop terminal — variant B\x1b[0m\r\n\
       \x1b[90mVT100/ANSI · UTF-8 · 16/256/truecolor · scrollback · selection\x1b[0m\r\n\
       \r\n\
       \x1b[90mType \x1b[0mhelp\x1b[90m for the demo commands.\x1b[0m\r\n\
@@ -318,7 +318,7 @@ pub fn build_demo(name: &str) -> Option<Terminal> {
 pub fn render_demo(name: &str, theme: &Theme) -> Option<Canvas> {
     let terminal = build_demo(name)?;
     let title = if terminal.screen.title.is_empty() {
-        "pagh-terminal"
+        "vt0 — Pagh Terminal"
     } else {
         &terminal.screen.title
     };
@@ -362,7 +362,7 @@ fn colors_demo() -> Terminal {
     let mut t = Terminal::new(80, 20);
     t.feed_str(
         "\x1b]0;PaghTerm — 256 colors\x07\x1b[?25l\
-         \x1b[1;36m  PaghTerm color coverage\x1b[0m  \x1b[90m16 ANSI · 256 xterm · 24-bit RGB\x1b[0m\r\n\r\n",
+         \x1b[0m  PaghTerm color coverage  \x1b[90m16 ANSI · 256 xterm · 24-bit RGB\x1b[0m\r\n\r\n",
     );
     // 16 ANSI colors with names.
     for i in 0..16 {
