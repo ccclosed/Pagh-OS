@@ -4,17 +4,21 @@
 //! The renderer has no GPU/backend dependency; the compositor receives the
 //! resulting RGBA frame through the PDP/1 protocol (or, for headless tests,
 //! it is written straight to PNG).
+//!
+//! The visual language is a plain-terminal one: the grid fills the surface,
+//! the palette is the stock Breeze-dark ANSI set, and the screenshot chrome is
+//! a single hairline title strip.  Nothing here is interactive: in the live
+//! PDP/1 path the compositor owns the window title bar and buttons
+//! (`PROTOCOL.md`), so the client commits content only.
 
 use crate::cell::{default_palette, Attrs, Cell, Color, Rgb, CELL_WIDE};
 use crate::font::{self, Glyph, CELL_H, CELL_W};
 use crate::screen::Screen;
 
 /// Padding around the text grid inside a client surface.
-pub const VIEWPORT_PADDING: usize = 6;
-/// Height of the screenshot-only title bar.
-pub const TITLE_H: usize = 30;
-/// Height of the screenshot-only status bar.
-pub const STATUS_H: usize = 22;
+pub const VIEWPORT_PADDING: usize = 2;
+/// Height of the screenshot-only title strip.
+pub const TITLE_H: usize = 22;
 /// Window border thickness.
 pub const BORDER: usize = 1;
 
@@ -310,14 +314,19 @@ impl pagh_ui::damage::DamageSurface for Canvas {
     }
 }
 
-/// Pagh terminal theme.  Teal accent, dark blue-green surfaces, readable ANSI
-/// palette — the same accent family as the desktop concept art.
+/// Pagh terminal theme: the stock Breeze-dark terminal palette.
+///
+/// The reference is the *look* of a KDE Konsole window (dark content, light
+/// monospace text, hairline chrome) as seen in a screenshot — no Konsole code,
+/// assets or color-scheme file is copied, so this crate stays MIT.  The palette
+/// is the long-published Breeze dark ANSI set: muted surfaces, no neon accent.
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub bg: Rgb,
     pub fg: Rgb,
     pub cursor: Rgb,
     pub cursor_text: Rgb,
+    pub cursor_unfocused: Rgb,
     pub selection: Rgb,
     pub selection_fg: Rgb,
     pub palette: [Rgb; 256],
@@ -325,32 +334,27 @@ pub struct Theme {
     pub border: Rgb,
     pub title_bg: Rgb,
     pub title_fg: Rgb,
-    pub status_bg: Rgb,
-    pub status_fg: Rgb,
-    pub accent: Rgb,
-    pub button: Rgb,
-    pub close: Rgb,
+    pub scrollbar_track: Rgb,
+    pub scrollbar: Rgb,
 }
 
 impl Default for Theme {
     fn default() -> Theme {
         Theme {
-            bg: Rgb(0x0e, 0x16, 0x1b),
-            fg: Rgb(0xd8, 0xe6, 0xe3),
-            cursor: Rgb(0x2f, 0xd4, 0xb0),
-            cursor_text: Rgb(0x06, 0x12, 0x14),
-            selection: Rgb(0x1f, 0x5f, 0x59),
-            selection_fg: Rgb(0xe8, 0xff, 0xfb),
+            bg: Rgb(0x23, 0x26, 0x27),
+            fg: Rgb(0xef, 0xf0, 0xf1),
+            cursor: Rgb(0xef, 0xf0, 0xf1),
+            cursor_text: Rgb(0x23, 0x26, 0x27),
+            cursor_unfocused: Rgb(0x7f, 0x8c, 0x8d),
+            selection: Rgb(0x3d, 0xae, 0xe9),
+            selection_fg: Rgb(0x23, 0x26, 0x27),
             palette: default_palette(),
-            window_bg: Rgb(0x0b, 0x12, 0x17),
-            border: Rgb(0x25, 0x3a, 0x40),
-            title_bg: Rgb(0x13, 0x22, 0x28),
-            title_fg: Rgb(0xc9, 0xdc, 0xd9),
-            status_bg: Rgb(0x10, 0x1d, 0x22),
-            status_fg: Rgb(0x91, 0xaa, 0xa8),
-            accent: Rgb(0x2f, 0xd4, 0xb0),
-            button: Rgb(0x8f, 0xa6, 0xa4),
-            close: Rgb(0xe0, 0x5c, 0x5c),
+            window_bg: Rgb(0x23, 0x26, 0x27),
+            border: Rgb(0x1b, 0x1e, 0x1f),
+            title_bg: Rgb(0x31, 0x36, 0x3b),
+            title_fg: Rgb(0xbd, 0xc3, 0xc7),
+            scrollbar_track: Rgb(0x23, 0x26, 0x27),
+            scrollbar: Rgb(0x7f, 0x8c, 0x8d),
         }
     }
 }
@@ -457,7 +461,7 @@ pub fn render_screen_into(
         let color = if opts.focused {
             theme.cursor
         } else {
-            theme.button
+            theme.cursor_unfocused
         };
         match screen.cursor.style {
             crate::screen::CursorStyle::Underline => {
@@ -472,7 +476,7 @@ pub fn render_screen_into(
     } else if cursor_on && !opts.focused {
         let px = ox + screen.cursor.x * CELL_W;
         let py = oy + screen.cursor.y * CELL_H;
-        canvas.outline_rect(px, py, CELL_W, CELL_H, theme.button);
+        canvas.outline_rect(px, py, CELL_W, CELL_H, theme.cursor_unfocused);
     }
 
     if opts.show_scrollbar {
@@ -480,114 +484,47 @@ pub fn render_screen_into(
     }
 }
 
-/// Render the grid plus a Pagh-style title bar and status bar.  The compositor
-/// normally draws decorations itself; this is for screenshots and standalone
-/// preview, and it makes the headless output representative of the window.
+/// Render the grid plus a hairline title strip.  The compositor normally draws
+/// the window decorations itself (`PROTOCOL.md`), so this chrome exists only
+/// for screenshots and standalone previews: one dark strip with the session
+/// name, and nothing else — no buttons, no status readouts, no accent bars.
 pub fn render_window(screen: &Screen, theme: &Theme, title: &str, opts: &RenderOptions) -> Canvas {
     let content = render_screen(screen, theme, opts);
     let width = content.width + BORDER * 2;
-    let height = content.height + BORDER * 2 + TITLE_H + STATUS_H;
+    let height = content.height + BORDER * 2 + TITLE_H;
     let mut canvas = Canvas::new(width, height, theme.window_bg);
-    canvas.outline_rect(0, 0, width, height, theme.border);
 
-    // Title bar.
+    // Title strip, with a hairline separating it from the grid the way a
+    // terminal's tab strip sits against the text area.
     canvas.fill_rect(BORDER, BORDER, width - BORDER * 2, TITLE_H, theme.title_bg);
     canvas.fill_rect(
-        BORDER,
-        BORDER + TITLE_H - 2,
-        width - BORDER * 2,
-        2,
+        0,
+        BORDER + TITLE_H - 1,
+        width,
+        1,
         if opts.focused {
-            theme.accent
-        } else {
             theme.border
+        } else {
+            theme.title_bg
         },
     );
-    for (i, color) in [theme.accent, Rgb(0xe6, 0xc3, 0x5c), Rgb(0xe0, 0x5c, 0x5c)]
-        .into_iter()
-        .enumerate()
-    {
-        canvas.fill_rect(BORDER + 12 + i * 12, BORDER + 11, 7, 7, color);
-    }
     let title = if title.is_empty() {
-        "pagh-terminal".to_string()
+        "vt0 — Pagh Terminal".to_string()
     } else {
         title.to_string()
     };
     let title_y = BORDER + (TITLE_H - CELL_H) / 2;
-    let max_title_px = width.saturating_sub(BORDER + 58 + 78);
     draw_text(
         &mut canvas,
-        BORDER + 50,
+        BORDER + 8,
         title_y,
         &title,
         theme.title_fg,
-        max_title_px,
+        width.saturating_sub(2 * BORDER + 16),
     );
-
-    // Window buttons (minimize / maximize / close).
-    let button_y = BORDER + TITLE_H / 2;
-    let bx = width - BORDER - 78;
-    let color = theme.button;
-    canvas.hline(bx, button_y, 10, color);
-    canvas.outline_rect(bx + 26, button_y - 4, 9, 9, color);
-    let cx = bx + 52;
-    for i in 0..9 {
-        canvas.put(cx + i, button_y - 4 + i, theme.close);
-        canvas.put(cx + 8 - i, button_y - 4 + i, theme.close);
-    }
 
     // Content.
     canvas.blit(&content, BORDER, BORDER + TITLE_H);
-
-    // Status bar.
-    let status_y = height - BORDER - STATUS_H;
-    canvas.fill_rect(
-        BORDER,
-        status_y,
-        width - BORDER * 2,
-        STATUS_H,
-        theme.status_bg,
-    );
-    let scroll = if screen.view_offset() > 0 {
-        format!(
-            "  SCROLL {}/{}",
-            screen.view_offset(),
-            screen.scrollback_len()
-        )
-    } else {
-        String::new()
-    };
-    let status = format!(
-        "{}x{}  UTF-8  ANSI 256  SB {}{}  {}:{}",
-        screen.cols(),
-        screen.rows(),
-        screen.scrollback_len(),
-        scroll,
-        screen.cursor.x,
-        screen.cursor.y
-    );
-    let status_text_y = status_y + (STATUS_H - CELL_H) / 2;
-    draw_text(
-        &mut canvas,
-        BORDER + 10,
-        status_text_y,
-        &status,
-        theme.status_fg,
-        width.saturating_sub(120),
-    );
-    let right = "PaghTerm 0.1";
-    let right_px = text_width(right);
-    if right_px + 20 < width {
-        draw_text(
-            &mut canvas,
-            width - BORDER - 10 - right_px,
-            status_text_y,
-            right,
-            theme.status_fg,
-            right_px,
-        );
-    }
     canvas
 }
 
@@ -764,27 +701,17 @@ fn draw_text(canvas: &mut Canvas, x: usize, y: usize, text: &str, fg: Rgb, max_p
     }
 }
 
-fn text_width(text: &str) -> usize {
-    text.chars()
-        .map(|c| {
-            if font::char_width(c) == 2 {
-                2 * CELL_W
-            } else {
-                CELL_W
-            }
-        })
-        .sum()
-}
-
 fn draw_scrollbar(canvas: &mut Canvas, ox: usize, oy: usize, screen: &Screen, theme: &Theme) {
     let sb = screen.scrollback_len();
     if sb == 0 {
         return;
     }
-    let track_h = screen.rows() * CELL_H - 8;
-    let track_x = ox + screen.cols() * CELL_W + 2;
-    let track_y = oy + 4;
-    canvas.fill_rect(track_x, track_y, 2, track_h, theme.border);
+    // The scrollbar lives in the right padding: 2 px wide, flush with the
+    // window edge, so it never eats a glyph cell.
+    let track_h = screen.rows() * CELL_H;
+    let track_x = ox + screen.cols() * CELL_W;
+    let track_y = oy;
+    canvas.fill_rect(track_x, track_y, 2, track_h, theme.scrollbar_track);
     let total = (sb + screen.rows()) as f32;
     let visible = screen.rows() as f32 / total;
     let thumb_h = ((track_h as f32 * visible).round() as usize)
@@ -792,7 +719,7 @@ fn draw_scrollbar(canvas: &mut Canvas, ox: usize, oy: usize, screen: &Screen, th
         .min(track_h);
     let start = (sb.saturating_sub(screen.view_offset())) as f32 / total;
     let thumb_y = track_y + ((track_h - thumb_h) as f32 * start).round() as usize;
-    canvas.fill_rect(track_x, thumb_y, 2, thumb_h, theme.accent);
+    canvas.fill_rect(track_x, thumb_y, 2, thumb_h, theme.scrollbar);
 }
 
 // ── box drawing & block elements ───────────────────────────────────────────
@@ -1183,7 +1110,7 @@ mod tests {
         );
         assert_eq!(
             canvas.height,
-            VIEWPORT_PADDING * 2 + 3 * CELL_H + BORDER * 2 + TITLE_H + STATUS_H
+            VIEWPORT_PADDING * 2 + 3 * CELL_H + BORDER * 2 + TITLE_H
         );
     }
 }

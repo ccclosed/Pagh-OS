@@ -47,9 +47,9 @@ fn demo_screenshot_is_a_valid_png_with_window_chrome() {
     assert!(out.is_file());
     let png = std::fs::read(&out).unwrap();
     let canvas = pagh_terminal::png::decode(&png).unwrap();
-    // 90x28 grid + padding + border + title/status bars.
-    assert_eq!(canvas.width, 90 * 8 + 12 + 2);
-    assert_eq!(canvas.height, 28 * 18 + 12 + 30 + 22 + 2);
+    // 90x28 grid + 2 px padding + 1 px border + a 22 px title strip.
+    assert_eq!(canvas.width, 90 * 8 + 4 + 2);
+    assert_eq!(canvas.height, 28 * 18 + 4 + 22 + 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -79,8 +79,10 @@ fn script_mode_no_window_and_resize() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("red\nplain Привет\n界"), "{stdout:?}");
     let canvas = pagh_terminal::png::decode(&std::fs::read(&out).unwrap()).unwrap();
-    assert_eq!(canvas.width, 20 * 8 + 12);
-    assert_eq!(canvas.height, 5 * 18 + 12);
+    // No window chrome: just the grid plus the client-side viewport padding.
+    let pad = pagh_terminal::render::VIEWPORT_PADDING * 2;
+    assert_eq!(canvas.width, 20 * 8 + pad);
+    assert_eq!(canvas.height, 5 * 18 + pad);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
