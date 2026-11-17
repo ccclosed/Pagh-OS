@@ -315,7 +315,11 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
                 if a[3] & !STREAM_SEND_FLAGS != 0 {
                     return Err(Errno::EINVAL);
                 }
-                let len = crate::arch::x86_64::linux::abi::socket_payload_len(a[2], true)?;
+                // TCP — поток байтов, а не датаграмма: длина больше
+                // [MAX_SOCKET_IO] здесь не ошибка (Linux копирует сколько
+                // помещается и возвращает короткую запись), поэтому предел
+                // работает как граница одной копии, а не как EMSGSIZE.
+                let len = crate::arch::x86_64::linux::abi::stream_send_len(a[2]);
                 check_user_ptr(a[1], len)?;
                 let data = crate::arch::x86_64::linux::io_sys::copy_in_pub(a[1], len);
                 let n = crate::arch::x86_64::linux::inet_sock::tcp_write(a[0], &data)?;

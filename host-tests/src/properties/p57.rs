@@ -9,14 +9,17 @@
 // allocations (F-x86v-1), but reachable through one socket syscall.
 //
 // `abi::socket_payload_len` is now the single decision point:
-//   * `sendto`: count > MAX_SOCKET_IO -> EMSGSIZE, before any allocation (a
-//     silently truncated datagram would be a correctness bug);
+//   * `sendto` on a datagram socket: count > MAX_SOCKET_IO -> EMSGSIZE, before
+//     any allocation (a silently truncated datagram would be a correctness bug);
 //   * `recvfrom`: the count is the buffer capacity, so it is truncated to the
 //     cap; the kernel validates/allocates/copies exactly that many bytes;
+//   * `sendto` on a STREAM socket: `abi::stream_send_len` caps the copy at
+//     MAX_SOCKET_IO and returns a short write — Linux never answers EMSGSIZE
+//     for a long stream write (see the regression test at the bottom);
 //   * everything the caller can ask for is bounded by the cap, and a small
 //     count is returned unchanged (no behaviour change for normal users).
 
-use crate::abi::{socket_payload_len, MAX_SOCKET_IO};
+use crate::abi::{socket_payload_len, stream_send_len, MAX_SOCKET_IO};
 use crate::errno::Errno;
 use proptest::prelude::*;
 
@@ -76,5 +79,38 @@ proptest! {
     #[test]
     fn recvfrom_never_rejects(count in any::<u64>()) {
         prop_assert!(socket_payload_len(count, false).is_ok());
+    }
+}
+
+// Stream sockets (`SOCK_STREAM`: AF_UNIX client/compositor pairs, TCP) have no
+// record boundaries: Linux never answers `EMSGSIZE` for a long `send(2)` on a
+// stream, it copies what fits and returns a **short write**, and `write_all`
+// carries the rest. `stream_send_len` is that policy: the 1 MiB cap stays as
+// the bound of a single copy/allocation (the P57 allocation-abort guard), but a
+// longer request is not an error. Regression: `pagh-files` sends its first
+// full frame (1060x640 RGBA = 2 713 600 bytes) with one `send(2)`, which is
+// `sendto(2)` nr 44 on x86_64, and the datagram rule turned it into
+// `EMSGSIZE` ("Message too large (os error 90)") that killed the process.
+
+#[test]
+fn stream_send_returns_short_writes_instead_of_emsgsize() {
+    // A 2.7 MB frame: exactly the pagh-files regression size.
+    assert_eq!(stream_send_len(2_713_600), MAX_SOCKET_IO);
+    assert_eq!(stream_send_len(u64::MAX), MAX_SOCKET_IO);
+    assert_eq!(stream_send_len(MAX_SOCKET_IO + 1), MAX_SOCKET_IO);
+    // In-cap lengths are untouched: a small `send` is still one write.
+    assert_eq!(stream_send_len(MAX_SOCKET_IO), MAX_SOCKET_IO);
+    assert_eq!(stream_send_len(1472), 1472);
+    assert_eq!(stream_send_len(0), 0);
+}
+
+proptest! {
+    /// The stream policy never asks the kernel to allocate more than the cap and
+    /// never turns a legal long write into an error.
+    #[test]
+    fn stream_send_is_a_chunk_bound(count in any::<u64>()) {
+        let n = stream_send_len(count);
+        prop_assert!(n <= MAX_SOCKET_IO);
+        prop_assert_eq!(n, count.min(MAX_SOCKET_IO));
     }
 }
