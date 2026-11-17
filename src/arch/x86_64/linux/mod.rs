@@ -191,6 +191,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::RENAMEAT2 => io_sys::sys_renameat2(a[0], a[1], a[2], a[3], a[4]),
         sysno::STAT => io_sys::sys_stat(a[0], a[1]),
         sysno::FSTAT => io_sys::sys_fstat(a[0], a[1]),
+        sysno::LSTAT => io_sys::sys_lstat(a[0], a[1]),
         sysno::NEWFSTATAT => io_sys::sys_newfstatat(a[0], a[1], a[2], a[3]),
         sysno::IOCTL => io_sys::sys_ioctl(a[0], a[1], a[2]),
         sysno::ACCESS => io_sys::sys_access(a[0], a[1]),
