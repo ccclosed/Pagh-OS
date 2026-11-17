@@ -246,7 +246,7 @@ pub fn tcp_write(fd: u64, data: &[u8]) -> Result<usize, Errno> {
 /// `recv`/`read` на AF_INET TCP fd.
 pub fn tcp_read(fd: u64, dst: &mut [u8]) -> Result<usize, Errno> {
     let sock = tcp_sock(fd)?;
-    let handle = sock.handle.lock().ok_or(Errno::ENOTCONN)?;
+    let mut handle = sock.handle.lock().ok_or(Errno::ENOTCONN)?;
     let nb = sock.nonblocking.load(Ordering::Relaxed);
     loop {
         if sock.eof.load(Ordering::Relaxed) {
@@ -264,7 +264,33 @@ pub fn tcp_read(fd: u64, dst: &mut [u8]) -> Result<usize, Errno> {
             return Err(Errno::EAGAIN);
         }
         crate::task::scheduler::yield_current();
+        // Проснувшись, первым делом спрашиваем таблицу fd. Закрытый из
+        // соседнего потока дескриптор EOF на TCP не выставляет (`Arc<InetTcp>`
+        // и сетевой handle живут сами по себе), поэтому без этой проверки
+        // ожидание было бы вечным — watchdog печатал
+        // `stuck in syscall ? (nr=45 arg0=0x3 closed)`. Идентичность сокета
+        // сохраняет ожидание при `dup`: пока хоть один дескриптор ссылается на
+        // этот `Arc`, читать его законно.
+        if !tcp_socket_owned(&sock) {
+            return Err(Errno::EBADF);
+        }
+        // `close` мог забрать handle, пока мы спали; не трогаем освобождённый
+        // сетевой handle. Такой сокет освобождён, то есть это конец потока.
+        handle = match *sock.handle.lock() {
+            Some(h) => h,
+            None => return Ok(0),
+        };
     }
+}
+
+/// Ссылается ли ещё хоть один дескриптор текущего процесса на `sock`.
+///
+/// Зеркало [`crate::task::fd::FdTable::holds_read_end`] для TCP: `dup`-дубликат —
+/// владение, закрытие последнего fd — потеря владения и повод разбудить
+/// блокирующее чтение `EBADF`.
+fn tcp_socket_owned(sock: &Arc<InetTcp>) -> bool {
+    let id = Arc::as_ptr(sock) as usize;
+    compat::with_current_compat(|cs| cs.fds.holds_inet_tcp(id)).unwrap_or(false)
 }
 
 /// `close` на AF_INET TCP fd.

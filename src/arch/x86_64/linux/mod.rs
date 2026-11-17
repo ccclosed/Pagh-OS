@@ -22,6 +22,7 @@ pub mod kill;
 pub mod mem;
 pub mod misc;
 pub mod rand_clock;
+pub mod sock_wait;
 pub mod stat;
 pub mod timeconv;
 pub mod tty;

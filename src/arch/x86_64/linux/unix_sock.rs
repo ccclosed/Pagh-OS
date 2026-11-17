@@ -777,7 +777,13 @@ pub fn sys_recvfrom_unix(
                 if nonblock {
                     return Err(Errno::EAGAIN);
                 }
-                crate::task::scheduler::yield_current();
+                match endpoint_wait_verdict(&rx) {
+                    super::sock_wait::WaitVerdict::Continue => {
+                        crate::task::scheduler::yield_current()
+                    }
+                    super::sock_wait::WaitVerdict::Eof => break 0,
+                    super::sock_wait::WaitVerdict::Ebadf => return Err(Errno::EBADF),
+                }
             }
         }
     };
@@ -790,6 +796,23 @@ pub fn sys_recvfrom_unix(
         unsafe { core::ptr::write_unaligned(addr_len as *mut u32, 0) };
     }
     Ok(n as u64)
+}
+
+/// Решение для блокирующего чтения, у которого очередь ответила `WouldBlock`.
+///
+/// Очередей ожидания в ядре нет: чтение уступает CPU и перечитывает очередь.
+/// Но закрытие ЧИТАЮЩЕГО fd из соседнего потока не выставляет EOF — счётчики
+/// `readers`/`writers` живут на общую очередь, а сам syscall держит её `Arc`.
+/// Без этой перепроверки задача уступала бы CPU вечно; watchdog печатал
+/// `stuck in syscall ? (nr=45 arg0=0x3 closed)` (см. `super::sock_wait`).
+///
+/// `dup` другого дескриптора на ту же очередь оставляет владение, поэтому
+/// закрытие одного из дубликатов законное ожидание не прерывает.
+pub(crate) fn endpoint_wait_verdict(rx: &PipeEndpoint) -> super::sock_wait::WaitVerdict {
+    let id = rx.queue_id();
+    // `None` (нет compat-состояния) — читать эту очередь больше некому: EBADF.
+    let referenced = compat::with_current_compat(|cs| cs.fds.holds_read_end(id)).unwrap_or(false);
+    super::sock_wait::wait_verdict(referenced, rx.writers())
 }
 
 /// `recvmsg` (47): данные и `SCM_RIGHTS` из AF_UNIX SOCK_STREAM.
@@ -893,7 +916,16 @@ pub fn sys_recvmsg(fd: u64, msg_addr: u64, flags: u64) -> Result<u64, Errno> {
                 if nonblock {
                     return Err(Errno::EAGAIN);
                 }
-                crate::task::scheduler::yield_current();
+                match endpoint_wait_verdict(&rx) {
+                    super::sock_wait::WaitVerdict::Continue => {
+                        crate::task::scheduler::yield_current()
+                    }
+                    super::sock_wait::WaitVerdict::Eof => {
+                        write_msghdr_out(msg_addr, 0, 0, flags as u32)?;
+                        return Ok(0);
+                    }
+                    super::sock_wait::WaitVerdict::Ebadf => return Err(Errno::EBADF),
+                }
             }
         }
     }

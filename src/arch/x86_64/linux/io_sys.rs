@@ -46,6 +46,7 @@ use super::{check_user_ptr, check_user_ptr_writable};
 // разошлись в номерах ABI.
 use super::stat::{encode_stat, LinuxStat, S_IFDIR, S_IFLNK, S_IFREG};
 use super::tty::{TIOCGPGRP, TIOCSPGRP, TOSTOP};
+use super::unix_sock;
 
 /// Биты типа `st_mode` для символьного устройства (консоль/stdin), чтобы
 /// `fstat` стандартного потока сообщал правдоподобный (не regular) тип.
@@ -344,13 +345,24 @@ fn read_user_cstr(ptr: u64) -> Result<String, Errno> {
     Err(Errno::EINVAL)
 }
 
+/// Блокирующее/неблокирующее чтение конца очереди (pipe или AF_UNIX-сокета).
+///
+/// Ожидание — уступка CPU с перечитыванием очереди. На каждой уступке
+/// перепроверяется владение очередью: закрытый из соседнего потока дескриптор
+/// EOF не выставляет (счётчики очереди считают концы, а не fd), поэтому без
+/// [`unix_sock::endpoint_wait_verdict`] заблокированный `read` спал бы вечно —
+/// тот же класс зависания, что watchdog печатает для `recvfrom` (nr 45).
 fn read_pipe(e: &PipeEndpoint, dst: &mut [u8]) -> Result<usize, Errno> {
     loop {
         match e.read(dst) {
             PipeReadResult::Data(n) => return Ok(n),
             PipeReadResult::Eof => return Ok(0),
             PipeReadResult::WouldBlock if e.nonblocking() => return Err(Errno::EAGAIN),
-            PipeReadResult::WouldBlock => crate::task::scheduler::yield_current(),
+            PipeReadResult::WouldBlock => match unix_sock::endpoint_wait_verdict(e) {
+                super::sock_wait::WaitVerdict::Continue => crate::task::scheduler::yield_current(),
+                super::sock_wait::WaitVerdict::Eof => return Ok(0),
+                super::sock_wait::WaitVerdict::Ebadf => return Err(Errno::EBADF),
+            },
         }
     }
 }
