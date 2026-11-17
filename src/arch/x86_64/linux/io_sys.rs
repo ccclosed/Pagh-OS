@@ -1715,6 +1715,18 @@ pub fn sys_stat(path: u64, statbuf: u64) -> Result<u64, Errno> {
     sys_newfstatat(AT_FDCWD, path, statbuf, 0)
 }
 
+/// `lstat` (6): статус самого пути, конечный символический компонент НЕ
+/// разыменовывается.
+///
+/// Ровно та же тонкая обёртка над `newfstatat`, что и [`sys_stat`], но с
+/// `AT_SYMLINK_NOFOLLOW`: одна реализация поиска в VFS, одна проверка буфера и
+/// один набор `ENOENT`/`ENOTDIR`/`ELOOP`. Отдельный номер нужен потому, что
+/// `std::fs::symlink_metadata`, `ls -l` и `find` зовут `lstat` напрямую, а
+/// `ENOSYS` здесь ломал их на любом симлинке (`/proc/self/exe`, `/lib64`).
+pub fn sys_lstat(path: u64, statbuf: u64) -> Result<u64, Errno> {
+    sys_newfstatat(AT_FDCWD, path, statbuf, AT_SYMLINK_NOFOLLOW)
+}
+
 /// `fstat` (5): заполнить пользовательский `struct stat` для открытого
 /// дескриптора (R2.8). `EBADF` для отсутствующего fd (R2.14). Консоль/stdin
 /// сообщают символьное устройство.
