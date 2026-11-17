@@ -807,15 +807,28 @@ pub fn inflight_refresh(pid: u64) {
 }
 
 /// Человеческое имя syscall'ов, в которых задача реально может блокироваться.
+///
+/// `sendto`/`sendmsg` здесь, потому что запись в полную очередь AF_UNIX уступает
+/// CPU так же, как чтение. `recvfrom`/`recvmsg` были главным пробелом: именно они
+/// печатались как `stuck in syscall ? (nr=45 arg0=0x3 closed)`, пока не был
+/// закрыт класс вечного ожидания на закрытом fd (`sock_wait`). `lstat`(6) и
+/// `shutdown`(48) не блокируются, но названы, чтобы такой же лог никогда не
+/// показывал «?» для сисколла, который кто-то увидит в профиле.
 fn wd_sys_name(nr: u64) -> &'static str {
     match nr {
         0 => "read",
         1 => "write",
+        6 => "lstat",
         7 => "poll",
         20 => "writev",
         23 => "select",
         35 => "nanosleep",
         43 => "accept",
+        44 => "sendto",
+        45 => "recvfrom",
+        46 => "sendmsg",
+        47 => "recvmsg",
+        48 => "shutdown",
         61 => "wait4",
         202 => "futex",
         232 => "epoll_wait",
