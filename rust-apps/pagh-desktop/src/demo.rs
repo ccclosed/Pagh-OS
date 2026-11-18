@@ -79,10 +79,7 @@ pub fn terminal_surface(width: u32, height: u32, _state: &DemoState) -> Surface 
     let prompt = "pagh:/mnt$ ";
     if y + line_h <= h {
         canvas.text(x, y, 1, TERM_TEXT, prompt);
-        canvas.fill_rect(
-            Rect::new(x + text_width(prompt), y, 8, line_h),
-            TERM_TEXT,
-        );
+        canvas.fill_rect(Rect::new(x + text_width(prompt), y, 8, line_h), TERM_TEXT);
     }
     Surface::from_canvas(&canvas, PixelFormat::Xrgb8888)
 }
