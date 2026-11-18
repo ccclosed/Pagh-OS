@@ -728,6 +728,13 @@ mod properties {
     // routines.
     mod scm_cmsg;
 
+    // Demand-paged user buffers on the general `read(2)`/`write(2)` path: the
+    // per-page acceptance table (`validate::page_acceptance`) shared by the
+    // syscall copy paths and `handle_user_page_fault`. Pins that absence alone
+    // is never accepted, that a large lazy anon span is fully populatable, and
+    // that `PROT_NONE`/out-of-region stay refused. The end-to-end half is the
+    // in-QEMU `userbuf::lazy_anon_read_write` routine.
+    mod user_buffer_paging;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the

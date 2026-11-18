@@ -97,6 +97,30 @@ pub(crate) fn check_user_ptr(start: u64, len: u64) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Проверить, что `[start, start + len)` — пользовательский диапазон, **не
+/// трогая PTE**.
+///
+/// Это диапазонная половина [`check_user_ptr`] для путей, которые копируют не
+/// весь `count`, а только реально доступную часть (`min(count, available)`, как
+/// `read(2)`/`pread(2)` в Linux): требовать PRESENT на всём `count` там нельзя —
+/// приёмник может быть свежим ленивым анонимным буфером, чьи страницы подпирает
+/// demand paging в точке копирования ([`mem_sys::populate_user_out`]), а сам
+/// запрос короче `count`.
+///
+/// Отказ (`EFAULT`) — только за заведомо не пользовательский адрес:
+/// `start >= User_Addr_Max`, переполнение `start + len` или конец выше границы.
+/// Наличие и права страниц проверяет копия
+/// ([`io_sys::copy_out_checked`]/[`check_user_ptr`]) уже по фактическому
+/// диапазону — иначе `EFAULT` возвращался бы за страницы, которые никто не
+/// трогал.
+pub(crate) fn check_user_ptr_bounds(start: u64, len: u64) -> Result<(), Errno> {
+    use validate::PtrCheck;
+    if validate::check_user_range(start, len) == PtrCheck::Efault {
+        return Err(Errno::EFAULT);
+    }
+    Ok(())
+}
+
 /// Проверить пользовательский диапазон, в который ядро будет **писать**:
 /// [`check_user_ptr`] плюс право записи на каждой странице.
 ///

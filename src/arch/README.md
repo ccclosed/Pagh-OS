@@ -25,7 +25,7 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 
 | Файл | Роль |
 |---|---|
-| `mod.rs` | Корень; `linux_dispatch(regs: *mut SavedRegs, reentry_allowed: u64)` — главный вход (бит 0 `REENTRY_ALLOWED` разрешает размаскировать IF: его передают оба входных стаба, boot-selftest передаёт 0; бит 1 `INT80_ENTRY` помечает вход через `int 0x80`, см. инвариант 2); `check_user_ptr` — единая точка валидации user-указателей; гейт набора `abi::SUPPORTED_SYSCALLS`; watchdog зависших syscall'ов |
+| `mod.rs` | Корень; `linux_dispatch(regs: *mut SavedRegs, reentry_allowed: u64)` — главный вход (бит 0 `REENTRY_ALLOWED` разрешает размаскировать IF: его передают оба входных стаба, boot-selftest передаёт 0; бит 1 `INT80_ENTRY` помечает вход через `int 0x80`, см. инвариант 2); `check_user_ptr` (диапазон + PRESENT/`USER_ACCESSIBLE` на каждой странице), `check_user_ptr_writable` (плюс право записи) и `check_user_ptr_bounds` (только диапазон, без PTE — для путей, копирующих `min(count, доступное)`); гейт набора `abi::SUPPORTED_SYSCALLS`; watchdog зависших syscall'ов |
 | `regs.rs` | `SavedRegs` — 15-GPR фрейм, общий контракт обоих входных стабов |
 | `abi.rs` | Чистый маршаллинг аргументов (`marshal_args`), полный перечень поддерживаемого набора `SUPPORTED_SYSCALLS` (единственный источник истины, `is_supported` — бинарный поиск по нему), константы номеров |
 | `validate.rs` | Чистая валидация user-указателей (`spanned_pages`, границы/переполнение, без разыменований) |
@@ -65,7 +65,27 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 - `apic`: `init()`, `register_irq(vector, handler)`, `irq_dispatch(vector)`, `send_eoi()`, `route_irq()`, `TICK_HZ=1000`, `ms_to_ticks()`.
 - `acpi`: `ApicAddrs { lapic_phys, ioapic_phys, gsi_base }`, `apic_addresses()`.
 - `syscall`: `init()`, `SYS_WRITE=1/SYS_EXIT=2/SYS_YIELD=3`, `legacy_dispatch`, `extern "C" int80_stub/syscall_entry`.
-- `linux`: `linux_dispatch`, `check_user_ptr`.
+- `linux`: `linux_dispatch`, `check_user_ptr`, `check_user_ptr_bounds`,
+  `mem_sys::populate_user_in/populate_user_out` (подпирание ленивого буфера перед копией).
+
+### Ленивые пользовательские буферы (read/write)
+- `read(2)`/`pread(2)`/`readv(2)` копируют `min(count, доступное)`, а `write(2)`/
+  `pwrite(2)`/`writev(2)` читают весь `count`, поэтому требовать PRESENT на всех
+  страницах `count` нельзя: свежий `Vec`/`Box` на ленивой куче `brk` или анонимный
+  `mmap` (`vec![0u8; total]`) отвергался `EFAULT`'ом на любой длине больше страницы.
+  Приёмник/источник подпирается `mem_sys::populate_user_in/out` — той же политикой,
+  что у `handle_user_page_fault`, через чистое правило `validate::page_acceptance`
+  (host-свойство `user_buffer_paging`): отсутствующая страница подпирается только в
+  ленивом `brk`/anon-регионе, а `PROT_NONE`, eager-файловый регион и адрес вне
+  регионов остаются `EFAULT`. Права записи по-прежнему проверяет `copy_out_checked`
+  после подпирания, поэтому TOCTOU-контракт (F-r4-arch-1) не ослаблен.
+- Буфер под копию наружу/внутрь выделяется fallible (`try_user_buf`): `count`
+  приходит от пользователя (до `COUNT_MAX` = 2 ГиБ), куча ядра фиксирована, а
+  неудачная аллокация в `no_std` паникует — `panic = "abort"` останавливает
+  машину. Отказ — `ENOMEM`, как нехватка памяти в Linux.
+- Остаток, названный явно: `signalfd`-чтение и `getdents64` сохраняют старую
+  проверку (первый — вне общего пути, второй исполняется под `COMPAT_STATES`, где
+  `handle_user_page_fault` отказывает по реентерабельности).
 - `pat`: `init()` — PAT-детект и WC-записи `IA32_PAT`; `memory::pat::{wc_supported, wc_pte_flags, fallback_pte_flags}`.
 
 ## Как работает
