@@ -674,19 +674,39 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
         .map_err(|e| format!("create_window: {e}"))?;
     // Ядро игнорирует SO_RCVTIMEO, поэтому «чтение с таймаутом» здесь означало бы
     // вечную блокировку на простое и никогда не прочитанный вывод shell'а.
-    client
-        .set_nonblocking(true)
-        .map_err(|e| format!("nonblocking: {e}"))?;
-
     let theme = Theme::default();
     let mut width = args.size.0.max(64);
     let mut height = args.size.1.max(32);
     let (cols, rows) = layout(width, height);
     let mut terminal = pagh_terminal::Terminal::with_scrollback(cols, rows, 2000);
-    // Кадр переиспользуется: `Canvas::new` каждый раз заново выделял бы ~2 МиБ,
-    // а каждая новая страница — demand-fault; на этой машине частые user-PF во
-    // время кадра оказались самым хрупким местом сессии.
-    let mut canvas = Canvas::new(width as usize, height as usize, theme.bg);
+
+    // ShmSurface: рендер прямо в общий mmap, по сокету — только damage. Это не
+    // оптимизация «на будущее», а разница между отзывчивым эхом и кадром 2 МиБ
+    // на каждую нажатую клавишу (в QEMU-TCG такой кадр идёт сотни миллисекунд).
+    // Сервер объявляет capability битом 2 welcome; если что-то не сложилось —
+    // молча откатываемся на полный кадр, как legacy-клиент.
+    let mut shm = match client.enable_shm(width, height) {
+        Ok(shm) => shm,
+        Err(error) => {
+            eprintln!("pagh-terminal: shm unavailable ({error}); full frames");
+            None
+        }
+    };
+    let mut fallback: Option<Canvas> = if shm.is_none() {
+        Some(Canvas::new(width as usize, height as usize, theme.bg))
+    } else {
+        None
+    };
+    let mut tracker = pagh_ui::damage::DamageTracker::new(
+        pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32),
+        pagh_ui::damage::DEFAULT_TILE,
+    );
+    // Ядро игнорирует SO_RCVTIMEO, поэтому «чтение с таймаутом» здесь означало бы
+    // вечную блокировку на простое и никогда не прочитанный вывод shell'а.
+    client
+        .set_nonblocking(true)
+        .map_err(|e| format!("nonblocking: {e}"))?;
+
     let mut dirty = true;
     let mut exited_reported = false;
     let mut input_error_reported = false;
@@ -729,11 +749,47 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
                     height = configure.height.max(32);
                     let (cols, rows) = layout(width, height);
                     terminal.resize(cols, rows);
-                    if canvas.width != width as usize || canvas.height != height as usize {
-                        canvas = Canvas::new(width as usize, height as usize, theme.bg);
+                    let same_size = shm.as_ref().is_some_and(|frame| {
+                        frame.canvas.width == width as usize
+                            && frame.canvas.height == height as usize
+                    });
+                    if same_size {
+                        dirty = true;
+                        continue;
+                    }
+                    let resized = match shm.as_mut() {
+                        Some(frame) => client.resize_shm(frame, width, height).unwrap_or(false),
+                        None => false,
+                    };
+                    if resized {
+                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
+                    } else {
+                        if let Some(stale) = shm.take() {
+                            let _ = client.release_shm(&stale);
+                        }
+                        fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
+                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
                     }
                     dirty = true;
                 }
+                Event::ShmRelease {
+                    window_id,
+                    generation,
+                } => {
+                    if window_id == args.window_id
+                        && shm
+                            .as_ref()
+                            .is_some_and(|frame| frame.generation == generation)
+                    {
+                        if let Some(stale) = shm.take() {
+                            let _ = client.release_shm(&stale);
+                        }
+                        fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
+                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
+                        dirty = true;
+                    }
+                }
+                Event::ShmReady { .. } => {}
                 Event::Input(InputEvent::Key {
                     code,
                     pressed,
@@ -788,16 +844,42 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
         // события выше уже разобраны, так что Enter не ждёт за кадром.
         let now = Instant::now();
         if dirty && now.duration_since(last_commit) >= Duration::from_millis(40) {
-            canvas.fill(theme.bg);
-            render_screen_into(
-                &mut canvas,
-                VIEWPORT_PADDING,
-                VIEWPORT_PADDING,
-                &terminal.screen,
-                &theme,
-                &RenderOptions::default(),
-            );
-            commit_blocking(&mut client, &canvas)?;
+            if let Some(frame) = shm.as_mut() {
+                frame.canvas.fill(theme.bg);
+                render_screen_into(
+                    &mut frame.canvas,
+                    VIEWPORT_PADDING,
+                    VIEWPORT_PADDING,
+                    &terminal.screen,
+                    &theme,
+                    &RenderOptions::default(),
+                );
+                let damage = tracker.update(&frame.canvas);
+                match client.commit_shm(frame, damage) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        // Поколение устарело (композитор пересоздал поверхность):
+                        // дальше — полный кадр, как legacy-клиент.
+                        if let Some(stale) = shm.take() {
+                            let _ = client.release_shm(&stale);
+                        }
+                        fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
+                        dirty = true;
+                    }
+                    Err(error) => return Err(format!("commit_shm: {error}")),
+                }
+            } else if let Some(canvas) = fallback.as_mut() {
+                canvas.fill(theme.bg);
+                render_screen_into(
+                    canvas,
+                    VIEWPORT_PADDING,
+                    VIEWPORT_PADDING,
+                    &terminal.screen,
+                    &theme,
+                    &RenderOptions::default(),
+                );
+                commit_blocking(&mut client, canvas)?;
+            }
             dirty = false;
             last_commit = Instant::now();
         }
