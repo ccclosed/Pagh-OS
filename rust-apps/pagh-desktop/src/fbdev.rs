@@ -12,6 +12,7 @@
 use crate::backend::Backend;
 use crate::canvas::Canvas;
 use crate::geometry::Rect;
+use crate::timing::{self, Stage};
 use std::ffi::{c_int, c_ulong, c_void};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -297,6 +298,7 @@ impl FbLayout {
     /// 16/24 bpp и нестандартных масок упаковка выполняется по строке, без
     /// `set_pixel`/`write_pixel` на каждый пиксель.
     pub fn blit_damage(&self, dst: &mut [u8], canvas: &Canvas, damage: &[Rect]) -> usize {
+        let _stage = timing::Scope::new(Stage::Copy);
         let screen = Rect::new(0, 0, self.width as i32, self.height as i32);
         let canvas_rect = canvas.bounds();
         let bytes = self.bytes_per_pixel();

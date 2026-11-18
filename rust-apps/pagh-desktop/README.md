@@ -150,6 +150,63 @@ cargo run --bin pagh-desktop -- --backend fbdev --fbdev /dev/fb0 \
 это документированное поведение `docs/desktop-b.md` §3.1, а не потеря функции.
 Shell/serial продолжают работать; после выхода desktop кадр остаётся на экране.
 
+## Frame time: замерочный harness (`--bench`)
+
+Оптимизация рендера начинается с цифры, поэтому в бинарь встроен замер:
+`--bench` прогоняет четыре сценария нагрузки **тем же** путём, что и сервер
+(`Compositor::render` → `Backend::present`), и печатает frame time в serial.
+
+```bash
+# хост (fbdev нет — тот же blit в память через FbLayout):
+pagh-desktop --bench --bench-frames 120 --bench-json .cache/frametime-baseline.json
+# гость QEMU (реальный /dev/fb0 и scanout):
+rust /mnt/pd --bench --bench-frames 120 --bench-label qemu
+```
+
+Сценарии (`--bench-frames N` измеренных кадров каждый + 4 кадра прогрева):
+
+| сценарий | каждый кадр |
+|---|---|
+| `idle-full` | полная перерисовка статичного рабочего стола |
+| `drag` | окно Terminal тянется за заголовок (±20 px) |
+| `cursor` | курсор идёт по кругу над обоями и окнами |
+| `files-scroll` | новое содержимое окна Files (скролл) |
+
+Метрики — `avg/p50/p95/max` кадра и breakdown стадий (вложенность важна:
+`Blend ⊂ Render`, `Copy ⊂ Present`, `Shadow ⊂ Blend` — доли, а не слагаемые):
+
+* `render_ms` — `Compositor::render` целиком (paint_scene);
+* `blend_ms` — операции холста (заливки, текст, блиты слоёв);
+* `shadow_ms` — попиксельный проход тени окна (отдельная стадия, потому что это
+  доминирующая стоимость кадра; измеряется отдельно от `blend`);
+* `copy_ms` — `FbLayout::blit_damage` (canvas → scanout);
+* `present_ms` — `Backend::present` целиком (включает `copy`);
+* `damage_rects`, `opaque_pct` — ректов damage на кадр и доля пикселей, записанных
+  непрозрачным путём (кандидат на `memcpy` вместо alpha-blend).
+
+Тайминг — `rdtsc` (`src/timing.rs`), калибровка в наносекунды против
+`CLOCK_MONOTONIC` один раз за процесс; счётчики пер-поточные, поэтому
+параллельные тесты и серверный поток не смешивают кадры. JSON пишется
+`--bench-json PATH` и дополнительно печатается между маркерами
+`FRAMETIME_JSON_BEGIN`/`FRAMETIME_JSON_END` (снять из serial без доступа к
+гостевой ФС). В живом сервере `--frame-log-every N` печатает ту же сводку
+каждые N presented-кадров.
+
+Измеренный baseline (host, release, 1280×800, 120 кадров, i5-12400F):
+
+| сценарий | frame avg | p50 | p95 | render | из него shadow | blend | copy |
+|---|---|---|---|---|---|---|---|
+| idle-full | 34.60 | 34.01 | 36.66 | 34.16 | 31.24 | 2.90 | 0.43 |
+| drag | 27.42 | 27.34 | 28.01 | 27.25 | 24.94 | 2.29 | 0.17 |
+| cursor | 20.10 | 17.48 | 23.63 | 20.10 | 18.30 | 1.79 | 0.001 |
+| files-scroll | 23.40 | 23.40 | 23.51 | 23.30 | 21.24 | 2.04 | 0.10 |
+
+Вывод baseline: ~91 % времени кадра — попиксельный проход тени окна
+(`paint_window_cached`), который не режется damage-отсечением (при крошечном
+damage курсора он всё равно идёт по всей площади окна), а `copy` в scanout —
+0.1–0.4 мс. Корректность рендера держит `tests/render_goldens.rs`: FNV-1a
+дайджесты кадра для четырёх состояний сцены, попиксельно.
+
 QEMU-приёмка (сама собирает static musl бинарники, готовит pagh-ext2 диск,
 запускает desktop и проверяет framebuffer/serial):
 
