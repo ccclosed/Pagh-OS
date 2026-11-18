@@ -270,15 +270,21 @@ pub static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "su",
-        description: "Switch the session identity (root session only, no password yet)",
-        usage: "su [user]",
+        description: "Switch the session identity, authenticating when the session is not root",
+        usage: "su [-p] [user]",
         handler: super::commands::cmd_su,
     },
     CommandSpec {
         name: "login",
-        description: "Start a session identity for a /etc/passwd user",
-        usage: "login <user>",
+        description: "Start a session identity for a /etc/passwd user (-p forces a password prompt)",
+        usage: "login [-p] <user>",
         handler: super::commands::cmd_login,
+    },
+    CommandSpec {
+        name: "passwd",
+        description: "Set a password in /etc/shadow (no echo; root may target any user)",
+        usage: "passwd [user]",
+        handler: super::commands::cmd_passwd,
     },
     CommandSpec {
         name: "whoami",

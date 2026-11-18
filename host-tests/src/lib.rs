@@ -66,6 +66,11 @@ pub mod cmsg;
 #[path = "../../src/arch/x86_64/linux/cred.rs"]
 pub mod cred;
 
+// `/etc/shadow` parser + `$6$` SHA-512-crypt (non-root A4): the same source the
+// kernel compiles, checked against independent `openssl passwd -6` vectors.
+#[path = "../../src/shell/shadow.rs"]
+pub mod shadow;
+
 // Shell identity database: pure `/etc/passwd` + `/etc/group` parsing used by
 // `id`/`groups`/`su` (phase 1 "groups separate from root"). `core`+`alloc`
 // only, so property P58 exercises the exact source the kernel compiles.
@@ -699,6 +704,11 @@ mod properties {
     // `p59` is the blocking-read wakeup property and `p60` the shutdown policy,
     // so this is `p61`.
     mod p61;
+
+    // `/etc/shadow` + `$6$` SHA-512-crypt (non-root A4): known `openssl passwd -6`
+    // vectors, fail-closed locked/unknown methods, and line-preserving rewrite.
+    // `p60` is the shutdown policy, so this is `p62`.
+    mod p62;
 
     // Socket payload cap (`sendto`/`recvfrom`): the kernel validated with a
     // capped length and then allocated/copied the raw u64 count (2026-11-13
