@@ -406,6 +406,23 @@ const uint8_t *surf = mmap(NULL, info.total_bytes, PROT_READ,
 дублируются в `/dev/input/event0`: терминал получает ввод из event0 desktop'а, и
 эхо `vtinput → event0` дало бы цикл.
 
+**Известный дефект: двойной ввод в Terminal (задокументирован, не исправлен).**
+Дублирование ввода в две очереди — не только защита shell-пути, но и источник
+двойного ввода. Физическое нажатие попадает (а) в PS/2-кольцо shell через
+IRQ1/USB HID и (б) в `/dev/input/event0`, откуда его читает композитор и
+отдаёт окну Terminal. Terminal отправляет полученный байт обратно через
+`/dev/vtinput`; `inject_scancode_from_vt` кладёт его в **то же** PS/2-кольцо
+shell (в event0 намеренно не дублирует — иначе был бы цикл). Пока foreground —
+сам Terminal (`FG_PID` указывает на его pid), vtinput уходит в `STDIN_PENDING`
+и shell ничего не видит. Но когда окно Terminal не является foreground-заданием
+shell (например, композитор держит экран, а shell ждёт на промпте, или Terminal
+запущен клиентом композитора), один и тот же символ доходит до shell дважды:
+напрямую из PS/2-кольца и эхом из Terminal через vtinput. Симптом — удвоенные
+символы в kernel-shell при наборе в окне Terminal. Это дефект kernel-ABI
+(разделение очередей shell/event0 и обратный мост vtinput), а не композитора;
+он назван здесь и в `rust-apps/pagh-terminal/TERMINAL.md`, но в этом срезе не
+чинился.
+
 ### 5.5. Ограничения VT-поверхности
 
 Одна консоль (`vtconsole0`); scrollback/selection остаются в kernel и не
