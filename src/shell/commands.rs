@@ -749,6 +749,20 @@ pub(super) fn cmd_login(_ctx: &mut ShellCtx, args: &[&str]) {
     switch_session("login", args[0]);
 }
 
+/// `whoami`: имя пользователя по **effective** uid из `/etc/passwd`.
+///
+/// Это ровно то, с чем `lxrun` запускает программы: сессионная идентичность
+/// (`su`/`login`/`/etc/pagh-session`). Если записи нет — печатается число,
+/// как `id`, а не выдуманное имя.
+pub(super) fn cmd_whoami(_ctx: &mut ShellCtx, args: &[&str]) {
+    if !args.is_empty() {
+        shell_println("whoami: usage: whoami");
+        return;
+    }
+    let creds = identity::current();
+    shell_println(&identity::user_label(creds.euid));
+}
+
 /// Общая часть `su`/`login`: построить идентичность цели и поставить её сессии.
 ///
 /// Возвращает `None`, если переключение не состоялось (сообщение уже

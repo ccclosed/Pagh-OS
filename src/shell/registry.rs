@@ -281,6 +281,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_login,
     },
     CommandSpec {
+        name: "whoami",
+        description: "Print the user name of the session's effective uid",
+        usage: "whoami",
+        handler: super::commands::cmd_whoami,
+    },
+    CommandSpec {
         name: "head",
         description: "Print the first lines of a file",
         usage: "head [-n LINES] FILE",
