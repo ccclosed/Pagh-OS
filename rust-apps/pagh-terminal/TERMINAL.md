@@ -326,6 +326,36 @@ Resize — только серверный: клиент не просит ра�
 нет.  Ошибки: magic/flags/type/payload/stride/pixel-length отклоняются как
 `InvalidData`; клиент не паникует на обрезанном потоке.
 
+## Оконная shell-сессия (два pipe, не boot-VT)
+
+Окно терминала в desktop B — **отдельная интерактивная сессия**, а не зеркало
+загрузочной консоли. При запуске с `--socket` (и без `--mirror-vt`) клиент
+запускает процесс-потомок `pagh-terminal --shell-child` с pipe'ами на
+stdin/stdout/stderr; вывод потомка идёт в VT-парсер этого окна, клавиатура окна —
+в его stdin. `/dev/vtconsole0` не читается, `/dev/vtinput` не трогается: desktop
+(`lxrun`) продолжает владеть boot-VT и его foreground-вводом, но больше не
+перехватывает набор в окне.
+
+Почему так, а не переиспользовать kernel-shell: shell ядра — консольная задача
+(`fb_println!`/`kprintln!` + PS/2-кольцо), её нельзя перенаправить в pipe без
+переписывания всего консольного UI. Спавн потомка ядро уже поддерживает
+(`posix_spawn`/`vfork` через `clone(CLONE_VM|CLONE_VFORK)` + `pipe2`); этим же
+путём desktop запускает приложения. Внутри того же статического бинаря живёт
+минимальный userspace shell: `help`, `ls`, `cd`, `pwd`, `echo`, `cat`, `uname`,
+`clear`, `exit` (плюс Backspace/Ctrl+U/Ctrl+C/Ctrl+D в строке). Команды
+kernel-shell (`df`, `ps`, `pkg`, `lxrun`, …) в сессии недоступны — `help` говорит
+об этом прямо, а `command not found` не делает вид, что команды нет в системе.
+
+Старое поведение осталось для диагностики: `--mirror-vt` рисует в окне снимок
+boot-VT и пишет ввод в `/dev/vtinput`, а `--vt PATH` без `--socket` печатает
+один снимок в stdout (headless).
+
+Ограничения сессии (честно, до PTY-этапа): нет управляющего терминала и
+`struct termios`, нет `TIOCGWINSZ`/SIGWINCH (размер знает только окно), нет
+job-control/Ctrl+Z, нет `SIGINT` реальному потомку (`Ctrl+C` — байт `0x03` в его
+stdin), нет echo-режима ядра (эхо делает сам shell-потомок). Кадры идут полным
+кадром, как в `--vt`-режиме, а не damage'ом.
+
 ## Kernel console shared surface ABI v1
 
 Реализовано в kernel (`/dev/vtconsole0`, `/dev/vtinput`; см.
@@ -538,8 +568,11 @@ Kernel-side проверка (после реализации): boot-тест п
   без частичных damage; `/dev/vtinput` переводит байты в PS/2-скан-коды shell
   (см. `docs/desktop-b.md` §5.4 — UTF-8 > ASCII пока отбрасывается).
   `kernel/src/**` этим крейтом не тронут.
-* **Нет PTY.** Live-режим без `/dev/vtconsole0` использует встроенный demo shell
-  с line editing; произвольные программы запускать нельзя.
+* **Нет PTY/termios/job-control.** Оконная сессия — процесс-shell за двумя
+  pipe'ами: нет управляющего терминала, `TIOCGWINSZ`, SIGWINCH, Ctrl+Z и
+  сигналов реальному потомку; `Ctrl+C` доставляется байтом. Shell внутри сессии —
+  встроенный минимальный userspace-shell (см. «Оконная shell-сессия»), а не
+  kernel-shell и не `/bin/sh` (на demo-образе его нет).
 * **Нет real framebuffer/evdev backend.** Клиент рисует в RGBA и отправляет
   кадры по сокету; `/dev/fb0` и `/dev/input/event0` — следующий шаг server/
   desktop-ветки.

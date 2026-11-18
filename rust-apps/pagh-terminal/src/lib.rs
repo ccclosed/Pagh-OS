@@ -14,6 +14,8 @@
 //! * [`vtconsole`] — parser for the proposed kernel VT console shared text
 //!   surface (ABI v1, see `TERMINAL.md`).
 //! * [`demo`] — built-in demo shell and deterministic screenshot generator.
+//! * [`session`] / [`sh`] — a real shell child behind two pipes for the terminal
+//!   window, and the minimal userspace shell it runs (boot-VT mirror is opt-in).
 
 #![forbid(unsafe_code)]
 
@@ -28,6 +30,8 @@ pub mod png;
 pub mod protocol;
 pub mod render;
 pub mod screen;
+pub mod session;
+pub mod sh;
 pub mod unicode_tables;
 pub mod vtconsole;
 

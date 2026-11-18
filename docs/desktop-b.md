@@ -304,10 +304,12 @@ fb[y * (fix.line_length / 4) + x] = argb;
 
 ## 5. `/dev/vtconsole0` + `/dev/vtinput` — shared VT surface
 
-Терминальное окно desktop B не переписывает shell на userspace PTY: kernel-VT
-остаётся владельцем сетки/курсора/scrollback, а терминал получает **read-only
-снимок видимой текстовой матрицы** и рисует его своим шрифтом. Ввод идёт обратно
-байтами через `/dev/vtinput`. Полный ABI — в
+Терминальное окно desktop B больше не зеркалит kernel-VT по умолчанию: оно
+запускает **собственный shell-потомок** (`pagh-terminal --shell-child`) с pipe'ами
+stdin/stdout, поэтому чистое окно не показывает boot-лог, а набор не уходит в
+`lxrun`, который держит консоль в форграунде. Старое поведение — снимок видимой
+текстовой матрицы + ввод байтами через `/dev/vtinput` — осталось диагностическим
+режимом `--mirror-vt`. Полный ABI — в
 `rust-apps/pagh-terminal/TERMINAL.md` (§«Kernel console shared surface ABI v1»);
 ниже — контракт, который реализует ядро.
 
@@ -702,8 +704,9 @@ Linux-поведение снято одноразовым пробником н
 * **Аппаратный курсор, KMS modeset, vt-switch, hotplug**: нет.
 * **EV_ABS/touch, EV_LED, автоповтор**: нет.
 * **fbdev modeset** (`FBIOPUT_VSCREENINFO`) и панорамирование: нет.
-* **PTY/терминал в окне**: kernel-shell остаётся особым случаем; userspace PTY
-  появится отдельно.
+* **PTY/терминал в окне**: окно запускает userspace shell за двумя pipe'ами
+  (без termios/job-control/размера окна), а kernel-shell остаётся особым случаем;
+  полноценный userspace PTY появится отдельно.
 
 ---
 

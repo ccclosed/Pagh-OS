@@ -60,9 +60,13 @@ cargo run -- --headless --script session.bin --cols 100 --rows 30 \
 # живое окно через compositor (task desktop-server)
 cargo run -- --socket /tmp/pagh-desktop.sock --size 900x600
 
-# kernel VT shared surface (когда появится /dev/vtconsole0)
+# окно с собственной shell-сессией (по умолчанию для --vt + --socket):
+# дочерний shell за pipe'ами, boot-VT не читается и ввод в lxrun не уходит
+cargo run -- --vt /dev/vtconsole0 --socket /tmp/pagh-desktop.sock
+
+# диагностика: по-прежнему зеркалить boot-VT в окне
 cargo run -- --vt /dev/vtconsole0 --vt-input /dev/vtinput \
-  --socket /tmp/pagh-desktop.sock
+  --socket /tmp/pagh-desktop.sock --mirror-vt
 ```
 
 Headless-демо: `01-welcome`, `02-colors`, `03-scrollback`, `04-unicode`.
@@ -71,9 +75,11 @@ Headless-демо: `01-welcome`, `02-colors`, `03-scrollback`, `04-unicode`.
 
 ## Ограничения
 
-Пока нет реального PTY и kernel-side shared surface (ABI v1 описан в
-[TERMINAL.md](TERMINAL.md)). Live-режим подключается к `pagh-desktop` по PDP/1;
-без VT-устройства используется demo shell. ShmSurface включается только если
+Полноценного PTY нет (ABI v1 kernel console surface описан в
+[TERMINAL.md](TERMINAL.md)). Live-режим подключается к `pagh-desktop` по PDP/1:
+окно запускает собственный shell-потомок через pipe'ы (минимальный userspace
+shell `help/ls/cd/pwd/echo/cat/uname/clear/exit`), а не зеркалит boot-VT;
+`--mirror-vt` возвращает старое зеркало для диагностики. ShmSurface включается только если
 сервер объявил `welcome.flags` bit 2 (иначе — полный кадр). Нет reflow при
 resize,
 комбинирующие метки не компонуются, OSC 4/8/52 игнорируются.  Подробно —
