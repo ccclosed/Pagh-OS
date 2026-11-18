@@ -2870,14 +2870,21 @@ def mode_desktop(h: "Harness") -> tuple[str, int]:
                               15.0, label="selection drag start")
         ok &= h.check("LMB on empty desktop starts rubber-band selection",
                       drag_start is not None, drag_start or "no drag-start trace")
-        for _ in range(4):
+        for _ in range(6):
             h.qmp.rel(-45, -35)
-            time.sleep(0.03)
-        time.sleep(0.5)
+            time.sleep(0.08)
         selection = CACHE / "e2e_desktop_selection.png"
-        kb.screenshot(selection)
-        selection_changed = (selection.is_file() and moved.is_file()
-                             and selection.read_bytes() != moved.read_bytes())
+        # The TCG compositor presents at ~1 fps, and QEMU's display updates a
+        # surface later still; a single 0.5 s dump reproducibly caught the frame
+        # before the overlay landed. Retry like the F10-menu dump above.
+        selection_changed = False
+        for attempt in range(3):
+            time.sleep(1.0 if attempt == 0 else 1.5)
+            kb.screenshot(selection)
+            selection_changed = (selection.is_file() and moved.is_file()
+                                 and selection.read_bytes() != moved.read_bytes())
+            if selection_changed:
+                break
         ok &= h.check("QEMU framebuffer shows the selection rectangle",
                       selection_changed, f"{selection.name} differs={selection_changed}")
         h.qmp.button("left", False)
@@ -2885,7 +2892,8 @@ def mode_desktop(h: "Harness") -> tuple[str, int]:
             guest, [r"pagh-desktop: selection committed rect=\(\d+, \d+, \d+x\d+\)"],
             15.0, label="selection committed")
         ok &= h.check("release commits the selection rect", committed is not None,
-                      committed or "no commit trace")
+                      regex_first(r"pagh-desktop: selection committed[^\r\n]*",
+                                  guest.serial()) or committed or "no commit trace")
 
         # Exit + one-way takeover: shell keeps running on serial, but the kernel
         # console must not repaint the screen over the last desktop frame.
