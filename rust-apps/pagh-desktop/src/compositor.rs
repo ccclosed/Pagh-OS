@@ -2196,6 +2196,117 @@ mod tests {
         compositor.pointer_button(MouseButton::Left, false);
     }
 
+    /// ЛКМ по клиентской области уходит клиенту как PDP `input`/button press с
+    /// координатами внутри поверхности — и НЕ открывает меню рабочего стола.
+    /// Это контракт `window_hit`/`pointer_button` (PROTOCOL.md §5).
+    #[test]
+    fn left_press_in_content_delivers_button_to_client() {
+        let mut compositor = compositor();
+        let content = compositor.window(2).unwrap().content_rect();
+        let point = content.center();
+        compositor.pointer_motion(point);
+        let events = compositor.pointer_button(MouseButton::Left, true);
+        assert!(
+            compositor.context_menu().is_none(),
+            "ЛКМ внутри окна не должна открывать меню рабочего стола"
+        );
+        let mut pressed = None;
+        for event in &events {
+            if let HostEvent::Send {
+                message:
+                    Message::Input {
+                        window_id,
+                        event:
+                            crate::protocol::InputEvent::Button {
+                                x,
+                                y,
+                                button,
+                                pressed: true,
+                                ..
+                            },
+                    },
+                ..
+            } = event
+            {
+                pressed = Some((*window_id, *x, *y, *button));
+            }
+        }
+        let (window_id, x, y, button) = pressed.expect("press не доставлен клиенту");
+        assert_eq!(window_id, 2);
+        assert_eq!(button, MouseButton::Left.to_wire());
+        assert_eq!(
+            (x, y),
+            (point.x - content.x, point.y - content.y),
+            "координаты press обязаны быть относительно клиентской поверхности"
+        );
+        let release = compositor.pointer_button(MouseButton::Left, false);
+        let released = release.iter().any(|event| {
+            matches!(
+                event,
+                HostEvent::Send {
+                    message: Message::Input {
+                        event: crate::protocol::InputEvent::Button { pressed: false, .. },
+                        ..
+                    },
+                    ..
+                }
+            )
+        });
+        assert!(released, "release не доставлен клиенту");
+    }
+
+    /// ЛКМ по пустому рабочему столу не открывает меню и ничего не шлёт;
+    /// меню рабочего стола — только ПКМ.
+    #[test]
+    fn left_press_on_empty_desktop_opens_no_menu() {
+        let mut compositor = compositor();
+        // Точка ниже окон и выше панели: чистые обои.
+        let empty = Point::new(1200, 640);
+        for window in compositor.windows() {
+            assert!(!window.frame.contains(empty), "точка должна быть вне окон");
+        }
+        compositor.pointer_motion(empty);
+        let events = compositor.pointer_button(MouseButton::Left, true);
+        assert!(events.is_empty(), "ЛКМ по обоям ничего не шлёт");
+        assert!(
+            compositor.context_menu().is_none(),
+            "ЛКМ по пустому месту не открывает меню"
+        );
+        compositor.pointer_button(MouseButton::Left, false);
+        let events = compositor.pointer_button(MouseButton::Right, true);
+        assert!(events.is_empty());
+        assert!(
+            compositor.context_menu().is_some(),
+            "ПКМ по пустому месту открывает меню рабочего стола"
+        );
+    }
+
+    /// ПКМ внутри клиентской области — это клиентское контекстное меню:
+    /// композитор пересылает кнопку, а своё меню рабочего стола не открывает.
+    #[test]
+    fn right_press_in_content_goes_to_client_not_desktop_menu() {
+        let mut compositor = compositor();
+        let point = compositor.window(2).unwrap().content_rect().center();
+        compositor.pointer_motion(point);
+        let events = compositor.pointer_button(MouseButton::Right, true);
+        assert!(compositor.context_menu().is_none());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HostEvent::Send {
+                message: Message::Input {
+                    event: crate::protocol::InputEvent::Button {
+                        button: 3,
+                        pressed: true,
+                        ..
+                    },
+                    ..
+                },
+                ..
+            }
+        )));
+        compositor.pointer_button(MouseButton::Right, false);
+    }
+
     #[test]
     fn drag_titlebar_moves_window_and_reports_damage() {
         let mut compositor = compositor();
