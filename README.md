@@ -507,10 +507,9 @@ Prompt показывает текущий рабочий каталог и ре
 | `fscrash`            | Демо replay журнала + персистентность (запись → remount → проверка) |
 | `sleep <seconds>`    | Спать N секунд                                                  |
 | `nano <path>`        | Полноэкранный редактор: undo/redo, поиск/замена, goto, клипборд  |
-| `rust <path> [...]`  | Запустить `.rs`/`.pbc` через mini-Rust или любой ELF через Linux-слой |
-| `rustc <file.rs>`    | Скомпилировать Rust-исходник в `.pbc` (реальный `/mnt/usr/bin/rustc`, если установлен, иначе встроенный mini-Rust) |
-| `cargo …`            | Реальный `/mnt/usr/bin/cargo`, если установлен, иначе встроенный mini-Rust |
-| `rustup …`           | Посмотреть встроенный офлайн-тулчейн mini-Rust                  |
+| `rust <path> [...]`  | Запустить статический Linux ELF (например, нативный Rust musl-бинарник) через Linux-слой |
+| `rustc <file.rs>`    | Запустить установленный `/mnt/usr/bin/rustc` через Linux-слой (встроенный mini-Rust удалён) |
+| `cargo …`            | Запустить установленный `/mnt/usr/bin/cargo` через Linux-слой  |
 | `lua [file\|-e code]` | Запустить Lua 5.5 (ставится через apt)                        |
 | `python [file\|-c code]` | Запустить установленный CPython 3.16 (glibc) через Linux-слой |
 | `python3 [file\|-c code]` | Алиас `python`                                             |
@@ -592,31 +591,13 @@ printf 'hello pagh' | nc -u 127.0.0.1 5555
 
 ## Rust-приложения и nano+
 
-### Встроенный mini-Rust
+### Встроенный mini-Rust удалён
 
-pagh включает офлайн-тулчейн в стиле Rust, рассчитанный на исходники, написанные прямо в
-`nano+`. Он намеренно меньше upstream rustc, Cargo и rustup, но использует привычные
-команды и не требует сети или хостового компилятора.
-
-```text
-cargo new /mnt/hello
-nano /mnt/hello/src/main.rs
-cargo run /mnt/hello
-
-nano /mnt/test.rs
-rust /mnt/test.rs
-rustc /mnt/test.rs -o /mnt/test.pbc
-rust /mnt/test.pbc
-
-rustup show
-rustup target list
-```
-
-Поддерживаемый синтаксис mini-Rust включает `fn main()`, целочисленные переменные и
-арифметику, целочисленные массивы, `.iter().sum()`, `println!`/`print!`, присваивания и
-целочисленные диапазоны `for`. Cargo поддерживает `new`, `check`, `build` и `run`. Файлы
-`.pbc` — портативные пакеты исходников, интерпретируемые встроенным runtime, а не
-нативные ELF.
+Раньше `rust`, `rustc`, `cargo` и `rustup` умели исполнять `.rs`/`.pbc` встроенным
+интерпретатором «pagh-mini» прямо в ring 0. Он удалён: парсер недоверенного исходника
+работал кодом ядра. Сейчас `rust <path>` — чистый алиас `lxrun` для Linux ELF,
+`.rs`/`.pbc` отвергаются с сообщением об удалении, а `cargo`/`rustc` запускают только
+установленные `/mnt/usr/bin/{cargo,rustc}` через Linux-слой.
 
 ### Нативный Rust-userland
 
@@ -633,9 +614,9 @@ tools/build-rust-app.sh rust-apps/hello
 rust /mnt/pagh-rust-hello one two
 ```
 
-Для `.rs` и `.pbc` команда `rust` выбирает встроенный интерпретатор. Для остальных файлов
-она выбирает ring-3 Linux ELF-загрузчик — статический или glibc-dynamic, однопоточный или
-многопоточный. GUI-библиотеки для нативных бинарников по-прежнему не поддерживаются.
+Команда `rust` — алиас `lxrun`: она запускает статический или glibc-dynamic Linux ELF
+(однопоточный или многопоточный) в ring 3. `.rs`/`.pbc` больше не исполняются в ядре.
+GUI-библиотеки для нативных бинарников по-прежнему не поддерживаются.
 
 ### Редактор nano+
 
@@ -801,7 +782,6 @@ src/
 │   ├── commands.rs     #   command handlers (ls, cd, cat, cp, mv, stat, write, nc, …)
 │   ├── nano.rs         #   full-screen text editor with undo/search/goto
 │   ├── nano_config.rs  #   persistent nano+ settings (theme, tabs, backups)
-│   ├── toolchain.rs    #   embedded cargo/rustc/rustup + mini-Rust runtime
 │   └── paint.rs        #   windowed mouse-driven framebuffer paint application
 ├── arch/
 │   ├── cpu.rs          # safe wrappers for privileged instrs (hlt/cli/sti/rd-/wrmsr, SSE)

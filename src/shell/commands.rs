@@ -1653,44 +1653,40 @@ pub(super) fn cmd_nano(_ctx: &mut ShellCtx, args: &[&str]) {
     super::nano::run(args[0]);
 }
 
-/// `rust <path> [args...]`: запустить мини-Rust исходник/пакет или Linux ELF.
-/// Путь `.rs`/`.pbc` идёт во встроенный мини-Rust toolchain; всё остальное
-/// передаётся загрузчику Linux-совместимости (`cmd_lxrun`).
+/// `rust <path> [args...]`: запустить Linux ELF через слой совместимости.
+///
+/// Встроенный мини-Rust интерпретатор удалён: он разбирал и исполнял недоверенный
+/// `.rs`/`.pbc` прямо в ring 0, то есть парсер атакующего работал кодом ядра.
+/// Команда оставлена чистым алиасом `lxrun` для нативных Rust-userland бинарников
+/// (статических musl ELF); исходники и `.pbc`-пакеты отвергаются.
 pub(super) fn cmd_rust(ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
-        shell_println("usage: rust <file.rs|file.pbc|static-elf> [args...]");
+        shell_println("usage: rust <static-elf> [args...]");
         return;
     }
     if args[0].ends_with(".rs") || args[0].ends_with(".pbc") {
-        if let Err(e) = super::toolchain::run_path(args[0]) {
-            super::render::error_line(&alloc::format!("rust: {}", e));
-        }
-    } else {
-        cmd_lxrun(ctx, args);
+        super::render::error_line("rust: mini-Rust removed; use lxrun for Linux ELF binaries");
+        return;
     }
+    cmd_lxrun(ctx, args);
 }
 
-/// Встроенный офлайн мини-Rust пакетный менеджер.
+/// `cargo`: запустить установленный `/mnt/usr/bin/cargo` через Linux-слой.
 pub(super) fn cmd_cargo(ctx: &mut ShellCtx, args: &[&str]) {
     if crate::vfs::lookup_path("/mnt/usr/bin/cargo").is_ok() {
         runtime_command(ctx, "/mnt/usr/bin/cargo", &[], args);
     } else {
-        super::toolchain::cargo(args);
+        super::render::error_line("cargo: not installed (the embedded mini-Rust was removed)");
     }
 }
 
-/// Скомпилировать мини-Rust исходник в переносимый `.pbc`-пакет исходников.
+/// `rustc`: запустить установленный `/mnt/usr/bin/rustc` через Linux-слой.
 pub(super) fn cmd_rustc(ctx: &mut ShellCtx, args: &[&str]) {
     if crate::vfs::lookup_path("/mnt/usr/bin/rustc").is_ok() {
         runtime_command(ctx, "/mnt/usr/bin/rustc", &[], args);
     } else {
-        super::toolchain::rustc(args);
+        super::render::error_line("rustc: not installed (the embedded mini-Rust was removed)");
     }
-}
-
-/// Показать встроенный мини-Rust toolchain.
-pub(super) fn cmd_rustup(_ctx: &mut ShellCtx, args: &[&str]) {
-    super::toolchain::rustup(args);
 }
 
 fn runtime_command(ctx: &mut ShellCtx, path: &'static str, prefix: &[&'static str], args: &[&str]) {
