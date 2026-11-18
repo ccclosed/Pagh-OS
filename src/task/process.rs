@@ -548,16 +548,26 @@ pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u6
 /// Для **не-root** сессии образ проверяется на execute+read по тем же битам,
 /// что и `execve` (root-сессия сохраняет историческое поведение лаунчера,
 /// документированное в `SECURITY.md`: kernel-лаунчеры обходят проверку
-/// сисколлов). Проверка промежуточных каталогов путём пока не выполняется —
-/// это ограничение фазы 1, вынесенное в `docs/security/groups.md`.
+/// сисколлов). Обход пути для не-root сессии проверяет и search-биты
+/// промежуточных каталогов.
+///
+/// Как и `execve(2)`, лаунчер применяет `S_ISUID`/`S_ISGID` цели (см.
+/// [`Creds::exec_setid`]) — иначе бинарь с setuid-битом, запущенный из
+/// непривилегированной сессии, вёл бы себя не как под Linux. Права
+/// проверяются по **исходным** креденшелам, биты применяются после проверки.
 pub fn run_linux_binary_as(
-    creds: Creds,
+    mut creds: Creds,
     path: &str,
     argv: &[&[u8]],
     envp: &[&[u8]],
 ) -> Result<u64, RunError> {
-    if !creds.is_root() {
-        let resolved = resolve_exec_path(path);
+    // Разрешить путь один раз: узел нужен и для проверок не-root сессии, и для
+    // `mode`/`owner` setuid-on-exec. Ошибку разрешения сообщает сам запуск
+    // (ENOENT/ENOEXEC), поэтому для root её здесь не поднимаем.
+    let resolved = resolve_exec_path(path);
+    let node = if creds.is_root() {
+        crate::vfs::lookup_path_walk(&resolved, true).ok()
+    } else {
         let may_search = |node: &Arc<dyn crate::vfs::VfsNode>| {
             creds.may(node.mode(), node.owner(), Access::Execute)
         };
@@ -568,6 +578,10 @@ pub fn run_linux_binary_as(
         {
             return Err(RunError::AccessDenied);
         }
+        Some(node)
+    };
+    if let Some(node) = node {
+        creds = creds.exec_setid(node.mode(), node.owner());
     }
     run_linux_binary_inner(creds, path, argv, envp)
 }

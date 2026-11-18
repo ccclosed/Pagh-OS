@@ -347,21 +347,56 @@ pub fn sys_execve(regs: &mut SavedRegs, path: u64, argv: u64, envp: u64) -> Resu
     // с образом/памятью. Root всё равно нуждается хотя бы в одном x-бите
     // (`Creds::may`); отсутствующий путь оставляется `exec_linux_image`, который
     // сообщает ENOENT.
-    if let Some(node) = crate::task::process::exec_target_node(&path) {
-        let creds = crate::task::compat::current_creds();
-        if !creds.may(
-            node.mode(),
-            node.owner(),
-            crate::arch::x86_64::linux::cred::Access::Execute,
-        ) {
-            return Err(Errno::EACCES);
+    //
+    // Заодно запоминаются `mode`/`owner` цели: по ним Linux (`bprm_fill_uid`)
+    // решает setuid/setgid уже ПОСЛЕ успешной загрузки образа, поэтому биты
+    // применяются ниже, а не здесь — неудачный exec не должен менять ids.
+    let exec_bits = match crate::task::process::exec_target_node(&path) {
+        Some(node) => {
+            let mode = node.mode();
+            let owner = node.owner();
+            let creds = crate::task::compat::current_creds();
+            if !creds.may(
+                mode,
+                owner,
+                crate::arch::x86_64::linux::cred::Access::Execute,
+            ) {
+                return Err(Errno::EACCES);
+            }
+            Some((mode, owner))
         }
-    }
+        None => None,
+    };
     let av = exec_vec(argv, &mut budget)?;
     let ev = exec_vec(envp, &mut budget)?;
     let ar: Vec<&[u8]> = av.iter().map(|v| v.as_slice()).collect();
     let er: Vec<&[u8]> = ev.iter().map(|v| v.as_slice()).collect();
     let image = crate::task::process::exec_linux_image(&path, &ar, &er).map_err(runerr)?;
+    // ── setuid/setgid-on-exec (A1) ──────────────────────────────────────────
+    // Linux применяет биты только к успешному exec; образ уже установлен, так
+    // что дальше ошибки нет. `S_ISUID` → `euid = suid =` владелец файла,
+    // `S_ISGID` → `egid = sgid =` группа файла; real ids и supplementary-наборы
+    // не трогаются (это делает `su` через `setgroups(2)`).
+    if let Some((mode, owner)) = exec_bits {
+        let current = crate::task::compat::current_creds();
+        let next = current.exec_setid(mode, owner);
+        if next != current {
+            crate::task::compat::set_current_creds(next);
+            if next.runs_privileged() {
+                crate::info!(
+                    "[linux] execve '{}': setuid/setgid mode={:o} owner={}:{} -> euid={} egid={} uid={} gid={}",
+                    path,
+                    mode & 0o7777,
+                    owner.0,
+                    owner.1,
+                    next.euid,
+                    next.egid,
+                    next.uid,
+                    next.gid
+                );
+            }
+        }
+    }
     let flags = regs.r11;
     *regs = SavedRegs::default();
     regs.r11 = flags | 2;
