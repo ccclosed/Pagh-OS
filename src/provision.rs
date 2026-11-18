@@ -59,7 +59,6 @@ pub fn seed() {
         ensure_dir("/mnt/home/user")?;
         ensure_dir("/mnt/usr/share/pagh")?;
         ensure_dir("/mnt/examples/hello/src")?;
-        write_once("/mnt/etc/pagh-release", RELEASE)?;
         // Резолвер glibc читает их до того, как заработает любой getaddrinfo;
         // 10.0.2.3 — встроенный DNS-форвардер QEMU slirp.
         write_once(
@@ -75,6 +74,11 @@ pub fn seed() {
         )?;
         write_once("/mnt/examples/hello/Cargo.toml", CARGO)?;
         write_once("/mnt/examples/hello/src/main.rs", MAIN_RS)?;
+        // Маркер «провижининг завершён» пишется ПОСЛЕДНИМ: если загрузка
+        // оборвалась посередине, следующий boot увидит его отсутствие и
+        // безопасно доделает остаток (все записи идемпотентны). Раньше маркер
+        // шёл первым, и обрыв после него навсегда оставлял диск полу-засеянным.
+        write_once("/mnt/etc/pagh-release", RELEASE)?;
         Ok::<(), VfsError>(())
     })();
     match result {

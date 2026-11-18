@@ -2194,6 +2194,39 @@ def mode_usb(h: Harness) -> tuple[str, int]:
     ok &= h.check("shell screenshot captured",
                   shell_shot.is_file() and shell_shot.stat().st_size > 0, rel(shell_shot))
 
+    # ── clean second boot: a provisioned volume must not re-run the menu ──
+    # The disk now carries the pagh volume the menu just formatted. Before the
+    # fix, `boot_menu::run` returned a menu on EVERY boot (20 s timeout, mount
+    # and format rows) — the "first launch" ritual. A second boot must instead
+    # mount the existing volume and go straight to the shell.
+    log("usb: rebooting the same disk (provisioned) to prove the menu is skipped")
+    guest.stop()
+    h.guest = None
+    h.boot(need_keyboard=False, disk=disk, net=False)
+    assert h.guest is not None
+    second = h.guest
+    second_text = ""
+    if wait_for(second, [r"Welcome to pagh OS Shell!"], a.boot_timeout,
+                label="clean second boot") is not None:
+        second_text = second.serial()
+    skipped = "boot disk menu skipped" in second_text
+    ok &= h.check("second boot skips the disk menu on a provisioned volume",
+                  skipped,
+                  regex_first(r"fs: [^\r\n]*boot menu[^\r\n]*", second_text)
+                  or "no skip marker")
+    reformatted = bool(re.search(r"fs: formatting|operator chose to format",
+                                 second_text))
+    ok &= h.check("second boot performs no format/mount ritual", not reformatted,
+                  "format line present" if reformatted else "none")
+    mounted_again = "ext2 mounted at /mnt" in second_text
+    ok &= h.check("second boot auto-mounts the existing pagh volume",
+                  mounted_again,
+                  regex_first(r"ext2 mounted at /mnt[^\r\n]*", second_text)
+                  or "not mounted")
+    ok &= h.check("second boot reached the shell without a menu timeout",
+                  bool(second_text),
+                  "shell banner seen" if second_text else "no banner")
+
     h.metrics.update({
         "keyboard reports (banner)": kbd_before if kbd_before >= 0 else "n/a",
         "keyboard reports (after `usb`)": int(stats.group(1)) if stats else "n/a",
