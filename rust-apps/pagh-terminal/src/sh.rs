@@ -42,7 +42,8 @@ impl Shell {
         let stdin = io::stdin();
         let stdout = io::stdout();
         let mut input = stdin.lock();
-        let mut out = stdout.lock();
+        let mut raw_out = stdout.lock();
+        let mut out = CrlfWriter::new(&mut raw_out);
         let mut line = Line::new();
         let mut escape = Escape::None;
         let mut pending_cr = false;
@@ -417,6 +418,45 @@ fn columns(names: &[String], width: usize) -> Vec<String> {
         lines.push(line.trim_end().to_string());
     }
     lines
+}
+
+/// Перевод `\n` в `\r\n` на выходе shell-потомка.
+///
+/// Pipe — не терминал: дисциплины строк (`OPOST`/`ONLCR`) здесь нет, поэтому
+/// одиночный `\n` опускает курсор вниз, оставляя колонку, и каждая следующая
+/// строка уезжает вправо. Настоящий tty пишет `\r\n` сам — здесь это делает
+/// эта обёртка, чтобы вывод ложился в сетку окна ровно.
+struct CrlfWriter<'a, W: Write> {
+    inner: &'a mut W,
+    last_cr: bool,
+}
+
+impl<'a, W: Write> CrlfWriter<'a, W> {
+    fn new(inner: &'a mut W) -> CrlfWriter<'a, W> {
+        CrlfWriter {
+            inner,
+            last_cr: false,
+        }
+    }
+}
+
+impl<W: Write> Write for CrlfWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut out = Vec::with_capacity(buf.len() + 8);
+        for &byte in buf {
+            if byte == b'\n' && !self.last_cr {
+                out.push(b'\r');
+            }
+            out.push(byte);
+            self.last_cr = byte == b'\r';
+        }
+        self.inner.write_all(&out)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Точка входа режима `--shell-child`.
