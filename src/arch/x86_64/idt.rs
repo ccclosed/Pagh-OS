@@ -325,6 +325,7 @@ extern "x86-interrupt" fn page_fault_handler(
         fault_addr.as_u64(),
         error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION),
         error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE),
+        error_code.contains(PageFaultErrorCode::USER_MODE),
     ) {
         return;
     }

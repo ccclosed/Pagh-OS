@@ -15,10 +15,10 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
 
+use crate::arch::x86_64::linux::compat_guard::CompatEntry;
 use crate::arch::x86_64::linux::cred::Creds;
 use crate::arch::x86_64::linux::mem::VmRegionSet;
 use crate::arch::x86_64::linux::signal_frame::{
@@ -306,6 +306,8 @@ pub fn compat_exists(pid: u64) -> bool {
 /// доказательство существования. Без этого отказ внутри замыкания (исторически:
 /// store в read-only user-страницу) звал `compat_exists` → повторный
 /// `COMPAT_STATES.lock()` с уже снятым IF → вечный спин (F-r4-arch-1).
+/// `compat_lock_held()` отвечает про ТЕКУЩУЮ задачу, поэтому глубина, поднятая
+/// вытесненной задачей, не выдаётся за существование состояния у этой.
 pub fn compat_exists_for_exit(pid: u64) -> bool {
     if compat_lock_held() {
         true
@@ -322,13 +324,21 @@ pub fn compat_exists_for_exit(pid: u64) -> bool {
 /// [`crate::task::scheduler::exit_current`], который снимет её состояние из
 /// реестра. Возвращает `false`, когда лок не удерживался (обычный kill-путь).
 ///
+/// Отпускает лок только НАСТОЯЩИЙ владелец учёта. Вытесненная задача может
+/// оставить глубину >0, вытеснившись между `enter` и `lock()`, — такая запись
+/// принадлежит не текущей задаче, и сбрасывать её (вместе с Depth) нельзя:
+/// возобновившийся владелец сделал бы `fetch_sub` из нуля, счётчик перевернулся
+/// бы в `usize::MAX`, и guard отказывал бы уже всем отказам подряд. См.
+/// [`crate::arch::x86_64::linux::compat_guard`].
+///
 /// # Safety
 /// Покинутое замыкание не должно продолжать мутировать защищаемую карту: путь
 /// существует для отказов на пользовательской памяти (store в RO-страницу),
 /// которые случаются после изменения compat-состояния. Это последний рубеж
 /// «машина живёт», а не общий механизм отмены.
 pub fn abandon_held_registry() -> bool {
-    if !compat_lock_held() {
+    let pid = super::scheduler::current_pid();
+    if !COMPAT_ENTRY.abandon(pid) {
         return false;
     }
     // SAFETY: прерванный кадр задачи (владелец guard'а) не будет возобновлён:
@@ -338,9 +348,6 @@ pub fn abandon_held_registry() -> bool {
     unsafe {
         COMPAT_STATES.force_unlock();
     }
-    // Счётчик глубины принадлежал тому же прерванному кадру. Обнуляем, чтобы
-    // exit-путь (with_current_compat для кода выхода) снова работал штатно.
-    COMPAT_DEPTH.store(0, Ordering::Relaxed);
     crate::error!(
         "[COMPAT] abandoned COMPAT_STATES held by interrupted with_current_compat (exit recovery)"
     );
@@ -915,23 +922,32 @@ pub fn note_int80_refused() -> bool {
 /// должен звать [`with_current_compat`] повторно (дедлок на том же локе).
 pub fn with_current_compat<R>(f: impl FnOnce(&mut CompatState) -> R) -> Option<R> {
     let pid = super::scheduler::current_pid();
-    COMPAT_DEPTH.fetch_add(1, Ordering::Relaxed);
+    COMPAT_ENTRY.enter(pid);
     let out = {
         let mut guard = COMPAT_STATES.lock();
         guard.get_mut(&pid).map(f)
     };
-    COMPAT_DEPTH.fetch_sub(1, Ordering::Relaxed);
+    COMPAT_ENTRY.exit(pid);
     out
 }
 
-/// Глубина повторного входа [`with_current_compat`] на этом (единственном) CPU.
+/// Кто и насколько глубоко вошёл в [`with_current_compat`] — pid владельца и
+/// глубина его замыканий.
+///
 /// Её смотрит обработчик page fault: отказ, случившийся ВНУТРИ замыкания
 /// `with_current_compat` (код ядра трогает память пользователя под локом), не
-/// должен повторно входить в реестр — спинлок не реентерабелен, и второй
-/// `lock()` заблокировал бы CPU.
-static COMPAT_DEPTH: AtomicUsize = AtomicUsize::new(0);
+/// должен повторно входить в реестр — спинлок нереентерабелен, и второй
+/// `lock()` заблокировал бы CPU. Ответ обязан быть про ТЕКУЩУЮ задачу: голый
+/// счётчик глубины, поднятый вытесненной задачей (тик между `enter` и `lock()`),
+/// отказывал бы законным отказам посторонних процессов и убивал их — ровно этот
+/// дефект и убирает [`crate::arch::x86_64::linux::compat_guard`].
+static COMPAT_ENTRY: CompatEntry = CompatEntry::new();
 
-/// Находится ли текущий контекст уже внутри [`with_current_compat`].
+/// Находится ли kernel-контекст ТЕКУЩЕЙ задачи уже внутри [`with_current_compat`].
+///
+/// Не «лок кем-то удерживается»: вытесненный владелец лок не держит (спинлок
+/// маскирует IF, поэтому удержание исключает переключение на этом CPU), и
+/// посторонняя задача имеет право войти.
 pub fn compat_lock_held() -> bool {
-    COMPAT_DEPTH.load(Ordering::Relaxed) > 0
+    COMPAT_ENTRY.is_inside(super::scheduler::current_pid())
 }
