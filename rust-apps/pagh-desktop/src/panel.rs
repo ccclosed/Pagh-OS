@@ -124,6 +124,11 @@ pub fn chip_rect(screen: Rect, slot: usize) -> Rect {
 pub struct Panel {
     pub time: String,
     pub date: String,
+    /// Доступность сети. Единственный сетевой факт, который композитор знает:
+    /// ядро пока не отдаёт userspace ни IP, ни имя интерфейса, ни счётчики
+    /// (`/proc/net/dev`, `SIOCGIFADDR`/netlink отсутствуют), а сервер не
+    /// присылает сетевых событий. Флайаут показывает это значение и не рисует
+    /// того, чего в модели нет (IP, скорости, «Отключить»).
     pub network_online: bool,
     pub hover: Option<PanelHover>,
 }
