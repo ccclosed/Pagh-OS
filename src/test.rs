@@ -10683,6 +10683,11 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             "userbuf::lazy anon read/write through demand paging",
             desktop_b_tests::lazy_anon_user_buffers
         ),
+        // MVP S4b: ring-3 отказ без CompatState убивает задачу, ядро выживает.
+        (
+            "arch::ring-3 #PF kills the task, kernel survives (S4b)",
+            ring3_fault_tests::ring3_page_fault_kills_task_not_kernel
+        ),
     ]
 }
 
@@ -12328,5 +12333,137 @@ mod texttools_tests {
         let out = head_of(&long, 1);
         assert_eq_kernel!(out.len(), 601, "head: a 600-byte line spans chunks");
         assert_eq_kernel!(out[600], b'\n', "head: the spanning line is terminated");
+    }
+}
+
+// ============================================================================
+// ring-3 отказ убивает задачу, а не машину (MVP S4b, ветка fix/ring3-pf-kill-task)
+// ============================================================================
+//
+// Регрессия критического фикса: `idt.rs` больше НЕ требует `CompatState`, чтобы
+// убить задачу, сфолтившую в ring 3. До фикса нативная ring-3 задача pagh (та,
+// что создаёт `create_user_process` до `install_compat`) на #PF попадала в ветку
+// `halt()` и уносила всю машину вместо себя.
+//
+// Сценарий — тот же эксперимент, которым фикс проверялся вручную: задача пишет
+// в неотображённую пользовательскую страницу `0x1337_0000`. Проверки:
+//   1) задача создана без compat-состояния (`create_user_process` его не ставит);
+//   2) после отказа её стек ядра снова не отображён — reaper снял задачу;
+//   3) она ушла из ready-очереди, а self-test продолжается (тики идут);
+//   4) PMM вернулся к исходному числу кадров, поэтому `selftest 2` не видит
+//      расхождения проходов.
+//
+// Не будь фикса, первый же тик с этой задачей увёл бы CPU в `halt()` и до
+// `SELFTEST SUMMARY` дело бы не дошло — `tools/e2e.py selftest` (и этот
+// `assert_kernel!`) упали бы.
+mod ring3_fault_tests {
+    use crate::arch::x86_64::apic::TICK_HZ;
+    use crate::memory::layout::kernel_stack_for_pid;
+    use crate::memory::{pmm, vmm};
+    use crate::task::{process, scheduler};
+
+    /// Потолок ожидания reap'а. Отказ обрабатывается мгновенно, а тик снимает не
+    /// больше одной задачи за проход; секунды (1000 тиков) хватает с запасом.
+    const REAP_TIMEOUT_TICKS: u64 = TICK_HZ;
+
+    pub fn ring3_page_fault_kills_task_not_kernel() {
+        // `create_user_process` ставит пользовательский CR3 на время отображения
+        // ELF/стека, поэтому запускать его обязательно с выключенными
+        // прерываниями (так делают kernel_main и shell-команда `exec`).
+        //
+        // ВСЕ наблюдения «до/после spawn» снимаются ПОД тем же запретом:
+        // `without_interrupts` возвращается через `sti`, и отложенный тик может
+        // вытеснить нас ровно на этой границе — в том числе сразу
+        // перепланировать уже стоящую в ready-очереди fault-задачу. Тогда её
+        // отказ случается ДО первого чтения после возврата, и счётчики
+        // «до/после» разъезжаются: рутина приняла бы собственный успех за FAIL
+        // (так и произошло в первом прогоне).
+        let spawned = crate::arch::cpu::without_interrupts(|| {
+            let frames_before = pmm::free_frames();
+            let ready_before = scheduler::ready_count();
+            let ticks_before = scheduler::ticks();
+            let pid = process::spawn_faulting_test_user_process()?;
+            let (_guard, stack_base, _top) = kernel_stack_for_pid(pid);
+            let stack_mapped = vmm::virt_to_phys(stack_base).is_some();
+            let ready_after = scheduler::ready_count();
+            // Регрессия проверяет именно НАТИВНУЮ задачу: появись у неё
+            // `CompatState`, отказ пошёл бы старым (compat) путём и фикс S4b
+            // остался бы непокрытым.
+            let native = !crate::task::compat::compat_exists(pid);
+            Ok::<_, &'static str>((
+                pid,
+                stack_base,
+                stack_mapped,
+                native,
+                ready_after,
+                ready_before,
+                frames_before,
+                ticks_before,
+            ))
+        });
+        let (
+            pid,
+            stack_base,
+            stack_mapped,
+            native,
+            ready_after,
+            ready_before,
+            frames_before,
+            ticks_before,
+        ) = match spawned {
+            Ok(v) => v,
+            Err(e) => {
+                assert_kernel!(false, e);
+                return;
+            }
+        };
+
+        assert_kernel!(
+            stack_mapped,
+            "ring3-fault: spawned task has a mapped kernel stack"
+        );
+        assert_kernel!(
+            native,
+            "ring3-fault: spawned task has NO CompatState (native ring-3 path)"
+        );
+        assert_eq_kernel!(
+            ready_after,
+            ready_before + 1,
+            "ring3-fault: spawned task is queued exactly once"
+        );
+
+        // Дать задаче поработать: тик перепланирует её, `mov [0x13370000], 0x41`
+        // даёт #PF, обработчик убивает задачу, следующий тик её reaps'ит. Если
+        // отказ уже случился на границе `sti`, цикл не выполнится ни разу —
+        // это нормально, ниже проверяется итоговое состояние.
+        let mut waited = 0u64;
+        while vmm::virt_to_phys(stack_base).is_some() && waited < REAP_TIMEOUT_TICKS {
+            scheduler::sleep_ticks(1);
+            waited = waited.saturating_add(1);
+        }
+
+        assert_kernel!(
+            vmm::virt_to_phys(stack_base).is_none(),
+            "ring3-fault: faulting task was killed and reaped (kernel stack unmapped)"
+        );
+        assert_eq_kernel!(
+            scheduler::ready_count(),
+            ready_before,
+            "ring3-fault: killed task left the scheduler ready queue"
+        );
+        assert_kernel!(
+            scheduler::ticks() > ticks_before,
+            "ring3-fault: kernel kept running after the ring-3 fault"
+        );
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "ring3-fault: routine returned every PMM frame"
+        );
+        crate::kprintln!(
+            "ring3-fault: pid {} killed by #PF, kernel survived ({} ticks)",
+            pid,
+            waited
+        );
     }
 }
