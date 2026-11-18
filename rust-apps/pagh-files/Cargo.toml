@@ -30,3 +30,9 @@ panic = "abort"
 opt-level = "s"
 lto = true
 strip = true
+
+# pagh-ui — render-крейт (виджеты, блиты, damage): P1 плана frame time.
+# Своя profile.release у pagh-ui не действует, когда он собран зависимостью,
+# поэтому целевой opt-level задаётся здесь.
+[profile.release.package.pagh-ui]
+opt-level = 3
