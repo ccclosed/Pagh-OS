@@ -46,6 +46,7 @@ use super::mem::{
     plan_brk, plan_mmap_base, plan_munmap, prot_to_flags, range_is_free, BrkOutcome, MmapBacking,
     MmapRegion, MunmapPlan, VmRegionSet, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, PROT_READ,
 };
+use super::trap_frame::pf_registry_must_refuse;
 use super::validate::{self, MappingKind, PageAcceptance, USER_ADDR_MAX};
 
 /// Архитектурный размер страницы (4 КиБ).
@@ -1211,8 +1212,12 @@ fn update_region_flags(
 /// (`RO_BIT`), поэтому запись туда всё равно даёт SIGSEGV, а не приватную
 /// записываемую копию. Работает и для отказов ring 3, и для отказов режима ядра на
 /// пользовательских адресах (`copy_out` по fork-разделённому буферу).
-fn handle_cow_fault(addr: u64, caused_by_write: bool) -> bool {
-    if !caused_by_write || compat::compat_lock_held() {
+///
+/// `user_mode` — из `PageFaultErrorCode::USER_MODE`: отказ ring 3 не бывает
+/// повторным входом в `COMPAT_STATES` (см.
+/// [`pf_registry_must_refuse`]), поэтому COW-копия для него разрешена всегда.
+fn handle_cow_fault(addr: u64, caused_by_write: bool, user_mode: bool) -> bool {
+    if !caused_by_write || pf_registry_must_refuse(user_mode, compat::compat_lock_held()) {
         return false;
     }
     // `cow_copy_page` сам проверяет оба маркера: присутствующая read-only
@@ -1246,21 +1251,30 @@ fn handle_cow_fault(addr: u64, caused_by_write: bool) -> bool {
 ///
 /// Контракт со слоем syscall (см. doc модуля): код ядра никогда не трогает память
 /// пользователя под compat-локом реестра, поэтому этот обработчик всегда может
-/// взять лок. `compat::compat_lock_held()` — растяжка нарушений этого правила:
-/// такой отказ сообщается как segfault, а не блокирует CPU на нереентерабельном
-/// спинлоке.
+/// взять лок. Отказ ring 0 (U=0) внутри замыкания — растяжка нарушений этого
+/// правила: он сообщается как segfault/kill процесса, а не блокирует CPU на
+/// нереентерабельном спинлоке. Отказ ring 3 (U=1) обслуживается безусловно:
+/// исполнять пользовательский код и одновременно быть внутри замыкания
+/// невозможно, а глубина, поднятая вытесненной задачей, принадлежит не этой
+/// (см. `trap_frame::pf_registry_must_refuse` и `compat_guard`).
 pub fn handle_user_page_fault(
     addr: u64,
     protection_violation: bool,
     caused_by_write: bool,
+    user_mode: bool,
 ) -> bool {
     if addr >= USER_ADDR_MAX {
         return false;
     }
     if protection_violation {
-        return handle_cow_fault(addr, caused_by_write);
+        return handle_cow_fault(addr, caused_by_write, user_mode);
     }
-    if compat::compat_lock_held() {
+    // Отказ ring 3 обслуживается всегда: повторным входом в нереентерабельный
+    // реестр он быть не может (см. `pf_registry_must_refuse`). Раньше здесь
+    // стояла проверка «глубина > 0 на этом CPU», и тик, вытеснивший владельца
+    // между `enter` и `lock()`, превращал законную запись в ленивую страницу
+    // кучи/anon-региона в SIGSEGV постороннего процесса.
+    if pf_registry_must_refuse(user_mode, compat::compat_lock_held()) {
         crate::error!(
             "[PF] fault on user addr 0x{:x} inside with_current_compat - refusing re-entry",
             addr
@@ -1379,7 +1393,9 @@ fn populate_user_range(start: u64, len: u64) -> Result<(), Errno> {
         if vmm::virt_to_phys(page).is_some() {
             continue;
         }
-        if !handle_user_page_fault(page, false, true) {
+        // Копия ядра: отказ здесь — kernel-mode (U=0), поэтому guard обязан
+        // сработать, если эта задача уже внутри `with_current_compat`.
+        if !handle_user_page_fault(page, false, true, false) {
             return Err(Errno::EFAULT);
         }
     }

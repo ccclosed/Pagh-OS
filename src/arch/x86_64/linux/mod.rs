@@ -14,6 +14,7 @@ pub mod regs;
 // обработчике.
 pub mod abi;
 pub mod cmsg;
+pub mod compat_guard;
 pub mod cred;
 pub mod diag;
 pub mod dirent;
