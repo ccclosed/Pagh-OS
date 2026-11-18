@@ -23,6 +23,7 @@ pagh-desktop server ──► Compositor ──► damage-регионы ──�
   (`app` + подсказка `cwd`) — так работают «Открыть терминал…» в Files и меню
   лаунчера. Цели запуска задаются `ServerOptions.launch_targets`/`--launch-target`
   (`{socket}` подставляется), иначе используется демо-клиент (`--spawn-demo`).
+  `--autostart APP` открывает приложение из этого реестра сразу после старта.
 * Шрифт интерфейса — 8×16 ASCII + **кириллица** и типографские знаки
   (`tools/gen_cyrillic_font.py`), поэтому заголовки русских приложений читаемы.
 * Окна: z-order, фокус, заголовок с кнопками `v/^/x`, перетаскивание за заголовок,
@@ -76,13 +77,19 @@ cargo run --bin pagh-desktop -- --socket /tmp/pagh-desktop.sock --spawn-demo
 cargo run --bin pagh-desktop-demo -- --connect /tmp/pagh-desktop.sock --app files
 ```
 
-Сервер сам запускает `pagh-desktop-demo` по запросам панели/меню, если рядом лежит
-бинарник (`--demo-binary PATH` задаёт явно), и приложения по `launch`:
+Сервер сам запускает приложение по запросам панели/меню/хоткея и по `launch`:
+сначала цель `--launch-target`, иначе демо-клиент `pagh-desktop-demo`, если рядом
+лежит бинарник (`--demo-binary PATH` задаёт явно):
 
 ```bash
 # настоящий терминал: {socket} подставится путём сокета сервера
 cargo run --bin pagh-desktop -- --socket /tmp/pagh-desktop.sock \
     --launch-target 'terminal=pagh-terminal|--socket|{socket}'
+
+# ...и он же открыт сразу после старта (MVP-образ: первое окно без клика)
+cargo run --bin pagh-desktop -- --socket /tmp/pagh-desktop.sock \
+    --launch-target 'terminal=pagh-terminal|--socket|{socket}' \
+    --autostart terminal
 ```
 
 Headless-кадры: `--screenshot-dir DIR` (каждый presented-кадр →
@@ -198,8 +205,8 @@ python3 tools/e2e.py desktop --reuse-desktop-disk --skip-build
   kernel-примитивами (`desktop-kernel`); headless-путь полностью автономен.
 * `ShmSurface`/`SCM_RIGHTS`, частичный commit, клиентские popup/курсоры, outputs/scale,
   анимации, PTY/kernel-console bridge — не в этом срезе.
-* `--spawn-demo` запускает именно демо-клиент (а не произвольные приложения);
-  реестр приложений/`.desktop`-файлы — следующий шаг.
+* `--spawn-demo` — фолбэк для панели/меню/хоткея, если приложения нет в
+  `--launch-target`; реестр приложений/`.desktop`-файлы — следующий шаг.
 * Скриншоты намеренно детерминированы (часы 23:38 / 15.11.2026), чтобы diff картинок
   был осмысленным.
 
