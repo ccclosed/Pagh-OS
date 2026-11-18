@@ -72,12 +72,28 @@ fn network_flyout_online_offline_render() {
     let online_text = count_color(&compositor, rect, compositor.theme().menu_text);
 
     // Иконка карточки — готовый глиф Plug Connected 24 px, тинтованный
-    // panel_icon. У него есть полностью непрозрачный пиксель вне диагонали
-    // (19,11), поэтому ожидаемый цвет — ровно тинт.
+    // panel_icon. Непрозрачный пиксель ищется по маске, а не хардкодится:
+    // фазовая подгонка ассетов сдвигает глиф на полпикселя, и координата
+    // «(19,11)» перестаёт быть непрозрачной. Точка берётся вне диагонали
+    // «нет сети», иначе её перекрывает штрих offline-состояния.
     let card = Rect::new(rect.x + 12, rect.y + 64, rect.w - 24, 56);
     let icon_center = pagh_desktop::geometry::Point::new(card.x + 24, card.center().y);
-    let icon_pixel =
-        pagh_desktop::geometry::Point::new(icon_center.x - 12 + 19, icon_center.y - 12 + 11);
+    let icon_mask = pagh_desktop::icons::raster(pagh_desktop::icons::Icon::NetworkWired, 24)
+        .expect("ассет иконки карточки");
+    let mut opaque = None;
+    for y in 0..icon_mask.height as i32 {
+        for x in 0..icon_mask.width as i32 {
+            let off_diagonal = (x + y - icon_mask.width as i32).abs() >= 4;
+            if off_diagonal && icon_mask.alpha(x as u32, y as u32) == 255 {
+                opaque = Some((x, y));
+            }
+        }
+    }
+    let (opaque_x, opaque_y) = opaque.expect("в глифе нет непрозрачного пикселя вне диагонали");
+    let icon_pixel = pagh_desktop::geometry::Point::new(
+        icon_center.x - 12 + opaque_x,
+        icon_center.y - 12 + opaque_y,
+    );
     let icon_box = Rect::new(icon_center.x - 12, icon_center.y - 12, 24, 24);
     let icon_lit = (icon_box.y..icon_box.bottom())
         .flat_map(|y| (icon_box.x..icon_box.right()).map(move |x| (x, y)))
