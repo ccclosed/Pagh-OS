@@ -23,6 +23,7 @@ use pagh_ui::theme::Theme;
 use pagh_ui::widgets::{Button, ButtonState, Grid, GridItem, List, ListItem, TextField};
 
 use crate::format;
+use crate::icons::{self, FluentIcon};
 use crate::menu_model::{self, action, MenuOptions, SortMode, ViewMode};
 use crate::vfs::{self, DirEntry, EntryKind, Stat, Vfs};
 
@@ -36,6 +37,12 @@ const LIST_ROW: i32 = 26;
 const LIST_HEADER: i32 = 24;
 /// Шаг прокрутки колесом.
 const WHEEL_STEP: i32 = 48;
+/// Прямоугольник иконки в ячейке сетки — как `ICON_WIDTH`/`ICON_HEIGHT`
+/// в `pagh_ui::widgets` (значения там приватные). По нему стирается
+/// векторный глиф перед отрисовкой готового растра.
+const GRID_ICON_WIDTH: i32 = 40;
+const GRID_ICON_HEIGHT: i32 = 32;
+const GRID_ICON_TOP: i32 = 8;
 
 /// Действие, которое приложение просит выполнить снаружи.
 ///
@@ -95,7 +102,10 @@ pub enum PlaceKind {
 pub struct Place {
     pub id: u32,
     pub label: String,
-    pub icon: Icon,
+    /// Готовая иконка Fluent; векторный `pagh_ui::Icon` из неё выводится
+    /// только чтобы список зарезервировал место под глиф (текст пункта
+    /// сдвигается на ширину иконки), а рисуется растр.
+    pub glyph: FluentIcon,
     pub path: String,
     pub kind: PlaceKind,
 }
@@ -521,10 +531,9 @@ impl FilesApp {
         // «Сеть» — виртуальная точка: читать её из VFS значило бы показать
         // «Не удалось открыть папку». Сетевого бэкенда нет, поэтому содержимое
         // пустое и об этом сказано прямо; выдуманных ресурсов здесь нет.
-        let virtual_network = self
-            .places
-            .iter()
-            .any(|place| place.kind == PlaceKind::Network && vfs::normalize(&place.path) == self.cwd);
+        let virtual_network = self.places.iter().any(|place| {
+            place.kind == PlaceKind::Network && vfs::normalize(&place.path) == self.cwd
+        });
         if virtual_network {
             self.all_entries.clear();
             self.error = None;
@@ -864,7 +873,7 @@ impl FilesApp {
         for entry in &self.entries {
             grid.push(GridItem {
                 label: entry.name.clone(),
-                icon: entry_icon(entry),
+                icon: legacy_icon(entry_icon(entry)),
                 is_dir: entry.is_dir(),
             });
         }
@@ -1188,7 +1197,28 @@ impl FilesApp {
         list.selected = self.sidebar_selected;
         list.hovered = self.sidebar_hover;
         let area = layout.sidebar.inset_by(Insets::new(8, 8, 10, 8));
-        list.draw(canvas, &self.theme, area);
+        let list_layout = list.draw(canvas, &self.theme, area);
+        // Поверх векторных глифов списка — готовые иконки Fluent. Пункт
+        // списка всё равно несёт `Icon` того же смысла: он резервирует место
+        // под глиф и служит запасным вариантом, если PNG не декодировался.
+        let icon_size = self.theme.metrics.icon_size;
+        for (id, rect) in &list_layout.items {
+            let Some(place) = self.places.iter().find(|place| place.id == *id) else {
+                continue;
+            };
+            let icon_rect = Rect::new(
+                rect.x + 8,
+                rect.y + (rect.h - icon_size) / 2,
+                icon_size,
+                icon_size,
+            );
+            let tint = if self.sidebar_selected == Some(*id) {
+                palette.sidebar_text_selected
+            } else {
+                palette.sidebar_text
+            };
+            draw_glyph(canvas, place.glyph, icon_rect, tint, true);
+        }
     }
 
     fn draw_content(&self, canvas: &mut Canvas, layout: &AppLayout) {
@@ -1227,7 +1257,20 @@ impl FilesApp {
             match self.view {
                 ViewMode::Grid => {
                     let grid = self.grid_widget(area);
-                    grid.draw(canvas, &self.theme, self.scrolled_area(area));
+                    let cells = grid.draw(canvas, &self.theme, self.scrolled_area(area));
+                    // Векторные глифы ячеек заменяем готовыми иконками.
+                    for (index, cell) in cells.iter().enumerate() {
+                        let Some(entry) = self.entries.get(index) else {
+                            continue;
+                        };
+                        let icon_rect = Rect::new(
+                            cell.x + (cell.w - GRID_ICON_WIDTH) / 2,
+                            cell.y + GRID_ICON_TOP,
+                            GRID_ICON_WIDTH,
+                            GRID_ICON_HEIGHT,
+                        );
+                        draw_entry_icon(canvas, entry, icon_rect, palette, true);
+                    }
                 }
                 ViewMode::List => self.draw_list(canvas, area),
             }
@@ -1324,12 +1367,7 @@ impl FilesApp {
                 );
             }
             let icon_rect = Rect::new(row.x + 8, row.y + (LIST_ROW - 14) / 2, 14, 14);
-            let entry_icon = entry_icon(entry);
-            if entry_icon == Icon::Folder {
-                icon::draw_folder(canvas, icon_rect, palette);
-            } else {
-                icon::draw(canvas, entry_icon, icon_rect, palette.text_muted, palette);
-            }
+            draw_entry_icon(canvas, entry, icon_rect, palette, false);
             let name = font::ellipsize(&entry.name, columns[0].w - 34);
             font::draw(
                 canvas,
@@ -2083,14 +2121,98 @@ fn display_path(path: &str, home: &str) -> String {
     }
 }
 
-fn entry_icon(entry: &DirEntry) -> Icon {
+fn entry_icon(entry: &DirEntry) -> FluentIcon {
     match entry.kind {
-        EntryKind::Directory => Icon::Folder,
-        EntryKind::Symlink => Icon::Link,
-        EntryKind::Device => Icon::Device,
-        EntryKind::Other => Icon::File,
-        EntryKind::File => Icon::File,
+        EntryKind::Directory => FluentIcon::Folder,
+        // Готового глифа ссылки в наборе нет; ссылка выглядит как документ,
+        // тип записи при этом остаётся честным (колонка «Тип»).
+        EntryKind::Symlink => FluentIcon::Document,
+        EntryKind::Device => FluentIcon::Drive,
+        EntryKind::Other | EntryKind::File => file_icon(&entry.name),
     }
+}
+
+/// Иконка файла по расширению (изображение/аудио/видео/документ).
+fn file_icon(name: &str) -> FluentIcon {
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "ico" | "tif" | "tiff"
+        | "avif" => FluentIcon::Image,
+        "mp3" | "flac" | "ogg" | "wav" | "m4a" | "aac" | "opus" | "mid" | "midi" => {
+            FluentIcon::MusicNote
+        }
+        "mp4" | "mkv" | "avi" | "mov" | "webm" | "m4v" | "wmv" | "mpg" | "mpeg" => {
+            FluentIcon::Video
+        }
+        _ => FluentIcon::Document,
+    }
+}
+
+/// Векторный глиф того же смысла — запасной вариант, если PNG не декодировался
+/// (и маска для резервирования места в списке).
+fn legacy_icon(glyph: FluentIcon) -> Icon {
+    match glyph {
+        FluentIcon::Folder | FluentIcon::FolderOpen => Icon::Folder,
+        FluentIcon::Document => Icon::File,
+        FluentIcon::Home => Icon::Home,
+        FluentIcon::Desktop => Icon::Desktop,
+        FluentIcon::Download => Icon::Downloads,
+        FluentIcon::Image => Icon::Pictures,
+        FluentIcon::MusicNote => Icon::Music,
+        FluentIcon::Video => Icon::Videos,
+        FluentIcon::Delete => Icon::Trash,
+        FluentIcon::Drive => Icon::Device,
+        FluentIcon::Network => Icon::Network,
+    }
+}
+
+/// Нарисовать значок записи готовым растром.
+///
+/// `erase` — прямоугольник, где виджет сетки/сайдбара уже нарисовал векторный
+/// глиф: его нужно закрыть фоном, иначе полупрозрачные края растра оставят
+/// двойной контур. Для подробного списка векторного глифа нет, и стирание не
+/// нужно. Фон берётся из самого холста рядом с иконкой, поэтому выделение и
+/// наведение сохраняются без повторения логики виджета.
+fn draw_entry_icon(
+    canvas: &mut Canvas,
+    entry: &DirEntry,
+    rect: Rect,
+    palette: &pagh_ui::theme::Palette,
+    erase_vector: bool,
+) {
+    let glyph = entry_icon(entry);
+    let tint = if entry.is_dir() {
+        palette.accent
+    } else {
+        palette.text_muted
+    };
+    draw_glyph(canvas, glyph, rect, tint, erase_vector);
+}
+
+/// Общий путь отрисовки готовой иконки: центр `rect`, тинт, опционально
+/// стирание векторного глифа.
+fn draw_glyph(canvas: &mut Canvas, glyph: FluentIcon, rect: Rect, tint: Color, erase_vector: bool) {
+    let size = icons::best_size(rect);
+    let Some(raster) = icons::raster(glyph, size) else {
+        return;
+    };
+    if erase_vector {
+        // Расширяем зону стирания: растр 16 px чуть больше 14-пиксельного
+        // прямоугольника списка и должен закрыть векторный глиф целиком.
+        let erase = Rect::new(rect.x - 2, rect.y - 2, rect.w + 4, rect.h + 4);
+        let backdrop = canvas.pixel(Point::new(erase.x - 4, erase.center().y));
+        canvas.fill(erase, backdrop);
+    }
+    let dst = Rect::new(
+        rect.x + (rect.w - raster.width as i32) / 2,
+        rect.y + (rect.h - raster.height as i32) / 2,
+        raster.width as i32,
+        raster.height as i32,
+    );
+    icons::blit_tinted(canvas, &raster, dst, tint, 255);
 }
 
 /// Поместить меню так, чтобы оно не выходило за окно.
@@ -2126,77 +2248,77 @@ fn default_places(home: &str) -> Vec<Place> {
         Place {
             id: 1,
             label: "Домашняя папка".to_string(),
-            icon: Icon::Home,
+            glyph: FluentIcon::Home,
             path: home.to_string(),
             kind: PlaceKind::Home,
         },
         Place {
             id: 2,
             label: "Рабочий стол".to_string(),
-            icon: Icon::Folder,
+            glyph: FluentIcon::Desktop,
             path: vfs::join(home, "Desktop"),
             kind: PlaceKind::UserDir,
         },
         Place {
             id: 3,
             label: "Документы".to_string(),
-            icon: Icon::Folder,
+            glyph: FluentIcon::FolderOpen,
             path: vfs::join(home, "Documents"),
             kind: PlaceKind::UserDir,
         },
         Place {
             id: 4,
             label: "Загрузки".to_string(),
-            icon: Icon::Folder,
+            glyph: FluentIcon::Download,
             path: vfs::join(home, "Downloads"),
             kind: PlaceKind::UserDir,
         },
         Place {
             id: 5,
             label: "Изображения".to_string(),
-            icon: Icon::Folder,
+            glyph: FluentIcon::Image,
             path: vfs::join(home, "Pictures"),
             kind: PlaceKind::UserDir,
         },
         Place {
             id: 6,
             label: "Музыка".to_string(),
-            icon: Icon::Folder,
+            glyph: FluentIcon::MusicNote,
             path: vfs::join(home, "Music"),
             kind: PlaceKind::UserDir,
         },
         Place {
             id: 7,
             label: "Видео".to_string(),
-            icon: Icon::Folder,
+            glyph: FluentIcon::Video,
             path: vfs::join(home, "Videos"),
             kind: PlaceKind::UserDir,
         },
         Place {
             id: 8,
             label: "Корзина".to_string(),
-            icon: Icon::Trash,
+            glyph: FluentIcon::Delete,
             path: vfs::join(home, ".local/share/Trash/files"),
             kind: PlaceKind::Trash,
         },
         Place {
             id: 9,
             label: "Сеть".to_string(),
-            icon: Icon::Network,
+            glyph: FluentIcon::Network,
             path: "/network".to_string(),
             kind: PlaceKind::Network,
         },
         Place {
             id: 10,
             label: "root".to_string(),
-            icon: Icon::Device,
+            glyph: FluentIcon::Drive,
             path: "/".to_string(),
             kind: PlaceKind::Device,
         },
         Place {
             id: 11,
             label: "Basic data partition".to_string(),
-            icon: Icon::Device,
+            glyph: FluentIcon::Drive,
             path: "/mnt".to_string(),
             kind: PlaceKind::Device,
         },
@@ -2207,7 +2329,9 @@ fn build_sidebar(places: &[Place]) -> List {
     let entry_items = |ids: &[u32]| -> Vec<ListItem> {
         ids.iter()
             .filter_map(|id| places.iter().find(|place| place.id == *id))
-            .map(|place| ListItem::new(place.id, place.label.clone()).with_icon(place.icon))
+            .map(|place| {
+                ListItem::new(place.id, place.label.clone()).with_icon(legacy_icon(place.glyph))
+            })
             .collect()
     };
     let mut list = List::new()
@@ -2298,11 +2422,12 @@ mod tests {
         }
 
         // Каталоги пользователя и корзина живут под `$HOME`.
-        for place in app
-            .places()
-            .iter()
-            .filter(|p| matches!(p.kind, PlaceKind::Home | PlaceKind::UserDir | PlaceKind::Trash))
-        {
+        for place in app.places().iter().filter(|p| {
+            matches!(
+                p.kind,
+                PlaceKind::Home | PlaceKind::UserDir | PlaceKind::Trash
+            )
+        }) {
             assert!(
                 place.path == home || place.path.starts_with(&format!("{home}/")),
                 "{} вне дома: {}",
@@ -2366,10 +2491,7 @@ mod tests {
     #[test]
     fn missing_user_dirs_are_created_and_listed() {
         let home = temp_home("create");
-        let mut app = FilesApp::new(
-            Box::new(HostVfs::with_home(home.to_string_lossy())),
-            SIZE,
-        );
+        let mut app = FilesApp::new(Box::new(HostVfs::with_home(home.to_string_lossy())), SIZE);
         for name in USER_DIRS {
             let path = home.join(name);
             assert!(path.is_dir(), "не создан {path:?}");
@@ -2417,6 +2539,79 @@ mod tests {
             .places()
             .iter()
             .any(|place| place.kind == PlaceKind::Device && place.path == "/mnt"));
+    }
+
+    /// Тип записи → готовый глиф Fluent: каталог, документ, медиа, устройство.
+    /// Это не только выбор картинки: тест ловит регрессию, когда запись снова
+    /// начинает рисоваться векторным примитивом.
+    #[test]
+    fn entry_icons_follow_entry_kind_and_extension() {
+        let cases = [
+            ("Папка", EntryKind::Directory, FluentIcon::Folder),
+            ("notes.md", EntryKind::File, FluentIcon::Document),
+            ("photo.png", EntryKind::File, FluentIcon::Image),
+            ("PHOTO.JPG", EntryKind::File, FluentIcon::Image),
+            ("track01.ogg", EntryKind::File, FluentIcon::MusicNote),
+            ("demo.mp4", EntryKind::File, FluentIcon::Video),
+            ("pagh.elf", EntryKind::Device, FluentIcon::Drive),
+            ("ссылка", EntryKind::Symlink, FluentIcon::Document),
+            ("без-расширения", EntryKind::Other, FluentIcon::Document),
+        ];
+        for (name, kind, expected) in cases {
+            let entry = DirEntry::new(name, kind, 0);
+            assert_eq!(entry_icon(&entry), expected, "{name}");
+            let raster = icons::raster(expected, 32).expect("растр иконки");
+            assert!(raster.lit_pixels() > 8, "{name}: пустой растр");
+        }
+    }
+
+    /// Отрисованное окно действительно содержит готовые растры: в области
+    /// иконки папки есть акцентные пиксели, в области файла — приглушённые.
+    #[test]
+    fn rendered_entries_use_ready_made_rasters() {
+        let app = FilesApp::new(Box::new(FakeVfs::concept()), SIZE);
+        let mut canvas = Canvas::filled(app.size().w, app.size().h, Color::hex(0x101010));
+        app.draw(&mut canvas);
+        let palette = app.theme.palette;
+
+        let count = |name: &str, color: Color| {
+            let index = app
+                .entries()
+                .iter()
+                .position(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("нет записи {name}"));
+            let cell = app.item_rect(index).expect("ячейка");
+            let icon = Rect::new(
+                cell.x + (cell.w - GRID_ICON_WIDTH) / 2,
+                cell.y + GRID_ICON_TOP,
+                GRID_ICON_WIDTH,
+                GRID_ICON_HEIGHT,
+            );
+            let mut hits = 0;
+            for y in icon.y..icon.bottom() {
+                for x in icon.x..icon.right() {
+                    if canvas.pixel(Point::new(x, y)) == color {
+                        hits += 1;
+                    }
+                }
+            }
+            hits
+        };
+
+        assert!(
+            count("Documents", palette.accent) > 50,
+            "иконка каталога не акцентная"
+        );
+        assert!(
+            count("notes.md", palette.text_muted) > 20,
+            "иконка документа не приглушённая"
+        );
+        // Изображение tinted так же, как документ, но маска другая: если бы
+        // код рисовал документ для всех файлов, число пикселей совпало бы.
+        assert_ne!(
+            count("photo.png", palette.text_muted),
+            count("notes.md", palette.text_muted)
+        );
     }
 
     /// Смонтированный `/mnt` показывается и открывается.
