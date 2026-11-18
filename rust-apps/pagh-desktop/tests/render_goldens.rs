@@ -6,6 +6,10 @@
 //! он падает на любое изменение цвета/геометрии/сглаживания, а не только на
 //! «картинка отличается размером».
 //!
+//! Дайджесты сняты на дереве после `fix/icon-render-quality` (чёткая отрисовка
+//! PNG-иконок в нативном размере): сравнение с до-иконочными значениями падало
+//! бы на каждом законном улучшении рендера.
+//!
 //! Сцена собирается тем же `bench::build_desktop`, на котором меряется frame
 //! time: goldens и замеры описывают один и тот же кадр.
 
@@ -37,7 +41,7 @@ fn rendered_pixels_match_golden_digests() {
     idle.render_full();
     let idle_digest = digest(&idle);
     assert_eq!(
-        idle_digest, 0x123d_1ca9_0b62_55a9,
+        idle_digest, 0x792e_fce4_c73a_b156,
         "idle-full: пиксели изменились (получено 0x{idle_digest:016x})"
     );
 
@@ -47,7 +51,7 @@ fn rendered_pixels_match_golden_digests() {
     cursor.render_full();
     let cursor_digest = digest(&cursor);
     assert_eq!(
-        cursor_digest, 0x172f_c965_3b98_62d3,
+        cursor_digest, 0x71bd_b466_b1a6_6aa8,
         "cursor: пиксели изменились (получено 0x{cursor_digest:016x})"
     );
 
@@ -59,7 +63,7 @@ fn rendered_pixels_match_golden_digests() {
     drag.render_full();
     let drag_digest = digest(&drag);
     assert_eq!(
-        drag_digest, 0xdf4c_a899_c133_4ebb,
+        drag_digest, 0xe54d_5c26_477b_cc48,
         "drag: пиксели изменились (получено 0x{drag_digest:016x})"
     );
 
@@ -77,7 +81,7 @@ fn rendered_pixels_match_golden_digests() {
     files.render_full();
     let files_digest = digest(&files);
     assert_eq!(
-        files_digest, 0x9101_4e4c_6248_9527,
+        files_digest, 0x6d6e_0c18_4571_1044,
         "files-scroll: пиксели изменились (получено 0x{files_digest:016x})"
     );
 
