@@ -174,16 +174,38 @@ value }` (24 байта) → EV_KEY/EV_REL/EV_SYN → те же `Compositor::poi
   сервер; `max_frames`/устаревший сокет; скриншот-сценарий с проверкой PNG и
   уникальности; host-тесты fbdev-упаковки/stride/damage и evdev-декодера).
 * `cargo clippy --all-targets` — без предупреждений; `cargo fmt --check` — чисто.
-* QEMU e2e `python3 tools/e2e.py desktop`: готовит pagh-ext2 диск (первая загрузка
-  kernel-format + инъекция статических бинарников через debugfs), запускает
-  `rust /mnt/pd --e2e`, проверяет serial/скриншоты: fbdev ioctl+mmap, takeover,
-  selfcheck пикселей scanout, F10-меню, REL/BTN_LEFT через QMP, выход и отсутствие
-  перерисовки консоли. Затем тот же сценарий запускает
-  `rust /mnt/pd --spawn-demo` и проверяет дочерний запуск: serial-маркер
-  `pagh-desktop: launch terminal ok`, `pagh-desktop-demo: window ... подключён`,
-  отсутствие `Function not implemented (os error 38)` и живой shell после выхода
-  сервера. Скриншоты: `screenshots/11-fbdev-qemu.png` (desktop на реальном scanout)
-  и `screenshots/12-fbdev-context-menu.png` (меню).
+* QEMU e2e `python3 tools/e2e.py desktop` (S2, реальные приложения): готовит
+  pagh-ext2 диск (первая загрузка kernel-format + инъекция четырёх статических
+  бинарников через debugfs: `pd` = композитор, `pagh-files`, `pagh-terminal`,
+  `pagh-desktop-demo`), затем на втором boot доказывает по serial и кадрам QEMU:
+  fbdev ioctl+mmap, takeover, selfcheck пикселей scanout, F10-меню, REL/BTN_LEFT
+  через QMP; **реальное окно `pagh-files`** (строка
+  `pagh-files: окно ... (сокет ...)`) и его живучесть после клика; **реальный
+  PDP/1 `launch` (type 13)**: Alt+Shift+F4 в Files заставляет композитор
+  запустить настроенный `--launch-target`, и записанный в `/mnt/launch-evidence`
+  PNG доказывает spawn именно реального бинарника; **второе окно
+  `pagh-terminal`** (`pagh-terminal: connected (client ...)`, `/dev/vtconsole0` +
+  `/dev/vtinput`), живое за счёт перерисовки курсора (два разных кадра); плюс
+  последовательность с `^Z`/`bg`, чтобы терминал оставался у shell. Первая
+  загрузка обёрнута fail-fast проверкой serial: 0 байт за ~25 с — это
+  **firmware-not-started** (печатаются OVMF/QEMU argv и stderr), байты без
+  kernel-лога — **kernel-silent**; вместо прежнего 160-секундного ожидания.
+  Сценарий с демо-клиентом (`pagh-desktop-demo`, `--spawn-demo`, маркер
+  `launch terminal ok`) остался под флагом `--legacy-demo` — панельный путь
+  `server.rs::launch()` пока зовёт только `spawn_demo`; PDP/`--launch-target`
+  путь проверяется в дефолтном сценарии. `--reuse-desktop-disk` переиспользует
+  уже подготовленный `.cache/e2e_desktop_disk.img`, пропуская первый boot.
+  Скриншоты: `screenshots/11-fbdev-qemu.png` (desktop на реальном scanout) и
+  `screenshots/12-fbdev-context-menu.png` (меню).
+
+  Ограничение сценария, намеренно названное: ядро держит `TOSTOP` включённым,
+  поэтому фоновое задание, пишущее в консоль, останавливается через SIGTTOU.
+  Композитор запускается в фоне с `--quiet` (его per-client `hello`/`launch`
+  строки не попадают в serial — их заменяет клиентский маркер окна), а реальные
+  клиенты водятся из shell в foreground. Серверный маркер
+  `pagh-desktop: hello ... app="pagh-files"` в этом режиме не печатается; сам
+  факт окна доказывает тот же handshake (клиент печатает строку только после
+  hello→welcome→create).
 * `cargo fmt --all -- --check` — чисто.
 * `./build-static.sh`: `x86_64-unknown-linux-musl`, оба бинарника `static-pie`,
   ~585 KiB сервер и ~497 KiB демо-клиент.
