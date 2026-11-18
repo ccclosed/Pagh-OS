@@ -6,6 +6,18 @@
 
 Пакетный менеджер: производительность, переименование команды и прогресс установки.
 
+* **Ring-3 `#PF`/`#GP` убивают задачу, а не машину (S4b).** Обработчик page fault
+  завершал только `Compat_Process`: у клиента в userspace без compat-состояния
+  (нативная ring-3 задача pagh до `install_compat`, любой будущий non-Linux
+  userspace) отказ проваливался мимо проверки в `halt()` и уносил всю машину —
+  «shell alive after child: no echo». Теперь отказ ring 3 завершает виновную
+  задачу штатным путём (`exit_code = 139`, `scheduler::exit_current`) **всегда**,
+  без compat-состояния; та же чистая политика `trap_frame::{page_fault,
+  exception}_action` применена к `#GP` и остальным синхронным исключениям.
+  Отказ ring 0 остаётся фатальным (кроме прежних заслонов F-x86a-4/F-r3-arch-1),
+  доставка `SIG_DFL`/`Ignore` по тику (#117) не изменена. Host-свойства
+  `page_fault`/`exception_trap` расширены.
+
 * **Linux compat: `stat(2)` (nr 4).** Старые статические musl-бинари
   (`pagh-desktop`/`pagh-desktop-demo`) зовут этот номер вместо `newfstatat`:
   без него `Command::spawn`/`Path::exists()` получали `ENOSYS` (os error 38) и
