@@ -43,8 +43,9 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 | `dirent.rs` | Чистая упаковка `linux_dirent64` для `getdents64` |
 | `epoll_sys.rs` | `clock_getres`, `eventfd2`, `epoll_create1/ctl/wait` |
 | `process_sys.rs` | Процессные syscall'ы: `execve`, `clone`, семейство futex |
-| `unix_sock.rs` | AF_UNIX stream-сокеты: socket/connect/accept/bind/listen/socketpair; реестр слушателей по пути, байтовые очереди |
-| `inet_sock.rs` | AF_INET TCP/UDP поверх собственного стека (`net::`) — curl, glibc resolver/DNS |
+| `unix_sock.rs` | AF_UNIX stream-сокеты: socket/connect/accept/bind/listen/socketpair; реестр слушателей по пути, байтовые очереди; `endpoint_wait_verdict` — пробуждение блокирующего ЧТЕНИЯ (`EBADF`/EOF), `endpoint_write_verdict` — блокирующей ЗАПИСИ (закрытый пишущий fd → `EBADF`); `sys_shutdown` (nr 48) — полузакрытие направления |
+| `inet_sock.rs` | AF_INET TCP/UDP поверх собственного стека (`net::`) — curl, glibc resolver/DNS; `tcp_apply_shutdown` — `shutdown(SHUT_WR)` шлёт FIN, оставляя сокет принимающим |
+| `sock_shutdown.rs` | Чистая политика `shutdown(2)` (nr 48): порядок отказов (`EBADF` → `ENOTSOCK` → `EINVAL` → `ENOTCONN`) и что значит каждый флаг направления для read/write/poll (хост-тестируемая, свойство `p59`) |
 | `rtc.rs` | Чтение CMOS RTC (порты 0x70/0x71) |
 | `timeconv.rs` | Чистый BCD-декод и civil-date → Unix-seconds (хост-тестируемый) |
 | `rand_clock.rs` | Чистое планирование `getrandom`/`ticks_to_timespec` |
@@ -53,7 +54,7 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 | `signal_frame.rs` | Чистая сборка/разбор `rt_sigframe` на user-стеке (хост-тестируемая) |
 
 Чистые модули (`abi`, `cred`, `diag`, `dirent`, `errno`, `io`, `kill`, `mem`, `rand_clock`, `regs`,
-`signal_frame`, `stat`, `timeconv`, `trap_frame`, `tty`, `validate`) через `#[path]` включаются в
+`signal_frame`, `sock_shutdown`, `sock_wait`, `stat`, `timeconv`, `trap_frame`, `tty`, `validate`) через `#[path]` включаются в
 хост-крейт `host-tests` — они обязаны быть только `core`+`alloc`.
 
 ## Ключевые символы

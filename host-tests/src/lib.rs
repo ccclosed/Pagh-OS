@@ -75,6 +75,20 @@ pub mod identity_db;
 #[path = "../../src/arch/x86_64/linux/rand_clock.rs"]
 pub mod rand_clock;
 
+// Блокирующее чтение сокета: чистое решение «продолжать ждать / EOF / EBADF»,
+// которое ядро принимает на каждой уступке CPU (`src/arch/x86_64/linux/
+// sock_wait.rs`). `core`-only, поэтому host-свойство `p59` исполняет ровно тот
+// исходник, который компилирует ядро.
+#[path = "../../src/arch/x86_64/linux/sock_wait.rs"]
+pub mod sock_wait;
+
+// `shutdown(2)` (nr 48): чистая политика полузакрытия — порядок отказов
+// (`EBADF`/`ENOTSOCK`/`EINVAL`/`ENOTCONN`) и что значит каждый флаг
+// направления для read/write/poll. `core`-only, поэтому host-свойство `p59`
+// исполняет ровно тот исходник, который компилирует ядро.
+#[path = "../../src/arch/x86_64/linux/sock_shutdown.rs"]
+pub mod sock_shutdown;
+
 // `stack` is `core` + `alloc` only (uses `alloc::vec::Vec`). The host crate links
 // `std`, which provides the `alloc` crate via the `extern crate alloc;` below, so
 // the exact same kernel source compiles and runs under proptest (task 5.4; P17–P19).
@@ -686,6 +700,17 @@ mod properties {
     // capped length and then allocated/copied the raw u64 count (2026-11-13
     // audit follow-up, F-x86v-1 allocation class). P57 pins the single policy.
     mod p57;
+
+    // Blocking AF_UNIX read wakeup: a read fd closed from a sibling thread must
+    // end the wait (`EBADF`), a peer close must produce `EOF`, and a live queue
+    // must keep waiting. Pins the watchdog `nr=45 arg0=0x3 closed` regression.
+    // `p58` is taken by the phase-1 groups identity property, so this is `p59`.
+    mod p59;
+
+    // `shutdown(2)` half-close policy (task-81): errno order and the
+    // per-direction read/write/poll answers. Pinned against a live-kernel probe.
+    // `p59` is the blocking-read wakeup property, so this is `p60`.
+    mod p60;
 
     // NVMe PRP lists + queue-depth arithmetic (PRP1/PRP2/list page, LBA chunk
     // planning, polled CQ phase tags, CAP.MQES clamping). The driver itself is

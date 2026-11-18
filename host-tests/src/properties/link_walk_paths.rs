@@ -123,6 +123,8 @@ fn fixture() -> Tree {
     // collapsed lexically against the link's own directory.
     t.make("mnt/a/deep", Kind::Link("../x/../x/y".to_string()));
     t.make("mnt/a/dang", Kind::Link("/nope".to_string()));
+    // `/mnt/a/flink` → guest `/b/c/f`: the `stat`/`lstat` shape pair below.
+    t.make("mnt/a/flink", Kind::Link("/b/c/f".to_string()));
     t.make("mnt/a/loop1", Kind::Link("/a/loop2".to_string()));
     t.make("mnt/a/loop2", Kind::Link("/a/loop1".to_string()));
     t.make("mnt/a/self", Kind::Link("/a/self".to_string()));
@@ -172,6 +174,47 @@ fn final_link_followed_only_when_requested() {
     // Intermediates are followed even with `follow_final == false`.
     let f = t.id("mnt/b/c/f").unwrap();
     assert_eq!(walk(&mut t, "/mnt/a/link/f", false), Ok(f));
+}
+
+/// The guest-visible `stat`/`lstat` split, in the exact encoding the syscall
+/// layer writes (`io_sys::write_stat` vs `write_link_stat`): a `follow_final ==
+/// false` walk that lands on a symlink keeps `S_IFLNK | 0o777` and reports the
+/// *length of the link's own text* as `st_size`, while the following walk
+/// reaches the target inode and reports its type and size. A dangling link is
+/// `lstat`-able and `stat`-invisible (`ENOENT`).
+///
+/// This is what `sys_lstat` (nr 6) encodes on top of `newfstatat` with
+/// `AT_SYMLINK_NOFOLLOW`; the test pins the walk's half of that contract, which
+/// is the half a wrong `follow_final` flag silently inverts.
+#[test]
+fn lstat_reports_the_link_while_stat_follows_to_the_file() {
+    use crate::stat::{encode_stat, S_IFLNK, S_IFREG};
+    /// Size the model claims for any regular file (the walker has no bytes).
+    const FILE_SIZE: u64 = 4096;
+
+    let mut t = fixture();
+    // `lstat /mnt/a/flink`: the walk stops at the link node.
+    let link = walk(&mut t, "/mnt/a/flink", false).expect("lstat of a link");
+    let text_len = match &t.nodes[link].kind {
+        Kind::Link(target) => target.len() as u64,
+        other => panic!("lstat returned {other:?}, not the link"),
+    };
+    let lst = encode_stat(text_len, S_IFLNK | 0o777, 0, 0);
+    assert_eq!(lst.stat_mode(), S_IFLNK | 0o777);
+    assert_eq!(lst.stat_size(), "/b/c/f".len() as i64);
+
+    // `stat /mnt/a/flink`: the same walk with `follow_final` reaches the file.
+    let file = walk(&mut t, "/mnt/a/flink", true).expect("stat follows");
+    assert!(matches!(t.nodes[file].kind, Kind::File));
+    let st = encode_stat(FILE_SIZE, S_IFREG | 0o644, 0, 0);
+    assert_eq!(st.stat_mode(), S_IFREG | 0o644);
+    assert_ne!(lst.stat_mode(), st.stat_mode());
+    assert_ne!(lst.stat_size(), st.stat_size());
+
+    // Dangling: `lstat` still describes the link itself, `stat` is ENOENT.
+    let dang = walk(&mut t, "/mnt/a/dang", false).expect("lstat of a dangling link");
+    assert!(matches!(t.nodes[dang].kind, Kind::Link(_)));
+    assert_eq!(walk(&mut t, "/mnt/a/dang", true), Err(WalkError::NotFound));
 }
 
 #[test]

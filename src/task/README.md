@@ -16,7 +16,7 @@
 | `switch.rs` | Контекст-свитч на asm: раскладка сохранённого фрейма, `yield_switch()`, `irq32_stub`, `kernel_thread_trampoline`, `scheduler_exit_thread` |
 | `process.rs` | Создание user-процессов: ring-3 стартовые фреймы, `create_user_process`, `run_linux_binary`, `exec_linux_image`, `fork_linux_process`, `spawn_linux_thread` |
 | `compat.rs` | Per-pid реестр `CompatState` (`COMPAT_STATES`): fd-таблица, VM-состояние, TLS, tid/tgid/ppid/**pgid**, cwd, umask, rlimits, exit-коды, зомби (`EXITED_CHILDREN`), сигнальное состояние (pending/blocked/dispositions) и флаг **`tty_job`** — «терминал передан этому процессу как заданию» (терминальный SIGTTIN/SIGTTOU применяется только к job'ам; наследуется fork/clone) |
-| `fd.rs` | Ядровая fd-таблица: `OpenObject` (консоль, файл, dir, pipes, сокеты, epoll, eventfd), `FdTable` с per-fd open/status flags (для `fdinfo`), `PipeEndpoint`, plumbing AF_UNIX-слушателей |
+| `fd.rs` | Ядровая fd-таблица: `OpenObject` (консоль, файл, dir, pipes, сокеты, epoll, eventfd), `FdTable` с per-fd open/status flags (для `fdinfo`), `PipeEndpoint`, plumbing AF_UNIX-слушателей; `holds_read_end`/`holds_inet_tcp` — на каждой уступке CPU отвечают блокирующему чтению, жив ли ещё его дескриптор |
 | `fd_alloc.rs` | Чистая bookkeeping fd-слотов (`FdSlots<T>`, `lowest_free_index`); core+alloc, шарится в host-tests |
 | `fpu.rs` | FPU/SSE per-task: eager FXSAVE/FXRSTOR (`FxArea`, 512 B, align 64) |
 | `stack.rs` | Чистый энкодер стартового стека System V + auxv (`build_initial_stack`, `AuxInputs`); хост-тестируемый |
