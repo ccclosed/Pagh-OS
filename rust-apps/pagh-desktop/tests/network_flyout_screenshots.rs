@@ -71,6 +71,28 @@ fn network_flyout_online_offline_render() {
     );
     let online_text = count_color(&compositor, rect, compositor.theme().menu_text);
 
+    // Иконка карточки — готовый глиф Plug Connected 24 px, тинтованный
+    // panel_icon. У него есть полностью непрозрачный пиксель вне диагонали
+    // (19,11), поэтому ожидаемый цвет — ровно тинт.
+    let card = Rect::new(rect.x + 12, rect.y + 64, rect.w - 24, 56);
+    let icon_center = pagh_desktop::geometry::Point::new(card.x + 24, card.center().y);
+    let icon_pixel =
+        pagh_desktop::geometry::Point::new(icon_center.x - 12 + 19, icon_center.y - 12 + 11);
+    let icon_box = Rect::new(icon_center.x - 12, icon_center.y - 12, 24, 24);
+    let icon_lit = (icon_box.y..icon_box.bottom())
+        .flat_map(|y| (icon_box.x..icon_box.right()).map(move |x| (x, y)))
+        .filter(|(x, y)| compositor.frame().get(*x, *y) != compositor.theme().chip_bg)
+        .count();
+    assert!(
+        icon_lit > 40,
+        "иконка подключения в карточке не нарисована: {icon_lit}"
+    );
+    assert_eq!(
+        compositor.frame().get(icon_pixel.x, icon_pixel.y),
+        compositor.theme().panel_icon,
+        "онлайн-иконка карточки не тинтована panel_icon"
+    );
+
     // «Подключено» — акцентная строка статуса; фейковых элементов быть не должно,
     // но акцент обязан присутствовать, иначе статус не отрисован.
     let accent_pixels = count_color(&compositor, rect, compositor.theme().accent);
@@ -84,6 +106,11 @@ fn network_flyout_online_offline_render() {
     png::write_png(dir.join("flyout-offline.png"), compositor.frame()).expect("PNG offline");
     let offline = compositor.frame().snapshot();
 
+    assert_eq!(
+        compositor.frame().get(icon_pixel.x, icon_pixel.y),
+        compositor.theme().panel_icon_dim,
+        "офлайн-иконка карточки не тинтована panel_icon_dim"
+    );
     let offline_accent = count_color(&compositor, rect, compositor.theme().accent);
     assert_eq!(offline_accent, 0, "в отключённом состоянии акцент не нужен");
     let offline_text = count_color(&compositor, rect, compositor.theme().menu_text);
