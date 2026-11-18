@@ -263,9 +263,14 @@ Shell хранит сессионные креденшелы (`src/shell/identit
 * **Нет login/session manager.** Один console-shell; нет `getty`, нет
   per-user сессий, нет `utmp`.
 * **`su` не понижает сам shell** (см. §4): встроенные команды остаются root.
-* **Проверка `lxrun` неполна:** для не-root сессии проверяются read+execute
-  финального образа, но не search-биты промежуточных каталогов; `execve(2)`
-  проверяет их сам, а kernel-лаунчер обходит.
+* **Корректность search-битов у `lxrun` (фаза 2, агент B):** для не-root
+  сессии `run_linux_binary_as` разрешает путь проверяющим обходчиком
+  (`lookup_path_walk_checked` с `may_search` по креденшелам ребёнка) и затем
+  требует read+execute на финальном образе, поэтому промежуточный каталог без
+  `x` даёт `EACCES`. `execve(2)` идёт тем же checked-обходом при загрузке
+  образа. `EACCES` на промежуточном каталоге покрыт host-свойством
+  `link_walk_paths`; непроверяемым остаётся только намеренно привилегированный
+  kernel-лаунчер `run_linux_binary` (boot-selftest'ы).
 * **Нет per-seat/DRM-master.** Эксклюзивность `fb0` — соглашение, а не
   enforcement; любой член `video` может открыть экран параллельно.
 * **Нет ACL, audit trail, `fsuid`/`fsgid`, user namespaces.** Набор групп — это
