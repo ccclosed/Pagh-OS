@@ -270,9 +270,15 @@ pub static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "su",
-        description: "Switch session identity (phase 1: root -> uid 1000, no password)",
+        description: "Switch the session identity (root session only, no password yet)",
         usage: "su [user]",
         handler: super::commands::cmd_su,
+    },
+    CommandSpec {
+        name: "login",
+        description: "Start a session identity for a /etc/passwd user",
+        usage: "login <user>",
+        handler: super::commands::cmd_login,
     },
     CommandSpec {
         name: "head",

@@ -718,12 +718,12 @@ pub(super) fn cmd_groups(_ctx: &mut ShellCtx, args: &[&str]) {
 
 /// `su [user]`: сменить сессионную идентичность shell.
 ///
-/// Фаза 1: только `root -> oleg` (uid 1000) и `root -> root` (сброс). Пароля
-/// нет — это **явно документированное** ограничение, а не забытая проверка:
-/// аутентификация/login — предмет фазы 2 (`docs/security/groups.md`).
+/// **Только из root-сессии** (как и в фазе 1): `su root` — сброс, `su <user>` —
+/// понижение до записи `/etc/passwd`. Пароль пока не спрашивается — это
+/// явно документированное ограничение (аутентификация — `login`/`passwd`,
+/// `docs/security/groups.md`); поэтому из непривилегированной сессии `su root`
+/// запрещён, иначе отсутствие пароля было бы эскалацией.
 ///
-/// Смена односторонняя: из непривилегированной сессии `su root` запрещён (иначе
-/// отсутствие пароля было бы эскалацией). Вернуться к root можно перезагрузкой.
 /// Shell-встроенные команды по-прежнему исполняются kernel-кодом; меняется
 /// идентичность процессов, которые запускает `lxrun`.
 pub(super) fn cmd_su(_ctx: &mut ShellCtx, args: &[&str]) {
@@ -732,67 +732,100 @@ pub(super) fn cmd_su(_ctx: &mut ShellCtx, args: &[&str]) {
         return;
     }
     let target = args.first().copied().unwrap_or("root");
+    switch_session("su", target);
+}
+
+/// `login [user]`: установить сессионную идентичность пользователя.
+///
+/// В отличие от `su` (переключение), это «вход»: цель обязательна, а `root`
+/// требует явного `login root` (эквивалент `su root`). Пароль — предмет A4
+/// (`docs/security/groups.md`), пока действует то же ограничение фазы 1: только
+/// из root-сессии.
+pub(super) fn cmd_login(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.len() != 1 {
+        shell_println("login: usage: login <user>");
+        return;
+    }
+    switch_session("login", args[0]);
+}
+
+/// Общая часть `su`/`login`: построить идентичность цели и поставить её сессии.
+///
+/// Возвращает `None`, если переключение не состоялось (сообщение уже
+/// напечатано). Отдельная функция, чтобы `su` и `login` не расходились в
+/// правилах: обе проверяют root-сессию, обе идут через
+/// [`identity::login_creds`].
+fn switch_session(command: &str, target: &str) -> Option<Creds> {
     let current = identity::current();
-    if !current.is_root() {
-        shell_println("su: permission denied (phase 1: only a root session may su)");
-        return;
-    }
     if target == "root" || target == "0" {
+        if !current.is_root() {
+            shell_println(&format!(
+                "{}: permission denied (only a root session may switch back to root)",
+                command
+            ));
+            return None;
+        }
         identity::set_session(Creds::ROOT);
-        shell_println("su: session identity is root (uid=0, gid=0, no groups)");
-        return;
+        shell_println(&format!(
+            "{}: session identity is root (uid=0, gid=0, no groups)",
+            command
+        ));
+        return Some(Creds::ROOT);
     }
-    let Some(user) = identity::lookup_user(target) else {
-        shell_println(&alloc::format!(
-            "su: user '{}' does not exist in /etc/passwd",
-            target
+    if !current.is_root() {
+        shell_println(&format!(
+            "{}: permission denied (phase 1: only a root session may switch identity)",
+            command
         ));
-        return;
-    };
-    if user.uid != 1000 {
-        shell_println(&alloc::format!(
-            "su: phase 1 supports only root -> uid 1000 ('oleg'); '{}' has uid {}",
-            user.name,
-            user.uid
-        ));
-        return;
+        return None;
     }
-    let Some(supplementary) = identity::supplementary_groups_for_user(&user.name) else {
-        shell_println(&alloc::format!(
-            "su: '{}': group database unavailable",
-            user.name
-        ));
-        return;
-    };
-    if supplementary.len() > GROUPS_CAP {
-        shell_println(&alloc::format!(
-            "su: '{}' is in {} groups; this kernel supports at most {}",
-            user.name,
-            supplementary.len(),
-            GROUPS_CAP
-        ));
-        return;
+    match identity::login_creds(target) {
+        Ok(creds) => {
+            identity::set_session(creds);
+            shell_println(&format!(
+                "{}: no password authentication in this phase: root -> {} (uid={} gid={})",
+                command, target, creds.uid, creds.gid
+            ));
+            shell_println(&format!(
+                "{}: groups={}",
+                command,
+                identity::format_gids(&identity::session_groups())
+            ));
+            shell_println(&format!(
+                "{}: 'lxrun' now starts programs with these credentials; shell built-ins still run as kernel/root (phase-1 limitation)",
+                command
+            ));
+            Some(creds)
+        }
+        Err(identity::LoginError::UnknownUser) => {
+            shell_println(&format!(
+                "{}: user '{}' does not exist in /etc/passwd",
+                command, target
+            ));
+            None
+        }
+        Err(identity::LoginError::RootTarget) => {
+            shell_println(&format!(
+                "{}: '{}' has uid 0; use '{} root' to reset to the root session",
+                command, target, command
+            ));
+            None
+        }
+        Err(identity::LoginError::GroupDatabase) => {
+            shell_println(&format!(
+                "{}: '{}': group database (/etc/group) unavailable",
+                command, target
+            ));
+            None
+        }
+        Err(identity::LoginError::TooManyGroups) => {
+            shell_println(&format!(
+                "{}: '{}': too many supplementary groups (this kernel supports at most {})",
+                command, target, GROUPS_CAP
+            ));
+            None
+        }
     }
-    let Some(next) = Creds::new(user.uid, user.gid, user.uid, user.gid, user.uid, user.gid)
-        .with_groups(&supplementary)
-    else {
-        shell_println("su: credentials construction failed");
-        return;
-    };
-    identity::set_session(next);
-    shell_println(&alloc::format!(
-        "su: no password authentication in phase 1: root -> {} (uid={} gid={})",
-        user.name,
-        user.uid,
-        user.gid
-    ));
-    shell_println(&alloc::format!(
-        "su: groups={}",
-        identity::format_gids(&identity::session_groups())
-    ));
-    shell_println(
-        "su: 'lxrun' now starts programs with these credentials; shell built-ins still run as kernel/root (phase-1 limitation)",
-    );
 }
 
 /// `exec`: запустить встроенный тестовый пользовательский процесс.
