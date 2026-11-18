@@ -123,6 +123,17 @@ pub struct Flyout {
     pub rect: Rect,
 }
 
+/// Ширина сетевого флайаута: референс Win11 «Сети» — заметно шире меню календаря.
+const NETWORK_FLYOUT_WIDTH: i32 = 372;
+/// Высота сетевого флайаута: заголовок, статус и одна карточка подключения.
+const NETWORK_FLYOUT_HEIGHT: i32 = 136;
+/// Зазор между флайаутом, панелью и краем экрана.
+const FLYOUT_GAP: i32 = 8;
+/// Скругление сетевого флайаута: 6 px, компактнее меню и календаря.
+const NETWORK_FLYOUT_RADIUS: i32 = 6;
+/// Скругление меню/календаря — прежний вид, сетевой флайаут его не наследует.
+const MENU_RADIUS: i32 = 10;
+
 /// Ошибки операций с окнами.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WindowError {
@@ -890,9 +901,15 @@ impl Compositor {
         let panel_top = panel::panel_rect(self.screen).y;
         match kind {
             FlyoutKind::Network => {
-                let network = panel::network_rect(self.screen);
+                // Правое ребро прижато к краю экрана, как у Win11: флайаут растёт
+                // влево от области уведомлений и прилегает к панели с зазором 8 px.
                 clamp_flyout(
-                    Rect::new(network.x - 60, panel_top - 188 - 8, 300, 188),
+                    Rect::new(
+                        self.screen.right() - FLYOUT_GAP - NETWORK_FLYOUT_WIDTH,
+                        panel_top - NETWORK_FLYOUT_HEIGHT - FLYOUT_GAP,
+                        NETWORK_FLYOUT_WIDTH,
+                        NETWORK_FLYOUT_HEIGHT,
+                    ),
                     self.screen,
                 )
             }
@@ -1845,73 +1862,79 @@ impl Compositor {
     }
 
     fn paint_flyout(&self, canvas: &mut Canvas, flyout: Flyout) {
-        canvas.shadow(flyout.rect, 10, 9, 18);
-        canvas.fill_rounded_rect(flyout.rect, 10, self.theme.menu_bg, 252);
-        canvas.stroke_rounded_rect(flyout.rect, 10, self.theme.menu_border, 255);
+        // У сетевого флайаута углы компактнее (референс 4–6 px), календарь
+        // сохраняет прежнее скругление меню.
+        let radius = match flyout.kind {
+            FlyoutKind::Network => NETWORK_FLYOUT_RADIUS,
+            FlyoutKind::Calendar => MENU_RADIUS,
+        };
+        canvas.shadow(flyout.rect, radius, 9, 18);
+        canvas.fill_rounded_rect(flyout.rect, radius, self.theme.menu_bg, 252);
+        canvas.stroke_rounded_rect(flyout.rect, radius, self.theme.menu_border, 255);
         match flyout.kind {
             FlyoutKind::Network => self.paint_network_flyout(canvas, flyout.rect),
             FlyoutKind::Calendar => self.paint_calendar_flyout(canvas, flyout.rect),
         }
     }
 
+    /// Сетевой флайаут: заголовок, честный статус связи и карточка подключения.
+    ///
+    /// Композитор знает о сети ровно одно поле — [`Panel::network_online`].
+    /// Ядро пока не отдаёт userspace ни имени интерфейса, ни IP, ни счётчиков
+    /// (`/proc/net/dev`, `SIOCGIFADDR`/netlink отсутствуют), поэтому IP и
+    /// скорости здесь не рисуются: выдуманные значения были бы обманом. По той
+    /// же причине нет кнопки «Отключить» и chevron — в ядре нет пути управления
+    /// линком (нет `SIOCSIFFLAGS`/netlink), а нерабочая кнопка хуже её
+    /// отсутствия. Когда источник данных появится, сюда добавятся строки IP,
+    /// скоростей и действий без переделки геометрии.
     fn paint_network_flyout(&self, canvas: &mut Canvas, rect: Rect) {
-        let x = rect.x + 16;
-        canvas.text(x, rect.y + 12, 1, self.theme.menu_text, "Network");
-        canvas.hline(
-            rect.x + 10,
-            rect.right() - 10,
-            rect.y + 34,
-            self.theme.separator,
-        );
-        let status = if self.panel.network_online {
-            "Connected | 5 GHz"
+        let x = rect.x + 20;
+        let online = self.panel.network_online;
+
+        canvas.text(x, rect.y + 14, 1, self.theme.menu_text, "Сети");
+
+        let status = if online {
+            "Подключено"
         } else {
-            "Disconnected"
+            "Отключено"
         };
-        let status_color = if self.panel.network_online {
+        let status_color = if online {
             self.theme.accent
+        } else {
+            self.theme.menu_text_dim
+        };
+        canvas.text(x, rect.y + 38, 1, status_color, status);
+
+        // Карточка подключения: подложка, проводная иконка и имя подключения.
+        // Настоящего имени интерфейса у композитора нет, поэтому подпись
+        // нейтральная («Проводное подключение 1» из референса), а не выдуманный
+        // SSID или модель адаптера.
+        let card = Rect::new(rect.x + 12, rect.y + 64, rect.w - 24, 56);
+        canvas.fill_rounded_rect(card, 4, self.theme.chip_bg, 255);
+        canvas.stroke_rounded_rect(card, 4, self.theme.menu_border, 90);
+
+        let icon_color = if online {
+            self.theme.panel_icon
         } else {
             self.theme.panel_icon_dim
         };
-        // Wi-Fi иконка.
-        let icon_center = Point::new(x + 9, rect.y + 54);
-        canvas.fill_circle(icon_center, 2, status_color, 255);
-        for radius in [6, 10, 14] {
-            canvas.arc(icon_center, radius, 218.0, 322.0, status_color, 2);
-        }
-        canvas.text(x + 28, rect.y + 44, 1, self.theme.menu_text, "Pagh-OS-5G");
-        canvas.text(x + 28, rect.y + 62, 1, status_color, status);
-
-        let wired_y = rect.y + 88;
-        canvas.fill_rounded_rect(
-            Rect::new(x, wired_y + 3, 18, 12),
-            2,
-            self.theme.panel_icon_dim,
-            255,
+        draw_wired_icon(
+            canvas,
+            Point::new(card.x + 24, card.center().y),
+            icon_color,
+            self.theme.chip_bg,
         );
-        canvas.text(x + 28, wired_y, 1, self.theme.menu_text, "Wired");
+        let label_color = if online {
+            self.theme.menu_text
+        } else {
+            self.theme.menu_text_dim
+        };
         canvas.text(
-            x + 28,
-            wired_y + 18,
+            card.x + 48,
+            card.center().y - 8,
             1,
-            self.theme.panel_text_dim,
-            "Connected | 1 Gb/s",
-        );
-
-        canvas.hline(
-            rect.x + 10,
-            rect.right() - 10,
-            rect.y + 132,
-            self.theme.separator,
-        );
-        canvas.text(x, rect.y + 144, 1, self.theme.menu_text, "VPN");
-        canvas.text(x + 28, rect.y + 144, 1, self.theme.panel_text_dim, "Off");
-        canvas.text(
-            x,
-            rect.bottom() - 24,
-            1,
-            self.theme.menu_text_dim,
-            "Network settings...",
+            label_color,
+            "Проводное подключение 1",
         );
     }
 
@@ -1982,6 +2005,27 @@ impl Compositor {
             "Sunday, 15 November 2026",
         );
     }
+}
+
+/// Проводная сеть: порт с контактами и кабелем — иконка карточки подключения.
+///
+/// `background` — цвет подложки карточки: им вырезается внутренность рамки
+/// порта, поэтому иконка остаётся контурной на любой поверхности.
+fn draw_wired_icon(
+    canvas: &mut Canvas,
+    center: Point,
+    color: color::Color,
+    background: color::Color,
+) {
+    let shell = Rect::new(center.x - 10, center.y - 8, 20, 15);
+    canvas.fill_rounded_rect(shell, 2, color, 255);
+    canvas.fill_rounded_rect(shell.inset(2), 1, background, 255);
+    // Четыре контакта разъёма.
+    for dx in [-6, -2, 2, 6] {
+        canvas.vline(center.x + dx, shell.y + 4, shell.y + 10, color);
+    }
+    // Кабель уходит вниз от корпуса.
+    canvas.vline(center.x, shell.bottom(), shell.bottom() + 3, color);
 }
 
 fn copy_shm_rect(surface: &mut Surface, view: &crate::shm::ShmView<'_>, area: Rect) {
@@ -2295,6 +2339,53 @@ mod tests {
         compositor.pointer_button(MouseButton::Left, true);
         compositor.pointer_button(MouseButton::Left, false);
         assert!(compositor.flyout().is_none());
+    }
+
+    #[test]
+    fn network_flyout_has_reference_geometry() {
+        let mut compositor = compositor();
+        let network = panel::network_rect(compositor.screen()).center();
+        compositor.pointer_motion(network);
+        compositor.pointer_button(MouseButton::Left, true);
+        compositor.pointer_button(MouseButton::Left, false);
+        let flyout = compositor.flyout().expect("флайаут открыт");
+        let screen = compositor.screen();
+        let panel_top = panel::panel_rect(screen).y;
+        assert_eq!(flyout.rect.w, NETWORK_FLYOUT_WIDTH);
+        assert_eq!(flyout.rect.right(), screen.right() - FLYOUT_GAP);
+        assert_eq!(flyout.rect.bottom(), panel_top - FLYOUT_GAP);
+        assert!(
+            flyout.rect.h <= 160,
+            "низ флайаута должен быть компактным: {}",
+            flyout.rect.h
+        );
+        assert!(flyout.rect.x >= 0);
+    }
+
+    #[test]
+    fn network_flyout_offers_no_fake_disconnect_action() {
+        // Клик внутри карточки не запускает действие: реального пути управления
+        // линком в ядре нет, поэтому «Отключить» не рисуется и не обрабатывается.
+        let mut compositor = compositor();
+        let network = panel::network_rect(compositor.screen()).center();
+        compositor.pointer_motion(network);
+        compositor.pointer_button(MouseButton::Left, true);
+        compositor.pointer_button(MouseButton::Left, false);
+        let rect = compositor.flyout().expect("флайаут открыт").rect;
+        let card = Point::new(rect.x + 12 + 174, rect.y + 64 + 28);
+        compositor.pointer_motion(card);
+        let events = compositor.pointer_button(MouseButton::Left, true);
+        let events = events
+            .into_iter()
+            .chain(compositor.pointer_button(MouseButton::Left, false));
+        assert!(
+            events.count() == 0,
+            "карточка не должна выполнять несуществующее действие"
+        );
+        assert!(
+            compositor.flyout().is_some(),
+            "клик по карточке не закрывает флайаут"
+        );
     }
 
     #[test]

@@ -184,7 +184,11 @@ pub fn run(out_dir: impl AsRef<Path>) -> io::Result<ScenarioReport> {
         "06-network-flyout.png",
         &mut screenshots,
     )?;
-    notes.push("клик по иконке сети: Wi-Fi flyout с Pagh-OS-5G / Wired / VPN".into());
+    notes.push(
+        "клик по иконке сети: флайаут «Сети» — статус и карточка проводного подключения; \
+         IP и скорости не рисуются, пока ядро их не отдаёт"
+            .into(),
+    );
 
     // Calendar flyout.
     click(&mut compositor, Point::new(300, 600));
