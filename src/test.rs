@@ -9046,6 +9046,244 @@ mod desktop_b_tests {
         );
     }
 
+    /// Регрессия ОБЩЕГО пути `read(2)`/`write(2)`: буфер, ни одна страница
+    /// которого ещё не подперта demand paging'ом.
+    ///
+    /// До фикса `check_user_ptr` требовал PRESENT на всех страницах всего
+    /// `count`, поэтому `read` в свежий `mmap` и `write` из свежего `Vec`/`Box`
+    /// возвращали `EFAULT` уже на второй странице, хотя это законная память
+    /// процесса. Ровно на этом падали клиент kernel VT-моста (read снимка) и
+    /// приложения, пишущие крупные буферы (Files и др.). Здесь проверяется
+    /// общий файловый/pipe путь, а не `/dev/vtconsole0` (у него собственный
+    /// ранний путь и своя регрессия выше).
+    pub fn lazy_anon_user_buffers() {
+        let frames_before = pmm::free_frames();
+        // 3 страницы данных через pipe: ёмкость 64 КиБ, запись не блокируется.
+        const DATA: u64 = 3 * 4096;
+        const CHUNK: usize = 0x800; // scratch-страница: шаблон в 0x800..0x1000
+        let mut pattern = alloc::vec::Vec::with_capacity(CHUNK);
+        for i in 0..CHUNK {
+            pattern.push((i % 251) as u8);
+        }
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            put_u32(0x200, 0);
+            put_u32(0x204, 0);
+            assert_eq_kernel!(
+                io_sys::sys_pipe(SCRATCH_VA + 0x200),
+                Ok(0),
+                "userbuf: pipe() for the lazy-buffer regression"
+            );
+            let rd = get_u32(0x200) as u64;
+            let wr = get_u32(0x204) as u64;
+
+            // ── read(2) в ленивый anon-буфер: 8 страниц приёмника, 3 страницы
+            // данных. Требование PRESENT на всём `count` отвергало такой буфер.
+            let rdbuf = match mem_sys::sys_mmap(
+                0,
+                8 * 4096,
+                (PROT_READ | PROT_WRITE) as u64,
+                (MAP_PRIVATE | MAP_ANONYMOUS) as u64,
+                u64::MAX,
+                0,
+            ) {
+                Ok(base) => base,
+                Err(_) => {
+                    assert_eq_kernel!(0, 1, "userbuf: lazy read mmap failed");
+                    return;
+                }
+            };
+            assert_kernel!(
+                vmm::virt_to_phys(rdbuf).is_none(),
+                "userbuf: read buffer starts demand-paged"
+            );
+            // Наполнить pipe шаблоном через настоящий write(2).
+            put(0x800, &pattern);
+            let mut written = 0u64;
+            while written < DATA {
+                match io_sys::sys_write(wr, SCRATCH_VA + 0x800, CHUNK as u64) {
+                    Ok(n) if n > 0 => written += n,
+                    other => {
+                        assert_eq_kernel!(other, Ok(CHUNK as u64), "userbuf: prime the pipe");
+                        return;
+                    }
+                }
+            }
+            let mut got = 0u64;
+            while got < DATA {
+                let n = match io_sys::sys_read(rd, rdbuf + got, 8 * 4096 - got) {
+                    Ok(n) if n > 0 => n,
+                    other => {
+                        assert_eq_kernel!(
+                            other,
+                            Ok(DATA - got),
+                            "userbuf: read() into a demand-paged buffer"
+                        );
+                        return;
+                    }
+                };
+                got += n;
+            }
+            assert_eq_kernel!(got, DATA, "userbuf: read() filled all buffered bytes");
+            let mut payload_ok = true;
+            for i in 0..DATA as usize {
+                // SAFETY: `rdbuf` — отображение длины 8 страниц; байты
+                // 0..DATA подперты чтением выше.
+                let b = unsafe { core::ptr::read_volatile((rdbuf + i as u64) as *const u8) };
+                if b != pattern[i % CHUNK] {
+                    payload_ok = false;
+                    break;
+                }
+            }
+            assert_kernel!(payload_ok, "userbuf: read() payload matches the pattern");
+            // min(count, available): приёмник объявлен на 8 страниц, данных 3,
+            // поэтому последняя скопированная страница резидентна, а всё, что
+            // дальше, обязано остаться ленивым — иначе `read` подпёр бы весь
+            // заявленный `count` (до 2 ГиБ) и раздул память вызова.
+            assert_kernel!(
+                vmm::virt_to_phys(rdbuf + DATA - 1).is_some(),
+                "userbuf: the last copied page is resident"
+            );
+            assert_kernel!(
+                vmm::virt_to_phys(rdbuf + 8 * 4096 - 1).is_none(),
+                "userbuf: pages past min(count, available) stay lazy"
+            );
+
+            // ── write(2) из ленивого anon-буфера: страницы источника подпирает
+            // ядро (пользователь их не трогал), поэтому данные — нули. До
+            // фикса `check_user_ptr` возвращал здесь EFAULT.
+            let src = match mem_sys::sys_mmap(
+                0,
+                3 * 4096,
+                (PROT_READ | PROT_WRITE) as u64,
+                (MAP_PRIVATE | MAP_ANONYMOUS) as u64,
+                u64::MAX,
+                0,
+            ) {
+                Ok(base) => base,
+                Err(_) => {
+                    assert_eq_kernel!(0, 1, "userbuf: lazy write mmap failed");
+                    return;
+                }
+            };
+            assert_kernel!(
+                vmm::virt_to_phys(src).is_none(),
+                "userbuf: write source starts demand-paged"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_write(wr, src, 3 * 4096),
+                Ok(3 * 4096),
+                "userbuf: write() accepts a demand-paged source"
+            );
+            assert_kernel!(
+                vmm::virt_to_phys(src).is_some(),
+                "userbuf: write() backed the source pages"
+            );
+
+            // ── Настоящие отказы остаются EFAULT ──
+            // PROT_NONE: подпирать нельзя (иначе mprotect стал бы совещательным).
+            let pn = match mem_sys::sys_mmap(
+                0,
+                4096,
+                0, // PROT_NONE
+                (MAP_PRIVATE | MAP_ANONYMOUS) as u64,
+                u64::MAX,
+                0,
+            ) {
+                Ok(base) => base,
+                Err(_) => {
+                    assert_eq_kernel!(0, 1, "userbuf: PROT_NONE mmap failed");
+                    return;
+                }
+            };
+            put(0x800, &[0x5A; 8]);
+            assert_eq_kernel!(
+                io_sys::sys_write(wr, SCRATCH_VA + 0x800, 8),
+                Ok(8),
+                "userbuf: prime the pipe with one refusal probe"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_read(rd, pn, 8),
+                Err(Errno::EFAULT),
+                "userbuf: read() into PROT_NONE is EFAULT"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_write(wr, pn, 8),
+                Err(Errno::EFAULT),
+                "userbuf: write() from PROT_NONE is EFAULT"
+            );
+            // Адрес в пользовательской половине, но вне всех регионов.
+            const WILD: u64 = 0x0000_7abc_0000_0000;
+            put(0x800, &[0x11; 8]);
+            assert_eq_kernel!(
+                io_sys::sys_write(wr, SCRATCH_VA + 0x800, 8),
+                Ok(8),
+                "userbuf: prime the pipe for the wild-address probe"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_read(rd, WILD, 8),
+                Err(Errno::EFAULT),
+                "userbuf: read() into an unregistered user address is EFAULT"
+            );
+            // Огромный `count` не должен превращаться в panic кучи ядра
+            // (`panic = abort` = машина мертва): буфер под копию выделяется
+            // fallible, поэтому `read(2)` отдаёт `ENOMEM` — так же, как нехватка
+            // памяти в Linux. До этого фикса такой `count` был недостижим только
+            // потому, что проверка PRESENT по всему диапазону отсекала его
+            // раньше, чем дело доходило до аллокации.
+            assert_eq_kernel!(
+                io_sys::sys_read(rd, SCRATCH_VA, 0x7FFF_FFFF),
+                Err(Errno::ENOMEM),
+                "userbuf: a 2 GiB count is ENOMEM, not a heap panic"
+            );
+            // `write(2)` с тем же `count`: диапазон не покрыт ленивым регионом,
+            // поэтому отказ — `EFAULT` (подпираются только свои ленивые
+            // страницы), и машина остаётся жива.
+            assert_eq_kernel!(
+                io_sys::sys_write(wr, SCRATCH_VA, 0x7FFF_FFFF),
+                Err(Errno::EFAULT),
+                "userbuf: a 2 GiB write with a non-lazy tail is EFAULT"
+            );
+            // Адрес ядра отсекается диапазонной проверкой ещё до копии.
+            assert_eq_kernel!(
+                io_sys::sys_read(rd, 0xffff_8000_0000_0000, 8),
+                Err(Errno::EFAULT),
+                "userbuf: kernel address is EFAULT"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_write(wr, 0xffff_8000_0000_0000, 8),
+                Err(Errno::EFAULT),
+                "userbuf: kernel address is EFAULT on write"
+            );
+
+            assert_eq_kernel!(io_sys::sys_close(rd), Ok(0), "userbuf: close read end");
+            assert_eq_kernel!(io_sys::sys_close(wr), Ok(0), "userbuf: close write end");
+            assert_eq_kernel!(
+                mem_sys::sys_munmap(rdbuf, 8 * 4096),
+                Ok(0),
+                "userbuf: munmap read buffer"
+            );
+            assert_eq_kernel!(
+                mem_sys::sys_munmap(src, 3 * 4096),
+                Ok(0),
+                "userbuf: munmap src"
+            );
+            assert_eq_kernel!(
+                mem_sys::sys_munmap(pn, 4096),
+                Ok(0),
+                "userbuf: munmap PROT_NONE"
+            );
+        })
+        .is_some();
+        restore_synth(me, saved);
+        assert_kernel!(ran, "userbuf: syscall test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "userbuf: routine returned every PMM frame"
+        );
+    }
+
     /// SCM_RIGHTS по AF_UNIX socketpair: данные и memfd в одном `sendmsg`,
     /// получатель принимает dup fd и через `mmap(MAP_SHARED)` видит те же
     /// страницы; отправитель свой fd не теряет. Плюс несколько fd в одном cmsg
@@ -10258,6 +10496,14 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "arch::ring-3 #PF kills the task, kernel survives (S4b)",
             ring3_fault_tests::ring3_page_fault_kills_task_not_kernel
+        ),
+        // Общий путь read(2)/write(2) через ещё не подпёртый ленивый
+        // анонимный буфер. Живёт рядом с desktop-b scaffolding'ом, потому что
+        // тест исполняет настоящие syscall'ы в свежем пользовательском PML4 с
+        // синтетическим `CompatState` (там же `with_user_space`).
+        (
+            "userbuf::lazy anon read/write through demand paging",
+            desktop_b_tests::lazy_anon_user_buffers
         ),
     ]
 }

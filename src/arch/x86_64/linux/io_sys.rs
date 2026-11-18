@@ -40,7 +40,7 @@ use super::cred::{Access, Creds};
 use super::dirent::{d_type_for, dirent_reclen, encode_dirent64};
 use super::errno::Errno;
 use super::io::{plan_lseek, plan_read};
-use super::{check_user_ptr, check_user_ptr_writable};
+use super::{check_user_ptr, check_user_ptr_bounds, check_user_ptr_writable};
 // Два ioctl foreground-группы (`tcgetpgrp`/`tcsetpgrp`), как и бит `TOSTOP`,
 // берутся из чистой модели (`super::tty`), чтобы ядро и host-свойства не
 // разошлись в номерах ABI.
@@ -126,7 +126,18 @@ fn write_statx_sock(buf: u64) -> Result<u64, Errno> {
 }
 
 pub(crate) fn copy_in_pub(buf: u64, count: u64) -> alloc::vec::Vec<u8> {
-    copy_in(buf, count)
+    // Мелкие фиксированные записи соседних модулей (sigset 8, timespec 32,
+    // sockaddr, cmsg): `count` здесь не пользовательского масштаба, поэтому
+    // прямой `vec!` уместен и отказ выделения невозможен.
+    let mut out = vec![0u8; count as usize];
+    if count > 0 {
+        // SAFETY: диапазон проверен вызывающим (`check_user_ptr`), а активный
+        // CR3 — user PML4 вызывающего процесса, поэтому источник читаем.
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf as *const u8, out.as_mut_ptr(), count as usize);
+        }
+    }
+    out
 }
 pub(crate) fn copy_out_pub(buf: u64, data: &[u8]) -> Result<(), Errno> {
     copy_out(buf, data)
@@ -142,6 +153,24 @@ pub(crate) fn copy_out_pub(buf: u64, data: &[u8]) -> Result<(), Errno> {
 pub(crate) fn copy_out_checked(ptr: u64, src: &[u8]) -> Result<(), Errno> {
     check_user_ptr_writable(ptr, src.len() as u64)?;
     copy_out(ptr, src)
+}
+
+/// Опубликовать `src` в пользовательский приёмник `read(2)`/`readv(2)`/
+/// `pread(2)`: подпереть ленивые страницы demand paging'ом, затем скопировать
+/// с повторной проверкой.
+///
+/// ПОЧЕМУ не `copy_out_checked` напрямую: приёмник `read(2)` у реальных
+/// приложений — свежий `Vec`/`Box` на ленивой куче `brk` или анонимный `mmap`
+/// (`vec![0u8; total]`), чьи страницы ещё не подперты. `check_user_ptr_writable`
+/// требует PRESENT и отвергал такой законный буфер `EFAULT`'ом на любой длине
+/// больше одной страницы. Порядок здесь тот же, что в vt-bridge фиксе:
+/// `populate_user_out` (политика `handle_user_page_fault`) → проверка прав →
+/// копия. Проверка идёт ПОСЛЕ подпирания и по фактической длине `src`, поэтому
+/// TOCTOU-контракт сохраняется: страница, ставшая read-only или исчезнувшая,
+/// пока вызов уступал CPU, по-прежнему даёт `EFAULT` до записи.
+fn publish_read(ptr: u64, src: &[u8]) -> Result<(), Errno> {
+    super::mem_sys::populate_user_out(ptr, src.len() as u64)?;
+    copy_out_checked(ptr, src)
 }
 
 /// Свести ошибку записи в VFS к errno.
@@ -289,11 +318,29 @@ fn console_write(slice: &[u8]) {
     }
 }
 
+/// `len` нулевых байт под копию пользовательских данных, либо `ENOMEM`.
+///
+/// ПОЧЕМУ не `vec![0u8; len]`: `len` выводится из пользовательского `count`
+/// (до `COUNT_MAX` = 2 ГиБ), а куча ядра фиксирована (512 МиБ). Неудачная
+/// аллокация в `no_std` паникует, `panic = "abort"` останавливает машину —
+/// то есть `write(2)`/`read(2)` с большим `count` стали бы machine-kill'ом
+/// ровно на тех буферах, которые этот фикс разрешает (ленивый anon-буфер
+/// больше не требует резидентности всех страниц заранее). Отказ обязан быть
+/// `ENOMEM`, как у нехватки памяти в Linux.
+fn try_user_buf(len: u64) -> Result<Vec<u8>, Errno> {
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len as usize)
+        .map_err(|_| Errno::ENOMEM)?;
+    buf.resize(len as usize, 0);
+    Ok(buf)
+}
+
 /// Скопировать `len` проверенных пользовательских байт по `ptr` в свой буфер.
 ///
-/// ПРЕДУСЛОВИЕ: `[ptr, ptr+len)` уже прошёл [`check_user_ptr`].
-fn copy_in(ptr: u64, len: u64) -> Vec<u8> {
-    let mut buf = vec![0u8; len as usize];
+/// ПРЕДУСЛОВИЕ: `[ptr, ptr+len)` уже прошёл [`check_user_ptr`]. Нехватка
+/// памяти — `ENOMEM` (см. [`try_user_buf`]), а не паника.
+fn copy_in(ptr: u64, len: u64) -> Result<Vec<u8>, Errno> {
+    let mut buf = try_user_buf(len)?;
     if len > 0 {
         // SAFETY: диапазон проверен (в границах, все страницы отображены), а
         // активный CR3 — user PML4 вызывающего процесса, поэтому источник читаем.
@@ -301,7 +348,7 @@ fn copy_in(ptr: u64, len: u64) -> Vec<u8> {
             core::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len as usize);
         }
     }
-    buf
+    Ok(buf)
 }
 
 /// Скопировать `src` наружу в пользовательский буфер по `ptr`.
@@ -469,7 +516,6 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
     }
     // evdev читает одно событие (24 байта), поэтому полный `count` ему не
     // обязан быть отображён: Linux проверяет только `sizeof(input_event)`.
-    // Остальные файловые/pipe-пути сохраняют прежнюю проверку всего буфера.
     // `/dev/vtconsole0` отдаёт снимок целиком, поэтому проверять присутствие
     // страниц по всему `count` нельзя: клиент читает его в свежий анонимный
     // `mmap`, чьи страницы ещё не подперты demand paging'ом, и общая проверка
@@ -487,7 +533,15 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             return read_vtconsole(fd as u32, buf, count);
         }
     }
-    check_user_ptr(buf, count)?;
+    // PRESENT больше не требуется от всего `count`: `read(2)` копирует
+    // `min(count, доступное)`, и требование резидентности всех `count` байт
+    // отвергало законные буферы — свежий `Vec`/`Box` на ленивой куче `brk` или
+    // анонимный `mmap`, заполняемый как раз этим вызовом. Остаётся диапазонная
+    // проверка (не пользовательский адрес/переполнение → `EFAULT`), а
+    // присутствие и права проверяются по фактической длине копии; страницы
+    // приёмника подпирает `publish_read`/`populate_user_out` той же политикой,
+    // что и обработчик page fault.
+    check_user_ptr_bounds(buf, count)?;
 
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
@@ -516,7 +570,7 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             if count < 8 {
                 return Err(Errno::EINVAL);
             }
-            check_user_ptr(buf, 8)?;
+            super::mem_sys::populate_user_out(buf, 8)?;
             loop {
                 let due = state.lock().take(crate::task::scheduler::ticks());
                 if due > 0 {
@@ -539,7 +593,7 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             if count < 8 {
                 return Err(Errno::EINVAL);
             }
-            check_user_ptr(buf, 8)?;
+            super::mem_sys::populate_user_out(buf, 8)?;
             loop {
                 let mut v = val.lock();
                 if *v > 0 {
@@ -563,26 +617,27 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         }
         Some(Resolved::Epoll) => Err(Errno::EINVAL),
         Some(Resolved::InetTcp(t)) => {
-            let mut data = vec![0u8; count as usize];
+            // `count` — пользовательский: буфер ядра ограничен кучей, OOM → ENOMEM.
+            let mut data = try_user_buf(count)?;
             let n = crate::arch::x86_64::linux::inet_sock::tcp_read(fd, &mut data)?;
-            copy_out_checked(buf, &data[..n])?;
+            publish_read(buf, &data[..n])?;
             return Ok(n as u64);
         }
         Some(Resolved::InetUdp(_)) => Err(Errno::ENOTCONN), // только recvfrom
         Some(Resolved::PipeRead(e)) => {
-            let mut data = vec![0u8; count as usize];
+            let mut data = try_user_buf(count)?;
             let n = read_pipe(&e, &mut data)?;
             if n > 0 {}
-            copy_out_checked(buf, &data[..n])?;
+            publish_read(buf, &data[..n])?;
             Ok(n as u64)
         }
         Some(Resolved::Socket { rx, .. }) => {
-            let mut data = vec![0u8; count as usize];
+            let mut data = try_user_buf(count)?;
             let n = read_pipe(&rx, &mut data)?;
             if n > 0 {
                 diag_count(&DIAG_SOCK_R, "sock read", n as u64, 16384);
             }
-            copy_out_checked(buf, &data[..n])?;
+            publish_read(buf, &data[..n])?;
             Ok(n as u64)
         }
         Some(Resolved::File { node, offset }) => {
@@ -591,7 +646,11 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             if copied == 0 {
                 return Ok(0);
             }
-            let mut kbuf = vec![0u8; copied as usize];
+            // Подпереть приёмник ДО чтения: копируется ровно `copied` =
+            // min(count, size - offset), поэтому EFAULT приходит на реально
+            // недоступном диапазоне, а не на всём `count`.
+            super::mem_sys::populate_user_out(buf, copied)?;
+            let mut kbuf = try_user_buf(copied)?;
             let n = node.read(offset, &mut kbuf).map_err(|e| {
                 // Настоящая ошибка чтения VFS/ext2 — не «неверный аргумент»:
                 // сообщаем EIO и логируем, что именно сломалось.
@@ -773,6 +832,15 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
     if count > COUNT_MAX {
         return Err(Errno::EINVAL);
     }
+    // `write(2)` читает ВЕСЬ `count` (copy_in на каждой ветке), поэтому здесь
+    // подпирание источника не «min(count, available)», а весь диапазон. Раньше
+    // PRESENT требовался от всех страниц `count`, и свежий пользовательский
+    // буфер — `Vec`/`Box` на ленивой куче `brk` или анонимный `mmap`, ещё не
+    // подпёртый, — отвергался `EFAULT`'ом, хотя ядро скопировало бы его без
+    // отказа. Подпирание идёт ТОЙ ЖЕ политикой, что и обработчик page fault
+    // (`populate_user_in` → `handle_user_page_fault`), а проверка присутствия
+    // остаётся и после него: она же отвергает страницу без `USER_ACCESSIBLE`.
+    super::mem_sys::populate_user_in(buf, count)?;
     check_user_ptr(buf, count)?;
 
     match resolve_fd(fd as u32) {
@@ -794,22 +862,22 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         Some(Resolved::Epoll) => Err(Errno::EINVAL),
         Some(Resolved::PipeRead(_)) => Err(Errno::EBADF),
         Some(Resolved::InetTcp(_)) => {
-            let data = copy_in(buf, count);
+            let data = copy_in(buf, count)?;
             let n = crate::arch::x86_64::linux::inet_sock::tcp_write(fd, &data)?;
             Ok(n as u64)
         }
         Some(Resolved::InetUdp(_)) => {
-            let data = copy_in(buf, count);
+            let data = copy_in(buf, count)?;
             let n = crate::arch::x86_64::linux::inet_sock::udp_write_fd(fd, &data)?;
             Ok(n as u64)
         }
         Some(Resolved::PipeWrite(e)) => {
-            let data = copy_in(buf, count);
+            let data = copy_in(buf, count)?;
 
             Ok(write_pipe(&e, &data)? as u64)
         }
         Some(Resolved::Socket { tx, .. }) => {
-            let data = copy_in(buf, count);
+            let data = copy_in(buf, count)?;
             let n = write_pipe(&tx, &data)?;
             if n > 0 {
                 diag_count(&DIAG_SOCK_W, "sock write", n as u64, 16384);
@@ -821,7 +889,7 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             // останавливается при TOSTOP (SIGTTOU + -EINTR), как в Linux; если
             // TOSTOP снят, запись проходит.
             crate::drivers::tty::check_access(super::tty::TtyAccess::Write)?;
-            let data = copy_in(buf, count);
+            let data = copy_in(buf, count)?;
             console_write(&data);
             Ok(count)
         }
@@ -830,7 +898,7 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             Err(Errno::EBADF)
         }
         Some(Resolved::File { node, offset }) => {
-            let data = copy_in(buf, count);
+            let data = copy_in(buf, count)?;
             let n = node.write(offset, &data).map_err(write_errno)?;
             set_fd_offset(fd as u32, offset + n as u64);
             Ok(n as u64)
@@ -853,6 +921,10 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     // Проверить сам массив iovec, прежде чем читать из него записи.
+    // Массив iovec ядро читает целиком: подпереть ленивые страницы и затем
+    // проверить присутствие (та же политика demand paging, что у page fault).
+    // Без этого writev/readv из свежего `Vec<iovec>` на куче давал EFAULT.
+    super::mem_sys::populate_user_in(iov, iovcnt * IOV_SIZE)?;
     check_user_ptr(iov, iovcnt * IOV_SIZE)?;
 
     let target = resolve_fd(fd as u32).ok_or(Errno::EBADF)?;
@@ -873,8 +945,9 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
             if len == 0 {
                 continue;
             }
+            super::mem_sys::populate_user_in(base, len)?;
             check_user_ptr(base, len)?;
-            let data = copy_in(base, len);
+            let data = copy_in(base, len)?;
             let n = crate::arch::x86_64::linux::inet_sock::tcp_write(fd, &data)?;
             total += n as u64;
             if (n as u64) < len {
@@ -916,8 +989,9 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
         if len > COUNT_MAX {
             return Err(Errno::EINVAL);
         }
+        super::mem_sys::populate_user_in(base, len)?;
         check_user_ptr(base, len)?;
-        let data = copy_in(base, len);
+        let data = copy_in(base, len)?;
         match &target {
             Resolved::Console => {
                 // Тот же контроль доступа к терминалу, что у `write(2)`:
@@ -969,6 +1043,10 @@ pub fn sys_readv(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
     if iovcnt > IOV_MAX {
         return Err(Errno::EINVAL);
     }
+    // Массив iovec ядро читает целиком: подпереть ленивые страницы и затем
+    // проверить присутствие (та же политика demand paging, что у page fault).
+    // Без этого writev/readv из свежего `Vec<iovec>` на куче давал EFAULT.
+    super::mem_sys::populate_user_in(iov, iovcnt * IOV_SIZE)?;
     check_user_ptr(iov, iovcnt * IOV_SIZE)?;
     let mut total: u64 = 0;
     for i in 0..iovcnt {
@@ -1004,6 +1082,10 @@ pub fn sys_preadv(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, Er
     if iovcnt > IOV_MAX {
         return Err(Errno::EINVAL);
     }
+    // Массив iovec ядро читает целиком: подпереть ленивые страницы и затем
+    // проверить присутствие (та же политика demand paging, что у page fault).
+    // Без этого writev/readv из свежего `Vec<iovec>` на куче давал EFAULT.
+    super::mem_sys::populate_user_in(iov, iovcnt * IOV_SIZE)?;
     check_user_ptr(iov, iovcnt * IOV_SIZE)?;
     let mut total: u64 = 0;
     for i in 0..iovcnt {
@@ -1039,6 +1121,10 @@ pub fn sys_pwritev(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, E
     if iovcnt > IOV_MAX {
         return Err(Errno::EINVAL);
     }
+    // Массив iovec ядро читает целиком: подпереть ленивые страницы и затем
+    // проверить присутствие (та же политика demand paging, что у page fault).
+    // Без этого writev/readv из свежего `Vec<iovec>` на куче давал EFAULT.
+    super::mem_sys::populate_user_in(iov, iovcnt * IOV_SIZE)?;
     check_user_ptr(iov, iovcnt * IOV_SIZE)?;
     let mut total: u64 = 0;
     for i in 0..iovcnt {
@@ -2224,14 +2310,22 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
         }
     }
     // Сначала вычерпать накопившиеся байты (raw-режим тоже может их оставлять).
-    {
+    // `publish_read` подпирает страницы приёмника demand paging'ом и берёт
+    // `COMPAT_STATES`, поэтому спинлок очереди отпускается до копии: держать
+    // его через подпирание/аллокацию кадров нельзя (инвариант 3 AGENTS.md).
+    let head = {
         let mut pending = STDIN_PENDING.lock();
-        if !pending.is_empty() {
+        if pending.is_empty() {
+            None
+        } else {
             let n = core::cmp::min(count as usize, pending.len());
-            let head: alloc::vec::Vec<u8> = pending.drain(..n).collect();
-            copy_out_checked(buf, &head)?;
-            return Ok(n as u64);
+            Some(pending.drain(..n).collect::<alloc::vec::Vec<u8>>())
         }
+    };
+    if let Some(head) = head {
+        let n = head.len() as u64;
+        publish_read(buf, &head)?;
+        return Ok(n);
     }
     let mut decoder = Decoder::new();
     // После первого потреблённого сканкода подождать ограниченное число
@@ -2309,7 +2403,7 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
             }
         }
         let n = core::cmp::min(count as usize, bytes.len());
-        copy_out_checked(buf, &bytes[..n])?;
+        publish_read(buf, &bytes[..n])?;
         if n < bytes.len() {
             STDIN_PENDING.lock().extend_from_slice(&bytes[n..]);
         }
@@ -2322,14 +2416,22 @@ fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
     if count == 0 {
         return Ok(0);
     }
-    {
+    // `publish_read` подпирает страницы приёмника demand paging'ом и берёт
+    // `COMPAT_STATES`, поэтому спинлок очереди отпускается до копии: держать
+    // его через подпирание/аллокацию кадров нельзя (инвариант 3 AGENTS.md).
+    let head = {
         let mut pending = STDIN_PENDING.lock();
-        if !pending.is_empty() {
+        if pending.is_empty() {
+            None
+        } else {
             let n = core::cmp::min(count as usize, pending.len());
-            let head: alloc::vec::Vec<u8> = pending.drain(..n).collect();
-            copy_out_checked(buf, &head)?;
-            return Ok(n as u64);
+            Some(pending.drain(..n).collect::<alloc::vec::Vec<u8>>())
         }
+    };
+    if let Some(head) = head {
+        let n = head.len() as u64;
+        publish_read(buf, &head)?;
+        return Ok(n);
     }
     let mut decoder = Decoder::new();
     let mut line: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
@@ -3245,7 +3347,10 @@ pub fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Er
     if count > COUNT_MAX {
         return Err(Errno::EINVAL);
     }
-    check_user_ptr_writable(buf, count)?;
+    // Как у `read(2)`: копируется `min(count, size - offset)`, поэтому требовать
+    // PRESENT/права на всём `count` нельзя — диапазон проверяется здесь, а
+    // приёмник подпирается и проверяется на фактическую длину копии ниже.
+    check_user_ptr_bounds(buf, count)?;
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
         Some(Resolved::Console)
@@ -3266,7 +3371,11 @@ pub fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Er
             if copied == 0 {
                 return Ok(0);
             }
-            let mut kbuf = vec![0u8; copied as usize];
+            // Подпереть приёмник ДО чтения: копируется ровно `copied` =
+            // min(count, size - offset), поэтому EFAULT приходит на реально
+            // недоступном диапазоне, а не на всём `count`.
+            super::mem_sys::populate_user_out(buf, copied)?;
+            let mut kbuf = try_user_buf(copied)?;
             let n = node.read(offset, &mut kbuf).map_err(|e| {
                 // Настоящая ошибка чтения VFS/ext2 — не «неверный аргумент»:
                 // сообщаем EIO и логируем, что именно сломалось.
@@ -3294,6 +3403,9 @@ pub fn sys_pwrite64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, E
     if count > COUNT_MAX {
         return Err(Errno::EINVAL);
     }
+    // Та же входная сторона, что у `write(2)`: подпереть ленивый источник и
+    // лишь затем проверять присутствие/права.
+    super::mem_sys::populate_user_in(buf, count)?;
     check_user_ptr(buf, count)?;
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
@@ -3309,12 +3421,12 @@ pub fn sys_pwrite64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, E
         Some(Resolved::Console) => {
             // Контроль доступа к терминалу, как у `write(2)`/`writev(2)`.
             crate::drivers::tty::check_access(super::tty::TtyAccess::Write)?;
-            let data = copy_in(buf, count);
+            let data = copy_in(buf, count)?;
             console_write(&data);
             Ok(count)
         }
         Some(Resolved::File { node, .. }) => {
-            let data = copy_in(buf, count);
+            let data = copy_in(buf, count)?;
             let n = node.write(offset, &data).map_err(write_errno)?;
             // ЗАМЕЧАНИЕ: смещение дескриптора намеренно НЕ обновляется.
             Ok(n as u64)
@@ -3567,7 +3679,7 @@ pub fn sys_poll(fds: u64, nfds: u64, timeout: u64) -> Result<u64, Errno> {
     // её только через `publish_pollfds`, который заново проверяет приёмник.
     // Буфер, размонтированный во время ожидания, теперь даёт `-EFAULT`, а не
     // падение в ring 0 с остановкой машины.
-    let mut kfds = copy_in(fds, bytes);
+    let mut kfds = copy_in(fds, bytes)?;
     let ms = timeout as i64;
     let deadline = if ms < 0 {
         None
