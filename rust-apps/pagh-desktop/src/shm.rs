@@ -164,6 +164,24 @@ pub struct ShmView<'a> {
     pub data: &'a [u8],
 }
 
+/// Длина поверхности `SHM_OFFER`, которую обязан покрыть memfd.
+///
+/// Повторяет проверки установки поверхности (`Server::handle_shm_offer`), потому
+/// что отображение делает ЧИТАЮЩИЙ поток — раньше, чем главный поток увидит
+/// сообщение. `None` — поля за пределами допустимого; точный код ошибки клиенту
+/// выдаст главный поток (он проверяет те же поля до обращения к fd).
+pub fn offer_required_len(width: u32, height: u32, format: u32, stride: u32) -> Option<usize> {
+    if width == 0 || height == 0 || width > 4096 || height > 4096 {
+        return None;
+    }
+    let format = PixelFormat::from_wire(format)?;
+    let minimum = width.saturating_mul(format.bytes_per_pixel());
+    if stride < minimum || stride > minimum.saturating_add(4096) {
+        return None;
+    }
+    (stride as usize).checked_mul(height as usize)
+}
+
 /// Отобразить memfd; `min_len` — минимум `stride*height`, проверяется по fstat.
 pub fn map_readonly(fd: OwnedFd, min_len: usize) -> io::Result<ShmMapping> {
     let file = File::from(fd);
