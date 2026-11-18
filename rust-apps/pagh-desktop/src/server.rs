@@ -138,6 +138,13 @@ pub struct ServerOptions {
     /// Если цели нет, но `spawn_demo` включён и `app` — известный
     /// `AppKind::id()`, сервер запускает демо-клиент.
     pub launch_targets: Vec<LaunchTarget>,
+    /// Автозапуск приложения по `launch_targets` сразу после старта сервера.
+    ///
+    /// Нужен MVP-образу: панель остаётся интерактивной, но первое окно
+    /// (например, `files`) открывается без ручного клика. Один раз и только
+    /// пока ни одно окно не запущено (тот же флаг, что у `spawn_demo`).
+    /// `None`/`""` — выключено.
+    pub autostart: Option<String>,
 }
 
 impl Default for ServerOptions {
@@ -161,6 +168,7 @@ impl Default for ServerOptions {
             spawn_demo: false,
             demo_binary: None,
             launch_targets: Vec::new(),
+            autostart: None,
         }
     }
 }
@@ -680,9 +688,14 @@ impl Server {
                 };
             }
             self.reap_children();
-            if !self.demo_started && self.options.spawn_demo {
-                self.demo_started = true;
-                self.launch(AppKind::Terminal);
+            if !self.demo_started {
+                if let Some(app) = self.options.autostart.clone() {
+                    self.demo_started = true;
+                    self.launch_app(&app, "", 0);
+                } else if self.options.spawn_demo {
+                    self.demo_started = true;
+                    self.launch(AppKind::Terminal);
+                }
             }
             self.maybe_selfcheck();
             if let Some(max) = self.options.max_frames {
