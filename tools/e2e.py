@@ -2210,10 +2210,9 @@ def mode_usb(h: Harness) -> tuple[str, int]:
                 label="clean second boot") is not None:
         second_text = second.serial()
     skipped = "boot disk menu skipped" in second_text
+    skip_line = regex_first(r"fs: [^\r\n]*boot[^\r\n]*menu[^\r\n]*", second_text)
     ok &= h.check("second boot skips the disk menu on a provisioned volume",
-                  skipped,
-                  regex_first(r"fs: [^\r\n]*boot menu[^\r\n]*", second_text)
-                  or "no skip marker")
+                  skipped, skip_line or "no skip marker")
     reformatted = bool(re.search(r"fs: formatting|operator chose to format",
                                  second_text))
     ok &= h.check("second boot performs no format/mount ritual", not reformatted,
@@ -2226,6 +2225,7 @@ def mode_usb(h: Harness) -> tuple[str, int]:
     ok &= h.check("second boot reached the shell without a menu timeout",
                   bool(second_text),
                   "shell banner seen" if second_text else "no banner")
+    h.metrics["second boot"] = skip_line or "no skip marker"
 
     h.metrics.update({
         "keyboard reports (banner)": kbd_before if kbd_before >= 0 else "n/a",
