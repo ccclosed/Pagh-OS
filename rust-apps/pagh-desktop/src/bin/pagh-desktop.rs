@@ -112,6 +112,7 @@ fn run() -> io::Result<()> {
                 let spec = value(&mut args, "--launch-target")?;
                 options.launch_targets.push(parse_launch_target(&spec)?);
             }
+            "--autostart" => options.autostart = Some(value(&mut args, "--autostart")?),
             "--clock" => {
                 let value = value(&mut args, "--clock")?;
                 match value.as_str() {
@@ -212,7 +213,7 @@ fn print_help() {
                [--screenshot-dir DIR] [--max-frames N] [--exit-after-ms N]
                [--selfcheck-ms N] [--demo-window] [--e2e] [--full-render]
                [--spawn-demo] [--demo-binary PATH]
-               [--launch-target APP=PROGRAM[|ARG…]]
+               [--launch-target APP=PROGRAM[|ARG…]] [--autostart APP]
                [--clock now|fixed] [--quiet]
 
 По умолчанию: /tmp/pagh-desktop.sock, backend=auto (fbdev, иначе headless),
@@ -225,6 +226,8 @@ input-trace + full-render (для QEMU-приёмки tools/e2e.py desktop).
 --launch-target задаёт приложение для PDP/1 launch (type 13):
   --launch-target 'terminal=/usr/bin/pagh-terminal|--socket|{{socket}}'
 Токен {{socket}} заменяется путём сокета; без него добавится --connect.
+--autostart APP открывает приложение из --launch-target сразу после старта
+(панель остаётся интерактивной; один раз, как --spawn-demo).
 Протокол: PROTOCOL.md; демо-клиент: pagh-desktop-demo."
     );
 }
