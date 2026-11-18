@@ -76,6 +76,13 @@ pub mod rand_clock;
 #[path = "../../src/arch/x86_64/linux/sock_wait.rs"]
 pub mod sock_wait;
 
+// `shutdown(2)` (nr 48): чистая политика полузакрытия — порядок отказов
+// (`EBADF`/`ENOTSOCK`/`EINVAL`/`ENOTCONN`) и что значит каждый флаг
+// направления для read/write/poll. `core`-only, поэтому host-свойство `p59`
+// исполняет ровно тот исходник, который компилирует ядро.
+#[path = "../../src/arch/x86_64/linux/sock_shutdown.rs"]
+pub mod sock_shutdown;
+
 // `stack` is `core` + `alloc` only (uses `alloc::vec::Vec`). The host crate links
 // `std`, which provides the `alloc` crate via the `extern crate alloc;` below, so
 // the exact same kernel source compiles and runs under proptest (task 5.4; P17–P19).
@@ -691,6 +698,10 @@ mod properties {
     // end the wait (`EBADF`), a peer close must produce `EOF`, and a live queue
     // must keep waiting. Pins the watchdog `nr=45 arg0=0x3 closed` regression.
     mod p58;
+
+    // `shutdown(2)` half-close policy (task-81): errno order and the
+    // per-direction read/write/poll answers. Pinned against a live-kernel probe.
+    mod p59;
 
     // NVMe PRP lists + queue-depth arithmetic (PRP1/PRP2/list page, LBA chunk
     // planning, polled CQ phase tags, CAP.MQES clamping). The driver itself is

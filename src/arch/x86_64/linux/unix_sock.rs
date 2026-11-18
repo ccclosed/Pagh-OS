@@ -12,6 +12,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 use super::cmsg;
 use super::errno::Errno;
@@ -813,6 +814,96 @@ pub(crate) fn endpoint_wait_verdict(rx: &PipeEndpoint) -> super::sock_wait::Wait
     // `None` (нет compat-состояния) — читать эту очередь больше некому: EBADF.
     let referenced = compat::with_current_compat(|cs| cs.fds.holds_read_end(id)).unwrap_or(false);
     super::sock_wait::wait_verdict(referenced, rx.writers())
+}
+
+/// Куда свёлся `shutdown(2)`: подключённая AF_UNIX-пара или TCP.
+///
+/// Снимок `Arc` берётся под compat-локом и отпускается до любых блокирующих
+/// действий (инвариант 4 из `AGENTS.md`): сама операция только ставит флаг и,
+/// для TCP, отправляет FIN.
+enum ShutTarget {
+    /// Конец socketpair: `rx` — очередь, которую он читает, `tx` — в которую
+    /// пишет.
+    UnixStream {
+        rx: Arc<PipeEndpoint>,
+        tx: Arc<PipeEndpoint>,
+    },
+    /// AF_INET TCP: `shutdown` идёт в собственный стек.
+    Tcp(Arc<super::inet_sock::InetTcp>),
+}
+
+/// `shutdown` (48): закрыть направление подключённого сокета.
+///
+/// Linux-семантику закрепляет чистая политика [`super::sock_shutdown`]:
+///  * `SHUT_WR` — пишущая половина закрыта: пир-читатель получает `EOF`
+///    (`Ok(0)`), собственная запись — `EPIPE`. У AF_UNIX ставится флаг очереди
+///    (`PipeState::write_shut`), поэтому блокирующийся в `yield_current()`
+///    читатель просыпается на следующем перечитывании; у TCP уходит FIN
+///    (`net::tcp_shutdown_wr`), а сокет остаётся в таблице стека и принимает
+///    дальше;
+///  * `SHUT_RD` — приём закрыт: последующие `recv`/`read` отвечают `Ok(0)`, а
+///    пир при записи в AF_UNIX-очередь получает `EPIPE` (никто не заберёт
+///    байты);
+///  * `SHUT_RDWR` — обе половины.
+///
+/// Отказы в порядке Linux (проверено пробой на хосте): `EBADF` (нет fd),
+/// `ENOTSOCK` (не сокет: файл, pipe, консоль), `EINVAL` (не 0/1/2 — даже у
+/// несоединённого сокета), `ENOTCONN` (TCP до `connect`, UDP). AF_UNIX без
+/// соединения (несвязанный, слушающий) Linux НЕ отвергает: там закрывать
+/// нечего, ответ `0`. Повторный вызов идемпотентен и успешен.
+pub fn sys_shutdown(fd: u64, how: u64) -> Result<u64, Errno> {
+    use super::sock_shutdown::{self, Action, FdKind};
+
+    // Снимок: вид дескриптора и (для подключённых сокетов) его объект. Лок
+    // отпускается здесь же.
+    let (kind, target) = compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
+        None => (FdKind::Absent, None),
+        Some(OpenObject::Socket { rx, tx }) => (
+            FdKind::UnixConnected,
+            Some(ShutTarget::UnixStream {
+                rx: Arc::clone(rx),
+                tx: Arc::clone(tx),
+            }),
+        ),
+        Some(OpenObject::InetTcp(sock)) => {
+            let kind = if sock.connected.load(Ordering::Relaxed) {
+                FdKind::TcpConnected
+            } else {
+                FdKind::TcpUnconnected
+            };
+            (kind, Some(ShutTarget::Tcp(Arc::clone(sock))))
+        }
+        // AF_UNIX без соединения — успешный no-op (как Linux); UDP и TCP до
+        // connect политика отвергает через `FdKind`.
+        Some(OpenObject::UnixListener(_)) | Some(OpenObject::UnixSocketUnbound { .. }) => {
+            (FdKind::UnixUnconnected, None)
+        }
+        Some(OpenObject::InetUdp(_)) => (FdKind::Udp, None),
+        Some(_) => (FdKind::NotSocket, None),
+    })
+    .unwrap_or((FdKind::Absent, None));
+
+    let action = sock_shutdown::plan(kind, how)?;
+    match action {
+        Action::Noop => Ok(0),
+        Action::Unix { read, write } => {
+            if let Some(ShutTarget::UnixStream { rx, tx }) = target {
+                if read {
+                    rx.shutdown_read();
+                }
+                if write {
+                    tx.shutdown_write();
+                }
+            }
+            Ok(0)
+        }
+        Action::Tcp { read, write } => {
+            if let Some(ShutTarget::Tcp(sock)) = target {
+                super::inet_sock::tcp_apply_shutdown(&sock, read, write);
+            }
+            Ok(0)
+        }
+    }
 }
 
 /// `recvmsg` (47): данные и `SCM_RIGHTS` из AF_UNIX SOCK_STREAM.
