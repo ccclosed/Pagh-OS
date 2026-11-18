@@ -9,6 +9,7 @@ use crate::font::{GLYPH_HEIGHT, GLYPH_WIDTH};
 use crate::geometry::{Point, Rect, Size};
 use crate::glyph::GlyphAtlas;
 use crate::surface::Surface;
+use crate::timing::{self, Stage};
 
 /// Программный холст кадра.
 pub struct Canvas {
@@ -140,6 +141,25 @@ impl Canvas {
         self.clip.iter().any(|r| r.contains(p))
     }
 
+    /// Сколько пикселей `rect` реально попадёт в холст при текущем отсечении.
+    ///
+    /// Нужно счётчикам `timing`: считать площадь всего запрошенного
+    /// прямоугольника нельзя — при малом damage большая часть отсекается, и
+    /// «записанные пиксели» раздулись бы до площади слоя.
+    pub(crate) fn visible_area(&self, rect: Rect) -> u64 {
+        if !self.clip_active {
+            return rect.area().max(0) as u64;
+        }
+        self.clip
+            .iter()
+            .map(|clip| {
+                clip.intersection(rect)
+                    .map(|area| area.area().max(0))
+                    .unwrap_or(0)
+            })
+            .sum::<i64>() as u64
+    }
+
     pub fn get(&self, x: i32, y: i32) -> Color {
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
             return TRANSPARENT;
@@ -169,6 +189,13 @@ impl Canvas {
         let Some(rect) = rect.intersection(self.bounds()) else {
             return;
         };
+        let _stage = timing::Scope::new(Stage::Blend);
+        let pixels = self.visible_area(rect);
+        if opacity == 255 {
+            timing::count_opaque(pixels);
+        } else {
+            timing::count_blended(pixels);
+        }
         for y in rect.y..rect.bottom() {
             for x in rect.x..rect.right() {
                 self.blend(x, y, color, opacity);
@@ -181,6 +208,8 @@ impl Canvas {
         let Some(rect) = rect.intersection(self.bounds()) else {
             return;
         };
+        let _stage = timing::Scope::new(Stage::Blend);
+        timing::count_opaque(self.visible_area(rect));
         let span = (rect.h - 1).max(1) as u32;
         for y in rect.y..rect.bottom() {
             let t = (((y - rect.y) as u32 * 255) / span).min(255) as u8;
@@ -196,6 +225,13 @@ impl Canvas {
         let Some(rect) = rect.intersection(self.bounds()) else {
             return;
         };
+        let _stage = timing::Scope::new(Stage::Blend);
+        let pixels = self.visible_area(rect);
+        if opacity == 255 {
+            timing::count_opaque(pixels);
+        } else {
+            timing::count_blended(pixels);
+        }
         let radius = radius.max(0).min(rect.w / 2).min(rect.h / 2);
         for y in rect.y..rect.bottom() {
             let dy = (y - rect.y).min(rect.bottom() - 1 - y);
@@ -425,6 +461,7 @@ impl Canvas {
         opacity: u8,
         text: &str,
     ) -> i32 {
+        let _stage = timing::Scope::new(Stage::Blend);
         let scale = scale.max(1);
         let mut cursor = x;
         for ch in text.chars() {
@@ -443,11 +480,14 @@ impl Canvas {
                 let py = y + row as i32;
                 for &(dx, len) in runs {
                     let px = cursor + dx;
+                    let run = Rect::new(px, py, len as i32, 1);
                     if opacity == 255 {
+                        timing::count_opaque(self.visible_area(run));
                         for i in 0..len {
                             self.put(px + i, py, color);
                         }
                     } else {
+                        timing::count_blended(self.visible_area(run));
                         for i in 0..len {
                             self.blend(px + i, py, color, opacity);
                         }
@@ -477,6 +517,13 @@ impl Canvas {
         let Some(dst) = dst.intersection(self.bounds()) else {
             return;
         };
+        let _stage = timing::Scope::new(Stage::Blend);
+        let pixels = self.visible_area(dst);
+        if opacity == 255 {
+            timing::count_opaque(pixels);
+        } else {
+            timing::count_blended(pixels);
+        }
         if surface.width == 0 || surface.height == 0 {
             return;
         }
@@ -546,6 +593,8 @@ impl Canvas {
         let Some(dst_rect) = dst_rect.intersection(self.bounds()) else {
             return;
         };
+        let _stage = timing::Scope::new(Stage::Blend);
+        timing::count_opaque(self.visible_area(dst_rect));
         let copy = |target: &mut Canvas, area: Rect| {
             let src_x = src_rect.x + (area.x - dst.x);
             let src_y = src_rect.y + (area.y - dst.y);
@@ -574,6 +623,8 @@ impl Canvas {
         let Some(dst_rect) = dst_rect.intersection(self.bounds()) else {
             return;
         };
+        let _stage = timing::Scope::new(Stage::Blend);
+        timing::count_blended(self.visible_area(dst_rect));
         let copy = |target: &mut Canvas, area: Rect| {
             let layer_x = area.x - dst.x;
             let layer_y = area.y - dst.y;

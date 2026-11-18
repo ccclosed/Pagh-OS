@@ -5,7 +5,9 @@
 //! cargo run --bin pagh-desktop -- --socket /tmp/pagh-desktop.sock --screenshot-dir /tmp/frames
 //! ```
 
+use pagh_desktop::bench::{self, MemoryBackend};
 use pagh_desktop::demo;
+use pagh_desktop::fbdev::FbdevBackend;
 use pagh_desktop::server::{InputChoice, LaunchTarget, OutputChoice, Server, ServerOptions};
 use std::env;
 use std::io;
@@ -25,6 +27,11 @@ fn run() -> io::Result<()> {
         ..ServerOptions::default()
     };
     let mut clock_now = false;
+    // Замерочный harness (P0): сценарии нагрузки вместо сервера.
+    let mut bench_mode = false;
+    let mut bench_frames = 60usize;
+    let mut bench_json: Option<PathBuf> = None;
+    let mut bench_label = String::from("host");
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -126,6 +133,17 @@ fn run() -> io::Result<()> {
                     }
                 }
             }
+            "--frame-log-every" => {
+                options.frame_log_every =
+                    parse_u64(value(&mut args, "--frame-log-every")?, "--frame-log-every")?
+            }
+            "--bench" => bench_mode = true,
+            "--bench-frames" => {
+                bench_frames = parse_u64(value(&mut args, "--bench-frames")?, "--bench-frames")?
+                    .clamp(1, 100_000) as usize
+            }
+            "--bench-json" => bench_json = Some(PathBuf::from(value(&mut args, "--bench-json")?)),
+            "--bench-label" => bench_label = value(&mut args, "--bench-label")?,
             "--quiet" => options.quiet = true,
             "--help" | "-h" => {
                 print_help();
@@ -140,12 +158,68 @@ fn run() -> io::Result<()> {
         }
     }
 
+    if bench_mode {
+        return run_bench(&options, bench_frames, bench_json, &bench_label);
+    }
+
     let mut server = Server::bind(options)?;
     if clock_now {
         let (time, date) = demo::clock_now();
         server.compositor_mut().set_clock(time, date);
     }
     server.run()
+}
+
+/// Замерочный прогон P0: реальный `FbdevBackend` в гостевом QEMU, `MemoryBackend`
+/// с тем же `FbLayout` — на хосте (там `/dev/fb0` нет).
+fn run_bench(
+    options: &ServerOptions,
+    frames: usize,
+    json_path: Option<PathBuf>,
+    label: &str,
+) -> io::Result<()> {
+    let mut backend: Box<dyn pagh_desktop::backend::Backend> = match options.backend {
+        OutputChoice::Headless => Box::new(MemoryBackend::new(options.width, options.height)),
+        OutputChoice::Fbdev | OutputChoice::Auto => match FbdevBackend::open(&options.fbdev_path) {
+            Ok(fbdev) => {
+                println!("pagh-desktop: frametime backend=fbdev {}", fbdev.describe());
+                Box::new(fbdev)
+            }
+            Err(err) if options.backend == OutputChoice::Fbdev => {
+                return Err(io::Error::new(
+                    err.kind(),
+                    format!("fbdev {}: {err}", options.fbdev_path.display()),
+                ));
+            }
+            Err(err) => {
+                println!(
+                    "pagh-desktop: frametime backend=memory (fbdev {}: {err})",
+                    options.fbdev_path.display()
+                );
+                Box::new(MemoryBackend::new(
+                    bench::DEFAULT_SCREEN.0,
+                    bench::DEFAULT_SCREEN.1,
+                ))
+            }
+        },
+    };
+    let report = bench::run(backend.as_mut(), frames, label)?;
+    report.print();
+    let json = report.to_json();
+    if let Some(path) = json_path {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::write(&path, &json)?;
+        println!("pagh-desktop: frametime json={}", path.display());
+    }
+    // Маркеры для снятия JSON из serial-лога без доступа к гостевой ФС.
+    println!("FRAMETIME_JSON_BEGIN");
+    print!("{json}");
+    println!("FRAMETIME_JSON_END");
+    Ok(())
 }
 
 fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> io::Result<String> {
@@ -214,7 +288,9 @@ fn print_help() {
                [--selfcheck-ms N] [--demo-window] [--e2e] [--full-render]
                [--spawn-demo] [--demo-binary PATH]
                [--launch-target APP=PROGRAM[|ARG…]] [--autostart APP]
-               [--clock now|fixed] [--quiet]
+               [--clock now|fixed] [--quiet] [--frame-log-every N]
+               [--bench] [--bench-frames N] [--bench-json PATH]
+               [--bench-label NAME]
 
 По умолчанию: /tmp/pagh-desktop.sock, backend=auto (fbdev, иначе headless),
 input=auto (evdev при fbdev), часы 23:38 / 15.11.2026.
@@ -222,6 +298,11 @@ fbdev забирает экран у kernel-консоли (takeover однос�
 docs/desktop-b.md); --input-trace печатает evdev-события в serial.
 --e2e = auto backend/input + demo-окно + exit-after-ms 15000 + selfcheck 3000 +
 input-trace + full-render (для QEMU-приёмки tools/e2e.py desktop).
+
+--bench прогоняет замерочный harness P0 (idle-full/drag/cursor/files-scroll) и
+печатает frame time + breakdown render/blend/copy/present в serial (JSON —
+между маркерами FRAMETIME_JSON_BEGIN/END, файл — по --bench-json).
+--frame-log-every N печатает frame-stats каждые N presented-кадров.
 
 --launch-target задаёт приложение для PDP/1 launch (type 13):
   --launch-target 'terminal=/usr/bin/pagh-terminal|--socket|{{socket}}'

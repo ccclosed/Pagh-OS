@@ -22,6 +22,7 @@ pub mod theme;
 pub mod window;
 
 pub mod backend;
+pub mod bench;
 pub mod canvas;
 pub mod client;
 pub mod compositor;
@@ -34,6 +35,7 @@ pub mod scenario;
 pub mod server;
 pub mod shm;
 pub mod surface;
+pub mod timing;
 
 pub use backend::{Backend, BackendKind, HeadlessBackend, OutputBackend};
 pub use canvas::Canvas;
