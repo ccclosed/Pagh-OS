@@ -8679,6 +8679,46 @@ mod desktop_b_tests {
                 }
             };
             let cmd = b"echo vtinput-ok\r";
+            // ── Дедупликация ввода: пока клавиатурой владеет VT-клиент,
+            // физический байт не попадает в shell-кольцо (в shell он придёт
+            // через vtinput), но event0 его по-прежнему видит — композитор не
+            // ломается. Запись в vtinput от compat-процесса (selftest ставит
+            // синтетический `CompatState`) защёлкивает владельца.
+            evdev::reset();
+            put(0x300, b"x");
+            assert_eq_kernel!(
+                io_sys::sys_write(ifd, SCRATCH_VA + 0x300, 1),
+                Ok(1),
+                "dedup: probe write to vtinput"
+            );
+            assert_kernel!(
+                crate::drivers::vtinput::client_active(),
+                "dedup: vtinput write from userspace marks the VT client"
+            );
+            while ps2_kbd::take_scancode().is_some() {}
+            evdev::reset();
+            ps2_kbd::inject_scancode(0x1E); // физический `a` make (USB-путь)
+            assert_kernel!(
+                !ps2_kbd::has_scancode(),
+                "dedup: physical key is not duplicated into the shell ring"
+            );
+            assert_kernel!(
+                evdev::pending() > 0,
+                "dedup: event0 still receives the physical key (compositor)"
+            );
+            ps2_kbd::inject_scancode_from_vt(0x1E);
+            assert_kernel!(
+                ps2_kbd::has_scancode(),
+                "dedup: the vtinput path is the single delivery to the shell"
+            );
+            while ps2_kbd::take_scancode().is_some() {}
+            evdev::reset();
+            crate::drivers::vtinput::reset();
+            assert_kernel!(
+                !crate::drivers::vtinput::client_active(),
+                "dedup: reset clears the VT client latch"
+            );
+
             put(0x300, cmd);
             assert_eq_kernel!(
                 io_sys::sys_write(ifd, SCRATCH_VA + 0x300, cmd.len() as u64),
