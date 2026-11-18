@@ -9,6 +9,7 @@ use crate::font::{GLYPH_HEIGHT, GLYPH_WIDTH};
 use crate::geometry::{Point, Rect, Size};
 use crate::glyph::GlyphAtlas;
 use crate::surface::Surface;
+use crate::timing::{self, Stage};
 
 /// Программный холст кадра.
 pub struct Canvas {
@@ -140,6 +141,116 @@ impl Canvas {
         self.clip.iter().any(|r| r.contains(p))
     }
 
+    /// Пересекается ли текущее отсечение с прямоугольником.
+    ///
+    /// Нужен горячим проходам, которые дороже своего пикселя: если damage не
+    /// задевает слой (например, тень окна при движении курсора), проход можно
+    /// не начинать вовсе.
+    pub fn clip_intersects(&self, rect: Rect) -> bool {
+        if !self.clip_active {
+            return true;
+        }
+        self.clip
+            .iter()
+            .any(|clip| clip.intersection(rect).is_some())
+    }
+
+    /// Интервалы строки `y` в диапазоне `x0..x1`, покрытые клипом.
+    ///
+    /// Возвращает `None`, если клипов больше, чем помещается в `out` — тогда
+    /// вызывающий обязан пойти старым попиксельным путём с `in_clip`.
+    /// Возвращённые интервалы отсортированы и не пересекаются: пиксель не
+    /// обрабатывается дважды даже на перекрывающихся damage-прямоугольниках.
+    fn clip_spans(&self, y: i32, x0: i32, x1: i32, out: &mut [(i32, i32)]) -> Option<usize> {
+        if y < 0 || y >= self.height as i32 || x1 <= x0 {
+            return Some(0);
+        }
+        if !self.clip_active {
+            let a = x0.max(0);
+            let b = x1.min(self.width as i32);
+            if a >= b {
+                return Some(0);
+            }
+            out[0] = (a, b);
+            return Some(1);
+        }
+        let mut n = 0usize;
+        for clip in &self.clip {
+            if y < clip.y || y >= clip.bottom() {
+                continue;
+            }
+            let a = x0.max(clip.x);
+            let b = x1.min(clip.right());
+            if a >= b {
+                continue;
+            }
+            if n == out.len() {
+                return None;
+            }
+            out[n] = (a, b);
+            n += 1;
+        }
+        // n <= out.len() и в out помещаются все интервалы: сортировка и
+        // слияние по месту (в кадре обычно 1-4 интервала).
+        out[..n].sort_unstable_by_key(|span| span.0);
+        let mut merged = 0usize;
+        for index in 0..n {
+            let (a, b) = out[index];
+            if merged > 0 && a <= out[merged - 1].1 {
+                out[merged - 1].1 = out[merged - 1].1.max(b);
+            } else {
+                out[merged] = (a, b);
+                merged += 1;
+            }
+        }
+        Some(merged)
+    }
+
+    /// Смешать `color` с `opacity` в горизонтальном интервале строки.
+    ///
+    /// В отличие от попиксельного [`Canvas::blend`], отсечение пересекается со
+    /// строкой один раз (спаны), а не проверяется на каждый пиксель. Так
+    /// рисуются кэшированные тени окон: damage в 16×23 пикселя курсора больше
+    /// не обходит всю площадь тени.
+    pub fn blend_span(&mut self, y: i32, x0: i32, x1: i32, color: Color, opacity: u8) {
+        let mut spans = [(0i32, 0i32); 8];
+        match self.clip_spans(y, x0, x1, &mut spans) {
+            Some(count) => {
+                let row = y as usize * self.width as usize;
+                for &(a, b) in &spans[..count] {
+                    for x in a..b {
+                        let index = row + x as usize;
+                        self.pixels[index] = color::blend(self.pixels[index], color, opacity);
+                    }
+                }
+            }
+            None => {
+                for x in x0..x1 {
+                    self.blend(x, y, color, opacity);
+                }
+            }
+        }
+    }
+
+    /// Сколько пикселей `rect` реально попадёт в холст при текущем отсечении.
+    ///
+    /// Нужно счётчикам `timing`: считать площадь всего запрошенного
+    /// прямоугольника нельзя — при малом damage большая часть отсекается, и
+    /// «записанные пиксели» раздулись бы до площади слоя.
+    pub(crate) fn visible_area(&self, rect: Rect) -> u64 {
+        if !self.clip_active {
+            return rect.area().max(0) as u64;
+        }
+        self.clip
+            .iter()
+            .map(|clip| {
+                clip.intersection(rect)
+                    .map(|area| area.area().max(0))
+                    .unwrap_or(0)
+            })
+            .sum::<i64>() as u64
+    }
+
     pub fn get(&self, x: i32, y: i32) -> Color {
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
             return TRANSPARENT;
@@ -169,6 +280,39 @@ impl Canvas {
         let Some(rect) = rect.intersection(self.bounds()) else {
             return;
         };
+        let _stage = timing::Scope::new(Stage::Blend);
+        let pixels = self.visible_area(rect);
+        if opacity == 255 {
+            timing::count_opaque(pixels);
+        } else {
+            timing::count_blended(pixels);
+        }
+        // Непрозрачная заливка (opacity=255, альфа цвета=255) — это ровно
+        // `src | 0xFF000000` для каждого пикселя, то есть построчное
+        // заполнение среза, без чтения dst и без `in_clip` на пиксель. Так
+        // закрашиваются фон окна, клиентская область и панель на каждом
+        // кадре; полупрозрачные цвета (тень, подсветка) идут старым путём.
+        if opacity == 255 && crate::color::alpha(color) == 255 {
+            let value = color | 0xFF00_0000;
+            let width = self.width as usize;
+            let fill = |pixels: &mut [Color], area: Rect| {
+                for y in area.y..area.bottom() {
+                    let d = (y as usize) * width + area.x as usize;
+                    pixels[d..d + area.w as usize].fill(value);
+                }
+            };
+            if self.clip_active {
+                for index in 0..self.clip.len() {
+                    let clip = self.clip[index];
+                    if let Some(area) = rect.intersection(clip) {
+                        fill(&mut self.pixels, area);
+                    }
+                }
+            } else {
+                fill(&mut self.pixels, rect);
+            }
+            return;
+        }
         for y in rect.y..rect.bottom() {
             for x in rect.x..rect.right() {
                 self.blend(x, y, color, opacity);
@@ -181,6 +325,8 @@ impl Canvas {
         let Some(rect) = rect.intersection(self.bounds()) else {
             return;
         };
+        let _stage = timing::Scope::new(Stage::Blend);
+        timing::count_opaque(self.visible_area(rect));
         let span = (rect.h - 1).max(1) as u32;
         for y in rect.y..rect.bottom() {
             let t = (((y - rect.y) as u32 * 255) / span).min(255) as u8;
@@ -196,6 +342,13 @@ impl Canvas {
         let Some(rect) = rect.intersection(self.bounds()) else {
             return;
         };
+        let _stage = timing::Scope::new(Stage::Blend);
+        let pixels = self.visible_area(rect);
+        if opacity == 255 {
+            timing::count_opaque(pixels);
+        } else {
+            timing::count_blended(pixels);
+        }
         let radius = radius.max(0).min(rect.w / 2).min(rect.h / 2);
         for y in rect.y..rect.bottom() {
             let dy = (y - rect.y).min(rect.bottom() - 1 - y);
@@ -264,9 +417,8 @@ impl Canvas {
         if x1 <= x0 {
             return;
         }
-        for x in x0..x1 {
-            self.blend(x, y, color, 255);
-        }
+        // Строка — это один спан: clip пересекается один раз, а не на пиксель.
+        self.blend_span(y, x0, x1, color, 255);
     }
 
     pub fn vline(&mut self, x: i32, y0: i32, y1: i32, color: Color) {
@@ -425,6 +577,7 @@ impl Canvas {
         opacity: u8,
         text: &str,
     ) -> i32 {
+        let _stage = timing::Scope::new(Stage::Blend);
         let scale = scale.max(1);
         let mut cursor = x;
         for ch in text.chars() {
@@ -443,11 +596,14 @@ impl Canvas {
                 let py = y + row as i32;
                 for &(dx, len) in runs {
                     let px = cursor + dx;
+                    let run = Rect::new(px, py, len as i32, 1);
                     if opacity == 255 {
+                        timing::count_opaque(self.visible_area(run));
                         for i in 0..len {
                             self.put(px + i, py, color);
                         }
                     } else {
+                        timing::count_blended(self.visible_area(run));
                         for i in 0..len {
                             self.blend(px + i, py, color, opacity);
                         }
@@ -477,6 +633,13 @@ impl Canvas {
         let Some(dst) = dst.intersection(self.bounds()) else {
             return;
         };
+        let _stage = timing::Scope::new(Stage::Blend);
+        let pixels = self.visible_area(dst);
+        if opacity == 255 {
+            timing::count_opaque(pixels);
+        } else {
+            timing::count_blended(pixels);
+        }
         if surface.width == 0 || surface.height == 0 {
             return;
         }
@@ -546,6 +709,8 @@ impl Canvas {
         let Some(dst_rect) = dst_rect.intersection(self.bounds()) else {
             return;
         };
+        let _stage = timing::Scope::new(Stage::Blend);
+        timing::count_opaque(self.visible_area(dst_rect));
         let copy = |target: &mut Canvas, area: Rect| {
             let src_x = src_rect.x + (area.x - dst.x);
             let src_y = src_rect.y + (area.y - dst.y);
@@ -574,6 +739,8 @@ impl Canvas {
         let Some(dst_rect) = dst_rect.intersection(self.bounds()) else {
             return;
         };
+        let _stage = timing::Scope::new(Stage::Blend);
+        timing::count_blended(self.visible_area(dst_rect));
         let copy = |target: &mut Canvas, area: Rect| {
             let layer_x = area.x - dst.x;
             let layer_y = area.y - dst.y;
@@ -633,6 +800,55 @@ mod tests {
         c.clear_clip();
         c.put(0, 0, rgb(7, 7, 7));
         assert_eq!(c.get(0, 0), rgb(7, 7, 7));
+    }
+
+    #[test]
+    fn blend_span_matches_per_pixel_blend_under_overlapping_clips() {
+        // Спаны сливают перекрывающиеся damage-прямоугольники, поэтому пиксель
+        // в пересечении двух клипов смешивается один раз, как и в старом
+        // попиксельном `blend`/`in_clip`.
+        let mut fast = Canvas::new(20, 3, rgb(10, 20, 30));
+        let mut slow = Canvas::new(20, 3, rgb(10, 20, 30));
+        let clips = [Rect::new(2, 0, 10, 2), Rect::new(6, 1, 10, 2)];
+        fast.set_clip(&clips);
+        slow.set_clip(&clips);
+        fast.blend_span(1, 0, 20, rgb(200, 100, 50), 77);
+        for x in 0..20 {
+            slow.blend(x, 1, rgb(200, 100, 50), 77);
+        }
+        assert_eq!(fast.pixels(), slow.pixels());
+
+        // Спан, выходящий за холст, обрезается по bounds, а не заворачивает строку.
+        let mut edge = Canvas::new(5, 2, rgb(1, 2, 3));
+        edge.blend_span(0, -3, 8, rgb(9, 9, 9), 255);
+        assert_eq!(edge.get(0, 0), rgb(9, 9, 9));
+        assert_eq!(edge.get(4, 0), rgb(9, 9, 9));
+        assert_eq!(edge.get(0, 1), rgb(1, 2, 3));
+    }
+
+    #[test]
+    fn opaque_fill_matches_old_blend_under_clip() {
+        // Непрозрачная заливка идёт построчным `fill`, минуя `blend`/`in_clip`.
+        // Гейт: на любом наборе клипов и размере она обязана дать ровно те же
+        // пиксели, что старый попиксельный alpha-путь.
+        let mut fast = Canvas::new(13, 9, rgb(1, 2, 3));
+        let mut slow = Canvas::new(13, 9, rgb(1, 2, 3));
+        let clips = [Rect::new(1, 1, 5, 4), Rect::new(8, 5, 4, 3)];
+        fast.set_clip(&clips);
+        slow.set_clip(&clips);
+        fast.fill_rect(Rect::new(0, 0, 13, 9), rgb(9, 8, 7));
+        for y in 0..9 {
+            for x in 0..13 {
+                slow.blend(x, y, rgb(9, 8, 7), 255);
+            }
+        }
+        assert_eq!(fast.pixels(), slow.pixels());
+
+        // Полупрозрачный цвет обязан остаться на старом пути (alpha < 255).
+        let mut translucent = Canvas::new(4, 1, rgb(10, 20, 30));
+        translucent.fill_rect(Rect::new(0, 0, 4, 1), crate::color::rgba(200, 0, 0, 128));
+        let mixed = crate::color::blend(rgb(10, 20, 30), crate::color::rgba(200, 0, 0, 128), 255);
+        assert_eq!(translucent.get(2, 0), mixed);
     }
 
     #[test]

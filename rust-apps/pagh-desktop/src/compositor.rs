@@ -1475,6 +1475,7 @@ impl Compositor {
 
     /// Перерисовать накопленный damage. Возвращает перерисованные области.
     pub fn render(&mut self) -> Vec<Rect> {
+        let _stage = crate::timing::Scope::new(crate::timing::Stage::Render);
         let damage = self.damage.take();
         if damage.is_empty() {
             return Vec::new();
@@ -1488,6 +1489,12 @@ impl Compositor {
         canvas.set_clip(&rects);
         self.paint_scene(&mut canvas);
         canvas.clear_clip();
+        // Курсор — отдельный проход поверх кадра, вне damage-отсечения:
+        // окна/тень/панель рисуются только в повреждённых прямоугольниках, а
+        // сам курсор (≤16×23 px) дорисовывается последним и всегда целиком.
+        // Иначе движение курсора заставляло бы paint_scene обходить всю сцену
+        // с попиксельной проверкой клипа.
+        self.paint_cursor(&mut canvas);
         self.canvas = canvas;
         self.frame_no += 1;
         rects
@@ -1523,7 +1530,6 @@ impl Compositor {
         if let Some(menu) = &self.context_menu {
             menu.draw(canvas, &self.theme);
         }
-        self.paint_cursor(canvas);
     }
 
     /// Обои кэшируются целиком: градиент и два радиальных свечения считаются
@@ -1580,15 +1586,33 @@ impl Compositor {
         // Тень предвычислена для размера окна; внеэкранные окна рисуем старым
         // путём, чтобы отсечение по bounds не меняло геометрию скруглений.
         let shadow_box = frame.inflate(9).offset(0, 6);
+        // Тень дороже прочих проходов (P0: 88-92% render), поэтому damage,
+        // который её не задевает (курсор, часы панели), вообще не должен её
+        // обходить. Внутри задетой площади смешивание идёт спанами строк:
+        // clip пересекается раз на строку, а не на каждый пиксель.
         if self.screen.contains_rect(shadow_box) {
             self.ensure_shadow(frame.w, frame.h);
-            if let Some(shadow) = self.shadow_cache.get(&(frame.w, frame.h)) {
-                for layer in &shadow.layers {
-                    for &(y, x0, x1) in &layer.rows {
-                        for x in x0..x1 {
-                            canvas.blend(frame.x + x, frame.y + y, color::BLACK, layer.alpha);
+            if canvas.clip_intersects(shadow_box) {
+                if let Some(shadow) = self.shadow_cache.get(&(frame.w, frame.h)) {
+                    let _stage = crate::timing::Scope::new(crate::timing::Stage::Shadow);
+                    let mut shadow_px = 0u64;
+                    for layer in &shadow.layers {
+                        for &(y, x0, x1) in &layer.rows {
+                            canvas.blend_span(
+                                frame.y + y,
+                                frame.x + x0,
+                                frame.x + x1,
+                                color::BLACK,
+                                layer.alpha,
+                            );
+                            // Считаем только пиксели внутри damage-отсечения:
+                            // иначе при мелком damage «записанные» пиксели тени
+                            // раздувались бы до площади окна и врали о доле blend.
+                            let row = Rect::new(frame.x + x0, frame.y + y, x1 - x0, 1);
+                            shadow_px += canvas.visible_area(row);
                         }
                     }
+                    crate::timing::count_blended(shadow_px);
                 }
             }
         } else {

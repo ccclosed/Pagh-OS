@@ -12,6 +12,7 @@
 use crate::backend::Backend;
 use crate::canvas::Canvas;
 use crate::geometry::Rect;
+use crate::timing::{self, Stage};
 use std::ffi::{c_int, c_ulong, c_void};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -297,6 +298,7 @@ impl FbLayout {
     /// 16/24 bpp и нестандартных масок упаковка выполняется по строке, без
     /// `set_pixel`/`write_pixel` на каждый пиксель.
     pub fn blit_damage(&self, dst: &mut [u8], canvas: &Canvas, damage: &[Rect]) -> usize {
+        let _stage = timing::Scope::new(Stage::Copy);
         let screen = Rect::new(0, 0, self.width as i32, self.height as i32);
         let canvas_rect = canvas.bounds();
         let bytes = self.bytes_per_pixel();
@@ -340,9 +342,25 @@ impl FbLayout {
             32 => {
                 if self.is_xrgb8888() {
                     // Внутренний холст хранит 0xAARRGGBB; в scanout XRGB
-                    // альфа-байт нулевой, как у `pack`.
-                    for (d, s) in dst.chunks_exact_mut(4).zip(src.iter()) {
-                        d.copy_from_slice(&(*s & 0x00FF_FFFF).to_le_bytes());
+                    // альфа-байт нулевой, как у `pack`. Строка копируется
+                    // блоками по 4 пикселя (16 байт) — на opt-level=3 это
+                    // разворачивается в широкие masked-store'ы, вместо
+                    // попиксельного `to_le_bytes` + маска на каждый вызов.
+                    let mut dst_blocks = dst.chunks_exact_mut(16);
+                    let mut src_blocks = src.chunks_exact(4);
+                    for (d, s) in dst_blocks.by_ref().zip(src_blocks.by_ref()) {
+                        for (i, &px) in s.iter().enumerate() {
+                            let off = i * 4;
+                            d[off..off + 4].copy_from_slice(&(px & 0x00FF_FFFF).to_le_bytes());
+                        }
+                    }
+                    // Хвост строки: 0..=3 пикселя, выравнивание блока не
+                    // совпало. Маска та же — байты scanout пиксель-в-пиксель
+                    // равны прежнему построчному пути.
+                    let blocks = src.len() / 4 * 16;
+                    for (i, &px) in src[src.len() / 4 * 4..].iter().enumerate() {
+                        let off = blocks + i * 4;
+                        dst[off..off + 4].copy_from_slice(&(px & 0x00FF_FFFF).to_le_bytes());
                     }
                 } else {
                     for (d, s) in dst.chunks_exact_mut(4).zip(src.iter()) {
@@ -626,6 +644,23 @@ mod tests {
             layout.blit_damage(&mut dst, &canvas, &[Rect::new(-5, -5, 2, 2)]),
             0
         );
+    }
+
+    #[test]
+    fn blits_odd_width_row_tail() {
+        // XRGB-путь копирует строку блоками по 4 пикселя; ширина 5 проверяет
+        // хвост в 1 пиксель (и что паддинг stride не задет).
+        let var = FbVarInfo::decode(&var_bytes(5, 1, 32, (16, 8), (8, 8), (0, 8)));
+        let fix = FbFixInfo::decode(&fix_bytes(24, 24));
+        let layout = FbLayout::from_info(&var, &fix).unwrap();
+        let mut dst = [0xAAu8; 24];
+        let mut canvas = Canvas::new(5, 1, rgb(0, 0, 0));
+        canvas.put(4, 0, rgb(0x12, 0x34, 0x56));
+        let written = layout.blit_damage(&mut dst, &canvas, &[Rect::new(0, 0, 5, 1)]);
+        assert_eq!(written, 5);
+        assert_eq!(&dst[16..20], &[0x56, 0x34, 0x12, 0x00]);
+        // 4 байта паддинга после активной строки не тронуты.
+        assert_eq!(&dst[20..24], &[0xAA; 4]);
     }
 
     #[test]
