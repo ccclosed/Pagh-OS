@@ -8,6 +8,7 @@ use crate::canvas::Canvas;
 use crate::color;
 use crate::context_menu::{ContextMenu, MenuAction};
 use crate::geometry::{DamageTracker, Point, Rect, Size};
+use crate::icons::{self, Icon};
 use crate::panel::{self, Panel, PanelHit, PanelHover, PanelIcon, PANEL_HEIGHT};
 use crate::protocol::{
     key, Message, BUTTONS_LEFT, BUTTONS_MIDDLE, BUTTONS_RIGHT, CLOSE_SERVER, CONFIGURE_FOCUSED,
@@ -1747,46 +1748,33 @@ impl Compositor {
                 self.theme.titlebar_text
             };
             let center = rect.center();
+            // Кнопки — готовые regular-глифы 16 px (_ □ ×). Состояние
+            // «восстановить» отдельного ассета не имеет, поэтому в
+            // maximized остаётся рисованный значок из двух квадратов:
+            // подменять его maximize-иконкой значило бы врать о действии.
             match part {
                 WindowPart::Minimize => {
-                    canvas.hline(center.x - 5, center.x + 5, center.y + 4, color);
+                    icons::draw(canvas, Icon::WindowMinimize, 16, center, color, 255);
+                }
+                WindowPart::Maximize if !maximized => {
+                    icons::draw(canvas, Icon::WindowMaximize, 16, center, color, 255);
                 }
                 WindowPart::Maximize => {
-                    if maximized {
-                        canvas.stroke_rounded_rect(
-                            Rect::new(center.x - 5, center.y - 3, 9, 9),
-                            1,
-                            color,
-                            255,
-                        );
-                        canvas.stroke_rounded_rect(
-                            Rect::new(center.x - 3, center.y - 5, 9, 9),
-                            1,
-                            color,
-                            255,
-                        );
-                    } else {
-                        canvas.stroke_rounded_rect(
-                            Rect::new(center.x - 5, center.y - 5, 10, 10),
-                            1,
-                            color,
-                            255,
-                        );
-                    }
+                    canvas.stroke_rounded_rect(
+                        Rect::new(center.x - 5, center.y - 3, 9, 9),
+                        1,
+                        color,
+                        255,
+                    );
+                    canvas.stroke_rounded_rect(
+                        Rect::new(center.x - 3, center.y - 5, 9, 9),
+                        1,
+                        color,
+                        255,
+                    );
                 }
                 WindowPart::Close => {
-                    canvas.line(
-                        Point::new(center.x - 4, center.y - 4),
-                        Point::new(center.x + 4, center.y + 4),
-                        color,
-                        2,
-                    );
-                    canvas.line(
-                        Point::new(center.x + 4, center.y - 4),
-                        Point::new(center.x - 4, center.y + 4),
-                        color,
-                        2,
-                    );
+                    icons::draw(canvas, Icon::WindowClose, 16, center, color, 255);
                 }
                 _ => {}
             }
@@ -1918,12 +1906,7 @@ impl Compositor {
         } else {
             self.theme.panel_icon_dim
         };
-        draw_wired_icon(
-            canvas,
-            Point::new(card.x + 24, card.center().y),
-            icon_color,
-            self.theme.chip_bg,
-        );
+        draw_wired_icon(canvas, Point::new(card.x + 24, card.center().y), icon_color);
         let label_color = if online {
             self.theme.menu_text
         } else {
@@ -2007,25 +1990,12 @@ impl Compositor {
     }
 }
 
-/// Проводная сеть: порт с контактами и кабелем — иконка карточки подключения.
+/// Проводная сеть: готовый глиф Plug Connected — иконка карточки подключения.
 ///
-/// `background` — цвет подложки карточки: им вырезается внутренность рамки
-/// порта, поэтому иконка остаётся контурной на любой поверхности.
-fn draw_wired_icon(
-    canvas: &mut Canvas,
-    center: Point,
-    color: color::Color,
-    background: color::Color,
-) {
-    let shell = Rect::new(center.x - 10, center.y - 8, 20, 15);
-    canvas.fill_rounded_rect(shell, 2, color, 255);
-    canvas.fill_rounded_rect(shell.inset(2), 1, background, 255);
-    // Четыре контакта разъёма.
-    for dx in [-6, -2, 2, 6] {
-        canvas.vline(center.x + dx, shell.y + 4, shell.y + 10, color);
-    }
-    // Кабель уходит вниз от корпуса.
-    canvas.vline(center.x, shell.bottom(), shell.bottom() + 3, color);
+/// Ассет regular (чёрный + альфа) тинтуется цветом состояния, поэтому
+/// подложка карточки не нужна: прозрачные пиксели не рисуются вовсе.
+fn draw_wired_icon(canvas: &mut Canvas, center: Point, color: color::Color) {
+    icons::draw(canvas, Icon::NetworkWired, 24, center, color, 255);
 }
 
 fn copy_shm_rect(surface: &mut Surface, view: &crate::shm::ShmView<'_>, area: Rect) {

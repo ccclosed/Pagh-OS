@@ -11,7 +11,7 @@
 
 use pagh_desktop::color;
 use pagh_desktop::compositor::Compositor;
-use pagh_desktop::geometry::Rect;
+use pagh_desktop::geometry::{Point, Rect};
 use pagh_desktop::panel;
 use pagh_desktop::png;
 use pagh_desktop::Canvas;
@@ -92,33 +92,47 @@ fn panel_network_icon_is_wired_and_renders() {
     let frame = compositor.frame().snapshot();
     let center = net.center();
 
-    // Проводная иконка укладывается в 20×19 вокруг центра: Wi-Fi-дуги старого
-    // образца давали вылет >= 15 px (радиус 16 от нижней точки блока).
+    // Готовый глиф Plug Connected 20×20: альфа занимает 2..=17, то есть ±8
+    // от центра. Wi-Fi-дуги старого образца поднимались на ~14 px выше центра
+    // и расходились до ±15 — такие пиксели здесь были бы регрессией.
     let (widest, lit) = widest_lit(&frame);
-    assert!(lit > 60, "иконка сети не нарисована, пикселей {lit}");
+    assert!(lit > 40, "иконка сети не нарисована, пикселей {lit}");
     assert!(
         widest <= 11,
         "иконка шире проводной формы: вылет {widest} px (Wi-Fi-дуги давали >= 15)"
     );
+    let (min_y, max_y) = lit_rows(&frame, net, center);
+    assert!(
+        min_y >= center.y - 10 && max_y <= center.y + 10,
+        "иконка выше проводной формы: y [{}, {}] от центра (дуги давали -14)",
+        min_y - center.y,
+        max_y - center.y
+    );
 
-    // Корпус порта: рамка по краям и вырезанная внутренность.
-    assert_eq!(frame.get(center.x - 10, center.y), theme.panel_icon);
-    assert_eq!(frame.get(center.x + 9, center.y), theme.panel_icon);
-    assert_eq!(frame.get(center.x - 4, center.y - 3), theme.panel_bg);
+    // Глиф тинтован цветом панели: у непрозрачного пикселя вне диагонали
+    // RGB заменён тинтом, альфа сохранена — сравниваем с точным blend.
+    let (source_x, source_y, alpha) = opaque_off_diagonal();
+    let sample = Point::new(center.x - 10 + source_x, center.y - 10 + source_y);
+    let expected = |frame: &Canvas, tint: pagh_desktop::color::Color| {
+        let background = frame.get(500, sample.y);
+        color::blend(
+            background,
+            color::rgba(
+                color::red(tint),
+                color::green(tint),
+                color::blue(tint),
+                alpha,
+            ),
+            255,
+        )
+    };
+    assert_eq!(
+        frame.get(sample.x, sample.y),
+        expected(&frame, theme.panel_icon),
+        "онлайн-иконка сети не тинтована panel_icon"
+    );
 
-    // Четыре контакта разъёма в один ряд.
-    let mut contacts = 0;
-    for dx in [-6, -2, 2, 6] {
-        if frame.get(center.x + dx, center.y - 4) == theme.panel_icon {
-            contacts += 1;
-        }
-    }
-    assert_eq!(contacts, 4, "контакты порта не нарисованы: {contacts}/4");
-
-    // Кабель уходит вниз от корпуса.
-    assert_eq!(frame.get(center.x, center.y + 7), theme.panel_icon);
-
-    // Старая иконка ставила акцентную точку; проводная — чисто монохромная.
+    // Иконка сети строго монохромная (старый образец ставил акцентную точку).
     let mut accent = 0;
     for y in net.y..net.bottom() {
         for x in net.x..net.right() {
@@ -129,15 +143,83 @@ fn panel_network_icon_is_wired_and_renders() {
     }
     assert_eq!(accent, 0, "в иконке сети не должно быть акцентных пикселей");
 
-    // Отключённая сеть: приглушённый контур и диагональ.
+    // Отключённая сеть: тот же глиф в panel_icon_dim плюс диагональ.
     compositor.set_network_online(false);
     compositor.render_full();
     png::write_png(dir.join("panel-network-offline.png"), compositor.frame()).expect("PNG offline");
     let frame = compositor.frame().snapshot();
-    assert_eq!(frame.get(center.x - 10, center.y), theme.panel_icon_dim);
+    assert_eq!(
+        frame.get(sample.x, sample.y),
+        expected(&frame, theme.panel_icon_dim),
+        "офлайн-иконка сети не тинтована panel_icon_dim"
+    );
     let struck = (net.y..net.bottom())
         .flat_map(|y| (net.x..net.right()).map(move |x| (x, y)))
         .filter(|(x, y)| frame.get(*x, *y) == theme.button_close)
         .count();
     assert!(struck > 0, "нет диагонали «нет сети»");
+}
+
+/// Готовые иконки приложений на панели: каждый блок ячейки закрашен, Paint —
+/// акцентом, а не прежней многоцветной палитрой из примитивов.
+#[test]
+fn panel_app_icons_are_ready_made() {
+    use pagh_desktop::panel::{icon_rect, PanelIcon};
+
+    let mut compositor = Compositor::new(1280, 720);
+    compositor.render_full();
+    let frame = compositor.frame().snapshot();
+    let theme = *compositor.theme();
+    let screen = compositor.screen();
+    for (index, icon) in PanelIcon::ALL.iter().enumerate() {
+        let cell = icon_rect(screen, index);
+        let lit = (cell.y..cell.bottom())
+            .flat_map(|y| (cell.x..cell.right()).map(move |x| (x, y)))
+            .filter(|(x, y)| frame.get(*x, *y) != theme.panel_bg)
+            .count();
+        assert!(
+            lit > 80,
+            "{icon:?}: готовая иконка не нарисована ({lit} пикселей)"
+        );
+    }
+    let paint = icon_rect(screen, PanelIcon::Paint.index());
+    let accent = (paint.y..paint.bottom())
+        .flat_map(|y| (paint.x..paint.right()).map(move |x| (x, y)))
+        .filter(|(x, y)| frame.get(*x, *y) == theme.accent)
+        .count();
+    assert!(accent > 0, "иконка Paint должна тинтоваться акцентом");
+}
+
+/// Вертикальные границы зажжённых пикселей блока сети.
+fn lit_rows(frame: &Canvas, net: Rect, center: Point) -> (i32, i32) {
+    let mut min_y = i32::MAX;
+    let mut max_y = i32::MIN;
+    for y in net.y..net.bottom() {
+        let bg = frame.get(500, y);
+        for x in net.x..net.right() {
+            if frame.get(x, y) != bg {
+                min_y = min_y.min(y - center.y);
+                max_y = max_y.max(y - center.y);
+            }
+        }
+    }
+    (center.y + min_y, center.y + max_y)
+}
+
+/// Пиксель глифа сети с максимальной альфой вне диагонали «нет сети».
+fn opaque_off_diagonal() -> (i32, i32, u8) {
+    let raster = pagh_desktop::icons::raster(pagh_desktop::icons::Icon::NetworkWired, 20)
+        .expect("ассет иконки сети");
+    let mut best = (0i32, 0i32, 0u8);
+    for y in 0..raster.height as i32 {
+        for x in 0..raster.width as i32 {
+            let alpha = raster.alpha(x as u32, y as u32);
+            let diagonal = (x + y - raster.width as i32).abs();
+            if alpha > best.2 && diagonal >= 4 {
+                best = (x, y, alpha);
+            }
+        }
+    }
+    assert!(best.2 > 200, "не нашлось непрозрачного пикселя глифа");
+    best
 }
