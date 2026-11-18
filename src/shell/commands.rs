@@ -14,7 +14,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use super::identity;
 use super::registry::ShellCtx;
+use crate::arch::x86_64::linux::cred::{Creds, GROUPS_CAP};
 
 /// Напечатать строку в serial и framebuffer, соблюдая двойное соглашение shell
 /// о выводе.
@@ -616,6 +618,181 @@ pub(super) fn cmd_pci(_ctx: &mut ShellCtx, _args: &[&str]) {
             ));
         }
     }
+}
+
+/// `id [user]`: идентичность сессии или запись `/etc/passwd`.
+///
+/// Без аргумента — сессионные креденшелы shell (то, с чем `lxrun` запускает
+/// Linux-программы; `su` меняет именно их). С аргументом — пользователь из
+/// `/etc/passwd` и его группы из `/etc/group`; это чисто справочный вывод и он
+/// не требует, чтобы пользователь был текущим. Формат повторяет coreutils
+/// (`uid=1000(oleg) gid=1000(oleg) groups=…`), чтобы привычные скрипты/глаза
+/// не удивлялись.
+pub(super) fn cmd_id(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.len() > 1 {
+        shell_println("id: usage: id [user]");
+        return;
+    }
+    if let Some(name) = args.first() {
+        let Some(user) = identity::lookup_user(name) else {
+            shell_println(&alloc::format!("id: '{}': no such user", name));
+            return;
+        };
+        let groups = identity::display_groups_for_user(name).unwrap_or_else(|| {
+            let mut v = alloc::vec::Vec::new();
+            v.push(user.gid);
+            v
+        });
+        shell_println(&alloc::format!(
+            "uid={}({}) gid={}({}) groups={}",
+            user.uid,
+            user.name,
+            user.gid,
+            identity::group_label(user.gid),
+            identity::format_gids(&groups)
+        ));
+        return;
+    }
+    let creds = identity::current();
+    let groups = identity::session_groups();
+    let mut line = alloc::format!(
+        "uid={}({}) gid={}({})",
+        creds.uid,
+        identity::user_label(creds.uid),
+        creds.gid,
+        identity::group_label(creds.gid)
+    );
+    if creds.euid != creds.uid {
+        line.push_str(&alloc::format!(
+            " euid={}({})",
+            creds.euid,
+            identity::user_label(creds.euid)
+        ));
+    }
+    if creds.egid != creds.gid {
+        line.push_str(&alloc::format!(
+            " egid={}({})",
+            creds.egid,
+            identity::group_label(creds.egid)
+        ));
+    }
+    line.push_str(&alloc::format!(
+        " groups={}",
+        identity::format_gids(&groups)
+    ));
+    shell_println(&line);
+}
+
+/// `groups [user]`: имена групп сессии (или пользователя из `/etc/group`).
+pub(super) fn cmd_groups(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.len() > 1 {
+        shell_println("groups: usage: groups [user]");
+        return;
+    }
+    let gids = match args.first() {
+        Some(name) => match identity::display_groups_for_user(name) {
+            Some(gids) => gids,
+            None => {
+                shell_println(&alloc::format!("groups: '{}': no such user", name));
+                return;
+            }
+        },
+        None => identity::session_groups(),
+    };
+    let groups = identity::load_groups();
+    let mut line = alloc::string::String::new();
+    for (i, gid) in gids.iter().enumerate() {
+        if i > 0 {
+            line.push(' ');
+        }
+        match crate::shell::identity_db::group_name(&groups, *gid) {
+            Some(name) => line.push_str(name),
+            None => line.push_str(&alloc::format!("{}", gid)),
+        }
+    }
+    if line.is_empty() {
+        line.push_str("(none)");
+    }
+    shell_println(&line);
+}
+
+/// `su [user]`: сменить сессионную идентичность shell.
+///
+/// Фаза 1: только `root -> oleg` (uid 1000) и `root -> root` (сброс). Пароля
+/// нет — это **явно документированное** ограничение, а не забытая проверка:
+/// аутентификация/login — предмет фазы 2 (`docs/security/groups.md`).
+///
+/// Смена односторонняя: из непривилегированной сессии `su root` запрещён (иначе
+/// отсутствие пароля было бы эскалацией). Вернуться к root можно перезагрузкой.
+/// Shell-встроенные команды по-прежнему исполняются kernel-кодом; меняется
+/// идентичность процессов, которые запускает `lxrun`.
+pub(super) fn cmd_su(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.len() > 1 {
+        shell_println("su: usage: su [user]");
+        return;
+    }
+    let target = args.first().copied().unwrap_or("root");
+    let current = identity::current();
+    if !current.is_root() {
+        shell_println("su: permission denied (phase 1: only a root session may su)");
+        return;
+    }
+    if target == "root" || target == "0" {
+        identity::set_session(Creds::ROOT);
+        shell_println("su: session identity is root (uid=0, gid=0, no groups)");
+        return;
+    }
+    let Some(user) = identity::lookup_user(target) else {
+        shell_println(&alloc::format!(
+            "su: user '{}' does not exist in /etc/passwd",
+            target
+        ));
+        return;
+    };
+    if user.uid != 1000 {
+        shell_println(&alloc::format!(
+            "su: phase 1 supports only root -> uid 1000 ('oleg'); '{}' has uid {}",
+            user.name,
+            user.uid
+        ));
+        return;
+    }
+    let Some(supplementary) = identity::supplementary_groups_for_user(&user.name) else {
+        shell_println(&alloc::format!(
+            "su: '{}': group database unavailable",
+            user.name
+        ));
+        return;
+    };
+    if supplementary.len() > GROUPS_CAP {
+        shell_println(&alloc::format!(
+            "su: '{}' is in {} groups; this kernel supports at most {}",
+            user.name,
+            supplementary.len(),
+            GROUPS_CAP
+        ));
+        return;
+    }
+    let Some(next) = Creds::new(user.uid, user.gid, user.uid, user.gid, user.uid, user.gid)
+        .with_groups(&supplementary)
+    else {
+        shell_println("su: credentials construction failed");
+        return;
+    };
+    identity::set_session(next);
+    shell_println(&alloc::format!(
+        "su: no password authentication in phase 1: root -> {} (uid={} gid={})",
+        user.name,
+        user.uid,
+        user.gid
+    ));
+    shell_println(&alloc::format!(
+        "su: groups={}",
+        identity::format_gids(&identity::session_groups())
+    ));
+    shell_println(
+        "su: 'lxrun' now starts programs with these credentials; shell built-ins still run as kernel/root (phase-1 limitation)",
+    );
 }
 
 /// `exec`: запустить встроенный тестовый пользовательский процесс.
@@ -1709,7 +1886,12 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
     // прерываниях: он берёт локи framebuffer/serial, ни один не берётся дважды и
     // ни один не блокирует.
     let result = crate::arch::cpu::without_interrupts(|| {
-        let r = crate::task::process::run_linux_binary(&path, &argv, &env);
+        let r = crate::task::process::run_linux_binary_as(
+            crate::shell::identity::current(),
+            &path,
+            &argv,
+            &env,
+        );
         if let Ok(pid) = r {
             let child_pgid = crate::task::compat::pgid_of(pid).unwrap_or(pid);
             crate::task::compat::mark_tty_job(pid);

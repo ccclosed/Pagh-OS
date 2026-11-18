@@ -1,5 +1,6 @@
 //! Идемпотентное первичное заполнение файловой системы при первой загрузке pagh.
 
+use crate::arch::x86_64::linux::cred::gid;
 use crate::vfs::{VfsError, VfsNode};
 use alloc::sync::Arc;
 
@@ -19,6 +20,33 @@ const MOTD: &[u8] = concat!(
 const README: &[u8] = b"Welcome to pagh!\n\nTry:\n  help\n  nano --settings\n  nano /mnt/home/user/notes.txt\n  cargo run /mnt/examples/hello\n  apt update\n";
 const CARGO: &[u8] = b"[package]\nname = \"pagh-hello\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
 const MAIN_RS: &[u8] = b"fn main() {\n    let values = [8, 16, 32];\n    println!(\"Hello from pagh mini-Rust! sum = {}\", values.iter().sum());\n}\n";
+
+/// Минимальная база идентичностей фазы 1 «группы отдельно от root»
+/// (`docs/security/groups.md`): root и единственный непривилегированный
+/// пользователь `oleg` (uid/gid 1000). Паролей нет — поле `x` оставлено
+/// заполнителем, а `su`/`login` в фазе 1 не аутентифицируют (см. docs).
+///
+/// Формат — ровно семь двоеточий-полей `/etc/passwd`; `id`/`groups` в shell
+/// разбирают именно его (и `/etc/group`), поэтому поля не переставлять.
+const PASSWD: &[u8] = b"\
+root:x:0:0:root:/root:/bin/sh
+oleg:x:1000:1000:Oleg:/home/oleg:/bin/sh
+";
+
+/// `/etc/group` фазы 1. Номера — [`gid`] в `cred.rs`: tty=5, disk=6, wheel=10,
+/// video=44, net=90, input=105. `oleg` включён в `tty`, `video` и `input`,
+/// потому что desktop-композитор работает от его имени; `wheel`/`disk`/`net`
+/// намеренно пусты (это privileged-группы фазы 2).
+const GROUP: &[u8] = b"\
+root:x:0:
+tty:x:5:oleg
+disk:x:6:
+wheel:x:10:
+video:x:44:oleg
+net:x:90:
+input:x:105:oleg
+oleg:x:1000:
+";
 
 fn ensure_dir(path: &str) -> Result<Arc<dyn VfsNode>, VfsError> {
     let mut node = crate::vfs::lookup_path("/")?;
@@ -48,10 +76,43 @@ fn write_once(path: &str, data: &[u8]) -> Result<(), VfsError> {
     Ok(())
 }
 
+/// Создать каталог, если его нет, и сразу выставить владельца/режим **только**
+/// новому каталогу. Существующий каталог не трогается: пользователь мог
+/// переименовать/ужать его, и boot-путь не должен молча возвращать свои права.
+fn ensure_dir_owned(path: &str, uid: u32, gid: u32, mode: u32) -> Result<(), VfsError> {
+    if crate::vfs::lookup_path(path).is_ok() {
+        return Ok(());
+    }
+    let node = ensure_dir(path)?;
+    node.set_owner(uid, gid)?;
+    node.set_mode(mode)?;
+    Ok(())
+}
+
+/// Идемпотентно установить идентичность-файлы фазы 1.
+///
+/// Отдельно от [`seed`], потому что `seed` выходит рано на уже
+/// провижиненном диске: обновление ядра на существующем образе должно получить
+/// `/etc/passwd`/`/etc/group` без переформатирования и без перезаписи
+/// пользовательских правок (`write_once`).
+fn seed_identity() -> Result<(), VfsError> {
+    ensure_dir("/mnt/etc")?;
+    write_once("/mnt/etc/passwd", PASSWD)?;
+    write_once("/mnt/etc/group", GROUP)?;
+    ensure_dir_owned("/mnt/home/oleg", 1000, gid::OLEG, 0o755)?;
+    Ok(())
+}
+
 /// Установить release-метаданные, скелет домашнего каталога и примеры при первой
 /// загрузке. Существующие файлы никогда не перезаписываются.
 pub fn seed() {
     if crate::vfs::lookup_path("/mnt/etc/pagh-release").is_ok() {
+        // Уже провижиненный диск: досоздать только то, что появилось в новых
+        // версиях ядра (идентичности фазы 1), не трогая остальное.
+        match seed_identity() {
+            Ok(()) => {}
+            Err(error) => crate::warn!("pagh identity files not installed: {:?}", error),
+        }
         return;
     }
     let result = (|| {
@@ -75,6 +136,7 @@ pub fn seed() {
         )?;
         write_once("/mnt/examples/hello/Cargo.toml", CARGO)?;
         write_once("/mnt/examples/hello/src/main.rs", MAIN_RS)?;
+        seed_identity()?;
         Ok::<(), VfsError>(())
     })();
     match result {

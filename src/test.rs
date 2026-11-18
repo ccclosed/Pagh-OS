@@ -7029,7 +7029,7 @@ mod linux_tick_tests {
 // ============================================================================
 mod security_tests {
     use super::mock_block::MockBlockDevice;
-    use crate::arch::x86_64::linux::cred::{Access, Creds};
+    use crate::arch::x86_64::linux::cred::{gid, Access, Creds, GROUPS_CAP};
     use crate::arch::x86_64::linux::errno::Errno;
     use crate::arch::x86_64::linux::kill::kill_permits;
     use crate::arch::x86_64::linux::misc;
@@ -7263,11 +7263,255 @@ mod security_tests {
             "setresuid(0) EPERM"
         );
 
+        // ── фаза 1: дополнительные группы ──────────────────────────────────
+        //
+        // Массив `gid_t` из сисколла — пользовательский указатель, а selftest
+        // исполняется в ring 0 на кернел-страницах; поэтому здесь проверяется
+        // контракт размера/указателя, а сам массив проходит через `Creds`
+        // (тот же переход, что зовёт обработчик) и через реальный gid-массив —
+        // в `tools/e2e.py groups` настоящей гостевой программой.
+        assert_eq_kernel!(compat::set_current_creds(Creds::ROOT), true, "back to root");
+        assert_eq_kernel!(misc::sys_getgroups(0, 0), Ok(0), "root has no groups");
+        let grouped = Creds::ROOT
+            .with_groups(&[gid::TTY, gid::VIDEO, gid::INPUT])
+            .expect("three groups fit");
+        assert_eq_kernel!(
+            compat::set_current_creds(grouped),
+            true,
+            "install supplementary groups"
+        );
+        assert_eq_kernel!(
+            misc::sys_getgroups(0, 0),
+            Ok(3),
+            "getgroups(0) reports the count"
+        );
+        assert_eq_kernel!(
+            misc::sys_getgroups(2, 0x1000),
+            Err(Errno::EINVAL),
+            "getgroups(size < ngroups) is EINVAL"
+        );
+        assert_eq_kernel!(
+            misc::sys_getgroups(4, 1),
+            Err(Errno::EFAULT),
+            "getgroups(bad list) is EFAULT"
+        );
+        assert_eq_kernel!(
+            misc::sys_setgroups(GROUPS_CAP as u64 + 1, 0),
+            Err(Errno::EINVAL),
+            "setgroups(count > cap) is EINVAL"
+        );
+        assert_eq_kernel!(
+            misc::sys_setgroups(0, 0),
+            Ok(0),
+            "setgroups(0) clears as root"
+        );
+        assert_eq_kernel!(
+            misc::sys_getgroups(0, 0),
+            Ok(0),
+            "cleared group set is empty"
+        );
+        assert_eq_kernel!(misc::sys_setuid(1000), Ok(0), "drop to uid 1000");
+        assert_eq_kernel!(
+            misc::sys_setgroups(0, 0),
+            Err(Errno::EPERM),
+            "unprivileged setgroups is EPERM"
+        );
+
         compat::remove_compat(me);
         assert_kernel!(
             !compat::current_has_compat(),
             "synthetic credential state removed"
         );
+    }
+
+    /// Проверить один узел `/dev`: режим и владелец ровно те, что обещает
+    /// `docs/security/groups.md`. `false` — узел недоступен (selftest без VFS).
+    fn check_device_node(path: &str, want_mode: u32, want_owner: (u32, u32), label: &str) -> bool {
+        match crate::vfs::lookup_path(path) {
+            Ok(node) => {
+                assert_eq_kernel!(node.mode() & 0o7777, want_mode, label);
+                assert_eq_kernel!(node.owner(), want_owner, label);
+                true
+            }
+            Err(_) => {
+                skip_kernel!("vfs", label);
+                false
+            }
+        }
+    }
+
+    /// Узлы `/dev` несут групповые права фазы 1, а `Creds::may` их учитывает:
+    /// член `video` открывает fb0, не-член — нет; `/dev/null` доступен всем;
+    /// `/dev/zero` читается нулями, `/dev/full` отвергает запись `ENOSPC`.
+    pub fn device_group_permissions() {
+        if !check_device_node("/dev/fb0", 0o660, (0, gid::VIDEO), "fb0 root:video 0660") {
+            return;
+        }
+        check_device_node(
+            "/dev/input/event0",
+            0o660,
+            (0, gid::INPUT),
+            "event0 root:input 0660",
+        );
+        check_device_node(
+            "/dev/vtconsole0",
+            0o660,
+            (0, gid::TTY),
+            "vtconsole0 root:tty 0660",
+        );
+        check_device_node(
+            "/dev/vtinput",
+            0o660,
+            (0, gid::INPUT),
+            "vtinput root:input 0660",
+        );
+        check_device_node("/dev/null", 0o666, (0, 0), "null 0666");
+        check_device_node("/dev/zero", 0o666, (0, 0), "zero 0666");
+        check_device_node("/dev/full", 0o666, (0, 0), "full 0666");
+
+        let desktop_user = Creds::new(1000, gid::OLEG, 1000, gid::OLEG, 1000, gid::OLEG)
+            .with_groups(&[gid::TTY, gid::VIDEO, gid::INPUT])
+            .expect("three groups fit");
+        let fb_owner = (0, gid::VIDEO);
+        assert_kernel!(
+            desktop_user.may(0o660, fb_owner, Access::Read),
+            "video member reads fb0"
+        );
+        assert_kernel!(
+            desktop_user.may(0o660, fb_owner, Access::Write),
+            "video member writes fb0"
+        );
+        let plain = Creds::new(1000, gid::OLEG, 1000, gid::OLEG, 1000, gid::OLEG);
+        assert_kernel!(
+            !plain.may(0o660, fb_owner, Access::Read),
+            "non-video user cannot read fb0"
+        );
+        assert_kernel!(
+            plain.may(0o666, (0, 0), Access::Write),
+            "null/zero/full remain world-writable"
+        );
+        assert_kernel!(
+            Creds::ROOT.may(0o660, fb_owner, Access::Read),
+            "root bypass unchanged"
+        );
+
+        if let Ok(zero) = crate::vfs::lookup_path("/dev/zero") {
+            let mut buf = [0xAAu8; 4];
+            assert_eq_kernel!(zero.read(0, &mut buf), Ok(4), "zero reads 4 bytes");
+            assert_eq_kernel!(buf, [0u8; 4], "zero fills with zeroes");
+        }
+        if let Ok(full) = crate::vfs::lookup_path("/dev/full") {
+            assert_eq_kernel!(
+                full.write(0, b"x"),
+                Err(VfsError::NoSpace),
+                "full rejects writes with ENOSPC"
+            );
+        }
+    }
+
+    /// `/etc/passwd` и `/etc/group` фазы 1 установлены провижинингом и
+    /// разбираются ровно теми функциями, что зовут `id`/`groups`/`su`.
+    pub fn identity_database_files() {
+        let read = |path: &str| -> Option<alloc::string::String> {
+            let node = crate::vfs::lookup_path(path).ok()?;
+            let size = node.size() as usize;
+            if size == 0 || size > 64 * 1024 {
+                return None;
+            }
+            let mut buf = alloc::vec![0u8; size];
+            let mut off = 0usize;
+            while off < size {
+                match node.read(off as u64, &mut buf[off..]) {
+                    Ok(0) => break,
+                    Ok(n) => off += n,
+                    Err(_) => return None,
+                }
+            }
+            buf.truncate(off);
+            alloc::string::String::from_utf8(buf).ok()
+        };
+        let Some(passwd_text) = read("/mnt/etc/passwd") else {
+            skip_kernel!("no /mnt", "/etc/passwd installed");
+            return;
+        };
+        let Some(group_text) = read("/mnt/etc/group") else {
+            skip_kernel!("no /mnt", "/etc/group installed");
+            return;
+        };
+        let users = crate::shell::identity_db::parse_passwd(&passwd_text);
+        let groups = crate::shell::identity_db::parse_group(&group_text);
+        let Some(oleg) = crate::shell::identity_db::user_by_name(&users, "oleg") else {
+            assert_kernel!(false, "/etc/passwd has oleg");
+            return;
+        };
+        assert_eq_kernel!((oleg.uid, oleg.gid), (1000, 1000), "oleg uid/gid 1000");
+        let root = crate::shell::identity_db::user_by_name(&users, "root").expect("root in passwd");
+        assert_eq_kernel!((root.uid, root.gid), (0, 0), "root uid/gid 0");
+        assert_eq_kernel!(
+            crate::shell::identity_db::supplementary_groups_for_user(&users, &groups, "oleg"),
+            Some(alloc::vec![gid::TTY, gid::VIDEO, gid::INPUT]),
+            "oleg supplementary groups = tty,video,input"
+        );
+        assert_eq_kernel!(
+            crate::shell::identity_db::groups_for_user(&users, &groups, "oleg"),
+            Some(alloc::vec![gid::OLEG, gid::TTY, gid::VIDEO, gid::INPUT]),
+            "oleg display groups"
+        );
+        assert_eq_kernel!(
+            crate::shell::identity_db::group_name(&groups, gid::VIDEO),
+            Some("video"),
+            "video gid is named"
+        );
+    }
+
+    /// fork/clone наследуют дополнительные группы; это чистая копия
+    /// `CompatState`, поэтому проверяется синтетическим состоянием без запуска
+    /// второго адресного пространства.
+    pub fn group_inheritance() {
+        const CHILD: u64 = 0x7E00_00C1;
+        const THREAD: u64 = 0x7E00_00C2;
+        let me = scheduler::current_pid();
+        let saved = compat::remove_compat(me);
+        let mut state = CompatState::new(
+            FdTable::with_standard_streams(),
+            Arc::new(crate::sync::spinlock::Spinlock::new(
+                crate::arch::x86_64::linux::mem::VmRegionSet::new(0, 0),
+            )),
+            me,
+        );
+        state.creds = Creds::new(1000, 1000, 1000, 1000, 1000, 1000)
+            .with_groups(&[gid::TTY, gid::VIDEO, gid::INPUT])
+            .expect("three groups fit");
+        compat::install_compat(me, state);
+
+        let want = Some(alloc::vec![gid::TTY, gid::VIDEO, gid::INPUT]);
+        assert_kernel!(compat::fork_current_compat(CHILD, 0), "fork compat clone");
+        assert_eq_kernel!(
+            compat::creds_of(CHILD).map(|c| c.groups().to_vec()),
+            want,
+            "fork inherits supplementary groups"
+        );
+        assert_eq_kernel!(
+            compat::creds_of(CHILD).map(|c| c.uid),
+            Some(1000),
+            "fork inherits ids"
+        );
+        assert_kernel!(
+            compat::clone_current_compat(THREAD, None, 0),
+            "thread compat clone"
+        );
+        assert_eq_kernel!(
+            compat::creds_of(THREAD).map(|c| c.groups().to_vec()),
+            want,
+            "clone inherits supplementary groups"
+        );
+
+        compat::remove_compat(CHILD);
+        compat::remove_compat(THREAD);
+        compat::remove_compat(me);
+        if let Some(previous) = saved {
+            compat::install_compat(me, previous);
+        }
     }
 }
 
@@ -10347,6 +10591,18 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "security::get/set*id syscall round-trip",
             security_tests::syscall_cred_roundtrip
+        ),
+        (
+            "security::device nodes carry group modes + supplementary-gid checks",
+            security_tests::device_group_permissions
+        ),
+        (
+            "security::/etc/passwd + /etc/group parse into ids and groups",
+            security_tests::identity_database_files
+        ),
+        (
+            "security::fork/clone inherit supplementary groups",
+            security_tests::group_inheritance
         ),
         ("usb: HID key make/break", usb_hid_tests::key_make_break),
         ("usb: HID Ctrl+C ordering", usb_hid_tests::ctrl_c_order),

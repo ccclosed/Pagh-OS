@@ -9,6 +9,7 @@
 use alloc::sync::Arc;
 
 use super::{VfsNode, VfsResult};
+use crate::arch::x86_64::linux::cred::gid;
 use crate::drivers::framebuffer::FbInfo;
 
 /// `/dev/fb0` — Limine-фреймбуфер, который desktop забирает через open/mmap.
@@ -38,6 +39,15 @@ impl VfsNode for FramebufferDevice {
     fn write(&self, _offset: u64, _buf: &[u8]) -> VfsResult<usize> {
         Err(super::VfsError::NotSupported)
     }
+    /// `root:video 0660`: экран принадлежит композитору, а не любому
+    /// пользователю. Членство в `video` — граница доверия (см.
+    /// `docs/security/groups.md`), поэтому other-биты нулевые.
+    fn mode(&self) -> u32 {
+        0o660
+    }
+    fn owner(&self) -> (u32, u32) {
+        (0, gid::VIDEO)
+    }
 }
 
 /// `/dev/input/event0` — evdev-подобный поток событий.
@@ -62,6 +72,13 @@ impl VfsNode for EventDevice {
     }
     fn write(&self, _offset: u64, _buf: &[u8]) -> VfsResult<usize> {
         Err(super::VfsError::NotSupported)
+    }
+    /// `root:input 0660`: клавиатура/мышь — sensitive-устройство (кейлоггер).
+    fn mode(&self) -> u32 {
+        0o660
+    }
+    fn owner(&self) -> (u32, u32) {
+        (0, gid::INPUT)
     }
 }
 
@@ -131,9 +148,13 @@ impl VfsNode for VtConsoleDevice {
         crate::drivers::vtsurface::page(index)
     }
     fn mode(&self) -> u32 {
-        // Экран консоли может содержать секреты: только владелец консоли
-        // (root) может читать shared surface.
-        0o600
+        // Экран консоли может содержать секреты: читать shared surface может
+        // только root или член группы `tty` (терминальная сессия/композитор).
+        // other-биты нулевые, запись узлом и так запрещена.
+        0o660
+    }
+    fn owner(&self) -> (u32, u32) {
+        (0, gid::TTY)
     }
     fn size(&self) -> u64 {
         self.vtconsole_info()
@@ -164,8 +185,13 @@ impl VfsNode for VtInputDevice {
     fn is_vtinput(&self) -> bool {
         true
     }
+    /// `root:input 0660`: приём VT-байтов (ввод терминала) — sensitive, как и
+    /// evdev; писать может root или член `input`.
     fn mode(&self) -> u32 {
-        0o600
+        0o660
+    }
+    fn owner(&self) -> (u32, u32) {
+        (0, gid::INPUT)
     }
     fn read(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> {
         Err(super::VfsError::NotSupported)

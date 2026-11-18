@@ -552,6 +552,8 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::SETGID => misc::sys_setgid(a[0]),
         sysno::SETREUID => misc::sys_setreuid(a[0], a[1]),
         sysno::SETREGID => misc::sys_setregid(a[0], a[1]),
+        sysno::GETGROUPS => misc::sys_getgroups(a[0], a[1]),
+        sysno::SETGROUPS => misc::sys_setgroups(a[0], a[1]),
         sysno::SETRESUID => misc::sys_setresuid(a[0], a[1], a[2]),
         sysno::SETRESGID => misc::sys_setresgid(a[0], a[1], a[2]),
         sysno::GETRESUID => misc::sys_getresuid(a[0], a[1], a[2]),

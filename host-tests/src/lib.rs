@@ -66,6 +66,12 @@ pub mod cmsg;
 #[path = "../../src/arch/x86_64/linux/cred.rs"]
 pub mod cred;
 
+// Shell identity database: pure `/etc/passwd` + `/etc/group` parsing used by
+// `id`/`groups`/`su` (phase 1 "groups separate from root"). `core`+`alloc`
+// only, so property P58 exercises the exact source the kernel compiles.
+#[path = "../../src/shell/identity_db.rs"]
+pub mod identity_db;
+
 #[path = "../../src/arch/x86_64/linux/rand_clock.rs"]
 pub mod rand_clock;
 
@@ -702,6 +708,12 @@ mod properties {
     // `shutdown(2)` half-close policy (task-81): errno order and the
     // per-direction read/write/poll answers. Pinned against a live-kernel probe.
     mod p59;
+
+    // Phase-1 group model, data half: the pure `/etc/passwd` + `/etc/group`
+    // parser/query layer behind `id`/`groups`/`su`, compared against an
+    // independently written oracle plus exact render→parse round trips.
+    // `p58`/`p59` were taken by sock_wait/shutdown, so this is P60.
+    mod p60;
 
     // NVMe PRP lists + queue-depth arithmetic (PRP1/PRP2/list page, LBA chunk
     // planning, polled CQ phase tags, CAP.MQES clamping). The driver itself is

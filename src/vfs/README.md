@@ -21,7 +21,7 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
 | `mod.rs` | Ядро VFS: трейт `VfsNode`, `VfsError`, `FsStat`, резолв путей (`lookup_path`), монтирование (`mount_at`/`MountNode`), синтетический `/dev` (`NullDevice`, `SerialDevice`, `DevDirectory`), корень (`RootDirectory`), `init()` |
 | `ramfs.rs` | In-memory ФС для `/tmp`; единственная in-memory-ФС с настоящими `create_dir`/`create_file`/`remove` (на диске то же умеет ext2-каталог под `/mnt`) |
 | `memfd.rs` | `memfd_create`-узел: анонимный файл, чьи страницы — кадры PMM в карте `page_index -> phys`. `read`/`write`/`truncate` и `mmap(MAP_SHARED)` видят одни байты; файл держит pin-ссылку кэша, отображения — свои (`SHARED_BIT`), поэтому `munmap`/exit/fork не вырывают страницы из-под живого отображения. Kernel-only |
-| `desktop_dev.rs` | Символьные устройства desktop-варианта B: `/dev/fb0` (`FramebufferDevice`), `/dev/input/event0` (`EventDevice`), `/dev/vtconsole0` (read-only shared VT surface, `vtconsole_info`/`vtconsole_page`), `/dev/vtinput` (write-only VT-байты) + `DeviceDirectory` для `/dev/input`. Реальная работа (ioctl/mmap/read/poll) — в syscall-слое |
+| `desktop_dev.rs` | Символьные устройства desktop-варианта B: `/dev/fb0` (`FramebufferDevice`, `root:video 0660`), `/dev/input/event0` (`EventDevice`, `root:input 0660`), `/dev/vtconsole0` (read-only shared VT surface, `root:tty 0660`), `/dev/vtinput` (write-only, `root:input 0660`) + `DeviceDirectory` для `/dev/input`. Реальная работа (ioctl/mmap/read/poll) — в syscall-слое; групповые права — `docs/security/groups.md` |
 | `procfs.rs` | Синтетический `/proc`: узлы `ProcDir`/`ProcFile`, ленивый рендер текста на `size()`/`read()`, источники — PMM/heap/тики/счётчики планировщика/`CompatState`/CPUID. `DirKind::TaskDir(tgid)` листает живые треды группы из `compat::thread_group_pids`, узел `task/<tid>` — это `pid_dir(tid)`. Kernel-only |
 | `procfs_format.rs` | Чистое (`core`+`alloc`) форматирование текстов procfs (включая `/proc/version`, `/proc/filesystems`, `/proc/loadavg`, `/proc/sys/kernel/*`, `fdinfo` и `limits`), таблица путей и inode'ов (`pid_task_dir_ino`) — включается в host-tests (свойства `procfs_*`) |
 | `elf.rs` | Эффектный загрузчик ELF64: `ElfLoader::load` (нативный `ET_EXEC`), `ElfLoader::load_linux` (`ET_EXEC`, static-PIE `ET_DYN` и glibc-dynamic образы — `PT_INTERP` подшивается отдельно через `map_interpreter`), `ElfLoader::map_interpreter`; `ElfProcess` |
@@ -70,7 +70,8 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
   **Ограничение v1: только одноуровневые монтирования** (`"/a/b"` → `InvalidArgument`).
 
 ### Синтетика и ramfs
-- `/dev/null` (read=0, write всасывает), `/dev/serial` (COM1; read — поллинг LSR 0x3FD / DATA 0x3F8,
+- `/dev/null` (read=0, write всасывает, 0666), `/dev/zero` (read — нули, write всасывает, 0666),
+  `/dev/full` (read — нули, write — `ENOSPC`, 0666), `/dev/serial` (COM1; read — поллинг LSR 0x3FD / DATA 0x3F8,
   write через `drivers::serial::write_bytes` — побайтово, без UTF-8-энкода).
 - ramfs: `RamDir` = `Spinlock<BTreeMap<String, Arc<dyn VfsNode>>>`, `RamFile` = `Spinlock<Vec<u8>>`;
   запись за EOF заполняет дыры нулями (`try_reserve` заранее — чтобы огромный offset не абортнул

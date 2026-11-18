@@ -15,6 +15,8 @@ Framebuffer-shell с редактированием строки, историе
 | `cat.rs` | Чистое ядро `cat`: потоковое чтение чанками 256 Б с капом 64 KiB, дословный вывод и завершающий `\n`, если файл не заканчивается переводом строки (иначе следующий промпт приклеивался к последней строке файла — QA F-04) |
 | `texttools.rs` | Чистое ядро `head`/`tail`/`wc`/`grep`: один потоковый обход строк (чанки 256 Б, кап 4 MiB), ring на N строк для `tail`, счётчики для `wc`, ASCII case-fold подмножество для `grep -i`; сюда же тонкий VFS-слой этих четырёх команд |
 | `registry.rs` | Статическая таблица `COMMANDS: &[CommandSpec]`; `lookup()`, `command_names()` |
+| `identity.rs` | Сессионная идентичность shell для фазы 1 «группы отдельно от root»: `current`/`set_session` (креденшелы, с которыми `lxrun` запускает Linux-программы), чтение `/mnt/etc/passwd` + `/mnt/etc/group`, метки uid/gid для `id`/`groups`/`su`; обработчики команд — в `commands.rs` |
+| `identity_db.rs` | Чистый (core+alloc) разбор `/etc/passwd` (7 полей) и `/etc/group` (4 поля), first-match lookups, `groups_for_user`/`supplementary_groups_for_user`; host-свойство P58 |
 | `editor.rs` | `LineEditor` — чистая буфер+курсор модель (курсор в чар-юнитах, cap 256) |
 | `history.rs` | `History` — bounded ring (CAP=64), recall вверх/вниз, stash текущей строки, дедуп подряд идущих |
 | `complete.rs` | Чистое таб-дополнение: `longest_common_prefix`, `Completion::{None, Single, Multiple}`, `complete_command`, `complete_path` |
@@ -40,6 +42,8 @@ Framebuffer-shell с редактированием строки, историе
 - `complete::{longest_common_prefix, complete_command, complete_path}`
 - `keys::{KeyEvent, Decoder::{new, feed}, CTRL_C_LATCH, CTRL_Z_LATCH}`
 - `jobs::{Job, record, remove, snapshot, last, set_stopped}`
+- `identity::{current, set_session, load_users, load_groups, display_groups_for_user, supplementary_groups_for_user, session_groups}`
+- `identity_db::{parse_passwd, parse_group, user_by_name, groups_for_user, supplementary_groups_for_user}`
 - `path::{normalize, resolve, cwd, set_cwd}`
 - `suggest::{edit_distance, nearest_command}`
 - `paint::run()`, `nano::run(path)`, `toolchain::{execute, run_path, rustc, cargo, rustup}`

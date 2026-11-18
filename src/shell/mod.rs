@@ -15,6 +15,11 @@ pub(crate) mod complete;
 pub(crate) mod disk;
 pub(crate) mod editor;
 pub(crate) mod history;
+// Сессионная идентичность фазы 1 (`id`/`groups`/`su`): чистый разбор
+// `/etc/passwd` + `/etc/group` (`identity_db`, host-тестируемый) и VFS-слой
+// хранения сессии (`identity`).
+pub(crate) mod identity;
+pub(crate) mod identity_db;
 pub(crate) mod jobs;
 pub(crate) mod keys;
 pub(crate) mod nano;
