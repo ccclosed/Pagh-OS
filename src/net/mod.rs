@@ -620,6 +620,20 @@ pub fn tcp_rx_at_eof(handle: SocketHandle) -> bool {
 pub fn tcp_close(handle: SocketHandle) {
     let mut g = NET.lock();
     let Some(s) = g.as_mut() else { return };
+    // У слушателя нет FIN-рукопожатия: `close()` лишь поднимает флаг, который
+    // обычный шаг сокета обрабатывает для соединённых состояний, а `reap_closed`
+    // снимает только `Closed`. Без этой ветки закрытый listener оставался в
+    // таблице навсегда, и порт было не занять повторно (`EADDRINUSE`) даже после
+    // успешного `close(2)`.
+    let listening = s
+        .tcp
+        .get(handle)
+        .map(|k| k.state() == tcp::State::Listen)
+        .unwrap_or(false);
+    if listening {
+        s.tcp.remove(handle);
+        return;
+    }
     if let Some(k) = s.tcp.get_mut(handle) {
         k.close();
     }

@@ -2949,7 +2949,7 @@ def _debugfs_inject_exec(image: pathlib.Path, src: pathlib.Path, name: str) -> N
 
 
 def _groups_prepare_disk(h: "Harness", image: pathlib.Path,
-                         probe: pathlib.Path) -> None:
+                         probe: pathlib.Path, name: str = "grpprobe") -> None:
     """Let the kernel format a blank disk, then inject the probe with debugfs.
 
     The kernel only mounts a volume carrying its WAL superblock, so the first
@@ -2981,8 +2981,8 @@ def _groups_prepare_disk(h: "Harness", image: pathlib.Path,
     h.kb = None
     if not image.is_file():
         raise SetupError("groups: formatted disk image disappeared")
-    _debugfs_inject_exec(image, probe, "grpprobe")
-    log(f"groups: injected {rel(probe)} into {rel(image)} as /grpprobe")
+    _debugfs_inject_exec(image, probe, name)
+    log(f"groups: injected {rel(probe)} into {rel(image)} as /{name}")
 
 
 def mode_groups(h: "Harness") -> tuple[str, int]:
@@ -3091,6 +3091,106 @@ def mode_groups(h: "Harness") -> tuple[str, int]:
     return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
 
 
+def _net_probe_binary() -> pathlib.Path:
+    """Assemble `tools/net_probe.c` into a freestanding static ELF.
+
+    Same discipline as the group probe: raw syscalls, no libc, so a green run
+    cannot be explained by glibc falling back to something else.
+    """
+    gcc = shutil.which("gcc")
+    if not gcc:
+        raise SetupError("netperms: gcc is required to build tools/net_probe.c")
+    src = ROOT / "tools" / "net_probe.c"
+    if not src.is_file():
+        raise SetupError(f"netperms: probe source missing: {src}")
+    out = CACHE / "netprobe"
+    CACHE.mkdir(parents=True, exist_ok=True)
+    run_checked(
+        [gcc, "-static", "-nostdlib", "-ffreestanding", "-fno-stack-protector",
+         "-fno-pie", "-no-pie", "-Os", "-o", out, src,
+         "-Wl,-e,_start", "-Wl,--build-id=none"],
+        "net probe build", timeout=120,
+    )
+    if not out.is_file():
+        raise SetupError("netperms: probe build produced no ELF")
+    return out
+
+
+def mode_netperms(h: "Harness") -> tuple[str, int]:
+    """AF_INET bind/listen port gate and the SOCK_RAW gate, from ring 3.
+
+    Two boots, as in `groups`: the first lets the kernel format a blank disk (the
+    only writable ext2 it will mount), the probe is injected with debugfs, and
+    the second boot attaches a NIC — `bind(2)` reserves a port in the stack, so
+    the stack must exist. The probe runs twice: as root (privileged port 80,
+    duplicate EADDRINUSE, raw gate EOPNOTSUPP) and after `su oleg` as uid 1000
+    (port 80 EACCES, the same socket then binds 8080, raw gate EPERM).
+    """
+    a = h.a
+    probe = _net_probe_binary()
+    disk = CACHE / "e2e_netperms_disk.img"
+    if not (getattr(a, "reuse_netperms_disk", False)
+            and _debugfs_stat(disk, "netprobe") is not None):
+        _groups_prepare_disk(h, disk, probe, name="netprobe")
+    else:
+        log(f"netperms: reusing {rel(disk)}")
+
+    h.boot(need_keyboard=True, disk=disk, net=True)
+    assert h.guest is not None and h.kb is not None
+    kb = h.kb
+    if not wait_for_shell(h.guest, kb, a, a.boot_timeout):
+        raise HarnessError(f"netperms: shell never appeared; serial tail:\n"
+                           f"{tail(h.guest.serial())}")
+
+    def sh(cmd: str) -> None:
+        log(f"type: {cmd}")
+        kb.text(cmd)
+        kb.key("ret")
+
+    ok = True
+    sh("lxrun /mnt/netprobe root")
+    if wait_for(h.guest, [r"NPROBE mode=root "], h.timeout,
+                label="netprobe root") is None:
+        ok &= h.check("netprobe root produced a result line", False,
+                      "timeout; serial tail: " + tail(h.guest.serial(), 10))
+        return ("FAIL", EXIT_FAIL)
+    time.sleep(1.0)
+
+    sh("su oleg")
+    if wait_for(h.guest, [r"su: no password authentication in phase 1"], 30.0,
+                label="su oleg") is None:
+        ok &= h.check("su oleg switches the session", False, "no su marker")
+        return ("FAIL", EXIT_FAIL)
+    sh("lxrun /mnt/netprobe drop")
+    if wait_for(h.guest, [r"NPROBE mode=drop "], h.timeout,
+                label="netprobe drop") is None:
+        ok &= h.check("netprobe drop produced a result line", False,
+                      "timeout; serial tail: " + tail(h.guest.serial(), 10))
+        return ("FAIL", EXIT_FAIL)
+    time.sleep(a.settle)
+    text = h.guest.serial()
+
+    expected = [
+        ("root: bind :80 and :8080 ok, duplicate :8080 EADDRINUSE, listen ok, "
+         "raw gate EOPNOTSUPP, close releases the port",
+         r"NPROBE mode=root uid=0 euid=0 bind80=0 bind8080=0 dup8080=98 "
+         r"listen8080=0 raw=95 afterclose=0"),
+        ("uid 1000: bind :80 EACCES, same socket binds :8080, listen ok, "
+         "SOCK_RAW EPERM, close releases the port",
+         r"NPROBE mode=drop setgid=0 setuid=0 uid=1000 euid=1000 bind80=13 "
+         r"bind8080=0 dup8080=98 listen8080=0 raw=1 afterclose=0"),
+    ]
+    for label, pattern in expected:
+        m = re.search(pattern, text)
+        ok &= h.check(label, bool(m), m.group(0).strip() if m else "not found")
+
+    crashes = re.findall(r"PANIC|\[EXC [^\]]+\]|DOUBLE FREE", text)
+    ok &= h.check("no panic/exception in guest", not crashes,
+                  crashes[0] if crashes else "none")
+    h.metrics["probe modes"] = "root, drop"
+    return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
+
+
 MODES = {
     "selftest": mode_selftest,
     "local-mirror": mode_local_mirror,
@@ -3104,6 +3204,7 @@ MODES = {
     "scroll": mode_scroll,
     "desktop": mode_desktop,
     "groups": mode_groups,
+    "netperms": mode_netperms,
     "smoke": mode_smoke,
     "boot-check": mode_boot_check,
     "restore": mode_restore,
@@ -3246,6 +3347,13 @@ def build_parser() -> argparse.ArgumentParser:
              "ring 3 via a static probe (root, dropped uid, su oleg)")
     gp.add_argument("--reuse-groups-disk", action="store_true",
                     help="reuse .cache/e2e_groups_disk.img (already formatted/injected)")
+
+    npp = sub.add_parser(
+        "netperms", parents=[common],
+        help="AF_INET bind/listen port gate and SOCK_RAW gate from ring 3 via a "
+             "static probe (root, dropped uid)")
+    npp.add_argument("--reuse-netperms-disk", action="store_true",
+                     help="reuse .cache/e2e_netperms_disk.img (already formatted/injected)")
 
     ts = sub.add_parser("tcp-shot", parents=[common],
                         help="regression: a peer that replies and closes in one burst "
