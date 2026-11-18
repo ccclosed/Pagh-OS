@@ -46,7 +46,7 @@ use super::mem::{
     plan_brk, plan_mmap_base, plan_munmap, prot_to_flags, range_is_free, BrkOutcome, MmapBacking,
     MmapRegion, MunmapPlan, VmRegionSet, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, PROT_READ,
 };
-use super::validate::USER_ADDR_MAX;
+use super::validate::{self, MappingKind, PageAcceptance, USER_ADDR_MAX};
 
 /// Архитектурный размер страницы (4 КиБ).
 const PAGE_SIZE: u64 = 4096;
@@ -1270,66 +1270,104 @@ pub fn handle_user_page_fault(
     let page = addr & !(PAGE_SIZE - 1);
     compat::with_current_compat(|cs| {
         let vm = &mut cs.vm.lock();
-        // Куча brk: страницы в [brk_lazy_from, page_up(current_brk)) подпираются
-        // по первому касанию, всегда writable + NX.
+        // Классифицируем страницу для чистой политики [`validate::page_acceptance`]:
+        // вид отображения говорит, законно ли отсутствие страницы. Куча brk:
+        // страницы в [brk_lazy_from, page_up(current_brk)) подпираются по первому
+        // касанию, всегда writable + NX.
         let brk_end = vm.current_brk.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        if page >= vm.brk_lazy_from && page < brk_end {
-            if vmm::virt_to_phys(page).is_some() {
-                return true; // снова резидентна (гонка сжатия/роста); повтор
-            }
-            return map_zeroed_range(page, page + PAGE_SIZE, leaf_flags(true, true));
-        }
-        // Отслеживаемые mmap-регионы.
-        let Some(r) = vm
+        let mut region_base = 0u64;
+        let (kind, writable, nx) = if page >= vm.brk_lazy_from && page < brk_end {
+            (MappingKind::LazyHeap, true, true)
+        } else if let Some(r) = vm
             .mmaps
             .iter()
             .find(|r| page >= r.base && page < r.base + r.pages * PAGE_SIZE)
-        else {
-            return false;
+        {
+            region_base = r.base;
+            let kind = if r.prot == 0 {
+                // PROT_NONE (например, guard-страница стека потока): касание —
+                // настоящий SIGSEGV, а не повод для отображения.
+                MappingKind::ProtNone
+            } else if !r.anon {
+                // File-backed регионы отображены жадно; отсутствующий PTE здесь —
+                // ошибка ядра, а не ленивое отображение.
+                MappingKind::Eager
+            } else {
+                MappingKind::LazyAnon
+            };
+            (kind, r.writable, r.nx)
+        } else {
+            (MappingKind::Outside, false, false)
         };
-        if r.prot == 0 {
-            // PROT_NONE (например, guard-страница стека потока): касание — это
-            // настоящий SIGSEGV, а не повод для отображения.
-            return false;
+        let present = vmm::virt_to_phys(page).is_some();
+        match validate::page_acceptance(present, kind) {
+            // Снова резидентна (гонка сжатия/роста) — инструкция просто повторится.
+            PageAcceptance::Accept => true,
+            PageAcceptance::Refuse => {
+                if kind == MappingKind::Eager {
+                    crate::error!(
+                        "[PF] missing PTE in eager file-backed region base=0x{:x} addr=0x{:x}",
+                        region_base,
+                        addr
+                    );
+                }
+                false
+            }
+            PageAcceptance::Populate => {
+                map_zeroed_range(page, page + PAGE_SIZE, leaf_flags(writable, nx))
+            }
         }
-        if vmm::virt_to_phys(page).is_some() {
-            return true; // уже резидентна; повтор
-        }
-        if !r.anon {
-            // File-backed регионы отображены жадно; отсутствующий PTE здесь —
-            // ошибка ядра, а не ленивое отображение.
-            crate::error!(
-                "[PF] missing PTE in eager file-backed region base=0x{:x} addr=0x{:x}",
-                r.base,
-                addr
-            );
-            return false;
-        }
-        map_zeroed_range(page, page + PAGE_SIZE, leaf_flags(r.writable, r.nx))
     })
     .unwrap_or(false)
 }
 
-/// Подпереть page-by-page пользовательский диапазон, в который ядро собирается
-/// писать, до [`super::io_sys::copy_out_checked`].
+/// Подпереть page-by-page пользовательский диапазон, который ядро собирается
+/// **читать** (`write(2)`/`writev(2)`, `copy_in`), до копии.
 ///
-/// Зачем это нужно отдельно: общая проверка присутствия (`check_user_ptr*`)
-/// отвергает ещё не подпертые страницы `EFAULT`'ом, а `copy_in`/`copy_out` по
-/// ним штатно обслуживаются обработчиком page fault (см. `idt.rs`). Для
-/// `read(2)` из `/dev/vtconsole0` это единственный путь, где приёмник — свежий
-/// анонимный `mmap` клиента: снимок в сотню килобайт копируется целиком, и без
-/// этой подготовки вызов возвращал `EFAULT` на законном буфере.
+/// Зачем это нужно: общая проверка присутствия ([`super::check_user_ptr`])
+/// отвергает ещё не подпертые страницы `EFAULT`'ом, а `copy_in` по ним штатно
+/// обслуживается обработчиком page fault (см. `idt.rs`) — то есть мешала только
+/// проверка. Источник `write(2)` у реальных приложений — свежий `Vec`/`Box` на
+/// ленивой куче `brk` или анонимный `mmap`: без этой подготовки `write` получал
+/// `EFAULT` на законной памяти процесса (тот же класс, что EFAULT на
+/// `/dev/vtconsole0`).
 ///
-/// Политика — ровно [`handle_user_page_fault`]: присутствующие страницы
-/// принимаются как есть; отсутствующие подпираются только внутри ленивой кучи
-/// `brk` или анонимного `mmap`-региона; `PROT_NONE`, eager-регион без PTE и
-/// адрес вне регионов остаются отказом (`EFAULT`), а не поводом что-то
-/// отобразить. Права листа при этом берутся из региона, поэтому приёмник
-/// `PROT_READ` подпирается read-only и всё равно отвергается `copy_out`'ом.
+/// Политика — ровно [`handle_user_page_fault`] через чистое правило
+/// [`validate::page_acceptance`]: присутствующие страницы принимаются как есть;
+/// отсутствующие подпираются ТОЛЬКО внутри ленивой кучи `brk` или анонимного
+/// `mmap`-региона; `PROT_NONE`, eager-регион без PTE и адрес вне регионов
+/// остаются отказом (`EFAULT`), а не поводом что-то отобразить. Права листа
+/// берутся из региона, поэтому страница региона `PROT_READ` подпирается
+/// read-only (для чтения этого достаточно).
 ///
 /// ПРЕДУСЛОВИЕ: вызывающий не держит `COMPAT_STATES` — [`handle_user_page_fault`]
 /// берёт его сам и в реентерабельном контексте отказывает.
+pub fn populate_user_in(start: u64, len: u64) -> Result<(), Errno> {
+    populate_user_range(start, len)
+}
+
+/// Подпереть page-by-page пользовательский диапазон, в который ядро собирается
+/// **писать** (`read(2)`/`readv(2)`/`pread(2)`, `copy_out`), до копии.
+///
+/// Отличие от [`populate_user_in`] — только в правах приёмника, и их проверяет
+/// не эта функция, а [`super::io_sys::copy_out_checked`] (присутствие +
+/// записываемость на единственном choke point'е копирования наружу), поэтому
+/// TOCTOU-контракт не ослаблен: подпирание лишь делает страницу резидентной,
+/// отказ по `PROT_READ`/`RO_BIT` приходит из повторной проверки перед записью.
+///
+/// ПРЕДУСЛОВИЕ: вызывающий не держит `COMPAT_STATES` (см. [`populate_user_in`]).
 pub fn populate_user_out(start: u64, len: u64) -> Result<(), Errno> {
+    populate_user_range(start, len)
+}
+
+/// Общий движок подпирания: обход страниц диапазона с политикой
+/// [`handle_user_page_fault`].
+///
+/// Диапазон обязан пройти [`super::validate::check_user_range`] до обхода
+/// (иначе — `EFAULT`); страницы, уже стоящие в PTE, пропускаются без работы.
+/// Направление копирования здесь не участвует: политика решается видом
+/// отображения (`MappingKind`), а не тем, читает ядро или пишет.
+fn populate_user_range(start: u64, len: u64) -> Result<(), Errno> {
     use super::validate::{check_user_range, spanned_pages, PtrCheck};
     if len == 0 {
         return Ok(());
