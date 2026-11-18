@@ -421,6 +421,45 @@ fn read_evdev_event(fd: u32, buf: u64, count: u64) -> Result<u64, Errno> {
     }
 }
 
+/// `read(2)` с `/dev/vtconsole0`: один целостный снимок shared-поверхности.
+///
+/// Отличается от общего файлового пути только подготовкой приёмника. Клиент
+/// (`pagh-terminal --vt`) читает снимок в свежий анонимный `mmap`, страницы
+/// которого ещё не подперты: общая проверка присутствия по всему `buf` давала
+/// ему `EFAULT` на 100-килобайтном снимке, хотя диапазон — законное
+/// записываемое отображение. Здесь запрос урезается до реально копируемого
+/// остатка снимка (как `read(2)` в Linux), а страницы приёмника подпираются
+/// [`super::mem_sys::populate_user_out`] — той же политикой demand paging, что
+/// применил бы обработчик page fault. Настоящий отказ (адрес вне
+/// зарегистрированных регионов, `PROT_NONE`, read-only лист) остаётся `EFAULT`
+/// и по-прежнему приходит из [`copy_out_checked`].
+fn read_vtconsole(fd: u32, buf: u64, count: u64) -> Result<u64, Errno> {
+    let (node, offset) = match resolve_fd(fd) {
+        Some(Resolved::File { node, offset }) => (node, offset),
+        _ => return Err(Errno::EBADF),
+    };
+    let (copied, _) = plan_read(node.size(), offset, count);
+    if copied == 0 {
+        return Ok(0);
+    }
+    super::mem_sys::populate_user_out(buf, copied)?;
+    let mut kbuf = vec![0u8; copied as usize];
+    let n = node.read(offset, &mut kbuf).map_err(|e| {
+        crate::error!(
+            "[linux] vtconsole read failed: {:?} off={} len={}",
+            e,
+            offset,
+            copied
+        );
+        Errno::EIO
+    })?;
+    // Повторная проверка на единственном choke point'е копирования наружу:
+    // приёмник мог исчезнуть/стать read-only, пока вызов уступал CPU.
+    copy_out_checked(buf, &kbuf[..n])?;
+    set_fd_offset(fd, offset + n as u64);
+    Ok(n as u64)
+}
+
 /// `read` (0): скопировать до `count` байт файла с текущего смещения в буфер
 /// пользователя, сдвинуть смещение на скопированное и вернуть это число
 /// (R2.3). `EBADF` для отсутствующего fd (R2.14); чтение консоли/stdin даёт 0.
@@ -431,12 +470,21 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
     // evdev читает одно событие (24 байта), поэтому полный `count` ему не
     // обязан быть отображён: Linux проверяет только `sizeof(input_event)`.
     // Остальные файловые/pipe-пути сохраняют прежнюю проверку всего буфера.
+    // `/dev/vtconsole0` отдаёт снимок целиком, поэтому проверять присутствие
+    // страниц по всему `count` нельзя: клиент читает его в свежий анонимный
+    // `mmap`, чьи страницы ещё не подперты demand paging'ом, и общая проверка
+    // ниже отвергла бы законный буфер с `EFAULT` (Linux проверяет только
+    // реально копируемый диапазон). Специальный путь урезает запрос до остатка
+    // снимка и подпирает приёмник той же политикой, что и page fault.
     if let Some(Resolved::File { node, .. }) = resolve_fd(fd as u32) {
         if node.is_vtinput() {
             return Err(Errno::EBADF);
         }
         if node.is_evdev() {
             return read_evdev_event(fd as u32, buf, count);
+        }
+        if node.is_vtconsole() {
+            return read_vtconsole(fd as u32, buf, count);
         }
     }
     check_user_ptr(buf, count)?;
