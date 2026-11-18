@@ -79,6 +79,15 @@ const TIMEOUT_SECS: u64 = 20;
 /// (a plain RAM-disk boot has nothing to ask about) or when the framebuffer is
 /// unavailable, so an unattended boot is never blocked.
 pub fn run(partitions: &[(Arc<dyn BlockDevice>, PartitionContent)]) -> Choice {
+    // A boot that already carries a pagh-owned volume is unambiguous: `Skip`
+    // mounts it by the normal priority. Asking again every boot is the
+    // "first launch" ritual this avoids — a 20 s menu with mount/format to
+    // answer a question whose safe answer is already on disk. The menu stays
+    // for genuinely ambiguous media (blank/foreign disk, first provision).
+    if has_pagh_volume(partitions) {
+        crate::info!("fs: pagh volume already present; boot disk menu skipped");
+        return Choice::Skip;
+    }
     let rows = collect(partitions);
     if rows.is_empty() || !framebuffer::is_initialized() {
         return Choice::Skip;
@@ -276,6 +285,21 @@ fn wait_ms_polling(ms: u32, decoder: &mut Decoder) -> Vec<KeyEvent> {
         }
     }
     events
+}
+
+/// True when the machine already has a pagh-provisioned volume, including a RAM
+/// disk carried by the boot medium. `classify` is the same probe the menu and
+/// the boot path use, so "provisioned" means exactly "mountable by pagh".
+fn has_pagh_volume(partitions: &[(Arc<dyn BlockDevice>, PartitionContent)]) -> bool {
+    if partitions
+        .iter()
+        .any(|(_, content)| *content == PartitionContent::PaghVolume)
+    {
+        return true;
+    }
+    crate::drivers::get_block("ram0")
+        .map(|ram| crate::drivers::partition::classify(&*ram) == PartitionContent::PaghVolume)
+        .unwrap_or(false)
 }
 
 /// Every choice the menu offers: the caller's partitions, plus the RAM disk when
