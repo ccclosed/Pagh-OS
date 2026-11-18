@@ -92,6 +92,89 @@ pub fn login_creds(name: &str) -> Result<Creds, LoginError> {
     Creds::for_login(user.uid, user.gid, &supplementary).ok_or(LoginError::TooManyGroups)
 }
 
+/// `/etc/shadow` в VFS-пространстве shell (`docs/security/groups.md` §4a).
+///
+/// Отдельный файл, как в Linux: `/etc/passwd` остаётся читаемым всеми и не несёт
+/// хэшей, а shadow создаётся `provision.rs` с режимом `0600 root:root`.
+pub const SHADOW_PATH: &str = "/mnt/etc/shadow";
+
+/// Записи `/etc/shadow` (пусто, если файла нет или он не читается).
+pub fn load_shadow() -> Vec<super::shadow::ShadowEntry> {
+    super::shadow::parse_shadow(&read_text(SHADOW_PATH))
+}
+
+/// Совпадает ли `password` с паролем пользователя `name`.
+///
+/// Fail-closed: нет файла/записи, хэш закрыт (`!`/`*`) или метод не `$6$` —
+/// `false` (см. [`super::shadow::verify_password`]).
+pub fn verify_user_password(name: &str, password: &str) -> bool {
+    let entries = load_shadow();
+    let stored = super::shadow::hash_for(&entries, name).unwrap_or("");
+    super::shadow::verify_password(stored, password)
+}
+
+/// Задан ли у пользователя входной пароль (хэш есть и не закрыт)?
+pub fn has_password(name: &str) -> bool {
+    let entries = load_shadow();
+    !super::shadow::is_locked(super::shadow::hash_for(&entries, name).unwrap_or(""))
+}
+
+/// Записать новый пароль пользователя `name`.
+///
+/// Salt — 16 случайных байт (`misc::random_bytes_16`) в алфавите `crypt(3)`;
+/// формат — `$6$<salt>$<sha512-crypt>` (Linux-совместимый, см. `shadow.rs`).
+/// Пустой пароль отвергается: `passwd` не должен молча открыть учётку.
+/// Возвращает `false` на пустом пароле и на ошибке записи VFS.
+pub fn set_user_password(name: &str, password: &str) -> bool {
+    if password.is_empty() || password.len() > super::shadow::PASSWORD_MAX {
+        return false;
+    }
+    let salt = super::shadow::salt_from_bytes(&crate::arch::x86_64::linux::misc::random_bytes_16());
+    let hash = super::shadow::hash_password(password, &salt);
+    let text = read_text(SHADOW_PATH);
+    let next = super::shadow::set_password(&text, name, &hash);
+    write_text(SHADOW_PATH, &next)
+}
+
+/// Записать текст в файл VFS, создав его в родителе, если файла ещё нет.
+///
+/// Используется только для `/etc/shadow`: на дисках, провижиненных до появления
+/// shadow, файла нет, а `passwd` обязан работать и там.
+fn write_text(path: &str, text: &str) -> bool {
+    let (node, created) = match crate::vfs::lookup_path(path) {
+        Ok(node) => (node, false),
+        Err(_) => {
+            let Some((parent, leaf)) = path.rsplit_once('/') else {
+                return false;
+            };
+            if parent.is_empty() || leaf.is_empty() {
+                return false;
+            }
+            let Ok(dir) = crate::vfs::lookup_path(parent) else {
+                return false;
+            };
+            match dir.create_file(leaf) {
+                Ok(node) => (node, true),
+                Err(_) => return false,
+            }
+        }
+    };
+    if created {
+        // На диске, провижиненном до появления shadow, файла нет; создать его
+        // с дефолтным режимом значило бы положить хэши читаемыми всем. Права
+        // выставляются только новому файлу (существующий не трогаем) и отказ
+        // `set_owner`/`set_mode` — это отказ записи, а не «запишем как вышло».
+        if node.set_owner(0, 0).is_err() || node.set_mode(0o600).is_err() {
+            return false;
+        }
+    }
+    if crate::vfs::replace_contents(&node, text.as_bytes()).is_err() {
+        return false;
+    }
+    node.sync();
+    true
+}
+
 /// Файл, задающий **стартовую** идентичность shell (опция запуска desktop/
 /// autorun не от root).
 ///
@@ -227,6 +310,16 @@ pub fn session_groups() -> Vec<u32> {
         }
     }
     out
+}
+
+/// Имя записи `/etc/passwd` для uid; `None`, если записи нет.
+///
+/// В отличие от [`user_label`] не подставляет число: вызывающий (`passwd`)
+/// должен отличить «пользователь есть» от «uid без записи», а не писать
+/// пароль под именем `1000`.
+pub fn name_for_uid(uid: u32) -> Option<String> {
+    let users = load_users();
+    identity_db::user_name(&users, uid).map(String::from)
 }
 
 /// Имя пользователя по uid для вывода; числовая строка, если базы нет.

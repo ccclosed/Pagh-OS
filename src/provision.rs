@@ -48,6 +48,20 @@ input:x:105:oleg
 oleg:x:1000:
 ";
 
+/// `/etc/shadow` (не-root A4): парольные хэши отдельно от читаемого всеми
+/// `/etc/passwd`.
+///
+/// Обе учётки **закрыты** на свежем диске: `root:*` (root-консоль — kernel-код,
+/// пароль ей не нужен, а `su root` из не-root сессии без пароля был бы
+/// эскалацией) и `oleg:!` (вход открывается только явным
+/// `passwd oleg <новый пароль>`, а не угадываемым паролем по умолчанию).
+/// Формат — семь полей Linux; `passwd`/`login` читают его через
+/// `shell::shadow` (`$6$` SHA-512-crypt), остальные поля сохраняются.
+const SHADOW: &[u8] = b"\
+root:*:19000:0:99999:7:::
+oleg:!:19000:0:99999:7:::
+";
+
 fn ensure_dir(path: &str) -> Result<Arc<dyn VfsNode>, VfsError> {
     let mut node = crate::vfs::lookup_path("/")?;
     for part in path.split('/').filter(|part| !part.is_empty()) {
@@ -76,6 +90,34 @@ fn write_once(path: &str, data: &[u8]) -> Result<(), VfsError> {
     Ok(())
 }
 
+/// [`write_once`] с владельцем и режимом, выставленными **только** новому файлу.
+///
+/// Существующий файл не трогается вообще: пользователь мог сменить режим
+/// `/etc/shadow` (или содержимое), и boot-путь не должен молча возвращать свои
+/// права — та же политика, что у [`ensure_dir_owned`].
+fn write_once_owned(
+    path: &str,
+    data: &[u8],
+    uid: u32,
+    gid: u32,
+    mode: u32,
+) -> Result<(), VfsError> {
+    if crate::vfs::lookup_path(path).is_ok() {
+        return Ok(());
+    }
+    let split = path.rfind('/').ok_or(VfsError::InvalidArgument)?;
+    let parent = if split == 0 { "/" } else { &path[..split] };
+    let dir = ensure_dir(parent)?;
+    let file = dir.create_file(&path[split + 1..])?;
+    if file.write(0, data)? != data.len() {
+        return Err(VfsError::IoError);
+    }
+    file.set_owner(uid, gid)?;
+    file.set_mode(mode)?;
+    file.sync();
+    Ok(())
+}
+
 /// Создать каталог, если его нет, и сразу выставить владельца/режим **только**
 /// новому каталогу. Существующий каталог не трогается: пользователь мог
 /// переименовать/ужать его, и boot-путь не должен молча возвращать свои права.
@@ -99,6 +141,8 @@ fn seed_identity() -> Result<(), VfsError> {
     ensure_dir("/mnt/etc")?;
     write_once("/mnt/etc/passwd", PASSWD)?;
     write_once("/mnt/etc/group", GROUP)?;
+    // Хэши паролей — только root: 0600 root:root, как в Linux.
+    write_once_owned("/mnt/etc/shadow", SHADOW, 0, 0, 0o600)?;
     ensure_dir_owned("/mnt/home/oleg", 1000, gid::OLEG, 0o755)?;
     Ok(())
 }
