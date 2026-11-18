@@ -710,6 +710,17 @@ mod properties {
     // `p60` is the shutdown policy, so this is `p62`.
     mod p62;
 
+    // Non-root phase 2 (agent B): the sticky-directory deletion rule
+    // (`S_ISVTX`, /tmp 1777). Isolated from P56's ordinary permission matrix so
+    // that a regression in either rule names itself.
+    mod p63;
+
+    // Non-root phase 2 (agent B): the network admission policy — privileged
+    // `bind(2)` ports (`< 1024`, root only) and the `SOCK_RAW` gate. Pure
+    // decisions the AF_INET syscall path applies before touching the stack.
+    // `p60` is the shutdown policy, so this is `p64`.
+    mod p64;
+
     // Socket payload cap (`sendto`/`recvfrom`): the kernel validated with a
     // capped length and then allocated/copied the raw u64 count (2026-11-13
     // audit follow-up, F-x86v-1 allocation class). P57 pins the single policy.
