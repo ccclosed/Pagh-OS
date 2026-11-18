@@ -372,7 +372,17 @@ fn write_pipe(e: &PipeEndpoint, src: &[u8]) -> Result<usize, Errno> {
             PipeWriteResult::Data(n) => return Ok(n),
             PipeWriteResult::Broken => return Err(Errno::EPIPE),
             PipeWriteResult::WouldBlock if e.nonblocking() => return Err(Errno::EAGAIN),
-            PipeWriteResult::WouldBlock => crate::task::scheduler::yield_current(),
+            PipeWriteResult::WouldBlock => {
+                crate::task::scheduler::yield_current();
+                // Зеркало `read_pipe`: закрытие ПИШУЩЕГО fd из соседнего
+                // потока счётчики очереди не меняет, и без перепроверки
+                // владения этот `write` уступал бы CPU вечно — watchdog печатал
+                // `stuck in syscall ? (nr=1 arg0=0x3 closed)`.
+                match unix_sock::endpoint_write_verdict(e) {
+                    super::sock_wait::WriteVerdict::Continue => {}
+                    super::sock_wait::WriteVerdict::Ebadf => return Err(Errno::EBADF),
+                }
+            }
         }
     }
 }

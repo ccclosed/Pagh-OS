@@ -265,6 +265,16 @@ pub fn tcp_write(fd: u64, data: &[u8]) -> Result<usize, Errno> {
             return Err(Errno::EPIPE);
         }
         crate::task::scheduler::yield_current();
+        // Тот же вопрос, что у чтения: закрытый из соседнего потока дескриптор
+        // не меняет состояние TCP, поэтому без проверки владения ожидание было
+        // бы вечным (`stuck in syscall ? (nr=1 arg0=0x3 closed)`).
+        if !tcp_socket_owned(&sock) {
+            return if sent_all > 0 {
+                Ok(sent_all)
+            } else {
+                Err(Errno::EBADF)
+            };
+        }
     }
 }
 

@@ -648,6 +648,15 @@ pub fn sys_sendmsg(fd: u64, msg_addr: u64, flags: u64) -> Result<u64, Errno> {
                             break;
                         }
                         crate::task::scheduler::yield_current();
+                        // Закрытый из соседнего потока ПИШУЩИЙ fd очередь не
+                        // замечает (счётчики считают концы, а syscall держит
+                        // `Arc`): без этой перепроверки ожидание было бы вечным.
+                        if let super::sock_wait::WriteVerdict::Ebadf = endpoint_write_verdict(&tx) {
+                            if written == 0 {
+                                return Err(Errno::EBADF);
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -729,6 +738,15 @@ pub fn sys_sendto_unix(
                     };
                 }
                 crate::task::scheduler::yield_current();
+                // Пишущий fd закрыли из соседнего потока: очередь этого не
+                // заметит, а ждать больше некому (см. `endpoint_write_verdict`).
+                if let super::sock_wait::WriteVerdict::Ebadf = endpoint_write_verdict(&tx) {
+                    return if written == 0 {
+                        Err(Errno::EBADF)
+                    } else {
+                        Ok(written as u64)
+                    };
+                }
             }
         }
     }
@@ -814,6 +832,21 @@ pub(crate) fn endpoint_wait_verdict(rx: &PipeEndpoint) -> super::sock_wait::Wait
     // `None` (нет compat-состояния) — читать эту очередь больше некому: EBADF.
     let referenced = compat::with_current_compat(|cs| cs.fds.holds_read_end(id)).unwrap_or(false);
     super::sock_wait::wait_verdict(referenced, rx.writers())
+}
+
+/// Решение для блокирующей ЗАПИСИ, у которой очередь ответила `WouldBlock`.
+///
+/// Зеркало [`endpoint_wait_verdict`] с другой стороны: закрытие ПИШУЩЕГО fd из
+/// соседнего потока не меняет счётчики очереди (syscall держит её `Arc`), и без
+/// перепроверки владения `sendto`/`sendmsg`/`write` уступали бы CPU вечно —
+/// watchdog печатал `stuck in syscall ? (nr=1 arg0=0x3 closed)`. Уход пира
+/// (закрытие читающего fd или `shutdown(SHUT_RD)`) чинится сам: следующая
+/// перезапись отвечает `Broken`, то есть `EPIPE`.
+pub(crate) fn endpoint_write_verdict(tx: &PipeEndpoint) -> super::sock_wait::WriteVerdict {
+    let id = tx.queue_id();
+    // `None` (нет compat-состояния) — писать в эту очередь больше некому.
+    let referenced = compat::with_current_compat(|cs| cs.fds.holds_write_end(id)).unwrap_or(false);
+    super::sock_wait::write_verdict(referenced)
 }
 
 /// Куда свёлся `shutdown(2)`: подключённая AF_UNIX-пара или TCP.
