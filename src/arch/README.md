@@ -106,7 +106,12 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 - `page_fault_handler`: сначала пробует demand paging через `linux::mem_sys::handle_user_page_fault`;
   kernel-mode фолт → backtrace + halt; ring-3 фолт → SIGSEGV (код 139) и завершение виновной
   задачи — **всегда**, в том числе у нативной ring-3 задачи без `CompatState` (S4b: раньше
-  такой отказ уходил в `halt()` и уносил машину).
+  такой отказ уходил в `halt()` и уносил машину). Ring-3 отказ обслуживается demand paging'ом
+  **безусловно**: он не может быть повторным входом в `COMPAT_STATES` (пользовательский код
+  исполняется только вне замыкания), а учёт глубины — `compat_guard::CompatEntry` с pid
+  владельца, поэтому вытесненный тиком владелец не отказывает посторонней задаче
+  (`trap_frame::pf_registry_must_refuse`, host-свойство `pf_guard_reentry`). Guard остаётся
+  только для kernel-mode отказа на стеке задачи, чьё собственное замыкание удерживает реестр.
 - `gp_fault_handler` дамплит слова вокруг RSP (с проверкой `virt_to_phys`, чтобы не каскадить
   PF на guard-странице).
 - **Политика пользовательских исключений (см. `SECURITY.md`).** `#DE`/`#DB`/`#UD`/`#OF`/`#BR`/
