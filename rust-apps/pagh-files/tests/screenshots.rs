@@ -12,38 +12,38 @@ use pagh_ui::testkit;
 fn main_scene_matches_golden() {
     let canvas = screenshots::main_scene();
     assert_eq!(canvas.size(), screenshots::DESKTOP);
-    testkit::assert_golden("files-main", &canvas, 0x8506_b68f_c1a1_8cf3);
+    testkit::assert_golden("files-main", &canvas, 0x827c_541c_3a94_34ad);
 }
 
 #[test]
 fn context_menu_scene_matches_golden() {
     let canvas = screenshots::context_menu_scene();
     assert_eq!(canvas.size(), Size::new(1280, 800));
-    testkit::assert_golden("files-context-menu", &canvas, 0xa65c_fc02_cb3e_103a);
+    testkit::assert_golden("files-context-menu", &canvas, 0xaf07_d77b_196b_823c);
 }
 
 #[test]
 fn properties_scene_matches_golden() {
     let canvas = screenshots::properties_scene();
-    testkit::assert_golden("files-properties", &canvas, 0xbe5c_b8fb_c32e_1123);
+    testkit::assert_golden("files-properties", &canvas, 0xe036_72a8_25e7_47f1);
 }
 
 #[test]
 fn list_view_scene_matches_golden() {
     let canvas = screenshots::list_view_scene();
-    testkit::assert_golden("files-list-view", &canvas, 0x7e05_2ecc_5447_ac3f);
+    testkit::assert_golden("files-list-view", &canvas, 0x4029_6709_60c1_aff5);
 }
 
 #[test]
 fn search_scene_matches_golden() {
     let canvas = screenshots::search_scene();
-    testkit::assert_golden("files-search", &canvas, 0x8677_65d5_35f5_fe62);
+    testkit::assert_golden("files-search", &canvas, 0xc5f1_0a3a_77df_1ad8);
 }
 
 #[test]
 fn empty_folder_scene_matches_golden() {
     let canvas = screenshots::empty_folder_scene();
-    testkit::assert_golden("files-empty", &canvas, 0xd350_57e8_1dc1_67e3);
+    testkit::assert_golden("files-empty", &canvas, 0x6406_a7a6_3c3d_b6f9);
 }
 
 #[test]

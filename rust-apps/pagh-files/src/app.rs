@@ -62,6 +62,34 @@ enum ToolbarButton {
     Kebab,
 }
 
+/// Откуда берётся путь пункта боковой панели.
+///
+/// Это не косметика: от вида зависит, что приложение имеет право делать с
+/// путём при старте. Каталоги пользователя (`xdg-user-dirs`) создаются, а
+/// устройство — только проверяется на существование; выдумывать точку
+/// монтирования нельзя.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PlaceKind {
+    /// Домашний каталог (`$HOME`).
+    Home,
+    /// Каталог пользователя: `Desktop`, `Documents`, … — канонические имена
+    /// XDG. Отсутствующий создаётся при старте (так же поступает
+    /// `xdg-user-dirs-update`), иначе клик вёл бы в несуществующий путь.
+    UserDir,
+    /// Корзина: реальный каталог `$HOME/.local/share/Trash/files`. Создаётся
+    /// при старте, как и каталоги пользователя. Files этой версии удаляет
+    /// безвозвратно, поэтому корзина может быть пуста — но это настоящий
+    /// каталог, а не выдуманный листинг.
+    Trash,
+    /// Сеть: виртуальная точка входа. Сетевого ФС-бэкенда у Files нет, и
+    /// придумывать содержимое нельзя, поэтому пункт открывается с честным
+    /// «нет сетевых ресурсов», а не с ошибкой или фальшивым списком.
+    Network,
+    /// Устройство: реальная точка монтирования VFS. Пункт показывается,
+    /// только если путь разрешается.
+    Device,
+}
+
 /// Пункт боковой панели.
 #[derive(Clone, Debug)]
 pub struct Place {
@@ -69,6 +97,7 @@ pub struct Place {
     pub label: String,
     pub icon: Icon,
     pub path: String,
+    pub kind: PlaceKind,
 }
 
 /// Что находится в фокусе клавиатуры.
@@ -167,6 +196,9 @@ pub struct FilesApp {
     status: Status,
     message: Option<String>,
     error: Option<String>,
+    /// Пояснение к пустой области содержимого вместо «Папка пуста» — сейчас
+    /// это только виртуальная «Сеть» без бэкенда.
+    notice: Option<String>,
 }
 
 impl FilesApp {
@@ -207,7 +239,13 @@ impl FilesApp {
             status: Status::default(),
             message: None,
             error: None,
+            notice: None,
         };
+        // Устройства — только те точки монтирования, что разрешаются в этой
+        // ФС; каталоги пользователя доводим до существующих (см. PlaceKind).
+        app.prune_missing_devices();
+        app.ensure_user_dirs();
+        app.sidebar = build_sidebar(&app.places);
         app.reload();
         app
     }
@@ -421,6 +459,58 @@ impl FilesApp {
         self.history_pos + 1 < self.history.len()
     }
 
+    /// Оставить в «Устройствах» только реально смонтированные точки.
+    ///
+    /// Таблица монтирования ядра (`/proc/mounts`) приложению недоступна на
+    /// хосте, а путь в VFS — общий признак для гостя и хоста: устройство,
+    /// которое не разрешается, не показываем вместо того, чтобы вести клик в
+    /// несуществующий каталог.
+    fn prune_missing_devices(&mut self) {
+        let mut kept = Vec::with_capacity(self.places.len());
+        for place in self.places.drain(..) {
+            if place.kind == PlaceKind::Device && !self.vfs.exists(&place.path) {
+                continue;
+            }
+            kept.push(place);
+        }
+        self.places = kept;
+    }
+
+    /// Создать отсутствующие каталоги пользователя (`Desktop`, `Documents`, …).
+    ///
+    /// Это поведение `xdg-user-dirs-update`: клик по пункту боковой панели
+    /// должен открывать каталог, а не показывать ошибку. Создаём только пути
+    /// из [`PlaceKind::UserDir`] (внутри `$HOME`); устройства и корень не
+    /// трогаем. Если ФС только для чтения, `mkdir` не удастся — пункт останется
+    /// и честно покажет ошибку открытия.
+    fn ensure_user_dirs(&mut self) {
+        let paths: Vec<String> = self
+            .places
+            .iter()
+            .filter(|place| matches!(place.kind, PlaceKind::UserDir | PlaceKind::Trash))
+            .map(|place| place.path.clone())
+            .collect();
+        for path in paths {
+            self.ensure_dir_all(&path);
+        }
+    }
+
+    /// `mkdir -p`: создать каждый отсутствующий компонент пути.
+    fn ensure_dir_all(&mut self, path: &str) {
+        let normalized = vfs::normalize(path);
+        let mut prefix = String::new();
+        for part in normalized.split('/').filter(|part| !part.is_empty()) {
+            prefix.push('/');
+            prefix.push_str(part);
+            if self.vfs.exists(&prefix) {
+                continue;
+            }
+            // Ошибку не разыгрываем: пункт остаётся, а клик по нему покажет
+            // настоящее «Не удалось открыть папку: …» из read_dir.
+            let _ = self.vfs.mkdir(&prefix);
+        }
+    }
+
     /// Перечитать каталог и пересчитать статус.
     pub fn reload(&mut self) {
         self.sidebar_selected = self
@@ -428,6 +518,21 @@ impl FilesApp {
             .iter()
             .find(|place| vfs::normalize(&place.path) == self.cwd)
             .map(|place| place.id);
+        // «Сеть» — виртуальная точка: читать её из VFS значило бы показать
+        // «Не удалось открыть папку». Сетевого бэкенда нет, поэтому содержимое
+        // пустое и об этом сказано прямо; выдуманных ресурсов здесь нет.
+        let virtual_network = self
+            .places
+            .iter()
+            .any(|place| place.kind == PlaceKind::Network && vfs::normalize(&place.path) == self.cwd);
+        if virtual_network {
+            self.all_entries.clear();
+            self.error = None;
+            self.notice = Some("Нет сетевых ресурсов".to_string());
+            self.apply_filter_sort();
+            return;
+        }
+        self.notice = None;
         match self.vfs.read_dir(&self.cwd) {
             Ok(entries) => {
                 self.all_entries = entries;
@@ -1103,7 +1208,9 @@ impl FilesApp {
                 return;
             }
             if self.entries.is_empty() {
-                let text = if self.search.is_empty() {
+                let text = if let Some(notice) = &self.notice {
+                    notice.clone()
+                } else if self.search.is_empty() {
                     "Папка пуста".to_string()
                 } else {
                     format!("Ничего не найдено по запросу «{}»", self.search.text())
@@ -2000,6 +2107,20 @@ fn clamp_menu_origin(theme: &Theme, menu: &Menu, origin: Point, bounds: Rect) ->
     Point::new(x, y)
 }
 
+/// Точки входа боковой панели.
+///
+/// Каталоги пользователя — канонические имена XDG (`Desktop`, `Documents`,
+/// `Downloads`, `Pictures`, `Music`, `Videos`); отсутствующие Files создаёт при
+/// старте. «Корзина» — настоящий `~/.local/share/Trash/files` (тоже создаётся):
+/// удаление в этой версии безвозвратное (`unlink`), поэтому каталог обычно пуст,
+/// но это реальный путь, а не выдумка. «Сеть» — виртуальная точка: сетевого
+/// ФС-бэкенда в Files нет, поэтому она открывается пустой с честным
+/// «Нет сетевых ресурсов» (см. [`FilesApp::reload`]), без фальшивого листинга.
+///
+/// Устройства — реальные точки монтирования Pagh: `/` — корень VFS, `/mnt` —
+/// смонтированный ext2 (см. `boot.rs`); пункт, которого нет в VFS, отсеивает
+/// [`FilesApp::prune_missing_devices`]. Ни `/boot`, ни `/mnt/basic` в дереве
+/// ядра не существуют, поэтому их здесь нет.
 fn default_places(home: &str) -> Vec<Place> {
     vec![
         Place {
@@ -2007,72 +2128,77 @@ fn default_places(home: &str) -> Vec<Place> {
             label: "Домашняя папка".to_string(),
             icon: Icon::Home,
             path: home.to_string(),
+            kind: PlaceKind::Home,
         },
         Place {
             id: 2,
             label: "Рабочий стол".to_string(),
             icon: Icon::Folder,
             path: vfs::join(home, "Desktop"),
+            kind: PlaceKind::UserDir,
         },
         Place {
             id: 3,
             label: "Документы".to_string(),
             icon: Icon::Folder,
             path: vfs::join(home, "Documents"),
+            kind: PlaceKind::UserDir,
         },
         Place {
             id: 4,
             label: "Загрузки".to_string(),
             icon: Icon::Folder,
             path: vfs::join(home, "Downloads"),
+            kind: PlaceKind::UserDir,
         },
         Place {
             id: 5,
             label: "Изображения".to_string(),
             icon: Icon::Folder,
             path: vfs::join(home, "Pictures"),
+            kind: PlaceKind::UserDir,
         },
         Place {
             id: 6,
             label: "Музыка".to_string(),
             icon: Icon::Folder,
             path: vfs::join(home, "Music"),
+            kind: PlaceKind::UserDir,
         },
         Place {
             id: 7,
             label: "Видео".to_string(),
             icon: Icon::Folder,
             path: vfs::join(home, "Videos"),
+            kind: PlaceKind::UserDir,
         },
         Place {
             id: 8,
             label: "Корзина".to_string(),
             icon: Icon::Trash,
-            path: vfs::join(home, ".local/share/Trash"),
+            path: vfs::join(home, ".local/share/Trash/files"),
+            kind: PlaceKind::Trash,
         },
         Place {
             id: 9,
             label: "Сеть".to_string(),
             icon: Icon::Network,
             path: "/network".to_string(),
+            kind: PlaceKind::Network,
         },
         Place {
             id: 10,
-            label: "boot".to_string(),
+            label: "root".to_string(),
             icon: Icon::Device,
-            path: "/boot".to_string(),
+            path: "/".to_string(),
+            kind: PlaceKind::Device,
         },
         Place {
             id: 11,
             label: "Basic data partition".to_string(),
             icon: Icon::Device,
-            path: "/mnt/basic".to_string(),
-        },
-        Place {
-            id: 12,
-            label: "root".to_string(),
-            icon: Icon::Device,
-            path: "/".to_string(),
+            path: "/mnt".to_string(),
+            kind: PlaceKind::Device,
         },
     ]
 }
@@ -2084,10 +2210,13 @@ fn build_sidebar(places: &[Place]) -> List {
             .map(|place| ListItem::new(place.id, place.label.clone()).with_icon(place.icon))
             .collect()
     };
-    List::new()
+    let mut list = List::new()
         .section("ТОЧКИ ВХОДА", entry_items(&[1, 2, 3, 4, 5, 6, 7, 8]))
         .section("В СЕТИ", entry_items(&[9]))
-        .section("УСТРОЙСТВА", entry_items(&[10, 11, 12]))
+        .section("УСТРОЙСТВА", entry_items(&[10, 11]));
+    // Пустая секция «УСТРОЙСТВА» (диск не смонтирован) не рисуется.
+    list.sections.retain(|section| !section.items.is_empty());
+    list
 }
 
 const HTML_TEMPLATE: &str = "<!DOCTYPE html>\n<html lang=\"ru\">\n<head>\n  <meta charset=\"utf-8\">\n  <title>Новая страница</title>\n</head>\n<body>\n\n</body>\n</html>\n";
@@ -2096,3 +2225,208 @@ const URL_TEMPLATE: &str = "[InternetShortcut]\nURL=https://\n";
 
 const DESKTOP_TEMPLATE: &str =
     "[Desktop Entry]\nType=Application\nName=Новое приложение\nExec=\nIcon=\n";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fake::FakeVfs;
+    use crate::host_vfs::HostVfs;
+
+    const SIZE: Size = Size::new(1060, 640);
+    /// Канонические каталоги пользователя, которые Files обязан создать.
+    const USER_DIRS: [&str; 6] = [
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Pictures",
+        "Music",
+        "Videos",
+    ];
+
+    fn click_place(app: &mut FilesApp, label: &str) -> String {
+        let place = app
+            .places()
+            .iter()
+            .find(|place| place.label == label)
+            .unwrap_or_else(|| panic!("нет пункта {label:?}"))
+            .clone();
+        let rect = app
+            .layout()
+            .sidebar_list
+            .rect_of(place.id)
+            .unwrap_or_else(|| panic!("пункт {label:?} не разложен"));
+        app.handle_event(&Event::MouseDown {
+            pos: rect.center(),
+            button: MouseButton::Left,
+        });
+        place.path
+    }
+
+    fn temp_home(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "pagh-files-nav-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// Мёртвых пунктов прежней модели нет: ни `/boot`, ни `/mnt/basic`, а
+    /// «Корзина» ведёт в настоящий `Trash/files` (не в `Trash`-каталог) и
+    /// «Сеть» — в виртуальную точку, а не в несуществующий каталог VFS.
+    #[test]
+    fn places_have_no_dead_targets() {
+        let app = FilesApp::new(Box::new(FakeVfs::new()), SIZE);
+        let home = app.home();
+
+        let trash = app.places().iter().find(|p| p.label == "Корзина").unwrap();
+        assert_eq!(trash.path, format!("{home}/.local/share/Trash/files"));
+        assert_eq!(trash.kind, PlaceKind::Trash);
+
+        let network = app.places().iter().find(|p| p.label == "Сеть").unwrap();
+        assert_eq!(network.path, "/network");
+        assert_eq!(network.kind, PlaceKind::Network);
+
+        for place in app.places() {
+            assert_ne!(place.path, "/boot");
+            assert_ne!(place.path, "/mnt/basic");
+            assert!(!place.path.ends_with("/Trash"), "{}", place.label);
+        }
+
+        // Каталоги пользователя и корзина живут под `$HOME`.
+        for place in app
+            .places()
+            .iter()
+            .filter(|p| matches!(p.kind, PlaceKind::Home | PlaceKind::UserDir | PlaceKind::Trash))
+        {
+            assert!(
+                place.path == home || place.path.starts_with(&format!("{home}/")),
+                "{} вне дома: {}",
+                place.label,
+                place.path
+            );
+        }
+    }
+
+    /// Клик по каждому пункту «Точек входа» переходит в его каталог, а не
+    /// оставляет окно на месте и не показывает ошибку.
+    #[test]
+    fn sidebar_click_navigates_to_existing_directory() {
+        let mut app = FilesApp::new(Box::new(FakeVfs::new()), SIZE);
+        for label in [
+            "Домашняя папка",
+            "Рабочий стол",
+            "Документы",
+            "Загрузки",
+            "Изображения",
+            "Музыка",
+            "Видео",
+            "Корзина",
+        ] {
+            let path = click_place(&mut app, label);
+            assert_eq!(app.cwd(), path, "{label}");
+            assert!(app.error().is_none(), "{label}: {:?}", app.error());
+            assert_eq!(app.location_label(), label);
+        }
+    }
+
+    /// «Сеть» без бэкенда — пустая область с честной строкой, без ошибки
+    /// открытия и без выдуманных ресурсов.
+    #[test]
+    fn network_place_is_empty_and_honest() {
+        let mut app = FilesApp::new(Box::new(FakeVfs::new()), SIZE);
+        let path = click_place(&mut app, "Сеть");
+        assert_eq!(path, "/network");
+        assert_eq!(app.cwd(), "/network");
+        assert!(app.error().is_none());
+        assert_eq!(app.notice.as_deref(), Some("Нет сетевых ресурсов"));
+        assert!(app.entries().is_empty());
+
+        let mut canvas = Canvas::filled(app.size().w, app.size().h, Color::hex(0x101010));
+        app.draw(&mut canvas);
+    }
+
+    /// Уход из «Сети» в обычный каталог снимает пояснение.
+    #[test]
+    fn leaving_network_clears_notice() {
+        let mut app = FilesApp::new(Box::new(FakeVfs::new()), SIZE);
+        click_place(&mut app, "Сеть");
+        assert!(app.notice.is_some());
+        click_place(&mut app, "Документы");
+        assert!(app.notice.is_none());
+    }
+
+    /// На реальной ФС отсутствующие XDG-каталоги создаются при старте, поэтому
+    /// клик открывает (пустой) существующий каталог; появившийся файл виден
+    /// после перечитывания.
+    #[test]
+    fn missing_user_dirs_are_created_and_listed() {
+        let home = temp_home("create");
+        let mut app = FilesApp::new(
+            Box::new(HostVfs::with_home(home.to_string_lossy())),
+            SIZE,
+        );
+        for name in USER_DIRS {
+            let path = home.join(name);
+            assert!(path.is_dir(), "не создан {path:?}");
+        }
+        // Корзина — тоже настоящий каталог (`Trash/files`), созданный при
+        // старте, поэтому клик по пункту не показывает ошибку.
+        assert!(home.join(".local/share/Trash/files").is_dir());
+
+        let path = click_place(&mut app, "Документы");
+        assert_eq!(app.cwd(), path);
+        assert!(app.error().is_none(), "{:?}", app.error());
+        assert!(app.entries().is_empty(), "новый каталог должен быть пуст");
+
+        std::fs::write(home.join("Documents").join("план.txt"), b"ok").unwrap();
+        app.reload();
+        let names: Vec<&str> = app.entries().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["план.txt"]);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Несуществующий путь — честная ошибка в области содержимого, а не
+    /// фальшивый листинг; отрисовка окна при этом не падает.
+    #[test]
+    fn missing_directory_reports_error_instead_of_fake_listing() {
+        let mut app = FilesApp::new(Box::new(FakeVfs::new()), SIZE);
+        app.navigate_to("/home/user/Нет-такой-папки");
+        assert!(app.entries().is_empty());
+        assert_eq!(app.error(), Some("объект не найден"));
+
+        let mut canvas = Canvas::filled(app.size().w, app.size().h, Color::hex(0x101010));
+        app.draw(&mut canvas);
+    }
+
+    /// «Устройства» — реальные точки монтирования: без `/mnt` пункт не
+    /// показывается, корень остаётся.
+    #[test]
+    fn unmounted_device_is_not_shown() {
+        let mut vfs = FakeVfs::new();
+        vfs.unlink("/mnt/basic").unwrap();
+        vfs.unlink("/mnt").unwrap();
+        let app = FilesApp::new(Box::new(vfs), SIZE);
+        assert!(app.places().iter().any(|place| place.path == "/"));
+        assert!(!app.places().iter().any(|place| place.path == "/mnt"));
+        assert!(!app
+            .places()
+            .iter()
+            .any(|place| place.kind == PlaceKind::Device && place.path == "/mnt"));
+    }
+
+    /// Смонтированный `/mnt` показывается и открывается.
+    #[test]
+    fn mounted_device_opens() {
+        let mut app = FilesApp::new(Box::new(FakeVfs::new()), SIZE);
+        assert!(app.places().iter().any(|place| place.path == "/mnt"));
+        let path = click_place(&mut app, "Basic data partition");
+        assert_eq!(path, "/mnt");
+        assert_eq!(app.cwd(), "/mnt");
+        assert!(app.error().is_none(), "{:?}", app.error());
+    }
+}
