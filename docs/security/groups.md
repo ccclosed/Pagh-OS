@@ -30,7 +30,8 @@ pub struct Creds {
 * `Creds::ROOT` — идентичность каждого процесса, порождённого ядром; набор
   дополнительных групп пуст.
 * Дополнительные группы — часть `CompatState::creds`, поэтому `fork`/`clone`
-  копируют их, а `execve` сохраняет (setuid-бинари не моделируются).
+  копируют их; `execve` сохраняет их и на setuid-файле (Linux тоже не сбрасывает
+  supplementary-набор — это делает `su`/`login` явным `setgroups(2)`).
 * `Creds::in_group(gid)` истинно, когда `gid == egid` **или** `gid` есть в
   дополнительном наборе. Real `gid` сам по себе группового класса не даёт:
   Linux решает по effective id, а `setgroups(2)` меняет общий набор.
@@ -253,9 +254,12 @@ Shell хранит сессионные креденшелы (`src/shell/identit
   сложности и сроков нет, `wheel`-гейта нет. Встроенные команды shell всё равно
   исполняются ring 0 (§4), поэтому `su` — честная проверка пароля для смены
   идентичности `lxrun`-процессов, но **не** граница безопасности самого shell.
-* **Нет setuid-бинарей и capabilities.** `execve` никогда не меняет ids;
-  повышения прав через файл нет. `chown`/`chmod` остаются root-или-владелец,
-  как раньше.
+* **Setuid/setgid-on-exec есть, полной политики нет.** Успешный `execve` применяет
+  `S_ISUID`/`S_ISGID` (`euid`/`egid` и соответствующие saved id у владельца образа;
+  real id и дополнительные группы не меняются), неудачный — ids не трогает. Нет
+  `MS_NOSUID`-монтирований, `ptrace(2)`/`dumpable` и `execveat`, поэтому бит решает
+  только inode; setuid-root требует root (`chown` только root, `chmod` — владелец или
+  root). Capabilities по-прежнему нет.
 * **Нет login/session manager.** Один console-shell; нет `getty`, нет
   per-user сессий, нет `utmp`.
 * **`su` не понижает сам shell** (см. §4): встроенные команды остаются root.
@@ -300,11 +304,11 @@ Shell хранит сессионные креденшелы (`src/shell/identit
    только из уже запущенной console-shell), PAM-подобный минимум (`login.defs`,
    сроки, блокировки, число попыток), `su` в `wheel`, аудит попыток. Только
    после этого `su` станет настоящим входом, а не сменой идентичности shell.
-2. **Setuid/setgid-бинари.** `execve` читает `S_ISUID`/`S_ISGID` под
-   `nosuid`-политикой монтирования, выставляет `euid`/`egid`/saved ids и
-   сбрасывает дополнительные группы для setuid-root; аудит всех путей
-   (symlink, `O_PATH`, `execveat`). До этого — запрет на установку таких битов
-   из пакетов.
+2. **Setuid/setgid-бинари — частично сделано (A1).** Успешный `execve` уже
+   применяет `S_ISUID`/`S_ISGID` (`Creds::exec_setid`), real id и дополнительные
+   группы сохраняются. Остаётся: `nosuid`-политика монтирования, сброс
+   дополнительных групп для setuid-root, `ptrace`/`dumpable`, аудит всех путей
+   (symlink, `O_PATH`, `execveat`) и запрет на установку таких битов из пакетов.
 3. **Capabilities.** Разложить root-модель на минимальные наборы:
    `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH` (root bypass), `CAP_SETGID`/
    `CAP_SETUID`, `CAP_CHOWN`/`CAP_FOWNER`, `CAP_SYS_TTY_CONFIG`. `wheel` (gid 10)

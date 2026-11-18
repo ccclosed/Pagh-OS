@@ -138,9 +138,11 @@ kernel-e2e-legacy -> tools/e2e_*.ps1         # Windows-only legacy harnesses (ne
     same style voluntarily — keep it).
 11. **Учётные данные — состояние слоя сисколлов, никогда не политика VFS.**
     `CompatState::creds` (`src/task/compat.rs`) — единственный владелец шести ids процесса;
-    стартует как `Creds::ROOT`, наследуется `fork`/`clone` и сохраняется `execve`
-    (setuid-бинарники не моделируются). Чистые решения живут в
-    `src/arch/x86_64/linux/cred.rs` (host-свойство P56). Инварианты:
+    стартует как `Creds::ROOT`, наследуется `fork`/`clone`, а успешный `execve` применяет
+    `S_ISUID`/`S_ISGID` (`Creds::exec_setid`, как `bprm_fill_uid()` в Linux): `euid`/`egid`
+    и соответствующие saved id берутся у владельца образа, real id и дополнительные
+    группы не меняются, неудачный exec ids не трогает. Чистые решения живут в
+    `src/arch/x86_64/linux/cred.rs` (host-свойства P56/P59). Инварианты:
     * `VfsNode` несёт только метаданные (`mode`/`owner`/`set_mode`/`set_owner`). Никогда не
       добавляйте проверку учётных данных внутрь реализации `VfsNode` — boot provisioning,
       установщик пакетов и shell вызывают VFS напрямую и должны работать без идентичности.
@@ -446,11 +448,18 @@ slice 4; 2.10.0 — procfs slice 3; 2.9.x — правда о памяти и `/
 - Учётные данные процессов и права файловой системы реализованы (контракт
   `docs/security-model.md`): per-process real/effective/saved uid+gid в `CompatState`,
   семейство `set*id`, проверки owner/group/other на `open`, `execve`, мутациях каталогов,
-  `chmod`/`chown` и `kill`, плюс write-back ext2 `i_mode`/`i_uid`/`i_gid`. Чего всё ещё
-  нет и что названо в `SECURITY.md`: логина/аккаунтов (shell и все порождённые ядром
-  процессы стартуют root), повышения через setuid-бинарники на `execve`, дополнительных
-  групп/ACL/`fsuid`, наборов capabilities/seccomp/LSM/audit, проверок sticky-бита и
-  владельца каталога; синтетические узлы (`/dev`, `/proc`, ramfs) не могут сохранить
-  владельца и держат исторический per-process override для `stat`; SMEP — единственная
-  аппаратная митигация (SMAP/KPTI отсутствуют). `access(2)` проверяет real ids; `stat`
-  сообщает реальные метаданные inode.
+  `chmod`/`chown` и `kill`, write-back ext2 `i_mode`/`i_uid`/`i_gid`, дополнительные
+  группы (до 32, nr 115/116) и setuid/setgid-on-exec (`S_ISUID`/`S_ISGID` ставят
+  `euid`/`egid` и соответствующие saved id по владельцу образа; real id и группы
+  сохраняются). Вход и пароли появились частично: `/etc/passwd` + `/etc/group` +
+  `/etc/shadow` (`0600 root:root`, `$6$` SHA-512-crypt, fail-closed проверка),
+  `su`/`login` с паролем цели, `passwd`, `whoami` и опция `/etc/pagh-session` для
+  не-root сессии. Чего всё ещё нет и что названо в `docs/security-model.md`:
+  `getty`/PAM и per-user сессий (`su` из root-сессии пароля не спрашивает, как в Linux;
+  shell-встроенные команды остаются ring 0), `login.defs`, блокировок после N неудачных
+  попыток, `wheel`-гейта для `su`, аудита попыток входа, ACL/`fsuid`, наборов
+  capabilities/seccomp/LSM, `MS_NOSUID`/`ptrace`/`dumpable` для setuid-модели, проверок
+  sticky-бита и владельца каталога; синтетические узлы (`/dev`, `/proc`, ramfs) не могут
+  сохранить владельца и держат исторический per-process override для `stat`; SMEP —
+  единственная аппаратная митигация (SMAP/KPTI отсутствуют). `access(2)` проверяет real
+  ids; `stat` сообщает реальные метаданные inode.
