@@ -141,6 +141,97 @@ impl Canvas {
         self.clip.iter().any(|r| r.contains(p))
     }
 
+    /// Пересекается ли текущее отсечение с прямоугольником.
+    ///
+    /// Нужен горячим проходам, которые дороже своего пикселя: если damage не
+    /// задевает слой (например, тень окна при движении курсора), проход можно
+    /// не начинать вовсе.
+    pub fn clip_intersects(&self, rect: Rect) -> bool {
+        if !self.clip_active {
+            return true;
+        }
+        self.clip
+            .iter()
+            .any(|clip| clip.intersection(rect).is_some())
+    }
+
+    /// Интервалы строки `y` в диапазоне `x0..x1`, покрытые клипом.
+    ///
+    /// Возвращает `None`, если клипов больше, чем помещается в `out` — тогда
+    /// вызывающий обязан пойти старым попиксельным путём с `in_clip`.
+    /// Возвращённые интервалы отсортированы и не пересекаются: пиксель не
+    /// обрабатывается дважды даже на перекрывающихся damage-прямоугольниках.
+    fn clip_spans(&self, y: i32, x0: i32, x1: i32, out: &mut [(i32, i32)]) -> Option<usize> {
+        if y < 0 || y >= self.height as i32 || x1 <= x0 {
+            return Some(0);
+        }
+        if !self.clip_active {
+            let a = x0.max(0);
+            let b = x1.min(self.width as i32);
+            if a >= b {
+                return Some(0);
+            }
+            out[0] = (a, b);
+            return Some(1);
+        }
+        let mut n = 0usize;
+        for clip in &self.clip {
+            if y < clip.y || y >= clip.bottom() {
+                continue;
+            }
+            let a = x0.max(clip.x);
+            let b = x1.min(clip.right());
+            if a >= b {
+                continue;
+            }
+            if n == out.len() {
+                return None;
+            }
+            out[n] = (a, b);
+            n += 1;
+        }
+        // n <= out.len() и в out помещаются все интервалы: сортировка и
+        // слияние по месту (в кадре обычно 1-4 интервала).
+        out[..n].sort_unstable_by_key(|span| span.0);
+        let mut merged = 0usize;
+        for index in 0..n {
+            let (a, b) = out[index];
+            if merged > 0 && a <= out[merged - 1].1 {
+                out[merged - 1].1 = out[merged - 1].1.max(b);
+            } else {
+                out[merged] = (a, b);
+                merged += 1;
+            }
+        }
+        Some(merged)
+    }
+
+    /// Смешать `color` с `opacity` в горизонтальном интервале строки.
+    ///
+    /// В отличие от попиксельного [`Canvas::blend`], отсечение пересекается со
+    /// строкой один раз (спаны), а не проверяется на каждый пиксель. Так
+    /// рисуются кэшированные тени окон: damage в 16×23 пикселя курсора больше
+    /// не обходит всю площадь тени.
+    pub fn blend_span(&mut self, y: i32, x0: i32, x1: i32, color: Color, opacity: u8) {
+        let mut spans = [(0i32, 0i32); 8];
+        match self.clip_spans(y, x0, x1, &mut spans) {
+            Some(count) => {
+                let row = y as usize * self.width as usize;
+                for &(a, b) in &spans[..count] {
+                    for x in a..b {
+                        let index = row + x as usize;
+                        self.pixels[index] = color::blend(self.pixels[index], color, opacity);
+                    }
+                }
+            }
+            None => {
+                for x in x0..x1 {
+                    self.blend(x, y, color, opacity);
+                }
+            }
+        }
+    }
+
     /// Сколько пикселей `rect` реально попадёт в холст при текущем отсечении.
     ///
     /// Нужно счётчикам `timing`: считать площадь всего запрошенного
@@ -326,9 +417,8 @@ impl Canvas {
         if x1 <= x0 {
             return;
         }
-        for x in x0..x1 {
-            self.blend(x, y, color, 255);
-        }
+        // Строка — это один спан: clip пересекается один раз, а не на пиксель.
+        self.blend_span(y, x0, x1, color, 255);
     }
 
     pub fn vline(&mut self, x: i32, y0: i32, y1: i32, color: Color) {
@@ -710,6 +800,30 @@ mod tests {
         c.clear_clip();
         c.put(0, 0, rgb(7, 7, 7));
         assert_eq!(c.get(0, 0), rgb(7, 7, 7));
+    }
+
+    #[test]
+    fn blend_span_matches_per_pixel_blend_under_overlapping_clips() {
+        // Спаны сливают перекрывающиеся damage-прямоугольники, поэтому пиксель
+        // в пересечении двух клипов смешивается один раз, как и в старом
+        // попиксельном `blend`/`in_clip`.
+        let mut fast = Canvas::new(20, 3, rgb(10, 20, 30));
+        let mut slow = Canvas::new(20, 3, rgb(10, 20, 30));
+        let clips = [Rect::new(2, 0, 10, 2), Rect::new(6, 1, 10, 2)];
+        fast.set_clip(&clips);
+        slow.set_clip(&clips);
+        fast.blend_span(1, 0, 20, rgb(200, 100, 50), 77);
+        for x in 0..20 {
+            slow.blend(x, 1, rgb(200, 100, 50), 77);
+        }
+        assert_eq!(fast.pixels(), slow.pixels());
+
+        // Спан, выходящий за холст, обрезается по bounds, а не заворачивает строку.
+        let mut edge = Canvas::new(5, 2, rgb(1, 2, 3));
+        edge.blend_span(0, -3, 8, rgb(9, 9, 9), 255);
+        assert_eq!(edge.get(0, 0), rgb(9, 9, 9));
+        assert_eq!(edge.get(4, 0), rgb(9, 9, 9));
+        assert_eq!(edge.get(0, 1), rgb(1, 2, 3));
     }
 
     #[test]
