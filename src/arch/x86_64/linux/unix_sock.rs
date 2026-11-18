@@ -246,18 +246,71 @@ pub fn sys_getsockname(fd: u64, addr: u64, addrlen_ptr: u64) -> Result<u64, Errn
     Ok(0)
 }
 
-/// `setsockopt` (54): принимается и игнорируется. У ядерной пары AF_UNIX нет
-/// настраиваемых ручек (ни размеров буферов, ни передачи креденшелов), а libuv
-/// ставит на свои pipe только косметические опции; сообщить успех — то
-/// Linux-видимое поведение, которого ждут вызывающие.
+/// `SO_RCVTIMEO` (`include/uapi/asm-generic/socket.h`).
+const SO_RCVTIMEO: u64 = 20;
+/// `SO_SNDTIMEO`.
+const SO_SNDTIMEO: u64 = 21;
+
+/// `setsockopt` (54): `SO_RCVTIMEO`/`SO_SNDTIMEO` реализованы, остальное
+/// принимается и игнорируется.
+///
+/// Таймауты — не косметика: Rust-std ставит `SO_RCVTIMEO` из
+/// `UnixStream::set_read_timeout`, и раньше эта опция молча проглатывалась.
+/// Клиент PDP (`pagh-files`) опрашивал события через `poll(100ms)`, но `recv`
+/// не возвращал `EAGAIN` никогда, поэтому `poll` не возвращался: события
+/// ЧИТАЛИСЬ, а кадр после них не перерисовывался, и watchdog печатал
+/// `pid=7 stuck in recvfrom (nr=45)` сотни секунд.
+///
+/// Значение — `struct timeval` (`tv_sec`, `tv_usec`, оба 64-битные на
+/// x86_64). Отрицательные компоненты — `EINVAL`, как в Linux; таймаут
+/// округляется ВВЕРХ до миллисекунды, чтобы `tv_usec = 1` не стал нулём
+/// (ноль означал бы «ждать вечно», противоположность просьбе вызывающего).
 pub fn sys_setsockopt(
-    _fd: u64,
-    _level: u64,
-    _optname: u64,
-    _optval: u64,
-    _optlen: u64,
+    fd: u64,
+    level: u64,
+    optname: u64,
+    optval: u64,
+    optlen: u64,
 ) -> Result<u64, Errno> {
-    Ok(0)
+    if level != SOL_SOCKET {
+        return Ok(0);
+    }
+    if optname != SO_RCVTIMEO && optname != SO_SNDTIMEO {
+        return Ok(0);
+    }
+    // `socklen_t` — 4 байта; `struct timeval` — 16. Linux принимает длину
+    // меньще структуры (tv_usec = 0), поэтому читаем сколько дали.
+    if optlen == 0 || optval == 0 {
+        return Ok(0);
+    }
+    let mut raw = [0u8; 16];
+    let n = core::cmp::min(optlen as usize, raw.len());
+    check_user_ptr(optval, n as u64)?;
+    raw[..n].copy_from_slice(&super::io_sys::copy_in_pub(optval, n as u64));
+    let sec = i64::from_le_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
+    let usec = i64::from_le_bytes(raw[8..16].try_into().unwrap_or([0; 8]));
+    let Some(ms) = super::sock_wait::timeout_ms_from_timeval(sec, usec) else {
+        return Err(Errno::EINVAL);
+    };
+    // Настройка — на ОЧЕРЕДИ направления, а не на fd: `recv` этого сокета
+    // смотрит в `rx`, `send` — в `tx`, и обе половины делят настройку с
+    // `dup`/`fork`-копиями дескриптора, как в Linux.
+    compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
+        Some(OpenObject::Socket { rx, tx }) => {
+            if optname == SO_RCVTIMEO {
+                rx.set_rcv_timeout_ms(ms);
+            } else {
+                tx.set_snd_timeout_ms(ms);
+            }
+            Ok(0)
+        }
+        // Остальные виды дескрипторов: опция не применима, но Linux на
+        // `ENOTSOCK`-объектах отвечает `ENOTSOCK` только когда опция реально
+        // опрашивается — прежнее «принять и забыть» поведение сохраняем для
+        // pipe/прочих, чтобы не сломать libuv-косметику.
+        _ => Ok(0),
+    })
+    .unwrap_or(Err(Errno::EBADF))
 }
 
 /// `getsockopt` (55): отвечаем только `SOL_SOCKET`/`SO_ERROR` — «нет
@@ -622,6 +675,10 @@ pub fn sys_sendmsg(fd: u64, msg_addr: u64, flags: u64) -> Result<u64, Errno> {
                 return Ok(0);
             }
             let nonblock = tx.nonblocking() || flags & cmsg::MSG_DONTWAIT as u64 != 0;
+            let deadline = super::sock_wait::Deadline::from_ticks(
+                crate::arch::x86_64::apic::ms_to_ticks(tx.snd_timeout_ms()),
+                crate::task::scheduler::ticks(),
+            );
             let mut written = 0usize;
             loop {
                 match tx.write_scm(&data[written..], &mut objects) {
@@ -647,15 +704,28 @@ pub fn sys_sendmsg(fd: u64, msg_addr: u64, flags: u64) -> Result<u64, Errno> {
                             }
                             break;
                         }
-                        crate::task::scheduler::yield_current();
                         // Закрытый из соседнего потока ПИШУЩИЙ fd очередь не
                         // замечает (счётчики считают концы, а syscall держит
                         // `Arc`): без этой перепроверки ожидание было бы вечным.
-                        if let super::sock_wait::WriteVerdict::Ebadf = endpoint_write_verdict(&tx) {
-                            if written == 0 {
-                                return Err(Errno::EBADF);
+                        let timed_out = deadline
+                            .as_ref()
+                            .is_some_and(|d| d.expired(crate::task::scheduler::ticks()));
+                        match super::sock_wait::write_step(endpoint_writes_queue(&tx), timed_out) {
+                            super::sock_wait::WriteStep::Sleep => {
+                                crate::task::scheduler::sleep_ticks(1)
                             }
-                            break;
+                            super::sock_wait::WriteStep::TimedOut => {
+                                if written == 0 {
+                                    return Err(Errno::EAGAIN);
+                                }
+                                break;
+                            }
+                            super::sock_wait::WriteStep::Ebadf => {
+                                if written == 0 {
+                                    return Err(Errno::EBADF);
+                                }
+                                break;
+                            }
                         }
                     }
                 }
@@ -713,6 +783,10 @@ pub fn sys_sendto_unix(
     check_user_ptr(buf, len)?;
     let data = super::io_sys::copy_in_pub(buf, len);
     let nonblock = tx.nonblocking() || flags & cmsg::MSG_DONTWAIT as u64 != 0;
+    let deadline = super::sock_wait::Deadline::from_ticks(
+        crate::arch::x86_64::apic::ms_to_ticks(tx.snd_timeout_ms()),
+        crate::task::scheduler::ticks(),
+    );
     let mut written = 0usize;
     loop {
         match tx.write(&data[written..]) {
@@ -737,15 +811,30 @@ pub fn sys_sendto_unix(
                         Ok(written as u64)
                     };
                 }
-                crate::task::scheduler::yield_current();
-                // Пишущий fd закрыли из соседнего потока: очередь этого не
-                // заметит, а ждать больше некому (см. `endpoint_write_verdict`).
-                if let super::sock_wait::WriteVerdict::Ebadf = endpoint_write_verdict(&tx) {
-                    return if written == 0 {
-                        Err(Errno::EBADF)
-                    } else {
-                        Ok(written as u64)
-                    };
+                // Закрытый из соседнего потока пишущий fd очередь не заметит
+                // (см. `endpoint_write_verdict`); `SO_SNDTIMEO` обрывает
+                // ожидание полноценной очереди.
+                let timed_out = deadline
+                    .as_ref()
+                    .is_some_and(|d| d.expired(crate::task::scheduler::ticks()));
+                match super::sock_wait::write_step(endpoint_writes_queue(&tx), timed_out) {
+                    super::sock_wait::WriteStep::Sleep => crate::task::scheduler::sleep_ticks(1),
+                    super::sock_wait::WriteStep::TimedOut => {
+                        return if written == 0 {
+                            // Linux: блокирующий `send` с истёкшим таймаутом —
+                            // `EAGAIN` (короткая запись остаётся короткой).
+                            Err(Errno::EAGAIN)
+                        } else {
+                            Ok(written as u64)
+                        };
+                    }
+                    super::sock_wait::WriteStep::Ebadf => {
+                        return if written == 0 {
+                            Err(Errno::EBADF)
+                        } else {
+                            Ok(written as u64)
+                        };
+                    }
                 }
             }
         }
@@ -788,20 +877,37 @@ pub fn sys_recvfrom_unix(
     }
     let mut data: Vec<u8> = vec![0u8; cap as usize];
     let nonblock = rx.nonblocking() || flags & cmsg::MSG_DONTWAIT as u64 != 0;
+    // `SO_RCVTIMEO` фиксируется на входе вызова (как в Linux: смена посреди
+    // ожидания не продлевает/не обрывает уже идущий `recv`).
+    let deadline = super::sock_wait::Deadline::from_ticks(
+        crate::arch::x86_64::apic::ms_to_ticks(rx.rcv_timeout_ms()),
+        crate::task::scheduler::ticks(),
+    );
     let n = loop {
         match rx.read(&mut data) {
-            PipeReadResult::Data(n) => break n,
+            PipeReadResult::Data(n) => {
+                break n;
+            }
             PipeReadResult::Eof => break 0,
             PipeReadResult::WouldBlock => {
                 if nonblock {
                     return Err(Errno::EAGAIN);
                 }
-                match endpoint_wait_verdict(&rx) {
-                    super::sock_wait::WaitVerdict::Continue => {
-                        crate::task::scheduler::yield_current()
-                    }
-                    super::sock_wait::WaitVerdict::Eof => break 0,
-                    super::sock_wait::WaitVerdict::Ebadf => return Err(Errno::EBADF),
+                let timed_out = deadline
+                    .as_ref()
+                    .is_some_and(|d| d.expired(crate::task::scheduler::ticks()));
+                match super::sock_wait::read_step(
+                    endpoint_reads_queue(&rx),
+                    rx.writers(),
+                    timed_out,
+                ) {
+                    // Сон до ближайшего тика (1 мс), а не `yield_current()`:
+                    // уступка оставляла задачу готовой, поэтому блокирующий
+                    // `recv` выедал CPU и на каждом витке брал compat-лок.
+                    super::sock_wait::ReadStep::Sleep => crate::task::scheduler::sleep_ticks(1),
+                    super::sock_wait::ReadStep::TimedOut => return Err(Errno::EAGAIN),
+                    super::sock_wait::ReadStep::Eof => break 0,
+                    super::sock_wait::ReadStep::Ebadf => return Err(Errno::EBADF),
                 }
             }
         }
@@ -819,19 +925,26 @@ pub fn sys_recvfrom_unix(
 
 /// Решение для блокирующего чтения, у которого очередь ответила `WouldBlock`.
 ///
-/// Очередей ожидания в ядре нет: чтение уступает CPU и перечитывает очередь.
-/// Но закрытие ЧИТАЮЩЕГО fd из соседнего потока не выставляет EOF — счётчики
-/// `readers`/`writers` живут на общую очередь, а сам syscall держит её `Arc`.
-/// Без этой перепроверки задача уступала бы CPU вечно; watchdog печатал
+/// Очередей ожидания в ядре нет: чтение СПИТ до ближайшего тика и перечитывает
+/// очередь. Но закрытие ЧИТАЮЩЕГО fd из соседнего потока не выставляет EOF —
+/// счётчики `readers`/`writers` живут на общую очередь, а сам syscall держит её
+/// `Arc`. Без этой перепроверки задача спала бы вечно; watchdog печатал
 /// `stuck in syscall ? (nr=45 arg0=0x3 closed)` (см. `super::sock_wait`).
 ///
 /// `dup` другого дескриптора на ту же очередь оставляет владение, поэтому
 /// закрытие одного из дубликатов законное ожидание не прерывает.
 pub(crate) fn endpoint_wait_verdict(rx: &PipeEndpoint) -> super::sock_wait::WaitVerdict {
+    super::sock_wait::wait_verdict(endpoint_reads_queue(rx), rx.writers())
+}
+
+/// Ссылается ли ещё хоть один fd текущего процесса на ЧИТАЮЩИЙ конец этой
+/// очереди. Вынесено из [`endpoint_wait_verdict`], чтобы блокирующее чтение
+/// могло передать этот факт в [`super::sock_wait::read_step`] вместе с
+/// признаком истёкшего `SO_RCVTIMEO`.
+pub(crate) fn endpoint_reads_queue(rx: &PipeEndpoint) -> bool {
     let id = rx.queue_id();
     // `None` (нет compat-состояния) — читать эту очередь больше некому: EBADF.
-    let referenced = compat::with_current_compat(|cs| cs.fds.holds_read_end(id)).unwrap_or(false);
-    super::sock_wait::wait_verdict(referenced, rx.writers())
+    compat::with_current_compat(|cs| cs.fds.holds_read_end(id)).unwrap_or(false)
 }
 
 /// Решение для блокирующей ЗАПИСИ, у которой очередь ответила `WouldBlock`.
@@ -843,10 +956,15 @@ pub(crate) fn endpoint_wait_verdict(rx: &PipeEndpoint) -> super::sock_wait::Wait
 /// (закрытие читающего fd или `shutdown(SHUT_RD)`) чинится сам: следующая
 /// перезапись отвечает `Broken`, то есть `EPIPE`.
 pub(crate) fn endpoint_write_verdict(tx: &PipeEndpoint) -> super::sock_wait::WriteVerdict {
+    super::sock_wait::write_verdict(endpoint_writes_queue(tx))
+}
+
+/// Ссылается ли ещё хоть один fd текущего процесса на ПИШУЩИЙ конец этой
+/// очереди (пара к [`endpoint_reads_queue`]).
+pub(crate) fn endpoint_writes_queue(tx: &PipeEndpoint) -> bool {
     let id = tx.queue_id();
     // `None` (нет compat-состояния) — писать в эту очередь больше некому.
-    let referenced = compat::with_current_compat(|cs| cs.fds.holds_write_end(id)).unwrap_or(false);
-    super::sock_wait::write_verdict(referenced)
+    compat::with_current_compat(|cs| cs.fds.holds_write_end(id)).unwrap_or(false)
 }
 
 /// Куда свёлся `shutdown(2)`: подключённая AF_UNIX-пара или TCP.
@@ -984,6 +1102,10 @@ pub fn sys_recvmsg(fd: u64, msg_addr: u64, flags: u64) -> Result<u64, Errno> {
     }
     let mut buf: Vec<u8> = vec![0u8; cap as usize];
     let nonblock = rx.nonblocking() || flags & cmsg::MSG_DONTWAIT as u64 != 0;
+    let deadline = super::sock_wait::Deadline::from_ticks(
+        crate::arch::x86_64::apic::ms_to_ticks(rx.rcv_timeout_ms()),
+        crate::task::scheduler::ticks(),
+    );
     loop {
         match rx.read_scm(&mut buf) {
             ScmReadResult::Data(scm) => {
@@ -1040,15 +1162,21 @@ pub fn sys_recvmsg(fd: u64, msg_addr: u64, flags: u64) -> Result<u64, Errno> {
                 if nonblock {
                     return Err(Errno::EAGAIN);
                 }
-                match endpoint_wait_verdict(&rx) {
-                    super::sock_wait::WaitVerdict::Continue => {
-                        crate::task::scheduler::yield_current()
-                    }
-                    super::sock_wait::WaitVerdict::Eof => {
+                let timed_out = deadline
+                    .as_ref()
+                    .is_some_and(|d| d.expired(crate::task::scheduler::ticks()));
+                match super::sock_wait::read_step(
+                    endpoint_reads_queue(&rx),
+                    rx.writers(),
+                    timed_out,
+                ) {
+                    super::sock_wait::ReadStep::Sleep => crate::task::scheduler::sleep_ticks(1),
+                    super::sock_wait::ReadStep::TimedOut => return Err(Errno::EAGAIN),
+                    super::sock_wait::ReadStep::Eof => {
                         write_msghdr_out(msg_addr, 0, 0, flags as u32)?;
                         return Ok(0);
                     }
-                    super::sock_wait::WaitVerdict::Ebadf => return Err(Errno::EBADF),
+                    super::sock_wait::ReadStep::Ebadf => return Err(Errno::EBADF),
                 }
             }
         }

@@ -737,6 +737,15 @@ mod properties {
     // `p59` is the blocking-read wakeup property, so this is `p60`.
     mod p60;
 
+    // Blocking AF_UNIX delivery: the wait step must be a SLEEP (not the
+    // `yield_current` busy-spin that starved the CPU under the compat lock), and
+    // `SO_RCVTIMEO` must turn a still-live queue into `EAGAIN` instead of an
+    // eternal `recv`. Pins the live PDP-client `poll()` hang (`nr=45` watchdog)
+    // and the `timeval`→milliseconds conversion the kernel lost.
+    // `p60` is the shutdown half-close policy above, so this is `p65` (the
+    // next free number after the non-root phase-2 properties P61–P64).
+    mod p65;
+
     // NVMe PRP lists + queue-depth arithmetic (PRP1/PRP2/list page, LBA chunk
     // planning, polled CQ phase tags, CAP.MQES clamping). The driver itself is
     // MMIO/PMM code and cannot run on the host; this is the half that decides
