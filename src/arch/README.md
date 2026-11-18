@@ -83,14 +83,18 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
   генерируются макросом `irq_handler!` (вызов `apic::irq_dispatch` + `send_eoi`); вектор 0x80 —
   `int80_stub` с DPL=3.
 - `page_fault_handler`: сначала пробует demand paging через `linux::mem_sys::handle_user_page_fault`;
-  kernel-mode фолт → backtrace + halt; ring-3 фолт → SIGSEGV (код 139), убивает только Compat_Process.
+  kernel-mode фолт → backtrace + halt; ring-3 фолт → SIGSEGV (код 139) и завершение виновной
+  задачи — **всегда**, в том числе у нативной ring-3 задачи без `CompatState` (S4b: раньше
+  такой отказ уходил в `halt()` и уносил машину).
 - `gp_fault_handler` дамплит слова вокруг RSP (с проверкой `virt_to_phys`, чтобы не каскадить
   PF на guard-странице).
 - **Политика пользовательских исключений (см. `SECURITY.md`).** `#DE`/`#DB`/`#UD`/`#OF`/`#BR`/
   `#NM`/`#AC` (и user-reachable `#MF`/`#XM`) идут через чистую `linux::trap_frame::exception_action`
-  (host-свойство `exception_trap`): исключение из ring 3 (или с user-RIP) у Compat_Process →
-  `exit_code = 128 + signal` и `exit_current()` («[EXC #N] killing Compat_Process …»), машина
-  живёт; ring 0 на kernel-RIP → `halt()`, настоящая ошибка ядра остаётся фатальной. `syscall`
+  (host-свойство `exception_trap`): исключение из ring 3 завершает виновную задачу —
+  `exit_code = 128 + signal` для Compat_Process и `exit_current()` для любой ring-3 задачи
+  («[EXC #N] killing task …»), машина живёт даже без compat-состояния; ring 0 на kernel-RIP
+  (и ring 0 без compat, чтобы кого-то винить) → `halt()`, настоящая ошибка ядра остаётся
+  фатальной. `syscall`
   маскирует TF в kernel-RFLAGS (`SFMASK`), чтобы пользовательский single-step не превращался
   в kernel-mode `#DB`; сам TF сохраняется в r11/sysretq.
 
