@@ -448,8 +448,39 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::SENDMSG => unix_sock::sys_sendmsg(a[0], a[1], a[2]),
         sysno::RECVMSG => unix_sock::sys_recvmsg(a[0], a[1], a[2]),
         sysno::ACCEPT => unix_sock::sys_accept(a[0], a[1], a[2]),
-        sysno::BIND => unix_sock::sys_bind(a[0], a[1], a[2]),
-        sysno::LISTEN => unix_sock::sys_listen(a[0], a[1]),
+        sysno::BIND => {
+            // Маршрутизировать по типу fd, как у connect/sendto: у AF_INET-сокета
+            // bind(2) — это порт-гейт и резервирование порта в собственном стеке,
+            // а не путь AF_UNIX (который разбирает sockaddr_un).
+            let is_inet = crate::task::compat::with_current_compat(|cs| {
+                matches!(
+                    cs.fds.get(a[0] as u32),
+                    Some(crate::task::fd::OpenObject::InetTcp(_))
+                        | Some(crate::task::fd::OpenObject::InetUdp(_))
+                )
+            })
+            .unwrap_or(false);
+            if is_inet {
+                crate::arch::x86_64::linux::inet_sock::sys_bind_inet(a[0], a[1], a[2])
+            } else {
+                unix_sock::sys_bind(a[0], a[1], a[2])
+            }
+        }
+        sysno::LISTEN => {
+            let is_inet = crate::task::compat::with_current_compat(|cs| {
+                matches!(
+                    cs.fds.get(a[0] as u32),
+                    Some(crate::task::fd::OpenObject::InetTcp(_))
+                        | Some(crate::task::fd::OpenObject::InetUdp(_))
+                )
+            })
+            .unwrap_or(false);
+            if is_inet {
+                crate::arch::x86_64::linux::inet_sock::sys_listen_inet(a[0], a[1])
+            } else {
+                unix_sock::sys_listen(a[0], a[1])
+            }
+        }
         sysno::GETSOCKNAME => unix_sock::sys_getsockname(a[0], a[1], a[2]),
         sysno::ACCEPT4 => unix_sock::sys_accept4(a[0], a[1], a[2], a[3]),
         sysno::SETSOCKOPT => unix_sock::sys_setsockopt(a[0], a[1], a[2], a[3], a[4]),

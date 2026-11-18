@@ -44,7 +44,7 @@ LAPIC + I/O APIC, ACPI, вход в syscall и слой совместимост
 | `epoll_sys.rs` | `clock_getres`, `eventfd2`, `epoll_create1/ctl/wait` |
 | `process_sys.rs` | Процессные syscall'ы: `execve`, `clone`, семейство futex |
 | `unix_sock.rs` | AF_UNIX stream-сокеты: socket/connect/accept/bind/listen/socketpair; реестр слушателей по пути, байтовые очереди |
-| `inet_sock.rs` | AF_INET TCP/UDP поверх собственного стека (`net::`) — curl, glibc resolver/DNS |
+| `inet_sock.rs` | AF_INET TCP/UDP поверх собственного стека (`net::`) — curl, glibc resolver/DNS; `bind`/`listen` с порт-гейтом (`< 1024` — только root, `EACCES`) и raw-гейтом `SOCK_RAW` (`EPERM`); резервирование порта в таблице стека (`EADDRINUSE`) |
 | `rtc.rs` | Чтение CMOS RTC (порты 0x70/0x71) |
 | `timeconv.rs` | Чистый BCD-декод и civil-date → Unix-seconds (хост-тестируемый) |
 | `rand_clock.rs` | Чистое планирование `getrandom`/`ticks_to_timespec` |

@@ -55,7 +55,7 @@ pub use wire::{IpAddr, IpEndpoint, Ipv4Addr, Ipv4Cidr, Ipv6Addr};
 use crate::net::link::Link;
 use crate::sync::spinlock::Spinlock;
 use crate::task::scheduler;
-use crate::{info, warn};
+use crate::{debug, info, warn};
 
 /// Хэндл транспортного сокета (TCP или UDP — обе таблицы индексируются с 0).
 pub type SocketHandle = usize;
@@ -70,6 +70,18 @@ pub enum NetError {
     /// NIC найден, но инициализация упала, или сокетная операция не может
     /// завершиться.
     DeviceInit,
+}
+
+/// Отказ `bind(2)`/`listen(2)` на AF_INET-сокете.
+///
+/// Отдельный от [`NetError`] тип, потому что Linux различает «порт занят» и
+/// «сети нет»: `bind(2)` обязан вернуть `EADDRINUSE`, а не общий отказ стека.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindError {
+    /// Порт уже занят живым TCP- или UDP-сокетом.
+    AddrInUse,
+    /// Пригодного NIC нет: стек не инициализирован, порт зарезервировать негде.
+    NoDevice,
 }
 
 /// Статический fallback-адрес, когда DHCP не завершился (R13.3). Для e1000 это
@@ -617,6 +629,29 @@ pub fn tcp_close(handle: SocketHandle) {
     s.tcp.remove(handle);
 }
 
+/// Открыть слушающий TCP-сокет на `port` (`0` — эфемерный). Возвращает хэндл и
+/// фактически занятый порт.
+///
+/// `bind(2)` зовёт это, чтобы зарезервировать порт до `listen(2)`: таблица
+/// стека — единственное место, где порт можно атомарно проверить и занять.
+/// Порт, занятый любым живым сокетом (не только другим слушателем), — отказ
+/// `EADDRINUSE`, как в Linux.
+pub fn tcp_listen(port: u16) -> Result<(SocketHandle, u16), BindError> {
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(BindError::NoDevice)?;
+    let port = if port == 0 {
+        ephemeral_port_locked(state)
+    } else {
+        port
+    };
+    if state.tcp.port_in_use(port) {
+        return Err(BindError::AddrInUse);
+    }
+    let handle = state.tcp.listen(port).map_err(|_| BindError::AddrInUse)?;
+    debug!("[TCP] listen port={} handle={}", port, handle);
+    Ok((handle, port))
+}
+
 // ─── Публичный UDP API ──────────────────────────────────────────────────────
 
 /// Открыть UDP-сокет, привязанный к эфемерному локальному порту на 0.0.0.0.
@@ -624,6 +659,26 @@ pub fn udp_open() -> Result<SocketHandle, NetError> {
     let mut guard = NET.lock();
     let state = guard.as_mut().ok_or(NetError::NoDevice)?;
     let port = ephemeral_port_locked(state);
+    Ok(state.udp.open(port))
+}
+
+/// Перепривязать существующий UDP-сокет на `port` (`0` или текущий порт — no-op).
+///
+/// UDP-сокет уже занимает эфемерный порт с момента `socket(2)`, поэтому
+/// `bind(2)` — это замена порта, а не первая привязка: под `NET` проверяем
+/// занятость, закрываем старый слот и открываем новый. Занятый порт — отказ
+/// `EADDRINUSE`; сеть без NIC — `NoDevice`.
+pub fn udp_bind(handle: SocketHandle, port: u16) -> Result<SocketHandle, BindError> {
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(BindError::NoDevice)?;
+    let current = state.udp.port_of(handle).ok_or(BindError::NoDevice)?;
+    if port == 0 || port == current {
+        return Ok(handle);
+    }
+    if state.udp.port_in_use(port) {
+        return Err(BindError::AddrInUse);
+    }
+    state.udp.close(handle);
     Ok(state.udp.open(port))
 }
 
@@ -637,7 +692,7 @@ fn ephemeral_port_locked(s: &mut Stack) -> u16 {
         } else {
             s.next_eph + 1
         };
-        if !s.udp.port_in_use(p) {
+        if !s.udp.port_in_use(p) && !s.tcp.port_in_use(p) {
             return p;
         }
     }

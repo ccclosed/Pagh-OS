@@ -687,6 +687,11 @@ mod properties {
     // that a regression in either rule names itself.
     mod p59;
 
+    // Non-root phase 2 (agent B): the network admission policy — privileged
+    // `bind(2)` ports (`< 1024`, root only) and the `SOCK_RAW` gate. Pure
+    // decisions the AF_INET syscall path applies before touching the stack.
+    mod p60;
+
     // Socket payload cap (`sendto`/`recvfrom`): the kernel validated with a
     // capped length and then allocated/copied the raw u64 count (2026-11-13
     // audit follow-up, F-x86v-1 allocation class). P57 pins the single policy.
