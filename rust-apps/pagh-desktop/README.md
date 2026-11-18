@@ -77,8 +77,9 @@ cargo run --bin pagh-desktop -- --socket /tmp/pagh-desktop.sock --spawn-demo
 cargo run --bin pagh-desktop-demo -- --connect /tmp/pagh-desktop.sock --app files
 ```
 
-Сервер сам запускает `pagh-desktop-demo` по запросам панели/меню, если рядом лежит
-бинарник (`--demo-binary PATH` задаёт явно), и приложения по `launch`:
+Сервер сам запускает приложение по запросам панели/меню/хоткея и по `launch`:
+сначала цель `--launch-target`, иначе демо-клиент `pagh-desktop-demo`, если рядом
+лежит бинарник (`--demo-binary PATH` задаёт явно):
 
 ```bash
 # настоящий терминал: {socket} подставится путём сокета сервера
@@ -204,8 +205,8 @@ python3 tools/e2e.py desktop --reuse-desktop-disk --skip-build
   kernel-примитивами (`desktop-kernel`); headless-путь полностью автономен.
 * `ShmSurface`/`SCM_RIGHTS`, частичный commit, клиентские popup/курсоры, outputs/scale,
   анимации, PTY/kernel-console bridge — не в этом срезе.
-* `--spawn-demo` запускает именно демо-клиент (а не произвольные приложения);
-  реестр приложений/`.desktop`-файлы — следующий шаг.
+* `--spawn-demo` — фолбэк для панели/меню/хоткея, если приложения нет в
+  `--launch-target`; реестр приложений/`.desktop`-файлы — следующий шаг.
 * Скриншоты намеренно детерминированы (часы 23:38 / 15.11.2026), чтобы diff картинок
   был осмысленным.
 

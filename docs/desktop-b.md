@@ -43,7 +43,8 @@ Rust-std `Command::spawn`) поддержана как COW-fork с явным `c
 остановкой родителя до `execve`/выхода ребёнка: совместный стек vfork не
 нужен `posix_spawn` (статус идёт через pipe), а копия безопаснее. Поэтому
 `pagh-desktop --spawn-demo` и кнопки панели Files/Terminal запускают
-дочерний демо-клиент, а не падают с `Function not implemented (os error 38)`.
+дочерний процесс (реальное приложение из `--launch-target`, иначе демо-клиент),
+а не падают с `Function not implemented (os error 38)`.
 
 ---
 
