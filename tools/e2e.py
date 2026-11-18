@@ -1046,10 +1046,68 @@ class QemuShotKeyboard:
     def screenshot(self, path: pathlib.Path) -> None:
         self._guard("screendump", self.mon.screendump, pathlib.Path(path))
 
+    def screenshot_raw(self, path: pathlib.Path) -> None:
+        """Capture the framebuffer as binary PPM (raw RGB) for pixel assertions.
+
+        The PNG path above is the human evidence; comparing two PNGs byte-wise
+        cannot tell an overlay from a moved cursor (the cursor alone changed
+        ~250 pixels and produced a false PASS). PPM is header + raw RGB, so a
+        count of changed pixels inside the selection area is exact.
+        """
+        if self.mon is None:
+            raise HarnessError("QEMU monitor not connected")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.qemu_shot.tmp")
+        if tmp.exists():
+            tmp.unlink()
+        cmd = f"screendump {tmp} -f ppm"
+        reply = self._guard("screendump ppm", self.mon.command, cmd)
+        qemu_shot.Monitor._check(reply, cmd)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if tmp.exists() and tmp.stat().st_size > 0:
+                time.sleep(0.2)  # let QEMU finish flushing the file
+                tmp.replace(path)
+                return
+            time.sleep(0.2)
+        raise HarnessError(f"screendump ppm produced no file at {path}")
+
     def close(self) -> None:
         if self.mon is not None:
             self.mon.close()
             self.mon = None
+
+
+def ppm_rgb(path: pathlib.Path) -> tuple[int, int, bytes]:
+    """Decode a binary PPM (P6) framebuffer dump into raw RGB bytes."""
+    data = path.read_bytes()
+    match = re.match(rb"P6\s+(\d+)\s+(\d+)\s+(\d+)\s", data)
+    if not match:
+        raise HarnessError(f"{path}: not a P6 PPM dump")
+    width, height, maxval = (int(v) for v in match.groups())
+    body = data[match.end():]
+    if maxval != 255 or len(body) < width * height * 3:
+        raise HarnessError(f"{path}: unsupported PPM maxval/truncated body")
+    return width, height, body[: width * height * 3]
+
+
+def ppm_changed_inside(a: pathlib.Path, b: pathlib.Path,
+                       x0: int, y0: int, x1: int, y1: int) -> int:
+    """Count changed pixels in a rectangle of two same-size PPM dumps."""
+    wa, ha, ra = ppm_rgb(a)
+    wb, hb, rb = ppm_rgb(b)
+    if (wa, ha) != (wb, hb):
+        raise HarnessError(f"PPM size mismatch: {wa}x{ha} vs {wb}x{hb}")
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(wa, x1), min(ha, y1)
+    changed = 0
+    for y in range(y0, y1):
+        row = y * wa * 3
+        for x in range(x0, x1):
+            off = row + x * 3
+            if ra[off:off + 3] != rb[off:off + 3]:
+                changed += 1
+    return changed
 
 
 # ───────────────────────── serial waiting ─────────────────────────
@@ -3287,6 +3345,9 @@ def _desktop_abi_phase(h: "Harness", guest: "Guest", kb: "QemuShotKeyboard",
     ok &= h.check("pointer motion/click repainted the framebuffer",
                   pointer_changed, f"{moved.name} differs={pointer_changed}")
 
+    raw_before = CACHE / "e2e_desktop_pointer.ppm"
+    kb.screenshot_raw(raw_before)
+
     # Rubber-band selection: LMB press+drag on empty desktop (not a window,
     # not the panel). PS/2 packets carry an 8-bit delta, so the pointer is
     # homed and moved in small relative steps (one 1000 px event would be
@@ -3310,27 +3371,44 @@ def _desktop_abi_phase(h: "Harness", guest: "Guest", kb: "QemuShotKeyboard",
     for _ in range(6):
         h.qmp.rel(-45, -35)
         time.sleep(0.08)
-    selection = CACHE / "e2e_desktop_selection.png"
-    # The TCG compositor presents at ~1 fps, and QEMU's display updates a
-    # surface later still; a single 0.5 s dump reproducibly caught the frame
-    # before the overlay landed. Retry like the F10-menu dump above.
-    selection_changed = False
-    for attempt in range(3):
-        time.sleep(1.0 if attempt == 0 else 1.5)
-        kb.screenshot(selection)
-        selection_changed = (selection.is_file() and moved.is_file()
-                             and selection.read_bytes() != moved.read_bytes())
-        if selection_changed:
-            break
-    ok &= h.check("QEMU framebuffer shows the selection rectangle",
-                  selection_changed, f"{selection.name} differs={selection_changed}")
     h.qmp.button("left", False)
     committed = wait_for(
         guest, [r"pagh-desktop: selection committed rect=\(\d+, \d+, \d+x\d+\)"],
         15.0, label="selection committed")
+    committed_line = regex_first(
+        r"pagh-desktop: selection committed[^\r\n]*", guest.serial()) or ""
     ok &= h.check("release commits the selection rect", committed is not None,
-                  regex_first(r"pagh-desktop: selection committed[^\r\n]*",
-                              guest.serial()) or committed or "no commit trace")
+                  committed_line or committed or "no commit trace")
+
+    # The committed frame stays visible until the next click, and the TCG
+    # compositor presents at ~1 fps with QEMU exposing the surface later
+    # still. Wait for a settled frame, then prove the overlay by pixel count
+    # inside the committed rect: a byte-compare against `moved` also changes
+    # when only the cursor moved (that false PASS is why PPM is dumped).
+    time.sleep(1.0)
+    raw_after = CACHE / "e2e_desktop_selection.ppm"
+    rect_match = re.search(r"rect=\((\d+), (\d+), (\d+)x(\d+)\)", committed_line)
+    painted = 0
+    for attempt in range(3):
+        if attempt:
+            time.sleep(1.5)
+        kb.screenshot_raw(raw_after)
+        painted = 0
+        if rect_match and raw_before.is_file() and raw_after.is_file():
+            rx, ry, rw, rh = (int(v) for v in rect_match.groups())
+            painted = ppm_changed_inside(
+                raw_before, raw_after,
+                rx + 2, ry + 2, rx + rw - 2, ry + rh - 2)
+        if painted > 500:
+            break
+    ok &= h.check("selection overlay painted inside the committed rect",
+                  painted > 500, f"{painted} changed pixels (cursor excluded)")
+    selection = CACHE / "e2e_desktop_selection.png"
+    kb.screenshot(selection)
+    selection_changed = (selection.is_file() and moved.is_file()
+                         and selection.read_bytes() != moved.read_bytes())
+    ok &= h.check("QEMU screenshot shows the selection frame",
+                  selection_changed, f"{selection.name} differs={selection_changed}")
 
     # Exit + one-way takeover: shell keeps running on serial, but the kernel
     # console must not repaint the screen over the last desktop frame.
