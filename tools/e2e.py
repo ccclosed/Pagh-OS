@@ -3254,6 +3254,43 @@ def _desktop_abi_phase(h: "Harness", guest: "Guest", kb: "QemuShotKeyboard",
     ok &= h.check("pointer motion/click repainted the framebuffer",
                   pointer_changed, f"{moved.name} differs={pointer_changed}")
 
+    # Rubber-band selection: LMB press+drag on empty desktop (not a window,
+    # not the panel). PS/2 packets carry an 8-bit delta, so the pointer is
+    # homed and moved in small relative steps (one 1000 px event would be
+    # clamped and could land on the demo window). Screen is 1280x800; the
+    # 640x400 demo window sits at the top-left, so (1000, 640) is empty and
+    # (820, 500) stays clear of it and of the 44 px panel.
+    for _ in range(15):
+        h.qmp.rel(-100, -100)
+        time.sleep(0.02)
+    for _ in range(25):
+        h.qmp.rel(40, 25)
+        time.sleep(0.02)
+    h.qmp.rel(0, 15)
+    time.sleep(0.3)
+    h.qmp.button("left", True)
+    time.sleep(0.2)
+    drag_start = wait_for(guest, [r"pagh-desktop: selection drag start pointer="],
+                          15.0, label="selection drag start")
+    ok &= h.check("LMB on empty desktop starts rubber-band selection",
+                  drag_start is not None, drag_start or "no drag-start trace")
+    for _ in range(4):
+        h.qmp.rel(-45, -35)
+        time.sleep(0.03)
+    time.sleep(0.5)
+    selection = CACHE / "e2e_desktop_selection.png"
+    kb.screenshot(selection)
+    selection_changed = (selection.is_file() and moved.is_file()
+                         and selection.read_bytes() != moved.read_bytes())
+    ok &= h.check("QEMU framebuffer shows the selection rectangle",
+                  selection_changed, f"{selection.name} differs={selection_changed}")
+    h.qmp.button("left", False)
+    committed = wait_for(
+        guest, [r"pagh-desktop: selection committed rect=\(\d+, \d+, \d+x\d+\)"],
+        15.0, label="selection committed")
+    ok &= h.check("release commits the selection rect", committed is not None,
+                  committed or "no commit trace")
+
     # Exit + one-way takeover: shell keeps running on serial, but the kernel
     # console must not repaint the screen over the last desktop frame.
     exited = wait_for(guest, [r"pagh-desktop: exit-after-ms reached"],
