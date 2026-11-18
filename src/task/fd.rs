@@ -242,6 +242,17 @@ impl PipeEndpoint {
         }
         let n = core::cmp::min(room, src.len());
         s.bytes.extend(src[..n].iter().copied());
+        // Обычная запись двигает абсолютную позицию потока ровно так же, как
+        // [`Self::write_scm`]: `written_total` — это координата, в которой
+        // [`Self::write_scm`] регистрирует `SCM_RIGHTS`, а `read_total` — сколько
+        // байт потока уже потреблено. Если `write(2)` пишет мимо счётчика,
+        // координаты расходятся: первое же `sendmsg` с fd получает `pos = 0`
+        // (счётчик не двигался, хотя байты ушли), регистрирует cmsg ПОЗАДИ
+        // `read_total`, и [`Self::read_scm`] выбрасывает её как «пройденную» —
+        // дескриптор молча теряется, а `recvmsg` возвращает данные без cmsg.
+        // Именно так SHM_OFFER убивал соединение с каждым реальным клиентом:
+        // `hello`/`create` уходят через `write(2)`, а fd — следующим `sendmsg`.
+        s.written_total += n as u64;
         PipeWriteResult::Data(n)
     }
     pub fn read_ready(&self) -> bool {

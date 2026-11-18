@@ -212,12 +212,28 @@ pub enum ServerCommand {
     Shutdown,
 }
 
+/// Что случилось с memfd из `shm_offer` в читающем потоке.
+///
+/// Отображение делается ЗДЕСЬ, а не в главном потоке: `clone_current_compat`
+/// даёт каждому треду копию fd-таблицы (`docs/procfs.md` §13.7 #22 —
+/// `CLONE_FILES` не разделяет таблицу), поэтому принятый `SCM_RIGHTS` fd
+/// существует только в таблице читающего треда. Передать главному потоку
+/// голый номер значило бы получить `EBADF` (а `Drop` чужого `OwnedFd` закрыл бы
+/// в его таблице посторонний дескриптор). `ShmMapping` — `Send`, поэтому через
+/// канал едет само отображение.
+enum ShmArrival {
+    /// fd пришёл, поверхность отображена.
+    Mapped(crate::shm::ShmMapping),
+    /// fd пришёл, но отображение не удалось (не memfd, мал, EBADF).
+    Failed(io::Error),
+}
+
 enum Incoming {
     Client {
         conn: u64,
         message: Message,
-        /// Ровно один fd, пришедший вместе с `shm_offer`.
-        fd: Option<OwnedFd>,
+        /// Отображённая поверхность `shm_offer` (см. [`ShmArrival`]).
+        shm: Option<ShmArrival>,
     },
     Disconnected(u64),
     ProtocolError {
@@ -937,8 +953,12 @@ impl Server {
 
     fn handle_incoming(&mut self, incoming: Incoming) -> bool {
         match incoming {
-            Incoming::Client { conn, message, fd } => {
-                self.handle_client_message(conn, message, fd);
+            Incoming::Client {
+                conn,
+                message,
+                shm,
+            } => {
+                self.handle_client_message(conn, message, shm);
                 true
             }
             Incoming::Disconnected(conn) => {
@@ -1009,7 +1029,7 @@ impl Server {
         true
     }
 
-    fn handle_client_message(&mut self, conn: u64, message: Message, fd: Option<OwnedFd>) {
+    fn handle_client_message(&mut self, conn: u64, message: Message, shm: Option<ShmArrival>) {
         let Some(index) = self.clients.iter().position(|c| c.id == conn) else {
             return;
         };
@@ -1123,7 +1143,7 @@ impl Server {
                     return;
                 };
                 self.handle_shm_offer(
-                    conn, client_id, window_id, width, height, format, stride, flags, fd,
+                    conn, client_id, window_id, width, height, format, stride, flags, shm,
                 );
             }
             Message::ShmCommit {
@@ -1218,7 +1238,7 @@ impl Server {
         format: u32,
         stride: u32,
         flags: u32,
-        fd: Option<OwnedFd>,
+        shm: Option<ShmArrival>,
     ) {
         if flags != 0 {
             self.reply_error(conn, ERR_INVALID_SURFACE, "shm_offer: flags должны быть 0");
@@ -1263,17 +1283,32 @@ impl Server {
             self.reply_error(conn, ERR_INVALID_SURFACE, "shm_offer: overflow");
             return;
         };
-        let Some(fd) = fd else {
+        let Some(shm) = shm else {
             self.reply_error(conn, ERR_BAD_MESSAGE, "shm_offer без SCM_RIGHTS fd");
             return;
         };
-        let mapping = match crate::shm::map_readonly(fd, needed) {
-            Ok(mapping) => mapping,
-            Err(err) => {
+        let mapping = match shm {
+            // Отображение сделал читающий поток: только его fd-таблица видит
+            // принятый `SCM_RIGHTS` дескриптор (см. [`ShmArrival`]).
+            ShmArrival::Mapped(mapping) => mapping,
+            ShmArrival::Failed(err) => {
                 self.reply_error(conn, ERR_INVALID_SURFACE, format!("shm_offer: {err}"));
                 return;
             }
         };
+        if mapping.len() < needed {
+            // Страховка от расхождения проверок между потоками: сервер не
+            // должен отдавать композитору view короче `stride*height`.
+            self.reply_error(
+                conn,
+                ERR_INVALID_SURFACE,
+                format!(
+                    "shm_offer: отображено {} байт, нужно {needed}",
+                    mapping.len()
+                ),
+            );
+            return;
+        }
         if let Err(err) = self
             .compositor
             .install_shm_surface(client_id, window_id, width, height, format)
@@ -1297,6 +1332,14 @@ impl Server {
             },
         );
         self.counters.shm_offers.fetch_add(1, Ordering::Relaxed);
+        if !self.options.quiet {
+            // Единственная строка, по которой видно, каким путём клиент рисует:
+            // shm-поверхность или полный кадр. Без неё «окно есть, контент есть»
+            // не отличает рабочий SHM от молчаливого fallback'а.
+            eprintln!(
+                "pagh-desktop: shm surface window={window_id} {width}x{height} stride={stride} generation={generation}"
+            );
+        }
         self.send_to_client(
             client_id,
             Message::ShmReady {
@@ -1734,6 +1777,7 @@ fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<A
                 pending_fds.extend(fds);
                 // Защита от клиента, засыпающего сервер fd'ами без offer'ов.
                 if pending_fds.len() > 8 {
+                    eprintln!("pagh-desktop: conn={conn}: слишком много SCM_RIGHTS fd без shm_offer");
                     let _ = tx.send(Incoming::ProtocolError {
                         conn,
                         detail: "слишком много SCM_RIGHTS fd без shm_offer".to_string(),
@@ -1741,6 +1785,7 @@ fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<A
                     return;
                 }
                 if let Err(err) = decoder.push(&buffer[..n]) {
+                    eprintln!("pagh-desktop: conn={conn}: decode: {err}");
                     let _ = tx.send(Incoming::ProtocolError {
                         conn,
                         detail: err.to_string(),
@@ -1750,10 +1795,49 @@ fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<A
                 loop {
                     match decoder.next_message() {
                         Ok(Some(message)) => {
-                            let fd = if matches!(message, Message::ShmOffer { .. }) {
+                            // memfd отображаем ЗДЕСЬ: fd, установленный
+                            // `recvmsg`, живёт в таблице этого треда (у каждого
+                            // треда своя копия fd-таблицы, `docs/procfs.md`
+                            // §13.7 #22), и главный поток его не увидит. Через
+                            // канал едет готовое `ShmMapping`.
+                            let shm = if let Message::ShmOffer {
+                                width, height, format, stride, ..
+                            } = message
+                            {
                                 match pending_fds.pop_front() {
-                                    Some(fd) => Some(fd),
+                                    Some(fd) => {
+                                        // Невалидные поля отсеет главный поток
+                                        // (у него — точный код ошибки); тогда fd
+                                        // просто закрывается здесь же.
+                                        match crate::shm::offer_required_len(
+                                            width, height, format, stride,
+                                        ) {
+                                            Some(needed) => {
+                                                Some(match crate::shm::map_readonly(fd, needed) {
+                                                    Ok(mapping) => ShmArrival::Mapped(mapping),
+                                                    Err(err) => {
+                                                        eprintln!(
+                                                            "pagh-desktop: conn={conn}: shm_offer: \
+                                                             отображение memfd: {err}"
+                                                        );
+                                                        ShmArrival::Failed(err)
+                                                    }
+                                                })
+                                            }
+                                            // Поля вне пределов: fd закрывается
+                                            // здесь, сообщение всё равно уходит —
+                                            // точную ошибку клиенту скажет
+                                            // главный поток (проверки до fd).
+                                            None => {
+                                                drop(fd);
+                                                None
+                                            }
+                                        }
+                                    }
                                     None => {
+                                        eprintln!(
+                                            "pagh-desktop: conn={conn}: shm_offer без SCM_RIGHTS fd"
+                                        );
                                         let _ = tx.send(Incoming::ProtocolError {
                                             conn,
                                             detail: "shm_offer без SCM_RIGHTS fd".to_string(),
@@ -1764,12 +1848,13 @@ fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<A
                             } else {
                                 None
                             };
-                            if tx.send(Incoming::Client { conn, message, fd }).is_err() {
+                            if tx.send(Incoming::Client { conn, message, shm }).is_err() {
                                 break 'read;
                             }
                         }
                         Ok(None) => break,
                         Err(err) => {
+                            eprintln!("pagh-desktop: conn={conn}: decode: {err}");
                             let _ = tx.send(Incoming::ProtocolError {
                                 conn,
                                 detail: err.to_string(),
@@ -1781,7 +1866,12 @@ fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<A
             }
             Err(err)
                 if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut => {}
-            Err(_) => break,
+            Err(err) => {
+                // Молчаливый выход читающего потока — это потеря клиента без
+                // единой строки в логе; печатаем причину всегда.
+                eprintln!("pagh-desktop: read_loop conn={conn} failed: {err}");
+                break;
+            }
         }
     }
     let _ = tx.send(Incoming::Disconnected(conn));
