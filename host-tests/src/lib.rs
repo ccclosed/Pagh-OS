@@ -307,7 +307,6 @@ pub mod ca_bundle;
 #[path = "../../src/net/tls_auth.rs"]
 pub mod tls_auth;
 
-
 // `seed` is the pure `AT_RANDOM` fallback mixer (issue #16): a SHA-256
 // transcript over independent boot-time sources plus a counter-based derivation.
 // `core` + `sha2` only (no I/O, no globals), so P51 exercises the exact source
@@ -322,7 +321,6 @@ pub mod seed;
 // wiring (properties in `link_walk_paths`).
 #[path = "../../src/vfs/link_walk.rs"]
 pub mod link_walk;
-
 
 // `format_policy` decides whether boot may format a block device (issue #33).
 // Pure `core`, no I/O by design: `boot::init_fs` probes the device and feeds the
@@ -415,7 +413,6 @@ pub mod usb_rndis_proto;
 // мгновенно и этого не воспроизводит.
 #[path = "../../src/drivers/xhci_hub.rs"]
 pub mod xhci_hub;
-
 
 // ── OpenPGP repository-metadata verification (issue #32) ─────────────────────
 // The pure verifier the `apt` trust chain will use: packet/armor parsing,
@@ -568,7 +565,7 @@ mod properties {
     // merge that resolves it the wrong way drops properties silently. The test
     // FUNCTIONS keep their `p51_*` names — numbers inside a file are harmless.
     mod at_random;
-// ext2 symbolic links + hard links (issue #18, contract `EXT2-LINKS.md`
+    // ext2 symbolic links + hard links (issue #18, contract `EXT2-LINKS.md`
     // §2/§3/§8): the fast/slow layout boundary and inline image round-trip, the
     // `i_block` word reshape, and the link-count accounting that `unlink` and
     // `link` must obey (a name is only freed at the last link).
@@ -657,14 +654,14 @@ mod properties {
     // SIGCONT). Descriptive module name, same reason as `kill_target`.
     mod signal_stop;
 
-// The apt trust chain (issue #32, contract OPENPGP-VERIFY-CONTRACT.md
+    // The apt trust chain (issue #32, contract OPENPGP-VERIFY-CONTRACT.md
     // §5/§6): P54 covers the `Release` parser that binds `Packages` to the
     // signed metadata, P55 covers the per-record `.deb` digest on BOTH parser
     // paths (a missing or malformed digest must be `None`, never a zero digest
     // that would "verify" any payload).
     mod p54;
     mod p55;
-// The timer-tick frame adapter (issue #12, task t9): iret-frame mirror, the
+    // The timer-tick frame adapter (issue #12, task t9): iret-frame mirror, the
     // ring-3 classification, the exact handler-entry mutation set, the
     // "delivered signal == consumed signal" guard and the rt_sigframe round trip
     // for a tick-delivered signal. Descriptive module name, same reason as
@@ -695,6 +692,13 @@ mod properties {
     // taken by the OpenPGP `.deb`-digest property, so this is the next free
     // number.
     mod p56;
+
+    // Setuid/setgid-on-exec + login identities (non-root A1/A2): the pure
+    // `bprm_fill_uid()` decision (`exec_setid`), the exact "no bits => identical
+    // credentials" law, the secureexec flag and `Creds::for_login`.
+    // `p59` is the blocking-read wakeup property and `p60` the shutdown policy,
+    // so this is `p61`.
+    mod p61;
 
     // Socket payload cap (`sendto`/`recvfrom`): the kernel validated with a
     // capped length and then allocated/copied the raw u64 count (2026-11-13
