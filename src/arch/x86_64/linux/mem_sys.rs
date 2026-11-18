@@ -1309,3 +1309,41 @@ pub fn handle_user_page_fault(
     })
     .unwrap_or(false)
 }
+
+/// Подпереть page-by-page пользовательский диапазон, в который ядро собирается
+/// писать, до [`super::io_sys::copy_out_checked`].
+///
+/// Зачем это нужно отдельно: общая проверка присутствия (`check_user_ptr*`)
+/// отвергает ещё не подпертые страницы `EFAULT`'ом, а `copy_in`/`copy_out` по
+/// ним штатно обслуживаются обработчиком page fault (см. `idt.rs`). Для
+/// `read(2)` из `/dev/vtconsole0` это единственный путь, где приёмник — свежий
+/// анонимный `mmap` клиента: снимок в сотню килобайт копируется целиком, и без
+/// этой подготовки вызов возвращал `EFAULT` на законном буфере.
+///
+/// Политика — ровно [`handle_user_page_fault`]: присутствующие страницы
+/// принимаются как есть; отсутствующие подпираются только внутри ленивой кучи
+/// `brk` или анонимного `mmap`-региона; `PROT_NONE`, eager-регион без PTE и
+/// адрес вне регионов остаются отказом (`EFAULT`), а не поводом что-то
+/// отобразить. Права листа при этом берутся из региона, поэтому приёмник
+/// `PROT_READ` подпирается read-only и всё равно отвергается `copy_out`'ом.
+///
+/// ПРЕДУСЛОВИЕ: вызывающий не держит `COMPAT_STATES` — [`handle_user_page_fault`]
+/// берёт его сам и в реентерабельном контексте отказывает.
+pub fn populate_user_out(start: u64, len: u64) -> Result<(), Errno> {
+    use super::validate::{check_user_range, spanned_pages, PtrCheck};
+    if len == 0 {
+        return Ok(());
+    }
+    if check_user_range(start, len) != PtrCheck::Ok {
+        return Err(Errno::EFAULT);
+    }
+    for page in spanned_pages(start, len) {
+        if vmm::virt_to_phys(page).is_some() {
+            continue;
+        }
+        if !handle_user_page_fault(page, false, true) {
+            return Err(Errno::EFAULT);
+        }
+    }
+    Ok(())
+}
