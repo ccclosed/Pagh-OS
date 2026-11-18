@@ -1734,6 +1734,7 @@ fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<A
                 pending_fds.extend(fds);
                 // Защита от клиента, засыпающего сервер fd'ами без offer'ов.
                 if pending_fds.len() > 8 {
+                    eprintln!("pagh-desktop: conn={conn}: слишком много SCM_RIGHTS fd без shm_offer");
                     let _ = tx.send(Incoming::ProtocolError {
                         conn,
                         detail: "слишком много SCM_RIGHTS fd без shm_offer".to_string(),
@@ -1741,6 +1742,7 @@ fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<A
                     return;
                 }
                 if let Err(err) = decoder.push(&buffer[..n]) {
+                    eprintln!("pagh-desktop: conn={conn}: decode: {err}");
                     let _ = tx.send(Incoming::ProtocolError {
                         conn,
                         detail: err.to_string(),
@@ -1754,6 +1756,9 @@ fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<A
                                 match pending_fds.pop_front() {
                                     Some(fd) => Some(fd),
                                     None => {
+                                        eprintln!(
+                                            "pagh-desktop: conn={conn}: shm_offer без SCM_RIGHTS fd"
+                                        );
                                         let _ = tx.send(Incoming::ProtocolError {
                                             conn,
                                             detail: "shm_offer без SCM_RIGHTS fd".to_string(),
@@ -1770,6 +1775,7 @@ fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<A
                         }
                         Ok(None) => break,
                         Err(err) => {
+                            eprintln!("pagh-desktop: conn={conn}: decode: {err}");
                             let _ = tx.send(Incoming::ProtocolError {
                                 conn,
                                 detail: err.to_string(),
@@ -1781,7 +1787,12 @@ fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<A
             }
             Err(err)
                 if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut => {}
-            Err(_) => break,
+            Err(err) => {
+                // Молчаливый выход читающего потока — это потеря клиента без
+                // единой строки в логе; печатаем причину всегда.
+                eprintln!("pagh-desktop: read_loop conn={conn} failed: {err}");
+                break;
+            }
         }
     }
     let _ = tx.send(Incoming::Disconnected(conn));
