@@ -727,6 +727,17 @@ mod properties {
     // vectors, fail-closed locked/unknown methods, and line-preserving rewrite.
     mod p62;
 
+    // Non-root phase 2 (agent B): the sticky-directory deletion rule
+    // (`S_ISVTX`, /tmp 1777). Isolated from P56's ordinary permission matrix so
+    // that a regression in either rule names itself. (`p59`/`p60` were taken,
+    // so this is P63.)
+    mod p63;
+
+    // Non-root phase 2 (agent B): the network admission policy — privileged
+    // `bind(2)` ports (`< 1024`, root only) and the `SOCK_RAW` gate. Pure
+    // decisions the AF_INET syscall path applies before touching the stack.
+    mod p64;
+
     // NVMe PRP lists + queue-depth arithmetic (PRP1/PRP2/list page, LBA chunk
     // planning, polled CQ phase tags, CAP.MQES clamping). The driver itself is
     // MMIO/PMM code and cannot run on the host; this is the half that decides

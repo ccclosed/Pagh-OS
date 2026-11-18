@@ -15,7 +15,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::{VfsError, VfsNode, VfsResult};
 use crate::sync::spinlock::Spinlock;
@@ -33,14 +33,30 @@ fn next_ino() -> u64 {
 pub struct RamDir {
     name: String,
     ino: u64,
+    /// Биты прав плюс setuid/setgid/sticky (`chmod(2)`); по умолчанию `0755`.
+    /// Раньше ramfs не хранил метаданных, поэтому `/tmp` нельзя было сделать
+    /// sticky, а не-root не мог писать в него вовсе.
+    mode: AtomicU32,
+    /// `(uid, gid)` владельца: созданный не-root процессом узел принадлежит ему,
+    /// иначе sticky-правило `/tmp` не смогло бы отличить свой файл от чужого.
+    owner: Spinlock<(u32, u32)>,
     children: Spinlock<BTreeMap<String, Arc<dyn VfsNode>>>,
 }
 
 impl RamDir {
     pub fn new(name: &str) -> Self {
+        Self::new_with_mode(name, 0o755)
+    }
+
+    /// Каталог с явными битами прав: `S_ISVTX` (`0o1000`) на `/tmp` — это
+    /// POSIX-контракт общего временного каталога, который проверяет
+    /// `Creds::may_delete_child` на границе unlink/rename.
+    pub fn new_with_mode(name: &str, mode: u32) -> Self {
         RamDir {
             name: String::from(name),
             ino: next_ino(),
+            mode: AtomicU32::new(mode),
+            owner: Spinlock::new((0, 0)),
             children: Spinlock::new(BTreeMap::new()),
         }
     }
@@ -55,6 +71,24 @@ impl VfsNode for RamDir {
     }
     fn fs_ino(&self) -> u64 {
         self.ino
+    }
+
+    fn mode(&self) -> u32 {
+        self.mode.load(Ordering::Relaxed)
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        *self.owner.lock()
+    }
+
+    fn set_mode(&self, mode: u32) -> VfsResult<()> {
+        self.mode.store(mode & 0o7777, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) -> VfsResult<()> {
+        *self.owner.lock() = (uid, gid);
+        Ok(())
     }
 
     fn readdir(&self) -> VfsResult<Vec<Arc<dyn VfsNode>>> {
@@ -121,6 +155,10 @@ impl VfsNode for RamDir {
 pub struct RamFile {
     name: String,
     ino: u64,
+    /// `chmod(2)`-биты; по умолчанию `0644`, как у ext2-писателя.
+    mode: AtomicU32,
+    /// Владелец записи: нужен sticky-проверке `/tmp` (`unlink` чужого файла).
+    owner: Spinlock<(u32, u32)>,
     data: Spinlock<Vec<u8>>,
 }
 
@@ -129,6 +167,8 @@ impl RamFile {
         RamFile {
             name: String::from(name),
             ino: next_ino(),
+            mode: AtomicU32::new(0o644),
+            owner: Spinlock::new((0, 0)),
             data: Spinlock::new(Vec::new()),
         }
     }
@@ -143,6 +183,20 @@ impl VfsNode for RamFile {
     }
     fn fs_ino(&self) -> u64 {
         self.ino
+    }
+    fn mode(&self) -> u32 {
+        self.mode.load(Ordering::Relaxed)
+    }
+    fn owner(&self) -> (u32, u32) {
+        *self.owner.lock()
+    }
+    fn set_mode(&self, mode: u32) -> VfsResult<()> {
+        self.mode.store(mode & 0o7777, Ordering::Relaxed);
+        Ok(())
+    }
+    fn set_owner(&self, uid: u32, gid: u32) -> VfsResult<()> {
+        *self.owner.lock() = (uid, gid);
+        Ok(())
     }
     fn size(&self) -> u64 {
         self.data.lock().len() as u64
