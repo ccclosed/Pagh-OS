@@ -7481,7 +7481,9 @@ mod usb_hid_tests {
 // напечататься в shell после `selftest`; `evdev::reset` чистит очередь.
 mod desktop_b_tests {
     use crate::arch::x86_64::linux::errno::Errno;
-    use crate::arch::x86_64::linux::mem::{VmRegionSet, MAP_SHARED, PROT_READ, PROT_WRITE};
+    use crate::arch::x86_64::linux::mem::{
+        VmRegionSet, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, PROT_READ, PROT_WRITE,
+    };
     use crate::arch::x86_64::linux::{io_sys, mem_sys, unix_sock};
     use crate::drivers::fb_abi::{
         FBIOGET_FSCREENINFO, FBIOGET_VSCREENINFO, FB_FIX_SIZE, FB_VAR_SIZE,
@@ -8657,6 +8659,8 @@ mod desktop_b_tests {
                 vt_abi::MAGIC,
                 "vtconsole: read() snapshot starts with PGVT"
             );
+            // Регрессия клиента `pagh-terminal --vt`: см. helper ниже.
+            check_vtconsole_lazy_read(fd, info.total_bytes);
 
             assert_eq_kernel!(
                 mem_sys::sys_munmap(base, info.total_bytes as u64),
@@ -8744,6 +8748,58 @@ mod desktop_b_tests {
             "vtconsole: routine returned every PMM frame (surface is preallocated)"
         );
         crate::kprintln!("[VT] selftest: vtinput injected; expecting shell echo after return");
+    }
+
+    /// Регрессия `read(2)` в ещё не подпертый буфер — ровно то, что делает
+    /// `pagh-terminal --vt`: клиент читает остаток снимка в свежий анонимный
+    /// mmap. Сплошная проверка присутствия отвергала такой законный буфер
+    /// `EFAULT`'ом, и второе окно терминала падало на kernel VT-мост.
+    fn check_vtconsole_lazy_read(fd: u64, total_bytes: u32) {
+        let rest = total_bytes as u64 - 128;
+        let lazy = match mem_sys::sys_mmap(
+            0,
+            rest,
+            (PROT_READ | PROT_WRITE) as u64,
+            (MAP_PRIVATE | MAP_ANONYMOUS) as u64,
+            u64::MAX,
+            0,
+        ) {
+            Ok(base) => base,
+            Err(_) => {
+                assert_eq_kernel!(0, 1, "vtconsole: lazy mmap for read() failed");
+                return;
+            }
+        };
+        assert_kernel!(
+            vmm::virt_to_phys(lazy).is_none(),
+            "vtconsole: regression buffer starts demand-paged"
+        );
+        assert_eq_kernel!(
+            io_sys::sys_read(fd, lazy, rest),
+            Ok(rest),
+            "vtconsole: read() fills a demand-paged buffer"
+        );
+        let mut marker_rest = false;
+        for cell in 0..(rest as usize / 16).saturating_sub(2) {
+            // SAFETY: `lazy` — валидное пользовательское отображение длины
+            // `rest`, страницы подперты чтением выше; codepoint лежит в первых
+            // 4 байтах 16-байтной клетки.
+            let cp = |k: usize| unsafe {
+                core::ptr::read_unaligned((lazy as *const u8).add((cell + k) * 16) as *const u32)
+            };
+            if cp(0) == 'v' as u32 && cp(1) == 't' as u32 && cp(2) == '-' as u32 {
+                marker_rest = true;
+            }
+        }
+        assert_kernel!(
+            marker_rest,
+            "vtconsole: read() cell snapshot carries the shell marker"
+        );
+        assert_eq_kernel!(
+            mem_sys::sys_munmap(lazy, rest),
+            Ok(0),
+            "vtconsole: munmap of the read() buffer"
+        );
     }
 
     /// SCM_RIGHTS по AF_UNIX socketpair: данные и memfd в одном `sendmsg`,
