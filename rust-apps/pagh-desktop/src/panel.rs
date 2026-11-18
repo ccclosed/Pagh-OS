@@ -226,7 +226,7 @@ impl Panel {
             canvas.text(x, rect.y + (rect.h - 16) / 2, 1, theme.chip_text, s);
         }
 
-        // Сеть: иконка Wi-Fi. Выключенная сеть приглушена.
+        // Сеть: проводной порт (ethernet). Выключенная сеть приглушена.
         let net = network_rect(screen);
         if hover == Some(PanelHover::Network) {
             canvas.fill_rounded_rect(net.inset(2), 8, theme.panel_hover, 220);
@@ -327,21 +327,36 @@ fn draw_icon(canvas: &mut Canvas, icon: PanelIcon, cell: Rect, theme: &Theme) {
     }
 }
 
+/// Сеть: проводной порт (ethernet), а не Wi-Fi-дуги.
+///
+/// У машины нет Wi-Fi: линк приходит либо с e1000 (провод), либо с RNDIS
+/// поверх USB (тетеринг телефона), а референс Win11 «Сети» — «Проводное
+/// подключение» с ethernet-иконкой. Форма повторяет иконку карточки
+/// подключения во флайауте (`compositor::draw_wired_icon`): корпус 20×15 с
+/// вырезанной внутренностью, четыре контакта разъёма и кабель вниз; так
+/// панель и флайаут показывают один и тот же тип линка.
 fn draw_network(canvas: &mut Canvas, rect: Rect, theme: &Theme, online: bool) {
     let color: Color = if online {
         theme.panel_icon
     } else {
         theme.panel_icon_dim
     };
-    let center = Point::new(rect.center().x, rect.bottom() - 8);
-    canvas.fill_circle(center, 2, if online { theme.accent } else { color }, 255);
-    for (radius, thickness) in [(6, 2), (11, 2), (16, 2)] {
-        canvas.arc(center, radius, 218.0, 322.0, color, thickness);
+    let center = rect.center();
+    let shell = Rect::new(center.x - 10, center.y - 9, 20, 15);
+    canvas.fill_rounded_rect(shell, 2, color, 255);
+    // Внутренность вырезается цветом панели — контур остаётся контурным,
+    // как у соседних иконок (`draw_icon` для терминала делает то же самое).
+    canvas.fill_rounded_rect(shell.inset(2), 1, theme.panel_bg, 255);
+    // Четыре контакта разъёма.
+    for dx in [-6, -2, 2, 6] {
+        canvas.vline(center.x + dx, shell.y + 4, shell.y + 10, color);
     }
+    // Кабель уходит вниз от корпуса.
+    canvas.vline(center.x, shell.bottom(), shell.bottom() + 3, color);
     if !online {
         canvas.line(
-            Point::new(rect.x + 6, rect.bottom() - 6),
-            Point::new(rect.right() - 6, rect.y + 6),
+            Point::new(center.x - 11, center.y + 11),
+            Point::new(center.x + 11, center.y - 11),
             theme.button_close,
             2,
         );
@@ -417,5 +432,76 @@ mod tests {
             lit > 40,
             "часы и дата должны быть нарисованы, пикселей {lit}"
         );
+    }
+
+    /// Собрать кадр панели для пиксельных проверок иконки сети.
+    fn panel_frame(online: bool) -> Canvas {
+        let mut canvas = Canvas::new(1280, 720, crate::color::rgb(0, 0, 0));
+        let mut panel = Panel::new("23:38", "15.11.2026");
+        panel.network_online = online;
+        panel.draw(&mut canvas, SCREEN, &Theme::default(), None, &[]);
+        canvas
+    }
+
+    #[test]
+    fn network_icon_is_a_wired_port_not_wifi_arcs() {
+        let theme = Theme::default();
+        let canvas = panel_frame(true);
+        let net = network_rect(SCREEN);
+        let center = net.center();
+
+        // Wi-Fi-дуги старого образца расходились радиусом 16 от нижней точки
+        // блока и зажигали пиксели за ±15 по X. Проводная иконка укладывается
+        // в 20×19 вокруг центра: всё, что шире ±11, — это снова дуги.
+        // Фон панели — вертикальный градиент, поэтому «зажжённость» считается
+        // против цвета той же строки вне иконки (x = 500 — пустая область).
+        let mut widest = 0;
+        let mut lit = 0;
+        for y in net.y..net.bottom() {
+            let bg = canvas.get(500, y);
+            for x in net.x..net.right() {
+                if canvas.get(x, y) != bg {
+                    lit += 1;
+                    widest = widest.max((x - center.x).abs());
+                }
+            }
+        }
+        assert!(lit > 60, "иконка сети не нарисована, пикселей {lit}");
+        assert!(
+            widest <= 11,
+            "иконка шире проводной формы: вылет {widest} px (Wi-Fi-дуги давали >= 15)"
+        );
+
+        // Контур корпуса порта: рамка по краям, вырезанная внутренность.
+        assert_eq!(canvas.get(center.x - 10, center.y), theme.panel_icon);
+        assert_eq!(canvas.get(center.x + 9, center.y), theme.panel_icon);
+        assert_eq!(canvas.get(center.x - 4, center.y - 3), theme.panel_bg);
+        // Четыре контакта разъёма в один ряд.
+        for dx in [-6, -2, 2, 6] {
+            assert_eq!(
+                canvas.get(center.x + dx, center.y - 4),
+                theme.panel_icon,
+                "нет контакта при dx={dx}"
+            );
+        }
+        // Кабель уходит вниз от корпуса.
+        assert_eq!(canvas.get(center.x, center.y + 7), theme.panel_icon);
+    }
+
+    #[test]
+    fn network_icon_dims_and_strikes_when_offline() {
+        let theme = Theme::default();
+        let online = panel_frame(true);
+        let offline = panel_frame(false);
+        let center = network_rect(SCREEN).center();
+        assert_eq!(online.get(center.x - 10, center.y), theme.panel_icon);
+        assert_eq!(offline.get(center.x - 10, center.y), theme.panel_icon_dim);
+        // Диагональ «нет сети» — единственное, что красится `button_close`.
+        let struck = offline
+            .pixels()
+            .iter()
+            .filter(|p| **p == theme.button_close)
+            .count();
+        assert!(struck > 0, "в отключённом состоянии нет диагонали");
     }
 }
