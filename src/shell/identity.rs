@@ -24,7 +24,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::identity_db::{self, GroupEntry, UserEntry};
-use crate::arch::x86_64::linux::cred::Creds;
+use crate::arch::x86_64::linux::cred::{Creds, GROUPS_CAP};
 use crate::sync::spinlock::Spinlock;
 
 /// Путь, который видят и shell (VFS), и Linux-программы (гостевое отображение
@@ -43,13 +43,126 @@ static SESSION: Spinlock<Option<Creds>> = Spinlock::new(None);
 
 /// Текущая сессионная идентичность (root, пока `su` не сменил её).
 pub fn current() -> Creds {
+    ensure_boot_session();
     let stored = *SESSION.lock();
     stored.unwrap_or(Creds::ROOT)
 }
 
-/// Заменить сессионную идентичность (только из обработчика `su`).
+/// Заменить сессионную идентичность (только из обработчиков `su`/`login`).
 pub fn set_session(creds: Creds) {
     *SESSION.lock() = Some(creds);
+}
+
+/// Почему [`login_creds`] не смог построить идентичность входа.
+///
+/// Отдельный тип, а не `Option`: `su`/`login` печатают разные сообщения для
+/// «нет такого пользователя» и «база групп недоступна», и эти два случая нельзя
+/// молча смешивать с «войти нельзя».
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginError {
+    /// Нет записи в `/etc/passwd`.
+    UnknownUser,
+    /// `/etc/group` не разбирается (пустой результат при существующем
+    /// пользователе) — набор групп не построить.
+    GroupDatabase,
+    /// Пользователь состоит в большем числе групп, чем [`GROUPS_CAP`].
+    TooManyGroups,
+    /// Цель — uid 0 (`root`): вход root в этой модели не через пароль, а как
+    /// явный сброс root-сессии, и `login_creds` его не выдаёт.
+    RootTarget,
+}
+
+/// Креденшелы входа пользователя `name` из `/etc/passwd` + `/etc/group`.
+///
+/// Это единственное место, где строится «настоящая» не-root идентичность:
+/// `uid = euid = suid =` uid записи, `gid = egid = sgid =` её gid, а
+/// дополнительные группы — явные членства из `/etc/group` (как `setgroups(2)`
+/// перед `setuid(2)` в Linux login). `root` (uid 0) не выдаётся: сброс
+/// root-сессии — отдельная явная операция, а не «вход».
+pub fn login_creds(name: &str) -> Result<Creds, LoginError> {
+    let user = lookup_user(name).ok_or(LoginError::UnknownUser)?;
+    if user.uid == 0 {
+        return Err(LoginError::RootTarget);
+    }
+    let supplementary =
+        supplementary_groups_for_user(&user.name).ok_or(LoginError::GroupDatabase)?;
+    if supplementary.len() > GROUPS_CAP {
+        return Err(LoginError::TooManyGroups);
+    }
+    Creds::for_login(user.uid, user.gid, &supplementary).ok_or(LoginError::TooManyGroups)
+}
+
+/// Файл, задающий **стартовую** идентичность shell (опция запуска desktop/
+/// autorun не от root).
+///
+/// Первая непустая строка, не начинающаяся с `#`, — имя пользователя
+/// `/etc/passwd`. Файла нет — сессия стартует как root (историческое
+/// поведение). Битая строка/неизвестный пользователь — сессия остаётся root, а
+/// причина печатается в лог: boot не должен зависеть от содержимого файла.
+///
+/// `provision.rs` намеренно **не** создаёт этот файл: по умолчанию всё как
+/// раньше, а включение не-root сессии — явное действие администратора
+/// (`write /mnt/etc/pagh-session oleg` + перезагрузка).
+pub const SESSION_PATH: &str = "/mnt/etc/pagh-session";
+
+/// Читался ли уже [`SESSION_PATH`] (решение принимается один раз за загрузку).
+static BOOT_SESSION_READ: Spinlock<bool> = Spinlock::new(false);
+
+/// Первое имя пользователя из [`SESSION_PATH`]; `None`, если файла нет,
+/// только комментарии/пустые строки или чтение не удалось.
+fn boot_session_name() -> Option<String> {
+    let text = read_text(SESSION_PATH);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let name = line.split_whitespace().next()?;
+        return Some(String::from(name));
+    }
+    None
+}
+
+/// Применить [`SESSION_PATH`] к сессии при первом обращении.
+///
+/// Вызывается из [`current`] лениво: shell готова к VFS-чтению только когда
+/// команды уже исполняются, поэтому первое `id`/`su`/`lxrun` и есть корректная
+/// точка входа. Ошибка не фатальна — сессия остаётся root, причина в логе.
+fn ensure_boot_session() {
+    {
+        let mut read = BOOT_SESSION_READ.lock();
+        if *read {
+            return;
+        }
+        *read = true;
+    }
+    let Some(name) = boot_session_name() else {
+        return;
+    };
+    // Сессию уже мог сменить `su` в этой же загрузке — не перетираем её.
+    if SESSION.lock().is_some() {
+        return;
+    }
+    match login_creds(&name) {
+        Ok(creds) => {
+            *SESSION.lock() = Some(creds);
+            crate::info!(
+                "[session] boot identity from {}: {} (uid={} gid={})",
+                SESSION_PATH,
+                name,
+                creds.uid,
+                creds.gid
+            );
+        }
+        Err(err) => {
+            crate::warn!(
+                "[session] {}: '{}' unusable ({:?}); session stays root",
+                SESSION_PATH,
+                name,
+                err
+            );
+        }
+    }
 }
 
 /// Прочитать файл VFS в `String`; пустая строка при любой ошибке.
