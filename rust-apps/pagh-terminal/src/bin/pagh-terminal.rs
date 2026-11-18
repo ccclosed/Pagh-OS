@@ -74,7 +74,10 @@ impl Default for Args {
             select: None,
             window: true,
             focused: true,
-            title: "PaghTerm".to_string(),
+            // The compositor draws the window title bar, so this string is what
+            // the user sees above the grid: the session name, not a product
+            // name.  One kernel-VT means one session — no tab-style label.
+            title: "vt0 — Pagh Terminal".to_string(),
             window_id: 101,
             feed: None,
             screenshots: None,
