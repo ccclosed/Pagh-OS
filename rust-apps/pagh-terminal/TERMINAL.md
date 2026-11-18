@@ -186,8 +186,10 @@ wide wrap, selection, resize, DECRQM, malformed sequences.  Плюс unit-тес
   em 16 px).  Ассеты генерируются `tools/gen_font.py` (нужны Pillow/fontTools
   только на хосте): 1203 узких + 487 широких глифов, coverage 0–255.
   Лицензии шрифтов — `fonts/LICENSES.md`, OFL 1.1.
-* `Theme` (teal-dark): фон `#0e161b`, foreground `#d8e6e3`, accent
-  `#2fd4b0`, палитра xterm 256, отдельные цвета title/status/selection/cursor.
+* `Theme` (Breeze dark, как у Konsole): фон `#232627`, foreground `#eff0f1`,
+  блочный курсор, приглушённый `#7f8c8d` для неfocused-курсора и скроллбара,
+  `#31363b` для полосы заголовка; ANSI 0–15 — стандартные значения Breeze,
+  16–255 — обычный xterm-куб.
 * SGR-резолвинг: palette/truecolor, bold (bright + лёгкое усиление),
   dim, reverse, hidden, blink (фаза), underline/strikethrough/overline,
   italic (синтетический наклон), DECSCNM.
@@ -199,9 +201,12 @@ wide wrap, selection, resize, DECRQM, malformed sequences.  Плюс unit-тес
   foreground берутся из темы.
 * Scrollback: до 10 000 строк (настраивается), вытеснение oldest-first,
   абсолютные координаты selection не сдвигаются; view offset и scrollbar.
-* Окно для скриншотов: title bar с индикаторами, кнопками `— □ ×`, статус
-  `cols×rows  UTF-8  ANSI 256  SB n  cursor`, accent-полоса.  В live-режиме
-  decorations рисует compositor, клиент коммитит только содержимое (с padding).
+* Окно для скриншотов: одна тонкая полоса `#31363b` с именем сессии
+  `vt0 — Pagh Terminal` приглушённым мелким шрифтом, без индикаторов, кнопок,
+  статус-строки и accent-полосы; отступ сетки 2 px, контент на всю площадь.
+  В live-режиме decorations рисует compositor (`PROTOCOL.md` §10), поэтому
+  клиент коммитит только содержимое (с padding) и оконные кнопки не дублирует.
+  Вкладок нет: терминал зеркалит один kernel-VT (`/dev/vtconsole0`).
 * PNG: RGBA8, filter 0, zlib stored blocks; валидный PNG без внешних
   зависимостей, decoder проверяет CRC/Adler/LEN и читает только собственный
   подмножество (для golden-тестов).  Размер файла ~1–1.7 MB на кадр — цена

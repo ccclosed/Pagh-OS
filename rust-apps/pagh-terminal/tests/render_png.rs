@@ -4,8 +4,7 @@ use pagh_terminal::cell::Rgb;
 use pagh_terminal::demo;
 use pagh_terminal::png;
 use pagh_terminal::render::{
-    render_screen, render_window, Canvas, RenderOptions, Theme, BORDER, STATUS_H, TITLE_H,
-    VIEWPORT_PADDING,
+    render_screen, render_window, Canvas, RenderOptions, Theme, BORDER, TITLE_H, VIEWPORT_PADDING,
 };
 use pagh_terminal::screen::{Screen, SelectionMode};
 use pagh_terminal::Terminal;
@@ -102,15 +101,13 @@ fn scrollbar_appears_only_with_scrollback() {
     terminal.feed_str("1\r\n2\r\n3\r\n4\r\n5");
     let theme = theme();
     let with_sb = render_screen(&terminal.screen, &theme, &RenderOptions::default());
-    let x = VIEWPORT_PADDING + 8 * 8 + 2;
-    let found = (VIEWPORT_PADDING..with_sb.height - VIEWPORT_PADDING)
-        .any(|y| with_sb.pixel(x, y)[..3] == theme.accent.to_array());
+    let x = VIEWPORT_PADDING + 8 * 8;
+    let found = (0..with_sb.height).any(|y| with_sb.pixel(x, y)[..3] == theme.scrollbar.to_array());
     assert!(found, "scrollback thumb should be painted");
 
     let empty = Screen::new(8, 3);
     let no_sb = render_screen(&empty, &theme, &RenderOptions::default());
-    let found = (VIEWPORT_PADDING..no_sb.height - VIEWPORT_PADDING)
-        .any(|y| no_sb.pixel(x, y)[..3] == theme.accent.to_array());
+    let found = (0..no_sb.height).any(|y| no_sb.pixel(x, y)[..3] == theme.scrollbar.to_array());
     assert!(!found);
 }
 
@@ -151,14 +148,18 @@ fn window_chrome_dimensions_and_title_bar() {
     assert_eq!(canvas.width, VIEWPORT_PADDING * 2 + 20 * 8 + BORDER * 2);
     assert_eq!(
         canvas.height,
-        VIEWPORT_PADDING * 2 + 5 * 18 + BORDER * 2 + TITLE_H + STATUS_H
+        VIEWPORT_PADDING * 2 + 5 * 18 + BORDER * 2 + TITLE_H
     );
-    // Title bar background is distinct from the terminal background.
+    // Thin title strip, distinct from the grid background; a hairline separates
+    // it from the content, and there is no status bar or button cluster.
     assert_eq!(&canvas.pixel(20, 10)[..3], &theme.title_bg.to_array());
-    // Status bar exists at the bottom.
     assert_eq!(
-        &canvas.pixel(4, canvas.height - 3)[..3],
-        &theme.status_bg.to_array()
+        &canvas.pixel(20, BORDER + TITLE_H - 1)[..3],
+        &theme.border.to_array()
+    );
+    assert_eq!(
+        &canvas.pixel(4, canvas.height - 1)[..3],
+        &theme.bg.to_array()
     );
 }
 
