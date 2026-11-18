@@ -1421,11 +1421,59 @@ impl Server {
         }
     }
 
+    /// Запустить приложение по событию композитора (иконка панели, пункт меню,
+    /// хоткей Ctrl+Alt+T).
+    ///
+    /// Сначала ищется цель `launch_targets` по `AppKind::id()` — панель/меню
+    /// обязаны открывать тот же бинарник, что и клиентский PDP `launch`
+    /// (type 13); иначе MVP-образ поднимал бы демо-клиент вместо реального
+    /// приложения. Цели нет — прежний фолбэк: демо-клиент (`spawn_demo`) или
+    /// диагностика в stderr (сервер продолжает работать).
     fn launch(&mut self, app: AppKind) {
+        if let Some(target) = self
+            .options
+            .launch_targets
+            .iter()
+            .find(|target| target.app == app.id())
+            .cloned()
+        {
+            let argv = target.command_for(&self.options.socket);
+            if let Err(error) = self.spawn_target(app.id(), &argv) {
+                if !self.options.quiet {
+                    eprintln!("pagh-desktop: launch {}: {error}", app.id());
+                }
+            }
+            return;
+        }
         if let Err(error) = self.spawn_demo(app) {
             if !self.options.quiet {
                 eprintln!("pagh-desktop: launch {}: {error}", app.id());
             }
+        }
+    }
+
+    /// Запустить готовую argv приложения из `launch_targets`.
+    ///
+    /// Общий путь `launch_app` (клиент PDP, type 13) и `launch` (панель/меню/
+    /// хоткей): argv уже содержит подставленный сокет (`LaunchTarget::command_for`),
+    /// дочерний процесс попадает в `children` и reap'ится в главном цикле.
+    fn spawn_target(&mut self, app: &str, argv: &[std::ffi::OsString]) -> Result<(), String> {
+        let Some(program) = argv.first() else {
+            return Err(format!("пустая команда для {app}"));
+        };
+        match Command::new(program).args(&argv[1..]).spawn() {
+            Ok(child) => {
+                if !self.options.quiet {
+                    eprintln!(
+                        "pagh-desktop: launch {app} ok -> {} (pid {})",
+                        program.to_string_lossy(),
+                        child.id()
+                    );
+                }
+                self.children.push(child);
+                Ok(())
+            }
+            Err(err) => Err(format!("запуск {app}: {err}")),
         }
     }
 
@@ -1484,27 +1532,14 @@ impl Server {
             .cloned()
         {
             let argv = target.command_for(&self.options.socket);
-            let Some(program) = argv.first() else {
-                self.reply_error(conn, ERR_UNSUPPORTED, format!("пустая команда для {app}"));
-                return;
-            };
-            match Command::new(program).args(&argv[1..]).spawn() {
-                Ok(child) => {
-                    if !self.options.quiet {
-                        eprintln!(
-                            "pagh-desktop: launch {} ok -> {} (pid {})",
-                            app,
-                            program.to_string_lossy(),
-                            child.id()
-                        );
-                        if !cwd.is_empty() {
-                            eprintln!("pagh-desktop: launch {app}: cwd {cwd} (подсказка)");
-                        }
+            match self.spawn_target(app, &argv) {
+                Ok(()) => {
+                    if !self.options.quiet && !cwd.is_empty() {
+                        eprintln!("pagh-desktop: launch {app}: cwd {cwd} (подсказка)");
                     }
-                    self.children.push(child);
                 }
-                Err(err) => {
-                    self.reply_error(conn, ERR_INTERNAL, format!("запуск {app}: {err}"));
+                Err(error) => {
+                    self.reply_error(conn, ERR_INTERNAL, error);
                 }
             }
             return;

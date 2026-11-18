@@ -2,7 +2,9 @@
 //! устойчивость к мусору в сокете.
 
 use pagh_desktop::client::Client;
-use pagh_desktop::protocol::{key, Message, ERR_BAD_MESSAGE, ERR_UNSUPPORTED, WELCOME_SHM_SURFACE};
+use pagh_desktop::protocol::{
+    key, Message, ERR_BAD_MESSAGE, ERR_UNSUPPORTED, MOD_ALT, MOD_CTRL, WELCOME_SHM_SURFACE,
+};
 use pagh_desktop::server::{unique_socket_path, LaunchTarget, Server, ServerHandle, ServerOptions};
 use pagh_desktop::surface::{PixelFormat, Surface};
 use std::io::{Seek, SeekFrom, Write};
@@ -343,6 +345,216 @@ fn launch_message_spawns_configured_app() {
     let (code, message) = error.expect("ошибка на неизвестное приложение");
     assert_eq!(code, ERR_UNSUPPORTED, "message = {message:?}");
     assert!(message.contains("paint"), "message = {message:?}");
+
+    server.control.shutdown();
+    server.join().expect("сервер завершился");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Уникальный каталог для стабов и маркеров теста.
+fn scratch_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "pagh-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Исполняемый `/bin/sh`-стаб: дописывает свою argv строкой в `marker`.
+fn stub_app(dir: &Path, name: &str, marker: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = dir.join(name);
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    script
+}
+
+/// Панель/меню/хоткей (`Server::launch`, Ctrl+Alt+T) обязаны открывать цель из
+/// `launch_targets`, а не демо-клиент: иначе MVP-образ по клику поднимает
+/// `pagh-desktop-demo`, хотя цель настроена на реальный бинарник.
+#[test]
+fn hotkey_launches_configured_target_not_demo() {
+    let dir = scratch_dir("hotkey-target");
+    let target_marker = dir.join("target.txt");
+    let demo_marker = dir.join("demo.txt");
+    let target = stub_app(&dir, "target.sh", &target_marker);
+    let demo = stub_app(&dir, "demo.sh", &demo_marker);
+    let socket = unique_socket_path("hotkey-target");
+    let options = ServerOptions {
+        socket: socket.clone(),
+        width: 640,
+        height: 480,
+        quiet: true,
+        // Демо включён явно: если `launch` пойдёт старым путём, маркер появится.
+        spawn_demo: true,
+        demo_binary: Some(demo),
+        launch_targets: vec![LaunchTarget::new(
+            "terminal",
+            vec![
+                target.to_string_lossy().into_owned(),
+                "--socket".to_string(),
+                "{socket}".to_string(),
+            ],
+        )],
+        ..ServerOptions::default()
+    };
+    let server = Server::spawn(options).expect("сервер стартует");
+    server.control.key(key::T, true, MOD_CTRL | MOD_ALT);
+
+    assert!(
+        wait_for(Duration::from_secs(5), || target_marker.exists()),
+        "хоткей не запустил цель из launch_targets"
+    );
+    let argv = std::fs::read_to_string(&target_marker).unwrap();
+    assert!(
+        argv.contains(&socket.to_string_lossy().into_owned()),
+        "в argv цели нет пути сокета: {argv:?}"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !demo_marker.exists(),
+        "хоткей запустил демо-клиент вместо настроенной цели"
+    );
+
+    server.control.shutdown();
+    server.join().expect("сервер завершился");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Без цели `launch` сохраняет прежний фолбэк: демо-клиент с `--app <id>`.
+#[test]
+fn hotkey_without_target_falls_back_to_demo() {
+    let dir = scratch_dir("hotkey-demo");
+    let demo_marker = dir.join("demo.txt");
+    let demo = stub_app(&dir, "demo.sh", &demo_marker);
+    let socket = unique_socket_path("hotkey-demo");
+    let options = ServerOptions {
+        socket: socket.clone(),
+        width: 640,
+        height: 480,
+        quiet: true,
+        spawn_demo: true,
+        demo_binary: Some(demo),
+        ..ServerOptions::default()
+    };
+    let server = Server::spawn(options).expect("сервер стартует");
+    server.control.key(key::T, true, MOD_CTRL | MOD_ALT);
+
+    assert!(
+        wait_for(Duration::from_secs(5), || demo_marker.exists()),
+        "фолбэк на демо-клиент не сработал"
+    );
+    let argv = std::fs::read_to_string(&demo_marker).unwrap();
+    assert!(
+        argv.contains("--app terminal"),
+        "демо-клиент запущен без --app terminal: {argv:?}"
+    );
+
+    server.control.shutdown();
+    server.join().expect("сервер завершился");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ни цели, ни демо: `launch` только пишет диагностику — сервер жив и отвечает.
+#[test]
+fn hotkey_without_target_or_demo_keeps_server_alive() {
+    let socket = unique_socket_path("hotkey-none");
+    let options = ServerOptions {
+        socket: socket.clone(),
+        width: 640,
+        height: 480,
+        quiet: true,
+        ..ServerOptions::default()
+    };
+    let server = Server::spawn(options).expect("сервер стартует");
+    let mut client = Client::connect_retry(&socket, 200).expect("клиент подключается");
+    client.hello("hotkey-none").expect("hello");
+
+    server.control.key(key::T, true, MOD_CTRL | MOD_ALT);
+    client.ping(7).expect("ping");
+    let mut got = None;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let Some(Message::Pong { nonce }) = client
+            .next_message(Duration::from_millis(100))
+            .expect("чтение")
+        {
+            got = Some(nonce);
+            break;
+        }
+    }
+    assert_eq!(got, Some(7), "сервер не ответил pong после launch без цели");
+    assert!(
+        server.control.is_running(),
+        "сервер завершился после launch"
+    );
+
+    server.control.shutdown();
+    server.join().expect("сервер завершился");
+}
+
+/// `--autostart APP` открывает цель сразу после старта и ровно один раз.
+#[test]
+fn autostart_opens_target_once_at_startup() {
+    let dir = scratch_dir("autostart");
+    let target_marker = dir.join("target.txt");
+    let demo_marker = dir.join("demo.txt");
+    let target = stub_app(&dir, "target.sh", &target_marker);
+    let demo = stub_app(&dir, "demo.sh", &demo_marker);
+    let socket = unique_socket_path("autostart");
+    let options = ServerOptions {
+        socket: socket.clone(),
+        width: 640,
+        height: 480,
+        quiet: true,
+        spawn_demo: true,
+        demo_binary: Some(demo),
+        launch_targets: vec![LaunchTarget::new(
+            "terminal",
+            vec![
+                target.to_string_lossy().into_owned(),
+                "--socket".to_string(),
+                "{socket}".to_string(),
+            ],
+        )],
+        autostart: Some("terminal".to_string()),
+        ..ServerOptions::default()
+    };
+    let server = Server::spawn(options).expect("сервер стартует");
+
+    assert!(
+        wait_for(Duration::from_secs(5), || target_marker.exists()),
+        "autostart не запустил цель"
+    );
+    // Главный цикл успевает пройти много итераций: без флага «уже запущено»
+    // маркер пополнялся бы каждый кадр.
+    std::thread::sleep(Duration::from_millis(400));
+    let launches = std::fs::read_to_string(&target_marker)
+        .unwrap()
+        .lines()
+        .count();
+    assert_eq!(launches, 1, "autostart сработал больше одного раза");
+    let argv = std::fs::read_to_string(&target_marker).unwrap();
+    assert!(
+        argv.contains(&socket.to_string_lossy().into_owned()),
+        "в argv autostart-цели нет пути сокета: {argv:?}"
+    );
+    assert!(!demo_marker.exists(), "autostart ушёл в демо-клиент");
 
     server.control.shutdown();
     server.join().expect("сервер завершился");
