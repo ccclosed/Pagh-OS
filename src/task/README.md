@@ -160,6 +160,19 @@ sched_yield, tgkill и др.).
   `EINVAL` до аллокации; `FdSlots::alloc`/`try_alloc`/`try_set` независимо не дают вектору
   вырасти за предел (`EMFILE`), поэтому `open`/`pipe`/`socketpair` на полной таблице
   возвращают `EMFILE`, а `pipe` освобождает первый конец, если второй не помещается.
+- **Координаты байтового потока в `PipeState` — одна шкала, и двигают её ОБА
+  пути записи.** `written_total` — координата, в которой `write_scm` регистрирует
+  `SCM_RIGHTS`; `read_total` — сколько байт потока уже потреблено, и `read_scm`
+  выбрасывает cmsg с `pos < read_total` как «пройденную» (семантика `read(2)`,
+  который ancillary data не принимает). Поэтому `PipeEndpoint::write` обязан
+  двигать `written_total` ровно так же, как `write_scm`: без этого первое
+  `sendmsg` с fd после любой обычной записи получает `pos = 0`, fd молча
+  теряется, а `recvmsg` возвращает данные без cmsg. Именно так `SHM_OFFER`
+  терял memfd (`hello`/`create` уходят `write(2)`, memfd — следующим
+  `sendmsg`), клиент получал `EPIPE`, а окно навсегда оставалось с
+  плейсхолдером; same-process selftest этого не видел, потому что весь его
+  трафик идёт через `sendmsg`/`recvmsg`. Регрессия —
+  `desktop-b::SCM_RIGHTS after plain write (SHM_OFFER shape)`.
 - `spawn`/`requeue` дропают дубликат уже стоящего в очереди pid (лог `[SCHED] DOUBLE ENQUEUE`).
 - `setup_task_kernel_stack` перепрограммирует единственный глобальный слот RSP0/syscall-стека —
   fork/clone обязаны вернуть его на РОДИТЕЛЯ перед возвратом.

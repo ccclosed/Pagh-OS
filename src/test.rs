@@ -8982,6 +8982,185 @@ mod desktop_b_tests {
         );
     }
 
+    /// `SCM_RIGHTS` после **обычной** записи в тот же поток — форма `SHM_OFFER`.
+    ///
+    /// Регрессия, найденная на живом desktop: `PipeEndpoint::write` не двигал
+    /// `written_total`, поэтому первое `sendmsg` с fd после любого `write(2)`
+    /// регистрировало cmsg в координате 0 — ПОЗАДИ `read_total` — и `read_scm`
+    /// выбрасывал её как «пройденную». Получатель видел данные без fd.
+    ///
+    /// Ровно это и убивало каждого реального клиента: `hello`/`create` уходят
+    /// через `write(2)`, memfd — следующим `sendmsg`; композитор отвечал
+    /// `shm_offer без SCM_RIGHTS fd` и закрывал соединение (клиент — `EPIPE`,
+    /// окно навсегда с плейсхолдером «waiting for first frame»). Прежние
+    /// routine'ы этой формы не покрывали: у них весь трафик шёл через
+    /// `sendmsg`/`recvmsg`, где обе координаты ведёт один и тот же код, поэтому
+    /// расхождение счётчиков не проявлялось, и same-process selftest оставался
+    /// зелёным.
+    pub fn scm_rights_after_plain_write() {
+        let frames_before = pmm::free_frames();
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            assert_eq_kernel!(
+                io_sys::sys_socketpair(1, 1, 0, SCRATCH_VA + 0x40),
+                Ok(0),
+                "scm-plain: socketpair(AF_UNIX, SOCK_STREAM)"
+            );
+            let a = get_u32(0x40) as u64;
+            let b = get_u32(0x44) as u64;
+
+            // ── история потока: два кадра обычной записью, чтение — recvmsg ──
+            // (клиент пишет `write(2)`, серверный read_loop читает `recvmsg`.)
+            put(0x100, b"HELLO");
+            assert_eq_kernel!(
+                io_sys::sys_write(a, SCRATCH_VA + 0x100, 5),
+                Ok(5),
+                "scm-plain: hello via plain write(2)"
+            );
+            put(0x140, &[0u8; 16]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 16);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, SCRATCH_VA + 0x1c0, 64);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0),
+                Ok(5),
+                "scm-plain: recvmsg returns the plain-written hello"
+            );
+            // SAFETY: scratch writable, данные лежат по 0x140.
+            assert_eq_kernel!(
+                unsafe { core::slice::from_raw_parts((SCRATCH_VA + 0x140) as *const u8, 5) },
+                b"HELLO",
+                "scm-plain: hello payload intact"
+            );
+            assert_eq_kernel!(
+                get_u64(0x080 + 40),
+                0,
+                "scm-plain: no ancillary data on a plain write"
+            );
+
+            put(0x100, b"CREATE");
+            assert_eq_kernel!(
+                io_sys::sys_write(a, SCRATCH_VA + 0x100, 6),
+                Ok(6),
+                "scm-plain: create via plain write(2)"
+            );
+            put(0x140, &[0u8; 16]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 16);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, SCRATCH_VA + 0x1c0, 64);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0),
+                Ok(6),
+                "scm-plain: recvmsg returns the plain-written create"
+            );
+
+            // ── теперь memfd тем же потоком: cmsg обязан дойти ──
+            const MAGIC: u64 = 0x5343_4D50_4C41_494E; // "SCMPLAIN"
+            let (memfd, node) = make_shm(b"scm-plain", MAGIC);
+            put(0x100, b"OFFER");
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 5);
+            let space = put_cmsg_rights(0x180, &[memfd as i32]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x180, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Ok(5),
+                "scm-plain: sendmsg carries the offer + memfd"
+            );
+
+            put(0x140, &[0u8; 16]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 16);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, SCRATCH_VA + 0x1c0, 64);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0),
+                Ok(5),
+                "scm-plain: recvmsg returns the offer"
+            );
+            // SAFETY: scratch writable, данные лежат по 0x140.
+            assert_eq_kernel!(
+                unsafe { core::slice::from_raw_parts((SCRATCH_VA + 0x140) as *const u8, 5) },
+                b"OFFER",
+                "scm-plain: offer payload arrives"
+            );
+            // Главная проверка: fd не потерялся после обычной записи в поток.
+            assert_eq_kernel!(
+                get_u64(0x080 + 40),
+                24,
+                "scm-plain: msg_controllen = CMSG_SPACE(sizeof(int))"
+            );
+            assert_eq_kernel!(
+                get_u32(0x080 + 48) & 0x8,
+                0,
+                "scm-plain: no MSG_CTRUNC — the control buffer had room"
+            );
+            assert_eq_kernel!(get_u64(0x1c0), 20, "scm-plain: cmsg_len = CMSG_LEN(4)");
+            assert_eq_kernel!(get_u32(0x1c0 + 8), 1, "scm-plain: cmsg_level = SOL_SOCKET");
+            assert_eq_kernel!(get_u32(0x1c0 + 12), 1, "scm-plain: cmsg_type = SCM_RIGHTS");
+            let got = get_i32(0x1c0 + 16);
+            assert_kernel!(
+                got >= 3 && got as u64 != memfd,
+                "scm-plain: receiver gets a fresh dup descriptor"
+            );
+            assert_eq_kernel!(
+                read_shm_word(got as u64),
+                MAGIC,
+                "scm-plain: the received fd reads the sender's memfd page"
+            );
+            // SAFETY: scratch readable; узел установленного fd.
+            assert_kernel!(
+                io_sys::file_node_for_fd(got as u32)
+                    .map(|n| Arc::ptr_eq(&n, &node))
+                    .unwrap_or(false),
+                "scm-plain: received fd refers to the same open file"
+            );
+
+            // ── точки потока продолжают сходиться после передачи fd ──
+            put(0x100, b"TAIL");
+            assert_eq_kernel!(
+                io_sys::sys_write(a, SCRATCH_VA + 0x100, 4),
+                Ok(4),
+                "scm-plain: plain write after the fd-carrying frame"
+            );
+            put(0x140, &[0u8; 16]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 16);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, SCRATCH_VA + 0x1c0, 64);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0),
+                Ok(4),
+                "scm-plain: recvmsg returns the trailing frame"
+            );
+            // SAFETY: scratch writable, данные лежат по 0x140.
+            assert_eq_kernel!(
+                unsafe { core::slice::from_raw_parts((SCRATCH_VA + 0x140) as *const u8, 4) },
+                b"TAIL",
+                "scm-plain: trailing payload intact"
+            );
+            assert_eq_kernel!(
+                get_u64(0x080 + 40),
+                0,
+                "scm-plain: trailing frame carries no ancillary data"
+            );
+
+            assert_eq_kernel!(
+                io_sys::sys_close(got as u64),
+                Ok(0),
+                "scm-plain: close received fd"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_close(memfd),
+                Ok(0),
+                "scm-plain: close sender fd"
+            );
+            assert_eq_kernel!(io_sys::sys_close(a), Ok(0), "scm-plain: close end a");
+            assert_eq_kernel!(io_sys::sys_close(b), Ok(0), "scm-plain: close end b");
+        })
+        .is_some();
+        restore_synth(me, saved);
+        assert_kernel!(ran, "scm-plain: routine ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "scm-plain: routine returned every PMM frame"
+        );
+    }
+
     /// SCM_RIGHTS: грницы/ошибки, `MSG_CTRUNC`, закрытие недоставленных fd,
     /// отбрасывание cmsg обычным `read(2)` и то, что обычный AF_UNIX-поток
     /// (nvim/libuv) не изменился.
@@ -9933,6 +10112,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "desktop-b::SCM_RIGHTS memfd fd passing + shared pages",
             desktop_b_tests::scm_rights_memfd_passing
+        ),
+        (
+            "desktop-b::SCM_RIGHTS after plain write (SHM_OFFER shape)",
+            desktop_b_tests::scm_rights_after_plain_write
         ),
         (
             "desktop-b::SCM_RIGHTS truncation, errors, plain-stream regression",
