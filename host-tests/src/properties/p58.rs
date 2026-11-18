@@ -172,3 +172,4 @@ proptest! {
             prop_assert!(g.members.iter().all(|m| !m.is_empty()));
         }
     }
+}
