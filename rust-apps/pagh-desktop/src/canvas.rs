@@ -196,6 +196,32 @@ impl Canvas {
         } else {
             timing::count_blended(pixels);
         }
+        // Непрозрачная заливка (opacity=255, альфа цвета=255) — это ровно
+        // `src | 0xFF000000` для каждого пикселя, то есть построчное
+        // заполнение среза, без чтения dst и без `in_clip` на пиксель. Так
+        // закрашиваются фон окна, клиентская область и панель на каждом
+        // кадре; полупрозрачные цвета (тень, подсветка) идут старым путём.
+        if opacity == 255 && crate::color::alpha(color) == 255 {
+            let value = color | 0xFF00_0000;
+            let width = self.width as usize;
+            let fill = |pixels: &mut [Color], area: Rect| {
+                for y in area.y..area.bottom() {
+                    let d = (y as usize) * width + area.x as usize;
+                    pixels[d..d + area.w as usize].fill(value);
+                }
+            };
+            if self.clip_active {
+                for index in 0..self.clip.len() {
+                    let clip = self.clip[index];
+                    if let Some(area) = rect.intersection(clip) {
+                        fill(&mut self.pixels, area);
+                    }
+                }
+            } else {
+                fill(&mut self.pixels, rect);
+            }
+            return;
+        }
         for y in rect.y..rect.bottom() {
             for x in rect.x..rect.right() {
                 self.blend(x, y, color, opacity);
@@ -684,6 +710,31 @@ mod tests {
         c.clear_clip();
         c.put(0, 0, rgb(7, 7, 7));
         assert_eq!(c.get(0, 0), rgb(7, 7, 7));
+    }
+
+    #[test]
+    fn opaque_fill_matches_old_blend_under_clip() {
+        // Непрозрачная заливка идёт построчным `fill`, минуя `blend`/`in_clip`.
+        // Гейт: на любом наборе клипов и размере она обязана дать ровно те же
+        // пиксели, что старый попиксельный alpha-путь.
+        let mut fast = Canvas::new(13, 9, rgb(1, 2, 3));
+        let mut slow = Canvas::new(13, 9, rgb(1, 2, 3));
+        let clips = [Rect::new(1, 1, 5, 4), Rect::new(8, 5, 4, 3)];
+        fast.set_clip(&clips);
+        slow.set_clip(&clips);
+        fast.fill_rect(Rect::new(0, 0, 13, 9), rgb(9, 8, 7));
+        for y in 0..9 {
+            for x in 0..13 {
+                slow.blend(x, y, rgb(9, 8, 7), 255);
+            }
+        }
+        assert_eq!(fast.pixels(), slow.pixels());
+
+        // Полупрозрачный цвет обязан остаться на старом пути (alpha < 255).
+        let mut translucent = Canvas::new(4, 1, rgb(10, 20, 30));
+        translucent.fill_rect(Rect::new(0, 0, 4, 1), crate::color::rgba(200, 0, 0, 128));
+        let mixed = crate::color::blend(rgb(10, 20, 30), crate::color::rgba(200, 0, 0, 128), 255);
+        assert_eq!(translucent.get(2, 0), mixed);
     }
 
     #[test]
