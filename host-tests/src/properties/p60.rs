@@ -159,3 +159,6 @@ proptest! {
     ) {
         if read_at_eof(writers, read_shut, write_shut) {
             prop_assert!(read_ready(false, writers, read_shut, write_shut));
+        }
+    }
+}

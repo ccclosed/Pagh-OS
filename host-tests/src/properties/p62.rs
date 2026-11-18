@@ -93,3 +93,6 @@ proptest! {
                 "line missing after rewrite: {:?}",
                 line
             );
+        }
+    }
+}
