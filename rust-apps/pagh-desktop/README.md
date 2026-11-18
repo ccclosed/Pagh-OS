@@ -218,7 +218,7 @@ python3 tools/e2e.py desktop --reuse-desktop-disk --skip-build
 ## Атрибуция
 
 Иконки панели, сетевого флайаута и кнопок окна — Fluent UI System Icons
-(MIT, © Microsoft Corporation), regular-глифы 16/20/24/32 px в
+(MIT, © Microsoft Corporation), regular-глифы 16/20/24/32/48 px в
 [`assets/icons/`](assets/icons/); полный текст лицензии — в
 [`assets/icons/LICENSE`](assets/icons/LICENSE), соответствие «файл → глиф» —
 в [`assets/icons/README.md`](assets/icons/README.md). Байты PNG запечены в
