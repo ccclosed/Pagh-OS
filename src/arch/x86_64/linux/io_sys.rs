@@ -1615,13 +1615,31 @@ fn check_node_access(node: &Arc<dyn VfsNode>, access: Access) -> Result<(), Errn
 /// `may`, ему всё равно нужен execute-бит: каталог с правами `0644` не
 /// просматривается даже root.
 fn check_dir_mutation(dir: &Arc<dyn VfsNode>) -> Result<(), Errno> {
+    check_dir_mutation_of(dir, None)
+}
+
+/// [`check_dir_mutation`] плюс sticky-правило для существующей записи.
+///
+/// `child_owner` — владелец удаляемой/переименовываемой записи (`None` для
+/// создания: sticky-бит ограничивает только удаление и переименование чужих
+/// записей). В каталоге с `S_ISVTX` (`/tmp` 1777) Linux разрешает это только
+/// root'у, владельцу каталога и владельцу самой записи — иначе один
+/// непривилегированный пользователь мог бы уничтожать файлы другого. Отказ —
+/// `EPERM`, как в `may_delete()` Linux (не `EACCES`: биты каталога при этом
+/// позволяют операцию, запрещает дополнительное правило).
+fn check_dir_mutation_of(
+    dir: &Arc<dyn VfsNode>,
+    child_owner: Option<(u32, u32)>,
+) -> Result<(), Errno> {
     let creds = current_creds();
     let mode = dir.mode();
     let owner = dir.owner();
-    if creds.may(mode, owner, Access::Write) && creds.may(mode, owner, Access::Execute) {
-        Ok(())
-    } else {
-        Err(Errno::EACCES)
+    if !(creds.may(mode, owner, Access::Write) && creds.may(mode, owner, Access::Execute)) {
+        return Err(Errno::EACCES);
+    }
+    match child_owner {
+        Some(child) if !creds.may_delete_child(mode, owner, child) => Err(Errno::EPERM),
+        _ => Ok(()),
     }
 }
 
@@ -2626,9 +2644,14 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
     // должен попасть в его цель); *источник* намеренно остаётся
     // неразыменованным — см. замечание выше.
     let ndir = walk(nparent, true)?;
-    check_dir_mutation(&ndir)?;
+    // Sticky: заменяемая запись приёмника тоже защищена — чужой файл нельзя
+    // перезаписать rename'ом в /tmp (Linux проверяет may_delete и для target).
+    let target_owner = walk(newabs, false).ok().map(|n| n.owner());
+    check_dir_mutation_of(&ndir, target_owner)?;
     let odir = walk(oparent, true)?;
-    check_dir_mutation(&odir)?;
+    // Источник: `node` уже разрешён выше (конечный компонент не разыменован),
+    // его владелец — тот, кого защищает sticky-бит исходного каталога.
+    check_dir_mutation_of(&odir, Some(node.owner()))?;
     // Прочитать весь исходный файл.
     //
     // `i_size` контролируется образом и может быть разреженным обещанием на
@@ -2790,7 +2813,7 @@ pub fn sys_unlink(path: u64) -> Result<u64, Errno> {
         None => return Err(Errno::ENOENT),
     };
     let dir = walk(parent, true)?;
-    check_dir_mutation(&dir)?;
+    check_dir_mutation_of(&dir, Some(node.owner()))?;
     dir.remove(name).map_err(|e| {
         crate::warn!("[linux] unlink failed: {:?} path={}", e, trimmed);
         Errno::EIO
@@ -2817,7 +2840,7 @@ pub fn sys_rmdir(path: u64) -> Result<u64, Errno> {
         None => return Err(Errno::ENOENT),
     };
     let dir = walk(parent, true)?;
-    check_dir_mutation(&dir)?;
+    check_dir_mutation_of(&dir, Some(node.owner()))?;
     dir.remove(name).map_err(|e| {
         crate::warn!("[linux] rmdir failed: {:?} path={}", e, trimmed);
         Errno::EIO

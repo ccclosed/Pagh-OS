@@ -32,6 +32,14 @@ use alloc::vec::Vec;
 
 pub type VfsResult<T> = Result<T, VfsError>;
 
+/// Бит sticky (`S_ISVTX`) в `VfsNode::mode` — тот же бит, что у Linux.
+///
+/// VFS его только *хранит* (например, `/tmp` — `0o1777`); решение о том, кому
+/// разрешено удалить запись в sticky-каталоге, принимает syscall-слой через
+/// `cred::Creds::may_delete_child`. Никакой проверки идентичности внутри VFS
+/// нет — инвариант `AGENTS.md` §11.
+pub const S_ISVTX: u32 = 0o1000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsError {
     NotFound,
@@ -629,7 +637,10 @@ pub fn init() {
     }) as Arc<dyn VfsNode>;
     // Записываемый in-memory /tmp: Linux-userspace считает, что он есть, —
     // nvim в vim_mktempdir делает mkdir("/tmp/nvim.XXXXXX").
-    let tmp = Arc::new(ramfs::RamDir::new("tmp")) as Arc<dyn VfsNode>;
+    // 1777 + sticky: POSIX-контракт общего временного каталога. Без sticky
+    // любой мог бы удалять чужие файлы, а без `w` для other не-root вообще не
+    // смог бы создавать свои (прежние 0755).
+    let tmp = Arc::new(ramfs::RamDir::new_with_mode("tmp", 0o1777)) as Arc<dyn VfsNode>;
     crate::debug!("/tmp (ramfs) - ready");
     let root = Arc::new(RootDirectory {
         children: Spinlock::new(vec![Arc::clone(&dev), tmp]),

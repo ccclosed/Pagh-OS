@@ -109,4 +109,3 @@ proptest! {
 fn write_decision_table_is_exhaustive() {
     assert_eq!(write_verdict(true), WriteVerdict::Continue);
     assert_eq!(write_verdict(false), WriteVerdict::Ebadf);
-}
