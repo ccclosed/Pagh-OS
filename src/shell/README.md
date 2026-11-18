@@ -88,7 +88,10 @@ row 0`).
 **Клавиатура**: `keys::Decoder` применяет Shift в таблице `scancode_to_ascii`, а
 CapsLock — уже поверх результата (`caps` инвертирует регистр буквы, поэтому
 caps+shift = строчная). Старая формула `caps != shift` учитывала Shift дважды и делала
-Shift+букву строчной при выключенном CapsLock.
+Shift+букву строчной при выключенном CapsLock. Пока клавиатурой владеет VT-клиент
+(`/dev/vtinput`), физические скан-коды в это кольцо не кладутся — shell получает их
+один раз через vtinput (`drivers::vtinput::client_active`); когда клиент завершился,
+цикл shell снимает защёлку (`reap_dead_client`) и прямой путь возвращается.
 
 ### Tab-комплишн
 Без whitespace → `complete_command`; иначе `readdir()` родителя токена через VFS →
