@@ -168,7 +168,7 @@ python3 tools/e2e.py desktop --reuse-desktop-disk --skip-build
 | ![drag](screenshots/03-drag-window.png) | ![menu](screenshots/04-context-menu.png) |
 | Перетаскивание заголовка | Контекстное меню рабочего стола |
 | ![launch](screenshots/05-launched-terminal.png) | ![network](screenshots/06-network-flyout.png) |
-| Запуск Terminal из меню | Wi-Fi flyout |
+| Запуск Terminal из меню | Проводная сеть: flyout «Сети» |
 | ![calendar](screenshots/07-calendar.png) | ![maximized](screenshots/08-maximized.png) |
 | Календарь November 2026 | Maximized с клиентским configure |
 | ![live](screenshots/10-live-demo-client.png) | |
@@ -188,10 +188,11 @@ python3 tools/e2e.py desktop --reuse-desktop-disk --skip-build
 | `client.rs` | клиентская библиотека (hello/create/commit/input/close) |
 | `compositor.rs` | окна, z-order, фокус, drag/resize/maximize, панель, меню, damage |
 | `window.rs` | геометрия рамки/заголовка/кнопок, resize-угол |
-| `panel.rs` | 44-пиксельная панель, часы/дата, Wi-Fi, чипы окон |
+| `panel.rs` | 44-пиксельная панель, часы/дата, проводная сеть, чипы окон |
 | `context_menu.rs` | контекстные меню, hover, clamp к экрану |
 | `backend.rs` | trait `Backend`, headless-вывод PNG |
-| `canvas.rs` / `png.rs` / `deflate.rs` / `font.rs` | программный холст, примитивы, PNG-энкодер со встроенным deflate (fixed Huffman + LZ77, без зависимостей), шрифт 8×16 (ASCII + кириллица, генератор `tools/gen_cyrillic_font.py`) |
+| `canvas.rs` / `png.rs` / `deflate.rs` / `font.rs` | программный холст, примитивы, PNG-энкодер и -декодер со встроенным deflate (энкодер — fixed Huffman + LZ77, декодер понимает stored/fixed/dynamic; без зависимостей), шрифт 8×16 (ASCII + кириллица, генератор `tools/gen_cyrillic_font.py`) |
+| `icons.rs` | готовые PNG-иконки Fluent UI (`assets/icons/`): ленивый декод, кэш по `(иконка, размер)`, blit с тинтом RGB при сохранении альфы |
 | `surface.rs` | клиентские поверхности, `XRGB8888`/`RGB565`, stride |
 | `demo.rs` / `scenario.rs` | демо-контент Terminal/Files/Paint, сценарий скриншотов |
 | `src/bin/pagh-desktop.rs` | CLI сервера |
@@ -215,6 +216,13 @@ python3 tools/e2e.py desktop --reuse-desktop-disk --skip-build
   был осмысленным.
 
 ## Атрибуция
+
+Иконки панели, сетевого флайаута и кнопок окна — Fluent UI System Icons
+(MIT, © Microsoft Corporation), regular-глифы 16/20/24/32 px в
+[`assets/icons/`](assets/icons/); полный текст лицензии — в
+[`assets/icons/LICENSE`](assets/icons/LICENSE), соответствие «файл → глиф» —
+в [`assets/icons/README.md`](assets/icons/README.md). Байты PNG запечены в
+бинарь через `include_bytes!`, поэтому запуск не зависит от файлов на диске.
 
 Растровый шрифт 8×16 в `src/font.rs` растрирован из Terminus 16 (OFL-1.1). Идеи
 архитектуры сверялись со Smithay (`desktop::Space`, `input`, `backend`), cosmic-comp
