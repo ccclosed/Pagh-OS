@@ -19,7 +19,6 @@ This branch implements the safe foundation of the four-stage review plan.
 - A narrow page-flag inspection API and a CI check for undocumented unsafe in trust-boundary modules.
 - Security policy and explicit production-release requirements.
 
-- Embedded offline mini-Rust with `cargo`, `rustc`, `rust`, and `rustup` commands.
 - Static Rust/musl userspace build helper and sample application.
 - `nano+` full-screen editor with journal-safe truncation, undo/redo, search and goto.
 
