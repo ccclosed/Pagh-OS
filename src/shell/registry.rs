@@ -336,26 +336,21 @@ pub static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "cargo",
-        description: "Run cargo: real /mnt/usr/bin/cargo when installed, else the embedded mini-Rust (new/check/build/run)",
-        usage: "cargo <new|check|build|run> [path]",
+        description: "Run the installed Rust cargo toolchain through Linux compatibility",
+        usage: "cargo <args...>",
         handler: super::commands::cmd_cargo,
     },
     CommandSpec {
         name: "rustc",
-        description: "Compile Rust source: real /mnt/usr/bin/rustc when installed, else the embedded mini-Rust (.pbc)",
-        usage: "rustc <file.rs> [-o output.pbc]",
+        description: "Run the installed Rust compiler through Linux compatibility",
+        usage: "rustc <file.rs> [args...]",
         handler: super::commands::cmd_rustc,
     },
     CommandSpec {
-        name: "rustup",
-        description: "Show the built-in offline mini-Rust toolchain",
-        usage: "rustup [show|target list|default]",
-        handler: super::commands::cmd_rustup,
-    },
-    CommandSpec {
         name: "rust",
-        description: "Run a mini-Rust .rs/.pbc file, or a static ELF through Linux compatibility",
-        usage: "rust <path> [args...]",
+        description:
+            "Run a static Linux ELF (e.g. a native Rust musl binary) through Linux compatibility",
+        usage: "rust <static-elf> [args...]",
         handler: super::commands::cmd_rust,
     },
     CommandSpec {

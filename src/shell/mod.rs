@@ -31,7 +31,6 @@ pub(crate) mod selection;
 pub(crate) mod suggest;
 pub(crate) mod texttools;
 pub(crate) mod theme;
-pub(crate) mod toolchain;
 pub(crate) mod tree;
 
 use alloc::format;

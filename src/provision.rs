@@ -16,9 +16,7 @@ const MOTD: &[u8] = concat!(
     "\nType 'help' to list commands. Network apt and nano+ are available.\n"
 )
 .as_bytes();
-const README: &[u8] = b"Welcome to pagh!\n\nTry:\n  help\n  nano --settings\n  nano /mnt/home/user/notes.txt\n  cargo run /mnt/examples/hello\n  apt update\n";
-const CARGO: &[u8] = b"[package]\nname = \"pagh-hello\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
-const MAIN_RS: &[u8] = b"fn main() {\n    let values = [8, 16, 32];\n    println!(\"Hello from pagh mini-Rust! sum = {}\", values.iter().sum());\n}\n";
+const README: &[u8] = b"Welcome to pagh!\n\nTry:\n  help\n  nano --settings\n  nano /mnt/home/user/notes.txt\n  apt update\n";
 
 fn ensure_dir(path: &str) -> Result<Arc<dyn VfsNode>, VfsError> {
     let mut node = crate::vfs::lookup_path("/")?;
@@ -58,7 +56,6 @@ pub fn seed() {
         ensure_dir("/mnt/etc")?;
         ensure_dir("/mnt/home/user")?;
         ensure_dir("/mnt/usr/share/pagh")?;
-        ensure_dir("/mnt/examples/hello/src")?;
         write_once("/mnt/etc/pagh-release", RELEASE)?;
         // Резолвер glibc читает их до того, как заработает любой getaddrinfo;
         // 10.0.2.3 — встроенный DNS-форвардер QEMU slirp.
@@ -73,8 +70,6 @@ pub fn seed() {
             "/mnt/usr/share/pagh/LICENSE-NOTICE.txt",
             b"pagh kernel and bundled development environment: MIT.\n",
         )?;
-        write_once("/mnt/examples/hello/Cargo.toml", CARGO)?;
-        write_once("/mnt/examples/hello/src/main.rs", MAIN_RS)?;
         Ok::<(), VfsError>(())
     })();
     match result {
