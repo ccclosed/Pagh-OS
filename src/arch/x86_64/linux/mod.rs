@@ -22,6 +22,8 @@ pub mod kill;
 pub mod mem;
 pub mod misc;
 pub mod rand_clock;
+pub mod sock_shutdown;
+pub mod sock_wait;
 pub mod stat;
 pub mod timeconv;
 pub mod tty;
@@ -190,6 +192,7 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::RENAMEAT2 => io_sys::sys_renameat2(a[0], a[1], a[2], a[3], a[4]),
         sysno::STAT => io_sys::sys_stat(a[0], a[1]),
         sysno::FSTAT => io_sys::sys_fstat(a[0], a[1]),
+        sysno::LSTAT => io_sys::sys_lstat(a[0], a[1]),
         sysno::NEWFSTATAT => io_sys::sys_newfstatat(a[0], a[1], a[2], a[3]),
         sysno::IOCTL => io_sys::sys_ioctl(a[0], a[1], a[2]),
         sysno::ACCESS => io_sys::sys_access(a[0], a[1]),
@@ -315,7 +318,11 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
                 if a[3] & !STREAM_SEND_FLAGS != 0 {
                     return Err(Errno::EINVAL);
                 }
-                let len = crate::arch::x86_64::linux::abi::socket_payload_len(a[2], true)?;
+                // TCP — поток байтов, а не датаграмма: длина больше
+                // [MAX_SOCKET_IO] здесь не ошибка (Linux копирует сколько
+                // помещается и возвращает короткую запись), поэтому предел
+                // работает как граница одной копии, а не как EMSGSIZE.
+                let len = crate::arch::x86_64::linux::abi::stream_send_len(a[2]);
                 check_user_ptr(a[1], len)?;
                 let data = crate::arch::x86_64::linux::io_sys::copy_in_pub(a[1], len);
                 let n = crate::arch::x86_64::linux::inet_sock::tcp_write(a[0], &data)?;
@@ -447,6 +454,10 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         // ── AF_UNIX SCM_RIGHTS: fd passing для userspace-композитора ──
         sysno::SENDMSG => unix_sock::sys_sendmsg(a[0], a[1], a[2]),
         sysno::RECVMSG => unix_sock::sys_recvmsg(a[0], a[1], a[2]),
+        // ── shutdown: половинное закрытие направления (48) ──
+        // AF_UNIX ставит флаги на очередях направлений, AF_INET TCP заказывает
+        // FIN; и то и другое будит заблокированного читателя/писателя.
+        sysno::SHUTDOWN => unix_sock::sys_shutdown(a[0], a[1]),
         sysno::ACCEPT => unix_sock::sys_accept(a[0], a[1], a[2]),
         sysno::BIND => unix_sock::sys_bind(a[0], a[1], a[2]),
         sysno::LISTEN => unix_sock::sys_listen(a[0], a[1]),
@@ -800,15 +811,28 @@ pub fn inflight_refresh(pid: u64) {
 }
 
 /// Человеческое имя syscall'ов, в которых задача реально может блокироваться.
+///
+/// `sendto`/`sendmsg` здесь, потому что запись в полную очередь AF_UNIX уступает
+/// CPU так же, как чтение. `recvfrom`/`recvmsg` были главным пробелом: именно они
+/// печатались как `stuck in syscall ? (nr=45 arg0=0x3 closed)`, пока не был
+/// закрыт класс вечного ожидания на закрытом fd (`sock_wait`). `lstat`(6) и
+/// `shutdown`(48) не блокируются, но названы, чтобы такой же лог никогда не
+/// показывал «?» для сисколла, который кто-то увидит в профиле.
 fn wd_sys_name(nr: u64) -> &'static str {
     match nr {
         0 => "read",
         1 => "write",
+        6 => "lstat",
         7 => "poll",
         20 => "writev",
         23 => "select",
         35 => "nanosleep",
         43 => "accept",
+        44 => "sendto",
+        45 => "recvfrom",
+        46 => "sendmsg",
+        47 => "recvmsg",
+        48 => "shutdown",
         61 => "wait4",
         202 => "futex",
         232 => "epoll_wait",

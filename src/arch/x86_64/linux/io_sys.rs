@@ -46,6 +46,7 @@ use super::{check_user_ptr, check_user_ptr_writable};
 // разошлись в номерах ABI.
 use super::stat::{encode_stat, LinuxStat, S_IFDIR, S_IFLNK, S_IFREG};
 use super::tty::{TIOCGPGRP, TIOCSPGRP, TOSTOP};
+use super::unix_sock;
 
 /// Биты типа `st_mode` для символьного устройства (консоль/stdin), чтобы
 /// `fstat` стандартного потока сообщал правдоподобный (не regular) тип.
@@ -341,13 +342,24 @@ fn read_user_cstr(ptr: u64) -> Result<String, Errno> {
     Err(Errno::EINVAL)
 }
 
+/// Блокирующее/неблокирующее чтение конца очереди (pipe или AF_UNIX-сокета).
+///
+/// Ожидание — уступка CPU с перечитыванием очереди. На каждой уступке
+/// перепроверяется владение очередью: закрытый из соседнего потока дескриптор
+/// EOF не выставляет (счётчики очереди считают концы, а не fd), поэтому без
+/// [`unix_sock::endpoint_wait_verdict`] заблокированный `read` спал бы вечно —
+/// тот же класс зависания, что watchdog печатает для `recvfrom` (nr 45).
 fn read_pipe(e: &PipeEndpoint, dst: &mut [u8]) -> Result<usize, Errno> {
     loop {
         match e.read(dst) {
             PipeReadResult::Data(n) => return Ok(n),
             PipeReadResult::Eof => return Ok(0),
             PipeReadResult::WouldBlock if e.nonblocking() => return Err(Errno::EAGAIN),
-            PipeReadResult::WouldBlock => crate::task::scheduler::yield_current(),
+            PipeReadResult::WouldBlock => match unix_sock::endpoint_wait_verdict(e) {
+                super::sock_wait::WaitVerdict::Continue => crate::task::scheduler::yield_current(),
+                super::sock_wait::WaitVerdict::Eof => return Ok(0),
+                super::sock_wait::WaitVerdict::Ebadf => return Err(Errno::EBADF),
+            },
         }
     }
 }
@@ -357,7 +369,17 @@ fn write_pipe(e: &PipeEndpoint, src: &[u8]) -> Result<usize, Errno> {
             PipeWriteResult::Data(n) => return Ok(n),
             PipeWriteResult::Broken => return Err(Errno::EPIPE),
             PipeWriteResult::WouldBlock if e.nonblocking() => return Err(Errno::EAGAIN),
-            PipeWriteResult::WouldBlock => crate::task::scheduler::yield_current(),
+            PipeWriteResult::WouldBlock => {
+                crate::task::scheduler::yield_current();
+                // Зеркало `read_pipe`: закрытие ПИШУЩЕГО fd из соседнего
+                // потока счётчики очереди не меняет, и без перепроверки
+                // владения этот `write` уступал бы CPU вечно — watchdog печатал
+                // `stuck in syscall ? (nr=1 arg0=0x3 closed)`.
+                match unix_sock::endpoint_write_verdict(e) {
+                    super::sock_wait::WriteVerdict::Continue => {}
+                    super::sock_wait::WriteVerdict::Ebadf => return Err(Errno::EBADF),
+                }
+            }
         }
     }
 }
@@ -1701,6 +1723,18 @@ fn write_stat_struct(stat: &LinuxStat, statbuf: u64) -> Result<(), Errno> {
 /// (`EFAULT` до записи) и один набор `ENOENT`/`ENOTDIR`/`ELOOP`.
 pub fn sys_stat(path: u64, statbuf: u64) -> Result<u64, Errno> {
     sys_newfstatat(AT_FDCWD, path, statbuf, 0)
+}
+
+/// `lstat` (6): статус самого пути, конечный символический компонент НЕ
+/// разыменовывается.
+///
+/// Ровно та же тонкая обёртка над `newfstatat`, что и [`sys_stat`], но с
+/// `AT_SYMLINK_NOFOLLOW`: одна реализация поиска в VFS, одна проверка буфера и
+/// один набор `ENOENT`/`ENOTDIR`/`ELOOP`. Отдельный номер нужен потому, что
+/// `std::fs::symlink_metadata`, `ls -l` и `find` зовут `lstat` напрямую, а
+/// `ENOSYS` здесь ломал их на любом симлинке (`/proc/self/exe`, `/lib64`).
+pub fn sys_lstat(path: u64, statbuf: u64) -> Result<u64, Errno> {
+    sys_newfstatat(AT_FDCWD, path, statbuf, AT_SYMLINK_NOFOLLOW)
 }
 
 /// `fstat` (5): заполнить пользовательский `struct stat` для открытого

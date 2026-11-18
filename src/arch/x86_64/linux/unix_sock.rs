@@ -12,6 +12,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 use super::cmsg;
 use super::errno::Errno;
@@ -647,6 +648,15 @@ pub fn sys_sendmsg(fd: u64, msg_addr: u64, flags: u64) -> Result<u64, Errno> {
                             break;
                         }
                         crate::task::scheduler::yield_current();
+                        // Закрытый из соседнего потока ПИШУЩИЙ fd очередь не
+                        // замечает (счётчики считают концы, а syscall держит
+                        // `Arc`): без этой перепроверки ожидание было бы вечным.
+                        if let super::sock_wait::WriteVerdict::Ebadf = endpoint_write_verdict(&tx) {
+                            if written == 0 {
+                                return Err(Errno::EBADF);
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -683,8 +693,11 @@ pub fn sys_sendto_unix(
     if dest_addr != 0 && dest_len != 0 {
         return Err(Errno::EINVAL);
     }
-    // Предел ровно как у sendmsg: len — длина полезной нагрузки, а не ёмкость.
-    let len = super::abi::socket_payload_len(len, true)?;
+    // Поток байтов не имеет границ записи: длиннее [MAX_SOCKET_IO] — это не
+    // ошибка, а короткая запись (Linux копирует сколько помещается и возвращает
+    // счётчик; `write_all` вызывающего доносит остаток). Тот же предел остаётся
+    // границей одной аллокации/копии.
+    let len = super::abi::stream_send_len(len);
     let tx = compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
         None => Err(Errno::EBADF),
         Some(OpenObject::Socket { tx, .. }) => Ok(Arc::clone(tx)),
@@ -725,6 +738,15 @@ pub fn sys_sendto_unix(
                     };
                 }
                 crate::task::scheduler::yield_current();
+                // Пишущий fd закрыли из соседнего потока: очередь этого не
+                // заметит, а ждать больше некому (см. `endpoint_write_verdict`).
+                if let super::sock_wait::WriteVerdict::Ebadf = endpoint_write_verdict(&tx) {
+                    return if written == 0 {
+                        Err(Errno::EBADF)
+                    } else {
+                        Ok(written as u64)
+                    };
+                }
             }
         }
     }
@@ -774,7 +796,13 @@ pub fn sys_recvfrom_unix(
                 if nonblock {
                     return Err(Errno::EAGAIN);
                 }
-                crate::task::scheduler::yield_current();
+                match endpoint_wait_verdict(&rx) {
+                    super::sock_wait::WaitVerdict::Continue => {
+                        crate::task::scheduler::yield_current()
+                    }
+                    super::sock_wait::WaitVerdict::Eof => break 0,
+                    super::sock_wait::WaitVerdict::Ebadf => return Err(Errno::EBADF),
+                }
             }
         }
     };
@@ -787,6 +815,128 @@ pub fn sys_recvfrom_unix(
         unsafe { core::ptr::write_unaligned(addr_len as *mut u32, 0) };
     }
     Ok(n as u64)
+}
+
+/// Решение для блокирующего чтения, у которого очередь ответила `WouldBlock`.
+///
+/// Очередей ожидания в ядре нет: чтение уступает CPU и перечитывает очередь.
+/// Но закрытие ЧИТАЮЩЕГО fd из соседнего потока не выставляет EOF — счётчики
+/// `readers`/`writers` живут на общую очередь, а сам syscall держит её `Arc`.
+/// Без этой перепроверки задача уступала бы CPU вечно; watchdog печатал
+/// `stuck in syscall ? (nr=45 arg0=0x3 closed)` (см. `super::sock_wait`).
+///
+/// `dup` другого дескриптора на ту же очередь оставляет владение, поэтому
+/// закрытие одного из дубликатов законное ожидание не прерывает.
+pub(crate) fn endpoint_wait_verdict(rx: &PipeEndpoint) -> super::sock_wait::WaitVerdict {
+    let id = rx.queue_id();
+    // `None` (нет compat-состояния) — читать эту очередь больше некому: EBADF.
+    let referenced = compat::with_current_compat(|cs| cs.fds.holds_read_end(id)).unwrap_or(false);
+    super::sock_wait::wait_verdict(referenced, rx.writers())
+}
+
+/// Решение для блокирующей ЗАПИСИ, у которой очередь ответила `WouldBlock`.
+///
+/// Зеркало [`endpoint_wait_verdict`] с другой стороны: закрытие ПИШУЩЕГО fd из
+/// соседнего потока не меняет счётчики очереди (syscall держит её `Arc`), и без
+/// перепроверки владения `sendto`/`sendmsg`/`write` уступали бы CPU вечно —
+/// watchdog печатал `stuck in syscall ? (nr=1 arg0=0x3 closed)`. Уход пира
+/// (закрытие читающего fd или `shutdown(SHUT_RD)`) чинится сам: следующая
+/// перезапись отвечает `Broken`, то есть `EPIPE`.
+pub(crate) fn endpoint_write_verdict(tx: &PipeEndpoint) -> super::sock_wait::WriteVerdict {
+    let id = tx.queue_id();
+    // `None` (нет compat-состояния) — писать в эту очередь больше некому.
+    let referenced = compat::with_current_compat(|cs| cs.fds.holds_write_end(id)).unwrap_or(false);
+    super::sock_wait::write_verdict(referenced)
+}
+
+/// Куда свёлся `shutdown(2)`: подключённая AF_UNIX-пара или TCP.
+///
+/// Снимок `Arc` берётся под compat-локом и отпускается до любых блокирующих
+/// действий (инвариант 4 из `AGENTS.md`): сама операция только ставит флаг и,
+/// для TCP, отправляет FIN.
+enum ShutTarget {
+    /// Конец socketpair: `rx` — очередь, которую он читает, `tx` — в которую
+    /// пишет.
+    UnixStream {
+        rx: Arc<PipeEndpoint>,
+        tx: Arc<PipeEndpoint>,
+    },
+    /// AF_INET TCP: `shutdown` идёт в собственный стек.
+    Tcp(Arc<super::inet_sock::InetTcp>),
+}
+
+/// `shutdown` (48): закрыть направление подключённого сокета.
+///
+/// Linux-семантику закрепляет чистая политика [`super::sock_shutdown`]:
+///  * `SHUT_WR` — пишущая половина закрыта: пир-читатель получает `EOF`
+///    (`Ok(0)`), собственная запись — `EPIPE`. У AF_UNIX ставится флаг очереди
+///    (`PipeState::write_shut`), поэтому блокирующийся в `yield_current()`
+///    читатель просыпается на следующем перечитывании; у TCP уходит FIN
+///    (`net::tcp_shutdown_wr`), а сокет остаётся в таблице стека и принимает
+///    дальше;
+///  * `SHUT_RD` — приём закрыт: последующие `recv`/`read` отвечают `Ok(0)`, а
+///    пир при записи в AF_UNIX-очередь получает `EPIPE` (никто не заберёт
+///    байты);
+///  * `SHUT_RDWR` — обе половины.
+///
+/// Отказы в порядке Linux (проверено пробой на хосте): `EBADF` (нет fd),
+/// `ENOTSOCK` (не сокет: файл, pipe, консоль), `EINVAL` (не 0/1/2 — даже у
+/// несоединённого сокета), `ENOTCONN` (TCP до `connect`, UDP). AF_UNIX без
+/// соединения (несвязанный, слушающий) Linux НЕ отвергает: там закрывать
+/// нечего, ответ `0`. Повторный вызов идемпотентен и успешен.
+pub fn sys_shutdown(fd: u64, how: u64) -> Result<u64, Errno> {
+    use super::sock_shutdown::{self, Action, FdKind};
+
+    // Снимок: вид дескриптора и (для подключённых сокетов) его объект. Лок
+    // отпускается здесь же.
+    let (kind, target) = compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
+        None => (FdKind::Absent, None),
+        Some(OpenObject::Socket { rx, tx }) => (
+            FdKind::UnixConnected,
+            Some(ShutTarget::UnixStream {
+                rx: Arc::clone(rx),
+                tx: Arc::clone(tx),
+            }),
+        ),
+        Some(OpenObject::InetTcp(sock)) => {
+            let kind = if sock.connected.load(Ordering::Relaxed) {
+                FdKind::TcpConnected
+            } else {
+                FdKind::TcpUnconnected
+            };
+            (kind, Some(ShutTarget::Tcp(Arc::clone(sock))))
+        }
+        // AF_UNIX без соединения — успешный no-op (как Linux); UDP и TCP до
+        // connect политика отвергает через `FdKind`.
+        Some(OpenObject::UnixListener(_)) | Some(OpenObject::UnixSocketUnbound { .. }) => {
+            (FdKind::UnixUnconnected, None)
+        }
+        Some(OpenObject::InetUdp(_)) => (FdKind::Udp, None),
+        Some(_) => (FdKind::NotSocket, None),
+    })
+    .unwrap_or((FdKind::Absent, None));
+
+    let action = sock_shutdown::plan(kind, how)?;
+    match action {
+        Action::Noop => Ok(0),
+        Action::Unix { read, write } => {
+            if let Some(ShutTarget::UnixStream { rx, tx }) = target {
+                if read {
+                    rx.shutdown_read();
+                }
+                if write {
+                    tx.shutdown_write();
+                }
+            }
+            Ok(0)
+        }
+        Action::Tcp { read, write } => {
+            if let Some(ShutTarget::Tcp(sock)) = target {
+                super::inet_sock::tcp_apply_shutdown(&sock, read, write);
+            }
+            Ok(0)
+        }
+    }
 }
 
 /// `recvmsg` (47): данные и `SCM_RIGHTS` из AF_UNIX SOCK_STREAM.
@@ -890,7 +1040,16 @@ pub fn sys_recvmsg(fd: u64, msg_addr: u64, flags: u64) -> Result<u64, Errno> {
                 if nonblock {
                     return Err(Errno::EAGAIN);
                 }
-                crate::task::scheduler::yield_current();
+                match endpoint_wait_verdict(&rx) {
+                    super::sock_wait::WaitVerdict::Continue => {
+                        crate::task::scheduler::yield_current()
+                    }
+                    super::sock_wait::WaitVerdict::Eof => {
+                        write_msghdr_out(msg_addr, 0, 0, flags as u32)?;
+                        return Ok(0);
+                    }
+                    super::sock_wait::WaitVerdict::Ebadf => return Err(Errno::EBADF),
+                }
             }
         }
     }

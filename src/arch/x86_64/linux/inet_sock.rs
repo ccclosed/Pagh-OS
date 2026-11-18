@@ -36,6 +36,13 @@ pub struct InetTcp {
     pub so_error: AtomicU32,
     pub connected: AtomicBool,
     pub eof: AtomicBool,
+    /// `shutdown(SHUT_RD)` (nr 48): приём закрыт, последующие `recv` → `Ok(0)`.
+    /// Флаг на сокете, а не на fd: `dup`-дубликаты видят то же самое.
+    pub read_shut: AtomicBool,
+    /// `shutdown(SHUT_WR)` (nr 48): передача закрыта, FIN уже заказан, а
+    /// собственная запись отвечает `EPIPE` (`EPIPE`, не `ENOTCONN`: соединение
+    /// ещё принимает).
+    pub write_shut: AtomicBool,
 }
 
 /// Один AF_INET datagram-сокет, привязанный к эфемерному локальному порту.
@@ -124,6 +131,8 @@ pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
                 so_error: AtomicU32::new(0),
                 connected: AtomicBool::new(false),
                 eof: AtomicBool::new(false),
+                read_shut: AtomicBool::new(false),
+                write_shut: AtomicBool::new(false),
             });
             let fd = cs.fds.alloc_with_flags(
                 OpenObject::InetTcp(sock),
@@ -215,15 +224,31 @@ pub fn sys_connect_tcp(fd: u64, addr: u64, len: u64) -> Result<u64, Errno> {
 }
 
 /// `send`/`sendto`/`write` на AF_INET TCP fd.
+///
+/// `shutdown(SHUT_WR)` (nr 48) закрывает передачу раньше `close`, поэтому
+/// запись после него — `EPIPE`; закрытие самого fd из соседнего потока
+/// пробуждает ожидание `EBADF` (та же проверка владения, что у [`tcp_read`]).
 pub fn tcp_write(fd: u64, data: &[u8]) -> Result<usize, Errno> {
     let sock = tcp_sock(fd)?;
     if !sock.connected.load(Ordering::Relaxed) {
         return Err(Errno::ENOTCONN);
     }
-    let handle = sock.handle.lock().ok_or(Errno::ENOTCONN)?;
     let nb = sock.nonblocking.load(Ordering::Relaxed);
     let mut sent_all: usize = 0;
     loop {
+        // Половина, закрытая `shutdown(SHUT_WR)`, больше не принимает байты.
+        // Повторная проверка в цикле нужна, потому что соседний поток может
+        // позвать `shutdown` по этому же сокету во время ожидания.
+        if sock.write_shut.load(Ordering::Relaxed) {
+            return Err(Errno::EPIPE);
+        }
+        // `close` забрал сетевой handle: соединения больше нет. `None` здесь —
+        // именно `EPIPE`, а не `EBADF`: дескриптор мог остаться (`dup`), но
+        // писать в освобождённый сокет нельзя.
+        let handle = match *sock.handle.lock() {
+            Some(h) => h,
+            None => return Err(Errno::EPIPE),
+        };
         let n = net::tcp_send_chunk(handle, &data[sent_all..]);
         sent_all += n;
         if sent_all >= data.len() {
@@ -240,15 +265,38 @@ pub fn tcp_write(fd: u64, data: &[u8]) -> Result<usize, Errno> {
             return Err(Errno::EPIPE);
         }
         crate::task::scheduler::yield_current();
+        // Тот же вопрос, что у чтения: закрытый из соседнего потока дескриптор
+        // не меняет состояние TCP, поэтому без проверки владения ожидание было
+        // бы вечным (`stuck in syscall ? (nr=1 arg0=0x3 closed)`).
+        if !tcp_socket_owned(&sock) {
+            return if sent_all > 0 {
+                Ok(sent_all)
+            } else {
+                Err(Errno::EBADF)
+            };
+        }
     }
 }
 
 /// `recv`/`read` на AF_INET TCP fd.
 pub fn tcp_read(fd: u64, dst: &mut [u8]) -> Result<usize, Errno> {
     let sock = tcp_sock(fd)?;
-    let handle = sock.handle.lock().ok_or(Errno::ENOTCONN)?;
+    let mut handle = sock.handle.lock().ok_or(Errno::ENOTCONN)?;
     let nb = sock.nonblocking.load(Ordering::Relaxed);
     loop {
+        // `shutdown(SHUT_RD)` закрывает приём: `recv` отвечает `0`, как после
+        // EOF пира, хотя FIN от него не приходил.
+        if sock.read_shut.load(Ordering::Relaxed) {
+            // Linux отбрасывает входящие байты после `SHUT_RD`. Здесь они
+            // осушаются при следующем `recv`: иначе очередь приёма заполнилась
+            // бы и окно закрылось, подвесив пира. Названное упрощение —
+            // отбрасывание не асинхронное, а по вызову.
+            if let Some(h) = *sock.handle.lock() {
+                let mut sink = [0u8; 1024];
+                while net::tcp_recv_chunk(h, &mut sink) > 0 {}
+            }
+            return Ok(0);
+        }
         if sock.eof.load(Ordering::Relaxed) {
             return Ok(0);
         }
@@ -264,7 +312,33 @@ pub fn tcp_read(fd: u64, dst: &mut [u8]) -> Result<usize, Errno> {
             return Err(Errno::EAGAIN);
         }
         crate::task::scheduler::yield_current();
+        // Проснувшись, первым делом спрашиваем таблицу fd. Закрытый из
+        // соседнего потока дескриптор EOF на TCP не выставляет (`Arc<InetTcp>`
+        // и сетевой handle живут сами по себе), поэтому без этой проверки
+        // ожидание было бы вечным — watchdog печатал
+        // `stuck in syscall ? (nr=45 arg0=0x3 closed)`. Идентичность сокета
+        // сохраняет ожидание при `dup`: пока хоть один дескриптор ссылается на
+        // этот `Arc`, читать его законно.
+        if !tcp_socket_owned(&sock) {
+            return Err(Errno::EBADF);
+        }
+        // `close` мог забрать handle, пока мы спали; не трогаем освобождённый
+        // сетевой handle. Такой сокет освобождён, то есть это конец потока.
+        handle = match *sock.handle.lock() {
+            Some(h) => h,
+            None => return Ok(0),
+        };
     }
+}
+
+/// Ссылается ли ещё хоть один дескриптор текущего процесса на `sock`.
+///
+/// Зеркало [`crate::task::fd::FdTable::holds_read_end`] для TCP: `dup`-дубликат —
+/// владение, закрытие последнего fd — потеря владения и повод разбудить
+/// блокирующее чтение `EBADF`.
+fn tcp_socket_owned(sock: &Arc<InetTcp>) -> bool {
+    let id = Arc::as_ptr(sock) as usize;
+    compat::with_current_compat(|cs| cs.fds.holds_inet_tcp(id)).unwrap_or(false)
 }
 
 /// `close` на AF_INET TCP fd.
@@ -272,6 +346,28 @@ pub fn tcp_close_fd(fd: u64) {
     if let Ok(sock) = tcp_sock(fd) {
         if let Some(h) = sock.handle.lock().take() {
             net::tcp_close(h);
+        }
+    }
+}
+
+/// Применить `shutdown(2)` (nr 48) к AF_INET TCP-сокету.
+///
+/// `SHUT_WR` заказывает FIN через [`net::tcp_shutdown_wr`] — сокет при этом
+/// остаётся в таблице стека и продолжает ПРИНИМАТЬ, в отличие от
+/// [`tcp_close_fd`], снимающего слот; FIN отправляется один раз, повторный
+/// `shutdown` той же половины идемпотентен. `SHUT_RD` поднимает флаг приёма,
+/// который [`tcp_read`] превращает в `Ok(0)`.
+///
+/// `sock.handle.lock()` берётся на один оператор (копия [`net::SocketHandle`])
+/// и отпускается до `NET`-лока внутри `tcp_shutdown_wr` — порядок «handle →
+/// NET» тот же, что у записи и закрытия.
+pub fn tcp_apply_shutdown(sock: &Arc<InetTcp>, read: bool, write: bool) {
+    if read {
+        sock.read_shut.store(true, Ordering::Relaxed);
+    }
+    if write && !sock.write_shut.swap(true, Ordering::Relaxed) {
+        if let Some(h) = *sock.handle.lock() {
+            net::tcp_shutdown_wr(h);
         }
     }
 }

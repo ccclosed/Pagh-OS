@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 
 use crate::arch::x86_64::linux::epoll_sys::EpollEntry;
 use crate::arch::x86_64::linux::errno::Errno;
+use crate::arch::x86_64::linux::sock_shutdown;
 use crate::sync::spinlock::Spinlock;
 use crate::vfs::VfsNode;
 
@@ -54,6 +55,14 @@ struct PipeState {
     bytes: VecDeque<u8>,
     readers: usize,
     writers: usize,
+    /// Читающая половина этой стороны закрыта `shutdown(SHUT_RD)`: `read`
+    /// отвечает `Eof` (Linux: последующие `recv` → 0), а пир при записи в эту
+    /// очередь получает `EPIPE` — байты больше никто не заберёт.
+    read_shut: bool,
+    /// Пишущая половина этой стороны закрыта `shutdown(SHUT_WR)`: читатель
+    /// очереди видит `Eof`, хотя `Arc` пишущего конца ещё жив (обычный `close`
+    /// выставил бы то же самое, сняв счётчик `writers`).
+    write_shut: bool,
     /// Сколько байт всего записано в очередь (абсолютная позиция конца).
     written_total: u64,
     /// Сколько байт всего прочитано (абсолютная позиция начала доступного).
@@ -68,6 +77,8 @@ impl PipeState {
             bytes: VecDeque::new(),
             readers: 1,
             writers: 1,
+            read_shut: false,
+            write_shut: false,
             written_total: 0,
             read_total: 0,
             cmsgs: VecDeque::new(),
@@ -130,7 +141,7 @@ impl PipeEndpoint {
             drop(s);
             drop(skipped);
             PipeReadResult::Data(n)
-        } else if s.writers == 0 {
+        } else if sock_shutdown::read_at_eof(s.writers, s.read_shut, s.write_shut) {
             PipeReadResult::Eof
         } else {
             PipeReadResult::WouldBlock
@@ -146,7 +157,7 @@ impl PipeEndpoint {
     /// `objects` (`Some(empty)`) — обычная запись без cmsg.
     pub fn write_scm(&self, src: &[u8], objects: &mut Option<Vec<PassedFd>>) -> PipeWriteResult {
         let mut s = self.state.lock();
-        if s.readers == 0 {
+        if !sock_shutdown::write_alive(s.readers, s.read_shut, s.write_shut) {
             return PipeWriteResult::Broken;
         }
         if src.is_empty() {
@@ -182,7 +193,7 @@ impl PipeEndpoint {
     pub fn read_scm(&self, dst: &mut [u8]) -> ScmReadResult {
         let mut s = self.state.lock();
         if s.bytes.is_empty() {
-            return if s.writers == 0 {
+            return if sock_shutdown::read_at_eof(s.writers, s.read_shut, s.write_shut) {
                 ScmReadResult::Eof
             } else {
                 ScmReadResult::WouldBlock
@@ -222,7 +233,7 @@ impl PipeEndpoint {
     }
     pub fn write(&self, src: &[u8]) -> PipeWriteResult {
         let mut s = self.state.lock();
-        if s.readers == 0 {
+        if !sock_shutdown::write_alive(s.readers, s.read_shut, s.write_shut) {
             return PipeWriteResult::Broken;
         }
         let room = PIPE_CAPACITY.saturating_sub(s.bytes.len());
@@ -235,18 +246,59 @@ impl PipeEndpoint {
     }
     pub fn read_ready(&self) -> bool {
         let s = self.state.lock();
-        !s.bytes.is_empty() || s.writers == 0
+        sock_shutdown::read_ready(!s.bytes.is_empty(), s.writers, s.read_shut, s.write_shut)
     }
     pub fn write_ready(&self) -> bool {
         let s = self.state.lock();
-        s.readers > 0 && s.bytes.len() < PIPE_CAPACITY
+        sock_shutdown::write_ready(
+            s.readers,
+            s.read_shut,
+            s.write_shut,
+            s.bytes.len() < PIPE_CAPACITY,
+        )
     }
     pub fn peer_closed(&self) -> bool {
         let s = self.state.lock();
         if self.read_end {
-            s.writers == 0
+            // EOF пира: последний пишущий конец уничтожен либо закрыл свою
+            // половину через `shutdown(SHUT_WR)`.
+            s.writers == 0 || s.write_shut
         } else {
-            s.readers == 0
+            !sock_shutdown::write_alive(s.readers, s.read_shut, s.write_shut)
+        }
+    }
+    /// Закрыть читающую половину этого конца (`shutdown(SHUT_RD)`, nr 48).
+    ///
+    /// Флаг на общей очереди, поэтому `dup`-дубликаты и форкнутые процессы
+    /// видят то же самое — как в Linux, где `shutdown` действует на сокет, а не
+    /// на номер дескриптора. Повторный вызов идемпотентен.
+    pub fn shutdown_read(&self) {
+        self.state.lock().read_shut = true;
+    }
+    /// Закрыть пишущую половину этого конца (`shutdown(SHUT_WR)`): пир-читатель
+    /// увидит `Eof` / `POLLHUP`, собственная запись — `EPIPE`.
+    pub fn shutdown_write(&self) {
+        self.state.lock().write_shut = true;
+    }
+    /// Идентичность очереди: у всех концов (pipe и обоих концов socketpair)
+    /// одинаковый указатель на общее состояние. Блокирующее чтение по нему
+    /// спрашивает таблицу fd, жив ли ещё хоть один дескриптор этой очереди, — и
+    /// так отличает «пир ещё может написать» от «читающий fd закрыли из
+    /// соседнего потока, и ждать больше некому» (см. `linux::sock_wait`).
+    pub fn queue_id(&self) -> usize {
+        Arc::as_ptr(&self.state) as usize
+    }
+    /// Остались ли пишущие концы: для читающего конца это `writers == 0` (EOF).
+    ///
+    /// `shutdown(SHUT_WR)` на пишущей стороне закрывает направление раньше
+    /// `close`, поэтому очередь сообщает 0 и тогда: блокирующее чтение обязано
+    /// проснуться с `Ok(0)`, а не ждать, пока Arc пишущего конца исчезнет.
+    pub fn writers(&self) -> usize {
+        let s = self.state.lock();
+        if s.write_shut {
+            0
+        } else {
+            s.writers
         }
     }
     /// Клонировать этот конец pipe с другим флагом O_NONBLOCK (fcntl
@@ -611,6 +663,59 @@ impl FdTable {
     /// диапазона/пустого (вызывающий отображает `None` -> `EBADF`, R2.14).
     pub fn get_mut(&mut self, fd: u32) -> Option<&mut OpenObject> {
         self.slots.get_mut(fd)
+    }
+
+    /// Ссылается ли ХОТЬ ОДИН дескриптор процесса на ЧИТАЮЩИЙ конец очереди
+    /// `queue_id`.
+    ///
+    /// Этот вопрос задаёт блокирующее чтение на каждой уступке CPU: закрытый из
+    /// соседнего потока дескриптор не выставляет EOF (счётчики очереди считают
+    /// живые концы, а не fd), и без этой проверки `recvfrom` ждал бы вечно —
+    /// watchdog печатал `stuck in syscall ? (nr=45 arg0=0x3 closed)`. `dup`
+    /// другого fd на ту же очередь по-прежнему считается владением, поэтому
+    /// закрытие одного из дубликатов законное ожидание не прерывает.
+    ///
+    /// Учитываются именно ЧИТАЮЩИЕ концы: оставшийся в таблице пишущий конец
+    /// (self-pipe, второй конец `socketpair` в том же процессе) данные в очередь
+    /// класть может, но забрать их после закрытия читающего fd некому — это
+    /// `EBADF`, а не продолжение ожидания.
+    pub fn holds_read_end(&self, queue_id: usize) -> bool {
+        self.slots.any(|obj| match obj {
+            OpenObject::PipeRead(e) => e.queue_id() == queue_id,
+            OpenObject::Socket { rx, .. } => rx.queue_id() == queue_id,
+            _ => false,
+        })
+    }
+
+    /// Ссылается ли ХОТЬ ОДИН дескриптор процесса на ПИШУЩИЙ конец очереди
+    /// `queue_id`.
+    ///
+    /// Зеркало [`Self::holds_read_end`] для блокирующей ЗАПИСИ: `sendto`/
+    /// `sendmsg`/`write` на полной очереди уступают CPU и перечитывают её, а
+    /// закрытие пишущего fd из соседнего потока не меняет счётчики очереди —
+    /// syscall держит её `Arc` сам. Без этой проверки такой `write` крутил бы
+    /// `yield_current()` вечно (watchdog печатал `stuck in syscall ? (nr=1
+    /// arg0=0x3 closed)`); `dup` другого fd на ту же очередь — по-прежнему
+    /// владение.
+    pub fn holds_write_end(&self, queue_id: usize) -> bool {
+        self.slots.any(|obj| match obj {
+            OpenObject::PipeWrite(e) => e.queue_id() == queue_id,
+            OpenObject::Socket { tx, .. } => tx.queue_id() == queue_id,
+            _ => false,
+        })
+    }
+
+    /// Ссылается ли ХОТЬ ОДИН дескриптор процесса на TCP-сокет `id`
+    /// (идентичность — адрес `Arc<InetTcp>`, как [`Self::holds_read_end`]).
+    ///
+    /// Тот же вопрос задаёт блокирующее чтение TCP: закрытый из соседнего
+    /// потока fd не выставляет EOF на соединении, поэтому без проверки
+    /// `recvfrom`/`read` спал бы вечно (watchdog `nr=45 arg0=0x3 closed`).
+    pub fn holds_inet_tcp(&self, id: usize) -> bool {
+        self.slots.any(|obj| match obj {
+            OpenObject::InetTcp(t) => Arc::as_ptr(t) as usize == id,
+            _ => false,
+        })
     }
 
     pub fn pipe(&mut self, nonblocking: bool) -> Result<(u32, u32), Errno> {
