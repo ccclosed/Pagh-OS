@@ -195,49 +195,27 @@ pub fn create_user_process(elf_data: &[u8]) -> Result<u64, &'static str> {
     Ok(pid)
 }
 
-/// Собрать в памяти минимальный статически слинкованный `ET_EXEC` x86_64 ELF,
-/// чья программа выдаёт `SYS_WRITE(fd=1, msg, len)`, затем `SYS_EXIT(0)` через
-/// `int 0x80`.
-///
-/// Всё изображение — один `PT_LOAD` RWX-сегмент, загруженный по виртуальной базе
-/// `0x40_0000` (каноническая нижняя половина, поэтому валидация указателя в
-/// `sys_write` принимает буфер сообщения). Сообщение живёт внутри отображённого
-/// сегмента, то есть `USER_ACCESSIBLE` в пользовательском PML4 и достижимо из
-/// ring 3.
+/// База виртуальных адресов, по которой грузится собранный в памяти тестовый
+/// ELF (нижняя каноническая половина — валидация пользовательских указателей
+/// принимает адреса оттуда).
+const TEST_ELF_VBASE: u64 = 0x40_0000;
+
+/// Файловое смещение (оно же смещение в vaddr) первого байта кода: сразу за
+/// ELF-заголовком и единственным program header'ом.
+const TEST_ELF_CODE_OFF: u64 = 64 + 56; // sizeof(Elf64Header) + sizeof(Elf64ProgramHeader)
+
+/// Собрать в памяти статически слинкованный `ET_EXEC` x86_64 ELF: один
+/// `PT_LOAD` RWX-сегмент по [`TEST_ELF_VBASE`], в начале которого лежит код
+/// `code`, а за ним — данные `data`.
 ///
 /// Байты собираются здесь, а не коммитятся бинарём, чтобы ядру не нужен был
 /// внешний ассемблер/линкер при сборке.
-fn build_test_elf() -> Vec<u8> {
-    const VBASE: u64 = 0x40_0000;
+fn assemble_test_elf(code: &[u8], data: &[u8]) -> Vec<u8> {
     const EHSIZE: usize = 64; // sizeof(Elf64Header)
     const PHSIZE: usize = 56; // sizeof(Elf64ProgramHeader)
-    let code_off = EHSIZE + PHSIZE; // файловое смещение (и смещение vaddr) кода
-
-    let msg: &[u8] = b"Hello from ring3 user process!\n";
-
-    // ── Машинный код, собранный вручную (см. комментарии к байтам) ───────────
-    // Сообщение идёт сразу за кодом, поэтому сначала вычисляем его адрес.
-    const CODE_LEN: usize = 33;
-    let msg_off = code_off + CODE_LEN;
-    let msg_addr = VBASE + msg_off as u64;
-    let len = msg.len() as u32;
-
-    let mut code: Vec<u8> = Vec::with_capacity(CODE_LEN);
-    code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1  (SYS_WRITE)
-    code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]); // mov edi, 1  (fd = stdout)
-    code.push(0xBE);
-    code.extend_from_slice(&(msg_addr as u32).to_le_bytes()); // mov esi, msg_addr
-    code.push(0xBA);
-    code.extend_from_slice(&len.to_le_bytes()); // mov edx, len
-    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
-    code.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]); // mov eax, 2  (SYS_EXIT)
-    code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi (код = 0)
-    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
-    code.extend_from_slice(&[0xEB, 0xFE]); // 1: jmp 1b (запасной цикл)
-    debug_assert_eq!(code.len(), CODE_LEN);
-
-    let entry = VBASE + code_off as u64;
-    let total_len = (msg_off + msg.len()) as u64;
+    let code_off = TEST_ELF_CODE_OFF as usize;
+    let entry = TEST_ELF_VBASE + code_off as u64;
+    let total_len = (code_off + code.len() + data.len()) as u64;
 
     let mut elf: Vec<u8> = Vec::new();
 
@@ -268,19 +246,67 @@ fn build_test_elf() -> Vec<u8> {
     elf.extend_from_slice(&1u32.to_le_bytes()); // p_type  = PT_LOAD
     elf.extend_from_slice(&7u32.to_le_bytes()); // p_flags = PF_R|PF_W|PF_X
     elf.extend_from_slice(&0u64.to_le_bytes()); // p_offset (segment starts at file 0)
-    elf.extend_from_slice(&VBASE.to_le_bytes()); // p_vaddr
-    elf.extend_from_slice(&VBASE.to_le_bytes()); // p_paddr
+    elf.extend_from_slice(&TEST_ELF_VBASE.to_le_bytes()); // p_vaddr
+    elf.extend_from_slice(&TEST_ELF_VBASE.to_le_bytes()); // p_paddr
     elf.extend_from_slice(&total_len.to_le_bytes()); // p_filesz
     elf.extend_from_slice(&total_len.to_le_bytes()); // p_memsz
     elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
     debug_assert_eq!(elf.len(), EHSIZE + PHSIZE);
 
-    // ── Код + сообщение ──────────────────────────────────────────────────────
-    elf.extend_from_slice(&code);
-    elf.extend_from_slice(msg);
+    // ── Код + данные ────────────────────────────────────────────────────────
+    elf.extend_from_slice(code);
+    elf.extend_from_slice(data);
     debug_assert_eq!(elf.len() as u64, total_len);
 
     elf
+}
+
+/// Собрать в памяти минимальный статически слинкованный `ET_EXEC` x86_64 ELF,
+/// чья программа выдаёт `SYS_WRITE(fd=1, msg, len)`, затем `SYS_EXIT(0)` через
+/// `int 0x80`.
+///
+/// Сообщение живёт внутри отображённого сегмента, то есть `USER_ACCESSIBLE` в
+/// пользовательском PML4 и достижимо из ring 3.
+fn build_test_elf() -> Vec<u8> {
+    let msg: &[u8] = b"Hello from ring3 user process!\n";
+
+    // ── Машинный код, собранный вручную (см. комментарии к байтам) ───────────
+    // Сообщение идёт сразу за кодом, поэтому сначала вычисляем его адрес.
+    const CODE_LEN: usize = 33;
+    let msg_addr = TEST_ELF_VBASE + TEST_ELF_CODE_OFF + CODE_LEN as u64;
+    let len = msg.len() as u32;
+
+    let mut code: Vec<u8> = Vec::with_capacity(CODE_LEN);
+    code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1  (SYS_WRITE)
+    code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]); // mov edi, 1  (fd = stdout)
+    code.push(0xBE);
+    code.extend_from_slice(&(msg_addr as u32).to_le_bytes()); // mov esi, msg_addr
+    code.push(0xBA);
+    code.extend_from_slice(&len.to_le_bytes()); // mov edx, len
+    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+    code.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]); // mov eax, 2  (SYS_EXIT)
+    code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi (код = 0)
+    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+    code.extend_from_slice(&[0xEB, 0xFE]); // 1: jmp 1b (запасной цикл)
+    debug_assert_eq!(code.len(), CODE_LEN);
+
+    assemble_test_elf(&code, msg)
+}
+
+/// Собрать ELF нативной ring-3 задачи, которая пишет в НЕотображённую
+/// пользовательскую страницу `0x1337_0000` и потому гарантированно получает
+/// #PF (`P=false, W=true, U=true`).
+///
+/// Нужен in-QEMU регрессии `test::ring3_fault_tests`: задача создаётся нативно,
+/// БЕЗ `CompatState`, поэтому до фикса MVP S4b обработчик #PF уводил такой
+/// отказ в `halt()` и машина умирала.
+fn build_faulting_test_elf() -> Vec<u8> {
+    let code: &[u8] = &[
+        0xB8, 0x00, 0x00, 0x37, 0x13, // mov eax, 0x13370000
+        0xC7, 0x00, 0x41, 0x00, 0x00, 0x00, // mov dword [rax], 0x41
+        0xEB, 0xFE, // 1: jmp 1b (не исполняется: запись падает)
+    ];
+    assemble_test_elf(code, &[])
 }
 
 /// Собрать встроенный тестовый ELF и запустить его как ring-3 пользовательский
@@ -292,6 +318,16 @@ fn build_test_elf() -> Vec<u8> {
 pub fn spawn_test_user_process() -> Result<u64, &'static str> {
     let elf = build_test_elf();
     create_user_process(&elf)
+}
+
+/// Запустить нативную ring-3 задачу, которая сразу падает на записи в
+/// неотображённую пользовательскую страницу (регрессия MVP S4b: ring-3 отказ
+/// убивает задачу, а ядро выживает).
+///
+/// Как и [`spawn_test_user_process`], вызывать с выключенными прерываниями:
+/// создание процесса временно ставит пользовательский CR3.
+pub fn spawn_faulting_test_user_process() -> Result<u64, &'static str> {
+    create_user_process(&build_faulting_test_elf())
 }
 
 /// Режимы отказа [`run_linux_binary`] (R7.3, R7.4, R7.5).
