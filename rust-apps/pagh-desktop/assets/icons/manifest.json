@@ -1,0 +1,332 @@
+{
+  "schema": "pagh-icons/1",
+  "license": "MIT, Copyright (c) 2020 Microsoft Corporation",
+  "source": "https://github.com/microsoft/fluentui-system-icons",
+  "tooling": "cairosvg 2.9.0: вектор в точный размер + фазовая подгонка",
+  "render": {
+    "supersample": 1,
+    "downsample": "none (cairo AA)",
+    "style": "regular: #000000 + alpha, RGB заменяет тинт"
+  },
+  "sizes": [
+    16,
+    20,
+    24,
+    32,
+    48
+  ],
+  "icons": {
+    "grid": {
+      "fluent": "Grid",
+      "files": {
+        "16": "grid-16.png",
+        "20": "grid-20.png",
+        "24": "grid-24.png",
+        "32": "grid-32.png",
+        "48": "grid-48.png"
+      },
+      "master_svg_size": {
+        "16": 16,
+        "20": 20,
+        "24": 24,
+        "32": 28,
+        "48": 28
+      },
+      "phase": {
+        "16": [
+          0.0,
+          0.0
+        ],
+        "20": [
+          0.0,
+          0.0
+        ],
+        "24": [
+          0.0,
+          0.0
+        ],
+        "32": [
+          0.0,
+          0.0
+        ],
+        "48": [
+          0.5,
+          0.5
+        ]
+      }
+    },
+    "terminal": {
+      "fluent": "Window Console",
+      "files": {
+        "16": "terminal-16.png",
+        "20": "terminal-20.png",
+        "24": "terminal-24.png",
+        "32": "terminal-32.png",
+        "48": "terminal-48.png"
+      },
+      "master_svg_size": {
+        "16": 20,
+        "20": 20,
+        "24": 20,
+        "32": 20,
+        "48": 20
+      },
+      "phase": {
+        "16": [
+          0.0,
+          0.0
+        ],
+        "20": [
+          0.0,
+          0.0
+        ],
+        "24": [
+          0.0,
+          0.0
+        ],
+        "32": [
+          0.0,
+          0.0
+        ],
+        "48": [
+          0.5,
+          0.5
+        ]
+      }
+    },
+    "folder": {
+      "fluent": "Folder",
+      "files": {
+        "16": "folder-16.png",
+        "20": "folder-20.png",
+        "24": "folder-24.png",
+        "32": "folder-32.png",
+        "48": "folder-48.png"
+      },
+      "master_svg_size": {
+        "16": 16,
+        "20": 20,
+        "24": 24,
+        "32": 32,
+        "48": 48
+      },
+      "phase": {
+        "16": [
+          0.0,
+          0.0
+        ],
+        "20": [
+          0.0,
+          0.0
+        ],
+        "24": [
+          0.0,
+          0.0
+        ],
+        "32": [
+          0.0,
+          0.0
+        ],
+        "48": [
+          0.0,
+          0.5
+        ]
+      }
+    },
+    "image": {
+      "fluent": "Image",
+      "files": {
+        "16": "image-16.png",
+        "20": "image-20.png",
+        "24": "image-24.png",
+        "32": "image-32.png",
+        "48": "image-48.png"
+      },
+      "master_svg_size": {
+        "16": 16,
+        "20": 20,
+        "24": 24,
+        "32": 32,
+        "48": 48
+      },
+      "phase": {
+        "16": [
+          0.0,
+          0.0
+        ],
+        "20": [
+          0.0,
+          0.0
+        ],
+        "24": [
+          0.5,
+          0.0
+        ],
+        "32": [
+          0.0,
+          0.0
+        ],
+        "48": [
+          0.0,
+          0.0
+        ]
+      }
+    },
+    "network-wired": {
+      "fluent": "Plug Connected",
+      "files": {
+        "16": "network-wired-16.png",
+        "20": "network-wired-20.png",
+        "24": "network-wired-24.png",
+        "32": "network-wired-32.png",
+        "48": "network-wired-48.png"
+      },
+      "master_svg_size": {
+        "16": 16,
+        "20": 20,
+        "24": 24,
+        "32": 32,
+        "48": 48
+      },
+      "phase": {
+        "16": [
+          0.0,
+          0.0
+        ],
+        "20": [
+          0.0,
+          0.0
+        ],
+        "24": [
+          0.5,
+          0.5
+        ],
+        "32": [
+          0.5,
+          0.0
+        ],
+        "48": [
+          0.5,
+          0.5
+        ]
+      }
+    },
+    "window-minimize": {
+      "fluent": "Subtract",
+      "files": {
+        "16": "window-minimize-16.png",
+        "20": "window-minimize-20.png",
+        "24": "window-minimize-24.png",
+        "32": "window-minimize-32.png",
+        "48": "window-minimize-48.png"
+      },
+      "master_svg_size": {
+        "16": 16,
+        "20": 20,
+        "24": 24,
+        "32": 28,
+        "48": 48
+      },
+      "phase": {
+        "16": [
+          0.0,
+          0.5
+        ],
+        "20": [
+          0.0,
+          0.5
+        ],
+        "24": [
+          0.0,
+          0.5
+        ],
+        "32": [
+          0.0,
+          0.0
+        ],
+        "48": [
+          0.5,
+          0.5
+        ]
+      }
+    },
+    "window-maximize": {
+      "fluent": "Square",
+      "files": {
+        "16": "window-maximize-16.png",
+        "20": "window-maximize-20.png",
+        "24": "window-maximize-24.png",
+        "32": "window-maximize-32.png",
+        "48": "window-maximize-48.png"
+      },
+      "master_svg_size": {
+        "16": 16,
+        "20": 20,
+        "24": 24,
+        "32": 32,
+        "48": 48
+      },
+      "phase": {
+        "16": [
+          0.0,
+          0.0
+        ],
+        "20": [
+          0.0,
+          0.0
+        ],
+        "24": [
+          0.5,
+          0.0
+        ],
+        "32": [
+          0.0,
+          0.0
+        ],
+        "48": [
+          0.5,
+          0.0
+        ]
+      }
+    },
+    "window-close": {
+      "fluent": "Dismiss",
+      "files": {
+        "16": "window-close-16.png",
+        "20": "window-close-20.png",
+        "24": "window-close-24.png",
+        "32": "window-close-32.png",
+        "48": "window-close-48.png"
+      },
+      "master_svg_size": {
+        "16": 16,
+        "20": 20,
+        "24": 24,
+        "32": 32,
+        "48": 48
+      },
+      "phase": {
+        "16": [
+          0.5,
+          0.5
+        ],
+        "20": [
+          0.0,
+          0.0
+        ],
+        "24": [
+          0.5,
+          0.0
+        ],
+        "32": [
+          0.0,
+          0.0
+        ],
+        "48": [
+          0.5,
+          0.5
+        ]
+      }
+    }
+  }
+}
