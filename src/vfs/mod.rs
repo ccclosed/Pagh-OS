@@ -38,6 +38,10 @@ pub enum VfsError {
     NotSupported,
     InvalidArgument,
     IoError,
+    /// Нет места на устройстве (`ENOSPC`): `/dev/full` отвергает любую запись,
+    /// как Linux; файловые системы, которым не хватило блоков, пока сообщают
+    /// `IoError` (историческое поведение ext2).
+    NoSpace,
     AlreadyExists,
 }
 
@@ -281,6 +285,68 @@ impl VfsNode for NullDevice {
 
     fn write(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
         Ok(buf.len())
+    }
+
+    /// `/dev/null` — 0666: это не ресурс, а сток; его доступность не должна
+    /// зависеть от идентичности (иначе редирект `2>/dev/null` ломается у
+    /// непривилегированного процесса).
+    fn mode(&self) -> u32 {
+        0o666
+    }
+}
+
+// ─── /dev/zero и /dev/full ─────────────────────────────────────────────────
+
+/// `/dev/zero`: чтение даёт нули, запись отбрасывается. Linux-совместимый узел
+/// для `mmap`-паддинга/POSIX-программ; 0666, как `/dev/null`.
+struct ZeroDevice;
+
+impl VfsNode for ZeroDevice {
+    fn name(&self) -> &str {
+        "zero"
+    }
+    fn is_directory(&self) -> bool {
+        false
+    }
+
+    fn read(&self, _offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        buf.fill(0);
+        Ok(buf.len())
+    }
+
+    fn write(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        Ok(buf.len())
+    }
+
+    fn mode(&self) -> u32 {
+        0o666
+    }
+}
+
+/// `/dev/full`: чтение даёт нули, запись всегда `ENOSPC`. Linux-тест-узел для
+/// обработки ошибок записи; 0666, потому что отказ — часть контракта узла, а не
+/// вопрос прав.
+struct FullDevice;
+
+impl VfsNode for FullDevice {
+    fn name(&self) -> &str {
+        "full"
+    }
+    fn is_directory(&self) -> bool {
+        false
+    }
+
+    fn read(&self, _offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        buf.fill(0);
+        Ok(buf.len())
+    }
+
+    fn write(&self, _offset: u64, _buf: &[u8]) -> VfsResult<usize> {
+        Err(VfsError::NoSpace)
+    }
+
+    fn mode(&self) -> u32 {
+        0o666
     }
 }
 
@@ -532,6 +598,10 @@ pub fn init() {
     crate::debug!("Mounting /dev...");
     let null = Arc::new(NullDevice) as Arc<dyn VfsNode>;
     crate::debug!("/dev/null — ready");
+    let zero = Arc::new(ZeroDevice) as Arc<dyn VfsNode>;
+    crate::debug!("/dev/zero — ready");
+    let full = Arc::new(FullDevice) as Arc<dyn VfsNode>;
+    crate::debug!("/dev/full — ready");
     let serial = Arc::new(SerialDevice) as Arc<dyn VfsNode>;
     crate::debug!("/dev/serial — ready");
     // Устройства desktop-варианта B. Узлы создаются всегда: если фреймбуфера
@@ -548,6 +618,8 @@ pub fn init() {
     let dev = Arc::new(DevDirectory {
         children: vec![
             Arc::clone(&null),
+            Arc::clone(&zero),
+            Arc::clone(&full),
             Arc::clone(&serial),
             Arc::clone(&fb0),
             Arc::clone(&input),

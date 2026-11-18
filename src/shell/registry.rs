@@ -257,6 +257,24 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_pwd,
     },
     CommandSpec {
+        name: "id",
+        description: "Show uid/gid/groups of the session or a user",
+        usage: "id [user]",
+        handler: super::commands::cmd_id,
+    },
+    CommandSpec {
+        name: "groups",
+        description: "List group names of the session or a user",
+        usage: "groups [user]",
+        handler: super::commands::cmd_groups,
+    },
+    CommandSpec {
+        name: "su",
+        description: "Switch session identity (phase 1: root -> uid 1000, no password)",
+        usage: "su [user]",
+        handler: super::commands::cmd_su,
+    },
+    CommandSpec {
         name: "head",
         description: "Print the first lines of a file",
         usage: "head [-n LINES] FILE",

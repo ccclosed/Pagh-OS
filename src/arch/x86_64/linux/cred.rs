@@ -23,14 +23,60 @@
 //!
 //! ## Что намеренно не моделируется
 //!
-//! Дополнительных групп, capabilities и user namespace нет.
-//! [`Creds::gid`]/[`Creds::egid`] — единственная групповая идентичность, которую
-//! видит проверка прав. `fsuid`/`fsgid` (отдельная идентичность файловой системы
-//! в Linux) тоже не моделируются: проверки прав используют `euid`/`egid`, что и
-//! документирует `setuid(2)` для процесса, никогда не звавшего `setfsuid(2)`.
+//! Capabilities и user namespace не моделируются. `fsuid`/`fsgid` (отдельная
+//! идентичность файловой системы в Linux) тоже не моделируются: проверки прав
+//! используют `euid`/`egid`, что и документирует `setuid(2)` для процесса,
+//! никогда не звавшего `setfsuid(2)`.
+//!
+//! ## Дополнительные группы (фаза 1 «группы отдельно от root»)
+//!
+//! [`Creds::groups`] — фиксированный набор до [`GROUPS_CAP`] supplementary gid'ов
+//! (`setgroups(2)`). Linux проверяет групповой класс прав, если gid владельца
+//! равен **либо** `egid`, **либо** любому supplementary gid'у; именно это делает
+//! [`Creds::may`]. Набор наследуется `fork`/`clone` и переживает `execve` (они
+//! копируют [`Creds`] целиком; setuid-бинари не моделируются).
+//!
+//! Почему cap, а не `Vec`: `Creds` — `Copy`-снимок в `CompatState`, который
+//! копируется на каждом `fork`/проверке прав в `no_std`-ядре с фиксированной
+//! кучей. Linux `NGROUPS_MAX` = 65536; здесь осознанно 32 — это больше, чем
+//! нужно фазе 1 (root, wheel, disk, tty, video, input, net), и не раздувает
+//! состояние процесса. `setgroups(2)` с большим `size` отвергается `EINVAL`,
+//! а не обрезается молча.
 #![allow(dead_code)]
 
-/// Шесть POSIX-идентичностей процесса.
+/// Максимум дополнительных групп у процесса (`setgroups(2)`).
+///
+/// Linux `NGROUPS_MAX` = 65536; pagh сознательно ограничивает набор 32
+/// группами и документирует это в `docs/security/groups.md` как ограничение
+/// фазы 1.
+pub const GROUPS_CAP: usize = 32;
+
+/// Номера групп pagh (фаза 1).
+///
+/// Числа взяты из общепринятых Linux-конвенций, чтобы `/etc/group` и образы
+/// Debian-подобных систем не расходились: `tty = 5`, `disk = 6`, `wheel = 10`,
+/// `video = 44`, `input = 105`. `net = 90` — номер исторической группы `net`,
+/// который pagh резервирует для сетевого администрирования (сам по себе он пока
+/// не даёт прав: `security-model.md` §capabilities, фаза 2). Занятость номеров в
+/// образе userland не проверяется — это наши собственные узлы/файлы.
+pub mod gid {
+    /// Группа дисковых устройств (raw block devices, фаза 2).
+    pub const DISK: u32 = 6;
+    /// Группа терминалов: `/dev/vtconsole0`.
+    pub const TTY: u32 = 5;
+    /// Группа администраторов (`su`, фаза 2 login/setuid).
+    pub const WHEEL: u32 = 10;
+    /// Группа доступа к фреймбуферу: `/dev/fb0`.
+    pub const VIDEO: u32 = 44;
+    /// Группа устройств ввода: `/dev/input/event0`, `/dev/vtinput`.
+    pub const INPUT: u32 = 105;
+    /// Группа сетевого администрирования (фаза 2).
+    pub const NET: u32 = 90;
+    /// Группа пользователя `oleg` (uid 1000) — основная в `/etc/group`.
+    pub const OLEG: u32 = 1000;
+}
+
+/// Шесть POSIX-идентичностей процесса плюс дополнительные группы.
 ///
 /// Каждое поле — простой `u32` (Linux `uid_t`/`gid_t`); ядро никогда не выдаёт
 /// `(uid_t)-1` как реальную идентичность.
@@ -50,12 +96,17 @@ pub struct Creds {
     pub suid: u32,
     /// Saved set-group-ID (сохранённый group id).
     pub sgid: u32,
+    /// Дополнительные gid'ы (`setgroups(2)`), значимы только первые
+    /// `ngroups` записей. Хвост всегда нулевой (инвариант конструкторов).
+    groups: [u32; GROUPS_CAP],
+    /// Сколько элементов `groups` задано (0..=[`GROUPS_CAP`]).
+    ngroups: usize,
 }
 
 impl Creds {
     /// Идентичность, с которой стартуют все запущенные ядром процессы и шелл
     /// загрузки. Сохранение root поддерживает существующий userland (CPython,
-    /// apt).
+    /// apt). Дополнительных групп нет: root обходит DAC и без них.
     pub const ROOT: Creds = Creds {
         uid: 0,
         gid: 0,
@@ -63,9 +114,13 @@ impl Creds {
         egid: 0,
         suid: 0,
         sgid: 0,
+        groups: [0; GROUPS_CAP],
+        ngroups: 0,
     };
 
     /// Удобный конструктор для тестов и для политики запуска не от root.
+    ///
+    /// Дополнительные группы пусты; [`Creds::with_groups`] добавляет их.
     pub const fn new(uid: u32, gid: u32, euid: u32, egid: u32, suid: u32, sgid: u32) -> Self {
         Creds {
             uid,
@@ -74,7 +129,68 @@ impl Creds {
             egid,
             suid,
             sgid,
+            groups: [0; GROUPS_CAP],
+            ngroups: 0,
         }
+    }
+
+    /// Копия с заданным дополнительным набором групп (внутренняя политика,
+    /// тесты, запуск `su` из shell).
+    ///
+    /// `None`, когда `groups.len() > `[`GROUPS_CAP`] — вызывающий обязан
+    /// сообщить ошибку, а не молча обрезать набор.
+    pub fn with_groups(mut self, groups: &[u32]) -> Option<Creds> {
+        if groups.len() > GROUPS_CAP {
+            return None;
+        }
+        self.groups = [0; GROUPS_CAP];
+        self.groups[..groups.len()].copy_from_slice(groups);
+        self.ngroups = groups.len();
+        Some(self)
+    }
+
+    /// Дополнительные группы в порядке, заданном `setgroups(2)`.
+    #[inline]
+    pub fn groups(&self) -> &[u32] {
+        &self.groups[..self.ngroups]
+    }
+
+    /// Входит ли `gid` в групповую идентичность процесса?
+    ///
+    /// `egid` и любой дополнительный gid дают групповой класс прав; real `gid`
+    /// сам по себе — нет (Linux решает по effective id, а supplementary-набор
+    /// общий для всех трёх).
+    #[inline]
+    pub fn in_group(&self, gid: u32) -> bool {
+        self.egid == gid || self.groups().contains(&gid)
+    }
+
+    /// `setgroups(2)`: заменить дополнительные группы.
+    ///
+    /// Только привилегированный вызывающий (`euid == 0`, модель `CAP_SETGID`);
+    /// `size > `[`GROUPS_CAP`] или непривилегированный — `None` (`EINVAL`/
+    /// `EPERM` на границе syscall). Gid 0 разрешён: Linux с `CAP_SETGID` не
+    /// запрещает ни одного *числа* gid'а, запрет — только на идентичность
+    /// вызывающего.
+    pub fn setgroups(&self, groups: &[u32]) -> Option<Creds> {
+        if self.euid != 0 || groups.len() > GROUPS_CAP {
+            return None;
+        }
+        self.with_groups(groups)
+    }
+
+    /// Взгляд на те же креденшелы через **real** id'ы — семантика `access(2)`.
+    ///
+    /// `access(2)` проверяет real uid/gid, чтобы setuid-подобное повышение не
+    /// позволяло прощупать недоступное. Дополнительные группы при этом
+    /// сохраняются: `setgroups(2)` меняет общий набор, а не effective-проекцию,
+    /// поэтому отбрасывать их здесь было бы ошибкой (именно так group-класс
+    /// `access()` перестал бы находить свои группы).
+    pub fn with_real_ids(&self) -> Creds {
+        let mut next = *self;
+        next.euid = self.uid;
+        next.egid = self.gid;
+        next
     }
 
     /// Effective user id (`geteuid(2)` и идентичность проверки прав).
@@ -101,7 +217,8 @@ impl Creds {
     /// Проверка прав POSIX для `access` по `mode` и владельцу `(uid, gid)`.
     ///
     /// * Effective id выбирает класс: `euid == uid владельца` → биты owner; иначе
-    ///   `egid == gid владельца` → биты group; иначе биты other.
+    ///   `egid == gid владельца` **или** gid владельца входит в дополнительные
+    ///   группы → биты group; иначе биты other.
     /// * `euid == 0` полностью обходит read и write (семантика capabilities
     ///   Linux), но **не** execute: root всё равно нуждается хотя бы в одном из
     ///   трёх execute-битов. Это правило не даёт исполнить неисполняемый файл
@@ -119,7 +236,7 @@ impl Creds {
         }
         let class_shift = if self.euid == owner.0 {
             6
-        } else if self.egid == owner.1 {
+        } else if self.in_group(owner.1) {
             3
         } else {
             0
@@ -474,5 +591,112 @@ mod tests {
         assert!(owner.may_chmod((1000, 1000)));
         assert!(!owner.may_chmod((1001, 1000)));
         assert!(!owner.may_chown());
+    }
+
+    #[test]
+    fn supplementary_gid_grants_the_group_class() {
+        // egid 1000, но файл принадлежит группе video(44): только
+        // дополнительная группа 44 даёт доступ; other-биты запрещены.
+        let c = Creds::new(1000, 1000, 1000, 1000, 1000, 1000)
+            .with_groups(&[44, 105])
+            .expect("two supplementary groups fit");
+        assert_eq!(c.groups(), &[44, 105]);
+        assert!(c.in_group(44));
+        assert!(c.in_group(105));
+        assert!(c.in_group(1000), "egid is always a group identity");
+        assert!(!c.in_group(10));
+        assert!(c.may(0o640, (0, 44), Access::Read));
+        assert!(!c.may(0o640, (0, 44), Access::Write));
+        assert!(!c.may(0o660, (0, 10), Access::Read), "foreign group denied");
+        assert!(
+            c.may(0o004, (0, 10), Access::Read),
+            "other bits still apply"
+        );
+
+        // Без дополнительной группы тот же файл закрыт (доказательство, что
+        // доступ дал именно supplementary set, а не something else).
+        let none = Creds::new(1000, 1000, 1000, 1000, 1000, 1000);
+        assert!(!none.in_group(44));
+        assert!(!none.may(0o640, (0, 44), Access::Read));
+    }
+
+    #[test]
+    fn setgroups_is_root_only_capped_and_allows_gid_zero() {
+        let root = Creds::ROOT;
+        let with = root.setgroups(&[0, 44, 105]).expect("root may setgroups");
+        assert_eq!(with.groups(), &[0, 44, 105]);
+        assert!(with.in_group(0), "gid 0 may be listed explicitly");
+        // Linux `setgroups(0, NULL)` очищает набор.
+        assert!(with.setgroups(&[]).expect("clear").groups().is_empty());
+
+        // Больше cap — отказ, а не молчаливое обрезание.
+        let too_many = [7u32; GROUPS_CAP + 1];
+        assert_eq!(root.setgroups(&too_many), None);
+        // Ровно cap принимается.
+        let exactly = [7u32; GROUPS_CAP];
+        assert_eq!(
+            root.setgroups(&exactly).expect("cap is inclusive").groups(),
+            &exactly[..]
+        );
+
+        // Непривилегированный не может менять дополнительные группы даже на
+        // пустой набор; euid, а не uid, решает (Linux CAP_SETGID).
+        let plain = Creds::new(1000, 1000, 1000, 1000, 1000, 1000);
+        assert_eq!(plain.setgroups(&[]), None);
+        assert_eq!(plain.setgroups(&[44]), None);
+        let setuid_root = Creds::new(1000, 1000, 0, 1000, 0, 1000);
+        assert!(
+            setuid_root.setgroups(&[44]).is_some(),
+            "euid 0 is privileged"
+        );
+    }
+
+    #[test]
+    fn with_real_ids_projects_access_semantics_and_keeps_groups() {
+        // setuid-подобное состояние: real 1000, effective 0, supplemental 44.
+        let c = Creds::new(1000, 1000, 0, 44, 0, 44)
+            .with_groups(&[105])
+            .expect("groups fit");
+        let real = c.with_real_ids();
+        assert_eq!(
+            (real.uid, real.gid, real.euid, real.egid, real.suid, real.sgid),
+            (1000, 1000, 1000, 1000, 0, 44)
+        );
+        assert_eq!(real.groups(), &[105], "supplementary set survives access()");
+        // effective-взгляд — root bypass; real-взгляд — обычные биты.
+        assert!(c.may(0o000, (1000, 1000), Access::Read));
+        assert!(!real.may(0o000, (1000, 1000), Access::Read));
+        // И group-класс real-взгляда видит 105, но не 44 (egid стал 1000).
+        assert!(real.may(0o040, (0, 105), Access::Read));
+        assert!(!real.may(0o040, (0, 44), Access::Read));
+    }
+
+    #[test]
+    fn gid_constants_are_distinct_and_match_the_documented_numbers() {
+        let all = [
+            gid::DISK,
+            gid::TTY,
+            gid::WHEEL,
+            gid::VIDEO,
+            gid::INPUT,
+            gid::NET,
+            gid::OLEG,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "group numbers must be distinct");
+            }
+        }
+        assert_eq!(
+            (
+                gid::TTY,
+                gid::DISK,
+                gid::WHEEL,
+                gid::VIDEO,
+                gid::INPUT,
+                gid::NET
+            ),
+            (5, 6, 10, 44, 105, 90)
+        );
     }
 }

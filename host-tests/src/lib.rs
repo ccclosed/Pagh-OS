@@ -66,6 +66,12 @@ pub mod cmsg;
 #[path = "../../src/arch/x86_64/linux/cred.rs"]
 pub mod cred;
 
+// Shell identity database: pure `/etc/passwd` + `/etc/group` parsing used by
+// `id`/`groups`/`su` (phase 1 "groups separate from root"). `core`+`alloc`
+// only, so property P58 exercises the exact source the kernel compiles.
+#[path = "../../src/shell/identity_db.rs"]
+pub mod identity_db;
+
 #[path = "../../src/arch/x86_64/linux/rand_clock.rs"]
 pub mod rand_clock;
 
@@ -617,6 +623,7 @@ mod properties {
     mod p51;
     mod p52;
     mod p53;
+    mod p58;
 
     // Controlling-terminal job control: the pure foreground-group/TOSTOP model
     // behind TIOCGPGRP/TIOCSPGRP and the SIGTTIN/SIGTTOU signal choice.

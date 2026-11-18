@@ -39,16 +39,19 @@ fn oracle_may(c: &Creds, mode: u32, owner: (u32, u32), access: Access) -> bool {
             Access::Execute => (perms & 0o111) != 0,
         };
     }
+    // Group class: the owner gid matches egid OR any supplementary gid (phase 1
+    // "groups separate from root"). Written independently as a boolean test.
+    let in_group = c.egid == owner.1 || c.groups().iter().any(|g| *g == owner.1);
     let granted = if c.euid == owner.0 {
         perms & 0o700
-    } else if c.egid == owner.1 {
+    } else if in_group {
         perms & 0o070
     } else {
         perms & 0o007
     };
     let shift = if c.euid == owner.0 {
         6
-    } else if c.egid == owner.1 {
+    } else if in_group {
         3
     } else {
         0
@@ -60,6 +63,25 @@ fn credentials() -> impl Strategy<Value = Creds> {
     (any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>()).prop_map(
         |(uid, gid, euid, egid, suid, sgid)| Creds::new(uid, gid, euid, egid, suid, sgid),
     )
+}
+
+/// Credentials with 0..=cap supplementary groups drawn from the same small id
+/// universe as the property's owner ids, so group-class collisions are common.
+fn credentials_with_groups() -> impl Strategy<Value = Creds> {
+    (
+        any::<u32>(),
+        any::<u32>(),
+        any::<u32>(),
+        any::<u32>(),
+        any::<u32>(),
+        any::<u32>(),
+        prop::collection::vec(0u32..6, 0..crate::cred::GROUPS_CAP),
+    )
+        .prop_map(|(uid, gid, euid, egid, suid, sgid, groups)| {
+            Creds::new(uid, gid, euid, egid, suid, sgid)
+                .with_groups(&groups)
+                .expect("generator stays within the cap")
+        })
 }
 
 fn access() -> impl Strategy<Value = Access> {
@@ -289,6 +311,76 @@ proptest! {
             }
             None => prop_assert!(c.euid != 0),
         }
+    }
+
+    /// Supplementary groups are exactly the group-class mechanism: any of them
+    /// grants the group bits, regardless of egid; without them only egid does.
+    #[test]
+    fn supplementary_groups_select_the_group_class(
+        c in credentials_with_groups(),
+        mode in any::<u32>(),
+        owner_uid in any::<u32>(),
+        owner_gid in 0u32..6,
+        a in access(),
+    ) {
+        let in_supp = c.groups().contains(&owner_gid);
+        // Re-derive the expected decision from the class alone: owner wins,
+        // then group (egid or supplementary), then other.
+        let perms = mode & 0o777;
+        let shift = if c.euid == owner_uid {
+            6
+        } else if c.egid == owner_gid || in_supp {
+            3
+        } else {
+            0
+        };
+        let expected = if c.euid == 0 {
+            match a {
+                Access::Read | Access::Write => true,
+                Access::Execute => (perms & 0o111) != 0,
+            }
+        } else {
+            ((perms >> shift) & access_bit(a)) != 0
+        };
+        prop_assert_eq!(c.may(mode, (owner_uid, owner_gid), a), expected);
+    }
+
+    /// `setgroups` is root-only, honours the cap exactly, and either refuses or
+    /// returns a credentials value whose group slice is the requested one.
+    #[test]
+    fn setgroups_outcome_is_bounded(
+        c in credentials(),
+        groups in prop::collection::vec(any::<u32>(), 0..(crate::cred::GROUPS_CAP + 2)),
+    ) {
+        match c.setgroups(&groups) {
+            Some(next) => {
+                prop_assert!(c.euid == 0);
+                prop_assert!(groups.len() <= crate::cred::GROUPS_CAP);
+                prop_assert_eq!(next.groups(), &groups[..]);
+                // User/group identities are untouched by setgroups.
+                prop_assert_eq!(
+                    (next.uid, next.gid, next.euid, next.egid, next.suid, next.sgid),
+                    (c.uid, c.gid, c.euid, c.egid, c.suid, c.sgid)
+                );
+            }
+            None => {
+                prop_assert!(
+                    c.euid != 0 || groups.len() > crate::cred::GROUPS_CAP,
+                    "refusal must be EPERM or EINVAL by construction"
+                );
+            }
+        }
+    }
+
+    /// `access(2)`'s REAL-id projection keeps the supplementary set: the group
+    /// bits still see every group the process belongs to.
+    #[test]
+    fn real_id_projection_keeps_supplementary_groups(c in credentials_with_groups()) {
+        let real = c.with_real_ids();
+        prop_assert_eq!(real.groups(), c.groups());
+        prop_assert_eq!((real.euid, real.egid), (c.uid, c.gid));
+        prop_assert_eq!((real.uid, real.gid, real.suid, real.sgid),
+                        (c.uid, c.gid, c.suid, c.sgid));
     }
 }
 
