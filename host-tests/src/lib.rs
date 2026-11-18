@@ -682,6 +682,11 @@ mod properties {
     // number.
     mod p56;
 
+    // Non-root phase 2 (agent B): the sticky-directory deletion rule
+    // (`S_ISVTX`, /tmp 1777). Isolated from P56's ordinary permission matrix so
+    // that a regression in either rule names itself.
+    mod p59;
+
     // Socket payload cap (`sendto`/`recvfrom`): the kernel validated with a
     // capped length and then allocated/copied the raw u64 count (2026-11-13
     // audit follow-up, F-x86v-1 allocation class). P57 pins the single policy.
