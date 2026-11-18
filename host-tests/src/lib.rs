@@ -703,6 +703,13 @@ mod properties {
     // per-direction read/write/poll answers. Pinned against a live-kernel probe.
     mod p59;
 
+    // Blocking AF_UNIX delivery: the wait step must be a SLEEP (not the
+    // `yield_current` busy-spin that starved the CPU under the compat lock), and
+    // `SO_RCVTIMEO` must turn a still-live queue into `EAGAIN` instead of an
+    // eternal `recv`. Pins the live PDP-client `poll()` hang (`nr=45` watchdog)
+    // and the `timeval`→milliseconds conversion the kernel lost.
+    mod p60;
+
     // NVMe PRP lists + queue-depth arithmetic (PRP1/PRP2/list page, LBA chunk
     // planning, polled CQ phase tags, CAP.MQES clamping). The driver itself is
     // MMIO/PMM code and cannot run on the host; this is the half that decides
