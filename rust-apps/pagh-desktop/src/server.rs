@@ -937,8 +937,13 @@ impl Server {
         let _ = writer.set_write_timeout(Some(Duration::from_secs(2)));
         let tx = self.incoming_tx.clone();
         let running = self.running.clone();
+        // В Pagh у AF_UNIX нет очередей ожидания: блокирующий recvmsg
+        // уступает CPU и перечитывает очередь, то есть горячий тред-читатель
+        // занимает ядро целиком и на каждом витке берёт глобальный compat-лок.
+        // С неблокирующим сокетом тред спит между попытками (см. read_loop).
         let reader = stream;
         let _ = reader.set_read_timeout(Some(Duration::from_millis(200)));
+        let _ = reader.set_nonblocking(true);
         thread::spawn(move || read_loop(conn, reader, tx, running));
         self.clients.push(ClientConn {
             id: conn,
@@ -1865,7 +1870,10 @@ fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<A
                 }
             }
             Err(err)
-                if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut => {}
+                if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut =>
+            {
+                thread::sleep(Duration::from_millis(2));
+            }
             Err(err) => {
                 // Молчаливый выход читающего потока — это потеря клиента без
                 // единой строки в логе; печатаем причину всегда.
