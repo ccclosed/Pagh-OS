@@ -17,7 +17,9 @@
 //! - [`format`] — русские склонения, размеры, даты;
 //! - [`menu_model`] — контекстное меню Dolphin-стиля с подменю «Создать»;
 //! - [`app`] — состояние и отрисовка окна, обработка событий, [`Command`];
-//! - [`screenshots`] — детерминированные демо-сцены для PNG и golden-тестов.
+//! - [`screenshots`] — детерминированные демо-сцены для PNG и golden-тестов;
+//! - [`icons`] — готовые иконки Fluent (MIT) для записей и сайдбара, с
+//!   собственным PNG-декодером ([`png`] + [`deflate`]) без внешних зависимостей.
 //!
 //! ## Запуск
 //!
@@ -32,10 +34,13 @@
 //! ```
 
 pub mod app;
+pub mod deflate;
 pub mod fake;
 pub mod format;
 pub mod host_vfs;
+pub mod icons;
 pub mod menu_model;
+pub mod png;
 pub mod screenshots;
 pub mod vfs;
 
