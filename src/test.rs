@@ -9553,6 +9553,206 @@ mod desktop_b_tests {
             "scm-err: routine returned every PMM frame"
         );
     }
+
+    /// `shutdown(2)` (nr 48) на AF_UNIX: полузакрытие, EOF/EPIPE у обеих
+    /// сторон, идемпотентность, `dup` и отказы в порядке Linux.
+    ///
+    /// Пробуждение уже ЗАБЛОКИРОВАННОГО читателя здесь не проверяется: в этом
+    /// ядре блокирующий вызов крутит `yield_current()`, а boot-selftest идёт в
+    /// одном потоке, которому некому сделать `shutdown` во время ожидания.
+    /// Сама политика пробуждения (что значит флаг для read/write/poll) закреплена
+    /// host-свойством `p59`.
+    pub fn shutdown_half_close() {
+        let frames_before = pmm::free_frames();
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            assert_eq_kernel!(
+                io_sys::sys_socketpair(1, 1, 0, SCRATCH_VA + 0x40),
+                Ok(0),
+                "shutdown: socketpair"
+            );
+            let a = get_u32(0x40) as u64;
+            let b = get_u32(0x44) as u64;
+
+            // ── SHUT_WR: пир-читатель видит EOF, своя запись — EPIPE ──
+            put(0x100, b"hi");
+            assert_eq_kernel!(
+                io_sys::sys_write(a, SCRATCH_VA + 0x100, 2),
+                Ok(2),
+                "shutdown: write a->b"
+            );
+            put(0x140, &[0u8; 8]);
+            assert_eq_kernel!(
+                io_sys::sys_read(b, SCRATCH_VA + 0x140, 2),
+                Ok(2),
+                "shutdown: read b"
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(a, 1 /*SHUT_WR*/),
+                Ok(0),
+                "shutdown(SHUT_WR)"
+            );
+            // EOF пира наступает, хотя пишущий fd ещё открыт.
+            put(0x140, &[0u8; 8]);
+            assert_eq_kernel!(
+                io_sys::sys_read(b, SCRATCH_VA + 0x140, 8),
+                Ok(0),
+                "shutdown: peer sees EOF after SHUT_WR"
+            );
+            // Собственная запись закрыта...
+            put(0x100, b"x");
+            assert_eq_kernel!(
+                io_sys::sys_write(a, SCRATCH_VA + 0x100, 1),
+                Err(Errno::EPIPE),
+                "shutdown: write after own SHUT_WR is EPIPE"
+            );
+            // ...но приём своей стороны цел: пир пишет, мы читаем.
+            put(0x100, b"z");
+            assert_eq_kernel!(
+                io_sys::sys_write(b, SCRATCH_VA + 0x100, 1),
+                Ok(1),
+                "shutdown: b still writes after a's SHUT_WR"
+            );
+            put(0x140, &[0u8; 8]);
+            assert_eq_kernel!(
+                io_sys::sys_read(a, SCRATCH_VA + 0x140, 1),
+                Ok(1),
+                "shutdown: a still reads after its own SHUT_WR"
+            );
+
+            // ── SHUT_RD: свой приём = 0, пир при записи = EPIPE ──
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(a, 0 /*SHUT_RD*/),
+                Ok(0),
+                "shutdown(SHUT_RD)"
+            );
+            put(0x140, &[0u8; 8]);
+            assert_eq_kernel!(
+                io_sys::sys_read(a, SCRATCH_VA + 0x140, 8),
+                Ok(0),
+                "shutdown: own read after SHUT_RD is 0"
+            );
+            put(0x100, b"q");
+            assert_eq_kernel!(
+                io_sys::sys_write(b, SCRATCH_VA + 0x100, 1),
+                Err(Errno::EPIPE),
+                "shutdown: peer write after our SHUT_RD is EPIPE"
+            );
+            // ── идемпотентность SHUT_RDWR ──
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(a, 2 /*SHUT_RDWR*/),
+                Ok(0),
+                "shutdown(SHUT_RDWR)"
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(a, 2),
+                Ok(0),
+                "shutdown is idempotent"
+            );
+            assert_eq_kernel!(io_sys::sys_close(a), Ok(0), "shutdown: close a");
+            assert_eq_kernel!(io_sys::sys_close(b), Ok(0), "shutdown: close b");
+
+            // ── dup видит тот же сокет: shutdown действует на сокет, не на fd ──
+            assert_eq_kernel!(
+                io_sys::sys_socketpair(1, 1, 0, SCRATCH_VA + 0x40),
+                Ok(0),
+                "shutdown: socketpair 2"
+            );
+            let c = get_u32(0x40) as u64;
+            let d = get_u32(0x44) as u64;
+            let c2 = match io_sys::sys_dup(c) {
+                Ok(f) => f,
+                Err(_) => u64::MAX,
+            };
+            assert_kernel!(c2 != u64::MAX, "shutdown: dup");
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(c2, 1 /*SHUT_WR*/),
+                Ok(0),
+                "shutdown on the dup"
+            );
+            put(0x140, &[0u8; 8]);
+            assert_eq_kernel!(
+                io_sys::sys_read(d, SCRATCH_VA + 0x140, 8),
+                Ok(0),
+                "shutdown: dup closes the same direction for the original"
+            );
+            assert_eq_kernel!(io_sys::sys_close(c), Ok(0), "shutdown: close c");
+            assert_eq_kernel!(io_sys::sys_close(c2), Ok(0), "shutdown: close c2");
+            assert_eq_kernel!(io_sys::sys_close(d), Ok(0), "shutdown: close d");
+
+            // ── отказы: EBADF, ENOTSOCK (раньше EINVAL), EINVAL, ENOTCONN ──
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(4242, 0),
+                Err(Errno::EBADF),
+                "shutdown: bad fd is EBADF"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_pipe2(SCRATCH_VA + 0x40, 0),
+                Ok(0),
+                "shutdown: pipe2"
+            );
+            let rfd = get_u32(0x40) as u64;
+            let wfd = get_u32(0x44) as u64;
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(rfd, 0),
+                Err(Errno::ENOTSOCK),
+                "shutdown: pipe is ENOTSOCK"
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(rfd, 99),
+                Err(Errno::ENOTSOCK),
+                "shutdown: pipe with garbage how is still ENOTSOCK"
+            );
+            assert_eq_kernel!(io_sys::sys_close(rfd), Ok(0), "shutdown: close pipe r");
+            assert_eq_kernel!(io_sys::sys_close(wfd), Ok(0), "shutdown: close pipe w");
+
+            // AF_UNIX без соединения: Linux успешно игнорирует, но `how` всё
+            // равно проверяет.
+            let ufd = match unix_sock::sys_socket(1, 1, 0) {
+                Ok(f) => f,
+                Err(_) => u64::MAX,
+            };
+            assert_kernel!(ufd != u64::MAX, "shutdown: unconnected AF_UNIX socket");
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(ufd, 2),
+                Ok(0),
+                "shutdown: unconnected AF_UNIX is a successful no-op"
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(ufd, 99),
+                Err(Errno::EINVAL),
+                "shutdown: bad how on a socket is EINVAL"
+            );
+            assert_eq_kernel!(io_sys::sys_close(ufd), Ok(0), "shutdown: close u");
+
+            // TCP до connect: ENOTCONN, а мусорный how — EINVAL (порядок Linux).
+            let tfd = match crate::arch::x86_64::linux::inet_sock::sys_socket_in(2, 1) {
+                Ok(f) => f,
+                Err(_) => u64::MAX,
+            };
+            if tfd != u64::MAX {
+                assert_eq_kernel!(
+                    unix_sock::sys_shutdown(tfd, 1),
+                    Err(Errno::ENOTCONN),
+                    "shutdown: unconnected TCP is ENOTCONN"
+                );
+                assert_eq_kernel!(
+                    unix_sock::sys_shutdown(tfd, 99),
+                    Err(Errno::EINVAL),
+                    "shutdown: EINVAL precedes ENOTCONN"
+                );
+                assert_eq_kernel!(io_sys::sys_close(tfd), Ok(0), "shutdown: close t");
+            }
+        })
+        .is_some();
+        restore_synth(me, saved);
+        assert_kernel!(ran, "shutdown: half-close test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "shutdown: routine returned every PMM frame"
+        );
+    }
 }
 
 pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
@@ -9953,6 +10153,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "desktop-b::SCM_RIGHTS truncation, errors, plain-stream regression",
             desktop_b_tests::scm_rights_truncation_and_errors
+        ),
+        (
+            "desktop-b::shutdown(2) half-close EOF/EPIPE + errno order",
+            desktop_b_tests::shutdown_half_close
         ),
     ]
 }

@@ -603,6 +603,23 @@ pub fn tcp_rx_at_eof(handle: SocketHandle) -> bool {
     s.tcp.get(handle).map(|k| k.eof_visible()).unwrap_or(true)
 }
 
+/// Половинное закрытие TX для `shutdown(SHUT_WR)` (nr 48): FIN заказывается и
+/// стек получает несколько poll'ов, чтобы его отправить, но СЛОТ ОСТАЁТСЯ —
+/// соединение продолжает принимать данные и живёт до `close`.
+///
+/// Отличие от [`tcp_close`] только в `remove`: там слот снимается сразу после
+/// close-рукопожатия, здесь сокет доигрывает FIN-WAIT сам.
+pub fn tcp_shutdown_wr(handle: SocketHandle) {
+    let mut g = NET.lock();
+    let Some(s) = g.as_mut() else { return };
+    if let Some(k) = s.tcp.get_mut(handle) {
+        k.close();
+    }
+    for _ in 0..4 {
+        s.step();
+    }
+}
+
 /// Полузакрыть наш TX, дать close-рукопожатию несколько poll'ов и вернуть слот
 /// сокета.
 pub fn tcp_close(handle: SocketHandle) {

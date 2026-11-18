@@ -22,6 +22,7 @@ pub mod kill;
 pub mod mem;
 pub mod misc;
 pub mod rand_clock;
+pub mod sock_shutdown;
 pub mod sock_wait;
 pub mod stat;
 pub mod timeconv;
@@ -453,6 +454,10 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         // ── AF_UNIX SCM_RIGHTS: fd passing для userspace-композитора ──
         sysno::SENDMSG => unix_sock::sys_sendmsg(a[0], a[1], a[2]),
         sysno::RECVMSG => unix_sock::sys_recvmsg(a[0], a[1], a[2]),
+        // ── shutdown: половинное закрытие направления (48) ──
+        // AF_UNIX ставит флаги на очередях направлений, AF_INET TCP заказывает
+        // FIN; и то и другое будит заблокированного читателя/писателя.
+        sysno::SHUTDOWN => unix_sock::sys_shutdown(a[0], a[1]),
         sysno::ACCEPT => unix_sock::sys_accept(a[0], a[1], a[2]),
         sysno::BIND => unix_sock::sys_bind(a[0], a[1], a[2]),
         sysno::LISTEN => unix_sock::sys_listen(a[0], a[1]),

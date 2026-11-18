@@ -77,10 +77,17 @@ pub mod rand_clock;
 
 // Блокирующее чтение сокета: чистое решение «продолжать ждать / EOF / EBADF»,
 // которое ядро принимает на каждой уступке CPU (`src/arch/x86_64/linux/
-// sock_wait.rs`). `core`-only, поэтому host-свойство `p58` исполняет ровно тот
+// sock_wait.rs`). `core`-only, поэтому host-свойство `p59` исполняет ровно тот
 // исходник, который компилирует ядро.
 #[path = "../../src/arch/x86_64/linux/sock_wait.rs"]
 pub mod sock_wait;
+
+// `shutdown(2)` (nr 48): чистая политика полузакрытия — порядок отказов
+// (`EBADF`/`ENOTSOCK`/`EINVAL`/`ENOTCONN`) и что значит каждый флаг
+// направления для read/write/poll. `core`-only, поэтому host-свойство `p59`
+// исполняет ровно тот исходник, который компилирует ядро.
+#[path = "../../src/arch/x86_64/linux/sock_shutdown.rs"]
+pub mod sock_shutdown;
 
 // `stack` is `core` + `alloc` only (uses `alloc::vec::Vec`). The host crate links
 // `std`, which provides the `alloc` crate via the `extern crate alloc;` below, so
@@ -699,6 +706,11 @@ mod properties {
     // must keep waiting. Pins the watchdog `nr=45 arg0=0x3 closed` regression.
     // `p58` is taken by the phase-1 groups identity property, so this is `p59`.
     mod p59;
+
+    // `shutdown(2)` half-close policy (task-81): errno order and the
+    // per-direction read/write/poll answers. Pinned against a live-kernel probe.
+    // `p59` is the blocking-read wakeup property, so this is `p60`.
+    mod p60;
 
     // NVMe PRP lists + queue-depth arithmetic (PRP1/PRP2/list page, LBA chunk
     // planning, polled CQ phase tags, CAP.MQES clamping). The driver itself is
