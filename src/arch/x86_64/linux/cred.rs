@@ -289,6 +289,30 @@ impl Creds {
         self.is_root() || self.euid == dir_owner.0 || self.euid == child_owner.0
     }
 
+    /// Может ли процесс занять привилегированный порт `< 1024`?
+    ///
+    /// Linux требует `CAP_NET_BIND_SERVICE`; pagh сводит набор capabilities к
+    /// `euid == 0`, как и остальные проверки. Порты `>= 1024` свободны для всех,
+    /// порт `0` (эфемерный) — тоже: ядро само выберет непривилегированный.
+    ///
+    /// Это чистая policy-функция: `bind(2)`/`listen(2)` в `inet_sock.rs` зовут её
+    /// до любой работы со стеком, а host-свойство проверяет границу.
+    #[inline]
+    pub fn may_bind_port(&self, port: u16) -> bool {
+        port == 0 || port >= 1024 || self.is_root()
+    }
+
+    /// Может ли процесс создать `SOCK_RAW`-сокет?
+    ///
+    /// Linux требует `CAP_NET_RAW`; pagh сводит набор capabilities к
+    /// `euid == 0`, как и в [`Creds::may_bind_port`]. Это только гейт допуска:
+    /// сам пакетный уровень в ядре не реализован, поэтому root получает
+    /// `EOPNOTSUPP`, а не сокет (см. `inet_sock.rs`).
+    #[inline]
+    pub fn may_use_raw_socket(&self) -> bool {
+        self.is_root()
+    }
+
     /// Может ли процесс с такими креденшелами сменить режим узла, принадлежащего
     /// `owner`? Linux: root или владелец файла (`CAP_FOWNER` сведён к
     /// `euid == 0`).
