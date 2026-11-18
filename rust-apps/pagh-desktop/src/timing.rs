@@ -21,7 +21,7 @@
 //! доли процента бюджета кадра. Попиксельный `Canvas::put`/`blend` намеренно не
 //! инструментирован: там счётчик стоил бы дороже полезной работы.
 
-use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -43,33 +43,32 @@ pub const STAGE_COUNT: usize = 5;
 
 static CYCLES_PER_NS: OnceLock<f64> = OnceLock::new();
 
-// Счётчики — ПЕР-ПОТОЧНЫЕ, а не глобальные статики. Причина не только в гонках:
-// параллельные тесты в одном процессе рисуют холсты из разных потоков, и общий
-// `AtomicU64` сложил бы их blend-такты в кадр бенчмарка. Счётчик принадлежит
-// потоку, который рисует кадр; `take_frame` читает именно его.
-thread_local! {
-    static STAGE_CYCLES: Cell<[u64; STAGE_COUNT]> = const { Cell::new([0; STAGE_COUNT]) };
-    /// [непрозрачные, с альфа-смешиванием] пиксели текущего кадра.
-    static PIXELS: Cell<[u64; 2]> = const { Cell::new([0; 2]) };
-}
+// Счётчики — глобальные атомарные, НЕ `thread_local!`.
+//
+// Почему не TLS: пер-поточный вариант (два `Cell<[u64; N]>`) добавляет 56 байт
+// в `.tbss`, и гостевая сборка (static-pie musl под Pagh) после этого
+// детерминированно падает в `__libc_free` на выходе клиента (`[EXC #14]`
+// addr=0x100000035 RIP=0x60545, то есть free() богусного указателя). С
+// TLS-объёмом как у baseline (0x80) всё чисто; это баг ядра/ABI, а не рендера,
+// и он вне скоупа frame time — здесь просто не растим `.tbss`.
+//
+// Цена: счётчики общие на процесс. Горячий путь однопоточный (сервер рисует в
+// одном потоке, bench — тоже), поэтому в бою это точно; параллельные тесты
+// одного процесса делят счётчики, и тест бенчмарка не сравнивает стадии между
+// собой (см. комментарий в `bench::tests`).
+static STAGE_CYCLES: [AtomicU64; STAGE_COUNT] = [const { AtomicU64::new(0) }; STAGE_COUNT];
+/// [непрозрачные, с альфа-смешиванием] пиксели текущего кадра.
+static PIXELS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 #[inline]
 fn bump_stage(slot: usize, cycles: u64) {
-    STAGE_CYCLES.with(|cells| {
-        let mut values = cells.get();
-        values[slot] = values[slot].saturating_add(cycles);
-        cells.set(values);
-    });
+    STAGE_CYCLES[slot].fetch_add(cycles, Ordering::Relaxed);
 }
 
 #[inline]
 fn bump_pixels(opaque: u64, blended: u64) {
-    PIXELS.with(|cells| {
-        let mut values = cells.get();
-        values[0] = values[0].saturating_add(opaque);
-        values[1] = values[1].saturating_add(blended);
-        cells.set(values);
-    });
+    PIXELS[0].fetch_add(opaque, Ordering::Relaxed);
+    PIXELS[1].fetch_add(blended, Ordering::Relaxed);
 }
 
 /// Счётчик тактов. На x86_64 — `rdtsc` (инвариантный TSC), иначе монотонное
@@ -237,8 +236,17 @@ impl FrameStages {
 
 /// Прочитать и обнулить счётчики стадий (граница кадра).
 pub fn take_frame() -> FrameStages {
-    let stages = STAGE_CYCLES.with(|cells| cells.replace([0; STAGE_COUNT]));
-    let pixels = PIXELS.with(|cells| cells.replace([0; 2]));
+    let stages = [
+        STAGE_CYCLES[0].swap(0, Ordering::Relaxed),
+        STAGE_CYCLES[1].swap(0, Ordering::Relaxed),
+        STAGE_CYCLES[2].swap(0, Ordering::Relaxed),
+        STAGE_CYCLES[3].swap(0, Ordering::Relaxed),
+        STAGE_CYCLES[4].swap(0, Ordering::Relaxed),
+    ];
+    let pixels = [
+        PIXELS[0].swap(0, Ordering::Relaxed),
+        PIXELS[1].swap(0, Ordering::Relaxed),
+    ];
     FrameStages {
         render: stages[Stage::Render as usize],
         blend: stages[Stage::Blend as usize],
@@ -252,8 +260,12 @@ pub fn take_frame() -> FrameStages {
 
 /// Обнулить счётчики, не читая их.
 pub fn reset_frame() {
-    STAGE_CYCLES.with(|cells| cells.set([0; STAGE_COUNT]));
-    PIXELS.with(|cells| cells.set([0; 2]));
+    for counter in &STAGE_CYCLES {
+        counter.store(0, Ordering::Relaxed);
+    }
+    for counter in &PIXELS {
+        counter.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Агрегация выборки (миллисекунды): avg / p50 / p95 / max.
