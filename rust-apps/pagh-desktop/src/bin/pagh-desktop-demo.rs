@@ -7,7 +7,7 @@
 //! pagh-desktop-demo --scenario --out screenshots
 //! ```
 
-use pagh_desktop::client::Client;
+use pagh_desktop::client::{is_disconnect, Client};
 use pagh_desktop::demo::{self, DemoState};
 use pagh_desktop::protocol::{InputEvent, Message};
 use pagh_desktop::surface::{PixelFormat, Surface};
@@ -116,6 +116,19 @@ fn run() -> io::Result<()> {
 }
 
 fn run_client(socket: &PathBuf, app: DemoApp) -> io::Result<()> {
+    // Сервер штатно завершился (`--exit-after-ms`, финал прогона): клиент
+    // получает EOF/EPIPE. Это конец сеанса, а не ошибка — выходим с кодом 0.
+    match client_session(socket, app) {
+        Ok(()) => Ok(()),
+        Err(err) if is_disconnect(&err) => {
+            println!("pagh-desktop-demo: сервер закрыл соединение, завершаемся");
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn client_session(socket: &PathBuf, app: DemoApp) -> io::Result<()> {
     let mut client = Client::connect_retry(socket, 200)?;
     let welcome = client.hello("pagh-desktop-demo")?;
     let window_id = ((welcome.client_id as u32).wrapping_mul(100).wrapping_add(1)).max(1);

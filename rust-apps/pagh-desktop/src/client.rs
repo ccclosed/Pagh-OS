@@ -232,6 +232,8 @@ impl Client {
                         return Ok(Some(message));
                     }
                 }
+                // Сигнал прервал чтение: сокет жив, повторяем попытку.
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err)
                     if err.kind() == io::ErrorKind::WouldBlock
                         || err.kind() == io::ErrorKind::TimedOut =>
@@ -267,6 +269,19 @@ impl Client {
     }
 }
 
+/// Сервер ушёл (EOF) или соединение оборвано — это штатное завершение сеанса,
+/// а не ошибка клиента. Клиент должен выйти с кодом 0, ничего не паникуя.
+pub fn is_disconnect(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+    )
+}
+
 fn protocol_error(err: protocol::ProtocolError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err.to_string())
 }
@@ -284,5 +299,20 @@ mod tests {
                 io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
             )),
         }
+    }
+
+    #[test]
+    fn disconnect_kinds_are_not_errors() {
+        for kind in [
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+        ] {
+            assert!(is_disconnect(&io::Error::from(kind)), "{kind:?}");
+        }
+        // Таймаут — не разрыв: сеанс продолжается.
+        assert!(!is_disconnect(&io::Error::from(io::ErrorKind::TimedOut)));
+        assert!(!is_disconnect(&io::Error::from(io::ErrorKind::NotFound)));
     }
 }
