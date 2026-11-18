@@ -111,6 +111,30 @@ pub enum DragState {
     },
 }
 
+/// Протяжка ЛКМ по пустому рабочему столу: от точки нажатия до текущей.
+///
+/// Рамка выделения живёт отдельно от `DragState`: тот двигает окна, а это —
+/// desktop-выделение (rubber-band). Пока кнопка зажата, `Compositor` рисует
+/// полупрозрачный прямоугольник; отпускание фиксирует его как `selection`
+/// (основа для выбора desktop-иконок, когда они появятся).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SelectionDrag {
+    anchor: Point,
+    current: Point,
+}
+
+impl SelectionDrag {
+    fn rect(self) -> Rect {
+        Rect::from_points(self.anchor, self.current)
+    }
+}
+
+/// Минимальная сторона рамки, которая считается выделением, а не кликом.
+const MIN_SELECTION_SPAN: i32 = 4;
+/// Прозрачность заливки и контура выделения (в стиле акцента темы).
+const SELECTION_FILL_OPACITY: u8 = 44;
+const SELECTION_BORDER_OPACITY: u8 = 214;
+
 /// Вид всплывающей панели.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlyoutKind {
@@ -254,6 +278,10 @@ pub struct Compositor {
     pointer: Point,
     buttons: u32,
     drag: Option<DragState>,
+    /// Живая протяжка ЛКМ по пустому рабочему столу.
+    selection_drag: Option<SelectionDrag>,
+    /// Зафиксированное выделение (рамка остаётся видимой до следующего клика).
+    selection: Option<Rect>,
     context_menu: Option<ContextMenu>,
     flyout: Option<Flyout>,
     pressed_window: Option<u32>,
@@ -287,6 +315,8 @@ impl Compositor {
             pointer: Point::new((width / 2) as i32, (height / 2) as i32),
             buttons: 0,
             drag: None,
+            selection_drag: None,
+            selection: None,
             context_menu: None,
             flyout: None,
             pressed_window: None,
@@ -350,6 +380,28 @@ impl Compositor {
 
     pub fn pointer(&self) -> Point {
         self.pointer
+    }
+
+    /// Текущая рамка выделения: живая протяжка или зафиксированная.
+    /// `None` — на рабочем столе ничего не выделено.
+    pub fn selection_rect(&self) -> Option<Rect> {
+        self.selection_drag
+            .map(SelectionDrag::rect)
+            .or(self.selection)
+            .filter(|rect| !rect.is_empty())
+    }
+
+    /// Идёт ли прямо сейчас протяжка ЛКМ по пустому рабочему столу.
+    pub fn selection_drag_active(&self) -> bool {
+        self.selection_drag.is_some()
+    }
+
+    /// Попадает ли прямоугольник desktop-элемента в текущее выделение —
+    /// основа для выбора иконок рабочего стола (самих иконок пока нет).
+    pub fn selection_covers(&self, rect: Rect) -> bool {
+        self.selection_rect()
+            .map(|selection| selection.intersects(rect))
+            .unwrap_or(false)
     }
 
     pub fn context_menu(&self) -> Option<&ContextMenu> {
@@ -1047,6 +1099,57 @@ impl Compositor {
         self.damage.add(Rect::new(point.x - 1, point.y - 1, 16, 23));
     }
 
+    /// Повреждение под рамкой выделения: контур рисуется по границе, поэтому
+    /// расширяем на 2 px, чтобы старый контур не оставлял следов.
+    fn damage_selection(&mut self, rect: Rect) {
+        if !rect.is_empty() {
+            self.damage.add(rect.inflate(2));
+        }
+    }
+
+    /// Снять зафиксированное выделение и/или отменить протяжку.
+    fn clear_selection(&mut self) {
+        self.selection_drag = None;
+        if let Some(rect) = self.selection.take() {
+            self.damage_selection(rect);
+        }
+    }
+
+    /// ЛКМ на пустом рабочем столе: начать новую rubber-band протяжку.
+    fn begin_selection(&mut self, point: Point) {
+        self.clear_selection();
+        self.selection_drag = Some(SelectionDrag {
+            anchor: point,
+            current: point,
+        });
+    }
+
+    /// Движение при зажатой ЛКМ: обновить рамку и повредить старую/новую.
+    fn update_selection(&mut self, point: Point) {
+        let Some(drag) = self.selection_drag.as_mut() else {
+            return;
+        };
+        let old = drag.rect();
+        drag.current = point;
+        let new = drag.rect();
+        if new != old {
+            self.damage_selection(old);
+            self.damage_selection(new);
+        }
+    }
+
+    /// Отпускание ЛКМ: зафиксировать выделение, клик без протяжки — снять.
+    fn finish_selection(&mut self, point: Point) {
+        let Some(mut drag) = self.selection_drag.take() else {
+            return;
+        };
+        drag.current = point;
+        let rect = drag.rect();
+        self.damage_selection(rect);
+        self.selection =
+            (rect.w >= MIN_SELECTION_SPAN && rect.h >= MIN_SELECTION_SPAN).then_some(rect);
+    }
+
     fn panel_hit(&self, point: Point) -> Option<PanelHit> {
         let hit = self.panel.hit_static(self.screen, point)?;
         if matches!(hit, PanelHit::Background) {
@@ -1127,6 +1230,12 @@ impl Compositor {
             self.damage_button(new_hover.button);
         }
 
+        // Протяжка выделения по рабочему столу не двигает окна и не уходит
+        // клиенту: рамка живёт только в композиторе.
+        if self.selection_drag.is_some() {
+            self.update_selection(point);
+        }
+
         if let Some(menu) = self.context_menu.as_mut() {
             menu.hover = menu.item_at(point);
         }
@@ -1182,6 +1291,7 @@ impl Compositor {
 
         // Ввод клиенту: захваченное окно при нажатой кнопке, иначе окно под указателем.
         let target = if self.drag.is_some()
+            || self.selection_drag.is_some()
             || self.context_menu.is_some()
             || self.flyout.is_some()
             || panel::panel_rect(self.screen).contains(point)
@@ -1290,6 +1400,9 @@ impl Compositor {
             }
             self.buttons |= bit;
             self.damage_cursor(point);
+            // Любое новое нажатие снимает прежнее выделение; протяжка ниже
+            // может сразу начать новое.
+            self.clear_selection();
 
             if self.context_menu.is_some() {
                 let action = self
@@ -1364,6 +1477,10 @@ impl Compositor {
             }
             if button == MouseButton::Right {
                 self.open_desktop_menu(point);
+            } else if button == MouseButton::Left {
+                // Пустой рабочий стол: ЛКМ начинает rubber-band выделение
+                // (previously a no-op). Клик без движения снимается на release.
+                self.begin_selection(point);
             }
             Vec::new()
         } else {
@@ -1372,6 +1489,9 @@ impl Compositor {
             }
             self.buttons &= !bit;
             self.damage_cursor(point);
+            if button == MouseButton::Left {
+                self.finish_selection(point);
+            }
             let mut events = Vec::new();
             if let Some(drag) = self.drag {
                 match drag {
@@ -1432,7 +1552,12 @@ impl Compositor {
                 self.close_flyout();
                 return Vec::new();
             }
+            if code == key::ESC && self.selection_rect().is_some() {
+                // Esc снимает выделение рабочего стола (как в файловом менеджере).
+                self.clear_selection();
+            }
             if code == key::F10 {
+                self.clear_selection();
                 self.open_desktop_menu(self.pointer);
                 return Vec::new();
             }
@@ -1505,6 +1630,9 @@ impl Compositor {
         let panel_hover = self.panel_hover_at(self.pointer);
         let hover_button = self.window_button_at(self.pointer);
         self.paint_wallpaper_cached(canvas);
+        // Выделение живёт на рабочем столе: под окнами и панелью, над обоями.
+        // Отдельный проход — render-путь окон/панели не меняется.
+        self.paint_selection(canvas);
         let windows = std::mem::take(&mut self.windows);
         for window in &windows {
             if window.minimized {
@@ -1825,6 +1953,16 @@ impl Compositor {
                 Point::new(0, self.screen.bottom() - PANEL_HEIGHT),
             );
         }
+    }
+
+    fn paint_selection(&self, canvas: &mut Canvas) {
+        let Some(rect) = self.selection_rect() else {
+            return;
+        };
+        // Полупрозрачная заливка + контур акцентом темы: рамка читается и на
+        // светлом, и на тёмном участке обоев.
+        canvas.fill_rect_alpha(rect, self.theme.accent, SELECTION_FILL_OPACITY);
+        canvas.stroke_rounded_rect(rect, 0, self.theme.accent, SELECTION_BORDER_OPACITY);
     }
 
     fn paint_cursor(&self, canvas: &mut Canvas) {
@@ -2248,6 +2386,129 @@ mod tests {
         assert!(
             compositor.context_menu().is_some(),
             "ПКМ по пустому месту открывает меню рабочего стола"
+        );
+    }
+
+    /// ЛКМ с протяжкой по пустому рабочему столу — rubber-band выделение:
+    /// рамка появляется за указателем, на клиента ничего не уходит, отпускание
+    /// фиксирует прямоугольник (основа для выбора desktop-иконок).
+    #[test]
+    fn left_drag_on_empty_desktop_creates_and_commits_selection() {
+        let mut compositor = compositor();
+        let start = Point::new(1200, 640);
+        compositor.pointer_motion(start);
+        let events = compositor.pointer_button(MouseButton::Left, true);
+        assert!(events.is_empty(), "выделение не должно уходить клиенту");
+        assert!(compositor.selection_drag_active());
+        assert_eq!(
+            compositor.selection_rect(),
+            None,
+            "в точке нажатия рамки ещё нет"
+        );
+
+        let end = Point::new(1050, 540);
+        let events = compositor.pointer_motion(end);
+        assert!(
+            events.is_empty(),
+            "протяжка по обоям не шлёт motion клиенту"
+        );
+        let expected = Rect::from_points(start, end);
+        assert_eq!(compositor.selection_rect(), Some(expected));
+
+        compositor.pointer_button(MouseButton::Left, false);
+        assert!(!compositor.selection_drag_active());
+        assert_eq!(
+            compositor.selection_rect(),
+            Some(expected),
+            "отпускание фиксирует рамку"
+        );
+        assert!(compositor.selection_covers(Rect::new(1080, 560, 20, 20)));
+        assert!(!compositor.selection_covers(Rect::new(10, 10, 10, 10)));
+    }
+
+    /// ЛКМ без протяжки (клик по обоям) рамку не оставляет, а Esc снимает
+    /// зафиксированное выделение.
+    #[test]
+    fn click_or_escape_clears_desktop_selection() {
+        let mut compositor = compositor();
+        compositor.pointer_motion(Point::new(1200, 640));
+        compositor.pointer_button(MouseButton::Left, true);
+        compositor.pointer_motion(Point::new(1060, 560));
+        compositor.pointer_button(MouseButton::Left, false);
+        assert!(compositor.selection_rect().is_some());
+
+        compositor.pointer_motion(Point::new(1240, 660));
+        compositor.pointer_button(MouseButton::Left, true);
+        assert_eq!(
+            compositor.selection_rect(),
+            None,
+            "новое нажатие снимает старое выделение"
+        );
+        compositor.pointer_button(MouseButton::Left, false);
+        assert_eq!(
+            compositor.selection_rect(),
+            None,
+            "клик без drag ничего не оставляет"
+        );
+
+        // Протяжка, затем Esc: рамка исчезает.
+        compositor.pointer_motion(Point::new(1200, 640));
+        compositor.pointer_button(MouseButton::Left, true);
+        compositor.pointer_motion(Point::new(1060, 560));
+        compositor.pointer_button(MouseButton::Left, false);
+        assert!(compositor.selection_rect().is_some());
+        compositor.key_event(crate::protocol::key::ESC, true, 0);
+        assert_eq!(compositor.selection_rect(), None);
+    }
+
+    /// ЛКМ по окну идёт клиенту (press-routing не сломан) и не начинает
+    /// desktop-выделение.
+    #[test]
+    fn left_press_on_window_does_not_start_selection() {
+        let mut compositor = compositor();
+        let point = compositor.window(2).unwrap().content_rect().center();
+        compositor.pointer_motion(point);
+        let events = compositor.pointer_button(MouseButton::Left, true);
+        assert!(!compositor.selection_drag_active());
+        assert_eq!(compositor.selection_rect(), None);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HostEvent::Send {
+                message: Message::Input {
+                    event: crate::protocol::InputEvent::Button { pressed: true, .. },
+                    ..
+                },
+                ..
+            }
+        )));
+        compositor.pointer_button(MouseButton::Left, false);
+    }
+
+    /// Рамка выделения действительно попадает в кадр: заливка внутри
+    /// прямоугольника отличается от обоев до протяжки.
+    #[test]
+    fn selection_overlay_is_painted_on_the_desktop() {
+        let mut compositor = compositor();
+        compositor.render_full();
+        let probe = Point::new(1100, 600);
+        let wallpaper = compositor.frame().get(probe.x, probe.y);
+
+        compositor.pointer_motion(Point::new(1200, 640));
+        compositor.pointer_button(MouseButton::Left, true);
+        compositor.pointer_motion(Point::new(1020, 540));
+        compositor.render_full();
+        let painted = compositor.frame().get(probe.x, probe.y);
+        assert_ne!(
+            painted, wallpaper,
+            "заливка выделения должна попасть в кадр"
+        );
+
+        compositor.pointer_button(MouseButton::Left, false);
+        compositor.render_full();
+        let committed = compositor.frame().get(probe.x, probe.y);
+        assert_ne!(
+            committed, wallpaper,
+            "зафиксированная рамка остаётся видимой"
         );
     }
 

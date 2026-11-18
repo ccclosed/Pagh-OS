@@ -69,8 +69,13 @@ Wayland в Pagh-OS пока отсутствует (нет `wl_display`, xdg-she
   серверного resize/maximize клиент получает `configure` и присылает кадр нового
   размера; до этого старый кадр масштабируется nearest-neighbour.
 * Minimize скрывает окно; чип с первой буквой заголовка на панели возвращает его.
-* Alt+Tab циклически переключает фокус, Esc закрывает меню/flyout, F10 открывает
-  контекстное меню, Ctrl+Alt+T запускает Terminal, Super — лаунчер.
+* Alt+Tab циклически переключает фокус, Esc закрывает меню/flyout и снимает выделение,
+  F10 открывает контекстное меню, Ctrl+Alt+T запускает Terminal, Super — лаунчер.
+* ЛКМ по пустому рабочему столу с протяжкой — rubber-band выделение: полупрозрачная
+  рамка акцентом темы следует за указателем (damage-tracked, отдельный проход поверх обоев
+  под окнами), отпускание фиксирует прямоугольник (`selection_rect`/`selection_covers`),
+  клик без протяжки или Esc снимают его. ЛКМ по окну по-прежнему уходит клиенту как
+  `input`/button, ПКМ открывает меню, панель забирает свои клики.
 
 ## Панель и оболочка
 
@@ -141,6 +146,9 @@ headless-демо), либо синтетическими событиями bac
 wlroots/seat-подходу в упрощённом виде:
 
 * absolute/relative motion → hit-test сверху вниз (меню → flyout → панель → окна);
+* ЛКМ press по пустому рабочему столу начинает rubber-band: motion обновляет
+  damage-трекнутую рамку, release фиксирует её (клику ничего не отправляется); клик
+  без протяжки и Esc снимают выделение;
 * захват кнопки: press в клиентской области фиксирует окно, release уходит ему же;
 * drag/resize — серверные grabs: motion двигает рамку, release отправляет `configure`;
 * клавиатура — сфокусированному окну; серверные shortcuts обрабатываются до клиента;
@@ -177,8 +185,10 @@ value }` (24 байта) → EV_KEY/EV_REL/EV_SYN → те же `Compositor::poi
 * QEMU e2e `python3 tools/e2e.py desktop`: готовит pagh-ext2 диск (первая загрузка
   kernel-format + инъекция статических бинарников через debugfs), запускает
   `rust /mnt/pd --e2e`, проверяет serial/скриншоты: fbdev ioctl+mmap, takeover,
-  selfcheck пикселей scanout, F10-меню, REL/BTN_LEFT через QMP, выход и отсутствие
-  перерисовки консоли. Затем тот же сценарий запускает
+  selfcheck пикселей scanout, F10-меню, REL/BTN_LEFT через QMP, rubber-band
+  выделение (press+drag по пустым обоям → `selection drag start`/`selection
+  committed`, кадр `e2e_desktop_selection.png` отличается от desktop), выход и
+  отсутствие перерисовки консоли. Затем тот же сценарий запускает
   `rust /mnt/pd --spawn-demo` и проверяет дочерний запуск: serial-маркер
   `pagh-desktop: launch terminal ok`, `pagh-desktop-demo: window ... подключён`,
   отсутствие `Function not implemented (os error 38)` и живой shell после выхода
