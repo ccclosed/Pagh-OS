@@ -21,7 +21,7 @@
 // queue may still have `writers > 0` (the peer process is alive), so ownership
 // must dominate the writers count — `EBADF`, never a silent eternal wait.
 
-use crate::sock_wait::{wait_verdict, WaitVerdict};
+use crate::sock_wait::{wait_verdict, write_verdict, WaitVerdict, WriteVerdict};
 use proptest::prelude::*;
 
 proptest! {
@@ -85,4 +85,28 @@ fn decision_table_is_exhaustive() {
     assert_eq!(wait_verdict(true, 1), WaitVerdict::Continue);
     // Multi-writer queues (socketpair ends inherited by a child) stay waits.
     assert_eq!(wait_verdict(true, 3), WaitVerdict::Continue);
+}
+// ─── Пишущая сторона (SUBFIX 3): закрытие пишущего fd во время ожидания ───
+
+proptest! {
+    /// The write-side regression itself: a write fd closed from a sibling
+    /// thread must end the wait with `EBADF`, never keep polling a queue whose
+    /// counters cannot change (the syscall holds the queue's `Arc`).
+    #[test]
+    fn closed_write_fd_never_keeps_waiting(referenced in any::<bool>()) {
+        if referenced {
+            prop_assert_eq!(write_verdict(true), WriteVerdict::Continue);
+        } else {
+            prop_assert_eq!(write_verdict(false), WriteVerdict::Ebadf);
+        }
+    }
+}
+
+/// The two-row write table. Ownership is the ONLY question the policy asks:
+/// the peer-gone case (`EPIPE`) is decided by the queue itself, so it must not
+/// leak into this verdict.
+#[test]
+fn write_decision_table_is_exhaustive() {
+    assert_eq!(write_verdict(true), WriteVerdict::Continue);
+    assert_eq!(write_verdict(false), WriteVerdict::Ebadf);
 }

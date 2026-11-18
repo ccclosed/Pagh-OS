@@ -687,6 +687,24 @@ impl FdTable {
         })
     }
 
+    /// Ссылается ли ХОТЬ ОДИН дескриптор процесса на ПИШУЩИЙ конец очереди
+    /// `queue_id`.
+    ///
+    /// Зеркало [`Self::holds_read_end`] для блокирующей ЗАПИСИ: `sendto`/
+    /// `sendmsg`/`write` на полной очереди уступают CPU и перечитывают её, а
+    /// закрытие пишущего fd из соседнего потока не меняет счётчики очереди —
+    /// syscall держит её `Arc` сам. Без этой проверки такой `write` крутил бы
+    /// `yield_current()` вечно (watchdog печатал `stuck in syscall ? (nr=1
+    /// arg0=0x3 closed)`); `dup` другого fd на ту же очередь — по-прежнему
+    /// владение.
+    pub fn holds_write_end(&self, queue_id: usize) -> bool {
+        self.slots.any(|obj| match obj {
+            OpenObject::PipeWrite(e) => e.queue_id() == queue_id,
+            OpenObject::Socket { tx, .. } => tx.queue_id() == queue_id,
+            _ => false,
+        })
+    }
+
     /// Ссылается ли ХОТЬ ОДИН дескриптор процесса на TCP-сокет `id`
     /// (идентичность — адрес `Arc<InetTcp>`, как [`Self::holds_read_end`]).
     ///
