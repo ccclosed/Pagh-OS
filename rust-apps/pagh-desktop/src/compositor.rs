@@ -1475,6 +1475,7 @@ impl Compositor {
 
     /// Перерисовать накопленный damage. Возвращает перерисованные области.
     pub fn render(&mut self) -> Vec<Rect> {
+        let _stage = crate::timing::Scope::new(crate::timing::Stage::Render);
         let damage = self.damage.take();
         if damage.is_empty() {
             return Vec::new();
@@ -1583,13 +1584,23 @@ impl Compositor {
         if self.screen.contains_rect(shadow_box) {
             self.ensure_shadow(frame.w, frame.h);
             if let Some(shadow) = self.shadow_cache.get(&(frame.w, frame.h)) {
+                // Попиксельное alpha-смешивание предвычисленной тени — самый
+                // дорогой участок кадра (см. отчёт P0): считаем его в `blend`.
+                let _stage = crate::timing::Scope::new(crate::timing::Stage::Shadow);
+                let mut shadow_px = 0u64;
                 for layer in &shadow.layers {
                     for &(y, x0, x1) in &layer.rows {
                         for x in x0..x1 {
                             canvas.blend(frame.x + x, frame.y + y, color::BLACK, layer.alpha);
                         }
+                        // Считаем только пиксели внутри damage-отсечения:
+                        // иначе при мелком damage «записанные» пиксели тени
+                        // раздувались бы до площади окна и врали о доле blend.
+                        let row = Rect::new(frame.x + x0, frame.y + y, x1 - x0, 1);
+                        shadow_px += canvas.visible_area(row);
                     }
                 }
+                crate::timing::count_blended(shadow_px);
             }
         } else {
             canvas.shadow(frame, WINDOW_RADIUS, 9, 18);

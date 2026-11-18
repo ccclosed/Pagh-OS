@@ -138,6 +138,11 @@ pub struct ServerOptions {
     /// Если цели нет, но `spawn_demo` включён и `app` — известный
     /// `AppKind::id()`, сервер запускает демо-клиент.
     pub launch_targets: Vec<LaunchTarget>,
+    /// Печатать строку `frame-stats` каждые N presented-кадров (0 — выключено).
+    ///
+    /// Включается в `--e2e` (120) и флагом `--frame-log-every N`; строка несёт
+    /// frame time avg/p50/p95 и breakdown render/blend/copy/present.
+    pub frame_log_every: u64,
     /// Автозапуск приложения по `launch_targets` сразу после старта сервера.
     ///
     /// Нужен MVP-образу: панель остаётся интерактивной, но первое окно
@@ -168,6 +173,7 @@ impl Default for ServerOptions {
             spawn_demo: false,
             demo_binary: None,
             launch_targets: Vec::new(),
+            frame_log_every: 0,
             autostart: None,
         }
     }
@@ -434,6 +440,19 @@ pub struct Server {
     counters: Arc<RenderCounters>,
     shm: std::collections::HashMap<u32, crate::shm::ShmBinding>,
     next_shm_generation: u32,
+    /// Выборка frame time (мс) для периодической строки `frame-stats`.
+    frame_samples: crate::timing::Samples,
+    /// Выборки стадий текущего окна логирования.
+    render_samples: crate::timing::Samples,
+    blend_samples: crate::timing::Samples,
+    copy_samples: crate::timing::Samples,
+    present_samples: crate::timing::Samples,
+    /// Сколько presents накопилось с последней строки статистики.
+    frames_since_log: u64,
+    /// Сумма damage-rects и пикселей за окно логирования.
+    damage_since_log: u64,
+    opaque_since_log: u64,
+    blended_since_log: u64,
 }
 
 fn open_backend(options: &ServerOptions) -> io::Result<OutputBackend> {
@@ -614,6 +633,15 @@ impl Server {
             counters: Arc::new(RenderCounters::default()),
             shm: std::collections::HashMap::new(),
             next_shm_generation: 1,
+            frame_samples: crate::timing::Samples::with_capacity(256),
+            render_samples: crate::timing::Samples::with_capacity(256),
+            blend_samples: crate::timing::Samples::with_capacity(256),
+            copy_samples: crate::timing::Samples::with_capacity(256),
+            present_samples: crate::timing::Samples::with_capacity(256),
+            frames_since_log: 0,
+            damage_since_log: 0,
+            opaque_since_log: 0,
+            blended_since_log: 0,
         })
     }
 
@@ -958,11 +986,7 @@ impl Server {
 
     fn handle_incoming(&mut self, incoming: Incoming) -> bool {
         match incoming {
-            Incoming::Client {
-                conn,
-                message,
-                shm,
-            } => {
+            Incoming::Client { conn, message, shm } => {
                 self.handle_client_message(conn, message, shm);
                 true
             }
@@ -1633,7 +1657,67 @@ impl Server {
         self.compositor.render_full();
     }
 
+    /// Накопить frame time текущего кадра и, раз в `frame_log_every`
+    /// presents, напечатать строку `frame-stats` (serial в QEMU).
+    ///
+    /// `frame_start` — `rdtsc` перед `render`; стадии читаются из
+    /// [`crate::timing::take_frame`] сразу после `present`, поэтому строка
+    /// сравнивает средние за окно, а не мгновенный кадр.
+    fn note_frame_timing(&mut self, frame_start: u64, damage_rects: u64) {
+        let stages = crate::timing::take_frame();
+        let total = crate::timing::now_cycles().saturating_sub(frame_start);
+        self.frame_samples.push(crate::timing::cycles_to_ms(total));
+        self.render_samples.push(stages.render_ms());
+        self.blend_samples.push(stages.blend_ms());
+        self.copy_samples.push(stages.copy_ms());
+        self.present_samples.push(stages.present_ms());
+        self.frames_since_log += 1;
+        self.damage_since_log += damage_rects;
+        self.opaque_since_log += stages.opaque_px;
+        self.blended_since_log += stages.blended_px;
+        let every = self.options.frame_log_every;
+        if every == 0 || self.frames_since_log < every {
+            return;
+        }
+        let frames = self.frames_since_log as f64;
+        let painted = self.opaque_since_log + self.blended_since_log;
+        let opaque_pct = if painted == 0 {
+            0.0
+        } else {
+            self.opaque_since_log as f64 * 100.0 / painted as f64
+        };
+        if !self.options.quiet {
+            println!(
+                "pagh-desktop: frame-stats frames={} frame_ms avg={:.3} p50={:.3} p95={:.3} max={:.3} render_ms={:.3} blend_ms={:.3} copy_ms={:.3} present_ms={:.3} damage_rects={:.2}/frame opaque_pct={:.1}",
+                self.frames_since_log,
+                self.frame_samples.avg(),
+                self.frame_samples.p50(),
+                self.frame_samples.p95(),
+                self.frame_samples.max(),
+                self.render_samples.avg(),
+                self.blend_samples.avg(),
+                self.copy_samples.avg(),
+                self.present_samples.avg(),
+                self.damage_since_log as f64 / frames,
+                opaque_pct
+            );
+        }
+        self.frame_samples.clear();
+        self.render_samples.clear();
+        self.blend_samples.clear();
+        self.copy_samples.clear();
+        self.present_samples.clear();
+        self.frames_since_log = 0;
+        self.damage_since_log = 0;
+        self.opaque_since_log = 0;
+        self.blended_since_log = 0;
+    }
+
     fn render_if_needed(&mut self) -> io::Result<()> {
+        // Границы кадра: счётчики стадий обнуляются до `render`, читаются в
+        // `note_frame_timing` после `present`.
+        crate::timing::reset_frame();
+        let frame_start = crate::timing::now_cycles();
         let compose_start = Instant::now();
         let damage = if self.options.full_render {
             self.compositor.render_full()
@@ -1654,7 +1738,10 @@ impl Server {
             .unwrap_or(4);
         let area: i64 = damage.iter().map(|rect| rect.area().max(0)).sum();
         let present_start = Instant::now();
-        self.backend.present(self.compositor.frame(), &damage)?;
+        {
+            let _stage = crate::timing::Scope::new(crate::timing::Stage::Present);
+            self.backend.present(self.compositor.frame(), &damage)?;
+        }
         self.counters
             .present_ns
             .fetch_add(present_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1665,6 +1752,7 @@ impl Server {
         self.counters
             .damage_rects
             .fetch_add(damage.len() as u64, Ordering::Relaxed);
+        self.note_frame_timing(frame_start, damage.len() as u64);
         if let Some(dir) = &self.options.screenshot_dir {
             let path = dir.join(format!("frame_{:05}.png", self.backend.frames()));
             if let Err(err) = crate::png::write_png(&path, self.compositor.frame()) {
@@ -1782,7 +1870,9 @@ fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<A
                 pending_fds.extend(fds);
                 // Защита от клиента, засыпающего сервер fd'ами без offer'ов.
                 if pending_fds.len() > 8 {
-                    eprintln!("pagh-desktop: conn={conn}: слишком много SCM_RIGHTS fd без shm_offer");
+                    eprintln!(
+                        "pagh-desktop: conn={conn}: слишком много SCM_RIGHTS fd без shm_offer"
+                    );
                     let _ = tx.send(Incoming::ProtocolError {
                         conn,
                         detail: "слишком много SCM_RIGHTS fd без shm_offer".to_string(),
@@ -1806,7 +1896,11 @@ fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<A
                             // §13.7 #22), и главный поток его не увидит. Через
                             // канал едет готовое `ShmMapping`.
                             let shm = if let Message::ShmOffer {
-                                width, height, format, stride, ..
+                                width,
+                                height,
+                                format,
+                                stride,
+                                ..
                             } = message
                             {
                                 match pending_fds.pop_front() {
