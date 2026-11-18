@@ -716,83 +716,353 @@ pub(super) fn cmd_groups(_ctx: &mut ShellCtx, args: &[&str]) {
     shell_println(&line);
 }
 
-/// `su [user]`: сменить сессионную идентичность shell.
+/// `su [-p] [user]`: сменить сессионную идентичность shell.
 ///
-/// Фаза 1: только `root -> oleg` (uid 1000) и `root -> root` (сброс). Пароля
-/// нет — это **явно документированное** ограничение, а не забытая проверка:
-/// аутентификация/login — предмет фазы 2 (`docs/security/groups.md`).
+/// Пароль требуется там, где он что-то доказывает: из **не-root** сессии
+/// (`su` без аргумента — возврат к root, `su <user>` — переход под другим
+/// именем). Root-сессия понижается без пароля, как `su` из root в Linux, а
+/// `-p` заставляет спросить пароль и там — это единственный способ проверить
+/// сохранённый хэш с консоли. Закрытая запись (`!`/`*`, как `oleg` на свежем
+/// диске) не пускает никого: fail-closed, пока root-сессия не задаст пароль
+/// через `passwd`.
 ///
-/// Смена односторонняя: из непривилегированной сессии `su root` запрещён (иначе
-/// отсутствие пароля было бы эскалацией). Вернуться к root можно перезагрузкой.
 /// Shell-встроенные команды по-прежнему исполняются kernel-кодом; меняется
 /// идентичность процессов, которые запускает `lxrun`.
 pub(super) fn cmd_su(_ctx: &mut ShellCtx, args: &[&str]) {
-    if args.len() > 1 {
-        shell_println("su: usage: su [user]");
+    let Some((target, require_password)) = parse_identity_args("su", args, true) else {
+        return;
+    };
+    switch_session("su", target, require_password);
+}
+
+/// `login [-p] <user>`: установить сессионную идентичность пользователя.
+///
+/// В отличие от `su` (переключение) цель обязательна. Аутентификация — та же,
+/// что у `su`: из не-root сессии спрашивается пароль цели, `-p` спрашивает его
+/// и из root-сессии. `root` аутентифицируется своим паролем из `/etc/shadow`;
+/// пока он закрыт (`*`), `login root` из не-root невозможен.
+pub(super) fn cmd_login(_ctx: &mut ShellCtx, args: &[&str]) {
+    let Some((target, require_password)) = parse_identity_args("login", args, false) else {
+        return;
+    };
+    switch_session("login", target, require_password);
+}
+
+/// `whoami`: имя пользователя по **effective** uid из `/etc/passwd`.
+///
+/// Это ровно то, с чем `lxrun` запускает программы: сессионная идентичность
+/// (`su`/`login`/`/etc/pagh-session`). Если записи нет — печатается число,
+/// как `id`, а не выдуманное имя.
+pub(super) fn cmd_whoami(_ctx: &mut ShellCtx, args: &[&str]) {
+    if !args.is_empty() {
+        shell_println("whoami: usage: whoami");
         return;
     }
-    let target = args.first().copied().unwrap_or("root");
+    let creds = identity::current();
+    shell_println(&identity::user_label(creds.euid));
+}
+
+/// Разбор аргументов `su`/`login`: `[-p|--password] <user>`.
+///
+/// `default_root` — `su` без цели переключает на root; `login` цель обязан
+/// назвать. `None` — сообщение об ошибке уже напечатано (вызывающий
+/// возвращается молча).
+fn parse_identity_args<'a>(
+    command: &str,
+    args: &'a [&'a str],
+    default_root: bool,
+) -> Option<(&'a str, bool)> {
+    let mut require_password = false;
+    let mut target: Option<&'a str> = None;
+    for arg in args {
+        if *arg == "-p" || *arg == "--password" {
+            require_password = true;
+        } else if arg.starts_with('-') {
+            shell_println(&format!("{}: unknown option '{}'", command, arg));
+            print_identity_usage(command, default_root);
+            return None;
+        } else if target.is_none() {
+            target = Some(arg);
+        } else {
+            print_identity_usage(command, default_root);
+            return None;
+        }
+    }
+    match (target, default_root) {
+        (Some(target), _) => Some((target, require_password)),
+        (None, true) => Some(("root", require_password)),
+        (None, false) => {
+            print_identity_usage(command, false);
+            None
+        }
+    }
+}
+
+fn print_identity_usage(command: &str, default_root: bool) {
+    if default_root {
+        shell_println(&format!("{}: usage: {} [-p] [user]", command, command));
+    } else {
+        shell_println(&format!("{}: usage: {} [-p] <user>", command, command));
+    }
+}
+
+/// Общая часть `su`/`login`: доказать право (если нужно), построить
+/// идентичность цели и поставить её сессии.
+///
+/// Пароль спрашивается, когда сессия не root (иначе смена была бы эскалацией
+/// без аутентификации) или когда `require_password` выставлен явно (`-p`).
+/// Root-сессия понижается без пароля — как `su` из root в Linux.
+///
+/// Возвращает `None`, если переключение не состоялось (сообщение уже
+/// напечатано). Отдельная функция, чтобы `su` и `login` не расходились в
+/// правилах: обе идут через [`identity::login_creds`].
+fn switch_session(command: &str, target: &str, require_password: bool) -> Option<Creds> {
     let current = identity::current();
-    if !current.is_root() {
-        shell_println("su: permission denied (phase 1: only a root session may su)");
-        return;
-    }
-    if target == "root" || target == "0" {
+    let to_root = target == "root" || target == "0";
+    let authenticated = require_password || !current.is_root();
+
+    if to_root {
+        if authenticated && !authenticate(command, "root") {
+            return None;
+        }
         identity::set_session(Creds::ROOT);
-        shell_println("su: session identity is root (uid=0, gid=0, no groups)");
+        if authenticated {
+            shell_println(&format!(
+                "{}: authenticated as root: session identity is root (uid=0, gid=0, no groups)",
+                command
+            ));
+        } else {
+            shell_println(&format!(
+                "{}: session identity is root (uid=0, gid=0, no groups)",
+                command
+            ));
+        }
+        return Some(Creds::ROOT);
+    }
+
+    if authenticated && !authenticate(command, target) {
+        return None;
+    }
+    match identity::login_creds(target) {
+        Ok(creds) => {
+            identity::set_session(creds);
+            let how = if authenticated {
+                format!("authenticated as {}", target)
+            } else {
+                String::from("root session: no password required")
+            };
+            shell_println(&format!(
+                "{}: {}: {} -> {} (uid={} gid={})",
+                command,
+                how,
+                identity::user_label(current.euid),
+                target,
+                creds.uid,
+                creds.gid
+            ));
+            shell_println(&format!(
+                "{}: groups={}",
+                command,
+                identity::format_gids(&identity::session_groups())
+            ));
+            shell_println(&format!(
+                "{}: 'lxrun' now starts programs with these credentials; shell built-ins still run as kernel/root (phase-1 limitation)",
+                command
+            ));
+            Some(creds)
+        }
+        Err(identity::LoginError::UnknownUser) => {
+            shell_println(&format!(
+                "{}: user '{}' does not exist in /etc/passwd",
+                command, target
+            ));
+            None
+        }
+        Err(identity::LoginError::RootTarget) => {
+            shell_println(&format!(
+                "{}: '{}' has uid 0; use '{} root' to reset to the root session",
+                command, target, command
+            ));
+            None
+        }
+        Err(identity::LoginError::GroupDatabase) => {
+            shell_println(&format!(
+                "{}: '{}': group database (/etc/group) unavailable",
+                command, target
+            ));
+            None
+        }
+        Err(identity::LoginError::TooManyGroups) => {
+            shell_println(&format!(
+                "{}: '{}': too many supplementary groups (this kernel supports at most {})",
+                command, target, GROUPS_CAP
+            ));
+            None
+        }
+    }
+}
+
+/// Спросить пароль и проверить его против `/etc/shadow` (fail-closed).
+///
+/// Отсутствие записи, закрытый хэш (`!`/`*`), отсутствие клавиатуры и неверный
+/// пароль одинаково возвращают `false`: «не смогли проверить» не должно
+/// превращаться в «пустить». Сообщение печатается здесь, чтобы `su`/`login`
+/// не дублировали формулировки.
+fn authenticate(command: &str, user: &str) -> bool {
+    if identity::lookup_user(user).is_none() {
+        shell_println(&format!(
+            "{}: user '{}' does not exist in /etc/passwd",
+            command, user
+        ));
+        return false;
+    }
+    if !identity::has_password(user) {
+        shell_println(&format!(
+            "{}: '{}' has no password set (locked in /etc/shadow); a root session must run 'passwd {}'",
+            command, user, user
+        ));
+        return false;
+    }
+    let Some(password) = read_secret(&format!("Password for {}: ", user)) else {
+        shell_println(&format!("{}: authentication cancelled", command));
+        return false;
+    };
+    if !identity::verify_user_password(user, &password) {
+        shell_println(&format!("{}: incorrect password", command));
+        return false;
+    }
+    true
+}
+
+/// `passwd [user]`: сменить пароль записи `/etc/shadow`.
+///
+/// root-сессия меняет пароль любой записи без старого пароля (как root в
+/// Linux). Не-root сессия может менять **только свой** пароль и доказывает
+/// владение: если хэш уже задан — вводится текущий пароль. Закрытая (`!`/`*`)
+/// запись — это «первый пароль» учётки (доказывать нечего), но root при этом
+/// остаётся закрытым: задать ему пароль может только root-сессия, поэтому
+/// `su root` из не-root по-прежнему невозможен.
+///
+/// Пароль читается с клавиатуры без эха и не попадает ни в history, ни в
+/// вывод. Пустой пароль отвергается: `passwd` не должен молча открыть учётку.
+pub(super) fn cmd_passwd(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.len() > 1 {
+        shell_println("passwd: usage: passwd [user]");
         return;
     }
-    let Some(user) = identity::lookup_user(target) else {
-        shell_println(&alloc::format!(
-            "su: user '{}' does not exist in /etc/passwd",
+    let current = identity::current();
+    let target = match args.first() {
+        Some(name) => String::from(*name),
+        None => match identity::name_for_uid(current.euid) {
+            Some(name) => name,
+            None => {
+                shell_println(&format!(
+                    "passwd: no /etc/passwd entry for uid {}",
+                    current.euid
+                ));
+                return;
+            }
+        },
+    };
+    if identity::lookup_user(&target).is_none() {
+        shell_println(&format!(
+            "passwd: user '{}' does not exist in /etc/passwd",
             target
         ));
         return;
+    }
+    if !current.is_root() {
+        if identity::name_for_uid(current.euid).as_deref() != Some(target.as_str()) {
+            shell_println(
+                "passwd: permission denied (only a root session may change another user's password)",
+            );
+            return;
+        }
+        if identity::has_password(&target) {
+            let Some(old) = read_secret("Current password: ") else {
+                shell_println("passwd: cancelled");
+                return;
+            };
+            if !identity::verify_user_password(&target, &old) {
+                shell_println("passwd: incorrect current password");
+                return;
+            }
+        }
+    }
+    let Some(new) = read_secret("New password: ") else {
+        shell_println("passwd: cancelled");
+        return;
     };
-    if user.uid != 1000 {
-        shell_println(&alloc::format!(
-            "su: phase 1 supports only root -> uid 1000 ('oleg'); '{}' has uid {}",
-            user.name,
-            user.uid
-        ));
+    if new.is_empty() {
+        shell_println("passwd: empty password is not allowed");
         return;
     }
-    let Some(supplementary) = identity::supplementary_groups_for_user(&user.name) else {
-        shell_println(&alloc::format!(
-            "su: '{}': group database unavailable",
-            user.name
-        ));
+    let Some(again) = read_secret("Retype new password: ") else {
+        shell_println("passwd: cancelled");
         return;
     };
-    if supplementary.len() > GROUPS_CAP {
-        shell_println(&alloc::format!(
-            "su: '{}' is in {} groups; this kernel supports at most {}",
-            user.name,
-            supplementary.len(),
-            GROUPS_CAP
-        ));
+    if new != again {
+        shell_println("passwd: the passwords do not match");
         return;
     }
-    let Some(next) = Creds::new(user.uid, user.gid, user.uid, user.gid, user.uid, user.gid)
-        .with_groups(&supplementary)
-    else {
-        shell_println("su: credentials construction failed");
-        return;
-    };
-    identity::set_session(next);
-    shell_println(&alloc::format!(
-        "su: no password authentication in phase 1: root -> {} (uid={} gid={})",
-        user.name,
-        user.uid,
-        user.gid
-    ));
-    shell_println(&alloc::format!(
-        "su: groups={}",
-        identity::format_gids(&identity::session_groups())
-    ));
-    shell_println(
-        "su: 'lxrun' now starts programs with these credentials; shell built-ins still run as kernel/root (phase-1 limitation)",
-    );
+    if identity::set_user_password(&target, &new) {
+        shell_println(&format!("passwd: password updated for '{}'", target));
+    } else {
+        shell_println("passwd: cannot update /etc/shadow");
+    }
+}
+
+/// Прочитать строку с клавиатуры **без эха** (пароль).
+///
+/// `None` — нет клавиатуры (headless-прогон не должен висеть на промпте) или
+/// Ctrl+C/Esc. Введённое не печатается и не попадает в history: эхо выключено
+/// на уровне этого цикла, а строка живёт только в стеке. Backspace правит
+/// накопленный текст. В idle цикл уходит в `halt` с включёнными прерываниями
+/// (как основной цикл shell), поэтому не жжёт CPU и не спит вечно.
+fn read_secret(prompt: &str) -> Option<String> {
+    if !crate::drivers::any_keyboard() {
+        shell_println("no keyboard detected; cannot read a password");
+        return None;
+    }
+    crate::kprint!("{}", prompt);
+    crate::fb_print!("{}", prompt);
+    let mut decoder = super::keys::Decoder::new();
+    let mut line = String::new();
+    loop {
+        let Some(scancode) = super::try_read_scancode() else {
+            crate::arch::cpu::halt();
+            continue;
+        };
+        match decoder.feed(scancode) {
+            Some(super::keys::KeyEvent::Enter) => {
+                crate::kprintln!();
+                crate::fb_println!();
+                return Some(line);
+            }
+            Some(super::keys::KeyEvent::Ctrl('c')) | Some(super::keys::KeyEvent::Escape) => {
+                // Защёлку ^C, которую ставит декодер, гасим: она предназначена
+                // для ожидания foreground-ребёнка `lxrun`, и оставлять её
+                // взведённой значило бы мгновенно завершить следующую программу.
+                super::keys::CTRL_C_LATCH.store(false, core::sync::atomic::Ordering::Relaxed);
+                crate::kprintln!();
+                crate::fb_println!();
+                return None;
+            }
+            Some(super::keys::KeyEvent::Backspace) => {
+                line.pop();
+            }
+            Some(super::keys::KeyEvent::Char(c)) => {
+                // Верхняя граница — в байтах (`shadow::PASSWORD_MAX`), поэтому
+                // проверяем длину будущей строки, а не число символов: иначе
+                // многобайтный символ на пределе дал бы «пароль слишком
+                // длинный» уже после двух одинаковых вводов.
+                if line.len() + c.len_utf8() <= super::shadow::PASSWORD_MAX {
+                    line.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// `exec`: запустить встроенный тестовый пользовательский процесс.

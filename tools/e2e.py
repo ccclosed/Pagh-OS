@@ -3035,10 +3035,54 @@ def mode_groups(h: "Harness") -> tuple[str, int]:
             return ("FAIL", EXIT_FAIL)
         time.sleep(1.0)
 
+    # `/etc/shadow` + `passwd`: a real password prompt (no echo), written to
+    # the freshly provisioned `0600 root:root` file and then verified by `su`
+    # through the same kernel path the shell uses.
+    sh("passwd oleg")
+    if wait_for(h.guest, [r"New password: "], 30.0, label="passwd prompt") is None:
+        ok &= h.check("passwd asks for a new password", False, "no prompt")
+        return ("FAIL", EXIT_FAIL)
+    kb.text("opensesame")
+    kb.key("ret")
+    if wait_for(h.guest, [r"Retype new password: "], 30.0,
+                label="passwd retype") is None:
+        ok &= h.check("passwd asks to retype", False, "no retype prompt")
+        return ("FAIL", EXIT_FAIL)
+    kb.text("opensesame")
+    kb.key("ret")
+    if wait_for(h.guest, [r"passwd: password updated for 'oleg'"], 30.0,
+                label="passwd update") is None:
+        ok &= h.check("passwd updates /etc/shadow", False, "no success marker")
+        return ("FAIL", EXIT_FAIL)
+
     sh("su oleg")
-    if wait_for(h.guest, [r"su: no password authentication in phase 1"], 30.0,
+    if wait_for(h.guest, [r"su: root session: no password required"], 30.0,
                 label="su oleg") is None:
         ok &= h.check("su oleg switches the session", False, "no su marker")
+        return ("FAIL", EXIT_FAIL)
+    sh("whoami")
+    sh("su root")
+    sh("passwd root")
+    # Wrong password must be refused, the right one must authenticate: this is
+    # the in-guest proof that SHA-512-crypt verification and the shadow read
+    # path both work (not just the host property).
+    sh("su -p oleg")
+    if wait_for(h.guest, [r"Password for oleg: "], 30.0, label="su password") is None:
+        ok &= h.check("su asks for the target password", False, "no prompt")
+        return ("FAIL", EXIT_FAIL)
+    kb.text("wrongpass")
+    kb.key("ret")
+    if wait_for(h.guest, [r"su: incorrect password"], 30.0, label="su wrong") is None:
+        ok &= h.check("su rejects a wrong password", False, "wrong password accepted?")
+        return ("FAIL", EXIT_FAIL)
+    sh("su -p oleg")
+    if wait_for(h.guest, [r"Password for oleg: "], 30.0, label="su password 2") is None:
+        ok &= h.check("su asks again", False, "no prompt")
+        return ("FAIL", EXIT_FAIL)
+    kb.text("opensesame")
+    kb.key("ret")
+    if wait_for(h.guest, [r"su: authenticated as oleg"], 30.0, label="su right") is None:
+        ok &= h.check("su accepts the right password", False, "not authenticated")
         return ("FAIL", EXIT_FAIL)
     sh("id")
     sh("groups")
@@ -3079,6 +3123,15 @@ def mode_groups(h: "Harness") -> tuple[str, int]:
          r"-rw-rw-rw-\s+1\s+0\s+0\s+\d+\s+null"),
         ("su prints the loaded supplementary set",
          r"su: groups=1000\(oleg\),5\(tty\),44\(video\),105\(input\)"),
+        ("passwd wrote the hash into /etc/shadow",
+         r"passwd: password updated for 'oleg'"),
+        ("su authenticated oleg with the stored $6$ hash",
+         r"su: authenticated as oleg: oleg -> oleg \(uid=1000 gid=1000\)"),
+        ("whoami reports the session user", r"(?m)^oleg\r?$"),
+        ("su root from a non-root session is refused (root password locked)",
+         r"su: 'root' has no password set \(locked in /etc/shadow\)"),
+        ("passwd refuses another user from a non-root session",
+         r"passwd: permission denied \(only a root session may change another user's password\)"),
     ]
     for label, pattern in expected:
         m = re.search(pattern, text)
