@@ -9,6 +9,9 @@
 //!     owner/group/other используют **effective** id; root обходит read/write,
 //!     но, точно как в Linux, всё равно нуждается хотя бы в одном
 //!     execute-бите для `X`.
+//!   * [`Creds::exec_setid`] — `execve` на образе с `S_ISUID`/`S_ISGID`
+//!     (Linux `bprm_fill_uid()`): euid/egid и соответствующие saved id берутся
+//!     у владельца файла, real id и дополнительные группы сохраняются.
 //!   * [`Creds::setuid`]/[`Creds::setgid`] — переход `setuid(2)`/`setgid(2)`,
 //!     включая правила saved-set-id.
 //!   * [`Creds::setreuid`]/[`Creds::setresuid`] и групповые аналоги — более
@@ -33,8 +36,9 @@
 //! [`Creds::groups`] — фиксированный набор до [`GROUPS_CAP`] supplementary gid'ов
 //! (`setgroups(2)`). Linux проверяет групповой класс прав, если gid владельца
 //! равен **либо** `egid`, **либо** любому supplementary gid'у; именно это делает
-//! [`Creds::may`]. Набор наследуется `fork`/`clone` и переживает `execve` (они
-//! копируют [`Creds`] целиком; setuid-бинари не моделируются).
+//! [`Creds::may`]. Набор наследуется `fork`/`clone` и переживает `execve`: Linux
+//! не сбрасывает supplementary-набор на setuid-файле, это делает `su`/`login`
+//! явным `setgroups(2)` перед `setuid(2)` ([`Creds::for_login`]).
 //!
 //! Почему cap, а не `Vec`: `Creds` — `Copy`-снимок в `CompatState`, который
 //! копируется на каждом `fork`/проверке прав в `no_std`-ядре с фиксированной
@@ -50,6 +54,14 @@
 /// группами и документирует это в `docs/security/groups.md` как ограничение
 /// фазы 1.
 pub const GROUPS_CAP: usize = 32;
+
+/// Бит set-user-ID в `st_mode` (`S_ISUID`): `execve` ставит `euid = suid =`
+/// владельцу файла.
+pub const S_ISUID: u32 = 0o4000;
+
+/// Бит set-group-ID в `st_mode` (`S_ISGID`): `execve` ставит `egid = sgid =`
+/// группе файла.
+pub const S_ISGID: u32 = 0o2000;
 
 /// Номера групп pagh (фаза 1).
 ///
@@ -90,9 +102,8 @@ pub struct Creds {
     pub euid: u32,
     /// Effective group id — то, что используют проверки прав.
     pub egid: u32,
-    /// Saved set-user-ID (восстанавливается `execve` на привилегированном
-    /// бинаре; pagh сохраняет его через `exec`, поскольку setuid-бинари не
-    /// моделируются).
+    /// Saved set-user-ID: переписывается `execve` на образе с `S_ISUID`
+    /// ([`Creds::exec_setid`]) и `set*id`-переходами.
     pub suid: u32,
     /// Saved set-group-ID (сохранённый group id).
     pub sgid: u32,
@@ -257,6 +268,55 @@ impl Creds {
     #[inline]
     pub fn may_chown(&self) -> bool {
         self.euid == 0
+    }
+
+    /// Креденшелы после успешного `execve` образа с `mode`/`owner`.
+    ///
+    /// Повторяет `bprm_fill_uid()` из `fs/exec.c` Linux: бит `S_ISUID` ставит
+    /// `euid = suid = owner.uid`, бит `S_ISGID` — `egid = sgid = owner.gid`.
+    /// Оба бита независимы. Real id, второй saved id и дополнительные группы
+    /// **не** меняются: Linux тоже не трогает supplementary-набор на
+    /// setuid-файле (его сбрасывает `su`/login явным `setgroups(2)`).
+    ///
+    /// Ограничение модели названо, а не подразумевается: у pagh нет
+    /// `MS_NOSUID`-флагов монтирования, `ptrace(2)` и `dumpable`, поэтому
+    /// «под отладчиком» и «nosuid-монтирование» эту функцию не отключают —
+    /// применяется только inode-бит, а ставить его может лишь root (`chown`/
+    /// `chmod` — root или владелец файла).
+    pub fn exec_setid(&self, mode: u32, owner: (u32, u32)) -> Creds {
+        let mut next = *self;
+        if mode & S_ISUID != 0 {
+            next.euid = owner.0;
+            next.suid = owner.0;
+        }
+        if mode & S_ISGID != 0 {
+            next.egid = owner.1;
+            next.sgid = owner.1;
+        }
+        next
+    }
+
+    /// Работает ли процесс с effective id, отличным от real (Linux
+    /// «privileged process»)?
+    ///
+    /// Это **состояние**, а не переход: после setuid/setgid-on-exec
+    /// непривилегированный вызывающий как раз оказывается в нём, и именно это
+    /// Linux называет `secureexec`/`AT_SECURE`. В pagh нет ни `AT_SECURE`, ни
+    /// `dumpable`, поэтому флаг существует, чтобы сисколл-слой мог назвать
+    /// состояние в логе, а не выводить его повторно.
+    pub fn runs_privileged(&self) -> bool {
+        self.euid != self.uid || self.egid != self.gid
+    }
+
+    /// Креденшелы входа пользователя: `login`/`su` дают процессу
+    /// `uid = euid = suid` и `gid = egid = sgid` цели плюс её дополнительные
+    /// группы из `/etc/group`.
+    ///
+    /// `None` — набор групп не влезает в [`GROUPS_CAP`]; вызывающий обязан
+    /// сообщить ошибку, а не обрезать набор (та же политика, что у
+    /// [`Creds::with_groups`]).
+    pub fn for_login(uid: u32, gid: u32, supplementary: &[u32]) -> Option<Creds> {
+        Creds::new(uid, gid, uid, gid, uid, gid).with_groups(supplementary)
     }
 
     /// `setuid(2)`: задать real/effective/saved user id.
@@ -698,5 +758,59 @@ mod tests {
             ),
             (5, 6, 10, 44, 105, 90)
         );
+    }
+
+    #[test]
+    fn setuid_exec_of_a_root_binary_raises_euid_and_suid_only() {
+        // uid 1000 запускает root-owned 04755: Linux ставит euid/suid = 0,
+        // real id (1000) и группы не трогает.
+        let user = Creds::new(1000, 1000, 1000, 1000, 1000, 1000);
+        let next = user.exec_setid(0o4755, (0, 0));
+        assert_eq!((next.uid, next.euid, next.suid), (1000, 0, 0));
+        assert_eq!((next.gid, next.egid, next.sgid), (1000, 1000, 1000));
+        assert!(next.is_root());
+        assert!(next.runs_privileged());
+        // Обычный исполняемый файл (0755 root:root) не меняет ничего.
+        let plain = user.exec_setid(0o755, (0, 0));
+        assert_eq!(plain, user);
+        assert!(!plain.runs_privileged());
+    }
+
+    #[test]
+    fn setgid_exec_sets_egid_and_sgid_and_leaves_the_user_identity_alone() {
+        let user = Creds::new(1000, 1000, 1000, 1000, 1000, 1000);
+        let next = user.exec_setid(0o2755, (0, gid::VIDEO));
+        assert_eq!((next.gid, next.egid, next.sgid), (1000, 44, 44));
+        assert_eq!((next.uid, next.euid, next.suid), (1000, 1000, 1000));
+        assert!(next.runs_privileged());
+        // Оба бита независимы.
+        let both = user.exec_setid(S_ISUID | S_ISGID | 0o755, (0, 44));
+        assert_eq!((both.euid, both.egid), (0, 44));
+        assert_eq!((both.suid, both.sgid), (0, 44));
+    }
+
+    #[test]
+    fn setid_exec_keeps_real_ids_and_supplementary_groups() {
+        let user = Creds::new(1000, 1000, 1000, 1000, 1000, 1000)
+            .with_groups(&[5, 44, 105])
+            .unwrap();
+        let next = user.exec_setid(0o6755, (0, 0));
+        assert_eq!((next.uid, next.gid), (1000, 1000));
+        assert_eq!(next.groups(), &[5, 44, 105]);
+        assert_eq!((next.suid, next.sgid), (0, 0));
+    }
+
+    #[test]
+    fn for_login_maps_every_id_to_the_target_and_carries_the_group_set() {
+        let c = Creds::for_login(1000, 1000, &[5, 44, 105]).expect("three groups fit");
+        assert_eq!(
+            (c.uid, c.gid, c.euid, c.egid, c.suid, c.sgid),
+            (1000, 1000, 1000, 1000, 1000, 1000)
+        );
+        assert_eq!(c.groups(), &[5, 44, 105]);
+        assert!(!c.is_root());
+        // Набор больше cap'а отвергается, а не обрезается.
+        let too_many = [0u32; GROUPS_CAP + 1];
+        assert!(Creds::for_login(1000, 1000, &too_many).is_none());
     }
 }
