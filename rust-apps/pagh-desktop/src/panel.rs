@@ -1,8 +1,8 @@
 //! Нижняя icon-only панель (44 px): часы/дата, сеть, лаунчер и чипы окон.
 
 use crate::canvas::Canvas;
-use crate::color::Color;
 use crate::geometry::{Point, Rect};
+use crate::icons::{self, Icon};
 use crate::theme::Theme;
 
 /// Высота панели в пикселях.
@@ -226,7 +226,7 @@ impl Panel {
             canvas.text(x, rect.y + (rect.h - 16) / 2, 1, theme.chip_text, s);
         }
 
-        // Сеть: иконка Wi-Fi. Выключенная сеть приглушена.
+        // Сеть: проводной порт (ethernet). Выключенная сеть приглушена.
         let net = network_rect(screen);
         if hover == Some(PanelHover::Network) {
             canvas.fill_rounded_rect(net.inset(2), 8, theme.panel_hover, 220);
@@ -258,90 +258,41 @@ impl Panel {
 }
 
 fn draw_icon(canvas: &mut Canvas, icon: PanelIcon, cell: Rect, theme: &Theme) {
-    let center = cell.center();
-    match icon {
-        PanelIcon::Launcher => {
-            // 3x3 сетка квадратиков.
-            let size = 4;
-            let gap = 3;
-            let total = size * 3 + gap * 2;
-            let x0 = center.x - total / 2;
-            let y0 = center.y - total / 2;
-            for row in 0..3 {
-                for col in 0..3 {
-                    let color = if row == 1 && col == 1 {
-                        theme.accent
-                    } else {
-                        theme.panel_icon
-                    };
-                    canvas.fill_rounded_rect(
-                        Rect::new(x0 + col * (size + gap), y0 + row * (size + gap), size, size),
-                        1,
-                        color,
-                        255,
-                    );
-                }
-            }
-        }
-        PanelIcon::Terminal => {
-            let r = Rect::new(center.x - 12, center.y - 9, 24, 18);
-            canvas.fill_rounded_rect(r, 4, theme.panel_bg, 255);
-            canvas.stroke_rounded_rect(r, 4, theme.panel_icon, 255);
-            canvas.line(
-                Point::new(center.x - 7, center.y - 4),
-                Point::new(center.x - 3, center.y),
-                theme.accent,
-                2,
-            );
-            canvas.line(
-                Point::new(center.x - 3, center.y),
-                Point::new(center.x - 7, center.y + 4),
-                theme.accent,
-                2,
-            );
-            canvas.hline(center.x - 1, center.x + 6, center.y + 4, theme.panel_icon);
-        }
-        PanelIcon::Files => {
-            let body = Rect::new(center.x - 11, center.y - 8, 22, 16);
-            canvas.fill_rounded_rect(body, 3, theme.accent_dim, 255);
-            canvas.fill_rounded_rect(
-                Rect::new(center.x - 11, center.y - 11, 10, 5),
-                2,
-                theme.accent_dim,
-                255,
-            );
-            canvas.fill_rounded_rect(body.inset(2), 2, theme.panel_bg_alt, 255);
-            canvas.hline(body.x + 4, body.right() - 4, body.y + 6, theme.panel_icon);
-        }
-        PanelIcon::Paint => {
-            canvas.fill_circle(center, 9, theme.accent_dim, 255);
-            canvas.fill_circle(Point::new(center.x, center.y), 5, theme.panel_bg, 255);
-            for (dx, dy, color) in [
-                (-5, -4, crate::color::rgb(232, 92, 92)),
-                (5, -4, crate::color::rgb(235, 200, 90)),
-                (0, 5, theme.accent),
-            ] {
-                canvas.fill_circle(Point::new(center.x + dx, center.y + dy), 2, color, 255);
-            }
-        }
-    }
+    // Готовые regular-глифы Fluent (assets/icons), 24 px в ячейке 44 px.
+    // Иконки монохромные: тинт задаёт цвет, поэтому лаунчер/терминал/файлы
+    // берут обычный цвет панели, а Paint (единственный «цветной» апп в
+    // референсе) — акцент.
+    let (asset, tint) = match icon {
+        PanelIcon::Launcher => (Icon::Grid, theme.panel_icon),
+        PanelIcon::Terminal => (Icon::Terminal, theme.panel_icon),
+        PanelIcon::Files => (Icon::Folder, theme.panel_icon),
+        PanelIcon::Paint => (Icon::Image, theme.accent),
+    };
+    icons::draw(canvas, asset, 24, cell.center(), tint, 255);
 }
 
+/// Сеть: готовый глиф Plug Connected (проводная сеть), а не Wi-Fi-дуги.
+///
+/// У машины нет Wi-Fi: линк приходит либо с e1000 (провод), либо с RNDIS
+/// поверх USB (тетеринг телефона), а референс Win11 «Сети» — «Проводное
+/// подключение». Та же иконка, что в карточке подключения во флайауте
+/// (`compositor::draw_wired_icon`), поэтому панель и флайаут показывают
+/// один и тот же тип линка.
+///
+/// Офлайн: глиф приглушается в `panel_icon_dim`, поверх сохраняется
+/// диагональ «нет сети» цветом `button_close`.
 fn draw_network(canvas: &mut Canvas, rect: Rect, theme: &Theme, online: bool) {
-    let color: Color = if online {
+    let color = if online {
         theme.panel_icon
     } else {
         theme.panel_icon_dim
     };
-    let center = Point::new(rect.center().x, rect.bottom() - 8);
-    canvas.fill_circle(center, 2, if online { theme.accent } else { color }, 255);
-    for (radius, thickness) in [(6, 2), (11, 2), (16, 2)] {
-        canvas.arc(center, radius, 218.0, 322.0, color, thickness);
-    }
+    let center = rect.center();
+    icons::draw(canvas, Icon::NetworkWired, 20, center, color, 255);
     if !online {
         canvas.line(
-            Point::new(rect.x + 6, rect.bottom() - 6),
-            Point::new(rect.right() - 6, rect.y + 6),
+            Point::new(center.x - 11, center.y + 11),
+            Point::new(center.x + 11, center.y - 11),
             theme.button_close,
             2,
         );
@@ -416,6 +367,168 @@ mod tests {
         assert!(
             lit > 40,
             "часы и дата должны быть нарисованы, пикселей {lit}"
+        );
+    }
+
+    /// Собрать кадр панели для пиксельных проверок иконки сети.
+    fn panel_frame(online: bool) -> Canvas {
+        let mut canvas = Canvas::new(1280, 720, crate::color::rgb(0, 0, 0));
+        let mut panel = Panel::new("23:38", "15.11.2026");
+        panel.network_online = online;
+        panel.draw(&mut canvas, SCREEN, &Theme::default(), None, &[]);
+        canvas
+    }
+
+    /// Пиксели блока сети, отличающиеся от фона своей строки сильнее порога.
+    ///
+    /// Фон панели — вертикальный градиент, поэтому сравнение идёт с цветом
+    /// той же строки вне иконки (x = 500 — пустая область панели). Порог
+    /// отсекает антиалиасинг и позволяет отдельно мерить «яркую» (обычный
+    /// цвет) и «приглушённую» (dim) иконку.
+    fn lit_pixels(canvas: &Canvas, threshold: i32) -> Vec<(i32, i32)> {
+        let net = network_rect(SCREEN);
+        let mut lit = Vec::new();
+        for y in net.y..net.bottom() {
+            let bg = canvas.get(500, y);
+            for x in net.x..net.right() {
+                let pixel = canvas.get(x, y);
+                let delta = (i32::from(crate::color::red(pixel))
+                    - i32::from(crate::color::red(bg)))
+                .abs()
+                    + (i32::from(crate::color::green(pixel)) - i32::from(crate::color::green(bg)))
+                        .abs()
+                    + (i32::from(crate::color::blue(pixel)) - i32::from(crate::color::blue(bg)))
+                        .abs();
+                if delta > threshold {
+                    lit.push((x, y));
+                }
+            }
+        }
+        lit
+    }
+
+    #[test]
+    fn network_icon_is_a_wired_plug_not_wifi_arcs() {
+        let canvas = panel_frame(true);
+        let center = network_rect(SCREEN).center();
+        let lit = lit_pixels(&canvas, 40);
+        assert!(
+            lit.len() > 40,
+            "иконка сети не нарисована, пикселей {}",
+            lit.len()
+        );
+
+        // Готовый глиф Plug Connected 20×20: альфа занимает 2..=17, то есть
+        // ±8 от центра. Wi-Fi-дуги старого образца поднимались на ~14 px выше
+        // центра и расходились до ±15 — такие пиксели здесь были бы багом.
+        let (mut min_x, mut max_x) = (i32::MAX, i32::MIN);
+        let (mut min_y, mut max_y) = (i32::MAX, i32::MIN);
+        for &(x, y) in &lit {
+            min_x = min_x.min(x - center.x);
+            max_x = max_x.max(x - center.x);
+            min_y = min_y.min(y - center.y);
+            max_y = max_y.max(y - center.y);
+        }
+        assert!(
+            min_x >= -11 && max_x <= 11,
+            "иконка шире проводной формы: x [{min_x}, {max_x}] (дуги давали ±15)"
+        );
+        assert!(
+            min_y >= -10 && max_y <= 10,
+            "иконка выше проводной формы: y [{min_y}, {max_y}] (дуги давали -14)"
+        );
+
+        // Глиф реально закрашен, а не пустая рамка: вокруг центра есть пиксели.
+        let near_center = lit
+            .iter()
+            .filter(|(x, y)| (x - center.x).abs() <= 4 && (y - center.y).abs() <= 4)
+            .count();
+        assert!(
+            near_center >= 2,
+            "у центра иконки сети нет закрашенных пикселей: {near_center}"
+        );
+    }
+
+    /// Пиксель глифа с максимальной альфой вне диагонали «нет сети».
+    ///
+    /// Диагональ идёт через центр, поэтому для проверки тинта берётся
+    /// непрозрачный пиксель подальше от неё (иначе `button_close` перекрывает
+    /// цвет иконки).
+    fn opaque_off_diagonal() -> (i32, i32, u8) {
+        let raster = crate::icons::raster(Icon::NetworkWired, 20).expect("ассет иконки");
+        let mut best = (0i32, 0i32, 0u8);
+        for y in 0..raster.height as i32 {
+            for x in 0..raster.width as i32 {
+                let alpha = raster.alpha(x as u32, y as u32);
+                let diagonal = (x + y - raster.width as i32).abs();
+                if alpha > best.2 && diagonal >= 4 {
+                    best = (x, y, alpha);
+                }
+            }
+        }
+        assert!(best.2 > 200, "не нашлось непрозрачного пикселя глифа");
+        best
+    }
+
+    #[test]
+    fn network_icon_dims_and_strikes_when_offline() {
+        let theme = Theme::default();
+        let online = panel_frame(true);
+        let offline = panel_frame(false);
+        let center = network_rect(SCREEN).center();
+
+        // Один и тот же глиф: в онлайне — обычный цвет, в офлайне — dim.
+        // Пиксель с максимальной альфой даёт предсказуемый результат blend.
+        let (source_x, source_y, alpha) = opaque_off_diagonal();
+        let point = Point::new(center.x - 10 + source_x, center.y - 10 + source_y);
+        let expected = |frame: &Canvas, tint: crate::color::Color| {
+            let background = frame.get(500, point.y);
+            crate::color::blend(
+                background,
+                crate::color::rgba(
+                    crate::color::red(tint),
+                    crate::color::green(tint),
+                    crate::color::blue(tint),
+                    alpha,
+                ),
+                255,
+            )
+        };
+        assert_eq!(
+            online.get(point.x, point.y),
+            expected(&online, theme.panel_icon),
+            "онлайн-иконка должна быть цветом panel_icon"
+        );
+        assert_eq!(
+            offline.get(point.x, point.y),
+            expected(&offline, theme.panel_icon_dim),
+            "офлайн-иконка должна быть цветом panel_icon_dim"
+        );
+        assert!(
+            lit_pixels(&offline, 20).len() > 40,
+            "в офлайне иконка должна оставаться видимой"
+        );
+
+        // Диагональ «нет сети» — единственное, что красится `button_close`.
+        let struck = offline
+            .pixels()
+            .iter()
+            .filter(|p| **p == theme.button_close)
+            .count();
+        assert!(struck > 0, "в отключённом состоянии нет диагонали");
+        // ...и её нет в онлайне.
+        let struck_online = online
+            .pixels()
+            .iter()
+            .filter(|p| **p == theme.button_close)
+            .count();
+        assert_eq!(struck_online, 0, "в онлайне диагонали быть не должно");
+
+        // Центр блока — прозрачная середина глифа, не заливка.
+        assert_ne!(
+            online.get(center.x, center.y),
+            theme.panel_icon,
+            "центр иконки не должен быть сплошной заливкой"
         );
     }
 }
