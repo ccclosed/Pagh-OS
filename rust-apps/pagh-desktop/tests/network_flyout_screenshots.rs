@@ -14,7 +14,9 @@ fn open_network_flyout(compositor: &mut Compositor) -> Rect {
     compositor.pointer_motion(center);
     compositor.pointer_button(MouseButton::Left, true);
     compositor.pointer_button(MouseButton::Left, false);
-    let flyout = compositor.flyout().expect("клик по иконке сети открывает флайаут");
+    let flyout = compositor
+        .flyout()
+        .expect("клик по иконке сети открывает флайаут");
     assert_eq!(flyout.kind, pagh_desktop::compositor::FlyoutKind::Network);
     flyout.rect
 }
@@ -61,6 +63,14 @@ fn network_flyout_online_offline_render() {
     png::write_png(dir.join("flyout-online.png"), compositor.frame()).expect("PNG online");
     let online = compositor.frame().snapshot();
 
+    // Карточка подключения — подложка `chip_bg` (348×56 за вычетом иконки/текста).
+    let card_pixels = count_color(&compositor, rect, compositor.theme().chip_bg);
+    assert!(
+        card_pixels > 10_000,
+        "карточка подключения не нарисована: {card_pixels}"
+    );
+    let online_text = count_color(&compositor, rect, compositor.theme().menu_text);
+
     // «Подключено» — акцентная строка статуса; фейковых элементов быть не должно,
     // но акцент обязан присутствовать, иначе статус не отрисован.
     let accent_pixels = count_color(&compositor, rect, compositor.theme().accent);
@@ -76,6 +86,11 @@ fn network_flyout_online_offline_render() {
 
     let offline_accent = count_color(&compositor, rect, compositor.theme().accent);
     assert_eq!(offline_accent, 0, "в отключённом состоянии акцент не нужен");
+    let offline_text = count_color(&compositor, rect, compositor.theme().menu_text);
+    assert!(
+        offline_text < online_text,
+        "отключение должно приглушать подпись: {online_text} -> {offline_text}"
+    );
     assert!(
         diff(&online, &offline) > 40,
         "состояния online/offline визуально не различаются"
@@ -88,5 +103,9 @@ fn network_flyout_online_offline_render() {
             colors.insert(compositor.frame().get(x, y));
         }
     }
-    assert!(colors.len() >= 4, "флайаут почти одноцветный: {}", colors.len());
+    assert!(
+        colors.len() >= 4,
+        "флайаут почти одноцветный: {}",
+        colors.len()
+    );
 }
