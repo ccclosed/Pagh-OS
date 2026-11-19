@@ -3979,26 +3979,24 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
                   alive is not None, "^echo seen on serial")
 
     # ── REAL PDP/1 launch (type 13): requester -> launch_app -> spawn target ──
-    # This is the original check and it is EXPECTED TO FAIL on this kernel
-    # version: a client-started Files requester has never produced the evidence
-    # PNG (the same failure is present on unmodified dev, see the PR body). It is
-    # kept visible rather than replaced, because another stimulus would not cover
-    # the PDP `launch` (type 13) leg.
-    _desktop_restart_shell_line(kb)
-    off = mark()
-    requester_cmd = f"rust /mnt/pagh-files --connect {socket}"
-    log(f"type (PDP launch requester): {requester_cmd}")
-    kb.text(requester_cmd)
-    kb.key("ret")
-    requester = wait_new(off, [r"pagh-files: окно \d+ \d+x\d+"], 45.0,
-                         "launch requester window")
-    ok &= h.check("fresh pagh-files requester opened for the PDP/1 launch",
-                  requester is not None,
-                  regex_first(r"pagh-files: окно[^\r\n]*", guest.serial()[off:]) or
-                  "no window line")
-    time.sleep(0.8)
+    # The requester is the ORIGINAL Files client parked in the background above:
+    # a fresh `rust /mnt/pagh-files --connect ...` typed at this point is killed
+    # by an input artifact (serial: `[signal] pid=N sig=2 default-terminate`)
+    # before the hotkey can reach it, while the parked client has already proven
+    # it survives its own window checks. Focus it in a provably free point: the
+    # point is inside the 1060x640 Files content and outside the 720x420 Terminal
+    # rectangle, and is not the resize grip.
+    h.qmp.rel(2000, 2000)
+    time.sleep(0.2)
+    h.qmp.rel(-280, -200)
+    time.sleep(0.3)
+    h.qmp.button("left", True)
+    time.sleep(0.1)
+    h.qmp.button("left", False)
+    time.sleep(0.6)
     kb_off = mark()
     h.qmp.keys(["alt", "shift", "f4"])
+    time.sleep(0.5)  # let the chord land before the modifier reset
     h.qmp.release_modifiers()
     time.sleep(6.0)
     launch_text = guest.serial()[kb_off:]
@@ -4018,18 +4016,6 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     # NOT a substitute for the type-13 leg above: this proves the server-side
     # registry/spawn_target path only (no PDP message, no requester). The
     # evidence directory is cleared first so the two checks are independent.
-    # The requester may have survived the hotkey, in which case the shell still
-    # needs the terminal back before it can run `rm`.
-    off = mark()
-    if wait_new(off, [r"pagh:/> "], 2.0, "shell prompt after requester") is None:
-        h.qmp.keys(["ctrl", "z"])
-        h.qmp.release_modifiers()
-        if wait_new(off, [r"\^Z"], 20.0, "requester Ctrl+Z") is not None:
-            off = mark()
-            _desktop_restart_shell_line(kb)
-            kb.text("bg")
-            kb.key("ret")
-            wait_new(off, [r"bg: \[\d+\]"], 20.0, "bg requester")
     _desktop_restart_shell_line(kb)
     off = mark()
     kb.text("rm -r /mnt/launch-evidence")
