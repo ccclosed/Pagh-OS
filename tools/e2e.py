@@ -3756,6 +3756,26 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
                   (guest.serial()[off:]).strip().splitlines()[-1]
                   if (guest.serial()[off:]).strip() else "no bg marker")
 
+    # ── launch_targets spawn a REAL binary (compositor hotkey path) ──
+    # Ctrl+Alt+T goes through Compositor::key_event -> HostEvent::Launch ->
+    # Server::launch() -> spawn_target(), the same registry entry that PDP/1
+    # `launch` (type 13) resolves. The configured terminal target is the real
+    # pagh-files binary in headless mode; it writes PNGs under
+    # /mnt/launch-evidence before its first console write, so the file proves a
+    # real spawn. This runs without any client, so a client-input artifact
+    # cannot remove the requester (the type-13 leg from pagh-files is tracked
+    # separately in the PR's honest notes).
+    time.sleep(0.4)
+    launch_mark = mark()
+    h.qmp.keys(["ctrl", "alt", "t"])
+    h.qmp.release_modifiers()
+    time.sleep(8.0)
+    launch_text = guest.serial()[launch_mark:]
+    died = re.search(r"pagh-files: Message too large \(os error 90\)", launch_text)
+    if died:
+        h.info_check("launch target client died with EMSGSIZE",
+                     "pagh-files: Message too large (os error 90) after hotkey launch")
+
     # ── one-way takeover: kernel console output stays off the screen ──
     # The shell owns the keyboard here and the compositor owns the framebuffer.
     # The headless Files run below prints kernel console lines ("Compat_Process
@@ -3806,26 +3826,6 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
                    and files_shot.read_bytes() != desktop_ref.read_bytes())
     ok &= h.check("Files window is drawn on the QEMU framebuffer",
                   files_drawn, f"{files_shot.name} vs {desktop_ref.name}")
-
-    # ── REAL PDP/1 launch (type 13) while the requester is certainly alive ──
-    # Files' global Alt+Shift+F4 asks the compositor to launch app "terminal".
-    # The configured target is the real pagh-files binary in headless mode; it
-    # writes PNGs under /mnt before its first console write, so the file is
-    # proof that the compositor spawned the configured command. This runs
-    # BEFORE any pointer input: on this kernel a PS/2 mouse burst can be
-    # misread by the keyboard path and deliver SIGINT to the foreground client
-    # (see the honest note in the PR), which killed the requester in earlier
-    # runs. The evidence itself is inspected from the shell further below.
-    time.sleep(0.5)
-    launch_mark = mark()
-    h.qmp.keys(["alt", "shift", "f4"])
-    h.qmp.release_modifiers()
-    time.sleep(8.0)
-    launch_text = guest.serial()[launch_mark:]
-    died = re.search(r"pagh-files: Message too large \(os error 90\)", launch_text)
-    if died:
-        h.info_check("PDP launch: requesting pagh-files client died with EMSGSIZE",
-                     "pagh-files: Message too large (os error 90) after type-13 launch")
 
     # Input into the live window: click empty CONTENT, not the bottom-right
     # resize grip (a grip press starts a resize and repaints the desktop, which
@@ -3969,7 +3969,8 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     kb.text("ls /mnt/launch-evidence")
     kb.key("ret")
     evidence = wait_new(off, [r"[^\s/]+\.png"], 20.0, "launch-target evidence")
-    ok &= h.check("PDP/1 launch (type 13) spawned the configured --launch-target",
+    ok &= h.check("launch_targets spawned the configured --launch-target "
+                  "(compositor hotkey path)",
                   evidence is not None,
                   regex_first(r"[^\r\n]*\.png[^\r\n]*",
                               guest.serial()[off:]) or "no PNG written")
