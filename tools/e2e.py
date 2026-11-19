@@ -3799,14 +3799,21 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
                   survives, f"{files_clicked.name}")
 
     # ── one-way takeover: console output stays off the screen ──
-    kb.screenshot(console_a)
     off = mark()
     kb.text("echo E2E_ALIVE_TAKEOVER")
     kb.key("ret")
     alive = wait_new(off, [r"E2E_ALIVE_TAKEOVER"], 20.0, "shell echo under takeover")
     ok &= h.check("serial shell alive while the compositor owns the screen",
                   alive is not None, "^echo seen on serial")
-    time.sleep(0.3)
+    # Baseline AFTER the echo is entered: typing a command line takes seconds
+    # under TCG, and a client may legitimately commit frames meanwhile, so a
+    # pre-typing frame compared with a post-typing one differs for desktop
+    # reasons, not because the kernel console repainted. The property under test
+    # is that two frames of the SETTLED desktop are identical: a kernel console
+    # flush would replace the whole screen with text between them.
+    time.sleep(0.4)
+    kb.screenshot(console_a)
+    time.sleep(0.4)
     kb.screenshot(console_b)
     frozen = (console_a.is_file() and console_b.is_file()
               and console_a.read_bytes() == console_b.read_bytes())
