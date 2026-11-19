@@ -117,6 +117,9 @@ pub fn start() -> ! {
     step_begin(visible, "init_heap");
     init_heap();
     step(visible, "heap");
+    step_begin(visible, "premap_kernel_stacks");
+    memory::vmm::premap_kernel_stack_tables();
+    step(visible, "stacks");
     step_begin(visible, "init_apic");
     init_apic();
     step(visible, "apic");
