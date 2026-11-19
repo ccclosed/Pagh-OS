@@ -135,20 +135,30 @@ pub struct ServerOptions {
     /// Всегда презентовать полный кадр (QEMU screendump обновляет поверхность
     /// надёжнее; в headless/damage-тестах остаётся частичная отрисовка).
     pub full_render: bool,
-    /// Создать одно демонстрационное окно без AF_UNIX-клиента (fbdev e2e).
+    /// Создать одно демонстрационное окно без AF_UNIX-клиента.
+    ///
+    /// ТОЛЬКО ТЕСТЫ (`--demo-window`, `--e2e`): окно рисует
+    /// `demo::terminal_surface`, то есть фейковый терминал с demo-текстом.
+    /// Обычный образ этот флаг не передаёт — там окна создают реальные
+    /// клиенты (`pagh-files`/`pagh-terminal`) через PDP/1.
     pub demo_window: bool,
     /// Источник сетевых данных (этап U): реальные `/proc/net/dev` + `SIOCGIF*`.
     pub net: NetChoice,
     /// Не печатать диагностику подключений.
     pub quiet: bool,
     /// Запускать `pagh-desktop-demo` по запросам панели/меню.
+    ///
+    /// ТОЛЬКО ТЕСТЫ (`tools/e2e.py desktop --legacy-demo`): в обычном образе
+    /// приложения обязаны приходить из `launch_targets` (`desktop-autorun`).
     pub spawn_demo: bool,
     /// Явный путь к демо-клиенту (иначе ищется рядом с сервером).
     pub demo_binary: Option<PathBuf>,
     /// Приложения, которые сервер умеет запускать по `launch` (type 13).
     ///
-    /// Если цели нет, но `spawn_demo` включён и `app` — известный
-    /// `AppKind::id()`, сервер запускает демо-клиент.
+    /// Это единственный путь обычного образа (см. `desktop-autorun`). Если
+    /// цели нет и `spawn_demo` выключен, сервер сообщает «приложение не
+    /// настроено» (лог/`ERR_UNSUPPORTED`); включённый `spawn_demo` (тесты)
+    /// запускает демо-клиент для известного `AppKind::id()`.
     pub launch_targets: Vec<LaunchTarget>,
     /// Печатать строку `frame-stats` каждые N presented-кадров (0 — выключено).
     ///
@@ -551,6 +561,19 @@ fn open_input(options: &ServerOptions, backend: BackendKind) -> io::Result<Optio
             Ok(None)
         }
     }
+}
+
+/// Диагностика «приложение не настроено» для обычного (не тестового) пути.
+///
+/// Вынесена в функцию, чтобы панель/меню и PDP `launch` (type 13) говорили
+/// одно и то же: подсказывают `--launch-target`, а не предлагают включить
+/// demo-клиент. Тестовый фолбэк `--spawn-demo` этот текст не использует.
+fn unconfigured_launch_message(app: &str) -> String {
+    format!(
+        "pagh-desktop: launch {app}: приложение не настроено — задайте \
+         --launch-target {app}=<программа>|<аргументы> (демо-клиент доступен \
+         только с --spawn-demo)"
+    )
 }
 
 impl Server {
@@ -1617,9 +1640,11 @@ impl Server {
     ///
     /// Сначала ищется цель `launch_targets` по `AppKind::id()` — панель/меню
     /// обязаны открывать тот же бинарник, что и клиентский PDP `launch`
-    /// (type 13); иначе MVP-образ поднимал бы демо-клиент вместо реального
-    /// приложения. Цели нет — прежний фолбэк: демо-клиент (`spawn_demo`) или
-    /// диагностика в stderr (сервер продолжает работать).
+    /// (type 13). Обычный образ задаёт цели в `/mnt/etc/autorun`
+    /// (`desktop-autorun`), поэтому демо-клиент — не «тихий фолбэк»: без
+    /// `--spawn-demo` нечем запускать, и это честно пишется в лог, а не
+    /// выглядит как молчащее действие. `--spawn-demo` остаётся ровно для
+    /// тестов (`tools/e2e.py desktop --legacy-demo`) и работает как раньше.
     fn launch(&mut self, app: AppKind) {
         if let Some(target) = self
             .options
@@ -1633,6 +1658,12 @@ impl Server {
                 if !self.options.quiet {
                     eprintln!("pagh-desktop: launch {}: {error}", app.id());
                 }
+            }
+            return;
+        }
+        if !self.options.spawn_demo {
+            if !self.options.quiet {
+                eprintln!("{}", unconfigured_launch_message(app.id()));
             }
             return;
         }
@@ -1708,8 +1739,11 @@ impl Server {
 
     /// Обработать `launch` (type 13): запустить приложение по идентификатору.
     ///
-    /// Сначала ищется явная цель `ServerOptions.launch_targets`; иначе, если
-    /// включён `spawn_demo`, известный `AppKind` запускается демо-клиентом.
+    /// Сначала ищется явная цель `ServerOptions.launch_targets`. Цели нет: без
+    /// `--spawn-demo` клиенту возвращается `ERR_UNSUPPORTED` с подсказкой о
+    /// `--launch-target` (обычный образ не должен «молча» ничего не делать);
+    /// с `--spawn-demo` известный `AppKind` запускается демо-клиентом, как в
+    /// тестах.
     fn launch_app(&mut self, app: &str, cwd: &str, conn: u64) {
         if app.is_empty() || app.len() > 64 {
             self.reply_error(conn, ERR_UNSUPPORTED, "пустой или слишком длинный app id");
@@ -1736,6 +1770,12 @@ impl Server {
             return;
         }
         match AppKind::from_id(app) {
+            // Без --spawn-demo демо-клиента нет: это обычный образ, где
+            // приложение обязано быть в --launch-target. Клиент получает
+            // внятную причину, а не «spawn_demo выключен».
+            Some(_) if !self.options.spawn_demo => {
+                self.reply_error(conn, ERR_UNSUPPORTED, unconfigured_launch_message(app));
+            }
             Some(kind) => match self.spawn_demo(kind) {
                 Ok(()) => {}
                 Err(error) => {
@@ -2176,6 +2216,69 @@ mod tests {
         assert_eq!(window.content_size.w, 640);
         let _ = server.compositor.render_full();
         assert!(server.compositor.frame().get(100, 100) != 0);
+    }
+
+    /// Без `--demo-window` сервер не рисует встроенное demo-окно: обычный
+    /// образ получает первое окно только от реального клиента.
+    #[test]
+    fn demo_window_is_not_created_without_the_flag() {
+        let mut server = Server::bind(headless_options("no-demo-window")).unwrap();
+        server.ensure_demo_window();
+        assert!(
+            server.compositor.windows().is_empty(),
+            "demo-окно появилось без --demo-window"
+        );
+    }
+
+    /// Рецепт обычного образа (`desktop-autorun` -> `/mnt/etc/autorun`) обязан
+    /// задавать РЕАЛЬНЫЕ цели и не содержать demo-флагов: иначе первый экран
+    /// снова окажется фейковым терминалом `pagh-desktop-demo`. Тест держит
+    /// файл-рецепт и параметры запуска в согласии.
+    #[test]
+    fn ordinary_autorun_recipe_uses_real_targets_only() {
+        let recipe = include_str!("../desktop-autorun");
+        // Kernel `run_autorun` исполняет непустые строки и пропускает `#`:
+        // запрет demo-флагов проверяется по исполняемым строкам, а лимит — по
+        // всему файлу, потому что ядро читает его целиком (512 байт).
+        let active: String = recipe
+            .lines()
+            .filter(|line| {
+                let line = line.trim();
+                !line.is_empty() && !line.starts_with('#')
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in [
+            "--launch-target files=",
+            "--launch-target terminal=",
+            "--autostart files",
+        ] {
+            assert!(active.contains(needle), "в рецепте нет {needle:?}: {active}");
+        }
+        for banned in ["--spawn-demo", "--demo-window", "--demo-binary"] {
+            assert!(
+                !active.contains(banned),
+                "demo-флаг {banned:?} в обычном рецепте: {active}"
+            );
+        }
+        assert!(
+            recipe.len() <= 512,
+            "рецепт {} байт: kernel autorun читает только 512",
+            recipe.len()
+        );
+    }
+
+    /// Диагностика обычного пути называет приложение и подсказывает
+    /// `--launch-target`; demo-клиент не предлагается.
+    #[test]
+    fn unconfigured_launch_message_points_at_launch_target() {
+        let message = unconfigured_launch_message("terminal");
+        assert!(message.contains("terminal"), "{message}");
+        assert!(message.contains("--launch-target terminal="), "{message}");
+        assert!(
+            !message.contains("spawn_demo выключен"),
+            "старая внутренняя причина вместо подсказки: {message}"
+        );
     }
 
     #[test]
