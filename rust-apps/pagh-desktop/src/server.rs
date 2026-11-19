@@ -802,7 +802,12 @@ impl Server {
             }
             if let Some(due) = self.exit_due {
                 if Instant::now() >= due {
-                    println!("pagh-desktop: exit-after-ms reached");
+                    // Тот же TOSTOP-контракт, что и у per-client диагностики:
+                    // фоновый `--quiet` композитор не пишет в управляющий
+                    // терминал, иначе SIGTTOU паркует его вместо выхода.
+                    if !self.options.quiet {
+                        println!("pagh-desktop: exit-after-ms reached");
+                    }
                     break;
                 }
             }

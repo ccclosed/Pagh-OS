@@ -3117,8 +3117,9 @@ def mode_desktop(h: "Harness") -> tuple[str, int]:
     * its global Alt+Shift+F4 sent PDP/1 ``launch`` (type 13) and the compositor
       spawned the configured ``--launch-target`` — the real pagh-files binary in
       headless mode, whose PNG under /mnt is the evidence;
-    * pagh-terminal connected as a second window, reading ``/dev/vtconsole0``
-      and writing ``/dev/vtinput``, and keeps committing frames (cursor blink);
+    * pagh-terminal connected as a second window (the #138 private shell
+      session; the ``--vt``/``--vt-input`` VT mirror stays as the fallback) and
+      keeps committing frames (cursor blink);
     * the serial shell survives all of it, the kernel console stays suspended
       (fbdev takeover), and no panic/exception/ENOSYS appears.
 
@@ -3806,12 +3807,14 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
 
     # ── REAL pagh-terminal as the second window ──
     _desktop_restart_shell_line(kb)
+    # `--socket` selects the private shell session of #138 (the `--vt` pair is
+    # still passed and is used by the VT-mirror fallback below).
     term_cmd = (f"rust /mnt/pagh-terminal --vt /dev/vtconsole0 "
                 f"--vt-input /dev/vtinput --socket {socket} --size 720x420")
     log(f"type: {term_cmd}")
     kb.text(term_cmd)
     kb.key("ret")
-    term_win = wait_for(guest, [r"pagh-terminal: connected \(client \d+"], 45.0,
+    term_win = wait_for(guest, [r"pagh-terminal: (?:session )?connected \(client \d+"], 45.0,
                         label="Terminal window")
     ok &= h.check("REAL pagh-terminal connected as a second PDP/1 window "
                   "(/dev/vtconsole0 + /dev/vtinput)",
@@ -3831,7 +3834,7 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
         log(f"type (VT fallback, window-only): {retry_cmd}")
         kb.text(retry_cmd)
         kb.key("ret")
-        term_win = wait_for(guest, [r"pagh-terminal: connected \(client \d+"], 45.0,
+        term_win = wait_for(guest, [r"pagh-terminal: (?:session )?connected \(client \d+"], 45.0,
                             label="Terminal window (window-only)")
         ok &= h.check("second window still proven on the PDP surface (VT fallback)",
                       term_win is not None,
@@ -4224,10 +4227,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "--spawn-demo) instead of the REAL pagh-files/pagh-terminal "
                          "windows; the demo client is a test-only fallback and is "
                          "injected into the disk for this mode alone")
-    dp.add_argument("--pd-lifetime-ms", type=int, default=300_000,
+    dp.add_argument("--pd-lifetime-ms", type=int, default=1_800_000,
                     help="compositor lifetime in the real-apps path passed as "
-                         "--exit-after-ms (default 300000; the scenario is bounded by the "
-                         "harness teardown, the deadline only guards a hang)")
+                         "--exit-after-ms (default 1800000; the scenario is bounded by the "
+                         "harness teardown, the deadline only guards a hang — the QEMU/TCG "
+                         "run of phase 2 has been observed above 1500 s)")
     dp.add_argument("--serial-start-timeout", type=float, default=25.0,
                     help="fail-fast window for the first serial bytes/kernel banner after "
                          "each boot; separates firmware-not-started from kernel-silent "
