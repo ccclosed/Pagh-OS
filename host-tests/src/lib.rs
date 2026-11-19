@@ -322,6 +322,14 @@ pub mod ca_bundle;
 #[path = "../../src/net/tls_auth.rs"]
 pub mod tls_auth;
 
+// `netstats` — счётчики канала (`/proc/net/dev`, `SIOCGIF*`): байты и пакеты
+// RX/TX. `core`-only (атомики) и самодостаточный, поэтому host-свойство
+// `net_counters` исполняет ровно тот исходник, что компилирует ядро, и
+// проверяет и арифметику, и межпоточный инкремент (в QEMU это ловится только
+// вероятностно).
+#[path = "../../src/net/netstats.rs"]
+pub mod netstats;
+
 // `seed` is the pure `AT_RANDOM` fallback mixer (issue #16): a SHA-256
 // transcript over independent boot-time sources plus a counter-based derivation.
 // `core` + `sha2` only (no I/O, no globals), so P51 exercises the exact source
@@ -549,6 +557,10 @@ mod properties {
     mod p47;
     mod p48;
     mod p49;
+    // Канальные счётчики (`src/net/netstats.rs`): нулевой старт, точная
+    // арифметика байтов/пакетов, нулевая длина не считается, монотонность,
+    // отсутствие потерь при параллельном инкременте из нескольких потоков.
+    mod net_counters;
     // procfs (issue #11, contract `docs/procfs.md` §7): meminfo columns + the
     // libuv `strstr`/`sscanf` substrings; cpuinfo block/`\t: ` separators and the
     // truthfulness of the `flags` line against the CPUID bits; uptime arithmetic

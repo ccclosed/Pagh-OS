@@ -12,6 +12,7 @@
 
 use crate::drivers::e1000;
 use crate::drivers::usb_rndis;
+use crate::net::netstats::{self, LinkCounters};
 use crate::sync::spinlock::Spinlock;
 
 /// Какой драйвер обслуживает Ethernet.
@@ -32,19 +33,51 @@ impl Link {
     }
 
     /// Отправить один Ethernet-кадр; 0 — канал не принял кадр.
+    ///
+    /// Учёт байтов/пакетов — здесь, а не в драйвере: это единственная воронка
+    /// TX для `arp`/`ip`/`tcp`, и оба драйвера считаются одинаково. Нулевой
+    /// ответ драйвера не считается переданным кадром.
     pub fn send(self, frame: &[u8]) -> usize {
-        match self {
+        let sent = match self {
             Link::E1000 => e1000::send(frame),
             Link::UsbRndis => usb_rndis::send(frame),
-        }
+        };
+        netstats::LINK.record_tx(sent);
+        sent
     }
 
     /// Забрать один принятый кадр; `None` — очередь пуста.
+    ///
+    /// Счётчик RX учитывает только реально отданный стеком кадр: пустая
+    /// очередь — это не потеря, а отсутствие события.
     pub fn recv(self, dst: &mut [u8]) -> Option<usize> {
-        match self {
+        let got = match self {
             Link::E1000 => e1000::recv(dst),
             Link::UsbRndis => usb_rndis::recv(dst),
+        };
+        if let Some(n) = got {
+            netstats::LINK.record_rx(n);
         }
+        got
+    }
+}
+
+/// Снимок счётчиков канала (байты/пакеты RX и TX) для `/proc/net/dev` и ioctl.
+pub fn counters() -> LinkCounters {
+    netstats::LINK.snapshot()
+}
+
+/// Состояние линка активного канала: `STATUS.LU` у e1000, готовность RNDIS.
+///
+/// `false`, когда канал ещё не выбран. Копия `Option<Link>` снимается до
+/// обращения к драйверу, поэтому лок `ACTIVE` не вложен в драйверский —
+/// тот же порядок, что у [`send`]/[`recv`].
+pub fn running() -> bool {
+    let link = *ACTIVE.lock();
+    match link {
+        Some(Link::E1000) => e1000::link_up(),
+        Some(Link::UsbRndis) => usb_rndis::is_ready(),
+        None => false,
     }
 }
 
