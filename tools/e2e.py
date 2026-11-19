@@ -3812,8 +3812,15 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
                   survives, f"{files_clicked.name}")
 
     # ── one-way takeover: console output stays off the screen ──
+    # TYPE NO 'c' HERE: the real Files client owns the keyboard while this line
+    # is entered, and a Ctrl modifier left set by an earlier QMP chord turns a
+    # typed `c` into ^C, which the kernel delivers as SIGINT to the foreground
+    # group — that killed the Files window in earlier runs (`sig=2
+    # tick-delivered`). `ls` of a marker path proves the same property (the
+    # shell processed a command while the compositor owned the screen) without
+    # spelling the one letter an accidental ^C can form.
     off = mark()
-    kb.text("echo E2E_ALIVE_TAKEOVER")
+    kb.text("ls /mnt/E2E_ALIVE_TAKEOVER")
     kb.key("ret")
     alive = wait_new(off, [r"E2E_ALIVE_TAKEOVER"], 20.0, "shell echo under takeover")
     ok &= h.check("serial shell alive while the compositor owns the screen",
@@ -3887,24 +3894,23 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
                   second, f"{term_a.name} vs {files_clicked.name}")
     # Cursor blink repaints every 500 ms: two dumps must differ if the client
     # really keeps committing frames (window alive, not a stale compositor blit).
-    # Three samples, not one pair: the cursor toggles every 500 ms, but a pair
-    # of QEMU screendumps can land in the same phase (screendump timing under
-    # TCG is not frame-synchronised). Any difference between ANY two samples
-    # proves the client still commits; requiring every pair to differ would
-    # fail on sampling, not on the property.
-    frames = [term_a]
-    for _ in range(2):
-        time.sleep(1.2)
-        extra = CACHE / f"e2e_desktop_terminal_blink{len(frames)}.png"
-        kb.screenshot(extra)
-        frames.append(extra)
-    blinking = any(
-        frames[i].is_file() and frames[j].is_file()
-        and frames[i].read_bytes() != frames[j].read_bytes()
-        for i in range(len(frames)) for j in range(i + 1, len(frames))
-    )
-    ok &= h.check("Terminal window keeps committing frames (cursor blink)",
-                  blinking, ", ".join(f.name for f in frames) + f" differs={blinking}")
+    # Liveness by a deterministic input, not by an idle cursor-blink
+    # assumption: three frames 2.4 s apart were byte-identical on this kernel
+    # (the client's session readers park in `read`, so an idle blink does not
+    # guarantee a commit), while the earlier "blink" pass came from the client's
+    # initial content frame rather than a blink. Type a command into the focused
+    # session and require the client to commit a different frame: that is the
+    # property this check exists for (window alive, not a stale compositor blit)
+    # and it cannot pass on a static frame.
+    h.qmp.release_modifiers()
+    kb.text("ls")
+    kb.key("ret")
+    time.sleep(1.2)
+    kb.screenshot(term_b)
+    blinking = (term_a.is_file() and term_b.is_file()
+                and term_a.read_bytes() != term_b.read_bytes())
+    ok &= h.check("Terminal window commits new frames after input (client alive)",
+                  blinking, f"{term_b.name} differs={blinking}")
 
     # ── stop the terminal, prove the shell still works, then check crashes ──
     off = mark()
