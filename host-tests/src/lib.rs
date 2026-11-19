@@ -561,6 +561,10 @@ mod properties {
     // арифметика байтов/пакетов, нулевая длина не считается, монотонность,
     // отсутствие потерь при параллельном инкременте из нескольких потоков.
     mod net_counters;
+    // `/proc/net/dev` (этап K1, контракт `docs/procfs.md` §15): две шапки
+    // дословно как в Linux, строка `%6s:` + 16 колонок в фиксированном порядке,
+    // нули в не ведущихся колонках, u64 без обрезки.
+    mod net_dev;
     // procfs (issue #11, contract `docs/procfs.md` §7): meminfo columns + the
     // libuv `strstr`/`sscanf` substrings; cpuinfo block/`\t: ` separators and the
     // truthfulness of the `flags` line against the CPUID bits; uptime arithmetic

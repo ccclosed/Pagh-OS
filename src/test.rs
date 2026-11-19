@@ -1943,6 +1943,7 @@ mod procfs_tests {
                 String::from("filesystems"),
                 String::from("loadavg"),
                 String::from("mounts"),
+                String::from("net"),
             ],
             "procfs: /proc readdir order"
         );
@@ -1961,6 +1962,7 @@ mod procfs_tests {
             "filesystems",
             "loadavg",
             "mounts",
+            "net",
         ] {
             let node = match proc_dir.lookup(name) {
                 Ok(n) => n,
@@ -1983,6 +1985,89 @@ mod procfs_tests {
                 .unwrap_or(0),
             "procfs: /proc/meminfo reports its table inode"
         );
+
+        // ── /proc/net/dev: шапки дословно + живая строка eth0 ───────────────
+        //
+        // Контракт docs/procfs.md §15: две Linux-шапки и по строке на
+        // интерфейс с 16 числовыми полями. Канала может не быть (QEMU без
+        // NIC и без xHCI) — тогда честны только шапки, и это SKIP, не FAIL.
+        let net_node = match vfs::lookup_path("/proc/net") {
+            Ok(n) => n,
+            Err(_) => {
+                assert_kernel!(false, "procfs: lookup_path(/proc/net) failed");
+                return;
+            }
+        };
+        assert_kernel!(net_node.is_directory(), "procfs: /proc/net is a directory");
+        assert_eq_kernel!(
+            names(&net_node),
+            alloc::vec![String::from("dev")],
+            "procfs: /proc/net children"
+        );
+        assert_kernel!(
+            net_node.lookup("nope").is_err(),
+            "procfs: unknown /proc/net child is ENOENT"
+        );
+        let net_dev = read_path("/proc/net/dev");
+        let net_dev_text = core::str::from_utf8(&net_dev).unwrap_or("");
+        assert_kernel!(
+            net_dev_text.starts_with(
+                "Inter-|   Receive                                                |  Transmit\n"
+            ),
+            "procfs: /proc/net/dev first header is the Linux text"
+        );
+        let mut net_lines = net_dev_text.lines();
+        let _header1 = net_lines.next();
+        assert_eq_kernel!(
+            net_lines.next(),
+            Some(
+                " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed"
+            ),
+            "procfs: /proc/net/dev second header is the Linux text"
+        );
+        match crate::net::iface_stats() {
+            Some(stats) => {
+                let row = net_lines.next().unwrap_or("");
+                // Имя печатается шириной 6, как `%6s` в Linux; префикс строим
+                // из имени канала, а не из литерала eth0.
+                let prefix = alloc::format!("{:>6}:", stats.name);
+                let rest = row.strip_prefix(prefix.as_str()).unwrap_or("");
+                assert_kernel!(
+                    !rest.is_empty(),
+                    "procfs: /proc/net/dev has an eth0 row when the channel exists"
+                );
+                let fields: Vec<u64> = rest
+                    .split_whitespace()
+                    .filter_map(|f| f.parse::<u64>().ok())
+                    .collect();
+                assert_eq_kernel!(
+                    fields.len(),
+                    16,
+                    "procfs: /proc/net/dev row has 16 numeric fields"
+                );
+                assert_kernel!(
+                    net_lines.next().is_none(),
+                    "procfs: exactly one interface row (single channel)"
+                );
+                // Имя интерфейса — то же, что отдаёт net, а не литерал procfs.
+                assert_eq_kernel!(
+                    stats.name,
+                    crate::net::iface_name().unwrap_or(""),
+                    "procfs: /proc/net/dev and iface_name agree"
+                );
+                crate::kprintln!("NETDATA iface={} row={}", stats.name, row);
+            }
+            None => {
+                assert_kernel!(
+                    net_lines.next().is_none(),
+                    "procfs: /proc/net/dev has no rows without a channel"
+                );
+                crate::skip_kernel!(
+                    "netdata",
+                    "/proc/net/dev: no network channel in this boot (headers only)"
+                );
+            }
+        }
 
         // ── /proc/cpuinfo ────────────────────────────────────────────────────
         let cpuinfo = read_path("/proc/cpuinfo");

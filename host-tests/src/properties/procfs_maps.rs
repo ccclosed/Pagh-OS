@@ -18,8 +18,8 @@ use crate::procfs_format::{
     dev_bytes, format_maps, parse_pid_component, pid_dir_ino, pid_file_ino, proc_pid_file,
     MapsRegion,
     PROC_FILES, PROC_INO_BASE, PROC_PID_FILES, PROC_PID_INO_MASK, PROC_PID_INO_STRIDE,
-    PROC_PID_ORDER, PROC_ROOT_ORDER, PROC_SELF_FILES, PROC_SYS_FILES, PROT_EXEC, PROT_READ,
-    PROT_WRITE,
+    PROC_NET_DIR_INO, PROC_NET_FILES, PROC_PID_ORDER, PROC_ROOT_ORDER, PROC_SELF_FILES,
+    PROC_SYS_FILES, PROT_EXEC, PROT_READ, PROT_WRITE,
 };
 use proptest::prelude::*;
 
@@ -238,6 +238,7 @@ fn procfs_table_is_stable_and_unique() {
             "filesystems",
             "loadavg",
             "mounts",
+            "net",
         ]
     );
     assert_eq!(
@@ -276,6 +277,18 @@ fn procfs_table_is_stable_and_unique() {
         PROC_SYS_FILES.iter().map(|e| e.name).collect::<Vec<_>>(),
         ["ostype", "osrelease", "hostname"]
     );
+    assert_eq!(
+        PROC_NET_FILES.iter().map(|e| e.name).collect::<Vec<_>>(),
+        ["dev"],
+        "/proc/net exists only for `dev` (slice 8)"
+    );
+    assert_eq!(
+        crate::procfs_format::proc_net_file("dev").unwrap().ino,
+        PROC_INO_BASE + 24
+    );
+    assert_eq!(PROC_NET_DIR_INO, PROC_INO_BASE + 23);
+    assert!(crate::procfs_format::proc_net_file("tcp").is_none());
+    assert!(crate::procfs_format::proc_net_file("").is_none());
     assert_eq!(
         crate::procfs_format::proc_file("cpuinfo").unwrap().ino,
         PROC_INO_BASE + 6
@@ -329,6 +342,7 @@ fn procfs_table_is_stable_and_unique() {
         .iter()
         .chain(PROC_SELF_FILES.iter())
         .chain(PROC_SYS_FILES.iter())
+        .chain(PROC_NET_FILES.iter())
         .copied()
     {
         assert!(

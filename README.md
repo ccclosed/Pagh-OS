@@ -289,7 +289,8 @@ IDEMPOTENCY`, когда прогонов больше одного); экран
   точке возврата из сисколла (настоящие `rt_sigaction`/`rt_sigprocmask`/`sigaltstack`/
   `rt_sigreturn`, `^C` → SIGINT с пробуждениями `EINTR` в блокирующих ожиданиях);
   синтетический `procfs` отдаёт
-  `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}`, read-only
+  `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}`,
+  `/proc/net/dev` (живые байтовые/пакетные счётчики канала и линк `eth0`), read-only
   заглушки `/proc/sys/kernel/{ostype,osrelease,hostname}`, `/proc/self/*` и per-pid дерево
   `/proc/<pid>/{cmdline,stat,status,maps,cgroup,mountinfo,limits}`, плюс
   `/proc/<pid>/{fd,fdinfo}/<n>` и per-thread представление `/proc/<pid>/task/<tid>/` (с

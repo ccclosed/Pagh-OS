@@ -53,6 +53,8 @@ pub const PROC_SELF_DIR_INO: u64 = PROC_INO_BASE + 1;
 pub const PROC_SYS_DIR_INO: u64 = PROC_INO_BASE + 10;
 /// `/proc/sys/kernel`.
 pub const PROC_SYS_KERNEL_DIR_INO: u64 = PROC_INO_BASE + 11;
+/// `/proc/net` — каталог сетевой статистики (`docs/procfs.md` §15).
+pub const PROC_NET_DIR_INO: u64 = PROC_INO_BASE + 23;
 
 /// Какой файл `/proc` представляет узел.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +117,8 @@ pub enum ProcKind {
     SelfLimits,
     /// `/proc/<pid>/fdinfo/<n>` (pid цели и fd несёт узел).
     FdInfo,
+    /// `/proc/net/dev` — счётчики канала в Linux-формате.
+    NetDev,
 }
 
 /// Одна именованная запись: имя для `readdir`, стабильный inode и вид
@@ -189,6 +193,13 @@ pub const PROC_SYS_FILES: [ProcEntry; 3] = [
     },
 ];
 
+/// Обычные файлы под `/proc/net` (порядок `readdir`; сейчас один — `dev`).
+pub const PROC_NET_FILES: [ProcEntry; 1] = [ProcEntry {
+    name: "dev",
+    ino: PROC_INO_BASE + 24,
+    kind: ProcKind::NetDev,
+}];
+
 /// Обычные файлы под `/proc/self` (в порядке `readdir`).
 ///
 /// `stat` и `statm` описывают *вызывающий* процесс, поэтому их inode, как и у
@@ -252,7 +263,7 @@ pub const PROC_SELF_FILES: [ProcEntry; 10] = [
 /// обычные файлы. Живые числовые pid-каталоги вставляет между `self` и `cpuinfo`
 /// ядро-ориентированный `ProcDir::readdir` (pid по возрастанию, снимок реестра
 /// compat); они динамические и здесь не перечисляются.
-pub const PROC_ROOT_ORDER: [&str; 10] = [
+pub const PROC_ROOT_ORDER: [&str; 11] = [
     "self",
     "sys",
     "cpuinfo",
@@ -263,6 +274,7 @@ pub const PROC_ROOT_ORDER: [&str; 10] = [
     "filesystems",
     "loadavg",
     "mounts",
+    "net",
 ];
 
 // ─── идентичность пути / inode для /proc/<pid> ──────────────────────────────
@@ -416,6 +428,11 @@ pub fn proc_self_file(name: &str) -> Option<ProcEntry> {
 /// Ищет файл `/proc/sys/kernel` по имени.
 pub fn proc_sys_file(name: &str) -> Option<ProcEntry> {
     PROC_SYS_FILES.iter().copied().find(|e| e.name == name)
+}
+
+/// Ищет файл `/proc/net` по имени (`docs/procfs.md` §15).
+pub fn proc_net_file(name: &str) -> Option<ProcEntry> {
+    PROC_NET_FILES.iter().copied().find(|e| e.name == name)
 }
 
 // ─── /proc/meminfo ──────────────────────────────────────────────────────────
@@ -1594,4 +1611,73 @@ pub fn dev_bytes(dev: u64) -> (u8, u8) {
     let major = ((dev >> 8) & 0xfff) as u8;
     let minor = ((dev & 0xff) | ((dev >> 12) & 0xfff00)) as u8;
     (major, minor)
+}
+
+// ─── /proc/net/dev ──────────────────────────────────────────────────────────
+
+/// Первая шапка `/proc/net/dev` — дословно как `net/core/net-procfs.c`.
+const NET_DEV_HEADER_1: &[u8] =
+    b"Inter-|   Receive                                                |  Transmit\n";
+/// Вторая шапка: имена 16 колонок (`rx` 8 + `tx` 8), дословно как в Linux.
+const NET_DEV_HEADER_2: &[u8] =
+    b" face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n";
+
+/// Одна строка `/proc/net/dev`.
+///
+/// Реальными бывают только байты/пакеты и — у RNDIS — ошибки/потери; остальные
+/// колонки Linux (`fifo`/`frame`/`compressed`/`multicast`, `colls`/`carrier`)
+/// этот стек не ведёт и печатает нулями, как Linux для драйвера без статистики.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NetDevRow {
+    pub name: &'static str,
+    pub rx_bytes: u64,
+    pub rx_packets: u64,
+    pub rx_errs: u64,
+    pub rx_drop: u64,
+    pub tx_bytes: u64,
+    pub tx_packets: u64,
+    pub tx_errs: u64,
+    pub tx_drop: u64,
+}
+
+/// Рендерит `/proc/net/dev`: две шапки и по строке на интерфейс.
+///
+/// Ширины колонок копируют Linux (`%6s: %7llu ...`): `ifconfig`/`/proc/net/dev`
+/// парсеры (net-tools, busybox, libuv) полагаются на позиционное чтение
+/// whitespace-разделённых полей, а не на фиксированные столбцы, но совпадать
+/// с эталоном дешевле, чем объяснять расхождение. Нет интерфейсов — остаются
+/// только шапки (так Linux печатает пустую таблицу).
+pub fn format_net_dev(rows: &[NetDevRow]) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(NET_DEV_HEADER_1.len() + NET_DEV_HEADER_2.len() + rows.len() * 160);
+    out.extend_from_slice(NET_DEV_HEADER_1);
+    out.extend_from_slice(NET_DEV_HEADER_2);
+    for r in rows {
+        // 16 чисел: rx bytes/packets/errs/drop/fifo/frame/compressed/multicast,
+        // затем tx bytes/packets/errs/drop/fifo/colls/carrier/compressed.
+        push(
+            &mut out,
+            format_args!(
+                "{:>6}: {:>7} {:>7} {:>4} {:>4} {:>4} {:>5} {:>10} {:>9} {:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>7} {:>10}\n",
+                r.name,
+                r.rx_bytes,
+                r.rx_packets,
+                r.rx_errs,
+                r.rx_drop,
+                0u64,
+                0u64,
+                0u64,
+                0u64,
+                r.tx_bytes,
+                r.tx_packets,
+                r.tx_errs,
+                r.tx_drop,
+                0u64,
+                0u64,
+                0u64,
+                0u64,
+            ),
+        );
+    }
+    out
 }
