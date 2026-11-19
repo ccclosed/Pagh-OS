@@ -1733,7 +1733,11 @@ pub fn init_session(session: usize) -> bool {
         session,
         info.width as usize,
         info.height as usize,
-        info.bpp as usize,
+        // `FbInfo.bpp` — БИТЫ (32); геометрия поверхности считает БАЙТЫ на
+        // пиксель (3..=4), как `FramebufferWriter::bpp`. Путаница единиц здесь
+        // делала бы `geometry()` отказом и `init_session` всегда false — окно
+        // не поднималось бы вовсе.
+        (info.bpp / 8) as usize,
     ) else {
         return false;
     };
@@ -1868,13 +1872,19 @@ pub fn dimensions() -> (usize, usize) {
 
 /// Геометрия Limine-фреймбуфера для `/dev/fb0`; `None` на serial-only boot.
 pub fn fb_info() -> Option<FbInfo> {
-    writer_for_current().with(|w| w.info())
+    // Всегда boot-экземпляр: `/dev/fb0` — это scanout, и его геометрия не
+    // зависит от консольной сессии вызывающего (иначе open из задачи окна отдал
+    // бы offscreen-геометрию с `phys = 0`).
+    boot_info()
 }
 
 /// Снимок живой текстовой сетки для `/dev/vtconsole0`; `None` на serial-only
 /// boot (тогда поверхность живёт сеткой 80×25 и остаётся пустой).
 pub fn text_snapshot() -> Option<TextSnapshot> {
-    writer_for_current().with(|w| w.text_snapshot())
+    // Всегда boot-экземпляр: `vtconsole0` — снимок единственной kernel-консоли.
+    // Маршрутизация по задаче была бы утечкой содержимого окна в чужую
+    // shared-поверхность.
+    WRITERS[0].with(|w| w.text_snapshot())
 }
 
 /// The console's current foreground and background colours (see

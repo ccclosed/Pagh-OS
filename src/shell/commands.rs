@@ -2179,6 +2179,12 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
             &env,
         );
         if let Ok(pid) = r {
+            // Консоль ребёнка — консоль сессии, из которой его запустили:
+            // compat-процесс это ОТДЕЛЬНАЯ задача, и без привязки его stdout/VT
+            // ушли бы в boot-консоль (маршрут «задача → сессия» не знает, что он
+            // принадлежит окну). `bind(pid, 0)` убирает запись, поэтому
+            // boot-сессия не платит ничем.
+            crate::drivers::session::bind(pid, crate::drivers::session::current());
             let child_pgid = crate::task::compat::pgid_of(pid).unwrap_or(pid);
             crate::task::compat::mark_tty_job(pid);
             crate::drivers::tty::set_foreground_pgid(child_pgid);
