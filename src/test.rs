@@ -6318,7 +6318,8 @@ mod netdata_tests {
     use crate::arch::x86_64::linux::errno::Errno;
     use crate::arch::x86_64::linux::net_if_abi::{
         ARPHRD_ETHER, IFF_BROADCAST, IFF_MULTICAST, IFF_RUNNING, IFF_UP, IFREQ_SIZE, SIOCGIFADDR,
-        SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFNAME, SIOCGIFNETMASK,
+        SIOCGIFCONF, SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFNAME,
+        SIOCGIFNETMASK,
     };
     use crate::arch::x86_64::linux::net_if_sys::if_ioctl;
     use crate::memory::{pmm, vmm};
@@ -6361,6 +6362,17 @@ mod netdata_tests {
             let bytes = name.as_bytes();
             let n = bytes.len().min(15);
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), SCRATCH_VA as *mut u8, n);
+        }
+    }
+
+    /// `struct ifconf` в начало scratch-страницы: длина по смещению 0,
+    /// указатель буфера — по смещению 8.
+    fn put_ifconf(len: i32, buf: u64) {
+        // SAFETY: 16 байт начала отображённой страницы; запись полей ifconf.
+        unsafe {
+            core::ptr::write_bytes(SCRATCH_VA as *mut u8, 0, 16);
+            core::ptr::write_unaligned(SCRATCH_VA as *mut i32, len);
+            core::ptr::write_unaligned((SCRATCH_VA + 8) as *mut u64, buf);
         }
     }
 
@@ -6571,6 +6583,73 @@ mod netdata_tests {
             Err(Errno::ENODEV),
             "netdata: SIOCGIFFLAGS with an unknown name is ENODEV"
         );
+
+        // ── SIOCGIFCONF: перечисление интерфейса в массив `ifreq` ──────────
+        //
+        // Буфер лежит в той же scratch-странице по смещению 64; `ifc_len = 40`
+        // вмещает ровно одну запись. Linux кладёт в массив только интерфейсы с
+        // IPv4-адресом, поэтому без lease ожидается 0 и `ifc_len = 0`.
+        put_ifconf(40, SCRATCH_VA + 64);
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFCONF, SCRATCH_VA),
+            Ok(0),
+            "netdata: SIOCGIFCONF succeeds"
+        );
+        match stats.cidr {
+            Some(cidr) => {
+                assert_eq_kernel!(
+                    get_i32(0),
+                    40,
+                    "netdata: SIOCGIFCONF reports one 40-byte ifreq"
+                );
+                let mut name = [0u8; 16];
+                // SAFETY: запись сделана ядром в scratch+64..+80.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (SCRATCH_VA + 64) as *const u8,
+                        name.as_mut_ptr(),
+                        16,
+                    );
+                }
+                let len = name.iter().position(|&b| b == 0).unwrap_or(16);
+                assert_eq_kernel!(
+                    &name[..len],
+                    stats.name.as_bytes(),
+                    "netdata: SIOCGIFCONF entry names the interface"
+                );
+                assert_eq_kernel!(
+                    get_bytes::<4>(64 + 20),
+                    cidr.addr.0,
+                    "netdata: SIOCGIFCONF entry carries the interface address"
+                );
+            }
+            None => assert_eq_kernel!(
+                get_i32(0),
+                0,
+                "netdata: SIOCGIFCONF lists nothing before a lease"
+            ),
+        }
+        // Маленький буфер — 0 записей и `ifc_len = 0`, без ошибки.
+        put_ifconf(0, 0);
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFCONF, SCRATCH_VA),
+            Ok(0),
+            "netdata: SIOCGIFCONF with a 0-length buffer still succeeds"
+        );
+        assert_eq_kernel!(
+            get_i32(0),
+            0,
+            "netdata: SIOCGIFCONF with a short buffer writes no entry"
+        );
+        // NULL-буфер при достаточной длине — EFAULT, а не молчаливая запись.
+        if stats.cidr.is_some() {
+            put_ifconf(40, 0);
+            assert_eq_kernel!(
+                if_ioctl(SIOCGIFCONF, SCRATCH_VA),
+                Err(Errno::EFAULT),
+                "netdata: SIOCGIFCONF with a NULL buffer is EFAULT"
+            );
+        }
 
         // ── /proc/net/dev: счётчики не убывают между чтениями ─────────────
         let first = read_net_dev_row(stats.name);

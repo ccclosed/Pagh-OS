@@ -32,7 +32,7 @@
 - **Shell:** редактирование строки, история, tab completion, прокрутка консоли (колесо мыши / PageUp / PageDown), `ls`/`ls -l`/`tree`/`chmod`/`chown`/`df`/`free`/`date`/`head`/`tail`/`wc`/`grep`/`ifconfig`/`ps`, файловые операции ext2, `selftest`.
 - **GUI-приложения:** управляемый мышью `paint` (инструменты фигур, 16-цветная палитра, размеры кисти, undo, сохранение в ext2), полноэкранный редактор `nano+` и `settings` с живыми цветовыми темами и обоями.
 - **Хранилище:** ext2-совместимая read/write файловая система с журналом write-ahead-log, на реальном virtio-blk или NVMe-диске (или RAM-диске с загрузочного носителя).
-- **Сеть:** стек TCP/IP поверх e1000 или USB-RNDIS (USB-тетеринг телефона): DHCP/ARP/TCP/UDP; `ifconfig` показывает живой lease, `/proc/net/dev` — живые байтовые/пакетные счётчики `eth0`, а `SIOCGIFADDR`/`SIOCGIFFLAGS`/`SIOCGIFHWADDR`/`SIOCGIFNETMASK`/`SIOCGIFMTU`/`SIOCGIFINDEX`/`SIOCGIFNAME` на `AF_INET`-сокете отдают userspace те же адрес/маску/флаги/MAC из ядра.
+- **Сеть:** стек TCP/IP поверх e1000 или USB-RNDIS (USB-тетеринг телефона): DHCP/ARP/TCP/UDP; `ifconfig` показывает живой lease, `/proc/net/dev` — живые байтовые/пакетные счётчики `eth0`, а `SIOCGIFADDR`/`SIOCGIFFLAGS`/`SIOCGIFHWADDR`/`SIOCGIFNETMASK`/`SIOCGIFMTU`/`SIOCGIFINDEX`/`SIOCGIFNAME`/`SIOCGIFCONF` на `AF_INET`-сокете отдают userspace те же адрес/маску/флаги/MAC из ядра.
 - **Процессы:** вытесняющий планировщик ~1 кГц, ring-3 пользовательские процессы, `SYSCALL`/`int 0x80`.
 
 *Не показано в демо выше (реализовано, но не задействовано в этой записи):* `apt`-подобный

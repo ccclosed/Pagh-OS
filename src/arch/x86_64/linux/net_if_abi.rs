@@ -52,6 +52,13 @@ pub const SOCKADDR_OFF: usize = UNION_OFF;
 /// `sizeof(struct sockaddr_in)` — ровно столько занимает union при `SIOCGIFADDR`.
 pub const SOCKADDR_IN_SIZE: usize = 16;
 
+/// `sizeof(struct ifconf)` на x86_64: `int ifc_len` (4) + 4 байта выравнивания
+/// + `char *ifc_buf` (8) = 16.
+pub const IFCONF_SIZE: usize = 16;
+
+/// Смещение `ifc_buf` внутри `struct ifconf` (после `int` + padding).
+pub const IFCONF_BUF_OFF: usize = 8;
+
 // ─── запросы (SIOC*) ────────────────────────────────────────────────────────
 //
 // Значения — из `linux/sockios.h`; ioctl в Linux принимает их как
@@ -60,6 +67,9 @@ pub const SOCKADDR_IN_SIZE: usize = 16;
 
 /// `SIOCGIFNAME`: имя интерфейса по `ifr_ifindex`.
 pub const SIOCGIFNAME: u64 = 0x8910;
+/// `SIOCGIFCONF`: перечисление интерфейсов в массив `ifreq` (аргумент —
+/// `struct ifconf`, не `ifreq`).
+pub const SIOCGIFCONF: u64 = 0x8912;
 /// `SIOCGIFFLAGS`: `short ifr_flags` (IFF_*).
 pub const SIOCGIFFLAGS: u64 = 0x8913;
 /// `SIOCGIFADDR`: `sockaddr_in ifr_addr`.
@@ -78,6 +88,7 @@ pub fn is_ifreq(request: u64) -> bool {
     matches!(
         request,
         SIOCGIFNAME
+            | SIOCGIFCONF
             | SIOCGIFFLAGS
             | SIOCGIFADDR
             | SIOCGIFNETMASK
@@ -117,6 +128,15 @@ struct IfreqLayout {
 }
 
 #[repr(C)]
+struct IfconfLayout {
+    ifc_len: i32,
+    // Явный padding: `char *` в C выравнивается на 8, а `[u8; 8]` — на 1,
+    // поэтому без этого поля repr(C) положил бы указатель на смещение 4.
+    _pad: [u8; IFCONF_BUF_OFF - 4],
+    ifc_buf: [u8; 8],
+}
+
+#[repr(C)]
 struct SockaddrInLayout {
     sin_family: u16,
     sin_port: u16,
@@ -129,6 +149,8 @@ const _: () = assert!(core::mem::offset_of!(IfreqLayout, ifr_ifru) == UNION_OFF)
 const _: () = assert!(core::mem::size_of::<SockaddrInLayout>() == SOCKADDR_IN_SIZE);
 const _: () = assert!(core::mem::offset_of!(SockaddrInLayout, sin_addr) == 4);
 const _: () = assert!(core::mem::offset_of!(SockaddrInLayout, sin_zero) == 8);
+const _: () = assert!(core::mem::size_of::<IfconfLayout>() == IFCONF_SIZE);
+const _: () = assert!(core::mem::offset_of!(IfconfLayout, ifc_buf) == IFCONF_BUF_OFF);
 
 // ─── ifr_name ───────────────────────────────────────────────────────────────
 
@@ -183,6 +205,30 @@ pub fn read_i32(req: &[u8; IFREQ_SIZE], off: usize) -> i32 {
 /// Записать `int` по смещению union'а.
 pub fn write_i32(req: &mut [u8; IFREQ_SIZE], off: usize, value: i32) {
     req[off..off + 4].copy_from_slice(&value.to_ne_bytes());
+}
+
+// ─── struct ifconf (SIOCGIFCONF) ────────────────────────────────────────────
+
+/// Прочитать `ifc_len` из `struct ifconf` (смещение 0).
+pub fn read_ifconf_len(conf: &[u8; IFCONF_SIZE]) -> i32 {
+    i32::from_ne_bytes([conf[0], conf[1], conf[2], conf[3]])
+}
+
+/// Записать `ifc_len` (сколько байт реально занял массив `ifreq`).
+pub fn write_ifconf_len(conf: &mut [u8; IFCONF_SIZE], len: i32) {
+    conf[..4].copy_from_slice(&len.to_ne_bytes());
+}
+
+/// Прочитать пользовательский указатель `ifc_buf` (смещение 8).
+pub fn read_ifconf_buf(conf: &[u8; IFCONF_SIZE]) -> u64 {
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&conf[IFCONF_BUF_OFF..IFCONF_BUF_OFF + 8]);
+    u64::from_ne_bytes(raw)
+}
+
+/// Записать `ifc_buf` (нужно тестам и полному round-trip'у структуры).
+pub fn write_ifconf_buf(conf: &mut [u8; IFCONF_SIZE], buf: u64) {
+    conf[IFCONF_BUF_OFF..IFCONF_BUF_OFF + 8].copy_from_slice(&buf.to_ne_bytes());
 }
 
 // ─── sockaddr ───────────────────────────────────────────────────────────────

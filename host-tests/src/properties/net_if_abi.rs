@@ -10,11 +10,12 @@
 // кодирования; эффективный `net_if_sys` лишь копирует буфер и заполняет поля.
 
 use crate::net_if_abi::{
-    ifname_len, is_ifreq, read_i16, read_i32, read_ifname, sockaddr_hwaddr, sockaddr_in,
-    write_i16, write_i32, write_ifname, AF_INET, ARPHRD_ETHER, FLAGS_OFF, I32_OFF, IFF_BROADCAST,
-    IFF_MULTICAST, IFF_RUNNING, IFF_UP, IFNAMSIZ, IFREQ_SIZE, SIOCGIFADDR, SIOCGIFFLAGS,
-    SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFNAME, SIOCGIFNETMASK, SOCKADDR_IN_SIZE,
-    SOCKADDR_OFF, UNION_OFF,
+    ifname_len, is_ifreq, read_i16, read_i32, read_ifconf_buf, read_ifconf_len, read_ifname,
+    sockaddr_hwaddr, sockaddr_in, write_i16, write_i32, write_ifconf_buf, write_ifconf_len,
+    write_ifname, AF_INET, ARPHRD_ETHER, FLAGS_OFF, I32_OFF, IFCONF_BUF_OFF, IFCONF_SIZE,
+    IFF_BROADCAST, IFF_MULTICAST, IFF_RUNNING, IFF_UP, IFNAMSIZ, IFREQ_SIZE, SIOCGIFADDR,
+    SIOCGIFCONF, SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFNAME,
+    SIOCGIFNETMASK, SOCKADDR_IN_SIZE, SOCKADDR_OFF, UNION_OFF,
 };
 use proptest::prelude::*;
 
@@ -31,11 +32,15 @@ fn layout_constants_match_x86_64_linux() {
     assert_eq!(I32_OFF, 16);
     assert_eq!(SOCKADDR_OFF, 16);
     assert_eq!(SOCKADDR_IN_SIZE, 16);
+    // `struct ifconf { int ifc_len; char *ifc_buf; }` — 4 + 4 padding + 8.
+    assert_eq!(IFCONF_SIZE, 16);
+    assert_eq!(IFCONF_BUF_OFF, 8);
 }
 
 #[test]
 fn request_numbers_match_linux_sockios() {
     assert_eq!(SIOCGIFNAME, 0x8910);
+    assert_eq!(SIOCGIFCONF, 0x8912);
     assert_eq!(SIOCGIFFLAGS, 0x8913);
     assert_eq!(SIOCGIFADDR, 0x8915);
     assert_eq!(SIOCGIFNETMASK, 0x891B);
@@ -44,7 +49,6 @@ fn request_numbers_match_linux_sockios() {
     assert_eq!(SIOCGIFINDEX, 0x8933);
     // Значения, которые этот слой НЕ обслуживает, обязаны остаться вне
     // `is_ifreq` — иначе `ioctl` начнёт отвечать успехом на чужой запрос.
-    assert!(!is_ifreq(0x8912)); // SIOCGIFCONF — отдельный этап (K3)
     assert!(!is_ifreq(0x8914)); // SIOCSIFFLAGS (down/up) — K4, не делаем
 }
 
@@ -62,6 +66,7 @@ fn flag_and_address_family_constants_match_linux() {
 fn is_ifreq_covers_exactly_the_implemented_requests() {
     for request in [
         SIOCGIFNAME,
+        SIOCGIFCONF,
         SIOCGIFFLAGS,
         SIOCGIFADDR,
         SIOCGIFNETMASK,
@@ -71,7 +76,7 @@ fn is_ifreq_covers_exactly_the_implemented_requests() {
     ] {
         assert!(is_ifreq(request), "request {request:#x} must be served");
     }
-    for request in [0u64, 1, 0x5413, 0x8912, 0x8914, 0x8916, 0x8928, u64::MAX] {
+    for request in [0u64, 1, 0x5413, 0x8914, 0x8916, 0x8928, u64::MAX] {
         assert!(
             !is_ifreq(request),
             "request {request:#x} must stay ENOTTY"
@@ -214,5 +219,35 @@ proptest! {
             write_i32(&mut req, off, v32);
             prop_assert_eq!(read_i32(&req, off), v32);
         }
+    }
+}
+
+#[test]
+fn ifconf_layout_and_round_trip() {
+    let mut conf = [0u8; IFCONF_SIZE];
+    // Поле длины — native int по смещению 0.
+    write_ifconf_len(&mut conf, 40);
+    assert_eq!(&conf[..4], &40i32.to_ne_bytes());
+    assert_eq!(read_ifconf_len(&conf), 40);
+    // Указатель — по смещению 8, с 4 байтами padding между ними.
+    write_ifconf_buf(&mut conf, 0x0000_7fff_dead_beef);
+    assert_eq!(&conf[4..8], &[0u8; 4], "padding must stay zero");
+    assert_eq!(read_ifconf_buf(&conf), 0x0000_7fff_dead_beef);
+    // 64-битный указатель не должен терять старшие байты.
+    write_ifconf_buf(&mut conf, u64::MAX - 3);
+    assert_eq!(read_ifconf_buf(&conf), u64::MAX - 3);
+}
+
+proptest! {
+    /// `ifc_len` — знаковый int, `ifc_buf` — полный u64: оба поля переживают
+    /// любые значения, не задевая друг друга.
+    #[test]
+    fn ifconf_fields_are_independent(len: i32, buf: u64) {
+        let mut conf = [0u8; IFCONF_SIZE];
+        write_ifconf_len(&mut conf, len);
+        write_ifconf_buf(&mut conf, buf);
+        prop_assert_eq!(read_ifconf_len(&conf), len);
+        prop_assert_eq!(read_ifconf_buf(&conf), buf);
+        prop_assert_eq!(&conf[4..8], &[0u8; 4]);
     }
 }

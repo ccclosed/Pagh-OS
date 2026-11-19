@@ -33,6 +33,11 @@ pub fn if_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
     if !abi::is_ifreq(request) {
         return Err(Errno::ENOTTY);
     }
+    // `SIOCGIFCONF` — единственный запрос, чей аргумент не `ifreq`, а
+    // 16-байтный `struct ifconf`; он обслуживается отдельно, до чтения 40 байт.
+    if request == abi::SIOCGIFCONF {
+        return if_conf(arg);
+    }
     check_user_ptr_writable(arg, abi::IFREQ_SIZE as u64)?;
 
     // SAFETY: `check_user_ptr_writable` только что обошёл все страницы буфера
@@ -106,6 +111,57 @@ pub fn if_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
     // диапазон; `req` — локальный массив, источник валиден на всё копирование.
     unsafe {
         core::ptr::copy_nonoverlapping(req.as_ptr(), arg as *mut u8, abi::IFREQ_SIZE);
+    }
+    Ok(0)
+}
+
+/// `SIOCGIFCONF`: перечислить интерфейсы в пользовательский массив `ifreq`.
+///
+/// Linux-контракт (`net/core/dev_ioctl.c:dev_ifconf` + `inet_gifconf`): аргумент
+/// — `struct ifconf { int ifc_len; char *ifc_buf; }`; в буфер пишется столько
+/// 40-байтных `ifreq`, сколько влезает в `ifc_len` (по одному на интерфейс с
+/// IPv4-адресом), после чего `ifc_len` перезаписывается фактическим числом
+/// байт. Не хватает места — 0 записей и `ifc_len = 0`, без ошибки (именно так
+/// `ifconfig` узнаёт, что нужно спросить размер: он передаёт большой буфер и
+/// разбирает результат). Возврат — 0.
+///
+/// Канала нет — `ENODEV` (как у остальных `SIOCGIF*`). Интерфейс без адреса
+/// (DHCP ещё в полёте) — 0 записей, как Linux для `sin_addr`-less устройства.
+fn if_conf(arg: u64) -> Result<u64, Errno> {
+    check_user_ptr_writable(arg, abi::IFCONF_SIZE as u64)?;
+    let mut conf = [0u8; abi::IFCONF_SIZE];
+    // SAFETY: диапазон проверен `check_user_ptr_writable`; активный CR3 —
+    // адресное пространство вызывающего, 16 байт целиком в user-половине.
+    unsafe {
+        core::ptr::copy_nonoverlapping(arg as *const u8, conf.as_mut_ptr(), abi::IFCONF_SIZE);
+    }
+    let stats = match crate::net::iface_stats() {
+        Some(s) => s,
+        None => return Err(Errno::ENODEV),
+    };
+    let capacity = abi::read_ifconf_len(&conf);
+    let buf = abi::read_ifconf_buf(&conf);
+    let mut written = 0i32;
+    if let Some(cidr) = stats.cidr {
+        if capacity >= abi::IFREQ_SIZE as i32 {
+            check_user_ptr_writable(buf, abi::IFREQ_SIZE as u64)?;
+            let mut req = [0u8; abi::IFREQ_SIZE];
+            abi::write_ifname(&mut req, stats.name);
+            req[abi::SOCKADDR_OFF..abi::SOCKADDR_OFF + abi::SOCKADDR_IN_SIZE]
+                .copy_from_slice(&abi::sockaddr_in(cidr.addr.0, 0));
+            // SAFETY: 40-байтный диапазон `buf` только что проверен как
+            // пользовательский и записываемый; source — локальный массив.
+            unsafe {
+                core::ptr::copy_nonoverlapping(req.as_ptr(), buf as *mut u8, abi::IFREQ_SIZE);
+            }
+            written = abi::IFREQ_SIZE as i32;
+        }
+    }
+    abi::write_ifconf_len(&mut conf, written);
+    // SAFETY: тот же проверенный 16-байтный пользовательский диапазон, что и
+    // на чтении; обновлённый `ifc_len` — единственное изменённое поле.
+    unsafe {
+        core::ptr::copy_nonoverlapping(conf.as_ptr(), arg as *mut u8, abi::IFCONF_SIZE);
     }
     Ok(0)
 }
