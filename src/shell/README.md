@@ -1,8 +1,7 @@
-# `src/shell/` — интерактивный shell, paint, nano, мини-toolchain
+# `src/shell/` — интерактивный shell, paint, nano
 
 Framebuffer-shell с редактированием строки, историей, таб-комплишном, цветным выводом;
-оконная рисовалка `paint`; полноэкранный редактор `nano+`; интерпретатор мини-Rust
-«pagh-mini». Вход — `shell::shell_main()`, вызывается из `boot.rs` после поднятия ФС/сети.
+оконная рисовалка `paint`; полноэкранный редактор `nano+`. Вход — `shell::shell_main()`, вызывается из `boot.rs` после поднятия ФС/сети.
 
 ## Файлы
 
@@ -31,7 +30,6 @@ Framebuffer-shell с редактированием строки, историе
 | `nano.rs` | `nano+` полноэкранный редактор: `Editor`, undo/redo, поиск/замена/goto, clipboard, мигающая каретка, сайдбар с деревом файлов (`^B`) |
 | `tree.rs` | Дерево файлов для сайдбара редактора: плоский список видимых строк с отступами, раскрытие/сворачивание каталогов, навигация с клавиатуры; обход VFS с ограничением глубины и числа записей |
 | `nano_config.rs` | Персист `NanoConfig` в `/mnt/.nanorc`; темы Dark/Light/Blue; CLI `nano --settings` |
-| `toolchain.rs` | «pagh-mini» мини-Rust: интерпретатор (`execute`), `rustc` (компиляция в `.pbc` = магия `PAGH-MINI-RUST:1\n` + исходник), `cargo new/check/build/run`, `rustup` |
 
 ## Ключевые символы
 
@@ -46,7 +44,7 @@ Framebuffer-shell с редактированием строки, историе
 - `identity_db::{parse_passwd, parse_group, user_by_name, groups_for_user, supplementary_groups_for_user}`
 - `path::{normalize, resolve, cwd, set_cwd}`
 - `suggest::{edit_distance, nearest_command}`
-- `paint::run()`, `nano::run(path)`, `toolchain::{execute, run_path, rustc, cargo, rustup}`
+- `paint::run()`, `nano::run(path)`; `rust` = алиас `lxrun`, `cargo`/`rustc` = установленные бинарники через Linux-слой
 
 ## Как работает REPL
 
@@ -124,7 +122,7 @@ Shift+букву строчной при выключенном CapsLock. Пок
 тестовый ring-3 процесс), `ifconfig`, `ping`, `nc`, `selftest` (`test::run_all()`),
 `cd`, `pwd`, `cp` (cap 16 MiB), `mv` (только файлы), `stat`, `chmod` (октальный режим),
 `chown` (числовой `uid[:gid]`), `sleep`, `nano`, `lua`,
-`python`/`python3`, `pythonc`, `cargo`, `rustc`, `rustup`, `rust`, `paint`,
+`python`/`python3`, `pythonc`, `cargo`, `rustc`, `rust`, `paint`,
 `pkg <host> <path> [port]` (HTTP GET .deb → ar → decompress → tar → install в /mnt),
 `ppkg <update|install|show|list|setmirror>` (`install` принимает `--quiet` и
 `--progress=ansi|cr|plain`, рисуя DNF-style прогресс), `lxrun <path> [args]` (Linux ELF в ring 3,

@@ -113,8 +113,8 @@ Sinks: serial всегда, framebuffer условно. Гейты fb-зерка
 
 ### `provision.rs` — первичный userland
 - `seed()` — идемпотентный посев ФС первого бута (guard `/mnt/etc/pagh-release`):
-  `etc/`, `home/user/`, `usr/share/pagh/`, `examples/hello/`; `resolv.conf` (10.0.2.3),
-  `hosts`, `motd`, README, LICENSE-NOTICE, hello-пример. `write_once` — не перезаписывает,
+  `etc/`, `home/user/`, `usr/share/pagh/`; `resolv.conf` (10.0.2.3),
+  `hosts`, `motd`, README, LICENSE-NOTICE. `write_once` — не перезаписывает,
   а сам маркер `pagh-release` пишется последним: оборванный посев доделывается на
   следующей загрузке, а не считается завершённым.
   Зависит только от `vfs` (`VfsNode`/`VfsError`): никакого apt/python в этой функции уже

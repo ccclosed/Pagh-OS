@@ -63,7 +63,7 @@ path after `/mnt` is mounted, and is idempotent (its guard is `/mnt/etc/pagh-rel
 
 1. Seeds `/mnt` with release metadata (`etc/pagh-release`) and a motd that carry the same
    crate version, a home skeleton (`home/user/`), `/usr/share/pagh/`, a `resolv.conf`
-   pointing at slirp's DNS (`10.0.2.3`), and a mini-Rust example (`examples/hello`).
+   pointing at slirp's DNS (`10.0.2.3`).
 2. Installs nothing over the network and asks nothing on the console: boot no longer
    stops at a Y/n question, because a console prompt without a timeout is not something
    boot may do.

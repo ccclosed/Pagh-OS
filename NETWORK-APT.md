@@ -20,8 +20,8 @@ python
 
 ## First-boot provisioning
 
-On the first boot with a fresh `disk.img`, the kernel seeds `/mnt` (release metadata, home
-skeleton, mini-Rust example) from `src/provision.rs::seed()`, guarded by
+On the first boot with a fresh `disk.img`, the kernel seeds `/mnt` (release metadata and home
+skeleton) from `src/provision.rs::seed()`, guarded by
 `/mnt/etc/pagh-release`, so later boots are no-ops. Boot installs nothing over the network
 and never blocks on a console question: the base glibc + CPython userland (≈35 packages,
 ≈50 MB of downloads) is installed **on demand from the shell** with `ppkg update` +
