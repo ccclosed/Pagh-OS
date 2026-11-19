@@ -250,6 +250,22 @@ pub fn default_is_fatal(sig: u64) -> bool {
     default_action(sig) == DefaultAction::Term
 }
 
+/// Есть ли у `SIG_DFL`-диспозиции этого сигнала РАБОТА в обработчике?
+///
+/// `false` для `Ignore` (SIGCHLD/SIGURG/SIGWINCH) и `Cont` (SIGCONT):
+/// возобновление по SIGCONT уже выполнено на времени генерации
+/// (`signal::resume_group`), а «игнорировать» — не действие вообще. Такой сигнал
+/// обязан быть потреблён без построения `rt_sigframe`: при `SIG_DFL` поле
+/// handler равно нулю, и возврат «из обработчика» увёл бы процесс в RIP=0
+/// (SIGSEGV). Ровно это убивало композитор после `bg`: pending SIGCONT
+/// доставлялся тиком одному из возобновлённых процессов.
+pub fn default_action_is_silent(sig: u64) -> bool {
+    matches!(
+        default_action(sig),
+        DefaultAction::Ignore | DefaultAction::Cont
+    )
+}
+
 // ─── записи диспозиций + альтернативного стека ──────────────────────────────
 
 /// Ядерная копия одной диспозиции (`struct kernel_sigaction`, 32-байтный
