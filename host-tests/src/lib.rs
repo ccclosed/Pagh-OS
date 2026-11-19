@@ -250,6 +250,13 @@ pub mod kill;
 #[path = "../../src/arch/x86_64/linux/tty.rs"]
 pub mod tty;
 
+// `net_if_abi` — чистый ABI `SIOCGIF*`: 40-байтный `ifreq` (name 16 @0,
+// union @16), `sockaddr_in`/`sockaddr` для адреса/маски/MAC и номера запросов
+// из Linux UAPI. `core`-only, без `super::`-зависимостей, поэтому host-свойство
+// `net_if_abi` кодирует/декодирует ровно тот источник, что компилирует ядро.
+#[path = "../../src/arch/x86_64/linux/net_if_abi.rs"]
+pub mod net_if_abi;
+
 // `regs` is the pure 15-GPR syscall frame contract (`repr(C)`, `rax` at offset
 // 112) — `core`-only and self-contained, included here so the tick-path frame
 // mirror below can be asserted against the REAL struct rather than a copy.
@@ -321,6 +328,14 @@ pub mod ca_bundle;
 // synthetic chains and real signatures generated on the host.
 #[path = "../../src/net/tls_auth.rs"]
 pub mod tls_auth;
+
+// `netstats` — счётчики канала (`/proc/net/dev`, `SIOCGIF*`): байты и пакеты
+// RX/TX. `core`-only (атомики) и самодостаточный, поэтому host-свойство
+// `net_counters` исполняет ровно тот исходник, что компилирует ядро, и
+// проверяет и арифметику, и межпоточный инкремент (в QEMU это ловится только
+// вероятностно).
+#[path = "../../src/net/netstats.rs"]
+pub mod netstats;
 
 // `seed` is the pure `AT_RANDOM` fallback mixer (issue #16): a SHA-256
 // transcript over independent boot-time sources plus a counter-based derivation.
@@ -549,6 +564,18 @@ mod properties {
     mod p47;
     mod p48;
     mod p49;
+    // Канальные счётчики (`src/net/netstats.rs`): нулевой старт, точная
+    // арифметика байтов/пакетов, нулевая длина не считается, монотонность,
+    // отсутствие потерь при параллельном инкременте из нескольких потоков.
+    mod net_counters;
+    // `/proc/net/dev` (этап K1, контракт `docs/procfs.md` §15): две шапки
+    // дословно как в Linux, строка `%6s:` + 16 колонок в фиксированном порядке,
+    // нули в не ведущихся колонках, u64 без обрезки.
+    mod net_dev;
+    // `ifreq`/`sockaddr` ABI для `SIOCGIF*` (этап K2): точные константы Linux
+    // UAPI, раскладка/смещения, round-trip имени и `sockaddr_in`/`sockaddr`,
+    // байтовый порядок порта и адреса.
+    mod net_if_abi;
     // procfs (issue #11, contract `docs/procfs.md` §7): meminfo columns + the
     // libuv `strstr`/`sscanf` substrings; cpuinfo block/`\t: ` separators and the
     // truthfulness of the `flags` line against the CPUID bits; uptime arithmetic

@@ -32,7 +32,7 @@
 - **Shell:** редактирование строки, история, tab completion, прокрутка консоли (колесо мыши / PageUp / PageDown), `ls`/`ls -l`/`tree`/`chmod`/`chown`/`df`/`free`/`date`/`head`/`tail`/`wc`/`grep`/`ifconfig`/`ps`, файловые операции ext2, `selftest`.
 - **GUI-приложения:** управляемый мышью `paint` (инструменты фигур, 16-цветная палитра, размеры кисти, undo, сохранение в ext2), полноэкранный редактор `nano+` и `settings` с живыми цветовыми темами и обоями.
 - **Хранилище:** ext2-совместимая read/write файловая система с журналом write-ahead-log, на реальном virtio-blk или NVMe-диске (или RAM-диске с загрузочного носителя).
-- **Сеть:** стек TCP/IP поверх e1000 или USB-RNDIS (USB-тетеринг телефона): DHCP/ARP/TCP/UDP; `ifconfig` показывает живой lease.
+- **Сеть:** стек TCP/IP поверх e1000 или USB-RNDIS (USB-тетеринг телефона): DHCP/ARP/TCP/UDP; `ifconfig` показывает живой lease, `/proc/net/dev` — живые байтовые/пакетные счётчики `eth0`, а `SIOCGIFADDR`/`SIOCGIFFLAGS`/`SIOCGIFHWADDR`/`SIOCGIFNETMASK`/`SIOCGIFMTU`/`SIOCGIFINDEX`/`SIOCGIFNAME`/`SIOCGIFCONF` на `AF_INET`-сокете отдают userspace те же адрес/маску/флаги/MAC из ядра.
 - **Процессы:** вытесняющий планировщик ~1 кГц, ring-3 пользовательские процессы, `SYSCALL`/`int 0x80`.
 
 *Не показано в демо выше (реализовано, но не задействовано в этой записи):* `apt`-подобный
@@ -289,7 +289,8 @@ IDEMPOTENCY`, когда прогонов больше одного); экран
   точке возврата из сисколла (настоящие `rt_sigaction`/`rt_sigprocmask`/`sigaltstack`/
   `rt_sigreturn`, `^C` → SIGINT с пробуждениями `EINTR` в блокирующих ожиданиях);
   синтетический `procfs` отдаёт
-  `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}`, read-only
+  `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}`,
+  `/proc/net/dev` (живые байтовые/пакетные счётчики канала и линк `eth0`), read-only
   заглушки `/proc/sys/kernel/{ostype,osrelease,hostname}`, `/proc/self/*` и per-pid дерево
   `/proc/<pid>/{cmdline,stat,status,maps,cgroup,mountinfo,limits}`, плюс
   `/proc/<pid>/{fd,fdinfo}/<n>` и per-thread представление `/proc/<pid>/task/<tid>/` (с
@@ -686,8 +687,8 @@ python
   состояние терминала, а `ioctl(FIONBIO)` покрывает non-blocking путь libuv — `nvim`
   работает и сохраняет свой ShaDa. Синтетический `/proc` (issue #11) отдаёт
   `/proc/cpuinfo`, `/proc/meminfo`, `/proc/uptime`, `/proc/stat`, `/proc/version`,
-  `/proc/filesystems`, `/proc/loadavg`, `/proc/mounts`, read-only заглушки
-  `/proc/sys/kernel/{ostype,osrelease,hostname}`, `/proc/self/*` и per-pid дерево
+  `/proc/filesystems`, `/proc/loadavg`, `/proc/mounts`, `/proc/net/dev`, read-only
+  заглушки `/proc/sys/kernel/{ostype,osrelease,hostname}`, `/proc/self/*` и per-pid дерево
   `/proc/<pid>/{cmdline,stat,status,maps,cgroup,mountinfo,limits}` из живого состояния
   ядра (CPUID, счётчики PMM, тиковые часы, счётчики задач планировщика, `CompatState`
   целевого процесса), причём `readlink`/`lstat`/`getdents64` обрабатывают `/proc/self/exe`

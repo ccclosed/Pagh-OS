@@ -14,7 +14,8 @@ net-поток или bounded locked-step помпы); из IRQ-контекст
 | Файл | Роль |
 |---|---|
 | `mod.rs` | Корень: `Stack`, лок `NET`, init, poll-цикл, `net_thread`, публичный TCP/UDP API, DNS `resolve`, `ping`, `nc_echo`, demo echo-сервисы |
-| `link.rs` | Канальный уровень: `Link::{E1000, UsbRndis}`, активный канал, `send`/`recv`, позднее подключение RNDIS |
+| `link.rs` | Канальный уровень: `Link::{E1000, UsbRndis}`, активный канал, `send`/`recv`, позднее подключение RNDIS, `counters()`/`running()` |
+| `netstats.rs` | Чистые (`core`-only) атомарные счётчики канала: байты/пакеты RX и TX, снимок `LinkCounters`. Host-свойство `net_counters` |
 | `wire.rs` | Чистые wire-форматы + encode/decode: Ethernet, ARP, IPv4/IPv6 (+ext headers), ICMP/ICMPv6/NDP/RA, UDP, TCP (MSS/WS/SACK-опции), internet checksum. Юнит-тесты инлайн |
 | `arp.rs` | Link-слой: `ArpTable` (IPv4, RFC 826), `NdpTable` (IPv6, RFC 4861); парковка кадров + rate-limited запросы |
 | `ip.rs` | IPv4/IPv6: next-hop роутинг, TX-фрагментация v4, RX-реассемблинг обоих семейств, ICMP echo-ответы, SLAAC (`ra_apply`), разрешение ping-waiter'ов |
@@ -83,6 +84,22 @@ v6: multicast MAC, link-local/on-link, RA-роутер; v6 на TX не фраг
 ARP/NDP lookup; не резолвится → парковка кадра + rate-limited запрос → `link::send`.
 `arp`/`ip` не держат `Stack` и берут активный канал из отдельного локата `link.rs`, поэтому
 отправка не может задедлочить сетевой лок.
+
+### Интерфейс и счётчики для userspace
+
+У стека один интерфейс с Linux-совместимым именем `eth0` (`net::IFACE_NAME`,
+`net::iface_name()` — `Some`, только когда канал уже выбран). `net::iface_stats()` отдаёт
+снимок `IfaceStats`: MAC, `cidr`/`gateway` (до DHCP — `None`), `running` (физический линк:
+`STATUS.LU` у e1000, готовность RNDIS), MTU 1500 и счётчики `netstats::LinkCounters`.
+Из него живут `/proc/net/dev` и ioctl `SIOCGIF*`; форматтеры не знают о драйверах.
+
+Учёт кадров — в `Link::send`/`Link::recv` (`netstats::LINK`), то есть **после драйвера**:
+считается кадр, который драйвер принял (`send` вернул ненулевой размер) или отдал
+(`recv` вернул `Some(len)`), а не байты на проводе. Отброшенный кадр (`send` = 0) не
+становится пакетом. Ошибки/потери приёма берутся из `usb_rndis::stats()` (у e1000
+статистики нет — честные нули, а не выдуманные числа). Счётчики атомарные и без спинлока:
+`Link::recv` вызывается из `Stack::step` под `NET`, и второй лок в этой вложенности ничего
+не защищает.
 
 ### IPv4/IPv6
 - IPv4: приём только своих/broadcast адресов; реассемблер ≤4 буферов, выравнивание 8 байт;

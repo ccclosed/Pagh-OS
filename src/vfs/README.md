@@ -84,8 +84,13 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
 ### procfs (контракт `docs/procfs.md`)
 - Поверхность: `/proc` + `/proc/self` + `self/{exe,cmdline,status,maps,stat,statm,mounts,cgroup,mountinfo,limits}`
   + `{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}` + read-only
-  `/proc/sys/kernel/{ostype,osrelease,hostname}` + per-pid
+  `/proc/sys/kernel/{ostype,osrelease,hostname}` + `/proc/net/dev` (живые счётчики
+  канала; каталог `net` и файл `dev` — отдельные inode, §15) + per-pid
   `{cmdline,stat,status,maps,cgroup,mountinfo,limits,fd/*,fdinfo/*,task/*}`.
+  `/proc/net/dev` рендерится тем же ленивым проходом, что остальные файлы, из
+  `net::iface_stats()`: имя `eth0`, байты/пакеты RX/TX, драйверские `errs`/`drop`
+  (`usb-rndis`; у e1000 — нули), остальные Linux-колонки — нули. Формат и ширины —
+  в чистом `procfs_format::format_net_dev`.
   `/proc/<pid>/task/` (и `/proc/self/task/`) — per-thread view: по каталогу на каждый
   живой тред группы (`COMPAT_STATES`-запись с `tgid == pid`), сортировка по tid;
   `task/<tgid>/task/<tid>` резолвится в `pid_dir(tid)`, то есть это ТОТ ЖЕ VFS-объект/

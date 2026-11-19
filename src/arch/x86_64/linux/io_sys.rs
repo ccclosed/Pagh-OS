@@ -40,6 +40,7 @@ use super::cred::{Access, Creds};
 use super::dirent::{d_type_for, dirent_reclen, encode_dirent64};
 use super::errno::Errno;
 use super::io::{plan_lseek, plan_read};
+use super::net_if_sys;
 use super::{check_user_ptr, check_user_ptr_bounds, check_user_ptr_writable};
 // Два ioctl foreground-группы (`tcgetpgrp`/`tcsetpgrp`), как и бит `TOSTOP`,
 // берутся из чистой модели (`super::tty`), чтобы ядро и host-свойства не
@@ -2037,6 +2038,13 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
             vtconsole_ioctl(&node, request, arg)
         }
         Some(Resolved::Console) | Some(Resolved::Stdin) => tty_ioctl(request, arg),
+        // Сетевые `SIOCGIF*` — на любом `AF_INET`-сокете, как в Linux. До этой
+        // ветки они падали в общий ENOTTY, и `ifconfig` не видел ни адреса, ни
+        // флагов, хотя `/proc/net/dev` уже отдавал счётчики. Неизвестный
+        // запрос по-прежнему ENOTTY (внутри `if_ioctl`).
+        Some(Resolved::InetTcp(_)) | Some(Resolved::InetUdp(_)) => {
+            net_if_sys::if_ioctl(request, arg)
+        }
         // tty-запрос на не-tty дескриптор — «неподходящий ioctl для
         // устройства», а не «неверный аргумент». isatty() из glibc ждёт ENOTTY;
         // EINVAL ещё и зажигал diag на каждой пробе isatty у CPython (TCGETS на
