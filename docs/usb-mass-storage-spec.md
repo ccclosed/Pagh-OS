@@ -878,8 +878,8 @@ WAL-durable без flush. `umount2` делает дополнительный `d
 | 9 | u8 | `error` | 0 none, 1 io, 2 mount_failed, 3 flush_failed, 4 unsupported_fs, 5 no_media |
 | 10 | u16 | `reserved0` | 0 |
 | 12 | u32 | `seq` | live: монотонный (wrap); snapshot: 0 |
-| 16 | u64 | `sectors` | ёмкость в 512-байтовых секторах; `capacity = sectors * sector_size` |
-| 24 | u32 | `sector_size` | Phase 1 = 512; формула capacity общая |
+| 16 | u64 | `sectors` | число логических блоков размера `sector_size`; Phase 1: 512-байтовые секторы (= `BlockDevice::sector_count`); `capacity = sectors * sector_size` |
+| 24 | u32 | `sector_size` | размер логического блока; Phase 1 = 512 |
 | 28 | [u8;16] | `dev` | `"usb0p1"`, NUL-padded ASCII |
 | 44 | [u8;16] | `mount` | `"/usb0p1"` или `""`; NUL-padded; max 15 символов |
 | 60 | [u8;16] | `vendor` | INQUIRY vendor, ASCII, `?` для не-ASCII |
@@ -889,8 +889,10 @@ WAL-durable без flush. `umount2` делает дополнительный `d
 
 Итого 128 байт. Все `u16/u32/u64` — little-endian (x86_64). Строки — NUL-padded
 ASCII; не-ASCII/непечатаемое → `?`; если vendor/product/label пусты, UI fallback
-«USB-накопитель». `capacity = sectors * sector_size` — формула для UI (Phase 1
-`= sectors * 512`).
+«USB-накопитель». `capacity = sectors * sector_size` — формула для UI; в Phase 1
+`sector_size = 512`, поэтому `capacity = sectors * 512` и `sectors` совпадает с
+`BlockDevice::sector_count`. В будущем (4K logical block) `sectors` — логические
+блоки, а не 512-байтовые единицы; это фиксируется в ABI v2 вместе с `sector_size`.
 
 **Почему `label`, а не `serial`:** `serial` (VPD 0x80) в Phase 1 не читается (лишний
 SCSI-запрос ради диалога «Свойства»); `label` нужен Files для подписи тома и читается
