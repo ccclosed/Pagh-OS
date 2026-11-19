@@ -1,6 +1,6 @@
-# Контракт procfs для issue #11 — срезы 1–7
+# Контракт procfs для issue #11 — срезы 1–8
 
-**Статус:** контракт приёмки issue #11. Реализовано по срезам: срез 1 — вместе с `/proc` в `vfs::init()`; срез 2 — 2.9.0 (`/proc/stat`); срез 3 — 2.10.0 (`/proc/version`, `/proc/filesystems`, `/proc/loadavg`, read-only `/proc/sys/kernel/*`); срез 4 — 2.11.0 (per-pid `cmdline/stat/status/maps`, `/proc/self/{stat,statm}`, mountinfo/mounts/cgroup — в 2.12–2.15); срез 5 — 2.16.0 (`/proc/<pid>/fdinfo/<n>`, `/proc/self/fdinfo/<n>`, `/proc/<pid>/limits`, `/proc/self/limits`; §12); срез 6 — 2.19.0 (`/proc/<pid>/task/`, `/proc/self/task/` — per-thread view; §13); срез 7 — 2.20.0 (достоверные `maj:min`/`ino`/`pathname` в `/proc/<pid>/maps` для file-backed строк; §14). Отступления от текста ниже перечислены в коде и в `src/vfs/README.md`; DEVIATION-2 уточнён: рендер ленивый и живёт один проход чтения (`read(offset == 0)` перерисовывает), а не снимок на `open()`. Номера строк в ссылках исторические; имена файлов и функций стабильнее.
+**Статус:** контракт приёмки issue #11. Реализовано по срезам: срез 1 — вместе с `/proc` в `vfs::init()`; срез 2 — 2.9.0 (`/proc/stat`); срез 3 — 2.10.0 (`/proc/version`, `/proc/filesystems`, `/proc/loadavg`, read-only `/proc/sys/kernel/*`); срез 4 — 2.11.0 (per-pid `cmdline/stat/status/maps`, `/proc/self/{stat,statm}`, mountinfo/mounts/cgroup — в 2.12–2.15); срез 5 — 2.16.0 (`/proc/<pid>/fdinfo/<n>`, `/proc/self/fdinfo/<n>`, `/proc/<pid>/limits`, `/proc/self/limits`; §12); срез 6 — 2.19.0 (`/proc/<pid>/task/`, `/proc/self/task/` — per-thread view; §13); срез 7 — 2.20.0 (достоверные `maj:min`/`ino`/`pathname` в `/proc/<pid>/maps` для file-backed строк; §14); срез 8 — этап K (`/proc/net/dev` с живыми счётчиками канала; §15). Отступления от текста ниже перечислены в коде и в `src/vfs/README.md`; DEVIATION-2 уточнён: рендер ленивый и живёт один проход чтения (`read(offset == 0)` перерисовывает), а не снимок на `open()`. Номера строк в ссылках исторические; имена файлов и функций стабильнее.
 
 Источники решения: issue #11; `src/vfs/mod.rs` (трейт `VfsNode`); `src/vfs/ramfs.rs`;
 `src/arch/x86_64/linux/io_sys.rs` (резолв путей, `open`/`stat`/`readlink`/`getdents64`);
@@ -1468,3 +1468,66 @@ pid-каталог (алиас), поэтому `stat`/`status`/`cmdline` (и `m
 - ENOENT-правила не изменились: `/proc/<pid>/maps` существует для каждого живого pid,
   мёртвый pid — `ENOENT`, синтетические узлы (без `CompatState`) — `ENOENT` для
   `/proc/self/maps` (§5.5).
+
+## 15. Срез 8 (этап K): `/proc/net/dev`
+
+**Мотивация.** Флайаут «Сети» и Linux-инструменты (`ifconfig`, `busybox ifconfig`, любые
+читатели `/proc/net/dev`) не имели в ядре ни имени интерфейса, ни байтовых/пакетных
+счётчиков, ни состояния линка: счётчики жили только в RNDIS-драйвере, у e1000 их не было
+вовсе. Срез добавляет Linux-совместимый путь, из которого userspace получает реальные
+числа.
+
+### 15.1 Путь и inode
+
+| Путь | Вид | inode |
+|---|---|---|
+| `/proc/net` | каталог | `PROC_NET_DIR_INO` = `PROC_INO_BASE + 23` |
+| `/proc/net/dev` | regular, read-only | `PROC_INO_BASE + 24` |
+
+Таблица — `procfs_format::{PROC_NET_FILES, proc_net_file}`; каталог — `DirKind::NetDir`
+в `vfs/procfs.rs`. `readdir("/proc")`: `net` идёт после `mounts` (порядок закреплён
+`PROC_ROOT_ORDER`), `readdir("/proc/net")` — ровно `dev`. Неизвестное имя и запись в
+`dev` — `ENOENT`/`EACCES` как у остальных procfs-файлов; `write`-поверхность не
+расширяется.
+
+### 15.2 Формат
+
+Две шапки — дословно `net/core/net-procfs.c`, затем по строке на интерфейс:
+
+```text
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+  eth0: <rx_bytes> <rx_packets> <rx_errs> <rx_drop> <fifo> <frame> <compressed> <multicast> <tx_bytes> <tx_packets> <tx_errs> <tx_drop> <fifo> <colls> <carrier> <compressed>
+```
+
+- 16 числовых колонок; ширины совпадают с Linux (`%6s: %7llu %7llu %4llu %4llu %4llu
+  %5llu %10llu %9llu %8llu %7llu %4llu %4llu %4llu %5llu %7llu %10llu`), имя —
+  `{:>6}`. Парсеры читают поля по whitespace, но совпадать с эталоном дешевле, чем
+  объяснять расхождение.
+- Нет канала — только шапки (так Linux печатает пустую таблицу).
+- Источник строк — `net::iface_stats()`: имя `eth0`, байты/пакеты RX/TX из
+  `netstats::LinkCounters`, а `errs`/`drop` — драйверские счётчики RNDIS; у e1000
+  статистики нет, поэтому эти четыре колонки — честные нули (`docs`-правило: не
+  выдумывать числа).
+- Колонки `fifo`, `frame`, `compressed`, `multicast`, `colls`, `carrier` этот стек не
+  ведёт — нули, как Linux для драйвера без соответствующей статистики.
+
+### 15.3 Что считается (важно для интерпретации)
+
+Счётчики инкрементируются в `net::link::{Link::send, Link::recv}` — единственной
+воронке кадров, **после** драйвера: кадр, который драйвер принял к передаче (`send`
+вернул ненулевой размер) или отдал стеку (`recv` вернул `Some(len)`), а не байты на
+проводе. Отброшенный кадр не становится пакетом, пустая RX-очередь — не потеря. Байты
+включают заголовок Ethernet-кадра, как в Linux.
+
+### 15.4 Тесты
+
+- host-property `properties/net_dev.rs`: обе шапки дословно, 0/1/N строк, порядок строк,
+  16 полей и их позиции, `%6s`-выравнивание имени, нули в не ведущихся колонках, u64
+  без обрезки; `properties/net_counters.rs` — арифметика/монотонность/параллельный
+  инкремент счётчиков.
+- host-property `properties/procfs_maps.rs`: таблица путей стабильна, `dev` = `+24`,
+  каталог `+23`, inode'ы уникальны.
+- in-QEMU `src/test.rs::procfs_tests::tree_and_contents`: `/proc/net` — каталог с одним
+  `dev`, шапки дословно, строка `eth0` = 16 полей, ровно одна строка; без канала —
+  только шапки и `SKIP` (не `FAIL`). Маркер `NETDATA` несёт имя и строку для e2e.

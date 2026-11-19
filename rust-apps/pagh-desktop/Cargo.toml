@@ -8,8 +8,12 @@ description = "Userspace desktop compositor/server for Pagh-OS (PDP/1 protocol, 
 
 [workspace]
 
+# opt-level=3 для render-крейтов: P1 плана frame time. На "s"/"z" LLVM
+# отключает автовекторизацию и разворот циклов, а горячий путь композитора —
+# это попиксельные циклы blend/тени и построчный copy_row. Ядро (корневой
+# Cargo.toml, "z") не меняется: это другой workspace и другой бинарь.
 [profile.release]
 panic = "abort"
-opt-level = "s"
+opt-level = 3
 lto = true
 strip = true

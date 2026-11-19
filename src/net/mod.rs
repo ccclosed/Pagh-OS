@@ -37,6 +37,7 @@ pub mod http;
 pub mod http_fetch;
 pub mod ip;
 pub mod link;
+pub mod netstats;
 pub mod progress;
 pub mod tcp;
 pub mod tls;
@@ -796,6 +797,83 @@ pub fn ip_config() -> Option<IpConfig> {
         addr: cidr,
         gateway: state.gateway.unwrap_or(Ipv4Addr::UNSPECIFIED),
         mac: state.mac,
+    })
+}
+
+/// Имя единственного сетевого интерфейса.
+///
+/// Имя стабильное и Linux-совместимое (`eth0`): у стека один канал, а какой
+/// драйвер его обслуживает — деталь реализации, которую userspace видит в
+/// `/proc/net/dev` и `SIOCGIF*`. Драйверное имя (`e1000`/`usb-rndis`) остаётся
+/// в `link::Link::name` для логов.
+pub const IFACE_NAME: &str = "eth0";
+
+/// MTU, который объявляет канал (`SIOCGIFMTU`, `/proc/net/dev`).
+///
+/// e1000 и RNDIS принимают кадры до 1500 байт полезной нагрузки; больше стек и
+/// не отправляет (`wire::Ipv4` не фрагментирует под меньший MTU).
+pub const IFACE_MTU: u32 = 1500;
+
+/// Есть ли канал: `Some("eth0")`, если драйвер уже выбран, иначе `None`.
+///
+/// «Канал выбран» — то же условие, что у [`link::active`]: стек может
+/// существовать без канала (xHCI есть, RNDIS ещё не перечислен), и тогда
+/// интерфейса для userspace нет.
+pub fn iface_name() -> Option<&'static str> {
+    link::active().map(|_| IFACE_NAME)
+}
+
+/// Реальное состояние интерфейса для `/proc/net/dev` и `SIOCGIF*`.
+///
+/// Это снимок: каждый вызов заново берёт `NET` и атомарные счётчики, поэтому
+/// два чтения подряд отражают прогресс стека. `cidr`/`gateway` — `None` до
+/// DHCP/fallback; `running` — физический линк, а не «адрес назначен».
+#[derive(Clone, Copy, Debug)]
+pub struct IfaceStats {
+    pub name: &'static str,
+    pub mac: Mac,
+    pub cidr: Option<Ipv4Cidr>,
+    pub gateway: Option<Ipv4Addr>,
+    pub running: bool,
+    pub counters: netstats::LinkCounters,
+    /// Ошибки/потери приёма, которые считает драйвер. У e1000 их нет (нули):
+    /// драйвер не ведёт статистику, и выдумывать числа нельзя.
+    pub rx_errors: u64,
+    pub rx_dropped: u64,
+    pub tx_errors: u64,
+    pub tx_dropped: u64,
+    pub mtu: u32,
+}
+
+/// Снимок [`IfaceStats`] или `None`, если канала нет.
+///
+/// Лок `NET` берётся здесь и отпускается до возврата; `link::running`/
+/// `link::counters` не берут `NET`, поэтому порядок локов остаётся прежним
+/// (`NET` → `ACTIVE` → драйвер), как на путях передачи.
+pub fn iface_stats() -> Option<IfaceStats> {
+    let guard = NET.lock();
+    let state = guard.as_ref()?;
+    let kind = state.link?;
+    // Драйверские счётчики ошибок: RNDIS ведёт их сам, e1000 — нет.
+    let (rx_errors, rx_dropped, tx_errors, tx_dropped) = match kind {
+        Link::UsbRndis => {
+            let s = crate::drivers::usb_rndis::stats();
+            (s.rx_errors, s.rx_dropped, s.tx_errors, s.tx_dropped)
+        }
+        Link::E1000 => (0, 0, 0, 0),
+    };
+    Some(IfaceStats {
+        name: IFACE_NAME,
+        mac: state.mac,
+        cidr: state.cidr,
+        gateway: state.gateway,
+        running: link::running(),
+        counters: link::counters(),
+        rx_errors,
+        rx_dropped,
+        tx_errors,
+        tx_dropped,
+        mtu: IFACE_MTU,
     })
 }
 

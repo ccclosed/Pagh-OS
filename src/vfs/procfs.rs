@@ -90,6 +90,8 @@ enum DirKind {
     SysDir,
     /// `/proc/sys/kernel`.
     SysKernelDir,
+    /// `/proc/net` — каталог сетевой статистики (`docs/procfs.md` §15).
+    NetDir,
     /// `/proc/<pid>` с pid цели.
     Pid(u64),
     /// `/proc/self/fd` или `/proc/<pid>/fd` с pid цели.
@@ -135,6 +137,15 @@ fn sys_kernel_dir() -> Arc<dyn VfsNode> {
         name: String::from("kernel"),
         ino: fmt::PROC_SYS_KERNEL_DIR_INO,
         kind: DirKind::SysKernelDir,
+    })
+}
+
+/// `/proc/net` — read-only каталог сетевой статистики (Linux-совместимый путь).
+fn net_dir() -> Arc<dyn VfsNode> {
+    Arc::new(ProcDir {
+        name: String::from("net"),
+        ino: fmt::PROC_NET_DIR_INO,
+        kind: DirKind::NetDir,
     })
 }
 
@@ -288,6 +299,7 @@ impl VfsNode for ProcDir {
                 for e in fmt::PROC_FILES.iter().copied() {
                     out.push(file_for(e));
                 }
+                out.push(net_dir());
             }
             DirKind::SelfDir => {
                 for e in fmt::PROC_SELF_FILES.iter().copied() {
@@ -305,6 +317,11 @@ impl VfsNode for ProcDir {
             }
             DirKind::SysKernelDir => {
                 for e in fmt::PROC_SYS_FILES.iter().copied() {
+                    out.push(file_for(e));
+                }
+            }
+            DirKind::NetDir => {
+                for e in fmt::PROC_NET_FILES.iter().copied() {
                     out.push(file_for(e));
                 }
             }
@@ -360,6 +377,9 @@ impl VfsNode for ProcDir {
                 if name == "sys" {
                     return Ok(sys_dir());
                 }
+                if name == "net" {
+                    return Ok(net_dir());
+                }
                 // Числовые компоненты — per-pid дерево. Именно проверка живости
                 // делает это пространством имён, а не wildcard'ом: мёртвый (или
                 // никогда не использованный) pid — ENOENT, не пустой файл.
@@ -412,6 +432,9 @@ impl VfsNode for ProcDir {
                 }
             }
             DirKind::SysKernelDir => fmt::proc_sys_file(name)
+                .map(file_for)
+                .ok_or(VfsError::NotFound),
+            DirKind::NetDir => fmt::proc_net_file(name)
                 .map(file_for)
                 .ok_or(VfsError::NotFound),
             DirKind::Pid(pid) => {
@@ -619,6 +642,26 @@ impl ProcFile {
                     .map(|(point, fs)| (point.as_str(), *fs))
                     .collect();
                 fmt::format_mounts(&refs)
+            }
+            // Сетевые счётчики — живой снимок канала; канала нет — только две
+            // шапки (Linux так же печатает таблицу без интерфейсов). Формат и
+            // ширины колонок живут в чистом форматтере.
+            ProcKind::NetDev => {
+                let rows: Vec<fmt::NetDevRow> = crate::net::iface_stats()
+                    .map(|s| fmt::NetDevRow {
+                        name: s.name,
+                        rx_bytes: s.counters.rx_bytes,
+                        rx_packets: s.counters.rx_packets,
+                        rx_errs: s.rx_errors,
+                        rx_drop: s.rx_dropped,
+                        tx_bytes: s.counters.tx_bytes,
+                        tx_packets: s.counters.tx_packets,
+                        tx_errs: s.tx_errors,
+                        tx_drop: s.tx_dropped,
+                    })
+                    .into_iter()
+                    .collect();
+                fmt::format_net_dev(&rows)
             }
             // Узел `exe` — симлинк, а не читаемый файл.
             ProcKind::SelfExe => Vec::new(),

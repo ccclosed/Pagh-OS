@@ -11,6 +11,7 @@ pub mod device;
 pub mod ext2;
 pub mod format_policy;
 pub mod journal;
+pub mod mount_choice;
 
 /// Ошибки подсистемы файловых систем.
 ///

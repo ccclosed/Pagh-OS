@@ -1,175 +1,164 @@
-// Feature: phase 1 "groups separate from root", property P60: the pure
-// `/etc/passwd` + `/etc/group` layer the shell's `id`/`groups`/`su` commands use.
+// Feature: `shutdown(2)` at nr 48 (task-81), property `p60`: the pure
+// direction-closing policy in `src/arch/x86_64/linux/sock_shutdown.rs`.
 //
-// The files are the *data* half of the group model; the enforcement half is
-// `cred.rs` (P56) and the syscall boundary (`getgroups`/`setgroups`). A parser
-// bug here would be silent: `id` would print plausible groups that do not match
-// `/etc/group`, or `su` would load a different supplementary set than the file
-// says. The properties below therefore compare the parser/query results against
-// an independently written oracle over generated databases, and require the
-// render→parse round trip to be exact for well-formed entries.
+// Why this exists: `shutdown` is the half-close that `close` cannot express. A
+// client that finished writing had only `close`, which also destroys the
+// reading half; the peer therefore never saw a clean `SHUT_WR` EOF while the
+// connection was still usable in the other direction. The kernel now sets a
+// per-direction flag on the AF_UNIX queue (or orders a FIN in the TCP stack)
+// and every read/write/poll path asks this module what that flag means, so a
+// blocked peer wakes up instead of spinning in `yield_current()`.
+//
+// The errno order is the part that silently rots: Linux finds the descriptor
+// first (`EBADF`), then its kind (`ENOTSOCK`), then validates `how` (`EINVAL`),
+// and only then looks at the connection (`ENOTCONN`, TCP/UDP only). It was
+// verified on the host with a live kernel probe (`pipe` + `how=99` is
+// `ENOTSOCK`, unconnected TCP + `how=99` is `EINVAL`, an unconnected AF_UNIX
+// socket is a successful no-op), and these tests pin that table.
 
+use crate::errno::Errno;
+use crate::sock_shutdown::{
+    plan, read_at_eof, read_ready, write_alive, write_ready, Action, FdKind, How, SHUT_RD,
+    SHUT_RDWR, SHUT_WR,
+};
 use proptest::prelude::*;
 
-use crate::identity_db::{
-    group_by_gid, groups_for_user, parse_group, parse_passwd, supplementary_groups_for_user,
-    user_by_name, user_by_uid, GroupEntry, UserEntry,
-};
-
-/// Small alphabets keep collisions (same gid twice, same user name in two
-/// groups) reachable; that is where dedup and primary-group handling live.
-fn name() -> impl Strategy<Value = String> {
-    "[a-z]{1,6}".prop_map(String::from)
-}
-
-fn user_strategy() -> impl Strategy<Value = UserEntry> {
-    (name(), 0u32..8, 0u32..8).prop_map(|(name, uid, gid)| UserEntry {
-        name,
-        uid,
-        gid,
-        gecos: String::from("test"),
-        home: String::from("/home/test"),
-        shell: String::from("/bin/sh"),
-    })
-}
-
-fn group_strategy() -> impl Strategy<Value = GroupEntry> {
-    (name(), 0u32..8, prop::collection::vec(name(), 0..4)).prop_map(|(name, gid, members)| {
-        GroupEntry {
-            name,
-            gid,
-            members,
-        }
-    })
-}
-
-fn render_passwd(users: &[UserEntry]) -> String {
-    let mut out = String::new();
-    for u in users {
-        out.push_str(&format!(
-            "{}:x:{}:{}:{}:{}:{}\n",
-            u.name, u.uid, u.gid, u.gecos, u.home, u.shell
-        ));
-    }
-    out
-}
-
-fn render_group(groups: &[GroupEntry]) -> String {
-    let mut out = String::new();
-    for g in groups {
-        out.push_str(&format!("{}:x:{}:{}\n", g.name, g.gid, g.members.join(",")));
-    }
-    out
-}
-
-/// Independent oracle: primary gid first, then every distinct group gid in file
-/// order where the user is listed.
-fn oracle_groups(users: &[UserEntry], groups: &[GroupEntry], name: &str) -> Option<Vec<u32>> {
-    let user = users.iter().find(|u| u.name == name)?;
-    let mut out = vec![user.gid];
-    for group in groups {
-        let listed = group.members.iter().any(|m| m == name);
-        if listed && !out.contains(&group.gid) {
-            out.push(group.gid);
-        }
-    }
-    Some(out)
+fn kinds() -> impl Strategy<Value = FdKind> {
+    prop_oneof![
+        Just(FdKind::Absent),
+        Just(FdKind::NotSocket),
+        Just(FdKind::UnixConnected),
+        Just(FdKind::UnixUnconnected),
+        Just(FdKind::TcpConnected),
+        Just(FdKind::TcpUnconnected),
+        Just(FdKind::Udp),
+    ]
 }
 
 proptest! {
-    /// Well-formed entries survive render→parse byte-for-byte. The generator
-    /// never emits `:` or `,` in names, which is exactly the domain the parser
-    /// promises to round-trip.
+    /// Descriptor-less always wins, whatever `how` says — `sockfd_lookup` runs
+    /// before any protocol code.
     #[test]
-    fn passwd_round_trips(
-        users in prop::collection::vec(user_strategy(), 0..6),
-    ) {
-        let parsed = parse_passwd(&render_passwd(&users));
-        prop_assert_eq!(parsed, users);
+    fn absent_fd_is_ebadf(how in any::<u64>()) {
+        prop_assert_eq!(plan(FdKind::Absent, how), Err(Errno::EBADF));
     }
 
+    /// A non-socket descriptor is `ENOTSOCK`, even with a garbage `how`
+    /// (host probe: pipe + how=99 -> ENOTSOCK).
     #[test]
-    fn group_round_trips(
-        groups in prop::collection::vec(group_strategy(), 0..6),
-    ) {
-        let parsed = parse_group(&render_group(&groups));
-        prop_assert_eq!(parsed, groups);
+    fn non_socket_is_enotsock(how in any::<u64>()) {
+        prop_assert_eq!(plan(FdKind::NotSocket, how), Err(Errno::ENOTSOCK));
     }
 
-    /// `groups_for_user` equals the independent oracle for every user name that
-    /// appears in the generated passwd database.
+    /// `how` outside 0/1/2 is `EINVAL` for every socket kind, including the
+    /// unconnected ones (host probe: unconnected TCP + how=99 -> EINVAL).
     #[test]
-    fn groups_for_user_matches_the_oracle(
-        users in prop::collection::vec(user_strategy(), 1..5),
-        groups in prop::collection::vec(group_strategy(), 0..6),
-    ) {
-        for user in &users {
-            prop_assert_eq!(
-                groups_for_user(&users, &groups, &user.name),
-                oracle_groups(&users, &groups, &user.name)
-            );
+    fn bad_how_is_einval(kind in kinds(), how in any::<u64>()) {
+        prop_assume!(how > SHUT_RDWR);
+        if kind == FdKind::Absent || kind == FdKind::NotSocket {
+            return Ok(());
         }
-        // A name absent from passwd has no group set at all — not even an empty
-        // one (that would make `su unknown` look like a valid user).
-        prop_assert_eq!(groups_for_user(&users, &groups, "definitely-absent"), None);
+        prop_assert_eq!(plan(kind, how), Err(Errno::EINVAL));
     }
 
-    /// The set loaded into `setgroups(2)` is the display set minus the primary
-    /// gid: the kernel already knows egid, so listing it again would make
-    /// `getgroups(2)` report a group Linux would not.
+    /// An unconnected AF_UNIX socket has nothing to close and Linux succeeds
+    /// (it just checks `how`), while TCP/UDP report `ENOTCONN`.
     #[test]
-    fn supplementary_groups_exclude_primary_and_duplicates(
-        users in prop::collection::vec(user_strategy(), 1..5),
-        groups in prop::collection::vec(group_strategy(), 0..6),
-    ) {
-        for user in &users {
-            let display = groups_for_user(&users, &groups, &user.name).unwrap();
-            let supp = supplementary_groups_for_user(&users, &groups, &user.name).unwrap();
-            for gid in &supp {
-                prop_assert_ne!(*gid, user.gid);
-                prop_assert!(display.contains(gid));
+    fn connection_state_after_how(how in 0u64..=SHUT_RDWR) {
+        prop_assert_eq!(plan(FdKind::UnixUnconnected, how), Ok(Action::Noop));
+        prop_assert_eq!(plan(FdKind::TcpUnconnected, how), Err(Errno::ENOTCONN));
+        prop_assert_eq!(plan(FdKind::Udp, how), Err(Errno::ENOTCONN));
+    }
+
+    /// A connected socket maps `how` onto the two direction bits, and only
+    /// those bits: `SHUT_RD` never touches the write half and vice versa.
+    #[test]
+    fn connected_sockets_map_how_to_directions(how in 0u64..=SHUT_RDWR) {
+        let parsed = How::parse(how).unwrap();
+        let unix = plan(FdKind::UnixConnected, how).unwrap();
+        let tcp = plan(FdKind::TcpConnected, how).unwrap();
+        match unix {
+            Action::Unix { read, write } => {
+                prop_assert_eq!(read, parsed.shuts_read());
+                prop_assert_eq!(write, parsed.shuts_write());
             }
-            // Every non-primary display gid is present exactly once.
-            for gid in display.iter().skip(1) {
-                prop_assert_eq!(supp.iter().filter(|g| *g == gid).count(), 1);
+            _ => prop_assert!(false, "AF_UNIX chose a non-Unix action"),
+        }
+        match tcp {
+            Action::Tcp { read, write } => {
+                prop_assert_eq!(read, parsed.shuts_read());
+                prop_assert_eq!(write, parsed.shuts_write());
             }
+            _ => prop_assert!(false, "TCP chose a non-TCP action"),
         }
     }
+}
 
-    /// Lookups follow the first-match rule and never invent entries.
+/// The documented decision table, spelled out so no future edit can reorder the
+/// checks (the natural mistake: validating `how` first, which turns a non-socket
+/// with a garbage `how` into `EINVAL` instead of `ENOTSOCK`).
+#[test]
+fn errno_order_table_is_exhaustive() {
+    assert_eq!(plan(FdKind::Absent, SHUT_RD), Err(Errno::EBADF));
+    assert_eq!(plan(FdKind::Absent, 7), Err(Errno::EBADF));
+    assert_eq!(plan(FdKind::NotSocket, SHUT_RD), Err(Errno::ENOTSOCK));
+    assert_eq!(plan(FdKind::NotSocket, 7), Err(Errno::ENOTSOCK));
+    assert_eq!(plan(FdKind::UnixConnected, 7), Err(Errno::EINVAL));
+    assert_eq!(plan(FdKind::TcpUnconnected, 7), Err(Errno::EINVAL));
+    assert_eq!(plan(FdKind::TcpUnconnected, SHUT_WR), Err(Errno::ENOTCONN));
+    assert_eq!(plan(FdKind::Udp, SHUT_RDWR), Err(Errno::ENOTCONN));
+    assert_eq!(plan(FdKind::UnixUnconnected, SHUT_RDWR), Ok(Action::Noop));
+}
+
+/// Both halves independently: after `SHUT_WR` a reader sees EOF while the
+/// writer keeps *its own* read side open; after `SHUT_RD` a writer sees EPIPE
+/// while the reader keeps its own write side open.
+#[test]
+fn half_close_is_one_direction_only() {
+    // SHUT_WR: reader at EOF, writer's own receive side untouched.
+    assert!(read_at_eof(1, false, true));
+    assert!(read_ready(false, 1, false, true));
+    assert!(!write_alive(1, false, true));
+
+    // SHUT_RD: writer sees EPIPE, reader's own send side untouched.
+    assert!(!write_alive(1, true, false));
+    assert!(!write_ready(1, true, false, true));
+    assert!(read_at_eof(1, true, false));
+
+    // Untouched queue: neither side is closed.
+    assert!(!read_at_eof(1, false, false));
+    assert!(write_alive(1, false, false));
+    assert!(write_ready(1, false, false, true));
+    assert!(!write_ready(1, false, false, false));
+}
+
+proptest! {
+    /// Closing either direction is enough to break the opposite half; only a
+    /// fully healthy queue stays writable. (`write_alive` must never be true
+    /// when *any* shutdown flag is set — that is the flagged-write EPIPE.)
     #[test]
-    fn lookups_are_consistent(
-        users in prop::collection::vec(user_strategy(), 0..6),
-        groups in prop::collection::vec(group_strategy(), 0..6),
+    fn write_alive_requires_both_halves(
+        readers in 0usize..=4,
+        read_shut in any::<bool>(),
+        write_shut in any::<bool>(),
     ) {
-        // Generators may produce duplicate names/uids deliberately: the rule is
-        // FIRST match (getpwnam on a duplicated database), not "any match".
-        for user in &users {
-            let first_by_name = users.iter().find(|u| u.name == user.name);
-            prop_assert_eq!(user_by_name(&users, &user.name), first_by_name);
-            let first_by_uid = users.iter().find(|u| u.uid == user.uid);
-            prop_assert_eq!(user_by_uid(&users, user.uid), first_by_uid);
-        }
-        for group in &groups {
-            let first_by_gid = groups.iter().find(|g| g.gid == group.gid);
-            prop_assert_eq!(group_by_gid(&groups, group.gid), first_by_gid);
+        let alive = write_alive(readers, read_shut, write_shut);
+        prop_assert_eq!(alive, !read_shut && !write_shut && readers > 0);
+        if alive {
+            prop_assert!(read_ready(true, readers, read_shut, write_shut));
         }
     }
 
-    /// Arbitrary text — including colon/comma garbage, CRLF, comments and
-    /// out-of-range numbers — must never panic and never yields an empty name
-    /// or a non-numeric id.
+    /// A reader at EOF must never be reported as "no data yet" — otherwise the
+    /// blocked peer loops forever instead of returning `Ok(0)`.
     #[test]
-    fn arbitrary_text_is_skipped_not_panicked(text in ".*") {
-        let users = parse_passwd(&text);
-        for u in &users {
-            prop_assert!(!u.name.is_empty());
-            prop_assert!(!u.name.contains('\n'));
-        }
-        let groups = parse_group(&text);
-        for g in &groups {
-            prop_assert!(!g.name.is_empty());
-            prop_assert!(g.members.iter().all(|m| !m.is_empty()));
+    fn eof_is_read_ready(
+        writers in 0usize..=4,
+        read_shut in any::<bool>(),
+        write_shut in any::<bool>(),
+    ) {
+        if read_at_eof(writers, read_shut, write_shut) {
+            prop_assert!(read_ready(false, writers, read_shut, write_shut));
         }
     }
 }

@@ -3,6 +3,7 @@
 use crate::canvas::Canvas;
 use crate::geometry::{Point, Rect};
 use crate::icons::{self, Icon};
+use crate::netinfo::NetInfo;
 use crate::theme::Theme;
 
 /// Высота панели в пикселях.
@@ -119,17 +120,26 @@ pub fn chip_rect(screen: Rect, slot: usize) -> Rect {
     )
 }
 
-/// Состояние панели: часы, дата и доступность сети.
+/// Сеть на панели: три честных состояния вместо прежнего `bool`.
+///
+/// `NoData` — сервер ещё не прочитал `/proc/net/dev` (или канала нет); это не
+/// «офлайн», поэтому иконка приглушена, но диагонали «нет сети» нет: неизвестность
+/// нельзя выдавать за отключение.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetState {
+    NoData,
+    Offline,
+    Online,
+}
+
+/// Состояние панели: часы, дата и реальные сетевые данные.
 #[derive(Clone, Debug)]
 pub struct Panel {
     pub time: String,
     pub date: String,
-    /// Доступность сети. Единственный сетевой факт, который композитор знает:
-    /// ядро пока не отдаёт userspace ни IP, ни имя интерфейса, ни счётчики
-    /// (`/proc/net/dev`, `SIOCGIFADDR`/netlink отсутствуют), а сервер не
-    /// присылает сетевых событий. Флайаут показывает это значение и не рисует
-    /// того, чего в модели нет (IP, скорости, «Отключить»).
-    pub network_online: bool,
+    /// Сетевой сэмпл из ядра (`/proc/net/dev` + `SIOCGIF*`). `None` — данных
+    /// ещё нет: панель не выдумывает «онлайн» по умолчанию.
+    pub network: Option<NetInfo>,
     pub hover: Option<PanelHover>,
 }
 
@@ -138,8 +148,17 @@ impl Panel {
         Self {
             time: time.into(),
             date: date.into(),
-            network_online: true,
+            network: None,
             hover: None,
+        }
+    }
+
+    /// Состояние иконки: онлайн только при реальном `IFF_UP | IFF_RUNNING`.
+    pub fn net_state(&self) -> NetState {
+        match &self.network {
+            None => NetState::NoData,
+            Some(info) if info.up && info.running => NetState::Online,
+            Some(_) => NetState::Offline,
         }
     }
 
@@ -226,12 +245,13 @@ impl Panel {
             canvas.text(x, rect.y + (rect.h - 16) / 2, 1, theme.chip_text, s);
         }
 
-        // Сеть: проводной порт (ethernet). Выключенная сеть приглушена.
+        // Сеть: проводной порт (ethernet). Нет линка — приглушён и перечёркнут,
+        // нет данных — только приглушён (неизвестность не равна отключению).
         let net = network_rect(screen);
         if hover == Some(PanelHover::Network) {
             canvas.fill_rounded_rect(net.inset(2), 8, theme.panel_hover, 220);
         }
-        draw_network(canvas, net, theme, self.network_online);
+        draw_network(canvas, net, theme, self.net_state());
 
         // Часы и дата, выровненные по правому краю блока.
         let clock = clock_rect(screen);
@@ -280,8 +300,11 @@ fn draw_icon(canvas: &mut Canvas, icon: PanelIcon, cell: Rect, theme: &Theme) {
 /// один и тот же тип линка.
 ///
 /// Офлайн: глиф приглушается в `panel_icon_dim`, поверх сохраняется
-/// диагональ «нет сети» цветом `button_close`.
-fn draw_network(canvas: &mut Canvas, rect: Rect, theme: &Theme, online: bool) {
+/// диагональ «нет сети» цветом `button_close`. Нет данных (`NoData`) — тот же
+/// приглушённый глиф без диагонали: штрих утверждал бы «сети нет», а мы этого
+/// не знаем.
+fn draw_network(canvas: &mut Canvas, rect: Rect, theme: &Theme, state: NetState) {
+    let online = state == NetState::Online;
     let color = if online {
         theme.panel_icon
     } else {
@@ -289,7 +312,7 @@ fn draw_network(canvas: &mut Canvas, rect: Rect, theme: &Theme, online: bool) {
     };
     let center = rect.center();
     icons::draw(canvas, Icon::NetworkWired, 20, center, color, 255);
-    if !online {
+    if state == NetState::Offline {
         canvas.line(
             Point::new(center.x - 11, center.y + 11),
             Point::new(center.x + 11, center.y - 11),
@@ -370,11 +393,30 @@ mod tests {
         );
     }
 
+    /// Сэмпл сети для пиксельных проверок: поля реальные, значения — эталонные.
+    fn test_net(running: bool) -> NetInfo {
+        NetInfo {
+            iface: crate::netinfo::IFACE.to_string(),
+            ip: Some(std::net::Ipv4Addr::new(10, 0, 2, 15)),
+            prefix: Some(24),
+            mac: Some([0x52, 0x54, 0, 12, 34, 56]),
+            up: true,
+            running,
+            rx_bytes: 1234,
+            tx_bytes: 567,
+            rx_packets: 10,
+            tx_packets: 7,
+            rx_rate: 1200,
+            tx_rate: 340,
+            at: std::time::Instant::now(),
+        }
+    }
+
     /// Собрать кадр панели для пиксельных проверок иконки сети.
     fn panel_frame(online: bool) -> Canvas {
         let mut canvas = Canvas::new(1280, 720, crate::color::rgb(0, 0, 0));
         let mut panel = Panel::new("23:38", "15.11.2026");
-        panel.network_online = online;
+        panel.network = Some(test_net(online));
         panel.draw(&mut canvas, SCREEN, &Theme::default(), None, &[]);
         canvas
     }
@@ -530,5 +572,46 @@ mod tests {
             theme.panel_icon,
             "центр иконки не должен быть сплошной заливкой"
         );
+    }
+
+    /// Нет данных (`None`) — приглушённый глиф без диагонали: «неизвестно» не
+    /// притворяется ни «онлайн», ни «отключено».
+    #[test]
+    fn network_icon_without_data_is_dim_and_unstruck() {
+        let theme = Theme::default();
+        let mut canvas = Canvas::new(1280, 720, crate::color::rgb(0, 0, 0));
+        let panel = Panel::new("23:38", "15.11.2026");
+        assert_eq!(panel.net_state(), NetState::NoData);
+        panel.draw(&mut canvas, SCREEN, &theme, None, &[]);
+
+        let center = network_rect(SCREEN).center();
+        let (source_x, source_y, alpha) = opaque_off_diagonal();
+        let point = Point::new(center.x - 10 + source_x, center.y - 10 + source_y);
+        let background = canvas.get(500, point.y);
+        let expected = crate::color::blend(
+            background,
+            crate::color::rgba(
+                crate::color::red(theme.panel_icon_dim),
+                crate::color::green(theme.panel_icon_dim),
+                crate::color::blue(theme.panel_icon_dim),
+                alpha,
+            ),
+            255,
+        );
+        assert_eq!(
+            canvas.get(point.x, point.y),
+            expected,
+            "без данных иконка должна быть panel_icon_dim"
+        );
+        assert!(
+            lit_pixels(&canvas, 20).len() > 40,
+            "без данных иконка должна оставаться видимой"
+        );
+        let struck = canvas
+            .pixels()
+            .iter()
+            .filter(|p| **p == theme.button_close)
+            .count();
+        assert_eq!(struck, 0, "без данных диагонали «нет сети» быть не должно");
     }
 }

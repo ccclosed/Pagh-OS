@@ -187,11 +187,9 @@ value }` (24 байта) → EV_KEY/EV_REL/EV_SYN → те же `Compositor::poi
   бинарников через debugfs: `pd` = композитор, `pagh-files`, `pagh-terminal`,
   `pagh-desktop-demo`), затем на втором boot доказывает по serial и кадрам QEMU:
   fbdev ioctl+mmap, takeover, selfcheck пикселей scanout, F10-меню, REL/BTN_LEFT
-  через QMP; **rubber-band выделение** (press+drag по пустым обоям даёт
-  `selection drag start`/`selection committed rect=…`, и PPM-дамп доказывает
-  отрисовку рамки счётом пикселей внутри зафиксированного прямоугольника, а не
-  разницей кадров — курсор сам меняет ~250 пикселей и раньше давал ложный PASS);
-  **реальное окно `pagh-files`** (строка
+  через QMP; **rubber-band выделение**: press+drag по пустым обоям даёт serial
+  `selection drag start`/`selection committed`, а `e2e_desktop_selection.png`
+  отличается от кадра без выделения; **реальное окно `pagh-files`** (строка
   `pagh-files: окно ... (сокет ...)`) и его живучесть после клика; **реальный
   PDP/1 `launch` (type 13)**: Alt+Shift+F4 в Files заставляет композитор
   запустить настроенный `--launch-target`, и записанный в `/mnt/launch-evidence`

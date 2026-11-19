@@ -53,6 +53,9 @@ struct Args {
     screenshots: Option<PathBuf>,
     /// Run as the shell child of a terminal session (`--shell-child`).
     shell_child: bool,
+    /// Optional program for the session's child (default: this binary in
+    /// `--shell-child` mode). Used to drive a real shell once one exists.
+    shell_cmd: Option<PathBuf>,
     /// Keep the old windowed behaviour: mirror the kernel boot VT instead of
     /// starting a private shell session.
     mirror_vt: bool,
@@ -88,6 +91,7 @@ impl Default for Args {
             feed: None,
             screenshots: None,
             shell_child: false,
+            shell_cmd: None,
             mirror_vt: false,
             help: false,
             version: false,
@@ -536,8 +540,11 @@ fn run_vt(args: &Args, path: &str) -> Result<(), String> {
             continue;
         };
 
+        // Нулевой дедлайн + неблокирующий сокет: забираем то, что уже пришло,
+        // и возвращаемся к выводу shell'а. Иначе окно ждало бы только события
+        // композитора и не заметило бы эхо/строку, напечатанную потомком.
         for event in client
-            .poll_events(Duration::from_millis(16))
+            .poll_events(Duration::ZERO)
             .map_err(|e| format!("poll: {e}"))?
         {
             match event {
@@ -601,6 +608,45 @@ fn run_vt(args: &Args, path: &str) -> Result<(), String> {
     }
 }
 
+/// Отправить полный кадр, временно вернув сокету блокирующий режим.
+///
+/// UI-цикл держит сокет неблокирующим, чтобы не зависнуть в `read` (ядро
+/// игнорирует `SO_RCVTIMEO`). Но `commit` — это `write` целого кадра; на
+/// неблокирующем сокете большой кадр может быть принят частично и вернуть
+/// `EAGAIN`. Блокирующая запись дожидается приёма всего кадра композитором.
+fn commit_blocking(client: &mut SurfaceClient, canvas: &Canvas) -> Result<(), String> {
+    client
+        .set_nonblocking(false)
+        .map_err(|e| format!("commit: {e}"))?;
+    // Ядро отдаёт EAGAIN и на блокирующем сокете, когда буфер приёма
+    // композитора полон (кадр больше него): ждём, пока он вычитает порцию,
+    // вместо того чтобы ронять сессию на первом же большом кадре.
+    let mut result = Ok(());
+    for _ in 0..80 {
+        match client.commit(canvas) {
+            Ok(()) => {
+                result = Ok(());
+                break;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                result = Err(format!("commit: {error}"));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => {
+                result = Err(format!("commit: {error}"));
+                break;
+            }
+        }
+    }
+    client
+        .set_nonblocking(true)
+        .map_err(|e| format!("commit: {e}"))?;
+    result
+}
+
 /// Оконная shell-сессия: отдельный процесс-shell за двумя pipe'ами.
 ///
 /// Окно не читает `/dev/vtconsole0` и не пишет в `/dev/vtinput`: вывод потомка
@@ -608,8 +654,11 @@ fn run_vt(args: &Args, path: &str) -> Result<(), String> {
 /// boot-лог не появляется, а ввод не уходит в `lxrun`/desktop, который держит
 /// консоль в форграунде.
 fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
-    let child = session::self_shell_command(std::env::args().next().as_deref())
-        .map_err(|e| format!("shell child: {e}"))?;
+    let child = match &args.shell_cmd {
+        Some(program) => std::process::Command::new(program),
+        None => session::self_shell_command(std::env::args().next().as_deref())
+            .map_err(|e| format!("shell child: {e}"))?,
+    };
     let mut shell = ShellSession::spawn(child).map_err(|e| format!("shell child: {e}"))?;
 
     let mut client = SurfaceClient::connect(socket).map_err(|e| format!("{socket}: {e}"))?;
@@ -623,15 +672,45 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
     client
         .create_window(args.window_id, args.size.0, args.size.1, &args.title)
         .map_err(|e| format!("create_window: {e}"))?;
-
+    // Ядро игнорирует SO_RCVTIMEO, поэтому «чтение с таймаутом» здесь означало бы
+    // вечную блокировку на простое и никогда не прочитанный вывод shell'а.
     let theme = Theme::default();
     let mut width = args.size.0.max(64);
     let mut height = args.size.1.max(32);
     let (cols, rows) = layout(width, height);
     let mut terminal = pagh_terminal::Terminal::with_scrollback(cols, rows, 2000);
+
+    // ShmSurface: рендер прямо в общий mmap, по сокету — только damage. Это не
+    // оптимизация «на будущее», а разница между отзывчивым эхом и кадром 2 МиБ
+    // на каждую нажатую клавишу (в QEMU-TCG такой кадр идёт сотни миллисекунд).
+    // Сервер объявляет capability битом 2 welcome; если что-то не сложилось —
+    // молча откатываемся на полный кадр, как legacy-клиент.
+    let mut shm = match client.enable_shm(width, height) {
+        Ok(shm) => shm,
+        Err(error) => {
+            eprintln!("pagh-terminal: shm unavailable ({error}); full frames");
+            None
+        }
+    };
+    let mut fallback: Option<Canvas> = if shm.is_none() {
+        Some(Canvas::new(width as usize, height as usize, theme.bg))
+    } else {
+        None
+    };
+    let mut tracker = pagh_ui::damage::DamageTracker::new(
+        pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32),
+        pagh_ui::damage::DEFAULT_TILE,
+    );
+    // Ядро игнорирует SO_RCVTIMEO, поэтому «чтение с таймаутом» здесь означало бы
+    // вечную блокировку на простое и никогда не прочитанный вывод shell'а.
+    client
+        .set_nonblocking(true)
+        .map_err(|e| format!("nonblocking: {e}"))?;
+
     let mut dirty = true;
     let mut exited_reported = false;
     let mut input_error_reported = false;
+    let mut last_commit = Instant::now();
 
     loop {
         // Вывод shell'а приходит асинхронно: забираем всё, что уже прочитал
@@ -657,14 +736,11 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
             }
         }
 
-        if dirty {
-            let canvas = render_frame(&terminal.screen, &theme, width, height);
-            client.commit(&canvas).map_err(|e| format!("commit: {e}"))?;
-            dirty = false;
-        }
-
+        // Нулевой дедлайн + неблокирующий сокет: забираем то, что уже пришло,
+        // и возвращаемся к выводу shell'а. Иначе окно ждало бы только события
+        // композитора и не заметило бы эхо/строку, напечатанную потомком.
         for event in client
-            .poll_events(Duration::from_millis(16))
+            .poll_events(Duration::ZERO)
             .map_err(|e| format!("poll: {e}"))?
         {
             match event {
@@ -673,8 +749,47 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
                     height = configure.height.max(32);
                     let (cols, rows) = layout(width, height);
                     terminal.resize(cols, rows);
+                    let same_size = shm.as_ref().is_some_and(|frame| {
+                        frame.canvas.width == width as usize
+                            && frame.canvas.height == height as usize
+                    });
+                    if same_size {
+                        dirty = true;
+                        continue;
+                    }
+                    let resized = match shm.as_mut() {
+                        Some(frame) => client.resize_shm(frame, width, height).unwrap_or(false),
+                        None => false,
+                    };
+                    if resized {
+                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
+                    } else {
+                        if let Some(stale) = shm.take() {
+                            let _ = client.release_shm(&stale);
+                        }
+                        fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
+                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
+                    }
                     dirty = true;
                 }
+                Event::ShmRelease {
+                    window_id,
+                    generation,
+                } => {
+                    if window_id == args.window_id
+                        && shm
+                            .as_ref()
+                            .is_some_and(|frame| frame.generation == generation)
+                    {
+                        if let Some(stale) = shm.take() {
+                            let _ = client.release_shm(&stale);
+                        }
+                        fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
+                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
+                        dirty = true;
+                    }
+                }
+                Event::ShmReady { .. } => {}
                 Event::Input(InputEvent::Key {
                     code,
                     pressed,
@@ -723,6 +838,54 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
                 _ => {}
             }
         }
+        // Кадр — полный (2 МиБ на 900×600), поэтому отправлять его на каждое
+        // эхо-нажатие нельзя: окно перестало бы успевать читать ввод, пока
+        // композитор принимает предыдущий кадр. 40 мс — 25 кадров/с, при этом
+        // события выше уже разобраны, так что Enter не ждёт за кадром.
+        let now = Instant::now();
+        if dirty && now.duration_since(last_commit) >= Duration::from_millis(40) {
+            if let Some(frame) = shm.as_mut() {
+                frame.canvas.fill(theme.bg);
+                render_screen_into(
+                    &mut frame.canvas,
+                    VIEWPORT_PADDING,
+                    VIEWPORT_PADDING,
+                    &terminal.screen,
+                    &theme,
+                    &RenderOptions::default(),
+                );
+                let damage = tracker.update(&frame.canvas);
+                match client.commit_shm(frame, damage) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        // Поколение устарело (композитор пересоздал поверхность):
+                        // дальше — полный кадр, как legacy-клиент.
+                        if let Some(stale) = shm.take() {
+                            let _ = client.release_shm(&stale);
+                        }
+                        fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
+                        dirty = true;
+                    }
+                    Err(error) => return Err(format!("commit_shm: {error}")),
+                }
+            } else if let Some(canvas) = fallback.as_mut() {
+                canvas.fill(theme.bg);
+                render_screen_into(
+                    canvas,
+                    VIEWPORT_PADDING,
+                    VIEWPORT_PADDING,
+                    &terminal.screen,
+                    &theme,
+                    &RenderOptions::default(),
+                );
+                commit_blocking(&mut client, canvas)?;
+            }
+            dirty = false;
+            last_commit = Instant::now();
+        }
+        // Короткий сон: ввод и вывод shell'а замечаются в пределах кадра, а
+        // простаивающее окно не крутит CPU.
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -795,6 +958,9 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
                 out.screenshots = Some(PathBuf::from(next_value(&mut args, "--screenshots")?))
             }
             "--shell-child" => out.shell_child = true,
+            "--shell-cmd" => {
+                out.shell_cmd = Some(PathBuf::from(next_value(&mut args, "--shell-cmd")?))
+            }
             "--mirror-vt" => out.mirror_vt = true,
             "--help" | "-h" => out.help = true,
             "--version" | "-V" => out.version = true,
@@ -881,6 +1047,8 @@ LIVE:
   --mirror-vt      keep mirroring the boot VT in the window instead of starting
                    the session (diagnostics; the boot VT is held by lxrun)
   --shell-child    internal: run as the session's shell process (pipes)
+  --shell-cmd PATH child program for the session (default: this binary with
+                   --shell-child; use a real shell when the image has one)
 
 SCREENSHOTS:
   --screenshots DIR  regenerate the committed demo PNG fixtures

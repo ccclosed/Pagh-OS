@@ -82,7 +82,7 @@ pub mod rand_clock;
 
 // Блокирующее чтение сокета: чистое решение «продолжать ждать / EOF / EBADF»,
 // которое ядро принимает на каждой уступке CPU (`src/arch/x86_64/linux/
-// sock_wait.rs`). `core`-only, поэтому host-свойство `p58` исполняет ровно тот
+// sock_wait.rs`). `core`-only, поэтому host-свойство `p59` исполняет ровно тот
 // исходник, который компилирует ядро.
 #[path = "../../src/arch/x86_64/linux/sock_wait.rs"]
 pub mod sock_wait;
@@ -250,6 +250,13 @@ pub mod kill;
 #[path = "../../src/arch/x86_64/linux/tty.rs"]
 pub mod tty;
 
+// `net_if_abi` — чистый ABI `SIOCGIF*`: 40-байтный `ifreq` (name 16 @0,
+// union @16), `sockaddr_in`/`sockaddr` для адреса/маски/MAC и номера запросов
+// из Linux UAPI. `core`-only, без `super::`-зависимостей, поэтому host-свойство
+// `net_if_abi` кодирует/декодирует ровно тот источник, что компилирует ядро.
+#[path = "../../src/arch/x86_64/linux/net_if_abi.rs"]
+pub mod net_if_abi;
+
 // `regs` is the pure 15-GPR syscall frame contract (`repr(C)`, `rax` at offset
 // 112) — `core`-only and self-contained, included here so the tick-path frame
 // mirror below can be asserted against the REAL struct rather than a copy.
@@ -322,6 +329,14 @@ pub mod ca_bundle;
 #[path = "../../src/net/tls_auth.rs"]
 pub mod tls_auth;
 
+// `netstats` — счётчики канала (`/proc/net/dev`, `SIOCGIF*`): байты и пакеты
+// RX/TX. `core`-only (атомики) и самодостаточный, поэтому host-свойство
+// `net_counters` исполняет ровно тот исходник, что компилирует ядро, и
+// проверяет и арифметику, и межпоточный инкремент (в QEMU это ловится только
+// вероятностно).
+#[path = "../../src/net/netstats.rs"]
+pub mod netstats;
+
 // `seed` is the pure `AT_RANDOM` fallback mixer (issue #16): a SHA-256
 // transcript over independent boot-time sources plus a counter-based derivation.
 // `core` + `sha2` only (no I/O, no globals), so P51 exercises the exact source
@@ -344,6 +359,16 @@ pub mod link_walk;
 // that no CI job could reach, because no CI job ever boots the kernel.
 #[path = "../../src/fs/format_policy.rs"]
 pub mod format_policy;
+
+// `mount_choice` is the recorded boot-time mount choice — the marker that makes
+// the disk menu a once-per-machine question instead of an every-boot 20 s
+// ritual (or, as the `has_pagh_volume` skip did, a question nobody ever saw).
+// Pure `core`, no I/O: `boot::init_fs` reads and writes one raw sector through
+// `BlockDevice`, so the property is that any damaged, foreign or random sector
+// reads as "no choice" — the failure mode being a silently skipped menu, which
+// decides a mount on the operator's behalf.
+#[path = "../../src/fs/mount_choice.rs"]
+pub mod mount_choice;
 
 // `nvme_prp` is the NVMe driver's pure transfer arithmetic: PRP1/PRP2 and the
 // PRP-list page contents (NVMe Base Spec §3.3.3), LBA-aligned command chunking,
@@ -549,6 +574,18 @@ mod properties {
     mod p47;
     mod p48;
     mod p49;
+    // Канальные счётчики (`src/net/netstats.rs`): нулевой старт, точная
+    // арифметика байтов/пакетов, нулевая длина не считается, монотонность,
+    // отсутствие потерь при параллельном инкременте из нескольких потоков.
+    mod net_counters;
+    // `/proc/net/dev` (этап K1, контракт `docs/procfs.md` §15): две шапки
+    // дословно как в Linux, строка `%6s:` + 16 колонок в фиксированном порядке,
+    // нули в не ведущихся колонках, u64 без обрезки.
+    mod net_dev;
+    // `ifreq`/`sockaddr` ABI для `SIOCGIF*` (этап K2): точные константы Linux
+    // UAPI, раскладка/смещения, round-trip имени и `sockaddr_in`/`sockaddr`,
+    // байтовый порядок порта и адреса.
+    mod net_if_abi;
     // procfs (issue #11, contract `docs/procfs.md` §7): meminfo columns + the
     // libuv `strstr`/`sscanf` substrings; cpuinfo block/`\t: ` separators and the
     // truthfulness of the `flags` line against the CPUID bits; uptime arithmetic
@@ -656,6 +693,7 @@ mod properties {
     mod p51;
     mod p52;
     mod p53;
+    mod p58;
 
     // Controlling-terminal job control: the pure foreground-group/TOSTOP model
     // behind TIOCGPGRP/TIOCSPGRP and the SIGTTIN/SIGTTOU signal choice.
@@ -714,6 +752,29 @@ mod properties {
     // number.
     mod p56;
 
+    // Setuid/setgid-on-exec + login identities (non-root A1/A2): the pure
+    // `bprm_fill_uid()` decision (`exec_setid`), the exact "no bits => identical
+    // credentials" law, the secureexec flag and `Creds::for_login`.
+    // `p59` is the blocking-read wakeup property and `p60` the shutdown policy,
+    // so this is `p61`.
+    mod p61;
+
+    // `/etc/shadow` + `$6$` SHA-512-crypt (non-root A4): known `openssl passwd -6`
+    // vectors, fail-closed locked/unknown methods, and line-preserving rewrite.
+    // `p60` is the shutdown policy, so this is `p62`.
+    mod p62;
+
+    // Non-root phase 2 (agent B): the sticky-directory deletion rule
+    // (`S_ISVTX`, /tmp 1777). Isolated from P56's ordinary permission matrix so
+    // that a regression in either rule names itself.
+    mod p63;
+
+    // Non-root phase 2 (agent B): the network admission policy — privileged
+    // `bind(2)` ports (`< 1024`, root only) and the `SOCK_RAW` gate. Pure
+    // decisions the AF_INET syscall path applies before touching the stack.
+    // `p60` is the shutdown policy, so this is `p64`.
+    mod p64;
+
     // Socket payload cap (`sendto`/`recvfrom`): the kernel validated with a
     // capped length and then allocated/copied the raw u64 count (2026-11-13
     // audit follow-up, F-x86v-1 allocation class). P57 pins the single policy.
@@ -722,44 +783,21 @@ mod properties {
     // Blocking AF_UNIX read wakeup: a read fd closed from a sibling thread must
     // end the wait (`EBADF`), a peer close must produce `EOF`, and a live queue
     // must keep waiting. Pins the watchdog `nr=45 arg0=0x3 closed` regression.
-    mod p58;
+    // `p58` is taken by the phase-1 groups identity property, so this is `p59`.
+    mod p59;
 
     // `shutdown(2)` half-close policy (task-81): errno order and the
     // per-direction read/write/poll answers. Pinned against a live-kernel probe.
-    mod p59;
-
-    // Phase-1 group model, data half: the pure `/etc/passwd` + `/etc/group`
-    // parser/query layer behind `id`/`groups`/`su`, compared against an
-    // independently written oracle plus exact render→parse round trips.
-    // `p58`/`p59` were taken by sock_wait/shutdown, so this is P60.
+    // `p59` is the blocking-read wakeup property, so this is `p60`.
     mod p60;
-
-    // Setuid/setgid-on-exec + login identities (non-root A1/A2): the pure
-    // `bprm_fill_uid()` decision (`exec_setid`), the exact "no bits => identical
-    // credentials" law, the secureexec flag and `Creds::for_login`.
-    // (`p59`/`p60` were already taken, so this is P61.)
-    mod p61;
-
-    // `/etc/shadow` + `$6$` SHA-512-crypt (non-root A4): known `openssl passwd -6`
-    // vectors, fail-closed locked/unknown methods, and line-preserving rewrite.
-    mod p62;
-
-    // Non-root phase 2 (agent B): the sticky-directory deletion rule
-    // (`S_ISVTX`, /tmp 1777). Isolated from P56's ordinary permission matrix so
-    // that a regression in either rule names itself. (`p59`/`p60` were taken,
-    // so this is P63.)
-    mod p63;
-
-    // Non-root phase 2 (agent B): the network admission policy — privileged
-    // `bind(2)` ports (`< 1024`, root only) and the `SOCK_RAW` gate. Pure
-    // decisions the AF_INET syscall path applies before touching the stack.
-    mod p64;
 
     // Blocking AF_UNIX delivery: the wait step must be a SLEEP (not the
     // `yield_current` busy-spin that starved the CPU under the compat lock), and
     // `SO_RCVTIMEO` must turn a still-live queue into `EAGAIN` instead of an
     // eternal `recv`. Pins the live PDP-client `poll()` hang (`nr=45` watchdog)
     // and the `timeval`→milliseconds conversion the kernel lost.
+    // `p60` is the shutdown half-close policy above, so this is `p65` (the
+    // next free number after the non-root phase-2 properties P61–P64).
     mod p65;
 
     // NVMe PRP lists + queue-depth arithmetic (PRP1/PRP2/list page, LBA chunk
@@ -786,6 +824,13 @@ mod properties {
     // effectful fd-table half is covered by the in-QEMU `desktop-b::SCM_RIGHTS`
     // routines.
     mod scm_cmsg;
+
+    // Recorded boot-time mount choice (`src/fs/mount_choice.rs`): the marker
+    // that makes the disk menu a once-per-machine question. Round trip of the
+    // written sector, and — the failure mode that decides a mount on the
+    // operator's behalf — every damaged or foreign sector reads as "no choice",
+    // so the menu is asked again instead of silently skipped.
+    mod mount_choice;
 
     // Demand-paged user buffers on the general `read(2)`/`write(2)` path: the
     // per-page acceptance table (`validate::page_acceptance`) shared by the

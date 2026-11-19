@@ -1,13 +1,35 @@
-//! Headless-рендер сетевого флайаута: PNG «до/после» и проверки кадра.
+//! Headless-рендер сетевого флайаута: три честных состояния и проверки кадра.
 //!
 //! Композитор рисует 1280×720 в память, поэтому вид флайаута проверяется без
 //! QEMU/дисплея. PNG-файлы кладутся в `.cache/netfly/` (каталог git-ignored):
-//! `flyout-online.png` — сеть есть, `flyout-offline.png` — сети нет.
+//! `flyout-online.png` — линк есть и данные реальные (`eth0 · 10.0.2.15/24` +
+//! `↓N Б/с ↑N Б/с`), `flyout-offline.png` — `IFF_RUNNING` снят,
+//! `flyout-nodata.png` — сэмпла ещё нет (`None`), и флайаут не выдумывает чисел.
 
 use pagh_desktop::compositor::{Compositor, MouseButton};
-use pagh_desktop::geometry::Rect;
+use pagh_desktop::geometry::{Point, Rect};
+use pagh_desktop::netinfo::{self, NetInfo};
 use pagh_desktop::panel;
 use pagh_desktop::png;
+
+/// Сэмпл, который в QEMU отдаёт ядро: один интерфейс `eth0`, DHCP 10.0.2.15/24.
+fn sample(running: bool) -> NetInfo {
+    NetInfo {
+        iface: netinfo::IFACE.to_string(),
+        ip: Some("10.0.2.15".parse().expect("IPv4")),
+        prefix: Some(24),
+        mac: Some([0x52, 0x54, 0, 12, 34, 56]),
+        up: true,
+        running,
+        rx_bytes: 4096,
+        tx_bytes: 2048,
+        rx_packets: 20,
+        tx_packets: 10,
+        rx_rate: 1536,
+        tx_rate: 340,
+        at: std::time::Instant::now(),
+    }
+}
 
 fn open_network_flyout(compositor: &mut Compositor) -> Rect {
     let center = panel::network_rect(compositor.screen()).center();
@@ -21,7 +43,7 @@ fn open_network_flyout(compositor: &mut Compositor) -> Rect {
     flyout.rect
 }
 
-/// Пиксели цвета `color` внутри `area` (центры пикселей, границы включительно).
+/// Пиксели цвета `color` внутри `area` (границы включительно).
 fn count_color(compositor: &Compositor, area: Rect, color: pagh_desktop::color::Color) -> usize {
     let mut count = 0;
     for y in area.y..area.bottom() {
@@ -34,18 +56,21 @@ fn count_color(compositor: &Compositor, area: Rect, color: pagh_desktop::color::
     count
 }
 
-/// Число пикселей, где кадры различаются.
-fn diff(a: &pagh_desktop::canvas::Canvas, b: &pagh_desktop::canvas::Canvas) -> usize {
-    a.pixels()
+/// Число различающихся пикселей между текущим кадром и снимком.
+fn diff_with(compositor: &Compositor, snapshot: &pagh_desktop::canvas::Canvas) -> usize {
+    compositor
+        .frame()
+        .pixels()
         .iter()
-        .zip(b.pixels().iter())
+        .zip(snapshot.pixels().iter())
         .filter(|(left, right)| left != right)
         .count()
 }
 
 #[test]
-fn network_flyout_online_offline_render() {
+fn network_flyout_online_offline_nodata_render() {
     let mut compositor = Compositor::new(1280, 720);
+    compositor.set_network_info(Some(sample(true)));
     let rect = open_network_flyout(&mut compositor);
 
     let panel_top = panel::panel_rect(compositor.screen()).y;
@@ -63,21 +88,33 @@ fn network_flyout_online_offline_render() {
     png::write_png(dir.join("flyout-online.png"), compositor.frame()).expect("PNG online");
     let online = compositor.frame().snapshot();
 
-    // Карточка подключения — подложка `chip_bg` (348×56 за вычетом иконки/текста).
-    let card_pixels = count_color(&compositor, rect, compositor.theme().chip_bg);
+    // Карточка подключения — подложка `chip_bg` (348×76 за вычетом иконки/текста).
+    let card = Rect::new(rect.x + 12, rect.y + 64, rect.w - 24, 76);
+    let card_pixels = count_color(&compositor, card, compositor.theme().chip_bg);
     assert!(
         card_pixels > 10_000,
         "карточка подключения не нарисована: {card_pixels}"
     );
-    let online_text = count_color(&compositor, rect, compositor.theme().menu_text);
+
+    // Первая строка карточки — имя/адрес (`eth0 · 10.0.2.15/24`), вторая —
+    // реальные скорости. Обе рисуются цветами `menu_text`/`menu_text_dim`
+    // (иконка занимает левые 48 px, поэтому текстовые области — правее).
+    let line_one = Rect::new(card.x + 48, card.y + 22, card.w - 48, 16);
+    let line_two = Rect::new(card.x + 48, card.y + 46, card.w - 48, 16);
+    let text_one = count_color(&compositor, line_one, compositor.theme().menu_text);
+    let text_two = count_color(&compositor, line_two, compositor.theme().menu_text_dim);
+    assert!(
+        text_one > 60,
+        "имя/адрес интерфейса не нарисованы: {text_one}"
+    );
+    assert!(text_two > 60, "строка скоростей не нарисована: {text_two}");
 
     // Иконка карточки — готовый глиф Plug Connected 24 px, тинтованный
     // panel_icon. Непрозрачный пиксель ищется по маске, а не хардкодится:
     // фазовая подгонка ассетов сдвигает глиф на полпикселя, и координата
     // «(19,11)» перестаёт быть непрозрачной. Точка берётся вне диагонали
     // «нет сети», иначе её перекрывает штрих offline-состояния.
-    let card = Rect::new(rect.x + 12, rect.y + 64, rect.w - 24, 56);
-    let icon_center = pagh_desktop::geometry::Point::new(card.x + 24, card.center().y);
+    let icon_center = Point::new(card.x + 24, card.center().y);
     let icon_mask = pagh_desktop::icons::raster(pagh_desktop::icons::Icon::NetworkWired, 24)
         .expect("ассет иконки карточки");
     let mut opaque = None;
@@ -90,38 +127,41 @@ fn network_flyout_online_offline_render() {
         }
     }
     let (opaque_x, opaque_y) = opaque.expect("в глифе нет непрозрачного пикселя вне диагонали");
-    let icon_pixel = pagh_desktop::geometry::Point::new(
-        icon_center.x - 12 + opaque_x,
-        icon_center.y - 12 + opaque_y,
-    );
-    let icon_box = Rect::new(icon_center.x - 12, icon_center.y - 12, 24, 24);
-    let icon_lit = (icon_box.y..icon_box.bottom())
-        .flat_map(|y| (icon_box.x..icon_box.right()).map(move |x| (x, y)))
-        .filter(|(x, y)| compositor.frame().get(*x, *y) != compositor.theme().chip_bg)
-        .count();
-    assert!(
-        icon_lit > 40,
-        "иконка подключения в карточке не нарисована: {icon_lit}"
-    );
+    let icon_pixel = Point::new(icon_center.x - 12 + opaque_x, icon_center.y - 12 + opaque_y);
     assert_eq!(
         compositor.frame().get(icon_pixel.x, icon_pixel.y),
         compositor.theme().panel_icon,
         "онлайн-иконка карточки не тинтована panel_icon"
     );
 
-    // «Подключено» — акцентная строка статуса; фейковых элементов быть не должно,
-    // но акцент обязан присутствовать, иначе статус не отрисован.
+    // «Подключено» — акцентная строка статуса; акцент обязан присутствовать.
     let accent_pixels = count_color(&compositor, rect, compositor.theme().accent);
     assert!(
         accent_pixels > 20,
         "статус «Подключено» не нарисован акцентом: {accent_pixels}"
     );
 
-    compositor.set_network_online(false);
+    // Нет данных: `None` — «Нет данных» и карточка без чисел/скоростей.
+    compositor.set_network_info(None);
+    compositor.render_full();
+    png::write_png(dir.join("flyout-nodata.png"), compositor.frame()).expect("PNG nodata");
+    let nodata = compositor.frame().snapshot();
+    let accent_nodata = count_color(&compositor, rect, compositor.theme().accent);
+    assert_eq!(accent_nodata, 0, "без данных акцент не нужен");
+    let nodata_text = count_color(&compositor, rect, compositor.theme().menu_text_dim);
+    assert!(
+        nodata_text > 100,
+        "«Нет данных» не нарисовано: {nodata_text}"
+    );
+    assert!(
+        diff_with(&compositor, &online) > 40,
+        "состояния online/нет данных визуально не различаются"
+    );
+
+    // Линк снят (`IFF_RUNNING` = 0): тот же глиф в dim и подпись «линк не поднят».
+    compositor.set_network_info(Some(sample(false)));
     compositor.render_full();
     png::write_png(dir.join("flyout-offline.png"), compositor.frame()).expect("PNG offline");
-    let offline = compositor.frame().snapshot();
-
     assert_eq!(
         compositor.frame().get(icon_pixel.x, icon_pixel.y),
         compositor.theme().panel_icon_dim,
@@ -129,13 +169,12 @@ fn network_flyout_online_offline_render() {
     );
     let offline_accent = count_color(&compositor, rect, compositor.theme().accent);
     assert_eq!(offline_accent, 0, "в отключённом состоянии акцент не нужен");
-    let offline_text = count_color(&compositor, rect, compositor.theme().menu_text);
     assert!(
-        offline_text < online_text,
-        "отключение должно приглушать подпись: {online_text} -> {offline_text}"
+        diff_with(&compositor, &nodata) > 40,
+        "состояния офлайн/нет данных визуально не различаются"
     );
     assert!(
-        diff(&online, &offline) > 40,
+        diff_with(&compositor, &online) > 40,
         "состояния online/offline визуально не различаются"
     );
 

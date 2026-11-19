@@ -577,6 +577,56 @@ def prepare_usb_menu_disk(path: pathlib.Path) -> pathlib.Path:
     return path
 
 
+def wipe_mount_choice(source: pathlib.Path, dest: pathlib.Path) -> pathlib.Path:
+    """Copy `source` and erase the recorded boot mount choice, wherever it is.
+
+    WHY THIS IS THE REPORTED DISK. `#136` skipped the boot disk menu whenever a
+    pagh volume existed, so a disk that arrives already provisioned — every image
+    `tools/mkimage.py --make-disk` writes (GPT + one ext2+WAL partition) and every
+    disk whose first boot went through the old kernel — never showed the mount
+    menu at all ("why do I have NO mount-selection menu, I asked for it once, not
+    4334 times"). Meanwhile the rule before it asked on every single boot. The
+    fix keys the skip on the RECORDED CHOICE (`fs::mount_choice`), so this exact
+    image — volume present, choice never made — must ask once and then never
+    again. Recreating it means removing the marker from a disk that has one.
+
+    The marker sits in the second 512-byte sector of the volume the boot path
+    mounted, which is not a fixed image offset: on a partitioned disk the
+    partition's own start moves it. Searching for the magic is the honest way to
+    find it. EVERY copy has to go, not just the first: the marker sector lies
+    inside ext2 block 0, the WAL journals that block, and a journal replay would
+    otherwise restore the bytes this helper just erased — the reconstructed disk
+    would quietly still carry a choice and the test would prove nothing. The
+    test then proves the wipe worked by requiring the menu on the next boot.
+    """
+    data = bytearray(source.read_bytes())
+    magic = b"PAGH-MNT-CHOICE"  # must match `fs::mount_choice::MAGIC`
+    wiped = 0
+    first = -1
+    search = 0
+    while True:
+        index = data.find(magic, search)
+        if index < 0:
+            break
+        sector = index - index % 512
+        data[sector:sector + 512] = b"\0" * 512
+        if first < 0:
+            first = sector
+        search = sector + 512
+        wiped += 1
+    if wiped == 0:
+        raise HarnessError(
+            f"{rel(source)} carries no recorded mount choice; the first boot of this "
+            f"mode should have written one (fs: mount choice recorded on ...)")
+    if magic in data:
+        raise HarnessError(f"{rel(source)} still carries a mount choice marker after the wipe")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(bytes(data))
+    log(f"usb: mount choice wiped from {rel(dest)} "
+        f"({wiped} marker sector(s), live one at image offset {first:#x})")
+    return dest
+
+
 def _elf_load_ranges(data: bytes) -> list[tuple[int, int]]:
     """File-offset range of every PT_LOAD segment of an ELF64 LSB image.
 
@@ -2031,7 +2081,18 @@ def mode_usb(h: Harness) -> tuple[str, int]:
     4. type `usb` in the shell over the same USB keyboard and assert the driver's
        own evidence: `input: usb: ... 2 HID, kbd N reports`, `xhci: HID device on
        port ...` with protocol=1 (keyboard) and protocol=2 (mouse), and the `usb`
-       command's port table showing both devices connected/enabled at high speed.
+       command's port table showing both devices connected/enabled at high speed;
+    5. reboot the same disk: the menu must NOT come back. `#136` skipped it on a
+       provisioned volume, which is what this boot now proves was the wrong key —
+       the skip must come from the RECORDED CHOICE (`fs::mount_choice`), so the
+       marker has to be on the volume after step 3 and the serial must say
+       `boot disk menu skipped`;
+    6. rebuild the reported disk — the image from step 5 with the recorded choice
+       erased (`wipe_mount_choice`), i.e. "a pagh volume arrives provisioned and
+       nobody ever answered". First boot: the menu SHOWS (the user's bug was that
+       it never did), Enter mounts the volume, `fs: mount choice recorded` lands
+       before the next boot. Second boot of the same disk: `boot disk menu
+       skipped`, no reformat, volume mounted, shell without a menu timeout.
 
     WHY THE REPORT COUNTERS ARE THE PROOF: q35 always emulates i8042 (`ps2: yes`
     in the banner) and QEMU cannot be told to remove it, so a keystroke could in
@@ -2311,6 +2372,95 @@ def mode_usb(h: Harness) -> tuple[str, int]:
                   bool(second_text),
                   "shell banner seen" if second_text else "no banner")
     h.metrics["second boot"] = skip_line or "no skip marker"
+
+    # ── the reported bug: provisioned disk, choice never recorded ──
+    # The second boot above skipped because THIS run answered the question (the
+    # menu formatted p1). The user's disk is the other shape: it carries a pagh
+    # volume but no recorded choice — `#136` skipped the menu on the volume alone,
+    # so it was never shown, and before that it was shown on every boot. Both
+    # halves are tested by wiping the marker and booting twice more.
+    legacy = wipe_mount_choice(disk, CACHE / "e2e_usb_disk_unchosen.img")
+    unchosen_shot = CACHE / "e2e_usb_menu_unchosen.png"
+    after_choice_shot = CACHE / "e2e_usb_menu_unchosen_shell.png"
+    evidence = {"menu_shot": False, "chose_mount": False, "recorded": False,
+                "mounted": False, "skipped": False, "second_mounted": False}
+
+    second.stop()
+    h.guest = None
+    log("usb: first boot of a provisioned disk with NO recorded choice — the menu "
+        "must appear here")
+    h.boot(need_keyboard=False, disk=legacy, net=False)
+    assert h.guest is not None
+    third = h.guest
+    kb3 = QemuShotKeyboard(h.monitor, a.key_delay)
+    kb3.connect(timeout=min(a.boot_timeout, 180.0))
+    if wait_for(third, [rf"part: MBR on {re.escape(device)}: 2 partition\(s\)"], timeout,
+                label="menu on a provisioned disk without a recorded choice") is not None:
+        evidence["menu_shot"] = True
+        time.sleep(0.6)  # let a redrawn frame land before the screenshot
+        kb3.screenshot(unchosen_shot)
+        # Enter on row 1 = the pagh volume: mount, never format, and it is exactly
+        # the one-time answer the operator would give.
+        kb3.key("ret")
+        evidence["chose_mount"] = wait_for(
+            third, [rf"fs: operator chose to mount {re.escape(device)}p1"], timeout,
+            label="the one-time menu choice") is not None
+        evidence["recorded"] = wait_for(
+            third, [rf"fs: mount choice recorded on {re.escape(device)}p1 \(mount\)"], timeout,
+            label="the recorded mount choice") is not None
+        evidence["mounted"] = wait_for(third, [r"ext2 mounted at /mnt"], timeout,
+                                       label="mount after the one-time choice") is not None
+        if wait_for_shell(third, kb3, a, a.boot_timeout):
+            kb3.screenshot(after_choice_shot)
+    third_text = third.serial()
+    ok &= h.check("a provisioned disk with no recorded choice still SHOWS the mount menu",
+                  evidence["menu_shot"], "menu drawn" if evidence["menu_shot"]
+                  else regex_first(r"fs: [^\r\n]*boot[^\r\n]*menu[^\r\n]*", third_text)
+                  or "no menu, no skip line")
+    ok &= h.check("the menu's mount choice went through", evidence["chose_mount"],
+                  regex_first(r"fs: operator chose to mount[^\r\n]*", third_text)
+                  or "no choice line")
+    ok &= h.check("the choice is recorded on the volume before the next boot",
+                  evidence["recorded"],
+                  regex_first(r"fs: mount choice recorded[^\r\n]*", third_text)
+                  or "no record line")
+    ok &= h.check("the volume mounted after the one-time choice", evidence["mounted"],
+                  regex_first(r"ext2 mounted at /mnt[^\r\n]*", third_text) or "not mounted")
+    ok &= h.check("first boot of the unchosen disk captured",
+                  unchosen_shot.is_file() and unchosen_shot.stat().st_size > 0,
+                  rel(unchosen_shot))
+    ok &= h.check("shell after the one-time choice captured",
+                  after_choice_shot.is_file() and after_choice_shot.stat().st_size > 0,
+                  rel(after_choice_shot))
+
+    third.stop()
+    h.guest = None
+    log("usb: second boot of the SAME disk — the menu must never come back")
+    h.boot(need_keyboard=False, disk=legacy, net=False)
+    assert h.guest is not None
+    fourth = h.guest
+    fourth_text = ""
+    if wait_for(fourth, [r"Welcome to pagh OS Shell!"], a.boot_timeout,
+                label="boot after the choice was recorded") is not None:
+        fourth_text = fourth.serial()
+    evidence["skipped"] = "boot disk menu skipped" in fourth_text
+    evidence["second_mounted"] = "ext2 mounted at /mnt" in fourth_text
+    choice_line = regex_first(r"fs: mount choice already recorded[^\r\n]*", fourth_text)
+    ok &= h.check("the same disk never asks again (menu skipped by the recorded choice)",
+                  evidence["skipped"], choice_line or "no skip marker")
+    ok &= h.check("the second boot of the unchosen disk auto-mounts the volume",
+                  evidence["second_mounted"],
+                  regex_first(r"ext2 mounted at /mnt[^\r\n]*", fourth_text) or "not mounted")
+    ok &= h.check("the second boot of the unchosen disk does not reformat",
+                  not re.search(r"fs: formatting|operator chose to format", fourth_text),
+                  "format line present" if re.search(r"fs: formatting|operator chose to format",
+                                                     fourth_text) else "none")
+    h.metrics["unchosen disk"] = choice_line or "no skip marker"
+    h.metrics["unchosen disk menu screenshot"] = rel(unchosen_shot)
+    try:
+        kb3.close()
+    except Exception:  # a closed monitor socket at teardown is not a verdict
+        pass
 
     h.metrics.update({
         "keyboard reports (banner)": kbd_before if kbd_before >= 0 else "n/a",
@@ -2993,6 +3143,243 @@ def mode_desktop(h: "Harness") -> tuple[str, int]:
         kb.close()
 
 
+# ── phase 1 groups: real getgroups/setgroups/VFS decisions from ring 3 ───────
+
+
+def _groups_probe_binary() -> pathlib.Path:
+    """Assemble `tools/group_probe.c` into a freestanding static ELF.
+
+    No libc and no package dependencies: the probe is raw syscalls, so a green
+    run cannot be explained by glibc falling back to something else. `gcc` is
+    only a build tool here, exactly as the desktop mode needs a cargo target.
+    """
+    gcc = shutil.which("gcc")
+    if not gcc:
+        raise SetupError("groups: gcc is required to build tools/group_probe.c")
+    src = ROOT / "tools" / "group_probe.c"
+    if not src.is_file():
+        raise SetupError(f"groups: probe source missing: {src}")
+    out = CACHE / "grpprobe"
+    CACHE.mkdir(parents=True, exist_ok=True)
+    run_checked(
+        [gcc, "-static", "-nostdlib", "-ffreestanding", "-fno-stack-protector",
+         "-fno-pie", "-no-pie", "-Os", "-o", out, src,
+         "-Wl,-e,_start", "-Wl,--build-id=none"],
+        "groups probe build", timeout=120,
+    )
+    if not out.is_file():
+        raise SetupError("groups: probe build produced no ELF")
+    return out
+
+
+def _debugfs_inject_exec(image: pathlib.Path, src: pathlib.Path, name: str) -> None:
+    """Write `src` as `/{name}` mode 0100755 into an ext2 image, then verify it."""
+    for argv in (
+        ["debugfs", "-w", "-R", f"write {src} /{name}", str(image)],
+        ["debugfs", "-w", "-R", f"sif /{name} mode 0100755", str(image)],
+    ):
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise SetupError(f"debugfs {argv[3]} failed: {proc.stderr.strip()}")
+    stat = _debugfs_stat(image, name)
+    if stat is None or "Mode:  0755" not in stat:
+        raise SetupError(f"debugfs: /{name} is not executable after injection")
+
+
+def _groups_prepare_disk(h: "Harness", image: pathlib.Path,
+                         probe: pathlib.Path, name: str = "grpprobe") -> None:
+    """Let the kernel format a blank disk, then inject the probe with debugfs.
+
+    The kernel only mounts a volume carrying its WAL superblock, so the first
+    boot must be the kernel's own format path (a host mkfs.ext2 image would be
+    refused). After QEMU stops, the probe is written into the already-provisioned
+    ext2 and the second boot mounts it without prompting.
+    """
+    if not shutil.which("qemu-img") or not shutil.which("debugfs"):
+        raise SetupError("groups: qemu-img and debugfs are required")
+    image.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        image.unlink()
+    except FileNotFoundError:
+        pass
+    run_checked([shutil.which("qemu-img"), "create", "-f", "raw", str(image), "64M"],
+                "qemu-img create (groups format)", timeout=60)
+    log("groups: first boot on a blank disk to let the kernel format ext2+WAL")
+    h.boot(need_keyboard=True, disk=image, net=False)
+    assert h.guest is not None and h.kb is not None
+    if not wait_for_shell(h.guest, h.kb, h.a, h.a.boot_timeout):
+        raise HarnessError("groups: shell never appeared on the blank disk; "
+                           f"serial tail:\n{tail(h.guest.serial())}")
+    if wait_for(h.guest, [r"ext2 mounted at /mnt"], 60.0, label="ext2 mount") is None:
+        raise HarnessError("groups: kernel did not mount the freshly formatted volume")
+    time.sleep(2.0)
+    h.guest.stop()
+    h.guest = None
+    h.kb.close()
+    h.kb = None
+    if not image.is_file():
+        raise SetupError("groups: formatted disk image disappeared")
+    _debugfs_inject_exec(image, probe, name)
+    log(f"groups: injected {rel(probe)} into {rel(image)} as /{name}")
+
+
+def mode_groups(h: "Harness") -> tuple[str, int]:
+    """Phase 1 acceptance for supplementary groups, group VFS checks and devices.
+
+    Two boots: the first formats a blank disk (the only writable ext2 the kernel
+    will mount), the probe is injected with debugfs, and the second boot drives
+    the shell. The probe is the part selftest cannot do from ring 0: it passes a
+    real user `gid_t*` through getgroups/setgroups and asks access/open for
+    group-owned files and /dev nodes as root, as uid 1000 with no groups, as
+    uid 1000 with only supplementary video(44), and as the `su oleg` session.
+    """
+    a = h.a
+    probe = _groups_probe_binary()
+    disk = CACHE / "e2e_groups_disk.img"
+    if not (getattr(a, "reuse_groups_disk", False)
+            and _debugfs_stat(disk, "grpprobe") is not None):
+        _groups_prepare_disk(h, disk, probe)
+    else:
+        log(f"groups: reusing {rel(disk)}")
+
+    h.boot(need_keyboard=True, disk=disk, net=False)
+    assert h.guest is not None and h.kb is not None
+    kb = h.kb
+    if not wait_for_shell(h.guest, kb, a, a.boot_timeout):
+        raise HarnessError(f"groups: shell never appeared; serial tail:\n"
+                           f"{tail(h.guest.serial())}")
+
+    def sh(cmd: str) -> None:
+        log(f"type: {cmd}")
+        kb.text(cmd)
+        kb.key("ret")
+
+    # `root:video 0640` data file: the group-class probe target, created as root
+    # by the native shell (which bypasses VFS checks by design).
+    sh("write /mnt/groupfile topsecret")
+    sh("chmod 0640 /mnt/groupfile")
+    sh("chown 0:44 /mnt/groupfile")
+    sh("id")
+    sh("ls -l /dev/fb0")
+    sh("ls -l /dev/null")
+
+    ok = True
+    for mode in ("root", "drop", "dropvideo"):
+        sh(f"lxrun /mnt/grpprobe {mode}")
+        if wait_for(h.guest, [rf"GPROBE mode={mode} "], h.timeout,
+                    label=f"grpprobe {mode}") is None:
+            ok &= h.check(f"grpprobe {mode} produced a result line", False,
+                          "timeout; serial tail: " + tail(h.guest.serial(), 10))
+            return ("FAIL", EXIT_FAIL)
+        time.sleep(1.0)
+
+    # `/etc/shadow` + `passwd`: a real password prompt (no echo), written to
+    # the freshly provisioned `0600 root:root` file and then verified by `su`
+    # through the same kernel path the shell uses.
+    sh("passwd oleg")
+    if wait_for(h.guest, [r"New password: "], 30.0, label="passwd prompt") is None:
+        ok &= h.check("passwd asks for a new password", False, "no prompt")
+        return ("FAIL", EXIT_FAIL)
+    kb.text("opensesame")
+    kb.key("ret")
+    if wait_for(h.guest, [r"Retype new password: "], 30.0,
+                label="passwd retype") is None:
+        ok &= h.check("passwd asks to retype", False, "no retype prompt")
+        return ("FAIL", EXIT_FAIL)
+    kb.text("opensesame")
+    kb.key("ret")
+    if wait_for(h.guest, [r"passwd: password updated for 'oleg'"], 30.0,
+                label="passwd update") is None:
+        ok &= h.check("passwd updates /etc/shadow", False, "no success marker")
+        return ("FAIL", EXIT_FAIL)
+
+    sh("su oleg")
+    if wait_for(h.guest, [r"su: root session: no password required"], 30.0,
+                label="su oleg") is None:
+        ok &= h.check("su oleg switches the session", False, "no su marker")
+        return ("FAIL", EXIT_FAIL)
+    sh("whoami")
+    sh("su root")
+    sh("passwd root")
+    # Wrong password must be refused, the right one must authenticate: this is
+    # the in-guest proof that SHA-512-crypt verification and the shadow read
+    # path both work (not just the host property).
+    sh("su -p oleg")
+    if wait_for(h.guest, [r"Password for oleg: "], 30.0, label="su password") is None:
+        ok &= h.check("su asks for the target password", False, "no prompt")
+        return ("FAIL", EXIT_FAIL)
+    kb.text("wrongpass")
+    kb.key("ret")
+    if wait_for(h.guest, [r"su: incorrect password"], 30.0, label="su wrong") is None:
+        ok &= h.check("su rejects a wrong password", False, "wrong password accepted?")
+        return ("FAIL", EXIT_FAIL)
+    sh("su -p oleg")
+    if wait_for(h.guest, [r"Password for oleg: "], 30.0, label="su password 2") is None:
+        ok &= h.check("su asks again", False, "no prompt")
+        return ("FAIL", EXIT_FAIL)
+    kb.text("opensesame")
+    kb.key("ret")
+    if wait_for(h.guest, [r"su: authenticated as oleg"], 30.0, label="su right") is None:
+        ok &= h.check("su accepts the right password", False, "not authenticated")
+        return ("FAIL", EXIT_FAIL)
+    sh("id")
+    sh("groups")
+    sh("lxrun /mnt/grpprobe file")
+    if wait_for(h.guest, [r"GPROBE mode=file "], h.timeout,
+                label="grpprobe file") is None:
+        ok &= h.check("grpprobe file produced a result line", False,
+                      "timeout; serial tail: " + tail(h.guest.serial(), 10))
+        return ("FAIL", EXIT_FAIL)
+    time.sleep(a.settle)
+    text = h.guest.serial()
+
+    expected = [
+        ("root: getgroups count/size/EFAULT and setgroups cap+clear",
+         r"GPROBE mode=root uid=0 euid=0 gid=0 egid=0 ngroups=0 groups=- "
+         r"initial=0 invalid33=22 set=0 count=3 listed=3 vals=0,44,105 "
+         r"small=22 badptr=14 cleared=0 after=0"),
+        ("uid 1000 with no groups: group file/devices denied, null allowed",
+         r"GPROBE mode=drop uid=1000 euid=1000 gid=1000 egid=1000 ngroups=0 groups=- "
+         r"rootfile=0 setgroups=0 setgid=0 setuid=0 file=13 read=13 fb0=13 "
+         r"event0=13 vtconsole=13 null=0 setgroups_again=1"),
+        ("supplementary video(44), egid 1000: group file and fb0 allowed, tty denied",
+         r"GPROBE mode=dropvideo uid=1000 euid=1000 gid=1000 egid=1000 ngroups=1 "
+         r"groups=44 rootfile=0 setgroups=0 setgid=0 setuid=0 file=0 read=9 "
+         r"fb0=0 event0=13 vtconsole=13 null=0 setgroups_again=1"),
+        ("su oleg + lxrun: session tty/video/input groups reach the child",
+         r"GPROBE mode=file uid=1000 euid=1000 gid=1000 egid=1000 ngroups=3 "
+         r"groups=5,44,105 file=0 read=9 fb0=0 event0=0 vtconsole=0 vtinput=0 "
+         r"null=0 setgroups=1"),
+        ("id after su oleg reports the same groups",
+         r"uid=1000\(oleg\) gid=1000\(oleg\) "
+         r"groups=1000\(oleg\),5\(tty\),44\(video\),105\(input\)"),
+        ("groups after su oleg lists tty/video/input",
+         r"(?m)^oleg tty video input\r?$"),
+        ("/dev/fb0 is root:video 0660",
+         r"-rw-rw----\s+1\s+0\s+44\s+\d+\s+fb0"),
+        ("/dev/null is 0666",
+         r"-rw-rw-rw-\s+1\s+0\s+0\s+\d+\s+null"),
+        ("su prints the loaded supplementary set",
+         r"su: groups=1000\(oleg\),5\(tty\),44\(video\),105\(input\)"),
+        ("passwd wrote the hash into /etc/shadow",
+         r"passwd: password updated for 'oleg'"),
+        ("su authenticated oleg with the stored $6$ hash",
+         r"su: authenticated as oleg: oleg -> oleg \(uid=1000 gid=1000\)"),
+        ("whoami reports the session user", r"(?m)^oleg\r?$"),
+        ("su root from a non-root session is refused (root password locked)",
+         r"su: 'root' has no password set \(locked in /etc/shadow\)"),
+        ("passwd refuses another user from a non-root session",
+         r"passwd: permission denied \(only a root session may change another user's password\)"),
+    ]
+    for label, pattern in expected:
+        m = re.search(pattern, text)
+        ok &= h.check(label, bool(m), m.group(0).strip() if m else "not found")
+
+    crashes = re.findall(r"PANIC|\[EXC [^\]]+\]|DOUBLE FREE", text)
+    ok &= h.check("no panic/exception in guest", not crashes,
+                  crashes[0] if crashes else "none")
+    h.metrics["probe modes"] = "root, drop, dropvideo, file"
+    return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
 def _desktop_restart_shell_line(kb: "QemuShotKeyboard") -> None:
     """Discard any keys the compositor/evdev left in the shell line editor.
 
@@ -3107,6 +3494,7 @@ def _desktop_abi_phase(h: "Harness", guest: "Guest", kb: "QemuShotKeyboard",
                        and moved.read_bytes() != desktop.read_bytes())
     ok &= h.check("pointer motion/click repainted the framebuffer",
                   pointer_changed, f"{moved.name} differs={pointer_changed}")
+
     raw_before = CACHE / "e2e_desktop_pointer.ppm"
     kb.screenshot_raw(raw_before)
 
@@ -3196,8 +3584,7 @@ def _desktop_abi_phase(h: "Harness", guest: "Guest", kb: "QemuShotKeyboard",
                   "takeover remains armed" in text,
                   regex_first(r"pagh-desktop: fbdev closed[^\r\n]*", text) or "")
     h.metrics["desktop screenshots"] = ", ".join(
-        rel(p) for p in (baseline, desktop, menu, moved, selection,
-                         after_exit, after_cmd)
+        rel(p) for p in (baseline, desktop, menu, moved, after_exit, after_cmd)
     )
     return ok
 
@@ -3526,245 +3913,6 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
                          console_a, console_b)
     )
     return ok
-
-
-# ── phase 1 groups: real getgroups/setgroups/VFS decisions from ring 3 ───────
-
-
-def _groups_probe_binary() -> pathlib.Path:
-    """Assemble `tools/group_probe.c` into a freestanding static ELF.
-
-    No libc and no package dependencies: the probe is raw syscalls, so a green
-    run cannot be explained by glibc falling back to something else. `gcc` is
-    only a build tool here, exactly as the desktop mode needs a cargo target.
-    """
-    gcc = shutil.which("gcc")
-    if not gcc:
-        raise SetupError("groups: gcc is required to build tools/group_probe.c")
-    src = ROOT / "tools" / "group_probe.c"
-    if not src.is_file():
-        raise SetupError(f"groups: probe source missing: {src}")
-    out = CACHE / "grpprobe"
-    CACHE.mkdir(parents=True, exist_ok=True)
-    run_checked(
-        [gcc, "-static", "-nostdlib", "-ffreestanding", "-fno-stack-protector",
-         "-fno-pie", "-no-pie", "-Os", "-o", out, src,
-         "-Wl,-e,_start", "-Wl,--build-id=none"],
-        "groups probe build", timeout=120,
-    )
-    if not out.is_file():
-        raise SetupError("groups: probe build produced no ELF")
-    return out
-
-
-def _debugfs_inject_exec(image: pathlib.Path, src: pathlib.Path, name: str) -> None:
-    """Write `src` as `/{name}` mode 0100755 into an ext2 image, then verify it."""
-    for argv in (
-        ["debugfs", "-w", "-R", f"write {src} /{name}", str(image)],
-        ["debugfs", "-w", "-R", f"sif /{name} mode 0100755", str(image)],
-    ):
-        proc = subprocess.run(argv, capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise SetupError(f"debugfs {argv[3]} failed: {proc.stderr.strip()}")
-    stat = _debugfs_stat(image, name)
-    if stat is None or "Mode:  0755" not in stat:
-        raise SetupError(f"debugfs: /{name} is not executable after injection")
-
-
-def _groups_prepare_disk(h: "Harness", image: pathlib.Path,
-                         probe: pathlib.Path, name: str = "grpprobe") -> None:
-    """Let the kernel format a blank disk, then inject the probe with debugfs.
-
-    The kernel only mounts a volume carrying its WAL superblock, so the first
-    boot must be the kernel's own format path (a host mkfs.ext2 image would be
-    refused). After QEMU stops, the probe is written into the already-provisioned
-    ext2 and the second boot mounts it without prompting.
-    """
-    if not shutil.which("qemu-img") or not shutil.which("debugfs"):
-        raise SetupError("groups: qemu-img and debugfs are required")
-    image.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        image.unlink()
-    except FileNotFoundError:
-        pass
-    run_checked([shutil.which("qemu-img"), "create", "-f", "raw", str(image), "64M"],
-                "qemu-img create (groups format)", timeout=60)
-    log("groups: first boot on a blank disk to let the kernel format ext2+WAL")
-    h.boot(need_keyboard=True, disk=image, net=False)
-    assert h.guest is not None and h.kb is not None
-    if not wait_for_shell(h.guest, h.kb, h.a, h.a.boot_timeout):
-        raise HarnessError("groups: shell never appeared on the blank disk; "
-                           f"serial tail:\n{tail(h.guest.serial())}")
-    if wait_for(h.guest, [r"ext2 mounted at /mnt"], 60.0, label="ext2 mount") is None:
-        raise HarnessError("groups: kernel did not mount the freshly formatted volume")
-    time.sleep(2.0)
-    h.guest.stop()
-    h.guest = None
-    h.kb.close()
-    h.kb = None
-    if not image.is_file():
-        raise SetupError("groups: formatted disk image disappeared")
-    _debugfs_inject_exec(image, probe, name)
-    log(f"groups: injected {rel(probe)} into {rel(image)} as /{name}")
-
-
-def mode_groups(h: "Harness") -> tuple[str, int]:
-    """Phase 1 acceptance for supplementary groups, group VFS checks and devices.
-
-    Two boots: the first formats a blank disk (the only writable ext2 the kernel
-    will mount), the probe is injected with debugfs, and the second boot drives
-    the shell. The probe is the part selftest cannot do from ring 0: it passes a
-    real user `gid_t*` through getgroups/setgroups and asks access/open for
-    group-owned files and /dev nodes as root, as uid 1000 with no groups, as
-    uid 1000 with only supplementary video(44), and as the `su oleg` session.
-    """
-    a = h.a
-    probe = _groups_probe_binary()
-    disk = CACHE / "e2e_groups_disk.img"
-    if not (getattr(a, "reuse_groups_disk", False)
-            and _debugfs_stat(disk, "grpprobe") is not None):
-        _groups_prepare_disk(h, disk, probe)
-    else:
-        log(f"groups: reusing {rel(disk)}")
-
-    h.boot(need_keyboard=True, disk=disk, net=False)
-    assert h.guest is not None and h.kb is not None
-    kb = h.kb
-    if not wait_for_shell(h.guest, kb, a, a.boot_timeout):
-        raise HarnessError(f"groups: shell never appeared; serial tail:\n"
-                           f"{tail(h.guest.serial())}")
-
-    def sh(cmd: str) -> None:
-        log(f"type: {cmd}")
-        kb.text(cmd)
-        kb.key("ret")
-
-    # `root:video 0640` data file: the group-class probe target, created as root
-    # by the native shell (which bypasses VFS checks by design).
-    sh("write /mnt/groupfile topsecret")
-    sh("chmod 0640 /mnt/groupfile")
-    sh("chown 0:44 /mnt/groupfile")
-    sh("id")
-    sh("ls -l /dev/fb0")
-    sh("ls -l /dev/null")
-
-    ok = True
-    for mode in ("root", "drop", "dropvideo"):
-        sh(f"lxrun /mnt/grpprobe {mode}")
-        if wait_for(h.guest, [rf"GPROBE mode={mode} "], h.timeout,
-                    label=f"grpprobe {mode}") is None:
-            ok &= h.check(f"grpprobe {mode} produced a result line", False,
-                          "timeout; serial tail: " + tail(h.guest.serial(), 10))
-            return ("FAIL", EXIT_FAIL)
-        time.sleep(1.0)
-
-    # `/etc/shadow` + `passwd`: a real password prompt (no echo), written to
-    # the freshly provisioned `0600 root:root` file and then verified by `su`
-    # through the same kernel path the shell uses.
-    sh("passwd oleg")
-    if wait_for(h.guest, [r"New password: "], 30.0, label="passwd prompt") is None:
-        ok &= h.check("passwd asks for a new password", False, "no prompt")
-        return ("FAIL", EXIT_FAIL)
-    kb.text("opensesame")
-    kb.key("ret")
-    if wait_for(h.guest, [r"Retype new password: "], 30.0,
-                label="passwd retype") is None:
-        ok &= h.check("passwd asks to retype", False, "no retype prompt")
-        return ("FAIL", EXIT_FAIL)
-    kb.text("opensesame")
-    kb.key("ret")
-    if wait_for(h.guest, [r"passwd: password updated for 'oleg'"], 30.0,
-                label="passwd update") is None:
-        ok &= h.check("passwd updates /etc/shadow", False, "no success marker")
-        return ("FAIL", EXIT_FAIL)
-
-    sh("su oleg")
-    if wait_for(h.guest, [r"su: root session: no password required"], 30.0,
-                label="su oleg") is None:
-        ok &= h.check("su oleg switches the session", False, "no su marker")
-        return ("FAIL", EXIT_FAIL)
-    sh("whoami")
-    sh("su root")
-    sh("passwd root")
-    # Wrong password must be refused, the right one must authenticate: this is
-    # the in-guest proof that SHA-512-crypt verification and the shadow read
-    # path both work (not just the host property).
-    sh("su -p oleg")
-    if wait_for(h.guest, [r"Password for oleg: "], 30.0, label="su password") is None:
-        ok &= h.check("su asks for the target password", False, "no prompt")
-        return ("FAIL", EXIT_FAIL)
-    kb.text("wrongpass")
-    kb.key("ret")
-    if wait_for(h.guest, [r"su: incorrect password"], 30.0, label="su wrong") is None:
-        ok &= h.check("su rejects a wrong password", False, "wrong password accepted?")
-        return ("FAIL", EXIT_FAIL)
-    sh("su -p oleg")
-    if wait_for(h.guest, [r"Password for oleg: "], 30.0, label="su password 2") is None:
-        ok &= h.check("su asks again", False, "no prompt")
-        return ("FAIL", EXIT_FAIL)
-    kb.text("opensesame")
-    kb.key("ret")
-    if wait_for(h.guest, [r"su: authenticated as oleg"], 30.0, label="su right") is None:
-        ok &= h.check("su accepts the right password", False, "not authenticated")
-        return ("FAIL", EXIT_FAIL)
-    sh("id")
-    sh("groups")
-    sh("lxrun /mnt/grpprobe file")
-    if wait_for(h.guest, [r"GPROBE mode=file "], h.timeout,
-                label="grpprobe file") is None:
-        ok &= h.check("grpprobe file produced a result line", False,
-                      "timeout; serial tail: " + tail(h.guest.serial(), 10))
-        return ("FAIL", EXIT_FAIL)
-    time.sleep(a.settle)
-    text = h.guest.serial()
-
-    expected = [
-        ("root: getgroups count/size/EFAULT and setgroups cap+clear",
-         r"GPROBE mode=root uid=0 euid=0 gid=0 egid=0 ngroups=0 groups=- "
-         r"initial=0 invalid33=22 set=0 count=3 listed=3 vals=0,44,105 "
-         r"small=22 badptr=14 cleared=0 after=0"),
-        ("uid 1000 with no groups: group file/devices denied, null allowed",
-         r"GPROBE mode=drop uid=1000 euid=1000 gid=1000 egid=1000 ngroups=0 groups=- "
-         r"rootfile=0 setgroups=0 setgid=0 setuid=0 file=13 read=13 fb0=13 "
-         r"event0=13 vtconsole=13 null=0 setgroups_again=1"),
-        ("supplementary video(44), egid 1000: group file and fb0 allowed, tty denied",
-         r"GPROBE mode=dropvideo uid=1000 euid=1000 gid=1000 egid=1000 ngroups=1 "
-         r"groups=44 rootfile=0 setgroups=0 setgid=0 setuid=0 file=0 read=9 "
-         r"fb0=0 event0=13 vtconsole=13 null=0 setgroups_again=1"),
-        ("su oleg + lxrun: session tty/video/input groups reach the child",
-         r"GPROBE mode=file uid=1000 euid=1000 gid=1000 egid=1000 ngroups=3 "
-         r"groups=5,44,105 file=0 read=9 fb0=0 event0=0 vtconsole=0 vtinput=0 "
-         r"null=0 setgroups=1"),
-        ("id after su oleg reports the same groups",
-         r"uid=1000\(oleg\) gid=1000\(oleg\) "
-         r"groups=1000\(oleg\),5\(tty\),44\(video\),105\(input\)"),
-        ("groups after su oleg lists tty/video/input",
-         r"(?m)^oleg tty video input\r?$"),
-        ("/dev/fb0 is root:video 0660",
-         r"-rw-rw----\s+1\s+0\s+44\s+\d+\s+fb0"),
-        ("/dev/null is 0666",
-         r"-rw-rw-rw-\s+1\s+0\s+0\s+\d+\s+null"),
-        ("su prints the loaded supplementary set",
-         r"su: groups=1000\(oleg\),5\(tty\),44\(video\),105\(input\)"),
-        ("passwd wrote the hash into /etc/shadow",
-         r"passwd: password updated for 'oleg'"),
-        ("su authenticated oleg with the stored $6$ hash",
-         r"su: authenticated as oleg: oleg -> oleg \(uid=1000 gid=1000\)"),
-        ("whoami reports the session user", r"(?m)^oleg\r?$"),
-        ("su root from a non-root session is refused (root password locked)",
-         r"su: 'root' has no password set \(locked in /etc/shadow\)"),
-        ("passwd refuses another user from a non-root session",
-         r"passwd: permission denied \(only a root session may change another user's password\)"),
-    ]
-    for label, pattern in expected:
-        m = re.search(pattern, text)
-        ok &= h.check(label, bool(m), m.group(0).strip() if m else "not found")
-
-    crashes = re.findall(r"PANIC|\[EXC [^\]]+\]|DOUBLE FREE", text)
-    ok &= h.check("no panic/exception in guest", not crashes,
-                  crashes[0] if crashes else "none")
-    h.metrics["probe modes"] = "root, drop, dropvideo, file"
-    return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
 
 
 def _net_probe_binary() -> pathlib.Path:

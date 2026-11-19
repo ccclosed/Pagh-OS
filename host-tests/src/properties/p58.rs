@@ -1,112 +1,175 @@
-// Feature: blocking AF_UNIX read wakeup (watchdog `nr=45 arg0=0x3 closed`),
-// property `p58`: the `sock_wait` verdict the kernel takes on every yielded CPU
-// slice of `recvfrom`/`recvmsg`/`read` on a socket queue.
+// Feature: phase 1 "groups separate from root", property P58: the pure
+// `/etc/passwd` + `/etc/group` layer the shell's `id`/`groups`/`su` commands use.
 //
-// Why this exists: there are no wait queues here — a blocking read loops on
-// `yield_current()` and re-reads the byte queue. `readers`/`writers` are counted
-// per QUEUE (`src/task/fd.rs`), not per fd, and the syscall itself holds an
-// `Arc` to the queue, so closing the READING fd from a sibling thread neither
-// drops a counter nor produces EOF: `read` answers `WouldBlock` forever. Real
-// serial logs show exactly that shape — two processes stuck in `recvfrom` on
-// descriptors their own table already reports "closed" (`serial_shell.log`,
-// `serial_desktop.log`). The kernel now asks two questions per yield and this
-// property pins the answer:
-//
-//   * does any fd in the process still refer to this queue? (`holds_read_end`)
-//     No  -> `EBADF`: nobody can consume bytes written there any more;
-//   * are there live writing ends? (`writers`)
-//     No  -> `Ok(0)`: EOF, the normal peer-close path.
-//
-// The interesting corner is exactly the one the old code got wrong: an orphaned
-// queue may still have `writers > 0` (the peer process is alive), so ownership
-// must dominate the writers count — `EBADF`, never a silent eternal wait.
+// The files are the *data* half of the group model; the enforcement half is
+// `cred.rs` (P56) and the syscall boundary (`getgroups`/`setgroups`). A parser
+// bug here would be silent: `id` would print plausible groups that do not match
+// `/etc/group`, or `su` would load a different supplementary set than the file
+// says. The properties below therefore compare the parser/query results against
+// an independently written oracle over generated databases, and require the
+// render→parse round trip to be exact for well-formed entries.
 
-use crate::sock_wait::{wait_verdict, write_verdict, WaitVerdict, WriteVerdict};
 use proptest::prelude::*;
 
-proptest! {
-    /// The regression itself: a closed fd (no fd references the queue) is never
-    /// "keep waiting", no matter how many writing ends the queue still counts.
-    #[test]
-    fn closed_fd_never_keeps_waiting(writers in any::<usize>()) {
-        prop_assert_eq!(wait_verdict(false, writers), WaitVerdict::Ebadf);
-    }
+use crate::identity_db::{
+    group_by_gid, groups_for_user, parse_group, parse_passwd, supplementary_groups_for_user,
+    user_by_name, user_by_uid, GroupEntry, UserEntry,
+};
 
-    /// A queue still owned by a descriptor with live writers still waits — the
-    /// fix must not turn ordinary blocked reads into spurious EBADF.
-    #[test]
-    fn owned_queue_with_writers_keeps_waiting(writers in 1usize..=usize::MAX) {
-        prop_assert_eq!(wait_verdict(true, writers), WaitVerdict::Continue);
-    }
+/// Small alphabets keep collisions (same gid twice, same user name in two
+/// groups) reachable; that is where dedup and primary-group handling live.
+fn name() -> impl Strategy<Value = String> {
+    "[a-z]{1,6}".prop_map(String::from)
+}
 
-    /// Peer close (last writing end gone) on an owned queue is EOF, not EAGAIN
-    /// and not a wait.
-    #[test]
-    fn peer_close_is_eof(referenced in any::<bool>()) {
-        let v = wait_verdict(referenced, 0);
-        prop_assert_ne!(v, WaitVerdict::Continue);
-        if referenced {
-            prop_assert_eq!(v, WaitVerdict::Eof);
+fn user_strategy() -> impl Strategy<Value = UserEntry> {
+    (name(), 0u32..8, 0u32..8).prop_map(|(name, uid, gid)| UserEntry {
+        name,
+        uid,
+        gid,
+        gecos: String::from("test"),
+        home: String::from("/home/test"),
+        shell: String::from("/bin/sh"),
+    })
+}
+
+fn group_strategy() -> impl Strategy<Value = GroupEntry> {
+    (name(), 0u32..8, prop::collection::vec(name(), 0..4)).prop_map(|(name, gid, members)| {
+        GroupEntry {
+            name,
+            gid,
+            members,
+        }
+    })
+}
+
+fn render_passwd(users: &[UserEntry]) -> String {
+    let mut out = String::new();
+    for u in users {
+        out.push_str(&format!(
+            "{}:x:{}:{}:{}:{}:{}\n",
+            u.name, u.uid, u.gid, u.gecos, u.home, u.shell
+        ));
+    }
+    out
+}
+
+fn render_group(groups: &[GroupEntry]) -> String {
+    let mut out = String::new();
+    for g in groups {
+        out.push_str(&format!("{}:x:{}:{}\n", g.name, g.gid, g.members.join(",")));
+    }
+    out
+}
+
+/// Independent oracle: primary gid first, then every distinct group gid in file
+/// order where the user is listed.
+fn oracle_groups(users: &[UserEntry], groups: &[GroupEntry], name: &str) -> Option<Vec<u32>> {
+    let user = users.iter().find(|u| u.name == name)?;
+    let mut out = vec![user.gid];
+    for group in groups {
+        let listed = group.members.iter().any(|m| m == name);
+        if listed && !out.contains(&group.gid) {
+            out.push(group.gid);
         }
     }
+    Some(out)
+}
 
-    /// Ownership dominates: raising the writers count can never turn an
-    /// orphaned queue into a wait, and lowering it can never turn an owned
-    /// queue into EBADF. In other words the verdict is monotone in `writers`
-    /// and depends on ownership before the writer count.
+proptest! {
+    /// Well-formed entries survive render→parse byte-for-byte. The generator
+    /// never emits `:` or `,` in names, which is exactly the domain the parser
+    /// promises to round-trip.
     #[test]
-    fn verdict_is_monotone_in_writers(
-        referenced in any::<bool>(),
-        a in any::<usize>(),
-        b in any::<usize>(),
+    fn passwd_round_trips(
+        users in prop::collection::vec(user_strategy(), 0..6),
     ) {
-        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-        let v_lo = wait_verdict(referenced, lo);
-        let v_hi = wait_verdict(referenced, hi);
-        // Only `Continue`/`Eof` for an owned queue, only `Ebadf` for an
-        // orphaned one — across the whole writers range.
-        prop_assert_eq!(v_lo == WaitVerdict::Continue, v_hi == WaitVerdict::Continue);
-        prop_assert_eq!(v_lo == WaitVerdict::Ebadf, v_hi == WaitVerdict::Ebadf);
-        if !referenced {
-            prop_assert_eq!(v_lo, WaitVerdict::Ebadf);
-            prop_assert_eq!(v_hi, WaitVerdict::Ebadf);
-        }
+        let parsed = parse_passwd(&render_passwd(&users));
+        prop_assert_eq!(parsed, users);
     }
-}
 
-/// The complete 2x2 decision table, so no future edit can quietly reorder the
-/// ownership and writer checks (the natural mistake: `writers > 0` first, which
-/// reintroduces the eternal sleep for an orphaned queue with a live peer).
-#[test]
-fn decision_table_is_exhaustive() {
-    assert_eq!(wait_verdict(false, 0), WaitVerdict::Ebadf);
-    assert_eq!(wait_verdict(false, 1), WaitVerdict::Ebadf);
-    assert_eq!(wait_verdict(true, 0), WaitVerdict::Eof);
-    assert_eq!(wait_verdict(true, 1), WaitVerdict::Continue);
-    // Multi-writer queues (socketpair ends inherited by a child) stay waits.
-    assert_eq!(wait_verdict(true, 3), WaitVerdict::Continue);
-}
-// ─── Пишущая сторона (SUBFIX 3): закрытие пишущего fd во время ожидания ───
-
-proptest! {
-    /// The write-side regression itself: a write fd closed from a sibling
-    /// thread must end the wait with `EBADF`, never keep polling a queue whose
-    /// counters cannot change (the syscall holds the queue's `Arc`).
     #[test]
-    fn closed_write_fd_never_keeps_waiting(referenced in any::<bool>()) {
-        if referenced {
-            prop_assert_eq!(write_verdict(true), WriteVerdict::Continue);
-        } else {
-            prop_assert_eq!(write_verdict(false), WriteVerdict::Ebadf);
+    fn group_round_trips(
+        groups in prop::collection::vec(group_strategy(), 0..6),
+    ) {
+        let parsed = parse_group(&render_group(&groups));
+        prop_assert_eq!(parsed, groups);
+    }
+
+    /// `groups_for_user` equals the independent oracle for every user name that
+    /// appears in the generated passwd database.
+    #[test]
+    fn groups_for_user_matches_the_oracle(
+        users in prop::collection::vec(user_strategy(), 1..5),
+        groups in prop::collection::vec(group_strategy(), 0..6),
+    ) {
+        for user in &users {
+            prop_assert_eq!(
+                groups_for_user(&users, &groups, &user.name),
+                oracle_groups(&users, &groups, &user.name)
+            );
+        }
+        // A name absent from passwd has no group set at all — not even an empty
+        // one (that would make `su unknown` look like a valid user).
+        prop_assert_eq!(groups_for_user(&users, &groups, "definitely-absent"), None);
+    }
+
+    /// The set loaded into `setgroups(2)` is the display set minus the primary
+    /// gid: the kernel already knows egid, so listing it again would make
+    /// `getgroups(2)` report a group Linux would not.
+    #[test]
+    fn supplementary_groups_exclude_primary_and_duplicates(
+        users in prop::collection::vec(user_strategy(), 1..5),
+        groups in prop::collection::vec(group_strategy(), 0..6),
+    ) {
+        for user in &users {
+            let display = groups_for_user(&users, &groups, &user.name).unwrap();
+            let supp = supplementary_groups_for_user(&users, &groups, &user.name).unwrap();
+            for gid in &supp {
+                prop_assert_ne!(*gid, user.gid);
+                prop_assert!(display.contains(gid));
+            }
+            // Every non-primary display gid is present exactly once.
+            for gid in display.iter().skip(1) {
+                prop_assert_eq!(supp.iter().filter(|g| *g == gid).count(), 1);
+            }
         }
     }
-}
 
-/// The two-row write table. Ownership is the ONLY question the policy asks:
-/// the peer-gone case (`EPIPE`) is decided by the queue itself, so it must not
-/// leak into this verdict.
-#[test]
-fn write_decision_table_is_exhaustive() {
-    assert_eq!(write_verdict(true), WriteVerdict::Continue);
-    assert_eq!(write_verdict(false), WriteVerdict::Ebadf);
+    /// Lookups follow the first-match rule and never invent entries.
+    #[test]
+    fn lookups_are_consistent(
+        users in prop::collection::vec(user_strategy(), 0..6),
+        groups in prop::collection::vec(group_strategy(), 0..6),
+    ) {
+        // Generators may produce duplicate names/uids deliberately: the rule is
+        // FIRST match (getpwnam on a duplicated database), not "any match".
+        for user in &users {
+            let first_by_name = users.iter().find(|u| u.name == user.name);
+            prop_assert_eq!(user_by_name(&users, &user.name), first_by_name);
+            let first_by_uid = users.iter().find(|u| u.uid == user.uid);
+            prop_assert_eq!(user_by_uid(&users, user.uid), first_by_uid);
+        }
+        for group in &groups {
+            let first_by_gid = groups.iter().find(|g| g.gid == group.gid);
+            prop_assert_eq!(group_by_gid(&groups, group.gid), first_by_gid);
+        }
+    }
+
+    /// Arbitrary text — including colon/comma garbage, CRLF, comments and
+    /// out-of-range numbers — must never panic and never yields an empty name
+    /// or a non-numeric id.
+    #[test]
+    fn arbitrary_text_is_skipped_not_panicked(text in ".*") {
+        let users = parse_passwd(&text);
+        for u in &users {
+            prop_assert!(!u.name.is_empty());
+            prop_assert!(!u.name.contains('\n'));
+        }
+        let groups = parse_group(&text);
+        for g in &groups {
+            prop_assert!(!g.name.is_empty());
+            prop_assert!(g.members.iter().all(|m| !m.is_empty()));
+        }
+    }
 }
